@@ -1,6 +1,6 @@
 CC      ?= cc
 CFLAGS  ?= -std=c99 -Wall -Wextra -Wpedantic -g -O0
-SRCS    := main.c lexer.c ast.c parser.c check.c
+SRCS    := main.c lexer.c ast.c parser.c check.c emit.c
 OBJS    := $(SRCS:.c=.o)
 TARGET  := kaic0
 

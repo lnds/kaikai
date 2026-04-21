@@ -12,6 +12,7 @@
 
 #include "ast.h"
 #include "check.h"
+#include "emit.h"
 #include "lexer.h"
 #include "parser.h"
 
@@ -37,6 +38,7 @@ static char *read_file(const char *path, size_t *out_len) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s [--tokens|--ast] <file.kai>\n"
+            "  default     lex, parse, check, and emit C to stdout\n"
             "  --tokens    print the token stream and exit\n"
             "  --ast       parse and print the AST and exit\n"
             "  -h, --help  this help\n",
@@ -98,9 +100,14 @@ int main(int argc, char **argv) {
     }
 
     int rc = kai_check(prog, path, src);
-    if (rc == 0) {
-        printf("kaic0: %s: checked OK (%zu top-level decls)\n", path, prog->n_children);
+    if (rc != 0) {
+        kai_free_node(prog);
+        free(src);
+        return rc;
     }
+
+    /* Emit C to stdout. */
+    rc = kai_emit(prog, stdout);
 
     kai_free_node(prog);
     free(src);
