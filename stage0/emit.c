@@ -106,7 +106,10 @@ static const struct {
     { "string_to_real", "kai_prelude_string_to_real", 1 },
     { "char_at",        "kai_prelude_char_at",        2 },
     { "string_split",   "kai_prelude_string_split",   2 },
-    { "string_contains","kai_prelude_string_contains",2 }
+    { "string_contains","kai_prelude_string_contains",2 },
+    { "string_slice",   "kai_prelude_string_slice",   3 },
+    { "char_to_int",    "kai_prelude_char_to_int",    1 },
+    { "int_to_char",    "kai_prelude_int_to_char",    1 }
 };
 static const size_t N_PRELUDE = sizeof(PRELUDE) / sizeof(PRELUDE[0]);
 

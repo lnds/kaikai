@@ -390,9 +390,12 @@ string_to_real(s: String) -> Option[Real]
 # String operations
 string_length(s: String) -> Int
 string_concat(a: String, b: String) -> String
+string_slice(s: String, from: Int, len: Int) -> String
 string_split(s: String, sep: String) -> [String]
 string_contains(s: String, substr: String) -> Bool
 char_at(s: String, i: Int) -> Option[Char]
+char_to_int(c: Char) -> Int
+int_to_char(n: Int) -> Char
 
 # List operations — minimal set; full library is in stdlib for stage 1
 list_length(xs: [a]) -> Int

@@ -569,6 +569,7 @@ static KaiValue *kai_mod(KaiValue *a, KaiValue *b) {
 static KaiValue *kai_lt(KaiValue *a, KaiValue *b) {
     if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_bool(a->as.i < b->as.i);
     if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_bool(a->as.r < b->as.r);
+    if (a->tag == KAI_CHAR && b->tag == KAI_CHAR) return kai_bool(a->as.c < b->as.c);
     if (a->tag == KAI_STR  && b->tag == KAI_STR) {
         size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
@@ -581,6 +582,7 @@ static KaiValue *kai_lt(KaiValue *a, KaiValue *b) {
 static KaiValue *kai_gt(KaiValue *a, KaiValue *b) {
     if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_bool(a->as.i > b->as.i);
     if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_bool(a->as.r > b->as.r);
+    if (a->tag == KAI_CHAR && b->tag == KAI_CHAR) return kai_bool(a->as.c > b->as.c);
     if (a->tag == KAI_STR  && b->tag == KAI_STR) {
         size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
@@ -849,6 +851,28 @@ static KaiValue *kai_prelude_string_split(KaiValue *s, KaiValue *sep) {
     return acc;
 }
 
+static KaiValue *kai_prelude_string_slice(KaiValue *s, KaiValue *from, KaiValue *len) {
+    if (!s || s->tag != KAI_STR) return kai_str("");
+    int64_t f = (from && from->tag == KAI_INT) ? from->as.i : 0;
+    int64_t l = (len  && len->tag  == KAI_INT) ? len->as.i  : 0;
+    if (f < 0) f = 0;
+    if (l < 0) l = 0;
+    if ((size_t) f > s->as.s.len) f = (int64_t) s->as.s.len;
+    size_t avail = s->as.s.len - (size_t) f;
+    size_t take  = ((size_t) l > avail) ? avail : (size_t) l;
+    return kai_str_from_bytes(s->as.s.bytes + f, take);
+}
+
+static KaiValue *kai_prelude_char_to_int(KaiValue *c) {
+    if (!c || c->tag != KAI_CHAR) return kai_int(0);
+    return kai_int((int64_t) c->as.c);
+}
+
+static KaiValue *kai_prelude_int_to_char(KaiValue *n) {
+    if (!n || n->tag != KAI_INT) return kai_char(0);
+    return kai_char((uint32_t) n->as.i);
+}
+
 static KaiValue *kai_prelude_string_contains(KaiValue *s, KaiValue *sub) {
     if (!s || s->tag != KAI_STR || !sub || sub->tag != KAI_STR) return kai_bool(0);
     if (sub->as.s.len == 0) return kai_bool(1);
@@ -885,6 +909,9 @@ static KaiValue *_kai_prelude_string_to_real_thunk(KaiValue *s, KaiValue **a, in
 static KaiValue *_kai_prelude_char_at_thunk(KaiValue *s, KaiValue **a, int n)        { (void) s; (void) n; return kai_prelude_char_at(a[0], a[1]); }
 static KaiValue *_kai_prelude_string_split_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_string_split(a[0], a[1]); }
 static KaiValue *_kai_prelude_string_contains_thunk(KaiValue *s, KaiValue **a, int n){ (void) s; (void) n; return kai_prelude_string_contains(a[0], a[1]); }
+static KaiValue *_kai_prelude_string_slice_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_string_slice(a[0], a[1], a[2]); }
+static KaiValue *_kai_prelude_char_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_char_to_int(a[0]); }
+static KaiValue *_kai_prelude_int_to_char_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_int_to_char(a[0]); }
 
 /* ---------- test harness hooks (used by --test runs) ---------- */
 
