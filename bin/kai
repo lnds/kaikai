@@ -1,0 +1,122 @@
+#!/bin/sh
+# kai — stage 1 compiler driver.
+#
+# Subcommands:
+#   kai build <file.kai> [-o <out>]   compile to a native binary
+#   kai run   <file.kai> [args...]    compile and execute; forward args
+#   kai test  <file.kai>              compile with --test and run
+#   kai help                          show this help
+#   kai --version                     print version
+#
+# The driver wraps kaic1 + cc. It auto-builds stage 0 and stage 1 on
+# first use if their binaries are missing. Paths resolve relative to
+# this script's own location, so the script works from any working
+# directory.
+
+set -eu
+
+# Resolve script path portably (macOS lacks GNU readlink -f).
+SCRIPT="$0"
+case "$SCRIPT" in
+  /*) ;;
+  *)  SCRIPT="$(pwd)/$SCRIPT" ;;
+esac
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+KAIC0="$ROOT/stage0/kaic0"
+KAIC1="$ROOT/stage1/kaic1"
+RUNTIME_INC="$ROOT/stage0"
+
+CC="${CC:-cc}"
+CFLAGS="${CFLAGS:--std=c99 -Wno-unused-function -Wno-unused-variable -O2}"
+
+die() {
+  echo "kai: $*" >&2
+  exit 2
+}
+
+ensure_built() {
+  if [ ! -x "$KAIC0" ]; then
+    (cd "$ROOT/stage0" && make kaic0) >&2
+  fi
+  if [ ! -x "$KAIC1" ]; then
+    (cd "$ROOT/stage1" && make kaic1) >&2
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+usage: kai <command> [args...]
+
+Commands:
+  build <file.kai> [-o <out>]   Compile a kaikai file to a native binary.
+  run   <file.kai> [args...]    Build and execute; forwards remaining args.
+  test  <file.kai>              Compile with --test and run the test binary.
+  help                          Show this help.
+  --version                     Print version.
+
+Environment:
+  CC        C compiler to invoke (default: cc).
+  CFLAGS    Extra flags passed to CC.
+EOF
+}
+
+# $1 = source .kai path; $2 = tmpdir; $3 = output binary path; rest = extra kaic1 flags
+compile_to_binary() {
+  src="$1"; tmp="$2"; out="$3"; shift 3
+  [ -f "$src" ] || die "cannot read '$src'"
+  ensure_built
+  "$KAIC1" "$@" "$src" > "$tmp/out.c"
+  # shellcheck disable=SC2086
+  $CC $CFLAGS -I "$RUNTIME_INC" "$tmp/out.c" -o "$out"
+}
+
+cmd_build() {
+  src=""; out=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o) shift; [ $# -gt 0 ] || die "-o needs an argument"; out="$1"; shift ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "unknown flag: $1" ;;
+      *) [ -z "$src" ] || die "only one input file supported"; src="$1"; shift ;;
+    esac
+  done
+  [ -n "$src" ] || die "missing input file"
+  if [ -z "$out" ]; then
+    out="$(basename "$src" .kai)"
+  fi
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  compile_to_binary "$src" "$tmp" "$out"
+}
+
+cmd_run() {
+  [ $# -gt 0 ] || die "missing input file"
+  src="$1"; shift
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  bin="$tmp/$(basename "$src" .kai)"
+  compile_to_binary "$src" "$tmp" "$bin"
+  "$bin" "$@"
+}
+
+cmd_test() {
+  [ $# -gt 0 ] || die "missing input file"
+  src="$1"; shift
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  bin="$tmp/$(basename "$src" .kai)-t"
+  compile_to_binary "$src" "$tmp" "$bin" --test
+  "$bin"
+}
+
+case "${1:-}" in
+  build)     shift; cmd_build "$@" ;;
+  run)       shift; cmd_run   "$@" ;;
+  test)      shift; cmd_test  "$@" ;;
+  help|-h|--help) usage ;;
+  --version) echo "kai 0.1.0 (stage 1)" ;;
+  "")        usage >&2; exit 2 ;;
+  *)         echo "unknown command: $1" >&2; usage >&2; exit 2 ;;
+esac
