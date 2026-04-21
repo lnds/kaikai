@@ -81,6 +81,8 @@ This document is updated as decisions are closed.
   - Tests are automatically excluded from production builds.
   - Post-MVP: property testing (`check ... with a: Int`), benchmarks (`bench`), snapshots, fuzzing, doctests.
   - Motivation: single canonical form, integration with `kai test`, LLM-friendly (LLMs write tests without picking frameworks).
+- **Typed holes** (stage 2): `?` and `?name` are first-class expressions/patterns. At check time the compiler reports the expected type, bindings in scope, and synthesis candidates, both as human-readable text and as JSON (`kai build --holes-json`). Unfilled holes don't break the build — they become a runtime panic — so partial programs run. Designed as the integration point for LLM-assisted editing. Full rationale and syntax in `docs/typed-holes.md`.
+- **Structured concurrency** (stage 2): every fiber lives inside a lexical scope (`nursery`) that waits for its children and propagates cancellation. `spawn` / `await` / `select` are operations of a `Spawn` effect, not built-in primitives; the nursery is literally a handler for that effect. `Fiber[T]` is a region-branded capability that cannot escape its scope. Cancellation is an effect (`Cancel`) that fibers can handle for cleanup. Full rationale, syntax, and patterns in `docs/structured-concurrency.md`.
 
 ## MVP scope
 
@@ -185,6 +187,9 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 
 **Post-MVP** (out of immediate scope):
 - Stage 2 with LLVM backend directly, full Perceus, effect inference, fibers, BEAM-style scheduler.
+- **Typed holes** (`docs/typed-holes.md`): `?` / `?name` in expressions and patterns, structured reports (expected type, in-scope bindings, candidates) in text and JSON. First-class integration point for LLM-assisted editing.
+- **Structured concurrency** (`docs/structured-concurrency.md`): nursery-scoped fibers, `Spawn` / `Cancel` as effects, region-branded `Fiber[T]` that cannot escape its scope. Built on top of the effects + handlers machinery.
+- Elm/Rust-level error messages as an explicit design investment (not a "feature" — a quality bar for every diagnostic).
 - `kai fmt`, `kai repl`, `kai lsp`.
 - Property testing (`check`), benchmarks (`bench`), snapshots.
 - FFI binding generator.
