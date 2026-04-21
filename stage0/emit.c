@@ -42,6 +42,29 @@ typedef struct {
     int    cap_caps;
 } LamInfo;
 
+/* Local-binding scope used by both capture analysis and emission. A
+   flat stack of names (borrowed from source) with a parallel stack
+   of "marks" — each mark is the size of the name stack at the time
+   a scope was entered. push_mark records the size; pop_mark
+   truncates back to it. Lookups walk the name stack from the end,
+   so inner scopes shadow outer ones.
+
+   During `collect_all_lambdas` the stack tracks which names are
+   introduced by lets / match patterns inside a lambda body — those
+   bindings should never end up as phantom captures.
+
+   During emission the stack tracks the same thing, plus function
+   parameters and lambda captures, so `emit_ident_value` /
+   `emit_ident_callee` can prefer a local binding over a colliding
+   prelude name or user function. */
+typedef struct {
+    char **names;
+    size_t *lens;
+    size_t  n, cap;
+    size_t *marks;
+    size_t  n_marks, cap_marks;
+} LocalScope;
+
 typedef struct {
     FILE *out;
     int   had_error;
@@ -56,7 +79,73 @@ typedef struct {
     SymEntry *fns;      size_t n_fns, cap_fns;
     SymEntry *variants; size_t n_variants, cap_variants;
     LamInfo  *lams;     size_t n_lams, cap_lams;
+
+    LocalScope locals;
 } E;
+
+/* ---------- local scope ---------- */
+
+static void ls_push_mark(E *e) {
+    LocalScope *s = &e->locals;
+    if (s->n_marks == s->cap_marks) {
+        s->cap_marks = s->cap_marks ? s->cap_marks * 2 : 8;
+        s->marks = (size_t *) realloc(s->marks, s->cap_marks * sizeof(size_t));
+    }
+    s->marks[s->n_marks++] = s->n;
+}
+
+static void ls_pop_mark(E *e) {
+    LocalScope *s = &e->locals;
+    if (s->n_marks == 0) return;
+    s->n = s->marks[--s->n_marks];
+}
+
+static void ls_add(E *e, const char *name, size_t len) {
+    LocalScope *s = &e->locals;
+    if (s->n == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 16;
+        s->names = (char **) realloc(s->names, s->cap * sizeof(char *));
+        s->lens  = (size_t *) realloc(s->lens,  s->cap * sizeof(size_t));
+    }
+    s->names[s->n] = (char *) name;
+    s->lens[s->n]  = len;
+    s->n++;
+}
+
+static int ls_has(E *e, const char *name, size_t len) {
+    LocalScope *s = &e->locals;
+    for (size_t i = s->n; i > 0;) {
+        --i;
+        if (s->lens[i] == len && memcmp(s->names[i], name, len) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Walk a pattern, adding every PAT_BIND name to the local scope. Used
+   by both collect_free_vars and emit_pat_binds so pattern bindings
+   are never counted as captures and are never redirected to a
+   same-named global at emit time. */
+static void pat_add_locals(E *e, Node *pat) {
+    if (!pat) return;
+    switch (pat->kind) {
+        case N_PAT_WILD:
+        case N_PAT_LIT:
+            return;
+        case N_PAT_BIND:
+            ls_add(e, pat->name, pat->name_len);
+            return;
+        case N_PAT_LIST:
+        case N_PAT_VARIANT:
+        case N_PAT_RECORD:
+            for (size_t i = 0; i < pat->n_children; ++i) pat_add_locals(e, pat->children[i]);
+            return;
+        case N_PAT_FIELD:
+            if (pat->n_children >= 1) pat_add_locals(e, pat->children[0]);
+            return;
+        default:
+            return;
+    }
+}
 
 /* ---------- forwards ---------- */
 
@@ -162,6 +251,15 @@ static int find_variant(E *e, const char *name, size_t len, int *out_arity) {
 static int emit_ident_callee(E *e, const char *name, size_t len) {
     const char *mapped = NULL;
     int arity = 0;
+    /* Local bindings beat every global. Before this check, a parameter
+       or pattern-bound name that happened to share a prelude / user-fn
+       name was silently redirected to the global — the cause of many
+       phantom bugs in early stage-1/stage-2 bootstraps. */
+    if (ls_has(e, name, len)) {
+        /* Fall through to the non-handled path so the caller emits
+           `kai_apply(kai_<name>, ...)` against the local closure. */
+        return 0;
+    }
     if (find_prelude(name, len, &arity, &mapped)) {
         fputs(mapped, e->out);
         return 1;
@@ -177,6 +275,11 @@ static int emit_ident_callee(E *e, const char *name, size_t len) {
 static void emit_ident_value(E *e, const char *name, size_t len) {
     int arity = 0;
     const char *mapped = NULL;
+    /* Locals shadow everything, same rationale as emit_ident_callee. */
+    if (ls_has(e, name, len)) {
+        fprintf(e->out, "kai_%.*s", (int) len, name);
+        return;
+    }
     if (find_variant(e, name, len, &arity)) {
         fprintf(e->out, "kai_variant(0, \"%.*s\", 0, NULL)", (int) len, name);
         return;
@@ -271,7 +374,8 @@ static void collect_free_vars(E *e, Node *n, Node *lam, LamInfo *info) {
     if (n->kind == N_LAMBDA) return;         /* inner lambdas have their own */
     if (n->kind == N_IDENT) {
         if (!is_lambda_param(lam, n->name, n->name_len) &&
-            !is_global_name(e, n->name, n->name_len)) {
+            !is_global_name(e, n->name, n->name_len) &&
+            !ls_has(e, n->name, n->name_len)) {
             add_capture(info, n->name, n->name_len);
         }
         return;
@@ -289,6 +393,36 @@ static void collect_free_vars(E *e, Node *n, Node *lam, LamInfo *info) {
             collect_free_vars(e, n->children[i], lam, info);
         return;
     }
+    /* N_LET adds pattern binds into scope *after* its RHS, so the RHS
+       doesn't see the new name (correct: `let x = expr` where expr
+       cannot refer to x). */
+    if (n->kind == N_LET) {
+        if (n->n_children >= 3) collect_free_vars(e, n->children[2], lam, info);
+        if (n->n_children >= 1) pat_add_locals(e, n->children[0]);
+        return;
+    }
+    /* Each match arm is its own scope: walk the pattern for binds,
+       push, walk guard + body, pop. */
+    if (n->kind == N_ARM) {
+        Node *pat = n->children[0];
+        int has_guard = (n->v.flags & 0x1) != 0;
+        Node *body_idx = n->children[has_guard ? 2 : 1];
+        Node *guard    = has_guard ? n->children[1] : NULL;
+        ls_push_mark(e);
+        pat_add_locals(e, pat);
+        if (guard)    collect_free_vars(e, guard,    lam, info);
+        if (body_idx) collect_free_vars(e, body_idx, lam, info);
+        ls_pop_mark(e);
+        return;
+    }
+    /* Blocks get their own scope so a nested `let` doesn't leak. */
+    if (n->kind == N_BLOCK) {
+        ls_push_mark(e);
+        for (size_t i = 0; i < n->n_children; ++i)
+            collect_free_vars(e, n->children[i], lam, info);
+        ls_pop_mark(e);
+        return;
+    }
     for (size_t i = 0; i < n->n_children; ++i)
         collect_free_vars(e, n->children[i], lam, info);
 }
@@ -303,7 +437,15 @@ static LamInfo *register_lambda(E *e, Node *lam) {
     info->id  = (int) e->n_lams;
     info->lam = lam;
     e->n_lams++;
-    if (lam->n_children >= 1) collect_free_vars(e, lam->children[0], lam, info);
+    if (lam->n_children >= 1) {
+        /* The body starts in a fresh local scope. Lambda params are
+           already covered by is_lambda_param, but we still push a mark
+           so any let/pattern binds inside the body are tracked against
+           this lambda's scope and popped cleanly afterwards. */
+        ls_push_mark(e);
+        collect_free_vars(e, lam->children[0], lam, info);
+        ls_pop_mark(e);
+    }
     return info;
 }
 
@@ -724,7 +866,11 @@ static void emit_match(E *e, Node *m) {
         fputs("    if (", e->out);
         emit_pat_test(e, pat, "_scr");
         fputs(") { ", e->out);
+        /* Each arm opens its own local scope so pattern bindings don't
+           leak and don't shadow siblings. */
+        ls_push_mark(e);
         emit_pat_binds(e, pat, "_scr");
+        pat_add_locals(e, pat);
         if (has_guard) {
             fputs("if (kai_truthy(", e->out);
             emit_expr(e, guard);
@@ -736,6 +882,7 @@ static void emit_match(E *e, Node *m) {
             emit_expr(e, body);
             fputs("; break; }\n", e->out);
         }
+        ls_pop_mark(e);
     }
     fputs("    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n", e->out);
     fputs("} while (0); _r; })", e->out);
@@ -860,18 +1007,22 @@ static void emit_lambda_helper_def(E *e, LamInfo *info) {
     fprintf(e->out, "static KaiValue *_kai_lam_%d(KaiValue *self, KaiValue **args, int n) {\n",
             info->id);
     fputs("    (void) self; (void) n;\n", e->out);
+    ls_push_mark(e);
     for (int i = 0; i < n_params; ++i) {
         Node *p = lam->children[1 + i];
         fprintf(e->out, "    KaiValue *kai_%.*s = args[%d];\n",
                 (int) p->name_len, p->name, i);
+        ls_add(e, p->name, p->name_len);
     }
     for (int i = 0; i < info->n_caps; ++i) {
         fprintf(e->out, "    KaiValue *kai_%.*s = self->as.clo.captures[%d];\n",
                 (int) info->caps[i].len, info->caps[i].name, i);
+        ls_add(e, info->caps[i].name, info->caps[i].len);
     }
     fputs("    return ", e->out);
     emit_expr(e, lam->children[0]);
     fputs(";\n}\n\n", e->out);
+    ls_pop_mark(e);
 }
 
 /* ---------- expression dispatch ---------- */
@@ -904,10 +1055,14 @@ static void emit_expr(E *e, Node *n) {
             Node *value = (n->n_children > 0) ? n->children[n->n_children - 1] : NULL;
             int has_value = (n->v.flags & 0x1) != 0;
             if (n_stmts == 0 && has_value) { emit_expr(e, value); return; }
+            /* Block scope: let bindings inside the block must not leak
+               out or shadow across block boundaries. */
             fputs("({ ", e->out);
+            ls_push_mark(e);
             for (size_t i = 0; i < n_stmts; ++i) { emit_stmt(e, n->children[i]); fputc(' ', e->out); }
             if (has_value) { emit_expr(e, value); fputs("; ", e->out); }
             else            { fputs("kai_unit(); ", e->out); }
+            ls_pop_mark(e);
             fputs("})", e->out);
             return;
         }
@@ -935,13 +1090,16 @@ static void emit_let(E *e, Node *n) {
         fprintf(e->out, "KaiValue *kai_%.*s = ", (int) pat->name_len, pat->name);
         emit_expr(e, val);
         fputs(";", e->out);
+        /* Record the binding *after* emitting the RHS so the RHS does
+           not see the new name. */
+        ls_add(e, pat->name, pat->name_len);
         return;
     }
-    /* Destructuring let: bind a temp, emit pattern bindings referencing it. */
     fputs("KaiValue *_letv = ", e->out);
     emit_expr(e, val);
     fputs("; ", e->out);
     emit_pat_binds(e, pat, "_letv");
+    pat_add_locals(e, pat);
 }
 
 static void emit_stmt(E *e, Node *n) {
@@ -1017,7 +1175,13 @@ static void emit_fn_signature(E *e, Node *fn) {
 static void emit_fn_body(E *e, Node *fn) {
     emit_fn_signature(e, fn);
     fputs(" {\n    return ", e->out);
+    ls_push_mark(e);
+    for (size_t i = 2; i < fn->n_children; ++i) {
+        Node *p = fn->children[i];
+        if (p && p->kind == N_PARAM) ls_add(e, p->name, p->name_len);
+    }
     emit_expr(e, fn->children[1]);
+    ls_pop_mark(e);
     fputs(";\n}\n\n", e->out);
 }
 
@@ -1058,8 +1222,10 @@ static void emit_test_fn(E *e, int id, Node *t) {
     fprintf(e->out, "    kai_test_begin(%.*s);\n",
             (int) t->name_len, t->name);
     fputs("    KaiValue *_body = ", e->out);
+    ls_push_mark(e);
     if (t->n_children >= 1) emit_expr(e, t->children[0]);
     else                    fputs("kai_unit()", e->out);
+    ls_pop_mark(e);
     fputs(";\n", e->out);
     fputs("    kai_decref(_body);\n", e->out);
     fputs("    kai_test_pass();\n", e->out);
