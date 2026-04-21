@@ -58,7 +58,25 @@ test-check: $(TARGET) build
 	    || { echo "check FAIL $$name"; exit 1; }; \
 	done
 
-test: test-tokens test-ast test-check
+# End-to-end: compile a .kai file via kaic1, feed the C to cc, run the
+# binary, and compare its stdout against stage 0's equivalent. For now
+# only hello.kai; milestones 7-8 extend this.
+test-run: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/hello.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/$$name.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name; \
+	  ./build/$$name > build/$$name.out; \
+	  $(STAGE0) $$f > build/$$name-s0.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-s0.c -o build/$$name-s0; \
+	  ./build/$$name-s0 > build/$$name-s0.out; \
+	  diff -q build/$$name.out build/$$name-s0.out > /dev/null \
+	    && echo "run OK $$name" \
+	    || { echo "run DIFF $$name"; diff build/$$name-s0.out build/$$name.out; exit 1; }; \
+	done
+
+test: test-tokens test-ast test-check test-run
 
 clean:
 	rm -rf build $(TARGET)

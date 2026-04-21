@@ -3040,7 +3040,7 @@ fn register_one(e: Env, d: Decl) : Env {
     DType(_, name, _, body, _, _) -> {
       let e1 = env_add(e, name)
       match body {
-        TBSum(variants) -> register_variants(e1, variants)
+        TBSum(variants) -> register_variants_env(e1, variants)
         _ -> e1
       }
     }
@@ -3049,11 +3049,11 @@ fn register_one(e: Env, d: Decl) : Env {
   }
 }
 
-fn register_variants(e: Env, vs: [Variant]) : Env {
+fn register_variants_env(e: Env, vs: [Variant]) : Env {
   match vs {
     [] -> e
     [v, ...rest] -> match v {
-      Var(name, _) -> register_variants(env_add(e, name), rest)
+      Var(name, _) -> register_variants_env(env_add(e, name), rest)
     }
   }
 }
@@ -3092,6 +3092,369 @@ fn check_program(file: String, decls: [Decl]) : Int {
   let e2 = register_decls(e1, decls)
   let e3 = chk_decls(e2, decls)
   if e3.had_error { 1 } else { 0 }
+}
+
+# ====================================================================
+# emitter
+# ====================================================================
+#
+# Produces C source that links against stage 0's runtime.h. This
+# milestone (6) only covers what hello.kai needs — enough of expressions
+# to emit a call, a string literal, a block body, and the top-level
+# scaffolding (forward decls, thunks, int main). Subsequent milestones
+# extend emit_expr to cover the rest of ExprKind.
+
+# ---- small string helpers ----
+
+fn cat2(a: String, b: String) : String = string_concat(a, b)
+fn cat3(a: String, b: String, c: String) : String =
+  string_concat(a, string_concat(b, c))
+fn cat4(a: String, b: String, c: String, d: String) : String =
+  string_concat(a, string_concat(b, string_concat(c, d)))
+fn cat5(a: String, b: String, c: String, d: String, ee: String) : String =
+  string_concat(a, string_concat(b, string_concat(c, string_concat(d, ee))))
+
+fn concat_all(xs: [String]) : String =
+  reduce(xs, "", (acc, s) => string_concat(acc, s))
+
+fn join_with(xs: [String], sep: String) : String {
+  match xs {
+    [] -> ""
+    [x] -> x
+    [x, ...rest] -> string_concat(x, string_concat(sep, join_with(rest, sep)))
+  }
+}
+
+# ---- tables: user function arities, variant arities ----
+#
+# Stage 0 emit keeps parallel tables of user-defined function names and
+# variant constructors; the ident dispatcher looks into both before
+# falling back to a local. Stage 1 does the same; both tables are
+# lists of sum-variant pairs.
+
+type EFn  = EFn(String, Int)
+type EVar = EV(String, Int)
+
+fn efn_find(fns: [EFn], target: String) : Option[Int] {
+  match fns {
+    [] -> None
+    [h, ...rest] -> match h {
+      EFn(n, ar) -> if n == target { Some(ar) } else { efn_find(rest, target) }
+    }
+  }
+}
+
+fn evar_find(vs: [EVar], target: String) : Option[Int] {
+  match vs {
+    [] -> None
+    [h, ...rest] -> match h {
+      EV(n, ar) -> if n == target { Some(ar) } else { evar_find(rest, target) }
+    }
+  }
+}
+
+fn fn_of_decl(d: Decl) : Option[EFn] {
+  match d {
+    DFn(_, name, params, _, _, _, _) -> Some(EFn(name, list_length(params)))
+    _ -> None
+  }
+}
+
+fn register_fn_decls(decls: [Decl]) : [EFn] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match fn_of_decl(d) {
+      Some(fs) -> [fs, ...register_fn_decls(rest)]
+      None -> register_fn_decls(rest)
+    }
+  }
+}
+
+fn builtin_variants() : [EVar] =
+  [EV("Some", 1), EV("None", 0), EV("Ok", 1), EV("Err", 1)]
+
+fn collect_user_variants_loop(ds: [Decl], acc: [EVar]) : [EVar] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DType(_, _, _, body, _, _) -> match body {
+        TBSum(vs) -> collect_user_variants_loop(rest, vs_to_evars(vs, acc))
+        _ -> collect_user_variants_loop(rest, acc)
+      }
+      _ -> collect_user_variants_loop(rest, acc)
+    }
+  }
+}
+
+fn vs_to_evars(vs: [Variant], acc: [EVar]) : [EVar] {
+  match vs {
+    [] -> acc
+    [v, ...rest] -> match v {
+      Var(n, tys) -> vs_to_evars(rest, [EV(n, list_length(tys)), ...acc])
+    }
+  }
+}
+
+fn register_variants(decls: [Decl]) : [EVar] =
+  collect_user_variants_loop(decls, builtin_variants())
+
+# ---- prelude mapping for emission ----
+#
+# For user-facing builtins, we map to their runtime C symbol and arity.
+# Stage 1 mirrors stage 0's table 1:1.
+
+type EPrelude = EP(String, String, Int)     # kai name, c name, arity
+
+fn prelude_table() : [EPrelude] {
+  [
+    EP("print",            "kai_prelude_print",            1),
+    EP("eprint",           "kai_prelude_eprint",           1),
+    EP("panic",            "kai_prelude_panic",            1),
+    EP("exit",             "kai_prelude_exit",             1),
+    EP("int_to_string",    "kai_prelude_int_to_string",    1),
+    EP("real_to_string",   "kai_prelude_real_to_string",   1),
+    EP("string_length",    "kai_prelude_string_length",    1),
+    EP("string_concat",    "kai_prelude_string_concat",    2),
+    EP("list_length",      "kai_prelude_list_length",      1),
+    EP("list_append",      "kai_prelude_list_append",      2),
+    EP("list_reverse",     "kai_prelude_list_reverse",     1),
+    EP("map",              "kai_prelude_map",              2),
+    EP("filter",           "kai_prelude_filter",           2),
+    EP("reduce",           "kai_prelude_reduce",           3),
+    EP("each",             "kai_prelude_each",             2),
+    EP("args",             "kai_prelude_args",             0),
+    EP("read_file",        "kai_prelude_read_file",        1),
+    EP("write_file",       "kai_prelude_write_file",       2),
+    EP("read_line",        "kai_prelude_read_line",        0),
+    EP("string_to_int",    "kai_prelude_string_to_int",    1),
+    EP("string_to_real",   "kai_prelude_string_to_real",   1),
+    EP("char_at",          "kai_prelude_char_at",          2),
+    EP("string_split",     "kai_prelude_string_split",     2),
+    EP("string_contains",  "kai_prelude_string_contains",  2),
+    EP("string_slice",     "kai_prelude_string_slice",     3),
+    EP("char_to_int",      "kai_prelude_char_to_int",      1),
+    EP("int_to_char",      "kai_prelude_int_to_char",      1)
+  ]
+}
+
+fn prelude_find(target: String) : Option[EPrelude] {
+  prelude_find_loop(prelude_table(), target)
+}
+
+fn prelude_find_loop(table: [EPrelude], target: String) : Option[EPrelude] {
+  match table {
+    [] -> None
+    [ep, ...rest] -> match ep {
+      EP(name, _, _) -> if name == target { Some(ep) } else { prelude_find_loop(rest, target) }
+    }
+  }
+}
+
+# ---- expression emission ----
+
+fn emit_ident_callee(name: String) : String {
+  match prelude_find(name) {
+    Some(ep) -> match ep { EP(_, cname, _) -> cname }
+    None -> cat2("kai_", name)
+  }
+}
+
+# Emit an ident used as a value (not a call target).
+fn emit_ident_value(name: String, fns: [EFn], variants: [EVar]) : String {
+  match evar_find(variants, name) {
+    Some(_) -> cat3("kai_variant(0, \"", name, "\", 0, NULL)")
+    None -> match prelude_find(name) {
+      Some(ep) -> match ep {
+        EP(_, cname, ar) ->
+          cat5("kai_closure(&_", cname, "_thunk, ", int_to_string(ar), ", 0, NULL)")
+      }
+      None -> match efn_find(fns, name) {
+        Some(ar) ->
+          cat5("kai_closure(&_kai_", name, "_thunk, ", int_to_string(ar), ", 0, NULL)")
+        None -> cat2("kai_", name)
+      }
+    }
+  }
+}
+
+# Emit a raw string literal's *body* as a C string literal. For now this
+# only handles hello-style cases: no #{...} interpolation, no \u{HHHH},
+# the escapes that kaikai and C share are passed through unchanged.
+# Later milestones extend this to full interpolation.
+fn emit_string_lit_body(span: String) : String {
+  # span includes opening and closing quotes; C literal syntax matches.
+  span
+}
+
+fn emit_expr_hello(src: String, x: Expr, fns: [EFn], variants: [EVar]) : String {
+  match x.kind {
+    EStr(span, _) -> cat3("kai_str(", span, ")")
+    EUnit -> "kai_unit()"
+    EVar(name) -> emit_ident_value(name, fns, variants)
+    ECall(f, args_e) -> {
+      let call_args = join_with(map(args_e, (a) => emit_expr_hello(src, a, fns, variants)), ", ")
+      match f.kind {
+        EVar(callee) -> {
+          match prelude_find(callee) {
+            Some(ep) -> match ep {
+              EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
+            }
+            None -> match efn_find(fns, callee) {
+              Some(_) -> cat5("kai_", callee, "(", call_args, ")")
+              None -> cat5("kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e)),
+                           cat3(", (KaiValue *[]){", call_args, "})"))
+            }
+          }
+        }
+        _ -> {
+          let fc = emit_expr_hello(src, f, fns, variants)
+          cat5("kai_apply(", fc, ", ", int_to_string(list_length(args_e)),
+               cat3(", (KaiValue *[]){", call_args, "})"))
+        }
+      }
+    }
+    EBlock(stmts, opt_final) -> {
+      # Trivial block: just the final expression.
+      match stmts {
+        [] -> match opt_final {
+          Some(fe) -> emit_expr_hello(src, fe, fns, variants)
+          None -> "kai_unit()"
+        }
+        _ -> {
+          # Full block: use GCC statement-expression `({ ... })`.
+          let stmt_out = concat_all(map(stmts, (s) => emit_stmt_hello(src, s, fns, variants)))
+          let final_out = match opt_final {
+            Some(fe) -> cat3(emit_expr_hello(src, fe, fns, variants), "; ", "")
+            None -> "kai_unit(); "
+          }
+          cat4("({ ", stmt_out, final_out, "})")
+        }
+      }
+    }
+    _ -> "kai_unit() /* emit: TODO in milestone 7+ */"
+  }
+}
+
+fn emit_stmt_hello(src: String, s: Stmt, fns: [EFn], variants: [EVar]) : String {
+  match s {
+    SExprStmt(x) -> cat3("{ KaiValue *_ = ", emit_expr_hello(src, x, fns, variants), "; (void) _; } ")
+    _ -> "/* stmt: TODO in milestone 7+ */ "
+  }
+}
+
+# ---- declaration emission ----
+
+fn emit_param_list(params: [Param]) : String {
+  match params {
+    [] -> "void"
+    _ -> join_with(map(params, (pm) => cat2("KaiValue *kai_", pm.pname)), ", ")
+  }
+}
+
+fn emit_fn_signature(name: String, params: [Param]) : String =
+  cat5("static KaiValue *kai_", name, "(", emit_param_list(params), ")")
+
+fn emit_fn_forward(d: Decl) : String {
+  match d {
+    DFn(_, name, params, _, _, _, _) -> cat2(emit_fn_signature(name, params), ";\n")
+    _ -> ""
+  }
+}
+
+fn emit_thunk_forward(d: Decl) : String {
+  match d {
+    DFn(_, name, _, _, _, _, _) ->
+      cat3("static KaiValue *_kai_", name, "_thunk(KaiValue *, KaiValue **, int);\n")
+    _ -> ""
+  }
+}
+
+fn emit_fn_body(src: String, d: Decl, fns: [EFn], variants: [EVar]) : String {
+  match d {
+    DFn(_, name, params, _, body, _, _) -> {
+      let sig = emit_fn_signature(name, params)
+      let body_c = emit_expr_hello(src, body, fns, variants)
+      cat5(sig, " {\n    return ", body_c, ";\n", "}\n\n")
+    }
+    _ -> ""
+  }
+}
+
+fn emit_param_args(params: [Param]) : String =
+  join_with(map(params, (pm) => cat2("kai_", pm.pname)), ", ")
+
+fn emit_param_reads(params: [Param], start: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] ->
+      cat2(
+        concat_all(["    KaiValue *kai_", p.pname, " = args[", int_to_string(start), "];\n"]),
+        emit_param_reads(rest, start + 1))
+  }
+}
+
+fn emit_fn_thunk(d: Decl) : String {
+  match d {
+    DFn(_, name, params, _, _, _, _) -> {
+      let param_reads = emit_param_reads(params, 0)
+      let named_args = emit_param_args(params)
+      let hdr = concat_all([
+        "static KaiValue *_kai_", name,
+        "_thunk(KaiValue *self, KaiValue **args, int n) {\n    (void) self; (void) n;\n"
+      ])
+      let call = concat_all(["    return kai_", name, "(", named_args, ");\n}\n\n"])
+      concat_all([hdr, param_reads, call])
+    }
+    _ -> ""
+  }
+}
+
+# ---- top-level passes ----
+
+fn fn_forward_decls(decls: [Decl]) : String =
+  concat_all(map(decls, emit_fn_forward))
+
+fn thunk_forward_decls(decls: [Decl]) : String =
+  concat_all(map(decls, emit_thunk_forward))
+
+fn fn_bodies(src: String, decls: [Decl], fns: [EFn], variants: [EVar]) : String =
+  concat_all(map(decls, (d) => {
+    match d {
+      DFn(_, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, fns, variants), emit_fn_thunk(d))
+      _ -> ""
+    }
+  }))
+
+fn has_main_decl(decls: [Decl]) : Bool {
+  match decls {
+    [] -> false
+    [d, ...rest] -> match d {
+      DFn(_, n, _, _, _, _, _) -> if n == "main" { true } else { has_main_decl(rest) }
+      _ -> has_main_decl(rest)
+    }
+  }
+}
+
+fn emit_main_wrapper(decls: [Decl], test_mode: Bool) : String {
+  if test_mode {
+    # milestone 9 will fill in test enumeration; for now, empty shell.
+    "int main(int argc, char **argv) {\n    kai_set_args(argc, argv);\n    return kai_test_summary();\n}\n"
+  } else if has_main_decl(decls) {
+    "int main(int argc, char **argv) {\n    kai_set_args(argc, argv);\n    KaiValue *_result = kai_main();\n    kai_decref(_result);\n    return 0;\n}\n"
+  } else {
+    ""
+  }
+}
+
+fn emit_program(file: String, src: String, decls: [Decl], test_mode: Bool) : String {
+  let fns = register_fn_decls(decls)
+  let variants = register_variants(decls)
+  let header = "/* generated by kaikai stage 1 */\n#include \"runtime.h\"\n\n"
+  let fwd = fn_forward_decls(decls)
+  let thunk_fwd = thunk_forward_decls(decls)
+  let bodies = fn_bodies(src, decls, fns, variants)
+  let main_wr = emit_main_wrapper(decls, test_mode)
+  cat5(header, fwd, cat2("\n", thunk_fwd), cat2("\n", bodies), main_wr)
 }
 
 # ====================================================================
@@ -3162,8 +3525,9 @@ fn compile_source(path: String, mode: Mode, src: String) : Int {
               let chk = check_program(path, decls)
               if chk != 0 { chk }
               else {
-                # Milestone 5 stub: the emitter lands next.
-                print("/* stage1 placeholder: emitter not yet wired */")
+                let test_mode = match mode { MTest -> true _ -> false }
+                let out = emit_program(path, src, decls, test_mode)
+                print(out)
                 0
               }
             }
