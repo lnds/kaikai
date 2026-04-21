@@ -63,7 +63,7 @@ test-check: $(TARGET) build
 # only hello.kai; milestones 7-8 extend this.
 test-run: $(TARGET) build
 	@set -e; \
-	for f in ../examples/minimal/hello.kai; do \
+	for f in ../examples/minimal/hello.kai ../examples/minimal/fizzbuzz.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/$$name.c; \
 	  $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name; \

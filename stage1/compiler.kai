@@ -3286,60 +3286,251 @@ fn emit_string_lit_body(span: String) : String {
   span
 }
 
-fn emit_expr_hello(src: String, x: Expr, fns: [EFn], variants: [EVar]) : String {
-  match x.kind {
-    EStr(span, _) -> cat3("kai_str(", span, ")")
-    EUnit -> "kai_unit()"
-    EVar(name) -> emit_ident_value(name, fns, variants)
-    ECall(f, args_e) -> {
-      let call_args = join_with(map(args_e, (a) => emit_expr_hello(src, a, fns, variants)), ", ")
-      match f.kind {
-        EVar(callee) -> {
-          match prelude_find(callee) {
-            Some(ep) -> match ep {
-              EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
-            }
-            None -> match efn_find(fns, callee) {
-              Some(_) -> cat5("kai_", callee, "(", call_args, ")")
-              None -> cat5("kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e)),
-                           cat3(", (KaiValue *[]){", call_args, "})"))
-            }
+fn binop_cname(op: String) : Option[String] {
+  if op == "+" { Some("kai_add") }
+  else if op == "-" { Some("kai_sub") }
+  else if op == "*" { Some("kai_mul") }
+  else if op == "/" { Some("kai_div") }
+  else if op == "//" { Some("kai_idiv") }
+  else if op == "%" { Some("kai_mod") }
+  else if op == "<" { Some("kai_lt") }
+  else if op == ">" { Some("kai_gt") }
+  else if op == "<=" { Some("kai_le") }
+  else if op == ">=" { Some("kai_ge") }
+  else if op == "==" { Some("kai_eq_v") }
+  else if op == "!=" { Some("kai_ne_v") }
+  else { None }
+}
+
+fn unop_cname(op: String) : Option[String] {
+  if op == "-" { Some("kai_neg") }
+  else if op == "not" { Some("kai_boolnot") }
+  else { None }
+}
+
+fn emit_call_args(src: String, args_e: [Expr], fns: [EFn], variants: [EVar]) : String =
+  join_with(map(args_e, (a) => emit_expr(src, a, fns, variants)), ", ")
+
+fn emit_variant_call(name: String, n_args: Int, arg_out: String) : String {
+  if n_args == 0 {
+    cat3("kai_variant(0, \"", name, "\", 0, NULL)")
+  } else {
+    concat_all([
+      "kai_variant(0, \"", name, "\", ", int_to_string(n_args),
+      ", (KaiValue *[]){", arg_out, "})"
+    ])
+  }
+}
+
+fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [EVar]) : String {
+  let call_args = emit_call_args(src, args_e, fns, variants)
+  match f.kind {
+    EVar(callee) -> {
+      match evar_find(variants, callee) {
+        Some(_) -> emit_variant_call(callee, list_length(args_e), call_args)
+        None -> match prelude_find(callee) {
+          Some(ep) -> match ep {
+            EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
           }
-        }
-        _ -> {
-          let fc = emit_expr_hello(src, f, fns, variants)
-          cat5("kai_apply(", fc, ", ", int_to_string(list_length(args_e)),
-               cat3(", (KaiValue *[]){", call_args, "})"))
+          None -> match efn_find(fns, callee) {
+            Some(_) -> cat5("kai_", callee, "(", call_args, ")")
+            None -> concat_all([
+              "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e)),
+              ", (KaiValue *[]){", call_args, "})"
+            ])
+          }
         }
       }
     }
+    _ -> {
+      let fc = emit_expr(src, f, fns, variants)
+      concat_all([
+        "kai_apply(", fc, ", ", int_to_string(list_length(args_e)),
+        ", (KaiValue *[]){", call_args, "})"
+      ])
+    }
+  }
+}
+
+# Emit a pipe `lhs |> rhs`. stage 0 specialises the common case where rhs
+# is a call: the left side becomes the first argument, prepended.
+fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar]) : String {
+  let lhs_c = emit_expr(src, lhs, fns, variants)
+  match rhs.kind {
+    ECall(f, args_e) -> match f.kind {
+      EVar(callee) -> {
+        let rest_args = emit_call_args(src, args_e, fns, variants)
+        let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
+        match evar_find(variants, callee) {
+          Some(_) -> emit_variant_call(callee, list_length(args_e) + 1, args_all)
+          None -> match prelude_find(callee) {
+            Some(ep) -> match ep {
+              EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
+            }
+            None -> match efn_find(fns, callee) {
+              Some(_) -> cat5("kai_", callee, "(", args_all, ")")
+              None -> concat_all([
+                "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e) + 1),
+                ", (KaiValue *[]){", args_all, "})"
+              ])
+            }
+          }
+        }
+      }
+      _ -> {
+        let fc = emit_expr(src, f, fns, variants)
+        let rest_args = emit_call_args(src, args_e, fns, variants)
+        let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
+        concat_all([
+          "kai_apply(", fc, ", ", int_to_string(list_length(args_e) + 1),
+          ", (KaiValue *[]){", args_all, "})"
+        ])
+      }
+    }
+    EVar(callee) -> {
+      # `xs |> f` — single-arg application of f.
+      match evar_find(variants, callee) {
+        Some(_) -> emit_variant_call(callee, 1, lhs_c)
+        None -> match prelude_find(callee) {
+          Some(ep) -> match ep { EP(_, cname, _) -> cat4(cname, "(", lhs_c, ")") }
+          None -> match efn_find(fns, callee) {
+            Some(_) -> cat5("kai_", callee, "(", lhs_c, ")")
+            None -> concat_all([
+              "kai_apply(kai_", callee,
+              ", 1, (KaiValue *[]){", lhs_c, "})"
+            ])
+          }
+        }
+      }
+    }
+    _ -> concat_all([
+      "kai_apply(", emit_expr(src, rhs, fns, variants),
+      ", 1, (KaiValue *[]){", lhs_c, "})"
+    ])
+  }
+}
+
+fn emit_range_expr(src: String, from: Expr, to: Expr, opt_step: Option[Expr],
+                   fns: [EFn], variants: [EVar]) : String {
+  let a = emit_expr(src, from, fns, variants)
+  let b = emit_expr(src, to, fns, variants)
+  match opt_step {
+    None -> cat5("kai_range(", a, ", ", b, ")")
+    Some(s) -> {
+      let sc = emit_expr(src, s, fns, variants)
+      concat_all(["kai_range_step(", a, ", ", b, ", ", sc, ")"])
+    }
+  }
+}
+
+fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar]) : String {
+  match x.kind {
+    EInt(n)      -> cat3("kai_int(", int_to_string(n), "LL)")
+    EReal(r)     -> cat3("kai_real(", real_to_string(r), ")")
+    EBool(b)     -> if b { "kai_bool(1)" } else { "kai_bool(0)" }
+    EChar(c)     -> cat3("kai_char(", int_to_string(char_to_int(c)), ")")
+    EStr(span, _) -> cat3("kai_str(", span, ")")
+    EUnit        -> "kai_unit()"
+    EVar(name)   -> emit_ident_value(name, fns, variants)
+    EUnder       -> "kai_unit() /* _ */"
+    EPlaceholder -> "kai_unit() /* placeholder */"
+    ECall(f, args_e) -> emit_call_expr(src, f, args_e, fns, variants)
+    EField(base, fname) -> {
+      let b = emit_expr(src, base, fns, variants)
+      cat5("kai_field(", b, ", \"", fname, "\")")
+    }
+    EIndex(_, _) -> "kai_unit() /* index: not used by bootstrap examples */"
+    EBinop(op, a, b) -> {
+      if op == "and" {
+        concat_all([
+          "({ KaiValue *_a = ", emit_expr(src, a, fns, variants),
+          "; kai_truthy(_a) ? ", emit_expr(src, b, fns, variants),
+          " : kai_bool(0); })"
+        ])
+      } else if op == "or" {
+        concat_all([
+          "({ KaiValue *_a = ", emit_expr(src, a, fns, variants),
+          "; kai_truthy(_a) ? kai_bool(1) : ", emit_expr(src, b, fns, variants), "; })"
+        ])
+      } else {
+        match binop_cname(op) {
+          Some(cn) -> concat_all([
+            cn, "(",
+            emit_expr(src, a, fns, variants), ", ",
+            emit_expr(src, b, fns, variants), ")"
+          ])
+          None -> cat3("kai_unit() /* unknown binop: ", op, " */")
+        }
+      }
+    }
+    EUnop(op, inner) -> {
+      match unop_cname(op) {
+        Some(cn) -> concat_all([cn, "(", emit_expr(src, inner, fns, variants), ")"])
+        None -> cat3("kai_unit() /* unknown unop: ", op, " */")
+      }
+    }
+    EIf(c, a, opt_b) -> {
+      let cc = emit_expr(src, c, fns, variants)
+      let tc = emit_expr(src, a, fns, variants)
+      let ec = match opt_b {
+        Some(eb) -> emit_expr(src, eb, fns, variants)
+        None -> "kai_unit()"
+      }
+      concat_all(["(kai_truthy(", cc, ") ? ", tc, " : ", ec, ")"])
+    }
+    EMatch(_, _) -> "kai_unit() /* match: milestone 8 */"
+    ELambda(_, _) -> "kai_unit() /* lambda: milestone 8 */"
+    ERecordLit(_, _) -> "kai_unit() /* record_lit: milestone 8 */"
+    EList(_) -> "kai_unit() /* list: milestone 8 */"
+    ERange(a, b, opt_step) -> emit_range_expr(src, a, b, opt_step, fns, variants)
     EBlock(stmts, opt_final) -> {
-      # Trivial block: just the final expression.
       match stmts {
         [] -> match opt_final {
-          Some(fe) -> emit_expr_hello(src, fe, fns, variants)
+          Some(fe) -> emit_expr(src, fe, fns, variants)
           None -> "kai_unit()"
         }
         _ -> {
-          # Full block: use GCC statement-expression `({ ... })`.
-          let stmt_out = concat_all(map(stmts, (s) => emit_stmt_hello(src, s, fns, variants)))
+          let stmt_out = concat_all(map(stmts, (s) => emit_stmt(src, s, fns, variants)))
           let final_out = match opt_final {
-            Some(fe) -> cat3(emit_expr_hello(src, fe, fns, variants), "; ", "")
+            Some(fe) -> cat2(emit_expr(src, fe, fns, variants), "; ")
             None -> "kai_unit(); "
           }
           cat4("({ ", stmt_out, final_out, "})")
         }
       }
     }
-    _ -> "kai_unit() /* emit: TODO in milestone 7+ */"
+    EPipe(a, b) -> emit_pipe_expr(src, a, b, fns, variants)
   }
 }
 
-fn emit_stmt_hello(src: String, s: Stmt, fns: [EFn], variants: [EVar]) : String {
+fn emit_stmt(src: String, s: Stmt, fns: [EFn], variants: [EVar]) : String {
   match s {
-    SExprStmt(x) -> cat3("{ KaiValue *_ = ", emit_expr_hello(src, x, fns, variants), "; (void) _; } ")
-    _ -> "/* stmt: TODO in milestone 7+ */ "
+    SLet(pat, _, rhs) -> emit_let_stmt(src, pat, rhs, fns, variants)
+    SAssert(cond, opt_msg) -> emit_assert_stmt(src, cond, opt_msg, fns, variants)
+    SExprStmt(x) -> cat3("{ KaiValue *_ = ", emit_expr(src, x, fns, variants), "; (void) _; } ")
   }
+}
+
+fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, fns: [EFn], variants: [EVar]) : String {
+  let rhs_c = emit_expr(src, rhs, fns, variants)
+  match pat.pkind {
+    PBind(name) -> concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
+    PWild -> cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
+    _ -> cat3("/* let pattern: milestone 8 */ KaiValue *_letv = ", rhs_c, "; ")
+  }
+}
+
+fn emit_assert_stmt(src: String, cond: Expr, opt_msg: Option[Expr],
+                    fns: [EFn], variants: [EVar]) : String {
+  # Inside test_mode the runner function wraps each test and returns on
+  # failure. Out of test_mode we panic. Stage 0 chooses based on the
+  # enclosing block's mode; stage 1 treats every assert identically for
+  # now — assertions outside tests panic, matching stage 0's behaviour.
+  let cc = emit_expr(src, cond, fns, variants)
+  concat_all([
+    "{ KaiValue *_c = ", cc,
+    "; if (!kai_truthy(_c)) { kai_prelude_panic(kai_str(\"assertion failed\")); } } "
+  ])
 }
 
 # ---- declaration emission ----
@@ -3373,7 +3564,7 @@ fn emit_fn_body(src: String, d: Decl, fns: [EFn], variants: [EVar]) : String {
   match d {
     DFn(_, name, params, _, body, _, _) -> {
       let sig = emit_fn_signature(name, params)
-      let body_c = emit_expr_hello(src, body, fns, variants)
+      let body_c = emit_expr(src, body, fns, variants)
       cat5(sig, " {\n    return ", body_c, ";\n", "}\n\n")
     }
     _ -> ""
