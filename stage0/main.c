@@ -1,17 +1,18 @@
 /*
  * stage 0: kaikai-minimal bootstrap compiler.
  *
- * Current state: lexer wired in. Flags:
+ * Flags:
  *   --tokens   print the token stream and exit
+ *   --ast      parse and print the AST and exit
  *   -h, --help show usage
- *
- * Parser, type checker, and emitter are filled in by later milestones.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "ast.h"
 #include "lexer.h"
+#include "parser.h"
 
 static char *read_file(const char *path, size_t *out_len) {
     FILE *fp = fopen(path, "rb");
@@ -34,8 +35,9 @@ static char *read_file(const char *path, size_t *out_len) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s [--tokens] <file.kai>\n"
+            "usage: %s [--tokens|--ast] <file.kai>\n"
             "  --tokens    print the token stream and exit\n"
+            "  --ast       parse and print the AST and exit\n"
             "  -h, --help  this help\n",
             prog);
 }
@@ -43,13 +45,15 @@ static void usage(const char *prog) {
 int main(int argc, char **argv) {
     const char *path = NULL;
     int dump_tokens = 0;
+    int dump_ast    = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         if (strcmp(a, "--tokens") == 0) { dump_tokens = 1; continue; }
+        if (strcmp(a, "--ast")    == 0) { dump_ast    = 1; continue; }
         if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(argv[0]); return 0; }
         if (a[0] == '-') { fprintf(stderr, "unknown flag: %s\n", a); usage(argv[0]); return 2; }
-        if (path)      { fprintf(stderr, "only one input file supported\n"); return 2; }
+        if (path)       { fprintf(stderr, "only one input file supported\n"); return 2; }
         path = a;
     }
 
@@ -63,7 +67,6 @@ int main(int argc, char **argv) {
     Token *toks = kai_lex(path, src, len, &n);
     if (!toks) { free(src); return 1; }
 
-    /* Report any lexer errors. */
     int had_errors = 0;
     for (size_t i = 0; i < n; ++i) {
         if (toks[i].kind == TK_ERROR) {
@@ -76,11 +79,23 @@ int main(int argc, char **argv) {
 
     if (dump_tokens) {
         kai_lex_dump(path, src, toks, n);
-    } else if (!had_errors) {
-        printf("kaic0: %s: %zu tokens (parser not implemented yet)\n", path, n);
+        free(toks); free(src);
+        return had_errors ? 1 : 0;
     }
 
+    if (had_errors) { free(toks); free(src); return 1; }
+
+    Node *prog = kai_parse(path, src, toks, n);
     free(toks);
+    if (!prog) { free(src); return 1; }
+
+    if (dump_ast) {
+        kai_dump_ast(prog);
+    } else {
+        printf("kaic0: %s: parsed OK (%zu top-level decls)\n", path, prog->n_children);
+    }
+
+    kai_free_node(prog);
     free(src);
-    return had_errors ? 1 : 0;
+    return 0;
 }
