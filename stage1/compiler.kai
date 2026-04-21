@@ -4507,43 +4507,75 @@ type Mode
   | MTest
   | MHelp
 
-type CliOptions = { mode: Mode, path: Option[String] }
+type CliOptions = { mode: Mode, path: Option[String], prelude: Option[String] }
+
+fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
+  CliOptions { mode: m, path: opts.path, prelude: opts.prelude }
+
+fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
+  CliOptions { mode: opts.mode, path: Some(p), prelude: opts.prelude }
+
+fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path, prelude: Some(p) }
 
 fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
   match rest {
     [] -> opts
     [a, ...more] -> {
       if a == "--tokens" {
-        parse_cli_loop(more, CliOptions { mode: MTokens, path: opts.path })
+        parse_cli_loop(more, cli_with_mode(opts, MTokens))
       } else if a == "--ast" {
-        parse_cli_loop(more, CliOptions { mode: MAst, path: opts.path })
+        parse_cli_loop(more, cli_with_mode(opts, MAst))
       } else if a == "--test" {
-        parse_cli_loop(more, CliOptions { mode: MTest, path: opts.path })
-      } else if a == "-h" {
-        parse_cli_loop(more, CliOptions { mode: MHelp, path: opts.path })
-      } else if a == "--help" {
-        parse_cli_loop(more, CliOptions { mode: MHelp, path: opts.path })
+        parse_cli_loop(more, cli_with_mode(opts, MTest))
+      } else if a == "-h" or a == "--help" {
+        parse_cli_loop(more, cli_with_mode(opts, MHelp))
+      } else if a == "--prelude" {
+        match more {
+          [p, ...rest2] -> parse_cli_loop(rest2, cli_with_prelude(opts, p))
+          [] -> {
+            eprint("kaic1: --prelude requires a file argument")
+            cli_with_mode(opts, MHelp)
+          }
+        }
       } else {
-        parse_cli_loop(more, CliOptions { mode: opts.mode, path: Some(a) })
+        parse_cli_loop(more, cli_with_path(opts, a))
       }
     }
   }
 }
 
 fn parse_cli(argv: [String]) : CliOptions {
-  parse_cli_loop(argv, CliOptions { mode: MDefault, path: None })
+  parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, prelude: None })
 }
 
 fn usage() : Unit {
-  eprint("usage: kaic1 [--tokens|--ast|--test] <file.kai>")
-  eprint("  default     lex, parse, check, and emit C to stdout")
-  eprint("  --tokens    print the token stream and exit")
-  eprint("  --ast       parse and print the AST and exit")
-  eprint("  --test      emit C wired to a test runner (runs test blocks)")
-  eprint("  -h, --help  this help")
+  eprint("usage: kaic1 [options] <file.kai>")
+  eprint("  --prelude <file>   include <file>'s decls before the input")
+  eprint("  --tokens           print the token stream and exit")
+  eprint("  --ast              parse and print the AST and exit")
+  eprint("  --test             emit C wired to a test runner (runs test blocks)")
+  eprint("  -h, --help         this help")
 }
 
-fn compile_source(path: String, mode: Mode, src: String) : Int {
+# Parse a prelude file and return its decl list. On any error report
+# to stderr and return None.
+fn load_prelude(path: String) : Option[[Decl]] {
+  match read_file(path) {
+    Err(msg) -> { eprint("kaic1: #{path}: #{msg}"); None }
+    Ok(src) -> {
+      let tokens = tokenize(src)
+      let errs = report_errors(path, src, tokens)
+      if errs != 0 { None }
+      else {
+        let parsed = parse_program(path, src, tokens)
+        parsed.decls
+      }
+    }
+  }
+}
+
+fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) : Int {
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
   match mode {
@@ -4558,16 +4590,19 @@ fn compile_source(path: String, mode: Mode, src: String) : Int {
         let parsed = parse_program(path, src, tokens)
         match parsed.decls {
           None -> 1
-          Some(decls) -> match mode {
-            MAst -> { dump_program(decls); 0 }
-            _ -> {
-              let chk = check_program(path, decls)
-              if chk != 0 { chk }
-              else {
-                let test_mode = match mode { MTest -> true _ -> false }
-                let out = emit_program(path, src, decls, test_mode)
-                print(out)
-                0
+          Some(own_decls) -> {
+            let all_decls = list_append(prelude_decls, own_decls)
+            match mode {
+              MAst -> { dump_program(all_decls); 0 }
+              _ -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk }
+                else {
+                  let test_mode = match mode { MTest -> true _ -> false }
+                  let out = emit_program(path, src, all_decls, test_mode)
+                  print(out)
+                  0
+                }
               }
             }
           }
@@ -4582,9 +4617,19 @@ fn run(opts: CliOptions) : Int {
     MHelp -> { usage(); 0 }
     _ -> match opts.path {
       None -> { usage(); 2 }
-      Some(p) -> match read_file(p) {
-        Ok(src) -> compile_source(p, opts.mode, src)
-        Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
+      Some(p) -> {
+        let prelude_decls =
+          match opts.prelude {
+            None -> Some([])
+            Some(pp) -> load_prelude(pp)
+          }
+        match prelude_decls {
+          None -> 1
+          Some(pds) -> match read_file(p) {
+            Ok(src) -> compile_source(p, opts.mode, src, pds)
+            Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
+          }
+        }
       }
     }
   }
