@@ -207,6 +207,21 @@ static uint32_t decode_char(const char *s, size_t len) {
 
 /* ---------- entry ---------- */
 
+Node *kai_parse_expr_standalone(const char *file, const char *src,
+                                const Token *toks, size_t n) {
+    P p;
+    p.file      = file;
+    p.src       = src;
+    p.toks      = toks;
+    p.n         = n;
+    p.i         = 0;
+    p.had_error = 0;
+    skip_newlines(&p);
+    Node *e = parse_expr(&p);
+    if (p.had_error) { kai_free_node(e); return NULL; }
+    return e;
+}
+
 Node *kai_parse(const char *file, const char *src,
                 const Token *toks, size_t n) {
     P p;

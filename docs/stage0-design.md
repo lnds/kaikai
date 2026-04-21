@@ -241,6 +241,7 @@ These are deliberately omitted — they are the job of stage 1 or later:
 - Tail-call optimization (we rely on `cc -O2` to do TCO for simple cases; deep recursion can blow the stack).
 - Specialization of generics (uniform boxing is enough).
 - Proper effect tracking (only a conventional `Io` soup).
+- The placeholder lambda shorthand `.` (e.g. `filter(. < 5)`): stage 0 requires the explicit arrow form `filter(x => x < 5)`. The shorthand is defined in `docs/kaikai-minimal.md` and will arrive in stage 1.
 - LLVM backend.
 - Package manager.
 - Incremental compilation.

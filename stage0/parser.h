@@ -13,4 +13,12 @@
 Node *kai_parse(const char *file, const char *src,
                 const Token *toks, size_t n);
 
+/*
+ * Parse a single expression from a token stream. Used by the emitter to
+ * handle expressions embedded inside string interpolation (#{...}).
+ * Returns NULL on error.
+ */
+Node *kai_parse_expr_standalone(const char *file, const char *src,
+                                const Token *toks, size_t n);
+
 #endif /* KAI_PARSER_H */

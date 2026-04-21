@@ -89,6 +89,9 @@ struct KaiValue {
 
 /* ---------- allocation and refcounting ---------- */
 
+/* Forward declarations used across sections. */
+static int       kai_truthy(KaiValue *v);
+
 static KaiValue *kai_alloc(KaiTag tag) {
     KaiValue *v = (KaiValue *) calloc(1, sizeof(KaiValue));
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
@@ -369,6 +372,12 @@ static KaiValue *kai_string_concat(KaiValue *a, KaiValue *b) {
 
 /* ---------- prelude: IO ---------- */
 
+/*
+ * Calling convention for the prelude: borrow semantics. Arguments are
+ * borrowed from the caller (no incref / no decref on them). Return
+ * values are owned by the caller.
+ */
+
 static KaiValue *kai_prelude_print(KaiValue *arg) {
     if (!arg) { fputc('\n', stdout); return kai_unit(); }
     if (arg->tag == KAI_STR) {
@@ -379,7 +388,6 @@ static KaiValue *kai_prelude_print(KaiValue *arg) {
         kai_decref(s);
     }
     fputc('\n', stdout);
-    kai_decref(arg);
     return kai_unit();
 }
 
@@ -393,7 +401,6 @@ static KaiValue *kai_prelude_eprint(KaiValue *arg) {
         kai_decref(s);
     }
     fputc('\n', stderr);
-    kai_decref(arg);
     return kai_unit();
 }
 
@@ -409,7 +416,6 @@ static KaiValue *kai_prelude_panic(KaiValue *msg) {
 
 static KaiValue *kai_prelude_exit(KaiValue *code) {
     int c = (code && code->tag == KAI_INT) ? (int) code->as.i : 0;
-    kai_decref(code);
     exit(c);
     return kai_unit();
 }
@@ -419,31 +425,24 @@ static KaiValue *kai_prelude_exit(KaiValue *code) {
 static KaiValue *kai_prelude_int_to_string(KaiValue *v) {
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long) v->as.i);
-    KaiValue *r = kai_str(buf);
-    kai_decref(v);
-    return r;
+    return kai_str(buf);
 }
 
 static KaiValue *kai_prelude_real_to_string(KaiValue *v) {
     char buf[64];
     snprintf(buf, sizeof(buf), "%g", v->as.r);
-    KaiValue *r = kai_str(buf);
-    kai_decref(v);
-    return r;
+    return kai_str(buf);
 }
 
 /* ---------- prelude: strings ---------- */
 
 static KaiValue *kai_prelude_string_length(KaiValue *s) {
     int64_t n = (s && s->tag == KAI_STR) ? (int64_t) s->as.s.len : 0;
-    kai_decref(s);
     return kai_int(n);
 }
 
 static KaiValue *kai_prelude_string_concat(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_string_concat(a, b);
-    kai_decref(a); kai_decref(b);
-    return r;
+    return kai_string_concat(a, b);
 }
 
 /* ---------- prelude: lists ---------- */
@@ -452,21 +451,13 @@ static KaiValue *kai_prelude_list_length(KaiValue *xs) {
     int64_t n = 0;
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) { n++; p = p->as.cons.tail; }
-    kai_decref(xs);
     return kai_int(n);
 }
 
 static KaiValue *kai_prelude_list_append(KaiValue *xs, KaiValue *ys) {
-    /* Build result from xs front, then attach ys. */
-    if (!xs || xs->tag == KAI_NIL) {
-        kai_decref(xs);
-        return ys;
-    }
-    KaiValue *head = kai_incref(xs->as.cons.head);
-    KaiValue *tail = kai_incref(xs->as.cons.tail);
-    kai_decref(xs);
-    KaiValue *rest = kai_prelude_list_append(tail, ys);
-    return kai_cons(head, rest);
+    if (!xs || xs->tag == KAI_NIL) return kai_incref(ys);
+    KaiValue *rest = kai_prelude_list_append(xs->as.cons.tail, ys);
+    return kai_cons(kai_incref(xs->as.cons.head), rest);
 }
 
 static KaiValue *kai_prelude_list_reverse(KaiValue *xs) {
@@ -476,70 +467,53 @@ static KaiValue *kai_prelude_list_reverse(KaiValue *xs) {
         acc = kai_cons(kai_incref(p->as.cons.head), acc);
         p   = p->as.cons.tail;
     }
-    kai_decref(xs);
     return acc;
 }
 
 /* ---------- prelude: higher order ---------- */
 
 static KaiValue *kai_prelude_map(KaiValue *xs, KaiValue *f) {
-    if (!xs || xs->tag == KAI_NIL) { kai_decref(xs); kai_decref(f); return kai_nil(); }
-    KaiValue **arg = (KaiValue **) malloc(sizeof(KaiValue *));
-    arg[0] = kai_incref(xs->as.cons.head);
-    KaiValue *head = kai_apply(f, 1, arg);
-    free(arg);
-    KaiValue *tail = kai_incref(xs->as.cons.tail);
-    KaiValue *rest = kai_prelude_map(tail, kai_incref(f));
-    kai_decref(xs); kai_decref(f);
+    if (!xs || xs->tag == KAI_NIL) return kai_nil();
+    KaiValue *arg0 = xs->as.cons.head;
+    KaiValue *head = kai_apply(f, 1, &arg0);
+    KaiValue *rest = kai_prelude_map(xs->as.cons.tail, f);
     return kai_cons(head, rest);
 }
 
 static KaiValue *kai_prelude_filter(KaiValue *xs, KaiValue *p) {
-    if (!xs || xs->tag == KAI_NIL) { kai_decref(xs); kai_decref(p); return kai_nil(); }
-    KaiValue **arg = (KaiValue **) malloc(sizeof(KaiValue *));
-    arg[0] = kai_incref(xs->as.cons.head);
-    KaiValue *keep = kai_apply(p, 1, arg);
-    free(arg);
-    int yes = keep && keep->tag == KAI_BOOL && keep->as.b;
+    if (!xs || xs->tag == KAI_NIL) return kai_nil();
+    KaiValue *arg0 = xs->as.cons.head;
+    KaiValue *keep = kai_apply(p, 1, &arg0);
+    int yes = kai_truthy(keep);
     kai_decref(keep);
-    KaiValue *tail = kai_incref(xs->as.cons.tail);
-    KaiValue *rest = kai_prelude_filter(tail, kai_incref(p));
-    if (yes) {
-        KaiValue *head = kai_incref(xs->as.cons.head);
-        kai_decref(xs); kai_decref(p);
-        return kai_cons(head, rest);
-    } else {
-        kai_decref(xs); kai_decref(p);
-        return rest;
-    }
+    KaiValue *rest = kai_prelude_filter(xs->as.cons.tail, p);
+    if (yes) return kai_cons(kai_incref(xs->as.cons.head), rest);
+    return rest;
 }
 
 static KaiValue *kai_prelude_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
-    KaiValue *acc = init;
+    KaiValue *acc = kai_incref(init);
     KaiValue *p   = xs;
     while (p && p->tag == KAI_CONS) {
-        KaiValue **args = (KaiValue **) malloc(2 * sizeof(KaiValue *));
+        KaiValue *args[2];
         args[0] = acc;
-        args[1] = kai_incref(p->as.cons.head);
-        acc = kai_apply(f, 2, args);
-        free(args);
+        args[1] = p->as.cons.head;
+        KaiValue *next = kai_apply(f, 2, args);
+        kai_decref(acc);
+        acc = next;
         p = p->as.cons.tail;
     }
-    kai_decref(xs); kai_decref(f);
     return acc;
 }
 
 static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) {
-        KaiValue **arg = (KaiValue **) malloc(sizeof(KaiValue *));
-        arg[0] = kai_incref(p->as.cons.head);
-        KaiValue *r = kai_apply(f, 1, arg);
-        free(arg);
+        KaiValue *arg0 = p->as.cons.head;
+        KaiValue *r = kai_apply(f, 1, &arg0);
         kai_decref(r);
         p = p->as.cons.tail;
     }
-    kai_decref(xs); kai_decref(f);
     return kai_unit();
 }
 

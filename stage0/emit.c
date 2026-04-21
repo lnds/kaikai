@@ -1,42 +1,64 @@
 /*
  * C emitter for kaikai-minimal.
  *
- * Milestone 7 scope: every expression form that fizzbuzz.kai needs —
- * if/else chains, binary and unary operators, let bindings, pipes,
- * range and list literals, and first-class references to user functions
- * and prelude functions (map, filter, each, reduce). String
- * interpolation (#{...}) still errors out; that is milestone 8.
+ * Covers everything the four canonical examples need: literals, binops
+ * and unops, if/else chains, match with list and variant patterns, let
+ * bindings, blocks, records (literals + field access), ranges and list
+ * literals, pipes, user fns and prelude fns as first-class values, and
+ * named lambdas (x => body) with capture analysis.
+ *
+ * String literals with #{...} interpolation are re-parsed and emitted
+ * as kai_string_concat chains that wrap each inner expression with
+ * kai_to_string.
+ *
+ * The placeholder `.` lambda shorthand is deliberately not supported
+ * in stage 0 — users must spell out `x => expr`. This keeps the emitter
+ * simpler; the restriction is listed in docs/stage0-design.md.
  */
 
 #include "emit.h"
 #include "ast.h"
 #include "lexer.h"
+#include "parser.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* ---------- emitter state ---------- */
+/* ---------- tables ---------- */
+
+typedef struct { const char *name; size_t len; int arity; } SymEntry;
 
 typedef struct {
-    const char *name;
+    const char *name;       /* capture name (borrowed from source) */
     size_t      len;
-    int         arity;
-} FnEntry;
+} Capture;
+
+typedef struct {
+    int    id;
+    Node  *lam;             /* the N_LAMBDA node */
+    Capture *caps;
+    int    n_caps;
+    int    cap_caps;
+} LamInfo;
 
 typedef struct {
     FILE *out;
     int   had_error;
 
-    FnEntry *fns;
-    size_t   n_fns;
-    size_t   cap_fns;
+    SymEntry *fns;      size_t n_fns, cap_fns;
+    SymEntry *variants; size_t n_variants, cap_variants;
+    LamInfo  *lams;     size_t n_lams, cap_lams;
 } E;
 
 /* ---------- forwards ---------- */
 
 static void emit_expr(E *e, Node *n);
 static void emit_stmt(E *e, Node *n);
+static void emit_pat_test(E *e, Node *pat, const char *scr);
+static void emit_pat_binds(E *e, Node *pat, const char *scr);
+static void emit_string_expr(E *e, Node *s);
+static void emit_lambda_ref(E *e, Node *lam);
 
 /* ---------- diagnostics ---------- */
 
@@ -51,7 +73,7 @@ static void bug(E *e, Node *n, const char *what) {
 
 static const struct {
     const char *k;
-    const char *c;            /* C symbol for direct call */
+    const char *c;
     int         arity;
 } PRELUDE[] = {
     { "print",          "kai_prelude_print",          1 },
@@ -84,35 +106,40 @@ static int find_prelude(const char *name, size_t len, int *out_arity, const char
     return 0;
 }
 
-/* ---------- user fn table ---------- */
+/* ---------- user fns + variants tables ---------- */
 
-static void register_fn(E *e, const char *name, size_t len, int arity) {
-    if (e->n_fns == e->cap_fns) {
-        e->cap_fns = e->cap_fns ? e->cap_fns * 2 : 16;
-        e->fns = (FnEntry *) realloc(e->fns, e->cap_fns * sizeof(FnEntry));
+static void reg_entry(SymEntry **arr, size_t *n, size_t *cap,
+                      const char *name, size_t len, int arity) {
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 16;
+        *arr = (SymEntry *) realloc(*arr, *cap * sizeof(SymEntry));
     }
-    e->fns[e->n_fns].name = name;
-    e->fns[e->n_fns].len = len;
-    e->fns[e->n_fns].arity = arity;
-    e->n_fns++;
+    (*arr)[*n].name = name;
+    (*arr)[*n].len  = len;
+    (*arr)[*n].arity = arity;
+    (*n)++;
 }
 
-static int find_user_fn(E *e, const char *name, size_t len, int *out_arity) {
-    for (size_t i = 0; i < e->n_fns; ++i) {
-        if (e->fns[i].len == len && memcmp(e->fns[i].name, name, len) == 0) {
-            if (out_arity) *out_arity = e->fns[i].arity;
+static int find_entry(SymEntry *arr, size_t n,
+                      const char *name, size_t len, int *out_arity) {
+    for (size_t i = 0; i < n; ++i) {
+        if (arr[i].len == len && memcmp(arr[i].name, name, len) == 0) {
+            if (out_arity) *out_arity = arr[i].arity;
             return 1;
         }
     }
     return 0;
 }
 
+static int find_user_fn(E *e, const char *name, size_t len, int *out_arity) {
+    return find_entry(e->fns, e->n_fns, name, len, out_arity);
+}
+static int find_variant(E *e, const char *name, size_t len, int *out_arity) {
+    return find_entry(e->variants, e->n_variants, name, len, out_arity);
+}
+
 /* ---------- identifier emission modes ---------- */
 
-/* As a direct callee (in a call position). Writes the C symbol; the caller
-   then writes arguments in parens. Returns 1 if this was a known callable
-   (prelude or user fn) — in which case a direct call is appropriate — or
-   0 otherwise. */
 static int emit_ident_callee(E *e, const char *name, size_t len) {
     const char *mapped = NULL;
     int arity = 0;
@@ -124,16 +151,17 @@ static int emit_ident_callee(E *e, const char *name, size_t len) {
         fprintf(e->out, "kai_%.*s", (int) len, name);
         return 1;
     }
-    /* Fall back: treat as a value that should be a closure (use kai_apply). */
     fprintf(e->out, "kai_%.*s", (int) len, name);
     return 0;
 }
 
-/* As a value (expression position). Functions are wrapped in closures;
-   variables are emitted as-is. */
 static void emit_ident_value(E *e, const char *name, size_t len) {
-    const char *mapped = NULL;
     int arity = 0;
+    const char *mapped = NULL;
+    if (find_variant(e, name, len, &arity)) {
+        fprintf(e->out, "kai_variant(0, \"%.*s\", 0, NULL)", (int) len, name);
+        return;
+    }
     if (find_prelude(name, len, &arity, &mapped)) {
         fprintf(e->out, "kai_closure(&_%s_thunk, %d, 0, NULL)", mapped, arity);
         return;
@@ -146,24 +174,92 @@ static void emit_ident_value(E *e, const char *name, size_t len) {
     fprintf(e->out, "kai_%.*s", (int) len, name);
 }
 
-/* ---------- string literal ---------- */
+/* ---------- lambda registration and capture analysis ---------- */
 
-static void emit_string_inner(E *e, const Node *s) {
-    const char *src = s->name;
-    size_t len = s->name_len;
-    int triple = (s->v.flags & 0x1) != 0;
-    size_t start = triple ? 3 : 1;
-    size_t end   = triple ? len - 3 : len - 1;
-    fputc('"', e->out);
-    for (size_t i = start; i < end; ++i) {
-        unsigned char c = (unsigned char) src[i];
-        if (c == '#' && i + 1 < end && src[i + 1] == '{') {
-            bug(e, (Node *) s, "string interpolation (#{...}) — arrives in M8");
-            break;
-        }
-        fputc(c, e->out);
+static int is_global_name(E *e, const char *name, size_t len) {
+    int a;
+    const char *c;
+    return find_prelude(name, len, &a, &c) ||
+           find_user_fn(e, name, len, &a) ||
+           find_variant(e, name, len, &a);
+}
+
+static int is_lambda_param(Node *lam, const char *name, size_t len) {
+    for (size_t i = 1; i < lam->n_children; ++i) {
+        Node *p = lam->children[i];
+        if (p && p->kind == N_IDENT &&
+            p->name_len == len && memcmp(p->name, name, len) == 0) return 1;
     }
-    fputc('"', e->out);
+    return 0;
+}
+
+static void add_capture(LamInfo *info, const char *name, size_t len) {
+    for (int i = 0; i < info->n_caps; ++i) {
+        if (info->caps[i].len == len &&
+            memcmp(info->caps[i].name, name, len) == 0) return;
+    }
+    if (info->n_caps == info->cap_caps) {
+        info->cap_caps = info->cap_caps ? info->cap_caps * 2 : 4;
+        info->caps = (Capture *) realloc(info->caps, info->cap_caps * sizeof(Capture));
+    }
+    info->caps[info->n_caps].name = name;
+    info->caps[info->n_caps].len  = len;
+    info->n_caps++;
+}
+
+static void collect_free_vars(E *e, Node *n, Node *lam, LamInfo *info) {
+    if (!n) return;
+    if (n->kind == N_LAMBDA) return;         /* inner lambdas have their own */
+    if (n->kind == N_IDENT) {
+        if (!is_lambda_param(lam, n->name, n->name_len) &&
+            !is_global_name(e, n->name, n->name_len)) {
+            add_capture(info, n->name, n->name_len);
+        }
+        return;
+    }
+    if (n->kind == N_FIELD) {
+        if (n->n_children >= 1) collect_free_vars(e, n->children[0], lam, info);
+        return;
+    }
+    if (n->kind == N_RECORD_LIT) {
+        for (size_t i = 0; i < n->n_children; ++i)
+            collect_free_vars(e, n->children[i], lam, info);
+        return;
+    }
+    for (size_t i = 0; i < n->n_children; ++i)
+        collect_free_vars(e, n->children[i], lam, info);
+}
+
+static LamInfo *register_lambda(E *e, Node *lam) {
+    if (e->n_lams == e->cap_lams) {
+        e->cap_lams = e->cap_lams ? e->cap_lams * 2 : 8;
+        e->lams = (LamInfo *) realloc(e->lams, e->cap_lams * sizeof(LamInfo));
+    }
+    LamInfo *info = &e->lams[e->n_lams];
+    memset(info, 0, sizeof(LamInfo));
+    info->id  = (int) e->n_lams;
+    info->lam = lam;
+    e->n_lams++;
+    if (lam->n_children >= 1) collect_free_vars(e, lam->children[0], lam, info);
+    return info;
+}
+
+static void collect_lambdas(E *e, Node *n) {
+    if (!n) return;
+    if (n->kind == N_LAMBDA) {
+        register_lambda(e, n);
+        /* Recurse into the body for nested lambdas. */
+        if (n->n_children >= 1) collect_lambdas(e, n->children[0]);
+        return;
+    }
+    for (size_t i = 0; i < n->n_children; ++i) collect_lambdas(e, n->children[i]);
+}
+
+static LamInfo *find_lam_info(E *e, Node *lam) {
+    for (size_t i = 0; i < e->n_lams; ++i) {
+        if (e->lams[i].lam == lam) return &e->lams[i];
+    }
+    return NULL;
 }
 
 /* ---------- operator helpers ---------- */
@@ -221,7 +317,7 @@ static void emit_unop(E *e, Node *n) {
     fputc(')', e->out);
 }
 
-/* ---------- if / call / pipe / range / list ---------- */
+/* ---------- if / call / pipe / range / list / record / field ---------- */
 
 static void emit_if(E *e, Node *n) {
     Node *cond = n->children[0];
@@ -235,40 +331,63 @@ static void emit_if(E *e, Node *n) {
     fputc(')', e->out);
 }
 
-static void emit_args(E *e, Node *call_or_null, Node *prepended) {
+static void emit_args_with_prepend(E *e, Node *call, Node *prepended) {
     int first = 1;
     fputc('(', e->out);
     if (prepended) { emit_expr(e, prepended); first = 0; }
-    if (call_or_null) {
-        for (size_t i = 1; i < call_or_null->n_children; ++i) {
+    if (call) {
+        for (size_t i = 1; i < call->n_children; ++i) {
             if (!first) fputs(", ", e->out);
             first = 0;
-            emit_expr(e, call_or_null->children[i]);
+            emit_expr(e, call->children[i]);
         }
     }
     fputc(')', e->out);
 }
 
+static void emit_variant_construction(E *e, const char *name, size_t name_len,
+                                       Node *call_or_null) {
+    /* Emits kai_variant(0, "<Name>", n_args, <args array>). */
+    size_t n_args = call_or_null ? (call_or_null->n_children - 1) : 0;
+    fprintf(e->out, "kai_variant(0, \"%.*s\", %d, ", (int) name_len, name, (int) n_args);
+    if (n_args == 0) {
+        fputs("NULL)", e->out);
+    } else {
+        fputs("(KaiValue *[]){", e->out);
+        for (size_t i = 1; i < call_or_null->n_children; ++i) {
+            if (i > 1) fputs(", ", e->out);
+            emit_expr(e, call_or_null->children[i]);
+        }
+        fputs("})", e->out);
+    }
+}
+
 static void emit_call(E *e, Node *n) {
     Node *callee = n->children[0];
     if (callee && callee->kind == N_IDENT) {
+        int arity = 0;
+        if (find_variant(e, callee->name, callee->name_len, &arity)) {
+            emit_variant_construction(e, callee->name, callee->name_len, n);
+            return;
+        }
         int handled = emit_ident_callee(e, callee->name, callee->name_len);
         if (handled) {
-            emit_args(e, n, NULL);
-        } else {
-            /* Fallback via kai_apply on a closure stored in a variable. */
-            fprintf(e->out, "kai_apply(%.*s, %d, (KaiValue *[]){",
-                    (int) callee->name_len + 4, "kai_", /* prefix */
-                    (int) (n->n_children - 1));
-            for (size_t i = 1; i < n->n_children; ++i) {
-                if (i > 1) fputs(", ", e->out);
-                emit_expr(e, n->children[i]);
-            }
-            fputs("})", e->out);
+            emit_args_with_prepend(e, n, NULL);
+            return;
         }
+        /* Variable holding a closure. */
+        fputs("kai_apply(", e->out);
+        fprintf(e->out, "kai_%.*s, %d, (KaiValue *[]){",
+                (int) callee->name_len, callee->name,
+                (int) (n->n_children - 1));
+        for (size_t i = 1; i < n->n_children; ++i) {
+            if (i > 1) fputs(", ", e->out);
+            emit_expr(e, n->children[i]);
+        }
+        fputs("})", e->out);
         return;
     }
-    /* Non-ident callee: treat as value that should be a closure. */
+    /* Non-ident callee. */
     fputs("kai_apply(", e->out);
     emit_expr(e, callee);
     fprintf(e->out, ", %d, (KaiValue *[]){", (int) (n->n_children - 1));
@@ -285,13 +404,23 @@ static void emit_pipe(E *e, Node *n) {
     if (rhs && rhs->kind == N_CALL) {
         Node *callee = rhs->children[0];
         if (callee && callee->kind == N_IDENT) {
-            int handled = emit_ident_callee(e, callee->name, callee->name_len);
-            if (handled) {
-                emit_args(e, rhs, lhs);
+            int arity = 0;
+            if (find_variant(e, callee->name, callee->name_len, &arity)) {
+                /* Variant constructor with piped first arg. */
+                fprintf(e->out, "kai_variant(0, \"%.*s\", %d, (KaiValue *[]){",
+                        (int) callee->name_len, callee->name,
+                        (int) rhs->n_children);
+                emit_expr(e, lhs);
+                for (size_t i = 1; i < rhs->n_children; ++i) {
+                    fputs(", ", e->out);
+                    emit_expr(e, rhs->children[i]);
+                }
+                fputs("})", e->out);
                 return;
             }
+            int handled = emit_ident_callee(e, callee->name, callee->name_len);
+            if (handled) { emit_args_with_prepend(e, rhs, lhs); return; }
         }
-        /* Fallback: apply rhs's callee as a closure with lhs prepended. */
         fputs("kai_apply(", e->out);
         emit_expr(e, callee);
         fprintf(e->out, ", %d, (KaiValue *[]){", (int) rhs->n_children);
@@ -311,7 +440,6 @@ static void emit_pipe(E *e, Node *n) {
             fputc(')', e->out);
             return;
         }
-        /* Apply closure stored in variable. */
         fputs("kai_apply(", e->out);
         emit_expr(e, rhs);
         fputs(", 1, (KaiValue *[]){", e->out);
@@ -326,18 +454,13 @@ static void emit_range(E *e, Node *n) {
     int has_step = (n->v.flags & 0x1) != 0;
     if (has_step) {
         fputs("kai_range_step(", e->out);
-        emit_expr(e, n->children[0]);
-        fputs(", ", e->out);
-        emit_expr(e, n->children[1]);
-        fputs(", ", e->out);
-        emit_expr(e, n->children[2]);
-        fputc(')', e->out);
+        emit_expr(e, n->children[0]); fputs(", ", e->out);
+        emit_expr(e, n->children[1]); fputs(", ", e->out);
+        emit_expr(e, n->children[2]); fputc(')', e->out);
     } else {
         fputs("kai_range(", e->out);
-        emit_expr(e, n->children[0]);
-        fputs(", ", e->out);
-        emit_expr(e, n->children[1]);
-        fputc(')', e->out);
+        emit_expr(e, n->children[0]); fputs(", ", e->out);
+        emit_expr(e, n->children[1]); fputc(')', e->out);
     }
 }
 
@@ -359,8 +482,333 @@ static void emit_list_tail(E *e, Node *lit, size_t i) {
     }
 }
 
-static void emit_list(E *e, Node *n) {
-    emit_list_tail(e, n, 0);
+static void emit_list(E *e, Node *n) { emit_list_tail(e, n, 0); }
+
+static void emit_record_lit(E *e, Node *n) {
+    int nf = (int) n->n_children;
+    fprintf(e->out, "kai_record(%d, (KaiValue *[]){", nf);
+    for (int i = 0; i < nf; ++i) {
+        if (i > 0) fputs(", ", e->out);
+        Node *fi = n->children[i];
+        emit_expr(e, fi->children[0]);
+    }
+    fputs("}, (const char *[]){", e->out);
+    for (int i = 0; i < nf; ++i) {
+        if (i > 0) fputs(", ", e->out);
+        Node *fi = n->children[i];
+        fprintf(e->out, "\"%.*s\"", (int) fi->name_len, fi->name);
+    }
+    fputs("})", e->out);
+}
+
+static void emit_field_access(E *e, Node *n) {
+    fputs("kai_field(", e->out);
+    emit_expr(e, n->children[0]);
+    fprintf(e->out, ", \"%.*s\")", (int) n->name_len, n->name);
+}
+
+/* ---------- match ---------- */
+
+static void emit_pat_test(E *e, Node *pat, const char *scr) {
+    switch (pat->kind) {
+        case N_PAT_WILD:
+        case N_PAT_BIND:
+            fputs("1", e->out); return;
+
+        case N_PAT_LIT: {
+            Node *lit = pat->children[0];
+            fprintf(e->out, "kai_eq(%s, ", scr);
+            emit_expr(e, lit);
+            fputc(')', e->out);
+            return;
+        }
+
+        case N_PAT_LIST: {
+            int has_rest = (pat->v.flags & 0x1) != 0;
+            size_t n_fixed = has_rest ? (pat->n_children - 1) : pat->n_children;
+
+            if (n_fixed == 0 && !has_rest) {
+                fprintf(e->out, "(%s && %s->tag == KAI_NIL)", scr, scr);
+                return;
+            }
+
+            fputs("(", e->out);
+            char cur[512];
+            snprintf(cur, sizeof(cur), "%s", scr);
+            int first = 1;
+            for (size_t i = 0; i < n_fixed; ++i) {
+                if (!first) fputs(" && ", e->out);
+                first = 0;
+                fprintf(e->out, "%s && %s->tag == KAI_CONS && ", cur, cur);
+                char head[512];
+                snprintf(head, sizeof(head), "%s->as.cons.head", cur);
+                emit_pat_test(e, pat->children[i], head);
+                char nxt[512];
+                snprintf(nxt, sizeof(nxt), "%s->as.cons.tail", cur);
+                memcpy(cur, nxt, sizeof(cur));
+            }
+            if (!has_rest) {
+                if (!first) fputs(" && ", e->out);
+                fprintf(e->out, "%s && %s->tag == KAI_NIL", cur, cur);
+            }
+            fputs(")", e->out);
+            return;
+        }
+
+        case N_PAT_VARIANT: {
+            fprintf(e->out, "(%s && %s->tag == KAI_VARIANT && strcmp(%s->as.var.variant_name, \"%.*s\") == 0",
+                    scr, scr, scr, (int) pat->name_len, pat->name);
+            for (size_t i = 0; i < pat->n_children; ++i) {
+                fputs(" && ", e->out);
+                char sub[512];
+                snprintf(sub, sizeof(sub), "%s->as.var.args[%zu]", scr, i);
+                emit_pat_test(e, pat->children[i], sub);
+            }
+            fputs(")", e->out);
+            return;
+        }
+
+        case N_PAT_RECORD: {
+            fprintf(e->out, "(%s && %s->tag == KAI_RECORD", scr, scr);
+            for (size_t i = 0; i < pat->n_children; ++i) {
+                Node *pf = pat->children[i];
+                char tmp[512];
+                snprintf(tmp, sizeof(tmp),
+                         "kai_field(%s, \"%.*s\")", scr,
+                         (int) pf->name_len, pf->name);
+                fputs(" && (", e->out);
+                emit_pat_test(e, pf->children[0], tmp);
+                fputs(")", e->out);
+            }
+            fputs(")", e->out);
+            return;
+        }
+
+        default:
+            bug(e, pat, nk_name(pat->kind));
+            fputs("0", e->out);
+            return;
+    }
+}
+
+static void emit_pat_binds(E *e, Node *pat, const char *scr) {
+    switch (pat->kind) {
+        case N_PAT_WILD:
+        case N_PAT_LIT:
+            return;
+
+        case N_PAT_BIND:
+            fprintf(e->out, "KaiValue *kai_%.*s = %s; ",
+                    (int) pat->name_len, pat->name, scr);
+            return;
+
+        case N_PAT_LIST: {
+            int has_rest = (pat->v.flags & 0x1) != 0;
+            size_t n_fixed = has_rest ? (pat->n_children - 1) : pat->n_children;
+            char cur[512];
+            snprintf(cur, sizeof(cur), "%s", scr);
+            for (size_t i = 0; i < n_fixed; ++i) {
+                char head[512];
+                snprintf(head, sizeof(head), "%s->as.cons.head", cur);
+                emit_pat_binds(e, pat->children[i], head);
+                char nxt[512];
+                snprintf(nxt, sizeof(nxt), "%s->as.cons.tail", cur);
+                memcpy(cur, nxt, sizeof(cur));
+            }
+            if (has_rest) {
+                Node *rest_pat = pat->children[n_fixed];
+                emit_pat_binds(e, rest_pat, cur);
+            }
+            return;
+        }
+
+        case N_PAT_VARIANT: {
+            for (size_t i = 0; i < pat->n_children; ++i) {
+                char sub[512];
+                snprintf(sub, sizeof(sub), "%s->as.var.args[%zu]", scr, i);
+                emit_pat_binds(e, pat->children[i], sub);
+            }
+            return;
+        }
+
+        case N_PAT_RECORD: {
+            for (size_t i = 0; i < pat->n_children; ++i) {
+                Node *pf = pat->children[i];
+                char tmp[512];
+                snprintf(tmp, sizeof(tmp),
+                         "kai_field(%s, \"%.*s\")", scr,
+                         (int) pf->name_len, pf->name);
+                emit_pat_binds(e, pf->children[0], tmp);
+            }
+            return;
+        }
+
+        default: return;
+    }
+}
+
+static void emit_match(E *e, Node *m) {
+    fputs("({ KaiValue *_scr = ", e->out);
+    emit_expr(e, m->children[0]);
+    fputs("; KaiValue *_r = kai_unit(); do {\n", e->out);
+    for (size_t i = 1; i < m->n_children; ++i) {
+        Node *arm = m->children[i];
+        int has_guard = (arm->v.flags & 0x1) != 0;
+        Node *pat = arm->children[0];
+        Node *guard = has_guard ? arm->children[1] : NULL;
+        Node *body = arm->children[has_guard ? 2 : 1];
+
+        fputs("    if (", e->out);
+        emit_pat_test(e, pat, "_scr");
+        fputs(") { ", e->out);
+        emit_pat_binds(e, pat, "_scr");
+        if (has_guard) {
+            fputs("if (kai_truthy(", e->out);
+            emit_expr(e, guard);
+            fputs(")) { _r = ", e->out);
+            emit_expr(e, body);
+            fputs("; break; } } ", e->out);
+        } else {
+            fputs("_r = ", e->out);
+            emit_expr(e, body);
+            fputs("; break; }\n", e->out);
+        }
+    }
+    fputs("    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n", e->out);
+    fputs("} while (0); _r; })", e->out);
+}
+
+/* ---------- string literal (with interpolation) ---------- */
+
+static void write_c_string_slice(FILE *out, const char *src, size_t start, size_t end) {
+    fputc('"', out);
+    for (size_t i = start; i < end; ++i) {
+        unsigned char c = (unsigned char) src[i];
+        fputc(c, out);
+    }
+    fputc('"', out);
+}
+
+static void emit_string_expr(E *e, Node *s) {
+    const char *src = s->name;
+    size_t len = s->name_len;
+    int triple = (s->v.flags & 0x1) != 0;
+    size_t start = triple ? 3 : 1;
+    size_t end   = triple ? len - 3 : len - 1;
+
+    /* Collect parts in order. */
+    typedef struct {
+        int        is_expr;
+        size_t     lit_start, lit_end;
+        const char *expr_src;
+        size_t     expr_src_len;
+    } Part;
+    Part parts[64];
+    int  n_parts = 0;
+
+    size_t i = start;
+    size_t lit_start = start;
+    while (i < end) {
+        if (src[i] == '#' && i + 1 < end && src[i + 1] == '{') {
+            if (i > lit_start) {
+                parts[n_parts].is_expr = 0;
+                parts[n_parts].lit_start = lit_start;
+                parts[n_parts].lit_end   = i;
+                n_parts++;
+            }
+            i += 2;
+            size_t expr_start = i;
+            int depth = 1;
+            while (i < end && depth > 0) {
+                if      (src[i] == '{') depth++;
+                else if (src[i] == '}') { depth--; if (depth == 0) break; }
+                ++i;
+            }
+            parts[n_parts].is_expr      = 1;
+            parts[n_parts].expr_src     = src + expr_start;
+            parts[n_parts].expr_src_len = i - expr_start;
+            n_parts++;
+            if (i < end) i++;              /* past } */
+            lit_start = i;
+        } else {
+            ++i;
+        }
+    }
+    if (lit_start < end) {
+        parts[n_parts].is_expr = 0;
+        parts[n_parts].lit_start = lit_start;
+        parts[n_parts].lit_end   = end;
+        n_parts++;
+    }
+
+    if (n_parts == 0) { fputs("kai_str(\"\")", e->out); return; }
+
+    /* Emit as nested kai_string_concat. */
+    for (int k = 0; k < n_parts - 1; ++k) fputs("kai_string_concat(", e->out);
+    for (int k = 0; k < n_parts; ++k) {
+        if (k > 0) fputs(", ", e->out);
+        if (parts[k].is_expr) {
+            /* Parse and emit. Interpolations may introduce new lambdas;
+               collect and register them before emitting. */
+            size_t ntk = 0;
+            Token *toks = kai_lex("<interp>", parts[k].expr_src, parts[k].expr_src_len, &ntk);
+            Node *en = kai_parse_expr_standalone("<interp>", parts[k].expr_src, toks, ntk);
+            if (!en) { bug(e, s, "failed to parse interpolation"); fputs("kai_str(\"\")", e->out); }
+            else {
+                collect_lambdas(e, en);
+                fputs("kai_to_string(", e->out);
+                emit_expr(e, en);
+                fputc(')', e->out);
+                kai_free_node(en);
+            }
+            free(toks);
+        } else {
+            fputs("kai_str(", e->out);
+            write_c_string_slice(e->out, src, parts[k].lit_start, parts[k].lit_end);
+            fputc(')', e->out);
+        }
+        if (k > 0) fputc(')', e->out);
+    }
+}
+
+/* ---------- lambda ---------- */
+
+static void emit_lambda_ref(E *e, Node *lam) {
+    LamInfo *info = find_lam_info(e, lam);
+    if (!info) { bug(e, lam, "unregistered lambda"); return; }
+    int n_params = (int) lam->n_children - 1;
+    fprintf(e->out, "kai_closure(&_kai_lam_%d, %d, %d, ",
+            info->id, n_params, info->n_caps);
+    if (info->n_caps == 0) {
+        fputs("NULL)", e->out);
+    } else {
+        fputs("(KaiValue *[]){", e->out);
+        for (int i = 0; i < info->n_caps; ++i) {
+            if (i > 0) fputs(", ", e->out);
+            fprintf(e->out, "kai_%.*s", (int) info->caps[i].len, info->caps[i].name);
+        }
+        fputs("})", e->out);
+    }
+}
+
+static void emit_lambda_helper_def(E *e, LamInfo *info) {
+    Node *lam = info->lam;
+    int n_params = (int) lam->n_children - 1;
+    fprintf(e->out, "static KaiValue *_kai_lam_%d(KaiValue *self, KaiValue **args, int n) {\n",
+            info->id);
+    fputs("    (void) self; (void) n;\n", e->out);
+    for (int i = 0; i < n_params; ++i) {
+        Node *p = lam->children[1 + i];
+        fprintf(e->out, "    KaiValue *kai_%.*s = args[%d];\n",
+                (int) p->name_len, p->name, i);
+    }
+    for (int i = 0; i < info->n_caps; ++i) {
+        fprintf(e->out, "    KaiValue *kai_%.*s = self->as.clo.captures[%d];\n",
+                (int) info->caps[i].len, info->caps[i].name, i);
+    }
+    fputs("    return ", e->out);
+    emit_expr(e, lam->children[0]);
+    fputs(";\n}\n\n", e->out);
 }
 
 /* ---------- expression dispatch ---------- */
@@ -374,20 +822,19 @@ static void emit_expr(E *e, Node *n) {
         case N_INT:  fprintf(e->out, "kai_int(%lldLL)", (long long) n->v.i); return;
         case N_REAL: fprintf(e->out, "kai_real(%.17g)", n->v.r); return;
         case N_CHAR: fprintf(e->out, "kai_char(0x%08X)", (unsigned) n->v.c); return;
-        case N_STRING:
-            fputs("kai_str(", e->out);
-            emit_string_inner(e, n);
-            fputc(')', e->out);
-            return;
-
-        case N_IDENT:       emit_ident_value(e, n->name, n->name_len); return;
-        case N_CALL:        emit_call(e, n);     return;
-        case N_PIPE:        emit_pipe(e, n);     return;
-        case N_BINOP:       emit_binop(e, n);    return;
-        case N_UNOP:        emit_unop(e, n);     return;
-        case N_IF:          emit_if(e, n);       return;
-        case N_RANGE_LIT:   emit_range(e, n);    return;
-        case N_LIST_LIT:    emit_list(e, n);     return;
+        case N_STRING:     emit_string_expr(e, n); return;
+        case N_IDENT:      emit_ident_value(e, n->name, n->name_len); return;
+        case N_CALL:       emit_call(e, n);     return;
+        case N_PIPE:       emit_pipe(e, n);     return;
+        case N_BINOP:      emit_binop(e, n);    return;
+        case N_UNOP:       emit_unop(e, n);     return;
+        case N_IF:         emit_if(e, n);       return;
+        case N_RANGE_LIT:  emit_range(e, n);    return;
+        case N_LIST_LIT:   emit_list(e, n);     return;
+        case N_MATCH:      emit_match(e, n);    return;
+        case N_RECORD_LIT: emit_record_lit(e, n); return;
+        case N_FIELD:      emit_field_access(e, n); return;
+        case N_LAMBDA:     emit_lambda_ref(e, n); return;
 
         case N_BLOCK: {
             size_t n_stmts = (n->n_children > 0) ? n->n_children - 1 : 0;
@@ -402,17 +849,13 @@ static void emit_expr(E *e, Node *n) {
             return;
         }
 
-        case N_FIELD:
-        case N_INDEX:
-        case N_MATCH:
-        case N_LAMBDA:
-        case N_RECORD_LIT:
-        case N_SPREAD:
         case N_PLACEHOLDER:
-            bug(e, n, nk_name(n->kind));
+            bug(e, n, "placeholder `.` — use explicit `x => expr` in stage 0");
             fputs("kai_unit()", e->out);
             return;
 
+        case N_INDEX:
+        case N_SPREAD:
         default:
             bug(e, n, nk_name(n->kind));
             fputs("kai_unit()", e->out);
@@ -422,33 +865,36 @@ static void emit_expr(E *e, Node *n) {
 
 /* ---------- statements ---------- */
 
+static void emit_let(E *e, Node *n) {
+    Node *pat = n->children[0];
+    Node *val = n->children[2];
+    if (pat->kind == N_PAT_BIND) {
+        fprintf(e->out, "KaiValue *kai_%.*s = ", (int) pat->name_len, pat->name);
+        emit_expr(e, val);
+        fputs(";", e->out);
+        return;
+    }
+    /* Destructuring let: bind a temp, emit pattern bindings referencing it. */
+    fputs("KaiValue *_letv = ", e->out);
+    emit_expr(e, val);
+    fputs("; ", e->out);
+    emit_pat_binds(e, pat, "_letv");
+}
+
 static void emit_stmt(E *e, Node *n) {
     if (!n) return;
     switch (n->kind) {
-        case N_LET: {
-            Node *pat = n->children[0];
-            Node *val = n->children[2];
-            if (pat->kind != N_PAT_BIND) {
-                bug(e, n, "let with destructuring pattern (arrives in M8)");
-                return;
-            }
-            fprintf(e->out, "KaiValue *kai_%.*s = ", (int) pat->name_len, pat->name);
-            emit_expr(e, val);
-            fputs(";", e->out);
-            return;
-        }
-        case N_ASSERT: {
+        case N_LET:       emit_let(e, n); return;
+        case N_ASSERT:
             fputs("{ KaiValue *_c = ", e->out);
             emit_expr(e, n->children[0]);
             fputs("; if (!kai_truthy(_c)) { kai_prelude_panic(kai_str(\"assertion failed\")); } }", e->out);
             return;
-        }
-        case N_EXPR_STMT: {
+        case N_EXPR_STMT:
             fputs("{ KaiValue *_ = ", e->out);
             emit_expr(e, n->children[0]);
             fputs("; (void) _; }", e->out);
             return;
-        }
         default:
             fputs("{ KaiValue *_ = ", e->out);
             emit_expr(e, n);
@@ -503,11 +949,62 @@ static int has_main(Node *prog) {
     for (size_t i = 0; i < prog->n_children; ++i) {
         Node *d = prog->children[i];
         if (d && d->kind == N_FN &&
-            d->name_len == 4 && memcmp(d->name, "main", 4) == 0) {
-            return 1;
-        }
+            d->name_len == 4 && memcmp(d->name, "main", 4) == 0) return 1;
     }
     return 0;
+}
+
+/* ---------- top-level passes ---------- */
+
+static void register_top_level_fns(E *e, Node *prog) {
+    for (size_t i = 0; i < prog->n_children; ++i) {
+        Node *d = prog->children[i];
+        if (d && d->kind == N_FN) {
+            int arity = 0;
+            for (size_t j = 2; j < d->n_children; ++j) {
+                Node *p = d->children[j];
+                if (p && p->kind == N_PARAM) arity++;
+            }
+            reg_entry(&e->fns, &e->n_fns, &e->cap_fns, d->name, d->name_len, arity);
+        }
+    }
+}
+
+static void register_builtin_variants(E *e) {
+    static const struct { const char *n; int a; } B[] = {
+        { "Some", 1 }, { "None", 0 }, { "Ok", 1 }, { "Err", 1 }
+    };
+    for (size_t i = 0; i < sizeof(B) / sizeof(B[0]); ++i) {
+        reg_entry(&e->variants, &e->n_variants, &e->cap_variants,
+                  B[i].n, strlen(B[i].n), B[i].a);
+    }
+}
+
+static void register_user_variants(E *e, Node *prog) {
+    for (size_t i = 0; i < prog->n_children; ++i) {
+        Node *d = prog->children[i];
+        if (!d || d->kind != N_TYPE_DECL) continue;
+        if (d->n_children < 1) continue;
+        Node *body = d->children[0];
+        if (!body || body->kind != N_TY_SUM) continue;
+        for (size_t j = 0; j < body->n_children; ++j) {
+            Node *v = body->children[j];
+            if (v && v->kind == N_VARIANT) {
+                reg_entry(&e->variants, &e->n_variants, &e->cap_variants,
+                          v->name, v->name_len, (int) v->n_children);
+            }
+        }
+    }
+}
+
+static void collect_all_lambdas(E *e, Node *prog) {
+    for (size_t i = 0; i < prog->n_children; ++i) {
+        Node *d = prog->children[i];
+        if (!d) continue;
+        if (d->kind == N_FN) collect_lambdas(e, d->children[1]);
+        else if (d->kind == N_TEST && d->n_children >= 1)
+            collect_lambdas(e, d->children[0]);
+    }
 }
 
 int kai_emit(Node *program, FILE *out) {
@@ -515,18 +1012,10 @@ int kai_emit(Node *program, FILE *out) {
     memset(&e, 0, sizeof(e));
     e.out = out;
 
-    /* Pre-register all top-level fns so forward references resolve. */
-    for (size_t i = 0; i < program->n_children; ++i) {
-        Node *d = program->children[i];
-        if (d && d->kind == N_FN) {
-            int arity = 0;
-            for (size_t j = 2; j < d->n_children; ++j) {
-                Node *p = d->children[j];
-                if (p && p->kind == N_PARAM) arity++;
-            }
-            register_fn(&e, d->name, d->name_len, arity);
-        }
-    }
+    register_top_level_fns(&e, program);
+    register_builtin_variants(&e);
+    register_user_variants(&e, program);
+    collect_all_lambdas(&e, program);
 
     fprintf(out, "/* generated by kaikai-minimal stage 0 */\n");
     fprintf(out, "#include \"runtime.h\"\n\n");
@@ -541,7 +1030,6 @@ int kai_emit(Node *program, FILE *out) {
     }
     fputc('\n', out);
 
-    /* Thunk forward declarations (for first-class fn refs). */
     for (size_t i = 0; i < program->n_children; ++i) {
         Node *d = program->children[i];
         if (d && d->kind == N_FN) {
@@ -551,7 +1039,14 @@ int kai_emit(Node *program, FILE *out) {
     }
     fputc('\n', out);
 
-    /* Function bodies and thunks. */
+    /* Lambda helper forward declarations. */
+    for (size_t i = 0; i < e.n_lams; ++i) {
+        fprintf(out, "static KaiValue *_kai_lam_%d(KaiValue *, KaiValue **, int);\n",
+                e.lams[i].id);
+    }
+    fputc('\n', out);
+
+    /* Function bodies and their thunks. */
     for (size_t i = 0; i < program->n_children; ++i) {
         Node *d = program->children[i];
         if (!d) continue;
@@ -559,6 +1054,11 @@ int kai_emit(Node *program, FILE *out) {
             emit_fn_body(&e, d);
             emit_fn_thunk(&e, d);
         }
+    }
+
+    /* Lambda helper bodies. */
+    for (size_t i = 0; i < e.n_lams; ++i) {
+        emit_lambda_helper_def(&e, &e.lams[i]);
     }
 
     if (has_main(program)) {
@@ -569,6 +1069,10 @@ int kai_emit(Node *program, FILE *out) {
               "}\n", out);
     }
 
+    /* Free tables. */
     free(e.fns);
+    free(e.variants);
+    for (size_t i = 0; i < e.n_lams; ++i) free(e.lams[i].caps);
+    free(e.lams);
     return e.had_error ? 1 : 0;
 }
