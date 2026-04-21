@@ -152,6 +152,7 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 ## Open decisions
 
 - **Concrete syntax consolidation**: eliminate redundancies (`let`/`:=`, `switch`/`cond`/`match`, `|` vs `|>`, collections `[]`/`()`/`{}`, atoms/structs/maps). *Deferred until kaikai-minimal stabilizes.*
+- **LLM-friendly extensions**: a catalogue of typed-holes-adjacent features — principled `todo!`, type-query JSON, exhaustiveness counterexamples, `axiom`, effect holes, import holes, canonical-form lints. All proposed, none adopted. Each follows the typed-holes output contract (human text + stable JSON). Full list, costs, and adoption criteria in `docs/proposed-extensions.md`.
 
 ## Roadmap
 
