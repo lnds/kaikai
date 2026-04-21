@@ -543,6 +543,160 @@ static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
     return kai_unit();
 }
 
+/* ---------- binary and unary operators ---------- */
+
+static KaiValue *kai_add(KaiValue *a, KaiValue *b) {
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_int(a->as.i + b->as.i);
+    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_real(a->as.r + b->as.r);
+    fprintf(stderr, "kai: type mismatch in +\n"); exit(1);
+}
+
+static KaiValue *kai_sub(KaiValue *a, KaiValue *b) {
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_int(a->as.i - b->as.i);
+    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_real(a->as.r - b->as.r);
+    fprintf(stderr, "kai: type mismatch in -\n"); exit(1);
+}
+
+static KaiValue *kai_mul(KaiValue *a, KaiValue *b) {
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_int(a->as.i * b->as.i);
+    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_real(a->as.r * b->as.r);
+    fprintf(stderr, "kai: type mismatch in *\n"); exit(1);
+}
+
+static KaiValue *kai_div(KaiValue *a, KaiValue *b) {
+    if (a->tag == KAI_INT && b->tag == KAI_INT) {
+        if (b->as.i == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); }
+        return kai_int(a->as.i / b->as.i);
+    }
+    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_real(a->as.r / b->as.r);
+    fprintf(stderr, "kai: type mismatch in /\n"); exit(1);
+}
+
+static KaiValue *kai_idiv(KaiValue *a, KaiValue *b) {
+    int64_t av = 0, bv = 0;
+    if      (a->tag == KAI_INT)  av = a->as.i;
+    else if (a->tag == KAI_REAL) av = (int64_t) a->as.r;
+    else { fprintf(stderr, "kai: type mismatch in //\n"); exit(1); }
+    if      (b->tag == KAI_INT)  bv = b->as.i;
+    else if (b->tag == KAI_REAL) bv = (int64_t) b->as.r;
+    else { fprintf(stderr, "kai: type mismatch in //\n"); exit(1); }
+    if (bv == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); }
+    return kai_int(av / bv);
+}
+
+static KaiValue *kai_mod(KaiValue *a, KaiValue *b) {
+    if (a->tag == KAI_INT && b->tag == KAI_INT) {
+        if (b->as.i == 0) { fprintf(stderr, "kai: mod by zero\n"); exit(1); }
+        return kai_int(a->as.i % b->as.i);
+    }
+    fprintf(stderr, "kai: type mismatch in %%\n"); exit(1);
+}
+
+static KaiValue *kai_lt(KaiValue *a, KaiValue *b) {
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_bool(a->as.i < b->as.i);
+    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_bool(a->as.r < b->as.r);
+    if (a->tag == KAI_STR  && b->tag == KAI_STR) {
+        size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
+        int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
+        if (c != 0) return kai_bool(c < 0);
+        return kai_bool(a->as.s.len < b->as.s.len);
+    }
+    fprintf(stderr, "kai: type mismatch in <\n"); exit(1);
+}
+
+static KaiValue *kai_gt(KaiValue *a, KaiValue *b) {
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_bool(a->as.i > b->as.i);
+    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_bool(a->as.r > b->as.r);
+    if (a->tag == KAI_STR  && b->tag == KAI_STR) {
+        size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
+        int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
+        if (c != 0) return kai_bool(c > 0);
+        return kai_bool(a->as.s.len > b->as.s.len);
+    }
+    fprintf(stderr, "kai: type mismatch in >\n"); exit(1);
+}
+
+static KaiValue *kai_le(KaiValue *a, KaiValue *b) {
+    KaiValue *g = kai_gt(a, b);
+    KaiValue *r = kai_bool(!g->as.b);
+    kai_decref(g);
+    return r;
+}
+
+static KaiValue *kai_ge(KaiValue *a, KaiValue *b) {
+    KaiValue *l = kai_lt(a, b);
+    KaiValue *r = kai_bool(!l->as.b);
+    kai_decref(l);
+    return r;
+}
+
+static KaiValue *kai_eq_v(KaiValue *a, KaiValue *b) { return kai_bool(kai_eq(a, b)); }
+static KaiValue *kai_ne_v(KaiValue *a, KaiValue *b) { return kai_bool(!kai_eq(a, b)); }
+
+static KaiValue *kai_neg(KaiValue *a) {
+    if (a->tag == KAI_INT)  return kai_int(-a->as.i);
+    if (a->tag == KAI_REAL) return kai_real(-a->as.r);
+    fprintf(stderr, "kai: type mismatch in unary -\n"); exit(1);
+}
+
+static KaiValue *kai_boolnot(KaiValue *a) {
+    if (a->tag == KAI_BOOL) return kai_bool(!a->as.b);
+    fprintf(stderr, "kai: type mismatch in `not`\n"); exit(1);
+}
+
+static int kai_truthy(KaiValue *v) {
+    return v && v->tag == KAI_BOOL && v->as.b;
+}
+
+/* ---------- range construction ---------- */
+
+static KaiValue *kai_range(KaiValue *from, KaiValue *to) {
+    int64_t f = from->as.i, t = to->as.i;
+    KaiValue *acc = kai_nil();
+    for (int64_t i = t; i >= f; --i) acc = kai_cons(kai_int(i), acc);
+    return acc;
+}
+
+static KaiValue *kai_range_step(KaiValue *from, KaiValue *to, KaiValue *step) {
+    int64_t f = from->as.i, t = to->as.i, s = step->as.i;
+    if (s == 0) { fprintf(stderr, "kai: zero step in range\n"); exit(1); }
+    int64_t *buf = NULL;
+    size_t cap = 0, n = 0;
+    if (s > 0) {
+        for (int64_t i = f; i <= t; i += s) {
+            if (n == cap) { cap = cap ? cap * 2 : 16; buf = (int64_t *) realloc(buf, cap * sizeof(int64_t)); }
+            buf[n++] = i;
+        }
+    } else {
+        for (int64_t i = f; i >= t; i += s) {
+            if (n == cap) { cap = cap ? cap * 2 : 16; buf = (int64_t *) realloc(buf, cap * sizeof(int64_t)); }
+            buf[n++] = i;
+        }
+    }
+    KaiValue *acc = kai_nil();
+    for (size_t i = n; i > 0;) { --i; acc = kai_cons(kai_int(buf[i]), acc); }
+    free(buf);
+    return acc;
+}
+
+/* ---------- prelude thunks for first-class function refs ---------- */
+
+static KaiValue *_kai_prelude_print_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_prelude_print(a[0]); }
+static KaiValue *_kai_prelude_eprint_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_eprint(a[0]); }
+static KaiValue *_kai_prelude_panic_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_prelude_panic(a[0]); }
+static KaiValue *_kai_prelude_exit_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_prelude_exit(a[0]); }
+static KaiValue *_kai_prelude_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_int_to_string(a[0]); }
+static KaiValue *_kai_prelude_real_to_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_real_to_string(a[0]); }
+static KaiValue *_kai_prelude_string_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_length(a[0]); }
+static KaiValue *_kai_prelude_string_concat_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_concat(a[0], a[1]); }
+static KaiValue *_kai_prelude_list_length_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_list_length(a[0]); }
+static KaiValue *_kai_prelude_list_append_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_list_append(a[0], a[1]); }
+static KaiValue *_kai_prelude_list_reverse_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_list_reverse(a[0]); }
+static KaiValue *_kai_prelude_map_thunk(KaiValue *s, KaiValue **a, int n)            { (void) s; (void) n; return kai_prelude_map(a[0], a[1]); }
+static KaiValue *_kai_prelude_filter_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_filter(a[0], a[1]); }
+static KaiValue *_kai_prelude_reduce_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_reduce(a[0], a[1], a[2]); }
+static KaiValue *_kai_prelude_each_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_prelude_each(a[0], a[1]); }
+
 /* ---------- test harness hooks (used by --test runs) ---------- */
 
 static int kai_test_count_total   = 0;
