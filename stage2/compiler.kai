@@ -4633,6 +4633,277 @@ fn dump_types(decls: [Decl]) : Unit {
 }
 
 # ====================================================================
+# type schemes + environment (M2b)
+# ====================================================================
+#
+# A TyScheme is `Scheme(bound_vars, Ty)`: the vars in `bound_vars`
+# appear as TyVarT(n) inside `Ty` and are meant to be instantiated
+# to fresh variables at each use site. M2b only builds the env; the
+# instantiation mechanics live in M2c.
+#
+# A TyEnv is a flat association list of (name, scheme) entries plus a
+# fresh-variable counter used later. Lookups are linear — fine at this
+# stage (a few dozen entries).
+
+type TyScheme = Scheme([Int], Ty)
+
+type TyEntry = { name: String, scheme: TyScheme }
+
+type TyEnv = { entries: [TyEntry], fresh: Int }
+
+fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0 }
+
+fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv =
+  TyEnv { entries: [TyEntry { name: name, scheme: sc }, ...env.entries], fresh: env.fresh }
+
+fn ty_env_lookup_loop(es: [TyEntry], target: String) : Option[TyScheme] {
+  match es {
+    [] -> None
+    [e, ...rest] -> if e.name == target { Some(e.scheme) } else { ty_env_lookup_loop(rest, target) }
+  }
+}
+
+fn ty_env_lookup(env: TyEnv, target: String) : Option[TyScheme] =
+  ty_env_lookup_loop(env.entries, target)
+
+# ---- small constructors ----
+
+fn mono(ty: Ty) : TyScheme = Scheme([], ty)
+
+fn scheme(vars: [Int], ty: Ty) : TyScheme = Scheme(vars, ty)
+
+fn tv(n: Int) : Ty = TyVarT(n)
+
+fn fn_ty(ps: [Ty], ret: Ty) : Ty = TyFnT(ps, ret)
+
+fn list_ty(t: Ty) : Ty = TyListT(t)
+
+# ---- prelude signatures ----
+#
+# Kept in sync with stage 0's runtime and with stdlib/core.kai's
+# assumptions. Type variables inside a scheme are private to it.
+
+fn add_prelude_sigs(env: TyEnv) : TyEnv {
+  let es = [
+    # IO
+    TyEntry { name: "print",          scheme: mono(fn_ty([TyString], TyUnit)) },
+    TyEntry { name: "eprint",         scheme: mono(fn_ty([TyString], TyUnit)) },
+    TyEntry { name: "args",           scheme: mono(fn_ty([], list_ty(TyString))) },
+    TyEntry { name: "read_file",      scheme: mono(fn_ty([TyString], TyCon("Result", [TyString, TyString]))) },
+    TyEntry { name: "write_file",     scheme: mono(fn_ty([TyString, TyString], TyCon("Result", [TyUnit, TyString]))) },
+    TyEntry { name: "read_line",      scheme: mono(fn_ty([], TyCon("Result", [TyString, TyString]))) },
+    # `exit` and `panic` never return — give them a polymorphic result so
+    # they unify with any context.
+    TyEntry { name: "exit",           scheme: scheme([0], fn_ty([TyInt],    tv(0))) },
+    TyEntry { name: "panic",          scheme: scheme([0], fn_ty([TyString], tv(0))) },
+
+    # Conversions
+    TyEntry { name: "int_to_string",  scheme: mono(fn_ty([TyInt],    TyString)) },
+    TyEntry { name: "real_to_string", scheme: mono(fn_ty([TyReal],   TyString)) },
+    TyEntry { name: "string_to_int",  scheme: mono(fn_ty([TyString], TyCon("Option", [TyInt]))) },
+    TyEntry { name: "string_to_real", scheme: mono(fn_ty([TyString], TyCon("Option", [TyReal]))) },
+    TyEntry { name: "char_to_int",    scheme: mono(fn_ty([TyChar],   TyInt)) },
+    TyEntry { name: "int_to_char",    scheme: mono(fn_ty([TyInt],    TyChar)) },
+
+    # Strings
+    TyEntry { name: "string_length",  scheme: mono(fn_ty([TyString],                TyInt)) },
+    TyEntry { name: "string_concat",  scheme: mono(fn_ty([TyString, TyString],      TyString)) },
+    TyEntry { name: "string_slice",   scheme: mono(fn_ty([TyString, TyInt, TyInt],  TyString)) },
+    TyEntry { name: "string_split",   scheme: mono(fn_ty([TyString, TyString],      list_ty(TyString))) },
+    TyEntry { name: "string_contains",scheme: mono(fn_ty([TyString, TyString],      TyBool)) },
+    TyEntry { name: "char_at",        scheme: mono(fn_ty([TyString, TyInt],         TyCon("Option", [TyChar]))) },
+
+    # Lists (monomorphic over element type `0`).
+    TyEntry { name: "list_length",    scheme: scheme([0], fn_ty([list_ty(tv(0))],                    TyInt)) },
+    TyEntry { name: "list_append",    scheme: scheme([0], fn_ty([list_ty(tv(0)), list_ty(tv(0))],    list_ty(tv(0)))) },
+    TyEntry { name: "list_reverse",   scheme: scheme([0], fn_ty([list_ty(tv(0))],                    list_ty(tv(0)))) },
+
+    # Higher-order (element `0`, result `1`).
+    TyEntry { name: "map",    scheme: scheme([0, 1], fn_ty([list_ty(tv(0)), fn_ty([tv(0)], tv(1))], list_ty(tv(1)))) },
+    TyEntry { name: "filter", scheme: scheme([0],    fn_ty([list_ty(tv(0)), fn_ty([tv(0)], TyBool)], list_ty(tv(0)))) },
+    TyEntry { name: "reduce", scheme: scheme([0, 1], fn_ty([list_ty(tv(0)), tv(1), fn_ty([tv(1), tv(0)], tv(1))], tv(1))) },
+    TyEntry { name: "each",   scheme: scheme([0],    fn_ty([list_ty(tv(0)), fn_ty([tv(0)], TyUnit)],  TyUnit)) }
+  ]
+  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh }
+}
+
+# ---- built-in variant constructors ----
+
+fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
+  let es = [
+    # Option[a]
+    TyEntry { name: "Some", scheme: scheme([0],    fn_ty([tv(0)], TyCon("Option", [tv(0)]))) },
+    TyEntry { name: "None", scheme: scheme([0],    TyCon("Option", [tv(0)])) },
+    # Result[e, a]: Ok carries `a` (TyVarT(1)), Err carries `e` (TyVarT(0)).
+    TyEntry { name: "Ok",   scheme: scheme([0, 1], fn_ty([tv(1)], TyCon("Result", [tv(0), tv(1)]))) },
+    TyEntry { name: "Err",  scheme: scheme([0, 1], fn_ty([tv(0)], TyCon("Result", [tv(0), tv(1)]))) }
+  ]
+  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh }
+}
+
+# ---- user-defined signatures ----
+#
+# For each DFn decl add its signature; for each DType of sum-shape add a
+# scheme per variant that produces TyCon(type_name, [tparams]). Records
+# are not yet constructor-exposed in the env; they'll land alongside
+# field-access typing in M2c.
+
+fn tparam_ids_loop(tparams: [String], i: Int, acc: [Int]) : [Int] {
+  match tparams {
+    [] -> list_reverse(acc)
+    [_, ...rest] -> tparam_ids_loop(rest, i + 1, [i, ...acc])
+  }
+}
+
+fn tparam_ids(tparams: [String]) : [Int] = tparam_ids_loop(tparams, 0, [])
+
+# Resolve a TypeExpr under a mapping from tparam name to its TyVarT id.
+# The mapping is itself an association list for now.
+type TPBind = TPB(String, Int)
+
+fn tpbind_lookup(binds: [TPBind], name: String) : Option[Int] {
+  match binds {
+    [] -> None
+    [b, ...rest] -> match b {
+      TPB(n, i) -> if n == name { Some(i) } else { tpbind_lookup(rest, name) }
+    }
+  }
+}
+
+fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
+  match t.tkind {
+    TyName(name, tas) -> {
+      match tpbind_lookup(binds, name) {
+        Some(i) -> tv(i)
+        None -> {
+          if name == "Int"    { TyInt }
+          else if name == "Real"   { TyReal }
+          else if name == "Bool"   { TyBool }
+          else if name == "String" { TyString }
+          else if name == "Char"   { TyChar }
+          else if name == "Unit"   { TyUnit }
+          else { TyCon(name, resolve_tas_with(tas, binds)) }
+        }
+      }
+    }
+    TyList(inner) -> list_ty(resolve_ty_with_tparams(inner, binds))
+    TyFn(ps, ret) -> fn_ty(map(ps, (p) => resolve_ty_with_tparams(p, binds)),
+                           resolve_ty_with_tparams(ret, binds))
+  }
+}
+
+fn resolve_tas_with(tas: [TypeExpr], binds: [TPBind]) : [Ty] =
+  map(tas, (t) => resolve_ty_with_tparams(t, binds))
+
+# Build the TPBind list for a decl's generic type parameters.
+fn mk_tpbinds_loop(tparams: [String], i: Int, acc: [TPBind]) : [TPBind] {
+  match tparams {
+    [] -> list_reverse(acc)
+    [n, ...rest] -> mk_tpbinds_loop(rest, i + 1, [TPB(n, i), ...acc])
+  }
+}
+
+fn mk_tpbinds(tparams: [String]) : [TPBind] = mk_tpbinds_loop(tparams, 0, [])
+
+fn scheme_of_variant(type_name: String, tparams: [String], v: Variant) : TyScheme {
+  match v {
+    Var(ctor_name, vargs) -> {
+      let binds = mk_tpbinds(tparams)
+      let ids = tparam_ids(tparams)
+      let arg_tys = map(vargs, (a) => resolve_ty_with_tparams(a, binds))
+      let result = TyCon(type_name, map(ids, tv))
+      match vargs {
+        [] -> scheme(ids, result)
+        _  -> scheme(ids, fn_ty(arg_tys, result))
+      }
+    }
+  }
+}
+
+fn add_variants_of_decl(env: TyEnv, d: Decl) : TyEnv {
+  match d {
+    DType(_, tname, tparams, body, _, _) -> match body {
+      TBSum(vs) -> add_variants_loop(env, tname, tparams, vs)
+      _ -> env
+    }
+    _ -> env
+  }
+}
+
+fn add_variants_loop(env: TyEnv, tname: String, tparams: [String], vs: [Variant]) : TyEnv {
+  match vs {
+    [] -> env
+    [v, ...rest] -> match v {
+      Var(cname, _) -> {
+        let sc = scheme_of_variant(tname, tparams, v)
+        add_variants_loop(ty_env_add(env, cname, sc), tname, tparams, rest)
+      }
+    }
+  }
+}
+
+fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
+  match d {
+    DFn(_, _, params, opt_ret, _, _, _) -> {
+      # Function-level generics are inferred later; for now everything
+      # that uses a user function is monomorphic. Type variables can be
+      # added in M2c when generic inference lands.
+      let pts = map(params, param_ty)
+      let ret = match opt_ret {
+        Some(rty) -> resolve_ty(rty)
+        None      -> TyUnit
+      }
+      Some(mono(fn_ty(pts, ret)))
+    }
+    _ -> None
+  }
+}
+
+fn add_decls_loop(env: TyEnv, ds: [Decl]) : TyEnv {
+  match ds {
+    [] -> env
+    [d, ...rest] -> {
+      let env1 = match d {
+        DFn(_, fname, _, _, _, _, _) -> match fn_scheme_of_decl(d) {
+          Some(sc) -> ty_env_add(env, fname, sc)
+          None     -> env
+        }
+        DType(_, _, _, _, _, _) -> add_variants_of_decl(env, d)
+        _ -> env
+      }
+      add_decls_loop(env1, rest)
+    }
+  }
+}
+
+fn build_ty_env(decls: [Decl]) : TyEnv {
+  let e0 = ty_env_empty()
+  let e1 = add_prelude_sigs(e0)
+  let e2 = add_builtin_variant_sigs(e1)
+  add_decls_loop(e2, decls)
+}
+
+# ---- env dump (debugging) ----
+
+fn scheme_to_string(sc: TyScheme) : String {
+  match sc {
+    Scheme(vars, ty) -> match vars {
+      [] -> ty_to_string(ty)
+      _  -> concat_all([
+        "forall ", join_with(map(vars, (n) => cat2("?t", int_to_string(n))), " "),
+        ". ", ty_to_string(ty)
+      ])
+    }
+  }
+}
+
+fn dump_env_entry(e: TyEntry) : Unit =
+  print("#{e.name} : #{scheme_to_string(e.scheme)}")
+
+fn dump_env(env: TyEnv) : Unit =
+  list_reverse(env.entries) |> each(dump_env_entry)
+
+# ====================================================================
 # cli + driver
 # ====================================================================
 
@@ -4641,6 +4912,7 @@ type Mode
   | MTokens
   | MAst
   | MTypes
+  | MEnv
   | MTest
   | MHelp
 
@@ -4665,6 +4937,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
         parse_cli_loop(more, cli_with_mode(opts, MAst))
       } else if a == "--types" {
         parse_cli_loop(more, cli_with_mode(opts, MTypes))
+      } else if a == "--env" {
+        parse_cli_loop(more, cli_with_mode(opts, MEnv))
       } else if a == "--test" {
         parse_cli_loop(more, cli_with_mode(opts, MTest))
       } else if a == "-h" or a == "--help" {
@@ -4694,6 +4968,7 @@ fn usage() : Unit {
   eprint("  --tokens           print the token stream and exit")
   eprint("  --ast              parse and print the AST and exit")
   eprint("  --types            print declared top-level signatures and exit")
+  eprint("  --env              print the full type environment (prelude + variants + decls)")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
   eprint("  -h, --help         this help")
 }
@@ -4735,6 +5010,7 @@ fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) 
             match mode {
               MAst -> { dump_program(all_decls); 0 }
               MTypes -> { dump_types(own_decls); 0 }
+              MEnv -> { dump_env(build_ty_env(all_decls)); 0 }
               _ -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk }

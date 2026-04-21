@@ -50,6 +50,15 @@ test-types: $(TARGET) build
 	    || { echo "types FAIL $$name"; exit 1; }; \
 	done
 
+# --env smoke test: full type environment (prelude + variants + user decls).
+test-env: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai $(SRC); do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --env $$f > build/s2-$$name.env && echo "env OK $$name" \
+	    || { echo "env FAIL $$name"; exit 1; }; \
+	done
+
 # Checker: undefined-name resolution runs clean on every example.
 test-check: $(TARGET) build
 	@set -e; \
@@ -103,7 +112,7 @@ selfhost: $(TARGET) build
 	  && echo "self-hosting fixed point: OK" \
 	  || { echo "self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-check test-run test-blocks
+test: test-tokens test-ast test-types test-env test-check test-run test-blocks
 
 clean:
 	rm -rf build $(TARGET)
