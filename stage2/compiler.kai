@@ -4962,6 +4962,29 @@ fn ty_env_lookup_loop(es: [TyEntry], target: String) : Option[TyScheme] {
 fn ty_env_lookup(env: TyEnv, target: String) : Option[TyScheme] =
   ty_env_lookup_loop(env.entries, target)
 
+# Names of entries whose first byte is uppercase ASCII. Used to
+# filter down to variant constructors (`Some`, `Ok`, `Err`, user
+# variants) when suggesting alternatives for unknown variants.
+fn ty_env_uppercase_names(env: TyEnv) : [String] =
+  uppercase_names_loop(env.entries, [])
+
+fn uppercase_names_loop(es: [TyEntry], acc: [String]) : [String] {
+  match es {
+    [] -> list_reverse(acc)
+    [e, ...rest] -> {
+      let first_upper = match char_at(e.name, 0) {
+        Some(c) -> c >= 'A' and c <= 'Z'
+        None    -> false
+      }
+      if first_upper {
+        uppercase_names_loop(rest, [e.name, ...acc])
+      } else {
+        uppercase_names_loop(rest, acc)
+      }
+    }
+  }
+}
+
 # ---- small constructors ----
 
 fn mono(ty: Ty) : TyScheme = Scheme([], ty)
@@ -5726,6 +5749,24 @@ fn fty_find_loop(fs: [FTy], target: String) : Option[Ty] {
 
 fn fty_find(fs: [FTy], target: String) : Option[Ty] = fty_find_loop(fs, target)
 
+fn fty_names(fs: [FTy]) : [String] = fty_names_loop(fs, [])
+
+fn fty_names_loop(fs: [FTy], acc: [String]) : [String] {
+  match fs {
+    [] -> list_reverse(acc)
+    [f, ...rest] -> match f {
+      FT(nm, _) -> fty_names_loop(rest, [nm, ...acc])
+    }
+  }
+}
+
+fn field_hint(fs: [FTy], target: String) : String {
+  match closest_name(target, fty_names(fs)) {
+    Some(sug) -> " (did you mean `.#{sug}`?)"
+    None      -> ""
+  }
+}
+
 # ---- the walker ----
 
 fn synth(st: InferState, e: Expr) : Inferred {
@@ -5840,7 +5881,7 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
             mk_inferred(st1, ty, field_root(r.expr, fnm, line, col, ty))
           }
           None -> {
-            diag_error(st.file, line, col, "no field '#{fnm}' on #{cname}")
+            diag_error(st.file, line, col, "no field '#{fnm}' on #{cname}#{field_hint(inst.fields, fnm)}")
             mk_inferred(st_bump_err(st1), TyAny, field_root(r.expr, fnm, line, col, TyAny))
           }
         }
@@ -6191,7 +6232,14 @@ fn check_list_subpats(st: InferState, ps: [Pattern], elem: Ty) : InferState {
 
 fn check_variant_pattern(st: InferState, cname: String, subpats: [Pattern], expected: Ty, line: Int, col: Int) : InferState {
   match ty_env_lookup(st.env, cname) {
-    None -> check_unknown_subpats(st, subpats)
+    None -> {
+      let hint = match closest_name(cname, ty_env_uppercase_names(st.env)) {
+        Some(sug) -> " (did you mean `#{sug}`?)"
+        None      -> ""
+      }
+      diag_error(st.file, line, col, "unknown variant '#{cname}'#{hint}")
+      check_unknown_subpats(st_bump_err(st), subpats)
+    }
     Some(sc) -> {
       let inst = st_instantiate(st, sc)
       match inst.ty {
@@ -6286,7 +6334,7 @@ fn check_pfield_list(st: InferState, pfs: [PField], fields: [FTy], line: Int, co
         let s1 = match fty_find(fields, fnm) {
           Some(ft) -> check_pattern(st, sub, ft)
           None -> {
-            diag_error(st.file, line, col, "no field '#{fnm}' in record pattern")
+            diag_error(st.file, line, col, "no field '#{fnm}' in record pattern#{field_hint(fields, fnm)}")
             check_pattern(st_bump_err(st), sub, TyAny)
           }
         }
