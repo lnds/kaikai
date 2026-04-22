@@ -95,6 +95,26 @@ test-check: $(TARGET) build
 	    || { echo "check FAIL $$name"; exit 1; }; \
 	done
 
+# LLVM backend round-trip: emitted .ll is compiled with clang against
+# the runtime shim, and the resulting binary's output must match the
+# C backend's. Scoped to hello.kai for M3a — extended as more language
+# features land in the LLVM emitter.
+LLVM_EXAMPLES := hello
+test-llvm: $(TARGET) build
+	@set -e; \
+	for name in $(LLVM_EXAMPLES); do \
+	  f=../examples/minimal/$$name.kai; \
+	  ./$(TARGET) --emit=llvm $$f > build/$$name.ll; \
+	  clang -w -I ../stage0 build/$$name.ll ../stage0/runtime_llvm.c -o build/$$name-llvm; \
+	  ./build/$$name-llvm > build/$$name-llvm.out; \
+	  ./$(TARGET) $$f > build/$$name.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name-c; \
+	  ./build/$$name-c > build/$$name-c.out; \
+	  diff -q build/$$name-llvm.out build/$$name-c.out > /dev/null \
+	    && echo "llvm OK $$name" \
+	    || { echo "llvm DIFF $$name"; diff build/$$name-llvm.out build/$$name-c.out | head; exit 1; }; \
+	done
+
 # End-to-end: emitted C from kaic2 matches stage 1's stdout byte for byte.
 test-run: $(TARGET) build
 	@set -e; \
@@ -138,7 +158,7 @@ selfhost: $(TARGET) build
 	  && echo "self-hosting fixed point: OK" \
 	  || { echo "self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-check test-run test-blocks
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-check test-run test-blocks test-llvm
 
 clean:
 	rm -rf build $(TARGET)
