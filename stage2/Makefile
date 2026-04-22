@@ -216,8 +216,11 @@ test-modules: $(TARGET) build
 
 # Typed holes (M10): every example under examples/holes/ must
 # (a) produce a --holes report with at least one "type hole" entry,
-# (b) compile clean through both backends, and
-# (c) panic at runtime with "unfilled hole:" when the hole is reached.
+# (b) produce a valid --holes-json array,
+# (c) fail under --strict-holes with non-zero exit,
+# (d) compile clean through both backends, and
+# (e) if the runtime aborts, the message must contain "unfilled hole:"
+#     (expression holes panic; pattern holes fall through to arm body).
 test-holes: $(TARGET) build
 	@set -e; \
 	for f in ../examples/holes/*.kai; do \
@@ -226,17 +229,24 @@ test-holes: $(TARGET) build
 	  if ! grep -q "type hole" build/s2-$$name.holes; then \
 	    echo "holes FAIL $$name (no report)"; cat build/s2-$$name.holes; exit 1; \
 	  fi; \
+	  ./$(TARGET) --holes-json $$f > build/s2-$$name.holes.json; \
+	  python3 ../scripts/validate_holes_json.py build/s2-$$name.holes.json \
+	    || { echo "holes FAIL $$name (invalid JSON / schema)"; cat build/s2-$$name.holes.json; exit 1; }; \
+	  rc=0; ./$(TARGET) --strict-holes $$f > /dev/null 2> build/s2-$$name.strict.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "holes FAIL $$name (--strict-holes did not fail)"; cat build/s2-$$name.strict.err; exit 1; \
+	  fi; \
 	  ./$(TARGET) $$f > build/$$name-holes.c; \
 	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-holes.c -o build/$$name-holes-c; \
-	  ./build/$$name-holes-c > build/$$name-holes-c.out 2>&1 || true; \
-	  if ! grep -q "unfilled hole:" build/$$name-holes-c.out; then \
-	    echo "holes FAIL $$name (C backend did not panic)"; cat build/$$name-holes-c.out; exit 1; \
+	  crc=0; ./build/$$name-holes-c > build/$$name-holes-c.out 2>&1 || crc=$$?; \
+	  if [ $$crc -ne 0 ] && ! grep -q "unfilled hole:" build/$$name-holes-c.out; then \
+	    echo "holes FAIL $$name (C backend aborted without hole message)"; cat build/$$name-holes-c.out; exit 1; \
 	  fi; \
 	  ./$(TARGET) --emit=llvm $$f > build/$$name-holes.ll; \
 	  clang -w -I ../stage0 build/$$name-holes.ll ../stage0/runtime_llvm.c -o build/$$name-holes-llvm; \
-	  ./build/$$name-holes-llvm > build/$$name-holes-llvm.out 2>&1 || true; \
-	  if ! grep -q "unfilled hole:" build/$$name-holes-llvm.out; then \
-	    echo "holes FAIL $$name (LLVM backend did not panic)"; cat build/$$name-holes-llvm.out; exit 1; \
+	  lrc=0; ./build/$$name-holes-llvm > build/$$name-holes-llvm.out 2>&1 || lrc=$$?; \
+	  if [ $$lrc -ne 0 ] && ! grep -q "unfilled hole:" build/$$name-holes-llvm.out; then \
+	    echo "holes FAIL $$name (LLVM backend aborted without hole message)"; cat build/$$name-holes-llvm.out; exit 1; \
 	  fi; \
 	  echo "holes OK $$name"; \
 	done

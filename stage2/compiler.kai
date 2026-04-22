@@ -711,6 +711,7 @@ type PatKind
   | PVariant(String, [Pattern])
   | PVariantRecord(String, [PField])
   | PRecord([PField])
+  | PHole(Option[String])                   # `?` or `?name` in pattern position
 
 type PField = PField(String, Pattern, Bool) # field name, sub-pattern, is_shorthand
 
@@ -1847,6 +1848,14 @@ fn parse_arm_body(p: Parser, pat: Pattern, guard: Option[Expr]) : PArm {
 
 fn parse_pattern(p: Parser) : PPat {
   let t = p_peek(p)
+  match t.kind {
+    TkHole          -> ok_p(p_advance(p), mk_pat(PHole(None), t.line, t.col))
+    TkHoleName(nm)  -> ok_p(p_advance(p), mk_pat(PHole(Some(nm)), t.line, t.col))
+    _ -> parse_pattern_rest(p, t)
+  }
+}
+
+fn parse_pattern_rest(p: Parser, t: Token) : PPat {
   if tk_is(t.kind, TkUnderscore) {
     ok_p(p_advance(p), mk_pat(PWild, t.line, t.col))
   } else if tk_is(t.kind, TkInt) {
@@ -2712,6 +2721,10 @@ fn dump_pat(pat: Pattern, depth: Int) : Unit {
       emit_line(depth, "pat_record @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
       fields |> each((pf) => dump_pfield(pf, depth + 1))
     }
+    PHole(nm_opt) -> {
+      let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+      emit_line(depth, "pat_hole #{label} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+    }
   }
 }
 
@@ -2913,6 +2926,7 @@ fn bind_pat(e: Env, pat: Pattern) : Env {
     PVariant(_, subs) -> bind_pats_loop(e, subs)
     PVariantRecord(_, fields) -> bind_pfields_loop(e, fields)
     PRecord(fields) -> bind_pfields_loop(e, fields)
+    PHole(_) -> e
   }
 }
 
@@ -3543,6 +3557,7 @@ fn emit_pat_test(src: String, pat: Pattern, scr: String, fns: [EFn], variants: [
     PVariant(name, subs) -> emit_pat_test_variant(src, name, subs, scr, fns, variants, lams)
     PVariantRecord(name, fields) -> emit_pat_test_variant_record(src, name, fields, scr, fns, variants, lams)
     PRecord(fields) -> emit_pat_test_record(src, fields, scr, fns, variants, lams)
+    PHole(_) -> "1"
   }
 }
 
@@ -3645,6 +3660,7 @@ fn emit_pat_binds(src: String, pat: Pattern, scr: String, fns: [EFn], variants: 
     PVariant(_, subs) -> emit_pat_binds_variant(src, subs, scr, 0, fns, variants, lams)
     PVariantRecord(_, fields) -> emit_pat_binds_record(src, fields, scr, fns, variants, lams)
     PRecord(fields) -> emit_pat_binds_record(src, fields, scr, fns, variants, lams)
+    PHole(_) -> ""
   }
 }
 
@@ -5260,7 +5276,8 @@ type CallSite = CS(String, Int, Int, [Int])        # name, line, col, fresh ids
 # env entries visible at that point (snapshot of the locals stack).
 # After inference the fresh id runs through the final sub to
 # recover the expected type.
-type HoleSite = HS(Option[String], Int, Int, Int, [TyEntry])
+type HoleSite = HS(Option[String], Int, Int, Int, [TyEntry], Int)
+#                   name            line col fresh scope      env_fresh
 
 type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs: [RecInfo], errs: Int,
                     insts: [CallSite], holes: [HoleSite] }
@@ -5525,7 +5542,7 @@ fn synth_hole(st: InferState, nm_opt: Option[String], e: Expr) : Inferred {
 fn register_fresh_hole(st: InferState, nm_opt: Option[String], e: Expr) : Inferred {
   let fresh_id = st.env.fresh
   let st1 = st_set_env(st, fresh_var(st.env))
-  let site = HS(nm_opt, e.line, e.col, fresh_id, st1.env.entries)
+  let site = HS(nm_opt, e.line, e.col, fresh_id, st1.env.entries, st1.env.fresh)
   let st2 = st_push_hole(st1, site)
   inferred_leaf(st2, TyVarT(fresh_id), e)
 }
@@ -5534,7 +5551,7 @@ fn find_hole_by_name(holes: [HoleSite], target: String) : Option[Int] {
   match holes {
     [] -> None
     [h, ...rest] -> match h {
-      HS(nm_opt, _, _, fresh, _) -> match nm_opt {
+      HS(nm_opt, _, _, fresh, _, _) -> match nm_opt {
         Some(nm) -> if nm == target { Some(fresh) } else { find_hole_by_name(rest, target) }
         None -> find_hole_by_name(rest, target)
       }
@@ -5896,7 +5913,32 @@ fn check_pattern(st: InferState, pat: Pattern, expected: Ty) : InferState {
       check_variant_record_pattern(st, cname, pfs, expected, pat.line, pat.col)
     PRecord(pfs) ->
       check_record_pattern(st, pfs, expected, pat.line, pat.col)
+    PHole(nm_opt) -> check_hole_pattern(st, nm_opt, expected, pat.line, pat.col)
   }
+}
+
+# A hole in pattern position behaves like PWild at runtime (matches
+# anything, binds nothing) but additionally registers a HoleSite so
+# the report surfaces the expected pattern type and the scope. For
+# named pattern holes we reuse the same name-sharing rule as the
+# expression form: two `?x` in the same decl unify to one TyVar.
+fn check_hole_pattern(st: InferState, nm_opt: Option[String], expected: Ty, line: Int, col: Int) : InferState {
+  let expected_now = apply_ty(st.sub, expected)
+  match nm_opt {
+    Some(nm) -> match find_hole_by_name(st.holes, nm) {
+      Some(prior_fresh) -> st_unify(st, TyVarT(prior_fresh), expected_now, "pattern hole", line, col)
+      None -> register_fresh_pattern_hole(st, nm_opt, expected_now, line, col)
+    }
+    None -> register_fresh_pattern_hole(st, nm_opt, expected_now, line, col)
+  }
+}
+
+fn register_fresh_pattern_hole(st: InferState, nm_opt: Option[String], expected: Ty, line: Int, col: Int) : InferState {
+  let fresh_id = st.env.fresh
+  let st1 = st_set_env(st, fresh_var(st.env))
+  let site = HS(nm_opt, line, col, fresh_id, st1.env.entries, st1.env.fresh)
+  let st2 = st_push_hole(st1, site)
+  st_unify(st2, TyVarT(fresh_id), expected, "pattern hole", line, col)
 }
 
 fn check_list_subpats(st: InferState, ps: [Pattern], elem: Ty) : InferState {
@@ -6083,14 +6125,8 @@ fn resolve_callsites(css: [CallSite], sub: Subst) : [ResolvedCS] {
 # type from context but can remain a TyVarT if the hole sits in a
 # position that doesn't constrain (e.g. the whole body of a fn with
 # no declared return).
-type ResolvedHole = RH(Option[String], Int, Int, Ty, [TyEntry])
-#                       name            line col expected scope
-
-fn drop_last_entries(es: [TyEntry], n: Int) : [TyEntry] {
-  let total = list_length(es)
-  let keep = total - n
-  if keep <= 0 { [] } else { take_entries(es, keep, []) }
-}
+type ResolvedHole = RH(Option[String], Int, Int, Ty, [TyEntry], Int)
+#                       name            line col expected scope     env_fresh
 
 fn take_entries(es: [TyEntry], n: Int, acc: [TyEntry]) : [TyEntry] {
   if n <= 0 { list_reverse(acc) }
@@ -6100,13 +6136,19 @@ fn take_entries(es: [TyEntry], n: Int, acc: [TyEntry]) : [TyEntry] {
   } }
 }
 
-fn resolve_holes(hs: [HoleSite], sub: Subst, prelude_len: Int) : [ResolvedHole] {
+fn drop_last_entries(es: [TyEntry], n: Int) : [TyEntry] {
+  let total = list_length(es)
+  let keep = total - n
+  if keep <= 0 { [] } else { take_entries(es, keep, []) }
+}
+
+fn resolve_holes(hs: [HoleSite], sub: Subst) : [ResolvedHole] {
   match hs {
     [] -> []
     [h, ...rest] -> match h {
-      HS(nm_opt, line, col, fresh, scope) ->
-        [RH(nm_opt, line, col, apply_ty(sub, TyVarT(fresh)), drop_last_entries(scope, prelude_len)),
-         ...resolve_holes(rest, sub, prelude_len)]
+      HS(nm_opt, line, col, fresh, scope, env_fresh) ->
+        [RH(nm_opt, line, col, apply_ty(sub, TyVarT(fresh)), scope, env_fresh),
+         ...resolve_holes(rest, sub)]
     }
   }
 }
@@ -6132,7 +6174,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: De
         print_inferred_fn(nm, apply_ty(st1.sub, declared_ret), apply_tys(st1.sub, added.tys), line, col)
       } else { () }
       let resolved = resolve_callsites(list_reverse(st1.insts), st1.sub)
-      let hole_reports = resolve_holes(list_reverse(st1.holes), st1.sub, prelude_len)
+      let hole_reports = resolve_holes(list_reverse(st1.holes), st1.sub)
       TypedDecl {
         decl: DFn(is_pub, nm, ps, opt_ret, rb.expr, line, col),
         errs: st1.errs,
@@ -6144,7 +6186,8 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: De
   }
 }
 
-type TypedProgram = { decls: [Decl], errs: Int, insts: [ResolvedCS], holes: [ResolvedHole] }
+type TypedProgram = { decls: [Decl], errs: Int, insts: [ResolvedCS],
+                      holes: [ResolvedHole], prelude_len: Int }
 
 fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], ds: [Decl], verbose: Bool,
                    acc_decls: [Decl], acc_errs: Int, acc_insts: [ResolvedCS],
@@ -6152,7 +6195,8 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d
   match ds {
     [] -> TypedProgram {
       decls: list_reverse(acc_decls), errs: acc_errs,
-      insts: list_reverse(acc_insts), holes: list_reverse(acc_holes)
+      insts: list_reverse(acc_insts), holes: list_reverse(acc_holes),
+      prelude_len: prelude_len
     }
     [d, ...rest] -> {
       let r = infer_decl(file, env, prelude_len, recs, d, verbose)
@@ -6413,19 +6457,32 @@ fn dump_mono(file: String, decls: [Decl]) : Int {
 fn dump_scope_entry(te: TyEntry) : Unit =
   print("    #{te.name} : #{scheme_to_string(te.scheme)}")
 
-fn dump_hole_report(file: String, rh: ResolvedHole) : Unit {
+fn dump_hole_candidate(c: String) : Unit =
+  print("    #{c}")
+
+fn dump_hole_report(file: String, rh: ResolvedHole, prelude_len: Int) : Unit {
   match rh {
-    RH(nm_opt, line, col, ty, scope) -> {
+    RH(nm_opt, line, col, ty, scope, env_fresh) -> {
       let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+      let user_scope = drop_last_entries(scope, prelude_len)
+      let cands = synth_candidates(scope, ty, env_fresh)
       print("#{file}:#{int_to_string(line)}:#{int_to_string(col)}: type hole #{label}")
       print("")
       print("  expected: #{ty_to_string(ty)}")
       print("")
-      match scope {
+      match user_scope {
         [] -> { print("  in scope: (empty)") print("") }
         _  -> {
           print("  in scope:")
-          scope |> each(dump_scope_entry)
+          user_scope |> each(dump_scope_entry)
+          print("")
+        }
+      }
+      match cands {
+        [] -> ()
+        _  -> {
+          print("  candidates that fit:")
+          cands |> each(dump_hole_candidate)
           print("")
         }
       }
@@ -6433,18 +6490,261 @@ fn dump_hole_report(file: String, rh: ResolvedHole) : Unit {
   }
 }
 
-fn dump_holes_loop(file: String, hs: [ResolvedHole]) : Unit {
+fn dump_holes_loop(file: String, hs: [ResolvedHole], prelude_len: Int) : Unit {
   match hs {
     [] -> ()
-    [h, ...rest] -> { dump_hole_report(file, h) dump_holes_loop(file, rest) }
+    [h, ...rest] -> { dump_hole_report(file, h, prelude_len) dump_holes_loop(file, rest, prelude_len) }
   }
 }
+
+# ---- bounded candidate synthesis ----
+#
+# Given a hole's expected type `E` and the visible scope, enumerate a
+# small set of expressions the user (or an LLM) might plug in. The
+# doc calls this a "bounded enumeration": we do not explore beyond a
+# single application, and we never nest candidates. Two classes:
+#   1. direct: `name` where `name : T` and `T ~= E`.
+#   2. application: `f(x1, .., xn)` where `f : (T1..Tn) -> R`, `R ~= E`,
+#      and each `Ti` unifies with some in-scope name's type.
+# Entries whose *immediate* return type is a bare polymorphic var (e.g.
+# `panic`, `exit`) are rejected from class 2 — they'd match any hole
+# and drown useful suggestions. A shared `env_fresh` counter keeps
+# each instantiation's fresh TyVars disjoint from the hole's own
+# residual vars.
+
+fn list_has_int(xs: [Int], n: Int) : Bool {
+  match xs {
+    [] -> false
+    [h, ...rest] -> if h == n { true } else { list_has_int(rest, n) }
+  }
+}
+
+# Reject entries whose return type after stripping TyFnT is a bare
+# bound variable — the scheme accepts anything, so suggesting it is
+# noise. Accept structural return types (TyCon, TyList, primitives),
+# which still constrain the substitution meaningfully.
+fn synth_return_structural(sc: TyScheme) : Bool {
+  match sc {
+    Scheme(vars, ty) -> match ty {
+      TyFnT(_, ret) -> match ret {
+        TyVarT(v) -> not list_has_int(vars, v)
+        _         -> true
+      }
+      TyVarT(v) -> not list_has_int(vars, v)
+      _         -> true
+    }
+  }
+}
+
+fn list_has_string(xs: [String], s: String) : Bool {
+  match xs {
+    [] -> false
+    [h, ...rest] -> if h == s { true } else { list_has_string(rest, s) }
+  }
+}
+
+# Walk scope looking for the first entry whose instantiated type
+# unifies with `want`. Returns the name on hit, None otherwise.
+# `avoid` prevents obvious circular fills like `f(f)` when f itself
+# is the candidate head.
+type ArgMatch = { name: String, sub: Subst, fresh: Int }
+
+fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: Subst) : Option[ArgMatch] {
+  match scope {
+    [] -> None
+    [te, ...rest] -> {
+      if list_has_string(avoid, te.name) or (not synth_return_structural(te.scheme)) {
+        synth_find_arg(rest, want, fresh, avoid, sub)
+      } else {
+        let inst = instantiate(TyEnv { entries: [], fresh: fresh }, te.scheme)
+        match unify(inst.ty, want, sub) {
+          Some(sub1) -> Some(ArgMatch { name: te.name, sub: sub1, fresh: inst.env.fresh })
+          None       -> synth_find_arg(rest, want, fresh, avoid, sub)
+        }
+      }
+    }
+  }
+}
+
+type ArgsMatch = { names: [String], sub: Subst, fresh: Int }
+
+fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
+                   sub: Subst, acc: [String]) : Option[ArgsMatch] {
+  match params {
+    [] -> Some(ArgsMatch { names: list_reverse(acc), sub: sub, fresh: fresh })
+    [p, ...rest] -> {
+      let p_now = apply_ty(sub, p)
+      match synth_find_arg(scope, p_now, fresh, avoid, sub) {
+        Some(am) -> synth_find_args(scope, rest, am.fresh, avoid, am.sub, [am.name, ...acc])
+        None     -> None
+      }
+    }
+  }
+}
+
+# Try entry `te` as a direct match or a 1-level application against
+# `expected`. Returns rendered candidate text or None.
+fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) : Option[String] {
+  let inst = instantiate(TyEnv { entries: [], fresh: fresh }, te.scheme)
+  match unify(inst.ty, expected, subst_empty()) {
+    Some(_) -> Some(te.name)
+    None    -> match inst.ty {
+      TyFnT(ps, r) -> {
+        if synth_return_structural(te.scheme) {
+          match unify(r, expected, subst_empty()) {
+            None     -> None
+            Some(s0) -> match synth_find_args(all_scope, ps, inst.env.fresh, [te.name], s0, []) {
+              None    -> None
+              Some(m) -> Some(concat_all([te.name, "(", join_with(m.names, ", "), ")"]))
+            }
+          }
+        } else { None }
+      }
+      _ -> None
+    }
+  }
+}
+
+fn synth_candidates_loop(all: [TyEntry], cur: [TyEntry], expected: Ty, fresh: Int,
+                         acc: [String], max: Int) : [String] {
+  if list_length(acc) >= max { list_reverse(acc) }
+  else { match cur {
+    [] -> list_reverse(acc)
+    [te, ...rest] -> match synth_try_entry(all, te, expected, fresh) {
+      Some(expr) -> synth_candidates_loop(all, rest, expected, fresh, [expr, ...acc], max)
+      None       -> synth_candidates_loop(all, rest, expected, fresh, acc, max)
+    }
+  } }
+}
+
+fn synth_candidates(scope: [TyEntry], expected: Ty, fresh: Int) : [String] =
+  synth_candidates_loop(scope, scope, expected, fresh, [], 8)
 
 fn dump_holes(file: String, decls: [Decl]) : Int {
   let r = infer_program(file, decls, false)
   match r.holes {
     [] -> { print("(no typed holes)") r.errs }
-    _  -> { dump_holes_loop(file, r.holes) r.errs }
+    _  -> { dump_holes_loop(file, r.holes, r.prelude_len) r.errs }
+  }
+}
+
+# ---- `--holes-json`: machine-readable hole reports ----
+#
+# Emits a single JSON array, stable schema per docs/typed-holes.md.
+# Each element carries {file, line, col, name, expected_type, in_scope,
+# candidates}. `in_scope` lists every reachable binding including the
+# prelude — an LLM that consumes this output wants the full picture.
+# `candidates` is a (possibly empty) list; bounded synthesis fills it
+# in a follow-up pass, but the array is always present so the schema
+# stays stable across feature rollouts.
+
+fn json_escape_char(c: Char) : String {
+  if c == '"' { "\\\"" }
+  else if c == '\\' { "\\\\" }
+  else if c == '\n' { "\\n" }
+  else if c == '\r' { "\\r" }
+  else if c == '\t' { "\\t" }
+  else if char_to_int(c) < 32 {
+    # Control byte → \u00XX. We only ever feed ASCII into this path,
+    # so two hex digits suffice.
+    let n = char_to_int(c)
+    let hi = n / 16
+    let lo = n % 16
+    concat_all(["\\u00", hex_digit(hi), hex_digit(lo)])
+  }
+  else { "#{c}" }
+}
+
+fn json_escape_loop(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      Some(c) -> json_escape_loop(s, i + 1, n, string_concat(acc, json_escape_char(c)))
+      None    -> acc
+    }
+  }
+}
+
+fn json_escape(s: String) : String =
+  json_escape_loop(s, 0, string_length(s), "")
+
+fn json_str(s: String) : String =
+  concat_all(["\"", json_escape(s), "\""])
+
+fn json_null() : String = "null"
+
+fn json_scope_entry(te: TyEntry) : String =
+  concat_all([
+    "{\"name\": ", json_str(te.name),
+    ", \"type\": ", json_str(scheme_to_string(te.scheme)), "}"
+  ])
+
+fn json_scope_entries(es: [TyEntry]) : String =
+  concat_all(["[", join_with(map(es, json_scope_entry), ", "), "]"])
+
+fn json_candidate(expr: String) : String =
+  concat_all(["{\"expr\": ", json_str(expr), ", \"kind\": \"synth\"}"])
+
+fn json_candidates(cs: [String]) : String =
+  concat_all(["[", join_with(map(cs, json_candidate), ", "), "]"])
+
+fn json_hole_report(file: String, rh: ResolvedHole) : String {
+  match rh {
+    RH(nm_opt, line, col, ty, scope, env_fresh) -> {
+      let name_json = match nm_opt {
+        Some(nm) -> json_str(nm)
+        None     -> json_null()
+      }
+      let cands = synth_candidates(scope, ty, env_fresh)
+      concat_all([
+        "{",
+        "\"file\": ", json_str(file),
+        ", \"line\": ", int_to_string(line),
+        ", \"col\": ", int_to_string(col),
+        ", \"name\": ", name_json,
+        ", \"expected_type\": ", json_str(ty_to_string(ty)),
+        ", \"in_scope\": ", json_scope_entries(scope),
+        ", \"candidates\": ", json_candidates(cands),
+        "}"
+      ])
+    }
+  }
+}
+
+fn dump_holes_json(file: String, decls: [Decl]) : Int {
+  let r = infer_program(file, decls, false)
+  let body = join_with(map(r.holes, (h) => json_hole_report(file, h)), ", ")
+  print(concat_all(["[", body, "]"]))
+  r.errs
+}
+
+# --strict-holes uses this on the normal compile path: emit a
+# one-line diagnostic per hole to stderr, and promote the hole count
+# to the return code so the driver skips emission. Users who want the
+# rich report should run --holes or --holes-json explicitly.
+fn strict_holes_report_loop(file: String, hs: [ResolvedHole]) : Unit {
+  match hs {
+    [] -> ()
+    [h, ...rest] -> {
+      match h {
+        RH(nm_opt, line, col, ty, _, _) -> {
+          let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+          eprint("#{file}:#{int_to_string(line)}:#{int_to_string(col)}: error: unfilled hole #{label} : #{ty_to_string(ty)}")
+        }
+      }
+      strict_holes_report_loop(file, rest)
+    }
+  }
+}
+
+fn strict_holes_check(file: String, decls: [Decl]) : Int {
+  let r = infer_program(file, decls, false)
+  let n = list_length(r.holes)
+  if n == 0 { r.errs }
+  else {
+    strict_holes_report_loop(file, r.holes)
+    eprint("#{file}: #{int_to_string(n)} unfilled hole(s) (--strict-holes)")
+    r.errs + n
   }
 }
 
@@ -7687,6 +7987,7 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
       llvm_emit_pat_subpats(e3, subpats, scr, fail_lbl, 0)
     }
     PList(sub_pats, opt_rest) -> llvm_emit_pat_list(e, sub_pats, opt_rest, scr, fail_lbl)
+    PHole(_) -> e
     _ -> {
       eprint("llvm: pattern kind not supported at #{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
       e
@@ -8196,20 +8497,24 @@ type Mode
   | MDumpTyped
   | MDumpMono
   | MHoles
+  | MHolesJson
   | MEmitLlvm
   | MTest
   | MHelp
 
-type CliOptions = { mode: Mode, path: Option[String], prelude: Option[String] }
+type CliOptions = { mode: Mode, path: Option[String], prelude: Option[String], strict_holes: Bool }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
-  CliOptions { mode: m, path: opts.path, prelude: opts.prelude }
+  CliOptions { mode: m, path: opts.path, prelude: opts.prelude, strict_holes: opts.strict_holes }
 
 fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: Some(p), prelude: opts.prelude }
+  CliOptions { mode: opts.mode, path: Some(p), prelude: opts.prelude, strict_holes: opts.strict_holes }
 
 fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path, prelude: Some(p) }
+  CliOptions { mode: opts.mode, path: opts.path, prelude: Some(p), strict_holes: opts.strict_holes }
+
+fn cli_with_strict_holes(opts: CliOptions) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path, prelude: opts.prelude, strict_holes: true }
 
 fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
   match rest {
@@ -8233,6 +8538,10 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
         parse_cli_loop(more, cli_with_mode(opts, MDumpMono))
       } else if a == "--holes" {
         parse_cli_loop(more, cli_with_mode(opts, MHoles))
+      } else if a == "--holes-json" {
+        parse_cli_loop(more, cli_with_mode(opts, MHolesJson))
+      } else if a == "--strict-holes" {
+        parse_cli_loop(more, cli_with_strict_holes(opts))
       } else if a == "--emit=llvm" {
         parse_cli_loop(more, cli_with_mode(opts, MEmitLlvm))
       } else if a == "--test" {
@@ -8255,7 +8564,7 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
 }
 
 fn parse_cli(argv: [String]) : CliOptions {
-  parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, prelude: None })
+  parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, prelude: None, strict_holes: false })
 }
 
 fn usage() : Unit {
@@ -8270,6 +8579,8 @@ fn usage() : Unit {
   eprint("  --dump-typed       run HM inference and dump the typed AST with per-node Ty")
   eprint("  --dump-mono        list call-site instantiations (name, loc, resolved type args)")
   eprint("  --holes            report every typed hole (`?` / `?name`) with expected type + scope")
+  eprint("  --holes-json       same as --holes, but JSON array for machine consumption")
+  eprint("  --strict-holes     treat every unfilled hole as a compilation error (default: warning)")
   eprint("  --emit=llvm        emit LLVM IR (.ll) instead of C; link with stage0/runtime_llvm.c")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
   eprint("  -h, --help         this help")
@@ -8292,7 +8603,7 @@ fn load_prelude(path: String) : Option[[Decl]] {
   }
 }
 
-fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) : Int {
+fn compile_source(path: String, mode: Mode, strict_holes: Bool, src: String, prelude_decls: [Decl]) : Int {
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
   match mode {
@@ -8331,6 +8642,10 @@ fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) 
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_holes(path, all_decls) }
               }
+              MHolesJson -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_holes_json(path, all_decls) }
+              }
               _ -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk }
@@ -8338,15 +8653,19 @@ fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) 
                   let ty_errs = check_infer(path, all_decls)
                   if ty_errs != 0 { ty_errs }
                   else {
-                    let test_mode = match mode { MTest -> true _ -> false }
-                    let use_llvm = match mode { MEmitLlvm -> true _ -> false }
-                    let out = if use_llvm {
-                      emit_program_llvm(path, src, all_decls, test_mode)
-                    } else {
-                      emit_program(path, src, all_decls, test_mode)
+                    let hole_errs = if strict_holes { strict_holes_check(path, all_decls) } else { 0 }
+                    if hole_errs != 0 { hole_errs }
+                    else {
+                      let test_mode = match mode { MTest -> true _ -> false }
+                      let use_llvm = match mode { MEmitLlvm -> true _ -> false }
+                      let out = if use_llvm {
+                        emit_program_llvm(path, src, all_decls, test_mode)
+                      } else {
+                        emit_program(path, src, all_decls, test_mode)
+                      }
+                      print(out)
+                      0
                     }
-                    print(out)
-                    0
                   }
                 }
               }
@@ -8372,7 +8691,7 @@ fn run(opts: CliOptions) : Int {
         match prelude_decls {
           None -> 1
           Some(pds) -> match read_file(p) {
-            Ok(src) -> compile_source(p, opts.mode, src, pds)
+            Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, src, pds)
             Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
           }
         }
