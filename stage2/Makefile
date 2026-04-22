@@ -100,7 +100,7 @@ test-check: $(TARGET) build
 # C backend's. `minimal/hello.kai` exercises the M3a skeleton; files
 # under `examples/llvm/` cover the incremental milestones with just
 # the constructs each one targets.
-LLVM_MIN_EXAMPLES := hello fizzbuzz
+LLVM_MIN_EXAMPLES := hello fizzbuzz interp
 LLVM_EXAMPLES     := m3b
 test-llvm: $(TARGET) build
 	@set -e; \

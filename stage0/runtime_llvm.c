@@ -72,6 +72,33 @@ KaiValue *kaix_print_thunk(KaiValue *s, KaiValue **a, int n)            { (void)
 KaiValue *kaix_eprint_thunk(KaiValue *s, KaiValue **a, int n)           { (void)s; (void)n; return kai_prelude_eprint(a[0]); }
 KaiValue *kaix_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)    { (void)s; (void)n; return kai_prelude_int_to_string(a[0]); }
 
+/* ---------- M3d: variants + match ---------- */
+KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args) {
+    return kai_variant(tag, name, n, args);
+}
+
+/* 1 iff `v` is a KAI_VARIANT whose tag name matches `name`. Used as
+   the discriminator in match arms. */
+int kaix_is_variant(KaiValue *v, const char *name) {
+    return v && v->tag == KAI_VARIANT && strcmp(v->as.var.variant_name, name) == 0;
+}
+
+/* Read the i-th argument of a variant. incref so the caller owns it;
+   the C backend passes variant args as borrowed references, but the
+   LLVM path keeps ownership uniform. */
+KaiValue *kaix_variant_arg(KaiValue *v, int i) {
+    return kai_incref(v->as.var.args[i]);
+}
+
+/* kai_eq returns an int; wrap for direct use from the IR in match
+   guards or literal patterns that want a KaiValue* Bool. */
+KaiValue *kaix_eq_raw(KaiValue *a, KaiValue *b) { return kai_bool(kai_eq(a, b)); }
+
+/* Panic with a message. The LLVM match lowering calls this in the
+   fall-through block of the last arm when no pattern matches, so the
+   generated IR then drops into `unreachable`. */
+KaiValue *kaix_panic(KaiValue *msg) { return kai_prelude_panic(msg); }
+
 /* Entry point: the LLVM output defines kai_main. Match what the C
    backend's emit_main_wrapper does. */
 extern KaiValue *kai_main(void);
