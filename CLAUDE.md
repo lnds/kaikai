@@ -10,32 +10,66 @@ The project is in a **full redesign phase**. The previous history (a partial com
 - **All documentation in English.** Including `README.md`, `docs/`, code comments, and any user-facing text.
 - Conversation with the user (Spanish) is not documentation and does not appear in the repo.
 
-## Cross-cutting principles (non-negotiable)
+## Cross-cutting principles
 
-1. **Fast compilation** (Go-style)
-   - Decidable, predictable type system. No costly type-class resolution.
-   - Single-pass parsing, no arbitrary macros.
+Three tiers, ordered by how non-negotiable they are. When principles conflict, the higher tier wins.
 
-2. **LLM-friendly**
-   - Regular and predictable syntax, minimal special cases.
-   - One canonical form for each construct (no syntactic redundancy).
-   - Self-explanatory compile errors with concrete suggestions.
+### Tier 1 — Load-bearing
 
-3. **Safe**
+1. **Safe at compile time**
    - Memory safety by default.
-   - No-null by types (`Option[T]`, never `null`).
-   - Typed effects: IO and errors cannot escape unhandled.
+   - No null; `Option[T]` always.
+   - Effects visible in types: IO, errors, cancellation, spawn. A function cannot be called from a context that does not handle its effects.
+   - Explicit runtime escapes, audited not incidental: `panic`, unfilled `?`, `todo!`, unbound `axiom`, FFI crossings, **opaque mutable `Array[T]`**.
+   - The Array escape is provisional: `array_make / get / set / grow` mutate in place and the mutation is not visible in the type. It exists so the stage 2 inferencer can index its substitution by TyVar id in O(1). It must migrate behind a `Mutable` / `State` effect once effects land, and must not be used as a general-purpose container in new code.
 
-4. **Runtime-efficient**
-   - Monomorphization of generics.
-   - Mandatory tail-call optimization.
-   - Compact representations (unbox when possible).
-   - Low-overhead effects (CPS or segmented stacks).
+2. **Runtime-efficient**
+   - Monomorphisation of generics.
+   - Mandatory tail-call optimisation.
+   - Primitives unboxed inside fibers; heap boxing only for compound immutables.
+   - Effects compiled with one-shot continuations as the zero-cost default; multi-shot pays on use.
 
-5. **Easy to learn**
-   - Familiar syntax (Python / JS / Elixir as references).
-   - Few core concepts, orthogonal to each other.
-   - Early REPL, readable error messages.
+3. **Fast compilation**
+   - Single-pass parse, LL(1) grammar with minor bookkeeping.
+   - HM-extended types with effect rows; decidable; no type-class resolution.
+   - Pipeline `lex → parse → resolve → infer → monomorph → perceus → lower`, dumpable between any two passes.
+
+### Tier 2 — Aspirational (trade-offs allowed; Tier 1 wins ties)
+
+4. **Structured compiler output**
+   - Diagnostics and queries come as stable JSON alongside human text. Typed holes + `--holes-json` are the prototype; `kai type --json` and siblings extend the contract.
+   - **Not** "one canonical form per construct". The language has intentional redundancies (`=` vs `{}` bodies, `|>` vs `|`, multiple lambda forms) — each form signals intent. The real rule is *few forms, each with clear intent*.
+
+5. **Approachable core, novel where it pays off**
+   - Day-to-day syntax (declarations, `let`, `if`, `match`, pipes, pattern matching) stays close to Python / JS / Elixir.
+   - Advanced surface — effects, handlers, nursery, fibers, holes — is **novel on purpose**. Expect a one-day ramp for sequential kaikai and a week to internalise the effect model.
+
+6. **Few visible concepts, layered**
+   - Floor: ~10 concepts for basic code (types, functions, `let`, `match`, `if`, records, sum types, lists, pipes, strings).
+   - Advanced features stack on top; no program pays for every concept.
+
+### Tier 3 — Strategic bet (depends on future conditions)
+
+7. **LLM authorability**
+   - Bet: with typed holes + structured JSON + stable rules, LLMs can author kaikai, even though current models know Python / Rust far better than effect-typed languages.
+   - Mechanism: shift weight from *the model knowing kaikai* to *the compiler telling the model what goes where* — holes, effect queries, exhaustiveness counterexamples.
+   - Acceptance criterion: an LLM with JSON access completes the top 80% of typical functions within one round of compilation.
+
+## Tie-breakers when principles conflict
+
+- Safety beats ergonomics.
+- Fast compilation beats generality.
+- Runtime efficiency beats expressive novelty.
+- Approachability beats one-canonical-form.
+- LLM-friendliness is not a veto: a feature good for LLMs but bad for humans does not ship.
+
+## Not principles
+
+Do not cite these in design arguments:
+- *One canonical form per construct* — already violated four times deliberately; see #4.
+- *Never surprise a Python programmer* — effects surprise them, by design; see #5.
+- *Zero-cost abstractions* — effects, fibers, and RC have small but non-zero costs.
+- *Backward compatibility* — not promised until post-MVP.
 
 ## Baseline architectural decisions
 
@@ -66,9 +100,10 @@ cc stage0/*.c -o kaic0
 
 - **Do not go back to Go** for the compiler. The prior Go frontend was discarded on purpose.
 - **Do not introduce a Rust-style borrow checker**. Perceus + fibers resolves memory at compile time without cognitive cost.
-- **Do not add redundant syntax**. One canonical form per construct.
+- **Do not add forms whose intent overlaps with an existing one**. Two bodies for functions is fine (short vs block); two pipes is fine (apply vs map); a third way to do the same thing with no new intent is not. The standard is *few forms, each carrying distinct intent* — not *one form, full stop*.
 - **Do not add dependencies to stage 0**. It must build on any system with an ANSI `cc`.
 - **Do not design against WASM, Windows, or other post-MVP targets**, but do not invest effort in them now either.
+- **Do not cite retired principles** in design arguments (see the "Not principles" section above).
 
 ## Current state
 

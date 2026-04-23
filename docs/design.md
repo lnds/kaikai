@@ -17,31 +17,128 @@ This document is updated as decisions are closed.
 
 ## Cross-cutting principles
 
-1. **Fast compilation** (Go model)
-   - Decidable, predictable type system (HM-extended or Effekt-style).
-   - Single-pass parsing, no arbitrary macros.
-   - No costly type-class resolution.
+Three tiers, ordered by how non-negotiable they are. When principles
+conflict, the higher tier wins. This structure replaces the earlier
+flat list; the motivation is that the flat list had internal
+tensions (e.g. "familiar syntax" vs "one canonical form"; "easy to
+learn" vs algebraic effects) that were being resolved case by case
+without being named. Tiers make the trade-offs explicit.
 
-2. **LLM-friendly**
-   - Regular, predictable syntax, minimal special cases.
-   - One canonical form per construct (no syntactic redundancy).
-   - Self-explanatory compile errors with concrete suggestions.
+### Tier 1 — Load-bearing
 
-3. **Safe**
-   - Memory safety by default (see memory model).
-   - No-null by types (`Option[T]`, never `null`).
-   - Typed effects: IO and errors cannot escape unhandled.
+The design breaks if any of these is compromised.
 
-4. **Runtime-efficient**
-   - Monomorphization of generics.
-   - Mandatory tail-call optimization.
-   - Compact representations (unbox when possible).
-   - Low-overhead effects (CPS or segmented stacks).
+1. **Safe at compile time**
+   - Memory safety by default (see memory model below).
+   - No null; `Option[T]` is the canonical absence type.
+   - Effects are visible in types: IO, errors, cancellation, spawn
+     appear as rows on the function's signature. A function cannot
+     be called from a context that does not handle its effects.
+   - Runtime escapes are explicit and audited: `panic(msg)`,
+     unfilled typed holes (`?`), `todo!(msg)`, `axiom` without a
+     linked body, and FFI crossings. These abort the process; they
+     do not silently recover.
 
-5. **Easy to learn**
-   - Familiar syntax (Python/JS/Elixir as references).
-   - Few core concepts, orthogonal to each other.
-   - Early REPL, readable error messages.
+2. **Runtime-efficient**
+   - Monomorphisation of generics; no dictionary passing.
+   - Mandatory tail-call optimisation for self-recursion and mutual
+     recursion within a module.
+   - Compact representations: primitives unboxed inside each fiber,
+     heap boxing only for compound immutable values.
+   - Effects compiled with one-shot continuations as the zero-cost
+     default; multi-shot is a runtime property paid only on use.
+
+3. **Fast compilation**
+   - Single-pass parse, LL(1) grammar with minor bookkeeping.
+   - HM-extended type system with effect rows. Decidable. No
+     type-class resolution.
+   - Pipeline `lex → parse → resolve → infer → monomorph → perceus →
+     lower`, each pass a pure function of its input, with
+     `--dump=<pass>` between any two.
+
+### Tier 2 — Aspirational (trade-offs allowed; Tier 1 wins ties)
+
+4. **Structured compiler output**
+   - Every diagnostic and query is emitted as stable JSON alongside
+     the human-readable text. Typed holes + `--holes-json` are the
+     prototype for this contract; `kai type --json`, `kai effects
+     --json`, and the counterexample JSON for non-exhaustive matches
+     extend it. See `docs/proposed-extensions.md`.
+   - **Not** "one canonical form per construct". The language has
+     intentional redundancies: `=` expression body vs `{ ... }` block
+     body, `|>` (apply) vs `|` (map), and three lambda forms
+     (`x => ...`, `(a, b) => ...`, placeholder `.`). Each form
+     signals intent. The real rule is *few forms, each with clear
+     intent*, not *one form, full stop*.
+
+5. **Approachable core, novel where it pays off**
+   - Day-to-day syntax — declarations, `let`, `if`, `match`, pipes,
+     pattern matching, interpolation — deliberately stays close to
+     Python / JavaScript / Elixir.
+   - The advanced surface — effects, handlers, nursery, fibers,
+     typed holes — is **novel on purpose**. It has no direct
+     analogue in mainstream languages. The cost is a learning bump;
+     the payoff is that one coherent mechanism replaces
+     async/await + try/catch + cancellation tokens + actor
+     frameworks.
+   - Concretely: a Python programmer should be productive on
+     sequential kaikai in about a day, and take roughly a week to
+     internalise the effect model.
+
+6. **Few visible concepts, layered**
+   - The floor for basic code is about ten concepts: types,
+     functions, `let`, `match`, `if`, records, sum types, lists,
+     pipes, strings.
+   - Advanced features (effects, handlers, fibers, nursery, holes)
+     layer on top and are adopted when needed. A program that does
+     not use them pays no cognitive cost for them.
+   - Orthogonality is enforced by review: every new feature must
+     not duplicate another, must compose cleanly with effects, and
+     must live in a single dedicated design doc.
+
+### Tier 3 — Strategic bet (depends on future conditions)
+
+7. **LLM authorability**
+   - The bet: with typed holes + structured JSON + a stable
+     ruleset, LLMs can author kaikai well, even though current
+     models know Python and Rust far better than effect-typed
+     languages. The corpus catches up, or the tooling compensates;
+     either way the loop closes.
+   - The mechanism: shift weight from *the model knowing kaikai*
+     to *the compiler telling the model what goes where*. Typed
+     holes surface expected types and candidates; `kai type --json`
+     answers position queries; counterexample JSON tells the model
+     which patterns it missed.
+   - Acceptance criterion: an LLM with access to the JSON surface
+     can complete the top 80% of typical functions a programmer
+     would ask it to write, within one round of compilation. If
+     that does not hold in practice, re-evaluate before adding
+     features motivated by this principle.
+
+## Tie-breakers when principles conflict
+
+- Safety beats ergonomics.
+- Fast compilation beats generality.
+- Runtime efficiency beats expressive novelty.
+- Approachability beats one-canonical-form.
+- LLM-friendliness is not a veto: a feature good for LLMs but bad
+  for humans does not ship.
+
+## Not principles
+
+Retired or explicitly rejected. Do not cite these in design
+arguments:
+
+- *One canonical form per construct* — already violated four times
+  deliberately; see #4. The real standard is *few forms with clear
+  intent*.
+- *Never surprise a Python programmer* — effects, nursery, and
+  typed holes will surprise them, by design; see #5.
+- *Zero-cost abstractions* — effects, fibers, and Perceus RC have
+  small but non-zero costs. The target is *low* cost, not zero.
+- *Backward compatibility across phases* — not promised until
+  post-MVP. Phase-4 code may not compile under stage 2 without
+  adjustment.
 
 ## Decisions
 
@@ -52,6 +149,7 @@ This document is updated as decisions are closed.
   - **Perceus** (compile-time optimized reference counting, Koka-style) within each fiber.
   - **Isolated fibers** BEAM-style: private heap per fiber, messages copied across boundaries.
   - Goal: compile-time memory-lifetime decisions without a visible borrow checker, predictable latencies via fiber-local GC.
+  - **Provisional escape — opaque mutable `Array[T]`**. The stage 2 inferencer needs O(1) substitution lookups to self-compile in reasonable time; `array_make / length / get / set / grow` are builtins that mutate in place. Treated today as an audited runtime escape (alongside `panic`, FFI, unfilled `?`), *not* as a general-purpose container. The mutation is invisible in the type, which violates Tier 1 "effects visible in types" — accepted as technical debt. **Migration plan**: once the `Mutable` / `State` effect lands, retrofit `array_set` and friends behind it so callers declare the capability. Until then, do not expose `Array[T]` in userland surface code; confine it to the compiler's inferencer and similar linearly-threaded hot paths.
 - **Formal effects model**: capability-passing **Effekt + inference**.
   - Effects as an explicit set of capabilities, passed implicitly by the compiler.
   - **Effect inference in local bodies**: the user does not annotate sets in private functions; the compiler infers them.
@@ -152,7 +250,9 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 ## Open decisions
 
 - **Concrete syntax consolidation**: eliminate redundancies (`let`/`:=`, `switch`/`cond`/`match`, `|` vs `|>`, collections `[]`/`()`/`{}`, atoms/structs/maps). *Deferred until kaikai-minimal stabilizes.*
-- **LLM-friendly extensions**: a catalogue of typed-holes-adjacent features — principled `todo!`, type-query JSON, exhaustiveness counterexamples, `axiom`, effect holes, import holes, canonical-form lints. All proposed, none adopted. Each follows the typed-holes output contract (human text + stable JSON). Full list, costs, and adoption criteria in `docs/proposed-extensions.md`.
+- **Extensions catalogue** (`docs/proposed-extensions.md`): two families of proposed additions, none adopted yet.
+  - *LLM-friendly diagnostics* — typed-holes-adjacent features (principled `todo!`, type-query JSON, exhaustiveness counterexamples, `axiom`, effect holes, import holes, canonical-form lints). Share the typed-holes output contract (human text + stable JSON).
+  - *Language-surface features* — tuples `(T1, T2)`, record punning `{ x, y }`, `variants[T]()`, sum types with constant attributes, `!` postfix (Option/Result propagation), `@` as-patterns, `?.` optional chaining, and deferred bitwise operators. These are the candidates for closing the *syntax consolidation* decision above.
 
 ## Roadmap
 
