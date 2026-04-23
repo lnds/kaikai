@@ -3106,10 +3106,12 @@ fn prelude_names() : [String] {
     "print", "eprint", "read_file", "write_file", "read_line", "args",
     "exit", "panic",
     "int_to_string", "real_to_string", "string_to_int", "string_to_real",
-    "string_length", "string_concat", "string_split", "string_contains", "char_at",
+    "string_length", "string_concat", "string_concat_all", "string_join",
+    "string_split", "string_contains", "char_at",
     "string_slice", "char_to_int", "int_to_char",
     "list_length", "list_append", "list_reverse",
     "map", "filter", "reduce", "each",
+    "array_make", "array_length", "array_get", "array_set", "array_grow",
     "Some", "None", "Ok", "Err"
   ]
 }
@@ -3413,16 +3415,9 @@ fn cat4(a: String, b: String, c: String, d: String) : String =
 fn cat5(a: String, b: String, c: String, d: String, ee: String) : String =
   string_concat(a, string_concat(b, string_concat(c, string_concat(d, ee))))
 
-fn concat_all(xs: [String]) : String =
-  reduce(xs, "", (acc, s) => string_concat(acc, s))
+fn concat_all(xs: [String]) : String = string_concat_all(xs)
 
-fn join_with(xs: [String], sep: String) : String {
-  match xs {
-    [] -> ""
-    [x] -> x
-    [x, ...rest] -> string_concat(x, string_concat(sep, join_with(rest, sep)))
-  }
-}
+fn join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 
 # ---- tables: user function arities, variant arities ----
 #
@@ -3514,6 +3509,8 @@ fn prelude_table() : [EPrelude] {
     EP("real_to_string",   "kai_prelude_real_to_string",   1),
     EP("string_length",    "kai_prelude_string_length",    1),
     EP("string_concat",    "kai_prelude_string_concat",    2),
+    EP("string_concat_all","kai_prelude_string_concat_all",1),
+    EP("string_join",      "kai_prelude_string_join",      2),
     EP("list_length",      "kai_prelude_list_length",      1),
     EP("list_append",      "kai_prelude_list_append",      2),
     EP("list_reverse",     "kai_prelude_list_reverse",     1),
@@ -3532,7 +3529,12 @@ fn prelude_table() : [EPrelude] {
     EP("string_contains",  "kai_prelude_string_contains",  2),
     EP("string_slice",     "kai_prelude_string_slice",     3),
     EP("char_to_int",      "kai_prelude_char_to_int",      1),
-    EP("int_to_char",      "kai_prelude_int_to_char",      1)
+    EP("int_to_char",      "kai_prelude_int_to_char",      1),
+    EP("array_make",       "kai_prelude_array_make",       2),
+    EP("array_length",     "kai_prelude_array_length",     1),
+    EP("array_get",        "kai_prelude_array_get",        2),
+    EP("array_set",        "kai_prelude_array_set",        3),
+    EP("array_grow",       "kai_prelude_array_grow",       3)
   ]
 }
 
@@ -3724,6 +3726,15 @@ fn emit_range_expr(src: String, from: Expr, to: Expr, opt_step: Option[Expr],
 fn emit_list_tail(src: String, elems: [ListElem], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   match elems {
     [] -> "kai_nil()"
+    # Tail spread `[..., ...xs]`: `kai_incref(xs)` gives the caller
+    # a result whose RC is 1 and leaves xs untouched, matching the
+    # ownership contract list_append used to provide via spine copy
+    # — but in O(1) instead of O(|xs|). This collapses the O(n²)
+    # blowup of the `[x, ...acc]` parser prepend pattern.
+    [el] -> match el {
+      ElPlain(x) -> concat_all(["kai_cons(", emit_expr(src,x, fns, variants, lams), ", kai_nil())"])
+      ElSpread(x) -> concat_all(["kai_incref(", emit_expr(src, x, fns, variants, lams), ")"])
+    }
     [el, ...rest] -> match el {
       ElPlain(x) -> concat_all([
         "kai_cons(", emit_expr(src,x, fns, variants, lams), ", ",
@@ -3987,32 +3998,37 @@ fn interp_is_triple(span: String) : Bool {
 # grow the current literal span.
 type IScan = { parts: [IPart], lit_start: Int, i: Int }
 
-fn iscan_collect(span: String, end: Int, st: IScan) : [IPart] {
-  if st.i >= end { finish_iscan(span, end, st) }
+# `st.parts` accumulates in REVERSE here for O(1) prepend; the public
+# iscan_collect entry point reverses once at the end.
+fn iscan_collect_rev(span: String, end: Int, st: IScan) : [IPart] {
+  if st.i >= end { finish_iscan_rev(span, end, st) }
   else {
     match char_at(span, st.i) {
-      None -> finish_iscan(span, end, st)
+      None -> finish_iscan_rev(span, end, st)
       Some(c) -> {
         let nxt = match char_at(span, st.i + 1) { Some(c2) -> c2 None -> ' ' }
         if c == '#' and nxt == '{' and st.i + 1 < end {
-          let lit_part =
+          let with_lit =
             if st.i > st.lit_start {
               let piece = string_slice(span, st.lit_start, st.i - st.lit_start)
-              [IpLit(piece, cat3("\"", piece, "\""))]
-            } else { [] }
+              [IpLit(piece, cat3("\"", piece, "\"")), ...st.parts]
+            } else { st.parts }
           let expr_start = st.i + 2
           let expr_end = iscan_expr_end(span, expr_start, end, 1)
           let expr_src = string_slice(span, expr_start, expr_end - expr_start)
-          let new_parts = list_append(st.parts, list_append(lit_part, [IpExp(expr_src)]))
+          let new_parts = [IpExp(expr_src), ...with_lit]
           let next_i = if expr_end < end { expr_end + 1 } else { expr_end }
-          iscan_collect(span, end, IScan { parts: new_parts, lit_start: next_i, i: next_i })
+          iscan_collect_rev(span, end, IScan { parts: new_parts, lit_start: next_i, i: next_i })
         } else {
-          iscan_collect(span, end, IScan { parts: st.parts, lit_start: st.lit_start, i: st.i + 1 })
+          iscan_collect_rev(span, end, IScan { parts: st.parts, lit_start: st.lit_start, i: st.i + 1 })
         }
       }
     }
   }
 }
+
+fn iscan_collect(span: String, end: Int, st: IScan) : [IPart] =
+  list_reverse(iscan_collect_rev(span, end, st))
 
 fn iscan_expr_end(span: String, i: Int, end: Int, depth: Int) : Int {
   if depth == 0 or i >= end { i }
@@ -4031,10 +4047,10 @@ fn iscan_expr_end(span: String, i: Int, end: Int, depth: Int) : Int {
   }
 }
 
-fn finish_iscan(span: String, end: Int, st: IScan) : [IPart] {
+fn finish_iscan_rev(span: String, end: Int, st: IScan) : [IPart] {
   if st.lit_start < end {
     let piece = string_slice(span, st.lit_start, end - st.lit_start)
-    list_append(st.parts, [IpLit(piece, cat3("\"", piece, "\""))])
+    [IpLit(piece, cat3("\"", piece, "\"")), ...st.parts]
   } else {
     st.parts
   }
@@ -4284,7 +4300,7 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
       let own = params_to_names(params)
       let caps = fv_expr(body, own, st.globals, [])
       let info = LamInfo(id, x.line, x.col, params, caps, body)
-      let st1 = LamCollect { next_id: id + 1, lams: list_append(st.lams, [info]), globals: st.globals }
+      let st1 = LamCollect { next_id: id + 1, lams: [info, ...st.lams], globals: st.globals }
       collect_expr(body, st1)
     }
     ERecordLit(_, fields) -> collect_field_inits(fields, st)
@@ -5035,6 +5051,8 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     # Strings
     TyEntry { name: "string_length",  scheme: mono(fn_ty([TyString],                TyInt)) },
     TyEntry { name: "string_concat",  scheme: mono(fn_ty([TyString, TyString],      TyString)) },
+    TyEntry { name: "string_concat_all", scheme: mono(fn_ty([list_ty(TyString)],    TyString)) },
+    TyEntry { name: "string_join",    scheme: mono(fn_ty([list_ty(TyString), TyString], TyString)) },
     TyEntry { name: "string_slice",   scheme: mono(fn_ty([TyString, TyInt, TyInt],  TyString)) },
     TyEntry { name: "string_split",   scheme: mono(fn_ty([TyString, TyString],      list_ty(TyString))) },
     TyEntry { name: "string_contains",scheme: mono(fn_ty([TyString, TyString],      TyBool)) },
@@ -5049,7 +5067,14 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "map",    scheme: scheme([0, 1], fn_ty([list_ty(tv(0)), fn_ty([tv(0)], tv(1))], list_ty(tv(1)))) },
     TyEntry { name: "filter", scheme: scheme([0],    fn_ty([list_ty(tv(0)), fn_ty([tv(0)], TyBool)], list_ty(tv(0)))) },
     TyEntry { name: "reduce", scheme: scheme([0, 1], fn_ty([list_ty(tv(0)), tv(1), fn_ty([tv(1), tv(0)], tv(1))], tv(1))) },
-    TyEntry { name: "each",   scheme: scheme([0],    fn_ty([list_ty(tv(0)), fn_ty([tv(0)], TyUnit)],  TyUnit)) }
+    TyEntry { name: "each",   scheme: scheme([0],    fn_ty([list_ty(tv(0)), fn_ty([tv(0)], TyUnit)],  TyUnit)) },
+
+    # Opaque mutable arrays.
+    TyEntry { name: "array_make",   scheme: scheme([0], fn_ty([TyInt, tv(0)],                                TyCon("Array", [tv(0)]))) },
+    TyEntry { name: "array_length", scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)])],                      TyInt)) },
+    TyEntry { name: "array_get",    scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)]), TyInt],               tv(0))) },
+    TyEntry { name: "array_set",    scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)]), TyInt, tv(0)],        TyCon("Array", [tv(0)]))) },
+    TyEntry { name: "array_grow",   scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)]), TyInt, tv(0)],        TyCon("Array", [tv(0)]))) }
   ]
   TyEnv { entries: list_append(es, env.entries), fresh: env.fresh }
 }
@@ -5248,27 +5273,32 @@ fn dump_env(env: TyEnv) : Unit =
 # with a fresh TyVarT drawn from the environment's counter. Each call
 # site of a polymorphic function gets its own fresh vars.
 
-# Kaikai-minimal doesn't have bare tuples, so we wrap (Int, Ty) in a
-# single-variant sum SB. The Subst record holds `[SB]`.
-type SBind = SB(Int, Ty)
+# The substitution is indexed directly by TyVar id, so apply_ty and
+# occurs do O(1) lookups instead of walking an association list. The
+# underlying array is mutable: subst_extend mutates in place and
+# returns a new record that aliases the same array. Callers must not
+# keep references to the "old" subst across an extend. This pattern
+# matches how unify / mk_fresh_subst already use the subst (build,
+# thread, discard) but would break if a caller tried to fork the
+# state between two trials.
+type Subst = { slots: Array[Option[Ty]] }
 
-type Subst = { binds: [SBind] }
+fn subst_empty() : Subst = Subst { slots: array_make(64, None) }
 
-fn subst_empty() : Subst = Subst { binds: [] }
-
-fn subst_lookup_loop(bs: [SBind], v: Int) : Option[Ty] {
-  match bs {
-    [] -> None
-    [b, ...rest] -> match b {
-      SB(k, ty) -> if k == v { Some(ty) } else { subst_lookup_loop(rest, v) }
-    }
-  }
+fn subst_lookup(s: Subst, v: Int) : Option[Ty] {
+  if v >= array_length(s.slots) { None }
+  else { array_get(s.slots, v) }
 }
 
-fn subst_lookup(s: Subst, v: Int) : Option[Ty] = subst_lookup_loop(s.binds, v)
-
-fn subst_extend(s: Subst, v: Int, ty: Ty) : Subst =
-  Subst { binds: [SB(v, ty), ...s.binds] }
+fn subst_extend(s: Subst, v: Int, ty: Ty) : Subst {
+  let len = array_length(s.slots)
+  let slots1 = if v >= len {
+    let grown = if v + 1 > len * 2 { v + 1 } else { len * 2 }
+    array_grow(s.slots, grown, None)
+  } else { s.slots }
+  let slots2 = array_set(slots1, v, Some(ty))
+  Subst { slots: slots2 }
+}
 
 # Apply the substitution to a type. Recurses structurally; resolves
 # `TyVarT(n)` via subst_lookup, then recurses on the replacement so a
@@ -5407,15 +5437,15 @@ fn fresh_var(env: TyEnv) : TyEnv =
 fn advance_fresh(env: TyEnv, n: Int) : TyEnv =
   if n <= 0 { env } else { advance_fresh(fresh_var(env), n - 1) }
 
-fn mk_fresh_subst_loop(vars: [Int], start: Int, acc: [SBind]) : [SBind] {
+fn mk_fresh_subst_loop(vars: [Int], start: Int, s: Subst) : Subst {
   match vars {
-    [] -> acc
-    [v, ...rest] -> mk_fresh_subst_loop(rest, start + 1, [SB(v, TyVarT(start)), ...acc])
+    [] -> s
+    [v, ...rest] -> mk_fresh_subst_loop(rest, start + 1, subst_extend(s, v, TyVarT(start)))
   }
 }
 
 fn mk_fresh_subst(vars: [Int], start: Int) : Subst =
-  Subst { binds: mk_fresh_subst_loop(vars, start, []) }
+  mk_fresh_subst_loop(vars, start, subst_empty())
 
 # Turn a TyScheme into a pair `(env-with-advanced-counter, ty)` where
 # every bound var in the scheme has been replaced by a fresh TyVarT
@@ -7352,6 +7382,13 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_prelude_string_to_real(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_string_length(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_string_concat(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_string_concat_all(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_string_join(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_array_make(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_array_length(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_array_get(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_array_set(%KaiValue*, %KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_array_grow(%KaiValue*, %KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_string_slice(%KaiValue*, %KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_string_split(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_string_contains(%KaiValue*, %KaiValue*)\n",
@@ -7585,12 +7622,19 @@ fn llvm_prelude_table() : [LlvmPrelude] {
     LP("string_to_real",   1, None),
     LP("string_length",    1, None),
     LP("string_concat",    2, None),
+    LP("string_concat_all",1, None),
+    LP("string_join",      2, None),
     LP("string_slice",     3, None),
     LP("string_split",     2, None),
     LP("string_contains",  2, None),
     LP("char_at",          2, None),
     LP("char_to_int",      1, None),
-    LP("int_to_char",      1, None)
+    LP("int_to_char",      1, None),
+    LP("array_make",       2, None),
+    LP("array_length",     1, None),
+    LP("array_get",        2, None),
+    LP("array_set",        3, None),
+    LP("array_grow",       3, None)
   ]
 }
 

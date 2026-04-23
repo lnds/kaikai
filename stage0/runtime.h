@@ -50,7 +50,8 @@ typedef enum {
     KAI_CONS,
     KAI_RECORD,
     KAI_VARIANT,
-    KAI_CLOSURE
+    KAI_CLOSURE,
+    KAI_ARRAY
 } KaiTag;
 
 typedef struct KaiValue KaiValue;
@@ -85,6 +86,16 @@ struct KaiValue {
             int32_t     n_captures;
             KaiValue  **captures;
         } clo;
+        /* Opaque mutable array. Used by the stage 2 inferencer to keep
+           the HM substitution indexed by TyVar id, so apply_ty lookups
+           are O(1) instead of O(k) over an association list. Set
+           mutates in place and returns the same value (Perceus unaware
+           — callers must not alias an array across logical versions). */
+        struct {
+            int64_t     len;
+            int64_t     cap;
+            KaiValue  **items;
+        } arr;
     } as;
 };
 
@@ -125,6 +136,10 @@ static void kai_free_value(KaiValue *v) {
         case KAI_CLOSURE:
             for (int i = 0; i < v->as.clo.n_captures; ++i) kai_decref(v->as.clo.captures[i]);
             free(v->as.clo.captures);
+            break;
+        case KAI_ARRAY:
+            for (int64_t i = 0; i < v->as.arr.len; ++i) kai_decref(v->as.arr.items[i]);
+            free(v->as.arr.items);
             break;
         default: break;
     }
@@ -213,6 +228,66 @@ static KaiValue *kai_variant(int32_t tag, const char *name, int n, KaiValue **ar
     return v;
 }
 
+/* Allocate an array of `len` slots, each initialised to `init`
+   (incref'd once per slot). Caller owns the returned array. */
+static KaiValue *kai_array_make(int64_t len, KaiValue *init) {
+    if (len < 0) { fprintf(stderr, "kai: array_make: negative length\n"); exit(1); }
+    KaiValue *v = kai_alloc(KAI_ARRAY);
+    v->as.arr.len = len;
+    v->as.arr.cap = len > 0 ? len : 1;
+    v->as.arr.items = (KaiValue **) malloc((size_t) v->as.arr.cap * sizeof(KaiValue *));
+    if (!v->as.arr.items) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    for (int64_t i = 0; i < len; ++i) v->as.arr.items[i] = kai_incref(init);
+    return v;
+}
+
+/* Grow `a` to length `new_len`, initialising new slots with `init`.
+   Mutates in place, returns the same value (incref'd for the caller
+   so the result can be bound just like kai_array_make). If new_len
+   <= current len this is a no-op beyond the incref. */
+static KaiValue *kai_array_grow_impl(KaiValue *a, int64_t new_len, KaiValue *init) {
+    if (!a || a->tag != KAI_ARRAY) {
+        fprintf(stderr, "kai: array_grow: not an array\n"); exit(1);
+    }
+    if (new_len > a->as.arr.cap) {
+        int64_t nc = a->as.arr.cap * 2;
+        if (nc < new_len) nc = new_len;
+        a->as.arr.items = (KaiValue **) realloc(a->as.arr.items, (size_t) nc * sizeof(KaiValue *));
+        if (!a->as.arr.items) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        a->as.arr.cap = nc;
+    }
+    for (int64_t i = a->as.arr.len; i < new_len; ++i) a->as.arr.items[i] = kai_incref(init);
+    if (new_len > a->as.arr.len) a->as.arr.len = new_len;
+    return kai_incref(a);
+}
+
+/* O(1) read. Callers own the returned reference. */
+static KaiValue *kai_array_get_impl(KaiValue *a, int64_t i) {
+    if (!a || a->tag != KAI_ARRAY) {
+        fprintf(stderr, "kai: array_get: not an array\n"); exit(1);
+    }
+    if (i < 0 || i >= a->as.arr.len) {
+        fprintf(stderr, "kai: array_get: index %lld out of range (len=%lld)\n",
+                (long long) i, (long long) a->as.arr.len); exit(1);
+    }
+    return kai_incref(a->as.arr.items[i]);
+}
+
+/* O(1) write. Takes ownership of `v`, decref's the previous slot.
+   Returns the same array (incref'd) so callers can thread it. */
+static KaiValue *kai_array_set_impl(KaiValue *a, int64_t i, KaiValue *v) {
+    if (!a || a->tag != KAI_ARRAY) {
+        fprintf(stderr, "kai: array_set: not an array\n"); exit(1);
+    }
+    if (i < 0 || i >= a->as.arr.len) {
+        fprintf(stderr, "kai: array_set: index %lld out of range (len=%lld)\n",
+                (long long) i, (long long) a->as.arr.len); exit(1);
+    }
+    kai_decref(a->as.arr.items[i]);
+    a->as.arr.items[i] = v;
+    return kai_incref(a);
+}
+
 static KaiValue *kai_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures) {
     KaiValue *v = kai_alloc(KAI_CLOSURE);
     v->as.clo.fn = fn;
@@ -282,6 +357,7 @@ static int kai_eq(KaiValue *a, KaiValue *b) {
             }
             return 1;
         case KAI_CLOSURE: return 0;      /* closures are not equatable */
+        case KAI_ARRAY:   return 0;      /* arrays are opaque, identity-compared */
     }
     return 0;
 }
@@ -355,6 +431,7 @@ static KaiValue *kai_to_string(KaiValue *v) {
             return cl;
         }
         case KAI_CLOSURE: return kai_str("<closure>");
+        case KAI_ARRAY:   return kai_str("<array>");
     }
     return kai_str("?");
 }
@@ -368,6 +445,65 @@ static KaiValue *kai_string_concat(KaiValue *a, KaiValue *b) {
     if (la) memcpy(v->as.s.bytes, a->as.s.bytes, la);
     if (lb) memcpy(v->as.s.bytes + la, b->as.s.bytes, lb);
     v->as.s.bytes[la + lb] = '\0';
+    return v;
+}
+
+/* Two-pass concat of every KAI_STR in the cons list: measure total
+   length, allocate once, memcpy each piece in. Avoids the O(n²)
+   accumulation that a naive fold of kai_string_concat produces, which
+   dominates emit-heavy workloads like the self-hosting compiler. */
+static KaiValue *kai_string_concat_all_impl(KaiValue *xs) {
+    size_t total = 0;
+    for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+        KaiValue *s = p->as.cons.head;
+        if (s && s->tag == KAI_STR) total += s->as.s.len;
+    }
+    KaiValue *v = kai_alloc(KAI_STR);
+    v->as.s.len = total;
+    v->as.s.bytes = (char *) malloc(total + 1);
+    if (!v->as.s.bytes) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    size_t off = 0;
+    for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+        KaiValue *s = p->as.cons.head;
+        if (s && s->tag == KAI_STR && s->as.s.len > 0) {
+            memcpy(v->as.s.bytes + off, s->as.s.bytes, s->as.s.len);
+            off += s->as.s.len;
+        }
+    }
+    v->as.s.bytes[total] = '\0';
+    return v;
+}
+
+/* Two-pass join: like concat_all but interleaves `sep` between pieces. */
+static KaiValue *kai_string_join_impl(KaiValue *xs, KaiValue *sep) {
+    size_t slen = (sep && sep->tag == KAI_STR) ? sep->as.s.len : 0;
+    size_t total = 0;
+    int count = 0;
+    for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+        KaiValue *s = p->as.cons.head;
+        if (s && s->tag == KAI_STR) total += s->as.s.len;
+        count++;
+    }
+    if (count > 1) total += slen * (size_t)(count - 1);
+    KaiValue *v = kai_alloc(KAI_STR);
+    v->as.s.len = total;
+    v->as.s.bytes = (char *) malloc(total + 1);
+    if (!v->as.s.bytes) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    size_t off = 0;
+    int first = 1;
+    for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+        if (!first && slen > 0) {
+            memcpy(v->as.s.bytes + off, sep->as.s.bytes, slen);
+            off += slen;
+        }
+        first = 0;
+        KaiValue *s = p->as.cons.head;
+        if (s && s->tag == KAI_STR && s->as.s.len > 0) {
+            memcpy(v->as.s.bytes + off, s->as.s.bytes, s->as.s.len);
+            off += s->as.s.len;
+        }
+    }
+    v->as.s.bytes[total] = '\0';
     return v;
 }
 
@@ -444,6 +580,41 @@ static KaiValue *kai_prelude_string_length(KaiValue *s) {
 
 static KaiValue *kai_prelude_string_concat(KaiValue *a, KaiValue *b) {
     return kai_string_concat(a, b);
+}
+
+static KaiValue *kai_prelude_string_concat_all(KaiValue *xs) {
+    return kai_string_concat_all_impl(xs);
+}
+
+static KaiValue *kai_prelude_string_join(KaiValue *xs, KaiValue *sep) {
+    return kai_string_join_impl(xs, sep);
+}
+
+/* ---------- prelude: arrays ---------- */
+
+static KaiValue *kai_prelude_array_make(KaiValue *n, KaiValue *init) {
+    int64_t len = (n && n->tag == KAI_INT) ? n->as.i : 0;
+    return kai_array_make(len, init);
+}
+
+static KaiValue *kai_prelude_array_length(KaiValue *a) {
+    int64_t len = (a && a->tag == KAI_ARRAY) ? a->as.arr.len : 0;
+    return kai_int(len);
+}
+
+static KaiValue *kai_prelude_array_get(KaiValue *a, KaiValue *i) {
+    int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
+    return kai_array_get_impl(a, idx);
+}
+
+static KaiValue *kai_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
+    int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
+    return kai_array_set_impl(a, idx, kai_incref(v));
+}
+
+static KaiValue *kai_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) {
+    int64_t new_len = (n && n->tag == KAI_INT) ? n->as.i : 0;
+    return kai_array_grow_impl(a, new_len, init);
 }
 
 /* ---------- prelude: lists ---------- */
@@ -894,6 +1065,13 @@ static KaiValue *_kai_prelude_int_to_string_thunk(KaiValue *s, KaiValue **a, int
 static KaiValue *_kai_prelude_real_to_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_real_to_string(a[0]); }
 static KaiValue *_kai_prelude_string_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_length(a[0]); }
 static KaiValue *_kai_prelude_string_concat_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_concat(a[0], a[1]); }
+static KaiValue *_kai_prelude_string_concat_all_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_concat_all(a[0]); }
+static KaiValue *_kai_prelude_string_join_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_string_join(a[0], a[1]); }
+static KaiValue *_kai_prelude_array_make_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_array_make(a[0], a[1]); }
+static KaiValue *_kai_prelude_array_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_array_length(a[0]); }
+static KaiValue *_kai_prelude_array_get_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_array_get(a[0], a[1]); }
+static KaiValue *_kai_prelude_array_set_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_array_set(a[0], a[1], a[2]); }
+static KaiValue *_kai_prelude_array_grow_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_array_grow(a[0], a[1], a[2]); }
 static KaiValue *_kai_prelude_list_length_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_list_length(a[0]); }
 static KaiValue *_kai_prelude_list_append_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_list_append(a[0], a[1]); }
 static KaiValue *_kai_prelude_list_reverse_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_list_reverse(a[0]); }

@@ -91,11 +91,14 @@ static const char *PRELUDE[] = {
     /* conversions */
     "int_to_string", "real_to_string", "string_to_int", "string_to_real",
     /* strings */
-    "string_length", "string_concat", "string_split", "string_contains", "char_at",
+    "string_length", "string_concat", "string_concat_all", "string_join",
+    "string_split", "string_contains", "char_at",
     "string_slice", "char_to_int", "int_to_char",
     /* lists */
     "list_length", "list_append", "list_reverse",
     "map", "filter", "reduce", "each",
+    /* opaque mutable arrays (used by the stage 2 inferencer) */
+    "array_make", "array_length", "array_get", "array_set", "array_grow",
     /* Option / Result constructors */
     "Some", "None", "Ok", "Err",
     NULL

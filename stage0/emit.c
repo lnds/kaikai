@@ -180,6 +180,8 @@ static const struct {
     { "real_to_string", "kai_prelude_real_to_string", 1 },
     { "string_length",  "kai_prelude_string_length",  1 },
     { "string_concat",  "kai_prelude_string_concat",  2 },
+    { "string_concat_all", "kai_prelude_string_concat_all", 1 },
+    { "string_join",    "kai_prelude_string_join",    2 },
     { "list_length",    "kai_prelude_list_length",    1 },
     { "list_append",    "kai_prelude_list_append",    2 },
     { "list_reverse",   "kai_prelude_list_reverse",   1 },
@@ -198,7 +200,12 @@ static const struct {
     { "string_contains","kai_prelude_string_contains",2 },
     { "string_slice",   "kai_prelude_string_slice",   3 },
     { "char_to_int",    "kai_prelude_char_to_int",    1 },
-    { "int_to_char",    "kai_prelude_int_to_char",    1 }
+    { "int_to_char",    "kai_prelude_int_to_char",    1 },
+    { "array_make",     "kai_prelude_array_make",     2 },
+    { "array_length",   "kai_prelude_array_length",   1 },
+    { "array_get",      "kai_prelude_array_get",      2 },
+    { "array_set",      "kai_prelude_array_set",      3 },
+    { "array_grow",     "kai_prelude_array_grow",     3 }
 };
 static const size_t N_PRELUDE = sizeof(PRELUDE) / sizeof(PRELUDE[0]);
 
@@ -672,12 +679,23 @@ static void emit_range(E *e, Node *n) {
 static void emit_list_tail(E *e, Node *lit, size_t i) {
     if (i >= lit->n_children) { fputs("kai_nil()", e->out); return; }
     Node *elt = lit->children[i];
+    int is_last = (i + 1 == lit->n_children);
     if (elt && elt->kind == N_SPREAD) {
-        fputs("kai_prelude_list_append(", e->out);
-        emit_expr(e, elt->children[0]);
-        fputs(", ", e->out);
-        emit_list_tail(e, lit, i + 1);
-        fputc(')', e->out);
+        /* Tail spread `[..., ...xs]`: no wrapper list_append — the
+           spread value is the whole remainder. Incref preserves the
+           ownership contract (result RC=1, source untouched) that
+           list_append gave via spine copy, in O(1) vs O(|xs|). */
+        if (is_last) {
+            fputs("kai_incref(", e->out);
+            emit_expr(e, elt->children[0]);
+            fputc(')', e->out);
+        } else {
+            fputs("kai_prelude_list_append(", e->out);
+            emit_expr(e, elt->children[0]);
+            fputs(", ", e->out);
+            emit_list_tail(e, lit, i + 1);
+            fputc(')', e->out);
+        }
     } else {
         fputs("kai_cons(", e->out);
         emit_expr(e, elt);
