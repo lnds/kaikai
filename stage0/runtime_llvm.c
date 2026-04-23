@@ -113,6 +113,12 @@ KaiValue *kaix_match_panic(KaiValue *msg) { return kai_prelude_panic(msg); }
 
 KaiValue *kaix_prelude_panic(KaiValue *msg) { return kai_prelude_panic(msg); }
 
+/* ---------- refcounting ---------- */
+/* Used by the LLVM backend's tail-spread fast path: `[x, ...xs]` emits
+   kai_cons(x, kaix_incref(xs)) instead of the quadratic
+   list_append(xs, nil()). */
+KaiValue *kaix_incref(KaiValue *v)                        { return kai_incref(v); }
+
 /* ---------- M3e: lists + closures-with-captures ---------- */
 KaiValue *kaix_cons(KaiValue *h, KaiValue *t)            { return kai_cons(h, t); }
 KaiValue *kaix_nil(void)                                  { return kai_nil(); }
