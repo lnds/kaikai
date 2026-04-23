@@ -6351,8 +6351,142 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
   let rv = st_fresh_ty(rs_.st)
   let ra = synth_arms(rv.st, arms, rs_.ty, rv.ty, line, col)
   let ty = apply_ty(ra.st.sub, rv.ty)
+  let scr_final = apply_ty(ra.st.sub, rs_.ty)
+  let st_post = check_exhaustive(ra.st, arms, scr_final, line, col)
   let root = with_ty(mk_expr(EMatch(rs_.expr, ra.arms), line, col), ty)
-  mk_inferred(ra.st, ty, root)
+  mk_inferred(st_post, ty, root)
+}
+
+# ---- exhaustiveness checking ----
+#
+# Flag match expressions that miss a constructor of a known sum
+# type. Scope: built-in Option / Result and any user sum whose
+# TyCon name appears in the env. "Known variants" is derived by
+# walking the env and collecting uppercase-lead entries whose
+# return type is that TyCon — cheap since errors are the only
+# callers.
+
+fn is_catch_all_pat(pat: Pattern) : Bool {
+  match pat.pkind {
+    PWild     -> true
+    PBind(_)  -> true
+    PHole(_)  -> true
+    _         -> false
+  }
+}
+
+fn has_catch_all(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(pat, guard, _) -> {
+        let catch = is_catch_all_pat(pat)
+        let unguarded = match guard { None -> true Some(_) -> false }
+        if catch and unguarded { true }
+        else { has_catch_all(rest) }
+      }
+    }
+  }
+}
+
+fn variant_name_of_arm(a: Arm) : Option[String] {
+  match a {
+    Arm(pat, _, _) -> match pat.pkind {
+      PVariant(nm, _)       -> Some(nm)
+      PVariantRecord(nm, _) -> Some(nm)
+      _                     -> None
+    }
+  }
+}
+
+fn arms_cover_variant(arms: [Arm], target: String) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match variant_name_of_arm(a) {
+      Some(nm) -> if nm == target { true } else { arms_cover_variant(rest, target) }
+      None     -> arms_cover_variant(rest, target)
+    }
+  }
+}
+
+fn extract_return_tycon(sc: TyScheme) : Option[String] {
+  match sc {
+    Scheme(_, ty) -> match ty {
+      TyFnT(_, ret) -> match ret {
+        TyCon(nm, _) -> Some(nm)
+        _            -> None
+      }
+      TyCon(nm, _) -> Some(nm)
+      _            -> None
+    }
+  }
+}
+
+fn variants_of_type_loop(es: [TyEntry], target: String, acc: [String]) : [String] {
+  match es {
+    [] -> list_reverse(acc)
+    [e, ...rest] -> {
+      let first_upper = match char_at(e.name, 0) {
+        Some(c) -> c >= 'A' and c <= 'Z'
+        None    -> false
+      }
+      if first_upper {
+        match extract_return_tycon(e.scheme) {
+          Some(tn) -> if tn == target {
+            variants_of_type_loop(rest, target, [e.name, ...acc])
+          } else {
+            variants_of_type_loop(rest, target, acc)
+          }
+          None -> variants_of_type_loop(rest, target, acc)
+        }
+      } else {
+        variants_of_type_loop(rest, target, acc)
+      }
+    }
+  }
+}
+
+fn variants_of_type(env: TyEnv, tycon: String) : [String] =
+  variants_of_type_loop(env.entries, tycon, [])
+
+fn find_missing_variants(needed: [String], arms: [Arm], acc: [String]) : [String] {
+  match needed {
+    [] -> list_reverse(acc)
+    [v, ...rest] -> {
+      if arms_cover_variant(arms, v) {
+        find_missing_variants(rest, arms, acc)
+      } else {
+        find_missing_variants(rest, arms, [v, ...acc])
+      }
+    }
+  }
+}
+
+fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState {
+  if has_catch_all(arms) { st }
+  else {
+    match scr_ty {
+      TyCon(tycon, _) -> {
+        let needed = variants_of_type(st.env, tycon)
+        match needed {
+          [] -> st                     # unknown sum (e.g. Int, lists): skip
+          _  -> {
+            let missing = find_missing_variants(needed, arms, [])
+            match missing {
+              [] -> st
+              _  -> {
+                diag_error(st.file, line, col,
+                  "non-exhaustive match on #{tycon}: missing #{join_with(missing, ", ")}")
+                diag_help("add an arm for each missing variant, or a wildcard `_` arm")
+                st_bump_err(st)
+              }
+            }
+          }
+        }
+      }
+      _ -> st
+    }
+  }
 }
 
 fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int, col: Int) : InferredArms {
@@ -7536,6 +7670,7 @@ fn expr_kind_name(k: ExprKind) : String {
     ERange(_, _, _) -> "ERange"
     EBlock(_, _)   -> "EBlock"
     EPipe(_, _)    -> "EPipe"
+    EHole(_)       -> "EHole"
   }
 }
 
