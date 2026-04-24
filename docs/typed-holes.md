@@ -122,14 +122,16 @@ subsequent expression-hole's scope.
 
 ## Implementation notes
 
-Stage 2 target. The checker already computes the expected type at
-every AST node; the hole case is "stop, record, keep going". Scope
-reporting piggybacks on the existing scope stack. Candidate synthesis
-is a bounded enumeration (≤ one function application deep); the
-bound keeps compilation fast, matches the "one canonical form"
-principle, and leaves deeper reasoning to tools.
+Landed in stage 2 (milestone m10). The checker computes the expected
+type at every AST node; the hole case is "stop, record, keep going".
+Scope reporting piggybacks on the existing scope stack. Candidate
+synthesis is a bounded enumeration (≤ one function application
+deep); the bound keeps compilation fast, keeps candidate lists short
+(*few forms, each with clear intent*), and leaves deeper reasoning
+to tools.
 
-Rough complexity: a few hundred lines on top of the existing
-checker; no runtime support beyond the panic helper (which already
-exists as `kai_prelude_panic`). No impact on codegen except a stub
-for unfilled positions.
+The flags are `--holes` (human-readable report) and `--holes-json`
+(stable JSON schema, same contract as typed holes promises). Unfilled
+holes compile to a runtime panic via the existing `kai_prelude_panic`
+helper; no codegen impact beyond a stub for unfilled positions. The
+JSON schema is validated by `scripts/validate_holes_json.py`.
