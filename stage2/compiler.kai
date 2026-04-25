@@ -941,16 +941,15 @@ type Stmt
   # field path). Lowered to a `Mutable.array_set`-style call by the
   # pre-resolve `desugar_index_assign` pass; never reaches the checker.
   | SIndexAssign(Expr, Expr, Expr, Int, Int)
-  # m7b #5: local mutable cell `var name [: T] = init`. The pre-resolve
-  # `desugar_var_decls` pass rewrites every block containing an SVar
-  # into the variable-specialised form: a `let name = array_make(1,
-  # init)` cell-binding plus a rewrite of every `name.get()` /
-  # `name.set(v)` in the rest of the enclosing block to
-  # `array_get(name, 0)` / `array_set(name, 0, v)`. SVar therefore
-  # never reaches the resolver. The line/col point at the `var`
-  # keyword. See `desugar_var_decls` for the full reasoning, including
-  # why this skips the spec's intermediate `with State[T](init)`
-  # handler form.
+  # m7b #5: local mutable cell `var name [: T] = init`. NOT YET FULLY
+  # IMPLEMENTED — the parser produces this node, but the planned
+  # `desugar_var_decls` pass that rewrites it into a `handle ... with
+  # State[T](init)` form is unimplemented (blocked on EHandle lacking
+  # type-arg / init-expr slots, no generic effects, no state-threading
+  # resume — see m7b #5 final report). Until that lands, SVar reaches
+  # the resolver and inference, where it is rejected with an explicit
+  # "not yet implemented" diagnostic. The line/col point at the `var`
+  # keyword.
   | SVar(String, Option[TypeExpr], Expr, Int, Int)
 
 type Pattern = { pkind: PatKind, line: Int, col: Int }
@@ -2407,10 +2406,12 @@ fn parse_let(p: Parser, t: Token) : PStmt {
 }
 
 # m7b #5: `var name (: T)? = init` — local mutable cell. The parser
-# produces an `SVar` node; the pre-resolve `desugar_var_decls` pass
-# rewrites it into a cell-binding `let` plus an array_get/array_set
-# rewrite over the rest of the enclosing block. No `var name` (without
-# `= init`) form: rejected here with a syntax error.
+# produces an `SVar` node; the planned `desugar_var_decls` pass that
+# rewrites it into a `handle ... with State[T](init) as name { ... }`
+# is not yet implemented (see SVar's declaration comment), so any
+# program containing `var` is rejected at resolve time with an explicit
+# "not yet implemented" diagnostic. No `var name` (without `= init`)
+# form: rejected here with a syntax error.
 fn parse_var(p: Parser, t: Token) : PStmt {
   let p1 = p_advance(p)
   let nt = p_peek(p1)
@@ -4116,13 +4117,14 @@ fn chk_stmt(e: Env, s: Stmt) : Env {
       let e2 = chk_expr(e1, idx)
       chk_expr(e2, val)
     }
-    # m7b #5: SVar is desugared away pre-resolve by desugar_var_decls.
-    # This arm is dead code in normal compilation; if a future debug
-    # mode skips the desugar, treat the binding like a let so the match
-    # stays exhaustive.
-    SVar(name, _, rhs, line, col) -> {
+    # m7b #5: `var name = init` — desugar pass not yet implemented.
+    # Reject explicitly so users do not silently get `let`-like behaviour
+    # while State[T] support is missing. Still resolves the init for
+    # follow-on diagnostics, but does not bind the name.
+    SVar(_, _, rhs, line, col) -> {
       let e1 = chk_expr(e, rhs)
-      bind_pat(e1, mk_pat(PBind(name), line, col))
+      chk_error(e1, line, col,
+        "`var` is not yet implemented (m7b #5: parser landed, desugar pending)")
     }
   }
 }
@@ -6343,9 +6345,10 @@ fn desugar_index_stmt(s: Stmt) : Stmt {
                          line, col)
       SExprStmt(call)
     }
-    # m7b #5: SVar runs through this pass before desugar_var_decls
-    # consumes it. Recurse into `init` so any nested `a[i]` inside the
-    # initialiser is rewritten.
+    # m7b #5: pass through; the var-desugar pass below transforms SVar
+    # into a `handle ... with State[T](init)` form. Until that pass runs
+    # we still need to recurse into `init` so any nested `a[i]` inside
+    # the initialiser is rewritten.
     SVar(n, ty, rhs, l, c) -> SVar(n, ty, desugar_index_expr(rhs), l, c)
   }
 }
@@ -6428,382 +6431,6 @@ fn desugar_index_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
                                       desugar_index_expr(b),
                                       desugar_index_opt(opt_step))
     _ -> k
-  }
-}
-
-# ====================================================================
-# m7b #5: pre-resolve desugar of `var name [: T] = init`
-# ====================================================================
-#
-# Spec — `docs/syntax-sugars.md` §3 — phrases the desugar as:
-#
-#   var name: T = init
-#   <rest of block>
-#
-#         ↓
-#
-#   handle { <rest of block> } with State[T](init) as name {
-#     get(resume)    -> resume(state)
-#     set(v, resume) -> resume((), v)
-#     return(x)      -> x
-#   }
-#
-# That target form is *not yet representable* in the stage 2 AST: the
-# `EHandle` node has no slot for the `[T]` type argument or the
-# `(init)` initial-state expression, no generic-effect declaration
-# carries `State[T]`, and the `KaiCont`-based runtime resume is
-# single-arg (so `resume((), v)` cannot lower). Adding those slots
-# touches the m7a code paths the m7b brief explicitly fences off.
-#
-# This pass therefore lowers `var` directly to the *variable-
-# specialised* form that `docs/syntax-sugars.md` §3 *Performance* and
-# `docs/effects-impl.md` §*Variable specialisation* document as the
-# end-state when all four trigger conditions hold (canonical clauses,
-# no `resume_multishot`, no escape, normal init). For every test case
-# this milestone exercises, conditions 1–4 hold by construction:
-#
-#   var name = init
-#   <rest using name.get() / name.set(v)>
-#
-#         ↓
-#
-#   let name = array_make(1, init)
-#   <rest with name.get() rewritten to array_get(name, 0)
-#         and name.set(v) rewritten to array_set(name, 0, v)>
-#
-# Scoping: the cell is bound under the same name `name` the user
-# wrote, so lexical scoping handles inner shadowing automatically — a
-# nested `var name = ...` becomes its own `let name = array_make(...)`
-# that shadows the outer cell for the duration of the inner block.
-#
-# When the missing State[T] infrastructure lands (generic effects,
-# extended `EHandle`, two-arg resume), this pass becomes the
-# specialisation step of a two-stage lowering: m7b #5 emits the
-# canonical `with State[T](init)` handler form, and a separate
-# variable-specialisation pass folds it into the array-cell shape this
-# pass produces today.
-
-fn desugar_var_decls(ds: [Decl]) : [Decl] = map(ds, desugar_var_decl)
-
-fn desugar_var_decl(d: Decl) : Decl {
-  match d {
-    DFn(pub_, n, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, ps, ret, row, desugar_var_expr(body), l, c)
-    DTest(desc, body, l, c) -> DTest(desc, desugar_var_expr(body), l, c)
-    _ -> d
-  }
-}
-
-fn desugar_var_expr(e: Expr) : Expr =
-  Expr { kind: desugar_var_kind(e.kind, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
-
-fn desugar_var_opt(opt: Option[Expr]) : Option[Expr] {
-  match opt {
-    Some(e) -> Some(desugar_var_expr(e))
-    None    -> None
-  }
-}
-
-fn desugar_var_exprs(es: [Expr]) : [Expr] = map(es, desugar_var_expr)
-
-fn desugar_var_arms(arms: [Arm]) : [Arm] = map(arms, desugar_var_arm)
-
-fn desugar_var_arm(a: Arm) : Arm {
-  match a {
-    Arm(p, g, b) -> Arm(p, desugar_var_opt(g), desugar_var_expr(b))
-  }
-}
-
-fn desugar_var_fields(fs: [FieldInit]) : [FieldInit] =
-  map(fs, desugar_var_field)
-
-fn desugar_var_field(f: FieldInit) : FieldInit {
-  match f {
-    FI(n, v) -> FI(n, desugar_var_expr(v))
-  }
-}
-
-fn desugar_var_elems(els: [ListElem]) : [ListElem] =
-  map(els, desugar_var_elem)
-
-fn desugar_var_elem(el: ListElem) : ListElem {
-  match el {
-    ElPlain(x)  -> ElPlain(desugar_var_expr(x))
-    ElSpread(x) -> ElSpread(desugar_var_expr(x))
-  }
-}
-
-fn desugar_var_clauses(cs: [HClause]) : [HClause] =
-  map(cs, desugar_var_clause)
-
-fn desugar_var_clause(c: HClause) : HClause {
-  match c {
-    HC(n, ps, b, l, co) -> HC(n, ps, desugar_var_expr(b), l, co)
-  }
-}
-
-fn desugar_var_opt_return(opt: Option[HReturn]) : Option[HReturn] {
-  match opt {
-    Some(r) -> Some(desugar_var_return(r))
-    None    -> None
-  }
-}
-
-fn desugar_var_return(r: HReturn) : HReturn {
-  match r {
-    HR(p, b, l, c) -> HR(p, desugar_var_expr(b), l, c)
-  }
-}
-
-fn desugar_var_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
-  match k {
-    EBlock(stmts, tail) -> {
-      let r = desugar_var_block(stmts, tail)
-      EBlock(r.stmts, r.tail)
-    }
-    ECall(callee, args_) -> ECall(desugar_var_expr(callee),
-                                   desugar_var_exprs(args_))
-    EIf(c, t_, eo) -> EIf(desugar_var_expr(c), desugar_var_expr(t_),
-                          desugar_var_opt(eo))
-    EBinop(op, a, b) -> EBinop(op, desugar_var_expr(a), desugar_var_expr(b))
-    EUnop(op, x) -> EUnop(op, desugar_var_expr(x))
-    EHandle(body, eff_name, alias_opt, clauses, ret_opt) ->
-      EHandle(desugar_var_expr(body), eff_name, alias_opt,
-              desugar_var_clauses(clauses), desugar_var_opt_return(ret_opt))
-    ELambda(ps, b) -> ELambda(ps, desugar_var_expr(b))
-    EMatch(scr, arms) -> EMatch(desugar_var_expr(scr),
-                                 desugar_var_arms(arms))
-    EPipe(a, b) -> EPipe(desugar_var_expr(a), desugar_var_expr(b))
-    EField(base, fname) -> EField(desugar_var_expr(base), fname)
-    EIndex(a, b) -> EIndex(desugar_var_expr(a), desugar_var_expr(b))
-    ERecordLit(name, fields) -> ERecordLit(name, desugar_var_fields(fields))
-    EList(elems) -> EList(desugar_var_elems(elems))
-    ERange(a, b, opt_step) -> ERange(desugar_var_expr(a),
-                                      desugar_var_expr(b),
-                                      desugar_var_opt(opt_step))
-    _ -> k
-  }
-}
-
-# Block-level rewrite pair: list of statements + optional tail expr.
-# When an SVar is found, the rest of the block is wrapped under a new
-# binding that holds the cell, and every name.get()/name.set(v) in the
-# rest is rewritten to array_get/array_set.
-type DvBlock = { stmts: [Stmt], tail: Option[Expr] }
-
-fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : DvBlock {
-  match stmts {
-    [] -> {
-      DvBlock { stmts: [], tail: desugar_var_opt(tail) }
-    }
-    [s, ...rest] -> match s {
-      SVar(name, _ty, init, line, col) -> {
-        let init_d = desugar_var_expr(init)
-        let cell_init = mk_expr(
-          ECall(mk_expr(EVar("array_make"), line, col),
-                [mk_expr(EInt(1), line, col), init_d]),
-          line, col)
-        let pat = mk_pat(PBind(name), line, col)
-        let new_let = SLet(pat, None, cell_init)
-        let rest_rw_stmts = map(rest, (st) => rewrite_var_in_stmt(st, name))
-        let rest_rw_tail = match tail {
-          Some(e) -> Some(rewrite_var_in_expr(e, name))
-          None    -> None
-        }
-        let inner = desugar_var_block(rest_rw_stmts, rest_rw_tail)
-        DvBlock { stmts: [new_let, ...inner.stmts], tail: inner.tail }
-      }
-      _ -> {
-        let s_d = desugar_var_stmt(s)
-        let inner = desugar_var_block(rest, tail)
-        DvBlock { stmts: [s_d, ...inner.stmts], tail: inner.tail }
-      }
-    }
-  }
-}
-
-fn desugar_var_stmt(s: Stmt) : Stmt {
-  match s {
-    SLet(pat, ann, rhs) -> SLet(pat, ann, desugar_var_expr(rhs))
-    SAssert(c, m) -> SAssert(desugar_var_expr(c), desugar_var_opt(m))
-    SExprStmt(x) -> SExprStmt(desugar_var_expr(x))
-    SIndexAssign(b, i, v, l, c) ->
-      SIndexAssign(desugar_var_expr(b), desugar_var_expr(i),
-                   desugar_var_expr(v), l, c)
-    # SVar at this site means it's the head of a block we already
-    # consumed via desugar_var_block. desugar_var_stmt only fires on
-    # non-head statements, so an SVar here is a parser-only shape that
-    # already appeared as the head of its own block. Pass through —
-    # desugar_var_block will catch it on its own pass.
-    SVar(n, ty, rhs, l, c) -> SVar(n, ty, desugar_var_expr(rhs), l, c)
-  }
-}
-
-# Rewrite all `name.get()` and `name.set(v)` patterns in a statement,
-# recursively. Used on the rest-of-block after a var declaration is
-# replaced with its cell-binding let. The walker descends through every
-# nested expression.
-fn rewrite_var_in_stmt(s: Stmt, name: String) : Stmt {
-  match s {
-    SLet(pat, ann, rhs) -> SLet(pat, ann, rewrite_var_in_expr(rhs, name))
-    SAssert(c, m) -> SAssert(rewrite_var_in_expr(c, name),
-                              rewrite_var_in_opt(m, name))
-    SExprStmt(x) -> SExprStmt(rewrite_var_in_expr(x, name))
-    SIndexAssign(b, i, v, l, c) ->
-      SIndexAssign(rewrite_var_in_expr(b, name),
-                   rewrite_var_in_expr(i, name),
-                   rewrite_var_in_expr(v, name), l, c)
-    SVar(n, ty, rhs, l, c) ->
-      SVar(n, ty, rewrite_var_in_expr(rhs, name), l, c)
-  }
-}
-
-fn rewrite_var_in_expr(e: Expr, name: String) : Expr =
-  Expr { kind: rewrite_var_in_kind(e.kind, e.line, e.col, name),
-         line: e.line, col: e.col, ty: e.ty }
-
-fn rewrite_var_in_opt(opt: Option[Expr], name: String) : Option[Expr] {
-  match opt {
-    Some(e) -> Some(rewrite_var_in_expr(e, name))
-    None    -> None
-  }
-}
-
-fn rewrite_var_in_exprs(es: [Expr], name: String) : [Expr] =
-  map(es, (e) => rewrite_var_in_expr(e, name))
-
-fn rewrite_var_in_arms(arms: [Arm], name: String) : [Arm] =
-  map(arms, (a) => rewrite_var_in_arm(a, name))
-
-fn rewrite_var_in_arm(a: Arm, name: String) : Arm {
-  match a {
-    Arm(p, g, b) -> Arm(p, rewrite_var_in_opt(g, name),
-                          rewrite_var_in_expr(b, name))
-  }
-}
-
-fn rewrite_var_in_fields(fs: [FieldInit], name: String) : [FieldInit] =
-  map(fs, (f) => rewrite_var_in_field(f, name))
-
-fn rewrite_var_in_field(f: FieldInit, name: String) : FieldInit {
-  match f {
-    FI(n, v) -> FI(n, rewrite_var_in_expr(v, name))
-  }
-}
-
-fn rewrite_var_in_elems(els: [ListElem], name: String) : [ListElem] =
-  map(els, (el) => rewrite_var_in_elem(el, name))
-
-fn rewrite_var_in_elem(el: ListElem, name: String) : ListElem {
-  match el {
-    ElPlain(x)  -> ElPlain(rewrite_var_in_expr(x, name))
-    ElSpread(x) -> ElSpread(rewrite_var_in_expr(x, name))
-  }
-}
-
-fn rewrite_var_in_clauses(cs: [HClause], name: String) : [HClause] =
-  map(cs, (c) => rewrite_var_in_clause(c, name))
-
-fn rewrite_var_in_clause(c: HClause, name: String) : HClause {
-  match c {
-    HC(n, ps, b, l, co) -> HC(n, ps, rewrite_var_in_expr(b, name), l, co)
-  }
-}
-
-fn rewrite_var_in_opt_return(opt: Option[HReturn], name: String) : Option[HReturn] {
-  match opt {
-    Some(r) -> Some(rewrite_var_in_return(r, name))
-    None    -> None
-  }
-}
-
-fn rewrite_var_in_return(r: HReturn, name: String) : HReturn {
-  match r {
-    HR(p, b, l, c) -> HR(p, rewrite_var_in_expr(b, name), l, c)
-  }
-}
-
-fn rewrite_var_in_stmts(ss: [Stmt], name: String) : [Stmt] =
-  map(ss, (s) => rewrite_var_in_stmt(s, name))
-
-fn rewrite_var_in_kind(k: ExprKind, line: Int, col: Int, name: String) : ExprKind {
-  match k {
-    # The two patterns that actually rewrite. `name.get()` becomes
-    # `array_get(name, 0)` and `name.set(v)` becomes
-    # `array_set(name, 0, v)`. Receiver must be a plain `EVar(name)`.
-    ECall(callee, args_) -> {
-      let rewritten = rewrite_var_get_set(callee, args_, line, col, name)
-      match rewritten {
-        Some(k_new) -> k_new
-        None -> ECall(rewrite_var_in_expr(callee, name),
-                      rewrite_var_in_exprs(args_, name))
-      }
-    }
-    EBlock(stmts, tail) -> EBlock(rewrite_var_in_stmts(stmts, name),
-                                   rewrite_var_in_opt(tail, name))
-    EIf(c, t_, eo) -> EIf(rewrite_var_in_expr(c, name),
-                          rewrite_var_in_expr(t_, name),
-                          rewrite_var_in_opt(eo, name))
-    EBinop(op, a, b) -> EBinop(op, rewrite_var_in_expr(a, name),
-                                   rewrite_var_in_expr(b, name))
-    EUnop(op, x) -> EUnop(op, rewrite_var_in_expr(x, name))
-    EHandle(body, eff_name, alias_opt, clauses, ret_opt) ->
-      EHandle(rewrite_var_in_expr(body, name), eff_name, alias_opt,
-              rewrite_var_in_clauses(clauses, name),
-              rewrite_var_in_opt_return(ret_opt, name))
-    ELambda(ps, b) -> ELambda(ps, rewrite_var_in_expr(b, name))
-    EMatch(scr, arms) -> EMatch(rewrite_var_in_expr(scr, name),
-                                 rewrite_var_in_arms(arms, name))
-    EPipe(a, b) -> EPipe(rewrite_var_in_expr(a, name),
-                          rewrite_var_in_expr(b, name))
-    EField(base, fname) -> EField(rewrite_var_in_expr(base, name), fname)
-    EIndex(a, b) -> EIndex(rewrite_var_in_expr(a, name),
-                            rewrite_var_in_expr(b, name))
-    ERecordLit(rname, fields) -> ERecordLit(rname,
-                                              rewrite_var_in_fields(fields, name))
-    EList(elems) -> EList(rewrite_var_in_elems(elems, name))
-    ERange(a, b, opt_step) -> ERange(rewrite_var_in_expr(a, name),
-                                      rewrite_var_in_expr(b, name),
-                                      rewrite_var_in_opt(opt_step, name))
-    _ -> k
-  }
-}
-
-# If `callee` is `name.get` or `name.set`, return the rewritten ECall.
-# Otherwise return None and the caller falls back to recursive descent.
-fn rewrite_var_get_set(callee: Expr, args_: [Expr], line: Int, col: Int,
-                       name: String) : Option[ExprKind] {
-  match callee.kind {
-    EField(base, fname) -> match base.kind {
-      EVar(rname) -> {
-        if rname == name and fname == "get" {
-          match args_ {
-            [] -> {
-              Some(ECall(mk_expr(EVar("array_get"), line, col),
-                         [mk_expr(EVar(name), base.line, base.col),
-                          mk_expr(EInt(0), line, col)]))
-            }
-            _ -> None
-          }
-        } else if rname == name and fname == "set" {
-          match args_ {
-            [v] -> {
-              let vrw = rewrite_var_in_expr(v, name)
-              Some(ECall(mk_expr(EVar("array_set"), line, col),
-                         [mk_expr(EVar(name), base.line, base.col),
-                          mk_expr(EInt(0), line, col),
-                          vrw]))
-            }
-            _ -> None
-          }
-        } else {
-          None
-        }
-      }
-      _ -> None
-    }
-    _ -> None
   }
 }
 
@@ -9283,24 +8910,15 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt {
       let rv = synth(ri.st, v)
       OneStmt { st: rv.st, stmt: SIndexAssign(rb.expr, ri.expr, rv.expr, line, col) }
     }
-    # m7b #5: SVar is desugared away pre-resolve. Dead arm; mirrors
-    # SLet so the match stays exhaustive if invoked on the raw AST.
+    # m7b #5: `var name = init` — desugar pass not yet implemented.
+    # The resolve pass (chk_stmt) already emits the explicit "not yet
+    # implemented" diagnostic and short-circuits before infer normally
+    # runs. If a future caller invokes inference on the raw AST, return
+    # the init's type without binding `name`, so we never silently
+    # produce a `let`-equivalent.
     SVar(name, ann, rhs, line, col) -> {
       let rr = synth(st, rhs)
-      let binding_st = match ann {
-        None -> rr.st
-        Some(te) -> {
-          let declared = resolve_ty(te)
-          st_unify(rr.st, declared, rr.ty, "var annotation", line, col)
-        }
-      }
-      let binding_ty = match ann {
-        None -> rr.ty
-        Some(te) -> resolve_ty(te)
-      }
-      let pat = mk_pat(PBind(name), line, col)
-      let after = check_pattern(binding_st, pat, binding_ty)
-      OneStmt { st: after, stmt: SVar(name, ann, rr.expr, line, col) }
+      OneStmt { st: rr.st, stmt: SVar(name, ann, rr.expr, line, col) }
     }
   }
 }
@@ -12594,15 +12212,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # name resolution so every downstream pass sees only the
             # core form. `--ast` keeps the raw decls so the dump shows
             # the sugar as written.
-            #
-            # m7b #5: pre-resolve desugar of `var name = init` into a
-            # cell-binding `let name = array_make(1, init)` plus a
-            # rewrite of every `name.get()` / `name.set(v)` in the rest
-            # of the enclosing block. This is the variable-specialised
-            # form of the spec's State[T] handler — see
-            # `desugar_var_decls` header comment for the full reasoning.
-            let after_index = desugar_index_decls(raw_decls)
-            let all_decls = desugar_var_decls(after_index)
+            let all_decls = desugar_index_decls(raw_decls)
             if alias_res.errs > 0 { alias_res.errs }
             else {
             match mode {
