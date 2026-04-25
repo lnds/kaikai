@@ -4423,8 +4423,75 @@ fn check_program(file: String, decls: [Decl]) : Int {
   let e2 = register_decls(e1, decls)
   let e3 = chk_decls(e2, decls)
   let eff_names = collect_effect_names(decls)
-  let row_errs = check_row_labels(decls, file, eff_names)
+  let arities = collect_effect_arities(decls)
+  let row_errs = check_row_labels(decls, file, eff_names, arities)
   if e3.had_error or row_errs > 0 { 1 } else { 0 }
+}
+
+# m7b #11j — arity table built from every DEffect in the program.
+# `inject_builtin_effects` runs before `check_program`, so the
+# parametric stdlib effects (State, Reader, Writer) and any used
+# default-handler effects are already in `decls`. Any builtin not
+# yet injected (the user's main doesn't reference it) is filled in
+# from `builtin_effect_arities()` so a helper can still use the
+# effect with the right tparam count.
+type EffArity = EA(String, Int)
+
+fn collect_effect_arities(decls: [Decl]) : [EffArity] {
+  let from_decls = collect_effect_arities_loop(decls)
+  list_append(from_decls, builtin_effect_arities_filtered(from_decls))
+}
+
+fn collect_effect_arities_loop(decls: [Decl]) : [EffArity] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, name, tparams, _, _, _) ->
+        [EA(name, list_length(tparams)), ...collect_effect_arities_loop(rest)]
+      _ -> collect_effect_arities_loop(rest)
+    }
+  }
+}
+
+# Names known to `builtin_effect_names()` that the program did not
+# declare or inject. Tparam counts are the canonical Doc B values
+# (Console/Fail/Stdin/Env/File: 0; State/Reader/Writer: 1).
+fn builtin_effect_arities_filtered(known: [EffArity]) : [EffArity] {
+  let all = [
+    EA("Console", 0), EA("Fail", 0), EA("Stdin", 0),
+    EA("Env", 0), EA("File", 0),
+    EA("State", 1), EA("Reader", 1), EA("Writer", 1)
+  ]
+  filter_unknown_arities(all, known)
+}
+
+fn filter_unknown_arities(all: [EffArity], known: [EffArity]) : [EffArity] {
+  match all {
+    [] -> []
+    [a, ...rest] -> match a {
+      EA(n, _) ->
+        if has_arity(known, n) { filter_unknown_arities(rest, known) }
+        else { [a, ...filter_unknown_arities(rest, known)] }
+    }
+  }
+}
+
+fn has_arity(arities: [EffArity], target: String) : Bool {
+  match arities {
+    [] -> false
+    [a, ...rest] -> match a {
+      EA(n, _) -> if n == target { true } else { has_arity(rest, target) }
+    }
+  }
+}
+
+fn lookup_arity(arities: [EffArity], target: String) : Option[Int] {
+  match arities {
+    [] -> None
+    [a, ...rest] -> match a {
+      EA(n, k) -> if n == target { Some(k) } else { lookup_arity(rest, target) }
+    }
+  }
 }
 
 # ---- m7a #3c: name resolution for effect labels in rows ----
@@ -4443,39 +4510,68 @@ fn collect_effect_names(decls: [Decl]) : [String] {
   }
 }
 
-fn check_row_labels(decls: [Decl], file: String, eff_names: [String]) : Int {
+fn check_row_labels(decls: [Decl], file: String, eff_names: [String],
+                     arities: [EffArity]) : Int {
   match decls {
     [] -> 0
-    [d, ...rest] -> check_decl_row_labels(d, file, eff_names) + check_row_labels(rest, file, eff_names)
+    [d, ...rest] ->
+      check_decl_row_labels(d, file, eff_names, arities) +
+      check_row_labels(rest, file, eff_names, arities)
   }
 }
 
-fn check_decl_row_labels(d: Decl, file: String, eff_names: [String]) : Int {
+fn check_decl_row_labels(d: Decl, file: String, eff_names: [String],
+                          arities: [EffArity]) : Int {
   match d {
-    DFn(_, _, _, _, rexpr, _, line, col) -> check_row_expr(rexpr, file, line, col, eff_names)
+    DFn(_, _, _, _, rexpr, _, line, col) ->
+      check_row_expr(rexpr, file, line, col, eff_names, arities)
     _ -> 0
   }
 }
 
-fn check_row_expr(re: RowExpr, file: String, line: Int, col: Int, eff_names: [String]) : Int {
+fn check_row_expr(re: RowExpr, file: String, line: Int, col: Int,
+                   eff_names: [String], arities: [EffArity]) : Int {
   match re {
     REmpty -> 0
-    RClosed(labels) -> check_label_names(row_label_names(labels), file, line, col, eff_names)
-    ROpen(_, labels) -> check_label_names(row_label_names(labels), file, line, col, eff_names)
+    RClosed(labels) -> check_row_labels_loop(labels, file, line, col, eff_names, arities)
+    # m7b #12: row variables in tail position carry the same labels;
+    # apply the same name + arity check.
+    ROpen(_, labels) -> check_row_labels_loop(labels, file, line, col, eff_names, arities)
   }
 }
 
-fn check_label_names(names: [String], file: String, line: Int, col: Int, eff_names: [String]) : Int {
-  match names {
+# m7b #11j — per-label name + arity check. Unknown effect → "unknown
+# effect: X". Arity mismatch → "effect 'X' expects N type
+# argument(s), got M".
+fn check_row_labels_loop(labels: [RowLabel], file: String, line: Int, col: Int,
+                          eff_names: [String], arities: [EffArity]) : Int {
+  match labels {
     [] -> 0
-    [n, ...rest] -> {
-      let here =
-        if list_has(eff_names, n) { 0 }
-        else {
-          let _ = diag_error(file, line, col, string_concat("unknown effect: ", n))
-          1
-        }
-      here + check_label_names(rest, file, line, col, eff_names)
+    [l, ...rest] -> match l {
+      RL(name, ts) -> {
+        let got = list_length(ts)
+        let here =
+          if not list_has(eff_names, name) {
+            let _ = diag_error(file, line, col,
+              string_concat("unknown effect: ", name))
+            1
+          } else {
+            match lookup_arity(arities, name) {
+              None -> 0     # declared without arity — should not happen given collect_effect_arities covers all
+              Some(want) ->
+                if want == got { 0 }
+                else {
+                  let _ = diag_error(file, line, col,
+                    concat_all(["effect '", name, "' expects ",
+                                int_to_string(want),
+                                " type argument(s), got ",
+                                int_to_string(got)]))
+                  1
+                }
+            }
+          }
+        here + check_row_labels_loop(rest, file, line, col, eff_names, arities)
+      }
     }
   }
 }
