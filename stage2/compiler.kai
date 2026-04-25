@@ -6433,6 +6433,273 @@ fn row_labels_of_names(ns: [String]) : [Label] {
   }
 }
 
+# m7b #1b — closed effect aliases (Doc A §*Open questions* #5).
+# An effect alias `type Io = Console + Stdin + Env + File` is a name
+# that expands to a fixed label set in row position. The resolver
+# performs a DFS expansion before any RowExpr is consumed; cycles and
+# non-effect labels in alias bodies are rejected here. After
+# rewriting, RowExpr.RClosed labels reference only declared effects.
+#
+# AliasCand: candidate alias decl harvested from the AST.
+#   name     — the type-decl name
+#   raw      — the labels as written (effects or other alias names)
+#   explicit — true for `TBEffectAlias` (explicit `+` form); false for
+#              `TBAlias(TyName(n, []))` (single-name form). Implicit
+#              candidates whose label is not an effect/alias are
+#              silently treated as regular type aliases instead of
+#              effect aliases. Cycles are still rejected for both.
+#   line/col — source position for diagnostics.
+type AliasCand = AC(String, [String], Bool, Int, Int)
+
+# AliasResult: a candidate that resolved to a flat label list.
+type AliasResult = AR(String, [String])
+
+# DFS expansion status for an alias name.
+type AStatus = AsTodo | AsActive | AsDone([String]) | AsFail
+
+type AEntry = AE(String, AStatus)
+
+fn collect_alias_cands(decls: [Decl]) : [AliasCand] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> {
+      let here = match d {
+        DType(_, name, _, body, line, col) -> match body {
+          TBEffectAlias(labels) -> [AC(name, labels, true, line, col)]
+          TBAlias(ty) -> match ty.tkind {
+            TyName(n, args) ->
+              if args == [] { [AC(name, [n], false, line, col)] }
+              else { [] }
+            _ -> []
+          }
+          _ -> []
+        }
+        _ -> []
+      }
+      list_append(here, collect_alias_cands(rest))
+    }
+  }
+}
+
+fn cand_names_of(cands: [AliasCand]) : [String] {
+  match cands {
+    [] -> []
+    [c, ...rest] -> match c {
+      AC(n, _, _, _, _) -> [n, ...cand_names_of(rest)]
+    }
+  }
+}
+
+fn find_alias_cand(cands: [AliasCand], name: String) : Option[AliasCand] {
+  match cands {
+    [] -> None
+    [c, ...rest] -> match c {
+      AC(n, _, _, _, _) -> if n == name { Some(c) } else { find_alias_cand(rest, name) }
+    }
+  }
+}
+
+fn alias_status(entries: [AEntry], name: String) : AStatus {
+  match entries {
+    [] -> AsTodo
+    [e, ...rest] -> match e {
+      AE(en, es) -> if en == name { es } else { alias_status(rest, name) }
+    }
+  }
+}
+
+fn alias_set_status(entries: [AEntry], name: String, status: AStatus) : [AEntry] {
+  match entries {
+    [] -> [AE(name, status)]
+    [e, ...rest] -> match e {
+      AE(en, es) ->
+        if en == name { [AE(en, status), ...rest] }
+        else { [AE(en, es), ...alias_set_status(rest, name, status)] }
+    }
+  }
+}
+
+fn prepend_rev_strs(xs: [String], acc: [String]) : [String] {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> prepend_rev_strs(rest, [x, ...acc])
+  }
+}
+
+fn dedup_strs(xs: [String]) : [String] = dedup_strs_loop(xs, [])
+fn dedup_strs_loop(xs: [String], acc: [String]) : [String] {
+  match xs {
+    [] -> list_reverse(acc)
+    [x, ...rest] ->
+      if list_has(acc, x) { dedup_strs_loop(rest, acc) }
+      else { dedup_strs_loop(rest, [x, ...acc]) }
+  }
+}
+
+type ResolveState = { entries: [AEntry], errs: Int }
+type ResolveOne   = { st: ResolveState, r: Option[[String]] }
+type AliasPos     = { line: Int, col: Int }
+
+fn cand_pos(cands: [AliasCand], name: String) : AliasPos {
+  match find_alias_cand(cands, name) {
+    None -> AliasPos { line: 0, col: 0 }
+    Some(c) -> match c {
+      AC(_, _, _, ln, co) -> AliasPos { line: ln, col: co }
+    }
+  }
+}
+
+fn resolve_alias(name: String, cands: [AliasCand], cand_ns: [String],
+                 eff_names: [String], file: String, st: ResolveState) : ResolveOne {
+  match alias_status(st.entries, name) {
+    AsDone(labels) -> ResolveOne { st: st, r: Some(labels) }
+    AsFail -> ResolveOne { st: st, r: None }
+    AsActive -> {
+      let pos = cand_pos(cands, name)
+      diag_error(file, pos.line, pos.col,
+        string_concat("cyclic effect alias: ", name))
+      let st2 = ResolveState {
+        entries: alias_set_status(st.entries, name, AsFail),
+        errs:    st.errs + 1
+      }
+      ResolveOne { st: st2, r: None }
+    }
+    AsTodo -> {
+      match find_alias_cand(cands, name) {
+        None -> ResolveOne { st: st, r: None }
+        Some(c) -> match c {
+          AC(_, raw, explicit, line, col) -> {
+            let entries1 = alias_set_status(st.entries, name, AsActive)
+            let st1 = ResolveState { entries: entries1, errs: st.errs }
+            let r = resolve_alias_labels(raw, cands, cand_ns, eff_names, file,
+                                         name, explicit, line, col, st1, [])
+            match r.r {
+              None -> {
+                let entries2 = alias_set_status(r.st.entries, name, AsFail)
+                ResolveOne { st: ResolveState { entries: entries2, errs: r.st.errs }, r: None }
+              }
+              Some(labels) -> {
+                let unique = dedup_strs(labels)
+                let entries2 = alias_set_status(r.st.entries, name, AsDone(unique))
+                ResolveOne { st: ResolveState { entries: entries2, errs: r.st.errs }, r: Some(unique) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn resolve_alias_labels(raw: [String], cands: [AliasCand], cand_ns: [String],
+                        eff_names: [String], file: String,
+                        parent: String, explicit: Bool, pline: Int, pcol: Int,
+                        st: ResolveState, acc: [String]) : ResolveOne {
+  match raw {
+    [] -> ResolveOne { st: st, r: Some(list_reverse(acc)) }
+    [label, ...rest] -> {
+      if list_has(eff_names, label) {
+        resolve_alias_labels(rest, cands, cand_ns, eff_names, file, parent,
+                             explicit, pline, pcol, st, [label, ...acc])
+      } else if list_has(cand_ns, label) {
+        let r = resolve_alias(label, cands, cand_ns, eff_names, file, st)
+        match r.r {
+          None -> ResolveOne { st: r.st, r: None }
+          Some(sub) ->
+            resolve_alias_labels(rest, cands, cand_ns, eff_names, file, parent,
+                                 explicit, pline, pcol, r.st,
+                                 prepend_rev_strs(sub, acc))
+        }
+      } else {
+        if explicit {
+          diag_error(file, pline, pcol,
+            concat_all(["unknown effect in alias body: ", label,
+                        " (declared as part of `", parent, "`)"]))
+          let st1 = ResolveState { entries: st.entries, errs: st.errs + 1 }
+          ResolveOne { st: st1, r: None }
+        } else {
+          ResolveOne { st: st, r: None }
+        }
+      }
+    }
+  }
+}
+
+type AliasResolution = { aliases: [AliasResult], errs: Int }
+
+fn resolve_alias_cands(cands: [AliasCand], eff_names: [String], file: String) : AliasResolution {
+  let cand_ns = cand_names_of(cands)
+  resolve_alias_cands_loop(cands, cand_ns, eff_names, file,
+                           ResolveState { entries: [], errs: 0 }, cands, [])
+}
+
+fn resolve_alias_cands_loop(all_cands: [AliasCand], cand_ns: [String],
+                            eff_names: [String], file: String,
+                            st: ResolveState, todo: [AliasCand],
+                            acc: [AliasResult]) : AliasResolution {
+  match todo {
+    [] -> AliasResolution { aliases: list_reverse(acc), errs: st.errs }
+    [c, ...rest] -> match c {
+      AC(name, _, _, _, _) -> {
+        let r = resolve_alias(name, all_cands, cand_ns, eff_names, file, st)
+        let acc1 = match r.r {
+          Some(labels) -> [AR(name, labels), ...acc]
+          None -> acc
+        }
+        resolve_alias_cands_loop(all_cands, cand_ns, eff_names, file, r.st, rest, acc1)
+      }
+    }
+  }
+}
+
+fn find_alias(aliases: [AliasResult], name: String) : Option[AliasResult] {
+  match aliases {
+    [] -> None
+    [a, ...rest] -> match a {
+      AR(n, _) -> if n == name { Some(a) } else { find_alias(rest, name) }
+    }
+  }
+}
+
+# Substitute every alias name in `labels` with its expanded form.
+# Effect names pass through unchanged. Duplicates introduced by
+# expansion are removed by the caller.
+fn expand_label_list(labels: [String], aliases: [AliasResult]) : [String] {
+  match labels {
+    [] -> []
+    [l, ...rest] -> {
+      let here = match find_alias(aliases, l) {
+        Some(AR(_, expanded)) -> expanded
+        None -> [l]
+      }
+      list_append(here, expand_label_list(rest, aliases))
+    }
+  }
+}
+
+fn expand_aliases_in_row(re: RowExpr, aliases: [AliasResult]) : RowExpr {
+  match re {
+    REmpty -> REmpty
+    RClosed(names) -> RClosed(dedup_strs(expand_label_list(names, aliases)))
+  }
+}
+
+fn expand_aliases_in_decl(d: Decl, aliases: [AliasResult]) : Decl {
+  match d {
+    DFn(p, n, params, ret, rexpr, body, l, c) ->
+      DFn(p, n, params, ret, expand_aliases_in_row(rexpr, aliases), body, l, c)
+    _ -> d
+  }
+}
+
+fn expand_aliases_in_decls(decls: [Decl], aliases: [AliasResult]) : [Decl] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> [expand_aliases_in_decl(d, aliases),
+                     ...expand_aliases_in_decls(rest, aliases)]
+  }
+}
+
 fn param_ty(pm: Param) : Ty {
   match pm.ptype {
     Some(te) -> resolve_ty(te)
@@ -11656,6 +11923,14 @@ fn param_string_zero(name: String) : Param =
   Param { pname: name, ptype: Some(ty_name_zero("String")),
           pline: 0, pcol: 0 }
 
+# Names of every effect for which the compiler ships a built-in
+# effect declaration (Doc B §*Catalog*). Kept in sync with the
+# inject_builtin_effects helpers below; alias resolution accepts
+# these as effect names whether or not the file already declared
+# them via `effect`.
+fn builtin_effect_names() : [String] =
+  ["Console", "Fail", "Stdin", "Env", "File"]
+
 fn builtin_console_decl() : Decl =
   DEffect(false, "Console",
     [
@@ -11709,13 +11984,31 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
           Some(own_decls) -> {
             let expanded = expand_imports(path, search_paths, own_decls)
             let merged = list_append(prelude_decls, expanded)
-            let raw_decls = inject_builtin_effects(merged)
+            # m7b #1b — closed effect aliases. Resolve every `type Foo
+            # = Eff1 + Eff2 + ...` (and `type Foo = Eff` single-name
+            # form) into a flat label set and rewrite every DFn's
+            # RowExpr to substitute alias names *before* builtin-
+            # effect injection. inject_builtin_effects gates on main's
+            # row labels, and expanding `Io` first means the runtime
+            # default handlers for Console/Stdin/Env/File are wired
+            # whenever any alias resolves to them. Builtin effect
+            # names participate in the alias namespace whether or not
+            # the file declared an `effect` for them. Cycles and
+            # non-effect labels in alias bodies are fatal.
+            let declared_effs = collect_effect_names(merged)
+            let eff_names_for_alias = list_append(builtin_effect_names(), declared_effs)
+            let alias_cands = collect_alias_cands(merged)
+            let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, path)
+            let rewritten = expand_aliases_in_decls(merged, alias_res.aliases)
+            let raw_decls = inject_builtin_effects(rewritten)
             # m7b #6: pre-resolve desugar of `a[i]` and `a[i] := v` into
             # the underlying array_get / array_set calls. Runs before
             # name resolution so every downstream pass sees only the
             # core form. `--ast` keeps the raw decls so the dump shows
             # the sugar as written.
             let all_decls = desugar_index_decls(raw_decls)
+            if alias_res.errs > 0 { alias_res.errs }
+            else {
             match mode {
               MAst -> { dump_program(raw_decls); 0 }
               MTypes -> { dump_types(own_decls); 0 }
@@ -11764,6 +12057,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   }
                 }
               }
+            }
             }
           }
         }
