@@ -326,6 +326,22 @@ test-effects: $(TARGET) build
 	  grep -q "unknown effect: Unknown" build/s2-$$name.err \
 	    && echo "effects OK $$name (rejected as expected)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/row_match_higher_order.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    && echo "effects OK $$name (row match accepted)" \
+	    || { echo "effects FAIL $$name (matching rows rejected)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/row_mismatch_higher_order.kai \
+	         ../examples/effects/row_pure_to_effectful.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (row mismatch accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "type mismatch in function call" build/s2-$$name.err \
+	    && echo "effects OK $$name (rejected as expected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done
 
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
