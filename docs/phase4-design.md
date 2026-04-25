@@ -81,13 +81,22 @@ Each validated and committed before moving on:
 
 ## What phase 4 still cannot do
 
-These remain post-MVP:
-- Cross-file imports and a package manager.
-- Effect inference and the full effects system.
-- Fibers, actors, concurrency.
-- The LLVM backend.
-- WASM, Windows, more architectures.
-- Formatter, REPL, LSP, doc generator.
+These all land in stage 2 — see `docs/stage2-design.md`
+§Milestones for the full plan:
 
-The point of phase 4 is to make the MVP *usable* without extending the
-language itself. Everything above is deliberately deferred.
+- **Cross-file imports** — stage 2 m6 (Module resolution).
+- **Effects system and inference** — stage 2 m7a (mechanics)
+  and m7b (ergonomic sugars). Pinned across `docs/effects.md`,
+  `docs/effects-stdlib.md`, `docs/effects-impl.md`,
+  `docs/syntax-sugars.md`.
+- **Fibers, actors, structured concurrency** — stage 2 m8.
+  See `docs/structured-concurrency.md` and `docs/actors.md`.
+- **LLVM backend** — stage 2 m3.
+- **Formatter, REPL, LSP, doc generator** — stage 2 m15 / m16
+  / m17.
+- **WASM, Windows, more architectures, package manager** —
+  post-stage-2.
+
+The point of phase 4 is to make the MVP *usable* without
+extending the language itself. Everything above is deliberately
+deferred to stage 2 (or beyond).
