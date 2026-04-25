@@ -974,11 +974,11 @@ type TyKind
   | TyFn([TypeExpr], TypeExpr, RowExpr)
 
 # Syntactic effect row: REmpty for `T` (no `/`), RClosed for `T / Io
-# + Fail`. Open rows (with a tail variable like `T / Io + e`) are
-# parsed as RClosed for now; the row variable will land in a later
-# m7a step. In the AST this is the *raw* parsed shape; resolve_ty
+# + Fail`, ROpen for `T / Io + e` or `T / e` where the lowercase tail
+# `e` is a row variable scoped to the enclosing function declaration
+# (m7b #12). In the AST this is the *raw* parsed shape; resolve_ty
 # converts it into the semantic `Row` that lives inside `TyFnT`.
-type RowExpr = REmpty | RClosed([String])
+type RowExpr = REmpty | RClosed([String]) | ROpen(String, [String])
 
 # Handler clause (op): `op_name(args..., resume) -> body`. The
 # resume binding is conventionally the last param; m7a #4d will
@@ -2785,10 +2785,13 @@ fn parse_record_pattern_fields(p: Parser, acc: [PField], ctor: Option[String], t
 # After a return-type is parsed, an optional row suffix can follow:
 #   T / Eff
 #   T / Eff + Eff + ...
-# m7a #3b parses closed rows only — open rows (with a tail variable
-# like `T / Io + e`) are accepted by the lexer as an identifier in
-# the same position but rejected here for now; the row variable
-# lands in a later milestone. If `/` is absent, REmpty.
+#   T / e                # row variable alone (m7b #12)
+#   T / Eff + e          # closed labels followed by a row variable
+# Capitalisation disambiguates: TitleCase identifiers are effect
+# labels, lowercase identifiers in tail position are row variables.
+# Two row variables (`/ e + r`) and a row variable not in tail
+# (`/ e + Eff`) are syntax errors — kaikai picks the simpler
+# tail-variable semantics. If `/` is absent, REmpty.
 type PRow = { p: Parser, r: RowExpr }
 
 fn parse_row_suffix(p: Parser) : PRow {
@@ -2806,11 +2809,26 @@ fn parse_row_labels(p: Parser, acc: [String]) : PRow {
   } else {
     let name = tok_source(p.src, t)
     let p1 = p_advance(p)
-    let acc1 = [name, ...acc]
-    if p_at(p1, TkPlus) {
-      parse_row_labels(p_advance(p1), acc1)
+    if is_upper_ident(p.src, t) {
+      # Effect label: may be followed by `+` and more labels (or a
+      # row variable as the very last element).
+      let acc1 = [name, ...acc]
+      if p_at(p1, TkPlus) {
+        parse_row_labels(p_advance(p1), acc1)
+      } else {
+        PRow { p: p1, r: RClosed(list_reverse(acc1)) }
+      }
     } else {
-      PRow { p: p1, r: RClosed(list_reverse(acc1)) }
+      # Lowercase identifier: a row variable. Must be the last item
+      # in the row — anything after `+` here would be a second row
+      # variable or a label appearing after the tail, both rejected.
+      if p_at(p1, TkPlus) {
+        let pe = p_error(p1, p_peek(p1),
+          "row variable must be the last item in the row")
+        PRow { p: pe, r: ROpen(name, list_reverse(acc)) }
+      } else {
+        PRow { p: p1, r: ROpen(name, list_reverse(acc)) }
+      }
     }
   }
 }
@@ -3707,6 +3725,13 @@ fn dump_row_expr(r: RowExpr, depth: Int) : Unit {
               else { string_concat("row ", join_with(labels, " + ")) }
       emit_line(depth, s)
     }
+    ROpen(rv, labels) -> {
+      let s = if labels == [] { string_concat("row ", rv) }
+              else { string_concat("row ",
+                       string_concat(join_with(labels, " + "),
+                         string_concat(" + ", rv))) }
+      emit_line(depth, s)
+    }
   }
 }
 
@@ -4270,6 +4295,7 @@ fn check_row_expr(re: RowExpr, file: String, line: Int, col: Int, eff_names: [St
   match re {
     REmpty -> 0
     RClosed(names) -> check_label_names(names, file, line, col, eff_names)
+    ROpen(_, names) -> check_label_names(names, file, line, col, eff_names)
   }
 }
 
@@ -6049,6 +6075,7 @@ fn main_row_labels(decls: [Decl]) : [String] {
           match row {
             REmpty       -> []
             RClosed(lbs) -> lbs
+            ROpen(_, lbs) -> lbs
           }
         } else { main_row_labels(rest) }
       _ -> main_row_labels(rest)
@@ -6534,12 +6561,44 @@ fn resolve_ty(t: TypeExpr) : Ty {
 # Labels with empty ty_args (parameterised effects are m7b). m7a #3c
 # will validate that each label refers to a declared effect; for now
 # unknown names slip through and produce no error.
+#
+# m7b #12: ROpen carries a row-variable name in tail position. This
+# helper has no per-decl row-var binding context, so it returns a
+# Row with a *placeholder* tail id (-1). Callers that need a proper
+# row-var binding (fn_scheme_of_decl, infer_decl) use
+# `row_of_expr_with_rbinds` instead and pass a context built by
+# `mk_rvbinds`. Diagnostics-only paths are fine with the placeholder.
 fn row_of_expr(re: RowExpr) : Row {
+  row_of_expr_with_rbinds(re, [])
+}
+
+# Row-variable binding: maps a surface name (`e`) to its allocated
+# row variable id within the enclosing function declaration.
+type RVBind = RVB(String, Int)
+
+fn rvbind_lookup(binds: [RVBind], name: String) : Option[Int] {
+  match binds {
+    [] -> None
+    [b, ...rest] -> match b {
+      RVB(n, i) -> if n == name { Some(i) } else { rvbind_lookup(rest, name) }
+    }
+  }
+}
+
+fn row_of_expr_with_rbinds(re: RowExpr, rbinds: [RVBind]) : Row {
   match re {
     REmpty -> row_empty()
     RClosed(names) -> Row {
       labels: row_labels_of_names(names),
       tail: None,
+      display_alias: None
+    }
+    ROpen(rv, names) -> Row {
+      labels: row_labels_of_names(names),
+      tail: match rvbind_lookup(rbinds, rv) {
+        Some(id) -> Some(id)
+        None     -> Some(-1)
+      },
       display_alias: None
     }
   }
@@ -6800,6 +6859,7 @@ fn expand_aliases_in_row(re: RowExpr, aliases: [AliasResult]) : RowExpr {
   match re {
     REmpty -> REmpty
     RClosed(names) -> RClosed(dedup_strs(expand_label_list(names, aliases)))
+    ROpen(rv, names) -> ROpen(rv, dedup_strs(expand_label_list(names, aliases)))
   }
 }
 
@@ -9455,15 +9515,16 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: De
 }
 
 # m7a #4c: enforce that every effect the body performs appears in
-# the declared row. Open rows (with a tail variable) are deferred
-# — RClosed handles all current uses.
+# the declared row. m7b #12: ROpen carries a row variable that
+# absorbs any extras — every body row is admissible against an
+# open declared row.
 fn check_body_row(st: InferState, fname: String, declared: RowExpr,
                   line: Int, col: Int) : InferState {
-  let declared_names = match declared {
-    REmpty       -> []
-    RClosed(ns)  -> ns
+  match declared {
+    REmpty       -> check_body_row_loop(st, fname, st.row, [], line, col)
+    RClosed(ns)  -> check_body_row_loop(st, fname, st.row, ns, line, col)
+    ROpen(_, _)  -> st
   }
-  check_body_row_loop(st, fname, st.row, declared_names, line, col)
 }
 
 # m7a #8: per-label diagnostic. For each effect the body performed
