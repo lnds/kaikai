@@ -938,10 +938,17 @@ type TypeExpr = { tkind: TyKind, line: Int, col: Int }
 type TyKind
   = TyName(String, [TypeExpr])              # Name or Name[T1, T2, ...]
   | TyList(TypeExpr)
-  | TyFn([TypeExpr], TypeExpr)
+  | TyFn([TypeExpr], TypeExpr, RowExpr)
+
+# Syntactic effect row: REmpty for `T` (no `/`), RClosed for `T / Io
+# + Fail`. Open rows (with a tail variable like `T / Io + e`) are
+# parsed as RClosed for now; the row variable will land in a later
+# m7a step. In the AST this is the *raw* parsed shape; resolve_ty
+# converts it into the semantic `Row` that lives inside `TyFnT`.
+type RowExpr = REmpty | RClosed([String])
 
 type Decl
-  = DFn(Bool, String, [Param], Option[TypeExpr], Expr, Int, Int)
+  = DFn(Bool, String, [Param], Option[TypeExpr], RowExpr, Expr, Int, Int)
   | DType(Bool, String, [String], TypeBody, Int, Int)
   | DTest(String, Expr, Int, Int)
   | DImport(ImportKind, Int, Int)
@@ -2250,6 +2257,39 @@ fn parse_record_pattern_fields(p: Parser, acc: [PField], ctor: Option[String], t
 # type expressions
 # ====================================================================
 
+# After a return-type is parsed, an optional row suffix can follow:
+#   T / Eff
+#   T / Eff + Eff + ...
+# m7a #3b parses closed rows only — open rows (with a tail variable
+# like `T / Io + e`) are accepted by the lexer as an identifier in
+# the same position but rejected here for now; the row variable
+# lands in a later milestone. If `/` is absent, REmpty.
+type PRow = { p: Parser, r: RowExpr }
+
+fn parse_row_suffix(p: Parser) : PRow {
+  if not p_at(p, TkSlash) { PRow { p: p, r: REmpty } }
+  else {
+    let p1 = p_advance(p)
+    parse_row_labels(p1, [])
+  }
+}
+
+fn parse_row_labels(p: Parser, acc: [String]) : PRow {
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) {
+    PRow { p: p_error(p, t, "expected effect name in row"), r: REmpty }
+  } else {
+    let name = tok_source(p.src, t)
+    let p1 = p_advance(p)
+    let acc1 = [name, ...acc]
+    if p_at(p1, TkPlus) {
+      parse_row_labels(p_advance(p1), acc1)
+    } else {
+      PRow { p: p1, r: RClosed(list_reverse(acc1)) }
+    }
+  }
+}
+
 fn parse_type(p: Parser) : PTy {
   let t = p_peek(p)
   if tk_is(t.kind, TkLbracket) {
@@ -2313,7 +2353,10 @@ fn parse_fn_type(p: Parser, t: Token) : PTy {
       let r = parse_type(p_advance(p2))
       match r.r {
         None -> err_t(r.p)
-        Some(ret) -> ok_t(r.p, mk_ty(TyFn([], ret), t.line, t.col))
+        Some(ret) -> {
+          let row_r = parse_row_suffix(r.p)
+          ok_t(row_r.p, mk_ty(TyFn([], ret, row_r.r), t.line, t.col))
+        }
       }
     }
   } else {
@@ -2337,7 +2380,10 @@ fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy {
           let rr = parse_type(p_advance(p2))
           match rr.r {
             None -> err_t(rr.p)
-            Some(ret) -> ok_t(rr.p, mk_ty(TyFn(list_reverse([arg, ...acc]), ret), t.line, t.col))
+            Some(ret) -> {
+              let row_r = parse_row_suffix(rr.p)
+              ok_t(row_r.p, mk_ty(TyFn(list_reverse([arg, ...acc]), ret, row_r.r), t.line, t.col))
+            }
           }
         }
       } else {
@@ -2415,21 +2461,23 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
             }
           if ret_r.p.had_error and not p3.had_error { err_d(ret_r.p) }
           else {
-            let p4 = p_skip_newlines(ret_r.p)
+            # Optional effect-row suffix: `T / Io + Fail`. m7a #3b.
+            let row_r = parse_row_suffix(ret_r.p)
+            let p4 = p_skip_newlines(row_r.p)
             # Body: `= expr` or `{ block }`.
             if p_at(p4, TkEq) {
               let p5 = p_skip_newlines(p_advance(p4))
               let rb = parse_expr(p5)
               match rb.r {
                 None -> err_d(rb.p)
-                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, body, t.line, t.col))
+                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, row_r.r, body, t.line, t.col))
               }
             } else if p_at(p4, TkLbrace) {
               let tb = p_peek(p4)
               let rb = parse_block(p4, tb)
               match rb.r {
                 None -> err_d(rb.p)
-                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, body, t.line, t.col))
+                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, row_r.r, body, t.line, t.col))
               }
             } else {
               err_d(p_error_here(p4, "expected `=` or `{` to start function body"))
@@ -3048,21 +3096,34 @@ fn dump_type(ty: TypeExpr, depth: Int) : Unit {
       emit_line(depth, "ty_list @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
       dump_type(inner, depth + 1)
     }
-    TyFn(targs, ret) -> {
+    TyFn(targs, ret, row) -> {
       emit_line(depth, "ty_fn @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
       targs |> each((a) => dump_type(a, depth + 1))
       dump_type(ret, depth + 1)
+      dump_row_expr(row, depth + 1)
+    }
+  }
+}
+
+fn dump_row_expr(r: RowExpr, depth: Int) : Unit {
+  match r {
+    REmpty -> ()
+    RClosed(labels) -> {
+      let s = if labels == [] { "row (empty)" }
+              else { string_concat("row ", join_with(labels, " + ")) }
+      emit_line(depth, s)
     }
   }
 }
 
 fn dump_decl(d: Decl, depth: Int) : Unit {
   match d {
-    DFn(is_pub, name, params, opt_ret, body, line, col) -> {
+    DFn(is_pub, name, params, opt_ret, row, body, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       emit_line(depth, "fn #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
       params |> each((pm) => dump_param(pm, depth + 1))
       match opt_ret { Some(ty) -> dump_type(ty, depth + 1) None -> () }
+      dump_row_expr(row, depth + 1)
       dump_expr(body, depth + 1)
     }
     DType(is_pub, name, tparams, body, line, col) -> {
@@ -3419,7 +3480,7 @@ fn add_params(e: Env, ps: [Param]) : Env {
 
 fn chk_decl(e: Env, d: Decl) : Env {
   match d {
-    DFn(_, _, params, _, body, _, _) -> {
+    DFn(_, _, params, _, _, body, _, _) -> {
       let e1 = env_push(e)
       let e2 = add_params(e1, params)
       let e3 = chk_expr(e2, body)
@@ -3454,7 +3515,7 @@ fn register_decls(e: Env, ds: [Decl]) : Env {
 
 fn register_one(e: Env, d: Decl) : Env {
   match d {
-    DFn(_, name, _, _, _, _, _) -> env_add(e, name)
+    DFn(_, name, _, _, _, _, _, _) -> env_add(e, name)
     DType(_, name, _, body, _, _) -> {
       let e1 = env_add(e, name)
       match body {
@@ -3567,7 +3628,7 @@ fn evar_find(vs: [EVar], target: String) : Option[Int] {
 
 fn fn_of_decl(d: Decl) : Option[EFn] {
   match d {
-    DFn(_, name, params, _, _, _, _) -> Some(EFn(name, list_length(params)))
+    DFn(_, name, params, _, _, _, _, _) -> Some(EFn(name, list_length(params)))
     _ -> None
   }
 }
@@ -4518,7 +4579,7 @@ fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect {
 
 fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
   match d {
-    DFn(_, _, _, _, body, _, _) -> collect_expr(body, st)
+    DFn(_, _, _, _, _, body, _, _) -> collect_expr(body, st)
     DType(_, _, _, _, _, _) -> st
     DTest(_, body, _, _) -> collect_expr(body, st)
     DImport(_, _, _) -> st
@@ -4760,14 +4821,14 @@ fn emit_fn_signature(name: String, params: [Param]) : String =
 
 fn emit_fn_forward(d: Decl) : String {
   match d {
-    DFn(_, name, params, _, _, _, _) -> cat2(emit_fn_signature(name, params), ";\n")
+    DFn(_, name, params, _, _, _, _, _) -> cat2(emit_fn_signature(name, params), ";\n")
     _ -> ""
   }
 }
 
 fn emit_thunk_forward(d: Decl) : String {
   match d {
-    DFn(_, name, _, _, _, _, _) ->
+    DFn(_, name, _, _, _, _, _, _) ->
       cat3("static KaiValue *_kai_", name, "_thunk(KaiValue *, KaiValue **, int);\n")
     _ -> ""
   }
@@ -4775,7 +4836,7 @@ fn emit_thunk_forward(d: Decl) : String {
 
 fn emit_fn_body(src: String, d: Decl, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   match d {
-    DFn(_, name, params, _, body, _, _) -> {
+    DFn(_, name, params, _, _, body, _, _) -> {
       let sig = emit_fn_signature(name, params)
       let body_c = emit_expr(src, body, fns, variants, lams)
       cat5(sig, " {\n    return ", body_c, ";\n", "}\n\n")
@@ -4799,7 +4860,7 @@ fn emit_param_reads(params: [Param], start: Int) : String {
 
 fn emit_fn_thunk(d: Decl) : String {
   match d {
-    DFn(_, name, params, _, _, _, _) -> {
+    DFn(_, name, params, _, _, _, _, _) -> {
       let param_reads = emit_param_reads(params, 0)
       let named_args = emit_param_args(params)
       let hdr = concat_all([
@@ -4824,7 +4885,7 @@ fn thunk_forward_decls(decls: [Decl]) : String =
 fn fn_bodies(src: String, decls: [Decl], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
   concat_all(map(decls, (d) => {
     match d {
-      DFn(_, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, fns, variants, lams), emit_fn_thunk(d))
+      DFn(_, _, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, fns, variants, lams), emit_fn_thunk(d))
       _ -> ""
     }
   }))
@@ -4902,7 +4963,7 @@ fn has_main_decl(decls: [Decl]) : Bool {
   match decls {
     [] -> false
     [d, ...rest] -> match d {
-      DFn(_, n, _, _, _, _, _) -> if n == "main" { true } else { has_main_decl(rest) }
+      DFn(_, n, _, _, _, _, _, _) -> if n == "main" { true } else { has_main_decl(rest) }
       _ -> has_main_decl(rest)
     }
   }
@@ -4998,7 +5059,29 @@ fn resolve_ty(t: TypeExpr) : Ty {
       else { TyCon(name, resolve_ty_list(targs)) }
     }
     TyList(inner) -> TyListT(resolve_ty(inner))
-    TyFn(fps, fret) -> TyFnT(resolve_ty_list(fps), resolve_ty(fret), row_empty())
+    TyFn(fps, fret, rexpr) -> TyFnT(resolve_ty_list(fps), resolve_ty(fret), row_of_expr(rexpr))
+  }
+}
+
+# Convert a parsed RowExpr into its semantic Row. Effect names become
+# Labels with empty ty_args (parameterised effects are m7b). m7a #3c
+# will validate that each label refers to a declared effect; for now
+# unknown names slip through and produce no error.
+fn row_of_expr(re: RowExpr) : Row {
+  match re {
+    REmpty -> row_empty()
+    RClosed(names) -> Row {
+      labels: row_labels_of_names(names),
+      tail: None,
+      display_alias: None
+    }
+  }
+}
+
+fn row_labels_of_names(ns: [String]) : [Label] {
+  match ns {
+    [] -> []
+    [n, ...rest] -> [Label { eff: n, ty_args: [] }, ...row_labels_of_names(rest)]
   }
 }
 
@@ -5013,13 +5096,13 @@ fn param_ty(pm: Param) : Ty {
 # decl has no signature shape (DType, DImport).
 fn sig_of_decl(d: Decl) : Option[Ty] {
   match d {
-    DFn(_, _, params, opt_ret, _, _, _) -> {
+    DFn(_, _, params, opt_ret, rexpr, _, _, _) -> {
       let pts = map(params, param_ty)
       let ret = match opt_ret {
         Some(rty) -> resolve_ty(rty)
         None -> TyUnit
       }
-      Some(TyFnT(pts, ret, row_empty()))
+      Some(TyFnT(pts, ret, row_of_expr(rexpr)))
     }
     _ -> None
   }
@@ -5058,7 +5141,7 @@ fn ty_to_string(t: Ty) : String {
 # the user wrote.
 fn dump_decl_type(d: Decl) : Unit {
   match d {
-    DFn(is_pub, name, _, _, _, line, col) -> {
+    DFn(is_pub, name, _, _, _, _, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       match sig_of_decl(d) {
         Some(ty) -> print("#{pub_s}fn #{name} : #{ty_to_string(ty)} @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -5280,7 +5363,7 @@ fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
       }
     }
     TyList(inner) -> list_ty(resolve_ty_with_tparams(inner, binds))
-    TyFn(ps, ret) -> fn_ty(map(ps, (p) => resolve_ty_with_tparams(p, binds)),
+    TyFn(ps, ret, _) -> fn_ty(map(ps, (p) => resolve_ty_with_tparams(p, binds)),
                            resolve_ty_with_tparams(ret, binds))
   }
 }
@@ -5337,7 +5420,7 @@ fn add_variants_loop(env: TyEnv, tname: String, tparams: [String], vs: [Variant]
 
 fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
   match d {
-    DFn(_, _, params, opt_ret, _, _, _) -> {
+    DFn(_, _, params, opt_ret, _, _, _, _) -> {
       # Function-level generics are inferred later; for now everything
       # that uses a user function is monomorphic. Type variables can be
       # added in M2c when generic inference lands.
@@ -5357,7 +5440,7 @@ fn add_decls_loop(env: TyEnv, ds: [Decl]) : TyEnv {
     [] -> env
     [d, ...rest] -> {
       let env1 = match d {
-        DFn(_, fname, _, _, _, _, _) -> match fn_scheme_of_decl(d) {
+        DFn(_, fname, _, _, _, _, _, _) -> match fn_scheme_of_decl(d) {
           Some(sc) -> ty_env_add(env, fname, sc)
           None     -> env
         }
@@ -7084,7 +7167,7 @@ fn return_site_of(e: Expr) : Expr {
 
 fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: Decl, verbose: Bool) : TypedDecl {
   match d {
-    DFn(is_pub, nm, ps, opt_ret, body, line, col) -> {
+    DFn(is_pub, nm, ps, opt_ret, row, body, line, col) -> {
       let st0 = infer_state_new(file, env, prelude_len, recs)
       let added = add_infer_params(st0, ps)
       let rb = synth(added.st, body)
@@ -7101,7 +7184,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: De
       let resolved = resolve_callsites(list_reverse(st1.insts), st1.sub)
       let hole_reports = resolve_holes(list_reverse(st1.holes), st1.sub)
       TypedDecl {
-        decl: DFn(is_pub, nm, ps, opt_ret, rb.expr, line, col),
+        decl: DFn(is_pub, nm, ps, opt_ret, row, rb.expr, line, col),
         errs: st1.errs,
         insts: resolved,
         holes: hole_reports
@@ -7329,7 +7412,7 @@ fn dump_typed_stmt(s: Stmt, depth: Int) : Unit {
 
 fn dump_typed_decl(d: Decl) : Unit {
   match d {
-    DFn(_, nm, _, _, body, line, col) -> {
+    DFn(_, nm, _, _, _, body, line, col) -> {
       print("fn #{nm} @#{int_to_string(line)}:#{int_to_string(col)}")
       dump_typed_expr(body, 1)
     }
@@ -9217,7 +9300,7 @@ type LlvmDeclOut = { text: String, next_id: Int }
 
 fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], start_id: Int) : LlvmDeclOut {
   match d {
-    DFn(_, nm, ps, _, body, _, _) -> {
+    DFn(_, nm, ps, _, _, body, _, _) -> {
       let locals0 = llvm_init_locals_from_params(ps)
       let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
                           globals: "", body: "",

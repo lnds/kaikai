@@ -285,9 +285,11 @@ test-holes: $(TARGET) build
 	  echo "holes OK $$name"; \
 	done
 
-# m7a #3 — `effect` declarations parse cleanly + negative cases fail
-# with the expected diagnostic. Exercises the parser only; name
-# resolution and codegen for `effect` are still deferred (#3c, #3d).
+# m7a #3 — parser-level smoke tests for `effect` declarations and
+# the `T / Eff + Eff` row syntax. Each .kai file dumps to AST and
+# the test asserts grep-able markers exist (or, for negatives,
+# that the expected diagnostic fires). Semantic checks (row
+# inferred from body equals declared row) are m7a #8.
 test-effects: $(TARGET) build
 	@set -e; \
 	for f in ../examples/effects/parse_effect.kai; do \
@@ -296,6 +298,14 @@ test-effects: $(TARGET) build
 	    && grep -q "effect \"Io\"" build/s2-$$name.ast \
 	    && grep -q "effect \"Fail\"" build/s2-$$name.ast \
 	    && grep -q "op \"print\"" build/s2-$$name.ast \
+	    && echo "effects OK $$name" \
+	    || { echo "effects FAIL $$name"; cat build/s2-$$name.ast; exit 1; }; \
+	done; \
+	for f in ../examples/effects/parse_row_syntax.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --ast $$f > build/s2-$$name.ast \
+	    && grep -q "row Io" build/s2-$$name.ast \
+	    && grep -q "row Io + Fail" build/s2-$$name.ast \
 	    && echo "effects OK $$name" \
 	    || { echo "effects FAIL $$name"; cat build/s2-$$name.ast; exit 1; }; \
 	done; \
