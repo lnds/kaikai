@@ -1,22 +1,29 @@
 # syntax sugars
 
-This is the authoritative specification for the four call-site
+This is the authoritative specification for the five call-site
 syntactic sugars shipping in milestone **m7b**. They are
 **general language features**, not effect-specific extensions:
 they apply anywhere the grammar allows, and the parser /
 grammar treats this document as the single source of truth for
 their shape, precedence, and desugaring.
 
-The four sugars:
+The five sugars:
 
 1. **Trailing lambdas** — the last `() -> T` argument of any
-   call can be written as a block outside the parens.
+   call can be written as a block outside the parens. The
+   block-form `{ x -> body }` is also legal as a standalone
+   lambda expression in non-trailing positions (operand of
+   `|` / `|>`, RHS of `let`, etc.).
 2. **Capability read/write** — `@cap` and `cap := v` as short
    forms for capability ops on `State[T]` and `Reader[T]`.
 3. **Local mutable cells** — `var x = init` declares an
    in-block `State[T]` handler.
 4. **Array indexing** — `a[i]` and `a[i] := v` for
    `Mutable.array_get` / `Mutable.array_set`.
+5. **Double trailing lambdas** — when the last two arguments
+   are both function type, both may be written as trailing
+   blocks (`while { cond } { body }`, `if_then_else(p) { a }
+   { b }`).
 
 Each sugar desugars before type checking — the checker sees
 only the post-desugar AST, so effect-row inference is
@@ -30,13 +37,17 @@ sugar where it is useful). This document is where the grammar
 actually lives:
 
 - Trailing lambdas — Doc B §*Syntax note: trailing lambdas*
-  motivates; §1 below specifies.
+  motivates; §1 below specifies, including the lambda-block
+  expression form.
 - `@cap` / `cap := v` — Doc B §*Syntax note: capability
   read/write sugar* motivates; §2 below specifies.
 - `var` — Doc B §*Syntax note: local mutable cells with `var`*
   motivates; §3 below specifies.
 - `a[i]` / `a[i] := v` — Doc B §*Syntax note: array indexing*
   motivates; §4 below specifies.
+- Double trailing lambdas — motivated by `loop_while`,
+  `if_then_else`, and similar control-flow helpers built as
+  ordinary stdlib functions; §5 below specifies.
 
 Doc A (`docs/effects.md`) §*Handling* records that the
 `handle { body } with Eff { ... }` form already uses the
@@ -45,13 +56,16 @@ and a cross-reference back to Doc A.
 
 ## Design principles
 
-The four sugars together add:
+The five sugars together add:
 
 - one keyword: `var`.
 - three binding shapes: `cap := v`, `a[i] := v`, `var x = v`.
 - one prefix form: `@cap`.
 - one postfix form: `a[i]`.
-- one call-site shape: trailing lambda.
+- two call-site shapes: trailing lambda, and a second
+  trailing-lambda slot for two-block control-flow helpers.
+- the block-form `{ x -> body }` accepted as a standalone
+  lambda expression wherever a `Primary` is legal.
 
 Two filters justify accepting this surface:
 
@@ -206,6 +220,38 @@ Style guidance for stdlib and project code:
   `f(arg) { body }` reads as "do `{ body }` with `arg`
   configured", which matches the intent of most effectful
   helpers.
+
+### Lambda-block in non-trailing positions
+
+The block-form `{ x -> body }` (or `{ body }` for zero arity) is
+also legal as a **standalone lambda expression** in any position
+where an expression is legal — not only in trailing position.
+This is the form preferred when the lambda is the right operand
+of a binary pipe such as `|` (map pipe) or `|>`:
+
+```kai
+[1..10] | { x -> x * x }              # squared list
+xs |> { ys -> list.length(ys) }       # apply a custom transform
+let inc = { x -> x + 1 }              # bind to a variable
+```
+
+The desugar is identical to `(x) => body`: both produce the same
+lambda expression. The two forms coexist intentionally and signal
+different intents (CLAUDE.md cross-cutting principle: *few forms,
+each with clear intent*):
+
+- `(x) => body` — **lambda-as-value**: assigned to a binding,
+  passed in paren-form, returned from a function. Reads as a
+  function value standing on its own.
+- `{ x -> body }` — **lambda-as-block**: the body of a call's
+  intent (trailing position) or a transformation that reads
+  better as a block (operand of `|` / `|>`, multi-line bodies).
+
+The same-line attachment rule from §*Grammar delta* still
+applies: `xs | { ... }` parses as `xs | (lambda)` only when `|`
+and `{` are on the same line. A newline between them splits the
+two into separate statements (the second of which would be a
+standalone block expression).
 
 ## 2. Capability read/write: `@cap` and `cap := v`
 
@@ -429,17 +475,114 @@ Three deliberate non-targets:
   `docs/proposed-extensions.md` §18; lands alongside
   `Vector[T]` post-MVP, with a separate grammar rule.
 
+## 5. Double trailing lambdas
+
+### Rule
+
+A call whose **last two arguments are both function type** may
+be written with both trailing as blocks:
+
+```kai
+f(arg)        { x -> body1 } { y -> body2 }
+            ≡ f(arg, (x) => { body1 }, (y) => { body2 })
+
+f(arg1, arg2) { body1 }      { body2 }
+            ≡ f(arg1, arg2, () => { body1 }, () => { body2 })
+
+# Zero-argument call with two trailing lambdas:
+f { cond } { body }
+            ≡ f((() => cond), (() => { body }))
+```
+
+The canonical use is control-flow helpers built as ordinary
+stdlib functions:
+
+```kai
+loop_while { @i > 0 } { i := @i - 1; io.println("#{@i}") }
+until      { @done }  { process_one() }
+if_then_else(p)       { run_a() } { run_b() }
+```
+
+These compose with row polymorphism the same way single-trailing
+calls do — the row variable on the two lambda parameters
+unifies, and the call's result row is the union.
+
+### Grammar delta
+
+```
+Call           ::= Primary "(" Args ")" TrailingLambda? TrailingLambda?
+                 | Primary                TrailingLambda  TrailingLambda?
+```
+
+The optional second `TrailingLambda` is greedy: when two `{...}`
+blocks follow a callable on the same line, the parser attaches
+both. The same-line discipline from §1 *Grammar delta* extends
+to the second block: a newline before either `{` terminates the
+call and starts a new statement.
+
+### Type-check rule
+
+When two trailing lambdas are present, the call's declared
+arity must be at least two and the **last two declared
+parameters must both have function type**. The checker reports
+the same diagnostic shape as single-trailing for arity or type
+mismatches; the second lambda's expected type is the
+penultimate declared parameter, the first lambda's expected
+type is the last.
+
+### Editorial preference
+
+Use double trailing **only when the two lambdas have visibly
+distinct intents** — predicate + body, then-branch + else-branch,
+condition + action — so the reader can tell which is which from
+position alone. When both lambdas play similar roles
+(`map_two(xs, f, g)`), keep paren form; the position of two
+indistinguishable blocks is more confusing than verbose.
+
+Three constructs that benefit clearly:
+
+- **`loop_while { cond } { body }`** — predicate then action.
+- **`if_then_else(p) { a } { b }`** — then-branch then else.
+- **`with_resource(r) { setup } { teardown }`** — RAII-shaped
+  bracketed-init pattern.
+
+### Ambiguity with block expressions
+
+Same resolution as §1: blocks-as-expressions and trailing-
+lambda blocks differ by **same-line attachment**. With two
+trailings the rule generalises:
+
+```kai
+f { a } { b }            # one call: f((() => a), (() => b))
+
+f { a }
+{ b }                    # one call f((() => a)), then a standalone block { b }
+
+f
+{ a } { b }              # f reference, then two standalone blocks
+```
+
+The first `{` after the callable starts a trailing lambda only
+when same-line; the second `{` is consumed greedily under the
+same rule. Newlines terminate.
+
 ## Cross-sugar interaction
 
-All four sugars compose without ambiguity because their
-grammar slots are disjoint:
+All five sugars compose without ambiguity because their grammar
+slots are disjoint:
 
 - `@cap` is a prefix of `Primary`.
 - `a[i]` is a postfix of `Primary`.
 - `cap := v` and `a[i] := v` are statement forms.
 - `var x = init` is a statement form with a distinct keyword.
 - Trailing lambda is a suffix of a call (also a `Primary`
-  postfix slot, distinct from `[i]`).
+  postfix slot, distinct from `[i]`); the second trailing
+  lambda (§5) extends the same suffix slot with greedy
+  same-line attachment.
+- Lambda-block in expression position (§1 *Lambda-block in
+  non-trailing positions*) is parsed as `Primary` when the
+  position demands an expression and the same-line rule binds
+  the `{` to its preceding operator or `(`.
 
 Combining them:
 
@@ -597,13 +740,14 @@ reasons:
   - The formatter spec for `kai fmt`: canonical line breaks
     and spacing for each sugar, on top of the structural rules
     already pinned in this document.
-- **Grammar update in `docs/kaikai-minimal.md`** — all four
+- **Grammar update in `docs/kaikai-minimal.md`** — all five
   sugars modify the expression / statement grammar.
   `kaikai-minimal.md` carries the canonical EBNF; its
   §*Grammar* should be extended with the post-sugars productions
   introduced here so the LL(1) property is checkable from a
   single source.
 
-Trailing lambdas, `@` / `:=`, `var`, and `a[i]` all land
-together in milestone **m7b**. None has a hard dependency on
-another, so the order inside m7b is by convenience.
+Trailing lambdas (single and double), the lambda-block
+expression form, `@` / `:=`, `var`, and `a[i]` all land together
+in milestone **m7b**. None has a hard dependency on another, so
+the order inside m7b is by convenience.
