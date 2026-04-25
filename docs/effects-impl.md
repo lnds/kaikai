@@ -1313,26 +1313,25 @@ page the way they are written.
    **Landed.**
 4. **`@cap` and `cap := v`** — post-resolve desugar pass
    (depends on capability bindings produced by resolve).
-   **Blocked on #11** — `@cap` only applies to `State[T].get()`
-   and `Reader[T].ask()`; until parametric effects exist there
-   are no capability bindings of those types.
+   **Unblocked by #11** — `State[T]` and `Reader[T]` are now
+   available as parametric effects; capability bindings of those
+   types exist in scope. *Pending.*
 5. **`var x = init`** — pre-resolve desugar + variable
    specialisation (§*Variable specialisation*). **Parser-only
-   landed; desugar blocked on #11** — Doc B §3 mandates lowering
+   landed; desugar unblocked by #11** — Doc B §3 mandates lowering
    to `handle { rest } with State[T](init) as name { ... }`,
-   which requires `State[T]` to exist. A first attempt lowered
-   to a 1-element `Mutable.array_make` cell-binding instead;
-   that shortcut was reverted to stay faithful to Doc B (locality
-   guarantee, no Mutable-row contamination). The desugar lands
-   once #11 is in.
+   which now exists end-to-end. A first attempt lowered to a
+   1-element `Mutable.array_make` cell-binding instead; that
+   shortcut was reverted to stay faithful to Doc B (locality
+   guarantee, no Mutable-row contamination). *Desugar pending.*
 6. **`a[i]` and `a[i] := v`** — pre-resolve desugar pass.
    **Landed.**
 7. **`Reader[T]` / `Writer[W]`** — new stdlib effects (Doc B
-   §*Open questions* #2 resolved in their favour). **Blocked on
-   #11** — both effects are type-parameterised; pre-flight on
-   the original m7b #7 attempt confirmed m7a's `effect` parser
-   does not accept `[T]`, `RowExpr` cannot carry per-effect type
-   args, and `EHandle` has no slot for handler-state init.
+   §*Open questions* #2 resolved in their favour). **Unblocked
+   by #11** — both effects work end-to-end as #11 fixtures
+   (`examples/effects/m7b_11_reader_basic.kai`,
+   `m7b_11_writer_basic.kai`); what remains is promoting them
+   from test fixtures into `stdlib/`. *Pending.*
 8. **Diagnostic review** — every message rewritten against the
    stage 2 §8 bar. *Lands last.*
 9. **`|` map pipe** — binary operator wired in the parser,
@@ -1356,6 +1355,12 @@ page the way they are written.
     First end-to-end user: `State[T]`. Once that lands,
     `Reader[T]` and `Writer[W]` become the trivial stdlib pair
     of #7. Comparable in scope to m7a #6 + #7 + #8 combined.
+    **Landed.** Sub-steps a/b (parser + AST), c-h (`State[T]`,
+    `Reader[T]`, `Writer[W]` end-to-end), i (per-instance
+    `row.ty_args` propagation), j (arity check), k (diagnostics
+    render type args), l (type-check `state` / `log` / `resume`),
+    m (followup tests). Promotion of `Reader[T]` / `Writer[W]`
+    from test fixtures into `stdlib/` remains as #7.
 12. **Open row variables in user-written signatures** —
     `pub fn while(pred: () -> Bool / e, body: () -> Unit / e) :
     Unit / e` etc. Today the resolver (`check_row_expr` in
@@ -1373,9 +1378,9 @@ Within each sub-milestone the ordering is dependency-driven: the
 evidence type generation (m7a #3) unblocks everything else in
 m7a; the desugar pass (m7b #3–#6) runs as a single addition and
 then specialisation (m7b #5) piggybacks on top. m7b #11 and
-#12 are large enough to be milestones in their own right and
-should each get a dedicated sub-design-doc when their turn
-arrives.
+#12 were each large enough to be milestones in their own right;
+both have landed. The remaining m7b items (#2, #4, #5b, #7, #8)
+are now all unblocked.
 
 ## Next steps
 
