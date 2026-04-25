@@ -941,10 +941,15 @@ type Stmt
   # field path). Lowered to a `Mutable.array_set`-style call by the
   # pre-resolve `desugar_index_assign` pass; never reaches the checker.
   | SIndexAssign(Expr, Expr, Expr, Int, Int)
-  # m7b #5: local mutable cell `var name [: T] = init`. The pre-resolve
-  # `desugar_var_decls` pass rewrites every block containing an SVar into
-  # a nested `handle { rest } with State[T](init) as name { ... }` so SVar
-  # never reaches the resolver. The line/col point at the `var` keyword.
+  # m7b #5: local mutable cell `var name [: T] = init`. NOT YET FULLY
+  # IMPLEMENTED — the parser produces this node, but the planned
+  # `desugar_var_decls` pass that rewrites it into a `handle ... with
+  # State[T](init)` form is unimplemented (blocked on EHandle lacking
+  # type-arg / init-expr slots, no generic effects, no state-threading
+  # resume — see m7b #5 final report). Until that lands, SVar reaches
+  # the resolver and inference, where it is rejected with an explicit
+  # "not yet implemented" diagnostic. The line/col point at the `var`
+  # keyword.
   | SVar(String, Option[TypeExpr], Expr, Int, Int)
 
 type Pattern = { pkind: PatKind, line: Int, col: Int }
@@ -2400,10 +2405,12 @@ fn parse_let(p: Parser, t: Token) : PStmt {
   }
 }
 
-# m7b #5: `var name (: T)? = init` — local mutable cell. The pre-resolve
-# desugar pass (desugar_var_decls) rewrites every block containing an
-# SVar into a nested `handle { rest } with State[T](init) as name { ... }`,
-# so SVar is a parser-only AST shape. No `var name` (without `= init`)
+# m7b #5: `var name (: T)? = init` — local mutable cell. The parser
+# produces an `SVar` node; the planned `desugar_var_decls` pass that
+# rewrites it into a `handle ... with State[T](init) as name { ... }`
+# is not yet implemented (see SVar's declaration comment), so any
+# program containing `var` is rejected at resolve time with an explicit
+# "not yet implemented" diagnostic. No `var name` (without `= init`)
 # form: rejected here with a syntax error.
 fn parse_var(p: Parser, t: Token) : PStmt {
   let p1 = p_advance(p)
@@ -4110,12 +4117,14 @@ fn chk_stmt(e: Env, s: Stmt) : Env {
       let e2 = chk_expr(e1, idx)
       chk_expr(e2, val)
     }
-    # m7b #5: `var name` — should be desugared away pre-resolve. Mirror
-    # the SLet shape (resolve init, bind name) so the match remains
-    # exhaustive without changing resolve semantics.
-    SVar(name, _, rhs, line, col) -> {
+    # m7b #5: `var name = init` — desugar pass not yet implemented.
+    # Reject explicitly so users do not silently get `let`-like behaviour
+    # while State[T] support is missing. Still resolves the init for
+    # follow-on diagnostics, but does not bind the name.
+    SVar(_, _, rhs, line, col) -> {
       let e1 = chk_expr(e, rhs)
-      bind_pat(e1, mk_pat(PBind(name), line, col))
+      chk_error(e1, line, col,
+        "`var` is not yet implemented (m7b #5: parser landed, desugar pending)")
     }
   }
 }
@@ -8901,25 +8910,15 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt {
       let rv = synth(ri.st, v)
       OneStmt { st: rv.st, stmt: SIndexAssign(rb.expr, ri.expr, rv.expr, line, col) }
     }
-    # m7b #5: `var name = init` should be desugared away pre-resolve. If
-    # one reaches inference, treat it as `let name = init` so the match
-    # stays exhaustive without changing inference behaviour.
+    # m7b #5: `var name = init` — desugar pass not yet implemented.
+    # The resolve pass (chk_stmt) already emits the explicit "not yet
+    # implemented" diagnostic and short-circuits before infer normally
+    # runs. If a future caller invokes inference on the raw AST, return
+    # the init's type without binding `name`, so we never silently
+    # produce a `let`-equivalent.
     SVar(name, ann, rhs, line, col) -> {
       let rr = synth(st, rhs)
-      let binding_st = match ann {
-        None -> rr.st
-        Some(te) -> {
-          let declared = resolve_ty(te)
-          st_unify(rr.st, declared, rr.ty, "var annotation", line, col)
-        }
-      }
-      let binding_ty = match ann {
-        None -> rr.ty
-        Some(te) -> resolve_ty(te)
-      }
-      let pat = mk_pat(PBind(name), line, col)
-      let after = check_pattern(binding_st, pat, binding_ty)
-      OneStmt { st: after, stmt: SVar(name, ann, rr.expr, line, col) }
+      OneStmt { st: rr.st, stmt: SVar(name, ann, rr.expr, line, col) }
     }
   }
 }
