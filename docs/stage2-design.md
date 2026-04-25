@@ -60,21 +60,40 @@ Grouped by subsystem:
 
 ### 3. Effects system — full
 
-Inherits the skeleton from stage 1 and fills it in.
+The full design lives in three pinned docs:
 
-- **Capability-passing Effekt + inference**. Effects are first-class
-  rows on function types; the checker infers them in private
-  bodies and requires them on public signatures.
-- `perform Effect.op(args)` does the call; `handle { body } with {
-  op(x, k) -> ... }` installs a handler; `resume(v)` continues.
-- The one-shot/multi-shot distinction is a runtime property, not a
-  type: continuations are represented by a stack segment pointer,
-  multi-shot pays copy cost on `resume`, one-shot is free.
-- Coarse-grained polymorphism over effect rows: `map[A, B, e](xs:
-  [A], f: (A) -> B / e) : [B] / e`.
-- **Actor capability** is a handler in the stdlib, not a language
-  built-in: `Actor` defines `spawn`, `send`, `receive`; the default
-  scheduler provides its implementation.
+- `docs/effects.md` (Doc A): rows, unification, syntax,
+  `handle`/`resume`, inference. The mental model.
+- `docs/effects-stdlib.md` (Doc B): catalog of stdlib effects,
+  default handlers, the `Io` alias, m7a/m7b split.
+- `docs/effects-impl.md` (Doc C): CPS transform, handler-stack
+  runtime, codemod.
+
+Stage 2 ships the implementation; this section summarises the
+shape.
+
+- **Capability-passing Effekt + inference**. Effects are
+  first-class rows on function types; the checker infers them
+  in private bodies and requires them on public signatures.
+- `Eff.op(args)` does the call (no `perform` keyword — ops are
+  invoked as methods on the effect or its `as`-bound capability,
+  per Doc A §*Calling an operation*). `handle { body } with
+  Effect { op(args, resume) -> expr }` installs a handler;
+  `resume(v)` continues, one-shot by default.
+- One-shot/multi-shot is a runtime property, not a type: one-shot
+  resume is a tail call, multi-shot pays copy cost via opt-in
+  `resume_multishot`.
+- Row polymorphism over effect rows: `map[A, B, e](xs: [A], f:
+  (A) -> B / e) : [B] / e`.
+- **Stdlib effect catalog** (Doc B): `Console`, `Stdin`, `Env`,
+  `File` (granularised from a coarse `Io`, with `type Io =
+  Console + Stdin + Env + File` as a closed alias); `Fail`,
+  `State[T]`, `Reader[T]`, `Writer[W]`, `Mutable`, `Cancel`,
+  `Spawn`, `Ffi`. Mailboxes (`Actor[Msg]`) live in
+  `docs/actors.md`. The runtime installs default handlers for
+  `Console`/`Stdin`/`Env`/`File`/`Mutable`/`Cancel`/`Spawn`/`Ffi`
+  when `main`'s row contains them; `Fail`/`State[T]`/`Reader[T]`/
+  `Writer[W]` always require an explicit handler.
 
 ### 4. Fibers + scheduler
 
@@ -83,21 +102,46 @@ Inherits the skeleton from stage 1 and fills it in.
 - Per-fiber heap (Perceus RC-scoped); messages are **deep-copied**
   across fiber boundaries and there is no aliasing between fibers.
   Matches BEAM's isolation guarantee.
-- Cooperative scheduler in the runtime. Pre-emption via effect-op
-  check-points (every `perform` is a pre-emption point).
-- `Fiber[T]` is a capability tagged with the region brand of the
-  enclosing nursery (see structured concurrency below); it cannot
-  escape its scope.
+- **Cooperative scheduler** in the runtime. There is no
+  pre-emption: cancellation is delivered only at yield points
+  (effect-op call sites). A tight CPU loop with no effect ops is
+  not interrupted until it reaches one — `Spawn.yield()` is the
+  canonical pinning point. See `docs/structured-concurrency.md`
+  §*Non-goals* for the rule.
+- `Fiber[T]` is a region-branded **handle** tagged with the
+  brand of the enclosing nursery (same machinery as `Pid[Msg]`
+  in `docs/actors.md`); it cannot escape its scope.
 
 ### 5. Structured concurrency
 
-Design already adopted in `docs/structured-concurrency.md`. Stage 2
-is where it lands.
+Design already adopted in `docs/structured-concurrency.md`.
+Stage 2 is where it lands (m8).
 
-- `nursery (n) => { ... }` as a macro-like expansion to `handle Spawn
-  with (n) => { ... }`.
-- `Spawn`, `Cancel` effects defined in the stdlib.
-- Region-branding of `Fiber[T]` lives in the type checker.
+- `nursery { n -> ... }` is a trailing-lambda call (per
+  `docs/syntax-sugars.md` §1) to a stdlib helper that installs
+  the `Spawn` effect handler.
+- `Spawn` and `Cancel` effects defined in the stdlib.
+- Region-branding of `Fiber[T]` lives in the type checker; the
+  same brand machinery is shared with `Pid[Msg]` from
+  `docs/actors.md`.
+
+### 5b. Actors
+
+Design pinned in `docs/actors.md`. Lands in m8 alongside the
+scheduler and `Spawn`.
+
+- `Actor[Msg]` parameterised effect with `self`, `send`,
+  `receive` ops; `send` and `receive` carry `Cancel` because
+  blocking on a full mailbox or empty receive is a yield point.
+- Mailbox policies: `Unbounded`, `Bounded(capacity, on_full)`
+  with three overflow rules (`DropOldest`, `DropNewest`,
+  `BlockSender`).
+- Stdlib helpers: `spawn_actor` (explicit policy),
+  `spawn_actor_default` (`Bounded(1024, BlockSender)`),
+  `with_mailbox` (mailbox in the current fiber), all passing
+  the capability as `m: ActorCap[Msg]` to the body.
+- Supervision: `Link` (bidirectional, auto-cancels peer) and
+  `Monitor` (unidirectional, sends `MonitorDown` to observer).
 
 ### 6. Typed holes
 
@@ -152,11 +196,14 @@ that lands with its message text, not a TODO.
 .kai source
   → lex        (shared with stage 1 — subset-compatible)
   → parse      (extended grammar: effects, handlers, nursery, holes)
+  → desugar    (trailing lambdas, @cap / cap := v, var, a[i] —
+                see docs/syntax-sugars.md §Migration and diagnostics)
   → resolve    (module-aware: imports become edges)
   → infer      (HM-extended with effect rows, region branding)
   → monomorph  (instantiate generics, specialise drops)
   → perceus    (reuse analysis, insert incref/decref)
-  → lower      (typed IR → LLVM IR or C)
+  → lower      (typed IR → LLVM IR or C; CPS transform of effect ops
+                lives in this pass — see docs/effects-impl.md)
   → link       (ld / clang wrapper)
 ```
 
@@ -198,11 +245,14 @@ import math.vector.{dot, cross}
 
 - `extern "C" fn name(args...) : T / Ffi` — declaration.
 - Calling an extern is an op of `Ffi`. Pure kaikai code cannot
-  reach it without a handler (in practice, `main` installs a trivial
-  pass-through handler at program start; libraries opt in).
-- `kai bindgen foo.h` — reads a C header, emits an `extern` module
-  against the project's conventions. Post-stage-2 deliverable but
-  keep the door open.
+  reach it without `Ffi` in its row.
+- The `Ffi` "handler" is **compiler-synthesised**, not stdlib
+  code: `Ffi` operations lower directly to the C ABI call at
+  the declared symbol. There is no user-written clause to run
+  (Doc B §`Ffi` *Default handler*).
+- `kai bindgen foo.h` — reads a C header, emits an `extern`
+  module against the project's conventions. Post-stage-2
+  deliverable but keep the door open.
 
 ## Bootstrapping
 
@@ -228,46 +278,74 @@ stage 1 is frozen. Any language-level change lands only in stage 2.
 
 ## Milestones within stage 2
 
-High level — each item will get its own sub-design-doc when it comes
-up.
-
-1. **Stage 2 skeleton**: `stage2/compiler.kai`, CLI, file IO, minimal
-   pipeline that calls stage 1's existing pieces (lex + parse +
-   check) and emits the same C stage 1 does. Proves the wiring.
-2. **HM-extended type checker**: replace stage 1's name-resolution-
-   only check with a real inference pass that returns a typed AST.
-3. **LLVM IR backend (no optimisations)**: emit `.ll` that produces
-   the same output as the existing C backend. All four minimal
-   examples round-trip.
-4. **Monomorphisation**: retire uniform boxing; emit specialised
-   functions per generic instantiation. Verify perf on
-   phase-4-demo workloads.
-5. **Basic Perceus**: reuse analysis + drop insertion in the typed
-   IR pass. Measure allocation reduction vs stage 1.
-6. **Module resolution**: cross-file imports, topological
-   compilation, standard library loaded from a search path.
-7. **Effects + handlers**: `perform` / `handle` / `resume`, effect
-   inference for private bodies, annotation at module boundaries.
-8. **Fibers + scheduler**: CPS-transformed emission, cooperative
-   runtime, `Actor` effect handler in the stdlib.
-9. **Structured concurrency**: `nursery` sugar, `Spawn` / `Cancel`
-   effects, region-branding of `Fiber[T]`.
-10. **Typed holes**: `?` / `?name` expressions and patterns, text
-    and JSON reports.
-11. **Diagnostics quality pass**: every error message reviewed,
-    rewritten, and tested against an Elm/Rust bar.
-12. **Self-hosting checkpoint**: `kaic2 stage2/compiler.kai`
-    produces a byte-identical output. Stage 1 retired from the dev
-    loop.
-13. **Property testing + bench**: `check` and `bench` blocks,
-    matching runners.
-14. **Stdlib expansion**: stage-2-native stdlib, module-organised.
-15. **`kai fmt`** using the stage 2 parser.
-16. **`kai lsp`** using the stage 2 pipeline.
-17. **`kai repl`** using the stage 2 pipeline + holes.
-
-Order is indicative; some items can land in parallel once 1–4 are
+High level — each item gets its own sub-design-doc when it comes
+up. Milestone numbers are stable (referenced from other docs);
+order is indicative and items can land in parallel once 1–4 are
 in.
+
+1. **m1 — Stage 2 skeleton**: `stage2/compiler.kai`, CLI, file
+   IO, minimal pipeline that calls stage 1's existing pieces
+   (lex + parse + check) and emits the same C stage 1 does.
+   Proves the wiring.
+2. **m2 — HM-extended type checker**: replace stage 1's
+   name-resolution-only check with a real inference pass that
+   returns a typed AST.
+3. **m3 — LLVM IR backend (no optimisations)**: emit `.ll` that
+   produces the same output as the existing C backend. All four
+   minimal examples round-trip.
+4. **m4 — Monomorphisation**: retire uniform boxing; emit
+   specialised functions per generic instantiation. Verify perf
+   on phase-4-demo workloads.
+5. **m5 — Basic Perceus**: reuse analysis + drop insertion in
+   the typed IR pass. Measure allocation reduction vs stage 1.
+6. **m6 — Module resolution**: cross-file imports, topological
+   compilation, standard library loaded from a search path.
+7. **m7 — Effects + handlers** (split in two sub-milestones —
+   see `docs/effects-stdlib.md` §*Next steps* for the full
+   plan):
+   - **m7a — mechanics**: row unification, `TyFnT` with
+     effect-row slot, CPS transform, handler-stack runtime,
+     default handlers for `Console`/`Stdin`/`Env`/`File`/
+     `Mutable`/`Cancel`/`Spawn`/`Fail`/`Ffi`, basic
+     diagnostics for row-mismatch and effect-not-handled.
+     End state: `fn main() : Unit / Console { Console.print("hi") }`
+     compiles and runs end-to-end.
+   - **m7b — ergonomics**: closed effect aliases (`type Io =
+     Console + Stdin + Env + File`), per-operation type
+     generics (Doc A amendment), trailing lambdas, `@cap` /
+     `cap := v` capability sugar, local mutable cells (`var x
+     = init`), array indexing (`a[i]` / `a[i] := v`),
+     `Reader[T]` / `Writer[W]` as their own effects.
+8. **m8 — Fibers + structured concurrency + actors**: CPS
+   scheduler, `Spawn` / `Cancel` effects with default
+   handlers, `nursery { n -> ... }` helper, region-branded
+   `Fiber[T]`. Same milestone delivers `Actor[Msg]`,
+   `Pid[Msg]`, mailbox policies, link/monitor supervision —
+   designs in `docs/structured-concurrency.md` and
+   `docs/actors.md`.
+9. **m9 — Supervisor DSL** (post-actors): `one_for_one` /
+   `rest_for_one` / `one_for_all` patterns as a stdlib module,
+   built on `Monitor` + `Spawn`. Lands once usage data from m8
+   stabilises the right shape.
+10. **m10 — Typed holes** *(landed)*: `?` / `?name` expressions
+    and patterns, text and `--holes-json` reports. See
+    `docs/typed-holes.md` and the validation script
+    `scripts/validate_holes_json.py`.
+11. **m11 — Diagnostics quality pass**: every error message
+    reviewed, rewritten, and tested against an Elm/Rust bar.
+12. **m12 — Self-hosting checkpoint**: `kaic2
+    stage2/compiler.kai` produces a byte-identical output.
+    Stage 1 retired from the dev loop.
+13. **m13 — Property testing + bench**: `check` and `bench`
+    blocks, matching runners.
+14. **m14 — Stdlib expansion**: stage-2-native stdlib,
+    module-organised. `Map[K, V]`, `Vector[T]`, `Range[T]`
+    (collection-design pass — see
+    `docs/proposed-extensions.md` §17, §20).
+15. **m15 — `kai fmt`** using the stage 2 parser. Canonical,
+    no options (gofmt-style discipline).
+16. **m16 — `kai lsp`** using the stage 2 pipeline.
+17. **m17 — `kai repl`** using the stage 2 pipeline + holes.
 
 ## What stage 2 deliberately does not ship
 
