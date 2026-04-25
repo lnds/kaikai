@@ -6132,6 +6132,148 @@ fn desugar_op_calls_stmt(s: Stmt, effs: [String]) : Stmt {
   }
 }
 
+# m7b #6: pre-resolve desugar of the array-indexing sugars.
+#
+# `a[i]`        ≡  Mutable.array_get(a, i)
+# `a[i] := v`   ≡  Mutable.array_set(a, i, v)
+#
+# `docs/syntax-sugars.md` §4 phrases the desugaring as `Mutable.<op>`
+# calls; the migration of `array_get` / `array_set` behind the
+# `Mutable` effect lands together with the rest of m7a's `Mutable`
+# retrofit. Until that arrives the bare prelude functions of the same
+# name carry the same operational semantics (mutate-in-place +
+# panic-on-OOB), so this pass emits them directly. Switching the
+# desugar target from `array_get` → `Mutable.array_get` is one
+# rewrite each in `array_index_callee_get` / `_set`.
+fn desugar_index_decls(ds: [Decl]) : [Decl] = map(ds, desugar_index_decl)
+
+fn desugar_index_decl(d: Decl) : Decl {
+  match d {
+    DFn(pub_, n, ps, ret, row, body, l, c) ->
+      DFn(pub_, n, ps, ret, row, desugar_index_expr(body), l, c)
+    DTest(desc, body, l, c) -> DTest(desc, desugar_index_expr(body), l, c)
+    _ -> d
+  }
+}
+
+fn array_index_callee_get(line: Int, col: Int) : Expr =
+  mk_expr(EVar("array_get"), line, col)
+
+fn array_index_callee_set(line: Int, col: Int) : Expr =
+  mk_expr(EVar("array_set"), line, col)
+
+fn desugar_index_expr(e: Expr) : Expr =
+  Expr { kind: desugar_index_kind(e.kind, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty }
+
+fn desugar_index_opt(opt: Option[Expr]) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(desugar_index_expr(e))
+    None    -> None
+  }
+}
+
+fn desugar_index_exprs(es: [Expr]) : [Expr] = map(es, desugar_index_expr)
+
+fn desugar_index_stmts(ss: [Stmt]) : [Stmt] = map(ss, desugar_index_stmt)
+
+fn desugar_index_stmt(s: Stmt) : Stmt {
+  match s {
+    SLet(pat, ann, rhs) -> SLet(pat, ann, desugar_index_expr(rhs))
+    SAssert(c, m) -> SAssert(desugar_index_expr(c), desugar_index_opt(m))
+    SExprStmt(x) -> SExprStmt(desugar_index_expr(x))
+    SIndexAssign(b, i, v, line, col) -> {
+      let bd = desugar_index_expr(b)
+      let id = desugar_index_expr(i)
+      let vd = desugar_index_expr(v)
+      let call = mk_expr(ECall(array_index_callee_set(line, col), [bd, id, vd]),
+                         line, col)
+      SExprStmt(call)
+    }
+  }
+}
+
+fn desugar_index_arms(arms: [Arm]) : [Arm] = map(arms, desugar_index_arm)
+
+fn desugar_index_arm(a: Arm) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, desugar_index_opt(g), desugar_index_expr(b))
+  }
+}
+
+fn desugar_index_fields(fs: [FieldInit]) : [FieldInit] =
+  map(fs, desugar_index_field)
+
+fn desugar_index_field(f: FieldInit) : FieldInit {
+  match f {
+    FI(n, v) -> FI(n, desugar_index_expr(v))
+  }
+}
+
+fn desugar_index_elems(els: [ListElem]) : [ListElem] =
+  map(els, desugar_index_elem)
+
+fn desugar_index_elem(el: ListElem) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(desugar_index_expr(x))
+    ElSpread(x) -> ElSpread(desugar_index_expr(x))
+  }
+}
+
+fn desugar_index_clauses(cs: [HClause]) : [HClause] =
+  map(cs, desugar_index_clause)
+
+fn desugar_index_clause(c: HClause) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, desugar_index_expr(b), l, co)
+  }
+}
+
+fn desugar_index_opt_return(opt: Option[HReturn]) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(desugar_index_return(r))
+    None    -> None
+  }
+}
+
+fn desugar_index_return(r: HReturn) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, desugar_index_expr(b), l, c)
+  }
+}
+
+fn desugar_index_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
+  match k {
+    EIndex(a, b) -> {
+      let ad = desugar_index_expr(a)
+      let bd = desugar_index_expr(b)
+      ECall(array_index_callee_get(line, col), [ad, bd])
+    }
+    ECall(callee, args_) -> ECall(desugar_index_expr(callee),
+                                   desugar_index_exprs(args_))
+    EBlock(stmts, tail) -> EBlock(desugar_index_stmts(stmts),
+                                   desugar_index_opt(tail))
+    EIf(c, t_, eo) -> EIf(desugar_index_expr(c), desugar_index_expr(t_),
+                          desugar_index_opt(eo))
+    EBinop(op, a, b) -> EBinop(op, desugar_index_expr(a), desugar_index_expr(b))
+    EUnop(op, x) -> EUnop(op, desugar_index_expr(x))
+    EHandle(body, eff_name, alias_opt, clauses, ret_opt) ->
+      EHandle(desugar_index_expr(body), eff_name, alias_opt,
+              desugar_index_clauses(clauses), desugar_index_opt_return(ret_opt))
+    ELambda(ps, b) -> ELambda(ps, desugar_index_expr(b))
+    EMatch(scr, arms) -> EMatch(desugar_index_expr(scr),
+                                 desugar_index_arms(arms))
+    EPipe(a, b) -> EPipe(desugar_index_expr(a), desugar_index_expr(b))
+    EField(base, fname) -> EField(desugar_index_expr(base), fname)
+    ERecordLit(name, fields) -> ERecordLit(name, desugar_index_fields(fields))
+    EList(elems) -> EList(desugar_index_elems(elems))
+    ERange(a, b, opt_step) -> ERange(desugar_index_expr(a),
+                                      desugar_index_expr(b),
+                                      desugar_index_opt(opt_step))
+    _ -> k
+  }
+}
+
 fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool) : String {
   # m7a #6c: rewrite `Eff.op(args)` callees from `EField(EVar(Eff), op)`
   # to `EVar("Eff.op")` before code emission. The typer (synth_op_call_with_scheme)
@@ -11526,9 +11668,15 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
           Some(own_decls) -> {
             let expanded = expand_imports(path, search_paths, own_decls)
             let merged = list_append(prelude_decls, expanded)
-            let all_decls = inject_builtin_effects(merged)
+            let raw_decls = inject_builtin_effects(merged)
+            # m7b #6: pre-resolve desugar of `a[i]` and `a[i] := v` into
+            # the underlying array_get / array_set calls. Runs before
+            # name resolution so every downstream pass sees only the
+            # core form. `--ast` keeps the raw decls so the dump shows
+            # the sugar as written.
+            let all_decls = desugar_index_decls(raw_decls)
             match mode {
-              MAst -> { dump_program(all_decls); 0 }
+              MAst -> { dump_program(raw_decls); 0 }
               MTypes -> { dump_types(own_decls); 0 }
               MEnv -> { dump_env(build_ty_env(all_decls).env); 0 }
               MInfer -> dump_infer(path, all_decls)
