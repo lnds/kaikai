@@ -9201,7 +9201,8 @@ fn synth_handle(st: InferState, e: Expr) : Inferred {
       let st_out2 = check_clause_names(st_out1, eff_name, clauses, e.line, e.col)
       let stateful = match init_opt { Some(_) -> true None -> false }
       let st_clauses = check_clauses_types(st_out2, eff_name, clauses,
-                                            stateful, init_typed_st.state_ty)
+                                            stateful, init_typed_st.state_ty,
+                                            resolved_eff_tyargs)
       let r_typed = check_return_clause_opt(st_clauses, ret_opt, rb.ty,
                                              stateful, init_typed_st.state_ty)
       let new_e = with_ty(
@@ -9257,19 +9258,21 @@ fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
 # slot — clause-arity validation is a separate diagnostic-baseline
 # task (m7a #8).
 fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause],
-                        stateful: Bool, state_ty: Option[Ty]) : InferState {
+                        stateful: Bool, state_ty: Option[Ty],
+                        eff_tyargs: [Ty]) : InferState {
   match cs {
     [] -> st
     [c, ...rest] -> match c {
       HC(op_name, params, body, _, _) -> {
         let outer = st
-        # m7b #11l: bind the clause params; the trailing `resume` gets
-        # a stateful-aware binding (see bind_resume_param). For stateful
-        # handlers, st.clause_resume is set to RB(answer_ty, state_ty)
-        # so synth_call can validate `resume(v)` and `resume(v, ns)`
-        # calls with the right shape.
+        # m7b #11l: bind the clause params and unify the op's
+        # effect-tparam tyvars with the handler's instantiation, so
+        # the answer type is concrete (e.g., `Int` for State.get under
+        # `with State[Int]`). `st.clause_resume` is then set with the
+        # concrete answer/state types so `resume(v)` / `resume(v, ns)`
+        # are typechecked precisely.
         let bind_res = bind_clause_env_typed(st, eff_name, op_name, params,
-                                              stateful, state_ty)
+                                              stateful, state_ty, eff_tyargs)
         let sty = match state_ty { Some(t) -> t None -> TyAny }
         let env_bound = bind_res.st.env
         let env_with_sl =
@@ -9278,17 +9281,18 @@ fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause],
                        "log", mono(sty))
           } else { env_bound }
         let st_env = st_set_env(bind_res.st, env_with_sl)
+        let answer_resolved = apply_ty(st_env.sub, bind_res.answer_ty)
         let st_resume = if stateful {
           match state_ty {
             Some(sv) -> st_set_clause_resume(st_env,
-              Some(RB(bind_res.answer_ty, sv)))
+              Some(RB(answer_resolved, sv)))
             None -> st_env
           }
         } else { st_env }
         let rb = synth(st_resume, body)
         let st_out0 = st_restore_entries(outer, rb.st)
         let st_out = st_set_clause_resume(st_out0, outer.clause_resume)
-        check_clauses_types(st_out, eff_name, rest, stateful, state_ty)
+        check_clauses_types(st_out, eff_name, rest, stateful, state_ty, eff_tyargs)
       }
     }
   }
@@ -9296,24 +9300,53 @@ fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause],
 
 # m7b #11l — bind clause params; also returns the answer type recovered
 # from the op's instantiated signature so the caller can build a
-# precise resume binding.
+# precise resume binding. The op's effect-tparam fresh tyvars are
+# unified with `eff_tyargs` (the handler's `with Eff[T1, T2]`
+# instantiation) so the answer type is concrete when the handler is
+# instantiated to concrete types.
 type ClauseBindRes = { st: InferState, answer_ty: Ty }
 
 fn bind_clause_env_typed(st: InferState, eff_name: String, op_name: String,
                           params: [Param], stateful: Bool,
-                          state_ty: Option[Ty]) : ClauseBindRes {
+                          state_ty: Option[Ty], eff_tyargs: [Ty]) : ClauseBindRes {
   let key = string_concat(eff_name, string_concat(".", op_name))
   match ty_env_lookup(st.env, key) {
     None     -> ClauseBindRes { st: bind_params_lenient(st, params), answer_ty: TyAny }
     Some(sc) -> {
-      let inst = st_instantiate(st, sc)
+      let inst = st_instantiate_report(st, sc)
+      # m7b #11l — unify the op-scheme's effect-tparam fresh tyvars
+      # with the handler's instantiation. For State[Int], `get`'s
+      # bound `?Tfresh` becomes `Int`, so the resume answer type is
+      # `Int` rather than a free tyvar.
+      let st_unified = unify_eff_tparams(inst.st, inst.fresh, eff_tyargs,
+                                          op_name)
       match inst.ty {
         TyFnT(arg_tys, ret_ty, _) -> {
-          let bound = bind_params_with_sig_typed(inst.st, params, arg_tys, ret_ty,
+          let bound = bind_params_with_sig_typed(st_unified, params, arg_tys, ret_ty,
                                                    stateful, state_ty)
           ClauseBindRes { st: bound, answer_ty: ret_ty }
         }
-        _ -> ClauseBindRes { st: bind_params_lenient(inst.st, params), answer_ty: TyAny }
+        _ -> ClauseBindRes { st: bind_params_lenient(st_unified, params), answer_ty: TyAny }
+      }
+    }
+  }
+}
+
+# Unify each effect-tparam fresh tyvar (from the op's polymorphic
+# scheme) with the corresponding handler instantiation type. Length
+# mismatch is silent — m7b #11j arity check has already reported the
+# row-level error.
+fn unify_eff_tparams(st: InferState, fresh: [Int], tys: [Ty],
+                      op_name: String) : InferState {
+  match fresh {
+    [] -> st
+    [id, ...frest] -> match tys {
+      [] -> st
+      [t, ...trest] -> {
+        let st1 = st_unify(st, TyVarT(id), t,
+                            string_concat("clause op tparam in ", op_name),
+                            -1, -1)
+        unify_eff_tparams(st1, frest, trest, op_name)
       }
     }
   }
@@ -9525,13 +9558,16 @@ fn synth_resume_call(st: InferState, rb: ResumeBind, args_: [Expr],
     RB(answer_ty, state_ty) -> {
       let ra = synth_many(st, args_)
       let rv = st_fresh_ty(ra.st)
+      # st_unify treats the first arg as `expected` and the second as
+      # `found`; the resume answer is what the clause must produce, so
+      # answer_ty is the `expected` slot.
       let st_after = match ra.tys {
-        [a]     -> st_unify(rv.st, a, answer_ty,
+        [a]     -> st_unify(rv.st, answer_ty, a,
                              "resume answer", line, col)
         [a, ns] -> {
-          let s1 = st_unify(rv.st, a, answer_ty,
+          let s1 = st_unify(rv.st, answer_ty, a,
                               "resume answer", line, col)
-          st_unify(s1, ns, state_ty,
+          st_unify(s1, state_ty, ns,
                     "resume new state", line, col)
         }
         _ -> {
