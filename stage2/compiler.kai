@@ -6438,6 +6438,15 @@ fn st_add_effect(st: InferState, eff: String) : InferState {
   }
 }
 
+# m7a #4d: replace the row accumulator wholesale. Used by
+# synth_handle to switch into an empty inner row before walking
+# the body, then to merge the filtered body-row back with the
+# outer row.
+fn st_set_row(st: InferState, new_row: [String]) : InferState =
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: new_row }
+
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
@@ -6702,18 +6711,49 @@ fn synth(st: InferState, e: Expr) : Inferred {
     EBlock(stmts, tail)        -> synth_block(st, stmts, tail, e.line, e.col)
     EPipe(lhs, rhs)            -> synth_pipe(st, lhs, rhs, e.line, e.col)
     EHole(nm_opt)              -> synth_hole(st, nm_opt, e)
-    EHandle(_, _, _, _, _)     -> synth_handle_stub(st, e)
+    EHandle(_, _, _, _, _)     -> synth_handle(st, e)
   }
 }
 
-# m7a #4b: type-check stub for `handle ... with ... { ... }`. Real
-# semantic checking (the body's row contains the handled effect,
-# clauses match the effect's op signatures, and the handle's
-# result type comes from the body or the optional return clause)
-# is m7a #4d. For now we accept any handle expression as having
-# type TyAny so the surrounding inferencer keeps walking.
-fn synth_handle_stub(st: InferState, e: Expr) : Inferred {
-  mk_inferred(st, TyAny, with_ty(e, TyAny))
+# m7a #4d: type-check `handle { body } with Eff [as alias] {
+# clauses }`. The body is walked under a fresh row accumulator;
+# the named effect is filtered out of whatever the body
+# accumulates, and the remainder merges back into the outer
+# function's row. Clause bodies and the optional return clause
+# are not yet type-checked against the op signatures — that
+# extension lands in a later sub-step (or m7a #6 lowering).
+# Alias resolution (`Eff as log`) is also deferred.
+fn synth_handle(st: InferState, e: Expr) : Inferred {
+  match e.kind {
+    EHandle(body, eff_name, _alias_opt, _clauses, _ret_opt) -> {
+      let prev_row = st.row
+      let st_in = st_set_row(st, [])
+      let rb = synth(st_in, body)
+      let body_row_minus = filter_string_ne(rb.st.row, eff_name)
+      let merged = merge_string_lists(prev_row, body_row_minus)
+      let st_out = st_set_row(rb.st, merged)
+      mk_inferred(st_out, rb.ty, with_ty(e, rb.ty))
+    }
+    _ -> mk_inferred(st, TyAny, with_ty(e, TyAny))
+  }
+}
+
+fn filter_string_ne(xs: [String], target: String) : [String] {
+  match xs {
+    [] -> []
+    [h, ...rest] ->
+      if h == target { filter_string_ne(rest, target) }
+      else { [h, ...filter_string_ne(rest, target)] }
+  }
+}
+
+fn merge_string_lists(a: [String], b: [String]) : [String] {
+  match b {
+    [] -> a
+    [h, ...rest] ->
+      if list_has(a, h) { merge_string_lists(a, rest) }
+      else { merge_string_lists([h, ...a], rest) }
+  }
 }
 
 # A hole gets a fresh TyVarT and records its source position and the
