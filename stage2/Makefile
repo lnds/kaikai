@@ -618,6 +618,51 @@ test-effects: $(TARGET) build
 	  grep -q "^eof$$" build/s2-$$name.out2 \
 	    && echo "effects OK $$name (default Stdin: read_line None on EOF)" \
 	    || { echo "effects FAIL $$name (None path output wrong)"; cat build/s2-$$name.out2; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7b_1_alias_io.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_default_console_print" build/s2-$$name.c \
+	    && grep -q "kai_default_stdin_read_line" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (alias did not expand to default handlers)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^hello via alias$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (Io alias resolves + runs)" \
+	    || { echo "effects FAIL $$name (alias output wrong)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7b_1_alias_single.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^single-alias works$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (single-effect alias resolves + runs)" \
+	    || { echo "effects FAIL $$name (alias output wrong)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7b_1_alias_cycle.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (cyclic alias accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "cyclic effect alias:" build/s2-$$name.err \
+	    && echo "effects OK $$name (cycle rejected as expected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7b_1_alias_non_effect.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (non-effect label accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "unknown effect in alias body: Int" build/s2-$$name.err \
+	    && echo "effects OK $$name (non-effect label rejected as expected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,
