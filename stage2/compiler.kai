@@ -8919,19 +8919,17 @@ fn synth_handle(st: InferState, e: Expr) : Inferred {
   match e.kind {
     EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
       # m7b #11: type-check the init expression in the outer scope
-      # (it does not see the body's bindings).
+      # (it does not see the body's bindings). The init type is *not*
+      # unified with the effect's tparam: for `State[T]` the init is a
+      # `T`, but for `Writer[W]` the init is `[W]` — the relationship
+      # is per-effect, not a row-arg invariant. Per-effect typing of
+      # the handler-state slot is deferred to a later sub-task; until
+      # then the body's uses of `state` / `log` (bound to TyAny in the
+      # checker) carry the typing burden.
       let init_typed_st = match init_opt {
         Some(ie) -> {
           let ri = synth(st, ie)
-          # If the handler has exactly one tparam, the init's type is
-          # the value of that tparam — unify accordingly.
-          let resolved_tyargs = resolve_ty_list(eff_tyargs)
-          let st_after = match resolved_tyargs {
-            [t0] -> st_unify(ri.st, ri.ty, t0,
-                             "handler-state initializer", ie.line, ie.col)
-            _    -> ri.st
-          }
-          IT { st: st_after, init_opt: Some(ri.expr) }
+          IT { st: ri.st, init_opt: Some(ri.expr) }
         }
         None -> IT { st: st, init_opt: None }
       }
@@ -9021,7 +9019,7 @@ fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause],
     [c, ...rest] -> match c {
       HC(op_name, params, body, _, _) -> {
         let outer = st
-        let st_bound = bind_clause_env(st, eff_name, op_name, params)
+        let st_bound = bind_clause_env(st, eff_name, op_name, params, stateful)
         # m7b #11: stateful handlers bind `state` / `log` inside every
         # clause body (TyAny — see check_return_clause_opt comment).
         let st_state =
@@ -9039,14 +9037,14 @@ fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause],
 }
 
 fn bind_clause_env(st: InferState, eff_name: String, op_name: String,
-                   params: [Param]) : InferState {
+                   params: [Param], stateful: Bool) : InferState {
   let key = string_concat(eff_name, string_concat(".", op_name))
   match ty_env_lookup(st.env, key) {
     None     -> bind_params_lenient(st, params)
     Some(sc) -> {
       let inst = st_instantiate(st, sc)
       match inst.ty {
-        TyFnT(arg_tys, ret_ty, _) -> bind_params_with_sig(inst.st, params, arg_tys, ret_ty)
+        TyFnT(arg_tys, ret_ty, _) -> bind_params_with_sig(inst.st, params, arg_tys, ret_ty, stateful)
         _                          -> bind_params_lenient(inst.st, params)
       }
     }
@@ -9054,24 +9052,34 @@ fn bind_clause_env(st: InferState, eff_name: String, op_name: String,
 }
 
 fn bind_params_with_sig(st: InferState, params: [Param], arg_tys: [Ty],
-                         ret_ty: Ty) : InferState {
+                         ret_ty: Ty, stateful: Bool) : InferState {
   match params {
     []      -> st
-    [last]  -> bind_resume_param(st, last, ret_ty)
+    [last]  -> bind_resume_param(st, last, ret_ty, stateful)
     [p, ...rest] -> match arg_tys {
       []           -> bind_params_lenient(st, params)
       [a, ...rest_a] -> {
         let env1 = ty_env_add(st.env, p.pname, mono(a))
-        bind_params_with_sig(st_set_env(st, env1), rest, rest_a, ret_ty)
+        bind_params_with_sig(st_set_env(st, env1), rest, rest_a, ret_ty, stateful)
       }
     }
   }
 }
 
-fn bind_resume_param(st: InferState, p: Param, ret_ty: Ty) : InferState {
-  let f = st_fresh_ty(st)
-  let resume_ty = TyFnT([ret_ty], f.ty, row_empty())
-  st_set_env(f.st, ty_env_add(f.st.env, p.pname, mono(resume_ty)))
+# m7b #11: in stateful clauses (`with State[T](init)` / `with Writer[W]([])`)
+# the user can call `resume` with one or two arguments — the second
+# argument writes the new handler-state. To accept both shapes from
+# the same scheme, bind `resume` to TyAny in stateful clauses;
+# unification short-circuits on TyAny so any arity passes. Stateless
+# clauses keep the precise `(ret_ty) -> ?fresh` form.
+fn bind_resume_param(st: InferState, p: Param, ret_ty: Ty, stateful: Bool) : InferState {
+  if stateful {
+    st_set_env(st, ty_env_add(st.env, p.pname, mono(TyAny)))
+  } else {
+    let f = st_fresh_ty(st)
+    let resume_ty = TyFnT([ret_ty], f.ty, row_empty())
+    st_set_env(f.st, ty_env_add(f.st.env, p.pname, mono(resume_ty)))
+  }
 }
 
 fn bind_params_lenient(st: InferState, params: [Param]) : InferState {
@@ -12835,17 +12843,36 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   let stdin_d   = inject_one(main_row, existing, "Stdin",   builtin_stdin_decl())
   let env_d     = inject_one(main_row, existing, "Env",     builtin_env_decl())
   let file_d    = inject_one(main_row, existing, "File",    builtin_file_decl())
+  # m7b #11: parametric stdlib effects (State[T], Reader[T], Writer[W])
+  # have no runtime default handler — the user always writes an explicit
+  # `with State[T](init)` form. Inject the declarations unconditionally
+  # (gated only on "not already declared by the user"). The `Ev<Eff>`
+  # struct is emitted alongside any declared effect; that is harmless
+  # for parametric effects whose handlers are user-supplied.
+  let state_d   = inject_unconditional(existing, "State",  builtin_state_decl())
+  let reader_d  = inject_unconditional(existing, "Reader", builtin_reader_decl())
+  let writer_d  = inject_unconditional(existing, "Writer", builtin_writer_decl())
   list_append(console_d,
     list_append(fail_d,
       list_append(stdin_d,
         list_append(env_d,
-          list_append(file_d, decls)))))
+          list_append(file_d,
+            list_append(state_d,
+              list_append(reader_d,
+                list_append(writer_d, decls))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
               name: String, decl: Decl) : [Decl] {
   if list_has(main_row, name) and not list_has(existing, name) { [decl] }
   else { [] }
+}
+
+# m7b #11: inject a builtin effect decl regardless of whether `main`'s
+# row mentions it. Used for parametric stdlib effects that the user
+# only ever reaches through an explicit `handle ... with Foo[T]` block.
+fn inject_unconditional(existing: [String], name: String, decl: Decl) : [Decl] {
+  if list_has(existing, name) { [] } else { [decl] }
 }
 
 fn ty_name_zero(name: String) : TypeExpr =
@@ -12873,13 +12900,19 @@ fn param_string_zero(name: String) : Param =
   Param { pname: name, ptype: Some(ty_name_zero("String")),
           pline: 0, pcol: 0 }
 
+# m7b #11: a parameter with an arbitrary TypeExpr annotation —
+# used to declare parameterised effect ops whose param types
+# reference an effect tparam (`set(v: T)`).
+fn param_typed_zero(name: String, ty: TypeExpr) : Param =
+  Param { pname: name, ptype: Some(ty), pline: 0, pcol: 0 }
+
 # Names of every effect for which the compiler ships a built-in
 # effect declaration (Doc B §*Catalog*). Kept in sync with the
 # inject_builtin_effects helpers below; alias resolution accepts
 # these as effect names whether or not the file already declared
 # them via `effect`.
 fn builtin_effect_names() : [String] =
-  ["Console", "Fail", "Stdin", "Env", "File"]
+  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer"]
 
 fn builtin_console_decl() : Decl =
   DEffect(false, "Console", [],
@@ -12914,6 +12947,31 @@ fn builtin_file_decl() : Decl =
       EOp("write_file",
           [param_string_zero("path"), param_string_zero("contents")],
           ty_result_unit_string_zero(), 0, 0)
+    ], 0, 0)
+
+# m7b #11: stdlib parameterised effects per Doc B §`State[T]` and
+# §`Reader[T] and Writer[W]`. Each one gets its own evidence struct,
+# its ops get polymorphic schemes via `add_effect_op_sigs`, and their
+# clauses run as user-written handlers (no runtime default).
+fn builtin_state_decl() : Decl =
+  DEffect(false, "State", ["T"],
+    [
+      EOp("get", [], ty_name_zero("T"), 0, 0),
+      EOp("set", [param_typed_zero("v", ty_name_zero("T"))],
+          ty_name_zero("Unit"), 0, 0)
+    ], 0, 0)
+
+fn builtin_reader_decl() : Decl =
+  DEffect(false, "Reader", ["T"],
+    [
+      EOp("ask", [], ty_name_zero("T"), 0, 0)
+    ], 0, 0)
+
+fn builtin_writer_decl() : Decl =
+  DEffect(false, "Writer", ["W"],
+    [
+      EOp("tell", [param_typed_zero("w", ty_name_zero("W"))],
+          ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
 fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int {

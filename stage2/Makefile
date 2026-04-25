@@ -715,6 +715,18 @@ test-effects: $(TARGET) build
 	  grep -q "unknown effect: E" build/s2-$$name.err \
 	    && echo "effects OK $$name (uppercase treated as label, rejected)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7b_11_state_basic.kai \
+	         ../examples/effects/m7b_11_reader_basic.kai \
+	         ../examples/effects/m7b_11_writer_basic.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name \
+	    && echo "effects OK $$name (parametric effect runs end-to-end)" \
+	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,
