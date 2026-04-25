@@ -84,12 +84,13 @@ let r = try {
 }
 ```
 
-The trailing form is how `handle { body } with Eff { ... }`
-already reads in Doc A: `handle` is not a keyword, it is a
-function whose first argument is a block. Extending the same
-sugar to any call lets `try`, `with_state`, `nursery`, etc. look
-like the control-flow constructs they semantically are, without
-any of them being special-cased in the grammar.
+Trailing lambdas are a separate construct from `handle ... with
+... { ... }`. Doc A §*Handling* pins `handle` and `with` as
+reserved keywords forming a dedicated control-flow production —
+not a function call with a trailing block. Trailing lambdas in
+this section apply only to ordinary stdlib helpers (`try`,
+`with_state`, `nursery`, etc.); the grammar does not special-case
+those helpers, only `handle`/`with`.
 
 Rule of thumb for writers of Doc B examples: prefer the
 trailing form when the lambda is the whole intent of the call,

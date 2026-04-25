@@ -271,15 +271,21 @@ handle { body } with Effect {
   return value of `body`.
 - Outside the `with` block, `Effect` is no longer in the row.
 
-The `{ body }` preceding `with` is the first occurrence of a
-general syntactic sugar: **trailing lambdas**. Any call whose
-last argument has type `() -> T` can write that argument as a
-block outside the parens. `try { body }`, `with_state(0) { body
-}`, and `nursery { n -> body }` (all stdlib helpers — see
-`docs/effects-stdlib.md`) use the same mechanism; `handle` is
-not a keyword. Trailing lambdas land in milestone **m7b**, so
-until then `handle` is a parser special case and every other
-helper is called with paren-and-lambda form.
+`handle { body } with Eff { clauses }` is a **control-flow
+construct** of the language, in the same family as `if` and
+`match`. `handle` and `with` are reserved keywords; the form has
+its own dedicated grammar production. The body block is parsed
+as an ordinary block expression; the `with` tail introduces the
+handler clauses. The shape is *not* a function call and *not* a
+trailing-lambda — `handle` is not a value, `with` is not an
+argument separator, and `Eff` is a capability identifier rather
+than an expression.
+
+Trailing-lambda syntax is a *separate* sugar (see
+`docs/effects-stdlib.md` §*Syntax note: trailing lambdas*) that
+lands in milestone **m7b**. It applies to stdlib helpers like
+`try { body }`, `with_state(0) { body }`, and `nursery { n ->
+body }`. It does **not** apply to `handle`.
 
 Example — supplying a value via an effect:
 

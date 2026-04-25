@@ -366,6 +366,23 @@ test-effects: $(TARGET) build
 	  grep -q "type mismatch in op call Io.print" build/s2-$$name.err \
 	    && echo "effects OK $$name (rejected as expected)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/handle_basic.kai \
+	         ../examples/effects/handle_alias.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --ast $$f > build/s2-$$name.ast 2> build/s2-$$name.err \
+	    && grep -q "handle Io" build/s2-$$name.ast \
+	    && echo "effects OK $$name (handle parsed)" \
+	    || { echo "effects FAIL $$name"; cat build/s2-$$name.err build/s2-$$name.ast; exit 1; }; \
+	done; \
+	for f in ../examples/effects/handle_bad_no_with.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (missing with accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "expected \`with\` after handle body" build/s2-$$name.err \
+	    && echo "effects OK $$name (rejected as expected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done
 
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches

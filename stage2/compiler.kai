@@ -38,8 +38,10 @@ type TokKind
   = TkEof
   | TkNewline
   # keywords (alphabetical)
-  | TkAnd | TkAs | TkAssert | TkEffect | TkElse | TkFalse | TkFn | TkIf | TkImport
+  | TkAnd | TkAs | TkAssert | TkEffect | TkElse | TkFalse | TkFn
+  | TkHandle | TkIf | TkImport
   | TkLet | TkMatch | TkNot | TkOr | TkPub | TkTest | TkTrue | TkType
+  | TkWith
   # literals
   | TkInt | TkReal | TkChar | TkString
   # identifiers
@@ -72,9 +74,11 @@ fn tk_name(k: TokKind) : String {
     TkEof -> "EOF"
     TkNewline -> "NEWLINE"
     TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkEffect -> "effect" TkElse -> "else"
-    TkFalse -> "false" TkFn -> "fn" TkIf -> "if" TkImport -> "import"
+    TkFalse -> "false" TkFn -> "fn" TkHandle -> "handle"
+    TkIf -> "if" TkImport -> "import"
     TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
     TkPub -> "pub" TkTest -> "test" TkTrue -> "true" TkType -> "type"
+    TkWith -> "with"
     TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
     TkIdent -> "IDENT" TkUnderscore -> "_"
     TkLparen -> "(" TkRparen -> ")" TkLbracket -> "[" TkRbracket -> "]"
@@ -189,6 +193,7 @@ fn keyword_kind(text: String) : TokKind {
   else if text == "else" { TkElse }
   else if text == "false" { TkFalse }
   else if text == "fn" { TkFn }
+  else if text == "handle" { TkHandle }
   else if text == "if" { TkIf }
   else if text == "import" { TkImport }
   else if text == "let" { TkLet }
@@ -199,6 +204,7 @@ fn keyword_kind(text: String) : TokKind {
   else if text == "test" { TkTest }
   else if text == "true" { TkTrue }
   else if text == "type" { TkType }
+  else if text == "with" { TkWith }
   else { TkIdent }
 }
 
@@ -905,6 +911,11 @@ type ExprKind
   # `?name`. Checker reports at each hole site; emitter falls back
   # to a runtime panic so unfilled holes in a binary are loud.
   | EHole(Option[String])
+  # Effect handler (m7a #4b). `handle { body } with Eff [as alias]
+  # { clauses [return(x) -> expr] }`. The `alias` (Option[String])
+  # rebinds the capability name inside the body. m7a #4b is parser
+  # only; type-checking and runtime are #4d / #6.
+  | EHandle(Expr, String, Option[String], [HClause], Option[HReturn])
 
 type ListElem = ElPlain(Expr) | ElSpread(Expr)
 
@@ -946,6 +957,15 @@ type TyKind
 # m7a step. In the AST this is the *raw* parsed shape; resolve_ty
 # converts it into the semantic `Row` that lives inside `TyFnT`.
 type RowExpr = REmpty | RClosed([String])
+
+# Handler clause (op): `op_name(args..., resume) -> body`. The
+# resume binding is conventionally the last param; m7a #4d will
+# validate. m7a #4b stores the param list verbatim.
+type HClause = HC(String, [Param], Expr, Int, Int)
+
+# Optional `return(x) -> expr` clause inside a handle. `pname` is
+# the parameter name bound inside `body`.
+type HReturn = HR(String, Expr, Int, Int)
 
 type Decl
   = DFn(Bool, String, [Param], Option[TypeExpr], RowExpr, Expr, Int, Int)
@@ -1059,6 +1079,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkElse       -> match b { TkElse -> true _ -> false }
     TkFalse      -> match b { TkFalse -> true _ -> false }
     TkFn         -> match b { TkFn -> true _ -> false }
+    TkHandle     -> match b { TkHandle -> true _ -> false }
     TkIf         -> match b { TkIf -> true _ -> false }
     TkImport     -> match b { TkImport -> true _ -> false }
     TkLet        -> match b { TkLet -> true _ -> false }
@@ -1069,6 +1090,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkTest       -> match b { TkTest -> true _ -> false }
     TkTrue       -> match b { TkTrue -> true _ -> false }
     TkType       -> match b { TkType -> true _ -> false }
+    TkWith       -> match b { TkWith -> true _ -> false }
     TkInt        -> match b { TkInt -> true _ -> false }
     TkReal       -> match b { TkReal -> true _ -> false }
     TkChar       -> match b { TkChar -> true _ -> false }
@@ -1603,7 +1625,166 @@ fn parse_primary(p: Parser) : PExpr {
     TkLbrace -> parse_block(p, t)
     TkIf -> parse_if(p, t)
     TkMatch -> parse_match(p, t)
+    TkHandle -> parse_handle(p_advance(p), t)
     _ -> err_e(p_error_here(p, "expected expression"))
+  }
+}
+
+# `handle { body } with Eff [as alias] { clauses }`. Pinned in
+# Doc A §*Handling*. Both blocks are parsed by handle-specific
+# rules; the body is an ordinary block expression, the clauses
+# block contains `op_name(args, resume) -> body` plus an optional
+# `return(x) -> body` at the end.
+fn parse_handle(p: Parser, t: Token) : PExpr {
+  let bt = p_peek(p)
+  if not p_at(p, TkLbrace) {
+    err_e(p_error_here(p, "expected `{` to start handle body"))
+  } else {
+    let body_r = parse_block(p, bt)
+    match body_r.r {
+      None -> err_e(body_r.p)
+      Some(body) -> {
+        let p1 = p_skip_newlines(body_r.p)
+        if not p_at(p1, TkWith) {
+          err_e(p_error_here(p1, "expected `with` after handle body"))
+        } else {
+          let p2 = p_advance(p1)
+          let eff_t = p_peek(p2)
+          if not tk_is(eff_t.kind, TkIdent) {
+            err_e(p_error(p2, eff_t, "expected effect name after `with`"))
+          } else {
+            let eff_name = tok_source(p2.src, eff_t)
+            let p3 = p_advance(p2)
+            let alias_r = parse_handle_alias(p3)
+            let p4 = p_skip_newlines(alias_r.p)
+            if not p_at(p4, TkLbrace) {
+              err_e(p_error_here(p4, "expected `{` to start handler clauses"))
+            } else {
+              let p5 = p_skip_newlines(p_advance(p4))
+              let cr = parse_handle_clauses(p5, [], None)
+              match cr.r {
+                None -> err_e(cr.p)
+                Some(_) -> ok_e(cr.p,
+                  mk_expr(EHandle(body, eff_name, alias_r.r, cr.clauses, cr.return_clause),
+                          t.line, t.col))
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Handler-clause params: like fn params but the type annotation is
+# optional. `print(s, resume) -> ...` is the common shape.
+fn parse_clause_params(p: Parser, acc: [Param]) : PParams {
+  if p_at(p, TkRparen) { PParams { p: p_advance(p), r: Some(list_reverse(acc)) } }
+  else {
+    let t = p_peek(p)
+    if not tk_is(t.kind, TkIdent) {
+      PParams { p: p_error(p, t, "expected parameter name"), r: None }
+    } else {
+      let name = tok_source(p.src, t)
+      let p1 = p_advance(p)
+      let opt_ty_r =
+        if p_at(p1, TkColon) {
+          let rt = parse_type(p_advance(p1))
+          match rt.r {
+            None -> PTy { p: rt.p, r: None }
+            Some(ty) -> PTy { p: rt.p, r: Some(ty) }
+          }
+        } else {
+          PTy { p: p1, r: None }
+        }
+      let pm = Param { pname: name, ptype: opt_ty_r.r, pline: t.line, pcol: t.col }
+      let p2 = p_skip_newlines(opt_ty_r.p)
+      if p_at(p2, TkComma) {
+        parse_clause_params(p_skip_newlines(p_advance(p2)), [pm, ...acc])
+      } else if p_at(p2, TkRparen) {
+        PParams { p: p_advance(p2), r: Some(list_reverse([pm, ...acc])) }
+      } else {
+        PParams { p: p_error_here(p2, "expected `,` or `)` in parameter list"), r: None }
+      }
+    }
+  }
+}
+
+type PAlias = { p: Parser, r: Option[String] }
+
+fn parse_handle_alias(p: Parser) : PAlias {
+  if not p_at(p, TkAs) { PAlias { p: p, r: None } }
+  else {
+    let p1 = p_advance(p)
+    let nt = p_peek(p1)
+    if not tk_is(nt.kind, TkIdent) {
+      PAlias { p: p_error(p1, nt, "expected alias name after `as`"), r: None }
+    } else {
+      PAlias { p: p_advance(p1), r: Some(tok_source(p1.src, nt)) }
+    }
+  }
+}
+
+type PClauses = {
+  p: Parser,
+  clauses: [HClause],
+  return_clause: Option[HReturn],
+  r: Option[Bool]
+}
+
+fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn]) : PClauses {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    PClauses { p: p_advance(p0), clauses: list_reverse(acc),
+               return_clause: rret, r: Some(true) }
+  } else {
+    let id_t = p_peek(p0)
+    if not tk_is(id_t.kind, TkIdent) {
+      PClauses { p: p_error(p0, id_t, "expected operation name in handler"),
+                 clauses: [], return_clause: None, r: None }
+    } else {
+      let name = tok_source(p0.src, id_t)
+      let p1 = p_advance(p0)
+      if not p_at(p1, TkLparen) {
+        PClauses { p: p_error_here(p1, "expected `(` after operation name"),
+                   clauses: [], return_clause: None, r: None }
+      } else {
+        let p2 = p_skip_newlines(p_advance(p1))
+        let params_r = parse_clause_params(p2, [])
+        match params_r.r {
+          None -> PClauses { p: params_r.p, clauses: [], return_clause: None, r: None }
+          Some(params) -> {
+            let p3 = p_skip_newlines(params_r.p)
+            if not p_at(p3, TkArrow) {
+              PClauses { p: p_error_here(p3, "expected `->` after operation parameters"),
+                         clauses: [], return_clause: None, r: None }
+            } else {
+              let p4 = p_skip_newlines(p_advance(p3))
+              let rb = parse_expr(p4)
+              match rb.r {
+                None -> PClauses { p: rb.p, clauses: [], return_clause: None, r: None }
+                Some(body) -> {
+                  if name == "return" {
+                    match params {
+                      [pp] -> {
+                        let hr = HR(pp.pname, body, id_t.line, id_t.col)
+                        parse_handle_clauses(rb.p, acc, Some(hr))
+                      }
+                      _ -> PClauses { p: p_error(p3, id_t,
+                             "return clause takes exactly one parameter"),
+                             clauses: [], return_clause: None, r: None }
+                    }
+                  } else {
+                    let hc = HC(name, params, body, id_t.line, id_t.col)
+                    parse_handle_clauses(rb.p, [hc, ...acc], rret)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }
 
@@ -2994,6 +3175,33 @@ fn dump_expr(e: Expr, depth: Int) : Unit {
       let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
       emit_line(depth, "hole #{label} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
     }
+    EHandle(body, eff_name, alias_opt, clauses, ret_opt) -> {
+      let alias_s = match alias_opt { Some(a) -> string_concat(" as ", a) None -> "" }
+      emit_line(depth, "handle #{eff_name}#{alias_s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      emit_line(depth + 1, "body")
+      dump_expr(body, depth + 2)
+      clauses |> each((c) => dump_hclause(c, depth + 1))
+      match ret_opt { Some(r) -> dump_hreturn(r, depth + 1) None -> () }
+    }
+  }
+}
+
+fn dump_hclause(c: HClause, depth: Int) : Unit {
+  match c {
+    HC(name, params, body, line, col) -> {
+      emit_line(depth, "clause #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+      params |> each((pm) => dump_param(pm, depth + 1))
+      dump_expr(body, depth + 1)
+    }
+  }
+}
+
+fn dump_hreturn(r: HReturn, depth: Int) : Unit {
+  match r {
+    HR(name, body, line, col) -> {
+      emit_line(depth, "return #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_expr(body, depth + 1)
+    }
   }
 }
 
@@ -3400,6 +3608,39 @@ fn chk_expr(e: Env, x: Expr) : Env {
     }
     EPipe(a, b) -> chk_expr(chk_expr(e, a), b)
     EHole(_) -> e          # holes bind no names; checker lets them pass silently
+    EHandle(body, _, _, clauses, ret_opt) -> {
+      let e1 = chk_expr(e, body)
+      let e2 = chk_handler_clauses(e1, clauses)
+      match ret_opt {
+        Some(r) -> chk_handler_return(e2, r)
+        None    -> e2
+      }
+    }
+  }
+}
+
+fn chk_handler_clauses(e: Env, cs: [HClause]) : Env {
+  match cs {
+    [] -> e
+    [c, ...rest] -> match c {
+      HC(_, params, body, _, _) -> {
+        let e1 = env_push(e)
+        let e2 = add_params(e1, params)
+        let e3 = chk_expr(e2, body)
+        chk_handler_clauses(env_pop(e3), rest)
+      }
+    }
+  }
+}
+
+fn chk_handler_return(e: Env, r: HReturn) : Env {
+  match r {
+    HR(name, body, _, _) -> {
+      let e1 = env_push(e)
+      let e2 = env_add(e1, name)
+      let e3 = chk_expr(e2, body)
+      env_pop(e3)
+    }
   }
 }
 
@@ -4412,6 +4653,37 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
     }
     EPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
     EHole(_) -> acc
+    EHandle(body, _, _, clauses, ret_opt) -> {
+      let acc1 = fv_expr(body, own, globals, acc)
+      let acc2 = fv_hclauses(clauses, own, globals, acc1)
+      match ret_opt { Some(r) -> fv_hreturn(r, own, globals, acc2) None -> acc2 }
+    }
+  }
+}
+
+fn fv_hclauses(cs: [HClause], own: [String], globals: [String], acc: [String]) : [String] {
+  match cs {
+    [] -> acc
+    [c, ...rest] -> match c {
+      HC(_, params, body, _, _) -> {
+        let own1 = list_concat_strings(map(params, (pm) => pm.pname), own)
+        let acc1 = fv_expr(body, own1, globals, acc)
+        fv_hclauses(rest, own, globals, acc1)
+      }
+    }
+  }
+}
+
+fn fv_hreturn(r: HReturn, own: [String], globals: [String], acc: [String]) : [String] {
+  match r {
+    HR(name, body, _, _) -> fv_expr(body, [name, ...own], globals, acc)
+  }
+}
+
+fn list_concat_strings(a: [String], b: [String]) : [String] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...list_concat_strings(rest, b)]
   }
 }
 
@@ -4548,6 +4820,26 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     }
     EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
     EHole(_) -> st
+    EHandle(body, _, _, clauses, ret_opt) -> {
+      let s1 = collect_expr(body, st)
+      let s2 = collect_hclauses(clauses, s1)
+      match ret_opt { Some(r) -> collect_hreturn(r, s2) None -> s2 }
+    }
+  }
+}
+
+fn collect_hclauses(cs: [HClause], st: LamCollect) : LamCollect {
+  match cs {
+    [] -> st
+    [c, ...rest] -> match c {
+      HC(_, _, body, _, _) -> collect_hclauses(rest, collect_expr(body, st))
+    }
+  }
+}
+
+fn collect_hreturn(r: HReturn, st: LamCollect) : LamCollect {
+  match r {
+    HR(_, body, _, _) -> collect_expr(body, st)
   }
 }
 
@@ -4824,6 +5116,13 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
       # on first reach.
       let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
       let msg = cat2("unfilled hole: ", label)
+      concat_all(["kai_prelude_panic(kai_str(\"", msg, "\"))"])
+    }
+    EHandle(_, eff_name, _, _, _) -> {
+      # m7a #4b parses handle but does not yet lower it. m7a #6
+      # (perform/handle/resume lowering) replaces this stub with
+      # the actual evidence-passing code.
+      let msg = cat2("handle of `", cat2(eff_name, "` not yet implemented (m7a #6)"))
       concat_all(["kai_prelude_panic(kai_str(\"", msg, "\"))"])
     }
   }
@@ -6387,7 +6686,18 @@ fn synth(st: InferState, e: Expr) : Inferred {
     EBlock(stmts, tail)        -> synth_block(st, stmts, tail, e.line, e.col)
     EPipe(lhs, rhs)            -> synth_pipe(st, lhs, rhs, e.line, e.col)
     EHole(nm_opt)              -> synth_hole(st, nm_opt, e)
+    EHandle(_, _, _, _, _)     -> synth_handle_stub(st, e)
   }
+}
+
+# m7a #4b: type-check stub for `handle ... with ... { ... }`. Real
+# semantic checking (the body's row contains the handled effect,
+# clauses match the effect's op signatures, and the handle's
+# result type comes from the body or the optional return clause)
+# is m7a #4d. For now we accept any handle expression as having
+# type TyAny so the surrounding inferencer keeps walking.
+fn synth_handle_stub(st: InferState, e: Expr) : Inferred {
+  mk_inferred(st, TyAny, with_ty(e, TyAny))
 }
 
 # A hole gets a fresh TyVarT and records its source position and the
@@ -7452,6 +7762,7 @@ fn tag_of_kind(k: ExprKind) : String {
       Some(nm) -> concat_all(["hole ?", nm])
       None     -> "hole ?"
     }
+    EHandle(_, eff_name, _, _, _) -> concat_all(["handle ", eff_name])
   }
 }
 
@@ -8416,6 +8727,7 @@ fn expr_kind_name(k: ExprKind) : String {
     EBlock(_, _)   -> "EBlock"
     EPipe(_, _)    -> "EPipe"
     EHole(_)       -> "EHole"
+    EHandle(_, _, _, _, _) -> "EHandle"
   }
 }
 

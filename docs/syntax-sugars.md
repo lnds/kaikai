@@ -143,18 +143,16 @@ each(xs) { x -> Console.print(x) }
 
 ### Relation to `handle`
 
-Doc A's `handle { body } with Eff { clauses }` form looks like
-a trailing-lambda call, but it is **not** one — `handle` remains
-a dedicated parser production because the `{ clauses }` block
-contains handler clauses (`op(args, resume) -> expr`), which are
-not ordinary expressions, and because `Eff` is a capability
-identifier, not a value. The parser uses the trailing-lambda
-grammar for the `{ body }` part only; the rest (the `with Eff {
-clauses }` tail) is handle-specific syntax.
-
-In short: the `{ body }` slot inside `handle` is syntactically
-identical to any trailing lambda, and the grammar shares that
-sub-production. The outer shape of `handle` stays its own.
+`handle { body } with Eff { clauses }` is a control-flow
+construct of the language (see Doc A §*Handling*). `handle` and
+`with` are reserved keywords; the form has its own grammar
+production and is not a function call with a trailing block.
+Both blocks (`{ body }` and `{ clauses }`) are parsed by
+handle-specific rules: the body is an ordinary block expression,
+and the clauses block contains handler clauses (`op(args,
+resume) -> expr`) which are not ordinary expressions. Trailing
+lambdas (this document's main subject) do not interact with
+`handle` at all.
 
 ### Ambiguity with block expressions
 
