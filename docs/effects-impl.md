@@ -1002,6 +1002,177 @@ lets the op be type-erased. The cost is that the caller pays one
 extra argument (element size, or a runtime type witness) for each
 generic op — negligible compared to the op's own body.
 
+### Implementation plan (m7b)
+
+This section pins the m7b #2 work plan. The spec above (§*Per-op
+type generics*) is the *what*; the breakdown below is the *how*.
+
+#### State at the start of m7b #2
+
+- `effect Foo { op[T](...) : T }` — `parse_effect_ops`
+  (`stage2/compiler.kai:3168`) does **not** accept `[T]` after the
+  op name. The parser rejects it as malformed.
+- `EffectOp = EOp(name, params, ret, line, col)` — no slot for
+  per-op tparams. ~10 pattern-match sites across the file.
+- `array_make / array_get / array_set / array_length / array_grow`
+  are **prelude builtins** (`prelude_table` line ~4714, type
+  schemes in `infer_initial_env` line ~7666, listed in
+  `prelude_names` line ~4067). Their type schemes already use
+  HM polymorphism (`scheme([0], …)`) — what is missing is the
+  `Mutable` row.
+- `Mutable` is **not** declared and **not** builtin-injected. No
+  default handler exists.
+- m7b #11 (parametric *effects*, `effect Foo[T] { … }`) is
+  orthogonal: it parameterises the effect, not the op. A
+  `State[Int]` handler serves only `Int`; per-op `[T]` lets one
+  handler instance serve every `T` at every call. Both kinds
+  coexist.
+
+#### Partition
+
+The work splits into three sub-PRs, landed in order. **Each
+sub-PR is its own branch**, rebased after the previous one
+merges. Do **not** combine #2a and #2b: the AST shape changes in
+#2a alone are large, and bundling them makes the self-host break
+in #2b harder to triage.
+
+##### m7b #2a — Per-op generics mechanism (no consumer)
+
+Goal: a user-declared effect with a per-op generic op compiles,
+type-checks, and runs end-to-end. `Mutable` stays untouched.
+
+Touches:
+
+1. **Parser** (`parse_effect_ops`, ~3168) — accept optional
+   `[T1, T2, …]` between op name and `(args)`. Match the bracket
+   placement of m7b #11's effect-level tparams for visual
+   consistency.
+2. **AST** — extend `EffectOp` to carry per-op tparams:
+   `EOp(name, op_tparams, params, ret, line, col)`. Update **every**
+   pattern match on `EOp(...)` in the file: builtin decls
+   (`13365–13412`), printer, resolver, inferencer, codegen,
+   diagnostics. Existing call sites pass `[]`.
+3. **Resolver** — push the op's tparams onto the resolution
+   environment when checking the op's signature, popped after.
+   Distinct scope from the effect-level tparams (m7b #11): a
+   `State[T]` op can also have its own `op[U]`, with `T` bound at
+   the effect level and `U` per-op.
+4. **Inferencer** — at each call site `Eff.op(args)`, instantiate
+   fresh tvars for the op's tparams (the same machinery that
+   handles `forall T. …` for top-level functions, applied to the
+   op's signature).
+5. **Codegen** — pass an implicit element-size hint per op tparam
+   as an extra `i64` argument, before user args. The default
+   handler ignores it; FFI handlers consume it. This is the
+   simplest evidence-layout-stable encoding (Doc C §*Evidence-
+   layout stability*); a richer runtime witness can come later.
+6. **Diagnostics** — render `Foo.op[T]` faithfully in error
+   messages where the op signature is shown.
+
+Test fixtures (new, under `examples/effects/m7b_2a_*.kai`):
+
+- `m7b_2a_op_id_basic` — `effect Box { id[T](x: T) : T }` with a
+  trivial `id(x, resume) -> resume(x)` clause; one call with
+  `T = Int`, one with `T = String`, in the same handler scope.
+- `m7b_2a_op_distinct_types` — same handler, two ops, distinct
+  per-op tparams (`get[T] : T` returning state-of-T).
+- `m7b_2a_negative_arity` — wrong number of tparams in op signature
+  vs declaration (mirroring #11j arity check).
+- `m7b_2a_negative_undeclared_tparam` — op body mentions a tparam
+  not declared at the op (should be a clear resolver error).
+
+Scope envelope: ~6–8 commits, comparable to m7b #11 a-h. **Do
+not** touch `Mutable`, prelude, or stage 2 self-host code paths.
+
+##### m7b #2b — `Mutable` migration
+
+Goal: `Mutable` exists as a real effect declaration; `array_*`
+are reached through it; stage 2 self-hosts unchanged at the
+top-level row.
+
+Touches:
+
+1. **Builtin decl** — add `builtin_mutable_decl()` mirroring Doc B
+   §`Mutable` §*Declaration*: `array_make[T]`, `array_length[T]`,
+   `array_get[T]`, `array_set[T]`, `array_grow[T]`,
+   `ref_make[T]`, `ref_get[T]`, `ref_set[T]`. All use per-op `[T]`
+   (this is the first real consumer of #2a).
+2. **Injection** — `inject_builtin_effects` injects `Mutable` per
+   `inject_one` (gated on main's row mentioning it) — **not** per
+   `inject_unconditional`, because unlike `State`/`Reader`/
+   `Writer`, every `Mutable` use comes via the builtin, not via
+   user-written `with Mutable { … }`.
+3. **Default handler** — emit a default handler for `Mutable`
+   whose clauses call directly into the existing
+   `kai_prelude_array_*` C entry points and `resume`. The runtime
+   piece is small because the C side already exists.
+4. **Prelude removal** — drop `array_make / array_length /
+   array_get / array_set / array_grow / ref_*` from
+   `prelude_names` and `prelude_table`. They no longer exist as
+   bare names; the only path is through `Mutable`.
+5. **Compiler self-call rewrite** — every `array_make(…)` /
+   `array_get(…)` / etc. inside `stage2/compiler.kai` becomes
+   `Mutable.array_make(…)` / `Mutable.array_get(…)` / etc.
+   Mechanical sed-class change, but the compiler **must keep
+   compiling itself** at every commit boundary.
+6. **Row propagation check** — once the rewrite is in, every
+   compiler function that touches an array acquires `Mutable` in
+   its row. Verify `main`'s row picks it up (and only it) and
+   that the default handler installs cleanly.
+
+The self-host break is the load-bearing risk. Mitigation: land
+this sub-PR as one atomic commit (or a tightly-grouped pair
+where #1 = decl + injection + default handler runtime, #2 =
+prelude removal + compiler rewrite + Mutable.* migration).
+Self-host gate (`make selfhost` + `make -C stage2 selfhost-llvm`)
+must be green before the second commit.
+
+Test fixtures: existing `examples/effects/` and any test that
+exercises `array_*` is the regression suite. Add at least one
+`examples/effects/m7b_2b_mutable_intercept.kai` that installs an
+explicit `with Mutable { … }` to log every `array_set`, proving
+the observe-mutation use case from Doc B §`Mutable` §*Default
+handler*.
+
+##### m7b #2c — Cleanup
+
+After #2b stabilises:
+
+1. Remove any compatibility shim left behind in #2b.
+2. Audit the row of every public-facing stage 2 function: if a
+   helper that does no real mutation acquired `Mutable` only via
+   transitive plumbing, see whether refactoring removes the row.
+   This is opportunistic; do not block #2c on it.
+3. Update `docs/effects-impl.md` §m7b #2: *Pending* → **Landed**.
+4. Update `docs/effects-stdlib.md` §`Mutable` §*Migration plan*:
+   strike "currently uses … as unchecked builtins" — that is
+   no longer true.
+
+#### Decisions taken
+
+- **Order**: #2a then #2b then #2c. Three sub-PRs, three
+  branches, three rebases.
+- **When**: after m7b #5b and #7 merge — both touch the desugar
+  pipeline and `stdlib/`, neither overlaps #2 textually, but
+  parallelising AST-shape changes (#2a's `EOp` extension) with
+  in-flight desugar work invites painful textual rebases on the
+  mono-file.
+- **Not absorbed by #11**: m7b #11 parameterises the *effect*;
+  #2 parameterises the *op*. `Mutable` needs the latter — one
+  handler must serve every element type — and #11 cannot express
+  that.
+
+#### Out of scope for #2
+
+- Row-polymorphic op call sites (Doc A §*Out of scope for v1*
+  item 3, row-polymorphic clause). Stays out per Doc B §`Mutable`
+  §*Declaration*.
+- A richer runtime type witness beyond the implicit element-size
+  hint. The hint suffices for `Mutable`'s FFI shape; richer
+  witnesses can land if a future op needs them.
+- Migration of `Spawn` or `Actor[Msg]` to per-op generics. Doc B
+  flags both as candidates but neither is in m7b's scope.
+
 ## Diagnostic quality
 
 Three new error classes from effect types. Each has a prescribed
