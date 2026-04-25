@@ -17,6 +17,7 @@ To make the scope explicit:
 - No tuples (use records; or use sum-type variants with positional fields).
 - No full Perceus — a simple reference counter is used.
 - No string format beyond interpolation. No regex.
+- No m7b sugars (trailing lambdas, double trailing, `@cap`, `:=`, `var`, `a[i]`, lambda-block as expression). They appear in stage 1+; their grammar lives in §*Post-stage-0 grammar additions* below.
 
 These all appear in **full kaikai** (the language stage 1 compiles), but stage 0 does not need them.
 
@@ -675,3 +676,75 @@ hand-written recursive descent — no parser generator. Operator
 grouping (within `Expr BinOp Expr`) is not encoded in these rules
 directly; it is resolved by precedence climbing against the table
 above.
+
+### Post-stage-0 grammar additions (m7b)
+
+Stage 0 (kaikai-minimal) does **not** parse the productions
+below. Stage 1 and beyond do. They are gathered here so the
+canonical EBNF stays in one place — `docs/syntax-sugars.md`
+remains the authoritative *specification* of each sugar's
+intent and editorial use; this section is the *grammar*.
+
+```
+(* §1 — trailing lambdas + §5 — double trailing lambdas *)
+Call            ::= Expr "(" ArgList? ")" TrailingLambda? TrailingLambda?
+                  | Expr                  TrailingLambda  TrailingLambda?
+TrailingLambda  ::= "{" (LambdaParams "->")? Block "}"
+LambdaParams    ::= Ident ("," Ident)*
+
+(* §1 — lambda-block as standalone expression *)
+Expr            ::= ...
+                  | "{" LambdaParams "->" Expr "}"     (* lambda-block expression *)
+                  | "{" "->" Expr "}"                  (* zero-arity lambda-block *)
+
+(* §2 — capability read/write *)
+Expr            ::= ...
+                  | "@" Ident                           (* capability read *)
+Stmt            ::= ...
+                  | Ident ":=" Expr                     (* capability write *)
+                  | IndexLhs "[" Expr "]" ":=" Expr     (* indexed write *)
+IndexLhs        ::= Ident ("." Ident)*
+
+(* §3 — local mutable cells *)
+Stmt            ::= ...
+                  | "var" Ident (":" Type)? "=" Expr
+
+(* §4 — array indexing read uses the existing postfix on Expr *)
+```
+
+#### LL(1) status and the lookahead exceptions
+
+The post-stage-0 grammar stays LL(1) in the same "with minor
+bookkeeping" sense as stage 0, with **two specific lookahead
+rules** the recursive-descent parser observes:
+
+1. **Trailing-lambda attachment vs block-statement.** When a
+   `{` follows a callable, it is a `TrailingLambda` only when
+   on the same line as the callable. A newline before the `{`
+   terminates the `Call` and starts a new statement whose first
+   token is `{` (a block expression). Single-token lookahead
+   plus a one-bit "saw newline since previous token" flag.
+   Same rule extends to the second `TrailingLambda` of §5.
+
+2. **Lambda-block expression vs block expression.** Inside an
+   expression position (e.g. RHS of `|`, RHS of `let`), `{` may
+   start either a lambda-block (`{ x -> ... }`, `{ -> ... }`)
+   or a plain block expression. The parser peeks past the `{`:
+   - `{` followed by `->` → zero-arity lambda-block.
+   - `{` followed by `Ident ("," Ident)* "->"` → parameterised
+     lambda-block.
+   - Anything else → block expression.
+
+   This is a bounded lookahead (one identifier list scan
+   terminating at `->` or any non-`,`/non-`Ident` token). The
+   stage 1 parser implements it as a checkpoint-and-rewind on
+   the lexer, identical to how Kotlin and Scala distinguish
+   block-with-expression from block-with-lambda.
+
+#### Same-line discipline for `:=` and `[i]`
+
+The §2 / §4 statement forms (`Ident ":=" Expr`, `IndexLhs
+"[" Expr "]" ":=" Expr`) attach without ambiguity because
+`:=` is a distinct token that no other production starts with.
+Indexed read (`a[i]`) is already covered by the existing postfix
+`Expr "[" Expr "]"` on `Expr` and stays unchanged.
