@@ -1498,11 +1498,24 @@ page the way they are written.
 6. **`a[i]` and `a[i] := v`** — pre-resolve desugar pass.
    **Landed.**
 7. **`Reader[T]` / `Writer[W]`** — new stdlib effects (Doc B
-   §*Open questions* #2 resolved in their favour). **Unblocked
-   by #11** — both effects work end-to-end as #11 fixtures
+   §*Open questions* #2 resolved in their favour). The effect
+   declarations are builtin-injected by `inject_builtin_effects`
+   and the inline `handle ... with Reader[T]` / `with Writer[W]`
+   forms work end-to-end as #11 fixtures
    (`examples/effects/m7b_11_reader_basic.kai`,
-   `m7b_11_writer_basic.kai`); what remains is promoting them
-   from test fixtures into `stdlib/`. *Pending.*
+   `m7b_11_writer_basic.kai`). **Blocked on #13 + #14** —
+   surfaced by a 2026-04-25 attempt at #7: Doc B's required
+   helpers `with_reader[T, S](env, body) : S` and
+   `with_writer[W, S](body) : (S, [W])` need (a) polymorphic
+   user-function signatures (`fn name[T, S](...)`, see #13) and
+   (b) lambda bodies that carry their effect row in their own
+   type rather than leaking it to the enclosing function (#14).
+   Without both, the helpers either fail to type-check or only
+   work for monomorphic body types — and the brief explicitly
+   asks for nested distinct instantiations
+   (`Reader[Int]` inside `Reader[String]`). Promotion to
+   `stdlib/reader.kai` and `stdlib/writer.kai` resumes once
+   #13 and #14 land. *Pending.*
 8. **Diagnostic review** — every message rewritten against the
    stage 2 §8 bar. *Lands last.*
 9. **`|` map pipe** — binary operator wired in the parser,
@@ -1543,15 +1556,55 @@ page the way they are written.
     variable position — distinct from a label, scoped to the
     function's type parameters. Independent of #11; the two
     can land in either order. Blocker of `stdlib/loop.kai` as
-    specified in `docs/stdlib-layout.md` §`loop`.
+    specified in `docs/stdlib-layout.md` §`loop`. **Landed.**
+13. **Polymorphic user-function signatures** — `fn name[T, S](...)`
+    declares per-function type parameters that generalise across
+    call sites the same way op-level `[T]` does for #2. Today
+    `parse_fn_decl` (`stage2/compiler.kai:3069`) accepts only
+    `fn name(params) : T / row` and `fn_scheme_of_decl` builds
+    `scheme_full([], rvbind_ids(rbinds), body)` — the tparam list
+    is always empty. `resolve_ty_with_rvbinds` treats every
+    lowercase identifier in type position as a `TyCon(name, [])`
+    nominal type, not as a quantified variable. Reproducible by
+    declaring `pub fn id(x: a) : a = x` and calling `id(42)`:
+    the call site fails unification with `expected: (a) -> a`
+    vs `found: (Int) -> ?t0`. Required for any polymorphic
+    higher-order helper (Doc B's `with_reader[T, S]`,
+    `with_writer[W, S]`, future `map`, `fold`, etc.). Surfaced
+    by the 2026-04-25 attempt at #7. Independent of #11/#12 in
+    mechanism; uses the same HM machinery already wired for
+    builtin polymorphic prelude functions (`array_make`,
+    `list_append`, etc.) — the gap is at the user-fn entry point,
+    not the inferencer core. Blocker of #7. *Pending.*
+14. **Lambda effect rows** — `synth_lambda`
+    (`stage2/compiler.kai:9846`) builds the lambda's type as
+    `fn_ty(args, ret)` with no row slot, so effects invoked
+    inside the body (`Reader.ask()`, `Writer.tell(...)`) accumulate
+    on the *enclosing* function's `st.row` rather than on the
+    lambda's own type. `repeat(3) { Console.print("hi") }`
+    appears to work today only because `Console` is default-
+    handled and main happens to declare it — the leak is
+    benign. For effects without default handlers (`Reader[T]`,
+    `Writer[W]`) and for any callee that wants to *contain*
+    the effect of its body argument (every handler-runner
+    helper), the lambda must carry the effect in its own type
+    so the unification of `() -> S / Reader[T]` with the lambda
+    type binds the row correctly. Required for #7. Surfaced
+    by the 2026-04-25 attempt at #7. Likely needs companion
+    work in codegen (lambdas with non-empty rows must close
+    over the handler stack accordingly). Blocker of #7. *Pending.*
 
 Within each sub-milestone the ordering is dependency-driven: the
 evidence type generation (m7a #3) unblocks everything else in
 m7a; the desugar pass (m7b #3–#6) runs as a single addition and
 then specialisation (m7b #5) piggybacks on top. m7b #11 and
 #12 were each large enough to be milestones in their own right;
-both have landed. The remaining m7b items (#2, #4, #5b, #7, #8)
-are now all unblocked.
+both have landed. m7b #13 and #14 are the post-#11 gaps surfaced
+by attempting #7 — neither was on the original m7b list, but
+together they unblock #7 and any future polymorphic higher-order
+helper. The remaining m7b items are: #2 (per-op generics), #4
+(`@cap` / `cap := v` sugar), #5b (`var` desugar), #7 (blocked
+on #13 + #14), #8 (diagnostic review), #13, #14.
 
 ## Next steps
 
