@@ -412,6 +412,24 @@ test-effects: $(TARGET) build
 	  grep -q "unknown op \`unknown\` on effect \`Io\`" build/s2-$$name.err \
 	    && echo "effects OK $$name (rejected as expected)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7a_6a_struct_emit.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "typedef struct EvCounter EvCounter;" build/s2-$$name.c \
+	    && grep -q "typedef struct EvGreeter EvGreeter;" build/s2-$$name.c \
+	    && grep -q "KaiHandlerId handler_id;" build/s2-$$name.c \
+	    && grep -q "KaiValue \*(\*tick)(EvCounter \*self, KaiCont \*k);" build/s2-$$name.c \
+	    && grep -q "KaiValue \*(\*get)(EvCounter \*self, KaiCont \*k);"  build/s2-$$name.c \
+	    && grep -q "KaiValue \*(\*hello)(EvGreeter \*self, KaiValue \*kai_name, KaiCont \*k);" build/s2-$$name.c \
+	    && grep -q "KaiValue \*(\*bye)(EvGreeter \*self, KaiValue \*kai_name, KaiValue \*kai_count, KaiCont \*k);" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (struct shape wrong)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name \
+	    && echo "effects OK $$name (struct emitted + compiles + runs)" \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
 	done
 
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches

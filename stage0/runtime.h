@@ -1159,6 +1159,26 @@ static void kai_assert_check(KaiValue *cond, const char *msg) {
  * call kai_evidence_lookup.
  */
 
+/* m7a #6a: handler-id stamped onto each EvE struct at handle entry,
+ * and copied into the continuation closure for one-shot diagnostics
+ * (Doc C §*resume representation*). The id is cosmetic — the
+ * status byte in the continuation is the real one-shot check.
+ * Monotonic + unique-per-process is enough for v1; m8 may revisit
+ * if cross-fiber id collisions become a debugging concern. */
+typedef unsigned long long KaiHandlerId;
+
+static KaiHandlerId kai_next_handler_id = 1;
+
+static KaiHandlerId kai_fresh_handler_id(void) {
+    return kai_next_handler_id++;
+}
+
+/* m7a #6a: forward declaration of the continuation closure. The
+ * concrete layout (status byte + env ptr + fn ptr + handler_id)
+ * lands in m7a #6d; until then, every EvE op fn ptr declares its
+ * trailing parameter as KaiCont* without inspecting it. */
+typedef struct KaiCont KaiCont;
+
 typedef struct KaiEvidence KaiEvidence;
 struct KaiEvidence {
     KaiEvidence *parent;
