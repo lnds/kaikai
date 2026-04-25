@@ -7980,6 +7980,19 @@ fn mk_fresh_row_subst(rvars: [Int], s: Subst) : FreshRowSubst {
   mk_fresh_row_subst_loop(rvars, subst_empty(), s_seed)
 }
 
+# m7b #12: bump the row-var fresh counter past `n` reserved ids so a
+# subsequent `subst_fresh_row` returns ids that don't alias them.
+# Used by `infer_decl` to keep its row-poly bound ids out of the
+# inferencer's fresh-row pool.
+fn advance_row_fresh(st: InferState, n: Int) : InferState {
+  if n <= 0 { st }
+  else {
+    let s1 = Subst { slots: st.sub.slots, row_slots: st.sub.row_slots,
+                     row_fresh: st.sub.row_fresh + n }
+    st_set_sub(st, s1)
+  }
+}
+
 # ====================================================================
 # bidirectional inference (M2d)
 # ====================================================================
@@ -8264,13 +8277,27 @@ fn st_instantiate(st: InferState, sc: TyScheme) : TyRes {
 
 fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes {
   match sc {
-    Scheme(vars, _, _) -> {
+    Scheme(vars, rvars, _) -> {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if st.env.fresh >= need { st.env.fresh } else { need }
       let inst = instantiate(st.env, sc)
       let fresh = range_ids(start, start + n)
-      TyInstRes { st: st_set_env(st, inst.env), ty: inst.ty, fresh: fresh }
+      # m7b #12: also fresh-instantiate row vars. The temp substitution
+      # rewrites each bound row-var id to a fresh one drawn from the
+      # inferencer's row_fresh counter; we apply it once to the body
+      # produced by `instantiate` (which rewrote type vars only) and
+      # propagate the bumped row_fresh into the returned state.
+      let st_env = st_set_env(st, inst.env)
+      match rvars {
+        [] -> TyInstRes { st: st_env, ty: inst.ty, fresh: fresh }
+        _  -> {
+          let frs = mk_fresh_row_subst(rvars, st_env.sub)
+          let body1 = apply_ty(frs.temp, inst.ty)
+          let st_out = st_set_sub(st_env, frs.sub)
+          TyInstRes { st: st_out, ty: body1, fresh: fresh }
+        }
+      }
     }
   }
 }
@@ -8694,8 +8721,18 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
       let rc = synth(st, callee)
       let ra = synth_many(rc.st, args_)
       let rv = st_fresh_ty(ra.st)
-      let expected = fn_ty(ra.tys, rv.ty)
-      let st2 = st_unify(rv.st, rc.ty, expected, "function call", line, col)
+      # m7b #12: build the expected function type with an *open* row
+      # (a fresh row variable in the tail) so that calling a function
+      # whose declared row is non-empty or carries its own row variable
+      # doesn't force-bind the callee's tail to the empty row at the
+      # call site. The fresh row var absorbs whatever residual labels
+      # the callee carries; the caller's effect tracking is handled
+      # separately by `st_add_effect` for op calls.
+      let fr = subst_fresh_row(rv.st.sub)
+      let st_fresh = st_set_sub(rv.st, fr.subst)
+      let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+      let expected = TyFnT(ra.tys, rv.ty, expected_row)
+      let st2 = st_unify(st_fresh, rc.ty, expected, "function call", line, col)
       let ty = apply_ty(st2.sub, rv.ty)
       let root = with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), ty)
       mk_inferred(st2, ty, root)
@@ -9666,9 +9703,13 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: De
     DFn(is_pub, nm, ps, opt_ret, row, body, line, col) -> {
       # m7b #12: row-variable binding context for this decl. The
       # bound ids match those produced by fn_scheme_of_decl so the
-      # body's params agree with the scheme stored in the env.
+      # body's params and any internal references to row-poly user
+      # functions agree with the scheme stored in the env. The
+      # inferencer's row_fresh counter is advanced past the highest
+      # bound id, so future fresh row vars can never alias these.
       let rbinds = mk_rvbinds(collect_decl_rvars(d))
-      let st0 = infer_state_new(file, env, prelude_len, recs)
+      let st_init = infer_state_new(file, env, prelude_len, recs)
+      let st0 = advance_row_fresh(st_init, list_length(rbinds))
       let added = add_infer_params_with_rvbinds(st0, ps, rbinds)
       let rb = synth(added.st, body)
       let declared_ret = match opt_ret {
