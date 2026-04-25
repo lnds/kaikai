@@ -620,14 +620,13 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (None path output wrong)"; cat build/s2-$$name.out2; exit 1; }; \
 	done
 
-# m7b #3 — syntax sugars (trailing lambdas, lambda-block as
-# expression, double trailing lambdas). Each .kai under
-# `examples/sugars/` either compiles + runs to a known integer
-# (positive cases) or fails with a specific diagnostic (negatives).
-# The positive cases all `print` their final value, the test diffs
-# stdout against a `<name>.out.expected` golden file. Negative
-# cases drop a `<name>.err.expected` line that must appear in the
-# compiler's stderr.
+# m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,
+# lambda-block as expression, double trailing lambdas) and m7b #6
+# (array indexing `a[i]` / `a[i] := v`). Each .kai under
+# `examples/sugars/` either compiles + runs to a known stdout
+# (positive cases — diffed against `<name>.out.expected`) or fails
+# with a specific diagnostic (negative cases — every line of
+# `<name>.err.expected` must be a substring of the compiler's stderr).
 test-sugars: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/sugars/*.kai; do \
