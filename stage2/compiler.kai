@@ -38,7 +38,7 @@ type TokKind
   = TkEof
   | TkNewline
   # keywords (alphabetical)
-  | TkAnd | TkAs | TkAssert | TkElse | TkFalse | TkFn | TkIf | TkImport
+  | TkAnd | TkAs | TkAssert | TkEffect | TkElse | TkFalse | TkFn | TkIf | TkImport
   | TkLet | TkMatch | TkNot | TkOr | TkPub | TkTest | TkTrue | TkType
   # literals
   | TkInt | TkReal | TkChar | TkString
@@ -71,7 +71,7 @@ fn tk_name(k: TokKind) : String {
   match k {
     TkEof -> "EOF"
     TkNewline -> "NEWLINE"
-    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkElse -> "else"
+    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkEffect -> "effect" TkElse -> "else"
     TkFalse -> "false" TkFn -> "fn" TkIf -> "if" TkImport -> "import"
     TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
     TkPub -> "pub" TkTest -> "test" TkTrue -> "true" TkType -> "type"
@@ -185,6 +185,7 @@ fn keyword_kind(text: String) : TokKind {
   if text == "and" { TkAnd }
   else if text == "as" { TkAs }
   else if text == "assert" { TkAssert }
+  else if text == "effect" { TkEffect }
   else if text == "else" { TkElse }
   else if text == "false" { TkFalse }
   else if text == "fn" { TkFn }
@@ -944,6 +945,11 @@ type Decl
   | DType(Bool, String, [String], TypeBody, Int, Int)
   | DTest(String, Expr, Int, Int)
   | DImport(ImportKind, Int, Int)
+  | DEffect(Bool, String, [EffectOp], Int, Int)
+
+# An operation declared inside an `effect Eff { ... }` block.
+# name(params) : ret_ty — no body, no `fn` keyword.
+type EffectOp = EOp(String, [Param], TypeExpr, Int, Int)
 
 type TypeBody = TBAlias(TypeExpr) | TBRecord([FieldDecl]) | TBSum([Variant])
 type FieldDecl = FD(String, TypeExpr)
@@ -1042,6 +1048,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkAnd        -> match b { TkAnd -> true _ -> false }
     TkAs         -> match b { TkAs -> true _ -> false }
     TkAssert     -> match b { TkAssert -> true _ -> false }
+    TkEffect     -> match b { TkEffect -> true _ -> false }
     TkElse       -> match b { TkElse -> true _ -> false }
     TkFalse      -> match b { TkFalse -> true _ -> false }
     TkFn         -> match b { TkFn -> true _ -> false }
@@ -2358,6 +2365,8 @@ fn parse_decl(p: Parser) : PDecl {
     parse_fn_decl(p_advance(p1), is_pub, hd)
   } else if tk_is(hd.kind, TkType) {
     parse_type_decl(p_advance(p1), is_pub, hd)
+  } else if tk_is(hd.kind, TkEffect) {
+    parse_effect_decl(p_advance(p1), is_pub, hd)
   } else if tk_is(hd.kind, TkTest) {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a test")) }
     else { parse_test_decl(p_advance(p1), hd) }
@@ -2365,10 +2374,10 @@ fn parse_decl(p: Parser) : PDecl {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on an import")) }
     else { parse_import_decl(p_advance(p1), hd) }
   } else {
-    let base = "expected `fn`, `type`, `test`, or `import`"
+    let base = "expected `fn`, `type`, `effect`, `test`, or `import`"
     let msg = if tk_is(hd.kind, TkIdent) {
       let text = tok_source(p1.src, hd)
-      match closest_name(text, ["fn", "type", "test", "import", "pub"]) {
+      match closest_name(text, ["fn", "type", "effect", "test", "import", "pub"]) {
         Some(sug) -> concat_all([base, " (did you mean `", sug, "`?)"])
         None      -> base
       }
@@ -2424,6 +2433,72 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
               }
             } else {
               err_d(p_error_here(p4, "expected `=` or `{` to start function body"))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# `effect Eff { op_decl ... }` — m7a #3a. No name resolution and no
+# evidence-type emission yet (those are #3c and #3d). Each op_decl is
+# `name(params) : ReturnType`, body-less; per docs/effects-impl.md
+# §*Evidence types*. Per-op type generics are m7b.
+fn parse_effect_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) {
+    err_d(p_error(p, id, "expected effect name"))
+  } else {
+    let name = tok_source(p.src, id)
+    let p1 = p_advance(p)
+    let p2 = p_skip_newlines(p1)
+    if not p_at(p2, TkLbrace) {
+      err_d(p_error_here(p2, "expected `{` to start effect body"))
+    } else {
+      let p3 = p_skip_newlines(p_advance(p2))
+      let ops_r = parse_effect_ops(p3, [])
+      match ops_r.r {
+        None -> err_d(ops_r.p)
+        Some(ops) -> ok_d(ops_r.p, DEffect(is_pub, name, ops, t.line, t.col))
+      }
+    }
+  }
+}
+
+type PEffectOps = { p: Parser, r: Option[[EffectOp]] }
+
+fn parse_effect_ops(p: Parser, acc: [EffectOp]) : PEffectOps {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    PEffectOps { p: p_advance(p0), r: Some(list_reverse(acc)) }
+  } else {
+    let id = p_peek(p0)
+    if not tk_is(id.kind, TkIdent) {
+      PEffectOps { p: p_error(p0, id, "expected operation name"), r: None }
+    } else {
+      let opname = tok_source(p0.src, id)
+      let p1 = p_advance(p0)
+      if not p_at(p1, TkLparen) {
+        PEffectOps { p: p_error_here(p1, "expected `(` after operation name"), r: None }
+      } else {
+        let p2 = p_skip_newlines(p_advance(p1))
+        let params_r = parse_fn_params(p2, [])
+        match params_r.r {
+          None -> PEffectOps { p: params_r.p, r: None }
+          Some(params) -> {
+            let p3 = p_skip_newlines(params_r.p)
+            if not p_at(p3, TkColon) {
+              PEffectOps { p: p_error_here(p3, "expected `:` before operation return type"), r: None }
+            } else {
+              let rt = parse_type(p_advance(p3))
+              match rt.r {
+                None -> PEffectOps { p: rt.p, r: None }
+                Some(ty) -> {
+                  let op = EOp(opname, params, ty, id.line, id.col)
+                  parse_effect_ops(rt.p, [op, ...acc])
+                }
+              }
             }
           }
         }
@@ -3010,6 +3085,21 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
         }
       }
     }
+    DEffect(is_pub, name, ops, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      emit_line(depth, "effect #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      ops |> each((op) => dump_effect_op(op, depth + 1))
+    }
+  }
+}
+
+fn dump_effect_op(op: EffectOp, depth: Int) : Unit {
+  match op {
+    EOp(name, params, ret, line, col) -> {
+      emit_line(depth, "op \"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      params |> each((pm) => dump_param(pm, depth + 1))
+      dump_type(ret, depth + 1)
+    }
   }
 }
 
@@ -3342,6 +3432,7 @@ fn chk_decl(e: Env, d: Decl) : Env {
       env_pop(e2)
     }
     DImport(_, _, _) -> e
+    DEffect(_, _, _, _, _) -> e          # m7a #3c will register effect names
   }
 }
 
@@ -3373,6 +3464,7 @@ fn register_one(e: Env, d: Decl) : Env {
     }
     DTest(_, _, _, _) -> e
     DImport(ik, _, _) -> register_import(e, ik)
+    DEffect(_, name, _, _, _) -> env_add(e, name)
   }
 }
 
@@ -4430,6 +4522,7 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
     DType(_, _, _, _, _, _) -> st
     DTest(_, body, _, _) -> collect_expr(body, st)
     DImport(_, _, _) -> st
+    DEffect(_, _, _, _, _) -> st          # no expressions to walk
   }
 }
 
@@ -4988,6 +5081,10 @@ fn dump_decl_type(d: Decl) : Unit {
         IkAlias(p, a) -> print("import #{p} as #{a} @#{int_to_string(line)}:#{int_to_string(col)}")
         IkSelective(p, _) -> print("import #{p} @#{int_to_string(line)}:#{int_to_string(col)}")
       }
+    }
+    DEffect(is_pub, name, _, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      print("#{pub_s}effect #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
   }
 }

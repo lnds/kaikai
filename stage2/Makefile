@@ -10,7 +10,7 @@ SRC     := compiler.kai
 # feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
 STACK := ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-modules test-modules-path selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-modules test-modules-path selfhost
 
 all: $(TARGET)
 
@@ -285,6 +285,30 @@ test-holes: $(TARGET) build
 	  echo "holes OK $$name"; \
 	done
 
+# m7a #3 — `effect` declarations parse cleanly + negative cases fail
+# with the expected diagnostic. Exercises the parser only; name
+# resolution and codegen for `effect` are still deferred (#3c, #3d).
+test-effects: $(TARGET) build
+	@set -e; \
+	for f in ../examples/effects/parse_effect.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --ast $$f > build/s2-$$name.ast \
+	    && grep -q "effect \"Io\"" build/s2-$$name.ast \
+	    && grep -q "effect \"Fail\"" build/s2-$$name.ast \
+	    && grep -q "op \"print\"" build/s2-$$name.ast \
+	    && echo "effects OK $$name" \
+	    || { echo "effects FAIL $$name"; cat build/s2-$$name.ast; exit 1; }; \
+	done; \
+	for f in ../examples/effects/parse_effect_bad_no_ret.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (parser accepted bad input)"; exit 1; } \
+	    || true; \
+	  grep -q "expected \`:\` before operation return type" build/s2-$$name.err \
+	    && echo "effects OK $$name (rejected as expected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done
+
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
 # a fixed point.
 selfhost: $(TARGET) build
@@ -310,7 +334,7 @@ selfhost-llvm: $(TARGET) build
 	  && echo "llvm self-hosting fixed point: OK" \
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -319,7 +343,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects
 
 clean:
 	rm -rf build $(TARGET)
