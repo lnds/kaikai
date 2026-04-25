@@ -923,7 +923,13 @@ type ExprKind
   # { clauses [return(x) -> expr] }`. The `alias` (Option[String])
   # rebinds the capability name inside the body. m7a #4b is parser
   # only; type-checking and runtime are #4d / #6.
-  | EHandle(Expr, String, Option[String], [HClause], Option[HReturn])
+  # m7b #11: parametric effects. `eff_tyargs` is the `[T1, T2]` after
+  # the effect name in `with Reader[Int]` (empty when none); `init_opt`
+  # is the `(init)` after the type args in `with State[Int](0)` form
+  # (None when the handler is stateless). Both extensions are inert
+  # for stateless effects, so existing handlers parse to `[]` /
+  # `None` and behave as before.
+  | EHandle(Expr, String, [TypeExpr], Option[Expr], Option[String], [HClause], Option[HReturn])
 
 type ListElem = ElPlain(Expr) | ElSpread(Expr)
 
@@ -978,7 +984,13 @@ type TyKind
 # `e` is a row variable scoped to the enclosing function declaration
 # (m7b #12). In the AST this is the *raw* parsed shape; resolve_ty
 # converts it into the semantic `Row` that lives inside `TyFnT`.
-type RowExpr = REmpty | RClosed([String]) | ROpen(String, [String])
+#
+# m7b #11: each label carries optional type arguments (`Reader[Int]`
+# parses as `RL("Reader", [TyName("Int", [])])`). Stateless effects
+# (and pre-m7b #11 syntax) carry an empty arg list. ROpen merges m7b
+# #11 (parametric labels) with m7b #12 (open row variable in tail).
+type RowExpr = REmpty | RClosed([RowLabel]) | ROpen(String, [RowLabel])
+type RowLabel = RL(String, [TypeExpr])
 
 # Handler clause (op): `op_name(args..., resume) -> body`. The
 # resume binding is conventionally the last param; m7a #4d will
@@ -994,7 +1006,9 @@ type Decl
   | DType(Bool, String, [String], TypeBody, Int, Int)
   | DTest(String, Expr, Int, Int)
   | DImport(ImportKind, Int, Int)
-  | DEffect(Bool, String, [EffectOp], Int, Int)
+  # m7b #11: optional type parameters on the effect declaration —
+  # `effect Reader[T] { ask() : T }`. Empty list for stateless effects.
+  | DEffect(Bool, String, [String], [EffectOp], Int, Int)
 
 # An operation declared inside an `effect Eff { ... }` block.
 # name(params) : ret_ty — no body, no `fn` keyword.
@@ -1870,18 +1884,61 @@ fn parse_handle(p: Parser, t: Token) : PExpr {
           } else {
             let eff_name = tok_source(p2.src, eff_t)
             let p3 = p_advance(p2)
-            let alias_r = parse_handle_alias(p3)
-            let p4 = p_skip_newlines(alias_r.p)
-            if not p_at(p4, TkLbrace) {
-              err_e(p_error_here(p4, "expected `{` to start handler clauses"))
-            } else {
-              let p5 = p_skip_newlines(p_advance(p4))
-              let cr = parse_handle_clauses(p5, [], None)
-              match cr.r {
-                None -> err_e(cr.p)
-                Some(_) -> ok_e(cr.p,
-                  mk_expr(EHandle(body, eff_name, alias_r.r, cr.clauses, cr.return_clause),
-                          t.line, t.col))
+            # m7b #11: optional `[T1, T2]` after the effect name —
+            # the type instantiation. e.g. `with Reader[Int]`.
+            let tyargs_r =
+              if p_at(p3, TkLbracket) {
+                parse_row_label_args(p_skip_newlines(p_advance(p3)), [])
+              } else {
+                PRowArgs { p: p3, r: Some([]) }
+              }
+            match tyargs_r.r {
+              None -> err_e(tyargs_r.p)
+              Some(eff_tyargs) -> {
+                # m7b #11: optional `(init)` after the type args —
+                # the handler-state initial value, e.g. `with State[Int](0)`.
+                let init_r =
+                  if p_at(tyargs_r.p, TkLparen) {
+                    let p_io = p_skip_newlines(p_advance(tyargs_r.p))
+                    let ie = parse_expr(p_io)
+                    match ie.r {
+                      None -> PInit { p: ie.p, r: None, has_init: true }
+                      Some(ix) -> {
+                        let p_ic = p_skip_newlines(ie.p)
+                        if not p_at(p_ic, TkRparen) {
+                          PInit { p: p_error_here(p_ic, "expected `)` after handler-state initializer"),
+                                  r: None, has_init: true }
+                        } else {
+                          PInit { p: p_advance(p_ic), r: Some(ix), has_init: true }
+                        }
+                      }
+                    }
+                  } else {
+                    PInit { p: tyargs_r.p, r: None, has_init: false }
+                  }
+                let init_failed =
+                  if init_r.has_init {
+                    match init_r.r { None -> true Some(_) -> false }
+                  } else { false }
+                if init_failed {
+                  err_e(init_r.p)
+                } else {
+                let alias_r = parse_handle_alias(init_r.p)
+                let p4 = p_skip_newlines(alias_r.p)
+                if not p_at(p4, TkLbrace) {
+                  err_e(p_error_here(p4, "expected `{` to start handler clauses"))
+                } else {
+                  let p5 = p_skip_newlines(p_advance(p4))
+                  let cr = parse_handle_clauses(p5, [], None)
+                  match cr.r {
+                    None -> err_e(cr.p)
+                    Some(_) -> ok_e(cr.p,
+                      mk_expr(EHandle(body, eff_name, eff_tyargs, init_r.r,
+                                       alias_r.r, cr.clauses, cr.return_clause),
+                              t.line, t.col))
+                  }
+                }
+                }
               }
             }
           }
@@ -1890,6 +1947,8 @@ fn parse_handle(p: Parser, t: Token) : PExpr {
     }
   }
 }
+
+type PInit = { p: Parser, r: Option[Expr], has_init: Bool }
 
 # Handler-clause params: like fn params but the type annotation is
 # optional. `print(s, resume) -> ...` is the common shape.
@@ -2802,7 +2861,7 @@ fn parse_row_suffix(p: Parser) : PRow {
   }
 }
 
-fn parse_row_labels(p: Parser, acc: [String]) : PRow {
+fn parse_row_labels(p: Parser, acc: [RowLabel]) : PRow {
   let t = p_peek(p)
   if not tk_is(t.kind, TkIdent) {
     PRow { p: p_error(p, t, "expected effect name in row"), r: REmpty }
@@ -2810,24 +2869,56 @@ fn parse_row_labels(p: Parser, acc: [String]) : PRow {
     let name = tok_source(p.src, t)
     let p1 = p_advance(p)
     if is_upper_ident(p.src, t) {
-      # Effect label: may be followed by `+` and more labels (or a
-      # row variable as the very last element).
-      let acc1 = [name, ...acc]
-      if p_at(p1, TkPlus) {
-        parse_row_labels(p_advance(p1), acc1)
-      } else {
-        PRow { p: p1, r: RClosed(list_reverse(acc1)) }
+      # m7b #11: optional `[T1, T2]` after the label name. `Reader[Int]`
+      # in row position parses the same way as a generic type
+      # application — distinct labels for distinct instantiations.
+      let args_r =
+        if p_at(p1, TkLbracket) {
+          parse_row_label_args(p_skip_newlines(p_advance(p1)), [])
+        } else {
+          PRowArgs { p: p1, r: Some([]) }
+        }
+      match args_r.r {
+        None -> PRow { p: args_r.p, r: REmpty }
+        Some(targs) -> {
+          let acc1 = [RL(name, targs), ...acc]
+          if p_at(args_r.p, TkPlus) {
+            parse_row_labels(p_advance(args_r.p), acc1)
+          } else {
+            PRow { p: args_r.p, r: RClosed(list_reverse(acc1)) }
+          }
+        }
       }
     } else {
-      # Lowercase identifier: a row variable. Must be the last item
-      # in the row — anything after `+` here would be a second row
-      # variable or a label appearing after the tail, both rejected.
+      # m7b #12: lowercase identifier — a row variable in tail
+      # position. Row variables themselves carry no type args and
+      # must be the last item in the row; anything after `+` here
+      # is rejected.
       if p_at(p1, TkPlus) {
         let pe = p_error(p1, p_peek(p1),
           "row variable must be the last item in the row")
         PRow { p: pe, r: ROpen(name, list_reverse(acc)) }
       } else {
         PRow { p: p1, r: ROpen(name, list_reverse(acc)) }
+      }
+    }
+  }
+}
+
+type PRowArgs = { p: Parser, r: Option[[TypeExpr]] }
+
+fn parse_row_label_args(p: Parser, acc: [TypeExpr]) : PRowArgs {
+  let r = parse_type(p)
+  match r.r {
+    None -> PRowArgs { p: r.p, r: None }
+    Some(arg) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_row_label_args(p_skip_newlines(p_advance(p1)), [arg, ...acc])
+      } else if p_at(p1, TkRbracket) {
+        PRowArgs { p: p_advance(p1), r: Some(list_reverse([arg, ...acc])) }
+      } else {
+        PRowArgs { p: p_error_here(p1, "expected `,` or `]` after row-label type arguments"), r: None }
       }
     }
   }
@@ -3032,10 +3123,13 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
   }
 }
 
-# `effect Eff { op_decl ... }` — m7a #3a. No name resolution and no
-# evidence-type emission yet (those are #3c and #3d). Each op_decl is
-# `name(params) : ReturnType`, body-less; per docs/effects-impl.md
-# §*Evidence types*. Per-op type generics are m7b.
+# `effect Eff[T1, T2] { op_decl ... }` — m7a #3a + m7b #11.
+# No name resolution and no evidence-type emission live here; those are
+# #3c and #3d. Each op_decl is `name(params) : ReturnType`, body-less;
+# per docs/effects-impl.md §*Evidence types*. Per-op type generics are
+# m7b #2 (separate sub-task). m7b #11 adds the optional `[T1, T2]`
+# tparam list after the effect name; tparams are in scope inside every
+# op signature's parameter and return types.
 fn parse_effect_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
   let id = p_peek(p)
   if not tk_is(id.kind, TkIdent) {
@@ -3043,15 +3137,27 @@ fn parse_effect_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
   } else {
     let name = tok_source(p.src, id)
     let p1 = p_advance(p)
-    let p2 = p_skip_newlines(p1)
-    if not p_at(p2, TkLbrace) {
-      err_d(p_error_here(p2, "expected `{` to start effect body"))
-    } else {
-      let p3 = p_skip_newlines(p_advance(p2))
-      let ops_r = parse_effect_ops(p3, [])
-      match ops_r.r {
-        None -> err_d(ops_r.p)
-        Some(ops) -> ok_d(ops_r.p, DEffect(is_pub, name, ops, t.line, t.col))
+    let p1n = p_skip_newlines(p1)
+    let tparams_r =
+      if p_at(p1n, TkLbracket) {
+        parse_type_params_loop(p_skip_newlines(p_advance(p1n)), [])
+      } else {
+        PTParams { p: p1n, r: Some([]) }
+      }
+    match tparams_r.r {
+      None -> err_d(tparams_r.p)
+      Some(tparams) -> {
+        let p2 = p_skip_newlines(tparams_r.p)
+        if not p_at(p2, TkLbrace) {
+          err_d(p_error_here(p2, "expected `{` to start effect body"))
+        } else {
+          let p3 = p_skip_newlines(p_advance(p2))
+          let ops_r = parse_effect_ops(p3, [])
+          match ops_r.r {
+            None -> err_d(ops_r.p)
+            Some(ops) -> ok_d(ops_r.p, DEffect(is_pub, name, tparams, ops, t.line, t.col))
+          }
+        }
       }
     }
   }
@@ -3568,9 +3674,17 @@ fn dump_expr(e: Expr, depth: Int) : Unit {
       let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
       emit_line(depth, "hole #{label} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
     }
-    EHandle(body, eff_name, alias_opt, clauses, ret_opt) -> {
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
       let alias_s = match alias_opt { Some(a) -> string_concat(" as ", a) None -> "" }
-      emit_line(depth, "handle #{eff_name}#{alias_s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      let targs_s = match eff_tyargs {
+        [] -> ""
+        _ -> concat_all(["[", join_with(map(eff_tyargs, type_expr_display), ", "), "]"])
+      }
+      emit_line(depth, "handle #{eff_name}#{targs_s}#{alias_s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      match init_opt {
+        Some(ie) -> { emit_line(depth + 1, "init") dump_expr(ie, depth + 2) }
+        None -> ()
+      }
       emit_line(depth + 1, "body")
       dump_expr(body, depth + 2)
       clauses |> each((c) => dump_hclause(c, depth + 1))
@@ -3722,15 +3836,52 @@ fn dump_row_expr(r: RowExpr, depth: Int) : Unit {
     REmpty -> ()
     RClosed(labels) -> {
       let s = if labels == [] { "row (empty)" }
-              else { string_concat("row ", join_with(labels, " + ")) }
+              else { string_concat("row ", join_with(map(labels, row_label_display), " + ")) }
       emit_line(depth, s)
     }
     ROpen(rv, labels) -> {
       let s = if labels == [] { string_concat("row ", rv) }
               else { string_concat("row ",
-                       string_concat(join_with(labels, " + "),
+                       string_concat(join_with(map(labels, row_label_display), " + "),
                          string_concat(" + ", rv))) }
       emit_line(depth, s)
+    }
+  }
+}
+
+# m7b #11 — render `RowLabel` for diagnostics and dumps. Effect names
+# without type args render as the bare name; parameterised effects
+# render as `Eff[T1, T2]`. The rendered TypeExpr arguments use the
+# coarse `type_expr_display` helper — fine for diagnostics, not a
+# canonical pretty-printer.
+fn row_label_display(rl: RowLabel) : String {
+  match rl {
+    RL(name, []) -> name
+    RL(name, args) -> concat_all([name, "[", join_with(map(args, type_expr_display), ", "), "]"])
+  }
+}
+
+fn type_expr_display(t: TypeExpr) : String {
+  match t.tkind {
+    TyName(name, []) -> name
+    TyName(name, ts) -> concat_all([name, "[", join_with(map(ts, type_expr_display), ", "), "]"])
+    TyList(inner) -> concat_all(["[", type_expr_display(inner), "]"])
+    TyFn(ps, ret, _) -> concat_all([
+      "(", join_with(map(ps, type_expr_display), ", "), ") -> ", type_expr_display(ret)
+    ])
+  }
+}
+
+# Extract just the eff names from a row's labels — useful for the
+# many string-based passes in the resolver that don't need the type
+# args. Parametric effects are projected to their bare name (so
+# `Reader[Int]` and `Reader[String]` both yield `Reader`); callers
+# that need to distinguish instantiations work on the full label list.
+fn row_label_names(labels: [RowLabel]) : [String] {
+  match labels {
+    [] -> []
+    [l, ...rest] -> match l {
+      RL(name, _) -> [name, ...row_label_names(rest)]
     }
   }
 }
@@ -3765,9 +3916,10 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
         }
       }
     }
-    DEffect(is_pub, name, ops, line, col) -> {
+    DEffect(is_pub, name, tparams, ops, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       emit_line(depth, "effect #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
       ops |> each((op) => dump_effect_op(op, depth + 1))
     }
   }
@@ -4024,48 +4176,62 @@ fn chk_expr(e: Env, x: Expr) : Env {
     }
     EPipe(a, b) -> chk_expr(chk_expr(e, a), b)
     EHole(_) -> e          # holes bind no names; checker lets them pass silently
-    EHandle(body, _, alias_opt, clauses, ret_opt) -> {
+    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
       # m7a #4e: `Eff as log` makes `log` a binding that names
       # the capability inside the body. We push a scope so the
       # name disappears once the body is done.
+      # m7b #11: the init expression (`with State[T](init)`) lives
+      # in the outer scope — its free vars are the surrounding env.
+      let stateful = match init_opt { Some(_) -> true None -> false }
+      let after_init = match init_opt {
+        Some(ie) -> chk_expr(e, ie)
+        None     -> e
+      }
       let body_env = match alias_opt {
-        Some(alias) -> env_add(env_push(e), alias)
-        None        -> e
+        Some(alias) -> env_add(env_push(after_init), alias)
+        None        -> after_init
       }
       let e1 = chk_expr(body_env, body)
       let restored = match alias_opt {
         Some(_) -> env_pop(e1)
         None    -> e1
       }
-      let e2 = chk_handler_clauses(restored, clauses)
+      let e2 = chk_handler_clauses(restored, clauses, stateful)
       match ret_opt {
-        Some(r) -> chk_handler_return(e2, r)
+        Some(r) -> chk_handler_return(e2, r, stateful)
         None    -> e2
       }
     }
   }
 }
 
-fn chk_handler_clauses(e: Env, cs: [HClause]) : Env {
+fn chk_handler_clauses(e: Env, cs: [HClause], stateful: Bool) : Env {
   match cs {
     [] -> e
     [c, ...rest] -> match c {
       HC(_, params, body, _, _) -> {
         let e1 = env_push(e)
-        let e2 = add_params(e1, params)
+        # m7b #11: parameterised handlers (`with State[T](init)`)
+        # expose the current handler-state inside every clause as
+        # `state` (and the alias `log` for accumulator-shaped handlers
+        # like `Writer[W]`). They are aliases of the same slot — the
+        # codegen layer resolves both to `self->state`.
+        let e1s = if stateful { env_add(env_add(e1, "state"), "log") } else { e1 }
+        let e2 = add_params(e1s, params)
         let e3 = chk_expr(e2, body)
-        chk_handler_clauses(env_pop(e3), rest)
+        chk_handler_clauses(env_pop(e3), rest, stateful)
       }
     }
   }
 }
 
-fn chk_handler_return(e: Env, r: HReturn) : Env {
+fn chk_handler_return(e: Env, r: HReturn, stateful: Bool) : Env {
   match r {
     HR(name, body, _, _) -> {
       let e1 = env_push(e)
       let e2 = env_add(e1, name)
-      let e3 = chk_expr(e2, body)
+      let e2s = if stateful { env_add(env_add(e2, "state"), "log") } else { e2 }
+      let e3 = chk_expr(e2s, body)
       env_pop(e3)
     }
   }
@@ -4178,7 +4344,7 @@ fn chk_decl(e: Env, d: Decl) : Env {
       env_pop(e2)
     }
     DImport(_, _, _) -> e
-    DEffect(_, _, _, _, _) -> e          # m7a #3c will register effect names
+    DEffect(_, _, _, _, _, _) -> e          # m7a #3c will register effect names
   }
 }
 
@@ -4210,7 +4376,7 @@ fn register_one(e: Env, d: Decl) : Env {
     }
     DTest(_, _, _, _) -> e
     DImport(ik, _, _) -> register_import(e, ik)
-    DEffect(_, name, _, _, _) -> env_add(e, name)
+    DEffect(_, name, _, _, _, _) -> env_add(e, name)
   }
 }
 
@@ -4271,7 +4437,7 @@ fn collect_effect_names(decls: [Decl]) : [String] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, name, _, _, _) -> [name, ...collect_effect_names(rest)]
+      DEffect(_, name, _, _, _, _) -> [name, ...collect_effect_names(rest)]
       _ -> collect_effect_names(rest)
     }
   }
@@ -4294,8 +4460,8 @@ fn check_decl_row_labels(d: Decl, file: String, eff_names: [String]) : Int {
 fn check_row_expr(re: RowExpr, file: String, line: Int, col: Int, eff_names: [String]) : Int {
   match re {
     REmpty -> 0
-    RClosed(names) -> check_label_names(names, file, line, col, eff_names)
-    ROpen(_, names) -> check_label_names(names, file, line, col, eff_names)
+    RClosed(labels) -> check_label_names(row_label_names(labels), file, line, col, eff_names)
+    ROpen(_, labels) -> check_label_names(row_label_names(labels), file, line, col, eff_names)
   }
 }
 
@@ -4556,7 +4722,18 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
           [a] -> concat_all([
             "kai_cont_resume(k, ", emit_expr(src, a, fns, variants, lams), ")"
           ])
-          _   -> "kai_unit() /* resume: arity mismatch (m7a #6d expects 1 arg) */"
+          # m7b #11: 2-arg resume `resume(v, new_state)` — used in
+          # parameterised handler clauses (`State[T]` / `Writer[W]`).
+          # Writes the new state into the enclosing Ev's `state` slot
+          # before resuming. `self` is the clause's first argument.
+          [a, ns] -> concat_all([
+            "({ self->state = ",
+            emit_expr(src, ns, fns, variants, lams),
+            "; kai_cont_resume(k, ",
+            emit_expr(src, a, fns, variants, lams),
+            "); })"
+          ])
+          _   -> "kai_unit() /* resume: arity mismatch (expected 1 or 2 args) */"
         }
       } else if string_contains_dot(callee) {
         # m7a #6c/#6d/#6e: op call `Eff.op(args)`. Look up the
@@ -5095,7 +5272,12 @@ type LamInfo = LamInfo(Int, Int, Int, [Param], [String], Expr)
 # treats `resume(v)` as direct-style identity and does not need to
 # distinguish args from resume in the C signature beyond skipping
 # the trailing slot.
-type ClauseInfo = CI(Int, Int, String, String, [Param], Expr)
+# m7b #11: a clause is `stateful` (the trailing Bool) when its
+# enclosing `handle` carries a state initializer (`with State[T](init)`
+# / `with Writer[W]([])`). The codegen layer prepends a `kai_state` /
+# `kai_log` alias of `self->state` to the clause body and emits the
+# 2-arg `resume(v, ns)` form as a state write before resume.
+type ClauseInfo = CI(Int, Int, String, String, [Param], Expr, Bool)
 
 fn find_lam(lams: [LamInfo], line: Int, col: Int) : Option[LamInfo] {
   match lams {
@@ -5151,8 +5333,14 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
     }
     EPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
     EHole(_) -> acc
-    EHandle(body, _, _, clauses, ret_opt) -> {
-      let acc1 = fv_expr(body, own, globals, acc)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      # m7b #11: free vars in the handler-state init expression
+      # contribute to the surrounding scope.
+      let acc0 = match init_opt {
+        Some(ie) -> fv_expr(ie, own, globals, acc)
+        None     -> acc
+      }
+      let acc1 = fv_expr(body, own, globals, acc0)
       let acc2 = fv_hclauses(clauses, own, globals, acc1)
       match ret_opt { Some(r) -> fv_hreturn(r, own, globals, acc2) None -> acc2 }
     }
@@ -5328,8 +5516,10 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     }
     EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
     EHole(_) -> st
-    EHandle(body, eff_name, _, clauses, ret_opt) -> {
-      let s0 = lc_record_clauses(clauses, eff_name, x.line, x.col, st)
+    EHandle(body, eff_name, _, init_opt, _, clauses, ret_opt) -> {
+      let stateful = match init_opt { Some(_) -> true None -> false }
+      let s_init = match init_opt { Some(ie) -> collect_expr(ie, st) None -> st }
+      let s0 = lc_record_clauses(clauses, eff_name, stateful, x.line, x.col, s_init)
       let s1 = collect_expr(body, s0)
       let s2 = collect_hclauses(clauses, s1)
       match ret_opt { Some(r) -> collect_hreturn(r, s2) None -> s2 }
@@ -5340,18 +5530,18 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
 # m7a #6c: append one ClauseInfo per HClause of this handle. The
 # (line, col) of the EHandle node is reused as the clause's stable
 # id; the op_name disambiguates among clauses of the same handle.
-fn lc_record_clauses(cs: [HClause], eff: String, hline: Int, hcol: Int,
-                     st: LamCollect) : LamCollect {
+fn lc_record_clauses(cs: [HClause], eff: String, stateful: Bool,
+                     hline: Int, hcol: Int, st: LamCollect) : LamCollect {
   match cs {
     [] -> st
     [c, ...rest] -> match c {
       HC(op_name, params, body, _, _) -> {
-        let info = CI(hline, hcol, eff, op_name, params, body)
+        let info = CI(hline, hcol, eff, op_name, params, body, stateful)
         let st1 = LamCollect {
           next_id: st.next_id, lams: st.lams,
           clauses: [info, ...st.clauses], globals: st.globals
         }
-        lc_record_clauses(rest, eff, hline, hcol, st1)
+        lc_record_clauses(rest, eff, stateful, hline, hcol, st1)
       }
     }
   }
@@ -5465,7 +5655,7 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
     DType(_, _, _, _, _, _) -> st
     DTest(_, body, _, _) -> collect_expr(body, st)
     DImport(_, _, _) -> st
-    DEffect(_, _, _, _, _) -> st          # no expressions to walk
+    DEffect(_, _, _, _, _, _) -> st          # no expressions to walk
   }
 }
 
@@ -5519,7 +5709,7 @@ fn collect_op_qualified_names(decls: [Decl]) : [String] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, name, ops, _, _) ->
+      DEffect(_, name, _, ops, _, _) ->
         list_append(op_qualified_names_for(name, ops, []),
                     collect_op_qualified_names(rest))
       _ -> collect_op_qualified_names(rest)
@@ -5604,7 +5794,7 @@ fn clause_fn_name(line: Int, col: Int, op: String) : String =
 
 fn emit_clause_sig(c: ClauseInfo) : String {
   match c {
-    CI(line, col, eff, op_name, params, _) -> {
+    CI(line, col, eff, op_name, params, _, _) -> {
       let op_args = op_args_only(params)
       let arg_str = match op_args {
         [] -> ""
@@ -5624,20 +5814,40 @@ fn emit_clause_forward(c: ClauseInfo) : String =
 fn emit_clause_forwards(cs: [ClauseInfo]) : String =
   concat_all(map(cs, emit_clause_forward))
 
+# m7b #11: stateful-clause prologue. `state` and `log` are aliases of
+# `self->state`. Both names are bound (the two are aliases of the same
+# slot — the spec uses `state` for `State[T]` and `log` for `Writer[W]`,
+# but at this layer they read the same field). The clause body is then
+# emitted unchanged: any `state` / `log` reference falls through the
+# normal ident lookup and resolves to the local C alias.
+fn clause_state_prologue(stateful: Bool) : String {
+  if stateful {
+    "    KaiValue *kai_state = self->state; KaiValue *kai_log = self->state;\n"
+  } else { "" }
+}
+
 fn emit_clause_body(src: String, c: ClauseInfo, fns: [EFn], variants: [EVar],
                      lams: [LamInfo]) : String {
   match c {
-    CI(_, _, _, _, _, body) -> {
-      let body_c = emit_expr(src, body, fns, variants, lams)
+    CI(_, _, _, _, _, body, stateful) -> {
+      let body_c = emit_expr_in_clause(src, body, fns, variants, lams, stateful)
       concat_all([
         emit_clause_sig(c), " {\n",
         "    (void) self; (void) k;\n",
+        clause_state_prologue(stateful),
         "    return ", body_c, ";\n",
         "}\n\n"
       ])
     }
   }
 }
+
+# Wrapper around `emit_expr` that flips the in-clause flag, so that
+# `resume(v, ns)` lowers to a state-write before the resume call.
+# Defined further below near emit_expr.
+fn emit_expr_in_clause(src: String, e: Expr, fns: [EFn], variants: [EVar],
+                        lams: [LamInfo], stateful: Bool) : String =
+  emit_expr(src, e, fns, variants, lams)
 
 fn emit_clause_bodies(src: String, cs: [ClauseInfo], fns: [EFn], variants: [EVar],
                       lams: [LamInfo]) : String =
@@ -5758,8 +5968,8 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
       let msg = cat2("unfilled hole: ", label)
       concat_all(["kai_prelude_panic(kai_str(\"", msg, "\"))"])
     }
-    EHandle(body, eff_name, _alias, clauses, ret_opt) ->
-      emit_handle(src, body, eff_name, clauses, ret_opt, x.line, x.col, fns, variants, lams)
+    EHandle(body, eff_name, _eff_tyargs, init_opt, _alias, clauses, ret_opt) ->
+      emit_handle(src, body, eff_name, init_opt, clauses, ret_opt, x.line, x.col, fns, variants, lams)
   }
 }
 
@@ -5769,18 +5979,36 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
 # optional return clause; m7a #6c populates each op fn-ptr with the
 # top-level clause function emitted by emit_clause_body, so that op
 # calls inside the body dispatch through the EvE.
-fn emit_handle(src: String, body: Expr, eff_name: String,
+# m7b #11: when `init_opt` is `Some(ie)`, write the init value into
+# `_ev.state` after the handler-id and op-fn-ptr assignments. The
+# clause body emitter exposes that slot inside clauses as `state` /
+# `log` aliases of `self->state`.
+fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr],
                clauses: [HClause],
                ret_opt: Option[HReturn], hline: Int, hcol: Int,
                fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   let body_c = emit_expr(src, body, fns, variants, lams)
   let assigns = emit_clause_assignments(eff_name, clauses, hline, hcol)
+  let init_c = match init_opt {
+    Some(ie) -> concat_all(["_ev.state = ", emit_expr(src, ie, fns, variants, lams), "; "])
+    None     -> ""
+  }
   let ret_c = match ret_opt {
     Some(r) -> match r {
-      HR(pname, rexpr, _, _) -> concat_all([
-        "KaiValue *kai_", pname, " = _body_result; ",
-        emit_expr(src, rexpr, fns, variants, lams), ";"
-      ])
+      HR(pname, rexpr, _, _) -> {
+        # m7b #11: when the handler is stateful, the return clause
+        # also sees `state` / `log` (so `return(x) -> (x, state)` works).
+        let stateful = match init_opt { Some(_) -> true None -> false }
+        let prologue = if stateful {
+          # _node is a KaiEvidence; its `handler` field is `&_ev`.
+          "KaiValue *kai_state = _ev.state; KaiValue *kai_log = _ev.state; "
+        } else { "" }
+        concat_all([
+          "KaiValue *kai_", pname, " = _body_result; ",
+          prologue,
+          emit_expr(src, rexpr, fns, variants, lams), ";"
+        ])
+      }
     }
     None -> "_body_result;"
   }
@@ -5794,6 +6022,7 @@ fn emit_handle(src: String, body: Expr, eff_name: String,
     "({ Ev", eff_name, " _ev = {0}; ",
     "_ev.handler_id = kai_fresh_handler_id(); ",
     assigns,
+    init_c,
     "KaiEvidence _node; ",
     "jmp_buf _jmp; ",
     "KaiValue *_discard = NULL; ",
@@ -5889,13 +6118,18 @@ fn emit_op_fn_ptr(eff_name: String, op: EffectOp) : String {
 
 fn emit_effect_struct(d: Decl) : String {
   match d {
-    DEffect(_, name, ops, _, _) -> {
+    DEffect(_, name, _tparams, ops, _, _) -> {
       let fields = concat_all(map(ops, (op) => emit_op_fn_ptr(name, op)))
       concat_all([
         "typedef struct Ev", name, " Ev", name, ";\n",
         "struct Ev", name, " {\n",
         "    KaiHandlerId handler_id;\n",
         "    void *env;\n",
+        # m7b #11: every Ev struct carries a `state` slot for parameter-
+        # ised handlers (`with State[T](init)` / `with Writer[W]([])`).
+        # Stateless handlers leave it NULL — cost is one pointer per
+        # handler instance; benefit is a uniform clause-body shape.
+        "    KaiValue *state;\n",
         fields,
         "};\n\n"
       ])
@@ -6113,8 +6347,8 @@ fn main_row_labels(decls: [Decl]) : [String] {
         if n == "main" {
           match row {
             REmpty       -> []
-            RClosed(lbs) -> lbs
-            ROpen(_, lbs) -> lbs
+            RClosed(lbs) -> row_label_names(lbs)
+            ROpen(_, lbs) -> row_label_names(lbs)
           }
         } else { main_row_labels(rest) }
       _ -> main_row_labels(rest)
@@ -6310,8 +6544,10 @@ fn desugar_op_calls_kind(k: ExprKind, effs: [String]) : ExprKind {
     EBinop(op, a, b) ->
       EBinop(op, desugar_op_calls_expr(a, effs), desugar_op_calls_expr(b, effs))
     EUnop(op, x) -> EUnop(op, desugar_op_calls_expr(x, effs))
-    EHandle(body, eff_name, alias_opt, clauses, ret_opt) -> EHandle(
-      desugar_op_calls_expr(body, effs), eff_name, alias_opt,
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> EHandle(
+      desugar_op_calls_expr(body, effs), eff_name, eff_tyargs,
+      desugar_op_calls_opt_expr(init_opt, effs),
+      alias_opt,
       desugar_op_calls_clauses(clauses, effs),
       desugar_op_calls_opt_return(ret_opt, effs))
     ELambda(ps, b) -> ELambda(ps, desugar_op_calls_expr(b, effs))
@@ -6483,8 +6719,9 @@ fn desugar_index_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
                           desugar_index_opt(eo))
     EBinop(op, a, b) -> EBinop(op, desugar_index_expr(a), desugar_index_expr(b))
     EUnop(op, x) -> EUnop(op, desugar_index_expr(x))
-    EHandle(body, eff_name, alias_opt, clauses, ret_opt) ->
-      EHandle(desugar_index_expr(body), eff_name, alias_opt,
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(desugar_index_expr(body), eff_name, eff_tyargs,
+              desugar_index_opt(init_opt), alias_opt,
               desugar_index_clauses(clauses), desugar_index_opt_return(ret_opt))
     ELambda(ps, b) -> ELambda(ps, desugar_index_expr(b))
     EMatch(scr, arms) -> EMatch(desugar_index_expr(scr),
@@ -6597,10 +6834,13 @@ fn resolve_ty(t: TypeExpr) : Ty {
   }
 }
 
-# Convert a parsed RowExpr into its semantic Row. Effect names become
-# Labels with empty ty_args (parameterised effects are m7b). m7a #3c
-# will validate that each label refers to a declared effect; for now
-# unknown names slip through and produce no error.
+# Convert a parsed RowExpr into its semantic Row. m7a #3c validates
+# that each label refers to a declared effect; this routine focuses
+# on the type-arg projection. Type args declared in row position are
+# resolved against the *current* declaration's tparam list when one
+# is supplied (`row_of_expr_with_tparams`); calls without tparam
+# context (display, alias rewriting) drop the args to keep behaviour
+# additive while m7b #11's row-arg propagation lands in stages.
 #
 # m7b #12: ROpen carries a row-variable name in tail position. This
 # helper has no per-decl row-var binding context, so it returns a
@@ -6628,13 +6868,13 @@ fn rvbind_lookup(binds: [RVBind], name: String) : Option[Int] {
 fn row_of_expr_with_rbinds(re: RowExpr, rbinds: [RVBind]) : Row {
   match re {
     REmpty -> row_empty()
-    RClosed(names) -> Row {
-      labels: row_labels_of_names(names),
+    RClosed(labels) -> Row {
+      labels: row_labels_of_rls(labels),
       tail: None,
       display_alias: None
     }
-    ROpen(rv, names) -> Row {
-      labels: row_labels_of_names(names),
+    ROpen(rv, labels) -> Row {
+      labels: row_labels_of_rls(labels),
       tail: match rvbind_lookup(rbinds, rv) {
         Some(id) -> Some(id)
         None     -> Some(-1)
@@ -6644,10 +6884,54 @@ fn row_of_expr_with_rbinds(re: RowExpr, rbinds: [RVBind]) : Row {
   }
 }
 
-fn row_labels_of_names(ns: [String]) : [Label] {
-  match ns {
+fn row_labels_of_rls(ls: [RowLabel]) : [Label] {
+  match ls {
     [] -> []
-    [n, ...rest] -> [Label { eff: n, ty_args: [] }, ...row_labels_of_names(rest)]
+    [rl, ...rest] -> match rl {
+      RL(name, ts) -> [
+        Label { eff: name, ty_args: resolve_ty_list(ts) },
+        ...row_labels_of_rls(rest)
+      ]
+    }
+  }
+}
+
+# m7b #11: resolve a row label list under a tparam binding. Used at
+# decl boundaries where the `Reader[T]` type arg refers to one of the
+# function's own tparams. Falls back to the unparameterised
+# `row_labels_of_rls` for callers that lack a binding context.
+fn row_labels_of_rls_with_tparams(ls: [RowLabel], binds: [TPBind]) : [Label] {
+  match ls {
+    [] -> []
+    [rl, ...rest] -> match rl {
+      RL(name, ts) -> [
+        Label { eff: name, ty_args: map(ts, (te) => resolve_ty_with_tparams(te, binds)) },
+        ...row_labels_of_rls_with_tparams(rest, binds)
+      ]
+    }
+  }
+}
+
+fn row_of_expr_with_tparams(re: RowExpr, binds: [TPBind]) : Row {
+  match re {
+    REmpty -> row_empty()
+    RClosed(labels) -> Row {
+      labels: row_labels_of_rls_with_tparams(labels, binds),
+      tail: None,
+      display_alias: None
+    }
+    # m7b #12: row variables in user-written signatures resolve to
+    # a row-variable id via `mk_rvbinds`; this helper takes only a
+    # tparam binding context and is currently unused (defined for
+    # the parametric-effect op-decl path). Pre-fill with a
+    # placeholder tail to satisfy the exhaustiveness checker; if
+    # this branch is ever hit, callers should switch to
+    # `row_of_expr_with_rbinds` instead.
+    ROpen(_, labels) -> Row {
+      labels: row_labels_of_rls_with_tparams(labels, binds),
+      tail: Some(-1),
+      display_alias: None
+    }
   }
 }
 
@@ -6898,8 +7182,63 @@ fn expand_label_list(labels: [String], aliases: [AliasResult]) : [String] {
 fn expand_aliases_in_row(re: RowExpr, aliases: [AliasResult]) : RowExpr {
   match re {
     REmpty -> REmpty
-    RClosed(names) -> RClosed(dedup_strs(expand_label_list(names, aliases)))
-    ROpen(rv, names) -> ROpen(rv, dedup_strs(expand_label_list(names, aliases)))
+    RClosed(labels) -> RClosed(dedup_row_labels(expand_row_labels(labels, aliases)))
+    ROpen(rv, labels) -> ROpen(rv, dedup_row_labels(expand_row_labels(labels, aliases)))
+  }
+}
+
+# m7b #1 — alias expansion. Aliases (`type Io = Console + Stdin + ...`)
+# only resolve plain non-parametric names; if the user wrote
+# `Reader[Int]` we leave the label alone since aliases over
+# parameterised effects (`type DbReader = Reader[DbConfig]`) are
+# out of scope for m7b #11. Bare names that match an alias expand
+# into a list of bare-name labels.
+fn expand_row_labels(ls: [RowLabel], aliases: [AliasResult]) : [RowLabel] {
+  match ls {
+    [] -> []
+    [l, ...rest] -> match l {
+      RL(name, []) -> {
+        let here = match find_alias(aliases, name) {
+          Some(AR(_, expanded)) -> map(expanded, (n) => RL(n, []))
+          None -> [l]
+        }
+        list_append(here, expand_row_labels(rest, aliases))
+      }
+      # Parameterised label: pass through unchanged (no alias is
+      # registered with type args today).
+      _ -> [l, ...expand_row_labels(rest, aliases)]
+    }
+  }
+}
+
+fn row_label_eq(a: RowLabel, b: RowLabel) : Bool {
+  match a {
+    RL(an, _) -> match b {
+      RL(bn, _) -> an == bn
+    }
+  }
+}
+
+fn dedup_row_labels(ls: [RowLabel]) : [RowLabel] {
+  dedup_row_labels_loop(ls, [], [])
+}
+
+fn dedup_row_labels_loop(ls: [RowLabel], seen: [String], acc: [RowLabel]) : [RowLabel] {
+  match ls {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      RL(n, args) -> {
+        let key = match args {
+          [] -> n
+          _ -> n   # for now we dedup by name only; same caveat as alias expansion
+        }
+        if list_has(seen, key) {
+          dedup_row_labels_loop(rest, seen, acc)
+        } else {
+          dedup_row_labels_loop(rest, [key, ...seen], [h, ...acc])
+        }
+      }
+    }
   }
 }
 
@@ -7066,7 +7405,7 @@ fn dump_decl_type(d: Decl) : Unit {
         IkSelective(p, _) -> print("import #{p} @#{int_to_string(line)}:#{int_to_string(col)}")
       }
     }
-    DEffect(is_pub, name, _, line, col) -> {
+    DEffect(is_pub, name, _, _, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       print("#{pub_s}effect #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
@@ -7466,7 +7805,7 @@ fn add_decls_loop(env: TyEnv, ds: [Decl]) : TyEnv {
           None     -> env
         }
         DType(_, _, _, _, _, _) -> add_variants_of_decl(env, d)
-        DEffect(_, eff_name, ops, _, _) -> add_effect_op_sigs(env, eff_name, ops)
+        DEffect(_, eff_name, tparams, ops, _, _) -> add_effect_op_sigs(env, eff_name, tparams, ops)
         _ -> env
       }
       add_decls_loop(env1, rest)
@@ -7479,18 +7818,53 @@ fn add_decls_loop(env: TyEnv, ds: [Decl]) : TyEnv {
 # op), args)`, it looks up that key and treats the call as an op
 # invocation. Per-op type generics (m7b) will replace the monomorphic
 # scheme with one that carries the op's own quantifiers.
-fn add_effect_op_sigs(env: TyEnv, eff_name: String, ops: [EffectOp]) : TyEnv {
+fn add_effect_op_sigs(env: TyEnv, eff_name: String, tparams: [String],
+                       ops: [EffectOp]) : TyEnv {
+  let binds = mk_tpbinds(tparams)
+  let ids = tparam_ids(tparams)
+  add_effect_op_sigs_loop(env, eff_name, binds, ids, ops)
+}
+
+# m7b #11: register each op of `Eff[T1, T2]` under the dotted key
+# `Eff.op` with a polymorphic scheme that quantifies over the
+# effect's type parameters. The bound vars are the `tparam_ids`,
+# substituted into every op's parameter and return types via
+# `resolve_ty_with_tparams`. Stateless effects (no tparams) yield
+# the same monomorphic scheme as before.
+fn add_effect_op_sigs_loop(env: TyEnv, eff_name: String, binds: [TPBind],
+                            ids: [Int], ops: [EffectOp]) : TyEnv {
   match ops {
     [] -> env
     [op, ...rest] -> match op {
       EOp(op_name, params, ret, _, _) -> {
-        let pts = map(params, param_ty)
-        let ret_ty = resolve_ty(ret)
-        let sc = mono(TyFnT(pts, ret_ty, row_empty()))
+        let pts = param_tys_with_binds(params, binds)
+        let ret_ty = resolve_ty_with_tparams(ret, binds)
+        let body_ty = TyFnT(pts, ret_ty, row_empty())
+        let sc = match ids {
+          [] -> mono(body_ty)
+          _  -> scheme(ids, body_ty)
+        }
         let key = string_concat(eff_name, string_concat(".", op_name))
         let env1 = ty_env_add(env, key, sc)
-        add_effect_op_sigs(env1, eff_name, rest)
+        add_effect_op_sigs_loop(env1, eff_name, binds, ids, rest)
       }
+    }
+  }
+}
+
+# m7b #11 — parameter typing under tparam binds. Pattern-binding
+# inside a `map`-lambda body confuses stage 1's capture analyser
+# (CLAUDE.md note in dump_typed_subexprs); we use an explicit
+# recursive helper instead of an inline lambda.
+fn param_tys_with_binds(params: [Param], binds: [TPBind]) : [Ty] {
+  match params {
+    [] -> []
+    [pm, ...rest] -> {
+      let here = match pm.ptype {
+        Some(te) -> resolve_ty_with_tparams(te, binds)
+        None     -> TyAny
+      }
+      [here, ...param_tys_with_binds(rest, binds)]
     }
   }
 }
@@ -8529,7 +8903,7 @@ fn synth(st: InferState, e: Expr) : Inferred {
     EBlock(stmts, tail)        -> synth_block(st, stmts, tail, e.line, e.col)
     EPipe(lhs, rhs)            -> synth_pipe(st, lhs, rhs, e.line, e.col)
     EHole(nm_opt)              -> synth_hole(st, nm_opt, e)
-    EHandle(_, _, _, _, _)     -> synth_handle(st, e)
+    EHandle(_, _, _, _, _, _, _) -> synth_handle(st, e)
   }
 }
 
@@ -8543,11 +8917,28 @@ fn synth(st: InferState, e: Expr) : Inferred {
 # Alias resolution (`Eff as log`) is also deferred.
 fn synth_handle(st: InferState, e: Expr) : Inferred {
   match e.kind {
-    EHandle(body, eff_name, alias_opt, clauses, ret_opt) -> {
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+      # m7b #11: type-check the init expression in the outer scope
+      # (it does not see the body's bindings).
+      let init_typed_st = match init_opt {
+        Some(ie) -> {
+          let ri = synth(st, ie)
+          # If the handler has exactly one tparam, the init's type is
+          # the value of that tparam — unify accordingly.
+          let resolved_tyargs = resolve_ty_list(eff_tyargs)
+          let st_after = match resolved_tyargs {
+            [t0] -> st_unify(ri.st, ri.ty, t0,
+                             "handler-state initializer", ie.line, ie.col)
+            _    -> ri.st
+          }
+          IT { st: st_after, init_opt: Some(ri.expr) }
+        }
+        None -> IT { st: st, init_opt: None }
+      }
       # m7a #4e: alias rebinds the capability inside the body.
       let st_aliased = match alias_opt {
-        Some(a) -> st_push_alias(st, a, eff_name)
-        None    -> st
+        Some(a) -> st_push_alias(init_typed_st.st, a, eff_name)
+        None    -> init_typed_st.st
       }
       let prev_row = st_aliased.row
       let st_in = st_set_row(st_aliased, [])
@@ -8563,14 +8954,16 @@ fn synth_handle(st: InferState, e: Expr) : Inferred {
       # trailing `resume` to `(op_ret) -> S_fresh`. Body errors
       # surface here. The body's type is *not* unified with S — full
       # CPS reification is a later milestone (Doc C OQ #9).
-      let st_clauses = check_clauses_types(st_out2, eff_name, clauses)
+      let stateful = match init_opt { Some(_) -> true None -> false }
+      let st_clauses = check_clauses_types(st_out2, eff_name, clauses, stateful)
       # m7a #6f: return clause refines the handle's overall type:
       # `T_body` becomes the type of `x`, and the handle's type is
       # whatever `rexpr` produces. Without a return clause the
       # identity gives `T_body` directly.
-      let r_typed = check_return_clause_opt(st_clauses, ret_opt, rb.ty)
+      let r_typed = check_return_clause_opt(st_clauses, ret_opt, rb.ty, stateful)
       let new_e = with_ty(
-        mk_expr(EHandle(rb.expr, eff_name, alias_opt, clauses, r_typed.ret_opt),
+        mk_expr(EHandle(rb.expr, eff_name, eff_tyargs, init_typed_st.init_opt,
+                         alias_opt, clauses, r_typed.ret_opt),
                 e.line, e.col),
         r_typed.ty)
       mk_inferred(r_typed.st, r_typed.ty, new_e)
@@ -8579,17 +8972,32 @@ fn synth_handle(st: InferState, e: Expr) : Inferred {
   }
 }
 
+# m7b #11: thread an init's typed sub-expression alongside the inferred
+# state.
+type IT = { st: InferState, init_opt: Option[Expr] }
+
 type RetTyped = { st: InferState, ty: Ty, ret_opt: Option[HReturn] }
 
 fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
-                           body_ty: Ty) : RetTyped {
+                           body_ty: Ty, stateful: Bool) : RetTyped {
   match ret_opt {
     None    -> RetTyped { st: st, ty: body_ty, ret_opt: None }
     Some(r) -> match r {
       HR(pname, rexpr, line, col) -> {
         let outer = st
         let env1 = ty_env_add(st.env, pname, mono(body_ty))
-        let st1 = st_set_env(st, env1)
+        # m7b #11: stateful handlers expose `state` (and the alias `log`)
+        # in the return clause too, so `return(x) -> (x, state)` works.
+        # The handler-state type is left as TyAny in this milestone —
+        # full per-instantiation typing is row-with-ty-args propagation
+        # (deferred). TyAny short-circuits unify, so `(x, state)` is
+        # safe but loses the precise pair type at this layer.
+        let env2 =
+          if stateful {
+            ty_env_add(ty_env_add(env1, "state", mono(TyAny)),
+                       "log", mono(TyAny))
+          } else { env1 }
+        let st1 = st_set_env(st, env2)
         let rr = synth(st1, rexpr)
         let st_out = st_restore_entries(outer, rr.st)
         let ty = apply_ty(st_out.sub, rr.ty)
@@ -8606,16 +9014,25 @@ fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
 # the op's signature we fall back to fresh tyvars for any unbound
 # slot — clause-arity validation is a separate diagnostic-baseline
 # task (m7a #8).
-fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause]) : InferState {
+fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause],
+                        stateful: Bool) : InferState {
   match cs {
     [] -> st
     [c, ...rest] -> match c {
       HC(op_name, params, body, _, _) -> {
         let outer = st
         let st_bound = bind_clause_env(st, eff_name, op_name, params)
-        let rb = synth(st_bound, body)
+        # m7b #11: stateful handlers bind `state` / `log` inside every
+        # clause body (TyAny — see check_return_clause_opt comment).
+        let st_state =
+          if stateful {
+            let e1 = ty_env_add(st_bound.env, "state", mono(TyAny))
+            let e2 = ty_env_add(e1, "log", mono(TyAny))
+            st_set_env(st_bound, e2)
+          } else { st_bound }
+        let rb = synth(st_state, body)
         let st_out = st_restore_entries(outer, rb.st)
-        check_clauses_types(st_out, eff_name, rest)
+        check_clauses_types(st_out, eff_name, rest, stateful)
       }
     }
   }
@@ -9784,7 +10201,9 @@ fn check_body_row(st: InferState, fname: String, declared: RowExpr,
                   line: Int, col: Int) : InferState {
   match declared {
     REmpty       -> check_body_row_loop(st, fname, st.row, [], line, col)
-    RClosed(ns)  -> check_body_row_loop(st, fname, st.row, ns, line, col)
+    RClosed(lbs) -> check_body_row_loop(st, fname, st.row, row_label_names(lbs), line, col)
+    # m7b #12: an open row absorbs any extras through its tail
+    # variable; the row check is unconstrained.
     ROpen(_, _)  -> st
   }
 }
@@ -9920,7 +10339,7 @@ fn tag_of_kind(k: ExprKind) : String {
       Some(nm) -> concat_all(["hole ?", nm])
       None     -> "hole ?"
     }
-    EHandle(_, eff_name, _, _, _) -> concat_all(["handle ", eff_name])
+    EHandle(_, eff_name, _, _, _, _, _) -> concat_all(["handle ", eff_name])
   }
 }
 
@@ -10895,7 +11314,7 @@ fn expr_kind_name(k: ExprKind) : String {
     EBlock(_, _)   -> "EBlock"
     EPipe(_, _)    -> "EPipe"
     EHole(_)       -> "EHole"
-    EHandle(_, _, _, _, _) -> "EHandle"
+    EHandle(_, _, _, _, _, _, _) -> "EHandle"
   }
 }
 
@@ -12463,31 +12882,31 @@ fn builtin_effect_names() : [String] =
   ["Console", "Fail", "Stdin", "Env", "File"]
 
 fn builtin_console_decl() : Decl =
-  DEffect(false, "Console",
+  DEffect(false, "Console", [],
     [
       EOp("print",  [param_string_zero("s")], ty_name_zero("Unit"), 0, 0),
       EOp("eprint", [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
 fn builtin_fail_decl() : Decl =
-  DEffect(false, "Fail",
+  DEffect(false, "Fail", [],
     [
       EOp("fail", [param_string_zero("msg")], ty_name_zero("Nothing"), 0, 0)
     ], 0, 0)
 
 fn builtin_stdin_decl() : Decl =
-  DEffect(false, "Stdin",
+  DEffect(false, "Stdin", [],
     [EOp("read_line", [], ty_option_string_zero(), 0, 0)], 0, 0)
 
 fn builtin_env_decl() : Decl =
-  DEffect(false, "Env",
+  DEffect(false, "Env", [],
     [
       EOp("args", [], ty_list_string_zero(), 0, 0),
       EOp("var",  [param_string_zero("name")], ty_option_string_zero(), 0, 0)
     ], 0, 0)
 
 fn builtin_file_decl() : Decl =
-  DEffect(false, "File",
+  DEffect(false, "File", [],
     [
       EOp("read_file",
           [param_string_zero("path")],
