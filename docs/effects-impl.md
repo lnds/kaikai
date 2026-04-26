@@ -1738,38 +1738,33 @@ page the way they are written.
     bodies. Verified end-to-end with `m7b_14_state_helper.kai`,
     `m7b_14_reader_helper.kai`, `m7b_14_writer_helper.kai`.
     **Landed.**
-15. **Per-instance handler dispatch** — runtime now exposes
-    `kai_evidence_lookup_node_by_id(KaiHandlerId)` as the
-    primitive an alias-aware op-call site would use. The
-    surrounding compiler integration is **deferred**: a
-    2026-04-26 spike confirmed that tagging op names with
-    `@<alias>` after the alias rewrite (so `cap.get` becomes
-    `EVar("State.get@a")` after `desugar_op_calls`) breaks at
-    several layers — the magic char leaks into closure-capture
-    variable names (`KaiValue *kai_State.get@a = ...` is invalid
-    C), the free-var collector treats the tagged identifier as
-    a stray reference, and the lambda emit path has no way to
-    capture the enclosing handle's `kai_alias_<a>_id` into the
-    closure. The clean shape requires:
-
-    - a new `EOpCallByAlias(eff, op, alias, args)` AST node so
-      the alias does not pollute the var-name namespace;
-    - the lambda-capture pass to recognise that node and add
-      the relevant `kai_alias_<a>_id` to the closure's capture
-      array (separate from the value captures);
-    - codegen for the new node that loads the captured id and
-      calls `lookup_node_by_id`.
-
-    That is its own milestone-sized change. For now the
-    mitigation is m7b #16: the common case (`var x = init` with
-    no escape) lowers to a stack slot and never touches the
-    handler stack; the bug only surfaces when two `var`s of
-    the same `Eff[T]` are both captured by an enclosing
-    closure, which the desugar declines to specialise. The
-    runtime helper is left in stage0/runtime.h so the future
-    PR can wire it up without touching the runtime again.
-    *Pending — runtime primitive landed; compiler integration
-    deferred.*
+15. **Per-instance handler dispatch** — runtime exposes
+    `kai_evidence_lookup_node_by_id(KaiHandlerId)`; the
+    compiler now uses it for op calls that share the handle's
+    lexical scope (no intervening closure). Mechanism: the
+    alias rewrite tags op names with `@<alias>`, the
+    inferencer's alias-fallback in `try_op_call` does the same
+    (its op-call rewrite runs before `rewrite_alias_decls`,
+    via `synth_op_call_with_scheme_keys` which separates the
+    type-lookup key from the dispatch key), `emit_handle`
+    binds the local `kai_alias_<a>_id` next to the handle
+    prologue, and `emit_call_expr` routes tagged callees
+    through `kai_evidence_lookup_node_by_id`. Both the
+    rewrite-pass `AliasMap` (per-map `may_tag` Bool) and the
+    inferencer's `aliases` stack (per-binding `Bool taggable`)
+    flip taggability off when descending into a lambda body —
+    the handle's `kai_alias_<a>_id` C local is not in scope
+    across the lambda boundary, so the tagged dispatch would
+    emit invalid C. Inside a lambda the substitution
+    `cap.op` → `Eff.op` still runs and the legacy
+    `kai_evidence_lookup_node("Eff")` keeps the closure
+    capturing path compiling. Verified end-to-end with
+    `m7b_15_nested_alias.kai` (two `with State[Int]` handlers
+    both `as`-bound; `outer.set` from inside the inner body
+    routes to the outer node, `inner.get` to the inner). The
+    LLVM dispatcher strips the alias tag at lookup time;
+    per-instance dispatch on the LLVM backend stays a
+    follow-up. **Landed (scope-limited).**
 16. **Variable specialisation pass** — landed in the m7b #5b
     var-desugar itself. When the four trigger conditions hold
     (canonical handler shape — always true; no multi-shot resume
@@ -1852,34 +1847,94 @@ most user-visible diagnostics that were below the §8 bar.
 (scheduled as a dedicated mini-milestone — see *Scheduled
 follow-up: #15 compiler integration* below).
 
-### Scheduled follow-up: #15 compiler integration
+### m7b #15 — Compiler integration (scope-limited). Landed.
 
-Per-instance handler dispatch needs the runtime primitive
-(landed) **plus** these compiler changes, as a single
-mini-milestone:
+Per-instance handler dispatch on the C backend, sized to fix
+the innermost-wins bug for op-call sites that share the
+handle's lexical scope. The closure-captured case keeps the
+legacy name-keyed lookup; the proper fix lives in the
+follow-up below.
 
-1. **New AST node `EOpCallByAlias(eff, op, alias, args)`** so the
-   alias name does not pollute the var-name namespace
-   (`State.get@a` is invalid C as a captured-var identifier).
-2. **Lambda-capture pass** recognises the new node and adds the
-   relevant `kai_alias_<a>_id` to the closure's capture array,
-   separate from the value captures (handler ids are scalar
-   `KaiHandlerId`, not `KaiValue *`).
-3. **Codegen for the new node** loads the captured id and calls
-   `kai_evidence_lookup_node_by_id` (already in stage0/runtime.h).
-4. **Two new fixtures** under `examples/effects/`:
-   - `m7b_15_nested_var_outer_reachable` — two `var`s of the same
-     `State[Int]` with both captured by an enclosing closure;
-     the closure must read the outer cell, not the inner.
+**Mechanism.**
+
+1. **Alias rewrite tags op names with `@<alias>`.**
+   `rewrite_alias_kind`'s `EField` branch already substitutes
+   `cap.op` → `Eff.op` when `cap` is in the alias map; it now
+   also appends `@<alias>` so downstream emit can route the
+   dispatch via the handle's `kai_alias_<a>_id` C local. The
+   tag is suppressed when the rewrite is descending into a
+   closure (the local is out of scope) — the rewrite-pass
+   `AliasMap` carries a per-map `may_tag` Bool that is cleared
+   when entering an `ELambda` body.
+2. **Inferencer's alias-fallback also tags.** `try_op_call`
+   sees `EField(EVar("cap"), "op")` before the alias rewrite
+   runs (inference precedes `emit_program`); when the fallback
+   resolves `cap → Eff` it now passes a separate `dispatch_key`
+   into `synth_op_call_with_scheme_keys`. Type-level lookups
+   (`op_eff_arities`, row label) keep using the bare key. The
+   alias stack stores a per-binding `Bool taggable`;
+   `synth_lambda` flips every visible alias to `taggable=false`
+   before walking the body and the standard `st_restore_entries`
+   snapshot puts them back afterwards.
+3. **`emit_handle` exposes `kai_alias_<a>_id`** as a local
+   right after `_ev.handler_id` is assigned, so it lives in
+   the same statement-expression as every op-call site inside
+   `body_c`.
+4. **`emit_call_expr` splits the callee on `@`.** Tagged ops
+   emit `kai_evidence_lookup_node_by_id(kai_alias_<a>_id)`;
+   bare ops keep the legacy
+   `kai_evidence_lookup_node("Eff")`. The LLVM emitter strips
+   the tag at lookup time — per-instance dispatch on the LLVM
+   backend stays a follow-up.
+5. **Fixture: `examples/effects/m7b_15_nested_alias.kai`** —
+   two `with State[Int]` handlers nested, both `as`-bound;
+   `outer.set(99)` inside the inner body must hit the outer
+   node, `inner.get()` must hit the inner. Without the tag
+   both alias would resolve to the innermost handler.
+
+**Scope limit.** The fix only routes dispatch correctly when
+the op call is in the same lexical scope as the handle's
+prologue. Inside a closure that captures the alias, the
+`kai_alias_<a>_id` local is out of scope, so codegen falls
+back to the name-keyed lookup and the inner-handler-wins bug
+recurs in that narrow shape. Scheduled follow-up below.
+
+### Scheduled follow-up: #15 compiler integration — closure capture
+
+The scope-limited landing above does not handle alias use
+inside a closure. The proper fix needs:
+
+1. **New AST node `EOpCallByAlias(eff, op, alias, args)`** so
+   the alias name does not pollute the var-name namespace
+   (`State.get@a` is invalid C as a captured-var identifier;
+   the current scope-limited code sidesteps this by suppressing
+   the tag at the lambda boundary).
+2. **Lambda-capture pass** recognises the new node and adds
+   the relevant `kai_alias_<a>_id` to the closure's capture
+   array, separate from the value captures (handler ids are
+   scalar `KaiHandlerId`, not `KaiValue *`).
+3. **Codegen for the new node** loads the captured id and
+   calls `kai_evidence_lookup_node_by_id` (already in
+   stage0/runtime.h).
+4. **LLVM dispatcher** consumes the alias tag too, so the
+   LLVM backend stops falling back to name-keyed lookup. The
+   C-side strip happens in `llvm_emit_call`
+   (`string_strip_alias_tag` before `lookup_op_offset`).
+5. **Two new fixtures** under `examples/effects/`:
+   - `m7b_15_nested_var_outer_reachable` — two `var`s of the
+     same `State[Int]` with both captured by an enclosing
+     closure; the closure must read the outer cell, not the
+     inner.
    - `m7b_15_explicit_handler_per_instance` — same shape, but
-     using user-written `with State[T] as a { with State[T] as b
-     { ... } }` instead of the var sugar.
+     using user-written `with State[T] as a { with State[T] as
+     b { ... } }` instead of the var sugar.
 
-**Trigger to schedule**: when the next code change touches
-`synth_lambda` / lambda-capture in `stage2/compiler.kai`, OR when
-a real-world program hits the bug. Until then the mitigation
-(m7b #16's stack-slot lowering for non-escaping vars) covers
-the common case.
+**Trigger to schedule**: when a real-world program hits the
+closure-capture bug, OR when the LLVM backend grows
+per-instance dispatch parity with the C backend. Until then
+the mitigation (m7b #16's stack-slot lowering for non-escaping
+vars + the scope-limited landing above) covers the common
+case.
 
 ### m7c — LLVM effects port
 
