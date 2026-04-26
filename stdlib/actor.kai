@@ -1,0 +1,73 @@
+# stdlib/actor.kai — typed wrappers + helpers for Actor[Msg].
+#
+# Doc B / docs/actors.md is the surface spec. v1 ships the
+# `with_mailbox` shape (Doc B §`Actor` *with_mailbox — mailbox for
+# the current fiber*); the spawning helpers `spawn_actor` /
+# `spawn_actor_default` lift on top of `Spawn` once mailbox
+# policies (m8 #8) and supervision (m8 #9) land alongside the
+# m8.x cooperative scheduler. v1's mailbox is unbounded — bounded
+# policies require either the m8.x scheduler (BlockSender needs to
+# suspend the sender) or a runtime side-channel (DropOldest /
+# DropNewest can ship earlier).
+#
+# `receive()` on an empty mailbox is a runtime error in v1 — the
+# inline-eager scheduler (m8 #3) cannot suspend the caller until a
+# message arrives. Demos sequence the sends before any receive
+# (e.g., self-send patterns) to stay within the synchronous frame.
+
+# Mailbox overflow policies (m8 #8). Doc B / actors.md §*Mailbox
+# policies* spec. v1 ships Unbounded + Bounded(c, DropOldest) +
+# Bounded(c, DropNewest); BlockSender requires the m8.x
+# cooperative scheduler to actually suspend the sender (without it,
+# the runtime errors at allocation).
+pub type Overflow = DropOldest | DropNewest | BlockSender
+
+pub type MailboxPolicy = Unbounded | Bounded(Int, Overflow)
+
+# Decoded policy → runtime overflow code (must match the
+# KAI_OVERFLOW_* constants in stage0/runtime.h).
+fn overflow_code(o: Overflow) : Int = match o {
+  DropOldest  -> 1
+  DropNewest  -> 2
+  BlockSender -> 3
+}
+
+# Allocate a mailbox honouring `policy`. Unbounded reuses the
+# default mailbox_alloc; Bounded routes through the bounded
+# variant.
+fn alloc_for_policy(p: MailboxPolicy) : Pid[Nothing] = match p {
+  Unbounded             -> mailbox_alloc()
+  Bounded(cap, on_full) -> mailbox_alloc_bounded(cap, overflow_code(on_full))
+}
+
+# Install an Actor[Msg] handler in the current fiber and run `body`
+# under it. The mailbox is allocated on entry and freed on exit;
+# the body talks to it via the standard Actor.self() / Actor.send()
+# / Actor.receive() ops. Default policy is `Unbounded`.
+pub fn with_mailbox[Msg, R, e](body: () -> R / e) : R / e = {
+  let mb = mailbox_alloc()
+  let r = handle { body() } with Actor[Msg](mb) {
+    self(resume)        -> resume(state)
+    send(p, m, resume)  -> { mailbox_send(p, m); resume(()) }
+    receive(resume)     -> resume(mailbox_recv(state))
+    return(x)           -> x
+  }
+  let _ = mailbox_free(mb)
+  r
+}
+
+# Same as `with_mailbox` but takes an explicit policy. Use this
+# when the default Unbounded mailbox is not appropriate (e.g.
+# back-pressure scenarios where DropOldest / DropNewest matters).
+pub fn with_mailbox_policy[Msg, R, e](policy: MailboxPolicy,
+                                       body: () -> R / Actor[Msg] + e) : R / e = {
+  let mb = alloc_for_policy(policy)
+  let r = handle { body() } with Actor[Msg](mb) {
+    self(resume)        -> resume(state)
+    send(p, m, resume)  -> { mailbox_send(p, m); resume(()) }
+    receive(resume)     -> resume(mailbox_recv(state))
+    return(x)           -> x
+  }
+  let _ = mailbox_free(mb)
+  r
+}

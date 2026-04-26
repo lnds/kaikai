@@ -394,6 +394,16 @@ in.
    `Pid[Msg]`, mailbox policies, link/monitor supervision —
    designs in `docs/structured-concurrency.md` and
    `docs/actors.md`.
+
+   **m8 v1 (landed)** ships the full *type surface* and an
+   inline-eager scheduler — every spawned thunk runs to
+   completion synchronously inside `Spawn.spawn`. Genuine
+   fiber suspension (real cooperative scheduler, cooperative
+   `Cancel` delivery, `BlockSender`, blocking `receive()`,
+   cross-fiber Link/Monitor delivery, full region brand)
+   defers to **m8.x**, tracked in `docs/m8x-followup.md`.
+   The user-facing API is the final shape; m8.x is a runtime
+   swap, invisible to user code.
 8.5. **m8.5 — Tuples decision gate**: one-day measurement task
     against the open `proposed-extensions.md` §9 decision. Pick
     one effect-heavy program (actor service / parser combinator

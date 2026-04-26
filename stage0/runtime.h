@@ -51,7 +51,9 @@ typedef enum {
     KAI_RECORD,
     KAI_VARIANT,
     KAI_CLOSURE,
-    KAI_ARRAY
+    KAI_ARRAY,
+    KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
+    KAI_PID         /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
 } KaiTag;
 
 typedef struct KaiValue KaiValue;
@@ -96,6 +98,19 @@ struct KaiValue {
             int64_t     cap;
             KaiValue  **items;
         } arr;
+        /* m8 #3: opaque handle to a KaiFiber. The KaiFiber struct
+         * itself is heap-allocated by Spawn.spawn and owned by this
+         * value: when the value's RC drops to zero, kai_free_value
+         * frees the KaiFiber and decrefs its result + thunk. */
+        struct KaiFiber *fib;
+        /* m8 #7: opaque handle to a KaiMailbox. Pid values share the
+         * mailbox's lifetime through borrowed pointers — the mailbox
+         * is owned by the with_mailbox / spawn_actor helper that
+         * allocated it, not by the Pid value. RC on the Pid value
+         * is just a handle count; freeing a Pid does not free the
+         * mailbox (that happens when the with_mailbox / spawn_actor
+         * scope exits). */
+        struct KaiMailbox *mb;
     } as;
 };
 
@@ -175,6 +190,186 @@ static KaiValue *kai_alloc(KaiTag tag) {
 static KaiValue *kai_incref(KaiValue *v) { if (v) v->rc++; return v; }
 static void       kai_decref(KaiValue *v);
 
+/* m8 #1/#3: KaiFiber definitions sit here (before kai_free_value)
+ * because KAI_FIBER values own their KaiFiber struct and the free
+ * path needs the full layout. The handler-stack runtime
+ * (KaiEvidence + push/pop/lookup) lives further down; KaiFiber only
+ * holds a `KaiEvidence *`, so a forward declaration is enough. The
+ * Spawn default handlers (kai_default_spawn_*) come later in the
+ * file too — they reach the struct through this declaration and use
+ * kai_apply (defined further down) to invoke spawned thunks. */
+typedef struct KaiEvidence KaiEvidence;
+
+/* m8 #3: fiber lifecycle states. Inline-eager v1: every spawned
+ * fiber goes NEW → DONE inside a single Spawn.spawn call (the thunk
+ * runs synchronously). The state machine is here so #4 (Cancel)
+ * and a future m8.x ucontext-based scheduler can extend it without
+ * a layout change. */
+typedef enum {
+    KAI_FIBER_NEW       = 0,
+    KAI_FIBER_DONE      = 1,
+    KAI_FIBER_CANCELLED = 2
+} KaiFiberState;
+
+typedef struct KaiFiber KaiFiber;
+struct KaiFiber {
+    KaiEvidence *evidence_top;
+    int             cancel_requested;  /* Spawn.cancel(target) sets this (#4) */
+    int             cancel_delivered;  /* Cancel.raise() injected once (#4)   */
+    KaiFiber       *sched_next;        /* intrusive ready-queue link          */
+    KaiFiber       *parent;            /* spawning fiber, NULL for the root   */
+    KaiFiberState   state;
+    KaiValue       *thunk;             /* held alive while the fiber runs     */
+    KaiValue       *result;            /* set on DONE; what await returns     */
+};
+
+/* m7a #5: single implicit fiber. m8 #3's inline-eager scheduler
+ * still hands back the implicit fiber as "current" — every spawned
+ * thunk runs to completion synchronously inside the spawning fiber,
+ * so there is no real distinction yet. m8.x's ucontext or full-CPS
+ * scheduler will replace the body of kai_current_fiber to return
+ * the head of the run queue. */
+static KaiFiber kai_main_fiber = { NULL, 0, 0, NULL, NULL, KAI_FIBER_NEW, NULL, NULL };
+
+static KaiFiber *kai_current_fiber(void) {
+    return &kai_main_fiber;
+}
+
+/* m8 #1: ready queue. Empty in v1 (every spawned thunk runs
+ * immediately); the head/tail pair is here so the data-flow path is
+ * the final shape for m8.x's real scheduler. */
+static KaiFiber *kai_ready_head = NULL;
+static KaiFiber *kai_ready_tail = NULL;
+
+/* m8 #3: wrap a heap-allocated KaiFiber in an opaque KAI_FIBER
+ * value. The KaiFiber struct's lifetime is tied to the value's RC
+ * (kai_free_value frees both together). */
+static KaiValue *kai_fiber_value(KaiFiber *f) {
+    KaiValue *v = kai_alloc(KAI_FIBER);
+    v->as.fib = f;
+    return v;
+}
+
+/* m8 #7: mailbox runtime. A KaiMailbox is a singly-linked list of
+ * heap-allocated KaiValue messages (head = next-to-pop, tail =
+ * next-to-enqueue). Send pushes at the tail; receive pops the head.
+ * v1 is unbounded — every send succeeds, every receive on an empty
+ * mailbox is a runtime error (the inline-eager scheduler can't
+ * suspend the caller until a message arrives). Bounded mailboxes
+ * with the three overflow policies (DropOldest / DropNewest /
+ * BlockSender) land in m8 #8 once Doc B's policy enum is wired
+ * through the typer; BlockSender additionally needs the m8.x
+ * cooperative scheduler to actually suspend the sender. */
+typedef struct KaiMboxNode KaiMboxNode;
+struct KaiMboxNode {
+    KaiValue    *msg;
+    KaiMboxNode *next;
+};
+
+/* m8 #8: mailbox overflow policy codes (matched in stdlib/actor.kai
+ * by the MailboxPolicy enum). 0 = Unbounded, 1 = Bounded+DropOldest,
+ * 2 = Bounded+DropNewest, 3 = Bounded+BlockSender. v1 ships 0/1/2;
+ * BlockSender (3) errors at allocation because the inline-eager
+ * scheduler can't suspend the sender on a full mailbox — that
+ * lifts together with the m8.x cooperative scheduler. */
+#define KAI_OVERFLOW_UNBOUNDED    0
+#define KAI_OVERFLOW_DROP_OLDEST  1
+#define KAI_OVERFLOW_DROP_NEWEST  2
+#define KAI_OVERFLOW_BLOCK_SENDER 3
+
+typedef struct KaiMailbox KaiMailbox;
+struct KaiMailbox {
+    KaiMboxNode *head;
+    KaiMboxNode *tail;
+    int          len;
+    int          cap;       /* m8 #8: 0 = unbounded; >0 = bounded */
+    int          overflow;  /* m8 #8: KAI_OVERFLOW_* code */
+};
+
+static KaiMailbox *kai_mailbox_alloc(void) {
+    KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
+    if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    /* default policy: unbounded — matches m8 #7 behaviour. */
+    mb->cap      = 0;
+    mb->overflow = KAI_OVERFLOW_UNBOUNDED;
+    return mb;
+}
+
+static KaiMailbox *kai_mailbox_alloc_bounded(int cap, int overflow) {
+    KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
+    if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (overflow == KAI_OVERFLOW_BLOCK_SENDER) {
+        fprintf(stderr, "kai: BlockSender mailbox policy requires the m8.x cooperative scheduler\n");
+        exit(1);
+    }
+    mb->cap      = cap;
+    mb->overflow = overflow;
+    return mb;
+}
+
+static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
+    /* m8 #8: enforce policy on full. */
+    if (mb->cap > 0 && mb->len >= mb->cap) {
+        if (mb->overflow == KAI_OVERFLOW_DROP_NEWEST) {
+            kai_decref(msg);
+            return;
+        } else if (mb->overflow == KAI_OVERFLOW_DROP_OLDEST) {
+            /* Pop and discard the head; fall through to enqueue. */
+            KaiMboxNode *old = mb->head;
+            mb->head = old->next;
+            if (!mb->head) { mb->tail = NULL; }
+            kai_decref(old->msg);
+            free(old);
+            mb->len--;
+        }
+        /* BlockSender is rejected at alloc, so no case here. */
+    }
+    KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
+    if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    node->msg  = msg;
+    node->next = NULL;
+    if (mb->tail) { mb->tail->next = node; }
+    else          { mb->head       = node; }
+    mb->tail = node;
+    mb->len++;
+}
+
+static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
+    if (!mb->head) {
+        fprintf(stderr, "kai: Actor.receive on empty mailbox (v1 inline-eager: no blocking)\n");
+        exit(1);
+    }
+    KaiMboxNode *node = mb->head;
+    mb->head = node->next;
+    if (!mb->head) { mb->tail = NULL; }
+    KaiValue *msg = node->msg;
+    free(node);
+    mb->len--;
+    return msg;
+}
+
+static void kai_mailbox_free(KaiMailbox *mb) {
+    if (!mb) return;
+    KaiMboxNode *node = mb->head;
+    while (node) {
+        KaiMboxNode *next = node->next;
+        kai_decref(node->msg);
+        free(node);
+        node = next;
+    }
+    free(mb);
+}
+
+/* m8 #7: wrap a borrowed mailbox pointer as a KAI_PID value. The
+ * mailbox itself is owned by the with_mailbox / spawn_actor scope
+ * that allocated it; Pid values are non-owning handles that just
+ * carry the address. */
+static KaiValue *kai_pid_value(KaiMailbox *mb) {
+    KaiValue *v = kai_alloc(KAI_PID);
+    v->as.mb = mb;
+    return v;
+}
+
 static void kai_free_value(KaiValue *v) {
     switch ((KaiTag) v->tag) {
         case KAI_STR:
@@ -200,6 +395,18 @@ static void kai_free_value(KaiValue *v) {
         case KAI_ARRAY:
             for (int64_t i = 0; i < v->as.arr.len; ++i) kai_decref(v->as.arr.items[i]);
             free(v->as.arr.items);
+            break;
+        case KAI_FIBER:
+            if (v->as.fib) {
+                kai_decref(v->as.fib->thunk);
+                kai_decref(v->as.fib->result);
+                free(v->as.fib);
+            }
+            break;
+        case KAI_PID:
+            /* The mailbox is owned by the with_mailbox / spawn_actor
+             * scope, NOT by the Pid value. Dropping a Pid handle
+             * does not free the mailbox. */
             break;
         default: break;
     }
@@ -421,6 +628,8 @@ static int kai_eq(KaiValue *a, KaiValue *b) {
             return 1;
         case KAI_CLOSURE: return 0;      /* closures are not equatable */
         case KAI_ARRAY:   return 0;      /* arrays are opaque, identity-compared */
+        case KAI_FIBER:   return a->as.fib == b->as.fib;  /* identity */
+        case KAI_PID:     return a->as.mb  == b->as.mb;   /* identity */
     }
     return 0;
 }
@@ -495,6 +704,8 @@ static KaiValue *kai_to_string(KaiValue *v) {
         }
         case KAI_CLOSURE: return kai_str("<closure>");
         case KAI_ARRAY:   return kai_str("<array>");
+        case KAI_FIBER:   return kai_str("<fiber>");
+        case KAI_PID:     return kai_str("<pid>");
     }
     return kai_str("?");
 }
@@ -913,6 +1124,51 @@ static KaiValue *kai_prelude_args(void) {
     return acc;
 }
 
+/* ---------- prelude: mailbox runtime (m8 #7) ---------- */
+
+/* User code reaches the mailbox runtime through these prelude
+ * functions. They are wrapped in stdlib/actor.kai's `with_mailbox`
+ * helper, which also installs the user-facing Actor[Msg] handler.
+ * The polymorphic surface uses Nothing → TyAny so a single set of
+ * runtime entries serves every Msg type. */
+
+static KaiValue *kai_prelude_mailbox_alloc(void) {
+    return kai_pid_value(kai_mailbox_alloc());
+}
+
+static KaiValue *kai_prelude_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {
+    int c = (cap && cap->tag == KAI_INT) ? (int) cap->as.i : 0;
+    int o = (overflow && overflow->tag == KAI_INT) ? (int) overflow->as.i : 0;
+    return kai_pid_value(kai_mailbox_alloc_bounded(c, o));
+}
+
+static KaiValue *kai_prelude_mailbox_send(KaiValue *pid, KaiValue *msg) {
+    if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
+        fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
+        exit(1);
+    }
+    kai_mailbox_push(pid->as.mb, kai_incref(msg));
+    return kai_unit();
+}
+
+static KaiValue *kai_prelude_mailbox_recv(KaiValue *pid) {
+    if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
+        fprintf(stderr, "kai: mailbox_recv: argument is not a Pid\n");
+        exit(1);
+    }
+    return kai_mailbox_pop(pid->as.mb);
+}
+
+/* Free the mailbox attached to a Pid. Called by `with_mailbox` when
+ * the scope exits; the Pid value itself is RC-managed independently. */
+static KaiValue *kai_prelude_mailbox_free(KaiValue *pid) {
+    if (pid && pid->tag == KAI_PID && pid->as.mb) {
+        kai_mailbox_free(pid->as.mb);
+        pid->as.mb = NULL;
+    }
+    return kai_unit();
+}
+
 /* ---------- prelude: file io ---------- */
 
 static KaiValue *kai_prelude_read_file(KaiValue *path) {
@@ -1159,6 +1415,11 @@ static KaiValue *_kai_prelude_string_contains_thunk(KaiValue *s, KaiValue **a, i
 static KaiValue *_kai_prelude_string_slice_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_string_slice(a[0], a[1], a[2]); }
 static KaiValue *_kai_prelude_char_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_char_to_int(a[0]); }
 static KaiValue *_kai_prelude_int_to_char_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_int_to_char(a[0]); }
+static KaiValue *_kai_prelude_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) a; (void) n; return kai_prelude_mailbox_alloc(); }
+static KaiValue *_kai_prelude_mailbox_alloc_bounded_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_mailbox_alloc_bounded(a[0], a[1]); }
+static KaiValue *_kai_prelude_mailbox_send_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_send(a[0], a[1]); }
+static KaiValue *_kai_prelude_mailbox_recv_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_recv(a[0]); }
+static KaiValue *_kai_prelude_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_free(a[0]); }
 
 /* ---------- test harness hooks (used by --test runs) ---------- */
 
@@ -1435,7 +1696,105 @@ static KaiValue *kai_default_mutable_array_grow(void *self, KaiValue *a,
     return kai_cont_resume(k, kai_prelude_array_grow(a, n, init));
 }
 
-typedef struct KaiEvidence KaiEvidence;
+/* m8 #2/#3: default Spawn handlers. Inline-eager v1: spawn(thunk)
+ * runs the thunk synchronously, stores the result in a heap KaiFiber,
+ * and returns a KAI_FIBER handle; await(fib) returns the cached
+ * result; yield is a no-op (the implicit single fiber has nowhere to
+ * yield to); select picks the first fiber's result; cancel sets a
+ * flag (delivery in m8 #4). A future m8.x replaces this with a real
+ * cooperative scheduler whose surface is identical (same evidence
+ * struct, same op signatures). */
+static KaiValue *kai_default_spawn_yield(void *self, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_unit());
+}
+
+static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k) {
+    (void) self;
+    if (!thunk || thunk->tag != KAI_CLOSURE) {
+        fprintf(stderr, "kai: Spawn.spawn called with non-closure value\n");
+        exit(1);
+    }
+    KaiFiber *f = (KaiFiber *) calloc(1, sizeof(KaiFiber));
+    if (!f) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    f->parent = kai_current_fiber();
+    f->state  = KAI_FIBER_NEW;
+    f->thunk  = kai_incref(thunk);
+    /* Inline-eager: invoke the thunk now. m8.x replaces this with
+     * an enqueue + scheduler dispatch. */
+    f->result = kai_apply(thunk, 0, NULL);
+    f->state  = KAI_FIBER_DONE;
+    return kai_cont_resume(k, kai_fiber_value(f));
+}
+
+static KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiCont *k) {
+    (void) self;
+    if (!fib_v || fib_v->tag != KAI_FIBER || !fib_v->as.fib) {
+        fprintf(stderr, "kai: Spawn.await called on non-fiber value\n");
+        exit(1);
+    }
+    KaiFiber *f = fib_v->as.fib;
+    if (f->state != KAI_FIBER_DONE) {
+        /* Should be unreachable in v1: spawn always finishes before
+         * returning. m8.x will block the caller and resume on
+         * completion. */
+        fprintf(stderr, "kai: Spawn.await on incomplete fiber (v1 inline-eager)\n");
+        exit(1);
+    }
+    return kai_cont_resume(k, kai_incref(f->result));
+}
+
+static KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, KaiCont *k) {
+    (void) self;
+    /* Argument is a [Fiber[T]] — a KAI_CONS list of KAI_FIBER. v1:
+     * pick the head and return its result. m8.x cancels the losers
+     * and picks whichever finishes first. */
+    if (!fibs_v || fibs_v->tag != KAI_CONS) {
+        fprintf(stderr, "kai: Spawn.select called on empty or non-list value\n");
+        exit(1);
+    }
+    KaiValue *first = fibs_v->as.cons.head;
+    if (!first || first->tag != KAI_FIBER || !first->as.fib) {
+        fprintf(stderr, "kai: Spawn.select: list head is not a fiber\n");
+        exit(1);
+    }
+    return kai_cont_resume(k, kai_incref(first->as.fib->result));
+}
+
+static KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *k) {
+    (void) self;
+    if (fib_v && fib_v->tag == KAI_FIBER && fib_v->as.fib) {
+        fib_v->as.fib->cancel_requested = 1;
+        /* m8 #4 records the flag; the cooperative-yield delivery
+         * (inject Cancel.raise() at the next op-call boundary on
+         * that fiber) lands together with the m8.x ucontext or
+         * full-CPS scheduler. In the inline-eager v1, the target
+         * fiber is already DONE by the time cancel runs, so the
+         * flag is harmless — Spawn.cancel + Cancel still type-
+         * check correctly so user code can be written against the
+         * final API. */
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* m8 #4: default Cancel.raise handler. Doc B §`Cancel`/Default
+ * handler: an unhandled Cancel.raise() unwinds the fiber cleanly
+ * (the runtime delivers "no silent survivors"). v1 mirrors Fail's
+ * default: write a banner + exit(0). A user-installed handler
+ * (`with Cancel { raise(resume) -> cleanup }`) discards resume and
+ * the m7a #6e setjmp/longjmp pair unwinds to the wrapping handle —
+ * that is the actual "fiber unwinds out of the wrapped block"
+ * semantics from Doc B §*Handling for cleanup*. The exit code is 0
+ * (not 1 like Fail) because cancellation is an expected termination
+ * path, not a programmer error. */
+static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
+    (void) self;
+    (void) k;
+    fputs("kai: Cancel.raise: unhandled (fiber cancelled)\n", stderr);
+    exit(0);
+}
+
+/* (typedef forward-declared above, before KaiFiber.) */
 struct KaiEvidence {
     KaiEvidence *parent;
     const char  *eff_label;     /* canonical effect name (literal or interned). */
@@ -1450,20 +1809,6 @@ struct KaiEvidence {
     jmp_buf     *handle_jmp;
     KaiValue   **discard_slot;
 };
-
-typedef struct KaiFiber KaiFiber;
-struct KaiFiber {
-    KaiEvidence *evidence_top;
-    /* Future: per-fiber stack/heap/scheduler links land here. */
-};
-
-/* m7a #5: single implicit fiber. m8's scheduler will hand back
- * the current fiber instead of returning &kai_main_fiber. */
-static KaiFiber kai_main_fiber = { NULL };
-
-static KaiFiber *kai_current_fiber(void) {
-    return &kai_main_fiber;
-}
 
 /* Push an Evidence node onto the current fiber's stack. The caller
  * owns the node's storage — typically `alloca`'d inside a compiled

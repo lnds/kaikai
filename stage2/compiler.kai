@@ -4149,6 +4149,11 @@ fn prelude_names() : [String] {
     "list_length", "list_append", "list_reverse",
     "map", "filter", "reduce", "each",
     "array_make", "array_length", "array_get", "array_set", "array_grow",
+    # m8 #7: mailbox runtime exposed as prelude functions; user-facing
+    # API lives in stdlib/actor.kai's `with_mailbox` helper.
+    # m8 #8: bounded variant takes (cap: Int, overflow_code: Int).
+    "mailbox_alloc", "mailbox_alloc_bounded",
+    "mailbox_send", "mailbox_recv", "mailbox_free",
     "Some", "None", "Ok", "Err"
   ]
 }
@@ -4800,7 +4805,13 @@ fn prelude_table() : [EPrelude] {
     EP("array_length",     "kai_prelude_array_length",     1),
     EP("array_get",        "kai_prelude_array_get",        2),
     EP("array_set",        "kai_prelude_array_set",        3),
-    EP("array_grow",       "kai_prelude_array_grow",       3)
+    EP("array_grow",       "kai_prelude_array_grow",       3),
+    # m8 #7: mailbox runtime
+    EP("mailbox_alloc",         "kai_prelude_mailbox_alloc",         0),
+    EP("mailbox_alloc_bounded", "kai_prelude_mailbox_alloc_bounded", 2),
+    EP("mailbox_send",          "kai_prelude_mailbox_send",          2),
+    EP("mailbox_recv",          "kai_prelude_mailbox_recv",          1),
+    EP("mailbox_free",          "kai_prelude_mailbox_free",          1)
   ]
 }
 
@@ -6684,9 +6695,44 @@ fn default_mutable_setup() : String =
     "    kai_evidence_push(&_kai_default_node_mutable, \"Mutable\", &_kai_default_ev_mutable);\n"
   ])
 
-# m7a #7: assemble the full setup block for the builtins listed in
-# `main`'s row, push order Console → Fail → Stdin → Env → File →
-# Mutable. Mutable goes last so it pops first (LIFO).
+# m8 #4: emit EvCancel + push it between the I/O group and Spawn
+# (Doc B §*Installation order*). Single op `raise()`. The default
+# resumes by exiting the program; user-installed Cancel handlers
+# can wrap a region to run cleanup before the unwind escapes the
+# wrapping `handle` block.
+fn default_cancel_setup() : String =
+  concat_all([
+    "    static EvCancel _kai_default_ev_cancel;\n",
+    "    static KaiEvidence _kai_default_node_cancel;\n",
+    "    _kai_default_ev_cancel.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_cancel.raise = (KaiValue *(*)(EvCancel *, KaiCont *)) &kai_default_cancel_raise;\n",
+    "    kai_evidence_push(&_kai_default_node_cancel, \"Cancel\", &_kai_default_ev_cancel);\n"
+  ])
+
+# m8 #2/#3: emit EvSpawn + push it as the innermost default-handler
+# node (Doc B §*Installation order*: Spawn sits closest to main,
+# Cancel the layer below it, the I/O group below that). Wires all
+# five ops to the inline-eager v1 defaults — see stage0/runtime.h
+# for what each one does at runtime.
+fn default_spawn_setup() : String =
+  concat_all([
+    "    static EvSpawn _kai_default_ev_spawn;\n",
+    "    static KaiEvidence _kai_default_node_spawn;\n",
+    "    _kai_default_ev_spawn.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_spawn.yield  = (KaiValue *(*)(EvSpawn *, KaiCont *)) &kai_default_spawn_yield;\n",
+    "    _kai_default_ev_spawn.spawn  = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_spawn;\n",
+    "    _kai_default_ev_spawn.await  = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_await;\n",
+    "    _kai_default_ev_spawn.select = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_select;\n",
+    "    _kai_default_ev_spawn.cancel = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_cancel;\n",
+    "    kai_evidence_push(&_kai_default_node_spawn, \"Spawn\", &_kai_default_ev_spawn);\n"
+  ])
+
+# m7a #7 + m7b #2b + m8 #2/#4: assemble the full setup block for the
+# builtins listed in `main`'s row. Push order Console → Fail → Stdin →
+# Env → File → Mutable → Cancel → Spawn matches Doc B §*Installation
+# order*: Spawn innermost (last pushed, first looked up); Cancel the
+# layer below it (root nursery flags fibers, Cancel handler unwinds);
+# Mutable below Cancel (I/O cluster).
 fn default_setups_for(main_row: [String]) : String =
   concat_all([
     if list_has(main_row, "Console") { default_console_setup() } else { "" },
@@ -6694,12 +6740,16 @@ fn default_setups_for(main_row: [String]) : String =
     if list_has(main_row, "Stdin")   { default_stdin_setup() }   else { "" },
     if list_has(main_row, "Env")     { default_env_setup() }     else { "" },
     if list_has(main_row, "File")    { default_file_setup() }    else { "" },
-    if list_has(main_row, "Mutable") { default_mutable_setup() } else { "" }
+    if list_has(main_row, "Mutable") { default_mutable_setup() } else { "" },
+    if list_has(main_row, "Cancel")  { default_cancel_setup() }  else { "" },
+    if list_has(main_row, "Spawn")   { default_spawn_setup() }   else { "" }
   ])
 
 # Pops in reverse-push order so the evidence stack drains LIFO.
 fn default_pops_for(main_row: [String]) : String =
   concat_all([
+    if list_has(main_row, "Spawn")   { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "Cancel")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Mutable") { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "File")    { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Env")     { "    kai_evidence_pop();\n" } else { "" },
@@ -8319,7 +8369,18 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "array_length", scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)])],                      TyInt)) },
     TyEntry { name: "array_get",    scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)]), TyInt],               tv(0))) },
     TyEntry { name: "array_set",    scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)]), TyInt, tv(0)],        TyCon("Array", [tv(0)]))) },
-    TyEntry { name: "array_grow",   scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)]), TyInt, tv(0)],        TyCon("Array", [tv(0)]))) }
+    TyEntry { name: "array_grow",   scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)]), TyInt, tv(0)],        TyCon("Array", [tv(0)]))) },
+    # m8 #7: mailbox runtime — type-erased entries (Msg flows
+    # through TyAny). The polymorphic surface is in stdlib/actor.kai
+    # where `with_mailbox[Msg]` and `Actor[Msg]`'s clauses re-attach
+    # the right Msg to send/receive. mailbox_alloc returns a Pid
+    # whose Msg type is fresh at the call site (TyAny unifies with
+    # whatever the surrounding context expects).
+    TyEntry { name: "mailbox_alloc",         scheme: scheme([0], fn_ty([],                                       TyCon("Pid", [tv(0)]))) },
+    TyEntry { name: "mailbox_alloc_bounded", scheme: scheme([0], fn_ty([TyInt, TyInt],                            TyCon("Pid", [tv(0)]))) },
+    TyEntry { name: "mailbox_send",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)]), tv(0)],           TyUnit)) },
+    TyEntry { name: "mailbox_recv",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)])],                  tv(0))) },
+    TyEntry { name: "mailbox_free",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)])],                  TyUnit)) }
   ]
   TyEnv { entries: list_append(es, env.entries), fresh: env.fresh }
 }
@@ -8384,6 +8445,14 @@ fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
           else if name == "String" { TyString }
           else if name == "Char"   { TyChar }
           else if name == "Unit"   { TyUnit }
+          # m7a #7 / m8 #3: Nothing is the bottom type (used by
+          # Fail.fail and Spawn's type-erased ops); the typer treats
+          # it as TyAny because it can't witness uninhabitedness.
+          # Without this case, Spawn.spawn(thunk: Nothing) refuses
+          # any non-Nothing thunk argument. resolve_ty and
+          # resolve_ty_with_binds both have this case; it was
+          # missing here.
+          else if name == "Nothing" { TyAny }
           else { TyCon(name, resolve_tas_with(tas, binds)) }
         }
       }
@@ -11417,7 +11486,18 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       let tpbinds = mk_tpbinds(tparams)
       let st_init = infer_state_new_full(file, env, prelude_len, recs, op_eff_arities)
       let st0 = advance_row_fresh(st_init, list_length(rbinds))
-      let added = add_infer_params_with_binds(st0, ps, tpbinds, rbinds)
+      # m7b #13 follow-up (surfaced by m8 #3's typed Spawn wrappers):
+      # mk_tpbinds allocates ids 0..n-1 for the fn-level tparams, but
+      # infer_state_new starts env.fresh at 0 too. Without bumping the
+      # counter past the tparam ids, the first fresh ty-var minted in
+      # the body (e.g., the result of synth_op_call_with_scheme inside
+      # `pub fn fiber_spawn[T, e](...) = Spawn.spawn(f)`) aliases `T`,
+      # which then fails the return-type unify with an occurs-check
+      # error ("expected: Fiber[?t0], found: ?t0"). Advance the env's
+      # fresh counter past the tpbinds the same way we already advance
+      # the row_fresh counter past the rbinds above.
+      let st0a = st_set_env(st0, advance_fresh(st0.env, list_length(tpbinds)))
+      let added = add_infer_params_with_binds(st0a, ps, tpbinds, rbinds)
       let rb = synth(added.st, body)
       let declared_ret = match opt_ret {
         Some(rty) -> resolve_ty_with_binds(rty, tpbinds, rbinds)
@@ -11426,7 +11506,20 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       let what = string_concat("return type of ", nm)
       let ret_site = return_site_of(body)
       let st1 = st_unify(rb.st, declared_ret, rb.ty, what, ret_site.line, ret_site.col)
-      let st2 = check_body_row(st1, nm, row, line, col)
+      # m8 #6: shallow region-brand check. The full brand machinery
+      # (Doc B / structured-concurrency.md §*Type system*) tags every
+      # Fiber[T] / Pid[Msg] handle with the brand of its enclosing
+      # nursery scope and rejects values whose brand has expired.
+      # That is significant typer work and lands together with the
+      # m8.x ucontext or full-CPS scheduler. v1 ships the pragmatic
+      # syntactic approximation: any function declared OUTSIDE
+      # stdlib/ whose declared return type contains Fiber[T] (at any
+      # nesting depth — list, option, record, etc.) is rejected at
+      # the type-annotation line. Internal stdlib helpers
+      # (fiber_spawn, etc.) are exempt by file-path because they are
+      # the legitimate constructors of Fiber[T] values.
+      let st1b = check_no_fiber_escape(st1, file, nm, opt_ret, line, col)
+      let st2 = check_body_row(st1b, nm, row, line, col)
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
       } else { () }
@@ -11440,6 +11533,71 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       }
     }
     _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [] }
+  }
+}
+
+# m8 #6: shallow region-brand check on Fiber[T]. Walks the type
+# annotation (the user-written TypeExpr, not the resolved Ty, so
+# the diagnostic can point at the exact text the user wrote) and
+# rejects any occurrence of `Fiber[...]` in the return-type
+# position of a fn that is NOT one of the legitimate stdlib
+# producers (`fiber_spawn` family in stdlib/spawn.kai). See the
+# comment at the call site in infer_decl for the design trade-off
+# (path-based exemption doesn't work because import decls inherit
+# the importer's file path through expand_imports).
+fn check_no_fiber_escape(st: InferState, file: String, fname: String,
+                          opt_ret: Option[TypeExpr], line: Int, col: Int) : InferState {
+  if is_fiber_producer_helper(fname) { st }
+  else {
+    match opt_ret {
+      None -> st
+      Some(rty) -> {
+        if ty_expr_contains_fiber(rty) {
+          let lline = if rty.line > 0 { rty.line } else { line }
+          let lcol  = if rty.col  > 0 { rty.col  } else { col  }
+          diag_error(file, lline, lcol,
+            string_concat(string_concat("Fiber[T] cannot escape `", fname),
+                          "`'s structured-concurrency scope"))
+          diag_note("a `Fiber[T]` handle is bound to the nursery that created it")
+          diag_note("returning one from a function lets it outlive that scope")
+          diag_help("process the fiber inside the nursery (e.g. with `fiber_await`), or pass a thunk in and a value out instead")
+          st_bump_err(st)
+        } else {
+          st
+        }
+      }
+    }
+  }
+}
+
+# Hardcoded list of stdlib helpers permitted to mention Fiber[T] in
+# their return type. Kept intentionally narrow — these are the only
+# legitimate constructors / passthroughs of Fiber values today
+# (stdlib/spawn.kai). Any new helper that needs to return a Fiber
+# must be added here on purpose.
+fn is_fiber_producer_helper(fname: String) : Bool =
+  fname == "fiber_spawn"
+
+# Walks a TypeExpr looking for any TyName("Fiber", ...) at any depth
+# (list, function-arg / -ret, type-arg). Returns true on the first
+# hit. Cheap because TypeExprs are small and shallow.
+fn ty_expr_contains_fiber(t: TypeExpr) : Bool {
+  match t.tkind {
+    TyName(name, tas) ->
+      if name == "Fiber" { true }
+      else { ty_expr_list_has_fiber(tas) }
+    TyList(inner) -> ty_expr_contains_fiber(inner)
+    TyFn(ps, ret, _) -> {
+      if ty_expr_list_has_fiber(ps) { true }
+      else { ty_expr_contains_fiber(ret) }
+    }
+  }
+}
+
+fn ty_expr_list_has_fiber(ts: [TypeExpr]) : Bool {
+  match ts {
+    [] -> false
+    [t, ...rest] -> if ty_expr_contains_fiber(t) { true } else { ty_expr_list_has_fiber(rest) }
   }
 }
 
@@ -14157,6 +14315,34 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   # default-handler setup is gated separately on `main`'s row in
   # `default_setups_for`.
   let mutable_d = inject_unconditional(existing, "Mutable", builtin_mutable_decl())
+  # m8 #9: Link / Monitor — typer-side declarations only in v1; the
+  # runtime registry + cross-fiber delivery land with the m8.x
+  # cooperative scheduler.
+  let link_d    = inject_unconditional(existing, "Link",    builtin_link_decl())
+  let monitor_d = inject_unconditional(existing, "Monitor", builtin_monitor_decl())
+  # m8 #2: Spawn ships the canonical pinning point op `yield()`. The
+  # full op set (spawn / await / select / cancel) lands in #3, after
+  # the per-op-generics shape is settled. inject_unconditional so the
+  # typer always knows the effect exists — a helper declaring `/ Spawn`
+  # in its row should compile regardless of whether `main` mentions
+  # Spawn. The runtime default-handler push is still gated on main's
+  # row in default_setups_for. (The same decoupling could be applied to
+  # Console/Stdin/Env/File/Fail; that is an m7a #7 follow-up, not m8
+  # scope.)
+  let spawn_d   = inject_unconditional(existing, "Spawn",  builtin_spawn_decl())
+  # m8 #4: Cancel — single op `raise() : Nothing`. Same
+  # decoupling as Spawn: the typer always knows about it (so user-
+  # written cleanup handlers `with Cancel { raise(_) -> ... }`
+  # compile), but the runtime default-handler push is gated on main's
+  # row in default_setups_for. Per Doc B §*Installation order*,
+  # Cancel sits between the I/O group and Spawn (the root nursery
+  # is what flags fibers for cancellation, but the Cancel handler
+  # itself is the unwind target).
+  let cancel_d  = inject_unconditional(existing, "Cancel", builtin_cancel_decl())
+  # m8 #7: Actor[Msg] is parametric — no runtime default handler;
+  # users always install their own (typically via stdlib/actor.kai's
+  # `with_mailbox` helper).
+  let actor_d   = inject_unconditional(existing, "Actor",  builtin_actor_decl())
   list_append(console_d,
     list_append(fail_d,
       list_append(stdin_d,
@@ -14165,7 +14351,12 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
             list_append(state_d,
               list_append(reader_d,
                 list_append(writer_d,
-                  list_append(mutable_d, decls)))))))))
+                  list_append(mutable_d,
+                    list_append(spawn_d,
+                      list_append(cancel_d,
+                        list_append(actor_d,
+                          list_append(link_d,
+                            list_append(monitor_d, decls))))))))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -14218,7 +14409,7 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # these as effect names whether or not the file already declared
 # them via `effect`.
 fn builtin_effect_names() : [String] =
-  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable"]
+  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor"]
 
 fn builtin_console_decl() : Decl =
   DEffect(false, "Console", [],
@@ -14331,6 +14522,109 @@ fn builtin_mutable_decl() : Decl =
            param_typed_zero("init", ty_name_zero("T"))],
           ty_named_zero("Array", [ty_name_zero("T")]),
           0, 0)
+    ], 0, 0)
+
+# m8 #7: Actor[Msg] — parameterised effect on the message type. Same
+# m7b #11 machinery as State[T] / Reader[T] / Writer[W]: the effect-
+# level tparam Msg substitutes into every op's signature. The user
+# installs an Actor[Msg] handler via `with Actor[Msg](pid_value) {
+# ... }`; the canonical wrapper `with_mailbox[Msg]` lives in
+# stdlib/actor.kai. Doc B / docs/actors.md is the surface spec.
+#
+# `self()` returns the current actor's Pid; `send(p, m)` enqueues
+# msg on p's mailbox; `receive()` dequeues from this actor's
+# mailbox. v1 receives synchronously — calling receive() on an
+# empty mailbox is a runtime error because the inline-eager
+# scheduler can't suspend. Real blocking receive lands with the m8.x
+# scheduler. Six-field EOp shape (op_tparams = [], no per-op generics
+# beyond the effect-level Msg).
+fn builtin_actor_decl() : Decl =
+  DEffect(false, "Actor", ["Msg"],
+    [
+      EOp("self", [], [], ty_named_zero("Pid", [ty_name_zero("Msg")]), 0, 0),
+      EOp("send", [],
+          [param_typed_zero("pid", ty_named_zero("Pid", [ty_name_zero("Msg")])),
+           param_typed_zero("msg", ty_name_zero("Msg"))],
+          ty_name_zero("Unit"), 0, 0),
+      EOp("receive", [], [], ty_name_zero("Msg"), 0, 0)
+    ], 0, 0)
+
+# m8 #9: Link — bidirectional supervision. `link(peer)` registers a
+# bidirectional crash-propagation between the current actor and
+# `peer`: if either crashes, the other receives `Cancel.raise()` at
+# its next yield point. v1 declares the type surface but the cross-
+# fiber propagation lands with the m8.x cooperative scheduler — in
+# the inline-eager v1 a child fiber's panic aborts the program before
+# any peer can react. The Doc spec uses `Pid[_]` (existential pid);
+# v1 uses Pid[Nothing] which TyAny-erases the message type, giving
+# the same "any pid" surface without needing existential types in
+# the typer.
+fn builtin_link_decl() : Decl =
+  DEffect(false, "Link", [],
+    [
+      EOp("link", [], [param_typed_zero("peer", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
+          ty_name_zero("Unit"), 0, 0)
+    ], 0, 0)
+
+# m8 #9: Monitor — unidirectional supervision. `monitor(target)`
+# registers the current actor as an observer of `target`; when
+# `target` terminates, a `MonitorDown(ref, cause)` message is
+# delivered to the observer's own mailbox. `demonitor(ref)`
+# withdraws the subscription. v1 declares the type surface; the
+# runtime registry + delivery on termination land with the m8.x
+# scheduler. Demos exercise the supervision *pattern* through the
+# Actor[Msg] mailbox + spawn primitives directly.
+fn builtin_monitor_decl() : Decl =
+  DEffect(false, "Monitor", [],
+    [
+      EOp("monitor", [], [param_typed_zero("target", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
+          ty_name_zero("MonitorRef"), 0, 0),
+      EOp("demonitor", [], [param_typed_zero("ref", ty_name_zero("MonitorRef"))],
+          ty_name_zero("Unit"), 0, 0)
+    ], 0, 0)
+
+# m8 #4: Cancel — single op `raise() : Nothing`. Doc B §`Cancel`.
+# The default handler exits the program with a banner; user code
+# installs its own `with Cancel { raise(resume) -> cleanup }` to
+# catch the unwind and run cleanup. Cooperative-yield delivery
+# (the scheduler injecting Cancel.raise() at the next op-call
+# boundary) lands together with the m8.x ucontext or full-CPS
+# scheduler. Six-field EOp shape (op_tparams = [], no per-op
+# generics).
+fn builtin_cancel_decl() : Decl =
+  DEffect(false, "Cancel", [],
+    [
+      EOp("raise", [], [], ty_name_zero("Nothing"), 0, 0)
+    ], 0, 0)
+
+# m8 #2/#3: Spawn — non-parametric effect. Per Doc B §`Spawn`, the
+# user-facing API is polymorphic (`spawn[T, e]`, `await[T]`, etc.).
+# m7b #2a (per-op TYPE generics) is now in main, but Doc B's `spawn`
+# also wants a per-op ROW generic (`/ e`), which is a separate
+# extension. v1 sidesteps both by declaring spawn / await / select /
+# cancel with type-erased parameter and return types
+# (`Nothing` → TyAny in the typer); the polymorphic surface lives in
+# `stdlib/spawn.kai` as fn-level wrappers (m7b #13 + m7b #14 give
+# the type-param + lambda-row machinery the wrappers need).
+# `yield()` is the canonical pinning point per Doc B §`Cancel` /
+# Delivery points; it stays monomorphic.
+#
+# EOp shape is m7b #2a's six-field form (name, op_tparams, params,
+# ret, line, col); none of these ops use per-op tparams in v1, so
+# op_tparams stays []. Migration to the proper Doc B signatures is
+# tracked in `docs/m8x-followup.md` item 7.
+fn builtin_spawn_decl() : Decl =
+  DEffect(false, "Spawn", [],
+    [
+      EOp("yield",  [], [], ty_name_zero("Unit"), 0, 0),
+      EOp("spawn",  [], [param_typed_zero("thunk", ty_name_zero("Nothing"))],
+                    ty_name_zero("Nothing"), 0, 0),
+      EOp("await",  [], [param_typed_zero("fiber", ty_name_zero("Nothing"))],
+                    ty_name_zero("Nothing"), 0, 0),
+      EOp("select", [], [param_typed_zero("fibers", ty_name_zero("Nothing"))],
+                    ty_name_zero("Nothing"), 0, 0),
+      EOp("cancel", [], [param_typed_zero("fiber", ty_name_zero("Nothing"))],
+                    ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
 fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int {

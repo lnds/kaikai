@@ -1,0 +1,65 @@
+# demos/concurrent — m8 integration demo.
+#
+# Combines the four pieces m8 ships:
+#   - nursery        (m8 #5)  structured-concurrency scope
+#   - fiber_spawn    (m8 #3)  spawn child fibers
+#   - Actor[Status]  (m8 #7)  supervisor's typed mailbox
+#   - Cancel handler (m8 #4)  cleanup region
+#
+# Pattern: a "supervisor" (the main fiber, with its own mailbox)
+# launches three workers inside a nursery, each reports its result
+# through an Actor.send back to the supervisor's pid, then the
+# supervisor drains the mailbox and prints the summary. A wrapping
+# `with Cancel` block shows the cleanup region — it is declarative
+# in v1 (no Cancel.raise() lands in the body), but the surface
+# matches what the m8.x cooperative scheduler will actually deliver
+# when a sibling crash propagates.
+#
+# v1 scheduler is inline-eager (m8 #3 / docs follow-up): each
+# spawned thunk runs to completion synchronously inside fiber_spawn.
+# Real cooperative scheduling lifts this surface unchanged into m8.x
+# — the same kaikai source will exercise true interleaving once
+# ucontext (or full CPS reification) lands.
+#
+# `print_status` lives at top level (not inside the trailing-lambda
+# body) to sidestep the closure-capture-through-pattern-bind bug
+# (project_stage0_bugs.md #7).
+
+import actor
+import spawn
+
+type Status = Done(Int)
+
+fn job_a() : Status = Done(7)
+fn job_b() : Status = Done(13)
+fn job_c() : Status = Done(20)
+
+fn print_status(s: Status) : Unit / Console = match s {
+  Done(v) -> Console.print(int_to_string(v))
+}
+
+fn main() : Int / Console + Spawn + Cancel = {
+  Console.print("supervisor up")
+  let r = handle {
+    with_mailbox {
+      nursery {
+        Actor.send(Actor.self(), fiber_await(fiber_spawn(job_a)))
+        Actor.send(Actor.self(), fiber_await(fiber_spawn(job_b)))
+        Actor.send(Actor.self(), fiber_await(fiber_spawn(job_c)))
+        print_status(Actor.receive())
+        print_status(Actor.receive())
+        print_status(Actor.receive())
+        Console.print("all jobs reported")
+        0
+      }
+    }
+  } with Cancel {
+    raise(resume) -> {
+      Console.print("supervision cancelled — cleanup ran")
+      99
+    }
+  }
+  Console.print("supervisor done")
+  Console.print(int_to_string(r))
+  0
+}
