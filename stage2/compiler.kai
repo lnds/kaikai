@@ -5207,13 +5207,28 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
         # handlers (m7a #7) always resume, so the longjmp branch is
         # a no-op for them; the node's handle_jmp is NULL there.
         let eff_n = dotted_prefix(callee)
-        let op_n  = dotted_suffix(callee)
+        let op_n_tagged = dotted_suffix(callee)
+        # m7b #15 (compiler integration, scope-limited): the alias
+        # rewrite tags op names with `@<alias>` when the original
+        # callee was an `as`-bound capability. Split here: when
+        # tagged, dispatch via the handle's local
+        # `kai_alias_<alias>_id` (kai_evidence_lookup_node_by_id);
+        # otherwise the standard innermost-by-name lookup.
+        let at_pos = string_index_of_at(op_n_tagged)
+        let op_n = if at_pos >= 0 { string_slice(op_n_tagged, 0, at_pos) } else { op_n_tagged }
+        let alias_n = if at_pos >= 0 { string_slice(op_n_tagged, at_pos + 1, string_length(op_n_tagged)) } else { "" }
+        let lookup_c =
+          if at_pos >= 0 {
+            concat_all(["kai_evidence_lookup_node_by_id(kai_alias_", alias_n, "_id)"])
+          } else {
+            concat_all(["kai_evidence_lookup_node(\"", eff_n, "\")"])
+          }
         let arg_str = match args_e {
           [] -> ""
           _  -> cat2(", ", call_args)
         }
         concat_all([
-          "({ KaiEvidence *_node_op = kai_evidence_lookup_node(\"", eff_n, "\"); ",
+          "({ KaiEvidence *_node_op = ", lookup_c, "; ",
           "Ev", eff_n, " *_ev_op = (Ev", eff_n, " *) _node_op->handler; ",
           "KaiCont _k; kai_cont_init_identity(&_k, _ev_op->handler_id); ",
           "KaiValue *_op_r = _ev_op->", op_n, "(_ev_op", arg_str, ", &_k); ",
@@ -6627,8 +6642,8 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
       let full = cat2("todo: ", msg)
       concat_all(["kai_prelude_panic(kai_str(\"", full, "\"))"])
     }
-    EHandle(body, eff_name, _eff_tyargs, init_opt, _alias, clauses, ret_opt) ->
-      emit_handle(src, body, eff_name, init_opt, clauses, ret_opt, x.line, x.col, fns, variants, lams)
+    EHandle(body, eff_name, _eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      emit_handle(src, body, eff_name, init_opt, alias_opt, clauses, ret_opt, x.line, x.col, fns, variants, lams)
   }
 }
 
@@ -6643,11 +6658,27 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
 # clause body emitter exposes that slot inside clauses as `state` /
 # `log` aliases of `self->state`.
 fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr],
+               alias_opt: Option[String],
                clauses: [HClause],
                ret_opt: Option[HReturn], hline: Int, hcol: Int,
                fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   let body_c = emit_expr(src, body, fns, variants, lams)
   let assigns = emit_clause_assignments(eff_name, clauses, hline, hcol)
+  # m7b #15 (compiler integration): expose the handle's
+  # `handler_id` as a local C variable named `kai_alias_<a>_id`
+  # whenever the handle declared an `as`-bound capability. The
+  # op-call dispatch (emit_call_expr) emits a
+  # `kai_evidence_lookup_node_by_id(kai_alias_<a>_id)` call
+  # whenever the alias rewrite tagged the op name with
+  # `@<a>`. The local lives in the same statement-expression
+  # as the rest of the handle prologue, so it is in scope for
+  # every op-call site inside `body_c`.
+  let alias_id_c = match alias_opt {
+    Some(a) -> concat_all([
+      "KaiHandlerId kai_alias_", a, "_id = _ev.handler_id; "
+    ])
+    None -> ""
+  }
   let init_c = match init_opt {
     Some(ie) -> concat_all(["_ev.state = ", emit_expr(src, ie, fns, variants, lams), "; "])
     None     -> ""
@@ -6686,6 +6717,7 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
     "jmp_buf _jmp; ",
     "KaiValue *_discard = NULL; ",
     "KaiValue *_body_result; ",
+    alias_id_c,
     "if (setjmp(_jmp) == 0) { ",
       "kai_evidence_push_with_jmp(&_node, \"", eff_name, "\", &_ev, &_jmp, &_discard); ",
       "_body_result = ", body_c, "; ",
@@ -7334,16 +7366,37 @@ fn default_pops_for(main_row: [String]) : String =
 # pattern resolve to the let, but for now this rewrite naively rewrites
 # any `alias.op` it finds inside the body. Pinned in Doc C §m7b #5
 # *Pre-resolve sugars*.
-type AliasMap = AM([AliasBinding])
+type AliasMap = AM([AliasBinding], Bool)   # bindings, may_tag
 
-fn alias_map_empty() : AliasMap = AM([])
+fn alias_map_empty() : AliasMap = AM([], true)
 
 fn alias_map_push(m: AliasMap, name: String, eff: String) : AliasMap {
-  match m { AM(xs) -> AM([AB(name, eff), ...xs]) }
+  # m7b #15: the rewrite-pass AliasMap stores the per-binding
+  # taggability Bool inside AB so the inferencer's snapshots stay
+  # symmetric, but the rewrite pass actually consults
+  # `alias_map_may_tag(m)` (a per-map flag) to decide tagging.
+  # Pass `true` here unconditionally — the per-map flag is what
+  # gates EField tagging in `rewrite_alias_kind`.
+  match m { AM(xs, t) -> AM([AB(name, eff, true), ...xs], t) }
 }
 
 fn alias_map_lookup(m: AliasMap, name: String) : Option[String] {
-  match m { AM(xs) -> lookup_alias(xs, name) }
+  match m { AM(xs, _) -> lookup_alias(xs, name) }
+}
+
+# m7b #15 (compiler integration, scope-limited): once we descend
+# into a closure (lambda body), the handle prologue's
+# `kai_alias_<a>_id` C local is no longer in scope. Mark the
+# alias map so the EField rewrite stops tagging op names with
+# `@<alias>` and falls back to the legacy name-keyed lookup.
+# The bindings themselves stay live so the substitution
+# `cap.op` → `Eff.op` keeps working inside the closure.
+fn alias_map_disable_tag(m: AliasMap) : AliasMap {
+  match m { AM(xs, _) -> AM(xs, false) }
+}
+
+fn alias_map_may_tag(m: AliasMap) : Bool {
+  match m { AM(_, t) -> t }
 }
 
 # m7b #17: drop every binding for `name` from the alias map. Used
@@ -7351,14 +7404,14 @@ fn alias_map_lookup(m: AliasMap, name: String) : Option[String] {
 # whose binder shadows an outer `with Eff as name`. Removes from
 # the head down so the most recent re-bind no longer matches.
 fn alias_map_remove(m: AliasMap, name: String) : AliasMap {
-  match m { AM(xs) -> AM(alias_remove_loop(xs, name, [])) }
+  match m { AM(xs, t) -> AM(alias_remove_loop(xs, name, []), t) }
 }
 
 fn alias_remove_loop(xs: [AliasBinding], name: String, acc: [AliasBinding]) : [AliasBinding] {
   match xs {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
-      AB(n, _) ->
+      AB(n, _, _) ->
         if n == name { alias_remove_loop(rest, name, acc) }
         else        { alias_remove_loop(rest, name, [h, ...acc]) }
     }
@@ -7524,7 +7577,23 @@ fn rewrite_alias_kind(k: ExprKind, m: AliasMap, line: Int, col: Int) : ExprKind 
           # `cap.get()` call becomes `Reader.ask()`.
           let real_fname =
             if eff_name == "Reader" and fname == "get" { "ask" } else { fname }
-          EField(mk_expr(EVar(eff_name), base.line, base.col), real_fname)
+          # m7b #15 (compiler integration, scope-limited): tag the
+          # field name with `@<alias>` so the codegen can dispatch
+          # via the handle's local `kai_alias_<a>_id` instead of a
+          # name-keyed lookup. This fixes the innermost-wins bug
+          # for the case where the op-call site is reachable from
+          # the handle prologue's lexical scope (no intervening
+          # closure). Inside a closure (`alias_map_may_tag = false`)
+          # the handle's local is out of scope, so we do not tag —
+          # the legacy name-keyed lookup runs and the closure-
+          # capture path keeps working. See m7b #15 sub-followup.
+          let tagged_fname =
+            if alias_map_may_tag(m) {
+              string_concat(real_fname, string_concat("@", name))
+            } else {
+              real_fname
+            }
+          EField(mk_expr(EVar(eff_name), base.line, base.col), tagged_fname)
         }
         None -> EField(rewrite_alias_expr(base, m), fname)
       }
@@ -7557,8 +7626,14 @@ fn rewrite_alias_kind(k: ExprKind, m: AliasMap, line: Int, col: Int) : ExprKind 
     EUnop(op, x) -> EUnop(op, rewrite_alias_expr(x, m))
     ELambda(ps, b) -> {
       # m7b #17: lambda params shadow outer aliases inside the body.
+      # m7b #15 (scope-limited): also disable the @alias tagging
+      # inside the lambda body — the handle's `kai_alias_<a>_id`
+      # local is not in scope across the lambda boundary, so any
+      # tagged op call would emit invalid C. The substitution
+      # `cap.op` → `Eff.op` still runs; only the per-instance
+      # dispatch tag is suppressed.
       let names = map(ps, (pm) => pm.pname)
-      let m1 = alias_map_remove_all(m, names)
+      let m1 = alias_map_disable_tag(alias_map_remove_all(m, names))
       ELambda(ps, rewrite_alias_expr(b, m1))
     }
     EMatch(scr, arms) -> EMatch(rewrite_alias_expr(scr, m),
@@ -10651,7 +10726,17 @@ type EffUse = EU(String, Int, Int)
 # on exit. try_op_call consults it when the dotted lookup fails:
 # `log.print` walks the stack, finds `log → Io`, and retries as
 # `Io.print`.
-type AliasBinding = AB(String, String)   # alias_name, eff_name
+#
+# m7b #15 (compiler integration, scope-limited): the Bool field
+# records whether the binding is "taggable" — when true, an op
+# call through this alias gets the `@<alias>` suffix that the
+# codegen turns into a `kai_evidence_lookup_node_by_id(...)`
+# dispatch. When false (after we descended into a lambda body),
+# the alias still resolves for substitution but the codegen
+# falls back to the legacy name-keyed lookup. The handle
+# prologue's `kai_alias_<a>_id` C local is not in scope across
+# the lambda boundary, so tagged dispatch would emit invalid C.
+type AliasBinding = AB(String, String, Bool)   # alias_name, eff_name, taggable
 
 # `TyRes` is the narrow result returned by pure type operations that
 # don't consume or produce an expression (fresh var, instantiate a
@@ -10817,11 +10902,16 @@ fn st_set_row(st: InferState, new_row: [Label]) : InferState =
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
 
 # m7a #4e: push/pop the alias stack as we enter/leave a handle's body.
+# m7b #15: a freshly-pushed alias starts taggable; descending into a
+# lambda body marks every alias visible at that point as
+# non-taggable so try_op_call's alias-fallback emits a bare
+# dispatch key (no `@<alias>` suffix) and codegen falls back to
+# the legacy name-keyed lookup.
 fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses,
-               aliases: [AB(alias, eff), ...st.aliases],
+               aliases: [AB(alias, eff, true), ...st.aliases],
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
 
 fn st_pop_alias(st: InferState) : InferState {
@@ -10845,10 +10935,38 @@ fn st_set_clause_resume(st: InferState, rb: Option[ResumeBind]) : InferState =
 fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
   match aliases {
     [] -> None
-    [AB(alias, eff), ...rest] ->
+    [AB(alias, eff, _), ...rest] ->
       if alias == name { Some(eff) } else { lookup_alias(rest, name) }
   }
 }
+
+# m7b #15: variant of lookup_alias that also returns the binding's
+# taggability flag. Used by try_op_call's alias-fallback to decide
+# whether to emit a tagged dispatch key.
+fn lookup_alias_taggable(aliases: [AliasBinding], name: String) : Option[Bool] {
+  match aliases {
+    [] -> None
+    [AB(alias, _, t), ...rest] ->
+      if alias == name { Some(t) } else { lookup_alias_taggable(rest, name) }
+  }
+}
+
+# m7b #15: mark every alias currently in scope as non-taggable.
+# Called from synth_lambda before walking the body and reverted
+# afterwards via the standard `st_restore_entries` snapshot.
+fn aliases_disable_tag(aliases: [AliasBinding]) : [AliasBinding] {
+  match aliases {
+    [] -> []
+    [AB(a, e, _), ...rest] -> [AB(a, e, false), ...aliases_disable_tag(rest)]
+  }
+}
+
+fn st_disable_alias_tag(st: InferState) : InferState =
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: st.row, eff_uses: st.eff_uses,
+               aliases: aliases_disable_tag(st.aliases),
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
 
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
@@ -11685,9 +11803,30 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                 Some(eff) -> {
                   let real_op =
                     if eff == "Reader" and op_name == "get" { "ask" } else { op_name }
-                  let key2 = string_concat(eff, string_concat(".", real_op))
-                  match ty_env_lookup(st.env, key2) {
-                    Some(sc) -> Some(synth_op_call_with_scheme(st, sc, args_, key2, line, col))
+                  let lookup_key = string_concat(eff, string_concat(".", real_op))
+                  # m7b #15 (compiler integration, scope-limited):
+                  # when the alias is taggable (the call site is
+                  # in the same lexical scope as the handle's
+                  # prologue, no intervening lambda), the
+                  # dispatched callee carries an `@<alias>`
+                  # suffix so the codegen routes through the
+                  # handle's `kai_alias_<a>_id` C local instead
+                  # of the innermost name-keyed lookup. Inside a
+                  # lambda body the local is out of scope; we
+                  # then emit a bare dispatch key so the legacy
+                  # name-keyed lookup runs and the closure-
+                  # capture path keeps compiling.
+                  let taggable = match lookup_alias_taggable(st.aliases, name) {
+                    Some(b) -> b
+                    None    -> false
+                  }
+                  let dispatch_key = if taggable {
+                    string_concat(lookup_key, string_concat("@", name))
+                  } else {
+                    lookup_key
+                  }
+                  match ty_env_lookup(st.env, lookup_key) {
+                    Some(sc) -> Some(synth_op_call_with_scheme_keys(st, sc, args_, lookup_key, dispatch_key, line, col))
                     None ->
                       if is_effect_in_env(st.env, eff) {
                         Some(synth_op_call_unknown_op(st, eff, real_op, line, col))
@@ -11735,6 +11874,14 @@ fn synth_op_call_unknown_op(st: InferState, eff_name: String, op_name: String,
 
 fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
                               key: String, line: Int, col: Int) : Inferred {
+  # m7b #15: most call sites pass a single key — both the type
+  # lookup key and the codegen dispatch key are the same.
+  synth_op_call_with_scheme_keys(st, sc, args_, key, key, line, col)
+}
+
+fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
+                                   lookup_key: String, dispatch_key: String,
+                                   line: Int, col: Int) : Inferred {
   # m7b #11i: capture the fresh ids minted by instantiation. For
   # parametric effects (where the scheme quantifies over the effect's
   # tparams) these fresh tyvars are the row label's ty_args. For
@@ -11743,19 +11890,23 @@ fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
   # tparams; those are NOT part of the row label's ty_args. Use the
   # `op_eff_arities` table to take only the first N fresh ids
   # (corresponding to the effect's tparams) for the row.
+  # m7b #15: alias-rewritten op calls carry a `dispatch_key` with an
+  # `@<alias>` suffix so codegen can route through the handle's
+  # `kai_alias_<a>_id` local. Type-level lookups (op_eff_arities,
+  # row label) still use the bare `lookup_key`.
   let inst = st_instantiate_report(st, sc)
   let ra = synth_many(inst.st, args_)
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
-  let st2 = st_unify(rv.st, inst.ty, expected, string_concat("op call ", key), line, col)
-  let eff_n = dotted_prefix(key)
-  let eff_arity = lookup_op_eff_arity(st2.op_eff_arities, key)
+  let st2 = st_unify(rv.st, inst.ty, expected, string_concat("op call ", lookup_key), line, col)
+  let eff_n = dotted_prefix(lookup_key)
+  let eff_arity = lookup_op_eff_arity(st2.op_eff_arities, lookup_key)
   let eff_fresh = take_first(inst.fresh, eff_arity)
   let row_args = resolve_fresh_ids(eff_fresh, st2.sub)
   let lab = Label { eff: eff_n, ty_args: row_args }
   let st3 = st_add_label(st2, lab, line, col)
   let ty = apply_ty(st3.sub, rv.ty)
-  let root = with_ty(mk_expr(ECall(callee_expr_for_op(key, line, col), ra.exprs), line, col), ty)
+  let root = with_ty(mk_expr(ECall(callee_expr_for_op(dispatch_key, line, col), ra.exprs), line, col), ty)
   mk_inferred(st3, ty, root)
 }
 
@@ -11826,6 +11977,26 @@ fn string_contains_dot_loop(s: String, i: Int, n: Int) : Bool {
       None    -> false
     }
   }
+}
+
+# m7b #15 (compiler integration) — locate the `@` separator the
+# alias rewrite uses to tag op names. Returns the byte index, or
+# -1 when no `@` is present.
+fn string_index_of_at(s: String) : Int = string_index_of_at_loop(s, 0, string_length(s))
+
+fn string_index_of_at_loop(s: String, i: Int, n: Int) : Int {
+  if i >= n { -1 }
+  else { match char_at(s, i) {
+    Some(c) -> if c == '@' { i } else { string_index_of_at_loop(s, i + 1, n) }
+    None    -> -1
+  } }
+}
+
+# m7b #15: drop the `@<alias>` suffix from a tagged op key. When
+# absent, returns the key unchanged.
+fn string_strip_alias_tag(s: String) : String {
+  let at = string_index_of_at(s)
+  if at < 0 { s } else { string_slice(s, 0, at) }
 }
 
 # Synthesise a placeholder callee for the typed AST that emit later
@@ -11985,8 +12156,14 @@ fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : 
   # invoked inside the lambda body MUST NOT leak to the enclosing
   # function's row — they belong to the lambda type's own row.
   # Same pattern as `synth_handle` (snapshot, reset, walk, restore).
+  # m7b #15 (scope-limited): also mark every alias visible at the
+  # lambda boundary as non-taggable. The handle's
+  # `kai_alias_<a>_id` C local is not in scope across the lambda
+  # boundary, so try_op_call's alias-fallback must emit a bare
+  # dispatch key (no @-suffix) for op calls inside the body.
   let prev_row = added.st.row
-  let st_in = st_set_row(added.st, [])
+  let st_row = st_set_row(added.st, [])
+  let st_in = st_disable_alias_tag(st_row)
   let rb = synth(st_in, body)
   let lambda_row_labels = apply_labels(rb.st.sub, rb.st.row)
   let st_after = st_set_row(rb.st, prev_row)
@@ -15405,8 +15582,15 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
         # with KaiCont alloca). Otherwise fall through to the
         # standard fn-call path so dotted module paths and
         # non-effect names keep working.
-        match lookup_op_offset(e.op_offsets, nm) {
-          Some(offset) -> llvm_emit_op_dispatch(e, nm, offset, xs)
+        # m7b #15 (compiler integration): the alias rewrite tags
+        # op names with `@<alias>`; the LLVM dispatcher does not
+        # use the tag yet (the C dispatcher does — see
+        # emit_call_expr), so strip it from the lookup key here.
+        # Per-instance dispatch on the LLVM side stays a
+        # follow-up.
+        let lookup_key = string_strip_alias_tag(nm)
+        match lookup_op_offset(e.op_offsets, lookup_key) {
+          Some(offset) -> llvm_emit_op_dispatch(e, lookup_key, offset, xs)
           None ->
             match evar_find(e.vars_, nm) {
               Some(_) -> llvm_emit_variant_ctor(e, nm, xs)
