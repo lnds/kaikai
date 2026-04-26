@@ -956,6 +956,16 @@ type ExprKind
   # distinct `kind = "todo"` so tooling can tell `?` apart from
   # "I will fill this in" markers.
   | ETodo(String)
+  # m7e §13: `expr!` — postfix `Option`/`Result` propagation.
+  # `e!` on `Option[T]` unwraps `Some(x) -> x`; `None` short-circuits
+  # with `return None` from the enclosing function. On `Result[E, T]`,
+  # `Ok(x) -> x`; `Err(e)` short-circuits with `return Err(e)`. The
+  # enclosing function's return type must be the matching `Option[U]`
+  # or `Result[E, U]` (same E — no `From`-style coercion). The typer
+  # validates the enclosing return type and stamps `x.ty` with the
+  # unwrapped success type, which the emitter consumes to choose the
+  # correct discriminator (`Some` / `Ok`).
+  | EBang(Expr)
   # Effect handler (m7a #4b). `handle { body } with Eff [as alias]
   # { clauses [return(x) -> expr] }`. The `alias` (Option[String])
   # rebinds the capability name inside the body. m7a #4b is parser
@@ -1823,6 +1833,11 @@ fn parse_postfix_rest(p: Parser, lhs: Expr) : PExpr {
         }
       }
     }
+  } else if tk_is(t.kind, TkBang) {
+    # m7e §13: `expr!` — postfix Option/Result propagation. Binds
+    # tighter than calls and field access can chain through it
+    # (`f()!.field`, `xs[0]!`), but binary operators sit lower.
+    parse_postfix_rest(p_advance(p), mk_expr(EBang(lhs), t.line, t.col))
   } else if tk_is(t.kind, TkLbrace) and p.allow_trailing_lambda {
     # m7b §1: paren-free trailing lambda — `f { body }` desugars
     # to `f(() => body)`, optionally followed by a second trailing
@@ -3970,6 +3985,10 @@ fn dump_expr(e: Expr, depth: Int) : Unit {
     }
     ETodo(msg) ->
       emit_line(depth, "todo \"#{msg}\" @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EBang(inner) -> {
+      emit_line(depth, "bang @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(inner, depth + 1)
+    }
     EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
       let alias_s = match alias_opt { Some(a) -> string_concat(" as ", a) None -> "" }
       let targs_s = match eff_tyargs {
@@ -4492,6 +4511,7 @@ fn chk_expr(e: Env, x: Expr) : Env {
     EPipe(a, b) -> chk_expr(chk_expr(e, a), b)
     EHole(_) -> e          # holes bind no names; checker lets them pass silently
     ETodo(_) -> e          # m7d §1: same posture as a hole
+    EBang(inner) -> chk_expr(e, inner)   # m7e §13: scope-walk the operand
     EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
       # m7a #4e: `Eff as log` makes `log` a binding that names
       # the capability inside the body. We push a scope so the
@@ -5806,6 +5826,7 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
     EMatch(scr, arms) -> fv_arms(arms, own, globals, fv_expr(scr, own, globals, acc))
     ELambda(_, _) -> acc                      # nested lambdas collect their own
     ETodo(_) -> acc
+    EBang(inner) -> fv_expr(inner, own, globals, acc)
     ERecordLit(_, fields) -> fv_field_inits(fields, own, globals, acc)
     EList(elems) -> fv_list_elems(elems, own, globals, acc)
     ERange(a, b, opt_step) -> {
@@ -6081,6 +6102,7 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
     EHole(_) -> st
     ETodo(_) -> st
+    EBang(inner) -> collect_expr(inner, st)
     EHandle(body, eff_name, _, init_opt, _, clauses, ret_opt) -> {
       let stateful = match init_opt { Some(_) -> true None -> false }
       let s_init = match init_opt { Some(ie) -> collect_expr(ie, st) None -> st }
@@ -6642,8 +6664,46 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
       let full = cat2("todo: ", msg)
       concat_all(["kai_prelude_panic(kai_str(\"", full, "\"))"])
     }
+    EBang(inner) -> emit_bang(src, inner, fns, variants, lams)
     EHandle(body, eff_name, _eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
       emit_handle(src, body, eff_name, init_opt, alias_opt, clauses, ret_opt, x.line, x.col, fns, variants, lams)
+  }
+}
+
+# m7e §13 — lower `expr!` to a statement-expression that evaluates
+# `inner`, returns the success payload, or short-circuits the
+# enclosing C function with an early `return`. The discriminator
+# (`Some` vs `Ok`) is chosen from `inner.ty`, which the typer
+# stamped to `Option[_]` or `Result[_, _]` after substitution. Any
+# other shape here is a typer bug — we fall back to a panic stub
+# rather than emit silently-wrong C.
+fn emit_bang(src: String, inner: Expr, fns: [EFn], variants: [EVar],
+             lams: [LamInfo]) : String {
+  let inner_c = emit_expr(src, inner, fns, variants, lams)
+  let success = bang_success_variant(inner.ty)
+  match success {
+    Some(name) -> concat_all([
+      "({ KaiValue *_b = ", inner_c, "; ",
+      "if (!(_b && _b->tag == KAI_VARIANT && strcmp(_b->as.var.variant_name, \"",
+      name, "\") == 0)) return _b; ",
+      "_b->as.var.args[0]; })"
+    ])
+    None -> concat_all([
+      "kai_prelude_panic(kai_str(\"internal: `!` on non-Option/Result reached emitter\"))"
+    ])
+  }
+}
+
+fn bang_success_variant(opt_ty: Option[Ty]) : Option[String] {
+  match opt_ty {
+    None -> None
+    Some(t) -> match t {
+      TyCon(name, _) ->
+        if name == "Option" { Some("Some") }
+        else if name == "Result" { Some("Ok") }
+        else { None }
+      _ -> None
+    }
   }
 }
 
@@ -7786,6 +7846,7 @@ fn desugar_op_calls_kind(k: ExprKind, effs: [String]) : ExprKind {
       desugar_op_calls_expr(a, effs),
       desugar_op_calls_expr(b, effs),
       desugar_op_calls_opt_expr(opt_step, effs))
+    EBang(inner) -> EBang(desugar_op_calls_expr(inner, effs))
     _ -> k
   }
 }
@@ -7953,6 +8014,7 @@ fn desugar_index_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
     ERange(a, b, opt_step) -> ERange(desugar_index_expr(a),
                                       desugar_index_expr(b),
                                       desugar_index_opt(opt_step))
+    EBang(inner) -> EBang(desugar_index_expr(inner))
     _ -> k
   }
 }
@@ -8195,6 +8257,7 @@ fn body_escapes(name: String, e: Expr) : Bool {
     ERange(a, b, opt_step) -> body_escapes(name, a) or body_escapes(name, b) or opt_escapes(name, opt_step)
     ERecordLit(_, fields) -> fields_escape(name, fields)
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> body_escapes(name, body) or opt_escapes(name, init_opt) or clauses_escape(name, clauses) or ret_opt_escapes(name, ret_opt)
+    EBang(inner) -> body_escapes(name, inner)
   }
 }
 
@@ -8301,6 +8364,7 @@ fn contains_var(name: String, e: Expr) : Bool {
     ERecordLit(_, fields) -> fields_contain(name, fields)
     EPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> contains_var(name, body) or opt_contains(name, init_opt) or clauses_contain(name, clauses) or ret_opt_contains(name, ret_opt)
+    EBang(inner) -> contains_var(name, inner)
     _ -> false
   }
 }
@@ -8459,6 +8523,7 @@ fn specialise_kind(name: String, slot_name: String, k: ExprKind, line: Int, col:
               specialise_clauses(name, slot_name, clauses),
               specialise_ret_opt(name, slot_name, ret_opt))
     ELambda(ps, b) -> ELambda(ps, specialise_body(name, slot_name, b))
+    EBang(inner) -> EBang(specialise_body(name, slot_name, inner))
     _ -> k
   }
 }
@@ -8630,6 +8695,7 @@ fn desugar_var_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
     ERange(a, b, opt_step) -> ERange(desugar_var_expr(a),
                                       desugar_var_expr(b),
                                       desugar_var_opt(opt_step))
+    EBang(inner) -> EBang(desugar_var_expr(inner))
     _ -> k
   }
 }
@@ -10707,7 +10773,14 @@ type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs
                     # records, per dotted "Eff.op" key, the effect's
                     # arity so synth_op_call_with_scheme can split
                     # `inst.fresh` correctly. Builds during build_ty_env.
-                    op_eff_arities: [OpEffArity] }
+                    op_eff_arities: [OpEffArity],
+                    # m7e §13: declared return type of the immediately-
+                    # enclosing function. Set by `infer_decl` before it
+                    # walks the body; cleared (None) inside lambda
+                    # bodies — `e!` propagates from the enclosing
+                    # function, not from a closure, so `!` inside a
+                    # lambda is rejected with a clear diagnostic.
+                    ret_ty: Option[Ty] }
 
 type OpEffArity = OEA(String, Int)
 
@@ -10762,25 +10835,28 @@ fn infer_state_new_full(file: String, env: TyEnv, prelude_len: Int,
   InferState { file: file, env: env, prelude_len: prelude_len, sub: subst_empty(),
                recs: recs, errs: 0, insts: [], holes: [], row: [],
                eff_uses: [], aliases: [], clause_resume: None,
-               op_eff_arities: op_eff_arities }
+               op_eff_arities: op_eff_arities, ret_ty: None }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
   InferState { file: st.file, env: new_env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: new_sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty }
 
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty }
 
 # m7a #4c / m7b #11i: mark that the current body has performed an op
 # of `eff` with the given type-arg instantiation. Labels with the same
@@ -10795,7 +10871,8 @@ fn st_add_label(st: InferState, lab: Label, line: Int, col: Int) : InferState {
                  row: [lab, ...st.row],
                  eff_uses: [EU(lab.eff, line, col), ...st.eff_uses],
                  aliases: st.aliases,
-                 clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
+                 clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+                 ret_ty: st.ret_ty }
   }
 }
 
@@ -10899,7 +10976,8 @@ fn st_set_row(st: InferState, new_row: [Label]) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: new_row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty }
 
 # m7a #4e: push/pop the alias stack as we enter/leave a handle's body.
 # m7b #15: a freshly-pushed alias starts taggable; descending into a
@@ -10912,7 +10990,8 @@ fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses,
                aliases: [AB(alias, eff, true), ...st.aliases],
-               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty }
 
 fn st_pop_alias(st: InferState) : InferState {
   match st.aliases {
@@ -10921,7 +11000,8 @@ fn st_pop_alias(st: InferState) : InferState {
       InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                    recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                    row: st.row, eff_uses: st.eff_uses, aliases: rest,
-                   clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
+                   clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+                   ret_ty: st.ret_ty }
   }
 }
 
@@ -10930,7 +11010,19 @@ fn st_set_clause_resume(st: InferState, rb: Option[ResumeBind]) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: rb, op_eff_arities: st.op_eff_arities }
+               clause_resume: rb, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty }
+
+# m7e §13: stash/clear/restore the enclosing function's declared
+# return type for `e!` propagation. Set by `infer_decl` before walking
+# the body; cleared by `synth_lambda` so `!` inside a closure is
+# rejected (would propagate from the lambda, not the surrounding fn).
+fn st_set_ret_ty(st: InferState, rt: Option[Ty]) : InferState =
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: rt }
 
 fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
   match aliases {
@@ -10966,19 +11058,22 @@ fn st_disable_alias_tag(st: InferState) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses,
                aliases: aliases_disable_tag(st.aliases),
-               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty }
 
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty }
 
 fn st_push_hole(st: InferState, h: HoleSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes],
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty }
 
 # m7a #8: lookup the recorded first-use line/col of an effect label.
 # Returns (-1, -1) when the effect was never tracked — that should
@@ -11121,7 +11216,8 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     eff_uses: inner.eff_uses,
     aliases: outer.aliases,
     clause_resume: outer.clause_resume,
-    op_eff_arities: outer.op_eff_arities
+    op_eff_arities: outer.op_eff_arities,
+    ret_ty: outer.ret_ty
   }
 
 # ---- parameter typing ----
@@ -11307,6 +11403,7 @@ fn synth(st: InferState, e: Expr) : Inferred {
     EPipe(lhs, rhs)            -> synth_pipe(st, lhs, rhs, e.line, e.col)
     EHole(nm_opt)              -> synth_hole(st, nm_opt, e)
     ETodo(msg)                 -> synth_todo(st, msg, e)
+    EBang(inner)               -> synth_bang(st, inner, e.line, e.col)
     EHandle(_, _, _, _, _, _, _) -> synth_handle(st, e)
   }
 }
@@ -11644,6 +11741,137 @@ fn synth_hole(st: InferState, nm_opt: Option[String], e: Expr) : Inferred {
 # fresh TyVarT.
 fn synth_todo(st: InferState, msg: String, e: Expr) : Inferred =
   register_fresh_hole(st, HKTodo(msg), e)
+
+# m7e §13 — `expr!` typer.
+# - Operand must be `Option[T]` or `Result[E, T]` (after substitution).
+# - Enclosing function's declared return type must be the matching
+#   `Option[U]` or `Result[E, U]` (same `E` — no `From` coercion).
+# - Result type of the EBang node is the unwrapped success type `T`.
+# Diagnostics name both types; the inner Expr is re-stamped with its
+# resolved operand type so the C emitter can pick the correct
+# discriminator (`Some` / `Ok`).
+fn synth_bang(st: InferState, inner: Expr, line: Int, col: Int) : Inferred {
+  let ri = synth(st, inner)
+  let it_now = apply_ty(ri.st.sub, ri.ty)
+  let inner_typed = with_ty(ri.expr, it_now)
+  match it_now {
+    TyCon(name, args_) ->
+      if name == "Option" {
+        match args_ {
+          [t] -> bang_finish_option(ri.st, inner_typed, t, line, col)
+          _   -> bang_bad_operand(ri.st, it_now, inner_typed, line, col)
+        }
+      } else if name == "Result" {
+        match args_ {
+          [e_ty, t] -> bang_finish_result(ri.st, inner_typed, e_ty, t, line, col)
+          _ -> bang_bad_operand(ri.st, it_now, inner_typed, line, col)
+        }
+      } else {
+        bang_bad_operand(ri.st, it_now, inner_typed, line, col)
+      }
+    _ -> bang_bad_operand(ri.st, it_now, inner_typed, line, col)
+  }
+}
+
+# Validate `Option[t]` against the enclosing return type. The fn must
+# return `Option[U]` for some `U` — we extract the U via a fresh
+# tyvar so a generic `fn f[a]() : Option[a]` body still type-checks.
+fn bang_finish_option(st: InferState, inner_typed: Expr, t: Ty,
+                       line: Int, col: Int) : Inferred {
+  match st.ret_ty {
+    None -> bang_no_enclosing_fn(st, "Option", t, inner_typed, line, col)
+    Some(rt) -> {
+      let rt_now = apply_ty(st.sub, rt)
+      match rt_now {
+        TyCon(rname, rargs) ->
+          if rname == "Option" {
+            match rargs {
+              [_] ->
+                mk_inferred(st, t, with_ty(mk_expr(EBang(inner_typed), line, col), t))
+              _ -> bang_ret_mismatch(st, "Option", t, rt_now, inner_typed, line, col)
+            }
+          } else {
+            bang_ret_mismatch(st, "Option", t, rt_now, inner_typed, line, col)
+          }
+        _ -> bang_ret_mismatch(st, "Option", t, rt_now, inner_typed, line, col)
+      }
+    }
+  }
+}
+
+# Validate `Result[e_ty, t]` against the enclosing return type. The fn
+# must return `Result[E, U]` for the same E — we unify e_ty with the
+# function's declared error type (no implicit conversion).
+fn bang_finish_result(st: InferState, inner_typed: Expr, e_ty: Ty, t: Ty,
+                       line: Int, col: Int) : Inferred {
+  match st.ret_ty {
+    None -> bang_no_enclosing_fn(st, "Result", t, inner_typed, line, col)
+    Some(rt) -> {
+      let rt_now = apply_ty(st.sub, rt)
+      match rt_now {
+        TyCon(rname, rargs) ->
+          if rname == "Result" {
+            match rargs {
+              [ret_e_ty, _] -> {
+                let st1 = st_unify(st, e_ty, ret_e_ty,
+                  "`!` propagation requires the same error type as the enclosing function",
+                  line, col)
+                mk_inferred(st1, t, with_ty(mk_expr(EBang(inner_typed), line, col), t))
+              }
+              _ -> bang_ret_mismatch_result(st, e_ty, t, rt_now, inner_typed, line, col)
+            }
+          } else {
+            bang_ret_mismatch_result(st, e_ty, t, rt_now, inner_typed, line, col)
+          }
+        _ -> bang_ret_mismatch_result(st, e_ty, t, rt_now, inner_typed, line, col)
+      }
+    }
+  }
+}
+
+fn bang_bad_operand(st: InferState, found: Ty, inner_typed: Expr,
+                     line: Int, col: Int) : Inferred {
+  diag_error(st.file, line, col,
+    "`!` requires an `Option[T]` or `Result[E, T]` operand")
+  diag_note("operand type: #{ty_to_string(found)}")
+  diag_help("`!` is reserved for the two compiler-blessed propagation types; convert the value explicitly first")
+  let st1 = st_bump_err(st)
+  let stub = with_ty(mk_expr(EBang(inner_typed), line, col), TyAny)
+  mk_inferred(st1, TyAny, stub)
+}
+
+fn bang_no_enclosing_fn(st: InferState, fam: String, t: Ty, inner_typed: Expr,
+                         line: Int, col: Int) : Inferred {
+  diag_error(st.file, line, col,
+    "`!` is only valid inside a function body")
+  diag_note("operand type: #{fam}[#{ty_to_string(t)}]")
+  diag_help("`!` propagates from the enclosing function; it cannot appear inside a lambda or at top level")
+  let st1 = st_bump_err(st)
+  let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
+  mk_inferred(st1, t, stub)
+}
+
+fn bang_ret_mismatch(st: InferState, fam: String, t: Ty, ret_ty: Ty,
+                      inner_typed: Expr, line: Int, col: Int) : Inferred {
+  diag_error(st.file, line, col,
+    "`!` on `#{fam}[#{ty_to_string(t)}]` requires the enclosing function to return `#{fam}[U]`")
+  diag_note("enclosing return type: #{ty_to_string(ret_ty)}")
+  diag_help("change the function's return type, or pattern-match the operand explicitly")
+  let st1 = st_bump_err(st)
+  let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
+  mk_inferred(st1, t, stub)
+}
+
+fn bang_ret_mismatch_result(st: InferState, e_ty: Ty, t: Ty, ret_ty: Ty,
+                             inner_typed: Expr, line: Int, col: Int) : Inferred {
+  diag_error(st.file, line, col,
+    "`!` on `Result[#{ty_to_string(e_ty)}, #{ty_to_string(t)}]` requires the enclosing function to return `Result[#{ty_to_string(e_ty)}, U]`")
+  diag_note("enclosing return type: #{ty_to_string(ret_ty)}")
+  diag_help("kaikai does not implicitly convert error types (no `From`); convert the error explicitly or change the function's return type")
+  let st1 = st_bump_err(st)
+  let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
+  mk_inferred(st1, t, stub)
+}
 
 fn register_fresh_hole(st: InferState, kind: HoleKind, e: Expr) : Inferred {
   let fresh_id = st.env.fresh
@@ -12164,7 +12392,13 @@ fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : 
   let prev_row = added.st.row
   let st_row = st_set_row(added.st, [])
   let st_in = st_disable_alias_tag(st_row)
-  let rb = synth(st_in, body)
+  # m7e §13: `e!` propagates from the enclosing function, not from a
+  # closure. Clear ret_ty inside the lambda body so any `!` site
+  # inside reports a clean diagnostic. st_restore_entries (below)
+  # restores ret_ty from `outer` after the walk, so subsequent
+  # siblings of the lambda see the function-level ret_ty unchanged.
+  let st_in2 = st_set_ret_ty(st_in, None)
+  let rb = synth(st_in2, body)
   let lambda_row_labels = apply_labels(rb.st.sub, rb.st.row)
   let st_after = st_set_row(rb.st, prev_row)
   let st2 = st_restore_entries(outer, st_after)
@@ -12960,11 +13194,16 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # the row_fresh counter past the rbinds above.
       let st0a = st_set_env(st0, advance_fresh(st0.env, list_length(tpbinds)))
       let added = add_infer_params_with_binds(st0a, ps, tpbinds, rbinds)
-      let rb = synth(added.st, body)
       let declared_ret = match opt_ret {
         Some(rty) -> resolve_ty_with_binds(rty, tpbinds, rbinds)
         None      -> TyUnit
       }
+      # m7e §13: thread the declared return type through the body walk
+      # so `e!` can validate the propagation target. Cleared on entry
+      # to lambda bodies (synth_lambda) — `!` does not propagate from
+      # closures.
+      let st_ready = st_set_ret_ty(added.st, Some(declared_ret))
+      let rb = synth(st_ready, body)
       let what = string_concat("return type of ", nm)
       let ret_site = return_site_of(body)
       let st1 = st_unify(rb.st, declared_ret, rb.ty, what, ret_site.line, ret_site.col)
@@ -13263,6 +13502,7 @@ fn tag_of_kind(k: ExprKind) : String {
       None     -> "hole ?"
     }
     ETodo(msg)     -> concat_all(["todo \"", msg, "\""])
+    EBang(_)       -> "bang"
     EHandle(_, eff_name, _, _, _, _, _) -> concat_all(["handle ", eff_name])
   }
 }
@@ -13366,6 +13606,7 @@ fn dump_typed_subexprs(k: ExprKind, depth: Int) : Unit {
       match tail { Some(t) -> dump_typed_expr(t, depth) None -> () }
     }
     EPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    EBang(inner) -> dump_typed_expr(inner, depth)
     _ -> ()
   }
 }
@@ -13604,6 +13845,7 @@ fn pcs_collect_uses_kind(k: ExprKind, line: Int, col: Int, scope: [String],
         }
       }
     }
+    EBang(inner) -> pcs_collect_uses_expr(inner, scope, in_lam, acc)
     _ -> acc
   }
 }
@@ -13839,6 +14081,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
       }
       EHandle(body1, eff, eff_tas, init1, alias, cls1, ret1)
     }
+    EBang(inner) -> EBang(pcs_rewrite_expr(inner, scope, uses, in_lam))
     _ -> k
   }
 }
@@ -15148,6 +15391,14 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
       ])
       llvm_set_last(llvm_append_body(r.e, p_instr), r.reg)
     }
+    EBang(_) -> {
+      # m7e §13: the LLVM backend does not yet implement the
+      # `expr!` propagation lowering. Stage 2's own source does not
+      # use `!`, so selfhost-llvm is unaffected; user programs that
+      # use `!` go through the C backend (test-sugars, test-run).
+      eprint("llvm: `!` postfix lowering not yet implemented (m7e §13 follow-up)")
+      llvm_set_last(e, "undef")
+    }
     _ -> {
       eprint("llvm: unsupported expression kind (#{expr_kind_name(x.kind)}) at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
       llvm_set_last(e, "undef")
@@ -15181,6 +15432,7 @@ fn expr_kind_name(k: ExprKind) : String {
     EPipe(_, _)    -> "EPipe"
     EHole(_)       -> "EHole"
     ETodo(_)       -> "ETodo"
+    EBang(_)       -> "EBang"
     EHandle(_, _, _, _, _, _, _) -> "EHandle"
   }
 }

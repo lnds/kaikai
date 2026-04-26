@@ -40,7 +40,7 @@ on.
 | Record punning `{ x, y }`                  | landed m7d   | parser                 |
 | `variants[T]()` builtin                    | scheduled m7e | monomorphisation       |
 | Sum types with constant attributes         | proposed     | parser + resolution     |
-| `!` postfix — `Option` / `Result` propagation | scheduled m7e | `Option` / `Result` in prelude |
+| `!` postfix — `Option` / `Result` propagation | landed m7e §13 | `Option` / `Result` in prelude |
 | `@` as-pattern in `match`                  | landed m7d   | parser                 |
 | `?.` optional chaining                     | proposed     | parser + type checker   |
 | Bit ops (`bit.and` / `bit.or` / `bit.shl` / ...) | scheduled m13 | stdlib module + intrinsic recognition |
@@ -502,9 +502,16 @@ unwraps the success case into a `T` and short-circuits the enclosing
 function on the failure case. Equivalent to Rust's `?`, renamed
 because `?` is already taken by typed holes.
 
-**Status**: already reserved in `docs/kaikai-minimal.md` ("`!` is
-reserved (post-minimal uses for `Option`/`Result` propagation)").
-This entry formalises the semantics.
+**Status**: **landed m7e §13** (mini-lane ahead of m12.8 — see
+`docs/stage2-design.md` §"Update 2026-04-26 — post-m7b reordering").
+The token was already reserved in `docs/kaikai-minimal.md` ("`!` is
+reserved (post-minimal uses for `Option`/`Result` propagation)");
+this entry formalised the semantics, and the parser, typer (with
+enclosing-`ret_ty` threading), and C emitter now implement it. The
+LLVM backend stub aborts at use-site (`!`-using programs go through
+the C path); a real LLVM lowering is a follow-up. Stage 2's own
+source does not use `!`, so selfhost and selfhost-llvm are
+unaffected. Fixtures live under `examples/sugars/m7e_13_*`.
 
 ### Semantics
 
