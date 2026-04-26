@@ -1521,11 +1521,19 @@ page the way they are written.
    (`docs/syntax-sugars.md` §*Trailing lambdas*). Includes
    single trailing, lambda-block as expression, double trailing.
    **Landed.**
-4. **`@cap` and `cap := v`** — post-resolve desugar pass
-   (depends on capability bindings produced by resolve).
-   **Unblocked by #11** — `State[T]` and `Reader[T]` are now
-   available as parametric effects; capability bindings of those
-   types exist in scope. *Pending.*
+4. **`@cap` and `cap := v`** — Doc B §`Syntax note: capability
+   read/write sugar`. Implementation: parser inlines the desugar.
+   `@Ident` parses as `EApp(EField(EVar(name), "get"), [])`;
+   `Ident := value` parses as
+   `SExprStmt(EApp(EField(EVar(name), "set"), [value]))`. The
+   inferencer's existing alias path (`try_op_call`) handles
+   `cap.op(args)` by looking up `Eff.op` once the alias is
+   resolved; an extra remap turns `cap.get` into `Reader.ask`
+   when `cap` is bound to a Reader. The narrow scope from
+   Doc B (rule 1: `@` only on get/ask; rule 2: `:=` only on set)
+   is enforced by shape — `@State.get` does not parse, and
+   `cap := v` on a Reader binding falls through to the existing
+   "unknown op `set` on effect Reader" diagnostic. **Landed.**
 5. **`var x = init`** — pre-resolve desugar + variable
    specialisation (§*Variable specialisation*). **Landed.** Doc B
    §3 mandates lowering to `handle { rest } with State[T](init) as
@@ -1697,8 +1705,9 @@ and #17 are the three known gaps it left behind, promoted from
 the §*Known follow-ups after m7b #5b* subsection. m7b #13, #14,
 and #7 all landed in sequence after #5b. m7b #18 (lambda free-var
 capture) landed too, surfaced while exercising the polymorphic
-helpers from #14. The remaining m7b items are: #2 (per-op
-generics), #4 (`@cap` / `cap := v` sugar), #8 (diagnostic
+helpers from #14. m7b #4 (`@cap` / `cap := v` sugars) also
+landed, completing the user-facing surface of the `var` workflow.
+The remaining m7b items are: #2 (per-op generics), #8 (diagnostic
 review), #15, #16, #17.
 
 ## Next steps
