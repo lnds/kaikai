@@ -1692,10 +1692,21 @@ page the way they are written.
     matching a declared tparam resolves to `TyVarT(id)` instead of
     `TyCon`; `fn_scheme_of_decl` generalises over both tparam_ids
     and rvbind_ids; `infer_decl` wires tpbinds into body inference
-    via `add_infer_params_with_binds`. Same HM machinery as the
-    pre-existing builtin polymorphic prelude functions
-    (`array_make`, `list_append`, etc.); the gap was only at the
-    user-fn entry point. **Landed.**
+    via `add_infer_params_with_binds`. **Landed.**
+
+    *Amended 2026-04-26 (R1 fix):* the original #13 plan rejected
+    undeclared lowercase identifiers as nominal `TyCon`s. That
+    decision broke `stdlib/core.kai` (its functions never declared
+    `[a]`) — `make test` did not catch it because the recursive
+    self-calls inside the stdlib unify `a` with itself; only an
+    external caller with a concrete element type exposed the
+    mismatch. `fn_scheme_of_decl` and `infer_decl` now also
+    auto-collect lowercase identifiers from the signature and
+    promote them to *implicit* tparams. The explicit `[T]` bracket
+    form keeps working unchanged; users no longer have to write it
+    when the lowercase identifier already appears in the signature.
+    The negative fixture `m7b_13_lowercase_undeclared` is removed
+    because `pub fn id(x: a) : a = x` is now valid.
 14. **Lambda effect rows** — effects invoked inside a lambda body
     now stay in the lambda type's own row instead of leaking to the
     enclosing function. Surfaced by the 2026-04-25 attempt at #7.
@@ -1824,7 +1835,38 @@ landed only its runtime primitive
 deferred after a 2026-04-26 spike showed the clean shape
 requires a new AST node + closure-capture changes. The
 remaining m7b items are: #8 (diagnostic review), and the
-deferred compiler-side of #15.
+deferred compiler-side of #15 (scheduled as a dedicated mini-
+milestone — see *Scheduled follow-up: #15 compiler integration*
+below).
+
+### Scheduled follow-up: #15 compiler integration
+
+Per-instance handler dispatch needs the runtime primitive
+(landed) **plus** these compiler changes, as a single
+mini-milestone:
+
+1. **New AST node `EOpCallByAlias(eff, op, alias, args)`** so the
+   alias name does not pollute the var-name namespace
+   (`State.get@a` is invalid C as a captured-var identifier).
+2. **Lambda-capture pass** recognises the new node and adds the
+   relevant `kai_alias_<a>_id` to the closure's capture array,
+   separate from the value captures (handler ids are scalar
+   `KaiHandlerId`, not `KaiValue *`).
+3. **Codegen for the new node** loads the captured id and calls
+   `kai_evidence_lookup_node_by_id` (already in stage0/runtime.h).
+4. **Two new fixtures** under `examples/effects/`:
+   - `m7b_15_nested_var_outer_reachable` — two `var`s of the same
+     `State[Int]` with both captured by an enclosing closure;
+     the closure must read the outer cell, not the inner.
+   - `m7b_15_explicit_handler_per_instance` — same shape, but
+     using user-written `with State[T] as a { with State[T] as b
+     { ... } }` instead of the var sugar.
+
+**Trigger to schedule**: when the next code change touches
+`synth_lambda` / lambda-capture in `stage2/compiler.kai`, OR when
+a real-world program hits the bug. Until then the mitigation
+(m7b #16's stack-slot lowering for non-escaping vars) covers
+the common case.
 
 ## Next steps
 

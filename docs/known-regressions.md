@@ -11,12 +11,30 @@ re-discover anything.
 
 ## R1 — `list_contains` / `list_sort_by` self-recursion leaks a row variable when called from an effectful context
 
-**Status**: open since 2026-04-25, surfaced after merging `m5-stdlib`
-(commit `939705f`) and confirmed still present after merging `m8`
-(commit `4e4a5b6`) and after the m7b sweep that closed #14, #15,
-#16, #17, #2a, #2b, #2c, #4, #7 (last verified 2026-04-26 against
-main `fc17034`). None of those sub-tasks touched the row-unify
-path; the bug is upstream of any single m7b item.
+**Status**: **FIXED** 2026-04-26. The hypothesis ("row-unify path
+problem") was wrong. The actual bug: `stdlib/core.kai` declares its
+polymorphic functions as `pub fn list_contains(xs: [a], x: a) : Bool`
+*without* the `[a]` tparam brackets. Post-m7b #13, lowercase
+identifiers in type position are nominal `TyCon`s unless declared
+in `[…]`, so `a` was a concrete type and the call site failed to
+unify with `[Int], Int`. The reason `make test` looked green is
+that the recursive self-call inside the stdlib unifies `a` with
+itself; only an external caller with concrete element types
+exposes the mismatch.
+
+**Fix**: `fn_scheme_of_decl` and `infer_decl` now auto-collect
+lowercase identifiers in a decl's signature that were not
+declared in `[…]` and treat them as *implicit* tparams. The
+explicit-bracket form keeps working; users who wrote it pre-#13
+do not need to rewrite.
+
+**Side effect**: the m7b #13 negative fixture
+`examples/sugars/m7b_13_lowercase_undeclared.{kai,err.expected}`
+is removed because `pub fn id(x: a) : a = x` is now valid.
+
+Original report below for posterity.
+
+---
 
 **Severity**: medium. `make test` is **green** — every official
 fixture under `examples/` compiles. The regression manifests only
