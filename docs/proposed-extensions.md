@@ -23,7 +23,7 @@ on.
 
 | Extension                                  | Status        | Depends on              |
 |--------------------------------------------|---------------|-------------------------|
-| `todo!(msg) : T`                           | scheduled m7d | typed holes             |
+| `todo!(msg) : T`                           | landed m7d    | typed holes             |
 | `kai type <pos> --json`                    | proposed      | stage-2 type checker    |
 | Counterexample JSON for exhaustiveness     | proposed      | match exhaustiveness    |
 | `axiom name : T`                           | scheduled m12.7 | stage-2 type checker  |
@@ -37,20 +37,20 @@ on.
 | Extension                                  | Status   | Depends on              |
 |--------------------------------------------|----------|-------------------------|
 | Tuples `(T1, T2, ...)`                     | gated m8.5  | m8 corpus + measurement  |
-| Record punning `{ x, y }`                  | scheduled m7d | parser                 |
+| Record punning `{ x, y }`                  | landed m7d   | parser                 |
 | `variants[T]()` builtin                    | scheduled m7e | monomorphisation       |
 | Sum types with constant attributes         | proposed     | parser + resolution     |
 | `!` postfix — `Option` / `Result` propagation | scheduled m7e | `Option` / `Result` in prelude |
-| `@` as-pattern in `match`                  | scheduled m7d | parser                 |
+| `@` as-pattern in `match`                  | landed m7d   | parser                 |
 | `?.` optional chaining                     | proposed     | parser + type checker   |
 | Bit ops (`bit.and` / `bit.or` / `bit.shl` / ...) | scheduled m13 | stdlib module + intrinsic recognition |
 | `Map[K, V]` + `m["key"]` indexing          | proposed     | collection design       |
 | Slice syntax `a[i..j]`                     | proposed     | `Vector[T]` landing     |
 | Method references as values (`obj.method`) | scheduled m7f | parser + brand machinery |
 | `Range[T]` as a first-class iterable       | proposed     | collection design       |
-| Pipeline placeholder `_`                   | scheduled m7d | parser                 |
+| Pipeline placeholder `_`                   | landed m7d   | parser                 |
 | Binary pattern matching `<<...>>`          | proposed     | parser + match exhaustiveness |
-| `++` operator (string + list concat)       | scheduled m7d | parser + 2 typer rules |
+| `++` operator (string + list concat)       | landed m7d   | parser + 2 typer rules |
 | `main()` row inference                     | scheduled m7e | typer + runtime default loader |
 | `use Effect` — open effect in scope        | scheduled m7e | parser + resolver scoping |
 
