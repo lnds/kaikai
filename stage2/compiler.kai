@@ -1000,7 +1000,12 @@ type HClause = HC(String, [Param], Expr, Int, Int)
 type HReturn = HR(String, Expr, Int, Int)
 
 type Decl
-  = DFn(Bool, String, [Param], Option[TypeExpr], RowExpr, Expr, Int, Int)
+  # m7b #13: optional type parameters on the function declaration —
+  # `pub fn id[T](x: T) : T = x`. Empty list for monomorphic decls.
+  # Each name in tparams is a quantified type variable in scope across
+  # the param types, return type, row, and body. Generalised in
+  # fn_scheme_of_decl so each call site fresh-instantiates.
+  = DFn(Bool, String, [String], [Param], Option[TypeExpr], RowExpr, Expr, Int, Int)
   | DType(Bool, String, [String], TypeBody, Int, Int)
   | DTest(String, Expr, Int, Int)
   | DImport(ImportKind, Int, Int)
@@ -3071,10 +3076,23 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
   } else {
     let name = tok_source(p.src, id)
     let p1 = p_advance(p)
-    if not p_at(p1, TkLparen) {
-      err_d(p_error_here(p1, "expected `(` after function name"))
-    } else {
-      let p2 = p_skip_newlines(p_advance(p1))
+    # m7b #13: optional `[T1, T2, ...]` type parameter list before `(`.
+    # Same shape as effect tparams (m7b #11) — uppercase or lowercase
+    # identifiers, comma-separated. Empty when omitted.
+    let tparams_r =
+      if p_at(p1, TkLbracket) {
+        parse_type_params_loop(p_skip_newlines(p_advance(p1)), [])
+      } else {
+        PTParams { p: p1, r: Some([]) }
+      }
+    match tparams_r.r {
+      None -> err_d(tparams_r.p)
+      Some(tparams) -> {
+        let pp = tparams_r.p
+        if not p_at(pp, TkLparen) {
+          err_d(p_error_here(pp, "expected `(` after function name"))
+        } else {
+      let p2 = p_skip_newlines(p_advance(pp))
       let params_r = parse_fn_params(p2, [])
       match params_r.r {
         None -> err_d(params_r.p)
@@ -3102,19 +3120,21 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
               let rb = parse_expr(p5)
               match rb.r {
                 None -> err_d(rb.p)
-                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, row_r.r, body, t.line, t.col))
+                Some(body) -> ok_d(rb.p, DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body, t.line, t.col))
               }
             } else if p_at(p4, TkLbrace) {
               let tb = p_peek(p4)
               let rb = parse_block(p4, tb)
               match rb.r {
                 None -> err_d(rb.p)
-                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, row_r.r, body, t.line, t.col))
+                Some(body) -> ok_d(rb.p, DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body, t.line, t.col))
               }
             } else {
               err_d(p_error_here(p4, "expected `=` or `{` to start function body"))
             }
           }
+        }
+      }
         }
       }
     }
@@ -3886,9 +3906,10 @@ fn row_label_names(labels: [RowLabel]) : [String] {
 
 fn dump_decl(d: Decl, depth: Int) : Unit {
   match d {
-    DFn(is_pub, name, params, opt_ret, row, body, line, col) -> {
+    DFn(is_pub, name, tparams, params, opt_ret, row, body, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       emit_line(depth, "fn #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
       params |> each((pm) => dump_param(pm, depth + 1))
       match opt_ret { Some(ty) -> dump_type(ty, depth + 1) None -> () }
       dump_row_expr(row, depth + 1)
@@ -4329,7 +4350,7 @@ fn add_params(e: Env, ps: [Param]) : Env {
 
 fn chk_decl(e: Env, d: Decl) : Env {
   match d {
-    DFn(_, _, params, _, _, body, _, _) -> {
+    DFn(_, _, _, params, _, _, body, _, _) -> {
       let e1 = env_push(e)
       let e2 = add_params(e1, params)
       let e3 = chk_expr(e2, body)
@@ -4364,7 +4385,7 @@ fn register_decls(e: Env, ds: [Decl]) : Env {
 
 fn register_one(e: Env, d: Decl) : Env {
   match d {
-    DFn(_, name, _, _, _, _, _, _) -> env_add(e, name)
+    DFn(_, name, _, _, _, _, _, _, _) -> env_add(e, name)
     DType(_, name, _, body, _, _) -> {
       let e1 = env_add(e, name)
       match body {
@@ -4521,7 +4542,7 @@ fn check_row_labels(decls: [Decl], file: String, eff_names: [String],
 fn check_decl_row_labels(d: Decl, file: String, eff_names: [String],
                           arities: [EffArity]) : Int {
   match d {
-    DFn(_, _, _, _, rexpr, _, line, col) ->
+    DFn(_, _, _, _, _, rexpr, _, line, col) ->
       check_row_expr(rexpr, file, line, col, eff_names, arities)
     _ -> 0
   }
@@ -4628,7 +4649,7 @@ fn evar_find(vs: [EVar], target: String) : Option[Int] {
 
 fn fn_of_decl(d: Decl) : Option[EFn] {
   match d {
-    DFn(_, name, params, _, _, _, _, _) -> Some(EFn(name, list_length(params)))
+    DFn(_, name, _, params, _, _, _, _, _) -> Some(EFn(name, list_length(params)))
     _ -> None
   }
 }
@@ -5745,7 +5766,7 @@ fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect {
 
 fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
   match d {
-    DFn(_, _, _, _, _, body, _, _) -> collect_expr(body, st)
+    DFn(_, _, _, _, _, _, body, _, _) -> collect_expr(body, st)
     DType(_, _, _, _, _, _) -> st
     DTest(_, body, _, _) -> collect_expr(body, st)
     DImport(_, _, _) -> st
@@ -6247,14 +6268,14 @@ fn emit_fn_signature(name: String, params: [Param]) : String =
 
 fn emit_fn_forward(d: Decl) : String {
   match d {
-    DFn(_, name, params, _, _, _, _, _) -> cat2(emit_fn_signature(name, params), ";\n")
+    DFn(_, name, _, params, _, _, _, _, _) -> cat2(emit_fn_signature(name, params), ";\n")
     _ -> ""
   }
 }
 
 fn emit_thunk_forward(d: Decl) : String {
   match d {
-    DFn(_, name, _, _, _, _, _, _) ->
+    DFn(_, name, _, _, _, _, _, _, _) ->
       cat3("static KaiValue *_kai_", name, "_thunk(KaiValue *, KaiValue **, int);\n")
     _ -> ""
   }
@@ -6262,7 +6283,7 @@ fn emit_thunk_forward(d: Decl) : String {
 
 fn emit_fn_body(src: String, d: Decl, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   match d {
-    DFn(_, name, params, _, _, body, _, _) -> {
+    DFn(_, name, _, params, _, _, body, _, _) -> {
       let sig = emit_fn_signature(name, params)
       let body_c = emit_expr(src, body, fns, variants, lams)
       cat5(sig, " {\n    return ", body_c, ";\n", "}\n\n")
@@ -6286,7 +6307,7 @@ fn emit_param_reads(params: [Param], start: Int) : String {
 
 fn emit_fn_thunk(d: Decl) : String {
   match d {
-    DFn(_, name, params, _, _, _, _, _) -> {
+    DFn(_, name, _, params, _, _, _, _, _) -> {
       let param_reads = emit_param_reads(params, 0)
       let named_args = emit_param_args(params)
       let hdr = concat_all([
@@ -6311,7 +6332,7 @@ fn thunk_forward_decls(decls: [Decl]) : String =
 fn fn_bodies(src: String, decls: [Decl], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
   concat_all(map(decls, (d) => {
     match d {
-      DFn(_, _, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, fns, variants, lams), emit_fn_thunk(d))
+      DFn(_, _, _, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, fns, variants, lams), emit_fn_thunk(d))
       _ -> ""
     }
   }))
@@ -6389,7 +6410,7 @@ fn has_main_decl(decls: [Decl]) : Bool {
   match decls {
     [] -> false
     [d, ...rest] -> match d {
-      DFn(_, n, _, _, _, _, _, _) -> if n == "main" { true } else { has_main_decl(rest) }
+      DFn(_, n, _, _, _, _, _, _, _) -> if n == "main" { true } else { has_main_decl(rest) }
       _ -> has_main_decl(rest)
     }
   }
@@ -6437,7 +6458,7 @@ fn main_row_labels(decls: [Decl]) : [String] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DFn(_, n, _, _, row, _, _, _) ->
+      DFn(_, n, _, _, _, row, _, _, _) ->
         if n == "main" {
           match row {
             REmpty       -> []
@@ -6560,8 +6581,8 @@ fn rewrite_alias_decls(ds: [Decl]) : [Decl] = map(ds, rewrite_alias_decl)
 
 fn rewrite_alias_decl(d: Decl) : Decl {
   match d {
-    DFn(pub_, n, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, ps, ret, row, rewrite_alias_expr(body, alias_map_empty()), l, c)
+    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
+      DFn(pub_, n, tps, ps, ret, row, rewrite_alias_expr(body, alias_map_empty()), l, c)
     DTest(desc, body, l, c) ->
       DTest(desc, rewrite_alias_expr(body, alias_map_empty()), l, c)
     _ -> d
@@ -6701,8 +6722,8 @@ fn desugar_op_calls_decls(ds: [Decl], effs: [String]) : [Decl] =
 
 fn desugar_op_calls_decl(d: Decl, effs: [String]) : Decl {
   match d {
-    DFn(pub_, n, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, ps, ret, row, desugar_op_calls_expr(body, effs), l, c)
+    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
+      DFn(pub_, n, tps, ps, ret, row, desugar_op_calls_expr(body, effs), l, c)
     DTest(desc, body, l, c) ->
       DTest(desc, desugar_op_calls_expr(body, effs), l, c)
     _ -> d
@@ -6868,8 +6889,8 @@ fn desugar_index_decls(ds: [Decl]) : [Decl] = map(ds, desugar_index_decl)
 
 fn desugar_index_decl(d: Decl) : Decl {
   match d {
-    DFn(pub_, n, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, ps, ret, row, desugar_index_expr(body), l, c)
+    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
+      DFn(pub_, n, tps, ps, ret, row, desugar_index_expr(body), l, c)
     DTest(desc, body, l, c) -> DTest(desc, desugar_index_expr(body), l, c)
     _ -> d
   }
@@ -7031,8 +7052,8 @@ fn desugar_var_decls(ds: [Decl]) : [Decl] = map(ds, desugar_var_decl)
 
 fn desugar_var_decl(d: Decl) : Decl {
   match d {
-    DFn(pub_, n, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, ps, ret, row, desugar_var_expr(body), l, c)
+    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
+      DFn(pub_, n, tps, ps, ret, row, desugar_var_expr(body), l, c)
     DTest(desc, body, l, c) -> DTest(desc, desugar_var_expr(body), l, c)
     _ -> d
   }
@@ -7714,8 +7735,8 @@ fn dedup_row_labels_loop(ls: [RowLabel], seen: [String], acc: [RowLabel]) : [Row
 
 fn expand_aliases_in_decl(d: Decl, aliases: [AliasResult]) : Decl {
   match d {
-    DFn(p, n, params, ret, rexpr, body, l, c) ->
-      DFn(p, n, params, ret, expand_aliases_in_row(rexpr, aliases), body, l, c)
+    DFn(p, n, tps, params, ret, rexpr, body, l, c) ->
+      DFn(p, n, tps, params, ret, expand_aliases_in_row(rexpr, aliases), body, l, c)
     _ -> d
   }
 }
@@ -7806,7 +7827,7 @@ fn param_ty(pm: Param) : Ty {
 # decl has no signature shape (DType, DImport).
 fn sig_of_decl(d: Decl) : Option[Ty] {
   match d {
-    DFn(_, _, params, opt_ret, rexpr, _, _, _) -> {
+    DFn(_, _, _, params, opt_ret, rexpr, _, _, _) -> {
       let pts = map(params, param_ty)
       let ret = match opt_ret {
         Some(rty) -> resolve_ty(rty)
@@ -7877,7 +7898,7 @@ fn row_to_string_suffix(r: Row) : String {
 # the user wrote.
 fn dump_decl_type(d: Decl) : Unit {
   match d {
-    DFn(is_pub, name, _, _, _, _, line, col) -> {
+    DFn(is_pub, name, _, _, _, _, _, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       match sig_of_decl(d) {
         Some(ty) -> print("#{pub_s}fn #{name} : #{ty_to_string(ty)} @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -8168,7 +8189,7 @@ fn add_variants_loop(env: TyEnv, tname: String, tparams: [String], vs: [Variant]
 # decl gets a stable assignment of bound row-var ids.
 fn collect_decl_rvars(d: Decl) : [String] {
   match d {
-    DFn(_, _, params, opt_ret, rexpr, _, _, _) -> {
+    DFn(_, _, _, params, opt_ret, rexpr, _, _, _) -> {
       let acc0 = collect_rvars_in_row(rexpr, [])
       let acc1 = collect_rvars_in_params(params, acc0)
       match opt_ret {
@@ -8241,51 +8262,103 @@ fn rvbind_ids_loop(binds: [RVBind], acc: [Int]) : [Int] {
 fn rvbind_ids(binds: [RVBind]) : [Int] = rvbind_ids_loop(binds, [])
 
 # Resolve a TypeExpr under both the type-parameter and row-variable
-# binding contexts. Variant of `resolve_ty` used by paths that need
-# row vars wired to their bound ids (m7b #12).
-fn resolve_ty_with_rvbinds(t: TypeExpr, rbinds: [RVBind]) : Ty {
+# binding contexts. m7b #13 added the tpbinds half on top of the
+# m7b #12 rbinds half. A `TyName(name, [])` is first looked up as a
+# tparam; if not found, the existing builtin / user-type fallback
+# applies.
+fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty {
   match t.tkind {
     TyName(name, tas) -> {
-      if name == "Int" { TyInt }
-      else if name == "Real"   { TyReal }
-      else if name == "Bool"   { TyBool }
-      else if name == "String" { TyString }
-      else if name == "Char"   { TyChar }
-      else if name == "Unit"   { TyUnit }
-      else if name == "Nothing" { TyAny }
-      else { TyCon(name, map(tas, (a) => resolve_ty_with_rvbinds(a, rbinds))) }
+      match tpbind_lookup(tpbinds, name) {
+        Some(i) -> tv(i)
+        None -> {
+          if name == "Int" { TyInt }
+          else if name == "Real"   { TyReal }
+          else if name == "Bool"   { TyBool }
+          else if name == "String" { TyString }
+          else if name == "Char"   { TyChar }
+          else if name == "Unit"   { TyUnit }
+          else if name == "Nothing" { TyAny }
+          else { TyCon(name, map(tas, (a) => resolve_ty_with_binds(a, tpbinds, rbinds))) }
+        }
+      }
     }
-    TyList(inner) -> TyListT(resolve_ty_with_rvbinds(inner, rbinds))
+    TyList(inner) -> TyListT(resolve_ty_with_binds(inner, tpbinds, rbinds))
     TyFn(fps, fret, rexpr) ->
-      TyFnT(map(fps, (p) => resolve_ty_with_rvbinds(p, rbinds)),
-            resolve_ty_with_rvbinds(fret, rbinds),
-            row_of_expr_with_rbinds(rexpr, rbinds))
+      TyFnT(map(fps, (p) => resolve_ty_with_binds(p, tpbinds, rbinds)),
+            resolve_ty_with_binds(fret, tpbinds, rbinds),
+            row_of_expr_with_binds(rexpr, tpbinds, rbinds))
   }
 }
 
-fn param_ty_with_rvbinds(pm: Param, rbinds: [RVBind]) : Ty {
+# Pre-#13 callers that only carry rbinds (no fn-level tparams).
+fn resolve_ty_with_rvbinds(t: TypeExpr, rbinds: [RVBind]) : Ty =
+  resolve_ty_with_binds(t, [], rbinds)
+
+fn param_ty_with_binds(pm: Param, tpbinds: [TPBind], rbinds: [RVBind]) : Ty {
   match pm.ptype {
-    Some(te) -> resolve_ty_with_rvbinds(te, rbinds)
+    Some(te) -> resolve_ty_with_binds(te, tpbinds, rbinds)
     None     -> TyAny
+  }
+}
+
+fn param_ty_with_rvbinds(pm: Param, rbinds: [RVBind]) : Ty =
+  param_ty_with_binds(pm, [], rbinds)
+
+# Variant of row_of_expr_with_rbinds that also resolves per-label
+# ty_args under tpbinds — labels like `Reader[T]` where `T` is a
+# fn-level type parameter (m7b #13).
+fn row_of_expr_with_binds(re: RowExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Row {
+  match re {
+    REmpty -> row_empty()
+    RClosed(labels) -> Row {
+      labels: row_labels_of_rls_with_binds(labels, tpbinds, rbinds),
+      tail: None,
+      display_alias: None
+    }
+    ROpen(rv, labels) -> Row {
+      labels: row_labels_of_rls_with_binds(labels, tpbinds, rbinds),
+      tail: match rvbind_lookup(rbinds, rv) {
+        Some(id) -> Some(id)
+        None     -> Some(-1)
+      },
+      display_alias: None
+    }
+  }
+}
+
+fn row_labels_of_rls_with_binds(ls: [RowLabel], tpbinds: [TPBind], rbinds: [RVBind]) : [Label] {
+  match ls {
+    [] -> []
+    [rl, ...rest] -> match rl {
+      RL(name, ts) -> [
+        Label { eff: name, ty_args: map(ts, (te) => resolve_ty_with_binds(te, tpbinds, rbinds)) },
+        ...row_labels_of_rls_with_binds(rest, tpbinds, rbinds)
+      ]
+    }
   }
 }
 
 fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
   match d {
-    DFn(_, _, params, opt_ret, rexpr, _, _, _) -> {
+    DFn(_, _, tparams, params, opt_ret, rexpr, _, _, _) -> {
       # m7b #12: collect row-variable names per decl, allocate small
       # bound ids (0, 1, ...) in order of appearance, build the body
       # type with those ids in tail positions. The scheme generalises
       # over them so each call site fresh-instantiates.
+      # m7b #13: same idea for declared type parameters (`fn id[T]...`).
+      # tparam ids are 0..len(tparams)-1; row-var ids live in their
+      # own dimension, so the two namespaces don't collide.
       let names = collect_decl_rvars(d)
       let rbinds = mk_rvbinds(names)
-      let pts = map(params, (p) => param_ty_with_rvbinds(p, rbinds))
+      let tpbinds = mk_tpbinds(tparams)
+      let pts = map(params, (p) => param_ty_with_binds(p, tpbinds, rbinds))
       let ret = match opt_ret {
-        Some(rty) -> resolve_ty_with_rvbinds(rty, rbinds)
+        Some(rty) -> resolve_ty_with_binds(rty, tpbinds, rbinds)
         None      -> TyUnit
       }
-      let body = TyFnT(pts, ret, row_of_expr_with_rbinds(rexpr, rbinds))
-      Some(scheme_full([], rvbind_ids(rbinds), body))
+      let body = TyFnT(pts, ret, row_of_expr_with_binds(rexpr, tpbinds, rbinds))
+      Some(scheme_full(tparam_ids(tparams), rvbind_ids(rbinds), body))
     }
     _ -> None
   }
@@ -8296,7 +8369,7 @@ fn add_decls_loop(env: TyEnv, ds: [Decl]) : TyEnv {
     [] -> env
     [d, ...rest] -> {
       let env1 = match d {
-        DFn(_, fname, _, _, _, _, _, _) -> match fn_scheme_of_decl(d) {
+        DFn(_, fname, _, _, _, _, _, _, _) -> match fn_scheme_of_decl(d) {
           Some(sc) -> ty_env_add(env, fname, sc)
           None     -> env
         }
@@ -9366,9 +9439,15 @@ fn param_ty_or_fresh(st: InferState, pm: Param) : TyRes {
   }
 }
 
-fn param_ty_or_fresh_with_rvbinds(st: InferState, pm: Param, rbinds: [RVBind]) : TyRes {
+fn param_ty_or_fresh_with_rvbinds(st: InferState, pm: Param, rbinds: [RVBind]) : TyRes =
+  param_ty_or_fresh_with_binds(st, pm, [], rbinds)
+
+# m7b #13: variant that also resolves type names against the fn-level
+# tparams declared on the surrounding decl.
+fn param_ty_or_fresh_with_binds(st: InferState, pm: Param,
+                                tpbinds: [TPBind], rbinds: [RVBind]) : TyRes {
   match pm.ptype {
-    Some(te) -> ty_res(st, resolve_ty_with_rvbinds(te, rbinds))
+    Some(te) -> ty_res(st, resolve_ty_with_binds(te, tpbinds, rbinds))
     None     -> st_fresh_ty(st)
   }
 }
@@ -9396,22 +9475,29 @@ fn add_infer_params(st: InferState, ps: [Param]) : InferredParams = add_infer_pa
 # under a row-variable binding context — used by `infer_decl` so the
 # function body's view of every parameter type carries the same
 # bound row-var ids that `fn_scheme_of_decl` chose for the scheme.
-fn add_infer_params_with_rvbinds_loop(st: InferState, ps: [Param],
-                                      rbinds: [RVBind], acc: [Ty]) : InferredParams {
+# m7b #13 added the tpbinds half so the body also sees fn-level
+# tparams as bound type variables (`fn id[T](x: T) : T = x`).
+fn add_infer_params_with_binds_loop(st: InferState, ps: [Param],
+                                    tpbinds: [TPBind], rbinds: [RVBind],
+                                    acc: [Ty]) : InferredParams {
   match ps {
     [] -> InferredParams { st: st, tys: list_reverse(acc) }
     [pm, ...rest] -> {
-      let pr = param_ty_or_fresh_with_rvbinds(st, pm, rbinds)
+      let pr = param_ty_or_fresh_with_binds(st, pm, tpbinds, rbinds)
       let env2 = ty_env_add(pr.st.env, pm.pname, mono(pr.ty))
       let st2 = st_set_env(pr.st, env2)
-      add_infer_params_with_rvbinds_loop(st2, rest, rbinds, [pr.ty, ...acc])
+      add_infer_params_with_binds_loop(st2, rest, tpbinds, rbinds, [pr.ty, ...acc])
     }
   }
 }
 
+fn add_infer_params_with_binds(st: InferState, ps: [Param],
+                               tpbinds: [TPBind], rbinds: [RVBind]) : InferredParams =
+  add_infer_params_with_binds_loop(st, ps, tpbinds, rbinds, [])
+
 fn add_infer_params_with_rvbinds(st: InferState, ps: [Param],
                                  rbinds: [RVBind]) : InferredParams =
-  add_infer_params_with_rvbinds_loop(st, ps, rbinds, [])
+  add_infer_params_with_binds(st, ps, [], rbinds)
 
 # ---- record instantiation ----
 
@@ -10948,20 +11034,24 @@ fn return_site_of(e: Expr) : Expr {
 
 fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: Decl, verbose: Bool) : TypedDecl {
   match d {
-    DFn(is_pub, nm, ps, opt_ret, row, body, line, col) -> {
+    DFn(is_pub, nm, tparams, ps, opt_ret, row, body, line, col) -> {
       # m7b #12: row-variable binding context for this decl. The
       # bound ids match those produced by fn_scheme_of_decl so the
       # body's params and any internal references to row-poly user
       # functions agree with the scheme stored in the env. The
       # inferencer's row_fresh counter is advanced past the highest
       # bound id, so future fresh row vars can never alias these.
+      # m7b #13: same idea for tpbinds — fn-level tparams resolve
+      # to small bound ids reused by the inferencer when fresh-
+      # instantiating at call sites.
       let rbinds = mk_rvbinds(collect_decl_rvars(d))
+      let tpbinds = mk_tpbinds(tparams)
       let st_init = infer_state_new(file, env, prelude_len, recs)
       let st0 = advance_row_fresh(st_init, list_length(rbinds))
-      let added = add_infer_params_with_rvbinds(st0, ps, rbinds)
+      let added = add_infer_params_with_binds(st0, ps, tpbinds, rbinds)
       let rb = synth(added.st, body)
       let declared_ret = match opt_ret {
-        Some(rty) -> resolve_ty_with_rvbinds(rty, rbinds)
+        Some(rty) -> resolve_ty_with_binds(rty, tpbinds, rbinds)
         None      -> TyUnit
       }
       let what = string_concat("return type of ", nm)
@@ -10974,7 +11064,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: De
       let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub)
       let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub)
       TypedDecl {
-        decl: DFn(is_pub, nm, ps, opt_ret, row, rb.expr, line, col),
+        decl: DFn(is_pub, nm, tparams, ps, opt_ret, row, rb.expr, line, col),
         errs: st2.errs,
         insts: resolved,
         holes: hole_reports
@@ -11311,7 +11401,7 @@ fn dump_typed_stmt(s: Stmt, depth: Int) : Unit {
 
 fn dump_typed_decl(d: Decl) : Unit {
   match d {
-    DFn(_, nm, _, _, _, body, line, col) -> {
+    DFn(_, nm, _, _, _, _, body, line, col) -> {
       print("fn #{nm} @#{int_to_string(line)}:#{int_to_string(col)}")
       dump_typed_expr(body, 1)
     }
@@ -13212,7 +13302,7 @@ type LlvmDeclOut = { text: String, next_id: Int }
 
 fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], start_id: Int) : LlvmDeclOut {
   match d {
-    DFn(_, nm, ps, _, _, body, _, _) -> {
+    DFn(_, nm, _, ps, _, _, body, _, _) -> {
       let locals0 = llvm_init_locals_from_params(ps)
       let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
                           globals: "", body: "",
