@@ -443,8 +443,15 @@ in.
     declarations, and selfhost scaffolding while a real
     definition is pending. ~0.5 day; reuses the typed-holes
     runtime infrastructure. Optional but cheap.
-13. **m13 — Property testing + bench**: `check` and `bench`
-    blocks, matching runners.
+13. **m13 — Property testing + bench + bit ops**: `check` and
+    `bench` blocks, matching runners. Plus the bit-operations
+    module per `proposed-extensions.md` §16: `stdlib/core/bit.kai`
+    with `bit.and` / `bit.or` / `bit.xor` / `bit.shl` / `bit.shr`
+    / `bit.ushr` / `bit.not` as **compiler intrinsics** (function
+    syntax at the surface, lowered directly to the backend op
+    with zero call overhead). No new operators. Demand surfaced
+    from `demos/9d9l/huffman` bit-packing and the planned `crypto`
+    / `encoding` stdlib modules.
 14. **m14 — Stdlib expansion**: stage-2-native stdlib,
     module-organised under `stdlib/core/{list,string,option,result,
     char,tuple,ordering}.kai` per `docs/stdlib-layout.md`.

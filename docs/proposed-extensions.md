@@ -43,7 +43,7 @@ on.
 | `!` postfix — `Option` / `Result` propagation | scheduled m7e | `Option` / `Result` in prelude |
 | `@` as-pattern in `match`                  | scheduled m7d | parser                 |
 | `?.` optional chaining                     | proposed     | parser + type checker   |
-| Bitwise operators (`&`, `~`, `^`, `<<`, `>>`) | deferred  | demand-driven          |
+| Bit ops (`bit.and` / `bit.or` / `bit.shl` / ...) | scheduled m13 | stdlib module + intrinsic recognition |
 | `Map[K, V]` + `m["key"]` indexing          | proposed     | collection design       |
 | Slice syntax `a[i..j]`                     | proposed     | `Vector[T]` landing     |
 | Method references as values (`obj.method`) | scheduled m7f | parser + brand machinery |
@@ -658,42 +658,89 @@ in kaikai).
 pass (to nested `opt_and_then`).
 **Depends on**: parser + type checker.
 
-## 16. Bitwise operators — deferred
+## 16. Bit operations — schedule m13 (intrinsic functions)
 
-Not a full proposal — a placeholder so the decision is not made by
-default.
+```kai
+import bit
 
-`&`, `~`, `^`, `<<`, `>>` on `Int` are standard bitwise operators in
-Rust, Go, C. kaikai has not adopted them because:
+fn pack_byte(bits: [Int]) : Int =
+  bits |> reduce(0, (acc, b) => bit.or(bit.shl(acc, 1), b))
 
-- No code in the project currently needs bit manipulation.
-- The arithmetic family (`+ - * / //`) is already wide; adding five
-  more symbols without pull from real code would grow the surface
-  for no gain.
-- `|` is taken (map pipe + variant separator); offering `&`, `~`,
-  `^`, `<<`, `>>` without `|` for bitwise OR is asymmetric.
+fn extract(byte: Int, pos: Int) : Int =
+  bit.and(bit.shr(byte, pos), 1)
+```
 
-### When to reconsider
+A concrete demand surfaced (`demos/9d9l/huffman` bit-packing,
+upcoming `crypto` / `encoding/base64` stdlib modules). Bit ops ship
+as **named functions in `stdlib/core/bit.kai`**, not as new
+operators. The compiler recognises them as intrinsics and lowers
+each call directly to the backend's bit op — same code emitted as
+if `&`/`^`/`<<`/`>>` were syntax, no function-call overhead.
 
-Land when any of these is true:
-- Stage-2 compiler internals need bit manipulation (likely for
-  efficient tag/layout computations in the emitter).
-- A stdlib module (hashing, encoding, random PRNG, networking) is
-  written and is obviously clearer with operators than with named
-  functions.
-- A user submits a concrete module where `bit_and`, `bit_or`,
-  `bit_shl` make ≥30% of expressions and hurt readability.
+### Why functions, not operators
 
-### Interim
+- **Surface stays small**: no new tokens, no precedence rules, no
+  parser change. CLAUDE.md Tier 1 #3 (fast compilation) and Tier 2
+  #6 (few visible concepts) both reward this.
+- **No conflict with `|`**: the map-pipe keeps its slot. Asymmetric
+  operator sets (`&`, `^`, `<<`, `>>` but not `|`) are avoided too;
+  the function form is uniform.
+- **Performance**: the compiler treats `bit.and` / `bit.or` /
+  `bit.xor` / `bit.shl` / `bit.shr` / `bit.not` as **intrinsics** —
+  they are recognised by name in the typed IR and emitted directly
+  as the corresponding C / LLVM bit op. Zero call overhead;
+  monomorphisation is unnecessary because they are already
+  monomorphic on `Int`.
+- **Readability**: in code that does heavy bit manipulation
+  (compression, crypto, parsing binary formats), the bit ops are
+  one node per call — the same density as operator chains. The
+  cost is a few extra characters per line, which buys parser /
+  lexer / precedence-table simplicity.
 
-Provide named functions in the prelude: `bit_and`, `bit_or`,
-`bit_xor`, `bit_not`, `bit_shl`, `bit_shr`. If the functions get
-heavy use, that is the signal to add operators. If they do not,
-the language stays smaller.
+### The `bit` module
 
-**Cost**: zero for now (stdlib functions). Medium if/when operators
-ship (lexer, parser, precedence rules, new AST node).
-**Depends on**: demonstrated need.
+```kai
+# stdlib/core/bit.kai
+
+pub fn bit.and(a: Int, b: Int) : Int           # intrinsic
+pub fn bit.or(a: Int, b: Int)  : Int           # intrinsic
+pub fn bit.xor(a: Int, b: Int) : Int           # intrinsic
+pub fn bit.not(a: Int)         : Int           # intrinsic
+pub fn bit.shl(a: Int, n: Int) : Int           # intrinsic, signed left shift
+pub fn bit.shr(a: Int, n: Int) : Int           # intrinsic, arithmetic right shift (sign-extending)
+pub fn bit.ushr(a: Int, n: Int) : Int          # intrinsic, logical right shift (zero-fill)
+
+# Non-intrinsic helpers (real functions, but pure):
+pub fn bit.popcount(n: Int) : Int
+pub fn bit.leading_zeros(n: Int) : Int
+pub fn bit.trailing_zeros(n: Int) : Int
+pub fn bit.rotate_left(n: Int, k: Int) : Int
+pub fn bit.rotate_right(n: Int, k: Int) : Int
+```
+
+The first seven are intrinsics — recognised by the compiler at the
+typed-IR level and lowered directly. The auxiliary helpers are
+ordinary kaikai functions implemented in terms of the intrinsics.
+
+### What it costs
+
+- **Stdlib**: one new module file.
+- **Compiler**: an intrinsic-recognition pass between type
+  inference and codegen. Walk the typed IR; for each call to a
+  `bit.*` symbol that the table marks intrinsic, replace with the
+  corresponding low-level node. ~50 lines.
+- **Backend (C and LLVM)**: emit the corresponding op for each
+  intrinsic node. ~30 lines per backend.
+- **No lexer / parser / precedence change**.
+
+Total ~1 day at observed velocity.
+
+### Decision posture
+
+**Schedule m13**, alongside property testing and bench. The crypto
+and encoding stdlib modules planned for m14 lean on this; landing
+the intrinsics just before keeps that stdlib code performant
+without resorting to FFI.
 
 ## 17. `Map[K, V]` — hash-map / associative container
 
