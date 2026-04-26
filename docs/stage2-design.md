@@ -683,6 +683,17 @@ Total estimated days for the reordering block (`!` postfix + m12.8
 + cleanup + m12): **3.5 - 6.5 days**, of which `!` postfix and
 cleanup are nearly mechanical. m12.8 itself dominates the variance.
 
+### Update 2026-04-26 — m12.5 (units of measure) landed
+
+Implemented in stage 2 ahead of the post-m7b ordering above (which
+had m12.5 sitting after m8.5). Lane brought forward as part of the
+m12.5 spike — independent of effects/fibers and contained in the
+typer + parser + AST extensions; codegen emits identical C/LLVM IR
+with or without unit annotations. Roughly +1100 lines added to
+`stage2/compiler.kai`. Fixtures land in `examples/units/`. Full
+landing notes in `docs/units-of-measure.md` (Status: Landed at the
+top); lane experience report in `docs/lane-experience-m12.5.md`.
+
 ## What stage 2 deliberately does not ship
 
 - Gradual typing, dependent types, refinement types.

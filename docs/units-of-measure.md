@@ -1,5 +1,13 @@
 # Units of Measure for kaikai
 
+## Status: Landed (m12.5, 2026-04-26)
+
+Implemented end-to-end in stage 2: lexer, parser, typer (abelian-group
+unification of unit expressions, generalisation over unit-vars), and
+codegen erasure (units evaporate before any C/LLVM IR is emitted).
+Fixtures live in `examples/units/m12_5_*.kai`. Lane experience report
+at `docs/lane-experience-m12.5.md`.
+
 Research notes, snapshot 2026-04-25. Discussion document.
 Question: does F#'s units-of-measure feature (Andrew Kennedy
 1997, 2010) fit kaikai, and is it worth implementing?
