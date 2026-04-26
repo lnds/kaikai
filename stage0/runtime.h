@@ -451,6 +451,25 @@ static void kai_decref(KaiValue *v) {
     if (--v->rc == 0) kai_free_value(v);
 }
 
+/* m5 #4 — Perceus dup/drop wrappers callable as KaiValue-returning fns.
+ *
+ * `__perceus_dup` and `__perceus_drop` are AST-level magic names the
+ * `perceus_pass` rewrites onto non-last EVar reads (dup) and unused-
+ * binding scope ends (drop). The emitter lowers them to these
+ * wrappers so the pass operates entirely through the prelude path
+ * without bespoke C generation.
+ *
+ * `kai_internal_dup` is `kai_incref` with a typed return; the AST
+ * rewrite wraps `EVar(x)` as `ECall(EVar("__perceus_dup"), [EVar(x)])`
+ * and the emitter sees a normal call.
+ *
+ * `kai_internal_drop` decrefs and returns `unit`. Drops emit as
+ * `SExprStmt(ECall(EVar("__perceus_drop"), [EVar(x)]))` so the unit
+ * return goes into the discarded `KaiValue *_` slot of the existing
+ * `SExprStmt` lowering. */
+static KaiValue *kai_internal_dup(KaiValue *v) { return kai_incref(v); }
+static KaiValue *kai_internal_drop(KaiValue *v) { kai_decref(v); return &kai_singleton_unit; }
+
 /* ---------- constructors ---------- */
 
 static KaiValue *kai_unit(void) { return &kai_singleton_unit; }
