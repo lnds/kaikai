@@ -206,20 +206,64 @@ struct KaiMboxNode {
     KaiMboxNode *next;
 };
 
+/* m8 #8: mailbox overflow policy codes (matched in stdlib/actor.kai
+ * by the MailboxPolicy enum). 0 = Unbounded, 1 = Bounded+DropOldest,
+ * 2 = Bounded+DropNewest, 3 = Bounded+BlockSender. v1 ships 0/1/2;
+ * BlockSender (3) errors at allocation because the inline-eager
+ * scheduler can't suspend the sender on a full mailbox — that
+ * lifts together with the m8.x cooperative scheduler. */
+#define KAI_OVERFLOW_UNBOUNDED    0
+#define KAI_OVERFLOW_DROP_OLDEST  1
+#define KAI_OVERFLOW_DROP_NEWEST  2
+#define KAI_OVERFLOW_BLOCK_SENDER 3
+
 typedef struct KaiMailbox KaiMailbox;
 struct KaiMailbox {
     KaiMboxNode *head;
     KaiMboxNode *tail;
     int          len;
+    int          cap;       /* m8 #8: 0 = unbounded; >0 = bounded */
+    int          overflow;  /* m8 #8: KAI_OVERFLOW_* code */
 };
 
 static KaiMailbox *kai_mailbox_alloc(void) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    /* default policy: unbounded — matches m8 #7 behaviour. */
+    mb->cap      = 0;
+    mb->overflow = KAI_OVERFLOW_UNBOUNDED;
+    return mb;
+}
+
+static KaiMailbox *kai_mailbox_alloc_bounded(int cap, int overflow) {
+    KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
+    if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (overflow == KAI_OVERFLOW_BLOCK_SENDER) {
+        fprintf(stderr, "kai: BlockSender mailbox policy requires the m8.x cooperative scheduler\n");
+        exit(1);
+    }
+    mb->cap      = cap;
+    mb->overflow = overflow;
     return mb;
 }
 
 static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
+    /* m8 #8: enforce policy on full. */
+    if (mb->cap > 0 && mb->len >= mb->cap) {
+        if (mb->overflow == KAI_OVERFLOW_DROP_NEWEST) {
+            kai_decref(msg);
+            return;
+        } else if (mb->overflow == KAI_OVERFLOW_DROP_OLDEST) {
+            /* Pop and discard the head; fall through to enqueue. */
+            KaiMboxNode *old = mb->head;
+            mb->head = old->next;
+            if (!mb->head) { mb->tail = NULL; }
+            kai_decref(old->msg);
+            free(old);
+            mb->len--;
+        }
+        /* BlockSender is rejected at alloc, so no case here. */
+    }
     KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
     if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     node->msg  = msg;
@@ -1024,6 +1068,12 @@ static KaiValue *kai_prelude_mailbox_alloc(void) {
     return kai_pid_value(kai_mailbox_alloc());
 }
 
+static KaiValue *kai_prelude_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {
+    int c = (cap && cap->tag == KAI_INT) ? (int) cap->as.i : 0;
+    int o = (overflow && overflow->tag == KAI_INT) ? (int) overflow->as.i : 0;
+    return kai_pid_value(kai_mailbox_alloc_bounded(c, o));
+}
+
 static KaiValue *kai_prelude_mailbox_send(KaiValue *pid, KaiValue *msg) {
     if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
         fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
@@ -1298,6 +1348,7 @@ static KaiValue *_kai_prelude_string_slice_thunk(KaiValue *s, KaiValue **a, int 
 static KaiValue *_kai_prelude_char_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_char_to_int(a[0]); }
 static KaiValue *_kai_prelude_int_to_char_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_int_to_char(a[0]); }
 static KaiValue *_kai_prelude_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) a; (void) n; return kai_prelude_mailbox_alloc(); }
+static KaiValue *_kai_prelude_mailbox_alloc_bounded_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_mailbox_alloc_bounded(a[0], a[1]); }
 static KaiValue *_kai_prelude_mailbox_send_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_send(a[0], a[1]); }
 static KaiValue *_kai_prelude_mailbox_recv_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_recv(a[0]); }
 static KaiValue *_kai_prelude_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_free(a[0]); }
