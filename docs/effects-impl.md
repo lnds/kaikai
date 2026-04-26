@@ -1836,16 +1836,20 @@ parser limitations) all landed. m7b #17 (alias-rewrite shadow
 tracking) closed the latent walker bug from the #5b follow-ups.
 m7b #16 (variable specialisation pass) realised Doc B's
 promised stack-slot lowering for the safe `var` cases. m7b #15
-landed only its runtime primitive
-(`kai_evidence_lookup_node_by_id`); the compiler integration was
-deferred after a 2026-04-26 spike showed the clean shape
-requires a new AST node + closure-capture changes. m7b #8
+landed scope-limited: the compiler now dispatches alias-bound
+op calls through `kai_evidence_lookup_node_by_id` whenever the
+call site shares the handle's lexical scope, fixing the
+innermost-wins bug for the common case; the closure-captured
+case still falls back to name-keyed lookup and is scheduled as
+a dedicated follow-up (new `EOpCallByAlias` AST node + closure
+capture of `kai_alias_<a>_id` + LLVM dispatcher parity). m7b #8
 (diagnostic review first sweep) backticked the op/effect/
 variant names and added `help:` / `note:` lines to the seven
 most user-visible diagnostics that were below the §8 bar.
-**m7b is closed**, modulo the deferred compiler-side of #15
-(scheduled as a dedicated mini-milestone — see *Scheduled
-follow-up: #15 compiler integration* below).
+**m7b is closed.** The closure-capture follow-up to #15
+(*Scheduled follow-up: #15 compiler integration — closure
+capture* below) and m7c-e (LLVM setjmp landing pad) are the
+known follow-ups carried into the next milestone.
 
 ### m7b #15 — Compiler integration (scope-limited). Landed.
 
