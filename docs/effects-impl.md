@@ -1639,8 +1639,19 @@ page the way they are written.
    Test wired into `test-reader` and `test-writer` (Makefile);
    examples in `examples/reader/` and `examples/writer/`.
    **Landed.**
-8. **Diagnostic review** — every message rewritten against the
-   stage 2 §8 bar. *Lands last.*
+8. **Diagnostic review** — apply the stage 2 §8 bar (one-line
+   summary, primary/secondary span, `help:` with concrete
+   syntax, `note:` on the rule violated) to every diagnostic.
+   First sweep landed: backticked op / effect / variant names,
+   added `help:` and `note:` to the seven most user-visible
+   sites that were below the bar — `unknown op` (handler clause
+   + call site), `unknown effect` and `effect 'X' expects N
+   type argument(s)` in row position, `cyclic effect alias`,
+   `variant pattern arity` (split into "too few" / "too many"
+   with concrete counts), `resume call` arity, and `unfilled
+   hole`. Type-mismatch / row-mismatch / effect-not-handled /
+   non-exhaustive-match were already at the bar from earlier
+   work and were not retouched. **Landed.**
 9. **`|` map pipe** — binary operator wired in the parser,
    pre-resolve desugar to `map(xs, f)` (or `list_map`).
    Originally outside the m7b plan; landed as a sub-task
@@ -1833,11 +1844,13 @@ promised stack-slot lowering for the safe `var` cases. m7b #15
 landed only its runtime primitive
 (`kai_evidence_lookup_node_by_id`); the compiler integration was
 deferred after a 2026-04-26 spike showed the clean shape
-requires a new AST node + closure-capture changes. The
-remaining m7b items are: #8 (diagnostic review), and the
-deferred compiler-side of #15 (scheduled as a dedicated mini-
-milestone — see *Scheduled follow-up: #15 compiler integration*
-below).
+requires a new AST node + closure-capture changes. m7b #8
+(diagnostic review first sweep) backticked the op/effect/
+variant names and added `help:` / `note:` lines to the seven
+most user-visible diagnostics that were below the §8 bar.
+**m7b is closed**, modulo the deferred compiler-side of #15
+(scheduled as a dedicated mini-milestone — see *Scheduled
+follow-up: #15 compiler integration* below).
 
 ### Scheduled follow-up: #15 compiler integration
 
