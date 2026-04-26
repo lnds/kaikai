@@ -1461,6 +1461,66 @@ fn parse_pipe(p: Parser) : PExpr {
   }
 }
 
+# m7d §21 — outcome of a pipeline placeholder substitution attempt.
+# `PPRPassthrough` keeps the legacy first-arg behaviour. The other
+# two arms either return the substituted call expression (single `_`
+# in the rhs args) or report a multiple-placeholder error.
+type PPRResult
+  = PPRPassthrough
+  | PPRSubstituted(Expr, Parser)
+  | PPRError(Parser)
+
+fn try_pipe_placeholder(line: Int, col: Int, lhs: Expr, rhs: Expr, p: Parser) : PPRResult {
+  match rhs.kind {
+    ECall(callee, args_) -> {
+      let n = count_underscores(args_, 0)
+      if n == 0 { PPRPassthrough }
+      else if n > 1 {
+        PPRError(p_error(p, p_peek(p),
+          "multiple `_` in a `|>` call would evaluate the left-hand side more than once"))
+      }
+      else {
+        # The substitution evaluates the lhs once via an immediate
+        # lambda application: `((__pipe) => f(args[_ := __pipe]))(lhs)`.
+        # Equivalent to a `let __pipe = lhs in f(...)` block but
+        # composes through the existing lambda machinery (closure
+        # capture, perceus, monomorphisation) without depending on
+        # the SLet -> EBlock walker quirks for sub-expressions
+        # synthesised mid-parse.
+        let tmp_name = "__pipe"
+        let tmp_var = mk_expr(EVar(tmp_name), lhs.line, lhs.col)
+        let new_args = subst_underscores(args_, tmp_var)
+        let new_call = mk_expr(ECall(callee, new_args), rhs.line, rhs.col)
+        let param = Param { pname: tmp_name, ptype: None, pline: lhs.line, pcol: lhs.col }
+        let lam = mk_expr(ELambda([param], new_call), line, col)
+        let app = mk_expr(ECall(lam, [lhs]), line, col)
+        PPRSubstituted(app, p)
+      }
+    }
+    _ -> PPRPassthrough
+  }
+}
+
+fn count_underscores(es: [Expr], acc: Int) : Int {
+  match es {
+    [] -> acc
+    [h, ...rest] -> match h.kind {
+      EUnder -> count_underscores(rest, acc + 1)
+      _      -> count_underscores(rest, acc)
+    }
+  }
+}
+
+fn subst_underscores(es: [Expr], replacement: Expr) : [Expr] {
+  match es {
+    [] -> []
+    [h, ...rest] -> match h.kind {
+      EUnder -> [replacement, ...subst_underscores(rest, replacement)]
+      _      -> [h, ...subst_underscores(rest, replacement)]
+    }
+  }
+}
+
 fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
   # Both `|>` (apply pipe) and `|` (map pipe) sit at the lowest binop
   # level, left-associative. `|` is m7b #9: `xs | f` lowers at parse
@@ -1481,7 +1541,21 @@ fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
     let r = parse_or(p1)
     match r.r {
       None -> err_e(r.p)
-      Some(rhs) -> parse_pipe_rest(r.p, mk_expr(EPipe(lhs, rhs), t.line, t.col))
+      Some(rhs) -> {
+        # m7d §21: pipeline placeholder. If the rhs is a call whose
+        # arg list contains exactly one `_`, the apply pipe lands
+        # the lhs at that position instead of as the first arg.
+        # `let __pipe = lhs in f(args[_ := __pipe])` — the let
+        # binding ensures the lhs is evaluated once, even if it has
+        # side effects. The default-first-arg behaviour stays for
+        # calls with no `_`. Multiple `_` in the same call would
+        # silently duplicate side effects, so we reject them.
+        match try_pipe_placeholder(t.line, t.col, lhs, rhs, r.p) {
+          PPRError(p2)         -> err_e(p2)
+          PPRSubstituted(e, p2) -> parse_pipe_rest(p2, e)
+          PPRPassthrough       -> parse_pipe_rest(r.p, mk_expr(EPipe(lhs, rhs), t.line, t.col))
+        }
+      }
     }
   } else if p_at(p, TkPipe) {
     let t = p_peek(p)
