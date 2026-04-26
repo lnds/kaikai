@@ -1897,13 +1897,27 @@ Split into four sub-tasks, landed in order, each its own branch
    i8*, %KaiValue*, fn-ptrs... }` per declared effect; declare
    `%KaiCont` and `%KaiEvidence` as opaque. Inert until #c-b
    lowers `EHandle`. **Landed.**
-2. **m7c-b — `EHandle` lowering**. The push/pop dance + the
-   setjmp/longjmp landing pad. LLVM has no portable `setjmp`
-   intrinsic — use `@llvm.eh.sjlj.setjmp` (Itanium ABI) or
-   declare `@setjmp` / `@longjmp` as external libc calls, with
-   the buffer as an `[5 x i8*]` alloca. The discard-resume slot
-   becomes a stack alloca that the longjmp branch loads via a
-   PHI node. *Pending.*
+2. **m7c-b — `EHandle` lowering** (push/pop, no setjmp yet).
+   Allocates `%EvX` on the stack and initialises `handler_id`
+   (via `@kai_fresh_handler_id`), `env` (NULL), and `state`
+   (from the optional init or NULL). Op fn-ptr slots stay
+   undef — m7c-d wires them when each clause becomes its own
+   LLVM function. Allocates a 48-byte buffer for the
+   `%KaiEvidence` node, bitcasts it, calls
+   `@kai_evidence_push`, evaluates the body in-line, calls
+   `@kai_evidence_pop`, and runs the return clause with
+   `body_result` bound to its parameter. Stateful return
+   clauses also see `state` / `log` aliases (m7b #11) re-loaded
+   from the Ev struct's slot. **Landed.**
+
+   *Limitation*: clauses that discard `resume` (m7a #6e)
+   require the setjmp + longjmp landing pad. The op-call site
+   triggers it, so it lives in m7c-c (op dispatch + setjmp
+   landing). For now every handler whose clauses always resume
+   — every canonical State / Reader / Writer / Mutable
+   handler, every default handler, every #5b `var` desugar —
+   emits clean IR. Discard-bearing user handlers UB at runtime
+   until m7c-c lands.
 3. **m7c-c — Op-call dispatch**. The `Eff.op(args)` branch of
    `emit_call_expr`: call `@kai_evidence_lookup_node` (declared
    in the header), bitcast the returned `%KaiEvidence*` to the
