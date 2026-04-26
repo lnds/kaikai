@@ -9168,19 +9168,114 @@ fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
       # m7b #13: same idea for declared type parameters (`fn id[T]...`).
       # tparam ids are 0..len(tparams)-1; row-var ids live in their
       # own dimension, so the two namespaces don't collide.
+      # R1 fix (2026-04-26): also auto-collect lowercase TyName
+      # identifiers that appear in the signature but were not
+      # declared in `[T1, T2]`. Treat them as *implicit* tparams.
+      # Without this, `pub fn list_contains(xs: [a], x: a) : Bool`
+      # ends up with `a` as a nominal `TyCon("a", [])` and the
+      # call site fails to unify with `[Int], Int`. The implicit
+      # set is appended to the declared one so explicit `[a]` still
+      # wins on collisions; their ids form a contiguous block.
       let names = collect_decl_rvars(d)
       let rbinds = mk_rvbinds(names)
-      let tpbinds = mk_tpbinds(tparams)
+      let implicit = collect_implicit_tparams_in_decl(d, tparams)
+      let effective_tparams = list_append(tparams, implicit)
+      let tpbinds = mk_tpbinds(effective_tparams)
       let pts = map(params, (p) => param_ty_with_binds(p, tpbinds, rbinds))
       let ret = match opt_ret {
         Some(rty) -> resolve_ty_with_binds(rty, tpbinds, rbinds)
         None      -> TyUnit
       }
       let body = TyFnT(pts, ret, row_of_expr_with_binds(rexpr, tpbinds, rbinds))
-      Some(scheme_full(tparam_ids(tparams), rvbind_ids(rbinds), body))
+      Some(scheme_full(tparam_ids(effective_tparams), rvbind_ids(rbinds), body))
     }
     _ -> None
   }
+}
+
+# R1 fix: walk a decl's signature for lowercase identifiers in type
+# position, appending them in first-seen order. Skip names already
+# declared in the explicit `[…]` tparam list, builtin primitive
+# names (which start uppercase anyway, but defensive), and the empty
+# string. Used by `fn_scheme_of_decl` and `infer_decl` to make
+# implicit polymorphism work the way pre-#13 code (and the stdlib)
+# already assumed.
+fn collect_implicit_tparams_in_decl(d: Decl, declared: [String]) : [String] {
+  match d {
+    DFn(_, _, _, params, opt_ret, rexpr, _, _, _) -> {
+      let acc0 = collect_implicit_in_params(params, declared, [])
+      let acc1 = match opt_ret {
+        Some(rty) -> collect_implicit_in_typeexpr(rty, declared, acc0)
+        None      -> acc0
+      }
+      collect_implicit_in_row(rexpr, declared, acc1)
+    }
+    _ -> []
+  }
+}
+
+fn collect_implicit_in_params(ps: [Param], declared: [String], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> {
+      let acc1 = match p.ptype {
+        Some(te) -> collect_implicit_in_typeexpr(te, declared, acc)
+        None     -> acc
+      }
+      collect_implicit_in_params(rest, declared, acc1)
+    }
+  }
+}
+
+fn collect_implicit_in_typeexpr(t: TypeExpr, declared: [String], acc: [String]) : [String] {
+  match t.tkind {
+    TyName(name, tas) -> {
+      let acc1 = collect_implicit_in_typeexprs(tas, declared, acc)
+      if is_implicit_tparam_candidate(name) and not list_has(declared, name) and not list_has(acc1, name) { list_append(acc1, [name]) } else { acc1 }
+    }
+    TyList(inner) -> collect_implicit_in_typeexpr(inner, declared, acc)
+    TyFn(ps, ret, rexpr) -> {
+      let acc1 = collect_implicit_in_typeexprs(ps, declared, acc)
+      let acc2 = collect_implicit_in_typeexpr(ret, declared, acc1)
+      collect_implicit_in_row(rexpr, declared, acc2)
+    }
+  }
+}
+
+fn collect_implicit_in_typeexprs(ts: [TypeExpr], declared: [String], acc: [String]) : [String] {
+  match ts {
+    [] -> acc
+    [t, ...rest] -> collect_implicit_in_typeexprs(rest, declared, collect_implicit_in_typeexpr(t, declared, acc))
+  }
+}
+
+fn collect_implicit_in_row(re: RowExpr, declared: [String], acc: [String]) : [String] {
+  match re {
+    REmpty -> acc
+    RClosed(labels) -> collect_implicit_in_row_labels(labels, declared, acc)
+    ROpen(_, labels) -> collect_implicit_in_row_labels(labels, declared, acc)
+  }
+}
+
+fn collect_implicit_in_row_labels(labels: [RowLabel], declared: [String], acc: [String]) : [String] {
+  match labels {
+    [] -> acc
+    [l, ...rest] -> match l {
+      RL(_, tas) -> collect_implicit_in_row_labels(rest, declared,
+                       collect_implicit_in_typeexprs(tas, declared, acc))
+    }
+  }
+}
+
+# A name is an implicit-tparam candidate if it begins with a
+# lowercase letter. Builtin primitives (Int, Real, Bool, …) all
+# start uppercase, so this naturally excludes them.
+fn is_implicit_tparam_candidate(name: String) : Bool {
+  if string_length(name) == 0 { false }
+  else { match char_at(name, 0) {
+    Some(c) -> ch_is_lower(c)
+    None -> false
+  } }
 }
 
 fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl]) : EnvWithArities {
@@ -11952,7 +12047,12 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # to small bound ids reused by the inferencer when fresh-
       # instantiating at call sites.
       let rbinds = mk_rvbinds(collect_decl_rvars(d))
-      let tpbinds = mk_tpbinds(tparams)
+      # R1 fix (2026-04-26): pick up implicit lowercase tparams the
+      # signature uses but did not declare in `[…]`, matching the
+      # set fn_scheme_of_decl built into the registered scheme.
+      let implicit = collect_implicit_tparams_in_decl(d, tparams)
+      let effective_tparams = list_append(tparams, implicit)
+      let tpbinds = mk_tpbinds(effective_tparams)
       let st_init = infer_state_new_full(file, env, prelude_len, recs, op_eff_arities)
       let st0 = advance_row_fresh(st_init, list_length(rbinds))
       # m7b #13 follow-up (surfaced by m8 #3's typed Spawn wrappers):
