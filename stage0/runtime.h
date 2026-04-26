@@ -1367,6 +1367,18 @@ static KaiValue *kai_default_mutable_array_grow(void *self, KaiValue *a,
     return kai_cont_resume(k, kai_prelude_array_grow(a, n, init));
 }
 
+/* m8 #2: default Spawn.yield handler. Single op for now — the
+ * canonical pinning point per Doc B §`Cancel`/Delivery points. The
+ * inline default is a no-op resume: the implicit single fiber has
+ * nowhere to yield to until m8 #3 wires the real ready queue, so
+ * `Spawn.yield()` is observable only through the typer (it forces
+ * `Spawn` into the row). The full op set (spawn / await / select /
+ * cancel) lands in #3 alongside the cooperative scheduler. */
+static KaiValue *kai_default_spawn_yield(void *self, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_unit());
+}
+
 typedef struct KaiEvidence KaiEvidence;
 struct KaiEvidence {
     KaiEvidence *parent;

@@ -760,7 +760,8 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7b_11_followup_arity_error.kai \
 	         ../examples/effects/m7b_11_followup_diag_type_args.kai \
-	         ../examples/effects/m7b_11_followup_resume_type.kai; do \
+	         ../examples/effects/m7b_11_followup_resume_type.kai \
+	         ../examples/effects/m8_2_yield_unhandled.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/effects/$$name.err.expected; \
 	  rc=0; ./$(TARGET) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
@@ -773,6 +774,22 @@ test-effects: $(TARGET) build
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "effects OK $$name (rejected with expected diagnostic)"; \
+	done; \
+	for f in ../examples/effects/m8_2_yield_noop.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_default_spawn_yield" build/s2-$$name.c \
+	    && grep -q "kai_evidence_push(&_kai_default_node_spawn" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (default-Spawn wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^before yield$$" build/s2-$$name.out \
+	    && grep -q "^after yield$$"  build/s2-$$name.out \
+	    && echo "effects OK $$name (default Spawn: yield resumes inline)" \
+	    || { echo "effects FAIL $$name (wrong default-handler output)"; cat build/s2-$$name.out; exit 1; }; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,

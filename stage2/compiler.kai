@@ -6684,9 +6684,25 @@ fn default_mutable_setup() : String =
     "    kai_evidence_push(&_kai_default_node_mutable, \"Mutable\", &_kai_default_ev_mutable);\n"
   ])
 
-# m7a #7: assemble the full setup block for the builtins listed in
-# `main`'s row, push order Console → Fail → Stdin → Env → File →
-# Mutable. Mutable goes last so it pops first (LIFO).
+# m8 #2: emit EvSpawn + push it as the innermost default-handler node
+# (Doc B §`main` and the runtime — Installation order: Spawn sits
+# closest to main, Cancel the layer below it, the I/O group below
+# that). Only `yield` is wired here; the rest of the op set lands in
+# #3 with the real scheduler.
+fn default_spawn_setup() : String =
+  concat_all([
+    "    static EvSpawn _kai_default_ev_spawn;\n",
+    "    static KaiEvidence _kai_default_node_spawn;\n",
+    "    _kai_default_ev_spawn.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_spawn.yield = (KaiValue *(*)(EvSpawn *, KaiCont *)) &kai_default_spawn_yield;\n",
+    "    kai_evidence_push(&_kai_default_node_spawn, \"Spawn\", &_kai_default_ev_spawn);\n"
+  ])
+
+# m7a #7 + m7b #2b + m8 #2: assemble the full setup block for the
+# builtins listed in `main`'s row. Push order Console → Fail → Stdin →
+# Env → File → Mutable → Spawn matches Doc B §*Installation order*:
+# Spawn is innermost (last pushed, first looked up); Cancel will sit
+# between Mutable and Spawn once it lands in m8 #4.
 fn default_setups_for(main_row: [String]) : String =
   concat_all([
     if list_has(main_row, "Console") { default_console_setup() } else { "" },
@@ -6694,12 +6710,14 @@ fn default_setups_for(main_row: [String]) : String =
     if list_has(main_row, "Stdin")   { default_stdin_setup() }   else { "" },
     if list_has(main_row, "Env")     { default_env_setup() }     else { "" },
     if list_has(main_row, "File")    { default_file_setup() }    else { "" },
-    if list_has(main_row, "Mutable") { default_mutable_setup() } else { "" }
+    if list_has(main_row, "Mutable") { default_mutable_setup() } else { "" },
+    if list_has(main_row, "Spawn")   { default_spawn_setup() }   else { "" }
   ])
 
 # Pops in reverse-push order so the evidence stack drains LIFO.
 fn default_pops_for(main_row: [String]) : String =
   concat_all([
+    if list_has(main_row, "Spawn")   { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Mutable") { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "File")    { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Env")     { "    kai_evidence_pop();\n" } else { "" },
@@ -14071,6 +14089,16 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   # default-handler setup is gated separately on `main`'s row in
   # `default_setups_for`.
   let mutable_d = inject_unconditional(existing, "Mutable", builtin_mutable_decl())
+  # m8 #2: Spawn ships the canonical pinning point op `yield()`. The
+  # full op set (spawn / await / select / cancel) lands in #3, after
+  # the per-op-generics shape is settled. inject_unconditional so the
+  # typer always knows the effect exists — a helper declaring `/ Spawn`
+  # in its row should compile regardless of whether `main` mentions
+  # Spawn. The runtime default-handler push is still gated on main's
+  # row in default_setups_for. (The same decoupling could be applied to
+  # Console/Stdin/Env/File/Fail; that is an m7a #7 follow-up, not m8
+  # scope.)
+  let spawn_d   = inject_unconditional(existing, "Spawn",  builtin_spawn_decl())
   list_append(console_d,
     list_append(fail_d,
       list_append(stdin_d,
@@ -14079,7 +14107,8 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
             list_append(state_d,
               list_append(reader_d,
                 list_append(writer_d,
-                  list_append(mutable_d, decls)))))))))
+                  list_append(mutable_d,
+                    list_append(spawn_d, decls))))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -14132,7 +14161,7 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # these as effect names whether or not the file already declared
 # them via `effect`.
 fn builtin_effect_names() : [String] =
-  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable"]
+  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable", "Spawn"]
 
 fn builtin_console_decl() : Decl =
   DEffect(false, "Console", [],
@@ -14245,6 +14274,20 @@ fn builtin_mutable_decl() : Decl =
            param_typed_zero("init", ty_name_zero("T"))],
           ty_named_zero("Array", [ty_name_zero("T")]),
           0, 0)
+    ], 0, 0)
+
+# m8 #2: Spawn — non-parametric effect, single op for now. `yield()` is
+# the canonical pinning point per Doc B §`Cancel`/Delivery points: a
+# tight CPU loop with no other effect ops uses it to give the scheduler
+# a chance to inject `Cancel.raise()`. The full set (spawn / await /
+# select / cancel) lands in #3 once the per-op-generics shape for
+# `spawn[T, e]` is decided alongside the real cooperative scheduler.
+# EOp shape is m7b #2a's six-field form (name, op_tparams, params,
+# ret, line, col); `yield` has no per-op generics so op_tparams = [].
+fn builtin_spawn_decl() : Decl =
+  DEffect(false, "Spawn", [],
+    [
+      EOp("yield", [], [], ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
 fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int {
