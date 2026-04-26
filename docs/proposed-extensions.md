@@ -507,11 +507,18 @@ because `?` is already taken by typed holes.
 The token was already reserved in `docs/kaikai-minimal.md` ("`!` is
 reserved (post-minimal uses for `Option`/`Result` propagation)");
 this entry formalised the semantics, and the parser, typer (with
-enclosing-`ret_ty` threading), and C emitter now implement it. The
-LLVM backend stub aborts at use-site (`!`-using programs go through
-the C path); a real LLVM lowering is a follow-up. Stage 2's own
-source does not use `!`, so selfhost and selfhost-llvm are
-unaffected. Fixtures live under `examples/sugars/m7e_13_*`.
+enclosing-`ret_ty` threading), C emitter, and LLVM emitter all
+implement it. The LLVM lowering uses a `bang.unwrap` / `bang.fail`
+basic-block split: on `Some` / `Ok` the payload at `args[0]` is
+extracted via `kaix_variant_arg`; on `None` / `Err` the operand is
+returned verbatim from the enclosing fn. Stage 2's own source does
+not use `!`, so selfhost and selfhost-llvm round-trip cleanly.
+Fixtures live under `examples/sugars/m7e_13_*`; the same five
+positive fixtures have also been verified end-to-end under
+`--emit=llvm` (manual run — the existing `test-llvm` Makefile target
+only iterates `examples/minimal/` and `examples/llvm/`, so adding
+sugars to the LLVM fixture harness is a separate follow-up
+documented in `docs/lane-experience-m7e13.md` Phase 2).
 
 ### Semantics
 

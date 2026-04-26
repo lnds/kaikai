@@ -15391,14 +15391,7 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
       ])
       llvm_set_last(llvm_append_body(r.e, p_instr), r.reg)
     }
-    EBang(_) -> {
-      # m7e §13: the LLVM backend does not yet implement the
-      # `expr!` propagation lowering. Stage 2's own source does not
-      # use `!`, so selfhost-llvm is unaffected; user programs that
-      # use `!` go through the C backend (test-sugars, test-run).
-      eprint("llvm: `!` postfix lowering not yet implemented (m7e §13 follow-up)")
-      llvm_set_last(e, "undef")
-    }
+    EBang(inner) -> llvm_emit_bang(e, inner)
     _ -> {
       eprint("llvm: unsupported expression kind (#{expr_kind_name(x.kind)}) at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
       llvm_set_last(e, "undef")
@@ -16928,6 +16921,82 @@ fn llvm_emit_match(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : L
         "  ", phi.reg, " = phi %KaiValue* ", llvm_format_phi(arm_res.entries), "\n"
       ])
       llvm_set_last(llvm_append_body(phi.e, phi_instr), phi.reg)
+    }
+  }
+}
+
+# m7e §13 (Phase 2) — LLVM lowering for `expr!`.
+#
+# Mirrors the C backend's `emit_bang`: evaluate the operand, branch
+# on the success-variant tag (`Some` for Option, `Ok` for Result),
+# return the operand value verbatim from the enclosing fn on failure,
+# and yield the unwrapped payload on success. The discriminator is
+# picked from `inner.ty`, which `synth_bang` stamps with the resolved
+# `TyCon("Option" | "Result", _)` after substitution. The typer also
+# rejects `e!` inside lambdas (see `synth_lambda`'s `ret_ty = None`),
+# so the `ret` here is always for the immediately-enclosing kaikai
+# fn — never for a closure body.
+fn llvm_emit_bang(e: LlvmEmit, inner: Expr) : LlvmEmit {
+  let success = bang_success_variant(inner.ty)
+  match success {
+    None -> {
+      # Should be unreachable — synth_bang rejects non-Option/Result
+      # operands. Keeping a panic stub here so a typer regression
+      # surfaces as a runtime trap rather than silently-wrong IR.
+      let msg = "internal: `!` on non-Option/Result reached LLVM emitter"
+      let nm_res = llvm_emit_name_constant(e, msg, "bang.bug.msg.")
+      let sreg = llvm_fresh_reg(nm_res.e)
+      let s_instr = concat_all([
+        "  ", sreg.reg, " = call %KaiValue* @kaix_str(i8* ", nm_res.gep, ")\n"
+      ])
+      let e_s = llvm_append_body(sreg.e, s_instr)
+      let pcall = llvm_fresh_reg(e_s)
+      let p_instr = concat_all([
+        "  ", pcall.reg, " = call %KaiValue* @kaix_match_panic(%KaiValue* ", sreg.reg, ")\n",
+        "  unreachable\n"
+      ])
+      llvm_set_last(llvm_append_body(pcall.e, p_instr), pcall.reg)
+    }
+    Some(name) -> {
+      let ei = llvm_emit_expr(e, inner)
+      let inner_reg = ei.last_val
+      let nm_res = llvm_emit_name_constant(ei, name, "bang.var.")
+      let chk = llvm_fresh_reg(nm_res.e)
+      let chk_i = concat_all([
+        "  ", chk.reg, " = call i32 @kaix_is_variant(%KaiValue* ", inner_reg,
+        ", i8* ", nm_res.gep, ")\n"
+      ])
+      let e1 = llvm_append_body(chk.e, chk_i)
+      let cond = llvm_fresh_reg(e1)
+      let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk.reg, ", 0\n"])
+      let e2 = llvm_append_body(cond.e, cond_i)
+      let unwrap_lbl = llvm_fresh_label(e2, "bang.unwrap.")
+      let fail_lbl   = llvm_fresh_label(unwrap_lbl.e, "bang.fail.")
+      let br_i = concat_all([
+        "  br i1 ", cond.reg,
+        ", label %", unwrap_lbl.reg,
+        ", label %", fail_lbl.reg, "\n"
+      ])
+      let e3 = llvm_append_body(fail_lbl.e, br_i)
+      # Fail block: propagate the operand verbatim to the caller's
+      # caller. The operand is already a `%KaiValue*` of the enclosing
+      # fn's return type (typer enforces `Option[U]` / `Result[E, U]`
+      # match), so a bare `ret` of `%inner_reg` is well-typed.
+      let e_fail = llvm_open_block(e3, fail_lbl.reg)
+      let fail_ret = concat_all([
+        "  ret %KaiValue* ", inner_reg, "\n"
+      ])
+      let e_fail_done = llvm_append_body(e_fail, fail_ret)
+      # Unwrap block: extract the payload at args[0]. Becomes the
+      # `last_val` of the EBang expression, so any consumer reads
+      # the unwrapped value as a regular SSA register.
+      let e_unwrap = llvm_open_block(e_fail_done, unwrap_lbl.reg)
+      let payload = llvm_fresh_reg(e_unwrap)
+      let payload_i = concat_all([
+        "  ", payload.reg, " = call %KaiValue* @kaix_variant_arg(%KaiValue* ",
+        inner_reg, ", i32 0)\n"
+      ])
+      llvm_set_last(llvm_append_body(payload.e, payload_i), payload.reg)
     }
   }
 }
