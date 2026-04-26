@@ -400,6 +400,66 @@ that makes diagnostics confusing — both stages emit the same C
 text, but the C means different things at link time. Reject
 unless the stage-1 walker port turns out unexpectedly hard.
 
+### Step 3+ outcome (m5.x-1-2 lane, 2026-04-26)
+
+The lane landed step 1 (stage 1 perceus port, `f327d34`) and the
+companion `kai_closure` capture incref (`80b0015`). Step 2 — the
+atomic flip of `kai_lt / gt / le / ge / eq_v / ne_v / add / sub /
+mul / div / idiv / mod / neg / boolnot / truthy / field` to
+linear-consumption — was attempted and reverted. The revert keeps
+the runtime in its current loose state; the dup/drop machinery
+(both stages now have it) stays inert.
+
+Why the flip did not land — three compounding issues surfaced
+during attempted self-host:
+
+1. **C argument-order independence.** `pcs_is_non_last` marks the
+   lexically-last read as transferred-raw, but C does not specify
+   the evaluation order of function-call arguments. clang on
+   AArch64 evaluates argument lists right-to-left, so the
+   transferred read in `f(opts.mode, opts.path, opts.search_paths)`
+   fires *before* the dup-wrapped earlier reads. Under linear
+   consumption that frees the local first and the dups read from
+   freed memory. A conservative variant (any binding with ≥ 2 uses
+   has every read dup'd) was prototyped and is sound, but does not
+   close the leak gap on its own.
+2. **Stage 0's record-pattern emission.** `emit_pat_test` /
+   `emit_pat_binds` for `N_PAT_RECORD` chains `kai_field(_scr, ...)`
+   for each named field, sharing the same scrutinee. Under linear
+   consumption the first field-test consumes `_scr`; subsequent
+   tests UAF on it. A targeted dup wrap fixes record patterns but
+   the same shape recurs in nested variant patterns where bindings
+   alias `_scr->as.var.args[i]` storage.
+3. **Stage 0 has no perceus pass.** The kaic1 binary's machine code
+   is whatever stage 0 emits from `stage1/compiler.kai`; stage 0
+   emits primitive calls without dup wraps. An eager-dup retrofit
+   (every local read of `kai_<name>` becomes
+   `kai_internal_dup(kai_<name>)`) was prototyped and does protect
+   simple programs, but interacts with closure construction and
+   match patterns in ways that would need a substantial stage 0
+   audit.
+
+Diagnosis ran past the lane budget. Per the lane's revert clause,
+step 2 was rolled back. Step 1 + the closure-capture incref are
+landed and inert, giving the next lane a clean starting point: a
+stage 1 with `perceus_pass` already wired, a runtime with the
+closure-capture leak closed, and a recorded list of the three
+issues above to address before retrying the flip.
+
+Empirical numbers (from `KAI_TRACE_RC=1 ./stage2/kaic2
+stage2/compiler.kai`, post-revert, with stage 1 perceus active):
+
+| stage      | alloc       | free   | leaked      | live_peak   |
+|------------|-------------|--------|-------------|-------------|
+| pre-flip   | 40,635,512  |   614  | 40,634,898  | 40,634,898  |
+| post-flip  | (see above) | (n/a)  | (n/a)       | (n/a)       |
+
+The post-flip row is "not applicable" because the flip did not
+self-host. The 40.6 M alloc baseline is ~7 M higher than the
+m5 #9 step-2 row in the table above (33.0 M); the delta is the
+post-m7e13 feature load (`!` postfix lowering, plus stage 2's
+`pcs_*` walker source itself).
+
 ## Concrete sub-milestones for m5 proper
 
 In rough dependency order. Each is its own commit-grain piece.
