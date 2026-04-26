@@ -1888,6 +1888,24 @@ static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
     return NULL;
 }
 
+/* m7b #15: per-instance dispatch — find the evidence node whose
+ * handler_id matches `id`, no name match required. The codegen
+ * uses this when the op call comes from a `with Eff as alias`
+ * binding, so an outer alias's op stays reachable even after an
+ * inner `with Eff as other` shadows the effect name. */
+static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
+    KaiFiber *f = kai_current_fiber();
+    KaiEvidence *node = f->evidence_top;
+    while (node != NULL) {
+        KaiHandlerId nid = ((KaiHandlerId *) node->handler)[0];
+        if (nid == id) {
+            return node;
+        }
+        node = node->parent;
+    }
+    return NULL;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #  pragma GCC diagnostic pop
 #endif
