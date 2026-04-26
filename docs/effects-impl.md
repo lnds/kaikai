@@ -1716,15 +1716,38 @@ page the way they are written.
     bodies. Verified end-to-end with `m7b_14_state_helper.kai`,
     `m7b_14_reader_helper.kai`, `m7b_14_writer_helper.kai`.
     **Landed.**
-15. **Per-instance handler dispatch** — runtime
-    `kai_evidence_lookup_node(name)` is name-keyed + LIFO, so
-    nested `var`s of the same effect+ty_args shadow innermost-wins
-    and the outer cell becomes unreachable from inside the inner
-    body. Cure: the alias rewrite emits a lookup keyed on the
-    specific `handler_id`, not the effect name. Runtime + codegen
-    change. Surfaced by m7b #5b; details and motivating example
-    in §*Variable specialisation* §*Known follow-ups after
-    m7b #5b* item 1. *Pending.*
+15. **Per-instance handler dispatch** — runtime now exposes
+    `kai_evidence_lookup_node_by_id(KaiHandlerId)` as the
+    primitive an alias-aware op-call site would use. The
+    surrounding compiler integration is **deferred**: a
+    2026-04-26 spike confirmed that tagging op names with
+    `@<alias>` after the alias rewrite (so `cap.get` becomes
+    `EVar("State.get@a")` after `desugar_op_calls`) breaks at
+    several layers — the magic char leaks into closure-capture
+    variable names (`KaiValue *kai_State.get@a = ...` is invalid
+    C), the free-var collector treats the tagged identifier as
+    a stray reference, and the lambda emit path has no way to
+    capture the enclosing handle's `kai_alias_<a>_id` into the
+    closure. The clean shape requires:
+
+    - a new `EOpCallByAlias(eff, op, alias, args)` AST node so
+      the alias does not pollute the var-name namespace;
+    - the lambda-capture pass to recognise that node and add
+      the relevant `kai_alias_<a>_id` to the closure's capture
+      array (separate from the value captures);
+    - codegen for the new node that loads the captured id and
+      calls `lookup_node_by_id`.
+
+    That is its own milestone-sized change. For now the
+    mitigation is m7b #16: the common case (`var x = init` with
+    no escape) lowers to a stack slot and never touches the
+    handler stack; the bug only surfaces when two `var`s of
+    the same `Eff[T]` are both captured by an enclosing
+    closure, which the desugar declines to specialise. The
+    runtime helper is left in stage0/runtime.h so the future
+    PR can wire it up without touching the runtime again.
+    *Pending — runtime primitive landed; compiler integration
+    deferred.*
 16. **Variable specialisation pass** — landed in the m7b #5b
     var-desugar itself. When the four trigger conditions hold
     (canonical handler shape — always true; no multi-shot resume
@@ -1795,8 +1818,13 @@ and #2c (audit, "no migration" decision pinned to stage 0
 parser limitations) all landed. m7b #17 (alias-rewrite shadow
 tracking) closed the latent walker bug from the #5b follow-ups.
 m7b #16 (variable specialisation pass) realised Doc B's
-promised stack-slot lowering for the safe `var` cases. The
-remaining m7b items are: #8 (diagnostic review), #15.
+promised stack-slot lowering for the safe `var` cases. m7b #15
+landed only its runtime primitive
+(`kai_evidence_lookup_node_by_id`); the compiler integration was
+deferred after a 2026-04-26 spike showed the clean shape
+requires a new AST node + closure-capture changes. The
+remaining m7b items are: #8 (diagnostic review), and the
+deferred compiler-side of #15.
 
 ## Next steps
 
