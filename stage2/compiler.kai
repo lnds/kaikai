@@ -6208,7 +6208,14 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
           None -> "kai_unit()"
         }
         _ -> {
-          let stmt_out = concat_all(map(stmts, (s) => emit_stmt(src, s, fns, variants, lams)))
+          # m5 #3 — drops for unused let-bindings whose RHS is a
+          # fresh allocation. See `block_unused_lets`. The set is
+          # computed once per block so each let-binding's drop
+          # decision considers all subsequent stmts and the trailing
+          # final expression.
+          let drops = block_unused_lets(stmts, opt_final)
+          let stmt_out = concat_all(map(stmts,
+            (s) => emit_stmt_with_drops(src, s, drops, fns, variants, lams)))
           let final_out = match opt_final {
             Some(fe) -> cat2(emit_expr(src, fe, fns, variants, lams), "; ")
             None -> "kai_unit(); "
@@ -6322,6 +6329,127 @@ fn emit_stmt(src: String, s: Stmt, fns: [EFn], variants: [EVar], lams: [LamInfo]
     # m7b #5: `var name = init` desugars away pre-resolve; this arm
     # is dead code in normal compilation but keeps the match exhaustive.
     SVar(_, _, _, _, _) -> "/* SVar: should have been desugared */ "
+  }
+}
+
+# m5 #3 — emit_stmt variant that consults the per-block drop set.
+# Only `SLet` is augmented; the other stmt forms route through the
+# original `emit_stmt` path. The set is the result of
+# `block_unused_lets`, so a name only appears here when it is safe
+# to decref immediately after the let.
+fn emit_stmt_with_drops(src: String, s: Stmt, drops: [String],
+                        fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match s {
+    SLet(pat, _, rhs) ->
+      emit_let_stmt_with_drops(src, pat, rhs, drops, fns, variants, lams)
+    _ -> emit_stmt(src, s, fns, variants, lams)
+  }
+}
+
+fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
+                             drops: [String],
+                             fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let rhs_c = emit_expr(src, rhs, fns, variants, lams)
+  match pat.pkind {
+    PBind(name) -> {
+      let bind = concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
+      if list_has(drops, name) {
+        cat2(bind, concat_all(["kai_decref(kai_", name, "); "]))
+      } else {
+        bind
+      }
+    }
+    # `let _ = expr` discards the value. If RHS is a fresh
+    # allocation we can decref it; otherwise the original behaviour
+    # (no decref) is preserved to avoid double-freeing an alias.
+    PWild -> {
+      if is_fresh_alloc(rhs) {
+        cat3("{ KaiValue *_w = ", rhs_c, "; kai_decref(_w); } ")
+      } else {
+        cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
+      }
+    }
+    _ -> {
+      let binds = emit_pat_binds(src, pat, "_letv", fns, variants, lams)
+      concat_all(["{ KaiValue *_letv = ", rhs_c, "; ", binds, "} "])
+    }
+  }
+}
+
+# A let-binding is "droppable" when:
+#   1. The pattern is a single `PBind(name)` (no destructuring).
+#   2. The RHS is a fresh allocation (rc=1, no aliasing — see
+#      `is_fresh_alloc` for the conservative subset).
+#   3. The bound name is never read in the rest of the block: later
+#      stmts AND the trailing optional final expression.
+# Returns the list of droppable names in the block. The walker
+# from m5 #2 (`scan_uses_in_stmts` / `scan_uses_expr`) is reused
+# unchanged.
+fn block_unused_lets(stmts: [Stmt], opt_final: Option[Expr]) : [String] =
+  block_unused_lets_loop(stmts, opt_final, [])
+
+fn block_unused_lets_loop(stmts: [Stmt], opt_final: Option[Expr],
+                          acc: [String]) : [String] {
+  match stmts {
+    [] -> list_reverse(acc)
+    [s, ...rest] -> {
+      let acc1 = match s {
+        SLet(pat, _, rhs) -> match pat.pkind {
+          PBind(nm) -> {
+            if is_fresh_alloc(rhs) and not name_read_in_block(rest, opt_final, nm) {
+              [nm, ...acc]
+            } else { acc }
+          }
+          _ -> acc
+        }
+        _ -> acc
+      }
+      block_unused_lets_loop(rest, opt_final, acc1)
+    }
+  }
+}
+
+fn name_read_in_block(stmts: [Stmt], opt_final: Option[Expr], nm: String) : Bool {
+  let stmt_uses = scan_uses_in_stmts(stmts, false)
+  let final_uses = match opt_final {
+    None -> []
+    Some(e) -> scan_uses_expr(e, false)
+  }
+  any_use_of(list_append(stmt_uses, final_uses), nm)
+}
+
+fn any_use_of(uses: [Use], nm: String) : Bool {
+  match uses {
+    [] -> false
+    [h, ...rest] -> match h {
+      U(uname, _, _, _) ->
+        if uname == nm { true } else { any_use_of(rest, nm) }
+    }
+  }
+}
+
+# Conservative "fresh allocation" predicate. Returns true when the
+# RHS is known to materialise a value with rc=1 and no aliasing.
+# False for `EVar` (alias of an existing binding), `EField` /
+# `EIndex` (extracted ref into a parent), and the composite control
+# forms (`EIf`, `EMatch`, `EBlock`, `EHandle`, `EPipe`) whose result
+# can be a sub-expression aliased into the surrounding scope.
+fn is_fresh_alloc(e: Expr) : Bool {
+  match e.kind {
+    EInt(_)         -> true
+    EReal(_)        -> true
+    EBool(_)        -> true
+    EChar(_)        -> true
+    EStr(_, _)      -> true
+    EUnit           -> true
+    ECall(_, _)     -> true
+    EList(_)        -> true
+    ERecordLit(_, _) -> true
+    ERange(_, _, _) -> true
+    ELambda(_, _)   -> true
+    EBinop(_, _, _) -> true
+    EUnop(_, _)     -> true
+    _               -> false
   }
 }
 
