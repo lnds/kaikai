@@ -14093,6 +14093,11 @@ fn llvm_header() : String =
     "declare i64 @kai_fresh_handler_id()\n",
     "declare void @kai_evidence_push(i8*, i8*, i8*)\n",
     "declare void @kai_evidence_pop()\n",
+    # m7c-c — op-call dispatch helpers. `lookup_handler` returns
+    # the `*Ev<Eff>` blob (cast to i8*); `cont_init_identity`
+    # initialises the on-stack KaiCont alloca.
+    "declare i8* @kai_evidence_lookup_handler(i8*)\n",
+    "declare void @kai_cont_init_identity(i8*, i64)\n",
     "\n"
   ])
 
@@ -14131,42 +14136,51 @@ type LlvmEmit = {
   locals: [LlvmLocal],
   fns: [EFn],
   vars_: [EVar],
-  lams: [LamInfo]
+  lams: [LamInfo],
+  # m7c-c — per-`Eff.op` field offset inside the matching `%EvX`
+  # struct. Populated once in `emit_program_llvm` from the
+  # declared (and injected-builtin) effects; consulted by the
+  # op-call dispatch in `llvm_emit_call` to GEP the right
+  # function pointer.
+  op_offsets: [OpOffset]
 }
+
+type OpOffset = OO(String, Int)
 
 fn llvm_emit_new() : LlvmEmit =
   LlvmEmit { ids: llvm_id_new(), globals: "", body: "", last_val: "",
-             cur_label: "entry", locals: [], fns: [], vars_: [], lams: [] }
+             cur_label: "entry", locals: [], fns: [], vars_: [], lams: [],
+             op_offsets: [] }
 
 fn llvm_append_body(e: LlvmEmit, s: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: string_concat(e.body, s),
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets }
 
 fn llvm_set_last(e: LlvmEmit, v: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: v, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets }
 
 fn llvm_set_label(e: LlvmEmit, lbl: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: lbl,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets }
 
 fn llvm_append_global(e: LlvmEmit, s: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: string_concat(e.globals, s), body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets }
 
 fn llvm_fresh_id(e: LlvmEmit) : LlvmEmit =
   LlvmEmit { ids: llvm_id_bump(e.ids), globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets }
 
 fn llvm_push_local(e: LlvmEmit, nm: String, reg: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: [LL(nm, reg), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams }
+             locals: [LL(nm, reg), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets }
 
 # Open a new LLVM basic block: emit the `<label>:` header and
 # record `label` as the active one so downstream phi nodes can
@@ -14723,6 +14737,110 @@ fn llvm_closure_error(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit {
   llvm_set_last(e, "undef")
 }
 
+# m7c-c — emit the LLVM IR for an `Eff.op(args)` call. Mirrors the
+# C `emit_call_expr` op-call branch minus the discard/longjmp path
+# (m7a #6e). The IR shape is:
+#   %h = call i8* @kai_evidence_lookup_handler(i8* @effname.str)
+#   %ev = bitcast i8* %h to %EvEff*
+#   ; KaiCont alloca (32 bytes covers the C struct)
+#   %k_buf = alloca [32 x i8], align 8
+#   %k = bitcast [32 x i8]* %k_buf to i8*
+#   ; Read handler_id (field 0) for the cont's identity slot
+#   %hid_p = getelementptr %EvEff, %EvEff* %ev, i32 0, i32 0
+#   %hid = load i64, i64* %hid_p
+#   call void @kai_cont_init_identity(i8* %k, i64 %hid)
+#   ; GEP fn ptr at field 3 + op_idx, load, indirect-call
+#   %op_p = getelementptr %EvEff, %EvEff* %ev, i32 0, i32 N
+#   %op = load <fn-type>, <fn-type>* %op_p
+#   %r = call %KaiValue* %op(%EvEff* %ev, args..., i8* %k)
+fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : LlvmEmit {
+  let eff_n = dotted_prefix(key)
+  let name_res = llvm_emit_name_constant(e, eff_n, "eff.disp.name.")
+  # 1. Lookup handler.
+  let h_reg = llvm_fresh_reg(name_res.e)
+  let h_call = concat_all([
+    "  ", h_reg.reg, " = call i8* @kai_evidence_lookup_handler(i8* ",
+    name_res.gep, ")\n"
+  ])
+  let e1 = llvm_append_body(h_reg.e, h_call)
+  # 2. Bitcast to %EvEff*.
+  let ev_reg = llvm_fresh_reg(e1)
+  let ev_cast = concat_all([
+    "  ", ev_reg.reg, " = bitcast i8* ", h_reg.reg, " to %Ev", eff_n, "*\n"
+  ])
+  let e2 = llvm_append_body(ev_reg.e, ev_cast)
+  # 3. Allocate KaiCont buf + cast.
+  let k_buf_reg = llvm_fresh_reg(e2)
+  let k_alloca = concat_all([
+    "  ", k_buf_reg.reg, " = alloca [32 x i8], align 8\n"
+  ])
+  let e3 = llvm_append_body(k_buf_reg.e, k_alloca)
+  let k_reg = llvm_fresh_reg(e3)
+  let k_cast = concat_all([
+    "  ", k_reg.reg, " = bitcast [32 x i8]* ", k_buf_reg.reg, " to i8*\n"
+  ])
+  let e4 = llvm_append_body(k_reg.e, k_cast)
+  # 4. Read handler_id (field 0) and init the cont.
+  let hid_p_reg = llvm_fresh_reg(e4)
+  let hid_p_gep = concat_all([
+    "  ", hid_p_reg.reg, " = getelementptr %Ev", eff_n,
+    ", %Ev", eff_n, "* ", ev_reg.reg, ", i32 0, i32 0\n"
+  ])
+  let e5 = llvm_append_body(hid_p_reg.e, hid_p_gep)
+  let hid_reg = llvm_fresh_reg(e5)
+  let hid_load = concat_all([
+    "  ", hid_reg.reg, " = load i64, i64* ", hid_p_reg.reg, "\n",
+    "  call void @kai_cont_init_identity(i8* ", k_reg.reg,
+    ", i64 ", hid_reg.reg, ")\n"
+  ])
+  let e6 = llvm_append_body(hid_reg.e, hid_load)
+  # 5. Evaluate args; build a comma-joined arg list of %KaiValue* registers.
+  let ra = llvm_emit_args(e6, xs, [])
+  # 6. GEP to op fn-ptr at field `offset`, load, indirect call.
+  let fn_ptr_p_reg = llvm_fresh_reg(ra.st)
+  # Build the fn-ptr type: %KaiValue* (%EvEff*, args..., i8*)*
+  let arg_ty_list = llvm_op_arg_kaivalue_list(list_length(xs))
+  let fn_ptr_ty = concat_all([
+    "%KaiValue* (%Ev", eff_n, "*", arg_ty_list, ", i8*)*"
+  ])
+  let fn_p_gep = concat_all([
+    "  ", fn_ptr_p_reg.reg, " = getelementptr %Ev", eff_n,
+    ", %Ev", eff_n, "* ", ev_reg.reg, ", i32 0, i32 ",
+    int_to_string(offset), "\n"
+  ])
+  let e7 = llvm_append_body(fn_ptr_p_reg.e, fn_p_gep)
+  let fn_ptr_reg = llvm_fresh_reg(e7)
+  let fn_load = concat_all([
+    "  ", fn_ptr_reg.reg, " = load ", fn_ptr_ty, ", ", fn_ptr_ty, "* ", fn_ptr_p_reg.reg, "\n"
+  ])
+  let e8 = llvm_append_body(fn_ptr_reg.e, fn_load)
+  # 7. Indirect call.
+  let r_reg = llvm_fresh_reg(e8)
+  let arg_regs_str = llvm_format_op_arg_regs(ra.regs)
+  let call_instr = concat_all([
+    "  ", r_reg.reg, " = call %KaiValue* ", fn_ptr_reg.reg,
+    "(%Ev", eff_n, "* ", ev_reg.reg, arg_regs_str,
+    ", i8* ", k_reg.reg, ")\n"
+  ])
+  llvm_set_last(llvm_append_body(r_reg.e, call_instr), r_reg.reg)
+}
+
+# Build the type signature suffix `, %KaiValue*, %KaiValue*, …`
+# for `n` op arguments.
+fn llvm_op_arg_kaivalue_list(n: Int) : String {
+  if n <= 0 { "" }
+  else { string_concat(", %KaiValue*", llvm_op_arg_kaivalue_list(n - 1)) }
+}
+
+# Emit the registered arg list as ", %KaiValue* %r1, %KaiValue* %r2, ..."
+# for an indirect call.
+fn llvm_format_op_arg_regs(regs: [String]) : String {
+  match regs {
+    [] -> ""
+    [r, ...rest] -> string_concat(", %KaiValue* ", string_concat(r, llvm_format_op_arg_regs(rest)))
+  }
+}
+
 fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
   match callee.kind {
     EVar(nm) -> {
@@ -14737,19 +14855,30 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
                                 llvm_format_args(ra.regs), ")\n"])
         llvm_set_last(llvm_append_body(r.e, instr), r.reg)
       } else {
-        match evar_find(e.vars_, nm) {
-          Some(_) -> llvm_emit_variant_ctor(e, nm, xs)
-          None -> match llvm_local_find_loop(e.locals, nm) {
-            Some(reg) -> llvm_emit_apply(e, reg, xs)
-            None      -> {
-              let ra = llvm_emit_args(e, xs, [])
-              let sym = if llvm_is_prelude_fn(nm) { llvm_prelude_symbol(nm) } else { string_concat("@kai_", nm) }
-              let r = llvm_fresh_reg(ra.st)
-              let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
-                                      llvm_format_args(ra.regs), ")\n"])
-              llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+        # m7c-c: callees of the form "Eff.op" come from the
+        # `desugar_op_calls` pass. Look the offset up in
+        # `op_offsets`; if present, emit a per-instance dispatch
+        # (lookup handler → bitcast → GEP fn ptr → indirect call
+        # with KaiCont alloca). Otherwise fall through to the
+        # standard fn-call path so dotted module paths and
+        # non-effect names keep working.
+        match lookup_op_offset(e.op_offsets, nm) {
+          Some(offset) -> llvm_emit_op_dispatch(e, nm, offset, xs)
+          None ->
+            match evar_find(e.vars_, nm) {
+              Some(_) -> llvm_emit_variant_ctor(e, nm, xs)
+              None -> match llvm_local_find_loop(e.locals, nm) {
+                Some(reg) -> llvm_emit_apply(e, reg, xs)
+                None      -> {
+                  let ra = llvm_emit_args(e, xs, [])
+                  let sym = if llvm_is_prelude_fn(nm) { llvm_prelude_symbol(nm) } else { string_concat("@kai_", nm) }
+                  let r = llvm_fresh_reg(ra.st)
+                  let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
+                                          llvm_format_args(ra.regs), ")\n"])
+                  llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+                }
+              }
             }
-          }
         }
       }
     }
@@ -15162,7 +15291,7 @@ fn llvm_emit_block(e: LlvmEmit, stmts: [Stmt], tail: Option[Expr]) : LlvmEmit {
   # Restore outer scope, keep id counter / body / globals / last_val.
   LlvmEmit { ids: tailed.ids, globals: tailed.globals, body: tailed.body,
              last_val: tailed.last_val, cur_label: tailed.cur_label,
-             locals: outer_locals, fns: tailed.fns, vars_: tailed.vars_, lams: tailed.lams }
+             locals: outer_locals, fns: tailed.fns, vars_: tailed.vars_, lams: tailed.lams, op_offsets: tailed.op_offsets }
 }
 
 fn llvm_emit_stmts(e: LlvmEmit, stmts: [Stmt]) : LlvmEmit {
@@ -15598,7 +15727,7 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
           ids: e_br.ids, globals: e_br.globals, body: e_br.body,
           last_val: e_br.last_val, cur_label: e_br.cur_label,
           locals: outer_locals, fns: e_br.fns, vars_: e_br.vars_,
-          lams: e_br.lams
+          lams: e_br.lams, op_offsets: e_br.op_offsets
         }
         let e_next = llvm_open_block(e_scoped, next_try.reg)
         llvm_emit_match_arms(e_next, rest, scr_reg, end_lbl,
@@ -15691,14 +15820,15 @@ fn llvm_thunk_call_args(i: Int, arity: Int, acc: String) : String {
 # through all decls.
 type LlvmDeclOut = { text: String, next_id: Int }
 
-fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], start_id: Int) : LlvmDeclOut {
+fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], start_id: Int) : LlvmDeclOut {
   match d {
     DFn(_, nm, _, ps, _, _, body, _, _) -> {
       let locals0 = llvm_init_locals_from_params(ps)
       let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
                           globals: "", body: "",
                           last_val: "", cur_label: "entry",
-                          locals: locals0, fns: fns, vars_: vs, lams: lams }
+                          locals: locals0, fns: fns, vars_: vs, lams: lams,
+                          op_offsets: oo }
       let e1 = llvm_emit_expr(e0, body)
       let sym = if nm == "main" { "@kai_main" } else { string_concat("@kai_", nm) }
       let arity = list_length(ps)
@@ -15718,12 +15848,12 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], start_id: Int)
   }
 }
 
-fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], lams: [LamInfo], start_id: Int, acc: String) : LlvmDeclOut {
+fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], start_id: Int, acc: String) : LlvmDeclOut {
   match ds {
     [] -> LlvmDeclOut { text: acc, next_id: start_id }
     [d, ...rest] -> {
-      let out = llvm_emit_fn(d, fns, vs, lams, start_id)
-      llvm_emit_decls_loop(rest, fns, vs, lams, out.next_id, string_concat(acc, out.text))
+      let out = llvm_emit_fn(d, fns, vs, lams, oo, start_id)
+      llvm_emit_decls_loop(rest, fns, vs, lams, oo, out.next_id, string_concat(acc, out.text))
     }
   }
 }
@@ -15733,13 +15863,14 @@ fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], lams: [LamInfo], sta
 # has thunk signature `(self, args, n)` — args[i] reads the i-th
 # param, `kaix_capture(self, i)` reads the i-th captured local. The
 # body is then emitted under an env that pushes both as named regs.
-fn llvm_emit_lambda_body(l: LamInfo, fns: [EFn], vs: [EVar], lams: [LamInfo], start_id: Int) : LlvmDeclOut {
+fn llvm_emit_lambda_body(l: LamInfo, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], start_id: Int) : LlvmDeclOut {
   match l {
     LamInfo(id, _, _, params, caps, body) -> {
       let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
                           globals: "", body: "",
                           last_val: "", cur_label: "entry",
-                          locals: [], fns: fns, vars_: vs, lams: lams }
+                          locals: [], fns: fns, vars_: vs, lams: lams,
+                          op_offsets: oo }
       let e1 = llvm_emit_lambda_param_loads(e0, params, 0)
       let e2 = llvm_emit_lambda_capture_loads(e1, caps, 0)
       let e3 = llvm_emit_expr(e2, body)
@@ -15794,12 +15925,12 @@ fn llvm_emit_lambda_capture_loads(e: LlvmEmit, caps: [String], i: Int) : LlvmEmi
   }
 }
 
-fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], start_id: Int, acc: String) : String {
+fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], start_id: Int, acc: String) : String {
   match lams {
     [] -> acc
     [l, ...rest] -> {
-      let out = llvm_emit_lambda_body(l, fns, vs, lams, start_id)
-      llvm_emit_lambda_bodies(rest, fns, vs, out.next_id, string_concat(acc, out.text))
+      let out = llvm_emit_lambda_body(l, fns, vs, lams, oo, start_id)
+      llvm_emit_lambda_bodies(rest, fns, vs, oo, out.next_id, string_concat(acc, out.text))
     }
   }
 }
@@ -15823,9 +15954,58 @@ fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], test_mode: Bo
   # m7c-b/c handle and op-call lowerings; emitting them here keeps
   # the LLVM IR self-contained without forward declarations.
   let eff_structs = llvm_effect_struct_decls(decls)
-  let decls_out = llvm_emit_decls_loop(decls, fns, vs, lams, 0, "")
-  let lam_bodies = llvm_emit_lambda_bodies(lams, fns, vs, decls_out.next_id, "")
+  # m7c-c: compute (Eff.op → field index) for every declared
+  # effect; the dispatcher in `llvm_emit_call` consults this to
+  # GEP the right function pointer in the matching `%EvX` struct.
+  # First three fields are handler_id / env / state, so op N is at
+  # field 3 + N (in declaration order).
+  let oo = compute_op_offsets(decls)
+  let decls_out = llvm_emit_decls_loop(decls, fns, vs, lams, oo, 0, "")
+  let lam_bodies = llvm_emit_lambda_bodies(lams, fns, vs, oo, decls_out.next_id, "")
   concat_all([llvm_header(), eff_structs, "\n", decls_out.text, lam_bodies])
+}
+
+# m7c-c: per-decl walker that flattens every effect's ops into a
+# `[OpOffset]` table keyed on the dotted "Eff.op" name. Handles
+# both user-declared effects and the builtins inject_builtin_effects
+# adds based on main's row.
+fn compute_op_offsets(decls: [Decl]) : [OpOffset] =
+  compute_op_offsets_loop(decls, [])
+
+fn compute_op_offsets_loop(decls: [Decl], acc: [OpOffset]) : [OpOffset] {
+  match decls {
+    [] -> acc
+    [d, ...rest] -> {
+      let acc1 = match d {
+        DEffect(_, name, _, ops, _, _) -> compute_op_offsets_for_eff(name, ops, 0, acc)
+        _ -> acc
+      }
+      compute_op_offsets_loop(rest, acc1)
+    }
+  }
+}
+
+fn compute_op_offsets_for_eff(eff: String, ops: [EffectOp], idx: Int, acc: [OpOffset]) : [OpOffset] {
+  match ops {
+    [] -> acc
+    [op, ...rest] -> match op {
+      EOp(op_name, _, _, _, _, _) -> {
+        let key = string_concat(eff, string_concat(".", op_name))
+        # Field offset = 3 leading fields + position in op list.
+        let acc1 = list_append(acc, [OO(key, 3 + idx)])
+        compute_op_offsets_for_eff(eff, rest, idx + 1, acc1)
+      }
+    }
+  }
+}
+
+fn lookup_op_offset(table: [OpOffset], key: String) : Option[Int] {
+  match table {
+    [] -> None
+    [h, ...rest] -> match h {
+      OO(k, n) -> if k == key { Some(n) } else { lookup_op_offset(rest, key) }
+    }
+  }
 }
 
 # ====================================================================

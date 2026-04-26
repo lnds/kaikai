@@ -180,6 +180,15 @@ KaiValue *kaix_prelude_array_get(KaiValue *a, KaiValue *i)               { retur
 KaiValue *kaix_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v)  { return kai_prelude_array_set(a, i, v); }
 KaiValue *kaix_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) { return kai_prelude_array_grow(a, n, init); }
 
+/* m7c-c — op-call dispatch helper. The LLVM IR does its own
+ * lookup of the evidence node + handler pointer; expose just the
+ * handler for the dispatcher to bitcast to *Ev<Eff>. */
+void *kai_evidence_lookup_handler(const char *eff_label) {
+    KaiEvidence *node = kai_evidence_lookup_node(eff_label);
+    if (node == NULL) { return NULL; }
+    return node->handler;
+}
+
 /* Entry point: the LLVM output defines kai_main. Match what the C
    backend's emit_main_wrapper does. */
 extern KaiValue *kai_main(void);
