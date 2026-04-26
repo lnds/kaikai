@@ -187,7 +187,36 @@ static KaiValue *kai_alloc(KaiTag tag) {
     return v;
 }
 
-static KaiValue *kai_incref(KaiValue *v) { if (v) v->rc++; return v; }
+/* m5 #7: constant pool for nullary primitives.
+ *
+ * `kai_unit()`, `kai_bool(true)`, `kai_bool(false)`, `kai_nil()` are
+ * the four nullary constructors that dominated the per-tag alloc
+ * breakdown on kaic2 self-compile (~78% combined). Returning shared
+ * static singletons collapses every call to those factories into a
+ * pointer to .data, eliminating the calloc and the four
+ * `kai_rc_alloc_total` / `kai_rc_alloc_by_tag[]` increments per call.
+ *
+ * Singletons carry `rc = INT32_MAX` as a saturation sentinel.
+ * `kai_incref` / `kai_decref` short-circuit when they see the
+ * sentinel, so RC bookkeeping skips the singletons entirely:
+ *   - incref leaves rc as-is (no overflow toward zero).
+ *   - decref never triggers `kai_free_value` on a static, which
+ *     would otherwise call `free()` on .data and crash.
+ * The sentinel costs one extra `int` compare in the hot RC path;
+ * the saved alloc/free traffic dominates by orders of magnitude.
+ *
+ * Selfhost stays byte-identical because the emitted text is
+ * unchanged — only the runtime semantics shift.
+ */
+static KaiValue kai_singleton_unit  = { INT32_MAX, KAI_UNIT, { .b = 0 } };
+static KaiValue kai_singleton_true  = { INT32_MAX, KAI_BOOL, { .b = 1 } };
+static KaiValue kai_singleton_false = { INT32_MAX, KAI_BOOL, { .b = 0 } };
+static KaiValue kai_singleton_nil   = { INT32_MAX, KAI_NIL,  { .b = 0 } };
+
+static KaiValue *kai_incref(KaiValue *v) {
+    if (v && v->rc != INT32_MAX) v->rc++;
+    return v;
+}
 static void       kai_decref(KaiValue *v);
 
 /* m8 #1/#3: KaiFiber definitions sit here (before kai_free_value)
@@ -418,17 +447,16 @@ static void kai_free_value(KaiValue *v) {
 
 static void kai_decref(KaiValue *v) {
     if (!v) return;
+    if (v->rc == INT32_MAX) return;   /* m5 #7 — singleton, saturated */
     if (--v->rc == 0) kai_free_value(v);
 }
 
 /* ---------- constructors ---------- */
 
-static KaiValue *kai_unit(void) { return kai_alloc(KAI_UNIT); }
+static KaiValue *kai_unit(void) { return &kai_singleton_unit; }
 
 static KaiValue *kai_bool(int b) {
-    KaiValue *v = kai_alloc(KAI_BOOL);
-    v->as.b = b ? 1 : 0;
-    return v;
+    return b ? &kai_singleton_true : &kai_singleton_false;
 }
 
 static KaiValue *kai_int(int64_t i) {
@@ -463,7 +491,7 @@ static KaiValue *kai_str(const char *cstr) {
     return kai_str_from_bytes(cstr, strlen(cstr));
 }
 
-static KaiValue *kai_nil(void) { return kai_alloc(KAI_NIL); }
+static KaiValue *kai_nil(void) { return &kai_singleton_nil; }
 
 static KaiValue *kai_cons(KaiValue *head, KaiValue *tail) {
     KaiValue *v = kai_alloc(KAI_CONS);
