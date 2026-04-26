@@ -15,10 +15,20 @@ m5 #0, and what stays deferred.
   currently follow a reference-counting discipline that a use-
   analysis pass could optimise.
 - m5 #0 lands **measurement infrastructure** (`KAI_TRACE_RC` env
-  var) and pins the baseline numbers below. Everything beyond m5
-  #0 — actual `dup` / `drop` emission, last-use suppression, drop
-  specialisation, reuse-in-place — stays deferred to m5 proper,
-  scoped honestly as multi-week.
+  var) and pins the baseline numbers below.
+- m5 round 2 (2026-04-26) lands a typed-AST walker for fn-param
+  last-use analysis (`scan_uses_expr` + `last_use_for`,
+  diagnosable via `--dump-last-use`) and a conservative drop pass
+  for unused `let` bindings whose RHS is freshly allocated. Bench
+  fixture `stage2/bench/m5_unused_lets.kai` shows ~24× more frees
+  and ~7× lower leak rate on a focused workload; kaic2 self-
+  compile is unchanged because compiler.kai's hand discipline
+  rarely produces droppable lets. Detail in §"What landed under
+  m5 (round 2, 2026-04-26)".
+- Everything beyond — capture-aware drops, dup at non-last uses,
+  drops at fn exit points, drop specialisation, reuse-in-place —
+  stays deferred to a future m5 lane, scoped honestly as multi-
+  week.
 - The single fact every future m5 work item must reckon with: the
   current compiler **leaks 97-98% of every value it allocates**.
   Memory is reclaimed only when the process exits and the runtime's
@@ -201,56 +211,158 @@ The runtime change is purely additive and does not affect emitted
 text — the kaic2 self-host fixed point (`make -C stage2 selfhost`)
 remains byte-identical.
 
+## What landed under m5 (round 2, 2026-04-26)
+
+A second m5 lane shipped six commits over m5 #0. The brief's
+sub-numbering (m5 #1-#6 = walker + last-use + drop + dup + bench +
+docs) was retired during the work; the actual landings line up
+with the doc's m5 sub-milestones below as follows:
+
+| commit    | brief grain   | doc grain        | scope                                        |
+|-----------|---------------|------------------|----------------------------------------------|
+| `f9c84a5` | m4c #1        | precondition     | identity `monomorphise` pipeline slot        |
+| `412938b` | m4c #2        | precondition     | mangling helpers + `--dump-mono-out`         |
+| `1d85043` | m5 #1         | precondition     | identity `perceus_pass` slot, m4c rescoped   |
+| `2474729` | m5 #2         | shared           | last-use walker for fn params + dump         |
+| `592c71c` | m5 #2b        | bug fix          | walker covers `EStr` interpolations          |
+| `834af22` | m5 #3         | doc m5 **#3**    | drop unused let-bindings, fresh-RHS subset   |
+| `448e18d` | m5 #5         | doc m5 (bench)   | bench fixture + measured deltas              |
+
+m4c proper (the specialiser) is **not** in tree. m4c #1/#2 wire the
+slot and ship a deterministic name-mangling helper, but
+`monomorphise(tp) = tp.decls` — actual specialisation hit a
+`clause_fn_name` collision under duplicated bodies and was deferred.
+The doc's m5 #1 (constant pool), m5 #4 (decref params at exits),
+m5 #5 (last-use reuse), and m5 #6 (closure capture incref) did not
+land.
+
+**The shipped work is the safe core**: a typed-AST walker for
+last-use analysis (fn params only), a dump diagnostic, and a
+conservative "drop unused let-bindings whose RHS is freshly
+allocated" pass in `emit_expr`'s `EBlock` case. The conservative
+filter is `is_fresh_alloc`: literals, calls, lists, record literals,
+ranges, lambdas, binops, unops. Excluded: `EVar` (alias),
+`EField` / `EIndex` (extracted refs), and the composite control
+forms. `PWild` lets get the same treatment when the RHS is fresh.
+
+### Measured deltas
+
+Bench fixture: `stage2/bench/m5_unused_lets.kai` — 4 unused let-
+bindings per iteration, self-contained literal RHS, 1000 iterations.
+
+| version    | alloc  | free   | leaked | leak rate | live_peak |
+|------------|--------|--------|--------|-----------|-----------|
+| pre-m5     | 29,007 |  1,002 | 28,005 |   96.5 %  |   28,006  |
+| m5 round 2 | 29,007 | 25,002 |  4,005 |   13.8 %  |    4,010  |
+
+~24× more frees mid-program; ~7× drop in leak rate; same alloc
+total (m5 #3 frees sooner, never eliminates allocations).
+
+Self-compile of `stage2/compiler.kai` is essentially flat:
+
+| version    | alloc       | free      | leaked      |
+|------------|-------------|-----------|-------------|
+| pre-m5     | 130,735,107 | 3,545,979 | 127,189,128 |
+| m5 round 2 | 138,684,259 | 3,784,645 | 134,899,614 |
+
+The +8M alloc / +239K free deltas are dominated by the new walker
++ emit code in `compiler.kai` itself. The brief's "kaic2 self-
+compile alloc count must be measurably lower than pre-m5" gate is
+**not** satisfied: compiler.kai is hand-disciplined enough that the
+emitted drops fire only inside diagnostic-error branches that do
+not run on a clean compile. Real-world wins for m5 round 2 live in
+user code that allocates intermediate structures it never reads —
+exactly the bench fixture's shape.
+
+### Capture-aware drops are deferred
+
+`is_fresh_alloc` checks the outer constructor only. A let whose RHS
+captures an existing binding (e.g. `let unused = [n, n+1]` with `n`
+a fn parameter) transfers ownership of `n` into the cons cell;
+dropping the cons chain-decref's `n` too. Subsequent uses of `n`
+are use-after-free. compiler.kai avoids this pattern by hand
+discipline, so selfhost stays green; user code that does not
+will surface the latent bug.
+
+Capture-aware drops require pairing with `kai_incref` at non-last
+uses (the brief's m5 #4) so the original binding survives the
+chain-decref. That is its own milestone and lands separately.
+
 ## Concrete sub-milestones for m5 proper
 
 In rough dependency order. Each is its own commit-grain piece.
+Status as of 2026-04-26: m5 #3 shipped. The rest are deferred to
+a future m5 lane.
 
-- **m5 #1 — Constant pool for nullary primitives.** Return shared
-  references for `kai_unit()`, `kai_bool(true)`, `kai_bool(false)`,
-  `kai_nil()` from `runtime.h`. The four constructors return a
-  pointer to a static `KaiValue` rather than fresh `calloc`s; the
-  refcount on those statics is ignored (or saturates). Expected
-  reduction: ~80% of total allocs in the kaic2 self-compile, with
-  no change to emitter or downstream code. Selfhost stays
-  byte-identical (only the linked runtime changes). 0.5-1 day.
+- **m5 #1 — Constant pool for nullary primitives.** [DEFERRED]
+  Return shared references for `kai_unit()`, `kai_bool(true)`,
+  `kai_bool(false)`, `kai_nil()` from `runtime.h`. The four
+  constructors return a pointer to a static `KaiValue` rather than
+  fresh `calloc`s; the refcount on those statics is ignored (or
+  saturates). Expected reduction: ~80% of total allocs in the
+  kaic2 self-compile, with no change to emitter or downstream
+  code. Selfhost stays byte-identical (only the linked runtime
+  changes). 0.5-1 day.
 
-- **m5 #2 — m4c specialiser.** Walk the typed AST and produce one
-  concrete copy of every generic function per call-site
-  instantiation, replacing the uniform-box dispatch on those calls.
-  This is the IR foundation a real Perceus pass walks. The output
-  is still a `Decl` shape — no separate IR datatype necessary if
-  m5 #3-#5 stay simple. 3-5 days.
+- **m5 #2 — m4c specialiser.** [PARTIAL] The pipeline slot
+  (`monomorphise(tp) : [Decl]`) ships as identity in `f9c84a5`,
+  with a deterministic mangling helper (`mangle_name`,
+  `mangle_ty`) and a `--dump-mono-out` diagnostic in `412938b`.
+  Specialised body emission was attempted under m4c #3 and hit a
+  hard blocker: `clause_fn_name(line, col, op)` mints C symbols
+  by source position alone, so duplicating a body that contains
+  an `EHandle` produces colliding clause symbols and the linker
+  rejects the binary. Fixing it is a real retrofit (~1-2 days,
+  plumbing fn name through `collect_decls` / `lc_new` /
+  clause-info) and only pays off once unboxing / drop
+  specialisation / reuse-in-place arrive. The basic Perceus pass
+  below operates on uniform-boxed values regardless. 3-5 days
+  remaining if pursued.
 
-- **m5 #3 — Decref of unused locals.** Identify `let unused = ...`
-  bindings whose RHS is a fresh allocation (constructor / call) and
-  whose name is never referenced in the rest of the block. Emit a
-  `kai_decref` immediately after the let. Limited initially to the
-  unaliased subset where the RHS produces a value with rc=1. 2-3
-  days.
+- **m5 #3 — Decref of unused locals.** [SHIPPED in `834af22`]
+  Identifies `let name = rhs; rest` where `name` is never
+  referenced in `rest` AND `rhs` matches the `is_fresh_alloc`
+  predicate (literals, calls, lists, record literals, ranges,
+  lambdas, binops, unops; excludes `EVar`, `EField`, `EIndex`,
+  and composite control forms). Emits `kai_decref(kai_<name>)`
+  immediately after the let. `PWild` lets get the same treatment
+  when RHS is fresh. The freshness check looks at the outer
+  constructor only; capture-aware drops require pairing with
+  m5 #4's dups and stay deferred. Bench fixture and measured
+  deltas in the round-2 section above.
 
-- **m5 #4 — Decref of function parameters at exit points.** Walk
-  each `pub fn` body; at every return-equivalent position (final
-  expression of the body, every match-arm tail, every if-arm tail)
-  emit `kai_decref` for parameters that are not part of the
-  returned value. Requires the same use-analysis machinery as #3.
-  3-5 days.
+- **m5 #4 — Decref of function parameters at exit points.**
+  [DEFERRED] Walk each `pub fn` body; at every return-equivalent
+  position (final expression of the body, every match-arm tail,
+  every if-arm tail) emit `kai_decref` for parameters that are
+  not part of the returned value. Requires the same use-analysis
+  machinery as #3 (already shipped via m5 #2's `scan_uses_expr`
+  + `last_use_for`). The naïve "drop every LUUnused param at
+  body start" attempt during m5 round 2 broke selfhost because
+  callers in compiler.kai re-use the same `t = p_peek(p)` token
+  across the if/elif dispatch chain — a callee-side decref frees
+  the value the caller is still holding. m5 #4 must therefore
+  pair with `kai_incref` at non-last uses on the caller side
+  (Perceus' linear discipline). 3-5 days when pursued together
+  with the dup-insertion side.
 
-- **m5 #5 — Last-use reuse / drop suppression.** The actual
-  Perceus optimisation: when a binding's last use is consumed by
-  a constructor or another function call, no `kai_incref` is
-  emitted (the existing reference is taken) and the corresponding
-  `kai_decref` is suppressed. Builds on #3-#4's analysis. 2-3
-  days once the framework is in place.
+- **m5 #5 — Last-use reuse / drop suppression.** [DEFERRED]
+  The actual Perceus optimisation: when a binding's last use is
+  consumed by a constructor or another function call, no
+  `kai_incref` is emitted (the existing reference is taken) and
+  the corresponding `kai_decref` is suppressed. Builds on #3-#4's
+  analysis. 2-3 days once the framework is in place.
 
-- **m5 #6 — Closure capture incref.** Capture-by-share is unsafe
-  once #3-#4 land (the captured value may be decref'd before the
-  closure runs). `kai_closure` must incref captures at creation,
-  `kai_free_value` already decrefs them. Coordinated change in
-  runtime + emitter. 1 day.
+- **m5 #6 — Closure capture incref.** [DEFERRED] Capture-by-share
+  is unsafe once #3-#4 land (the captured value may be decref'd
+  before the closure runs). `kai_closure` must incref captures at
+  creation, `kai_free_value` already decrefs them. Coordinated
+  change in runtime + emitter. 1 day.
 
-The total is on the order of 2-3 weeks of focused work, dwarfing
-the original brief's "1-2 days for basic Perceus." The original
-estimate predates the audit recorded here.
+Round 2 closed out at m5 #3 + diagnostic infrastructure (walker
+dump, mono-out dump). Continuing through #4-#6 is the natural
+follow-up; the work fits within ~1-2 weeks of focused effort, with
+the m4c retrofit as a separate optional milestone.
 
 ## Out of scope (full Perceus, m6+)
 

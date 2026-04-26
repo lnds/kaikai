@@ -6228,7 +6228,14 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
           None -> "kai_unit()"
         }
         _ -> {
-          let stmt_out = concat_all(map(stmts, (s) => emit_stmt(src, s, fns, variants, lams)))
+          # m5 #3 — drops for unused let-bindings whose RHS is a
+          # fresh allocation. See `block_unused_lets`. The set is
+          # computed once per block so each let-binding's drop
+          # decision considers all subsequent stmts and the trailing
+          # final expression.
+          let drops = block_unused_lets(stmts, opt_final)
+          let stmt_out = concat_all(map(stmts,
+            (s) => emit_stmt_with_drops(src, s, drops, fns, variants, lams)))
           let final_out = match opt_final {
             Some(fe) -> cat2(emit_expr(src, fe, fns, variants, lams), "; ")
             None -> "kai_unit(); "
@@ -6342,6 +6349,127 @@ fn emit_stmt(src: String, s: Stmt, fns: [EFn], variants: [EVar], lams: [LamInfo]
     # m7b #5: `var name = init` desugars away pre-resolve; this arm
     # is dead code in normal compilation but keeps the match exhaustive.
     SVar(_, _, _, _, _) -> "/* SVar: should have been desugared */ "
+  }
+}
+
+# m5 #3 — emit_stmt variant that consults the per-block drop set.
+# Only `SLet` is augmented; the other stmt forms route through the
+# original `emit_stmt` path. The set is the result of
+# `block_unused_lets`, so a name only appears here when it is safe
+# to decref immediately after the let.
+fn emit_stmt_with_drops(src: String, s: Stmt, drops: [String],
+                        fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match s {
+    SLet(pat, _, rhs) ->
+      emit_let_stmt_with_drops(src, pat, rhs, drops, fns, variants, lams)
+    _ -> emit_stmt(src, s, fns, variants, lams)
+  }
+}
+
+fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
+                             drops: [String],
+                             fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let rhs_c = emit_expr(src, rhs, fns, variants, lams)
+  match pat.pkind {
+    PBind(name) -> {
+      let bind = concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
+      if list_has(drops, name) {
+        cat2(bind, concat_all(["kai_decref(kai_", name, "); "]))
+      } else {
+        bind
+      }
+    }
+    # `let _ = expr` discards the value. If RHS is a fresh
+    # allocation we can decref it; otherwise the original behaviour
+    # (no decref) is preserved to avoid double-freeing an alias.
+    PWild -> {
+      if is_fresh_alloc(rhs) {
+        cat3("{ KaiValue *_w = ", rhs_c, "; kai_decref(_w); } ")
+      } else {
+        cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
+      }
+    }
+    _ -> {
+      let binds = emit_pat_binds(src, pat, "_letv", fns, variants, lams)
+      concat_all(["{ KaiValue *_letv = ", rhs_c, "; ", binds, "} "])
+    }
+  }
+}
+
+# A let-binding is "droppable" when:
+#   1. The pattern is a single `PBind(name)` (no destructuring).
+#   2. The RHS is a fresh allocation (rc=1, no aliasing — see
+#      `is_fresh_alloc` for the conservative subset).
+#   3. The bound name is never read in the rest of the block: later
+#      stmts AND the trailing optional final expression.
+# Returns the list of droppable names in the block. The walker
+# from m5 #2 (`scan_uses_in_stmts` / `scan_uses_expr`) is reused
+# unchanged.
+fn block_unused_lets(stmts: [Stmt], opt_final: Option[Expr]) : [String] =
+  block_unused_lets_loop(stmts, opt_final, [])
+
+fn block_unused_lets_loop(stmts: [Stmt], opt_final: Option[Expr],
+                          acc: [String]) : [String] {
+  match stmts {
+    [] -> list_reverse(acc)
+    [s, ...rest] -> {
+      let acc1 = match s {
+        SLet(pat, _, rhs) -> match pat.pkind {
+          PBind(nm) -> {
+            if is_fresh_alloc(rhs) and not name_read_in_block(rest, opt_final, nm) {
+              [nm, ...acc]
+            } else { acc }
+          }
+          _ -> acc
+        }
+        _ -> acc
+      }
+      block_unused_lets_loop(rest, opt_final, acc1)
+    }
+  }
+}
+
+fn name_read_in_block(stmts: [Stmt], opt_final: Option[Expr], nm: String) : Bool {
+  let stmt_uses = scan_uses_in_stmts(stmts, false)
+  let final_uses = match opt_final {
+    None -> []
+    Some(e) -> scan_uses_expr(e, false)
+  }
+  any_use_of(list_append(stmt_uses, final_uses), nm)
+}
+
+fn any_use_of(uses: [Use], nm: String) : Bool {
+  match uses {
+    [] -> false
+    [h, ...rest] -> match h {
+      U(uname, _, _, _) ->
+        if uname == nm { true } else { any_use_of(rest, nm) }
+    }
+  }
+}
+
+# Conservative "fresh allocation" predicate. Returns true when the
+# RHS is known to materialise a value with rc=1 and no aliasing.
+# False for `EVar` (alias of an existing binding), `EField` /
+# `EIndex` (extracted ref into a parent), and the composite control
+# forms (`EIf`, `EMatch`, `EBlock`, `EHandle`, `EPipe`) whose result
+# can be a sub-expression aliased into the surrounding scope.
+fn is_fresh_alloc(e: Expr) : Bool {
+  match e.kind {
+    EInt(_)         -> true
+    EReal(_)        -> true
+    EBool(_)        -> true
+    EChar(_)        -> true
+    EStr(_, _)      -> true
+    EUnit           -> true
+    ECall(_, _)     -> true
+    EList(_)        -> true
+    ERecordLit(_, _) -> true
+    ERange(_, _, _) -> true
+    ELambda(_, _)   -> true
+    EBinop(_, _, _) -> true
+    EUnop(_, _)     -> true
+    _               -> false
   }
 }
 
@@ -8656,6 +8784,60 @@ fn ty_to_string(t: Ty) : String {
     }
     TyVarT(n) -> cat2("?t", int_to_string(n))
     TyAny -> "?"
+  }
+}
+
+# m4c #2 — name-mangling helpers for monomorphisation.
+#
+# `mangle_name(name, [Ty]) : String` produces a deterministic,
+# C-identifier-safe name for a polymorphic decl instantiated at a
+# concrete type tuple. The empty tuple maps back to `name` (no
+# instantiation, e.g. fully monomorphic decls). For non-empty tuples
+# the form is `name__mono__T1[__T2...]`, with each `Tn` rendered by
+# `mangle_ty` using bracketed sentinels (`L_..._E` for lists,
+# `_O_..._C` for type-constructor argument lists, `F_..._R_..._E`
+# for function arrows). The sentinels make the encoding unambiguous:
+# `Foo[Bar]` and a hypothetical user fn named `Foo_Bar` cannot
+# collide. Effects are erased — two instantiations that differ only
+# in the row of an inner `TyFnT` mangle the same, by design (Perceus
+# operates on values, not on rows).
+#
+# The mangler errors implicitly on `TyVarT` / `TyAny`: a resolved
+# call-site tuple should not contain unresolved variables. If one
+# slips through the renderer emits `TVAR` / `Any` and the resulting
+# duplicate is caught by the m4c #3 collision check.
+
+fn mangle_ty(t: Ty) : String {
+  match t {
+    TyInt    -> "Int"
+    TyReal   -> "Real"
+    TyBool   -> "Bool"
+    TyString -> "String"
+    TyChar   -> "Char"
+    TyUnit   -> "Unit"
+    TyListT(inner) -> concat_all(["L_", mangle_ty(inner), "_E"])
+    TyFnT(ps, ret, _) -> concat_all([
+      "F_", join_with(map(ps, mangle_ty), "_"),
+      "_R_", mangle_ty(ret), "_E"
+    ])
+    TyCon(cname, tas) -> {
+      match tas {
+        [] -> cname
+        [h, ...rest] -> concat_all([cname, "_O_",
+                                    join_with(map(tas, mangle_ty), "_"),
+                                    "_C"])
+      }
+    }
+    TyVarT(_) -> "TVAR"
+    TyAny     -> "Any"
+  }
+}
+
+fn mangle_name(name: String, tys: [Ty]) : String {
+  match tys {
+    [] -> name
+    [h, ...rest] -> concat_all([name, "__mono__",
+                                join_with(map(tys, mangle_ty), "__")])
   }
 }
 
@@ -12566,6 +12748,349 @@ fn dump_mono(file: String, decls: [Decl]) : Int {
   r.errs
 }
 
+# ---- `--dump-mono-out`: planned mangled names per call site ----
+#
+# Same input as `--dump-mono` (the resolved-call-site list); output
+# adds the mangled name `mangle_name` would produce for each tuple.
+# Diagnostic for m4c #2; m4c #3 will use these names to mint the
+# specialised decls. Lines look like:
+#   foo@line:col  [Int, Bool]  ->  foo__mono__Int__Bool
+
+fn dump_mono_out_line(cs: ResolvedCS) : Unit {
+  match cs {
+    RCS(nm, line, col, tys) -> {
+      let tys_str = join_with(ty_string_list(tys), ", ")
+      let mname = mangle_name(nm, tys)
+      print("#{nm}@#{int_to_string(line)}:#{int_to_string(col)}  [#{tys_str}]  ->  #{mname}")
+    }
+  }
+}
+
+fn dump_mono_out(file: String, decls: [Decl]) : Int {
+  let r = infer_program(file, decls, false)
+  r.insts |> each(dump_mono_out_line)
+  r.errs
+}
+
+# ---- m4c — monomorphise (identity, m4c #1) ----
+#
+# Sits between `infer_program` and `perceus_pass` in the pipeline.
+# Given a TypedProgram (post-inference, with `Expr.ty` populated and
+# all `ResolvedCS` known), produce the `[Decl]` shape the next pass
+# walks. m4c #1 is an identity transform: the post-mono decls are
+# the typed decls, unchanged. Selfhost stays byte-identical because
+# the emitter does not consume `Expr.ty`.
+#
+# Real specialisation (per-instantiation copies of polymorphic decls,
+# call-site rewrites, dead-generic pruning) is deferred. The blocker
+# surfaced under m4c #3: `clause_fn_name(line, col, op)` mints C
+# symbols by source position alone, so two copies of a body that
+# contains an `EHandle` produce identical clause symbols and the C
+# linker rejects the binary. Fixing it is a real retrofit (~1-2 days,
+# touches the clause-collection plumbing) and only pays off once
+# unboxing / drop specialisation / reuse-in-place arrive — the
+# "basic Perceus" pass below operates on uniform-boxed values and
+# does not require specialised bodies.
+#
+# When the time comes, the four sub-steps still apply: mangling
+# helper (`mangle_name` in this file already), specialised-copy
+# emission (with fn-name-aware clause symbols), call-site rewrite,
+# generic prune. Until then `monomorphise` stays identity and
+# `--dump-mono-out` documents what specialisation WOULD do.
+
+fn monomorphise(tp: TypedProgram) : [Decl] {
+  tp.decls
+}
+
+# ---- m5 — basic Perceus (m5 #1, walker scaffold) ----
+#
+# Walks the post-mono `[Decl]` and (eventually) inserts `kai_dup` /
+# `kai_decref` calls at non-last / last-use positions per the Koka
+# Perceus paper. m5 #1 wires the slot; the body is identity. m5 #2
+# computes per-binding last-use positions; m5 #3 emits drops at
+# end-of-scope; m5 #4 emits dups at non-last uses; m5 #5 measures.
+#
+# Operates on values, not types. Under uniform boxing every
+# `KaiValue *` has the same RC shape, so a single drop/dup discipline
+# applies across instantiations — the m4c retrofit blocking real
+# monomorphisation does not block this pass.
+#
+# Reads the source AST as the IR. The emitter consumes whatever this
+# function returns; selfhost convergence remains the gate.
+
+fn perceus_pass(decls: [Decl]) : [Decl] {
+  decls
+}
+
+# ---- m5 #2 — last-use analysis (fn-param scope) ----
+#
+# For each `pub fn` parameter, find the lexical position of its last
+# direct read in the body. Reads inside an `ELambda` body are
+# conservatively treated as closure captures and BLOCK "last": the
+# lambda may survive past its own evaluation point, so the captured
+# binding is alive until the closure dies. m5 #2 stays at fn-param
+# scope; let-bindings, match-pattern bindings, and closure-aware
+# data-flow refinement land in m5 #2b / m5 #3.
+#
+# Output is diagnostic only — `--dump-last-use` prints one line per
+# parameter:
+#   fn add@10:
+#     param x: last-use at 10:32
+#     param y: last-use at 10:36
+#     param z: blocked by closure capture
+#     param u: never used
+# m5 #3 will consume the same `last_use_for` result to drive drop
+# emission.
+
+type Use = U(String, Int, Int, Bool)   # name, line, col, in_lambda
+
+type LU
+  = LUAt(String, Int, Int)             # last-use position
+  | LUBlocked(String)                  # closure capture blocks last
+  | LUUnused(String)                   # never referenced
+
+# Walker entry: collect every EVar in `e`. The flag is true while we
+# are inside any enclosing ELambda body; closure capture detection
+# is conservative — a single in-lambda ref to a name blocks last for
+# that name regardless of how far up the lambda is nested.
+fn scan_uses_expr(e: Expr, in_lam: Bool) : [Use] =
+  scan_uses_kind(e.kind, e.line, e.col, in_lam)
+
+fn scan_uses_kind(k: ExprKind, line: Int, col: Int, in_lam: Bool) : [Use] {
+  match k {
+    EVar(nm) -> [U(nm, line, col, in_lam)]
+    # Interpolated strings hide EVar refs inside `#{...}` segments —
+    # the lexer keeps the raw source span and emit re-parses at code
+    # gen. Mirror `fv_interp` (5700-5725) so a binding read only via
+    # interpolation never gets mis-classified as `LUUnused`.
+    EStr(span, is_triple) -> scan_uses_in_interp(span, is_triple, in_lam)
+    ECall(f, xs) -> list_append(scan_uses_expr(f, in_lam),
+                                scan_uses_in_exprs(xs, in_lam))
+    EField(x, _) -> scan_uses_expr(x, in_lam)
+    EIndex(x, i) -> list_append(scan_uses_expr(x, in_lam),
+                                scan_uses_expr(i, in_lam))
+    EBinop(_, l, r) -> list_append(scan_uses_expr(l, in_lam),
+                                   scan_uses_expr(r, in_lam))
+    EUnop(_, x) -> scan_uses_expr(x, in_lam)
+    EIf(c, t, opt_e) -> {
+      let p1 = list_append(scan_uses_expr(c, in_lam), scan_uses_expr(t, in_lam))
+      match opt_e {
+        None -> p1
+        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
+      }
+    }
+    EMatch(s, arms) -> list_append(scan_uses_expr(s, in_lam),
+                                    scan_uses_in_arms(arms, in_lam))
+    ELambda(_, body) -> scan_uses_expr(body, true)
+    ERecordLit(_, fis) -> scan_uses_in_field_inits(fis, in_lam)
+    EList(elems) -> scan_uses_in_list_elems(elems, in_lam)
+    ERange(lo, hi, opt_by) -> {
+      let p1 = list_append(scan_uses_expr(lo, in_lam), scan_uses_expr(hi, in_lam))
+      match opt_by {
+        None -> p1
+        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
+      }
+    }
+    EBlock(stmts, opt_tail) -> {
+      let p1 = scan_uses_in_stmts(stmts, in_lam)
+      match opt_tail {
+        None -> p1
+        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
+      }
+    }
+    EPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
+                                scan_uses_expr(r, in_lam))
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let p1 = scan_uses_expr(body, in_lam)
+      let p2 = match init_opt {
+        None -> p1
+        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
+      }
+      let p3 = list_append(p2, scan_uses_in_clauses(clauses, in_lam))
+      match ret_opt {
+        None -> p3
+        Some(hr) -> match hr {
+          HR(_, body2, _, _) -> list_append(p3, scan_uses_expr(body2, in_lam))
+        }
+      }
+    }
+    _ -> []
+  }
+}
+
+fn scan_uses_in_exprs(es: [Expr], in_lam: Bool) : [Use] {
+  match es {
+    [] -> []
+    [h, ...rest] -> list_append(scan_uses_expr(h, in_lam),
+                                scan_uses_in_exprs(rest, in_lam))
+  }
+}
+
+fn scan_uses_in_arms(arms: [Arm], in_lam: Bool) : [Use] {
+  match arms {
+    [] -> []
+    [h, ...rest] -> match h {
+      Arm(_, guard_opt, body) -> {
+        let p1 = match guard_opt {
+          None -> []
+          Some(g) -> scan_uses_expr(g, in_lam)
+        }
+        let p2 = list_append(p1, scan_uses_expr(body, in_lam))
+        list_append(p2, scan_uses_in_arms(rest, in_lam))
+      }
+    }
+  }
+}
+
+fn scan_uses_in_field_inits(fis: [FieldInit], in_lam: Bool) : [Use] {
+  match fis {
+    [] -> []
+    [h, ...rest] -> match h {
+      FI(_, e) -> list_append(scan_uses_expr(e, in_lam),
+                              scan_uses_in_field_inits(rest, in_lam))
+    }
+  }
+}
+
+fn scan_uses_in_list_elems(es: [ListElem], in_lam: Bool) : [Use] {
+  match es {
+    [] -> []
+    [h, ...rest] -> {
+      let inner = match h {
+        ElPlain(e) -> e
+        ElSpread(e) -> e
+      }
+      list_append(scan_uses_expr(inner, in_lam),
+                  scan_uses_in_list_elems(rest, in_lam))
+    }
+  }
+}
+
+fn scan_uses_in_stmts(stmts: [Stmt], in_lam: Bool) : [Use] {
+  match stmts {
+    [] -> []
+    [h, ...rest] -> {
+      let p1 = match h {
+        SLet(_, _, rhs) -> scan_uses_expr(rhs, in_lam)
+        SAssert(c, opt_msg) -> {
+          let q = scan_uses_expr(c, in_lam)
+          match opt_msg {
+            None -> q
+            Some(e2) -> list_append(q, scan_uses_expr(e2, in_lam))
+          }
+        }
+        SExprStmt(e) -> scan_uses_expr(e, in_lam)
+        SIndexAssign(arr, idx, val, _, _) -> {
+          let q1 = list_append(scan_uses_expr(arr, in_lam),
+                               scan_uses_expr(idx, in_lam))
+          list_append(q1, scan_uses_expr(val, in_lam))
+        }
+        SVar(_, _, init, _, _) -> scan_uses_expr(init, in_lam)
+      }
+      list_append(p1, scan_uses_in_stmts(rest, in_lam))
+    }
+  }
+}
+
+fn scan_uses_in_clauses(cs: [HClause], in_lam: Bool) : [Use] {
+  match cs {
+    [] -> []
+    [h, ...rest] -> match h {
+      HC(_, _, body, _, _) -> list_append(scan_uses_expr(body, in_lam),
+                                          scan_uses_in_clauses(rest, in_lam))
+    }
+  }
+}
+
+# Re-parse an `EStr` span to surface `#{expr}` interpolations and
+# scan each parsed sub-expression for EVar refs. Mirrors `fv_interp`.
+fn scan_uses_in_interp(span: String, is_triple: Bool, in_lam: Bool) : [Use] {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  let parts = iscan_collect(span, body_end,
+                            IScan { parts: [], lit_start: body_start, i: body_start })
+  scan_uses_interp_parts(parts, in_lam)
+}
+
+fn scan_uses_interp_parts(parts: [IPart], in_lam: Bool) : [Use] {
+  match parts {
+    [] -> []
+    [p, ...rest] -> match p {
+      IpLit(_, _) -> scan_uses_interp_parts(rest, in_lam)
+      IpExp(esrc) -> {
+        let toks = tokenize(esrc)
+        let prs = parser_new("<interp>", esrc, toks)
+        let r = parse_expr(prs)
+        let head = match r.r {
+          Some(e) -> scan_uses_expr(e, in_lam)
+          None -> []
+        }
+        list_append(head, scan_uses_interp_parts(rest, in_lam))
+      }
+    }
+  }
+}
+
+# Find the last-use record for `nm` among `uses`. A single in-lambda
+# reference forces `LUBlocked`; otherwise the max (line, col) wins.
+fn last_use_for(nm: String, uses: [Use]) : LU =
+  last_use_for_loop(nm, uses, false, -1, -1)
+
+fn last_use_for_loop(nm: String, uses: [Use], blocked: Bool,
+                     mx_line: Int, mx_col: Int) : LU {
+  match uses {
+    [] -> {
+      if blocked { LUBlocked(nm) }
+      else if mx_line < 0 { LUUnused(nm) }
+      else { LUAt(nm, mx_line, mx_col) }
+    }
+    [h, ...rest] -> match h {
+      U(uname, ln, cl, in_lam) -> {
+        if uname == nm {
+          if in_lam {
+            last_use_for_loop(nm, rest, true, mx_line, mx_col)
+          } else if ln > mx_line or (ln == mx_line and cl > mx_col) {
+            last_use_for_loop(nm, rest, blocked, ln, cl)
+          } else {
+            last_use_for_loop(nm, rest, blocked, mx_line, mx_col)
+          }
+        } else {
+          last_use_for_loop(nm, rest, blocked, mx_line, mx_col)
+        }
+      }
+    }
+  }
+}
+
+# ---- `--dump-last-use`: per-fn-param last-use diagnostic ----
+
+fn dump_last_use_for_param(p: Param, uses: [Use]) : Unit {
+  let lu = last_use_for(p.pname, uses)
+  match lu {
+    LUAt(nm, ln, cl) -> print("  param #{nm}: last-use at #{int_to_string(ln)}:#{int_to_string(cl)}")
+    LUBlocked(nm)    -> print("  param #{nm}: blocked by closure capture")
+    LUUnused(nm)     -> print("  param #{nm}: never used")
+  }
+}
+
+fn dump_last_use_for_decl(d: Decl) : Unit {
+  match d {
+    DFn(_, nm, _, params, _, _, body, ln, _) -> {
+      print("fn #{nm}@#{int_to_string(ln)}:")
+      let uses = scan_uses_expr(body, false)
+      params |> each((p) => dump_last_use_for_param(p, uses))
+    }
+    _ -> {}
+  }
+}
+
+fn dump_last_use(file: String, decls: [Decl]) : Int {
+  let r = infer_program(file, decls, false)
+  r.decls |> each(dump_last_use_for_decl)
+  r.errs
+}
+
 # ---- `--holes`: typed-hole reports ----
 #
 # For each `?` / `?name` in the program, print the expected type
@@ -14750,6 +15275,8 @@ type Mode
   | MCheck
   | MDumpTyped
   | MDumpMono
+  | MDumpMonoOut
+  | MDumpLastUse
   | MHoles
   | MHolesJson
   | MEmitLlvm
@@ -14801,6 +15328,10 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
         parse_cli_loop(more, cli_with_mode(opts, MDumpTyped))
       } else if a == "--dump-mono" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpMono))
+      } else if a == "--dump-mono-out" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpMonoOut))
+      } else if a == "--dump-last-use" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpLastUse))
       } else if a == "--holes" {
         parse_cli_loop(more, cli_with_mode(opts, MHoles))
       } else if a == "--holes-json" {
@@ -14855,6 +15386,8 @@ fn usage() : Unit {
   eprint("  --check            run name resolution and HM inference; report errors and exit")
   eprint("  --dump-typed       run HM inference and dump the typed AST with per-node Ty")
   eprint("  --dump-mono        list call-site instantiations (name, loc, resolved type args)")
+  eprint("  --dump-mono-out    list call-site instantiations with planned mangled monomorphic names")
+  eprint("  --dump-last-use    list each fn parameter's last-use position (m5 #2 diagnostic)")
   eprint("  --holes            report every typed hole (`?` / `?name`) with expected type + scope")
   eprint("  --holes-json       same as --holes, but JSON array for machine consumption")
   eprint("  --strict-holes     treat every unfilled hole as a compilation error (default: warning)")
@@ -15290,6 +15823,14 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_mono(path, all_decls) }
               }
+              MDumpMonoOut -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_mono_out(path, all_decls) }
+              }
+              MDumpLastUse -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_last_use(path, all_decls) }
+              }
               MHoles -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_holes(path, all_decls) }
@@ -15302,18 +15843,25 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk }
                 else {
-                  let ty_errs = check_infer(path, all_decls)
-                  if ty_errs != 0 { ty_errs }
+                  let typed_prog = infer_program(path, all_decls, false)
+                  if typed_prog.errs != 0 { typed_prog.errs }
                   else {
                     let hole_errs = if strict_holes { strict_holes_check(path, all_decls) } else { 0 }
                     if hole_errs != 0 { hole_errs }
                     else {
+                      # m4c #1 — identity monomorphise. Hands typed decls
+                      # to the next pass; semantics unchanged because the
+                      # emitter does not read `Expr.ty`.
+                      let mono_decls = monomorphise(typed_prog)
+                      # m5 #1 — basic Perceus walker (identity).
+                      # m5 #2-#4 fill in last-use analysis + dup/drop.
+                      let perceus_decls = perceus_pass(mono_decls)
                       let test_mode = match mode { MTest -> true _ -> false }
                       let use_llvm = match mode { MEmitLlvm -> true _ -> false }
                       let out = if use_llvm {
-                        emit_program_llvm(path, src, all_decls, test_mode)
+                        emit_program_llvm(path, src, perceus_decls, test_mode)
                       } else {
-                        emit_program(path, src, all_decls, test_mode)
+                        emit_program(path, src, perceus_decls, test_mode)
                       }
                       print(out)
                       0
