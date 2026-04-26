@@ -43,6 +43,10 @@ KaiValue *kaix_not(KaiValue *a)                { return kai_bool(!kai_truthy(a))
 /* ---------- control helpers ---------- */
 int kaix_truthy(KaiValue *v)                   { return kai_truthy(v); }
 
+/* ---------- m5 #4 — Perceus dup/drop wrappers for LLVM backend ---------- */
+KaiValue *kaix_internal_dup(KaiValue *v)       { return kai_internal_dup(v); }
+KaiValue *kaix_internal_drop(KaiValue *v)      { return kai_internal_drop(v); }
+
 /* ---------- prelude subset used by M3b ---------- */
 KaiValue *kaix_prelude_print(KaiValue *v)          { return kai_prelude_print(v); }
 KaiValue *kaix_prelude_eprint(KaiValue *v)         { return kai_prelude_eprint(v); }
