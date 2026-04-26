@@ -547,6 +547,11 @@ Rationale:
    Lands once `Option` and `Result` are firm in prelude (post
    m7b/m7c). `!` is the highest-value pending sugar after UoM
    and refinements; without it, error handling reads verbose.
+   **Update 2026-04-26**: `!` postfix is extracted into its own
+   mini-lane (`!`-postfix-only) ahead of m12.8; the rest of m7e
+   (`variants[T]()`, main-row inference, `use Effect`) lands after
+   m12 selfhost checkpoint. See "Update 2026-04-26 — post-m7b
+   reordering" at the end of this section.
 3.7. **m7f (LLM affordances + method refs)** — `kai effects
    --json`, `?e` effect holes, `import ?name`, method
    references as values. ~2-3 days. Lands here because all
@@ -624,6 +629,59 @@ This ordering is recorded in `docs/stage1-design.md` §Features
 item 6 (basic Perceus deferred from stage 1 to stage 2 m5) and
 mirrored in this section so the next contributor can find the
 critical path without re-deriving it from the milestone list.
+
+### Update 2026-04-26 — post-m7b reordering
+
+After m7c, m7d, and the m7b #15 scope-limited follow-up landed in
+main, the path forward was re-evaluated. The original ordering
+above is preserved for historical context; the **vigente order
+from this point** is:
+
+```
+!-postfix → m12.8 → compiler-cleanup → m12 → m7e (rest) → m7f
+  → m5.x → m8.5 → m12.5 → m12.6 → m12.7 → full Perceus
+  → m11/m13/m14/m15-17
+```
+
+Two changes vs the original ordering:
+
+1. **`!` postfix split out of m7e** as a 0.5-1d mini-lane and moved
+   ahead of m12.8. Rationale: it is a pure desugar with zero
+   bootstrap risk; landing it now removes ~108 lines of
+   `match Some(x) -> ... None -> return None` cascades from the
+   stage 2 compiler, which every subsequent agent benefits from.
+2. **m12.8 (single-dispatch protocols) moved ahead of m12** instead
+   of after m12.7. Rationale: the Tier 3 "LLM authorability"
+   argument has present-tense traction — the compiler is being
+   built using LLM agents (Claude), and each agent that adds a new
+   compiler type today writes ~30 lines of `dump_*` / `eq_*` /
+   `hash_*` boilerplate. With `#derive(Show, Eq, Hash)` shipped
+   first, that drops to one line. Demos are already rewritten
+   (`d1e909c`) using `#derive` and `impl Show`; landing m12.8 makes
+   them compile instead of acting as aspirational syntax.
+
+Implementation guard: m12.8 protocols ship as O(1) lookup table
+without polymorphism (single-dispatch only, no constraint solver).
+Stage 1 must compile them, so the dispatch table mirrors the
+existing evidence-passing infrastructure for effects.
+
+A **compiler cleanup pass** lands immediately after m12.8 stabilises:
+convert ~150 lines of hand-written `dump_X` / `eq_X` / `hash_X`
+functions to `impl Show for X` / `impl Eq for X` / `impl Hash for X`.
+This pass is the immediate dividend of m12.8; it cannot run before.
+
+The **m12 self-hosting checkpoint** then validates the cleaned-up
+compiler. Doing the cleanup first means the checkpoint baseline
+is the smaller, deduplicated compiler — which is what selfhost will
+re-verify on every subsequent change.
+
+After m12 the rest of m7e and m7f run in either order, since both
+their dependencies (firm `Option`/`Result`, `kai effects --json` on
+top of m7c emit) are satisfied.
+
+Total estimated days for the reordering block (`!` postfix + m12.8
++ cleanup + m12): **3.5 - 6.5 days**, of which `!` postfix and
+cleanup are nearly mechanical. m12.8 itself dominates the variance.
 
 ## What stage 2 deliberately does not ship
 
