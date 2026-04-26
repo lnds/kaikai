@@ -630,6 +630,29 @@ item 6 (basic Perceus deferred from stage 1 to stage 2 m5) and
 mirrored in this section so the next contributor can find the
 critical path without re-deriving it from the milestone list.
 
+### Update 2026-04-26 — m12.8 landed
+
+`m12.8 — Single-dispatch protocols` shipped. `protocol`, `impl`, and
+`#derive(...)` syntax compiles end-to-end on both backends; selfhost
+and `selfhost-llvm` are still green and the new `test-protocols` suite
+covers Show/Eq/Ord/Hash/Serialize positives plus orphan + duplicate-impl
+negatives. Stdlib protocols live in `stdlib/protocols.kai` (loaded via
+`--prelude`) — folding them into the default prelude requires teaching
+stage 1's compiler to parse the new keywords, which is the
+**compiler-cleanup** lane immediately after this one.
+
+The vigente order (below) now reads:
+
+```
+m12.8 ✅ → compiler-cleanup → m12 → m7e (rest) → m7f → m5.x → m8.5
+  → m12.5 → m12.6 → m12.7 → full Perceus → m11/m13/m14/m15-17
+```
+
+See `docs/lane-experience-m12.8.md` for the lane retrospective and the
+v1 limitations the cleanup lane will need to factor in (return-type
+dispatch via `from_string`, scope-aware renaming, vtable emission for
+genuinely-late-binding sites).
+
 ### Update 2026-04-26 — post-m7b reordering
 
 After m7c, m7d, and the m7b #15 scope-limited follow-up landed in

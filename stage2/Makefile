@@ -10,7 +10,7 @@ SRC     := compiler.kai
 # feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
 STACK := ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop test-stdlib selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop test-stdlib test-protocols selfhost
 
 all: $(TARGET)
 
@@ -1022,6 +1022,56 @@ test-sugars: $(TARGET) build
 	  fi; \
 	done
 
+# m12.8 — single-dispatch protocols. Each .kai under
+# `examples/protocols/` either compiles + runs to a known stdout
+# (positive cases — diffed against `<name>.out.expected`) or fails
+# with a specific diagnostic substring (negative cases — every line
+# of `<name>.err.expected` must appear in the compiler's stderr).
+# Positive cases run on both backends (C and LLVM) when an
+# `.out.expected` file is present.
+test-protocols: $(TARGET) build
+	@$(STACK) set -e; \
+	for f in ../examples/protocols/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/protocols/$$name.out.expected; \
+	  exp_err=../examples/protocols/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    rc=0; ./$(TARGET) $$f > /dev/null 2> build/p2-$$name.err || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "protocols FAIL $$name (expected error, got success)"; exit 1; \
+	    fi; \
+	    while read -r line; do \
+	      grep -qF "$$line" build/p2-$$name.err \
+	        || { echo "protocols FAIL $$name (missing diagnostic: $$line)"; \
+	             cat build/p2-$$name.err; exit 1; }; \
+	    done < $$exp_err; \
+	    echo "protocols OK $$name (rejected as expected)"; \
+	  else \
+	    ./$(TARGET) $$f > build/p2-$$name.c \
+	      || { echo "protocols FAIL $$name (kaic2 errored)"; exit 1; }; \
+	    $(CC) $(CFLAGS) -I ../stage0 build/p2-$$name.c -o build/p2-$$name \
+	      || { echo "protocols FAIL $$name (C compile failed)"; exit 1; }; \
+	    ./build/p2-$$name > build/p2-$$name.out \
+	      || { echo "protocols FAIL $$name (run errored)"; cat build/p2-$$name.out; exit 1; }; \
+	    if [ -f $$exp_out ]; then \
+	      diff -q $$exp_out build/p2-$$name.out > /dev/null \
+	        && echo "protocols OK $$name (C)" \
+	        || { echo "protocols DIFF $$name (C)"; diff $$exp_out build/p2-$$name.out; exit 1; }; \
+	      ./$(TARGET) --emit=llvm $$f > build/p2-$$name.ll \
+	        || { echo "protocols FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
+	      $(CC) $(CFLAGS) -I ../stage0 build/p2-$$name.ll ../stage0/runtime_llvm.c -o build/p2-$$name-llvm 2>/dev/null \
+	        || { echo "protocols FAIL $$name (LLVM compile failed)"; exit 1; }; \
+	      ./build/p2-$$name-llvm > build/p2-$$name-llvm.out \
+	        || { echo "protocols FAIL $$name (LLVM run errored)"; cat build/p2-$$name-llvm.out; exit 1; }; \
+	      diff -q $$exp_out build/p2-$$name-llvm.out > /dev/null \
+	        && echo "protocols OK $$name (LLVM)" \
+	        || { echo "protocols DIFF $$name (LLVM)"; diff $$exp_out build/p2-$$name-llvm.out; exit 1; }; \
+	    else \
+	      echo "protocols OK $$name (no golden, ran clean)"; \
+	    fi; \
+	  fi; \
+	done
+
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
 # a fixed point.
 # m7a #5: smoke test for the handler-stack runtime primitives.
@@ -1066,7 +1116,7 @@ selfhost-llvm: $(TARGET) build
 	  && echo "llvm self-hosting fixed point: OK" \
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -1075,7 +1125,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols
 
 clean:
 	rm -rf build $(TARGET)

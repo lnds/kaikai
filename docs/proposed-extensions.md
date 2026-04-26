@@ -1343,6 +1343,9 @@ any new language.
 
 ## 26. Protocols — single-dispatch ad-hoc polymorphism
 
+**Status: Landed in m12.8.** The full design is in `docs/protocols.md`;
+the lane retrospective is in `docs/lane-experience-m12.8.md`.
+
 ```kai
 protocol Show {
   show(x: Self) : String
