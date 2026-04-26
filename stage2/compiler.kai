@@ -14087,6 +14087,12 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_prelude_char_at(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_char_to_int(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_int_to_char(%KaiValue*)\n",
+    # m7c-b: runtime helpers for the effects ABI. The C backend
+    # invokes these via in-line statement-expressions; the LLVM
+    # backend declares them as external and emits the same calls.
+    "declare i64 @kai_fresh_handler_id()\n",
+    "declare void @kai_evidence_push(i8*, i8*, i8*)\n",
+    "declare void @kai_evidence_pop()\n",
     "\n"
   ])
 
@@ -14431,6 +14437,8 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
     EList(elems) -> llvm_emit_list(e, elems)
     ELambda(_, _) -> llvm_emit_lambda_ref(e, x)
     EField(obj, fnm) -> llvm_emit_field(e, obj, fnm)
+    EHandle(body, eff_name, _eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      llvm_emit_handle(e, body, eff_name, init_opt, alias_opt, clauses, ret_opt, x.line, x.col)
     EHole(nm_opt) -> {
       let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
       let msg = cat2("unfilled hole: ", label)
@@ -15004,6 +15012,142 @@ type LlvmArm = { e: LlvmEmit, reg: String, from_label: String }
 # Block: evaluate stmts for side effects (SLet adds a local), then the
 # tail expression. Without a tail, the block value is a placeholder
 # Unit — inference already ensures Unit-valued callers accept it.
+# m7c-b — lower an `EHandle` expression to LLVM IR. The shape
+# mirrors the C `emit_handle` minus the setjmp/longjmp landing
+# pad: we allocate the `%EvX` struct on the stack, initialise
+# its `handler_id` and (optional) `state`, leave the op fn-ptr
+# slots NULL (m7c-d wires them when clauses become LLVM
+# functions), allocate a 48-byte `%KaiEvidence` buffer, push,
+# evaluate the body in-line, pop, and run the return clause
+# with the body result bound to its parameter.
+#
+# Limitation: a clause that *discards* `resume` requires the
+# longjmp dance from C's m7a #6e, which is m7c-c's territory
+# (the op-call site is what triggers the discard branch). For
+# now, every fixture whose clauses always resume — every
+# State / Reader / Writer canonical handler, every default
+# handler, every #5b var-desugar — type-checks and emits clean
+# LLVM IR. Discard-bearing user handlers will UB until m7c-c
+# (op dispatch) and m7c-d (clauses + setjmp) land.
+fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
+                    init_opt: Option[Expr], alias_opt: Option[String],
+                    clauses: [HClause], ret_opt: Option[HReturn],
+                    hline: Int, hcol: Int) : LlvmEmit {
+  let _ = alias_opt    # m7c-c will use this for per-instance dispatch
+  let _ = clauses      # m7c-d will wire op fn ptrs
+  let _ = hline
+  let _ = hcol
+  # alloca the `%EvX` struct; zero-init field by field.
+  let ev_reg = llvm_fresh_reg(e)
+  let ev_alloca = concat_all([
+    "  ", ev_reg.reg, " = alloca %Ev", eff_name, ", align 8\n"
+  ])
+  let e1 = llvm_append_body(ev_reg.e, ev_alloca)
+  # handler_id <- kai_fresh_handler_id()
+  let hid_reg = llvm_fresh_reg(e1)
+  let hid_call = concat_all([
+    "  ", hid_reg.reg, " = call i64 @kai_fresh_handler_id()\n"
+  ])
+  let e2 = llvm_append_body(hid_reg.e, hid_call)
+  let hid_gep_reg = llvm_fresh_reg(e2)
+  let hid_gep = concat_all([
+    "  ", hid_gep_reg.reg, " = getelementptr %Ev", eff_name,
+    ", %Ev", eff_name, "* ", ev_reg.reg, ", i32 0, i32 0\n",
+    "  store i64 ", hid_reg.reg, ", i64* ", hid_gep_reg.reg, "\n"
+  ])
+  let e3 = llvm_append_body(hid_gep_reg.e, hid_gep)
+  # env <- null
+  let env_gep_reg = llvm_fresh_reg(e3)
+  let env_gep = concat_all([
+    "  ", env_gep_reg.reg, " = getelementptr %Ev", eff_name,
+    ", %Ev", eff_name, "* ", ev_reg.reg, ", i32 0, i32 1\n",
+    "  store i8* null, i8** ", env_gep_reg.reg, "\n"
+  ])
+  let e4 = llvm_append_body(env_gep_reg.e, env_gep)
+  # state <- init_opt or null
+  let state_init = match init_opt {
+    Some(ie) -> {
+      let r = llvm_emit_expr(e4, ie)
+      let r1 = r
+      let st_gep_reg = llvm_fresh_reg(r1)
+      let st_gep = concat_all([
+        "  ", st_gep_reg.reg, " = getelementptr %Ev", eff_name,
+        ", %Ev", eff_name, "* ", ev_reg.reg, ", i32 0, i32 2\n",
+        "  store %KaiValue* ", r1.last_val, ", %KaiValue** ", st_gep_reg.reg, "\n"
+      ])
+      llvm_append_body(st_gep_reg.e, st_gep)
+    }
+    None -> {
+      let st_gep_reg = llvm_fresh_reg(e4)
+      let st_gep = concat_all([
+        "  ", st_gep_reg.reg, " = getelementptr %Ev", eff_name,
+        ", %Ev", eff_name, "* ", ev_reg.reg, ", i32 0, i32 2\n",
+        "  store %KaiValue* null, %KaiValue** ", st_gep_reg.reg, "\n"
+      ])
+      llvm_append_body(st_gep_reg.e, st_gep)
+    }
+  }
+  # alloca a 48-byte buffer for the KaiEvidence node and bitcast.
+  let node_buf_reg = llvm_fresh_reg(state_init)
+  let node_alloca = concat_all([
+    "  ", node_buf_reg.reg, " = alloca [48 x i8], align 8\n"
+  ])
+  let e5 = llvm_append_body(node_buf_reg.e, node_alloca)
+  let node_ptr_reg = llvm_fresh_reg(e5)
+  let node_cast = concat_all([
+    "  ", node_ptr_reg.reg, " = bitcast [48 x i8]* ", node_buf_reg.reg, " to i8*\n"
+  ])
+  let e6 = llvm_append_body(node_ptr_reg.e, node_cast)
+  # name string
+  let name_res = llvm_emit_name_constant(e6, eff_name, "eff.name.")
+  # cast EvX* to i8* for kai_evidence_push
+  let ev_void_reg = llvm_fresh_reg(name_res.e)
+  let ev_cast = concat_all([
+    "  ", ev_void_reg.reg, " = bitcast %Ev", eff_name, "* ", ev_reg.reg, " to i8*\n"
+  ])
+  let e7 = llvm_append_body(ev_void_reg.e, ev_cast)
+  # push
+  let push_call = concat_all([
+    "  call void @kai_evidence_push(i8* ", node_ptr_reg.reg,
+    ", i8* ", name_res.gep,
+    ", i8* ", ev_void_reg.reg, ")\n"
+  ])
+  let e8 = llvm_append_body(e7, push_call)
+  # evaluate body
+  let body_e = llvm_emit_expr(e8, body)
+  let body_val = body_e.last_val
+  # pop
+  let e9 = llvm_append_body(body_e, "  call void @kai_evidence_pop()\n")
+  # return clause: bind body result to its pname and emit
+  match ret_opt {
+    Some(r) -> match r {
+      HR(pname, rexpr, _, _) -> {
+        let bound = llvm_push_local(e9, pname, body_val)
+        # m7b #11: stateful return clauses also see `state` / `log`
+        let bound2 = match init_opt {
+          Some(_) -> {
+            # Re-load state from the Ev struct (which we wrote above).
+            # Since the alloca persists for the function, the load is fine.
+            let st_gep_reg = llvm_fresh_reg(bound)
+            let st_load_reg = llvm_fresh_reg(st_gep_reg.e)
+            let st_code = concat_all([
+              "  ", st_gep_reg.reg, " = getelementptr %Ev", eff_name,
+              ", %Ev", eff_name, "* ", ev_reg.reg, ", i32 0, i32 2\n",
+              "  ", st_load_reg.reg, " = load %KaiValue*, %KaiValue** ", st_gep_reg.reg, "\n"
+            ])
+            let with_load = llvm_append_body(st_load_reg.e, st_code)
+            let with_state = llvm_push_local(with_load, "state", st_load_reg.reg)
+            llvm_push_local(with_state, "log", st_load_reg.reg)
+          }
+          None -> bound
+        }
+        llvm_emit_expr(bound2, rexpr)
+      }
+    }
+    None -> llvm_set_last(e9, body_val)
+  }
+}
+
 fn llvm_emit_block(e: LlvmEmit, stmts: [Stmt], tail: Option[Expr]) : LlvmEmit {
   let outer_locals = e.locals
   let after = llvm_emit_stmts(e, stmts)
