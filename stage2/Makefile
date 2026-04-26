@@ -869,6 +869,32 @@ test-effects: $(TARGET) build
 	  grep -q "^33$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (nursery join: 11 + 22 = 33)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m8_6_fiber_inside_ok.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^99$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (Fiber used locally, returned as Int)" \
+	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m8_6_fiber_escapes.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_err=../examples/effects/$$name.err.expected; \
+	  rc=0; ./$(TARGET) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
+	  fi; \
+	  while read -r line; do \
+	    grep -qF "$$line" build/s2-$$name.err \
+	      || { echo "effects FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/s2-$$name.err; exit 1; }; \
+	  done < $$exp_err; \
+	  echo "effects OK $$name (Fiber escape rejected with diagnostic)"; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,

@@ -11398,7 +11398,20 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       let what = string_concat("return type of ", nm)
       let ret_site = return_site_of(body)
       let st1 = st_unify(rb.st, declared_ret, rb.ty, what, ret_site.line, ret_site.col)
-      let st2 = check_body_row(st1, nm, row, line, col)
+      # m8 #6: shallow region-brand check. The full brand machinery
+      # (Doc B / structured-concurrency.md §*Type system*) tags every
+      # Fiber[T] / Pid[Msg] handle with the brand of its enclosing
+      # nursery scope and rejects values whose brand has expired.
+      # That is significant typer work and lands together with the
+      # m8.x ucontext or full-CPS scheduler. v1 ships the pragmatic
+      # syntactic approximation: any function declared OUTSIDE
+      # stdlib/ whose declared return type contains Fiber[T] (at any
+      # nesting depth — list, option, record, etc.) is rejected at
+      # the type-annotation line. Internal stdlib helpers
+      # (fiber_spawn, etc.) are exempt by file-path because they are
+      # the legitimate constructors of Fiber[T] values.
+      let st1b = check_no_fiber_escape(st1, file, nm, opt_ret, line, col)
+      let st2 = check_body_row(st1b, nm, row, line, col)
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
       } else { () }
@@ -11412,6 +11425,71 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       }
     }
     _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [] }
+  }
+}
+
+# m8 #6: shallow region-brand check on Fiber[T]. Walks the type
+# annotation (the user-written TypeExpr, not the resolved Ty, so
+# the diagnostic can point at the exact text the user wrote) and
+# rejects any occurrence of `Fiber[...]` in the return-type
+# position of a fn that is NOT one of the legitimate stdlib
+# producers (`fiber_spawn` family in stdlib/spawn.kai). See the
+# comment at the call site in infer_decl for the design trade-off
+# (path-based exemption doesn't work because import decls inherit
+# the importer's file path through expand_imports).
+fn check_no_fiber_escape(st: InferState, file: String, fname: String,
+                          opt_ret: Option[TypeExpr], line: Int, col: Int) : InferState {
+  if is_fiber_producer_helper(fname) { st }
+  else {
+    match opt_ret {
+      None -> st
+      Some(rty) -> {
+        if ty_expr_contains_fiber(rty) {
+          let lline = if rty.line > 0 { rty.line } else { line }
+          let lcol  = if rty.col  > 0 { rty.col  } else { col  }
+          diag_error(file, lline, lcol,
+            string_concat(string_concat("Fiber[T] cannot escape `", fname),
+                          "`'s structured-concurrency scope"))
+          diag_note("a `Fiber[T]` handle is bound to the nursery that created it")
+          diag_note("returning one from a function lets it outlive that scope")
+          diag_help("process the fiber inside the nursery (e.g. with `fiber_await`), or pass a thunk in and a value out instead")
+          st_bump_err(st)
+        } else {
+          st
+        }
+      }
+    }
+  }
+}
+
+# Hardcoded list of stdlib helpers permitted to mention Fiber[T] in
+# their return type. Kept intentionally narrow — these are the only
+# legitimate constructors / passthroughs of Fiber values today
+# (stdlib/spawn.kai). Any new helper that needs to return a Fiber
+# must be added here on purpose.
+fn is_fiber_producer_helper(fname: String) : Bool =
+  fname == "fiber_spawn"
+
+# Walks a TypeExpr looking for any TyName("Fiber", ...) at any depth
+# (list, function-arg / -ret, type-arg). Returns true on the first
+# hit. Cheap because TypeExprs are small and shallow.
+fn ty_expr_contains_fiber(t: TypeExpr) : Bool {
+  match t.tkind {
+    TyName(name, tas) ->
+      if name == "Fiber" { true }
+      else { ty_expr_list_has_fiber(tas) }
+    TyList(inner) -> ty_expr_contains_fiber(inner)
+    TyFn(ps, ret, _) -> {
+      if ty_expr_list_has_fiber(ps) { true }
+      else { ty_expr_contains_fiber(ret) }
+    }
+  }
+}
+
+fn ty_expr_list_has_fiber(ts: [TypeExpr]) : Bool {
+  match ts {
+    [] -> false
+    [t, ...rest] -> if ty_expr_contains_fiber(t) { true } else { ty_expr_list_has_fiber(rest) }
   }
 }
 
