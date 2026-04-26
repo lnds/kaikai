@@ -989,6 +989,12 @@ type PatKind
   | PVariantRecord(String, [PField])
   | PRecord([PField])
   | PHole(Option[String])                   # `?` or `?name` in pattern position
+  # m7d §14: `name @ pattern` — bind the whole scrutinee to `name`
+  # while still destructuring it as `pattern`. The bound name must
+  # be a fresh identifier; the inner pattern's bindings (if any)
+  # remain visible in the arm body. Disjoint from m7b §2's prefix
+  # `@cap` (an expression), which never appears in pattern position.
+  | PAs(String, Pattern)
 
 type PField = PField(String, Pattern, Bool) # field name, sub-pattern, is_shorthand
 
@@ -2905,6 +2911,18 @@ fn parse_ident_pattern(p: Parser, t: Token) : PPat {
   } else if is_upper_ident(p.src, t) {
     # Bare uppercase ident: 0-arg variant.
     ok_p(p1, mk_pat(PVariant(name, []), t.line, t.col))
+  } else if p_at(p1, TkAt) {
+    # m7d §14: `name @ pattern` — as-pattern. Bind `name` to the
+    # whole scrutinee and continue matching with the sub-pattern.
+    # The lowercase ident already implies a fresh binding; the inner
+    # pattern is parsed by the same `parse_pattern` entry, so list,
+    # variant, record, hole, and even nested as-patterns compose.
+    let p2 = p_skip_newlines(p_advance(p1))
+    let r = parse_pattern(p2)
+    match r.r {
+      None -> err_p(r.p)
+      Some(sub) -> ok_p(r.p, mk_pat(PAs(name, sub), t.line, t.col))
+    }
   } else {
     ok_p(p1, mk_pat(PBind(name), t.line, t.col))
   }
@@ -3965,6 +3983,10 @@ fn dump_pat(pat: Pattern, depth: Int) : Unit {
       let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
       emit_line(depth, "pat_hole #{label} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
     }
+    PAs(name, sub) -> {
+      emit_line(depth, "pat_as #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      dump_pat(sub, depth + 1)
+    }
   }
 }
 
@@ -4270,6 +4292,7 @@ fn bind_pat(e: Env, pat: Pattern) : Env {
     PVariantRecord(_, fields) -> bind_pfields_loop(e, fields)
     PRecord(fields) -> bind_pfields_loop(e, fields)
     PHole(_) -> e
+    PAs(name, sub) -> bind_pat(env_add(e, name), sub)
   }
 }
 
@@ -5233,6 +5256,9 @@ fn emit_pat_test(src: String, pat: Pattern, scr: String, fns: [EFn], variants: [
     PVariantRecord(name, fields) -> emit_pat_test_variant_record(src, name, fields, scr, fns, variants, lams)
     PRecord(fields) -> emit_pat_test_record(src, fields, scr, fns, variants, lams)
     PHole(_) -> "1"
+    # m7d §14: `name @ sub` matches iff `sub` matches; the binding
+    # is performed by emit_pat_binds.
+    PAs(_, sub) -> emit_pat_test(src, sub, scr, fns, variants, lams)
   }
 }
 
@@ -5336,6 +5362,11 @@ fn emit_pat_binds(src: String, pat: Pattern, scr: String, fns: [EFn], variants: 
     PVariantRecord(_, fields) -> emit_pat_binds_record(src, fields, scr, fns, variants, lams)
     PRecord(fields) -> emit_pat_binds_record(src, fields, scr, fns, variants, lams)
     PHole(_) -> ""
+    # m7d §14: bind the as-name to the whole scrutinee, then descend
+    # into the inner pattern's bindings on the same scrutinee.
+    PAs(name, sub) -> cat2(
+      concat_all(["KaiValue *kai_", name, " = ", scr, "; "]),
+      emit_pat_binds(src, sub, scr, fns, variants, lams))
   }
 }
 
@@ -5742,6 +5773,7 @@ fn pat_bindings(pat: Pattern, acc: [String]) : [String] {
     PVariantRecord(_, fields) -> pfield_bindings_loop(fields, acc)
     PRecord(fields) -> pfield_bindings_loop(fields, acc)
     PHole(_) -> acc
+    PAs(name, sub) -> pat_bindings(sub, [name, ...acc])
   }
 }
 
@@ -11907,6 +11939,14 @@ fn check_pattern(st: InferState, pat: Pattern, expected: Ty) : InferState {
     PRecord(pfs) ->
       check_record_pattern(st, pfs, expected, pat.line, pat.col)
     PHole(nm_opt) -> check_hole_pattern(st, nm_opt, expected, pat.line, pat.col)
+    # m7d §14: bind the as-name to the scrutinee at the *expected*
+    # type, then continue typing the inner pattern at the same type.
+    # The inner pattern owns its own bindings; the as-binding adds
+    # one more name that aliases the whole scrutinee.
+    PAs(nm, sub) -> {
+      let env2 = ty_env_add(st.env, nm, mono(apply_ty(st.sub, expected)))
+      check_pattern(st_set_env(st, env2), sub, expected)
+    }
   }
 }
 
@@ -12091,6 +12131,9 @@ fn is_catch_all_pat(pat: Pattern) : Bool {
     PWild     -> true
     PBind(_)  -> true
     PHole(_)  -> true
+    # m7d §14: `name @ catch_all` is itself a catch-all — the binding
+    # does not narrow the cases the arm covers.
+    PAs(_, sub) -> is_catch_all_pat(sub)
     _         -> false
   }
 }
@@ -12111,11 +12154,18 @@ fn has_catch_all(arms: [Arm]) : Bool {
 
 fn variant_name_of_arm(a: Arm) : Option[String] {
   match a {
-    Arm(pat, _, _) -> match pat.pkind {
-      PVariant(nm, _)       -> Some(nm)
-      PVariantRecord(nm, _) -> Some(nm)
-      _                     -> None
-    }
+    Arm(pat, _, _) -> variant_name_of_pat(pat)
+  }
+}
+
+# m7d §14: drill through `name @ inner` so `Some(x) @ pat` and
+# similar shapes still report their variant for exhaustiveness.
+fn variant_name_of_pat(pat: Pattern) : Option[String] {
+  match pat.pkind {
+    PVariant(nm, _)       -> Some(nm)
+    PVariantRecord(nm, _) -> Some(nm)
+    PAs(_, sub)           -> variant_name_of_pat(sub)
+    _                     -> None
   }
 }
 
@@ -12226,15 +12276,22 @@ fn arm_pat_empty_list(a: Arm) : Bool {
   match a {
     Arm(pat, guard, _) -> {
       let unguarded = match guard { None -> true Some(_) -> false }
-      if not unguarded { false }
-      else { match pat.pkind {
-        PList(ps, rest_opt) -> match ps {
-          [] -> match rest_opt { None -> true Some(_) -> false }
-          _  -> false
-        }
-        _ -> false
-      } }
+      if not unguarded { false } else { pat_is_empty_list(pat) }
     }
+  }
+}
+
+# m7d §14: drill through `name @ inner` for the list-exhaustiveness
+# helpers so an as-pattern wrapping `[]` or `[_, ...rest]` still
+# satisfies the check.
+fn pat_is_empty_list(pat: Pattern) : Bool {
+  match pat.pkind {
+    PList(ps, rest_opt) -> match ps {
+      [] -> match rest_opt { None -> true Some(_) -> false }
+      _  -> false
+    }
+    PAs(_, sub) -> pat_is_empty_list(sub)
+    _ -> false
   }
 }
 
@@ -12242,15 +12299,19 @@ fn arm_pat_spread_list(a: Arm) : Bool {
   match a {
     Arm(pat, guard, _) -> {
       let unguarded = match guard { None -> true Some(_) -> false }
-      if not unguarded { false }
-      else { match pat.pkind {
-        PList(_, rest_opt) -> match rest_opt {
-          Some(_) -> true
-          None    -> false
-        }
-        _ -> false
-      } }
+      if not unguarded { false } else { pat_is_spread_list(pat) }
     }
+  }
+}
+
+fn pat_is_spread_list(pat: Pattern) : Bool {
+  match pat.pkind {
+    PList(_, rest_opt) -> match rest_opt {
+      Some(_) -> true
+      None    -> false
+    }
+    PAs(_, sub) -> pat_is_spread_list(sub)
+    _ -> false
   }
 }
 
@@ -15433,6 +15494,12 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
     }
     PList(sub_pats, opt_rest) -> llvm_emit_pat_list(e, sub_pats, opt_rest, scr, fail_lbl)
     PHole(_) -> e
+    # m7d §14: bind the as-name to the whole scrutinee, then test +
+    # bind the inner pattern on the same scrutinee.
+    PAs(nm, sub) -> {
+      let e1 = llvm_push_local(e, nm, scr)
+      llvm_emit_pattern_test(e1, sub, scr, fail_lbl)
+    }
     _ -> {
       eprint("llvm: pattern kind not supported at #{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
       e
