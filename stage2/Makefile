@@ -746,7 +746,9 @@ test-effects: $(TARGET) build
 	         ../examples/effects/m7b_14_writer_helper.kai \
 	         ../examples/effects/m7b_2a_op_id_basic.kai \
 	         ../examples/effects/m7b_2a_op_distinct_types.kai \
-	         ../examples/effects/m7b_2a_op_in_parametric.kai; do \
+	         ../examples/effects/m7b_2a_op_in_parametric.kai \
+	         ../examples/effects/m7b_2b_mutable_default.kai \
+	         ../examples/effects/m7b_2b_mutable_intercept.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
