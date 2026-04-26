@@ -1725,14 +1725,26 @@ page the way they are written.
     change. Surfaced by m7b #5b; details and motivating example
     in §*Variable specialisation* §*Known follow-ups after
     m7b #5b* item 1. *Pending.*
-16. **Variable specialisation pass** — the optimisation pass
-    promised by Doc B §`State[T]` *Performance* and specified in
-    §*Variable specialisation*. The m7b #5b desugar emits the
-    canonical heap-handler form unconditionally, so today every
-    `var n = 0; n.set(@n + 1)` pays a full op-call (evidence
-    lookup + identity continuation) per access. Trigger check +
-    slot replacement is the missing pass. Independent of #15;
-    either can land first. *Pending.*
+16. **Variable specialisation pass** — landed in the m7b #5b
+    var-desugar itself. When the four trigger conditions hold
+    (canonical handler shape — always true; no multi-shot resume
+    — always true; `name` does not escape into a closure or
+    function argument — `body_escapes` walks the body checking;
+    `init` is a normal expression — `init_is_safe` allows
+    literals, EVar, prelude arithmetic, and non-effect calls)
+    the desugar swaps the `with State[T] as name { ... }`
+    handler for `let name__slot = array_make(1, init); body'`
+    where `body'` rewrites every `name.get()` to
+    `array_get(name__slot, 0)` and every `name.set(v)` to
+    `{ let _ = array_set(name__slot, 0, v); () }`. Uses prelude
+    `array_*` (stage 0 visible, no `Mutable` row) so the
+    surrounding row stays clean. When any trigger fails the
+    canonical handler runs — verified by
+    `m7b_16_var_escape_falls_back`. Specialisation verified by
+    `m7b_16_var_specialised`: the generated C calls
+    `kai_prelude_array_*` directly with no `EvState` evidence
+    struct or push/pop, exactly the "stack slot" Doc B promised.
+    **Landed.**
 17. **Alias-rewrite shadow tracking** — the pre-emit
     `rewrite_alias_decls` walker now drops a binding from its
     `AliasMap` whenever an inner scope rebinds the name.
@@ -1782,7 +1794,9 @@ m7b #2a (per-op generics mechanism), #2b (Mutable introduction),
 and #2c (audit, "no migration" decision pinned to stage 0
 parser limitations) all landed. m7b #17 (alias-rewrite shadow
 tracking) closed the latent walker bug from the #5b follow-ups.
-The remaining m7b items are: #8 (diagnostic review), #15, #16.
+m7b #16 (variable specialisation pass) realised Doc B's
+promised stack-slot lowering for the safe `var` cases. The
+remaining m7b items are: #8 (diagnostic review), #15.
 
 ## Next steps
 
