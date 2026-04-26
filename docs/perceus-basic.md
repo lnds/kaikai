@@ -27,6 +27,15 @@ m5 #0, and what stays deferred.
   self-compile alloc count drops from 130,735,107 (pre-m5) to
   29,533,152 — a **77.4% reduction** with no emitter changes, only
   a runtime swap to shared static singletons.
+- m5 #9 (round 3, 2026-04-26) lands the dup/drop infrastructure +
+  scope-aware AST rewrite (steps 1+2 of 4). Step 3 (uniformising
+  runtime primitives to consume their args linearly) is **blocked
+  on stage 1 also needing a perceus pass**: stage 1's compiler.kai
+  has no dups, so flipping the runtime to consume mid-flight
+  produces use-after-free in stage 1 selfhost. The dup/drop
+  infrastructure is staged in tree but inert against the loose
+  runtime; it ships as scaffolding for a future stage-1 + runtime
+  flip. See "What landed under m5 #9 (round 3)".
 - Everything beyond — capture-aware drops, dup at non-last uses,
   drops at fn exit points, drop specialisation, reuse-in-place —
   stays deferred to a future m5 lane, scoped honestly as multi-
@@ -231,6 +240,9 @@ with the doc's m5 sub-milestones below as follows:
 | `448e18d` | m5 #5         | doc m5 (bench)   | bench fixture + measured deltas              |
 | `156f597` | m5 #6         | doc m5 (docs)    | this section's first cut                    |
 | `6f3255e` | m5 #7         | doc m5 **#1**    | constant pool for `unit` / `bool` / `nil`   |
+| `0c5c19a` | m5 #8         | doc              | fold m5 #7 outcomes into this doc           |
+| `2a7a7b5` | m5 #9 step 1  | precondition     | runtime helpers + emit special cases        |
+| `3a148e7` | m5 #9 step 2  | doc m5 **#4**+   | scope-aware perceus_pass + dups + drops     |
 
 m4c proper (the specialiser) is **not** in tree. m4c #1/#2 wire the
 slot and ship a deterministic name-mangling helper, but
@@ -305,6 +317,86 @@ Capture-aware drops require pairing with `kai_incref` at non-last
 uses (the brief's m5 #4) so the original binding survives the
 chain-decref. That is its own milestone and lands separately.
 
+## What landed under m5 #9 (round 3, 2026-04-26)
+
+Three commits ship the scope-aware AST rewrite + dup/drop magic
+infrastructure but stop short of flipping the runtime:
+
+- **`2a7a7b5` (step 1/4 — infrastructure):** runtime helpers
+  `kai_internal_dup` / `kai_internal_drop` + parallel `kaix_*`
+  exports for the LLVM backend. Special cases in `emit_call_expr`
+  and `llvm_emit_call` lower `ECall(EVar("__perceus_dup"), [a])`
+  → `kai_internal_dup(a)` and `__perceus_drop` analogously. The
+  magic names are added to `prelude_names()` so the closure
+  free-var collector treats them as globals, not captures.
+
+- **`3a148e7` (step 2/4 — scope-aware rewrite):** replaces
+  `perceus_pass`'s identity body with a real walker:
+  - `pcs_collect_uses_*` — scope-aware EVar collection (mirrors
+    `fv_expr` modulo polarity). Tracks scope through `SLet` /
+    `SVar`, `EMatch` arm patterns, `ELambda` params, and
+    handler-clause params. The trailing `resume` clause param is
+    filtered out (it's a magic keyword the emitter intercepts at
+    call sites; wrapping it in dup would route through
+    `emit_ident_value`'s undeclared `kai_resume` fallback).
+  - `pcs_rewrite_*` — wraps every non-last in-scope EVar in
+    `ECall(EVar("__perceus_dup"), [...])`. "Non-last" =
+    position != `last_use_for(name).LUAt(line, col)` OR enclosed
+    in a lambda body (closure capture conservatively blocks
+    last).
+  - `pcs_prepend_unused_drops` — wraps the body in `EBlock` to
+    insert `SExprStmt(__perceus_drop(p))` for every `LUUnused`
+    parameter.
+
+- **Step 3/4 (runtime uniformisation) — attempted, reverted:**
+  modifying `kai_lt` / `gt` / `le` / `ge` / `eq_v` / `ne_v` /
+  `add` / `sub` / `mul` / `div` / `idiv` / `mod` / `neg` /
+  `boolnot` / `truthy` / `field` to consume their args breaks
+  stage 1's selfhost. Stage 1's compiler.kai has no
+  perceus_pass; its emitted C uses primitive ops in the loose
+  pre-m5 discipline, and a linear runtime turns those reads into
+  use-after-free.
+
+- **Step 4/4 (effect measurement) — n/a:** with step 3
+  reverted, the dup/drop machinery is *staged but inert*. Every
+  primitive op in the runtime still leaves its inputs alive, so
+  the dups bump rc and never get matched by a consumer.
+  `live_peak` and `leaked` do not move on kaic2 self-compile.
+
+### Numbers (kaic2 self-compile)
+
+| version    | alloc       | free   | leaked      | live_peak   |
+|------------|-------------|--------|-------------|-------------|
+| pre-m5     | 130,735,107 | 3.5 M  | 127,189,128 | 127,189,128 |
+| m5 #3      | 138,684,259 | 3.8 M  | 134,899,614 | 134,899,614 |
+| m5 #7      |  29,533,152 |     37 |  29,533,115 |  29,533,115 |
+| m5 #9 s2   |  33,020,295 |     39 |  33,020,256 |  33,020,256 |
+
+The +3.5 M alloc delta from m5 #7 to m5 #9-step-2 is the perceus
+walker's own source code (~550 new lines in compiler.kai itself);
+the dup wrapping and drop emission do not allocate. Once stage 1
+gains a perceus pass and step 3 lands, the dup/drop machinery
+should drop `live_peak` materially while keeping alloc near m5 #7
+levels.
+
+### What unblocks step 3+
+
+Stage 1 needs its own perceus pass. The simplest path is to port
+the m5 #9 step-2 walker to stage 1's `compiler.kai` (~550 LOC
+mirror), publish the same `__perceus_dup` / `__perceus_drop`
+magic-name handling in stage 1's emitter, then flip the runtime
+in one commit covering both stages. The full chain costs another
+~1-2 days and finally lets `live_peak` collapse on real-world
+workloads.
+
+Alternative: stage-1-skip. Make stage 1 link a *loose* runtime
+(static-inlined fork of runtime.h with non-consuming primitives)
+while stage 2 + downstream link the linear runtime. Cheaper to
+implement (no stage-1 walker port) but introduces a runtime split
+that makes diagnostics confusing — both stages emit the same C
+text, but the C means different things at link time. Reject
+unless the stage-1 walker port turns out unexpectedly hard.
+
 ## Concrete sub-milestones for m5 proper
 
 In rough dependency order. Each is its own commit-grain piece.
@@ -347,32 +439,39 @@ a future m5 lane.
   deltas in the round-2 section above.
 
 - **m5 #4 — Decref of function parameters at exit points.**
-  [DEFERRED] Walk each `pub fn` body; at every return-equivalent
-  position (final expression of the body, every match-arm tail,
-  every if-arm tail) emit `kai_decref` for parameters that are
-  not part of the returned value. Requires the same use-analysis
-  machinery as #3 (already shipped via m5 #2's `scan_uses_expr`
-  + `last_use_for`). The naïve "drop every LUUnused param at
-  body start" attempt during m5 round 2 broke selfhost because
-  callers in compiler.kai re-use the same `t = p_peek(p)` token
-  across the if/elif dispatch chain — a callee-side decref frees
-  the value the caller is still holding. m5 #4 must therefore
-  pair with `kai_incref` at non-last uses on the caller side
-  (Perceus' linear discipline). 3-5 days when pursued together
-  with the dup-insertion side.
+  [SHIPPED in `3a148e7` as m5 #9 step 2/4, **inert** until the
+  runtime uniformisation lands] `pcs_prepend_unused_drops` wraps
+  every fn body in an `EBlock` that inserts `__perceus_drop(p)`
+  for every `LUUnused` parameter. Combined with the m5 #2
+  walker, this covers the brief's m5 #3 ("drops at end-of-scope
+  for last-use bindings"). Currently inert because the loose
+  runtime does not consume primitive-op args, so an unused param
+  passed only to a primitive remains alive at "drop" time.
 
-- **m5 #5 — Last-use reuse / drop suppression.** [DEFERRED]
-  The actual Perceus optimisation: when a binding's last use is
-  consumed by a constructor or another function call, no
-  `kai_incref` is emitted (the existing reference is taken) and
-  the corresponding `kai_decref` is suppressed. Builds on #3-#4's
-  analysis. 2-3 days once the framework is in place.
+- **m5 #5 — Last-use reuse / drop suppression.** [SHIPPED in
+  `3a148e7` as m5 #9 step 2/4, **inert**] `pcs_rewrite_*` wraps
+  every non-last in-scope EVar read in `__perceus_dup`. The last
+  read sees no wrap, transferring its existing reference per
+  Koka's Perceus model. Inert pending runtime uniformisation
+  (the dups bump rc but no consumer matches the increment until
+  primitives consume their args).
 
-- **m5 #6 — Closure capture incref.** [DEFERRED] Capture-by-share
-  is unsafe once #3-#4 land (the captured value may be decref'd
-  before the closure runs). `kai_closure` must incref captures at
-  creation, `kai_free_value` already decrefs them. Coordinated
-  change in runtime + emitter. 1 day.
+- **m5 #6 — Closure capture incref.** [DEFERRED] `kai_closure`
+  must incref captures at creation; `kai_free_value` already
+  decrefs them on chain-free. Independent change once the dup
+  machinery is live. Without it, capture-by-share remains unsafe
+  once primitives consume — a captured local may be decref'd
+  before the closure runs. ~1 day.
+
+- **m5 #9 step 3/4 — runtime primitive consumption.** [BLOCKED
+  on stage 1] Modify `kai_lt` / `gt` / `le` / `ge` / `eq_v` /
+  `ne_v` / `add` / `sub` / `mul` / `div` / `idiv` / `mod` /
+  `neg` / `boolnot` / `truthy` / `field` to decref their args
+  before returning. Tried during m5 round 3 and reverted because
+  stage 1's selfhost broke: stage 1 emits non-perceus C (no
+  dups), and a linear runtime turns its primitive-op uses into
+  use-after-free. Unblocks once stage 1 gets its own perceus
+  pass — see "What unblocks step 3+".
 
 Round 2 closed out at m5 #3 + diagnostic infrastructure (walker
 dump, mono-out dump). Continuing through #4-#6 is the natural
