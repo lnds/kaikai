@@ -269,10 +269,13 @@ bindings per iteration, self-contained literal RHS, 1000 iterations.
 | version    | alloc  | free   | leaked | leak rate | live_peak |
 |------------|--------|--------|--------|-----------|-----------|
 | pre-m5     | 29,007 |  1,002 | 28,005 |   96.5 %  |   28,006  |
-| m5 round 2 | 29,007 | 25,002 |  4,005 |   13.8 %  |    4,010  |
+| m5 #3      | 29,007 | 25,002 |  4,005 |   13.8 %  |    4,010  |
+| m5 #9 s2   | 25,004 | 22,000 |  3,004 |   12.0 %  |    3,009  |
 
-~24× more frees mid-program; ~7× drop in leak rate; same alloc
-total (m5 #3 frees sooner, never eliminates allocations).
+m5 #3 alone: ~24× more frees mid-program, ~7× drop in leak rate,
+same alloc total. m5 #7 (constant pool) trims another 4,003 allocs
+by aliasing every `nil` to a singleton. The m5 #9 dup machinery is
+inert on this fixture (no multi-use bindings) but does no harm.
 
 Self-compile of `stage2/compiler.kai`:
 
