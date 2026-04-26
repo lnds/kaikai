@@ -7471,6 +7471,454 @@ fn var_canonical_return(line: Int, col: Int) : HReturn {
   HR("x", mk_expr(EVar("x"), line, col), line, col)
 }
 
+# m7b #16 — variable specialisation. Doc B §`State[T]` *Performance*
+# promised that a `var x = init; @x; x := v` block compiles to a
+# stack slot, not a chain of handler invocations. The specialised
+# form replaces the canonical `with State[T] as x` handler with:
+#   let x_slot = array_make(1, init)
+#   { rest_with_n.get() → array_get(x_slot, 0)
+#         and n.set(v)   → { let _ = array_set(x_slot, 0, v); () } }
+# Trigger conditions per Doc C §*Variable specialisation*:
+#   1. canonical handler shape (always true — emitted by us);
+#   2. no multi-shot resume (always true — canonical clauses);
+#   3. `name` only appears as `name.get()` / `name.set(v)` callee
+#      (no escape into a closure or argument);
+#   4. `init` is a "normal expression" — no op calls.
+# Conditions 1 and 2 hold by construction; this section adds the
+# conservative checks for 3 and 4 plus the rewrite.
+
+# Trigger 4: init is a normal expression. Conservative subset:
+# literals, EVar (refers to a local or global value), prelude
+# arithmetic / unary, calls whose callee is a non-effect EVar.
+# Anything else (op call, lambda, handle, match, if, block, list,
+# record, etc.) is rejected so the canonical handler runs instead.
+fn init_is_safe(e: Expr) : Bool {
+  match e.kind {
+    EInt(_) -> true
+    EReal(_) -> true
+    EBool(_) -> true
+    EChar(_) -> true
+    EStr(_, _) -> true
+    EUnit -> true
+    EVar(_) -> true
+    EBinop(_, a, b) -> init_is_safe(a) and init_is_safe(b)
+    EUnop(_, x) -> init_is_safe(x)
+    ECall(callee, args_) -> {
+      let callee_ok = match callee.kind {
+        EVar(_) -> true
+        _ -> false
+      }
+      callee_ok and init_args_safe(args_)
+    }
+    _ -> false
+  }
+}
+
+fn init_args_safe(es: [Expr]) : Bool {
+  match es {
+    [] -> true
+    [h, ...rest] -> if init_is_safe(h) { init_args_safe(rest) } else { false }
+  }
+}
+
+# Trigger 3: name appears in body ONLY as the immediate base of a
+# `name.get` or `name.set` field on the callee of a call. Any other
+# occurrence — closure capture, function-argument position, plain
+# value reference — is treated as escape and disables specialisation.
+fn body_escapes(name: String, e: Expr) : Bool {
+  match e.kind {
+    EInt(_) -> false
+    EReal(_) -> false
+    EBool(_) -> false
+    EChar(_) -> false
+    EStr(_, _) -> false
+    EUnit -> false
+    EUnder -> false
+    EPlaceholder -> false
+    EHole(_) -> false
+    EVar(n) -> n == name
+    ECall(callee, args_) -> {
+      let callee_is_get_set = match callee.kind {
+        EField(base, fname) -> match base.kind {
+          EVar(n) ->
+            if n == name and (fname == "get" or fname == "set") { true }
+            else { false }
+          _ -> false
+        }
+        _ -> false
+      }
+      let callee_escape =
+        if callee_is_get_set { false } else { body_escapes(name, callee) }
+      callee_escape or args_escape(name, args_)
+    }
+    EField(base, _) -> body_escapes(name, base)
+    EIndex(a, b) -> body_escapes(name, a) or body_escapes(name, b)
+    EBinop(_, a, b) -> body_escapes(name, a) or body_escapes(name, b)
+    EUnop(_, x) -> body_escapes(name, x)
+    EIf(c, t_, eo) -> body_escapes(name, c) or body_escapes(name, t_) or opt_escapes(name, eo)
+    EBlock(stmts, tail) -> stmts_escape(name, stmts) or opt_escapes(name, tail)
+    EPipe(a, b) -> body_escapes(name, a) or body_escapes(name, b)
+    EMatch(scr, arms) -> body_escapes(name, scr) or arms_escape(name, arms)
+    ELambda(_, _) -> contains_var(name, e)
+    EList(elems) -> elems_escape(name, elems)
+    ERange(a, b, opt_step) -> body_escapes(name, a) or body_escapes(name, b) or opt_escapes(name, opt_step)
+    ERecordLit(_, fields) -> fields_escape(name, fields)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> body_escapes(name, body) or opt_escapes(name, init_opt) or clauses_escape(name, clauses) or ret_opt_escapes(name, ret_opt)
+  }
+}
+
+fn args_escape(name: String, es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if body_escapes(name, h) { true } else { args_escape(name, rest) }
+  }
+}
+
+fn opt_escapes(name: String, opt: Option[Expr]) : Bool {
+  match opt {
+    None -> false
+    Some(e) -> body_escapes(name, e)
+  }
+}
+
+fn stmts_escape(name: String, ss: [Stmt]) : Bool {
+  match ss {
+    [] -> false
+    [s, ...rest] -> if stmt_escapes(name, s) { true } else { stmts_escape(name, rest) }
+  }
+}
+
+fn stmt_escapes(name: String, s: Stmt) : Bool {
+  match s {
+    SLet(_, _, rhs) -> body_escapes(name, rhs)
+    SAssert(c, msg) -> body_escapes(name, c) or opt_escapes(name, msg)
+    SExprStmt(x) -> body_escapes(name, x)
+    SIndexAssign(b, i, v, _, _) ->
+      body_escapes(name, b) or body_escapes(name, i) or body_escapes(name, v)
+    SVar(_, _, rhs, _, _) -> body_escapes(name, rhs)
+  }
+}
+
+fn arms_escape(name: String, arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> if arm_escapes(name, a) { true } else { arms_escape(name, rest) }
+  }
+}
+
+fn arm_escapes(name: String, a: Arm) : Bool {
+  match a {
+    Arm(_, opt_g, b) -> opt_escapes(name, opt_g) or body_escapes(name, b)
+  }
+}
+
+fn elems_escape(name: String, es: [ListElem]) : Bool {
+  match es {
+    [] -> false
+    [el, ...rest] -> match el {
+      ElPlain(x)  -> if body_escapes(name, x) { true } else { elems_escape(name, rest) }
+      ElSpread(x) -> if body_escapes(name, x) { true } else { elems_escape(name, rest) }
+    }
+  }
+}
+
+fn fields_escape(name: String, fs: [FieldInit]) : Bool {
+  match fs {
+    [] -> false
+    [f, ...rest] -> match f {
+      FI(_, v) -> if body_escapes(name, v) { true } else { fields_escape(name, rest) }
+    }
+  }
+}
+
+fn clauses_escape(name: String, cs: [HClause]) : Bool {
+  match cs {
+    [] -> false
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) ->
+        if body_escapes(name, b) { true } else { clauses_escape(name, rest) }
+    }
+  }
+}
+
+fn ret_opt_escapes(name: String, opt: Option[HReturn]) : Bool {
+  match opt {
+    None -> false
+    Some(r) -> match r { HR(_, b, _, _) -> body_escapes(name, b) }
+  }
+}
+
+# Conservative containment check used by the lambda branch of
+# `body_escapes`: a closure that mentions `name` at all is treated
+# as escape (we have no way to prove the closure does not outlive
+# the handle). Returns true if `name` appears anywhere in `e`.
+fn contains_var(name: String, e: Expr) : Bool {
+  match e.kind {
+    EVar(n) -> n == name
+    ECall(c, args_) -> contains_var(name, c) or any_contains(name, args_)
+    EField(b, _) -> contains_var(name, b)
+    EIndex(a, b) -> contains_var(name, a) or contains_var(name, b)
+    EBinop(_, a, b) -> contains_var(name, a) or contains_var(name, b)
+    EUnop(_, x) -> contains_var(name, x)
+    EIf(c, t_, eo) -> contains_var(name, c) or contains_var(name, t_) or opt_contains(name, eo)
+    EBlock(stmts, tail) -> stmts_contain(name, stmts) or opt_contains(name, tail)
+    EMatch(scr, arms) -> contains_var(name, scr) or arms_contain(name, arms)
+    ELambda(_, b) -> contains_var(name, b)
+    EList(elems) -> elems_contain(name, elems)
+    ERange(a, b, opt_step) ->
+      contains_var(name, a) or contains_var(name, b) or opt_contains(name, opt_step)
+    ERecordLit(_, fields) -> fields_contain(name, fields)
+    EPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> contains_var(name, body) or opt_contains(name, init_opt) or clauses_contain(name, clauses) or ret_opt_contains(name, ret_opt)
+    _ -> false
+  }
+}
+
+fn any_contains(name: String, es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if contains_var(name, h) { true } else { any_contains(name, rest) }
+  }
+}
+
+fn opt_contains(name: String, opt: Option[Expr]) : Bool {
+  match opt { None -> false  Some(e) -> contains_var(name, e) }
+}
+
+fn stmts_contain(name: String, ss: [Stmt]) : Bool {
+  match ss {
+    [] -> false
+    [s, ...rest] -> if stmt_contains(name, s) { true } else { stmts_contain(name, rest) }
+  }
+}
+
+fn stmt_contains(name: String, s: Stmt) : Bool {
+  match s {
+    SLet(_, _, rhs) -> contains_var(name, rhs)
+    SAssert(c, msg) -> contains_var(name, c) or opt_contains(name, msg)
+    SExprStmt(x) -> contains_var(name, x)
+    SIndexAssign(b, i, v, _, _) ->
+      contains_var(name, b) or contains_var(name, i) or contains_var(name, v)
+    SVar(_, _, rhs, _, _) -> contains_var(name, rhs)
+  }
+}
+
+fn arms_contain(name: String, arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, g, b) ->
+        if opt_contains(name, g) or contains_var(name, b) { true }
+        else { arms_contain(name, rest) }
+    }
+  }
+}
+
+fn elems_contain(name: String, es: [ListElem]) : Bool {
+  match es {
+    [] -> false
+    [el, ...rest] -> match el {
+      ElPlain(x)  -> if contains_var(name, x) { true } else { elems_contain(name, rest) }
+      ElSpread(x) -> if contains_var(name, x) { true } else { elems_contain(name, rest) }
+    }
+  }
+}
+
+fn fields_contain(name: String, fs: [FieldInit]) : Bool {
+  match fs {
+    [] -> false
+    [f, ...rest] -> match f {
+      FI(_, v) -> if contains_var(name, v) { true } else { fields_contain(name, rest) }
+    }
+  }
+}
+
+fn clauses_contain(name: String, cs: [HClause]) : Bool {
+  match cs {
+    [] -> false
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) ->
+        if contains_var(name, b) { true } else { clauses_contain(name, rest) }
+    }
+  }
+}
+
+fn ret_opt_contains(name: String, opt: Option[HReturn]) : Bool {
+  match opt { None -> false  Some(r) -> match r { HR(_, b, _, _) -> contains_var(name, b) } }
+}
+
+# Specialise a body: rewrite every `name.get()` to
+# `array_get(slot_var, 0)` and every `name.set(v)` to a unit-typed
+# block `{ let _ = array_set(slot_var, 0, v); () }`. The slot_var
+# name is `<name>__slot`. Other expressions pass through.
+fn specialise_body(name: String, slot_name: String, e: Expr) : Expr {
+  Expr { kind: specialise_kind(name, slot_name, e.kind, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty }
+}
+
+fn specialise_kind(name: String, slot_name: String, k: ExprKind, line: Int, col: Int) : ExprKind {
+  match k {
+    ECall(callee, args_) -> {
+      let getset = match callee.kind {
+        EField(base, fname) -> match base.kind {
+          EVar(n) ->
+            if n == name and fname == "get" { Some("get") }
+            else if n == name and fname == "set" { Some("set") }
+            else { None }
+          _ -> None
+        }
+        _ -> None
+      }
+      match getset {
+        Some(op) -> {
+          let slot_e = mk_expr(EVar(slot_name), line, col)
+          let zero = mk_expr(EInt(0), line, col)
+          if op == "get" {
+            ECall(mk_expr(EVar("array_get"), line, col), [slot_e, zero])
+          } else {
+            # `name.set(v)`: emit `{ let _ = array_set(slot, 0, v); () }`
+            # so the result type stays Unit (matches the canonical clause).
+            let v = match args_ {
+              [a, ...ignore] -> specialise_body(name, slot_name, a)
+              [] -> mk_expr(EUnit, line, col)
+            }
+            let set_call = mk_expr(
+              ECall(mk_expr(EVar("array_set"), line, col), [slot_e, zero, v]),
+              line, col)
+            let let_pat = mk_pat(PWild, line, col)
+            let let_stmt = SLet(let_pat, None, set_call)
+            EBlock([let_stmt], Some(mk_expr(EUnit, line, col)))
+          }
+        }
+        None ->
+          ECall(specialise_body(name, slot_name, callee),
+                specialise_args(name, slot_name, args_))
+      }
+    }
+    EBlock(stmts, tail) ->
+      EBlock(specialise_stmts(name, slot_name, stmts),
+             match tail { Some(t) -> Some(specialise_body(name, slot_name, t)) None -> None })
+    EIf(c, t_, eo) ->
+      EIf(specialise_body(name, slot_name, c),
+          specialise_body(name, slot_name, t_),
+          match eo { Some(e2) -> Some(specialise_body(name, slot_name, e2)) None -> None })
+    EBinop(op, a, b) ->
+      EBinop(op, specialise_body(name, slot_name, a),
+                  specialise_body(name, slot_name, b))
+    EUnop(op, x) -> EUnop(op, specialise_body(name, slot_name, x))
+    EField(base, fname) -> EField(specialise_body(name, slot_name, base), fname)
+    EIndex(a, b) -> EIndex(specialise_body(name, slot_name, a),
+                            specialise_body(name, slot_name, b))
+    EPipe(a, b) -> EPipe(specialise_body(name, slot_name, a),
+                          specialise_body(name, slot_name, b))
+    EList(elems) -> EList(specialise_elems(name, slot_name, elems))
+    ERange(a, b, opt_step) ->
+      ERange(specialise_body(name, slot_name, a),
+             specialise_body(name, slot_name, b),
+             match opt_step { Some(s) -> Some(specialise_body(name, slot_name, s)) None -> None })
+    ERecordLit(rname, fields) ->
+      ERecordLit(rname, specialise_fields(name, slot_name, fields))
+    EMatch(scr, arms) ->
+      EMatch(specialise_body(name, slot_name, scr),
+             specialise_arms(name, slot_name, arms))
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(specialise_body(name, slot_name, body), eff, eff_tyargs,
+              match init_opt { Some(i) -> Some(specialise_body(name, slot_name, i)) None -> None },
+              alias_opt,
+              specialise_clauses(name, slot_name, clauses),
+              specialise_ret_opt(name, slot_name, ret_opt))
+    ELambda(ps, b) -> ELambda(ps, specialise_body(name, slot_name, b))
+    _ -> k
+  }
+}
+
+fn specialise_args(name: String, slot_name: String, es: [Expr]) : [Expr] {
+  match es {
+    [] -> []
+    [h, ...rest] -> [specialise_body(name, slot_name, h),
+                      ...specialise_args(name, slot_name, rest)]
+  }
+}
+
+fn specialise_stmts(name: String, slot_name: String, ss: [Stmt]) : [Stmt] {
+  match ss {
+    [] -> []
+    [s, ...rest] -> [specialise_stmt(name, slot_name, s),
+                      ...specialise_stmts(name, slot_name, rest)]
+  }
+}
+
+fn specialise_stmt(name: String, slot_name: String, s: Stmt) : Stmt {
+  match s {
+    SLet(pat, ann, rhs) -> SLet(pat, ann, specialise_body(name, slot_name, rhs))
+    SAssert(c, msg) ->
+      SAssert(specialise_body(name, slot_name, c),
+              match msg { Some(m) -> Some(specialise_body(name, slot_name, m)) None -> None })
+    SExprStmt(x) -> SExprStmt(specialise_body(name, slot_name, x))
+    SIndexAssign(b, i, v, l, c) ->
+      SIndexAssign(specialise_body(name, slot_name, b),
+                    specialise_body(name, slot_name, i),
+                    specialise_body(name, slot_name, v), l, c)
+    SVar(n, ty, rhs, l, c) ->
+      SVar(n, ty, specialise_body(name, slot_name, rhs), l, c)
+  }
+}
+
+fn specialise_arms(name: String, slot_name: String, arms: [Arm]) : [Arm] {
+  match arms {
+    [] -> []
+    [a, ...rest] -> match a {
+      Arm(p, g, b) -> [
+        Arm(p,
+            match g { Some(gg) -> Some(specialise_body(name, slot_name, gg)) None -> None },
+            specialise_body(name, slot_name, b)),
+        ...specialise_arms(name, slot_name, rest)
+      ]
+    }
+  }
+}
+
+fn specialise_elems(name: String, slot_name: String, es: [ListElem]) : [ListElem] {
+  match es {
+    [] -> []
+    [el, ...rest] -> match el {
+      ElPlain(x)  -> [ElPlain(specialise_body(name, slot_name, x)),
+                       ...specialise_elems(name, slot_name, rest)]
+      ElSpread(x) -> [ElSpread(specialise_body(name, slot_name, x)),
+                       ...specialise_elems(name, slot_name, rest)]
+    }
+  }
+}
+
+fn specialise_fields(name: String, slot_name: String, fs: [FieldInit]) : [FieldInit] {
+  match fs {
+    [] -> []
+    [f, ...rest] -> match f {
+      FI(fn_, v) -> [FI(fn_, specialise_body(name, slot_name, v)),
+                      ...specialise_fields(name, slot_name, rest)]
+    }
+  }
+}
+
+fn specialise_clauses(name: String, slot_name: String, cs: [HClause]) : [HClause] {
+  match cs {
+    [] -> []
+    [c, ...rest] -> match c {
+      HC(n, ps, b, l, co) -> [HC(n, ps, specialise_body(name, slot_name, b), l, co),
+                              ...specialise_clauses(name, slot_name, rest)]
+    }
+  }
+}
+
+fn specialise_ret_opt(name: String, slot_name: String, opt: Option[HReturn]) : Option[HReturn] {
+  match opt {
+    None -> None
+    Some(r) -> match r {
+      HR(p, b, l, c) -> Some(HR(p, specialise_body(name, slot_name, b), l, c))
+    }
+  }
+}
+
 # Walk a block's stmts looking for the first SVar. Returns the rewritten
 # (stmts, tail) pair: every stmt before the first SVar is structurally
 # desugared (so lambdas / inner blocks inside their expressions still
@@ -7485,13 +7933,34 @@ fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
         let init_d = desugar_var_expr(init)
         let inner_kind = desugar_var_block(rest, tail)
         let inner_expr = mk_expr(inner_kind, line, col)
-        let tyargs = match ty { Some(t) -> [t] None -> [] }
-        let clauses = var_canonical_clauses(line, col)
-        let ret = var_canonical_return(line, col)
-        let handle_kind = EHandle(inner_expr, "State", tyargs,
-                                   Some(init_d), Some(name),
-                                   clauses, Some(ret))
-        EBlock([], Some(mk_expr(handle_kind, line, col)))
+        # m7b #16 — try variable specialisation first. When all
+        # trigger conditions hold, lower the var to a 1-element
+        # array slot (prelude `array_*`, no `Mutable` row) instead
+        # of the canonical State[T] handler. The conditions:
+        #   * init is a "normal expression" (init_is_safe)
+        #   * `name` only appears as `name.get`/`name.set` callee
+        #     in the body (body_escapes is false)
+        # When either fails, fall back to the canonical handler so
+        # captures, escapes, and complex inits still work.
+        if init_is_safe(init_d) and not body_escapes(name, inner_expr) {
+          let slot_name = string_concat(name, "__slot")
+          let slot_init = mk_expr(
+            ECall(mk_expr(EVar("array_make"), line, col),
+                  [mk_expr(EInt(1), line, col), init_d]),
+            line, col)
+          let let_pat = mk_pat(PBind(slot_name), line, col)
+          let let_stmt = SLet(let_pat, None, slot_init)
+          let body_spec = specialise_body(name, slot_name, inner_expr)
+          EBlock([let_stmt], Some(body_spec))
+        } else {
+          let tyargs = match ty { Some(t) -> [t] None -> [] }
+          let clauses = var_canonical_clauses(line, col)
+          let ret = var_canonical_return(line, col)
+          let handle_kind = EHandle(inner_expr, "State", tyargs,
+                                     Some(init_d), Some(name),
+                                     clauses, Some(ret))
+          EBlock([], Some(mk_expr(handle_kind, line, col)))
+        }
       }
       _ -> {
         let s_d = desugar_var_stmt(s)
