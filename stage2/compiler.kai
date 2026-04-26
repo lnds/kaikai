@@ -53,7 +53,7 @@ type TokKind
   | TkEq | TkArrow | TkFatArrow | TkPipe | TkPipeApply
   | TkPlus | TkMinus | TkStar | TkSlash | TkSlashSlash | TkPercent
   | TkEqEq | TkNeq | TkLt | TkGt | TkLe | TkGe
-  | TkBang
+  | TkBang | TkAt
   # typed holes (M10): TkHole is a bare `?`; TkHoleName carries the
   # identifier for `?foo`. The lexer recognises `?ident` as one token
   # so the parser does not have to re-synthesise the form.
@@ -90,7 +90,7 @@ fn tk_name(k: TokKind) : String {
     TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
     TkSlashSlash -> "//" TkPercent -> "%"
     TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">"
-    TkLe -> "<=" TkGe -> ">=" TkBang -> "!"
+    TkLe -> "<=" TkGe -> ">=" TkBang -> "!" TkAt -> "@"
     TkHole -> "?" TkHoleName(_) -> "?NAME"
     TkError(_) -> "ERROR"
   }
@@ -466,6 +466,7 @@ fn lex_punct(l: Lexer) : LexStep {
       else if c == '{' { Step(l1, tok(TkLbrace, sl, sc, start, l1.pos)) }
       else if c == '}' { Step(l1, tok(TkRbrace, sl, sc, start, l1.pos)) }
       else if c == ',' { Step(l1, tok(TkComma, sl, sc, start, l1.pos)) }
+      else if c == '@' { Step(l1, tok(TkAt, sl, sc, start, l1.pos)) }
       else if c == ':' {
         if lex_peek_is(l1, '=') {
           let l2 = lex_advance(l1)
@@ -1183,6 +1184,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkLe         -> match b { TkLe -> true _ -> false }
     TkGe         -> match b { TkGe -> true _ -> false }
     TkBang       -> match b { TkBang -> true _ -> false }
+    TkAt         -> match b { TkAt -> true _ -> false }
     TkHole       -> match b { TkHole -> true _ -> false }
     TkHoleName(_) -> match b { TkHoleName(_) -> true _ -> false }
     TkError(_)   -> false
@@ -1598,6 +1600,22 @@ fn parse_unary(p: Parser) : PExpr {
     match r.r {
       None -> err_e(r.p)
       Some(e) -> ok_e(r.p, mk_expr(EUnop("not", e), t.line, t.col))
+    }
+  } else if tk_is(t.kind, TkAt) {
+    # m7b #4: `@cap` desugars to `cap.get()`. The alias rewrite later
+    # remaps `Reader[T].get` to `Reader.ask`. Doc B §`Syntax note:
+    # capability read/write sugar` rule 3: the identifier after `@`
+    # must be a simple capability binding (no dotted paths).
+    let p1 = p_advance(p)
+    let id = p_peek(p1)
+    if not tk_is(id.kind, TkIdent) {
+      err_e(p_error(p1, id, "expected capability name after `@`"))
+    } else {
+      let name = tok_source(p1.src, id)
+      let p2 = p_advance(p1)
+      let cap = mk_expr(EVar(name), id.line, id.col)
+      let getter = mk_expr(EField(cap, "get"), t.line, t.col)
+      ok_e(p2, mk_expr(ECall(getter, []), t.line, t.col))
     }
   } else {
     parse_postfix(p)
@@ -2398,7 +2416,13 @@ fn parse_stmt(p: Parser) : PStmt {
   }
 }
 
-# m7b #6: validate the LHS of `:=` and parse the RHS.
+# m7b #6 + m7b #4: validate the LHS of `:=` and parse the RHS.
+# Accepted shapes:
+#   `Ident[i] := v`            (m7b #6 indexed write — SIndexAssign)
+#   `Ident.field…[i] := v`     (m7b #6 indexed write through field path)
+#   `Ident := v`               (m7b #4 capability write — desugared to
+#                              `cap.set(v)`; the alias rewrite later
+#                              maps it to `State.set(cap, v)`)
 fn parse_index_assign_rest(p: Parser, lhs: Expr, t: Token) : PStmt {
   match lhs.kind {
     EIndex(base, idx) -> {
@@ -2416,8 +2440,29 @@ fn parse_index_assign_rest(p: Parser, lhs: Expr, t: Token) : PStmt {
         }
       }
     }
+    EVar(name) -> {
+      # m7b #4: `cap := v` — desugar inline to `cap.set(v)` as a
+      # statement. The alias rewrite remaps the resulting field
+      # expression to `State.set(cap, v)`. Doc B §`Syntax note:
+      # capability read/write sugar` rule 2: only `State[T].set(v)`
+      # is the semantic target; if cap is a Reader binding the
+      # desugar still produces `cap.set(v)`, the alias rewrite emits
+      # `Reader.set(v)`, and the resolver rejects it ("Reader has
+      # no operation `set`").
+      let p1 = p_skip_newlines(p_advance(p))
+      let rv = parse_expr(p1)
+      match rv.r {
+        None -> err_s(rv.p)
+        Some(v) -> {
+          let cap = mk_expr(EVar(name), lhs.line, lhs.col)
+          let setter = mk_expr(EField(cap, "set"), lhs.line, lhs.col)
+          let call = mk_expr(ECall(setter, [v]), lhs.line, lhs.col)
+          ok_s(rv.p, SExprStmt(call))
+        }
+      }
+    }
     _ -> err_s(p_error(p, t,
-      "left-hand side of `:=` must be an indexed `Ident[i]` or `Ident.field…[i]`"))
+      "left-hand side of `:=` must be a capability binding `Ident`, an indexed `Ident[i]`, or `Ident.field…[i]`"))
   }
 }
 
@@ -6750,8 +6795,15 @@ fn rewrite_alias_kind(k: ExprKind, m: AliasMap, line: Int, col: Int) : ExprKind 
   match k {
     EField(base, fname) -> match base.kind {
       EVar(name) -> match alias_map_lookup(m, name) {
-        Some(eff_name) ->
-          EField(mk_expr(EVar(eff_name), base.line, base.col), fname)
+        Some(eff_name) -> {
+          # m7b #4: the `@cap` desugar always emits `cap.get`; for
+          # a Reader-bound capability the actual op is `ask`.
+          # Translate the field name here so a downstream
+          # `cap.get()` call becomes `Reader.ask()`.
+          let real_fname =
+            if eff_name == "Reader" and fname == "get" { "ask" } else { fname }
+          EField(mk_expr(EVar(eff_name), base.line, base.col), real_fname)
+        }
         None -> EField(rewrite_alias_expr(base, m), fname)
       }
       _ -> EField(rewrite_alias_expr(base, m), fname)
@@ -10164,15 +10216,20 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
               # m7a #4e: maybe `name` is an alias bound by an
               # enclosing `handle ... with Eff as name`. Resolve
               # to the underlying effect and retry.
+              # m7b #4: `@cap` desugars to `cap.get()` for every
+              # capability shape; for a Reader-bound alias the op
+              # is `ask`, not `get`. Remap here so the lookup hits.
               match lookup_alias(st.aliases, name) {
                 None -> None
                 Some(eff) -> {
-                  let key2 = string_concat(eff, string_concat(".", op_name))
+                  let real_op =
+                    if eff == "Reader" and op_name == "get" { "ask" } else { op_name }
+                  let key2 = string_concat(eff, string_concat(".", real_op))
                   match ty_env_lookup(st.env, key2) {
                     Some(sc) -> Some(synth_op_call_with_scheme(st, sc, args_, key2, line, col))
                     None ->
                       if is_effect_in_env(st.env, eff) {
-                        Some(synth_op_call_unknown_op(st, eff, op_name, line, col))
+                        Some(synth_op_call_unknown_op(st, eff, real_op, line, col))
                       } else { None }
                   }
                 }
