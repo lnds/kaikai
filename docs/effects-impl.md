@@ -1734,15 +1734,20 @@ page the way they are written.
     slot replacement is the missing pass. Independent of #15;
     either can land first. *Pending.*
 17. **Alias-rewrite shadow tracking** — the pre-emit
-    `rewrite_alias_decls` walker rewrites every `alias.op(args)`
-    inside an `EHandle` body without tracking inner
-    `let alias = ...` shadowing. The resolver catches the
-    resulting type error today, so it is a latent
-    correctness bug rather than a user-visible one. Small change
-    to `rewrite_alias_kind`'s `EBlock` / `ELambda` / `EMatch`
-    cases. Surfaced by m7b #5b; details in §*Variable
-    specialisation* §*Known follow-ups after m7b #5b* item 3.
-    *Pending.*
+    `rewrite_alias_decls` walker now drops a binding from its
+    `AliasMap` whenever an inner scope rebinds the name.
+    Implementation: a new `alias_map_remove` /
+    `alias_map_remove_all` pair walks the underlying
+    `[AliasBinding]` list and returns a copy with every matching
+    head removed. `rewrite_alias_stmts` splits into a wrapper +
+    a `rewrite_alias_stmts_scoped` inner that returns both the
+    rewritten statements and the alias map as extended by every
+    SLet (via `pat_bindings` from m7b #18) and SVar binder.
+    `EBlock` consumes the scoped result so the trailing
+    expression sees the same map. `EMatch` arms remove pattern
+    bindings; `ELambda` removes its param names; handler clause
+    params and the return clause's `p` binding remove themselves
+    the same way. Surfaced by m7b #5b. **Landed.**
 18. **Lambda free-var capture treats inner `let`s as free** — the
     codegen's `fv_*` family walked lambda bodies without tracking
     `let` / `var` / pattern bindings, so any name they bound and a
@@ -1775,8 +1780,9 @@ helpers from #14. m7b #4 (`@cap` / `cap := v` sugars) also
 landed, completing the user-facing surface of the `var` workflow.
 m7b #2a (per-op generics mechanism), #2b (Mutable introduction),
 and #2c (audit, "no migration" decision pinned to stage 0
-parser limitations) all landed. The remaining m7b items are:
-#8 (diagnostic review), #15, #16, #17.
+parser limitations) all landed. m7b #17 (alias-rewrite shadow
+tracking) closed the latent walker bug from the #5b follow-ups.
+The remaining m7b items are: #8 (diagnostic review), #15, #16.
 
 ## Next steps
 
