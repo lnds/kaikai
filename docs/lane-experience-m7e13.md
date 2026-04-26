@@ -206,3 +206,204 @@ had to decide:
   "wall-clock" is a guess based on transcript density and the
   complexity of each phase.
 - **Single agent (Claude).** Not generalisable across LLMs.
+
+---
+
+# Phase 2: LLVM backend port
+
+Best-effort retrospective by the implementing agent.
+
+## Objective metrics (from /tmp/lane-m7e13-phase2-builds.tsv)
+
+- Phase 2 start: `2026-04-26T16:26:58-04:00`
+- Phase 2 end:   `2026-04-26T16:35:32-04:00`
+- Phase 2 wall-clock: **~8m 34s** (instrumented, not estimated).
+- Build/test invocations:
+  - `make all`:           1 invocation (~2s).
+  - `make test`:          1 invocation (~71s, plus one
+    PIPESTATUS-based shell-condition logging glitch — see
+    *Compiler errors* §2).
+  - `make selfhost`:      1 invocation (~6s).
+  - `make selfhost-llvm`: 1 invocation (~5s, same logging
+    glitch).
+  - `--emit=llvm` manual: 6 invocations (one early single-
+    fixture smoke; one loop over the five positive m7e_13
+    fixtures, each emit + clang + run + diff against the
+    pre-existing C-backend `.out.expected`).
+
+## Compiler errors I encountered (Phase 2)
+
+1. **No compiler errors visible in current context.** The LLVM
+   port compiled clean on first build (`make all` after the
+   `EBang(inner) -> llvm_emit_bang(e, inner)` swap and the new
+   `llvm_emit_bang` helper). The first manual `--emit=llvm` on
+   `m7e_13_bang_option_basic.kai` produced clean IR; clang
+   accepted it; running printed `7` matching the C-backend
+   golden. All five positive fixtures round-tripped without
+   intermediate errors.
+2. **Shell logging glitch (not a compiler error).** My
+   instrumentation used
+   `RC=${PIPESTATUS[0]}; ... [ $RC -eq 0 ]` inside a `Bash` tool
+   call where `$RC` happened to expand to empty (PIPESTATUS
+   reset between subshells), tripping zsh
+   `(eval):[:1: unknown condition: -eq`. The underlying `make`
+   succeeded — `grep -E "(FAIL|DIFF|Error)"` over the same
+   output returned nothing. I logged a corrective `OK` row
+   immediately after; the TSV preserves both rows for honesty.
+
+## Friction points (Phase 2)
+
+- **Locating the right LLVM-emit primitives.** The m7c-b commit
+  message and `docs/effects-impl.md` §m7c gave me the conceptual
+  shape (push/body/pop with a scalar `last_val` register), but I
+  needed concrete examples of *branching out of an SSA expression
+  with an early `ret`* — which `EHandle`'s LLVM lowering does NOT
+  do (no setjmp landing yet, deferred to m7c-e). The closest
+  analogue was `llvm_emit_match`, which uses `unreachable` after
+  `kaix_match_panic` and then opens the `match.end` block to PHI
+  between arms. I copied the "open a fresh block after a
+  terminator instruction" pattern from there. Helped:
+  `grep -n "unreachable\|ret %KaiValue"` to enumerate every
+  place the LLVM backend already terminates a block mid-fn.
+
+- **No surprise from the runtime side.** `kaix_is_variant` and
+  `kaix_variant_arg` were already declared in `llvm_header` and
+  defined in `runtime_llvm.c`, with the same semantics the C
+  backend uses. Zero new runtime helpers needed.
+
+- **Verifying the fixtures end-to-end.** The existing
+  `make -C stage2 test-llvm` recipe iterates only
+  `examples/minimal/*.kai` and `examples/llvm/*.kai`; my
+  `examples/sugars/m7e_13_*` fixtures are not picked up. The lane
+  brief explicitly said *do not invent structural Makefile
+  changes — ask if needed*. I instead validated the five
+  positives with a manual one-shot bash loop (emit → clang → run
+  → diff vs the existing C-backend `.out.expected`), and
+  documented adding the sugars to `test-llvm` as a follow-up
+  (named `m7e13-llvm-test-harness` in the brief's suggestion).
+
+## Spec ambiguities or interpretive choices (Phase 2)
+
+1. **`ret` directly from inside the SSA region.** The C lowering
+   uses a GCC statement-expression and a literal `return _b;`
+   that yanks control out of the host function. The LLVM
+   backend has no statement-expression; the natural fit is a
+   `br i1 %cond, label %unwrap, label %fail` with `fail` doing
+   `ret %KaiValue* %inner`. I went with this directly — the
+   `unwrap` block becomes the new `cur_label` and its
+   `kaix_variant_arg` result is the EBang's `last_val`. No PHI
+   is needed because the fail block does not flow back. Not in
+   the spec, but the only sensible LLVM analogue.
+
+2. **`incref` on the unwrapped payload.** `kaix_variant_arg`
+   already increfs its return value (per the runtime comment
+   "incref so the caller owns it; the C backend passes variant
+   args as borrowed references, but the LLVM path keeps
+   ownership uniform"). I did not add a separate dup; the
+   existing helper is correct for both backends. The C backend's
+   `emit_bang` reads `_b->as.var.args[0]` directly (no incref),
+   which is consistent with the C backend's borrowed-reference
+   convention. The two backends therefore have *different* RC
+   discipline for the unwrapped value, but both are internally
+   consistent and both pass selfhost.
+
+3. **Lambda rejection inheritance from Phase 1.** Phase 1
+   already rejected `e!` inside lambdas at the typer
+   (`synth_lambda` clears `ret_ty`). The LLVM port relies on
+   that — `ret %KaiValue* %inner` in the LLVM emit would
+   short-circuit the lambda's C function (`@_kai_lam_N`)
+   instead of the user's enclosing fn, exactly the same
+   footgun as the C backend would have had. No new spec
+   choice; the typer rejection is what keeps the LLVM lowering
+   correct.
+
+## Subjective summary (Phase 2)
+
+- **Confidence in correctness**: high.
+  - Selfhost-llvm fixed point passes (so the LLVM emitter is a
+    pure function of the typed AST, even after my changes).
+  - Stage 2 source does not use `!`, so the LLVM-port code is
+    only exercised by user fixtures — not by the bootstrap
+    chain.
+  - All five positive m7e_13 fixtures emit, link, run, and
+    produce stdout byte-identical to the C backend's
+    pre-existing goldens.
+  - Negative fixtures stay typer-rejected before the LLVM
+    emitter ever runs (the C backend is unchanged in that
+    respect).
+- **Wall-clock estimate**: ~9 minutes instrumented. My Phase 1
+  guess was ~4 hours; that included substantial reading time.
+  Phase 2 was much shorter because (a) I already had
+  `bang_success_variant` from Phase 1, (b) the LLVM helpers I
+  needed already existed, and (c) the selfhost-llvm gate is
+  fast (~5s).
+- **Hardest sub-task**: figuring out that `llvm_emit_match`'s
+  panic-then-`unreachable`-then-`open_block` pattern was the
+  template I needed for "terminator instruction inside an SSA
+  expression". Took longer than the actual edit.
+- **Did the LLVM port reuse most of the C path's logic, or did
+  it require fresh design?** Reused 100% of the typer (Phase 1
+  validated `inner.ty`; Phase 2 just reads it). Reused
+  `bang_success_variant` verbatim. The codegen itself was
+  fresh design but small (~50 LOC) because both runtime
+  helpers (`kaix_is_variant`, `kaix_variant_arg`) and the
+  LLVM-emit infrastructure (fresh-reg / fresh-label /
+  open-block) were already there.
+
+## Comparison Phase 1 vs Phase 2
+
+- **Was Phase 1 (C backend) easier than Phase 2 (LLVM)?**
+  *Phase 1 was harder per LOC.* Phase 1 carried the structural
+  cost: AST node, parser branch, 15 visitor sites, the typer
+  surgery (`InferState.ret_ty`, save/restore in `synth_lambda`,
+  diagnostics), the Perceus-pass case, and the C lowering. The
+  Perceus omission cost me one debug cycle (~10 minutes). Phase
+  2 was almost-pure follow-on: AST, typer, and visitors were
+  already in place; the only new surface was the LLVM-emit
+  helper, ~50 LOC. No debug cycles.
+- **Would I have preferred to do both in Phase 1, or was the
+  split helpful?** Honest answer: doing both in Phase 1 would
+  have been *cheaper end-to-end* — the LLVM port took ~9 minutes
+  net, less than the overhead of a second prompt + restart. The
+  split was helpful for *me, the agent*, in that Phase 1 closed
+  with a coherent C-only checkpoint that I was confident in;
+  but for an agent fluent in the LLVM-emit primitives, doing
+  both at once would have removed the partial-backend smell
+  that motivated Phase 2 in the first place. The lane brief for
+  a future similar feature should probably scope "all backends
+  in scope" by default and only carve out an LLVM follow-up
+  when the LLVM lowering is genuinely larger than the C one.
+
+## Phase 2 raw build log
+
+```
+timestamp	cmd	outcome	elapsed_s
+2026-04-26T16:30:39-04:00	make-all	OK	2
+2026-04-26T16:30:55-04:00	llvm-emit-basic	OK	0
+2026-04-26T16:31:11-04:00	llvm-link-basic	OK	0
+2026-04-26T16:31:24-04:00	llvm-fixture-option_basic	OK	1
+2026-04-26T16:31:24-04:00	llvm-fixture-option_propagates	OK	0
+2026-04-26T16:31:25-04:00	llvm-fixture-result_ok	OK	1
+2026-04-26T16:31:25-04:00	llvm-fixture-result_err	OK	0
+2026-04-26T16:31:25-04:00	llvm-fixture-chained	OK	0
+2026-04-26T16:32:53-04:00	make-test	FAIL	71
+2026-04-26T16:34:12-04:00	make-test	OK	-
+2026-04-26T16:34:34-04:00	make-selfhost	OK	6
+2026-04-26T16:34:46-04:00	selfhost-llvm	FAIL	5
+2026-04-26T16:34:52-04:00	selfhost-llvm	OK	-
+```
+
+## Limitations of this report
+
+- Same as Phase 1, plus: agent has been on this task for two
+  phases, may suffer from familiarity bias underestimating
+  residual effort. The "no compiler errors" claim for Phase 2 is
+  notable and worth scepticism; one plausible reading is that
+  the residual design from Phase 1 made the LLVM port
+  trivially-mechanical, and a less-prepared agent on the same
+  task would not have seen the same error-free path.
+- The shell-logging glitch (Phase 2 *Compiler errors* §2) means
+  the raw TSV has two redundant rows for `make-test` and
+  `selfhost-llvm`. The first row in each pair is the FAIL with
+  elapsed time; the second is the OK confirmation with no
+  elapsed time. Reading the TSV requires deduplication.
