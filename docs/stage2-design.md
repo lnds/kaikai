@@ -296,8 +296,17 @@ in.
 4. **m4 — Monomorphisation**: retire uniform boxing; emit
    specialised functions per generic instantiation. Verify perf
    on phase-4-demo workloads.
-5. **m5 — Basic Perceus**: reuse analysis + drop insertion in
-   the typed IR pass. Measure allocation reduction vs stage 1.
+5. **m5 — Basic Perceus** *(landed in main as rounds 1-3,
+   2026-04-25/26)*: walker scaffold + last-use analysis on fn
+   parameters + drop unused fresh-allocation let-bindings + dup/drop
+   runtime infrastructure (inert until stage 1 also has perceus).
+   Measured impact: -77.4% self-compile allocations via m5 #7
+   (constant pool for nullary primitives). Items deferred to a
+   follow-up: stage-1 perceus port, runtime linear consumption,
+   kai_closure capture incref, m4c real specialisation, LLVM
+   mirror of m5 #3 drops, full Perceus optimisations
+   (reuse-in-place, drop specialisation, unboxing, regions).
+   See `docs/m5x-followup.md`.
 6. **m6 — Module resolution**: cross-file imports, topological
    compilation, standard library loaded from a search path.
 7. **m7 — Effects + handlers** (split in two sub-milestones —
