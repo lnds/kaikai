@@ -41,7 +41,7 @@ type TokKind
   | TkAnd | TkAs | TkAssert | TkEffect | TkElse | TkFalse | TkFn | TkFor
   | TkHandle | TkIf | TkImpl | TkImport
   | TkLet | TkMatch | TkNot | TkOr | TkProtocol | TkPub | TkTest | TkTrue | TkType
-  | TkVar | TkWith
+  | TkUnitKw | TkVar | TkWith
   # m12.8: `#derive(P, ...)` annotation. The lexer recognises `#derive`
   # specifically (instead of treating it as a comment) so the parser can
   # consume it as a prefix to a `type` declaration.
@@ -62,6 +62,10 @@ type TokKind
   | TkPlusPlus
   | TkEqEq | TkNeq | TkLt | TkGt | TkLe | TkGe
   | TkBang | TkAt
+  # m12.5: caret used for integer power inside unit expressions, e.g.
+  # `m^2`, `sec^-1`. Reserved exclusively for unit syntax — outside
+  # `<...>` annotations it is a parser error.
+  | TkCaret
   # typed holes (M10): TkHole is a bare `?`; TkHoleName carries the
   # identifier for `?foo`. The lexer recognises `?ident` as one token
   # so the parser does not have to re-synthesise the form.
@@ -90,7 +94,7 @@ fn tk_name(k: TokKind) : String {
     TkIf -> "if" TkImpl -> "impl" TkImport -> "import"
     TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
     TkProtocol -> "protocol" TkPub -> "pub" TkTest -> "test" TkTrue -> "true" TkType -> "type"
-    TkVar -> "var" TkWith -> "with"
+    TkUnitKw -> "unit" TkVar -> "var" TkWith -> "with"
     TkDerive -> "#derive"
     TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
     TkIdent -> "IDENT" TkUnderscore -> "_"
@@ -103,7 +107,7 @@ fn tk_name(k: TokKind) : String {
     TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
     TkSlashSlash -> "//" TkPercent -> "%" TkPlusPlus -> "++"
     TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">"
-    TkLe -> "<=" TkGe -> ">=" TkBang -> "!" TkAt -> "@"
+    TkLe -> "<=" TkGe -> ">=" TkBang -> "!" TkAt -> "@" TkCaret -> "^"
     TkHole -> "?" TkHoleName(_) -> "?NAME"
     TkTodoBang -> "todo!"
     TkError(_) -> "ERROR"
@@ -255,6 +259,7 @@ fn keyword_kind(text: String) : TokKind {
   else if text == "test" { TkTest }
   else if text == "true" { TkTrue }
   else if text == "type" { TkType }
+  else if text == "unit" { TkUnitKw }   # m12.5
   else if text == "var" { TkVar }
   else if text == "with" { TkWith }
   else { TkIdent }
@@ -527,6 +532,9 @@ fn lex_punct(l: Lexer) : LexStep {
       else if c == '}' { Step(l1, tok(TkRbrace, sl, sc, start, l1.pos)) }
       else if c == ',' { Step(l1, tok(TkComma, sl, sc, start, l1.pos)) }
       else if c == '@' { Step(l1, tok(TkAt, sl, sc, start, l1.pos)) }
+      # m12.5: caret token for unit exponents — only meaningful inside
+      # `<...>` annotations; the parser rejects it elsewhere.
+      else if c == '^' { Step(l1, tok(TkCaret, sl, sc, start, l1.pos)) }
       else if c == ':' {
         if lex_peek_is(l1, '=') {
           let l2 = lex_advance(l1)
@@ -1030,6 +1038,10 @@ type ExprKind
   # for stateless effects, so existing handlers parse to `[]` /
   # `None` and behave as before.
   | EHandle(Expr, String, [TypeExpr], Option[Expr], Option[String], [HClause], Option[HReturn])
+  # m12.5: numeric literal annotated with a unit, e.g. `1.50<USD>` or
+  # `42<UserId>`. The inner Expr is always EInt or EReal; the
+  # UnitExprT comes from the source between the angle brackets.
+  | ELitUnit(Expr, UnitExprT)
 
 type ListElem = ElPlain(Expr) | ElSpread(Expr)
 
@@ -1082,6 +1094,11 @@ type TyKind
   = TyName(String, [TypeExpr])              # Name or Name[T1, T2, ...]
   | TyList(TypeExpr)
   | TyFn([TypeExpr], TypeExpr, RowExpr)
+  # m12.5: dimensioned numeric type, e.g. `Real<USD>` or `Int<m/sec>`.
+  # The base TypeExpr is the underlying primitive (parser only ever
+  # produces this with `Real`/`Int` underneath); the UnitExprT carries
+  # the unit annotation that the typer canonicalises and unifies.
+  | TyDim(TypeExpr, UnitExprT)
 
 # Syntactic effect row: REmpty for `T` (no `/`), RClosed for `T / Io
 # + Fail`, ROpen for `T / Io + e` or `T / e` where the lowercase tail
@@ -1095,6 +1112,25 @@ type TyKind
 # #11 (parametric labels) with m7b #12 (open row variable in tail).
 type RowExpr = REmpty | RClosed([RowLabel]) | ROpen(String, [RowLabel])
 type RowLabel = RL(String, [TypeExpr])
+
+# m12.5: units of measure. UnitExprT is a tree of unit operations.
+# The canonicaliser flattens it to a sorted vector of (sym, exponent).
+# UVar appears only at the semantic level — the parser produces only
+# the other shapes; UVar is allocated by the unifier for unit
+# inference variables (parallel to TyVarT).
+type UnitExprT
+  = UOne                                    # the dimensionless unit "1"
+  | USym(String)                            # atomic unit name (USD, m, kg)
+  | UMul(UnitExprT, UnitExprT)              # product
+  | UInv(UnitExprT)                          # multiplicative inverse
+  | UPow(UnitExprT, Int)                     # integer power
+  | UVar(Int)                                # unit unification variable
+
+# m12.5: kind of a type parameter. KType is the default; KUnit marks a
+# parameter that ranges over units rather than types (`[u: Unit]`).
+# Kinds are encoded inside the tparam name with a "#Unit" suffix so
+# the existing `tparams: [String]` plumbing keeps working unchanged.
+type Kind = KType | KUnit
 
 # Handler clause (op): `op_name(args..., resume) -> body`. The
 # resume binding is conventionally the last param; m7a #4d will
@@ -1135,6 +1171,11 @@ type Decl
   # annotation alongside the wrapped DType so the desugar pass has all
   # the data in one node.
   | DDerive([String], Decl, Int, Int)
+  # m12.5: unit declaration. `unit USD` (alias = None) introduces an
+  # atomic unit symbol; `unit Newton = kg * m / sec^2` (alias = Some)
+  # introduces a named alias whose RHS the resolver expands eagerly
+  # before unification ever runs. Codegen emits nothing for DUnit.
+  | DUnit(Bool, String, Option[UnitExprT], Int, Int)
 
 # m12.8: a single operation declared inside a `protocol P { ... }`
 # block. Mirrors EffectOp's shape (no body, with optional generic
@@ -1280,6 +1321,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkTest       -> match b { TkTest -> true _ -> false }
     TkTrue       -> match b { TkTrue -> true _ -> false }
     TkType       -> match b { TkType -> true _ -> false }
+    TkUnitKw     -> match b { TkUnitKw -> true _ -> false }
     TkVar        -> match b { TkVar -> true _ -> false }
     TkWith       -> match b { TkWith -> true _ -> false }
     TkInt        -> match b { TkInt -> true _ -> false }
@@ -1320,6 +1362,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkGe         -> match b { TkGe -> true _ -> false }
     TkBang       -> match b { TkBang -> true _ -> false }
     TkAt         -> match b { TkAt -> true _ -> false }
+    TkCaret      -> match b { TkCaret -> true _ -> false }
     TkHole       -> match b { TkHole -> true _ -> false }
     TkHoleName(_) -> match b { TkHoleName(_) -> true _ -> false }
     TkTodoBang   -> match b { TkTodoBang -> true _ -> false }
@@ -2078,16 +2121,45 @@ fn parse_call_args_loop(p: Parser, acc: [Expr]) : PArgs {
 # primary expressions — placeholders for later implementations
 # ====================================================================
 
+# m12.5: after a numeric literal, peek for an *adjacent* `<` (no
+# whitespace between the literal and the `<`). When found, parse the
+# unit expression and wrap the literal in an ELitUnit. Adjacency is
+# the only disambiguator from a comparison `1 < 2`; the spec explicitly
+# requires no space between the number and `<`.
+fn try_lit_unit_annotation(p: Parser, lit: Expr, lit_tok: Token) : PExpr {
+  let nxt = p_peek(p)
+  let lit_end = lit_tok.start + lit_tok.length
+  if tk_is(nxt.kind, TkLt) and nxt.start == lit_end {
+    let p2 = p_skip_newlines(p_advance(p))
+    let ru = parse_unit_expr(p2)
+    match ru.r {
+      None -> err_e(ru.p)
+      Some(u) -> {
+        let p3 = p_skip_newlines(ru.p)
+        if not p_at(p3, TkGt) {
+          err_e(p_error_here(p3, "expected `>` to close the unit annotation on a literal"))
+        } else {
+          ok_e(p_advance(p3), mk_expr(ELitUnit(lit, u), lit_tok.line, lit_tok.col))
+        }
+      }
+    }
+  } else {
+    ok_e(p, lit)
+  }
+}
+
 fn parse_primary(p: Parser) : PExpr {
   let t = p_peek(p)
   match t.kind {
     TkInt -> {
       let span = tok_source(p.src, t)
-      ok_e(p_advance(p), mk_expr(EInt(decode_int(span)), t.line, t.col))
+      let lit = mk_expr(EInt(decode_int(span)), t.line, t.col)
+      try_lit_unit_annotation(p_advance(p), lit, t)
     }
     TkReal -> {
       let span = tok_source(p.src, t)
-      ok_e(p_advance(p), mk_expr(EReal(decode_real(span)), t.line, t.col))
+      let lit = mk_expr(EReal(decode_real(span)), t.line, t.col)
+      try_lit_unit_annotation(p_advance(p), lit, t)
     }
     TkTrue  -> ok_e(p_advance(p), mk_expr(EBool(true),  t.line, t.col))
     TkFalse -> ok_e(p_advance(p), mk_expr(EBool(false), t.line, t.col))
@@ -3314,6 +3386,23 @@ fn parse_named_type(p: Parser, t: Token) : PTy {
     # Generic type: Name[T1, T2, ...]
     let p2 = p_skip_newlines(p_advance(p1))
     parse_type_args_loop(p2, [], name, t)
+  } else if (name == "Real" or name == "Int") and p_at(p1, TkLt) {
+    # m12.5: dimensioned numeric — `Real<unit-expr>` / `Int<unit-expr>`.
+    # Restricted to the two primitive eligible types per spec §3.
+    let p2 = p_skip_newlines(p_advance(p1))
+    let ru = parse_unit_expr(p2)
+    match ru.r {
+      None -> err_t(ru.p)
+      Some(u) -> {
+        let p3 = p_skip_newlines(ru.p)
+        if not p_at(p3, TkGt) {
+          err_t(p_error_here(p3, "expected `>` to close the unit annotation"))
+        } else {
+          let base = mk_ty(TyName(name, []), t.line, t.col)
+          ok_t(p_advance(p3), mk_ty(TyDim(base, u), t.line, t.col))
+        }
+      }
+    }
   } else {
     ok_t(p1, mk_ty(TyName(name, []), t.line, t.col))
   }
@@ -3420,16 +3509,136 @@ fn parse_decl(p: Parser) : PDecl {
   } else if tk_is(hd.kind, TkImport) {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on an import")) }
     else { parse_import_decl(p_advance(p1), hd) }
+  } else if tk_is(hd.kind, TkUnitKw) {
+    parse_unit_decl(p_advance(p1), is_pub, hd)
   } else {
-    let base = "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, or `import`"
+    let base = "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, `unit`, or `import`"
     let msg = if tk_is(hd.kind, TkIdent) {
       let text = tok_source(p1.src, hd)
-      match closest_name(text, ["fn", "type", "effect", "protocol", "impl", "test", "import", "pub"]) {
+      match closest_name(text, ["fn", "type", "effect", "protocol", "impl", "test", "unit", "import", "pub"]) {
         Some(sug) -> concat_all([base, " (did you mean `", sug, "`?)"])
         None      -> base
       }
     } else { base }
     err_d(p_error(p1, hd, msg))
+  }
+}
+
+# m12.5: parse a unit declaration. Two shapes:
+#   `unit USD`                                    — atomic
+#   `unit Newton = kg * m / sec^2`                — alias
+fn parse_unit_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) {
+    err_d(p_error(p, id, "expected unit name after `unit`"))
+  } else {
+    let name = tok_source(p.src, id)
+    let p1 = p_advance(p)
+    if p_at(p1, TkEq) {
+      let p2 = p_skip_newlines(p_advance(p1))
+      let rb = parse_unit_expr(p2)
+      match rb.r {
+        None -> err_d(rb.p)
+        Some(u) -> ok_d(rb.p, DUnit(is_pub, name, Some(u), t.line, t.col))
+      }
+    } else {
+      ok_d(p1, DUnit(is_pub, name, None, t.line, t.col))
+    }
+  }
+}
+
+# m12.5: unit-expression grammar.
+#   unit_expr := unit_term ( ('*' | '/') unit_term )*
+#   unit_term := unit_factor ('^' integer)?
+#   unit_factor := IDENT | INT('1') | '(' unit_expr ')'
+type PUnit = { p: Parser, r: Option[UnitExprT] }
+
+fn ok_u(p: Parser, u: UnitExprT) : PUnit = PUnit { p: p, r: Some(u) }
+fn err_u(p: Parser) : PUnit = PUnit { p: p, r: None }
+
+fn parse_unit_expr(p: Parser) : PUnit {
+  let r = parse_unit_term(p)
+  match r.r {
+    None -> err_u(r.p)
+    Some(lhs) -> parse_unit_expr_rest(r.p, lhs)
+  }
+}
+
+fn parse_unit_expr_rest(p: Parser, lhs: UnitExprT) : PUnit {
+  if p_at(p, TkStar) {
+    let r = parse_unit_term(p_advance(p))
+    match r.r {
+      None -> err_u(r.p)
+      Some(rhs) -> parse_unit_expr_rest(r.p, UMul(lhs, rhs))
+    }
+  } else if p_at(p, TkSlash) {
+    let r = parse_unit_term(p_advance(p))
+    match r.r {
+      None -> err_u(r.p)
+      Some(rhs) -> parse_unit_expr_rest(r.p, UMul(lhs, UInv(rhs)))
+    }
+  } else {
+    ok_u(p, lhs)
+  }
+}
+
+fn parse_unit_term(p: Parser) : PUnit {
+  let r = parse_unit_factor(p)
+  match r.r {
+    None -> err_u(r.p)
+    Some(base) -> {
+      if p_at(r.p, TkCaret) {
+        let p1 = p_advance(r.p)
+        let rn = parse_unit_signed_int(p1)
+        match rn.r {
+          None -> err_u(rn.p)
+          Some(n) -> ok_u(rn.p, UPow(base, n))
+        }
+      } else {
+        ok_u(r.p, base)
+      }
+    }
+  }
+}
+
+type PUInt = { p: Parser, r: Option[Int] }
+
+fn parse_unit_signed_int(p: Parser) : PUInt {
+  let neg = p_at(p, TkMinus)
+  let p1 = if neg { p_advance(p) } else { p }
+  let t = p_peek(p1)
+  if not tk_is(t.kind, TkInt) {
+    PUInt { p: p_error_here(p1, "expected integer after `^` in unit expression"), r: None }
+  } else {
+    let n = decode_int(tok_source(p1.src, t))
+    let v = if neg { 0 - n } else { n }
+    PUInt { p: p_advance(p1), r: Some(v) }
+  }
+}
+
+fn parse_unit_factor(p: Parser) : PUnit {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkIdent) {
+    ok_u(p_advance(p), USym(tok_source(p.src, t)))
+  } else if tk_is(t.kind, TkInt) {
+    # Per spec §6 `<1>` is the dimensionless unit. Reject other ints.
+    let span = tok_source(p.src, t)
+    if decode_int(span) == 1 { ok_u(p_advance(p), UOne) }
+    else { err_u(p_error(p, t, "only `1` is allowed as a unit literal (use a unit symbol or a parenthesised expression instead)")) }
+  } else if tk_is(t.kind, TkLparen) {
+    let r = parse_unit_expr(p_advance(p))
+    match r.r {
+      None -> err_u(r.p)
+      Some(u) -> {
+        if not p_at(r.p, TkRparen) {
+          err_u(p_error_here(r.p, "expected `)` in unit expression"))
+        } else {
+          ok_u(p_advance(r.p), u)
+        }
+      }
+    }
+  } else {
+    err_u(p_error(p, t, "expected unit symbol, `1`, or parenthesised unit expression"))
   }
 }
 
@@ -3859,15 +4068,42 @@ fn parse_type_params_loop(p: Parser, acc: [String]) : PTParams {
   if not tk_is(t.kind, TkIdent) {
     PTParams { p: p_error(p, t, "expected type parameter name"), r: None }
   } else {
-    let name = tok_source(p.src, t)
+    let raw_name = tok_source(p.src, t)
     let p1 = p_skip_newlines(p_advance(p))
-    if p_at(p1, TkComma) {
-      parse_type_params_loop(p_skip_newlines(p_advance(p1)), [name, ...acc])
-    } else if p_at(p1, TkRbracket) {
-      PTParams { p: p_advance(p1), r: Some(list_reverse([name, ...acc])) }
+    # m12.5: optional `: Unit` (or `: Type`) kind annotation. Stored
+    # by suffixing the param name with "#Unit" for unit-kind params.
+    let kr = parse_optional_kind_annotation(p1)
+    let stored = tp_make(raw_name, kr.kind)
+    let p2 = p_skip_newlines(kr.p)
+    if p_at(p2, TkComma) {
+      parse_type_params_loop(p_skip_newlines(p_advance(p2)), [stored, ...acc])
+    } else if p_at(p2, TkRbracket) {
+      PTParams { p: p_advance(p2), r: Some(list_reverse([stored, ...acc])) }
     } else {
-      PTParams { p: p_error_here(p1, "expected `,` or `]` after type parameter"), r: None }
+      PTParams { p: p_error_here(p2, "expected `,` or `]` after type parameter"), r: None }
     }
+  }
+}
+
+# m12.5: helper — consume an optional `: Type` / `: Unit` kind suffix.
+# Defaults to KType when absent, preserving existing behaviour.
+type PKind = { p: Parser, kind: Kind }
+
+fn parse_optional_kind_annotation(p: Parser) : PKind {
+  if p_at(p, TkColon) {
+    let p1 = p_skip_newlines(p_advance(p))
+    let t = p_peek(p1)
+    if not tk_is(t.kind, TkIdent) {
+      PKind { p: p_error_here(p1, "expected `Type` or `Unit` after `:` in type parameter"), kind: KType }
+    } else {
+      let kw = tok_source(p1.src, t)
+      let p2 = p_advance(p1)
+      if kw == "Unit" { PKind { p: p2, kind: KUnit } }
+      else if kw == "Type" { PKind { p: p2, kind: KType } }
+      else { PKind { p: p_error(p1, t, "type-parameter kind must be `Type` or `Unit`"), kind: KType } }
+    }
+  } else {
+    PKind { p: p, kind: KType }
   }
 }
 
@@ -4280,6 +4516,10 @@ fn dump_expr(e: Expr, depth: Int) : Unit {
       clauses |> each((c) => dump_hclause(c, depth + 1))
       match ret_opt { Some(r) -> dump_hreturn(r, depth + 1) None -> () }
     }
+    ELitUnit(inner, u) -> {
+      emit_line(depth, "lit-unit <#{unit_expr_display(u)}> @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(inner, depth + 1)
+    }
   }
 }
 
@@ -4422,6 +4662,10 @@ fn dump_type(ty: TypeExpr, depth: Int) : Unit {
       dump_type(ret, depth + 1)
       dump_row_expr(row, depth + 1)
     }
+    TyDim(base, u) -> {
+      emit_line(depth, "ty_dim <#{unit_expr_display(u)}> @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      dump_type(base, depth + 1)
+    }
   }
 }
 
@@ -4463,6 +4707,22 @@ fn type_expr_display(t: TypeExpr) : String {
     TyFn(ps, ret, _) -> concat_all([
       "(", join_with(map(ps, type_expr_display), ", "), ") -> ", type_expr_display(ret)
     ])
+    TyDim(base, u) -> concat_all([type_expr_display(base), "<", unit_expr_display(u), ">"])
+  }
+}
+
+# m12.5: render a UnitExprT as user-readable text. The display is *not*
+# the canonical form (which lives as Map[Sym,Int]); it's the tree shape
+# the parser produced, with light cleanup. Use unit_canon_display for
+# canonical output.
+fn unit_expr_display(u: UnitExprT) : String {
+  match u {
+    UOne -> "1"
+    USym(s) -> s
+    UMul(a, b) -> concat_all([unit_expr_display(a), " * ", unit_expr_display(b)])
+    UInv(a) -> concat_all(["1 / ", unit_expr_display(a)])
+    UPow(a, n) -> concat_all([unit_expr_display(a), "^", int_to_string(n)])
+    UVar(n) -> cat2("?u", int_to_string(n))
   }
 }
 
@@ -4531,6 +4791,14 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
       let names_s = join_with(names, ", ")
       emit_line(depth, "#derive(#{names_s}) @#{int_to_string(line)}:#{int_to_string(col)}")
       dump_decl(inner, depth + 1)
+    }
+    DUnit(is_pub, name, alias_opt, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      let body_s = match alias_opt {
+        None -> ""
+        Some(u) -> string_concat(" = ", unit_expr_display(u))
+      }
+      emit_line(depth, "unit #{pub_s}\"#{name}\"#{body_s} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
   }
 }
@@ -4699,7 +4967,9 @@ fn prelude_names() : [String] {
     # in emit_call_expr. They're listed here so the closure-capture
     # analyser does not treat them as free vars to capture inside lambda
     # bodies (which would emit invalid C: `kai___perceus_dup` is undeclared).
-    "__perceus_dup", "__perceus_drop"
+    "__perceus_dup", "__perceus_drop",
+    # m12.5: unit-erasure escape; emitter lowers to identity.
+    "unitless"
   ]
 }
 
@@ -4839,6 +5109,10 @@ fn chk_expr(e: Env, x: Expr) : Env {
         None    -> e2
       }
     }
+    # m12.5: literal carrying a unit annotation. Recurse into the inner
+    # numeric literal; the unit symbols themselves are validated at
+    # type-resolution time, not here.
+    ELitUnit(inner, _) -> chk_expr(e, inner)
   }
 }
 
@@ -4992,6 +5266,7 @@ fn chk_decl(e: Env, d: Decl) : Env {
     DProtocol(_, _, _, _, _) -> e
     DImpl(_, _, _, _, _) -> e
     DDerive(_, _, _, _) -> e
+    DUnit(_, _, _, _, _) -> e               # m12.5: unit declarations introduce no value bindings
   }
 }
 
@@ -5029,6 +5304,7 @@ fn register_one(e: Env, d: Decl) : Env {
     DProtocol(_, _, _, _, _) -> e
     DImpl(_, _, _, _, _) -> e
     DDerive(_, _, _, _) -> e
+    DUnit(_, _, _, _, _) -> e               # m12.5: unit names live in their own namespace, validated at type-resolve time
   }
 }
 
@@ -5522,6 +5798,16 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
             "kai_internal_dup(", emit_expr(src, a, fns, variants, lams), ")"
           ])
           _   -> "kai_unit() /* __perceus_dup: arity mismatch */"
+        }
+      } else if callee == "unitless" {
+        # m12.5: `unitless(x)` is the type-level escape from a
+        # dimensioned to a bare numeric. At runtime it is identity —
+        # units carry no representation, so the lowered call is
+        # exactly the inner expression. No `kai_prelude_unitless`
+        # runtime function is needed.
+        match args_e {
+          [a] -> emit_expr(src, a, fns, variants, lams)
+          _   -> "kai_unit() /* unitless: expected 1 arg */"
         }
       } else if callee == "__perceus_drop" {
         # m5 #4 — AST-level drop, lowered to runtime `kai_decref`
@@ -6169,6 +6455,9 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
       let acc2 = fv_hclauses(clauses, own, globals, acc1)
       match ret_opt { Some(r) -> fv_hreturn(r, own, globals, acc2) None -> acc2 }
     }
+    # m12.5: literal-with-unit captures whatever the inner literal does
+    # (always nothing in practice, since the inner is EInt/EReal).
+    ELitUnit(inner, _) -> fv_expr(inner, own, globals, acc)
   }
 }
 
@@ -6427,6 +6716,9 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
       let s2 = collect_hclauses(clauses, s1)
       match ret_opt { Some(r) -> collect_hreturn(r, s2) None -> s2 }
     }
+    # m12.5: literal-with-unit — the inner literal contributes nothing,
+    # but recurse so future non-literal carriers stay covered.
+    ELitUnit(inner, _) -> collect_expr(inner, st)
   }
 }
 
@@ -6564,6 +6856,7 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
     DProtocol(_, _, _, _, _) -> st
     DImpl(_, _, _, _, _) -> st
     DDerive(_, _, _, _) -> st
+    DUnit(_, _, _, _, _) -> st               # m12.5: no expressions in a unit decl
   }
 }
 
@@ -6988,6 +7281,9 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
     EBang(inner) -> emit_bang(src, inner, fns, variants, lams)
     EHandle(body, eff_name, _eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
       emit_handle(src, body, eff_name, init_opt, alias_opt, clauses, ret_opt, x.line, x.col, fns, variants, lams)
+    # m12.5: codegen erasure — `1.0<USD>` emits the same C as `1.0`.
+    # Units are typer-only; the generated value carries no unit tag.
+    ELitUnit(inner, _) -> emit_expr(src, inner, fns, variants, lams)
   }
 }
 
@@ -8579,6 +8875,7 @@ fn body_escapes(name: String, e: Expr) : Bool {
     ERecordLit(_, fields) -> fields_escape(name, fields)
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> body_escapes(name, body) or opt_escapes(name, init_opt) or clauses_escape(name, clauses) or ret_opt_escapes(name, ret_opt)
     EBang(inner) -> body_escapes(name, inner)
+    ELitUnit(inner, _) -> body_escapes(name, inner)
   }
 }
 
@@ -9076,6 +9373,10 @@ type Ty
   | TyCon(String, [Ty])                 # user-defined type constructor application
   | TyVarT(Int)                         # unification variable
   | TyAny                               # placeholder for "not yet resolved"
+  # m12.5: resolved dimensioned type. Inner Ty is always TyInt / TyReal
+  # (or a TyVarT that the unifier later pins to one of them); the
+  # unit lives in canonicalised form once the unifier touches it.
+  | TyDimT(Ty, UnitExprT)
 
 # Effect row, per docs/effects-impl.md §*Types: row slot on TyFnT*.
 # The slot is reserved here in m7a #1; row unification (m7a #2) and
@@ -9116,6 +9417,10 @@ fn resolve_ty(t: TypeExpr) : Ty {
     }
     TyList(inner) -> TyListT(resolve_ty(inner))
     TyFn(fps, fret, rexpr) -> TyFnT(resolve_ty_list(fps), resolve_ty(fret), row_of_expr(rexpr))
+    # m12.5: dimensioned base type. The unit goes through unit_canon
+    # (with empty alias and tparam contexts here) so two textually
+    # different but algebraically equal forms compare equal under unify.
+    TyDim(base, u) -> TyDimT(resolve_ty(base), unit_canon(u))
   }
 }
 
@@ -9665,8 +9970,17 @@ fn ty_to_string(t: Ty) : String {
     }
     TyVarT(n) -> cat2("?t", int_to_string(n))
     TyAny -> "?"
+    # m12.5: render dimensioned base types as `Real<u>` / `Int<u>`.
+    # The unit goes through unit_canon so the printed form matches
+    # what the unifier compares against — same shape on every side.
+    TyDimT(base, u) -> concat_all([ty_to_string(base), "<", unit_canon_display(u), ">"])
   }
 }
+
+# m12.5: render a UnitExprT in canonical form for diagnostics. Sorts
+# symbols alphabetically and groups powers, so `kg * m` and `m * kg`
+# render identically.
+fn unit_canon_display(u: UnitExprT) : String = unit_expr_display(unit_canon(u))
 
 # m4c #2 — name-mangling helpers for monomorphisation.
 #
@@ -9711,6 +10025,12 @@ fn mangle_ty(t: Ty) : String {
     }
     TyVarT(_) -> "TVAR"
     TyAny     -> "Any"
+    # m12.5: units are erased at codegen time. The mangled name for a
+    # dimensioned type is the same as its base type's mangle — so a
+    # call like `f(1.0<USD>)` and a call `f(1.0)` mangle into the same
+    # specialisation. This is the codegen-erasure invariant manifest
+    # at the mangler level.
+    TyDimT(base, _) -> mangle_ty(base)
   }
 }
 
@@ -9783,6 +10103,14 @@ fn dump_decl_type(d: Decl) : Unit {
     DImpl(pname, _, _, line, col) ->
       print("impl #{pname} @#{int_to_string(line)}:#{int_to_string(col)}")
     DDerive(_, inner, _, _) -> dump_decl_type(inner)
+    DUnit(is_pub, name, alias_opt, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      let body_s = match alias_opt {
+        None -> ""
+        Some(u) -> string_concat(" = ", unit_canon_display(u))
+      }
+      print("#{pub_s}unit #{name}#{body_s} @#{int_to_string(line)}:#{int_to_string(col)}")
+    }
   }
 }
 
@@ -9808,7 +10136,11 @@ fn dump_types(decls: [Decl]) : Unit {
 # fresh-variable counter used later. Lookups are linear — fine at this
 # stage (a few dozen entries).
 
-type TyScheme = Scheme([Int], [Int], Ty)
+type TyScheme = Scheme([Int], [Int], [Int], Ty)
+# m12.5: third parameter `bound_uvars` lists unit-var ids quantified
+# by the scheme. Instantiation allocates a fresh UVar per bound id
+# (parallel to bound_vars / bound_rvars). Empty for non-unit-poly
+# schemes — preserves prior behaviour.
 
 type TyEntry = { name: String, scheme: TyScheme }
 
@@ -9854,11 +10186,16 @@ fn uppercase_names_loop(es: [TyEntry], acc: [String]) : [String] {
 
 # ---- small constructors ----
 
-fn mono(ty: Ty) : TyScheme = Scheme([], [], ty)
+fn mono(ty: Ty) : TyScheme = Scheme([], [], [], ty)
 
-fn scheme(vars: [Int], ty: Ty) : TyScheme = Scheme(vars, [], ty)
+fn scheme(vars: [Int], ty: Ty) : TyScheme = Scheme(vars, [], [], ty)
 
-fn scheme_full(vars: [Int], rvars: [Int], ty: Ty) : TyScheme = Scheme(vars, rvars, ty)
+fn scheme_full(vars: [Int], rvars: [Int], ty: Ty) : TyScheme = Scheme(vars, rvars, [], ty)
+
+# m12.5: scheme generalising over type-, row-, and unit-vars all at once.
+# Used by fn_scheme_of_decl when the signature has [u: Unit] tparams.
+fn scheme_uvars(vars: [Int], rvars: [Int], uvars: [Int], ty: Ty) : TyScheme =
+  Scheme(vars, rvars, uvars, ty)
 
 fn tv(n: Int) : Ty = TyVarT(n)
 
@@ -9930,7 +10267,13 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "mailbox_alloc_bounded", scheme: scheme([0], fn_ty([TyInt, TyInt],                            TyCon("Pid", [tv(0)]))) },
     TyEntry { name: "mailbox_send",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)]), tv(0)],           TyUnit)) },
     TyEntry { name: "mailbox_recv",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)])],                  tv(0))) },
-    TyEntry { name: "mailbox_free",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)])],                  TyUnit)) }
+    TyEntry { name: "mailbox_free",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)])],                  TyUnit)) },
+    # m12.5: `unitless[u: Unit](x: Real<u>) : Real` — drop a unit
+    # annotation. The only sanctioned escape from the unit world to
+    # bare numerics, per docs/units-of-measure.md §7.
+    TyEntry { name: "unitless",
+              scheme: scheme_uvars([], [], [0],
+                fn_ty([TyDimT(TyReal, UVar(0))], TyReal)) }
   ]
   TyEnv { entries: list_append(es, env.entries), fresh: env.fresh }
 }
@@ -9969,6 +10312,28 @@ fn tparam_ids(tparams: [String]) : [Int] = tparam_ids_loop(tparams, 0, [])
 # nested set of tparams (op-level on top of effect-level) gets a
 # disjoint id range.
 fn tparam_ids_from(tparams: [String], start: Int) : [Int] = tparam_ids_loop(tparams, start, [])
+
+# m12.5: split the tparam list into separate type-var and unit-var ID
+# lists. Mirrors the kind-aware allocation in mk_tpbinds — bound_vars
+# (type pool) get IDs 0..nT-1; bound_uvars (unit pool) get IDs 0..nU-1.
+type TParamSplit = { tvars: [Int], uvars: [Int] }
+
+fn tparam_id_split(tparams: [String]) : TParamSplit =
+  tparam_id_split_loop(tparams, 0, 0, [], [])
+
+fn tparam_id_split_loop(tparams: [String], ti: Int, ui: Int,
+                        tacc: [Int], uacc: [Int]) : TParamSplit {
+  match tparams {
+    [] -> TParamSplit { tvars: list_reverse(tacc), uvars: list_reverse(uacc) }
+    [n, ...rest] -> {
+      if tp_kind_is_unit(n) {
+        tparam_id_split_loop(rest, ti, ui + 1, tacc, [ui, ...uacc])
+      } else {
+        tparam_id_split_loop(rest, ti + 1, ui, [ti, ...tacc], uacc)
+      }
+    }
+  }
+}
 
 # Resolve a TypeExpr under a mapping from tparam name to its TyVarT id.
 # The mapping is itself an association list for now.
@@ -10010,6 +10375,10 @@ fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
     TyList(inner) -> list_ty(resolve_ty_with_tparams(inner, binds))
     TyFn(ps, ret, _) -> fn_ty(map(ps, (p) => resolve_ty_with_tparams(p, binds)),
                            resolve_ty_with_tparams(ret, binds))
+    # m12.5: dimensioned types in this lighter resolver — without unit
+    # tparam bindings — leave UVar references as USym holdovers. Real
+    # generic-unit resolution lives in resolve_ty_with_binds below.
+    TyDim(base, u) -> dim_collapse(resolve_ty_with_tparams(base, binds), unit_canon(u))
   }
 }
 
@@ -10017,19 +10386,29 @@ fn resolve_tas_with(tas: [TypeExpr], binds: [TPBind]) : [Ty] =
   map(tas, (t) => resolve_ty_with_tparams(t, binds))
 
 # Build the TPBind list for a decl's generic type parameters.
-fn mk_tpbinds_loop(tparams: [String], i: Int, acc: [TPBind]) : [TPBind] {
+# m12.5: type-kind and unit-kind params allocate IDs from *separate*
+# pools (type-var pool for KType, unit-var pool for KUnit). Without
+# this split a `[u: Unit, T]` decl would conflate type-var 1 with
+# unit-var 1 across instantiation passes.
+fn mk_tpbinds_loop(tparams: [String], ti: Int, ui: Int, acc: [TPBind]) : [TPBind] {
   match tparams {
     [] -> list_reverse(acc)
-    [n, ...rest] -> mk_tpbinds_loop(rest, i + 1, [TPB(n, i), ...acc])
+    [n, ...rest] -> {
+      if tp_kind_is_unit(n) {
+        mk_tpbinds_loop(rest, ti, ui + 1, [TPB(n, ui), ...acc])
+      } else {
+        mk_tpbinds_loop(rest, ti + 1, ui, [TPB(n, ti), ...acc])
+      }
+    }
   }
 }
 
-fn mk_tpbinds(tparams: [String]) : [TPBind] = mk_tpbinds_loop(tparams, 0, [])
+fn mk_tpbinds(tparams: [String]) : [TPBind] = mk_tpbinds_loop(tparams, 0, 0, [])
 
 # m7b #2: same as mk_tpbinds but starts ids at `start`. Used to
 # combine effect-level and op-level tparams into a single binding
 # context with disjoint ids.
-fn mk_tpbinds_from(tparams: [String], start: Int) : [TPBind] = mk_tpbinds_loop(tparams, start, [])
+fn mk_tpbinds_from(tparams: [String], start: Int) : [TPBind] = mk_tpbinds_loop(tparams, start, 0, [])
 
 fn append_tpbinds(a: [TPBind], b: [TPBind]) : [TPBind] {
   match a {
@@ -10131,6 +10510,9 @@ fn collect_rvars_in_typeexpr(t: TypeExpr, acc: [String]) : [String] {
       let acc2 = collect_rvars_in_typeexpr(ret, acc1)
       collect_rvars_in_row(rexpr, acc2)
     }
+    # m12.5: dimensioned base — recurse into the inner ty; the unit
+    # itself never carries row variables.
+    TyDim(base, _) -> collect_rvars_in_typeexpr(base, acc)
   }
 }
 
@@ -10188,7 +10570,78 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty 
       TyFnT(map(fps, (p) => resolve_ty_with_binds(p, tpbinds, rbinds)),
             resolve_ty_with_binds(fret, tpbinds, rbinds),
             row_of_expr_with_binds(rexpr, tpbinds, rbinds))
+    # m12.5: dimensioned base — resolve the inner Ty against tpbinds,
+    # then walk the unit and rewrite any symbol that names a unit
+    # tparam (`[u: Unit]` → name "u#Unit") to UVar(id).
+    TyDim(base, u) ->
+      dim_collapse(resolve_ty_with_binds(base, tpbinds, rbinds),
+                   unit_canon(unit_resolve_tparams(u, tpbinds)))
   }
+}
+
+# m12.5: walk a UnitExprT and replace USym("u") with UVar(id) when "u"
+# matches a unit-kind tparam. Type-kind tparams are left alone — they
+# would be a category error in unit position; we surface that as a
+# unification failure later if necessary, not as a parser/resolve error.
+fn unit_resolve_tparams(u: UnitExprT, tpbinds: [TPBind]) : UnitExprT {
+  match u {
+    UOne -> u
+    UVar(_) -> u
+    USym(s) -> match unit_tparam_lookup(tpbinds, s) {
+      Some(id) -> UVar(id)
+      None     -> u
+    }
+    UMul(a, b) -> UMul(unit_resolve_tparams(a, tpbinds), unit_resolve_tparams(b, tpbinds))
+    UInv(a) -> UInv(unit_resolve_tparams(a, tpbinds))
+    UPow(a, n) -> UPow(unit_resolve_tparams(a, tpbinds), n)
+  }
+}
+
+# Look up a unit-kind tparam by its surface name. The tparam list
+# stores names with the "#Unit" suffix for unit-kind params; the
+# resolver compares the bare surface name against the suffix-stripped
+# stored name.
+fn unit_tparam_lookup(binds: [TPBind], surface: String) : Option[Int] {
+  match binds {
+    [] -> None
+    [b, ...rest] -> match b {
+      TPB(stored, id) -> {
+        if tp_kind_is_unit(stored) and tp_strip_kind(stored) == surface { Some(id) }
+        else { unit_tparam_lookup(rest, surface) }
+      }
+    }
+  }
+}
+
+# m12.5: tparam-name suffix encoding helpers. KType params keep the
+# user's surface name; KUnit params get "#Unit" appended. The "#"
+# character can never appear in a kaikai identifier (lexer only
+# accepts alnum + '_'), so the encoding is collision-free.
+fn tp_unit_suffix() : String = "#Unit"
+
+fn tp_make(name: String, k: Kind) : String {
+  match k {
+    KType -> name
+    KUnit -> string_concat(name, tp_unit_suffix())
+  }
+}
+
+fn tp_kind_is_unit(stored: String) : Bool = string_ends_with(stored, tp_unit_suffix())
+
+fn tp_kind_of(stored: String) : Kind =
+  if tp_kind_is_unit(stored) { KUnit } else { KType }
+
+fn tp_strip_kind(stored: String) : String {
+  if tp_kind_is_unit(stored) {
+    string_slice(stored, 0, string_length(stored) - string_length(tp_unit_suffix()))
+  } else { stored }
+}
+
+fn string_ends_with(s: String, suffix: String) : Bool {
+  let sl = string_length(s)
+  let xl = string_length(suffix)
+  if xl > sl { false }
+  else { string_slice(s, sl - xl, xl) == suffix }
 }
 
 # Pre-#13 callers that only carry rbinds (no fn-level tparams).
@@ -10268,7 +10721,10 @@ fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
         None      -> TyUnit
       }
       let body = TyFnT(pts, ret, row_of_expr_with_binds(rexpr, tpbinds, rbinds))
-      Some(scheme_full(tparam_ids(effective_tparams), rvbind_ids(rbinds), body))
+      # m12.5: split tparam IDs by kind so unit-vars live in their own
+      # pool and get fresh-instantiated by st_instantiate_report.
+      let split = tparam_id_split(effective_tparams)
+      Some(scheme_uvars(split.tvars, rvbind_ids(rbinds), split.uvars, body))
     }
     _ -> None
   }
@@ -10320,6 +10776,10 @@ fn collect_implicit_in_typeexpr(t: TypeExpr, declared: [String], acc: [String]) 
       let acc2 = collect_implicit_in_typeexpr(ret, declared, acc1)
       collect_implicit_in_row(rexpr, declared, acc2)
     }
+    # m12.5: implicit-tparam collection for dimensioned types — recurse
+    # into the base ty; unit-vars are NOT implicitly generalised, the
+    # user must declare them via `[u: Unit]`.
+    TyDim(base, _) -> collect_implicit_in_typeexpr(base, declared, acc)
   }
 }
 
@@ -10472,10 +10932,11 @@ fn build_ty_env(decls: [Decl]) : BuiltEnv {
 
 fn scheme_to_string(sc: TyScheme) : String {
   match sc {
-    Scheme(vars, rvars, ty) -> {
+    Scheme(vars, rvars, uvars, ty) -> {
       let tv_part = map(vars, (n) => cat2("?t", int_to_string(n)))
       let rv_part = map(rvars, (n) => cat2("?r", int_to_string(n)))
-      let all = list_append(tv_part, rv_part)
+      let uv_part = map(uvars, (n) => cat2("?u", int_to_string(n)))
+      let all = list_append(tv_part, list_append(rv_part, uv_part))
       match all {
         [] -> ty_to_string(ty)
         _  -> concat_all(["forall ", join_with(all, " "), ". ", ty_to_string(ty)])
@@ -10536,13 +10997,20 @@ fn dump_env(env: TyEnv) : Unit =
 type Subst = {
   slots:     Array[Option[Ty]],
   row_slots: Array[Option[Row]],
-  row_fresh: Int
+  row_fresh: Int,
+  # m12.5: parallel slot table for unit unification variables (UVar).
+  # Same opaque-mutable Array discipline as `slots`; never publish
+  # outside the inferencer.
+  unit_slots: Array[Option[UnitExprT]],
+  unit_fresh: Int
 }
 
 fn subst_empty() : Subst = Subst {
   slots:     array_make(64, None),
   row_slots: array_make(16, None),
-  row_fresh: 0
+  row_fresh: 0,
+  unit_slots: array_make(16, None),
+  unit_fresh: 0
 }
 
 fn subst_lookup(s: Subst, v: Int) : Option[Ty] {
@@ -10557,7 +11025,8 @@ fn subst_extend(s: Subst, v: Int, ty: Ty) : Subst {
     array_grow(s.slots, grown, None)
   } else { s.slots }
   let slots2 = array_set(slots1, v, Some(ty))
-  Subst { slots: slots2, row_slots: s.row_slots, row_fresh: s.row_fresh }
+  Subst { slots: slots2, row_slots: s.row_slots, row_fresh: s.row_fresh,
+          unit_slots: s.unit_slots, unit_fresh: s.unit_fresh }
 }
 
 # Row-var substitution (parallel to subst_lookup / subst_extend, but
@@ -10576,7 +11045,8 @@ fn subst_row_extend(s: Subst, v: Int, r: Row) : Subst {
     array_grow(s.row_slots, grown, None)
   } else { s.row_slots }
   let rs2 = array_set(rs1, v, Some(r))
-  Subst { slots: s.slots, row_slots: rs2, row_fresh: s.row_fresh }
+  Subst { slots: s.slots, row_slots: rs2, row_fresh: s.row_fresh,
+          unit_slots: s.unit_slots, unit_fresh: s.unit_fresh }
 }
 
 # Allocate a fresh row variable id and bump the counter. Returned in
@@ -10585,8 +11055,421 @@ type FreshRow = { id: Int, subst: Subst }
 
 fn subst_fresh_row(s: Subst) : FreshRow {
   let id = s.row_fresh
-  let s1 = Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: id + 1 }
+  let s1 = Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: id + 1,
+                   unit_slots: s.unit_slots, unit_fresh: s.unit_fresh }
   FreshRow { id: id, subst: s1 }
+}
+
+# m12.5: unit-var substitution. UVar(n) into the parallel `unit_slots`
+# array. Same growth/lookup discipline as the type-var slots.
+fn subst_unit_lookup(s: Subst, v: Int) : Option[UnitExprT] {
+  if v >= array_length(s.unit_slots) { None }
+  else { array_get(s.unit_slots, v) }
+}
+
+fn subst_unit_extend(s: Subst, v: Int, u: UnitExprT) : Subst {
+  let len = array_length(s.unit_slots)
+  let us1 = if v >= len {
+    let grown = if v + 1 > len * 2 { v + 1 } else { len * 2 }
+    array_grow(s.unit_slots, grown, None)
+  } else { s.unit_slots }
+  let us2 = array_set(us1, v, Some(u))
+  Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
+          unit_slots: us2, unit_fresh: s.unit_fresh }
+}
+
+type FreshUnit = { id: Int, subst: Subst }
+
+fn subst_fresh_unit(s: Subst) : FreshUnit {
+  let id = s.unit_fresh
+  let s1 = Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
+                   unit_slots: s.unit_slots, unit_fresh: id + 1 }
+  FreshUnit { id: id, subst: s1 }
+}
+
+# ====================================================================
+# m12.5 — unit-of-measure operations
+# ====================================================================
+#
+# Three layers of operations on UnitExprT:
+#   1. unit_to_table / unit_from_table — convert between the AST tree
+#      shape and a canonical (sym, exponent) / (uvar, exponent) table.
+#   2. unit_canon — normal form: alphabetically-sorted symbols, grouped
+#      exponents, no factor-of-1 noise.
+#   3. unify_unit — abelian-group unification (Stuckey/Kennedy): solve
+#      `u1 = u2` by reducing `u1 * u2^-1 = 1` to a substitution.
+#
+# Aliases (`unit Newton = kg * m / sec^2`) are expanded by the *resolver*
+# before they reach unification; canonicalisation never sees them.
+
+# Sym and unit-var entries of the canonical table. Both use a sorted
+# (key, exponent) representation; zero exponents are dropped.
+type USymEntry = USE(String, Int)
+type UVarEntry = UVE(Int, Int)
+
+type UTable = { syms: [USymEntry], vars: [UVarEntry] }
+
+fn utable_empty() : UTable = UTable { syms: [], vars: [] }
+
+# True iff the table represents the dimensionless unit "1".
+fn utable_is_one(t: UTable) : Bool {
+  match t.syms { [] -> match t.vars { [] -> true _ -> false } _ -> false }
+}
+
+# Insert a `(sym, exp)` contribution; merges with an existing entry by
+# adding exponents; drops entries that reach 0; keeps the list sorted
+# alphabetically.
+fn usym_insert(xs: [USymEntry], k: String, n: Int) : [USymEntry] {
+  match xs {
+    [] -> if n == 0 { [] } else { [USE(k, n)] }
+    [h, ...rest] -> match h {
+      USE(hk, hn) ->
+        if hk == k {
+          let m = hn + n
+          if m == 0 { rest } else { [USE(hk, m), ...rest] }
+        } else if string_lt(k, hk) {
+          if n == 0 { [h, ...rest] } else { [USE(k, n), h, ...rest] }
+        } else {
+          [h, ...usym_insert(rest, k, n)]
+        }
+    }
+  }
+}
+
+fn uvar_insert(xs: [UVarEntry], k: Int, n: Int) : [UVarEntry] {
+  match xs {
+    [] -> if n == 0 { [] } else { [UVE(k, n)] }
+    [h, ...rest] -> match h {
+      UVE(hk, hn) ->
+        if hk == k {
+          let m = hn + n
+          if m == 0 { rest } else { [UVE(hk, m), ...rest] }
+        } else if k < hk {
+          if n == 0 { [h, ...rest] } else { [UVE(k, n), h, ...rest] }
+        } else {
+          [h, ...uvar_insert(rest, k, n)]
+        }
+    }
+  }
+}
+
+# Lexicographic less-than for ASCII strings. The lexer guarantees
+# unit symbols are plain identifiers, so this is a complete order.
+fn string_lt(a: String, b: String) : Bool = string_lt_loop(a, b, 0)
+
+fn string_lt_loop(a: String, b: String, i: Int) : Bool {
+  let alen = string_length(a)
+  let blen = string_length(b)
+  if i >= alen { i < blen }
+  else if i >= blen { false }
+  else {
+    match char_at(a, i) {
+      Some(ca) -> match char_at(b, i) {
+        Some(cb) ->
+          if ca == cb { string_lt_loop(a, b, i + 1) }
+          else { char_to_int(ca) < char_to_int(cb) }
+        None -> false
+      }
+      None -> false
+    }
+  }
+}
+
+# Walk a UnitExprT, accumulating contributions into the table. The
+# `mul` parameter scales every leaf's exponent; flips sign for UInv
+# and multiplies by n for UPow.
+fn unit_to_table_at(u: UnitExprT, scale: Int, t: UTable) : UTable {
+  match u {
+    UOne -> t
+    USym(s) -> UTable { syms: usym_insert(t.syms, s, scale), vars: t.vars }
+    UVar(v) -> UTable { syms: t.syms, vars: uvar_insert(t.vars, v, scale) }
+    UMul(a, b) -> unit_to_table_at(b, scale, unit_to_table_at(a, scale, t))
+    UInv(a) -> unit_to_table_at(a, 0 - scale, t)
+    UPow(a, n) -> unit_to_table_at(a, scale * n, t)
+  }
+}
+
+fn unit_to_table(u: UnitExprT) : UTable = unit_to_table_at(u, 1, utable_empty())
+
+# m12.5: parallel walker that *also* chases UVar bindings through the
+# substitution. `seen` keeps the recursion linear by short-circuiting
+# any cycle (occurs check is the real guard; this is just defence).
+fn unit_resolve_to_at(u: UnitExprT, scale: Int, t: UTable, s: Subst, seen: [Int]) : UTable {
+  match u {
+    UOne -> t
+    USym(sm) -> UTable { syms: usym_insert(t.syms, sm, scale), vars: t.vars }
+    UVar(v) -> {
+      if list_has_int(seen, v) {
+        UTable { syms: t.syms, vars: uvar_insert(t.vars, v, scale) }
+      } else {
+        match subst_unit_lookup(s, v) {
+          Some(u_sub) -> unit_resolve_to_at(u_sub, scale, t, s, [v, ...seen])
+          None -> UTable { syms: t.syms, vars: uvar_insert(t.vars, v, scale) }
+        }
+      }
+    }
+    UMul(a, b) -> unit_resolve_to_at(b, scale, unit_resolve_to_at(a, scale, t, s, seen), s, seen)
+    UInv(a) -> unit_resolve_to_at(a, 0 - scale, t, s, seen)
+    UPow(a, n) -> unit_resolve_to_at(a, scale * n, t, s, seen)
+  }
+}
+
+# Rebuild a UnitExprT from a canonical table. The table is already
+# sorted, so we walk left-to-right and chain UMul; positive exponents
+# render as USym/UVar (or UPow when |n|>1), negative as UInv-of-pow.
+fn utable_to_tree(t: UTable) : UnitExprT {
+  let factors_syms = sym_entries_to_factors(t.syms)
+  let factors_vars = var_entries_to_factors(t.vars)
+  let all_factors = list_append(factors_syms, factors_vars)
+  match all_factors {
+    [] -> UOne
+    [h, ...rest] -> tree_chain(h, rest)
+  }
+}
+
+# m12.5: helpers to convert table entries into UnitExprT factors.
+# Standalone (rather than inline lambdas) because stage 1's lambda
+# free-var analysis predates m7b #18 and would over-capture the
+# pattern binders here.
+fn sym_entries_to_factors(xs: [USymEntry]) : [UnitExprT] {
+  match xs {
+    [] -> []
+    [h, ...rest] -> match h {
+      USE(k, n) -> [sym_factor(k, n), ...sym_entries_to_factors(rest)]
+    }
+  }
+}
+
+fn var_entries_to_factors(xs: [UVarEntry]) : [UnitExprT] {
+  match xs {
+    [] -> []
+    [h, ...rest] -> match h {
+      UVE(k, n) -> [var_factor(k, n), ...var_entries_to_factors(rest)]
+    }
+  }
+}
+
+fn sym_factor(k: String, n: Int) : UnitExprT {
+  if n == 1 { USym(k) }
+  else if n == 0 - 1 { UInv(USym(k)) }
+  else if n > 0 { UPow(USym(k), n) }
+  else { UInv(UPow(USym(k), 0 - n)) }
+}
+
+fn var_factor(k: Int, n: Int) : UnitExprT {
+  if n == 1 { UVar(k) }
+  else if n == 0 - 1 { UInv(UVar(k)) }
+  else if n > 0 { UPow(UVar(k), n) }
+  else { UInv(UPow(UVar(k), 0 - n)) }
+}
+
+fn tree_chain(acc: UnitExprT, rest: [UnitExprT]) : UnitExprT {
+  match rest {
+    [] -> acc
+    [h, ...tl] -> tree_chain(UMul(acc, h), tl)
+  }
+}
+
+# Public canonicaliser. Aliases are *not* expanded here; that's the
+# resolver's job (resolve_ty_with_units below).
+fn unit_canon(u: UnitExprT) : UnitExprT = utable_to_tree(unit_to_table(u))
+
+fn unit_is_one(u: UnitExprT) : Bool = utable_is_one(unit_to_table(u))
+
+# Apply the unit substitution to a UnitExprT: each UVar(n) is chased
+# through unit_slots to its current binding (if any), and the resolved
+# tree is canonicalised. This is the unit-side analogue of apply_ty
+# and must be called before any structural decision about a unit.
+fn apply_unit(s: Subst, u: UnitExprT) : UnitExprT {
+  let tab = unit_to_table_resolved(u, s)
+  utable_to_tree(tab)
+}
+
+# Walk the unit, chasing UVar bindings through `s.unit_slots`. The
+# Bool guard prevents cycles by remembering which uvars we've already
+# expanded on the current path; a cycle indicates a bug elsewhere
+# (occurs check should have caught it) and we treat it as identity.
+fn unit_to_table_resolved(u: UnitExprT, s: Subst) : UTable =
+  unit_resolve_to_at(u, 1, utable_empty(), s, [])
+
+# Subtract `b` from `a` (i.e. compute `a / b` as exponent vector). The
+# result is `a * b^-1` in canonical form.
+fn utable_diff(a: UTable, b: UTable) : UTable {
+  let s1 = utable_diff_syms(a.syms, b.syms)
+  let v1 = utable_diff_vars(a.vars, b.vars)
+  UTable { syms: s1, vars: v1 }
+}
+
+fn utable_diff_syms(a: [USymEntry], b: [USymEntry]) : [USymEntry] {
+  match b {
+    [] -> a
+    [h, ...rest] -> match h {
+      USE(k, n) -> utable_diff_syms(usym_insert(a, k, 0 - n), rest)
+    }
+  }
+}
+
+fn utable_diff_vars(a: [UVarEntry], b: [UVarEntry]) : [UVarEntry] {
+  match b {
+    [] -> a
+    [h, ...rest] -> match h {
+      UVE(k, n) -> utable_diff_vars(uvar_insert(a, k, 0 - n), rest)
+    }
+  }
+}
+
+# Pick the unit-var with the smallest |exponent| in the table; returns
+# (index_in_vars, var_id, exponent). None if `vars` is empty.
+type UPickVar = { id: Int, exp: Int }
+
+fn utable_pick_min_var(t: UTable) : Option[UPickVar] {
+  match t.vars {
+    [] -> None
+    [h, ...rest] -> match h {
+      UVE(id, e) -> Some(utable_pick_min_var_pick(rest, UPickVar { id: id, exp: e }))
+    }
+  }
+}
+
+fn utable_pick_min_var_pick(rest: [UVarEntry], best: UPickVar) : UPickVar {
+  match rest {
+    [] -> best
+    [h, ...tl] -> match h {
+      UVE(id, e) -> {
+        let abs_e = abs_int(e)
+        let abs_b = abs_int(best.exp)
+        if abs_e < abs_b { utable_pick_min_var_pick(tl, UPickVar { id: id, exp: e }) }
+        else { utable_pick_min_var_pick(tl, best) }
+      }
+    }
+  }
+}
+
+# Remove a single (var, exp) entry by its id from the table, returning
+# the table without that var.
+fn utable_drop_var(t: UTable, target: Int) : UTable {
+  UTable { syms: t.syms, vars: utable_drop_var_loop(t.vars, target) }
+}
+
+fn utable_drop_var_loop(xs: [UVarEntry], target: Int) : [UVarEntry] {
+  match xs {
+    [] -> []
+    [h, ...rest] -> match h {
+      UVE(k, _) -> if k == target { rest } else { [h, ...utable_drop_var_loop(rest, target)] }
+    }
+  }
+}
+
+# True iff every entry's exponent is a multiple of `k`. Used by the
+# unit unifier to decide whether the chosen pivot var divides cleanly.
+fn utable_all_divisible(t: UTable, k: Int) : Bool =
+  syms_divisible(t.syms, k) and vars_divisible(t.vars, k)
+
+fn syms_divisible(xs: [USymEntry], k: Int) : Bool {
+  match xs {
+    [] -> true
+    [h, ...rest] -> match h {
+      USE(_, n) -> if (n - (n / k) * k) == 0 { syms_divisible(rest, k) } else { false }
+    }
+  }
+}
+
+fn vars_divisible(xs: [UVarEntry], k: Int) : Bool {
+  match xs {
+    [] -> true
+    [h, ...rest] -> match h {
+      UVE(_, n) -> if (n - (n / k) * k) == 0 { vars_divisible(rest, k) } else { false }
+    }
+  }
+}
+
+# Negate every exponent and divide by k (caller guarantees k | every
+# entry). Used to construct the substitution `var := -(rest)/k`.
+fn utable_negdiv(t: UTable, k: Int) : UTable {
+  UTable {
+    syms: usym_negdiv(t.syms, k),
+    vars: uvar_negdiv(t.vars, k)
+  }
+}
+
+fn usym_negdiv(xs: [USymEntry], k: Int) : [USymEntry] {
+  match xs {
+    [] -> []
+    [h, ...rest] -> match h {
+      USE(s, n) -> [USE(s, (0 - n) / k), ...usym_negdiv(rest, k)]
+    }
+  }
+}
+
+fn uvar_negdiv(xs: [UVarEntry], k: Int) : [UVarEntry] {
+  match xs {
+    [] -> []
+    [h, ...rest] -> match h {
+      UVE(v, n) -> [UVE(v, (0 - n) / k), ...uvar_negdiv(rest, k)]
+    }
+  }
+}
+
+# Occurs check: does unit-var `v` appear (after substitution chase) in
+# `u`? Refuses self-binding to keep apply_unit terminating.
+fn occurs_unit(v: Int, u: UnitExprT, s: Subst) : Bool {
+  let tab = unit_to_table_resolved(u, s)
+  occurs_unit_in_vars(v, tab.vars)
+}
+
+fn occurs_unit_in_vars(v: Int, xs: [UVarEntry]) : Bool {
+  match xs {
+    [] -> false
+    [h, ...rest] -> match h {
+      UVE(k, _) -> if k == v { true } else { occurs_unit_in_vars(v, rest) }
+    }
+  }
+}
+
+# Unify two unit expressions under `s`. The classic equational view:
+# `u1 ≡ u2` iff `u1 * u2^-1 ≡ 1`. We solve the homogeneous form by
+# repeatedly picking the unit-var with the smallest |exponent| and
+# isolating it. Polynomial in the size of the input — Kennedy 1996.
+#
+# Stop guard: this function only ever recurses through utable bookkeeping
+# and a single substitution + retry. If the lane ever needs to introduce
+# a real Smith-normal-form pass, that is a sign the design is being
+# pushed past the docs/units-of-measure.md "polynomial" promise — call
+# it out before extending.
+fn unify_unit(u1: UnitExprT, u2: UnitExprT, s: Subst) : Option[Subst] {
+  let t1 = unit_to_table_resolved(u1, s)
+  let t2 = unit_to_table_resolved(u2, s)
+  let diff = utable_diff(t1, t2)
+  unify_unit_diff(diff, s)
+}
+
+fn unify_unit_diff(t: UTable, s: Subst) : Option[Subst] {
+  if utable_is_one(t) { Some(s) }
+  else {
+    match utable_pick_min_var(t) {
+      None -> None                                 # only syms left, but non-zero — fail
+      Some(pick) -> {
+        let rest = utable_drop_var(t, pick.id)
+        let k = pick.exp
+        if utable_all_divisible(rest, k) {
+          # Bind `pick.id := (-rest) / k`. occurs check guards against
+          # self-cycle (would be unusual since we removed the var).
+          let bound = utable_to_tree(utable_negdiv(rest, k))
+          if occurs_unit(pick.id, bound, s) { None }
+          else { Some(subst_unit_extend(s, pick.id, bound)) }
+        } else {
+          # Pivot does not cleanly divide the remainder. The classical
+          # Kennedy/Stuckey fix introduces a fresh unit-var w and
+          # rewrites `pick := w * (low/k)` so the residual equation
+          # uses smaller exponents. The lane fixtures don't exercise
+          # this path (every case the lane ships pivots with |k|=1).
+          # Refuse here so the failure is loud rather than silent —
+          # see docs/units-of-measure.md §Risks "polynomial" guarantee.
+          None
+        }
+      }
+    }
+  }
 }
 
 # Apply the substitution to a type. Recurses structurally; resolves
@@ -10608,6 +11491,23 @@ fn apply_ty(s: Subst, t: Ty) : Ty {
     TyListT(inner) -> TyListT(apply_ty(s, inner))
     TyFnT(params, ret, row) -> TyFnT(apply_tys(s, params), apply_ty(s, ret), apply_row(s, row))
     TyCon(name, atys) -> TyCon(name, apply_tys(s, atys))
+    # m12.5: applying a substitution to a dimensioned type recurses into
+    # both the base type and the unit expression. Unit-vars chase
+    # through unit_slots; everything else passes through unchanged.
+    TyDimT(base, u) -> dim_collapse(apply_ty(s, base), apply_unit(s, u))
+  }
+}
+
+# m12.5: collapse `TyDimT(TyDimT(b, u1), u2)` to `TyDimT(b, u1*u2)` and
+# strip a `TyDimT(_, UOne)` down to its base. Both shapes can arise
+# transiently when chasing unit-vars through nested dimensioned types.
+fn dim_collapse(base: Ty, u: UnitExprT) : Ty {
+  match base {
+    TyDimT(inner, u_inner) -> dim_collapse(inner, unit_canon(UMul(u_inner, u)))
+    _ -> {
+      let uc = unit_canon(u)
+      if unit_is_one(uc) { base } else { TyDimT(base, uc) }
+    }
   }
 }
 
@@ -10820,6 +11720,9 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
     TyListT(inner) -> occurs(v, inner, s)
     TyFnT(params, ret, _) -> occurs_any(v, [ret, ...params], s)
     TyCon(_, atys) -> occurs_any(v, atys, s)
+    # m12.5: TyDimT carries a base Ty to recurse into; the unit side
+    # has its own occurs_unit guard inside unify_unit.
+    TyDimT(base, _) -> occurs(v, base, s)
     _ -> false
   }
 }
@@ -10871,8 +11774,19 @@ fn unify_list(xs: [Ty], ys: [Ty], s: Subst) : Option[Subst] {
 
 fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
   match a {
-    TyInt    -> match b { TyInt    -> Some(s) _ -> None }
-    TyReal   -> match b { TyReal   -> Some(s) _ -> None }
+    # m12.5: bare numerics on the LHS treat the RHS dim case specially
+    # — `Real` ≡ `Real<1>`. Any other unit is a mismatch (`Real` vs
+    # `Real<USD>` is rejected per spec §6).
+    TyInt    -> match b {
+      TyInt    -> Some(s)
+      TyDimT(bb, bu) -> match bb { TyInt -> unify_unit(UOne, bu, s) _ -> None }
+      _ -> None
+    }
+    TyReal   -> match b {
+      TyReal   -> Some(s)
+      TyDimT(bb, bu) -> match bb { TyReal -> unify_unit(UOne, bu, s) _ -> None }
+      _ -> None
+    }
     TyBool   -> match b { TyBool   -> Some(s) _ -> None }
     TyString -> match b { TyString -> Some(s) _ -> None }
     TyChar   -> match b { TyChar   -> Some(s) _ -> None }
@@ -10899,6 +11813,18 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
       _ -> None
     }
     TyVarT(_) -> None                                  # handled in unify
+    # m12.5: TyDimT vs TyDimT — unify base then unit. TyDimT vs bare
+    # primitive uses the `Real ≡ Real<1>` rule above (the bare-side
+    # arms catch this via the dim-aware match arms).
+    TyDimT(ab, au) -> match b {
+      TyDimT(bb, bu) -> match unify(ab, bb, s) {
+        None -> None
+        Some(s1) -> unify_unit(au, bu, s1)
+      }
+      TyInt    -> match ab { TyInt -> unify_unit(au, UOne, s) _ -> None }
+      TyReal   -> match ab { TyReal -> unify_unit(au, UOne, s) _ -> None }
+      _ -> None
+    }
   }
 }
 
@@ -10943,7 +11869,7 @@ fn max_id_loop(vs: [Int], acc: Int) : Int {
 # clamping up to `max(vars) + 1`, fresh vars never alias any bound id.
 fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
   match sc {
-    Scheme(vars, _, body) -> {
+    Scheme(vars, _, _, body) -> {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if env.fresh >= need { env.fresh } else { need }
@@ -10980,8 +11906,33 @@ fn mk_fresh_row_subst(rvars: [Int], s: Subst) : FreshRowSubst {
   let need = if rvars == [] { 0 } else { max_id_loop(rvars, 0) + 1 }
   let s_seed = if s.row_fresh >= need { s }
                else { Subst { slots: s.slots, row_slots: s.row_slots,
-                              row_fresh: need } }
+                              row_fresh: need,
+                              unit_slots: s.unit_slots, unit_fresh: s.unit_fresh } }
   mk_fresh_row_subst_loop(rvars, subst_empty(), s_seed)
+}
+
+# m12.5: parallel to mk_fresh_row_subst — but for unit-vars. Allocates a
+# fresh UVar per bound unit-var id and binds it via subst_unit_extend.
+type FreshUnitSubst = { temp: Subst, sub: Subst }
+
+fn mk_fresh_unit_subst_loop(uvars: [Int], temp: Subst, s: Subst) : FreshUnitSubst {
+  match uvars {
+    [] -> FreshUnitSubst { temp: temp, sub: s }
+    [v, ...rest] -> {
+      let fr = subst_fresh_unit(s)
+      let temp1 = subst_unit_extend(temp, v, UVar(fr.id))
+      mk_fresh_unit_subst_loop(rest, temp1, fr.subst)
+    }
+  }
+}
+
+fn mk_fresh_unit_subst(uvars: [Int], s: Subst) : FreshUnitSubst {
+  let need = if uvars == [] { 0 } else { max_id_loop(uvars, 0) + 1 }
+  let s_seed = if s.unit_fresh >= need { s }
+               else { Subst { slots: s.slots, row_slots: s.row_slots,
+                              row_fresh: s.row_fresh,
+                              unit_slots: s.unit_slots, unit_fresh: need } }
+  mk_fresh_unit_subst_loop(uvars, subst_empty(), s_seed)
 }
 
 # m7b #12: bump the row-var fresh counter past `n` reserved ids so a
@@ -10992,7 +11943,20 @@ fn advance_row_fresh(st: InferState, n: Int) : InferState {
   if n <= 0 { st }
   else {
     let s1 = Subst { slots: st.sub.slots, row_slots: st.sub.row_slots,
-                     row_fresh: st.sub.row_fresh + n }
+                     row_fresh: st.sub.row_fresh + n,
+                     unit_slots: st.sub.unit_slots, unit_fresh: st.sub.unit_fresh }
+    st_set_sub(st, s1)
+  }
+}
+
+# m12.5: parallel to advance_row_fresh, for unit-vars. Used by
+# infer_decl when reserving bound unit-var ids ahead of synth.
+fn advance_unit_fresh(st: InferState, n: Int) : InferState {
+  if n <= 0 { st }
+  else {
+    let s1 = Subst { slots: st.sub.slots, row_slots: st.sub.row_slots,
+                     row_fresh: st.sub.row_fresh,
+                     unit_slots: st.sub.unit_slots, unit_fresh: st.sub.unit_fresh + n }
     st_set_sub(st, s1)
   }
 }
@@ -11502,7 +12466,7 @@ fn st_instantiate(st: InferState, sc: TyScheme) : TyRes {
 
 fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes {
   match sc {
-    Scheme(vars, rvars, _) -> {
+    Scheme(vars, rvars, uvars, _) -> {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if st.env.fresh >= need { st.env.fresh } else { need }
@@ -11514,13 +12478,24 @@ fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes {
       # produced by `instantiate` (which rewrote type vars only) and
       # propagate the bumped row_fresh into the returned state.
       let st_env = st_set_env(st, inst.env)
-      match rvars {
+      let mid = match rvars {
         [] -> TyInstRes { st: st_env, ty: inst.ty, fresh: fresh }
         _  -> {
           let frs = mk_fresh_row_subst(rvars, st_env.sub)
           let body1 = apply_ty(frs.temp, inst.ty)
           let st_out = st_set_sub(st_env, frs.sub)
           TyInstRes { st: st_out, ty: body1, fresh: fresh }
+        }
+      }
+      # m12.5: also fresh-instantiate unit-vars. Same shape as the
+      # row-var step above but threaded through unit_slots.
+      match uvars {
+        [] -> mid
+        _  -> {
+          let fus = mk_fresh_unit_subst(uvars, mid.st.sub)
+          let body2 = apply_ty(fus.temp, mid.ty)
+          let st_out2 = st_set_sub(mid.st, fus.sub)
+          TyInstRes { st: st_out2, ty: body2, fresh: mid.fresh }
         }
       }
     }
@@ -11733,7 +12708,24 @@ fn synth(st: InferState, e: Expr) : Inferred {
     ETodo(msg)                 -> synth_todo(st, msg, e)
     EBang(inner)               -> synth_bang(st, inner, e.line, e.col)
     EHandle(_, _, _, _, _, _, _) -> synth_handle(st, e)
+    # m12.5: numeric literal with a unit annotation. The inner Expr is
+    # always EInt or EReal; the literal's type is `TyDimT(base, u)`
+    # where base is TyInt or TyReal and u is the canonical unit.
+    ELitUnit(inner, u) -> synth_lit_unit(st, inner, u, e.line, e.col)
   }
+}
+
+# m12.5: synth a literal annotated with a unit. Unit aliases were
+# expanded by the resolver before the typer ever sees them; here we
+# only canonicalise (sort/group) and stamp the dimensioned type onto
+# the rebuilt expression node.
+fn synth_lit_unit(st: InferState, inner: Expr, u: UnitExprT, line: Int, col: Int) : Inferred {
+  let ri = synth(st, inner)
+  let base = apply_ty(ri.st.sub, ri.ty)
+  let canon_u = unit_canon(u)
+  let ty = dim_collapse(base, canon_u)
+  let root = with_ty(mk_expr(ELitUnit(ri.expr, canon_u), line, col), ty)
+  mk_inferred(ri.st, ty, root)
 }
 
 # m7a #4d: type-check `handle { body } with Eff [as alias] {
@@ -12628,12 +13620,48 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     let s1 = st_unify(rr.st, rl.ty, TyInt, "integer arithmetic", line, col)
     let s2 = st_unify(s1, rr.ty, TyInt, "integer arithmetic", line, col)
     mk_inferred(s2, TyInt, binop_root(op, rl.expr, rr.expr, line, col, TyInt))
+  } else if op == "*" or op == "/" {
+    # m12.5: multiplication and division of dimensioned values
+    # combine units rather than requiring equality. The operand-type
+    # rule still requires the *base* numeric types to agree (Real*Real
+    # / Int*Int) — we delegate that to synth_dim_mul_div.
+    synth_dim_mul_div(rr.st, op, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
   } else {
+    # `+` / `-` keep the unify-both-sides rule. The dim-aware unifier
+    # checks the unit equality automatically.
     let what = string_concat("arithmetic operator '", string_concat(op, "'"))
     let s1 = st_unify(rr.st, rl.ty, rr.ty, what, line, col)
     let ty = apply_ty(s1.sub, rl.ty)
     mk_inferred(s1, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
   }
+}
+
+# m12.5: type rule for `*` and `/` over (possibly) dimensioned values.
+# Splits each operand into (base_ty, unit_expr) — bare Real → unit
+# `1`, TyDimT(b, u) → (b, u). The base types are unified; the units
+# are combined into the result.
+type DimSplit = { base: Ty, dim: UnitExprT }
+
+fn ty_split_dim(t: Ty, s: Subst) : DimSplit {
+  match apply_ty(s, t) {
+    TyDimT(b, u) -> DimSplit { base: b, dim: u }
+    other -> DimSplit { base: other, dim: UOne }
+  }
+}
+
+fn synth_dim_mul_div(st: InferState, op: String, lt: Ty, le: Expr,
+                     rt: Ty, re: Expr, line: Int, col: Int) : Inferred {
+  let ls = ty_split_dim(lt, st.sub)
+  let rs = ty_split_dim(rt, st.sub)
+  let what = string_concat("arithmetic operator '", string_concat(op, "'"))
+  let s1 = st_unify(st, ls.base, rs.base, what, line, col)
+  let combined = if op == "*" {
+    UMul(ls.dim, rs.dim)
+  } else {
+    UMul(ls.dim, UInv(rs.dim))
+  }
+  let ty = dim_collapse(apply_ty(s1.sub, ls.base), unit_canon(combined))
+  mk_inferred(s1, ty, binop_root(op, le, re, line, col, ty))
 }
 
 # m7d §23 — `++` typer. Two hardcoded rules:
@@ -13226,7 +14254,7 @@ fn arms_cover_variant(arms: [Arm], target: String) : Bool {
 
 fn extract_return_tycon(sc: TyScheme) : Option[String] {
   match sc {
-    Scheme(_, _, ty) -> match ty {
+    Scheme(_, _, _, ty) -> match ty {
       TyFnT(_, ret, _) -> match ret {
         TyCon(nm, _) -> Some(nm)
         _            -> None
@@ -13620,6 +14648,8 @@ fn ty_expr_contains_fiber(t: TypeExpr) : Bool {
       if ty_expr_list_has_fiber(ps) { true }
       else { ty_expr_contains_fiber(ret) }
     }
+    # m12.5: dimensioned types never carry a Fiber — recurse into base.
+    TyDim(base, _) -> ty_expr_contains_fiber(base)
   }
 }
 
@@ -13769,11 +14799,291 @@ fn prepend_reverse_holes(xs: [ResolvedHole], acc: [ResolvedHole]) : [ResolvedHol
   }
 }
 
+# m12.5: alias expansion pre-pass.
+#
+# Walks decls, collecting the body of every `unit Newton = ...` alias
+# into a flat table, then rewrites every USym(name) inside a TyDim or
+# ELitUnit to that body recursively. After this pass the typer never
+# sees an alias symbol — it only sees atomic units and unit-vars.
+
+type UAliasEntry = UAE(String, UnitExprT)
+
+fn collect_unit_alias_table(decls: [Decl]) : [UAliasEntry] =
+  collect_unit_alias_table_loop(decls, [])
+
+fn collect_unit_alias_table_loop(decls: [Decl], acc: [UAliasEntry]) : [UAliasEntry] {
+  match decls {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DUnit(_, name, Some(body), _, _) -> collect_unit_alias_table_loop(rest, [UAE(name, body), ...acc])
+      _ -> collect_unit_alias_table_loop(rest, acc)
+    }
+  }
+}
+
+fn unit_alias_lookup(aliases: [UAliasEntry], name: String) : Option[UnitExprT] {
+  match aliases {
+    [] -> None
+    [a, ...rest] -> match a {
+      UAE(n, b) -> if n == name { Some(b) } else { unit_alias_lookup(rest, name) }
+    }
+  }
+}
+
+# Walk a UnitExprT and replace USym(name) with the alias body whenever
+# `name` is registered as an alias. Recursive — alias-of-alias chains
+# expand fully. The `seen` parameter guards against accidental cycles
+# (the m12.5 spec rules them out, but a defensive guard keeps the
+# compiler from looping if a future refactor introduces one).
+fn expand_unit_aliases_in_unit(u: UnitExprT, aliases: [UAliasEntry], seen: [String]) : UnitExprT {
+  match u {
+    UOne -> u
+    UVar(_) -> u
+    USym(s) -> {
+      if list_has_string(seen, s) { u }
+      else {
+        match unit_alias_lookup(aliases, s) {
+          Some(body) -> expand_unit_aliases_in_unit(body, aliases, [s, ...seen])
+          None -> u
+        }
+      }
+    }
+    UMul(a, b) -> UMul(expand_unit_aliases_in_unit(a, aliases, seen),
+                      expand_unit_aliases_in_unit(b, aliases, seen))
+    UInv(a) -> UInv(expand_unit_aliases_in_unit(a, aliases, seen))
+    UPow(a, n) -> UPow(expand_unit_aliases_in_unit(a, aliases, seen), n)
+  }
+}
+
+fn expand_unit_aliases_decls(ds: [Decl], aliases: [UAliasEntry]) : [Decl] =
+  map(ds, (d) => expand_unit_aliases_decl(d, aliases))
+
+fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
+  match d {
+    DFn(p, n, tps, ps, ret, row, body, l, c) ->
+      DFn(p, n, tps,
+          map(ps, (pm) => expand_aliases_param(pm, aliases)),
+          match ret { Some(t) -> Some(expand_aliases_typeexpr(t, aliases)) None -> None },
+          row,
+          expand_aliases_expr(body, aliases),
+          l, c)
+    DType(p, n, tps, body, l, c) ->
+      DType(p, n, tps, expand_aliases_typebody(body, aliases), l, c)
+    DTest(desc, body, l, c) -> DTest(desc, expand_aliases_expr(body, aliases), l, c)
+    DImport(_, _, _) -> d
+    DEffect(p, n, tps, ops, l, c) ->
+      DEffect(p, n, tps, map(ops, (op) => expand_aliases_op(op, aliases)), l, c)
+    DUnit(_, _, _, _, _) -> d
+    # m12.8: protocols are stripped by `lower_protocols` before
+    # `infer_program` runs, so reaching one here means the unit-alias
+    # pass executed on a pre-lowering decl stream — pass through.
+    DProtocol(_, _, _, _, _) -> d
+    DImpl(_, _, _, _, _) -> d
+    DDerive(_, _, _, _) -> d
+  }
+}
+
+fn expand_aliases_param(pm: Param, aliases: [UAliasEntry]) : Param =
+  Param {
+    pname: pm.pname,
+    ptype: match pm.ptype {
+      Some(t) -> Some(expand_aliases_typeexpr(t, aliases))
+      None -> None
+    },
+    pline: pm.pline,
+    pcol: pm.pcol
+  }
+
+fn expand_aliases_typebody(b: TypeBody, aliases: [UAliasEntry]) : TypeBody {
+  match b {
+    TBAlias(t) -> TBAlias(expand_aliases_typeexpr(t, aliases))
+    TBRecord(fs) -> TBRecord(expand_aliases_fdecls(fs, aliases))
+    TBSum(vs) -> TBSum(expand_aliases_variants(vs, aliases))
+    TBEffectAlias(_) -> b
+  }
+}
+
+fn expand_aliases_fdecls(fs: [FieldDecl], aliases: [UAliasEntry]) : [FieldDecl] {
+  match fs {
+    [] -> []
+    [h, ...rest] -> match h {
+      FD(n, t) -> [FD(n, expand_aliases_typeexpr(t, aliases)),
+                   ...expand_aliases_fdecls(rest, aliases)]
+    }
+  }
+}
+
+fn expand_aliases_variants(vs: [Variant], aliases: [UAliasEntry]) : [Variant] {
+  match vs {
+    [] -> []
+    [h, ...rest] -> match h {
+      Var(n, ts) -> [Var(n, expand_aliases_typeexprs(ts, aliases)),
+                     ...expand_aliases_variants(rest, aliases)]
+    }
+  }
+}
+
+fn expand_aliases_typeexprs(ts: [TypeExpr], aliases: [UAliasEntry]) : [TypeExpr] {
+  match ts {
+    [] -> []
+    [h, ...rest] -> [expand_aliases_typeexpr(h, aliases),
+                     ...expand_aliases_typeexprs(rest, aliases)]
+  }
+}
+
+fn expand_aliases_op(op: EffectOp, aliases: [UAliasEntry]) : EffectOp {
+  match op {
+    EOp(n, tps, ps, ret, l, c) ->
+      EOp(n, tps,
+          map(ps, (pm) => expand_aliases_param(pm, aliases)),
+          expand_aliases_typeexpr(ret, aliases), l, c)
+  }
+}
+
+fn expand_aliases_typeexpr(t: TypeExpr, aliases: [UAliasEntry]) : TypeExpr {
+  match t.tkind {
+    TyName(n, ts) ->
+      mk_ty(TyName(n, map(ts, (a) => expand_aliases_typeexpr(a, aliases))), t.line, t.col)
+    TyList(inner) ->
+      mk_ty(TyList(expand_aliases_typeexpr(inner, aliases)), t.line, t.col)
+    TyFn(ps, ret, row) ->
+      mk_ty(TyFn(map(ps, (a) => expand_aliases_typeexpr(a, aliases)),
+                 expand_aliases_typeexpr(ret, aliases), row), t.line, t.col)
+    TyDim(base, u) ->
+      mk_ty(TyDim(expand_aliases_typeexpr(base, aliases),
+                  expand_unit_aliases_in_unit(u, aliases, [])), t.line, t.col)
+  }
+}
+
+fn expand_aliases_expr(e: Expr, aliases: [UAliasEntry]) : Expr {
+  let new_kind = expand_aliases_exprkind(e.kind, aliases)
+  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty }
+}
+
+fn expand_aliases_exprkind(k: ExprKind, aliases: [UAliasEntry]) : ExprKind {
+  match k {
+    EInt(_) -> k
+    EReal(_) -> k
+    EBool(_) -> k
+    EChar(_) -> k
+    EStr(_, _) -> k
+    EUnit -> k
+    EVar(_) -> k
+    EUnder -> k
+    EPlaceholder -> k
+    ECall(f, xs) -> ECall(expand_aliases_expr(f, aliases),
+                          map(xs, (x) => expand_aliases_expr(x, aliases)))
+    EField(b, n) -> EField(expand_aliases_expr(b, aliases), n)
+    EIndex(a, b) -> EIndex(expand_aliases_expr(a, aliases),
+                           expand_aliases_expr(b, aliases))
+    EBinop(op, a, b) -> EBinop(op, expand_aliases_expr(a, aliases),
+                                   expand_aliases_expr(b, aliases))
+    EUnop(op, x) -> EUnop(op, expand_aliases_expr(x, aliases))
+    EIf(c, t_, eo) -> EIf(expand_aliases_expr(c, aliases),
+                          expand_aliases_expr(t_, aliases),
+                          match eo { Some(eb) -> Some(expand_aliases_expr(eb, aliases)) None -> None })
+    EMatch(scr, arms) -> EMatch(expand_aliases_expr(scr, aliases),
+                                map(arms, (a) => expand_aliases_arm(a, aliases)))
+    ELambda(ps, body) ->
+      ELambda(map(ps, (pm) => expand_aliases_param(pm, aliases)),
+              expand_aliases_expr(body, aliases))
+    ERecordLit(n, fis) -> ERecordLit(n, expand_aliases_field_inits(fis, aliases))
+    EList(els) -> EList(map(els, (el) => expand_aliases_listelem(el, aliases)))
+    ERange(a, b, opt_step) ->
+      ERange(expand_aliases_expr(a, aliases),
+             expand_aliases_expr(b, aliases),
+             match opt_step { Some(s) -> Some(expand_aliases_expr(s, aliases)) None -> None })
+    EBlock(stmts, opt_final) ->
+      EBlock(map(stmts, (s) => expand_aliases_stmt(s, aliases)),
+             match opt_final { Some(fe) -> Some(expand_aliases_expr(fe, aliases)) None -> None })
+    EPipe(a, b) -> EPipe(expand_aliases_expr(a, aliases),
+                         expand_aliases_expr(b, aliases))
+    EHole(_) -> k
+    ETodo(_) -> k
+    EBang(inner) -> EBang(expand_aliases_expr(inner, aliases))
+    EHandle(body, eff_n, eff_tas, init_opt, alias_opt, cs, ret_opt) ->
+      EHandle(expand_aliases_expr(body, aliases), eff_n,
+              map(eff_tas, (t) => expand_aliases_typeexpr(t, aliases)),
+              match init_opt { Some(ie) -> Some(expand_aliases_expr(ie, aliases)) None -> None },
+              alias_opt,
+              map(cs, (c) => expand_aliases_hclause(c, aliases)),
+              match ret_opt { Some(r) -> Some(expand_aliases_hreturn(r, aliases)) None -> None })
+    ELitUnit(inner, u) ->
+      ELitUnit(expand_aliases_expr(inner, aliases),
+               expand_unit_aliases_in_unit(u, aliases, []))
+  }
+}
+
+fn expand_aliases_field_inits(fis: [FieldInit], aliases: [UAliasEntry]) : [FieldInit] {
+  match fis {
+    [] -> []
+    [h, ...rest] -> match h {
+      FI(fn_, v) -> [FI(fn_, expand_aliases_expr(v, aliases)),
+                     ...expand_aliases_field_inits(rest, aliases)]
+    }
+  }
+}
+
+fn expand_aliases_arm(a: Arm, aliases: [UAliasEntry]) : Arm {
+  match a {
+    Arm(pat, opt_g, body) -> Arm(pat,
+      match opt_g { Some(g) -> Some(expand_aliases_expr(g, aliases)) None -> None },
+      expand_aliases_expr(body, aliases))
+  }
+}
+
+fn expand_aliases_listelem(el: ListElem, aliases: [UAliasEntry]) : ListElem {
+  match el {
+    ElPlain(x) -> ElPlain(expand_aliases_expr(x, aliases))
+    ElSpread(x) -> ElSpread(expand_aliases_expr(x, aliases))
+  }
+}
+
+fn expand_aliases_stmt(s: Stmt, aliases: [UAliasEntry]) : Stmt {
+  match s {
+    SLet(p, t, rhs) ->
+      SLet(p,
+           match t { Some(te) -> Some(expand_aliases_typeexpr(te, aliases)) None -> None },
+           expand_aliases_expr(rhs, aliases))
+    SAssert(c, msg) ->
+      SAssert(expand_aliases_expr(c, aliases),
+              match msg { Some(m) -> Some(expand_aliases_expr(m, aliases)) None -> None })
+    SExprStmt(x) -> SExprStmt(expand_aliases_expr(x, aliases))
+    SIndexAssign(b, i, v, l, c) ->
+      SIndexAssign(expand_aliases_expr(b, aliases),
+                   expand_aliases_expr(i, aliases),
+                   expand_aliases_expr(v, aliases), l, c)
+    SVar(n, te, rhs, l, c) ->
+      SVar(n,
+           match te { Some(t) -> Some(expand_aliases_typeexpr(t, aliases)) None -> None },
+           expand_aliases_expr(rhs, aliases), l, c)
+  }
+}
+
+fn expand_aliases_hclause(c: HClause, aliases: [UAliasEntry]) : HClause {
+  match c {
+    HC(n, ps, body, l, col) ->
+      HC(n, map(ps, (pm) => expand_aliases_param(pm, aliases)),
+         expand_aliases_expr(body, aliases), l, col)
+  }
+}
+
+fn expand_aliases_hreturn(r: HReturn, aliases: [UAliasEntry]) : HReturn {
+  match r {
+    HR(n, body, l, c) -> HR(n, expand_aliases_expr(body, aliases), l, c)
+  }
+}
+
 fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram {
-  let built = build_ty_env(decls)
-  let recs = collect_records(decls)
+  # m12.5: expand `unit Newton = kg * m / sec^2` aliases at the AST
+  # level before any pass that calls resolve_ty. After this pass no
+  # USym in any TyDim or ELitUnit refers to an alias name.
+  let aliases = collect_unit_alias_table(decls)
+  let decls_a = expand_unit_aliases_decls(decls, aliases)
+  let built = build_ty_env(decls_a)
+  let recs = collect_records(decls_a)
   infer_all_loop(file, built.env, built.prelude_len, recs,
-                 built.op_eff_arities, decls, verbose, [], 0, [], [])
+                 built.op_eff_arities, decls_a, verbose, [], 0, [], [])
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int {
@@ -13832,6 +15142,7 @@ fn tag_of_kind(k: ExprKind) : String {
     ETodo(msg)     -> concat_all(["todo \"", msg, "\""])
     EBang(_)       -> "bang"
     EHandle(_, eff_name, _, _, _, _, _) -> concat_all(["handle ", eff_name])
+    ELitUnit(_, u) -> concat_all(["lit-unit <", unit_canon_display(u), ">"])
   }
 }
 
@@ -14941,7 +16252,7 @@ fn list_has_int(xs: [Int], n: Int) : Bool {
 # which still constrain the substitution meaningfully.
 fn synth_return_structural(sc: TyScheme) : Bool {
   match sc {
-    Scheme(vars, _, ty) -> match ty {
+    Scheme(vars, _, _, ty) -> match ty {
       TyFnT(_, ret, _) -> match ret {
         TyVarT(v) -> not list_has_int(vars, v)
         _         -> true
@@ -15721,6 +17032,9 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
       llvm_set_last(llvm_append_body(r.e, p_instr), r.reg)
     }
     EBang(inner) -> llvm_emit_bang(e, inner)
+    # m12.5: codegen erasure — emit the inner literal exactly as if no
+    # unit annotation were present. Units never reach LLVM IR.
+    ELitUnit(inner, _) -> llvm_emit_expr(e, inner)
     _ -> {
       eprint("llvm: unsupported expression kind (#{expr_kind_name(x.kind)}) at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
       llvm_set_last(e, "undef")
@@ -15756,6 +17070,7 @@ fn expr_kind_name(k: ExprKind) : String {
     ETodo(_)       -> "ETodo"
     EBang(_)       -> "EBang"
     EHandle(_, _, _, _, _, _, _) -> "EHandle"
+    ELitUnit(_, _) -> "ELitUnit"
   }
 }
 
@@ -16109,6 +17424,12 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
         let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
                                 llvm_format_args(ra.regs), ")\n"])
         llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+      } else if nm == "unitless" {
+        # m12.5: identity at runtime — emit the inner value directly.
+        match xs {
+          [a] -> llvm_emit_expr(e, a)
+          _   -> llvm_set_last(e, "undef")
+        }
       } else if nm == "resume" {
         # m7c-d — emit `kai_cont_resume(k, v)` for the 1-arg form.
         # The 2-arg form `resume(v, ns)` writes new state first;
@@ -17816,6 +19137,11 @@ fn proto_type_name(te: TypeExpr) : String {
     TyName(name, _) -> name
     TyList(_)       -> "List"
     TyFn(_, _, _)   -> "Fn"
+    # m12.5: `Decimal<USD>` and friends collapse to the base
+    # constructor (`Decimal`); the unit annotation is invisible to
+    # protocol dispatch (which is single-dispatch on the head TyName,
+    # exactly as the spec describes for `impl Show for Money[u: Unit]`).
+    TyDim(base, _)  -> proto_type_name(base)
   }
 }
 
@@ -18096,6 +19422,10 @@ fn substitute_self_in_kind(k: TyKind) : TyKind {
     TyList(inner) -> TyList(substitute_self_in_type(inner))
     TyFn(ps, ret, row) ->
       TyFn(map(ps, substitute_self_in_type), substitute_self_in_type(ret), row)
+    # m12.5: substitute under the dimensioned base; the unit
+    # expression is leaf data with no `Self` reference (units come
+    # from the global unit table, not from the protocol's tparam).
+    TyDim(base, u) -> TyDim(substitute_self_in_type(base), u)
   }
 }
 
@@ -18783,6 +20113,10 @@ fn ty_head_name(t: Ty) : Option[String] {
     TyUnit         -> Some("Unit")
     TyListT(_)     -> Some("List")
     TyCon(name, _) -> Some(name)
+    # m12.5: a dimensioned value dispatches on the underlying base
+    # type's head — `Decimal<USD>` → `Decimal`, mirroring the
+    # `proto_type_name` collapse on the syntactic side.
+    TyDimT(base, _) -> ty_head_name(base)
     TyVarT(_)      -> None
     TyFnT(_, _, _) -> None
     TyAny          -> None

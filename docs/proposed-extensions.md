@@ -54,6 +54,7 @@ on.
 | `main()` row inference                     | scheduled m7e | typer + runtime default loader |
 | `use Effect` — open effect in scope        | scheduled m7e | parser + resolver scoping |
 | Protocols (single-dispatch)                | scheduled m12.8 | parser + resolver + vtable codegen |
+| Units of measure `Real<USD>` / `Int<UserId>` | landed m12.5 | parser + typer extension |
 
 ## 1. `todo!(msg) : T` — principled unimplemented
 

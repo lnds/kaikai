@@ -273,3 +273,48 @@ timestamp	cmd	outcome	elapsed_s
 2026-04-26T17:59:15-04:00	selfhost	OK	-
 2026-04-26T17:59:15-04:00	selfhost-llvm	OK	-
 ```
+
+## Rebase notes (against `dbdfed2`)
+
+After the lane closed, `main` advanced with two merged lanes:
+- **m5x-1-2**: stage-1 perceus port + closure-capture incref. No
+  stage-2 changes — disjoint zone.
+- **m12.5**: F#-style units of measure. New `TyDim`/`TyDimT` variants,
+  `DUnit` Decl variant, `TkUnitKw`/`TkCaret` tokens, ~1100 LOC in
+  stage 2.
+
+Conflicts resolved: **9 blocks in `stage2/compiler.kai`** (token list,
+token-name table, Decl union, parse-decl error message, `dump_decl`,
+`chk_decl`, `register_one`, `collect_decl`, `dump_decl_type`). Every
+block was a "keep both" merge — m12.5 added one variant, m12.8 added
+three, neither lane modified the other's logic. No semantic conflicts.
+
+Three additional fixes were needed beyond conflict-marker resolution:
+1. `expand_unit_aliases_decl` (m12.5) needed pass-through arms for
+   `DProtocol` / `DImpl` / `DDerive` because the typer's exhaustive-
+   match check triggers on every Decl pattern in the source even
+   though the lower pass strips them before this site runs.
+2. `proto_type_name` (m12.8, syntactic) needed a `TyDim` arm that
+   recurses into the base — `Decimal<USD>` collapses to `Decimal` for
+   protocol dispatch (matches the spec's polymorphic-impl rule).
+3. `ty_head_name` (m12.8, post-inference) needed the same recursive
+   `TyDimT` arm, mirroring 2.
+
+The third fix unblocks the spec's headline composition example
+(`impl Show for Decimal[u: Unit]`): `100.50<USD>` and `100.50<EUR>`
+both dispatch to the same impl entry, exactly as the spec promised.
+
+Validation:
+- `make all` — green
+- `make selfhost` — green
+- `make -C stage2 selfhost-llvm` — green
+- `make test` — 261 OK lines, no FAIL/DIFF/error
+- `examples/units/*.kai` re-checked: every positive case compiles,
+  every `_err_*` case rejects with its expected diagnostic.
+
+Time on rebase: ~12 min wall-clock. The merge was almost entirely
+mechanical because the lanes touched orthogonal zones (m12.8 owns
+dispatch lookup + `__proto_<op>` rename + `#derive` expansion; m12.5
+owns `TyDim` unification + unit codegen erasure). The `TyDim`
+recursion fixes were the only ones that needed attention to spec
+semantics rather than just keep-both concatenation.
