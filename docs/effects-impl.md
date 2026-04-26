@@ -1881,6 +1881,57 @@ a real-world program hits the bug. Until then the mitigation
 (m7b #16's stack-slot lowering for non-escaping vars) covers
 the common case.
 
+### m7c — LLVM effects port
+
+Replicate the m7a/m7b effects codegen in the LLVM backend. The
+C and LLVM backends must round-trip identically: every
+`m7a_*.kai` / `m7b_*.kai` fixture compiled with `--emit=llvm`
+behaves the same as `--emit=c`. Doc B's open question OQ #6
+(C vs LLVM perf ratio for trivial-clause ops) gets re-measured
+after this lands.
+
+Split into four sub-tasks, landed in order, each its own branch
++ FF merge with selfhost-llvm gate:
+
+1. **m7c-a — Effect-struct emission**. Emit `%EvX = type { i64,
+   i8*, %KaiValue*, fn-ptrs... }` per declared effect; declare
+   `%KaiCont` and `%KaiEvidence` as opaque. Inert until #c-b
+   lowers `EHandle`. **Landed.**
+2. **m7c-b — `EHandle` lowering**. The push/pop dance + the
+   setjmp/longjmp landing pad. LLVM has no portable `setjmp`
+   intrinsic — use `@llvm.eh.sjlj.setjmp` (Itanium ABI) or
+   declare `@setjmp` / `@longjmp` as external libc calls, with
+   the buffer as an `[5 x i8*]` alloca. The discard-resume slot
+   becomes a stack alloca that the longjmp branch loads via a
+   PHI node. *Pending.*
+3. **m7c-c — Op-call dispatch**. The `Eff.op(args)` branch of
+   `emit_call_expr`: call `@kai_evidence_lookup_node` (declared
+   in the header), bitcast the returned `%KaiEvidence*` to the
+   matching `%EvX*`, GEP into the right field, indirect-call
+   the function pointer with the arg list + a fresh `%KaiCont*`
+   (alloca + `@kai_cont_init_identity`), check the status, and
+   either fall through with the value or longjmp to the
+   handle's pad. *Pending.*
+4. **m7c-d — Clauses + default-handler wrappers**. Each
+   `HClause` becomes a top-level LLVM function (mirroring the
+   C side's `_kai_clause_<line>_<col>_<op>`). The `default_*_setup`
+   helpers also need an LLVM analogue — they install evidence
+   nodes around `@kai_main` for builtins that appear in main's
+   row. End-to-end gate: every `m7a_*` / `m7b_*` fixture passes
+   `make -C stage2 test-llvm` (a new make target paralleling the
+   existing `test-effects`). *Pending.*
+
+**Decisions taken before splitting**:
+- Use opaque `%KaiCont` / `%KaiEvidence` types in the IR; let
+  the runtime own the layout.
+- Use stage0/runtime_llvm.c (not the C one) for the LLVM-backend
+  helper definitions. The runtime helpers may share C source
+  via `#include`, but the LLVM-side compiles them with `clang
+  -S -emit-llvm` if needed for inlining.
+- Match the C codegen verbatim for handler_id allocation and
+  evidence stack semantics. No reordering or different abstract
+  machine — that is m7c's whole point.
+
 ## Next steps
 
 Two documents are unblocked by Doc C:
