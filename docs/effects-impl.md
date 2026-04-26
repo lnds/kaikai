@@ -1528,10 +1528,30 @@ page the way they are written.
      `m7b_2a_op_id_basic`, `m7b_2a_op_distinct_types`,
      `m7b_2a_op_in_parametric` (op tparam stacked on a
      parametric effect).
-   - **#2b — `Mutable` migration** (declaration + injection +
-     default handler + replacement of every prelude `array_*`
-     call site in `stage2/compiler.kai`). *Pending.*
-   - **#2c — cleanup** (audit, doc updates). *Pending.*
+   - **#2b — `Mutable` introduction** (declaration + unconditional
+     injection + default handler wrapping the prelude
+     `kai_prelude_array_*` helpers). **Landed.** Diverges from the
+     original plan in one important way: the prelude `array_*`
+     calls inside `stage2/compiler.kai` itself are NOT migrated to
+     `Mutable.array_*`. Reason: Doc B specifies
+     `array_set : (Array[T], Int, T) -> Unit`, but stage 2's
+     prelude returns `Array[T]` so internal
+     `xs = array_set(xs, i, v)` chains type-check. Migrating the
+     compiler's call sites would require either rewriting every
+     such chain (~hundreds of sites) or matching the prelude shape
+     in the Mutable signature (which then diverges from Doc B at
+     the user surface). The Mutable op signatures here mirror the
+     prelude (Array[T] return) so the compiler sources stay
+     untouched and stage 2 keeps no `Mutable` in its row.
+     Verified by `m7b_2b_mutable_default` (runtime default) and
+     `m7b_2b_mutable_intercept` (user handler). `ref_*` ops
+     deferred — kaikai has no surface `Ref[T]` type today.
+   - **#2c — cleanup / Mutable internal migration** (audit; if
+     Doc B's `Unit` shape proves more idiomatic, migrate every
+     `array_*` call in `stage2/compiler.kai` to
+     `Mutable.array_*` and accept `Mutable` in every helper's row
+     via the runtime default). *Pending — scope expanded vs the
+     original plan to include this question.*
 3. **Trailing lambdas** — pre-resolve desugar pass
    (`docs/syntax-sugars.md` §*Trailing lambdas*). Includes
    single trailing, lambda-block as expression, double trailing.
@@ -1722,9 +1742,11 @@ and #7 all landed in sequence after #5b. m7b #18 (lambda free-var
 capture) landed too, surfaced while exercising the polymorphic
 helpers from #14. m7b #4 (`@cap` / `cap := v` sugars) also
 landed, completing the user-facing surface of the `var` workflow.
-m7b #2a (per-op generics mechanism) landed; #2b (Mutable migration)
-and #2c (cleanup) remain. The remaining m7b items are: #2b, #2c,
-#8 (diagnostic review), #15, #16, #17.
+m7b #2a (per-op generics mechanism) and #2b (Mutable
+introduction) both landed; #2c (audit + decide whether to
+migrate the compiler's internal `array_*` calls) remains. The
+remaining m7b items are: #2c, #8 (diagnostic review), #15, #16,
+#17.
 
 ## Next steps
 
