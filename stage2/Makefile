@@ -260,6 +260,27 @@ test-loop: $(TARGET) build
 	diff -q ../examples/loop/main.out.expected build/loop.out > /dev/null \
 	  && echo "loop OK" \
 	  || { echo "loop DIFF"; diff ../examples/loop/main.out.expected build/loop.out; exit 1; }
+
+# m7b #7 — stdlib `Reader[T]` / `Writer[W]` helpers. Same pattern
+# as test-loop: compile the example with `--path ../stdlib` so
+# the resolver finds the new module, run, diff against golden.
+test-reader: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --path ../stdlib ../examples/reader/main.kai > build/reader.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/reader.c -o build/reader-c; \
+	./build/reader-c > build/reader.out; \
+	diff -q ../examples/reader/main.out.expected build/reader.out > /dev/null \
+	  && echo "reader OK" \
+	  || { echo "reader DIFF"; diff ../examples/reader/main.out.expected build/reader.out; exit 1; }
+
+test-writer: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --path ../stdlib ../examples/writer/main.kai > build/writer.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/writer.c -o build/writer-c; \
+	./build/writer-c > build/writer.out; \
+	diff -q ../examples/writer/main.out.expected build/writer.out > /dev/null \
+	  && echo "writer OK" \
+	  || { echo "writer DIFF"; diff ../examples/writer/main.out.expected build/writer.out; exit 1; }
 # Typed holes (M10): every example under examples/holes/ must
 # (a) produce a --holes report with at least one "type hole" entry,
 # (b) produce a valid --holes-json array,
@@ -834,7 +855,7 @@ selfhost-llvm: $(TARGET) build
 	  && echo "llvm self-hosting fixed point: OK" \
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -843,7 +864,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer
 
 clean:
 	rm -rf build $(TARGET)
