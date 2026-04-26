@@ -21,20 +21,22 @@ m5 #0, and what stays deferred.
   diagnosable via `--dump-last-use`) and a conservative drop pass
   for unused `let` bindings whose RHS is freshly allocated. Bench
   fixture `stage2/bench/m5_unused_lets.kai` shows ~24× more frees
-  and ~7× lower leak rate on a focused workload; kaic2 self-
-  compile is unchanged because compiler.kai's hand discipline
-  rarely produces droppable lets. Detail in §"What landed under
-  m5 (round 2, 2026-04-26)".
+  and ~7× lower leak rate on a focused workload.
+- m5 #7 (constant pool for `unit` / `bool` / `nil`) closes out
+  round 2 and **satisfies the brief's bench-gating clause**: kaic2
+  self-compile alloc count drops from 130,735,107 (pre-m5) to
+  29,533,152 — a **77.4% reduction** with no emitter changes, only
+  a runtime swap to shared static singletons.
 - Everything beyond — capture-aware drops, dup at non-last uses,
   drops at fn exit points, drop specialisation, reuse-in-place —
   stays deferred to a future m5 lane, scoped honestly as multi-
   week.
 - The single fact every future m5 work item must reckon with: the
-  current compiler **leaks 97-98% of every value it allocates**.
-  Memory is reclaimed only when the process exits and the runtime's
-  recursive `kai_decref` chain runs over the final result. This is
-  not a Perceus inefficiency that needs tightening; it is the
-  absence of a Perceus discipline.
+  remaining ~29M allocations per self-compile **still leak almost
+  in full**. Memory beyond the singletons is reclaimed only when
+  the process exits and the runtime's recursive `kai_decref` chain
+  runs over the final result. This is not a Perceus inefficiency
+  that needs tightening; it is the absence of a Perceus discipline.
 
 ## What the emitter does today
 
@@ -213,7 +215,7 @@ remains byte-identical.
 
 ## What landed under m5 (round 2, 2026-04-26)
 
-A second m5 lane shipped six commits over m5 #0. The brief's
+A second m5 lane shipped nine commits over m5 #0. The brief's
 sub-numbering (m5 #1-#6 = walker + last-use + drop + dup + bench +
 docs) was retired during the work; the actual landings line up
 with the doc's m5 sub-milestones below as follows:
@@ -227,6 +229,8 @@ with the doc's m5 sub-milestones below as follows:
 | `592c71c` | m5 #2b        | bug fix          | walker covers `EStr` interpolations          |
 | `834af22` | m5 #3         | doc m5 **#3**    | drop unused let-bindings, fresh-RHS subset   |
 | `448e18d` | m5 #5         | doc m5 (bench)   | bench fixture + measured deltas              |
+| `156f597` | m5 #6         | doc m5 (docs)    | this section's first cut                    |
+| `6f3255e` | m5 #7         | doc m5 **#1**    | constant pool for `unit` / `bool` / `nil`   |
 
 m4c proper (the specialiser) is **not** in tree. m4c #1/#2 wire the
 slot and ship a deterministic name-mangling helper, but
@@ -258,21 +262,34 @@ bindings per iteration, self-contained literal RHS, 1000 iterations.
 ~24× more frees mid-program; ~7× drop in leak rate; same alloc
 total (m5 #3 frees sooner, never eliminates allocations).
 
-Self-compile of `stage2/compiler.kai` is essentially flat:
+Self-compile of `stage2/compiler.kai`:
 
-| version    | alloc       | free      | leaked      |
-|------------|-------------|-----------|-------------|
-| pre-m5     | 130,735,107 | 3,545,979 | 127,189,128 |
-| m5 round 2 | 138,684,259 | 3,784,645 | 134,899,614 |
+| version       | alloc       | free      | leaked      |
+|---------------|-------------|-----------|-------------|
+| pre-m5        | 130,735,107 | 3,545,979 | 127,189,128 |
+| m5 #3 round 2 | 138,684,259 | 3,784,645 | 134,899,614 |
+| m5 #7         |  29,533,152 |        37 |  29,533,115 |
 
-The +8M alloc / +239K free deltas are dominated by the new walker
-+ emit code in `compiler.kai` itself. The brief's "kaic2 self-
-compile alloc count must be measurably lower than pre-m5" gate is
-**not** satisfied: compiler.kai is hand-disciplined enough that the
-emitted drops fire only inside diagnostic-error branches that do
-not run on a clean compile. Real-world wins for m5 round 2 live in
-user code that allocates intermediate structures it never reads —
-exactly the bench fixture's shape.
+m5 #3 alone moved alloc upward (+6.1%) — the new walker / emit
+helpers in `compiler.kai` itself add code that allocates faster
+than the emitted drops can free, and compiler.kai's hand
+discipline means the emitted drops mostly fire inside
+diagnostic-error branches that do not run on a clean compile.
+
+m5 #7 swings it the other way decisively: shifting `unit`,
+`bool`, and `nil` to shared static singletons takes the alloc
+count from 138.7M → 29.5M (**-77.4 % vs pre-m5**), satisfying
+the brief's gate. The remaining ~29.5M allocations are split
+across `int` (8.4M), `char` (8.9M), `variant` (6.3M), `str`
+(2.6M), `record` (1.8M), `cons` (1.5M), `closure` (67K), and
+`array` (43K). `free_total` collapses to 37 because most prior
+"frees" were the unit/bool/nil chain-decrefs at exit; now those
+three tags are inert in the RC path, so almost nothing fires.
+
+`live_peak` ≡ `leaked` is back to the m5 #0 tautology — basic
+Perceus' eventual contribution lives in shrinking `live_peak`
+while leaving alloc roughly fixed, which requires the
+capture-aware drop / dup-at-non-last work below.
 
 ### Capture-aware drops are deferred
 
@@ -294,15 +311,13 @@ In rough dependency order. Each is its own commit-grain piece.
 Status as of 2026-04-26: m5 #3 shipped. The rest are deferred to
 a future m5 lane.
 
-- **m5 #1 — Constant pool for nullary primitives.** [DEFERRED]
-  Return shared references for `kai_unit()`, `kai_bool(true)`,
-  `kai_bool(false)`, `kai_nil()` from `runtime.h`. The four
-  constructors return a pointer to a static `KaiValue` rather than
-  fresh `calloc`s; the refcount on those statics is ignored (or
-  saturates). Expected reduction: ~80% of total allocs in the
-  kaic2 self-compile, with no change to emitter or downstream
-  code. Selfhost stays byte-identical (only the linked runtime
-  changes). 0.5-1 day.
+- **m5 #1 — Constant pool for nullary primitives.** [SHIPPED in
+  `6f3255e` as m5 #7] Static `KaiValue` singletons for `unit`,
+  `bool(true)`, `bool(false)`, `nil` carrying `rc = INT32_MAX` as
+  a saturation sentinel; `kai_incref` / `kai_decref` short-circuit
+  on the sentinel. Pure runtime change, selfhost byte-identical.
+  Measured 77.4% alloc reduction on kaic2 self-compile — matches
+  the predicted ~80%.
 
 - **m5 #2 — m4c specialiser.** [PARTIAL] The pipeline slot
   (`monomorphise(tp) : [Decl]`) ships as identity in `f9c84a5`,
