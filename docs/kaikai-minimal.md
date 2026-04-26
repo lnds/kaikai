@@ -390,7 +390,7 @@ string_to_real(s: String) -> Option[Real]
 
 # String operations
 string_length(s: String) -> Int
-string_concat(a: String, b: String) -> String
+string_concat(a: String, b: String) -> String  # lowering target for `++`; prefer `a ++ b` in source
 string_slice(s: String, from: Int, len: Int) -> String
 string_split(s: String, sep: String) -> [String]
 string_contains(s: String, substr: String) -> Bool
@@ -400,7 +400,7 @@ int_to_char(n: Int) -> Char
 
 # List operations — minimal set; full library is in stdlib for stage 1
 list_length(xs: [a]) -> Int
-list_append(xs: [a], ys: [a]) -> [a]
+list_append(xs: [a], ys: [a]) -> [a]    # lowering target for `++`; prefer `xs ++ ys` in source
 list_reverse(xs: [a]) -> [a]
 
 # Program termination

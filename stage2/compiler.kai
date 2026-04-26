@@ -52,6 +52,10 @@ type TokKind
   # operators
   | TkEq | TkArrow | TkFatArrow | TkPipe | TkPipeApply
   | TkPlus | TkMinus | TkStar | TkSlash | TkSlashSlash | TkPercent
+  # m7d §23: `++` is the string / list concatenation operator.
+  # Right-associative, lower precedence than `+`/`-`/`*`/`/`,
+  # higher than comparison.
+  | TkPlusPlus
   | TkEqEq | TkNeq | TkLt | TkGt | TkLe | TkGe
   | TkBang | TkAt
   # typed holes (M10): TkHole is a bare `?`; TkHoleName carries the
@@ -92,7 +96,7 @@ fn tk_name(k: TokKind) : String {
     TkEq -> "=" TkArrow -> "->" TkFatArrow -> "=>"
     TkPipe -> "|" TkPipeApply -> "|>"
     TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
-    TkSlashSlash -> "//" TkPercent -> "%"
+    TkSlashSlash -> "//" TkPercent -> "%" TkPlusPlus -> "++"
     TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">"
     TkLe -> "<=" TkGe -> ">=" TkBang -> "!" TkAt -> "@"
     TkHole -> "?" TkHoleName(_) -> "?NAME"
@@ -490,7 +494,18 @@ fn lex_punct(l: Lexer) : LexStep {
         }
       }
       else if c == ';' { Step(l1, tok(TkSemi, sl, sc, start, l1.pos)) }
-      else if c == '+' { Step(l1, tok(TkPlus, sl, sc, start, l1.pos)) }
+      else if c == '+' {
+        # m7d §23: `++` is the concatenation operator. The lexer
+        # fuses two adjacent `+` characters into a single token; a
+        # space breaks it (so `1 + +2` is still allowed if anyone
+        # writes it).
+        if lex_peek_is(l1, '+') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkPlusPlus, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkPlus, sl, sc, start, l1.pos))
+        }
+      }
       else if c == '*' { Step(l1, tok(TkStar, sl, sc, start, l1.pos)) }
       else if c == '%' { Step(l1, tok(TkPercent, sl, sc, start, l1.pos)) }
       else if c == '-' {
@@ -1219,6 +1234,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkHole       -> match b { TkHole -> true _ -> false }
     TkHoleName(_) -> match b { TkHoleName(_) -> true _ -> false }
     TkTodoBang   -> match b { TkTodoBang -> true _ -> false }
+    TkPlusPlus   -> match b { TkPlusPlus -> true _ -> false }
     TkError(_)   -> false
   }
 }
@@ -1415,7 +1431,7 @@ fn decode_char(span: String) : Char {
 fn op_of_tok(k: TokKind) : String {
   match k {
     TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
-    TkSlashSlash -> "//" TkPercent -> "%"
+    TkSlashSlash -> "//" TkPercent -> "%" TkPlusPlus -> "++"
     TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">" TkLe -> "<=" TkGe -> ">="
     TkAnd -> "and" TkOr -> "or"
     _ -> "?"
@@ -1628,14 +1644,14 @@ fn is_cmp_tok(k: TokKind) : Bool {
 # tailored diagnostic pointing at the offending `OP'` and suggesting
 # the `and`-based rewrite.
 fn parse_cmp(p: Parser) : PExpr {
-  let r = parse_add(p)
+  let r = parse_concat(p)
   match r.r {
     None -> r
     Some(lhs) -> {
       let t = p_peek(r.p)
       if is_cmp_tok(t.kind) {
         let op = op_of_tok(t.kind)
-        let r2 = parse_add(p_skip_newlines(p_advance(r.p)))
+        let r2 = parse_concat(p_skip_newlines(p_advance(r.p)))
         match r2.r {
           None -> err_e(r2.p)
           Some(rhs) -> {
@@ -1647,6 +1663,28 @@ fn parse_cmp(p: Parser) : PExpr {
               ok_e(r2.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
             }
           }
+        }
+      } else { ok_e(r.p, lhs) }
+    }
+  }
+}
+
+# m7d §23 — `++` sits one slot below comparison, one above
+# additive (`+`/`-`). Right-associative, so `a ++ b ++ c` parses
+# as `a ++ (b ++ c)` — which matches both `string_concat` and
+# `list_append` since both are the natural fold direction (no
+# spine duplication on the head list / left string).
+fn parse_concat(p: Parser) : PExpr {
+  let r = parse_add(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> {
+      if p_at(r.p, TkPlusPlus) {
+        let t = p_peek(r.p)
+        let rr = parse_concat(p_skip_newlines(p_advance(r.p)))
+        match rr.r {
+          None -> err_e(rr.p)
+          Some(rhs) -> ok_e(rr.p, mk_expr(EBinop("++", lhs, rhs), t.line, t.col))
         }
       } else { ok_e(r.p, lhs) }
     }
@@ -5062,6 +5100,20 @@ fn emit_string_lit_body(span: String) : String {
   span
 }
 
+# m7d §23: pick the runtime helper a `++` lowers to. The typer
+# pins the binop's result type to `String` or `[T]`; anything else
+# means we lost the annotation somewhere upstream.
+fn concat_helper_of(opt_ty: Option[Ty]) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyString    -> "kai_prelude_string_concat"
+      TyListT(_)  -> "kai_prelude_list_append"
+      _           -> "kai_prelude_string_concat /* m7d §23: unexpected type */"
+    }
+    None -> "kai_prelude_string_concat /* m7d §23: missing type */"
+  }
+}
+
 fn binop_cname(op: String) : Option[String] {
   if op == "+" { Some("kai_add") }
   else if op == "-" { Some("kai_sub") }
@@ -6408,6 +6460,18 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
         concat_all([
           "({ KaiValue *_a = ", emit_expr(src, a, fns, variants, lams),
           "; kai_truthy(_a) ? kai_bool(1) : ", emit_expr(src, b, fns, variants, lams), "; })"
+        ])
+      } else if op == "++" {
+        # m7d §23: lower `a ++ b` to either `string_concat(a, b)` or
+        # `list_append(a, b)` depending on the binop's typed result.
+        # The typer pins `x.ty` to `String` or `[T]` before we get
+        # here; an untyped `++` is a typer bug we surface as a panic
+        # stub so it shows up in fixtures.
+        let helper = concat_helper_of(x.ty)
+        concat_all([
+          helper, "(",
+          emit_expr(src, a, fns, variants, lams), ", ",
+          emit_expr(src, b, fns, variants, lams), ")"
         ])
       } else {
         match binop_cname(op) {
@@ -11693,7 +11757,9 @@ fn binop_root(op: String, l_expr: Expr, r_expr: Expr, line: Int, col: Int, ty: T
 fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int) : Inferred {
   let rl = synth(st, l)
   let rr = synth(rl.st, r)
-  if op == "and" or op == "or" {
+  if op == "++" {
+    synth_concat(rr.st, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
+  } else if op == "and" or op == "or" {
     let s1 = st_unify(rr.st, rl.ty, TyBool, "boolean operator", line, col)
     let s2 = st_unify(s1, rr.ty, TyBool, "boolean operator", line, col)
     mk_inferred(s2, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
@@ -11713,6 +11779,44 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     let ty = apply_ty(s1.sub, rl.ty)
     mk_inferred(s1, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
   }
+}
+
+# m7d §23 — `++` typer. Two hardcoded rules:
+#   String ++ String  : String
+#   [a]    ++ [a]     : [a]
+# We probe the lhs's resolved type first; if it is a TyVar we fall
+# back to the rhs's resolved type (mirror case). If neither side
+# pins the operator, we report a targeted diagnostic — the
+# concatenation operator is intentionally not generic, the way `+`
+# is intentionally not overloaded for strings.
+fn synth_concat(st: InferState, lt: Ty, le: Expr, rt: Ty, re: Expr, line: Int, col: Int) : Inferred {
+  let lt_now = apply_ty(st.sub, lt)
+  match lt_now {
+    TyString -> concat_finish(st, TyString, lt, le, rt, re, line, col)
+    TyListT(elem) -> concat_finish(st, TyListT(elem), lt, le, rt, re, line, col)
+    _ -> {
+      let rt_now = apply_ty(st.sub, rt)
+      match rt_now {
+        TyString -> concat_finish(st, TyString, lt, le, rt, re, line, col)
+        TyListT(elem) -> concat_finish(st, TyListT(elem), lt, le, rt, re, line, col)
+        _ -> {
+          diag_error(st.file, line, col,
+            "operator `++` requires both operands to be `String` or both to be `[T]`")
+          diag_help("annotate one of the operands so the compiler can pick the right rule")
+          mk_inferred(st_bump_err(st), TyAny,
+            with_ty(mk_expr(EBinop("++", le, re), line, col), TyAny))
+        }
+      }
+    }
+  }
+}
+
+fn concat_finish(st: InferState, target: Ty, lt: Ty, le: Expr, rt: Ty, re: Expr, line: Int, col: Int) : Inferred {
+  let s1 = st_unify(st, lt, target, "concat operator", line, col)
+  let s2 = st_unify(s1, rt, target, "concat operator", line, col)
+  let result_ty = apply_ty(s2.sub, target)
+  let root = with_ty(mk_expr(EBinop("++", le, re), line, col), result_ty)
+  mk_inferred(s2, result_ty, root)
 }
 
 fn synth_unop(st: InferState, op: String, x: Expr, line: Int, col: Int) : Inferred {
@@ -14649,7 +14753,7 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
       }
     }
     ECall(callee, xs) -> llvm_emit_call(e, callee, xs)
-    EBinop(op, l, r) -> llvm_emit_binop(e, op, l, r)
+    EBinop(op, l, r) -> llvm_emit_binop_typed(e, op, l, r, x.ty)
     EUnop(op, inner) -> llvm_emit_unop(e, op, inner)
     EIf(c, t, eo) -> llvm_emit_if(e, c, t, eo)
     EBlock(stmts, tail) -> llvm_emit_block(e, stmts, tail)
@@ -15105,6 +15209,31 @@ fn llvm_format_args(regs: [String]) : String {
     [] -> ""
     [x] -> string_concat("%KaiValue* ", x)
     [x, ...rest] -> concat_all(["%KaiValue* ", x, ", ", llvm_format_args(rest)])
+  }
+}
+
+fn llvm_emit_binop_typed(e: LlvmEmit, op: String, l: Expr, r: Expr, opt_ty: Option[Ty]) : LlvmEmit {
+  if op == "++" {
+    let helper = llvm_concat_helper_of(opt_ty)
+    let el = llvm_emit_expr(e, l)
+    let lv = el.last_val
+    let er = llvm_emit_expr(el, r)
+    let rv = er.last_val
+    let reg = llvm_fresh_reg(er)
+    let instr = concat_all(["  ", reg.reg, " = call %KaiValue* ", helper,
+                            "(%KaiValue* ", lv, ", %KaiValue* ", rv, ")\n"])
+    llvm_set_last(llvm_append_body(reg.e, instr), reg.reg)
+  } else { llvm_emit_binop(e, op, l, r) }
+}
+
+fn llvm_concat_helper_of(opt_ty: Option[Ty]) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyString    -> "@kaix_string_concat"
+      TyListT(_)  -> "@kaix_prelude_list_append"
+      _           -> "@kaix_string_concat"
+    }
+    None -> "@kaix_string_concat"
   }
 }
 
