@@ -58,6 +58,10 @@ type TokKind
   # identifier for `?foo`. The lexer recognises `?ident` as one token
   # so the parser does not have to re-synthesise the form.
   | TkHole | TkHoleName(String)
+  # m7d §1: `todo!` is a single token. The lexer recognises the
+  # `todo` identifier followed immediately by `!` as `TkTodoBang`,
+  # so the parser sees one symbol at the call site.
+  | TkTodoBang
   # error token carries a human-readable message
   | TkError(String)
 
@@ -92,6 +96,7 @@ fn tk_name(k: TokKind) : String {
     TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">"
     TkLe -> "<=" TkGe -> ">=" TkBang -> "!" TkAt -> "@"
     TkHole -> "?" TkHoleName(_) -> "?NAME"
+    TkTodoBang -> "todo!"
     TkError(_) -> "ERROR"
   }
 }
@@ -215,13 +220,22 @@ fn lex_ident(l: Lexer) : LexStep {
   let sc = l.col
   let l2 = lex_scan_ident_rest(l)
   let text = string_slice(l.src, start, l2.pos - start)
-  let kind =
-    if string_length(text) == 1 and text == "_" {
-      TkUnderscore
-    } else {
-      keyword_kind(text)
-    }
-  Step(l2, tok(kind, sl, sc, start, l2.pos))
+  # m7d §1: `todo!` lexes as a single token. We recognise the
+  # identifier `todo` immediately followed by `!` (no whitespace)
+  # so the parser sees `TkTodoBang` instead of `TkIdent` + `TkBang`.
+  # The bang stays available as a postfix operator elsewhere (m7e §13).
+  if text == "todo" and lex_peek_is(l2, '!') {
+    let l3 = lex_advance(l2)
+    Step(l3, tok(TkTodoBang, sl, sc, start, l3.pos))
+  } else {
+    let kind =
+      if string_length(text) == 1 and text == "_" {
+        TkUnderscore
+      } else {
+        keyword_kind(text)
+      }
+    Step(l2, tok(kind, sl, sc, start, l2.pos))
+  }
 }
 
 # ====================================================================
@@ -920,6 +934,13 @@ type ExprKind
   # `?name`. Checker reports at each hole site; emitter falls back
   # to a runtime panic so unfilled holes in a binary are loud.
   | EHole(Option[String])
+  # m7d §1: `todo!(msg) : T` — a typed *unimplemented* marker. The
+  # message is a literal `String` extracted at parse time. Behaves
+  # like `EHole(None)` for inference (any expected type fits) and
+  # like a panic at runtime, but the checker reports it under a
+  # distinct `kind = "todo"` so tooling can tell `?` apart from
+  # "I will fill this in" markers.
+  | ETodo(String)
   # Effect handler (m7a #4b). `handle { body } with Eff [as alias]
   # { clauses [return(x) -> expr] }`. The `alias` (Option[String])
   # rebinds the capability name inside the body. m7a #4b is parser
@@ -1191,6 +1212,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkAt         -> match b { TkAt -> true _ -> false }
     TkHole       -> match b { TkHole -> true _ -> false }
     TkHoleName(_) -> match b { TkHoleName(_) -> true _ -> false }
+    TkTodoBang   -> match b { TkTodoBang -> true _ -> false }
     TkError(_)   -> false
   }
 }
@@ -1873,6 +1895,7 @@ fn parse_primary(p: Parser) : PExpr {
     TkDot -> ok_e(p_advance(p), mk_expr(EPlaceholder, t.line, t.col))
     TkHole -> ok_e(p_advance(p), mk_expr(EHole(None), t.line, t.col))
     TkHoleName(nm) -> ok_e(p_advance(p), mk_expr(EHole(Some(nm)), t.line, t.col))
+    TkTodoBang -> parse_todo_bang(p, t)
     TkIdent -> parse_ident_primary(p, t)
     TkLparen -> parse_paren_or_lambda(p, t)
     TkLbracket -> parse_list_or_range(p, t)
@@ -1881,6 +1904,50 @@ fn parse_primary(p: Parser) : PExpr {
     TkMatch -> parse_match(p, t)
     TkHandle -> parse_handle(p_advance(p), t)
     _ -> err_e(p_error_here(p, "expected expression"))
+  }
+}
+
+# m7d §1: `todo!(msg)` — `todo!` is a single token (lexer-fused).
+# The message must be a plain (non-triple, no interpolation) string
+# literal so the compile-time `--holes-json` report and the runtime
+# panic message agree on a single static value. The token at `t` is
+# the `todo!`, and `p` is positioned right after it.
+fn parse_todo_bang(p: Parser, t: Token) : PExpr {
+  let p1 = p_advance(p)
+  if not p_at(p1, TkLparen) {
+    err_e(p_error_here(p1, "expected `(` after `todo!`"))
+  } else {
+    let p2 = p_skip_newlines(p_advance(p1))
+    let st = p_peek(p2)
+    if not tk_is(st.kind, TkString) {
+      err_e(p_error(p2, st, "`todo!` requires a literal string message: `todo!(\"...\")`"))
+    } else {
+      let span = tok_source(p2.src, st)
+      let n = string_length(span)
+      let is_triple =
+        n >= 6 and
+        match char_at(span, 0) { Some(c) -> c == '"' _ -> false } and
+        match char_at(span, 1) { Some(c) -> c == '"' _ -> false } and
+        match char_at(span, 2) { Some(c) -> c == '"' _ -> false }
+      if is_triple {
+        err_e(p_error(p2, st, "`todo!` does not accept triple-quoted strings"))
+      } else {
+        let body_start = 1
+        let body_end = n - 1
+        if has_interp(span, body_start, body_end) {
+          err_e(p_error(p2, st,
+            "`todo!` message must be a plain string literal (no interpolation)"))
+        } else {
+          let msg = string_slice(span, body_start, body_end - body_start)
+          let p3 = p_skip_newlines(p_advance(p2))
+          if not p_at(p3, TkRparen) {
+            err_e(p_error_here(p3, "expected `)` after `todo!` message"))
+          } else {
+            ok_e(p_advance(p3), mk_expr(ETodo(msg), t.line, t.col))
+          }
+        }
+      }
+    }
   }
 }
 
@@ -3771,6 +3838,8 @@ fn dump_expr(e: Expr, depth: Int) : Unit {
       let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
       emit_line(depth, "hole #{label} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
     }
+    ETodo(msg) ->
+      emit_line(depth, "todo \"#{msg}\" @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
     EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
       let alias_s = match alias_opt { Some(a) -> string_concat(" as ", a) None -> "" }
       let targs_s = match eff_tyargs {
@@ -4287,6 +4356,7 @@ fn chk_expr(e: Env, x: Expr) : Env {
     }
     EPipe(a, b) -> chk_expr(chk_expr(e, a), b)
     EHole(_) -> e          # holes bind no names; checker lets them pass silently
+    ETodo(_) -> e          # m7d §1: same posture as a hole
     EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
       # m7a #4e: `Eff as log` makes `log` a binding that names
       # the capability inside the body. We push a scope so the
@@ -5563,6 +5633,7 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
     }
     EMatch(scr, arms) -> fv_arms(arms, own, globals, fv_expr(scr, own, globals, acc))
     ELambda(_, _) -> acc                      # nested lambdas collect their own
+    ETodo(_) -> acc
     ERecordLit(_, fields) -> fv_field_inits(fields, own, globals, acc)
     EList(elems) -> fv_list_elems(elems, own, globals, acc)
     ERange(a, b, opt_step) -> {
@@ -5836,6 +5907,7 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     }
     EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
     EHole(_) -> st
+    ETodo(_) -> st
     EHandle(body, eff_name, _, init_opt, _, clauses, ret_opt) -> {
       let stateful = match init_opt { Some(_) -> true None -> false }
       let s_init = match init_opt { Some(ie) -> collect_expr(ie, st) None -> st }
@@ -6294,6 +6366,13 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
       let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
       let msg = cat2("unfilled hole: ", label)
       concat_all(["kai_prelude_panic(kai_str(\"", msg, "\"))"])
+    }
+    ETodo(msg) -> {
+      # m7d §1: `todo!(msg)` lowers to the same panic path as a hole
+      # but with the user-supplied message, prefixed `todo: ` so the
+      # binary's abort tag matches the source-form intent.
+      let full = cat2("todo: ", msg)
+      concat_all(["kai_prelude_panic(kai_str(\"", full, "\"))"])
     }
     EHandle(body, eff_name, _eff_tyargs, init_opt, _alias, clauses, ret_opt) ->
       emit_handle(src, body, eff_name, init_opt, clauses, ret_opt, x.line, x.col, fns, variants, lams)
@@ -7714,6 +7793,7 @@ fn body_escapes(name: String, e: Expr) : Bool {
     EUnder -> false
     EPlaceholder -> false
     EHole(_) -> false
+    ETodo(_) -> false
     EVar(n) -> n == name
     ECall(callee, args_) -> {
       let callee_is_get_set = match callee.kind {
@@ -10212,13 +10292,22 @@ fn collect_records(ds: [Decl]) : [RecInfo] = collect_records_loop(ds, [])
 # through the final sub recovers the concrete type arguments.
 type CallSite = CS(String, Int, Int, [Int])        # name, line, col, fresh ids
 
-# A typed hole site: the name (if named), source position, the
-# fresh TyVarT id that stands in for it during inference, and the
-# env entries visible at that point (snapshot of the locals stack).
-# After inference the fresh id runs through the final sub to
-# recover the expected type.
-type HoleSite = HS(Option[String], Int, Int, Int, [TyEntry], Int)
-#                   name            line col fresh scope      env_fresh
+# A typed hole site: the kind discriminator (m7d §1 splits `?` /
+# `?name` from `todo!(msg)`), source position, the fresh TyVarT id
+# that stands in for it during inference, and the env entries
+# visible at that point (snapshot of the locals stack). After
+# inference the fresh id runs through the final sub to recover the
+# expected type.
+type HoleSite = HS(HoleKind, Int, Int, Int, [TyEntry], Int)
+#                   kind     line col fresh scope      env_fresh
+
+# m7d §1: hole kinds.
+# - `HKHole(None)`     — anonymous `?` (M10).
+# - `HKHole(Some(n))`  — named `?n`. Same `n` shares one TyVarT.
+# - `HKTodo(msg)`      — `todo!(msg)`. Each occurrence is independent
+#   (no name-based sharing), and reporting flags it under
+#   `"kind": "todo"` in `--holes-json`.
+type HoleKind = HKHole(Option[String]) | HKTodo(String)
 
 type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs: [RecInfo], errs: Int,
                     insts: [CallSite], holes: [HoleSite],
@@ -10801,6 +10890,7 @@ fn synth(st: InferState, e: Expr) : Inferred {
     EBlock(stmts, tail)        -> synth_block(st, stmts, tail, e.line, e.col)
     EPipe(lhs, rhs)            -> synth_pipe(st, lhs, rhs, e.line, e.col)
     EHole(nm_opt)              -> synth_hole(st, nm_opt, e)
+    ETodo(msg)                 -> synth_todo(st, msg, e)
     EHandle(_, _, _, _, _, _, _) -> synth_handle(st, e)
   }
 }
@@ -11126,16 +11216,23 @@ fn synth_hole(st: InferState, nm_opt: Option[String], e: Expr) : Inferred {
   match nm_opt {
     Some(nm) -> match find_hole_by_name(st.holes, nm) {
       Some(prior_fresh) -> inferred_leaf(st, TyVarT(prior_fresh), e)
-      None -> register_fresh_hole(st, nm_opt, e)
+      None -> register_fresh_hole(st, HKHole(nm_opt), e)
     }
-    None -> register_fresh_hole(st, nm_opt, e)
+    None -> register_fresh_hole(st, HKHole(nm_opt), e)
   }
 }
 
-fn register_fresh_hole(st: InferState, nm_opt: Option[String], e: Expr) : Inferred {
+# m7d §1: register a `todo!(msg)` site as a hole-with-kind. Each
+# occurrence is independent (no name-based sharing — `todo!` carries
+# a free-form message, not an identifier), so we always allocate a
+# fresh TyVarT.
+fn synth_todo(st: InferState, msg: String, e: Expr) : Inferred =
+  register_fresh_hole(st, HKTodo(msg), e)
+
+fn register_fresh_hole(st: InferState, kind: HoleKind, e: Expr) : Inferred {
   let fresh_id = st.env.fresh
   let st1 = st_set_env(st, fresh_var(st.env))
-  let site = HS(nm_opt, e.line, e.col, fresh_id, st1.env.entries, st1.env.fresh)
+  let site = HS(kind, e.line, e.col, fresh_id, st1.env.entries, st1.env.fresh)
   let st2 = st_push_hole(st1, site)
   inferred_leaf(st2, TyVarT(fresh_id), e)
 }
@@ -11144,9 +11241,12 @@ fn find_hole_by_name(holes: [HoleSite], target: String) : Option[Int] {
   match holes {
     [] -> None
     [h, ...rest] -> match h {
-      HS(nm_opt, _, _, fresh, _, _) -> match nm_opt {
-        Some(nm) -> if nm == target { Some(fresh) } else { find_hole_by_name(rest, target) }
-        None -> find_hole_by_name(rest, target)
+      HS(kind, _, _, fresh, _, _) -> match kind {
+        HKHole(nm_opt) -> match nm_opt {
+          Some(nm) -> if nm == target { Some(fresh) } else { find_hole_by_name(rest, target) }
+          None     -> find_hole_by_name(rest, target)
+        }
+        HKTodo(_) -> find_hole_by_name(rest, target)
       }
     }
   }
@@ -11829,7 +11929,7 @@ fn check_hole_pattern(st: InferState, nm_opt: Option[String], expected: Ty, line
 fn register_fresh_pattern_hole(st: InferState, nm_opt: Option[String], expected: Ty, line: Int, col: Int) : InferState {
   let fresh_id = st.env.fresh
   let st1 = st_set_env(st, fresh_var(st.env))
-  let site = HS(nm_opt, line, col, fresh_id, st1.env.entries, st1.env.fresh)
+  let site = HS(HKHole(nm_opt), line, col, fresh_id, st1.env.entries, st1.env.fresh)
   let st2 = st_push_hole(st1, site)
   st_unify(st2, TyVarT(fresh_id), expected, "pattern hole", line, col)
 }
@@ -12234,8 +12334,8 @@ fn resolve_callsites(css: [CallSite], sub: Subst) : [ResolvedCS] {
 # type from context but can remain a TyVarT if the hole sits in a
 # position that doesn't constrain (e.g. the whole body of a fn with
 # no declared return).
-type ResolvedHole = RH(Option[String], Int, Int, Ty, [TyEntry], Int)
-#                       name            line col expected scope     env_fresh
+type ResolvedHole = RH(HoleKind, Int, Int, Ty, [TyEntry], Int)
+#                       kind     line col expected scope     env_fresh
 
 fn take_entries(es: [TyEntry], n: Int, acc: [TyEntry]) : [TyEntry] {
   if n <= 0 { list_reverse(acc) }
@@ -12255,8 +12355,8 @@ fn resolve_holes(hs: [HoleSite], sub: Subst) : [ResolvedHole] {
   match hs {
     [] -> []
     [h, ...rest] -> match h {
-      HS(nm_opt, line, col, fresh, scope, env_fresh) ->
-        [RH(nm_opt, line, col, apply_ty(sub, TyVarT(fresh)), scope, env_fresh),
+      HS(kind, line, col, fresh, scope, env_fresh) ->
+        [RH(kind, line, col, apply_ty(sub, TyVarT(fresh)), scope, env_fresh),
          ...resolve_holes(rest, sub)]
     }
   }
@@ -12618,6 +12718,7 @@ fn tag_of_kind(k: ExprKind) : String {
       Some(nm) -> concat_all(["hole ?", nm])
       None     -> "hole ?"
     }
+    ETodo(msg)     -> concat_all(["todo \"", msg, "\""])
     EHandle(_, eff_name, _, _, _, _, _) -> concat_all(["handle ", eff_name])
   }
 }
@@ -13650,8 +13751,8 @@ fn dump_hole_candidate(c: String) : Unit =
 
 fn dump_hole_report(file: String, rh: ResolvedHole, prelude_len: Int) : Unit {
   match rh {
-    RH(nm_opt, line, col, ty, scope, env_fresh) -> {
-      let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+    RH(kind, line, col, ty, scope, env_fresh) -> {
+      let label = hole_kind_label(kind)
       let user_scope = drop_last_entries(scope, prelude_len)
       let cands = synth_candidates(scope, ty, env_fresh)
       print("#{file}:#{int_to_string(line)}:#{int_to_string(col)}: type hole #{label}")
@@ -13675,6 +13776,18 @@ fn dump_hole_report(file: String, rh: ResolvedHole, prelude_len: Int) : Unit {
         }
       }
     }
+  }
+}
+
+# Human-readable label for a hole site. `?`, `?name`, or
+# `todo!("msg")`. Used by `--holes` and `--strict-holes`.
+fn hole_kind_label(k: HoleKind) : String {
+  match k {
+    HKHole(nm_opt) -> match nm_opt {
+      Some(nm) -> cat2("?", nm)
+      None     -> "?"
+    }
+    HKTodo(msg) -> concat_all(["todo!(\"", msg, "\")"])
   }
 }
 
@@ -13878,24 +13991,42 @@ fn json_candidates(cs: [String]) : String =
 
 fn json_hole_report(file: String, rh: ResolvedHole) : String {
   match rh {
-    RH(nm_opt, line, col, ty, scope, env_fresh) -> {
-      let name_json = match nm_opt {
-        Some(nm) -> json_str(nm)
-        None     -> json_null()
-      }
+    RH(kind, line, col, ty, scope, env_fresh) -> {
+      let kj = hole_kind_json(kind)
       let cands = synth_candidates(scope, ty, env_fresh)
       concat_all([
         "{",
         "\"file\": ", json_str(file),
         ", \"line\": ", int_to_string(line),
         ", \"col\": ", int_to_string(col),
-        ", \"name\": ", name_json,
+        ", \"kind\": ", kj.kind,
+        ", \"name\": ", kj.name,
+        ", \"message\": ", kj.message,
         ", \"expected_type\": ", json_str(ty_to_string(ty)),
         ", \"in_scope\": ", json_scope_entries(scope),
         ", \"candidates\": ", json_candidates(cands),
         "}"
       ])
     }
+  }
+}
+
+# Triple of JSON fields derived from a HoleKind: the discriminator
+# string, the optional `name` payload (only `?name` populates it),
+# and the optional `message` payload (only `todo!(msg)` populates).
+type HoleKindJson = { kind: String, name: String, message: String }
+
+fn hole_kind_json(k: HoleKind) : HoleKindJson {
+  match k {
+    HKHole(nm_opt) -> {
+      let nm_field = match nm_opt {
+        Some(nm) -> json_str(nm)
+        None     -> json_null()
+      }
+      HoleKindJson { kind: json_str("hole"), name: nm_field, message: json_null() }
+    }
+    HKTodo(msg) ->
+      HoleKindJson { kind: json_str("todo"), name: json_null(), message: json_str(msg) }
   }
 }
 
@@ -13915,11 +14046,11 @@ fn strict_holes_report_loop(file: String, hs: [ResolvedHole]) : Unit {
     [] -> ()
     [h, ...rest] -> {
       match h {
-        RH(nm_opt, line, col, ty, _, _) -> {
-          let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+        RH(kind, line, col, ty, _, _) -> {
+          let label = hole_kind_label(kind)
           diag_error(file, line, col, "unfilled hole #{label} : #{ty_to_string(ty)}")
           diag_help("replace `#{label}` with an expression of type `#{ty_to_string(ty)}`")
-          diag_note("--strict-holes blocks emission until every `?` / `?name` is filled")
+          diag_note("--strict-holes blocks emission until every `?` / `?name` / `todo!` is filled")
         }
       }
       strict_holes_report_loop(file, rest)
@@ -14408,6 +14539,22 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
       ])
       llvm_set_last(llvm_append_body(r.e, p_instr), r.reg)
     }
+    ETodo(msg) -> {
+      # m7d §1: same lowering as a hole, but the panic message is the
+      # user-supplied string prefixed with `todo: `.
+      let full = cat2("todo: ", msg)
+      let name_res = llvm_emit_name_constant(e, full, "todo.msg.")
+      let sreg = llvm_fresh_reg(name_res.e)
+      let s_instr = concat_all([
+        "  ", sreg.reg, " = call %KaiValue* @kaix_str(i8* ", name_res.gep, ")\n"
+      ])
+      let e_s = llvm_append_body(sreg.e, s_instr)
+      let r = llvm_fresh_reg(e_s)
+      let p_instr = concat_all([
+        "  ", r.reg, " = call %KaiValue* @kaix_match_panic(%KaiValue* ", sreg.reg, ")\n"
+      ])
+      llvm_set_last(llvm_append_body(r.e, p_instr), r.reg)
+    }
     _ -> {
       eprint("llvm: unsupported expression kind (#{expr_kind_name(x.kind)}) at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
       llvm_set_last(e, "undef")
@@ -14440,6 +14587,7 @@ fn expr_kind_name(k: ExprKind) : String {
     EBlock(_, _)   -> "EBlock"
     EPipe(_, _)    -> "EPipe"
     EHole(_)       -> "EHole"
+    ETodo(_)       -> "ETodo"
     EHandle(_, _, _, _, _, _, _) -> "EHandle"
   }
 }

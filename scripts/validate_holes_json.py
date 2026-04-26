@@ -11,11 +11,15 @@ REQUIRED = {
     "file",
     "line",
     "col",
+    "kind",
     "name",
+    "message",
     "expected_type",
     "in_scope",
     "candidates",
 }
+
+VALID_KINDS = {"hole", "todo"}
 
 
 def main() -> int:
@@ -31,6 +35,18 @@ def main() -> int:
         missing = REQUIRED - set(row.keys())
         if missing:
             print(f"entry {i}: missing keys {missing}", file=sys.stderr)
+            return 1
+        if row["kind"] not in VALID_KINDS:
+            print(f"entry {i}: kind {row['kind']!r} not in {VALID_KINDS}", file=sys.stderr)
+            return 1
+        if row["kind"] == "hole" and row["message"] is not None:
+            print(f"entry {i}: hole sites must have null message", file=sys.stderr)
+            return 1
+        if row["kind"] == "todo" and row["name"] is not None:
+            print(f"entry {i}: todo sites must have null name", file=sys.stderr)
+            return 1
+        if row["kind"] == "todo" and not isinstance(row["message"], str):
+            print(f"entry {i}: todo sites must have a string message", file=sys.stderr)
             return 1
     return 0
 
