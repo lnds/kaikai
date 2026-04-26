@@ -4154,7 +4154,14 @@ fn prelude_names() : [String] {
     # m8 #8: bounded variant takes (cap: Int, overflow_code: Int).
     "mailbox_alloc", "mailbox_alloc_bounded",
     "mailbox_send", "mailbox_recv", "mailbox_free",
-    "Some", "None", "Ok", "Err"
+    "Some", "None", "Ok", "Err",
+    # m5 #4 — Perceus dup/drop magic names. The pass synthesises
+    # ECall(EVar("__perceus_dup"), [...]) and ECall(EVar("__perceus_drop"),
+    # [...]) AFTER inference; the emitter handles them via special cases
+    # in emit_call_expr. They're listed here so the closure-capture
+    # analyser does not treat them as free vars to capture inside lambda
+    # bodies (which would emit invalid C: `kai___perceus_dup` is undeclared).
+    "__perceus_dup", "__perceus_drop"
   ]
 }
 
@@ -4935,6 +4942,25 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
             "); })"
           ])
           _   -> "kai_unit() /* resume: arity mismatch (expected 1 or 2 args) */"
+        }
+      } else if callee == "__perceus_dup" {
+        # m5 #4 — AST-level dup, lowered to runtime `kai_incref`.
+        # Inserted by `perceus_pass` around every non-last EVar read of
+        # a binding that lives long enough to need an extra reference.
+        match args_e {
+          [a] -> concat_all([
+            "kai_internal_dup(", emit_expr(src, a, fns, variants, lams), ")"
+          ])
+          _   -> "kai_unit() /* __perceus_dup: arity mismatch */"
+        }
+      } else if callee == "__perceus_drop" {
+        # m5 #4 — AST-level drop, lowered to runtime `kai_decref`
+        # (returns Unit so the call site type-checks as KaiValue *).
+        match args_e {
+          [a] -> concat_all([
+            "kai_internal_drop(", emit_expr(src, a, fns, variants, lams), ")"
+          ])
+          _   -> "kai_unit() /* __perceus_drop: arity mismatch */"
         }
       } else if string_contains_dot(callee) {
         # m7a #6c/#6d/#6e: op call `Eff.op(args)`. Look up the
@@ -12818,9 +12844,509 @@ fn monomorphise(tp: TypedProgram) : [Decl] {
 # Reads the source AST as the IR. The emitter consumes whatever this
 # function returns; selfhost convergence remains the gate.
 
-fn perceus_pass(decls: [Decl]) : [Decl] {
-  decls
+# m5 #4 step 2/4 — scope-aware Perceus pass.
+#
+# For each `DFn`, walks the body twice:
+#   1. `pcs_collect_uses_expr` — accumulates `[Use]` for every EVar
+#      whose name is currently in scope (params + lets + match
+#      pattern bindings + handler-clause params + lambda params).
+#      Mirrors `fv_expr` (5478) modulo polarity: we want IN-scope
+#      reads, fv wants free vars.
+#   2. `pcs_rewrite_expr` — reconstructs the body, wrapping every
+#      non-last in-scope EVar in `ECall(EVar("__perceus_dup"), [...])`.
+#      Last-use-per-name is computed via `pcs_last_use_for` (same as
+#      m5 #2 but consumed for rewriting, not just reporting).
+#
+# Then `pcs_prepend_unused_drops` wraps the body in `EBlock` to drop
+# every parameter whose `pcs_last_use_for` is `LUUnused`. Drops emit
+# at body START — safe because the param was never read after entry.
+#
+# Together with the runtime primitive consumption (step 3/4 —
+# blocked on stage 1 needing its own perceus pass; see
+# `docs/perceus-basic.md` §"What unblocks step 3+"), this
+# would produce a coherent linear discipline: every binding
+# transferred at exactly one position (last use); earlier reads
+# bump the refcount via dup; unused params dropped at entry.
+# Inert until step 3 lands.
+
+fn perceus_pass(decls: [Decl]) : [Decl] = map(decls, perceus_decl)
+
+fn perceus_decl(d: Decl) : Decl {
+  match d {
+    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl) -> {
+      let pnames = map(params, (p) => p.pname)
+      let uses = pcs_collect_uses_expr(body, pnames, false, [])
+      let new_body = pcs_rewrite_expr(body, pnames, uses, false)
+      let body_with_drops = pcs_prepend_unused_drops(new_body, params, uses)
+      DFn(is_pub, name, tparams, params, opt_ret, row, body_with_drops, ln, cl)
+    }
+    _ -> d
+  }
 }
+
+# ---- pcs_collect_uses: scope-tracking EVar collection ----
+
+fn pcs_collect_uses_expr(e: Expr, scope: [String], in_lam: Bool, acc: [Use]) : [Use] =
+  pcs_collect_uses_kind(e.kind, e.line, e.col, scope, in_lam, acc)
+
+fn pcs_collect_uses_kind(k: ExprKind, line: Int, col: Int, scope: [String],
+                         in_lam: Bool, acc: [Use]) : [Use] {
+  match k {
+    EVar(nm) -> if list_has(scope, nm) { [U(nm, line, col, in_lam), ...acc] } else { acc }
+    EStr(span, is_triple) -> pcs_collect_uses_in_interp(span, is_triple, scope, in_lam, acc)
+    ECall(f, xs) -> pcs_collect_uses_in_exprs(xs, scope, in_lam,
+                       pcs_collect_uses_expr(f, scope, in_lam, acc))
+    EField(x, _) -> pcs_collect_uses_expr(x, scope, in_lam, acc)
+    EIndex(x, i) -> pcs_collect_uses_expr(i, scope, in_lam,
+                       pcs_collect_uses_expr(x, scope, in_lam, acc))
+    EBinop(_, l, r) -> pcs_collect_uses_expr(r, scope, in_lam,
+                          pcs_collect_uses_expr(l, scope, in_lam, acc))
+    EUnop(_, x) -> pcs_collect_uses_expr(x, scope, in_lam, acc)
+    EIf(c, t, opt_e) -> {
+      let a1 = pcs_collect_uses_expr(c, scope, in_lam, acc)
+      let a2 = pcs_collect_uses_expr(t, scope, in_lam, a1)
+      match opt_e {
+        None -> a2
+        Some(e2) -> pcs_collect_uses_expr(e2, scope, in_lam, a2)
+      }
+    }
+    EMatch(s, arms) -> pcs_collect_uses_in_arms(arms, scope, in_lam,
+                          pcs_collect_uses_expr(s, scope, in_lam, acc))
+    ELambda(ps, body) -> {
+      let pn = map(ps, (p) => p.pname)
+      pcs_collect_uses_expr(body, list_append(scope, pn), true, acc)
+    }
+    ERecordLit(_, fis) -> pcs_collect_uses_in_field_inits(fis, scope, in_lam, acc)
+    EList(elems) -> pcs_collect_uses_in_list_elems(elems, scope, in_lam, acc)
+    ERange(lo, hi, opt_by) -> {
+      let a1 = pcs_collect_uses_expr(lo, scope, in_lam, acc)
+      let a2 = pcs_collect_uses_expr(hi, scope, in_lam, a1)
+      match opt_by {
+        None -> a2
+        Some(e2) -> pcs_collect_uses_expr(e2, scope, in_lam, a2)
+      }
+    }
+    EBlock(stmts, opt_tail) -> pcs_collect_uses_in_block(stmts, opt_tail, scope, in_lam, acc)
+    EPipe(l, r) -> pcs_collect_uses_expr(r, scope, in_lam,
+                      pcs_collect_uses_expr(l, scope, in_lam, acc))
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let a1 = pcs_collect_uses_expr(body, scope, in_lam, acc)
+      let a2 = match init_opt {
+        None -> a1
+        Some(e2) -> pcs_collect_uses_expr(e2, scope, in_lam, a1)
+      }
+      let a3 = pcs_collect_uses_in_clauses(clauses, scope, in_lam, a2)
+      match ret_opt {
+        None -> a3
+        Some(hr) -> match hr {
+          HR(pname, body2, _, _) ->
+            pcs_collect_uses_expr(body2, [pname, ...scope], in_lam, a3)
+        }
+      }
+    }
+    _ -> acc
+  }
+}
+
+fn pcs_collect_uses_in_exprs(es: [Expr], scope: [String], in_lam: Bool, acc: [Use]) : [Use] {
+  match es {
+    [] -> acc
+    [h, ...rest] -> pcs_collect_uses_in_exprs(rest, scope, in_lam,
+                       pcs_collect_uses_expr(h, scope, in_lam, acc))
+  }
+}
+
+fn pcs_collect_uses_in_arms(arms: [Arm], scope: [String], in_lam: Bool, acc: [Use]) : [Use] {
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a {
+      Arm(pat, opt_g, body) -> {
+        let scope1 = pat_bindings(pat, scope)
+        let a1 = match opt_g {
+          None -> acc
+          Some(g) -> pcs_collect_uses_expr(g, scope1, in_lam, acc)
+        }
+        let a2 = pcs_collect_uses_expr(body, scope1, in_lam, a1)
+        pcs_collect_uses_in_arms(rest, scope, in_lam, a2)
+      }
+    }
+  }
+}
+
+fn pcs_collect_uses_in_field_inits(fis: [FieldInit], scope: [String],
+                                    in_lam: Bool, acc: [Use]) : [Use] {
+  match fis {
+    [] -> acc
+    [h, ...rest] -> match h {
+      FI(_, e) -> pcs_collect_uses_in_field_inits(rest, scope, in_lam,
+                     pcs_collect_uses_expr(e, scope, in_lam, acc))
+    }
+  }
+}
+
+fn pcs_collect_uses_in_list_elems(es: [ListElem], scope: [String],
+                                   in_lam: Bool, acc: [Use]) : [Use] {
+  match es {
+    [] -> acc
+    [h, ...rest] -> {
+      let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+      pcs_collect_uses_in_list_elems(rest, scope, in_lam,
+        pcs_collect_uses_expr(inner, scope, in_lam, acc))
+    }
+  }
+}
+
+fn pcs_collect_uses_in_block(stmts: [Stmt], opt_tail: Option[Expr],
+                              scope: [String], in_lam: Bool, acc: [Use]) : [Use] {
+  let r = pcs_block_loop(stmts, scope, in_lam, acc)
+  match opt_tail {
+    None -> r.acc
+    Some(e) -> pcs_collect_uses_expr(e, r.scope, in_lam, r.acc)
+  }
+}
+
+type PcsBlockState = { scope: [String], acc: [Use] }
+
+fn pcs_block_loop(stmts: [Stmt], scope: [String], in_lam: Bool,
+                   acc: [Use]) : PcsBlockState {
+  match stmts {
+    [] -> PcsBlockState { scope: scope, acc: acc }
+    [s, ...rest] -> {
+      let nxt = match s {
+        SLet(pat, _, rhs) -> {
+          let acc1 = pcs_collect_uses_expr(rhs, scope, in_lam, acc)
+          PcsBlockState { scope: pat_bindings(pat, scope), acc: acc1 }
+        }
+        SVar(name, _, rhs, _, _) -> {
+          let acc1 = pcs_collect_uses_expr(rhs, scope, in_lam, acc)
+          PcsBlockState { scope: [name, ...scope], acc: acc1 }
+        }
+        SAssert(c, opt_m) -> {
+          let a1 = pcs_collect_uses_expr(c, scope, in_lam, acc)
+          let a2 = match opt_m {
+            None -> a1
+            Some(m) -> pcs_collect_uses_expr(m, scope, in_lam, a1)
+          }
+          PcsBlockState { scope: scope, acc: a2 }
+        }
+        SExprStmt(e) ->
+          PcsBlockState { scope: scope, acc: pcs_collect_uses_expr(e, scope, in_lam, acc) }
+        SIndexAssign(b, i, v, _, _) -> {
+          let a1 = pcs_collect_uses_expr(b, scope, in_lam, acc)
+          let a2 = pcs_collect_uses_expr(i, scope, in_lam, a1)
+          let a3 = pcs_collect_uses_expr(v, scope, in_lam, a2)
+          PcsBlockState { scope: scope, acc: a3 }
+        }
+      }
+      pcs_block_loop(rest, nxt.scope, in_lam, nxt.acc)
+    }
+  }
+}
+
+fn pcs_collect_uses_in_clauses(cs: [HClause], scope: [String], in_lam: Bool,
+                                acc: [Use]) : [Use] {
+  match cs {
+    [] -> acc
+    [h, ...rest] -> match h {
+      HC(_, params, body, _, _) -> {
+        # Filter out the trailing `resume` param. `resume(v)` is
+        # emitted via a special case in emit_call_expr (and
+        # llvm_emit_call) and has no runtime KaiValue representation,
+        # so wrapping `EVar("resume")` in `__perceus_dup` would route
+        # the inner `resume` through `emit_ident_value`'s `kai_resume`
+        # fallback, which is undeclared.
+        let pn = pcs_filter_non_resume(map(params, (p) => p.pname), [])
+        let scope1 = list_append(scope, ["state", "log", ...pn])
+        pcs_collect_uses_in_clauses(rest, scope, in_lam,
+          pcs_collect_uses_expr(body, scope1, in_lam, acc))
+      }
+    }
+  }
+}
+
+fn pcs_filter_non_resume(names: [String], acc: [String]) : [String] {
+  match names {
+    [] -> list_reverse(acc)
+    [h, ...rest] ->
+      if h == "resume" { pcs_filter_non_resume(rest, acc) }
+      else { pcs_filter_non_resume(rest, [h, ...acc]) }
+  }
+}
+
+fn pcs_collect_uses_in_interp(span: String, is_triple: Bool, scope: [String],
+                               in_lam: Bool, acc: [Use]) : [Use] {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  let parts = iscan_collect(span, body_end,
+                            IScan { parts: [], lit_start: body_start, i: body_start })
+  pcs_collect_uses_interp_parts(parts, scope, in_lam, acc)
+}
+
+fn pcs_collect_uses_interp_parts(parts: [IPart], scope: [String], in_lam: Bool,
+                                   acc: [Use]) : [Use] {
+  match parts {
+    [] -> acc
+    [p, ...rest] -> match p {
+      IpLit(_, _) -> pcs_collect_uses_interp_parts(rest, scope, in_lam, acc)
+      IpExp(esrc) -> {
+        let toks = tokenize(esrc)
+        let prs = parser_new("<interp>", esrc, toks)
+        let r = parse_expr(prs)
+        let acc1 = match r.r {
+          Some(e) -> pcs_collect_uses_expr(e, scope, in_lam, acc)
+          None -> acc
+        }
+        pcs_collect_uses_interp_parts(rest, scope, in_lam, acc1)
+      }
+    }
+  }
+}
+
+# ---- pcs_rewrite: wrap non-last in-scope EVar reads in __perceus_dup ----
+
+fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool) : Expr =
+  Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam),
+         line: e.line, col: e.col, ty: e.ty }
+
+fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
+                    uses: [Use], in_lam: Bool) : ExprKind {
+  match k {
+    EVar(nm) -> {
+      if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam) {
+        ECall(
+          Expr { kind: EVar("__perceus_dup"), line: line, col: col, ty: None },
+          [Expr { kind: EVar(nm), line: line, col: col, ty: None }]
+        )
+      } else { EVar(nm) }
+    }
+    ECall(f, xs) -> ECall(pcs_rewrite_expr(f, scope, uses, in_lam),
+                          pcs_rewrite_exprs(xs, scope, uses, in_lam))
+    EField(x, fname) -> EField(pcs_rewrite_expr(x, scope, uses, in_lam), fname)
+    EIndex(x, i) -> EIndex(pcs_rewrite_expr(x, scope, uses, in_lam),
+                           pcs_rewrite_expr(i, scope, uses, in_lam))
+    EBinop(op, l, r) -> EBinop(op, pcs_rewrite_expr(l, scope, uses, in_lam),
+                                   pcs_rewrite_expr(r, scope, uses, in_lam))
+    EUnop(op, x) -> EUnop(op, pcs_rewrite_expr(x, scope, uses, in_lam))
+    EIf(c, t, opt_e) -> EIf(
+      pcs_rewrite_expr(c, scope, uses, in_lam),
+      pcs_rewrite_expr(t, scope, uses, in_lam),
+      match opt_e {
+        None -> None
+        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam))
+      }
+    )
+    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam),
+                              pcs_rewrite_arms(arms, scope, uses, in_lam))
+    ELambda(ps, body) -> {
+      let pn = map(ps, (p) => p.pname)
+      ELambda(ps, pcs_rewrite_expr(body, list_append(scope, pn), uses, true))
+    }
+    ERecordLit(name, fis) -> ERecordLit(name, pcs_rewrite_field_inits(fis, scope, uses, in_lam))
+    EList(elems) -> EList(pcs_rewrite_list_elems(elems, scope, uses, in_lam))
+    ERange(lo, hi, opt_by) -> ERange(
+      pcs_rewrite_expr(lo, scope, uses, in_lam),
+      pcs_rewrite_expr(hi, scope, uses, in_lam),
+      match opt_by {
+        None -> None
+        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam))
+      }
+    )
+    EBlock(stmts, opt_tail) -> {
+      let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [])
+      EBlock(r.stmts, match opt_tail {
+        None -> None
+        Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam))
+      })
+    }
+    EPipe(l, r) -> EPipe(pcs_rewrite_expr(l, scope, uses, in_lam),
+                          pcs_rewrite_expr(r, scope, uses, in_lam))
+    EHandle(body, eff, eff_tas, init_opt, alias, clauses, ret_opt) -> {
+      let body1 = pcs_rewrite_expr(body, scope, uses, in_lam)
+      let init1 = match init_opt {
+        None -> None
+        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam))
+      }
+      let cls1 = pcs_rewrite_clauses(clauses, scope, uses, in_lam)
+      let ret1 = match ret_opt {
+        None -> None
+        Some(hr) -> match hr {
+          HR(pname, body2, hl, hc) ->
+            Some(HR(pname,
+                    pcs_rewrite_expr(body2, [pname, ...scope], uses, in_lam),
+                    hl, hc))
+        }
+      }
+      EHandle(body1, eff, eff_tas, init1, alias, cls1, ret1)
+    }
+    _ -> k
+  }
+}
+
+fn pcs_rewrite_exprs(es: [Expr], scope: [String], uses: [Use], in_lam: Bool) : [Expr] {
+  match es {
+    [] -> []
+    [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, in_lam),
+                     ...pcs_rewrite_exprs(rest, scope, uses, in_lam)]
+  }
+}
+
+fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool) : [Arm] {
+  match arms {
+    [] -> []
+    [a, ...rest] -> match a {
+      Arm(pat, opt_g, body) -> {
+        let scope1 = pat_bindings(pat, scope)
+        let g1 = match opt_g {
+          None -> None
+          Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam))
+        }
+        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam)
+        [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam)]
+      }
+    }
+  }
+}
+
+fn pcs_rewrite_field_inits(fis: [FieldInit], scope: [String], uses: [Use],
+                            in_lam: Bool) : [FieldInit] {
+  match fis {
+    [] -> []
+    [h, ...rest] -> match h {
+      FI(nm, e) -> [FI(nm, pcs_rewrite_expr(e, scope, uses, in_lam)),
+                    ...pcs_rewrite_field_inits(rest, scope, uses, in_lam)]
+    }
+  }
+}
+
+fn pcs_rewrite_list_elems(es: [ListElem], scope: [String], uses: [Use],
+                           in_lam: Bool) : [ListElem] {
+  match es {
+    [] -> []
+    [h, ...rest] -> {
+      let h1 = match h {
+        ElPlain(e) -> ElPlain(pcs_rewrite_expr(e, scope, uses, in_lam))
+        ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam))
+      }
+      [h1, ...pcs_rewrite_list_elems(rest, scope, uses, in_lam)]
+    }
+  }
+}
+
+type PcsRwBlock = { stmts: [Stmt], scope: [String] }
+
+fn pcs_rewrite_block(stmts: [Stmt], scope: [String], uses: [Use], in_lam: Bool,
+                     acc: [Stmt]) : PcsRwBlock {
+  match stmts {
+    [] -> PcsRwBlock { stmts: list_reverse(acc), scope: scope }
+    [s, ...rest] -> {
+      let r = pcs_rewrite_stmt(s, scope, uses, in_lam)
+      pcs_rewrite_block(rest, r.scope, uses, in_lam, [r.stmt, ...acc])
+    }
+  }
+}
+
+type PcsRwStmt = { stmt: Stmt, scope: [String] }
+
+fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool) : PcsRwStmt {
+  match s {
+    SLet(pat, ty_opt, rhs) -> {
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam)
+      PcsRwStmt { stmt: SLet(pat, ty_opt, rhs1), scope: pat_bindings(pat, scope) }
+    }
+    SVar(name, ty_opt, rhs, ln, cl) -> {
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam)
+      PcsRwStmt { stmt: SVar(name, ty_opt, rhs1, ln, cl), scope: [name, ...scope] }
+    }
+    SAssert(c, opt_m) -> {
+      let c1 = pcs_rewrite_expr(c, scope, uses, in_lam)
+      let m1 = match opt_m {
+        None -> None
+        Some(m) -> Some(pcs_rewrite_expr(m, scope, uses, in_lam))
+      }
+      PcsRwStmt { stmt: SAssert(c1, m1), scope: scope }
+    }
+    SExprStmt(e) -> {
+      let e1 = pcs_rewrite_expr(e, scope, uses, in_lam)
+      PcsRwStmt { stmt: SExprStmt(e1), scope: scope }
+    }
+    SIndexAssign(b, i, v, ln, cl) -> {
+      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam)
+      let i1 = pcs_rewrite_expr(i, scope, uses, in_lam)
+      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam)
+      PcsRwStmt { stmt: SIndexAssign(b1, i1, v1, ln, cl), scope: scope }
+    }
+  }
+}
+
+fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
+                        in_lam: Bool) : [HClause] {
+  match cs {
+    [] -> []
+    [h, ...rest] -> match h {
+      HC(op, params, body, ln, cl) -> {
+        let pn = pcs_filter_non_resume(map(params, (p) => p.pname), [])
+        let scope1 = list_append(scope, ["state", "log", ...pn])
+        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam)
+        [HC(op, params, body1, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam)]
+      }
+    }
+  }
+}
+
+# Last-use predicate, modeled on `last_use_for` but returning a Bool
+# directly. A name is non-last when (a) it appears in a closure
+# (in_lam==true at the use site), or (b) the use's (line, col) is
+# strictly less than the max non-in-lam position recorded for the
+# name. LUUnused names cannot reach this predicate (they have no
+# uses to be wrapped).
+
+fn pcs_is_non_last(nm: String, line: Int, col: Int, uses: [Use],
+                   in_lam_here: Bool) : Bool {
+  if in_lam_here { true }
+  else {
+    match last_use_for(nm, uses) {
+      LUAt(_, ml, mc) -> not (line == ml and col == mc)
+      LUBlocked(_) -> true
+      LUUnused(_) -> false
+    }
+  }
+}
+
+# ---- unused-param drops at body start ----
+
+fn pcs_prepend_unused_drops(body: Expr, params: [Param], uses: [Use]) : Expr {
+  let drops = pcs_collect_param_drops(params, uses, [])
+  match drops {
+    [] -> body
+    [_, ...__] -> Expr {
+      kind: EBlock(drops, Some(body)),
+      line: body.line, col: body.col, ty: body.ty
+    }
+  }
+}
+
+fn pcs_collect_param_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
+  match params {
+    [] -> list_reverse(acc)
+    [p, ...rest] -> {
+      let acc1 = match last_use_for(p.pname, uses) {
+        LUUnused(_) -> [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...acc]
+        _ -> acc
+      }
+      pcs_collect_param_drops(rest, uses, acc1)
+    }
+  }
+}
+
+fn pcs_make_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
+  SExprStmt(Expr {
+    kind: ECall(
+      Expr { kind: EVar("__perceus_drop"), line: ln, col: cl, ty: None },
+      [Expr { kind: EVar(nm), line: ln, col: cl, ty: None }]
+    ),
+    line: ln, col: cl, ty: None
+  })
 
 # ---- m5 #2 — last-use analysis (fn-param scope) ----
 #
@@ -13431,6 +13957,8 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_int(i64)\n",
     "declare %KaiValue* @kaix_bool(i32)\n",
     "declare i32           @kaix_truthy(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_internal_dup(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_internal_drop(%KaiValue*)\n",
     "declare %KaiValue* @kaix_add(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_sub(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_mul(%KaiValue*, %KaiValue*)\n",
@@ -14136,17 +14664,31 @@ fn llvm_closure_error(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit {
 
 fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
   match callee.kind {
-    EVar(nm) -> match evar_find(e.vars_, nm) {
-      Some(_) -> llvm_emit_variant_ctor(e, nm, xs)
-      None -> match llvm_local_find_loop(e.locals, nm) {
-        Some(reg) -> llvm_emit_apply(e, reg, xs)
-        None      -> {
-          let ra = llvm_emit_args(e, xs, [])
-          let sym = if llvm_is_prelude_fn(nm) { llvm_prelude_symbol(nm) } else { string_concat("@kai_", nm) }
-          let r = llvm_fresh_reg(ra.st)
-          let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
-                                  llvm_format_args(ra.regs), ")\n"])
-          llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+    EVar(nm) -> {
+      # m5 #4 — same dup/drop magic-name handling as the C emit
+      # (`emit_call_expr` 4920-4937). Lower to direct `kaix_internal_*`
+      # calls. Both names take exactly one arg.
+      if nm == "__perceus_dup" or nm == "__perceus_drop" {
+        let sym = if nm == "__perceus_dup" { "@kaix_internal_dup" } else { "@kaix_internal_drop" }
+        let ra = llvm_emit_args(e, xs, [])
+        let r = llvm_fresh_reg(ra.st)
+        let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
+                                llvm_format_args(ra.regs), ")\n"])
+        llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+      } else {
+        match evar_find(e.vars_, nm) {
+          Some(_) -> llvm_emit_variant_ctor(e, nm, xs)
+          None -> match llvm_local_find_loop(e.locals, nm) {
+            Some(reg) -> llvm_emit_apply(e, reg, xs)
+            None      -> {
+              let ra = llvm_emit_args(e, xs, [])
+              let sym = if llvm_is_prelude_fn(nm) { llvm_prelude_symbol(nm) } else { string_concat("@kai_", nm) }
+              let r = llvm_fresh_reg(ra.st)
+              let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
+                                      llvm_format_args(ra.regs), ")\n"])
+              llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+            }
+          }
         }
       }
     }
