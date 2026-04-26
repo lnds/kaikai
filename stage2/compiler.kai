@@ -4644,6 +4644,8 @@ fn check_row_labels_loop(labels: [RowLabel], file: String, line: Int, col: Int,
           if not list_has(eff_names, name) {
             let _ = diag_error(file, line, col,
               string_concat("unknown effect: ", name))
+            let _ = diag_note("only declared `effect Foo { ... }` names and the catalog (Console, Fail, Stdin, Env, File, State, Reader, Writer, Mutable) are valid in a row")
+            let _ = diag_help("declare `effect #{name} { ... }` first, or fix the spelling")
             1
           } else {
             match lookup_arity(arities, name) {
@@ -4656,6 +4658,13 @@ fn check_row_labels_loop(labels: [RowLabel], file: String, line: Int, col: Int,
                                 int_to_string(want),
                                 " type argument(s), got ",
                                 int_to_string(got)]))
+                  let _ = diag_note("the parametric label must match the effect's `[...]` declaration")
+                  let _ = diag_help(
+                    if got > want {
+                      concat_all(["drop ", int_to_string(got - want), " type argument(s) from `", name, "[...]`"])
+                    } else {
+                      concat_all(["add ", int_to_string(want - got), " more type argument(s) to `", name, "[...]`"])
+                    })
                   1
                 }
             }
@@ -8327,6 +8336,8 @@ fn resolve_alias(name: String, cands: [AliasCand], cand_ns: [String],
       let pos = cand_pos(cands, name)
       diag_error(file, pos.line, pos.col,
         string_concat("cyclic effect alias: ", name))
+      diag_note("an alias can only expand to declared effects, not back to itself")
+      diag_help("break the cycle: list each effect explicitly in the body of `type #{name} = ...`")
       let st2 = AliasResolveState {
         entries: alias_set_status(st.entries, name, AsFail),
         errs:    st.errs + 1
@@ -10840,7 +10851,9 @@ fn check_clause_names(st: InferState, eff: String, cs: [HClause],
               string_concat("unknown op `",
                 string_concat(name,
                   string_concat("` on effect `",
-                    string_concat(eff, "` (handler clause does not match any declared op)")))))
+                    string_concat(eff, "`")))))
+            diag_note("handler clauses must match an op declared in `effect #{eff} { ... }`")
+            diag_help("either remove this clause, or add `#{name}(...)` to the effect declaration")
             check_clause_names(st_bump_err(st), eff, rest, line, col)
           }
         }
@@ -11002,6 +11015,8 @@ fn synth_resume_call(st: InferState, rb: ResumeBind, args_: [Expr],
         _ -> {
           diag_error(rv.st.file, line, col,
             "resume call: expected 1 or 2 arguments inside a stateful clause")
+          diag_note("`resume(v)` resumes with the answer; `resume(v, ns)` also writes the new handler state")
+          diag_help("for `with State[T]` and `with Writer[W]`, use `resume(v, new_state)`; otherwise `resume(v)`")
           st_bump_err(rv.st)
         }
       }
@@ -11089,8 +11104,10 @@ fn string_has_prefix(s: String, p: String) : Bool {
 fn synth_op_call_unknown_op(st: InferState, eff_name: String, op_name: String,
                              line: Int, col: Int) : Inferred {
   diag_error(st.file, line, col,
-    string_concat("unknown op ", string_concat(op_name,
-      string_concat(" on effect ", eff_name))))
+    string_concat("unknown op `", string_concat(op_name,
+      string_concat("` on effect `", string_concat(eff_name, "`")))))
+  diag_note("`#{eff_name}.#{op_name}` is not declared in `effect #{eff_name} { ... }`")
+  diag_help("declare `#{op_name}(...)` inside the effect, or call an existing op")
   let st1 = st_bump_err(st)
   mk_inferred(st1, TyAny, with_ty(mk_expr(EVar(eff_name), line, col), TyAny))
 }
@@ -11643,20 +11660,29 @@ fn check_unknown_subpats(st: InferState, ps: [Pattern]) : InferState {
 }
 
 fn check_subpat_list(st: InferState, ps: [Pattern], tys: [Ty], line: Int, col: Int) : InferState {
+  variant_arity_check(st, ps, tys, line, col, list_length(tys), list_length(ps))
+}
+
+fn variant_arity_check(st: InferState, ps: [Pattern], tys: [Ty],
+                        line: Int, col: Int, expected: Int, found: Int) : InferState {
   match ps {
     [] -> match tys {
       [] -> st
       _  -> {
-        diag_error(st.file, line, col, "variant pattern arity mismatch")
+        diag_error(st.file, line, col, "variant pattern has too few sub-patterns")
+        diag_note("expected #{int_to_string(expected)}, found #{int_to_string(found)}")
+        diag_help("add #{int_to_string(expected - found)} more sub-pattern(s), or use a wildcard `_` for each")
         st_bump_err(st)
       }
     }
     [p, ...pr] -> match tys {
       [] -> {
-        diag_error(st.file, line, col, "variant pattern arity mismatch")
+        diag_error(st.file, line, col, "variant pattern has too many sub-patterns")
+        diag_note("expected #{int_to_string(expected)}, found #{int_to_string(found)}")
+        diag_help("remove #{int_to_string(found - expected)} sub-pattern(s) so the count matches the variant's declared arity")
         st_bump_err(st)
       }
-      [t, ...tr] -> check_subpat_list(check_pattern(st, p, t), pr, tr, line, col)
+      [t, ...tr] -> variant_arity_check(check_pattern(st, p, t), pr, tr, line, col, expected, found)
     }
   }
 }
@@ -12826,6 +12852,8 @@ fn strict_holes_report_loop(file: String, hs: [ResolvedHole]) : Unit {
         RH(nm_opt, line, col, ty, _, _) -> {
           let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
           diag_error(file, line, col, "unfilled hole #{label} : #{ty_to_string(ty)}")
+          diag_help("replace `#{label}` with an expression of type `#{ty_to_string(ty)}`")
+          diag_note("--strict-holes blocks emission until every `?` / `?name` is filled")
         }
       }
       strict_holes_report_loop(file, rest)
