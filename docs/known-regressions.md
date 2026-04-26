@@ -13,7 +13,10 @@ re-discover anything.
 
 **Status**: open since 2026-04-25, surfaced after merging `m5-stdlib`
 (commit `939705f`) and confirmed still present after merging `m8`
-(commit `4e4a5b6`).
+(commit `4e4a5b6`) and after the m7b sweep that closed #14, #15,
+#16, #17, #2a, #2b, #2c, #4, #7 (last verified 2026-04-26 against
+main `fc17034`). None of those sub-tasks touched the row-unify
+path; the bug is upstream of any single m7b item.
 
 **Severity**: medium. `make test` is **green** — every official
 fixture under `examples/` compiles. The regression manifests only
@@ -137,8 +140,25 @@ m7b #12 (open row variables). Specifically, the moment a generic
 function is instantiated at its call site **inside the elaboration
 of a polymorphic function whose own row has not yet collapsed**.
 
-The agent that lands m7b #14 or audits the row-unification rules
-post-m7b is the natural owner.
+The error shape after the m7b sweep:
+
+```
+expected: ([a], a) -> Bool
+found:    ([Int], Int) -> ?t5 / ?e1
+```
+
+`expected` is the registered scheme (no row — `list_contains`'s
+declared signature is `: Bool` with no `/ row`). `found` is the
+self-call's instantiation: tyvars are bound (`a := Int`) but a
+fresh row var `?e1` survives. The mismatch is row-shape: empty
+row vs row-with-free-var. In a pure caller, `?e1` ends up unified
+to `{}` by some side-channel (TBD); in an effectful caller, it
+stays free.
+
+The owner is the next agent who **specifically audits the row
+side of `unify_*` and `synth_app`** in stage2/compiler.kai. The
+m7b sweep (#14, #15, #16, #17, #2a-c, #4, #7) closed in 2026-04-26
+without touching this path — none of those tasks needed it.
 
 ### Verification path
 
