@@ -53,6 +53,7 @@ on.
 | `++` operator (string + list concat)       | scheduled m7d | parser + 2 typer rules |
 | `main()` row inference                     | scheduled m7e | typer + runtime default loader |
 | `use Effect` — open effect in scope        | scheduled m7e | parser + resolver scoping |
+| Protocols (single-dispatch)                | scheduled m12.8 | parser + resolver + vtable codegen |
 
 ## 1. `todo!(msg) : T` — principled unimplemented
 
@@ -1325,6 +1326,118 @@ underlying resolution mechanism is the same.
 (`main()` row inference). The two ergonomic wins compose into
 "hello-world is one line" — the most-asked first impression of
 any new language.
+
+## 26. Protocols — single-dispatch ad-hoc polymorphism
+
+```kai
+protocol Show {
+  show(x: Self) : String
+}
+
+impl Show for Money[u: Unit] {
+  show(m) = decimal_repr(m.amount) ++ " " ++ unit_name(u)
+}
+
+let usd = 100.50<USD>
+println("balance: #{usd}")            # "balance: 100.50 USD"
+```
+
+Explicit `protocol` declarations + `impl` blocks. **Single dispatch**
+on the first-position type tag. Modeled on Clojure protocols, Elixir
+protocols, Go interfaces (with explicit declaration), and the
+lightweight subset of Rust traits.
+
+This is **not** Haskell typeclasses. Specifically: no higher-kinded
+types, no constraints in signatures, no functional dependencies, no
+type families, no superclass constraints, no overlapping instances.
+Single dispatch only.
+
+### Why this is consistent with CLAUDE.md
+
+CLAUDE.md Tier 1 #3 prohibits "type-class resolution". The phrase
+targets the Haskell-style solver — constraint propagation, instance
+chains, multi-param dispatch with functional dependencies — which is
+the source of slow compile times and subtle resolution rules.
+
+Single-dispatch protocols (Go / Clojure / Elixir / Rust traits in
+their non-HKT form) do **not** invoke that solver. Resolution is an
+`O(1)` hash lookup by `(protocol, type)` pair, scoped to the
+transitively imported impl table. Coherence is enforced by the
+orphan rule (impl must live in the protocol's module or the type's
+module) plus single-impl-per-pair check. No constraint propagation.
+
+The distinction is real and well-attested:
+
+| Capability | Haskell typeclass | kaikai protocol |
+|---|---|---|
+| Higher-kinded types | yes (`Functor`, `Monad`, ...) | **no** |
+| Constraints in signatures | `Show a => a -> String` | **no** |
+| Multi-param classes | yes (with fundeps) | **no** (single dispatch) |
+| Type families | yes | **no** |
+| Compile cost | high (solver) | low (`O(1)` lookup) |
+| Runtime cost | mostly direct (after monomorph) | direct when monomorphic, 1 indirection otherwise |
+
+CLAUDE.md should be amended to clarify the distinction; the m12.8
+milestone includes that doc update.
+
+### What it buys
+
+- **`#{x}` works for any type with `impl Show`**. The interpolation
+  no longer requires explicit conversion functions for primitive-like
+  types or the user's custom data.
+- **One mechanism, multiple uses**: `Show`, `Eq`, `Ord`, `Hash`,
+  `Serialize` all share the same machinery. Users add new protocols
+  for domain-specific cases (`Auditable`, `Renderable`, etc.) within
+  the same coherence rules.
+- **`#derive(Show, Eq)` for records**: structural impls auto-generated
+  by the compiler when the user opts in via the `#derive` annotation.
+
+### What it costs
+
+- **Parser**: `protocol`, `impl`, `Self`, `#derive` keywords. ~50
+  lines.
+- **Resolver**: per-module impl table; orphan-rule check; single-impl
+  enforcement. ~60 lines.
+- **Typer**: resolve protocol op calls; substitute the impl function
+  during monomorphization. ~50 lines.
+- **Codegen**: vtable per `(protocol, type)` pair; lookup helper for
+  late-binding sites. ~50 lines (C backend; LLVM port follows the
+  m7c pattern).
+- **Stdlib**: declare `Show` / `Eq` / `Ord` / `Hash` / `Serialize`;
+  impls for primitives. ~80 lines.
+- **`#derive` annotation**: structural-impl generator. ~50 lines.
+- **Tests**: ~80 lines.
+
+Total ~450 lines, **2-3 days at observed velocity**.
+
+### Constraints
+
+- **Single dispatch only**. Two-arg dispatch (e.g. `convert(from: T,
+  to: U)`) is not supported. Workaround: free function with explicit
+  match.
+- **Pure protocols**: protocol ops cannot have effect rows. Behaviour
+  with effects (audit, log, persist) goes via effects, not protocols.
+- **Closed coherence**: orphan rule enforced at compile time. No
+  global registry, no overlapping impls.
+- **Opt-in derivation**: `#derive(Show)` is required for auto-generated
+  impls on records / sum types. No silent default impls.
+- **No HKT, ever**. Re-opening this means a separate proposal with
+  fresh cost analysis, not extension of this one.
+
+### Reference
+
+- Clojure protocols: <https://clojure.org/reference/protocols>
+- Clojure multimethods: <https://clojure.org/reference/multimethods>
+  (more flexible dispatch; kaikai picks the simpler protocol model)
+- Elixir protocols: `defprotocol` + `defimpl`
+- Go interfaces: structural typing without explicit `impl`; kaikai
+  picks the explicit-impl model for clarity at impl sites
+- Rust traits: kaikai's design subset is "traits without HKT,
+  without GAT, without `dyn`, without coherence-orphan-tricks"
+
+**Decision posture**: scheduled m12.8, after m12.7 axiom and before
+m13. Lands as its own milestone with full design doc in
+`docs/protocols.md`.
 
 ## Deliberately not on this list
 
