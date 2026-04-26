@@ -1932,14 +1932,35 @@ Split into four sub-tasks, landed in order, each its own branch
    loops (fn, decls, lambda). The discard/longjmp path lives
    in m7c-d (it needs the clause body + setjmp landing pad to
    exist). **Landed.**
-4. **m7c-d — Clauses + default-handler wrappers**. Each
-   `HClause` becomes a top-level LLVM function (mirroring the
-   C side's `_kai_clause_<line>_<col>_<op>`). The `default_*_setup`
-   helpers also need an LLVM analogue — they install evidence
-   nodes around `@kai_main` for builtins that appear in main's
-   row. End-to-end gate: every `m7a_*` / `m7b_*` fixture passes
-   `make -C stage2 test-llvm` (a new make target paralleling the
-   existing `test-effects`). *Pending.*
+4. **m7c-d — Clauses + default-handler wrappers**.
+   `llvm_emit_clause_body` walks each clause's body in an
+   LlvmEmit whose locals bind the op args (`%kai_<name>`),
+   `self`, and `k`; stateful clauses prepend a load of
+   `self->state` and bind it under `state`/`log`. The handle
+   prologue (m7c-b) was extended via
+   `llvm_emit_handle_clause_assigns` to GEP into the matching
+   `%EvX` field per clause and store the function pointer.
+   `resume(v)` in clause bodies lowers to
+   `kaix_cont_resume(%k, %v)`; the 2-arg form first writes the
+   new state via `kaix_clause_state_set`. Two new LLVM IR
+   functions, `kai_main_install_defaults` and
+   `kai_main_teardown_defaults`, push/pop default evidence
+   nodes for any builtin in main's row (Console / Fail /
+   Mutable for now); `runtime_llvm.c`'s `int main` calls them
+   around `kai_main`. Every effects-ABI helper that was static
+   in `runtime.h` got a non-static `kaix_*` shim in
+   `runtime_llvm.c`. **Landed.**
+
+   Verified end-to-end: `Console.print("hi from llvm")` and a
+   `with State[Int](0) { get/set/return }` block both compile
+   and run with `--emit=llvm`. `make selfhost-llvm` stays a
+   fixed point.
+
+   *Limitation*: clauses that *discard* `resume` (m7a #6e)
+   still UB because the op-call site does not check `k.status`
+   and does not longjmp to a handle's pad. The entire setjmp
+   landing path is its own follow-up — see *Scheduled
+   follow-up: m7c-e setjmp landing pad* below.
 
 **Decisions taken before splitting**:
 - Use opaque `%KaiCont` / `%KaiEvidence` types in the IR; let
@@ -1951,6 +1972,53 @@ Split into four sub-tasks, landed in order, each its own branch
 - Match the C codegen verbatim for handler_id allocation and
   evidence stack semantics. No reordering or different abstract
   machine — that is m7c's whole point.
+
+**m7c is closed** as the four-piece port (struct emission,
+handle lowering, op dispatch, clauses + default handlers). The
+deferred setjmp landing pad lives in the next sub-section as a
+scheduled follow-up.
+
+### Scheduled follow-up: m7c-e setjmp landing pad
+
+The C backend's m7a #6e flow uses `setjmp(_jmp)` in the handle
+prologue and a `longjmp(_jmp, 1)` from the op-call site when a
+clause discards `resume` (status stays `KAI_CONT_UNRESUMED`
+after the clause returns). The current LLVM lowering emits
+neither — discard-resuming user handlers UB.
+
+Implementation plan when the follow-up runs:
+
+1. **`@setjmp` / `@longjmp` declared in `llvm_header`**. LLVM has
+   no portable setjmp intrinsic; declare libc's signatures
+   (`i32 setjmp(i8*)`, `void longjmp(i8*, i32) noreturn`) and
+   mark the call site with `returns_twice` so the optimiser
+   leaves the SSA structure intact.
+2. **Handle prologue** allocates a 256-byte `jmp_buf` buffer +
+   a 1-slot `discard_slot` alloca, calls `setjmp`, and branches
+   on the result via `phi`:
+   - cmp == 0 → run body, store body_v in `body_result`, pop
+     evidence;
+   - cmp != 0 → load `discard_slot` into `body_result`.
+   Then the existing return-clause code consumes
+   `body_result` unchanged. The push uses the existing
+   `kai_evidence_push` helper extended to accept the jmp_buf
+   pointer (already exists as `kai_evidence_push_with_jmp` in
+   `runtime.h`; needs a `kaix_*` wrapper).
+3. **Op-call dispatch** loads `node->handle_jmp` and
+   `node->discard_slot` via two new `kaix_*` helpers, checks
+   `k.status == KAI_CONT_UNRESUMED && handle_jmp != NULL`,
+   stores the clause's return value into `discard_slot`, calls
+   `kai_evidence_pop`, and `longjmp`s. The check needs
+   `kaix_cont_status(k)` to read the byte field.
+4. **Test target**: a new `make -C stage2 test-llvm-effects`
+   that runs every `m7a_*.kai` / `m7b_*.kai` fixture under
+   `--emit=llvm` and asserts the same stdout as `--emit=c`.
+
+**Trigger to schedule**: when a real-world program needs to
+discard a continuation under the LLVM backend, OR when the
+benchmark from the original m7c §`docs/stage2-design.md`
+re-measure happens (Doc C OQ #6 — it requires representative
+discard-bearing handlers).
 
 ## Next steps
 
