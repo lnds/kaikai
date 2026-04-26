@@ -1,0 +1,90 @@
+# 9d9l #2 — Weather
+#
+# Fetches weather for cities from OpenWeatherMap, optionally in parallel
+# with `-p`. Sorts by current temperature (high to low) and reports the
+# total time spent.
+#
+# Showcase of the kaikai concurrency story:
+#   - `nursery { n -> ... }` scopes the spawned fibers (m8).
+#   - Each city is fetched on its own fiber via `n.spawn(...)`.
+#   - `n.await(fiber)` joins the result.
+#   - On any failure, the nursery cancels the rest cooperatively.
+#
+# Pending features:
+#   - `use Effect`            — m7e §25
+#   - `Spawn`/nursery         — m8
+#   - `Net.http.get`          — stdlib net.http (post-m8 + m14)
+#   - `json.parse`            — stdlib encoding.json (post-m14)
+#   - `Clock.monotonic` + diff — m8/Time effect
+#   - `list.sort_by`           — m5-stdlib lane
+#   - `++`                    — m7d §23
+
+use Console
+use Env
+use Net
+use Spawn
+use Clock
+
+type Report = {
+  city:     String,
+  temp:     Real,
+  temp_max: Real,
+  temp_min: Real,
+  desc:     String,
+}
+
+fn fetch_one(api_key: String, city: String) : Report / Net + Fail = {
+  let url = "https://api.openweathermap.org/data/2.5/weather?q="
+    ++ city ++ "&appid=" ++ api_key ++ "&units=metric"
+  let body = Net.http.get(url)
+  let j = json.parse(body)
+  Report {
+    city:     city,
+    temp:     j |> json.get("main") |> json.get("temp") |> json.as_real,
+    temp_max: j |> json.get("main") |> json.get("temp_max") |> json.as_real,
+    temp_min: j |> json.get("main") |> json.get("temp_min") |> json.as_real,
+    desc:     j |> json.get("weather") |> json.nth(0) |> json.get("description") |> json.as_string,
+  }
+}
+
+fn fetch_parallel(api_key: String, cities: [String]) : [Report] / Net + Spawn + Fail = {
+  nursery { n ->
+    let fibers = list.map(cities, (c) => n.spawn(() => fetch_one(api_key, c)))
+    list.map(fibers, (f) => n.await(f))
+  }
+}
+
+fn fetch_sequential(api_key: String, cities: [String]) : [Report] / Net + Fail =
+  list.map(cities, (c) => fetch_one(api_key, c))
+
+fn render(r: Report) : String = {
+  r.city
+    ++ "  max: " ++ real_to_string(r.temp_max)
+    ++ "  min: " ++ real_to_string(r.temp_min)
+    ++ "  actual: " ++ real_to_string(r.temp)
+    ++ "  " ++ r.desc
+}
+
+fn main() = {
+  let args = Env.args()
+  let parallel = list.contains(args, "-p")
+  let cities = list.filter(args, (a) => a != "-p")
+
+  match cities {
+    [] -> println("usage: weather [-p] <city1> <city2> ...")
+    _  -> match Env.get("WEATHER_API_KEY") {
+      None      -> Console.eprint("error: WEATHER_API_KEY not set")
+      Some(key) -> {
+        let t0 = Clock.monotonic()
+        let reports =
+          if parallel { fetch_parallel(key, cities) }
+          else        { fetch_sequential(key, cities) }
+        let sorted = list.sort_by(reports, (r) => -r.temp)  # desc by temp
+        list.each(sorted, (r) => println(render(r)))
+        let t1 = Clock.monotonic()
+        println("")
+        println("Tiempo: " ++ Clock.format_diff(t0, t1))
+      }
+    }
+  }
+}

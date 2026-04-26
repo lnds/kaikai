@@ -1,0 +1,119 @@
+# 9d9l #4 — Huffman compression
+#
+# Compress / decompress files using Huffman coding. Builds the tree
+# from character frequencies, encodes with the resulting code table,
+# decompresses by walking the tree per bit.
+#
+# This demo emits the encoded bits as a string of '0'/'1' characters
+# (no bit packing) — the goal is the algorithm shape, not space
+# efficiency. A real implementation would pack 8 bits per byte and
+# serialise the tree alongside.
+#
+# Pending features:
+#   - `use Effect`            — m7e §25
+#   - `File.read` / `File.write` — File effect (post-m14)
+#   - `++`                    — m7d §23
+#   - tuples in match         — m8.5 gate
+#   - `list.fold`             — stdlib lite (m5-stdlib lane; equivalent to existing `reduce`)
+
+use Console
+use Env
+use File
+
+# A Huffman tree is either a leaf (char + frequency) or an internal node
+# (combined frequency + two subtrees).
+type Tree
+  = Leaf(Int, Char)
+  | Node(Int, Tree, Tree)
+
+fn freq(t: Tree) : Int = match t {
+  Leaf(f, _)    -> f
+  Node(f, _, _) -> f
+}
+
+# --- Frequency table as an association list of (Char, Int) ---
+
+fn bump(table: [(Char, Int)], c: Char) : [(Char, Int)] = match table {
+  []                           -> [(c, 1)]
+  [(k, n), ...rest] if k == c  -> [(k, n + 1), ...rest]
+  [pair, ...rest]              -> [pair, ...bump(rest, c)]
+}
+
+fn count(chars: [Char], acc: [(Char, Int)]) : [(Char, Int)] = match chars {
+  []           -> acc
+  [c, ...rest] -> count(rest, bump(acc, c))
+}
+
+# --- Priority queue as a sorted list (min-first) ---
+
+fn pq_insert(t: Tree, q: [Tree]) : [Tree] = match q {
+  []                                   -> [t]
+  [h, ...rest] if freq(t) <= freq(h)   -> [t, h, ...rest]
+  [h, ...rest]                         -> [h, ...pq_insert(t, rest)]
+}
+
+fn build(q: [Tree]) : Tree / Fail = match q {
+  []              -> Fail.fail("empty queue")
+  [t]             -> t
+  [a, b, ...rest] -> build(pq_insert(Node(freq(a) + freq(b), a, b), rest))
+}
+
+fn from_text(text: String) : Tree / Fail = {
+  let table = count(string.chars(text), [])
+  let leaves = list.map(table, (p) => Leaf(p.1, p.0))
+  let queue = reduce(leaves, [], (q, t) => pq_insert(t, q))
+  build(queue)
+}
+
+# --- Encode / decode ---
+
+fn lookup(t: Tree, target: Char, code: String) : Option[String] = match t {
+  Leaf(_, c) if c == target -> Some(code)
+  Leaf(_, _)                -> None
+  Node(_, l, r)             -> match lookup(l, target, code ++ "0") {
+    Some(s) -> Some(s)
+    None    -> lookup(r, target, code ++ "1")
+  }
+}
+
+fn encode(t: Tree, text: String) : String / Fail = {
+  string.chars(text)
+    |> list.map((c) => match lookup(t, c, "") {
+      Some(code) -> code
+      None       -> Fail.fail("char not in tree")
+    })
+    |> string.join("")
+}
+
+fn decode_step(root: Tree, cur: Tree, bits: [Char], acc: String) : String / Fail = match (cur, bits) {
+  (Leaf(_, c), [])              -> acc ++ char_to_string(c)
+  (Leaf(_, c), more)            -> decode_step(root, root, more, acc ++ char_to_string(c))
+  (Node(_, l, _), [b, ...rest]) if b == '0' -> decode_step(root, l, rest, acc)
+  (Node(_, _, r), [b, ...rest]) if b == '1' -> decode_step(root, r, rest, acc)
+  _                             -> Fail.fail("malformed bitstream")
+}
+
+fn decode(t: Tree, bits: String) : String / Fail =
+  decode_step(t, t, string.chars(bits), "")
+
+# --- CLI driver ---
+
+fn main() = {
+  match Env.args() {
+    ["-c", input, output] -> match File.read(input) {
+      Err(msg) -> Console.eprint("error: " ++ msg)
+      Ok(text) -> {
+        let tree = from_text(text)
+        let bits = encode(tree, text)
+        # NOTE: A real implementation would also serialise `tree`
+        # alongside the bits so decompression can reconstruct it.
+        match File.write(output, bits) {
+          Err(msg) -> Console.eprint("error: " ++ msg)
+          Ok(_)    -> println("compressed: " ++ int_to_string(string.length(bits)) ++ " bits")
+        }
+      }
+    }
+    ["-d", _, _] -> println("decode requires the serialised tree from compression — out of scope for this demo")
+    _            -> println("usage: huffman [-c|-d] <input> <output>")
+  }
+}
