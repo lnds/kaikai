@@ -416,7 +416,7 @@ test-effects: $(TARGET) build
 	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
 	    { echo "effects FAIL $$name (unknown op accepted)"; exit 1; } \
 	    || true; \
-	  grep -q "unknown op unknown on effect Io" build/s2-$$name.err \
+	  grep -q "unknown op .unknown. on effect .Io." build/s2-$$name.err \
 	    && echo "effects OK $$name (rejected as expected)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
