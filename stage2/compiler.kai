@@ -6158,6 +6158,89 @@ fn emit_clause_bodies(src: String, cs: [ClauseInfo], fns: [EFn], variants: [EVar
                       lams: [LamInfo]) : String =
   concat_all(map(cs, (c) => emit_clause_body(src, c, fns, variants, lams)))
 
+# m7c-d — emit each clause as a top-level LLVM function. Mirrors
+# `emit_clause_body`/`emit_clause_sig` from the C backend. The
+# function takes `(EvX *self, %KaiValue* %arg1, ..., i8* %k)`
+# and returns `%KaiValue*`. Inside, `self` and `k` are bound as
+# locals (literal register names `%self` / `%k` so the resume
+# handler in `llvm_emit_call` can reference `%k` directly). For
+# stateful clauses we load `self->state` once into a local
+# `%kai_state` (also bound as `%kai_log`) so the body can
+# reference `state`/`log` like any other ident.
+fn llvm_emit_clause_body(c: ClauseInfo, fns: [EFn], vs: [EVar], lams: [LamInfo],
+                          oo: [OpOffset], start_id: Int) : LlvmDeclOut {
+  match c {
+    CI(line, col, eff, op_name, params, body, stateful) -> {
+      let sym = clause_fn_name(line, col, op_name)
+      let op_args = op_args_only(params)
+      let arg_sig = llvm_clause_arg_sig(op_args)
+      let locals0 = llvm_clause_locals(op_args)
+      let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
+                          globals: "", body: "",
+                          last_val: "", cur_label: "entry",
+                          locals: locals0, fns: fns, vars_: vs, lams: lams,
+                          op_offsets: oo }
+      # Stateful prologue: read self->state into a fresh value and
+      # bind it under both `state` and `log` so the body resolves.
+      let e_pro = if stateful {
+        let st_p_reg = llvm_fresh_reg(e0)
+        let st_p_gep = concat_all([
+          "  ", st_p_reg.reg, " = getelementptr %Ev", eff,
+          ", %Ev", eff, "* %self, i32 0, i32 2\n"
+        ])
+        let e_p1 = llvm_append_body(st_p_reg.e, st_p_gep)
+        let st_v_reg = llvm_fresh_reg(e_p1)
+        let st_load = concat_all([
+          "  ", st_v_reg.reg, " = load %KaiValue*, %KaiValue** ", st_p_reg.reg, "\n"
+        ])
+        let e_p2 = llvm_append_body(st_v_reg.e, st_load)
+        let bound_state = llvm_push_local(e_p2, "state", st_v_reg.reg)
+        llvm_push_local(bound_state, "log", st_v_reg.reg)
+      } else { e0 }
+      let e1 = llvm_emit_expr(e_pro, body)
+      let text = concat_all([
+        e1.globals,
+        "\n",
+        "define %KaiValue* @", sym,
+        "(%Ev", eff, "* %self", arg_sig, ", i8* %k) {\n",
+        e1.body,
+        "  ret %KaiValue* ", e1.last_val, "\n",
+        "}\n\n"
+      ])
+      LlvmDeclOut { text: text, next_id: e1.ids.next }
+    }
+  }
+}
+
+fn llvm_clause_arg_sig(ps: [Param]) : String {
+  match ps {
+    [] -> ""
+    [p, ...rest] ->
+      concat_all([", %KaiValue* %kai_", p.pname, llvm_clause_arg_sig(rest)])
+  }
+}
+
+fn llvm_clause_locals(ps: [Param]) : [LlvmLocal] {
+  match ps {
+    [] -> []
+    [p, ...rest] -> [LL(p.pname, concat_all(["%kai_", p.pname])),
+                      ...llvm_clause_locals(rest)]
+  }
+}
+
+fn llvm_emit_clause_bodies(cs: [ClauseInfo], fns: [EFn], vs: [EVar],
+                            lams: [LamInfo], oo: [OpOffset],
+                            start_id: Int, acc: String) : LlvmDeclOut {
+  match cs {
+    [] -> LlvmDeclOut { text: acc, next_id: start_id }
+    [c, ...rest] -> {
+      let out = llvm_emit_clause_body(c, fns, vs, lams, oo, start_id)
+      llvm_emit_clause_bodies(rest, fns, vs, lams, oo,
+                              out.next_id, string_concat(acc, out.text))
+    }
+  }
+}
+
 fn emit_closure_caps(caps: [String]) : String =
   join_with(map(caps, (c) => cat2("kai_", c)), ", ")
 
@@ -14090,14 +14173,33 @@ fn llvm_header() : String =
     # m7c-b: runtime helpers for the effects ABI. The C backend
     # invokes these via in-line statement-expressions; the LLVM
     # backend declares them as external and emits the same calls.
-    "declare i64 @kai_fresh_handler_id()\n",
-    "declare void @kai_evidence_push(i8*, i8*, i8*)\n",
-    "declare void @kai_evidence_pop()\n",
+    "declare i64 @kaix_fresh_handler_id()\n",
+    "declare void @kaix_evidence_push(i8*, i8*, i8*)\n",
+    "declare void @kaix_evidence_pop()\n",
     # m7c-c — op-call dispatch helpers. `lookup_handler` returns
     # the `*Ev<Eff>` blob (cast to i8*); `cont_init_identity`
     # initialises the on-stack KaiCont alloca.
-    "declare i8* @kai_evidence_lookup_handler(i8*)\n",
-    "declare void @kai_cont_init_identity(i8*, i64)\n",
+    "declare i8* @kaix_evidence_lookup_handler(i8*)\n",
+    "declare void @kaix_cont_init_identity(i8*, i64)\n",
+    # m7c-d — clause-body helper. The LLVM IR emits each
+    # `resume(v)` call as a direct `kai_cont_resume(k, v)`
+    # invocation; the cont pointer comes from the clause's `%k`
+    # parameter (bound as a local register).
+    "declare %KaiValue* @kaix_cont_resume(i8*, %KaiValue*)\n",
+    # m7c-d — write `state` slot for 2-arg `resume(v, ns)`.
+    # Wraps `((KaiValue **)((char*)self + 16))[0] = v` so the IR
+    # stays free of EvX layout assumptions.
+    "declare void @kaix_clause_state_set(i8*, %KaiValue*)\n",
+    # m7c-d — default-handler wrappers for builtins in main's row.
+    # Defined non-static in runtime_llvm.c so the IR can link.
+    "declare %KaiValue* @kaix_default_console_print(i8*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_console_eprint(i8*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_fail_fail(i8*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_mutable_array_make(i8*, %KaiValue*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_mutable_array_length(i8*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_mutable_array_get(i8*, %KaiValue*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_mutable_array_set(i8*, %KaiValue*, %KaiValue*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_mutable_array_grow(i8*, %KaiValue*, %KaiValue*, %KaiValue*, i8*)\n",
     "\n"
   ])
 
@@ -14740,7 +14842,7 @@ fn llvm_closure_error(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit {
 # m7c-c — emit the LLVM IR for an `Eff.op(args)` call. Mirrors the
 # C `emit_call_expr` op-call branch minus the discard/longjmp path
 # (m7a #6e). The IR shape is:
-#   %h = call i8* @kai_evidence_lookup_handler(i8* @effname.str)
+#   %h = call i8* @kaix_evidence_lookup_handler(i8* @effname.str)
 #   %ev = bitcast i8* %h to %EvEff*
 #   ; KaiCont alloca (32 bytes covers the C struct)
 #   %k_buf = alloca [32 x i8], align 8
@@ -14748,7 +14850,7 @@ fn llvm_closure_error(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit {
 #   ; Read handler_id (field 0) for the cont's identity slot
 #   %hid_p = getelementptr %EvEff, %EvEff* %ev, i32 0, i32 0
 #   %hid = load i64, i64* %hid_p
-#   call void @kai_cont_init_identity(i8* %k, i64 %hid)
+#   call void @kaix_cont_init_identity(i8* %k, i64 %hid)
 #   ; GEP fn ptr at field 3 + op_idx, load, indirect-call
 #   %op_p = getelementptr %EvEff, %EvEff* %ev, i32 0, i32 N
 #   %op = load <fn-type>, <fn-type>* %op_p
@@ -14759,7 +14861,7 @@ fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : Ll
   # 1. Lookup handler.
   let h_reg = llvm_fresh_reg(name_res.e)
   let h_call = concat_all([
-    "  ", h_reg.reg, " = call i8* @kai_evidence_lookup_handler(i8* ",
+    "  ", h_reg.reg, " = call i8* @kaix_evidence_lookup_handler(i8* ",
     name_res.gep, ")\n"
   ])
   let e1 = llvm_append_body(h_reg.e, h_call)
@@ -14790,7 +14892,7 @@ fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : Ll
   let hid_reg = llvm_fresh_reg(e5)
   let hid_load = concat_all([
     "  ", hid_reg.reg, " = load i64, i64* ", hid_p_reg.reg, "\n",
-    "  call void @kai_cont_init_identity(i8* ", k_reg.reg,
+    "  call void @kaix_cont_init_identity(i8* ", k_reg.reg,
     ", i64 ", hid_reg.reg, ")\n"
   ])
   let e6 = llvm_append_body(hid_reg.e, hid_load)
@@ -14854,6 +14956,45 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
         let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
                                 llvm_format_args(ra.regs), ")\n"])
         llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+      } else if nm == "resume" {
+        # m7c-d — emit `kai_cont_resume(k, v)` for the 1-arg form.
+        # The 2-arg form `resume(v, ns)` writes new state first;
+        # delegate to the runtime helper `kai_clause_state_set`
+        # so we don't have to GEP into the opaque self struct from
+        # IR. Together these cover every canonical State / Reader
+        # / Writer / Mutable clause.
+        match xs {
+          [v] -> {
+            let rv = llvm_emit_expr(e, v)
+            let r = llvm_fresh_reg(rv)
+            let instr = concat_all([
+              "  ", r.reg, " = call %KaiValue* @kaix_cont_resume(i8* %k, %KaiValue* ",
+              rv.last_val, ")\n"
+            ])
+            llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+          }
+          [v, ns] -> {
+            let rns = llvm_emit_expr(e, ns)
+            let e_set = llvm_append_body(rns, concat_all([
+              "  call void @kaix_clause_state_set(i8* %self, %KaiValue* ",
+              rns.last_val, ")\n"
+            ]))
+            let rv = llvm_emit_expr(e_set, v)
+            let r = llvm_fresh_reg(rv)
+            let instr = concat_all([
+              "  ", r.reg, " = call %KaiValue* @kaix_cont_resume(i8* %k, %KaiValue* ",
+              rv.last_val, ")\n"
+            ])
+            llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+          }
+          _ -> {
+            let r = llvm_fresh_reg(e)
+            let instr = concat_all([
+              "  ", r.reg, " = call %KaiValue* @kaix_unit()\n"
+            ])
+            llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+          }
+        }
       } else {
         # m7c-c: callees of the form "Eff.op" come from the
         # `desugar_op_calls` pass. Look the offset up in
@@ -15158,14 +15299,157 @@ type LlvmArm = { e: LlvmEmit, reg: String, from_label: String }
 # handler, every #5b var-desugar — type-checks and emits clean
 # LLVM IR. Discard-bearing user handlers will UB until m7c-c
 # (op dispatch) and m7c-d (clauses + setjmp) land.
+# m7c-d — for each handler clause, GEP into the matching `%EvX`
+# field and store a function pointer to the clause's emitted
+# top-level LLVM function (named via `clause_fn_name`).
+# m7c-d — generate the LLVM IR body of `kai_main_install_defaults`
+# and `kai_main_teardown_defaults`. Each builtin in main's row
+# contributes a `kai_evidence_push(...)` (install) and a matching
+# `kai_evidence_pop()` (teardown, in reverse order). The
+# `Ev<Builtin>` struct, the per-op fn-ptr table, and the
+# `kai_default_<eff>_<op>` symbols all live in stage0/runtime.h
+# and are declared here as externals when needed.
+fn llvm_default_builtin_decls(main_row: [String]) : String {
+  # Function declarations live in `llvm_header`; here we only emit
+  # the per-builtin globals (Ev struct + node buffer + name string)
+  # gated on main's row.
+  concat_all([
+    if list_has(main_row, "Console") {
+      concat_all([
+        "@_kai_default_ev_console = internal global %EvConsole zeroinitializer\n",
+        "@_kai_default_node_console = internal global [48 x i8] zeroinitializer\n",
+        "@_kai_default_console_name = private unnamed_addr constant [8 x i8] c\"Console\\00\"\n"
+      ])
+    } else { "" },
+    if list_has(main_row, "Fail") {
+      concat_all([
+        "@_kai_default_ev_fail = internal global %EvFail zeroinitializer\n",
+        "@_kai_default_node_fail = internal global [48 x i8] zeroinitializer\n",
+        "@_kai_default_fail_name = private unnamed_addr constant [5 x i8] c\"Fail\\00\"\n"
+      ])
+    } else { "" },
+    if list_has(main_row, "Mutable") {
+      concat_all([
+        "@_kai_default_ev_mutable = internal global %EvMutable zeroinitializer\n",
+        "@_kai_default_node_mutable = internal global [48 x i8] zeroinitializer\n",
+        "@_kai_default_mutable_name = private unnamed_addr constant [8 x i8] c\"Mutable\\00\"\n"
+      ])
+    } else { "" }
+  ])
+}
+
+fn llvm_emit_main_install_defaults(main_row: [String]) : String {
+  let console = if list_has(main_row, "Console") {
+    concat_all([
+      "  ; install Console default handler\n",
+      "  %hid_console = call i64 @kaix_fresh_handler_id()\n",
+      "  %ev_console_hid_p = getelementptr %EvConsole, %EvConsole* @_kai_default_ev_console, i32 0, i32 0\n",
+      "  store i64 %hid_console, i64* %ev_console_hid_p\n",
+      "  %ev_console_print_p = getelementptr %EvConsole, %EvConsole* @_kai_default_ev_console, i32 0, i32 3\n",
+      "  store %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_console_print to %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)** %ev_console_print_p\n",
+      "  %ev_console_eprint_p = getelementptr %EvConsole, %EvConsole* @_kai_default_ev_console, i32 0, i32 4\n",
+      "  store %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_console_eprint to %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)** %ev_console_eprint_p\n",
+      "  %node_console_p = getelementptr [48 x i8], [48 x i8]* @_kai_default_node_console, i32 0, i32 0\n",
+      "  %ev_console_void = bitcast %EvConsole* @_kai_default_ev_console to i8*\n",
+      "  call void @kaix_evidence_push(i8* %node_console_p, i8* getelementptr inbounds ([8 x i8], [8 x i8]* @_kai_default_console_name, i64 0, i64 0), i8* %ev_console_void)\n"
+    ])
+  } else { "" }
+  let fail = if list_has(main_row, "Fail") {
+    concat_all([
+      "  ; install Fail default handler\n",
+      "  %hid_fail = call i64 @kaix_fresh_handler_id()\n",
+      "  %ev_fail_hid_p = getelementptr %EvFail, %EvFail* @_kai_default_ev_fail, i32 0, i32 0\n",
+      "  store i64 %hid_fail, i64* %ev_fail_hid_p\n",
+      "  %ev_fail_op_p = getelementptr %EvFail, %EvFail* @_kai_default_ev_fail, i32 0, i32 3\n",
+      "  store %KaiValue* (%EvFail*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_fail_fail to %KaiValue* (%EvFail*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvFail*, %KaiValue*, %KaiCont*)** %ev_fail_op_p\n",
+      "  %node_fail_p = getelementptr [48 x i8], [48 x i8]* @_kai_default_node_fail, i32 0, i32 0\n",
+      "  %ev_fail_void = bitcast %EvFail* @_kai_default_ev_fail to i8*\n",
+      "  call void @kaix_evidence_push(i8* %node_fail_p, i8* getelementptr inbounds ([5 x i8], [5 x i8]* @_kai_default_fail_name, i64 0, i64 0), i8* %ev_fail_void)\n"
+    ])
+  } else { "" }
+  let mutable_ = if list_has(main_row, "Mutable") {
+    concat_all([
+      "  ; install Mutable default handler\n",
+      "  %hid_mutable = call i64 @kaix_fresh_handler_id()\n",
+      "  %ev_mutable_hid_p = getelementptr %EvMutable, %EvMutable* @_kai_default_ev_mutable, i32 0, i32 0\n",
+      "  store i64 %hid_mutable, i64* %ev_mutable_hid_p\n",
+      "  %ev_mutable_make_p = getelementptr %EvMutable, %EvMutable* @_kai_default_ev_mutable, i32 0, i32 3\n",
+      "  store %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, %KaiValue*, i8*)* @kaix_default_mutable_array_make to %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiCont*)** %ev_mutable_make_p\n",
+      "  %ev_mutable_len_p = getelementptr %EvMutable, %EvMutable* @_kai_default_ev_mutable, i32 0, i32 4\n",
+      "  store %KaiValue* (%EvMutable*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_mutable_array_length to %KaiValue* (%EvMutable*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvMutable*, %KaiValue*, %KaiCont*)** %ev_mutable_len_p\n",
+      "  %ev_mutable_get_p = getelementptr %EvMutable, %EvMutable* @_kai_default_ev_mutable, i32 0, i32 5\n",
+      "  store %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, %KaiValue*, i8*)* @kaix_default_mutable_array_get to %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiCont*)** %ev_mutable_get_p\n",
+      "  %ev_mutable_set_p = getelementptr %EvMutable, %EvMutable* @_kai_default_ev_mutable, i32 0, i32 6\n",
+      "  store %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, %KaiValue*, %KaiValue*, i8*)* @kaix_default_mutable_array_set to %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiValue*, %KaiCont*)** %ev_mutable_set_p\n",
+      "  %ev_mutable_grow_p = getelementptr %EvMutable, %EvMutable* @_kai_default_ev_mutable, i32 0, i32 7\n",
+      "  store %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, %KaiValue*, %KaiValue*, i8*)* @kaix_default_mutable_array_grow to %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvMutable*, %KaiValue*, %KaiValue*, %KaiValue*, %KaiCont*)** %ev_mutable_grow_p\n",
+      "  %node_mutable_p = getelementptr [48 x i8], [48 x i8]* @_kai_default_node_mutable, i32 0, i32 0\n",
+      "  %ev_mutable_void = bitcast %EvMutable* @_kai_default_ev_mutable to i8*\n",
+      "  call void @kaix_evidence_push(i8* %node_mutable_p, i8* getelementptr inbounds ([8 x i8], [8 x i8]* @_kai_default_mutable_name, i64 0, i64 0), i8* %ev_mutable_void)\n"
+    ])
+  } else { "" }
+  concat_all([
+    llvm_default_builtin_decls(main_row),
+    "\ndefine void @kai_main_install_defaults() {\n",
+    console,
+    fail,
+    mutable_,
+    "  ret void\n",
+    "}\n\n"
+  ])
+}
+
+fn llvm_emit_main_teardown_defaults(main_row: [String]) : String {
+  let pops = concat_all([
+    if list_has(main_row, "Mutable") { "  call void @kaix_evidence_pop()\n" } else { "" },
+    if list_has(main_row, "Fail") { "  call void @kaix_evidence_pop()\n" } else { "" },
+    if list_has(main_row, "Console") { "  call void @kaix_evidence_pop()\n" } else { "" }
+  ])
+  concat_all([
+    "define void @kai_main_teardown_defaults() {\n",
+    pops,
+    "  ret void\n",
+    "}\n"
+  ])
+}
+
+fn llvm_emit_handle_clause_assigns(e: LlvmEmit, ev_reg: String, eff_name: String,
+                                    hline: Int, hcol: Int,
+                                    cs: [HClause]) : LlvmEmit {
+  match cs {
+    [] -> e
+    [c, ...rest] -> match c {
+      HC(op_name, params, _, _, _) -> {
+        let key = string_concat(eff_name, string_concat(".", op_name))
+        match lookup_op_offset(e.op_offsets, key) {
+          None -> llvm_emit_handle_clause_assigns(e, ev_reg, eff_name, hline, hcol, rest)
+          Some(offset) -> {
+            let op_args = op_args_only(params)
+            let arg_ty_list = llvm_op_arg_kaivalue_list(list_length(op_args))
+            let p_reg = llvm_fresh_reg(e)
+            let p_gep = concat_all([
+              "  ", p_reg.reg, " = getelementptr %Ev", eff_name,
+              ", %Ev", eff_name, "* ", ev_reg, ", i32 0, i32 ",
+              int_to_string(offset), "\n",
+              "  store %KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", i8*)* @",
+              clause_fn_name(hline, hcol, op_name),
+              ", %KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", i8*)** ",
+              p_reg.reg, "\n"
+            ])
+            let e1 = llvm_append_body(p_reg.e, p_gep)
+            llvm_emit_handle_clause_assigns(e1, ev_reg, eff_name, hline, hcol, rest)
+          }
+        }
+      }
+    }
+  }
+}
+
 fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
                     init_opt: Option[Expr], alias_opt: Option[String],
                     clauses: [HClause], ret_opt: Option[HReturn],
                     hline: Int, hcol: Int) : LlvmEmit {
   let _ = alias_opt    # m7c-c will use this for per-instance dispatch
-  let _ = clauses      # m7c-d will wire op fn ptrs
-  let _ = hline
-  let _ = hcol
   # alloca the `%EvX` struct; zero-init field by field.
   let ev_reg = llvm_fresh_reg(e)
   let ev_alloca = concat_all([
@@ -15175,7 +15459,7 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
   # handler_id <- kai_fresh_handler_id()
   let hid_reg = llvm_fresh_reg(e1)
   let hid_call = concat_all([
-    "  ", hid_reg.reg, " = call i64 @kai_fresh_handler_id()\n"
+    "  ", hid_reg.reg, " = call i64 @kaix_fresh_handler_id()\n"
   ])
   let e2 = llvm_append_body(hid_reg.e, hid_call)
   let hid_gep_reg = llvm_fresh_reg(e2)
@@ -15216,8 +15500,13 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
       llvm_append_body(st_gep_reg.e, st_gep)
     }
   }
+  # m7c-d — wire each clause's fn pointer into the matching field
+  # of the EvX struct. Field index comes from `op_offsets`, fn ptr
+  # type is built from the clause's params (mirroring the effect
+  # struct's per-op signature).
+  let after_clauses = llvm_emit_handle_clause_assigns(state_init, ev_reg.reg, eff_name, hline, hcol, clauses)
   # alloca a 48-byte buffer for the KaiEvidence node and bitcast.
-  let node_buf_reg = llvm_fresh_reg(state_init)
+  let node_buf_reg = llvm_fresh_reg(after_clauses)
   let node_alloca = concat_all([
     "  ", node_buf_reg.reg, " = alloca [48 x i8], align 8\n"
   ])
@@ -15237,7 +15526,7 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
   let e7 = llvm_append_body(ev_void_reg.e, ev_cast)
   # push
   let push_call = concat_all([
-    "  call void @kai_evidence_push(i8* ", node_ptr_reg.reg,
+    "  call void @kaix_evidence_push(i8* ", node_ptr_reg.reg,
     ", i8* ", name_res.gep,
     ", i8* ", ev_void_reg.reg, ")\n"
   ])
@@ -15246,7 +15535,7 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
   let body_e = llvm_emit_expr(e8, body)
   let body_val = body_e.last_val
   # pop
-  let e9 = llvm_append_body(body_e, "  call void @kai_evidence_pop()\n")
+  let e9 = llvm_append_body(body_e, "  call void @kaix_evidence_pop()\n")
   # return clause: bind body result to its pname and emit
   match ret_opt {
     Some(r) -> match r {
@@ -15962,7 +16251,23 @@ fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], test_mode: Bo
   let oo = compute_op_offsets(decls)
   let decls_out = llvm_emit_decls_loop(decls, fns, vs, lams, oo, 0, "")
   let lam_bodies = llvm_emit_lambda_bodies(lams, fns, vs, oo, decls_out.next_id, "")
-  concat_all([llvm_header(), eff_structs, "\n", decls_out.text, lam_bodies])
+  # m7c-d: emit each handler clause as a top-level LLVM function;
+  # the handle prologue stores function pointers to these into
+  # the matching `%EvX` field.
+  let clauses_info = lc.clauses
+  let clauses_out = llvm_emit_clause_bodies(clauses_info, fns, vs, lams, oo,
+                                              decls_out.next_id, "")
+  # m7c-d: emit the install/teardown wrappers the LLVM runtime's
+  # `int main` calls. They push/pop default-handler evidence
+  # nodes for any builtin (Console / Fail / Stdin / Env / File /
+  # Mutable) that appears in main's row. When main has no
+  # builtins the functions are no-ops.
+  let main_row = main_row_labels(decls)
+  let install = llvm_emit_main_install_defaults(main_row)
+  let teardown = llvm_emit_main_teardown_defaults(main_row)
+  concat_all([llvm_header(), eff_structs, "\n",
+              decls_out.text, lam_bodies, clauses_out.text,
+              install, teardown])
 }
 
 # m7c-c: per-decl walker that flattens every effect's ops into a
