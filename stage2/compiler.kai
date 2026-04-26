@@ -11855,6 +11855,240 @@ fn perceus_pass(decls: [Decl]) : [Decl] {
   decls
 }
 
+# ---- m5 #2 — last-use analysis (fn-param scope) ----
+#
+# For each `pub fn` parameter, find the lexical position of its last
+# direct read in the body. Reads inside an `ELambda` body are
+# conservatively treated as closure captures and BLOCK "last": the
+# lambda may survive past its own evaluation point, so the captured
+# binding is alive until the closure dies. m5 #2 stays at fn-param
+# scope; let-bindings, match-pattern bindings, and closure-aware
+# data-flow refinement land in m5 #2b / m5 #3.
+#
+# Output is diagnostic only — `--dump-last-use` prints one line per
+# parameter:
+#   fn add@10:
+#     param x: last-use at 10:32
+#     param y: last-use at 10:36
+#     param z: blocked by closure capture
+#     param u: never used
+# m5 #3 will consume the same `last_use_for` result to drive drop
+# emission.
+
+type Use = U(String, Int, Int, Bool)   # name, line, col, in_lambda
+
+type LU
+  = LUAt(String, Int, Int)             # last-use position
+  | LUBlocked(String)                  # closure capture blocks last
+  | LUUnused(String)                   # never referenced
+
+# Walker entry: collect every EVar in `e`. The flag is true while we
+# are inside any enclosing ELambda body; closure capture detection
+# is conservative — a single in-lambda ref to a name blocks last for
+# that name regardless of how far up the lambda is nested.
+fn scan_uses_expr(e: Expr, in_lam: Bool) : [Use] =
+  scan_uses_kind(e.kind, e.line, e.col, in_lam)
+
+fn scan_uses_kind(k: ExprKind, line: Int, col: Int, in_lam: Bool) : [Use] {
+  match k {
+    EVar(nm) -> [U(nm, line, col, in_lam)]
+    ECall(f, xs) -> list_append(scan_uses_expr(f, in_lam),
+                                scan_uses_in_exprs(xs, in_lam))
+    EField(x, _) -> scan_uses_expr(x, in_lam)
+    EIndex(x, i) -> list_append(scan_uses_expr(x, in_lam),
+                                scan_uses_expr(i, in_lam))
+    EBinop(_, l, r) -> list_append(scan_uses_expr(l, in_lam),
+                                   scan_uses_expr(r, in_lam))
+    EUnop(_, x) -> scan_uses_expr(x, in_lam)
+    EIf(c, t, opt_e) -> {
+      let p1 = list_append(scan_uses_expr(c, in_lam), scan_uses_expr(t, in_lam))
+      match opt_e {
+        None -> p1
+        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
+      }
+    }
+    EMatch(s, arms) -> list_append(scan_uses_expr(s, in_lam),
+                                    scan_uses_in_arms(arms, in_lam))
+    ELambda(_, body) -> scan_uses_expr(body, true)
+    ERecordLit(_, fis) -> scan_uses_in_field_inits(fis, in_lam)
+    EList(elems) -> scan_uses_in_list_elems(elems, in_lam)
+    ERange(lo, hi, opt_by) -> {
+      let p1 = list_append(scan_uses_expr(lo, in_lam), scan_uses_expr(hi, in_lam))
+      match opt_by {
+        None -> p1
+        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
+      }
+    }
+    EBlock(stmts, opt_tail) -> {
+      let p1 = scan_uses_in_stmts(stmts, in_lam)
+      match opt_tail {
+        None -> p1
+        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
+      }
+    }
+    EPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
+                                scan_uses_expr(r, in_lam))
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let p1 = scan_uses_expr(body, in_lam)
+      let p2 = match init_opt {
+        None -> p1
+        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
+      }
+      let p3 = list_append(p2, scan_uses_in_clauses(clauses, in_lam))
+      match ret_opt {
+        None -> p3
+        Some(hr) -> match hr {
+          HR(_, body2, _, _) -> list_append(p3, scan_uses_expr(body2, in_lam))
+        }
+      }
+    }
+    _ -> []
+  }
+}
+
+fn scan_uses_in_exprs(es: [Expr], in_lam: Bool) : [Use] {
+  match es {
+    [] -> []
+    [h, ...rest] -> list_append(scan_uses_expr(h, in_lam),
+                                scan_uses_in_exprs(rest, in_lam))
+  }
+}
+
+fn scan_uses_in_arms(arms: [Arm], in_lam: Bool) : [Use] {
+  match arms {
+    [] -> []
+    [h, ...rest] -> match h {
+      Arm(_, guard_opt, body) -> {
+        let p1 = match guard_opt {
+          None -> []
+          Some(g) -> scan_uses_expr(g, in_lam)
+        }
+        let p2 = list_append(p1, scan_uses_expr(body, in_lam))
+        list_append(p2, scan_uses_in_arms(rest, in_lam))
+      }
+    }
+  }
+}
+
+fn scan_uses_in_field_inits(fis: [FieldInit], in_lam: Bool) : [Use] {
+  match fis {
+    [] -> []
+    [h, ...rest] -> match h {
+      FI(_, e) -> list_append(scan_uses_expr(e, in_lam),
+                              scan_uses_in_field_inits(rest, in_lam))
+    }
+  }
+}
+
+fn scan_uses_in_list_elems(es: [ListElem], in_lam: Bool) : [Use] {
+  match es {
+    [] -> []
+    [h, ...rest] -> {
+      let inner = match h {
+        ElPlain(e) -> e
+        ElSpread(e) -> e
+      }
+      list_append(scan_uses_expr(inner, in_lam),
+                  scan_uses_in_list_elems(rest, in_lam))
+    }
+  }
+}
+
+fn scan_uses_in_stmts(stmts: [Stmt], in_lam: Bool) : [Use] {
+  match stmts {
+    [] -> []
+    [h, ...rest] -> {
+      let p1 = match h {
+        SLet(_, _, rhs) -> scan_uses_expr(rhs, in_lam)
+        SAssert(c, opt_msg) -> {
+          let q = scan_uses_expr(c, in_lam)
+          match opt_msg {
+            None -> q
+            Some(e2) -> list_append(q, scan_uses_expr(e2, in_lam))
+          }
+        }
+        SExprStmt(e) -> scan_uses_expr(e, in_lam)
+        SIndexAssign(arr, idx, val, _, _) -> {
+          let q1 = list_append(scan_uses_expr(arr, in_lam),
+                               scan_uses_expr(idx, in_lam))
+          list_append(q1, scan_uses_expr(val, in_lam))
+        }
+        SVar(_, _, init, _, _) -> scan_uses_expr(init, in_lam)
+      }
+      list_append(p1, scan_uses_in_stmts(rest, in_lam))
+    }
+  }
+}
+
+fn scan_uses_in_clauses(cs: [HClause], in_lam: Bool) : [Use] {
+  match cs {
+    [] -> []
+    [h, ...rest] -> match h {
+      HC(_, _, body, _, _) -> list_append(scan_uses_expr(body, in_lam),
+                                          scan_uses_in_clauses(rest, in_lam))
+    }
+  }
+}
+
+# Find the last-use record for `nm` among `uses`. A single in-lambda
+# reference forces `LUBlocked`; otherwise the max (line, col) wins.
+fn last_use_for(nm: String, uses: [Use]) : LU =
+  last_use_for_loop(nm, uses, false, -1, -1)
+
+fn last_use_for_loop(nm: String, uses: [Use], blocked: Bool,
+                     mx_line: Int, mx_col: Int) : LU {
+  match uses {
+    [] -> {
+      if blocked { LUBlocked(nm) }
+      else if mx_line < 0 { LUUnused(nm) }
+      else { LUAt(nm, mx_line, mx_col) }
+    }
+    [h, ...rest] -> match h {
+      U(uname, ln, cl, in_lam) -> {
+        if uname == nm {
+          if in_lam {
+            last_use_for_loop(nm, rest, true, mx_line, mx_col)
+          } else if ln > mx_line or (ln == mx_line and cl > mx_col) {
+            last_use_for_loop(nm, rest, blocked, ln, cl)
+          } else {
+            last_use_for_loop(nm, rest, blocked, mx_line, mx_col)
+          }
+        } else {
+          last_use_for_loop(nm, rest, blocked, mx_line, mx_col)
+        }
+      }
+    }
+  }
+}
+
+# ---- `--dump-last-use`: per-fn-param last-use diagnostic ----
+
+fn dump_last_use_for_param(p: Param, uses: [Use]) : Unit {
+  let lu = last_use_for(p.pname, uses)
+  match lu {
+    LUAt(nm, ln, cl) -> print("  param #{nm}: last-use at #{int_to_string(ln)}:#{int_to_string(cl)}")
+    LUBlocked(nm)    -> print("  param #{nm}: blocked by closure capture")
+    LUUnused(nm)     -> print("  param #{nm}: never used")
+  }
+}
+
+fn dump_last_use_for_decl(d: Decl) : Unit {
+  match d {
+    DFn(_, nm, _, params, _, _, body, ln, _) -> {
+      print("fn #{nm}@#{int_to_string(ln)}:")
+      let uses = scan_uses_expr(body, false)
+      params |> each((p) => dump_last_use_for_param(p, uses))
+    }
+    _ -> {}
+  }
+}
+
+fn dump_last_use(file: String, decls: [Decl]) : Int {
+  let r = infer_program(file, decls, false)
+  r.decls |> each(dump_last_use_for_decl)
+  r.errs
+}
+
 # ---- `--holes`: typed-hole reports ----
 #
 # For each `?` / `?name` in the program, print the expected type
@@ -14038,6 +14272,7 @@ type Mode
   | MDumpTyped
   | MDumpMono
   | MDumpMonoOut
+  | MDumpLastUse
   | MHoles
   | MHolesJson
   | MEmitLlvm
@@ -14091,6 +14326,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
         parse_cli_loop(more, cli_with_mode(opts, MDumpMono))
       } else if a == "--dump-mono-out" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpMonoOut))
+      } else if a == "--dump-last-use" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpLastUse))
       } else if a == "--holes" {
         parse_cli_loop(more, cli_with_mode(opts, MHoles))
       } else if a == "--holes-json" {
@@ -14146,6 +14383,7 @@ fn usage() : Unit {
   eprint("  --dump-typed       run HM inference and dump the typed AST with per-node Ty")
   eprint("  --dump-mono        list call-site instantiations (name, loc, resolved type args)")
   eprint("  --dump-mono-out    list call-site instantiations with planned mangled monomorphic names")
+  eprint("  --dump-last-use    list each fn parameter's last-use position (m5 #2 diagnostic)")
   eprint("  --holes            report every typed hole (`?` / `?name`) with expected type + scope")
   eprint("  --holes-json       same as --holes, but JSON array for machine consumption")
   eprint("  --strict-holes     treat every unfilled hole as a compilation error (default: warning)")
@@ -14448,6 +14686,10 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               MDumpMonoOut -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_mono_out(path, all_decls) }
+              }
+              MDumpLastUse -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_last_use(path, all_decls) }
               }
               MHoles -> {
                 let chk = check_program(path, all_decls)
