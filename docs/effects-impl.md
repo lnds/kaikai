@@ -1918,14 +1918,20 @@ Split into four sub-tasks, landed in order, each its own branch
    handler, every default handler, every #5b `var` desugar —
    emits clean IR. Discard-bearing user handlers UB at runtime
    until m7c-c lands.
-3. **m7c-c — Op-call dispatch**. The `Eff.op(args)` branch of
-   `emit_call_expr`: call `@kai_evidence_lookup_node` (declared
-   in the header), bitcast the returned `%KaiEvidence*` to the
-   matching `%EvX*`, GEP into the right field, indirect-call
-   the function pointer with the arg list + a fresh `%KaiCont*`
-   (alloca + `@kai_cont_init_identity`), check the status, and
-   either fall through with the value or longjmp to the
-   handle's pad. *Pending.*
+3. **m7c-c — Op-call dispatch**. Lowers `Eff.op(args)` to LLVM
+   IR: call `@kai_evidence_lookup_handler(eff_name)` (a new
+   runtime helper that returns the handler pointer of the
+   innermost matching evidence node), bitcast to the matching
+   `%EvX*`, GEP the function pointer at field `3 + op_idx`,
+   alloca a 32-byte `KaiCont` buffer, init identity from the
+   handler_id field, and indirect-call. A new
+   `op_offsets: [OpOffset]` field on `LlvmEmit` carries the
+   `(Eff.op → field-index)` table populated by
+   `compute_op_offsets` from the decl list; threaded through
+   every LlvmEmit constructor and the three top-level emit
+   loops (fn, decls, lambda). The discard/longjmp path lives
+   in m7c-d (it needs the clause body + setjmp landing pad to
+   exist). **Landed.**
 4. **m7c-d — Clauses + default-handler wrappers**. Each
    `HClause` becomes a top-level LLVM function (mirroring the
    C side's `_kai_clause_<line>_<col>_<op>`). The `default_*_setup`
