@@ -6741,6 +6741,35 @@ fn alias_map_lookup(m: AliasMap, name: String) : Option[String] {
   match m { AM(xs) -> lookup_alias(xs, name) }
 }
 
+# m7b #17: drop every binding for `name` from the alias map. Used
+# when entering a scope (let / var / lambda param / match pattern)
+# whose binder shadows an outer `with Eff as name`. Removes from
+# the head down so the most recent re-bind no longer matches.
+fn alias_map_remove(m: AliasMap, name: String) : AliasMap {
+  match m { AM(xs) -> AM(alias_remove_loop(xs, name, [])) }
+}
+
+fn alias_remove_loop(xs: [AliasBinding], name: String, acc: [AliasBinding]) : [AliasBinding] {
+  match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      AB(n, _) ->
+        if n == name { alias_remove_loop(rest, name, acc) }
+        else        { alias_remove_loop(rest, name, [h, ...acc]) }
+    }
+  }
+}
+
+# m7b #17: drop every binding whose name is in `names`. Convenience
+# for shadowing by lambda params and match-arm patterns where the
+# whole pattern's bound-name set lands in scope at once.
+fn alias_map_remove_all(m: AliasMap, names: [String]) : AliasMap {
+  match names {
+    [] -> m
+    [h, ...rest] -> alias_map_remove_all(alias_map_remove(m, h), rest)
+  }
+}
+
 fn rewrite_alias_decls(ds: [Decl]) : [Decl] = map(ds, rewrite_alias_decl)
 
 fn rewrite_alias_decl(d: Decl) : Decl {
@@ -6767,8 +6796,37 @@ fn rewrite_alias_opt(opt: Option[Expr], m: AliasMap) : Option[Expr] {
 fn rewrite_alias_exprs(es: [Expr], m: AliasMap) : [Expr] =
   map(es, (e) => rewrite_alias_expr(e, m))
 
-fn rewrite_alias_stmts(ss: [Stmt], m: AliasMap) : [Stmt] =
-  map(ss, (s) => rewrite_alias_stmt(s, m))
+# m7b #17: walk a statement list with shadow-aware alias map.
+# Each SLet / SVar binds its name(s) for the rest of the block, so
+# subsequent statements (and the trailing expression handled in
+# the EBlock arm) see a map with those names removed. Without this
+# the walker would rewrite an inner `let x = ...; x.op()` against
+# an outer `with Eff as x` even though the inner `x` shadows.
+type StmtsRewrite = { stmts: [Stmt], m: AliasMap }
+
+fn rewrite_alias_stmts(ss: [Stmt], m: AliasMap) : [Stmt] {
+  let r = rewrite_alias_stmts_scoped(ss, m, [])
+  r.stmts
+}
+
+fn rewrite_alias_stmts_scoped(ss: [Stmt], m: AliasMap, acc: [Stmt]) : StmtsRewrite {
+  match ss {
+    [] -> StmtsRewrite { stmts: list_reverse(acc), m: m }
+    [s, ...rest] -> match s {
+      SLet(pat, ann, rhs) -> {
+        let s1 = SLet(pat, ann, rewrite_alias_expr(rhs, m))
+        let m1 = alias_map_remove_all(m, pat_bindings(pat, []))
+        rewrite_alias_stmts_scoped(rest, m1, [s1, ...acc])
+      }
+      SVar(n, ty, rhs, l, c) -> {
+        let s1 = SVar(n, ty, rewrite_alias_expr(rhs, m), l, c)
+        let m1 = alias_map_remove(m, n)
+        rewrite_alias_stmts_scoped(rest, m1, [s1, ...acc])
+      }
+      _ -> rewrite_alias_stmts_scoped(rest, m, [rewrite_alias_stmt(s, m), ...acc])
+    }
+  }
+}
 
 fn rewrite_alias_stmt(s: Stmt, m: AliasMap) : Stmt {
   match s {
@@ -6785,9 +6843,14 @@ fn rewrite_alias_stmt(s: Stmt, m: AliasMap) : Stmt {
 fn rewrite_alias_arms(arms: [Arm], m: AliasMap) : [Arm] =
   map(arms, (a) => rewrite_alias_arm(a, m))
 
+# m7b #17: pattern bindings shadow outer aliases inside the arm's
+# guard and body — same idea as the SLet shadow in stmts.
 fn rewrite_alias_arm(a: Arm, m: AliasMap) : Arm {
   match a {
-    Arm(p, g, b) -> Arm(p, rewrite_alias_opt(g, m), rewrite_alias_expr(b, m))
+    Arm(p, g, b) -> {
+      let m1 = alias_map_remove_all(m, pat_bindings(p, []))
+      Arm(p, rewrite_alias_opt(g, m1), rewrite_alias_expr(b, m1))
+    }
   }
 }
 
@@ -6815,7 +6878,13 @@ fn rewrite_alias_clauses(cs: [HClause], m: AliasMap) : [HClause] =
 
 fn rewrite_alias_clause(c: HClause, m: AliasMap) : HClause {
   match c {
-    HC(n, ps, b, l, co) -> HC(n, ps, rewrite_alias_expr(b, m), l, co)
+    HC(n, ps, b, l, co) -> {
+      # m7b #17: clause params (op args + the trailing `resume`)
+      # shadow outer aliases inside the clause body.
+      let names = map(ps, (pm) => pm.pname)
+      let m1 = alias_map_remove_all(m, names)
+      HC(n, ps, rewrite_alias_expr(b, m1), l, co)
+    }
   }
 }
 
@@ -6828,7 +6897,14 @@ fn rewrite_alias_opt_return(opt: Option[HReturn], m: AliasMap) : Option[HReturn]
 
 fn rewrite_alias_return(r: HReturn, m: AliasMap) : HReturn {
   match r {
-    HR(p, b, l, c) -> HR(p, rewrite_alias_expr(b, m), l, c)
+    # m7b #17: the return clause's `p` binding shadows outer
+    # aliases inside its body (Doc C §m7b #11l: `state` / `log`
+    # magic bindings are introduced by the codegen, not the
+    # rewrite pass — only `p` is user-visible here).
+    HR(p, b, l, c) -> {
+      let m1 = alias_map_remove(m, p)
+      HR(p, rewrite_alias_expr(b, m1), l, c)
+    }
   }
 }
 
@@ -6861,15 +6937,25 @@ fn rewrite_alias_kind(k: ExprKind, m: AliasMap, line: Int, col: Int) : ExprKind 
     }
     ECall(callee, args_) ->
       ECall(rewrite_alias_expr(callee, m), rewrite_alias_exprs(args_, m))
-    EBlock(stmts, tail) ->
-      EBlock(rewrite_alias_stmts(stmts, m), rewrite_alias_opt(tail, m))
+    EBlock(stmts, tail) -> {
+      # m7b #17: track shadowing through the block. The trailing
+      # expression sees the alias map after every SLet / SVar in
+      # the block has had its name removed.
+      let r = rewrite_alias_stmts_scoped(stmts, m, [])
+      EBlock(r.stmts, rewrite_alias_opt(tail, r.m))
+    }
     EIf(c, t_, eo) ->
       EIf(rewrite_alias_expr(c, m), rewrite_alias_expr(t_, m),
           rewrite_alias_opt(eo, m))
     EBinop(op, a, b) ->
       EBinop(op, rewrite_alias_expr(a, m), rewrite_alias_expr(b, m))
     EUnop(op, x) -> EUnop(op, rewrite_alias_expr(x, m))
-    ELambda(ps, b) -> ELambda(ps, rewrite_alias_expr(b, m))
+    ELambda(ps, b) -> {
+      # m7b #17: lambda params shadow outer aliases inside the body.
+      let names = map(ps, (pm) => pm.pname)
+      let m1 = alias_map_remove_all(m, names)
+      ELambda(ps, rewrite_alias_expr(b, m1))
+    }
     EMatch(scr, arms) -> EMatch(rewrite_alias_expr(scr, m),
                                  rewrite_alias_arms(arms, m))
     EPipe(a, b) -> EPipe(rewrite_alias_expr(a, m), rewrite_alias_expr(b, m))
