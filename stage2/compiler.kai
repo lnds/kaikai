@@ -6684,17 +6684,21 @@ fn default_mutable_setup() : String =
     "    kai_evidence_push(&_kai_default_node_mutable, \"Mutable\", &_kai_default_ev_mutable);\n"
   ])
 
-# m8 #2: emit EvSpawn + push it as the innermost default-handler node
-# (Doc B §`main` and the runtime — Installation order: Spawn sits
-# closest to main, Cancel the layer below it, the I/O group below
-# that). Only `yield` is wired here; the rest of the op set lands in
-# #3 with the real scheduler.
+# m8 #2/#3: emit EvSpawn + push it as the innermost default-handler
+# node (Doc B §*Installation order*: Spawn sits closest to main,
+# Cancel the layer below it, the I/O group below that). Wires all
+# five ops to the inline-eager v1 defaults — see stage0/runtime.h
+# for what each one does at runtime.
 fn default_spawn_setup() : String =
   concat_all([
     "    static EvSpawn _kai_default_ev_spawn;\n",
     "    static KaiEvidence _kai_default_node_spawn;\n",
     "    _kai_default_ev_spawn.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_spawn.yield = (KaiValue *(*)(EvSpawn *, KaiCont *)) &kai_default_spawn_yield;\n",
+    "    _kai_default_ev_spawn.yield  = (KaiValue *(*)(EvSpawn *, KaiCont *)) &kai_default_spawn_yield;\n",
+    "    _kai_default_ev_spawn.spawn  = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_spawn;\n",
+    "    _kai_default_ev_spawn.await  = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_await;\n",
+    "    _kai_default_ev_spawn.select = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_select;\n",
+    "    _kai_default_ev_spawn.cancel = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_cancel;\n",
     "    kai_evidence_push(&_kai_default_node_spawn, \"Spawn\", &_kai_default_ev_spawn);\n"
   ])
 
@@ -8316,6 +8320,14 @@ fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
           else if name == "String" { TyString }
           else if name == "Char"   { TyChar }
           else if name == "Unit"   { TyUnit }
+          # m7a #7 / m8 #3: Nothing is the bottom type (used by
+          # Fail.fail and Spawn's type-erased ops); the typer treats
+          # it as TyAny because it can't witness uninhabitedness.
+          # Without this case, Spawn.spawn(thunk: Nothing) refuses
+          # any non-Nothing thunk argument. resolve_ty and
+          # resolve_ty_with_binds both have this case; it was
+          # missing here.
+          else if name == "Nothing" { TyAny }
           else { TyCon(name, resolve_tas_with(tas, binds)) }
         }
       }
@@ -11349,7 +11361,18 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       let tpbinds = mk_tpbinds(tparams)
       let st_init = infer_state_new_full(file, env, prelude_len, recs, op_eff_arities)
       let st0 = advance_row_fresh(st_init, list_length(rbinds))
-      let added = add_infer_params_with_binds(st0, ps, tpbinds, rbinds)
+      # m7b #13 follow-up (surfaced by m8 #3's typed Spawn wrappers):
+      # mk_tpbinds allocates ids 0..n-1 for the fn-level tparams, but
+      # infer_state_new starts env.fresh at 0 too. Without bumping the
+      # counter past the tparam ids, the first fresh ty-var minted in
+      # the body (e.g., the result of synth_op_call_with_scheme inside
+      # `pub fn fiber_spawn[T, e](...) = Spawn.spawn(f)`) aliases `T`,
+      # which then fails the return-type unify with an occurs-check
+      # error ("expected: Fiber[?t0], found: ?t0"). Advance the env's
+      # fresh counter past the tpbinds the same way we already advance
+      # the row_fresh counter past the rbinds above.
+      let st0a = st_set_env(st0, advance_fresh(st0.env, list_length(tpbinds)))
+      let added = add_infer_params_with_binds(st0a, ps, tpbinds, rbinds)
       let rb = synth(added.st, body)
       let declared_ret = match opt_ret {
         Some(rty) -> resolve_ty_with_binds(rty, tpbinds, rbinds)
@@ -14276,18 +14299,34 @@ fn builtin_mutable_decl() : Decl =
           0, 0)
     ], 0, 0)
 
-# m8 #2: Spawn — non-parametric effect, single op for now. `yield()` is
-# the canonical pinning point per Doc B §`Cancel`/Delivery points: a
-# tight CPU loop with no other effect ops uses it to give the scheduler
-# a chance to inject `Cancel.raise()`. The full set (spawn / await /
-# select / cancel) lands in #3 once the per-op-generics shape for
-# `spawn[T, e]` is decided alongside the real cooperative scheduler.
+# m8 #2/#3: Spawn — non-parametric effect. Per Doc B §`Spawn`, the
+# user-facing API is polymorphic (`spawn[T, e]`, `await[T]`, etc.).
+# m7b #2a (per-op TYPE generics) is now in main, but Doc B's `spawn`
+# also wants a per-op ROW generic (`/ e`), which is a separate
+# extension. v1 sidesteps both by declaring spawn / await / select /
+# cancel with type-erased parameter and return types
+# (`Nothing` → TyAny in the typer); the polymorphic surface lives in
+# `stdlib/spawn.kai` as fn-level wrappers (m7b #13 + m7b #14 give
+# the type-param + lambda-row machinery the wrappers need).
+# `yield()` is the canonical pinning point per Doc B §`Cancel` /
+# Delivery points; it stays monomorphic.
+#
 # EOp shape is m7b #2a's six-field form (name, op_tparams, params,
-# ret, line, col); `yield` has no per-op generics so op_tparams = [].
+# ret, line, col); none of these ops use per-op tparams in v1, so
+# op_tparams stays []. Migration to the proper Doc B signatures is
+# tracked in `docs/m8x-followup.md` item 7.
 fn builtin_spawn_decl() : Decl =
   DEffect(false, "Spawn", [],
     [
-      EOp("yield", [], [], ty_name_zero("Unit"), 0, 0)
+      EOp("yield",  [], [], ty_name_zero("Unit"), 0, 0),
+      EOp("spawn",  [], [param_typed_zero("thunk", ty_name_zero("Nothing"))],
+                    ty_name_zero("Nothing"), 0, 0),
+      EOp("await",  [], [param_typed_zero("fiber", ty_name_zero("Nothing"))],
+                    ty_name_zero("Nothing"), 0, 0),
+      EOp("select", [], [param_typed_zero("fibers", ty_name_zero("Nothing"))],
+                    ty_name_zero("Nothing"), 0, 0),
+      EOp("cancel", [], [param_typed_zero("fiber", ty_name_zero("Nothing"))],
+                    ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
 fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int {

@@ -51,7 +51,8 @@ typedef enum {
     KAI_RECORD,
     KAI_VARIANT,
     KAI_CLOSURE,
-    KAI_ARRAY
+    KAI_ARRAY,
+    KAI_FIBER       /* m8 #3: Spawn / Fiber[T] handle (opaque to user code) */
 } KaiTag;
 
 typedef struct KaiValue KaiValue;
@@ -96,6 +97,11 @@ struct KaiValue {
             int64_t     cap;
             KaiValue  **items;
         } arr;
+        /* m8 #3: opaque handle to a KaiFiber. The KaiFiber struct
+         * itself is heap-allocated by Spawn.spawn and owned by this
+         * value: when the value's RC drops to zero, kai_free_value
+         * frees the KaiFiber and decrefs its result + thunk. */
+        struct KaiFiber *fib;
     } as;
 };
 
@@ -114,6 +120,66 @@ static KaiValue *kai_alloc(KaiTag tag) {
 
 static KaiValue *kai_incref(KaiValue *v) { if (v) v->rc++; return v; }
 static void       kai_decref(KaiValue *v);
+
+/* m8 #1/#3: KaiFiber definitions sit here (before kai_free_value)
+ * because KAI_FIBER values own their KaiFiber struct and the free
+ * path needs the full layout. The handler-stack runtime
+ * (KaiEvidence + push/pop/lookup) lives further down; KaiFiber only
+ * holds a `KaiEvidence *`, so a forward declaration is enough. The
+ * Spawn default handlers (kai_default_spawn_*) come later in the
+ * file too — they reach the struct through this declaration and use
+ * kai_apply (defined further down) to invoke spawned thunks. */
+typedef struct KaiEvidence KaiEvidence;
+
+/* m8 #3: fiber lifecycle states. Inline-eager v1: every spawned
+ * fiber goes NEW → DONE inside a single Spawn.spawn call (the thunk
+ * runs synchronously). The state machine is here so #4 (Cancel)
+ * and a future m8.x ucontext-based scheduler can extend it without
+ * a layout change. */
+typedef enum {
+    KAI_FIBER_NEW       = 0,
+    KAI_FIBER_DONE      = 1,
+    KAI_FIBER_CANCELLED = 2
+} KaiFiberState;
+
+typedef struct KaiFiber KaiFiber;
+struct KaiFiber {
+    KaiEvidence *evidence_top;
+    int             cancel_requested;  /* Spawn.cancel(target) sets this (#4) */
+    int             cancel_delivered;  /* Cancel.raise() injected once (#4)   */
+    KaiFiber       *sched_next;        /* intrusive ready-queue link          */
+    KaiFiber       *parent;            /* spawning fiber, NULL for the root   */
+    KaiFiberState   state;
+    KaiValue       *thunk;             /* held alive while the fiber runs     */
+    KaiValue       *result;            /* set on DONE; what await returns     */
+};
+
+/* m7a #5: single implicit fiber. m8 #3's inline-eager scheduler
+ * still hands back the implicit fiber as "current" — every spawned
+ * thunk runs to completion synchronously inside the spawning fiber,
+ * so there is no real distinction yet. m8.x's ucontext or full-CPS
+ * scheduler will replace the body of kai_current_fiber to return
+ * the head of the run queue. */
+static KaiFiber kai_main_fiber = { NULL, 0, 0, NULL, NULL, KAI_FIBER_NEW, NULL, NULL };
+
+static KaiFiber *kai_current_fiber(void) {
+    return &kai_main_fiber;
+}
+
+/* m8 #1: ready queue. Empty in v1 (every spawned thunk runs
+ * immediately); the head/tail pair is here so the data-flow path is
+ * the final shape for m8.x's real scheduler. */
+static KaiFiber *kai_ready_head = NULL;
+static KaiFiber *kai_ready_tail = NULL;
+
+/* m8 #3: wrap a heap-allocated KaiFiber in an opaque KAI_FIBER
+ * value. The KaiFiber struct's lifetime is tied to the value's RC
+ * (kai_free_value frees both together). */
+static KaiValue *kai_fiber_value(KaiFiber *f) {
+    KaiValue *v = kai_alloc(KAI_FIBER);
+    v->as.fib = f;
+    return v;
+}
 
 static void kai_free_value(KaiValue *v) {
     switch ((KaiTag) v->tag) {
@@ -140,6 +206,13 @@ static void kai_free_value(KaiValue *v) {
         case KAI_ARRAY:
             for (int64_t i = 0; i < v->as.arr.len; ++i) kai_decref(v->as.arr.items[i]);
             free(v->as.arr.items);
+            break;
+        case KAI_FIBER:
+            if (v->as.fib) {
+                kai_decref(v->as.fib->thunk);
+                kai_decref(v->as.fib->result);
+                free(v->as.fib);
+            }
             break;
         default: break;
     }
@@ -358,6 +431,7 @@ static int kai_eq(KaiValue *a, KaiValue *b) {
             return 1;
         case KAI_CLOSURE: return 0;      /* closures are not equatable */
         case KAI_ARRAY:   return 0;      /* arrays are opaque, identity-compared */
+        case KAI_FIBER:   return a->as.fib == b->as.fib;  /* identity */
     }
     return 0;
 }
@@ -432,6 +506,7 @@ static KaiValue *kai_to_string(KaiValue *v) {
         }
         case KAI_CLOSURE: return kai_str("<closure>");
         case KAI_ARRAY:   return kai_str("<array>");
+        case KAI_FIBER:   return kai_str("<fiber>");
     }
     return kai_str("?");
 }
@@ -1367,19 +1442,82 @@ static KaiValue *kai_default_mutable_array_grow(void *self, KaiValue *a,
     return kai_cont_resume(k, kai_prelude_array_grow(a, n, init));
 }
 
-/* m8 #2: default Spawn.yield handler. Single op for now — the
- * canonical pinning point per Doc B §`Cancel`/Delivery points. The
- * inline default is a no-op resume: the implicit single fiber has
- * nowhere to yield to until m8 #3 wires the real ready queue, so
- * `Spawn.yield()` is observable only through the typer (it forces
- * `Spawn` into the row). The full op set (spawn / await / select /
- * cancel) lands in #3 alongside the cooperative scheduler. */
+/* m8 #2/#3: default Spawn handlers. Inline-eager v1: spawn(thunk)
+ * runs the thunk synchronously, stores the result in a heap KaiFiber,
+ * and returns a KAI_FIBER handle; await(fib) returns the cached
+ * result; yield is a no-op (the implicit single fiber has nowhere to
+ * yield to); select picks the first fiber's result; cancel sets a
+ * flag (delivery in m8 #4). A future m8.x replaces this with a real
+ * cooperative scheduler whose surface is identical (same evidence
+ * struct, same op signatures). */
 static KaiValue *kai_default_spawn_yield(void *self, KaiCont *k) {
     (void) self;
     return kai_cont_resume(k, kai_unit());
 }
 
-typedef struct KaiEvidence KaiEvidence;
+static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k) {
+    (void) self;
+    if (!thunk || thunk->tag != KAI_CLOSURE) {
+        fprintf(stderr, "kai: Spawn.spawn called with non-closure value\n");
+        exit(1);
+    }
+    KaiFiber *f = (KaiFiber *) calloc(1, sizeof(KaiFiber));
+    if (!f) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    f->parent = kai_current_fiber();
+    f->state  = KAI_FIBER_NEW;
+    f->thunk  = kai_incref(thunk);
+    /* Inline-eager: invoke the thunk now. m8.x replaces this with
+     * an enqueue + scheduler dispatch. */
+    f->result = kai_apply(thunk, 0, NULL);
+    f->state  = KAI_FIBER_DONE;
+    return kai_cont_resume(k, kai_fiber_value(f));
+}
+
+static KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiCont *k) {
+    (void) self;
+    if (!fib_v || fib_v->tag != KAI_FIBER || !fib_v->as.fib) {
+        fprintf(stderr, "kai: Spawn.await called on non-fiber value\n");
+        exit(1);
+    }
+    KaiFiber *f = fib_v->as.fib;
+    if (f->state != KAI_FIBER_DONE) {
+        /* Should be unreachable in v1: spawn always finishes before
+         * returning. m8.x will block the caller and resume on
+         * completion. */
+        fprintf(stderr, "kai: Spawn.await on incomplete fiber (v1 inline-eager)\n");
+        exit(1);
+    }
+    return kai_cont_resume(k, kai_incref(f->result));
+}
+
+static KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, KaiCont *k) {
+    (void) self;
+    /* Argument is a [Fiber[T]] — a KAI_CONS list of KAI_FIBER. v1:
+     * pick the head and return its result. m8.x cancels the losers
+     * and picks whichever finishes first. */
+    if (!fibs_v || fibs_v->tag != KAI_CONS) {
+        fprintf(stderr, "kai: Spawn.select called on empty or non-list value\n");
+        exit(1);
+    }
+    KaiValue *first = fibs_v->as.cons.head;
+    if (!first || first->tag != KAI_FIBER || !first->as.fib) {
+        fprintf(stderr, "kai: Spawn.select: list head is not a fiber\n");
+        exit(1);
+    }
+    return kai_cont_resume(k, kai_incref(first->as.fib->result));
+}
+
+static KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *k) {
+    (void) self;
+    if (fib_v && fib_v->tag == KAI_FIBER && fib_v->as.fib) {
+        fib_v->as.fib->cancel_requested = 1;
+        /* m8 #4 will turn this flag into a Cancel.raise() at the
+         * next op-call boundary on that fiber. v1 just records it. */
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* (typedef forward-declared above, before KaiFiber.) */
 struct KaiEvidence {
     KaiEvidence *parent;
     const char  *eff_label;     /* canonical effect name (literal or interned). */
@@ -1394,40 +1532,6 @@ struct KaiEvidence {
     jmp_buf     *handle_jmp;
     KaiValue   **discard_slot;
 };
-
-typedef struct KaiFiber KaiFiber;
-struct KaiFiber {
-    KaiEvidence *evidence_top;
-    /* m8 #1: scheduler scaffolding. The fields are zero on the
-     * implicit kai_main_fiber and stay zero until m8 #2/#3 wire the
-     * Spawn handler + cooperative scheduler that actually populate
-     * them. Layout pinned now so emitted EvSpawn structs and any
-     * helper that takes a KaiFiber * compile against the final
-     * shape from the start. */
-    int             cancel_requested;  /* set by Spawn.cancel(target) (#4) */
-    int             cancel_delivered;  /* set after Cancel.raise() injected once (#4) */
-    KaiFiber       *sched_next;        /* intrusive ready-queue link (#3) */
-    KaiFiber       *parent;            /* spawning fiber, NULL for the root (#3) */
-};
-
-/* m7a #5: single implicit fiber. m8's real scheduler (#3) replaces
- * kai_current_fiber's body with a "current of the run-queue" lookup;
- * the function signature stays the same so every m7a call site
- * (kai_evidence_push / pop / lookup) keeps working unchanged. */
-static KaiFiber kai_main_fiber = { NULL, 0, 0, NULL, NULL };
-
-static KaiFiber *kai_current_fiber(void) {
-    return &kai_main_fiber;
-}
-
-/* m8 #1: ready queue. Empty until #3 enqueues spawned fibers; the
- * head/tail pair lets enqueue (tail) and dequeue (head) stay O(1)
- * without traversing on the cooperative single-thread scheduler.
- * Doc B §`Spawn` defers the policy choice to Doc C; FIFO is the
- * simplest one that satisfies the structured-concurrency drain
- * semantics. */
-static KaiFiber *kai_ready_head = NULL;
-static KaiFiber *kai_ready_tail = NULL;
 
 /* Push an Evidence node onto the current fiber's stack. The caller
  * owns the node's storage — typically `alloca`'d inside a compiled
