@@ -605,6 +605,12 @@ static KaiValue *kai_array_set_impl(KaiValue *a, int64_t i, KaiValue *v) {
     return kai_incref(a);
 }
 
+/* m5.x #2: incref each captured value so the closure owns its own
+ * reference. Symmetric with `kai_free_value` (KAI_CLOSURE branch),
+ * which decrefs every capture on chain-free. Without this incref the
+ * closure stores raw aliases of caller-owned bindings; the alias goes
+ * dangling as soon as the caller's scope decrefs them — latent under
+ * the loose runtime, a use-after-free under linear consumption. */
 static KaiValue *kai_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures) {
     KaiValue *v = kai_alloc(KAI_CLOSURE);
     v->as.clo.fn = fn;
@@ -612,7 +618,7 @@ static KaiValue *kai_closure(KaiFn fn, int arity, int n_captures, KaiValue **cap
     v->as.clo.n_captures = n_captures;
     if (n_captures > 0) {
         v->as.clo.captures = (KaiValue **) malloc(n_captures * sizeof(KaiValue *));
-        for (int i = 0; i < n_captures; ++i) v->as.clo.captures[i] = captures[i];
+        for (int i = 0; i < n_captures; ++i) v->as.clo.captures[i] = kai_incref(captures[i]);
     } else {
         v->as.clo.captures = NULL;
     }

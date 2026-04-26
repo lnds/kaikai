@@ -16,43 +16,47 @@ below address.
 
 ## Deferred items
 
-### 1. m5 #9 step 3/4 — runtime primitive linear consumption *(BLOCKED on stage 1)*
+### 1. m5 #9 step 3/4 — runtime primitive linear consumption *(STEP 1 LANDED, STEP 2 BLOCKED)*
 
 Modify `kai_lt` / `gt` / `le` / `ge` / `eq_v` / `ne_v` / `add` / `sub` /
 `mul` / `div` / `idiv` / `mod` / `neg` / `boolnot` / `truthy` / `field`
-to decref their args linearly. Tried during m5 round 3 and reverted
-because `stage1/compiler.kai` has no `perceus_pass`: stage 1 emits C
-in a *loose* discipline where primitives are called without dup, so a
-linear-consuming runtime produces use-after-free in stage 1 selfhost.
+to decref their args linearly.
 
-**Path to unblock**:
+**Step 1 — stage 1 perceus port**: LANDED (`f327d34`, 2026-04-26).
+`stage1/compiler.kai` now has its own `perceus_pass`, with magic-name
+emit for `__perceus_dup` / `__perceus_drop`. Inert under the loose
+runtime; ready to balance the runtime once the flip lands.
 
-1. Port `perceus_pass` to `stage1/compiler.kai` (~550 LOC mirror of
-   the stage 2 implementation, simpler because no parametric-effect
-   complications).
-2. Atomic flip of the runtime covering both stages in a single
-   commit. Both kaic1 and kaic2 must agree on linear-consumption
-   semantics from that commit on.
-3. Re-measure `live_peak` and leak rate. Expect a step change beyond
-   the current 77.4%.
+**Step 2 — atomic runtime flip**: BLOCKED. Attempted in the m5x-1-2
+lane (2026-04-26) and reverted. Three compounding issues surfaced
+during self-host:
 
-**Estimate**: ~1-2 days.
+1. C does not specify the evaluation order of function-call arguments.
+   The lexically-last "transferred raw" read can fire before the
+   dup-wrapped earlier reads (clang on AArch64 evaluates right-to-
+   left), freeing the local before the dups execute. A conservative
+   variant (any binding with ≥ 2 uses dups every read) is sound but
+   not sufficient on its own — the other two issues remain.
+2. `stage0/emit.c`'s `emit_pat_test` / `emit_pat_binds` for record
+   patterns chains multiple `kai_field(_scr, ...)` on the same
+   scrutinee. Under linear consumption the first field-test consumes
+   `_scr`; subsequent tests UAF.
+3. The kaic1 binary's machine code is whatever stage 0 emits, and
+   stage 0 has no perceus pass. An eager-dup retrofit at every local
+   read works for simple programs but interacts with closure capture
+   construction and match-pattern aliasing in ways that need a
+   substantial stage 0 audit.
 
-Documented in `perceus-basic.md` §"What unblocks step 3+".
+Detail in `docs/perceus-basic.md` §"Step 3+ outcome (m5.x-1-2 lane)"
+and `docs/lane-experience-m5x-1-2.md`.
 
-### 2. m5 #6 (doc grain) — `kai_closure` incref of captures *(DEFERRED)*
+### 2. m5 #6 (doc grain) — `kai_closure` incref of captures *(LANDED)*
 
-When a lambda is constructed, its captured values need an incref to
-survive the call site. Today they do not. This is a latent bug: the
-loose-consumption runtime hides it because nothing decrefs aggressively
-mid-flight, but **once step 3 above flips the runtime, this becomes a
-crash bug** as soon as a captured value is consumed by a primitive
-inside the lambda.
-
-**Cost**: coordinated change in runtime + emitter. ~1 day.
-
-Order of operations: ship this **before** step 3 lands, so the flip
-does not reveal the bomb.
+Landed (`80b0015`, 2026-04-26). `kai_closure` now increfs each
+captured value at construction; the symmetric decref already lived
+in `kai_free_value`'s KAI_CLOSURE branch. Inert under the loose
+runtime — nothing decrefs primitive args mid-flight — and ready to
+balance the closure-capture rc once step 1 above lands.
 
 ### 3. m4c retrofit — `clause_fn_name` should be fn-name aware *(BLOCKED)*
 
