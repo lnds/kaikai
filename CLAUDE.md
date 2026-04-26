@@ -31,7 +31,7 @@ Three tiers, ordered by how non-negotiable they are. When principles conflict, t
 
 3. **Fast compilation**
    - Single-pass parse, LL(1) grammar with minor bookkeeping.
-   - HM-extended types with effect rows; decidable; no type-class resolution.
+   - HM-extended types with effect rows; decidable; **no Haskell-style type-class resolution** (no HKT, no constraint propagation in signatures, no functional dependencies, no type families). Single-dispatch protocols Go/Clojure/Elixir-style — `O(1)` impl-table lookup, no constraint solver — are permitted (m12.8, see `docs/protocols.md`).
    - Pipeline `lex → parse → resolve → infer → monomorph → perceus → lower`, dumpable between any two passes.
 
 ### Tier 2 — Aspirational (trade-offs allowed; Tier 1 wins ties)

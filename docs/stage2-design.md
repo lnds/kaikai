@@ -462,6 +462,20 @@ in.
     declarations, and selfhost scaffolding while a real
     definition is pending. ~0.5 day; reuses the typed-holes
     runtime infrastructure. Optional but cheap.
+12.8. **m12.8 — Single-dispatch protocols**: explicit `protocol`
+    declarations + `impl` blocks for ad-hoc polymorphism by
+    type tag. Modeled on Clojure / Elixir protocols, Go
+    interfaces, and Rust traits without higher-kinded types.
+    Stdlib ships `Show` / `Eq` / `Ord` / `Hash` / `Serialize`
+    with default impls for primitives. `#derive(...)` annotation
+    auto-generates structural impls for records and sum types.
+    **Not** Haskell typeclasses: no HKT, no constraints in
+    signatures, no functional dependencies, no overlapping
+    instances; coherence enforced by orphan rule + single-impl
+    check. Resolution is `O(1)` per call site, no constraint
+    solver. Independent of effects/fibers; subsumes the magic
+    `to_string` / auto-derivation pseudo-typeclass discussed
+    earlier. Full design in `docs/protocols.md`. ~2-3 days.
 13. **m13 — Property testing + bench + bit ops**: `check` and
     `bench` blocks, matching runners. Plus the bit-operations
     module per `proposed-extensions.md` §16: `stdlib/core/bit.kai`
@@ -504,7 +518,7 @@ exists as a usable language as soon as possible" and treats
 performance work as a follow-up:
 
 ```
-m7a → m7b → m7c → m7d → m7e → m7f → m8 → m8.5 → m12 → m12.5 → m12.6 → m12.7 → m5 → full Perceus → m11/m13/m14/m15-17
+m7a → m7b → m7c → m7d → m7e → m7f → m8 → m8.5 → m12 → m12.5 → m12.6 → m12.7 → m12.8 → m5 → full Perceus → m11/m13/m14/m15-17
 ```
 
 Rationale:

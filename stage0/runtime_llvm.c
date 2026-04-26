@@ -180,13 +180,88 @@ KaiValue *kaix_prelude_array_get(KaiValue *a, KaiValue *i)               { retur
 KaiValue *kaix_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v)  { return kai_prelude_array_set(a, i, v); }
 KaiValue *kaix_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) { return kai_prelude_array_grow(a, n, init); }
 
+/* m7c-c / m7c-d — kaix_* wrappers around the static runtime
+ * helpers in runtime.h. The LLVM IR can only see externally-
+ * linkable symbols, so these thin shims expose every helper the
+ * effects ABI needs (push/pop, lookup, cont init/resume,
+ * default-handler clauses for the catalog builtins). */
+KaiHandlerId kaix_fresh_handler_id(void) { return kai_fresh_handler_id(); }
+
+void kaix_evidence_push(KaiEvidence *node, const char *eff_label, void *handler) {
+    kai_evidence_push(node, eff_label, handler);
+}
+
+void kaix_evidence_pop(void) { kai_evidence_pop(); }
+
+void *kaix_evidence_lookup_handler(const char *eff_label) {
+    KaiEvidence *node = kai_evidence_lookup_node(eff_label);
+    if (node == NULL) { return NULL; }
+    return node->handler;
+}
+
+void kaix_cont_init_identity(KaiCont *k, KaiHandlerId hid) {
+    kai_cont_init_identity(k, hid);
+}
+
+KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v) {
+    return kai_cont_resume(k, v);
+}
+
+/* m7c-d — clause-body helper for the 2-arg `resume(v, ns)` form.
+ * Every Ev<Eff> struct begins with `KaiHandlerId` (8 bytes) +
+ * `void *env` (8 bytes), so `state` lives at byte offset 16. */
+void kaix_clause_state_set(void *self, KaiValue *v) {
+    *((KaiValue **)((char *) self + 16)) = v;
+}
+
+/* m7c-d — non-static wrappers for the default-handler clause
+ * functions defined static in runtime.h. The LLVM emit's
+ * `kai_main_install_defaults` references these. Untyped i8*
+ * self-args mirror the IR-level signature; the underlying
+ * statics use the typed Ev<Eff> *self but the layout is the
+ * same KaiHandlerId-leading prefix so the cast is safe. */
+KaiValue *kaix_default_console_print(void *self, KaiValue *s, KaiCont *k) {
+    return kai_default_console_print(self, s, k);
+}
+KaiValue *kaix_default_console_eprint(void *self, KaiValue *s, KaiCont *k) {
+    return kai_default_console_eprint(self, s, k);
+}
+KaiValue *kaix_default_fail_fail(void *self, KaiValue *msg, KaiCont *k) {
+    return kai_default_fail_fail(self, msg, k);
+}
+KaiValue *kaix_default_mutable_array_make(void *self, KaiValue *n, KaiValue *init, KaiCont *k) {
+    return kai_default_mutable_array_make(self, n, init, k);
+}
+KaiValue *kaix_default_mutable_array_length(void *self, KaiValue *a, KaiCont *k) {
+    return kai_default_mutable_array_length(self, a, k);
+}
+KaiValue *kaix_default_mutable_array_get(void *self, KaiValue *a, KaiValue *i, KaiCont *k) {
+    return kai_default_mutable_array_get(self, a, i, k);
+}
+KaiValue *kaix_default_mutable_array_set(void *self, KaiValue *a, KaiValue *i, KaiValue *v, KaiCont *k) {
+    return kai_default_mutable_array_set(self, a, i, v, k);
+}
+KaiValue *kaix_default_mutable_array_grow(void *self, KaiValue *a, KaiValue *n, KaiValue *init, KaiCont *k) {
+    return kai_default_mutable_array_grow(self, a, n, init, k);
+}
+
+/* m7c-d — install/teardown default handlers for builtins that
+ * appear in main's row. The LLVM emitter generates the body of
+ * these two functions per program (filling in the right
+ * push/pop sequence for the row). When main has no builtin
+ * effects the LLVM IR still defines them as no-ops. */
+extern void kai_main_install_defaults(void);
+extern void kai_main_teardown_defaults(void);
+
 /* Entry point: the LLVM output defines kai_main. Match what the C
    backend's emit_main_wrapper does. */
 extern KaiValue *kai_main(void);
 
 int main(int argc, char **argv) {
     kai_set_args(argc, argv);
+    kai_main_install_defaults();
     KaiValue *result = kai_main();
+    kai_main_teardown_defaults();
     kai_decref(result);
     return 0;
 }
