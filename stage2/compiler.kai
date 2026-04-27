@@ -19429,6 +19429,150 @@ fn substitute_self_in_kind(k: TyKind) : TyKind {
   }
 }
 
+# m12.8.x: validate that, before expansion, every `#derive(P)` on a
+# sum type can be discharged: each variant field's head type must
+# already have a registered impl of `P` reachable from this
+# compilation unit (an explicit `impl P for T`, another `#derive(P)`
+# on `T`, or a builtin from `derive_builtin_impl`). Records keep the
+# pre-existing v1 behaviour (synthesise the impl, fall through to
+# the runtime panic if an inner field has no impl).
+fn validate_derives(ds: [Decl], file: String) : Int {
+  let future_impls = collect_future_impl_keys(ds, [])
+  validate_derives_loop(ds, file, future_impls, 0)
+}
+
+fn collect_future_impl_keys(ds: [Decl], acc: [String]) : [String] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DImpl(pname, target, _, _, _) ->
+        collect_future_impl_keys(rest,
+          [concat_all([pname, "/", proto_type_name(target)]), ...acc])
+      DDerive(names, inner, _, _) -> {
+        let acc1 = match inner {
+          DType(_, tname, _, _, _, _) -> add_future_impl_keys(names, tname, acc)
+          _ -> acc
+        }
+        collect_future_impl_keys(rest, acc1)
+      }
+      _ -> collect_future_impl_keys(rest, acc)
+    }
+  }
+}
+
+fn add_future_impl_keys(names: [String], tname: String, acc: [String]) : [String] {
+  match names {
+    [] -> acc
+    [n, ...rest] ->
+      add_future_impl_keys(rest, tname, [concat_all([n, "/", tname]), ...acc])
+  }
+}
+
+# Builtin impls bundled with kaikai for primitive types, kept in
+# sync with stdlib/protocols.kai. The validator treats these as
+# always available so users do not have to redeclare `impl Eq for
+# Int` in every fixture that derives Eq on a sum carrying Ints.
+fn derive_builtin_impl(pname: String, tname: String) : Bool {
+  if pname == "Eq" {
+    list_has(["Int", "Real", "Bool", "String", "Char", "Unit"], tname)
+  } else if pname == "Hash" {
+    list_has(["Int", "String", "Bool", "Char"], tname)
+  } else if pname == "Show" {
+    list_has(["Int", "Real", "Bool", "String", "Unit", "Char"], tname)
+  } else { false }
+}
+
+fn validate_derives_loop(ds: [Decl], file: String,
+                          future_impls: [String], errs: Int) : Int {
+  match ds {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DDerive(names, inner, line, col) -> {
+        let errs1 = validate_derive_decl(names, inner, file, future_impls,
+                                          line, col, errs)
+        validate_derives_loop(rest, file, future_impls, errs1)
+      }
+      _ -> validate_derives_loop(rest, file, future_impls, errs)
+    }
+  }
+}
+
+fn validate_derive_decl(names: [String], inner: Decl, file: String,
+                         future_impls: [String], dline: Int, dcol: Int,
+                         errs: Int) : Int {
+  match inner {
+    DType(_, tname, _, body, _, _) -> match body {
+      TBSum(variants) -> validate_derive_sum_protos(names, tname, variants,
+                                                     file, future_impls,
+                                                     dline, dcol, errs)
+      _ -> errs
+    }
+    _ -> errs
+  }
+}
+
+fn validate_derive_sum_protos(names: [String], tname: String, variants: [Variant],
+                                file: String, future_impls: [String],
+                                line: Int, col: Int, errs: Int) : Int {
+  match names {
+    [] -> errs
+    [pname, ...rest] -> {
+      let errs1 =
+        if pname == "Eq" or pname == "Hash" {
+          validate_derive_sum_variants(pname, tname, variants, file,
+                                        future_impls, line, col, errs)
+        } else { errs }
+      validate_derive_sum_protos(rest, tname, variants, file, future_impls,
+                                  line, col, errs1)
+    }
+  }
+}
+
+fn validate_derive_sum_variants(pname: String, tname: String, vs: [Variant],
+                                 file: String, future_impls: [String],
+                                 line: Int, col: Int, errs: Int) : Int {
+  match vs {
+    [] -> errs
+    [v, ...rest] -> match v {
+      Var(vname, vargs) -> {
+        let errs1 = validate_derive_variant_args(pname, tname, vname, vargs,
+                                                  0, file, future_impls,
+                                                  line, col, errs)
+        validate_derive_sum_variants(pname, tname, rest, file, future_impls,
+                                      line, col, errs1)
+      }
+    }
+  }
+}
+
+fn validate_derive_variant_args(pname: String, tname: String, vname: String,
+                                 vargs: [TypeExpr], i: Int, file: String,
+                                 future_impls: [String], line: Int, col: Int,
+                                 errs: Int) : Int {
+  match vargs {
+    [] -> errs
+    [te, ...rest] -> {
+      let head = proto_type_name(te)
+      let key = concat_all([pname, "/", head])
+      let ok = list_has(future_impls, key) or derive_builtin_impl(pname, head)
+      let errs1 =
+        if ok { errs }
+        else {
+          eprint(concat_all([
+            file, ":", int_to_string(line), ":", int_to_string(col),
+            ": error: cannot derive `", pname, "` for `", tname,
+            "`: variant `", vname, "` field #", int_to_string(i),
+            " has type `", head,
+            "` which has no `impl ", pname, " for ", head,
+            "` in this compilation unit"]))
+          errs + 1
+        }
+      validate_derive_variant_args(pname, tname, vname, rest, i + 1, file,
+                                    future_impls, line, col, errs1)
+    }
+  }
+}
+
 # Phase 1: expand each `DDerive(names, type_decl)` into its wrapped
 # DType followed by one synthetic DImpl per derived protocol.
 # DProtocol and ordinary DImpl decls pass through unchanged so the
@@ -19626,6 +19770,16 @@ fn derive_eq_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option[D
         mk_ty(TyName("Bool", []), line, col),
         body_expr, line, col))
     }
+    TBSum(variants) -> {
+      let body_expr = derive_eq_sum_body(variants, line, col)
+      Some(make_derived_impl("Eq", tname, "eq",
+        [Param { pname: "a", ptype: Some(mk_ty(TyName(tname, []), line, col)),
+                 pline: line, pcol: col },
+         Param { pname: "b", ptype: Some(mk_ty(TyName(tname, []), line, col)),
+                 pline: line, pcol: col }],
+        mk_ty(TyName("Bool", []), line, col),
+        body_expr, line, col))
+    }
     _ -> None
   }
 }
@@ -19655,10 +19809,84 @@ fn derive_eq_record_chain(head: FieldDecl, rest: [FieldDecl], line: Int, col: In
   }
 }
 
+# m12.8.x: `#derive(Eq)` on a sum type. Outer-match on `a`, one arm
+# per variant; each arm rematches `b` for the same variant
+# (returning `eq(la_0, lb_0) and eq(la_1, lb_1) and ...`) with a
+# wildcard arm returning `false`. Empty sums (no variants) are
+# defensive; the parser does not produce them today.
+fn derive_eq_sum_body(variants: [Variant], line: Int, col: Int) : Expr {
+  match variants {
+    [] -> mk_expr(EBool(false), line, col)
+    _  -> {
+      let scrut = mk_expr(EVar("a"), line, col)
+      let arms = map(variants, (v) => derive_eq_sum_outer_arm(v, line, col))
+      mk_expr(EMatch(scrut, arms), line, col)
+    }
+  }
+}
+
+fn derive_eq_sum_outer_arm(v: Variant, line: Int, col: Int) : Arm {
+  match v {
+    Var(name, vargs) -> {
+      let pat_subs = derive_eq_sum_pat_subs("la_", vargs, 0, line, col)
+      let pat = mk_pat(PVariant(name, pat_subs), line, col)
+      let inner = derive_eq_sum_inner_match(name, vargs, line, col)
+      Arm(pat, None, inner)
+    }
+  }
+}
+
+fn derive_eq_sum_inner_match(name: String, vargs: [TypeExpr], line: Int, col: Int) : Expr {
+  let scrut = mk_expr(EVar("b"), line, col)
+  let pat_subs = derive_eq_sum_pat_subs("lb_", vargs, 0, line, col)
+  let match_pat = mk_pat(PVariant(name, pat_subs), line, col)
+  let body = derive_eq_sum_field_chain(vargs, 0, line, col)
+  let arm_match = Arm(match_pat, None, body)
+  let arm_wild  = Arm(mk_pat(PWild, line, col), None,
+                      mk_expr(EBool(false), line, col))
+  mk_expr(EMatch(scrut, [arm_match, arm_wild]), line, col)
+}
+
+fn derive_eq_sum_pat_subs(prefix: String, vargs: [TypeExpr], i: Int,
+                           line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PBind(concat_all([prefix, int_to_string(i)])), line, col),
+       ...derive_eq_sum_pat_subs(prefix, rest, i + 1, line, col)]
+  }
+}
+
+fn derive_eq_sum_field_chain(vargs: [TypeExpr], i: Int, line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> mk_expr(EBool(true), line, col)
+    [_, ...rest] -> {
+      let l = mk_expr(EVar(concat_all(["la_", int_to_string(i)])), line, col)
+      let r = mk_expr(EVar(concat_all(["lb_", int_to_string(i)])), line, col)
+      let call = mk_expr(ECall(mk_expr(EVar("eq"), line, col), [l, r]), line, col)
+      match rest {
+        [] -> call
+        _  -> {
+          let tail = derive_eq_sum_field_chain(rest, i + 1, line, col)
+          mk_expr(EBinop("and", call, tail), line, col)
+        }
+      }
+    }
+  }
+}
+
 fn derive_hash_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
   match body {
     TBRecord(fields) -> {
       let body_expr = derive_hash_record_body(fields, line, col)
+      Some(make_derived_impl("Hash", tname, "hash",
+        [Param { pname: "x", ptype: Some(mk_ty(TyName(tname, []), line, col)),
+                 pline: line, pcol: col }],
+        mk_ty(TyName("Int", []), line, col),
+        body_expr, line, col))
+    }
+    TBSum(variants) -> {
+      let body_expr = derive_hash_sum_body(variants, line, col)
       Some(make_derived_impl("Hash", tname, "hash",
         [Param { pname: "x", ptype: Some(mk_ty(TyName(tname, []), line, col)),
                  pline: line, pcol: col }],
@@ -19693,6 +19921,61 @@ fn derive_hash_record_chain(head: FieldDecl, rest: [FieldDecl], line: Int, col: 
   }
 }
 
+# m12.8.x: `#derive(Hash)` on a sum type. Match on the value, one arm
+# per variant; each arm seeds the running accumulator with the
+# variant's 1-based tag and folds in `hash(field)` using the same
+# `acc * 31 + h` combination the record helper uses, so two values
+# that are eq via the derived Eq hash to the same Int.
+fn derive_hash_sum_body(variants: [Variant], line: Int, col: Int) : Expr {
+  match variants {
+    [] -> mk_expr(EInt(0), line, col)
+    _  -> {
+      let scrut = mk_expr(EVar("x"), line, col)
+      let arms = derive_hash_sum_arms(variants, 1, line, col)
+      mk_expr(EMatch(scrut, arms), line, col)
+    }
+  }
+}
+
+fn derive_hash_sum_arms(vs: [Variant], tag: Int, line: Int, col: Int) : [Arm] {
+  match vs {
+    [] -> []
+    [v, ...rest] ->
+      [derive_hash_sum_arm(v, tag, line, col),
+       ...derive_hash_sum_arms(rest, tag + 1, line, col)]
+  }
+}
+
+fn derive_hash_sum_arm(v: Variant, tag: Int, line: Int, col: Int) : Arm {
+  match v {
+    Var(name, vargs) -> {
+      let pat_subs = derive_eq_sum_pat_subs("h_", vargs, 0, line, col)
+      let pat = mk_pat(PVariant(name, pat_subs), line, col)
+      let body = derive_hash_sum_arm_body(vargs, tag, line, col)
+      Arm(pat, None, body)
+    }
+  }
+}
+
+fn derive_hash_sum_arm_body(vargs: [TypeExpr], tag: Int, line: Int, col: Int) : Expr {
+  let head = mk_expr(EInt(tag), line, col)
+  derive_hash_sum_chain(head, vargs, 0, line, col)
+}
+
+fn derive_hash_sum_chain(acc: Expr, vargs: [TypeExpr], i: Int,
+                          line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> acc
+    [_, ...rest] -> {
+      let v = mk_expr(EVar(concat_all(["h_", int_to_string(i)])), line, col)
+      let h = mk_expr(ECall(mk_expr(EVar("hash"), line, col), [v]), line, col)
+      let mul = mk_expr(EBinop("*", acc, mk_expr(EInt(31), line, col)), line, col)
+      let next = mk_expr(EBinop("+", mul, h), line, col)
+      derive_hash_sum_chain(next, rest, i + 1, line, col)
+    }
+  }
+}
+
 fn make_derived_impl(pname: String, tname: String, opname: String,
                       params: [Param], ret: TypeExpr, body: Expr,
                       line: Int, col: Int) : Decl {
@@ -19706,13 +19989,18 @@ fn make_derived_impl(pname: String, tname: String, opname: String,
 type LoweredProtocols = { decls: [Decl], reg: ProtocolReg, errs: Int }
 
 fn lower_protocols(decls: [Decl], file: String) : LoweredProtocols {
+  # Step 0 — m12.8.x: validate `#derive(Eq/Hash)` on sum types: every
+  # variant field's head type must already have an impl reachable in
+  # this compilation unit. Reported errors short-circuit the typer
+  # via `proto_errs > 0` in the driver.
+  let pre_errs = validate_derives(decls, file)
   # Step 1 — expand `#derive(...)` annotations into synthetic DImpl
   # decls so subsequent steps see all impls uniformly.
   let expanded = expand_derives(decls)
   # Step 2 — coherence: orphan + duplicate-impl validation.
   let proto_names = collect_proto_names(expanded, [])
   let local_types = collect_local_type_names(expanded, [])
-  let errs = validate_impls(expanded, file, proto_names, local_types)
+  let errs = pre_errs + validate_impls(expanded, file, proto_names, local_types)
   # Step 3 — collect every protocol op into the registry.
   let reg0 = collect_proto_decls(expanded, proto_reg_empty())
   # Step 4 — lower each DImpl method into a top-level DFn (mangled
