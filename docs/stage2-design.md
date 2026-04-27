@@ -930,6 +930,42 @@ inspection (`desugar_interp_decls` no scope tracking,
 `clause_resume`). See `docs/m12.8-followup.md` post-Core section
 for the live tracking.
 
+**Update 2026-04-27 (post-REOPEN final) — Core RE-CLOSED.** All
+three levels of the revised gate are met:
+
+- **Level 1** (automated, mechanical): `make selfhost` + `make -C
+  stage2 selfhost-llvm` byte-identical fixed point; `make test`
+  clean (incl. `test-demos-core` and the new `test-aspirational`).
+- **Level 2** (audit + invariant verifier): every `_ -> k`
+  wildcard in every AST walker pass justified or made explicit
+  (`7bd5a68`); rep invariant (b) — protocol-dispatcher references
+  outside enclosing binders — runs on every compile via
+  `validate_typer_invariants` (`0afc2a9`); invariants (a) and (c)
+  documented as construction-site properties, not post-finalise
+  walkers. The four lurking suspects Linus called out are fixed
+  (suspects 2/3/4) or analyzed as false-positive (suspect 1).
+- **Level 3** (demo gate + unplanned program): `make
+  demos-no-regression` enforces a baseline of 18 OK + PASS demos
+  in `demos/`; `make -C stage2 test-aspirational` runs
+  `examples/aspirational/event_logger` — a custom Logger effect
+  + handler + `each` with effectful callback — that exercises
+  features the milestone-planned demos did not (custom effect
+  declaration, effectful HOF callbacks, sum-type-with-payload
+  `#derive(Show)` interpolation).
+
+The `map_expr_kind` shared visitor refactor Linus floated is
+explicitly **not** part of the gate — CLAUDE.md "no premature
+abstraction" rules it out. The combination of the wildcard audit +
+the rep invariant walker covers the bug class the abstraction
+would prevent without imposing a new compiler-wide pattern.
+
+Recap of all four bugs found post-the-original-CLOSED (in the
+order they surfaced): handler-clause alias rewrite (`10a1e7b`),
+scope-blind protocol rename (`257b247`), closed lambda rows
+(`b528655`), closure-captured handler aliases (`4c61184`). All
+fixed; all defended by either the audit, the runtime invariant
+walker, or a regression fixture.
+
 What is **not** in Core but is part of Full:
 
 - Remaining m7e items: `variants[T]()`, main-row inference, `use Effect`.

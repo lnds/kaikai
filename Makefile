@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos demos-verify selfhost clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos demos-verify demos-no-regression selfhost clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -45,6 +45,14 @@ test-demos: kaic1
 # top-level alias matches the name Eric proposed in the m12.8 review.
 demos-verify: kaic2
 	$(MAKE) -C stage2 test-demos-core
+
+# m12.8.x post-Core REOPEN — Eric level 3 gate. Runs the full demo
+# probe set under demos/ and fails when the OK + PASS count drops
+# below the baseline pinned in `demos/baseline.txt`. Used at every
+# milestone close to prevent silent regressions in features the
+# Core demo gate (`demos-verify`) does not exercise.
+demos-no-regression: kaic2
+	$(MAKE) -C demos no-regression
 
 # Self-hosting fixed point for both compilers.
 selfhost:

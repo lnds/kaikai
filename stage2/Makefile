@@ -10,7 +10,7 @@ SRC     := compiler.kai
 # feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
 STACK := ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop test-stdlib test-protocols test-demos-core selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop test-stdlib test-protocols test-demos-core test-aspirational selfhost
 
 all: $(TARGET)
 
@@ -1269,7 +1269,43 @@ test-demos-core: $(TARGET) build
 	    || { echo "demos-core DIFF $$name (LLVM)"; diff $$exp build/demo-$$name-llvm.out; exit 1; }; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols test-demos-core
+# m12.8.x post-Core REOPEN — Eric level 3: aspirational unplanned
+# program. Verifies that `make -C demos verify` was not the only
+# probe pushing the typer beyond the milestone-planned paths. Each
+# demo under examples/aspirational/ exercises a feature combination
+# the milestone did not anticipate; failures here mean the close
+# criterion is not met.
+ASPIRATIONAL_DEMOS := event_logger
+
+test-aspirational: $(TARGET) build
+	@$(STACK) set -e; \
+	for name in $(ASPIRATIONAL_DEMOS); do \
+	  src=../examples/aspirational/$$name/$$name.kai; \
+	  exp=../examples/aspirational/$$name/$$name.out.expected; \
+	  if [ ! -f $$src ]; then echo "aspirational FAIL $$name (missing $$src)"; exit 1; fi; \
+	  if [ ! -f $$exp ]; then echo "aspirational FAIL $$name (missing $$exp)"; exit 1; fi; \
+	  preludes="--prelude ../stdlib/core.kai --prelude ../stdlib/protocols.kai --prelude ../stdlib/effects.kai"; \
+	  ./$(TARGET) $$preludes $$src > build/asp-$$name.c \
+	    || { echo "aspirational FAIL $$name (kaic2 errored)"; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/asp-$$name.c -o build/asp-$$name \
+	    || { echo "aspirational FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/asp-$$name > build/asp-$$name.out \
+	    || { echo "aspirational FAIL $$name (run errored)"; cat build/asp-$$name.out; exit 1; }; \
+	  diff -q $$exp build/asp-$$name.out > /dev/null \
+	    && echo "aspirational OK $$name (C)" \
+	    || { echo "aspirational DIFF $$name (C)"; diff $$exp build/asp-$$name.out; exit 1; }; \
+	  ./$(TARGET) --emit=llvm $$preludes $$src > build/asp-$$name.ll \
+	    || { echo "aspirational FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/asp-$$name.ll ../stage0/runtime_llvm.c -o build/asp-$$name-llvm 2>/dev/null \
+	    || { echo "aspirational FAIL $$name (LLVM compile failed)"; exit 1; }; \
+	  ./build/asp-$$name-llvm > build/asp-$$name-llvm.out \
+	    || { echo "aspirational FAIL $$name (LLVM run errored)"; cat build/asp-$$name-llvm.out; exit 1; }; \
+	  diff -q $$exp build/asp-$$name-llvm.out > /dev/null \
+	    && echo "aspirational OK $$name (LLVM)" \
+	    || { echo "aspirational DIFF $$name (LLVM)"; diff $$exp build/asp-$$name-llvm.out; exit 1; }; \
+	done
+
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols test-demos-core test-aspirational
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -1278,7 +1314,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols test-demos-core
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols test-demos-core test-aspirational
 
 clean:
 	rm -rf build $(TARGET)

@@ -89,5 +89,36 @@ verify:
 $(DEMOS):
 	@$(MAKE) --no-print-directory verify DEMOS=$@ 2>/dev/null | tail -10
 
+# m12.8.x post-Core REOPEN — Eric level 3: no-regression gate.
+# `baseline.txt` stores the minimum OK + PASS count that the demo
+# probe set must produce. Drops below the baseline fail the build;
+# the file is updated by hand when a demo legitimately leaves the
+# OK/PASS column (e.g., the language gains a feature that requires
+# a previously-passing demo to be rewritten in target syntax that
+# is not yet implemented). The intent is to prevent silent
+# regressions where a compiler change knocks a demo out of the OK
+# column; the user must explicitly acknowledge the regression by
+# editing the baseline.
+no-regression: verify
+	@expected=$$(cat baseline.txt 2>/dev/null || echo 0); \
+	pass=0; nogolden=0; \
+	for d in $(DEMOS); do \
+	  st=$$(cat $(BUILD)/$$d.status 2>/dev/null || echo "?"); \
+	  case "$$st" in \
+	    OK)                 pass=$$((pass+1)) ;; \
+	    "PASS (no golden)") nogolden=$$((nogolden+1)) ;; \
+	  esac; \
+	done; \
+	got=$$((pass + nogolden)); \
+	if [ $$got -lt $$expected ]; then \
+	  echo ""; \
+	  echo "*** demos REGRESSION: expected at least $$expected demos passing (OK+PASS), got $$got ***"; \
+	  echo "*** edit demos/baseline.txt only when a demo legitimately becomes blocked ***"; \
+	  exit 1; \
+	else \
+	  echo ""; \
+	  echo "demos no-regression OK ($$got passing, baseline $$expected)"; \
+	fi
+
 clean:
 	rm -rf $(BUILD)
