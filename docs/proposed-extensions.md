@@ -467,6 +467,13 @@ the matching `let { ... } = ...` form (lands together).
 
 ## 11. `variants[T]()` — enumerate sum-type constructors
 
+**Status: LANDED 2026-04-27** as Full lane 1.3, the first
+post-`map_expr_kind` feature that exercises the new shared visitor
+abstraction. The lane added a fresh `ExprKind` variant
+(`EVariantsOf(TypeExpr, [String])`); the shared visitor caught it
+in one match site instead of degrading the ten walkers — exactly
+the property `map_expr_kind` was introduced to ensure.
+
 ```kai
 type Rank = Two | Three | ... | Ace
 
@@ -483,8 +490,55 @@ mechanical.
 Restricted to nullary constructors on purpose: once any variant
 takes arguments, "list all inhabitants" is ill-defined.
 
-**Cost**: low. A prelude entry, resolved at monomorphisation.
-**Depends on**: stage-2 monomorphisation pass.
+### Implementation summary
+
+- Parser (`parse_ident_primary`): special-cases `variants[T]()` via
+  a 5-token lookahead — when the source ident is exactly
+  `variants` and the next token is `[`, the parser routes through
+  `parse_variants_of`. Any other `variants[expr]` parse falls
+  through to the existing `EIndex` postfix path. Not a reserved
+  keyword.
+- AST: `EVariantsOf(TypeExpr, [String])`. The TypeExpr is whatever
+  `parse_type` accepts; the second field is the typer-resolved
+  variant names. Parser emits `[]` for the names list; the typer
+  fills it.
+- Resolver / typer (`synth_variants_of`): resolves the TypeExpr to
+  Ty, demands `TyCon`, and walks the env via
+  `check_variants_nullary`. The walker partitions entries
+  returning the target tycon into nullary (the OK list) vs
+  payload-bearing (the error list); a fresh sum
+  `VariantsCheck = VCOk | VCNotSum | VCHasPayload` carries the
+  three outcomes back. Errors emit `diag_error` + `diag_note` +
+  `diag_help`. Result type: `TyListT(TyCon(name, []))`.
+- Codegen C (`emit_variants_of_list`): kai_cons spine of
+  `kai_variant(0, "Name", 0, NULL)` calls.
+- Codegen LLVM (`llvm_emit_variants_of`): mirrors the C shape
+  using `llvm_emit_variant_ctor` + `kaix_cons` + `kaix_nil`.
+- Order: declaration order. `env.entries` is most-recent-first
+  (`ty_env_add` prepends), so walking head-to-tail and prepending
+  to the accumulator double-inverts back to declaration order.
+  Documented inline; the original `variants_of_type_loop` does a
+  redundant `list_reverse` that was never noticed because its
+  caller (exhaustiveness) is order-insensitive.
+
+### Fixtures
+
+- `examples/sugars/variants_basic.kai` — Suit nullary, golden
+  `H D C S done`, dual-backend via `test-llvm-coverage`.
+- `examples/sugars/variants_payload.kai` — `Mixed = Foo | Bar(Int) | Baz | Qux(String)`,
+  rejected with names of payload-bearing variants in the diag.
+- `examples/sugars/variants_builtin.kai` — `variants[Int]()`,
+  rejected ("requires T to be a named user type").
+- `examples/sugars/variants_undeclared.kai` —
+  `variants[NoSuchType]()`, rejected ("requires T to be a
+  declared sum type").
+
+**Cost (historical)**: low. Closed in ~1 day of work after
+`map_expr_kind` landed. The visitor abstraction reduced the
+per-walker overhead to a single shared match site for the new
+node kind; the per-pass `_ -> k` debt the post-Core REOPEN
+documented does not re-appear here.
+**Depends on**: nothing further.
 
 ## 12. Sum types with constant attributes
 
