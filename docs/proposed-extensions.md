@@ -444,17 +444,26 @@ noise. Punning desugars `{ x, y }` to `{ x: x, y: y }`. Not a new
 product form; purely a parser-level rewrite. Same shape as the
 placeholder `.` lambda (`. < 5` desugars to `(x) => x < 5`).
 
-Applies symmetrically in patterns: `let { hand, deck } = pair`
-already works when field names are explicit; punning lets it be
-written `let { hand, deck } = pair` without the `: hand` / `: deck`
-suffix.
+Applies symmetrically in *match* patterns: `match p { { hand, deck } -> ... }`
+already works in the typer's `PRecord` path; punning makes the
+`{ hand: hand, deck: deck }` long form unnecessary at the match
+site. The `let { hand, deck } = pair` *binding* form does **not**
+work today — the parser rejects record patterns on the LHS of
+`let`. That gap lives in §28 (record destructuring in `let`),
+which lands together with this proposal so the construction and
+read sides stay symmetric.
+
+**Status post-2026-04-27**: promoted to *canonical answer* by the
+m8.5 tuples decision gate (§9). With tuples rejected as a second
+product form, punning + §28 destructuring are the ergonomic
+substitute the gate's REJECT clause explicitly cited.
 
 Aligns with all principles — doesn't add a construct, only shortens
-a common pattern. Independent of the tuples decision: even if
-tuples ship, records still benefit.
+a common pattern.
 
 **Cost**: trivial. A desugar at parse time.
-**Depends on**: nothing.
+**Depends on**: nothing for the literal/match side; **§28** for
+the matching `let { ... } = ...` form (lands together).
 
 ## 11. `variants[T]()` — enumerate sum-type constructors
 
@@ -1553,6 +1562,172 @@ Total ~450 lines, **2-3 days at observed velocity**.
 **Decision posture**: scheduled m12.8, after m12.7 axiom and before
 m13. Lands as its own milestone with full design doc in
 `docs/protocols.md`.
+
+## 27. Multi-arg `match` sugar — `match a, b { PatA, PatB -> ... }`
+
+```kai
+# Today (synthesises a transient tuple-shaped pattern):
+fn count_toques(guess: [Int], target: [Int]) : Int = match (guess, target) {
+  ([], _)                  -> 0
+  (_, [])                  -> 0
+  ([g, ...gs], [t, ...ts]) -> {
+    let here = if g == t { 1 } else { 0 }
+    here + count_toques(gs, ts)
+  }
+}
+
+# Proposed (no synthetic tuple, no nested match):
+fn count_toques(guess: [Int], target: [Int]) : Int = match guess, target {
+  [], _                    -> 0
+  _, []                    -> 0
+  [g, ...gs], [t, ...ts]   -> {
+    let here = if g == t { 1 } else { 0 }
+    here + count_toques(gs, ts)
+  }
+}
+```
+
+A **scheduled mini-lane** that surfaced from the m8.5 stress test
+(see §9 *Decision — REJECTED*). Four `demos/*` files (`forth`,
+`toquefama`, `9d9l/huffman`, `9d9l/toquefama`) use the
+`match (a, b) { (PatA, PatB) -> ... }` shape today, where the
+`(a, b)` is *transient*: it never escapes the match arm and no
+signature returns it. With tuples rejected as a type, a parser
+sugar that scrutinises N expressions and matches N patterns per arm
+gives every demo a clean form without introducing tuples-as-a-type
+through the back door.
+
+### Semantics
+
+The desugaring is mechanical: `match e1, ..., eN { p1, ..., pN -> body | ... }`
+lowers to a nested `match e1 { p1 -> match e2 { p2 -> ... pN -> body } | ... }`
+form. Wildcards in any column behave the same; guards on an arm
+attach to the innermost branch. The compiler emits the same
+exhaustiveness check it already runs on multi-arity sum types.
+
+The N is constrained at parse time (probably ≤ 4 to keep the
+diagnostics readable; revisit if a use case wants 5+). N must equal
+across every arm; mismatched arities are a parse-time error.
+
+### What it buys
+
+- **No transient tuple type** to support a transient pattern shape.
+  The four affected demos drop their synthesised `(a, b)` and read
+  their two scrutinees positionally.
+- **Same surface area as the existing `match`** for diagnostics
+  and codegen. The desugaring runs in the parser; downstream passes
+  see only nested matches.
+- **Consistent with `if a, b, c` — wait, no**: kaikai does not have
+  multi-arg `if`. This sugar is `match`-only, deliberately. `if`
+  remains single-condition.
+
+### What it costs
+
+- **Parser bookkeeping**: a comma-separated scrutinee list before
+  `{`, plus a comma-separated pattern list per arm. Ambiguity vs
+  function-call args is local to the parser's match-head state.
+- **Diagnostics**: a per-column "missing pattern" message is
+  doable but more work than today's single-scrutinee form. A v1
+  can defer column-aware diagnostics to a follow-up.
+
+### Constraints
+
+1. **Same N across all arms.** Mixed-arity arms are rejected at
+   parse time.
+2. **No defaults / "rest" columns.** A wildcard `_` covers any
+   single column; there is no syntax for "any number of remaining
+   columns".
+3. **Sugar only.** No new ExprKind, no new type, no Pattern node.
+   Desugars to nested matches in the parser.
+
+### Decision posture
+
+**Scheduled** as a m7d/m7e-class mini-lane (~1 day, parser only).
+Lands when the protocol-call rewrite has stabilised so the new
+parser path is not in conflict with another lane in flight. The
+four demos that depend on it (`forth`, `toquefama`,
+`9d9l/huffman`, `9d9l/toquefama`) flip from FAIL to OK in the
+same commit.
+
+**Cost**: low. Parser sugar with no type-system impact.
+**Depends on**: nothing structural; can land any time after the
+protocols hardening (m12.8.y) settles.
+
+## 28. Record destructuring in `let` — `let { fst, snd } = expr`
+
+```kai
+# Today:
+let p = transfer(alice, bob, 30.00<USD>)
+let from = p.fst
+let to   = p.snd
+
+# Proposed (with record punning §10 + destructuring):
+let { fst, snd } = transfer(alice, bob, 30.00<USD>)
+# or, with renaming when the record's field names are inconvenient:
+let { fst: from, snd: to } = transfer(alice, bob, 30.00<USD>)
+```
+
+The third stress-test follow-up from §9. Record patterns already
+work in `match` arms (`PRecord([PField])`); this proposal extends
+the same pattern shape to the LHS of `let`. Combined with record
+punning §10 the result is the ergonomic substitute for tuple
+destructuring `let (a, b) = ...` that the gate's REJECT closed.
+
+### Semantics
+
+`let { f1, f2: y, f3 } = e` desugars to `let __tmp = e; let f1 = __tmp.f1; let y = __tmp.f2; let f3 = __tmp.f3`.
+Field punning (a bare `f1` instead of `f1: x`) reuses the field
+name as the local binding, exactly like in record literals (§10).
+
+The pattern shape is the same `PRecord` the typer already validates
+in `match`. The implementation reuses the existing
+`pat_bindings` / typer codepaths; the only new surface is the
+parser path that recognises `let { ... } =`.
+
+### What it buys
+
+- **One line instead of three** for the
+  return-multiple-related-values pattern. With `Pair[a, b]`
+  shipped, every multi-return call site can read both halves
+  on the binding line.
+- **Consistent with existing record pattern matching**. Users
+  who learned `match { f1, f2 } -> ...` get the `let` form for
+  free.
+- **Symmetric with literal punning** (§10): write
+  `Pair { fst, snd }` to construct, read it back with
+  `let { fst, snd } = ...`.
+
+### What it costs
+
+- **Parser**: extend `parse_let` to accept a record pattern on
+  the LHS in addition to a plain identifier, an `_`, or the
+  existing list-spread shape. Local cost.
+- **Typer / resolver**: nothing new — the pattern types already
+  exist for `match` and the binders flow into the same scope
+  table.
+
+### Constraints
+
+- **Exhaustive only.** `let` does not branch, so the pattern
+  must match the value's record shape exactly. A field omitted
+  from the pattern is a parse error (no implicit "drop"); use
+  `_` to bind-and-discard if needed.
+- **No nested wildcards.** A `let` with a non-trivial nested
+  destructure should be a `match` instead. The form is
+  deliberately limited to "spread a record's fields onto the
+  binding line".
+
+### Decision posture
+
+**Scheduled** alongside record punning (§10). Both depend on
+each other to fully retire the "tuple-destructuring ergonomics"
+case the m8.5 gate examined: punning makes the construction side
+terse, destructuring makes the read side terse. Land them in
+the same lane.
+
+**Cost**: low. Parser change + reuse the existing record pattern
+machinery.
+**Depends on**: §10 (record punning) — lands together.
 
 ## Deliberately not on this list
 
