@@ -973,8 +973,13 @@ What is **not** in Core but is part of Full:
   `import ?name`, method refs as values.
 - Refinement types and Eiffel-style contracts (m12.6).
 - `axiom` declarations (m12.7).
-- String interpolation auto-Show via `#{x}` (currently requires
-  explicit `#{show(x)}`).
+
+(String interpolation auto-Show via `#{x}` was originally listed
+here. It actually shipped earlier as m12.8.x phase 2 / Bug 4 fix
+(`4b137d4`): `desugar_interp_decls` lifts every `#{e}` body into
+`__proto_show(e)` ahead of inference, so the post-inference rewrite
+routes each call to the user's `impl Show`. Fixture
+`examples/protocols/m12_8_y_interp_show.kai`. No further work.)
 
 **Full language** — Core + the items above. Does not include
 post-MVP bets (LSP server, package manager, WASM target, full
