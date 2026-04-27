@@ -738,14 +738,28 @@ informal "MVP" labels used in earlier planning snapshots.
   (`m5x-1-flip`); current Perceus pass is functionally correct under
   loose runtime, optimisation only.
 - Units of measure (m12.5).
-- Single-dispatch protocols + 5 stdlib protocols + `#derive` for
-  records and sum types (m12.8 + m12.8.x).
-- Compiler cleanup passes (m12.8-cleanup round 1 + round 2): convert
-  hand-written `dump_*` / `eq_*` / `hash_*` in `stage2/compiler.kai`
-  to `impl ... for X` via `#derive`. Validates protocols on
-  real-world code (the compiler itself).
-- m12 self-host checkpoint: byte-identical fixed-point on the
-  cleaned-up compiler.
+- Single-dispatch protocols + 5 stdlib protocols + `#derive(Show, Eq,
+  Hash)` for records and sum types (m12.8 + m12.8.x), plus
+  `#derive(Ord)` (m12.8.z).
+- Protocol feature validation: a fixture that exercises Show / Eq /
+  Hash / Ord derives on records and sum types whose shapes mirror
+  the compiler's internal data structures
+  (`examples/protocols/m12_8_compiler_shapes.kai`). This is the
+  honest substitute for the original "compiler cleanup" plan in
+  `687f1f3`, which presupposed hand-written structural Show / Eq /
+  Hash functions in `stage2/compiler.kai` that an audit
+  (`docs/lane-experience-m12.8-cleanup.md`) showed do not exist —
+  the compiler's `dump_*` family is depth-indented AST printers,
+  not structural Show; its `*_eq` helpers are intentionally partial
+  (e.g. `row_label_eq` ignores args by design); `hash_*` does not
+  appear at all. A second structural blocker is that the selfhost
+  pipeline cannot import `stdlib/protocols.kai` without rebaselining
+  the byte-identical fixed-point, so `#derive(Show)` inside
+  `compiler.kai` itself would fail with `unknown protocol Show`.
+  Validation moved out to the dedicated fixture instead, and to the
+  in-flight external demos (`/tmp/kaikai-portfolio-demo`).
+- m12 self-host checkpoint: byte-identical fixed-point of
+  `kaic2 stage2/compiler.kai`.
 - Both backends (`--emit=c`, `--emit=llvm`) at parity for every
   shipped feature.
 
@@ -753,21 +767,31 @@ State as of 2026-04-26: m12.8 protocols + #derive(records) landed
 (`1cf1183`); m12.8-cleanup round 1 in flight; m12.8.x and round 2
 queued; m12 checkpoint pending.
 
-**Update 2026-04-27 — m12.8.x and m12.8.z landed; Core checkpoint
-still pending m12.8-cleanup.** m12.8.x merged (Phase 1+2+3+4:
-sum-type derives; Bugs 1-5 + Gap 1; Bug 6 effects-prelude gap with
-the main-row exception preserved per pinned decision; followup
-`49b4bd7` after the merge restored that exception). m12.8.z merged
-(`#derive(Ord)` for records and sum types; followup `f8a2881`
-aligned the lane with Phase 4's row enforcement). Bug 8 (`unitless`
-leak, `f0acda2`) and the multi-prelude support (`6be885f`) shipped
-on the same wave. Selfhost C + LLVM fixed-point both green;
-`test-llvm-coverage` 60 pass / 0 DIFF / 14 skip on the post-merge
-HEAD. **Still pending for Core close**: m12.8-cleanup round 1
-(`dump_*` → `#derive(Show)` / `impl Show for X` in
-`stage2/compiler.kai`), round 2 (`eq_*` / `hash_*` likewise,
-leveraging the new sum-type derives), and the formal m12 self-host
-checkpoint **on the cleaned-up compiler**.
+**Update 2026-04-27 — Core CLOSED.** Every Core item above is in
+place. m12.8.x merged (Phase 1+2+3+4: sum-type derives; Bugs 1-5 +
+Gap 1; Bug 6 effects-prelude gap with the main-row exception
+preserved per pinned decision; followup `49b4bd7` after the merge
+restored that exception). m12.8.z merged (`#derive(Ord)` for records
+and sum types; followup `f8a2881` aligned the lane with Phase 4's
+row enforcement). Bug 8 (`unitless` leak, `f0acda2`) and the
+multi-prelude support (`6be885f`) shipped on the same wave. The
+protocol-validation fixture
+`examples/protocols/m12_8_compiler_shapes.kai` exercises Show / Eq /
+Hash / Ord derives on records and sum types whose shapes mirror
+`compiler.kai`'s `Pos` / `Span` / `TokKind` / `Token` carriers; it
+passes both backends. Selfhost C + LLVM fixed-point both green;
+`test-llvm-coverage` 60 pass / 0 DIFF / 14 skip; the m12 self-host
+checkpoint is implicit in those gates.
+
+The original "compiler cleanup" plan in `687f1f3` is retired. The
+audit in `docs/lane-experience-m12.8-cleanup.md` showed the
+estimated dividend (150 LOC of hand-written `dump_*` / `eq_*` /
+`hash_*` to convert) was speculative — the compiler does not contain
+structural Show / Eq / Hash to convert. A second structural blocker
+showed up later: the selfhost pipeline does not load
+`stdlib/protocols.kai`, so `#derive(Show)` inside `compiler.kai`
+fails with `unknown protocol Show`. The validation that the cleanup
+was meant to provide moves to the new fixture above.
 
 What is **not** in Core but is part of Full:
 
