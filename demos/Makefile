@@ -11,15 +11,25 @@
 # Uses kaic2 directly (stage 2: full effects, m7a/m7b, --path, --prelude).
 # bin/kai wraps kaic1 (stage 1, no effects-in-types) and is unsuitable here.
 
-KAIC2   := ../stage2/kaic2
-PRELUDE := ../stdlib/core.kai
-STDLIB  := ../stdlib
-RT_INC  := -I ../stage0
-CC      := cc
-CFLAGS  := -std=c99 -O2 -Wno-unused-function -Wno-unused-variable
+KAIC2     := ../stage2/kaic2
+# Match `bin/kai`'s effect-aware surface (atomic Stdout / Stderr /
+# Stdin + `Console` / `Io` aliases land via stdlib/effects.kai).
+# Note: stdlib/protocols.kai is intentionally NOT loaded here. The
+# m12.8 protocol-op resolver currently shadows local parameters
+# whose name matches a registered op (e.g. `cmp` in
+# `list_sort_by(cmp)` collides with `Ord.cmp`); demos that need
+# protocols (blackjack with `#derive(Show, Eq)`) document the gap
+# rather than work around it. Adding protocols here flips poker /
+# quicksort etc. to runtime panic via `__protocol_dispatch_Ord_cmp`.
+PRELUDES  := --prelude ../stdlib/core.kai \
+             --prelude ../stdlib/effects.kai
+STDLIB    := ../stdlib
+RT_INC    := -I ../stage0
+CC        := cc
+CFLAGS    := -std=c99 -O2 -Wno-unused-function -Wno-unused-variable
 
-BUILD   := build
-DEMOS   := $(patsubst %/,%,$(dir $(wildcard */main.kai)))
+BUILD     := build
+DEMOS     := $(patsubst %/,%,$(dir $(wildcard */main.kai)))
 
 .PHONY: all verify list clean $(DEMOS)
 
@@ -33,7 +43,7 @@ verify:
 	@mkdir -p $(BUILD)
 	@for d in $(DEMOS); do \
 	  rm -f $(BUILD)/$$d.status $(BUILD)/$$d.err $(BUILD)/$$d.out $(BUILD)/$$d.c $(BUILD)/$$d-bin; \
-	  if ! $(KAIC2) --prelude $(PRELUDE) --path $(STDLIB) $$d/main.kai > $(BUILD)/$$d.c 2> $(BUILD)/$$d.err; then \
+	  if ! $(KAIC2) $(PRELUDES) --path $(STDLIB) $$d/main.kai > $(BUILD)/$$d.c 2> $(BUILD)/$$d.err; then \
 	    err=$$(head -1 $(BUILD)/$$d.err 2>/dev/null | sed 's/^[[:space:]]*//'); \
 	    [ -z "$$err" ] && err="kaikai compile error"; \
 	    echo "FAIL kaikai: $$err" > $(BUILD)/$$d.status; \

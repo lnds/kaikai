@@ -34,3 +34,29 @@ files at this level have all been either migrated into per-demo
 subdirectories or deleted (when their syntax / concepts had no
 recovery path in the redesigned language). The full migration log is in
 [STATUS.md](STATUS.md); the originals are preserved in git history.
+
+## `use Effect` convention
+
+Core demos do **not** open the namespace of built-in IO effects. The
+sugar prelude already exposes `print` / `eprint` / `read_line` /
+`read_file` / `write_file` as bare names that auto-inject the
+matching atomic effect (`Stdout` / `Stderr` / `Stdin` / `File`) into
+the caller's row. Forcing every `hello world` through `use Console`
+adds a Tier-2-advanced concept to the floor without buying anything.
+
+What helpers must declare:
+
+```kai
+fn greet(name: String) : Unit / Stdout = print("hola, #{name}")
+```
+
+The row obligation stays — `Stdout` is visible in the signature, so
+Tier 1 #1 (effects-in-types) is honored. `main` is the pinned
+exception (its row is inferred from the body, defaults handlers
+auto-installed by the runtime).
+
+`use Effect` is reserved for **m7e** — opening the namespace of a
+**user-declared** effect so `Stack.push(x)` becomes `push(x)` after
+`use Stack`. That feature lives in Full, not Core. Until it lands,
+custom effects are called with their explicit `Eff.op(...)` form
+(see `stack/main.kai`).
