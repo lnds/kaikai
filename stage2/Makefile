@@ -170,12 +170,58 @@ test-llvm: $(TARGET) build
 	    || { echo "llvm DIFF $$name"; diff build/$$name-llvm.out build/$$name-c.out | head; exit 1; }; \
 	done
 
-# Backend-parity coverage harness (mirrored from main bd0c5b0). For
-# every fixture under examples/{sugars,units,minimal,llvm}/ the
-# binary is built through both the C and LLVM backends, run, and
-# stdouts diffed. Any divergence between backends fails the build.
-# Negatives (.err.expected) and fixtures the bare compiler rejects
-# without --prelude are skipped, not failed.
+# End-to-end: emitted C from kaic2 matches stage 1's stdout byte for byte.
+test-run: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/$$name.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name; \
+	  ./build/$$name > build/$$name.out; \
+	  ../stage1/kaic1 $$f > build/$$name-s1.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-s1.c -o build/$$name-s1; \
+	  ./build/$$name-s1 > build/$$name-s1.out; \
+	  diff -q build/$$name.out build/$$name-s1.out > /dev/null \
+	    && echo "run OK $$name" \
+	    || { echo "run DIFF $$name"; exit 1; }; \
+	done
+
+# --test binaries produce the same stderr as stage 1's.
+test-blocks: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --test $$f > build/$$name-t.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t.c -o build/$$name-t; \
+	  ./build/$$name-t 2> build/$$name-t.err || true; \
+	  ../stage1/kaic1 --test $$f > build/$$name-t-s1.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t-s1.c -o build/$$name-t-s1; \
+	  ./build/$$name-t-s1 2> build/$$name-t-s1.err || true; \
+	  diff -q build/$$name-t.err build/$$name-t-s1.err > /dev/null \
+	    && echo "tests OK $$name" \
+	    || { echo "tests DIFF $$name"; exit 1; }; \
+	done
+
+# Backend-parity coverage harness: for every fixture in
+# {sugars, units, minimal, llvm} that has a `.out.expected` golden,
+# compile through BOTH the C backend and the LLVM backend, run each
+# binary, and diff the outputs. A divergence (e.g. `Real<unit>`
+# printing 0 in LLVM but the actual value in C) fails the build.
+#
+# This rule is the systemic answer to the m7e13 / m12.5 / m12.8 lanes
+# each validating LLVM manually with a one-shot bash loop. It is
+# deliberately separate from `test-llvm` (which uses a hardcoded
+# fixture list and pre-dates the coverage push) and from
+# `test-protocols` / `test-modules` (which already do dual-backend
+# inside their own rules).
+#
+# Fixtures with `.err.expected` (negative) are skipped — backend
+# divergence is irrelevant when the typer rejects the program.
+# Fixtures without any expected file get a "no golden" pass when both
+# backends compile + run cleanly.
+#
+# To add a directory: extend the `for d in ...` loop. Each subdir
+# must contain `.kai` files at the top level.
 test-llvm-coverage: $(TARGET) build
 	@$(STACK) set -e; \
 	pass=0; fail=0; skip=0; \
@@ -217,38 +263,6 @@ test-llvm-coverage: $(TARGET) build
 	echo ""; \
 	echo "coverage summary: $$pass pass, $$fail DIFF, $$skip skip"; \
 	[ $$fail -eq 0 ] || exit 1
-
-# End-to-end: emitted C from kaic2 matches stage 1's stdout byte for byte.
-test-run: $(TARGET) build
-	@set -e; \
-	for f in ../examples/minimal/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f > build/$$name.c; \
-	  $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name; \
-	  ./build/$$name > build/$$name.out; \
-	  ../stage1/kaic1 $$f > build/$$name-s1.c; \
-	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-s1.c -o build/$$name-s1; \
-	  ./build/$$name-s1 > build/$$name-s1.out; \
-	  diff -q build/$$name.out build/$$name-s1.out > /dev/null \
-	    && echo "run OK $$name" \
-	    || { echo "run DIFF $$name"; exit 1; }; \
-	done
-
-# --test binaries produce the same stderr as stage 1's.
-test-blocks: $(TARGET) build
-	@set -e; \
-	for f in ../examples/minimal/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) --test $$f > build/$$name-t.c; \
-	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t.c -o build/$$name-t; \
-	  ./build/$$name-t 2> build/$$name-t.err || true; \
-	  ../stage1/kaic1 --test $$f > build/$$name-t-s1.c; \
-	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t-s1.c -o build/$$name-t-s1; \
-	  ./build/$$name-t-s1 2> build/$$name-t-s1.err || true; \
-	  diff -q build/$$name-t.err build/$$name-t-s1.err > /dev/null \
-	    && echo "tests OK $$name" \
-	    || { echo "tests DIFF $$name"; exit 1; }; \
-	done
 
 # M6.1 modules smoke test: the `examples/modules/` tree has a
 # diamond `main → {arith, shapes}` where `shapes` also imports
