@@ -66,6 +66,7 @@ the compiler is.
 | `9d9l/huffman` | sum types + assoc list (Map deferred) + priority queue + recursive encode/decode + **bit ops** (m13 §16: `bit.shl`/`bit.shr`/`bit.and`/`bit.or` as intrinsics) + bit-pack/unpack |
 | `toquefama` | `Stdin` + `Console`, recursion, multi-arg match on `(guess, target)`, `todo!` (m7d §1) |
 | `blackjack` | sum types, records, hypothetical `Random` effect, `todo!` (m7d §1), `++` (m7d §23) |
+| `poker` | sum types with positional payloads, records, list pattern matching (`[g1, g2, ...]`), `list_sort_by` + custom comparators, recursive RLE on a sorted list — Core baseline, no protocols / `use Effect` |
 | `mini_ledger` | UoM (m12.5) + refinements + contracts (m12.6) + record update (`with`) + protocols (m12.8 — `Show` + `#derive`) |
 
 When a feature lands, demos that depended on it should flip from `FAIL` to
