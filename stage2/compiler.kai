@@ -6902,14 +6902,14 @@ fn build_globals(fns: [EFn], variants: [EVar], eff_names: [String], op_quals: [S
   let f = map(fns, efn_name)
   let v = map(variants, evar_name)
   # Effect names (e.g. `Console`) and qualified op references
-  # (`Console.print`) are not runtime values; they are
+  # (`Stdout.print`) are not runtime values; they are
   # name-resolved at op-call sites via the evidence stack.
   # `desugar_op_calls_callee` rewrites `EField(EVar(Eff), op)` into
   # `EVar("Eff.op")` (a single qualified ident), so without
   # including the qualified form in globals, `fv_expr` would treat
-  # `Console.print` as a free variable inside a lambda body and the
+  # `Stdout.print` as a free variable inside a lambda body and the
   # lambda lifter would capture it, emitting invalid C
-  # (`kai_Console.print` is not a valid C identifier).
+  # (`kai_Stdout.print` is not a valid C identifier).
   list_append(p,
     list_append(f,
       list_append(v,
@@ -7915,18 +7915,27 @@ fn main_row_labels(decls: [Decl]) : [String] {
   }
 }
 
-# m7a #7: emit the static EvConsole + KaiEvidence node and the
-# in-main initialisation that wires the default fn ptrs and pushes
-# the node onto the fiber's evidence stack. Kept as a string-only
-# helper so emit_main_wrapper stays a flat concat.
-fn default_console_setup() : String =
+# m12.8 Phase 4b: atomic Stdout / Stderr default setups. The
+# combined `Console` is an alias `type Console = Stdout + Stderr`,
+# so a `main` declaring `/ Console` installs BOTH the Stdout and
+# Stderr default handlers via the alias-expansion path in
+# `default_setups_for`.
+fn default_stdout_setup() : String =
   concat_all([
-    "    static EvConsole _kai_default_ev_console;\n",
-    "    static KaiEvidence _kai_default_node_console;\n",
-    "    _kai_default_ev_console.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_console.print  = (KaiValue *(*)(EvConsole *, KaiValue *, KaiCont *)) &kai_default_console_print;\n",
-    "    _kai_default_ev_console.eprint = (KaiValue *(*)(EvConsole *, KaiValue *, KaiCont *)) &kai_default_console_eprint;\n",
-    "    kai_evidence_push(&_kai_default_node_console, \"Console\", &_kai_default_ev_console);\n"
+    "    static EvStdout _kai_default_ev_stdout;\n",
+    "    static KaiEvidence _kai_default_node_stdout;\n",
+    "    _kai_default_ev_stdout.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_stdout.print = (KaiValue *(*)(EvStdout *, KaiValue *, KaiCont *)) &kai_default_stdout_print;\n",
+    "    kai_evidence_push(&_kai_default_node_stdout, \"Stdout\", &_kai_default_ev_stdout);\n"
+  ])
+
+fn default_stderr_setup() : String =
+  concat_all([
+    "    static EvStderr _kai_default_ev_stderr;\n",
+    "    static KaiEvidence _kai_default_node_stderr;\n",
+    "    _kai_default_ev_stderr.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_stderr.eprint = (KaiValue *(*)(EvStderr *, KaiValue *, KaiCont *)) &kai_default_stderr_eprint;\n",
+    "    kai_evidence_push(&_kai_default_node_stderr, \"Stderr\", &_kai_default_ev_stderr);\n"
   ])
 
 fn default_fail_setup() : String =
@@ -8016,15 +8025,20 @@ fn default_spawn_setup() : String =
     "    kai_evidence_push(&_kai_default_node_spawn, \"Spawn\", &_kai_default_ev_spawn);\n"
   ])
 
-# m7a #7 + m7b #2b + m8 #2/#4: assemble the full setup block for the
-# builtins listed in `main`'s row. Push order Console → Fail → Stdin →
-# Env → File → Mutable → Cancel → Spawn matches Doc B §*Installation
-# order*: Spawn innermost (last pushed, first looked up); Cancel the
-# layer below it (root nursery flags fibers, Cancel handler unwinds);
-# Mutable below Cancel (I/O cluster).
-fn default_setups_for(main_row: [String]) : String =
+# m7a #7 + m7b #2b + m8 #2/#4 + m12.8 Phase 4b: assemble the full
+# setup block for the builtins listed in `main`'s row. Push order
+# Stdout → Stderr → Fail → Stdin → Env → File → Mutable → Cancel →
+# Spawn matches Doc B §*Installation order*: Spawn innermost (last
+# pushed, first looked up); Cancel the layer below it (root nursery
+# flags fibers, Cancel handler unwinds); Mutable below Cancel (I/O
+# cluster). Phase 4b: `Console` acts as the alias `Stdout + Stderr`,
+# so a row containing it triggers both setups.
+fn default_setups_for(main_row: [String]) : String = {
+  let want_stdout = list_has(main_row, "Stdout") or list_has(main_row, "Console")
+  let want_stderr = list_has(main_row, "Stderr") or list_has(main_row, "Console")
   concat_all([
-    if list_has(main_row, "Console") { default_console_setup() } else { "" },
+    if want_stdout                   { default_stdout_setup() } else { "" },
+    if want_stderr                   { default_stderr_setup() } else { "" },
     if list_has(main_row, "Fail")    { default_fail_setup() }    else { "" },
     if list_has(main_row, "Stdin")   { default_stdin_setup() }   else { "" },
     if list_has(main_row, "Env")     { default_env_setup() }     else { "" },
@@ -8033,9 +8047,12 @@ fn default_setups_for(main_row: [String]) : String =
     if list_has(main_row, "Cancel")  { default_cancel_setup() }  else { "" },
     if list_has(main_row, "Spawn")   { default_spawn_setup() }   else { "" }
   ])
+}
 
 # Pops in reverse-push order so the evidence stack drains LIFO.
-fn default_pops_for(main_row: [String]) : String =
+fn default_pops_for(main_row: [String]) : String = {
+  let want_stdout = list_has(main_row, "Stdout") or list_has(main_row, "Console")
+  let want_stderr = list_has(main_row, "Stderr") or list_has(main_row, "Console")
   concat_all([
     if list_has(main_row, "Spawn")   { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Cancel")  { "    kai_evidence_pop();\n" } else { "" },
@@ -8044,8 +8061,10 @@ fn default_pops_for(main_row: [String]) : String =
     if list_has(main_row, "Env")     { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Stdin")   { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Fail")    { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Console") { "    kai_evidence_pop();\n" } else { "" }
+    if want_stderr                   { "    kai_evidence_pop();\n" } else { "" },
+    if want_stdout                   { "    kai_evidence_pop();\n" } else { "" }
   ])
+}
 
 # m7b #5b/handle-as: rewrite alias-based callees `EField(EVar(alias),
 # op)` to `EField(EVar(eff_name), op)` so the subsequent
@@ -14186,7 +14205,8 @@ fn add_prelude_effect_label(st: InferState, callee: Expr,
 }
 
 fn prelude_effect_for(name: String) : Option[String] {
-  if name == "print" or name == "eprint" { Some("Console") }
+  if name == "print" { Some("Stdout") }
+  else if name == "eprint" { Some("Stderr") }
   else if name == "read_line" { Some("Stdin") }
   else if name == "read_file" or name == "write_file" { Some("File") }
   else { None }
@@ -15155,10 +15175,32 @@ fn check_body_row(st: InferState, fname: String, declared: RowExpr,
       # builtin effect the body performs. Helpers must still declare
       # their row — Bug 6 enforcement still bites where it matters.
       if fname == "main" { st }
-      else { check_body_row_label_loop(st, fname, st.row, [], line, col) }
-    RClosed(lbs) -> check_body_row_label_loop(st, fname, st.row,
-                                                row_labels_of_rls(lbs), line, col)
+      else { check_body_row_label_loop(st, fname, expand_console_alias(st.row), [], line, col) }
+    RClosed(lbs) -> check_body_row_label_loop(st, fname, expand_console_alias(st.row),
+                                                expand_console_alias(row_labels_of_rls(lbs)),
+                                                line, col)
     ROpen(_, _)  -> st
+  }
+}
+
+# m12.8 Phase 4b: `Console` declared in a row stands for the alias
+# `Stdout + Stderr`. The sugar prelude routes `print` to `Stdout`
+# and `eprint` to `Stderr`, so any declared `Console` must satisfy
+# bodies that perform Stdout, Stderr, or both. This walker rewrites
+# the declared label list before the subset check sees it; the
+# label's ty_args are empty for these atomic effects, so we only
+# need to substitute the eff name.
+fn expand_console_alias(labs: [Label]) : [Label] {
+  match labs {
+    [] -> []
+    [lab, ...rest] ->
+      if lab.eff == "Console" {
+        [Label { eff: "Stdout", ty_args: [] },
+         Label { eff: "Stderr", ty_args: [] },
+         ...expand_console_alias(rest)]
+      } else {
+        [lab, ...expand_console_alias(rest)]
+      }
   }
 }
 
@@ -17127,8 +17169,8 @@ fn llvm_header() : String =
     "declare void @kaix_clause_state_set(i8*, %KaiValue*)\n",
     # m7c-d — default-handler wrappers for builtins in main's row.
     # Defined non-static in runtime_llvm.c so the IR can link.
-    "declare %KaiValue* @kaix_default_console_print(i8*, %KaiValue*, i8*)\n",
-    "declare %KaiValue* @kaix_default_console_eprint(i8*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_stdout_print(i8*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_stderr_eprint(i8*, %KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_default_fail_fail(i8*, %KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_default_mutable_array_make(i8*, %KaiValue*, %KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_default_mutable_array_length(i8*, %KaiValue*, i8*)\n",
@@ -18322,13 +18364,23 @@ type LlvmArm = { e: LlvmEmit, reg: String, from_label: String }
 fn llvm_default_builtin_decls(main_row: [String]) : String {
   # Function declarations live in `llvm_header`; here we only emit
   # the per-builtin globals (Ev struct + node buffer + name string)
-  # gated on main's row.
+  # gated on main's row. m12.8 Phase 4b: Console is an alias for
+  # Stdout + Stderr — a row containing it triggers both.
+  let want_stdout = list_has(main_row, "Stdout") or list_has(main_row, "Console")
+  let want_stderr = list_has(main_row, "Stderr") or list_has(main_row, "Console")
   concat_all([
-    if list_has(main_row, "Console") {
+    if want_stdout {
       concat_all([
-        "@_kai_default_ev_console = internal global %EvConsole zeroinitializer\n",
-        "@_kai_default_node_console = internal global [48 x i8] zeroinitializer\n",
-        "@_kai_default_console_name = private unnamed_addr constant [8 x i8] c\"Console\\00\"\n"
+        "@_kai_default_ev_stdout = internal global %EvStdout zeroinitializer\n",
+        "@_kai_default_node_stdout = internal global [48 x i8] zeroinitializer\n",
+        "@_kai_default_stdout_name = private unnamed_addr constant [7 x i8] c\"Stdout\\00\"\n"
+      ])
+    } else { "" },
+    if want_stderr {
+      concat_all([
+        "@_kai_default_ev_stderr = internal global %EvStderr zeroinitializer\n",
+        "@_kai_default_node_stderr = internal global [48 x i8] zeroinitializer\n",
+        "@_kai_default_stderr_name = private unnamed_addr constant [7 x i8] c\"Stderr\\00\"\n"
       ])
     } else { "" },
     if list_has(main_row, "Fail") {
@@ -18349,19 +18401,32 @@ fn llvm_default_builtin_decls(main_row: [String]) : String {
 }
 
 fn llvm_emit_main_install_defaults(main_row: [String]) : String {
-  let console = if list_has(main_row, "Console") {
+  let want_stdout = list_has(main_row, "Stdout") or list_has(main_row, "Console")
+  let want_stderr = list_has(main_row, "Stderr") or list_has(main_row, "Console")
+  let stdout_ = if want_stdout {
     concat_all([
-      "  ; install Console default handler\n",
-      "  %hid_console = call i64 @kaix_fresh_handler_id()\n",
-      "  %ev_console_hid_p = getelementptr %EvConsole, %EvConsole* @_kai_default_ev_console, i32 0, i32 0\n",
-      "  store i64 %hid_console, i64* %ev_console_hid_p\n",
-      "  %ev_console_print_p = getelementptr %EvConsole, %EvConsole* @_kai_default_ev_console, i32 0, i32 3\n",
-      "  store %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_console_print to %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)** %ev_console_print_p\n",
-      "  %ev_console_eprint_p = getelementptr %EvConsole, %EvConsole* @_kai_default_ev_console, i32 0, i32 4\n",
-      "  store %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_console_eprint to %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvConsole*, %KaiValue*, %KaiCont*)** %ev_console_eprint_p\n",
-      "  %node_console_p = getelementptr [48 x i8], [48 x i8]* @_kai_default_node_console, i32 0, i32 0\n",
-      "  %ev_console_void = bitcast %EvConsole* @_kai_default_ev_console to i8*\n",
-      "  call void @kaix_evidence_push(i8* %node_console_p, i8* getelementptr inbounds ([8 x i8], [8 x i8]* @_kai_default_console_name, i64 0, i64 0), i8* %ev_console_void)\n"
+      "  ; install Stdout default handler\n",
+      "  %hid_stdout = call i64 @kaix_fresh_handler_id()\n",
+      "  %ev_stdout_hid_p = getelementptr %EvStdout, %EvStdout* @_kai_default_ev_stdout, i32 0, i32 0\n",
+      "  store i64 %hid_stdout, i64* %ev_stdout_hid_p\n",
+      "  %ev_stdout_print_p = getelementptr %EvStdout, %EvStdout* @_kai_default_ev_stdout, i32 0, i32 3\n",
+      "  store %KaiValue* (%EvStdout*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_stdout_print to %KaiValue* (%EvStdout*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvStdout*, %KaiValue*, %KaiCont*)** %ev_stdout_print_p\n",
+      "  %node_stdout_p = getelementptr [48 x i8], [48 x i8]* @_kai_default_node_stdout, i32 0, i32 0\n",
+      "  %ev_stdout_void = bitcast %EvStdout* @_kai_default_ev_stdout to i8*\n",
+      "  call void @kaix_evidence_push(i8* %node_stdout_p, i8* getelementptr inbounds ([7 x i8], [7 x i8]* @_kai_default_stdout_name, i64 0, i64 0), i8* %ev_stdout_void)\n"
+    ])
+  } else { "" }
+  let stderr_ = if want_stderr {
+    concat_all([
+      "  ; install Stderr default handler\n",
+      "  %hid_stderr = call i64 @kaix_fresh_handler_id()\n",
+      "  %ev_stderr_hid_p = getelementptr %EvStderr, %EvStderr* @_kai_default_ev_stderr, i32 0, i32 0\n",
+      "  store i64 %hid_stderr, i64* %ev_stderr_hid_p\n",
+      "  %ev_stderr_eprint_p = getelementptr %EvStderr, %EvStderr* @_kai_default_ev_stderr, i32 0, i32 3\n",
+      "  store %KaiValue* (%EvStderr*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_stderr_eprint to %KaiValue* (%EvStderr*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvStderr*, %KaiValue*, %KaiCont*)** %ev_stderr_eprint_p\n",
+      "  %node_stderr_p = getelementptr [48 x i8], [48 x i8]* @_kai_default_node_stderr, i32 0, i32 0\n",
+      "  %ev_stderr_void = bitcast %EvStderr* @_kai_default_ev_stderr to i8*\n",
+      "  call void @kaix_evidence_push(i8* %node_stderr_p, i8* getelementptr inbounds ([7 x i8], [7 x i8]* @_kai_default_stderr_name, i64 0, i64 0), i8* %ev_stderr_void)\n"
     ])
   } else { "" }
   let fail = if list_has(main_row, "Fail") {
@@ -18401,7 +18466,8 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
   concat_all([
     llvm_default_builtin_decls(main_row),
     "\ndefine void @kai_main_install_defaults() {\n",
-    console,
+    stdout_,
+    stderr_,
     fail,
     mutable_,
     "  ret void\n",
@@ -18410,10 +18476,13 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
 }
 
 fn llvm_emit_main_teardown_defaults(main_row: [String]) : String {
+  let want_stdout = list_has(main_row, "Stdout") or list_has(main_row, "Console")
+  let want_stderr = list_has(main_row, "Stderr") or list_has(main_row, "Console")
   let pops = concat_all([
     if list_has(main_row, "Mutable") { "  call void @kaix_evidence_pop()\n" } else { "" },
-    if list_has(main_row, "Fail") { "  call void @kaix_evidence_pop()\n" } else { "" },
-    if list_has(main_row, "Console") { "  call void @kaix_evidence_pop()\n" } else { "" }
+    if list_has(main_row, "Fail")    { "  call void @kaix_evidence_pop()\n" } else { "" },
+    if want_stderr                   { "  call void @kaix_evidence_pop()\n" } else { "" },
+    if want_stdout                   { "  call void @kaix_evidence_pop()\n" } else { "" }
   ])
   concat_all([
     "define void @kai_main_teardown_defaults() {\n",
@@ -21723,7 +21792,7 @@ fn load_preludes(paths: [String], acc: [Decl]) : Option[[Decl]] = match paths {
 # m7a #7: builtin effect declarations. The runtime ships a default
 # handler for these effects (Doc B §*Catalog*); the compiler injects
 # the corresponding `effect` decls at the front of every program so
-# the typer can resolve `Console.print(...)` etc. without the user
+# the typer can resolve `Stdout.print(...)` etc. without the user
 # writing a stdlib import. Each effect is only injected if the user
 # (or an imported file) hasn't already declared it.
 fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
@@ -21733,13 +21802,22 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   # main's. Helper fns that declare `: Unit / Console` need Console
   # as a known effect even when main doesn't mention it.
   let used_row = collect_used_row_labels(decls)
-  let console_d = inject_one(used_row, existing, "Console", builtin_console_decl())
-  let stdout_d  = inject_one(used_row, existing, "Stdout",  builtin_stdout_decl())
-  let stderr_d  = inject_one(used_row, existing, "Stderr",  builtin_stderr_decl())
-  let fail_d    = inject_one(used_row, existing, "Fail",    builtin_fail_decl())
-  let stdin_d   = inject_one(used_row, existing, "Stdin",   builtin_stdin_decl())
-  let env_d     = inject_one(used_row, existing, "Env",     builtin_env_decl())
-  let file_d    = inject_one(used_row, existing, "File",    builtin_file_decl())
+  # m12.8 Phase 4b: Stdout / Stderr / Stdin are atomic DEffect
+  # builtins; Console is the alias `Stdout + Stderr + Stdin` (per
+  # stdlib/effects.kai's pinned catalog). User-declared aliases
+  # (`type Io = Console + Env + File`, `type Net = Console + Stdin`,
+  # etc.) can mention Console transitively, so the auto-inject must
+  # not gate on a literal "Console" / "Stdout" appearance — the
+  # alias resolver runs after this pass and pulls the labels in
+  # via the alias graph. Inject all four unconditionally; downstream
+  # passes see them as no-ops when nothing references them.
+  let console_d = inject_unconditional(existing, "Console", builtin_console_decl())
+  let stdout_d  = inject_unconditional(existing, "Stdout",  builtin_stdout_decl())
+  let stderr_d  = inject_unconditional(existing, "Stderr",  builtin_stderr_decl())
+  let fail_d    = inject_unconditional(existing, "Fail",    builtin_fail_decl())
+  let stdin_d   = inject_unconditional(existing, "Stdin",   builtin_stdin_decl())
+  let env_d     = inject_unconditional(existing, "Env",     builtin_env_decl())
+  let file_d    = inject_unconditional(existing, "File",    builtin_file_decl())
   # m7b #11: parametric stdlib effects (State[T], Reader[T], Writer[W])
   # have no runtime default handler — the user always writes an explicit
   # `with State[T](init)` form. Inject the declarations unconditionally
@@ -21888,15 +21966,27 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # inject_builtin_effects helpers below; alias resolution accepts
 # these as effect names whether or not the file already declared
 # them via `effect`.
+# m12.8 Phase 4b: `Console` is no longer a first-class effect — it
+# is the auto-injected alias `Stdout + Stderr + Stdin`. Listing it
+# here would let the alias resolver treat it as a leaf, short-
+# circuiting the expansion. Other aliases (`Io`, user-declared) can
+# still mention Console because the resolver routes through
+# `cand_ns` for aliases.
 fn builtin_effect_names() : [String] =
-  ["Console", "Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor"]
+  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor"]
 
+# m12.8 Phase 4b: `Console` is now an alias `type Console = Stdout +
+# Stderr + Stdin` (per stdlib/effects.kai's pinned catalog), not a
+# first-class effect. The atomic Stdout/Stderr/Stdin decls carry the
+# actual ops; declaring `/ Console` in a row is an over-declaration
+# that the alias resolver expands to the three atomic labels before
+# the body-vs-declared subset check. Direct op calls of the form
+# `Stdout.print(...)` no longer typecheck — users write
+# `Stdout.print(...)` / `Stderr.eprint(...)` / `Stdin.read_line()`
+# explicitly, or rely on the bare `print` / `eprint` / `read_line`
+# sugar prelude that routes to the right atomic effect automatically.
 fn builtin_console_decl() : Decl =
-  DEffect(false, "Console", [],
-    [
-      EOp("print",  [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0),
-      EOp("eprint", [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)
-    ], 0, 0)
+  DType(false, "Console", [], TBEffectAlias(["Stdout", "Stderr", "Stdin"]), 0, 0)
 
 # m12.8 Phase 4b (atomic split): Stdout owns just `print`. The
 # Stdout/Stderr split lets a user fn declare exactly the IO surface
@@ -22138,23 +22228,22 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
           Some(own_decls) -> {
             let expanded = expand_imports(path, search_paths, own_decls)
             let merged = list_append(prelude_decls, expanded)
-            # m7b #1b — closed effect aliases. Resolve every `type Foo
-            # = Eff1 + Eff2 + ...` (and `type Foo = Eff` single-name
-            # form) into a flat label set and rewrite every DFn's
-            # RowExpr to substitute alias names *before* builtin-
-            # effect injection. inject_builtin_effects gates on main's
-            # row labels, and expanding `Io` first means the runtime
-            # default handlers for Console/Stdin/Env/File are wired
-            # whenever any alias resolves to them. Builtin effect
-            # names participate in the alias namespace whether or not
-            # the file declared an `effect` for them. Cycles and
+            # m7b #1b + m12.8 Phase 4b — closed effect aliases. Resolve
+            # every `type Foo = Eff1 + Eff2 + ...` (and `type Foo = Eff`
+            # single-name form) into a flat label set and rewrite every
+            # DFn's RowExpr to substitute alias names. Phase 4b: builtin
+            # effect injection runs *first* so the auto-injected
+            # `type Console = Stdout + Stderr` alias participates in
+            # alias resolution alongside user-declared aliases. Builtin
+            # effect names still participate in the namespace whether or
+            # not the file declared an `effect` for them. Cycles and
             # non-effect labels in alias bodies are fatal.
-            let declared_effs = collect_effect_names(merged)
+            let injected = inject_builtin_effects(merged)
+            let declared_effs = collect_effect_names(injected)
             let eff_names_for_alias = list_append(builtin_effect_names(), declared_effs)
-            let alias_cands = collect_alias_cands(merged)
+            let alias_cands = collect_alias_cands(injected)
             let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, path)
-            let rewritten = expand_aliases_in_decls(merged, alias_res.aliases)
-            let raw_decls = inject_builtin_effects(rewritten)
+            let raw_decls = expand_aliases_in_decls(injected, alias_res.aliases)
             # m7b #6: pre-resolve desugar of `a[i]` and `a[i] := v` into
             # the underlying array_get / array_set calls. Runs before
             # name resolution so every downstream pass sees only the

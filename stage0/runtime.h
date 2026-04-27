@@ -1606,15 +1606,16 @@ static KaiValue *kai_cont_resume(KaiCont *k, KaiValue *v) {
     return k->fn(k->env, v);
 }
 
-/* m7a #7: default Console handler clauses. Both write the string
- * + a trailing '\n' and resume with `()`. *Self is opaque to the
- * runtime because `EvConsole` is a compiler-emitted type — the
- * cast happens at the assignment in the main wrapper.
+/* m12.8 Phase 4b: split Console into atomic Stdout (print) and
+ * Stderr (eprint) default handlers. Both write the string + a
+ * trailing '\n' and resume with `()`. *Self is opaque to the
+ * runtime because `EvStdout` / `EvStderr` are compiler-emitted
+ * types — the cast happens at the assignment in the main wrapper.
  *
  * EPIPE absorption (Doc B §`Console`/Default handler) is later
  * polish — for now any write fault propagates through fputs's
  * default behaviour. The minimal-but-useful path lands first. */
-static KaiValue *kai_default_console_print(void *self, KaiValue *s, KaiCont *k) {
+static KaiValue *kai_default_stdout_print(void *self, KaiValue *s, KaiCont *k) {
     (void) self;
     if (s && s->tag == KAI_STR) {
         fwrite(s->as.s.bytes, 1, s->as.s.len, stdout);
@@ -1623,7 +1624,7 @@ static KaiValue *kai_default_console_print(void *self, KaiValue *s, KaiCont *k) 
     return kai_cont_resume(k, kai_unit());
 }
 
-static KaiValue *kai_default_console_eprint(void *self, KaiValue *s, KaiCont *k) {
+static KaiValue *kai_default_stderr_eprint(void *self, KaiValue *s, KaiCont *k) {
     (void) self;
     if (s && s->tag == KAI_STR) {
         fwrite(s->as.s.bytes, 1, s->as.s.len, stderr);

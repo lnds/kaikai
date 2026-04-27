@@ -220,11 +220,11 @@ void kaix_clause_state_set(void *self, KaiValue *v) {
  * self-args mirror the IR-level signature; the underlying
  * statics use the typed Ev<Eff> *self but the layout is the
  * same KaiHandlerId-leading prefix so the cast is safe. */
-KaiValue *kaix_default_console_print(void *self, KaiValue *s, KaiCont *k) {
-    return kai_default_console_print(self, s, k);
+KaiValue *kaix_default_stdout_print(void *self, KaiValue *s, KaiCont *k) {
+    return kai_default_stdout_print(self, s, k);
 }
-KaiValue *kaix_default_console_eprint(void *self, KaiValue *s, KaiCont *k) {
-    return kai_default_console_eprint(self, s, k);
+KaiValue *kaix_default_stderr_eprint(void *self, KaiValue *s, KaiCont *k) {
+    return kai_default_stderr_eprint(self, s, k);
 }
 KaiValue *kaix_default_fail_fail(void *self, KaiValue *msg, KaiCont *k) {
     return kai_default_fail_fail(self, msg, k);

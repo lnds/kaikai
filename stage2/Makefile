@@ -662,8 +662,10 @@ test-effects: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_console_print" build/s2-$$name.c \
-	    && grep -q "kai_evidence_push(&_kai_default_node_console" build/s2-$$name.c \
+	  grep -q "kai_default_stdout_print" build/s2-$$name.c \
+	    && grep -q "kai_default_stderr_eprint" build/s2-$$name.c \
+	    && grep -q "kai_evidence_push(&_kai_default_node_stdout" build/s2-$$name.c \
+	    && grep -q "kai_evidence_push(&_kai_default_node_stderr" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-handler wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -747,7 +749,7 @@ test-effects: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_console_print" build/s2-$$name.c \
+	  grep -q "kai_default_stdout_print" build/s2-$$name.c \
 	    && grep -q "kai_default_stdin_read_line" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (alias did not expand to default handlers)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
