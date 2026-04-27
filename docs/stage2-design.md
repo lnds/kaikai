@@ -719,11 +719,10 @@ top); lane experience report in `docs/lane-experience-m12.5.md`.
 
 ### Milestone naming: Core language vs Full language
 
-After m12.8 (single-dispatch protocols) landed on 2026-04-26, the
-project adopts two named milestones to disambiguate from the informal
-"MVP" labels used in earlier planning snapshots:
+The project adopts two named milestones to disambiguate from the
+informal "MVP" labels used in earlier planning snapshots.
 
-**Core language** — the surface declared closed at m12.8:
+**Core language** — closes when ALL of the following landed:
 
 - Stages 0/1/2 self-host (m1-m6), all with selfhost-llvm fixed-point
   green.
@@ -740,20 +739,29 @@ project adopts two named milestones to disambiguate from the informal
   loose runtime, optimisation only.
 - Units of measure (m12.5).
 - Single-dispatch protocols + 5 stdlib protocols + `#derive` for
-  records (m12.8).
+  records and sum types (m12.8 + m12.8.x).
+- Compiler cleanup passes (m12.8-cleanup round 1 + round 2): convert
+  hand-written `dump_*` / `eq_*` / `hash_*` in `stage2/compiler.kai`
+  to `impl ... for X` via `#derive`. Validates protocols on
+  real-world code (the compiler itself).
+- m12 self-host checkpoint: byte-identical fixed-point on the
+  cleaned-up compiler.
 - Both backends (`--emit=c`, `--emit=llvm`) at parity for every
   shipped feature.
 
-What is **not** in core but is part of full:
+State as of 2026-04-26: m12.8 protocols + #derive(records) landed
+(`1cf1183`); m12.8-cleanup round 1 in flight; m12.8.x and round 2
+queued; m12 checkpoint pending.
+
+What is **not** in Core but is part of Full:
 
 - Remaining m7e items: `variants[T]()`, main-row inference, `use Effect`.
 - m7f LLM affordances: `kai effects --json`, `?e` effect holes,
   `import ?name`, method refs as values.
 - Refinement types and Eiffel-style contracts (m12.6).
 - `axiom` declarations (m12.7).
-- `#derive(Eq)` / `#derive(Hash)` for sum types (m12.8.x follow-up).
-- String interpolation auto-Show.
-- m12 self-host checkpoint as a formal release tag.
+- String interpolation auto-Show via `#{x}` (currently requires
+  explicit `#{show(x)}`).
 
 **Full language** — Core + the items above. Does not include
 post-MVP bets (LSP server, package manager, WASM target, full
