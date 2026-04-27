@@ -717,6 +717,54 @@ with or without unit annotations. Roughly +1100 lines added to
 landing notes in `docs/units-of-measure.md` (Status: Landed at the
 top); lane experience report in `docs/lane-experience-m12.5.md`.
 
+### Milestone naming: Core language vs Full language
+
+After m12.8 (single-dispatch protocols) landed on 2026-04-26, the
+project adopts two named milestones to disambiguate from the informal
+"MVP" labels used in earlier planning snapshots:
+
+**Core language** — the surface declared closed at m12.8:
+
+- Stages 0/1/2 self-host (m1-m6), all with selfhost-llvm fixed-point
+  green.
+- Effects + handlers + parametric effects + per-instance dispatch
+  (m7a/b/c).
+- Ergonomic sugars: trailing lambdas, `@cap`, `var`, `a[i]`, aliases,
+  `todo!`, record punning, `@` as-patterns, pipeline `_`, `++`, `!`
+  postfix on `Option`/`Result` (m7b/d/e§13).
+- Fibers, structured concurrency, actors with supervision (m8).
+- Typed holes (m10).
+- Perceus basic memory management (m5 rounds 1-3) plus capture incref
+  (m5.x #2). Linear-consumption runtime is deferred follow-up
+  (`m5x-1-flip`); current Perceus pass is functionally correct under
+  loose runtime, optimisation only.
+- Units of measure (m12.5).
+- Single-dispatch protocols + 5 stdlib protocols + `#derive` for
+  records (m12.8).
+- Both backends (`--emit=c`, `--emit=llvm`) at parity for every
+  shipped feature.
+
+What is **not** in core but is part of full:
+
+- Remaining m7e items: `variants[T]()`, main-row inference, `use Effect`.
+- m7f LLM affordances: `kai effects --json`, `?e` effect holes,
+  `import ?name`, method refs as values.
+- Refinement types and Eiffel-style contracts (m12.6).
+- `axiom` declarations (m12.7).
+- `#derive(Eq)` / `#derive(Hash)` for sum types (m12.8.x follow-up).
+- String interpolation auto-Show.
+- m12 self-host checkpoint as a formal release tag.
+
+**Full language** — Core + the items above. Does not include
+post-MVP bets (LSP server, package manager, WASM target, full
+Perceus optimisation, m11 diagnostics polish, m13 property/bench,
+m14 stdlib expansion, m15-17 tooling).
+
+The "MVP B" / "MVP D" labels in earlier snapshots map to:
+
+- "MVP B" → **Core language** (this section).
+- "MVP D" → **Full language** (Core + remaining items above).
+
 ## What stage 2 deliberately does not ship
 
 - Gradual typing, dependent types, refinement types.
