@@ -15955,6 +15955,7 @@ fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool) : Expr 
 fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
                     uses: [Use], in_lam: Bool) : ExprKind {
   match k {
+    # The actual rewrite: wrap a non-last `EVar` use in `__perceus_dup`.
     EVar(nm) -> {
       if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam) {
         ECall(
@@ -15963,38 +15964,15 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
         )
       } else { EVar(nm) }
     }
-    ECall(f, xs) -> ECall(pcs_rewrite_expr(f, scope, uses, in_lam),
-                          pcs_rewrite_exprs(xs, scope, uses, in_lam))
-    EField(x, fname) -> EField(pcs_rewrite_expr(x, scope, uses, in_lam), fname)
-    EIndex(x, i) -> EIndex(pcs_rewrite_expr(x, scope, uses, in_lam),
-                           pcs_rewrite_expr(i, scope, uses, in_lam))
-    EBinop(op, l, r) -> EBinop(op, pcs_rewrite_expr(l, scope, uses, in_lam),
-                                   pcs_rewrite_expr(r, scope, uses, in_lam))
-    EUnop(op, x) -> EUnop(op, pcs_rewrite_expr(x, scope, uses, in_lam))
-    EIf(c, t, opt_e) -> EIf(
-      pcs_rewrite_expr(c, scope, uses, in_lam),
-      pcs_rewrite_expr(t, scope, uses, in_lam),
-      match opt_e {
-        None -> None
-        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam))
-      }
-    )
-    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam),
-                              pcs_rewrite_arms(arms, scope, uses, in_lam))
+    # Scope-aware kinds: ELambda extends scope with params and flips
+    # in_lam; EBlock threads scope through SLet/SVar bindings; EMatch
+    # delegates to pcs_rewrite_arms which adds pattern bindings to the
+    # arm's scope; EHandle's HReturn binder shadows; clauses get the
+    # state/log/op-param scope.
     ELambda(ps, body) -> {
       let pn = map(ps, (p) => p.pname)
       ELambda(ps, pcs_rewrite_expr(body, list_append(scope, pn), uses, true))
     }
-    ERecordLit(name, fis) -> ERecordLit(name, pcs_rewrite_field_inits(fis, scope, uses, in_lam))
-    EList(elems) -> EList(pcs_rewrite_list_elems(elems, scope, uses, in_lam))
-    ERange(lo, hi, opt_by) -> ERange(
-      pcs_rewrite_expr(lo, scope, uses, in_lam),
-      pcs_rewrite_expr(hi, scope, uses, in_lam),
-      match opt_by {
-        None -> None
-        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam))
-      }
-    )
     EBlock(stmts, opt_tail) -> {
       let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [])
       EBlock(r.stmts, match opt_tail {
@@ -16002,8 +15980,8 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
         Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam))
       })
     }
-    EPipe(l, r) -> EPipe(pcs_rewrite_expr(l, scope, uses, in_lam),
-                          pcs_rewrite_expr(r, scope, uses, in_lam))
+    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam),
+                              pcs_rewrite_arms(arms, scope, uses, in_lam))
     EHandle(body, eff, eff_tas, init_opt, alias, clauses, ret_opt) -> {
       let body1 = pcs_rewrite_expr(body, scope, uses, in_lam)
       let init1 = match init_opt {
@@ -16022,27 +16000,11 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
       }
       EHandle(body1, eff, eff_tas, init1, alias, cls1, ret1)
     }
-    EBang(inner) -> EBang(pcs_rewrite_expr(inner, scope, uses, in_lam))
-    # m12.8.x post-Core REOPEN — Linus suspect 2: ELitUnit carries an
-    # inner expression (the literal that the dimensioned annotation
-    # decorates). Pre-fix this fell through `_ -> k`, so dups around
-    # the inner literal were skipped. Inert today (the inner is
-    # always EInt/EReal which never need dup), but the wildcard was
-    # an unjustified hole.
-    ELitUnit(inner, u) -> ELitUnit(pcs_rewrite_expr(inner, scope, uses, in_lam), u)
-    # Other variants are leaf or do not host sub-expressions
-    # reachable from this rewrite (EInt / EReal / EBool / EChar /
-    # EStr / EUnit / EVar handled above / EUnder / EPlaceholder /
-    # EHole / ETodo / EUnit / EBool literals).
-    _ -> k
-  }
-}
-
-fn pcs_rewrite_exprs(es: [Expr], scope: [String], uses: [Use], in_lam: Bool) : [Expr] {
-  match es {
-    [] -> []
-    [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, in_lam),
-                     ...pcs_rewrite_exprs(rest, scope, uses, in_lam)]
+    # All remaining kinds (ECall, EField, EIndex, EBinop, EUnop, EIf,
+    # ERecordLit, EList, ERange, EPipe, EBang, ELitUnit) recurse
+    # purely structurally with no scope changes; the leaves return
+    # unchanged. The shared visitor handles both.
+    _ -> map_expr_kind(k, (sub) => pcs_rewrite_expr(sub, scope, uses, in_lam))
   }
 }
 
@@ -16059,31 +16021,6 @@ fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool) : [
         let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam)
         [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam)]
       }
-    }
-  }
-}
-
-fn pcs_rewrite_field_inits(fis: [FieldInit], scope: [String], uses: [Use],
-                            in_lam: Bool) : [FieldInit] {
-  match fis {
-    [] -> []
-    [h, ...rest] -> match h {
-      FI(nm, e) -> [FI(nm, pcs_rewrite_expr(e, scope, uses, in_lam)),
-                    ...pcs_rewrite_field_inits(rest, scope, uses, in_lam)]
-    }
-  }
-}
-
-fn pcs_rewrite_list_elems(es: [ListElem], scope: [String], uses: [Use],
-                           in_lam: Bool) : [ListElem] {
-  match es {
-    [] -> []
-    [h, ...rest] -> {
-      let h1 = match h {
-        ElPlain(e) -> ElPlain(pcs_rewrite_expr(e, scope, uses, in_lam))
-        ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam))
-      }
-      [h1, ...pcs_rewrite_list_elems(rest, scope, uses, in_lam)]
     }
   }
 }
