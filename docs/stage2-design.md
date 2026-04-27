@@ -986,6 +986,29 @@ The "MVP B" / "MVP D" labels in earlier snapshots map to:
 - "MVP B" → **Core language** (this section).
 - "MVP D" → **Full language** (Core + remaining items above).
 
+## Full prerequisites (carried from Core post-mortem)
+
+These are not features but structural debt items that must land
+before specific Full lanes start. Identified during the
+post-Core REOPEN by `linus` and `eric` agents (independently);
+deferred from Core because they had no feature upside on the
+Core lane itself.
+
+- **`map_expr_kind` shared AST visitor refactor**. Today every
+  AST-walking pass (`rename_proto_calls`, `pcs_rewrite`,
+  `desugar_*`, `validate_resolved_protocols`,
+  `validate_typer_invariants`, etc.) hand-rolls structural
+  recursion over `ExprKind` with its own `_ -> k` catch-all. The
+  wildcard audit in `7bd5a68` is manual proof the pattern is
+  duplicated 10x. Adding a new `ExprKind` variant (m7e
+  `variants[T]()`, m8 actor primitives, m12.6 refinement carriers)
+  re-introduces the same `_ -> k` debt across all 10 sites.
+  Estimated 2-3 days, cross-cuts every pass, no feature-side
+  payoff in isolation. Eric's specific framing: "prerequisite to
+  landing actors without creating the same `_ -> k` debt a third
+  time." Pinned here so the next contributor doing actor lanes
+  knows to land it first.
+
 ## What stage 2 deliberately does not ship
 
 - Gradual typing, dependent types, refinement types.
