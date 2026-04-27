@@ -253,15 +253,36 @@ user can derive trivially:
 ```kai
 #derive(Show, Eq, Hash)
 type Account = { id: AccountId, balance: Decimal[USD], txs: Int }
+
+#derive(Show, Eq, Hash)
+type Shape = Circle(Real) | Rect(Real, Real) | Empty_
 ```
 
-The compiler generates the obvious structural impls. The annotation is
-the only meta-instruction needed for protocols (others — `#deprecated`
-etc. — live in their own whitelist per `proposed-extensions.md §27`).
+The compiler generates the obvious structural impls:
+- **Records** — field-by-field for every protocol.
+- **Sum types** — outer-match per variant for `Show` and `Eq` (the Eq
+  arm rematches the second argument with the same variant and conjoins
+  per-field `eq` calls; the wildcard returns `false`); per-variant tag
+  combined with field hashes via `acc * 31 + hash(field)` for `Hash`.
+  The chosen tag-and-fold scheme preserves the Hash↔Eq invariant: two
+  values judged equal by the derived `Eq` produce the same `Int` from
+  the derived `Hash`.
+
+The annotation is the only meta-instruction needed for protocols
+(others — `#deprecated` etc. — live in their own whitelist per
+`proposed-extensions.md §27`).
 
 `#derive` is **opt-in**: if the user does not write the annotation, no
 impl is generated. This avoids surprising user-defined `impl Show for
 Account` getting shadowed by an auto-derived one.
+
+For sum types, `#derive(Eq)` and `#derive(Hash)` reject at compile
+time when any variant carries a field whose head type lacks a
+reachable `impl P` (explicit `impl P for T`, another `#derive(P)`, or
+a builtin from stdlib). The diagnostic names the variant and the
+offending field type. Records continue to fall through to the
+dispatcher's runtime panic for missing field impls; promoting that
+to a compile-time error is left for a follow-up.
 
 ## Composition with other features
 

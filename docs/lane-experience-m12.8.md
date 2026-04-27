@@ -228,7 +228,8 @@ all OK / selfhost OK / selfhost-llvm OK / test OK / ...
   emitting per-(P, T) global vtable structs.
 - **Default impls in protocol declarations** (`show_with(x, prefix) =
   ...` inside `protocol Show { ... }`).
-- **`#derive(Eq)` and `#derive(Hash)` on sum types** (records work).
+- ~~**`#derive(Eq)` and `#derive(Hash)` on sum types** (records work).~~
+  **Landed m12.8.x** (5164898) — see `docs/lane-experience-m12.8.x.md`.
 - **Scope-aware renaming**: the v1 `__proto_<op>` rename rewrites
   every reachable `EVar(op)`, including ones that are local-let
   bindings. A correct implementation walks scopes.
