@@ -1042,6 +1042,17 @@ type ExprKind
   # `42<UserId>`. The inner Expr is always EInt or EReal; the
   # UnitExprT comes from the source between the angle brackets.
   | ELitUnit(Expr, UnitExprT)
+  # m7e §11: `variants[T]()` — enumerate the constructors of a sum
+  # type T whose every variant is nullary. The compiler has the
+  # constructor list after resolution; this node is a request to
+  # materialise it as a `[T]` literal in declaration order. The
+  # `()` suffix is required by the syntax but carries no payload —
+  # the parser rejects any argument list. Parser produces this via
+  # an explicit lookahead in `parse_ident_primary` when the source
+  # ident is `variants` and the next token is `[`. Resolver
+  # validates T (sum + nullary-only). Emitter materialises the
+  # ordered constructor list.
+  | EVariantsOf(TypeExpr)
 
 type ListElem = ElPlain(Expr) | ElSpread(Expr)
 
@@ -2442,8 +2453,17 @@ fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn]) : PCla
 fn parse_ident_primary(p: Parser, t: Token) : PExpr {
   let name = tok_source(p.src, t)
   let p1 = p_advance(p)
+  # m7e §11: `variants[T]()` — compile-time enumeration of a nullary
+  # sum type's constructors. Special-cased before `[` would otherwise
+  # pick up the postfix EIndex path. Active only when the source
+  # ident is exactly "variants" and the next token is `[`. Any other
+  # use of an identifier called `variants` followed by an expression
+  # in `[...]` still parses as EIndex via parse_postfix_rest.
+  if name == "variants" and p_at(p1, TkLbracket) {
+    parse_variants_of(p1, t)
+  }
   # Lambda: `name => body`
-  if p_at(p1, TkFatArrow) {
+  else if p_at(p1, TkFatArrow) {
     let p2 = p_advance(p1)
     let r = parse_expr(p2)
     match r.r {
@@ -2461,6 +2481,40 @@ fn parse_ident_primary(p: Parser, t: Token) : PExpr {
   # Plain variable reference.
   else {
     ok_e(p1, mk_expr(EVar(name), t.line, t.col))
+  }
+}
+
+# m7e §11: parse `variants[T]()`. `p` is positioned at the `[`; `t` is
+# the original `variants` token (used for line/col). The closing `()`
+# is mandatory and carries no payload — `variants[T](anything)` is a
+# parse error. The TypeExpr inside the brackets is whatever
+# `parse_type` accepts; resolver validates that it is a sum type with
+# nullary-only variants.
+fn parse_variants_of(p: Parser, t: Token) : PExpr {
+  let p1 = p_skip_newlines(p_advance(p))
+  let r = parse_type(p1)
+  match r.r {
+    None -> err_e(r.p)
+    Some(ty) -> {
+      let p2 = p_skip_newlines(r.p)
+      if not p_at(p2, TkRbracket) {
+        err_e(p_error_here(p2, "expected `]` after type in `variants[T]`"))
+      } else {
+        let p3 = p_advance(p2)
+        if not p_at(p3, TkLparen) {
+          err_e(p_error_here(p3, "expected `()` after `variants[T]`"))
+        } else {
+          let p4 = p_advance(p3)
+          if not p_at(p4, TkRparen) {
+            err_e(p_error_here(p4,
+              "`variants[T]()` does not accept arguments"))
+          } else {
+            ok_e(p_advance(p4),
+                  mk_expr(EVariantsOf(ty), t.line, t.col))
+          }
+        }
+      }
+    }
   }
 }
 
@@ -4559,6 +4613,8 @@ fn dump_expr(e: Expr, depth: Int) : Unit {
       emit_line(depth, "lit-unit <#{unit_expr_display(u)}> @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
       dump_expr(inner, depth + 1)
     }
+    EVariantsOf(ty) ->
+      emit_line(depth, "variants-of #{type_expr_display(ty)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
   }
 }
 
@@ -5166,6 +5222,10 @@ fn chk_expr(e: Env, x: Expr) : Env {
     # numeric literal; the unit symbols themselves are validated at
     # type-resolution time, not here.
     ELitUnit(inner, _) -> chk_expr(e, inner)
+    # m7e §11: `variants[T]()` carries no value-level sub-expressions.
+    # The TypeExpr is validated by the resolver (sum + nullary-only)
+    # in a later pass, not here.
+    EVariantsOf(_) -> e
   }
 }
 
@@ -6544,6 +6604,9 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
     # m12.5: literal-with-unit captures whatever the inner literal does
     # (always nothing in practice, since the inner is EInt/EReal).
     ELitUnit(inner, _) -> fv_expr(inner, own, globals, acc)
+    # m7e §11: `variants[T]()` has no value-level sub-expressions, so
+    # it captures nothing.
+    EVariantsOf(_) -> acc
   }
 }
 
@@ -6830,6 +6893,9 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     # m12.5: literal-with-unit — the inner literal contributes nothing,
     # but recurse so future non-literal carriers stay covered.
     ELitUnit(inner, _) -> collect_expr(inner, st)
+    # m7e §11: `variants[T]()` produces no lambdas / no clauses to
+    # collect. The TypeExpr is not a lambda host.
+    EVariantsOf(_) -> st
   }
 }
 
@@ -7453,6 +7519,16 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
     # m12.5: codegen erasure — `1.0<USD>` emits the same C as `1.0`.
     # Units are typer-only; the generated value carries no unit tag.
     ELitUnit(inner, _) -> emit_expr(src, inner, fns, variants, lams)
+    # m7e §11: `variants[T]()`. The real codegen (lookup the sum-type
+    # T's variant list and materialise it as a kai_list literal) lives
+    # in the m7e §11 codegen lane (task 16 of the variants[T]() Full
+    # prereq); this site only keeps the match exhaustive so commits
+    # before that lane still build. Until then any reachable use of
+    # `variants[T]()` panics at runtime with a clear message.
+    EVariantsOf(_) ->
+      concat_all([
+        "kai_prelude_panic(kai_str(\"variants[T]() codegen NYI (m7e §11 in flight)\"))"
+      ])
   }
 }
 
@@ -8461,6 +8537,10 @@ fn map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EPlaceholder   -> k
     EHole(_)       -> k
     ETodo(_)       -> k
+    # `EVariantsOf(TypeExpr)` carries no sub-Expr (only a TypeExpr,
+    # which the visitor does not traverse). Same shape as EHole/ETodo
+    # for the purposes of the structural recursion.
+    EVariantsOf(_) -> k
     # Composites: apply f to every direct sub-Expr.
     ECall(callee, args_) -> ECall(f(callee), map(args_, f))
     EField(base, name)   -> EField(f(base), name)
@@ -8938,6 +9018,9 @@ fn body_escapes(name: String, e: Expr) : Bool {
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> body_escapes(name, body) or opt_escapes(name, init_opt) or clauses_escape(name, clauses) or ret_opt_escapes(name, ret_opt)
     EBang(inner) -> body_escapes(name, inner)
     ELitUnit(inner, _) -> body_escapes(name, inner)
+    # m7e §11: `variants[T]()` has no value-level sub-expressions —
+    # nothing can mention `name` inside it.
+    EVariantsOf(_) -> false
   }
 }
 
@@ -12842,6 +12925,13 @@ fn synth(st: InferState, e: Expr) : Inferred {
     # always EInt or EReal; the literal's type is `TyDimT(base, u)`
     # where base is TyInt or TyReal and u is the canonical unit.
     ELitUnit(inner, u) -> synth_lit_unit(st, inner, u, e.line, e.col)
+    # m7e §11: `variants[T]()`. Real typing (`TyListT(TyCon(T, []))`
+    # after validating T is a nullary-only sum type) lands in the
+    # task-15 typer lane; this site keeps the match exhaustive with
+    # a TyAny stub so commits before that lane still build. TyAny
+    # unifies with anything, which is safe for a feature that has
+    # no runtime emission yet (codegen panics — see emit_expr).
+    EVariantsOf(_) -> inferred_leaf(st, TyAny, e)
   }
 }
 
@@ -15309,6 +15399,11 @@ fn expand_aliases_exprkind(k: ExprKind, aliases: [UAliasEntry]) : ExprKind {
     ELitUnit(inner, u) ->
       ELitUnit(expand_aliases_expr(inner, aliases),
                expand_unit_aliases_in_unit(u, aliases, []))
+    # m7e §11: expand aliases inside the TypeExpr that `variants[T]()`
+    # carries, so a unit-aliased name (or a future generic-aliased
+    # type) reaches the resolver in canonical form.
+    EVariantsOf(ty) ->
+      EVariantsOf(expand_aliases_typeexpr(ty, aliases))
   }
 }
 
@@ -15452,6 +15547,7 @@ fn tag_of_kind(k: ExprKind) : String {
     EBang(_)       -> "bang"
     EHandle(_, eff_name, _, _, _, _, _) -> concat_all(["handle ", eff_name])
     ELitUnit(_, u) -> concat_all(["lit-unit <", unit_canon_display(u), ">"])
+    EVariantsOf(ty) -> concat_all(["variants-of ", type_expr_display(ty)])
   }
 }
 
@@ -17341,6 +17437,7 @@ fn expr_kind_name(k: ExprKind) : String {
     EBang(_)       -> "EBang"
     EHandle(_, _, _, _, _, _, _) -> "EHandle"
     ELitUnit(_, _) -> "ELitUnit"
+    EVariantsOf(_) -> "EVariantsOf"
   }
 }
 
