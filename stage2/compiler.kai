@@ -6516,14 +6516,28 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
     }
     EPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
     EHole(_) -> acc
-    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
       # m7b #11: free vars in the handler-state init expression
       # contribute to the surrounding scope.
       let acc0 = match init_opt {
         Some(ie) -> fv_expr(ie, own, globals, acc)
         None     -> acc
       }
-      let acc1 = fv_expr(body, own, globals, acc0)
+      # m12.8.x phase 4 followup: when `with Eff(init) as name { body }`
+      # binds an alias, treat that name as in-scope for the body —
+      # references to it dispatch via the runtime evidence stack at
+      # call time, not via a captured C local. Pre-fix the m7b #5b
+      # desugar (`var top = 0` → `with State[Int](0) as top { ... }`)
+      # caused inner lambdas to capture `top` as if it were a value;
+      # the C emit then read `kai_top` against an undeclared
+      # identifier. The alias is only in scope inside the body — not
+      # in `init` (runs before the handler is installed) and not in
+      # the clauses (which see `state` / `log` magic instead).
+      let own_body = match alias_opt {
+        Some(a) -> [a, ...own]
+        None    -> own
+      }
+      let acc1 = fv_expr(body, own_body, globals, acc0)
       let acc2 = fv_hclauses(clauses, own, globals, acc1)
       match ret_opt { Some(r) -> fv_hreturn(r, own, globals, acc2) None -> acc2 }
     }
@@ -6780,11 +6794,36 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     EHole(_) -> st
     ETodo(_) -> st
     EBang(inner) -> collect_expr(inner, st)
-    EHandle(body, eff_name, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, eff_name, _, init_opt, alias_opt, clauses, ret_opt) -> {
       let stateful = match init_opt { Some(_) -> true None -> false }
       let s_init = match init_opt { Some(ie) -> collect_expr(ie, st) None -> st }
       let s0 = lc_record_clauses(clauses, eff_name, stateful, x.line, x.col, s_init)
-      let s1 = collect_expr(body, s0)
+      # m12.8.x phase 4 followup: when `with Eff(init) as name { body }`
+      # binds an alias, mark `name` as an in-scope global for the body
+      # walk so any inner lambda's free-var analysis treats references
+      # to it as alias dispatches (resolved via the runtime evidence
+      # stack), not as values that need capture in the closure
+      # environment. Pre-fix the m7b #5b desugar (`var top = 0` →
+      # `with State[Int](0) as top { ... }`) caused inner lambdas
+      # passed to row-polymorphic helpers like `while` to capture
+      # `top` as if it were a value, and the C emit then read
+      # `kai_top` against an undeclared identifier. Surfaced via
+      # `demos/spiral`. The alias is only in scope inside the body —
+      # not in `init` (runs before the handler is installed) and not
+      # in the clauses (which see `state` / `log` magic instead).
+      let outer_globals = s0.globals
+      let s_body_in = match alias_opt {
+        Some(a) -> LamCollect {
+          next_id: s0.next_id, lams: s0.lams,
+          clauses: s0.clauses, globals: [a, ...outer_globals]
+        }
+        None -> s0
+      }
+      let s1_ext = collect_expr(body, s_body_in)
+      let s1 = LamCollect {
+        next_id: s1_ext.next_id, lams: s1_ext.lams,
+        clauses: s1_ext.clauses, globals: outer_globals
+      }
       let s2 = collect_hclauses(clauses, s1)
       match ret_opt { Some(r) -> collect_hreturn(r, s2) None -> s2 }
     }
