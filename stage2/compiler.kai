@@ -1052,7 +1052,13 @@ type ExprKind
   # ident is `variants` and the next token is `[`. Resolver
   # validates T (sum + nullary-only). Emitter materialises the
   # ordered constructor list.
-  | EVariantsOf(TypeExpr)
+  #
+  # The second field carries the resolved variant names. Parser
+  # leaves it `[]`; the typer fills it in `synth_variants_of` once
+  # T has been validated as a nullary-only sum. The emitter consumes
+  # the list directly — it has no env access to look the names up
+  # itself.
+  | EVariantsOf(TypeExpr, [String])
 
 type ListElem = ElPlain(Expr) | ElSpread(Expr)
 
@@ -2510,7 +2516,7 @@ fn parse_variants_of(p: Parser, t: Token) : PExpr {
               "`variants[T]()` does not accept arguments"))
           } else {
             ok_e(p_advance(p4),
-                  mk_expr(EVariantsOf(ty), t.line, t.col))
+                  mk_expr(EVariantsOf(ty, []), t.line, t.col))
           }
         }
       }
@@ -4613,7 +4619,7 @@ fn dump_expr(e: Expr, depth: Int) : Unit {
       emit_line(depth, "lit-unit <#{unit_expr_display(u)}> @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
       dump_expr(inner, depth + 1)
     }
-    EVariantsOf(ty) ->
+    EVariantsOf(ty, _) ->
       emit_line(depth, "variants-of #{type_expr_display(ty)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
   }
 }
@@ -5225,7 +5231,7 @@ fn chk_expr(e: Env, x: Expr) : Env {
     # m7e §11: `variants[T]()` carries no value-level sub-expressions.
     # The TypeExpr is validated by the resolver (sum + nullary-only)
     # in a later pass, not here.
-    EVariantsOf(_) -> e
+    EVariantsOf(_, _) -> e
   }
 }
 
@@ -6606,7 +6612,7 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
     ELitUnit(inner, _) -> fv_expr(inner, own, globals, acc)
     # m7e §11: `variants[T]()` has no value-level sub-expressions, so
     # it captures nothing.
-    EVariantsOf(_) -> acc
+    EVariantsOf(_, _) -> acc
   }
 }
 
@@ -6895,7 +6901,7 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     ELitUnit(inner, _) -> collect_expr(inner, st)
     # m7e §11: `variants[T]()` produces no lambdas / no clauses to
     # collect. The TypeExpr is not a lambda host.
-    EVariantsOf(_) -> st
+    EVariantsOf(_, _) -> st
   }
 }
 
@@ -7519,16 +7525,26 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
     # m12.5: codegen erasure — `1.0<USD>` emits the same C as `1.0`.
     # Units are typer-only; the generated value carries no unit tag.
     ELitUnit(inner, _) -> emit_expr(src, inner, fns, variants, lams)
-    # m7e §11: `variants[T]()`. The real codegen (lookup the sum-type
-    # T's variant list and materialise it as a kai_list literal) lives
-    # in the m7e §11 codegen lane (task 16 of the variants[T]() Full
-    # prereq); this site only keeps the match exhaustive so commits
-    # before that lane still build. Until then any reachable use of
-    # `variants[T]()` panics at runtime with a clear message.
-    EVariantsOf(_) ->
-      concat_all([
-        "kai_prelude_panic(kai_str(\"variants[T]() codegen NYI (m7e §11 in flight)\"))"
-      ])
+    # m7e §11: `variants[T]()`. The typer baked the resolved variant
+    # names into the AST node (synth_variants_of); here we materialise
+    # them as a kai_cons spine of nullary constructors. Each variant
+    # was validated as nullary at typing time, so emit_variant_call
+    # with arity 0 / empty arg array is correct.
+    EVariantsOf(_, names) -> emit_variants_of_list(names)
+  }
+}
+
+# m7e §11: emit a `[V0, V1, ..., Vn]` C list of nullary variant
+# constructors. Mirrors emit_list_tail's cons-spine shape; uses the
+# same kai_variant signature emit_ident_value uses for a bare
+# nullary constructor reference.
+fn emit_variants_of_list(names: [String]) : String {
+  match names {
+    [] -> "kai_nil()"
+    [n, ...rest] -> concat_all([
+      "kai_cons(kai_variant(0, \"", n, "\", 0, NULL), ",
+      emit_variants_of_list(rest), ")"
+    ])
   }
 }
 
@@ -8537,10 +8553,11 @@ fn map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EPlaceholder   -> k
     EHole(_)       -> k
     ETodo(_)       -> k
-    # `EVariantsOf(TypeExpr)` carries no sub-Expr (only a TypeExpr,
-    # which the visitor does not traverse). Same shape as EHole/ETodo
-    # for the purposes of the structural recursion.
-    EVariantsOf(_) -> k
+    # `EVariantsOf(TypeExpr, [String])` carries no sub-Expr (only a
+    # TypeExpr and a resolved-names list, neither of which the
+    # visitor traverses). Same shape as EHole/ETodo for the
+    # purposes of the structural recursion.
+    EVariantsOf(_, _) -> k
     # Composites: apply f to every direct sub-Expr.
     ECall(callee, args_) -> ECall(f(callee), map(args_, f))
     EField(base, name)   -> EField(f(base), name)
@@ -9020,7 +9037,7 @@ fn body_escapes(name: String, e: Expr) : Bool {
     ELitUnit(inner, _) -> body_escapes(name, inner)
     # m7e §11: `variants[T]()` has no value-level sub-expressions —
     # nothing can mention `name` inside it.
-    EVariantsOf(_) -> false
+    EVariantsOf(_, _) -> false
   }
 }
 
@@ -12926,9 +12943,11 @@ fn synth(st: InferState, e: Expr) : Inferred {
     # where base is TyInt or TyReal and u is the canonical unit.
     ELitUnit(inner, u) -> synth_lit_unit(st, inner, u, e.line, e.col)
     # m7e §11: `variants[T]()`. Validate T is a sum type with
-    # nullary-only variants and stamp the result with `[T]`
-    # (TyListT). Errors yield a TyAny stub so cascade is graceful.
-    EVariantsOf(ty_expr) -> synth_variants_of(st, ty_expr, e)
+    # nullary-only variants, stamp the result with `[T]` (TyListT),
+    # and bake the resolved variant names into the AST so codegen
+    # has them without re-walking the env. Errors yield a TyAny
+    # stub so cascade is graceful.
+    EVariantsOf(ty_expr, _) -> synth_variants_of(st, ty_expr, e)
   }
 }
 
@@ -12945,9 +12964,15 @@ fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred {
     TyCon(name, _) -> {
       let vc = check_variants_nullary(st.env, name)
       match vc {
-        VCOk(_) -> {
+        VCOk(names) -> {
+          # Re-stamp the AST node with the resolved names so codegen
+          # has them without re-walking the env. Result type is
+          # `[T]` (TyListT of TyCon).
           let result_ty = TyListT(TyCon(name, []))
-          inferred_leaf(st, result_ty, e)
+          let resolved = with_ty(
+            mk_expr(EVariantsOf(ty_expr, names), e.line, e.col),
+            result_ty)
+          mk_inferred(st, result_ty, resolved)
         }
         VCNotSum -> {
           diag_error(st.file, e.line, e.col,
@@ -14673,12 +14698,22 @@ fn check_variants_nullary(env: TyEnv, target: String) : VariantsCheck {
 fn check_variants_nullary_loop(es: [TyEntry], target: String,
                                 ok_acc: [String], err_acc: [String]) : VariantsCheck {
   match es {
+    # NOTE on order: `env.entries` is most-recent-first (ty_env_add
+    # prepends). For sum-type variants registered via
+    # `add_variants_loop`, that means the head of `entries` is the
+    # *last*-declared variant. Walking head-to-tail and prepending to
+    # `acc` therefore double-inverts back to declaration order, so
+    # the accumulators here are returned **without** a final reverse.
+    # `variants[T]()`'s spec guarantees declaration order; relying on
+    # this ordering is intentional. (variants_of_type_loop does the
+    # opposite — it list_reverses — but its caller, exhaustiveness,
+    # is order-insensitive, so the bug never surfaced there.)
     [] -> {
       let ok_empty  = match ok_acc  { [] -> true _ -> false }
       let err_empty = match err_acc { [] -> true _ -> false }
       if ok_empty and err_empty { VCNotSum }
-      else if err_empty { VCOk(list_reverse(ok_acc)) }
-      else { VCHasPayload(list_reverse(err_acc)) }
+      else if err_empty { VCOk(ok_acc) }
+      else { VCHasPayload(err_acc) }
     }
     [e, ...rest] -> {
       let first_upper = match char_at(e.name, 0) {
@@ -15508,8 +15543,8 @@ fn expand_aliases_exprkind(k: ExprKind, aliases: [UAliasEntry]) : ExprKind {
     # m7e §11: expand aliases inside the TypeExpr that `variants[T]()`
     # carries, so a unit-aliased name (or a future generic-aliased
     # type) reaches the resolver in canonical form.
-    EVariantsOf(ty) ->
-      EVariantsOf(expand_aliases_typeexpr(ty, aliases))
+    EVariantsOf(ty, names) ->
+      EVariantsOf(expand_aliases_typeexpr(ty, aliases), names)
   }
 }
 
@@ -15653,7 +15688,7 @@ fn tag_of_kind(k: ExprKind) : String {
     EBang(_)       -> "bang"
     EHandle(_, eff_name, _, _, _, _, _) -> concat_all(["handle ", eff_name])
     ELitUnit(_, u) -> concat_all(["lit-unit <", unit_canon_display(u), ">"])
-    EVariantsOf(ty) -> concat_all(["variants-of ", type_expr_display(ty)])
+    EVariantsOf(ty, _) -> concat_all(["variants-of ", type_expr_display(ty)])
   }
 }
 
@@ -17507,9 +17542,39 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
     # m12.5: codegen erasure — emit the inner literal exactly as if no
     # unit annotation were present. Units never reach LLVM IR.
     ELitUnit(inner, _) -> llvm_emit_expr(e, inner)
+    # m7e §11: `variants[T]()`. Names already resolved by the typer.
+    # Emit a kai_cons spine of nullary variant constructors —
+    # mirrors the C backend's emit_variants_of_list, just routed
+    # through llvm_emit_variant_ctor + llvm_emit_cons primitives.
+    EVariantsOf(_, names) -> llvm_emit_variants_of(e, names)
     _ -> {
       eprint("llvm: unsupported expression kind (#{expr_kind_name(x.kind)}) at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
       llvm_set_last(e, "undef")
+    }
+  }
+}
+
+# m7e §11 (LLVM): build `[V0, V1, ..., Vn]` as a kai_cons spine of
+# nullary variant constructors. Each variant was validated nullary
+# at typing time, so llvm_emit_variant_ctor with `xs=[]` is sound.
+fn llvm_emit_variants_of(e: LlvmEmit, names: [String]) : LlvmEmit {
+  match names {
+    [] -> {
+      let r = llvm_fresh_reg(e)
+      let instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_nil()\n"])
+      llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+    }
+    [n, ...rest] -> {
+      let eh = llvm_emit_variant_ctor(e, n, [])
+      let head_reg = eh.last_val
+      let et = llvm_emit_variants_of(eh, rest)
+      let tail_reg = et.last_val
+      let r = llvm_fresh_reg(et)
+      let instr = concat_all([
+        "  ", r.reg, " = call %KaiValue* @kaix_cons(%KaiValue* ",
+        head_reg, ", %KaiValue* ", tail_reg, ")\n"
+      ])
+      llvm_set_last(llvm_append_body(r.e, instr), r.reg)
     }
   }
 }
@@ -17543,7 +17608,7 @@ fn expr_kind_name(k: ExprKind) : String {
     EBang(_)       -> "EBang"
     EHandle(_, _, _, _, _, _, _) -> "EHandle"
     ELitUnit(_, _) -> "ELitUnit"
-    EVariantsOf(_) -> "EVariantsOf"
+    EVariantsOf(_, _) -> "EVariantsOf"
   }
 }
 
