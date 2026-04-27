@@ -753,6 +753,22 @@ State as of 2026-04-26: m12.8 protocols + #derive(records) landed
 (`1cf1183`); m12.8-cleanup round 1 in flight; m12.8.x and round 2
 queued; m12 checkpoint pending.
 
+**Update 2026-04-27 — m12.8.x and m12.8.z landed; Core checkpoint
+still pending m12.8-cleanup.** m12.8.x merged (Phase 1+2+3+4:
+sum-type derives; Bugs 1-5 + Gap 1; Bug 6 effects-prelude gap with
+the main-row exception preserved per pinned decision; followup
+`49b4bd7` after the merge restored that exception). m12.8.z merged
+(`#derive(Ord)` for records and sum types; followup `f8a2881`
+aligned the lane with Phase 4's row enforcement). Bug 8 (`unitless`
+leak, `f0acda2`) and the multi-prelude support (`6be885f`) shipped
+on the same wave. Selfhost C + LLVM fixed-point both green;
+`test-llvm-coverage` 60 pass / 0 DIFF / 14 skip on the post-merge
+HEAD. **Still pending for Core close**: m12.8-cleanup round 1
+(`dump_*` → `#derive(Show)` / `impl Show for X` in
+`stage2/compiler.kai`), round 2 (`eq_*` / `hash_*` likewise,
+leveraging the new sum-type derives), and the formal m12 self-host
+checkpoint **on the cleaned-up compiler**.
+
 What is **not** in Core but is part of Full:
 
 - Remaining m7e items: `variants[T]()`, main-row inference, `use Effect`.
