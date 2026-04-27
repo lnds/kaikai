@@ -1027,6 +1027,47 @@ test-effects: $(TARGET) build
 	    && grep -q "^22$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (supervision pattern: workers report through Actor mailbox)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m12_8_y_phase4_*.kai; do \
+	  [ -e $$f ] || continue; \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/effects/$$name.out.expected; \
+	  exp_err=../examples/effects/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    rc=0; ./$(TARGET) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "effects FAIL $$name (expected error, got success)"; exit 1; \
+	    fi; \
+	    while read -r line; do \
+	      grep -qF "$$line" build/s2-$$name.err \
+	        || { echo "effects FAIL $$name (missing diagnostic: $$line)"; \
+	             cat build/s2-$$name.err; exit 1; }; \
+	    done < $$exp_err; \
+	    echo "effects OK $$name (rejected as expected)"; \
+	  else \
+	    ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	      || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	    $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	      || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	    ./build/s2-$$name > build/s2-$$name.out \
+	      || { echo "effects FAIL $$name (run errored)"; cat build/s2-$$name.out; exit 1; }; \
+	    if [ -f $$exp_out ]; then \
+	      diff -q $$exp_out build/s2-$$name.out > /dev/null \
+	        && echo "effects OK $$name (C)" \
+	        || { echo "effects DIFF $$name (C)"; diff $$exp_out build/s2-$$name.out; exit 1; }; \
+	      ./$(TARGET) --emit=llvm $$f > build/s2-$$name.ll \
+	        || { echo "effects FAIL $$name (LLVM errored)"; exit 1; }; \
+	      $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm 2>/dev/null \
+	        || { echo "effects FAIL $$name (LLVM compile failed)"; exit 1; }; \
+	      ./build/s2-$$name-llvm > build/s2-$$name-llvm.out \
+	        || { echo "effects FAIL $$name (LLVM run errored)"; exit 1; }; \
+	      diff -q $$exp_out build/s2-$$name-llvm.out > /dev/null \
+	        && echo "effects OK $$name (LLVM)" \
+	        || { echo "effects DIFF $$name (LLVM)"; diff $$exp_out build/s2-$$name-llvm.out; exit 1; }; \
+	    else \
+	      echo "effects OK $$name (ran clean)"; \
+	    fi; \
+	  fi; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,

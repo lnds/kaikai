@@ -715,7 +715,7 @@ fn tok_text(src: String, t: Token) : String = string_slice(src, t.start, t.lengt
 fn tok_line_str(t: Token) : String = int_to_string(t.line)
 fn tok_col_str(t: Token)  : String = int_to_string(t.col)
 
-fn dump_token(src: String, t: Token) : Unit {
+fn dump_token(src: String, t: Token) : Unit / Console {
   match t.kind {
     TkNewline -> print("#{tok_line_str(t)}:#{tok_col_str(t)}  NEWLINE")
     TkError(msg) -> eprint("#{tok_line_str(t)}:#{tok_col_str(t)}  ERROR  #{msg}")
@@ -805,7 +805,7 @@ fn scan_to_newline(src: String, i: Int, total: Int) : Int {
 
 # Render a snippet to stderr. `src` is the source of the entry file;
 # for imported modules we re-read on the fly (see emit_source_caret).
-fn emit_src_snippet(line: Int, col: Int, src_line: String) : Unit {
+fn emit_src_snippet(line: Int, col: Int, src_line: String) : Unit / Console {
   let num = int_to_string(line)
   let margin = spaces(string_length(num))
   eprint("  #{margin} |")
@@ -824,21 +824,21 @@ fn emit_source_caret_from_src(src: String, line: Int, col: Int) : Unit {
 # Self-contained variant: takes a path, reads it, and emits the
 # snippet. Used by diagnostics that don't already have the source
 # threaded through (most checker/infer sites).
-fn emit_source_caret(file: String, line: Int, col: Int) : Unit {
+fn emit_source_caret(file: String, line: Int, col: Int) : Unit / File {
   match read_file(file) {
     Err(_)  -> ()
     Ok(src) -> emit_source_caret_from_src(src, line, col)
   }
 }
 
-fn diag_error(file: String, line: Int, col: Int, msg: String) : Unit {
+fn diag_error(file: String, line: Int, col: Int, msg: String) : Unit / Console {
   eprint("error: #{msg}")
   eprint("  --> #{file}:#{int_to_string(line)}:#{int_to_string(col)}")
   emit_source_caret(file, line, col)
 }
 
-fn diag_note(msg: String) : Unit = eprint("  = note: #{msg}")
-fn diag_help(msg: String) : Unit = eprint("  = help: #{msg}")
+fn diag_note(msg: String) : Unit / Console = eprint("  = note: #{msg}")
+fn diag_help(msg: String) : Unit / Console = eprint("  = help: #{msg}")
 
 # Levenshtein edit distance for "did you mean?" suggestions. Plain
 # DP over rows, immutable — each row is a freshly-built list. Small
@@ -942,7 +942,7 @@ fn closest_name(target: String, cands: [String]) : Option[String] {
   closest_name_loop(target, cands, 3, None, 999999)
 }
 
-fn diag_error_from_src(file: String, src: String, line: Int, col: Int, msg: String) : Unit {
+fn diag_error_from_src(file: String, src: String, line: Int, col: Int, msg: String) : Unit / Console {
   eprint("error: #{msg}")
   eprint("  --> #{file}:#{int_to_string(line)}:#{int_to_string(col)}")
   emit_source_caret_from_src(src, line, col)
@@ -4411,7 +4411,7 @@ fn indent_of(depth: Int) : String {
   if depth == 0 { "" } else { string_concat("  ", indent_of(depth - 1)) }
 }
 
-fn emit_line(depth: Int, s: String) : Unit = print("#{indent_of(depth)}#{s}")
+fn emit_line(depth: Int, s: String) : Unit / Console = print("#{indent_of(depth)}#{s}")
 
 fn dump_expr(e: Expr, depth: Int) : Unit {
   match e.kind {
@@ -4870,7 +4870,7 @@ fn dump_variant(v: Variant, depth: Int) : Unit {
   }
 }
 
-fn dump_program(decls: [Decl]) : Unit {
+fn dump_program(decls: [Decl]) : Unit / Console {
   print("program")
   decls |> each((d) => dump_decl(d, 1))
 }
@@ -10325,7 +10325,7 @@ fn row_to_string_suffix(r: Row) : String {
 # Dump the declared signature (or shape) of every top-level decl. Used
 # by `--types`; does not attempt to infer bodies, just surfaces what
 # the user wrote.
-fn dump_decl_type(d: Decl) : Unit {
+fn dump_decl_type(d: Decl) : Unit / Console {
   match d {
     DFn(is_pub, name, _, _, _, _, _, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
@@ -10373,8 +10373,13 @@ fn dump_decl_type(d: Decl) : Unit {
   }
 }
 
-fn dump_types(decls: [Decl]) : Unit {
-  decls |> each(dump_decl_type)
+fn dump_types(decls: [Decl]) : Unit / Console = dump_types_loop(decls)
+
+fn dump_types_loop(ds: [Decl]) : Unit / Console {
+  match ds {
+    [] -> ()
+    [d, ...rest] -> { dump_decl_type(d) dump_types_loop(rest) }
+  }
 }
 
 # ====================================================================
@@ -10460,6 +10465,17 @@ fn tv(n: Int) : Ty = TyVarT(n)
 
 fn fn_ty(ps: [Ty], ret: Ty) : Ty = TyFnT(ps, ret, row_empty())
 
+# m12.8.x phase 4 (Bug 6): open-tail Row for row-polymorphic
+# prelude signatures (each/map/filter/reduce). The row var id
+# `rid` matches the scheme's bound rvar; at instantiation time the
+# inferencer mints a fresh rvar so labels propagate from callee
+# into caller.
+fn row_with_tail(rid: Int) : Row = Row {
+  labels:        [],
+  tail:          Some(rid),
+  display_alias: None
+}
+
 fn list_ty(t: Ty) : Ty = TyListT(t)
 
 # ---- prelude signatures ----
@@ -10505,10 +10521,17 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "list_reverse",   scheme: scheme([0], fn_ty([list_ty(tv(0))],                    list_ty(tv(0)))) },
 
     # Higher-order (element `0`, result `1`).
-    TyEntry { name: "map",    scheme: scheme([0, 1], fn_ty([list_ty(tv(0)), fn_ty([tv(0)], tv(1))], list_ty(tv(1)))) },
-    TyEntry { name: "filter", scheme: scheme([0],    fn_ty([list_ty(tv(0)), fn_ty([tv(0)], TyBool)], list_ty(tv(0)))) },
-    TyEntry { name: "reduce", scheme: scheme([0, 1], fn_ty([list_ty(tv(0)), tv(1), fn_ty([tv(1), tv(0)], tv(1))], tv(1))) },
-    TyEntry { name: "each",   scheme: scheme([0],    fn_ty([list_ty(tv(0)), fn_ty([tv(0)], TyUnit)],  TyUnit)) },
+    # m12.8.x phase 4 (Bug 6): higher-order combinators are row-
+    # polymorphic in the callback. The callback's row tail equals
+    # the combinator's outer row tail, so a `each(xs, dump_fn)` where
+    # `dump_fn : Decl -> Unit / Console` propagates Console back to
+    # the calling fn through `each`'s outer row. Without this,
+    # row-bearing dump helpers can't be passed to each/map/filter
+    # at all.
+    TyEntry { name: "map",    scheme: scheme_full([0, 1], [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], tv(1), row_with_tail(0))], list_ty(tv(1)), row_with_tail(0))) },
+    TyEntry { name: "filter", scheme: scheme_full([0],    [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], TyBool, row_with_tail(0))], list_ty(tv(0)), row_with_tail(0))) },
+    TyEntry { name: "reduce", scheme: scheme_full([0, 1], [0], TyFnT([list_ty(tv(0)), tv(1), TyFnT([tv(1), tv(0)], tv(1), row_with_tail(0))], tv(1), row_with_tail(0))) },
+    TyEntry { name: "each",   scheme: scheme_full([0],    [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], TyUnit, row_with_tail(0))], TyUnit, row_with_tail(0))) },
 
     # Opaque mutable arrays.
     TyEntry { name: "array_make",   scheme: scheme([0], fn_ty([TyInt, tv(0)],                                TyCon("Array", [tv(0)]))) },
@@ -11216,11 +11239,17 @@ fn scheme_to_string(sc: TyScheme) : String {
   }
 }
 
-fn dump_env_entry(e: TyEntry) : Unit =
+fn dump_env_entry(e: TyEntry) : Unit / Console =
   print("#{e.name} : #{scheme_to_string(e.scheme)}")
 
-fn dump_env(env: TyEnv) : Unit =
-  list_reverse(env.entries) |> each(dump_env_entry)
+fn dump_env(env: TyEnv) : Unit / Console = dump_env_loop(list_reverse(env.entries))
+
+fn dump_env_loop(es: [TyEntry]) : Unit / Console {
+  match es {
+    [] -> ()
+    [e, ...rest] -> { dump_env_entry(e) dump_env_loop(rest) }
+  }
+}
 
 # ====================================================================
 # substitution + unification (M2c)
@@ -13499,19 +13528,21 @@ fn synth_many(st: InferState, es: [Expr]) : InferredList {
 }
 
 fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred {
-  # m7b #11l: special-case `resume(...)` inside a stateful clause
-  # body. The clause's enclosing handler installs `st.clause_resume`
-  # = Some(RB(answer_ty, state_ty)); a 1-arg `resume(v)` requires
-  # `v : answer_ty`, a 2-arg `resume(v, ns)` additionally requires
-  # `ns : state_ty`. Outside stateful clauses, the standard env
-  # binding of `resume` carries the typing.
-  match try_resume_call(st, callee, args_, line, col) {
+  # m12.8.x phase 4 (Bug 6): when the callee is a syntactically-bare
+  # prelude IO builtin (`print`, `eprint`, `read_line`, `read_file`,
+  # `write_file`), accumulate the matching effect label on the
+  # caller's row. The op-call pathway already adds labels for
+  # explicit `Eff.op(...)` calls; this shim closes the gap for the
+  # sugar prelude form so `check_body_row` enforces row declaration
+  # uniformly per CLAUDE.md Tier 1 #1.
+  let st_p = add_prelude_effect_label(st, callee, line, col)
+  match try_resume_call(st_p, callee, args_, line, col) {
     Some(inf) -> inf
     None ->
-      match try_op_call(st, callee, args_, line, col) {
+      match try_op_call(st_p, callee, args_, line, col) {
         Some(inf) -> inf
         None -> {
-          let rc = synth(st, callee)
+          let rc = synth(st_p, callee)
           let ra = synth_many(rc.st, args_)
           let rv = st_fresh_ty(ra.st)
           # m7b #12: build the expected function type with an *open*
@@ -14105,8 +14136,15 @@ fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Infer
       let rf = synth(rl.st, f)
       let ra = synth_many(rf.st, pa)
       let rv = st_fresh_ty(ra.st)
-      let expected = fn_ty([rl.ty, ...ra.tys], rv.ty)
-      let st2 = st_unify(rv.st, rf.ty, expected, "pipe call", line, col)
+      # m12.8.x phase 4 (Bug 6): same open-row trick `synth_call`
+      # uses — let the callee's row tail bind to a fresh row var so
+      # `xs |> each(handler)` against a row-polymorphic combinator
+      # passes type checking when `handler` carries effect labels.
+      let fr = subst_fresh_row(rv.st.sub)
+      let st_fresh = st_set_sub(rv.st, fr.subst)
+      let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+      let expected = TyFnT([rl.ty, ...ra.tys], rv.ty, expected_row)
+      let st2 = st_unify(st_fresh, rf.ty, expected, "pipe call", line, col)
       let ty = apply_ty(st2.sub, rv.ty)
       let typed_rhs = with_ty(mk_expr(ECall(rf.expr, ra.exprs), rhs.line, rhs.col), ty)
       PipeRes { st: st2, ty: ty, rhs: typed_rhs }
@@ -14114,14 +14152,41 @@ fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Infer
     _ -> {
       let rf = synth(rl.st, rhs)
       let rv = st_fresh_ty(rf.st)
-      let expected = fn_ty([rl.ty], rv.ty)
-      let st2 = st_unify(rv.st, rf.ty, expected, "pipe call", line, col)
+      let fr = subst_fresh_row(rv.st.sub)
+      let st_fresh = st_set_sub(rv.st, fr.subst)
+      let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+      let expected = TyFnT([rl.ty], rv.ty, expected_row)
+      let st2 = st_unify(st_fresh, rf.ty, expected, "pipe call", line, col)
       let ty = apply_ty(st2.sub, rv.ty)
       PipeRes { st: st2, ty: ty, rhs: rf.expr }
     }
   }
   let root = with_ty(mk_expr(EPipe(rl.expr, res.rhs), line, col), res.ty)
   mk_inferred(res.st, res.ty, root)
+}
+
+# m12.8.x phase 4 (Bug 6): for the syntactically-bare prelude IO
+# builtins, accumulate the matching effect label on the caller's
+# row. Effect names follow Doc B's catalog: Console covers print
+# and eprint, Stdin owns read_line, File owns read_file and
+# write_file. The op-call pathway already handles explicit
+# `Eff.op(...)` calls; this shim closes the sugar-prelude gap.
+fn add_prelude_effect_label(st: InferState, callee: Expr,
+                              line: Int, col: Int) : InferState {
+  match callee.kind {
+    EVar(name) -> match prelude_effect_for(name) {
+      Some(eff) -> st_add_effect(st, eff, line, col)
+      None      -> st
+    }
+    _ -> st
+  }
+}
+
+fn prelude_effect_for(name: String) : Option[String] {
+  if name == "print" or name == "eprint" { Some("Console") }
+  else if name == "read_line" { Some("Stdin") }
+  else if name == "read_file" or name == "write_file" { Some("File") }
+  else { None }
 }
 
 fn synth_record_lit(st: InferState, nm: String, fis: [FieldInit], line: Int, col: Int) : Inferred {
@@ -14707,7 +14772,7 @@ fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int,
 
 # ---- per-decl entry + dumper ----
 
-fn print_inferred_fn(nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col: Int) : Unit {
+fn print_inferred_fn(nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col: Int) : Unit / Console {
   let fn_t = fn_ty(param_tys, final_ret)
   print("fn #{nm} : #{ty_to_string(fn_t)} @#{int_to_string(line)}:#{int_to_string(col)}")
 }
@@ -15681,7 +15746,7 @@ fn dump_typed_stmt(s: Stmt, depth: Int) : Unit {
   }
 }
 
-fn dump_typed_decl(d: Decl) : Unit {
+fn dump_typed_decl(d: Decl) : Unit / Console {
   match d {
     DFn(_, nm, _, _, _, _, body, line, col) -> {
       print("fn #{nm} @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -15691,10 +15756,17 @@ fn dump_typed_decl(d: Decl) : Unit {
   }
 }
 
-fn dump_typed(file: String, decls: [Decl]) : Int {
+fn dump_typed(file: String, decls: [Decl]) : Int / Console {
   let r = infer_program(file, decls, false)
-  r.decls |> each(dump_typed_decl)
+  dump_typed_loop(r.decls)
   r.errs
+}
+
+fn dump_typed_loop(ds: [Decl]) : Unit / Console {
+  match ds {
+    [] -> ()
+    [d, ...rest] -> { dump_typed_decl(d) dump_typed_loop(rest) }
+  }
 }
 
 # ---- `--dump-mono`: call-site instantiations ----
@@ -15708,7 +15780,7 @@ fn dump_typed(file: String, decls: [Decl]) : Int {
 # Monomorphisation (M4c) will de-duplicate these tuples per callee
 # and emit one specialised function body per unique instantiation.
 
-fn dump_mono_line(cs: ResolvedCS) : Unit {
+fn dump_mono_line(cs: ResolvedCS) : Unit / Console {
   match cs {
     RCS(nm, line, col, tys) -> {
       let tys_str = join_with(ty_string_list(tys), ", ")
@@ -15731,7 +15803,7 @@ fn dump_mono(file: String, decls: [Decl]) : Int {
 # specialised decls. Lines look like:
 #   foo@line:col  [Int, Bool]  ->  foo__mono__Int__Bool
 
-fn dump_mono_out_line(cs: ResolvedCS) : Unit {
+fn dump_mono_out_line(cs: ResolvedCS) : Unit / Console {
   match cs {
     RCS(nm, line, col, tys) -> {
       let tys_str = join_with(ty_string_list(tys), ", ")
@@ -16542,7 +16614,7 @@ fn last_use_for_loop(nm: String, uses: [Use], blocked: Bool,
 
 # ---- `--dump-last-use`: per-fn-param last-use diagnostic ----
 
-fn dump_last_use_for_param(p: Param, uses: [Use]) : Unit {
+fn dump_last_use_for_param(p: Param, uses: [Use]) : Unit / Console {
   let lu = last_use_for(p.pname, uses)
   match lu {
     LUAt(nm, ln, cl) -> print("  param #{nm}: last-use at #{int_to_string(ln)}:#{int_to_string(cl)}")
@@ -16551,7 +16623,7 @@ fn dump_last_use_for_param(p: Param, uses: [Use]) : Unit {
   }
 }
 
-fn dump_last_use_for_decl(d: Decl) : Unit {
+fn dump_last_use_for_decl(d: Decl) : Unit / Console {
   match d {
     DFn(_, nm, _, params, _, _, body, ln, _) -> {
       print("fn #{nm}@#{int_to_string(ln)}:")
@@ -16578,13 +16650,13 @@ fn dump_last_use(file: String, decls: [Decl]) : Int {
 #
 # Output mirrors the example in docs/typed-holes.md closely.
 
-fn dump_scope_entry(te: TyEntry) : Unit =
+fn dump_scope_entry(te: TyEntry) : Unit / Console =
   print("    #{te.name} : #{scheme_to_string(te.scheme)}")
 
-fn dump_hole_candidate(c: String) : Unit =
+fn dump_hole_candidate(c: String) : Unit / Console =
   print("    #{c}")
 
-fn dump_hole_report(file: String, rh: ResolvedHole, prelude_len: Int) : Unit {
+fn dump_hole_report(file: String, rh: ResolvedHole, prelude_len: Int) : Unit / Console {
   match rh {
     RH(kind, line, col, ty, scope, env_fresh) -> {
       let label = hole_kind_label(kind)
@@ -16756,7 +16828,7 @@ fn synth_candidates_loop(all: [TyEntry], cur: [TyEntry], expected: Ty, fresh: In
 fn synth_candidates(scope: [TyEntry], expected: Ty, fresh: Int) : [String] =
   synth_candidates_loop(scope, scope, expected, fresh, [], 8)
 
-fn dump_holes(file: String, decls: [Decl]) : Int {
+fn dump_holes(file: String, decls: [Decl]) : Int / Console {
   let r = infer_program(file, decls, false)
   match r.holes {
     [] -> { print("(no typed holes)") r.errs }
@@ -16865,7 +16937,7 @@ fn hole_kind_json(k: HoleKind) : HoleKindJson {
   }
 }
 
-fn dump_holes_json(file: String, decls: [Decl]) : Int {
+fn dump_holes_json(file: String, decls: [Decl]) : Int / Console {
   let r = infer_program(file, decls, false)
   let body = join_with(map(r.holes, (h) => json_hole_report(file, h)), ", ")
   print(concat_all(["[", body, "]"]))
@@ -16893,7 +16965,7 @@ fn strict_holes_report_loop(file: String, hs: [ResolvedHole]) : Unit {
   }
 }
 
-fn strict_holes_check(file: String, decls: [Decl]) : Int {
+fn strict_holes_check(file: String, decls: [Decl]) : Int / Console {
   let r = infer_program(file, decls, false)
   let n = list_length(r.holes)
   if n == 0 { r.errs }
@@ -17343,7 +17415,7 @@ fn llvm_binop_helper(op: String) : Option[String] {
 
 # ---- expression emission ----
 
-fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
+fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
   match x.kind {
     EInt(n) -> {
       let r = llvm_fresh_reg(e)
@@ -17716,7 +17788,7 @@ fn llvm_build_closure(e: LlvmEmit, thunk_sym: String, arity: Int) : LlvmEmit {
   llvm_set_last(llvm_append_body(r.e, instr), r.reg)
 }
 
-fn llvm_closure_error(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit {
+fn llvm_closure_error(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit / Console {
   eprint("llvm: cannot build closure for '#{nm}' at #{int_to_string(line)}:#{int_to_string(col)}")
   llvm_set_last(e, "undef")
 }
@@ -18070,7 +18142,7 @@ fn llvm_concat_helper_of(opt_ty: Option[Ty]) : String {
   }
 }
 
-fn llvm_emit_binop(e: LlvmEmit, op: String, l: Expr, r: Expr) : LlvmEmit {
+fn llvm_emit_binop(e: LlvmEmit, op: String, l: Expr, r: Expr) : LlvmEmit / Console {
   if op == "and" or op == "or" {
     llvm_emit_short_circuit(e, op, l, r)
   } else {
@@ -18519,7 +18591,7 @@ fn llvm_emit_stmts(e: LlvmEmit, stmts: [Stmt]) : LlvmEmit {
   }
 }
 
-fn llvm_emit_stmt(e: LlvmEmit, s: Stmt) : LlvmEmit {
+fn llvm_emit_stmt(e: LlvmEmit, s: Stmt) : LlvmEmit / Console {
   match s {
     SLet(pat, _, rhs) -> {
       let er = llvm_emit_expr(e, rhs)
@@ -18647,7 +18719,7 @@ fn llvm_emit_list_tail(e: LlvmEmit, elems: [ListElem]) : LlvmEmit {
 # At the ELambda site we look up the LamInfo by (line, col) and emit
 # a call to `kaix_closure` with the thunk's address, arity, and the
 # captured values currently in scope.
-fn llvm_emit_lambda_ref(e: LlvmEmit, x: Expr) : LlvmEmit {
+fn llvm_emit_lambda_ref(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
   match find_lam(e.lams, x.line, x.col) {
     None -> {
       eprint("llvm: lambda info missing at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
@@ -18783,7 +18855,7 @@ fn llvm_emit_truthy_br(e: LlvmEmit, scr_val: String, fail_lbl: String, prefix: S
 # Pattern test. Adds locals for PBind, branches to `fail_lbl` on any
 # non-matching leaf. Falls through into the current block on success;
 # the caller then emits the arm body.
-fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: String) : LlvmEmit {
+fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: String) : LlvmEmit / Console {
   match pat.pkind {
     PWild -> e
     PBind(nm) -> llvm_push_local(e, nm, scr)
@@ -18961,7 +19033,7 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
   }
 }
 
-fn llvm_emit_match(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : LlvmEmit {
+fn llvm_emit_match(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : LlvmEmit / Console {
   let es = llvm_emit_expr(e, scr)
   let scr_reg = es.last_val
   let end_lbl = llvm_fresh_label(es, "match.end.")
@@ -19414,7 +19486,7 @@ fn non_import_decls(ds: [Decl]) : [Decl] {
 type CandidateFile = CF(String, Option[String])
 #                      path    source (if read succeeded)
 
-fn try_candidate(abs_path: String) : Option[String] {
+fn try_candidate(abs_path: String) : Option[String] / File {
   match read_file(abs_path) {
     Err(_)  -> None
     Ok(src) -> Some(src)
@@ -19442,7 +19514,7 @@ fn find_module_file(base_dir: String, mod_path: String, search_paths: [String]) 
   }
 }
 
-fn resolve_module(base_dir: String, mod_path: String, search_paths: [String], rs: ResolveState) : ResolveState {
+fn resolve_module(base_dir: String, mod_path: String, search_paths: [String], rs: ResolveState) : ResolveState / Console {
   let cf = find_module_file(base_dir, mod_path, search_paths)
   match cf {
     CF(abs_path, opt_src) -> {
@@ -19671,7 +19743,7 @@ fn validate_impls(ds: [Decl], file: String,
 
 fn validate_impls_loop(ds: [Decl], file: String,
                        proto_names: [String], local_types: [String],
-                       seen: [String], errs: Int) : Int {
+                       seen: [String], errs: Int) : Int / Console {
   match ds {
     [] -> errs
     [d, ...rest] -> match d {
@@ -19971,7 +20043,7 @@ fn validate_derive_sum_variants(pname: String, tname: String, vs: [Variant],
 fn validate_derive_variant_args(pname: String, tname: String, vname: String,
                                  vargs: [TypeExpr], i: Int, file: String,
                                  future_impls: [String], line: Int, col: Int,
-                                 errs: Int) : Int {
+                                 errs: Int) : Int / Console {
   match vargs {
     [] -> errs
     [te, ...rest] -> {
@@ -21146,7 +21218,7 @@ fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
                strict_holes: opts.strict_holes,
                search_paths: list_append(opts.search_paths, [sp]) }
 
-fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
+fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
   match rest {
     [] -> opts
     [a, ...more] -> {
@@ -21212,7 +21284,7 @@ fn parse_cli(argv: [String]) : CliOptions {
                                     strict_holes: false, search_paths: [] })
 }
 
-fn usage() : Unit {
+fn usage() : Unit / Console {
   eprint("usage: kaic2 [options] <file.kai>")
   eprint("  --prelude <file>   include <file>'s decls before the input")
   eprint("  --path <dir>       add <dir> to the module search path (repeatable)")
@@ -21237,7 +21309,7 @@ fn usage() : Unit {
 
 # Parse a prelude file and return its decl list. On any error report
 # to stderr and return None.
-fn load_prelude(path: String) : Option[[Decl]] {
+fn load_prelude(path: String) : Option[[Decl]] / Console + File {
   match read_file(path) {
     Err(msg) -> { eprint("kaic1: #{path}: #{msg}"); None }
     Ok(src) -> {
@@ -21260,12 +21332,16 @@ fn load_prelude(path: String) : Option[[Decl]] {
 # (or an imported file) hasn't already declared it.
 fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   let existing = collect_effect_names(decls)
-  let main_row = main_row_labels(decls)
-  let console_d = inject_one(main_row, existing, "Console", builtin_console_decl())
-  let fail_d    = inject_one(main_row, existing, "Fail",    builtin_fail_decl())
-  let stdin_d   = inject_one(main_row, existing, "Stdin",   builtin_stdin_decl())
-  let env_d     = inject_one(main_row, existing, "Env",     builtin_env_decl())
-  let file_d    = inject_one(main_row, existing, "File",    builtin_file_decl())
+  # m12.8.x phase 4 (Bug 6): the gate on which builtin effect decls
+  # to inject is the union of every fn's declared row, not just
+  # main's. Helper fns that declare `: Unit / Console` need Console
+  # as a known effect even when main doesn't mention it.
+  let used_row = collect_used_row_labels(decls)
+  let console_d = inject_one(used_row, existing, "Console", builtin_console_decl())
+  let fail_d    = inject_one(used_row, existing, "Fail",    builtin_fail_decl())
+  let stdin_d   = inject_one(used_row, existing, "Stdin",   builtin_stdin_decl())
+  let env_d     = inject_one(used_row, existing, "Env",     builtin_env_decl())
+  let file_d    = inject_one(used_row, existing, "File",    builtin_file_decl())
   # m7b #11: parametric stdlib effects (State[T], Reader[T], Writer[W])
   # have no runtime default handler — the user always writes an explicit
   # `with State[T](init)` form. Inject the declarations unconditionally
@@ -21331,6 +21407,42 @@ fn inject_one(main_row: [String], existing: [String],
               name: String, decl: Decl) : [Decl] {
   if list_has(main_row, name) and not list_has(existing, name) { [decl] }
   else { [] }
+}
+
+# m12.8.x phase 4 (Bug 6): aggregate every DFn's declared row labels
+# (plus main's labels via main_row_labels). Used by
+# `inject_builtin_effects` so a helper fn declaring `: Unit /
+# Console` triggers the Console builtin injection even when main
+# itself doesn't mention Console.
+fn collect_used_row_labels(decls: [Decl]) : [String] {
+  let main_row = main_row_labels(decls)
+  collect_used_row_labels_loop(decls, main_row)
+}
+
+fn collect_used_row_labels_loop(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DFn(_, _, _, _, _, row, _, _, _) -> {
+        let names = match row {
+          REmpty       -> []
+          RClosed(lbs) -> row_label_names(lbs)
+          ROpen(_, lbs) -> row_label_names(lbs)
+        }
+        collect_used_row_labels_loop(rest, used_row_union(names, acc))
+      }
+      _ -> collect_used_row_labels_loop(rest, acc)
+    }
+  }
+}
+
+fn used_row_union(xs: [String], acc: [String]) : [String] {
+  match xs {
+    [] -> acc
+    [x, ...rest] ->
+      if list_has(acc, x) { used_row_union(rest, acc) }
+      else { used_row_union(rest, [x, ...acc]) }
+  }
 }
 
 # m7b #11: inject a builtin effect decl regardless of whether `main`'s
@@ -21595,7 +21707,7 @@ fn builtin_spawn_decl() : Decl =
                     ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
-fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int {
+fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int / Console {
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
   match mode {
@@ -21747,7 +21859,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
   }
 }
 
-fn run(opts: CliOptions) : Int {
+fn run(opts: CliOptions) : Int / Console + File {
   match opts.mode {
     MHelp -> { usage(); 0 }
     MVersion -> { print("kaic2 stage 2 (self-hosted)"); 0 }
