@@ -244,6 +244,9 @@ KaiValue *kaix_default_mutable_array_set(void *self, KaiValue *a, KaiValue *i, K
 KaiValue *kaix_default_mutable_array_grow(void *self, KaiValue *a, KaiValue *n, KaiValue *init, KaiCont *k) {
     return kai_default_mutable_array_grow(self, a, n, init, k);
 }
+KaiValue *kaix_default_random_int_range(void *self, KaiValue *lo, KaiValue *hi, KaiCont *k) {
+    return kai_default_random_int_range(self, lo, hi, k);
+}
 
 /* m7c-d — install/teardown default handlers for builtins that
  * appear in main's row. The LLVM emitter generates the body of

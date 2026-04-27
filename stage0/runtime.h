@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Not every program uses every prelude function; silence the
    unused-function warnings that would otherwise pile up in `cc` output
@@ -1748,6 +1749,66 @@ static KaiValue *kai_default_mutable_array_grow(void *self, KaiValue *a,
                                                  KaiValue *n, KaiValue *init, KaiCont *k) {
     (void) self;
     return kai_cont_resume(k, kai_prelude_array_grow(a, n, init));
+}
+
+/* Default Random handler — PCG32 (M.E.O'Neill 2014). Per-process
+ * shared state, seeded once on first use from time(NULL). Doc B
+ * §`Random` specifies seeding from SecureRandom; that is deferred
+ * until SecureRandom lands. Non-cryptographic by design — for
+ * games, simulations, sampling, fixtures. */
+static uint64_t _kai_pcg_state  = 0x853c49e6748fea9bULL;
+static uint64_t _kai_pcg_inc    = 0xda3e39cb94b95bdbULL;
+static int      _kai_pcg_seeded = 0;
+
+static uint32_t _kai_pcg32_next(void) {
+    uint64_t old = _kai_pcg_state;
+    _kai_pcg_state = old * 6364136223846793005ULL + (_kai_pcg_inc | 1ULL);
+    uint32_t xorshifted = (uint32_t)(((old >> 18u) ^ old) >> 27u);
+    uint32_t rot = (uint32_t)(old >> 59u);
+    return (xorshifted >> rot) | (xorshifted << (((uint32_t)(-(int32_t)rot)) & 31u));
+}
+
+static void _kai_pcg32_seed(uint64_t initstate, uint64_t initseq) {
+    _kai_pcg_state = 0u;
+    _kai_pcg_inc   = (initseq << 1u) | 1u;
+    (void) _kai_pcg32_next();
+    _kai_pcg_state += initstate;
+    (void) _kai_pcg32_next();
+}
+
+static void _kai_pcg32_ensure_seeded(void) {
+    if (!_kai_pcg_seeded) {
+        uint64_t t = (uint64_t) time(NULL);
+        _kai_pcg32_seed(t ^ 0xa5a5a5a5a5a5a5a5ULL, t * 6364136223846793005ULL);
+        _kai_pcg_seeded = 1;
+    }
+}
+
+/* Doc B §`Random`: int_range(lo, hi) returns a value in [lo, hi).
+ * lo >= hi is a panic — there is no meaningful value. The PRNG draw
+ * uses the `% delta` shortcut; for delta well under 2^32 (e.g. 52
+ * for a card deck) the modulo bias is negligible. Rejection sampling
+ * is a future polish. */
+static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue *hi, KaiCont *k) {
+    (void) self;
+    int64_t lo_v = (lo && lo->tag == KAI_INT) ? lo->as.i : 0;
+    int64_t hi_v = (hi && hi->tag == KAI_INT) ? hi->as.i : 0;
+    if (lo_v >= hi_v) {
+        fprintf(stderr, "kai: Random.int_range: lo (%lld) >= hi (%lld)\n",
+                (long long) lo_v, (long long) hi_v);
+        exit(1);
+    }
+    _kai_pcg32_ensure_seeded();
+    uint64_t delta = (uint64_t) (hi_v - lo_v);
+    uint64_t draw;
+    if (delta <= 0xFFFFFFFFULL) {
+        draw = (uint64_t) _kai_pcg32_next() % delta;
+    } else {
+        uint64_t hi32 = (uint64_t) _kai_pcg32_next();
+        uint64_t lo32 = (uint64_t) _kai_pcg32_next();
+        draw = ((hi32 << 32) | lo32) % delta;
+    }
+    return kai_cont_resume(k, kai_int(lo_v + (int64_t) draw));
 }
 
 /* m8 #2/#3: default Spawn handlers. Inline-eager v1: spawn(thunk)

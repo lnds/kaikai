@@ -21,7 +21,8 @@ KAIC2     := ../stage2/kaic2
 # rewritten to the dispatcher.
 PRELUDES  := --prelude ../stdlib/core.kai \
              --prelude ../stdlib/protocols.kai \
-             --prelude ../stdlib/effects.kai
+             --prelude ../stdlib/effects.kai \
+             --prelude ../stdlib/random.kai
 STDLIB    := ../stdlib
 RT_INC    := -I ../stage0
 CC        := cc
