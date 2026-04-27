@@ -8092,11 +8092,14 @@ fn default_spawn_setup() : String =
 # cluster). Phase 4b: `Console` acts as the alias `Stdout + Stderr`,
 # so a row containing it triggers both setups.
 fn default_setups_for(main_row: [String]) : String = {
-  let want_stdout = list_has(main_row, "Stdout") or list_has(main_row, "Console")
-  let want_stderr = list_has(main_row, "Stderr") or list_has(main_row, "Console")
+  # Phase 4b note: after alias expansion in `expand_aliases_in_decls`,
+  # main's row never contains "Console" — it has been substituted
+  # to `Stdout + Stderr + Stdin` already. We gate on the atomic
+  # labels only; the older `or list_has(main_row, "Console")` was
+  # dead code carried over from the pre-alias scaffolding.
   concat_all([
-    if want_stdout                   { default_stdout_setup() } else { "" },
-    if want_stderr                   { default_stderr_setup() } else { "" },
+    if list_has(main_row, "Stdout")  { default_stdout_setup() } else { "" },
+    if list_has(main_row, "Stderr")  { default_stderr_setup() } else { "" },
     if list_has(main_row, "Fail")    { default_fail_setup() }    else { "" },
     if list_has(main_row, "Stdin")   { default_stdin_setup() }   else { "" },
     if list_has(main_row, "Env")     { default_env_setup() }     else { "" },
@@ -8108,9 +8111,7 @@ fn default_setups_for(main_row: [String]) : String = {
 }
 
 # Pops in reverse-push order so the evidence stack drains LIFO.
-fn default_pops_for(main_row: [String]) : String = {
-  let want_stdout = list_has(main_row, "Stdout") or list_has(main_row, "Console")
-  let want_stderr = list_has(main_row, "Stderr") or list_has(main_row, "Console")
+fn default_pops_for(main_row: [String]) : String =
   concat_all([
     if list_has(main_row, "Spawn")   { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Cancel")  { "    kai_evidence_pop();\n" } else { "" },
@@ -8119,10 +8120,9 @@ fn default_pops_for(main_row: [String]) : String = {
     if list_has(main_row, "Env")     { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Stdin")   { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Fail")    { "    kai_evidence_pop();\n" } else { "" },
-    if want_stderr                   { "    kai_evidence_pop();\n" } else { "" },
-    if want_stdout                   { "    kai_evidence_pop();\n" } else { "" }
+    if list_has(main_row, "Stderr")  { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "Stdout")  { "    kai_evidence_pop();\n" } else { "" }
   ])
-}
 
 # m7b #5b/handle-as: rewrite alias-based callees `EField(EVar(alias),
 # op)` to `EField(EVar(eff_name), op)` so the subsequent
@@ -15287,34 +15287,21 @@ fn check_body_row(st: InferState, fname: String, declared: RowExpr,
       # builtin effect the body performs. Helpers must still declare
       # their row — Bug 6 enforcement still bites where it matters.
       if fname == "main" { st }
-      else { check_body_row_label_loop(st, fname, expand_console_alias(st.row), [], line, col) }
-    RClosed(lbs) -> check_body_row_label_loop(st, fname, expand_console_alias(st.row),
-                                                expand_console_alias(row_labels_of_rls(lbs)),
+      else { check_body_row_label_loop(st, fname, st.row, [], line, col) }
+    RClosed(lbs) -> check_body_row_label_loop(st, fname, st.row,
+                                                row_labels_of_rls(lbs),
                                                 line, col)
     ROpen(_, _)  -> st
   }
 }
 
-# m12.8 Phase 4b: `Console` declared in a row stands for the alias
-# `Stdout + Stderr`. The sugar prelude routes `print` to `Stdout`
-# and `eprint` to `Stderr`, so any declared `Console` must satisfy
-# bodies that perform Stdout, Stderr, or both. This walker rewrites
-# the declared label list before the subset check sees it; the
-# label's ty_args are empty for these atomic effects, so we only
-# need to substitute the eff name.
-fn expand_console_alias(labs: [Label]) : [Label] {
-  match labs {
-    [] -> []
-    [lab, ...rest] ->
-      if lab.eff == "Console" {
-        [Label { eff: "Stdout", ty_args: [] },
-         Label { eff: "Stderr", ty_args: [] },
-         ...expand_console_alias(rest)]
-      } else {
-        [lab, ...expand_console_alias(rest)]
-      }
-  }
-}
+# m12.8 Phase 4b: `expand_console_alias` removed. After Phase 4b,
+# `Console` is the auto-injected alias `type Console = Stdout +
+# Stderr + Stdin`; row labels are expanded to atomics by
+# `expand_aliases_in_decls` at the program level before any DFn
+# row reaches `check_body_row`. The earlier hardcoded expansion
+# (which only knew about `Stdout + Stderr`, not `Stdin`) was both
+# dead code and silently incomplete.
 
 # m7b #11i — label-aware body-vs-declared check. For each label the
 # body performed, look for an `eff`-name match in the declared list;
@@ -18491,19 +18478,18 @@ type LlvmArm = { e: LlvmEmit, reg: String, from_label: String }
 fn llvm_default_builtin_decls(main_row: [String]) : String {
   # Function declarations live in `llvm_header`; here we only emit
   # the per-builtin globals (Ev struct + node buffer + name string)
-  # gated on main's row. m12.8 Phase 4b: Console is an alias for
-  # Stdout + Stderr — a row containing it triggers both.
-  let want_stdout = list_has(main_row, "Stdout") or list_has(main_row, "Console")
-  let want_stderr = list_has(main_row, "Stderr") or list_has(main_row, "Console")
+  # gated on main's row. m12.8 Phase 4b: `Console` is the alias
+  # `Stdout + Stderr + Stdin`, expanded to its atomics by
+  # `expand_aliases_in_decls` before main's row reaches this point.
   concat_all([
-    if want_stdout {
+    if list_has(main_row, "Stdout") {
       concat_all([
         "@_kai_default_ev_stdout = internal global %EvStdout zeroinitializer\n",
         "@_kai_default_node_stdout = internal global [48 x i8] zeroinitializer\n",
         "@_kai_default_stdout_name = private unnamed_addr constant [7 x i8] c\"Stdout\\00\"\n"
       ])
     } else { "" },
-    if want_stderr {
+    if list_has(main_row, "Stderr") {
       concat_all([
         "@_kai_default_ev_stderr = internal global %EvStderr zeroinitializer\n",
         "@_kai_default_node_stderr = internal global [48 x i8] zeroinitializer\n",
@@ -18528,9 +18514,7 @@ fn llvm_default_builtin_decls(main_row: [String]) : String {
 }
 
 fn llvm_emit_main_install_defaults(main_row: [String]) : String {
-  let want_stdout = list_has(main_row, "Stdout") or list_has(main_row, "Console")
-  let want_stderr = list_has(main_row, "Stderr") or list_has(main_row, "Console")
-  let stdout_ = if want_stdout {
+  let stdout_ = if list_has(main_row, "Stdout") {
     concat_all([
       "  ; install Stdout default handler\n",
       "  %hid_stdout = call i64 @kaix_fresh_handler_id()\n",
@@ -18543,7 +18527,7 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
       "  call void @kaix_evidence_push(i8* %node_stdout_p, i8* getelementptr inbounds ([7 x i8], [7 x i8]* @_kai_default_stdout_name, i64 0, i64 0), i8* %ev_stdout_void)\n"
     ])
   } else { "" }
-  let stderr_ = if want_stderr {
+  let stderr_ = if list_has(main_row, "Stderr") {
     concat_all([
       "  ; install Stderr default handler\n",
       "  %hid_stderr = call i64 @kaix_fresh_handler_id()\n",
@@ -18603,13 +18587,11 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
 }
 
 fn llvm_emit_main_teardown_defaults(main_row: [String]) : String {
-  let want_stdout = list_has(main_row, "Stdout") or list_has(main_row, "Console")
-  let want_stderr = list_has(main_row, "Stderr") or list_has(main_row, "Console")
   let pops = concat_all([
     if list_has(main_row, "Mutable") { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Fail")    { "  call void @kaix_evidence_pop()\n" } else { "" },
-    if want_stderr                   { "  call void @kaix_evidence_pop()\n" } else { "" },
-    if want_stdout                   { "  call void @kaix_evidence_pop()\n" } else { "" }
+    if list_has(main_row, "Stderr")  { "  call void @kaix_evidence_pop()\n" } else { "" },
+    if list_has(main_row, "Stdout")  { "  call void @kaix_evidence_pop()\n" } else { "" }
   ])
   concat_all([
     "define void @kai_main_teardown_defaults() {\n",
