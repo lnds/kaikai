@@ -4969,7 +4969,10 @@ fn prelude_names() : [String] {
     # bodies (which would emit invalid C: `kai___perceus_dup` is undeclared).
     "__perceus_dup", "__perceus_drop",
     # m12.5: unit-erasure escape; emitter lowers to identity.
-    "unitless"
+    "unitless",
+    # m12.8.x phase 2 (Gap 1): compile-time unit reflection;
+    # emitter lowers to a constant String literal.
+    "unit_name"
   ]
 }
 
@@ -5808,6 +5811,23 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
         match args_e {
           [a] -> emit_expr(src, a, fns, variants, lams)
           _   -> "kai_unit() /* unitless: expected 1 arg */"
+        }
+      } else if callee == "unit_name" {
+        # m12.8.x phase 2 (Gap 1, partial): compile-time reflection
+        # on the dimensioned argument. Inlines the canonical unit
+        # symbol as a String literal. Reads the arg's `.ty` (which
+        # the typed-AST finalisation pass populated with the fully
+        # substituted type). When the unit is still a UVar (e.g.
+        # the protocol-impl-generic case) or the arg type is bare
+        # `Real` with no dimension, an empty string literal is
+        # emitted instead of failing — keeps user code that calls
+        # `unit_name` defensively well-defined.
+        match args_e {
+          [a] -> {
+            let nm = unit_name_of_ty(a.ty)
+            concat_all(["kai_str(\"", nm, "\")"])
+          }
+          _ -> "kai_unit() /* unit_name: expected 1 arg */"
         }
       } else if callee == "__perceus_drop" {
         # m5 #4 — AST-level drop, lowered to runtime `kai_decref`
@@ -9318,6 +9338,203 @@ fn desugar_var_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
   }
 }
 
+# ====================================================================
+# m12.8.x phase 2 (Bug 4): lift `"...#{x}..."` interpolation parts
+# into the pre-inference AST so the typer + protocol-call rewrite see
+# them. Without this the interp body is parsed at emit time and
+# routed through the universal `kai_to_string` runtime, which
+# bypasses any user-defined `impl Show for T`.
+# ====================================================================
+#
+# Run only when the program declares `protocol Show` (the
+# `op_names` list contains "show"); otherwise leave EStr nodes alone
+# so files that just use `#{int_to_string(x)}` and never load the
+# stdlib protocols continue to work via the legacy emit-time path.
+#
+# Lowering shape: a string `"prefix #{e1} mid #{e2} suffix"` becomes
+#
+#   string_concat_all(["prefix ", show(e1), " mid ", show(e2), " suffix"])
+#
+# Each interp body `e_i` is parsed using `parse_expr` (same parser
+# the emitter used to call lazily) and then recursively desugared so
+# nested interpolations also lift.
+
+fn desugar_interp_decls(ds: [Decl], op_names: [String]) : [Decl] {
+  if not list_has(op_names, "show") { ds }
+  else { map(ds, (d) => desugar_interp_decl(d, op_names)) }
+}
+
+fn desugar_interp_decl(d: Decl, op_names: [String]) : Decl {
+  match d {
+    DFn(p, n, tps, ps, ret, row, body, l, c) ->
+      DFn(p, n, tps, ps, ret, row, desugar_interp_expr(body, op_names), l, c)
+    DTest(desc, body, l, c) ->
+      DTest(desc, desugar_interp_expr(body, op_names), l, c)
+    _ -> d
+  }
+}
+
+fn desugar_interp_expr(e: Expr, op_names: [String]) : Expr =
+  Expr { kind: desugar_interp_kind(e.kind, op_names, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty }
+
+fn desugar_interp_opt(o: Option[Expr], op_names: [String]) : Option[Expr] {
+  match o {
+    Some(e) -> Some(desugar_interp_expr(e, op_names))
+    None    -> None
+  }
+}
+
+fn desugar_interp_exprs(xs: [Expr], op_names: [String]) : [Expr] =
+  map(xs, (e) => desugar_interp_expr(e, op_names))
+
+fn desugar_interp_arms(arms: [Arm], op_names: [String]) : [Arm] =
+  map(arms, (a) => desugar_interp_arm(a, op_names))
+
+fn desugar_interp_arm(a: Arm, op_names: [String]) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, desugar_interp_opt(g, op_names),
+                         desugar_interp_expr(b, op_names))
+  }
+}
+
+fn desugar_interp_stmts(ss: [Stmt], op_names: [String]) : [Stmt] =
+  map(ss, (st_) => desugar_interp_stmt(st_, op_names))
+
+fn desugar_interp_stmt(st_: Stmt, op_names: [String]) : Stmt {
+  match st_ {
+    SLet(p, ann, rhs) -> SLet(p, ann, desugar_interp_expr(rhs, op_names))
+    SAssert(c, m) -> SAssert(desugar_interp_expr(c, op_names),
+                              desugar_interp_opt(m, op_names))
+    SExprStmt(x) -> SExprStmt(desugar_interp_expr(x, op_names))
+    SIndexAssign(b, i, v, l, c) ->
+      SIndexAssign(desugar_interp_expr(b, op_names),
+                   desugar_interp_expr(i, op_names),
+                   desugar_interp_expr(v, op_names), l, c)
+    SVar(n, ty, rhs, l, c) ->
+      SVar(n, ty, desugar_interp_expr(rhs, op_names), l, c)
+  }
+}
+
+fn desugar_interp_clauses(cs: [HClause], op_names: [String]) : [HClause] =
+  map(cs, (c) => desugar_interp_clause(c, op_names))
+
+fn desugar_interp_clause(c: HClause, op_names: [String]) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, desugar_interp_expr(b, op_names), l, co)
+  }
+}
+
+fn desugar_interp_opt_return(o: Option[HReturn], op_names: [String]) : Option[HReturn] {
+  match o {
+    Some(r) -> Some(desugar_interp_return(r, op_names))
+    None    -> None
+  }
+}
+
+fn desugar_interp_return(r: HReturn, op_names: [String]) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, desugar_interp_expr(b, op_names), l, c)
+  }
+}
+
+fn desugar_interp_fields(fs: [FieldInit], op_names: [String]) : [FieldInit] =
+  map(fs, (f) => desugar_interp_field(f, op_names))
+
+fn desugar_interp_field(f: FieldInit, op_names: [String]) : FieldInit {
+  match f {
+    FI(n, v) -> FI(n, desugar_interp_expr(v, op_names))
+  }
+}
+
+fn desugar_interp_elems(els: [ListElem], op_names: [String]) : [ListElem] =
+  map(els, (el) => desugar_interp_elem(el, op_names))
+
+fn desugar_interp_elem(el: ListElem, op_names: [String]) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(desugar_interp_expr(x, op_names))
+    ElSpread(x) -> ElSpread(desugar_interp_expr(x, op_names))
+  }
+}
+
+fn desugar_interp_kind(k: ExprKind, op_names: [String],
+                        line: Int, col: Int) : ExprKind {
+  match k {
+    EStr(span, is_triple) -> {
+      let n = string_length(span)
+      let body_start = if is_triple { 3 } else { 1 }
+      let body_end = if is_triple { n - 3 } else { n - 1 }
+      if has_interp(span, body_start, body_end) {
+        lift_interp_string(span, body_start, body_end, op_names, line, col)
+      } else { k }
+    }
+    ECall(c, args_) -> ECall(desugar_interp_expr(c, op_names),
+                              desugar_interp_exprs(args_, op_names))
+    EBlock(ss, t) -> EBlock(desugar_interp_stmts(ss, op_names),
+                             desugar_interp_opt(t, op_names))
+    EIf(c, t_, eo) -> EIf(desugar_interp_expr(c, op_names),
+                          desugar_interp_expr(t_, op_names),
+                          desugar_interp_opt(eo, op_names))
+    EBinop(op, a, b) -> EBinop(op, desugar_interp_expr(a, op_names),
+                                    desugar_interp_expr(b, op_names))
+    EUnop(op, x) -> EUnop(op, desugar_interp_expr(x, op_names))
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(desugar_interp_expr(body, op_names), eff_name, eff_tyargs,
+              desugar_interp_opt(init_opt, op_names), alias_opt,
+              desugar_interp_clauses(clauses, op_names),
+              desugar_interp_opt_return(ret_opt, op_names))
+    ELambda(ps, b) -> ELambda(ps, desugar_interp_expr(b, op_names))
+    EMatch(scr, arms) -> EMatch(desugar_interp_expr(scr, op_names),
+                                 desugar_interp_arms(arms, op_names))
+    EPipe(a, b) -> EPipe(desugar_interp_expr(a, op_names),
+                          desugar_interp_expr(b, op_names))
+    EField(base, fname) -> EField(desugar_interp_expr(base, op_names), fname)
+    EIndex(a, b) -> EIndex(desugar_interp_expr(a, op_names),
+                            desugar_interp_expr(b, op_names))
+    ERecordLit(name, fields) ->
+      ERecordLit(name, desugar_interp_fields(fields, op_names))
+    EList(elems) -> EList(desugar_interp_elems(elems, op_names))
+    ERange(a, b, opt_step) ->
+      ERange(desugar_interp_expr(a, op_names),
+             desugar_interp_expr(b, op_names),
+             desugar_interp_opt(opt_step, op_names))
+    EBang(inner) -> EBang(desugar_interp_expr(inner, op_names))
+    ELitUnit(inner, u) -> ELitUnit(desugar_interp_expr(inner, op_names), u)
+    _ -> k
+  }
+}
+
+fn lift_interp_string(span: String, body_start: Int, body_end: Int,
+                       op_names: [String], line: Int, col: Int) : ExprKind {
+  let parts = iscan_collect(span, body_end,
+                             IScan { parts: [], lit_start: body_start, i: body_start })
+  let part_exprs = map(parts, (p: IPart) => interp_part_to_expr(p, op_names, line, col))
+  ECall(mk_expr(EVar("string_concat_all"), line, col),
+        [mk_expr(EList(map(part_exprs, (e: Expr) => ElPlain(e))), line, col)])
+}
+
+fn interp_part_to_expr(p: IPart, op_names: [String],
+                        line: Int, col: Int) : Expr {
+  match p {
+    IpLit(_, raw_quoted) -> mk_expr(EStr(raw_quoted, false), line, col)
+    IpExp(expr_src) -> {
+      let toks = tokenize(expr_src)
+      let prs = parser_new("<interp>", expr_src, toks)
+      let r = parse_expr(prs)
+      let inner = match r.r {
+        Some(e) -> desugar_interp_expr(e, op_names)
+        None    -> mk_expr(EStr("\"\"", false), line, col)
+      }
+      # The post-rename dispatcher name (`__proto_show`) bypasses the
+      # rename pass that already ran inside lower_protocols. The
+      # post-inference rewrite recognises this prefixed form.
+      mk_expr(ECall(mk_expr(EVar(proto_dispatcher_name("show")), line, col),
+                     [inner]),
+              line, col)
+    }
+  }
+}
+
 fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool) : String {
   # m7a #6c: rewrite `Eff.op(args)` callees from `EField(EVar(Eff), op)`
   # to `EVar("Eff.op")` before code emission. The typer (synth_op_call_with_scheme)
@@ -9982,6 +10199,24 @@ fn ty_to_string(t: Ty) : String {
 # render identically.
 fn unit_canon_display(u: UnitExprT) : String = unit_expr_display(unit_canon(u))
 
+# m12.8.x phase 2 (Gap 1, partial): extract the canonical unit symbol
+# of a dimensioned type for the `unit_name` compile-time intrinsic.
+# Bare types and unresolved unit-vars yield the empty string so the
+# emitter never produces an LLVM/C error from a missing dimension.
+fn unit_name_of_ty(ot: Option[Ty]) : String {
+  match ot {
+    Some(t) -> match t {
+      TyDimT(_, u) -> match unit_canon(u) {
+        UVar(_) -> ""
+        UOne    -> ""
+        cu      -> unit_expr_display(cu)
+      }
+      _ -> ""
+    }
+    None -> ""
+  }
+}
+
 # m4c #2 — name-mangling helpers for monomorphisation.
 #
 # `mangle_name(name, [Ty]) : String` produces a deterministic,
@@ -10273,7 +10508,19 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     # bare numerics, per docs/units-of-measure.md §7.
     TyEntry { name: "unitless",
               scheme: scheme_uvars([], [], [0],
-                fn_ty([TyDimT(TyReal, UVar(0))], TyReal)) }
+                fn_ty([TyDimT(TyReal, UVar(0))], TyReal)) },
+    # m12.8.x phase 2 (Gap 1): `unit_name[u: Unit](x: Real<u>) : String`
+    # — compile-time reflection that returns the canonical unit
+    # symbol of the dimensioned argument as a String literal. The
+    # call lowers to a constant string at the C / LLVM emit step,
+    # extracted from the arg's `.ty`. Lets user code build
+    # "<value> <unit>" strings without per-unit-specialised protocol
+    # impls (which would require a structural change to the impl
+    # machinery; deferred). When the arg's unit is still a UVar
+    # (the protocol-impl-generic case), the empty string is emitted.
+    TyEntry { name: "unit_name",
+              scheme: scheme_uvars([], [], [0],
+                fn_ty([TyDimT(TyReal, UVar(0))], TyString)) }
   ]
   TyEnv { entries: list_append(es, env.entries), fresh: env.fresh }
 }
@@ -14582,14 +14829,152 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       } else { () }
       let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub)
       let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub)
+      # m12.8.x phase 2 (Bug 2): apply the final substitution to every
+      # `Expr.ty` annotation in the body so the post-inference protocol-
+      # call rewrite can read concrete head types from sites whose
+      # `synth` saved a TyVar that later unified with a concrete type
+      # — most visibly the parameters of lambdas passed to generic
+      # higher-order ops (`each`, `map`, `filter`).
+      let final_body = finalise_typed_expr(st2.sub, rb.expr)
       TypedDecl {
-        decl: DFn(is_pub, nm, tparams, ps, opt_ret, row, rb.expr, line, col),
+        decl: DFn(is_pub, nm, tparams, ps, opt_ret, row, final_body, line, col),
         errs: st2.errs,
         insts: resolved,
         holes: hole_reports
       }
     }
     _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [] }
+  }
+}
+
+# Walk a typed Expr applying the per-decl substitution to every
+# `Expr.ty`. Recurses through every kind that contains sub-Exprs.
+# Patterns and Stmts are walked too because they hold Exprs whose
+# `ty` field is read by downstream passes (notably the protocol-call
+# rewrite). Pure structural; no type checking, no error production.
+fn finalise_typed_expr(s: Subst, e: Expr) : Expr {
+  let ty1 = match e.ty {
+    Some(t) -> Some(apply_ty(s, t))
+    None    -> None
+  }
+  Expr { kind: finalise_typed_kind(s, e.kind),
+         line: e.line, col: e.col, ty: ty1 }
+}
+
+fn finalise_typed_opt(s: Subst, o: Option[Expr]) : Option[Expr] {
+  match o {
+    Some(e) -> Some(finalise_typed_expr(s, e))
+    None    -> None
+  }
+}
+
+fn finalise_typed_exprs(s: Subst, xs: [Expr]) : [Expr] =
+  map(xs, (e) => finalise_typed_expr(s, e))
+
+fn finalise_typed_arms(s: Subst, arms: [Arm]) : [Arm] =
+  map(arms, (a) => finalise_typed_arm(s, a))
+
+fn finalise_typed_arm(s: Subst, a: Arm) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, finalise_typed_opt(s, g),
+                         finalise_typed_expr(s, b))
+  }
+}
+
+fn finalise_typed_stmts(s: Subst, ss: [Stmt]) : [Stmt] =
+  map(ss, (st_) => finalise_typed_stmt(s, st_))
+
+fn finalise_typed_stmt(s: Subst, st_: Stmt) : Stmt {
+  match st_ {
+    SLet(p, ann, rhs) -> SLet(p, ann, finalise_typed_expr(s, rhs))
+    SAssert(c, m) -> SAssert(finalise_typed_expr(s, c),
+                              finalise_typed_opt(s, m))
+    SExprStmt(x) -> SExprStmt(finalise_typed_expr(s, x))
+    SIndexAssign(b, i, v, l, c) ->
+      SIndexAssign(finalise_typed_expr(s, b),
+                   finalise_typed_expr(s, i),
+                   finalise_typed_expr(s, v), l, c)
+    SVar(n, ty, rhs, l, c) ->
+      SVar(n, ty, finalise_typed_expr(s, rhs), l, c)
+  }
+}
+
+fn finalise_typed_clauses(s: Subst, cs: [HClause]) : [HClause] =
+  map(cs, (c) => finalise_typed_clause(s, c))
+
+fn finalise_typed_clause(s: Subst, c: HClause) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, finalise_typed_expr(s, b), l, co)
+  }
+}
+
+fn finalise_typed_opt_return(s: Subst, o: Option[HReturn]) : Option[HReturn] {
+  match o {
+    Some(r) -> Some(finalise_typed_return(s, r))
+    None    -> None
+  }
+}
+
+fn finalise_typed_return(s: Subst, r: HReturn) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, finalise_typed_expr(s, b), l, c)
+  }
+}
+
+fn finalise_typed_fields(s: Subst, fs: [FieldInit]) : [FieldInit] =
+  map(fs, (f) => finalise_typed_field(s, f))
+
+fn finalise_typed_field(s: Subst, f: FieldInit) : FieldInit {
+  match f {
+    FI(n, v) -> FI(n, finalise_typed_expr(s, v))
+  }
+}
+
+fn finalise_typed_list_elems(s: Subst, els: [ListElem]) : [ListElem] =
+  map(els, (el) => finalise_typed_list_elem(s, el))
+
+fn finalise_typed_list_elem(s: Subst, el: ListElem) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(finalise_typed_expr(s, x))
+    ElSpread(x) -> ElSpread(finalise_typed_expr(s, x))
+  }
+}
+
+fn finalise_typed_kind(s: Subst, k: ExprKind) : ExprKind {
+  match k {
+    ECall(c, args_) -> ECall(finalise_typed_expr(s, c),
+                              finalise_typed_exprs(s, args_))
+    EBlock(ss, t) -> EBlock(finalise_typed_stmts(s, ss),
+                             finalise_typed_opt(s, t))
+    EIf(c, t_, eo) -> EIf(finalise_typed_expr(s, c),
+                          finalise_typed_expr(s, t_),
+                          finalise_typed_opt(s, eo))
+    EBinop(op, a, b) -> EBinop(op, finalise_typed_expr(s, a),
+                                    finalise_typed_expr(s, b))
+    EUnop(op, x) -> EUnop(op, finalise_typed_expr(s, x))
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(finalise_typed_expr(s, body), eff_name, eff_tyargs,
+              finalise_typed_opt(s, init_opt), alias_opt,
+              finalise_typed_clauses(s, clauses),
+              finalise_typed_opt_return(s, ret_opt))
+    ELambda(ps, b) -> ELambda(ps, finalise_typed_expr(s, b))
+    EMatch(scr, arms) -> EMatch(finalise_typed_expr(s, scr),
+                                 finalise_typed_arms(s, arms))
+    EPipe(a, b) -> EPipe(finalise_typed_expr(s, a),
+                          finalise_typed_expr(s, b))
+    EField(base, fname) -> EField(finalise_typed_expr(s, base), fname)
+    EIndex(a, b) -> EIndex(finalise_typed_expr(s, a),
+                            finalise_typed_expr(s, b))
+    ERecordLit(name, fields) ->
+      ERecordLit(name, finalise_typed_fields(s, fields))
+    EList(elems) -> EList(finalise_typed_list_elems(s, elems))
+    ERange(a, b, opt_step) ->
+      ERange(finalise_typed_expr(s, a),
+             finalise_typed_expr(s, b),
+             finalise_typed_opt(s, opt_step))
+    EBang(inner) -> EBang(finalise_typed_expr(s, inner))
+    ELitUnit(inner, u) -> ELitUnit(finalise_typed_expr(s, inner), u)
+    _ -> k
   }
 }
 
@@ -16956,14 +17341,19 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
                               int_to_string(char_to_int(c)), ")\n"])
       llvm_set_last(llvm_append_body(r.e, instr), r.reg)
     }
-    EReal(_) -> {
-      # Real literals carry their lexeme at parse time but the AST
-      # stores the decoded value. For M12 we only need to round-trip
-      # the compiler, which has exactly one real literal — and it's
-      # inside an unreachable arm. Emit 0.0 as a placeholder rather
-      # than plumb real serialisation through the emitter.
+    EReal(v) -> {
+      # m12.8.x phase 2 (Bug 3): emit the actual decoded value. The
+      # M12 placeholder hard-coded 0.0 because the compiler itself
+      # had no live real literals; user code with `100.0<USD>` and
+      # friends needs the real lexeme to round-trip. LLVM IR rejects
+      # `double 100` (integer literal as double) — `real_to_string`
+      # of an integer-valued double has no `.`, so append `.0`.
       let r = llvm_fresh_reg(e)
-      let instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_real(double 0.0)\n"])
+      let s = real_to_string(v)
+      let s_dbl = if string_contains_dot(s) { s } else { concat_all([s, ".0"]) }
+      let instr = concat_all(["  ", r.reg,
+                              " = call %KaiValue* @kaix_real(double ",
+                              s_dbl, ")\n"])
       llvm_set_last(llvm_append_body(r.e, instr), r.reg)
     }
     EUnit -> {
@@ -17428,6 +17818,15 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
         # m12.5: identity at runtime — emit the inner value directly.
         match xs {
           [a] -> llvm_emit_expr(e, a)
+          _   -> llvm_set_last(e, "undef")
+        }
+      } else if nm == "unit_name" {
+        # m12.8.x phase 2 (Gap 1, partial): same compile-time
+        # reflection as the C path. Emit a string-constant load
+        # whose contents are the canonical unit symbol of the
+        # arg's type (empty when the unit is unresolved or absent).
+        match xs {
+          [a] -> llvm_emit_plain_str_body(e, unit_name_of_ty(a.ty))
           _   -> llvm_set_last(e, "undef")
         }
       } else if nm == "resume" {
@@ -20985,7 +21384,13 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # consumes. The registry-driven dispatch resolution runs
             # later, after `infer_program` populates `Expr.ty`.
             let lowered = lower_protocols(var_decls, path)
-            let all_decls = lowered.decls
+            # m12.8.x phase 2 (Bug 4): lift `#{x}` interp parts into
+            # `string_concat_all([..., show(x), ...])` so the typer +
+            # protocol-call rewrite see them. Conditional on `Show`
+            # being declared (op_names contains "show"); otherwise
+            # the legacy emit-time `kai_to_string` path remains.
+            let all_decls = desugar_interp_decls(lowered.decls,
+                                                  lowered.reg.op_names)
             let proto_reg = lowered.reg
             let proto_errs = lowered.errs
             if alias_res.errs > 0 { alias_res.errs }
