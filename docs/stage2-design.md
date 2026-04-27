@@ -793,6 +793,48 @@ showed up later: the selfhost pipeline does not load
 fails with `unknown protocol Show`. The validation that the cleanup
 was meant to provide moves to the new fixture above.
 
+**Update 2026-04-28 — Core REOPENED for stronger demo-based
+validation.** On reflection, the fixture-based validation in
+`m12_8_compiler_shapes.kai` is weaker than the demo-based validation
+the original plan implied. The user's preferred Core-close criterion
+is "the aspirational external demos compile and produce the expected
+output", concretely:
+
+- `portfolio.kai` (57 lines, post-Phase-4 target): records + sum types
+  + `#derive(Show)` + UoM + per-stream effect rows + pipes;
+- `usd_to_eur.kai` (58 lines, post-Phase-4 target): `Stdin` and
+  `Stdout` as separate per-stream effects + UoM literal/algebra +
+  apply-pipe + `read_line`-based parsing.
+
+Two structural items must land before either demo compiles:
+
+1. **Stdout / Stderr atomic split** (defer-on-Phase-4 from
+   `docs/m12.8-followup.md`). Today `Console` is the combined effect
+   that owns both `print` (stdout) and `eprint` (stderr). Both demos
+   require declaring `/ Stdout` (and `usd_to_eur.kai` also `/ Stdin`
+   alongside) as atomic effects. Migration: split `Console` into
+   `Stdout` + `Stderr`, keep `Console = Stdout + Stderr` as an
+   alias for over-declaration.
+2. **Parametric `impl Show for Real[u: Unit]`** (Gap 1 partial in
+   `docs/m12.8-followup.md`). Today `unit_name(x: Real<u>)` is a
+   reflection intrinsic that gives the suffix string; the parametric
+   impl that lets `#{balance(txs)}` of `Real<USD>` render as
+   `"845 USD"` requires per-unit specialisation in the protocol-impl
+   resolver.
+
+After both land, the two demos move from `/tmp/kaikai-portfolio-demo/`
+into `examples/portfolio/` and `examples/usd_to_eur/` (or similar)
+with `.out.expected` golden files and harness wiring. The
+`m12_8_compiler_shapes.kai` fixture stays as a smoke test for the
+derive surface.
+
+Banking-style demos (`/tmp/ahu-ddd-example/`) are NOT in Core scope —
+they require `ahu` (OTP-analog) and `ahu-ddd` framework layers that
+land post-Core (~5-6 weeks total). Banking is validation of "Core +
+framework", not Core alone.
+
+Estimated time to Core CLOSED under this revised criterion: 4-6 days.
+
 What is **not** in Core but is part of Full:
 
 - Remaining m7e items: `variants[T]()`, main-row inference, `use Effect`.
