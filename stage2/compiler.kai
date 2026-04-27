@@ -3925,36 +3925,75 @@ fn parse_protocol_ops(p: Parser, acc: [ProtoOp]) : PProtoOps {
 # m12.8: `impl P for T { fn op(args) = body ... }`. Each method is a
 # regular DFn whose name matches a protocol op name. The body
 # inherits the parser's full feature set (any expression form).
+#
+# m12.8 phase 2: an optional impl-level tparam list `[u: Unit, ...]`
+# may follow `impl` (mirrors the `fn[T1, T2]` shape). The bound names
+# are prepended to each method's own tparams so the typer sees them
+# as ordinary fn tparams in scope inside parameter and body types
+# (e.g. `impl[u: Unit] Show for Real<u> { fn show(x: Real<u>) ... }`).
 fn parse_impl_decl(p: Parser, t: Token) : PDecl {
-  let id = p_peek(p)
-  if not tk_is(id.kind, TkIdent) or not is_upper_ident(p.src, id) {
-    err_d(p_error(p, id, "expected an uppercase protocol name after `impl`"))
-  } else {
-    let pname = tok_source(p.src, id)
-    let p1 = p_advance(p)
-    let p1n = p_skip_newlines(p1)
-    if not p_at(p1n, TkFor) {
-      err_d(p_error_here(p1n, "expected `for` after protocol name in `impl`"))
+  let imp_tps_r =
+    if p_at(p, TkLbracket) {
+      parse_type_params_loop(p_skip_newlines(p_advance(p)), [])
     } else {
-      let p2 = p_skip_newlines(p_advance(p1n))
-      let target_r = parse_type(p2)
-      match target_r.r {
-        None -> err_d(target_r.p)
-        Some(target_ty) -> {
-          let p3 = p_skip_newlines(target_r.p)
-          if not p_at(p3, TkLbrace) {
-            err_d(p_error_here(p3, "expected `{` to start impl body"))
-          } else {
-            let p4 = p_skip_newlines(p_advance(p3))
-            let methods_r = parse_impl_methods(p4, [])
-            match methods_r.r {
-              None -> err_d(methods_r.p)
-              Some(ms) -> ok_d(methods_r.p, DImpl(pname, target_ty, ms, t.line, t.col))
+      PTParams { p: p, r: Some([]) }
+    }
+  match imp_tps_r.r {
+    None -> err_d(imp_tps_r.p)
+    Some(impl_tparams) -> {
+      let p_after_tps = p_skip_newlines(imp_tps_r.p)
+      let id = p_peek(p_after_tps)
+      if not tk_is(id.kind, TkIdent) or not is_upper_ident(p_after_tps.src, id) {
+        err_d(p_error(p_after_tps, id, "expected an uppercase protocol name after `impl`"))
+      } else {
+        let pname = tok_source(p_after_tps.src, id)
+        let p1 = p_advance(p_after_tps)
+        let p1n = p_skip_newlines(p1)
+        if not p_at(p1n, TkFor) {
+          err_d(p_error_here(p1n, "expected `for` after protocol name in `impl`"))
+        } else {
+          let p2 = p_skip_newlines(p_advance(p1n))
+          let target_r = parse_type(p2)
+          match target_r.r {
+            None -> err_d(target_r.p)
+            Some(target_ty) -> {
+              let p3 = p_skip_newlines(target_r.p)
+              if not p_at(p3, TkLbrace) {
+                err_d(p_error_here(p3, "expected `{` to start impl body"))
+              } else {
+                let p4 = p_skip_newlines(p_advance(p3))
+                let methods_r = parse_impl_methods(p4, [])
+                match methods_r.r {
+                  None -> err_d(methods_r.p)
+                  Some(ms) -> {
+                    let ms2 = prepend_impl_tparams_to_methods(impl_tparams, ms)
+                    ok_d(methods_r.p, DImpl(pname, target_ty, ms2, t.line, t.col))
+                  }
+                }
+              }
             }
           }
         }
       }
     }
+  }
+}
+
+# m12.8 phase 2: prepend the impl-level tparams to each method's own
+# tparams. Caller has already validated method shape (parse_impl_methods
+# only emits DFn nodes).
+fn prepend_impl_tparams_to_methods(impl_tps: [String], ms: [Decl]) : [Decl] {
+  match impl_tps {
+    [] -> ms
+    _  -> map(ms, (d) => prepend_impl_tparams_to_method(impl_tps, d))
+  }
+}
+
+fn prepend_impl_tparams_to_method(impl_tps: [String], d: Decl) : Decl {
+  match d {
+    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
+      DFn(pub_, n, list_append(impl_tps, tps), ps, ret, row, body, l, c)
+    _ -> d
   }
 }
 
@@ -4972,12 +5011,18 @@ fn prelude_names() : [String] {
     # user-visible prelude. It was implemented as an emit-time
     # identity special case (no kai_prelude_unitless runtime fn),
     # which made first-class use (`x |> unitless`, `let f = unitless`)
-    # crash at C compile. The emit special cases below are kept as
-    # dead code in case a future internal compiler pass needs to
-    # re-introduce a named erasure intrinsic.
+    # crash at C compile. The emit special cases below were repurposed
+    # for `__strip_unit`, the typer-internal erasure intrinsic that
+    # the parametric `impl Show for Real[u: Unit]` body uses to feed
+    # `Real<u>` into `real_to_string : Real -> String`.
     # m12.8.x phase 2 (Gap 1): compile-time unit reflection;
     # emitter lowers to a constant String literal.
-    "unit_name"
+    "unit_name",
+    # m12.8 phase 2: typer-internal erasure of the unit annotation on a
+    # dimensioned Real. NOT for user code — the `__` prefix marks it as
+    # a compiler-generated name. Used by the parametric Show impl in
+    # stdlib/protocols.kai to revive the dead `unitless` emit identity.
+    "__strip_unit"
   ]
 }
 
@@ -5807,15 +5852,17 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
           ])
           _   -> "kai_unit() /* __perceus_dup: arity mismatch */"
         }
-      } else if callee == "unitless" {
-        # m12.5: `unitless(x)` is the type-level escape from a
-        # dimensioned to a bare numeric. At runtime it is identity —
-        # units carry no representation, so the lowered call is
-        # exactly the inner expression. No `kai_prelude_unitless`
-        # runtime function is needed.
+      } else if callee == "__strip_unit" {
+        # m12.8 phase 2: typer-internal erasure of the unit annotation
+        # on `Real<u>`. At runtime it is identity — units carry no
+        # representation, so the lowered call is exactly the inner
+        # expression. Inherits the original `unitless` emit shape
+        # (Bug 8 retired the user-visible name; the parametric Show
+        # impl in stdlib/protocols.kai now uses this intrinsic to feed
+        # `Real<u>` into `real_to_string : Real -> String`).
         match args_e {
           [a] -> emit_expr(src, a, fns, variants, lams)
-          _   -> "kai_unit() /* unitless: expected 1 arg */"
+          _   -> "kai_unit() /* __strip_unit: expected 1 arg */"
         }
       } else if callee == "unit_name" {
         # m12.8.x phase 2 (Gap 1, partial): compile-time reflection
@@ -10647,7 +10694,16 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     # (the protocol-impl-generic case), the empty string is emitted.
     TyEntry { name: "unit_name",
               scheme: scheme_uvars([], [], [0],
-                fn_ty([TyDimT(TyReal, UVar(0))], TyString)) }
+                fn_ty([TyDimT(TyReal, UVar(0))], TyString)) },
+    # m12.8 phase 2: typer-internal erasure of the unit annotation on
+    # a dimensioned Real. Polymorphic in the unit-var so the call site
+    # can pass `Real<USD>`, `Real<EUR>`, etc. and recover bare `Real`
+    # for use with `real_to_string`. Not part of the user-facing
+    # surface (the `__` prefix is the convention for compiler-internal
+    # names).
+    TyEntry { name: "__strip_unit",
+              scheme: scheme_uvars([], [], [0],
+                fn_ty([TyDimT(TyReal, UVar(0))], TyReal)) }
   ]
   TyEnv { entries: list_append(es, env.entries), fresh: env.fresh }
 }
@@ -18092,8 +18148,9 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
         let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
                                 llvm_format_args(ra.regs), ")\n"])
         llvm_set_last(llvm_append_body(r.e, instr), r.reg)
-      } else if nm == "unitless" {
-        # m12.5: identity at runtime — emit the inner value directly.
+      } else if nm == "__strip_unit" {
+        # m12.8 phase 2: identity at runtime — emit the inner value
+        # directly. See the matching C-emit branch for full context.
         match xs {
           [a] -> llvm_emit_expr(e, a)
           _   -> llvm_set_last(e, "undef")
@@ -21670,11 +21727,24 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
             Some(ty) -> match ty_head_name(ty) {
               None -> None
               Some(tname) -> {
-                match find_impl(reg, opname, tname) {
-                  None -> None
-                  Some(impl_fn) -> {
-                    let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
-                    Some(ECall(new_callee, args_))
+                # m12.8 phase 2: special-case `show(x)` when `x : Real<u>`
+                # with a concrete unit name. The parametric impl body in
+                # stdlib/protocols.kai cannot bake the unit suffix on its
+                # own (the body's `x.ty` keeps the impl-level UVar even
+                # after inference, since the m4c monomorphiser is still
+                # identity), so we synthesise the unit-aware expression
+                # at the call site using the concrete arg type. Bare
+                # `Real` falls through to the parametric body, which
+                # returns just `real_to_string(x)` because `unit_name(x)`
+                # emits "" for unresolved units.
+                match try_rewrite_show_dim_real(opname, self_arg) {
+                  Some(rk) -> Some(rk)
+                  None -> match find_impl(reg, opname, tname) {
+                    None -> None
+                    Some(impl_fn) -> {
+                      let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
+                      Some(ECall(new_callee, args_))
+                    }
                   }
                 }
               }
@@ -21685,6 +21755,41 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
     }
     _ -> None
   }
+}
+
+# m12.8 phase 2: synthesise `string_concat(real_to_string(__strip_unit(arg)),
+# " <UNIT>")` when the call is `show(arg)` and `arg : Real<u>` with a
+# concrete unit. Returns None for bare `Real` / `Real<1>` / unresolved
+# UVar — those cases either have nothing to suffix or cannot determine
+# the unit at compile time, so they fall back to the parametric impl
+# body's `real_to_string` path.
+fn try_rewrite_show_dim_real(opname: String, arg: Expr) : Option[ExprKind] {
+  if opname != "show" { None }
+  else { match arg.ty {
+    Some(t) -> match t {
+      TyDimT(base, _) -> match base {
+        TyReal -> {
+          let unit_str = unit_name_of_ty(arg.ty)
+          if string_length(unit_str) == 0 { None }
+          else {
+            let line = arg.line
+            let col = arg.col
+            let strip = mk_expr(ECall(mk_expr(EVar("__strip_unit"), line, col),
+                                       [arg]), line, col)
+            let bare  = mk_expr(ECall(mk_expr(EVar("real_to_string"), line, col),
+                                       [strip]), line, col)
+            let suffix_span = concat_all(["\" ", unit_str, "\""])
+            let suffix = mk_expr(EStr(suffix_span, false), line, col)
+            Some(ECall(mk_expr(EVar("string_concat"), line, col),
+                        [bare, suffix]))
+          }
+        }
+        _ -> None
+      }
+      _ -> None
+    }
+    None -> None
+  } }
 }
 
 # Strip the `__proto_` dispatcher prefix the rename pass attaches.
