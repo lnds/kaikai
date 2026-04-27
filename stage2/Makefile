@@ -10,7 +10,7 @@ SRC     := compiler.kai
 # feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
 STACK := ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop test-stdlib test-protocols selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop test-stdlib test-protocols test-demos-core selfhost
 
 all: $(TARGET)
 
@@ -1221,7 +1221,55 @@ selfhost-llvm: $(TARGET) build
 	  && echo "llvm self-hosting fixed point: OK" \
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols
+# m12.8 Phase 3 — Core demos. Each demo lives in its own
+# `examples/<name>/<name>.kai` directory, ships an `<name>.out.expected`
+# golden, and (if the demo reads stdin) an `<name>.in` fixture fed via
+# shell redirect. Builds each demo with the same `--prelude` chain
+# `bin/kai` uses (core + protocols + effects), runs both backends, and
+# diffs the output. Drives the "Core REOPENED" automatable golden gate
+# Eric called for in the m12.8 review.
+DEMOS_CORE := portfolio usd_to_eur
+
+test-demos-core: $(TARGET) build
+	@$(STACK) set -e; \
+	for name in $(DEMOS_CORE); do \
+	  src=../examples/$$name/$$name.kai; \
+	  exp=../examples/$$name/$$name.out.expected; \
+	  in=../examples/$$name/$$name.in; \
+	  if [ ! -f $$src ]; then echo "demos-core FAIL $$name (missing $$src)"; exit 1; fi; \
+	  if [ ! -f $$exp ]; then echo "demos-core FAIL $$name (missing $$exp)"; exit 1; fi; \
+	  preludes="--prelude ../stdlib/core.kai --prelude ../stdlib/protocols.kai --prelude ../stdlib/effects.kai"; \
+	  ./$(TARGET) $$preludes $$src > build/demo-$$name.c \
+	    || { echo "demos-core FAIL $$name (kaic2 errored)"; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/demo-$$name.c -o build/demo-$$name \
+	    || { echo "demos-core FAIL $$name (C compile failed)"; exit 1; }; \
+	  if [ -f $$in ]; then \
+	    ./build/demo-$$name < $$in > build/demo-$$name.out \
+	      || { echo "demos-core FAIL $$name (run errored)"; cat build/demo-$$name.out; exit 1; }; \
+	  else \
+	    ./build/demo-$$name > build/demo-$$name.out \
+	      || { echo "demos-core FAIL $$name (run errored)"; cat build/demo-$$name.out; exit 1; }; \
+	  fi; \
+	  diff -q $$exp build/demo-$$name.out > /dev/null \
+	    && echo "demos-core OK $$name (C)" \
+	    || { echo "demos-core DIFF $$name (C)"; diff $$exp build/demo-$$name.out; exit 1; }; \
+	  ./$(TARGET) --emit=llvm $$preludes $$src > build/demo-$$name.ll \
+	    || { echo "demos-core FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/demo-$$name.ll ../stage0/runtime_llvm.c -o build/demo-$$name-llvm 2>/dev/null \
+	    || { echo "demos-core FAIL $$name (LLVM compile failed)"; exit 1; }; \
+	  if [ -f $$in ]; then \
+	    ./build/demo-$$name-llvm < $$in > build/demo-$$name-llvm.out \
+	      || { echo "demos-core FAIL $$name (LLVM run errored)"; cat build/demo-$$name-llvm.out; exit 1; }; \
+	  else \
+	    ./build/demo-$$name-llvm > build/demo-$$name-llvm.out \
+	      || { echo "demos-core FAIL $$name (LLVM run errored)"; cat build/demo-$$name-llvm.out; exit 1; }; \
+	  fi; \
+	  diff -q $$exp build/demo-$$name-llvm.out > /dev/null \
+	    && echo "demos-core OK $$name (LLVM)" \
+	    || { echo "demos-core DIFF $$name (LLVM)"; diff $$exp build/demo-$$name-llvm.out; exit 1; }; \
+	done
+
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols test-demos-core
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -1230,7 +1278,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols test-demos-core
 
 clean:
 	rm -rf build $(TARGET)
