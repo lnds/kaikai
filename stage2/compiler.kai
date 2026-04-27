@@ -6931,6 +6931,64 @@ fn op_qualified_names_for(eff_name: String, ops: [EffectOp], acc: [String]) : [S
   }
 }
 
+# m12.8 Phase 4b: (op_name, eff_name) pairs collected from every
+# DEffect in the program. Used to resolve alias-qualified op calls
+# (`Console.print` → `Stdout.print`, `Io.read_line` → `Stdin.read_line`).
+type OpToEff = OEFP(String, String)
+
+fn collect_op_to_eff(decls: [Decl]) : [OpToEff] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, eff_name, _, ops, _, _) ->
+        list_append(ops_to_eff_pairs(eff_name, ops),
+                    collect_op_to_eff(rest))
+      _ -> collect_op_to_eff(rest)
+    }
+  }
+}
+
+fn ops_to_eff_pairs(eff_name: String, ops: [EffectOp]) : [OpToEff] {
+  match ops {
+    [] -> []
+    [op, ...rest] -> match op {
+      EOp(op_name, _, _, _, _, _) ->
+        [OEFP(op_name, eff_name), ...ops_to_eff_pairs(eff_name, rest)]
+    }
+  }
+}
+
+# Returns Some(eff_name) if some component of the alias provides op_name.
+# When multiple components share an op_name (currently impossible in
+# the catalog — Stdout.print, Stderr.eprint, Stdin.read_line, etc., are
+# disjoint), the leftmost component wins. The check is case-sensitive.
+fn find_eff_for_alias_op(components: [String], op_to_eff: [OpToEff], op_name: String) : Option[String] {
+  match components {
+    [] -> None
+    [c, ...rest] ->
+      if eff_has_op(c, op_name, op_to_eff) { Some(c) }
+      else { find_eff_for_alias_op(rest, op_to_eff, op_name) }
+  }
+}
+
+fn eff_has_op(eff_name: String, op_name: String, op_to_eff: [OpToEff]) : Bool {
+  match op_to_eff {
+    [] -> false
+    [oe, ...rest] -> match oe {
+      OEFP(o, e) ->
+        if o == op_name and e == eff_name { true }
+        else { eff_has_op(eff_name, op_name, rest) }
+    }
+  }
+}
+
+# m12.8 Phase 4b: alias-aware op-call resolution lives inside
+# `try_op_call` (typer) and `desugar_op_calls_callee` (emit) instead
+# of as a standalone walker — a separate pre-pass blew the selfhost
+# stack when traversing compiler.kai's deep AST. The helpers
+# `find_alias` / `find_eff_for_alias_op` / `eff_has_op` (defined
+# above) are consulted at each call site.
+
 fn collect_op_qualified_names(decls: [Decl]) : [String] {
   match decls {
     [] -> []
@@ -12394,7 +12452,20 @@ type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs
                     # bodies — `e!` propagates from the enclosing
                     # function, not from a closure, so `!` inside a
                     # lambda is rejected with a clear diagnostic.
-                    ret_ty: Option[Ty] }
+                    ret_ty: Option[Ty],
+                    # m12.8 Phase 4b: type aliases (`type Console =
+                    # Stdout + Stderr + Stdin`, `type Io = Console +
+                    # Env + File`, ...) carried into the typer so
+                    # `try_op_call` can resolve `Aliasname.opname` by
+                    # finding which component effect provides the op.
+                    # Populated from `alias_res.aliases` at the start
+                    # of `infer_program` (or empty).
+                    type_aliases: [AliasResult],
+                    # m12.8 Phase 4b: per-effect op→eff catalog
+                    # consulted alongside `type_aliases` so
+                    # `try_op_call` can answer "which component of
+                    # this alias declares this op?" in O(n*m).
+                    op_to_eff: [OpToEff] }
 
 type OpEffArity = OEA(String, Int)
 
@@ -12446,31 +12517,41 @@ fn infer_state_new(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo]) 
 
 fn infer_state_new_full(file: String, env: TyEnv, prelude_len: Int,
                         recs: [RecInfo], op_eff_arities: [OpEffArity]) : InferState =
+  infer_state_new_full_aliases(file, env, prelude_len, recs, op_eff_arities, [], [])
+
+# m12.8 Phase 4b: variant carrying type aliases + op-to-eff catalog
+# so `try_op_call` can resolve `Aliasname.opname` against alias
+# components. Older callers (no alias context) use the empty form.
+fn infer_state_new_full_aliases(file: String, env: TyEnv, prelude_len: Int,
+                                  recs: [RecInfo], op_eff_arities: [OpEffArity],
+                                  type_aliases: [AliasResult],
+                                  op_to_eff: [OpToEff]) : InferState =
   InferState { file: file, env: env, prelude_len: prelude_len, sub: subst_empty(),
                recs: recs, errs: 0, insts: [], holes: [], row: [],
                eff_uses: [], aliases: [], clause_resume: None,
-               op_eff_arities: op_eff_arities, ret_ty: None }
+               op_eff_arities: op_eff_arities, ret_ty: None,
+               type_aliases: type_aliases, op_to_eff: op_to_eff }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
   InferState { file: st.file, env: new_env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: new_sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
 
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
 
 # m7a #4c / m7b #11i: mark that the current body has performed an op
 # of `eff` with the given type-arg instantiation. Labels with the same
@@ -12486,7 +12567,7 @@ fn st_add_label(st: InferState, lab: Label, line: Int, col: Int) : InferState {
                  eff_uses: [EU(lab.eff, line, col), ...st.eff_uses],
                  aliases: st.aliases,
                  clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                 ret_ty: st.ret_ty }
+                 ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
   }
 }
 
@@ -12591,7 +12672,7 @@ fn st_set_row(st: InferState, new_row: [Label]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: new_row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
 
 # m7a #4e: push/pop the alias stack as we enter/leave a handle's body.
 # m7b #15: a freshly-pushed alias starts taggable; descending into a
@@ -12605,7 +12686,7 @@ fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
                row: st.row, eff_uses: st.eff_uses,
                aliases: [AB(alias, eff, true), ...st.aliases],
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
 
 fn st_pop_alias(st: InferState) : InferState {
   match st.aliases {
@@ -12615,7 +12696,7 @@ fn st_pop_alias(st: InferState) : InferState {
                    recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                    row: st.row, eff_uses: st.eff_uses, aliases: rest,
                    clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                   ret_ty: st.ret_ty }
+                   ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
   }
 }
 
@@ -12625,7 +12706,7 @@ fn st_set_clause_resume(st: InferState, rb: Option[ResumeBind]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: rb, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
 
 # m7e §13: stash/clear/restore the enclosing function's declared
 # return type for `e!` propagation. Set by `infer_decl` before walking
@@ -12636,7 +12717,7 @@ fn st_set_ret_ty(st: InferState, rt: Option[Ty]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: rt }
+               ret_ty: rt, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
 
 fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
   match aliases {
@@ -12673,21 +12754,21 @@ fn st_disable_alias_tag(st: InferState) : InferState =
                row: st.row, eff_uses: st.eff_uses,
                aliases: aliases_disable_tag(st.aliases),
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
 
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
 
 fn st_push_hole(st: InferState, h: HoleSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes],
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
 
 # m7a #8: lookup the recorded first-use line/col of an effect label.
 # Returns (-1, -1) when the effect was never tracked — that should
@@ -12842,7 +12923,9 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     aliases: outer.aliases,
     clause_resume: outer.clause_resume,
     op_eff_arities: outer.op_eff_arities,
-    ret_ty: outer.ret_ty
+    ret_ty: outer.ret_ty,
+    type_aliases: outer.type_aliases,
+    op_to_eff: outer.op_to_eff
   }
 
 # ---- parameter typing ----
@@ -13671,7 +13754,33 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
               # capability shape; for a Reader-bound alias the op
               # is `ask`, not `get`. Remap here so the lookup hits.
               match lookup_alias(st.aliases, name) {
-                None -> None
+                None ->
+                  # m12.8 Phase 4b: try type alias (`type Console =
+                  # Stdout + Stderr + Stdin`, `type Io = Console + Env
+                  # + File`). Find which component effect provides
+                  # `op_name` and retry the lookup with that effect's
+                  # qualified key. Body row label uses the resolved
+                  # effect name so subset checking sees atomic labels
+                  # and the runtime evidence stack is queried with
+                  # the right key. Ambiguity (multiple components
+                  # share an op_name) resolves to the leftmost.
+                  match find_alias(st.type_aliases, name) {
+                    None -> None
+                    Some(AR(_, components)) ->
+                      match find_eff_for_alias_op(components, st.op_to_eff, op_name) {
+                        None -> None
+                        Some(real_eff) -> {
+                          let key2 = string_concat(real_eff, string_concat(".", op_name))
+                          match ty_env_lookup(st.env, key2) {
+                            Some(sc) -> Some(synth_op_call_with_scheme(st, sc, args_, key2, line, col))
+                            None ->
+                              if is_effect_in_env(st.env, real_eff) {
+                                Some(synth_op_call_unknown_op(st, real_eff, op_name, line, col))
+                              } else { None }
+                          }
+                        }
+                      }
+                  }
                 Some(eff) -> {
                   let real_op =
                     if eff == "Reader" and op_name == "get" { "ask" } else { op_name }
@@ -14876,7 +14985,9 @@ fn return_site_of(e: Expr) : Expr {
 }
 
 fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
-              op_eff_arities: [OpEffArity], d: Decl, verbose: Bool) : TypedDecl {
+              op_eff_arities: [OpEffArity],
+              type_aliases: [AliasResult], op_to_eff: [OpToEff],
+              d: Decl, verbose: Bool) : TypedDecl {
   match d {
     DFn(is_pub, nm, tparams, ps, opt_ret, row, body, line, col) -> {
       # m7b #12: row-variable binding context for this decl. The
@@ -14895,7 +15006,8 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       let implicit = collect_implicit_tparams_in_decl(d, tparams)
       let effective_tparams = list_append(tparams, implicit)
       let tpbinds = mk_tpbinds(effective_tparams)
-      let st_init = infer_state_new_full(file, env, prelude_len, recs, op_eff_arities)
+      let st_init = infer_state_new_full_aliases(file, env, prelude_len, recs,
+                                                    op_eff_arities, type_aliases, op_to_eff)
       let st0 = advance_row_fresh(st_init, list_length(rbinds))
       # m7b #13 follow-up (surfaced by m8 #3's typed Spawn wrappers):
       # mk_tpbinds allocates ids 0..n-1 for the fn-level tparams, but
@@ -15290,7 +15402,9 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
                    op_eff_arities: [OpEffArity],
                    ds: [Decl], verbose: Bool,
                    acc_decls: [Decl], acc_errs: Int, acc_insts: [ResolvedCS],
-                   acc_holes: [ResolvedHole]) : TypedProgram {
+                   acc_holes: [ResolvedHole],
+                   type_aliases: [AliasResult],
+                   op_to_eff: [OpToEff]) : TypedProgram {
   match ds {
     [] -> TypedProgram {
       decls: list_reverse(acc_decls), errs: acc_errs,
@@ -15298,12 +15412,14 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       prelude_len: prelude_len
     }
     [d, ...rest] -> {
-      let r = infer_decl(file, env, prelude_len, recs, op_eff_arities, d, verbose)
+      let r = infer_decl(file, env, prelude_len, recs, op_eff_arities,
+                          type_aliases, op_to_eff, d, verbose)
       infer_all_loop(file, env, prelude_len, recs, op_eff_arities, rest, verbose,
                      [r.decl, ...acc_decls],
                      acc_errs + r.errs,
                      llvm_prepend_reverse(r.insts, acc_insts),
-                     prepend_reverse_holes(r.holes, acc_holes))
+                     prepend_reverse_holes(r.holes, acc_holes),
+                     type_aliases, op_to_eff)
     }
   }
 }
@@ -15607,8 +15723,19 @@ fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram {
   let decls_a = expand_unit_aliases_decls(decls, aliases)
   let built = build_ty_env(decls_a)
   let recs = collect_records(decls_a)
+  # m12.8 Phase 4b: rebuild the type-alias resolution table here so
+  # `try_op_call` can resolve `Aliasname.opname` for aliases like
+  # `Console = Stdout + Stderr + Stdin` and `Io = Console + Env +
+  # File`. The work duplicates `compile_source`'s alias resolution
+  # but avoids threading 10+ call sites with two extra parameters.
+  let alias_cands = collect_alias_cands(decls_a)
+  let eff_names_for_alias = list_append(builtin_effect_names(),
+                                          collect_effect_names(decls_a))
+  let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, file)
+  let op_to_eff = collect_op_to_eff(decls_a)
   infer_all_loop(file, built.env, built.prelude_len, recs,
-                 built.op_eff_arities, decls_a, verbose, [], 0, [], [])
+                 built.op_eff_arities, decls_a, verbose, [], 0, [], [],
+                 alias_res.aliases, op_to_eff)
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int {
