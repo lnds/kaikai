@@ -994,20 +994,27 @@ post-Core REOPEN by `linus` and `eric` agents (independently);
 deferred from Core because they had no feature upside on the
 Core lane itself.
 
-- **`map_expr_kind` shared AST visitor refactor**. Today every
-  AST-walking pass (`rename_proto_calls`, `pcs_rewrite`,
-  `desugar_*`, `validate_resolved_protocols`,
-  `validate_typer_invariants`, etc.) hand-rolls structural
-  recursion over `ExprKind` with its own `_ -> k` catch-all. The
-  wildcard audit in `7bd5a68` is manual proof the pattern is
-  duplicated 10x. Adding a new `ExprKind` variant (m7e
-  `variants[T]()`, m8 actor primitives, m12.6 refinement carriers)
-  re-introduces the same `_ -> k` debt across all 10 sites.
-  Estimated 2-3 days, cross-cuts every pass, no feature-side
-  payoff in isolation. Eric's specific framing: "prerequisite to
-  landing actors without creating the same `_ -> k` debt a third
-  time." Pinned here so the next contributor doing actor lanes
-  knows to land it first.
+- **`map_expr_kind` shared AST visitor refactor — LANDED
+  2026-04-27.** The 10 walker passes catalogued in `7bd5a68`
+  (`rewrite_alias`, `desugar_op_calls`, `desugar_index`,
+  `specialise`, `desugar_var`, `desugar_interp`, `finalise_typed`,
+  `pcs_rewrite`, `rename_proto_calls`, `resolve_protocol_calls`)
+  all delegate their structural recursion to `map_expr_kind` and
+  its sibling helpers (`map_stmt_exprs`, `map_arm_exprs`,
+  `map_field_exprs`, `map_elem_exprs`, `map_clause_exprs`,
+  `map_opt_return_exprs`, `map_return_exprs`, `map_opt_expr`).
+  Each walker keeps explicit cases only for kinds it actually
+  transforms or that need scope-aware bookkeeping; everything
+  else falls through to the visitor. Adding a new `ExprKind`
+  variant (m7e `variants[T]()`, m12.6 refinement carriers, future
+  actor primitives) now breaks the compiler at the visitor's
+  match site instead of silently degrading ten walkers.
+  Net: −1031 / +236 lines in `stage2/compiler.kai`, 12 commits
+  (1 abstraction + 10 walker migrations + this doc + cleanup).
+  Selfhost C + LLVM byte-identical fixed point at every step;
+  `make demos-no-regression` (baseline 18) clean;
+  `make -C stage2 test-aspirational` clean. Walker invariant (b)
+  in `validate_typer_invariants` still passes.
 
 ## What stage 2 deliberately does not ship
 
