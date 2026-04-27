@@ -9271,88 +9271,20 @@ fn desugar_interp_expr(e: Expr, op_names: [String]) : Expr =
   Expr { kind: desugar_interp_kind(e.kind, op_names, e.line, e.col),
          line: e.line, col: e.col, ty: e.ty }
 
-fn desugar_interp_opt(o: Option[Expr], op_names: [String]) : Option[Expr] {
-  match o {
-    Some(e) -> Some(desugar_interp_expr(e, op_names))
-    None    -> None
-  }
-}
-
-fn desugar_interp_exprs(xs: [Expr], op_names: [String]) : [Expr] =
-  map(xs, (e) => desugar_interp_expr(e, op_names))
-
-fn desugar_interp_arms(arms: [Arm], op_names: [String]) : [Arm] =
-  map(arms, (a) => desugar_interp_arm(a, op_names))
-
-fn desugar_interp_arm(a: Arm, op_names: [String]) : Arm {
-  match a {
-    Arm(p, g, b) -> Arm(p, desugar_interp_opt(g, op_names),
-                         desugar_interp_expr(b, op_names))
-  }
-}
-
-fn desugar_interp_stmts(ss: [Stmt], op_names: [String]) : [Stmt] =
-  map(ss, (st_) => desugar_interp_stmt(st_, op_names))
-
-fn desugar_interp_stmt(st_: Stmt, op_names: [String]) : Stmt {
-  match st_ {
-    SLet(p, ann, rhs) -> SLet(p, ann, desugar_interp_expr(rhs, op_names))
-    SAssert(c, m) -> SAssert(desugar_interp_expr(c, op_names),
-                              desugar_interp_opt(m, op_names))
-    SExprStmt(x) -> SExprStmt(desugar_interp_expr(x, op_names))
-    SIndexAssign(b, i, v, l, c) ->
-      SIndexAssign(desugar_interp_expr(b, op_names),
-                   desugar_interp_expr(i, op_names),
-                   desugar_interp_expr(v, op_names), l, c)
-    SVar(n, ty, rhs, l, c) ->
-      SVar(n, ty, desugar_interp_expr(rhs, op_names), l, c)
-  }
-}
-
-fn desugar_interp_clauses(cs: [HClause], op_names: [String]) : [HClause] =
-  map(cs, (c) => desugar_interp_clause(c, op_names))
-
-fn desugar_interp_clause(c: HClause, op_names: [String]) : HClause {
-  match c {
-    HC(n, ps, b, l, co) -> HC(n, ps, desugar_interp_expr(b, op_names), l, co)
-  }
-}
-
-fn desugar_interp_opt_return(o: Option[HReturn], op_names: [String]) : Option[HReturn] {
-  match o {
-    Some(r) -> Some(desugar_interp_return(r, op_names))
-    None    -> None
-  }
-}
-
-fn desugar_interp_return(r: HReturn, op_names: [String]) : HReturn {
-  match r {
-    HR(p, b, l, c) -> HR(p, desugar_interp_expr(b, op_names), l, c)
-  }
-}
-
-fn desugar_interp_fields(fs: [FieldInit], op_names: [String]) : [FieldInit] =
-  map(fs, (f) => desugar_interp_field(f, op_names))
-
-fn desugar_interp_field(f: FieldInit, op_names: [String]) : FieldInit {
-  match f {
-    FI(n, v) -> FI(n, desugar_interp_expr(v, op_names))
-  }
-}
-
-fn desugar_interp_elems(els: [ListElem], op_names: [String]) : [ListElem] =
-  map(els, (el) => desugar_interp_elem(el, op_names))
-
-fn desugar_interp_elem(el: ListElem, op_names: [String]) : ListElem {
-  match el {
-    ElPlain(x)  -> ElPlain(desugar_interp_expr(x, op_names))
-    ElSpread(x) -> ElSpread(desugar_interp_expr(x, op_names))
-  }
-}
-
 fn desugar_interp_kind(k: ExprKind, op_names: [String],
                         line: Int, col: Int) : ExprKind {
   match k {
+    # The two kinds the pass actually transforms:
+    #   * EStr with `#{...}` interpolation lifts into a
+    #     `string_concat_all([...])` call so the typer sees the
+    #     interp body's typed expressions and protocol ops route
+    #     through the user's `impl Show for T`.
+    #   * ECall whose callee is `EField(receiver, op_name)` for an
+    #     op_name in `op_names` (a declared protocol op) rewrites
+    #     to `__proto_<op>(receiver, ...args)` so the post-inference
+    #     rewrite can route the call to the matching impl. Records
+    #     that happen to carry a field with the same name as a
+    #     protocol op shadow this rule.
     EStr(span, is_triple) -> {
       let n = string_length(span)
       let body_start = if is_triple { 3 } else { 1 }
@@ -9361,63 +9293,22 @@ fn desugar_interp_kind(k: ExprKind, op_names: [String],
         lift_interp_string(span, body_start, body_end, op_names, line, col)
       } else { k }
     }
-    # m12.8.x phase 2 (Bug 5): postfix `x.op(args)` method-call
-    # sugar. When the callee is `EField(receiver, op_name)` and
-    # `op_name` is a protocol op declared in this compilation unit,
-    # rewrite to `ECall(EVar(__proto_<op>), [receiver, ...args])`.
-    # The post-inference rewrite then routes each call to the
-    # matching `__pimpl_<P>_<T>_<op>` direct call as if the user
-    # had written `op(receiver, ...args)`. Records that happen to
-    # carry a field named the same as a protocol op shadow this
-    # rule — same limitation as the existing rename pass; users
-    # hit it iff they declare a field whose name is a protocol op,
-    # which is unusual.
     ECall(c, args_) -> match c.kind {
       EField(receiver, op_name) ->
         if list_has(op_names, op_name) {
           let new_callee = mk_expr(EVar(proto_dispatcher_name(op_name)),
                                     c.line, c.col)
           let new_recv   = desugar_interp_expr(receiver, op_names)
-          let new_args   = desugar_interp_exprs(args_, op_names)
+          let new_args   = map(args_, (a) => desugar_interp_expr(a, op_names))
           ECall(new_callee, [new_recv, ...new_args])
         } else {
           ECall(desugar_interp_expr(c, op_names),
-                desugar_interp_exprs(args_, op_names))
+                map(args_, (a) => desugar_interp_expr(a, op_names)))
         }
       _ -> ECall(desugar_interp_expr(c, op_names),
-                  desugar_interp_exprs(args_, op_names))
+                  map(args_, (a) => desugar_interp_expr(a, op_names)))
     }
-    EBlock(ss, t) -> EBlock(desugar_interp_stmts(ss, op_names),
-                             desugar_interp_opt(t, op_names))
-    EIf(c, t_, eo) -> EIf(desugar_interp_expr(c, op_names),
-                          desugar_interp_expr(t_, op_names),
-                          desugar_interp_opt(eo, op_names))
-    EBinop(op, a, b) -> EBinop(op, desugar_interp_expr(a, op_names),
-                                    desugar_interp_expr(b, op_names))
-    EUnop(op, x) -> EUnop(op, desugar_interp_expr(x, op_names))
-    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(desugar_interp_expr(body, op_names), eff_name, eff_tyargs,
-              desugar_interp_opt(init_opt, op_names), alias_opt,
-              desugar_interp_clauses(clauses, op_names),
-              desugar_interp_opt_return(ret_opt, op_names))
-    ELambda(ps, b) -> ELambda(ps, desugar_interp_expr(b, op_names))
-    EMatch(scr, arms) -> EMatch(desugar_interp_expr(scr, op_names),
-                                 desugar_interp_arms(arms, op_names))
-    EPipe(a, b) -> EPipe(desugar_interp_expr(a, op_names),
-                          desugar_interp_expr(b, op_names))
-    EField(base, fname) -> EField(desugar_interp_expr(base, op_names), fname)
-    EIndex(a, b) -> EIndex(desugar_interp_expr(a, op_names),
-                            desugar_interp_expr(b, op_names))
-    ERecordLit(name, fields) ->
-      ERecordLit(name, desugar_interp_fields(fields, op_names))
-    EList(elems) -> EList(desugar_interp_elems(elems, op_names))
-    ERange(a, b, opt_step) ->
-      ERange(desugar_interp_expr(a, op_names),
-             desugar_interp_expr(b, op_names),
-             desugar_interp_opt(opt_step, op_names))
-    EBang(inner) -> EBang(desugar_interp_expr(inner, op_names))
-    ELitUnit(inner, u) -> ELitUnit(desugar_interp_expr(inner, op_names), u)
-    _ -> k
+    _ -> map_expr_kind(k, (sub) => desugar_interp_expr(sub, op_names))
   }
 }
 
