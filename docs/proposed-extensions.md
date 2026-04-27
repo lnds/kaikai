@@ -1395,6 +1395,13 @@ already implied.
 
 ## 25. `use Effect` — open an effect in scope
 
+**Status: LANDED 2026-04-27** as Full lane 1.4. File-level and
+block-level forms shipped together; alias forms (`use Eff as
+Name`) are not part of v1. The desugar runs after
+`desugar_var_decls` and before `lower_protocols`, threading a
+block-scoped opens stack through every fn body and respecting
+pat/param bindings as shadows.
+
 ```kai
 # file-level — applies to every fn in the file
 use Console
@@ -1486,13 +1493,62 @@ without qualifier. The mechanism is identical to those
 languages, applied to *effects* rather than modules — the
 underlying resolution mechanism is the same.
 
-**Cost**: low. ~0.5 day.
-**Depends on**: m7a (effect rows + cap selectors) ✓.
+### Implementation summary (post-landing)
 
-**Decision posture**: scheduled for m7e alongside #24
-(`main()` row inference). The two ergonomic wins compose into
-"hello-world is one line" — the most-asked first impression of
-any new language.
+- `TkUse` keyword + lexer; `DUse(name, line, col)` Decl;
+  `SUse(name, line, col)` Stmt. Effect names must start uppercase
+  (matches the existing convention).
+- `desugar_use_decls` builds an effect→ops table from every
+  `DEffect` in scope (post-`inject_builtin_effects`, so builtins
+  are present), collects the file-level opens from `DUse`, and
+  walks every fn body. The walker threads a `bound` set through
+  pattern bindings, lambda params, handler clause params,
+  return-clause binders, and handler aliases — these all shadow
+  opens. `EVar(name)` not in the bound set rewrites to
+  `EField(EVar(eff), name)` when exactly one open owns the name;
+  zero owners leaves the bare name alone (downstream resolver
+  handles the "undefined name" case); two or more owners emit
+  the ambiguity diagnostic.
+- `EBlock` walking strips `SUse` from the output and pushes the
+  named effect onto a per-block opens stack for the rest of the
+  block (subsequent stmts + tail expr).
+- Empty effect (`use NoSuchEffect`) is validated against the table
+  before any rewrite runs.
+- Downstream `desugar_op_calls` flattens `EField(EVar(eff), name)`
+  to `EVar("eff.name")` as it does for explicitly-qualified call
+  sites.
+
+### Fixtures
+
+- `examples/sugars/use_file_level.kai` — top-level `use Stdout`,
+  `print(...)` resolves in two fn bodies, dual-backend golden.
+- `examples/sugars/use_block_level.kai` — `use Stderr` inside
+  `shout`'s body; sibling `quiet` and `main` still use
+  `Stdout.print(...)` qualified. Verifies block scoping.
+- `examples/sugars/use_ambiguous.kai` — declares `effect MyEff
+  { print(s: String) : Unit }` alongside `use Stdout` + `use
+  MyEff`; rejects with "ambiguous bare name `print`".
+- `examples/sugars/use_undeclared.kai` — `use NoSuchEffect`
+  rejects with "no effect named ... is in scope".
+
+### Constraints not lifted in v1
+
+- **No `use Eff as Name` alias form.** A future iteration can add
+  it; the parser is the only piece that needs to grow.
+- **Aliases of effects (`type Console = Stdout + Stderr +
+  Stdin`)** are not openable with `use Console` — the table only
+  has `DEffect` decls. `use Stdout` / `use Stderr` / `use Stdin`
+  are the workaround. The desugar reports "no effect named
+  Console" at this stage. Lifting this restriction means
+  flattening the alias graph into the open-set, which is
+  mechanical and can ship later.
+
+**Cost (historical)**: low. The ergonomic shape was right on the
+0.5-day estimate; the bulk of the lane went into the
+exhaustive-match arm additions for SUse/DUse across the 14
+non-walker sites that were never visited by `map_expr_kind`.
+
+**Depends on**: m7a (effect rows + cap selectors) ✓.
 
 ## 26. Protocols — single-dispatch ad-hoc polymorphism
 

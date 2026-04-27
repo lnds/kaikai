@@ -972,7 +972,8 @@ What is **not** in Core but is part of Full:
 
 - Remaining m7e items: ~~`variants[T]()`~~ (landed 2026-04-27 as
   Full lane 1.3, see `docs/proposed-extensions.md` §11),
-  main-row inference, `use Effect`.
+  main-row inference, ~~`use Effect`~~ (landed 2026-04-27 as Full
+  lane 1.4, see `docs/proposed-extensions.md` §25).
 - m7f LLM affordances: `kai effects --json`, `?e` effect holes,
   `import ?name`, method refs as values.
 - Refinement types and Eiffel-style contracts (m12.6).
