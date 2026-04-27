@@ -12925,13 +12925,54 @@ fn synth(st: InferState, e: Expr) : Inferred {
     # always EInt or EReal; the literal's type is `TyDimT(base, u)`
     # where base is TyInt or TyReal and u is the canonical unit.
     ELitUnit(inner, u) -> synth_lit_unit(st, inner, u, e.line, e.col)
-    # m7e §11: `variants[T]()`. Real typing (`TyListT(TyCon(T, []))`
-    # after validating T is a nullary-only sum type) lands in the
-    # task-15 typer lane; this site keeps the match exhaustive with
-    # a TyAny stub so commits before that lane still build. TyAny
-    # unifies with anything, which is safe for a feature that has
-    # no runtime emission yet (codegen panics — see emit_expr).
-    EVariantsOf(_) -> inferred_leaf(st, TyAny, e)
+    # m7e §11: `variants[T]()`. Validate T is a sum type with
+    # nullary-only variants and stamp the result with `[T]`
+    # (TyListT). Errors yield a TyAny stub so cascade is graceful.
+    EVariantsOf(ty_expr) -> synth_variants_of(st, ty_expr, e)
+  }
+}
+
+# m7e §11 — type `variants[T]()` and validate T's shape.
+# Constraints (Doc: `proposed-extensions.md` §11):
+#   * T resolves to a TyCon (a named user-declared sum type).
+#   * Every variant of T must be nullary (no payload).
+# The first failure yields a single error; subsequent calls fall
+# through to the TyAny stub so we don't cascade noise from one
+# misuse.
+fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred {
+  let ty = resolve_ty(ty_expr)
+  match ty {
+    TyCon(name, _) -> {
+      let vc = check_variants_nullary(st.env, name)
+      match vc {
+        VCOk(_) -> {
+          let result_ty = TyListT(TyCon(name, []))
+          inferred_leaf(st, result_ty, e)
+        }
+        VCNotSum -> {
+          diag_error(st.file, e.line, e.col,
+            "`variants[T]()` requires T to be a declared sum type")
+          diag_note("type: #{ty_to_string(ty)}")
+          diag_help("declare T as `type T = A | B | ...` or use a different builtin")
+          inferred_leaf(st_bump_err(st), TyAny, e)
+        }
+        VCHasPayload(bad) -> {
+          let bad_list = join_with(bad, ", ")
+          diag_error(st.file, e.line, e.col,
+            "`variants[T]()` requires every variant of T to be nullary")
+          diag_note("variants of `#{name}` with payload: #{bad_list}")
+          diag_help("`variants[T]()` lists the inhabitants of a closed sum; this is ill-defined when a variant carries arguments")
+          inferred_leaf(st_bump_err(st), TyAny, e)
+        }
+      }
+    }
+    _ -> {
+      diag_error(st.file, e.line, e.col,
+        "`variants[T]()` requires T to be a named user type")
+      diag_note("type: #{ty_to_string(ty)}")
+      diag_help("T must be a `type T = A | B | ...` declaration; built-ins (Int, String, [a], etc.) are not supported")
+      inferred_leaf(st_bump_err(st), TyAny, e)
+    }
   }
 }
 
@@ -14615,6 +14656,71 @@ fn variants_of_type_loop(es: [TyEntry], target: String, acc: [String]) : [String
 
 fn variants_of_type(env: TyEnv, tycon: String) : [String] =
   variants_of_type_loop(env.entries, tycon, [])
+
+# m7e §11: classify a type's variants for `variants[T]()`. The
+# builtin restricts T to *nullary-only* sum types (Doc:
+# `proposed-extensions.md` §11): once a variant takes arguments,
+# "list all inhabitants" is ill-defined. This walker partitions
+# the env entries that mention `target` as their return tycon
+# into nullary names and payload-bearing names; it also reports
+# the "no such sum type" case (no entry matches at all).
+type VariantsCheck = VCOk([String]) | VCNotSum | VCHasPayload([String])
+
+fn check_variants_nullary(env: TyEnv, target: String) : VariantsCheck {
+  check_variants_nullary_loop(env.entries, target, [], [])
+}
+
+fn check_variants_nullary_loop(es: [TyEntry], target: String,
+                                ok_acc: [String], err_acc: [String]) : VariantsCheck {
+  match es {
+    [] -> {
+      let ok_empty  = match ok_acc  { [] -> true _ -> false }
+      let err_empty = match err_acc { [] -> true _ -> false }
+      if ok_empty and err_empty { VCNotSum }
+      else if err_empty { VCOk(list_reverse(ok_acc)) }
+      else { VCHasPayload(list_reverse(err_acc)) }
+    }
+    [e, ...rest] -> {
+      let first_upper = match char_at(e.name, 0) {
+        Some(c) -> c >= 'A' and c <= 'Z'
+        None    -> false
+      }
+      if first_upper and not string_contains_dot(e.name) {
+        match e.scheme {
+          Scheme(_, _, _, ty) -> match ty {
+            # Zero-arg variant: scheme is the bare TyCon (e.g. `Hearts`
+            # for `type Suit = Hearts | ...`).
+            TyCon(nm, _) ->
+              if nm == target {
+                check_variants_nullary_loop(rest, target, [e.name, ...ok_acc], err_acc)
+              } else {
+                check_variants_nullary_loop(rest, target, ok_acc, err_acc)
+              }
+            # N-ary variant: scheme is a TyFnT returning the target.
+            # Empty args list means nullary; non-empty means payload.
+            TyFnT(args, ret, _) -> match ret {
+              TyCon(nm, _) ->
+                if nm == target {
+                  let args_empty = match args { [] -> true _ -> false }
+                  if args_empty {
+                    check_variants_nullary_loop(rest, target, [e.name, ...ok_acc], err_acc)
+                  } else {
+                    check_variants_nullary_loop(rest, target, ok_acc, [e.name, ...err_acc])
+                  }
+                } else {
+                  check_variants_nullary_loop(rest, target, ok_acc, err_acc)
+                }
+              _ -> check_variants_nullary_loop(rest, target, ok_acc, err_acc)
+            }
+            _ -> check_variants_nullary_loop(rest, target, ok_acc, err_acc)
+          }
+        }
+      } else {
+        check_variants_nullary_loop(rest, target, ok_acc, err_acc)
+      }
+    }
+  }
+}
 
 fn find_missing_variants(needed: [String], arms: [Arm], acc: [String]) : [String] {
   match needed {
