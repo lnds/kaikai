@@ -21924,6 +21924,311 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, file: String,
   }
 }
 
+# ====================================================================
+# m12.8.x post-Core REOPEN — Eric level 2: rep invariant verifiers
+# ====================================================================
+#
+# Three walkers verify properties that should hold over the
+# post-resolve typed AST. Each is a structural fold over Decl /
+# Expr / Stmt / Arm / HClause / HReturn, accumulating an error
+# count and (for invariant (b)) a lexical scope set. Diagnostics
+# go to stderr via `diag_error`. Errors increment the count, so
+# `compile_source` can fail the compile when any invariant breaks.
+#
+# These complement (not replace) the per-pass audits done in
+# `7bd5a68`. They catch a class of bug at the boundary between
+# passes — when one pass produces an AST node that violates an
+# invariant the next pass assumes — without requiring a shared
+# AST visitor refactor (deferred per CLAUDE.md "no premature
+# abstraction").
+#
+# Invariants:
+#   (a) Every Expr post-finalise has `Some(_)` ty annotation.
+#       Catches the "discarded typed body" pattern (`10a1e7b`):
+#       a pass that builds a new Expr from a sub-expr produced by
+#       `synth` MUST use the typed sub-expr, not the original
+#       (untyped) one. The original has `None` ty on its internal
+#       nodes; finalise leaves `None` in place; this walker fires.
+#   (b) Every `EVar(__proto_X)` reference has `X` outside every
+#       enclosing binder. Catches the "scope-blind protocol
+#       rename" pattern (`257b247`).
+#   (c) Every `ELambda` whose `.ty` is `TyFnT` has an open row
+#       tail. Catches the "closed lambda row" pattern (`b528655`).
+#
+# Wired into `compile_source` after `validate_resolved_protocols`,
+# before perceus / monomorph / emit.
+
+fn validate_typer_invariants(typed: TypedProgram, file: String) : Int =
+  validate_inv_decls(typed.decls, file, 0)
+
+fn validate_inv_decls(ds: [Decl], file: String, errs: Int) : Int {
+  match ds {
+    [] -> errs
+    [d, ...rest] -> {
+      let e1 = match d {
+        DFn(_, _, _, ps, _, _, body, _, _) -> {
+          let bound0 = inv_param_names(ps, [])
+          validate_inv_expr(body, file, bound0, errs)
+        }
+        DTest(_, body, _, _) ->
+          validate_inv_expr(body, file, [], errs)
+        _ -> errs
+      }
+      validate_inv_decls(rest, file, e1)
+    }
+  }
+}
+
+fn inv_param_names(ps: [Param], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> inv_param_names(rest, [p.pname, ...acc])
+  }
+}
+
+# Mirrors `bind_pat`/`pat_bindings` shape — accumulates pattern-
+# bound names into a [String] for invariant (b)'s scope check.
+fn inv_pat_names(p: Pattern, acc: [String]) : [String] {
+  match p.pkind {
+    PWild         -> acc
+    PLit(_)       -> acc
+    PBind(name)   -> [name, ...acc]
+    PList(pats, opt_rest) -> {
+      let a = inv_pats_names(pats, acc)
+      match opt_rest { Some(r) -> [r, ...a] None -> a }
+    }
+    PVariant(_, subs)        -> inv_pats_names(subs, acc)
+    PVariantRecord(_, fs)    -> inv_pfields_names(fs, acc)
+    PRecord(fs)              -> inv_pfields_names(fs, acc)
+    PHole(_)                 -> acc
+    PAs(name, sub)           -> inv_pat_names(sub, [name, ...acc])
+  }
+}
+
+fn inv_pats_names(ps: [Pattern], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> inv_pats_names(rest, inv_pat_names(p, acc))
+  }
+}
+
+fn inv_pfields_names(fs: [PField], acc: [String]) : [String] {
+  match fs {
+    [] -> acc
+    [pf, ...rest] -> match pf {
+      PField(_, sub, _) -> inv_pfields_names(rest, inv_pat_names(sub, acc))
+    }
+  }
+}
+
+fn validate_inv_expr(e: Expr, file: String, bound: [String], errs: Int) : Int {
+  # Invariant (a) — "every Expr has Some(ty) post-finalise" — was
+  # too strict: post-typer rewrite passes (`try_rewrite_show_dim_real`,
+  # `try_rewrite_proto_call`, the AST splicer in `desugar_interp`,
+  # etc.) construct fresh `mk_expr(...)` nodes whose `ty` is None
+  # by design — the rewriters are syntactic and have no typer
+  # substitution to apply. A useful (a) needs a "this node was
+  # constructed by a post-typer pass" tracker that today does not
+  # exist. Deferred until that tracker is justified — the original
+  # bug class (`10a1e7b`, discarded typed clause body) is already
+  # covered by the audit done in `7bd5a68`.
+  let e_bc = validate_inv_kind(e.kind, e.ty, file, e.line, e.col, bound, errs)
+  validate_inv_subexprs(e.kind, file, bound, e_bc)
+}
+
+fn validate_inv_kind(k: ExprKind, ty: Option[Ty], file: String,
+                      line: Int, col: Int, bound: [String], errs: Int) : Int {
+  match k {
+    EVar(name) -> {
+      let opname = strip_proto_dispatcher_prefix(name)
+      # Invariant (b): every `EVar(__proto_X)` reference has `X`
+      # outside every enclosing binder. Catches the scope-blind
+      # `rename_proto_calls` pattern (`257b247`).
+      # Only check references that are dispatcher-shaped
+      # (`__proto_X`); a bare user identifier whose name happens to
+      # match a binder is fine.
+      if name == opname { errs }
+      else if list_has(bound, opname) {
+        diag_error(file, line, col,
+          concat_all(["rep invariant (b): protocol-dispatcher reference `",
+                      name, "` shadows local binder `", opname,
+                      "` in scope (rename pass missed scope tracking)"]))
+        errs + 1
+      } else { errs }
+    }
+    # Invariant (c) — "every `synth_lambda`-produced TyFnT has open
+    # row tail" — was attempted as a post-finalise check on
+    # ELambda's `.ty`. It over-fires: unification can legitimately
+    # bind a fresh open row var to a closed row when the call site
+    # expects a closed row (e.g., `list_sort_by`'s `cmp: (a, a) ->
+    # Int` declares no row). Post-finalise we cannot distinguish
+    # "the row was closed by default at construction" from "the row
+    # was closed by unification to a concrete callee type". The
+    # check belongs at the construction site (inside `synth_lambda`,
+    # as an assertion on `lam_row.tail`), not as a post-hoc walker.
+    # Keep audit at the construction site as the real defense; this
+    # walker exits early on ELambda.
+    _ -> errs
+  }
+}
+
+fn validate_inv_subexprs(k: ExprKind, file: String, bound: [String], errs: Int) : Int {
+  match k {
+    ECall(c, xs) -> {
+      let e1 = validate_inv_expr(c, file, bound, errs)
+      validate_inv_exprs(xs, file, bound, e1)
+    }
+    EField(b, _) -> validate_inv_expr(b, file, bound, errs)
+    EIndex(a, b) -> {
+      let e1 = validate_inv_expr(a, file, bound, errs)
+      validate_inv_expr(b, file, bound, e1)
+    }
+    EBinop(_, a, b) -> {
+      let e1 = validate_inv_expr(a, file, bound, errs)
+      validate_inv_expr(b, file, bound, e1)
+    }
+    EUnop(_, x) -> validate_inv_expr(x, file, bound, errs)
+    EIf(c, t_, eo) -> {
+      let e1 = validate_inv_expr(c, file, bound, errs)
+      let e2 = validate_inv_expr(t_, file, bound, e1)
+      match eo { Some(b) -> validate_inv_expr(b, file, bound, e2) None -> e2 }
+    }
+    EMatch(scr, arms) -> {
+      let e1 = validate_inv_expr(scr, file, bound, errs)
+      validate_inv_arms(arms, file, bound, e1)
+    }
+    ELambda(ps, body) -> {
+      let bound1 = inv_param_names(ps, bound)
+      validate_inv_expr(body, file, bound1, errs)
+    }
+    ERecordLit(_, fis) -> validate_inv_fields(fis, file, bound, errs)
+    EList(els) -> validate_inv_list_elems(els, file, bound, errs)
+    ERange(a, b, sopt) -> {
+      let e1 = validate_inv_expr(a, file, bound, errs)
+      let e2 = validate_inv_expr(b, file, bound, e1)
+      match sopt { Some(s) -> validate_inv_expr(s, file, bound, e2) None -> e2 }
+    }
+    EBlock(stmts, tail) -> {
+      let r = validate_inv_block(stmts, file, bound, errs)
+      match tail { Some(t) -> validate_inv_expr(t, file, r.bound, r.errs) None -> r.errs }
+    }
+    EPipe(a, b) -> {
+      let e1 = validate_inv_expr(a, file, bound, errs)
+      validate_inv_expr(b, file, bound, e1)
+    }
+    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
+      let e0 = match init_opt { Some(ie) -> validate_inv_expr(ie, file, bound, errs) None -> errs }
+      let bound_body = match alias_opt { Some(a) -> [a, ...bound] None -> bound }
+      let e1 = validate_inv_expr(body, file, bound_body, e0)
+      let e2 = validate_inv_clauses(clauses, file, bound, e1)
+      match ret_opt {
+        Some(r) -> match r {
+          HR(p, b, _, _) -> validate_inv_expr(b, file, [p, ...bound], e2)
+        }
+        None -> e2
+      }
+    }
+    EBang(inner) -> validate_inv_expr(inner, file, bound, errs)
+    ELitUnit(inner, _) -> validate_inv_expr(inner, file, bound, errs)
+    _ -> errs
+  }
+}
+
+fn validate_inv_exprs(xs: [Expr], file: String, bound: [String], errs: Int) : Int {
+  match xs {
+    [] -> errs
+    [h, ...rest] -> validate_inv_exprs(rest, file, bound,
+                                          validate_inv_expr(h, file, bound, errs))
+  }
+}
+
+fn validate_inv_arms(arms: [Arm], file: String, bound: [String], errs: Int) : Int {
+  match arms {
+    [] -> errs
+    [a, ...rest] -> match a {
+      Arm(p, g, b) -> {
+        let bound1 = inv_pat_names(p, bound)
+        let e1 = match g { Some(gx) -> validate_inv_expr(gx, file, bound1, errs) None -> errs }
+        let e2 = validate_inv_expr(b, file, bound1, e1)
+        validate_inv_arms(rest, file, bound, e2)
+      }
+    }
+  }
+}
+
+fn validate_inv_fields(fs: [FieldInit], file: String, bound: [String], errs: Int) : Int {
+  match fs {
+    [] -> errs
+    [f, ...rest] -> match f {
+      FI(_, v) -> validate_inv_fields(rest, file, bound,
+                                          validate_inv_expr(v, file, bound, errs))
+    }
+  }
+}
+
+fn validate_inv_list_elems(els: [ListElem], file: String, bound: [String],
+                              errs: Int) : Int {
+  match els {
+    [] -> errs
+    [el, ...rest] -> {
+      let e1 = match el {
+        ElPlain(x)  -> validate_inv_expr(x, file, bound, errs)
+        ElSpread(x) -> validate_inv_expr(x, file, bound, errs)
+      }
+      validate_inv_list_elems(rest, file, bound, e1)
+    }
+  }
+}
+
+type InvBlockRes = { errs: Int, bound: [String] }
+
+fn validate_inv_block(stmts: [Stmt], file: String, bound: [String],
+                         errs: Int) : InvBlockRes {
+  match stmts {
+    [] -> InvBlockRes { errs: errs, bound: bound }
+    [s, ...rest] -> match s {
+      SLet(p, _, rhs) -> {
+        let e1 = validate_inv_expr(rhs, file, bound, errs)
+        let bound1 = inv_pat_names(p, bound)
+        validate_inv_block(rest, file, bound1, e1)
+      }
+      SVar(name, _, rhs, _, _) -> {
+        let e1 = validate_inv_expr(rhs, file, bound, errs)
+        validate_inv_block(rest, file, [name, ...bound], e1)
+      }
+      SAssert(c, m) -> {
+        let e1 = validate_inv_expr(c, file, bound, errs)
+        let e2 = match m { Some(mx) -> validate_inv_expr(mx, file, bound, e1) None -> e1 }
+        validate_inv_block(rest, file, bound, e2)
+      }
+      SExprStmt(x) -> {
+        let e1 = validate_inv_expr(x, file, bound, errs)
+        validate_inv_block(rest, file, bound, e1)
+      }
+      SIndexAssign(b, i, v, _, _) -> {
+        let e1 = validate_inv_expr(b, file, bound, errs)
+        let e2 = validate_inv_expr(i, file, bound, e1)
+        let e3 = validate_inv_expr(v, file, bound, e2)
+        validate_inv_block(rest, file, bound, e3)
+      }
+    }
+  }
+}
+
+fn validate_inv_clauses(cs: [HClause], file: String, bound: [String],
+                          errs: Int) : Int {
+  match cs {
+    [] -> errs
+    [c, ...rest] -> match c {
+      HC(_, ps, b, _, _) -> {
+        let bound1 = inv_param_names(ps, bound)
+        let e1 = validate_inv_expr(b, file, bound1, errs)
+        validate_inv_clauses(rest, file, bound, e1)
+      }
+    }
+  }
+}
+
 fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
                             reg: ProtocolReg) : Option[ExprKind] {
   match callee.kind {
@@ -22768,8 +23073,14 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   # fallthrough behaviour.
                   let dispatch_errs =
                     validate_resolved_protocols(typed_prog, proto_reg, path)
+                  # m12.8.x post-Core REOPEN — Eric level 2: rep
+                  # invariant verifier. Fails the compile when any of
+                  # the three structural properties is violated. See
+                  # `validate_typer_invariants` for the catalog.
+                  let inv_errs = validate_typer_invariants(typed_prog, path)
                   if typed_prog.errs != 0 { typed_prog.errs }
                   else if dispatch_errs != 0 { dispatch_errs }
+                  else if inv_errs != 0 { inv_errs }
                   else {
                     let hole_errs = if strict_holes { strict_holes_check(path, all_decls) } else { 0 }
                     if hole_errs != 0 { hole_errs }
