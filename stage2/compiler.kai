@@ -8431,6 +8431,129 @@ fn rewrite_alias_return(r: HReturn, m: AliasMap) : HReturn {
   }
 }
 
+# ---------------------------------------------------------------------------
+# Shared structural map over ExprKind.
+#
+# Background (Full prerequisite 0.1, see `docs/stage2-design.md`):
+# every AST-walking pass used to hand-roll its own structural recursion
+# with a `_ -> k` catch-all over ExprKind. The wildcard audit in
+# `7bd5a68` showed the same pattern duplicated 10x. Adding a new
+# ExprKind variant (m7e variants[T](), refinement carriers, future
+# actor primitives) silently re-introduces the same `_ -> k` debt
+# at every site.
+#
+# `map_expr_kind` is the single point of structural recursion. Each
+# walker handles only the kinds it actually transforms (or that
+# require scope-aware bookkeeping); everything else falls through to
+# `map_expr_kind`, which recurses into sub-Exprs explicitly. Adding
+# a new ExprKind now breaks the compiler at one match site instead
+# of degrading ten walkers.
+#
+# Convention: `f` is a closure that captures the walker's context
+# and threads it through `<walker>_expr`. The closure is responsible
+# for further recursion (i.e., `map_expr_kind` is one-level: it
+# applies `f` to direct children, not to grandchildren).
+#
+# Sub-helpers (`map_stmt_exprs`, `map_arm_exprs`, etc.) replicate
+# the structure for the auxiliary AST nodes that contain Exprs.
+# A pass that needs scope-aware traversal (pattern shadowing in
+# arms, binding shadowing in stmt blocks) handles those nodes
+# explicitly in its own walker and never reaches the helpers below.
+# ---------------------------------------------------------------------------
+fn map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
+  match k {
+    # Leaves: no sub-Expr to recurse into.
+    EInt(_)        -> k
+    EReal(_)       -> k
+    EBool(_)       -> k
+    EChar(_)       -> k
+    EStr(_, _)     -> k
+    EUnit          -> k
+    EVar(_)        -> k
+    EUnder         -> k
+    EPlaceholder   -> k
+    EHole(_)       -> k
+    ETodo(_)       -> k
+    # Composites: apply f to every direct sub-Expr.
+    ECall(callee, args_) -> ECall(f(callee), map(args_, f))
+    EField(base, name)   -> EField(f(base), name)
+    EIndex(a, b)         -> EIndex(f(a), f(b))
+    EBinop(op, a, b)     -> EBinop(op, f(a), f(b))
+    EUnop(op, x)         -> EUnop(op, f(x))
+    EIf(c, t_, eo)       -> EIf(f(c), f(t_), map_opt_expr(eo, f))
+    EMatch(scr, arms)    -> EMatch(f(scr), map(arms, (a) => map_arm_exprs(a, f)))
+    ELambda(ps, b)       -> ELambda(ps, f(b))
+    ERecordLit(name, fs) -> ERecordLit(name, map(fs, (fi) => map_field_exprs(fi, f)))
+    EList(els)           -> EList(map(els, (el) => map_elem_exprs(el, f)))
+    ERange(a, b, opt_step) -> ERange(f(a), f(b), map_opt_expr(opt_step, f))
+    EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => map_stmt_exprs(s, f)),
+                                    map_opt_expr(tail, f))
+    EPipe(a, b)          -> EPipe(f(a), f(b))
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(f(body), eff_name, eff_tyargs,
+              map_opt_expr(init_opt, f), alias_opt,
+              map(clauses, (c) => map_clause_exprs(c, f)),
+              map_opt_return_exprs(ret_opt, f))
+    ELitUnit(inner, u)   -> ELitUnit(f(inner), u)
+    EBang(inner)         -> EBang(f(inner))
+  }
+}
+
+fn map_opt_expr(opt: Option[Expr], f: (Expr) -> Expr) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(f(e))
+    None    -> None
+  }
+}
+
+fn map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
+  match s {
+    SLet(p, ann, rhs)           -> SLet(p, ann, f(rhs))
+    SAssert(c, m)               -> SAssert(f(c), map_opt_expr(m, f))
+    SExprStmt(x)                -> SExprStmt(f(x))
+    SIndexAssign(b, i, v, l, c) -> SIndexAssign(f(b), f(i), f(v), l, c)
+    SVar(n, ty, rhs, l, c)      -> SVar(n, ty, f(rhs), l, c)
+  }
+}
+
+fn map_arm_exprs(a: Arm, f: (Expr) -> Expr) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, map_opt_expr(g, f), f(b))
+  }
+}
+
+fn map_field_exprs(fi: FieldInit, f: (Expr) -> Expr) : FieldInit {
+  match fi {
+    FI(n, v) -> FI(n, f(v))
+  }
+}
+
+fn map_elem_exprs(el: ListElem, f: (Expr) -> Expr) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(f(x))
+    ElSpread(x) -> ElSpread(f(x))
+  }
+}
+
+fn map_clause_exprs(c: HClause, f: (Expr) -> Expr) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, f(b), l, co)
+  }
+}
+
+fn map_opt_return_exprs(opt: Option[HReturn], f: (Expr) -> Expr) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(map_return_exprs(r, f))
+    None    -> None
+  }
+}
+
+fn map_return_exprs(r: HReturn, f: (Expr) -> Expr) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, f(b), l, c)
+  }
+}
+
 fn rewrite_alias_kind(k: ExprKind, m: AliasMap, line: Int, col: Int) : ExprKind {
   match k {
     EField(base, fname) -> match base.kind {
