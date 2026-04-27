@@ -728,3 +728,202 @@ timestamp	cmd	outcome	elapsed_s
 2026-04-26T22:45:58-04:00	make selfhost-llvm	OK	7
 2026-04-26T22:47:26-04:00	test-llvm-coverage	OK	78
 ```
+
+## Phase 4 retake — prelude effect-row enforcement (Bug 6)
+
+Eduardo authorised the stage 1 parser extension that the first
+phase-4 attempt would have needed. With that gate open the lane
+landed the Tier 1 enforcement gap closure: every fn calling
+prelude IO (`print`, `eprint`, `read_line`, `read_file`,
+`write_file`) must now declare the matching effect (`Console`,
+`Stdin`, or `File`) in its row. CLAUDE.md Tier 1 #1 holds for
+new code; selfhost holds; no parity loss.
+
+### Outcome: shipped (with two deferrals)
+
+Shipped in this lane (commit `a251689`):
+- Stage 1 parser tolerance for row syntax (~25 LOC).
+- Stage 2 typer's prelude effect-label injection in
+  `synth_call` (~30 LOC).
+- `inject_builtin_effects` extended to scan every fn's row, not
+  just main's (~50 LOC).
+- Row-polymorphic `each` / `map` / `filter` / `reduce` prelude
+  signatures + `synth_pipe` open-row trick (~30 LOC).
+- 39 helper fns in `stage2/compiler.kai` annotated with
+  `/ Console` (or `/ Console + File`) per their direct prelude
+  calls.
+- 41 example fixtures gained the appropriate row on `main` or
+  helper fn signatures.
+- 4 new fixtures `examples/effects/m12_8_y_phase4_*`:
+  `main_implicit`, `helper_explicit`, `subtyping`,
+  `no_row_negative`.
+
+Deferred (documented in `docs/m12.8-followup.md`):
+- Main row inference. Prototyped a structural body walker
+  (`prelude_eff_walk_*`) that should have fed
+  `inject_builtin_effects` from main's body when `main` lacks
+  a declared row. The walker triggered "non-exhaustive match"
+  panics on certain block shapes (`fn main() : Int { let r = 42
+  ; assert r == 42; r }`). Bisect narrowed it to the
+  `prelude_eff_walk_kind` match — explicitly enumerated all 27
+  ExprKind variants, still panicked. After ~45 minutes of
+  bisecting without root-causing the kaikai-runtime
+  "non-exhaustive match" emit, reverted. Every fixture's `main`
+  declares its row explicitly. The walker functions live on the
+  branch in the `prelude_eff_walk_*` namespace but are
+  unreachable; a future lane can pick a different scan
+  strategy (post-resolution? `fv_expr` reuse?) and avoid the
+  shape that panicked.
+- Stdout / Stderr split. Doc B's atomic catalog targets
+  `Stdin`, `Stdout`, `Stderr`, `File`, `Env` with `Console`
+  becoming an alias. The lane keeps the existing combined
+  `Console` runtime ABI; the split needs new effect decls,
+  runtime struct changes, and migration of every existing
+  `Console.print`/`Console.eprint` site. Documented in
+  `stdlib/effects.kai`.
+- `use Effect` open scope. The sugar prelude (`print(s)` ≈
+  `Console.print(s)`) is the only "open scope" that ships.
+
+### Stage 1 parser extension cost
+
+The lane spec predicted ~20 LOC. Actual: ~25 LOC (a 4-line
+`skip_effect_row` entry plus a 6-line `skip_effect_row_loop`,
+inside `parse_fn_decl`'s gap between the optional return type
+and the `=` / `{` body opener). The skip-loop bails on `=`,
+`{`, `}`, or `TkEof`, so a malformed signature still gets a
+clean diagnostic from the body parser rather than running off
+into the next decl.
+
+### compiler.kai row-add cost
+
+The lane spec predicted "43 helpers". Actual: **39** after a
+comment-aware Python script (the v1 script's regex also matched
+`print(s, resume) -> ...` inside docstrings, which v2 strips
+before scanning). The 39 are: `diag_*` (4 fns), `dump_*` (16
+fns), `emit_line`, `emit_src_snippet`, `emit_source_caret`
+(File), `print_inferred_fn`, `validate_*`, `usage`,
+`parse_cli_loop`, `compile_source`, `run` (Console + File),
+`load_prelude` (Console + File), `try_candidate` (File),
+`resolve_module`, `strict_holes_check`, every `llvm_emit_*`
+error reporter. All Console-only except for the file-IO ones
+that also got `+ File`.
+
+### Were all the rows `/ Console`?
+
+No — 4 fns took `/ File` only (`emit_source_caret`,
+`try_candidate`), 2 took `/ Console + File` (`load_prelude`,
+`run`). The other 33 are pure `/ Console`.
+
+### Errors I encountered (worth recording)
+
+- **First-time bulk-row-add false positives**. The v1 Python
+  script's regex `\bprint\(` matched `print(s, resume) -> ...`
+  inside a docstring inside `parse_handle`. Stage 1 still
+  parsed the modified file (the row was a no-op in stage 1)
+  but stage 2 typer rejected the call site since `parse_handle`
+  doesn't actually call print. v2 script strips line comments
+  and `"""` docstrings before scanning; correct count `39`.
+- **`each(handler)` doesn't typecheck** when `handler : Tx ->
+  Unit / Console` and `each : [a] -> ((a) -> Unit) -> Unit`.
+  `dump_types` is the canonical site (`decls |>
+  each(dump_decl_type)`). Initial fix: replace `each(handler)`
+  with explicit recursion in two compiler-internal sites.
+  Better fix: row-poly `each` / `map` / `filter` / `reduce`
+  prelude signatures (open row tail = callback's row tail).
+  `synth_pipe` needed a parallel open-row trick — without it,
+  the pipe's expected type built via `fn_ty([..., row_empty()])`
+  refused to unify with the row-poly callee. Both shipped.
+- **`_let _ = body` in main_row_labels triggered a runtime
+  panic** during walker bisect. Removing the binding made the
+  panic move (different message), suggesting kaikai's
+  evaluation of unused-but-bound Option values has a
+  pre-existing rough edge unrelated to phase 4. Out of scope;
+  the workaround is the bespoke walker pattern that doesn't
+  bind `body` in fn args.
+
+### Subjective summary
+
+Confidence: high for the parts that shipped. The selfhost
+fixed point matches; selfhost-llvm matches; coverage holds
+61 / 0 / 13. The negative fixture's diagnostic is clean and
+directs the user at the obvious fix. The external demo
+(`/tmp/kaikai-portfolio-demo/usd_to_eur.kai` adapted to
+declared rows) runs identically on C and LLVM with input
+`100\n0.92\n` producing the expected `92 EUR`.
+
+Confidence: low for the deferred main row inference. The
+walker's panic was investigated for ~45 minutes including a
+`fv_expr`-based variant, a bespoke walker with explicit ExprKind
+arms, and stubbed-helper bisects — none isolated the panic to a
+specific match. Likely a stage-1 parsing edge with my fn
+signatures plus runtime-time match handling, but I couldn't
+nail it. The user-visible cost is "every main declares its row";
+acceptable for now.
+
+### Wall-clock vs estimate
+
+The lane spec didn't predict a single number for the total but
+implied "~1 day" by listing the components. Phase 4 retake took
+~3 hours active engineering: ~25 min on the stage 1 parser
+extension, ~1.5 hours on the typer enforcement (including the
+walker bisect that reverted), ~30 min on bulk row-add to
+compiler.kai (with v1/v2 script iterations), ~25 min on
+fixture row-additions (script-driven), ~15 min on documentation
++ demo. The walker bisect was the time sink; without it the
+lane would have been ~2 hours.
+
+### Validation against external demo
+
+`/tmp/kaikai-portfolio-demo/usd_to_eur.kai` post-Phase-4-retake
+form ships in `/tmp/usd_to_eur_phase4.kai` (kept off-tree —
+the on-tree demo file is the original aspirational version
+from Bug 6's Pre-fix state). Both backends produce identical
+output:
+
+```
+=== USD => EUR Converter ===
+Amount in USD:
+EUR per USD rate (e.g. 0.92):
+
+100 USD
+x 0.92 EUR/USD
+= 92 EUR
+```
+
+with input `100\n0.92\n`. The `parse_real` helper declares
+`/ Console + Stdin`; `main` declares `/ Console + Stdin` (no
+inference). Console covers stdout in this lane (Stdout split
+deferred). String interpolation `#{x}` is not used because
+the Show-via-interp fix from Bug 4 + Gap 1's parametric
+`impl Show for Real[u]` aren't all present in the same
+lane state — the demo falls back to `real_to_string(unitless(
+x)) ++ " USD"`.
+
+### Limitations of this report
+
+- Self-report bias: I picked the conservative "ship the parts
+  that work" path over "ship everything or ship nothing".
+- Walker panic not root-caused. Future lanes that re-attempt
+  main inference need to debug it.
+- Single agent (Claude Opus 4.7); LOC/min figures aren't
+  generalisable across LLMs.
+- The Stdout/Stderr split is documented but not implemented;
+  any user who declares `: Unit / Stdout` today gets `unknown
+  effect: Stdout` because Stdout isn't a registered effect.
+  The ergonomic story still has rough edges until a future
+  lane lands the split.
+
+### Phase 4 retake build TSV (raw)
+
+```
+timestamp	cmd	outcome	elapsed_s
+2026-04-26T23:27:59-04:00	make selfhost	OK	9
+2026-04-26T23:28:18-04:00	make selfhost-llvm	OK	8
+2026-04-26T23:29:24-04:00	make test	OK	55
+2026-04-27T00:13:10-04:00	make selfhost	OK	13
+2026-04-27T00:13:29-04:00	make selfhost-llvm	OK	9
+2026-04-27T00:14:04-04:00	make test	OK	21
+2026-04-27T00:15:47-04:00	make test	OK	0
+2026-04-27T00:16:23-04:00	test-llvm-coverage	OK	26
+2026-04-27T00:34:29-04:00	final_gates	OK	133
+```
