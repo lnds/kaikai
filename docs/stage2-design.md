@@ -862,6 +862,74 @@ surface. `test-demos-core` is the demo-based gate the user asked for.
 Both runs the C and LLVM backends; selfhost C + LLVM remain at fixed
 point.
 
+**Update 2026-04-27 (later, same day) — Core REOPENED.**
+Within hours of running `make -C demos verify` over the broader probe
+set in `demos/`, four typer/resolver/codegen bugs surfaced:
+
+1. **Handler-clause alias resolution gap** (`10a1e7b`):
+   `synth_handle` reconstructed `EHandle` with the original (un-typed)
+   clauses, discarding the typed body returned by `check_clauses_types`.
+   `Console.print` inside `raise(resume) -> { ... }` emitted
+   `kai_apply(kai_field(kai_Console, "print"), ...)` against an
+   undeclared symbol.
+2. **Protocol-op shadows local parameter** (`257b247`): `rename_proto_calls`
+   rewrote every `EVar(name)` matching a registered op without lexical
+   scope tracking. `list_sort_by(cmp)` had its `cmp` parameter rewritten
+   to the dispatcher; runtime panicked with `__protocol_dispatch_Ord_cmp`.
+3. **Lambda rows closed by default** (`b528655`): `synth_lambda` built
+   lambdas with `Row { tail: None }`, so `while(pure_pred,
+   effectful_body)` failed type-check — the first lambda's empty closed
+   row pinned `while`'s row var `e` to empty, then the second lambda's
+   `[Stdout]` row could not unify.
+4. **Closure capture of var-bound aliases** (`4c61184`): `fv_expr` /
+   `collect_expr` collected handler aliases (`var top = 0` desugars
+   to `with State[Int](0) as top`) as captured values; the C emit
+   read `kai_top` against an undeclared identifier.
+
+Linus and Eric agents reviewed the codebase and converged: the gate
+("two demos compile + selfhost + 61-fixture suite") was extrinsic
+(observable output) without any intrinsic invariant (typer/resolver
+properties). All four bugs are instances of the same systemic
+failure: a 22000-line single-file compiler with no shared AST visitor;
+each pass duplicates the structural recursion manually and each must
+independently remember every invariant other passes already enforce
+(thread typed sub-expressions back, track lexical scope, give
+lambdas open rows). The two cherry-picked demos exercised neither
+the handler-clause path nor `list_sort_by`-style higher-order
+helpers nor row-polymorphic `while` callers nor lambda-with-alias
+capture.
+
+**Revised closure criterion** — three levels:
+
+1. **Automated, mechanical** (existing, unchanged): `make selfhost`
+   + `make -C stage2 selfhost-llvm` byte-identical fixed point;
+   `make test` clean (incl. `test-demos-core`).
+2. **Audit + invariant verifier**: every `_ -> k` wildcard in every
+   AST walker pass must be either (a) justified ("this kind cannot
+   contain sub-expressions"), or (b) made explicit. Three rep
+   invariants must be verifiable by walkers: (i) every reconstructed
+   `EHandle` uses typed clauses, not the originals; (ii) every
+   `EVar(name)` rewritten by `rename_proto_calls` has `name` outside
+   every enclosing binder; (iii) every `TyFnT` produced by
+   `synth_lambda` for an inferred row has an open tail.
+3. **Demo gate**: `make -C demos verify` produces no new FAIL relative
+   to the milestone start; remaining FAIL must each be blocked by a
+   documented roadmap item, not by a compiler bug. Plus: at least one
+   aspirational program *not* in the milestone plan must compile, to
+   force the designer to look outside the contemplated paths.
+
+The "two demos compile" gate is retired. The new gate runs at every
+milestone close, not just at Core.
+
+Estimated time to Core RE-CLOSE under the revised criterion: 2-4
+days, dominated by the audit (~1 day) + invariant walkers (~1-2
+days) + addressing the four lurking suspects Linus identified by
+inspection (`desugar_interp_decls` no scope tracking,
+`pcs_rewrite_kind` `ELitUnit` fallthrough, `rename_proto_calls_kind`
+`ELitUnit` fallthrough, `synth_lambda` doesn't clear
+`clause_resume`). See `docs/m12.8-followup.md` post-Core section
+for the live tracking.
+
 What is **not** in Core but is part of Full:
 
 - Remaining m7e items: `variants[T]()`, main-row inference, `use Effect`.
