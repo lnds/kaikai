@@ -256,14 +256,14 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
   - `let` vs `:=` — **resolved**: not redundant. `let` introduces an immutable binding; `:=` mutates a `var` cell or array slot (m7b #5, #6). Distinct operations.
   - `switch` / `cond` / `match` — **resolved**: `match` is the only form. Neither `switch` nor `cond` exist in kaikai-minimal (`kaikai-minimal.md` §`match`). No redundancy to remove.
   - `|` vs `|>` — **resolved**: both retained with distinct intent. `|>` is apply-pipe (first-arg threading); `|` is map-pipe over a list (m7b #9, see `docs/syntax-sugars.md`). Each form signals a different operation.
-  - collections `[]` / `()` / `{}` — **partially resolved**: `[]` for ordered lists, `{}` for records (named fields). `()` is grouping today; whether it gains a tuples meaning is **gated at m8.5** (`docs/proposed-extensions.md` §9 *Decision gate*).
+  - collections `[]` / `()` / `{}` — **resolved**: `[]` for ordered lists, `{}` for records (named fields), `()` for grouping only. The "should `()` gain a tuples meaning" sub-decision was closed on 2026-04-27 with verdict **REJECT** (m8.5 gate; methodology and metrics in `docs/proposed-extensions.md` §9). Anonymous products use `Pair[a, b]` (stdlib); transient pattern-match shapes use the multi-arg match sugar (scheduled).
   - atoms / structs / maps — **resolved**: kaikai has no atoms (no Erlang-style standalone symbols). Records carry nominal identity; `Map[K, V]` is a lookup table landing with the collection-design pass (m14). Distinct concepts, no overlap.
 
-  Net status: only the `()` / tuples sub-decision remains open; everything else is closed by the practice that landed during stages 0–1 and m7b.
+  Net status: every sub-decision in this list is now closed.
 
 - **Extensions catalogue** (`docs/proposed-extensions.md`): two families of proposed additions; status tracked per-item in that document.
   - *LLM-friendly diagnostics* — typed-holes-adjacent features (principled `todo!`, type-query JSON, exhaustiveness counterexamples, `axiom`, effect holes, import holes, canonical-form lints). Share the typed-holes output contract (human text + stable JSON). Most depend on m11 (diagnostics quality pass); `todo!` scheduled for m7d, `axiom` for m12.7.
-  - *Language-surface features* — tuples `(T1, T2)`, record punning `{ x, y }`, `variants[T]()`, sum types with constant attributes, `!` postfix (Option/Result propagation), `@` as-patterns, `?.` optional chaining, deferred bitwise operators, `Map[K, V]` with hash-map indexing, slice syntax `a[i..j]`, method references as values (`obj.method`), `Range[T]` as a first-class iterable, pipeline placeholder `_`, binary pattern matching `<<...>>`. Six items now scheduled (m7d/m7e); the rest split between collection-design (m14), demand-driven (#12, #15, #16), and standalone candidates (#19, #22).
+  - *Language-surface features* — record punning `{ x, y }`, `variants[T]()`, sum types with constant attributes, `!` postfix (Option/Result propagation), `@` as-patterns, `?.` optional chaining, deferred bitwise operators, `Map[K, V]` with hash-map indexing, slice syntax `a[i..j]`, method references as values (`obj.method`), `Range[T]` as a first-class iterable, pipeline placeholder `_`, binary pattern matching `<<...>>`. Tuples `(T1, T2)` were rejected at m8.5 (2026-04-27); see §9. Six items now scheduled (m7d/m7e); the rest split between collection-design (m14), demand-driven (#12, #15, #16), and standalone candidates (#19, #22).
 
 ## Roadmap
 

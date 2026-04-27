@@ -413,16 +413,19 @@ in.
    defers to **m8.x**, tracked in `docs/m8x-followup.md`.
    The user-facing API is the final shape; m8.x is a runtime
    swap, invisible to user code.
-8.5. **m8.5 — Tuples decision gate**: one-day measurement task
-    against the open `proposed-extensions.md` §9 decision. Pick
-    one effect-heavy program (actor service / parser combinator
-    suite / supervised worker pool) and rewrite under both
-    postures (records vs tuples + destructuring). Decision rule
-    pinned in §9 *Decision gate*: ≥10% line savings or ≥30%
-    signature shrink → accept and schedule a follow-up
-    implementation milestone; otherwise reject formally and
-    close the open decision in `design.md`. Produces a decision,
-    not code.
+8.5. **m8.5 — Tuples decision gate** *(landed 2026-04-27 — verdict
+    REJECT)*: one-day measurement task against the open
+    `proposed-extensions.md` §9 decision. Ran over a parser
+    combinator suite (n = 7 multi-return parsers); generic-record
+    baseline beat tuples on both gates (−2.2% LOC vs ≥10% required;
+    +5.8% sig length vs ≥30% required reduction). Verdict and
+    methodology pinned in `proposed-extensions.md` §9 "Decision —
+    REJECTED (2026-04-27)". Stress-test surfaced three follow-up
+    items as the canonical answer (none introduces tuples-as-a-
+    type): `Pair[a, b]` in stdlib (1-line shipped), multi-arg
+    match sugar (~1 day mini-lane), record destructuring in `let`
+    + record punning §10 (already scheduled). Tuples as a second
+    product form remain rejected.
 9. **m9 — Supervisor DSL** (post-actors): `one_for_one` /
    `rest_for_one` / `one_for_all` patterns as a stdlib module,
    built on `Monitor` + `Spawn`. Lands once usage data from m8
@@ -564,12 +567,11 @@ Rationale:
    sense that every promise of the design docs (effects +
    handlers + nurseries + actors + cancellation) compiles and
    runs.
-4.5. **m8.5 (tuples decision gate)** — one-day measurement
-   over an effect-heavy corpus (now available because m8
-   closed) to resolve the open `proposed-extensions.md` §9
-   decision. Produces accept/reject + a closed open-decision
-   in `design.md`, no code. Lands here because m8's
-   multi-return idioms are the corpus the gate needs.
+4.5. **m8.5 (tuples decision gate)** *(landed 2026-04-27 —
+   verdict REJECT)*. Closed the open `proposed-extensions.md`
+   §9 decision against a parser combinator suite. Verdict and
+   stress-test follow-ups (Pair[a, b], multi-arg match sugar,
+   record destructuring + punning) pinned in §9.
 5. **m12 (self-hosting checkpoint)** — `kaic2 stage2/compiler.kai`
    produces a byte-identical output. Stage 1 retires from the
    dev loop. This is the natural moment to evaluate stage 2's

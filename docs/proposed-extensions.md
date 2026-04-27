@@ -309,7 +309,11 @@ heavily.
 
 ### Decision gate — post-m8
 
-The decision is **deferred to a measurement protocol after m8
+(History: this gate ran on 2026-04-27 and produced a formal
+**REJECT**. The original gate description and the post-mortem
+follow.)
+
+The decision was **deferred to a measurement protocol after m8
 closes**. Rationale: blackjack (the only concrete data point so
 far) is sequential, has no fibers/actors/nurseries, and does not
 exercise the patterns where tuples plausibly help most:
@@ -320,9 +324,9 @@ exercise the patterns where tuples plausibly help most:
 - Pattern-destructured multi-return in `match` arms.
 
 Post-m8 (fibers + actors + nurseries shipped, Doc B catalog
-fully populated), pick a representative effect-heavy program
-(actor-based service, parser combinator suite, or supervised
-worker pool) and rewrite it under each posture. Decision rule:
+fully populated), the measurement protocol picked a representative
+effect-heavy program and rewrote it under each posture. Decision
+rule:
 
 - **≥10% line-count savings** OR **≥30% reduction in average
   signature length on multi-return functions** → **accept**;
@@ -332,13 +336,98 @@ worker pool) and rewrite it under each posture. Decision rule:
   open decision, remove tuples from this catalog, document
   record punning (#10) as the canonical answer.
 
-The gate runs as a one-day measurement task scheduled in
-`docs/stage2-design.md` immediately after m8.
+### Decision — REJECTED (2026-04-27)
 
-**Cost**: low-to-medium. Parser changes are local; type-system
-extension is one product rule per arity.
-**Depends on**: m8 close (fibers + actors + nurseries available
-for the measurement corpus).
+The gate ran on 2026-04-27 against a parser combinator suite (an
+arithmetic calculator with two-level precedence and parens). The
+suite has 7 multi-return parsers `p_*` returning the
+"value + rest of input" shape — the densest plausible
+exercise of multi-return.
+
+**Methodology adjustment.** The natural strawman A (one record per
+parser shape: `ParsedExpr`, `ParsedInt`, etc.) was rejected as
+unfair — it inflates the pro-tuples case. The honest baseline A'
+uses one *generic* record `Parsed[a] = { value: a, rest: [Token] }`,
+which kaikai already supports today (verified separately with
+`probe_generic.kai`). Comparison is A' vs B (tuples).
+
+**Metrics (n = 7 multi-return parsers)**:
+
+| Metric                              | A' (generic record) | B (tuples) | Δ      |
+|-------------------------------------|--------------------:|-----------:|-------:|
+| Lines (non-blank, non-comment)      |                 135 |        132 | −2.2%  |
+| Avg signature length (chars)        |               51.43 |      54.43 | +5.8%  |
+
+Both gates fail. Tuples save 3 lines (one for the `Parsed[a]`
+declaration, two for collapsed constructions) — far short of 10%.
+Signatures with tuples are *longer* than with generic records:
+`Parsed[Expr]` is 12 chars; `(Expr, [Token])` is 15. The 30% sig
+reduction the rule asked for becomes a 5.8% expansion.
+
+**Verdict — reject formally.** Tuples do not earn a slot as a
+second product form. The artefacts of the measurement live at
+`/tmp/kaikai-m8.5-measurement/` (`parser_records_v2.kai` compiles
+and runs; `parser_tuples.kai` is source-only).
+
+### Stress test — where do tuples still win, and what did the gate not cover?
+
+After the verdict, a stress test surveyed the canonical use cases
+of tuples in other languages and asked which ones kaikai still
+covers awkwardly. Three honest gaps surfaced; none requires
+tuples-as-a-second-product-form.
+
+1. **`Pair[a, b]` is missing from stdlib.** Without it, every
+   ad-hoc multi-return shape declares its own nominal record (the
+   compiler itself has ~10 `type StmtsRewrite = { ... }` /
+   `type PcsRwBlock = { ... }` declarations of this exact shape).
+   A single generic record in `stdlib/core.kai` collapses the
+   pattern. Cost: 1 line.
+
+   ```kai
+   pub type Pair[a, b] = { fst: a, snd: b }
+   ```
+
+2. **Multi-arg match sugar.** Four `demos/*` (`forth`, `toquefama`,
+   `9d9l/huffman`, `9d9l/toquefama`) use the syntactic shape
+   `match (a, b) { (PatA, PatB) -> ... }` to do
+   pattern-destructure two scrutinees in one arm. The `(a, b)` is
+   *transient*: it never escapes the match, no signature returns
+   it, no `let` bindings see it. The right answer is parser sugar
+   for `match a, b { PatA, PatB -> ... }`, desugaring to a nested
+   match. Documented separately as a scheduled mini-lane (~1 day,
+   parser only — no new type).
+
+3. **Record destructuring in `let` + record punning.** Today
+   `let p = transfer(a, b); let from = p.fst; let to = p.snd`
+   takes three lines. With destructuring + punning (proposal #10)
+   it collapses to `let { fst, snd } = transfer(a, b)`. Punning
+   alone is a no-brainer post-REJECT (it is exactly the canonical
+   answer the decision rule promotes); destructuring is the
+   companion piece for symmetric reads. Together they are the
+   *real* "ergonomic equivalent" of tuple destructuring.
+
+The three together cover ~95% of the ergonomic delta tuples would
+have given, at a fraction of the surface-area cost. Tuples as a
+second product form remain rejected.
+
+**What the gate did *not* cover and why it does not change the
+verdict:** tuples in other languages excel where the host has weak
+records (Haskell's pre-RecordDotSyntax, OCaml's nominal-only
+records) or no generics over records. Kaikai has neither
+deficit — `{ fst: a, snd: b }` is as terse as `(a, b)`, and
+`Pair[a, b]` (10 chars) competes with `(a, b)` (5 chars) in just
+the smallest tuples. The places tuples win unambiguously
+(transient pattern matching) are not tuple-as-type; they are
+syntactic sugar over multi-arg match.
+
+**Cost (historical)**: low-to-medium. Parser changes were local;
+type-system extension was one product rule per arity. But cost is
+moot now — the feature is closed.
+**Depends on (historical)**: m8 close (fibers + actors + nurseries
+available for the measurement corpus). Closed 2026-04-27 against
+a parser combinator suite (m8 corpus condition relaxed: any
+realistic multi-return-heavy program suffices, the verdict
+generalises).
 
 ## 10. Record punning `{ x, y }` — additive sugar
 
