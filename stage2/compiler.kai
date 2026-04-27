@@ -9468,8 +9468,32 @@ fn desugar_interp_kind(k: ExprKind, op_names: [String],
         lift_interp_string(span, body_start, body_end, op_names, line, col)
       } else { k }
     }
-    ECall(c, args_) -> ECall(desugar_interp_expr(c, op_names),
-                              desugar_interp_exprs(args_, op_names))
+    # m12.8.x phase 2 (Bug 5): postfix `x.op(args)` method-call
+    # sugar. When the callee is `EField(receiver, op_name)` and
+    # `op_name` is a protocol op declared in this compilation unit,
+    # rewrite to `ECall(EVar(__proto_<op>), [receiver, ...args])`.
+    # The post-inference rewrite then routes each call to the
+    # matching `__pimpl_<P>_<T>_<op>` direct call as if the user
+    # had written `op(receiver, ...args)`. Records that happen to
+    # carry a field named the same as a protocol op shadow this
+    # rule — same limitation as the existing rename pass; users
+    # hit it iff they declare a field whose name is a protocol op,
+    # which is unusual.
+    ECall(c, args_) -> match c.kind {
+      EField(receiver, op_name) ->
+        if list_has(op_names, op_name) {
+          let new_callee = mk_expr(EVar(proto_dispatcher_name(op_name)),
+                                    c.line, c.col)
+          let new_recv   = desugar_interp_expr(receiver, op_names)
+          let new_args   = desugar_interp_exprs(args_, op_names)
+          ECall(new_callee, [new_recv, ...new_args])
+        } else {
+          ECall(desugar_interp_expr(c, op_names),
+                desugar_interp_exprs(args_, op_names))
+        }
+      _ -> ECall(desugar_interp_expr(c, op_names),
+                  desugar_interp_exprs(args_, op_names))
+    }
     EBlock(ss, t) -> EBlock(desugar_interp_stmts(ss, op_names),
                              desugar_interp_opt(t, op_names))
     EIf(c, t_, eo) -> EIf(desugar_interp_expr(c, op_names),
@@ -20742,6 +20766,245 @@ fn resolve_protocol_calls_list_elem(el: ListElem, reg: ProtocolReg) : ListElem {
   }
 }
 
+# m12.8.x phase 2 (Bug 5): post-rewrite validation. After
+# `resolve_protocol_calls` has rewritten every dispatchable
+# `__proto_<op>(receiver, ...)` call into the matching
+# `__pimpl_<P>_<T>_<op>` direct call, walk the typed AST and report
+# any *remaining* dispatcher-shaped calls whose receiver type is
+# concrete but has no impl. This is the compile-time error the
+# `m12_8_y_postfix_no_impl` and similar negative fixtures expect.
+# Calls whose receiver is still a TyVar (the polymorphic-helper
+# fallthrough case the m12.8 v1 deliberately allowed) keep the
+# dispatcher panic at runtime.
+fn validate_resolved_protocols(typed: TypedProgram, reg: ProtocolReg,
+                                file: String) : Int =
+  validate_resolved_decls(typed.decls, reg, file, 0)
+
+fn validate_resolved_decls(ds: [Decl], reg: ProtocolReg,
+                            file: String, errs: Int) : Int {
+  match ds {
+    [] -> errs
+    [d, ...rest] -> {
+      let e1 = match d {
+        DFn(_, _, _, _, _, _, body, _, _) ->
+          validate_resolved_expr(body, reg, file, errs)
+        DTest(_, body, _, _) ->
+          validate_resolved_expr(body, reg, file, errs)
+        _ -> errs
+      }
+      validate_resolved_decls(rest, reg, file, e1)
+    }
+  }
+}
+
+fn validate_resolved_expr(e: Expr, reg: ProtocolReg, file: String,
+                           errs: Int) : Int {
+  let e1 = validate_proto_call_at(e, reg, file, errs)
+  validate_resolved_kind(e.kind, reg, file, e1)
+}
+
+fn validate_resolved_opt(o: Option[Expr], reg: ProtocolReg, file: String,
+                          errs: Int) : Int {
+  match o {
+    Some(e) -> validate_resolved_expr(e, reg, file, errs)
+    None    -> errs
+  }
+}
+
+fn validate_resolved_exprs(es: [Expr], reg: ProtocolReg, file: String,
+                            errs: Int) : Int {
+  match es {
+    [] -> errs
+    [e, ...rest] -> {
+      let e1 = validate_resolved_expr(e, reg, file, errs)
+      validate_resolved_exprs(rest, reg, file, e1)
+    }
+  }
+}
+
+fn validate_resolved_arms(arms: [Arm], reg: ProtocolReg, file: String,
+                           errs: Int) : Int {
+  match arms {
+    [] -> errs
+    [a, ...rest] -> match a {
+      Arm(_, g, b) -> {
+        let e1 = validate_resolved_opt(g, reg, file, errs)
+        let e2 = validate_resolved_expr(b, reg, file, e1)
+        validate_resolved_arms(rest, reg, file, e2)
+      }
+    }
+  }
+}
+
+fn validate_resolved_stmts(ss: [Stmt], reg: ProtocolReg, file: String,
+                            errs: Int) : Int {
+  match ss {
+    [] -> errs
+    [s, ...rest] -> {
+      let e1 = match s {
+        SLet(_, _, rhs) -> validate_resolved_expr(rhs, reg, file, errs)
+        SAssert(c, m) -> {
+          let x = validate_resolved_expr(c, reg, file, errs)
+          validate_resolved_opt(m, reg, file, x)
+        }
+        SExprStmt(x) -> validate_resolved_expr(x, reg, file, errs)
+        SIndexAssign(b, i, v, _, _) -> {
+          let x = validate_resolved_expr(b, reg, file, errs)
+          let y = validate_resolved_expr(i, reg, file, x)
+          validate_resolved_expr(v, reg, file, y)
+        }
+        SVar(_, _, rhs, _, _) -> validate_resolved_expr(rhs, reg, file, errs)
+      }
+      validate_resolved_stmts(rest, reg, file, e1)
+    }
+  }
+}
+
+fn validate_resolved_clauses(cs: [HClause], reg: ProtocolReg,
+                              file: String, errs: Int) : Int {
+  match cs {
+    [] -> errs
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) -> {
+        let e1 = validate_resolved_expr(b, reg, file, errs)
+        validate_resolved_clauses(rest, reg, file, e1)
+      }
+    }
+  }
+}
+
+fn validate_resolved_opt_return(o: Option[HReturn], reg: ProtocolReg,
+                                 file: String, errs: Int) : Int {
+  match o {
+    Some(r) -> match r { HR(_, b, _, _) -> validate_resolved_expr(b, reg, file, errs) }
+    None -> errs
+  }
+}
+
+fn validate_resolved_fields(fs: [FieldInit], reg: ProtocolReg,
+                             file: String, errs: Int) : Int {
+  match fs {
+    [] -> errs
+    [f, ...rest] -> match f {
+      FI(_, v) -> {
+        let e1 = validate_resolved_expr(v, reg, file, errs)
+        validate_resolved_fields(rest, reg, file, e1)
+      }
+    }
+  }
+}
+
+fn validate_resolved_list_elems(els: [ListElem], reg: ProtocolReg,
+                                 file: String, errs: Int) : Int {
+  match els {
+    [] -> errs
+    [el, ...rest] -> {
+      let e1 = match el {
+        ElPlain(x)  -> validate_resolved_expr(x, reg, file, errs)
+        ElSpread(x) -> validate_resolved_expr(x, reg, file, errs)
+      }
+      validate_resolved_list_elems(rest, reg, file, e1)
+    }
+  }
+}
+
+fn validate_resolved_kind(k: ExprKind, reg: ProtocolReg, file: String,
+                           errs: Int) : Int {
+  match k {
+    ECall(c, args_) -> {
+      let e1 = validate_resolved_expr(c, reg, file, errs)
+      validate_resolved_exprs(args_, reg, file, e1)
+    }
+    EBlock(ss, t) -> {
+      let e1 = validate_resolved_stmts(ss, reg, file, errs)
+      validate_resolved_opt(t, reg, file, e1)
+    }
+    EIf(c, t_, eo) -> {
+      let e1 = validate_resolved_expr(c, reg, file, errs)
+      let e2 = validate_resolved_expr(t_, reg, file, e1)
+      validate_resolved_opt(eo, reg, file, e2)
+    }
+    EBinop(_, a, b) -> {
+      let e1 = validate_resolved_expr(a, reg, file, errs)
+      validate_resolved_expr(b, reg, file, e1)
+    }
+    EUnop(_, x) -> validate_resolved_expr(x, reg, file, errs)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let e1 = validate_resolved_expr(body, reg, file, errs)
+      let e2 = validate_resolved_opt(init_opt, reg, file, e1)
+      let e3 = validate_resolved_clauses(clauses, reg, file, e2)
+      validate_resolved_opt_return(ret_opt, reg, file, e3)
+    }
+    ELambda(_, b) -> validate_resolved_expr(b, reg, file, errs)
+    EMatch(scr, arms) -> {
+      let e1 = validate_resolved_expr(scr, reg, file, errs)
+      validate_resolved_arms(arms, reg, file, e1)
+    }
+    EPipe(a, b) -> {
+      let e1 = validate_resolved_expr(a, reg, file, errs)
+      validate_resolved_expr(b, reg, file, e1)
+    }
+    EField(base, _) -> validate_resolved_expr(base, reg, file, errs)
+    EIndex(a, b) -> {
+      let e1 = validate_resolved_expr(a, reg, file, errs)
+      validate_resolved_expr(b, reg, file, e1)
+    }
+    ERecordLit(_, fields) -> validate_resolved_fields(fields, reg, file, errs)
+    EList(elems) -> validate_resolved_list_elems(elems, reg, file, errs)
+    ERange(a, b, opt_step) -> {
+      let e1 = validate_resolved_expr(a, reg, file, errs)
+      let e2 = validate_resolved_expr(b, reg, file, e1)
+      validate_resolved_opt(opt_step, reg, file, e2)
+    }
+    EBang(inner) -> validate_resolved_expr(inner, reg, file, errs)
+    ELitUnit(inner, _) -> validate_resolved_expr(inner, reg, file, errs)
+    _ -> errs
+  }
+}
+
+fn validate_proto_call_at(e: Expr, reg: ProtocolReg, file: String,
+                           errs: Int) : Int {
+  match e.kind {
+    ECall(callee, args_) -> match callee.kind {
+      EVar(name) -> {
+        let opname = strip_proto_dispatcher_prefix(name)
+        # Only inspect calls that survived the rewrite as
+        # `__proto_<op>(...)` (the prefix-strip yields a different
+        # name) AND whose op is one of our registered protocol ops.
+        if name == opname { errs }
+        else if not list_has(reg.op_names, opname) { errs }
+        else {
+          match args_ {
+            [] -> errs
+            [self_arg, ...rest_args] -> match self_arg.ty {
+              None -> errs
+              Some(ty) -> match ty_head_name(ty) {
+                None -> errs
+                Some(tname) -> match find_impl(reg, opname, tname) {
+                  Some(_) -> errs
+                  None -> {
+                    let pname = match proto_op_lookup(reg, opname) {
+                      Some(po) -> match po { POR(pn, _, _, _, _, _) -> pn }
+                      None -> "?"
+                    }
+                    diag_error(file, e.line, e.col,
+                      concat_all(["no impl of `", pname,
+                                  "` for type `", tname,
+                                  "` (operation `", opname, "`)"]))
+                    errs + 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      _ -> errs
+    }
+    _ -> errs
+  }
+}
+
 fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
                             reg: ProtocolReg) : Option[ExprKind] {
   match callee.kind {
@@ -21441,7 +21704,16 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   # unknown types fall through and execute the
                   # dispatcher fn's panic at runtime.
                   let typed_prog = resolve_protocol_calls(typed_prog0, proto_reg)
+                  # m12.8.x phase 2 (Bug 5): walk the post-rewrite
+                  # AST and report any `__proto_<op>` call whose
+                  # receiver type is concrete but has no matching
+                  # impl. Polymorphic helpers whose receiver is a
+                  # TyVar at this point keep the v1 runtime
+                  # fallthrough behaviour.
+                  let dispatch_errs =
+                    validate_resolved_protocols(typed_prog, proto_reg, path)
                   if typed_prog.errs != 0 { typed_prog.errs }
+                  else if dispatch_errs != 0 { dispatch_errs }
                   else {
                     let hole_errs = if strict_holes { strict_holes_check(path, all_decls) } else { 0 }
                     if hole_errs != 0 { hole_errs }
