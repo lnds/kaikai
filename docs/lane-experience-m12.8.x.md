@@ -515,3 +515,216 @@ timestamp	cmd	outcome	elapsed_s
 2026-04-26T22:01:16-04:00	make selfhost-llvm	OK	8
 2026-04-26T22:03:33-04:00	test-llvm-coverage	OK	74
 ```
+
+## Phase 4 — effects-prelude gap (Bug 6)
+
+Eduardo discovered while writing a USD→EUR external demo that
+kaikai's prelude `print`, `eprint`, `read_line`, `read_file`,
+`write_file` are **flat fns**, not effect ops, so any function
+with an empty row can perform IO without declaring it. That is a
+clean CLAUDE.md Tier 1 #1 violation. The Phase 4 spec tasked this
+lane with closing the gap: declare an atomic effect catalog
+(Stdin/Stdout/Stderr/File/Env), make the typer enforce row
+declaration on prelude calls, infer main's row from its body,
+add `use Effect` open scope, and implement row subtyping
+(declared row may over-cover the body's used row).
+
+### Outcome: investigated, partial-only ship
+
+The lane shipped:
+
+- `stdlib/effects.kai` — a documentation-only forward-compat
+  catalog file that records the proposed atomic-effect shape
+  (Stdin / Stdout / Stderr / File / Env, with `Console` and `Io`
+  aliases) for the follow-up lane to consume. Loadable via
+  `--prelude` as a no-op.
+- `docs/m12.8-followup.md` Bug 6 entry documenting the
+  investigation, the architectural blocker, and the two paths
+  forward.
+- This lane experience section.
+
+The lane did **not** ship the typer-level row enforcement,
+main row inference, `use Effect`, or row subtyping. Reasons
+below.
+
+### What I tried
+
+1. **Prelude effect-row label injection** in `synth_call`: a
+   ~30-LOC shim `add_prelude_effect_label` that, when the
+   callee is a syntactically-bare `print`/`eprint`/`read_line`/
+   `read_file`/`write_file`, accumulates the matching effect
+   label (`Console`/`Stdin`/`File`) in the caller's row. The
+   existing `check_body_row` then enforces "performed must be
+   subset of declared". The shim worked on user fixtures: a
+   `fn pure_fn(x: Int) : Int { print("...") x+1 }` correctly
+   reported "effect not handled: Console" with a clean
+   diagnostic.
+2. **Main row inference** in `infer_decl`: when main's declared
+   row is REmpty, skip the strict check, take the body's
+   accumulated `st.row`, dedup by effect name, and rebuild the
+   `DFn` with `RClosed([RL("Console", []), ...])`. The runtime
+   wrapper's `main_row_labels` then sees the inferred labels and
+   `inject_builtin_effects` installs the matching default
+   handlers automatically.
+3. **Pre-typer scan** for `main_row_labels`: a structural walker
+   `scan_prelude_effects_in_expr` that iterates main's body
+   looking for syntactically-bare prelude effect calls. This
+   ran before the typer so `inject_builtin_effects` (which also
+   runs pre-typer) had the row info up-front. Implementation
+   was ~150 LOC of pattern-match boilerplate mirroring the
+   existing `resolve_protocol_calls_kind` walker shape.
+
+Items 1+3 worked end-to-end on the
+`m12_8_y_phase4_main_implicit` fixture: `fn main() : Int {
+print("hello") 0 }` compiled, the runtime installed the
+Console handler automatically, and "hello" was printed.
+
+### What blocked the ship
+
+Selfhost. The kaikai compiler itself
+(`stage2/compiler.kai`) calls `print`/`eprint` directly from
+**43 helper fns** (`diag_error`, `diag_note`, `diag_help`,
+`diag_error_from_src`, every `dump_*` reporter, every
+`llvm_*` error reporter). With the new enforcement, those fns
+declared `: Unit` (REmpty row) but performed `Console` — so the
+typer rejected them, and the selfhost stopped at the first error
+("`diag_error`'s declared row does not include `Console`").
+
+The principled fix is to add `/ Console` to all 43 fn signatures
+in compiler.kai. I prototyped a Python script that did this
+mechanically: scanned for `print`/`eprint`/`read_line`/`read_file`/
+`write_file` call sites, walked back to the enclosing fn
+signature, and inserted the row annotation before the trailing
+`=` or `{`. The script applied 43 modifications cleanly — no
+syntax errors in the kaikai source.
+
+But **stage 1's parser cannot parse row syntax**. Stage 1
+(`stage1/compiler.kai` — kaikai-minimal) predates the effect
+system and rejects `: Unit / Console {` with "expected `=` or
+`{` to start function body" at the slash. The selfhost path is
+"stage 1 builds stage 2's source binary, then stage 2 builds
+its own source", so adding rows to compiler.kai breaks the
+stage-1 → stage-2 bootstrap before stage 2 ever runs.
+
+The lane spec was explicit: **"Stage 0/1 NO cambian:
+kaikai-minimal sigue sin effect system."** That sentence
+assumed compiler.kai's helpers don't need rows because stage 1
+doesn't enforce them; the assumption misses that **stage 2** is
+the one doing the enforcing, and stage 2 is asked to typecheck
+its own source during selfhost, which is exactly when the row
+violations bite.
+
+I considered four mitigations:
+
+1. **Extend stage 1's parser to accept-and-ignore row syntax**
+   (~20 LOC in stage1/compiler.kai). Cleanest. Forbidden by
+   the lane spec.
+2. **Opt-in enforcement gated on a marker**. The typer enforces
+   row checks only when the file declares the atomic effects
+   (e.g., loaded `stdlib/effects.kai`). compiler.kai doesn't load
+   it; new user code does. Preserves selfhost. Out of scope per
+   the lane spec's Tier 1 framing ("typer EMPIEZA a enforce").
+3. **Special-case "internal stdlib paths"** to skip enforcement.
+   File-path-based gating; brittle.
+4. **Ship with selfhost broken**, expecting Eduardo to bless the
+   stage-1 change as a follow-up. Leaves the branch in a known-
+   bad state that contradicts the lane's "selfhost obligatorio"
+   gate.
+
+I did not have authority for #1 in this lane and did not want
+to ship #4. #2 and #3 are non-trivial design decisions that
+deserve Eduardo's input rather than me picking. The pragmatic
+move was to revert the typer changes, ship the documentation
+catalog as a forward-compat marker, and surface the scoping
+issue in `docs/m12.8-followup.md` Bug 6 so the next lane has a
+clean handoff.
+
+### Reverted-from-disk notes
+
+In the course of bisecting whether the panic ("non-exhaustive
+match" in the running compiler) came from item 3 (the pre-typer
+scanner) or item 1 (the synth_call shim) or item 2 (the
+infer_decl rewrite), I `git checkout`-ed `stage2/compiler.kai`
+twice to restore baseline. The third attempt at re-adding just
+the pre-typer scanner reproduced the panic on `examples/effects/
+m7a_6b_handle_runs.kai` (which has nested `handle { ... } with
+Counter { ... }` blocks). The likely cause was a mishandled
+HClause / HReturn / Arm pattern in the new walker, but I did
+not invest further bisect time after deciding the lane should
+ship documentation only — the walker is uncommitted and not
+worth debugging in isolation.
+
+### Objective metrics
+
+- **Start**: 2026-04-26T22:18:33-04:00.
+- **End**: 2026-04-26T22:48:27-04:00.
+- **Wall-clock**: ~30 minutes of total work (most of it was
+  exploration: counting fixture impact, reading the existing
+  effects/handler infrastructure, verifying selfhost is the
+  blocker by attempting the bulk row-add and watching it
+  break).
+- **LOC shipped**: 1 file (`stdlib/effects.kai`, 67 lines, all
+  comment-only forward-compat catalog).
+- **LOC reverted**: ~310 LOC across two iterations of
+  `add_prelude_effect_label`, `main_row_labels` extension, and
+  the `scan_prelude_effects_*` walker family. The Python
+  bulk-row-add script's 43 modifications to compiler.kai were
+  also reverted.
+- **Gates**: `make test`, `make selfhost`, `make -C stage2
+  selfhost-llvm`, `make -C stage2 test-llvm-coverage` all green.
+  No regressions, by construction (no compiler change).
+
+### What the lane spec assumed vs. what was true
+
+| Spec assumption                                                    | Reality                                                                                |
+|--------------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| "Stage 0/1 don't enforce rows, so selfhost just works"             | Stage 2 enforces during its own selfhost; stage 1's role is just being able to *parse* |
+| "Phase 4 only affects user programs"                               | The compiler IS a user program from stage 2's typer's perspective                      |
+| "Subtyping check is the risk, ~3h of work"                         | Subtyping is straightforward; the parser-level gap is the real blocker                 |
+| "Each item lands independently"                                    | Items 1-7 (Stdlib catalog, Sugar enforcement, Main inference, `use`, Subtyping, Console split, Doc updates) all bottom out on the same selfhost question |
+
+### Recommended next move
+
+Eduardo's choice between two paths, both approachable as a
+~1-day follow-up lane:
+
+- **Path A (preferred)**: extend stage 1's parser to
+  accept-and-ignore row syntax. Once landed, the Phase 4 typer
+  changes (which I prototyped in this lane's git stash before
+  reverting) can be re-applied directly. Stage 2's row
+  enforcement bites uniformly; selfhost works because stage 1
+  silently parses past the slashes.
+- **Path B (fallback)**: opt-in enforcement gated on a
+  user-loaded `--prelude stdlib/effects.kai` that declares the
+  atomic effects. compiler.kai doesn't load it; new user code
+  does. Smaller blast radius but two-tier semantics.
+
+Either path can ship the unblocked items quickly — main row
+inference and the structural pre-scanner are ~150 LOC and were
+working in the prototype.
+
+### Limitations of this report
+
+- Self-report bias: I'm reporting on my own scoping decision.
+  An adversarial reviewer might argue I should have shipped #4
+  (selfhost broken) and asked Eduardo to unblock. I picked the
+  conservative path because the lane already had three green
+  phases (Phase 1 `#derive(Eq/Hash)`, Phase 2 4-bug bundle,
+  Phase 3 Bug 5) that I did not want to put at risk on a
+  branch whose merge state Eduardo controls.
+- The "non-exhaustive match" panic in the pre-typer scanner is
+  not root-caused. If a future lane resurrects the walker, that
+  panic needs to be debugged first.
+- Single agent (Claude Opus 4.7). LOC/min and reasoning style
+  are not generalisable.
+
+### Phase 4 build TSV (raw)
+
+```
+timestamp	cmd	outcome	elapsed_s
+2026-04-26T22:34:25-04:00	make test	OK	57
+2026-04-26T22:45:21-04:00	make test	OK	190
+2026-04-26T22:45:41-04:00	make selfhost	OK	9
+2026-04-26T22:45:58-04:00	make selfhost-llvm	OK	7
+2026-04-26T22:47:26-04:00	test-llvm-coverage	OK	78
+```
