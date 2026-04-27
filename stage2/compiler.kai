@@ -20151,6 +20151,8 @@ fn derive_impl_for_protocol(pname: String, tname: String, body: TypeBody,
     derive_eq_impl(tname, body, line, col)
   } else if pname == "Hash" {
     derive_hash_impl(tname, body, line, col)
+  } else if pname == "Ord" {
+    derive_ord_impl(tname, body, line, col)
   } else {
     None
   }
@@ -20480,11 +20482,373 @@ fn derive_hash_sum_chain(acc: Expr, vargs: [TypeExpr], i: Int,
   }
 }
 
+# m12.8.z: `#derive(Ord)` synthesises a lexicographic `cmp` for records
+# (compare field-by-field in declaration order, return on the first
+# non-zero result) and a position-then-payload `cmp` for sum types
+# (variants ordered by their position in the declaration; for the
+# same variant, payloads compared lexicographically). Either form
+# delegates to `cmp` on the field / payload type, so the typer
+# rejects the derive transitively if any sub-component lacks an
+# `Ord` impl — naming the missing call site in the diagnostic.
+fn derive_ord_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
+  match body {
+    TBRecord(fields) -> {
+      let body_expr = derive_ord_record_body(fields, line, col)
+      Some(make_derived_impl("Ord", tname, "cmp",
+        [Param { pname: "a", ptype: Some(mk_ty(TyName(tname, []), line, col)),
+                 pline: line, pcol: col },
+         Param { pname: "b", ptype: Some(mk_ty(TyName(tname, []), line, col)),
+                 pline: line, pcol: col }],
+        mk_ty(TyName("Int", []), line, col),
+        body_expr, line, col))
+    }
+    TBSum(variants) -> {
+      let body_expr = derive_ord_sum_body(variants, line, col)
+      Some(make_derived_impl("Ord", tname, "cmp",
+        [Param { pname: "a", ptype: Some(mk_ty(TyName(tname, []), line, col)),
+                 pline: line, pcol: col },
+         Param { pname: "b", ptype: Some(mk_ty(TyName(tname, []), line, col)),
+                 pline: line, pcol: col }],
+        mk_ty(TyName("Int", []), line, col),
+        body_expr, line, col))
+    }
+    _ -> None
+  }
+}
+
+fn derive_ord_record_body(fields: [FieldDecl], line: Int, col: Int) : Expr {
+  match fields {
+    [] -> mk_expr(EInt(0), line, col)
+    [fd, ...rest] -> derive_ord_record_chain(fd, rest, 0, line, col)
+  }
+}
+
+fn derive_ord_record_chain(head: FieldDecl, rest: [FieldDecl], idx: Int,
+                            line: Int, col: Int) : Expr {
+  match head {
+    FD(name, _) -> {
+      let l_access = mk_expr(EField(mk_expr(EVar("a"), line, col), name), line, col)
+      let r_access = mk_expr(EField(mk_expr(EVar("b"), line, col), name), line, col)
+      let cmp_call = mk_expr(ECall(mk_expr(EVar("cmp"), line, col),
+                                    [l_access, r_access]),
+                             line, col)
+      match rest {
+        [] -> cmp_call
+        [next, ...more] -> {
+          let cvar = concat_all(["c", int_to_string(idx)])
+          let pat = mk_pat(PBind(cvar), line, col)
+          let let_stmt = SLet(pat, None, cmp_call)
+          let cond = mk_expr(EBinop("!=", mk_expr(EVar(cvar), line, col),
+                                          mk_expr(EInt(0), line, col)),
+                             line, col)
+          let then_e = mk_expr(EVar(cvar), line, col)
+          let else_e = derive_ord_record_chain(next, more, idx + 1, line, col)
+          let if_e = mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
+          mk_expr(EBlock([let_stmt], Some(if_e)), line, col)
+        }
+      }
+    }
+  }
+}
+
+fn derive_ord_sum_body(variants: [Variant], line: Int, col: Int) : Expr {
+  let scrut = mk_expr(EVar("a"), line, col)
+  let arms = derive_ord_sum_outer_arms(variants, variants, 0, line, col)
+  mk_expr(EMatch(scrut, arms), line, col)
+}
+
+fn derive_ord_sum_outer_arms(remaining: [Variant], all_variants: [Variant],
+                              idx: Int, line: Int, col: Int) : [Arm] {
+  match remaining {
+    [] -> []
+    [v, ...rest] -> {
+      let arm = derive_ord_sum_outer_arm(v, all_variants, idx, line, col)
+      [arm, ...derive_ord_sum_outer_arms(rest, all_variants, idx + 1, line, col)]
+    }
+  }
+}
+
+fn derive_ord_sum_outer_arm(outer_v: Variant, all_variants: [Variant],
+                             outer_idx: Int, line: Int, col: Int) : Arm {
+  match outer_v {
+    Var(name, vargs) -> {
+      let outer_pat_subs = derive_ord_sum_pat_subs(vargs, "a", 0, line, col)
+      let outer_pat = mk_pat(PVariant(name, outer_pat_subs), line, col)
+      let inner = derive_ord_sum_inner_match(outer_v, outer_idx,
+                                              all_variants, line, col)
+      Arm(outer_pat, None, inner)
+    }
+  }
+}
+
+# Like `derive_sum_pat_subs`, but lets the caller pick the binder
+# prefix so the inner match can use `b0/b1/...` instead of `a0/a1/...`.
+fn derive_ord_sum_pat_subs(vargs: [TypeExpr], prefix: String, i: Int,
+                            line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PBind(concat_all([prefix, int_to_string(i)])), line, col),
+       ...derive_ord_sum_pat_subs(rest, prefix, i + 1, line, col)]
+  }
+}
+
+fn derive_ord_sum_inner_match(outer_v: Variant, outer_idx: Int,
+                               all_variants: [Variant], line: Int, col: Int) : Expr {
+  let scrut = mk_expr(EVar("b"), line, col)
+  let arms = derive_ord_sum_inner_arms(outer_v, outer_idx, all_variants,
+                                        0, line, col)
+  mk_expr(EMatch(scrut, arms), line, col)
+}
+
+# Generates the inner-match arms for one outer variant. For each
+# variant in the type's declaration, with index `idx`:
+#   - idx <  outer_idx → that variant comes earlier in declaration
+#                         order, so `cmp(outer, that) == 1`. Emit an
+#                         explicit `Variant(_, _, ...) -> 1` arm.
+#   - idx == outer_idx → same variant: emit `Variant(b0, b1, ...) ->
+#                         <payload chain>`. After the self arm, fold
+#                         every later variant under a single
+#                         `_ -> -1` wildcard and stop.
+fn derive_ord_sum_inner_arms(outer_v: Variant, outer_idx: Int,
+                              variants: [Variant], idx: Int,
+                              line: Int, col: Int) : [Arm] {
+  match variants {
+    [] -> []
+    [v, ...rest] -> {
+      if idx < outer_idx {
+        let arm = derive_ord_sum_wild_arm(v, 1, line, col)
+        [arm, ...derive_ord_sum_inner_arms(outer_v, outer_idx, rest,
+                                            idx + 1, line, col)]
+      } else if idx == outer_idx {
+        let self_arm = derive_ord_sum_self_arm(outer_v, line, col)
+        match rest {
+          [] -> [self_arm]
+          _  -> [self_arm, derive_ord_sum_default_arm(-1, line, col)]
+        }
+      } else {
+        # Defensive: outer_idx is always within bounds, so this
+        # branch is unreachable. Returning [] keeps the recursion
+        # well-typed without an extra `panic`.
+        []
+      }
+    }
+  }
+}
+
+# `Variant(_, _, ...) -> <int>` — used for variants on the "wrong"
+# side of the outer-vs-inner comparison.
+fn derive_ord_sum_wild_arm(v: Variant, ret: Int, line: Int, col: Int) : Arm {
+  match v {
+    Var(name, vargs) -> {
+      let pats = derive_ord_sum_wild_pats(vargs, line, col)
+      let pat = mk_pat(PVariant(name, pats), line, col)
+      Arm(pat, None, mk_expr(EInt(ret), line, col))
+    }
+  }
+}
+
+fn derive_ord_sum_wild_pats(vargs: [TypeExpr], line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PWild, line, col),
+       ...derive_ord_sum_wild_pats(rest, line, col)]
+  }
+}
+
+# `_ -> <int>` — covers every variant after the outer's position.
+fn derive_ord_sum_default_arm(ret: Int, line: Int, col: Int) : Arm {
+  Arm(mk_pat(PWild, line, col), None, mk_expr(EInt(ret), line, col))
+}
+
+# `Variant(b0, b1, ...) -> <payload chain>` — the same-variant case.
+# Payloads are compared field-by-field in declaration order; the
+# first non-zero `cmp` wins.
+fn derive_ord_sum_self_arm(v: Variant, line: Int, col: Int) : Arm {
+  match v {
+    Var(name, vargs) -> {
+      let inner_pat_subs = derive_ord_sum_pat_subs(vargs, "b", 0, line, col)
+      let pat = mk_pat(PVariant(name, inner_pat_subs), line, col)
+      let body = derive_ord_payload_chain(vargs, 0, line, col)
+      Arm(pat, None, body)
+    }
+  }
+}
+
+fn derive_ord_payload_chain(vargs: [TypeExpr], idx: Int,
+                             line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> mk_expr(EInt(0), line, col)
+    [_, ...rest] -> {
+      let av = mk_expr(EVar(concat_all(["a", int_to_string(idx)])), line, col)
+      let bv = mk_expr(EVar(concat_all(["b", int_to_string(idx)])), line, col)
+      let cmp_call = mk_expr(ECall(mk_expr(EVar("cmp"), line, col), [av, bv]),
+                             line, col)
+      match rest {
+        [] -> cmp_call
+        _  -> {
+          let cvar = concat_all(["p", int_to_string(idx)])
+          let pat = mk_pat(PBind(cvar), line, col)
+          let let_stmt = SLet(pat, None, cmp_call)
+          let cond = mk_expr(EBinop("!=", mk_expr(EVar(cvar), line, col),
+                                          mk_expr(EInt(0), line, col)),
+                             line, col)
+          let then_e = mk_expr(EVar(cvar), line, col)
+          let else_e = derive_ord_payload_chain(rest, idx + 1, line, col)
+          let if_e = mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
+          mk_expr(EBlock([let_stmt], Some(if_e)), line, col)
+        }
+      }
+    }
+  }
+}
+
 fn make_derived_impl(pname: String, tname: String, opname: String,
                       params: [Param], ret: TypeExpr, body: Expr,
                       line: Int, col: Int) : Decl {
   let method = DFn(false, opname, [], params, Some(ret), REmpty, body, line, col)
   DImpl(pname, mk_ty(TyName(tname, []), line, col), [method], line, col)
+}
+
+# m12.8.z: pre-expansion validation for `#derive(Ord)`. Walks the
+# decl stream once to collect every type that has — or will have
+# after derivation — an `Ord` impl, then rejects any
+# `#derive(Ord) type T` whose fields/payloads reference a type that
+# does not appear in that set. The `T` itself is whitelisted to
+# allow recursive types. Parametric type heads (`List`, `Option`,
+# `Result`, `Fn`) collapse to their constructor name via
+# `proto_type_name`, so a field of type `[Int]` looks like `List`
+# in the providers set — and unless `impl Ord for List` is
+# declared, the derive is rejected.
+fn validate_derive_ord(decls: [Decl], file: String) : Int {
+  let providers = collect_ord_providers(decls, [])
+  validate_derive_ord_loop(decls, file, providers, 0)
+}
+
+fn collect_ord_providers(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DImpl(pname, target, _, _, _) ->
+        if pname == "Ord" {
+          collect_ord_providers(rest, [proto_type_name(target), ...acc])
+        } else {
+          collect_ord_providers(rest, acc)
+        }
+      DDerive(names, inner, _, _) -> match inner {
+        DType(_, tname, _, _, _, _) ->
+          if list_has(names, "Ord") {
+            collect_ord_providers(rest, [tname, ...acc])
+          } else {
+            collect_ord_providers(rest, acc)
+          }
+        _ -> collect_ord_providers(rest, acc)
+      }
+      _ -> collect_ord_providers(rest, acc)
+    }
+  }
+}
+
+fn validate_derive_ord_loop(decls: [Decl], file: String,
+                              providers: [String], errs: Int) : Int {
+  match decls {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DDerive(names, inner, _, _) -> match inner {
+        DType(_, tname, _, body, line, col) ->
+          if list_has(names, "Ord") {
+            let errs1 = validate_derive_ord_body(file, tname, body, providers,
+                                                  line, col, errs)
+            validate_derive_ord_loop(rest, file, providers, errs1)
+          } else {
+            validate_derive_ord_loop(rest, file, providers, errs)
+          }
+        _ -> validate_derive_ord_loop(rest, file, providers, errs)
+      }
+      _ -> validate_derive_ord_loop(rest, file, providers, errs)
+    }
+  }
+}
+
+fn validate_derive_ord_body(file: String, tname: String, body: TypeBody,
+                              providers: [String], line: Int, col: Int,
+                              errs: Int) : Int {
+  match body {
+    TBRecord(fields) -> validate_derive_ord_fields(file, tname, fields,
+                                                     providers, line, col, errs)
+    TBSum(variants) -> validate_derive_ord_variants(file, tname, variants,
+                                                      providers, line, col, errs)
+    # Aliases / effect-aliases never reach derive — `derive_ord_impl`
+    # returns None for them and the existing pipeline handles the
+    # resulting "no impl" surface elsewhere. Nothing to validate here.
+    _ -> errs
+  }
+}
+
+fn validate_derive_ord_fields(file: String, tname: String,
+                                fields: [FieldDecl], providers: [String],
+                                line: Int, col: Int, errs: Int) : Int {
+  match fields {
+    [] -> errs
+    [fd, ...rest] -> match fd {
+      FD(fname, ftype) -> {
+        let errs1 = validate_derive_ord_one(file, tname, fname, "field",
+                                              ftype, providers, line, col, errs)
+        validate_derive_ord_fields(file, tname, rest, providers, line, col, errs1)
+      }
+    }
+  }
+}
+
+fn validate_derive_ord_variants(file: String, tname: String,
+                                  variants: [Variant], providers: [String],
+                                  line: Int, col: Int, errs: Int) : Int {
+  match variants {
+    [] -> errs
+    [v, ...rest] -> match v {
+      Var(vname, vargs) -> {
+        let errs1 = validate_derive_ord_payload(file, tname, vname, vargs, 0,
+                                                  providers, line, col, errs)
+        validate_derive_ord_variants(file, tname, rest, providers, line, col, errs1)
+      }
+    }
+  }
+}
+
+fn validate_derive_ord_payload(file: String, tname: String, vname: String,
+                                 vargs: [TypeExpr], idx: Int,
+                                 providers: [String], line: Int, col: Int,
+                                 errs: Int) : Int {
+  match vargs {
+    [] -> errs
+    [vt, ...rest] -> {
+      let label = concat_all([vname, " payload #", int_to_string(idx)])
+      let errs1 = validate_derive_ord_one(file, tname, label, "variant",
+                                            vt, providers, line, col, errs)
+      validate_derive_ord_payload(file, tname, vname, rest, idx + 1,
+                                    providers, line, col, errs1)
+    }
+  }
+}
+
+fn validate_derive_ord_one(file: String, tname: String, fname: String,
+                             kind: String, ftype: TypeExpr,
+                             providers: [String], line: Int, col: Int,
+                             errs: Int) : Int {
+  let head = proto_type_name(ftype)
+  if head == tname {
+    errs
+  } else if list_has(providers, head) {
+    errs
+  } else {
+    eprint(concat_all([
+      file, ":", int_to_string(line), ":", int_to_string(col),
+      ": error: cannot `#derive(Ord)` for `", tname,
+      "`: no `Ord` impl for ", kind, " `", fname, "` of type `", head,
+      "` (declare `impl Ord for ", head, "` or `#derive(Ord)` on `", head, "`)"]))
+    errs + 1
+  }
 }
 
 # Top-level entry point. Hands the post-desugar decl stream back
@@ -20498,13 +20862,24 @@ fn lower_protocols(decls: [Decl], file: String) : LoweredProtocols {
   # this compilation unit. Reported errors short-circuit the typer
   # via `proto_errs > 0` in the driver.
   let pre_errs = validate_derives(decls, file)
+  # Step 0b — m12.8.z: validate `#derive(Ord)` against available
+  # impls *before* expansion. The synthesised `cmp` body delegates
+  # to `cmp` on each field type, and the post-inference rewrite
+  # silently routes missing-impl calls to the dispatcher's runtime
+  # `panic` (a v1 tradeoff explained in §"resolve_protocol_calls").
+  # That fallback is acceptable for hand-written impls but a poor
+  # user experience for derived ones, where the field-level cause
+  # isn't surfaced. This pass walks the original decl stream
+  # (DDerive nodes still intact) and emits a clear typer-time error
+  # naming the offending field/payload.
+  let derive_errs = validate_derive_ord(decls, file)
   # Step 1 — expand `#derive(...)` annotations into synthetic DImpl
   # decls so subsequent steps see all impls uniformly.
   let expanded = expand_derives(decls)
   # Step 2 — coherence: orphan + duplicate-impl validation.
   let proto_names = collect_proto_names(expanded, [])
   let local_types = collect_local_type_names(expanded, [])
-  let errs = pre_errs + validate_impls(expanded, file, proto_names, local_types)
+  let errs = pre_errs + derive_errs + validate_impls(expanded, file, proto_names, local_types)
   # Step 3 — collect every protocol op into the registry.
   let reg0 = collect_proto_decls(expanded, proto_reg_empty())
   # Step 4 — lower each DImpl method into a top-level DFn (mangled

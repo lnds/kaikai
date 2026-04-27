@@ -251,7 +251,7 @@ For records and sum types whose fields all already have `impl P`, the
 user can derive trivially:
 
 ```kai
-#derive(Show, Eq, Hash)
+#derive(Show, Eq, Hash, Ord)
 type Account = { id: AccountId, balance: Decimal[USD], txs: Int }
 
 #derive(Show, Eq, Hash)
@@ -283,6 +283,61 @@ a builtin from stdlib). The diagnostic names the variant and the
 offending field type. Records continue to fall through to the
 dispatcher's runtime panic for missing field impls; promoting that
 to a compile-time error is left for a follow-up.
+
+### Supported protocols and shapes
+
+| Protocol | Records | Sum types | Notes |
+|---|---|---|---|
+| `Show` | ✓ | ✓ | renders `Type { f: v, ... }` and `Variant(arg, ...)` |
+| `Eq`   | ✓ | ✓ | record fields conjoined with `and`; sum types validated against field-impl set |
+| `Hash` | ✓ | ✓ | polynomial mix (`h * 31 + h_next`); sums validated against field-impl set |
+| `Ord`  | ✓ | ✓ | lexicographic by declaration order; sums by variant position then payload |
+| `Serialize` | — | — | needs return-type-driven dispatch (post-v1) |
+
+### Order semantics for `#derive(Ord)`
+
+Records compare lexicographically in declaration order: the first
+field whose `cmp` returns non-zero decides the result. Sum types
+compare by **variant declaration position** first (variant 0 < variant
+1 < ...); within the same variant, payloads compare lexicographically
+by position. The synthesised `cmp` for
+
+```kai
+#derive(Ord)
+type Tier = Bronze | Silver | Gold | Platinum
+```
+
+returns `-1` for `cmp(Bronze, Silver)`, `1` for `cmp(Gold, Bronze)`,
+and `0` for `cmp(Platinum, Platinum)`. The same rule extends to
+variants with payload: `cmp(Circle(99), Square(0)) == -1` because
+`Circle` is declared before `Square`, regardless of the inner radius.
+
+`#derive(Ord)` is consistent with `#derive(Eq)`: when both are
+derived (or `Eq` is hand-written to mirror the same field traversal),
+`cmp(a, b) == 0` ↔ `eq(a, b)`. The compiler does not enforce this
+across hand-written impls; users who derive only one of the two
+should keep them in sync.
+
+### Field-impl validation
+
+Before lowering a `#derive(Ord)` annotation, the compiler walks each
+field (or variant payload) and confirms the head type appears either
+in a same-unit `impl Ord for T` or in another `#derive(Ord)`. Missing
+impls are rejected at typer time with a diagnostic naming both the
+offending field and its type, e.g.:
+
+```
+foo.kai:7:1: error: cannot `#derive(Ord)` for `Tagged`: no `Ord`
+impl for field `tag` of type `String` (declare `impl Ord for String`
+or `#derive(Ord)` on `String`)
+```
+
+The same kind of validation runs for `#derive(Eq)` and `#derive(Hash)`
+on sum types (m12.8.x); the gap remaining is records with `Show` /
+`Eq` / `Hash` annotations referencing missing field impls — those still
+fall through to the dispatcher's runtime `panic`. Tightening that
+case to a compile-time error is a follow-up captured in
+`docs/m12.8-followup.md`.
 
 ## Composition with other features
 
