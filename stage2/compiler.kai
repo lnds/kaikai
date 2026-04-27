@@ -13247,14 +13247,14 @@ fn synth_handle(st: InferState, e: Expr) : Inferred {
       # m7a #4e: every clause name must be a declared op of `eff_name`.
       let st_out2 = check_clause_names(st_out1, eff_name, clauses, e.line, e.col)
       let stateful = match init_opt { Some(_) -> true None -> false }
-      let st_clauses = check_clauses_types(st_out2, eff_name, clauses,
-                                            stateful, init_typed_st.state_ty,
-                                            resolved_eff_tyargs)
-      let r_typed = check_return_clause_opt(st_clauses, ret_opt, rb.ty,
+      let cs_typed = check_clauses_types(st_out2, eff_name, clauses,
+                                          stateful, init_typed_st.state_ty,
+                                          resolved_eff_tyargs)
+      let r_typed = check_return_clause_opt(cs_typed.st, ret_opt, rb.ty,
                                              stateful, init_typed_st.state_ty)
       let new_e = with_ty(
         mk_expr(EHandle(rb.expr, eff_name, eff_tyargs, init_typed_st.init_opt,
-                         alias_opt, clauses, r_typed.ret_opt),
+                         alias_opt, cs_typed.clauses, r_typed.ret_opt),
                 e.line, e.col),
         r_typed.ty)
       mk_inferred(r_typed.st, r_typed.ty, new_e)
@@ -13304,13 +13304,20 @@ fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
 # the op's signature we fall back to fresh tyvars for any unbound
 # slot — clause-arity validation is a separate diagnostic-baseline
 # task (m7a #8).
+type ClausesTyped = { st: InferState, clauses: [HClause] }
+
 fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause],
                         stateful: Bool, state_ty: Option[Ty],
-                        eff_tyargs: [Ty]) : InferState {
+                        eff_tyargs: [Ty]) : ClausesTyped =
+  check_clauses_types_loop(st, eff_name, cs, stateful, state_ty, eff_tyargs, [])
+
+fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
+                             stateful: Bool, state_ty: Option[Ty],
+                             eff_tyargs: [Ty], acc: [HClause]) : ClausesTyped {
   match cs {
-    [] -> st
+    [] -> ClausesTyped { st: st, clauses: list_reverse(acc) }
     [c, ...rest] -> match c {
-      HC(op_name, params, body, _, _) -> {
+      HC(op_name, params, body, line, col) -> {
         let outer = st
         # m7b #11l: bind the clause params and unify the op's
         # effect-tparam tyvars with the handler's instantiation, so
@@ -13339,7 +13346,16 @@ fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause],
         let rb = synth(st_resume, body)
         let st_out0 = st_restore_entries(outer, rb.st)
         let st_out = st_set_clause_resume(st_out0, outer.clause_resume)
-        check_clauses_types(st_out, eff_name, rest, stateful, state_ty, eff_tyargs)
+        # m12.8 Phase 4b followup: keep the typed body so the
+        # alias-aware op resolution that fired inside `synth` (e.g.
+        # rewriting `Console.print(...)` to `EVar("Stdout.print")`)
+        # actually reaches the emit phase. Returning only `st` and
+        # discarding `rb.expr` was the bug behind the `kai_Console`
+        # leak in `demos/concurrent` — handler-clause bodies kept the
+        # original `EField(EVar("Console"), "print")` shape.
+        let new_clause = HC(op_name, params, rb.expr, line, col)
+        check_clauses_types_loop(st_out, eff_name, rest, stateful, state_ty,
+                                  eff_tyargs, [new_clause, ...acc])
       }
     }
   }
