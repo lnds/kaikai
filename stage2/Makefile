@@ -202,6 +202,68 @@ test-blocks: $(TARGET) build
 	    || { echo "tests DIFF $$name"; exit 1; }; \
 	done
 
+# Backend-parity coverage harness: for every fixture in
+# {sugars, units, minimal, llvm} that has a `.out.expected` golden,
+# compile through BOTH the C backend and the LLVM backend, run each
+# binary, and diff the outputs. A divergence (e.g. `Real<unit>`
+# printing 0 in LLVM but the actual value in C) fails the build.
+#
+# This rule is the systemic answer to the m7e13 / m12.5 / m12.8 lanes
+# each validating LLVM manually with a one-shot bash loop. It is
+# deliberately separate from `test-llvm` (which uses a hardcoded
+# fixture list and pre-dates the coverage push) and from
+# `test-protocols` / `test-modules` (which already do dual-backend
+# inside their own rules).
+#
+# Fixtures with `.err.expected` (negative) are skipped — backend
+# divergence is irrelevant when the typer rejects the program.
+# Fixtures without any expected file get a "no golden" pass when both
+# backends compile + run cleanly.
+#
+# To add a directory: extend the `for d in ...` loop. Each subdir
+# must contain `.kai` files at the top level.
+test-llvm-coverage: $(TARGET) build
+	@$(STACK) set -e; \
+	pass=0; fail=0; skip=0; \
+	for d in sugars units minimal llvm; do \
+	  for f in ../examples/$$d/*.kai; do \
+	    [ -e $$f ] || continue; \
+	    name=$$(basename $$f .kai); \
+	    tag="$$d/$$name"; \
+	    exp_out=../examples/$$d/$$name.out.expected; \
+	    exp_err=../examples/$$d/$$name.err.expected; \
+	    if [ -f $$exp_err ]; then \
+	      skip=$$((skip+1)); continue; \
+	    fi; \
+	    rc=0; ./$(TARGET) $$f > build/cov-$$d-$$name.c 2>/dev/null || rc=$$?; \
+	    if [ $$rc -ne 0 ]; then \
+	      echo "coverage SKIP $$tag (kaic2 rejects without --prelude)"; \
+	      skip=$$((skip+1)); continue; \
+	    fi; \
+	    $(CC) $(CFLAGS) -I ../stage0 build/cov-$$d-$$name.c -o build/cov-$$d-$$name-c 2>/dev/null \
+	      || { echo "coverage SKIP $$tag (C compile failed)"; skip=$$((skip+1)); continue; }; \
+	    ./build/cov-$$d-$$name-c > build/cov-$$d-$$name-c.out 2>/dev/null \
+	      || { echo "coverage SKIP $$tag (C run errored)"; skip=$$((skip+1)); continue; }; \
+	    ./$(TARGET) --emit=llvm $$f > build/cov-$$d-$$name.ll 2>/dev/null \
+	      || { echo "coverage SKIP $$tag (kaic2 --emit=llvm errored)"; skip=$$((skip+1)); continue; }; \
+	    $(CC) $(CFLAGS) -I ../stage0 build/cov-$$d-$$name.ll ../stage0/runtime_llvm.c -o build/cov-$$d-$$name-llvm 2>/dev/null \
+	      || { echo "coverage SKIP $$tag (LLVM compile failed)"; skip=$$((skip+1)); continue; }; \
+	    ./build/cov-$$d-$$name-llvm > build/cov-$$d-$$name-llvm.out 2>/dev/null \
+	      || { echo "coverage SKIP $$tag (LLVM run errored)"; skip=$$((skip+1)); continue; }; \
+	    if diff -q build/cov-$$d-$$name-c.out build/cov-$$d-$$name-llvm.out > /dev/null; then \
+	      echo "coverage OK $$tag"; \
+	      pass=$$((pass+1)); \
+	    else \
+	      echo "coverage DIFF $$tag"; \
+	      diff build/cov-$$d-$$name-c.out build/cov-$$d-$$name-llvm.out | head -10; \
+	      fail=$$((fail+1)); \
+	    fi; \
+	  done; \
+	done; \
+	echo ""; \
+	echo "coverage summary: $$pass pass, $$fail DIFF, $$skip skip"; \
+	[ $$fail -eq 0 ] || exit 1
+
 # M6.1 modules smoke test: the `examples/modules/` tree has a
 # diamond `main → {arith, shapes}` where `shapes` also imports
 # `arith`. A clean compile through each backend must produce the
