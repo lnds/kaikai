@@ -17625,6 +17625,305 @@ fn dump_holes_json(file: String, decls: [Decl]) : Int / Console {
   r.errs
 }
 
+# ---- `--effects-json`: per-fn effect graph as data (m7f §5) ----
+#
+# For each user-declared `DFn` in the typed AST, emit a JSON object
+# capturing the effects performed by the body and the handlers
+# installed within it. Effect detection is post-inference: the typed
+# `EVar("Eff.op")` references inside the body name the effects;
+# `EHandle` nodes name the handlers. Returns the inference's error
+# count so a typer-rejected program still produces a non-zero exit.
+#
+# Schema (stable):
+#   [{"fn": String, "line": Int, "col": Int,
+#     "effects": [String],
+#     "handlers_installed": [{"effect": String, "line": Int, "col": Int}]}]
+#
+# `effects` lists each *distinct* effect performed by the body in
+# declaration order of first appearance (sorted lexicographically
+# would also be fine — the schema does not promise an order, but
+# stable across runs is the only invariant a consumer needs).
+# Compiler-internal aliases like `__proto_show` are filtered out.
+
+type EffUseAcc = { effs: [String], handlers: [EffHandle] }
+type EffHandle = EH(String, Int, Int)
+
+fn dump_effects_json(file: String, decls: [Decl]) : Int / Console {
+  let r = infer_program(file, decls, false)
+  let entries = effects_walk_decls(r.decls, [])
+  let body = join_with(map(entries, effects_json_entry), ", ")
+  print(concat_all(["[", body, "]"]))
+  r.errs
+}
+
+type EffEntry = { fn_name: String, line: Int, col: Int,
+                  effs: [String], handlers: [EffHandle] }
+
+fn effects_walk_decls(decls: [Decl], acc: [EffEntry]) : [EffEntry] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DFn(_, name, _, _, _, _, body, line, col) ->
+        if effects_skip_internal(name) {
+          effects_walk_decls(rest, acc)
+        } else {
+          let acc0 = EffUseAcc { effs: [], handlers: [] }
+          let used = effects_collect_expr(body, acc0)
+          let entry = EffEntry { fn_name: name, line: line, col: col,
+                                  effs: used.effs, handlers: used.handlers }
+          effects_walk_decls(rest, [entry, ...acc])
+        }
+      _ -> effects_walk_decls(rest, acc)
+    }
+  }
+}
+
+# Skip compiler-generated names (protocol dispatchers, impl bodies,
+# auto-derived ops). They all start with `__`; the user did not
+# write them and an LLM consuming the JSON does not care about
+# them.
+fn effects_skip_internal(name: String) : Bool =
+  effects_starts_with_underscore_pair(name)
+
+fn effects_starts_with_underscore_pair(name: String) : Bool {
+  match char_at(name, 0) {
+    Some(c0) -> if c0 == '_' {
+      match char_at(name, 1) {
+        Some(c1) -> c1 == '_'
+        None     -> false
+      }
+    } else { false }
+    None -> false
+  }
+}
+
+# Walker over typed Expr — collects (a) every effect whose op is
+# called via `EVar("Eff.op")` (post-desugar_op_calls form), and
+# (b) every EHandle's effect+location. Recurse via map_expr_kind
+# for the structural cases; explicit cases for EVar (the source of
+# truth) and EHandle (handler installation).
+fn effects_collect_expr(e: Expr, acc: EffUseAcc) : EffUseAcc =
+  effects_collect_kind(e.kind, e.line, e.col, acc)
+
+fn effects_collect_kind(k: ExprKind, line: Int, col: Int,
+                         acc: EffUseAcc) : EffUseAcc {
+  match k {
+    EVar(name) -> {
+      # `Eff.op` qualified names — desugar_op_calls flattens
+      # EField(EVar(eff), op) into EVar("eff.op") before this point.
+      match effects_split_qualified(name) {
+        Some(eff) -> EffUseAcc {
+          effs: effects_add_unique(eff, acc.effs),
+          handlers: acc.handlers
+        }
+        None -> acc
+      }
+    }
+    EHandle(body, eff_name, _, init_opt, _, clauses, ret_opt) -> {
+      let h = EH(eff_name, line, col)
+      let acc1 = EffUseAcc { effs: acc.effs,
+                              handlers: [h, ...acc.handlers] }
+      let acc2 = effects_collect_expr(body, acc1)
+      let acc3 = match init_opt {
+        Some(e2) -> effects_collect_expr(e2, acc2)
+        None     -> acc2
+      }
+      let acc4 = effects_collect_clauses(clauses, acc3)
+      effects_collect_opt_return(ret_opt, acc4)
+    }
+    EBlock(stmts, tail) -> {
+      let a1 = effects_collect_stmts(stmts, acc)
+      match tail {
+        Some(t) -> effects_collect_expr(t, a1)
+        None    -> a1
+      }
+    }
+    EMatch(scr, arms) -> {
+      let a1 = effects_collect_expr(scr, acc)
+      effects_collect_arms(arms, a1)
+    }
+    ECall(callee, args_) -> {
+      let a1 = effects_collect_expr(callee, acc)
+      effects_collect_exprs(args_, a1)
+    }
+    EField(base, _) -> effects_collect_expr(base, acc)
+    EIndex(a, b) -> {
+      let a1 = effects_collect_expr(a, acc)
+      effects_collect_expr(b, a1)
+    }
+    EBinop(_, a, b) -> {
+      let a1 = effects_collect_expr(a, acc)
+      effects_collect_expr(b, a1)
+    }
+    EUnop(_, x) -> effects_collect_expr(x, acc)
+    EIf(c, t_, eo) -> {
+      let a1 = effects_collect_expr(c, acc)
+      let a2 = effects_collect_expr(t_, a1)
+      match eo {
+        Some(e2) -> effects_collect_expr(e2, a2)
+        None     -> a2
+      }
+    }
+    ELambda(_, b) -> effects_collect_expr(b, acc)
+    ERecordLit(_, fields) -> effects_collect_fields(fields, acc)
+    EList(elems) -> effects_collect_elems(elems, acc)
+    ERange(a, b, opt_step) -> {
+      let a1 = effects_collect_expr(a, acc)
+      let a2 = effects_collect_expr(b, a1)
+      match opt_step {
+        Some(s) -> effects_collect_expr(s, a2)
+        None    -> a2
+      }
+    }
+    EPipe(a, b) -> {
+      let a1 = effects_collect_expr(a, acc)
+      effects_collect_expr(b, a1)
+    }
+    ELitUnit(inner, _) -> effects_collect_expr(inner, acc)
+    EBang(inner) -> effects_collect_expr(inner, acc)
+    _ -> acc
+  }
+}
+
+fn effects_collect_exprs(es: [Expr], acc: EffUseAcc) : EffUseAcc {
+  match es {
+    [] -> acc
+    [h, ...rest] -> effects_collect_exprs(rest, effects_collect_expr(h, acc))
+  }
+}
+
+fn effects_collect_stmts(ss: [Stmt], acc: EffUseAcc) : EffUseAcc {
+  match ss {
+    [] -> acc
+    [s, ...rest] -> match s {
+      SLet(_, _, rhs) -> effects_collect_stmts(rest, effects_collect_expr(rhs, acc))
+      SAssert(c, m) -> {
+        let a1 = effects_collect_expr(c, acc)
+        let a2 = match m { Some(mx) -> effects_collect_expr(mx, a1) None -> a1 }
+        effects_collect_stmts(rest, a2)
+      }
+      SExprStmt(x) -> effects_collect_stmts(rest, effects_collect_expr(x, acc))
+      SIndexAssign(b, i, v, _, _) -> {
+        let a1 = effects_collect_expr(b, acc)
+        let a2 = effects_collect_expr(i, a1)
+        let a3 = effects_collect_expr(v, a2)
+        effects_collect_stmts(rest, a3)
+      }
+      SVar(_, _, rhs, _, _) -> effects_collect_stmts(rest, effects_collect_expr(rhs, acc))
+      SUse(_, _, _) -> effects_collect_stmts(rest, acc)
+    }
+  }
+}
+
+fn effects_collect_arms(arms: [Arm], acc: EffUseAcc) : EffUseAcc {
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a {
+      Arm(_, g, b) -> {
+        let a1 = match g { Some(gg) -> effects_collect_expr(gg, acc) None -> acc }
+        let a2 = effects_collect_expr(b, a1)
+        effects_collect_arms(rest, a2)
+      }
+    }
+  }
+}
+
+fn effects_collect_fields(fs: [FieldInit], acc: EffUseAcc) : EffUseAcc {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      FI(_, v) -> effects_collect_fields(rest, effects_collect_expr(v, acc))
+    }
+  }
+}
+
+fn effects_collect_elems(els: [ListElem], acc: EffUseAcc) : EffUseAcc {
+  match els {
+    [] -> acc
+    [el, ...rest] -> match el {
+      ElPlain(x)  -> effects_collect_elems(rest, effects_collect_expr(x, acc))
+      ElSpread(x) -> effects_collect_elems(rest, effects_collect_expr(x, acc))
+    }
+  }
+}
+
+fn effects_collect_clauses(cs: [HClause], acc: EffUseAcc) : EffUseAcc {
+  match cs {
+    [] -> acc
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) -> effects_collect_clauses(rest, effects_collect_expr(b, acc))
+    }
+  }
+}
+
+fn effects_collect_opt_return(opt: Option[HReturn], acc: EffUseAcc) : EffUseAcc {
+  match opt {
+    None -> acc
+    Some(r) -> match r {
+      HR(_, b, _, _) -> effects_collect_expr(b, acc)
+    }
+  }
+}
+
+# Split `"Eff.op"` into `Some("Eff")` if the name has the qualified
+# shape that desugar_op_calls produces. Reject names that start with
+# `__` (compiler-generated dispatchers, impl bodies, etc.) so
+# protocol dispatch traffic doesn't pollute the effect graph.
+fn effects_split_qualified(name: String) : Option[String] {
+  if effects_starts_with_underscore_pair(name) { None }
+  else { effects_find_dot(name, 0, string_length(name)) }
+}
+
+fn effects_find_dot(name: String, i: Int, n: Int) : Option[String] {
+  if i >= n { None }
+  else {
+    match char_at(name, i) {
+      Some(c) -> {
+        if c == '.' {
+          let prefix = string_slice(name, 0, i)
+          # First char must be uppercase so we don't catch e.g.
+          # `list.length` (records) — kaikai effects are uppercase.
+          let upper = match char_at(prefix, 0) {
+            Some(p) -> p >= 'A' and p <= 'Z'
+            None    -> false
+          }
+          if upper { Some(prefix) } else { None }
+        } else {
+          effects_find_dot(name, i + 1, n)
+        }
+      }
+      None -> None
+    }
+  }
+}
+
+fn effects_add_unique(eff: String, effs: [String]) : [String] {
+  if list_has(effs, eff) { effs } else { list_append(effs, [eff]) }
+}
+
+fn effects_json_entry(e: EffEntry) : String =
+  concat_all([
+    "{",
+    "\"fn\": ", json_str(e.fn_name),
+    ", \"line\": ", int_to_string(e.line),
+    ", \"col\": ", int_to_string(e.col),
+    ", \"effects\": [",
+    join_with(map(e.effs, json_str), ", "),
+    "], \"handlers_installed\": [",
+    join_with(map(e.handlers, effects_json_handler), ", "),
+    "]}"
+  ])
+
+fn effects_json_handler(h: EffHandle) : String {
+  match h {
+    EH(eff, line, col) -> concat_all([
+      "{\"effect\": ", json_str(eff),
+      ", \"line\": ", int_to_string(line),
+      ", \"col\": ", int_to_string(col), "}"
+    ])
+  }
+}
+
 # --strict-holes uses this on the normal compile path: emit a
 # one-line diagnostic per hole to stderr, and promote the hole count
 # to the return code so the driver skips emission. Users who want the
@@ -22663,6 +22962,7 @@ type Mode
   | MDumpLastUse
   | MHoles
   | MHolesJson
+  | MEffectsJson
   | MEmitLlvm
   | MTest
   | MHelp
@@ -22721,6 +23021,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MHoles))
       } else if a == "--holes-json" {
         parse_cli_loop(more, cli_with_mode(opts, MHolesJson))
+      } else if a == "--effects-json" {
+        parse_cli_loop(more, cli_with_mode(opts, MEffectsJson))
       } else if a == "--strict-holes" {
         parse_cli_loop(more, cli_with_strict_holes(opts))
       } else if a == "--emit=llvm" {
@@ -23356,6 +23658,10 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               MHolesJson -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_holes_json(path, all_decls) }
+              }
+              MEffectsJson -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_effects_json(path, all_decls) }
               }
               _ -> {
                 let chk = check_program(path, all_decls)
