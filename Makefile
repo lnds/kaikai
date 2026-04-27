@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos selfhost clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos demos-verify selfhost clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -37,6 +37,14 @@ test-demos: kaic1
 	  ./bin/kai test $$f > /tmp/kaikai-$$name-t.out 2>&1 || true; \
 	  echo "demo OK $$name"; \
 	done
+
+# m12.8 Phase 3 — Core demo gate. Delegates to stage2's
+# `test-demos-core` which builds each demo under examples/portfolio/
+# and examples/usd_to_eur/ on both backends, redirects stdin from the
+# `.in` fixture when present, and diffs against `.out.expected`. The
+# top-level alias matches the name Eric proposed in the m12.8 review.
+demos-verify: kaic2
+	$(MAKE) -C stage2 test-demos-core
 
 # Self-hosting fixed point for both compilers.
 selfhost:

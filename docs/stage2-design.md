@@ -835,6 +835,33 @@ framework", not Core alone.
 
 Estimated time to Core CLOSED under this revised criterion: 4-6 days.
 
+**Update 2026-04-27 (final) — Core CLOSED (revised criterion).**
+Both structural items above are in. The Stdout / Stderr atomic split
+landed in m12.8 Phase 4b (`8b134bb`, `54d5364`, `ee49db2`), with
+`Console = Stdout + Stderr + Stdin` and `Io = Console + Env + File`
+shipping as effect aliases plus alias-aware op resolution. The
+parametric `impl[u: Unit] Show for Real<u>` landed in m12.8 Phase 2
+(`81e0306`) — the v1 takes a call-site rewrite shortcut around the
+still-identity m4c monomorphiser, but the user-visible behaviour
+matches the original ask (`#{x : Real<USD>}` renders as `"100 USD"`).
+Both demos are in the repo:
+
+- `examples/portfolio/portfolio.kai` + `portfolio.out.expected`
+- `examples/usd_to_eur/usd_to_eur.kai` + `usd_to_eur.in` + `usd_to_eur.out.expected`
+
+Wired into `make test` via the new `stage2/Makefile :: test-demos-core`
+target. The diff is exact (post-Phase-2 output, not the README's
+aspirational format — the `.out.expected` files capture what the
+compiler actually produces, e.g. `EUR * 1 / USD` for the canonical
+form of `EUR/USD` from `unit_expr_display`). Demos remain editable
+only via the goldens; the .kai sources are immutable per the review
+note ("when the compiler reaches the demo, the demo wins").
+
+`m12_8_compiler_shapes.kai` stays as the smoke test for the derive
+surface. `test-demos-core` is the demo-based gate the user asked for.
+Both runs the C and LLVM backends; selfhost C + LLVM remain at fixed
+point.
+
 What is **not** in Core but is part of Full:
 
 - Remaining m7e items: `variants[T]()`, main-row inference, `use Effect`.
