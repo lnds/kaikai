@@ -388,3 +388,130 @@ timestamp	cmd	outcome	elapsed_s
 2026-04-26T21:42:11-04:00	make selfhost	OK	11
 2026-04-26T21:42:27-04:00	make selfhost-llvm	OK	8
 ```
+
+### Bug 5 — postfix `.method()` sugar + missing-impl diagnostic
+
+Eduardo added Bug 5 to phase-2 scope after the four-bug bundle had
+already shipped (commit `4e20b67` on main). It is ergonomic, not
+functional — `show(x)` inside `impl Show for X` looks recursive
+even though the rewrite dispatches it elsewhere — so it lands as
+a postfix method-call sugar `x.op()` that desugars to `op(x)`.
+
+#### Objective metrics
+
+- **Wall-clock incremental for Bug 5**: ~14 minutes from "start
+  reading the spec" to first commit.
+- **LOC added in `stage2/compiler.kai`**:
+  - Method-call arm in `desugar_interp_kind`'s ECall branch: ~25
+    LOC (one match arm; uses the existing op_names plumbing).
+  - `validate_resolved_protocols` walker (the missing-impl
+    diagnostic): ~210 LOC of mechanical mirror of the existing
+    `resolve_protocol_calls_kind` walker shape, threaded with an
+    Int errs accumulator. Plus the driver wiring (~10 LOC).
+- **Makefile**: imported `test-llvm-coverage` from main `bd0c5b0`
+  (~48 LOC). Coverage harness ran 61 pass / 0 DIFF / 13 skip on
+  the post-fix branch.
+- **Fixtures**: `m12_8_y_postfix_method_call.kai` (positive,
+  records + sums + `w.show()` on both sides of `++`) and
+  `m12_8_y_postfix_no_impl.kai` (negative, `b.show()` where
+  `Bare` has no impl Show; `.err.expected` matches `no impl of
+  \`Show\` for type \`Bare\``).
+
+#### Errors I encountered
+
+- **Duplicate impl on the first fixture draft**: I wrote both
+  `#derive(Show) type Inner = A | B` and a manual `impl Show for
+  Inner` in the same file. Phase 1's coherence check correctly
+  flagged the duplicate. Dropped the manual impl, regenerated.
+- **Two trivial parser nits in the validator walker**: kaikai
+  rejects `else match X { ... }` — needs explicit braces
+  (`else { match X { ... } }`); and rest-pattern bindings with
+  `[head, ..._]` need a name (`[head, ...rest]`), even when
+  unused. Both are five-second fixes.
+
+#### Friction points
+
+- **The "missing-impl as a typer-level error" feature was
+  arguably out of strict Bug 5 scope** but the negative fixture
+  (`m12_8_y_postfix_no_impl.err.expected`) implicitly required it.
+  Phase 1's m12.8 v1 had explicitly chosen "runtime panic" for
+  missing impls; Bug 5's negative fixture forces the choice the
+  other way. Implementing it touches a non-trivial amount of
+  walker boilerplate (mirroring `resolve_protocol_calls_kind`'s
+  shape but Int-valued), but the change is purely additive — no
+  existing behaviour breaks unless the user actually called a
+  protocol op on a concrete-type-with-no-impl, in which case the
+  v1 runtime panic is replaced by a clean compile-time
+  diagnostic. All 61 coverage fixtures still pass, all selfhost
+  gates green.
+- **Folding the method-call rewrite into the interp desugar pass
+  vs. a separate pass**: chose to fold. The interp pass is the
+  natural home for "post-`lower_protocols` desugars that depend on
+  `op_names`". Adding a method-call arm in the same `ECall` match
+  costs five lines of dispatch and avoids a second walker.
+
+#### Spec ambiguities or interpretive choices
+
+- **Field-vs-protocol-op precedence**: the lane spec suggested
+  "first try field-call, fall through to protocol-op if field
+  doesn't exist". I went the other way: when the field name
+  matches a registered protocol op, the desugar **always** lifts
+  to a protocol call. Reason: the desugar runs before the typer,
+  so we don't have the receiver's type yet, so we can't ask "does
+  this field exist on this record?". A user who declares a record
+  field with the same name as a protocol op (`record { show: fn(
+  Self) -> String }`) would be surprised; this is documented as
+  the same edge as the existing `__proto_<op>` rename pass and
+  noted as a v1 limitation. Realistic field names that collide
+  with protocol ops (`show`, `eq`, `cmp`, `hash`,
+  `to_string`/`from_string`) are unusual.
+- **Diagnostic wording**: I emitted `no impl of \`<P>\` for type
+  \`<T>\` (operation \`<op>\`)` — same shape as the existing
+  orphan-rule diagnostic. The lane spec sketched "no impl of Show
+  for T" so users can grep for substring `no impl of \`Show\``.
+- **What about polymorphic helpers (`fn show_list[a](xs: [a]) :
+  String = ...`)?**: their inner `show(xs[0])` site has receiver
+  type `TyVarT(_)` at rewrite time. The new validator skips
+  unresolved-TyVar receivers exactly because of this case;
+  `ty_head_name` returns `None` and the check returns the same
+  errs unchanged. Polymorphic helpers continue to compile cleanly
+  and rely on the v1 runtime fallthrough. Test: phase-1 fixtures
+  that exercise polymorphic helpers (e.g.,
+  `m12_8_x_derive_eq_sum_nested.kai`'s `eq(x.field, y.field)`
+  where `field` may be a polymorphic field at the time of synth)
+  all stayed green.
+
+#### Validation against the external demo
+
+A fourth portfolio variant `portfolio_v4` rewrites the demo's
+`impl Show for Tx` body in the new `t.kind.show()` style — the
+exact shape Bug 5 was aimed at:
+```kai
+impl Show for Tx {
+  fn show(t: Tx) : String =
+    t.kind.show() ++ "  " ++ t.amount.show() ++ " USD  (" ++ t.note ++ ")"
+}
+```
+Both backends produce `845 USD` byte-identical to the original
+demo. The original `portfolio.kai` (with the bare `show(t.kind)`
+calls) also still compiles + runs identically — backward-compat
+with the recursive-looking call-site form is preserved.
+
+#### Backward-compat audit
+
+`grep -rn "\.kai" examples/ | xargs grep -l '\.show()'` found no
+existing fixtures using `.show()` style; the new fixtures are the
+first instances. All other fixtures' field-accessor uses (`x.f`
+followed by no `(...)`) are untouched because the lift only
+triggers on `ECall(EField(...), ...)`, not on bare `EField(...)`.
+`make test` and `test-llvm-coverage` confirm no regressions.
+
+#### Phase 2 (Bug 5) build TSV (raw)
+
+```
+timestamp	cmd	outcome	elapsed_s
+2026-04-26T22:00:37-04:00	make test	OK	140
+2026-04-26T22:00:59-04:00	make selfhost	OK	9
+2026-04-26T22:01:16-04:00	make selfhost-llvm	OK	8
+2026-04-26T22:03:33-04:00	test-llvm-coverage	OK	74
+```
