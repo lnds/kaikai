@@ -21175,145 +21175,252 @@ fn lower_protocols(decls: [Decl], file: String) : LoweredProtocols {
 
 # m12.8: pre-resolve renaming pass. Walks every DFn / DTest body and
 # rewrites every `EVar(name)` whose name is a known protocol op into
-# `EVar(__proto_<name>)`. Local bindings that shadow the op name
-# also get rewritten (the typer still sees the local since the
-# dispatcher is a top-level fn — the shadowed version was the user's
-# intent and the rewrite would break it). The v1 limitation is
-# documented; users should not name local bindings the same as a
-# protocol op until m12.8.x adds scope-aware renaming.
+# `EVar(__proto_<name>)` — but only when `name` is NOT bound by an
+# enclosing local binder. Scope tracking is threaded as `bound:
+# [String]`, the union of names introduced by the surrounding fn
+# params, lambda params, handler-clause params, handler-return
+# pattern, `let` / `var` binders, and `match` arm patterns.
+#
+# Without this guard the rewrite would shadow common parameter names
+# like `cmp` in `list_sort_by(xs, cmp: (a, a) -> Int)`: every
+# reference to the parameter inside the body would silently route to
+# the protocol dispatcher (`__proto_cmp`) and panic at runtime since
+# the receiver is generic in `a`. The bug surfaced in `demos/poker`
+# via `list_sort` once `--prelude stdlib/protocols.kai` was added to
+# the demo build.
 
 fn rename_proto_calls_decls(ds: [Decl], op_names: [String]) : [Decl] =
   map(ds, (d) => rename_proto_calls_decl(d, op_names))
 
 fn rename_proto_calls_decl(d: Decl, op_names: [String]) : Decl {
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, tps, ps, ret, row, rename_proto_calls_expr(body, op_names), l, c)
+    DFn(pub_, n, tps, ps, ret, row, body, l, c) -> {
+      let bound = rename_param_names(ps, [])
+      DFn(pub_, n, tps, ps, ret, row,
+          rename_proto_calls_expr(body, op_names, bound), l, c)
+    }
     DTest(desc, body, l, c) ->
-      DTest(desc, rename_proto_calls_expr(body, op_names), l, c)
+      DTest(desc, rename_proto_calls_expr(body, op_names, []), l, c)
     _ -> d
   }
 }
 
-fn rename_proto_calls_expr(e: Expr, op_names: [String]) : Expr =
-  Expr { kind: rename_proto_calls_kind(e.kind, op_names),
+# Names introduced by a parameter list (fn / lambda / handler clause).
+fn rename_param_names(ps: [Param], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> rename_param_names(rest, [p.pname, ...acc])
+  }
+}
+
+# Names introduced by a single pattern. Mirrors `bind_pat` but
+# accumulates into a `[String]` rather than a resolver Env.
+fn rename_pat_names(p: Pattern, acc: [String]) : [String] {
+  match p.pkind {
+    PWild         -> acc
+    PLit(_)       -> acc
+    PBind(name)   -> [name, ...acc]
+    PList(pats, opt_rest) -> {
+      let a = rename_pats_names(pats, acc)
+      match opt_rest { Some(r) -> [r, ...a] None -> a }
+    }
+    PVariant(_, subs)        -> rename_pats_names(subs, acc)
+    PVariantRecord(_, fs)    -> rename_pfields_names(fs, acc)
+    PRecord(fs)              -> rename_pfields_names(fs, acc)
+    PHole(_)                 -> acc
+    PAs(name, sub)           -> rename_pat_names(sub, [name, ...acc])
+  }
+}
+
+fn rename_pats_names(ps: [Pattern], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> rename_pats_names(rest, rename_pat_names(p, acc))
+  }
+}
+
+fn rename_pfields_names(fs: [PField], acc: [String]) : [String] {
+  match fs {
+    [] -> acc
+    [pf, ...rest] -> match pf {
+      PField(_, sub, _) -> rename_pfields_names(rest, rename_pat_names(sub, acc))
+    }
+  }
+}
+
+fn rename_proto_calls_expr(e: Expr, op_names: [String], bound: [String]) : Expr =
+  Expr { kind: rename_proto_calls_kind(e.kind, op_names, bound),
          line: e.line, col: e.col, ty: e.ty }
 
-fn rename_proto_calls_opt(o: Option[Expr], op_names: [String]) : Option[Expr] {
+fn rename_proto_calls_opt(o: Option[Expr], op_names: [String], bound: [String]) : Option[Expr] {
   match o {
-    Some(e) -> Some(rename_proto_calls_expr(e, op_names))
+    Some(e) -> Some(rename_proto_calls_expr(e, op_names, bound))
     None    -> None
   }
 }
 
-fn rename_proto_calls_exprs(es: [Expr], op_names: [String]) : [Expr] =
-  map(es, (e) => rename_proto_calls_expr(e, op_names))
+fn rename_proto_calls_exprs(es: [Expr], op_names: [String], bound: [String]) : [Expr] =
+  map(es, (e) => rename_proto_calls_expr(e, op_names, bound))
 
-fn rename_proto_calls_arms(arms: [Arm], op_names: [String]) : [Arm] =
-  map(arms, (a) => rename_proto_calls_arm(a, op_names))
+fn rename_proto_calls_arms(arms: [Arm], op_names: [String], bound: [String]) : [Arm] =
+  map(arms, (a) => rename_proto_calls_arm(a, op_names, bound))
 
-fn rename_proto_calls_arm(a: Arm, op_names: [String]) : Arm {
+fn rename_proto_calls_arm(a: Arm, op_names: [String], bound: [String]) : Arm {
   match a {
-    Arm(p, g, b) -> Arm(p, rename_proto_calls_opt(g, op_names),
-                        rename_proto_calls_expr(b, op_names))
+    Arm(p, g, b) -> {
+      let bound1 = rename_pat_names(p, bound)
+      Arm(p, rename_proto_calls_opt(g, op_names, bound1),
+            rename_proto_calls_expr(b, op_names, bound1))
+    }
   }
 }
 
-fn rename_proto_calls_stmts(ss: [Stmt], op_names: [String]) : [Stmt] =
-  map(ss, (s) => rename_proto_calls_stmt(s, op_names))
+# m12.8.x scope-aware: SLet / SVar bindings extend the bound set for
+# every later stmt in the same block AND for the trailing expression.
+# `rename_proto_calls_block` threads the running `bound` accumulator;
+# stmts that don't bind (SExprStmt / SAssert / SIndexAssign) walk
+# their sub-exprs under the current `bound` and pass it through
+# unchanged.
+fn rename_proto_calls_block(stmts: [Stmt], tail: Option[Expr],
+                              op_names: [String], bound: [String]) : ExprKind =
+  rename_proto_calls_block_loop(stmts, tail, op_names, bound, [])
 
-fn rename_proto_calls_stmt(s: Stmt, op_names: [String]) : Stmt {
+type StmtsAcc = { stmts: [Stmt], bound: [String] }
+
+fn rename_proto_calls_block_loop(stmts: [Stmt], tail: Option[Expr],
+                                   op_names: [String], bound: [String],
+                                   acc: [Stmt]) : ExprKind {
+  match stmts {
+    [] -> EBlock(list_reverse(acc),
+                 rename_proto_calls_opt(tail, op_names, bound))
+    [s, ...rest] -> {
+      let r = rename_proto_calls_stmt(s, op_names, bound)
+      rename_proto_calls_block_loop(rest, tail, op_names, r.bound,
+                                       [r.s, ...acc])
+    }
+  }
+}
+
+type StmtTyped = { s: Stmt, bound: [String] }
+
+fn rename_proto_calls_stmt(s: Stmt, op_names: [String], bound: [String]) : StmtTyped {
   match s {
-    SLet(p, ann, rhs) -> SLet(p, ann, rename_proto_calls_expr(rhs, op_names))
-    SAssert(c, m) -> SAssert(rename_proto_calls_expr(c, op_names),
-                              rename_proto_calls_opt(m, op_names))
-    SExprStmt(x) -> SExprStmt(rename_proto_calls_expr(x, op_names))
+    SLet(p, ann, rhs) -> {
+      let new_rhs = rename_proto_calls_expr(rhs, op_names, bound)
+      let bound1 = rename_pat_names(p, bound)
+      StmtTyped { s: SLet(p, ann, new_rhs), bound: bound1 }
+    }
+    SAssert(c, m) ->
+      StmtTyped {
+        s: SAssert(rename_proto_calls_expr(c, op_names, bound),
+                    rename_proto_calls_opt(m, op_names, bound)),
+        bound: bound
+      }
+    SExprStmt(x) ->
+      StmtTyped {
+        s: SExprStmt(rename_proto_calls_expr(x, op_names, bound)),
+        bound: bound
+      }
     SIndexAssign(b, i, v, l, c) ->
-      SIndexAssign(rename_proto_calls_expr(b, op_names),
-                   rename_proto_calls_expr(i, op_names),
-                   rename_proto_calls_expr(v, op_names), l, c)
-    SVar(n, ty, rhs, l, c) ->
-      SVar(n, ty, rename_proto_calls_expr(rhs, op_names), l, c)
+      StmtTyped {
+        s: SIndexAssign(rename_proto_calls_expr(b, op_names, bound),
+                         rename_proto_calls_expr(i, op_names, bound),
+                         rename_proto_calls_expr(v, op_names, bound), l, c),
+        bound: bound
+      }
+    SVar(n, ty, rhs, l, c) -> {
+      let new_rhs = rename_proto_calls_expr(rhs, op_names, bound)
+      StmtTyped {
+        s: SVar(n, ty, new_rhs, l, c),
+        bound: [n, ...bound]
+      }
+    }
   }
 }
 
-fn rename_proto_calls_clauses(cs: [HClause], op_names: [String]) : [HClause] =
-  map(cs, (c) => rename_proto_calls_clause(c, op_names))
+fn rename_proto_calls_clauses(cs: [HClause], op_names: [String], bound: [String]) : [HClause] =
+  map(cs, (c) => rename_proto_calls_clause(c, op_names, bound))
 
-fn rename_proto_calls_clause(c: HClause, op_names: [String]) : HClause {
+fn rename_proto_calls_clause(c: HClause, op_names: [String], bound: [String]) : HClause {
   match c {
-    HC(n, ps, b, l, co) -> HC(n, ps, rename_proto_calls_expr(b, op_names), l, co)
+    HC(n, ps, b, l, co) -> {
+      let bound1 = rename_param_names(ps, bound)
+      HC(n, ps, rename_proto_calls_expr(b, op_names, bound1), l, co)
+    }
   }
 }
 
-fn rename_proto_calls_opt_return(o: Option[HReturn], op_names: [String]) : Option[HReturn] {
+fn rename_proto_calls_opt_return(o: Option[HReturn], op_names: [String], bound: [String]) : Option[HReturn] {
   match o {
-    Some(r) -> Some(rename_proto_calls_return(r, op_names))
+    Some(r) -> Some(rename_proto_calls_return(r, op_names, bound))
     None    -> None
   }
 }
 
-fn rename_proto_calls_return(r: HReturn, op_names: [String]) : HReturn {
+fn rename_proto_calls_return(r: HReturn, op_names: [String], bound: [String]) : HReturn {
   match r {
-    HR(p, b, l, c) -> HR(p, rename_proto_calls_expr(b, op_names), l, c)
+    HR(p, b, l, c) -> HR(p, rename_proto_calls_expr(b, op_names, [p, ...bound]), l, c)
   }
 }
 
-fn rename_proto_calls_fields(fs: [FieldInit], op_names: [String]) : [FieldInit] =
-  map(fs, (f) => rename_proto_calls_field(f, op_names))
+fn rename_proto_calls_fields(fs: [FieldInit], op_names: [String], bound: [String]) : [FieldInit] =
+  map(fs, (f) => rename_proto_calls_field(f, op_names, bound))
 
-fn rename_proto_calls_field(f: FieldInit, op_names: [String]) : FieldInit {
+fn rename_proto_calls_field(f: FieldInit, op_names: [String], bound: [String]) : FieldInit {
   match f {
-    FI(n, v) -> FI(n, rename_proto_calls_expr(v, op_names))
+    FI(n, v) -> FI(n, rename_proto_calls_expr(v, op_names, bound))
   }
 }
 
-fn rename_proto_calls_list_elems(els: [ListElem], op_names: [String]) : [ListElem] =
-  map(els, (el) => rename_proto_calls_list_elem(el, op_names))
+fn rename_proto_calls_list_elems(els: [ListElem], op_names: [String], bound: [String]) : [ListElem] =
+  map(els, (el) => rename_proto_calls_list_elem(el, op_names, bound))
 
-fn rename_proto_calls_list_elem(el: ListElem, op_names: [String]) : ListElem {
+fn rename_proto_calls_list_elem(el: ListElem, op_names: [String], bound: [String]) : ListElem {
   match el {
-    ElPlain(x)  -> ElPlain(rename_proto_calls_expr(x, op_names))
-    ElSpread(x) -> ElSpread(rename_proto_calls_expr(x, op_names))
+    ElPlain(x)  -> ElPlain(rename_proto_calls_expr(x, op_names, bound))
+    ElSpread(x) -> ElSpread(rename_proto_calls_expr(x, op_names, bound))
   }
 }
 
-fn rename_proto_calls_kind(k: ExprKind, op_names: [String]) : ExprKind {
+fn rename_proto_calls_kind(k: ExprKind, op_names: [String], bound: [String]) : ExprKind {
   match k {
     EVar(name) ->
-      if list_has(op_names, name) { EVar(proto_dispatcher_name(name)) }
-      else { k }
-    ECall(callee, xs) -> ECall(rename_proto_calls_expr(callee, op_names),
-                                rename_proto_calls_exprs(xs, op_names))
-    EBlock(stmts, tail) -> EBlock(rename_proto_calls_stmts(stmts, op_names),
-                                    rename_proto_calls_opt(tail, op_names))
-    EIf(c, t_, eo) -> EIf(rename_proto_calls_expr(c, op_names),
-                           rename_proto_calls_expr(t_, op_names),
-                           rename_proto_calls_opt(eo, op_names))
-    EBinop(op, a, b) -> EBinop(op, rename_proto_calls_expr(a, op_names),
-                                    rename_proto_calls_expr(b, op_names))
-    EUnop(op, x) -> EUnop(op, rename_proto_calls_expr(x, op_names))
+      if list_has(op_names, name) and not list_has(bound, name) {
+        EVar(proto_dispatcher_name(name))
+      } else { k }
+    ECall(callee, xs) -> ECall(rename_proto_calls_expr(callee, op_names, bound),
+                                rename_proto_calls_exprs(xs, op_names, bound))
+    EBlock(stmts, tail) -> rename_proto_calls_block(stmts, tail, op_names, bound)
+    EIf(c, t_, eo) -> EIf(rename_proto_calls_expr(c, op_names, bound),
+                           rename_proto_calls_expr(t_, op_names, bound),
+                           rename_proto_calls_opt(eo, op_names, bound))
+    EBinop(op, a, b) -> EBinop(op, rename_proto_calls_expr(a, op_names, bound),
+                                    rename_proto_calls_expr(b, op_names, bound))
+    EUnop(op, x) -> EUnop(op, rename_proto_calls_expr(x, op_names, bound))
     EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(rename_proto_calls_expr(body, op_names), eff_name, eff_tyargs,
-              rename_proto_calls_opt(init_opt, op_names), alias_opt,
-              rename_proto_calls_clauses(clauses, op_names),
-              rename_proto_calls_opt_return(ret_opt, op_names))
-    ELambda(ps, b) -> ELambda(ps, rename_proto_calls_expr(b, op_names))
-    EMatch(scr, arms) -> EMatch(rename_proto_calls_expr(scr, op_names),
-                                  rename_proto_calls_arms(arms, op_names))
-    EPipe(a, b) -> EPipe(rename_proto_calls_expr(a, op_names),
-                          rename_proto_calls_expr(b, op_names))
-    EField(base, fname) -> EField(rename_proto_calls_expr(base, op_names), fname)
-    EIndex(a, b) -> EIndex(rename_proto_calls_expr(a, op_names),
-                            rename_proto_calls_expr(b, op_names))
+      EHandle(rename_proto_calls_expr(body, op_names, bound), eff_name, eff_tyargs,
+              rename_proto_calls_opt(init_opt, op_names, bound), alias_opt,
+              rename_proto_calls_clauses(clauses, op_names, bound),
+              rename_proto_calls_opt_return(ret_opt, op_names, bound))
+    ELambda(ps, b) -> {
+      let bound1 = rename_param_names(ps, bound)
+      ELambda(ps, rename_proto_calls_expr(b, op_names, bound1))
+    }
+    EMatch(scr, arms) -> EMatch(rename_proto_calls_expr(scr, op_names, bound),
+                                  rename_proto_calls_arms(arms, op_names, bound))
+    EPipe(a, b) -> EPipe(rename_proto_calls_expr(a, op_names, bound),
+                          rename_proto_calls_expr(b, op_names, bound))
+    EField(base, fname) -> EField(rename_proto_calls_expr(base, op_names, bound), fname)
+    EIndex(a, b) -> EIndex(rename_proto_calls_expr(a, op_names, bound),
+                            rename_proto_calls_expr(b, op_names, bound))
     ERecordLit(name, fields) ->
-      ERecordLit(name, rename_proto_calls_fields(fields, op_names))
-    EList(elems) -> EList(rename_proto_calls_list_elems(elems, op_names))
+      ERecordLit(name, rename_proto_calls_fields(fields, op_names, bound))
+    EList(elems) -> EList(rename_proto_calls_list_elems(elems, op_names, bound))
     ERange(a, b, opt_step) ->
-      ERange(rename_proto_calls_expr(a, op_names),
-             rename_proto_calls_expr(b, op_names),
-             rename_proto_calls_opt(opt_step, op_names))
-    EBang(inner) -> EBang(rename_proto_calls_expr(inner, op_names))
+      ERange(rename_proto_calls_expr(a, op_names, bound),
+             rename_proto_calls_expr(b, op_names, bound),
+             rename_proto_calls_opt(opt_step, op_names, bound))
+    EBang(inner) -> EBang(rename_proto_calls_expr(inner, op_names, bound))
     _ -> k
   }
 }

@@ -12,16 +12,15 @@
 # bin/kai wraps kaic1 (stage 1, no effects-in-types) and is unsuitable here.
 
 KAIC2     := ../stage2/kaic2
-# Match `bin/kai`'s effect-aware surface (atomic Stdout / Stderr /
-# Stdin + `Console` / `Io` aliases land via stdlib/effects.kai).
-# Note: stdlib/protocols.kai is intentionally NOT loaded here. The
-# m12.8 protocol-op resolver currently shadows local parameters
-# whose name matches a registered op (e.g. `cmp` in
-# `list_sort_by(cmp)` collides with `Ord.cmp`); demos that need
-# protocols (blackjack with `#derive(Show, Eq)`) document the gap
-# rather than work around it. Adding protocols here flips poker /
-# quicksort etc. to runtime panic via `__protocol_dispatch_Ord_cmp`.
+# Match `bin/kai`'s prelude chain: core (basic prelude) + protocols
+# (Show / Eq / Ord / Hash / Serialize for primitives) + effects
+# (Stdin / Stdout / Stderr / File / Env declarations + the
+# `Console` / `Io` aliases). The earlier note about `cmp` shadowing
+# is retired with the m12.8 scope-aware rename pass — local
+# parameters whose name matches a registered op are no longer
+# rewritten to the dispatcher.
 PRELUDES  := --prelude ../stdlib/core.kai \
+             --prelude ../stdlib/protocols.kai \
              --prelude ../stdlib/effects.kai
 STDLIB    := ../stdlib
 RT_INC    := -I ../stage0
