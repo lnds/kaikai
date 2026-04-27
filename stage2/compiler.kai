@@ -20774,9 +20774,6 @@ fn rename_proto_calls_opt(o: Option[Expr], op_names: [String], bound: [String]) 
   }
 }
 
-fn rename_proto_calls_exprs(es: [Expr], op_names: [String], bound: [String]) : [Expr] =
-  map(es, (e) => rename_proto_calls_expr(e, op_names, bound))
-
 fn rename_proto_calls_arms(arms: [Arm], op_names: [String], bound: [String]) : [Arm] =
   map(arms, (a) => rename_proto_calls_arm(a, op_names, bound))
 
@@ -20878,75 +20875,40 @@ fn rename_proto_calls_return(r: HReturn, op_names: [String], bound: [String]) : 
   }
 }
 
-fn rename_proto_calls_fields(fs: [FieldInit], op_names: [String], bound: [String]) : [FieldInit] =
-  map(fs, (f) => rename_proto_calls_field(f, op_names, bound))
-
-fn rename_proto_calls_field(f: FieldInit, op_names: [String], bound: [String]) : FieldInit {
-  match f {
-    FI(n, v) -> FI(n, rename_proto_calls_expr(v, op_names, bound))
-  }
-}
-
-fn rename_proto_calls_list_elems(els: [ListElem], op_names: [String], bound: [String]) : [ListElem] =
-  map(els, (el) => rename_proto_calls_list_elem(el, op_names, bound))
-
-fn rename_proto_calls_list_elem(el: ListElem, op_names: [String], bound: [String]) : ListElem {
-  match el {
-    ElPlain(x)  -> ElPlain(rename_proto_calls_expr(x, op_names, bound))
-    ElSpread(x) -> ElSpread(rename_proto_calls_expr(x, op_names, bound))
-  }
-}
-
 fn rename_proto_calls_kind(k: ExprKind, op_names: [String], bound: [String]) : ExprKind {
   match k {
+    # Rep invariant (b): a bare EVar referring to a protocol op rewrites
+    # to its dispatcher only when the name is NOT bound by an enclosing
+    # binder (lambda param, let/var, match pattern, handler clause
+    # param, return-clause binder). Bound tracking is what
+    # `validate_typer_invariants` cross-checks; this case is the
+    # construction site.
     EVar(name) ->
       if list_has(op_names, name) and not list_has(bound, name) {
         EVar(proto_dispatcher_name(name))
       } else { k }
-    ECall(callee, xs) -> ECall(rename_proto_calls_expr(callee, op_names, bound),
-                                rename_proto_calls_exprs(xs, op_names, bound))
+    # Scope-aware kinds. Each adds names to `bound` before recursing
+    # into the bodies that they shadow.
     EBlock(stmts, tail) -> rename_proto_calls_block(stmts, tail, op_names, bound)
-    EIf(c, t_, eo) -> EIf(rename_proto_calls_expr(c, op_names, bound),
-                           rename_proto_calls_expr(t_, op_names, bound),
-                           rename_proto_calls_opt(eo, op_names, bound))
-    EBinop(op, a, b) -> EBinop(op, rename_proto_calls_expr(a, op_names, bound),
-                                    rename_proto_calls_expr(b, op_names, bound))
-    EUnop(op, x) -> EUnop(op, rename_proto_calls_expr(x, op_names, bound))
-    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(rename_proto_calls_expr(body, op_names, bound), eff_name, eff_tyargs,
-              rename_proto_calls_opt(init_opt, op_names, bound), alias_opt,
-              rename_proto_calls_clauses(clauses, op_names, bound),
-              rename_proto_calls_opt_return(ret_opt, op_names, bound))
     ELambda(ps, b) -> {
       let bound1 = rename_param_names(ps, bound)
       ELambda(ps, rename_proto_calls_expr(b, op_names, bound1))
     }
     EMatch(scr, arms) -> EMatch(rename_proto_calls_expr(scr, op_names, bound),
                                   rename_proto_calls_arms(arms, op_names, bound))
-    EPipe(a, b) -> EPipe(rename_proto_calls_expr(a, op_names, bound),
-                          rename_proto_calls_expr(b, op_names, bound))
-    EField(base, fname) -> EField(rename_proto_calls_expr(base, op_names, bound), fname)
-    EIndex(a, b) -> EIndex(rename_proto_calls_expr(a, op_names, bound),
-                            rename_proto_calls_expr(b, op_names, bound))
-    ERecordLit(name, fields) ->
-      ERecordLit(name, rename_proto_calls_fields(fields, op_names, bound))
-    EList(elems) -> EList(rename_proto_calls_list_elems(elems, op_names, bound))
-    ERange(a, b, opt_step) ->
-      ERange(rename_proto_calls_expr(a, op_names, bound),
-             rename_proto_calls_expr(b, op_names, bound),
-             rename_proto_calls_opt(opt_step, op_names, bound))
-    EBang(inner) -> EBang(rename_proto_calls_expr(inner, op_names, bound))
-    # m12.8.x post-Core REOPEN — Linus suspect 3: ELitUnit hosts an
-    # inner expression (the numeric literal a dimension annotation
-    # decorates). Pre-fix this fell through `_ -> k` so a protocol-op
-    # reference inside a dimensioned-literal sub-expression escaped
-    # the rename. The inner is always EInt / EReal in practice today,
-    # so no live regression — but the wildcard was unjustified.
-    ELitUnit(inner, u) -> ELitUnit(rename_proto_calls_expr(inner, op_names, bound), u)
-    # Remaining variants are leaves (EInt / EReal / EBool / EChar /
-    # EStr / EUnit / EUnder / EPlaceholder / EHole / ETodo) — no
-    # sub-expressions to walk.
-    _ -> k
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(rename_proto_calls_expr(body, op_names, bound), eff_name, eff_tyargs,
+              map_opt_expr(init_opt, (e) => rename_proto_calls_expr(e, op_names, bound)),
+              alias_opt,
+              rename_proto_calls_clauses(clauses, op_names, bound),
+              rename_proto_calls_opt_return(ret_opt, op_names, bound))
+    # All remaining kinds (ECall, EField, EIndex, EBinop, EUnop, EIf,
+    # ERecordLit, EList, ERange, EPipe, EBang, ELitUnit) recurse purely
+    # structurally without changing the bound set; the leaves return
+    # unchanged. The shared visitor handles both — keeping invariant
+    # (b)'s scope tracking concentrated in the explicit cases above
+    # where it actually matters.
+    _ -> map_expr_kind(k, (sub) => rename_proto_calls_expr(sub, op_names, bound))
   }
 }
 
