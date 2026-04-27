@@ -1275,7 +1275,7 @@ test-demos-core: $(TARGET) build
 # demo under examples/aspirational/ exercises a feature combination
 # the milestone did not anticipate; failures here mean the close
 # criterion is not met.
-ASPIRATIONAL_DEMOS := event_logger
+ASPIRATIONAL_DEMOS := event_logger audit_handler
 
 test-aspirational: $(TARGET) build
 	@$(STACK) set -e; \
