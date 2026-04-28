@@ -15,7 +15,7 @@ SRC     := compiler.kai
 # SIGSEGV; 65520 KB is the macOS hard-limit ceiling and works.
 STACK := ulimit -s 65520 2>/dev/null || ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-stdlib test-protocols test-demos-core test-aspirational selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational selfhost
 
 all: $(TARGET)
 
@@ -424,6 +424,24 @@ test-time: $(TARGET) build
 	diff -q ../examples/time/main.out.expected build/time.out > /dev/null \
 	  && echo "time OK" \
 	  || { echo "time DIFF"; diff ../examples/time/main.out.expected build/time.out; exit 1; }
+
+# m12.6.x #2 — interval propagation walker pinning. Compiles each
+# fixture under examples/intervals/ with `--dump-intervals` and
+# diffs the output against the golden. The walker is dead code as
+# far as user programs are concerned; the diff is what gives us
+# confidence the next sub-step (unifier reshape) reads correct
+# bounds.
+test-intervals: $(TARGET) build
+	@set -e; \
+	for f in ../examples/intervals/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) --dump-intervals $$f > build/iv-$$name.out 2>&1 \
+	    || { echo "intervals FAIL $$name (kaic2 errored)"; cat build/iv-$$name.out; exit 1; }; \
+	  diff -q $$exp build/iv-$$name.out > /dev/null \
+	    && echo "intervals OK $$name" \
+	    || { echo "intervals DIFF $$name"; diff $$exp build/iv-$$name.out; exit 1; }; \
+	done
 
 # m14-pre — stdlib/core/*.kai list-op smoke tests. Each fixture under
 # examples/stdlib/ is compiled with kaic2 + the full split core
@@ -1405,7 +1423,7 @@ test-aspirational: $(TARGET) build
 	    || { echo "aspirational DIFF $$name (LLVM)"; diff $$exp build/asp-$$name-llvm.out; exit 1; }; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -1414,7 +1432,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational
 
 clean:
 	rm -rf build $(TARGET)

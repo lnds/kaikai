@@ -5133,6 +5133,191 @@ fn ival_ne(a: Interval, b: Interval) : Option[Bool] = match ival_eq(a, b) {
   None     -> None
 }
 
+# ====================================================================
+# m12.6.x #2 (sub-step 2) — Post-typing interval propagation
+# ====================================================================
+#
+# Walks a typed Expr and infers an Interval for every node. Bindings
+# learned at SLet propagate through the rest of the block; EIf and
+# EMatch join branches; EBinop on Int dispatches to the lattice ops;
+# every other shape collapses to ITop (we are not in the business of
+# inferring `Real` ranges, `String` properties, etc. — only Int).
+#
+# This step adds the WALKER ONLY. The unifier still ignores
+# refinements; the assert path still emits runtime checks. The next
+# sub-step adds a `--dump-intervals` flag so fixtures can pin the
+# walker's output before the unifier reshape consumes it.
+#
+# Intentionally not threaded through the typer's InferState — the
+# walker runs after typing finalises, reading types off
+# `Expr.ty` to decide whether a node is Int-shaped at all.
+
+# Per-name interval table. Keyed by binding name; missing names
+# default to ITop. Uses a flat assoc-list because the typical
+# function body has a handful of bindings — a hashmap would be
+# overkill.
+type IntervalEnv = IE([IntervalBinding])
+
+type IntervalBinding = IB(String, Interval)
+
+fn ie_empty() : IntervalEnv = IE([])
+
+fn ie_lookup(env: IntervalEnv, name: String) : Interval = match env {
+  IE(bs) -> ie_lookup_loop(bs, name)
+}
+
+fn ie_lookup_loop(bs: [IntervalBinding], name: String) : Interval = match bs {
+  [] -> ITop
+  [b, ...rest] -> match b {
+    IB(nm, iv) -> if nm == name { iv } else { ie_lookup_loop(rest, name) }
+  }
+}
+
+fn ie_extend(env: IntervalEnv, name: String, iv: Interval) : IntervalEnv = match env {
+  IE(bs) -> IE([IB(name, iv), ...bs])
+}
+
+# Walk an Expr, returning its interval. The caller passes in the
+# current `env`; bindings introduced by sub-Exprs (via SLet inside
+# blocks) do NOT escape — their scope ends with the block.
+fn ival_of_expr(e: Expr, env: IntervalEnv) : Interval = match e.kind {
+  EInt(n)    -> Ival(n, n)
+  EBool(_)   -> ITop
+  EReal(_)   -> ITop
+  EChar(_)   -> ITop
+  EStr(_, _) -> ITop
+  EUnit      -> ITop
+  EVar(nm)   -> ie_lookup(env, nm)
+  EUnder     -> ITop
+  EPlaceholder -> ITop
+  EHole(_)   -> ITop
+  ETodo(_)   -> ITop
+  EVariantsOf(_, _) -> ITop
+  EModCall(_, _)    -> ITop
+  ECall(_, _)       -> ITop
+  EField(_, _)      -> ITop
+  EIndex(_, _)      -> ITop
+  EBinop(op, a, b)  -> ival_of_binop(op, a, b, env)
+  EUnop(op, x)      -> ival_of_unop(op, x, env)
+  EIf(c, t, eo)     -> ival_of_if(c, t, eo, env)
+  EMatch(scr, arms) -> ival_of_match(scr, arms, env)
+  ELambda(_, _)     -> ITop
+  ERecordLit(_, _)  -> ITop
+  EList(_)          -> ITop
+  ERange(_, _, _)   -> ITop
+  EBlock(stmts, tail) -> ival_of_block(stmts, tail, env)
+  EPipe(_, _)       -> ITop
+  EBang(_)          -> ITop
+  EHandle(_, _, _, _, _, _, _) -> ITop
+  ELitUnit(_, _)    -> ITop
+}
+
+fn ival_of_binop(op: String, a: Expr, b: Expr, env: IntervalEnv) : Interval = {
+  let ia = ival_of_expr(a, env)
+  let ib = ival_of_expr(b, env)
+  if op == "+" { ival_add(ia, ib) }
+  else if op == "-" { ival_sub(ia, ib) }
+  else if op == "*" { ival_mul(ia, ib) }
+  else { ITop }
+}
+
+# Unary minus narrows: -[lo, hi] = [-hi, -lo]. `not` is Bool, so it
+# falls through. Anything else (e.g. parser-only ops) — ITop.
+fn ival_of_unop(op: String, x: Expr, env: IntervalEnv) : Interval = {
+  if op == "-" {
+    match ival_of_expr(x, env) {
+      IBot -> IBot
+      ITop -> ITop
+      Ival(lo, hi) -> Ival(0 - hi, 0 - lo)
+    }
+  } else { ITop }
+}
+
+# Conditional: when `eo == None` the if-without-else returns Unit on
+# the false branch, so the result is the join of the then-branch
+# interval and ITop (= ITop). When eo is present, join both arms.
+fn ival_of_if(c: Expr, t: Expr, eo: Option[Expr], env: IntervalEnv) : Interval = {
+  let it = ival_of_expr(t, env)
+  match eo {
+    None -> ITop
+    Some(e) -> ival_join(it, ival_of_expr(e, env))
+  }
+}
+
+# match: join over all arm bodies. Pattern bindings are not
+# narrowed in v1 — every arm body sees the same env. Adding pattern-
+# narrowing (e.g. `Some(x) -> ...` reveals `x` is non-None) is a
+# follow-up sub-step alongside the unifier reshape.
+fn ival_of_match(scr: Expr, arms: [Arm], env: IntervalEnv) : Interval = {
+  let _ = scr  # walked for side-effects when the pass becomes intervalize
+  ival_of_match_loop(arms, env, IBot)
+}
+
+fn ival_of_match_loop(arms: [Arm], env: IntervalEnv, acc: Interval) : Interval = match arms {
+  [] -> if match_is_total(acc) { acc } else { acc }
+  [a, ...rest] -> match a {
+    Arm(_, _, body) -> ival_of_match_loop(rest, env, ival_join(acc, ival_of_expr(body, env)))
+  }
+}
+
+# Placeholder for "every variant of the scrutinee is covered" so we
+# can drop the IBot fallback. Without this we would over-approximate
+# to ITop on any match (the IBot starts polluting the join). Total
+# match analysis lives in the typer for exhaustiveness; for v1 we
+# trust the typer's exhaustiveness check has already run.
+fn match_is_total(_acc: Interval) : Bool = true
+
+fn ival_of_block(stmts: [Stmt], tail: Option[Expr], env: IntervalEnv) : Interval = {
+  let env1 = ival_thread_stmts(stmts, env)
+  match tail {
+    None    -> ITop
+    Some(e) -> ival_of_expr(e, env1)
+  }
+}
+
+# Thread the env through SLet bindings. Each SLet of `pat = e`
+# extends the env when `pat` is a single name (PBind) — destructuring
+# patterns are out of scope for v1; they bind to ITop. SAssert /
+# SExprStmt / SUse / SVar / SIndexAssign do not introduce Int
+# bindings worth tracking here (SVar's State desugar fires before
+# the typer; if it ever survives, treat as ITop binding).
+fn ival_thread_stmts(stmts: [Stmt], env: IntervalEnv) : IntervalEnv = match stmts {
+  [] -> env
+  [s, ...rest] -> match s {
+    SLet(pat, _, e) -> {
+      let iv = ival_of_expr(e, env)
+      let env1 = ival_bind_pat(pat, iv, env)
+      ival_thread_stmts(rest, env1)
+    }
+    _ -> ival_thread_stmts(rest, env)
+  }
+}
+
+# Bind a pattern to an interval. Only the simple PBind(name) case
+# adds a useful entry; everything else falls through.
+fn ival_bind_pat(pat: Pattern, iv: Interval, env: IntervalEnv) : IntervalEnv = match pat.pkind {
+  PBind(nm) -> ie_extend(env, nm, iv)
+  _ -> env
+}
+
+# Convenience entry: walk an entire DFn body, returning the
+# inferred interval for the whole expression. Used by the dump
+# flag and by the (future) unifier reshape that needs to consult
+# intervals at the body's tail expression.
+fn ival_of_decl(d: Decl) : Interval = match d {
+  DFn(_, _, _, params, _, _, body, _, _) ->
+    ival_of_expr(body, ival_seed_params(params, ie_empty()))
+  _ -> ITop
+}
+
+# Seed the env with each parameter mapped to ITop (no narrowing
+# from refinement types yet — the unifier reshape will refine
+# this when refined params land).
+fn ival_seed_params(params: [Param], env: IntervalEnv) : IntervalEnv = match params {
+  [] -> env
+  [p, ...rest] -> ival_seed_params(rest, ie_extend(env, p.pname, ITop))
+}
+
 # `effect Eff[T1, T2] { op_decl ... }` — m7a #3a + m7b #11.
 # No name resolution and no evidence-type emission live here; those are
 # #3c and #3d. Each op_decl is `name(params) : ReturnType`, body-less;
@@ -19623,6 +19808,25 @@ fn dump_last_use(file: String, decls: [Decl]) : Int {
   r.errs
 }
 
+# m12.6.x #2: dump per-fn body intervals. Runs the typer to anchor
+# every Expr's `.ty`, then walks each user-defined DFn's body with
+# the interval propagator and prints the inferred range. Useful for
+# pinning the lattice's behaviour in fixtures before the unifier
+# reshape consumes it.
+fn dump_intervals(file: String, decls: [Decl]) : Int / Console {
+  let r = infer_program(file, decls, false)
+  r.decls |> each(dump_intervals_for_decl)
+  r.errs
+}
+
+fn dump_intervals_for_decl(d: Decl) : Unit / Console = match d {
+  DFn(_, name, _, _, _, _, _, _, _) -> {
+    let iv = ival_of_decl(d)
+    print("#{name}: #{ival_show(iv)}")
+  }
+  _ -> ()
+}
+
 # ---- `--holes`: typed-hole reports ----
 #
 # For each `?` / `?name` in the program, print the expected type
@@ -25885,6 +26089,10 @@ type Mode
   | MTest
   | MHelp
   | MVersion
+  # m12.6.x #2: dump per-fn body intervals for Int-typed expressions.
+  # Debug-only; lets fixtures pin the walker output before the
+  # unifier reshape consumes it.
+  | MDumpIntervals
 
 type CliOptions = { mode: Mode, path: Option[String], preludes: [String],
                     strict_holes: Bool, search_paths: [String] }
@@ -25935,6 +26143,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MDumpMonoOut))
       } else if a == "--dump-last-use" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpLastUse))
+      } else if a == "--dump-intervals" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpIntervals))
       } else if a == "--holes" {
         parse_cli_loop(more, cli_with_mode(opts, MHoles))
       } else if a == "--holes-json" {
@@ -26623,6 +26833,10 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               MDumpLastUse -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_last_use(path, all_decls) }
+              }
+              MDumpIntervals -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_intervals(path, all_decls) }
               }
               MHoles -> {
                 let chk = check_program(path, all_decls)
