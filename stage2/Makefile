@@ -10,7 +10,7 @@ SRC     := compiler.kai
 # feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
 STACK := ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop test-stdlib test-protocols test-demos-core test-aspirational selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop test-time test-stdlib test-protocols test-demos-core test-aspirational selfhost
 
 all: $(TARGET)
 
@@ -344,6 +344,21 @@ test-writer: $(TARGET) build
 	  && echo "writer OK" \
 	  || { echo "writer DIFF"; diff ../examples/writer/main.out.expected build/writer.out; exit 1; }
 
+# stdlib/time.kai smoke test — exercises the Clock effect (wall_now,
+# monotonic_now, sleep_ns) plus pure Duration / Instant arithmetic.
+# v0 has no default Clock handler (m8.x scope); the fixture installs
+# its own stub handler with fixed return values so the golden stays
+# deterministic. Compiled with `--path ../stdlib` so the resolver
+# finds the module.
+test-time: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --path ../stdlib ../examples/time/main.kai > build/time.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/time.c -o build/time-c; \
+	./build/time-c > build/time.out; \
+	diff -q ../examples/time/main.out.expected build/time.out > /dev/null \
+	  && echo "time OK" \
+	  || { echo "time DIFF"; diff ../examples/time/main.out.expected build/time.out; exit 1; }
+
 # m14-pre — stdlib/core/*.kai list-op smoke tests. Each fixture under
 # examples/stdlib/ is compiled with kaic2 + the full split core
 # preludes and its stdout is diffed against `<name>.out.expected`.
@@ -366,6 +381,7 @@ EXTRA_PRELUDE_FLAGS := --prelude ../stdlib/protocols.kai \
                        --prelude ../stdlib/random.kai \
                        --prelude ../stdlib/encoding/base64.kai \
                        --prelude ../stdlib/encoding/hex.kai \
+                       --prelude ../stdlib/encoding/json.kai \
                        --prelude ../stdlib/collections/map.kai
 
 test-stdlib: $(TARGET) build
@@ -1315,7 +1331,7 @@ test-aspirational: $(TARGET) build
 	    || { echo "aspirational DIFF $$name (LLVM)"; diff $$exp build/asp-$$name-llvm.out; exit 1; }; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols test-demos-core test-aspirational
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -1324,7 +1340,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib test-protocols test-demos-core test-aspirational
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
 
 clean:
 	rm -rf build $(TARGET)
