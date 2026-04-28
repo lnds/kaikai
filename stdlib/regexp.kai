@@ -480,3 +480,473 @@ fn rx_range_show(r: CharRange) : String = match r {
     if char_to_int(lo) == char_to_int(hi) { "#{lo}" }
     else { "#{lo}-#{hi}" }
 }
+
+# ====================================================================
+# Phase 3 — NFA construction (Thompson-style)
+# ====================================================================
+#
+# Compile RxAst to an NFA whose start/accept states are connected by
+# a graph of transitions (char / class / epsilon / anchor / group
+# markers). Each AST node lowers to a "fragment" — a (start, accept)
+# pair — and parent nodes wire fragments together with ε-edges.
+#
+# State numbering uses a monotonically-increasing counter inside an
+# NfaBuilder. The accept state is the last one allocated; multiple
+# fragments are concatenated by patching the inner accept's
+# ε-transition to the outer fragment's start.
+
+# A single transition leaving an NFA state. The target is referenced
+# by state id (Int). Transitions are interpreted by Phase 4's
+# simulator: TChar / TClass consume one input character, TEpsilon /
+# TGroupOpen / TGroupClose / TAnchor are zero-width.
+pub type NfaTransition
+  = TChar(Char, Int)                    # consume `c`, go to target
+  | TClass([CharRange], Bool, Int)      # consume one char in class (Bool = negated), go to target
+  | TAny(Int)                           # consume any char (except newline), go to target
+  | TEpsilon(Int)                       # zero-width edge, go to target
+  | TGroupOpen(Int, Int)                # mark group_id start, go to target
+  | TGroupClose(Int, Int)               # mark group_id end, go to target
+  | TAnchor(Anchor, Int)                # match anchor (start/end of input), go to target
+
+pub type NfaState = { id: Int, transitions: [NfaTransition], accept: Bool }
+
+pub type Nfa = { states: [NfaState], start: Int, num_groups: Int }
+
+# Builder threads the in-progress state list and a fresh-id counter
+# through compilation. `num_groups` tracks the highest capture-group
+# id seen (so the simulator allocates that many position slots).
+pub type NfaBuilder = { states: [NfaState], next_id: Int, num_groups: Int }
+
+# A compiled fragment: the entry state (where matching starts) and
+# the accept state (whose outgoing ε wires to the next fragment).
+pub type NfaFrag = NF(Int, Int)
+#                    ^start ^accept
+
+fn nb_init() : NfaBuilder = NfaBuilder { states: [], next_id: 0, num_groups: 0 }
+
+fn nb_fresh(b: NfaBuilder) : NfaBuilder = {
+  let st = NfaState { id: b.next_id, transitions: [], accept: false }
+  NfaBuilder {
+    states: list_append(b.states, [st]),
+    next_id: b.next_id + 1,
+    num_groups: b.num_groups
+  }
+}
+
+fn nb_last_id(b: NfaBuilder) : Int = b.next_id - 1
+
+# Update the transitions list of state `id` to `trs`. Linear scan;
+# fine for the sizes we deal with (NFA size O(pattern length)).
+fn nb_set_transitions(b: NfaBuilder, id: Int, trs: [NfaTransition]) : NfaBuilder =
+  NfaBuilder {
+    states: nb_replace_state(b.states, id, trs),
+    next_id: b.next_id,
+    num_groups: b.num_groups
+  }
+
+fn nb_replace_state(states: [NfaState], id: Int, trs: [NfaTransition]) : [NfaState] =
+  match states {
+    [] -> []
+    [s, ...rest] ->
+      if s.id == id {
+        [NfaState { id: s.id, transitions: trs, accept: s.accept }, ...rest]
+      } else {
+        [s, ...nb_replace_state(rest, id, trs)]
+      }
+  }
+
+# Append a transition to the existing list of state `id`.
+fn nb_add_transition(b: NfaBuilder, id: Int, t: NfaTransition) : NfaBuilder = {
+  let cur = nb_get_transitions(b.states, id)
+  nb_set_transitions(b, id, list_append(cur, [t]))
+}
+
+fn nb_get_transitions(states: [NfaState], id: Int) : [NfaTransition] = match states {
+  []           -> []
+  [s, ...rest] -> if s.id == id { s.transitions } else { nb_get_transitions(rest, id) }
+}
+
+# Mark the state at `id` as accept. Used only on the final accept
+# state of the whole NFA — Thompson fragments don't need accept
+# flags on intermediate states.
+fn nb_mark_accept(b: NfaBuilder, id: Int) : NfaBuilder =
+  NfaBuilder {
+    states: nb_set_accept(b.states, id),
+    next_id: b.next_id,
+    num_groups: b.num_groups
+  }
+
+fn nb_set_accept(states: [NfaState], id: Int) : [NfaState] = match states {
+  [] -> []
+  [s, ...rest] ->
+    if s.id == id {
+      [NfaState { id: s.id, transitions: s.transitions, accept: true }, ...rest]
+    } else {
+      [s, ...nb_set_accept(rest, id)]
+    }
+}
+
+# Bump the highest-seen capture-group id. Called when compiling
+# RxGroup. The final NFA reports `max + 1` so that group 0 (the
+# whole match) plus all numbered groups have a slot.
+fn nb_record_group(b: NfaBuilder, gid: Int) : NfaBuilder =
+  NfaBuilder {
+    states: b.states,
+    next_id: b.next_id,
+    num_groups: if gid > b.num_groups { gid } else { b.num_groups }
+  }
+
+# ---- Compilation ----
+
+# Top-level entry: build a fresh NFA from an AST. The accept state
+# of the root fragment becomes the NFA's accept (single-accept by
+# construction; matching ends when any path reaches it).
+pub fn rx_compile_nfa(ast: RxAst) : Nfa = {
+  let b0 = nb_init()
+  let r = compile_frag(b0, ast)
+  match r {
+    NB_Frag(b1, frag) -> match frag {
+      NF(start, accept) -> {
+        let b2 = nb_mark_accept(b1, accept)
+        Nfa {
+          states: b2.states,
+          start: start,
+          # +1 because group ids are 1-based; group 0 is the whole match.
+          num_groups: b2.num_groups + 1
+        }
+      }
+    }
+  }
+}
+
+# Builder + fragment pair returned by compile_frag. kaikai-minimal
+# does not have tuple types, so we wrap in a 1-variant nominal.
+type NB_FragR = NB_Frag(NfaBuilder, NfaFrag)
+
+# Compile a single AST node to a fragment. Each branch allocates
+# states via nb_fresh and wires transitions with nb_add_transition.
+fn compile_frag(b: NfaBuilder, a: RxAst) : NB_FragR = match a {
+  RxChar(c) -> {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    let b2 = nb_fresh(b1)
+    let e = nb_last_id(b2)
+    let b3 = nb_add_transition(b2, s, TChar(c, e))
+    NB_Frag(b3, NF(s, e))
+  }
+  RxAny -> {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    let b2 = nb_fresh(b1)
+    let e = nb_last_id(b2)
+    let b3 = nb_add_transition(b2, s, TAny(e))
+    NB_Frag(b3, NF(s, e))
+  }
+  RxClass(rs, neg) -> {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    let b2 = nb_fresh(b1)
+    let e = nb_last_id(b2)
+    let b3 = nb_add_transition(b2, s, TClass(rs, neg, e))
+    NB_Frag(b3, NF(s, e))
+  }
+  RxAnchor(an) -> {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    let b2 = nb_fresh(b1)
+    let e = nb_last_id(b2)
+    let b3 = nb_add_transition(b2, s, TAnchor(an, e))
+    NB_Frag(b3, NF(s, e))
+  }
+  RxConcat(xs) -> compile_concat(b, xs)
+  RxAlt(xs)    -> compile_alt(b, xs)
+  RxStar(x)    -> compile_star(b, x)
+  RxPlus(x)    -> compile_plus(b, x)
+  RxOpt(x)     -> compile_opt(b, x)
+  RxRepeat(x, lo, hi_opt) -> compile_repeat(b, x, lo, hi_opt)
+  RxGroup(id, inner) -> compile_group(b, id, inner)
+}
+
+# Concatenation: empty -> a single ε-fragment (matches empty
+# string); non-empty -> compile each child, ε-wire successive
+# accepts to the next start.
+fn compile_concat(b: NfaBuilder, xs: [RxAst]) : NB_FragR = match xs {
+  []  -> {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    NB_Frag(b1, NF(s, s))
+  }
+  [first, ...rest] -> {
+    let r = compile_frag(b, first)
+    compile_concat_rest(r, rest)
+  }
+}
+
+fn compile_concat_rest(prev: NB_FragR, rest: [RxAst]) : NB_FragR = match prev {
+  NB_Frag(b, frag) -> match rest {
+    [] -> NB_Frag(b, frag)
+    [next, ...more] -> match frag {
+      NF(s, e) -> {
+        let r = compile_frag(b, next)
+        match r {
+          NB_Frag(b1, frag2) -> match frag2 {
+            NF(s2, e2) -> {
+              # Wire previous accept (e) to next start (s2) by ε.
+              let b2 = nb_add_transition(b1, e, TEpsilon(s2))
+              compile_concat_rest(NB_Frag(b2, NF(s, e2)), more)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Alternation: new start with ε-edges to each branch's start; new
+# accept with each branch's accept ε-wired in.
+fn compile_alt(b: NfaBuilder, xs: [RxAst]) : NB_FragR = {
+  # Allocate the outer start + accept up front so every branch
+  # knows where to wire.
+  let b1 = nb_fresh(b)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let b3 = compile_alt_branches(b2, xs, outer_s, outer_e)
+  NB_Frag(b3, NF(outer_s, outer_e))
+}
+
+fn compile_alt_branches(b: NfaBuilder, xs: [RxAst], outer_s: Int, outer_e: Int) : NfaBuilder = match xs {
+  [] -> b
+  [first, ...rest] -> {
+    let r = compile_frag(b, first)
+    match r {
+      NB_Frag(b1, frag) -> match frag {
+        NF(s, e) -> {
+          let b2 = nb_add_transition(b1, outer_s, TEpsilon(s))
+          let b3 = nb_add_transition(b2, e, TEpsilon(outer_e))
+          compile_alt_branches(b3, rest, outer_s, outer_e)
+        }
+      }
+    }
+  }
+}
+
+# Star: new start + new accept; ε-edges from outer_s to inner_s and
+# to outer_e (skip path); inner_e ε-back to inner_s (loop) and
+# ε-forward to outer_e.
+fn compile_star(b: NfaBuilder, x: RxAst) : NB_FragR = {
+  let b1 = nb_fresh(b)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let r = compile_frag(b2, x)
+  match r {
+    NB_Frag(b3, frag) -> match frag {
+      NF(s, e) -> {
+        let b4 = nb_add_transition(b3, outer_s, TEpsilon(s))
+        let b5 = nb_add_transition(b4, outer_s, TEpsilon(outer_e))
+        let b6 = nb_add_transition(b5, e, TEpsilon(s))
+        let b7 = nb_add_transition(b6, e, TEpsilon(outer_e))
+        NB_Frag(b7, NF(outer_s, outer_e))
+      }
+    }
+  }
+}
+
+# Plus: like star but no skip-path from outer_s — the body must
+# match at least once.
+fn compile_plus(b: NfaBuilder, x: RxAst) : NB_FragR = {
+  let r = compile_frag(b, x)
+  match r {
+    NB_Frag(b1, frag) -> match frag {
+      NF(s, e) -> {
+        # Add a loop-back ε from accept to start. The inner
+        # fragment's start/accept become the outer's directly —
+        # no need to allocate fresh wrapper states.
+        let b2 = nb_add_transition(b1, e, TEpsilon(s))
+        NB_Frag(b2, NF(s, e))
+      }
+    }
+  }
+}
+
+# Opt: ε-edge from outer_s to outer_e (skip path); compile body
+# between them.
+fn compile_opt(b: NfaBuilder, x: RxAst) : NB_FragR = {
+  let b1 = nb_fresh(b)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let r = compile_frag(b2, x)
+  match r {
+    NB_Frag(b3, frag) -> match frag {
+      NF(s, e) -> {
+        let b4 = nb_add_transition(b3, outer_s, TEpsilon(s))
+        let b5 = nb_add_transition(b4, outer_s, TEpsilon(outer_e))
+        let b6 = nb_add_transition(b5, e, TEpsilon(outer_e))
+        NB_Frag(b6, NF(outer_s, outer_e))
+      }
+    }
+  }
+}
+
+# Bounded repeat {n,m}: unroll into a chain of n required copies
+# followed by (m - n) optional copies. {n,} (max = None) emits
+# n required copies followed by a single Star wrapper for the
+# rest. {n,n} is just n required copies.
+fn compile_repeat(b: NfaBuilder, x: RxAst, lo: Int, hi_opt: Option[Int]) : NB_FragR = {
+  let r0 = compile_repeat_required(b, x, lo)
+  match r0 {
+    NB_Frag(b1, frag1) -> match frag1 {
+      NF(s1, e1) -> match hi_opt {
+        None    -> {
+          # Unbounded tail — append a Star.
+          let r_tail = compile_star(b1, x)
+          match r_tail {
+            NB_Frag(b2, frag_tail) -> match frag_tail {
+              NF(s_tail, e_tail) -> {
+                let b3 = nb_add_transition(b2, e1, TEpsilon(s_tail))
+                NB_Frag(b3, NF(s1, e_tail))
+              }
+            }
+          }
+        }
+        Some(hi) -> {
+          # Bounded tail — append (hi - lo) optional copies.
+          let r_tail = compile_repeat_optional(b1, x, hi - lo)
+          match r_tail {
+            NB_Frag(b2, frag_tail) -> match frag_tail {
+              NF(s_tail, e_tail) -> {
+                let b3 = nb_add_transition(b2, e1, TEpsilon(s_tail))
+                NB_Frag(b3, NF(s1, e_tail))
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Compile `n` required copies of `x` chained by ε. n == 0 yields a
+# trivial pass-through (single state, start == accept).
+fn compile_repeat_required(b: NfaBuilder, x: RxAst, n: Int) : NB_FragR = {
+  if n <= 0 {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    NB_Frag(b1, NF(s, s))
+  } else {
+    let r = compile_frag(b, x)
+    match r {
+      NB_Frag(b1, frag) -> match frag {
+        NF(s, e) ->
+          if n == 1 { NB_Frag(b1, NF(s, e)) }
+          else {
+            let r2 = compile_repeat_required(b1, x, n - 1)
+            match r2 {
+              NB_Frag(b2, frag2) -> match frag2 {
+                NF(s2, e2) -> {
+                  let b3 = nb_add_transition(b2, e, TEpsilon(s2))
+                  NB_Frag(b3, NF(s, e2))
+                }
+              }
+            }
+          }
+      }
+    }
+  }
+}
+
+# Compile `n` optional copies of `x` chained by ε. Each copy is
+# a fresh Opt-fragment (skip path included).
+fn compile_repeat_optional(b: NfaBuilder, x: RxAst, n: Int) : NB_FragR = {
+  if n <= 0 {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    NB_Frag(b1, NF(s, s))
+  } else {
+    let r = compile_opt(b, x)
+    match r {
+      NB_Frag(b1, frag) -> match frag {
+        NF(s, e) ->
+          if n == 1 { NB_Frag(b1, NF(s, e)) }
+          else {
+            let r2 = compile_repeat_optional(b1, x, n - 1)
+            match r2 {
+              NB_Frag(b2, frag2) -> match frag2 {
+                NF(s2, e2) -> {
+                  let b3 = nb_add_transition(b2, e, TEpsilon(s2))
+                  NB_Frag(b3, NF(s, e2))
+                }
+              }
+            }
+          }
+      }
+    }
+  }
+}
+
+# Capture group: outer_s opens the group, outer_e closes it.
+# Inner fragment is sandwiched between zero-width markers.
+fn compile_group(b: NfaBuilder, gid: Int, inner: RxAst) : NB_FragR = {
+  let b0 = nb_record_group(b, gid)
+  let b1 = nb_fresh(b0)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let r = compile_frag(b2, inner)
+  match r {
+    NB_Frag(b3, frag) -> match frag {
+      NF(s, e) -> {
+        let b4 = nb_add_transition(b3, outer_s, TGroupOpen(gid, s))
+        let b5 = nb_add_transition(b4, e, TGroupClose(gid, outer_e))
+        NB_Frag(b5, NF(outer_s, outer_e))
+      }
+    }
+  }
+}
+
+# ---- NFA dump (debug) ----
+#
+# Compact one-line-per-state textual dump for fixtures. Useful to
+# pin compilation shape before the simulator lands.
+
+pub fn rx_nfa_show(n: Nfa) : String =
+  string_concat_all([
+    "NFA(start=", int_to_string(n.start),
+    ", groups=", int_to_string(n.num_groups), ")\n",
+    rx_states_show(n.states)
+  ])
+
+fn rx_states_show(ss: [NfaState]) : String = match ss {
+  []           -> ""
+  [s, ...rest] -> string_concat(rx_state_show(s), rx_states_show(rest))
+}
+
+fn rx_state_show(s: NfaState) : String = {
+  let acc = if s.accept { "*" } else { " " }
+  string_concat_all([
+    "  ", acc, "[", int_to_string(s.id), "] ",
+    rx_transitions_show(s.transitions), "\n"
+  ])
+}
+
+fn rx_transitions_show(ts: [NfaTransition]) : String = match ts {
+  []           -> ""
+  [t]          -> rx_transition_show(t)
+  [t, ...rest] -> string_concat_all([rx_transition_show(t), ", ", rx_transitions_show(rest)])
+}
+
+fn rx_transition_show(t: NfaTransition) : String = match t {
+  TChar(c, dst)        -> "'#{c}'->#{int_to_string(dst)}"
+  TClass(rs, neg, dst) ->
+    string_concat_all(["[", if neg { "^" } else { "" }, rx_ranges_show(rs), "]->", int_to_string(dst)])
+  TAny(dst)            -> ".->#{int_to_string(dst)}"
+  TEpsilon(dst)        -> "ε->#{int_to_string(dst)}"
+  TGroupOpen(gid, dst) -> "(#{int_to_string(gid)}->#{int_to_string(dst)}"
+  TGroupClose(gid, dst) -> "#{int_to_string(gid)})->#{int_to_string(dst)}"
+  TAnchor(a, dst) -> match a {
+    AnchorStart -> "^->#{int_to_string(dst)}"
+    AnchorEnd   -> "$->#{int_to_string(dst)}"
+  }
+}
