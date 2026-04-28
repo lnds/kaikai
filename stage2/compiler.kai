@@ -4353,7 +4353,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
               match rb.r {
                 None -> err_d(rb.p)
                 Some(body) -> {
-                  let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, t.line, t.col)
+                  let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, t.line, t.col)
                   ok_d(rb.p, DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col))
                 }
               }
@@ -4363,7 +4363,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
               match rb.r {
                 None -> err_d(rb.p)
                 Some(body) -> {
-                  let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, t.line, t.col)
+                  let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, t.line, t.col)
                   ok_d(rb.p, DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col))
                 }
               }
@@ -4540,41 +4540,123 @@ fn check_pred_not_false(p: Parser, pred: Expr, kind: String, kw: Token) : Parser
 # returns the body's value. When both lists are empty, the body is
 # returned unchanged so functions without contracts cost nothing.
 fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
-                       line: Int, col: Int) : Expr {
+                       params: [Param], line: Int, col: Int) : Expr {
   if reqs == [] and enss == [] { body } else {
-    let req_stmts = preds_to_asserts(reqs, [], "requires")
+    let pp = collect_param_preds(params, [])
+    let req_stmts = preds_to_asserts(reqs, [], "requires", pp)
     if enss == [] {
-      mk_expr(EBlock(req_stmts, Some(body)), line, col)
+      if req_stmts == [] { body }
+      else { mk_expr(EBlock(req_stmts, Some(body)), line, col) }
     } else {
       # m12.6.c: bind `result` to the body's value so `ensures`
       # predicates can reference it. The shape is
       #   { req_asserts; let result = body; ens_asserts; result }
       let bind_pat = mk_pat(PBind("result"), line, col)
       let bind = SLet(bind_pat, None, body)
-      let ens_stmts = preds_to_asserts(enss, [], "ensures")
-      let res_var = mk_expr(EVar("result"), line, col)
-      let stmts = list_append(req_stmts, [bind, ...ens_stmts])
-      mk_expr(EBlock(stmts, Some(res_var)), line, col)
+      let ens_stmts = preds_to_asserts(enss, [], "ensures", pp)
+      if req_stmts == [] and ens_stmts == [] { body }
+      else {
+        let res_var = mk_expr(EVar("result"), line, col)
+        let stmts = list_append(req_stmts, [bind, ...ens_stmts])
+        mk_expr(EBlock(stmts, Some(res_var)), line, col)
+      }
     }
   }
 }
 
-fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String) : [Stmt] {
+fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
+                     param_preds: [Expr]) : [Stmt] {
   match preds {
     [] -> list_reverse(acc)
     # m12.6.d: drop trivially-true predicates at parse time.
+    # m12.6.x #2: drop a predicate that is structurally identical to
+    # some param's refinement — the type-system already guarantees
+    # it. (Caller-side narrowing into the refined type is the proof
+    # obligation; the callee body inherits the refinement for free.)
     # m12.6.x #8: build a positional msg so panic shows the clause
-    # kind + line. Future enhancement: include the predicate text.
-    [p, ...rest] -> match try_eval_pred(p) {
-      Some(true) -> preds_to_asserts(rest, acc, kind)
-      _          -> {
-        let msg_span = concat_all([
-          "\"", kind, " violated at line ",
-          int_to_string(p.line), "\""
-        ])
-        let msg = mk_expr(EStr(msg_span, false), p.line, p.col)
-        preds_to_asserts(rest, [SAssert(p, Some(msg)), ...acc], kind)
+    # kind + line.
+    [p, ...rest] -> {
+      if pred_entailed_by_params(p, param_preds) {
+        preds_to_asserts(rest, acc, kind, param_preds)
+      } else { match try_eval_pred(p) {
+        Some(true) -> preds_to_asserts(rest, acc, kind, param_preds)
+        _          -> {
+          let msg_span = concat_all([
+            "\"", kind, " violated at line ",
+            int_to_string(p.line), "\""
+          ])
+          let msg = mk_expr(EStr(msg_span, false), p.line, p.col)
+          preds_to_asserts(rest, [SAssert(p, Some(msg)), ...acc], kind, param_preds)
+        }
+      } }
+    }
+  }
+}
+
+# m12.6.x #2: collect every refinement predicate that appears on a
+# fn parameter's TypeExpr. Used by preds_to_asserts to omit a
+# `requires` clause that just restates a param's refinement.
+fn collect_param_preds(params: [Param], acc: [Expr]) : [Expr] {
+  match params {
+    [] -> list_reverse(acc)
+    [p, ...rest] -> match p.ptype {
+      Some(t) -> match t.tkind {
+        TyRefine(_, pred) -> collect_param_preds(rest, [pred, ...acc])
+        _ -> collect_param_preds(rest, acc)
       }
+      None -> collect_param_preds(rest, acc)
+    }
+  }
+}
+
+fn pred_entailed_by_params(pred: Expr, param_preds: [Expr]) : Bool {
+  match param_preds {
+    [] -> false
+    [pp, ...rest] -> if expr_struct_eq(pred, pp) { true }
+                     else { pred_entailed_by_params(pred, rest) }
+  }
+}
+
+# Structural equality on Expr, ignoring line/col. Conservative: only
+# the shapes the predicate-pure subset can produce are compared in
+# detail; everything else falls back to false (so a future feature
+# that produces a new ExprKind in predicate position is treated as
+# "definitely not equal" rather than wrongly entailed).
+fn expr_struct_eq(a: Expr, b: Expr) : Bool {
+  match a.kind {
+    EInt(av) -> match b.kind { EInt(bv) -> av == bv _ -> false }
+    EReal(av) -> match b.kind { EReal(bv) -> av == bv _ -> false }
+    EBool(av) -> match b.kind { EBool(bv) -> av == bv _ -> false }
+    EChar(av) -> match b.kind { EChar(bv) -> av == bv _ -> false }
+    EStr(av, _) -> match b.kind { EStr(bv, _) -> av == bv _ -> false }
+    EUnit -> match b.kind { EUnit -> true _ -> false }
+    EVar(an) -> match b.kind { EVar(bn) -> an == bn _ -> false }
+    EBinop(aop, al, ar) -> match b.kind {
+      EBinop(bop, bl, br) -> aop == bop and expr_struct_eq(al, bl) and expr_struct_eq(ar, br)
+      _ -> false
+    }
+    EUnop(aop, ai) -> match b.kind {
+      EUnop(bop, bi) -> aop == bop and expr_struct_eq(ai, bi)
+      _ -> false
+    }
+    EField(ab, an) -> match b.kind {
+      EField(bb, bn) -> an == bn and expr_struct_eq(ab, bb)
+      _ -> false
+    }
+    ECall(af, aa) -> match b.kind {
+      ECall(bf, ba) -> expr_struct_eq(af, bf) and expr_list_struct_eq(aa, ba)
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
+fn expr_list_struct_eq(a: [Expr], b: [Expr]) : Bool {
+  match a {
+    [] -> match b { [] -> true _ -> false }
+    [ah, ...arest] -> match b {
+      [] -> false
+      [bh, ...brest] -> expr_struct_eq(ah, bh) and expr_list_struct_eq(arest, brest)
     }
   }
 }
