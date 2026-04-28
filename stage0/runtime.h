@@ -971,10 +971,21 @@ static KaiValue *kai_prelude_list_reverse(KaiValue *xs) {
 }
 
 /* ---------- prelude: higher order ---------- */
+/*
+ * kai_apply contract under m5.x flip: every arg slot holds an OWNED
+ * reference that the callee consumes (the closure body is perceus-
+ * compiled and decrefs each arg through normal use). Callers that
+ * want to retain their reference must `kai_incref` before passing.
+ * The four helpers below borrow `xs->as.cons.head` from the caller's
+ * list cell, so each kai_apply arg gets a fresh incref to give the
+ * closure its own ownership; the original cons cell stays alive
+ * for the recursive tail traversal and for the `kai_cons(...)`
+ * reconstruction in `_filter`.
+ */
 
 static KaiValue *kai_prelude_map(KaiValue *xs, KaiValue *f) {
     if (!xs || xs->tag == KAI_NIL) return kai_nil();
-    KaiValue *arg0 = xs->as.cons.head;
+    KaiValue *arg0 = kai_incref(xs->as.cons.head);
     KaiValue *head = kai_apply(f, 1, &arg0);
     KaiValue *rest = kai_prelude_map(xs->as.cons.tail, f);
     return kai_cons(head, rest);
@@ -982,7 +993,7 @@ static KaiValue *kai_prelude_map(KaiValue *xs, KaiValue *f) {
 
 static KaiValue *kai_prelude_filter(KaiValue *xs, KaiValue *p) {
     if (!xs || xs->tag == KAI_NIL) return kai_nil();
-    KaiValue *arg0 = xs->as.cons.head;
+    KaiValue *arg0 = kai_incref(xs->as.cons.head);
     KaiValue *keep = kai_apply(p, 1, &arg0);
     int yes = kai_truthy(keep);
     kai_decref(keep);
@@ -996,10 +1007,10 @@ static KaiValue *kai_prelude_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
     KaiValue *p   = xs;
     while (p && p->tag == KAI_CONS) {
         KaiValue *args[2];
-        args[0] = acc;
-        args[1] = p->as.cons.head;
+        args[0] = kai_incref(acc);              /* closure consumes */
+        args[1] = kai_incref(p->as.cons.head);  /* closure consumes */
         KaiValue *next = kai_apply(f, 2, args);
-        kai_decref(acc);
+        kai_decref(acc);                        /* release prior owned ref */
         acc = next;
         p = p->as.cons.tail;
     }
@@ -1009,7 +1020,7 @@ static KaiValue *kai_prelude_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
 static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) {
-        KaiValue *arg0 = p->as.cons.head;
+        KaiValue *arg0 = kai_incref(p->as.cons.head);
         KaiValue *r = kai_apply(f, 1, &arg0);
         kai_decref(r);
         p = p->as.cons.tail;
@@ -1018,32 +1029,56 @@ static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
 }
 
 /* ---------- binary and unary operators ---------- */
+/*
+ * Linear-consumption primitives (m5.x-flip Phase 3, 2026-04-28):
+ * each op reads ALL relevant fields of its arguments BEFORE decref'ing,
+ * then returns a freshly-allocated result. Aliasing-safe: `kai_eq_v(x, x)`
+ * decrefs `a` and `b` separately, but the read-then-decref ordering means
+ * both reads complete on a still-alive value. This pairs with the dup
+ * pass + exit drops + producer-side incref-on-extract (Steps A + B) so
+ * every value is released exactly once. NOT flipped: `kai_field` (already
+ * increfs its return; introspection rather than consumer), `kai_eq` (C-int
+ * returning, used inside non-consuming match tests), `kai_apply` (closure
+ * invocation; lifecycle managed at the call lowering).
+ */
 
 static KaiValue *kai_add(KaiValue *a, KaiValue *b) {
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_int(a->as.i + b->as.i);
-    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_real(a->as.r + b->as.r);
-    fprintf(stderr, "kai: type mismatch in +\n"); exit(1);
+    KaiValue *r;
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int(a->as.i + b->as.i);
+    else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_real(a->as.r + b->as.r);
+    else { fprintf(stderr, "kai: type mismatch in +\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
 }
 
 static KaiValue *kai_sub(KaiValue *a, KaiValue *b) {
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_int(a->as.i - b->as.i);
-    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_real(a->as.r - b->as.r);
-    fprintf(stderr, "kai: type mismatch in -\n"); exit(1);
+    KaiValue *r;
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int(a->as.i - b->as.i);
+    else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_real(a->as.r - b->as.r);
+    else { fprintf(stderr, "kai: type mismatch in -\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
 }
 
 static KaiValue *kai_mul(KaiValue *a, KaiValue *b) {
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_int(a->as.i * b->as.i);
-    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_real(a->as.r * b->as.r);
-    fprintf(stderr, "kai: type mismatch in *\n"); exit(1);
+    KaiValue *r;
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int(a->as.i * b->as.i);
+    else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_real(a->as.r * b->as.r);
+    else { fprintf(stderr, "kai: type mismatch in *\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
 }
 
 static KaiValue *kai_div(KaiValue *a, KaiValue *b) {
+    KaiValue *r;
     if (a->tag == KAI_INT && b->tag == KAI_INT) {
         if (b->as.i == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); }
-        return kai_int(a->as.i / b->as.i);
-    }
-    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_real(a->as.r / b->as.r);
-    fprintf(stderr, "kai: type mismatch in /\n"); exit(1);
+        r = kai_int(a->as.i / b->as.i);
+    } else if (a->tag == KAI_REAL && b->tag == KAI_REAL) {
+        r = kai_real(a->as.r / b->as.r);
+    } else { fprintf(stderr, "kai: type mismatch in /\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
 }
 
 static KaiValue *kai_idiv(KaiValue *a, KaiValue *b) {
@@ -1055,43 +1090,55 @@ static KaiValue *kai_idiv(KaiValue *a, KaiValue *b) {
     else if (b->tag == KAI_REAL) bv = (int64_t) b->as.r;
     else { fprintf(stderr, "kai: type mismatch in //\n"); exit(1); }
     if (bv == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); }
-    return kai_int(av / bv);
+    KaiValue *r = kai_int(av / bv);
+    kai_decref(a); kai_decref(b);
+    return r;
 }
 
 static KaiValue *kai_mod(KaiValue *a, KaiValue *b) {
+    KaiValue *r;
     if (a->tag == KAI_INT && b->tag == KAI_INT) {
         if (b->as.i == 0) { fprintf(stderr, "kai: mod by zero\n"); exit(1); }
-        return kai_int(a->as.i % b->as.i);
-    }
-    fprintf(stderr, "kai: type mismatch in %%\n"); exit(1);
+        r = kai_int(a->as.i % b->as.i);
+    } else { fprintf(stderr, "kai: type mismatch in %%\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
 }
 
 static KaiValue *kai_lt(KaiValue *a, KaiValue *b) {
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_bool(a->as.i < b->as.i);
-    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_bool(a->as.r < b->as.r);
-    if (a->tag == KAI_CHAR && b->tag == KAI_CHAR) return kai_bool(a->as.c < b->as.c);
-    if (a->tag == KAI_STR  && b->tag == KAI_STR) {
+    KaiValue *r;
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_bool(a->as.i < b->as.i);
+    else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_bool(a->as.r < b->as.r);
+    else if (a->tag == KAI_CHAR && b->tag == KAI_CHAR) r = kai_bool(a->as.c < b->as.c);
+    else if (a->tag == KAI_STR  && b->tag == KAI_STR) {
         size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
-        if (c != 0) return kai_bool(c < 0);
-        return kai_bool(a->as.s.len < b->as.s.len);
-    }
-    fprintf(stderr, "kai: type mismatch in <\n"); exit(1);
+        if (c != 0) r = kai_bool(c < 0);
+        else        r = kai_bool(a->as.s.len < b->as.s.len);
+    } else { fprintf(stderr, "kai: type mismatch in <\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
 }
 
 static KaiValue *kai_gt(KaiValue *a, KaiValue *b) {
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)  return kai_bool(a->as.i > b->as.i);
-    if (a->tag == KAI_REAL && b->tag == KAI_REAL) return kai_bool(a->as.r > b->as.r);
-    if (a->tag == KAI_CHAR && b->tag == KAI_CHAR) return kai_bool(a->as.c > b->as.c);
-    if (a->tag == KAI_STR  && b->tag == KAI_STR) {
+    KaiValue *r;
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_bool(a->as.i > b->as.i);
+    else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_bool(a->as.r > b->as.r);
+    else if (a->tag == KAI_CHAR && b->tag == KAI_CHAR) r = kai_bool(a->as.c > b->as.c);
+    else if (a->tag == KAI_STR  && b->tag == KAI_STR) {
         size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
-        if (c != 0) return kai_bool(c > 0);
-        return kai_bool(a->as.s.len > b->as.s.len);
-    }
-    fprintf(stderr, "kai: type mismatch in >\n"); exit(1);
+        if (c != 0) r = kai_bool(c > 0);
+        else        r = kai_bool(a->as.s.len > b->as.s.len);
+    } else { fprintf(stderr, "kai: type mismatch in >\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
 }
 
+/* `kai_le` and `kai_ge` are now layered over the consuming `kai_gt` /
+ * `kai_lt`. The inner call consumes `a` and `b` already; we must not
+ * decref them again here. The intermediate bool result is consumed
+ * locally to read the inverted truth value. */
 static KaiValue *kai_le(KaiValue *a, KaiValue *b) {
     KaiValue *g = kai_gt(a, b);
     KaiValue *r = kai_bool(!g->as.b);
@@ -1106,20 +1153,49 @@ static KaiValue *kai_ge(KaiValue *a, KaiValue *b) {
     return r;
 }
 
-static KaiValue *kai_eq_v(KaiValue *a, KaiValue *b) { return kai_bool(kai_eq(a, b)); }
-static KaiValue *kai_ne_v(KaiValue *a, KaiValue *b) { return kai_bool(!kai_eq(a, b)); }
+/* `kai_eq` does NOT consume — it is the C-int returning equality used by
+ * pattern tests and other non-consuming sites. `kai_eq_v` / `kai_ne_v`
+ * are the value-level wrappers used for `==` / `!=` expressions; those
+ * DO consume per the m5.x flip. Self-aliasing (`kai_eq_v(x, x)`) is safe
+ * because `kai_eq` reads both pointers before either decref runs.  */
+static KaiValue *kai_eq_v(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_bool(kai_eq(a, b));
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+static KaiValue *kai_ne_v(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_bool(!kai_eq(a, b));
+    kai_decref(a); kai_decref(b);
+    return r;
+}
 
 static KaiValue *kai_neg(KaiValue *a) {
-    if (a->tag == KAI_INT)  return kai_int(-a->as.i);
-    if (a->tag == KAI_REAL) return kai_real(-a->as.r);
-    fprintf(stderr, "kai: type mismatch in unary -\n"); exit(1);
+    KaiValue *r;
+    if (a->tag == KAI_INT)       r = kai_int(-a->as.i);
+    else if (a->tag == KAI_REAL) r = kai_real(-a->as.r);
+    else { fprintf(stderr, "kai: type mismatch in unary -\n"); exit(1); }
+    kai_decref(a);
+    return r;
 }
 
 static KaiValue *kai_boolnot(KaiValue *a) {
-    if (a->tag == KAI_BOOL) return kai_bool(!a->as.b);
-    fprintf(stderr, "kai: type mismatch in `not`\n"); exit(1);
+    KaiValue *r;
+    if (a->tag == KAI_BOOL) r = kai_bool(!a->as.b);
+    else { fprintf(stderr, "kai: type mismatch in `not`\n"); exit(1); }
+    kai_decref(a);
+    return r;
 }
 
+/* `kai_truthy` is a non-consuming C-int predicate used inside
+ * `if (kai_truthy(...))`, ternary lowerings of `if`/`and`/`or`, and
+ * `kai_assert_check`. It is intentionally NOT flipped under the
+ * m5.x runtime flip: the LLVM short-circuit lowering's phi node
+ * returns `lhs` itself in the early-exit branch, so consuming `lhs`
+ * inside the truthiness probe would alias-free a value still
+ * referenced downstream. The emitted-C path leaks the temporary
+ * argument; pinned in `docs/m5x-followup.md` as future cleanup
+ * (predicate consumes + emit-side incref before short-circuit). */
 static int kai_truthy(KaiValue *v) {
     return v && v->tag == KAI_BOOL && v->as.b;
 }

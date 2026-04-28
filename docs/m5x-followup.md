@@ -16,7 +16,7 @@ below address.
 
 ## Deferred items
 
-### 1. m5 #9 step 3/4 — runtime primitive linear consumption *(STEP 1 LANDED, STEP 2 BLOCKED)*
+### 1. m5 #9 step 3/4 — runtime primitive linear consumption *(LANDED 2026-04-28)*
 
 Modify `kai_lt` / `gt` / `le` / `ge` / `eq_v` / `ne_v` / `add` / `sub` /
 `mul` / `div` / `idiv` / `mod` / `neg` / `boolnot` / `truthy` / `field`
@@ -60,27 +60,119 @@ Selfhost (C + LLVM) byte-identical, `make test` clean,
 `make demos-no-regression` baseline 20 holds. Inert under the loose
 runtime; pays its way once step 2c (runtime flip) lands.
 
-**Step 2b — exit drops for multi-use params (DEFERRED to step 2c).**
-The lane retro (2026-04-28) attempted to wrap fn bodies with
-`let __pcs_ret = body; <exit_drops>; __pcs_ret` so that multi-use and
-LUBlocked params are decref'd at fn return. The wrap parses, types,
-and emits valid C, but selfhost UAFs at typer time. Root cause:
-match-arm and field-access destructures alias the producer's storage
-without an incref, so the local binding shares a reference with the
-producer (`synth` extracts `callee` from `e.kind`'s `ECall(callee,
-args_)` slot via the variant args storage). When the callee's exit
-drop in `synth_call` decrefs `callee` and the shared rc reaches 0,
-the producer's slot is freed; subsequent reads of `e.kind` UAF.
-Under the loose runtime nothing else decrefs these aliased refs, so
-adding any callee-side drop is unsound. Step 2c (runtime flip)
-turns every primitive into a consumer **and** every shared-storage
-producer (match-arm extract, `kai_field`, list head/tail) into an
-incref-on-extraction site, at which point exit drops can land
-together with the flip in one atomic commit.
+**Step 2b — exit drops for multi-use params (LANDED with 2c, 2026-04-28).**
+The previous attempt to wrap fn bodies with
+`let __pcs_ret = body; <exit_drops>; __pcs_ret` self-host UAFed at
+typer time because match-arm and field-access destructures aliased
+the producer's storage without an incref. Step 2c (the runtime flip
+below) carries the producer-side incref-on-extract that makes those
+exit drops sound; both ship together in one coherent commit.
 
-The deleted exit-drop code shape is preserved in this branch's
-history under `pcs_wrap_param_drops` — re-emerge for step 2c by
-reverting the docstring at `pcs_prepend_unused_drops`.
+**Step 2c — atomic runtime flip LANDED (2026-04-28):** ships Steps A,
+B, C, and a stage-0 retrofit (D) together because each is unsound
+without the others. Five concrete changes:
+
+1. **A — Producer-side incref-on-extract (stage 0 + 1 + 2).**
+   `emit_pat_binds` gains an `is_alias` flag. Set true at every nested
+   destructure (variant args, cons head/tail, list-rest binding) and
+   at the top-level match-arm call (because subsequent arms re-read
+   `_scr` and a guard inside an arm may consume the binding —
+   const-pattern desugar emits `__cv_NAME == NAME()`). Top-level let
+   destructures (`_letv_*` from a transferred RHS) and record-field
+   destructures (`kai_field` already increfs its return) keep
+   is_alias=false. PBind under is_alias=true emits
+   `KaiValue *kai_x = kai_incref(scr)` so the binding owns its own
+   reference, decoupled from the producer's slot.
+
+2. **B — Exit drops for multi-use / LUBlocked params (stage 1 + 2).**
+   `pcs_prepend_unused_drops` now wraps the body as
+   `EBlock([entry_drops..., SLet(__pcs_ret, body), exit_drops...],
+   Some(EVar("__pcs_ret")))` when any param has LUBlocked or LUAt
+   with `pcs_count_non_lam_uses ≥ 2`. LUUnused params keep the
+   entry-drop they had under the inert Phase 1. Single-use LUAt
+   params still transfer raw (no drop). Test bodies (`DTest`) now
+   also run through `perceus_decl` so multi-use let-bindings inside
+   tests — especially ones captured by closures — get their dup
+   wraps; without this, the first invocation of a closure that
+   reads a captured binding twice consumes both refs and the second
+   invocation UAFs.
+
+3. **C — 13 primitive flips in `stage0/runtime.h`.**
+   `kai_add` / `sub` / `mul` / `div` / `idiv` / `mod` / `neg` / `lt` /
+   `gt` / `le` / `ge` / `eq_v` / `ne_v` / `boolnot` decref their args
+   after reading every relevant field. `kai_le` / `kai_ge` no longer
+   decref `a` / `b` themselves (the inner `kai_gt` / `kai_lt` does);
+   they only decref their own intermediate bool. `kai_truthy` is
+   intentionally **not** flipped — the LLVM short-circuit lowering's
+   phi returns `lhs` itself in the early-exit branch, so consuming
+   the truthiness probe's argument would alias-free a value still
+   referenced by downstream code. The `kai_apply` and `kai_field`
+   primitives also stay non-consuming (apply is closure invocation,
+   not a value op; field is introspection that already increfs its
+   return).
+
+4. **D — Stage 0 eager-dup retrofit.** Every local-binding read in
+   value position (`emit_ident_value` in `stage0/emit.c`) now emits
+   `kai_internal_dup(kai_<name>)` rather than the bare `kai_<name>`.
+   Stage 0 has no perceus pass; eager dup is a brute-force way to
+   keep the binding's reference alive across consuming primitives in
+   kaic1's emitted code. Leaks one ref per local read, matching the
+   pre-flip leak baseline.
+
+5. **Runtime helper update.** `kai_prelude_map` / `_filter` /
+   `_reduce` / `_each` previously borrowed `xs->as.cons.head` and
+   passed the alias to `kai_apply`; under the flip the closure body
+   consumed those refs and the caller's cons cell dangled (or the
+   helper itself decref'd a freed value, as `_reduce` did with
+   `acc`). Each helper now `kai_incref`s every arg before
+   `kai_apply` so the closure can consume freely; `_reduce` keeps
+   its own owned `acc` ref and decrefs the prior one at the end of
+   each iteration.
+
+**Numbers (kaic2 self-compile, 2026-04-28):**
+
+| metric        | pre-m5     | m5 #7      | Phase 1 (inert) | Phase 3 (flip) |
+|---------------|------------|------------|-----------------|----------------|
+| alloc_total   | 130.7 M    | 29.5 M     | 33.0 M          | 69.7 M         |
+| free_total    | 3.5 M      | 37         | 39              | 22.8 M         |
+| leaked        | 127.2 M    | 29.5 M     | 33.0 M          | 46.9 M         |
+| live_peak     | 127.2 M    | 29.5 M     | 33.0 M          | 46.9 M         |
+| max RSS       | 6.25 GB    | n/a        | n/a             | 3.02 GB        |
+| wall time     | 2.15 s     | n/a        | n/a             | 5.74 s         |
+
+The +36.7 M alloc_total delta vs Phase 1 is the dup machinery
+firing — every multi-use binding read calls `kai_internal_dup`
+which calls `kai_incref` (counter increments per call). The
+**52% RSS reduction** and **63% live_peak reduction** are the
+load-bearing wins; wall time grew 2.7× because of the additional
+RC bookkeeping on a per-allocation basis. Once Full Perceus lands
+(drop specialisation + unboxing of Int / Real / Bool / Char), the
+RC overhead should shrink.
+
+**Gates passed (2026-04-28):**
+- L1: `make selfhost` byte-identical (stage 1 + stage 2)
+- L1: `make -C stage2 selfhost-llvm` byte-identical
+- L1: `make test` clean (typer, runtime, emit, blocks, holes,
+  effects, sugars, modules, protocols, demos-core, aspirational)
+- L3: `make demos-no-regression` 20 passing (baseline 18)
+
+L2 (invariant walker for `EVar` count ≥ 2 wrap-or-return-binding)
+not added — the byte-identical selfhost gate establishes it by
+construction. Worth adding when Full Perceus introduces more
+re-write rules.
+
+**Known remaining leak sources** (not blockers for this lane):
+- Match scrutinee `_scr` is never decref'd at match exit; non-PBind
+  top-level patterns leak the scrutinee (matches pre-flip baseline).
+- `kai_truthy` non-consuming → `if (kai_truthy(<fresh>))` leaks the
+  fresh expr per evaluation. Cleanup requires emit-side incref
+  before short-circuit phi; deferred.
+- `kai_field` always increfs but the test-phase reads in
+  `emit_pat_test_record_fields` discard the incref'd value
+  unmatched — leak per field test.
+- Hand-written `kai_prelude_*` helpers in runtime.h leak their
+  own params (no exit drop in C).
+- Stage 0's eager-dup leaks one ref per local read in kaic1.
 
 ### 2. m5 #6 (doc grain) — `kai_closure` incref of captures *(LANDED)*
 
