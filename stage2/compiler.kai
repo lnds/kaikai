@@ -7093,23 +7093,17 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
           "_op_r; })"
         ])
       } else {
-      match evar_find(variants, callee) {
-        Some(_) -> emit_variant_call(callee, list_length(args_e), call_args)
-        None -> match prelude_find(callee) {
-          Some(ep) -> match ep {
-            EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
-          }
-          None -> match efn_find(fns, callee) {
-            Some(_) -> cat5("kai_", callee, "(", call_args, ")")
-            None -> concat_all([
-              "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e)),
-              ", (KaiValue *[]){", call_args, "})"
-            ])
-          }
-        }
-      }
+        emit_named_call_lookup(callee, args_e, call_args, fns, variants)
       }
     }
+    # m6.2 Phase 3: qualified call. v1 shares the C symbol with the
+    # legacy unqualified form — the M6.1 concat semantics put
+    # `fname` in the global decl stream under its bare name, so
+    # the lookup is identical to `EVar(fname)` minus the special
+    # callees (resume / __perceus_* / unit_name / dotted op-call)
+    # that cannot reach a qualified call by construction.
+    EModCall(_, fname) ->
+      emit_named_call_lookup(fname, args_e, call_args, fns, variants)
     _ -> {
       let fc = emit_expr(src, f, fns, variants, lams)
       concat_all([
@@ -7120,6 +7114,46 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
   }
 }
 
+# Shared by emit_pipe_expr's EVar / EModCall branches. Same lookup
+# chain as emit_named_call_lookup but parameterised on a pre-built
+# args string (the pipe LHS is already the first argument).
+fn emit_pipe_named_lookup(callee: String, arity: Int, args_all: String, fns: [EFn], variants: [EVar]) : String =
+  match evar_find(variants, callee) {
+    Some(_) -> emit_variant_call(callee, arity, args_all)
+    None -> match prelude_find(callee) {
+      Some(ep) -> match ep {
+        EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
+      }
+      None -> match efn_find(fns, callee) {
+        Some(_) -> cat5("kai_", callee, "(", args_all, ")")
+        None -> concat_all([
+          "kai_apply(kai_", callee, ", ", int_to_string(arity),
+          ", (KaiValue *[]){", args_all, "})"
+        ])
+      }
+    }
+  }
+
+# Shared by emit_call_expr's EVar non-special branch and its
+# EModCall (m6.2) branch. Picks variant / prelude / user-fn /
+# closure-thunk emission from the same lookup chain.
+fn emit_named_call_lookup(callee: String, args_e: [Expr], call_args: String, fns: [EFn], variants: [EVar]) : String =
+  match evar_find(variants, callee) {
+    Some(_) -> emit_variant_call(callee, list_length(args_e), call_args)
+    None -> match prelude_find(callee) {
+      Some(ep) -> match ep {
+        EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
+      }
+      None -> match efn_find(fns, callee) {
+        Some(_) -> cat5("kai_", callee, "(", call_args, ")")
+        None -> concat_all([
+          "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e)),
+          ", (KaiValue *[]){", call_args, "})"
+        ])
+      }
+    }
+  }
+
 fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   let lhs_c = emit_expr(src, lhs, fns, variants, lams)
   match rhs.kind {
@@ -7127,21 +7161,13 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar
       EVar(callee) -> {
         let rest_args = emit_call_args(src, args_e, fns, variants, lams)
         let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-        match evar_find(variants, callee) {
-          Some(_) -> emit_variant_call(callee, list_length(args_e) + 1, args_all)
-          None -> match prelude_find(callee) {
-            Some(ep) -> match ep {
-              EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
-            }
-            None -> match efn_find(fns, callee) {
-              Some(_) -> cat5("kai_", callee, "(", args_all, ")")
-              None -> concat_all([
-                "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e) + 1),
-                ", (KaiValue *[]){", args_all, "})"
-              ])
-            }
-          }
-        }
+        emit_pipe_named_lookup(callee, list_length(args_e) + 1, args_all, fns, variants)
+      }
+      # m6.2 Phase 3: piped qualified call `x |> mod.f(args)`.
+      EModCall(_, fname) -> {
+        let rest_args = emit_call_args(src, args_e, fns, variants, lams)
+        let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
+        emit_pipe_named_lookup(fname, list_length(args_e) + 1, args_all, fns, variants)
       }
       _ -> {
         let fc = emit_expr(src, f, fns, variants, lams)
@@ -7153,21 +7179,10 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar
         ])
       }
     }
-    EVar(callee) -> {
-      match evar_find(variants, callee) {
-        Some(_) -> emit_variant_call(callee, 1, lhs_c)
-        None -> match prelude_find(callee) {
-          Some(ep) -> match ep { EP(_, cname, _) -> cat4(cname, "(", lhs_c, ")") }
-          None -> match efn_find(fns, callee) {
-            Some(_) -> cat5("kai_", callee, "(", lhs_c, ")")
-            None -> concat_all([
-              "kai_apply(kai_", callee,
-              ", 1, (KaiValue *[]){", lhs_c, "})"
-            ])
-          }
-        }
-      }
-    }
+    EVar(callee) -> emit_pipe_named_lookup(callee, 1, lhs_c, fns, variants)
+    # m6.2 Phase 3: piped qualified-call shorthand `x |> mod.f` (no
+    # parens) — same lookup as the parens form.
+    EModCall(_, fname) -> emit_pipe_named_lookup(fname, 1, lhs_c, fns, variants)
     _ -> concat_all([
       "kai_apply(", emit_expr(src, rhs, fns, variants, lams),
       ", 1, (KaiValue *[]){", lhs_c, "})"
@@ -8637,13 +8652,12 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
     # was validated as nullary at typing time, so emit_variant_call
     # with arity 0 / empty arg array is correct.
     EVariantsOf(_, names) -> emit_variants_of_list(names)
-    # m6.2 Phase 2.1: scaffolding only — the resolver does not yet
-    # rewrite anything to EModCall, so reaching the C emitter with
-    # one is a compiler bug. Phase 2.4 wires the real lowering.
-    EModCall(m, fname) -> concat_all([
-      "kai_prelude_panic(kai_str(\"EModCall reached C emitter in Phase 2.1: ",
-      m, ".", fname, "\"))"
-    ])
+    # m6.2 Phase 3: qualified call as an expression value (callee
+    # of an ECall is handled in emit_call_expr; this branch covers
+    # `let f = list.map`-style first-class references). Mirrors
+    # `EVar(fname)` since v1 shares the C symbol with the legacy
+    # unqualified form.
+    EModCall(_, fname) -> emit_ident_value(fname, fns, variants)
   }
 }
 
@@ -14803,12 +14817,36 @@ fn synth(st: InferState, e: Expr) : Inferred {
     # has them without re-walking the env. Errors yield a TyAny
     # stub so cascade is graceful.
     EVariantsOf(ty_expr, _) -> synth_variants_of(st, ty_expr, e)
-    # m6.2 Phase 2.1: scaffolding only — the resolver does not yet
-    # rewrite anything to EModCall, so the typer should never see
-    # one. Phase 2.3 wires the resolver rewrite + 2.4 the typing.
-    EModCall(m, fname) -> panic(string_concat(
-      "EModCall reached typer in Phase 2.1: ",
-      string_concat(m, string_concat(".", fname))))
+    # m6.2 Phase 2.4: qualified call. Phase 2.3 only rewrites
+    # `EField(EVar(mod), fname)` to `EModCall(mod, fname)` after
+    # checking that `mod` is in the module table and `fname` is in
+    # its exports — which means the function decl is concatenated
+    # into the global decl stream (M6.1 semantics) and its scheme
+    # lives in TyEnv under the bare `fname` key. v1 shares the
+    # symbol with legacy unqualified callers; v2 will universalise
+    # the prefixed `kai_<module>__<name>` minting and use this
+    # variant to disambiguate two modules that export the same
+    # name. Until then, the lookup is the same as `EVar(fname)`.
+    EModCall(m, fname) -> match ty_env_lookup(st.env, fname) {
+      Some(sc) -> {
+        let r = st_instantiate_report(st, sc)
+        let st2 = match r.fresh {
+          [] -> r.st
+          _  -> st_push_inst(r.st, CS(fname, e.line, e.col, r.fresh))
+        }
+        inferred_leaf(st2, r.ty, e)
+      }
+      None -> {
+        # Should not happen — rqc only rewrites when fname is in
+        # the module's exports. If we land here, the table and the
+        # decl stream got out of sync; surface as a diagnostic
+        # rather than a panic so the user sees a concrete location.
+        diag_error(st.file, e.line, e.col,
+          concat_all(["module '", m, "' does not export '", fname,
+                      "' at the typer (rqc / TyEnv mismatch — internal)"]))
+        inferred_leaf(st_bump_err(st), TyAny, e)
+      }
+    }
   }
 }
 
@@ -19748,6 +19786,10 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
     # mirrors the C backend's emit_variants_of_list, just routed
     # through llvm_emit_variant_ctor + llvm_emit_cons primitives.
     EVariantsOf(_, names) -> llvm_emit_variants_of(e, names)
+    # m6.2 Phase 3: qualified call as expression value. v1 shares
+    # the C symbol with the legacy unqualified form; mirrors
+    # `EVar(fname)`'s fn-value path.
+    EModCall(_, fname) -> llvm_emit_fn_value(e, fname, x.line, x.col)
     _ -> {
       eprint("llvm: unsupported expression kind (#{expr_kind_name(x.kind)}) at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
       llvm_set_last(e, "undef")
@@ -20288,6 +20330,21 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
             }
         }
       }
+    }
+    # m6.2 Phase 3: qualified call. The user wrote `mod.fn(args)`;
+    # rqc rewrote the callee to EModCall(mod, fname); v1 emits the
+    # call against the legacy `@kai_<fname>` symbol since concat
+    # semantics put the fn body there. The variant exists so that
+    # v2 can switch this branch to mint a prefixed symbol while
+    # leaving the unqualified `EVar(fname)` branch alone.
+    EModCall(_, fname) -> {
+      let ra = llvm_emit_args(e, xs, [])
+      let sym = if llvm_is_prelude_fn(fname) { llvm_prelude_symbol(fname) }
+                else                         { string_concat("@kai_", fname) }
+      let r = llvm_fresh_reg(ra.st)
+      let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
+                              llvm_format_args(ra.regs), ")\n"])
+      llvm_set_last(llvm_append_body(r.e, instr), r.reg)
     }
     _ -> {
       let ec = llvm_emit_expr(e, callee)
