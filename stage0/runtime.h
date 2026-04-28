@@ -20,6 +20,20 @@
  * to keep the generated code uniform.
  */
 
+/* m8.x cooperative scheduler substrate: ucontext.
+ *
+ * The _XOPEN_SOURCE feature-test macro must be defined BEFORE ANY
+ * system header is included, otherwise sys/types.h (transitively
+ * pulled in by stdio.h, time.h, etc.) freezes the legacy POSIX
+ * ucontext_t layout (~56 bytes) instead of the full XSI shape
+ * (~880 bytes on darwin arm64). swapcontext then writes 880 bytes
+ * into a 56-byte buffer, silently corrupting whatever sits next to
+ * the embedded ucontext_t — exactly what bit Phase 2 once
+ * (kai_main_fiber.evidence_top got clobbered to a saved register
+ * value because the static evidence nodes were laid out adjacent).
+ * Spec: docs/fibers-impl.md §*macOS deprecation handling*. */
+#define _XOPEN_SOURCE 600
+
 #ifndef KAI_RUNTIME_H
 #define KAI_RUNTIME_H
 
@@ -29,6 +43,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* Apple deprecated ucontext in macOS 10.6 (POSIX-2008 obsoletion).
+ * The functions still work; the deprecation attribute on the
+ * prototypes triggers -Wdeprecated-declarations, which the local
+ * pragma silences. Same trick libco / libtask / Boost.Context use.
+ * The same envelope wraps every swap/get/makecontext call site. */
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+#include <ucontext.h>
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic pop
+#endif
 
 /* Not every program uses every prelude function; silence the
    unused-function warnings that would otherwise pile up in `cc` output
@@ -230,20 +258,25 @@ static void       kai_decref(KaiValue *v);
  * kai_apply (defined further down) to invoke spawned thunks. */
 typedef struct KaiEvidence KaiEvidence;
 
-/* m8 #3: fiber lifecycle states. Inline-eager v1: every spawned
- * fiber goes NEW → DONE inside a single Spawn.spawn call (the thunk
- * runs synchronously). The state machine is here so #4 (Cancel)
- * and a future m8.x ucontext-based scheduler can extend it without
- * a layout change. */
+/* m8 #3 + m8.x: fiber lifecycle states. m8 v1 used only NEW/DONE
+ * (the inline-eager scheduler ran spawn synchronously); m8.x adds
+ * READY (enqueued in the run queue), RUNNING (currently dispatched),
+ * and PARKED (blocked on await / receive / send). Spec:
+ * docs/fibers-impl.md §*Fiber state machine*. The numeric values are
+ * not stable across versions — no ABI commitment yet (CLAUDE.md
+ * "Backward compatibility — not promised until post-MVP"). */
 typedef enum {
     KAI_FIBER_NEW       = 0,
-    KAI_FIBER_DONE      = 1,
-    KAI_FIBER_CANCELLED = 2
+    KAI_FIBER_READY     = 1,  /* m8.x */
+    KAI_FIBER_RUNNING   = 2,  /* m8.x */
+    KAI_FIBER_PARKED    = 3,  /* m8.x */
+    KAI_FIBER_DONE      = 4,
+    KAI_FIBER_CANCELLED = 5
 } KaiFiberState;
 
 typedef struct KaiFiber KaiFiber;
 struct KaiFiber {
-    KaiEvidence *evidence_top;
+    KaiEvidence    *evidence_top;
     int             cancel_requested;  /* Spawn.cancel(target) sets this (#4) */
     int             cancel_delivered;  /* Cancel.raise() injected once (#4)   */
     KaiFiber       *sched_next;        /* intrusive ready-queue link          */
@@ -251,25 +284,48 @@ struct KaiFiber {
     KaiFiberState   state;
     KaiValue       *thunk;             /* held alive while the fiber runs     */
     KaiValue       *result;            /* set on DONE; what await returns     */
+    /* m8.x cooperative scheduler additions. Spec: docs/fibers-impl.md
+     * §*Scheduler*. main_fiber leaves ctx zero-initialised (filled in
+     * by getcontext on first dispatch); spawned fibers fill ctx via
+     * makecontext + a heap-allocated stack. */
+    ucontext_t      ctx;               /* swapcontext target              */
+    void           *stack_base;        /* heap-allocated; freed on RC=0   */
+    size_t          stack_size;        /* set per fiber (env-configurable) */
+    KaiFiber       *awaiters_head;     /* per-fiber awaiter chain head    */
+    KaiFiber       *awaiters_next;     /* link into another fiber's chain */
 };
 
-/* m7a #5: single implicit fiber. m8 #3's inline-eager scheduler
- * still hands back the implicit fiber as "current" — every spawned
- * thunk runs to completion synchronously inside the spawning fiber,
- * so there is no real distinction yet. m8.x's ucontext or full-CPS
- * scheduler will replace the body of kai_current_fiber to return
- * the head of the run queue. */
-static KaiFiber kai_main_fiber = { NULL, 0, 0, NULL, NULL, KAI_FIBER_NEW, NULL, NULL };
+/* m7a #5 + m8.x: kai_main_fiber starts as the OS-thread context,
+ * representing the dispatch loop. Its ctx is filled lazily on first
+ * yield (getcontext at the moment we suspend the dispatch loop into
+ * a fiber). The active-fiber pointer (kai_active_fiber) tracks
+ * whoever is currently executing; kai_current_fiber returns it.
+ * Spec: docs/fibers-impl.md §*Dispatch loop*. */
+static KaiFiber kai_main_fiber = {
+    NULL,                /* evidence_top */
+    0, 0,                /* cancel_requested, cancel_delivered */
+    NULL, NULL,          /* sched_next, parent */
+    KAI_FIBER_RUNNING,   /* state — main starts running on the OS thread */
+    NULL, NULL,          /* thunk, result */
+    {0},                 /* ctx — getcontext fills it on first swap */
+    NULL, 0,             /* stack_base, stack_size — main uses the OS stack */
+    NULL, NULL           /* awaiters_head, awaiters_next */
+};
+
+static KaiFiber *kai_active_fiber = &kai_main_fiber;
 
 static KaiFiber *kai_current_fiber(void) {
-    return &kai_main_fiber;
+    return kai_active_fiber;
 }
 
-/* m8 #1: ready queue. Empty in v1 (every spawned thunk runs
- * immediately); the head/tail pair is here so the data-flow path is
- * the final shape for m8.x's real scheduler. */
+/* m8 #1 + m8.x: ready queue (intrusive singly-linked, head/tail).
+ * Fibers go on the queue when spawned (NEW→READY) or unparked
+ * (PARKED→READY); off the queue when dispatched (READY→RUNNING).
+ * The dispatch loop drains it; deadlock detection panics when the
+ * queue is empty *and* parked fibers exist with no wakeup path. */
 static KaiFiber *kai_ready_head = NULL;
 static KaiFiber *kai_ready_tail = NULL;
+static int       kai_parked_count = 0;  /* deadlock detection */
 
 /* m8 #3: wrap a heap-allocated KaiFiber in an opaque KAI_FIBER
  * value. The KaiFiber struct's lifetime is tied to the value's RC
@@ -430,6 +486,13 @@ static void kai_free_value(KaiValue *v) {
             if (v->as.fib) {
                 kai_decref(v->as.fib->thunk);
                 kai_decref(v->as.fib->result);
+                /* m8.x: free the heap-allocated private stack. main
+                 * fiber has stack_base == NULL (uses the OS thread
+                 * stack) and is statically allocated; spawned fibers
+                 * own their stacks. */
+                if (v->as.fib->stack_base) {
+                    free(v->as.fib->stack_base);
+                }
                 free(v->as.fib);
             }
             break;
@@ -1887,16 +1950,220 @@ static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue
     return kai_cont_resume(k, kai_int(lo_v + (int64_t) draw));
 }
 
-/* m8 #2/#3: default Spawn handlers. Inline-eager v1: spawn(thunk)
- * runs the thunk synchronously, stores the result in a heap KaiFiber,
- * and returns a KAI_FIBER handle; await(fib) returns the cached
- * result; yield is a no-op (the implicit single fiber has nowhere to
- * yield to); select picks the first fiber's result; cancel sets a
- * flag (delivery in m8 #4). A future m8.x replaces this with a real
- * cooperative scheduler whose surface is identical (same evidence
- * struct, same op signatures). */
+/* =================================================================
+ * m8.x cooperative scheduler primitives
+ * =================================================================
+ *
+ * Spec: docs/fibers-impl.md §*Scheduler* and §*Yield primitives*.
+ *
+ * Single-threaded cooperative scheduler. The OS thread starts in
+ * kai_main_fiber (state=RUNNING); spawned fibers each get a private
+ * heap-allocated stack and a ucontext_t. Yield/park use swapcontext
+ * to hand control between fibers. The dispatcher is implicit — there
+ * is no separate scheduler context, just whoever was running before
+ * the current fiber gets resumed when the queue empties.
+ *
+ * v1 ships Phase 2 (scheduler core); Phase 3 adds Cancel delivery at
+ * yield points; Phase 4 adds blocking primitives (BlockSender mailbox
+ * + Actor.receive parking); Phase 5 adds Link/Monitor runtime.
+ */
+
+/* Read KAI_FIBER_STACK_SIZE once and cache. Out-of-range values
+ * fall back to the default and log a warning. Must be a multiple of
+ * 4096 (page size) on most POSIX targets; v1 does not enforce this
+ * because we do not install guard pages yet (m8.x #11 follow-up). */
+static size_t kai_fiber_stack_size(void) {
+    static size_t cached = 0;
+    if (cached != 0) return cached;
+    const char *env = getenv("KAI_FIBER_STACK_SIZE");
+    size_t sz = 64 * 1024;  /* default 64 KiB */
+    if (env && *env) {
+        char *end = NULL;
+        long long parsed = strtoll(env, &end, 10);
+        if (end != env && *end == '\0' && parsed >= 4096 && parsed <= (long long)(64 * 1024 * 1024)) {
+            sz = (size_t) parsed;
+        } else {
+            fprintf(stderr,
+                "kai: KAI_FIBER_STACK_SIZE=%s out of range [4096, 64M]; using default 64K\n",
+                env);
+        }
+    }
+    cached = sz;
+    return cached;
+}
+
+static void kai_sched_enqueue(KaiFiber *f) {
+    f->sched_next = NULL;
+    if (kai_ready_tail) {
+        kai_ready_tail->sched_next = f;
+    } else {
+        kai_ready_head = f;
+    }
+    kai_ready_tail = f;
+}
+
+static KaiFiber *kai_sched_dequeue(void) {
+    KaiFiber *f = kai_ready_head;
+    if (!f) return NULL;
+    kai_ready_head = f->sched_next;
+    if (!kai_ready_head) kai_ready_tail = NULL;
+    f->sched_next = NULL;
+    return f;
+}
+
+/* Forward decl: the trampoline drives a fiber's body and walks its
+ * awaiter chain on completion. Defined below so it can call the
+ * scheduler primitives + kai_apply. */
+static void kai_fiber_trampoline(void);
+
+/* Initialise a freshly-allocated KaiFiber's ucontext + private stack.
+ * Sets f->ctx so it can be a swapcontext target; fills uc_link as a
+ * fallback (the trampoline always exits via setcontext, so uc_link
+ * is reachable only on a runtime bug). The thunk slot must already
+ * be filled by the caller before the fiber runs. */
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+static void kai_fiber_init_ctx(KaiFiber *f) {
+    if (getcontext(&f->ctx) != 0) {
+        fprintf(stderr, "kai: getcontext failed for new fiber\n");
+        exit(1);
+    }
+    f->stack_size = kai_fiber_stack_size();
+    f->stack_base = malloc(f->stack_size);
+    if (!f->stack_base) {
+        fprintf(stderr, "kai: out of memory allocating fiber stack (%zu bytes)\n",
+                f->stack_size);
+        exit(1);
+    }
+    f->ctx.uc_stack.ss_sp   = f->stack_base;
+    f->ctx.uc_stack.ss_size = f->stack_size;
+    f->ctx.uc_link          = &kai_main_fiber.ctx;
+    makecontext(&f->ctx, kai_fiber_trampoline, 0);
+}
+
+/* Yield: caller stays READY and goes back on the run queue; control
+ * swaps to the head of the queue. No-op if the queue is empty (caller
+ * is the only ready fiber, nothing to switch to). */
+static void kai_sched_yield(void) {
+    KaiFiber *current = kai_active_fiber;
+    KaiFiber *next    = kai_sched_dequeue();
+    if (!next) return;  /* alone — nothing to yield to */
+    current->state = KAI_FIBER_READY;
+    kai_sched_enqueue(current);
+    next->state = KAI_FIBER_RUNNING;
+    kai_active_fiber = next;
+    swapcontext(&current->ctx, &next->ctx);
+    /* Resumed: another fiber yielded/parked back to us; the swap
+     * source (current->ctx) holds the state that was just restored.
+     * No further bookkeeping needed. */
+}
+
+/* Park: caller goes PARKED, control swaps to the head of the run
+ * queue. The caller must have already linked itself into a wakeup
+ * list (awaiter chain, mailbox waiter list) before calling park —
+ * otherwise no fiber can ever unpark it.
+ *
+ * Deadlock detection: if the run queue is empty when we park, no
+ * one can wake us up — panic with a diagnostic. */
+static void kai_sched_park(void) {
+    KaiFiber *current = kai_active_fiber;
+    KaiFiber *next    = kai_sched_dequeue();
+    if (!next) {
+        fprintf(stderr,
+            "kai: deadlock — fiber parked with empty run queue (%d parked total)\n",
+            kai_parked_count + 1);
+        exit(1);
+    }
+    current->state = KAI_FIBER_PARKED;
+    kai_parked_count++;
+    next->state = KAI_FIBER_RUNNING;
+    kai_active_fiber = next;
+    swapcontext(&current->ctx, &next->ctx);
+}
+
+/* Unpark: target PARKED → READY, enqueue at run queue tail. Caller
+ * stays RUNNING (does not yield); the unparked fiber runs whenever
+ * the scheduler reaches it. No-op if target is not currently
+ * PARKED (defensive against double-unpark). */
+static void kai_sched_unpark(KaiFiber *target) {
+    if (!target || target->state != KAI_FIBER_PARKED) return;
+    target->state = KAI_FIBER_READY;
+    kai_parked_count--;
+    kai_sched_enqueue(target);
+}
+
+/* Trampoline: the entry point makecontext installs on every spawned
+ * fiber's stack. Reads kai_active_fiber to find itself (set by the
+ * dispatcher who swapped in), runs the thunk, walks awaiters, and
+ * hands control to the next ready fiber via setcontext.
+ *
+ * RC contract (post-v0.2.0 linear-consume): f->thunk is owned by f
+ * for f's entire lifetime; kai_apply borrows. kai_free_value's
+ * KAI_FIBER branch decrefs both thunk and result when f's RC drops,
+ * so the trampoline does not touch RC on either. */
+static void kai_fiber_trampoline(void) {
+    KaiFiber *self = kai_active_fiber;
+    self->result = kai_apply(self->thunk, 0, NULL);
+    self->state  = KAI_FIBER_DONE;
+
+    /* Wake awaiters. Each was parked in Spawn.await (Phase 2.3) or
+     * Spawn.select (Phase 2.3). Walk the chain, clearing each
+     * awaiter's next-link before unparking so a re-park does not see
+     * stale links. */
+    KaiFiber *a = self->awaiters_head;
+    self->awaiters_head = NULL;
+    while (a) {
+        KaiFiber *nx = a->awaiters_next;
+        a->awaiters_next = NULL;
+        kai_sched_unpark(a);
+        a = nx;
+    }
+
+    /* Hand control to the next ready fiber. Awaiters we just woke
+     * are now in the queue; the FIFO discipline picks the oldest
+     * ready (which may be one of them, or main, or a sibling). If
+     * the queue is empty here, every other fiber is parked with no
+     * wakeup path → deadlock. */
+    KaiFiber *next = kai_sched_dequeue();
+    if (!next) {
+        fprintf(stderr,
+            "kai: fiber finished with empty run queue (%d parked) — deadlock\n",
+            kai_parked_count);
+        exit(1);
+    }
+    next->state = KAI_FIBER_RUNNING;
+    kai_active_fiber = next;
+    setcontext(&next->ctx);
+    /* setcontext does not return. */
+}
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic pop
+#endif
+
+/* m8.x: default Spawn handlers backed by the cooperative scheduler.
+ * spawn(thunk)        — alloc fiber + enqueue; thunk runs later.
+ * await(fiber)        — park on the fiber's awaiter chain until DONE.
+ * yield()             — rotate run queue (no-op if alone).
+ * select([fiber])     — Phase 2 simplification: head-of-list, parking
+ *                       on the head if not yet DONE. Real race +
+ *                       cancel-losers semantics land in Phase 4
+ *                       alongside Cancel delivery (Phase 3).
+ * cancel(fiber)       — set cancel_requested; delivery is Phase 3.
+ *
+ * RC contract: op handlers borrow their KaiValue* args (the call site
+ * decrefs after the call per Perceus). Handlers that need to retain
+ * an arg `kai_incref` before storing — same pattern the m8 v1 handlers
+ * used and that `kai_prelude_map` documents at runtime.h:1031-1040.
+ * R1 Phase 3 flipped only the 13 primitives named in CHANGELOG v0.2.0
+ * step C; effect-op handlers were not touched, so the call-site / op
+ * contract stayed "callee borrows".
+ *
+ * Spec: docs/fibers-impl.md §*Yield-point list* and §*Trampoline*. */
 static KaiValue *kai_default_spawn_yield(void *self, KaiCont *k) {
     (void) self;
+    kai_sched_yield();
     return kai_cont_resume(k, kai_unit());
 }
 
@@ -1908,13 +2175,18 @@ static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k
     }
     KaiFiber *f = (KaiFiber *) calloc(1, sizeof(KaiFiber));
     if (!f) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
-    f->parent = kai_current_fiber();
-    f->state  = KAI_FIBER_NEW;
-    f->thunk  = kai_incref(thunk);
-    /* Inline-eager: invoke the thunk now. m8.x replaces this with
-     * an enqueue + scheduler dispatch. */
-    f->result = kai_apply(thunk, 0, NULL);
-    f->state  = KAI_FIBER_DONE;
+    f->parent       = kai_current_fiber();
+    /* incref to retain a ref the fiber owns; the caller-side ref is
+     * still the caller's to manage (Perceus decrefs at call-site exit). */
+    f->thunk        = kai_incref(thunk);
+    /* Inherit parent's evidence_top as floor. The lexical guarantee
+     * (docs/fibers-impl.md §*Balance invariant*) keeps this pointer
+     * valid for the child's lifetime: a handle that scopes the spawn
+     * cannot pop while the spawned fiber is still live. */
+    f->evidence_top = f->parent->evidence_top;
+    kai_fiber_init_ctx(f);
+    f->state = KAI_FIBER_READY;
+    kai_sched_enqueue(f);
     return kai_cont_resume(k, kai_fiber_value(f));
 }
 
@@ -1926,44 +2198,77 @@ static KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiCont *k
     }
     KaiFiber *f = fib_v->as.fib;
     if (f->state != KAI_FIBER_DONE) {
-        /* Should be unreachable in v1: spawn always finishes before
-         * returning. m8.x will block the caller and resume on
-         * completion. */
-        fprintf(stderr, "kai: Spawn.await on incomplete fiber (v1 inline-eager)\n");
-        exit(1);
+        /* Park self on f's awaiter chain. The trampoline (in
+         * kai_fiber_trampoline) walks this chain on DONE and
+         * unparks each awaiter — putting us back on the run queue
+         * with state READY. */
+        KaiFiber *me = kai_active_fiber;
+        me->awaiters_next = f->awaiters_head;
+        f->awaiters_head  = me;
+        kai_sched_park();
+        if (f->state != KAI_FIBER_DONE) {
+            fprintf(stderr,
+                "kai: Spawn.await woken but target not DONE (state=%d)\n",
+                (int) f->state);
+            exit(1);
+        }
     }
     return kai_cont_resume(k, kai_incref(f->result));
 }
 
 static KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, KaiCont *k) {
     (void) self;
-    /* Argument is a [Fiber[T]] — a KAI_CONS list of KAI_FIBER. v1:
-     * pick the head and return its result. m8.x cancels the losers
-     * and picks whichever finishes first. */
-    if (!fibs_v || fibs_v->tag != KAI_CONS) {
-        fprintf(stderr, "kai: Spawn.select called on empty or non-list value\n");
+    if (!fibs_v || (fibs_v->tag != KAI_CONS && fibs_v->tag != KAI_NIL)) {
+        fprintf(stderr, "kai: Spawn.select called on non-list value\n");
         exit(1);
     }
-    KaiValue *first = fibs_v->as.cons.head;
-    if (!first || first->tag != KAI_FIBER || !first->as.fib) {
-        fprintf(stderr, "kai: Spawn.select: list head is not a fiber\n");
+    if (fibs_v->tag == KAI_NIL) {
+        fprintf(stderr, "kai: Spawn.select called on empty list\n");
         exit(1);
     }
-    return kai_cont_resume(k, kai_incref(first->as.fib->result));
+    /* v1 (Phase 2): walk once for an already-DONE fiber. If none,
+     * park on the head. Real race + cancel-losers needs Phase 3
+     * (Cancel delivery to losers' yield points) and lands in
+     * Phase 4 together with the blocking-mailbox primitives. */
+    KaiValue *cur   = fibs_v;
+    KaiFiber *head  = NULL;
+    while (cur && cur->tag == KAI_CONS) {
+        KaiValue *elem = cur->as.cons.head;
+        if (!elem || elem->tag != KAI_FIBER || !elem->as.fib) {
+            fprintf(stderr, "kai: Spawn.select: list element is not a fiber\n");
+            exit(1);
+        }
+        KaiFiber *fib = elem->as.fib;
+        if (!head) head = fib;
+        if (fib->state == KAI_FIBER_DONE) {
+            return kai_cont_resume(k, kai_incref(fib->result));
+        }
+        cur = cur->as.cons.tail;
+    }
+    /* No fiber DONE on entry. Park on the head; when woken, head
+     * must be DONE. */
+    KaiFiber *me = kai_active_fiber;
+    me->awaiters_next = head->awaiters_head;
+    head->awaiters_head = me;
+    kai_sched_park();
+    if (head->state != KAI_FIBER_DONE) {
+        fprintf(stderr,
+            "kai: Spawn.select woken but head fiber not DONE (state=%d)\n",
+            (int) head->state);
+        exit(1);
+    }
+    return kai_cont_resume(k, kai_incref(head->result));
 }
 
 static KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *k) {
     (void) self;
     if (fib_v && fib_v->tag == KAI_FIBER && fib_v->as.fib) {
         fib_v->as.fib->cancel_requested = 1;
-        /* m8 #4 records the flag; the cooperative-yield delivery
-         * (inject Cancel.raise() at the next op-call boundary on
-         * that fiber) lands together with the m8.x ucontext or
-         * full-CPS scheduler. In the inline-eager v1, the target
-         * fiber is already DONE by the time cancel runs, so the
-         * flag is harmless — Spawn.cancel + Cancel still type-
-         * check correctly so user code can be written against the
-         * final API. */
+        /* Delivery (inject Cancel.raise() at the target's next
+         * op-call boundary) lands in Phase 3 via the lookup-prologue
+         * hook in kai_evidence_lookup_node. The flag-only behaviour
+         * is the contract Spawn.cancel commits to; only the *visible
+         * effect* changes when Phase 3 lands. */
     }
     return kai_cont_resume(k, kai_unit());
 }

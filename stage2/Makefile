@@ -1033,6 +1033,19 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (effect row propagates through fiber_spawn)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
 	done; \
+	for f in ../examples/effects/m8x_2_yield_interleave.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (cooperative scheduler interleaves yielding fibers)" \
+	    || { echo "effects FAIL $$name (interleave output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
 	for f in ../examples/effects/m8_4_cancel_uncaught.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
