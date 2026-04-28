@@ -9441,6 +9441,151 @@ fn inferred_main_row(performed: [Label]) : RowExpr {
 
 fn label_to_rl_zero(lab: Label) : RowLabel = RL(lab.eff, [])
 
+# m12.6.x followup: walk a typed Expr collecting effect labels from
+# every call site's callee type. Used only on `main`'s body to fix
+# the footgun where every `Stdout.print` reached only via helpers
+# left `inferred_main_row` empty, the wrapper installed no default
+# handlers, and the program SIGSEGV'd. Caller-side effect tracking
+# during typing is intentionally direct-only (Bug 6 enforcement
+# lives there); this walk is a separate, post-typing pass that
+# reads the *callee's* declared row out of its resolved Expr.ty so
+# nothing changes for non-main inference. ELambda is *not* recursed
+# into — a lambda's body effects only run when the lambda is
+# invoked, and that invocation appears as its own ECall whose
+# callee row already carries those effects (the row var was
+# unified with the lambda's row at the call site).
+fn collect_call_labels(e: Expr, acc: [Label]) : [Label] = match e.kind {
+  EInt(_)             -> acc
+  EReal(_)            -> acc
+  EBool(_)            -> acc
+  EChar(_)            -> acc
+  EStr(_, _)          -> acc
+  EUnit               -> acc
+  EVar(_)             -> acc
+  EUnder              -> acc
+  EPlaceholder        -> acc
+  EHole(_)            -> acc
+  ETodo(_)            -> acc
+  EVariantsOf(_, _)   -> acc
+  EModCall(_, _)      -> acc
+  ECall(callee, args_) -> {
+    let acc1 = match callee.ty {
+      Some(t) -> match t {
+        TyFnT(_, _, row) -> append_labels(row.labels, acc)
+        _                -> acc
+      }
+      None    -> acc
+    }
+    collect_call_labels_list(args_, collect_call_labels(callee, acc1))
+  }
+  EField(base, _)     -> collect_call_labels(base, acc)
+  EIndex(a, b)        -> collect_call_labels(b, collect_call_labels(a, acc))
+  EBinop(_, a, b)     -> collect_call_labels(b, collect_call_labels(a, acc))
+  EUnop(_, x)         -> collect_call_labels(x, acc)
+  EIf(c, t, eo)       -> {
+    let a1 = collect_call_labels(t, collect_call_labels(c, acc))
+    match eo { Some(b) -> collect_call_labels(b, a1) None -> a1 }
+  }
+  EMatch(scr, arms)   -> collect_call_labels_arms(arms, collect_call_labels(scr, acc))
+  ELambda(_, _)       -> acc
+  ERecordLit(_, fs)   -> collect_call_labels_fields(fs, acc)
+  EList(els)          -> collect_call_labels_elems(els, acc)
+  ERange(a, b, opt)   -> {
+    let a1 = collect_call_labels(b, collect_call_labels(a, acc))
+    match opt { Some(s) -> collect_call_labels(s, a1) None -> a1 }
+  }
+  EBlock(stmts, tail) -> {
+    let a1 = collect_call_labels_stmts(stmts, acc)
+    match tail { Some(t) -> collect_call_labels(t, a1) None -> a1 }
+  }
+  EPipe(a, b)         -> collect_call_labels(b, collect_call_labels(a, acc))
+  EBang(inner)        -> collect_call_labels(inner, acc)
+  ELitUnit(inner, _)  -> collect_call_labels(inner, acc)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    let a1 = collect_call_labels(body, acc)
+    let a2 = match init_opt { Some(i) -> collect_call_labels(i, a1) None -> a1 }
+    let a3 = collect_call_labels_clauses(clauses, a2)
+    match ret_opt {
+      Some(r) -> match r { HR(_, b, _, _) -> collect_call_labels(b, a3) }
+      None    -> a3
+    }
+  }
+}
+
+fn collect_call_labels_list(es: [Expr], acc: [Label]) : [Label] = match es {
+  []           -> acc
+  [h, ...rest] -> collect_call_labels_list(rest, collect_call_labels(h, acc))
+}
+
+fn collect_call_labels_arms(arms: [Arm], acc: [Label]) : [Label] = match arms {
+  []           -> acc
+  [a, ...rest] -> match a {
+    Arm(_, opt_guard, body) -> {
+      let a1 = match opt_guard { Some(g) -> collect_call_labels(g, acc) None -> acc }
+      collect_call_labels_arms(rest, collect_call_labels(body, a1))
+    }
+  }
+}
+
+fn collect_call_labels_fields(fs: [FieldInit], acc: [Label]) : [Label] = match fs {
+  []           -> acc
+  [f, ...rest] -> match f {
+    FI(_, e) -> collect_call_labels_fields(rest, collect_call_labels(e, acc))
+  }
+}
+
+fn collect_call_labels_elems(els: [ListElem], acc: [Label]) : [Label] = match els {
+  []           -> acc
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> collect_call_labels_elems(rest, collect_call_labels(e, acc))
+    ElSpread(e) -> collect_call_labels_elems(rest, collect_call_labels(e, acc))
+  }
+}
+
+fn collect_call_labels_stmts(ss: [Stmt], acc: [Label]) : [Label] = match ss {
+  []           -> acc
+  [s, ...rest] -> match s {
+    SLet(_, _, e)        -> collect_call_labels_stmts(rest, collect_call_labels(e, acc))
+    SVar(_, _, e, _, _)  -> collect_call_labels_stmts(rest, collect_call_labels(e, acc))
+    SAssert(e, og)       -> {
+      let a1 = collect_call_labels(e, acc)
+      let a2 = match og { Some(g) -> collect_call_labels(g, a1) None -> a1 }
+      collect_call_labels_stmts(rest, a2)
+    }
+    SExprStmt(e)         -> collect_call_labels_stmts(rest, collect_call_labels(e, acc))
+    SIndexAssign(a, b, c, _, _) -> {
+      let a1 = collect_call_labels(c, collect_call_labels(b, collect_call_labels(a, acc)))
+      collect_call_labels_stmts(rest, a1)
+    }
+    SUse(_, _, _)        -> collect_call_labels_stmts(rest, acc)
+  }
+}
+
+fn collect_call_labels_clauses(cs: [HClause], acc: [Label]) : [Label] = match cs {
+  []           -> acc
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> collect_call_labels_clauses(rest, collect_call_labels(body, acc))
+  }
+}
+
+# Append `xs` onto `acc`, skipping labels already present by `eff`
+# name (caller's own dedup via `st_add_label` is structural; we use
+# the simpler eff-name dedup here because all builtin handlers are
+# non-parametric — `inferred_main_row` would drop the ty_args anyway).
+fn append_labels(xs: [Label], acc: [Label]) : [Label] = match xs {
+  []           -> acc
+  [h, ...rest] -> if eff_already_in(acc, h.eff) {
+    append_labels(rest, acc)
+  } else {
+    append_labels(rest, [h, ...acc])
+  }
+}
+
+fn eff_already_in(acc: [Label], eff: String) : Bool = match acc {
+  []           -> false
+  [l, ...rest] -> if l.eff == eff { true } else { eff_already_in(rest, eff) }
+}
+
 # m7a #7: extract the row labels declared on `fn main`. A row of
 # `REmpty` returns []; `RClosed([Console, Fail])` returns those
 # labels. The wrapper installs default handlers only for the
@@ -14746,6 +14891,14 @@ fn st_add_label(st: InferState, lab: Label, line: Int, col: Int) : InferState {
 fn st_add_effect(st: InferState, eff: String, line: Int, col: Int) : InferState =
   st_add_label(st, Label { eff: eff, ty_args: [] }, line, col)
 
+# Fold `st_add_label` over a list of labels. Used by `synth_call` to
+# propagate every label the callee declared into the caller's row, so
+# `inferred_main_row` sees effects reached transitively via helpers.
+fn st_add_labels(st: InferState, labels: [Label], line: Int, col: Int) : InferState = match labels {
+  []           -> st
+  [h, ...rest] -> st_add_labels(st_add_label(st, h, line, col), rest, line, col)
+}
+
 # True iff `target.eff` matches some label in `row` AND the existing
 # label's ty_args unify with target.ty_args under the current sub.
 # Used as a syntactic-dedup guard; non-unifying same-name labels do not
@@ -17458,8 +17611,23 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # default handlers for every builtin the body uses. Helpers
       # are not affected — only `main` gets this exception, matching
       # the §24 spec ("only main").
+      # m12.6.x followup: extend main's inferred row with effects
+      # reached transitively via helpers. `st2.row` only carries
+      # labels from *direct* op calls (`Stdout.print(x)` /
+      # `print(x)`); helper-only call chains were silent at the
+      # caller level, so the wrapper installed no default handlers
+      # and any `Stdout.print` segfaulted at runtime. The post-
+      # typing walker `collect_call_labels` reads the resolved
+      # callee type at every ECall in the typed body and merges
+      # those labels into the main-only row. Caller-side typing
+      # behaviour is unchanged for non-main fns, so signatures of
+      # higher-order helpers like `map_expr_kind` (which pass
+      # lambdas with effecting bodies) keep their current shape.
       let final_row = match row {
-        REmpty -> if nm == "main" { inferred_main_row(st2.row) } else { row }
+        REmpty -> if nm == "main" {
+          let extended = collect_call_labels(final_body, st2.row)
+          inferred_main_row(extended)
+        } else { row }
         _      -> row
       }
       TypedDecl {
