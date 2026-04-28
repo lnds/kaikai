@@ -19064,26 +19064,72 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
   }
 }
 
-# Last-use predicate, modeled on `last_use_for` but returning a Bool
-# directly. A name is non-last when (a) it appears in a closure
-# (in_lam==true at the use site), or (b) the use's (line, col) is
-# strictly less than the max non-in-lam position recorded for the
-# name. LUUnused names cannot reach this predicate (they have no
-# uses to be wrapped).
+# Dup predicate (m5.x-flip Phase 1, "dup all ≥2 uses" variant). A name
+# is wrapped in `__perceus_dup` whenever:
+#   (a) it appears inside a closure body (`in_lam_here == true`); the
+#       lambda may outlive the construction site, so every capture-side
+#       read pays a dup and the closure's incref-on-construction holds
+#       the original;
+#   (b) it has any in-lam use elsewhere (LUBlocked) — the closure owns
+#       the original, so non-lam reads must dup;
+#   (c) it has ≥ 2 non-lam uses (LUAt with count ≥ 2) — every read pays
+#       a dup. Under the loose runtime the original ref leaks (no exit
+#       drop yet); the exit-drop pass that reclaims it lands together
+#       with the runtime flip (see `docs/m5x-followup.md` step 2c).
+# The previous "lexically-last → raw transfer" rule was unsafe because
+# C does not specify the evaluation order of function-call arguments;
+# the lexically-last raw read could fire before earlier dup-wrapped
+# reads, freeing the local before the dups executed (lane experience
+# 2026-04-26). The all-dup variant is order-independent: every read
+# bumps rc before the primitive consumes it. The single-use case stays
+# raw — no dup, no drop, transferring the binding's existing reference.
+# LUUnused names cannot reach this predicate (they have no uses).
 
 fn pcs_is_non_last(nm: String, line: Int, col: Int, uses: [Use],
                    in_lam_here: Bool) : Bool {
   if in_lam_here { true }
   else {
     match last_use_for(nm, uses) {
-      LUAt(_, ml, mc) -> not (line == ml and col == mc)
+      LUAt(_, _, _) -> pcs_count_non_lam_uses(nm, uses, 0) >= 2
       LUBlocked(_) -> true
       LUUnused(_) -> false
     }
   }
 }
 
+# Count the non-in-lambda uses of `nm` in `uses`. Lambda uses are
+# excluded because they are accounted for by the LUBlocked branch and
+# the closure-capture incref; non-lam reads at the fn body's own scope
+# are what determine whether the binding is multi-use under the Phase 1
+# rule.
+fn pcs_count_non_lam_uses(nm: String, uses: [Use], acc: Int) : Int {
+  match uses {
+    [] -> acc
+    [h, ...rest] -> match h {
+      U(uname, _, _, in_lam) -> {
+        if uname == nm and not in_lam {
+          pcs_count_non_lam_uses(nm, rest, acc + 1)
+        } else {
+          pcs_count_non_lam_uses(nm, rest, acc)
+        }
+      }
+    }
+  }
+}
+
 # ---- unused-param drops at body start ----
+#
+# Phase 2 (exit drops for multi-use / blocked params) deferred — see
+# the lane retro at `docs/m5x-followup.md`. Adding callee-side exit
+# drops under the loose runtime is unsound because match-arm and
+# field-access destructures alias their producers' storage without an
+# incref; dropping the param frees memory the caller still references
+# via the shared producer (e.g. `synth` extracts `callee` from
+# `ECall(callee, args_)` and passes it to `synth_call`; an exit drop
+# in `synth_call` would free the variant slot still held by `e.kind`).
+# The exit-drop pass therefore lands together with the runtime flip
+# (Phase 3), which switches every primitive to consume its args and
+# every shared-storage producer to incref on extraction.
 
 fn pcs_prepend_unused_drops(body: Expr, params: [Param], uses: [Use]) : Expr {
   let drops = pcs_collect_param_drops(params, uses, [])

@@ -50,6 +50,38 @@ during self-host:
 Detail in `docs/perceus-basic.md` §"Step 3+ outcome (m5.x-1-2 lane)"
 and `docs/lane-experience-m5x-1-2.md`.
 
+**Step 2a — Phase 1 of m5.x-flip lane LANDED (2026-04-28):** stage 1 +
+stage 2 `pcs_is_non_last` switched to the conservative "dup all ≥ 2
+non-lambda uses" variant. Single-use bindings still transfer raw; any
+binding with ≥ 2 non-lam uses now wraps every read in
+`__perceus_dup`, removing the C-argument-order dependency from the
+multi-use path. `pcs_count_non_lam_uses` is the new helper.
+Selfhost (C + LLVM) byte-identical, `make test` clean,
+`make demos-no-regression` baseline 20 holds. Inert under the loose
+runtime; pays its way once step 2c (runtime flip) lands.
+
+**Step 2b — exit drops for multi-use params (DEFERRED to step 2c).**
+The lane retro (2026-04-28) attempted to wrap fn bodies with
+`let __pcs_ret = body; <exit_drops>; __pcs_ret` so that multi-use and
+LUBlocked params are decref'd at fn return. The wrap parses, types,
+and emits valid C, but selfhost UAFs at typer time. Root cause:
+match-arm and field-access destructures alias the producer's storage
+without an incref, so the local binding shares a reference with the
+producer (`synth` extracts `callee` from `e.kind`'s `ECall(callee,
+args_)` slot via the variant args storage). When the callee's exit
+drop in `synth_call` decrefs `callee` and the shared rc reaches 0,
+the producer's slot is freed; subsequent reads of `e.kind` UAF.
+Under the loose runtime nothing else decrefs these aliased refs, so
+adding any callee-side drop is unsound. Step 2c (runtime flip)
+turns every primitive into a consumer **and** every shared-storage
+producer (match-arm extract, `kai_field`, list head/tail) into an
+incref-on-extraction site, at which point exit drops can land
+together with the flip in one atomic commit.
+
+The deleted exit-drop code shape is preserved in this branch's
+history under `pcs_wrap_param_drops` — re-emerge for step 2c by
+reverting the docstring at `pcs_prepend_unused_drops`.
+
 ### 2. m5 #6 (doc grain) — `kai_closure` incref of captures *(LANDED)*
 
 Landed (`80b0015`, 2026-04-26). `kai_closure` now increfs each
