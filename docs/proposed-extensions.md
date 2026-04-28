@@ -1376,6 +1376,23 @@ binaries; kaikai folds both into `++`), F# (`@` for lists,
 
 ## 24. `main()` row inference
 
+**Status: LANDED 2026-04-27** as Full lane 1.5 (commit `7e36027`).
+When `main` ships without an explicit row, the typer writes the
+body-performed row back into the DFn so `emit_main_wrapper` /
+`main_row_labels` install the default handlers for every builtin
+the body uses. Only `main` is special-cased; every other public
+function still requires an explicit row. Backwards-compatible:
+`fn main() : Int / Stdout = ...` keeps working — the rewrite only
+fires when the row is REmpty. Fixture:
+`examples/effects/m7e_24_main_row_inferred.kai`.
+
+Known follow-up (not part of this lane): `check_body_row` returns
+without checking when main + REmpty, so a main body that uses an
+effect with no default handler segfaults at runtime instead of
+emitting the "effect not handled" diagnostic the spec prescribes.
+Pre-existing behaviour, not introduced or worsened by the lane;
+fix is a typer check orthogonal to row inference.
+
 ```kai
 # today: every effect main uses must appear in the row
 fn main() : Unit / Console = Console.print("hi")

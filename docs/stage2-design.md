@@ -970,10 +970,10 @@ walker, or a regression fixture.
 
 What is **not** in Core but is part of Full:
 
-- Remaining m7e items: ~~`variants[T]()`~~ (landed 2026-04-27 as
-  Full lane 1.3, see `docs/proposed-extensions.md` §11),
-  main-row inference, ~~`use Effect`~~ (landed 2026-04-27 as Full
-  lane 1.4, see `docs/proposed-extensions.md` §25).
+- ~~Remaining m7e items~~: all three landed 2026-04-27 —
+  `variants[T]()` (Full lane 1.3, `docs/proposed-extensions.md`
+  §11), `use Effect` (Full lane 1.4, §25), and `main()` row
+  inference (Full lane 1.5, §24, commit `7e36027`).
 - ~~m7f LLM affordances~~ (landed 2026-04-27 as Full lane 2.3 —
   see `docs/proposed-extensions.md` §5 `--effects-json`, §6 `?e`
   effect holes, §7 `import ?name`, §19 `.field` method-ref
