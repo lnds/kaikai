@@ -22131,21 +22131,21 @@ fn fn_param_names(params: [Param]) : [String] = match params {
   [p, ...rest] -> [p.pname, ...fn_param_names(rest)]
 }
 
-fn rqc_decls(decls: [Decl], mt: [ModuleEntry]) : [Decl] = match decls {
+fn rqc_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Console = match decls {
   [] -> []
-  [d, ...rest] -> [rqc_decl(d, mt), ...rqc_decls(rest, mt)]
+  [d, ...rest] -> [rqc_decl(d, mt, file), ...rqc_decls(rest, mt, file)]
 }
 
-fn rqc_decl(d: Decl, mt: [ModuleEntry]) : Decl = match d {
+fn rqc_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console = match d {
   DFn(p, n, tp, params, ret, row, body, l, c) ->
     DFn(p, n, tp, params, ret, row,
-        rqc_expr(body, fn_param_names(params), mt), l, c)
+        rqc_expr(body, fn_param_names(params), mt, file), l, c)
   DTest(n, body, l, c) ->
-    DTest(n, rqc_expr(body, [], mt), l, c)
+    DTest(n, rqc_expr(body, [], mt, file), l, c)
   DImpl(name, ty, sub_decls, l, c) ->
-    DImpl(name, ty, rqc_decls(sub_decls, mt), l, c)
+    DImpl(name, ty, rqc_decls(sub_decls, mt, file), l, c)
   DDerive(ps, inner, l, c) ->
-    DDerive(ps, rqc_decl(inner, mt), l, c)
+    DDerive(ps, rqc_decl(inner, mt, file), l, c)
   # DType / DEffect / DProtocol / DUnit / DAxiom / DUse / DImport
   # carry no Expr bodies that need walking. (DAxiom's body is
   # synthesised by lower_axioms and lives in the resulting DFn,
@@ -22153,38 +22153,60 @@ fn rqc_decl(d: Decl, mt: [ModuleEntry]) : Decl = match d {
   _ -> d
 }
 
-fn rqc_expr(e: Expr, locals: [String], mt: [ModuleEntry]) : Expr =
-  Expr { kind: rqc_kind(e.kind, locals, mt), line: e.line, col: e.col, ty: e.ty }
+fn rqc_expr(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : Expr / Console =
+  Expr { kind: rqc_kind(e, locals, mt, file), line: e.line, col: e.col, ty: e.ty }
 
-fn rqc_kind(k: ExprKind, locals: [String], mt: [ModuleEntry]) : ExprKind = match k {
+# m6.2 diagnostics: emit a specific message when the user wrote
+# `mod.fname` against a known imported module that does not export
+# `fname`. The list of available exports is included so the fix is
+# obvious. Returns the original EField shape so the typer's own
+# error path still fires (catches the unbound `mod` value as a
+# secondary effect, which is mostly redundant but harmless — the
+# rqc-emitted diag arrives first).
+fn rqc_diag_missing_export(mod: String, fname: String, exports: [String], file: String, line: Int, col: Int) : Unit / Console =
+  diag_error(file, line, col,
+    concat_all(["module '", mod, "' does not export '", fname,
+                "'; available exports: ",
+                join_with(exports, ", ")]))
+
+fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKind / Console = match e.kind {
   # The rewrite rule itself: only `EField(EVar(mod), fn)` is a
   # candidate. Every other shape just recurses with the same scope.
   EField(base, fname) -> match base.kind {
     EVar(name) ->
       if list_has(locals, name) {
         # Rule B: local in scope. Treat as record projection.
-        EField(rqc_expr(base, locals, mt), fname)
+        EField(rqc_expr(base, locals, mt, file), fname)
       } else {
         match mt_lookup(mt, name) {
           Some(me) ->
             if me_has_export(me, fname) { EModCall(name, fname) }
-            else                        { EField(rqc_expr(base, locals, mt), fname) }
-          None -> EField(rqc_expr(base, locals, mt), fname)
+            else {
+              # m6.2 diagnostics: imported module, missing export.
+              # Emit specific error before falling back to EField
+              # (which the typer treats as a record-field
+              # projection on TyAny — produces a generic but
+              # non-fatal cascade).
+              let exports = match me { ME(_, exs, _) -> exs }
+              let _ = rqc_diag_missing_export(name, fname, exports, file, e.line, e.col)
+              EField(rqc_expr(base, locals, mt, file), fname)
+            }
+          None -> EField(rqc_expr(base, locals, mt, file), fname)
         }
       }
-    _ -> EField(rqc_expr(base, locals, mt), fname)
+    _ -> EField(rqc_expr(base, locals, mt, file), fname)
   }
   # Scope-introducing shapes: lambda, match arms, handle, block.
   ELambda(params, body) ->
     ELambda(params,
-            rqc_expr(body, list_append(locals, fn_param_names(params)), mt))
+            rqc_expr(body, list_append(locals, fn_param_names(params)), mt, file))
   EMatch(scrut, arms) ->
-    EMatch(rqc_expr(scrut, locals, mt),
-           rqc_arms(arms, locals, mt))
+    EMatch(rqc_expr(scrut, locals, mt, file),
+           rqc_arms(arms, locals, mt, file))
   EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) -> {
-    let body1 = rqc_expr(body, locals, mt)
+    let body1 = rqc_expr(body, locals, mt, file)
     let init_opt1 = match init_opt {
-      Some(ie) -> Some(rqc_expr(ie, locals, mt))
+      Some(ie) -> Some(rqc_expr(ie, locals, mt, file))
       None -> None
     }
     # The handle alias (`as name`) and `with State[T](init) as
@@ -22192,9 +22214,9 @@ fn rqc_kind(k: ExprKind, locals: [String], mt: [ModuleEntry]) : ExprKind = match
     # and the return clause, not the body. The body sees the
     # original locals.
     let inner = match alias_opt { Some(a) -> [a, ...locals] None -> locals }
-    let clauses1 = rqc_hclauses(clauses, inner, mt)
+    let clauses1 = rqc_hclauses(clauses, inner, mt, file)
     let ret_opt1 = match ret_opt {
-      Some(r) -> Some(rqc_hreturn(r, inner, mt))
+      Some(r) -> Some(rqc_hreturn(r, inner, mt, file))
       None -> None
     }
     EHandle(body1, eff, ty_args, init_opt1, alias_opt, clauses1, ret_opt1)
@@ -22202,10 +22224,10 @@ fn rqc_kind(k: ExprKind, locals: [String], mt: [ModuleEntry]) : ExprKind = match
   EBlock(stmts, opt_final) -> {
     # Scope grows monotonically through the block. Each SLet /
     # SVar / SUse contributes new bindings to `inner`.
-    let res = rqc_block_stmts(stmts, locals, mt, [])
+    let res = rqc_block_stmts(stmts, locals, mt, file, [])
     let inner = res.bound
     let final1 = match opt_final {
-      Some(fe) -> Some(rqc_expr(fe, inner, mt))
+      Some(fe) -> Some(rqc_expr(fe, inner, mt, file))
       None -> None
     }
     EBlock(res.stmts, final1)
@@ -22217,41 +22239,41 @@ fn rqc_kind(k: ExprKind, locals: [String], mt: [ModuleEntry]) : ExprKind = match
   # list / unop / lit-unit / variants-of / hole / todo / bang /
   # int / real / bool / char / str / unit / under / placeholder /
   # var / modcall (already a leaf).
-  _ -> map_expr_kind(k, (sub) => rqc_expr(sub, locals, mt))
+  _ -> map_expr_kind(e.kind, (sub) => rqc_expr(sub, locals, mt, file))
 }
 
-fn rqc_arms(arms: [Arm], locals: [String], mt: [ModuleEntry]) : [Arm] = match arms {
+fn rqc_arms(arms: [Arm], locals: [String], mt: [ModuleEntry], file: String) : [Arm] / Console = match arms {
   [] -> []
-  [a, ...rest] -> [rqc_arm(a, locals, mt), ...rqc_arms(rest, locals, mt)]
+  [a, ...rest] -> [rqc_arm(a, locals, mt, file), ...rqc_arms(rest, locals, mt, file)]
 }
 
-fn rqc_arm(a: Arm, locals: [String], mt: [ModuleEntry]) : Arm = match a {
+fn rqc_arm(a: Arm, locals: [String], mt: [ModuleEntry], file: String) : Arm / Console = match a {
   Arm(pat, opt_guard, body) -> {
     let inner = pat_binders(pat, locals)
     let guard1 = match opt_guard {
-      Some(g) -> Some(rqc_expr(g, inner, mt))
+      Some(g) -> Some(rqc_expr(g, inner, mt, file))
       None -> None
     }
-    Arm(pat, guard1, rqc_expr(body, inner, mt))
+    Arm(pat, guard1, rqc_expr(body, inner, mt, file))
   }
 }
 
-fn rqc_hclauses(cs: [HClause], locals: [String], mt: [ModuleEntry]) : [HClause] =
+fn rqc_hclauses(cs: [HClause], locals: [String], mt: [ModuleEntry], file: String) : [HClause] / Console =
   match cs {
     [] -> []
-    [c, ...rest] -> [rqc_hclause(c, locals, mt), ...rqc_hclauses(rest, locals, mt)]
+    [c, ...rest] -> [rqc_hclause(c, locals, mt, file), ...rqc_hclauses(rest, locals, mt, file)]
   }
 
-fn rqc_hclause(c: HClause, locals: [String], mt: [ModuleEntry]) : HClause = match c {
+fn rqc_hclause(c: HClause, locals: [String], mt: [ModuleEntry], file: String) : HClause / Console = match c {
   HC(name, params, body, l, col) -> {
     let inner = list_append(locals, fn_param_names(params))
-    HC(name, params, rqc_expr(body, inner, mt), l, col)
+    HC(name, params, rqc_expr(body, inner, mt, file), l, col)
   }
 }
 
-fn rqc_hreturn(r: HReturn, locals: [String], mt: [ModuleEntry]) : HReturn = match r {
+fn rqc_hreturn(r: HReturn, locals: [String], mt: [ModuleEntry], file: String) : HReturn / Console = match r {
   HR(pname, body, l, c) ->
-    HR(pname, rqc_expr(body, [pname, ...locals], mt), l, c)
+    HR(pname, rqc_expr(body, [pname, ...locals], mt, file), l, c)
 }
 
 # Stmt-walker: threads the scope through a block's statement list.
@@ -22259,46 +22281,46 @@ fn rqc_hreturn(r: HReturn, locals: [String], mt: [ModuleEntry]) : HReturn = matc
 # expression after the last SExprStmt sees the full bound set.
 type RqcStmtsAcc = { stmts: [Stmt], bound: [String] }
 
-fn rqc_block_stmts(stmts: [Stmt], locals: [String], mt: [ModuleEntry], acc_stmts: [Stmt]) : RqcStmtsAcc =
+fn rqc_block_stmts(stmts: [Stmt], locals: [String], mt: [ModuleEntry], file: String, acc_stmts: [Stmt]) : RqcStmtsAcc / Console =
   match stmts {
     [] -> RqcStmtsAcc { stmts: list_reverse(acc_stmts), bound: locals }
     [s, ...rest] -> {
-      let r = rqc_stmt(s, locals, mt)
-      rqc_block_stmts(rest, r.bound, mt, [r.s, ...acc_stmts])
+      let r = rqc_stmt(s, locals, mt, file)
+      rqc_block_stmts(rest, r.bound, mt, file, [r.s, ...acc_stmts])
     }
   }
 
 type RqcStmtR = { s: Stmt, bound: [String] }
 
-fn rqc_stmt(s: Stmt, locals: [String], mt: [ModuleEntry]) : RqcStmtR = match s {
+fn rqc_stmt(s: Stmt, locals: [String], mt: [ModuleEntry], file: String) : RqcStmtR / Console = match s {
   SLet(pat, ty_opt, e) -> {
     # The RHS evaluates under the *outer* scope; bindings from `pat`
     # only become visible to subsequent stmts.
-    let e1 = rqc_expr(e, locals, mt)
+    let e1 = rqc_expr(e, locals, mt, file)
     let inner = pat_binders(pat, locals)
     RqcStmtR { s: SLet(pat, ty_opt, e1), bound: inner }
   }
   SAssert(e, opt_msg) -> {
-    let e1 = rqc_expr(e, locals, mt)
+    let e1 = rqc_expr(e, locals, mt, file)
     let m1 = match opt_msg {
-      Some(m) -> Some(rqc_expr(m, locals, mt))
+      Some(m) -> Some(rqc_expr(m, locals, mt, file))
       None -> None
     }
     RqcStmtR { s: SAssert(e1, m1), bound: locals }
   }
   SExprStmt(e) ->
-    RqcStmtR { s: SExprStmt(rqc_expr(e, locals, mt)), bound: locals }
+    RqcStmtR { s: SExprStmt(rqc_expr(e, locals, mt, file)), bound: locals }
   SIndexAssign(target, ix, v, l, c) -> {
-    let t1 = rqc_expr(target, locals, mt)
-    let i1 = rqc_expr(ix, locals, mt)
-    let v1 = rqc_expr(v, locals, mt)
+    let t1 = rqc_expr(target, locals, mt, file)
+    let i1 = rqc_expr(ix, locals, mt, file)
+    let v1 = rqc_expr(v, locals, mt, file)
     RqcStmtR { s: SIndexAssign(t1, i1, v1, l, c), bound: locals }
   }
   SVar(name, ty_opt, init, l, c) -> {
     # SVar should not survive the desugar pass that runs before
     # rqc, but we handle it defensively just in case rqc lands
     # earlier in the pipeline some day.
-    let init1 = rqc_expr(init, locals, mt)
+    let init1 = rqc_expr(init, locals, mt, file)
     RqcStmtR { s: SVar(name, ty_opt, init1, l, c), bound: [name, ...locals] }
   }
   # SUse introduces no value bindings; leaves locals untouched.
@@ -25458,7 +25480,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             let expanded = expand_imports(path, search_paths, own_decls_no_holes)
             let expanded_decls = match expanded { EP_Mod(ds, _) -> ds }
             let module_table = match expanded { EP_Mod(_, mt) -> mt }
-            let qualified_decls = rqc_decls(expanded_decls, module_table)
+            let qualified_decls = rqc_decls(expanded_decls, module_table, path)
             let merged_raw = list_append(prelude_decls, qualified_decls)
             # m12.7: lower DAxiom → DFn(body=todo!) before any other
             # Decl walker runs. Subsequent passes (alias resolution,

@@ -15,7 +15,7 @@ SRC     := compiler.kai
 # SIGSEGV; 65520 KB is the macOS hard-limit ceiling and works.
 STACK := ulimit -s 65520 2>/dev/null || ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-modules-qualified test-sugars test-loop test-time test-stdlib test-protocols test-demos-core test-aspirational selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-stdlib test-protocols test-demos-core test-aspirational selfhost
 
 all: $(TARGET)
 
@@ -301,6 +301,7 @@ test-modules: $(TARGET) build
 # record-field projection (M6.1 + record-projection legacy
 # behaviour preserved).
 QUALIFIED_DIRS := basic alias selective local_shadow two_modules record_projection
+QUALIFIED_NEG_DIRS := unknown_export
 
 test-modules-qualified: $(TARGET) build
 	@set -e; \
@@ -324,6 +325,27 @@ test-modules-qualified: $(TARGET) build
 	  diff -q build/mq-$$d-c.out build/mq-$$d-llvm.out > /dev/null \
 	    || { echo "modules-qualified DIFF $$d (C vs LLVM)"; diff build/mq-$$d-c.out build/mq-$$d-llvm.out; exit 1; }; \
 	  echo "modules-qualified OK $$d"; \
+	done
+
+# m6.2 negative fixtures — qualified-call diagnostics.
+# Each subdir under examples/modules-qualified/ named in
+# QUALIFIED_NEG_DIRS must FAIL to compile (kaic2 exit != 0) and
+# its stderr must contain the substring listed in
+# `<subdir>/main.err.expected`.
+test-modules-qualified-neg: $(TARGET) build
+	@set -e; \
+	for d in $(QUALIFIED_NEG_DIRS); do \
+	  src=../examples/modules-qualified/$$d/main.kai; \
+	  exp=../examples/modules-qualified/$$d/main.err.expected; \
+	  rc=0; ./$(TARGET) $$src > /dev/null 2> build/mq-neg-$$d.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "modules-qualified-neg FAIL $$d (expected error, got success)"; exit 1; \
+	  fi; \
+	  needle=$$(cat $$exp | head -1); \
+	  grep -qF "$$needle" build/mq-neg-$$d.err \
+	    || { echo "modules-qualified-neg FAIL $$d (substring '$$needle' not in stderr)"; \
+	         cat build/mq-neg-$$d.err; exit 1; }; \
+	  echo "modules-qualified-neg OK $$d"; \
 	done
 
 # M6.2 search-path smoke test: `examples/modules-path/main.kai`
@@ -1378,7 +1400,7 @@ test-aspirational: $(TARGET) build
 	    || { echo "aspirational DIFF $$name (LLVM)"; diff $$exp build/asp-$$name-llvm.out; exit 1; }; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -1387,7 +1409,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
 
 clean:
 	rm -rf build $(TARGET)
