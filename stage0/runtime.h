@@ -274,7 +274,9 @@ typedef enum {
     KAI_FIBER_CANCELLED = 5
 } KaiFiberState;
 
-typedef struct KaiFiber KaiFiber;
+typedef struct KaiFiber   KaiFiber;
+typedef struct KaiLinkNode KaiLinkNode;  /* Phase 5 — defined below */
+
 struct KaiFiber {
     KaiEvidence    *evidence_top;
     int             cancel_requested;  /* Spawn.cancel(target) sets this (#4) */
@@ -304,6 +306,12 @@ struct KaiFiber {
      * exit(0) (the m8 v1 behaviour for unhandled root cancellation). */
     jmp_buf         cancel_pad;
     int             cancel_pad_set;
+    /* Phase 5 — intrusive list of linked peer fibers. Walked at
+     * trampoline termination (DONE or CANCELLED branches) to set
+     * cancel_requested on each peer. Owned by the fiber; nodes are
+     * freed during the propagation walk and as a safety net in
+     * kai_free_value's KAI_FIBER branch. */
+    KaiLinkNode    *linked_head;
 };
 
 /* m7a #5 + m8.x: kai_main_fiber starts as the OS-thread context,
@@ -321,7 +329,8 @@ static KaiFiber kai_main_fiber = {
     {0},                 /* ctx — getcontext fills it on first swap */
     NULL, 0,             /* stack_base, stack_size — main uses the OS stack */
     NULL, NULL,          /* awaiters_head, awaiters_next */
-    {0}, 0               /* cancel_pad, cancel_pad_set — main has no pad */
+    {0}, 0,              /* cancel_pad, cancel_pad_set — main has no pad */
+    NULL                 /* linked_head */
 };
 
 static KaiFiber *kai_active_fiber = &kai_main_fiber;
@@ -392,6 +401,30 @@ struct KaiMailbox {
     KaiFiber    *recv_waiter_tail;
     KaiFiber    *send_waiter_head;
     KaiFiber    *send_waiter_tail;
+    /* Phase 5 — owner fiber for the Link/Monitor runtime.
+     * Set to kai_current_fiber() at allocation. Link.link(pid)
+     * resolves pid->mb->owner_fiber to find the target fiber to
+     * link to. v1 maps each mailbox to exactly one owning fiber
+     * (the one that called mailbox_alloc); spawn_actor (when it
+     * lands in m8.x #6) will set owner_fiber to the spawned
+     * fiber instead. */
+    KaiFiber    *owner_fiber;
+};
+
+/* Phase 5 — intrusive linked-peer chain on KaiFiber. A bidirectional
+ * link between two fibers consists of one KaiLinkNode in each
+ * fiber's linked_head chain pointing at the other peer. On fiber
+ * termination (DONE or CANCELLED in the trampoline), the chain is
+ * walked and each peer's cancel_requested flag is set. The doc
+ * spec distinguishes Normal vs Crashed termination for link
+ * propagation; v1 propagates on both DONE and CANCELLED (BEAM
+ * trap-exit semantics is queued for post-MVP).
+ *
+ * The forward typedef is at the KaiFiber declaration above so
+ * KaiFiber can hold a `KaiLinkNode *linked_head`. */
+struct KaiLinkNode {
+    KaiFiber    *peer;
+    KaiLinkNode *next;
 };
 
 /* Phase 4 forward decls: mailbox push/pop park/wake the calling
@@ -405,8 +438,13 @@ static KaiMailbox *kai_mailbox_alloc(void) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     /* default policy: unbounded — matches m8 #7 behaviour. */
-    mb->cap      = 0;
-    mb->overflow = KAI_OVERFLOW_UNBOUNDED;
+    mb->cap          = 0;
+    mb->overflow     = KAI_OVERFLOW_UNBOUNDED;
+    /* Phase 5: associate the mailbox with the allocating fiber. v1
+     * actor surface (with_mailbox) is the only path to mailbox_alloc,
+     * and the allocating fiber IS the actor; spawn_actor (m8.x #6)
+     * will set this differently. */
+    mb->owner_fiber  = kai_current_fiber();
     return mb;
 }
 
@@ -415,8 +453,9 @@ static KaiMailbox *kai_mailbox_alloc_bounded(int cap, int overflow) {
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     /* Phase 4: BlockSender now supported via the per-mailbox sender
      * waiter queue + cooperative parking on full push. */
-    mb->cap      = cap;
-    mb->overflow = overflow;
+    mb->cap          = cap;
+    mb->overflow     = overflow;
+    mb->owner_fiber  = kai_current_fiber();
     return mb;
 }
 
@@ -560,6 +599,21 @@ static void kai_free_value(KaiValue *v) {
             if (v->as.fib) {
                 kai_decref(v->as.fib->thunk);
                 kai_decref(v->as.fib->result);
+                /* Phase 5: free any remaining link nodes. Normally
+                 * the trampoline's kai_link_propagate_terminate
+                 * empties this chain; the safety net here covers
+                 * fibers that died without going through the
+                 * trampoline (or through this path before the
+                 * trampoline ran). */
+                {
+                    KaiLinkNode *ln = v->as.fib->linked_head;
+                    while (ln) {
+                        KaiLinkNode *next = ln->next;
+                        free(ln);
+                        ln = next;
+                    }
+                    v->as.fib->linked_head = NULL;
+                }
                 /* m8.x: free the heap-allocated private stack. main
                  * fiber has stack_base == NULL (uses the OS thread
                  * stack) and is statically allocated; spawned fibers
@@ -2090,6 +2144,11 @@ static KaiFiber *kai_sched_dequeue(void) {
  * scheduler primitives + kai_apply. */
 static void kai_fiber_trampoline(void);
 
+/* Phase 5 forward decl: link propagation runs in the trampoline's
+ * termination tail; the helper itself is defined alongside the
+ * Link default handler further down. */
+static void kai_link_propagate_terminate(KaiFiber *self);
+
 /* Initialise a freshly-allocated KaiFiber's ucontext + private stack.
  * Sets f->ctx so it can be a swapcontext target; fills uc_link as a
  * fallback (the trampoline always exits via setcontext, so uc_link
@@ -2196,6 +2255,14 @@ static void kai_fiber_trampoline(void) {
         self->cancel_pad_set = 0;
         self->state = KAI_FIBER_CANCELLED;
     }
+
+    /* Phase 5 — Link propagation. Walk the linked chain, set each
+     * peer's cancel_requested flag (delivered at the peer's next
+     * yield-point hook), and clean up the link nodes. v1
+     * propagates on both DONE and CANCELLED (the spec
+     * distinguishes them, BEAM-style trap-exit semantics queued
+     * for post-MVP). */
+    kai_link_propagate_terminate(self);
 
     /* Wake awaiters. Each was parked in Spawn.await (Phase 2.3) or
      * Spawn.select (Phase 2.3). Walk the chain, clearing each
@@ -2382,6 +2449,79 @@ static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
     }
     fputs("kai: Cancel.raise: unhandled (fiber cancelled)\n", stderr);
     exit(0);
+}
+
+/* Phase 5 — Link runtime registry.
+ *
+ * `Link.link(peer)` registers a bidirectional link between the
+ * current fiber and the fiber that owns `peer`'s mailbox. On
+ * either fiber's termination, the trampoline walks the linked
+ * chain and sets cancel_requested on each peer (delivered at
+ * that peer's next yield-point hook).
+ *
+ * v1 simplifications:
+ *  - `Pid[Nothing]` is the type-erased existential pid the typer
+ *    uses for link/monitor ops; we resolve via `peer->as.mb->owner_fiber`.
+ *  - Self-links (a == b) are dropped.
+ *  - If the peer mailbox has no owner_fiber (mailbox alloc'd
+ *    outside any fiber context, e.g. before runtime init), the
+ *    link is silently dropped — caller cannot observe failure
+ *    because the op is `Unit`.
+ *  - Duplicate links between the same pair are not de-dup'd; the
+ *    propagation walk sets cancel_requested idempotently, so the
+ *    duplicates are harmless beyond the wasted KaiLinkNode.
+ *  - Spec specifies "crash → propagate cancel"; v1 propagates on
+ *    both DONE and CANCELLED termination (BEAM-style trap-exit
+ *    semantics queued for post-MVP). */
+static void kai_link_add_bidirectional(KaiFiber *a, KaiFiber *b) {
+    if (!a || !b || a == b) return;
+    KaiLinkNode *na = (KaiLinkNode *) calloc(1, sizeof(KaiLinkNode));
+    KaiLinkNode *nb = (KaiLinkNode *) calloc(1, sizeof(KaiLinkNode));
+    if (!na || !nb) {
+        fprintf(stderr, "kai: out of memory (link)\n");
+        exit(1);
+    }
+    na->peer = b; na->next = a->linked_head; a->linked_head = na;
+    nb->peer = a; nb->next = b->linked_head; b->linked_head = nb;
+}
+
+/* Walk a fiber's linked chain at termination. For each peer:
+ *   - set cancel_requested (delivered at peer's next yield point);
+ *   - remove the back-pointer from peer->linked_head so the peer's
+ *     own future termination doesn't re-enter our (now-freed) chain.
+ * Each KaiLinkNode is freed as the walk passes it. */
+static void kai_link_propagate_terminate(KaiFiber *self) {
+    KaiLinkNode *ln = self->linked_head;
+    self->linked_head = NULL;
+    while (ln) {
+        KaiLinkNode *next = ln->next;
+        KaiFiber *peer = ln->peer;
+        if (peer) {
+            peer->cancel_requested = 1;
+            /* Remove our back-link from peer's chain (linear scan;
+             * v1 chains are short — typically 1-2 entries). */
+            KaiLinkNode **slot = &peer->linked_head;
+            while (*slot) {
+                if ((*slot)->peer == self) {
+                    KaiLinkNode *rm = *slot;
+                    *slot = rm->next;
+                    free(rm);
+                    break;
+                }
+                slot = &(*slot)->next;
+            }
+        }
+        free(ln);
+        ln = next;
+    }
+}
+
+static KaiValue *kai_default_link_link(void *self, KaiValue *peer, KaiCont *k) {
+    (void) self;
+    if (peer && peer->tag == KAI_PID && peer->as.mb && peer->as.mb->owner_fiber) {
+        kai_link_add_bidirectional(kai_current_fiber(), peer->as.mb->owner_fiber);
+    }
+    return kai_cont_resume(k, kai_unit());
 }
 
 /* (typedef forward-declared above, before KaiFiber.) */
