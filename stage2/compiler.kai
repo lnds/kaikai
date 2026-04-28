@@ -1235,6 +1235,13 @@ type ImportKind
   = IkPath(String)
   | IkAlias(String, String)
   | IkSelective(String, [String])
+  # m7f §7: `import ?name` — dependency hole. The compiler scans
+  # known stdlib modules (and modules in the search path) for a
+  # `pub fn name` and reports candidates so the user can replace
+  # the hole with an explicit module path. The hole itself does
+  # NOT load any module — it is a diagnostic-only construct that
+  # downstream passes drop after the symbol index runs.
+  | IkHole(String)
 
 # ---- small constructors ----
 fn mk_expr(k: ExprKind, line: Int, col: Int) : Expr = Expr { kind: k, line: line, col: col, ty: None }
@@ -4504,8 +4511,15 @@ fn parse_test_decl(p: Parser, t: Token) : PDecl {
 fn parse_import_decl(p: Parser, t: Token) : PDecl {
   # For stage 1 MVP, imports are structurally parsed but not resolved.
   # Accept: `import a.b.c`, `import a.b.c as X`, `import a.b.c.{f, g}`.
+  # m7f §7: `import ?name` — dependency hole. Symbol-index resolver
+  # runs after normal imports and reports candidates.
   let first = p_peek(p)
-  if not tk_is(first.kind, TkIdent) {
+  if match first.kind { TkHoleName(_) -> true _ -> false } {
+    let nm = match first.kind { TkHoleName(n) -> n _ -> "" }
+    ok_d(p_advance(p), DImport(IkHole(nm), t.line, t.col))
+  } else if tk_is(first.kind, TkHole) {
+    err_d(p_error(p, first, "`import ?` requires a name; write `import ?some_symbol`"))
+  } else if not tk_is(first.kind, TkIdent) {
     err_d(p_error(p, first, "expected module name after `import`"))
   } else {
     parse_import_path(p_advance(p), tok_source(p.src, first), t)
@@ -4954,6 +4968,7 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
           emit_line(depth, "import #{path} @#{int_to_string(line)}:#{int_to_string(col)}")
           names |> each((n) => emit_line(depth + 1, "sel #{n}"))
         }
+        IkHole(name) -> emit_line(depth, "import ?#{name} @#{int_to_string(line)}:#{int_to_string(col)}")
       }
     }
     DEffect(is_pub, name, tparams, ops, line, col) -> {
@@ -5551,6 +5566,10 @@ fn register_import(e: Env, ik: ImportKind) : Env {
     IkPath(path) -> env_add(e, last_segment(path))
     IkAlias(_, alias) -> env_add(e, alias)
     IkSelective(_, names) -> add_all(e, names)
+    # m7f §7: import holes don't bind anything in the value
+    # namespace — they are diagnostic-only. Skip for env-binding
+    # purposes; the symbol-index pass handles the diagnostic.
+    IkHole(_) -> e
   }
 }
 
@@ -10946,6 +10965,7 @@ fn dump_decl_type(d: Decl) : Unit / Console {
         IkPath(p) -> print("import #{p} @#{int_to_string(line)}:#{int_to_string(col)}")
         IkAlias(p, a) -> print("import #{p} as #{a} @#{int_to_string(line)}:#{int_to_string(col)}")
         IkSelective(p, _) -> print("import #{p} @#{int_to_string(line)}:#{int_to_string(col)}")
+        IkHole(name) -> print("import ?#{name} @#{int_to_string(line)}:#{int_to_string(col)}")
       }
     }
     DEffect(is_pub, name, _, _, line, col) -> {
@@ -20685,6 +20705,10 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], rs: 
           IkPath(p)         -> resolve_module(base_dir, p, search_paths, rs)
           IkAlias(p, _)     -> resolve_module(base_dir, p, search_paths, rs)
           IkSelective(p, _) -> resolve_module(base_dir, p, search_paths, rs)
+          # m7f §7: import holes are not module loads — they are
+          # diagnostic-only. The symbol-index pass runs separately
+          # after process_imports completes.
+          IkHole(_)         -> rs
         }
         _ -> rs
       }
@@ -20701,6 +20725,202 @@ fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl])
   let rs0 = ResolveState { visited: [root_path], decls: [] }
   let rs1 = process_imports(base_dir, root_decls, search_paths, rs0)
   list_append(rs1.decls, non_import_decls(root_decls))
+}
+
+# ====================================================================
+# m7f §7 — `import ?name` symbol-index resolver
+# ====================================================================
+#
+# When the user writes `import ?some_symbol`, the resolver scans a
+# small list of well-known stdlib modules and any module already
+# imported via a regular `import` for a `pub fn some_symbol`. The
+# diagnostic lists every match so the user can replace the hole with
+# an explicit module path.
+#
+# v1 scope:
+#  - The known-stdlib list is hardcoded — kaikai stage2 has no
+#    listdir effect, so an automatic walk over arbitrary search-paths
+#    is not feasible without one. The hardcoded list covers every
+#    module that lives in `stdlib/` today.
+#  - The match is the literal pub fn name (no fuzzy matching, no
+#    type-direction). A v2 lane can add Levenshtein suggestions
+#    when nothing matches exactly.
+#  - The IkHole node is treated as inert by every downstream pass
+#    (it loads no module, binds no name in the env, emits no code).
+#    The diagnostic is the entire user-visible effect.
+
+fn import_hole_known_stdlib() : [String] = [
+  "core", "actor", "effects", "loop", "protocols", "reader",
+  "spawn", "writer"
+]
+
+# Try to load a module's source from the search paths and return the
+# list of `pub fn name` identifiers it exports. Returns an empty
+# list if the module cannot be opened — the caller treats that as
+# "no candidate from this path".
+fn import_hole_pub_fns(base_dir: String, mod_path: String,
+                         search_paths: [String]) : [String] / File {
+  let cf = find_module_file(base_dir, mod_path, search_paths)
+  match cf {
+    CF(_, opt_src) -> match opt_src {
+      None      -> []
+      Some(src) -> {
+        let toks = tokenize(src)
+        let parsed = parse_program(mod_path, src, toks)
+        match parsed.decls {
+          None -> []
+          Some(decls) -> import_hole_collect_pub_fns(decls, [])
+        }
+      }
+    }
+  }
+}
+
+fn import_hole_collect_pub_fns(ds: [Decl], acc: [String]) : [String] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DFn(is_pub, name, _, _, _, _, _, _, _) ->
+        if is_pub { import_hole_collect_pub_fns(rest, [name, ...acc]) }
+        else     { import_hole_collect_pub_fns(rest, acc) }
+      _ -> import_hole_collect_pub_fns(rest, acc)
+    }
+  }
+}
+
+# A single "module exports name" hit.
+type ImportHoleHit = IHH(String, String)
+
+fn import_hole_search_modules(target: String, base_dir: String,
+                                 mods: [String], search_paths: [String],
+                                 acc: [ImportHoleHit]) : [ImportHoleHit] / File {
+  match mods {
+    [] -> list_reverse(acc)
+    [m, ...rest] -> {
+      let pubs = import_hole_pub_fns(base_dir, m, search_paths)
+      if list_has(pubs, target) {
+        import_hole_search_modules(target, base_dir, rest, search_paths,
+                                      [IHH(m, target), ...acc])
+      } else {
+        import_hole_search_modules(target, base_dir, rest, search_paths, acc)
+      }
+    }
+  }
+}
+
+# Also walk the modules the user already imported in this file
+# (regular DImport with IkPath / IkAlias / IkSelective).
+fn import_hole_explicit_paths(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DImport(ik, _, _) -> match ik {
+        IkPath(p)         -> import_hole_explicit_paths(rest, [p, ...acc])
+        IkAlias(p, _)     -> import_hole_explicit_paths(rest, [p, ...acc])
+        IkSelective(p, _) -> import_hole_explicit_paths(rest, [p, ...acc])
+        IkHole(_)         -> import_hole_explicit_paths(rest, acc)
+      }
+      _ -> import_hole_explicit_paths(rest, acc)
+    }
+  }
+}
+
+# Top-level: report every IkHole in `decls`. Returns the number of
+# unresolved holes (zero matches → 1; everything else → 0). The
+# caller aborts compilation if any holes failed to resolve so the
+# downstream typer/codegen sees no IkHole noise.
+fn report_import_holes(file: String, decls: [Decl], base_dir: String,
+                          search_paths: [String]) : Int / Console + File {
+  let explicit = import_hole_explicit_paths(decls, [])
+  # Combine stdlib + user-explicit module paths, deduped by name.
+  let all_mods = import_hole_dedup_paths(
+    list_append(import_hole_known_stdlib(), explicit), [])
+  report_import_holes_loop(file, decls, base_dir, all_mods, search_paths, 0)
+}
+
+fn import_hole_dedup_paths(xs: [String], acc: [String]) : [String] {
+  match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] ->
+      if list_has(acc, h) { import_hole_dedup_paths(rest, acc) }
+      else { import_hole_dedup_paths(rest, [h, ...acc]) }
+  }
+}
+
+fn report_import_holes_loop(file: String, decls: [Decl], base_dir: String,
+                              mods: [String], search_paths: [String],
+                              errs: Int) : Int / Console + File {
+  match decls {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DImport(ik, line, col) -> match ik {
+        IkHole(name) -> {
+          let hits = import_hole_search_modules(name, base_dir, mods,
+                                                   search_paths, [])
+          let new_errs = report_import_hole(file, name, line, col, hits)
+          report_import_holes_loop(file, rest, base_dir, mods, search_paths,
+                                      errs + new_errs)
+        }
+        _ -> report_import_holes_loop(file, rest, base_dir, mods, search_paths, errs)
+      }
+      _ -> report_import_holes_loop(file, rest, base_dir, mods, search_paths, errs)
+    }
+  }
+}
+
+fn report_import_hole(file: String, name: String, line: Int, col: Int,
+                        hits: [ImportHoleHit]) : Int / Console {
+  match hits {
+    [] -> {
+      diag_error(file, line, col,
+        "import hole: no module exports `#{name}`")
+      diag_help("the symbol-index v1 only scans well-known stdlib modules and modules already imported by name in this file")
+      diag_note("add an `import some.module` for the file that exports `#{name}`, then replace the hole if you still want the report")
+      1
+    }
+    [h] -> match h {
+      IHH(mod_path, _) -> {
+        diag_error(file, line, col,
+          "import hole: `#{name}` is exported by `#{mod_path}`")
+        diag_help("replace `?#{name}` with `#{mod_path}` (the import then loads the module and exposes `#{name}`)")
+        1
+      }
+    }
+    _ -> {
+      diag_error(file, line, col,
+        "import hole: `#{name}` is exported by multiple modules")
+      report_import_hole_candidates(hits)
+      diag_help("replace `?#{name}` with one of the explicit module paths above")
+      1
+    }
+  }
+}
+
+fn report_import_hole_candidates(hits: [ImportHoleHit]) : Unit / Console {
+  match hits {
+    [] -> ()
+    [h, ...rest] -> match h {
+      IHH(mod_path, _) -> {
+        diag_note("candidate: `#{mod_path}`")
+        report_import_hole_candidates(rest)
+      }
+    }
+  }
+}
+
+# Strip every DUse and IkHole DImport from the decl stream after
+# the diagnostic pass runs. Downstream passes never see them.
+fn strip_import_holes(decls: [Decl], acc: [Decl]) : [Decl] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DImport(ik, _, _) -> match ik {
+        IkHole(_) -> strip_import_holes(rest, acc)
+        _         -> strip_import_holes(rest, [d, ...acc])
+      }
+      _ -> strip_import_holes(rest, [d, ...acc])
+    }
+  }
 }
 
 # ====================================================================
@@ -23633,7 +23853,16 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
         match parsed.decls {
           None -> 1
           Some(own_decls) -> {
-            let expanded = expand_imports(path, search_paths, own_decls)
+            # m7f §7: report any `import ?name` holes BEFORE
+            # expand_imports walks the decls. The hole is inert
+            # for module loading (process_imports treats IkHole as
+            # a no-op), but we want the diagnostic to fire even
+            # when the hole is the only import-related issue.
+            let import_hole_errs = report_import_holes(path, own_decls,
+                                                         dir_of(path),
+                                                         search_paths)
+            let own_decls_no_holes = strip_import_holes(own_decls, [])
+            let expanded = expand_imports(path, search_paths, own_decls_no_holes)
             let merged = list_append(prelude_decls, expanded)
             # m7b #1b + m12.8 Phase 4b — closed effect aliases. Resolve
             # every `type Foo = Eff1 + Eff2 + ...` (and `type Foo = Eff`
@@ -23690,6 +23919,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             if alias_res.errs > 0 { alias_res.errs }
             else if use_errs > 0 { use_errs }
             else if proto_errs > 0 { proto_errs }
+            else if import_hole_errs > 0 { import_hole_errs }
             else {
             match mode {
               MAst -> { dump_program(raw_decls); 0 }
