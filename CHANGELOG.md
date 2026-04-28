@@ -13,10 +13,94 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 - Versioning infrastructure: `VERSION` file at repo root, this `CHANGELOG.md`,
   retroactive git tags `v0.1.0` / `v0.1.1` / `v0.1.2` / `v0.1.3` / `v0.2.0`
-  / `v0.2.1` / `v0.2.2` / `v0.3.0` / `v0.4.0` and the current `v0.4.1`. The
-  compiler's own `kaic2 --version` flag still reports the legacy `kaic2
-  stage 2 (self-hosted)` string; the `bin/kai --version` wrapper reads
-  VERSION dynamically.
+  / `v0.2.1` / `v0.2.2` / `v0.3.0` / `v0.4.0` / `v0.4.1` and the current
+  `v0.5.0`. The compiler's own `kaic2 --version` flag still reports the
+  legacy `kaic2 stage 2 (self-hosted)` string; the `bin/kai --version`
+  wrapper reads VERSION dynamically.
+
+## [0.5.0] — 2026-04-28 (m6.2 v2 — universal prefixed C-symbol minting)
+
+**Minor: linker namespace changed for module-owned decls.** Every public
+fn defined in a `--prelude`-loaded file or a transitively imported module
+now mints to `kai_<module>__<name>` instead of `kai_<name>`. Decls
+authored in the root file (the user program) keep `kai_<name>` flat. The
+shape of the AST `DFn` and the codegen `EFn` table both grew an
+`Option[String]` `module_origin` field; the parser produces `None` and
+the prelude / import loaders stamp the surface module name when concat-
+ing decls into the global stream.
+
+### Added
+
+- **m6.2 v2 — universal prefixed minting** (this release):
+  - Decl-side: every imported / pre-loaded `pub fn` mints
+    `kai_<module>__<name>` in both the C backend (`emit_fn_signature`,
+    `emit_thunk_forward`, `emit_fn_forward`, `emit_fn_thunk`,
+    `emit_fn_body`) and the LLVM backend (`llvm_emit_fn`,
+    `llvm_emit_thunk`).
+  - Use-side: `EModCall(mod, fname)` codegen routes the module surface
+    name straight into the symbol it emits (no round-trip through
+    `efn_resolve` that would lose the qualified context). Bare-name
+    `EVar(name)` resolution goes through `efn_resolve` which prefers
+    a root-file definition over module-owned ones (Rust / Python /
+    OCaml's locals-shadow-imports rule applied at the top-level
+    scope).
+  - Ambiguity diagnostic: `find_ambig_efns` walks `[EFn]` for names
+    exported by ≥2 modules with no root-file shadow; `report_ambig_efns`
+    emits a stderr warning at the start of each codegen run pointing
+    at the ambiguous pair (e.g. `option.map` vs `result.map` once
+    those renames land in m14 v1.B-E). Lazy: warns even if no caller
+    uses the bare form, harmless when the user qualifies every site.
+  - Regression fixture `examples/modules-qualified/two_modules_same_name`
+    exercises two modules exporting `pub fn wrap`; pre-v2 the C
+    output collided as duplicate `kai_wrap`; post-v2 they mint to
+    distinct `kai_box_a__wrap` / `kai_box_b__wrap`. Wired into
+    `make test-modules-qualified`.
+- Demo goldens: `demos/euler1/main.out.expected` + `demos/quicksort/
+  main.out.expected`. Pre-v2 both demos failed at link time because
+  the demo's local `fn sum` (resp. `fn sort`) collided with
+  `pub fn sum` (resp. `pub fn sort`) in `stdlib/core/list.kai` — both
+  minted `kai_sum` / `kai_sort`. v2 mints the prelude entries as
+  `kai_list__sum` / `kai_list__sort` so the demo locals shadow them
+  silently. `demos/baseline.txt` bumped from 18 → 20.
+
+### Changed
+
+- `DFn(...)` carries a 10th field `module_origin: Option[String]`.
+  All ~30 pattern / construction sites in `stage2/compiler.kai`
+  thread it through unchanged. Stage 1 + stage 0 are not touched —
+  stage 2 selfhost (`make selfhost`, `make selfhost-llvm`) does not
+  load preludes, so every decl seen by stage 1 has `module_origin =
+  None` and the bootstrap chain stays byte-identical.
+- `EFn(name, arity)` → `EFn(name, arity, module_origin)`. New
+  `efn_resolve` returns the full entry; `efn_find_arity` keeps the
+  pre-v2 `Option[Int]` shape.
+
+### Unblocks
+
+m14 v1.B-E renames (the per-module bare-name migration deferred from
+m14 v1 because two modules exporting the same name would collide on
+the C symbol). With v2 in place, `pub fn opt_map` → `pub fn map` in
+`stdlib/core/option.kai` (and the equivalents in result.kai / string.kai
+/ char.kai) become safe — each lands on its own prefixed C symbol.
+The rename itself is a separate lane.
+
+### Validation
+
+- `make selfhost` byte-identical fixed point: OK.
+- `make selfhost-llvm` byte-identical fixed point: OK.
+- `make test` full suite green (lex / parse / typer / runtime / LLVM
+  + qualified-call positive + negative + the new
+  `two_modules_same_name` fixture).
+- `make demos-no-regression`: 20 passing, baseline 20 (two demos
+  flipped from FAIL to OK without source edits).
+
+### Deferred
+
+- The lazy ambiguity walker that only warns when a bare-name call
+  actually uses an ambiguous name (rather than warning unconditionally
+  on every compile). Filtering would cost a body walk on every
+  invocation; the unconditional warning is cheap and silent in the
+  common case where stdlib modules pick distinct bare names.
 
 ## [0.4.1] — 2026-04-28 (Stage 1 codegen shadow-bug fix — symmetry with stage 2)
 
