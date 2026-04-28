@@ -5,11 +5,12 @@ deferred to a future milestone. The common thread is **TyRefineT
 on the semantic side**: m12.6 v1 shipped syntax + runtime semantics
 without ever surfacing the refinement in the typer's `Ty`.
 
-**Update 2026-04-27 (m12.6.x partial landing):** items #1, #4, #5
-(enforcement only), and #6 are now landed. The remaining items
-(#2 interval propagation, #3 match-arm narrowing, #5 attribute
-parser, #7 regex literals, #8 diagnostics quality) are still the
-pending list — see status notes inline below.
+**Update 2026-04-27 (m12.6.x v1 closed):** items #1, #2 (param-
+refinement entailment v1), #4, #5 (enforcement only), #6, and #8
+(positional msg) all landed. Items #3 (match-arm narrowing), #5
+attribute parser, and #7 regex literals are the remaining items
+— each is design-heavy and was deferred from v1 to keep the lane
+shippable. See status notes inline below.
 
 ## What landed in m12.6 v1 (for context)
 
@@ -66,16 +67,27 @@ but each arm is small. The biggest risk is the unifier — get the
 direction wrong and either every refinement leaks into every base
 type, or every assignment to a base needs an explicit cast.
 
-### 2. Static interval propagation through refined args *(STILL PENDING — design-heavy)*
+### 2. Static interval propagation through refined args *(v1 LANDED 2026-04-27, FULL VERSION STILL PENDING)*
 
-**Why deferred from m12.6.x v1**: omitting an assert at *one* call
-site requires either monomorphising the callee per refinement
-combination (binary bloat) or emitting per-call inline checks at
-the caller (which defeats the audit pitch — the predicate now
-lives in two places). The v1 const folder of m12.6.d already
-handles closed predicates; the missing piece — substituting
-caller-side refinements into callee predicates — needs an
-end-to-end design that picks one of the two paths above.
+**v1**: preds_to_asserts now drops a contract assert that is
+**structurally identical** to one of the fn's parameter refinements
+(`fn divide(a: Int, b: Int where b != 0) requires b != 0` → zero
+asserts emitted). Match: literals by value, EVar by name,
+EBinop/EUnop by op + recursive sub-equality. ~70 lines including
+the Expr-walker.
+
+**Still pending under #2**:
+- Alpha-equivalent matching: `requires b > 0` against
+  `Int where x > 0` (different variable names) doesn't fire.
+- Operator rewriting: `x > 0` not entailed by `0 < x`.
+- Real interval reasoning: `x >= 1` not entailed by `x > 0` even
+  on Int. Needs a lattice.
+- Substitution at the call site: omitting an assert when the
+  caller passes a literal (`divide(10, 5)` would entail
+  `requires b != 0` since `5 != 0` folds to true). The v1
+  pass operates inside the callee body; call-site substitution
+  needs either monomorphisation per refinement combination or
+  per-call inline checks.
 
 m12.6.d's `try_eval_pred` only evaluates **closed** predicates.
 With `TyRefineT` in hand, the typer can substitute the call-site
@@ -192,7 +204,15 @@ compile time rather than write a new one. Until that library
 exists, this item is also blocked on a separate "regex stdlib"
 lane.
 
-### 8. Diagnostics quality pass
+### 8. Diagnostics quality *(v1 LANDED 2026-04-27, FULL VERSION STILL PENDING)*
+
+**v1**: contract asserts now panic with `"requires violated at
+line N"` / `"ensures violated at line N"` instead of the generic
+`"assertion failed"`. preds_to_asserts builds the EStr msg and
+emit_assert_stmt embeds the literal span when opt_msg is a
+literal EStr.
+
+**Still pending**: pass
 
 m12.6 v1 panics with a generic `assertion failed`. The spec
 calls for predicate-aware messages:
