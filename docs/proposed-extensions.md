@@ -154,6 +154,15 @@ manifest pass.
 
 ## 5. `kai effects <target> --json` — effect graph as data
 
+**Status: LANDED 2026-04-27** as Full lane 2.3.a (m7f LLM
+affordances). Surfaced as the `--effects-json` flag on the
+existing `kaic2` binary (the multi-subcommand `kai` driver is
+post-MVP); the per-fn JSON output is identical to the spec's
+example. v1 reports only direct `Eff.op` references — effect
+propagation across calls (e.g. `main` picking up `/ Stdout`
+because it calls `greet : / Stdout`) is a v2 add. Fixture:
+`examples/sugars/effects_json_basic.kai`.
+
 ```
 $ kai effects src/ --json
 [
@@ -178,6 +187,16 @@ inferencer's output.
 
 ## 6. `?e` — effect holes
 
+**Status: LANDED 2026-04-27** as Full lane 2.3.b. Parser accepts
+`?e` and `?` (anonymous) in row tail position; the typer treats
+the hole as an anonymous row variable, so the body's effects
+unify into it exactly as they would into a user-named row var
+like `e`. The compiler-side reporter (which would print
+`?e resolves to ...`) is v2 — exposing the row at the hole site
+needs the post-typer TyEnv that TypedProgram does not yet expose.
+Fixtures: `examples/sugars/row_hole_basic.kai` (positive),
+`examples/sugars/row_hole_not_tail.kai` (rejection).
+
 ```kai
 fn run() : Int / ?e {
   perform Io.read_line() |> string_to_int |> unwrap
@@ -194,6 +213,18 @@ inference; this exposes one as a named hole.
 **Depends on**: typed holes + effects.
 
 ## 7. `import ?name` — dependency holes
+
+**Status: LANDED 2026-04-27** as Full lane 2.3.c. Parser accepts
+`import ?name`; the resolver scans a hardcoded stdlib module list
+(core / actor / effects / loop / protocols / reader / spawn /
+writer) plus modules the user imported by name in this file, and
+emits one of three diagnostics: single-match (suggests the literal
+replacement), multi-match (lists candidates), or no-match (with
+the v1 limitation note). Bare `import ?` (no name) is rejected at
+parse. Fixtures: `examples/sugars/import_hole_no_match.kai`,
+`examples/sugars/import_hole_bare.kai` (negatives — positive
+flow needs `--path stdlib` so it lives in a future
+test-import-holes target).
 
 ```kai
 import ?parse_expr
@@ -1027,6 +1058,18 @@ view-based slices with region tracking.
 confirmed in the grammar.
 
 ## 19. Method references as first-class values (point-free)
+
+**Status: PARTIALLY LANDED 2026-04-27** as Full lane 2.3.d (v1).
+Implemented: the `.field` placeholder lambda — `.name` in
+expression position desugars to `(__pl) => __pl.name`. Covers the
+canonical `map(xs, .field)` and `xs | .field` patterns the spec
+cites as the most common method-ref use case. The general
+`obj.method` (receiver-bound ref) form is **deferred to v2**:
+it requires parser ambiguity resolution against record field
+access plus brand-machinery extension for receiver-Fiber refs
+(so `n.spawn` cannot escape the nursery any more than
+`Fiber[T]` can). Fixtures: `examples/sugars/method_ref_field.kai`,
+`examples/sugars/method_ref_pipe.kai`.
 
 ```kai
 # Today (lambda required):

@@ -974,8 +974,10 @@ What is **not** in Core but is part of Full:
   Full lane 1.3, see `docs/proposed-extensions.md` §11),
   main-row inference, ~~`use Effect`~~ (landed 2026-04-27 as Full
   lane 1.4, see `docs/proposed-extensions.md` §25).
-- m7f LLM affordances: `kai effects --json`, `?e` effect holes,
-  `import ?name`, method refs as values.
+- ~~m7f LLM affordances~~ (landed 2026-04-27 as Full lane 2.3 —
+  see `docs/proposed-extensions.md` §5 `--effects-json`, §6 `?e`
+  effect holes, §7 `import ?name`, §19 `.field` method-ref
+  placeholder; the general `obj.method` ref is v2).
 - Refinement types and Eiffel-style contracts (m12.6).
 - `axiom` declarations (m12.7).
 
