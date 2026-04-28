@@ -13,9 +13,66 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 - Versioning infrastructure: `VERSION` file at repo root, this `CHANGELOG.md`,
   retroactive git tags `v0.1.0` / `v0.1.1` / `v0.1.2` / `v0.1.3` / `v0.2.0`
-  / `v0.2.1` and the current `v0.2.2`. The compiler's own `kaic2 --version`
-  flag still reports the legacy `kaic2 stage 2 (self-hosted)` string; the
-  `bin/kai --version` wrapper now reads VERSION dynamically (v0.2.2).
+  / `v0.2.1` / `v0.2.2` and the current `v0.3.0`. The compiler's own
+  `kaic2 --version` flag still reports the legacy `kaic2 stage 2
+  (self-hosted)` string; the `bin/kai --version` wrapper reads VERSION
+  dynamically.
+
+## [0.3.0] — 2026-04-28 (m14 v1 — stdlib qualified-call surface)
+
+**Minor: new user-visible API surface.** `list.*`, `string.*`, `option.*`,
+`result.*`, and `char.*` qualified calls are now first-class. Legacy
+bare-name calls (`list_take`, `opt_map`, `ch_is_digit`, ...) keep working
+via alias trampolines.
+
+### Added
+
+- **m14 v1 — stdlib qualified-call surface** (`ef6965e`, PR #6):
+  - **v0**: `--prelude` files now register as `ModuleEntries` in the
+    m6.2 module table, so qualified calls like `list.is_empty(xs)`
+    resolve without an explicit `import`.
+  - **v1**: per-module prefix-fallback in `me_lookup_export`
+    (`option`→`opt`, `char`→`ch`, others default to module basename)
+    backs the new surface against today's `pub fn list_take` /
+    `pub fn opt_map` / `pub fn ch_is_digit` definitions.
+  - **v1.A**: `stdlib/core/list.kai` definitions renamed to bare names
+    (39 ops + internal `*_loop` helpers privatised + 29 legacy
+    `pub fn list_X = X(...)` aliases for backward compat).
+- New user-visible call sites (non-exhaustive):
+  ```kai
+  list.is_empty(xs)    list.take(xs, 3)    list.sort(xs)
+  list.contains(xs, 7) list.flat_map(xs, f) list.head(xs)
+  string.trim(s)       string.repeat("ab", 3)
+  option.map(o, f)     option.is_some(o)
+  result.is_ok(r)      result.and_then(r, k)
+  char.is_digit(c)     char.to_lower(c)
+  ```
+
+### Fixed
+
+- **C-backend codegen shadow bug** (m14 v1.x, part of `ef6965e`):
+  `emit_ident_value` now threads `lcs: [String]` through every emit
+  helper so locals correctly shadow same-named top-level fns. Mirrors
+  the LLVM backend's `e.locals` design. The `decimal_basic` test was
+  the canary: `let drop = d.scale - target` now works correctly with
+  the prelude's `pub fn drop(xs, n)` defined.
+
+### Deferred
+
+- **`string` / `option` / `result` / `char` defs rename**: blocked on
+  m6.2 v2 universal prefixed minting (`kai_<module>__<name>`).
+  Cross-module bare-name collisions on `map` / `and_then` /
+  `unwrap_or` / `repeat` mean two `pub fn map` defs would land on
+  the same C symbol. The user-visible qualified surface is already
+  complete via the prefix-fallback; the rename of internal definitions
+  waits for m6.2 v2.
+- `print` / `println` → `Console.print` consolidation — separate lane.
+- Stage 1 codegen shadow fix — same bug exists in `stage1/compiler.kai`,
+  not triggered by current stage 2 source.
+- Stage 1 backport of `EModCall` — needed only when stage 2 source
+  itself starts using qualified calls.
+
+Lane experience: `docs/lane-experience-m14-v1.md`.
 
 ## [0.2.2] — 2026-04-28 (CLI polish — logo, dynamic version, RC trace fix)
 
@@ -247,7 +304,8 @@ is closed:
    `try_rewrite_show_dim_real` shortcut in m12.8 Phase 2 confirms it;
    polymorphics with `EHandle` in the body collide on `clause_fn_name`.
 
-[Unreleased]: https://github.com/lnds/kaikai/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/lnds/kaikai/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lnds/kaikai/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/lnds/kaikai/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/lnds/kaikai/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lnds/kaikai/compare/v0.1.3...v0.2.0
