@@ -382,7 +382,24 @@ struct KaiMailbox {
     int          len;
     int          cap;       /* m8 #8: 0 = unbounded; >0 = bounded */
     int          overflow;  /* m8 #8: KAI_OVERFLOW_* code */
+    /* Phase 4 — blocking primitives. Waiter queues for fibers
+     * parked on empty receive (head==NULL) or on full BlockSender
+     * push (len>=cap). Linked through each fiber's awaiters_next
+     * field — a fiber is in exactly one waiter chain at a time
+     * (await chain, receiver chain, or sender chain), so the
+     * single field is sufficient. */
+    KaiFiber    *recv_waiter_head;
+    KaiFiber    *recv_waiter_tail;
+    KaiFiber    *send_waiter_head;
+    KaiFiber    *send_waiter_tail;
 };
+
+/* Phase 4 forward decls: mailbox push/pop park/wake the calling
+ * fiber via the scheduler primitives, which are defined further
+ * down (after the handler-stack runtime). The decls here let the
+ * mailbox ops compile in their natural file location. */
+static void kai_sched_park(void);
+static void kai_sched_unpark(KaiFiber *target);
 
 static KaiMailbox *kai_mailbox_alloc(void) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
@@ -396,17 +413,36 @@ static KaiMailbox *kai_mailbox_alloc(void) {
 static KaiMailbox *kai_mailbox_alloc_bounded(int cap, int overflow) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
-    if (overflow == KAI_OVERFLOW_BLOCK_SENDER) {
-        fprintf(stderr, "kai: BlockSender mailbox policy requires the m8.x cooperative scheduler\n");
-        exit(1);
-    }
+    /* Phase 4: BlockSender now supported via the per-mailbox sender
+     * waiter queue + cooperative parking on full push. */
     mb->cap      = cap;
     mb->overflow = overflow;
     return mb;
 }
 
+/* Phase 4 helper: link a fiber into a waiter chain at the tail. */
+static void kai_mailbox_waiter_enqueue(KaiFiber **head, KaiFiber **tail, KaiFiber *f) {
+    f->awaiters_next = NULL;
+    if (*tail) {
+        (*tail)->awaiters_next = f;
+    } else {
+        *head = f;
+    }
+    *tail = f;
+}
+
+/* Phase 4 helper: pop the head waiter from a chain (FIFO wakeup). */
+static KaiFiber *kai_mailbox_waiter_dequeue(KaiFiber **head, KaiFiber **tail) {
+    KaiFiber *f = *head;
+    if (!f) return NULL;
+    *head = f->awaiters_next;
+    if (!*head) *tail = NULL;
+    f->awaiters_next = NULL;
+    return f;
+}
+
 static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
-    /* m8 #8: enforce policy on full. */
+    /* m8 #8 + Phase 4: enforce policy on full. */
     if (mb->cap > 0 && mb->len >= mb->cap) {
         if (mb->overflow == KAI_OVERFLOW_DROP_NEWEST) {
             kai_decref(msg);
@@ -419,8 +455,19 @@ static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
             kai_decref(old->msg);
             free(old);
             mb->len--;
+        } else if (mb->overflow == KAI_OVERFLOW_BLOCK_SENDER) {
+            /* Park sender until a receiver pops a slot. The cooperative
+             * scheduler guarantees forward progress: the receiver that
+             * eventually pops will wake one parked sender (FIFO). The
+             * loop re-checks because between unpark and resume another
+             * sender could have refilled the slot. */
+            while (mb->len >= mb->cap) {
+                kai_mailbox_waiter_enqueue(&mb->send_waiter_head,
+                                            &mb->send_waiter_tail,
+                                            kai_current_fiber());
+                kai_sched_park();
+            }
         }
-        /* BlockSender is rejected at alloc, so no case here. */
     }
     KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
     if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
@@ -430,12 +477,22 @@ static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
     else          { mb->head       = node; }
     mb->tail = node;
     mb->len++;
+    /* Phase 4: wake one parked receiver if any. */
+    KaiFiber *waiter = kai_mailbox_waiter_dequeue(&mb->recv_waiter_head,
+                                                    &mb->recv_waiter_tail);
+    if (waiter) kai_sched_unpark(waiter);
 }
 
 static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
-    if (!mb->head) {
-        fprintf(stderr, "kai: Actor.receive on empty mailbox (v1 inline-eager: no blocking)\n");
-        exit(1);
+    /* Phase 4: park the calling fiber until a sender enqueues. The
+     * loop handles the case where another receiver took the slot
+     * between our unpark and resume (rare but possible if multiple
+     * fibers race on the same mailbox). */
+    while (!mb->head) {
+        kai_mailbox_waiter_enqueue(&mb->recv_waiter_head,
+                                    &mb->recv_waiter_tail,
+                                    kai_current_fiber());
+        kai_sched_park();
     }
     KaiMboxNode *node = mb->head;
     mb->head = node->next;
@@ -443,6 +500,11 @@ static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
     KaiValue *msg = node->msg;
     free(node);
     mb->len--;
+    /* Phase 4: wake one parked sender if any (only meaningful for
+     * BlockSender; unbounded and Drop* mailboxes never park senders). */
+    KaiFiber *waiter = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
+                                                    &mb->send_waiter_tail);
+    if (waiter) kai_sched_unpark(waiter);
     return msg;
 }
 

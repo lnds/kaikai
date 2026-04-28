@@ -1059,6 +1059,32 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (Cancel delivered at yield-point hook unwinds fiber)" \
 	    || { echo "effects FAIL $$name (cancel output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
+	for f in ../examples/effects/m8x_4_recv_blocking.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (Actor.receive parks on empty; sender wakeup unblocks)" \
+	    || { echo "effects FAIL $$name (recv-blocking output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m8x_4_block_sender.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (Bounded(_, BlockSender) parks sender on full; receiver wakeup unblocks)" \
+	    || { echo "effects FAIL $$name (block-sender output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
 	for f in ../examples/effects/m8_4_cancel_uncaught.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
