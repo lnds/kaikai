@@ -4542,7 +4542,7 @@ fn check_pred_not_false(p: Parser, pred: Expr, kind: String, kw: Token) : Parser
 fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
                        line: Int, col: Int) : Expr {
   if reqs == [] and enss == [] { body } else {
-    let req_stmts = preds_to_asserts(reqs, [])
+    let req_stmts = preds_to_asserts(reqs, [], "requires")
     if enss == [] {
       mk_expr(EBlock(req_stmts, Some(body)), line, col)
     } else {
@@ -4551,7 +4551,7 @@ fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
       #   { req_asserts; let result = body; ens_asserts; result }
       let bind_pat = mk_pat(PBind("result"), line, col)
       let bind = SLet(bind_pat, None, body)
-      let ens_stmts = preds_to_asserts(enss, [])
+      let ens_stmts = preds_to_asserts(enss, [], "ensures")
       let res_var = mk_expr(EVar("result"), line, col)
       let stmts = list_append(req_stmts, [bind, ...ens_stmts])
       mk_expr(EBlock(stmts, Some(res_var)), line, col)
@@ -4559,18 +4559,22 @@ fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
   }
 }
 
-fn preds_to_asserts(preds: [Expr], acc: [Stmt]) : [Stmt] {
+fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String) : [Stmt] {
   match preds {
     [] -> list_reverse(acc)
-    # m12.6.d: drop trivially-true predicates at parse time. The
-    # const folder evaluates closed boolean / integer expressions;
-    # everything else stays as a runtime assert. False-evaluating
-    # predicates still emit the assert (the runtime panic is the
-    # diagnostic) — a future pass can promote them to compile-time
-    # errors.
+    # m12.6.d: drop trivially-true predicates at parse time.
+    # m12.6.x #8: build a positional msg so panic shows the clause
+    # kind + line. Future enhancement: include the predicate text.
     [p, ...rest] -> match try_eval_pred(p) {
-      Some(true) -> preds_to_asserts(rest, acc)
-      _          -> preds_to_asserts(rest, [SAssert(p, None), ...acc])
+      Some(true) -> preds_to_asserts(rest, acc, kind)
+      _          -> {
+        let msg_span = concat_all([
+          "\"", kind, " violated at line ",
+          int_to_string(p.line), "\""
+        ])
+        let msg = mk_expr(EStr(msg_span, false), p.line, p.col)
+        preds_to_asserts(rest, [SAssert(p, Some(msg)), ...acc], kind)
+      }
     }
   }
 }
@@ -8784,10 +8788,21 @@ fn emit_assert_stmt(src: String, cond: Expr, opt_msg: Option[Expr],
   # kai_assert_check consults kai_test_in_progress at runtime and either
   # aborts (outside a test) or longjmps to the test harness (inside one),
   # so the emitter doesn't need to know whether it's in test mode.
-  # `opt_msg` is ignored for now — we always pass the generic string,
-  # matching stage 0's out-of-test panic path.
+  # m12.6.x #8: when opt_msg is a literal string (e.g. the contract-
+  # desugar's "requires violated at line N"), embed its span as a C
+  # literal so the panic shows the contract context instead of the
+  # generic "assertion failed". Non-literal msgs fall back to the
+  # generic — runtime evaluation of an arbitrary Expr to a C string
+  # would need a kai_to_cstring helper that doesn't exist.
   let cc = emit_expr(src, cond, fns, variants, lams)
-  concat_all(["kai_assert_check(", cc, ", \"assertion failed\"); "])
+  let msg_lit = match opt_msg {
+    Some(m) -> match m.kind {
+      EStr(span, false) -> span
+      _ -> "\"assertion failed\""
+    }
+    None -> "\"assertion failed\""
+  }
+  concat_all(["kai_assert_check(", cc, ", ", msg_lit, "); "])
 }
 
 # ---- declaration emission ----
