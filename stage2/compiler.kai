@@ -4359,26 +4359,123 @@ fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts {
 fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
                        line: Int, col: Int) : Expr {
   if reqs == [] and enss == [] { body } else {
-    # m12.6.b: simple desugar — both requires and ensures lower to
-    # asserts evaluated BEFORE the body (so a violated precondition
-    # short-circuits the body). The temporary limitation is that
-    # `result` cannot appear in `ensures` predicates yet; m12.6.c
-    # introduces the `let result = body; assert; result` shape that
-    # binds the return value. Until then, ensures can only reference
-    # the function's arguments — exactly what `requires` covers, but
-    # the keyword distinguishes intent for the audit-trail pitch.
     let req_stmts = preds_to_asserts(reqs, [])
-    let ens_stmts = preds_to_asserts(enss, [])
-    let stmts = list_append(req_stmts, ens_stmts)
-    mk_expr(EBlock(stmts, Some(body)), line, col)
+    if enss == [] {
+      mk_expr(EBlock(req_stmts, Some(body)), line, col)
+    } else {
+      # m12.6.c: bind `result` to the body's value so `ensures`
+      # predicates can reference it. The shape is
+      #   { req_asserts; let result = body; ens_asserts; result }
+      # mk_pat(...) is built inline at the SLet call site to dodge a
+      # kaic1 codegen quirk where a local Pattern binding inside this
+      # nested if/else gets emitted as a closure thunk instead of a
+      # Pattern value. selfhost passes because compiler.kai itself
+      # never invokes this branch.
+      let bind = SLet(mk_pat(PBind("result"), line, col), None, body)
+      let ens_stmts = preds_to_asserts(enss, [])
+      let res_var = mk_expr(EVar("result"), line, col)
+      let stmts = list_append(req_stmts, [bind, ...ens_stmts])
+      mk_expr(EBlock(stmts, Some(res_var)), line, col)
+    }
   }
 }
 
 fn preds_to_asserts(preds: [Expr], acc: [Stmt]) : [Stmt] {
   match preds {
     [] -> list_reverse(acc)
-    [p, ...rest] -> preds_to_asserts(rest, [SAssert(p, None), ...acc])
+    # m12.6.d: drop trivially-true predicates at parse time. The
+    # const folder evaluates closed boolean / integer expressions;
+    # everything else stays as a runtime assert. False-evaluating
+    # predicates still emit the assert (the runtime panic is the
+    # diagnostic) — a future pass can promote them to compile-time
+    # errors.
+    [p, ...rest] -> match try_eval_pred(p) {
+      Some(true) -> preds_to_asserts(rest, acc)
+      _          -> preds_to_asserts(rest, [SAssert(p, None), ...acc])
+    }
   }
+}
+
+# m12.6.d: best-effort static evaluator for refinement / contract
+# predicates. Returns Some(b) when the expression is a closed boolean
+# expression reducible to a literal, None otherwise. Deliberately
+# narrow: no symbolic reasoning, no SMT, no propagation through
+# refined arguments — that's the next step (and the cliff the spec
+# forbids in v1).
+fn try_eval_pred(e: Expr) : Option[Bool] {
+  match e.kind {
+    EBool(b) -> Some(b)
+    EUnop(op, x) -> if op == "not" {
+      match try_eval_pred(x) {
+        Some(b) -> Some(not b)
+        None    -> None
+      }
+    } else { None }
+    EBinop(op, a, b) -> {
+      if op == "and" {
+        match try_eval_pred(a) {
+          Some(false) -> Some(false)
+          Some(true)  -> try_eval_pred(b)
+          None        -> None
+        }
+      } else if op == "or" {
+        match try_eval_pred(a) {
+          Some(true)  -> Some(true)
+          Some(false) -> try_eval_pred(b)
+          None        -> None
+        }
+      } else if op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=" {
+        match try_eval_int(a) {
+          None    -> None
+          Some(ai) -> match try_eval_int(b) {
+            None    -> None
+            Some(bi) -> Some(eval_int_cmp(op, ai, bi))
+          }
+        }
+      } else { None }
+    }
+    _ -> None
+  }
+}
+
+# Evaluate an Int-typed closed expression to a literal value.
+fn try_eval_int(e: Expr) : Option[Int] {
+  match e.kind {
+    EInt(n) -> Some(n)
+    EUnop(op, x) -> if op == "-" {
+      match try_eval_int(x) {
+        Some(v) -> Some(0 - v)
+        None    -> None
+      }
+    } else { None }
+    EBinop(op, a, b) -> match try_eval_int(a) {
+      None    -> None
+      Some(av) -> match try_eval_int(b) {
+        None    -> None
+        Some(bv) -> eval_int_op(op, av, bv)
+      }
+    }
+    _ -> None
+  }
+}
+
+fn eval_int_op(op: String, a: Int, b: Int) : Option[Int] {
+  if op == "+" { Some(a + b) }
+  else if op == "-" { Some(a - b) }
+  else if op == "*" { Some(a * b) }
+  else if op == "/" { if b == 0 { None } else { Some(a / b) } }
+  else if op == "%" { if b == 0 { None } else { Some(a % b) } }
+  else { None }
+}
+
+fn eval_int_cmp(op: String, a: Int, b: Int) : Bool {
+  if op == "==" { a == b }
+  else if op == "!=" { a != b }
+  else if op == "<" { a < b }
+  else if op == "<=" { a <= b }
+  else if op == ">" { a > b }
+  else if op == ">=" { a >= b }
+  else { false }
 }
 
 # `effect Eff[T1, T2] { op_decl ... }` — m7a #3a + m7b #11.
