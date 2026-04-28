@@ -35,9 +35,13 @@ checkpoint; this phase turns the compiler into something usable.
    The prelude's decls land in the same global scope, available for
    name resolution and emission. Makes a stdlib usable without imports.
 
-3. **`stdlib/core.kai`** — a single file with convenience wrappers over
-   the builtin prelude. Kept small and written in kaikai-minimal so it
-   compiles with both kaic0 and kaic1. Contents:
+3. **`stdlib/core/`** — a small set of files (one per topic) with
+   convenience wrappers over the builtin prelude. Kept small and
+   written in kaikai-minimal so they compile with both kaic0 and
+   kaic1. Originally a single `stdlib/core.kai` monolith; split
+   into per-topic files (`list.kai`, `string.kai`, `option.kai`,
+   `result.kai`, `char.kai`, `tuple.kai`, `io.kai`) on 2026-04-27
+   per `docs/stdlib-layout.md`. Contents:
    - **List**: `list_map_indexed`, `list_find`, `list_take`, `list_drop`,
      `list_any`, `list_all`, `list_sum`, `list_index_of`, `list_nth`,
      `list_is_empty`, `list_concat_list`.
@@ -71,9 +75,9 @@ Each validated and committed before moving on:
    the driver just wraps kaic1+cc.
 3. **`--prelude` flag** on kaic1; accepts a second `.kai` file whose
    decls are parsed, checked, and emitted before the input file.
-4. **`stdlib/core.kai`** with the list/string/option/result/io/char
-   helpers listed above, and a `kai` default of
-   `--prelude stdlib/core.kai`.
+4. **`stdlib/core/*.kai`** with the list/string/option/result/io/char
+   helpers listed above, and a `kai` default that prepends every
+   file under `stdlib/core/` (one `--prelude` per file).
 5. **Ported demos** under `examples/phase4/`, each running via
    `kai run`. Tests added to the repo-root Makefile.
 6. **README update** documenting the three-line bootstrap and a

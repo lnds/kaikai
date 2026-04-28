@@ -15,7 +15,7 @@ MVP in progress.
 
 - **Phase 1–3** (landed): kaikai-minimal language and a
   self-hosting `stage1/kaic1` compiler.
-- **Phase 4** (landed): small stdlib (`stdlib/core.kai`) and the
+- **Phase 4** (landed): small stdlib (`stdlib/core/`) and the
   `kai` driver so programs can be built with a single command.
 - **Stage 2** (in progress, `stage2/kaic2`): self-hosted
   compiler in full kaikai. **Typed holes** are landed in m10
@@ -77,8 +77,8 @@ kai test examples/phase4/factorials.kai
 ```
 
 The driver auto-builds `stage0/kaic0` and `stage1/kaic1` on first use
-and prepends `stdlib/core.kai` to every compilation (set
-`KAI_NO_STDLIB=1` to turn this off).
+and prepends every file under `stdlib/core/` to every compilation
+(set `KAI_NO_STDLIB=1` to turn this off).
 
 ## Layout
 

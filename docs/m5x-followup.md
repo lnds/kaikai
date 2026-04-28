@@ -122,8 +122,9 @@ again here for index visibility:
    `perceus-basic.md`.
 2. **m14 nominal migration coupling**: when m14 migrates `list_take`
    → `list.take`, the 16 m14-pre functions need to migrate together.
-   Currently the flat-prefix style sits in `stdlib/core.kai`; the
-   migration is mechanical but coordinated.
+   The flat-prefix style sits in `stdlib/core/*.kai` (split from the
+   former monolith on 2026-04-27); the migration is mechanical but
+   coordinated.
 3. **kaic2 typer rejects polymorphic prelude calls from foreign
    files**: blocks several tests under `examples/` from running
    against `kaic2` directly. Workaround in place; root cause stays

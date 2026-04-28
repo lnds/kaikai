@@ -12,8 +12,10 @@ re-discover anything.
 ## R1 — `list_contains` / `list_sort_by` self-recursion leaks a row variable when called from an effectful context
 
 **Status**: **FIXED** 2026-04-26. The hypothesis ("row-unify path
-problem") was wrong. The actual bug: `stdlib/core.kai` declares its
-polymorphic functions as `pub fn list_contains(xs: [a], x: a) : Bool`
+problem") was wrong. The actual bug: the stdlib core file (then
+`stdlib/core.kai`, now `stdlib/core/list.kai` after the 2026-04-27
+split) declared its polymorphic functions as
+`pub fn list_contains(xs: [a], x: a) : Bool`
 *without* the `[a]` tparam brackets. Post-m7b #13, lowercase
 identifiers in type position are nominal `TyCon`s unless declared
 in `[…]`, so `a` was a concrete type and the call site failed to
@@ -65,9 +67,12 @@ error: type mismatch in function call
 
 The reported file/line points into the demo source but the column
 reflects the **prelude** prepended by `kaic2 --prelude
-stdlib/core.kai`. Lines 201 and 389 of the concatenated file fall on
-the recursive call sites inside `list_contains` and `list_sort_by`
-respectively (declarations at `stdlib/core.kai:163` and `:375`).
+stdlib/core.kai` (the pre-split monolith; today the equivalent is
+the chain of `--prelude stdlib/core/*.kai`). Lines 201 and 389 of
+the concatenated file fell on the recursive call sites inside
+`list_contains` and `list_sort_by` respectively (declarations
+formerly at `stdlib/core.kai:163` and `:375`, now in
+`stdlib/core/list.kai`).
 
 ### What is in the demos
 
@@ -121,8 +126,11 @@ fn main() : Unit / Console = {
 ```
 
 ```sh
+# Pre-split form (kept for the original repro shape):
 ./stage2/kaic2 --prelude stdlib/core.kai regress.kai > /dev/null
-# fails with the same `?e1` row-var leak
+# Post-split equivalent:
+./stage2/kaic2 $(for f in stdlib/core/*.kai; do echo --prelude $f; done) regress.kai > /dev/null
+# both fail with the same `?e1` row-var leak (pre-fix)
 ```
 
 ### What `make test` does that masks the bug

@@ -1707,7 +1707,8 @@ page the way they are written.
 
     *Amended 2026-04-26 (R1 fix):* the original #13 plan rejected
     undeclared lowercase identifiers as nominal `TyCon`s. That
-    decision broke `stdlib/core.kai` (its functions never declared
+    decision broke the stdlib core (then `stdlib/core.kai`, now
+    `stdlib/core/list.kai` post-split) — its functions never declared
     `[a]`) — `make test` did not catch it because the recursive
     self-calls inside the stdlib unify `a` with itself; only an
     external caller with a concrete element type exposed the

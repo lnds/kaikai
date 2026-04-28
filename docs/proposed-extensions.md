@@ -411,8 +411,8 @@ tuples-as-a-second-product-form.
    ad-hoc multi-return shape declares its own nominal record (the
    compiler itself has ~10 `type StmtsRewrite = { ... }` /
    `type PcsRwBlock = { ... }` declarations of this exact shape).
-   A single generic record in `stdlib/core.kai` collapses the
-   pattern. Cost: 1 line.
+   A single generic record in `stdlib/core/tuple.kai` (formerly
+   `stdlib/core.kai` pre-split) collapses the pattern. Cost: 1 line.
 
    ```kai
    pub type Pair[a, b] = { fst: a, snd: b }

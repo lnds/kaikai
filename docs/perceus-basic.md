@@ -580,14 +580,14 @@ should not rediscover them from scratch.
    updated and re-validated against `kaic2 --path stdlib` once
    the kaic2 prelude-polymorphism issue (item 3 below) is fixed.
 3. **kaic2 typer rejects polymorphic prelude calls from foreign
-   files.** `kaic2 --prelude stdlib/core.kai` plus a fresh file
-   that calls `list_take([1,2,3], 2)` fails with
+   files.** Historical: `kaic2 --prelude stdlib/core.kai` plus a
+   fresh file that calls `list_take([1,2,3], 2)` failed with
    `expected: ([a], Int) -> [a], found: ([Int], Int) -> ?t1 / ?e0`.
-   The bug pre-dates m14-pre (existing `list_take` shows it). It
-   is the reason `test-stdlib` routes through kaic1, not kaic2;
-   the inline comment on the Makefile target documents this. m14
-   proper will need to fix it before re-validating selfhost on
-   the new `list.*` names.
+   Empirically resolved by 2026-04-27 — `test-stdlib` now routes
+   through kaic2 over the post-split `stdlib/core/*.kai` chain
+   without typer rejection. The original kaic1-only routing and
+   its inline Makefile comment have been retired. m14 proper still
+   needs to re-validate selfhost on the new `list.*` names.
 4. **Per-process double KAI_TRACE_RC report when run via bin/kai.**
    `KAI_TRACE_RC=1 ./bin/kai run foo.kai` emits two reports
    (kaic1 process + the user binary) because the env var is

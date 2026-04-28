@@ -422,11 +422,12 @@ Once this doc is reviewed and pinned:
    `NetTcp`, `NetUdp`, `NetDns`, `Clock`, `Random`, `SecureRandom`,
    `Process`, matching the existing per-effect format (Declaration
    / Default handler / Error model / Stdlib helpers).
-2. Move the current `stdlib/core.kai` monolith into the `core/*`
-   subdirectory (`list.kai`, `string.kai`, …). This is a stage-1-safe
-   refactor; functions stay the same, only the file layout changes.
-   Keep the `list_*` / `string_*` function names for now — the
-   rename to `list.map` / `string.trim` waits for the module system.
+2. ~~Move the current `stdlib/core.kai` monolith into the `core/*`
+   subdirectory~~ — **landed 2026-04-27** as `stdlib/core/{list,
+   string,option,result,char,tuple,io}.kai`. Function names
+   unchanged (still `list_*` / `string_*` / `opt_*` / `result_*` /
+   `ch_*` / `println` / `Pair`); the rename to `list.map` /
+   `string.trim` waits for the module system in m14 proper.
 3. Land one stage-2 module end-to-end (candidate: `time`) as the
    template for the rest. Drives whatever compiler plumbing the
    effect requires and validates the `Clock` handler contract before
