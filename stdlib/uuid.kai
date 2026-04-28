@@ -1,0 +1,188 @@
+# stdlib/uuid.kai — RFC 4122 UUID v4 generator + parser.
+#
+# 128-bit identifier formatted as `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`,
+# where the `4` at position 13 marks version 4 (random) and `y` at
+# position 17 is one of `8`, `9`, `a`, or `b` (RFC 4122 variant
+# bits 10xx).
+#
+# Public surface:
+#
+#   pub fn uuid_v4() : String / Random
+#   pub fn uuid_v4_bytes() : [Int] / Random
+#   pub fn uuid_format(bs: [Int]) : Option[String]
+#   pub fn uuid_parse(s: String) : Option[[Int]]
+#   pub fn uuid_is_valid(s: String) : Bool
+#
+# Sources of randomness:
+# - `Random` (PCG32 seeded from `time(NULL)` in v1) — fine for
+#   correlation IDs, request IDs, ephemeral object handles.
+# - For security-sensitive UUIDs (auth tokens, key derivation
+#   salts), wait for `SecureRandom` (deferred). The `random` module
+#   wraps a non-cryptographic PRNG and **must not** be used where
+#   adversaries can predict the seed.
+
+# ---- Generation -------------------------------------------------
+
+# Build a fresh 16-byte UUID v4 buffer. Version + variant bits set
+# per RFC 4122 §4.4.
+pub fn uuid_v4_bytes() : [Int] / Random = {
+  let raw = uuid_random_bytes(16, [])
+  # Set version 4 (bits 12-15 of the time_hi_and_version field =
+  # byte 6 high nibble): clear, then OR 0x40.
+  let with_version = uuid_set_byte(raw, 6,
+    uuid_byte_or(uuid_byte_and(uuid_get_byte(raw, 6), 15), 64))
+  # Set variant 10xx (bits 6-7 of clock_seq_hi_and_reserved = byte 8
+  # high two bits): clear top two, then OR 0x80.
+  uuid_set_byte(with_version, 8,
+    uuid_byte_or(uuid_byte_and(uuid_get_byte(with_version, 8), 63), 128))
+}
+
+pub fn uuid_v4() : String / Random = {
+  let bs = uuid_v4_bytes()
+  match uuid_format(bs) {
+    Some(s) -> s
+    None    -> ""   # unreachable: uuid_v4_bytes always produces 16 bytes
+  }
+}
+
+# Internal: collect `n` random bytes (each in [0, 256)) into a
+# list, in source order.
+fn uuid_random_bytes(n: Int, acc: [Int]) : [Int] / Random = {
+  if n <= 0 { list_reverse(acc) }
+  else {
+    let b = Random.int_range(0, 256)
+    uuid_random_bytes(n - 1, [b, ...acc])
+  }
+}
+
+# ---- Bit-level helpers (no bitops yet — m13 §16) ----------------
+# AND with a 0x..0F-style mask reduces to mod; OR with a single-bit
+# flag reduces to add-if-clear. Sufficient for the fixed mask
+# constants (15, 63, 64, 128) the version/variant setters need.
+
+fn uuid_byte_and(b: Int, mask: Int) : Int = {
+  # Only `mask = 15` (low nibble) and `mask = 63` (low 6 bits)
+  # are exercised by the v4 bit-twiddling above. Both reduce to
+  # mod (mask + 1) when mask = 2^n - 1.
+  if mask == 15 { b - (b / 16) * 16 }
+  else if mask == 63 { b - (b / 64) * 64 }
+  else { b }   # generic fallback when m13 ships proper bitops
+}
+
+fn uuid_byte_or(b: Int, flag: Int) : Int = {
+  # `flag = 64` sets bit 6; `flag = 128` sets bit 7. Add only if
+  # the bit is currently clear — `b / flag` mod 2 tells us.
+  let already_set = (b / flag) - (b / (flag * 2)) * 2 == 1
+  if already_set { b } else { b + flag }
+}
+
+# ---- Bytes-list mutators ----------------------------------------
+# Functional `set` over a `[Int]`: rebuilds the prefix, swaps the
+# i-th element, appends the suffix. O(n); fine for n=16.
+
+fn uuid_set_byte(bs: [Int], i: Int, v: Int) : [Int] = match bs {
+  []           -> []
+  [b, ...rest] -> if i == 0 { [v, ...rest] }
+                  else { [b, ...uuid_set_byte(rest, i - 1, v)] }
+}
+
+fn uuid_get_byte(bs: [Int], i: Int) : Int = match bs {
+  []           -> 0
+  [b, ...rest] -> if i == 0 { b } else { uuid_get_byte(rest, i - 1) }
+}
+
+# ---- Formatting -------------------------------------------------
+
+# 16 bytes → `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. Returns None
+# if the input is not exactly 16 bytes long. Doesn't validate that
+# the version/variant nibbles match v4 — the caller might be
+# rendering bytes from a different generation path.
+pub fn uuid_format(bs: [Int]) : Option[String] = {
+  if list_length(bs) != 16 { None }
+  else {
+    let part1 = uuid_hex_slice(bs, 0, 4)    # 8 chars
+    let part2 = uuid_hex_slice(bs, 4, 2)    # 4 chars
+    let part3 = uuid_hex_slice(bs, 6, 2)    # 4 chars
+    let part4 = uuid_hex_slice(bs, 8, 2)    # 4 chars
+    let part5 = uuid_hex_slice(bs, 10, 6)   # 12 chars
+    Some(string_concat(part1,
+         string_concat("-",
+         string_concat(part2,
+         string_concat("-",
+         string_concat(part3,
+         string_concat("-",
+         string_concat(part4,
+         string_concat("-", part5)))))))))
+  }
+}
+
+fn uuid_hex_slice(bs: [Int], start: Int, count: Int) : String = {
+  if count <= 0 { "" }
+  else {
+    let b = uuid_get_byte(bs, start)
+    let hi = uuid_hex_digit((b / 16) - (b / 256) * 16)
+    let lo = uuid_hex_digit(b - (b / 16) * 16)
+    string_concat(string_concat(hi, lo),
+                  uuid_hex_slice(bs, start + 1, count - 1))
+  }
+}
+
+fn uuid_hex_digit(n: Int) : String = string_slice("0123456789abcdef", n, 1)
+
+# ---- Parsing ----------------------------------------------------
+
+# Validate canonical form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
+# (36 chars total: 32 hex + 4 dashes at positions 8/13/18/23) and
+# return the 16 underlying bytes. None on any deviation.
+# Case-insensitive on the hex digits.
+pub fn uuid_parse(s: String) : Option[[Int]] = {
+  if string_length(s) != 36 { None }
+  else if not uuid_dashes_at_canonical_positions(s) { None }
+  else { uuid_parse_bytes(s, 0, 0, []) }
+}
+
+fn uuid_dashes_at_canonical_positions(s: String) : Bool =
+  uuid_char_eq(s, 8, '-') and uuid_char_eq(s, 13, '-') and uuid_char_eq(s, 18, '-') and uuid_char_eq(s, 23, '-')
+
+fn uuid_char_eq(s: String, i: Int, c: Char) : Bool = match char_at(s, i) {
+  Some(d) -> d == c
+  None    -> false
+}
+
+# Walk the input two hex chars at a time, skipping the dashes at
+# the canonical positions. `byte_idx` counts emitted bytes (0..16),
+# `i` is the cursor in `s`.
+fn uuid_parse_bytes(s: String, byte_idx: Int, i: Int, acc: [Int]) : Option[[Int]] = {
+  if byte_idx >= 16 { Some(list_reverse(acc)) }
+  else {
+    let i_skip = if i == 8 or i == 13 or i == 18 or i == 23 { i + 1 } else { i }
+    match char_at(s, i_skip) {
+      None     -> None
+      Some(ch) -> match uuid_hex_value(ch) {
+        None     -> None
+        Some(hi) -> match char_at(s, i_skip + 1) {
+          None     -> None
+          Some(cl) -> match uuid_hex_value(cl) {
+            None     -> None
+            Some(lo) -> uuid_parse_bytes(s, byte_idx + 1, i_skip + 2,
+                                          [hi * 16 + lo, ...acc])
+          }
+        }
+      }
+    }
+  }
+}
+
+fn uuid_hex_value(c: Char) : Option[Int] = {
+  if ch_is_digit(c) { Some(char_to_int(c) - char_to_int('0')) }
+  else if c >= 'a' and c <= 'f' { Some(char_to_int(c) - char_to_int('a') + 10) }
+  else if c >= 'A' and c <= 'F' { Some(char_to_int(c) - char_to_int('A') + 10) }
+  else { None }
+}
+
+# Canonical-form predicate. Useful as a guard before calling
+# `uuid_parse` when you want a Bool answer rather than the bytes.
+pub fn uuid_is_valid(s: String) : Bool = match uuid_parse(s) {
+  Some(_) -> true
+  None    -> false
+}
