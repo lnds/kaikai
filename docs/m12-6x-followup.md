@@ -5,12 +5,11 @@ deferred to a future milestone. The common thread is **TyRefineT
 on the semantic side**: m12.6 v1 shipped syntax + runtime semantics
 without ever surfacing the refinement in the typer's `Ty`.
 
-**Update 2026-04-27 (m12.6.x v1 closed):** items #1, #2 (param-
-refinement entailment v1), #4, #5 (enforcement only), #6, and #8
-(positional msg) all landed. Items #3 (match-arm narrowing), #5
-attribute parser, and #7 regex literals are the remaining items
-— each is design-heavy and was deferred from v1 to keep the lane
-shippable. See status notes inline below.
+**Update 2026-04-27/28 (m12.6.x closed end-to-end):** items #1, #2
+(param-refinement entailment v1), #3 (match-arm narrowing), #4,
+#5 (enforcement + attribute parser), #6, and #8 (positional msg)
+all landed. The only remaining item is #7 regex literals, which
+is blocked on a separate regex stdlib lane.
 
 ## What landed in m12.6 v1 (for context)
 
@@ -112,15 +111,17 @@ Cost: 0.5–1 day on top of #1. Most of the machinery is in
 `try_eval_pred` already; the new piece is the substitution
 (`predicate[arg ↦ caller's refinement]`) and the entailment check.
 
-### 3. Match-arm narrowing — `p : RefinedT` *(STILL PENDING)*
+### 3. Match-arm narrowing — `p : RefinedT` *(LANDED 2026-04-28)*
 
-**Why deferred from m12.6.x v1**: requires a new PatKind variant
-(`PTyped(String, TypeExpr)`), arms in every Pattern walker, and a
-match-runtime that supports per-arm fall-through via a runtime
-predicate check. The desugar shape (an `if pred { bind } else {
-fall through to next arm }`) is fine in isolation but the
-fall-through interaction with existing match exhaustiveness needs
-care.
+**v1**: parse_arm detects an optional `: Type` after a binding
+pattern; when the inner TypeExpr is a TyRefine, the parser
+synthesises a guard `{ let self = name; pred }` that AND-combines
+with any explicit `if user_pred`. Only PBind patterns participate;
+other shapes followed by `:` raise a clear error.
+
+**Limit**: only inline refinements (`Int where ...`) are accepted
+at the `:` site. Aliases (`type Port = Int where ...` followed by
+`p : Port`) need alias resolution at parse time — deferred.
 
 ```kai
 match n {
@@ -154,13 +155,21 @@ type Account = {
 Cost: ~half a day. The canonicalisation is one rewrite rule;
 display/diagnostics need to render the combined form readably.
 
-### 5. `[<refinement-pure>]` stdlib annotations + enforcement *(ENFORCEMENT LANDED 2026-04-27, ATTRIBUTE PARSER STILL PENDING)*
+### 5. `[<refinement-pure>]` stdlib annotations + enforcement *(ENFORCEMENT + ATTRIBUTE PARSER LANDED 2026-04-27/28)*
 
-The enforcement half (rejecting calls in predicates that aren't in
-the closed pure prelude set) is in tree as of m12.6.x v1. The
-attribute parser — letting user fns opt into the pure surface —
-remains pending: the closed list `[is_some, is_none, is_finite,
-is_nan, string_length, list_length, matches]` is hard-coded today.
+Both halves landed:
+- **Enforcement** (m12.6.x v1): `find_impure_call` walks every
+  contract predicate at parse time and rejects calls outside the
+  closed pure-prelude set.
+- **Attribute parser** (m12.6.x v2): `[<refinement_pure>]` opt-in
+  on user fn signatures. `DAttribPure` wrapper + post-parse
+  `extract_pure_names_decls` + `validate_contract_predicates_decls`
+  re-runs the impure-call check with the combined `closed ++ user`
+  list, so user fns marked pure participate in predicates.
+
+Limit: attribute placement requires a newline before `[<` because
+`Bool [` adjacent on a single line lexes as `Bool[T]` generic-type
+syntax. Inline placement needs lexer disambiguation.
 
 The spec lists a closed set of prelude predicates that may appear
 inside refinement / contract predicates: `is_finite`, `is_nan`,
