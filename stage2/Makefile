@@ -344,26 +344,26 @@ test-writer: $(TARGET) build
 	  && echo "writer OK" \
 	  || { echo "writer DIFF"; diff ../examples/writer/main.out.expected build/writer.out; exit 1; }
 
-# m14-pre — stdlib/core.kai list-op smoke tests. Each fixture under
-# examples/stdlib/ is compiled with `kaic1 --prelude ../stdlib/core.kai`
-# (the new functions live in core, no module import needed) and its
-# stdout is diffed against `<name>.out.expected`. One fixture per
-# group of related ops: list_basic, list_*-by, list_sort, …
+# m14-pre — stdlib/core/*.kai list-op smoke tests. Each fixture under
+# examples/stdlib/ is compiled with kaic2 + the full split core
+# preludes and its stdout is diffed against `<name>.out.expected`.
+# One fixture per group of related ops: list_basic, list_*-by,
+# list_sort, …
 #
-# Why kaic1, not kaic2: kaic2's HM typer currently rejects calls to
-# polymorphic prelude functions (`list_take([1,2,3], 2)` from a
-# foreign file fails with "expected ([a], Int) -> [a], found ([Int],
-# Int) -> ?t1 / ?e0"). bin/kai — the production end-user driver —
-# routes through kaic1, where this works. The kaic2 prelude path is
-# part of m14 proper (see stage2-design.md §m14, naming-convention
-# migration + selfhost re-validation); m14-pre intentionally
-# exercises the kaic1 path that today's users hit.
-test-stdlib: $(KAIC1) build
+# Routes through kaic2 to match bin/kai's actual prelude chain
+# (multiple --prelude flags, one per stdlib/core/*.kai file). The
+# earlier kaic1-only routing was retired when bin/kai migrated to
+# kaic2 + when the kaic2 typer learned to bind polymorphic prelude
+# calls. The naming-convention migration to `list.map` etc. is m14
+# proper (see stage2-design.md §m14).
+CORE_PRELUDE_FLAGS := $(patsubst %,--prelude %,$(sort $(wildcard ../stdlib/core/*.kai)))
+
+test-stdlib: $(TARGET) build
 	@set -e; \
 	for f in ../examples/stdlib/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC1) --prelude ../stdlib/core.kai $$f > build/stdlib-$$name.c \
-	    || { echo "stdlib FAIL $$name (kaic1 errored)"; exit 1; }; \
+	  ./$(TARGET) $(CORE_PRELUDE_FLAGS) $$f > build/stdlib-$$name.c \
+	    || { echo "stdlib FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) -I ../stage0 build/stdlib-$$name.c -o build/stdlib-$$name \
 	    || { echo "stdlib FAIL $$name (C compile failed)"; exit 1; }; \
 	  ./build/stdlib-$$name > build/stdlib-$$name.out \
@@ -1238,7 +1238,7 @@ test-demos-core: $(TARGET) build
 	  in=../examples/$$name/$$name.in; \
 	  if [ ! -f $$src ]; then echo "demos-core FAIL $$name (missing $$src)"; exit 1; fi; \
 	  if [ ! -f $$exp ]; then echo "demos-core FAIL $$name (missing $$exp)"; exit 1; fi; \
-	  preludes="--prelude ../stdlib/core.kai --prelude ../stdlib/protocols.kai --prelude ../stdlib/effects.kai"; \
+	  preludes="$(CORE_PRELUDE_FLAGS) --prelude ../stdlib/protocols.kai --prelude ../stdlib/effects.kai"; \
 	  ./$(TARGET) $$preludes $$src > build/demo-$$name.c \
 	    || { echo "demos-core FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) -I ../stage0 build/demo-$$name.c -o build/demo-$$name \
@@ -1284,7 +1284,7 @@ test-aspirational: $(TARGET) build
 	  exp=../examples/aspirational/$$name/$$name.out.expected; \
 	  if [ ! -f $$src ]; then echo "aspirational FAIL $$name (missing $$src)"; exit 1; fi; \
 	  if [ ! -f $$exp ]; then echo "aspirational FAIL $$name (missing $$exp)"; exit 1; fi; \
-	  preludes="--prelude ../stdlib/core.kai --prelude ../stdlib/protocols.kai --prelude ../stdlib/effects.kai"; \
+	  preludes="$(CORE_PRELUDE_FLAGS) --prelude ../stdlib/protocols.kai --prelude ../stdlib/effects.kai"; \
 	  ./$(TARGET) $$preludes $$src > build/asp-$$name.c \
 	    || { echo "aspirational FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) -I ../stage0 build/asp-$$name.c -o build/asp-$$name \

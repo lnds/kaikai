@@ -4,7 +4,7 @@
 # Standalone Makefile, parallel to demos/Makefile and demos/9d9l/Makefile.
 
 KAIC2   := ../../stage2/kaic2
-PRELUDE := ../../stdlib/core.kai
+PRELUDES := $(patsubst %,--prelude %,$(sort $(wildcard ../../stdlib/core/*.kai)))
 STDLIB  := ../../stdlib
 RT_INC  := -I ../../stage0
 CC      := cc
@@ -25,7 +25,7 @@ verify:
 	@mkdir -p $(BUILD)
 	@for d in $(DEMOS); do \
 	  rm -f $(BUILD)/$$d.status $(BUILD)/$$d.err $(BUILD)/$$d.out $(BUILD)/$$d.c $(BUILD)/$$d-bin; \
-	  if ! $(KAIC2) --prelude $(PRELUDE) --path $(STDLIB) $$d/main.kai > $(BUILD)/$$d.c 2> $(BUILD)/$$d.err; then \
+	  if ! $(KAIC2) $(PRELUDES) --path $(STDLIB) $$d/main.kai > $(BUILD)/$$d.c 2> $(BUILD)/$$d.err; then \
 	    err=$$(head -1 $(BUILD)/$$d.err 2>/dev/null | sed 's/^[[:space:]]*//'); \
 	    [ -z "$$err" ] && err="kaikai compile error"; \
 	    echo "FAIL kaikai: $$err" > $(BUILD)/$$d.status; \

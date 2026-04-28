@@ -19,7 +19,8 @@ KAIC2     := ../stage2/kaic2
 # is retired with the m12.8 scope-aware rename pass — local
 # parameters whose name matches a registered op are no longer
 # rewritten to the dispatcher.
-PRELUDES  := --prelude ../stdlib/core.kai \
+CORE_PRELUDES := $(patsubst %,--prelude %,$(sort $(wildcard ../stdlib/core/*.kai)))
+PRELUDES  := $(CORE_PRELUDES) \
              --prelude ../stdlib/protocols.kai \
              --prelude ../stdlib/effects.kai \
              --prelude ../stdlib/random.kai
