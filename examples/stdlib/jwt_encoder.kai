@@ -1,0 +1,144 @@
+# JWT encoder/decoder showcase — exercises stdlib/encoding/base64,
+# stdlib/encoding/hex, and stdlib/collections/map together.
+#
+# Implements `alg: none` JWTs (RFC 7519 §6.1) — three dot-separated
+# parts where the third (signature) is empty. Format:
+#
+#   base64url(header).base64url(payload).
+#
+# A real production JWT signs the first two parts with HMAC-SHA256
+# (HS256) or RSA (RS256) and writes the base64url-encoded signature
+# in the third slot. SHA-256 lives in the future `stdlib/crypto/`
+# module (m14, blocked on bit ops m13); this demo uses `alg: none`
+# which is RFC-valid for unprotected tokens.
+
+# ---- byte/string helpers ----------------------------------------
+
+fn string_to_bytes_loop(s: String, i: Int, acc: [Int]) : [Int] = {
+  if i >= string_length(s) { list_reverse(acc) }
+  else { match char_at(s, i) {
+    None    -> list_reverse(acc)
+    Some(c) -> string_to_bytes_loop(s, i + 1, [char_to_int(c), ...acc])
+  } }
+}
+
+fn string_to_bytes(s: String) : [Int] = string_to_bytes_loop(s, 0, [])
+
+# ASCII printable range (32–126) packed as a string. Each index `i`
+# maps to the char with codepoint `32 + i`. Non-printable bytes
+# render as `?` — fine for JSON-shaped JWT payloads (the spec
+# limits payload bytes to UTF-8 anyway, and our demo values are
+# pure ASCII).
+fn ascii_printable() : String =
+  " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+fn byte_to_str(b: Int) : String = {
+  if b < 32 or b > 126 { "?" }
+  else { string_slice(ascii_printable(), b - 32, 1) }
+}
+
+fn bytes_to_string(bs: [Int]) : String =
+  string_join(map(bs, byte_to_str), "")
+
+# ---- JWT encoding ------------------------------------------------
+
+fn jwt_encode(header_json: String, payload_json: String) : String = {
+  let h = base64_encode_url(string_to_bytes(header_json))
+  let p = base64_encode_url(string_to_bytes(payload_json))
+  # alg:none = empty signature segment, but the trailing dot stays
+  h ++ "." ++ p ++ "."
+}
+
+# ---- JWT decoding ------------------------------------------------
+
+#derive(Show, Eq)
+type Decoded = { header: String, payload: String }
+
+fn jwt_decode(token: String) : Option[Decoded] = {
+  let parts = string_split(token, ".")
+  match parts {
+    [h_b64, p_b64, _] -> match base64_decode_url(h_b64) {
+      None     -> None
+      Some(hb) -> match base64_decode_url(p_b64) {
+        None     -> None
+        Some(pb) -> Some(Decoded {
+          header:  bytes_to_string(hb),
+          payload: bytes_to_string(pb)
+        })
+      }
+    }
+    _ -> None
+  }
+}
+
+# ---- Claim storage in Map ---------------------------------------
+
+# Build a Map[String, String] with the claims that go into the
+# payload, then serialise to a small JSON object. The serialiser is
+# minimal — string-only values, no nesting, no escaping (the demo
+# values are alphanumerics and digits). A real `stdlib/encoding/json`
+# would handle the rest.
+
+fn json_pair(p: Pair[String, String]) : String =
+  "\"" ++ p.fst ++ "\":\"" ++ p.snd ++ "\""
+
+fn json_object(claims: Map[String, String]) : String = {
+  let parts = map(map_to_pairs(claims), json_pair)
+  "{" ++ string_join(parts, ",") ++ "}"
+}
+
+# ---- Demo --------------------------------------------------------
+
+fn main() = {
+  # Compute the key id as the hex of a fixed seed. In production
+  # this would be the hex sha256 of the public key; here it is just
+  # a placeholder to exercise `hex_from_int`. 48879 = 0xBEEF.
+  let kid_hex = hex_from_int(48879)
+
+  # Header: alg=none, typ=JWT, kid=<hex>
+  let header = "{\"alg\":\"none\",\"typ\":\"JWT\",\"kid\":\"" ++ kid_hex ++ "\"}"
+
+  # Payload: claims live in a Map first to demo lookup before
+  # serialisation. Insert order is preserved (Map[K, V] is
+  # assoc-list-backed in v1), so the JSON output is deterministic.
+  let claims_0 = map_empty()
+  let claims_1 = map_put(claims_0, "sub",  "user_42")
+  let claims_2 = map_put(claims_1, "iss",  "kaikai-demo")
+  let claims_3 = map_put(claims_2, "iat",  "1700000000")
+  let claims   = map_put(claims_3, "name", "Eric")
+
+  let payload = json_object(claims)
+
+  Stdout.print("=== build ===")
+  Stdout.print("header  : " ++ header)
+  Stdout.print("payload : " ++ payload)
+  Stdout.print("claims size: " ++ int_to_string(map_size(claims)))
+  match map_get(claims, "sub") {
+    Some(v) -> Stdout.print("claim sub: " ++ v)
+    None    -> Stdout.print("claim sub: <missing>")
+  }
+  match map_get(claims, "missing") {
+    Some(_) -> Stdout.print("claim missing: <found unexpectedly>")
+    None    -> Stdout.print("claim missing: not present")
+  }
+
+  let token = jwt_encode(header, payload)
+  Stdout.print("")
+  Stdout.print("=== encoded ===")
+  Stdout.print(token)
+
+  Stdout.print("")
+  Stdout.print("=== decoded ===")
+  match jwt_decode(token) {
+    None -> Stdout.print("decode failed")
+    Some(d) -> {
+      Stdout.print("header  : " ++ d.header)
+      Stdout.print("payload : " ++ d.payload)
+      let header_ok  = d.header == header
+      let payload_ok = d.payload == payload
+      if header_ok and payload_ok { Stdout.print("round-trip: ok") }
+      else { Stdout.print("round-trip: MISMATCH") }
+    }
+  }
+  0
+}
