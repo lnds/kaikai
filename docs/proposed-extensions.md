@@ -55,6 +55,7 @@ on.
 | `use Effect` — open effect in scope        | scheduled m7e | parser + resolver scoping |
 | Protocols (single-dispatch)                | scheduled m12.8 | parser + resolver + vtable codegen |
 | Units of measure `Real<USD>` / `Int<UserId>` | landed m12.5 | parser + typer extension |
+| `const NAME : T = literal` — top-level constants | proposed     | parse-time desugar to zero-arg fn |
 
 ## 1. `todo!(msg) : T` — principled unimplemented
 
@@ -1949,6 +1950,119 @@ the same lane.
 **Cost**: low. Parser change + reuse the existing record pattern
 machinery.
 **Depends on**: §10 (record punning) — lands together.
+
+## 29. `const NAME : T = literal` — top-level named constants
+
+**Status: PROPOSED 2026-04-28.** Discussed during the m12.6.x
+close-out; pinned here for a future lane to revisit when concrete
+demand surfaces.
+
+```kai
+const PI : Real = 3.14159
+const MAX_PORT : Int = 65535
+const ZERO : Int = 0
+
+type Port = Int where 1 <= self and self <= MAX_PORT
+
+fn classify(n: Int) : String = match n {
+  ZERO -> "zero"          # NB: requires the pattern-side fix below
+  _    -> "non-zero"
+}
+
+fn area(r: Real) : Real = PI * r * r
+```
+
+### Why this is a thing
+
+Three concrete sites where today's "zero-arg fn" workaround feels
+worse than a `const`:
+
+1. **Refinements / contract predicates.**
+   `type Port = Int where self <= MAX_PORT` reads naturally if
+   `MAX_PORT` is a name. Today the user has to write
+   `fn max_port() : Int [<refinement_pure>] = 65535` and then
+   `where self <= max_port()` — verbose and the parens look like
+   a function call when the value is conceptually a constant.
+
+2. **Pattern matching.** A bare name in pattern position binds;
+   it does not match against a constant. So `match n { ZERO -> ... }`
+   silently treats `ZERO` as a fresh bind. Today the workaround is
+   a guard: `match n { x if x == 0 -> ... }`, which is verbose
+   and loses the readability of a named constant.
+
+3. **Call-site noise.** `area = PI * r * r` reads cleanly;
+   `area = pi() * r * r` carries dead parens that the reader
+   has to parse past every time.
+
+### Why a `const` keyword and not just `let` at top level
+
+`let` already means "bind a fresh name to the result of an
+expression in this scope". Top-level `let` would either need to
+allow effects (a `let x = read_file(path)` at module load time)
+or would silently be different from local `let` (no effects
+allowed). Both options muddy the semantics.
+
+`const` says exactly what we mean: **a name for a literal value
+that the compiler can evaluate at parse time, with no effects
+and no runtime cost**. The constraint is the feature.
+
+### Sketch of a v1 implementation (parser-only desugar)
+
+The cheapest version is a pure parse-time rewrite — zero changes
+to the typer / unifier / codegen:
+
+1. **Lexer**: add `TkConst` keyword.
+2. **Parser**: top-level `const NAME : T = expr` parses to a
+   `DFn(true, NAME, [], [], Some(T), REmpty, expr, l, c)`
+   wrapped in `DAttribPure` (so it's automatically callable from
+   refinement / contract predicates).
+3. **Resolve pass**: a new `desugar_const_refs` rewrites every
+   `EVar(NAME)` in expression position (where `NAME` matches a
+   declared const) to `ECall(EVar(NAME), [])`.
+4. **Codegen**: nothing — the existing zero-arg-fn path emits
+   the inlined value just fine; const folding (m12.6.d) over
+   the predicate path picks up call-site evaluations
+   automatically when the body is a literal.
+
+What this v1 does NOT cover:
+- **Pattern-side constants (#2 above).** A bare name in pattern
+  position still binds. To fix it, add `PConstRef(String)` to
+  PatKind and a resolver pass that rewrites a `PBind(name)` to
+  `PConstRef(name)` when `name` resolves to a top-level const.
+  The runtime check then becomes structural equality against
+  the const's literal. ~1 day on top of the v1.
+- **Non-literal RHS.** `const TWO_PI : Real = 2.0 * PI` requires
+  evaluating `expr` at parse time after const-substitution.
+  Reuses `try_eval_pred` / `try_eval_int` / a new
+  `try_eval_real` from m12.6.d. ~half a day.
+- **Compound constants.** `const ORIGIN : Point = Point { x: 0.0,
+  y: 0.0 }` requires extending the const-folder to record
+  literals. Punt to v2.
+
+### Why this is "proposed" and not "scheduled"
+
+Cost-of-feature vs cost-of-workaround calculus:
+- Workaround today (`fn name() : T [<refinement_pure>] = lit`)
+  works for cases #1 and #3 above with one extra `()` per use.
+- Case #2 (pattern matching) is the only one where there's no
+  workaround short of `if` guards.
+- The feature touches lexer + parser + a new walker pass +
+  pattern-side change for full coverage. ~1.5 days of work
+  including fixtures.
+
+That ratio is fine if a concrete demo asks for it. Until then,
+`fn name() : T [<refinement_pure>] = lit` carries the load.
+
+**Cost**: low for the v1 parse-time desugar (~½ day). Medium for
+the pattern-side `PConstRef` (~1 day on top). High only if we
+extend to compound / computed constants.
+**Depends on**: m12.6.x #5(a) attribute parser (landed) — the
+desugar reuses `[<refinement_pure>]` so consts work in
+predicates without a separate pure-list registration.
+**Open question**: should `const` be allowed inside fn bodies
+as an alternative to `let` for compile-time literals? Probably
+not — `let x = 0` at the top of a fn already inlines. The
+distinction only matters at module scope.
 
 ## Deliberately not on this list
 
