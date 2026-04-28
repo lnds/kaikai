@@ -318,18 +318,24 @@ in.
      m7e/m7f effect lanes (`import spawn`, `import actor`,
      `import loop`) where the imported file declares effects /
      helpers that the importing file calls **unqualified**.
-   - **m6.2 — qualified calls** *(pending, prerequisite for m14)*:
-     real namespacing. `import list` makes `list.map(xs, f)` a
-     qualified call distinct from any unqualified `map`. Selective
-     `import list.{map}` brings `map` into the unqualified scope
-     while leaving the rest under the prefix. `import list as L`
-     binds `L.map`. Resolver, typer, and codegen learn to treat
-     `module.fn` as a single name lookup in the module's export
-     table, not a record field projection on a value named
-     `module`. Required before m14 can rename `list_map` →
-     `list.map` because the rename without resolver support is a
-     syntax error. Independent of effects/fibers; ~3-5 days
-     based on the scope of changes to resolver + typer + emitter.
+   - **m6.2 — qualified calls** *(v1 landed 2026-04-27,
+     prerequisite for m14)*: real namespacing. `import list`
+     makes `list.map(xs, f)` a qualified call distinct from any
+     unqualified `map`. Selective `import list.{map}` brings
+     `map` into the unqualified scope while leaving the rest
+     under the prefix. `import list as L` binds `L.map`.
+     Resolver rewrites `EField(EVar(mod), fn)` to a new
+     `EModCall(mod, fn)` AST variant when `mod` is in the module
+     table and not shadowed locally (rule B: locals shadow
+     imports — Rust/Python/OCaml-style). Typer treats `EModCall`
+     as a function reference; codegen v1 shares the C symbol
+     with the legacy unqualified form. Fixtures live under
+     `examples/modules-qualified/{basic, alias, selective,
+     local_shadow, two_modules, record_projection}/`.
+     Full design + decisions in `docs/m6.2-design.md`. v2
+     (universal prefixed minting `kai_<module>__<name>` and
+     diagnostic for two-modules-export-same-name) is a follow-up
+     lane.
 7. **m7 — Effects + handlers** (split in two sub-milestones —
    see `docs/effects-stdlib.md` §*Next steps* for the full
    plan):

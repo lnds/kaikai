@@ -10,7 +10,7 @@ SRC     := compiler.kai
 # feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
 STACK := ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop test-time test-stdlib test-protocols test-demos-core test-aspirational selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-modules-qualified test-sugars test-loop test-time test-stdlib test-protocols test-demos-core test-aspirational selfhost
 
 all: $(TARGET)
 
@@ -281,6 +281,45 @@ test-modules: $(TARGET) build
 	diff -q build/modules-c.out build/modules-llvm.out > /dev/null \
 	  && echo "modules OK" \
 	  || { echo "modules DIFF"; diff build/modules-c.out build/modules-llvm.out; exit 1; }
+
+# m6.2 — qualified module calls. Each subdirectory under
+# examples/modules-qualified/ is one self-contained scenario
+# (basic / alias / selective / local_shadow / two_modules /
+# record_projection): a `main.kai` plus zero or more helper
+# modules. Compiled with the subdir as the import root (no
+# --path needed because helpers live next to main.kai). Both
+# backends run; outputs diffed against `<subdir>/main.out.expected`
+# and against each other.
+#
+# `record_projection` is the no-op smoke test — no imports, so
+# rqc has an empty module table and every EField stays as a
+# record-field projection (M6.1 + record-projection legacy
+# behaviour preserved).
+QUALIFIED_DIRS := basic alias selective local_shadow two_modules record_projection
+
+test-modules-qualified: $(TARGET) build
+	@set -e; \
+	for d in $(QUALIFIED_DIRS); do \
+	  src=../examples/modules-qualified/$$d/main.kai; \
+	  exp=../examples/modules-qualified/$$d/main.out.expected; \
+	  ./$(TARGET) $$src > build/mq-$$d.c \
+	    || { echo "modules-qualified FAIL $$d (kaic2)"; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/mq-$$d.c -o build/mq-$$d-c \
+	    || { echo "modules-qualified FAIL $$d (cc)"; exit 1; }; \
+	  ./build/mq-$$d-c > build/mq-$$d-c.out \
+	    || { echo "modules-qualified FAIL $$d (run C)"; exit 1; }; \
+	  ./$(TARGET) --emit=llvm $$src > build/mq-$$d.ll \
+	    || { echo "modules-qualified FAIL $$d (kaic2 --emit=llvm)"; exit 1; }; \
+	  clang -w -I ../stage0 build/mq-$$d.ll ../stage0/runtime_llvm.c -o build/mq-$$d-llvm \
+	    || { echo "modules-qualified FAIL $$d (clang)"; exit 1; }; \
+	  ./build/mq-$$d-llvm > build/mq-$$d-llvm.out \
+	    || { echo "modules-qualified FAIL $$d (run LLVM)"; exit 1; }; \
+	  diff -q $$exp build/mq-$$d-c.out > /dev/null \
+	    || { echo "modules-qualified DIFF $$d (C vs golden)"; diff $$exp build/mq-$$d-c.out; exit 1; }; \
+	  diff -q build/mq-$$d-c.out build/mq-$$d-llvm.out > /dev/null \
+	    || { echo "modules-qualified DIFF $$d (C vs LLVM)"; diff build/mq-$$d-c.out build/mq-$$d-llvm.out; exit 1; }; \
+	  echo "modules-qualified OK $$d"; \
+	done
 
 # M6.2 search-path smoke test: `examples/modules-path/main.kai`
 # imports `shared.helpers`, which lives under
@@ -1331,7 +1370,7 @@ test-aspirational: $(TARGET) build
 	    || { echo "aspirational DIFF $$name (LLVM)"; diff $$exp build/asp-$$name-llvm.out; exit 1; }; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -1340,7 +1379,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-stdlib test-protocols test-demos-core test-aspirational
 
 clean:
 	rm -rf build $(TARGET)
