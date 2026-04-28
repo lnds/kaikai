@@ -1,0 +1,246 @@
+# stdlib/decimal.kai — fixed-point decimal arithmetic.
+#
+# Pure functional. The carrier is `{ raw: Int, scale: Int }` where
+# the represented value is `raw * 10^(-scale)`. So `1.23` is
+# `Decimal { raw: 123, scale: 2 }` and `100` is `Decimal { raw: 100,
+# scale: 0 }`.
+#
+# Variable scale (rather than a single fixed-point precision pinned
+# at module level) lets call sites preserve significant digits
+# across operations. Add and subtract normalise to `max(sa, sb)`;
+# multiply yields `sa + sb`; divide takes an explicit target scale
+# (no implicit precision loss).
+#
+# v1 limits:
+#   - scale must be in `[0, 18]`. Beyond 18, `pow10(scale)` overflows
+#     a 64-bit Int. Most financial work fits in 4 (microcents) or
+#     less, so this is generous.
+#   - parsing accepts `[+-]?digits[.digits]?`. No exponent notation,
+#     no thousands separator.
+#   - division never throws; division by zero returns
+#     `dec_zero()` and the caller is expected to guard via
+#     `dec_is_zero` first if that matters.
+#   - rounding is "half away from zero" (the common financial
+#     convention; bankers' rounding is a follow-up).
+
+# ---- Carrier -----------------------------------------------------
+
+pub type Decimal = { raw: Int, scale: Int }
+
+# ---- Constructors -----------------------------------------------
+
+pub fn dec_zero() : Decimal = Decimal { raw: 0, scale: 0 }
+
+pub fn dec_from_int(n: Int) : Decimal = Decimal { raw: n, scale: 0 }
+
+# Build a Decimal from integer + fractional parts and the digit
+# count of the fraction. Example: `dec_from_parts(12, 50, 2)` →
+# `12.50`. Sign flows through `units`; `fraction` must be
+# non-negative and shorter than `pow10(scale)`.
+pub fn dec_from_parts(units: Int, fraction: Int, scale: Int) : Decimal = {
+  let p = pow10(scale)
+  let mag = if units < 0 { 0 - units } else { units }
+  let raw_mag = mag * p + fraction
+  let raw_signed = if units < 0 { 0 - raw_mag } else { raw_mag }
+  Decimal { raw: raw_signed, scale: scale }
+}
+
+# ---- Internal arithmetic helpers --------------------------------
+
+# 10^n. Internal — clamps n to [0, 18] to stay within Int64 range.
+pub fn pow10(n: Int) : Int = {
+  if n <= 0 { 1 }
+  else if n >= 18 { pow10_loop(1, 18) }
+  else { pow10_loop(1, n) }
+}
+
+fn pow10_loop(acc: Int, n: Int) : Int =
+  if n <= 0 { acc } else { pow10_loop(acc * 10, n - 1) }
+
+# Re-scale a Decimal to a new scale by multiplying or truncating.
+# Scaling UP (new > old) is exact; scaling DOWN (new < old)
+# truncates toward zero. Use `dec_round` if you want rounding.
+fn dec_rescale(d: Decimal, new_scale: Int) : Decimal = {
+  if new_scale == d.scale { d }
+  else if new_scale > d.scale {
+    Decimal { raw: d.raw * pow10(new_scale - d.scale), scale: new_scale }
+  }
+  else {
+    Decimal { raw: d.raw / pow10(d.scale - new_scale), scale: new_scale }
+  }
+}
+
+# Two Decimals brought to a common scale (`max` of the two).
+# Returns Pair[Decimal, Decimal] (kaikai has no tuples post-m8.5).
+fn dec_align(a: Decimal, b: Decimal) : Pair[Decimal, Decimal] = {
+  let target = if a.scale > b.scale { a.scale } else { b.scale }
+  Pair { fst: dec_rescale(a, target), snd: dec_rescale(b, target) }
+}
+
+# ---- Arithmetic --------------------------------------------------
+
+pub fn dec_add(a: Decimal, b: Decimal) : Decimal = {
+  let p = dec_align(a, b)
+  Decimal { raw: p.fst.raw + p.snd.raw, scale: p.fst.scale }
+}
+
+pub fn dec_sub(a: Decimal, b: Decimal) : Decimal = {
+  let p = dec_align(a, b)
+  Decimal { raw: p.fst.raw - p.snd.raw, scale: p.fst.scale }
+}
+
+pub fn dec_neg(d: Decimal) : Decimal =
+  Decimal { raw: 0 - d.raw, scale: d.scale }
+
+# Multiply: scales add. `1.23 * 1.5 = 1.845` (scale 3).
+pub fn dec_mul(a: Decimal, b: Decimal) : Decimal =
+  Decimal { raw: a.raw * b.raw, scale: a.scale + b.scale }
+
+# Divide: caller picks the result scale. Internally we widen the
+# numerator first so the truncation only loses digits beyond
+# `target_scale`. Division by zero returns `dec_zero()` — guard
+# with `dec_is_zero(b)` if you want a different policy.
+pub fn dec_div(a: Decimal, b: Decimal, target_scale: Int) : Decimal = {
+  if b.raw == 0 { dec_zero() }
+  else {
+    # value = a.raw / 10^a.scale ÷ b.raw / 10^b.scale
+    #       = (a.raw * 10^b.scale) / (b.raw * 10^a.scale)
+    # Want result with `target_scale` decimal digits → multiply
+    # numerator by 10^target_scale extra.
+    let num = a.raw * pow10(b.scale + target_scale)
+    let den = b.raw * pow10(a.scale)
+    Decimal { raw: num / den, scale: target_scale }
+  }
+}
+
+# ---- Predicates --------------------------------------------------
+
+pub fn dec_is_zero(d: Decimal) : Bool = d.raw == 0
+
+pub fn dec_is_negative(d: Decimal) : Bool = d.raw < 0
+
+pub fn dec_abs(d: Decimal) : Decimal =
+  if d.raw < 0 { Decimal { raw: 0 - d.raw, scale: d.scale } } else { d }
+
+# ---- Comparison --------------------------------------------------
+
+pub fn dec_eq(a: Decimal, b: Decimal) : Bool = {
+  let p = dec_align(a, b)
+  p.fst.raw == p.snd.raw
+}
+
+pub fn dec_cmp(a: Decimal, b: Decimal) : Int = {
+  let p = dec_align(a, b)
+  if p.fst.raw < p.snd.raw { 0 - 1 }
+  else if p.fst.raw > p.snd.raw { 1 }
+  else { 0 }
+}
+
+# ---- Rounding ----------------------------------------------------
+
+# Round to `target_scale` decimal digits using "half away from zero"
+# (financial rounding). Scaling UP is exact (zero-pad); scaling
+# DOWN looks at the dropped digits.
+pub fn dec_round(d: Decimal, target_scale: Int) : Decimal = {
+  if target_scale >= d.scale { dec_rescale(d, target_scale) }
+  else {
+    let drop = d.scale - target_scale
+    let factor = pow10(drop)
+    let half = factor / 2
+    let mag = if d.raw < 0 { 0 - d.raw } else { d.raw }
+    let q = mag / factor
+    let r = mag - q * factor
+    let q1 = if r >= half { q + 1 } else { q }
+    let signed = if d.raw < 0 { 0 - q1 } else { q1 }
+    Decimal { raw: signed, scale: target_scale }
+  }
+}
+
+# ---- String I/O --------------------------------------------------
+
+# Pretty-print: integer part + dot + fractional part (zero-padded
+# to scale digits). Negative values prefix with `-`. Scale 0 emits
+# the integer alone with no trailing dot.
+pub fn dec_to_string(d: Decimal) : String = {
+  if d.scale == 0 { int_to_string(d.raw) }
+  else {
+    let neg = d.raw < 0
+    let mag = if neg { 0 - d.raw } else { d.raw }
+    let factor = pow10(d.scale)
+    let units = mag / factor
+    let frac = mag - units * factor
+    let frac_str = pad_left_zeros(int_to_string(frac), d.scale)
+    let sign = if neg { "-" } else { "" }
+    string_concat(string_concat(sign, int_to_string(units)),
+                  string_concat(".", frac_str))
+  }
+}
+
+# Left-pad a numeric string with zeros to a target width.
+fn pad_left_zeros(s: String, width: Int) : String = {
+  let n = string_length(s)
+  if n >= width { s }
+  else { string_concat(string_repeat("0", width - n), s) }
+}
+
+# Parse a Decimal from a string. Accepts `[+-]?digits[.digits]?`.
+# None on any malformed input. The fractional digit count
+# determines the resulting `scale`; `"1.5"` → scale 1, `"1.50"` →
+# scale 2 (preserves trailing zeros).
+pub fn dec_parse(s: String) : Option[Decimal] = {
+  let n = string_length(s)
+  if n == 0 { None }
+  else {
+    let first = char_at(s, 0)
+    let neg = match first { Some(c) -> c == '-'  None -> false }
+    let pos = match first { Some(c) -> c == '+'  None -> false }
+    let body_start = if neg or pos { 1 } else { 0 }
+    if body_start >= n { None }
+    else { dec_parse_body(s, body_start, n, neg) }
+  }
+}
+
+fn dec_parse_body(s: String, start: Int, n: Int, neg: Bool) : Option[Decimal] = {
+  let dot_idx = dec_find_dot(s, start, n)
+  if dot_idx < 0 {
+    # No decimal point — pure integer.
+    let int_str = string_slice(s, start, n - start)
+    match string_to_int(int_str) {
+      None    -> None
+      Some(v) -> Some(Decimal { raw: if neg { 0 - v } else { v }, scale: 0 })
+    }
+  }
+  else {
+    let int_part = string_slice(s, start, dot_idx - start)
+    let frac_part = string_slice(s, dot_idx + 1, n - dot_idx - 1)
+    if string_length(frac_part) == 0 { None }
+    else { match dec_parse_int_part(int_part) {
+      None     -> None
+      Some(iv) -> match string_to_int(frac_part) {
+        None     -> None
+        Some(fv) -> {
+          let scale = string_length(frac_part)
+          let raw_mag = iv * pow10(scale) + fv
+          Some(Decimal { raw: if neg { 0 - raw_mag } else { raw_mag },
+                         scale: scale })
+        }
+      }
+    } }
+  }
+}
+
+# Parse the integer-side digits. Empty string → 0 (allows ".5" to
+# decode as 0.5). Otherwise parses normally.
+fn dec_parse_int_part(s: String) : Option[Int] = {
+  if string_length(s) == 0 { Some(0) }
+  else { string_to_int(s) }
+}
+
+# Locate `.` in [start, n). Returns -1 if absent.
+fn dec_find_dot(s: String, i: Int, n: Int) : Int = {
+  if i >= n { 0 - 1 }
+  else { match char_at(s, i) {
+    None    -> 0 - 1
+    Some(c) -> if c == '.' { i } else { dec_find_dot(s, i + 1, n) }
+  } }
+}
