@@ -125,6 +125,11 @@ KaiValue *kaix_prelude_panic(KaiValue *msg) { return kai_prelude_panic(msg); }
    list_append(xs, nil()). */
 KaiValue *kaix_incref(KaiValue *v)                        { return kai_incref(v); }
 
+/* m5 #3 LLVM mirror: drop unused fresh-alloc let-bindings. The IR
+   emits `call void @kaix_decref(%KaiValue* <reg>)` immediately after
+   the binding when last-use analysis proves the name is unread. */
+void      kaix_decref(KaiValue *v)                        { kai_decref(v); }
+
 /* ---------- M3e: lists + closures-with-captures ---------- */
 KaiValue *kaix_cons(KaiValue *h, KaiValue *t)            { return kai_cons(h, t); }
 KaiValue *kaix_nil(void)                                  { return kai_nil(); }

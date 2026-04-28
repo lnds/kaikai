@@ -20633,6 +20633,7 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_match_panic(%KaiValue*)\n",
     "declare %KaiValue* @kaix_cons(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_incref(%KaiValue*)\n",
+    "declare void         @kaix_decref(%KaiValue*)\n",
     "declare %KaiValue* @kaix_nil()\n",
     "declare i32           @kaix_is_cons(%KaiValue*)\n",
     "declare i32           @kaix_is_nil(%KaiValue*)\n",
@@ -22277,7 +22278,12 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
 
 fn llvm_emit_block(e: LlvmEmit, stmts: [Stmt], tail: Option[Expr]) : LlvmEmit {
   let outer_locals = e.locals
-  let after = llvm_emit_stmts(e, stmts)
+  # m5 #3 LLVM mirror — drops for unused let-bindings whose RHS is a
+  # fresh allocation. Same per-block drop set the C-emitter computes
+  # in emit_expr's EBlock arm; reuses block_unused_lets unchanged so
+  # both backends agree on which bindings are droppable.
+  let drops = block_unused_lets(stmts, tail)
+  let after = llvm_emit_stmts_with_drops(e, stmts, drops)
   let tailed = match tail {
     Some(te) -> llvm_emit_expr(after, te)
     None -> {
@@ -22296,6 +22302,53 @@ fn llvm_emit_stmts(e: LlvmEmit, stmts: [Stmt]) : LlvmEmit {
   match stmts {
     [] -> e
     [s, ...rest] -> llvm_emit_stmts(llvm_emit_stmt(e, s), rest)
+  }
+}
+
+# m5 #3 LLVM mirror — variant of llvm_emit_stmts that consults the
+# per-block drop set computed by block_unused_lets. SLet routes
+# through llvm_emit_stmt_with_drops; other stmt forms delegate to
+# the original llvm_emit_stmt path.
+fn llvm_emit_stmts_with_drops(e: LlvmEmit, stmts: [Stmt], drops: [String]) : LlvmEmit {
+  match stmts {
+    [] -> e
+    [s, ...rest] -> llvm_emit_stmts_with_drops(llvm_emit_stmt_with_drops(e, s, drops), rest, drops)
+  }
+}
+
+fn llvm_emit_stmt_with_drops(e: LlvmEmit, s: Stmt, drops: [String]) : LlvmEmit / Console {
+  match s {
+    SLet(pat, _, rhs) -> {
+      let er = llvm_emit_expr(e, rhs)
+      match pat.pkind {
+        PBind(nm) -> {
+          let pushed = llvm_push_local(er, nm, er.last_val)
+          if list_has(drops, nm) {
+            llvm_append_body(pushed,
+              concat_all(["  call void @kaix_decref(%KaiValue* ", er.last_val, ")\n"]))
+          } else {
+            pushed
+          }
+        }
+        # `let _ = expr` discards the value. Mirrors the C-side: when
+        # the RHS is a fresh allocation we can decref it; otherwise we
+        # must not, to avoid double-freeing an alias.
+        PWild -> {
+          if is_fresh_alloc(rhs) {
+            llvm_append_body(er,
+              concat_all(["  call void @kaix_decref(%KaiValue* ", er.last_val, ")\n"]))
+          } else {
+            er
+          }
+        }
+        PRecord(fields) -> llvm_emit_let_record(er, er.last_val, fields)
+        _ -> {
+          eprint("llvm: let with non-trivial pattern not supported in M3b at #{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+          er
+        }
+      }
+    }
+    _ -> llvm_emit_stmt(e, s)
   }
 }
 
