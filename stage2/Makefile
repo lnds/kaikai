@@ -357,12 +357,22 @@ test-writer: $(TARGET) build
 # calls. The naming-convention migration to `list.map` etc. is m14
 # proper (see stage2-design.md §m14).
 CORE_PRELUDE_FLAGS := $(patsubst %,--prelude %,$(sort $(wildcard ../stdlib/core/*.kai)))
+# Mirrors bin/kai's full prelude chain so fixtures that lean on
+# encoding/collections modules (base64_basic, hex_basic, map_basic,
+# jwt_encoder) compile out of the box. Keep this in sync with bin/kai
+# when new top-level stdlib modules land.
+EXTRA_PRELUDE_FLAGS := --prelude ../stdlib/protocols.kai \
+                       --prelude ../stdlib/effects.kai \
+                       --prelude ../stdlib/random.kai \
+                       --prelude ../stdlib/encoding/base64.kai \
+                       --prelude ../stdlib/encoding/hex.kai \
+                       --prelude ../stdlib/collections/map.kai
 
 test-stdlib: $(TARGET) build
 	@set -e; \
 	for f in ../examples/stdlib/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(CORE_PRELUDE_FLAGS) $$f > build/stdlib-$$name.c \
+	  ./$(TARGET) $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f > build/stdlib-$$name.c \
 	    || { echo "stdlib FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) -I ../stage0 build/stdlib-$$name.c -o build/stdlib-$$name \
 	    || { echo "stdlib FAIL $$name (C compile failed)"; exit 1; }; \
