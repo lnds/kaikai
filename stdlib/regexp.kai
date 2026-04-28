@@ -1201,3 +1201,156 @@ fn rx_class_matches(ranges: [CharRange], c: Char) : Bool = match ranges {
       else { rx_class_matches(rest, c) }
   }
 }
+
+# ====================================================================
+# Phase 5 — Public API
+# ====================================================================
+#
+# Opaque `Regex` carrier wrapping a compiled `Nfa`. The lowercase
+# name is the public surface; the parser/NFA/simulator types stay
+# exported for power users (debugging, custom drivers) but are not
+# expected to be touched by typical code.
+#
+# Naming follows the pre-m14 flat-prefix convention:
+# `regex_compile` / `regex_match` / `regex_find_all` / `regex_replace`
+# / `regex_split`. The m14 migration will rename them to
+# `regex.compile` etc.
+
+pub type Regex = R(Nfa)
+
+# Compile a pattern string. The error variant carries a
+# human-readable message — the caller does not need to know about
+# RxParseError's internals.
+pub fn regex_compile(pattern: String) : Result[String, Regex] =
+  match rx_parse_pattern(pattern) {
+    Err(e) -> match e {
+      RxParseError { msg: m, pos: p } ->
+        Err(string_concat_all(["regex parse error at ", int_to_string(p), ": ", m]))
+    }
+    Ok(ast) -> Ok(R(rx_compile_nfa(ast)))
+  }
+
+# Find the first (leftmost-longest) match of `re` in `s`.
+pub fn regex_match(re: Regex, s: String) : Option[Match] = match re {
+  R(nfa) -> rx_simulate(nfa, s)
+}
+
+# Find every non-overlapping match. Zero-width matches advance the
+# scan cursor by one character so we don't loop forever on
+# patterns like `a*` against `bbb`.
+pub fn regex_find_all(re: Regex, s: String) : [Match] = match re {
+  R(nfa) -> rx_find_all_loop(nfa, s, 0, string_length(s), [])
+}
+
+fn rx_find_all_loop(nfa: Nfa, s: String, from_pos: Int, n: Int, acc: [Match]) : [Match] = {
+  if from_pos > n { acc }
+  else { match rx_simulate_from(nfa, s, n, from_pos) {
+    None -> acc
+    Some(m) -> {
+      let next = if m.end > m.start { m.end } else { m.start + 1 }
+      rx_find_all_loop(nfa, s, next, n, list_append(acc, [m]))
+    }
+  } }
+}
+
+# Replace every non-overlapping match with `replacement`. The
+# replacement supports `$0` (whole match) and `$1`..`$9` (numbered
+# groups). Use `$$` for a literal `$`.
+pub fn regex_replace(re: Regex, s: String, replacement: String) : String = match re {
+  R(nfa) -> rx_replace_loop(nfa, s, replacement, 0, string_length(s), "")
+}
+
+fn rx_replace_loop(nfa: Nfa, s: String, repl: String, from_pos: Int, n: Int, acc: String) : String = {
+  if from_pos > n { acc }
+  else { match rx_simulate_from(nfa, s, n, from_pos) {
+    None -> string_concat(acc, string_slice(s, from_pos, n - from_pos))
+    Some(m) -> {
+      # Append source [from_pos..m.start) verbatim, then the
+      # expanded replacement. Advance to m.end (or +1 on a
+      # zero-width match) for the next iteration.
+      let prefix = string_slice(s, from_pos, m.start - from_pos)
+      let expanded = rx_expand_replacement(repl, m, s)
+      let acc1 = string_concat(acc, string_concat(prefix, expanded))
+      let next = if m.end > m.start { m.end } else { m.start + 1 }
+      # Zero-width: also copy the skipped char so it is not lost.
+      let acc2 = if m.end == m.start and m.start < n {
+        match char_at(s, m.start) {
+          Some(c) -> string_concat(acc1, "#{c}")
+          None    -> acc1
+        }
+      } else { acc1 }
+      rx_replace_loop(nfa, s, repl, next, n, acc2)
+    }
+  } }
+}
+
+# Expand $N back-references in `repl` against the captured groups.
+# `$$` -> literal `$`. Unknown groups expand to the empty string
+# (mirrors most engines' lenient behaviour).
+fn rx_expand_replacement(repl: String, m: Match, src: String) : String = {
+  let n = string_length(repl)
+  rx_expand_loop(repl, 0, n, m, src, "")
+}
+
+fn rx_expand_loop(repl: String, i: Int, n: Int, m: Match, src: String, acc: String) : String = {
+  if i >= n { acc }
+  else { match char_at(repl, i) {
+    None -> acc
+    Some(c) ->
+      if c == '$' {
+        let i1 = i + 1
+        if i1 >= n { string_concat(acc, "$") }
+        else { match char_at(repl, i1) {
+          None -> string_concat(acc, "$")
+          Some(c2) ->
+            if c2 == '$' {
+              rx_expand_loop(repl, i1 + 1, n, m, src, string_concat(acc, "$"))
+            } else if ch_is_digit(c2) {
+              let gid = char_to_int(c2) - char_to_int('0')
+              let span = rx_group_span(m.groups, gid, src)
+              rx_expand_loop(repl, i1 + 1, n, m, src, string_concat(acc, span))
+            } else {
+              # `$x` where x is not a digit or $ — emit literally.
+              rx_expand_loop(repl, i1 + 1, n, m, src,
+                             string_concat(acc, string_concat("$", "#{c2}")))
+            }
+        } }
+      } else {
+        rx_expand_loop(repl, i + 1, n, m, src, string_concat(acc, "#{c}"))
+      }
+  } }
+}
+
+# Look up a captured span by group id. Missing or never-closed
+# groups expand to the empty string.
+fn rx_group_span(caps: [Capture], gid: Int, src: String) : String = match caps {
+  [] -> ""
+  [c, ...rest] ->
+    if c.group_id == gid {
+      if c.start >= 0 and c.end >= 0 and c.end >= c.start {
+        string_slice(src, c.start, c.end - c.start)
+      } else { "" }
+    } else { rx_group_span(rest, gid, src) }
+}
+
+# Split `s` at every non-overlapping match of `re`. The match
+# itself is excluded from the output (mirrors Python `re.split`).
+# Empty matches are tolerated: the scan advances by one char so
+# `"abc"` split by `"x*"` yields `["a", "b", "c"]` rather than
+# looping. Trailing empty segments are kept (Python semantics).
+pub fn regex_split(re: Regex, s: String) : [String] = match re {
+  R(nfa) -> rx_split_loop(nfa, s, 0, string_length(s), [])
+}
+
+fn rx_split_loop(nfa: Nfa, s: String, from_pos: Int, n: Int, acc: [String]) : [String] = {
+  if from_pos > n { acc }
+  else { match rx_simulate_from(nfa, s, n, from_pos) {
+    None -> list_append(acc, [string_slice(s, from_pos, n - from_pos)])
+    Some(m) -> {
+      let segment = string_slice(s, from_pos, m.start - from_pos)
+      let acc1 = list_append(acc, [segment])
+      let next = if m.end > m.start { m.end } else { m.start + 1 }
+      rx_split_loop(nfa, s, next, n, acc1)
+    }
+  } }
+}
