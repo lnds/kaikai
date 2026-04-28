@@ -22005,6 +22005,251 @@ fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl])
 }
 
 # ====================================================================
+# m6.2 Phase 2.3 — qualified call rewrite (EField → EModCall)
+# ====================================================================
+#
+# After expand_imports populates the module table, this pass walks
+# every Decl body and rewrites every `EField(EVar(mod), fn)` into
+# `EModCall(mod, fn)` when **rule B** holds:
+#
+#   1. `mod` is not bound as a local in the surrounding lexical
+#      scope (rule B — locals shadow imports).
+#   2. `mod` matches an entry in the module table.
+#   3. `fn` is in that module's exports list.
+#
+# When any of those fail, the EField stays as-is and the typer
+# treats it as a record-field projection (today's behaviour).
+#
+# Lexical scoping tracker: a flat `[String]` of names currently in
+# scope. Updated as the walker enters fn params, lambda params,
+# `let` patterns, `match` arm patterns, handle clause params, and
+# `with State[T](init) as alias` aliases. This is the same shape
+# stage 1 added in 2c5de6b for the codegen shadow bug — the
+# tracker reads identically here, just for a different decision.
+
+fn mt_lookup(mt: [ModuleEntry], name: String) : Option[ModuleEntry] {
+  match mt {
+    [] -> None
+    [me, ...rest] -> match me {
+      ME(mn, _, _) -> if mn == name { Some(me) } else { mt_lookup(rest, name) }
+    }
+  }
+}
+
+fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
+  ME(_, exports, _) -> list_has(exports, fn_name)
+}
+
+# Collect the bindings introduced by a pattern. Used by SLet,
+# match-arm patterns, and variant-record / record patterns.
+fn pat_binders(pat: Pattern, acc: [String]) : [String] = match pat.pkind {
+  PWild           -> acc
+  PLit(_)         -> acc
+  PBind(name)     -> [name, ...acc]
+  PList(subs, opt_rest) -> {
+    let acc1 = pat_binders_list(subs, acc)
+    match opt_rest { Some(n) -> [n, ...acc1] None -> acc1 }
+  }
+  PVariant(_, subs)        -> pat_binders_list(subs, acc)
+  PVariantRecord(_, fs)    -> pat_binders_pfields(fs, acc)
+  PRecord(fs)              -> pat_binders_pfields(fs, acc)
+  PHole(_)                 -> acc
+  PAs(name, inner)         -> pat_binders(inner, [name, ...acc])
+}
+
+fn pat_binders_list(ps: [Pattern], acc: [String]) : [String] = match ps {
+  [] -> acc
+  [p, ...rest] -> pat_binders_list(rest, pat_binders(p, acc))
+}
+
+fn pat_binders_pfields(fs: [PField], acc: [String]) : [String] = match fs {
+  [] -> acc
+  [f, ...rest] -> match f {
+    PField(_, sub, _) -> pat_binders_pfields(rest, pat_binders(sub, acc))
+  }
+}
+
+fn fn_param_names(params: [Param]) : [String] = match params {
+  [] -> []
+  [p, ...rest] -> [p.pname, ...fn_param_names(rest)]
+}
+
+fn rqc_decls(decls: [Decl], mt: [ModuleEntry]) : [Decl] = match decls {
+  [] -> []
+  [d, ...rest] -> [rqc_decl(d, mt), ...rqc_decls(rest, mt)]
+}
+
+fn rqc_decl(d: Decl, mt: [ModuleEntry]) : Decl = match d {
+  DFn(p, n, tp, params, ret, row, body, l, c) ->
+    DFn(p, n, tp, params, ret, row,
+        rqc_expr(body, fn_param_names(params), mt), l, c)
+  DTest(n, body, l, c) ->
+    DTest(n, rqc_expr(body, [], mt), l, c)
+  DImpl(name, ty, sub_decls, l, c) ->
+    DImpl(name, ty, rqc_decls(sub_decls, mt), l, c)
+  DDerive(ps, inner, l, c) ->
+    DDerive(ps, rqc_decl(inner, mt), l, c)
+  # DType / DEffect / DProtocol / DUnit / DAxiom / DUse / DImport
+  # carry no Expr bodies that need walking. (DAxiom's body is
+  # synthesised by lower_axioms and lives in the resulting DFn,
+  # which we already cover above.)
+  _ -> d
+}
+
+fn rqc_expr(e: Expr, locals: [String], mt: [ModuleEntry]) : Expr =
+  Expr { kind: rqc_kind(e.kind, locals, mt), line: e.line, col: e.col, ty: e.ty }
+
+fn rqc_kind(k: ExprKind, locals: [String], mt: [ModuleEntry]) : ExprKind = match k {
+  # The rewrite rule itself: only `EField(EVar(mod), fn)` is a
+  # candidate. Every other shape just recurses with the same scope.
+  EField(base, fname) -> match base.kind {
+    EVar(name) ->
+      if list_has(locals, name) {
+        # Rule B: local in scope. Treat as record projection.
+        EField(rqc_expr(base, locals, mt), fname)
+      } else {
+        match mt_lookup(mt, name) {
+          Some(me) ->
+            if me_has_export(me, fname) { EModCall(name, fname) }
+            else                        { EField(rqc_expr(base, locals, mt), fname) }
+          None -> EField(rqc_expr(base, locals, mt), fname)
+        }
+      }
+    _ -> EField(rqc_expr(base, locals, mt), fname)
+  }
+  # Scope-introducing shapes: lambda, match arms, handle, block.
+  ELambda(params, body) ->
+    ELambda(params,
+            rqc_expr(body, list_append(locals, fn_param_names(params)), mt))
+  EMatch(scrut, arms) ->
+    EMatch(rqc_expr(scrut, locals, mt),
+           rqc_arms(arms, locals, mt))
+  EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) -> {
+    let body1 = rqc_expr(body, locals, mt)
+    let init_opt1 = match init_opt {
+      Some(ie) -> Some(rqc_expr(ie, locals, mt))
+      None -> None
+    }
+    # The handle alias (`as name`) and `with State[T](init) as
+    # name` introduce a binding visible only inside the clauses
+    # and the return clause, not the body. The body sees the
+    # original locals.
+    let inner = match alias_opt { Some(a) -> [a, ...locals] None -> locals }
+    let clauses1 = rqc_hclauses(clauses, inner, mt)
+    let ret_opt1 = match ret_opt {
+      Some(r) -> Some(rqc_hreturn(r, inner, mt))
+      None -> None
+    }
+    EHandle(body1, eff, ty_args, init_opt1, alias_opt, clauses1, ret_opt1)
+  }
+  EBlock(stmts, opt_final) -> {
+    # Scope grows monotonically through the block. Each SLet /
+    # SVar / SUse contributes new bindings to `inner`.
+    let res = rqc_block_stmts(stmts, locals, mt, [])
+    let inner = res.bound
+    let final1 = match opt_final {
+      Some(fe) -> Some(rqc_expr(fe, inner, mt))
+      None -> None
+    }
+    EBlock(res.stmts, final1)
+  }
+  # Everything else: recurse via map_expr_kind closing over the
+  # current locals. map_expr_kind preserves shape and runs the
+  # transformer on every direct sub-Expr — exactly what we want
+  # for binop / call / if / index / range / pipe / record-lit /
+  # list / unop / lit-unit / variants-of / hole / todo / bang /
+  # int / real / bool / char / str / unit / under / placeholder /
+  # var / modcall (already a leaf).
+  _ -> map_expr_kind(k, (sub) => rqc_expr(sub, locals, mt))
+}
+
+fn rqc_arms(arms: [Arm], locals: [String], mt: [ModuleEntry]) : [Arm] = match arms {
+  [] -> []
+  [a, ...rest] -> [rqc_arm(a, locals, mt), ...rqc_arms(rest, locals, mt)]
+}
+
+fn rqc_arm(a: Arm, locals: [String], mt: [ModuleEntry]) : Arm = match a {
+  Arm(pat, opt_guard, body) -> {
+    let inner = pat_binders(pat, locals)
+    let guard1 = match opt_guard {
+      Some(g) -> Some(rqc_expr(g, inner, mt))
+      None -> None
+    }
+    Arm(pat, guard1, rqc_expr(body, inner, mt))
+  }
+}
+
+fn rqc_hclauses(cs: [HClause], locals: [String], mt: [ModuleEntry]) : [HClause] =
+  match cs {
+    [] -> []
+    [c, ...rest] -> [rqc_hclause(c, locals, mt), ...rqc_hclauses(rest, locals, mt)]
+  }
+
+fn rqc_hclause(c: HClause, locals: [String], mt: [ModuleEntry]) : HClause = match c {
+  HC(name, params, body, l, col) -> {
+    let inner = list_append(locals, fn_param_names(params))
+    HC(name, params, rqc_expr(body, inner, mt), l, col)
+  }
+}
+
+fn rqc_hreturn(r: HReturn, locals: [String], mt: [ModuleEntry]) : HReturn = match r {
+  HR(pname, body, l, c) ->
+    HR(pname, rqc_expr(body, [pname, ...locals], mt), l, c)
+}
+
+# Stmt-walker: threads the scope through a block's statement list.
+# `bound` accumulates the local names introduced so far; the final
+# expression after the last SExprStmt sees the full bound set.
+type RqcStmtsAcc = { stmts: [Stmt], bound: [String] }
+
+fn rqc_block_stmts(stmts: [Stmt], locals: [String], mt: [ModuleEntry], acc_stmts: [Stmt]) : RqcStmtsAcc =
+  match stmts {
+    [] -> RqcStmtsAcc { stmts: list_reverse(acc_stmts), bound: locals }
+    [s, ...rest] -> {
+      let r = rqc_stmt(s, locals, mt)
+      rqc_block_stmts(rest, r.bound, mt, [r.s, ...acc_stmts])
+    }
+  }
+
+type RqcStmtR = { s: Stmt, bound: [String] }
+
+fn rqc_stmt(s: Stmt, locals: [String], mt: [ModuleEntry]) : RqcStmtR = match s {
+  SLet(pat, ty_opt, e) -> {
+    # The RHS evaluates under the *outer* scope; bindings from `pat`
+    # only become visible to subsequent stmts.
+    let e1 = rqc_expr(e, locals, mt)
+    let inner = pat_binders(pat, locals)
+    RqcStmtR { s: SLet(pat, ty_opt, e1), bound: inner }
+  }
+  SAssert(e, opt_msg) -> {
+    let e1 = rqc_expr(e, locals, mt)
+    let m1 = match opt_msg {
+      Some(m) -> Some(rqc_expr(m, locals, mt))
+      None -> None
+    }
+    RqcStmtR { s: SAssert(e1, m1), bound: locals }
+  }
+  SExprStmt(e) ->
+    RqcStmtR { s: SExprStmt(rqc_expr(e, locals, mt)), bound: locals }
+  SIndexAssign(target, ix, v, l, c) -> {
+    let t1 = rqc_expr(target, locals, mt)
+    let i1 = rqc_expr(ix, locals, mt)
+    let v1 = rqc_expr(v, locals, mt)
+    RqcStmtR { s: SIndexAssign(t1, i1, v1, l, c), bound: locals }
+  }
+  SVar(name, ty_opt, init, l, c) -> {
+    # SVar should not survive the desugar pass that runs before
+    # rqc, but we handle it defensively just in case rqc lands
+    # earlier in the pipeline some day.
+    let init1 = rqc_expr(init, locals, mt)
+    RqcStmtR { s: SVar(name, ty_opt, init1, l, c), bound: [name, ...locals] }
+  }
+  # SUse introduces no value bindings; leaves locals untouched.
+  SUse(eff, l, c) ->
+    RqcStmtR { s: SUse(eff, l, c), bound: locals }
+}
+
+# ====================================================================
 # m7f §7 — `import ?name` symbol-index resolver
 # ====================================================================
 #
@@ -25148,16 +25393,16 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                                                          dir_of(path),
                                                          search_paths)
             let own_decls_no_holes = strip_import_holes(own_decls, [])
-            # m6.2 Phase 2.2: expand_imports now returns both the
-            # flat decl list (M6.1 behaviour) and the module table.
-            # `module_table` is unused until Phase 2.3 wires it into
-            # the resolver pass; building it now confirms the
-            # populate logic without affecting any other code path.
+            # m6.2 Phase 2.2/2.3: expand_imports returns both the
+            # flat decl list (M6.1 behaviour) and the module table;
+            # rqc_decls then walks every body and rewrites
+            # `EField(EVar(mod), fn)` to `EModCall(mod, fn)` when
+            # `mod` is in the module table and not shadowed locally.
             let expanded = expand_imports(path, search_paths, own_decls_no_holes)
             let expanded_decls = match expanded { EP_Mod(ds, _) -> ds }
             let module_table = match expanded { EP_Mod(_, mt) -> mt }
-            let _ = module_table  # consumed in Phase 2.3
-            let merged_raw = list_append(prelude_decls, expanded_decls)
+            let qualified_decls = rqc_decls(expanded_decls, module_table)
+            let merged_raw = list_append(prelude_decls, qualified_decls)
             # m12.7: lower DAxiom → DFn(body=todo!) before any other
             # Decl walker runs. Subsequent passes (alias resolution,
             # builtin injection, desugars, typer) see only ordinary
