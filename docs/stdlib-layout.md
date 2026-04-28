@@ -342,12 +342,15 @@ spec lands, it is added to this header.
 - **Function calls**: `module.function` (`net.http.get(url)`). No
   package-level prefixes inside function names.
 - **Migration from today's `list_*` / `string_*`**: those are a
-  stopgap for kaikai-minimal, which lacks modules. When stage 2's
-  module system lands, `list_map` becomes `list.map`, `string_trim`
-  becomes `string.trim`, and the prefix convention is retired.
-  Stage 1 code (kaikai-minimal) keeps the `list_*` / `string_*`
-  prefixes — the migration only applies to stage 2 code where the
-  module system exists.
+  stopgap for kaikai-minimal, which lacks modules. The current
+  stage 2 module system (m6.1) is concat-only — `import list`
+  brings every public decl into the unqualified scope, so
+  `list.map` is not a callable shape yet. When **m6.2 — qualified
+  calls** lands (see `docs/stage2-design.md`), `list_map` becomes
+  `list.map`, `string_trim` becomes `string.trim`, and the prefix
+  convention retires under m14. Stage 1 code (kaikai-minimal) keeps
+  the `list_*` / `string_*` prefixes — the migration only applies
+  to stage 2 code where qualified module calls exist.
 - **Type constructors**: PascalCase (`Some`, `None`, `Ok`, `Err`).
   Unchanged.
 - **Type names**: PascalCase (`List`, `String`, `Option`, `Instant`,
@@ -427,7 +430,9 @@ Once this doc is reviewed and pinned:
    string,option,result,char,tuple,io}.kai`. Function names
    unchanged (still `list_*` / `string_*` / `opt_*` / `result_*` /
    `ch_*` / `println` / `Pair`); the rename to `list.map` /
-   `string.trim` waits for the module system in m14 proper.
+   `string.trim` waits for **m6.2 (qualified module calls)** and
+   then m14 proper. See `docs/stage2-design.md` §m6 for the
+   m6.1/m6.2 split.
 3. Land one stage-2 module end-to-end (candidate: `time`) as the
    template for the rest. Drives whatever compiler plumbing the
    effect requires and validates the `Clock` handler contract before

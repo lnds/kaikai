@@ -307,8 +307,29 @@ in.
    mirror of m5 #3 drops, full Perceus optimisations
    (reuse-in-place, drop specialisation, unboxing, regions).
    See `docs/m5x-followup.md`.
-6. **m6 — Module resolution**: cross-file imports, topological
-   compilation, standard library loaded from a search path.
+6. **m6 — Module resolution** (split in two sub-milestones):
+   - **m6.1 — concat semantics** *(landed)*: `import a.b.c`
+     loads `<dir>/a/b/c.kai` and concatenates its decls into the
+     program. DFS topological order, visited-set for cycles,
+     `--path <dir>` repeatable search-path flag. Parser accepts
+     `import path as Alias` and `import path.{f, g}` shapes but
+     this pass treats them as plain imports — every imported
+     symbol lands in the flat global scope. Sufficient for the
+     m7e/m7f effect lanes (`import spawn`, `import actor`,
+     `import loop`) where the imported file declares effects /
+     helpers that the importing file calls **unqualified**.
+   - **m6.2 — qualified calls** *(pending, prerequisite for m14)*:
+     real namespacing. `import list` makes `list.map(xs, f)` a
+     qualified call distinct from any unqualified `map`. Selective
+     `import list.{map}` brings `map` into the unqualified scope
+     while leaving the rest under the prefix. `import list as L`
+     binds `L.map`. Resolver, typer, and codegen learn to treat
+     `module.fn` as a single name lookup in the module's export
+     table, not a record field projection on a value named
+     `module`. Required before m14 can rename `list_map` →
+     `list.map` because the rename without resolver support is a
+     syntax error. Independent of effects/fibers; ~3-5 days
+     based on the scope of changes to resolver + typer + emitter.
 7. **m7 — Effects + handlers** (split in two sub-milestones —
    see `docs/effects-stdlib.md` §*Next steps* for the full
    plan):
@@ -490,12 +511,18 @@ in.
     / `encoding` stdlib modules.
 14. **m14 — Stdlib expansion**: stage-2-native stdlib,
     module-organised under `stdlib/core/{list,string,option,result,
-    char,tuple,ordering}.kai` per `docs/stdlib-layout.md`.
-    Includes the **naming-convention migration** from the legacy
-    flat-prefix style (`list_take`, `string_concat`, `opt_map`)
-    to namespaced calls (`list.take`, `string.concat`,
-    `option.map`); legacy names retire after `stage2/compiler.kai`
-    re-validates self-host on the new names. Adds the missing
+    char,tuple,ordering}.kai` per `docs/stdlib-layout.md`. The
+    file split landed 2026-04-27 (function names still flat:
+    `list_*`, `string_*`, …); the rename below is the remaining
+    work. **Depends on m6.2** — without qualified calls,
+    `list.map(xs, f)` does not parse as a call at all, so the
+    nominal migration is blocked until the resolver learns
+    qualified-call lookup. Includes the **naming-convention
+    migration** from the legacy flat-prefix style (`list_take`,
+    `string_concat`, `opt_map`) to namespaced calls (`list.take`,
+    `string.concat`, `option.map`); legacy names retire after
+    `stage2/compiler.kai` re-validates self-host on the new
+    names. Adds the missing
     list ops noted in `stdlib-layout.md` §`core.list` (sort,
     sort_by, max, min, count, contains, flat_map, take_while,
     drop_while, repeat, head, tail, uniq, zip_with). Also lands
@@ -521,7 +548,7 @@ exists as a usable language as soon as possible" and treats
 performance work as a follow-up:
 
 ```
-m7a → m7b → m7c → m7d → m7e → m7f → m8 → m8.5 → m12 → m12.5 → m12.6 → m12.7 → m12.8 → m5 → full Perceus → m11/m13/m14/m15-17
+m7a → m7b → m7c → m7d → m7e → m7f → m8 → m8.5 → m12 → m12.5 → m12.6 → m12.7 → m12.8 → m5 → full Perceus → m6.2 → m11/m13/m14/m15-17
 ```
 
 Rationale:
@@ -604,11 +631,19 @@ Rationale:
 9. **Full Perceus** (§2 — reuse-in-place, drop specialisation,
    unboxing, opt-in regions) — the heavy memory work, scheduled
    after the basic pass has stabilised.
+9.5. **m6.2 (qualified module calls)** — namespacing on top of
+   m6.1's concat semantics. `import list` makes `list.map` a
+   qualified call distinct from any unqualified `map`. Required
+   before m14 can rename `list_map` → `list.map`; without it
+   the rename is a syntax error. Independent of effects/fibers.
+   Lands directly before m14 so the migration is the immediate
+   payoff.
 10. **m11 (diagnostics quality)**, **m13 (property/bench)**,
    **m14 (stdlib expansion)**, **m15–m17 (tooling)** — these
    are mostly independent and can land in parallel once the
    above is done. m11 in particular benefits from being able
-   to run end-to-end on the full feature set.
+   to run end-to-end on the full feature set. m14 specifically
+   blocks on m6.2 (see 9.5).
 
 Why this order and not "Perceus first":
 
@@ -647,7 +682,7 @@ The vigente order (below) now reads:
 
 ```
 m12.8 ✅ → compiler-cleanup → m12 → m7e (rest) → m7f → m5.x → m8.5
-  → m12.5 → m12.6 → m12.7 → full Perceus → m11/m13/m14/m15-17
+  → m12.5 → m12.6 → m12.7 → full Perceus → m6.2 → m11/m13/m14/m15-17
 ```
 
 See `docs/lane-experience-m12.8.md` for the lane retrospective and the
@@ -665,7 +700,7 @@ from this point** is:
 ```
 !-postfix → m12.8 → compiler-cleanup → m12 → m7e (rest) → m7f
   → m5.x → m8.5 → m12.5 → m12.6 → m12.7 → full Perceus
-  → m11/m13/m14/m15-17
+  → m6.2 → m11/m13/m14/m15-17
 ```
 
 Two changes vs the original ordering:
