@@ -8,7 +8,12 @@ SRC     := compiler.kai
 # emitter doesn't TCO. On stage 2's source (~9 k lines) those recurse
 # past the default 8 MB thread stack. Prepend this to any recipe that
 # feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
-STACK := ulimit -s 32768 2>/dev/null || true;
+# Bumped from 32 MB to 64 MB (macOS hard limit) on 2026-04-27:
+# m12.6 + m6.2 push compiler.kai past 25k lines and the recursive
+# init code at module load now needs ~32-40 MB of stack on the
+# main thread. The plain 32 MB ulimit was crashing selfhost with
+# SIGSEGV; 65520 KB is the macOS hard-limit ceiling and works.
+STACK := ulimit -s 65520 2>/dev/null || ulimit -s 32768 2>/dev/null || true;
 
 .PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-modules-qualified test-sugars test-loop test-time test-stdlib test-protocols test-demos-core test-aspirational selfhost
 
@@ -421,7 +426,10 @@ EXTRA_PRELUDE_FLAGS := --prelude ../stdlib/protocols.kai \
                        --prelude ../stdlib/encoding/base64.kai \
                        --prelude ../stdlib/encoding/hex.kai \
                        --prelude ../stdlib/encoding/json.kai \
-                       --prelude ../stdlib/collections/map.kai
+                       --prelude ../stdlib/collections/map.kai \
+                       --prelude ../stdlib/decimal.kai \
+                       --prelude ../stdlib/money.kai \
+                       --prelude ../stdlib/uuid.kai
 
 test-stdlib: $(TARGET) build
 	@set -e; \
