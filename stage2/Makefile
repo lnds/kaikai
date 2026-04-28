@@ -15,7 +15,7 @@ SRC     := compiler.kai
 # SIGSEGV; 65520 KB is the macOS hard-limit ceiling and works.
 STACK := ulimit -s 65520 2>/dev/null || ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational selfhost
 
 all: $(TARGET)
 
@@ -1358,6 +1358,17 @@ test-effect-runtime: build
 	  && echo "effect-runtime OK" \
 	  || { echo "effect-runtime FAIL"; exit 1; }
 
+# Phase 5: smoke test for the Link runtime registry. Exercises
+# kai_link_add_bidirectional + kai_link_propagate_terminate on
+# bare KaiFiber structs without going through scheduler dispatch.
+# A kaikai-level link-cascade demo defers to Phase 5.5+ (needs
+# spawn_actor / pid handoff machinery the v1 actor surface lacks).
+test-link-runtime: build
+	@$(CC) $(CFLAGS) -I ../stage0 tests/link_runtime_test.c -o build/link_runtime_test
+	@./build/link_runtime_test \
+	  && echo "link-runtime OK" \
+	  || { echo "link-runtime FAIL"; exit 1; }
+
 # m7a #9: régime-cost benchmark. Trivial-clause Counter.tick() loop
 # vs a C-direct call with the same side effect. Threshold 5× ns/op
 # (Doc C §*Open questions* #6). Compiled at -O2 to match how kaikai
@@ -1475,7 +1486,7 @@ test-aspirational: $(TARGET) build
 	    || { echo "aspirational DIFF $$name (LLVM)"; diff $$exp build/asp-$$name-llvm.out; exit 1; }; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
