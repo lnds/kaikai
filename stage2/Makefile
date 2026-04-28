@@ -1160,6 +1160,20 @@ test-effects: $(TARGET) build
 	  done < $$exp_err; \
 	  echo "effects OK $$name (Fiber escape rejected with diagnostic)"; \
 	done; \
+	for f in ../examples/effects/m8x_6_fiber_in_result.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_err=../examples/effects/$$name.err.expected; \
+	  rc=0; ./$(TARGET) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
+	  fi; \
+	  while read -r line; do \
+	    grep -qF "$$line" build/s2-$$name.err \
+	      || { echo "effects FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/s2-$$name.err; exit 1; }; \
+	  done < $$exp_err; \
+	  echo "effects OK $$name (Fiber escape detected through Result type-arg)"; \
+	done; \
 	for f in ../examples/effects/m8_7_actor_self_send.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
