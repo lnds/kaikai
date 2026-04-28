@@ -199,18 +199,23 @@ tuple) can re-land — currently m4c #1/#2 ship only an identity pass.
 Order of operations: lands when m4c real specialisation is back on
 the critical path, which is post-stage-1-perceus.
 
-### 4. LLVM emit mirror of m5 #3 *(PENDING)*
+### 4. LLVM emit mirror of m5 #3 *(LANDED 2026-04-28)*
 
-`llvm_emit_stmt` does not insert the `kai_decref` drops that m5 #3
-adds for unused let-bindings whose RHS is a fresh allocation. Programs
-compiled with `--emit=llvm` therefore do not benefit from the
-unused-let-drop pass; the C backend gets the optimisation, the LLVM
-backend stays loose.
+Mirrors the m5 #3 C-emitter pass into the stage 2 LLVM emitter.
+`llvm_emit_block` now computes the per-block drop set via the same
+`block_unused_lets` walker the C-emitter uses, and routes statements
+through `llvm_emit_stmts_with_drops` / `llvm_emit_stmt_with_drops`.
+For `SLet PBind`, when the bound name appears in the drop set, the
+emitter appends `call void @kaix_decref(%KaiValue* <reg>)` after the
+binding. For `SLet PWild` whose RHS is a fresh allocation, the same
+decref is emitted unconditionally, matching the C path. A new
+`kaix_decref` runtime wrapper in `runtime_llvm.c` exposes
+`kai_decref` to the LLVM backend.
 
-**Cost**: ~½ day. Mechanical mirror of the stage 2 C-emitter changes
-in m5 #3 into the LLVM emitter.
-
-Order of operations: anytime — independent of the stage-1 path.
+Selfhost C + LLVM byte-identical, `make test` clean,
+`make demos-no-regression` 20 passing (baseline 18). Stage 2's own
+self-emit (`kaic2 --emit=llvm stage2/compiler.kai`) now contains 11
+`kaix_decref` call sites, confirming the pass is active.
 
 ### 5. Full Perceus (post-m5 milestone)
 
