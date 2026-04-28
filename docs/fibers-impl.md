@@ -342,17 +342,39 @@ R2 lands across five phases. Each phase is its own commit (or a
 small set), gates with `make selfhost` + `make test`, and merges
 via PR (per the policy established by R1 PR #1).
 
-| Phase | Scope | Adds | Demo gate |
-|-------|-------|------|-----------|
-| Phase 2 | Scheduler core | `KaiFiber.ctx`, run-queue primitives, 5 Spawn handler rewrites, this doc | `examples/effects/m8x_2_yield_interleave.kai` (interleave golden) |
-| Phase 3 | Cancel delivery | yield-point hook in `kai_evidence_lookup_node`, setjmp landing in trampoline | `examples/effects/m8x_3_cancel_at_yield.kai` |
-| Phase 4 | Blocking primitives | mailbox waiter queues, `Actor.receive` parking, `BlockSender` parking | `examples/aspirational/ping_pong.kai` (full ping-pong) |
-| Phase 5 | Link/Monitor | per-fiber linked-set + monitor-set, EvLink/EvMonitor + default handlers | `examples/aspirational/supervised_pool.kai` |
-| Phase 6 (deferred) | Region-brand | `TyBranded` + brand-mint + escape check (typer-only) | regression test only |
+| Phase | Status | Scope | Demo gate |
+|-------|--------|-------|-----------|
+| Phase 2 | ✅ landed | Scheduler core (KaiFiber.ctx, run-queue, 5 Spawn handler rewrites, this doc) | `examples/effects/m8x_2_yield_interleave.kai` |
+| Phase 3 | ✅ landed | Cancel delivery (yield-point hook in `kai_evidence_lookup_node`, setjmp landing in trampoline) | `examples/effects/m8x_3_cancel_at_yield.kai` |
+| Phase 4 | ✅ landed | Blocking primitives (mailbox waiter queues, `Actor.receive` parking, `BlockSender` parking) | `examples/effects/m8x_4_recv_blocking.kai` + `m8x_4_block_sender.kai` |
+| Phase 5 | ✅ landed (Link only) | Link runtime registry: KaiMailbox.owner_fiber, KaiFiber.linked_head, EvLink + default handler, trampoline propagation | `stage2/tests/link_runtime_test.c` (C-level) |
+| Phase 6 | ✅ landed (v1) | Region-brand shallow check: `is_fiber_producer_helper` allow-list + `ty_expr_contains_fiber` recursive walk | `examples/effects/m8x_6_fiber_in_result.kai` |
 
-Phase 6 is deferred to post-Production-honest 1.0; the shallow check
-in `is_fiber_producer_helper` (`stage2/compiler.kai:18246`) is
-sufficient for v1 demos.
+**Phase 5 v1 caveats**: ships LINK only. Monitor stays a type-only
+declaration — its kaikai-level demo needs `spawn_actor` (m8.x #6) or
+custom message types carrying Pid, neither of which are in v1. Trap-
+exit semantics (BEAM "crash propagates, normal exit doesn't")
+collapsed in v1 to "any termination propagates"; the distinction is
+queued for post-MVP.
+
+**Phase 6 v1 caveats**: the shallow check in
+`is_fiber_producer_helper` + `ty_expr_contains_fiber` rejects
+`Fiber[T]` in any user-fn return-type position the walker reaches
+(direct, `[Fiber[_]]`, function-type return, `Result[_, Fiber[_]]`,
+etc.). It does NOT track:
+
+- Branding through let-bindings, pattern matches, list literals, or
+  record fields whose types don't lexically mention `Fiber` (e.g.
+  `type Boxed = Wrapper(Fiber[Int])` — the return type `Boxed`
+  hides Fiber from the walker).
+- `Pid[Msg]` escape (the same brand machinery would apply per
+  `docs/structured-concurrency.md` §*Type system*; v1 only checks
+  Fiber).
+
+The full `TyBranded(Ty, BrandId)` machinery — extending the
+inferencer to mint brands at handler-installation sites and tracking
+them through every binding form — is queued for post-Production-
+honest 1.0. See `docs/m8x-followup.md` item 6 for the inventory.
 
 ## Out of scope for v1
 
