@@ -12,11 +12,34 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 ### Added
 
 - Versioning infrastructure: `VERSION` file at repo root, this `CHANGELOG.md`,
-  retroactive git tags `v0.1.0` / `v0.1.1` / `v0.1.2` / `v0.1.3` and the
-  current `v0.2.0`. The compiler's `--version` flag still reports the legacy
-  `kaic2 stage 2 (self-hosted)` string; updating it to read `VERSION` is
-  deferred to a follow-up commit that can re-validate the selfhost fixed
-  point.
+  retroactive git tags `v0.1.0` / `v0.1.1` / `v0.1.2` / `v0.1.3` / `v0.2.0`
+  and the current `v0.2.1`. The compiler's `--version` flag still reports
+  the legacy `kaic2 stage 2 (self-hosted)` string; updating it to read
+  `VERSION` is deferred to a follow-up commit that can re-validate the
+  selfhost fixed point.
+
+## [0.2.1] — 2026-04-28 (m5.x #3 LLVM emit mirror — backend parity)
+
+### Added
+
+- **m5.x #3 LLVM emit mirror** (`3018d2d`, PR #2): `--emit=llvm` now drops
+  let-bindings whose RHS is a fresh allocation when last-use analysis
+  shows the binding is unused, restoring backend parity for the m5 #3
+  optimisation that the C-emitter has carried since pre-Core.
+  - `llvm_emit_block` computes the per-block drop set with the same
+    `block_unused_lets` walker the C-emitter uses; statements route
+    through new `llvm_emit_stmts_with_drops` / `llvm_emit_stmt_with_drops`
+    variants.
+  - `PBind` in the drop set appends `call void @kaix_decref(...)` after
+    the binding; `PWild` with a fresh-alloc RHS does the same.
+  - New `kaix_decref` runtime wrapper in `stage0/runtime_llvm.c` exposes
+    `kai_decref` to the LLVM backend.
+  - `kaic2 --emit=llvm stage2/compiler.kai` produces 11 `kaix_decref`
+    call sites — confirms the pass is active.
+
+### Closed
+
+- m5.x followup §4 ("LLVM emit mirror of m5 #3") — was PENDING, now LANDED.
 
 ## [0.2.0] — 2026-04-28 (R1 Phase 3 — runtime flip)
 
@@ -196,7 +219,8 @@ is closed:
    `try_rewrite_show_dim_real` shortcut in m12.8 Phase 2 confirms it;
    polymorphics with `EHandle` in the body collide on `clause_fn_name`.
 
-[Unreleased]: https://github.com/lnds/kaikai/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/lnds/kaikai/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/lnds/kaikai/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lnds/kaikai/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/lnds/kaikai/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/lnds/kaikai/compare/v0.1.1...v0.1.2
