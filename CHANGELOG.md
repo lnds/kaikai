@@ -13,10 +13,38 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 - Versioning infrastructure: `VERSION` file at repo root, this `CHANGELOG.md`,
   retroactive git tags `v0.1.0` / `v0.1.1` / `v0.1.2` / `v0.1.3` / `v0.2.0`
-  and the current `v0.2.1`. The compiler's `--version` flag still reports
-  the legacy `kaic2 stage 2 (self-hosted)` string; updating it to read
-  `VERSION` is deferred to a follow-up commit that can re-validate the
-  selfhost fixed point.
+  / `v0.2.1` and the current `v0.2.2`. The compiler's own `kaic2 --version`
+  flag still reports the legacy `kaic2 stage 2 (self-hosted)` string; the
+  `bin/kai --version` wrapper now reads VERSION dynamically (v0.2.2).
+
+## [0.2.2] — 2026-04-28 (CLI polish — logo, dynamic version, RC trace fix)
+
+### Added
+
+- **ASCII logo** on `bin/kai` (no args) and `bin/kai help` (`54435b5`,
+  PR #4): figlet "small" rendering of "kaikai" with tagline (version
+  + "a functional language" + "effects | fibers | protocols") inline:
+  ```
+   _      _ _      _
+  | |____(_) |____(_)    kaikai 0.2.2
+  | / / _` | / / _` |    a functional language
+  |_\_\__,_|_\_\__,_|    effects | fibers | protocols
+  ```
+
+### Changed
+
+- `bin/kai --version` and `-V` now read the `VERSION` file dynamically
+  (was hardcoded `"kai 0.2.0 (stage 2, Core language)"` and had drifted
+  after the SemVer bump). Falls back to `unknown` if `VERSION` is
+  missing.
+
+### Fixed
+
+- `bin/kai` no longer double-fires `KAI_TRACE_RC` reports. Prefix
+  `KAI_TRACE_RC=` to the `"$KAIC2"` invocation in `compile_to_binary`
+  so only the user's compiled program emits its RC trace, not kaic2
+  itself. Closes the m5 #0 follow-up "Per-process double KAI_TRACE_RC
+  report when run via bin/kai".
 
 ## [0.2.1] — 2026-04-28 (m5.x #3 LLVM emit mirror — backend parity)
 
@@ -219,7 +247,8 @@ is closed:
    `try_rewrite_show_dim_real` shortcut in m12.8 Phase 2 confirms it;
    polymorphics with `EHandle` in the body collide on `clause_fn_name`.
 
-[Unreleased]: https://github.com/lnds/kaikai/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/lnds/kaikai/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/lnds/kaikai/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/lnds/kaikai/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lnds/kaikai/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/lnds/kaikai/compare/v0.1.2...v0.1.3
