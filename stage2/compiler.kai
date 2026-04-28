@@ -3480,7 +3480,13 @@ fn parse_arm(p: Parser) : PArm {
   match rp.r {
     None -> err_a(rp.p)
     Some(pat) -> {
-      let p1 = p_skip_newlines(rp.p)
+      # m12.6.x #3: optional refinement-narrowing `: Type where ...`
+      # after a binding pattern. Lowers to a guard that evaluates the
+      # refinement's predicate with `self` bound to the name. Only
+      # PBind patterns participate; other shapes ignore the suffix.
+      let p_after_ty = p_skip_newlines(rp.p)
+      let nr = parse_optional_arm_refine(p_after_ty, pat)
+      let p1 = p_skip_newlines(nr.p)
       # Optional guard: `if expr`. Same discipline as `parse_if` /
       # `parse_match`: the guard expression cannot eat the `->` (or
       # an arm body's `{`) by extending into a trailing lambda. Off
@@ -3498,12 +3504,69 @@ fn parse_arm(p: Parser) : PArm {
         } else {
           PExpr { p: p1, r: None }
         }
+      let combined_guard = combine_guards(nr.guard, guard_opt_r.r)
       match guard_opt_r.r {
         None -> if guard_opt_r.p.had_error { err_a(guard_opt_r.p) } else {
-          parse_arm_body(guard_opt_r.p, pat, None)
+          parse_arm_body(guard_opt_r.p, pat, combined_guard)
         }
-        Some(_) -> parse_arm_body(guard_opt_r.p, pat, guard_opt_r.r)
+        Some(_) -> parse_arm_body(guard_opt_r.p, pat, combined_guard)
       }
+    }
+  }
+}
+
+# m12.6.x #3 result: parser state after consuming an optional `: Type`
+# refinement-narrowing suffix on a match arm pattern. `guard` holds
+# the synthesised predicate (or None when no suffix was present).
+type ArmRefine = { p: Parser, guard: Option[Expr] }
+
+fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine {
+  if not p_at(p, TkColon) { ArmRefine { p: p, guard: None } }
+  else { match pat.pkind {
+    PBind(name) -> {
+      let p1 = p_skip_newlines(p_advance(p))
+      let rt = parse_type(p1)
+      match rt.r {
+        None -> ArmRefine { p: rt.p, guard: None }
+        Some(ty) -> match ty.tkind {
+          TyRefine(_, pred) -> {
+            # Lower to `{ let self = <name>; pred }`. The let binding
+            # makes the user-side `self` reference inside the predicate
+            # resolve to the bound match variable. Same desugar as
+            # `ensure(value) where pred` (m12.6.e).
+            let var_e = mk_expr(EVar(name), pat.line, pat.col)
+            let self_let = SLet(mk_pat(PBind("self"), pat.line, pat.col),
+                                None, var_e)
+            let block = mk_expr(EBlock([self_let], Some(pred)),
+                                 pat.line, pat.col)
+            ArmRefine { p: rt.p, guard: Some(block) }
+          }
+          _ -> ArmRefine {
+            p: p_error(rt.p, p_peek(p),
+                       "match-arm narrowing `: Type` requires a refinement type (`Int where ...`)"),
+            guard: None
+          }
+        }
+      }
+    }
+    _ -> ArmRefine {
+      p: p_error(p, p_peek(p),
+                 "match-arm narrowing `: Type` only applies to a binding pattern (a bare name)"),
+      guard: None
+    }
+  } }
+}
+
+# m12.6.x #3: combine two optional guards with `and`. When either
+# side is None, return the other; when both are present, build
+# `narrow_guard and user_guard` so a violated refinement
+# short-circuits before the user predicate runs.
+fn combine_guards(narrow: Option[Expr], user: Option[Expr]) : Option[Expr] {
+  match narrow {
+    None -> user
+    Some(n) -> match user {
+      None -> Some(n)
+      Some(u) -> Some(mk_expr(EBinop("and", n, u), n.line, n.col))
     }
   }
 }
