@@ -469,16 +469,18 @@ in.
     Fintech toolkit (`Money<USD>` ≠ `Money<EUR>` as a compile
     error). Possibly brought forward if Money/Decimal becomes a
     priority. Full design in `docs/units-of-measure.md`.
-12.6. **m12.6 — Refinements + Contracts**: Pony/Ada-style
-    refinement types lite (`Int where >= 0`, `String where
-    matches /.../`) + Eiffel/Ada 2012-style `requires` /
-    `ensures` clauses on functions. Decidable subset, no SMT;
-    static proof where reducible to interval propagation +
-    regex subsumption, runtime checks otherwise. Closes the
-    third leg of the audit-trail-compile-time pitch (effects +
-    refinements + contracts). Composes with m12.5 (UoM): a
-    single field can carry both `Decimal<USD>` and `where >= 0`.
-    Independent of effects/fibers. Full design in
+12.6. **m12.6 — Refinements + Contracts** *(parser-side landed
+    2026-04-27, sub-lanes a–e; see the "Recommended ordering"
+    section §7 for what shipped and what remains deferred)*.
+    Pony/Ada-style refinement types lite (`Int where >= 0`,
+    `String where matches /.../`) + Eiffel/Ada 2012-style
+    `requires` / `ensures` clauses on functions. Decidable
+    subset, no SMT; static proof where reducible to interval
+    propagation + regex subsumption, runtime checks otherwise.
+    Closes the third leg of the audit-trail-compile-time pitch
+    (effects + refinements + contracts). Composes with m12.5
+    (UoM): a single field can carry both `Decimal<USD>` and
+    `where >= 0`. Independent of effects/fibers. Full design in
     `docs/refinements-and-contracts.md`.
 12.7. **m12.7 — Bootstrap helpers**: `axiom name : T` from
     `docs/proposed-extensions.md` §4 — postulate a typed symbol
@@ -611,7 +613,9 @@ Rationale:
    error) and it sits cleanly on a self-hosted stage 2.
    Candidate to bring forward if Money/Decimal becomes a priority
    before m12. Full design in `docs/units-of-measure.md`.
-7. **m12.6 (refinements + contracts)** — refinement types lite
+7. **m12.6 (refinements + contracts)** *(landed parser-side
+   2026-04-27 — see m12.6.a–e below for what shipped, and the
+   "deferred" list for what remains)*. Refinement types lite
    (`Int where >= 0`, regex predicates) + Eiffel-style `requires`
    / `ensures` on functions, decidable subset (no SMT). Lands
    right after m12.5 because the two share most of the typer
@@ -620,6 +624,59 @@ Rationale:
    the audit-trail-compile-time pitch with refinements +
    contracts as the third leg next to effects in types. Full
    design in `docs/refinements-and-contracts.md`.
+
+   Sub-lanes shipped:
+   - **m12.6.a** — `TyKind | TyRefine(TypeExpr, Expr)` AST + parser
+     for `BaseT where Pred`. The leading-comparator form
+     (`where >= 0` desugars to `where self >= 0`) lands at parse
+     time. `resolve_ty` drops the refinement so the semantic type
+     is unaffected; walker arms in 11 functions over `TyKind` keep
+     the refinement transparent for display, alias expansion, fiber
+     detection, implicit-tparam collection, protocol dispatch, and
+     `Self` substitution.
+   - **m12.6.b** — `TkRequires` / `TkEnsures` keywords +
+     `parse_contracts_loop` in `parse_fn_decl`. Each clause is a
+     single `Expr` (terminating naturally at the next clause / `=`
+     / `{`); both lists desugar to asserts that wrap the body. A
+     violated precondition aborts before the body runs; runtime
+     check is `kai_assert_check` from the existing assert path.
+   - **m12.6.c** — `let result = body` shape, so `ensures result
+     > x` and friends work end-to-end. The `mk_pat(...)` argument
+     is constructed inline at the SLet call site to dodge a kaic1
+     codegen quirk where a local Pattern binding inside a nested
+     if/else gets emitted as a closure thunk; selfhost masks the
+     bug because compiler.kai itself never invokes this branch.
+   - **m12.6.d** — Constant folding over contract predicates. The
+     `try_eval_pred` / `try_eval_int` evaluator covers Bool / Int
+     literals, the boolean operators (`and`/`or`/`not`), Int
+     comparisons, and Int arithmetic between literals. Trivially-
+     true predicates are dropped at parse time (zero runtime cost).
+     False-evaluating predicates still emit the assert (the runtime
+     panic remains the diagnostic; promoting to compile-time error
+     is a follow-up).
+   - **m12.6.e** — `ensure(value) where pred` primary expression
+     desugars to `{ let self = value; if pred { Some(self) } else
+     { None } }`, returning `Option[T]` for explicit narrowing.
+     Recognised only when `ensure(...)` is followed by `where`, so
+     user-defined `ensure` functions are unaffected.
+
+   Deferred from the original m12.6 plan:
+   - **m12.6.f** (UoM composition + match-arm narrowing `p :
+     RefinedT`) — requires reintroducing `TyRefineT` on the
+     semantic side so unify can carry the predicate through call
+     sites. Postponed until a use case demands it.
+   - **m12.6.g** (`[<refinement-pure>]` stdlib annotations) —
+     decorative without an enforcement pass; deferred until the
+     predicate-validation pass (which would also reject calls to
+     non-refinement-pure user fns) lands.
+   - **Static interval propagation through refined args** — the
+     m12.6.d folder only evaluates closed predicates. Propagating
+     refinements (`requires x > 0` ⇒ `x > 0` known statically at
+     the call site when the caller passes a literal) requires the
+     `TyRefineT` semantic threading from m12.6.f.
+   - **Compile-time errors for `assert false`** — the const folder
+     detects them but emits the runtime assert anyway; promoting
+     to a compile-time diagnostic is one extra error sink.
 7.5. **m12.7 (bootstrap helpers)** — `axiom name : T`. Optional,
    ~0.5 day. Useful for stubbing intrinsics and FFI declarations
    while their real definitions land. Lands here because m12

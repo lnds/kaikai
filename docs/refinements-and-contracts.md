@@ -640,6 +640,72 @@ Recommendation: schedule formally as m12.6 in
 joint m12.5+m12.6 pre-flight if the C2-pre fintech demo wants
 both UoM and refinements together.
 
+## Implementation status — 2026-04-27
+
+**Parser-side landed (sub-lanes a–e).** `BaseT where Pred`,
+`requires` / `ensures` clauses, the `result` binding, parse-time
+constant folding, and the `ensure(value) where pred` primary
+expression all ship in `stage2/compiler.kai`. The factorials and
+collatz demos use them; both flip from PASS-no-golden to OK on
+`make demos-no-regression`.
+
+What this means in practice for code today:
+
+- `type Port = Int where 1 <= self and self <= 65535` parses
+  and the predicate is preserved on the syntactic TypeExpr. The
+  semantic type drops to `Int` (so `Port` is a nominal alias of
+  `Int`, no implicit narrowing), but everything that walks
+  TyKind treats `TyRefine(base, _)` as transparent — display,
+  protocol dispatch, alias expansion, etc.
+- `requires P` and `ensures Q` on a fn signature lower to
+  asserts that wrap the body. The current shape (m12.6.b/c):
+    fn foo(x: T) : R requires P ensures Q = body
+  desugars to
+    fn foo(x: T) : R = {
+      assert P
+      let result = body
+      assert Q
+      result
+    }
+  so `result` is a real local binding inside `ensures`. Ordering
+  — all `requires` first, then the body bind, then all `ensures`
+  — matches the spec.
+- The const folder of m12.6.d evaluates closed boolean / Int
+  expressions and drops trivially-true predicates at parse time
+  (zero runtime cost). Predicates that mention runtime values
+  (function args, `result` after the bind) stay as runtime
+  asserts.
+- `ensure(v) where Pred` returns `Option[T]`: `Some(v)` when the
+  predicate holds, `None` otherwise. Recognised only when the
+  call is followed by `where`, so user code that defines a
+  function called `ensure` keeps working.
+
+What is **not** done yet (deferred from the original plan):
+
+- **Refinement-aware unify / `TyRefineT` semantic type.** The
+  semantic side still drops the predicate, so `Int where >= 0`
+  unifies as `Int` and the typer cannot reason about the
+  refinement. This blocks (a) static interval propagation
+  through refined arguments, (b) implicit upcast `Int where >= 0`
+  ⊑ `Int`, (c) match-arm narrowing `p : RefinedT`, and (d)
+  composition with UoM at the semantic level.
+- **`[<refinement-pure>]` stdlib annotations.** The attribute is
+  spec'd but not parsed yet because there is no enforcement pass
+  to rule against impure calls in predicates.
+- **Compile-time errors for trivially-false predicates.** The
+  const folder sees `assert false` but emits the runtime assert
+  anyway; promoting to a compile-time diagnostic is a future pass.
+- **Regex predicates** (`String where matches /.../`). The grammar
+  accepts arbitrary Expr in the `where` clause, so a regex literal
+  is rejected by the standard expression parser. Adding regex
+  literals is a separate feature.
+
+The honest one-line summary: kaikai now has the **syntax** and the
+**runtime semantics** of refinements + contracts. The **type-level
+reasoning** (interval propagation, subtyping, narrowing) is the
+piece that remains, and it requires reintroducing the refinement on
+the semantic Ty side.
+
 ## Sources
 
 - [Design by Contract — Bertrand Meyer 1986](https://se.inf.ethz.ch/~meyer/publications/computer/contract.pdf)
