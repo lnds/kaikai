@@ -38,7 +38,7 @@ type TokKind
   = TkEof
   | TkNewline
   # keywords (alphabetical)
-  | TkAnd | TkAs | TkAssert | TkEffect | TkElse | TkFalse | TkFn | TkFor
+  | TkAnd | TkAs | TkAssert | TkAxiom | TkEffect | TkElse | TkFalse | TkFn | TkFor
   | TkHandle | TkIf | TkImpl | TkImport
   | TkLet | TkMatch | TkNot | TkOr | TkProtocol | TkPub | TkTest | TkTrue | TkType
   | TkUnitKw | TkUse | TkVar | TkWith
@@ -89,7 +89,7 @@ fn tk_name(k: TokKind) : String {
   match k {
     TkEof -> "EOF"
     TkNewline -> "NEWLINE"
-    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkEffect -> "effect" TkElse -> "else"
+    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkAxiom -> "axiom" TkEffect -> "effect" TkElse -> "else"
     TkFalse -> "false" TkFn -> "fn" TkFor -> "for" TkHandle -> "handle"
     TkIf -> "if" TkImpl -> "impl" TkImport -> "import"
     TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
@@ -241,6 +241,7 @@ fn keyword_kind(text: String) : TokKind {
   if text == "and" { TkAnd }
   else if text == "as" { TkAs }
   else if text == "assert" { TkAssert }
+  else if text == "axiom" { TkAxiom }   # m12.7
   else if text == "effect" { TkEffect }
   else if text == "else" { TkElse }
   else if text == "false" { TkFalse }
@@ -1207,6 +1208,16 @@ type Decl
   # `use` does NOT remove the cap from the row — the effect still
   # appears in any caller's row annotation.
   | DUse(String, Int, Int)
+  # m12.7: `axiom name[tparams](params) : T / row` — postulate a
+  # typed symbol with no body. Useful for FFI declarations,
+  # architectural placeholders, and selfhost scaffolding while a
+  # real definition is pending. Calling an axiom at runtime aborts
+  # via the same `todo!` trap (m7d §1) the lower pass synthesises:
+  # "any type fits" at inference, `kai_prelude_panic` at runtime.
+  # `lower_axioms` rewrites every DAxiom to a DFn with the panic
+  # body BEFORE any other Decl walker runs, so downstream passes
+  # only see DFn. Doc: `docs/proposed-extensions.md` §4.
+  | DAxiom(Bool, String, [String], [Param], TypeExpr, RowExpr, Int, Int)
 
 # m12.8: a single operation declared inside a `protocol P { ... }`
 # block. Mirrors EffectOp's shape (no body, with optional generic
@@ -1341,6 +1352,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkAnd        -> match b { TkAnd -> true _ -> false }
     TkAs         -> match b { TkAs -> true _ -> false }
     TkAssert     -> match b { TkAssert -> true _ -> false }
+    TkAxiom      -> match b { TkAxiom -> true _ -> false }
     TkEffect     -> match b { TkEffect -> true _ -> false }
     TkElse       -> match b { TkElse -> true _ -> false }
     TkFalse      -> match b { TkFalse -> true _ -> false }
@@ -3913,16 +3925,75 @@ fn parse_decl(p: Parser) : PDecl {
   } else if tk_is(hd.kind, TkUse) {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a `use` declaration")) }
     else { parse_use_decl(p_advance(p1), hd) }
+  } else if tk_is(hd.kind, TkAxiom) {
+    parse_axiom_decl(p_advance(p1), is_pub, hd)
   } else {
-    let base = "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, `unit`, `use`, or `import`"
+    let base = "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, `unit`, `use`, `axiom`, or `import`"
     let msg = if tk_is(hd.kind, TkIdent) {
       let text = tok_source(p1.src, hd)
-      match closest_name(text, ["fn", "type", "effect", "protocol", "impl", "test", "unit", "use", "import", "pub"]) {
+      match closest_name(text, ["fn", "type", "effect", "protocol", "impl", "test", "unit", "use", "axiom", "import", "pub"]) {
         Some(sug) -> concat_all([base, " (did you mean `", sug, "`?)"])
         None      -> base
       }
     } else { base }
     err_d(p_error(p1, hd, msg))
+  }
+}
+
+# m12.7: parse `axiom name[tparams](params) : T / row`. Mirrors
+# `parse_fn_decl`'s prologue (name + tparams + params) but the
+# return type is REQUIRED (no default `Unit`) and there is no body
+# clause — `=` or `{` after the row annotation is rejected. The
+# Decl carries everything `lower_axioms` needs to synthesise a
+# `todo!` body in the desugar pass.
+fn parse_axiom_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) {
+    err_d(p_error(p, id, "expected axiom name"))
+  } else {
+    let name = tok_source(p.src, id)
+    let p1 = p_advance(p)
+    let tparams_r =
+      if p_at(p1, TkLbracket) {
+        parse_type_params_loop(p_skip_newlines(p_advance(p1)), [])
+      } else {
+        PTParams { p: p1, r: Some([]) }
+      }
+    match tparams_r.r {
+      None -> err_d(tparams_r.p)
+      Some(tparams) -> {
+        let pp = tparams_r.p
+        if not p_at(pp, TkLparen) {
+          err_d(p_error_here(pp, "expected `(` after axiom name"))
+        } else {
+          let p2 = p_skip_newlines(p_advance(pp))
+          let params_r = parse_fn_params(p2, [])
+          match params_r.r {
+            None -> err_d(params_r.p)
+            Some(params) -> {
+              let p3 = p_skip_newlines(params_r.p)
+              if not p_at(p3, TkColon) {
+                err_d(p_error_here(p3, "axiom requires a return type — write `axiom name(...) : T`"))
+              } else {
+                let rt = parse_type(p_advance(p3))
+                match rt.r {
+                  None -> err_d(rt.p)
+                  Some(ty) -> {
+                    let row_r = parse_row_suffix(rt.p)
+                    let p4 = p_skip_newlines(row_r.p)
+                    if p_at(p4, TkEq) or p_at(p4, TkLbrace) {
+                      err_d(p_error_here(p4, "axiom must not have a body — drop the `=` / `{` and trailing block"))
+                    } else {
+                      ok_d(row_r.p, DAxiom(is_pub, name, tparams, params, ty, row_r.r, t.line, t.col))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }
 
@@ -5220,6 +5291,14 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
       dump_row_expr(row, depth + 1)
       dump_expr(body, depth + 1)
     }
+    DAxiom(is_pub, name, tparams, params, ret_ty, row, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      emit_line(depth, "axiom #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
+      params |> each((pm) => dump_param(pm, depth + 1))
+      dump_type(ret_ty, depth + 1)
+      dump_row_expr(row, depth + 1)
+    }
     DType(is_pub, name, tparams, body, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       emit_line(depth, "type #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -5762,6 +5841,7 @@ fn chk_decl(e: Env, d: Decl) : Env {
     DDerive(_, _, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit declarations introduce no value bindings
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before chk runs
+    DAxiom(_, _, _, _, _, _, _, _) -> e     # m12.7: rewritten to DFn by lower_axioms before chk runs
   }
 }
 
@@ -5801,6 +5881,7 @@ fn register_one(e: Env, d: Decl) : Env {
     DDerive(_, _, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit names live in their own namespace, validated at type-resolve time
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before register_one runs
+    DAxiom(_, name, _, _, _, _, _, _) -> env_add(e, name)  # m12.7: also rewritten to DFn by lower_axioms; case kept for completeness
   }
 }
 
@@ -7426,6 +7507,7 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
     DDerive(_, _, _, _) -> st
     DUnit(_, _, _, _, _) -> st               # m12.5: no expressions in a unit decl
     DUse(_, _, _) -> st                       # m7e §25: stripped by desugar_use_decls; no expressions
+    DAxiom(_, _, _, _, _, _, _, _) -> st     # m12.7: rewritten to DFn by lower_axioms; no expressions on the bare form
   }
 }
 
@@ -9304,6 +9386,26 @@ fn desugar_index_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
 # a second `var` inside the rest produces a second handler nested
 # inside the first.
 
+# m12.7: rewrite every `axiom name(params) : T / row` into a regular
+# `fn name(params) : T / row = todo!("axiom <name> not bound")`. The
+# `todo!` (m7d §1) body inherits "any type fits" inference and a
+# runtime `kai_prelude_panic`, matching the §4 spec ("by default,
+# calling an axiom at runtime aborts via `kai_prelude_panic`"). The
+# typer / monomorphiser / emitter therefore see only ordinary fns
+# and need no DAxiom-specific handling.
+fn lower_axioms(ds: [Decl]) : [Decl] = map(ds, lower_axiom_one)
+
+fn lower_axiom_one(d: Decl) : Decl {
+  match d {
+    DAxiom(is_pub, name, tparams, params, ret_ty, row, l, c) -> {
+      let msg = string_concat("axiom ", string_concat(name, " not bound"))
+      let body = mk_expr(ETodo(msg), l, c)
+      DFn(is_pub, name, tparams, params, Some(ret_ty), row, body, l, c)
+    }
+    _ -> d
+  }
+}
+
 fn desugar_var_decls(ds: [Decl]) : [Decl] = map(ds, desugar_var_decl)
 
 fn desugar_var_decl(d: Decl) : Decl {
@@ -11076,6 +11178,14 @@ fn sig_of_decl(d: Decl) : Option[Ty] {
       }
       Some(TyFnT(pts, ret, row_of_expr(rexpr)))
     }
+    # m12.7: axiom signature has the same shape as a fn — params,
+    # return type, row. The body's row is replaced by the declared
+    # row directly (no body to read row_of_expr from).
+    DAxiom(_, _, _, params, ret_ty, row, _, _) -> {
+      let pts = map(params, param_ty)
+      let ret = resolve_ty(ret_ty)
+      Some(TyFnT(pts, ret, row_of_expr(row)))
+    }
     _ -> None
   }
 }
@@ -11272,6 +11382,13 @@ fn dump_decl_type(d: Decl) : Unit / Console {
     }
     DUse(name, line, col) ->
       print("use #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+    DAxiom(is_pub, name, _, _, _, _, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      match sig_of_decl(d) {
+        Some(ty) -> print("#{pub_s}axiom #{name} : #{ty_to_string(ty)} @#{int_to_string(line)}:#{int_to_string(col)}")
+        None -> print("#{pub_s}axiom #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+      }
+    }
   }
 }
 
@@ -16429,6 +16546,10 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     # m7e §25: DUse has no TypeExpr to expand; pass through. The
     # desugar_use_decls pass handles it later.
     DUse(_, _, _) -> d
+    # m12.7: DAxiom is rewritten to DFn by lower_axioms before this
+    # pass; the case is kept for completeness when expand_aliases_decl
+    # is invoked on a pre-lowering decl stream (e.g., via --ast).
+    DAxiom(_, _, _, _, _, _, _, _) -> d
   }
 }
 
@@ -24185,7 +24306,12 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                                                          search_paths)
             let own_decls_no_holes = strip_import_holes(own_decls, [])
             let expanded = expand_imports(path, search_paths, own_decls_no_holes)
-            let merged = list_append(prelude_decls, expanded)
+            let merged_raw = list_append(prelude_decls, expanded)
+            # m12.7: lower DAxiom → DFn(body=todo!) before any other
+            # Decl walker runs. Subsequent passes (alias resolution,
+            # builtin injection, desugars, typer) see only ordinary
+            # fns and never need to handle the DAxiom variant.
+            let merged = lower_axioms(merged_raw)
             # m7b #1b + m12.8 Phase 4b — closed effect aliases. Resolve
             # every `type Foo = Eff1 + Eff2 + ...` (and `type Foo = Eff`
             # single-name form) into a flat label set and rewrite every
