@@ -21758,15 +21758,64 @@ fn lookup_op_offset(table: [OpOffset], key: String) : Option[Int] {
 # reported. A → B → A still works — the second visit to A is a
 # no-op.
 
-type ResolveState = { visited: [String], decls: [Decl] }
+# m6.2: ModuleEntry records the surface name a user wrote on an
+# `import` line, the public names that file exports, and the
+# absolute path the file was loaded from. The resolver collects one
+# per import in expand_imports; later passes (Phase 2.3 onward) use
+# the table to disambiguate `mod.fn` qualified calls from
+# record-field projections.
+#
+# `name` is the surface form: the last segment of `IkPath("a.b.c")`
+# (=> `c`), the alias from `IkAlias`, or the last segment of
+# `IkSelective`. `exports` is the list of pub fn / pub type / pub
+# effect / pub protocol names declared in the imported file's
+# top-level (non-import) decls. Selective imports do NOT pre-filter
+# this list — concat semantics (M6.1) still bring every public decl
+# into the unqualified scope, so the qualified surface mirrors that
+# for now. Phase 2.3 / m6.2.v2 may revisit.
+type ModuleEntry = ME(String, [String], String)
+#                     ^name  ^exports  ^origin
+
+type ResolveState = { visited: [String], decls: [Decl], modules: [ModuleEntry] }
 
 fn rs_has(rs: ResolveState, p: String) : Bool = list_has(rs.visited, p)
 
 fn rs_mark(rs: ResolveState, p: String) : ResolveState =
-  ResolveState { visited: [p, ...rs.visited], decls: rs.decls }
+  ResolveState { visited: [p, ...rs.visited], decls: rs.decls, modules: rs.modules }
 
 fn rs_append_decls(rs: ResolveState, ds: [Decl]) : ResolveState =
-  ResolveState { visited: rs.visited, decls: list_append(rs.decls, ds) }
+  ResolveState { visited: rs.visited, decls: list_append(rs.decls, ds), modules: rs.modules }
+
+fn rs_add_module(rs: ResolveState, entry: ModuleEntry) : ResolveState =
+  ResolveState { visited: rs.visited, decls: rs.decls, modules: list_append(rs.modules, [entry]) }
+
+# Extract the public-facing names declared at the top of a module
+# file. Looks at pub fn / pub type / pub effect / pub protocol /
+# pub axiom / pub use? Currently: pub fn, pub type, pub effect,
+# pub protocol, pub axiom (which lower_axioms turns into pub fn
+# later, but at this point we still see them as DAxiom). Private
+# (non-pub) decls are intentionally excluded — they cannot be
+# called via qualified syntax from outside.
+fn collect_pub_exports(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let acc1 = match d {
+        DFn(true, name, _, _, _, _, _, _, _) -> [name, ...acc]
+        DType(true, name, _, _, _, _) -> [name, ...acc]
+        DEffect(true, name, _, _, _, _) -> [name, ...acc]
+        DProtocol(true, name, _, _, _) -> [name, ...acc]
+        DAxiom(true, name, _, _, _, _, _, _) -> [name, ...acc]
+        DUnit(true, name, _, _, _) -> [name, ...acc]
+        _ -> acc
+      }
+      collect_pub_exports(rest, acc1)
+    }
+  }
+}
+
+# `last_segment` already exists (line 6253) and is used by
+# register_import. We reuse it here unchanged.
 
 # Directory portion of a path. "a/b/c.kai" -> "a/b". If no slash,
 # returns "." (current dir).
@@ -21859,7 +21908,18 @@ fn find_module_file(base_dir: String, mod_path: String, search_paths: [String]) 
   }
 }
 
-fn resolve_module(base_dir: String, mod_path: String, search_paths: [String], rs: ResolveState) : ResolveState / Console {
+# m6.2: `import_name` is the surface binding the importing file
+# uses to refer to this module — last segment of `IkPath` /
+# `IkSelective`, or the alias from `IkAlias`. The resolver records
+# a ModuleEntry under this name once the file has been parsed
+# successfully (skipped when the file is missing or has lex/parse
+# errors — the M6.1 fallback diagnostic still fires).
+#
+# When `import_name` is `""`, the caller is asking for plain M6.1
+# behaviour without registering a module entry — used by paths that
+# load files for other reasons (none in v1, but the parameter
+# leaves the door open).
+fn resolve_module(base_dir: String, mod_path: String, import_name: String, search_paths: [String], rs: ResolveState) : ResolveState / Console {
   let cf = find_module_file(base_dir, mod_path, search_paths)
   match cf {
     CF(abs_path, opt_src) -> {
@@ -21881,7 +21941,13 @@ fn resolve_module(base_dir: String, mod_path: String, search_paths: [String], rs
                 None -> rs1
                 Some(decls) -> {
                   let rs2 = process_imports(base_dir, decls, search_paths, rs1)
-                  rs_append_decls(rs2, non_import_decls(decls))
+                  let kept = non_import_decls(decls)
+                  let rs3 = rs_append_decls(rs2, kept)
+                  if import_name == "" { rs3 }
+                  else {
+                    let exports = collect_pub_exports(kept, [])
+                    rs_add_module(rs3, ME(import_name, exports, abs_path))
+                  }
                 }
               }
             }
@@ -21898,9 +21964,14 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], rs: 
     [d, ...rest] -> {
       let rs1 = match d {
         DImport(ik, _, _) -> match ik {
-          IkPath(p)         -> resolve_module(base_dir, p, search_paths, rs)
-          IkAlias(p, _)     -> resolve_module(base_dir, p, search_paths, rs)
-          IkSelective(p, _) -> resolve_module(base_dir, p, search_paths, rs)
+          # m6.2: surface name = last segment of dotted path.
+          IkPath(p)         -> resolve_module(base_dir, p, last_segment(p), search_paths, rs)
+          # m6.2: surface name = alias.
+          IkAlias(p, alias) -> resolve_module(base_dir, p, alias, search_paths, rs)
+          # m6.2: surface name = last segment (selective imports keep
+          # the prefix surface binding, same as IkPath; the named-list
+          # affects unqualified scope, not the qualified surface).
+          IkSelective(p, _) -> resolve_module(base_dir, p, last_segment(p), search_paths, rs)
           # m7f §7: import holes are not module loads — they are
           # diagnostic-only. The symbol-index pass runs separately
           # after process_imports completes.
@@ -21913,14 +21984,24 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], rs: 
   }
 }
 
+# m6.2: result of import expansion. `decls` is the flat
+# topologically-sorted decl list (every DImport stripped, all
+# imported modules' public + private decls inlined — same as M6.1).
+# `modules` is the module table — one entry per `import` statement
+# at any level of the import graph. Phase 2.3+ uses the table to
+# rewrite `mod.fn` qualified calls; Phase 2.2 only populates it.
+type ExpandedProgram = EP_Mod([Decl], [ModuleEntry])
+
 # Given a root file's path and its parsed decls, return the flat
 # decl list with every (transitively-)imported module's decls
-# prepended in topological order and with every DImport stripped.
-fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl]) : [Decl] {
+# prepended in topological order and with every DImport stripped,
+# plus the module table for the qualified-call resolver.
+fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl]) : ExpandedProgram {
   let base_dir = dir_of(root_path)
-  let rs0 = ResolveState { visited: [root_path], decls: [] }
+  let rs0 = ResolveState { visited: [root_path], decls: [], modules: [] }
   let rs1 = process_imports(base_dir, root_decls, search_paths, rs0)
-  list_append(rs1.decls, non_import_decls(root_decls))
+  let all_decls = list_append(rs1.decls, non_import_decls(root_decls))
+  EP_Mod(all_decls, rs1.modules)
 }
 
 # ====================================================================
@@ -25067,8 +25148,16 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                                                          dir_of(path),
                                                          search_paths)
             let own_decls_no_holes = strip_import_holes(own_decls, [])
+            # m6.2 Phase 2.2: expand_imports now returns both the
+            # flat decl list (M6.1 behaviour) and the module table.
+            # `module_table` is unused until Phase 2.3 wires it into
+            # the resolver pass; building it now confirms the
+            # populate logic without affecting any other code path.
             let expanded = expand_imports(path, search_paths, own_decls_no_holes)
-            let merged_raw = list_append(prelude_decls, expanded)
+            let expanded_decls = match expanded { EP_Mod(ds, _) -> ds }
+            let module_table = match expanded { EP_Mod(_, mt) -> mt }
+            let _ = module_table  # consumed in Phase 2.3
+            let merged_raw = list_append(prelude_decls, expanded_decls)
             # m12.7: lower DAxiom → DFn(body=todo!) before any other
             # Decl walker runs. Subsequent passes (alias resolution,
             # builtin injection, desugars, typer) see only ordinary
