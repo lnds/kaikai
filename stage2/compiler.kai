@@ -41,7 +41,7 @@ type TokKind
   | TkAnd | TkAs | TkAssert | TkAxiom | TkEffect | TkElse | TkFalse | TkFn | TkFor
   | TkHandle | TkIf | TkImpl | TkImport
   | TkLet | TkMatch | TkNot | TkOr | TkProtocol | TkPub | TkTest | TkTrue | TkType
-  | TkUnitKw | TkUse | TkVar | TkWith
+  | TkUnitKw | TkUse | TkVar | TkWhere | TkWith
   # m12.8: `#derive(P, ...)` annotation. The lexer recognises `#derive`
   # specifically (instead of treating it as a comment) so the parser can
   # consume it as a prefix to a `type` declaration.
@@ -94,7 +94,7 @@ fn tk_name(k: TokKind) : String {
     TkIf -> "if" TkImpl -> "impl" TkImport -> "import"
     TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
     TkProtocol -> "protocol" TkPub -> "pub" TkTest -> "test" TkTrue -> "true" TkType -> "type"
-    TkUnitKw -> "unit" TkUse -> "use" TkVar -> "var" TkWith -> "with"
+    TkUnitKw -> "unit" TkUse -> "use" TkVar -> "var" TkWhere -> "where" TkWith -> "with"
     TkDerive -> "#derive"
     TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
     TkIdent -> "IDENT" TkUnderscore -> "_"
@@ -263,6 +263,7 @@ fn keyword_kind(text: String) : TokKind {
   else if text == "unit" { TkUnitKw }   # m12.5
   else if text == "use" { TkUse }       # m7e §25
   else if text == "var" { TkVar }
+  else if text == "where" { TkWhere }   # m12.6
   else if text == "with" { TkWith }
   else { TkIdent }
 }
@@ -1123,6 +1124,13 @@ type TyKind
   # produces this with `Real`/`Int` underneath); the UnitExprT carries
   # the unit annotation that the typer canonicalises and unifies.
   | TyDim(TypeExpr, UnitExprT)
+  # m12.6: refinement type, `BaseT where Predicate(self)`. The predicate
+  # is parsed as an Expr in the same expression grammar as the rest of
+  # the language; m12.6.b/c restrict it to the decidable subset and
+  # use it for compile-time + runtime contract verification. m12.6.a
+  # only stores the syntactic form; resolve_ty drops the refinement
+  # so it does not affect inference / unification yet.
+  | TyRefine(TypeExpr, Expr)
 
 # Syntactic effect row: REmpty for `T` (no `/`), RClosed for `T / Io
 # + Fail`, ROpen for `T / Io + e` or `T / e` where the lowercase tail
@@ -1374,6 +1382,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkUnitKw     -> match b { TkUnitKw -> true _ -> false }
     TkUse        -> match b { TkUse -> true _ -> false }
     TkVar        -> match b { TkVar -> true _ -> false }
+    TkWhere      -> match b { TkWhere -> true _ -> false }
     TkWith       -> match b { TkWith -> true _ -> false }
     TkInt        -> match b { TkInt -> true _ -> false }
     TkReal       -> match b { TkReal -> true _ -> false }
@@ -3767,6 +3776,94 @@ fn parse_row_label_args(p: Parser, acc: [TypeExpr]) : PRowArgs {
 }
 
 fn parse_type(p: Parser) : PTy {
+  let base = parse_type_base(p)
+  match base.r {
+    None -> base
+    Some(_) -> parse_optional_refinement(base)
+  }
+}
+
+# m12.6.a: after a base type parses, peek for `where` and consume the
+# refinement predicate as a single Expr. The predicate parses with the
+# normal expression grammar; m12.6.b/c restrict it to the decidable
+# subset and wire it into typer + codegen. The unary form
+# `where >= 0` (predicate begins with a comparator and elides `self`
+# on the LHS) is desugared at parse time into `self >= 0`.
+fn parse_optional_refinement(base: PTy) : PTy {
+  if not p_at(base.p, TkWhere) { base } else {
+    match base.r {
+      None -> base
+      Some(bt) -> {
+        let p1 = p_advance(base.p)
+        let pe = parse_refinement_predicate(p1, bt.line, bt.col)
+        match pe.r {
+          None -> PTy { p: pe.p, r: None }
+          Some(pred) ->
+            PTy { p: pe.p, r: Some(mk_ty(TyRefine(bt, pred), bt.line, bt.col)) }
+        }
+      }
+    }
+  }
+}
+
+# m12.6.a: parse the body of a `where` clause. The grammar accepts any
+# Expr; in addition, when the next token is a comparison operator
+# (`<`, `<=`, `==`, `!=`, `>`, `>=`), `self` is implicitly inserted as
+# the LHS so that `where >= 0` desugars to `self >= 0`. Validation that
+# the resulting Expr lies in the decidable subset is the typer's job
+# (m12.6.b).
+fn parse_refinement_predicate(p: Parser, line: Int, col: Int) : PExpr {
+  let t = p_peek(p)
+  if is_cmp_token(t.kind) {
+    let lhs = mk_expr(EVar("self"), line, col)
+    parse_refinement_cmp_with(p, lhs, line, col)
+  } else {
+    parse_expr(p)
+  }
+}
+
+fn is_cmp_token(k: TokKind) : Bool {
+  if tk_is(k, TkLt) { true }
+  else if tk_is(k, TkLe) { true }
+  else if tk_is(k, TkEqEq) { true }
+  else if tk_is(k, TkNeq) { true }
+  else if tk_is(k, TkGt) { true }
+  else if tk_is(k, TkGe) { true }
+  else { false }
+}
+
+# Build `self <op> rhs` (or chained `self <op1> rhs1 <op2> rhs2`) when
+# the where clause begins with a bare comparator. The chained form is
+# supported because the spec lists `1 <= self <= 65535` as the canonical
+# bounded-interval syntax; with `self` elided that becomes
+# `where 1 <= <= 65535`, which is awkward, so we only desugar the
+# leading comparator and then let parse_expr take over for the rest.
+fn parse_refinement_cmp_with(p: Parser, lhs: Expr, line: Int, col: Int) : PExpr {
+  let op_tok = p_peek(p)
+  let op_name = cmp_op_name(op_tok.kind)
+  let p1 = p_advance(p)
+  let rhs = parse_expr(p1)
+  match rhs.r {
+    None -> rhs
+    Some(rv) -> {
+      let call = mk_expr(ECall(mk_expr(EVar(op_name), line, col), [lhs, rv]),
+                         line, col)
+      PExpr { p: rhs.p, r: Some(call) }
+    }
+  }
+}
+
+fn cmp_op_name(k: TokKind) : String {
+  if tk_is(k, TkLt) { "<" }
+  else if tk_is(k, TkLe) { "<=" }
+  else if tk_is(k, TkEqEq) { "==" }
+  else if tk_is(k, TkNeq) { "!=" }
+  else if tk_is(k, TkGt) { ">" }
+  else if tk_is(k, TkGe) { ">=" }
+  else { "==" }
+}
+
+fn parse_type_base(p: Parser) : PTy {
   let t = p_peek(p)
   if tk_is(t.kind, TkLbracket) {
     let p1 = p_advance(p)
@@ -5206,6 +5303,10 @@ fn dump_type(ty: TypeExpr, depth: Int) : Unit {
       emit_line(depth, "ty_dim <#{unit_expr_display(u)}> @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
       dump_type(base, depth + 1)
     }
+    TyRefine(base, _) -> {
+      emit_line(depth, "ty_refine @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      dump_type(base, depth + 1)
+    }
   }
 }
 
@@ -5248,6 +5349,7 @@ fn type_expr_display(t: TypeExpr) : String {
       "(", join_with(map(ps, type_expr_display), ", "), ") -> ", type_expr_display(ret)
     ])
     TyDim(base, u) -> concat_all([type_expr_display(base), "<", unit_expr_display(u), ">"])
+    TyRefine(base, _) -> concat_all([type_expr_display(base), " where <pred>"])
   }
 }
 
@@ -10663,6 +10765,11 @@ fn resolve_ty(t: TypeExpr) : Ty {
     # (with empty alias and tparam contexts here) so two textually
     # different but algebraically equal forms compare equal under unify.
     TyDim(base, u) -> TyDimT(resolve_ty(base), unit_canon(u))
+    # m12.6.a: refinements do not yet affect the semantic type. The
+    # predicate stays in the syntactic AST for diagnostics; m12.6.b/c
+    # will reintroduce it on the semantic side once contracts wire
+    # into prologue/epilogue codegen.
+    TyRefine(base, _) -> resolve_ty(base)
   }
 }
 
@@ -11699,6 +11806,8 @@ fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
     # tparam bindings — leave UVar references as USym holdovers. Real
     # generic-unit resolution lives in resolve_ty_with_binds below.
     TyDim(base, u) -> dim_collapse(resolve_ty_with_tparams(base, binds), unit_canon(u))
+    # m12.6.a: refinements are stripped at semantic level; cf. resolve_ty.
+    TyRefine(base, _) -> resolve_ty_with_tparams(base, binds)
   }
 }
 
@@ -11833,6 +11942,9 @@ fn collect_rvars_in_typeexpr(t: TypeExpr, acc: [String]) : [String] {
     # m12.5: dimensioned base — recurse into the inner ty; the unit
     # itself never carries row variables.
     TyDim(base, _) -> collect_rvars_in_typeexpr(base, acc)
+    # m12.6.a: refinement predicates are pure (no effects, no rows);
+    # only the base type can contribute row variables.
+    TyRefine(base, _) -> collect_rvars_in_typeexpr(base, acc)
   }
 }
 
@@ -11896,6 +12008,8 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty 
     TyDim(base, u) ->
       dim_collapse(resolve_ty_with_binds(base, tpbinds, rbinds),
                    unit_canon(unit_resolve_tparams(u, tpbinds)))
+    # m12.6.a: refinements are dropped at the semantic level.
+    TyRefine(base, _) -> resolve_ty_with_binds(base, tpbinds, rbinds)
   }
 }
 
@@ -12100,6 +12214,9 @@ fn collect_implicit_in_typeexpr(t: TypeExpr, declared: [String], acc: [String]) 
     # into the base ty; unit-vars are NOT implicitly generalised, the
     # user must declare them via `[u: Unit]`.
     TyDim(base, _) -> collect_implicit_in_typeexpr(base, declared, acc)
+    # m12.6.a: refinements stay transparent; only the base type
+    # contributes implicit type parameters.
+    TyRefine(base, _) -> collect_implicit_in_typeexpr(base, declared, acc)
   }
 }
 
@@ -16294,6 +16411,9 @@ fn ty_expr_contains_fiber(t: TypeExpr) : Bool {
     }
     # m12.5: dimensioned types never carry a Fiber — recurse into base.
     TyDim(base, _) -> ty_expr_contains_fiber(base)
+    # m12.6.a: refinement predicates cannot mention Fiber (predicate
+    # subset is data-only); only the base type matters.
+    TyRefine(base, _) -> ty_expr_contains_fiber(base)
   }
 }
 
@@ -16622,6 +16742,10 @@ fn expand_aliases_typeexpr(t: TypeExpr, aliases: [UAliasEntry]) : TypeExpr {
     TyDim(base, u) ->
       mk_ty(TyDim(expand_aliases_typeexpr(base, aliases),
                   expand_unit_aliases_in_unit(u, aliases, [])), t.line, t.col)
+    # m12.6.a: refinements pass through alias expansion. The predicate
+    # is preserved verbatim — no unit aliases live inside it.
+    TyRefine(base, p) ->
+      mk_ty(TyRefine(expand_aliases_typeexpr(base, aliases), p), t.line, t.col)
   }
 }
 
@@ -21429,6 +21553,9 @@ fn proto_type_name(te: TypeExpr) : String {
     # protocol dispatch (which is single-dispatch on the head TyName,
     # exactly as the spec describes for `impl Show for Money[u: Unit]`).
     TyDim(base, _)  -> proto_type_name(base)
+    # m12.6.a: refinements collapse to the underlying base for protocol
+    # dispatch — `Int where >= 0` and `Int` resolve to the same `impl`.
+    TyRefine(base, _) -> proto_type_name(base)
   }
 }
 
@@ -21713,6 +21840,9 @@ fn substitute_self_in_kind(k: TyKind) : TyKind {
     # expression is leaf data with no `Self` reference (units come
     # from the global unit table, not from the protocol's tparam).
     TyDim(base, u) -> TyDim(substitute_self_in_type(base), u)
+    # m12.6.a: predicates do not contain TypeExpr nodes that mention
+    # Self, so the predicate is left intact.
+    TyRefine(base, p) -> TyRefine(substitute_self_in_type(base), p)
   }
 }
 
