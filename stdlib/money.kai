@@ -1,0 +1,169 @@
+# stdlib/money.kai — currency-tagged Decimal arithmetic.
+#
+# Wraps `Decimal` with a `currency: String` tag (ISO 4217 code by
+# convention: "USD", "EUR", "CLP", "JPY", ...). Operations across
+# different currencies return `None` instead of producing a
+# nonsensical result — callers must convert via an FX rate first
+# (FX is not part of this module; it's a `stdlib/fx` follow-up).
+#
+# Why a String tag and not a sum type:
+# - Cerrar las currencies con un sum type bloquea la extensibilidad
+#   y obliga a actualizar este file cada vez que aparezca una nueva
+#   moneda. ISO 4217 incluye 180+ codes.
+# - El runtime check via String compare es 1-3 instrucciones.
+# - Cuando UoM (m12.5) se integre con Money en una iteración futura,
+#   el `Currency` puede pasar a unit y el typer hará el check en
+#   compile time gratis. Hoy el typer no sabe sobre Currency, así
+#   que el check vive en runtime.
+#
+# Public surface:
+#
+#   pub type Money = { amount: Decimal, currency: String }
+#
+#   pub fn money_make / money_zero / money_from_int : ...
+#   pub fn money_add / money_sub : (Money, Money) -> Option[Money]
+#   pub fn money_neg / money_abs : Money -> Money
+#   pub fn money_scale / money_divide_scalar : (Money, Decimal[, Int]) -> Money
+#   pub fn money_ratio : (Money, Money, Int) -> Option[Decimal]
+#   pub fn money_eq / money_cmp : ...
+#   pub fn money_is_zero / money_is_negative : Money -> Bool
+#   pub fn money_to_string / money_parse : ...
+
+# ---- Carrier -----------------------------------------------------
+
+pub type Money = { amount: Decimal, currency: String }
+
+# ---- Constructors -----------------------------------------------
+
+pub fn money_make(amount: Decimal, currency: String) : Money =
+  Money { amount: amount, currency: currency }
+
+pub fn money_zero(currency: String) : Money =
+  Money { amount: dec_zero(), currency: currency }
+
+pub fn money_from_int(units: Int, currency: String) : Money =
+  Money { amount: dec_from_int(units), currency: currency }
+
+# Convenience: build a money value from "units, fraction, scale"
+# the same way `dec_from_parts` does. `money_from_parts(12, 50, 2,
+# "USD")` is `USD 12.50`.
+pub fn money_from_parts(units: Int, fraction: Int, scale: Int, currency: String) : Money =
+  Money { amount: dec_from_parts(units, fraction, scale), currency: currency }
+
+# ---- Accessors ---------------------------------------------------
+
+pub fn money_amount(m: Money) : Decimal = m.amount
+
+pub fn money_currency(m: Money) : String = m.currency
+
+# ---- Arithmetic --------------------------------------------------
+
+pub fn money_neg(m: Money) : Money =
+  Money { amount: dec_neg(m.amount), currency: m.currency }
+
+pub fn money_abs(m: Money) : Money =
+  Money { amount: dec_abs(m.amount), currency: m.currency }
+
+# Add / sub require matching currency. None on mismatch — callers
+# convert via FX first if they want to mix.
+pub fn money_add(a: Money, b: Money) : Option[Money] =
+  if a.currency == b.currency {
+    Some(Money { amount: dec_add(a.amount, b.amount), currency: a.currency })
+  } else { None }
+
+pub fn money_sub(a: Money, b: Money) : Option[Money] =
+  if a.currency == b.currency {
+    Some(Money { amount: dec_sub(a.amount, b.amount), currency: a.currency })
+  } else { None }
+
+# Scale by a dimensionless `Decimal` factor (interest rate, share
+# percentage, tax rate). Currency is preserved. The result's scale
+# is `amount.scale + factor.scale` (decimal multiplication law);
+# round explicitly via `dec_round` if you need a fixed precision.
+pub fn money_scale(m: Money, factor: Decimal) : Money =
+  Money { amount: dec_mul(m.amount, factor), currency: m.currency }
+
+# Divide by a dimensionless `Decimal`. Caller picks the result
+# scale (same convention as `dec_div`). Currency preserved.
+pub fn money_divide_scalar(m: Money, divisor: Decimal, target_scale: Int) : Money =
+  Money { amount: dec_div(m.amount, divisor, target_scale),
+          currency: m.currency }
+
+# Ratio between two same-currency Money values is a dimensionless
+# Decimal — the currencies cancel. None on currency mismatch.
+pub fn money_ratio(a: Money, b: Money, target_scale: Int) : Option[Decimal] =
+  if a.currency == b.currency { Some(dec_div(a.amount, b.amount, target_scale)) }
+  else { None }
+
+# ---- Predicates --------------------------------------------------
+
+pub fn money_is_zero(m: Money) : Bool = dec_is_zero(m.amount)
+
+pub fn money_is_negative(m: Money) : Bool = dec_is_negative(m.amount)
+
+# ---- Comparison --------------------------------------------------
+
+# Strict equality — different currencies are never equal, even at
+# zero. `money_zero("USD") == money_zero("EUR")` is false: zero
+# dollars and zero euros are distinct quantities.
+pub fn money_eq(a: Money, b: Money) : Bool =
+  a.currency == b.currency and dec_eq(a.amount, b.amount)
+
+# Three-way compare. None if currencies differ — there is no
+# meaningful ordering between USD and EUR without an FX rate.
+pub fn money_cmp(a: Money, b: Money) : Option[Int] =
+  if a.currency == b.currency { Some(dec_cmp(a.amount, b.amount)) }
+  else { None }
+
+# ---- String I/O --------------------------------------------------
+
+# Render as "ISO_CODE amount", e.g. "USD 12.50" or "JPY 1000".
+# Currency code is emitted as-is — no validation on the tag string.
+pub fn money_to_string(m: Money) : String =
+  string_concat(string_concat(m.currency, " "), dec_to_string(m.amount))
+
+# Parse "ISO_CODE amount". Format: 3-letter code, space, decimal.
+# Lenient on currency length (any non-empty alphabetic prefix
+# before the space works); strict on the rest of the format.
+pub fn money_parse(s: String) : Option[Money] = {
+  let n = string_length(s)
+  let space_idx = money_find_space(s, 0, n)
+  if space_idx <= 0 or space_idx >= n - 1 { None }
+  else {
+    let cur = string_slice(s, 0, space_idx)
+    let amt_str = string_slice(s, space_idx + 1, n - space_idx - 1)
+    if not money_is_currency_code(cur) { None }
+    else { match dec_parse(amt_str) {
+      None    -> None
+      Some(d) -> Some(Money { amount: d, currency: cur })
+    } }
+  }
+}
+
+# Locate the first ASCII space in [i, n). -1 if absent.
+fn money_find_space(s: String, i: Int, n: Int) : Int = {
+  if i >= n { 0 - 1 }
+  else { match char_at(s, i) {
+    None    -> 0 - 1
+    Some(c) -> if c == ' ' { i } else { money_find_space(s, i + 1, n) }
+  } }
+}
+
+# A currency code is a non-empty string of ASCII letters. We do
+# NOT enforce 3-letter ISO 4217 — historical codes (CLF, USS, ...)
+# and pre-decimal experiments (XAG, XAU) all fit, and crypto
+# tickers (BTC, ETH) want the same shape.
+fn money_is_currency_code(s: String) : Bool = {
+  let n = string_length(s)
+  if n == 0 { false }
+  else { money_is_currency_code_loop(s, 0, n) }
+}
+
+fn money_is_currency_code_loop(s: String, i: Int, n: Int) : Bool = {
+  if i >= n { true }
+  else { match char_at(s, i) {
+    None    -> false
+    Some(c) -> if ch_is_alpha(c) { money_is_currency_code_loop(s, i + 1, n) }
+               else { false }
+  } }
+}
