@@ -1,0 +1,204 @@
+# Changelog
+
+All notable changes to kaikai are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html);
+prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
+"Backward compatibility — not promised until post-MVP").
+
+## [Unreleased]
+
+### Added
+
+- Versioning infrastructure: `VERSION` file at repo root, this `CHANGELOG.md`,
+  retroactive git tags `v0.1.0` / `v0.1.1` / `v0.1.2` / `v0.1.3` and the
+  current `v0.2.0`. The compiler's `--version` flag still reports the legacy
+  `kaic2 stage 2 (self-hosted)` string; updating it to read `VERSION` is
+  deferred to a follow-up commit that can re-validate the selfhost fixed
+  point.
+
+## [0.2.0] — 2026-04-28 (R1 Phase 3 — runtime flip)
+
+**Major: runtime semantics changed.** Phase 3 of the Perceus flip lands
+the atomic A+B+C+D rewrite. The runtime now consumes args linearly;
+producers incref on extraction; primitives decref after reading. This
+is a behaviour change visible to any C-level extension or hand-written
+runtime helper.
+
+### Added
+
+- **R1 Phase 3 — atomic Perceus runtime flip** (`fbb532c`, PR #1):
+  - **Step A** — producer-side incref-on-extract. `emit_pat_binds`
+    gains an `is_alias` flag in stage 0 + 1 + 2. True at variant args,
+    cons head/tail, list-rest binding, and **top-level match-arm
+    scrutinee** (subsequent arms re-read `_scr` and a guard inside an
+    arm may consume the binding — const-pattern desugar emits
+    `__cv_NAME == NAME()`). False for top-level let-destructure and
+    record-field destructure (`kai_field` already increfs).
+  - **Step B** — exit drops for multi-use / LUBlocked params.
+    `pcs_prepend_unused_drops` wraps the body as
+    `EBlock([entry, SLet(__pcs_ret, body), exit], EVar("__pcs_ret"))`.
+    `DTest` now also routed through `perceus_decl` so test bodies get
+    the dup walker (closures capturing multi-use locals inside test
+    bodies were double-consuming captures across invocations).
+  - **Step C** — 13 primitives flipped in `stage0/runtime.h`:
+    `kai_add` / `sub` / `mul` / `div` / `idiv` / `mod` / `neg` / `lt`
+    / `gt` / `le` / `ge` / `eq_v` / `ne_v` / `boolnot` decref args
+    after reading every relevant field (self-aliasing-safe).
+    `kai_truthy`, `kai_field`, `kai_apply`, `kai_eq` intentionally
+    not flipped — see `stage0/runtime.h` comments.
+  - **Step D** — stage 0 eager-dup retrofit. `emit_ident_value` wraps
+    every local read in `kai_internal_dup(...)`. Brute force; stage 0
+    has no perceus pass.
+  - Hand-written runtime helpers (`kai_prelude_map` / `_filter` /
+    `_reduce` / `_each`) updated to incref each arg before
+    `kai_apply` so the consuming closure body has its own ref.
+
+### Changed
+
+- **Memory profile of `kaic2 self-compile**:
+  - RSS: **6.25 GB → 3.02 GB (−52%)**.
+  - live_peak: **−63%**.
+  - alloc_total: 130.7 M (pre-m5) → 33.0 M (Phase 1 inert) → 69.7 M
+    (Phase 3 — increfs and decrefs both counted).
+- **Wall time of `kaic2 self-compile`**: **+2.7×** (≈2.15s → ≈5.8s).
+  The dup/decref churn is real work; Phase 3 trades wall time for
+  RSS. Mitigations (reuse-in-place, drop specialisation) are
+  follow-up lanes.
+- Tier 1 #2 ("runtime-efficient") no longer carries the asterisk
+  about leaks. **However** the wall-time regression introduces a new
+  asterisk that the m5.x-2 follow-up will address.
+
+### Notes
+
+- Phase 4 (further stage 0 optimisations) is folded into the m5.x-2
+  follow-up rather than tracked separately.
+- The byte-identical selfhost fixed point is preserved across the
+  flip — both backends round-trip without diff.
+
+## [0.1.3] — 2026-04-28 (m12.6.x #2 sub-steps + Interval lattice)
+
+### Added
+
+- m12.6.x #2 sub-step 1: Interval lattice (`0a6e0f2`) — foundation
+  for refinement-type interval propagation in the typer.
+- m12.6.x #2 sub-steps 2+3+4: interval pass + dump flag + fixture
+  (`b6bd5f6`).
+- m12.6x refine-prop design doc (`7c1c836`) — lane A scope.
+
+## [0.1.2] — 2026-04-28 (R1 Phase 1)
+
+### Added
+
+- Perceus Phase 1 (m5.x-flip step 2a, `e824222`): `pcs_is_non_last`
+  switched from "lexically-last → raw transfer" to "any binding with ≥ 2
+  non-lam uses → dup every read". Single-use bindings still transfer
+  raw. The previous rule was unsafe under C's unspecified argument
+  evaluation order (clang on AArch64 evaluates argument lists
+  right-to-left); the all-dup variant is order-independent.
+
+### Notes
+
+- Phase 1 was inert under the loose runtime — extra `__perceus_dup`
+  calls bumped rc with no matching decref. Phase 1 paid its way in
+  v0.2.0 once Phase 3 made every primitive consume its args.
+
+## [0.1.1] — 2026-04-28 (m12.6.x close + regex + §29 const + stdlib Combo A)
+
+### Added
+
+- `stdlib/regexp.kai` (`608e694..3909c71`): RE2-style NFA regex engine,
+  8 phases: design + parser (`RxAst` + recursive descent) + Thompson-style
+  NFA construction + NFA simulator (set-of-states, leftmost-longest)
+  + public API (`compile` / `match` / `find_all` / `replace` / `split`)
+  + `regex_basic` fixture + `bin/kai` + Makefile wiring.
+- `stdlib/collections/{set,queue,stack}.kai` and `stdlib/math/int.kai`
+  (Combo A, `28c1b13`).
+- §29 const declarations: top-level `const NAME : T = literal`
+  (`75c6856`), refs inside `#{...}` interpolation, pattern-side `const`
+  in match arms (`d33db66`).
+- `[<refinement_pure>]` attribute (m12.6.x #5(a), `390311b`).
+- Inline pure attr in match-arm narrow + alias resolution (m12.6.x #3
+  v2 + #5 inline, `86dc465`).
+- `impl Show for Char` + cleaner regex AST dump (`98c663f`).
+
+### Fixed
+
+- Unannotated `main` SIGSEGV when effects reach via helpers (`fb5bc4c`):
+  post-typing walker `collect_call_labels` extends `inferred_main_row`
+  with effects reached transitively via callees; the runtime now installs
+  default handlers for those effects.
+
+### Closed
+
+- m12.6.x — refinements + contracts followup. All eight items closed:
+  parser (a-e), match-arm narrow, refinement_pure attribute,
+  result-binding, const-folding, `ensure(v) where pred`, **#7 regex
+  literals (unblocked by the regex stdlib lane)**.
+
+## [0.1.0] — 2026-04-27 (Core language feature-complete)
+
+Core language closed under the revised 3-level gate (`docs/stage2-design.md`
+§"Update 2026-04-27 (post-REOPEN final)").
+
+### Gate met
+
+- **Level 1 (mechanical)**: `make selfhost` + `make -C stage2 selfhost-llvm`
+  byte-identical fixed point; `make test` clean (incl. `test-demos-core`
+  and `test-aspirational`).
+- **Level 2 (audit + invariant verifier)**: every `_ -> k` wildcard in
+  every AST walker pass justified or explicit (`7bd5a68`); rep invariant
+  (b) — protocol-dispatcher references outside enclosing binders — runs
+  on every compile via `validate_typer_invariants` (`0afc2a9`).
+- **Level 3 (demo gate)**: `make demos-no-regression` baseline 18 OK
+  + PASS demos in `demos/`; `make -C stage2 test-aspirational` runs
+  `examples/aspirational/event_logger` (custom Logger effect + handler
+  + effectful HOF callbacks + sum-type-with-payload `#derive(Show)`).
+
+### Added (across the build-up to Core)
+
+- Stages 0 / 1 / 2 (m1-m6), all with `selfhost-llvm` fixed-point green.
+- Effects + handlers + parametric effects + per-instance dispatch
+  (m7a / m7b / m7c).
+- Ergonomic sugars: trailing lambdas, `@cap`, `var`, `a[i]`, aliases,
+  `todo!`, record punning, `@` as-patterns, pipeline `_`, `++`,
+  `!` postfix on `Option` / `Result` (m7b / m7d / m7e §13).
+- Fibers, structured concurrency, actors with supervision (m8 v1 type
+  surface; runtime is inline-eager — real scheduler is m8.x).
+- Typed holes (m10).
+- Perceus basic memory management (m5 rounds 1-3) + capture incref
+  (m5.x #2). Linear-consumption runtime closed in v0.2.0.
+- Units of measure (m12.5).
+- Single-dispatch protocols + 5 stdlib protocols + `#derive(Show, Eq,
+  Hash, Ord)` for records and sum types (m12.8 + m12.8.x + m12.8.z).
+- Atomic per-stream effects (`Stdout` / `Stderr` / `Stdin`) with
+  `Console` and `Io` aliases (m12.8 Phase 4b).
+- Parametric `impl[u: Unit] Show for Real<u>` (m12.8 Phase 2).
+- m12 self-host checkpoint: byte-identical fixed-point of
+  `kaic2 stage2/compiler.kai`.
+- Both backends (`--emit=c`, `--emit=llvm`) at parity for every shipped
+  feature.
+
+### Notes on remaining structural debt
+
+The runtime still carries two of the three structural deficits audited
+on 2026-04-28 (Linus + Eric). After v0.2.0 the third one (RC fictional)
+is closed:
+
+1. ~~RC fictional at runtime.~~ **Closed in v0.2.0 by R1 Phase 3.**
+2. **Fibers do not suspend.** m8 v1 is inline-eager — `Spawn.spawn`
+   runs the thunk synchronously, `await` is identity, `select` cannot
+   interleave, `Cancel` cannot be delivered (no yield points). The
+   BEAM-style structured-concurrency claim is type-check-only.
+   Target of the **R2** lane (m8.x real fiber scheduler).
+3. **m4c monomorphisation is an identity pass.** The
+   `try_rewrite_show_dim_real` shortcut in m12.8 Phase 2 confirms it;
+   polymorphics with `EHandle` in the body collide on `clause_fn_name`.
+
+[Unreleased]: https://github.com/lnds/kaikai/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/lnds/kaikai/compare/v0.1.3...v0.2.0
+[0.1.3]: https://github.com/lnds/kaikai/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/lnds/kaikai/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
