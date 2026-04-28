@@ -293,6 +293,17 @@ struct KaiFiber {
     size_t          stack_size;        /* set per fiber (env-configurable) */
     KaiFiber       *awaiters_head;     /* per-fiber awaiter chain head    */
     KaiFiber       *awaiters_next;     /* link into another fiber's chain */
+    /* m8.x Phase 3 — Cancel delivery at yield points. The trampoline
+     * sets up cancel_pad with setjmp before running the body; the
+     * yield-point hook in kai_evidence_lookup* longjmps here when the
+     * fiber's cancel_requested flag fires, unwinding the body to the
+     * trampoline's cancel branch (state=CANCELLED). cancel_pad_set
+     * gates the longjmp so it's only attempted while the pad is live
+     * — main_fiber never runs through the trampoline, so its
+     * cancel_pad stays unset and Cancel.raise() in main falls back to
+     * exit(0) (the m8 v1 behaviour for unhandled root cancellation). */
+    jmp_buf         cancel_pad;
+    int             cancel_pad_set;
 };
 
 /* m7a #5 + m8.x: kai_main_fiber starts as the OS-thread context,
@@ -309,7 +320,8 @@ static KaiFiber kai_main_fiber = {
     NULL, NULL,          /* thunk, result */
     {0},                 /* ctx — getcontext fills it on first swap */
     NULL, 0,             /* stack_base, stack_size — main uses the OS stack */
-    NULL, NULL           /* awaiters_head, awaiters_next */
+    NULL, NULL,          /* awaiters_head, awaiters_next */
+    {0}, 0               /* cancel_pad, cancel_pad_set — main has no pad */
 };
 
 static KaiFiber *kai_active_fiber = &kai_main_fiber;
@@ -2099,14 +2111,29 @@ static void kai_sched_unpark(KaiFiber *target) {
  * dispatcher who swapped in), runs the thunk, walks awaiters, and
  * hands control to the next ready fiber via setcontext.
  *
- * RC contract (post-v0.2.0 linear-consume): f->thunk is owned by f
- * for f's entire lifetime; kai_apply borrows. kai_free_value's
- * KAI_FIBER branch decrefs both thunk and result when f's RC drops,
- * so the trampoline does not touch RC on either. */
+ * Phase 3 — Cancel landing: setjmp(cancel_pad) before the body runs.
+ * The yield-point hook in kai_evidence_lookup* longjmps here when
+ * cancel_requested fires; the second-return path skips the body and
+ * marks the fiber CANCELLED instead of DONE. cancel_pad_set is the
+ * gate the hook reads before attempting the longjmp.
+ *
+ * RC contract: f->thunk is owned by f for f's entire lifetime;
+ * kai_apply borrows. kai_free_value's KAI_FIBER branch decrefs both
+ * thunk and result when f's RC drops, so the trampoline does not
+ * touch RC on either. */
 static void kai_fiber_trampoline(void) {
     KaiFiber *self = kai_active_fiber;
-    self->result = kai_apply(self->thunk, 0, NULL);
-    self->state  = KAI_FIBER_DONE;
+    if (setjmp(self->cancel_pad) == 0) {
+        self->cancel_pad_set = 1;
+        self->result = kai_apply(self->thunk, 0, NULL);
+        self->cancel_pad_set = 0;
+        self->state  = KAI_FIBER_DONE;
+    } else {
+        /* Cancel landing: the yield-point hook (or kai_default_cancel_raise)
+         * longjmped here. The body did not finish; result stays NULL. */
+        self->cancel_pad_set = 0;
+        self->state = KAI_FIBER_CANCELLED;
+    }
 
     /* Wake awaiters. Each was parked in Spawn.await (Phase 2.3) or
      * Spawn.select (Phase 2.3). Walk the chain, clearing each
@@ -2273,19 +2300,24 @@ static KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *
     return kai_cont_resume(k, kai_unit());
 }
 
-/* m8 #4: default Cancel.raise handler. Doc B §`Cancel`/Default
- * handler: an unhandled Cancel.raise() unwinds the fiber cleanly
- * (the runtime delivers "no silent survivors"). v1 mirrors Fail's
- * default: write a banner + exit(0). A user-installed handler
- * (`with Cancel { raise(resume) -> cleanup }`) discards resume and
- * the m7a #6e setjmp/longjmp pair unwinds to the wrapping handle —
- * that is the actual "fiber unwinds out of the wrapped block"
- * semantics from Doc B §*Handling for cleanup*. The exit code is 0
- * (not 1 like Fail) because cancellation is an expected termination
- * path, not a programmer error. */
+/* m8 #4 + Phase 3: default Cancel.raise handler. Doc B §`Cancel`/
+ * Default handler: an unhandled Cancel.raise() unwinds the fiber
+ * cleanly (the runtime delivers "no silent survivors"). For a
+ * spawned fiber whose trampoline cancel_pad is live, longjmp to it
+ * — same path as the yield-point hook, marks state CANCELLED and
+ * resumes the scheduler. For main_fiber (no pad — main never runs
+ * through the trampoline), fall back to the m8 v1 behaviour: banner
+ * + exit(0). Exit code 0 because cancellation at the program root
+ * is an expected termination, not a programmer error. */
 static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
     (void) self;
     (void) k;
+    KaiFiber *f = kai_current_fiber();
+    if (f->cancel_pad_set) {
+        f->cancel_delivered = 1;
+        longjmp(f->cancel_pad, 1);
+        /* Unreachable. */
+    }
     fputs("kai: Cancel.raise: unhandled (fiber cancelled)\n", stderr);
     exit(0);
 }
@@ -2356,7 +2388,31 @@ static void kai_evidence_pop(void) {
  * equality (most labels are literal strings shared at the call
  * site); strcmp is the fallback for edge cases like dynamically-
  * generated label strings. */
+
+/* Phase 3 — Cancel delivery at yield points. Every effect-op call
+ * goes through one of the kai_evidence_lookup* functions; we use
+ * that as the natural yield-point check. If the current fiber's
+ * cancel flag is set and not yet delivered AND its trampoline
+ * cancel_pad is live, longjmp to the pad — the trampoline's
+ * second-return path marks the fiber CANCELLED and continues with
+ * awaiter walk + dispatch. If the pad is not set (main_fiber, or
+ * outside trampoline scope), the check falls through and the op
+ * dispatches normally; a subsequent user-level Cancel.raise() will
+ * still hit kai_default_cancel_raise which exits the program. v1
+ * does not run user-installed `with Cancel { raise(_) -> cleanup }`
+ * handlers on runtime-triggered cancel; that interaction is queued
+ * for Phase 4+ (docs/m8x-followup.md item 2 follow-on). */
+static void kai_check_cancel_yield_point(void) {
+    KaiFiber *f = kai_current_fiber();
+    if (f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set) {
+        f->cancel_delivered = 1;
+        longjmp(f->cancel_pad, 1);
+        /* Unreachable. */
+    }
+}
+
 static void *kai_evidence_lookup(const char *eff_label) {
+    kai_check_cancel_yield_point();
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     while (node != NULL) {
@@ -2372,6 +2428,7 @@ static void *kai_evidence_lookup(const char *eff_label) {
 /* m7a #6e: same lookup but returns the whole node so the op-call
  * site can reach the handle's jmp_buf if a discard happens. */
 static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
+    kai_check_cancel_yield_point();
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     while (node != NULL) {
@@ -2390,6 +2447,7 @@ static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
  * binding, so an outer alias's op stays reachable even after an
  * inner `with Eff as other` shadows the effect name. */
 static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
+    kai_check_cancel_yield_point();
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     while (node != NULL) {
