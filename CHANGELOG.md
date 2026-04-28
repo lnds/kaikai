@@ -13,10 +13,36 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 - Versioning infrastructure: `VERSION` file at repo root, this `CHANGELOG.md`,
   retroactive git tags `v0.1.0` / `v0.1.1` / `v0.1.2` / `v0.1.3` / `v0.2.0`
-  / `v0.2.1` / `v0.2.2` / `v0.3.0` and the current `v0.4.0`. The compiler's
-  own `kaic2 --version` flag still reports the legacy `kaic2 stage 2
-  (self-hosted)` string; the `bin/kai --version` wrapper reads VERSION
-  dynamically.
+  / `v0.2.1` / `v0.2.2` / `v0.3.0` / `v0.4.0` and the current `v0.4.1`. The
+  compiler's own `kaic2 --version` flag still reports the legacy `kaic2
+  stage 2 (self-hosted)` string; the `bin/kai --version` wrapper reads
+  VERSION dynamically.
+
+## [0.4.1] — 2026-04-28 (Stage 1 codegen shadow-bug fix — symmetry with stage 2)
+
+**Patch: insurance fix.** Mirrors the m14 v1.x codegen shadow-bug fix from
+`stage2/compiler.kai` to `stage1/compiler.kai`. Stage 2 source does not
+currently exercise the local-shadow-global pattern, so the bootstrap chain
+was not breaking — but the asymmetry with stage 2 was real, and any future
+stage 2 code that did `let drop = ...; drop(x)` (with `pub fn drop`
+reachable through the prelude) would have silently emitted the wrong call.
+
+### Fixed
+
+- **`stage1/compiler.kai` codegen shadow bug** (`1cb7b63`, PR #10):
+  - New `emit_named_call_lookup` / `emit_pipe_named_lookup` helpers
+    mirror the stage 2 design.
+  - `emit_call_expr`'s `EVar` branch and the two `EVar` branches in
+    `emit_pipe_expr` now route through the new helpers, which
+    short-circuit to `kai_apply(kai_<callee>, ...)` over the local C
+    variable when the callee name is in `locals` instead of resolving
+    to a same-named top-level (variant / prelude / user fn).
+  - `emit_ident_value` already had the `locals` guard from the m12.6
+    kaic1 pattern-capture fix; the call paths did not — same bug shape
+    as stage 2 pre-v1.x.
+
+Closes the symmetry gap noted under "Items deferred from m14 v1" #3 in
+`docs/lane-experience-m14-v1.md`.
 
 ## [0.4.0] — 2026-04-28 (R2 — m8.x cooperative fiber scheduler)
 
@@ -397,7 +423,8 @@ is closed:
    `try_rewrite_show_dim_real` shortcut in m12.8 Phase 2 confirms it;
    polymorphics with `EHandle` in the body collide on `clause_fn_name`.
 
-[Unreleased]: https://github.com/lnds/kaikai/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/lnds/kaikai/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/lnds/kaikai/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/lnds/kaikai/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lnds/kaikai/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/lnds/kaikai/compare/v0.2.1...v0.2.2
