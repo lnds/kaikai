@@ -462,39 +462,54 @@ generalises).
 
 ## 10. Record punning `{ x, y }` — additive sugar
 
-```kai
-# Today:
-{ hand: hand, deck: deck }
+**Status: LANDED (already shipped pre-§9)**. Verified working in
+the three positions kaikai exposes records: literal, match
+pattern, and let-destructure. The §10 + §28 follow-up trio that
+the m8.5 tuples REJECT promised is now complete.
 
-# With punning:
-{ hand, deck }
+```kai
+type Pair = { x: Int, y: Int }
+
+# 1. Literal punning — desugars `{ x, y }` to `{ x: x, y: y }`.
+let p = Pair { x, y }                    # already worked
+
+# 2. Match-pattern punning — same desugar in pattern position.
+match p {
+  { x, y } -> ...                        # already worked
+  { x: a, y: b } -> ...                  # explicit rename also OK
+}
+
+# 3. Let-destructure punning — added by §28 (commit b3aa642).
+let { x, y } = p
 ```
 
-When the field name matches the variable in scope, repeating both is
-noise. Punning desugars `{ x, y }` to `{ x: x, y: y }`. Not a new
-product form; purely a parser-level rewrite. Same shape as the
-placeholder `.` lambda (`. < 5` desugars to `(x) => x < 5`).
+### What §10 deliberately does not include
 
-Applies symmetrically in *match* patterns: `match p { { hand, deck } -> ... }`
-already works in the typer's `PRecord` path; punning makes the
-`{ hand: hand, deck: deck }` long form unnecessary at the match
-site. The `let { hand, deck } = pair` *binding* form does **not**
-work today — the parser rejects record patterns on the LHS of
-`let`. That gap lives in §28 (record destructuring in `let`),
-which lands together with this proposal so the construction and
-read sides stay symmetric.
+- **Anonymous records (no nominal type)**: `let p = { x, y }` is
+  rejected. kaikai records are nominal — a literal needs the
+  `TypeName { ... }` prefix so the typer can unify the field
+  names against a declared shape. This is a kaikai design
+  decision, not a §10 limitation. If anonymous records ever
+  ship (they would be structural, not nominal), punning is
+  trivially additive there too.
+- **Record update via `with`** (`p with { x }`): not a parser
+  feature kaikai exposes today. Independent proposal — out of
+  §10 scope.
 
-**Status post-2026-04-27**: promoted to *canonical answer* by the
-m8.5 tuples decision gate (§9). With tuples rejected as a second
-product form, punning + §28 destructuring are the ergonomic
-substitute the gate's REJECT clause explicitly cited.
+### LLVM backend caveat (pre-existing, not §10)
 
-Aligns with all principles — doesn't add a construct, only shortens
-a common pattern.
+The LLVM backend's match-arm emitter does not support record
+patterns yet (`pattern kind not supported at <line>:<col>`).
+The C backend handles every form; LLVM coverage for record
+patterns is a separate fix orthogonal to §10. The `record_punning`
+fixture exercises the literal and let-destructure paths — both
+dual-backend.
 
-**Cost**: trivial. A desugar at parse time.
-**Depends on**: nothing for the literal/match side; **§28** for
-the matching `let { ... } = ...` form (lands together).
+Aligns with all principles — doesn't add a construct, only
+shortens a common pattern.
+
+**Cost**: trivial (already shipped).
+**Depends on**: nothing.
 
 ## 11. `variants[T]()` — enumerate sum-type constructors
 
