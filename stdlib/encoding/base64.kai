@@ -1,0 +1,166 @@
+# stdlib/encoding/base64.kai — Base64 encoder/decoder.
+#
+# Pure functional implementation. No effects. Operates on `[Int]`
+# byte lists (each element in `[0, 255]`) and `String`.
+#
+# Conventions match `stdlib/core.kai`'s flat-prefix style. The
+# namespaced form (`base64.encode`) belongs to the m14 stdlib
+# expansion.
+#
+# Two alphabets:
+#   - standard  — RFC 4648 §4: `ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/`
+#   - URL-safe  — RFC 4648 §5: `ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_`
+#
+# Both encoders pad with `=` to a 4-char boundary; both decoders
+# accept padded *and* unpadded input. `decode` returns `None` on
+# any invalid character (including stray padding); decoding never
+# panics.
+
+# ---- Alphabets ---------------------------------------------------
+
+fn b64_alpha_std() : String =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+fn b64_alpha_url() : String =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+# ---- Encoder helpers ---------------------------------------------
+
+# Map a 6-bit value (0..63) to its alphabet character (returned as
+# a 1-char String). The alphabet string indexes safely because
+# `string_slice` is bounds-checked.
+fn b64_lookup(alpha: String, idx: Int) : String =
+  string_slice(alpha, idx, 1)
+
+# Encode a single 3-byte block to 4 base64 characters.
+fn b64_encode_block3(alpha: String, b0: Int, b1: Int, b2: Int) : String = {
+  let n = (b0 * 65536) + (b1 * 256) + b2
+  let c0 = b64_lookup(alpha, n / 262144)
+  let c1 = b64_lookup(alpha, (n / 4096) % 64)
+  let c2 = b64_lookup(alpha, (n / 64) % 64)
+  let c3 = b64_lookup(alpha, n % 64)
+  string_concat(string_concat(c0, c1), string_concat(c2, c3))
+}
+
+# Encode a 2-byte tail block: 3 base64 chars + one `=`.
+fn b64_encode_block2(alpha: String, b0: Int, b1: Int) : String = {
+  let n = (b0 * 65536) + (b1 * 256)
+  let c0 = b64_lookup(alpha, n / 262144)
+  let c1 = b64_lookup(alpha, (n / 4096) % 64)
+  let c2 = b64_lookup(alpha, (n / 64) % 64)
+  string_concat(string_concat(c0, c1), string_concat(c2, "="))
+}
+
+# Encode a 1-byte tail block: 2 base64 chars + two `=`.
+fn b64_encode_block1(alpha: String, b0: Int) : String = {
+  let n = b0 * 65536
+  let c0 = b64_lookup(alpha, n / 262144)
+  let c1 = b64_lookup(alpha, (n / 4096) % 64)
+  string_concat(string_concat(c0, c1), "==")
+}
+
+# Drive the byte stream through 3-byte blocks, switching to 2- /
+# 1-byte tail handlers at the end.
+fn b64_encode_loop(alpha: String, bs: [Int], acc: String) : String = match bs {
+  []                 -> acc
+  [b0]               -> string_concat(acc, b64_encode_block1(alpha, b0))
+  [b0, b1]           -> string_concat(acc, b64_encode_block2(alpha, b0, b1))
+  [b0, b1, b2, ...rest] ->
+    b64_encode_loop(alpha, rest,
+      string_concat(acc, b64_encode_block3(alpha, b0, b1, b2)))
+}
+
+# ---- Encoders ----------------------------------------------------
+
+pub fn base64_encode(bs: [Int]) : String =
+  b64_encode_loop(b64_alpha_std(), bs, "")
+
+pub fn base64_encode_url(bs: [Int]) : String =
+  b64_encode_loop(b64_alpha_url(), bs, "")
+
+# ---- Decoder helpers ---------------------------------------------
+
+# Decode a single base64 character to its 6-bit value, or None for
+# anything not in the active alphabet. Both standard and URL-safe
+# alphabets share the A-Z/a-z/0-9 region; only positions 62 and 63
+# diverge.
+fn b64_char_value(c: Char) : Option[Int] = {
+  if ch_is_upper(c) { Some(char_to_int(c) - char_to_int('A')) }
+  else if ch_is_lower(c) { Some(char_to_int(c) - char_to_int('a') + 26) }
+  else if ch_is_digit(c) { Some(char_to_int(c) - char_to_int('0') + 52) }
+  else if c == '+' { Some(62) }
+  else if c == '/' { Some(63) }
+  else if c == '-' { Some(62) }
+  else if c == '_' { Some(63) }
+  else { None }
+}
+
+# Strip every trailing `=` from the input — both alphabets pad with
+# `=` and decoders accept unpadded input too. The padding count drives
+# the length of the final block.
+fn b64_strip_padding(s: String) : String = {
+  let n = string_length(s)
+  if n == 0 { s }
+  else {
+    match char_at(s, n - 1) {
+      Some(c) -> if c == '=' { b64_strip_padding(string_slice(s, 0, n - 1)) } else { s }
+      None    -> s
+    }
+  }
+}
+
+# Map a String to a `[Int]` of 6-bit values. None on any invalid
+# char. Loops over the string by index to avoid materialising a
+# `[Char]` intermediate.
+fn b64_string_to_values(s: String, i: Int, acc: [Int]) : Option[[Int]] = {
+  if i >= string_length(s) { Some(list_reverse(acc)) }
+  else {
+    match char_at(s, i) {
+      None -> None
+      Some(c) -> match b64_char_value(c) {
+        None    -> None
+        Some(v) -> b64_string_to_values(s, i + 1, [v, ...acc])
+      }
+    }
+  }
+}
+
+# Reassemble bytes from 6-bit values. The block sizes mirror the
+# encoder: 4 values → 3 bytes, 3 values → 2 bytes, 2 values → 1
+# byte; any other tail length is invalid.
+fn b64_values_to_bytes(vs: [Int], acc: [Int]) : Option[[Int]] = match vs {
+  [] -> Some(list_reverse(acc))
+  [v0, v1] -> {
+    let n = (v0 * 4) + (v1 / 16)
+    Some(list_reverse([n, ...acc]))
+  }
+  [v0, v1, v2] -> {
+    let n = (v0 * 1024) + (v1 * 16) + (v2 / 4)
+    let b0 = (n / 256) % 256
+    let b1 = n % 256
+    # acc holds bytes in reverse order (most-recent-first); to keep
+    # b0 before b1 in the final output, prepend b1 first then b0.
+    Some(list_reverse([b1, b0, ...acc]))
+  }
+  [v0, v1, v2, v3, ...rest] -> {
+    let n = (v0 * 262144) + (v1 * 4096) + (v2 * 64) + v3
+    let b0 = (n / 65536) % 256
+    let b1 = (n / 256) % 256
+    let b2 = n % 256
+    b64_values_to_bytes(rest, [b2, b1, b0, ...acc])
+  }
+  _ -> None
+}
+
+# ---- Decoders ----------------------------------------------------
+
+pub fn base64_decode(s: String) : Option[[Int]] = {
+  let stripped = b64_strip_padding(s)
+  match b64_string_to_values(stripped, 0, []) {
+    None     -> None
+    Some(vs) -> b64_values_to_bytes(vs, [])
+  }
+}
+
+pub fn base64_decode_url(s: String) : Option[[Int]] =
+  base64_decode(s)
