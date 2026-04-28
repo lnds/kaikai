@@ -2543,6 +2543,14 @@ fn parse_ident_primary(p: Parser, t: Token) : PExpr {
   if name == "variants" and p_at(p1, TkLbracket) {
     parse_variants_of(p1, t)
   }
+  # m12.6.e: `ensure(value) where pred` primary — narrows `value`
+  # into the refined type via a runtime check, returning
+  # `Option[T]`. Recognised only when the call is followed by
+  # `where`; without it, `ensure(x)` parses as an ordinary call so
+  # user code that defines a function called `ensure` is unaffected.
+  else if name == "ensure" and p_at(p1, TkLparen) {
+    parse_ensure_primary(p1, t)
+  }
   # Lambda: `name => body`
   else if p_at(p1, TkFatArrow) {
     let p2 = p_advance(p1)
@@ -2592,6 +2600,61 @@ fn parse_variants_of(p: Parser, t: Token) : PExpr {
           } else {
             ok_e(p_advance(p4),
                   mk_expr(EVariantsOf(ty, []), t.line, t.col))
+          }
+        }
+      }
+    }
+  }
+}
+
+# m12.6.e: parse `ensure(value) where pred`. `p` is positioned at the
+# `(` of `ensure(...)`; `t` is the original `ensure` token. The form
+# desugars to:
+#   { let self = value
+#     if pred { Some(self) } else { None } }
+# `self` is bound to the value so the predicate (which conventionally
+# uses `self`, possibly elided in the leading-comparator form) sees it
+# as a regular local. Without a `where` suffix, `ensure(...)` falls
+# through to an ordinary call so user-defined `ensure` functions are
+# preserved.
+fn parse_ensure_primary(p: Parser, t: Token) : PExpr {
+  let p1 = p_skip_newlines(p_advance(p))
+  let rv = parse_expr(p1)
+  match rv.r {
+    None -> err_e(rv.p)
+    Some(value) -> {
+      let p2 = p_skip_newlines(rv.p)
+      if not p_at(p2, TkRparen) {
+        err_e(p_error_here(p2, "expected `)` after value in `ensure(...)`"))
+      } else {
+        let p3 = p_advance(p2)
+        if not p_at(p3, TkWhere) {
+          # No `where` suffix — fall back to an ordinary call so the
+          # name `ensure` remains usable as a regular function.
+          let callee = mk_expr(EVar("ensure"), t.line, t.col)
+          ok_e(p3, mk_expr(ECall(callee, [value]), t.line, t.col))
+        } else {
+          let p4 = p_skip_newlines(p_advance(p3))
+          let pred_r = parse_refinement_predicate(p4, t.line, t.col)
+          match pred_r.r {
+            None -> err_e(pred_r.p)
+            Some(pred) -> {
+              # Build the desugared block:
+              #   let self = value
+              #   if pred { Some(self) } else { None }
+              let self_let = SLet(mk_pat(PBind("self"), t.line, t.col),
+                                  None, value)
+              let self_var = mk_expr(EVar("self"), t.line, t.col)
+              let some_call = mk_expr(ECall(
+                mk_expr(EVar("Some"), t.line, t.col),
+                [self_var]), t.line, t.col)
+              let none_var = mk_expr(EVar("None"), t.line, t.col)
+              let if_expr = mk_expr(EIf(pred, some_call, Some(none_var)),
+                                    t.line, t.col)
+              let block = mk_expr(EBlock([self_let], Some(if_expr)),
+                                  t.line, t.col)
+              ok_e(pred_r.p, block)
+            }
           }
         }
       }
@@ -3838,12 +3901,12 @@ fn is_cmp_token(k: TokKind) : Bool {
   else { false }
 }
 
-# Build `self <op> rhs` (or chained `self <op1> rhs1 <op2> rhs2`) when
-# the where clause begins with a bare comparator. The chained form is
-# supported because the spec lists `1 <= self <= 65535` as the canonical
-# bounded-interval syntax; with `self` elided that becomes
-# `where 1 <= <= 65535`, which is awkward, so we only desugar the
-# leading comparator and then let parse_expr take over for the rest.
+# Build `self <op> rhs` when the where clause begins with a bare
+# comparator. Emitted as an EBinop so the typer / codegen treat it
+# identically to a written-out comparison. The spec's bounded-interval
+# form `1 <= self <= 65535` is not chained here because parse_expr
+# rejects non-associative comparison chaining; users who want both
+# sides write `where 1 <= self and self <= 65535`.
 fn parse_refinement_cmp_with(p: Parser, lhs: Expr, line: Int, col: Int) : PExpr {
   let op_tok = p_peek(p)
   let op_name = cmp_op_name(op_tok.kind)
@@ -3852,9 +3915,8 @@ fn parse_refinement_cmp_with(p: Parser, lhs: Expr, line: Int, col: Int) : PExpr 
   match rhs.r {
     None -> rhs
     Some(rv) -> {
-      let call = mk_expr(ECall(mk_expr(EVar(op_name), line, col), [lhs, rv]),
-                         line, col)
-      PExpr { p: rhs.p, r: Some(call) }
+      let cmp = mk_expr(EBinop(op_name, lhs, rv), line, col)
+      PExpr { p: rhs.p, r: Some(cmp) }
     }
   }
 }
