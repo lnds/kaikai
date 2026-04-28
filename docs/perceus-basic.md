@@ -368,19 +368,33 @@ infrastructure but stop short of flipping the runtime:
 
 ### Numbers (kaic2 self-compile)
 
-| version    | alloc       | free   | leaked      | live_peak   |
-|------------|-------------|--------|-------------|-------------|
-| pre-m5     | 130,735,107 | 3.5 M  | 127,189,128 | 127,189,128 |
-| m5 #3      | 138,684,259 | 3.8 M  | 134,899,614 | 134,899,614 |
-| m5 #7      |  29,533,152 |     37 |  29,533,115 |  29,533,115 |
-| m5 #9 s2   |  33,020,295 |     39 |  33,020,256 |  33,020,256 |
+| version            | alloc        | free      | leaked       | live_peak    |
+|--------------------|--------------|-----------|--------------|--------------|
+| pre-m5             | 130,735,107  | 3.5 M     | 127,189,128  | 127,189,128  |
+| m5 #3              | 138,684,259  | 3.8 M     | 134,899,614  | 134,899,614  |
+| m5 #7              |  29,533,152  |     37    |  29,533,115  |  29,533,115  |
+| m5 #9 s2           |  33,020,295  |     39    |  33,020,256  |  33,020,256  |
+| m5.x flip Phase 1  |  40,635,512  |     614   |  40,634,898  |  40,634,898  |
+| m5.x flip Phase 3  |  69,714,160  | 22.8 M    |  46,876,299  |  46,876,299  |
 
 The +3.5 M alloc delta from m5 #7 to m5 #9-step-2 is the perceus
 walker's own source code (~550 new lines in compiler.kai itself);
-the dup wrapping and drop emission do not allocate. Once stage 1
-gains a perceus pass and step 3 lands, the dup/drop machinery
-should drop `live_peak` materially while keeping alloc near m5 #7
-levels.
+the dup wrapping and drop emission do not allocate.
+
+The m5.x flip Phase 3 (atomic Steps A+B+C+D, 2026-04-28) lands
+the runtime flip with producer-side incref-on-extract, exit
+drops on multi-use and LUBlocked params, and a stage-0
+eager-dup retrofit. Wall RSS drops from 6.25 GB to 3.02 GB
+(**52% reduction**); `live_peak` from 127.2 M to 46.9 M (**63%
+reduction**); `free_total` jumps from 39 to 22.8 M, evidence
+that the dup/drop discipline is finally consuming. The
++36.7 M alloc delta vs Phase 1 is the dup machinery firing
+(every multi-use read invokes `kai_internal_dup` →
+`kai_incref`, which counts as an alloc-side increment in
+the trace counters). Wall time grew from 2.15 s to 5.74 s
+(2.7×) due to per-allocation RC bookkeeping; Full Perceus
+(drop specialisation + unboxed primitives) is the path to
+shrink that. Detail: `docs/m5x-followup.md` §1 step 2c.
 
 ### What unblocks step 3+
 

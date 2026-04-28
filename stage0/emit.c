@@ -152,7 +152,13 @@ static void pat_add_locals(E *e, Node *pat) {
 static void emit_expr(E *e, Node *n);
 static void emit_stmt(E *e, Node *n);
 static void emit_pat_test(E *e, Node *pat, const char *scr);
-static void emit_pat_binds(E *e, Node *pat, const char *scr);
+/* `is_alias` = the scrutinee shares storage with its producer (variant args,
+ * cons head/tail). PBind/PAs emit `kai_incref(scr)` so the binding has its
+ * own owned reference, decoupled from the producer's slot. When false, the
+ * scrutinee is already owned (top-level _scr / _letv from a transferred RHS,
+ * or kai_field which already increfs its return) and the binding takes the
+ * ref directly. */
+static void emit_pat_binds(E *e, Node *pat, const char *scr, int is_alias);
 static void emit_string_expr(E *e, Node *s);
 static void emit_lambda_ref(E *e, Node *lam);
 
@@ -284,7 +290,16 @@ static void emit_ident_value(E *e, const char *name, size_t len) {
     const char *mapped = NULL;
     /* Locals shadow everything, same rationale as emit_ident_callee. */
     if (ls_has(e, name, len)) {
-        fprintf(e->out, "kai_%.*s", (int) len, name);
+        /* m5.x-flip Phase 3 — Step D eager-dup retrofit. Stage 0 has no
+         * perceus pass; under the linear-consumption runtime every read
+         * of a local that flows into a consuming primitive would free the
+         * binding mid-flight. Wrap every local read in kai_internal_dup
+         * so the binding's reference is preserved (the caller of the dup
+         * sees its own +1 ref; the binding's original ref stays alive).
+         * This brute-force eager-dup leaks one ref per binding (no exit
+         * drops in stage 0) but never UAFs. The leak baseline matches
+         * pre-flip behaviour where everything also leaked. */
+        fprintf(e->out, "kai_internal_dup(kai_%.*s)", (int) len, name);
         return;
     }
     if (find_variant(e, name, len, &arity)) {
@@ -814,15 +829,20 @@ static void emit_pat_test(E *e, Node *pat, const char *scr) {
     }
 }
 
-static void emit_pat_binds(E *e, Node *pat, const char *scr) {
+static void emit_pat_binds(E *e, Node *pat, const char *scr, int is_alias) {
     switch (pat->kind) {
         case N_PAT_WILD:
         case N_PAT_LIT:
             return;
 
         case N_PAT_BIND:
-            fprintf(e->out, "KaiValue *kai_%.*s = %s; ",
-                    (int) pat->name_len, pat->name, scr);
+            if (is_alias) {
+                fprintf(e->out, "KaiValue *kai_%.*s = kai_incref(%s); ",
+                        (int) pat->name_len, pat->name, scr);
+            } else {
+                fprintf(e->out, "KaiValue *kai_%.*s = %s; ",
+                        (int) pat->name_len, pat->name, scr);
+            }
             return;
 
         case N_PAT_LIST: {
@@ -833,14 +853,16 @@ static void emit_pat_binds(E *e, Node *pat, const char *scr) {
             for (size_t i = 0; i < n_fixed; ++i) {
                 char head[512];
                 snprintf(head, sizeof(head), "%s->as.cons.head", cur);
-                emit_pat_binds(e, pat->children[i], head);
+                /* cons.head is alias of cur's storage. */
+                emit_pat_binds(e, pat->children[i], head, 1);
                 char nxt[512];
                 snprintf(nxt, sizeof(nxt), "%s->as.cons.tail", cur);
                 memcpy(cur, nxt, sizeof(cur));
             }
             if (has_rest) {
                 Node *rest_pat = pat->children[n_fixed];
-                emit_pat_binds(e, rest_pat, cur);
+                /* rest is also alias of cur's storage. */
+                emit_pat_binds(e, rest_pat, cur, 1);
             }
             return;
         }
@@ -849,7 +871,8 @@ static void emit_pat_binds(E *e, Node *pat, const char *scr) {
             for (size_t i = 0; i < pat->n_children; ++i) {
                 char sub[512];
                 snprintf(sub, sizeof(sub), "%s->as.var.args[%zu]", scr, i);
-                emit_pat_binds(e, pat->children[i], sub);
+                /* variant arg slot is alias of scr's storage. */
+                emit_pat_binds(e, pat->children[i], sub, 1);
             }
             return;
         }
@@ -861,7 +884,8 @@ static void emit_pat_binds(E *e, Node *pat, const char *scr) {
                 snprintf(tmp, sizeof(tmp),
                          "kai_field(%s, \"%.*s\")", scr,
                          (int) pf->name_len, pf->name);
-                emit_pat_binds(e, pf->children[0], tmp);
+                /* kai_field already incrs its return; child is owned. */
+                emit_pat_binds(e, pf->children[0], tmp, 0);
             }
             return;
         }
@@ -887,7 +911,14 @@ static void emit_match(E *e, Node *m) {
         /* Each arm opens its own local scope so pattern bindings don't
            leak and don't shadow siblings. */
         ls_push_mark(e);
-        emit_pat_binds(e, pat, "_scr");
+        /* _scr is shared across all match arms — the next arm reads
+         * _scr's slots if this arm's pat_test or guard rejects, and a
+         * guard inside this arm may consume the binding (e.g. const-
+         * pattern desugar emits `__cv_NAME == NAME()`). Treat the
+         * binding as alias so PBind/PAs incref; subsequent arms keep
+         * a live _scr to test against. _scr leaks one ref per match,
+         * matching the pre-flip baseline. */
+        emit_pat_binds(e, pat, "_scr", 1);
         pat_add_locals(e, pat);
         if (has_guard) {
             fputs("if (kai_truthy(", e->out);
@@ -1116,7 +1147,8 @@ static void emit_let(E *e, Node *n) {
     fputs("KaiValue *_letv = ", e->out);
     emit_expr(e, val);
     fputs("; ", e->out);
-    emit_pat_binds(e, pat, "_letv");
+    /* _letv holds the RHS's owned ref; not aliased from any other producer. */
+    emit_pat_binds(e, pat, "_letv", 0);
     pat_add_locals(e, pat);
 }
 

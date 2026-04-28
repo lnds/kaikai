@@ -7872,21 +7872,43 @@ fn emit_pat_test_variant_record(src: String, name: String, fields: [PField], scr
   cat3(base, emit_pat_test_record_fields(src, fields, scr, fns, variants, lams), ")")
 }
 
-fn emit_pat_binds(src: String, pat: Pattern, scr: String, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+# `is_alias` = the scrutinee shares storage with its producer (variant args,
+# cons head/tail). PBind/PAs emit `kai_incref(scr)` so the binding has its
+# own owned reference. When false, scr is already owned (top-level _scr /
+# _letv from a transferred RHS, or `kai_field` which already increfs its
+# return) and the binding takes the ref directly. The producer-side incref
+# is the prerequisite for runtime-flip exit drops: a multi-use param
+# decref'd at exit must not free a value still pointed at by the original
+# scrutinee's variant slot — see `docs/m5x-followup.md` §1 step 2b.
+fn emit_pat_binds(src: String, pat: Pattern, scr: String, is_alias: Bool,
+                  fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   match pat.pkind {
     PWild -> ""
     PLit(_) -> ""
-    PBind(name) -> concat_all(["KaiValue *kai_", name, " = ", scr, "; "])
+    PBind(name) ->
+      if is_alias {
+        concat_all(["KaiValue *kai_", name, " = kai_incref(", scr, "); "])
+      } else {
+        concat_all(["KaiValue *kai_", name, " = ", scr, "; "])
+      }
     PList(pats, opt_rest) -> emit_pat_binds_list(src, pats, opt_rest, scr, 0, fns, variants, lams)
     PVariant(_, subs) -> emit_pat_binds_variant(src, subs, scr, 0, fns, variants, lams)
     PVariantRecord(_, fields) -> emit_pat_binds_record(src, fields, scr, fns, variants, lams)
     PRecord(fields) -> emit_pat_binds_record(src, fields, scr, fns, variants, lams)
     PHole(_) -> ""
     # m7d §14: bind the as-name to the whole scrutinee, then descend
-    # into the inner pattern's bindings on the same scrutinee.
-    PAs(name, sub) -> cat2(
-      concat_all(["KaiValue *kai_", name, " = ", scr, "; "]),
-      emit_pat_binds(src, sub, scr, fns, variants, lams))
+    # into the inner pattern's bindings on the same scrutinee. The
+    # bound name follows the outer is_alias; the sub-pattern always
+    # treats scr as alias because the as-bound name is now sharing
+    # storage with the sub-bindings even when scr was originally owned.
+    PAs(name, sub) -> {
+      let head_bind = if is_alias {
+        concat_all(["KaiValue *kai_", name, " = kai_incref(", scr, "); "])
+      } else {
+        concat_all(["KaiValue *kai_", name, " = ", scr, "; "])
+      }
+      cat2(head_bind, emit_pat_binds(src, sub, scr, true, fns, variants, lams))
+    }
   }
 }
 
@@ -7894,13 +7916,14 @@ fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[String],
                        cur: String, i: Int, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   match pats {
     [] -> match opt_rest {
-      Some(name) -> concat_all(["KaiValue *kai_", name, " = ", cur, "; "])
+      Some(name) -> concat_all(["KaiValue *kai_", name, " = kai_incref(", cur, "); "])
       None -> ""
     }
     [p, ...rest] -> {
       let head = cat2(cur, "->as.cons.head")
       let tail = cat2(cur, "->as.cons.tail")
-      cat2(emit_pat_binds(src, p, head, fns, variants, lams),
+      # cons.head / cons.tail are aliases of cur's storage.
+      cat2(emit_pat_binds(src, p, head, true, fns, variants, lams),
            emit_pat_binds_list(src, rest, opt_rest, tail, i + 1, fns, variants, lams))
     }
   }
@@ -7912,7 +7935,8 @@ fn emit_pat_binds_variant(src: String, subs: [Pattern], scr: String, i: Int,
     [] -> ""
     [sp, ...rest] -> {
       let sub_scr = concat_all([scr, "->as.var.args[", int_to_string(i), "]"])
-      cat2(emit_pat_binds(src, sp, sub_scr, fns, variants, lams),
+      # variant arg slot is alias of scr's storage.
+      cat2(emit_pat_binds(src, sp, sub_scr, true, fns, variants, lams),
            emit_pat_binds_variant(src, rest, scr, i + 1, fns, variants, lams))
     }
   }
@@ -7925,7 +7949,8 @@ fn emit_pat_binds_record(src: String, fields: [PField], scr: String,
     [pf, ...rest] -> match pf {
       PField(name, sub, _) -> {
         let tmp = concat_all(["kai_field(", scr, ", \"", name, "\")"])
-        cat2(emit_pat_binds(src, sub, tmp, fns, variants, lams),
+        # kai_field returns an incref'd value; child is owned.
+        cat2(emit_pat_binds(src, sub, tmp, false, fns, variants, lams),
              emit_pat_binds_record(src, rest, scr, fns, variants, lams))
       }
     }
@@ -7939,7 +7964,11 @@ fn emit_match_arm(src: String, a: Arm, fns: [EFn], variants: [EVar], lams: [LamI
   match a {
     Arm(pat, opt_guard, body) -> {
       let pt = emit_pat_test(src, pat, "_scr", fns, variants, lams)
-      let binds = emit_pat_binds(src, pat, "_scr", fns, variants, lams)
+      # _scr is shared across all match arms — subsequent arms re-read
+      # it after this one's pat_test/guard rejects, and a guard inside
+      # this arm may consume the binding (e.g. const-pattern desugar's
+      # `__cv_NAME == NAME()`). Treat as alias so PBind increfs.
+      let binds = emit_pat_binds(src, pat, "_scr", true, fns, variants, lams)
       let body_c = emit_expr(src,body, fns, variants, lams)
       match opt_guard {
         Some(g) -> {
@@ -9382,7 +9411,8 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
       # `drops` argument here is for PBind only.
       let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
                               int_to_string(pat.col)])
-      let binds = emit_pat_binds(src, pat, tmp, fns, variants, lams)
+      # _letv holds the RHS's owned ref; not aliased.
+      let binds = emit_pat_binds(src, pat, tmp, false, fns, variants, lams)
       concat_all(["KaiValue *", tmp, " = ", rhs_c, "; ", binds])
     }
   }
@@ -9478,7 +9508,8 @@ fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, fns: [EFn], variants: [EV
       # to avoid shadowing across nested let-destructurings.
       let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
                               int_to_string(pat.col)])
-      let binds = emit_pat_binds(src, pat, tmp, fns, variants, lams)
+      # _letv holds the RHS's owned ref; not aliased.
+      let binds = emit_pat_binds(src, pat, tmp, false, fns, variants, lams)
       concat_all(["KaiValue *", tmp, " = ", rhs_c, "; ", binds])
     }
   }
@@ -19069,6 +19100,17 @@ fn perceus_decl(d: Decl) : Decl {
       let body_with_drops = pcs_prepend_unused_drops(new_body, params, uses)
       DFn(is_pub, name, tparams, params, opt_ret, row, body_with_drops, ln, cl)
     }
+    # Test bodies are emitted as their own thunk fns; without rewriting
+    # them here, multi-use let-bindings inside test bodies (especially
+    # ones captured by closures) skip the dup pass and the closure body
+    # double-consumes its captures under the linear runtime. No params
+    # to drop, but the dup walker is still needed for in-body multi-use
+    # bindings.
+    DTest(desc, body, ln, cl) -> {
+      let uses = pcs_collect_uses_expr(body, [], false, [])
+      let new_body = pcs_rewrite_expr(body, [], uses, false)
+      DTest(desc, new_body, ln, cl)
+    }
     _ -> d
   }
 }
@@ -19490,32 +19532,63 @@ fn pcs_count_non_lam_uses(nm: String, uses: [Use], acc: Int) : Int {
   }
 }
 
-# ---- unused-param drops at body start ----
+# ---- per-param drops: entry for unused, exit for multi-use / blocked ----
 #
-# Phase 2 (exit drops for multi-use / blocked params) deferred — see
-# the lane retro at `docs/m5x-followup.md`. Adding callee-side exit
-# drops under the loose runtime is unsound because match-arm and
-# field-access destructures alias their producers' storage without an
-# incref; dropping the param frees memory the caller still references
-# via the shared producer (e.g. `synth` extracts `callee` from
-# `ECall(callee, args_)` and passes it to `synth_call`; an exit drop
-# in `synth_call` would free the variant slot still held by `e.kind`).
-# The exit-drop pass therefore lands together with the runtime flip
-# (Phase 3), which switches every primitive to consume its args and
-# every shared-storage producer to incref on extraction.
-
+# Categorisation by `last_use_for`:
+#   - LUUnused(p)         → drop at body entry (param never read; release
+#                           immediately).
+#   - LUBlocked(p)         → drop at body exit (a closure may keep the
+#                           param alive past the fn body via capture; the
+#                           closure-capture incref balances; the original
+#                           param ref is released when the fn returns).
+#   - LUAt + count >= 2    → drop at body exit (every read is dup-wrapped
+#                           per Phase 1, so the original ref is unconsumed
+#                           and must be released).
+#   - LUAt + count == 1    → no drop (the single read transfers the
+#                           original ref to its consumer).
+#
+# Wrap shape when both entry and exit drops are needed:
+#   EBlock([entry_drops..., SLet(__pcs_ret, body), exit_drops...],
+#          Some(EVar("__pcs_ret")))
+# `__pcs_ret` is reserved (no kaikai user-source name starts with `__`).
+# When neither set has drops, the body is returned unchanged so the
+# fixed-point selfhost sees no extra wrap on inert fns.
+#
+# This pass is sound only because `emit_pat_binds` increfs every alias
+# extraction (variant args, cons head/tail) — the shared-storage producer
+# (caller's `e.kind` / list cell) keeps its own ref independent of the
+# binding. The lane retro at `docs/m5x-followup.md` §1 step 2b explains
+# the previous attempt's UAF in `synth_call` and why incref-on-extract
+# (Step A here) is the prerequisite for this pass.
 fn pcs_prepend_unused_drops(body: Expr, params: [Param], uses: [Use]) : Expr {
-  let drops = pcs_collect_param_drops(params, uses, [])
-  match drops {
-    [] -> body
-    [_, ...__] -> Expr {
-      kind: EBlock(drops, Some(body)),
-      line: body.line, col: body.col, ty: body.ty
+  let entry = pcs_collect_entry_drops(params, uses, [])
+  let exit_ = pcs_collect_exit_drops(params, uses, [])
+  match entry {
+    [] -> match exit_ {
+      [] -> body
+      [_, ...__] -> pcs_wrap_with_exit(body, [], exit_)
+    }
+    [_, ...__] -> pcs_wrap_with_exit(body, entry, exit_)
+  }
+}
+
+fn pcs_wrap_with_exit(body: Expr, entry: [Stmt], exit_: [Stmt]) : Expr {
+  match exit_ {
+    [] -> Expr { kind: EBlock(entry, Some(body)), line: body.line, col: body.col, ty: body.ty }
+    [_, ...__] -> {
+      let ret_let = SLet(
+        Pattern { pkind: PBind("__pcs_ret"), line: body.line, col: body.col },
+        None,
+        body
+      )
+      let stmts = list_append(entry, [ret_let, ...exit_])
+      let tail = Expr { kind: EVar("__pcs_ret"), line: body.line, col: body.col, ty: body.ty }
+      Expr { kind: EBlock(stmts, Some(tail)), line: body.line, col: body.col, ty: body.ty }
     }
   }
 }
 
-fn pcs_collect_param_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
+fn pcs_collect_entry_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
   match params {
     [] -> list_reverse(acc)
     [p, ...rest] -> {
@@ -19523,7 +19596,24 @@ fn pcs_collect_param_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
         LUUnused(_) -> [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...acc]
         _ -> acc
       }
-      pcs_collect_param_drops(rest, uses, acc1)
+      pcs_collect_entry_drops(rest, uses, acc1)
+    }
+  }
+}
+
+fn pcs_collect_exit_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
+  match params {
+    [] -> list_reverse(acc)
+    [p, ...rest] -> {
+      let acc1 = match last_use_for(p.pname, uses) {
+        LUBlocked(_) -> [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...acc]
+        LUAt(_, _, _) ->
+          if pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 {
+            [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...acc]
+          } else { acc }
+        _ -> acc
+      }
+      pcs_collect_exit_drops(rest, uses, acc1)
     }
   }
 }
