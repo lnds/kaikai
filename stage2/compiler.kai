@@ -3556,9 +3556,25 @@ fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine {
                                  pat.line, pat.col)
             ArmRefine { p: rt.p, guard: Some(block) }
           }
+          # m12.6.x #3 v2: refinement-type aliases. `p : Port` lowers
+          # to `__ref_pred_Port(p)`. The synthesised pred fn lives in
+          # the post-parse pass `synthesize_refine_pred_fns`, which
+          # walks every `type X = Base where pred` and emits
+          # `fn __ref_pred_X(self: Base) : Bool [<refinement_pure>] = pred`.
+          # If the alias never resolves (e.g. typo), the resolver will
+          # report "undefined name `__ref_pred_<name>`" at this site —
+          # acceptable v1 diagnostic; a future iteration could pre-
+          # check at parse time.
+          TyName(tyname, []) -> {
+            let var_e = mk_expr(EVar(name), pat.line, pat.col)
+            let pred_fn = mk_expr(EVar(synth_refine_pred_fn_name(tyname)),
+                                   pat.line, pat.col)
+            let call = mk_expr(ECall(pred_fn, [var_e]), pat.line, pat.col)
+            ArmRefine { p: rt.p, guard: Some(call) }
+          }
           _ -> ArmRefine {
             p: p_error(rt.p, p_peek(p),
-                       "match-arm narrowing `: Type` requires a refinement type (`Int where ...`)"),
+                       "match-arm narrowing `: Type` requires either an inline `Int where ...` or a refinement-type alias name"),
             guard: None
           }
         }
@@ -3571,6 +3587,12 @@ fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine {
     }
   } }
 }
+
+# m12.6.x #3 v2: the synthesised pred-fn name for a refinement-type
+# alias. Centralised so the call-site builder and the post-parse
+# generator agree on the spelling.
+fn synth_refine_pred_fn_name(tyname: String) : String =
+  string_concat("__ref_pred_", tyname)
 
 # m12.6.x #3: combine two optional guards with `and`. When either
 # side is None, return the other; when both are present, build
@@ -4036,7 +4058,11 @@ fn parse_type_base(p: Parser) : PTy {
 fn parse_named_type(p: Parser, t: Token) : PTy {
   let name = tok_source(p.src, t)
   let p1 = p_advance(p)
-  if p_at(p1, TkLbracket) {
+  # m12.6.x #5 inline: peek-2 disambiguation. `Foo[<...>]` is the
+  # `[<refinement_pure>]` attribute (handled by the caller, e.g.
+  # parse_fn_decl), NOT a generic-type opener. So when `[` is
+  # followed by `<`, leave both tokens for the outer parser.
+  if p_at(p1, TkLbracket) and not tk_is(p_peek1(p1).kind, TkLt) {
     # Generic type: Name[T1, T2, ...]
     let p2 = p_skip_newlines(p_advance(p1))
     parse_type_args_loop(p2, [], name, t)
@@ -10144,6 +10170,52 @@ fn lower_axiom_one(d: Decl) : Decl {
     }
     _ -> d
   }
+}
+
+# m12.6.x #3 v2: synthesise a refinement-predicate fn for every
+# `type X = Base where pred` alias. The fn is named
+# `__ref_pred_X(self: Base) : Bool` and carries the same predicate
+# expression the user wrote. Wrapped in `DAttribPure` so the
+# refinement-pure validator admits calls to it inside contract
+# predicates. parse_optional_arm_refine references this name when
+# it sees `match { p : X -> ... }`; the resolver later binds the
+# call to this synthesised fn.
+fn synthesize_refine_pred_fns(decls: [Decl]) : [Decl] =
+  synth_refine_loop(decls, [])
+
+fn synth_refine_loop(decls: [Decl], acc: [Decl]) : [Decl] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let extra = synth_refine_for_decl(d)
+      let acc1 = list_append(extra, [d, ...acc])
+      synth_refine_loop(rest, acc1)
+    }
+  }
+}
+
+fn synth_refine_for_decl(d: Decl) : [Decl] {
+  match d {
+    DType(_, name, _, body, l, c) -> match body {
+      TBAlias(t) -> match t.tkind {
+        TyRefine(base, pred) -> [build_refine_pred_fn(name, base, pred, l, c)]
+        _ -> []
+      }
+      _ -> []
+    }
+    _ -> []
+  }
+}
+
+fn build_refine_pred_fn(tyname: String, base: TypeExpr, pred: Expr,
+                          l: Int, c: Int) : Decl {
+  let fn_name = synth_refine_pred_fn_name(tyname)
+  let self_param = Param { pname: "self", ptype: Some(base),
+                            pline: l, pcol: c }
+  let ret_ty = mk_ty(TyName("Bool", []), l, c)
+  let dfn = DFn(false, fn_name, [], [self_param], Some(ret_ty),
+                 REmpty, pred, l, c)
+  DAttribPure(dfn, l, c)
 }
 
 # m12.6.x #5(a) result: extracted refinement-pure fn names + the
@@ -25737,11 +25809,18 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             let module_table = match expanded { EP_Mod(_, mt) -> mt }
             let qualified_decls = rqc_decls(expanded_decls, module_table, path)
             let merged_raw = list_append(prelude_decls, qualified_decls)
+            # m12.6.x #3 v2: synthesise `__ref_pred_X` fn for every
+            # `type X = Base where pred` so match-arm narrowing
+            # `p : X` resolves cleanly (parse_optional_arm_refine
+            # emits an ECall to this name). Runs before
+            # extract_pure_names_decls so the synthesised fns'
+            # DAttribPure wrappers are picked up too.
+            let merged_raw_synth = synthesize_refine_pred_fns(merged_raw)
             # m12.6.x #5(a): unwrap DAttribPure → DFn before any other
             # walker runs. Captures the names marked
             # `[<refinement_pure>]` so the post-extract validation pass
             # admits them in contract predicates.
-            let pure_extract = extract_pure_names_decls(merged_raw)
+            let pure_extract = extract_pure_names_decls(merged_raw_synth)
             let user_pure_names = pure_extract.names
             let merged_raw_unwrapped = pure_extract.decls
             # m12.7: lower DAxiom → DFn(body=todo!) before any other
