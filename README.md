@@ -49,6 +49,12 @@ cc /tmp/stage1.c -I stage0 -o stage1/kaic1
 bin/kai run examples/phase4/hello.kai
 ```
 
+**Next step:** follow [`docs/tutorial.md`](docs/tutorial.md) for a
+30-minute ramp through the language — install, hello world,
+records / sums / pipes, custom effects, protocols, units of measure,
+refinements, fibers, and the builtin test runner. Each section runs
+against a numbered file in `examples/tutorial/`.
+
 ## Usage
 
 The `bin/kai` driver wraps `kaic1` + `cc`. Run a program:
