@@ -1216,6 +1216,12 @@ type Decl
   # annotation alongside the wrapped DType so the desugar pass has all
   # the data in one node.
   | DDerive([String], Decl, Int, Int)
+  # m12.6.x #5(a): `[<refinement_pure>]` attribute on a fn signature.
+  # Wraps a DFn so the post-parse `extract_pure_names_decls` walker
+  # can collect the marked names; the validator pass then admits
+  # calls to these names inside contract / refinement predicates.
+  # The wrapper is unwrapped before any other Decl walker runs.
+  | DAttribPure(Decl, Int, Int)
   # m12.5: unit declaration. `unit USD` (alias = None) introduces an
   # atomic unit symbol; `unit Newton = kg * m / sec^2` (alias = Some)
   # introduces a named alias whose RHS the resolver expands eagerly
@@ -4413,10 +4419,15 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
           else {
             # Optional effect-row suffix: `T / Io + Fail`. m7a #3b.
             let row_r = parse_row_suffix(ret_r.p)
+            # m12.6.x #5(a): optional `[<refinement_pure>]` attribute
+            # between the signature/row and the contract clauses. The
+            # parser uses peek-2 lookahead so a bare `[` (e.g. the
+            # rare list-type follow-up) doesn't trigger.
+            let attr = parse_optional_pure_attribute(p_skip_newlines(row_r.p))
             # m12.6.b: optional `requires` / `ensures` clauses between
             # the signature and the body. They desugar to asserts in
             # the body — see wrap_with_contracts.
-            let cc = parse_contracts_loop(p_skip_newlines(row_r.p), [], [])
+            let cc = parse_contracts_loop(p_skip_newlines(attr.p), [], [])
             let p4 = p_skip_newlines(cc.p)
             # Body: `= expr` or `{ block }`.
             if p_at(p4, TkEq) {
@@ -4426,7 +4437,8 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
                 None -> err_d(rb.p)
                 Some(body) -> {
                   let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, t.line, t.col)
-                  ok_d(rb.p, DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col))
+                  let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col)
+                  ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
                 }
               }
             } else if p_at(p4, TkLbrace) {
@@ -4436,7 +4448,8 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
                 None -> err_d(rb.p)
                 Some(body) -> {
                   let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, t.line, t.col)
-                  ok_d(rb.p, DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col))
+                  let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col)
+                  ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
                 }
               }
             } else {
@@ -4450,6 +4463,63 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
     }
   }
 }
+
+# m12.6.x #5(a): result of attempting to parse the optional
+# `[<refinement_pure>]` attribute after a fn signature / row. When
+# the bracket is absent (or doesn't open with `<`), `is_pure` stays
+# false and the parser is returned unchanged (peek-2 lookahead so a
+# bare `[` doesn't trigger).
+type PureAttr = { p: Parser, is_pure: Bool }
+
+fn parse_optional_pure_attribute(p: Parser) : PureAttr {
+  if not p_at(p, TkLbracket) { PureAttr { p: p, is_pure: false } }
+  else if not tk_is(p_peek1(p).kind, TkLt) {
+    PureAttr { p: p, is_pure: false }
+  } else {
+    let p1 = p_skip_newlines(p_advance(p))
+    let p2 = p_skip_newlines(p_advance(p1))
+    let id = p_peek(p2)
+    if not tk_is(id.kind, TkIdent) {
+      PureAttr {
+        p: p_error(p2, id, "expected attribute name after `[<`"),
+        is_pure: false
+      }
+    } else {
+      let attr_name = tok_source(p2.src, id)
+      let p3 = p_skip_newlines(p_advance(p2))
+      if not p_at(p3, TkGt) {
+        PureAttr {
+          p: p_error_here(p3, "expected `>` to close fn attribute"),
+          is_pure: false
+        }
+      } else {
+        let p4 = p_skip_newlines(p_advance(p3))
+        if not p_at(p4, TkRbracket) {
+          PureAttr {
+            p: p_error_here(p4, "expected `]` to close fn attribute"),
+            is_pure: false
+          }
+        } else {
+          let p5 = p_advance(p4)
+          if attr_name == "refinement_pure" {
+            PureAttr { p: p5, is_pure: true }
+          } else {
+            PureAttr {
+              p: p_error(p5, id, concat_all([
+                "unknown fn attribute `", attr_name,
+                "` — only `refinement_pure` is recognised in m12.6.x v1"
+              ])),
+              is_pure: false
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn maybe_wrap_pure(is_pure: Bool, dfn: Decl, line: Int, col: Int) : Decl =
+  if is_pure { DAttribPure(dfn, line, col) } else { dfn }
 
 # m12.6.b: contract-clause result. Carries the parser advanced past
 # all `requires` / `ensures` clauses plus the accumulated predicates.
@@ -4471,8 +4541,10 @@ fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts {
       None -> Contracts { p: pe.p, reqs: list_reverse(reqs), enss: list_reverse(enss) }
       Some(pred) -> {
         let p1 = check_pred_not_false(pe.p, pred, "requires", kw)
-        let p2 = check_pred_pure(p1, pred, "requires")
-        parse_contracts_loop(p2, [pred, ...reqs], enss)
+        # m12.6.x #5(a) v2: pure-call check moved to a post-parse pass
+        # so it can consult the program-wide list of fns marked with
+        # `[<refinement_pure>]`. See validate_contract_predicates_decls.
+        parse_contracts_loop(p1, [pred, ...reqs], enss)
       }
     }
   } else if p_at(p0, TkEnsures) {
@@ -4482,8 +4554,7 @@ fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts {
       None -> Contracts { p: pe.p, reqs: list_reverse(reqs), enss: list_reverse(enss) }
       Some(pred) -> {
         let p1 = check_pred_not_false(pe.p, pred, "ensures", kw)
-        let p2 = check_pred_pure(p1, pred, "ensures")
-        parse_contracts_loop(p2, reqs, [pred, ...enss])
+        parse_contracts_loop(p1, reqs, [pred, ...enss])
       }
     }
   } else {
@@ -4512,27 +4583,14 @@ fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts {
 # `[<refinement-pure>]` attribute on user fn signatures, so user fns
 # that *would* be marked pure are rejected today. The closed
 # prelude list below is the entirety of the allowed call surface.
-fn check_pred_pure(p: Parser, pred: Expr, kind: String) : Parser {
-  match find_impure_call(pred) {
-    None -> p
-    Some(name) -> p_error(p, p_peek(p), concat_all([
-      "`", kind, "` predicate calls non-pure function `", name,
-      "`. Refinement / contract predicates may only call the closed ",
-      "set: is_some, is_none, is_finite, is_nan, string_length, ",
-      "list_length, matches."
-    ]))
-  }
-}
-
 fn refinement_pure_names() : [String] = [
   "is_some", "is_none", "is_finite", "is_nan",
   "string_length", "list_length", "matches"
 ]
 
 # Walk an Expr looking for the first ECall whose callee is an EVar
-# not in the refinement-pure set. Returns the offending name, or
-# None if every call is permitted (or there are no calls).
-fn find_impure_call(e: Expr) : Option[String] {
+# not in `pure_names`. Returns the offending name, or None.
+fn find_impure_call(e: Expr, pure_names: [String]) : Option[String] {
   match e.kind {
     EInt(_) -> None
     EReal(_) -> None
@@ -4541,22 +4599,22 @@ fn find_impure_call(e: Expr) : Option[String] {
     EStr(_, _) -> None
     EUnit -> None
     EVar(_) -> None
-    EField(b, _) -> find_impure_call(b)
-    EIndex(a, b) -> match find_impure_call(a) {
+    EField(b, _) -> find_impure_call(b, pure_names)
+    EIndex(a, b) -> match find_impure_call(a, pure_names) {
       Some(n) -> Some(n)
-      None -> find_impure_call(b)
+      None -> find_impure_call(b, pure_names)
     }
-    EBinop(_, a, b) -> match find_impure_call(a) {
+    EBinop(_, a, b) -> match find_impure_call(a, pure_names) {
       Some(n) -> Some(n)
-      None -> find_impure_call(b)
+      None -> find_impure_call(b, pure_names)
     }
-    EUnop(_, x) -> find_impure_call(x)
-    EIf(c, t_, eo) -> match find_impure_call(c) {
+    EUnop(_, x) -> find_impure_call(x, pure_names)
+    EIf(c, t_, eo) -> match find_impure_call(c, pure_names) {
       Some(n) -> Some(n)
-      None -> match find_impure_call(t_) {
+      None -> match find_impure_call(t_, pure_names) {
         Some(n) -> Some(n)
         None -> match eo {
-          Some(eb) -> find_impure_call(eb)
+          Some(eb) -> find_impure_call(eb, pure_names)
           None -> None
         }
       }
@@ -4564,25 +4622,25 @@ fn find_impure_call(e: Expr) : Option[String] {
     ECall(callee, args_) -> {
       let callee_check = match callee.kind {
         EVar(name) ->
-          if list_has(refinement_pure_names(), name) { None }
+          if list_has(pure_names, name) { None }
           else { Some(name) }
         _ -> Some("<expression>")
       }
       match callee_check {
         Some(n) -> Some(n)
-        None -> find_impure_call_args(args_)
+        None -> find_impure_call_args(args_, pure_names)
       }
     }
     _ -> Some("<unsupported>")
   }
 }
 
-fn find_impure_call_args(args_: [Expr]) : Option[String] {
+fn find_impure_call_args(args_: [Expr], pure_names: [String]) : Option[String] {
   match args_ {
     [] -> None
-    [a, ...rest] -> match find_impure_call(a) {
+    [a, ...rest] -> match find_impure_call(a, pure_names) {
       Some(n) -> Some(n)
-      None -> find_impure_call_args(rest)
+      None -> find_impure_call_args(rest, pure_names)
     }
   }
 }
@@ -5978,6 +6036,12 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
     }
     DUse(name, line, col) ->
       emit_line(depth, "use #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+    # m12.6.x #5(a): unwrap and recurse so --ast shows the inner DFn
+    # alongside an attribute marker line.
+    DAttribPure(inner, line, col) -> {
+      emit_line(depth, "attrib refinement_pure @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_decl(inner, depth + 1)
+    }
   }
 }
 
@@ -6473,6 +6537,7 @@ fn chk_decl(e: Env, d: Decl) : Env {
     DUnit(_, _, _, _, _) -> e               # m12.5: unit declarations introduce no value bindings
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before chk runs
     DAxiom(_, _, _, _, _, _, _, _) -> e     # m12.7: rewritten to DFn by lower_axioms before chk runs
+    DAttribPure(inner, _, _) -> chk_decl(e, inner)  # m12.6.x #5(a)
   }
 }
 
@@ -6513,6 +6578,7 @@ fn register_one(e: Env, d: Decl) : Env {
     DUnit(_, _, _, _, _) -> e               # m12.5: unit names live in their own namespace, validated at type-resolve time
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before register_one runs
     DAxiom(_, name, _, _, _, _, _, _) -> env_add(e, name)  # m12.7: also rewritten to DFn by lower_axioms; case kept for completeness
+    DAttribPure(inner, _, _) -> register_one(e, inner)  # m12.6.x #5(a)
   }
 }
 
@@ -8161,6 +8227,7 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
     DUnit(_, _, _, _, _) -> st               # m12.5: no expressions in a unit decl
     DUse(_, _, _) -> st                       # m7e §25: stripped by desugar_use_decls; no expressions
     DAxiom(_, _, _, _, _, _, _, _) -> st     # m12.7: rewritten to DFn by lower_axioms; no expressions on the bare form
+    DAttribPure(inner, _, _) -> collect_decl(inner, st)  # m12.6.x #5(a)
   }
 }
 
@@ -10077,6 +10144,189 @@ fn lower_axiom_one(d: Decl) : Decl {
     }
     _ -> d
   }
+}
+
+# m12.6.x #5(a) result: extracted refinement-pure fn names + the
+# decls list with every DAttribPure unwrapped to its inner DFn so
+# downstream passes see ordinary fns.
+type PureExtract = { names: [String], decls: [Decl] }
+
+fn extract_pure_names_decls(decls: [Decl]) : PureExtract =
+  extract_pure_names_loop(decls, [], [])
+
+fn extract_pure_names_loop(decls: [Decl], names_acc: [String],
+                            decls_acc: [Decl]) : PureExtract {
+  match decls {
+    [] -> PureExtract { names: list_reverse(names_acc),
+                        decls: list_reverse(decls_acc) }
+    [d, ...rest] -> match d {
+      DAttribPure(inner, _, _) -> match inner {
+        DFn(_, n, _, _, _, _, _, _, _) ->
+          extract_pure_names_loop(rest, [n, ...names_acc], [inner, ...decls_acc])
+        _ -> extract_pure_names_loop(rest, names_acc, [inner, ...decls_acc])
+      }
+      _ -> extract_pure_names_loop(rest, names_acc, [d, ...decls_acc])
+    }
+  }
+}
+
+# m12.6.x #5(a): post-parse validation of contract predicates.
+# Walks every DFn body looking for SAsserts whose msg span tags
+# them as contract-derived (`"requires violated at ..."` or
+# `"ensures violated at ..."`) and runs find_impure_call on each
+# cond using `closed_pure_names ++ user_pure_names`. Returns the
+# error count; the driver folds it into the program's exit code.
+fn validate_contract_predicates_decls(decls: [Decl], user_pure: [String],
+                                       file: String) : Int {
+  let combined = list_append(refinement_pure_names(), user_pure)
+  validate_contract_decls_loop(decls, combined, file, 0)
+}
+
+fn validate_contract_decls_loop(decls: [Decl], pure_names: [String],
+                                 file: String, errs: Int) : Int {
+  match decls {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DFn(_, _, _, _, _, _, body, _, _) -> {
+        let de = validate_contract_expr(body, pure_names, file)
+        validate_contract_decls_loop(rest, pure_names, file, errs + de)
+      }
+      _ -> validate_contract_decls_loop(rest, pure_names, file, errs)
+    }
+  }
+}
+
+fn validate_contract_expr(e: Expr, pure_names: [String], file: String) : Int {
+  match e.kind {
+    EBlock(stmts, opt_tail) -> {
+      let s_errs = validate_contract_stmts(stmts, pure_names, file, 0)
+      let t_errs = match opt_tail {
+        Some(t) -> validate_contract_expr(t, pure_names, file)
+        None -> 0
+      }
+      s_errs + t_errs
+    }
+    EIf(c, t_, eo) -> {
+      let c_e = validate_contract_expr(c, pure_names, file)
+      let t_e = validate_contract_expr(t_, pure_names, file)
+      let e_e = match eo {
+        Some(eb) -> validate_contract_expr(eb, pure_names, file)
+        None -> 0
+      }
+      c_e + t_e + e_e
+    }
+    EMatch(scr, arms) -> {
+      let scr_e = validate_contract_expr(scr, pure_names, file)
+      validate_contract_arms(arms, pure_names, file, scr_e)
+    }
+    ECall(f, args_) -> {
+      let fe = validate_contract_expr(f, pure_names, file)
+      validate_contract_exprs(args_, pure_names, file, fe)
+    }
+    ELambda(_, body) -> validate_contract_expr(body, pure_names, file)
+    EBinop(_, a, b) -> validate_contract_expr(a, pure_names, file) +
+                        validate_contract_expr(b, pure_names, file)
+    EUnop(_, x) -> validate_contract_expr(x, pure_names, file)
+    EField(b, _) -> validate_contract_expr(b, pure_names, file)
+    _ -> 0
+  }
+}
+
+fn validate_contract_exprs(es: [Expr], pure_names: [String], file: String, acc: Int) : Int {
+  match es {
+    [] -> acc
+    [e, ...rest] -> validate_contract_exprs(rest, pure_names, file,
+                                             acc + validate_contract_expr(e, pure_names, file))
+  }
+}
+
+fn validate_contract_arms(arms: [Arm], pure_names: [String], file: String, acc: Int) : Int {
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, body) -> {
+        let g_e = match opt_g {
+          Some(g) -> validate_contract_expr(g, pure_names, file)
+          None -> 0
+        }
+        let b_e = validate_contract_expr(body, pure_names, file)
+        validate_contract_arms(rest, pure_names, file, acc + g_e + b_e)
+      }
+    }
+  }
+}
+
+fn validate_contract_stmts(stmts: [Stmt], pure_names: [String], file: String, acc: Int) : Int {
+  match stmts {
+    [] -> acc
+    [s, ...rest] -> {
+      let se = validate_contract_stmt(s, pure_names, file)
+      validate_contract_stmts(rest, pure_names, file, acc + se)
+    }
+  }
+}
+
+fn validate_contract_stmt(s: Stmt, pure_names: [String], file: String) : Int {
+  match s {
+    SAssert(cond, opt_msg) -> {
+      let kind_opt = contract_assert_kind(opt_msg)
+      let body_e = validate_contract_expr(cond, pure_names, file)
+      match kind_opt {
+        None -> body_e
+        Some(kind) -> match find_impure_call(cond, pure_names) {
+          None -> body_e
+          Some(name) -> {
+            diag_error_from_src(file, "", cond.line, cond.col,
+              concat_all([
+                "`", kind, "` predicate calls non-pure function `", name,
+                "`. Refinement / contract predicates may only call ",
+                "the closed pure-prelude set or fns marked ",
+                "`[<refinement_pure>]`."
+              ]))
+            body_e + 1
+          }
+        }
+      }
+    }
+    SLet(_, _, rhs) -> validate_contract_expr(rhs, pure_names, file)
+    SExprStmt(x) -> validate_contract_expr(x, pure_names, file)
+    SIndexAssign(b, i, v, _, _) ->
+      validate_contract_expr(b, pure_names, file) +
+      validate_contract_expr(i, pure_names, file) +
+      validate_contract_expr(v, pure_names, file)
+    _ -> 0
+  }
+}
+
+# Detect a contract-derived SAssert by matching the msg span shape
+# preds_to_asserts emits. Returns the kind string, or None for
+# user-written asserts.
+fn contract_assert_kind(opt_msg: Option[Expr]) : Option[String] {
+  match opt_msg {
+    None -> None
+    Some(m) -> match m.kind {
+      EStr(span, false) ->
+        if string_starts_with_q(span, "\"requires violated") { Some("requires") }
+        else if string_starts_with_q(span, "\"ensures violated") { Some("ensures") }
+        else { None }
+      _ -> None
+    }
+  }
+}
+
+fn string_starts_with_q(s: String, prefix: String) : Bool =
+  starts_with_loop(s, prefix, 0)
+
+fn starts_with_loop(s: String, prefix: String, i: Int) : Bool {
+  let pn = string_length(prefix)
+  if i >= pn { true }
+  else { match char_at(s, i) {
+    None -> false
+    Some(sc) -> match char_at(prefix, i) {
+      None -> true
+      Some(pc) -> if sc == pc { starts_with_loop(s, prefix, i + 1) } else { false }
+    }
+  } }
 }
 
 fn desugar_var_decls(ds: [Decl]) : [Decl] = map(ds, desugar_var_decl)
@@ -12088,6 +12338,7 @@ fn dump_decl_type(d: Decl) : Unit / Console {
         None -> print("#{pub_s}axiom #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
       }
     }
+    DAttribPure(inner, _, _) -> dump_decl_type(inner)  # m12.6.x #5(a)
   }
 }
 
@@ -17331,6 +17582,10 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     # pass; the case is kept for completeness when expand_aliases_decl
     # is invoked on a pre-lowering decl stream (e.g., via --ast).
     DAxiom(_, _, _, _, _, _, _, _) -> d
+    # m12.6.x #5(a): DAttribPure unwraps before this pass runs in
+    # the driver; case kept for `--ast` and other early-pipeline
+    # callers that work on the raw decl stream.
+    DAttribPure(inner, l, c) -> DAttribPure(expand_unit_aliases_decl(inner, aliases), l, c)
   }
 }
 
@@ -25482,11 +25737,24 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             let module_table = match expanded { EP_Mod(_, mt) -> mt }
             let qualified_decls = rqc_decls(expanded_decls, module_table, path)
             let merged_raw = list_append(prelude_decls, qualified_decls)
+            # m12.6.x #5(a): unwrap DAttribPure → DFn before any other
+            # walker runs. Captures the names marked
+            # `[<refinement_pure>]` so the post-extract validation pass
+            # admits them in contract predicates.
+            let pure_extract = extract_pure_names_decls(merged_raw)
+            let user_pure_names = pure_extract.names
+            let merged_raw_unwrapped = pure_extract.decls
             # m12.7: lower DAxiom → DFn(body=todo!) before any other
             # Decl walker runs. Subsequent passes (alias resolution,
             # builtin injection, desugars, typer) see only ordinary
             # fns and never need to handle the DAxiom variant.
-            let merged = lower_axioms(merged_raw)
+            let merged = lower_axioms(merged_raw_unwrapped)
+            # m12.6.x #5(a): validate that every contract predicate
+            # only calls into the closed pure-prelude set + user-marked
+            # names. Errors accumulate; the count is folded into the
+            # exit code further below.
+            let pred_errs = validate_contract_predicates_decls(
+              merged, user_pure_names, path)
             # m7b #1b + m12.8 Phase 4b — closed effect aliases. Resolve
             # every `type Foo = Eff1 + Eff2 + ...` (and `type Foo = Eff`
             # single-name form) into a flat label set and rewrite every
@@ -25543,6 +25811,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             else if use_errs > 0 { use_errs }
             else if proto_errs > 0 { proto_errs }
             else if import_hole_errs > 0 { import_hole_errs }
+            else if pred_errs > 0 { pred_errs }
             else {
             match mode {
               MAst -> { dump_program(raw_decls); 0 }
