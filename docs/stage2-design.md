@@ -677,7 +677,9 @@ Rationale:
      validation pass that enforces them.
    - **#6 Compile-time errors** for trivially-false predicates.
    - **#7 Regex literals** (`String where matches /.../ `) —
-     blocks on a separate regex stdlib lane.
+     stdlib regex engine landed 2026-04-28 (`stdlib/regexp.kai`,
+     RE2-style); the refinement-side `where matches /.../` syntax
+     + lexer/parser integration is the remaining sub-lane.
    - **#8 Diagnostics quality** (predicate-aware panic messages) —
      lands either in m12.6.x or inside m11.
 7.5. **m12.7 (bootstrap helpers)** — `axiom name : T`. Optional,

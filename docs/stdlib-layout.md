@@ -337,12 +337,27 @@ than what a primitive module should expose.
 - `encoding.base64` — `encode`, `decode` (standard + URL-safe)
 - `encoding.hex` — `encode`, `decode`
 
-### regexp (pure, stage 2)
+### regexp (pure, stage 2) — **landed 2026-04-28**
 
-- `regexp` — `compile`, `match`, `find_all`, `replace`, `split` (top-level module)
+- `regexp` — `regex_compile`, `regex_match`, `regex_find_all`,
+  `regex_replace`, `regex_split` (top-level module). Pre-m14
+  flat-prefix names; rename to `regexp.match` etc. lands in m14.
 
-MVP target: RE2-style deterministic engine (no backreferences, linear
-time). Validation before stabilising syntax.
+RE2-style deterministic engine. Linear-time set-of-states (Pike)
+simulation; no backreferences, no lookaround, no Unicode property
+classes (ASCII semantics only). Subset shipped:
+  - Char literals + escapes (`\d \D \w \W \s \S` `.` `\n \t \r \\`).
+  - Character classes `[abc]`, `[^abc]`, `[a-z]`.
+  - Anchors `^` `$` (input-absolute, no multiline mode).
+  - Greedy quantifiers `* + ? {n} {n,} {n,m}`.
+  - Grouping `(...)` (numbered captures) and `(?:...)` (non-capturing).
+  - Alternation `a|b`.
+  - Replacement back-references `$0..$9`, `$$` for literal `$`.
+
+End-to-end fixture: `examples/stdlib/regex_basic.kai` (38-line
+golden covering match / captures / find_all / replace / split).
+Validation: `make test-stdlib` passes; selfhost OK on both C and
+LLVM backends.
 
 ### crypto (pure, stage 2)
 
