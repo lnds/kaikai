@@ -4393,19 +4393,42 @@ type Contracts = { p: Parser, reqs: [Expr], enss: [Expr] }
 fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts {
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRequires) {
+    let kw = p_peek(p0)
     let pe = parse_expr(p_skip_newlines(p_advance(p0)))
     match pe.r {
       None -> Contracts { p: pe.p, reqs: list_reverse(reqs), enss: list_reverse(enss) }
-      Some(pred) -> parse_contracts_loop(pe.p, [pred, ...reqs], enss)
+      Some(pred) -> {
+        let p1 = check_pred_not_false(pe.p, pred, "requires", kw)
+        parse_contracts_loop(p1, [pred, ...reqs], enss)
+      }
     }
   } else if p_at(p0, TkEnsures) {
+    let kw = p_peek(p0)
     let pe = parse_expr(p_skip_newlines(p_advance(p0)))
     match pe.r {
       None -> Contracts { p: pe.p, reqs: list_reverse(reqs), enss: list_reverse(enss) }
-      Some(pred) -> parse_contracts_loop(pe.p, reqs, [pred, ...enss])
+      Some(pred) -> {
+        let p1 = check_pred_not_false(pe.p, pred, "ensures", kw)
+        parse_contracts_loop(p1, reqs, [pred, ...enss])
+      }
     }
   } else {
     Contracts { p: p0, reqs: list_reverse(reqs), enss: list_reverse(enss) }
+  }
+}
+
+# m12.6.x #6: if a contract predicate folds to `false` at parse time,
+# emit a compile-time error pointing at the clause keyword. The
+# contract list still accumulates the predicate so downstream stmts
+# parse cleanly; the parser's `had_error` flag aborts code emission
+# at the end of the file, the same path as any other parse error.
+fn check_pred_not_false(p: Parser, pred: Expr, kind: String, kw: Token) : Parser {
+  match try_eval_pred(pred) {
+    Some(false) -> p_error(p, kw, concat_all([
+      "`", kind, "` predicate is statically `false` — the contract ",
+      "would always panic. Remove the clause or fix the predicate."
+    ]))
+    _ -> p
   }
 }
 
@@ -5250,7 +5273,15 @@ fn parse_import_selectives(p: Parser, acc: [String], path: String, t: Token) : P
 
 fn parse_program_loop(p: Parser, acc: [Decl]) : PParser {
   let p0 = p_skip_newlines(p)
-  if p_at(p0, TkEof) { PParser { p: p0, decls: Some(list_reverse(acc)) } }
+  if p_at(p0, TkEof) {
+    # m12.6.x #6: a parser that accumulated errors (e.g. via
+    # check_pred_not_false in parse_contracts_loop) must not let
+    # the driver claim success. Surface had_error as `decls: None`
+    # so the entry point exits non-zero, even when every decl
+    # parsed in shape.
+    if p0.had_error { PParser { p: p0, decls: None } }
+    else { PParser { p: p0, decls: Some(list_reverse(acc)) } }
+  }
   else {
     let r = parse_decl(p0)
     match r.r {
