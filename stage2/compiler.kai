@@ -10464,15 +10464,152 @@ fn desugar_const_refs_expr(e: Expr, const_names: [String]) : Expr {
       if list_has(const_names, name) {
         ECall(mk_expr(EVar(name), e.line, e.col), [])
       } else { e.kind }
-    # §29 limitation: identifiers that appear inside `#{...}` string
-    # interpolation are NOT rewritten here because the legacy
-    # emit-time path re-parses the EStr span directly, bypassing
-    # this walker. Use explicit parens (`#{MAX_PORT()}`) inside
-    # interpolations until the textual span-rewrite ships.
+    # §29 v2: rewrite identifiers inside `#{...}` interpolation
+    # spans textually so the legacy emit-time path that re-parses
+    # the EStr span sees `NAME()` instead of `NAME`.
+    EStr(span, is_triple) ->
+      EStr(rewrite_const_refs_in_span(span, const_names), is_triple)
+    # §29 v3 pattern-side: rewrite a match arm whose pattern is a
+    # bare `PBind(name)` matching a const into a wildcard bind plus
+    # a synthesised guard `__cv == NAME()`. AND-combines with any
+    # explicit `if user_pred`. This makes `match n { ZERO -> ... }`
+    # work as comparison instead of silently binding.
+    EMatch(scr, arms) ->
+      EMatch(desugar_const_refs_expr(scr, const_names),
+              map(arms, (a) => desugar_const_refs_arm(a, const_names)))
     _ -> map_expr_kind(e.kind, (sub) => desugar_const_refs_expr(sub, const_names))
   }
   Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty }
 }
+
+fn desugar_const_refs_arm(a: Arm, const_names: [String]) : Arm {
+  match a {
+    Arm(pat, opt_g, body) -> {
+      let body2 = desugar_const_refs_expr(body, const_names)
+      let g2_orig = match opt_g {
+        Some(g) -> Some(desugar_const_refs_expr(g, const_names))
+        None -> None
+      }
+      desugar_const_refs_arm_pat(pat, g2_orig, body2, const_names)
+    }
+  }
+}
+
+fn desugar_const_refs_arm_pat(pat: Pattern, opt_g: Option[Expr], body: Expr,
+                                const_names: [String]) : Arm {
+  # Both PBind(name) (lowercase pattern bind) and PVariant(name, [])
+  # (uppercase parsed as zero-arg variant) participate. The user
+  # writes `MAX_PORT` and the parser's lex-time uppercase rule
+  # produces a PVariant; for const semantics we treat it like a
+  # bind that compares.
+  match pat.pkind {
+    PBind(name) -> arm_for_const_or_pass(pat, name, [], opt_g, body, const_names)
+    PVariant(name, subs) ->
+      if subs == [] {
+        arm_for_const_or_pass(pat, name, [], opt_g, body, const_names)
+      } else { Arm(pat, opt_g, body) }
+    _ -> Arm(pat, opt_g, body)
+  }
+}
+
+fn arm_for_const_or_pass(pat: Pattern, name: String, _ignored: [Pattern],
+                           opt_g: Option[Expr], body: Expr,
+                           const_names: [String]) : Arm {
+  if not list_has(const_names, name) { Arm(pat, opt_g, body) }
+  else {
+    let cv_name = string_concat("__cv_", name)
+    let new_pat = mk_pat(PBind(cv_name), pat.line, pat.col)
+    let cv_var = mk_expr(EVar(cv_name), pat.line, pat.col)
+    let const_call = mk_expr(ECall(mk_expr(EVar(name), pat.line, pat.col), []),
+                              pat.line, pat.col)
+    let extra_guard = mk_expr(EBinop("==", cv_var, const_call), pat.line, pat.col)
+    let combined = match opt_g {
+      None -> Some(extra_guard)
+      Some(ug) -> Some(mk_expr(EBinop("and", extra_guard, ug),
+                                 pat.line, pat.col))
+    }
+    Arm(new_pat, combined, body)
+  }
+}
+
+# §29 v2 textual rewrite. Walks the span byte-by-byte. State is
+# the index `i` and a Bool `inside` (true while we're between `#{`
+# and the matching `}`). Inside a segment we look for identifiers;
+# every identifier whose lexeme matches a const name gets a `()`
+# suffix appended. Outside segments the bytes are copied verbatim.
+fn rewrite_const_refs_in_span(span: String, names: [String]) : String {
+  let n = string_length(span)
+  rcr_main(span, names, n, 0, "", false)
+}
+
+fn rcr_main(span: String, names: [String], n: Int, i: Int, acc: String, inside: Bool) : String {
+  if i >= n { acc } else { rcr_step(span, names, n, i, acc, inside) }
+}
+
+fn rcr_step(span: String, names: [String], n: Int, i: Int, acc: String, inside: Bool) : String {
+  let c = char_at_or_zero(span, i)
+  if not inside { rcr_outside(span, names, n, i, acc, c) }
+  else { rcr_inn(span, names, n, i, acc, c) }
+}
+
+fn char_at_or_zero(span: String, i: Int) : Char {
+  match char_at(span, i) {
+    Some(c) -> c
+    None -> 'x'
+  }
+}
+
+fn rcr_outside(span: String, names: [String], n: Int, i: Int, acc: String, c: Char) : String {
+  if char_to_int(c) == 35 { rcr_after_hash(span, names, n, i, acc) }
+  else { rcr_main(span, names, n, i + 1, append_char(acc, c), false) }
+}
+
+# Char `#` at position i. Check if next char is `{` to switch into
+# interp mode; otherwise copy the `#` literally.
+fn rcr_after_hash(span: String, names: [String], n: Int, i: Int, acc: String) : String {
+  let nxt = char_at_or_zero(span, i + 1)
+  if char_to_int(nxt) == 123 {
+    rcr_main(span, names, n, i + 2, cat2(cat2(acc, "#"), "{"), true)
+  } else {
+    rcr_main(span, names, n, i + 1, append_char(acc, '#'), false)
+  }
+}
+
+fn rcr_inn(span: String, names: [String], n: Int, i: Int, acc: String, c: Char) : String {
+  if char_to_int(c) == 125 {
+    rcr_main(span, names, n, i + 1, cat2(acc, "}"), false)
+  } else {
+    rcr_innc(span, names, n, i, acc, c)
+  }
+}
+
+fn rcr_innc(span: String, names: [String], n: Int, i: Int, acc: String, c: Char) : String {
+  if ch_is_alpha(c) {
+    rcr_inid(span, names, n, i, acc)
+  } else {
+    rcr_main(span, names, n, i + 1, append_char(acc, c), true)
+  }
+}
+
+fn rcr_inid(span: String, names: [String], n: Int, i: Int, acc: String) : String {
+  let id_end = scan_ident_end(span, n, i + 1)
+  let ident = string_slice(span, i, id_end - i)
+  let has = list_has(names, ident)
+  let suffix = if has { "()" } else { "" }
+  rcr_main(span, names, n, id_end, cat2(acc, cat2(ident, suffix)), true)
+}
+
+fn scan_ident_end(span: String, n: Int, i: Int) : Int {
+  if i >= n { i } else { scan_ident_step(span, n, i) }
+}
+
+fn scan_ident_step(span: String, n: Int, i: Int) : Int {
+  let c = char_at_or_zero(span, i)
+  if ch_is_alnum(c) { scan_ident_end(span, n, i + 1) }
+  else { i }
+}
+
+fn append_char(acc: String, c: Char) : String = cat2(acc, "#{c}")
 
 # m12.6.x #3 v2: synthesise a refinement-predicate fn for every
 # `type X = Base where pred` alias. The fn is named

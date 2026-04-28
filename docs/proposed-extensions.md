@@ -2055,24 +2055,34 @@ What this v1 does NOT cover:
   predicates inside `SAssert` bodies — rewriting every
   `EVar(NAME)` to `ECall(EVar(NAME), [])`.
 
-### What still doesn't work in v1
+### What landed in v2 + v3 (2026-04-28 follow-up)
 
-- **Inside `#{...}` string interpolations.** The legacy
-  emit-time path re-parses the EStr span directly, bypassing the
-  AST walker. Workaround: write `#{MAX_PORT()}` with explicit
-  parens. A future iteration will textually rewrite identifiers
-  inside `#{...}` segments at the span level.
-- **Pattern-side constants.** `match n { ZERO -> ... }` still
-  binds `ZERO` as a fresh name. Adding `PConstRef(name)` is the
-  next ½-day extension.
+- **Inside `#{...}` string interpolations.** Now works. The
+  desugar walks every EStr span and rewrites identifier tokens
+  inside `#{...}` segments to `NAME()` textually before the
+  legacy emit-time path re-parses the span. Identifiers OUTSIDE
+  segments are preserved verbatim. Implementation note: a
+  literal `"#{"` in the rewriter source must be split as
+  `cat2("#", "{")` because kaikai's lexer treats `#{` inside a
+  string literal as the start of an interpolation — that single
+  obstacle is what blocked the v1 attempt.
+- **Pattern-side constants.** Now works for `match n { ZERO ->
+  ... }`. Both `PBind(name)` (lowercase) and `PVariant(name, [])`
+  (uppercase, parsed as zero-arg variant by the lex-time rule)
+  participate. The arm desugars to `match n { __cv_NAME if
+  __cv_NAME == NAME() -> body }`, AND-combining with any
+  explicit `if user_pred`.
+
+### What still doesn't work
+
 - **Non-literal RHS.** `const TWO_PI : Real = 2.0 * PI` works
-  syntactically — the body is any Expr — but the typer / runtime
-  evaluate the call every time `TWO_PI` is referenced. A
+  syntactically — the body is any Expr — but the runtime
+  evaluates the call every time `TWO_PI` is referenced. A
   compile-time evaluator (extending `try_eval_pred` from
   m12.6.d) would inline the constant; deferred.
 - **Compound constants.** `const ORIGIN : Point = Point { x: 0,
-  y: 0 }` ships as a runtime call. Extending the const-folder
-  to record literals is the v2 work.
+  y: 0 }` ships as a runtime call. Extending the const-folder to
+  record literals is future work.
 
 ### Open question
 
