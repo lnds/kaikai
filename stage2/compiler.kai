@@ -3120,23 +3120,257 @@ fn parse_if(p: Parser, t: Token) : PExpr {
 
 fn parse_match(p: Parser, t: Token) : PExpr {
   let p1 = p_advance(p)
-  # m7b §1: same as `if` — scrutinee cannot eat the `{` that opens
+  # m7b §1: same as `if` — scrutinees cannot eat the `{` that opens
   # the arms block as a trailing lambda.
   let prev_atl = p1.allow_trailing_lambda
   let ps = p_with_trailing_lambda(p1, false)
   let rs = parse_expr(ps)
   match rs.r {
     None -> err_e(rs.p)
-    Some(scrut) -> {
-      let p2 = p_skip_newlines(p_with_trailing_lambda(rs.p, prev_atl))
+    Some(scrut1) -> {
+      # m7d §27: comma after the first scrutinee opens multi-scrutinee
+      # match — `match e1, e2, ..., eN { p1, p2, ..., pN -> body | ... }`.
+      # Parser-only sugar: desugars to nested EMatch over each column,
+      # with fall-through to the remaining arms duplicated at the
+      # column-1 wildcard branch. For N=1 (the original form), the
+      # behaviour is unchanged.
+      let r_more = parse_more_scruts(rs.p, [scrut1])
+      let p2 = p_skip_newlines(p_with_trailing_lambda(r_more.p, prev_atl))
       if not p_at(p2, TkLbrace) {
         err_e(p_error_here(p2, "expected `{` after `match` expression"))
       } else {
-        parse_match_arms(p_skip_newlines(p_advance(p2)), [], scrut, t)
+        let scruts = list_reverse(r_more.r)
+        let n = list_length(scruts)
+        if n == 1 {
+          parse_match_arms(p_skip_newlines(p_advance(p2)), [], scrut1, t)
+        } else {
+          parse_multi_match_arms(p_skip_newlines(p_advance(p2)), [], scruts, n, t)
+        }
       }
     }
   }
 }
+
+# m7d §27: collect additional scrutinees after the first. `acc` is in
+# reverse order; caller reverses. Returns the parser state pointing
+# at the first non-`,` non-newline token.
+type PScruts = { p: Parser, r: [Expr] }
+
+fn parse_more_scruts(p: Parser, acc: [Expr]) : PScruts {
+  let p0 = p_skip_newlines(p)
+  if not p_at(p0, TkComma) { PScruts { p: p0, r: acc } }
+  else {
+    let p1 = p_skip_newlines(p_advance(p0))
+    let r = parse_expr(p1)
+    match r.r {
+      None    -> PScruts { p: r.p, r: acc }
+      Some(e) -> parse_more_scruts(r.p, [e, ...acc])
+    }
+  }
+}
+
+# m7d §27: a multi-scrutinee arm carries N patterns (where N ==
+# number of scrutinees). Mirrors `Arm` but with a list of patterns
+# instead of a single one. Lives only in the parser; the desugar
+# rewrites every MArm into nested standard `Arm`s before the AST
+# leaves the parser.
+type MArm = MArm([Pattern], Option[Expr], Expr)
+
+# m7d §27: parse arms where each arm has N patterns separated by commas,
+# optional guard, `->`, body. Stops at `}`.
+fn parse_multi_match_arms(p: Parser, acc: [MArm], scruts: [Expr], n: Int, t: Token) : PExpr {
+  let p0 = p_skip_newlines_and_semis(p)
+  if p_at(p0, TkRbrace) {
+    let p1 = p_advance(p0)
+    let arms_in_order = list_reverse(acc)
+    let desugared = desugar_multi_match(scruts, arms_in_order, t.line, t.col)
+    ok_e(p1, desugared)
+  } else {
+    let ra = parse_multi_arm(p0, n)
+    match ra.r {
+      None -> err_e(ra.p)
+      Some(arm) -> parse_multi_match_arms(ra.p, [arm, ...acc], scruts, n, t)
+    }
+  }
+}
+
+# m7d §27: parse N comma-separated patterns followed by optional guard,
+# `->`, body. The arity must match `n` (scrutinee count); mismatched
+# arities are a parse error per the §27 spec.
+type PMArm = { p: Parser, r: Option[MArm] }
+
+fn err_marm(p: Parser) : PMArm = PMArm { p: p, r: None }
+fn ok_marm(p: Parser, m: MArm) : PMArm = PMArm { p: p, r: Some(m) }
+
+fn parse_multi_arm(p: Parser, n: Int) : PMArm {
+  let r_pats = parse_n_patterns(p, n, [])
+  match r_pats.r {
+    None -> err_marm(r_pats.p)
+    Some(pats) -> {
+      let p1 = p_skip_newlines(r_pats.p)
+      let guard_opt_r =
+        if p_at(p1, TkIf) {
+          let prev_atl = p1.allow_trailing_lambda
+          let pg = p_with_trailing_lambda(p_advance(p1), false)
+          let rg = parse_expr(pg)
+          let rg_p = p_with_trailing_lambda(rg.p, prev_atl)
+          match rg.r {
+            None -> PExpr { p: rg_p, r: None }
+            Some(g) -> PExpr { p: rg_p, r: Some(g) }
+          }
+        } else {
+          PExpr { p: p1, r: None }
+        }
+      let p2 = p_skip_newlines(guard_opt_r.p)
+      if not p_at(p2, TkArrow) {
+        err_marm(p_error_here(p2, "expected `->` in multi-arg match arm"))
+      } else {
+        let p3 = p_skip_newlines(p_advance(p2))
+        let rb = parse_expr(p3)
+        match rb.r {
+          None -> err_marm(rb.p)
+          Some(body) -> ok_marm(rb.p, MArm(pats, guard_opt_r.r, body))
+        }
+      }
+    }
+  }
+}
+
+# m7d §27: parse exactly `n` patterns, separated by commas. Returns
+# None if any pattern fails to parse or if the comma count does not
+# match (n-1 commas expected between n patterns).
+type PPatN = { p: Parser, r: Option[[Pattern]] }
+
+fn err_patn(p: Parser) : PPatN = PPatN { p: p, r: None }
+fn ok_patn(p: Parser, ps: [Pattern]) : PPatN = PPatN { p: p, r: Some(ps) }
+
+fn parse_n_patterns(p: Parser, n: Int, acc: [Pattern]) : PPatN {
+  if n == 0 {
+    ok_patn(p, list_reverse(acc))
+  } else {
+    let rp = parse_pattern(p)
+    match rp.r {
+      None -> err_patn(rp.p)
+      Some(pat) -> {
+        let next = n - 1
+        if next == 0 { ok_patn(rp.p, list_reverse([pat, ...acc])) }
+        else {
+          let p1 = p_skip_newlines(rp.p)
+          if not p_at(p1, TkComma) {
+            err_patn(p_error_here(p1, "expected `,` between multi-arg match patterns"))
+          } else {
+            parse_n_patterns(p_skip_newlines(p_advance(p1)), next, [pat, ...acc])
+          }
+        }
+      }
+    }
+  }
+}
+
+# m7d §27: build the desugared AST. The shape is:
+#
+#   {
+#     let __mm_s_0 = e0
+#     let __mm_s_1 = e1
+#     ...
+#     match __mm_s_0 {
+#       p0_arm0 -> match __mm_s_1 { p1_arm0 -> ... pN_arm0 -> body_arm0 | _ -> fall_arm1 }
+#       _       -> fall_arm1
+#     }
+#   }
+#
+# where `fall_arm1` is the same shape recursively built over arm 1.
+# The base case (no arms left) is a panic via `Fail.fail`. Bodies
+# are duplicated only structurally — kaikai bodies are immutable
+# Exprs, so the duplication does not cost runtime evaluation, only
+# emitted-code size. For typical demo arities (N=2, K=3) the blow-up
+# is bounded.
+fn desugar_multi_match(scruts: [Expr], arms: [MArm], line: Int, col: Int) : Expr {
+  let stmts = build_scrut_lets(scruts, 0, [])
+  let scrut_vars = make_scrut_var_exprs(scruts, 0, line, col)
+  let body = build_multi_match_chain(scrut_vars, arms, line, col)
+  mk_expr(EBlock(list_reverse(stmts), Some(body)), line, col)
+}
+
+# m7d §27: emit `let __mm_s_i = scrut_i` statements, in the order
+# they appear; returned reversed so the desugar wraps them with
+# `list_reverse` to restore source order.
+fn build_scrut_lets(scruts: [Expr], i: Int, acc: [Stmt]) : [Stmt] {
+  match scruts {
+    [] -> acc
+    [e, ...rest] -> {
+      let nm = scrut_var_name(i)
+      let pat = mk_pat(PBind(nm), e.line, e.col)
+      build_scrut_lets(rest, i + 1, [SLet(pat, None, e), ...acc])
+    }
+  }
+}
+
+fn make_scrut_var_exprs(scruts: [Expr], i: Int, line: Int, col: Int) : [Expr] {
+  match scruts {
+    [] -> []
+    [_, ...rest] -> [
+      mk_expr(EVar(scrut_var_name(i)), line, col),
+      ...make_scrut_var_exprs(rest, i + 1, line, col)
+    ]
+  }
+}
+
+fn scrut_var_name(i: Int) : String =
+  string_concat("__mm_s_", int_to_string(i))
+
+# m7d §27: recursive builder for the arm chain. At each arm,
+# constructs an EMatch over scrut_var_0 with two arms:
+#   - column-1 pattern -> nested match on remaining columns
+#   - wildcard         -> fall-through to next arm
+# Both branches reference the same fall-through subtree, which is
+# computed once but referenced twice (the AST is shared structurally
+# since `Expr` values are immutable). When `arms` is empty, returns
+# a panic via Fail-style trap.
+fn build_multi_match_chain(scrut_vars: [Expr], arms: [MArm], line: Int, col: Int) : Expr {
+  match arms {
+    [] -> non_exhaustive_trap(line, col)
+    [head, ...rest] -> {
+      let fall = build_multi_match_chain(scrut_vars, rest, line, col)
+      build_one_marm(scrut_vars, head, fall, line, col)
+    }
+  }
+}
+
+# m7d §27: lower one MArm into the nested-EMatch chain it stands for,
+# wiring the failing-pattern branch to `fall`. The guard, when present,
+# is attached to the innermost arm (last column).
+fn build_one_marm(scrut_vars: [Expr], arm: MArm, fall: Expr, line: Int, col: Int) : Expr {
+  match arm {
+    MArm(pats, guard, body) -> build_marm_columns(scrut_vars, pats, guard, body, fall, line, col)
+  }
+}
+
+fn build_marm_columns(scrut_vars: [Expr], pats: [Pattern], guard: Option[Expr],
+                       body: Expr, fall: Expr, line: Int, col: Int) : Expr {
+  match scrut_vars {
+    [] -> body
+    [sv, ...rest_svs] -> match pats {
+      [] -> body
+      [p, ...rest_ps] -> {
+        let inner = match rest_ps {
+          [] -> Arm(p, guard, body)
+          _  -> Arm(p, None, build_marm_columns(rest_svs, rest_ps, guard, body, fall, line, col))
+        }
+        let wild = mk_pat(PWild, line, col)
+        mk_expr(EMatch(sv, [inner, Arm(wild, None, fall)]), line, col)
+      }
+    }
+  }
+}
+
+# m7d §27: trap for "no arm matched". Uses `todo!` (m7d §1) which
+# behaves like a panic at runtime and matches any expected type in
+# inference, without forcing the surrounding fn to declare a `/ Fail`
+# row. v2 can refine to a static cross-column exhaustiveness check
+# that elides the trap when arms statically cover the cartesian space.
+fn non_exhaustive_trap(line: Int, col: Int) : Expr =
+  mk_expr(ETodo("non-exhaustive multi-arg match"), line, col)
 
 fn parse_match_arms(p: Parser, acc: [Arm], scrut: Expr, t: Token) : PExpr {
   let p0 = p_skip_newlines_and_semis(p)
