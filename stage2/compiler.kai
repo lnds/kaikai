@@ -1193,7 +1193,17 @@ type Decl
   # Each name in tparams is a quantified type variable in scope across
   # the param types, return type, row, and body. Generalised in
   # fn_scheme_of_decl so each call site fresh-instantiates.
-  = DFn(Bool, String, [String], [Param], Option[TypeExpr], RowExpr, Expr, Int, Int)
+  #
+  # m6.2 v2: trailing `Option[String]` is the *module origin* — the
+  # surface name of the module that owns this decl, or None for
+  # decls authored in the root file. expand_imports + the prelude
+  # loader populate it (every imported / preloaded decl gets a
+  # `Some(<surface_name>)`); the parser produces only `None`. The
+  # codegen mints `kai_<m>__<name>` for `Some(m)` and `kai_<name>`
+  # for `None`, which lets two modules export the same bare name
+  # without a linker collision and lets a root-file `fn sum`
+  # silently shadow `pub fn sum` exported by a prelude.
+  = DFn(Bool, String, [String], [Param], Option[TypeExpr], RowExpr, Expr, Int, Int, Option[String])
   | DType(Bool, String, [String], TypeBody, Int, Int)
   | DTest(String, Expr, Int, Int)
   | DImport(ImportKind, Int, Int)
@@ -4244,7 +4254,7 @@ fn parse_const_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
             match re.r {
               None -> err_d(re.p)
               Some(body) -> {
-                let dfn = DFn(is_pub, name, [], [], Some(ty), REmpty, body, t.line, t.col)
+                let dfn = DFn(is_pub, name, [], [], Some(ty), REmpty, body, t.line, t.col, None)
                 ok_d(re.p, DAttribPure(dfn, t.line, t.col))
               }
             }
@@ -4509,7 +4519,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
                 None -> err_d(rb.p)
                 Some(body) -> {
                   let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, t.line, t.col)
-                  let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col)
+                  let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
                   ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
                 }
               }
@@ -4520,7 +4530,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
                 None -> err_d(rb.p)
                 Some(body) -> {
                   let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, t.line, t.col)
-                  let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col)
+                  let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
                   ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
                 }
               }
@@ -5305,7 +5315,7 @@ fn ival_bind_pat(pat: Pattern, iv: Interval, env: IntervalEnv) : IntervalEnv = m
 # flag and by the (future) unifier reshape that needs to consult
 # intervals at the body's tail expression.
 fn ival_of_decl(d: Decl) : Interval = match d {
-  DFn(_, _, _, params, _, _, body, _, _) ->
+  DFn(_, _, _, params, _, _, body, _, _, _) ->
     ival_of_expr(body, ival_seed_params(params, ie_empty()))
   _ -> ITop
 }
@@ -5595,8 +5605,8 @@ fn prepend_impl_tparams_to_methods(impl_tps: [String], ms: [Decl]) : [Decl] {
 
 fn prepend_impl_tparams_to_method(impl_tps: [String], d: Decl) : Decl {
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, list_append(impl_tps, tps), ps, ret, row, body, l, c)
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, n, list_append(impl_tps, tps), ps, ret, row, body, l, c, mo)
     _ -> d
   }
 }
@@ -6412,7 +6422,7 @@ fn row_label_names(labels: [RowLabel]) : [String] {
 
 fn dump_decl(d: Decl, depth: Int) : Unit {
   match d {
-    DFn(is_pub, name, tparams, params, opt_ret, row, body, line, col) -> {
+    DFn(is_pub, name, tparams, params, opt_ret, row, body, line, col, _) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       emit_line(depth, "fn #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
       tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
@@ -6955,7 +6965,7 @@ fn add_params(e: Env, ps: [Param]) : Env {
 
 fn chk_decl(e: Env, d: Decl) : Env {
   match d {
-    DFn(_, _, _, params, _, _, body, _, _) -> {
+    DFn(_, _, _, params, _, _, body, _, _, _) -> {
       let e1 = env_push(e)
       let e2 = add_params(e1, params)
       let e3 = chk_expr(e2, body)
@@ -7004,7 +7014,7 @@ fn register_decls(e: Env, ds: [Decl]) : Env {
 
 fn register_one(e: Env, d: Decl) : Env {
   match d {
-    DFn(_, name, _, _, _, _, _, _, _) -> env_add(e, name)
+    DFn(_, name, _, _, _, _, _, _, _, _) -> env_add(e, name)
     DType(_, name, _, body, _, _) -> {
       let e1 = env_add(e, name)
       match body {
@@ -7175,7 +7185,7 @@ fn check_row_labels(decls: [Decl], file: String, eff_names: [String],
 fn check_decl_row_labels(d: Decl, file: String, eff_names: [String],
                           arities: [EffArity]) : Int {
   match d {
-    DFn(_, _, _, _, _, rexpr, _, line, col) ->
+    DFn(_, _, _, _, _, rexpr, _, line, col, _) ->
       check_row_expr(rexpr, file, line, col, eff_names, arities)
     _ -> 0
   }
@@ -7268,16 +7278,93 @@ fn join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 # falling back to a local. Stage 1 does the same; both tables are
 # lists of sum-variant pairs.
 
-type EFn  = EFn(String, Int)
+# m6.2 v2: EFn now carries the decl's module of origin. None for
+# decls authored in the root file; Some(m) for decls imported from
+# module `m` (or pulled in via --prelude, see expand_imports +
+# load_prelude). Codegen reads the field to mint `kai_<m>__<name>`
+# vs `kai_<name>`, and to disambiguate two-modules-export-same-name
+# at bare-name call sites.
+type EFn  = EFn(String, Int, Option[String])
 type EVar = EV(String, Int)
 
-fn efn_find(fns: [EFn], target: String) : Option[Int] {
+fn efn_find(fns: [EFn], target: String) : Option[EFn] {
   match fns {
     [] -> None
     [h, ...rest] -> match h {
-      EFn(n, ar) -> if n == target { Some(ar) } else { efn_find(rest, target) }
+      EFn(n, _, _) -> if n == target { Some(h) } else { efn_find(rest, target) }
     }
   }
+}
+
+# m6.2 v2: bare-name lookup with the disambiguation rule. Returns:
+#   - the unique entry, when there is exactly one;
+#   - the root-file entry (module_origin = None) when present, even
+#     if other modules also export the same name (locals-shadow rule
+#     applied at top-level scope);
+#   - None when zero matches OR when there are multiple module-origin
+#     matches and no root-file entry (ambiguity — the codegen
+#     emit_named_call_lookup falls back to a closure thunk lookup
+#     against `kai_<name>` plain, which lets the linker fail with a
+#     clear undefined-symbol error in the rare unhandled case; the
+#     proper diagnostic ("ambiguous reference to ...") fires from
+#     check_efn_ambiguity at decl-registration time).
+fn efn_resolve(fns: [EFn], target: String) : Option[EFn] {
+  let candidates = efn_collect_matching(fns, target, [])
+  match candidates {
+    []     -> None
+    [one]  -> Some(one)
+    _      -> match efn_pick_root(candidates) {
+                Some(r) -> Some(r)
+                None    -> None
+              }
+  }
+}
+
+fn efn_collect_matching(fns: [EFn], target: String, acc: [EFn]) : [EFn] {
+  match fns {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      EFn(n, _, _) ->
+        if n == target { efn_collect_matching(rest, target, [h, ...acc]) }
+        else           { efn_collect_matching(rest, target, acc) }
+    }
+  }
+}
+
+fn efn_pick_root(cands: [EFn]) : Option[EFn] {
+  match cands {
+    [] -> None
+    [h, ...rest] -> match h {
+      EFn(_, _, None) -> Some(h)
+      _ -> efn_pick_root(rest)
+    }
+  }
+}
+
+# m6.2 v2: arity helper that wraps the new resolver. Codegen call
+# sites that previously consumed `Option[Int]` keep working unchanged.
+fn efn_find_arity(fns: [EFn], target: String) : Option[Int] = match efn_resolve(fns, target) {
+  Some(EFn(_, ar, _)) -> Some(ar)
+  None                -> None
+}
+
+# m6.2 v2: produce the C-symbol suffix (everything after the `kai_`
+# prefix) for a named function. None → just the bare name; Some(m) →
+# the module-prefixed `<m>__<name>`. Used to mint the symbol at decl
+# emission, in call sites, and in closure-thunk forward decls so all
+# three stay in sync.
+fn c_sym(name: String, mo: Option[String]) : String = match mo {
+  None    -> name
+  Some(m) -> string_concat(m, string_concat("__", name))
+}
+
+# m6.2 v2: mint the C-symbol suffix for a callee resolved via the
+# EFn table. Falls back to the bare name when the lookup misses (e.g.
+# the callee is a closure variable held in a local that gets routed
+# through `kai_apply` instead).
+fn c_sym_of_callee(fns: [EFn], callee: String) : String = match efn_resolve(fns, callee) {
+  Some(EFn(_, _, mo)) -> c_sym(callee, mo)
+  None                -> callee
 }
 
 fn evar_find(vs: [EVar], target: String) : Option[Int] {
@@ -7291,7 +7378,7 @@ fn evar_find(vs: [EVar], target: String) : Option[Int] {
 
 fn fn_of_decl(d: Decl) : Option[EFn] {
   match d {
-    DFn(_, name, _, params, _, _, _, _, _) -> Some(EFn(name, list_length(params)))
+    DFn(_, name, _, params, _, _, _, _, _, mo) -> Some(EFn(name, list_length(params), mo))
     _ -> None
   }
 }
@@ -7304,6 +7391,89 @@ fn register_fn_decls(decls: [Decl]) : [EFn] {
       None -> register_fn_decls(rest)
     }
   }
+}
+
+# m6.2 v2: a pair of an ambiguous bare-name and the surface names of
+# the modules that export it. Constructed by `find_ambig_efns` and
+# consumed by `report_ambig_efns` (compile-time warning) and
+# `is_ambig_name` (codegen-time short-circuit).
+type AmbigEntry = AmbE(String, [String])
+
+# m6.2 v2: return one AmbigEntry per name N that is exported by two
+# or more modules and has no root-file definition. Only such names
+# are ambiguous at a bare-name call site — when a root entry exists,
+# the locals-shadow-imports rule (efn_pick_root) picks the root
+# silently; when only one module exports the name, the resolution
+# is unique. Iteration is O(|fns|^2) — fine, |fns| stays in the
+# low thousands even with the full prelude chain loaded.
+fn find_ambig_efns(fns: [EFn]) : [AmbigEntry] = find_ambig_loop(fns, [], [])
+
+fn find_ambig_loop(fns: [EFn], seen: [String], acc: [AmbigEntry]) : [AmbigEntry] {
+  match fns {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      EFn(n, _, _) ->
+        if list_has(seen, n) { find_ambig_loop(rest, seen, acc) }
+        else {
+          let cands = efn_collect_matching(fns, n, [])
+          let count = list_length(cands)
+          if count <= 1 { find_ambig_loop(rest, [n, ...seen], acc) }
+          else {
+            match efn_pick_root(cands) {
+              Some(_) -> find_ambig_loop(rest, [n, ...seen], acc)
+              None    -> {
+                let mods = ambig_mods_of(cands, [])
+                let entry = AmbE(n, mods)
+                find_ambig_loop(rest, [n, ...seen], [entry, ...acc])
+              }
+            }
+          }
+        }
+    }
+  }
+}
+
+fn ambig_mods_of(cands: [EFn], acc: [String]) : [String] {
+  match cands {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      EFn(_, _, None)    -> ambig_mods_of(rest, acc)
+      EFn(_, _, Some(m)) ->
+        if list_has(acc, m) { ambig_mods_of(rest, acc) }
+        else                { ambig_mods_of(rest, [m, ...acc]) }
+    }
+  }
+}
+
+# m6.2 v2: emit a stderr warning for each ambiguous bare-name. The
+# warning fires at the start of every kaic2 invocation that loads a
+# prelude chain in which two modules export the same bare name with
+# no root-file shadow. It does NOT depend on the user's program
+# actually using the name — that filtering would cost a body walk
+# we do not want to pay on every compile. If the warning fires and
+# the user code does not reference the name, the diagnostic is
+# harmless (no link error follows); if the user code does reference
+# it, the link will fail with `undefined reference to 'kai_<name>'`
+# and the warning explains why.
+fn report_ambig_efns(amb: [AmbigEntry]) : Unit / Console = match amb {
+  [] -> ()
+  [a, ...rest] -> match a {
+    AmbE(name, mods) -> {
+      eprint(concat_all([
+        "warning: bare name '", name,
+        "' is exported by multiple modules with no root-file shadow: ",
+        join_with(mods, ", "),
+        "; use a qualified call (e.g. ", list_head_or(mods, "<mod>"),
+        ".", name, "(...)) to disambiguate"
+      ]))
+      report_ambig_efns(rest)
+    }
+  }
+}
+
+fn list_head_or(xs: [String], fallback: String) : String = match xs {
+  [] -> fallback
+  [h, ...rest] -> h
 }
 
 fn builtin_variants() : [EVar] =
@@ -7432,9 +7602,9 @@ fn emit_ident_value(name: String, lcs: [String], fns: [EFn], variants: [EVar]) :
         EP(_, cname, ar) ->
           cat5("kai_closure(&_", cname, "_thunk, ", int_to_string(ar), ", 0, NULL)")
       }
-      None -> match efn_find(fns, name) {
-        Some(ar) ->
-          cat5("kai_closure(&_kai_", name, "_thunk, ", int_to_string(ar), ", 0, NULL)")
+      None -> match efn_resolve(fns, name) {
+        Some(EFn(_, ar, mo)) ->
+          cat5("kai_closure(&_kai_", c_sym(name, mo), "_thunk, ", int_to_string(ar), ", 0, NULL)")
         None -> cat2("kai_", name)
       }
     }
@@ -7622,14 +7792,14 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn
         emit_named_call_lookup(callee, args_e, call_args, lcs, fns, variants)
       }
     }
-    # m6.2 Phase 3: qualified call. v1 shares the C symbol with the
-    # legacy unqualified form — the M6.1 concat semantics put
-    # `fname` in the global decl stream under its bare name, so
-    # the lookup is identical to `EVar(fname)` minus the special
-    # callees (resume / __perceus_* / unit_name / dotted op-call)
-    # that cannot reach a qualified call by construction.
-    EModCall(_, fname) ->
-      emit_named_call_lookup(fname, args_e, call_args, lcs, fns, variants)
+    # m6.2 Phase 3 / v2: qualified call `mod.fname(args)`. v2 mints
+    # `kai_<mod>__<fname>` directly from the EModCall payload — the
+    # resolver already verified `fname` is exported by `mod`, so we
+    # do not need to round-trip through emit_named_call_lookup (which
+    # would lose the qualified context and pick the wrong entry when
+    # two modules export the same bare name).
+    EModCall(mod, fname) ->
+      cat5("kai_", c_sym(fname, Some(mod)), "(", call_args, ")")
     _ -> {
       let fc = emit_expr(src, f, lcs, fns, variants, lams)
       concat_all([
@@ -7661,8 +7831,8 @@ fn emit_pipe_named_lookup(callee: String, arity: Int, args_all: String, lcs: [St
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
       }
-      None -> match efn_find(fns, callee) {
-        Some(_) -> cat5("kai_", callee, "(", args_all, ")")
+      None -> match efn_resolve(fns, callee) {
+        Some(EFn(_, _, mo)) -> cat5("kai_", c_sym(callee, mo), "(", args_all, ")")
         None -> concat_all([
           "kai_apply(kai_", callee, ", ", int_to_string(arity),
           ", (KaiValue *[]){", args_all, "})"
@@ -7688,8 +7858,8 @@ fn emit_named_call_lookup(callee: String, args_e: [Expr], call_args: String, lcs
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
       }
-      None -> match efn_find(fns, callee) {
-        Some(_) -> cat5("kai_", callee, "(", call_args, ")")
+      None -> match efn_resolve(fns, callee) {
+        Some(EFn(_, _, mo)) -> cat5("kai_", c_sym(callee, mo), "(", call_args, ")")
         None -> concat_all([
           "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e)),
           ", (KaiValue *[]){", call_args, "})"
@@ -7707,11 +7877,13 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, lcs: [String], fns: [EFn], 
         let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
         emit_pipe_named_lookup(callee, list_length(args_e) + 1, args_all, lcs, fns, variants)
       }
-      # m6.2 Phase 3: piped qualified call `x |> mod.f(args)`.
-      EModCall(_, fname) -> {
+      # m6.2 Phase 3 / v2: piped qualified call `x |> mod.f(args)`.
+      # Mint the prefixed symbol directly — same logic as the
+      # non-piped EModCall branch in emit_call_expr.
+      EModCall(mod, fname) -> {
         let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams)
         let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-        emit_pipe_named_lookup(fname, list_length(args_e) + 1, args_all, lcs, fns, variants)
+        cat5("kai_", c_sym(fname, Some(mod)), "(", args_all, ")")
       }
       _ -> {
         let fc = emit_expr(src, f, lcs, fns, variants, lams)
@@ -7724,9 +7896,9 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, lcs: [String], fns: [EFn], 
       }
     }
     EVar(callee) -> emit_pipe_named_lookup(callee, 1, lhs_c, lcs, fns, variants)
-    # m6.2 Phase 3: piped qualified-call shorthand `x |> mod.f` (no
-    # parens) — same lookup as the parens form.
-    EModCall(_, fname) -> emit_pipe_named_lookup(fname, 1, lhs_c, lcs, fns, variants)
+    # m6.2 Phase 3 / v2: piped qualified-call shorthand `x |> mod.f`
+    # (no parens) — same direct mint as the parens form.
+    EModCall(mod, fname) -> cat5("kai_", c_sym(fname, Some(mod)), "(", lhs_c, ")")
     _ -> concat_all([
       "kai_apply(", emit_expr(src, rhs, lcs, fns, variants, lams),
       ", 1, (KaiValue *[]){", lhs_c, "})"
@@ -8727,7 +8899,7 @@ fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect {
 
 fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
   match d {
-    DFn(_, _, _, _, _, _, body, _, _) -> collect_expr(body, st)
+    DFn(_, _, _, _, _, _, body, _, _, _) -> collect_expr(body, st)
     DType(_, _, _, _, _, _) -> st
     DTest(_, body, _, _) -> collect_expr(body, st)
     DImport(_, _, _) -> st
@@ -8753,7 +8925,7 @@ fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect {
 
 # Globals: prelude names + user fn names + variant ctor names. Used as a
 # cheap "this ident does not need to be captured" test.
-fn efn_name(e: EFn) : String = match e { EFn(n, _) -> n }
+fn efn_name(e: EFn) : String = match e { EFn(n, _, _) -> n }
 fn evar_name(v: EVar) : String = match v { EV(n, _) -> n }
 
 fn build_globals(fns: [EFn], variants: [EVar], eff_names: [String], op_quals: [String]) : [String] {
@@ -9248,12 +9420,17 @@ fn emit_expr(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [EVar], 
     # was validated as nullary at typing time, so emit_variant_call
     # with arity 0 / empty arg array is correct.
     EVariantsOf(_, names) -> emit_variants_of_list(names)
-    # m6.2 Phase 3: qualified call as an expression value (callee
-    # of an ECall is handled in emit_call_expr; this branch covers
-    # `let f = list.map`-style first-class references). Mirrors
-    # `EVar(fname)` since v1 shares the C symbol with the legacy
-    # unqualified form.
-    EModCall(_, fname) -> emit_ident_value(fname, lcs, fns, variants)
+    # m6.2 Phase 3 / v2: qualified call as an expression value
+    # (callee of an ECall is handled in emit_call_expr; this branch
+    # covers `let f = list.map`-style first-class references). Mint
+    # the prefixed thunk symbol directly from the EModCall payload.
+    # `emit_ident_value(fname, ...)` would lose the qualified context
+    # and pick the wrong entry in the ambiguous-name case.
+    EModCall(mod, fname) -> match efn_resolve(fns, fname) {
+      Some(EFn(_, ar, _)) ->
+        cat5("kai_closure(&_kai_", c_sym(fname, Some(mod)), "_thunk, ", int_to_string(ar), ", 0, NULL)")
+      None -> cat2("kai_", fname)
+    }
   }
 }
 
@@ -9729,23 +9906,23 @@ fn emit_fn_signature(name: String, params: [Param]) : String =
 
 fn emit_fn_forward(d: Decl) : String {
   match d {
-    DFn(_, name, _, params, _, _, _, _, _) -> cat2(emit_fn_signature(name, params), ";\n")
+    DFn(_, name, _, params, _, _, _, _, _, mo) -> cat2(emit_fn_signature(c_sym(name, mo), params), ";\n")
     _ -> ""
   }
 }
 
 fn emit_thunk_forward(d: Decl) : String {
   match d {
-    DFn(_, name, _, _, _, _, _, _, _) ->
-      cat3("static KaiValue *_kai_", name, "_thunk(KaiValue *, KaiValue **, int);\n")
+    DFn(_, name, _, _, _, _, _, _, _, mo) ->
+      cat3("static KaiValue *_kai_", c_sym(name, mo), "_thunk(KaiValue *, KaiValue **, int);\n")
     _ -> ""
   }
 }
 
 fn emit_fn_body(src: String, d: Decl, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   match d {
-    DFn(_, name, _, params, _, _, body, _, _) -> {
-      let sig = emit_fn_signature(name, params)
+    DFn(_, name, _, params, _, _, body, _, _, mo) -> {
+      let sig = emit_fn_signature(c_sym(name, mo), params)
       # Seed the local-name scope with the fn's parameters so an
       # `EVar(pname)` reference inside the body emits the local C
       # variable read (`kai_<pname>`) rather than a closure-thunk
@@ -9773,14 +9950,15 @@ fn emit_param_reads(params: [Param], start: Int) : String {
 
 fn emit_fn_thunk(d: Decl) : String {
   match d {
-    DFn(_, name, _, params, _, _, _, _, _) -> {
+    DFn(_, name, _, params, _, _, _, _, _, mo) -> {
+      let sym = c_sym(name, mo)
       let param_reads = emit_param_reads(params, 0)
       let named_args = emit_param_args(params)
       let hdr = concat_all([
-        "static KaiValue *_kai_", name,
+        "static KaiValue *_kai_", sym,
         "_thunk(KaiValue *self, KaiValue **args, int n) {\n    (void) self; (void) n;\n"
       ])
-      let call = concat_all(["    return kai_", name, "(", named_args, ");\n}\n\n"])
+      let call = concat_all(["    return kai_", sym, "(", named_args, ");\n}\n\n"])
       concat_all([hdr, param_reads, call])
     }
     _ -> ""
@@ -9798,7 +9976,7 @@ fn thunk_forward_decls(decls: [Decl]) : String =
 fn fn_bodies(src: String, decls: [Decl], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
   concat_all(map(decls, (d) => {
     match d {
-      DFn(_, _, _, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, lcs, fns, variants, lams), emit_fn_thunk(d))
+      DFn(_, _, _, _, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, lcs, fns, variants, lams), emit_fn_thunk(d))
       _ -> ""
     }
   }))
@@ -9876,7 +10054,7 @@ fn has_main_decl(decls: [Decl]) : Bool {
   match decls {
     [] -> false
     [d, ...rest] -> match d {
-      DFn(_, n, _, _, _, _, _, _, _) -> if n == "main" { true } else { has_main_decl(rest) }
+      DFn(_, n, _, _, _, _, _, _, _, _) -> if n == "main" { true } else { has_main_decl(rest) }
       _ -> has_main_decl(rest)
     }
   }
@@ -10091,7 +10269,7 @@ fn main_row_labels(decls: [Decl]) : [String] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DFn(_, n, _, _, _, row, _, _, _) ->
+      DFn(_, n, _, _, _, row, _, _, _, _) ->
         if n == "main" {
           match row {
             REmpty       -> []
@@ -10373,8 +10551,8 @@ fn rewrite_alias_decls(ds: [Decl]) : [Decl] = map(ds, rewrite_alias_decl)
 
 fn rewrite_alias_decl(d: Decl) : Decl {
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, tps, ps, ret, row, rewrite_alias_expr(body, alias_map_empty()), l, c)
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, n, tps, ps, ret, row, rewrite_alias_expr(body, alias_map_empty()), l, c, mo)
     DTest(desc, body, l, c) ->
       DTest(desc, rewrite_alias_expr(body, alias_map_empty()), l, c)
     _ -> d
@@ -10701,8 +10879,8 @@ fn desugar_op_calls_decls(ds: [Decl], effs: [String]) : [Decl] =
 
 fn desugar_op_calls_decl(d: Decl, effs: [String]) : Decl {
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, tps, ps, ret, row, desugar_op_calls_expr(body, effs), l, c)
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, n, tps, ps, ret, row, desugar_op_calls_expr(body, effs), l, c, mo)
     DTest(desc, body, l, c) ->
       DTest(desc, desugar_op_calls_expr(body, effs), l, c)
     _ -> d
@@ -10758,8 +10936,8 @@ fn desugar_index_decls(ds: [Decl]) : [Decl] = map(ds, desugar_index_decl)
 
 fn desugar_index_decl(d: Decl) : Decl {
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, tps, ps, ret, row, desugar_index_expr(body), l, c)
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, n, tps, ps, ret, row, desugar_index_expr(body), l, c, mo)
     DTest(desc, body, l, c) -> DTest(desc, desugar_index_expr(body), l, c)
     _ -> d
   }
@@ -10867,7 +11045,7 @@ fn lower_axiom_one(d: Decl) : Decl {
     DAxiom(is_pub, name, tparams, params, ret_ty, row, l, c) -> {
       let msg = string_concat("axiom ", string_concat(name, " not bound"))
       let body = mk_expr(ETodo(msg), l, c)
-      DFn(is_pub, name, tparams, params, Some(ret_ty), row, body, l, c)
+      DFn(is_pub, name, tparams, params, Some(ret_ty), row, body, l, c, None)
     }
     _ -> d
   }
@@ -10886,7 +11064,7 @@ fn collect_const_names_loop(decls: [Decl], acc: [String]) : [String] {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
       DAttribPure(inner, _, _) -> match inner {
-        DFn(_, name, _, [], _, _, _, _, _) ->
+        DFn(_, name, _, [], _, _, _, _, _, _) ->
           collect_const_names_loop(rest, [name, ...acc])
         _ -> collect_const_names_loop(rest, acc)
       }
@@ -10907,14 +11085,14 @@ fn desugar_const_refs_decls(decls: [Decl], const_names: [String]) : [Decl] =
 
 fn desugar_const_refs_decl(d: Decl, const_names: [String]) : Decl {
   match d {
-    DFn(p, n, tps, ps, ret, row, body, l, c) -> {
+    DFn(p, n, tps, ps, ret, row, body, l, c, mo) -> {
       let ps2 = map(ps, (pm) => desugar_const_refs_param(pm, const_names))
       let ret2 = match ret {
         Some(t) -> Some(desugar_const_refs_typeexpr(t, const_names))
         None -> None
       }
       DFn(p, n, tps, ps2, ret2, row,
-          desugar_const_refs_expr(body, const_names), l, c)
+          desugar_const_refs_expr(body, const_names), l, c, mo)
     }
     DTest(desc, body, l, c) -> DTest(desc, desugar_const_refs_expr(body, const_names), l, c)
     DType(p, n, tps, body, l, c) -> DType(p, n, tps,
@@ -11163,7 +11341,7 @@ fn build_refine_pred_fn(tyname: String, base: TypeExpr, pred: Expr,
                             pline: l, pcol: c }
   let ret_ty = mk_ty(TyName("Bool", []), l, c)
   let dfn = DFn(false, fn_name, [], [self_param], Some(ret_ty),
-                 REmpty, pred, l, c)
+                 REmpty, pred, l, c, None)
   DAttribPure(dfn, l, c)
 }
 
@@ -11182,7 +11360,7 @@ fn extract_pure_names_loop(decls: [Decl], names_acc: [String],
                         decls: list_reverse(decls_acc) }
     [d, ...rest] -> match d {
       DAttribPure(inner, _, _) -> match inner {
-        DFn(_, n, _, _, _, _, _, _, _) ->
+        DFn(_, n, _, _, _, _, _, _, _, _) ->
           extract_pure_names_loop(rest, [n, ...names_acc], [inner, ...decls_acc])
         _ -> extract_pure_names_loop(rest, names_acc, [inner, ...decls_acc])
       }
@@ -11208,7 +11386,7 @@ fn validate_contract_decls_loop(decls: [Decl], pure_names: [String],
   match decls {
     [] -> errs
     [d, ...rest] -> match d {
-      DFn(_, _, _, _, _, _, body, _, _) -> {
+      DFn(_, _, _, _, _, _, body, _, _, _) -> {
         let de = validate_contract_expr(body, pure_names, file)
         validate_contract_decls_loop(rest, pure_names, file, errs + de)
       }
@@ -11354,8 +11532,8 @@ fn desugar_var_decls(ds: [Decl]) : [Decl] = map(ds, desugar_var_decl)
 
 fn desugar_var_decl(d: Decl) : Decl {
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, tps, ps, ret, row, desugar_var_expr(body), l, c)
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, n, tps, ps, ret, row, desugar_var_expr(body), l, c, mo)
     DTest(desc, body, l, c) -> DTest(desc, desugar_var_expr(body), l, c)
     _ -> d
   }
@@ -12364,10 +12542,10 @@ type UseRwDecl = { decl: Decl, errs: Int }
 fn use_rewrite_decl(d: Decl, table: [EffOps], file_opens: [String],
                       file: String, errs: Int) : UseRwDecl {
   match d {
-    DFn(p, n, tps, ps, ret, row, body, l, c) -> {
+    DFn(p, n, tps, ps, ret, row, body, l, c, mo) -> {
       let bound = use_param_names(ps, [])
       let r = use_rewrite_expr(body, table, file_opens, bound, file, errs)
-      UseRwDecl { decl: DFn(p, n, tps, ps, ret, row, r.expr, l, c),
+      UseRwDecl { decl: DFn(p, n, tps, ps, ret, row, r.expr, l, c, mo),
                   errs: r.errs }
     }
     DTest(desc, body, l, c) -> {
@@ -12426,8 +12604,8 @@ fn desugar_interp_decls(ds: [Decl], op_names: [String]) : [Decl] {
 
 fn desugar_interp_decl(d: Decl, op_names: [String]) : Decl {
   match d {
-    DFn(p, n, tps, ps, ret, row, body, l, c) ->
-      DFn(p, n, tps, ps, ret, row, desugar_interp_expr(body, op_names), l, c)
+    DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(p, n, tps, ps, ret, row, desugar_interp_expr(body, op_names), l, c, mo)
     DTest(desc, body, l, c) ->
       DTest(desc, desugar_interp_expr(body, op_names), l, c)
     _ -> d
@@ -13043,8 +13221,8 @@ fn dedup_row_labels_loop(ls: [RowLabel], seen: [String], acc: [RowLabel]) : [Row
 
 fn expand_aliases_in_decl(d: Decl, aliases: [AliasResult]) : Decl {
   match d {
-    DFn(p, n, tps, params, ret, rexpr, body, l, c) ->
-      DFn(p, n, tps, params, ret, expand_aliases_in_row(rexpr, aliases), body, l, c)
+    DFn(p, n, tps, params, ret, rexpr, body, l, c, mo) ->
+      DFn(p, n, tps, params, ret, expand_aliases_in_row(rexpr, aliases), body, l, c, mo)
     _ -> d
   }
 }
@@ -13135,7 +13313,7 @@ fn param_ty(pm: Param) : Ty {
 # decl has no signature shape (DType, DImport).
 fn sig_of_decl(d: Decl) : Option[Ty] {
   match d {
-    DFn(_, _, _, params, opt_ret, rexpr, _, _, _) -> {
+    DFn(_, _, _, params, opt_ret, rexpr, _, _, _, _) -> {
       let pts = map(params, param_ty)
       let ret = match opt_ret {
         Some(rty) -> resolve_ty(rty)
@@ -13309,7 +13487,7 @@ fn row_to_string_suffix(r: Row) : String {
 # the user wrote.
 fn dump_decl_type(d: Decl) : Unit / Console {
   match d {
-    DFn(is_pub, name, _, _, _, _, _, line, col) -> {
+    DFn(is_pub, name, _, _, _, _, _, line, col, _) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       match sig_of_decl(d) {
         Some(ty) -> print("#{pub_s}fn #{name} : #{ty_to_string(ty)} @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -13764,7 +13942,7 @@ fn add_variants_loop(env: TyEnv, tname: String, tparams: [String], vs: [Variant]
 # decl gets a stable assignment of bound row-var ids.
 fn collect_decl_rvars(d: Decl) : [String] {
   match d {
-    DFn(_, _, _, params, opt_ret, rexpr, _, _, _) -> {
+    DFn(_, _, _, params, opt_ret, rexpr, _, _, _, _) -> {
       let acc0 = collect_rvars_in_row(rexpr, [])
       let acc1 = collect_rvars_in_params(params, acc0)
       match opt_ret {
@@ -13995,7 +14173,7 @@ fn row_labels_of_rls_with_binds(ls: [RowLabel], tpbinds: [TPBind], rbinds: [RVBi
 
 fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
   match d {
-    DFn(_, _, tparams, params, opt_ret, rexpr, _, _, _) -> {
+    DFn(_, _, tparams, params, opt_ret, rexpr, _, _, _, _) -> {
       # m7b #12: collect row-variable names per decl, allocate small
       # bound ids (0, 1, ...) in order of appearance, build the body
       # type with those ids in tail positions. The scheme generalises
@@ -14040,7 +14218,7 @@ fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
 # already assumed.
 fn collect_implicit_tparams_in_decl(d: Decl, declared: [String]) : [String] {
   match d {
-    DFn(_, _, _, params, opt_ret, rexpr, _, _, _) -> {
+    DFn(_, _, _, params, opt_ret, rexpr, _, _, _, _) -> {
       let acc0 = collect_implicit_in_params(params, declared, [])
       let acc1 = match opt_ret {
         Some(rty) -> collect_implicit_in_typeexpr(rty, declared, acc0)
@@ -14128,7 +14306,7 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl]) : EnvWithArities
     [] -> EnvWithArities { env: env, arities: ar_acc }
     [d, ...rest] -> {
       let r = match d {
-        DFn(_, fname, _, _, _, _, _, _, _) -> match fn_scheme_of_decl(d) {
+        DFn(_, fname, _, _, _, _, _, _, _, _) -> match fn_scheme_of_decl(d) {
           Some(sc) -> EnvWithArities { env: ty_env_add(env, fname, sc), arities: ar_acc }
           None     -> EnvWithArities { env: env, arities: ar_acc }
         }
@@ -18167,7 +18345,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
               type_aliases: [AliasResult], op_to_eff: [OpToEff],
               d: Decl, verbose: Bool) : TypedDecl {
   match d {
-    DFn(is_pub, nm, tparams, ps, opt_ret, row, body, line, col) -> {
+    DFn(is_pub, nm, tparams, ps, opt_ret, row, body, line, col, mo) -> {
       # m7b #12: row-variable binding context for this decl. The
       # bound ids match those produced by fn_scheme_of_decl so the
       # body's params and any internal references to row-poly user
@@ -18281,7 +18459,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
         _      -> row
       }
       TypedDecl {
-        decl: DFn(is_pub, nm, tparams, ps, opt_ret, final_row, final_body, line, col),
+        decl: DFn(is_pub, nm, tparams, ps, opt_ret, final_row, final_body, line, col, mo),
         errs: st2.errs,
         insts: resolved,
         holes: hole_reports
@@ -18609,13 +18787,13 @@ fn expand_unit_aliases_decls(ds: [Decl], aliases: [UAliasEntry]) : [Decl] =
 
 fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
   match d {
-    DFn(p, n, tps, ps, ret, row, body, l, c) ->
+    DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
       DFn(p, n, tps,
           map(ps, (pm) => expand_aliases_param(pm, aliases)),
           match ret { Some(t) -> Some(expand_aliases_typeexpr(t, aliases)) None -> None },
           row,
           expand_aliases_expr(body, aliases),
-          l, c)
+          l, c, mo)
     DType(p, n, tps, body, l, c) ->
       DType(p, n, tps, expand_aliases_typebody(body, aliases), l, c)
     DTest(desc, body, l, c) -> DTest(desc, expand_aliases_expr(body, aliases), l, c)
@@ -19063,7 +19241,7 @@ fn dump_typed_stmt(s: Stmt, depth: Int) : Unit {
 
 fn dump_typed_decl(d: Decl) : Unit / Console {
   match d {
-    DFn(_, nm, _, _, _, _, body, line, col) -> {
+    DFn(_, nm, _, _, _, _, body, line, col, _) -> {
       print("fn #{nm} @#{int_to_string(line)}:#{int_to_string(col)}")
       dump_typed_expr(body, 1)
     }
@@ -19209,12 +19387,12 @@ fn perceus_pass(decls: [Decl]) : [Decl] = map(decls, perceus_decl)
 
 fn perceus_decl(d: Decl) : Decl {
   match d {
-    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl) -> {
+    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
       let pnames = map(params, (p) => p.pname)
       let uses = pcs_collect_uses_expr(body, pnames, false, [])
       let new_body = pcs_rewrite_expr(body, pnames, uses, false)
       let body_with_drops = pcs_prepend_unused_drops(new_body, params, uses)
-      DFn(is_pub, name, tparams, params, opt_ret, row, body_with_drops, ln, cl)
+      DFn(is_pub, name, tparams, params, opt_ret, row, body_with_drops, ln, cl, mo)
     }
     # Test bodies are emitted as their own thunk fns; without rewriting
     # them here, multi-use let-bindings inside test bodies (especially
@@ -19999,7 +20177,7 @@ fn dump_last_use_for_param(p: Param, uses: [Use]) : Unit / Console {
 
 fn dump_last_use_for_decl(d: Decl) : Unit / Console {
   match d {
-    DFn(_, nm, _, params, _, _, body, ln, _) -> {
+    DFn(_, nm, _, params, _, _, body, ln, _, _) -> {
       print("fn #{nm}@#{int_to_string(ln)}:")
       let uses = scan_uses_expr(body, false)
       params |> each((p) => dump_last_use_for_param(p, uses))
@@ -20026,7 +20204,7 @@ fn dump_intervals(file: String, decls: [Decl]) : Int / Console {
 }
 
 fn dump_intervals_for_decl(d: Decl) : Unit / Console = match d {
-  DFn(_, name, _, _, _, _, _, _, _) -> {
+  DFn(_, name, _, _, _, _, _, _, _, _) -> {
     let iv = ival_of_decl(d)
     print("#{name}: #{ival_show(iv)}")
   }
@@ -20375,7 +20553,7 @@ fn effects_walk_decls(decls: [Decl], acc: [EffEntry]) : [EffEntry] {
   match decls {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DFn(_, name, _, _, _, _, body, line, col) ->
+      DFn(_, name, _, _, _, _, body, line, col, _) ->
         if effects_skip_internal(name) {
           effects_walk_decls(rest, acc)
         } else {
@@ -21220,10 +21398,11 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
     # mirrors the C backend's emit_variants_of_list, just routed
     # through llvm_emit_variant_ctor + llvm_emit_cons primitives.
     EVariantsOf(_, names) -> llvm_emit_variants_of(e, names)
-    # m6.2 Phase 3: qualified call as expression value. v1 shares
-    # the C symbol with the legacy unqualified form; mirrors
-    # `EVar(fname)`'s fn-value path.
-    EModCall(_, fname) -> llvm_emit_fn_value(e, fname, x.line, x.col)
+    # m6.2 Phase 3 / v2: qualified call as expression value
+    # (`let f = mod.fname`). Mint the prefixed thunk symbol so the
+    # closure ends up holding `@_kai_<m>__<n>_thunk` regardless of
+    # whether other modules also export the same bare name.
+    EModCall(mod, fname) -> llvm_emit_modcall_fn_value(e, mod, fname, x.line, x.col)
     _ -> {
       eprint("llvm: unsupported expression kind (#{expr_kind_name(x.kind)}) at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
       llvm_set_last(e, "undef")
@@ -21533,9 +21712,9 @@ fn llvm_emit_fn_value(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit {
       LP(_, arity, Some(thunk)) -> llvm_build_closure(e, thunk, arity)
       _ -> llvm_closure_error(e, nm, line, col)
     }
-    None -> match efn_find(e.fns, nm) {
-      Some(arity) -> {
-        let thunk = concat_all(["@_kai_", nm, "_thunk"])
+    None -> match efn_resolve(e.fns, nm) {
+      Some(EFn(_, arity, mo)) -> {
+        let thunk = concat_all(["@_kai_", c_sym(nm, mo), "_thunk"])
         llvm_build_closure(e, thunk, arity)
       }
       None -> llvm_closure_error(e, nm, line, col)
@@ -21556,6 +21735,21 @@ fn llvm_build_closure(e: LlvmEmit, thunk_sym: String, arity: Int) : LlvmEmit {
 fn llvm_closure_error(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit / Console {
   eprint("llvm: cannot build closure for '#{nm}' at #{int_to_string(line)}:#{int_to_string(col)}")
   llvm_set_last(e, "undef")
+}
+
+# m6.2 v2: qualified `let f = mod.fname` value-position. Builds a
+# 0-capture closure over `@_kai_<m>__<n>_thunk`. The arity comes from
+# the EFn table just like `llvm_emit_fn_value`'s user-fn branch;
+# unlike that branch, the symbol is unconditionally prefixed with
+# the module name carried in EModCall.
+fn llvm_emit_modcall_fn_value(e: LlvmEmit, mod: String, fname: String, line: Int, col: Int) : LlvmEmit / Console {
+  match efn_resolve(e.fns, fname) {
+    Some(EFn(_, arity, _)) -> {
+      let thunk = concat_all(["@_kai_", c_sym(fname, Some(mod)), "_thunk"])
+      llvm_build_closure(e, thunk, arity)
+    }
+    None -> llvm_closure_error(e, fname, line, col)
+  }
 }
 
 # m7c-c — emit the LLVM IR for an `Eff.op(args)` call. Mirrors the
@@ -21754,7 +21948,12 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
                 Some(reg) -> llvm_emit_apply(e, reg, xs)
                 None      -> {
                   let ra = llvm_emit_args(e, xs, [])
-                  let sym = if llvm_is_prelude_fn(nm) { llvm_prelude_symbol(nm) } else { string_concat("@kai_", nm) }
+                  # m6.2 v2: route the bare-name callee through the
+                  # EFn table so it picks up the right module prefix
+                  # (`@kai_<m>__<n>` for module-owned decls, plain
+                  # `@kai_<n>` for root-file decls).
+                  let sym = if llvm_is_prelude_fn(nm) { llvm_prelude_symbol(nm) }
+                            else { string_concat("@kai_", c_sym_of_callee(e.fns, nm)) }
                   let r = llvm_fresh_reg(ra.st)
                   let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
                                           llvm_format_args(ra.regs), ")\n"])
@@ -21771,10 +21970,16 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
     # semantics put the fn body there. The variant exists so that
     # v2 can switch this branch to mint a prefixed symbol while
     # leaving the unqualified `EVar(fname)` branch alone.
-    EModCall(_, fname) -> {
+    EModCall(mod, fname) -> {
       let ra = llvm_emit_args(e, xs, [])
+      # m6.2 v2: qualified call `mod.fname(args)`. Mint the prefixed
+      # symbol directly from the EModCall payload — the resolver
+      # already verified `fname` is exported by `mod`, so the EFn
+      # entry for it carries `module_origin = Some(mod)`. We could
+      # equivalently route through `efn_resolve`; using `mod`
+      # directly is one indirection less.
       let sym = if llvm_is_prelude_fn(fname) { llvm_prelude_symbol(fname) }
-                else                         { string_concat("@kai_", fname) }
+                else                         { string_concat("@kai_", c_sym(fname, Some(mod))) }
       let r = llvm_fresh_reg(ra.st)
       let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
                               llvm_format_args(ra.regs), ")\n"])
@@ -23037,6 +23242,9 @@ fn llvm_emit_bang(e: LlvmEmit, inner: Expr) : LlvmEmit {
 # Emit an `_kai_<name>_thunk` that unpacks args from a `KaiValue**`
 # and forwards them to the user-defined `kai_<name>`. One per user
 # fn so its address can be taken when the fn is passed as a value.
+# m6.2 v2: `nm` here is already the c_sym suffix (`<name>` for
+# root-file decls, `<m>__<name>` for module-owned decls); the
+# caller in llvm_emit_fn does the c_sym build before passing in.
 fn llvm_emit_thunk(nm: String, arity: Int) : String {
   let thunk_sym = concat_all(["@_kai_", nm, "_thunk"])
   let target_sym = concat_all(["@kai_", nm])
@@ -23082,7 +23290,7 @@ type LlvmDeclOut = { text: String, next_id: Int }
 
 fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], start_id: Int) : LlvmDeclOut {
   match d {
-    DFn(_, nm, _, ps, _, _, body, _, _) -> {
+    DFn(_, nm, _, ps, _, _, body, _, _, mo) -> {
       let locals0 = llvm_init_locals_from_params(ps)
       let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
                           globals: "", body: "",
@@ -23090,9 +23298,15 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
                           locals: locals0, fns: fns, vars_: vs, lams: lams,
                           op_offsets: oo }
       let e1 = llvm_emit_expr(e0, body)
-      let sym = if nm == "main" { "@kai_main" } else { string_concat("@kai_", nm) }
+      # m6.2 v2: mint the prefixed symbol when the decl is owned by
+      # an imported module. `main` is special-cased — it is always
+      # `@kai_main` (the runtime calls it directly), so a hypothetical
+      # `pub fn main` defined in a prelude file (none exist today)
+      # would still emit unprefixed.
+      let csuffix = c_sym(nm, mo)
+      let sym = if nm == "main" { "@kai_main" } else { string_concat("@kai_", csuffix) }
       let arity = list_length(ps)
-      let thunk = llvm_emit_thunk(nm, arity)
+      let thunk = llvm_emit_thunk(csuffix, arity)
       let text = concat_all([
         e1.globals,
         "\n",
@@ -23344,7 +23558,7 @@ fn collect_pub_exports(decls: [Decl], acc: [String]) : [String] {
     [] -> list_reverse(acc)
     [d, ...rest] -> {
       let acc1 = match d {
-        DFn(true, name, _, _, _, _, _, _, _) -> [name, ...acc]
+        DFn(true, name, _, _, _, _, _, _, _, _) -> [name, ...acc]
         DType(true, name, _, _, _, _) -> [name, ...acc]
         DEffect(true, name, _, _, _, _) -> [name, ...acc]
         DProtocol(true, name, _, _, _) -> [name, ...acc]
@@ -23485,7 +23699,18 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                 Some(decls) -> {
                   let rs2 = process_imports(base_dir, decls, search_paths, rs1)
                   let kept = non_import_decls(decls)
-                  let rs3 = rs_append_decls(rs2, kept)
+                  # m6.2 v2: tag every DFn coming from this module
+                  # with `module_origin = Some(import_name)` so the
+                  # codegen mints `kai_<import_name>__<name>`. Done
+                  # before the global concat so transitive imports
+                  # carry their own surface name through to emission.
+                  # When the caller is doing the M6.1-only path
+                  # (import_name == ""), we still concat decls but
+                  # leave them with their parser-supplied None — the
+                  # M6.1 fallback diag fires later.
+                  let tagged = if import_name == "" { kept }
+                               else { tag_decls_module_origin(kept, import_name) }
+                  let rs3 = rs_append_decls(rs2, tagged)
                   if import_name == "" { rs3 }
                   else {
                     let exports = collect_pub_exports(kept, [])
@@ -23662,9 +23887,9 @@ fn rqc_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Console 
 }
 
 fn rqc_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console = match d {
-  DFn(p, n, tp, params, ret, row, body, l, c) ->
+  DFn(p, n, tp, params, ret, row, body, l, c, mo) ->
     DFn(p, n, tp, params, ret, row,
-        rqc_expr(body, fn_param_names(params), mt, file), l, c)
+        rqc_expr(body, fn_param_names(params), mt, file), l, c, mo)
   DTest(n, body, l, c) ->
     DTest(n, rqc_expr(body, [], mt, file), l, c)
   DImpl(name, ty, sub_decls, l, c) ->
@@ -23911,7 +24136,7 @@ fn import_hole_collect_pub_fns(ds: [Decl], acc: [String]) : [String] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DFn(is_pub, name, _, _, _, _, _, _, _) ->
+      DFn(is_pub, name, _, _, _, _, _, _, _, _) ->
         if is_pub { import_hole_collect_pub_fns(rest, [name, ...acc]) }
         else     { import_hole_collect_pub_fns(rest, acc) }
       _ -> import_hole_collect_pub_fns(rest, acc)
@@ -24299,9 +24524,9 @@ fn lower_impl_methods(pname: String, tname: String, methods: [Decl],
   match methods {
     [] -> LowerImplsRes { reg: reg, fns: acc_fns }
     [d, ...rest] -> match d {
-      DFn(_, op_name, tparams, params, ret, row, body, line, col) -> {
+      DFn(_, op_name, tparams, params, ret, row, body, line, col, mo) -> {
         let mangled = proto_mangled_fn(pname, tname, op_name)
-        let new_fn = DFn(false, mangled, tparams, params, ret, row, body, line, col)
+        let new_fn = DFn(false, mangled, tparams, params, ret, row, body, line, col, mo)
         let entry = PIR(pname, tname, op_name, mangled)
         let reg1 = ProtocolReg {
           ops: reg.ops,
@@ -24343,7 +24568,7 @@ fn dispatcher_in_acc(ds: [Decl], target: String) : Bool {
   match ds {
     [] -> false
     [d, ...rest] -> match d {
-      DFn(_, n, _, _, _, _, _, _, _) ->
+      DFn(_, n, _, _, _, _, _, _, _, _) ->
         if n == want { true } else { dispatcher_in_acc(rest, target) }
       _ -> dispatcher_in_acc(rest, target)
     }
@@ -24356,7 +24581,7 @@ fn make_dispatcher_fn(pname: String, opname: String, params: [Param],
   let new_ret = substitute_self_in_type(ret)
   let body = make_dispatcher_body(pname, opname, new_ret, line, col)
   DFn(true, proto_dispatcher_name(opname), [], new_params, Some(new_ret),
-      REmpty, body, line, col)
+      REmpty, body, line, col, None)
 }
 
 # Synthesises a body that *typechecks* with the declared return type
@@ -25184,7 +25409,7 @@ fn derive_ord_payload_chain(vargs: [TypeExpr], idx: Int,
 fn make_derived_impl(pname: String, tname: String, opname: String,
                       params: [Param], ret: TypeExpr, body: Expr,
                       line: Int, col: Int) : Decl {
-  let method = DFn(false, opname, [], params, Some(ret), REmpty, body, line, col)
+  let method = DFn(false, opname, [], params, Some(ret), REmpty, body, line, col, None)
   DImpl(pname, mk_ty(TyName(tname, []), line, col), [method], line, col)
 }
 
@@ -25403,10 +25628,10 @@ fn rename_proto_calls_decls(ds: [Decl], op_names: [String]) : [Decl] =
 
 fn rename_proto_calls_decl(d: Decl, op_names: [String]) : Decl {
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c) -> {
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) -> {
       let bound = rename_param_names(ps, [])
       DFn(pub_, n, tps, ps, ret, row,
-          rename_proto_calls_expr(body, op_names, bound), l, c)
+          rename_proto_calls_expr(body, op_names, bound), l, c, mo)
     }
     DTest(desc, body, l, c) ->
       DTest(desc, rename_proto_calls_expr(body, op_names, []), l, c)
@@ -25643,8 +25868,8 @@ fn resolve_protocol_calls(typed: TypedProgram, reg: ProtocolReg) : TypedProgram 
 
 fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg) : Decl {
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c) ->
-      DFn(pub_, n, tps, ps, ret, row, resolve_protocol_calls_expr(body, reg), l, c)
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, n, tps, ps, ret, row, resolve_protocol_calls_expr(body, reg), l, c, mo)
     DTest(desc, body, l, c) ->
       DTest(desc, resolve_protocol_calls_expr(body, reg), l, c)
     _ -> d
@@ -25696,7 +25921,7 @@ fn validate_resolved_decls(ds: [Decl], reg: ProtocolReg,
     [] -> errs
     [d, ...rest] -> {
       let e1 = match d {
-        DFn(_, _, _, _, _, _, body, _, _) ->
+        DFn(_, _, _, _, _, _, body, _, _, _) ->
           validate_resolved_expr(body, reg, file, errs)
         DTest(_, body, _, _) ->
           validate_resolved_expr(body, reg, file, errs)
@@ -25959,7 +26184,7 @@ fn validate_inv_decls(ds: [Decl], file: String, errs: Int) : Int {
     [] -> errs
     [d, ...rest] -> {
       let e1 = match d {
-        DFn(_, _, _, ps, _, _, body, _, _) -> {
+        DFn(_, _, _, ps, _, _, body, _, _, _) -> {
           let bound0 = inv_param_names(ps, [])
           validate_inv_expr(body, file, bound0, errs)
         }
@@ -26553,12 +26778,40 @@ fn load_prelude(path: String) : Option[PreludeLoaded] / Console + File {
           Some(ds) -> {
             let mod_name = prelude_module_name(path)
             let exports = collect_pub_exports(ds, [])
-            Some(PL(ds, ME(mod_name, exports, path)))
+            # m6.2 v2: tag every DFn coming from this prelude file
+            # with `module_origin = Some(<basename>)` so the codegen
+            # mints `kai_<basename>__<name>` for it. Decls authored
+            # in the root file keep `None` (set by the parser).
+            let tagged = tag_decls_module_origin(ds, mod_name)
+            Some(PL(tagged, ME(mod_name, exports, path)))
           }
         }
       }
     }
   }
+}
+
+# m6.2 v2: walk a freshly-parsed module's decls and stamp every DFn
+# with the surface module name. The parser produces every DFn with
+# `module_origin = None`; this pass overwrites that to `Some(mod)`
+# at the boundary between parsed module and the global flat decl
+# stream concat. Non-DFn decls are unaffected.
+fn tag_decls_module_origin(ds: [Decl], mod: String) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [tag_decl_module_origin(d, mod), ...tag_decls_module_origin(rest, mod)]
+}
+
+fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, _) ->
+    DFn(p, n, tps, ps, ret, row, body, l, c, Some(mod))
+  # DAttribPure wraps a DFn (refinement-pure const decls); keep the
+  # outer wrap and tag the inner.
+  DAttribPure(inner, l, c) -> DAttribPure(tag_decl_module_origin(inner, mod), l, c)
+  # DDerive wraps a Decl too (the wrapped one is normally a DType
+  # but the lower pass synthesises further DFns from it later, after
+  # this point). Tag whatever's inside.
+  DDerive(ps, inner, l, c) -> DDerive(ps, tag_decl_module_origin(inner, mod), l, c)
+  _ -> d
 }
 
 type PreludesLoaded = PLS([Decl], [ModuleEntry])
@@ -26690,7 +26943,7 @@ fn collect_used_row_labels_loop(decls: [Decl], acc: [String]) : [String] {
   match decls {
     [] -> acc
     [d, ...rest] -> match d {
-      DFn(_, _, _, _, _, row, _, _, _) -> {
+      DFn(_, _, _, _, _, row, _, _, _, _) -> {
         let names = match row {
           REmpty       -> []
           RClosed(lbs) -> row_label_names(lbs)
@@ -27217,6 +27470,16 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   # the three structural properties is violated. See
                   # `validate_typer_invariants` for the catalog.
                   let inv_errs = validate_typer_invariants(typed_prog, path)
+                  # m6.2 v2: emit a warning at the start of every
+                  # codegen run for each bare-name that two or more
+                  # imported modules export without a root-file shadow
+                  # (e.g. `pub fn map` in both option.kai and
+                  # result.kai once their bare-name renames land).
+                  # The warning is non-fatal; a real linker error
+                  # follows if any caller actually uses the bare
+                  # form. Fired once per name regardless of usage —
+                  # cheap, no body walk needed.
+                  let _ = report_ambig_efns(find_ambig_efns(register_fn_decls(typed_prog.decls)))
                   if typed_prog.errs != 0 { typed_prog.errs }
                   else if dispatch_errs != 0 { dispatch_errs }
                   else if inv_errs != 0 { inv_errs }
