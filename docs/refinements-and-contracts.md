@@ -706,6 +706,13 @@ reasoning** (interval propagation, subtyping, narrowing) is the
 piece that remains, and it requires reintroducing the refinement on
 the semantic Ty side.
 
+**Follow-up lane** for everything deferred from m12.6 v1 lives in
+`docs/m12-6x-followup.md`. The single load-bearing item there is
+`TyRefineT` on the semantic side; it unblocks 4 of the 8 deferred
+items directly. The rest are independent (`[<refinement-pure>]`
+enforcement, compile-time `assert false` errors, regex literals,
+diagnostics quality).
+
 ## Sources
 
 - [Design by Contract — Bertrand Meyer 1986](https://se.inf.ethz.ch/~meyer/publications/computer/contract.pdf)

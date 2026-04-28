@@ -660,23 +660,20 @@ Rationale:
      Recognised only when `ensure(...)` is followed by `where`, so
      user-defined `ensure` functions are unaffected.
 
-   Deferred from the original m12.6 plan:
-   - **m12.6.f** (UoM composition + match-arm narrowing `p :
-     RefinedT`) — requires reintroducing `TyRefineT` on the
-     semantic side so unify can carry the predicate through call
-     sites. Postponed until a use case demands it.
-   - **m12.6.g** (`[<refinement-pure>]` stdlib annotations) —
-     decorative without an enforcement pass; deferred until the
-     predicate-validation pass (which would also reject calls to
-     non-refinement-pure user fns) lands.
-   - **Static interval propagation through refined args** — the
-     m12.6.d folder only evaluates closed predicates. Propagating
-     refinements (`requires x > 0` ⇒ `x > 0` known statically at
-     the call site when the caller passes a literal) requires the
-     `TyRefineT` semantic threading from m12.6.f.
-   - **Compile-time errors for `assert false`** — the const folder
-     detects them but emits the runtime assert anyway; promoting
-     to a compile-time diagnostic is one extra error sink.
+   Deferred from the original m12.6 plan, formally tracked in
+   `docs/m12-6x-followup.md`:
+   - **#1 `TyRefineT` semantic type** (load-bearing — unblocks
+     #2/#3/#4 below).
+   - **#2 Static interval propagation** through refined arguments.
+   - **#3 Match-arm narrowing** (`p : RefinedT`).
+   - **#4 UoM composition** (`Decimal<USD> where >= 0`).
+   - **#5 `[<refinement-pure>]` stdlib annotations** + the
+     validation pass that enforces them.
+   - **#6 Compile-time errors** for trivially-false predicates.
+   - **#7 Regex literals** (`String where matches /.../ `) —
+     blocks on a separate regex stdlib lane.
+   - **#8 Diagnostics quality** (predicate-aware panic messages) —
+     lands either in m12.6.x or inside m11.
 7.5. **m12.7 (bootstrap helpers)** — `axiom name : T`. Optional,
    ~0.5 day. Useful for stubbing intrinsics and FFI declarations
    while their real definitions land. Lands here because m12
