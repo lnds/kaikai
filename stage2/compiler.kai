@@ -10956,6 +10956,14 @@ type Ty
   # (or a TyVarT that the unifier later pins to one of them); the
   # unit lives in canonicalised form once the unifier touches it.
   | TyDimT(Ty, UnitExprT)
+  # m12.6.x #1: resolved refinement type, `TyRefineT(base, pred)`.
+  # The predicate stays as the syntactic Expr from the parser. The
+  # unifier treats `TyRefineT(b, _)` ⊑ `b` (upcast OK, downcast
+  # demands explicit narrowing via `ensure(...)` or a match-arm
+  # `: RefinedT`); diagnostics, mangling, and most other walkers
+  # transparently recurse on `b`. Predicates are pure (no effects,
+  # no rows) so the row machinery is untouched.
+  | TyRefineT(Ty, Expr)
 
 # Effect row, per docs/effects-impl.md §*Types: row slot on TyFnT*.
 # The slot is reserved here in m7a #1; row unification (m7a #2) and
@@ -11000,11 +11008,10 @@ fn resolve_ty(t: TypeExpr) : Ty {
     # (with empty alias and tparam contexts here) so two textually
     # different but algebraically equal forms compare equal under unify.
     TyDim(base, u) -> TyDimT(resolve_ty(base), unit_canon(u))
-    # m12.6.a: refinements do not yet affect the semantic type. The
-    # predicate stays in the syntactic AST for diagnostics; m12.6.b/c
-    # will reintroduce it on the semantic side once contracts wire
-    # into prologue/epilogue codegen.
-    TyRefine(base, _) -> resolve_ty(base)
+    # m12.6.x #1: preserve the refinement on the semantic side.
+    # `TyRefineT(b, p)` ⊑ `b` in the unifier (upcast); narrowing
+    # requires explicit `ensure(...)` or a match-arm `: RefinedT`.
+    TyRefine(base, p) -> TyRefineT(resolve_ty(base), p)
   }
 }
 
@@ -11566,6 +11573,10 @@ fn ty_to_string(t: Ty) : String {
     # The unit goes through unit_canon so the printed form matches
     # what the unifier compares against — same shape on every side.
     TyDimT(base, u) -> concat_all([ty_to_string(base), "<", unit_canon_display(u), ">"])
+    # m12.6.x #1: render `T where ...` for diagnostics. The predicate
+    # is left as `<pred>` to keep the line short; full predicate text
+    # lands with the diagnostics-quality pass (m12.6.x #8).
+    TyRefineT(base, _) -> concat_all([ty_to_string(base), " where <pred>"])
   }
 }
 
@@ -11641,6 +11652,10 @@ fn mangle_ty(t: Ty) : String {
     # specialisation. This is the codegen-erasure invariant manifest
     # at the mangler level.
     TyDimT(base, _) -> mangle_ty(base)
+    # m12.6.x #1: refinements erase like units. `Int where >= 0` and
+    # `Int` mangle the same — they share monomorphisations and
+    # protocol-impl dispatch entries.
+    TyRefineT(base, _) -> mangle_ty(base)
   }
 }
 
@@ -12041,8 +12056,8 @@ fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
     # tparam bindings — leave UVar references as USym holdovers. Real
     # generic-unit resolution lives in resolve_ty_with_binds below.
     TyDim(base, u) -> dim_collapse(resolve_ty_with_tparams(base, binds), unit_canon(u))
-    # m12.6.a: refinements are stripped at semantic level; cf. resolve_ty.
-    TyRefine(base, _) -> resolve_ty_with_tparams(base, binds)
+    # m12.6.x #1: preserve refinement on the semantic side.
+    TyRefine(base, p) -> TyRefineT(resolve_ty_with_tparams(base, binds), p)
   }
 }
 
@@ -12243,8 +12258,8 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty 
     TyDim(base, u) ->
       dim_collapse(resolve_ty_with_binds(base, tpbinds, rbinds),
                    unit_canon(unit_resolve_tparams(u, tpbinds)))
-    # m12.6.a: refinements are dropped at the semantic level.
-    TyRefine(base, _) -> resolve_ty_with_binds(base, tpbinds, rbinds)
+    # m12.6.x #1: preserve refinement on the semantic side.
+    TyRefine(base, p) -> TyRefineT(resolve_ty_with_binds(base, tpbinds, rbinds), p)
   }
 }
 
@@ -13173,6 +13188,10 @@ fn apply_ty(s: Subst, t: Ty) : Ty {
     # both the base type and the unit expression. Unit-vars chase
     # through unit_slots; everything else passes through unchanged.
     TyDimT(base, u) -> dim_collapse(apply_ty(s, base), apply_unit(s, u))
+    # m12.6.x #1: substitutions don't touch the predicate Expr (it
+    # references value-level identifiers, not Ty vars); just recurse
+    # through the base.
+    TyRefineT(base, p) -> TyRefineT(apply_ty(s, base), p)
   }
 }
 
@@ -13401,6 +13420,9 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
     # m12.5: TyDimT carries a base Ty to recurse into; the unit side
     # has its own occurs_unit guard inside unify_unit.
     TyDimT(base, _) -> occurs(v, base, s)
+    # m12.6.x #1: predicates carry value-level identifiers, not Ty
+    # vars; only the base contributes to occurs.
+    TyRefineT(base, _) -> occurs(v, base, s)
     _ -> false
   }
 }
@@ -13416,8 +13438,13 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
 # turn clean `[?t1]` inferences into `[?]` noise. So short-circuit it
 # at the top of unify, before the var-binding branches.
 fn unify(t1: Ty, t2: Ty, s: Subst) : Option[Subst] {
-  let a = apply_ty(s, t1)
-  let b = apply_ty(s, t2)
+  # m12.6.x #1: refinements are transparent for unify in v1 — peel
+  # them off both sides before head-unification so neither direction
+  # gets blocked. The predicate stays attached at the declaration
+  # site; downstream passes that need to reason about it look it up
+  # from the source signature.
+  let a = unwrap_refines(apply_ty(s, t1))
+  let b = unwrap_refines(apply_ty(s, t2))
   match a {
     TyAny -> Some(s)
     _ -> match b {
@@ -13433,6 +13460,14 @@ fn unify(t1: Ty, t2: Ty, s: Subst) : Option[Subst] {
         }
       }
     }
+  }
+}
+
+# m12.6.x #1: peel a stack of TyRefineT wrappers down to the base type.
+fn unwrap_refines(t: Ty) : Ty {
+  match t {
+    TyRefineT(base, _) -> unwrap_refines(base)
+    _ -> t
   }
 }
 
@@ -13501,8 +13536,17 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
       }
       TyInt    -> match ab { TyInt -> unify_unit(au, UOne, s) _ -> None }
       TyReal   -> match ab { TyReal -> unify_unit(au, UOne, s) _ -> None }
+      TyRefineT(bbase, _) -> unify(a, bbase, s)
       _ -> None
     }
+    # m12.6.x #1: refinements are transparent to unify in v1 — both
+    # `TyRefineT(b, p) ⊑ b` (upcast) and `b ⊑ TyRefineT(b, p)` go
+    # through. The predicate stays attached on the source-side fn
+    # signature; downstream passes (interval propagation, match-arm
+    # narrowing, ensure() desugar) consume it from there. A future
+    # refinement-aware unify could distinguish argument-flow direction
+    # to reject downcasts, but it requires reshape of unify's API.
+    TyRefineT(abase, _) -> unify(abase, b, s)
   }
 }
 
@@ -13931,19 +13975,23 @@ fn ty_unifiable_shallow(a: Ty, b: Ty) : Bool {
 # `ty_unifiable_shallow`. Excludes TyVarT/TyAny which short-circuit
 # above. Approximates HM-equality for concrete types.
 fn ty_eq_shape(a: Ty, b: Ty) : Bool {
-  match a {
-    TyInt    -> match b { TyInt -> true _ -> false }
-    TyReal   -> match b { TyReal -> true _ -> false }
-    TyBool   -> match b { TyBool -> true _ -> false }
-    TyString -> match b { TyString -> true _ -> false }
-    TyChar   -> match b { TyChar -> true _ -> false }
-    TyUnit   -> match b { TyUnit -> true _ -> false }
-    TyListT(ai) -> match b { TyListT(bi) -> ty_eq_shape(ai, bi) _ -> false }
-    TyFnT(ap, ar, _) -> match b {
+  # m12.6.x #1: ty_eq_shape is a shape-only check (no predicate
+  # equality), so refinements are peeled before comparing.
+  let ax = unwrap_refines(a)
+  let bx = unwrap_refines(b)
+  match ax {
+    TyInt    -> match bx { TyInt -> true _ -> false }
+    TyReal   -> match bx { TyReal -> true _ -> false }
+    TyBool   -> match bx { TyBool -> true _ -> false }
+    TyString -> match bx { TyString -> true _ -> false }
+    TyChar   -> match bx { TyChar -> true _ -> false }
+    TyUnit   -> match bx { TyUnit -> true _ -> false }
+    TyListT(ai) -> match bx { TyListT(bi) -> ty_eq_shape(ai, bi) _ -> false }
+    TyFnT(ap, ar, _) -> match bx {
       TyFnT(bp, br, _) -> ty_list_eq_shape(ap, bp) and ty_eq_shape(ar, br)
       _ -> false
     }
-    TyCon(an, atas) -> match b {
+    TyCon(an, atas) -> match bx {
       TyCon(bn, btas) -> an == bn and ty_list_eq_shape(atas, btas)
       _ -> false
     }
@@ -24005,6 +24053,9 @@ fn ty_head_name(t: Ty) : Option[String] {
     # type's head — `Decimal<USD>` → `Decimal`, mirroring the
     # `proto_type_name` collapse on the syntactic side.
     TyDimT(base, _) -> ty_head_name(base)
+    # m12.6.x #1: refinements are transparent for protocol dispatch
+    # — `Int where >= 0` and `Int` resolve to the same `impl`.
+    TyRefineT(base, _) -> ty_head_name(base)
     TyVarT(_)      -> None
     TyFnT(_, _, _) -> None
     TyAny          -> None
