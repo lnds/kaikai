@@ -12,9 +12,17 @@ The user-facing **type surface** of every Spawn / Cancel / Actor /
 Link / Monitor op already matches what m8.x will deliver. The
 runtime swap should be invisible to user code.
 
+## Status (R2 lane)
+
+R2 (`fiber-scheduler` branch) lands the m8.x runtime in five
+phases. Items 1-5 below are now ✅ landed; item 6 ships v1 (shallow
+check) with the full machinery deferred; item 7 is independent
+typer work. See `docs/fibers-impl.md` §*Phasing* for the
+phase-by-phase landing table.
+
 ## Deferred items
 
-### 1. Real cooperative scheduler
+### 1. Real cooperative scheduler — ✅ Phase 2
 
 Replace the inline-eager defaults of `Spawn.spawn` / `Spawn.await` /
 `Spawn.select` (`stage0/runtime.h` §m8 #2/#3) with a scheduler that
@@ -39,7 +47,7 @@ caller's body as a heap closure (see Doc C §*The CPS transform*
 §*One-shot case*); right now every op-call site uses the identity
 continuation and resume is effectively a tail return.
 
-### 2. Cooperative `Cancel` delivery at yield points
+### 2. Cooperative `Cancel` delivery at yield points — ✅ Phase 3
 
 Once the scheduler can suspend, every yield point (every effect-op
 call site, plus `Spawn.yield()`) checks the current fiber's
@@ -53,7 +61,7 @@ in compiler-emitted code at every `kai_evidence_lookup_node` site).
 Spec: Doc B §`Cancel`/Delivery points; `docs/structured-concurrency.md`
 §Cancellation.
 
-### 3. `Bounded(_, BlockSender)` mailbox policy
+### 3. `Bounded(_, BlockSender)` mailbox policy — ✅ Phase 4
 
 `KAI_OVERFLOW_BLOCK_SENDER` (3) currently errors at allocation in
 `kai_mailbox_alloc_bounded`. The full semantics: a `send` to a full
@@ -64,7 +72,7 @@ unwind it (per actors.md §`Bounded(capacity, on_full)`).
 
 Depends on item 1.
 
-### 4. Blocking `Actor.receive()` on empty mailbox
+### 4. Blocking `Actor.receive()` on empty mailbox — ✅ Phase 4
 
 Today `kai_mailbox_pop` errors when the mailbox is empty (v1 inline-
 eager has no way to suspend). m8.x makes it park the calling fiber
@@ -73,35 +81,55 @@ Same machinery as item 3 in reverse.
 
 Spec: Doc actors.md §`Actor[Msg]` *receive()*.
 
-### 5. Cross-fiber `Link` / `Monitor` runtime registry
+### 5. Cross-fiber `Link` / `Monitor` runtime registry — ⚠ partial Phase 5
 
-Today `Link` and `Monitor` are typer-side declarations only
-(`stage2/compiler.kai` §m8 #9 builtin_*_decl). m8.x adds:
+**Link**: ✅ landed. KaiMailbox.owner_fiber, KaiFiber.linked_head
+(intrusive list), `kai_link_add_bidirectional` /
+`kai_link_propagate_terminate` helpers, EvLink + `kai_default_link_link`,
+`default_link_setup` wired into compiler.kai's main installation.
+Trampoline DONE/CANCELLED branches walk the linked chain and set
+`cancel_requested` on each peer.
 
-- Per-fiber linked-set and monitor-set, populated by the op clauses.
-- On fiber termination (normal / crash / cancel), walk the linked
-  set → set `cancel_requested` on each peer; walk the monitor set
-  → push `MonitorDown(ref, cause)` to each observer's mailbox.
-- A user-installable default handler for `Link` and `Monitor`
-  (vs the type-only stubs today).
+**Monitor**: ⏳ deferred to Phase 5.5+. Pid handoff for a clean
+two-fiber `Monitor.monitor` demo needs `spawn_actor` (m8.x #6
+follow-on) or message types carrying Pid; the v1 actor surface
+(with_mailbox only) supports neither cleanly. The runtime registry
+shape (per-fiber monitor-set, MonitorDown push at termination)
+will mirror Link's; the work is small once the demo path exists.
+
+**Trap-exit semantics**: collapsed in v1 to "any termination
+propagates to linked peers". Doc spec distinguishes Crashed from
+Normal exit (BEAM-style `process_flag(trap_exit, true)`); deferred
+to post-MVP.
 
 Spec: Doc actors.md §*Supervision: links and monitors*.
 
-### 6. Full region-brand machinery for `Fiber[T]` / `Pid[Msg]`
+### 6. Full region-brand machinery for `Fiber[T]` / `Pid[Msg]` — ⚠ v1 shallow
 
-m8 #6 ships a *syntactic* approximation: any user fn (not in
-`is_fiber_producer_helper`) declaring `Fiber[T]` in its return
-type is rejected. The full Doc B / structured-concurrency.md
-§*Type system* design tags every Fiber / Pid value with the brand
-id of its enclosing nursery scope and tracks the brand through
-let-bindings, pattern-matches, list literals, etc., rejecting any
-value whose brand has expired against the current scope.
+**Phase 6 v1** ships the existing shallow check
+(`ty_expr_contains_fiber` recursive walk through TyName / TyList /
+TyFn / TyDim / TyRefine looking for `Fiber`) plus a generalised
+allow-list (`fiber_producer_helpers` in `stage2/compiler.kai`).
+Regression test `examples/effects/m8x_6_fiber_in_result.kai`
+covers the parametric-sum-type case (Fiber[T] embedded in
+`Result[String, Fiber[Int]]`).
 
-This is closer to lifetime checking than to HM unification.
-Implementation likely: extend `Ty` with `TyBranded(Ty, BrandId)`,
-extend the inferencer to mint brands at handler-installation
-sites, add a brand-escape check at fn return + fn arg + record
-field positions.
+**Deferred to post-MVP**: the full machinery from
+`docs/structured-concurrency.md` §*Type system* — extend `Ty`
+with `TyBranded(Ty, BrandId)`, mint brands at handler-installation
+sites, propagate the brand through every binding form (let, match,
+list literal, record field, etc.), check escape at fn return /
+fn arg / record field. Closer to lifetime checking than to HM
+unification.
+
+**Known shallow-check gaps** (not caught by v1):
+- Custom sum types with Fiber in a constructor payload but no
+  `Fiber` in the type's name or args (e.g. `type Boxed = Wrapper(Fiber[Int])`
+  — return type `Boxed` hides Fiber from the walker).
+- `Pid[Msg]` escape checks (Pid would need the same brand
+  machinery; v1 only checks Fiber).
+- Brand mismatch between sibling nurseries (only the lexical-
+  walking version detects nursery scope, not the shallow check).
 
 ### 7. Per-op type generics (m7b #2)
 
