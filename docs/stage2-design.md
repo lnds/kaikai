@@ -521,16 +521,24 @@ in.
     module-organised under `stdlib/core/{list,string,option,result,
     char,tuple,ordering}.kai` per `docs/stdlib-layout.md`. The
     file split landed 2026-04-27 (function names still flat:
-    `list_*`, `string_*`, …); the rename below is the remaining
-    work. **Depends on m6.2** — without qualified calls,
-    `list.map(xs, f)` does not parse as a call at all, so the
-    nominal migration is blocked until the resolver learns
-    qualified-call lookup. Includes the **naming-convention
-    migration** from the legacy flat-prefix style (`list_take`,
-    `string_concat`, `opt_map`) to namespaced calls (`list.take`,
-    `string.concat`, `option.map`); legacy names retire after
-    `stage2/compiler.kai` re-validates self-host on the new
-    names. Adds the missing
+    `list_*`, `string_*`, …). **m14 v0 + v1 landed 2026-04-28**:
+    the user-visible **qualified-call surface** is in place —
+    `list.take(xs, n)`, `string.trim(s)`, `option.map(o, f)`,
+    `result.is_ok(r)`, `char.is_digit(c)` resolve directly against
+    the existing flat-prefix definitions through a prefix-fallback
+    in `me_lookup_export` (with per-module legacy overrides for
+    `option` -> `opt` and `char` -> `ch`). v0 wired the
+    `--prelude` loader to register each prelude file as a
+    `ModuleEntry` so the resolver can dispatch qualified calls
+    without an explicit `import`. See `docs/lane-experience-m14-v1.md`
+    for the full sequence and the discoveries (preludes were not
+    modules, the codegen `emit_ident_value` shadowing bug). The
+    actual rename of the stdlib definitions to drop the prefix
+    (`pub fn list_take` -> `pub fn take`) is **deferred** to a
+    follow-up lane: it exposes the codegen shadowing bug across
+    common bare names (`take`, `drop`, `head`, …) and was rolled
+    back after empirically reproducing the read-of-garbage on
+    `let drop = 5; print(int_to_string(drop))`. Adds the missing
     list ops noted in `stdlib-layout.md` §`core.list` (sort,
     sort_by, max, min, count, contains, flat_map, take_while,
     drop_while, repeat, head, tail, uniq, zip_with). Also lands
@@ -539,9 +547,12 @@ in.
     `Console` existed as an effect) retire from surface, replaced
     by `Console.print(s)` / `Console.println(s)`. Two forms with
     identical intent collapse into one — the effect-bearing one
-    consistent with the rest of the I/O surface. Lands the
-    collection-design pass on top: `Map[K, V]`, `Vector[T]`,
-    `Range[T]` (see `docs/proposed-extensions.md` §17, §20).
+    consistent with the rest of the I/O surface. **Status:** the
+    consolidation is **deferred** in m14 v1; it is independent
+    of the qualified-call work and lands on a separate lane.
+    Lands the collection-design pass on top: `Map[K, V]`,
+    `Vector[T]`, `Range[T]` (see `docs/proposed-extensions.md`
+    §17, §20).
 15. **m15 — `kai fmt`** using the stage 2 parser. Canonical,
     no options (gofmt-style discipline).
 16. **m16 — `kai lsp`** using the stage 2 pipeline.
