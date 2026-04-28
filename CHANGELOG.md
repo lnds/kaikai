@@ -13,10 +13,103 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 - Versioning infrastructure: `VERSION` file at repo root, this `CHANGELOG.md`,
   retroactive git tags `v0.1.0` / `v0.1.1` / `v0.1.2` / `v0.1.3` / `v0.2.0`
-  / `v0.2.1` / `v0.2.2` and the current `v0.3.0`. The compiler's own
-  `kaic2 --version` flag still reports the legacy `kaic2 stage 2
+  / `v0.2.1` / `v0.2.2` / `v0.3.0` and the current `v0.4.0`. The compiler's
+  own `kaic2 --version` flag still reports the legacy `kaic2 stage 2
   (self-hosted)` string; the `bin/kai --version` wrapper reads VERSION
   dynamically.
+
+## [0.4.0] — 2026-04-28 (R2 — m8.x cooperative fiber scheduler)
+
+**Minor: runtime semantics changed.** m8 v1's inline-eager scheduler is
+replaced with a real cooperative runtime built on POSIX `ucontext`.
+After this release, the BEAM-style structured-concurrency claim from
+`docs/structured-concurrency.md` and `docs/actors.md` is no longer
+type-check-only — fibers actually suspend, `await` actually parks,
+cancellation actually propagates, and mailbox blocking actually parks
+senders/receivers.
+
+R2 closes the second of the three structural-debt audit findings from
+2026-04-28 (Linus + Eric). After this release: R1 (v0.2.0 — Perceus
+runtime flip) + R2 (this) done. R3 (effect-row strictness) remains
+queued.
+
+### Added
+
+- **R2 Phase 2 — cooperative scheduler core** (`5de03d2`): `KaiFiber.ctx`
+  via POSIX `ucontext` (`swapcontext` / `makecontext`), run-queue
+  primitives, 5 Spawn handler rewrites (spawn / await / yield / select
+  / cancel), `docs/fibers-impl.md` substrate design doc.
+  Demo: `examples/effects/m8x_2_yield_interleave.kai` — two yielding
+  fibers genuinely interleave (`A0 B0 A1 B1 A2 B2`).
+- **R2 Phase 3 — Cancel delivery at yield points** (`c8aa1a7`):
+  `setjmp` landing pad in trampoline, `kai_check_cancel_yield_point`
+  hook in all `kai_evidence_lookup*`. Demo:
+  `examples/effects/m8x_3_cancel_at_yield.kai` — worker cancelled
+  mid-loop, body unwinds to `KAI_FIBER_CANCELLED`.
+- **R2 Phase 4 — blocking mailbox primitives** (`4cb56c9`):
+  per-mailbox sender/receiver waiter queues. `Actor.receive` parks
+  on empty mailbox, `Bounded(_, BlockSender)` parks senders on full.
+  Demos: `m8x_4_recv_blocking.kai` + `m8x_4_block_sender.kai`.
+- **R2 Phase 5 — Link runtime registry** (`55e6152`):
+  `KaiMailbox.owner_fiber`, `KaiFiber.linked_head`, EvLink + default
+  handler `kai_default_link_link`, trampoline propagation on
+  termination. C-level smoke test in `stage2/tests/link_runtime_test.c`.
+- **R2 Phase 6 — region-brand v1** (`97f3f28`): generalised
+  `is_fiber_producer_helper` allow-list + recursive walker that rejects
+  `Fiber[T]` escape through `TyName` / `TyList` / `TyFn` / `TyDim` /
+  `TyRefine`. Demo: `m8x_6_fiber_in_result` (negative — `Fiber[T]` in
+  `Result`'s second type-arg rejected).
+
+### Substrate decision
+
+**Path A — `ucontext` (POSIX)** over Path B (full CPS reification
+through `KaiCont`). Defended in `docs/fibers-impl.md` §*Substrate*:
+containment, no parser/typer/CPS/emitter changes, MVP-target alignment
+(macOS arm64 + Linux x86_64/aarch64), and the runtime was already
+structured for it. Per CLAUDE.md "Do not design against WASM"; the
+deprecation status of `ucontext` in POSIX-2008 is acknowledged but
+not a blocker for MVP.
+
+### Critical bug fixed during Phase 2
+
+`#define _XOPEN_SOURCE 600` MUST sit ABOVE every system include, not
+just above `<ucontext.h>`. If an earlier header (`stdio.h`, `time.h`,
+…) transitively pulls in `<sys/types.h>`, the feature-test macro is
+frozen and `ucontext_t` compiles as the legacy 56-byte shape instead
+of the full 880-byte XSI shape on darwin arm64. `swapcontext` then
+writes 880 bytes into a 56-byte slot, silently corrupting adjacent
+memory — in this case `kai_main_fiber.evidence_top` and the static
+evidence nodes laid out next to it. Fix and rationale pinned in
+`stage0/runtime.h` above the include.
+
+### Deferred (post-MVP)
+
+Pinned in `docs/m8x-followup.md` and `docs/fibers-impl.md`:
+
+- **Monitor runtime (Phase 5.5+)**: not shipped. The Pid handoff for
+  a clean two-fiber `Monitor.monitor` demo needs `spawn_actor`
+  (m8.x #6) or message types carrying Pid; v1's actor surface
+  (`with_mailbox` only) supports neither cleanly. The runtime
+  registry shape mirrors Link's; the work is small once the demo
+  path exists.
+- **Trap-exit semantics**: collapsed to "any termination propagates
+  to linked peers". BEAM-style Crashed-vs-Normal distinction
+  (`process_flag(trap_exit, true)`) deferred.
+- **Region-brand full machinery**: Phase 6 ships the existing
+  shallow check (recursive walk through `TyName` / `TyList` /
+  `TyFn` / `TyDim` / `TyRefine` looking for `Fiber`) with a
+  generalised allow-list. The full `TyBranded(Ty, BrandId)` +
+  brand-mint at handler-installation + propagation through every
+  binding form is queued for post-Production-honest 1.0.
+- **User-installed Cancel cleanup**: Phase 3's runtime-triggered
+  cancel longjmps directly to the trampoline pad, skipping
+  user-installed `with Cancel { raise(_) -> cleanup }` handlers.
+  Direct user calls to `Cancel.raise()` still go through normal
+  op dispatch, so user handlers fire there. Wiring runtime-cancel
+  into the user-handler path requires more careful interaction
+  with m7a #6e's discard-resume machinery.
+
+Lane retro: see PR #8 body and `docs/fibers-impl.md`.
 
 ## [0.3.0] — 2026-04-28 (m14 v1 — stdlib qualified-call surface)
 
@@ -304,7 +397,8 @@ is closed:
    `try_rewrite_show_dim_real` shortcut in m12.8 Phase 2 confirms it;
    polymorphics with `EHandle` in the body collide on `clause_fn_name`.
 
-[Unreleased]: https://github.com/lnds/kaikai/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/lnds/kaikai/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/lnds/kaikai/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lnds/kaikai/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/lnds/kaikai/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/lnds/kaikai/compare/v0.2.0...v0.2.1
