@@ -1,8 +1,9 @@
 # JWT encoder/decoder showcase — exercises stdlib/encoding/base64,
-# stdlib/encoding/hex, and stdlib/collections/map together.
+# stdlib/encoding/hex, stdlib/encoding/json, and stdlib/collections/map
+# together.
 #
 # Implements `alg: none` JWTs (RFC 7519 §6.1) — three dot-separated
-# parts where the third (signature) is empty. Format:
+# parts where the third (signature) is empty:
 #
 #   base64url(header).base64url(payload).
 #
@@ -11,6 +12,11 @@
 # in the third slot. SHA-256 lives in the future `stdlib/crypto/`
 # module (m14, blocked on bit ops m13); this demo uses `alg: none`
 # which is RFC-valid for unprotected tokens.
+#
+# v2 (2026-04-27 night): the JSON for the header and the payload
+# now goes through `json_encode` / `json_decode` from the real
+# `stdlib/encoding/json` module instead of the hardcoded
+# string-concat encoder the v1 carried.
 
 # ---- byte/string helpers ----------------------------------------
 
@@ -51,8 +57,7 @@ fn jwt_encode(header_json: String, payload_json: String) : String = {
 
 # ---- JWT decoding ------------------------------------------------
 
-#derive(Show, Eq)
-type Decoded = { header: String, payload: String }
+type Decoded = { header: JsonValue, payload: JsonValue }
 
 fn jwt_decode(token: String) : Option[Decoded] = {
   let parts = string_split(token, ".")
@@ -61,31 +66,47 @@ fn jwt_decode(token: String) : Option[Decoded] = {
       None     -> None
       Some(hb) -> match base64_decode_url(p_b64) {
         None     -> None
-        Some(pb) -> Some(Decoded {
-          header:  bytes_to_string(hb),
-          payload: bytes_to_string(pb)
-        })
+        Some(pb) -> {
+          let h_str = bytes_to_string(hb)
+          let p_str = bytes_to_string(pb)
+          match json_decode(h_str) {
+            None    -> None
+            Some(h) -> match json_decode(p_str) {
+              None    -> None
+              Some(p) -> Some(Decoded { header: h, payload: p })
+            }
+          }
+        }
       }
     }
     _ -> None
   }
 }
 
-# ---- Claim storage in Map ---------------------------------------
+# ---- JsonValue helpers -------------------------------------------
 
-# Build a Map[String, String] with the claims that go into the
-# payload, then serialise to a small JSON object. The serialiser is
-# minimal — string-only values, no nesting, no escaping (the demo
-# values are alphanumerics and digits). A real `stdlib/encoding/json`
-# would handle the rest.
-
-fn json_pair(p: Pair[String, String]) : String =
-  "\"" ++ p.fst ++ "\":\"" ++ p.snd ++ "\""
-
-fn json_object(claims: Map[String, String]) : String = {
-  let parts = map(map_to_pairs(claims), json_pair)
-  "{" ++ string_join(parts, ",") ++ "}"
+# Look up a string-valued field of a JObj. Useful for reading
+# specific claims (`sub`, `iss`, `kid`...) out of a decoded JWT
+# without writing match arms by hand.
+fn json_lookup_str(v: JsonValue, key: String) : Option[String] = match v {
+  JObj(pairs) -> json_lookup_str_loop(pairs, key)
+  _           -> None
 }
+
+fn json_lookup_str_loop(pairs: [Pair[String, JsonValue]], key: String) : Option[String] = match pairs {
+  []           -> None
+  [p, ...rest] -> if p.fst == key { match p.snd {
+                                      JStr(s) -> Some(s)
+                                      _       -> None
+                                    } }
+                  else { json_lookup_str_loop(rest, key) }
+}
+
+# Lift a `Pair[String, String]` claim into `Pair[String, JsonValue]`
+# so the resulting list can be wrapped in a `JObj`. Top-level
+# helper because nested `fn` is not valid in a let-block body.
+fn jwt_lift_claim(p: Pair[String, String]) : Pair[String, JsonValue] =
+  Pair { fst: p.fst, snd: JStr(p.snd) }
 
 # ---- Demo --------------------------------------------------------
 
@@ -95,19 +116,29 @@ fn main() = {
   # a placeholder to exercise `hex_from_int`. 48879 = 0xBEEF.
   let kid_hex = hex_from_int(48879)
 
-  # Header: alg=none, typ=JWT, kid=<hex>
-  let header = "{\"alg\":\"none\",\"typ\":\"JWT\",\"kid\":\"" ++ kid_hex ++ "\"}"
+  # Header: alg=none, typ=JWT, kid=<hex>. v2 builds it as a
+  # JsonValue tree and serialises through `json_encode` — escaping,
+  # quoting, and key ordering all handled by the encoder.
+  let header_v = JObj([
+    Pair { fst: "alg", snd: JStr("none") },
+    Pair { fst: "typ", snd: JStr("JWT") },
+    Pair { fst: "kid", snd: JStr(kid_hex) }
+  ])
+  let header = json_encode(header_v)
 
-  # Payload: claims live in a Map first to demo lookup before
-  # serialisation. Insert order is preserved (Map[K, V] is
-  # assoc-list-backed in v1), so the JSON output is deterministic.
+  # Payload: claims live in a Map first to demo Map.put / .get,
+  # then convert to JsonValue pairs for serialisation. Insert order
+  # is preserved (Map[K, V] is assoc-list-backed in v1), so the
+  # JSON output stays deterministic.
   let claims_0 = map_empty()
   let claims_1 = map_put(claims_0, "sub",  "user_42")
   let claims_2 = map_put(claims_1, "iss",  "kaikai-demo")
   let claims_3 = map_put(claims_2, "iat",  "1700000000")
   let claims   = map_put(claims_3, "name", "Eric")
 
-  let payload = json_object(claims)
+  let payload_pairs = map(map_to_pairs(claims), jwt_lift_claim)
+  let payload_v = JObj(payload_pairs)
+  let payload = json_encode(payload_v)
 
   Stdout.print("=== build ===")
   Stdout.print("header  : " ++ header)
@@ -132,10 +163,22 @@ fn main() = {
   match jwt_decode(token) {
     None -> Stdout.print("decode failed")
     Some(d) -> {
-      Stdout.print("header  : " ++ d.header)
-      Stdout.print("payload : " ++ d.payload)
-      let header_ok  = d.header == header
-      let payload_ok = d.payload == payload
+      let header_back  = json_encode(d.header)
+      let payload_back = json_encode(d.payload)
+      Stdout.print("header  : " ++ header_back)
+      Stdout.print("payload : " ++ payload_back)
+      # Inspect specific fields out of the decoded JsonValue
+      # without re-parsing — the AST is structured.
+      match json_lookup_str(d.header, "kid") {
+        Some(k) -> Stdout.print("decoded kid : " ++ k)
+        None    -> Stdout.print("decoded kid : <missing>")
+      }
+      match json_lookup_str(d.payload, "sub") {
+        Some(s) -> Stdout.print("decoded sub : " ++ s)
+        None    -> Stdout.print("decoded sub : <missing>")
+      }
+      let header_ok  = header_back == header
+      let payload_ok = payload_back == payload
       if header_ok and payload_ok { Stdout.print("round-trip: ok") }
       else { Stdout.print("round-trip: MISMATCH") }
     }
