@@ -1,0 +1,283 @@
+# Aspirational program — Full language Level 3 candidate (#2).
+#
+# A small arithmetic calculator. Recursive-descent parser over a
+# String, AST as a sum type, evaluator over a `Map[String, Decimal]`
+# variable environment, and an AST → JSON dumper for tooling
+# integration. NOT in any milestone plan.
+#
+# Combines four stdlib modules with deeply recursive sum-type
+# pattern matching:
+#
+#   - `Decimal` — every literal and every intermediate result.
+#   - `Map[String, Decimal]` — variable bindings.
+#   - `JsonValue` + `json_encode` — pretty-print the parsed AST as
+#     structured data (the kind of output a future `kai expr --json`
+#     subcommand would emit).
+#   - `Stdout` — render the parse + eval trace.
+#
+# Grammar (operator precedence):
+#
+#   expr    = term (('+' | '-') term)*
+#   term    = factor (('*' | '/') factor)*
+#   factor  = primary | '-' factor
+#   primary = NUMBER | IDENT | '(' expr ')'
+#
+# Numbers parse via `dec_parse` (sign + digits + optional fraction).
+# Identifiers are `[a-zA-Z][a-zA-Z0-9_]*`. Whitespace is ignored
+# between tokens. Division uses a fixed scale of 6 decimal digits;
+# real callers would parameterise that.
+
+# ---- AST --------------------------------------------------------
+
+type BinOp = Add | Sub | Mul | Div
+
+type Expr
+  = ENum(Decimal)
+  | EVar(String)
+  | EBin(BinOp, Expr, Expr)
+  | ENeg(Expr)
+
+# ---- Parser -----------------------------------------------------
+
+type PResult = { v: Expr, i: Int }
+
+fn pr_some(v: Expr, i: Int) : Option[PResult] = Some(PResult { v: v, i: i })
+
+fn calc_skip_ws(s: String, i: Int) : Int = {
+  if i >= string_length(s) { i }
+  else { match char_at(s, i) {
+    None    -> i
+    Some(c) -> if c == ' ' or c == '\t' { calc_skip_ws(s, i + 1) } else { i }
+  } }
+}
+
+# expr → term (('+' | '-') term)*
+fn parse_expr(s: String, i: Int) : Option[PResult] = {
+  match parse_term(s, i) {
+    None    -> None
+    Some(r) -> parse_expr_tail(s, r.v, r.i)
+  }
+}
+
+fn parse_expr_tail(s: String, lhs: Expr, i: Int) : Option[PResult] = {
+  let j = calc_skip_ws(s, i)
+  match char_at(s, j) {
+    Some('+') -> match parse_term(s, j + 1) {
+      None    -> None
+      Some(r) -> parse_expr_tail(s, EBin(Add, lhs, r.v), r.i)
+    }
+    Some('-') -> match parse_term(s, j + 1) {
+      None    -> None
+      Some(r) -> parse_expr_tail(s, EBin(Sub, lhs, r.v), r.i)
+    }
+    _ -> pr_some(lhs, i)
+  }
+}
+
+# term → factor (('*' | '/') factor)*
+fn parse_term(s: String, i: Int) : Option[PResult] = {
+  match parse_factor(s, i) {
+    None    -> None
+    Some(r) -> parse_term_tail(s, r.v, r.i)
+  }
+}
+
+fn parse_term_tail(s: String, lhs: Expr, i: Int) : Option[PResult] = {
+  let j = calc_skip_ws(s, i)
+  match char_at(s, j) {
+    Some('*') -> match parse_factor(s, j + 1) {
+      None    -> None
+      Some(r) -> parse_term_tail(s, EBin(Mul, lhs, r.v), r.i)
+    }
+    Some('/') -> match parse_factor(s, j + 1) {
+      None    -> None
+      Some(r) -> parse_term_tail(s, EBin(Div, lhs, r.v), r.i)
+    }
+    _ -> pr_some(lhs, i)
+  }
+}
+
+# factor → '-' factor | primary
+fn parse_factor(s: String, i: Int) : Option[PResult] = {
+  let j = calc_skip_ws(s, i)
+  match char_at(s, j) {
+    Some('-') -> match parse_factor(s, j + 1) {
+      None    -> None
+      Some(r) -> pr_some(ENeg(r.v), r.i)
+    }
+    _ -> parse_primary(s, j)
+  }
+}
+
+# primary → NUMBER | IDENT | '(' expr ')'
+fn parse_primary(s: String, i: Int) : Option[PResult] = {
+  let j = calc_skip_ws(s, i)
+  if j >= string_length(s) { None }
+  else { match char_at(s, j) {
+    None      -> None
+    Some('(') -> match parse_expr(s, j + 1) {
+      None    -> None
+      Some(r) -> {
+        let k = calc_skip_ws(s, r.i)
+        match char_at(s, k) {
+          Some(')') -> pr_some(r.v, k + 1)
+          _         -> None
+        }
+      }
+    }
+    Some(c) -> {
+      if ch_is_digit(c) { parse_number(s, j) }
+      else if ch_is_alpha(c) { parse_ident(s, j) }
+      else { None }
+    }
+  } }
+}
+
+# Number: sequence of digits + optional '.' + more digits.
+fn parse_number(s: String, i: Int) : Option[PResult] = {
+  let i_int = scan_digits(s, i)
+  let i_full =
+    match char_at(s, i_int) {
+      Some('.') -> scan_digits(s, i_int + 1)
+      _         -> i_int
+    }
+  let raw = string_slice(s, i, i_full - i)
+  match dec_parse(raw) {
+    None    -> None
+    Some(d) -> pr_some(ENum(d), i_full)
+  }
+}
+
+fn scan_digits(s: String, i: Int) : Int = {
+  if i >= string_length(s) { i }
+  else { match char_at(s, i) {
+    None    -> i
+    Some(c) -> if ch_is_digit(c) { scan_digits(s, i + 1) } else { i }
+  } }
+}
+
+# Identifier: [a-zA-Z][a-zA-Z0-9_]*
+fn parse_ident(s: String, i: Int) : Option[PResult] = {
+  let i_end = scan_ident(s, i + 1)
+  let name = string_slice(s, i, i_end - i)
+  pr_some(EVar(name), i_end)
+}
+
+fn scan_ident(s: String, i: Int) : Int = {
+  if i >= string_length(s) { i }
+  else { match char_at(s, i) {
+    None    -> i
+    Some(c) -> if ch_is_alnum(c) { scan_ident(s, i + 1) } else { i }
+  } }
+}
+
+# Top-level entry: parse the full string, demand it ends at EOF.
+pub fn calc_parse(s: String) : Option[Expr] = match parse_expr(s, 0) {
+  None    -> None
+  Some(r) -> {
+    let j = calc_skip_ws(s, r.i)
+    if j == string_length(s) { Some(r.v) } else { None }
+  }
+}
+
+# ---- Evaluator --------------------------------------------------
+
+pub fn calc_eval(e: Expr, env: Map[String, Decimal]) : Option[Decimal] = match e {
+  ENum(d)         -> Some(d)
+  EVar(name)      -> map_get(env, name)
+  ENeg(inner)     -> match calc_eval(inner, env) {
+    None    -> None
+    Some(d) -> Some(dec_neg(d))
+  }
+  EBin(op, l, r)  -> match calc_eval(l, env) {
+    None     -> None
+    Some(lv) -> match calc_eval(r, env) {
+      None     -> None
+      Some(rv) -> Some(eval_op(op, lv, rv))
+    }
+  }
+}
+
+fn eval_op(op: BinOp, l: Decimal, r: Decimal) : Decimal = match op {
+  Add -> dec_add(l, r)
+  Sub -> dec_sub(l, r)
+  Mul -> dec_mul(l, r)
+  Div -> dec_div(l, r, 6)   # 6-digit fixed precision; real callers parameterise
+}
+
+# ---- AST → JSON -------------------------------------------------
+
+fn binop_to_string(op: BinOp) : String = match op {
+  Add -> "+"
+  Sub -> "-"
+  Mul -> "*"
+  Div -> "/"
+}
+
+pub fn expr_to_json(e: Expr) : JsonValue = match e {
+  ENum(d)        -> JObj([
+    Pair { fst: "kind",  snd: JStr("num") },
+    Pair { fst: "value", snd: JStr(dec_to_string(d)) }
+  ])
+  EVar(name)     -> JObj([
+    Pair { fst: "kind", snd: JStr("var") },
+    Pair { fst: "name", snd: JStr(name) }
+  ])
+  ENeg(inner)    -> JObj([
+    Pair { fst: "kind", snd: JStr("neg") },
+    Pair { fst: "of",   snd: expr_to_json(inner) }
+  ])
+  EBin(op, l, r) -> JObj([
+    Pair { fst: "kind",  snd: JStr("bin") },
+    Pair { fst: "op",    snd: JStr(binop_to_string(op)) },
+    Pair { fst: "left",  snd: expr_to_json(l) },
+    Pair { fst: "right", snd: expr_to_json(r) }
+  ])
+}
+
+# ---- Demo --------------------------------------------------------
+
+fn show_eval(label: String, src: String, env: Map[String, Decimal]) : Unit / Stdout = {
+  Stdout.print("--- " ++ label ++ " ---")
+  Stdout.print("source: " ++ src)
+  match calc_parse(src) {
+    None -> Stdout.print("parse: FAIL")
+    Some(ast) -> {
+      Stdout.print("ast: " ++ json_encode(expr_to_json(ast)))
+      match calc_eval(ast, env) {
+        None    -> Stdout.print("eval: FAIL (unbound name)")
+        Some(d) -> Stdout.print("value: " ++ dec_to_string(d))
+      }
+    }
+  }
+  Stdout.print("")
+}
+
+fn main() : Int / Stdout = {
+  let env_empty = map_empty()
+
+  show_eval("constant",         "42",                              env_empty)
+  show_eval("simple add",       "1 + 2 + 3",                       env_empty)
+  show_eval("precedence",       "1 + 2 * 3",                       env_empty)
+  show_eval("parens",           "(1 + 2) * 3",                     env_empty)
+  show_eval("decimal",          "1.5 + 2.25",                      env_empty)
+  show_eval("unary minus",      "-5 + 3",                          env_empty)
+  show_eval("nested",           "(1.5 - 0.5) * (2 + 3)",           env_empty)
+  show_eval("division",         "10 / 3",                          env_empty)
+
+  let env_xy = map_put(map_put(env_empty, "x", dec_from_int(10)),
+                                "y", dec_from_parts(2, 5, 1))
+  show_eval("with vars",        "x * y",                           env_xy)
+  show_eval("formula",          "x + 2 * y - 1",                   env_xy)
+
+  # Unbound variable → eval returns None.
+  show_eval("unbound",          "z + 1",                           env_xy)
+
+  # Parse failures.
+  Stdout.print("--- parse errors ---")
+  match calc_parse("(1 + 2") { None -> Stdout.print("  unbalanced paren: ok (None)") Some(_) -> Stdout.print("  unbalanced: FAIL") }
+  match calc_parse("1 + + 2") { None -> Stdout.print("  double op:        ok (None)") Some(_) -> Stdout.print("  double op: FAIL") }
+  match calc_parse("$$$")     { None -> Stdout.print("  garbage:          ok (None)") Some(_) -> Stdout.print("  garbage: FAIL") }
+  match calc_parse("1 + 2 abc"){ None -> Stdout.print("  trailing junk:    ok (None)") Some(_) -> Stdout.print("  trailing: FAIL") }
+  0
+}
