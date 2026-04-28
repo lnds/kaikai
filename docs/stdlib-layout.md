@@ -91,16 +91,56 @@ read short (`xs |> map(f) |> filter(p)`). The aliases re-export
 
 Modules are tagged by which compiler stage they require:
 
-- **Stage 1** — compiles with kaikai-minimal (no effects, no row
-  polymorphism, no typeclasses; parametric HM only). Only `core/*`
-  lives here. This is the set that bootstraps with `kaic0`.
-- **Stage 2** — requires the full language (effects, row
-  polymorphism, Perceus, monomorphisation). Everything else.
+- **Stage 1 — bootstrap-safe.** Compiles with kaikai-minimal (no
+  effects, no row polymorphism, no typeclasses, no `++` operator;
+  parametric HM only). Only `core/*` lives here. This is the set
+  that bootstraps with `kaic0` and is what `selfhost` exercises
+  every CI run.
+- **Stage 2 — full-kaikai.** Requires the full language (effects,
+  row polymorphism, Perceus, monomorphisation, `++`). Everything
+  else (`encoding/`, `collections/`, `decimal`, `money`, `loop`,
+  `reader`, `writer`, `random`, `time`, `net/`, `crypto/`,
+  `regexp`, `concurrent/`, `testing`).
 
 The `stdlib/` directory does not reshuffle itself between stages; the
-stage 1 driver (`kaic0` / `kaic1`) prepends only `core/*` as prelude,
-the stage 2 driver prepends the full `core/*` plus a curated set of
-auto-imports (TBD in a later pass).
+stage 1 driver (`kaic0` / `kaic1`) prepends only `core/*.kai` as
+preludes, the stage 2 driver (`bin/kai`) prepends the full chain
+(`core/*.kai` + `protocols.kai` + `effects.kai` + `random.kai` +
+`encoding/*.kai` + `collections/*.kai`).
+
+### The fixture-side rule
+
+The same boundary applies to the test fixtures under
+`examples/stdlib/`:
+
+- Fixtures that exercise `core/*` (`list_basic`, `list_extrema`,
+  `list_sort`, `list_while_uniq`, `list_flat_zip`) are written in
+  **kaikai-minimal** and must remain bootstrap-safe. They use the
+  pre-effect `print` builtin (no row), unqualified
+  `string_concat(a, b)` rather than `a ++ b`, and avoid every
+  full-kaikai sugar. Validation: they must still compile under
+  `kaic1 --prelude stdlib/core/*.kai`.
+- Fixtures that exercise full-kaikai modules (`base64_basic`,
+  `hex_basic`, `map_basic`, `jwt_encoder`) **are full-kaikai**.
+  They use `Stdout.print` with the `/ Stdout` row, the `++`
+  operator, and other m7+ features. Validation lives in
+  `make test-stdlib`, which routes through kaic2 with the full
+  prelude chain.
+
+The `make test-stdlib` target validates the full-kaikai layer
+end-to-end (kaic2 + complete prelude chain). The bootstrap-safe
+subset is validated indirectly by `make selfhost`, which compiles
+`stage2/compiler.kai` through kaic1 with `core/*` as the only
+prelude — if any `core/*.kai` file picks up a full-kaikai-only
+construct, selfhost breaks.
+
+> Why this split is intentional: kaikai-minimal is **the bootstrap
+> language**, not "kaikai for beginners". Effects, row polymorphism,
+> and the operator sugars (`++`, `@cap`, trailing lambdas) are
+> full-kaikai by design — they cannot land in kaikai-minimal
+> without breaking Tier 1 principle 3 ("fast compilation, LL(1)
+> grammar with minor bookkeeping"). The right layer for those
+> features is stage 2.
 
 ## Module tree
 
