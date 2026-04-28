@@ -532,13 +532,18 @@ in.
     `ModuleEntry` so the resolver can dispatch qualified calls
     without an explicit `import`. See `docs/lane-experience-m14-v1.md`
     for the full sequence and the discoveries (preludes were not
-    modules, the codegen `emit_ident_value` shadowing bug). The
-    actual rename of the stdlib definitions to drop the prefix
-    (`pub fn list_take` -> `pub fn take`) is **deferred** to a
-    follow-up lane: it exposes the codegen shadowing bug across
-    common bare names (`take`, `drop`, `head`, …) and was rolled
-    back after empirically reproducing the read-of-garbage on
-    `let drop = 5; print(int_to_string(drop))`. Adds the missing
+    modules, the codegen `emit_ident_value` shadowing bug, the
+    list-def rename). The shadow bug was fixed in **v1.x**
+    (threaded `lcs: [String]` through every C-emit helper,
+    mirroring the LLVM backend's `e.locals`); the
+    **list rename landed in v1.A** — `pub fn list_take` ->
+    `pub fn take` plus 38 sibling ops, internal `*_loop` helpers
+    demoted to private, 29 legacy `pub fn list_X = X(...)` aliases
+    at the bottom for backward compat. Equivalent renames for
+    `string` / `option` / `result` / `char` are deferred —
+    bare `repeat` (list vs string), `map` / `and_then` /
+    `unwrap_or` (option vs result) collide on `kai_<name>`
+    minting and need m6.2 v2 universal prefixed minting first. Adds the missing
     list ops noted in `stdlib-layout.md` §`core.list` (sort,
     sort_by, max, min, count, contains, flat_map, take_while,
     drop_while, repeat, head, tail, uniq, zip_with). Also lands

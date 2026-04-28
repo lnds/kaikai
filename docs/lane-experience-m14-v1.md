@@ -1,9 +1,11 @@
 # Lane experience — m14 v1 (stdlib qualified-call surface)
 
-Date: 2026-04-28. Branch: `m14-v1`. Two commits:
+Date: 2026-04-28. Branch: `m14-v1`. Four commits:
 
   - `m14 v0: register --prelude files as modules` (infra prerequisite)
   - `m14 v1: qualified-call surface for stdlib (prefix-fallback)`
+  - `m14 v1.x: fix emit_ident_value local-shadow-global codegen bug`
+  - `m14 v1.A: rename list_* defs to bare names + legacy aliases`
 
 The original lane was scoped as a "mechanical naming migration" —
 rename `pub fn list_take` -> `pub fn take` across `stdlib/core/*`
@@ -114,24 +116,80 @@ End state:
   - Selfhost C + LLVM byte-identical fixed point: OK.
   - Full test suite green.
 
+## Finding 3 — codegen shadow fix landed (resolved)
+
+The shadow bug was fixed by mirroring the LLVM backend's
+`e.locals` design in the C backend: a `lcs: [String]` parameter
+threads lexical scope through every `emit_*` helper, extended at
+each scope-introducing site (fn params, lambda params + captures,
+clause params + stateful aliases, match-arm pattern binders,
+`SLet` bindings folded across block stmts). `emit_ident_value`
+and the named-call paths (`emit_named_call_lookup` /
+`emit_pipe_named_lookup`) check `lcs` before falling through to
+`evar_find` / `prelude_find` / `efn_find`.
+
+Selfhost C + LLVM byte-identical fixed point preserved (stage 2
+source has no local-shadow-global pattern, so visible output is
+unchanged); user code that triggers the pattern now codegens the
+local read.
+
+## Finding 4 — list.kai rename landed (v1.A)
+
+With the shadow fix in place the rename was straightforward.
+`stdlib/core/list.kai` now defines its 39 ops under bare names
+and ships 29 legacy `pub fn list_X(...) = X(...)` thin aliases
+at the bottom for backward compat. Internal `*_loop` helpers
+demoted to private `fn`. Selfhost + full test battery green.
+
+## Why string / option / result / char did NOT follow in v1
+
+Cross-module bare-name collisions:
+
+  | bare name    | collides between                               |
+  |--------------|------------------------------------------------|
+  | `repeat`     | list.kai (renamed) + string.kai                |
+  | `map`        | option.kai + result.kai + builtin `map`        |
+  | `and_then`   | option.kai + result.kai                        |
+  | `unwrap_or`  | option.kai + result.kai                        |
+
+m6.2 v1's plain-path minting is `kai_<name>` regardless of
+module — two `pub fn map` defs land on the same C symbol and the
+linker fails. Resolving this needs **m6.2 v2 universal prefixed
+minting** (`kai_<module>__<name>`), tracked separately in
+`docs/m6.2-design.md`.
+
+The user-visible qualified surface for these four modules is
+already complete via `me_lookup_export`'s prefix-fallback:
+
+  - `string.repeat(s, n)` resolves to `string_repeat`
+  - `option.map(o, f)` resolves to `opt_map` (override `option->opt`)
+  - `result.is_ok(r)` resolves to `result_is_ok`
+  - `char.is_digit(c)` resolves to `ch_is_digit` (override `char->ch`)
+
+Internal-name cleanup for these four modules waits for m6.2 v2.
+
 ## Items deferred from m14 v1
 
-  1. **Rename of stdlib definitions** to drop the prefix
-     (`pub fn list_take` -> `pub fn take`). Blocked on the
-     `emit_ident_value` shadow fix; the prefix-fallback is
-     callable forever in principle, but the long-term goal is
-     the cleaner internal form once the codegen is fixed.
+  1. **Rename of `string` / `option` / `result` / `char` defs**
+     (per `Why string / option / result / char did NOT follow`
+     above). Blocked on m6.2 v2 universal prefixed minting.
   2. **`print` / `println` consolidation** (`Console.print` /
      `Console.println`). Independent of the rename; shipped on
      a separate lane.
-  3. **Stage 1 backport of `EModCall`**. Only required when
+  3. **Stage 1 codegen shadow fix**. The bug is identical in
+     `stage1/compiler.kai`'s `emit_ident_value`. Stage 2 source
+     does not currently trigger it (no local-shadow-global
+     pattern), so the bootstrap chain stays consistent. Worth
+     fixing for full correctness when stage 1 maintenance
+     touches that area.
+  4. **Stage 1 backport of `EModCall`**. Only required when
      `stage2/compiler.kai` itself starts using qualified calls
      internally; today every caller in the bootstrap chain
      stays on the legacy bare-name surface.
-  4. **m6.2 v2 universal prefixed minting** (`kai_<module>__<name>`).
-     Tracked separately in `docs/m6.2-design.md`. Becomes
-     relevant when two stdlib modules want to export the same
-     bare name (e.g. `list.repeat` and `string.repeat`).
+  5. **m6.2 v2 universal prefixed minting** (`kai_<module>__<name>`).
+     Tracked separately in `docs/m6.2-design.md`. Unblocks
+     v1.B-E renames and lets two stdlib modules export the
+     same bare name (e.g. `list.repeat` and `string.repeat`).
 
 ## Methodological notes
 
