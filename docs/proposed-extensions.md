@@ -55,7 +55,7 @@ on.
 | `use Effect` — open effect in scope        | scheduled m7e | parser + resolver scoping |
 | Protocols (single-dispatch)                | scheduled m12.8 | parser + resolver + vtable codegen |
 | Units of measure `Real<USD>` / `Int<UserId>` | landed m12.5 | parser + typer extension |
-| `const NAME : T = literal` — top-level constants | proposed     | parse-time desugar to zero-arg fn |
+| `const NAME : T = literal` — top-level constants | landed 2026-04-28 | parse-time desugar to zero-arg fn |
 
 ## 1. `todo!(msg) : T` — principled unimplemented
 
@@ -1953,9 +1953,10 @@ machinery.
 
 ## 29. `const NAME : T = literal` — top-level named constants
 
-**Status: PROPOSED 2026-04-28.** Discussed during the m12.6.x
-close-out; pinned here for a future lane to revisit when concrete
-demand surfaces.
+**Status: LANDED 2026-04-28.** Sketch became real after the m12.6.x
+close-out: the user wanted `const MAX_PORT` precisely for the
+refinement / contract use case. Implementation followed the
+parser-only desugar plan from the original proposal.
 
 ```kai
 const PI : Real = 3.14159
@@ -2039,30 +2040,46 @@ What this v1 does NOT cover:
   y: 0.0 }` requires extending the const-folder to record
   literals. Punt to v2.
 
-### Why this is "proposed" and not "scheduled"
+### What landed in v1
 
-Cost-of-feature vs cost-of-workaround calculus:
-- Workaround today (`fn name() : T [<refinement_pure>] = lit`)
-  works for cases #1 and #3 above with one extra `()` per use.
-- Case #2 (pattern matching) is the only one where there's no
-  workaround short of `if` guards.
-- The feature touches lexer + parser + a new walker pass +
-  pattern-side change for full coverage. ~1.5 days of work
-  including fixtures.
+- `TkConst` keyword + `parse_const_decl` produces
+  `DAttribPure(DFn zero-arg)` so the const is automatically a
+  refinement-pure call target.
+- `pub` works on consts via the standard `parse_decl` path.
+- `collect_const_names_decls` runs early (before
+  `extract_pure_names_decls` unwraps `DAttribPure`); names of
+  zero-arg pure fns are captured as the const-name list.
+- `desugar_const_refs_decls` runs late (after
+  `desugar_interp_decls`) and walks the entire decl stream —
+  including refinement predicates inside `TyRefine` and contract
+  predicates inside `SAssert` bodies — rewriting every
+  `EVar(NAME)` to `ECall(EVar(NAME), [])`.
 
-That ratio is fine if a concrete demo asks for it. Until then,
-`fn name() : T [<refinement_pure>] = lit` carries the load.
+### What still doesn't work in v1
 
-**Cost**: low for the v1 parse-time desugar (~½ day). Medium for
-the pattern-side `PConstRef` (~1 day on top). High only if we
-extend to compound / computed constants.
-**Depends on**: m12.6.x #5(a) attribute parser (landed) — the
-desugar reuses `[<refinement_pure>]` so consts work in
-predicates without a separate pure-list registration.
-**Open question**: should `const` be allowed inside fn bodies
-as an alternative to `let` for compile-time literals? Probably
-not — `let x = 0` at the top of a fn already inlines. The
-distinction only matters at module scope.
+- **Inside `#{...}` string interpolations.** The legacy
+  emit-time path re-parses the EStr span directly, bypassing the
+  AST walker. Workaround: write `#{MAX_PORT()}` with explicit
+  parens. A future iteration will textually rewrite identifiers
+  inside `#{...}` segments at the span level.
+- **Pattern-side constants.** `match n { ZERO -> ... }` still
+  binds `ZERO` as a fresh name. Adding `PConstRef(name)` is the
+  next ½-day extension.
+- **Non-literal RHS.** `const TWO_PI : Real = 2.0 * PI` works
+  syntactically — the body is any Expr — but the typer / runtime
+  evaluate the call every time `TWO_PI` is referenced. A
+  compile-time evaluator (extending `try_eval_pred` from
+  m12.6.d) would inline the constant; deferred.
+- **Compound constants.** `const ORIGIN : Point = Point { x: 0,
+  y: 0 }` ships as a runtime call. Extending the const-folder
+  to record literals is the v2 work.
+
+### Open question
+
+Should `const` be allowed inside fn bodies as an alternative to
+`let` for compile-time literals? Probably not — `let x = 0` at
+the top of a fn already inlines. The distinction only matters at
+module scope.
 
 ## Deliberately not on this list
 

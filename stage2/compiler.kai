@@ -38,7 +38,7 @@ type TokKind
   = TkEof
   | TkNewline
   # keywords (alphabetical)
-  | TkAnd | TkAs | TkAssert | TkAxiom | TkEffect | TkElse | TkEnsures | TkFalse | TkFn | TkFor
+  | TkAnd | TkAs | TkAssert | TkAxiom | TkConst | TkEffect | TkElse | TkEnsures | TkFalse | TkFn | TkFor
   | TkHandle | TkIf | TkImpl | TkImport
   | TkLet | TkMatch | TkNot | TkOr | TkProtocol | TkPub | TkRequires | TkTest | TkTrue | TkType
   | TkUnitKw | TkUse | TkVar | TkWhere | TkWith
@@ -89,7 +89,7 @@ fn tk_name(k: TokKind) : String {
   match k {
     TkEof -> "EOF"
     TkNewline -> "NEWLINE"
-    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkAxiom -> "axiom" TkEffect -> "effect" TkElse -> "else"
+    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkAxiom -> "axiom" TkConst -> "const" TkEffect -> "effect" TkElse -> "else"
     TkEnsures -> "ensures"
     TkFalse -> "false" TkFn -> "fn" TkFor -> "for" TkHandle -> "handle"
     TkIf -> "if" TkImpl -> "impl" TkImport -> "import"
@@ -244,6 +244,7 @@ fn keyword_kind(text: String) : TokKind {
   else if text == "as" { TkAs }
   else if text == "assert" { TkAssert }
   else if text == "axiom" { TkAxiom }   # m12.7
+  else if text == "const" { TkConst }   # §29 / m12.6.x #const
   else if text == "effect" { TkEffect }
   else if text == "else" { TkElse }
   else if text == "ensures" { TkEnsures }   # m12.6.b
@@ -1380,6 +1381,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkAs         -> match b { TkAs -> true _ -> false }
     TkAssert     -> match b { TkAssert -> true _ -> false }
     TkAxiom      -> match b { TkAxiom -> true _ -> false }
+    TkConst      -> match b { TkConst -> true _ -> false }
     TkEffect     -> match b { TkEffect -> true _ -> false }
     TkElse       -> match b { TkElse -> true _ -> false }
     TkEnsures    -> match b { TkEnsures -> true _ -> false }
@@ -4196,16 +4198,60 @@ fn parse_decl(p: Parser) : PDecl {
     else { parse_use_decl(p_advance(p1), hd) }
   } else if tk_is(hd.kind, TkAxiom) {
     parse_axiom_decl(p_advance(p1), is_pub, hd)
+  } else if tk_is(hd.kind, TkConst) {
+    parse_const_decl(p_advance(p1), is_pub, hd)
   } else {
-    let base = "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, `unit`, `use`, `axiom`, or `import`"
+    let base = "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, `unit`, `use`, `axiom`, `const`, or `import`"
     let msg = if tk_is(hd.kind, TkIdent) {
       let text = tok_source(p1.src, hd)
-      match closest_name(text, ["fn", "type", "effect", "protocol", "impl", "test", "unit", "use", "axiom", "import", "pub"]) {
+      match closest_name(text, ["fn", "type", "effect", "protocol", "impl", "test", "unit", "use", "axiom", "const", "import", "pub"]) {
         Some(sug) -> concat_all([base, " (did you mean `", sug, "`?)"])
         None      -> base
       }
     } else { base }
     err_d(p_error(p1, hd, msg))
+  }
+}
+
+# §29 const NAME : T = expr — top-level named constant. Parses to
+# `pub fn NAME() : T = expr` wrapped in DAttribPure so it's
+# automatically callable from contract / refinement predicates.
+# A post-parse pass `desugar_const_refs_decls` rewrites every
+# `EVar(NAME)` reference to `ECall(EVar(NAME), [])` so call sites
+# read paren-free.
+fn parse_const_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) {
+    err_d(p_error(p, id, "expected constant name after `const`"))
+  } else {
+    let name = tok_source(p.src, id)
+    let p1 = p_advance(p)
+    let p2 = p_skip_newlines(p1)
+    if not p_at(p2, TkColon) {
+      err_d(p_error_here(p2, "expected `:` after constant name (`const NAME : T = expr`)"))
+    } else {
+      let p3 = p_skip_newlines(p_advance(p2))
+      let rt = parse_type(p3)
+      match rt.r {
+        None -> err_d(rt.p)
+        Some(ty) -> {
+          let p4 = p_skip_newlines(rt.p)
+          if not p_at(p4, TkEq) {
+            err_d(p_error_here(p4, "expected `=` in constant declaration"))
+          } else {
+            let p5 = p_skip_newlines(p_advance(p4))
+            let re = parse_expr(p5)
+            match re.r {
+              None -> err_d(re.p)
+              Some(body) -> {
+                let dfn = DFn(is_pub, name, [], [], Some(ty), REmpty, body, t.line, t.col)
+                ok_d(re.p, DAttribPure(dfn, t.line, t.col))
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }
 
@@ -10170,6 +10216,117 @@ fn lower_axiom_one(d: Decl) : Decl {
     }
     _ -> d
   }
+}
+
+# §29 const desugar: collect every zero-arg DAttribPure(DFn) name
+# (every const declaration produces this shape; user fns marked
+# `[<refinement_pure>]` with arguments are skipped). Returns the
+# list of names that should be rewritten from `EVar(name)` to
+# `ECall(EVar(name), [])` in subsequent passes.
+fn collect_const_names_decls(decls: [Decl]) : [String] =
+  collect_const_names_loop(decls, [])
+
+fn collect_const_names_loop(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DAttribPure(inner, _, _) -> match inner {
+        DFn(_, name, _, [], _, _, _, _, _) ->
+          collect_const_names_loop(rest, [name, ...acc])
+        _ -> collect_const_names_loop(rest, acc)
+      }
+      _ -> collect_const_names_loop(rest, acc)
+    }
+  }
+}
+
+# §29 const desugar: rewrite every `EVar(name)` reference in any
+# Expr position (fn body, type-refinement predicate, contract
+# predicate via SAssert in body, match-arm guard) where `name`
+# matches a declared const into `ECall(EVar(name), [])` so the
+# resolver/typer treats it as a zero-arg fn call. Operates on the
+# whole decl stream after collect_const_names_decls produces the
+# const-name list.
+fn desugar_const_refs_decls(decls: [Decl], const_names: [String]) : [Decl] =
+  map(decls, (d) => desugar_const_refs_decl(d, const_names))
+
+fn desugar_const_refs_decl(d: Decl, const_names: [String]) : Decl {
+  match d {
+    DFn(p, n, tps, ps, ret, row, body, l, c) -> {
+      let ps2 = map(ps, (pm) => desugar_const_refs_param(pm, const_names))
+      let ret2 = match ret {
+        Some(t) -> Some(desugar_const_refs_typeexpr(t, const_names))
+        None -> None
+      }
+      DFn(p, n, tps, ps2, ret2, row,
+          desugar_const_refs_expr(body, const_names), l, c)
+    }
+    DTest(desc, body, l, c) -> DTest(desc, desugar_const_refs_expr(body, const_names), l, c)
+    DType(p, n, tps, body, l, c) -> DType(p, n, tps,
+                                            desugar_const_refs_typebody(body, const_names),
+                                            l, c)
+    DAttribPure(inner, l, c) -> DAttribPure(desugar_const_refs_decl(inner, const_names), l, c)
+    _ -> d
+  }
+}
+
+fn desugar_const_refs_param(pm: Param, const_names: [String]) : Param {
+  match pm.ptype {
+    Some(t) -> Param { pname: pm.pname,
+                        ptype: Some(desugar_const_refs_typeexpr(t, const_names)),
+                        pline: pm.pline, pcol: pm.pcol }
+    None -> pm
+  }
+}
+
+fn desugar_const_refs_typebody(b: TypeBody, const_names: [String]) : TypeBody {
+  match b {
+    TBAlias(t) -> TBAlias(desugar_const_refs_typeexpr(t, const_names))
+    TBRecord(fields) -> TBRecord(map(fields, (fd) => desugar_const_refs_field(fd, const_names)))
+    _ -> b
+  }
+}
+
+fn desugar_const_refs_field(fd: FieldDecl, const_names: [String]) : FieldDecl {
+  match fd {
+    FD(name, ty) -> FD(name, desugar_const_refs_typeexpr(ty, const_names))
+  }
+}
+
+fn desugar_const_refs_typeexpr(t: TypeExpr, const_names: [String]) : TypeExpr {
+  match t.tkind {
+    TyRefine(base, pred) ->
+      mk_ty(TyRefine(desugar_const_refs_typeexpr(base, const_names),
+                      desugar_const_refs_expr(pred, const_names)),
+            t.line, t.col)
+    TyDim(base, u) ->
+      mk_ty(TyDim(desugar_const_refs_typeexpr(base, const_names), u), t.line, t.col)
+    TyList(inner) ->
+      mk_ty(TyList(desugar_const_refs_typeexpr(inner, const_names)), t.line, t.col)
+    TyName(n, tas) ->
+      mk_ty(TyName(n, map(tas, (a) => desugar_const_refs_typeexpr(a, const_names))),
+            t.line, t.col)
+    TyFn(ps, ret, row) ->
+      mk_ty(TyFn(map(ps, (p) => desugar_const_refs_typeexpr(p, const_names)),
+                  desugar_const_refs_typeexpr(ret, const_names), row),
+            t.line, t.col)
+  }
+}
+
+fn desugar_const_refs_expr(e: Expr, const_names: [String]) : Expr {
+  let new_kind = match e.kind {
+    EVar(name) ->
+      if list_has(const_names, name) {
+        ECall(mk_expr(EVar(name), e.line, e.col), [])
+      } else { e.kind }
+    # §29 limitation: identifiers that appear inside `#{...}` string
+    # interpolation are NOT rewritten here because the legacy
+    # emit-time path re-parses the EStr span directly, bypassing
+    # this walker. Use explicit parens (`#{MAX_PORT()}`) inside
+    # interpolations until the textual span-rewrite ships.
+    _ -> map_expr_kind(e.kind, (sub) => desugar_const_refs_expr(sub, const_names))
+  }
+  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty }
 }
 
 # m12.6.x #3 v2: synthesise a refinement-predicate fn for every
@@ -25816,6 +25973,11 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # extract_pure_names_decls so the synthesised fns'
             # DAttribPure wrappers are picked up too.
             let merged_raw_synth = synthesize_refine_pred_fns(merged_raw)
+            # §29 const desugar: collect names early (before extract
+            # unwraps DAttribPure) but apply the EVar→ECall rewrite
+            # late (after desugar_interp_decls so interpolated string
+            # parts are also reached).
+            let const_names = collect_const_names_decls(merged_raw_synth)
             # m12.6.x #5(a): unwrap DAttribPure → DFn before any other
             # walker runs. Captures the names marked
             # `[<refinement_pure>]` so the post-extract validation pass
@@ -25882,8 +26044,14 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # protocol-call rewrite see them. Conditional on `Show`
             # being declared (op_names contains "show"); otherwise
             # the legacy emit-time `kai_to_string` path remains.
-            let all_decls = desugar_interp_decls(lowered.decls,
-                                                  lowered.reg.op_names)
+            let interp_decls = desugar_interp_decls(lowered.decls,
+                                                     lowered.reg.op_names)
+            # §29 const desugar — late phase: rewrite every
+            # `EVar(NAME)` reference (including those that just
+            # surfaced from the interpolation desugar above) to
+            # `ECall(EVar(NAME), [])`. const_names was collected
+            # earlier from DAttribPure-wrapped zero-arg fns.
+            let all_decls = desugar_const_refs_decls(interp_decls, const_names)
             let proto_reg = lowered.reg
             let proto_errs = lowered.errs
             if alias_res.errs > 0 { alias_res.errs }
