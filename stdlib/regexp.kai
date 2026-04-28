@@ -1,0 +1,489 @@
+# stdlib/regexp.kai — RE2-style regular expressions.
+#
+# Pure full-kaikai implementation. Linear-time matching via NFA
+# set-of-states simulation. RE2-compatible subset:
+#   - Char literals + escapes (\\d \\w \\s . \\n \\t \\\\ \\/).
+#   - Character classes [abc], [^abc], [a-z], [0-9].
+#   - Anchors ^ $.
+#   - Greedy quantifiers * + ? {n} {n,} {n,m}.
+#   - Groups (...) capturing, (?:...) non-capturing.
+#   - Alternation a|b.
+#
+# Out of scope: backreferences, lookaround, Unicode property
+# classes, non-greedy quantifiers, named captures, inline flags.
+#
+# Bootstrap layering: full-kaikai (uses ++ in implementation,
+# effects-aware diagnostics). Validated through kaic2 + the
+# stage 2 test-stdlib harness.
+#
+# Phase 2 of the m12.6.x #7 / regex MVP lane lands the pattern
+# parser only — RxAst types + parsing. NFA construction and
+# simulation come in Phases 3 and 4.
+
+# ---- Types ----
+
+# A single character range inside a class. `lo == hi` represents a
+# single-character match. The class itself stores a list of ranges
+# plus a `negated` flag.
+pub type CharRange = CR(Char, Char)
+
+# Anchor positions: start-of-input or end-of-input. Multiline mode
+# is out of scope for v1, so ^/$ are absolute.
+pub type Anchor = AnchorStart | AnchorEnd
+
+# Pattern AST. The parser produces this; Phase 3 lowers to NFA.
+#
+# RxClass(ranges, negated): matches any char in ranges (or, when
+# negated, any char NOT in ranges). Built-in classes (\\d \\w \\s)
+# desugar to the corresponding RxClass at parse time. `.` desugars
+# to a "any char except newline" class.
+#
+# RxConcat([]) is the empty sequence (matches empty string).
+# RxAlt is at least 2 alternatives by construction; single-arm
+# alternation is collapsed to the inner expression.
+#
+# RxRepeat(inner, min, max_opt): min..max bounded repeat. {n}
+# becomes RxRepeat(inner, n, Some(n)); {n,} becomes RxRepeat(inner,
+# n, None); {n,m} becomes RxRepeat(inner, n, Some(m)). The simpler
+# RxStar/RxPlus/RxOpt forms are kept for clarity in the NFA pass.
+#
+# RxGroup(id, inner): capture group with 1-based id. Non-capturing
+# groups (?:...) parse to inner directly without an RxGroup wrap.
+pub type RxAst
+  = RxChar(Char)
+  | RxAny
+  | RxClass([CharRange], Bool)
+  | RxAnchor(Anchor)
+  | RxConcat([RxAst])
+  | RxAlt([RxAst])
+  | RxStar(RxAst)
+  | RxPlus(RxAst)
+  | RxOpt(RxAst)
+  | RxRepeat(RxAst, Int, Option[Int])
+  | RxGroup(Int, RxAst)
+
+# Parser carries the input string, current position, and a
+# monotonically-increasing capture-group counter. The counter is
+# advanced when a `(...)` (non-`?:`) is opened, so groups are
+# numbered in source order.
+pub type RxParseState = { input: String, pos: Int, n: Int, group_id: Int }
+
+# Parser result wrapper. `r = None` means the parse failed and the
+# `err_msg` field describes what went wrong; `r = Some(ast)` is the
+# successful parse paired with the consumed state.
+pub type RxParseError = { msg: String, pos: Int }
+pub type PRx = { st: RxParseState, r: Option[RxAst], err: Option[RxParseError] }
+
+fn rx_ok(st: RxParseState, ast: RxAst) : PRx =
+  PRx { st: st, r: Some(ast), err: None }
+
+fn rx_err(st: RxParseState, msg: String) : PRx =
+  PRx { st: st, r: None, err: Some(RxParseError { msg: msg, pos: st.pos }) }
+
+# ---- Parse-state helpers ----
+
+fn rx_state_init(input: String) : RxParseState =
+  RxParseState { input: input, pos: 0, n: string_length(input), group_id: 0 }
+
+fn rx_at_end(st: RxParseState) : Bool = st.pos >= st.n
+
+fn rx_peek(st: RxParseState) : Option[Char] =
+  if rx_at_end(st) { None } else { char_at(st.input, st.pos) }
+
+fn rx_peek_at(st: RxParseState, off: Int) : Option[Char] =
+  if st.pos + off >= st.n { None } else { char_at(st.input, st.pos + off) }
+
+fn rx_advance(st: RxParseState) : RxParseState =
+  RxParseState { input: st.input, pos: st.pos + 1, n: st.n, group_id: st.group_id }
+
+fn rx_advance_n(st: RxParseState, k: Int) : RxParseState =
+  RxParseState { input: st.input, pos: st.pos + k, n: st.n, group_id: st.group_id }
+
+fn rx_bump_group(st: RxParseState) : RxParseState =
+  RxParseState { input: st.input, pos: st.pos, n: st.n, group_id: st.group_id + 1 }
+
+# ---- Public entry point ----
+
+# Parse a pattern string into an RxAst. Returns Result so callers
+# can handle malformed patterns explicitly. The error form carries
+# a message and the byte offset at which parsing failed.
+pub fn rx_parse_pattern(pattern: String) : Result[RxParseError, RxAst] = {
+  let st0 = rx_state_init(pattern)
+  let r = rx_parse_alt(st0)
+  match r.r {
+    None -> match r.err {
+      Some(e) -> Err(e)
+      None    -> Err(RxParseError { msg: "regex parse failed", pos: r.st.pos })
+    }
+    Some(ast) ->
+      if rx_at_end(r.st) { Ok(ast) }
+      else {
+        Err(RxParseError {
+          msg: "trailing characters after regex",
+          pos: r.st.pos
+        })
+      }
+  }
+}
+
+# ---- Top-down recursive descent ----
+#
+# Grammar (informal):
+#   alt    ::= concat ("|" concat)*
+#   concat ::= atom*
+#   atom   ::= primary quantifier?
+#   primary ::= group | class | "." | anchor | escape | char
+#   group  ::= "(" "?:"? alt ")"
+#   class  ::= "[" "^"? class_item* "]"
+#
+# Each rx_parse_* takes an RxParseState and returns a PRx. The
+# parser is greedy; quantifiers attach to the most recent atom only
+# (no quantifier-on-empty).
+
+fn rx_parse_alt(st: RxParseState) : PRx = {
+  let r0 = rx_parse_concat(st)
+  match r0.r {
+    None -> r0
+    Some(first) -> rx_parse_alt_loop(r0.st, [first])
+  }
+}
+
+fn rx_parse_alt_loop(st: RxParseState, acc: [RxAst]) : PRx = {
+  match rx_peek(st) {
+    Some(c) -> if c == '|' {
+      let st1 = rx_advance(st)
+      let rn = rx_parse_concat(st1)
+      match rn.r {
+        None -> rn
+        Some(next) -> rx_parse_alt_loop(rn.st, list_append(acc, [next]))
+      }
+    } else { rx_finish_alt(st, acc) }
+    None -> rx_finish_alt(st, acc)
+  }
+}
+
+fn rx_finish_alt(st: RxParseState, alts: [RxAst]) : PRx = match alts {
+  []  -> rx_ok(st, RxConcat([]))
+  [a] -> rx_ok(st, a)
+  _   -> rx_ok(st, RxAlt(alts))
+}
+
+# `concat` parses a sequence of atoms until end-of-input, ')' or
+# '|'. An empty concat is valid (matches the empty string) so we
+# always succeed but may return RxConcat([]).
+fn rx_parse_concat(st: RxParseState) : PRx = rx_parse_concat_loop(st, [])
+
+fn rx_parse_concat_loop(st: RxParseState, acc: [RxAst]) : PRx = {
+  match rx_peek(st) {
+    None -> rx_finish_concat(st, acc)
+    Some(c) -> if c == '|' or c == ')' {
+      rx_finish_concat(st, acc)
+    } else {
+      let r = rx_parse_atom(st)
+      match r.r {
+        None -> r
+        Some(at) -> rx_parse_concat_loop(r.st, list_append(acc, [at]))
+      }
+    }
+  }
+}
+
+fn rx_finish_concat(st: RxParseState, items: [RxAst]) : PRx = match items {
+  []  -> rx_ok(st, RxConcat([]))
+  [x] -> rx_ok(st, x)
+  _   -> rx_ok(st, RxConcat(items))
+}
+
+# An atom is a primary expression optionally followed by a single
+# quantifier. Quantifiers do not stack (`a**` is rejected) — that
+# is the user's job to write `(a*)*` if they want the meaning.
+fn rx_parse_atom(st: RxParseState) : PRx = {
+  let r = rx_parse_primary(st)
+  match r.r {
+    None -> r
+    Some(p) -> rx_apply_quantifier(r.st, p)
+  }
+}
+
+fn rx_apply_quantifier(st: RxParseState, p: RxAst) : PRx = {
+  match rx_peek(st) {
+    None -> rx_ok(st, p)
+    Some(c) ->
+      if c == '*' { rx_ok(rx_advance(st), RxStar(p)) }
+      else if c == '+' { rx_ok(rx_advance(st), RxPlus(p)) }
+      else if c == '?' { rx_ok(rx_advance(st), RxOpt(p)) }
+      else if c == '{' { rx_parse_repeat(rx_advance(st), p) }
+      else { rx_ok(st, p) }
+  }
+}
+
+# {n}, {n,}, {n,m}. Reject malformed forms (`{}`, `{,5}`,
+# `{2,1}`).
+fn rx_parse_repeat(st: RxParseState, p: RxAst) : PRx = {
+  let rn = rx_parse_int(st)
+  match rn.r_int {
+    None    -> rx_err(rn.st, "expected count after `{`")
+    Some(lo) -> match rx_peek(rn.st) {
+      Some(c) -> if c == '}' {
+        rx_ok(rx_advance(rn.st), RxRepeat(p, lo, Some(lo)))
+      } else if c == ',' {
+        let st_after_comma = rx_advance(rn.st)
+        match rx_peek(st_after_comma) {
+          Some(c2) -> if c2 == '}' {
+            rx_ok(rx_advance(st_after_comma), RxRepeat(p, lo, None))
+          } else {
+            let rh = rx_parse_int(st_after_comma)
+            match rh.r_int {
+              None -> rx_err(rh.st, "expected count or `}` after `,`")
+              Some(hi) ->
+                if hi < lo { rx_err(rh.st, "repeat count {n,m}: m < n") }
+                else { match rx_peek(rh.st) {
+                  Some('}') -> rx_ok(rx_advance(rh.st), RxRepeat(p, lo, Some(hi)))
+                  _         -> rx_err(rh.st, "expected `}` to close repeat")
+                } }
+            }
+          }
+          None -> rx_err(st_after_comma, "unterminated `{`")
+        }
+      } else { rx_err(rn.st, "expected `,` or `}` after count") }
+      None -> rx_err(rn.st, "unterminated `{`")
+    }
+  }
+}
+
+# Parse a base-10 integer of one or more digits. Returns the
+# advanced state and the parsed value (or None if no digits).
+type RxIntParse = { st: RxParseState, r_int: Option[Int] }
+
+fn rx_parse_int(st: RxParseState) : RxIntParse =
+  rx_parse_int_loop(st, 0, false)
+
+fn rx_parse_int_loop(st: RxParseState, acc: Int, any: Bool) : RxIntParse = {
+  match rx_peek(st) {
+    Some(c) -> if ch_is_digit(c) {
+      let d = char_to_int(c) - char_to_int('0')
+      rx_parse_int_loop(rx_advance(st), acc * 10 + d, true)
+    } else {
+      RxIntParse { st: st, r_int: if any { Some(acc) } else { None } }
+    }
+    None -> RxIntParse { st: st, r_int: if any { Some(acc) } else { None } }
+  }
+}
+
+# A primary expression is one of: group, class, anchor, ".", escape,
+# or a literal char.
+fn rx_parse_primary(st: RxParseState) : PRx = {
+  match rx_peek(st) {
+    None    -> rx_err(st, "unexpected end of pattern")
+    Some(c) ->
+      if c == '(' { rx_parse_group(rx_advance(st)) }
+      else if c == '[' { rx_parse_class(rx_advance(st)) }
+      else if c == '.' { rx_ok(rx_advance(st), RxAny) }
+      else if c == '^' { rx_ok(rx_advance(st), RxAnchor(AnchorStart)) }
+      else if c == '$' { rx_ok(rx_advance(st), RxAnchor(AnchorEnd)) }
+      else if c == '\\' { rx_parse_escape(rx_advance(st)) }
+      else if c == ')' or c == '|' or c == '*' or c == '+' or c == '?' or c == '{' or c == '}' or c == ']' {
+        rx_err(st, "unexpected metacharacter in primary position")
+      }
+      else { rx_ok(rx_advance(st), RxChar(c)) }
+  }
+}
+
+# `(` already consumed. Detect `?:` for non-capturing form, parse
+# inner alt, expect `)`.
+fn rx_parse_group(st: RxParseState) : PRx = {
+  let is_noncap =
+    match rx_peek(st) {
+      Some('?') -> match rx_peek_at(st, 1) { Some(':') -> true _ -> false }
+      _         -> false
+    }
+  let st1 = if is_noncap { rx_advance_n(st, 2) } else { st }
+  let st2 = if is_noncap { st1 } else { rx_bump_group(st1) }
+  let gid = if is_noncap { 0 } else { st2.group_id }
+  let r = rx_parse_alt(st2)
+  match r.r {
+    None -> r
+    Some(inner) -> match rx_peek(r.st) {
+      Some(')') -> {
+        let inner_wrapped = if is_noncap { inner } else { RxGroup(gid, inner) }
+        rx_ok(rx_advance(r.st), inner_wrapped)
+      }
+      _ -> rx_err(r.st, "expected `)` to close group")
+    }
+  }
+}
+
+# `[` already consumed. Parse optional `^` then class items until
+# closing `]`.
+fn rx_parse_class(st: RxParseState) : PRx = {
+  let neg = match rx_peek(st) { Some('^') -> true _ -> false }
+  let st1 = if neg { rx_advance(st) } else { st }
+  rx_parse_class_loop(st1, [], neg)
+}
+
+fn rx_parse_class_loop(st: RxParseState, acc: [CharRange], neg: Bool) : PRx = {
+  match rx_peek(st) {
+    None      -> rx_err(st, "unterminated character class")
+    Some(']') -> if list_is_empty(acc) {
+      rx_err(st, "empty character class")
+    } else { rx_ok(rx_advance(st), RxClass(acc, neg)) }
+    Some(c)   -> {
+      let r = rx_parse_class_atom(st, c)
+      match r.r_range {
+        None -> rx_err(r.st, "malformed character class")
+        Some(rng) -> rx_parse_class_loop(r.st, list_append(acc, [rng]), neg)
+      }
+    }
+  }
+}
+
+type RxRangeParse = { st: RxParseState, r_range: Option[CharRange] }
+
+# Parse a single class atom: a literal char, an escape, or a
+# range `a-z`. The leading char is `c`, already in the buffer at
+# st.pos.
+fn rx_parse_class_atom(st: RxParseState, c: Char) : RxRangeParse = {
+  let res_first = if c == '\\' {
+    rx_parse_escape_char(rx_advance(st))
+  } else {
+    RxCharParse { st: rx_advance(st), r_char: Some(c) }
+  }
+  match res_first.r_char {
+    None -> RxRangeParse { st: res_first.st, r_range: None }
+    Some(lo) -> {
+      # Optional range: `-` followed by another char (not `]`)
+      match rx_peek(res_first.st) {
+        Some('-') -> match rx_peek_at(res_first.st, 1) {
+          Some(']') -> RxRangeParse { st: res_first.st, r_range: Some(CR(lo, lo)) }
+          Some(_) -> {
+            let st_dash = rx_advance(res_first.st)
+            match rx_peek(st_dash) {
+              Some(c2) -> {
+                let res_hi = if c2 == '\\' {
+                  rx_parse_escape_char(rx_advance(st_dash))
+                } else {
+                  RxCharParse { st: rx_advance(st_dash), r_char: Some(c2) }
+                }
+                match res_hi.r_char {
+                  None     -> RxRangeParse { st: res_hi.st, r_range: None }
+                  Some(hi) -> RxRangeParse { st: res_hi.st, r_range: Some(CR(lo, hi)) }
+                }
+              }
+              None -> RxRangeParse { st: st_dash, r_range: None }
+            }
+          }
+          None -> RxRangeParse { st: res_first.st, r_range: None }
+        }
+        _ -> RxRangeParse { st: res_first.st, r_range: Some(CR(lo, lo)) }
+      }
+    }
+  }
+}
+
+# Parse an escape that introduces a primary RxAst (outside a class).
+# `\\d` `\\w` `\\s` desugar to RxClass; `\\D` `\\W` `\\S` are their
+# negations; everything else falls through to a literal char.
+fn rx_parse_escape(st: RxParseState) : PRx = {
+  match rx_peek(st) {
+    None    -> rx_err(st, "trailing backslash")
+    Some(c) -> {
+      let st1 = rx_advance(st)
+      if c == 'd' { rx_ok(st1, RxClass([CR('0', '9')], false)) }
+      else if c == 'D' { rx_ok(st1, RxClass([CR('0', '9')], true)) }
+      else if c == 'w' { rx_ok(st1, RxClass(rx_word_ranges(), false)) }
+      else if c == 'W' { rx_ok(st1, RxClass(rx_word_ranges(), true)) }
+      else if c == 's' { rx_ok(st1, RxClass(rx_space_ranges(), false)) }
+      else if c == 'S' { rx_ok(st1, RxClass(rx_space_ranges(), true)) }
+      else if c == 'n' { rx_ok(st1, RxChar('\n')) }
+      else if c == 't' { rx_ok(st1, RxChar('\t')) }
+      else if c == 'r' { rx_ok(st1, RxChar('\r')) }
+      else { rx_ok(st1, RxChar(c)) }
+    }
+  }
+}
+
+# Word characters per Perl/POSIX ASCII: [A-Za-z0-9_].
+fn rx_word_ranges() : [CharRange] =
+  [CR('A', 'Z'), CR('a', 'z'), CR('0', '9'), CR('_', '_')]
+
+# Whitespace: space, tab, newline, carriage-return, vertical-tab,
+# form-feed.
+fn rx_space_ranges() : [CharRange] =
+  [CR(' ', ' '), CR('\t', '\t'), CR('\n', '\n'), CR('\r', '\r')]
+
+# Inside a character class, `\\` introduces an escape that must
+# resolve to a single character (no class-of-class expansion in v1
+# — `[\\d]` is treated as the literal `d`, mirroring most engines'
+# strict reading; users wanting digits write `[0-9]` explicitly).
+type RxCharParse = { st: RxParseState, r_char: Option[Char] }
+
+fn rx_parse_escape_char(st: RxParseState) : RxCharParse = {
+  match rx_peek(st) {
+    None -> RxCharParse { st: st, r_char: None }
+    Some(c) -> {
+      let st1 = rx_advance(st)
+      let mapped =
+        if c == 'n' { '\n' }
+        else if c == 't' { '\t' }
+        else if c == 'r' { '\r' }
+        else { c }
+      RxCharParse { st: st1, r_char: Some(mapped) }
+    }
+  }
+}
+
+# ---- AST inspection helpers (debug / dump) ----
+#
+# Codepoint-based dump for fixtures that want to round-trip an AST
+# and check structural shape without running the engine. Phase 6
+# may shape these differently once the simulator lands and
+# end-to-end fixtures take precedence over parser-only tests.
+# Char values render as their decimal codepoint so we can stay
+# pre-`Show[Char]` (no `impl Show for Char` in stdlib yet — adding
+# one is its own micro-lane).
+
+pub fn rx_ast_show(a: RxAst) : String = match a {
+  RxChar(c)     -> string_concat_all(["Ch(", int_to_string(char_to_int(c)), ")"])
+  RxAny         -> "Any"
+  RxClass(rs, neg) ->
+    string_concat_all(["Cls(", if neg { "^" } else { "" }, rx_ranges_show(rs), ")"])
+  RxAnchor(a) -> match a {
+    AnchorStart -> "Start"
+    AnchorEnd   -> "End"
+  }
+  RxConcat(xs) -> string_concat_all(["Cat(", rx_list_show(xs), ")"])
+  RxAlt(xs)    -> string_concat_all(["Alt(", rx_list_show(xs), ")"])
+  RxStar(x)    -> string_concat_all(["Star(", rx_ast_show(x), ")"])
+  RxPlus(x)    -> string_concat_all(["Plus(", rx_ast_show(x), ")"])
+  RxOpt(x)     -> string_concat_all(["Opt(", rx_ast_show(x), ")"])
+  RxRepeat(x, lo, hi_opt) -> {
+    let hi_s = match hi_opt {
+      Some(h) -> int_to_string(h)
+      None    -> "*"
+    }
+    string_concat_all(["Rep(", rx_ast_show(x), ",", int_to_string(lo), ",", hi_s, ")"])
+  }
+  RxGroup(id, x) ->
+    string_concat_all(["Grp(", int_to_string(id), ",", rx_ast_show(x), ")"])
+}
+
+fn rx_list_show(xs: [RxAst]) : String = match xs {
+  []           -> ""
+  [x]          -> rx_ast_show(x)
+  [x, ...rest] -> string_concat_all([rx_ast_show(x), ",", rx_list_show(rest)])
+}
+
+fn rx_ranges_show(rs: [CharRange]) : String = match rs {
+  []           -> ""
+  [r]          -> rx_range_show(r)
+  [r, ...rest] -> string_concat_all([rx_range_show(r), ",", rx_ranges_show(rest)])
+}
+
+fn rx_range_show(r: CharRange) : String = match r {
+  CR(lo, hi) -> {
+    let lo_s = int_to_string(char_to_int(lo))
+    let hi_s = int_to_string(char_to_int(hi))
+    if char_to_int(lo) == char_to_int(hi) { lo_s }
+    else { string_concat_all([lo_s, "-", hi_s]) }
+  }
+}
