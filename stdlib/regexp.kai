@@ -950,3 +950,254 @@ fn rx_transition_show(t: NfaTransition) : String = match t {
     AnchorEnd   -> "$->#{int_to_string(dst)}"
   }
 }
+
+# ====================================================================
+# Phase 4 — NFA simulation (set-of-states, leftmost-longest)
+# ====================================================================
+#
+# Pike-style simulator. Each *thread* is a (state_id, captures) pair.
+# At every input position we run an ε-closure over the active set,
+# then consume one input char with TChar / TClass / TAny edges. The
+# threadset is deduped by state_id (first thread to reach a given
+# state wins — gives the leftmost-longest semantics RE2 promises).
+#
+# Capture tracking: each thread carries an immutable map
+# `[Capture]` where Capture is `(group_id, start, end)`. TGroupOpen
+# bumps the start; TGroupClose bumps the end. Group 0 is reserved
+# for the whole-match span and is initialised when the seed thread
+# is built.
+#
+# leftmost-longest: try start positions 0, 1, 2, ... in order; for
+# each start, run the simulation and remember the longest accept
+# position. The first start that produces *any* accept wins (left)
+# and we return its longest span.
+
+# Captured span. `start == -1` means the group has not opened yet
+# along this thread; `end == -1` means it opened but did not close.
+pub type Capture = { group_id: Int, start: Int, end: Int }
+
+pub type Match = { start: Int, end: Int, groups: [Capture] }
+
+# Thread record: which NFA state and the per-thread capture stack.
+type Thread = { state_id: Int, captures: [Capture] }
+
+# Initialise a fresh capture vector with group 0's start anchored at
+# the input position the simulation seeds from. Group ids 1..n-1 are
+# absent until TGroupOpen fills them in.
+fn rx_init_captures(start_pos: Int) : [Capture] =
+  [Capture { group_id: 0, start: start_pos, end: -1 }]
+
+# Update the capture vector with a TGroupOpen at `pos`. If a record
+# for `gid` already exists, replace its start (last open wins for
+# that thread); otherwise append.
+fn rx_capture_open(caps: [Capture], gid: Int, pos: Int) : [Capture] =
+  rx_capture_set(caps, gid, pos, -1, true)
+
+fn rx_capture_close(caps: [Capture], gid: Int, pos: Int) : [Capture] =
+  rx_capture_set(caps, gid, -1, pos, false)
+
+fn rx_capture_set(caps: [Capture], gid: Int, start_v: Int, end_v: Int, is_open: Bool) : [Capture] = match caps {
+  [] ->
+    if is_open { [Capture { group_id: gid, start: start_v, end: end_v }] }
+    else       { [Capture { group_id: gid, start: -1, end: end_v }] }
+  [c, ...rest] ->
+    if c.group_id == gid {
+      let new_c = if is_open {
+        Capture { group_id: gid, start: start_v, end: c.end }
+      } else {
+        Capture { group_id: gid, start: c.start, end: end_v }
+      }
+      [new_c, ...rest]
+    } else {
+      [c, ...rx_capture_set(rest, gid, start_v, end_v, is_open)]
+    }
+}
+
+# Close group 0 (the whole-match span) at `pos`. Used right before
+# returning a successful Match so the user always sees the match
+# bounds.
+fn rx_close_match(caps: [Capture], pos: Int) : [Capture] =
+  rx_capture_close(caps, 0, pos)
+
+# ---- Public entry point ----
+
+# Simulate `nfa` over `input`. Returns Some(Match) at the leftmost
+# position with the longest extent, or None if no match exists.
+pub fn rx_simulate(nfa: Nfa, input: String) : Option[Match] = {
+  let n = string_length(input)
+  rx_simulate_from(nfa, input, n, 0)
+}
+
+# Try start positions in order until one matches. n is precomputed.
+fn rx_simulate_from(nfa: Nfa, input: String, n: Int, start: Int) : Option[Match] = {
+  if start > n { None }
+  else {
+    match rx_simulate_at(nfa, input, n, start) {
+      Some(m) -> Some(m)
+      None    -> rx_simulate_from(nfa, input, n, start + 1)
+    }
+  }
+}
+
+# Simulate from a fixed start position. Returns the longest accept
+# position (or None) by stepping the threadset forward.
+fn rx_simulate_at(nfa: Nfa, input: String, n: Int, start: Int) : Option[Match] = {
+  let seed = Thread { state_id: nfa.start, captures: rx_init_captures(start) }
+  let initial = rx_eps_closure(nfa, [seed], input, n, start)
+  # If any thread already in an accept state, the empty match
+  # at `start` is the current best. We keep stepping in case a
+  # longer match exists.
+  let initial_best = rx_pick_accept(nfa, initial, start)
+  rx_simulate_loop(nfa, input, n, start, initial, initial_best)
+}
+
+# Step pos by pos until threadset empties or input ends.
+fn rx_simulate_loop(nfa: Nfa, input: String, n: Int, pos: Int,
+                     threads: [Thread], best: Option[Match]) : Option[Match] = {
+  if pos >= n or list_is_empty(threads) { best }
+  else {
+    match char_at(input, pos) {
+      None    -> best
+      Some(c) -> {
+        let stepped = rx_step(nfa, threads, c)
+        let pos1 = pos + 1
+        let closed = rx_eps_closure(nfa, stepped, input, n, pos1)
+        let new_best = match rx_pick_accept(nfa, closed, pos1) {
+          Some(m) -> Some(m)
+          None    -> best
+        }
+        rx_simulate_loop(nfa, input, n, pos1, closed, new_best)
+      }
+    }
+  }
+}
+
+# If any thread is in an accept state, materialise its capture
+# vector as a Match record (closing group 0 at `end_pos`). Returns
+# None when no thread is at accept.
+fn rx_pick_accept(nfa: Nfa, threads: [Thread], end_pos: Int) : Option[Match] = match threads {
+  []           -> None
+  [t, ...rest] ->
+    if rx_state_is_accept(nfa.states, t.state_id) {
+      let caps = rx_close_match(t.captures, end_pos)
+      Some(Match { start: rx_match_start(caps), end: end_pos, groups: caps })
+    } else { rx_pick_accept(nfa, rest, end_pos) }
+}
+
+fn rx_match_start(caps: [Capture]) : Int = match caps {
+  [] -> 0
+  [c, ...rest] -> if c.group_id == 0 { c.start } else { rx_match_start(rest) }
+}
+
+fn rx_state_is_accept(states: [NfaState], id: Int) : Bool = match states {
+  [] -> false
+  [s, ...rest] -> if s.id == id { s.accept } else { rx_state_is_accept(rest, id) }
+}
+
+# ---- ε-closure ----
+#
+# Expand the threadset over zero-width transitions:
+# TEpsilon, TGroupOpen, TGroupClose, TAnchor (when satisfied at pos).
+# Anchors that don't match at the current position simply don't
+# expand — the thread stays where it is, but no new edge fires.
+#
+# Dedup: when a thread arrives at a state that already has a
+# representative in the closure, the *first* representative wins.
+# Pike-style. This keeps the threadset bounded by the number of
+# NFA states.
+
+fn rx_eps_closure(nfa: Nfa, seeds: [Thread], input: String, n: Int, pos: Int) : [Thread] = {
+  rx_eps_closure_loop(nfa, seeds, [], input, n, pos)
+}
+
+# Worklist algorithm: pop a thread, if its state is not yet in the
+# closure, add it and push its zero-width neighbours. Order
+# preserved so leftmost-priority is naturally the seed order.
+fn rx_eps_closure_loop(nfa: Nfa, work: [Thread], closure: [Thread],
+                        input: String, n: Int, pos: Int) : [Thread] = match work {
+  [] -> closure
+  [t, ...rest] ->
+    if rx_thread_in(closure, t.state_id) {
+      rx_eps_closure_loop(nfa, rest, closure, input, n, pos)
+    } else {
+      let closure1 = list_append(closure, [t])
+      let trs = rx_get_transitions(nfa.states, t.state_id)
+      let new_threads = rx_zero_width_targets(trs, t.captures, input, n, pos)
+      rx_eps_closure_loop(nfa, list_append(rest, new_threads), closure1, input, n, pos)
+    }
+}
+
+fn rx_thread_in(threads: [Thread], state_id: Int) : Bool = match threads {
+  [] -> false
+  [t, ...rest] -> if t.state_id == state_id { true } else { rx_thread_in(rest, state_id) }
+}
+
+# Collect every zero-width transition's target as a new thread,
+# updating captures appropriately. TAnchor only contributes when the
+# anchor condition holds at `pos`.
+fn rx_zero_width_targets(trs: [NfaTransition], caps: [Capture],
+                          input: String, n: Int, pos: Int) : [Thread] = match trs {
+  [] -> []
+  [t, ...rest] -> {
+    let mine = match t {
+      TEpsilon(dst) -> [Thread { state_id: dst, captures: caps }]
+      TGroupOpen(gid, dst) ->
+        [Thread { state_id: dst, captures: rx_capture_open(caps, gid, pos) }]
+      TGroupClose(gid, dst) ->
+        [Thread { state_id: dst, captures: rx_capture_close(caps, gid, pos) }]
+      TAnchor(an, dst) -> match an {
+        AnchorStart -> if pos == 0 { [Thread { state_id: dst, captures: caps }] } else { [] }
+        AnchorEnd   -> if pos >= n { [Thread { state_id: dst, captures: caps }] } else { [] }
+      }
+      _ -> []
+    }
+    list_append(mine, rx_zero_width_targets(rest, caps, input, n, pos))
+  }
+}
+
+fn rx_get_transitions(states: [NfaState], id: Int) : [NfaTransition] = match states {
+  [] -> []
+  [s, ...rest] -> if s.id == id { s.transitions } else { rx_get_transitions(rest, id) }
+}
+
+# ---- Step ----
+#
+# For each thread, try every consuming transition (TChar / TClass /
+# TAny) against the current character. Accumulate the targets. Order
+# preserved so the next ε-closure dedup keeps leftmost priority.
+
+fn rx_step(nfa: Nfa, threads: [Thread], c: Char) : [Thread] = match threads {
+  [] -> []
+  [t, ...rest] -> {
+    let trs = rx_get_transitions(nfa.states, t.state_id)
+    let here = rx_step_thread(trs, t.captures, c)
+    list_append(here, rx_step(nfa, rest, c))
+  }
+}
+
+fn rx_step_thread(trs: [NfaTransition], caps: [Capture], c: Char) : [Thread] = match trs {
+  [] -> []
+  [t, ...rest] -> {
+    let mine = match t {
+      TChar(ch, dst) ->
+        if ch == c { [Thread { state_id: dst, captures: caps }] } else { [] }
+      TClass(ranges, neg, dst) ->
+        if rx_class_matches(ranges, c) != neg { [Thread { state_id: dst, captures: caps }] }
+        else { [] }
+      TAny(dst) ->
+        # `.` matches any char EXCEPT newline (Perl/RE2 default).
+        if c == '\n' { [] } else { [Thread { state_id: dst, captures: caps }] }
+      _ -> []
+    }
+    list_append(mine, rx_step_thread(rest, caps, c))
+  }
+}
+
+fn rx_class_matches(ranges: [CharRange], c: Char) : Bool = match ranges {
+  [] -> false
+  [r, ...rest] -> match r {
+    CR(lo, hi) ->
+      if char_to_int(c) >= char_to_int(lo) and char_to_int(c) <= char_to_int(hi) { true }
+      else { rx_class_matches(rest, c) }
+  }
+}
