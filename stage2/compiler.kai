@@ -26355,9 +26355,31 @@ fn usage() : Unit / Console {
   eprint("  -V, --version      print version and exit")
 }
 
-# Parse a prelude file and return its decl list. On any error report
-# to stderr and return None.
-fn load_prelude(path: String) : Option[[Decl]] / Console + File {
+# m14 v0: a prelude file's contribution to compile_source — its
+# decls (concat'd into the global flat list, M6.1-style) and a
+# `ModuleEntry` registering its public surface under its file's
+# basename so user code can call `list.take(xs, n)` without an
+# explicit `import list`. Without this, qualified calls into the
+# stdlib would error with "module 'list' is not imported".
+type PreludeLoaded = PL([Decl], ModuleEntry)
+
+# Strip directory + ".kai" extension from a prelude path. Used as
+# the qualified-call surface name. "stdlib/core/list.kai" -> "list".
+# Files lacking the ".kai" suffix keep their full basename — there
+# is no fallback path that ships such files today.
+fn prelude_module_name(path: String) : String {
+  let total = string_length(path)
+  let i = last_slash(path, total - 1)
+  let after_slash = if i < 0 { path } else { string_slice(path, i + 1, total - i - 1) }
+  let n = string_length(after_slash)
+  if n > 4 and string_slice(after_slash, n - 4, 4) == ".kai" {
+    string_slice(after_slash, 0, n - 4)
+  } else { after_slash }
+}
+
+# Parse a prelude file and return its decl list paired with a
+# ModuleEntry. On any error report to stderr and return None.
+fn load_prelude(path: String) : Option[PreludeLoaded] / Console + File {
   match read_file(path) {
     Err(msg) -> { eprint("kaic1: #{path}: #{msg}"); None }
     Ok(src) -> {
@@ -26366,20 +26388,31 @@ fn load_prelude(path: String) : Option[[Decl]] / Console + File {
       if errs != 0 { None }
       else {
         let parsed = parse_program(path, src, tokens)
-        parsed.decls
+        match parsed.decls {
+          None -> None
+          Some(ds) -> {
+            let mod_name = prelude_module_name(path)
+            let exports = collect_pub_exports(ds, [])
+            Some(PL(ds, ME(mod_name, exports, path)))
+          }
+        }
       }
     }
   }
 }
 
+type PreludesLoaded = PLS([Decl], [ModuleEntry])
+
 # Load every prelude file in `paths`, concatenating their decls in
-# argument order. Returns None if any single load fails. Empty list
-# yields Some([]).
-fn load_preludes(paths: [String], acc: [Decl]) : Option[[Decl]] = match paths {
-  [] -> Some(acc)
+# argument order and accumulating one ModuleEntry per file. Returns
+# None if any single load fails. Empty list yields Some(PLS([], [])).
+fn load_preludes(paths: [String], acc_decls: [Decl], acc_mods: [ModuleEntry]) : Option[PreludesLoaded] = match paths {
+  [] -> Some(PLS(acc_decls, acc_mods))
   [p, ...rest] -> match load_prelude(p) {
     None -> None
-    Some(ds) -> load_preludes(rest, list_append(acc, ds))
+    Some(pl) -> match pl {
+      PL(ds, me) -> load_preludes(rest, list_append(acc_decls, ds), list_append(acc_mods, [me]))
+    }
   }
 }
 
@@ -26823,7 +26856,7 @@ fn builtin_spawn_decl() : Decl =
                     ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
-fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int / Console {
+fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry]) : Int / Console {
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
   match mode {
@@ -26855,7 +26888,13 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # `mod` is in the module table and not shadowed locally.
             let expanded = expand_imports(path, search_paths, own_decls_no_holes)
             let expanded_decls = match expanded { EP_Mod(ds, _) -> ds }
-            let module_table = match expanded { EP_Mod(_, mt) -> mt }
+            # m14 v0: every `--prelude` file is also registered as a
+            # module under its basename, so qualified calls into the
+            # stdlib (`list.take(xs, n)`, `string.trim(s)`) resolve
+            # without an explicit `import list`. Prelude entries come
+            # first so an `import` of a module of the same name (none
+            # in practice today) can still shadow with rule B.
+            let module_table = list_append(prelude_mods, match expanded { EP_Mod(_, mt) -> mt })
             let qualified_decls = rqc_decls(expanded_decls, module_table, path)
             let merged_raw = list_append(prelude_decls, qualified_decls)
             # m12.6.x #3 v2: synthesise `__ref_pred_X` fn for every
@@ -27067,12 +27106,14 @@ fn run(opts: CliOptions) : Int / Console + File {
         # and concatenate the loaded decls in argument order. Names
         # in later preludes shadow earlier ones (intentional —
         # callers pass `--prelude` in dependency order).
-        let prelude_decls = load_preludes(opts.preludes, [])
-        match prelude_decls {
+        let prelude_loaded = load_preludes(opts.preludes, [], [])
+        match prelude_loaded {
           None -> 1
-          Some(pds) -> match read_file(p) {
-            Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds)
-            Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
+          Some(pls) -> match pls {
+            PLS(pds, pmods) -> match read_file(p) {
+              Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds, pmods)
+              Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
+            }
           }
         }
       }
