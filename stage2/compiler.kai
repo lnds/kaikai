@@ -23467,6 +23467,45 @@ fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
   ME(_, exports, _) -> list_has(exports, fn_name)
 }
 
+# m14 v1: per-module legacy prefix overrides. Most stdlib core
+# files declare functions with a prefix that matches the module
+# name (`list_take` in list.kai), but two diverge: option.kai uses
+# `opt_*` and char.kai uses `ch_*`. Until the per-module rename
+# lane retires the prefixed surface, the qualified-call resolver
+# needs to know how to map `option.map` -> `opt_map`,
+# `char.is_digit` -> `ch_is_digit`. Other modules fall back to the
+# verbatim `<module>_<fname>` form. The list is closed (one entry
+# per stdlib core module that needed it); new modules pick names
+# matching their basename and need no entry here.
+fn module_legacy_prefix(mod_name: String) : Option[String] =
+  if mod_name == "option" { Some("opt") }
+  else if mod_name == "char" { Some("ch") }
+  else { None }
+
+# m14 v1: resolve a qualified-call field name to the real exported
+# name in the module. Tries the verbatim `fname` first; if that is
+# not exported, falls back to `<module>_<fname>` (or the per-module
+# legacy prefix) so a caller can write `list.take(xs, n)` against
+# today's flat-prefix definitions (`pub fn list_take`) without
+# renaming the stdlib. The legacy definitions retire when the
+# per-module surface migration completes in a follow-up lane
+# (see `docs/stage2-design.md` §m14). Returns the export name to
+# thread through `EModCall`, which is what codegen uses to mint
+# the C symbol (`kai_<actual>`).
+fn me_lookup_export(me: ModuleEntry, fname: String) : Option[String] = match me {
+  ME(mod_name, exports, _) ->
+    if list_has(exports, fname) { Some(fname) }
+    else {
+      let p = match module_legacy_prefix(mod_name) {
+        Some(alias) -> alias
+        None        -> mod_name
+      }
+      let prefixed = string_concat(string_concat(p, "_"), fname)
+      if list_has(exports, prefixed) { Some(prefixed) }
+      else { None }
+    }
+}
+
 # Collect the bindings introduced by a pattern. Used by SLet,
 # match-arm patterns, and variant-record / record patterns.
 fn pat_binders(pat: Pattern, acc: [String]) : [String] = match pat.pkind {
@@ -23550,16 +23589,21 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKi
       } else {
         match mt_lookup(mt, name) {
           Some(me) ->
-            if me_has_export(me, fname) { EModCall(name, fname) }
-            else {
-              # m6.2 diagnostics: imported module, missing export.
-              # Emit specific error before falling back to EField
-              # (which the typer treats as a record-field
-              # projection on TyAny — produces a generic but
-              # non-fatal cascade).
-              let exports = match me { ME(_, exs, _) -> exs }
-              let _ = rqc_diag_missing_export(name, fname, exports, file, e.line, e.col)
-              EField(rqc_expr(base, locals, mt, file), fname)
+            # m14 v1: prefix-fallback — `list.take` resolves to the
+            # actual export `list_take` when the bare form is not
+            # exported. EModCall carries the real name for codegen.
+            match me_lookup_export(me, fname) {
+              Some(actual) -> EModCall(name, actual)
+              None -> {
+                # m6.2 diagnostics: imported module, missing export.
+                # Emit specific error before falling back to EField
+                # (which the typer treats as a record-field
+                # projection on TyAny — produces a generic but
+                # non-fatal cascade).
+                let exports = match me { ME(_, exs, _) -> exs }
+                let _ = rqc_diag_missing_export(name, fname, exports, file, e.line, e.col)
+                EField(rqc_expr(base, locals, mt, file), fname)
+              }
             }
           None -> EField(rqc_expr(base, locals, mt, file), fname)
         }
