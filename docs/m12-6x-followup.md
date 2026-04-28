@@ -2,19 +2,14 @@
 
 Tracks every item the m12.6 lane (sub-lanes a–e + h, 2026-04-27)
 deferred to a future milestone. The common thread is **TyRefineT
-on the semantic side**: m12.6 v1 ships syntax + runtime semantics
-without ever surfacing the refinement in the typer's `Ty`. As a
-result the type system cannot reason about refined values — it
-treats `Int where >= 0` as plain `Int` after `resolve_ty` strips
-the predicate. Every deferred item below either needs `TyRefineT`
-to land first, or is independently small enough that it was just
-not worth the m12.6 budget.
+on the semantic side**: m12.6 v1 shipped syntax + runtime semantics
+without ever surfacing the refinement in the typer's `Ty`.
 
-The user-facing **runtime semantics** of refinements + contracts
-already matches what m12.6.x will deliver. Predicates that hold at
-runtime keep holding; predicates that fail still abort with
-`panic: assertion failed`. The semantic-typing swap should be
-invisible to user code that already type-checks.
+**Update 2026-04-27 (m12.6.x partial landing):** items #1, #4, #5
+(enforcement only), and #6 are now landed. The remaining items
+(#2 interval propagation, #3 match-arm narrowing, #5 attribute
+parser, #7 regex literals, #8 diagnostics quality) are still the
+pending list — see status notes inline below.
 
 ## What landed in m12.6 v1 (for context)
 
@@ -39,7 +34,7 @@ invisible to user code that already type-checks.
 
 ## Deferred items
 
-### 1. `TyRefineT` semantic type — the load-bearing block
+### 1. `TyRefineT` semantic type — the load-bearing block *(LANDED 2026-04-27)*
 
 `resolve_ty` currently drops `TyRefine(base, pred)` to whatever
 `base` resolves to. That makes the predicate invisible to unify,
@@ -71,7 +66,16 @@ but each arm is small. The biggest risk is the unifier — get the
 direction wrong and either every refinement leaks into every base
 type, or every assignment to a base needs an explicit cast.
 
-### 2. Static interval propagation through refined args
+### 2. Static interval propagation through refined args *(STILL PENDING — design-heavy)*
+
+**Why deferred from m12.6.x v1**: omitting an assert at *one* call
+site requires either monomorphising the callee per refinement
+combination (binary bloat) or emitting per-call inline checks at
+the caller (which defeats the audit pitch — the predicate now
+lives in two places). The v1 const folder of m12.6.d already
+handles closed predicates; the missing piece — substituting
+caller-side refinements into callee predicates — needs an
+end-to-end design that picks one of the two paths above.
 
 m12.6.d's `try_eval_pred` only evaluates **closed** predicates.
 With `TyRefineT` in hand, the typer can substitute the call-site
@@ -96,7 +100,15 @@ Cost: 0.5–1 day on top of #1. Most of the machinery is in
 `try_eval_pred` already; the new piece is the substitution
 (`predicate[arg ↦ caller's refinement]`) and the entailment check.
 
-### 3. Match-arm narrowing — `p : RefinedT`
+### 3. Match-arm narrowing — `p : RefinedT` *(STILL PENDING)*
+
+**Why deferred from m12.6.x v1**: requires a new PatKind variant
+(`PTyped(String, TypeExpr)`), arms in every Pattern walker, and a
+match-runtime that supports per-arm fall-through via a runtime
+predicate check. The desugar shape (an `if pred { bind } else {
+fall through to next arm }`) is fine in isolation but the
+fall-through interaction with existing match exhaustiveness needs
+care.
 
 ```kai
 match n {
@@ -114,7 +126,7 @@ type `Int`.
 Cost: 0.5 day on top of #1. Pure pattern-match desugar; the
 runtime check is already what `assert` produces.
 
-### 4. UoM composition — `Decimal<USD> where >= 0`
+### 4. UoM composition — `Decimal<USD> where >= 0` *(LANDED 2026-04-27)*
 
 Once `TyRefineT` exists, the canonicalisation rule
 `TyDimT(TyRefineT(b, p), u) ↔ TyRefineT(TyDimT(b, u), p)` lets a
@@ -130,7 +142,13 @@ type Account = {
 Cost: ~half a day. The canonicalisation is one rewrite rule;
 display/diagnostics need to render the combined form readably.
 
-### 5. `[<refinement-pure>]` stdlib annotations + enforcement
+### 5. `[<refinement-pure>]` stdlib annotations + enforcement *(ENFORCEMENT LANDED 2026-04-27, ATTRIBUTE PARSER STILL PENDING)*
+
+The enforcement half (rejecting calls in predicates that aren't in
+the closed pure prelude set) is in tree as of m12.6.x v1. The
+attribute parser — letting user fns opt into the pure surface —
+remains pending: the closed list `[is_some, is_none, is_finite,
+is_nan, string_length, list_length, matches]` is hard-coded today.
 
 The spec lists a closed set of prelude predicates that may appear
 inside refinement / contract predicates: `is_finite`, `is_nan`,
@@ -147,7 +165,7 @@ Cost: 1 day. The annotation parser is straightforward; the
 validation pass walks predicate Exprs with the existing
 `map_expr_kind` visitor.
 
-### 6. Compile-time errors for trivially-false predicates
+### 6. Compile-time errors for trivially-false predicates *(LANDED 2026-04-27)*
 
 `try_eval_pred` already detects `assert false` from the const-fold
 pass; today it leaves the assert in place and lets the runtime
