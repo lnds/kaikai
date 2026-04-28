@@ -4399,7 +4399,8 @@ fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts {
       None -> Contracts { p: pe.p, reqs: list_reverse(reqs), enss: list_reverse(enss) }
       Some(pred) -> {
         let p1 = check_pred_not_false(pe.p, pred, "requires", kw)
-        parse_contracts_loop(p1, [pred, ...reqs], enss)
+        let p2 = check_pred_pure(p1, pred, "requires")
+        parse_contracts_loop(p2, [pred, ...reqs], enss)
       }
     }
   } else if p_at(p0, TkEnsures) {
@@ -4409,11 +4410,108 @@ fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts {
       None -> Contracts { p: pe.p, reqs: list_reverse(reqs), enss: list_reverse(enss) }
       Some(pred) -> {
         let p1 = check_pred_not_false(pe.p, pred, "ensures", kw)
-        parse_contracts_loop(p1, reqs, [pred, ...enss])
+        let p2 = check_pred_pure(p1, pred, "ensures")
+        parse_contracts_loop(p2, reqs, [pred, ...enss])
       }
     }
   } else {
     Contracts { p: p0, reqs: list_reverse(reqs), enss: list_reverse(enss) }
+  }
+}
+
+# m12.6.x #5 (v1): enforce that a contract predicate calls only into
+# the closed refinement-pure prelude set + the standard subset
+# operators. Walks the Expr tree once; the first illegal call lands
+# as a parse-time error pointing at the offending span.
+#
+# What is allowed:
+#  - Literals (Int, Real, Bool, Char, String, EUnit)
+#  - EVar (parameter / `self` / `result` / outer locals — the typer
+#    later checks the binding actually exists in scope)
+#  - EField, EIndex (read-only access)
+#  - EBinop, EUnop (the standard arithmetic / boolean operators)
+#  - EIf (allowed for short-circuiting)
+#  - ECall whose callee is one of the closed pure prelude names
+#  - EBlock (allowed only when every stmt + tail is pure — m12.6.x
+#    leaves this conservative for now and rejects EBlock outright;
+#    the spec does not show predicates with let bindings).
+#
+# Pre-existing limitation: this pass does not parse the
+# `[<refinement-pure>]` attribute on user fn signatures, so user fns
+# that *would* be marked pure are rejected today. The closed
+# prelude list below is the entirety of the allowed call surface.
+fn check_pred_pure(p: Parser, pred: Expr, kind: String) : Parser {
+  match find_impure_call(pred) {
+    None -> p
+    Some(name) -> p_error(p, p_peek(p), concat_all([
+      "`", kind, "` predicate calls non-pure function `", name,
+      "`. Refinement / contract predicates may only call the closed ",
+      "set: is_some, is_none, is_finite, is_nan, string_length, ",
+      "list_length, matches."
+    ]))
+  }
+}
+
+fn refinement_pure_names() : [String] = [
+  "is_some", "is_none", "is_finite", "is_nan",
+  "string_length", "list_length", "matches"
+]
+
+# Walk an Expr looking for the first ECall whose callee is an EVar
+# not in the refinement-pure set. Returns the offending name, or
+# None if every call is permitted (or there are no calls).
+fn find_impure_call(e: Expr) : Option[String] {
+  match e.kind {
+    EInt(_) -> None
+    EReal(_) -> None
+    EBool(_) -> None
+    EChar(_) -> None
+    EStr(_, _) -> None
+    EUnit -> None
+    EVar(_) -> None
+    EField(b, _) -> find_impure_call(b)
+    EIndex(a, b) -> match find_impure_call(a) {
+      Some(n) -> Some(n)
+      None -> find_impure_call(b)
+    }
+    EBinop(_, a, b) -> match find_impure_call(a) {
+      Some(n) -> Some(n)
+      None -> find_impure_call(b)
+    }
+    EUnop(_, x) -> find_impure_call(x)
+    EIf(c, t_, eo) -> match find_impure_call(c) {
+      Some(n) -> Some(n)
+      None -> match find_impure_call(t_) {
+        Some(n) -> Some(n)
+        None -> match eo {
+          Some(eb) -> find_impure_call(eb)
+          None -> None
+        }
+      }
+    }
+    ECall(callee, args_) -> {
+      let callee_check = match callee.kind {
+        EVar(name) ->
+          if list_has(refinement_pure_names(), name) { None }
+          else { Some(name) }
+        _ -> Some("<expression>")
+      }
+      match callee_check {
+        Some(n) -> Some(n)
+        None -> find_impure_call_args(args_)
+      }
+    }
+    _ -> Some("<unsupported>")
+  }
+}
+
+fn find_impure_call_args(args_: [Expr]) : Option[String] {
+  match args_ {
+    [] -> None
+    [a, ...rest] -> match find_impure_call(a) {
+      Some(n) -> Some(n)
+      None -> find_impure_call_args(rest)
+    }
   }
 }
 
