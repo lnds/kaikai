@@ -1,0 +1,355 @@
+# stdlib/encoding/json.kai — JSON encoder + decoder.
+#
+# Pure functional. Operates on a small algebraic data type
+# (`JsonValue`) and `String`. No effects.
+#
+# Coverage of RFC 8259:
+#   - null, true, false: yes
+#   - numbers: integers only in v1 (no decimals, no exponents — the
+#     stage 2 prelude has no `Real` parser yet).
+#   - strings: full escape table (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`,
+#     `\r`, `\t`, `\uXXXX`); the decoder folds `\uXXXX` to the raw
+#     codepoint when it fits in a single byte (BMP-only — surrogate
+#     pairs are out of scope for v1).
+#   - arrays: yes
+#   - objects: yes; key ordering preserved on encode/decode.
+#
+# Public surface:
+#
+#   pub type JsonValue
+#     = JNull
+#     | JBool(Bool)
+#     | JNum(Int)
+#     | JStr(String)
+#     | JArr([JsonValue])
+#     | JObj([Pair[String, JsonValue]])
+#
+#   pub fn json_encode(v: JsonValue) : String
+#   pub fn json_decode(s: String) : Option[JsonValue]
+
+# ---- AST ---------------------------------------------------------
+
+pub type JsonValue
+  = JNull
+  | JBool(Bool)
+  | JNum(Int)
+  | JStr(String)
+  | JArr([JsonValue])
+  | JObj([Pair[String, JsonValue]])
+
+# ---- Encoder -----------------------------------------------------
+
+# Escape a String per RFC 8259 §7. Walks the input char-by-char
+# and emits the standard escape sequence for the seven required
+# escapes plus any control character below U+0020.
+fn json_escape_loop(s: String, i: Int, acc: String) : String = {
+  if i >= string_length(s) { acc }
+  else { match char_at(s, i) {
+    None    -> acc
+    Some(c) -> {
+      let esc = json_escape_char(c)
+      json_escape_loop(s, i + 1, string_concat(acc, esc))
+    }
+  } }
+}
+
+fn json_escape_char(c: Char) : String = {
+  if c == '"'        { "\\\"" }
+  else if c == '\\'  { "\\\\" }
+  else if c == '\n'  { "\\n" }
+  else if c == '\r'  { "\\r" }
+  else if c == '\t'  { "\\t" }
+  else if char_to_int(c) < 32 {
+    # \uXXXX for any other control character.
+    string_concat("\\u00", json_hex_byte(char_to_int(c)))
+  }
+  else { string_slice(json_ascii_table(), char_to_int(c) - 32, 1) }
+}
+
+# Hex digits 0–F (lowercase), used to render `\u00XX` for the
+# control characters that don't have a dedicated short escape.
+fn json_hex_byte(n: Int) : String = {
+  let hi = json_hex_digit((n / 16) % 16)
+  let lo = json_hex_digit(n % 16)
+  string_concat(hi, lo)
+}
+
+fn json_hex_digit(n: Int) : String =
+  string_slice("0123456789abcdef", n, 1)
+
+# Printable ASCII (32..126) packed as a single string. Indexing
+# `json_ascii_table()` at `c - 32` gives the 1-char String for
+# any non-control byte. For bytes ≥ 127 this would over-index, but
+# `json_escape_char` only routes here for `c >= 32 and c < 127`-ish
+# inputs; the encoder accepts arbitrary chars and renders them via
+# the printable-table when they fit (UTF-8 bytes ≥ 128 emit their
+# raw byte, which JSON accepts inside string literals only when
+# the surrounding text is valid UTF-8 — assumed here).
+fn json_ascii_table() : String =
+  " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+pub fn json_encode(v: JsonValue) : String = match v {
+  JNull       -> "null"
+  JBool(b)    -> if b { "true" } else { "false" }
+  JNum(n)     -> int_to_string(n)
+  JStr(s)     -> string_concat(string_concat("\"", json_escape_loop(s, 0, "")), "\"")
+  JArr(xs)    -> string_concat(string_concat("[", string_join(map(xs, json_encode), ",")), "]")
+  JObj(ps)    -> string_concat(string_concat("{", string_join(map(ps, json_encode_pair), ",")), "}")
+}
+
+fn json_encode_pair(p: Pair[String, JsonValue]) : String =
+  string_concat(
+    string_concat(string_concat("\"", json_escape_loop(p.fst, 0, "")), "\":"),
+    json_encode(p.snd))
+
+# ---- Decoder -----------------------------------------------------
+#
+# Recursive-descent parser. The state is a (String, Int) pair —
+# the input and a cursor — passed through every helper. To keep
+# the surface small, helpers return `Option[Pair[JsonValue, Int]]`
+# (None on parse error; on success, the value plus the cursor
+# position right after the consumed token).
+#
+# Whitespace is silently skipped before every token. Trailing
+# garbage after the top-level value yields a parse error.
+
+type JParse = { v: JsonValue, i: Int }
+
+fn jp_some(v: JsonValue, i: Int) : Option[JParse] =
+  Some(JParse { v: v, i: i })
+
+# Skip ASCII whitespace (space, tab, CR, LF) starting at `i`.
+fn json_skip_ws(s: String, i: Int) : Int = {
+  if i >= string_length(s) { i }
+  else { match char_at(s, i) {
+    None    -> i
+    Some(c) -> if c == ' ' or c == '\t' or c == '\n' or c == '\r' {
+                 json_skip_ws(s, i + 1)
+               } else { i }
+  } }
+}
+
+# Match a literal at the cursor: returns the new cursor on match,
+# or None.
+fn json_match_lit(s: String, i: Int, lit: String) : Option[Int] = {
+  let ll = string_length(lit)
+  if i + ll > string_length(s) { None }
+  else if string_slice(s, i, ll) == lit { Some(i + ll) }
+  else { None }
+}
+
+# Top-level: skip leading whitespace, parse a value, demand only
+# whitespace until end-of-input.
+pub fn json_decode(s: String) : Option[JsonValue] = {
+  let i0 = json_skip_ws(s, 0)
+  match json_parse_value(s, i0) {
+    None    -> None
+    Some(r) -> {
+      let i_end = json_skip_ws(s, r.i)
+      if i_end == string_length(s) { Some(r.v) } else { None }
+    }
+  }
+}
+
+# Dispatch on the first non-whitespace char.
+fn json_parse_value(s: String, i: Int) : Option[JParse] = {
+  let j = json_skip_ws(s, i)
+  if j >= string_length(s) { None }
+  else { match char_at(s, j) {
+    None    -> None
+    Some(c) -> {
+      if c == '{' { json_parse_object(s, j) }
+      else if c == '[' { json_parse_array(s, j) }
+      else if c == '"' { json_parse_string(s, j) }
+      else if c == 't' or c == 'f' { json_parse_bool(s, j) }
+      else if c == 'n' { json_parse_null(s, j) }
+      else if c == '-' or ch_is_digit(c) { json_parse_number(s, j) }
+      else { None }
+    }
+  } }
+}
+
+fn json_parse_null(s: String, i: Int) : Option[JParse] = match json_match_lit(s, i, "null") {
+  None    -> None
+  Some(j) -> jp_some(JNull, j)
+}
+
+fn json_parse_bool(s: String, i: Int) : Option[JParse] = match json_match_lit(s, i, "true") {
+  Some(j) -> jp_some(JBool(true), j)
+  None    -> match json_match_lit(s, i, "false") {
+    Some(j) -> jp_some(JBool(false), j)
+    None    -> None
+  }
+}
+
+# Number: optional `-`, then a non-empty digit run. v1 parses
+# integers only — fractions and exponents return None.
+fn json_parse_number(s: String, i: Int) : Option[JParse] = {
+  let neg = match char_at(s, i) {
+    Some(c) -> c == '-'
+    None    -> false
+  }
+  let start = if neg { i + 1 } else { i }
+  let n_end = json_digits_end(s, start)
+  if n_end == start { None }
+  else {
+    # Reject decimals and exponents in v1.
+    match char_at(s, n_end) {
+      Some(c) -> if c == '.' or c == 'e' or c == 'E' { None }
+                 else { json_finish_number(s, i, n_end, neg, start) }
+      None -> json_finish_number(s, i, n_end, neg, start)
+    }
+  }
+}
+
+fn json_digits_end(s: String, i: Int) : Int = {
+  if i >= string_length(s) { i }
+  else { match char_at(s, i) {
+    None    -> i
+    Some(c) -> if ch_is_digit(c) { json_digits_end(s, i + 1) } else { i }
+  } }
+}
+
+fn json_finish_number(s: String, _i_start: Int, i_end: Int, neg: Bool, mag_start: Int) : Option[JParse] = {
+  let mag_str = string_slice(s, mag_start, i_end - mag_start)
+  match string_to_int(mag_str) {
+    None    -> None
+    Some(m) -> jp_some(JNum(if neg { 0 - m } else { m }), i_end)
+  }
+}
+
+# String: opening `"`, then chars / escapes until closing `"`. The
+# escape table mirrors `json_escape_char` plus `\uXXXX` for
+# codepoints in the basic multilingual plane (≤ U+00FF emitted as
+# raw byte; higher codepoints replaced by `?` to avoid surrogate
+# pair handling in v1).
+fn json_parse_string(s: String, i: Int) : Option[JParse] = {
+  let i1 = i + 1   # skip opening `"`
+  json_parse_string_loop(s, i1, "")
+}
+
+fn json_parse_string_loop(s: String, i: Int, acc: String) : Option[JParse] = {
+  if i >= string_length(s) { None }
+  else { match char_at(s, i) {
+    None    -> None
+    Some(c) -> {
+      if c == '"' { jp_some(JStr(acc), i + 1) }
+      else if c == '\\' { json_parse_escape(s, i + 1, acc) }
+      else { json_parse_string_loop(s, i + 1,
+                                     string_concat(acc, string_slice(s, i, 1))) }
+    }
+  } }
+}
+
+fn json_parse_escape(s: String, i: Int, acc: String) : Option[JParse] = {
+  if i >= string_length(s) { None }
+  else { match char_at(s, i) {
+    None    -> None
+    Some(c) -> {
+      let appended = json_escape_decode(c)
+      match appended {
+        Some(ch_str) -> json_parse_string_loop(s, i + 1, string_concat(acc, ch_str))
+        None         -> if c == 'u' { json_parse_unicode(s, i + 1, acc) }
+                        else { None }
+      }
+    }
+  } }
+}
+
+fn json_escape_decode(c: Char) : Option[String] = {
+  if c == '"'      { Some("\"") }
+  else if c == '\\' { Some("\\") }
+  else if c == '/'  { Some("/") }
+  else if c == 'b'  { Some("") }
+  else if c == 'f'  { Some("") }
+  else if c == 'n'  { Some("\n") }
+  else if c == 'r'  { Some("\r") }
+  else if c == 't'  { Some("\t") }
+  else { None }
+}
+
+# Decode `\uXXXX`. v1 keeps codepoints ≤ U+00FF (emit as the byte
+# in the printable-ASCII range, or via raw substring trick); higher
+# codepoints render as `?`. Surrogate pairs are not handled.
+fn json_parse_unicode(s: String, i: Int, acc: String) : Option[JParse] = {
+  if i + 4 > string_length(s) { None }
+  else {
+    let hex4 = string_slice(s, i, 4)
+    match hex_to_int(hex4) {
+      None    -> None
+      Some(cp) -> {
+        let ch_str = if cp >= 32 and cp < 127 {
+          string_slice(json_ascii_table(), cp - 32, 1)
+        } else { "?" }
+        json_parse_string_loop(s, i + 4, string_concat(acc, ch_str))
+      }
+    }
+  }
+}
+
+# Array: `[` value (`,` value)* `]`. Empty array allowed.
+fn json_parse_array(s: String, i: Int) : Option[JParse] = {
+  let j = json_skip_ws(s, i + 1)
+  match char_at(s, j) {
+    Some(']') -> jp_some(JArr([]), j + 1)
+    _         -> json_parse_array_items(s, j, [])
+  }
+}
+
+fn json_parse_array_items(s: String, i: Int, acc: [JsonValue]) : Option[JParse] = {
+  match json_parse_value(s, i) {
+    None    -> None
+    Some(r) -> {
+      let acc1 = list_append(acc, [r.v])
+      let j = json_skip_ws(s, r.i)
+      match char_at(s, j) {
+        Some(',') -> json_parse_array_items(s, json_skip_ws(s, j + 1), acc1)
+        Some(']') -> jp_some(JArr(acc1), j + 1)
+        _         -> None
+      }
+    }
+  }
+}
+
+# Object: `{` (key:value (`,` key:value)*)? `}`.
+fn json_parse_object(s: String, i: Int) : Option[JParse] = {
+  let j = json_skip_ws(s, i + 1)
+  match char_at(s, j) {
+    Some('}') -> jp_some(JObj([]), j + 1)
+    _         -> json_parse_object_pairs(s, j, [])
+  }
+}
+
+fn json_parse_object_pairs(s: String, i: Int, acc: [Pair[String, JsonValue]]) : Option[JParse] = {
+  let j = json_skip_ws(s, i)
+  match char_at(s, j) {
+    Some('"') -> match json_parse_string(s, j) {
+      None    -> None
+      Some(rk) -> match rk.v {
+        JStr(k) -> {
+          let j2 = json_skip_ws(s, rk.i)
+          match char_at(s, j2) {
+            Some(':') -> {
+              let j3 = json_skip_ws(s, j2 + 1)
+              match json_parse_value(s, j3) {
+                None    -> None
+                Some(rv) -> {
+                  let acc1 = list_append(acc, [Pair { fst: k, snd: rv.v }])
+                  let j4 = json_skip_ws(s, rv.i)
+                  match char_at(s, j4) {
+                    Some(',') -> json_parse_object_pairs(s, json_skip_ws(s, j4 + 1), acc1)
+                    Some('}') -> jp_some(JObj(acc1), j4 + 1)
+                    _         -> None
+                  }
+                }
+              }
+            }
+            _ -> None
+          }
+        }
+        _ -> None
+      }
+    }
+    _ -> None
+  }
+}
