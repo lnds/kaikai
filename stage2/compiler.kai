@@ -1066,6 +1066,15 @@ type ExprKind
   # the list directly — it has no env access to look the names up
   # itself.
   | EVariantsOf(TypeExpr, [String])
+  # m6.2: qualified module call. The resolver pass rewrites
+  # `EField(EVar(mod), fn)` to this variant when `mod` is unbound
+  # locally and bound in the module table (rule B — locals shadow
+  # imports). Phase 2.1 only adds the variant + the walker arms;
+  # the rewrite logic and typer/codegen support land in 2.3 / 2.4
+  # / 3 respectively. Until then, this variant is never constructed
+  # at runtime — every walker arm exists purely to keep the
+  # exhaustive matches valid.
+  | EModCall(String, String)
 
 type ListElem = ElPlain(Expr) | ElSpread(Expr)
 
@@ -5668,6 +5677,9 @@ fn dump_expr(e: Expr, depth: Int) : Unit {
     }
     EVariantsOf(ty, _) ->
       emit_line(depth, "variants-of #{type_expr_display(ty)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    # m6.2: qualified module call. Two strings (module + fn).
+    EModCall(m, fname) ->
+      emit_line(depth, "modcall #{m}.#{fname} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
   }
 }
 
@@ -6297,6 +6309,10 @@ fn chk_expr(e: Env, x: Expr) : Env {
     # The TypeExpr is validated by the resolver (sum + nullary-only)
     # in a later pass, not here.
     EVariantsOf(_, _) -> e
+    # m6.2 Phase 2.1: qualified module call carries no sub-expressions
+    # and binds no names — the resolver fills it in once everything
+    # is in scope, so the checker has nothing to verify here.
+    EModCall(_, _) -> e
   }
 }
 
@@ -7690,6 +7706,10 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
     # m7e §11: `variants[T]()` has no value-level sub-expressions, so
     # it captures nothing.
     EVariantsOf(_, _) -> acc
+    # m6.2 Phase 2.1: qualified module call references no local
+    # binding — module name and function name are both pure strings
+    # resolved via the module table.
+    EModCall(_, _) -> acc
   }
 }
 
@@ -7981,6 +8001,9 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     # m7e §11: `variants[T]()` produces no lambdas / no clauses to
     # collect. The TypeExpr is not a lambda host.
     EVariantsOf(_, _) -> st
+    # m6.2 Phase 2.1: qualified module call hosts no lambdas and
+    # introduces no clauses — both fields are plain strings.
+    EModCall(_, _) -> st
   }
 }
 
@@ -8614,6 +8637,13 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
     # was validated as nullary at typing time, so emit_variant_call
     # with arity 0 / empty arg array is correct.
     EVariantsOf(_, names) -> emit_variants_of_list(names)
+    # m6.2 Phase 2.1: scaffolding only — the resolver does not yet
+    # rewrite anything to EModCall, so reaching the C emitter with
+    # one is a compiler bug. Phase 2.4 wires the real lowering.
+    EModCall(m, fname) -> concat_all([
+      "kai_prelude_panic(kai_str(\"EModCall reached C emitter in Phase 2.1: ",
+      m, ".", fname, "\"))"
+    ])
   }
 }
 
@@ -9692,6 +9722,9 @@ fn map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     # visitor traverses). Same shape as EHole/ETodo for the
     # purposes of the structural recursion.
     EVariantsOf(_, _) -> k
+    # m6.2 Phase 2.1: qualified module call carries no sub-Exprs
+    # (both fields are plain Strings), so `f` has nothing to apply.
+    EModCall(_, _) -> k
     # Composites: apply f to every direct sub-Expr.
     ECall(callee, args_) -> ECall(f(callee), map(args_, f))
     EField(base, name)   -> EField(f(base), name)
@@ -10198,6 +10231,9 @@ fn body_escapes(name: String, e: Expr) : Bool {
     # m7e §11: `variants[T]()` has no value-level sub-expressions —
     # nothing can mention `name` inside it.
     EVariantsOf(_, _) -> false
+    # m6.2 Phase 2.1: qualified module call mentions a module name and
+    # a function name as plain strings, never the local `name`.
+    EModCall(_, _) -> false
   }
 }
 
@@ -10728,6 +10764,9 @@ fn use_rewrite_recurse(k: ExprKind, table: [EffOps], opens: [String],
     EHole(_)       -> UseKindAcc { kind: k, acc: acc }
     ETodo(_)       -> UseKindAcc { kind: k, acc: acc }
     EVariantsOf(_, _) -> UseKindAcc { kind: k, acc: acc }
+    # m6.2 Phase 2.1: qualified module call has no sub-Exprs to
+    # recurse into and binds no names — pass through unchanged.
+    EModCall(_, _) -> UseKindAcc { kind: k, acc: acc }
     ECall(callee, args_) -> {
       let rc = use_rewrite_expr(callee, table, opens, bound, file, acc.errs)
       let ra = use_rewrite_exprs(args_, table, opens, bound, file, rc.errs, [])
@@ -14764,6 +14803,12 @@ fn synth(st: InferState, e: Expr) : Inferred {
     # has them without re-walking the env. Errors yield a TyAny
     # stub so cascade is graceful.
     EVariantsOf(ty_expr, _) -> synth_variants_of(st, ty_expr, e)
+    # m6.2 Phase 2.1: scaffolding only — the resolver does not yet
+    # rewrite anything to EModCall, so the typer should never see
+    # one. Phase 2.3 wires the resolver rewrite + 2.4 the typing.
+    EModCall(m, fname) -> panic(string_concat(
+      "EModCall reached typer in Phase 2.1: ",
+      string_concat(m, string_concat(".", fname))))
   }
 }
 
@@ -17388,6 +17433,9 @@ fn expand_aliases_exprkind(k: ExprKind, aliases: [UAliasEntry]) : ExprKind {
     # type) reaches the resolver in canonical form.
     EVariantsOf(ty, names) ->
       EVariantsOf(expand_aliases_typeexpr(ty, aliases), names)
+    # m6.2 Phase 2.1: qualified module call holds plain strings
+    # (module + function names). No type alias to expand.
+    EModCall(m, fname) -> EModCall(m, fname)
   }
 }
 
@@ -17534,6 +17582,8 @@ fn tag_of_kind(k: ExprKind) : String {
     EHandle(_, eff_name, _, _, _, _, _) -> concat_all(["handle ", eff_name])
     ELitUnit(_, u) -> concat_all(["lit-unit <", unit_canon_display(u), ">"])
     EVariantsOf(ty, _) -> concat_all(["variants-of ", type_expr_display(ty)])
+    # m6.2 Phase 2.1: qualified module call dump label.
+    EModCall(m, fname) -> concat_all(["modcall ", m, ".", fname])
   }
 }
 
@@ -19760,6 +19810,7 @@ fn expr_kind_name(k: ExprKind) : String {
     EHandle(_, _, _, _, _, _, _) -> "EHandle"
     ELitUnit(_, _) -> "ELitUnit"
     EVariantsOf(_, _) -> "EVariantsOf"
+    EModCall(_, _) -> "EModCall"
   }
 }
 
