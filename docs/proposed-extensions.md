@@ -1825,6 +1825,42 @@ protocols hardening (m12.8.y) settles.
 
 ## 28. Record destructuring in `let` — `let { fst, snd } = expr`
 
+**Status: LANDED 2026-04-27** as the m7d §28 follow-up to the m8.5
+tuples REJECT decision. Parser now accepts `TkLbrace` in
+`parse_pattern_rest` and delegates to the existing
+`parse_record_pattern_fields` machinery shared with match arms.
+Both forms ship together:
+
+```kai
+let { fst, snd } = transfer()                  # field punning
+let { fst: from, snd: to } = transfer()        # explicit rename
+```
+
+C backend: `emit_let_stmt` (and `emit_let_stmt_with_drops`) emit
+`KaiValue *_letv_<line>_<col> = rhs; <field-binds...>` directly
+into the enclosing block — no `{...}` wrapping, so the
+destructured names stay in scope. The pre-fix code wrapped both
+the temp and the binds in a sub-block, which dropped the bound
+names before the rest of the block ran (caught by the smoke test
+on `let { fst, snd } = make_pair()`).
+
+LLVM backend: `llvm_emit_let_record` mirrors the C path —
+`kaix_field(scr, "name")` per field, then `llvm_push_local` to
+add each binding to the locals table.
+
+v1 limitations:
+- Nested patterns (`let { from: { owner }, ... }`) are not
+  supported — match arms still cover that case.
+- Drops do not interact with destructuring; the per-block
+  drop-set in `emit_let_stmt_with_drops` is for `PBind` only.
+
+Fixtures: `examples/sugars/let_destructure_punning.kai` (shorthand),
+`examples/sugars/let_destructure_rename.kai` (explicit rename +
+nested field read on the bound name). Both dual-backend via
+`test-llvm-coverage`.
+
+
+
 ```kai
 # Today:
 let p = transfer(alice, bob, 30.00<USD>)
