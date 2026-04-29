@@ -67,8 +67,31 @@ CC="${CC:-cc}"
 CFLAGS="${CFLAGS:--std=c99 -Wno-unused-function -Wno-unused-variable -O2}"
 
 die() {
-  echo "kai: $*" >&2
+  echo "kai: error: $*" >&2
   exit 2
+}
+
+# $1 = path that was not found; $2 = subcommand name (build/run/test)
+die_file_not_found() {
+  echo "kai: error: file '$1' not found." >&2
+  echo "Try 'kai $2 --help' for usage." >&2
+  exit 2
+}
+
+read_version() {
+  if [ -f "$ROOT/VERSION" ]; then
+    cat "$ROOT/VERSION"
+  else
+    echo "unknown"
+  fi
+}
+
+read_baseline() {
+  if [ -f "$ROOT/demos/baseline.txt" ]; then
+    cat "$ROOT/demos/baseline.txt"
+  else
+    echo "?"
+  fi
 }
 
 ensure_built() {
@@ -84,15 +107,11 @@ ensure_built() {
 }
 
 usage() {
-  if [ -f "$ROOT/VERSION" ]; then
-    v="$(cat "$ROOT/VERSION")"
-  else
-    v="unknown"
-  fi
+  v="$(read_version)"
   cat <<EOF
  _      _ _      _
 | |____(_) |____(_)    kaikai $v
-| / / _\` | / / _\` |    a functional language
+| / / _\` | / / _\` |    a statically typed functional language
 |_\\_\\__,_|_\\_\\__,_|    effects | fibers | protocols
 
 usage: kai <command> [args...]
@@ -102,18 +121,90 @@ Commands:
   run   <file.kai> [args...]    Build and execute; forwards remaining args.
   test  <file.kai>              Compile with --test and run the test binary.
   help                          Show this help.
-  --version                     Print version.
+  --version                     Print version and demo baseline.
+
+Run 'kai <command> --help' for command-specific options.
 
 Environment:
-  CC        C compiler to invoke (default: cc).
-  CFLAGS    Extra flags passed to CC.
+  CC               C compiler to invoke (default: cc).
+  CFLAGS           Extra flags passed to CC.
+  KAI_NO_STDLIB    If 1, skip auto-loading the stdlib preludes.
+
+See README.md and docs/ for the language reference.
+Project home: https://kaikai-lang.org
 EOF
 }
 
-# $1 = source .kai path; $2 = tmpdir; $3 = output binary path; rest = extra kaic2 flags
+usage_build() {
+  cat <<EOF
+usage: kai build <file.kai> [-o <out>]
+
+Compile a kaikai source file to a native binary using kaic2 + cc.
+
+Options:
+  -o <out>     Output binary path (default: basename of input without .kai).
+  -h, --help   Show this help.
+
+Examples:
+  kai build hello.kai                    # produces ./hello
+  kai build src/app.kai -o build/app     # produces ./build/app
+
+The compiler auto-loads the stdlib preludes (stdlib/core, protocols,
+effects, etc.). Set KAI_NO_STDLIB=1 to skip them.
+EOF
+}
+
+usage_run() {
+  cat <<EOF
+usage: kai run <file.kai> [args...]
+
+Compile and immediately execute a kaikai program. Any arguments after
+the source file are forwarded to the compiled binary.
+
+Options:
+  -h, --help   Show this help.
+
+Examples:
+  kai run examples/minimal/hello.kai
+  kai run demos/fizzbuzz/fizzbuzz.kai 30
+  kai run app.kai --user alice --port 8080
+
+The temporary binary is removed after the program exits.
+EOF
+}
+
+usage_test() {
+  cat <<EOF
+usage: kai test <file.kai>
+
+Compile a kaikai source with --test enabled and run the test binary.
+The compiler emits a main that runs every 'test "..." { ... }' block
+and reports the result.
+
+Options:
+  -h, --help   Show this help.
+
+Examples:
+  kai test stage2/tests/test_lex.kai
+  kai test demos/poker/poker.kai
+EOF
+}
+
+print_version() {
+  v="$(read_version)"
+  baseline="$(read_baseline)"
+  cat <<EOF
+kaikai $v (stage 2, self-hosted)
+demos baseline: $baseline
+home:           https://kaikai-lang.org
+EOF
+}
+
+# $1 = source .kai path; $2 = tmpdir; $3 = output binary path;
+# $4 = subcommand name (for help-pointer in errors); rest = extra kaic2 flags
 compile_to_binary() {
-  src="$1"; tmp="$2"; out="$3"; shift 3
-  [ -f "$src" ] || die "cannot read '$src'"
+  src="$1"; tmp="$2"; out="$3"; sub="$4"; shift 4
+  [ -f "$src" ] || die_file_not_found "$src" "$sub"
   ensure_built
   prelude_flags=""
   if [ "${KAI_NO_STDLIB:-}" != "1" ]; then
@@ -156,37 +247,43 @@ cmd_build() {
   while [ $# -gt 0 ]; do
     case "$1" in
       -o) shift; [ $# -gt 0 ] || die "-o needs an argument"; out="$1"; shift ;;
-      -h|--help) usage; return 0 ;;
-      -*) die "unknown flag: $1" ;;
+      -h|--help) usage_build; return 0 ;;
+      -*) die "unknown flag: $1 (see 'kai build --help')" ;;
       *) [ -z "$src" ] || die "only one input file supported"; src="$1"; shift ;;
     esac
   done
-  [ -n "$src" ] || die "missing input file"
+  [ -n "$src" ] || die "missing input file (see 'kai build --help')"
   if [ -z "$out" ]; then
     out="$(basename "$src" .kai)"
   fi
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
-  compile_to_binary "$src" "$tmp" "$out"
+  compile_to_binary "$src" "$tmp" "$out" "build"
 }
 
 cmd_run() {
-  [ $# -gt 0 ] || die "missing input file"
+  case "${1:-}" in
+    -h|--help) usage_run; return 0 ;;
+    "") die "missing input file (see 'kai run --help')" ;;
+  esac
   src="$1"; shift
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
   bin="$tmp/$(basename "$src" .kai)"
-  compile_to_binary "$src" "$tmp" "$bin"
+  compile_to_binary "$src" "$tmp" "$bin" "run"
   "$bin" "$@"
 }
 
 cmd_test() {
-  [ $# -gt 0 ] || die "missing input file"
+  case "${1:-}" in
+    -h|--help) usage_test; return 0 ;;
+    "") die "missing input file (see 'kai test --help')" ;;
+  esac
   src="$1"; shift
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
   bin="$tmp/$(basename "$src" .kai)-t"
-  compile_to_binary "$src" "$tmp" "$bin" --test
+  compile_to_binary "$src" "$tmp" "$bin" "test" --test
   "$bin"
 }
 
@@ -195,14 +292,7 @@ case "${1:-}" in
   run)       shift; cmd_run   "$@" ;;
   test)      shift; cmd_test  "$@" ;;
   help|-h|--help) usage ;;
-  --version|-V)
-    if [ -f "$ROOT/VERSION" ]; then
-      v="$(cat "$ROOT/VERSION")"
-    else
-      v="unknown"
-    fi
-    echo "kaikai $v (stage 2, self-hosted)"
-    ;;
+  --version|-V) print_version ;;
   "")        usage >&2; exit 2 ;;
-  *)         echo "unknown command: $1" >&2; usage >&2; exit 2 ;;
+  *)         echo "kai: error: unknown command: $1" >&2; usage >&2; exit 2 ;;
 esac

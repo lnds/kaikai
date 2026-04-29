@@ -136,6 +136,57 @@ second Tier 1 item, in a separate lane.
 - `docs/fibers-honesty-targets.md` Tier 1 row crossed out for R4;
   Tier 2 carry-over row mirrored.
 
+## [0.14.0] — 2026-04-29 (tooling: bin/kai polish + editor syntax)
+
+**Patch-shaped minor: developer-experience polish, no compiler
+changes.** This release brings `bin/kai` to a state a first-time
+visitor can navigate without reading the source, and ships the
+first round of editor support. No effect on the compiler, runtime,
+or selfhost path; demos baseline (24) is unchanged.
+
+### Added
+
+- `bin/kai <subcommand> --help`: per-subcommand usage with flags and
+  examples (`build`, `run`, `test`). Each subcommand intercepts
+  `-h` / `--help` and prints its own block instead of falling back
+  to the global help.
+- `bin/kai --version`: now prints a 3-line banner with the version,
+  the demos baseline read from `demos/baseline.txt`, and a link to
+  https://kaikai-lang.org. Still works regardless of the calling
+  cwd (`bin/kai` resolves paths against its own location).
+- File-not-found errors across `build`, `run`, `test` now read
+  `kai: error: file '<path>' not found.` followed by a pointer to
+  the relevant `kai <sub> --help`. Replaces the prior cryptic
+  `kai: cannot read '<path>'`.
+- `tools/kaikai.vim`: Vim 8 / Neovim syntax file. Covers keywords,
+  built-in primitives, the Doc B effect catalog, numbers, strings
+  with `#{...}` interpolation, char literals, typed holes, and
+  pipe / arrow / range operators. Loads cleanly under
+  `vim -u NONE` and on `stage2/compiler.kai` (~30k lines).
+- `tools/kaikai-syntax.json`: TextMate-format grammar with
+  matching coverage. Drop-in for VSCode / Sublime / GitHub web
+  rendering. Mapped to standard TextMate scopes so any colour
+  theme picks up the highlighting.
+- `tools/README.md`: install instructions for both syntax files
+  plus a calibrated honesty section about the heuristic limits
+  (capitalisation-driven constructor detection, no semantic
+  scoping; real LSP-driven highlighting waits on m17).
+
+### Changed
+
+- `bin/kai`'s `usage()` adds an `Environment` line for
+  `KAI_NO_STDLIB` and a one-liner pointer to
+  `kai <command> --help`. The descriptive line moves from "a
+  functional language" to "a statically typed functional language"
+  to match the project README.
+
+### Notes
+
+- Out of scope, deferred: shell autocompletion (`kai completion
+  bash/zsh/fish`), `kai new` / `kai init` scaffolding, tree-sitter
+  grammar, `kai fmt` indentation rules, full LSP integration.
+  Each is a separate lane.
+
 ## [0.11.0] — 2026-04-29 (m4c #4 Phase 2 full — call-site rewrite)
 
 **Minor: monomorphisation now retargets call sites.** The previous
