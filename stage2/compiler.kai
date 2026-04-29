@@ -11635,6 +11635,285 @@ fn desugar_var_decl(d: Decl) : Decl {
   }
 }
 
+# Pre-desugar validation: walk every fn / test body looking for bare
+# `EVar(name)` references where `name` is currently bound by an
+# enclosing `var name = init` (an SVar that has not yet been desugared
+# into the State[T] handler). The legitimate uses are
+# `name.get()` / `name.set(v)` (capability access) and `name := <expr>`
+# (cap write — the parser already lowers it before we get here, so it
+# surfaces as `name.set(v)`). Any other bare read leaks the cap binder
+# to the emitter as `kai_<name>`, which the linker rejects with an
+# unhelpful `undeclared identifier` from `cc`. Reporting at this layer
+# turns the post-cc opaque link error into a typed-hole-style hint at
+# the use site — a Tier 3 (LLM authorability) requirement.
+#
+# Scope rules: SLet, lambda params, match arm patterns, fn params,
+# nested SVar with the same name, and handler `as` aliases all shadow
+# a `var` binder. Bare reads under those scopes are NOT flagged.
+fn validate_var_uses_decls(ds: [Decl], file: String) : Int / Console {
+  validate_var_decls_loop(ds, file, 0)
+}
+
+fn validate_var_decls_loop(ds: [Decl], file: String, errs: Int) : Int / Console {
+  match ds {
+    [] -> errs
+    [d, ...rest] -> {
+      let e1 = match d {
+        DFn(_, _, _, ps, _, _, body, _, _, _) -> {
+          let pnames = rename_param_names(ps, [])
+          validate_var_in_expr(body, caps_minus_names([], pnames), file, errs)
+        }
+        DTest(_, body, _, _) -> validate_var_in_expr(body, [], file, errs)
+        _ -> errs
+      }
+      validate_var_decls_loop(rest, file, e1)
+    }
+  }
+}
+
+fn caps_remove_name(caps: [String], n: String) : [String] {
+  match caps {
+    [] -> []
+    [h, ...rest] ->
+      if h == n { caps_remove_name(rest, n) }
+      else      { [h, ...caps_remove_name(rest, n)] }
+  }
+}
+
+fn caps_minus_names(caps: [String], names: [String]) : [String] {
+  match names {
+    [] -> caps
+    [n, ...rest] -> caps_minus_names(caps_remove_name(caps, n), rest)
+  }
+}
+
+fn validate_var_in_expr(e: Expr, caps: [String], file: String, errs: Int) : Int / Console {
+  validate_var_in_kind(e.kind, caps, e.line, e.col, file, errs)
+}
+
+fn validate_var_in_opt(o: Option[Expr], caps: [String], file: String, errs: Int) : Int / Console {
+  match o {
+    Some(e) -> validate_var_in_expr(e, caps, file, errs)
+    None    -> errs
+  }
+}
+
+fn validate_var_in_exprs(es: [Expr], caps: [String], file: String, errs: Int) : Int / Console {
+  match es {
+    [] -> errs
+    [h, ...rest] -> {
+      let e1 = validate_var_in_expr(h, caps, file, errs)
+      validate_var_in_exprs(rest, caps, file, e1)
+    }
+  }
+}
+
+fn validate_var_in_list_elem(le: ListElem, caps: [String], file: String, errs: Int) : Int / Console {
+  match le {
+    ElPlain(e) -> validate_var_in_expr(e, caps, file, errs)
+    ElSpread(e) -> validate_var_in_expr(e, caps, file, errs)
+  }
+}
+
+fn validate_var_in_list_elems(les: [ListElem], caps: [String], file: String, errs: Int) : Int / Console {
+  match les {
+    [] -> errs
+    [h, ...rest] -> {
+      let e1 = validate_var_in_list_elem(h, caps, file, errs)
+      validate_var_in_list_elems(rest, caps, file, e1)
+    }
+  }
+}
+
+fn validate_var_in_field(f: FieldInit, caps: [String], file: String, errs: Int) : Int / Console {
+  match f {
+    FI(_, value) -> validate_var_in_expr(value, caps, file, errs)
+  }
+}
+
+fn validate_var_in_fields(fs: [FieldInit], caps: [String], file: String, errs: Int) : Int / Console {
+  match fs {
+    [] -> errs
+    [h, ...rest] -> {
+      let e1 = validate_var_in_field(h, caps, file, errs)
+      validate_var_in_fields(rest, caps, file, e1)
+    }
+  }
+}
+
+fn validate_var_in_arm(a: Arm, caps: [String], file: String, errs: Int) : Int / Console {
+  match a {
+    Arm(p, g, b) -> {
+      let names = rename_pat_names(p, [])
+      let caps1 = caps_minus_names(caps, names)
+      let e1 = validate_var_in_opt(g, caps1, file, errs)
+      validate_var_in_expr(b, caps1, file, e1)
+    }
+  }
+}
+
+fn validate_var_in_arms(arms: [Arm], caps: [String], file: String, errs: Int) : Int / Console {
+  match arms {
+    [] -> errs
+    [h, ...rest] -> {
+      let e1 = validate_var_in_arm(h, caps, file, errs)
+      validate_var_in_arms(rest, caps, file, e1)
+    }
+  }
+}
+
+fn validate_var_in_clause(c: HClause, caps: [String], file: String, errs: Int) : Int / Console {
+  match c {
+    HC(_, ps, b, _, _) -> {
+      let pnames = rename_param_names(ps, [])
+      validate_var_in_expr(b, caps_minus_names(caps, pnames), file, errs)
+    }
+  }
+}
+
+fn validate_var_in_clauses(cs: [HClause], caps: [String], file: String, errs: Int) : Int / Console {
+  match cs {
+    [] -> errs
+    [h, ...rest] -> {
+      let e1 = validate_var_in_clause(h, caps, file, errs)
+      validate_var_in_clauses(rest, caps, file, e1)
+    }
+  }
+}
+
+fn validate_var_in_return(r: HReturn, caps: [String], file: String, errs: Int) : Int / Console {
+  match r {
+    HR(p, b, _, _) -> validate_var_in_expr(b, caps_remove_name(caps, p), file, errs)
+  }
+}
+
+fn validate_var_in_kind(k: ExprKind, caps: [String], line: Int, col: Int, file: String, errs: Int) : Int / Console {
+  match k {
+    EVar(n) ->
+      if list_has(caps, n) {
+        diag_error(file, line, col, concat_all([
+          "`", n, "` is a State capability bound by `var ", n, " = ...` — bare reads are not allowed"
+        ]))
+        diag_help(concat_all([
+          "use `@", n, "` to read the cell, `", n, " := <expr>` to write it; cap binders are not ordinary locals"
+        ]))
+        errs + 1
+      } else { errs }
+    ECall(callee, args_) -> match callee.kind {
+      EField(base, fname) -> match base.kind {
+        EVar(n) ->
+          if list_has(caps, n) and (fname == "get" or fname == "set") {
+            # Legitimate cap usage. Skip the base; the get/set is the
+            # whole point of the binder. Validate the args under the
+            # same scope so nested misuses still surface.
+            validate_var_in_exprs(args_, caps, file, errs)
+          } else {
+            let e1 = validate_var_in_expr(callee, caps, file, errs)
+            validate_var_in_exprs(args_, caps, file, e1)
+          }
+        _ -> {
+          let e1 = validate_var_in_expr(callee, caps, file, errs)
+          validate_var_in_exprs(args_, caps, file, e1)
+        }
+      }
+      _ -> {
+        let e1 = validate_var_in_expr(callee, caps, file, errs)
+        validate_var_in_exprs(args_, caps, file, e1)
+      }
+    }
+    EBlock(stmts, tail) -> validate_var_in_block(stmts, tail, caps, file, errs)
+    ELambda(ps, body) -> {
+      let pnames = rename_param_names(ps, [])
+      validate_var_in_expr(body, caps_minus_names(caps, pnames), file, errs)
+    }
+    EMatch(scr, arms) -> {
+      let e1 = validate_var_in_expr(scr, caps, file, errs)
+      validate_var_in_arms(arms, caps, file, e1)
+    }
+    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
+      let e1 = validate_var_in_opt(init_opt, caps, file, errs)
+      let body_caps = match alias_opt {
+        Some(a) -> caps_remove_name(caps, a)
+        None    -> caps
+      }
+      let e2 = validate_var_in_expr(body, body_caps, file, e1)
+      let e3 = validate_var_in_clauses(clauses, caps, file, e2)
+      match ret_opt {
+        Some(r) -> validate_var_in_return(r, caps, file, e3)
+        None    -> e3
+      }
+    }
+    EField(base, _) -> validate_var_in_expr(base, caps, file, errs)
+    EIndex(b, i) -> {
+      let e1 = validate_var_in_expr(b, caps, file, errs)
+      validate_var_in_expr(i, caps, file, e1)
+    }
+    EBinop(_, a, b) -> {
+      let e1 = validate_var_in_expr(a, caps, file, errs)
+      validate_var_in_expr(b, caps, file, e1)
+    }
+    EUnop(_, x) -> validate_var_in_expr(x, caps, file, errs)
+    EIf(c, t_, eo) -> {
+      let e1 = validate_var_in_expr(c, caps, file, errs)
+      let e2 = validate_var_in_expr(t_, caps, file, e1)
+      validate_var_in_opt(eo, caps, file, e2)
+    }
+    EList(elems) -> validate_var_in_list_elems(elems, caps, file, errs)
+    EPipe(a, b) -> {
+      let e1 = validate_var_in_expr(a, caps, file, errs)
+      validate_var_in_expr(b, caps, file, e1)
+    }
+    ERange(a, b, opt_step) -> {
+      let e1 = validate_var_in_expr(a, caps, file, errs)
+      let e2 = validate_var_in_expr(b, caps, file, e1)
+      validate_var_in_opt(opt_step, caps, file, e2)
+    }
+    ERecordLit(_, fields) -> validate_var_in_fields(fields, caps, file, errs)
+    EBang(inner) -> validate_var_in_expr(inner, caps, file, errs)
+    ELitUnit(inner, _) -> validate_var_in_expr(inner, caps, file, errs)
+    _ -> errs
+  }
+}
+
+fn validate_var_in_block(stmts: [Stmt], tail: Option[Expr], caps: [String], file: String, errs: Int) : Int / Console {
+  match stmts {
+    [] -> validate_var_in_opt(tail, caps, file, errs)
+    [s, ...rest] -> match s {
+      SLet(p, _, rhs) -> {
+        let e1 = validate_var_in_expr(rhs, caps, file, errs)
+        let names = rename_pat_names(p, [])
+        validate_var_in_block(rest, tail, caps_minus_names(caps, names), file, e1)
+      }
+      SVar(n, _, rhs, _, _) -> {
+        # The init is evaluated under the *outer* caps (a `var n = n`
+        # is a self-shadow only after the binder appears, F# / Rust
+        # convention).
+        let e1 = validate_var_in_expr(rhs, caps, file, errs)
+        # From this point the new var binder shadows any same-named
+        # outer cap and adds itself to the live set.
+        let caps1 = [n, ...caps_remove_name(caps, n)]
+        validate_var_in_block(rest, tail, caps1, file, e1)
+      }
+      SExprStmt(x) -> {
+        let e1 = validate_var_in_expr(x, caps, file, errs)
+        validate_var_in_block(rest, tail, caps, file, e1)
+      }
+      SIndexAssign(b, i, v, _, _) -> {
+        let e1 = validate_var_in_expr(b, caps, file, errs)
+        let e2 = validate_var_in_expr(i, caps, file, e1)
+        let e3 = validate_var_in_expr(v, caps, file, e2)
+        validate_var_in_block(rest, tail, caps, file, e3)
+      }
+      SAssert(c, m) -> {
+        let e1 = validate_var_in_expr(c, caps, file, errs)
+        let e2 = validate_var_in_opt(m, caps, file, e1)
+        validate_var_in_block(rest, tail, caps, file, e2)
+      }
+      SUse(_, _, _) -> validate_var_in_block(rest, tail, caps, file, errs)
+    }
+  }
+}
+
 fn desugar_var_expr(e: Expr) : Expr =
   Expr { kind: desugar_var_kind(e.kind, e.line, e.col),
          line: e.line, col: e.col, ty: e.ty }
@@ -11672,14 +11951,28 @@ fn desugar_var_stmt(s: Stmt) : Stmt {
 
 # Build the canonical `with State[?T](init) as name { ... }` clauses
 # Doc B §`State[T]` *Syntax note* prescribes for a `var` lowering.
+#
+# `state` in the clause body is an alias of the C-level `self->state`
+# pointer. Returning it bare via `resume(state)` makes the caller the
+# *consumer* of `self->state` — the next op call will then read
+# freed memory (manifests as `type mismatch in +` once the slot byte
+# pattern stops looking like a KAI_INT). To keep the slot alive
+# across iterations we dup the slot value on every read; the caller
+# consumes the dup, `self->state` keeps its original refcount.
+# The set clause's `resume(unit, v)` writes `v` into `self->state`
+# directly (handled by `emit_expr`'s `resume(a, ns)` lowering) so no
+# dup is needed there — the new value is owned by `self->state`
+# after the assign.
 fn var_canonical_clauses(line: Int, col: Int) : [HClause] {
   let p_resume = Param { pname: "resume", ptype: None, pline: line, pcol: col }
   let p_v      = Param { pname: "v",      ptype: None, pline: line, pcol: col }
   let resume_e = mk_expr(EVar("resume"), line, col)
   let state_e  = mk_expr(EVar("state"),  line, col)
+  let dup_e    = mk_expr(EVar("__perceus_dup"), line, col)
+  let state_dup = mk_expr(ECall(dup_e, [state_e]), line, col)
   let unit_e   = mk_expr(EUnit,           line, col)
   let v_e      = mk_expr(EVar("v"),       line, col)
-  let get_body = mk_expr(ECall(resume_e, [state_e]), line, col)
+  let get_body = mk_expr(ECall(resume_e, [state_dup]), line, col)
   let set_body = mk_expr(ECall(resume_e, [unit_e, v_e]), line, col)
   [
     HC("get", [p_resume], get_body, line, col),
@@ -27910,6 +28203,15 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # `var`'s init or its rest-of-block has already been
             # lowered to a call.
             let indexed_decls = desugar_index_decls(raw_decls)
+            # Pre-desugar validation: bare reads of `var` cap binders
+            # are caught here with a Tier-3-style help line, instead
+            # of leaking to the C compiler as `kai_<name>` undeclared
+            # (or, worse, panicking inside `lower_protocols` while it
+            # walks the still-bare AST). Short-circuit when this
+            # validation fires so downstream passes never see bare
+            # cap reads.
+            let var_use_errs = validate_var_uses_decls(indexed_decls, path)
+            if var_use_errs > 0 { var_use_errs } else {
             let var_decls = desugar_var_decls(indexed_decls)
             # m7e §25: `use Effect` desugar. Strips DUse / SUse and
             # rewrites bare `EVar(op)` references into qualified
@@ -28054,6 +28356,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   }
                 }
               }
+            }
             }
             }
           }
