@@ -91,37 +91,70 @@ and body symbols — but does not by itself prove the
 specialisation-collision case. Real m4c (Phase 2) is required to
 exercise the duplicated-body codepath end-to-end.
 
-## What is deferred
+### Phase 2 minimal — real specialisation *(LANDED 2026-04-29)*
 
-### Phase 2 — real specialisation *(DEFERRED — design review)*
+`c27a1fe m4c #4: real specialisation — generate per-tuple copies +
+collision demo`.
 
-`monomorphise(tp: TypedProgram) : [Decl]` still returns `tp.decls`
-unchanged. Real specialisation needs:
+`monomorphise(tp: TypedProgram) : [Decl]` flips from identity to a
+real pass that collects distinct `(name, [Ty])` tuples per
+polymorphic DFn from `tp.insts` (`[ResolvedCS]`) and emits one
+specialised copy per tuple with `mangle_name(name, tys)` applied
+to the symbol and `tparams = []`. The clone shares its body Expr
+with the original; the cloned `enc_fn` swaps to the post-monomorph
+C symbol so any embedded `EHandle` clauses mint distinct C
+symbols across copies (the collision case Phase 1 unblocked).
 
-- Collect distinct `(name, [Ty])` tuples per polymorphic DFn from
-  `tp.insts` (`[ResolvedCS]`).
-- For each distinct tuple, emit a specialised copy with
-  `mangle_name(name, tys)` and `tparams = []`.
-- Walk the full AST and rewrite every call site at the recorded
-  `(line, col)` to point at the specialised name. New AST walker,
-  shaped like `rename_proto_calls_*` with a `(line, col, name) →
-  mangled_name` lookup parameter (~300 LOC of mostly-mechanical
-  recursion).
-- Decide whether to prune the original polymorphic decl. Pruning
-  breaks function-as-value patterns (passing the polymorphic name
-  as an argument, partial application beyond what `ResolvedCS`
-  records); keeping it means the codegen budget grows by exactly
-  the number of specialised copies, which is the explicit m4c
-  trade-off.
+In this minimal phase the call sites stayed pointing at the
+polymorphic original — the specialisations existed in the binary
+but were unreached. The follow-up Phase 2 full lane (next section)
+threaded the call-site rewrite that makes them reachable.
 
-The blocker here is no longer technical (Phase 1 unblocks it) but
-design: the call-site rewrite ordering against
-`rename_proto_calls`, the protocol-impl resolver, and `derive`
-expansion needs a careful pass to avoid scope-aware rewrites
-clobbering each other. Pinned for human review per the lane's
-design-decision policy.
+### Phase 2 full — call-site rewrite *(LANDED 2026-04-29)*
 
-### Phase 3 — remove `try_rewrite_show_dim_real` *(DEFERRED — depends on Phase 2 + body type substitution)*
+`monomorphise` now runs the call-site rewrite walker
+`rewrite_callsites_decls` over `tp.decls` *before* cloning the
+specialised copies, so the specs inherit the rewritten body via
+structural sharing. After the rewrite, every
+`ECall(EVar(name), args)` whose `(name, callee.line, callee.col)`
+matches a `ResolvedCS` with concrete tys retargets its callee to
+`mangle_name(name, tys)`. Calls whose recorded tys still contain
+`TyVarT` (polymorphic flow-through) are left untouched and reach
+the polymorphic original at runtime — body type substitution
+(deferred) is the proper fix for that case.
+
+Implementation:
+
+- `rewrite_callsites_decls / _decl / _expr / _kind` mirror the
+  shape of `rename_proto_calls_*`. The only rewrite case is
+  `ECall(EVar(name), args)`; every other ExprKind variant
+  delegates to `map_expr_kind` so a new variant fails the build
+  in `map_expr_kind` rather than silently leaking through this
+  walker.
+- `find_mono_tys(insts, name, line, col)` is a linear scan over
+  `tp.insts` keyed on the `EVar`'s source position. The typer
+  pushes one `CS(name, e.line, e.col, fresh_ids)` per polymorphic
+  `EVar` instantiation, and never pushes one for an EVar shadowed
+  by a local (the local's scheme is monomorphic). That makes the
+  lookup unambiguous and removes the need for scope tracking at
+  the rewrite stage.
+- The polymorphic original stays in the decl list. Bare
+  `EVar(name)` references (function-as-value, partial application)
+  are not in `tp.insts`, so they continue to bind to the original;
+  pruning would break them. Generic prune is a separate lane.
+
+**Keying decision.** Used `(name, line, col)` against
+`tp.insts` rather than `(name, [Ty])` against the spec table.
+Reason: the typer's `synth` already records each polymorphic-EVar
+position in `tp.insts` with the exact source span, and
+`resolve_callsites` resolves the tyvar ids to concrete tys at the
+end of typing. Looking up `(name, line, col)` returns the tys
+directly, which we then mangle. Reaching for `(name, [Ty])`
+keying would have required reconstructing the call-site's tys
+from `Expr.ty` of the callee, which is the same data the typer
+already memoised — pointless work.
+
+### Phase 3 — remove `try_rewrite_show_dim_real` *(DEFERRED — depends on body type substitution)*
 
 The callsite rewrite in `try_rewrite_show_dim_real`
 (`stage2/compiler.kai:27465`) bypasses the parametric impl body
@@ -141,6 +174,24 @@ specialisation step that can fan out to other dim-aware impls.
 That option is also pinned for design review — it preserves the
 current shape of the impl-body emission while removing the
 "show is special" inversion.
+
+### Phase 4 — generic prune *(DEFERRED — depends on function-as-value tracking)*
+
+Drop the polymorphic original from `[Decl]` once every reference
+has been redirected. Today pruning would break function-as-value
+patterns (`let f = my_poly_fn; f(42)`, `map(xs, my_poly_fn)`) the
+`ResolvedCS` table does not index — it only carries call-site
+EVar positions, not bare-name references stored in bindings or
+passed as arguments. Adding the missing index plus a separate
+walker that rewrites bare references to specialised symbols (or
+falls back to a runtime evidence dispatch when no concrete tuple
+is recorded) is the followup that unlocks pruning. Keeping the
+original today means the codegen budget carries the polymorphic
+copy plus one cloned copy per distinct call-site type tuple — the
+explicit m4c trade-off. Whether the polymorphic copy survives the
+final C link depends on the host compiler's dead-code-elimination
+pass (LTO / `-ffunction-sections` + `--gc-sections`); the default
+`-O0` build keeps it.
 
 ## Gate evidence — Phase 1
 
@@ -173,25 +224,67 @@ current shape of the impl-body emission while removing the
   - `try_rewrite_show_dim_real` is **NOT** removed in this lane —
     Phase 3 depends on Phase 2.
 
+## Gate evidence — Phase 2 full (call-site rewrite)
+
+- **Level 1 (mechanical)**:
+  - `make selfhost`: byte-identical fixed point. `compiler.kai`
+    has polymorphic helpers (`map`, `filter`, `list_*`, etc.) but
+    every concrete tuple resolves the same way under
+    `kaic2b → kaic2c`, so the rewritten symbols agree across the
+    two stages. Selfhost diff is empty.
+  - `make -C stage2 selfhost-llvm`: byte-identical.
+  - `make test`: 368 OK, 0 fail (full target including
+    `test-tokens / test-ast / test-types / test-env / test-infer
+    / test-run / test-blocks / test-llvm / test-modules /
+    test-effects / test-effect-runtime / test-protocols /
+    test-demos-core / test-aspirational / test-m4c`).
+- **Level 2 (invariant verifier + audit)**:
+  - `validate_typer_invariants` clean (the invariant pass runs
+    pre-monomorphise; rewriting does not touch the typed-prog
+    invariants).
+  - Wildcard audit on `rewrite_callsites_*`: every `_ ->` arm
+    delegates to `map_expr_kind` (`rewrite_callsites_kind`) or
+    pass-through on non-DFn / non-DTest decls
+    (`rewrite_callsites_decl`, mirroring the precedent set by
+    `rename_proto_calls_decl`). Adding a new `ExprKind` variant
+    fails compilation in `map_expr_kind`'s exhaustive match
+    rather than silently leaking through this walker.
+  - Structural-grep invariant on emitted code: the `test-m4c`
+    target greps both backends' emitted code for the rewritten
+    call-site shape (`= kai_run_with__mono__Int__Int(` etc.) and
+    fails if `main` still calls the polymorphic name.
+- **Level 3 (demo gate)**:
+  - `make demos-no-regression`: baseline 23 demos pass (no
+    regression from 0.10.0).
+  - `make -C stage2 test-m4c`: both `m4c_run_with.kai` and
+    `m4c_handler_in_body.kai` succeed on C and LLVM. The new
+    structural greps confirm `main`'s call sites are rewritten
+    on both backends (5 OK lines from this target alone).
+  - `make -C stage2 test-demos-core`: `portfolio` and
+    `usd_to_eur` (the `Show<Real<u>>` demos that exercise
+    `try_rewrite_show_dim_real`) still pass on both backends.
+
 ## Measurements
 
 `make selfhost` wall-clock and RSS (Apple M-series, Darwin 25.4,
 release build):
 
-| commit                         | wall-clock | max RSS  |
-|--------------------------------|-----------:|---------:|
-| `551bf35` (baseline pre-lane)  |   14.42 s  | 1.83 GB  |
-| `eb8909a` (Phase 1 + Phase 2)  |   11.90 s  | 1.85 GB  |
+| commit                                      | wall-clock | max RSS  |
+|---------------------------------------------|-----------:|---------:|
+| `551bf35` (baseline pre-lane)               |   14.42 s  | 1.83 GB  |
+| `eb8909a` (Phase 1 + Phase 2 minimal)       |   11.90 s  | 1.85 GB  |
+| `r4-mc-callsite-rewrite` (Phase 2 full)     |   11.11 s  | 1.74 GB  |
 
-Wall-clock dropped ~17 % (variance dominated; this is one run on
-a quiet machine). Max RSS is essentially flat (+0.02 GB, within
-noise). The ClauseInfo arity bump (7→8 fields) and the `cls:
-[ClauseInfo]` parameter threading add fixed-shape overhead per
-emitted record but do not introduce per-iteration allocation —
-the lookup at install time is `O(#clauses)` against a single
-flat list, which is small in practice (the largest selfhost run
-collects under a hundred clauses).
+Wall-clock and RSS are essentially flat across the lane (variance
+dominated; single run on a quiet machine). The walker adds one
+extra structural traversal of every typed body and an O(#insts)
+linear scan per `ECall(EVar(_))`, but the cost is absorbed by the
+existing pipeline budget — `tp.insts` for selfhost is bounded by
+the number of polymorphic call sites in `compiler.kai`, which is
+small enough that the linear lookup never shows up in profiles.
+Specialised copies are appended after rewriting, so the codegen
+budget grows by exactly one cloned `DFn` per distinct (name,
+[Ty]) tuple — same as Phase 2 minimal.
 
 `make -C stage2 selfhost-llvm` follows the same pattern: byte-
-identical fixed point, no measurable wall-clock or RSS regression
-on the test suite.
+identical fixed point, no measurable wall-clock or RSS regression.
