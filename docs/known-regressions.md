@@ -632,3 +632,38 @@ The fix lane should re-run `/tmp/interp` and confirm it prints
 `(2 + (3 * 4)) = 14`. Out of m4c real specialisation scope; tracked
 here so the next agent doesn't re-discover.
 
+---
+
+## R-m8x2 — `examples/effects/m8x_2_yield_interleave` segfaults under default stack
+
+**Severity**: low. `make -C stage2 test-effects` runs without a
+`$(STACK) ulimit -s` wrapper, so the m8x_2 binary inherits macOS's
+8 MB default and the cooperative-fiber scheduler blows the stack.
+The test target itself, the binary, and the kaikai source are all
+correct — the missing wrapper is the bug.
+
+### Symptom
+
+```
+$ make -C stage2 test-effects
+...
+effects OK m8_3_spawn_console (effect row propagates through fiber_spawn)
+/bin/sh: line 1: <pid> Segmentation fault: 11  ./build/s2-$name > build/s2-$name.out 2>&1
+effects FAIL m8x_2_yield_interleave (binary exit non-zero)
+```
+
+### Repro
+
+```
+ulimit -s 65520            # then ./build/s2-m8x_2_yield_interleave runs OK
+```
+
+Confirmed pre-existing on `main` HEAD before the m4c-real
+specialisation lane (`git stash` of m4c changes still segfaults).
+
+### Verification path
+
+Add `$(STACK)` to the start of `test-effects` (and other targets
+that don't currently chain through `$(STACK) set -e;`). Out of m4c
+lane scope.
+

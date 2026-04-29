@@ -694,8 +694,8 @@ test-effects: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "_ev.tick = &_kai_clause_" build/s2-$$name.c \
-	    && grep -q "_ev.get = &_kai_clause_" build/s2-$$name.c \
+	  grep -q "_ev.tick = &_kai_main__clause_" build/s2-$$name.c \
+	    && grep -q "_ev.get = &_kai_main__clause_" build/s2-$$name.c \
 	    && grep -q "kai_evidence_lookup_node(\"Counter\")" build/s2-$$name.c \
 	    && grep -q "_ev_op->tick(_ev_op, &_k)" build/s2-$$name.c \
 	    && grep -q "_ev_op->get(_ev_op, &_k)"  build/s2-$$name.c \
