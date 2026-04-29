@@ -402,13 +402,24 @@ type AccountId = String where matches /^acc_[a-zA-Z0-9]{8}$/
 
 **Error**: `unexpected character '$'` at the closing anchor.
 
-**Cause**: the regex stdlib (lane B, 2026-04-28) shipped a Thompson
-NFA matcher but does not yet parse the `^` / `$` start/end anchors.
-Tracked as m12.6.x #7 in `docs/m12-6x-followup.md`.
+**Cause** (re-diagnosed 2026-04-29): the regex stdlib already
+supports `^` / `$` end-to-end (`RxAnchor`, `TAnchor`, NFA threading
+in `stdlib/regexp.kai`). The actual blocker is upstream: kaikai
+has no `/.../` regex-literal syntax in the lexer. The character
+between `where matches` and the type's closing structure is just
+parsed as expression tokens, so `/^acc_...{8}$/` lexes as
+`/`, identifier, `[a-zA-Z0-9]`, ..., `$` — and `$` is not a
+valid token in expression position.
 
-**Fix path**: extend `stdlib/regexp.kai`'s pattern parser to accept
-`^` (start-of-input) and `$` (end-of-input), threading them through
-the NFA construction as zero-width transitions. ~0.5d lane.
+**Fix path**: full regex-literal lane. Lexer change to detect
+`/.../` (with the usual ambiguity heuristic vs the `/` operator —
+look at the previous token; division only after expressions, regex
+only after operators / keywords / open brackets). Parser branch
+for `matches <regex_literal>` predicates. Emit / runtime hookup so
+the regex source feeds `rx_parse_pattern` once at compile time
+(refinement predicate) or the call site (general use). Bigger
+than the half-day estimate this entry used to carry — defer to a
+proper lane.
 
 #### `demos/spiral/main.kai` — module path + legacy `println`
 
@@ -462,6 +473,27 @@ same bug the `resolver-arity-aware` lane is fixing right now.
 **Fix path**: blocked on `resolver-arity-aware` (in flight). Once
 that lane lands, the `use Stdout` + `--path stdlib` edits become a
 ~10-min demo+driver fix as originally estimated.
+
+**Update 2026-04-29**: resolver-arity-aware shipped (v0.7.2) and
+the same-name same-arity collision was diagnosed deeper: when
+`stdlib/loop.repeat` (arity 2) coexists with `stdlib/core/list.repeat`
+(arity 2 with different signature), the typer needs same-module
+preference to resolve `repeat(...)` recursively from inside a body
+that lives in `loop`. v0.9.1 added `fns_prefer_module` in both
+backends (`emit_fn_body`, `llvm_emit_fn`) — the EFn table is
+rotated so same-module entries come first, and `efn_resolve`'s
+ambiguous fallback returns the first match. `stdlib/core/list.kai`
+also has `list_repeat_loop` as the internal recursive helper so
+the user-facing `repeat` and `list_repeat` no longer call each
+other through the global namespace.
+
+The `repeat` collision is gone (verified: `kai_loop__repeat` and
+`kai_list__repeat` both link cleanly when `import loop` is used
+alongside the prelude). `spiral` still fails with a separate bug
+in the `var` desugar — references to `r2`, `left`, `n` inside
+the inner `while { ... }` blocks emit as bare `kai_<name>` instead
+of `State` capability reads, so `cc` rejects with `use of
+undeclared identifier`. That belongs to a `var`-desugar lane.
 
 ### Categorization summary
 

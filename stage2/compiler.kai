@@ -7355,10 +7355,55 @@ fn efn_resolve(fns: [EFn], target: String) : Option[EFn] {
   match candidates {
     []     -> None
     [one]  -> Some(one)
-    _      -> match efn_pick_root(candidates) {
+    [first, ...rest] -> match efn_pick_root(candidates) {
                 Some(r) -> Some(r)
-                None    -> None
+                # Same-module preference: when several modules export
+                # the same name AND no root-file shadow exists, fall
+                # back to the FIRST match. Callers that emit a DFn
+                # body (`emit_fn_body`, `llvm_emit_fn_body`) reorder
+                # the `fns` table with `fns_prefer_module(fns, mo)`
+                # before recursing so the same-module entry wins
+                # over imported modules. This is what unblocks
+                # `stdlib/loop.repeat` recursing on its own name when
+                # `stdlib/core/list.repeat` is also in scope.
+                None    -> Some(first)
               }
+  }
+}
+
+# m6.2 v2 + same-module preference: project the EFn table so entries
+# whose `module_origin` equals `mo` come first. Stable on the rest.
+# Called from emit_fn_body / llvm_emit_fn_body before the body walk
+# so `efn_resolve`'s "first-match" fallback resolves to the local
+# module. With `mo == None` (root file) the table is returned
+# unchanged — root-file fns already win via `efn_pick_root`.
+fn fns_prefer_module(fns: [EFn], mo: Option[String]) : [EFn] = match mo {
+  None    -> fns
+  Some(m) -> list_append(fns_filter_same_module(fns, m, []),
+                          fns_filter_other_module(fns, m, []))
+}
+
+fn fns_filter_same_module(fns: [EFn], m: String, acc: [EFn]) : [EFn] {
+  match fns {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      EFn(_, _, Some(em)) ->
+        if em == m { fns_filter_same_module(rest, m, [h, ...acc]) }
+        else       { fns_filter_same_module(rest, m, acc) }
+      _ -> fns_filter_same_module(rest, m, acc)
+    }
+  }
+}
+
+fn fns_filter_other_module(fns: [EFn], m: String, acc: [EFn]) : [EFn] {
+  match fns {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      EFn(_, _, Some(em)) ->
+        if em == m { fns_filter_other_module(rest, m, acc) }
+        else       { fns_filter_other_module(rest, m, [h, ...acc]) }
+      _ -> fns_filter_other_module(rest, m, [h, ...acc])
+    }
   }
 }
 
@@ -9973,7 +10018,13 @@ fn emit_fn_body(src: String, d: Decl, lcs: [String], fns: [EFn], variants: [EVar
       # variable read (`kai_<pname>`) rather than a closure-thunk
       # over a same-named top-level fn.
       let body_lcs = list_append(lcs, fn_param_names(params))
-      let body_c = emit_expr(src, body, body_lcs, fns, variants, lams)
+      # Same-module preference: when this DFn lives in a module,
+      # rotate the EFn table so entries from that same module come
+      # first. `efn_resolve`'s ambiguous-fallback returns the first
+      # match, so a recursive call inside `loop.repeat` resolves
+      # to `loop.repeat` even when `list.repeat` is also in scope.
+      let body_fns = fns_prefer_module(fns, mo)
+      let body_c = emit_expr(src, body, body_lcs, body_fns, variants, lams)
       cat5(sig, " {\n    return ", body_c, ";\n", "}\n\n")
     }
     _ -> ""
@@ -23625,10 +23676,15 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
   match d {
     DFn(_, nm, _, ps, _, _, body, _, _, mo) -> {
       let locals0 = llvm_init_locals_from_params(ps)
+      # Same-module preference: rotate `fns` so DFns from this DFn's
+      # module come first. `efn_resolve`'s ambiguous fallback returns
+      # the first match so a recursive call resolves to the local
+      # module entry. Mirror of the C backend's emit_fn_body.
+      let body_fns = fns_prefer_module(fns, mo)
       let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
                           globals: "", body: "",
                           last_val: "", cur_label: "entry",
-                          locals: locals0, fns: fns, vars_: vs, lams: lams,
+                          locals: locals0, fns: body_fns, vars_: vs, lams: lams,
                           op_offsets: oo }
       let e1 = llvm_emit_expr(e0, body)
       # m6.2 v2: mint the prefixed symbol when the decl is owned by
