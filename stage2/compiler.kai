@@ -20202,28 +20202,37 @@ fn dump_mono_out(file: String, decls: [Decl]) : Int {
 # an `EHandle` would emit the same clause symbol and the C linker
 # would reject the binary. Pinned in `docs/m5x-followup.md` §3.
 #
-# m4c #4 (this lane): the clause-info plumbing now prefixes clause
-# symbols with the enclosing fn name (`_kai_<enc>__clause_<l>_<c>_<op>`
-# — see `clause_fn_name`), so two specialisations of one source body
-# emit distinct symbols. With the blocker gone, this pass walks the
-# resolved call sites in `tp.insts` and **appends** specialised
-# copies of every polymorphic DFn for each distinct call-site type
-# tuple. The original polymorphic DFn stays in the decl list — call
-# sites are NOT rewritten in this minimal landing, so the
-# specialisations are emitted alongside the original (which keeps
-# function-as-value patterns and fn references working without a
-# deeper AST walk). The collision-avoidance proof is that the new
-# decls and the original each get their own `enc_fn` at collect
-# time, so any embedded `EHandle` in the body produces unique
+# m4c #4 Phase 2 minimal (c27a1fe): the clause-info plumbing now
+# prefixes clause symbols with the enclosing fn name
+# (`_kai_<enc>__clause_<l>_<c>_<op>` — see `clause_fn_name`), so two
+# specialisations of one source body emit distinct symbols. With the
+# blocker gone, this pass walks the resolved call sites in `tp.insts`
+# and appends specialised copies of every polymorphic DFn for each
+# distinct call-site type tuple. The collision-avoidance proof is
+# that the new decls and the original each get their own `enc_fn` at
+# collect time, so any embedded `EHandle` in the body produces unique
 # clause symbols across all copies.
 #
-# Deferred to a follow-up lane:
-#   - Call-site rewrite (`ECall(EVar(name)) → ECall(EVar(mangled))`)
-#     so the specialisations are actually called instead of the
-#     original — needs a deep AST walker keyed on `(line, col,
-#     name)`. The shape mirrors `rename_proto_calls_*` and is
-#     ~300 LOC of mostly-mechanical recursion. Pinned for design
-#     review per the lane policy.
+# m4c #4 Phase 2 full (this lane): also rewrite every call site
+# whose `(name, line, col)` matches a recorded `ResolvedCS` with
+# concrete tys — `ECall(EVar(name), args)` becomes
+# `ECall(EVar(mangle_name(name, tys)), args)`. The walker runs once
+# on `tp.decls` BEFORE the specialised copies are cloned, so the
+# specialisations inherit the rewritten body (calls inside a poly
+# body that resolved to concrete `g(...)` retarget to `g__mono__T`
+# in every copy). Calls whose recorded tys still contain TyVarT are
+# left untouched and reach the polymorphic original at runtime —
+# body type substitution (deferred) is what would let those flow
+# through per-spec.
+#
+# The original polymorphic DFn stays in the decl list. Pruning would
+# break function-as-value patterns: `ResolvedCS` is keyed on
+# `EVar` *call sites*, not on bare-name references, so a bare
+# `EVar(name)` passed as an argument or stored in a binding is not
+# in the table and would dangle if the original were dropped.
+# Generic prune is a separate lane.
+#
+# Deferred to follow-up lanes:
 #   - Body type substitution (replace `Expr.ty` carrying impl-level
 #     uvars with concrete tuple types) so compile-time intrinsics
 #     like `unit_name(x)` and `__strip_unit(x)` see the call-site
@@ -20237,14 +20246,18 @@ fn dump_mono_out(file: String, decls: [Decl]) : Int {
 # Implementation: walk decls collecting polymorphic DFn entries
 # (those with non-empty tparams), walk `tp.insts` collecting
 # distinct `(name, [Ty])` tuples whose name matches a polymorphic
-# decl, and emit one cloned DFn per tuple with `mangle_name`
-# applied to the name and `tparams = []` (the clone is concrete).
+# decl, rewrite the AST so concrete call sites point at the mangled
+# names, then emit one cloned DFn per tuple with `mangle_name`
+# applied to the name and `tparams = []` (the clone is concrete and
+# carries the rewritten body via structural sharing).
 
 fn monomorphise(tp: TypedProgram) : [Decl] {
   let polys = collect_poly_fns(tp.decls)
   let tuples = collect_distinct_tuples(tp.insts, polys, [])
-  let specs = generate_specs(polys, tuples, [])
-  list_append(tp.decls, specs)
+  let rewritten = rewrite_callsites_decls(tp.decls, tp.insts, tuples)
+  let polys_after = collect_poly_fns(rewritten)
+  let specs = generate_specs(polys_after, tuples, [])
+  list_append(rewritten, specs)
 }
 
 # Index polymorphic DFn entries by name. A `DFn` with non-empty
@@ -20410,6 +20423,94 @@ fn specialise_decl(d: Decl, tys: [Ty]) : Decl {
       DFn(is_pub, mangled, [], params, opt_ret, row, body, ln, cl, mo)
     }
     _ -> d
+  }
+}
+
+# ---- m4c Phase 2 — call-site rewrite ----
+#
+# Walk every DFn / DTest body and rewrite each `ECall(EVar(name),
+# args)` whose `(name, callee.line, callee.col)` matches a
+# `ResolvedCS` with concrete tys that produced a specialisation in
+# `tuples`. The rewritten callee is `EVar(mangle_name(name, tys))`
+# at the same source position; args recurse under the same walker.
+#
+# Keying is `(name, line, col)` against `tp.insts` because the typer
+# pushes one `CS(name, e.line, e.col, fresh_ids)` per polymorphic
+# `EVar` instantiation (`synth` line ~16902). The line/col are the
+# `EVar`'s source position, which equals the `ECall`'s callee
+# position — so a single linear scan over `tp.insts` resolves to a
+# unique RCS per call site. Names shadowed by a local binding never
+# push a CS (the local's scheme is monomorphic), so scope tracking
+# is unnecessary at the rewrite stage.
+#
+# Bare `EVar(name)` references (function-as-value, partial
+# application) are left untouched: the polymorphic original stays in
+# the decl list specifically to support those uses.
+fn rewrite_callsites_decls(ds: [Decl], insts: [ResolvedCS],
+                            tuples: [MonoTuple]) : [Decl] =
+  map(ds, (d) => rewrite_callsites_decl(d, insts, tuples))
+
+fn rewrite_callsites_decl(d: Decl, insts: [ResolvedCS],
+                           tuples: [MonoTuple]) : Decl {
+  match d {
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, n, tps, ps, ret, row,
+          rewrite_callsites_expr(body, insts, tuples), l, c, mo)
+    DTest(desc, body, l, c) ->
+      DTest(desc, rewrite_callsites_expr(body, insts, tuples), l, c)
+    _ -> d
+  }
+}
+
+fn rewrite_callsites_expr(e: Expr, insts: [ResolvedCS],
+                           tuples: [MonoTuple]) : Expr =
+  Expr { kind: rewrite_callsites_kind(e.kind, insts, tuples),
+         line: e.line, col: e.col, ty: e.ty }
+
+fn rewrite_callsites_kind(k: ExprKind, insts: [ResolvedCS],
+                           tuples: [MonoTuple]) : ExprKind {
+  match k {
+    ECall(callee, args_) -> match callee.kind {
+      EVar(name) -> {
+        let new_args = map(args_, (a) => rewrite_callsites_expr(a, insts, tuples))
+        match find_mono_tys(insts, name, callee.line, callee.col) {
+          Some(tys) ->
+            if tuple_in(tuples, MT(name, tys)) {
+              let mangled = mangle_name(name, tys)
+              let new_callee = Expr { kind: EVar(mangled),
+                                       line: callee.line, col: callee.col,
+                                       ty: callee.ty }
+              ECall(new_callee, new_args)
+            } else {
+              ECall(callee, new_args)
+            }
+          None -> ECall(callee, new_args)
+        }
+      }
+      _ -> ECall(rewrite_callsites_expr(callee, insts, tuples),
+                  map(args_, (a) => rewrite_callsites_expr(a, insts, tuples)))
+    }
+    # All other ExprKind variants recurse purely structurally — there
+    # is no scope bookkeeping needed and `map_expr_kind` already covers
+    # every Stmt / Arm / HClause / HReturn descendant. Adding a new
+    # ExprKind variant fails compilation in `map_expr_kind` rather
+    # than silently leaking through this walker.
+    _ -> map_expr_kind(k, (sub) => rewrite_callsites_expr(sub, insts, tuples))
+  }
+}
+
+fn find_mono_tys(insts: [ResolvedCS], name: String,
+                  line: Int, col: Int) : Option[[Ty]] {
+  match insts {
+    [] -> None
+    [r, ...rest] -> match r {
+      RCS(rn, rl, rc, tys) ->
+        if rn == name and rl == line and rc == col {
+          Some(tys)
+        } else {
+          find_mono_tys(rest, name, line, col)
+        }
+    }
   }
 }
 
