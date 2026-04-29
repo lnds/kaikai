@@ -4010,8 +4010,11 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
       match opt_step { Some(s) -> fv_expr(s, own, globals, acc1) None -> acc1 }
     }
     EBlock(stmts, opt_final) -> {
-      let acc1 = fv_stmts(stmts, own, globals, acc)
-      match opt_final { Some(f) -> fv_expr(f, own, globals, acc1) None -> acc1 }
+      # stage 0 bug #9: thread the scope as it grows through SLet
+      # so the trailing tail expression sees the same bindings
+      # the earlier statements introduced.
+      let r = fv_stmts_scoped(stmts, own, globals, acc)
+      match opt_final { Some(f) -> fv_expr(f, r.own, globals, r.acc) None -> r.acc }
     }
     EPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
   }
@@ -4028,9 +4031,13 @@ fn fv_arms(arms: [Arm], own: [String], globals: [String], acc: [String]) : [Stri
   match arms {
     [] -> acc
     [a, ...rest] -> match a {
-      Arm(_, opt_g, body) -> {
-        let acc1 = match opt_g { Some(g) -> fv_expr(g, own, globals, acc) None -> acc }
-        fv_arms(rest, own, globals, fv_expr(body, own, globals, acc1))
+      Arm(pat, opt_g, body) -> {
+        # stage 0 bug #7: extend `own` with the pattern's bound
+        # names so the guard and body don't treat them as free
+        # vars when the arm sits inside a lambda body.
+        let own1 = pat_bindings(pat, own)
+        let acc1 = match opt_g { Some(g) -> fv_expr(g, own1, globals, acc) None -> acc }
+        fv_arms(rest, own, globals, fv_expr(body, own1, globals, acc1))
       }
     }
   }
@@ -4055,23 +4062,46 @@ fn fv_list_elems(es: [ListElem], own: [String], globals: [String], acc: [String]
   }
 }
 
+# stage 0 bug #9: each `SLet(pat, _, rhs)` introduces names that
+# subsequent stmts (and the trailing tail of the enclosing
+# EBlock) must see as locally bound, not free. Walking with a
+# constant `own` set treats `let f1 = ...; let f2 = ...; f1 + f2`
+# as free-vars f1/f2 inside any enclosing lambda. Thread the
+# scope through stmts so each fv_expr sees the right `own`.
+type FvScopedS = { own: [String], acc: [String] }
+
 fn fv_stmts(ss: [Stmt], own: [String], globals: [String], acc: [String]) : [String] {
+  fv_stmts_scoped(ss, own, globals, acc).acc
+}
+
+fn fv_stmts_scoped(ss: [Stmt], own: [String], globals: [String],
+                   acc: [String]) : FvScopedS {
   match ss {
-    [] -> acc
-    [s, ...rest] -> fv_stmts(rest, own, globals, fv_stmt(s, own, globals, acc))
+    [] -> FvScopedS { own: own, acc: acc }
+    [s, ...rest] -> {
+      let r = fv_stmt_scoped(s, own, globals, acc)
+      fv_stmts_scoped(rest, r.own, globals, r.acc)
+    }
   }
 }
 
-fn fv_stmt(s: Stmt, own: [String], globals: [String], acc: [String]) : [String] {
+fn fv_stmt_scoped(s: Stmt, own: [String], globals: [String], acc: [String]) : FvScopedS {
   match s {
-    SLet(_, _, rhs) -> fv_expr(rhs, own, globals, acc)
+    SLet(pat, _, rhs) -> {
+      let acc1 = fv_expr(rhs, own, globals, acc)
+      FvScopedS { own: pat_bindings(pat, own), acc: acc1 }
+    }
     SAssert(c, opt_m) -> {
       let acc1 = fv_expr(c, own, globals, acc)
-      match opt_m { Some(m) -> fv_expr(m, own, globals, acc1) None -> acc1 }
+      let acc2 = match opt_m { Some(m) -> fv_expr(m, own, globals, acc1) None -> acc1 }
+      FvScopedS { own: own, acc: acc2 }
     }
-    SExprStmt(x) -> fv_expr(x, own, globals, acc)
+    SExprStmt(x) -> FvScopedS { own: own, acc: fv_expr(x, own, globals, acc) }
   }
 }
+
+fn fv_stmt(s: Stmt, own: [String], globals: [String], acc: [String]) : [String] =
+  fv_stmt_scoped(s, own, globals, acc).acc
 
 fn fv_interp(span: String, is_triple: Bool, own: [String], globals: [String], acc: [String]) : [String] {
   let n = string_length(span)
