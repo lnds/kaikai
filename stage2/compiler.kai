@@ -25830,7 +25830,16 @@ fn lower_protocols(decls: [Decl], file: String) : LoweredProtocols {
   # Resolver-arity (lane: resolver-arity): project the registry's
   # POR list into [OpAr] once so the rewriter can compare against
   # `length(args)` at every call site without re-walking the registry.
-  let op_arities = op_arities_from_ops(lower_res.reg.ops)
+  # Resolver-local-shadow refinement: drop any op entry whose
+  # `(name, arity)` is already provided by a top-level DFn in the
+  # compilation unit. Same-arity collisions like `fn show(s: [Int])`
+  # vs `protocol Show { show(x: Self) }` resolve to the local fn; the
+  # protocol stays reachable through a qualified call. The arity-1
+  # `pub fn min(xs)` / arity-2 `Ord.min(a, b)` split is preserved as
+  # before — different arities never get filtered.
+  let raw_op_arities = op_arities_from_ops(lower_res.reg.ops)
+  let local_arities = collect_local_fn_arities(stripped)
+  let op_arities = filter_shadowed_ops(raw_op_arities, local_arities)
   let user_renamed = rename_proto_calls_decls(stripped, op_arities)
   let impl_renamed = rename_proto_calls_decls(lower_res.fns, op_arities)
   let final_decls = list_append(user_renamed, list_append(impl_renamed, dispatchers))
@@ -25906,6 +25915,52 @@ fn op_ar_match(arities: [OpAr], target: String, n: Int) : Bool {
       OpAr(name, ar) ->
         if name == target and ar == n { true }
         else { op_ar_match(rest, target, n) }
+    }
+  }
+}
+
+# Resolver-arity / local-shadow (lane: resolver-local-shadow): collect
+# every top-level `DFn` in the compilation unit as `(name, arity)`. A
+# protocol op whose `(name, arity)` matches one of these is considered
+# locally shadowed: the user (or stdlib) has provided their own fn by
+# that name, so the rewriter should leave call sites alone and let the
+# typer's normal name resolution pick the local DFn. The protocol
+# remains reachable through a qualified call (e.g. `Show.show(x)`).
+#
+# The collection runs at the `lower_protocols` boundary on the
+# pre-stripped decl stream, where impl methods are still nested inside
+# `DImpl` (only ordinary top-level fns and `DAttribPure(DFn(..))`
+# wrappers surface here). The resulting set is then used to filter
+# `op_arities` *before* the rewrite, so each entry that is shadowed by
+# a same-name same-arity local DFn drops out and never participates in
+# the per-call rewrite logic.
+fn collect_local_fn_arities(ds: [Decl]) : [OpAr] {
+  match ds {
+    [] -> []
+    [d, ...rest] -> match d {
+      DFn(_, name, _, ps, _, _, _, _, _, _) ->
+        [OpAr(name, list_length(ps)), ...collect_local_fn_arities(rest)]
+      _ -> collect_local_fn_arities(rest)
+    }
+  }
+}
+
+# Drop every op entry whose `(name, arity)` exists in `locals`. Same
+# `(name, arity)` pair means a user-visible DFn shadows the protocol
+# op; the rewrite should skip those call sites entirely so the local
+# fn wins. A protocol op whose arity differs from the local DFn (the
+# `min(xs)` / `Ord.min(a, b)` case) is preserved here and continues to
+# rely on `op_ar_match`'s arity check at the call site.
+fn filter_shadowed_ops(ops: [OpAr], locals: [OpAr]) : [OpAr] {
+  match ops {
+    [] -> []
+    [op, ...rest] -> match op {
+      OpAr(n, a) ->
+        if op_ar_match(locals, n, a) {
+          filter_shadowed_ops(rest, locals)
+        } else {
+          [op, ...filter_shadowed_ops(rest, locals)]
+        }
     }
   }
 }
