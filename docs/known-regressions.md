@@ -576,3 +576,59 @@ allowed only when:
 Demos in this section with category "aspirational" or "feature
 deferred" are NOT counted in the baseline; they fail by design
 until their upstream lane lands.
+
+---
+
+## R-interp — `examples/minimal/interp.kai` panics on stage 2 codegen with `non-exhaustive match`
+
+**Severity**: medium. `make test` (`test-run`) fails on `interp` after
+`hello` runs OK; affects every commit on `main` since the m8 bug-#12
+fix landed (4a77d49, 2026-04-29).
+
+### Symptom
+
+```
+$ stage2/kaic2 examples/minimal/interp.kai > /tmp/interp.c \
+  && cc -std=c99 -I stage0 /tmp/interp.c -o /tmp/interp && /tmp/interp
+panic: non-exhaustive match
+```
+
+`stage1/kaic1` on the same source emits a binary that prints
+`(2 + (3 * 4)) = 14` correctly. The other four minimal examples
+(`hello`, `fizzbuzz`, `capture`, `quicksort`) work end-to-end through
+both stages.
+
+### Hypothesis
+
+The match is on a recursive sum-type (`Expr = Lit | Add | Mul | Neg`)
+walked by `eval`/`show`. The emitted C looks identical between stage 1
+and stage 2 except for the tail `kai_decref(_scr)` the new perceus
+flip inserts after the match block. Suspect the recently landed
+runtime change — `kai_decref(_scr)` after the match arm has
+incref'd the variant args — is freeing the parent variant before
+nested recursive calls finish reading siblings, which corrupts the
+walked tree on the next recursion.
+
+The trigger isolates to `interp` (the only minimal demo that walks
+a recursive variant via match arms holding multiple incref'd field
+references), so the bug is likely a refcount discipline gap in
+either `pcs_rewrite_expr` (perceus) or the match-scrutinee drop
+that 9fe6f6d introduced.
+
+### Repro
+
+```
+make selfhost                                 # baseline byte-identical: OK
+stage2/kaic2 examples/minimal/interp.kai > /tmp/interp.c
+cc -std=c99 -I stage0 /tmp/interp.c -o /tmp/interp
+/tmp/interp                                    # -> panic: non-exhaustive match
+diff <(stage1/kaic1 examples/minimal/interp.kai) /tmp/interp.c \
+  | grep -v '^[<>] /\*'                        # only the perceus tail differs
+```
+
+### Verification path
+
+The fix lane should re-run `/tmp/interp` and confirm it prints
+`(2 + (3 * 4)) = 14`. Out of m4c real specialisation scope; tracked
+here so the next agent doesn't re-discover.
+
