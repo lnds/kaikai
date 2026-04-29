@@ -151,6 +151,18 @@ unit Newton  = kg * m / sec^2
 unit Pascal  = Newton / m^2
 ```
 
+**Capitalisation**: unit symbols are ordinary identifiers, so any
+casing is accepted (`m`, `M`, `kg`, `USD`, `Newton`). Names are
+case-sensitive — `m` and `M` are distinct units. Conventional usage
+(not enforced by the compiler):
+
+- SI base units in lowercase: `m`, `s`, `kg`, `mol`, `cd`. The two
+  exceptions `K` (kelvin) and `A` (ampere) are uppercase because
+  `k` and `a` collide with common metric prefixes.
+- Units named after a person in titlecase: `Newton`, `Pascal`,
+  `Joule`, `Hertz`, `Watt`, `Celsius`.
+- Currencies in ISO 4217 uppercase: `USD`, `EUR`, `CLP`.
+
 ### 2. Literals and types
 
 **Decision**: angle brackets like F#, syntax `<unit-expr>`.
@@ -198,6 +210,36 @@ m * sec, m / sec, m^2, sec^-1, m * sec / kg
 Canonicalisation: alphabetically order numerator and denominator,
 group exponents (`m * m` → `m^2`), eliminate factor `1`.
 `kg m / sec^2 ≡ m kg / sec^2 ≡ m * kg * sec^-2`.
+
+**Pretty-printing** (used by `unit_name`, `impl Show for Real<u>`,
+and typer diagnostics): scientific style. Multiplication renders
+as a single space (`kg m`), division as `/` with no surrounding
+spaces (`m/s`, `kg m/s^2`). Powers use `^` with the integer
+literal (`m^2`, `s^-1`). Trivial `1` factors collapse out.
+
+#### 4.1. Value-level `^` (v0.9.0)
+
+The `^` operator also works at the expression level: `r ^ n`
+raises a numeric value to an integer power. When `r` has a non-
+trivial unit, the exponent must be a literal Int so the typer can
+lift `Real<u> ^ N` to `Real<u^N>` statically (no dependent types).
+A non-literal exponent on a dimensioned base is rejected.
+
+```kai
+let r : Real<m>     = 3.0<m>
+let area : Real<m^2> = r ^ 2     # OK — literal exponent, unit lifted
+let vol  : Real<m^3> = r ^ 3
+let inv  : Real<m^-1> = r ^ -1   # negative literal accepted
+
+let n = 2
+let bad = r ^ n                  # error: literal Int exponent required
+```
+
+`^` is right-associative (`2 ^ 3 ^ 2` parses as `2 ^ (3 ^ 2) = 512`)
+and binds tighter than `*`/`/`. Bare numeric bases (`Int`, `Real`,
+`Real<1>`) accept any `Int` exponent — the runtime helper
+`kai_pow_int` handles negatives on `Real` as `1.0 / base^|n|` and
+clamps negatives to 0 on `Int`.
 
 ### 5. Generic units
 
