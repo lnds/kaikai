@@ -337,8 +337,30 @@ found:    (Option[Int]) -> ?t7 / ?e3
 `!` postfix on `Option` IS landed (m7e §13, v0.1.0). Demo just
 hasn't been updated to use it.
 
-**Fix path**: 5-min demo edit. Replace `TNum(string_to_int(n))` with
-`TNum(string_to_int(n)!)`. No language change needed.
+**Why the obvious 5-min fix doesn't work** (foreground experiment
+2026-04-29): replacing the call site with
+`TNum(string_to_int(n)!)` fails with a different error:
+
+```
+error: `!` is only valid inside a function body
+help: `!` propagates from the enclosing function; it cannot appear
+inside a lambda or at top level
+```
+
+The `!` postfix is restricted to the immediately enclosing fn body;
+the call site here is inside a `(w) => match w { ... }` lambda
+passed to `map`. The lambda has no Fail row that `!` can propagate
+through.
+
+**Fix path**: ~30 min refactor — extract `token_of` from the
+`tokenise` lambda into a top-level `fn token_of(w: String) : Token
+/ Fail`, then call `tokens.map(token_of)`. The `!` lives inside
+`token_of`'s body and propagates correctly. Demo edit only, no
+language change needed.
+
+(A more invasive language fix would be to allow `!` to escape
+through a lambda whose enclosing fn has the matching `Fail` row.
+Out of scope for this demo.)
 
 #### `demos/mini_ledger/main.kai` — regex anchors
 
@@ -384,9 +406,30 @@ fn fill(grid: Array[Int], dim: Int) : Unit / Mutable = {
    the canonical surface is `Stdout.println(s)` (or `println(s)`
    with `use Stdout` in scope). The demo predates that.
 
-**Fix path**: dual demo edit — add `use Stdout` at file top and
-either keep `import loop` (with `--path` setup) or inline the loop
-combinator. ~10 min.
+**Why the obvious 10-min fix doesn't work** (foreground experiment
+2026-04-29): adding `use Stdout` and `--path "$ROOT/stdlib"` to
+`bin/kai`'s `compile_to_binary` got past the original errors but
+surfaced a deeper bug:
+
+```
+warning: bare name 'repeat' is exported by multiple modules with no
+root-file shadow: list, loop; use a qualified call (e.g.
+list.repeat(...)) to disambiguate
+error: type mismatch in function call
+expected: (Int, () -> Unit / ?e1) -> Unit / ?e1
+found:    (Int, Int) -> ?t3 / ?e2
+```
+
+`stdlib/loop.kai` exports `repeat(n: Int, body: () -> Unit / e)`
+(control-flow combinator) and `stdlib/core/list.kai` exports
+`repeat(x: a, n: Int) : [a]` (list of n copies). Different arity,
+different types — but the resolver picks one by name without
+arity-filtering and the call site fails to type-check. This is the
+same bug the `resolver-arity-aware` lane is fixing right now.
+
+**Fix path**: blocked on `resolver-arity-aware` (in flight). Once
+that lane lands, the `use Stdout` + `--path stdlib` edits become a
+~10-min demo+driver fix as originally estimated.
 
 ### Categorization summary
 
@@ -395,13 +438,20 @@ combinator. ~10 min.
 | `state` | aspirational m7b #5b | post-MVP | wait for sugar lane |
 | `stack` | aspirational m7b #5b | post-MVP | wait for sugar lane |
 | `toquefama` | aspirational tuples (REJECTED) | demo migration | rewrite to `Pair` or multi-arg match |
-| `forth` | demo not updated to use `!` postfix | 5 min | demo edit |
+| `forth` | `!` blocked in lambda scope | ~30 min refactor | extract `token_of` from lambda |
 | `mini_ledger` | regex anchors not parsed | 0.5d | m12.6.x #7 lane |
-| `spiral` | dual: module path + legacy `println` | 10 min | demo edit |
+| `spiral` | repeat collision (loop vs list) | blocked | wait for `resolver-arity-aware` lane |
 
-**Cheapest wins**: `forth` (5 min) and `spiral` (10 min) are demo
-edits that flip 2 more demos to OK. `mini_ledger` waits for the
-regex anchor lane.
+**Foreground experiment results (2026-04-29)**: the original audit
+estimated `forth` at 5 min and `spiral` at 10 min. Both hit deeper
+issues than expected:
+- `forth`'s `!` does not work inside a lambda — needs a refactor,
+  not a 1-line edit.
+- `spiral`'s `import loop` collides with `stdlib/core/list.kai` on
+  the `repeat` name — blocked until the resolver learns to filter
+  candidates by arity (lane in flight).
+
+`mini_ledger` waits for the regex anchor lane regardless.
 
 `state`, `stack`, `toquefama` stay failing as honest reminders of
 deferred features — fixing them either changes the demo's intent
