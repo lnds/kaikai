@@ -408,6 +408,91 @@ its emit avoids the issue.
 
 ---
 
+## R4 — discarding a `Fiber[T]` value (`let _ = fiber_spawn(…)`) deadlocks the scheduler
+
+**Status**: **OPEN** as of 2026-04-29 evening. Surfaced while writing
+`demos/ping_pong/`. Workaround documented in the demo: bind every
+spawned Fiber to a real name and call `fiber_await` before exiting
+the `with_mailbox` body.
+
+### Symptom
+
+```kai
+fn run() : Unit / Actor[String] + Spawn + Console = {
+  let me = Actor.self()
+  let _ = fiber_spawn(() => worker(me, "hi"))   # discard via `_`
+  Stdout.print(Actor.receive())
+}
+```
+
+```
+$ ./binary
+kai: deadlock — fiber parked with empty run queue (2 parked total)
+```
+
+The same source with `let f = fiber_spawn(…)` followed by
+`fiber_await(f)` runs to completion. The bug triggers regardless of
+whether the worker yields, recurses, or sends a single message.
+
+### Hypothesis
+
+`fiber_spawn` returns a `Fiber[T]` value whose RC starts at 1.
+`let _ = …` is treated as a discard, so the RC drops to 0
+immediately. Under the R1 Perceus flip, RC=0 frees the value via
+`kai_free_value`'s `KAI_FIBER` branch. But the scheduler still
+holds a raw `KaiFiber *` in its ready queue (and the trampoline
+walks Phase-5 link chains), so the freed struct gets picked up
+later as garbage memory and the cooperative loop wedges.
+
+The fix is per-fiber RC discipline: either
+(a) the scheduler takes its own incref when it enqueues the fiber
+    and decrefs in the trampoline DONE / CANCELLED branch, OR
+(b) the Fiber value's KAI_FIBER drop path checks `state` and
+    no-ops when the fiber is still on the run queue (defers the
+    free to the trampoline).
+
+Option (a) is the cleaner contract — every reference path holds
+its own ref. Option (b) is closer to a tactical patch.
+
+### Repro
+
+Minimal — three lines suffice:
+
+```kai
+import actor; import spawn
+fn worker(t: Pid[String]) : Unit / Actor[String] + Console = Actor.send(t, "hi")
+fn run() : Unit / Actor[String] + Spawn + Console = {
+  let me = Actor.self(); let _ = fiber_spawn(() => worker(me))
+  Stdout.print(Actor.receive())
+}
+fn main() : Int / Console + Spawn = { with_mailbox { run() } 0 }
+```
+
+### Workaround for callers
+
+Bind every spawned fiber and `fiber_await` it before exiting the
+mailbox / spawn scope:
+
+```kai
+let f = fiber_spawn(…)
+…
+fiber_await(f)
+```
+
+### Verification path
+
+After a candidate fix:
+- `demos/ping_pong/main.kai` rewritten with `let _ = fiber_spawn(…)`
+  for at least one of the three workers — should still produce the
+  round-robin output.
+- New fixture `examples/effects/m8_fiber_discard.kai` with the
+  three-line repro above, hooked into `make test-effects`.
+
+Out of r4-mc-callsite-rewrite scope; deserves its own runtime
+lane post-m4c.
+
+---
+
 ## Demos failing inventory (as of v0.7.1, 2026-04-29)
 
 `make demos-no-regression` reports **20 passing (baseline 20)** plus
