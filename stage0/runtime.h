@@ -1090,6 +1090,24 @@ static KaiValue *kai_prelude_real_to_string(KaiValue *v) {
     return kai_str(buf);
 }
 
+static KaiValue *kai_prelude_int_to_real(KaiValue *v) {
+    int64_t n = (v && v->tag == KAI_INT) ? v->as.i : 0;
+    return kai_real((double) n);
+}
+
+/* Truncating cast toward zero. Out-of-range, NaN and Inf collapse to
+ * 0 — kaikai has no IEEE 754 surface for the user yet, so the safer
+ * default beats a UB conversion. Revisit when the math/real lane
+ * adds NaN-aware predicates. */
+static KaiValue *kai_prelude_real_to_int(KaiValue *v) {
+    if (!v || v->tag != KAI_REAL) return kai_int(0);
+    double r = v->as.r;
+    if (r != r) return kai_int(0);                  /* NaN */
+    if (r >  9.2233720368547748e18) return kai_int(0); /* > INT64_MAX */
+    if (r < -9.2233720368547758e18) return kai_int(0); /* < INT64_MIN */
+    return kai_int((int64_t) r);
+}
+
 /* ---------- prelude: strings ---------- */
 
 static KaiValue *kai_prelude_string_length(KaiValue *s) {
@@ -1708,6 +1726,8 @@ static KaiValue *_kai_prelude_panic_thunk(KaiValue *s, KaiValue **a, int n)     
 static KaiValue *_kai_prelude_exit_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_prelude_exit(a[0]); }
 static KaiValue *_kai_prelude_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_int_to_string(a[0]); }
 static KaiValue *_kai_prelude_real_to_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_real_to_string(a[0]); }
+static KaiValue *_kai_prelude_int_to_real_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_int_to_real(a[0]); }
+static KaiValue *_kai_prelude_real_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_real_to_int(a[0]); }
 static KaiValue *_kai_prelude_string_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_length(a[0]); }
 static KaiValue *_kai_prelude_string_concat_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_concat(a[0], a[1]); }
 static KaiValue *_kai_prelude_string_concat_all_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_concat_all(a[0]); }
