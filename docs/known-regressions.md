@@ -207,3 +207,218 @@ Casting the call site through a wrapper with explicit row breaks the
 leak in some experiments — but the fix is in the typer, not the
 caller side. No source-level workaround is recommended; let the
 typer be fixed.
+
+---
+
+## Demos failing inventory (as of v0.7.1, 2026-04-29)
+
+`make demos-no-regression` reports **20 passing (baseline 20)** plus
+**6 failing**. **None of the 6 are regressions** — they fall into two
+categories:
+
+1. **Aspirational** — demos that intentionally use syntax for features
+   not yet shipped (m7b #5b sugar, tuples).
+2. **Pre-existing pre-m14 v1** — demos that depend on language pieces
+   or stdlib pieces that were never finished (regex anchors, demo
+   not updated to use `!` postfix on `Option`, module path resolution
+   plus legacy `println`).
+
+Documenting each failure with root cause and fix path so the next
+agent does not need to re-discover. Updating this section is part of
+any milestone close that changes the failure inventory.
+
+### Aspirational (intentionally future-looking)
+
+These demos declare in their own comments that they exercise sugar
+forms not yet landed. Their FAIL is the expected status until the
+feature ships.
+
+#### `demos/state/main.kai` — m7b #5b sugar
+
+```kai
+fn make_counter() : () -> Int / Mutable = {
+  var n = 0
+  () => {
+    n := n + 1
+    n
+  }
+}
+```
+
+**Error**:
+
+```
+type mismatch in return type of make_counter
+expected: () -> Int / Mutable
+found:    () -> ? / State[?t1] + ?e0
+```
+
+**Cause**: `var n = 0` desugars to `with State[Int](0) as n` — the
+typer infers `State` effect, not `Mutable`. The `var → Mutable`
+collapse is m7b #5b sugar (see `docs/syntax-sugars.md`), not yet
+landed. Demo intentionally uses the sugar form; for the explicit
+parametric handler that runs today, see `demos/state_explicit/`.
+
+**Fix path**: m7b #5b sugar lane (post-MVP polish).
+
+#### `demos/stack/main.kai` — m7b #5b sugar (handler-clause scope)
+
+```kai
+fn run() : Unit / Stack + Console = {
+  with Stack {
+    var xs = []
+    push(x) -> { ... }
+    pop()   -> ...
+  }
+}
+```
+
+**Error**: `expected operation name in handler` at `var xs = []`.
+
+**Cause**: `var` inside a handler clause body would desugar to a
+sibling `with State[T](init) as xs`, but that handler-clause-scope
+extension to m7b #5b is also not landed. Demo intentionally
+aspirational. For the explicit parametric handler that runs today,
+see `demos/stack_explicit/`.
+
+**Fix path**: m7b #5b sugar lane (post-MVP polish), same as `state`.
+
+#### `demos/toquefama/main.kai` — tuples (REJECTED in m8.5)
+
+```kai
+fn count_toques(guess: [Int], target: [Int]) : Int = match (guess, target) {
+  ([], _)                  -> 0
+  (_, [])                  -> 0
+  ([g, ...gs], [t, ...ts]) -> { ... }
+}
+```
+
+**Error**: `expected ')' after expression` at the parenthesised
+match scrutinee `(guess, target)`.
+
+**Cause**: tuple match expressions. m8.5 (2026-04-27) measured a
+parser-combinator suite and **rejected tuples** as a second product
+form (n=7, generic-record baseline beat tuples on both LOC and
+signature length). The tuple syntax is not coming back.
+
+**Fix path**: rewrite the demo to either `match a, b { PatA, PatB ->
+... }` (m7d §27 multi-arg match sugar, post-m14 v1.A) or wrap inputs
+in a `Pair[a, b]` record. Demo migration, not language change.
+
+### Pre-existing — feature deferred
+
+These demos exercise stdlib or language pieces that are deferred to
+known follow-up lanes.
+
+#### `demos/forth/main.kai` — `!` postfix on `Option` (demo not updated)
+
+```kai
+fn tokenise(s: String) : [Token] / Fail = {
+  s |> string_split(" ") |> map((w) => match w {
+    n -> TNum(string_to_int(n))   # string_to_int returns Option[Int]
+    ...
+  })
+}
+```
+
+**Error**:
+
+```
+type mismatch in function call
+expected: (Int) -> Token
+found:    (Option[Int]) -> ?t7 / ?e3
+```
+
+**Cause**: `string_to_int` returns `Option[Int]`. The demo passes the
+`Option` directly to `TNum(_)` which takes `Int`. The intent is
+`TNum(string_to_int(n)!)` — propagate the `None` to the enclosing
+`Fail` handler via `!` postfix.
+
+`!` postfix on `Option` IS landed (m7e §13, v0.1.0). Demo just
+hasn't been updated to use it.
+
+**Fix path**: 5-min demo edit. Replace `TNum(string_to_int(n))` with
+`TNum(string_to_int(n)!)`. No language change needed.
+
+#### `demos/mini_ledger/main.kai` — regex anchors
+
+```kai
+type AccountId = String where matches /^acc_[a-zA-Z0-9]{8}$/
+```
+
+**Error**: `unexpected character '$'` at the closing anchor.
+
+**Cause**: the regex stdlib (lane B, 2026-04-28) shipped a Thompson
+NFA matcher but does not yet parse the `^` / `$` start/end anchors.
+Tracked as m12.6.x #7 in `docs/m12-6x-followup.md`.
+
+**Fix path**: extend `stdlib/regexp.kai`'s pattern parser to accept
+`^` (start-of-input) and `$` (end-of-input), threading them through
+the NFA construction as zero-width transitions. ~0.5d lane.
+
+#### `demos/spiral/main.kai` — module path + legacy `println`
+
+```kai
+import loop
+
+fn fill(grid: Array[Int], dim: Int) : Unit / Mutable = {
+  ...
+  if c >= dim { println(acc) }
+}
+```
+
+**Errors** (in order, with full prelude chain):
+
+1. `cannot open module 'loop' (tried demos/spiral/loop.kai)` —
+   module path resolution.
+2. `undefined name 'println'` — bare `println` does not resolve to
+   the `Stdout` effect post-m12.8 Phase 4b atomic-effects split.
+
+**Cause**:
+
+1. The `import loop` resolver looks under the demo's directory, not
+   `stdlib/`. m6.2 v1 ships the `--path stdlib` flag for this; the
+   `demos/Makefile` passes it but the bin/kai wrapper does not by
+   default.
+2. `println` is a legacy bare builtin (pre-m7a). After m12.8 Phase 4b
+   the canonical surface is `Stdout.println(s)` (or `println(s)`
+   with `use Stdout` in scope). The demo predates that.
+
+**Fix path**: dual demo edit — add `use Stdout` at file top and
+either keep `import loop` (with `--path` setup) or inline the loop
+combinator. ~10 min.
+
+### Categorization summary
+
+| Demo | Category | Effort | Owner |
+|---|---|---|---|
+| `state` | aspirational m7b #5b | post-MVP | wait for sugar lane |
+| `stack` | aspirational m7b #5b | post-MVP | wait for sugar lane |
+| `toquefama` | aspirational tuples (REJECTED) | demo migration | rewrite to `Pair` or multi-arg match |
+| `forth` | demo not updated to use `!` postfix | 5 min | demo edit |
+| `mini_ledger` | regex anchors not parsed | 0.5d | m12.6.x #7 lane |
+| `spiral` | dual: module path + legacy `println` | 10 min | demo edit |
+
+**Cheapest wins**: `forth` (5 min) and `spiral` (10 min) are demo
+edits that flip 2 more demos to OK. `mini_ledger` waits for the
+regex anchor lane.
+
+`state`, `stack`, `toquefama` stay failing as honest reminders of
+deferred features — fixing them either changes the demo's intent
+(state / stack) or rewrites it for a feature that will not ship
+(toquefama).
+
+### Demos baseline policy
+
+`demos/baseline.txt` records the minimum count of OK+PASS demos
+that must keep passing on every commit. Editing the baseline is
+allowed only when:
+
+- A demo legitimately becomes aspirational (its feature was retired
+  or deferred), at which point the baseline drops by 1.
+- A demo that was previously failing flips to OK, at which point
+  the baseline rises by 1.
+
+Demos in this section with category "aspirational" or "feature
+deferred" are NOT counted in the baseline; they fail by design
+until their upstream lane lands.
