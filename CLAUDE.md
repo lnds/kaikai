@@ -130,9 +130,20 @@ Adjacent rules every agent must apply:
   bug outside your lane, document it in `docs/known-regressions.md`
   with repro + hypothesis, do not fix it inline. The L2 wrong-lane
   revert from 2026-04-29 is the precedent.
-- **VERSION + CHANGELOG**: bump at *lane close*, not per commit.
-  Commits land under `## [Unreleased]` until the lane finishes;
-  the closing commit moves them to a new `## [vX.Y.Z]` section.
+- **VERSION + CHANGELOG**: do NOT bump the version yourself. Add
+  your closing-commit entry to `CHANGELOG.md` under the existing
+  `## [Unreleased]` section and **leave `VERSION` untouched**. The
+  integrator (the human merging the PR) assigns the final version
+  number at merge time, in the merge commit. This is required
+  because parallel lanes can not know each other's order of merge:
+  on 2026-04-29 three agents (PR #24 / #25 / #26) all asked for
+  the same `0.12.0` because each was opened against the same
+  baseline; the integrator had to bump them to 0.12.0 / 0.13.0 /
+  0.14.0 by hand. Leaving `VERSION` and the section header alone
+  in the PR avoids that work — the merge commit promotes the
+  Unreleased entry to a versioned section in one step. The PR
+  description may suggest the *next* number, but treat it as
+  advisory only.
 - **`make daily` failures are diagnostics, not blockers.** Tier 0
   / Tier 1 already gated every commit, so `main` stays unbroken.
   A `daily` failure opens a lane the next morning; do not jam
