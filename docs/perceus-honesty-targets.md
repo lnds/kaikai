@@ -32,20 +32,24 @@ R1 atomic flip landed v0.2.0 (2026-04-28):
 
 Numbers on `kaic2` self-compile (KAI_TRACE_RC):
 
-| metric        | pre-m5  | m5 #7   | Phase 1 (inert) | Phase 3 (flip) |
-|---------------|--------:|--------:|----------------:|---------------:|
-| alloc_total   | 130.7 M | 29.5 M  | 33.0 M          | 69.7 M         |
-| free_total    | 3.5 M   | 37      | 39              | 22.8 M         |
-| leaked        | 127.2 M | 29.5 M  | 33.0 M          | **46.9 M**     |
-| live_peak     | 127.2 M | 29.5 M  | 33.0 M          | 46.9 M         |
-| max RSS       | 6.25 GB | n/a     | n/a             | **3.02 GB**    |
-| wall time     | 2.15 s  | n/a     | n/a             | **5.74 s**     |
+| metric        | pre-m5  | m5 #7   | Phase 1 (inert) | Phase 3 (flip) | + Tier 2 partial (2026-04-29 evening) |
+|---------------|--------:|--------:|----------------:|---------------:|--------------------------------------:|
+| alloc_total   | 130.7 M | 29.5 M  | 33.0 M          | 69.7 M         | (similar)                             |
+| free_total    | 3.5 M   | 37      | 39              | 22.8 M         | (higher)                              |
+| leaked        | 127.2 M | 29.5 M  | 33.0 M          | 46.9 M         | **23.8 M** (−49%)                     |
+| live_peak     | 127.2 M | 29.5 M  | 33.0 M          | 46.9 M         | (similar)                             |
+| max RSS       | 6.25 GB | n/a     | n/a             | 3.02 GB        | (untouched, Tier 2 hasn't moved RSS)  |
+| wall time     | 2.15 s  | n/a     | n/a             | 5.74 s         | (untouched, expected to recover with kai_field/pat_test balance) |
 
-The flip cuts RSS in half and finally calls `free` (~23 M times,
-vs 37 calls pre-flip) but still leaks 67% of allocations. That
-gap is the agenda below — and the wall-time regression is its
-mirror image (every dup is real work; without their savings the
-flip pays cost without recovering it).
+The flip cut RSS in half and started calling `free` (~23 M times,
+vs 37 calls pre-flip). Three Tier 2 partial-landings on
+2026-04-29 evening (commits `8bd6431`, `73a12d4`, `7ab3d64`) cut
+the residual leak roughly in half: **46.9 M → 23.8 M (−49%)**.
+The remaining ~24 M are the named sources below (perceus_pass
+multi-read, kai_field/pat_test, stage 0 deeper let/match audit).
+Wall time has not moved — the dup machinery still fires;
+recovering wall regression is paired with the kai_field balance
+work that drops redundant increfs in the match-test phase.
 
 ## What does NOT work today
 
