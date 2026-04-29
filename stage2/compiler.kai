@@ -20175,34 +20175,229 @@ fn dump_mono_out(file: String, decls: [Decl]) : Int {
   r.errs
 }
 
-# ---- m4c — monomorphise (identity, m4c #1) ----
+# ---- m4c — monomorphise (m4c #4 minimal real, 2026-04-29) ----
 #
 # Sits between `infer_program` and `perceus_pass` in the pipeline.
 # Given a TypedProgram (post-inference, with `Expr.ty` populated and
 # all `ResolvedCS` known), produce the `[Decl]` shape the next pass
-# walks. m4c #1 is an identity transform: the post-mono decls are
-# the typed decls, unchanged. Selfhost stays byte-identical because
-# the emitter does not consume `Expr.ty`.
+# walks.
 #
-# Real specialisation (per-instantiation copies of polymorphic decls,
-# call-site rewrites, dead-generic pruning) is deferred. The blocker
-# surfaced under m4c #3: `clause_fn_name(line, col, op)` mints C
-# symbols by source position alone, so two copies of a body that
-# contains an `EHandle` produce identical clause symbols and the C
-# linker rejects the binary. Fixing it is a real retrofit (~1-2 days,
-# touches the clause-collection plumbing) and only pays off once
-# unboxing / drop specialisation / reuse-in-place arrive — the
-# "basic Perceus" pass below operates on uniform-boxed values and
-# does not require specialised bodies.
+# m4c #1 (pre-fix): identity transform, decls unchanged. The
+# blocker on real specialisation was symbol collision —
+# `clause_fn_name(line, col, op)` minted C symbols by source position
+# alone, so two specialised copies of a polymorphic body containing
+# an `EHandle` would emit the same clause symbol and the C linker
+# would reject the binary. Pinned in `docs/m5x-followup.md` §3.
 #
-# When the time comes, the four sub-steps still apply: mangling
-# helper (`mangle_name` in this file already), specialised-copy
-# emission (with fn-name-aware clause symbols), call-site rewrite,
-# generic prune. Until then `monomorphise` stays identity and
-# `--dump-mono-out` documents what specialisation WOULD do.
+# m4c #4 (this lane): the clause-info plumbing now prefixes clause
+# symbols with the enclosing fn name (`_kai_<enc>__clause_<l>_<c>_<op>`
+# — see `clause_fn_name`), so two specialisations of one source body
+# emit distinct symbols. With the blocker gone, this pass walks the
+# resolved call sites in `tp.insts` and **appends** specialised
+# copies of every polymorphic DFn for each distinct call-site type
+# tuple. The original polymorphic DFn stays in the decl list — call
+# sites are NOT rewritten in this minimal landing, so the
+# specialisations are emitted alongside the original (which keeps
+# function-as-value patterns and fn references working without a
+# deeper AST walk). The collision-avoidance proof is that the new
+# decls and the original each get their own `enc_fn` at collect
+# time, so any embedded `EHandle` in the body produces unique
+# clause symbols across all copies.
+#
+# Deferred to a follow-up lane:
+#   - Call-site rewrite (`ECall(EVar(name)) → ECall(EVar(mangled))`)
+#     so the specialisations are actually called instead of the
+#     original — needs a deep AST walker keyed on `(line, col,
+#     name)`. The shape mirrors `rename_proto_calls_*` and is
+#     ~300 LOC of mostly-mechanical recursion. Pinned for design
+#     review per the lane policy.
+#   - Body type substitution (replace `Expr.ty` carrying impl-level
+#     uvars with concrete tuple types) so compile-time intrinsics
+#     like `unit_name(x)` and `__strip_unit(x)` see the call-site
+#     types instead of the impl-level uvar. Required for removing
+#     `try_rewrite_show_dim_real`.
+#   - Generic prune (drop the original polymorphic DFn when every
+#     reference has been redirected to a specialisation). Today
+#     pruning would break the function-as-value paths that
+#     `ResolvedCS` does not track.
+#
+# Implementation: walk decls collecting polymorphic DFn entries
+# (those with non-empty tparams), walk `tp.insts` collecting
+# distinct `(name, [Ty])` tuples whose name matches a polymorphic
+# decl, and emit one cloned DFn per tuple with `mangle_name`
+# applied to the name and `tparams = []` (the clone is concrete).
 
 fn monomorphise(tp: TypedProgram) : [Decl] {
-  tp.decls
+  let polys = collect_poly_fns(tp.decls)
+  let tuples = collect_distinct_tuples(tp.insts, polys, [])
+  let specs = generate_specs(polys, tuples, [])
+  list_append(tp.decls, specs)
+}
+
+# Index polymorphic DFn entries by name. A `DFn` with non-empty
+# `tparams` is polymorphic and a candidate for specialisation.
+# Implicit tparams (auto-collected lowercase identifiers, see m7b
+# #13) are folded into the explicit tparam list at type-check time
+# so this single check covers both surface forms.
+type PolyFn = PFn(String, Decl)
+
+fn collect_poly_fns(ds: [Decl]) : [PolyFn] {
+  match ds {
+    [] -> []
+    [d, ...rest] -> match d {
+      DFn(_, name, tparams, _, _, _, _, _, _, _) ->
+        if list_length(tparams) > 0 {
+          [PFn(name, d), ...collect_poly_fns(rest)]
+        } else {
+          collect_poly_fns(rest)
+        }
+      DAttribPure(inner, _, _) -> collect_poly_fns([inner, ...rest])
+      _ -> collect_poly_fns(rest)
+    }
+  }
+}
+
+fn lookup_poly_fn(polys: [PolyFn], name: String) : Option[Decl] {
+  match polys {
+    [] -> None
+    [p, ...rest] -> match p {
+      PFn(n, d) -> if n == name { Some(d) } else { lookup_poly_fn(rest, name) }
+    }
+  }
+}
+
+# Resolved call-site tuples keyed by (name, [Ty]). Stored as a
+# flat list; lookup is O(n × m) but the input is bounded by the
+# program's total call-site count which is small in practice.
+type MonoTuple = MT(String, [Ty])
+
+fn tuple_eq(a: MonoTuple, b: MonoTuple) : Bool =
+  match a { MT(an, atys) -> match b { MT(bn, btys) ->
+    an == bn and ty_list_eq(atys, btys)
+  }}
+
+fn ty_list_eq(a: [Ty], b: [Ty]) : Bool =
+  match a {
+    [] -> match b { [] -> true _ -> false }
+    [ah, ...arest] -> match b {
+      [] -> false
+      [bh, ...brest] -> if ty_eq(ah, bh) { ty_list_eq(arest, brest) } else { false }
+    }
+  }
+
+# `ty_eq` is a structural equality on resolved types. Conservative:
+# `TyVarT` only matches itself by id; refinements / units erase
+# (since `mangle_ty` erases them at codegen time, two tuples that
+# differ only in a refinement collapse to the same specialisation).
+fn ty_eq(a: Ty, b: Ty) : Bool {
+  match a {
+    TyInt -> match b { TyInt -> true _ -> false }
+    TyReal -> match b { TyReal -> true _ -> false }
+    TyBool -> match b { TyBool -> true _ -> false }
+    TyChar -> match b { TyChar -> true _ -> false }
+    TyString -> match b { TyString -> true _ -> false }
+    TyUnit -> match b { TyUnit -> true _ -> false }
+    TyAny -> match b { TyAny -> true _ -> false }
+    TyVarT(ai) -> match b { TyVarT(bi) -> ai == bi _ -> false }
+    TyListT(ai) -> match b { TyListT(bi) -> ty_eq(ai, bi) _ -> false }
+    TyFnT(aps, ar, _) -> match b {
+      TyFnT(bps, br, _) -> ty_list_eq(aps, bps) and ty_eq(ar, br)
+      _ -> false
+    }
+    TyCon(an, atas) -> match b {
+      TyCon(bn, btas) -> an == bn and ty_list_eq(atas, btas)
+      _ -> false
+    }
+    TyDimT(ab, _) -> match b { TyDimT(bb, _) -> ty_eq(ab, bb) _ -> false }
+    TyRefineT(ab, _) -> match b { TyRefineT(bb, _) -> ty_eq(ab, bb) _ -> false }
+  }
+}
+
+fn tuple_in(tuples: [MonoTuple], t: MonoTuple) : Bool {
+  match tuples {
+    [] -> false
+    [h, ...rest] -> if tuple_eq(h, t) { true } else { tuple_in(rest, t) }
+  }
+}
+
+# Reduce `tp.insts` to the distinct `(name, [Ty])` pairs whose
+# `name` matches a polymorphic DFn. Empty tuples (calls to
+# non-polymorphic decls or to local variables) are filtered out.
+# Tuples containing unresolved `TyVarT` slots are also filtered —
+# specialisation requires concrete types.
+fn collect_distinct_tuples(insts: [ResolvedCS], polys: [PolyFn],
+                           acc: [MonoTuple]) : [MonoTuple] {
+  match insts {
+    [] -> list_reverse(acc)
+    [cs, ...rest] -> match cs {
+      RCS(name, _, _, tys) -> {
+        let is_poly = match lookup_poly_fn(polys, name) {
+          Some(_) -> true None -> false
+        }
+        let concrete = list_length(tys) > 0 and tuple_concrete(tys)
+        let mt = MT(name, tys)
+        if is_poly and concrete and not tuple_in(acc, mt) {
+          collect_distinct_tuples(rest, polys, [mt, ...acc])
+        } else {
+          collect_distinct_tuples(rest, polys, acc)
+        }
+      }
+    }
+  }
+}
+
+fn tuple_concrete(tys: [Ty]) : Bool {
+  match tys {
+    [] -> true
+    [t, ...rest] -> if ty_concrete(t) { tuple_concrete(rest) } else { false }
+  }
+}
+
+fn ty_concrete(t: Ty) : Bool {
+  match t {
+    TyVarT(_) -> false
+    TyListT(inner) -> ty_concrete(inner)
+    TyFnT(ps, r, _) -> tuple_concrete(ps) and ty_concrete(r)
+    TyCon(_, tas) -> tuple_concrete(tas)
+    TyDimT(b, _) -> ty_concrete(b)
+    TyRefineT(b, _) -> ty_concrete(b)
+    _ -> true   # primitive types and TyAny are concrete
+  }
+}
+
+# Generate one specialised DFn per distinct tuple. The clone keeps
+# the original body (no `Expr.ty` substitution in this lane — the
+# emitter is type-erased so two specialisations of one source body
+# produce identical C code modulo their top-level symbol). The
+# clone's `tparams` is empty so subsequent passes treat it as a
+# fully-concrete decl. The clone's source position is shared with
+# the original; embedded clauses re-collect under the new
+# `enc_fn = c_sym(mangled, mo)` so their C symbols don't collide
+# with the original's clause symbols.
+fn generate_specs(polys: [PolyFn], tuples: [MonoTuple],
+                  acc: [Decl]) : [Decl] {
+  match tuples {
+    [] -> list_reverse(acc)
+    [t, ...rest] -> match t {
+      MT(name, tys) -> match lookup_poly_fn(polys, name) {
+        None -> generate_specs(polys, rest, acc)
+        Some(d) -> {
+          let spec = specialise_decl(d, tys)
+          generate_specs(polys, rest, [spec, ...acc])
+        }
+      }
+    }
+  }
+}
+
+fn specialise_decl(d: Decl, tys: [Ty]) : Decl {
+  match d {
+    DFn(is_pub, name, _, params, opt_ret, row, body, ln, cl, mo) -> {
+      let mangled = mangle_name(name, tys)
+      DFn(is_pub, mangled, [], params, opt_ret, row, body, ln, cl, mo)
+    }
+    _ -> d
+  }
 }
 
 # ---- m5 — basic Perceus (m5 #1, walker scaffold) ----
