@@ -14,6 +14,38 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 - Versioning infrastructure: tags v0.1.0 → v0.7.2; `bin/kai --version`
   reads `VERSION` dynamically.
 
+## [0.8.1] — 2026-04-29 (resolver — local DFn shadows same-arity protocol op)
+
+**Patch: resolver-local-shadow.** Companion to v0.7.2's resolver-arity
+fix. The pre-resolve dispatcher rewrite now also drops every protocol
+op entry whose `(name, arity)` is provided by a top-level `DFn` in
+the compilation unit. Same-arity collisions like `fn show(stack:
+[Int])` vs `protocol Show { show(x: Self) }` resolve to the local
+fn instead of routing to `__proto_show` and failing with the
+misleading `error: no impl of \`Show\` for type \`List\``. The
+protocol stays reachable through a qualified call (`Show.show(x)`).
+
+### Fixed
+
+- `stage2/compiler.kai`: `lower_protocols` collects local DFn arities
+  from the post-strip decl stream and filters `op_arities` through
+  `filter_shadowed_ops` before the rewrite walks user fns or impl
+  bodies. The arity-1 `pub fn min(xs)` / arity-2 `Ord.min(a, b)`
+  split is unchanged — different arities never get filtered.
+
+### Added
+
+- `examples/protocols/resolver_local_shadow.kai` (+ golden):
+  `fn show(stack: [Int])` shadows `Show.show(x: Self)`; both call
+  forms (`show(xs)` and bare `let f = show`) resolve to the local
+  fn.
+
+### Validation
+
+- selfhost (C + LLVM) byte-identical fixed point.
+- `make test` clean (test-protocols includes the new fixture).
+- `make demos-no-regression` 21 (baseline 21).
+
 ## [0.8.0] — 2026-04-29 (stdlib extras — int↔real builtins, math/real rounding, path module)
 
 **Minor: new user-visible stdlib surface.** Triple-combo lane that
