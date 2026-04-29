@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos demos-verify demos-no-regression selfhost clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos demos-verify demos-no-regression selfhost clean tier0 tier1 daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -63,3 +63,65 @@ clean:
 	$(MAKE) -C stage0 clean
 	$(MAKE) -C stage1 clean
 	$(MAKE) -C stage2 clean
+
+# ---- testing tiers (see docs/testing-tiers.md) ----------------------
+#
+# Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
+# before every commit. If it fails, no commit happens.
+tier0: selfhost demos-no-regression
+	@echo "tier0 OK — selfhost byte-identical, demos baseline holds"
+
+# Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
+# PR description should include the trailing line of this output (or
+# a CI link) — without it, the merge does not happen.
+tier1: test demos-no-regression
+	@echo "tier1 OK — full make test + demos baseline"
+
+# Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
+# not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
+# commit) but a diagnostic opens a lane the next morning.
+daily: tier1 stress-fixtures coverage-probe rc-budget
+	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget"
+
+# Stress fixtures: programs that exercise patterns the per-feature
+# suite does not. Some are aspirational (expected to fail until a
+# specific lane lands); the daily run reports them and the maintainer
+# decides if a green flip is unexpected.
+stress-fixtures: kaic2
+	@set -e; \
+	for f in examples/effects/interp_recursive_walk.kai \
+	         examples/effects/m4c_flow_through.kai; do \
+	  name=$$(basename $$f .kai); \
+	  stage2/kaic2 $$f > /tmp/stress-$$name.c 2> /tmp/stress-$$name.err \
+	    || { echo "stress FAIL $$name (kaic2 errored)"; cat /tmp/stress-$$name.err; exit 1; }; \
+	  cc -std=c99 -I stage0 /tmp/stress-$$name.c -o /tmp/stress-$$name 2>> /tmp/stress-$$name.err \
+	    || { echo "stress FAIL $$name (cc errored)"; cat /tmp/stress-$$name.err; exit 1; }; \
+	  /tmp/stress-$$name > /tmp/stress-$$name.out 2>&1 \
+	    && echo "stress OK $$name" \
+	    || { echo "stress FAIL $$name (binary exit non-zero)"; cat /tmp/stress-$$name.out; exit 1; }; \
+	done
+	@echo "stress-fixtures: aspirational fixtures (expected fail until upstream lane lands):"
+	@echo "  - examples/effects/m8_fiber_discard.kai (expects R4 fix)"
+
+# Coverage probe: every section of the runtime / language docs has a
+# fixture; if not, alarm. Implemented as a shell script so it can run
+# in CI without depending on the kaikai compiler itself.
+coverage-probe:
+	@./tools/coverage-probe.sh
+
+# RC budget: leaked / RSS / wall vs the threshold pinned in
+# docs/perceus-honesty-targets.md. Today the threshold is "no
+# regression from 46.9 M leaked".
+rc-budget: kaic2
+	@KAI_TRACE_RC=1 stage2/kaic2 stage2/compiler.kai > /dev/null 2> /tmp/rc.log; \
+	leaked=$$(grep -E "alloc_total" /tmp/rc.log | head -1 | sed 's/.*leaked=\([0-9]*\).*/\1/'); \
+	if [ -z "$$leaked" ]; then \
+	  echo "rc-budget SKIP — KAI_TRACE_RC trace empty (kaic2 not built with trace)"; \
+	  exit 0; \
+	fi; \
+	threshold=50000000; \
+	if [ "$$leaked" -gt "$$threshold" ]; then \
+	  echo "rc-budget FAIL — leaked $$leaked > threshold $$threshold (regression)"; \
+	  exit 1; \
+	fi; \
+	echo "rc-budget OK — leaked $$leaked <= threshold $$threshold"
