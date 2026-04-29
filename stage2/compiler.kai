@@ -14649,6 +14649,23 @@ fn canon_tvars_ty(t: Ty, m: [IntPair]) : Ty {
   }
 }
 
+# Canonicalise a list of ResolvedCS records by applying the bound-id
+# redirect maps to each CS's tys / units. Mirrors the canon_*_expr
+# walkers but operates on the per-decl call-site list.
+fn canon_resolved_css(css: [ResolvedCS], tv_map: [IntPair],
+                       uv_map: [IntPair]) : [ResolvedCS] {
+  match css {
+    [] -> []
+    [cs, ...rest] -> match cs {
+      RCS(nm, line, col, tys, units) ->
+        [RCS(nm, line, col,
+             map(tys, (t) => canon_uvars_ty(canon_tvars_ty(t, tv_map), uv_map)),
+             map(units, (u) => canon_uvars_unit(u, uv_map))),
+         ...canon_resolved_css(rest, tv_map, uv_map)]
+    }
+  }
+}
+
 fn tparam_id_split_loop(tparams: [String], ti: Int, ui: Int,
                         tacc: [Int], uacc: [Int]) : TParamSplit {
   match tparams {
@@ -19530,7 +19547,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
       } else { () }
-      let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub)
+      let resolved0 = resolve_callsites(list_reverse(st2.insts), st2.sub)
       let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub)
       # m12.8.x phase 2 (Bug 2): apply the final substitution to every
       # `Expr.ty` annotation in the body so the post-inference protocol-
@@ -19556,6 +19573,16 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
         final_body0
       } else {
         canon_uvars_expr(canon_tvars_expr(final_body0, canon_tvars), canon_uvars)
+      }
+      # Apply the same canonicalisation to the resolved CSs so the
+      # body subst map (keyed on bound ids 0..n-1) and the recorded
+      # CS tys/units agree. Without this, an inner-call CS in a
+      # polymorphic-flow-through position records the chain endpoint
+      # id and the substitution becomes a no-op for transitive specs.
+      let resolved = if list_length(canon_uvars) == 0 and list_length(canon_tvars) == 0 {
+        resolved0
+      } else {
+        canon_resolved_css(resolved0, canon_tvars, canon_uvars)
       }
       # m7e §24: main-row inference. When `main` ships without a
       # declared row, write the body-performed row back into the
@@ -20489,232 +20516,31 @@ fn monomorphise(tp: TypedProgram) : [Decl] {
   # `resolve_protocol_calls` renames `__proto_<op>(arg)` call sites
   # to `__pimpl_<P>_<T>_<op>(arg)` AFTER `infer_program` has populated
   # tp.insts, so insts are keyed on the dispatcher names — calls in
-  # the rewritten AST cannot find their matching CS by name. Recover
-  # by synthesising one CS per `__pimpl_*` call site, unifying the
-  # impl's formal param types with the actual arg types to extract
-  # both type-tparam and unit-tparam bindings.
-  let recovered = recover_protoimpl_insts(tp.decls, polys, tp.insts)
-  let insts = list_append(tp.insts, recovered)
-  let initial_tuples = collect_distinct_tuples(insts, polys, [])
+  # the rewritten AST cannot find their matching CS by name. Discover
+  # the impl-side tuples by walking the decl bodies and synthesising
+  # one MonoTuple per `__pimpl_*` call site (using
+  # `synthesize_inst_for_decl` to unify formal vs actual types). The
+  # rewrite walker uses the same path inline so each call site
+  # retargets to its own per-(tys, units) specialisation, even when
+  # multiple calls share a (line, col) under string interpolation.
+  let typer_tuples = collect_distinct_tuples(tp.insts, polys, [])
+  let impl_tuples = collect_impl_tuples_in_decls(tp.decls, polys, typer_tuples)
+  let initial_tuples = list_append(typer_tuples, impl_tuples)
   # Pre-mono rewrite over the whole program, retargeting every
   # concrete call site whose tuple matches a known specialisation.
-  let rewritten = rewrite_callsites_decls(tp.decls, insts, initial_tuples)
+  let rewritten = rewrite_callsites_decls_full(tp.decls, tp.insts, initial_tuples, polys)
   # Iterate spec generation to fixpoint. Per-spec body subst can
   # promote previously-polymorphic flow-through call sites to
   # concrete tuples (e.g., `f__mono__Int`'s body calls `g(x : Int)`
   # which now mangles to `g__mono__Int`); those new tuples enter
   # the worklist and produce additional specs.
-  let r = generate_specs_iter(polys, initial_tuples, insts, [], initial_tuples)
+  let r = generate_specs_iter(polys, initial_tuples, tp.insts, [], initial_tuples)
   match r {
     GenSpecsOut(specs, _) -> list_append(rewritten, specs)
   }
 }
 
 type GenSpecsResult = GenSpecsOut([Decl], [MonoTuple])
-
-# ---- m4c Phase 3 — protocol-impl inst recovery ----
-#
-# `resolve_protocol_calls` runs AFTER `infer_program`, rewriting
-# `__proto_<op>(arg)` to `__pimpl_<P>_<T>_<op>(arg)` in the AST. The
-# typer therefore recorded a CS for the dispatcher (`__proto_<op>`)
-# but not for the impl. This walker visits each ECall(EVar(name))
-# whose name matches a polymorphic DFn and synthesises a CS by
-# unifying the impl's formal param types against the actual arg
-# types — extracting bindings for both type-tparam ids (TyVarT) and
-# unit-tparam ids (UVar). Calls that already have a matching CS in
-# `tp.insts` are skipped so the walker is idempotent for non-impl
-# calls.
-fn recover_protoimpl_insts(ds: [Decl], polys: [PolyFn],
-                            existing: [ResolvedCS]) : [ResolvedCS] =
-  list_reverse(recover_in_decls(ds, polys, existing, []))
-
-fn recover_in_decls(ds: [Decl], polys: [PolyFn], existing: [ResolvedCS],
-                     acc: [ResolvedCS]) : [ResolvedCS] {
-  match ds {
-    [] -> acc
-    [d, ...rest] -> {
-      let acc1 = match d {
-        DFn(_, _, _, _, _, _, body, _, _, _) ->
-          recover_in_expr(body, polys, existing, acc)
-        DTest(_, body, _, _) ->
-          recover_in_expr(body, polys, existing, acc)
-        _ -> acc
-      }
-      recover_in_decls(rest, polys, existing, acc1)
-    }
-  }
-}
-
-fn recover_in_expr(e: Expr, polys: [PolyFn], existing: [ResolvedCS],
-                    acc: [ResolvedCS]) : [ResolvedCS] {
-  let acc1 = recover_in_kind(e.kind, polys, existing, acc)
-  match e.kind {
-    ECall(callee, args_) -> match callee.kind {
-      EVar(name) -> match lookup_poly_fn(polys, name) {
-        Some(d) -> {
-          let already = match find_mono_inst(existing, name, callee.line, callee.col) {
-            Some(_) -> true None -> false
-          }
-          let already_acc = match find_mono_inst(acc1, name, callee.line, callee.col) {
-            Some(_) -> true None -> false
-          }
-          if already or already_acc { acc1 }
-          else {
-            match synthesize_inst_for_decl(d, args_, callee.line, callee.col) {
-              Some(cs) -> [cs, ...acc1]
-              None -> acc1
-            }
-          }
-        }
-        None -> acc1
-      }
-      _ -> acc1
-    }
-    _ -> acc1
-  }
-}
-
-fn recover_in_kind(k: ExprKind, polys: [PolyFn], existing: [ResolvedCS],
-                    acc: [ResolvedCS]) : [ResolvedCS] {
-  match k {
-    EInt(_)        -> acc
-    EReal(_)       -> acc
-    EBool(_)       -> acc
-    EChar(_)       -> acc
-    EStr(_, _)     -> acc
-    EUnit          -> acc
-    EVar(_)        -> acc
-    EUnder         -> acc
-    EPlaceholder   -> acc
-    EHole(_)       -> acc
-    ETodo(_)       -> acc
-    EVariantsOf(_, _) -> acc
-    EModCall(_, _) -> acc
-    ECall(callee, args_) -> {
-      let acc1 = recover_in_expr(callee, polys, existing, acc)
-      recover_in_args(args_, polys, existing, acc1)
-    }
-    EField(base, _)   -> recover_in_expr(base, polys, existing, acc)
-    EIndex(a, b)      -> recover_in_expr(b, polys, existing,
-                          recover_in_expr(a, polys, existing, acc))
-    EBinop(_, a, b)   -> recover_in_expr(b, polys, existing,
-                          recover_in_expr(a, polys, existing, acc))
-    EUnop(_, x)       -> recover_in_expr(x, polys, existing, acc)
-    EIf(c, t_, eo)    -> {
-      let a1 = recover_in_expr(c, polys, existing, acc)
-      let a2 = recover_in_expr(t_, polys, existing, a1)
-      match eo { Some(eb) -> recover_in_expr(eb, polys, existing, a2) None -> a2 }
-    }
-    EMatch(scr, arms) -> {
-      let a1 = recover_in_expr(scr, polys, existing, acc)
-      recover_in_arms(arms, polys, existing, a1)
-    }
-    ELambda(_, b)     -> recover_in_expr(b, polys, existing, acc)
-    ERecordLit(_, fs) -> recover_in_fields(fs, polys, existing, acc)
-    EList(els)        -> recover_in_elems(els, polys, existing, acc)
-    ERange(a, b, opt_step) -> {
-      let a1 = recover_in_expr(a, polys, existing, acc)
-      let a2 = recover_in_expr(b, polys, existing, a1)
-      match opt_step { Some(e3) -> recover_in_expr(e3, polys, existing, a2) None -> a2 }
-    }
-    EBlock(stmts, tail) -> {
-      let a1 = recover_in_stmts(stmts, polys, existing, acc)
-      match tail { Some(e3) -> recover_in_expr(e3, polys, existing, a1) None -> a1 }
-    }
-    EPipe(a, b)      -> recover_in_expr(b, polys, existing,
-                          recover_in_expr(a, polys, existing, acc))
-    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-      let a1 = recover_in_expr(body, polys, existing, acc)
-      let a2 = match init_opt { Some(e3) -> recover_in_expr(e3, polys, existing, a1) None -> a1 }
-      let a3 = recover_in_clauses(clauses, polys, existing, a2)
-      match ret_opt {
-        Some(r) -> match r { HR(_, b, _, _) -> recover_in_expr(b, polys, existing, a3) }
-        None -> a3
-      }
-    }
-    ELitUnit(inner, _) -> recover_in_expr(inner, polys, existing, acc)
-    EBang(inner)       -> recover_in_expr(inner, polys, existing, acc)
-  }
-}
-
-fn recover_in_args(args: [Expr], polys: [PolyFn], existing: [ResolvedCS],
-                    acc: [ResolvedCS]) : [ResolvedCS] {
-  match args {
-    [] -> acc
-    [a, ...rest] -> recover_in_args(rest, polys, existing,
-                      recover_in_expr(a, polys, existing, acc))
-  }
-}
-
-fn recover_in_arms(arms: [Arm], polys: [PolyFn], existing: [ResolvedCS],
-                    acc: [ResolvedCS]) : [ResolvedCS] {
-  match arms {
-    [] -> acc
-    [arm, ...rest] -> match arm {
-      Arm(_, g, b) -> {
-        let a1 = match g { Some(ge) -> recover_in_expr(ge, polys, existing, acc) None -> acc }
-        let a2 = recover_in_expr(b, polys, existing, a1)
-        recover_in_arms(rest, polys, existing, a2)
-      }
-    }
-  }
-}
-
-fn recover_in_fields(fs: [FieldInit], polys: [PolyFn], existing: [ResolvedCS],
-                      acc: [ResolvedCS]) : [ResolvedCS] {
-  match fs {
-    [] -> acc
-    [f, ...rest] -> match f {
-      FI(_, v) -> recover_in_fields(rest, polys, existing,
-                    recover_in_expr(v, polys, existing, acc))
-    }
-  }
-}
-
-fn recover_in_elems(els: [ListElem], polys: [PolyFn], existing: [ResolvedCS],
-                     acc: [ResolvedCS]) : [ResolvedCS] {
-  match els {
-    [] -> acc
-    [el, ...rest] -> {
-      let acc1 = match el {
-        ElPlain(x)  -> recover_in_expr(x, polys, existing, acc)
-        ElSpread(x) -> recover_in_expr(x, polys, existing, acc)
-      }
-      recover_in_elems(rest, polys, existing, acc1)
-    }
-  }
-}
-
-fn recover_in_stmts(stmts: [Stmt], polys: [PolyFn], existing: [ResolvedCS],
-                     acc: [ResolvedCS]) : [ResolvedCS] {
-  match stmts {
-    [] -> acc
-    [s, ...rest] -> {
-      let acc1 = match s {
-        SLet(_, _, rhs)            -> recover_in_expr(rhs, polys, existing, acc)
-        SAssert(c, m)              -> match m { Some(me) -> recover_in_expr(me, polys, existing, recover_in_expr(c, polys, existing, acc)) None -> recover_in_expr(c, polys, existing, acc) }
-        SExprStmt(x)               -> recover_in_expr(x, polys, existing, acc)
-        SIndexAssign(b, i, v, _, _)-> recover_in_expr(v, polys, existing,
-                                        recover_in_expr(i, polys, existing,
-                                          recover_in_expr(b, polys, existing, acc)))
-        SVar(_, _, rhs, _, _)      -> recover_in_expr(rhs, polys, existing, acc)
-        SUse(_, _, _)              -> acc
-      }
-      recover_in_stmts(rest, polys, existing, acc1)
-    }
-  }
-}
-
-fn recover_in_clauses(cs: [HClause], polys: [PolyFn], existing: [ResolvedCS],
-                       acc: [ResolvedCS]) : [ResolvedCS] {
-  match cs {
-    [] -> acc
-    [c, ...rest] -> match c {
-      HC(_, _, b, _, _) -> recover_in_clauses(rest, polys, existing,
-                            recover_in_expr(b, polys, existing, acc))
-    }
-  }
-}
 
 # Synthesise a ResolvedCS for a call to a polymorphic DFn by
 # walking the impl's formal param types in parallel with the actual
@@ -21164,7 +20990,7 @@ fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
     # CS, apply sm, and collect concrete poly tuples not yet known.
     let new_tuples = discover_new_tuples_decl(spec1, insts, polys, all_tuples, sm)
     let updated_tuples = list_append(all_tuples, new_tuples)
-    let spec2 = rewrite_callsites_decl_sm(spec1, insts, updated_tuples, sm)
+    let spec2 = rewrite_callsites_decl_sm(spec1, insts, updated_tuples, polys, sm)
     SEO(spec2, new_tuples)
   } }
 }
@@ -21173,6 +20999,39 @@ fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
 # applying `sm` to each call site's recorded `(tys, units)`. Used
 # only by `emit_spec` for transitive spec discovery; the pre-mono
 # rewrite uses the empty sm so this is a no-op for it.
+# Pre-mono pass: walk every decl looking for `__pimpl_*`-style impl
+# calls (and any other call whose tparam tuple isn't in the typer's
+# `tp.insts`) and synthesise the per-call tuple via
+# `synthesize_inst_for_decl`. With no SubstMap the resolver returns
+# the actual call-site tuple; only concrete tuples enter the spec
+# worklist. This is what gives `print("...#{x}...#{y}...")` distinct
+# `__pimpl_Show_<T>_show__umono__<u>` specialisations even though
+# the interpolation desugar collapses every show callee onto the
+# enclosing print's source position.
+fn collect_impl_tuples_in_decls(ds: [Decl], polys: [PolyFn],
+                                 existing: [MonoTuple]) : [MonoTuple] {
+  let r = collect_impl_tuples_in_decls_loop(ds, polys, existing, [])
+  list_reverse(r)
+}
+
+fn collect_impl_tuples_in_decls_loop(ds: [Decl], polys: [PolyFn],
+                                      existing: [MonoTuple],
+                                      acc: [MonoTuple]) : [MonoTuple] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> {
+      let acc1 = match d {
+        DFn(_, _, _, _, _, _, body, _, _, _) ->
+          discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc)
+        DTest(_, body, _, _) ->
+          discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc)
+        _ -> acc
+      }
+      collect_impl_tuples_in_decls_loop(rest, polys, existing, acc1)
+    }
+  }
+}
+
 fn discover_new_tuples_decl(d: Decl, insts: [ResolvedCS], polys: [PolyFn],
                              existing: [MonoTuple], sm: SubstMap) : [MonoTuple] {
   match d {
@@ -21189,23 +21048,26 @@ fn discover_new_tuples_expr(e: Expr, insts: [ResolvedCS], polys: [PolyFn],
                              acc: [MonoTuple]) : [MonoTuple] {
   let acc1 = discover_new_tuples_kind(e.kind, insts, polys, existing, sm, acc)
   match e.kind {
-    ECall(callee, _) -> match callee.kind {
-      EVar(name) -> match find_mono_inst(insts, name, callee.line, callee.col) {
-        Some(p) -> match p {
-          MIPair(tys0, units0) -> {
-            let tys = map(tys0, (t) => subst_ty(t, sm))
-            let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
-            let is_poly = match lookup_poly_fn(polys, name) {
-              Some(_) -> true None -> false
+    ECall(callee, args_) -> match callee.kind {
+      EVar(name) -> {
+        let is_user_poly = match lookup_poly_fn(polys, name) {
+          Some(_) -> true None -> false
+        }
+        if not is_user_poly { acc1 }
+        else {
+          match resolve_call_inst(insts, polys, name, callee, args_, sm) {
+            Some(p) -> match p {
+              MIPair(tys, units) -> {
+                let any_slot = list_length(tys) > 0 or list_length(units) > 0
+                let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
+                let mt = MT(name, tys, units)
+                let is_new = concrete and not tuple_in(existing, mt) and not mt_in_acc(acc1, mt)
+                if is_new { [mt, ...acc1] } else { acc1 }
+              }
             }
-            let any_slot = list_length(tys) > 0 or list_length(units) > 0
-            let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
-            let mt = MT(name, tys, units)
-            let is_new = is_poly and concrete and not tuple_in(existing, mt) and not mt_in_acc(acc1, mt)
-            if is_new { [mt, ...acc1] } else { acc1 }
+            None -> acc1
           }
         }
-        None -> acc1
       }
       _ -> acc1
     }
@@ -21375,51 +21237,86 @@ fn discover_new_tuples_clauses(cs: [HClause], insts: [ResolvedCS], polys: [PolyF
 # internal polymorphic-flow-through calls retarget to their spec
 # mangled names.
 fn rewrite_callsites_decl_sm(d: Decl, insts: [ResolvedCS],
-                              tuples: [MonoTuple], sm: SubstMap) : Decl {
+                              tuples: [MonoTuple], polys: [PolyFn],
+                              sm: SubstMap) : Decl {
   match d {
     DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
       DFn(pub_, n, tps, ps, ret, row,
-          rewrite_callsites_expr_sm(body, insts, tuples, sm), l, c, mo)
+          rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c, mo)
     DTest(desc, body, l, c) ->
-      DTest(desc, rewrite_callsites_expr_sm(body, insts, tuples, sm), l, c)
+      DTest(desc, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c)
     _ -> d
   }
 }
 
 fn rewrite_callsites_expr_sm(e: Expr, insts: [ResolvedCS],
-                              tuples: [MonoTuple], sm: SubstMap) : Expr =
-  Expr { kind: rewrite_callsites_kind_sm(e.kind, insts, tuples, sm),
+                              tuples: [MonoTuple], polys: [PolyFn],
+                              sm: SubstMap) : Expr =
+  Expr { kind: rewrite_callsites_kind_sm(e.kind, insts, tuples, polys, sm),
          line: e.line, col: e.col, ty: e.ty }
 
 fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
-                              tuples: [MonoTuple], sm: SubstMap) : ExprKind {
+                              tuples: [MonoTuple], polys: [PolyFn],
+                              sm: SubstMap) : ExprKind {
   match k {
     ECall(callee, args_) -> match callee.kind {
       EVar(name) -> {
-        let new_args = map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, sm))
-        match find_mono_inst(insts, name, callee.line, callee.col) {
-          Some(p) -> match p {
-            MIPair(tys0, units0) -> {
-              let tys = map(tys0, (t) => subst_ty(t, sm))
-              let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
-              if tuple_in(tuples, MT(name, tys, units)) {
-                let mangled = mangle_name(name, tys, units)
-                let new_callee = Expr { kind: EVar(mangled),
-                                         line: callee.line, col: callee.col,
-                                         ty: callee.ty }
-                ECall(new_callee, new_args)
-              } else {
-                ECall(callee, new_args)
-              }
+        let new_args = map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, polys, sm))
+        match resolve_call_inst(insts, polys, name, callee, args_, sm) {
+          Some(MIPair(tys, units)) ->
+            if tuple_in(tuples, MT(name, tys, units)) {
+              let mangled = mangle_name(name, tys, units)
+              let new_callee = Expr { kind: EVar(mangled),
+                                       line: callee.line, col: callee.col,
+                                       ty: callee.ty }
+              ECall(new_callee, new_args)
+            } else {
+              ECall(callee, new_args)
             }
-          }
           None -> ECall(callee, new_args)
         }
       }
-      _ -> ECall(rewrite_callsites_expr_sm(callee, insts, tuples, sm),
-                  map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, sm)))
+      _ -> ECall(rewrite_callsites_expr_sm(callee, insts, tuples, polys, sm),
+                  map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, polys, sm)))
     }
-    _ -> map_expr_kind(k, (sub) => rewrite_callsites_expr_sm(sub, insts, tuples, sm))
+    _ -> map_expr_kind(k, (sub) => rewrite_callsites_expr_sm(sub, insts, tuples, polys, sm))
+  }
+}
+
+# Resolve the (tys, units) tuple for an `ECall(EVar(name), args)`
+# call site, applying `sm`. The lookup prefers the typer-recorded
+# RCS at (name, callee.line, callee.col) when it exists;
+# falls back to inline synthesis from `args`' types when no inst
+# was recorded (e.g., `__pimpl_*` names produced by
+# `resolve_protocol_calls` AFTER tp.insts was populated). The
+# inline synth path uses `synthesize_inst_for_decl` to extract
+# bindings by unifying the polymorphic DFn's formal param types
+# with the actual arg types. This also disambiguates multiple impl
+# calls that coalesce onto one source position under string
+# interpolation (each `#{x}` becomes `__pimpl_Show_<T>_show(x)` at
+# the same outer (line, col) for distinct `x.ty`).
+fn resolve_call_inst(insts: [ResolvedCS], polys: [PolyFn], name: String,
+                      callee: Expr, args_: [Expr],
+                      sm: SubstMap) : Option[MonoInstPair] {
+  match find_mono_inst(insts, name, callee.line, callee.col) {
+    Some(MIPair(tys0, units0)) -> {
+      let tys = map(tys0, (t) => subst_ty(t, sm))
+      let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
+      Some(MIPair(tys, units))
+    }
+    None -> match lookup_poly_fn(polys, name) {
+      Some(d) -> match synthesize_inst_for_decl(d, args_, callee.line, callee.col) {
+        Some(rcs) -> match rcs {
+          RCS(_, _, _, tys0, units0) -> {
+            let tys = map(tys0, (t) => subst_ty(t, sm))
+            let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
+            Some(MIPair(tys, units))
+          }
+        }
+        None -> None
+      }
+      None -> None
+    }
   }
 }
 
@@ -21486,13 +21383,9 @@ fn specialise_decl(d: Decl, tys: [Ty], units: [UnitExprT]) : Decl {
 # whose tuples still contain `TyVarT` / `UVar` (polymorphic flow-
 # through) leave the callee alone — those become concrete only inside
 # specs, where `rewrite_callsites_decl_sm` runs with the spec's map.
-fn rewrite_callsites_decls(ds: [Decl], insts: [ResolvedCS],
-                            tuples: [MonoTuple]) : [Decl] =
-  map(ds, (d) => rewrite_callsites_decl(d, insts, tuples))
-
-fn rewrite_callsites_decl(d: Decl, insts: [ResolvedCS],
-                           tuples: [MonoTuple]) : Decl =
-  rewrite_callsites_decl_sm(d, insts, tuples, subst_map_empty())
+fn rewrite_callsites_decls_full(ds: [Decl], insts: [ResolvedCS],
+                                 tuples: [MonoTuple], polys: [PolyFn]) : [Decl] =
+  map(ds, (d) => rewrite_callsites_decl_sm(d, insts, tuples, polys, subst_map_empty()))
 
 type MonoInstPair = MIPair([Ty], [UnitExprT])
 
