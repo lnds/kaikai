@@ -14,6 +14,112 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 - Versioning infrastructure: tags v0.1.0 → v0.7.2; `bin/kai --version`
   reads `VERSION` dynamically.
 
+## [0.10.0] — 2026-04-29 (m4c #4 — clause-info plumbing + minimal real specialisation)
+
+**Minor: monomorphisation unblocked.** The `monomorphise` pipeline
+pass shipped as identity since stage 2 m4c #1 (early 2026) because
+duplicating a polymorphic body that contained an `EHandle` would
+mint colliding C symbols for the embedded clauses and the linker
+would reject the binary. This release threads the **enclosing fn
+name** through the clause-info plumbing so each clause symbol
+carries a post-monomorph prefix (`_kai_<enc>__clause_<l>_<c>_<op>`),
+and flips `monomorphise` from identity to a minimal real
+specialisation pass that emits one cloned `DFn` per distinct
+call-site type tuple. The collision-avoidance is exercised
+end-to-end by the new
+`examples/effects/m4c_handler_in_body.kai` regression demo (a
+polymorphic body with an embedded `EHandle` called at two distinct
+(a, b) tuples produces three distinct clause C symbols and the
+binary links and runs on both backends). One of the three
+"structural lies" called out in the 2026-04-28 audit
+(`docs/runtime-debt-2026-04-28.md`) — that monomorphisation didn't
+actually monomorphise — is closed in scope; full call-site rewrite
+(redirect every `EVar` to its specialised name) and body type
+substitution (which removes the `try_rewrite_show_dim_real`
+shortcut around `Show<Real<u>>`) stay deferred for a follow-up
+lane. Both follow-ups are pinned in
+`docs/m4c-real-specialisation.md` with concrete shape + cost.
+
+### Added
+
+- `ClauseInfo` carries an 8th `String` field with the post-monomorph
+  enclosing fn name. The collect walker (`lc_record_clauses`,
+  `collect_decl`, `collect_expr`'s `ELambda` arm) populates it from
+  `LamCollect.cur_enc_fn`, swapping the value at scope boundaries.
+- `clause_fn_name(enc_fn, line, col, op)` mints the prefixed C
+  symbol; both the install path
+  (`emit_clause_assignments`/`llvm_emit_handle_clause_assigns`) and
+  the body emit path (`emit_clause_sig`/`emit_clause_body`/
+  `llvm_emit_clause_body`) feed it the same `enc_fn` so install and
+  body symbols match.
+- C emit family: `cls: [ClauseInfo]` threaded alongside `lams` and
+  read by `emit_clause_assignments` via `lookup_clause_enc_fn` to
+  find the matching enc_fn at install.
+- LLVM emit: `LlvmEmit` gains a `cls` field populated once at the
+  top of `emit_program_llvm`; `llvm_emit_handle` reads `e.cls` for
+  the same lookup.
+- `monomorphise` flips from identity to real: walks polymorphic
+  DFns (non-empty tparams), gathers distinct concrete (name, [Ty])
+  tuples from `tp.insts`, and emits one cloned DFn per tuple with
+  `mangle_name` applied and `tparams = []`.
+- New regression demos
+  `examples/effects/m4c_run_with.kai` and
+  `examples/effects/m4c_handler_in_body.kai`. The first exercises a
+  polymorphic helper called at two tuples under a single handler
+  (call-site handler, no clauses inside the polymorphic body); the
+  second exercises the actual collision case (handler installed
+  inside the polymorphic body, two specialisations).
+- New `make -C stage2 test-m4c` target wires both demos into the
+  umbrella `test` target; gates assert both backends emit + link +
+  run, the C output carries the expected mangled symbols, and the
+  collision-prevented clause symbols are present.
+
+### Fixed
+
+- Monomorphisation no longer ships as identity. Polymorphic decls
+  with concrete call-site type tuples now produce specialised C
+  copies. The change is selfhost-byte-identical because
+  `compiler.kai` itself has no `EHandle` blocks (the prefixed
+  naming is a no-op for self-compilation) and no polymorphic decls
+  with concrete instantiations recorded against them at the same
+  source position twice.
+
+### Deferred
+
+- **Call-site rewrite**: today the specialisations are emitted
+  alongside the polymorphic original and the original is what gets
+  called. The C linker's DCE may strip the unused symbols at link
+  time but they ARE in the source. Real call-site rewrite
+  (`ECall(EVar(name)) → ECall(EVar(mangled))`) needs a deep AST
+  walker shaped like `rename_proto_calls_*` (~300 LOC of
+  mostly-mechanical recursion). Pinned for design review per the
+  lane's design-decision policy.
+- **Body type substitution**: required to remove the
+  `try_rewrite_show_dim_real` workaround around `Show<Real<u>>`.
+  The impl body's `unit_name(x)` reads the impl-level uvar after
+  identity monomorphisation; substituting Expr.ty across the
+  cloned body lets the parametric impl produce the unit suffix
+  natively. Coupled with the call-site rewrite — both must land
+  together, so deferred together.
+- **Generic prune**: dropping the polymorphic original once every
+  reference is redirected. Today pruning would break
+  function-as-value patterns the `ResolvedCS` table doesn't index.
+
+### Documentation
+
+- `docs/m4c-real-specialisation.md` — new design / lane doc.
+  Covers what landed in Phase 1 (plumbing) and Phase 2 minimal
+  (specialisation generation), what is deferred (call-site
+  rewrite, body type substitution, generic prune), the gate
+  evidence, and the measurements.
+- `docs/m5x-followup.md` §3 marked LANDED with the m4c #4
+  reference.
+- `docs/known-regressions.md` — pinned R-interp (pre-existing
+  stage-2 codegen panic on `examples/minimal/interp.kai`) and
+  R-m8x2 (effect-runtime stack overflow under default ulimit on
+  `examples/effects/m8x_2_yield_interleave.kai`). Both pre-existing
+  on `main` HEAD, out of m4c lane scope.
+
 ## [0.9.2] — 2026-04-29 (var sugar — didactic errors + nested handler closure capture)
 
 **Patch: var sugar correctness.** Three changes that close a
