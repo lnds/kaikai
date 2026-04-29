@@ -14100,11 +14100,65 @@ fn mangle_ty(t: Ty) : String {
   }
 }
 
-fn mangle_name(name: String, tys: [Ty]) : String {
-  match tys {
-    [] -> name
-    [h, ...rest] -> concat_all([name, "__mono__",
-                                join_with(map(tys, mangle_ty), "__")])
+fn mangle_name(name: String, tys: [Ty], units: [UnitExprT]) : String {
+  let ty_part = match tys {
+    [] -> ""
+    [h, ...rest] -> concat_all(["__mono__", join_with(map(tys, mangle_ty), "__")])
+  }
+  # m4c Phase 3: encode the unit-tparam tuple after the type-tparam
+  # tuple. Empty units means no per-unit specialisation (the common
+  # case). For `impl[u: Unit] Show for Real<u>` and friends, two
+  # specs binding `u` to USD and EUR mangle distinctly via
+  # `__umono__USD` / `__umono__EUR`. The rendering uses the same
+  # canonical-unit display as `unit_name(x)` so emit and rewrite
+  # agree on the suffix string.
+  let u_part = match units {
+    [] -> ""
+    [h, ...rest] -> concat_all(["__umono__", join_with(map(units, mangle_unit), "__")])
+  }
+  if string_length(ty_part) == 0 and string_length(u_part) == 0 {
+    name
+  } else {
+    concat_all([name, ty_part, u_part])
+  }
+}
+
+# Render a unit canonically for mangling. `unit_one` (i.e. no unit)
+# emits "1" so a `Real<1>` spec sits in its own slot. Bare unit-vars
+# only appear in pre-monomorphisation insts and would not key a
+# real spec; we still emit a stable "TUVAR" sentinel so any such
+# slip-through is observable rather than silently colliding with a
+# concrete unit.
+fn mangle_unit(u: UnitExprT) : String {
+  let cu = unit_canon(u)
+  match cu {
+    UVar(_) -> "TUVAR"
+    UOne    -> "1"
+    _       -> mangle_unit_ident(unit_expr_display(cu))
+  }
+}
+
+# Replace mangle-unsafe characters in the canonical unit display with
+# C-identifier-safe sentinels. `*` -> `_x_`, `/` -> `_d_`, `^` ->
+# `_p_`, `(`/`)` -> `_l_` / `_r_`. Spaces, if any, become `_s_`.
+fn mangle_unit_ident(s: String) : String =
+  mangle_unit_ident_loop(s, 0, string_length(s), [])
+
+fn mangle_unit_ident_loop(s: String, i: Int, n: Int, acc: [String]) : String {
+  if i >= n { concat_all(list_reverse(acc)) }
+  else {
+    let c = match char_at(s, i) {
+      Some(ch) -> ch
+      None     -> ' '
+    }
+    let piece = if c == '*' { "_x_" }
+                else if c == '/' { "_d_" }
+                else if c == '^' { "_p_" }
+                else if c == '(' { "_l_" }
+                else if c == ')' { "_r_" }
+                else if c == ' ' { "_s_" }
+                else { string_slice(s, i, 1) }
+    mangle_unit_ident_loop(s, i + 1, n, [piece, ...acc])
   }
 }
 
@@ -14446,6 +14500,154 @@ type TParamSplit = { tvars: [Int], uvars: [Int] }
 
 fn tparam_id_split(tparams: [String]) : TParamSplit =
   tparam_id_split_loop(tparams, 0, 0, [], [])
+
+# Count how many tparams in `tparams` are unit-kind. Used by
+# `infer_decl` to advance the inferencer's unit_fresh counter past
+# the impl-level bound uvar ids so freshly minted uvars during body
+# type-checking do not alias them.
+fn tparam_unit_count(tparams: [String]) : Int =
+  tparam_unit_count_loop(tparams, 0)
+
+fn tparam_unit_count_loop(tparams: [String], acc: Int) : Int {
+  match tparams {
+    [] -> acc
+    [n, ...rest] -> {
+      let next = if tp_kind_is_unit(n) { acc + 1 } else { acc }
+      tparam_unit_count_loop(rest, next)
+    }
+  }
+}
+
+# m4c Phase 3: build a `[(endpoint_id, bound_id)]` redirect map for
+# uvar canonicalisation. For each bound uvar id, chase the
+# substitution to find the chain endpoint. If the endpoint is a
+# different UVar id, record `(endpoint -> bound)` so subsequent
+# walkers can rewrite the body's `Expr.ty` to use the bound id (the
+# id the body subst map keys on). If the endpoint resolves to a
+# concrete unit (USym / UMul / ...), no redirect is needed — the
+# body's `Expr.ty` already pinpoints a non-generic call site.
+type IntPair = IPair(Int, Int)
+
+fn build_uvar_canon_map(bound: [Int], sub: Subst, acc: [IntPair]) : [IntPair] {
+  match bound {
+    [] -> list_reverse(acc)
+    [b, ...rest] -> {
+      let resolved = apply_unit(sub, UVar(b))
+      let acc1 = match resolved {
+        UVar(f) -> if f != b { [IPair(f, b), ...acc] } else { acc }
+        _ -> acc
+      }
+      build_uvar_canon_map(rest, sub, acc1)
+    }
+  }
+}
+
+fn build_tvar_canon_map(bound: [Int], sub: Subst, acc: [IntPair]) : [IntPair] {
+  match bound {
+    [] -> list_reverse(acc)
+    [b, ...rest] -> {
+      let resolved = apply_ty(sub, TyVarT(b))
+      let acc1 = match resolved {
+        TyVarT(f) -> if f != b { [IPair(f, b), ...acc] } else { acc }
+        _ -> acc
+      }
+      build_tvar_canon_map(rest, sub, acc1)
+    }
+  }
+}
+
+fn intpair_lookup(ps: [IntPair], k: Int) : Option[Int] {
+  match ps {
+    [] -> None
+    [h, ...rest] -> match h {
+      IPair(a, b) -> if a == k { Some(b) } else { intpair_lookup(rest, k) }
+    }
+  }
+}
+
+# Walkers `canon_uvars_*` / `canon_tvars_*` rewrite `Expr.ty` in
+# place by replacing `UVar(endpoint)` / `TyVarT(endpoint)` with the
+# bound id per the redirect map. Recurse via subst_expr-style
+# structural traversal. The map is small (≤ #bound-tparams) so
+# linear lookups are cheap.
+fn canon_uvars_expr(e: Expr, m: [IntPair]) : Expr {
+  let ty1 = match e.ty {
+    Some(t) -> Some(canon_uvars_ty(t, m))
+    None    -> None
+  }
+  Expr { kind: canon_uvars_kind(e.kind, m), line: e.line, col: e.col, ty: ty1 }
+}
+
+fn canon_uvars_kind(k: ExprKind, m: [IntPair]) : ExprKind {
+  map_expr_kind(k, (sub) => canon_uvars_expr(sub, m))
+}
+
+fn canon_uvars_ty(t: Ty, m: [IntPair]) : Ty {
+  match t {
+    TyInt    -> t
+    TyReal   -> t
+    TyBool   -> t
+    TyChar   -> t
+    TyString -> t
+    TyUnit   -> t
+    TyAny    -> t
+    TyVarT(_) -> t
+    TyListT(inner) -> TyListT(canon_uvars_ty(inner, m))
+    TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => canon_uvars_ty(p, m)),
+                                  canon_uvars_ty(ret, m), row)
+    TyCon(name, tas) -> TyCon(name, map(tas, (a) => canon_uvars_ty(a, m)))
+    TyDimT(base, u) -> TyDimT(canon_uvars_ty(base, m), canon_uvars_unit(u, m))
+    TyRefineT(base, p) -> TyRefineT(canon_uvars_ty(base, m), p)
+  }
+}
+
+fn canon_uvars_unit(u: UnitExprT, m: [IntPair]) : UnitExprT {
+  match u {
+    UOne        -> u
+    USym(_)     -> u
+    UVar(n)     -> match intpair_lookup(m, n) {
+      Some(b) -> UVar(b)
+      None    -> u
+    }
+    UMul(a, b)  -> UMul(canon_uvars_unit(a, m), canon_uvars_unit(b, m))
+    UInv(a)     -> UInv(canon_uvars_unit(a, m))
+    UPow(a, n)  -> UPow(canon_uvars_unit(a, m), n)
+  }
+}
+
+fn canon_tvars_expr(e: Expr, m: [IntPair]) : Expr {
+  let ty1 = match e.ty {
+    Some(t) -> Some(canon_tvars_ty(t, m))
+    None    -> None
+  }
+  Expr { kind: canon_tvars_kind(e.kind, m), line: e.line, col: e.col, ty: ty1 }
+}
+
+fn canon_tvars_kind(k: ExprKind, m: [IntPair]) : ExprKind {
+  map_expr_kind(k, (sub) => canon_tvars_expr(sub, m))
+}
+
+fn canon_tvars_ty(t: Ty, m: [IntPair]) : Ty {
+  match t {
+    TyInt    -> t
+    TyReal   -> t
+    TyBool   -> t
+    TyChar   -> t
+    TyString -> t
+    TyUnit   -> t
+    TyAny    -> t
+    TyVarT(n) -> match intpair_lookup(m, n) {
+      Some(b) -> TyVarT(b)
+      None    -> t
+    }
+    TyListT(inner) -> TyListT(canon_tvars_ty(inner, m))
+    TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => canon_tvars_ty(p, m)),
+                                  canon_tvars_ty(ret, m), row)
+    TyCon(name, tas) -> TyCon(name, map(tas, (a) => canon_tvars_ty(a, m)))
+    TyDimT(base, u) -> TyDimT(canon_tvars_ty(base, m), u)
+    TyRefineT(base, p) -> TyRefineT(canon_tvars_ty(base, m), p)
+  }
+}
 
 fn tparam_id_split_loop(tparams: [String], ti: Int, ui: Int,
                         tacc: [Int], uacc: [Int]) : TParamSplit {
@@ -16090,15 +16292,19 @@ fn mk_fresh_row_subst(rvars: [Int], s: Subst) : FreshRowSubst {
 
 # m12.5: parallel to mk_fresh_row_subst — but for unit-vars. Allocates a
 # fresh UVar per bound unit-var id and binds it via subst_unit_extend.
-type FreshUnitSubst = { temp: Subst, sub: Subst }
+# m4c Phase 3: also returns the fresh uvar ids in `fresh_ids` so the
+# caller (st_instantiate_report) can record them in the call-site for
+# per-unit specialisation later.
+type FreshUnitSubst = { temp: Subst, sub: Subst, fresh_ids: [Int] }
 
-fn mk_fresh_unit_subst_loop(uvars: [Int], temp: Subst, s: Subst) : FreshUnitSubst {
+fn mk_fresh_unit_subst_loop(uvars: [Int], temp: Subst, s: Subst,
+                             fids_acc: [Int]) : FreshUnitSubst {
   match uvars {
-    [] -> FreshUnitSubst { temp: temp, sub: s }
+    [] -> FreshUnitSubst { temp: temp, sub: s, fresh_ids: list_reverse(fids_acc) }
     [v, ...rest] -> {
       let fr = subst_fresh_unit(s)
       let temp1 = subst_unit_extend(temp, v, UVar(fr.id))
-      mk_fresh_unit_subst_loop(rest, temp1, fr.subst)
+      mk_fresh_unit_subst_loop(rest, temp1, fr.subst, [fr.id, ...fids_acc])
     }
   }
 }
@@ -16109,7 +16315,7 @@ fn mk_fresh_unit_subst(uvars: [Int], s: Subst) : FreshUnitSubst {
                else { Subst { slots: s.slots, row_slots: s.row_slots,
                               row_fresh: s.row_fresh,
                               unit_slots: s.unit_slots, unit_fresh: need } }
-  mk_fresh_unit_subst_loop(uvars, subst_empty(), s_seed)
+  mk_fresh_unit_subst_loop(uvars, subst_empty(), s_seed, [])
 }
 
 # m7b #12: bump the row-var fresh counter past `n` reserved ids so a
@@ -16197,8 +16403,13 @@ fn collect_records(ds: [Decl]) : [RecInfo] = collect_records_loop(ds, [])
 
 # A single call-site that instantiated a polymorphic scheme. `fresh`
 # lists the TyVarT ids minted for that instantiation; running each
-# through the final sub recovers the concrete type arguments.
-type CallSite = CS(String, Int, Int, [Int])        # name, line, col, fresh ids
+# through the final sub recovers the concrete type arguments. The
+# parallel `unit_fresh` list carries the UVar ids minted for the
+# scheme's unit-kind tparams (m4c Phase 3): without these the impl
+# `Show for Real<u>` cannot be specialised per concrete unit, since
+# the scheme has zero type-vars and the parametric body's
+# `unit_name(x)` reads the impl-level uvar baked into `Expr.ty`.
+type CallSite = CS(String, Int, Int, [Int], [Int])  # name, line, col, fresh ty ids, fresh unit ids
 
 # A typed hole site: the kind discriminator (m7d §1 splits `?` /
 # `?name` from `todo!(msg)`), source position, the fresh TyVarT id
@@ -16669,7 +16880,7 @@ fn emit_type_hint(expected: Ty, found: Ty) : Unit {
 # were minted to replace the scheme's bound vars. Those ids, run
 # through the final substitution, give the call-site's concrete
 # type arguments (M4b) and feed monomorphisation (M4c).
-type TyInstRes = { st: InferState, ty: Ty, fresh: [Int] }
+type TyInstRes = { st: InferState, ty: Ty, fresh: [Int], unit_fresh: [Int] }
 
 fn st_instantiate(st: InferState, sc: TyScheme) : TyRes {
   let r = st_instantiate_report(st, sc)
@@ -16691,23 +16902,27 @@ fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes {
       # propagate the bumped row_fresh into the returned state.
       let st_env = st_set_env(st, inst.env)
       let mid = match rvars {
-        [] -> TyInstRes { st: st_env, ty: inst.ty, fresh: fresh }
+        [] -> TyInstRes { st: st_env, ty: inst.ty, fresh: fresh, unit_fresh: [] }
         _  -> {
           let frs = mk_fresh_row_subst(rvars, st_env.sub)
           let body1 = apply_ty(frs.temp, inst.ty)
           let st_out = st_set_sub(st_env, frs.sub)
-          TyInstRes { st: st_out, ty: body1, fresh: fresh }
+          TyInstRes { st: st_out, ty: body1, fresh: fresh, unit_fresh: [] }
         }
       }
       # m12.5: also fresh-instantiate unit-vars. Same shape as the
       # row-var step above but threaded through unit_slots.
+      # m4c Phase 3: capture the freshly-minted unit-var ids alongside
+      # the type-var fresh ids so the call-site record can drive
+      # per-unit specialisation downstream.
       match uvars {
         [] -> mid
         _  -> {
           let fus = mk_fresh_unit_subst(uvars, mid.st.sub)
           let body2 = apply_ty(fus.temp, mid.ty)
           let st_out2 = st_set_sub(mid.st, fus.sub)
-          TyInstRes { st: st_out2, ty: body2, fresh: mid.fresh }
+          TyInstRes { st: st_out2, ty: body2, fresh: mid.fresh,
+                      unit_fresh: fus.fresh_ids }
         }
       }
     }
@@ -16897,9 +17112,10 @@ fn synth(st: InferState, e: Expr) : Inferred {
     EVar(nm)       -> match ty_env_lookup(st.env, nm) {
       Some(sc) -> {
         let r = st_instantiate_report(st, sc)
-        let st2 = match r.fresh {
-          [] -> r.st
-          _  -> st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh))
+        let st2 = if r.fresh == [] and r.unit_fresh == [] {
+          r.st
+        } else {
+          st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh, r.unit_fresh))
         }
         inferred_leaf(st2, r.ty, e)
       }
@@ -16945,9 +17161,10 @@ fn synth(st: InferState, e: Expr) : Inferred {
     EModCall(m, fname) -> match ty_env_lookup(st.env, fname) {
       Some(sc) -> {
         let r = st_instantiate_report(st, sc)
-        let st2 = match r.fresh {
-          [] -> r.st
-          _  -> st_push_inst(r.st, CS(fname, e.line, e.col, r.fresh))
+        let st2 = if r.fresh == [] and r.unit_fresh == [] {
+          r.st
+        } else {
+          st_push_inst(r.st, CS(fname, e.line, e.col, r.fresh, r.unit_fresh))
         }
         inferred_leaf(st2, r.ty, e)
       }
@@ -18988,8 +19205,12 @@ fn print_inferred_fn(nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col:
 
 # A CallSite whose fresh var ids have been resolved via the final
 # substitution to concrete types. Consumed by monomorphisation later
-# and surfaced as-is by `--dump-mono`.
-type ResolvedCS = RCS(String, Int, Int, [Ty])       # name, line, col, concrete tys
+# and surfaced as-is by `--dump-mono`. The trailing `[UnitExprT]`
+# carries the resolved units for the scheme's unit-kind tparams
+# (m4c Phase 3) — used to differentiate impl `Show for Real<u>`
+# specialisations that share an empty type tuple but bind `u` to
+# distinct concrete units (USD vs EUR vs `m^2` ...).
+type ResolvedCS = RCS(String, Int, Int, [Ty], [UnitExprT])  # name, line, col, concrete tys, concrete units
 
 fn resolve_callsite_tys(ids: [Int], sub: Subst) : [Ty] {
   match ids {
@@ -18998,12 +19219,20 @@ fn resolve_callsite_tys(ids: [Int], sub: Subst) : [Ty] {
   }
 }
 
+fn resolve_callsite_units(ids: [Int], sub: Subst) : [UnitExprT] {
+  match ids {
+    [] -> []
+    [i, ...rest] -> [apply_unit(sub, UVar(i)), ...resolve_callsite_units(rest, sub)]
+  }
+}
+
 fn resolve_callsites(css: [CallSite], sub: Subst) : [ResolvedCS] {
   match css {
     [] -> []
     [cs, ...rest] -> match cs {
-      CS(nm, line, col, ids) ->
-        [RCS(nm, line, col, resolve_callsite_tys(ids, sub)), ...resolve_callsites(rest, sub)]
+      CS(nm, line, col, ids, uids) ->
+        [RCS(nm, line, col, resolve_callsite_tys(ids, sub),
+             resolve_callsite_units(uids, sub)), ...resolve_callsites(rest, sub)]
     }
   }
 }
@@ -19239,7 +19468,21 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # fresh counter past the tpbinds the same way we already advance
       # the row_fresh counter past the rbinds above.
       let st0a = st_set_env(st0, advance_fresh(st0.env, list_length(tpbinds)))
-      let added = add_infer_params_with_binds(st0a, ps, tpbinds, rbinds)
+      # m4c Phase 3: parallel to the env.fresh bump above, advance the
+      # unit_fresh counter past any unit-kind tpbinds so fresh uvars
+      # minted while typing the body do not alias the impl-level bound
+      # uvar id (the unifier's `utable_pick_min_var` would otherwise
+      # always select the bound id and bind it to a fresh id, leaving
+      # `x : Real<UVar(N)>` for some chained fresh N — breaking the
+      # body subst map that keys on the bound id from `tparam_id_split`).
+      # The advance alone is not sufficient: even with reserved ids,
+      # `utable_pick_min_var` picks the smallest-id var in the diff,
+      # which is still the bound id when it appears alongside a fresh
+      # one. The post-finalise canonicalisation pass below redirects
+      # the chain endpoint back to the bound id.
+      let unit_tpcount = tparam_unit_count(effective_tparams)
+      let st0b = if unit_tpcount > 0 { advance_unit_fresh(st0a, unit_tpcount) } else { st0a }
+      let added = add_infer_params_with_binds(st0b, ps, tpbinds, rbinds)
       # m12.8 Phase 4b follow-up: when the user omits the return-type
       # annotation, infer it from the body's actual type. The
       # `fn x() = expr` form (and `fn x() { ... last_expr }`) signals
@@ -19295,7 +19538,25 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # `synth` saved a TyVar that later unified with a concrete type
       # — most visibly the parameters of lambdas passed to generic
       # higher-order ops (`each`, `map`, `filter`).
-      let final_body = finalise_typed_expr(st2.sub, rb.expr)
+      let final_body0 = finalise_typed_expr(st2.sub, rb.expr)
+      # m4c Phase 3: canonicalise the body's UVar / TyVarT ids back
+      # to the impl's bound ids. The unifier may have redirected
+      # `UVar(b) -> UVar(f)` (chain through fresh ids) when typing
+      # `unit_name(x)` etc., so post-finalise the body's `Expr.ty`
+      # references the chain endpoint UVar, not the bound id. The
+      # body subst map keys on the bound id (since `tparam_id_split`
+      # numbers them 0..n-1), so without this canonicalisation the
+      # subst is a no-op in the spec body. We compute the redirect
+      # map by chasing each bound id through `st2.sub` and rewriting
+      # any UVar(endpoint) / TyVarT(endpoint) in the body's tys.
+      let split_for_canon = tparam_id_split(effective_tparams)
+      let canon_uvars = build_uvar_canon_map(split_for_canon.uvars, st2.sub, [])
+      let canon_tvars = build_tvar_canon_map(split_for_canon.tvars, st2.sub, [])
+      let final_body = if list_length(canon_uvars) == 0 and list_length(canon_tvars) == 0 {
+        final_body0
+      } else {
+        canon_uvars_expr(canon_tvars_expr(final_body0, canon_tvars), canon_uvars)
+      }
       # m7e §24: main-row inference. When `main` ships without a
       # declared row, write the body-performed row back into the
       # DFn so `emit_main_wrapper` / `main_row_labels` install the
@@ -20151,7 +20412,7 @@ fn dump_typed_loop(ds: [Decl]) : Unit / Console {
 
 fn dump_mono_line(cs: ResolvedCS) : Unit / Console {
   match cs {
-    RCS(nm, line, col, tys) -> {
+    RCS(nm, line, col, tys, _) -> {
       let tys_str = join_with(ty_string_list(tys), ", ")
       print("#{nm}@#{int_to_string(line)}:#{int_to_string(col)}  [#{tys_str}]")
     }
@@ -20174,9 +20435,9 @@ fn dump_mono(file: String, decls: [Decl]) : Int {
 
 fn dump_mono_out_line(cs: ResolvedCS) : Unit / Console {
   match cs {
-    RCS(nm, line, col, tys) -> {
+    RCS(nm, line, col, tys, units) -> {
       let tys_str = join_with(ty_string_list(tys), ", ")
-      let mname = mangle_name(nm, tys)
+      let mname = mangle_name(nm, tys, units)
       print("#{nm}@#{int_to_string(line)}:#{int_to_string(col)}  [#{tys_str}]  ->  #{mname}")
     }
   }
@@ -20188,76 +20449,385 @@ fn dump_mono_out(file: String, decls: [Decl]) : Int {
   r.errs
 }
 
-# ---- m4c — monomorphise (m4c #4 minimal real, 2026-04-29) ----
+# ---- m4c — monomorphise (m4c #4 + Phase 3 body subst, 2026-04-29) ----
 #
 # Sits between `infer_program` and `perceus_pass` in the pipeline.
 # Given a TypedProgram (post-inference, with `Expr.ty` populated and
 # all `ResolvedCS` known), produce the `[Decl]` shape the next pass
 # walks.
 #
-# m4c #1 (pre-fix): identity transform, decls unchanged. The
-# blocker on real specialisation was symbol collision —
-# `clause_fn_name(line, col, op)` minted C symbols by source position
-# alone, so two specialised copies of a polymorphic body containing
-# an `EHandle` would emit the same clause symbol and the C linker
-# would reject the binary. Pinned in `docs/m5x-followup.md` §3.
+# Phase 1 (376d3f3) — clause-info plumbing — prefixes embedded
+# `EHandle` clause symbols with the enclosing fn's post-monomorph
+# name so per-spec clauses don't collide.
+# Phase 2 minimal (c27a1fe) — generate one cloned DFn per distinct
+# `(name, tys, units)` tuple, with the mangled symbol.
+# Phase 2 full (7768e04) — pre-mono walker `rewrite_callsites_decls`
+# retargets every concrete-tuple call site at the call's source
+# position; specs inherit the rewritten body via structural sharing.
+# Phase 3 (this lane) — body type substitution. Each cloned spec's
+# body is freshly built (no longer shared) and every `Expr.ty`
+# carrying the impl-level uvars or tparam type-vars gets replaced
+# by the concrete spec tuple. This:
+#   1. Lets `unit_name(x)` and `__strip_unit(x)` read the call-site
+#      unit instead of the parametric `UVar(_)` — removes the
+#      `try_rewrite_show_dim_real` workaround entirely.
+#   2. Resolves polymorphic flow-through. A spec body's call to
+#      another polymorphic helper now sees concrete tys (the
+#      tparam was substituted) so the per-spec call-site rewrite
+#      retargets to the matching specialisation, not back to the
+#      polymorphic original.
+# Phase 4 — generic prune (drop the original polymorphic DFn when
+# every reference has been redirected). Still deferred.
 #
-# m4c #4 Phase 2 minimal (c27a1fe): the clause-info plumbing now
-# prefixes clause symbols with the enclosing fn name
-# (`_kai_<enc>__clause_<l>_<c>_<op>` — see `clause_fn_name`), so two
-# specialisations of one source body emit distinct symbols. With the
-# blocker gone, this pass walks the resolved call sites in `tp.insts`
-# and appends specialised copies of every polymorphic DFn for each
-# distinct call-site type tuple. The collision-avoidance proof is
-# that the new decls and the original each get their own `enc_fn` at
-# collect time, so any embedded `EHandle` in the body produces unique
-# clause symbols across all copies.
-#
-# m4c #4 Phase 2 full (this lane): also rewrite every call site
-# whose `(name, line, col)` matches a recorded `ResolvedCS` with
-# concrete tys — `ECall(EVar(name), args)` becomes
-# `ECall(EVar(mangle_name(name, tys)), args)`. The walker runs once
-# on `tp.decls` BEFORE the specialised copies are cloned, so the
-# specialisations inherit the rewritten body (calls inside a poly
-# body that resolved to concrete `g(...)` retarget to `g__mono__T`
-# in every copy). Calls whose recorded tys still contain TyVarT are
-# left untouched and reach the polymorphic original at runtime —
-# body type substitution (deferred) is what would let those flow
-# through per-spec.
-#
-# The original polymorphic DFn stays in the decl list. Pruning would
-# break function-as-value patterns: `ResolvedCS` is keyed on
-# `EVar` *call sites*, not on bare-name references, so a bare
-# `EVar(name)` passed as an argument or stored in a binding is not
-# in the table and would dangle if the original were dropped.
-# Generic prune is a separate lane.
-#
-# Deferred to follow-up lanes:
-#   - Body type substitution (replace `Expr.ty` carrying impl-level
-#     uvars with concrete tuple types) so compile-time intrinsics
-#     like `unit_name(x)` and `__strip_unit(x)` see the call-site
-#     types instead of the impl-level uvar. Required for removing
-#     `try_rewrite_show_dim_real`.
-#   - Generic prune (drop the original polymorphic DFn when every
-#     reference has been redirected to a specialisation). Today
-#     pruning would break the function-as-value paths that
-#     `ResolvedCS` does not track.
-#
-# Implementation: walk decls collecting polymorphic DFn entries
-# (those with non-empty tparams), walk `tp.insts` collecting
-# distinct `(name, [Ty])` tuples whose name matches a polymorphic
-# decl, rewrite the AST so concrete call sites point at the mangled
-# names, then emit one cloned DFn per tuple with `mangle_name`
-# applied to the name and `tparams = []` (the clone is concrete and
-# carries the rewritten body via structural sharing).
+# Tuples carry both `[Ty]` (type-tparam tuple) and `[UnitExprT]`
+# (unit-tparam tuple). Two `Show<Real<u>>` call sites with `u :=
+# USD` and `u := EUR` therefore key into distinct specialisations
+# even though their type-tparam tuple is empty.
 
 fn monomorphise(tp: TypedProgram) : [Decl] {
   let polys = collect_poly_fns(tp.decls)
-  let tuples = collect_distinct_tuples(tp.insts, polys, [])
-  let rewritten = rewrite_callsites_decls(tp.decls, tp.insts, tuples)
-  let polys_after = collect_poly_fns(rewritten)
-  let specs = generate_specs(polys_after, tuples, [])
-  list_append(rewritten, specs)
+  # `resolve_protocol_calls` renames `__proto_<op>(arg)` call sites
+  # to `__pimpl_<P>_<T>_<op>(arg)` AFTER `infer_program` has populated
+  # tp.insts, so insts are keyed on the dispatcher names — calls in
+  # the rewritten AST cannot find their matching CS by name. Recover
+  # by synthesising one CS per `__pimpl_*` call site, unifying the
+  # impl's formal param types with the actual arg types to extract
+  # both type-tparam and unit-tparam bindings.
+  let recovered = recover_protoimpl_insts(tp.decls, polys, tp.insts)
+  let insts = list_append(tp.insts, recovered)
+  let initial_tuples = collect_distinct_tuples(insts, polys, [])
+  # Pre-mono rewrite over the whole program, retargeting every
+  # concrete call site whose tuple matches a known specialisation.
+  let rewritten = rewrite_callsites_decls(tp.decls, insts, initial_tuples)
+  # Iterate spec generation to fixpoint. Per-spec body subst can
+  # promote previously-polymorphic flow-through call sites to
+  # concrete tuples (e.g., `f__mono__Int`'s body calls `g(x : Int)`
+  # which now mangles to `g__mono__Int`); those new tuples enter
+  # the worklist and produce additional specs.
+  let r = generate_specs_iter(polys, initial_tuples, insts, [], initial_tuples)
+  match r {
+    GenSpecsOut(specs, _) -> list_append(rewritten, specs)
+  }
+}
+
+type GenSpecsResult = GenSpecsOut([Decl], [MonoTuple])
+
+# ---- m4c Phase 3 — protocol-impl inst recovery ----
+#
+# `resolve_protocol_calls` runs AFTER `infer_program`, rewriting
+# `__proto_<op>(arg)` to `__pimpl_<P>_<T>_<op>(arg)` in the AST. The
+# typer therefore recorded a CS for the dispatcher (`__proto_<op>`)
+# but not for the impl. This walker visits each ECall(EVar(name))
+# whose name matches a polymorphic DFn and synthesises a CS by
+# unifying the impl's formal param types against the actual arg
+# types — extracting bindings for both type-tparam ids (TyVarT) and
+# unit-tparam ids (UVar). Calls that already have a matching CS in
+# `tp.insts` are skipped so the walker is idempotent for non-impl
+# calls.
+fn recover_protoimpl_insts(ds: [Decl], polys: [PolyFn],
+                            existing: [ResolvedCS]) : [ResolvedCS] =
+  list_reverse(recover_in_decls(ds, polys, existing, []))
+
+fn recover_in_decls(ds: [Decl], polys: [PolyFn], existing: [ResolvedCS],
+                     acc: [ResolvedCS]) : [ResolvedCS] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> {
+      let acc1 = match d {
+        DFn(_, _, _, _, _, _, body, _, _, _) ->
+          recover_in_expr(body, polys, existing, acc)
+        DTest(_, body, _, _) ->
+          recover_in_expr(body, polys, existing, acc)
+        _ -> acc
+      }
+      recover_in_decls(rest, polys, existing, acc1)
+    }
+  }
+}
+
+fn recover_in_expr(e: Expr, polys: [PolyFn], existing: [ResolvedCS],
+                    acc: [ResolvedCS]) : [ResolvedCS] {
+  let acc1 = recover_in_kind(e.kind, polys, existing, acc)
+  match e.kind {
+    ECall(callee, args_) -> match callee.kind {
+      EVar(name) -> match lookup_poly_fn(polys, name) {
+        Some(d) -> {
+          let already = match find_mono_inst(existing, name, callee.line, callee.col) {
+            Some(_) -> true None -> false
+          }
+          let already_acc = match find_mono_inst(acc1, name, callee.line, callee.col) {
+            Some(_) -> true None -> false
+          }
+          if already or already_acc { acc1 }
+          else {
+            match synthesize_inst_for_decl(d, args_, callee.line, callee.col) {
+              Some(cs) -> [cs, ...acc1]
+              None -> acc1
+            }
+          }
+        }
+        None -> acc1
+      }
+      _ -> acc1
+    }
+    _ -> acc1
+  }
+}
+
+fn recover_in_kind(k: ExprKind, polys: [PolyFn], existing: [ResolvedCS],
+                    acc: [ResolvedCS]) : [ResolvedCS] {
+  match k {
+    EInt(_)        -> acc
+    EReal(_)       -> acc
+    EBool(_)       -> acc
+    EChar(_)       -> acc
+    EStr(_, _)     -> acc
+    EUnit          -> acc
+    EVar(_)        -> acc
+    EUnder         -> acc
+    EPlaceholder   -> acc
+    EHole(_)       -> acc
+    ETodo(_)       -> acc
+    EVariantsOf(_, _) -> acc
+    EModCall(_, _) -> acc
+    ECall(callee, args_) -> {
+      let acc1 = recover_in_expr(callee, polys, existing, acc)
+      recover_in_args(args_, polys, existing, acc1)
+    }
+    EField(base, _)   -> recover_in_expr(base, polys, existing, acc)
+    EIndex(a, b)      -> recover_in_expr(b, polys, existing,
+                          recover_in_expr(a, polys, existing, acc))
+    EBinop(_, a, b)   -> recover_in_expr(b, polys, existing,
+                          recover_in_expr(a, polys, existing, acc))
+    EUnop(_, x)       -> recover_in_expr(x, polys, existing, acc)
+    EIf(c, t_, eo)    -> {
+      let a1 = recover_in_expr(c, polys, existing, acc)
+      let a2 = recover_in_expr(t_, polys, existing, a1)
+      match eo { Some(eb) -> recover_in_expr(eb, polys, existing, a2) None -> a2 }
+    }
+    EMatch(scr, arms) -> {
+      let a1 = recover_in_expr(scr, polys, existing, acc)
+      recover_in_arms(arms, polys, existing, a1)
+    }
+    ELambda(_, b)     -> recover_in_expr(b, polys, existing, acc)
+    ERecordLit(_, fs) -> recover_in_fields(fs, polys, existing, acc)
+    EList(els)        -> recover_in_elems(els, polys, existing, acc)
+    ERange(a, b, opt_step) -> {
+      let a1 = recover_in_expr(a, polys, existing, acc)
+      let a2 = recover_in_expr(b, polys, existing, a1)
+      match opt_step { Some(e3) -> recover_in_expr(e3, polys, existing, a2) None -> a2 }
+    }
+    EBlock(stmts, tail) -> {
+      let a1 = recover_in_stmts(stmts, polys, existing, acc)
+      match tail { Some(e3) -> recover_in_expr(e3, polys, existing, a1) None -> a1 }
+    }
+    EPipe(a, b)      -> recover_in_expr(b, polys, existing,
+                          recover_in_expr(a, polys, existing, acc))
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let a1 = recover_in_expr(body, polys, existing, acc)
+      let a2 = match init_opt { Some(e3) -> recover_in_expr(e3, polys, existing, a1) None -> a1 }
+      let a3 = recover_in_clauses(clauses, polys, existing, a2)
+      match ret_opt {
+        Some(r) -> match r { HR(_, b, _, _) -> recover_in_expr(b, polys, existing, a3) }
+        None -> a3
+      }
+    }
+    ELitUnit(inner, _) -> recover_in_expr(inner, polys, existing, acc)
+    EBang(inner)       -> recover_in_expr(inner, polys, existing, acc)
+  }
+}
+
+fn recover_in_args(args: [Expr], polys: [PolyFn], existing: [ResolvedCS],
+                    acc: [ResolvedCS]) : [ResolvedCS] {
+  match args {
+    [] -> acc
+    [a, ...rest] -> recover_in_args(rest, polys, existing,
+                      recover_in_expr(a, polys, existing, acc))
+  }
+}
+
+fn recover_in_arms(arms: [Arm], polys: [PolyFn], existing: [ResolvedCS],
+                    acc: [ResolvedCS]) : [ResolvedCS] {
+  match arms {
+    [] -> acc
+    [arm, ...rest] -> match arm {
+      Arm(_, g, b) -> {
+        let a1 = match g { Some(ge) -> recover_in_expr(ge, polys, existing, acc) None -> acc }
+        let a2 = recover_in_expr(b, polys, existing, a1)
+        recover_in_arms(rest, polys, existing, a2)
+      }
+    }
+  }
+}
+
+fn recover_in_fields(fs: [FieldInit], polys: [PolyFn], existing: [ResolvedCS],
+                      acc: [ResolvedCS]) : [ResolvedCS] {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      FI(_, v) -> recover_in_fields(rest, polys, existing,
+                    recover_in_expr(v, polys, existing, acc))
+    }
+  }
+}
+
+fn recover_in_elems(els: [ListElem], polys: [PolyFn], existing: [ResolvedCS],
+                     acc: [ResolvedCS]) : [ResolvedCS] {
+  match els {
+    [] -> acc
+    [el, ...rest] -> {
+      let acc1 = match el {
+        ElPlain(x)  -> recover_in_expr(x, polys, existing, acc)
+        ElSpread(x) -> recover_in_expr(x, polys, existing, acc)
+      }
+      recover_in_elems(rest, polys, existing, acc1)
+    }
+  }
+}
+
+fn recover_in_stmts(stmts: [Stmt], polys: [PolyFn], existing: [ResolvedCS],
+                     acc: [ResolvedCS]) : [ResolvedCS] {
+  match stmts {
+    [] -> acc
+    [s, ...rest] -> {
+      let acc1 = match s {
+        SLet(_, _, rhs)            -> recover_in_expr(rhs, polys, existing, acc)
+        SAssert(c, m)              -> match m { Some(me) -> recover_in_expr(me, polys, existing, recover_in_expr(c, polys, existing, acc)) None -> recover_in_expr(c, polys, existing, acc) }
+        SExprStmt(x)               -> recover_in_expr(x, polys, existing, acc)
+        SIndexAssign(b, i, v, _, _)-> recover_in_expr(v, polys, existing,
+                                        recover_in_expr(i, polys, existing,
+                                          recover_in_expr(b, polys, existing, acc)))
+        SVar(_, _, rhs, _, _)      -> recover_in_expr(rhs, polys, existing, acc)
+        SUse(_, _, _)              -> acc
+      }
+      recover_in_stmts(rest, polys, existing, acc1)
+    }
+  }
+}
+
+fn recover_in_clauses(cs: [HClause], polys: [PolyFn], existing: [ResolvedCS],
+                       acc: [ResolvedCS]) : [ResolvedCS] {
+  match cs {
+    [] -> acc
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) -> recover_in_clauses(rest, polys, existing,
+                            recover_in_expr(b, polys, existing, acc))
+    }
+  }
+}
+
+# Synthesise a ResolvedCS for a call to a polymorphic DFn by
+# walking the impl's formal param types in parallel with the actual
+# args' `Expr.ty` and extracting bindings for both type-tparam ids
+# (TyVarT) and unit-tparam ids (UVar). Returns None if we cannot
+# resolve the impl's scheme or any arg lacks a `.ty` annotation.
+fn synthesize_inst_for_decl(d: Decl, args_: [Expr], line: Int, col: Int) : Option[ResolvedCS] {
+  match d {
+    DFn(_, name, tparams, _, _, _, _, _, _, _) -> match fn_scheme_of_decl(d) {
+      None -> None
+      Some(sc) -> match sc {
+        Scheme(_, _, _, fnty) -> match fnty {
+          TyFnT(formal_pts, _, _) -> {
+            let implicit = collect_implicit_tparams_in_decl(d, tparams)
+            let effective = list_append(tparams, implicit)
+            let split = tparam_id_split(effective)
+            let bindings = extract_bindings_args(formal_pts, args_,
+                              SubstBindings { tvars: [], uvars: [] })
+            let tys = collect_subst_tys(split.tvars, bindings.tvars)
+            let units = collect_subst_units(split.uvars, bindings.uvars)
+            Some(RCS(name, line, col, tys, units))
+          }
+          _ -> None
+        }
+      }
+    }
+    _ -> None
+  }
+}
+
+type SubstBindings = { tvars: [SubstPairTy], uvars: [SubstPairUnit] }
+
+fn extract_bindings_args(formals: [Ty], args_: [Expr],
+                          b: SubstBindings) : SubstBindings {
+  match formals {
+    [] -> b
+    [f, ...frest] -> match args_ {
+      [] -> b
+      [a, ...arest] -> match a.ty {
+        Some(at) -> extract_bindings_args(frest, arest, extract_bindings_ty(f, at, b))
+        None     -> extract_bindings_args(frest, arest, b)
+      }
+    }
+  }
+}
+
+fn extract_bindings_ty(formal: Ty, actual: Ty, b: SubstBindings) : SubstBindings {
+  match formal {
+    TyVarT(id) -> SubstBindings { tvars: [STP(id, actual), ...b.tvars], uvars: b.uvars }
+    TyListT(fi) -> match actual {
+      TyListT(ai) -> extract_bindings_ty(fi, ai, b)
+      _ -> b
+    }
+    TyFnT(fps, fret, _) -> match actual {
+      TyFnT(aps, aret, _) -> extract_bindings_ty(fret, aret,
+                              extract_bindings_tys(fps, aps, b))
+      _ -> b
+    }
+    TyCon(_, fas) -> match actual {
+      TyCon(_, aas) -> extract_bindings_tys(fas, aas, b)
+      _ -> b
+    }
+    TyDimT(fb, fu) -> match actual {
+      TyDimT(ab, au) -> extract_bindings_unit(fu, au,
+                          extract_bindings_ty(fb, ab, b))
+      _ -> b
+    }
+    TyRefineT(fb, _) -> match actual {
+      TyRefineT(ab, _) -> extract_bindings_ty(fb, ab, b)
+      _ -> extract_bindings_ty(fb, actual, b)
+    }
+    _ -> b
+  }
+}
+
+fn extract_bindings_tys(fs: [Ty], a_s: [Ty], b: SubstBindings) : SubstBindings {
+  match fs {
+    [] -> b
+    [f, ...frest] -> match a_s {
+      [] -> b
+      [a, ...arest] -> extract_bindings_tys(frest, arest, extract_bindings_ty(f, a, b))
+    }
+  }
+}
+
+fn extract_bindings_unit(formal: UnitExprT, actual: UnitExprT,
+                          b: SubstBindings) : SubstBindings {
+  let f_canon = unit_canon(formal)
+  match f_canon {
+    UVar(id) -> SubstBindings { tvars: b.tvars,
+                                uvars: [SUP(id, unit_canon(actual)), ...b.uvars] }
+    _ -> b
+  }
+}
+
+fn collect_subst_tys(ids: [Int], pairs: [SubstPairTy]) : [Ty] {
+  match ids {
+    [] -> []
+    [i, ...rest] -> match subst_pairs_lookup_ty(pairs, i) {
+      Some(t) -> [t, ...collect_subst_tys(rest, pairs)]
+      None    -> [TyAny, ...collect_subst_tys(rest, pairs)]
+    }
+  }
+}
+
+fn collect_subst_units(ids: [Int], pairs: [SubstPairUnit]) : [UnitExprT] {
+  match ids {
+    [] -> []
+    [i, ...rest] -> match subst_pairs_lookup_unit(pairs, i) {
+      Some(u) -> [u, ...collect_subst_units(rest, pairs)]
+      None    -> [UOne, ...collect_subst_units(rest, pairs)]
+    }
+  }
 }
 
 # Index polymorphic DFn entries by name. A `DFn` with non-empty
@@ -20292,14 +20862,15 @@ fn lookup_poly_fn(polys: [PolyFn], name: String) : Option[Decl] {
   }
 }
 
-# Resolved call-site tuples keyed by (name, [Ty]). Stored as a
-# flat list; lookup is O(n × m) but the input is bounded by the
-# program's total call-site count which is small in practice.
-type MonoTuple = MT(String, [Ty])
+# Resolved call-site tuples keyed by (name, [Ty], [UnitExprT]).
+# Stored as a flat list; lookup is O(n × m) but the input is
+# bounded by the program's total call-site count which is small in
+# practice.
+type MonoTuple = MT(String, [Ty], [UnitExprT])
 
 fn tuple_eq(a: MonoTuple, b: MonoTuple) : Bool =
-  match a { MT(an, atys) -> match b { MT(bn, btys) ->
-    an == bn and ty_list_eq(atys, btys)
+  match a { MT(an, atys, aus) -> match b { MT(bn, btys, bus) ->
+    an == bn and ty_list_eq(atys, btys) and unit_list_eq(aus, bus)
   }}
 
 fn ty_list_eq(a: [Ty], b: [Ty]) : Bool =
@@ -20311,10 +20882,28 @@ fn ty_list_eq(a: [Ty], b: [Ty]) : Bool =
     }
   }
 
+fn unit_list_eq(a: [UnitExprT], b: [UnitExprT]) : Bool =
+  match a {
+    [] -> match b { [] -> true _ -> false }
+    [ah, ...arest] -> match b {
+      [] -> false
+      [bh, ...brest] -> if unit_eq(ah, bh) { unit_list_eq(arest, brest) } else { false }
+    }
+  }
+
+# Structural equality on canonical units. Both sides are canonicalised
+# first so `m * sec` and `sec * m` collapse to the same shape.
+fn unit_eq(a: UnitExprT, b: UnitExprT) : Bool {
+  let ca = unit_canon(a)
+  let cb = unit_canon(b)
+  unit_expr_display(ca) == unit_expr_display(cb)
+}
+
 # `ty_eq` is a structural equality on resolved types. Conservative:
-# `TyVarT` only matches itself by id; refinements / units erase
-# (since `mangle_ty` erases them at codegen time, two tuples that
-# differ only in a refinement collapse to the same specialisation).
+# `TyVarT` only matches itself by id; refinements / units erase at
+# the type level (units distinguished separately in MonoTuple's
+# `[UnitExprT]` field, refinements stay erased per Tier 1's
+# value-only refinement semantics).
 fn ty_eq(a: Ty, b: Ty) : Bool {
   match a {
     TyInt -> match b { TyInt -> true _ -> false }
@@ -20346,22 +20935,23 @@ fn tuple_in(tuples: [MonoTuple], t: MonoTuple) : Bool {
   }
 }
 
-# Reduce `tp.insts` to the distinct `(name, [Ty])` pairs whose
-# `name` matches a polymorphic DFn. Empty tuples (calls to
+# Reduce `tp.insts` to distinct `(name, [Ty], [UnitExprT])` triples
+# whose `name` matches a polymorphic DFn. Empty tuples (calls to
 # non-polymorphic decls or to local variables) are filtered out.
-# Tuples containing unresolved `TyVarT` slots are also filtered —
-# specialisation requires concrete types.
+# Tuples containing unresolved `TyVarT` slots or `UVar` units are
+# also filtered — specialisation requires concrete types.
 fn collect_distinct_tuples(insts: [ResolvedCS], polys: [PolyFn],
                            acc: [MonoTuple]) : [MonoTuple] {
   match insts {
     [] -> list_reverse(acc)
     [cs, ...rest] -> match cs {
-      RCS(name, _, _, tys) -> {
+      RCS(name, _, _, tys, units) -> {
         let is_poly = match lookup_poly_fn(polys, name) {
           Some(_) -> true None -> false
         }
-        let concrete = list_length(tys) > 0 and tuple_concrete(tys)
-        let mt = MT(name, tys)
+        let any_slot = list_length(tys) > 0 or list_length(units) > 0
+        let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
+        let mt = MT(name, tys, units)
         if is_poly and concrete and not tuple_in(acc, mt) {
           collect_distinct_tuples(rest, polys, [mt, ...acc])
         } else {
@@ -20385,41 +20975,487 @@ fn ty_concrete(t: Ty) : Bool {
     TyListT(inner) -> ty_concrete(inner)
     TyFnT(ps, r, _) -> tuple_concrete(ps) and ty_concrete(r)
     TyCon(_, tas) -> tuple_concrete(tas)
-    TyDimT(b, _) -> ty_concrete(b)
+    TyDimT(b, u) -> ty_concrete(b) and unit_concrete(u)
     TyRefineT(b, _) -> ty_concrete(b)
     _ -> true   # primitive types and TyAny are concrete
   }
 }
 
-# Generate one specialised DFn per distinct tuple. The clone keeps
-# the original body (no `Expr.ty` substitution in this lane — the
-# emitter is type-erased so two specialisations of one source body
-# produce identical C code modulo their top-level symbol). The
-# clone's `tparams` is empty so subsequent passes treat it as a
-# fully-concrete decl. The clone's source position is shared with
-# the original; embedded clauses re-collect under the new
-# `enc_fn = c_sym(mangled, mo)` so their C symbols don't collide
-# with the original's clause symbols.
-fn generate_specs(polys: [PolyFn], tuples: [MonoTuple],
-                  acc: [Decl]) : [Decl] {
-  match tuples {
-    [] -> list_reverse(acc)
-    [t, ...rest] -> match t {
-      MT(name, tys) -> match lookup_poly_fn(polys, name) {
-        None -> generate_specs(polys, rest, acc)
-        Some(d) -> {
-          let spec = specialise_decl(d, tys)
-          generate_specs(polys, rest, [spec, ...acc])
+fn units_concrete(us: [UnitExprT]) : Bool {
+  match us {
+    [] -> true
+    [u, ...rest] -> if unit_concrete(u) { units_concrete(rest) } else { false }
+  }
+}
+
+fn unit_concrete(u: UnitExprT) : Bool {
+  let cu = unit_canon(u)
+  match cu {
+    UVar(_)    -> false
+    UOne       -> true
+    USym(_)    -> true
+    UMul(a, b) -> unit_concrete(a) and unit_concrete(b)
+    UInv(a)    -> unit_concrete(a)
+    UPow(a, _) -> unit_concrete(a)
+  }
+}
+
+# ---- m4c Phase 3 — body type / unit substitution ----
+#
+# A SubstMap binds the original DFn's tparam ids to the concrete
+# tys and units selected for one specialisation. `tvars` lists
+# `(TyVarT id, Ty)` pairs; `uvars` lists `(UVar id, UnitExprT)`
+# pairs. Both ids come from `tparam_id_split(effective_tparams)`,
+# which is the same allocation order the inferencer used to type
+# the body (so a body's `TyVarT(0)` is the first tvar tparam, etc.).
+type SubstPairTy = STP(Int, Ty)
+type SubstPairUnit = SUP(Int, UnitExprT)
+type SubstMap = SM([SubstPairTy], [SubstPairUnit])
+
+fn subst_map_empty() : SubstMap = SM([], [])
+
+fn subst_map_lookup_ty(sm: SubstMap, id: Int) : Option[Ty] {
+  match sm { SM(tvars, _) -> subst_pairs_lookup_ty(tvars, id) }
+}
+
+fn subst_pairs_lookup_ty(ps: [SubstPairTy], id: Int) : Option[Ty] {
+  match ps {
+    [] -> None
+    [h, ...rest] -> match h {
+      STP(i, t) -> if i == id { Some(t) } else { subst_pairs_lookup_ty(rest, id) }
+    }
+  }
+}
+
+fn subst_map_lookup_unit(sm: SubstMap, id: Int) : Option[UnitExprT] {
+  match sm { SM(_, uvars) -> subst_pairs_lookup_unit(uvars, id) }
+}
+
+fn subst_pairs_lookup_unit(ps: [SubstPairUnit], id: Int) : Option[UnitExprT] {
+  match ps {
+    [] -> None
+    [h, ...rest] -> match h {
+      SUP(i, u) -> if i == id { Some(u) } else { subst_pairs_lookup_unit(rest, id) }
+    }
+  }
+}
+
+# Build the SubstMap for a DFn given a concrete `(tys, units)` tuple.
+# Re-derives the same effective_tparams the inferencer used (declared
+# tparams ++ implicit lowercase tparams) so the id allocation in
+# `tparam_id_split` agrees with the body's `TyVarT` / `UVar` ids.
+fn build_subst_map(d: Decl, tys: [Ty], units: [UnitExprT]) : SubstMap {
+  match d {
+    DFn(_, _, tparams, _, _, _, _, _, _, _) -> {
+      let implicit = collect_implicit_tparams_in_decl(d, tparams)
+      let effective = list_append(tparams, implicit)
+      let split = tparam_id_split(effective)
+      SM(zip_int_ty(split.tvars, tys),
+         zip_int_unit(split.uvars, units))
+    }
+    _ -> subst_map_empty()
+  }
+}
+
+fn zip_int_ty(ids: [Int], tys: [Ty]) : [SubstPairTy] {
+  match ids {
+    [] -> []
+    [i, ...irest] -> match tys {
+      [] -> []
+      [t, ...trest] -> [STP(i, t), ...zip_int_ty(irest, trest)]
+    }
+  }
+}
+
+fn zip_int_unit(ids: [Int], us: [UnitExprT]) : [SubstPairUnit] {
+  match ids {
+    [] -> []
+    [i, ...irest] -> match us {
+      [] -> []
+      [u, ...urest] -> [SUP(i, u), ...zip_int_unit(irest, urest)]
+    }
+  }
+}
+
+# Walker `subst_ty(t, sm)` — exhaustive over every Ty constructor.
+# `TyVarT(id)` substitutes via `sm.tvars`; `TyDimT(base, u)` recurses
+# into the base AND substitutes the unit (which may be a UVar matching
+# `sm.uvars`). Adding a new Ty variant fails compilation here rather
+# than slipping through.
+fn subst_ty(t: Ty, sm: SubstMap) : Ty {
+  match t {
+    TyInt    -> t
+    TyReal   -> t
+    TyBool   -> t
+    TyChar   -> t
+    TyString -> t
+    TyUnit   -> t
+    TyAny    -> t
+    TyVarT(n) -> match subst_map_lookup_ty(sm, n) {
+      Some(t2) -> t2
+      None     -> t
+    }
+    TyListT(inner) -> TyListT(subst_ty(inner, sm))
+    TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => subst_ty(p, sm)),
+                                  subst_ty(ret, sm), row)
+    TyCon(name, tas) -> TyCon(name, map(tas, (a) => subst_ty(a, sm)))
+    TyDimT(base, u) -> dim_collapse(subst_ty(base, sm), unit_canon(subst_unit(u, sm)))
+    TyRefineT(base, p) -> TyRefineT(subst_ty(base, sm), p)
+  }
+}
+
+# Walker `subst_unit(u, sm)` — recurses through every UnitExprT
+# constructor. `UVar(id)` substitutes via `sm.uvars` (canonicalised
+# at TyDimT level via `dim_collapse` above).
+fn subst_unit(u: UnitExprT, sm: SubstMap) : UnitExprT {
+  match u {
+    UOne        -> u
+    USym(_)     -> u
+    UVar(n)     -> match subst_map_lookup_unit(sm, n) {
+      Some(u2) -> u2
+      None     -> u
+    }
+    UMul(a, b)  -> UMul(subst_unit(a, sm), subst_unit(b, sm))
+    UInv(a)     -> UInv(subst_unit(a, sm))
+    UPow(a, n)  -> UPow(subst_unit(a, sm), n)
+  }
+}
+
+# Walker `subst_expr(e, sm)` rewrites every `Expr.ty` via subst_ty
+# and recurses through map_expr_kind. No name rewriting happens here
+# — call-site rewrite is a separate walker that runs post-subst.
+fn subst_expr(e: Expr, sm: SubstMap) : Expr {
+  let ty1 = match e.ty {
+    Some(t) -> Some(subst_ty(t, sm))
+    None    -> None
+  }
+  Expr { kind: subst_kind(e.kind, sm), line: e.line, col: e.col, ty: ty1 }
+}
+
+fn subst_kind(k: ExprKind, sm: SubstMap) : ExprKind {
+  map_expr_kind(k, (sub) => subst_expr(sub, sm))
+}
+
+fn subst_decl(d: Decl, sm: SubstMap) : Decl {
+  match d {
+    DFn(is_pub, name, tps, ps, ret, row, body, ln, cl, mo) ->
+      DFn(is_pub, name, tps, ps, ret, row, subst_expr(body, sm), ln, cl, mo)
+    DTest(desc, body, ln, cl) ->
+      DTest(desc, subst_expr(body, sm), ln, cl)
+    _ -> d
+  }
+}
+
+# Per-spec body emission: build SubstMap, substitute the body, run
+# the call-site rewrite walker with the substitution map applied
+# inline at each call site (so internal polymorphic-flow-through
+# calls retarget to their spec mangled names), and return the
+# rewritten DFn alongside the list of newly-discovered tuples.
+type SpecEmitOut = SEO(Decl, [MonoTuple])
+
+fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
+              all_tuples: [MonoTuple]) : SpecEmitOut {
+  match mt { MT(_, tys, units) -> {
+    let sm = build_subst_map(d, tys, units)
+    let spec0 = specialise_decl(d, tys, units)
+    let spec1 = subst_decl(spec0, sm)
+    # Discover transitive tuples introduced by body subst: for each
+    # ECall(EVar(name)) inside the spec body, look up the original
+    # CS, apply sm, and collect concrete poly tuples not yet known.
+    let new_tuples = discover_new_tuples_decl(spec1, insts, polys, all_tuples, sm)
+    let updated_tuples = list_append(all_tuples, new_tuples)
+    let spec2 = rewrite_callsites_decl_sm(spec1, insts, updated_tuples, sm)
+    SEO(spec2, new_tuples)
+  } }
+}
+
+# Walk a decl's body collecting concrete poly tuples introduced by
+# applying `sm` to each call site's recorded `(tys, units)`. Used
+# only by `emit_spec` for transitive spec discovery; the pre-mono
+# rewrite uses the empty sm so this is a no-op for it.
+fn discover_new_tuples_decl(d: Decl, insts: [ResolvedCS], polys: [PolyFn],
+                             existing: [MonoTuple], sm: SubstMap) : [MonoTuple] {
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) ->
+      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
+    DTest(_, body, _, _) ->
+      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
+    _ -> []
+  }
+}
+
+fn discover_new_tuples_expr(e: Expr, insts: [ResolvedCS], polys: [PolyFn],
+                             existing: [MonoTuple], sm: SubstMap,
+                             acc: [MonoTuple]) : [MonoTuple] {
+  let acc1 = discover_new_tuples_kind(e.kind, insts, polys, existing, sm, acc)
+  match e.kind {
+    ECall(callee, _) -> match callee.kind {
+      EVar(name) -> match find_mono_inst(insts, name, callee.line, callee.col) {
+        Some(p) -> match p {
+          MIPair(tys0, units0) -> {
+            let tys = map(tys0, (t) => subst_ty(t, sm))
+            let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
+            let is_poly = match lookup_poly_fn(polys, name) {
+              Some(_) -> true None -> false
+            }
+            let any_slot = list_length(tys) > 0 or list_length(units) > 0
+            let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
+            let mt = MT(name, tys, units)
+            let is_new = is_poly and concrete and not tuple_in(existing, mt) and not mt_in_acc(acc1, mt)
+            if is_new { [mt, ...acc1] } else { acc1 }
+          }
+        }
+        None -> acc1
+      }
+      _ -> acc1
+    }
+    _ -> acc1
+  }
+}
+
+fn mt_in_acc(acc: [MonoTuple], t: MonoTuple) : Bool {
+  match acc {
+    [] -> false
+    [h, ...rest] -> if tuple_eq(h, t) { true } else { mt_in_acc(rest, t) }
+  }
+}
+
+# Recurse through every direct sub-Expr inside an ExprKind so the
+# discovery walker can find calls in nested positions. Uses
+# map_expr_kind shape but with a fold accumulator.
+fn discover_new_tuples_kind(k: ExprKind, insts: [ResolvedCS], polys: [PolyFn],
+                             existing: [MonoTuple], sm: SubstMap,
+                             acc: [MonoTuple]) : [MonoTuple] {
+  match k {
+    EInt(_)        -> acc
+    EReal(_)       -> acc
+    EBool(_)       -> acc
+    EChar(_)       -> acc
+    EStr(_, _)     -> acc
+    EUnit          -> acc
+    EVar(_)        -> acc
+    EUnder         -> acc
+    EPlaceholder   -> acc
+    EHole(_)       -> acc
+    ETodo(_)       -> acc
+    EVariantsOf(_, _) -> acc
+    EModCall(_, _) -> acc
+    ECall(callee, args_) -> {
+      let acc1 = discover_new_tuples_expr(callee, insts, polys, existing, sm, acc)
+      discover_new_tuples_args(args_, insts, polys, existing, sm, acc1)
+    }
+    EField(base, _)   -> discover_new_tuples_expr(base, insts, polys, existing, sm, acc)
+    EIndex(a, b)      -> discover_new_tuples_expr(b, insts, polys, existing, sm,
+                          discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+    EBinop(_, a, b)   -> discover_new_tuples_expr(b, insts, polys, existing, sm,
+                          discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+    EUnop(_, x)       -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
+    EIf(c, t_, eo)    -> {
+      let a1 = discover_new_tuples_expr(c, insts, polys, existing, sm, acc)
+      let a2 = discover_new_tuples_expr(t_, insts, polys, existing, sm, a1)
+      match eo { Some(eb) -> discover_new_tuples_expr(eb, insts, polys, existing, sm, a2) None -> a2 }
+    }
+    EMatch(scr, arms) -> {
+      let a1 = discover_new_tuples_expr(scr, insts, polys, existing, sm, acc)
+      discover_new_tuples_arms(arms, insts, polys, existing, sm, a1)
+    }
+    ELambda(_, b)     -> discover_new_tuples_expr(b, insts, polys, existing, sm, acc)
+    ERecordLit(_, fs) -> discover_new_tuples_fields(fs, insts, polys, existing, sm, acc)
+    EList(els)        -> discover_new_tuples_elems(els, insts, polys, existing, sm, acc)
+    ERange(a, b, opt_step) -> {
+      let a1 = discover_new_tuples_expr(a, insts, polys, existing, sm, acc)
+      let a2 = discover_new_tuples_expr(b, insts, polys, existing, sm, a1)
+      match opt_step { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a2) None -> a2 }
+    }
+    EBlock(stmts, tail) -> {
+      let a1 = discover_new_tuples_stmts(stmts, insts, polys, existing, sm, acc)
+      match tail { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a1) None -> a1 }
+    }
+    EPipe(a, b)      -> discover_new_tuples_expr(b, insts, polys, existing, sm,
+                         discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let a1 = discover_new_tuples_expr(body, insts, polys, existing, sm, acc)
+      let a2 = match init_opt { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a1) None -> a1 }
+      let a3 = discover_new_tuples_clauses(clauses, insts, polys, existing, sm, a2)
+      match ret_opt { Some(r) -> match r { HR(_, b, _, _) -> discover_new_tuples_expr(b, insts, polys, existing, sm, a3) } None -> a3 }
+    }
+    ELitUnit(inner, _) -> discover_new_tuples_expr(inner, insts, polys, existing, sm, acc)
+    EBang(inner)       -> discover_new_tuples_expr(inner, insts, polys, existing, sm, acc)
+  }
+}
+
+fn discover_new_tuples_args(args: [Expr], insts: [ResolvedCS], polys: [PolyFn],
+                             existing: [MonoTuple], sm: SubstMap,
+                             acc: [MonoTuple]) : [MonoTuple] {
+  match args {
+    [] -> acc
+    [a, ...rest] -> discover_new_tuples_args(rest, insts, polys, existing, sm,
+                      discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+  }
+}
+
+fn discover_new_tuples_arms(arms: [Arm], insts: [ResolvedCS], polys: [PolyFn],
+                             existing: [MonoTuple], sm: SubstMap,
+                             acc: [MonoTuple]) : [MonoTuple] {
+  match arms {
+    [] -> acc
+    [arm, ...rest] -> match arm {
+      Arm(_, g, b) -> {
+        let a1 = match g { Some(ge) -> discover_new_tuples_expr(ge, insts, polys, existing, sm, acc) None -> acc }
+        let a2 = discover_new_tuples_expr(b, insts, polys, existing, sm, a1)
+        discover_new_tuples_arms(rest, insts, polys, existing, sm, a2)
+      }
+    }
+  }
+}
+
+fn discover_new_tuples_fields(fs: [FieldInit], insts: [ResolvedCS], polys: [PolyFn],
+                               existing: [MonoTuple], sm: SubstMap,
+                               acc: [MonoTuple]) : [MonoTuple] {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      FI(_, v) -> discover_new_tuples_fields(rest, insts, polys, existing, sm,
+                    discover_new_tuples_expr(v, insts, polys, existing, sm, acc))
+    }
+  }
+}
+
+fn discover_new_tuples_elems(els: [ListElem], insts: [ResolvedCS], polys: [PolyFn],
+                              existing: [MonoTuple], sm: SubstMap,
+                              acc: [MonoTuple]) : [MonoTuple] {
+  match els {
+    [] -> acc
+    [el, ...rest] -> {
+      let acc1 = match el {
+        ElPlain(x)  -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
+        ElSpread(x) -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
+      }
+      discover_new_tuples_elems(rest, insts, polys, existing, sm, acc1)
+    }
+  }
+}
+
+fn discover_new_tuples_stmts(stmts: [Stmt], insts: [ResolvedCS], polys: [PolyFn],
+                              existing: [MonoTuple], sm: SubstMap,
+                              acc: [MonoTuple]) : [MonoTuple] {
+  match stmts {
+    [] -> acc
+    [s, ...rest] -> {
+      let acc1 = match s {
+        SLet(_, _, rhs)            -> discover_new_tuples_expr(rhs, insts, polys, existing, sm, acc)
+        SAssert(c, m)              -> match m { Some(me) -> discover_new_tuples_expr(me, insts, polys, existing, sm, discover_new_tuples_expr(c, insts, polys, existing, sm, acc)) None -> discover_new_tuples_expr(c, insts, polys, existing, sm, acc) }
+        SExprStmt(x)               -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
+        SIndexAssign(b, i, v, _, _)-> discover_new_tuples_expr(v, insts, polys, existing, sm,
+                                        discover_new_tuples_expr(i, insts, polys, existing, sm,
+                                          discover_new_tuples_expr(b, insts, polys, existing, sm, acc)))
+        SVar(_, _, rhs, _, _)      -> discover_new_tuples_expr(rhs, insts, polys, existing, sm, acc)
+        SUse(_, _, _)              -> acc
+      }
+      discover_new_tuples_stmts(rest, insts, polys, existing, sm, acc1)
+    }
+  }
+}
+
+fn discover_new_tuples_clauses(cs: [HClause], insts: [ResolvedCS], polys: [PolyFn],
+                                existing: [MonoTuple], sm: SubstMap,
+                                acc: [MonoTuple]) : [MonoTuple] {
+  match cs {
+    [] -> acc
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) -> discover_new_tuples_clauses(rest, insts, polys, existing, sm,
+                            discover_new_tuples_expr(b, insts, polys, existing, sm, acc))
+    }
+  }
+}
+
+# rewrite_callsites_decl with an explicit SubstMap. Pre-mono uses
+# `subst_map_empty()`; per-spec uses the spec's own map. Subst is
+# applied to the looked-up `(tys, units)` at each call site so that
+# internal polymorphic-flow-through calls retarget to their spec
+# mangled names.
+fn rewrite_callsites_decl_sm(d: Decl, insts: [ResolvedCS],
+                              tuples: [MonoTuple], sm: SubstMap) : Decl {
+  match d {
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, n, tps, ps, ret, row,
+          rewrite_callsites_expr_sm(body, insts, tuples, sm), l, c, mo)
+    DTest(desc, body, l, c) ->
+      DTest(desc, rewrite_callsites_expr_sm(body, insts, tuples, sm), l, c)
+    _ -> d
+  }
+}
+
+fn rewrite_callsites_expr_sm(e: Expr, insts: [ResolvedCS],
+                              tuples: [MonoTuple], sm: SubstMap) : Expr =
+  Expr { kind: rewrite_callsites_kind_sm(e.kind, insts, tuples, sm),
+         line: e.line, col: e.col, ty: e.ty }
+
+fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
+                              tuples: [MonoTuple], sm: SubstMap) : ExprKind {
+  match k {
+    ECall(callee, args_) -> match callee.kind {
+      EVar(name) -> {
+        let new_args = map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, sm))
+        match find_mono_inst(insts, name, callee.line, callee.col) {
+          Some(p) -> match p {
+            MIPair(tys0, units0) -> {
+              let tys = map(tys0, (t) => subst_ty(t, sm))
+              let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
+              if tuple_in(tuples, MT(name, tys, units)) {
+                let mangled = mangle_name(name, tys, units)
+                let new_callee = Expr { kind: EVar(mangled),
+                                         line: callee.line, col: callee.col,
+                                         ty: callee.ty }
+                ECall(new_callee, new_args)
+              } else {
+                ECall(callee, new_args)
+              }
+            }
+          }
+          None -> ECall(callee, new_args)
+        }
+      }
+      _ -> ECall(rewrite_callsites_expr_sm(callee, insts, tuples, sm),
+                  map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, sm)))
+    }
+    _ -> map_expr_kind(k, (sub) => rewrite_callsites_expr_sm(sub, insts, tuples, sm))
+  }
+}
+
+# Iterate spec emission to fixpoint. `worklist` holds tuples not yet
+# emitted; `done` holds emitted tuples (so we never spec the same
+# (name, tys, units) twice). `all_tuples` is the running set used
+# by per-spec rewrite to know which retargets are reachable.
+fn generate_specs_iter(polys: [PolyFn], worklist: [MonoTuple],
+                        insts: [ResolvedCS], specs_acc: [Decl],
+                        all_tuples: [MonoTuple]) : GenSpecsResult {
+  match worklist {
+    [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples)
+    [t, ...rest] -> match lookup_poly_fn(polys, mt_name(t)) {
+      None -> generate_specs_iter(polys, rest, insts, specs_acc, all_tuples)
+      Some(d) -> {
+        let r = emit_spec(d, t, insts, polys, all_tuples)
+        match r {
+          SEO(spec, new_ts) -> {
+            let next_worklist = list_append(rest, new_ts)
+            let next_all = list_append(all_tuples, new_ts)
+            generate_specs_iter(polys, next_worklist, insts,
+                                 [spec, ...specs_acc], next_all)
+          }
         }
       }
     }
   }
 }
 
-fn specialise_decl(d: Decl, tys: [Ty]) : Decl {
+fn mt_name(t: MonoTuple) : String =
+  match t { MT(n, _, _) -> n }
+
+fn specialise_decl(d: Decl, tys: [Ty], units: [UnitExprT]) : Decl {
   match d {
     DFn(is_pub, name, _, params, opt_ret, row, body, ln, cl, mo) -> {
-      let mangled = mangle_name(name, tys)
+      let mangled = mangle_name(name, tys, units)
       DFn(is_pub, mangled, [], params, opt_ret, row, body, ln, cl, mo)
     }
     _ -> d
@@ -20430,85 +21466,46 @@ fn specialise_decl(d: Decl, tys: [Ty]) : Decl {
 #
 # Walk every DFn / DTest body and rewrite each `ECall(EVar(name),
 # args)` whose `(name, callee.line, callee.col)` matches a
-# `ResolvedCS` with concrete tys that produced a specialisation in
-# `tuples`. The rewritten callee is `EVar(mangle_name(name, tys))`
-# at the same source position; args recurse under the same walker.
+# `ResolvedCS` with concrete tys+units that produced a specialisation
+# in `tuples`. The rewritten callee is `EVar(mangle_name(name, tys,
+# units))` at the same source position; args recurse under the
+# same walker.
 #
-# Keying is `(name, line, col)` against `tp.insts` because the typer
-# pushes one `CS(name, e.line, e.col, fresh_ids)` per polymorphic
-# `EVar` instantiation (`synth` line ~16902). The line/col are the
-# `EVar`'s source position, which equals the `ECall`'s callee
-# position — so a single linear scan over `tp.insts` resolves to a
-# unique RCS per call site. Names shadowed by a local binding never
-# push a CS (the local's scheme is monomorphic), so scope tracking
-# is unnecessary at the rewrite stage.
+# Keying is `(name, line, col)` against insts because the typer
+# pushes one `CS(name, e.line, e.col, fresh_tys, fresh_units)` per
+# polymorphic `EVar` instantiation. Names shadowed by a local
+# binding never push a CS (the local's scheme is monomorphic), so
+# scope tracking is unnecessary at the rewrite stage.
 #
 # Bare `EVar(name)` references (function-as-value, partial
 # application) are left untouched: the polymorphic original stays in
 # the decl list specifically to support those uses.
+# Pre-mono rewrite over the whole program. Delegates to the SM-aware
+# rewriter with an empty SubstMap, so call sites whose recorded tys/
+# units are already concrete retarget to their mangled names; ones
+# whose tuples still contain `TyVarT` / `UVar` (polymorphic flow-
+# through) leave the callee alone — those become concrete only inside
+# specs, where `rewrite_callsites_decl_sm` runs with the spec's map.
 fn rewrite_callsites_decls(ds: [Decl], insts: [ResolvedCS],
                             tuples: [MonoTuple]) : [Decl] =
   map(ds, (d) => rewrite_callsites_decl(d, insts, tuples))
 
 fn rewrite_callsites_decl(d: Decl, insts: [ResolvedCS],
-                           tuples: [MonoTuple]) : Decl {
-  match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
-      DFn(pub_, n, tps, ps, ret, row,
-          rewrite_callsites_expr(body, insts, tuples), l, c, mo)
-    DTest(desc, body, l, c) ->
-      DTest(desc, rewrite_callsites_expr(body, insts, tuples), l, c)
-    _ -> d
-  }
-}
+                           tuples: [MonoTuple]) : Decl =
+  rewrite_callsites_decl_sm(d, insts, tuples, subst_map_empty())
 
-fn rewrite_callsites_expr(e: Expr, insts: [ResolvedCS],
-                           tuples: [MonoTuple]) : Expr =
-  Expr { kind: rewrite_callsites_kind(e.kind, insts, tuples),
-         line: e.line, col: e.col, ty: e.ty }
+type MonoInstPair = MIPair([Ty], [UnitExprT])
 
-fn rewrite_callsites_kind(k: ExprKind, insts: [ResolvedCS],
-                           tuples: [MonoTuple]) : ExprKind {
-  match k {
-    ECall(callee, args_) -> match callee.kind {
-      EVar(name) -> {
-        let new_args = map(args_, (a) => rewrite_callsites_expr(a, insts, tuples))
-        match find_mono_tys(insts, name, callee.line, callee.col) {
-          Some(tys) ->
-            if tuple_in(tuples, MT(name, tys)) {
-              let mangled = mangle_name(name, tys)
-              let new_callee = Expr { kind: EVar(mangled),
-                                       line: callee.line, col: callee.col,
-                                       ty: callee.ty }
-              ECall(new_callee, new_args)
-            } else {
-              ECall(callee, new_args)
-            }
-          None -> ECall(callee, new_args)
-        }
-      }
-      _ -> ECall(rewrite_callsites_expr(callee, insts, tuples),
-                  map(args_, (a) => rewrite_callsites_expr(a, insts, tuples)))
-    }
-    # All other ExprKind variants recurse purely structurally — there
-    # is no scope bookkeeping needed and `map_expr_kind` already covers
-    # every Stmt / Arm / HClause / HReturn descendant. Adding a new
-    # ExprKind variant fails compilation in `map_expr_kind` rather
-    # than silently leaking through this walker.
-    _ -> map_expr_kind(k, (sub) => rewrite_callsites_expr(sub, insts, tuples))
-  }
-}
-
-fn find_mono_tys(insts: [ResolvedCS], name: String,
-                  line: Int, col: Int) : Option[[Ty]] {
+fn find_mono_inst(insts: [ResolvedCS], name: String,
+                   line: Int, col: Int) : Option[MonoInstPair] {
   match insts {
     [] -> None
     [r, ...rest] -> match r {
-      RCS(rn, rl, rc, tys) ->
+      RCS(rn, rl, rc, tys, units) ->
         if rn == name and rl == line and rc == col {
-          Some(tys)
+          Some(MIPair(tys, units))
         } else {
-          find_mono_tys(rest, name, line, col)
+          find_mono_inst(rest, name, line, col)
         }
     }
   }
@@ -27647,9 +28644,9 @@ fn inv_pfields_names(fs: [PField], acc: [String]) : [String] {
 
 fn validate_inv_expr(e: Expr, file: String, bound: [String], errs: Int) : Int {
   # Invariant (a) — "every Expr has Some(ty) post-finalise" — was
-  # too strict: post-typer rewrite passes (`try_rewrite_show_dim_real`,
-  # `try_rewrite_proto_call`, the AST splicer in `desugar_interp`,
-  # etc.) construct fresh `mk_expr(...)` nodes whose `ty` is None
+  # too strict: post-typer rewrite passes (`try_rewrite_proto_call`,
+  # the AST splicer in `desugar_interp`, etc.) construct fresh
+  # `mk_expr(...)` nodes whose `ty` is None
   # by design — the rewriters are syntactic and have no typer
   # substitution to apply. A useful (a) needs a "this node was
   # constructed by a post-typer pass" tracker that today does not
@@ -27868,26 +28865,11 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
             None -> None
             Some(ty) -> match ty_head_name(ty) {
               None -> None
-              Some(tname) -> {
-                # m12.8 phase 2: special-case `show(x)` when `x : Real<u>`
-                # with a concrete unit name. The parametric impl body in
-                # stdlib/protocols.kai cannot bake the unit suffix on its
-                # own (the body's `x.ty` keeps the impl-level UVar even
-                # after inference, since the m4c monomorphiser is still
-                # identity), so we synthesise the unit-aware expression
-                # at the call site using the concrete arg type. Bare
-                # `Real` falls through to the parametric body, which
-                # returns just `real_to_string(x)` because `unit_name(x)`
-                # emits "" for unresolved units.
-                match try_rewrite_show_dim_real(opname, self_arg) {
-                  Some(rk) -> Some(rk)
-                  None -> match find_impl(reg, opname, tname) {
-                    None -> None
-                    Some(impl_fn) -> {
-                      let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
-                      Some(ECall(new_callee, args_))
-                    }
-                  }
+              Some(tname) -> match find_impl(reg, opname, tname) {
+                None -> None
+                Some(impl_fn) -> {
+                  let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
+                  Some(ECall(new_callee, args_))
                 }
               }
             }
@@ -27897,41 +28879,6 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
     }
     _ -> None
   }
-}
-
-# m12.8 phase 2: synthesise `string_concat(real_to_string(__strip_unit(arg)),
-# " <UNIT>")` when the call is `show(arg)` and `arg : Real<u>` with a
-# concrete unit. Returns None for bare `Real` / `Real<1>` / unresolved
-# UVar — those cases either have nothing to suffix or cannot determine
-# the unit at compile time, so they fall back to the parametric impl
-# body's `real_to_string` path.
-fn try_rewrite_show_dim_real(opname: String, arg: Expr) : Option[ExprKind] {
-  if opname != "show" { None }
-  else { match arg.ty {
-    Some(t) -> match t {
-      TyDimT(base, _) -> match base {
-        TyReal -> {
-          let unit_str = unit_name_of_ty(arg.ty)
-          if string_length(unit_str) == 0 { None }
-          else {
-            let line = arg.line
-            let col = arg.col
-            let strip = mk_expr(ECall(mk_expr(EVar("__strip_unit"), line, col),
-                                       [arg]), line, col)
-            let bare  = mk_expr(ECall(mk_expr(EVar("real_to_string"), line, col),
-                                       [strip]), line, col)
-            let suffix_span = concat_all(["\" ", unit_str, "\""])
-            let suffix = mk_expr(EStr(suffix_span, false), line, col)
-            Some(ECall(mk_expr(EVar("string_concat"), line, col),
-                        [bare, suffix]))
-          }
-        }
-        _ -> None
-      }
-      _ -> None
-    }
-    None -> None
-  } }
 }
 
 # Strip the `__proto_` dispatcher prefix the rename pass attaches.
