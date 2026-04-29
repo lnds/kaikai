@@ -18293,6 +18293,147 @@ fn resolve_callsites(css: [CallSite], sub: Subst) : [ResolvedCS] {
 # position that doesn't constrain (e.g. the whole body of a fn with
 # no declared return).
 type ResolvedHole = RH(HoleKind, Int, Int, Ty, [TyEntry], Int)
+
+# m7f §6 / L2 (Phase L #2): a typed effect-hole resolution. Recorded
+# per occurrence of `?` or `?name` in row tail position; one instance
+# per parser placeholder regardless of how many times the same source
+# name (`?e`) appears in a signature — each `?e` is its own anonymous
+# row variable, not a re-use, so the reporter mirrors that.
+#
+# Fields:
+#   - source name (`Some("e")` for `?e`, `None` for bare `?`)
+#   - source line/col (location of the `?` token in the input file)
+#   - enclosing fn name
+#   - resolved Row (apply_row of the row-var the hole was bound to)
+#   - body_row: labels actually performed by the fn's body. Useful
+#     because `check_body_row` skips unification when the declared
+#     row is `ROpen` (a hole IS an open row), so `resolved` is often
+#     just the unbound tail variable. Consumers (LLMs) want to know
+#     the body's effective row to fill the hole with. Order matches
+#     the order labels were first encountered during inference.
+type ResolvedRowHole = RRH(Option[String], Int, Int, String, Row, [String])
+
+# Parse an internal row-hole placeholder name back into its
+# components. Mirrors the format minted by parse_row_labels:
+#   - `__rowhole__anon_<line>_<col>` for `?`     → (None, line, col)
+#   - `__rowhole_<name>_<line>_<col>` for `?nm`  → (Some(name), line, col)
+# Anything else returns None — defensive in case a non-hole rvar
+# gets passed in by mistake.
+type RowHoleSplit = { name: Option[String], line: Int, col: Int }
+
+fn split_row_hole_name(s: String) : Option[RowHoleSplit] {
+  if not string_starts_with_q(s, "__rowhole_") { None }
+  else {
+    let n = string_length(s)
+    # Find the last `_` (between line and col).
+    match find_last_underscore(s, n - 1) {
+      None -> None
+      Some(p_col) -> {
+        # Find the second-to-last `_` (between name and line).
+        match find_last_underscore(s, p_col - 1) {
+          None -> None
+          Some(p_line) -> {
+            let col_s  = substring_range(s, p_col + 1, n)
+            let line_s = substring_range(s, p_line + 1, p_col)
+            let name_part = substring_range(s, 10, p_line)
+            # 10 = length of "__rowhole_"; remaining is either "_anon"
+            # (anonymous `?`) or the user-written name (`e`, `eff`, …).
+            let nm = if name_part == "_anon" { None } else { Some(name_part) }
+            match parse_decimal(line_s) {
+              None -> None
+              Some(line) -> match parse_decimal(col_s) {
+                None -> None
+                Some(col) ->
+                  Some(RowHoleSplit { name: nm, line: line, col: col })
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn find_last_underscore(s: String, from: Int) : Option[Int] {
+  if from < 0 { None }
+  else {
+    match char_at(s, from) {
+      Some(c) -> if c == '_' { Some(from) } else { find_last_underscore(s, from - 1) }
+      None    -> find_last_underscore(s, from - 1)
+    }
+  }
+}
+
+fn substring_range(s: String, lo: Int, hi: Int) : String =
+  substring_loop(s, lo, hi, "")
+
+fn substring_loop(s: String, i: Int, hi: Int, acc: String) : String {
+  if i >= hi { acc }
+  else {
+    match char_at(s, i) {
+      Some(c) -> substring_loop(s, i + 1, hi, string_concat(acc, "#{c}"))
+      None    -> acc
+    }
+  }
+}
+
+fn parse_decimal(s: String) : Option[Int] = parse_decimal_loop(s, 0, string_length(s), 0, false)
+
+fn parse_decimal_loop(s: String, i: Int, n: Int, acc: Int, any: Bool) : Option[Int] {
+  if i >= n { if any { Some(acc) } else { None } }
+  else {
+    match char_at(s, i) {
+      None -> None
+      Some(c) -> {
+        let d = char_to_int(c) - char_to_int('0')
+        if d < 0 or d > 9 { None }
+        else { parse_decimal_loop(s, i + 1, n, acc * 10 + d, true) }
+      }
+    }
+  }
+}
+
+# Build the [ResolvedRowHole] for one decl. For each rvar name in the
+# decl that matches the row-hole placeholder format, look up its
+# allocated id in `rbinds`, resolve `Row { tail: Some(id) }` under the
+# final substitution, and emit one entry. Non-hole row variables (the
+# user-written tail `e` in `... / Io + e`) are skipped — they are not
+# typed-hole resolutions and belong to a different reporter.
+fn extract_row_holes(d: Decl, rbinds: [RVBind], sub: Subst, body_row: [Label]) : [ResolvedRowHole] {
+  match d {
+    DFn(_, fn_name, _, _, _, _, _, _, _, _) -> {
+      let names = collect_decl_rvars(d)
+      let body_labels = map(apply_labels(sub, body_row), (l) => l.eff)
+      extract_row_holes_loop(names, fn_name, rbinds, sub, body_labels, [])
+    }
+    _ -> []
+  }
+}
+
+fn extract_row_holes_loop(names: [String], fn_name: String,
+                           rbinds: [RVBind], sub: Subst,
+                           body_labels: [String],
+                           acc: [ResolvedRowHole]) : [ResolvedRowHole] {
+  match names {
+    [] -> list_reverse(acc)
+    [n, ...rest] -> {
+      match split_row_hole_name(n) {
+        None -> extract_row_holes_loop(rest, fn_name, rbinds, sub, body_labels, acc)
+        Some(split) -> {
+          match rvbind_lookup(rbinds, n) {
+            None -> extract_row_holes_loop(rest, fn_name, rbinds, sub, body_labels, acc)
+            Some(id) -> {
+              let r = apply_row(sub, Row { labels: [], tail: Some(id),
+                                             display_alias: None })
+              let entry = RRH(split.name, split.line, split.col, fn_name, r, body_labels)
+              extract_row_holes_loop(rest, fn_name, rbinds, sub, body_labels, [entry, ...acc])
+            }
+          }
+        }
+      }
+    }
+  }
+}
 #                       kind     line col expected scope     env_fresh
 
 fn take_entries(es: [TyEntry], n: Int, acc: [TyEntry]) : [TyEntry] {
@@ -18323,7 +18464,8 @@ fn resolve_holes(hs: [HoleSite], sub: Subst) : [ResolvedHole] {
 # Decls after inference: type-annotated body (or original decl for
 # non-DFn). Also carries the error count, the resolved call-site
 # instantiations, and the resolved hole reports.
-type TypedDecl = { decl: Decl, errs: Int, insts: [ResolvedCS], holes: [ResolvedHole] }
+type TypedDecl = { decl: Decl, errs: Int, insts: [ResolvedCS],
+                    holes: [ResolvedHole], row_holes: [ResolvedRowHole] }
 
 # Walk to the expression whose type is what the function body
 # "produces". For block bodies that's the tail expression (or the
@@ -18458,14 +18600,16 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
         } else { row }
         _      -> row
       }
+      let row_holes = extract_row_holes(d, rbinds, st2.sub, st2.row)
       TypedDecl {
         decl: DFn(is_pub, nm, tparams, ps, opt_ret, final_row, final_body, line, col, mo),
         errs: st2.errs,
         insts: resolved,
-        holes: hole_reports
+        holes: hole_reports,
+        row_holes: row_holes
       }
     }
-    _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [] }
+    _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [], row_holes: [] }
   }
 }
 
@@ -18682,19 +18826,22 @@ fn label_to_string(l: Label) : String {
 }
 
 type TypedProgram = { decls: [Decl], errs: Int, insts: [ResolvedCS],
-                      holes: [ResolvedHole], prelude_len: Int }
+                      holes: [ResolvedHole], row_holes: [ResolvedRowHole],
+                      prelude_len: Int }
 
 fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
                    op_eff_arities: [OpEffArity],
                    ds: [Decl], verbose: Bool,
                    acc_decls: [Decl], acc_errs: Int, acc_insts: [ResolvedCS],
                    acc_holes: [ResolvedHole],
+                   acc_row_holes: [ResolvedRowHole],
                    type_aliases: [AliasResult],
                    op_to_eff: [OpToEff]) : TypedProgram {
   match ds {
     [] -> TypedProgram {
       decls: list_reverse(acc_decls), errs: acc_errs,
       insts: list_reverse(acc_insts), holes: list_reverse(acc_holes),
+      row_holes: list_reverse(acc_row_holes),
       prelude_len: prelude_len
     }
     [d, ...rest] -> {
@@ -18705,8 +18852,16 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
                      acc_errs + r.errs,
                      llvm_prepend_reverse(r.insts, acc_insts),
                      prepend_reverse_holes(r.holes, acc_holes),
+                     prepend_reverse_row_holes(r.row_holes, acc_row_holes),
                      type_aliases, op_to_eff)
     }
+  }
+}
+
+fn prepend_reverse_row_holes(xs: [ResolvedRowHole], acc: [ResolvedRowHole]) : [ResolvedRowHole] {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> prepend_reverse_row_holes(rest, [x, ...acc])
   }
 }
 
@@ -19045,7 +19200,7 @@ fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram {
   let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, file)
   let op_to_eff = collect_op_to_eff(decls_a)
   infer_all_loop(file, built.env, built.prelude_len, recs,
-                 built.op_eff_arities, decls_a, verbose, [], 0, [], [],
+                 built.op_eff_arities, decls_a, verbose, [], 0, [], [], [],
                  alias_res.aliases, op_to_eff)
 }
 
@@ -20544,6 +20699,63 @@ fn dump_effects_json(file: String, decls: [Decl]) : Int / Console {
   let body = join_with(map(entries, effects_json_entry), ", ")
   print(concat_all(["[", body, "]"]))
   r.errs
+}
+
+# ---- `--effect-holes-json`: typed effect-hole resolutions as data
+# (m7f §6 + Phase L #2) ----
+#
+# For each `?` or `?name` that appeared in a row tail position, emit
+# what the inferencer resolved it to. Consumers (LLMs, IDEs, the
+# author themselves) read this to know which effect row goes where
+# the hole was written.
+#
+# Schema (stable):
+#   [{
+#     "file": String, "fn": String,
+#     "line": Int, "col": Int,
+#     "name": String | null,        # `?e` → "e"; bare `?` → null
+#     "labels": [String],           # resolved effect labels (sorted)
+#     "open": Bool,                 # true if the tail is still a free row var
+#     "tail_var": String | null     # "?eN" id when open, else null
+#   }]
+fn dump_effect_holes_json(file: String, decls: [Decl]) : Int / Console {
+  let r = infer_program(file, decls, false)
+  let body = join_with(map(r.row_holes, (rh) => json_row_hole_report(file, rh)), ", ")
+  print(concat_all(["[", body, "]"]))
+  r.errs
+}
+
+fn json_row_hole_report(file: String, rrh: ResolvedRowHole) : String {
+  match rrh {
+    RRH(nm_opt, line, col, fn_name, row, body_labels) -> {
+      let name_field = match nm_opt {
+        Some(n) -> json_str(n)
+        None    -> json_null()
+      }
+      let label_strs = map(row.labels, (l) => json_str(l.eff))
+      let labels_field = concat_all(["[", join_with(label_strs, ", "), "]"])
+      let body_strs = map(body_labels, json_str)
+      let body_field = concat_all(["[", join_with(body_strs, ", "), "]"])
+      let open = match row.tail { Some(_) -> true None -> false }
+      let tail_field = match row.tail {
+        Some(v) -> json_str(concat_all(["?e", int_to_string(v)]))
+        None    -> json_null()
+      }
+      concat_all([
+        "{",
+        "\"file\": ", json_str(file),
+        ", \"fn\": ", json_str(fn_name),
+        ", \"line\": ", int_to_string(line),
+        ", \"col\": ", int_to_string(col),
+        ", \"name\": ", name_field,
+        ", \"labels\": ", labels_field,
+        ", \"open\": ", if open { "true" } else { "false" },
+        ", \"tail_var\": ", tail_field,
+        ", \"body_row\": ", body_field,
+        "}"
+      ])
+    }
+  }
 }
 
 type EffEntry = { fn_name: String, line: Int, col: Int,
@@ -25862,6 +26074,7 @@ fn resolve_protocol_calls(typed: TypedProgram, reg: ProtocolReg) : TypedProgram 
     errs: typed.errs,
     insts: typed.insts,
     holes: typed.holes,
+    row_holes: typed.row_holes,
     prelude_len: typed.prelude_len
   }
 }
@@ -26613,6 +26826,7 @@ type Mode
   | MHoles
   | MHolesJson
   | MEffectsJson
+  | MEffectHolesJson
   | MEmitLlvm
   | MTest
   | MHelp
@@ -26679,6 +26893,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MHolesJson))
       } else if a == "--effects-json" {
         parse_cli_loop(more, cli_with_mode(opts, MEffectsJson))
+      } else if a == "--effect-holes-json" {
+        parse_cli_loop(more, cli_with_mode(opts, MEffectHolesJson))
       } else if a == "--strict-holes" {
         parse_cli_loop(more, cli_with_strict_holes(opts))
       } else if a == "--emit=llvm" {
@@ -26733,6 +26949,8 @@ fn usage() : Unit / Console {
   eprint("  --dump-last-use    list each fn parameter's last-use position (m5 #2 diagnostic)")
   eprint("  --holes            report every typed hole (`?` / `?name`) with expected type + scope")
   eprint("  --holes-json       same as --holes, but JSON array for machine consumption")
+  eprint("  --effects-json     report per-fn effects + handlers as JSON")
+  eprint("  --effect-holes-json  report typed effect-hole resolutions (`?` / `?e` in row tail) as JSON")
   eprint("  --strict-holes     treat every unfilled hole as a compilation error (default: warning)")
   eprint("  --emit=llvm        emit LLVM IR (.ll) instead of C; link with stage0/runtime_llvm.c")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
@@ -27444,6 +27662,10 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               MEffectsJson -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_effects_json(path, all_decls) }
+              }
+              MEffectHolesJson -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_effect_holes_json(path, all_decls) }
               }
               _ -> {
                 let chk = check_program(path, all_decls)
