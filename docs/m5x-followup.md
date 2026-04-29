@@ -14,6 +14,11 @@ changes. The remaining ~29M still leak — that is the absence of a
 Perceus discipline, not a Perceus inefficiency, and what the items
 below address.
 
+**Scope decision** (2026-04-29): see `docs/perceus-honesty-targets.md`
+for which items below belong to Show-HN-honest, Production-honest 1.0,
+and post-MVP tiers. This file is the operational inventory; the
+honesty-target file is the strategic scope.
+
 ## Deferred items
 
 ### 1. m5 #9 step 3/4 — runtime primitive linear consumption *(LANDED 2026-04-28)*
