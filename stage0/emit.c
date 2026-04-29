@@ -65,6 +65,28 @@ typedef struct {
     size_t  n_marks, cap_marks;
 } LocalScope;
 
+/* m5.x flip Phase 3 closeout — Step D refinement (2026-04-29):
+ * use-counter for the current fn body. Populated with parameters
+ * before emit and walked over the body to count IDENT references.
+ * `emit_ident_value` consults it: a parameter that is read exactly
+ * once and never referenced from inside a lambda can be emitted
+ * raw (`kai_<name>`) instead of wrapped in `kai_internal_dup` —
+ * the consuming primitive takes the binding's only ref directly,
+ * no leak. Multi-use or captured params keep the brute-force
+ * eager-dup. Locals declared inside the body (let, match arms)
+ * are not tracked here and stay eager-dup. */
+typedef struct {
+    const char *name;
+    size_t      name_len;
+    int         total_count;
+    int         lambda_count;  /* > 0 means at least one read sits inside a lambda body */
+} ParamUse;
+
+typedef struct {
+    ParamUse *items;
+    size_t    n, cap;
+} ParamUseTable;
+
 typedef struct {
     FILE *out;
     int   had_error;
@@ -80,7 +102,8 @@ typedef struct {
     SymEntry *variants; size_t n_variants, cap_variants;
     LamInfo  *lams;     size_t n_lams, cap_lams;
 
-    LocalScope locals;
+    LocalScope    locals;
+    ParamUseTable params;   /* current fn's parameters; cleared between fns */
 } E;
 
 /* ---------- local scope ---------- */
@@ -119,6 +142,58 @@ static int ls_has(E *e, const char *name, size_t len) {
         if (s->lens[i] == len && memcmp(s->names[i], name, len) == 0) return 1;
     }
     return 0;
+}
+
+/* ---------- parameter use counter ---------- */
+
+static void pu_clear(E *e) {
+    e->params.n = 0;
+}
+
+static void pu_add(E *e, const char *name, size_t len) {
+    ParamUseTable *t = &e->params;
+    if (t->n == t->cap) {
+        t->cap = t->cap ? t->cap * 2 : 8;
+        t->items = (ParamUse *) realloc(t->items, t->cap * sizeof(ParamUse));
+    }
+    t->items[t->n].name = name;
+    t->items[t->n].name_len = len;
+    t->items[t->n].total_count = 0;
+    t->items[t->n].lambda_count = 0;
+    t->n++;
+}
+
+static ParamUse *pu_lookup(E *e, const char *name, size_t len) {
+    ParamUseTable *t = &e->params;
+    for (size_t i = 0; i < t->n; ++i) {
+        if (t->items[i].name_len == len
+            && memcmp(t->items[i].name, name, len) == 0) {
+            return &t->items[i];
+        }
+    }
+    return NULL;
+}
+
+/* Walk an AST node, incrementing each parameter's use count for every
+ * N_IDENT reference. `in_lambda` flips to 1 when descending into an
+ * N_LAMBDA so the parameter's `lambda_count` records whether it is
+ * captured. Pattern-bound names that shadow a parameter are not
+ * tracked here — the body lookup goes through ls_has first, so the
+ * shadowing case stays at the eager-dup default safely. */
+static void count_param_uses(E *e, Node *n, int in_lambda) {
+    if (!n) return;
+    if (n->kind == N_IDENT) {
+        ParamUse *u = pu_lookup(e, n->name, n->name_len);
+        if (u) {
+            u->total_count++;
+            if (in_lambda) u->lambda_count++;
+        }
+        return;
+    }
+    int child_in_lambda = in_lambda || (n->kind == N_LAMBDA);
+    for (size_t i = 0; i < n->n_children; ++i) {
+        count_param_uses(e, n->children[i], child_in_lambda);
+    }
 }
 
 /* Walk a pattern, adding every PAT_BIND name to the local scope. Used
@@ -292,15 +367,24 @@ static void emit_ident_value(E *e, const char *name, size_t len) {
     const char *mapped = NULL;
     /* Locals shadow everything, same rationale as emit_ident_callee. */
     if (ls_has(e, name, len)) {
-        /* m5.x-flip Phase 3 — Step D eager-dup retrofit. Stage 0 has no
-         * perceus pass; under the linear-consumption runtime every read
-         * of a local that flows into a consuming primitive would free the
-         * binding mid-flight. Wrap every local read in kai_internal_dup
-         * so the binding's reference is preserved (the caller of the dup
-         * sees its own +1 ref; the binding's original ref stays alive).
-         * This brute-force eager-dup leaks one ref per binding (no exit
-         * drops in stage 0) but never UAFs. The leak baseline matches
-         * pre-flip behaviour where everything also leaked. */
+        /* m5.x-flip Phase 3 — Step D refinement (2026-04-29): a fn
+         * parameter that is read exactly once in the whole body and
+         * never referenced from inside a lambda owns the only live
+         * ref; the consuming primitive takes that ref directly, no
+         * leak. Multi-use or captured parameters fall through to the
+         * brute-force eager-dup so the binding survives the consume.
+         * Locals introduced by let / match arms are not tracked by
+         * pu_lookup and always take the eager-dup path (safe). */
+        ParamUse *u = pu_lookup(e, name, len);
+        if (u && u->total_count == 1 && u->lambda_count == 0) {
+            fprintf(e->out, "kai_%.*s", (int) len, name);
+            return;
+        }
+        /* m5.x-flip Phase 3 — Step D eager-dup retrofit. Wrap every
+         * other local read in kai_internal_dup so the binding's
+         * reference is preserved (the caller of the dup sees its own
+         * +1 ref; the binding's original ref stays alive). Leaks one
+         * ref per read (no exit drops in stage 0) but never UAFs. */
         fprintf(e->out, "kai_internal_dup(kai_%.*s)", (int) len, name);
         return;
     }
@@ -1228,10 +1312,18 @@ static void emit_fn_body(E *e, Node *fn) {
     emit_fn_signature(e, fn);
     fputs(" {\n    return ", e->out);
     ls_push_mark(e);
+    pu_clear(e);
     for (size_t i = 2; i < fn->n_children; ++i) {
         Node *p = fn->children[i];
-        if (p && p->kind == N_PARAM) ls_add(e, p->name, p->name_len);
+        if (p && p->kind == N_PARAM) {
+            ls_add(e, p->name, p->name_len);
+            pu_add(e, p->name, p->name_len);
+        }
     }
+    /* Walk the body once to count IDENT references against each
+     * parameter; emit_ident_value uses the result to skip the
+     * eager-dup wrap on single-use, non-captured parameters. */
+    count_param_uses(e, fn->children[1], 0);
     emit_expr(e, fn->children[1]);
     ls_pop_mark(e);
     fputs(";\n}\n\n", e->out);
