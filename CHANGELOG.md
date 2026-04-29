@@ -14,6 +14,65 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 - Versioning infrastructure: tags v0.1.0 → v0.6.0; `bin/kai --version`
   reads `VERSION` dynamically.
 
+## [0.7.0] — 2026-04-29 (math/numeric — single-dispatch `Numeric` protocol)
+
+**Minor: new stdlib protocol.** Single-dispatch `protocol Numeric` in
+`stdlib/math/numeric.kai` collapses the dual-surface (`int_abs(5)` vs
+`real_abs(3.5)` vs `dec_abs(d)`) into one polymorphic call: `abs(x)`,
+`sign(x)`, `pow_int(x, n)`, `clamp(x, lo, hi)`. Lives under `stdlib/math/`
+because it is domain-specific (numeric types only) — `stdlib/protocols.kai`
+is reserved for protocols universal to any type (Show, Eq, Ord, Hash,
+Serialize).
+
+### Added
+
+- **`stdlib/math/numeric.kai`** (new): protocol declaration + impls
+  for `Int` and `Real` (4 ops × 2 types = 8 method bodies).
+- **`stdlib/decimal.kai`** appended `impl Numeric for Decimal` (4
+  ops; `pow_int` uses recursive `dec_mul`, `clamp` wraps `dec_cmp`).
+- **`stdlib/math/real.kai`** (renamed from `float.kai`): keeps only
+  `real_pi`/`real_e`/`real_tau` constants and prefixed `real_min`/
+  `real_max`. abs/sign/pow_int/clamp moved to the Numeric impl.
+- **`stdlib/math/int.kai`**: `int_abs` / `int_pow` removed (now
+  `abs(5)` / `pow_int(5, 3)`). `gcd` / `lcm` / `factorial` / `fib` /
+  `is_prime` stay (Int-specific). `int_min` / `int_max` stay
+  prefixed for the same reason `real_min`/`real_max` do.
+- **`bin/kai` + `stage2/Makefile`**: `numeric.kai` loads before
+  `int`/`real` so the impls see the protocol declaration.
+- **`examples/stdlib/math_int_basic`** + **`math_real_basic`**
+  (renamed from `math_float_basic`): updated to call `abs`/`sign`/
+  `pow_int`/`clamp` polymorphic.
+
+### Changed
+
+- `stdlib/math/float.kai` → `stdlib/math/real.kai` (file rename;
+  the type is `Real`, not `Float`).
+- `examples/stdlib/math_float_basic.*` → `math_real_basic.*` (rename).
+
+### Not in this release
+
+- **`min` / `max` NOT added to `Ord`**: collides with
+  `pub fn min(xs)` / `pub fn max(xs)` in `stdlib/core/list.kai`
+  (different arity, same surface name). Resolver prioritises
+  protocol dispatch even when arity does not match → typer error
+  at the `list.max(xs)` call site. Two paths unblock: (a) rename
+  list.min/max to list.minimum/maximum (Haskell convention);
+  (b) fix resolver to fall back to module fns when no protocol
+  impl matches. Until then `int_min` / `real_min` etc. stay
+  prefixed.
+- **`Numeric` NOT implemented for `Money`**: `pow_int` has no
+  meaning for Money (Money^Int undefined). abs/sign/clamp would
+  work but are partial (clamp requires same currency). Money keeps
+  its `money_*` prefixed surface; if a `Currency` / `Tagged`
+  protocol with a smaller method set emerges, Money picks those up.
+
+### Validation
+
+- Selfhost C + LLVM byte-identical.
+- `make test` clean (incl. new Numeric for Decimal exercises in
+  `math_*_basic`).
+- `make demos-no-regression`: 20 passing (baseline 20).
+
 ## [0.6.0] — 2026-04-28 (stdlib/math/float — Real math helpers)
 
 **Minor: new stdlib module.** Pure-kaikai `Real` math helpers mirroring
