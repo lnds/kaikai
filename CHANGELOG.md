@@ -11,8 +11,64 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Added
 
-- Versioning infrastructure: tags v0.1.0 → v0.6.0; `bin/kai --version`
+- Versioning infrastructure: tags v0.1.0 → v0.7.2; `bin/kai --version`
   reads `VERSION` dynamically.
+
+## [0.8.0] — 2026-04-29 (stdlib extras — int↔real builtins, math/real rounding, path module)
+
+**Minor: new user-visible stdlib surface.** Triple-combo lane that
+lands three mechanically-related stdlib extras:
+
+### Added
+
+- **Phase A — runtime builtins** (`20b7f8e`): `int_to_real(n: Int) :
+  Real` (lossless cast) and `real_to_int(x: Real) : Int` (truncating
+  toward zero). Wired through every layer: `stage0/runtime.h`,
+  `stage0/runtime_llvm.c`, `stage0/check.c`, `stage0/emit.c`,
+  `stage1/stage2 compiler.kai` (prelude_names + EP table), stage2
+  typer (TyEntry) + LLVM declarations + LP table.
+
+  `real_to_int` matches C's `(int64_t) r` semantics: NaN, Inf, and
+  out-of-Int64-range values collapse to 0 — kaikai has no IEEE 754
+  predicate surface for the user yet, so the safer default beats UB.
+
+- **Phase B — `stdlib/math/real.kai` rounding** (`78667a0`): four
+  rounding ops, all pure kaikai over Phase A:
+  - `real_trunc` — toward zero.
+  - `real_floor` — toward -inf.
+  - `real_ceil` — toward +inf.
+  - `real_round` — half-away-from-zero (schoolbook).
+
+  These were marked "deferred — need int_to_real / real_to_int
+  runtime builtins" in v0.6.0; Phase A unblocks them. Banker's
+  rounding (round-half-to-even) stays deferred.
+
+- **Phase C — `stdlib/path.kai`** (`9fa5f3e`): new module with
+  seven public fns over POSIX paths (`/` separator only):
+  - `path_join` / `path_dirname` / `path_basename`
+  - `path_ext` / `path_strip_ext`
+  - `path_split` (returns `Pair[dirname, basename]`)
+  - `path_is_absolute`
+
+  Pure kaikai over the existing string builtins — no FFI, no
+  syscalls. Edge cases verified: leading-dot files (.bashrc has no
+  extension), dots in dirname (`a.b/foo` has no extension), multiple
+  consecutive slashes (`a//` joined with `//c` yields `a/c`),
+  absolute paths preserved through join with root `/`. Wired into
+  `bin/kai` and `stage2/Makefile EXTRA_PRELUDE_FLAGS`.
+
+- New fixtures:
+  - `examples/stdlib/int_real_convert_basic` — Phase A round-trip.
+  - `examples/stdlib/math_real_basic` — extended with 16 rounding
+    checks.
+  - `examples/stdlib/path_basic` — Phase C, 37 checks across all 7 fns.
+
+### Validation
+
+- `make selfhost` byte-identical fixed point.
+- `make -C stage2 selfhost-llvm` byte-identical.
+- `make test` clean (incl. 3 new fixtures).
+- `make demos-no-regression` 21 passing (baseline 21).
 
 ## [0.7.2] — 2026-04-29 (resolver: arity-aware overload resolution)
 
@@ -728,7 +784,11 @@ is closed:
    `try_rewrite_show_dim_real` shortcut in m12.8 Phase 2 confirms it;
    polymorphics with `EHandle` in the body collide on `clause_fn_name`.
 
-[Unreleased]: https://github.com/lnds/kaikai/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/lnds/kaikai/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/lnds/kaikai/compare/v0.7.2...v0.8.0
+[0.7.2]: https://github.com/lnds/kaikai/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/lnds/kaikai/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/lnds/kaikai/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/lnds/kaikai/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/lnds/kaikai/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/lnds/kaikai/compare/v0.4.1...v0.5.0
