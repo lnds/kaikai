@@ -421,6 +421,46 @@ the regex source feeds `rx_parse_pattern` once at compile time
 than the half-day estimate this entry used to carry — defer to a
 proper lane.
 
+#### `demos/spiral/main.kai` — FIXED 2026-04-29 (v0.9.2)
+
+Three lanes had to land before this demo compiled cleanly:
+
+1. **resolver same-module preference** (v0.9.1) — unblocked the
+   `repeat` collision between `stdlib/loop.repeat` and
+   `stdlib/core/list.repeat`.
+2. **didactic error for bare cap reads** (v0.9.2) — turned the
+   spiral source's bare `n`, `top`, ... reads into a typed
+   error pointing at each call site with a `@name` / `name :=
+   <expr>` help line. The original demo predated the `var`
+   sugar's actual semantics; the new diagnostic surfaced every
+   bad site at once.
+3. **closure capture of `kai_alias_<a>_id`** (v0.9.2) — the
+   tagged-op dispatch now stays enabled across lambda
+   boundaries because the closure literal carries the
+   enclosing handle's handler id as an `__alias_id__<a>`
+   sentinel cap, packed as a `kai_int` in the capture array
+   and unpacked by the lambda body prologue. Without this the
+   inner while body's `@n` was routed to the innermost State
+   handler by name and silently shadowed by every nested
+   `var`. Nested-lambda free vars also now propagate to the
+   outer closure's capture set so `grid` / `dim` / cap ids
+   referenced by an inner closure stay visible at the outer's
+   construction site.
+
+After the demo migration to `@n` / `n := @n + 1`, the 4×4
+clockwise spiral renders correctly:
+
+```
+1 2 3 4
+12 13 14 5
+11 16 15 6
+10 9 8 7
+```
+
+Demos baseline raised 22 → 23.
+
+##### Original report
+
 #### `demos/spiral/main.kai` — module path + legacy `println`
 
 ```kai

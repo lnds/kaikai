@@ -14,6 +14,71 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 - Versioning infrastructure: tags v0.1.0 → v0.7.2; `bin/kai --version`
   reads `VERSION` dynamically.
 
+## [0.9.2] — 2026-04-29 (var sugar — didactic errors + nested handler closure capture)
+
+**Patch: var sugar correctness.** Three changes that close a
+long-standing m7b #15 sub-followup. Nested `var` bindings now
+work end-to-end across a lambda boundary, the runtime no longer
+aliases the State slot pointer, and bare reads of a cap binder
+report a Tier-3-style diagnostic at the call site instead of
+crashing inside `cc`.
+
+### Fixed
+
+- **State runtime aliasing** (`stage2/compiler.kai`,
+  `var_canonical_clauses`): the canonical `with State[T] as
+  name` get clause now returns `__perceus_dup(state)` so
+  `self->state` keeps its refcount when the caller consumes
+  the value. Pre-fix `var n = 0; while @n < lim { n := @n + 1
+  }` crashed with `kai: type mismatch in +` once the slot was
+  reused after a single get/consume cycle.
+- **Closure capture of `kai_alias_<a>_id`** for per-instance
+  dispatch (`fv_expr`, `emit_closure_caps`, `emit_lam_cap_reads`,
+  `synth_lambda`, `rewrite_alias_kind`): tagged op calls
+  (`Eff.op@<alias>`) now stay tagged across lambda boundaries.
+  The collector adds an `__alias_id__<alias>` sentinel to each
+  lambda's free-var set, the closure literal packs the matching
+  `KaiHandlerId` as a `kai_int`, and the body prologue unpacks
+  it back into the local the dispatch expects. Nested
+  lambdas now also propagate their free vars to the outer
+  closure's capture set so the inner `kai_closure(...)` literal
+  sees every value it references.
+- **Spiral demo unblocked**: rewritten with the correct cap
+  syntax (`@name`, `name := <expr>`) and now compiles + runs
+  cleanly. 4×4 clockwise spiral output stable. Demo baseline
+  22 → 23.
+
+### Added
+
+- **Didactic error for bare cap reads** (`validate_var_uses_decls`
+  in `stage2/compiler.kai`): a new pre-desugar pass that walks
+  every fn / test body with a stack of in-scope cap binders
+  and reports each bare `EVar(name)` whose `name` is a live
+  cap binder. Reports a span-aware diagnostic with help line:
+
+  ```
+  error: `top` is a State capability bound by `var top = ...` —
+         bare reads are not allowed
+    --> file.kai:12:11
+       |
+    12 |   while { top <= bottom and left <= right } {
+       |           ^
+    = help: use `@top` to read the cell, `top := <expr>` to write it;
+            cap binders are not ordinary locals
+  ```
+
+  Legitimate uses (`name.get()`, `name.set(v)`) and shadowing
+  (let / var / lambda params / match patterns) are recognised
+  and pass through. Pre-fix the bare read leaked to the C
+  compiler as `kai_<name>` undeclared, with no .kai location
+  in the diagnostic.
+
+### Validation
+
+- selfhost (C + LLVM) byte-identical fixed point.
+- `make test` clean.
+- `make demos-no-regression` 23 (baseline raised 22 → 23).
+
 ## [0.9.1] — 2026-04-29 (resolver same-module preference + banker's rounding)
 
 **Patch: same-module preference + new rounding mode.** Two
