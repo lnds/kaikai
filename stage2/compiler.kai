@@ -25813,19 +25813,24 @@ fn lower_protocols(decls: [Decl], file: String) : LoweredProtocols {
   # registered under the same safe name in step 5; the post-inference
   # rewrite then redirects each reachable call to the matching
   # `__pimpl_<P>_<T>_<op>` direct call when the type is known.
-  let user_renamed = rename_proto_calls_decls(stripped, lower_res.reg.op_names)
-  let impl_renamed = rename_proto_calls_decls(lower_res.fns, lower_res.reg.op_names)
+  # Resolver-arity (lane: resolver-arity): project the registry's
+  # POR list into [OpAr] once so the rewriter can compare against
+  # `length(args)` at every call site without re-walking the registry.
+  let op_arities = op_arities_from_ops(lower_res.reg.ops)
+  let user_renamed = rename_proto_calls_decls(stripped, op_arities)
+  let impl_renamed = rename_proto_calls_decls(lower_res.fns, op_arities)
   let final_decls = list_append(user_renamed, list_append(impl_renamed, dispatchers))
   LoweredProtocols { decls: final_decls, reg: lower_res.reg, errs: errs }
 }
 
-# m12.8: pre-resolve renaming pass. Walks every DFn / DTest body and
-# rewrites every `EVar(name)` whose name is a known protocol op into
-# `EVar(__proto_<name>)` — but only when `name` is NOT bound by an
-# enclosing local binder. Scope tracking is threaded as `bound:
-# [String]`, the union of names introduced by the surrounding fn
-# params, lambda params, handler-clause params, handler-return
-# pattern, `let` / `var` binders, and `match` arm patterns.
+# m12.8 + resolver-arity: pre-resolve renaming pass. Walks every DFn /
+# DTest body and rewrites every `EVar(name)` whose name is a known
+# protocol op into `EVar(__proto_<name>)` — but only when `name` is
+# NOT bound by an enclosing local binder. Scope tracking is threaded
+# as `bound: [String]`, the union of names introduced by the
+# surrounding fn params, lambda params, handler-clause params,
+# handler-return pattern, `let` / `var` binders, and `match` arm
+# patterns.
 #
 # Without this guard the rewrite would shadow common parameter names
 # like `cmp` in `list_sort_by(xs, cmp: (a, a) -> Int)`: every
@@ -25834,19 +25839,75 @@ fn lower_protocols(decls: [Decl], file: String) : LoweredProtocols {
 # the receiver is generic in `a`. The bug surfaced in `demos/poker`
 # via `list_sort` once `--prelude stdlib/protocols.kai` was added to
 # the demo build.
+#
+# Resolver-arity refinement (lane: resolver-arity): when the rewrite
+# target is the CALLEE of `ECall(EVar(name), args)`, the rewrite
+# only fires when `length(args)` matches a declared arity for that
+# op. This keeps a same-named module function with a different arity
+# reachable — e.g., `pub fn max(xs: [Int])` in `stdlib/core/list.kai`
+# coexists with `Ord.max(a: Self, b: Self)` in `stdlib/protocols.kai`
+# because `max(xs)` (arity 1) does not match the protocol op's arity
+# 2 and is therefore left alone for the typer to resolve against the
+# EFn table. Each protocol op is threaded as `OpAr(name, arity)`
+# rather than the original `[String]`; the bare-EVar case (first-class
+# fn reference) stays arity-independent and keeps the original
+# "any matching name routes to the dispatcher" behaviour so partial
+# application of an op like `let f = cmp` still resolves.
 
-fn rename_proto_calls_decls(ds: [Decl], op_names: [String]) : [Decl] =
-  map(ds, (d) => rename_proto_calls_decl(d, op_names))
+# Protocol op signature pair `(name, arity)` consumed by the
+# arity-aware rewriter.
+type OpAr = OpAr(String, Int)
 
-fn rename_proto_calls_decl(d: Decl, op_names: [String]) : Decl {
+# Project the registry's POR list into `[OpAr]`. Done once at the
+# `lower_protocols` boundary; the rewriter then threads it.
+fn op_arities_from_ops(ops: [ProtoOpReg]) : [OpAr] {
+  match ops {
+    [] -> []
+    [op, ...rest] -> match op {
+      POR(_, name, params, _, _, _) ->
+        [OpAr(name, list_length(params)), ...op_arities_from_ops(rest)]
+    }
+  }
+}
+
+# Bare-name membership — true when at least one op has `target` as
+# its name, regardless of arity. Used by the bare-EVar branch where
+# no call shape constrains arity.
+fn op_ar_has_name(arities: [OpAr], target: String) : Bool {
+  match arities {
+    [] -> false
+    [a, ...rest] -> match a {
+      OpAr(n, _) -> if n == target { true } else { op_ar_has_name(rest, target) }
+    }
+  }
+}
+
+# True when at least one op named `target` declares arity `n`. Used
+# by the ECall branch to decide whether to rewrite the callee to its
+# dispatcher (match) or leave it for normal name resolution (no match).
+fn op_ar_match(arities: [OpAr], target: String, n: Int) : Bool {
+  match arities {
+    [] -> false
+    [a, ...rest] -> match a {
+      OpAr(name, ar) ->
+        if name == target and ar == n { true }
+        else { op_ar_match(rest, target, n) }
+    }
+  }
+}
+
+fn rename_proto_calls_decls(ds: [Decl], op_arities: [OpAr]) : [Decl] =
+  map(ds, (d) => rename_proto_calls_decl(d, op_arities))
+
+fn rename_proto_calls_decl(d: Decl, op_arities: [OpAr]) : Decl {
   match d {
     DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) -> {
       let bound = rename_param_names(ps, [])
       DFn(pub_, n, tps, ps, ret, row,
-          rename_proto_calls_expr(body, op_names, bound), l, c, mo)
+          rename_proto_calls_expr(body, op_arities, bound), l, c, mo)
     }
     DTest(desc, body, l, c) ->
-      DTest(desc, rename_proto_calls_expr(body, op_names, []), l, c)
+      DTest(desc, rename_proto_calls_expr(body, op_arities, []), l, c)
     _ -> d
   }
 }
@@ -25894,26 +25955,26 @@ fn rename_pfields_names(fs: [PField], acc: [String]) : [String] {
   }
 }
 
-fn rename_proto_calls_expr(e: Expr, op_names: [String], bound: [String]) : Expr =
-  Expr { kind: rename_proto_calls_kind(e.kind, op_names, bound),
+fn rename_proto_calls_expr(e: Expr, op_arities: [OpAr], bound: [String]) : Expr =
+  Expr { kind: rename_proto_calls_kind(e.kind, op_arities, bound),
          line: e.line, col: e.col, ty: e.ty }
 
-fn rename_proto_calls_opt(o: Option[Expr], op_names: [String], bound: [String]) : Option[Expr] {
+fn rename_proto_calls_opt(o: Option[Expr], op_arities: [OpAr], bound: [String]) : Option[Expr] {
   match o {
-    Some(e) -> Some(rename_proto_calls_expr(e, op_names, bound))
+    Some(e) -> Some(rename_proto_calls_expr(e, op_arities, bound))
     None    -> None
   }
 }
 
-fn rename_proto_calls_arms(arms: [Arm], op_names: [String], bound: [String]) : [Arm] =
-  map(arms, (a) => rename_proto_calls_arm(a, op_names, bound))
+fn rename_proto_calls_arms(arms: [Arm], op_arities: [OpAr], bound: [String]) : [Arm] =
+  map(arms, (a) => rename_proto_calls_arm(a, op_arities, bound))
 
-fn rename_proto_calls_arm(a: Arm, op_names: [String], bound: [String]) : Arm {
+fn rename_proto_calls_arm(a: Arm, op_arities: [OpAr], bound: [String]) : Arm {
   match a {
     Arm(p, g, b) -> {
       let bound1 = rename_pat_names(p, bound)
-      Arm(p, rename_proto_calls_opt(g, op_names, bound1),
-            rename_proto_calls_expr(b, op_names, bound1))
+      Arm(p, rename_proto_calls_opt(g, op_arities, bound1),
+            rename_proto_calls_expr(b, op_arities, bound1))
     }
   }
 }
@@ -25925,20 +25986,20 @@ fn rename_proto_calls_arm(a: Arm, op_names: [String], bound: [String]) : Arm {
 # their sub-exprs under the current `bound` and pass it through
 # unchanged.
 fn rename_proto_calls_block(stmts: [Stmt], tail: Option[Expr],
-                              op_names: [String], bound: [String]) : ExprKind =
-  rename_proto_calls_block_loop(stmts, tail, op_names, bound, [])
+                              op_arities: [OpAr], bound: [String]) : ExprKind =
+  rename_proto_calls_block_loop(stmts, tail, op_arities, bound, [])
 
 type StmtsAcc = { stmts: [Stmt], bound: [String] }
 
 fn rename_proto_calls_block_loop(stmts: [Stmt], tail: Option[Expr],
-                                   op_names: [String], bound: [String],
+                                   op_arities: [OpAr], bound: [String],
                                    acc: [Stmt]) : ExprKind {
   match stmts {
     [] -> EBlock(list_reverse(acc),
-                 rename_proto_calls_opt(tail, op_names, bound))
+                 rename_proto_calls_opt(tail, op_arities, bound))
     [s, ...rest] -> {
-      let r = rename_proto_calls_stmt(s, op_names, bound)
-      rename_proto_calls_block_loop(rest, tail, op_names, r.bound,
+      let r = rename_proto_calls_stmt(s, op_arities, bound)
+      rename_proto_calls_block_loop(rest, tail, op_arities, r.bound,
                                        [r.s, ...acc])
     }
   }
@@ -25946,33 +26007,33 @@ fn rename_proto_calls_block_loop(stmts: [Stmt], tail: Option[Expr],
 
 type StmtTyped = { s: Stmt, bound: [String] }
 
-fn rename_proto_calls_stmt(s: Stmt, op_names: [String], bound: [String]) : StmtTyped {
+fn rename_proto_calls_stmt(s: Stmt, op_arities: [OpAr], bound: [String]) : StmtTyped {
   match s {
     SLet(p, ann, rhs) -> {
-      let new_rhs = rename_proto_calls_expr(rhs, op_names, bound)
+      let new_rhs = rename_proto_calls_expr(rhs, op_arities, bound)
       let bound1 = rename_pat_names(p, bound)
       StmtTyped { s: SLet(p, ann, new_rhs), bound: bound1 }
     }
     SAssert(c, m) ->
       StmtTyped {
-        s: SAssert(rename_proto_calls_expr(c, op_names, bound),
-                    rename_proto_calls_opt(m, op_names, bound)),
+        s: SAssert(rename_proto_calls_expr(c, op_arities, bound),
+                    rename_proto_calls_opt(m, op_arities, bound)),
         bound: bound
       }
     SExprStmt(x) ->
       StmtTyped {
-        s: SExprStmt(rename_proto_calls_expr(x, op_names, bound)),
+        s: SExprStmt(rename_proto_calls_expr(x, op_arities, bound)),
         bound: bound
       }
     SIndexAssign(b, i, v, l, c) ->
       StmtTyped {
-        s: SIndexAssign(rename_proto_calls_expr(b, op_names, bound),
-                         rename_proto_calls_expr(i, op_names, bound),
-                         rename_proto_calls_expr(v, op_names, bound), l, c),
+        s: SIndexAssign(rename_proto_calls_expr(b, op_arities, bound),
+                         rename_proto_calls_expr(i, op_arities, bound),
+                         rename_proto_calls_expr(v, op_arities, bound), l, c),
         bound: bound
       }
     SVar(n, ty, rhs, l, c) -> {
-      let new_rhs = rename_proto_calls_expr(rhs, op_names, bound)
+      let new_rhs = rename_proto_calls_expr(rhs, op_arities, bound)
       StmtTyped {
         s: SVar(n, ty, new_rhs, l, c),
         bound: [n, ...bound]
@@ -25984,32 +26045,32 @@ fn rename_proto_calls_stmt(s: Stmt, op_names: [String], bound: [String]) : StmtT
   }
 }
 
-fn rename_proto_calls_clauses(cs: [HClause], op_names: [String], bound: [String]) : [HClause] =
-  map(cs, (c) => rename_proto_calls_clause(c, op_names, bound))
+fn rename_proto_calls_clauses(cs: [HClause], op_arities: [OpAr], bound: [String]) : [HClause] =
+  map(cs, (c) => rename_proto_calls_clause(c, op_arities, bound))
 
-fn rename_proto_calls_clause(c: HClause, op_names: [String], bound: [String]) : HClause {
+fn rename_proto_calls_clause(c: HClause, op_arities: [OpAr], bound: [String]) : HClause {
   match c {
     HC(n, ps, b, l, co) -> {
       let bound1 = rename_param_names(ps, bound)
-      HC(n, ps, rename_proto_calls_expr(b, op_names, bound1), l, co)
+      HC(n, ps, rename_proto_calls_expr(b, op_arities, bound1), l, co)
     }
   }
 }
 
-fn rename_proto_calls_opt_return(o: Option[HReturn], op_names: [String], bound: [String]) : Option[HReturn] {
+fn rename_proto_calls_opt_return(o: Option[HReturn], op_arities: [OpAr], bound: [String]) : Option[HReturn] {
   match o {
-    Some(r) -> Some(rename_proto_calls_return(r, op_names, bound))
+    Some(r) -> Some(rename_proto_calls_return(r, op_arities, bound))
     None    -> None
   }
 }
 
-fn rename_proto_calls_return(r: HReturn, op_names: [String], bound: [String]) : HReturn {
+fn rename_proto_calls_return(r: HReturn, op_arities: [OpAr], bound: [String]) : HReturn {
   match r {
-    HR(p, b, l, c) -> HR(p, rename_proto_calls_expr(b, op_names, [p, ...bound]), l, c)
+    HR(p, b, l, c) -> HR(p, rename_proto_calls_expr(b, op_arities, [p, ...bound]), l, c)
   }
 }
 
-fn rename_proto_calls_kind(k: ExprKind, op_names: [String], bound: [String]) : ExprKind {
+fn rename_proto_calls_kind(k: ExprKind, op_arities: [OpAr], bound: [String]) : ExprKind {
   match k {
     # Rep invariant (b): a bare EVar referring to a protocol op rewrites
     # to its dispatcher only when the name is NOT bound by an enclosing
@@ -26018,31 +26079,63 @@ fn rename_proto_calls_kind(k: ExprKind, op_names: [String], bound: [String]) : E
     # `validate_typer_invariants` cross-checks; this case is the
     # construction site.
     EVar(name) ->
-      if list_has(op_names, name) and not list_has(bound, name) {
+      if op_ar_has_name(op_arities, name) and not list_has(bound, name) {
         EVar(proto_dispatcher_name(name))
       } else { k }
+    # Resolver-arity (lane: resolver-arity): when a call's callee is a
+    # bare EVar matching a protocol op name, only rewrite to the
+    # dispatcher when the call's argument count matches a declared
+    # arity for that op. Otherwise the callee is left verbatim so the
+    # typer's normal name resolution can find a same-named module
+    # function with a different arity (e.g. `pub fn max(xs)` arity 1
+    # vs `Ord.max(a, b)` arity 2). The args still walk under the
+    # standard rewrite (they may themselves call protocol ops).
+    ECall(callee, args_) -> match callee.kind {
+      EVar(name) -> {
+        let is_op = op_ar_has_name(op_arities, name)
+        let bound_locally = list_has(bound, name)
+        let arity_ok = op_ar_match(op_arities, name, list_length(args_))
+        let preserve_callee = is_op and not bound_locally and not arity_ok
+        let new_args = map(args_, (a) => rename_proto_calls_expr(a, op_arities, bound))
+        if preserve_callee {
+          # Same name as a protocol op but the call's arity matches
+          # neither variant. Keep the callee EVar untouched; the
+          # arity-1-list-fn case (e.g. `max(xs)`) lands here when
+          # `Ord.max(a, b)` is the only protocol op.
+          ECall(callee, new_args)
+        } else {
+          # Match (or no protocol-op collision at all): fall through
+          # to the structural recursion. The EVar branch above turns
+          # the matched callee into `__proto_<name>` exactly as in
+          # the original m12.8 pass.
+          ECall(rename_proto_calls_expr(callee, op_arities, bound), new_args)
+        }
+      }
+      _ -> ECall(rename_proto_calls_expr(callee, op_arities, bound),
+                  map(args_, (a) => rename_proto_calls_expr(a, op_arities, bound)))
+    }
     # Scope-aware kinds. Each adds names to `bound` before recursing
     # into the bodies that they shadow.
-    EBlock(stmts, tail) -> rename_proto_calls_block(stmts, tail, op_names, bound)
+    EBlock(stmts, tail) -> rename_proto_calls_block(stmts, tail, op_arities, bound)
     ELambda(ps, b) -> {
       let bound1 = rename_param_names(ps, bound)
-      ELambda(ps, rename_proto_calls_expr(b, op_names, bound1))
+      ELambda(ps, rename_proto_calls_expr(b, op_arities, bound1))
     }
-    EMatch(scr, arms) -> EMatch(rename_proto_calls_expr(scr, op_names, bound),
-                                  rename_proto_calls_arms(arms, op_names, bound))
+    EMatch(scr, arms) -> EMatch(rename_proto_calls_expr(scr, op_arities, bound),
+                                  rename_proto_calls_arms(arms, op_arities, bound))
     EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(rename_proto_calls_expr(body, op_names, bound), eff_name, eff_tyargs,
-              map_opt_expr(init_opt, (e) => rename_proto_calls_expr(e, op_names, bound)),
+      EHandle(rename_proto_calls_expr(body, op_arities, bound), eff_name, eff_tyargs,
+              map_opt_expr(init_opt, (e) => rename_proto_calls_expr(e, op_arities, bound)),
               alias_opt,
-              rename_proto_calls_clauses(clauses, op_names, bound),
-              rename_proto_calls_opt_return(ret_opt, op_names, bound))
-    # All remaining kinds (ECall, EField, EIndex, EBinop, EUnop, EIf,
+              rename_proto_calls_clauses(clauses, op_arities, bound),
+              rename_proto_calls_opt_return(ret_opt, op_arities, bound))
+    # All remaining kinds (EField, EIndex, EBinop, EUnop, EIf,
     # ERecordLit, EList, ERange, EPipe, EBang, ELitUnit) recurse purely
     # structurally without changing the bound set; the leaves return
     # unchanged. The shared visitor handles both — keeping invariant
     # (b)'s scope tracking concentrated in the explicit cases above
     # where it actually matters.
-    _ -> map_expr_kind(k, (sub) => rename_proto_calls_expr(sub, op_names, bound))
+    _ -> map_expr_kind(k, (sub) => rename_proto_calls_expr(sub, op_arities, bound))
   }
 }
 
