@@ -1,0 +1,164 @@
+# stdlib/path.kai — POSIX path manipulation.
+#
+# Pure kaikai over the string builtins (string_length, string_slice,
+# char_at, string_concat, string_starts_with). No FFI, no syscalls —
+# every fn here is a pure transformation on a path-as-string.
+#
+# Conventions:
+#   - POSIX only: `/` is the separator. Windows backslash and
+#     drive-letter handling are deferred until kaikai targets Windows
+#     (post-MVP). A program running on macOS / Linux can call any of
+#     these on `args()` paths or on user-supplied strings without
+#     escaping.
+#   - Naming uses the `path_*` prefix, mirroring `int_*`, `real_*`,
+#     `string_*`, `list_*` in the rest of the stdlib. A future
+#     `path.*` module-call surface arrives with type-directed
+#     dispatch (m14 module system); the prefix migrates then.
+#
+# What lives here:
+#   - path_join          glue two components with `/`, normalising slashes
+#   - path_dirname       everything up to (not including) the last `/`
+#   - path_basename      everything after the last `/`
+#   - path_ext           ".ext" of the basename, or "" if none
+#   - path_strip_ext     basename with the trailing ".ext" removed
+#   - path_split         (dirname, basename) as a Pair
+#   - path_is_absolute   true iff the path starts with `/`
+
+# ---- internal helpers --------------------------------------------
+
+# Index of the last `/` in `s`, or -1 if none.
+fn path_last_slash_loop(s: String, i: Int) : Int =
+  if i < 0 { 0 - 1 }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '/' { i } else { path_last_slash_loop(s, i - 1) }
+      None -> 0 - 1
+    }
+  }
+
+fn path_last_slash(s: String) : Int =
+  path_last_slash_loop(s, string_length(s) - 1)
+
+# Index of the last `.` in `s`, or -1 if none. Used to find the
+# extension delimiter inside a basename.
+fn path_last_dot_loop(s: String, i: Int) : Int =
+  if i < 0 { 0 - 1 }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '.' { i } else { path_last_dot_loop(s, i - 1) }
+      None -> 0 - 1
+    }
+  }
+
+fn path_last_dot(s: String) : Int =
+  path_last_dot_loop(s, string_length(s) - 1)
+
+# Length of the trailing run of `/` characters, used by path_join to
+# strip the join's left side. `path_trailing_slashes("a/")` is 1,
+# `path_trailing_slashes("a//")` is 2, `path_trailing_slashes("a")` is 0.
+fn path_trailing_slashes_loop(s: String, i: Int, n: Int) : Int =
+  if i < 0 { n }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '/' { path_trailing_slashes_loop(s, i - 1, n + 1) } else { n }
+      None -> n
+    }
+  }
+
+fn path_trailing_slashes(s: String) : Int =
+  path_trailing_slashes_loop(s, string_length(s) - 1, 0)
+
+# Length of the leading run of `/` characters in `s`. Mirror of
+# path_trailing_slashes for the right side of a join.
+fn path_leading_slashes_loop(s: String, i: Int, n: Int) : Int = {
+  let len = string_length(s)
+  if i >= len { n }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '/' { path_leading_slashes_loop(s, i + 1, n + 1) } else { n }
+      None -> n
+    }
+  }
+}
+
+fn path_leading_slashes(s: String) : Int =
+  path_leading_slashes_loop(s, 0, 0)
+
+# ---- public surface ----------------------------------------------
+
+# True iff `p` begins with `/` (POSIX absolute path).
+pub fn path_is_absolute(p: String) : Bool = string_starts_with(p, "/")
+
+# The last component of `p`. `path_basename("a/b/c.kai") == "c.kai"`,
+# `path_basename("c.kai") == "c.kai"`, `path_basename("/") == ""`.
+pub fn path_basename(p: String) : String = {
+  let n = string_length(p)
+  let i = path_last_slash(p)
+  if i < 0 { p }
+  else { string_slice(p, i + 1, n - i - 1) }
+}
+
+# Everything before the last `/`, with trailing slashes stripped.
+# `path_dirname("a/b/c.kai") == "a/b"`, `path_dirname("c.kai") == ""`,
+# `path_dirname("/etc/hosts") == "/etc"`, `path_dirname("/") == ""`.
+pub fn path_dirname(p: String) : String = {
+  let i = path_last_slash(p)
+  if i < 0 { "" }
+  else if i == 0 { "/" }
+  else { string_slice(p, 0, i) }
+}
+
+# `(dirname(p), basename(p))` in one pass-equivalent call. Returned as
+# a `Pair` so callers can use `.fst` / `.snd` instead of computing
+# both halves twice.
+pub fn path_split(p: String) : Pair[String, String] =
+  Pair { fst: path_dirname(p), snd: path_basename(p) }
+
+# The extension of `p`'s basename, including the leading `.`.
+# `path_ext("foo.kai") == ".kai"`, `path_ext("foo") == ""`,
+# `path_ext("a.b/foo") == ""` (dot is in the dirname),
+# `path_ext(".bashrc") == ""` (leading-dot files have no extension).
+pub fn path_ext(p: String) : String = {
+  let base = path_basename(p)
+  let n = string_length(base)
+  let i = path_last_dot(base)
+  # Leading-dot file (e.g. `.bashrc`) has no extension. An empty or
+  # missing dot returns "".
+  if i <= 0 { "" }
+  else { string_slice(base, i, n - i) }
+}
+
+# `p` with its trailing extension removed. The dirname is preserved.
+# `path_strip_ext("a/b/c.kai") == "a/b/c"`, `path_strip_ext("c") == "c"`,
+# `path_strip_ext(".bashrc") == ".bashrc"` (no extension to strip).
+pub fn path_strip_ext(p: String) : String = {
+  let ext = path_ext(p)
+  let n = string_length(p)
+  let el = string_length(ext)
+  if el == 0 { p }
+  else { string_slice(p, 0, n - el) }
+}
+
+# Join two components with `/`. Strips any trailing `/` from `a` and
+# any leading `/` from `b` before concatenating, so
+# `path_join("a/", "/b") == "a/b"`. Empty components pass through:
+# `path_join("", "b") == "b"`, `path_join("a", "") == "a"`.
+pub fn path_join(a: String, b: String) : String = {
+  let an = string_length(a)
+  let bn = string_length(b)
+  if an == 0 { b }
+  else if bn == 0 { a }
+  else {
+    let ts = path_trailing_slashes(a)
+    let ls = path_leading_slashes(b)
+    let a2 = if ts == 0 { a } else { string_slice(a, 0, an - ts) }
+    let b2 = if ls == 0 { b } else { string_slice(b, ls, bn - ls) }
+    # If `a` was nothing but slashes (e.g. "/"), preserve a single
+    # leading `/` so the result remains absolute.
+    let a3 = if string_length(a2) == 0 and ts > 0 { "/" } else { a2 }
+    if string_length(a3) == 0 { b2 }
+    else if string_length(b2) == 0 { a3 }
+    else if string_ends_with(a3, "/") { string_concat(a3, b2) }
+    else { string_concat_all([a3, "/", b2]) }
+  }
+}
