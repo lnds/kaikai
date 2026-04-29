@@ -8496,7 +8496,22 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
     EStr(span, is_triple) -> fv_interp(span, is_triple, own, globals, acc)
     EUnit -> acc
     EVar(name) -> {
-      if list_has(own, name) { acc }
+      # m7b #15 closure-capture: a tagged op call like
+      # `Eff.op@<alias>` rewrites to `EVar("Eff.op@alias")`. The
+      # name is *not* a real identifier — emit_call_expr splits the
+      # `@` and dispatches via `kai_alias_<alias>_id`. For closure
+      # capture purposes we record the alias under the sentinel
+      # name `__alias_id__<alias>`; the lambda emit decodes it back
+      # to `KaiHandlerId kai_alias_<alias>_id` in the body prologue.
+      let at_pos = string_index_of_at(name)
+      if at_pos >= 0 {
+        let alias = string_slice(name, at_pos + 1, string_length(name))
+        let cap_name = string_concat("__alias_id__", alias)
+        if list_has(own, alias) { acc }
+        else if list_has(acc, cap_name) { acc }
+        else { [cap_name, ...acc] }
+      }
+      else if list_has(own, name) { acc }
       else if list_has(globals, name) { acc }
       else if list_has(acc, name) { acc }
       else { [name, ...acc] }
@@ -8513,7 +8528,21 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
       match opt_b { Some(b) -> fv_expr(b, own, globals, acc1) None -> acc1 }
     }
     EMatch(scr, arms) -> fv_arms(arms, own, globals, fv_expr(scr, own, globals, acc))
-    ELambda(_, _) -> acc                      # nested lambdas collect their own
+    ELambda(ps, body) -> {
+      # m7b #15 closure-capture: a nested lambda computes its own
+      # capture list independently, but every free var that
+      # nested body references AND that is not bound by the
+      # nested params still has to be visible at the *outer*
+      # lambda's body — that body is where the nested
+      # `kai_closure(...)` literal evaluates its capture array.
+      # Pre-fix, an outer lambda whose body contained
+      # `while(() => @i < dim, () => ...)` failed to pick up
+      # `kai_dim` / `kai_alias_i_id` as outer captures, so the
+      # generated C referenced undeclared identifiers when
+      # building the inner closure.
+      let nested_own = list_append(own, params_to_names(ps))
+      fv_expr(body, nested_own, globals, acc)
+    }
     ETodo(_) -> acc
     EBang(inner) -> fv_expr(inner, own, globals, acc)
     ERecordLit(_, fields) -> fv_field_inits(fields, own, globals, acc)
@@ -9137,10 +9166,27 @@ fn emit_lam_arg_reads(params: [Param], i: Int) : String {
 fn emit_lam_cap_reads(caps: [String], i: Int) : String {
   match caps {
     [] -> ""
-    [c, ...rest] -> concat_all([
-      "    KaiValue *kai_", c, " = self->as.clo.captures[", int_to_string(i), "];\n",
-      emit_lam_cap_reads(rest, i + 1)
-    ])
+    [c, ...rest] -> {
+      let prefix = "__alias_id__"
+      let read_line = if string_starts_with_q(c, prefix) {
+        # Handler-id sentinel: unpack the kai_int back to a
+        # KaiHandlerId so the existing tagged-op emit
+        # (`kai_evidence_lookup_node_by_id(kai_alias_<a>_id)`)
+        # finds the local in scope.
+        let alias = string_slice(c, string_length(prefix), string_length(c))
+        concat_all([
+          "    KaiHandlerId kai_alias_", alias,
+          "_id = (KaiHandlerId) self->as.clo.captures[",
+          int_to_string(i),
+          "]->as.i;\n"
+        ])
+      } else {
+        concat_all([
+          "    KaiValue *kai_", c, " = self->as.clo.captures[", int_to_string(i), "];\n"
+        ])
+      }
+      concat_all([read_line, emit_lam_cap_reads(rest, i + 1)])
+    }
   }
 }
 
@@ -9351,8 +9397,24 @@ fn llvm_emit_clause_bodies(cs: [ClauseInfo], fns: [EFn], vs: [EVar],
   }
 }
 
+# m7b #15 closure-capture: a regular cap reads the enclosing
+# `kai_<name>` C local. A handler-id sentinel
+# (`__alias_id__<alias>`) instead reads `kai_alias_<alias>_id` —
+# a `KaiHandlerId` (unsigned long long) — and packs it as a
+# `kai_int` so the closure capture array stays uniformly
+# `KaiValue *`. The lambda body unpacks it on the way in.
+fn emit_one_closure_cap(c: String) : String {
+  let prefix = "__alias_id__"
+  if string_starts_with_q(c, prefix) {
+    let alias = string_slice(c, string_length(prefix), string_length(c))
+    concat_all(["kai_int((int64_t) kai_alias_", alias, "_id)"])
+  } else {
+    cat2("kai_", c)
+  }
+}
+
 fn emit_closure_caps(caps: [String]) : String =
-  join_with(map(caps, (c) => cat2("kai_", c)), ", ")
+  join_with(map(caps, emit_one_closure_cap), ", ")
 
 fn emit_lambda_ref(x: Expr, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   match find_lam(lams, x.line, x.col) {
@@ -10942,14 +11004,12 @@ fn rewrite_alias_kind(k: ExprKind, m: AliasMap, line: Int, col: Int) : ExprKind 
     }
     ELambda(ps, b) -> {
       # m7b #17: lambda params shadow outer aliases inside the body.
-      # m7b #15 (scope-limited): also disable the @alias tagging
-      # inside the lambda body — the handle's `kai_alias_<a>_id`
-      # local is not in scope across the lambda boundary, so any
-      # tagged op call would emit invalid C. The substitution
-      # `cap.op` → `Eff.op` still runs; only the per-instance
-      # dispatch tag is suppressed.
+      # The cross-lambda tagging (`@<alias>`) stays enabled now that
+      # the closure carries the enclosing handle's
+      # `kai_alias_<a>_id` as a capture (see fv_expr's tagged-op
+      # detection and the closure prologue in emit_lambda_body).
       let names = map(ps, (pm) => pm.pname)
-      let m1 = alias_map_disable_tag(alias_map_remove_all(m, names))
+      let m1 = alias_map_remove_all(m, names)
       ELambda(ps, rewrite_alias_expr(b, m1))
     }
     EMatch(scr, arms) -> EMatch(rewrite_alias_expr(scr, m),
@@ -17889,14 +17949,18 @@ fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : 
   # invoked inside the lambda body MUST NOT leak to the enclosing
   # function's row — they belong to the lambda type's own row.
   # Same pattern as `synth_handle` (snapshot, reset, walk, restore).
-  # m7b #15 (scope-limited): also mark every alias visible at the
-  # lambda boundary as non-taggable. The handle's
-  # `kai_alias_<a>_id` C local is not in scope across the lambda
-  # boundary, so try_op_call's alias-fallback must emit a bare
-  # dispatch key (no @-suffix) for op calls inside the body.
+  # m7b #15 closure-capture: tagging stays enabled across the
+  # lambda boundary now that `kai_alias_<a>_id` is captured by the
+  # closure (see `fv_expr`'s tagged-op detection plus the
+  # `__alias_id__<a>` lane in `emit_closure_caps` /
+  # `emit_lam_cap_reads`). Without this the typer would emit a
+  # bare dispatch key for every op call inside the lambda and the
+  # innermost-name lookup would shadow outer cap binders — the
+  # exact failure mode that broke `var n = ...; var m = ...; while
+  # @n < lim { ... }` and routed `@n` to `m`.
   let prev_row = added.st.row
   let st_row = st_set_row(added.st, [])
-  let st_in = st_disable_alias_tag(st_row)
+  let st_in = st_row
   # m7e §13: `e!` propagates from the enclosing function, not from a
   # closure. Clear ret_ty inside the lambda body so any `!` site
   # inside reports a clean diagnostic. st_restore_entries (below)
