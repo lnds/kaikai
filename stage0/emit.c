@@ -49,6 +49,13 @@ typedef struct {
    truncates back to it. Lookups walk the name stack from the end,
    so inner scopes shadow outer ones.
 
+   Each entry carries the declaring AST node (`N_PARAM` for fn
+   params, `N_PAT_BIND` for let bindings and match-arm binds, NULL
+   for shadow-only entries like lambda params and captures). The
+   decl is looked up via `ls_resolve` at emit time so use-count
+   queries can identify the specific binding being read (two
+   bindings sharing a name in disjoint scopes don't alias).
+
    During `collect_all_lambdas` the stack tracks which names are
    introduced by lets / match patterns inside a lambda body — those
    bindings should never end up as phantom captures.
@@ -60,32 +67,37 @@ typedef struct {
 typedef struct {
     char **names;
     size_t *lens;
+    Node  **decls;
     size_t  n, cap;
     size_t *marks;
     size_t  n_marks, cap_marks;
 } LocalScope;
 
 /* m5.x flip Phase 3 closeout — Step D refinement (2026-04-29):
- * use-counter for the current fn body. Populated with parameters
- * before emit and walked over the body to count IDENT references.
- * `emit_ident_value` consults it: a parameter that is read exactly
- * once and never referenced from inside a lambda can be emitted
- * raw (`kai_<name>`) instead of wrapped in `kai_internal_dup` —
- * the consuming primitive takes the binding's only ref directly,
- * no leak. Multi-use or captured params keep the brute-force
- * eager-dup. Locals declared inside the body (let, match arms)
- * are not tracked here and stay eager-dup. */
+ * use-counter for the current fn body. Each entry is keyed by the
+ * declaring AST node — `N_PARAM` for fn parameters, `N_PAT_BIND`
+ * for let bindings and match-arm pattern binds. `count_local_uses`
+ * walks the body once before emit, maintaining its own scope stack
+ * to resolve each `N_IDENT` reference back to the specific binding
+ * it shadows. `emit_ident_value` then queries by decl pointer: a
+ * binding read exactly once, never from inside a lambda body, owns
+ * the only live ref and can be emitted raw (`kai_<name>`) — the
+ * consuming primitive takes the binding's only ref directly, no
+ * leak. Multi-use, captured, or unresolved bindings (lambda
+ * params, captures) keep the brute-force eager-dup that preserves
+ * the slot at the cost of one leaked ref per read. */
 typedef struct {
+    Node       *decl;          /* binding identity: N_PARAM or N_PAT_BIND */
     const char *name;
     size_t      name_len;
     int         total_count;
     int         lambda_count;  /* > 0 means at least one read sits inside a lambda body */
-} ParamUse;
+} LocalUse;
 
 typedef struct {
-    ParamUse *items;
+    LocalUse *items;
     size_t    n, cap;
-} ParamUseTable;
+} LocalUseTable;
 
 typedef struct {
     FILE *out;
@@ -103,7 +115,7 @@ typedef struct {
     LamInfo  *lams;     size_t n_lams, cap_lams;
 
     LocalScope    locals;
-    ParamUseTable params;   /* current fn's parameters; cleared between fns */
+    LocalUseTable uses;     /* current fn's local-binding use counts; cleared between fns */
 } E;
 
 /* ---------- local scope ---------- */
@@ -123,15 +135,17 @@ static void ls_pop_mark(E *e) {
     s->n = s->marks[--s->n_marks];
 }
 
-static void ls_add(E *e, const char *name, size_t len) {
+static void ls_add(E *e, const char *name, size_t len, Node *decl) {
     LocalScope *s = &e->locals;
     if (s->n == s->cap) {
         s->cap = s->cap ? s->cap * 2 : 16;
         s->names = (char **) realloc(s->names, s->cap * sizeof(char *));
         s->lens  = (size_t *) realloc(s->lens,  s->cap * sizeof(size_t));
+        s->decls = (Node **)  realloc(s->decls, s->cap * sizeof(Node *));
     }
     s->names[s->n] = (char *) name;
     s->lens[s->n]  = len;
+    s->decls[s->n] = decl;
     s->n++;
 }
 
@@ -144,18 +158,33 @@ static int ls_has(E *e, const char *name, size_t len) {
     return 0;
 }
 
-/* ---------- parameter use counter ---------- */
-
-static void pu_clear(E *e) {
-    e->params.n = 0;
+/* Innermost matching declaration, or NULL if no entry has a decl
+ * (e.g. lambda params or captures, which use_lookup will miss and
+ * fall through to the eager-dup path). */
+static Node *ls_resolve(E *e, const char *name, size_t len) {
+    LocalScope *s = &e->locals;
+    for (size_t i = s->n; i > 0;) {
+        --i;
+        if (s->lens[i] == len && memcmp(s->names[i], name, len) == 0) {
+            return s->decls[i];
+        }
+    }
+    return NULL;
 }
 
-static void pu_add(E *e, const char *name, size_t len) {
-    ParamUseTable *t = &e->params;
+/* ---------- local-binding use counter ---------- */
+
+static void lu_clear(E *e) {
+    e->uses.n = 0;
+}
+
+static void lu_add(E *e, Node *decl, const char *name, size_t len) {
+    LocalUseTable *t = &e->uses;
     if (t->n == t->cap) {
-        t->cap = t->cap ? t->cap * 2 : 8;
-        t->items = (ParamUse *) realloc(t->items, t->cap * sizeof(ParamUse));
+        t->cap = t->cap ? t->cap * 2 : 16;
+        t->items = (LocalUse *) realloc(t->items, t->cap * sizeof(LocalUse));
     }
+    t->items[t->n].decl = decl;
     t->items[t->n].name = name;
     t->items[t->n].name_len = len;
     t->items[t->n].total_count = 0;
@@ -163,43 +192,20 @@ static void pu_add(E *e, const char *name, size_t len) {
     t->n++;
 }
 
-static ParamUse *pu_lookup(E *e, const char *name, size_t len) {
-    ParamUseTable *t = &e->params;
+static LocalUse *lu_lookup(E *e, Node *decl) {
+    if (!decl) return NULL;
+    LocalUseTable *t = &e->uses;
     for (size_t i = 0; i < t->n; ++i) {
-        if (t->items[i].name_len == len
-            && memcmp(t->items[i].name, name, len) == 0) {
-            return &t->items[i];
-        }
+        if (t->items[i].decl == decl) return &t->items[i];
     }
     return NULL;
-}
-
-/* Walk an AST node, incrementing each parameter's use count for every
- * N_IDENT reference. `in_lambda` flips to 1 when descending into an
- * N_LAMBDA so the parameter's `lambda_count` records whether it is
- * captured. Pattern-bound names that shadow a parameter are not
- * tracked here — the body lookup goes through ls_has first, so the
- * shadowing case stays at the eager-dup default safely. */
-static void count_param_uses(E *e, Node *n, int in_lambda) {
-    if (!n) return;
-    if (n->kind == N_IDENT) {
-        ParamUse *u = pu_lookup(e, n->name, n->name_len);
-        if (u) {
-            u->total_count++;
-            if (in_lambda) u->lambda_count++;
-        }
-        return;
-    }
-    int child_in_lambda = in_lambda || (n->kind == N_LAMBDA);
-    for (size_t i = 0; i < n->n_children; ++i) {
-        count_param_uses(e, n->children[i], child_in_lambda);
-    }
 }
 
 /* Walk a pattern, adding every PAT_BIND name to the local scope. Used
    by both collect_free_vars and emit_pat_binds so pattern bindings
    are never counted as captures and are never redirected to a
-   same-named global at emit time. */
+   same-named global at emit time. The PAT_BIND node itself is the
+   binding identity used by the use counter. */
 static void pat_add_locals(E *e, Node *pat) {
     if (!pat) return;
     switch (pat->kind) {
@@ -207,7 +213,7 @@ static void pat_add_locals(E *e, Node *pat) {
         case N_PAT_LIT:
             return;
         case N_PAT_BIND:
-            ls_add(e, pat->name, pat->name_len);
+            ls_add(e, pat->name, pat->name_len, pat);
             return;
         case N_PAT_LIST:
         case N_PAT_VARIANT:
@@ -219,6 +225,160 @@ static void pat_add_locals(E *e, Node *pat) {
             return;
         default:
             return;
+    }
+}
+
+/* Variant of `pat_add_locals` that also registers a `LocalUse` entry
+ * for each PAT_BIND keyed by the pat node, so subsequent IDENT reads
+ * inside the binding's scope can be counted against the right
+ * binding identity. Used only by `count_local_uses` when not
+ * descending into a lambda body — lambda-local lets are tracked for
+ * shadowing only and stay on the safe eager-dup path. */
+static void pat_register_uses(E *e, Node *pat) {
+    if (!pat) return;
+    switch (pat->kind) {
+        case N_PAT_WILD:
+        case N_PAT_LIT:
+            return;
+        case N_PAT_BIND:
+            lu_add(e, pat, pat->name, pat->name_len);
+            return;
+        case N_PAT_LIST:
+        case N_PAT_VARIANT:
+        case N_PAT_RECORD:
+            for (size_t i = 0; i < pat->n_children; ++i) pat_register_uses(e, pat->children[i]);
+            return;
+        case N_PAT_FIELD:
+            if (pat->n_children >= 1) pat_register_uses(e, pat->children[0]);
+            return;
+        default:
+            return;
+    }
+}
+
+/* ---------- forwards (use counter) ---------- */
+
+static void count_local_uses(E *e, Node *n, int in_lambda);
+static void count_local_uses_in_string(E *e, Node *s, int in_lambda);
+
+/* Walk an AST node, incrementing each tracked binding's use count
+ * for every `N_IDENT` reference resolving to it. Maintains its own
+ * scope by piggy-backing on `e->locals` (push_mark / pop_mark
+ * balanced), so a `let x` inside a block shadows an outer `x`
+ * correctly. `in_lambda` flips to 1 on descent into an `N_LAMBDA`
+ * so `lambda_count` flags bindings that survive past the outer
+ * statement and need to keep their slot live for the closure.
+ *
+ * Lambda params and captures, and lets declared inside lambda
+ * bodies, are pushed onto the scope without a `LocalUse` entry —
+ * they shadow outer entries during count, and `emit_ident_value`
+ * sees `lu_lookup == NULL` for them and stays on eager-dup.
+ *
+ * String literals carry interpolations that are re-parsed at emit
+ * time. Counting has to mirror that or captured names referenced
+ * only from inside `#{...}` would be undercounted. */
+static void count_local_uses(E *e, Node *n, int in_lambda) {
+    if (!n) return;
+
+    if (n->kind == N_IDENT) {
+        Node *decl = ls_resolve(e, n->name, n->name_len);
+        LocalUse *u = lu_lookup(e, decl);
+        if (u) {
+            u->total_count++;
+            if (in_lambda) u->lambda_count++;
+        }
+        return;
+    }
+
+    if (n->kind == N_STRING) {
+        count_local_uses_in_string(e, n, in_lambda);
+        return;
+    }
+
+    if (n->kind == N_LAMBDA) {
+        ls_push_mark(e);
+        for (size_t i = 1; i < n->n_children; ++i) {
+            Node *p = n->children[i];
+            if (p && p->kind == N_IDENT) {
+                ls_add(e, p->name, p->name_len, NULL);  /* shadow only */
+            }
+        }
+        if (n->n_children >= 1) count_local_uses(e, n->children[0], 1);
+        ls_pop_mark(e);
+        return;
+    }
+
+    if (n->kind == N_LET) {
+        /* RHS sees the outer scope, not the new binding. */
+        if (n->n_children >= 3) count_local_uses(e, n->children[2], in_lambda);
+        if (n->n_children >= 1) {
+            Node *pat = n->children[0];
+            if (!in_lambda) pat_register_uses(e, pat);
+            pat_add_locals(e, pat);
+        }
+        return;
+    }
+
+    if (n->kind == N_BLOCK) {
+        ls_push_mark(e);
+        for (size_t i = 0; i < n->n_children; ++i)
+            count_local_uses(e, n->children[i], in_lambda);
+        ls_pop_mark(e);
+        return;
+    }
+
+    if (n->kind == N_ARM) {
+        Node *pat = n->children[0];
+        int has_guard = (n->v.flags & 0x1) != 0;
+        Node *body  = n->children[has_guard ? 2 : 1];
+        Node *guard = has_guard ? n->children[1] : NULL;
+        ls_push_mark(e);
+        if (!in_lambda) pat_register_uses(e, pat);
+        pat_add_locals(e, pat);
+        if (guard) count_local_uses(e, guard, in_lambda);
+        if (body)  count_local_uses(e, body,  in_lambda);
+        ls_pop_mark(e);
+        return;
+    }
+
+    for (size_t i = 0; i < n->n_children; ++i) {
+        count_local_uses(e, n->children[i], in_lambda);
+    }
+}
+
+/* Mirror of `collect_free_vars_in_string`: re-parse `#{...}` chunks
+ * and walk them so identifiers referenced only from interpolations
+ * are still counted against the binding they read. Keep in
+ * lock-step with `emit_string_expr` and `collect_free_vars_in_string`. */
+static void count_local_uses_in_string(E *e, Node *s, int in_lambda) {
+    const char *src = s->name;
+    if (!src || s->name_len < 2) return;
+    int triple = (s->v.flags & 0x1) != 0;
+    size_t start = triple ? 3 : 1;
+    size_t end   = triple ? s->name_len - 3 : s->name_len - 1;
+    size_t i = start;
+    while (i < end) {
+        if (src[i] == '#' && i + 1 < end && src[i + 1] == '{') {
+            i += 2;
+            size_t expr_start = i;
+            int depth = 1;
+            while (i < end && depth > 0) {
+                if      (src[i] == '{') depth++;
+                else if (src[i] == '}') { depth--; if (depth == 0) break; }
+                ++i;
+            }
+            size_t ntk = 0;
+            Token *toks = kai_lex("<interp>", src + expr_start, i - expr_start, &ntk);
+            Node *en = kai_parse_expr_standalone("<interp>", src + expr_start, toks, ntk);
+            if (en) {
+                count_local_uses(e, en, in_lambda);
+                kai_free_node(en);
+            }
+            free(toks);
+            if (i < end) i++;                 /* past } */
+        } else {
+            ++i;
+        }
     }
 }
 
@@ -367,15 +527,18 @@ static void emit_ident_value(E *e, const char *name, size_t len) {
     const char *mapped = NULL;
     /* Locals shadow everything, same rationale as emit_ident_callee. */
     if (ls_has(e, name, len)) {
-        /* m5.x-flip Phase 3 — Step D refinement (2026-04-29): a fn
-         * parameter that is read exactly once in the whole body and
-         * never referenced from inside a lambda owns the only live
-         * ref; the consuming primitive takes that ref directly, no
-         * leak. Multi-use or captured parameters fall through to the
-         * brute-force eager-dup so the binding survives the consume.
-         * Locals introduced by let / match arms are not tracked by
-         * pu_lookup and always take the eager-dup path (safe). */
-        ParamUse *u = pu_lookup(e, name, len);
+        /* m5.x-flip Phase 3 — Step D refinement (2026-04-29, deeper
+         * 2026-04-29): resolve the IDENT to its declaring node via
+         * the scope stack, then look up the use count. A binding
+         * read exactly once and never referenced from inside a
+         * lambda body owns the only live ref; the consuming
+         * primitive takes that ref directly, no leak. Multi-use,
+         * captured, or unresolved bindings (lambda params and
+         * captures use decl=NULL → lu_lookup misses) fall through
+         * to the brute-force eager-dup so the slot stays live for
+         * later reads. */
+        Node *decl = ls_resolve(e, name, len);
+        LocalUse *u = lu_lookup(e, decl);
         if (u && u->total_count == 1 && u->lambda_count == 0) {
             fprintf(e->out, "kai_%.*s", (int) len, name);
             return;
@@ -1143,16 +1306,20 @@ static void emit_lambda_helper_def(E *e, LamInfo *info) {
             info->id);
     fputs("    (void) self; (void) n;\n", e->out);
     ls_push_mark(e);
+    /* Lambda params and captures use decl=NULL: the lambda body's
+     * use counter is not run (per-fn scope only), so a non-NULL
+     * decl would still find no LocalUse entry — passing NULL keeps
+     * the intent explicit and shaves the lookup. */
     for (int i = 0; i < n_params; ++i) {
         Node *p = lam->children[1 + i];
         fprintf(e->out, "    KaiValue *kai_%.*s = args[%d];\n",
                 (int) p->name_len, p->name, i);
-        ls_add(e, p->name, p->name_len);
+        ls_add(e, p->name, p->name_len, NULL);
     }
     for (int i = 0; i < info->n_caps; ++i) {
         fprintf(e->out, "    KaiValue *kai_%.*s = self->as.clo.captures[%d];\n",
                 (int) info->caps[i].len, info->caps[i].name, i);
-        ls_add(e, info->caps[i].name, info->caps[i].len);
+        ls_add(e, info->caps[i].name, info->caps[i].len, NULL);
     }
     fputs("    return ", e->out);
     emit_expr(e, lam->children[0]);
@@ -1226,8 +1393,9 @@ static void emit_let(E *e, Node *n) {
         emit_expr(e, val);
         fputs(";", e->out);
         /* Record the binding *after* emitting the RHS so the RHS does
-           not see the new name. */
-        ls_add(e, pat->name, pat->name_len);
+           not see the new name. The pat node itself is the binding
+           identity used by the use counter. */
+        ls_add(e, pat->name, pat->name_len, pat);
         return;
     }
     fputs("KaiValue *_letv = ", e->out);
@@ -1312,18 +1480,23 @@ static void emit_fn_body(E *e, Node *fn) {
     emit_fn_signature(e, fn);
     fputs(" {\n    return ", e->out);
     ls_push_mark(e);
-    pu_clear(e);
+    lu_clear(e);
     for (size_t i = 2; i < fn->n_children; ++i) {
         Node *p = fn->children[i];
         if (p && p->kind == N_PARAM) {
-            ls_add(e, p->name, p->name_len);
-            pu_add(e, p->name, p->name_len);
+            ls_add(e, p->name, p->name_len, p);
+            lu_add(e, p, p->name, p->name_len);
         }
     }
-    /* Walk the body once to count IDENT references against each
-     * parameter; emit_ident_value uses the result to skip the
-     * eager-dup wrap on single-use, non-captured parameters. */
-    count_param_uses(e, fn->children[1], 0);
+    /* Walk the body once to count IDENT references against every
+     * tracked binding (params + lets + match-arm binds). The walker
+     * pushes/pops scope marks as it descends through blocks, lets,
+     * and match arms, so reads resolve to the innermost binding by
+     * declaration identity rather than by name alone. emit_expr
+     * below then mirrors the same scope shape as it emits, and
+     * emit_ident_value uses the resulting use counts to skip the
+     * eager-dup wrap on single-use, non-captured bindings. */
+    count_local_uses(e, fn->children[1], 0);
     emit_expr(e, fn->children[1]);
     ls_pop_mark(e);
     fputs(";\n}\n\n", e->out);
@@ -1519,5 +1692,10 @@ int kai_emit(Node *program, FILE *out, int test_mode) {
     free(e.variants);
     for (size_t i = 0; i < e.n_lams; ++i) free(e.lams[i].caps);
     free(e.lams);
+    free(e.locals.names);
+    free(e.locals.lens);
+    free(e.locals.decls);
+    free(e.locals.marks);
+    free(e.uses.items);
     return e.had_error ? 1 : 0;
 }
