@@ -1041,10 +1041,38 @@ lets the op be type-erased. The cost is that the caller pays one
 extra argument (element size, or a runtime type witness) for each
 generic op — negligible compared to the op's own body.
 
-### Implementation plan (m7b)
+### Implementation plan (m7b) — **Landed (2026)**
 
-This section pins the m7b #2 work plan. The spec above (§*Per-op
-type generics*) is the *what*; the breakdown below is the *how*.
+m7b #2a (mechanism) and m7b #2b (`Mutable` migration) shipped.
+The fixtures `examples/effects/m7b_2a_op_id_basic`,
+`m7b_2a_op_distinct_types`, `m7b_2a_op_in_parametric`,
+`m7b_2b_mutable_default`, and `m7b_2b_mutable_intercept`
+exercise the per-op generics machinery end to end.
+
+m7b #2c was de-scoped to docs (this section + the §`Mutable`
+§*Migration plan* in `docs/effects-stdlib.md`). The original
+plan called for dropping `array_*` from `prelude_names` /
+`prelude_table`; the implementation kept them so the array-
+index sugar (m7b #6) and the `var` specialisation (m7b #16)
+can emit bare calls without minting `Mutable.*` chains. The
+bare and `Mutable.*` paths share the runtime, so the
+distinction is purely surface; pinned in `docs/effects-stdlib.md`
+§`Mutable` §*Migration plan*.
+
+What's still open in this section is the *next* per-op
+generics consumer:
+
+- **Spawn API cleanup** (`docs/m8x-followup.md` item 7):
+  `builtin_spawn_decl` still uses `Nothing → TyAny` for the
+  thunk and the result. Migrating to `spawn[T, e]` per Doc B
+  would need *per-op row* generics that Doc C explicitly leaves
+  out of scope; the path forward is either (a) per-op row poly
+  (a separate spec lane) or (b) accept the typed wrappers in
+  `stdlib/spawn.kai` as the canonical user surface and leave
+  the effect declaration TyAny-erased. No decision yet.
+
+The historical work plan from when m7b #2 was *Pending* is
+preserved below for posterity.
 
 #### State at the start of m7b #2
 
