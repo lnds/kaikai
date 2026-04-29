@@ -14,6 +14,40 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 - Versioning infrastructure: tags v0.1.0 → v0.7.2; `bin/kai --version`
   reads `VERSION` dynamically.
 
+## [0.9.1] — 2026-04-29 (resolver same-module preference + banker's rounding)
+
+**Patch: same-module preference + new rounding mode.** Two
+quick-win lanes:
+
+### Fixed
+
+- **Resolver same-module preference** (`stage2/compiler.kai`):
+  when several modules export the same name with the same arity
+  AND no root-file shadow exists, `efn_resolve` now falls back
+  to the first match instead of returning ambiguous. The C and
+  LLVM backends rotate the EFn table via `fns_prefer_module(fns,
+  mo)` before walking each DFn body, so a recursive call inside
+  `stdlib/loop.repeat` resolves to `loop.repeat` even when
+  `stdlib/core/list.repeat` is also in scope.
+- `stdlib/core/list.kai`: `repeat` and `list_repeat` both
+  delegate to a new internal `list_repeat_loop`. This keeps the
+  recursive call off the global namespace so the same-module
+  preference is not even exercised on stdlib's recursion path.
+
+### Added
+
+- `stdlib/math/real.kai`: `real_round_half_even` (banker's
+  rounding, IEEE 754 default). Previously listed as deferred in
+  v0.6.0. Ten cases added to `examples/stdlib/math_real_basic`.
+
+### Validation
+
+- selfhost (C + LLVM) byte-identical fixed point.
+- `make test` clean.
+- `make demos-no-regression` 22 (baseline 22 unchanged — `spiral`
+  still fails, but on a different bug in the `var` desugar; see
+  `docs/known-regressions.md`).
+
 ## [0.9.0] — 2026-04-29 (`^` value-level operator + canonical unit pretty-print)
 
 **Minor: new operator surface and prettier UoM render.** Resolves
