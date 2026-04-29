@@ -12,6 +12,11 @@ The user-facing **type surface** of every Spawn / Cancel / Actor /
 Link / Monitor op already matches what m8.x will deliver. The
 runtime swap should be invisible to user code.
 
+**Scope decision** (2026-04-29): see `docs/fibers-honesty-targets.md`
+for which items below belong to Show-HN-honest, Production-honest
+1.0, and post-MVP tiers. This file is the operational inventory; the
+honesty-target file is the strategic scope.
+
 ## Status (R2 lane)
 
 R2 (`fiber-scheduler` branch) lands the m8.x runtime in five
