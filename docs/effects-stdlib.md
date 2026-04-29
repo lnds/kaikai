@@ -1255,14 +1255,25 @@ accept `Mutable` on boundary functions that use `Array[T]`.
 
 ### Migration plan for existing code
 
-Stage 2's inferencer currently uses `array_make / array_get /
-array_set / array_grow` as unchecked builtins (CLAUDE.md "Tier 1
-— Load-bearing"). Once `Mutable` lands, those call sites gain
-`Mutable` in their row. The default handler means no other code
-change is required at stage 2's top level; the row grows but the
-behaviour is identical. Userland code that wanted to avoid
-`Mutable` never had access to `array_*` in the first place, so no
-downstream impact.
+`Mutable` landed in m7b #2b (2026). Stage 2's inferencer now
+ships the effect as a real `DEffect` declaration (see
+`builtin_mutable_decl`) with per-op generics over `T`, and a
+default handler whose clauses delegate to the existing
+`kai_prelude_array_*` runtime entry points. Call sites such as
+`array_get(a, i)` are routed through the `Mutable` row uniformly
+— a function that touches an array acquires `Mutable` in its
+declared row and the default handler installs at `main`'s
+boundary like `Console` / `Stdin`.
+
+Bare `array_make / array_length / array_get / array_set /
+array_grow` are kept reachable as prelude builtins because the
+desugars for array-index sugar (`a[i]` / `a[i] := v`, m7b #6)
+and the `var` specialisation (m7b #16) emit bare calls and
+their call site already lives inside a `Mutable`-row context.
+Removing the bare builtins would force every desugar to mint
+`Mutable.array_*` calls without changing observable semantics;
+not worth the churn. Users should still prefer `Mutable.array_*`
+when writing source by hand for clarity and tooling.
 
 ## `Cancel`
 
