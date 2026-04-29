@@ -471,6 +471,7 @@ EXTRA_PRELUDE_FLAGS := --prelude ../stdlib/protocols.kai \
                        --prelude ../stdlib/collections/queue.kai \
                        --prelude ../stdlib/collections/stack.kai \
                        --prelude ../stdlib/math/int.kai \
+                       --prelude ../stdlib/math/float.kai \
                        --prelude ../stdlib/decimal.kai \
                        --prelude ../stdlib/money.kai \
                        --prelude ../stdlib/uuid.kai \
