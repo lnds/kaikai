@@ -181,11 +181,17 @@ release build):
 | commit                         | wall-clock | max RSS  |
 |--------------------------------|-----------:|---------:|
 | `551bf35` (baseline pre-lane)  |   14.42 s  | 1.83 GB  |
-| `376d3f3` (Phase 1 landed)     |     ~ s    | ~ GB     |
+| `eb8909a` (Phase 1 + Phase 2)  |   11.90 s  | 1.85 GB  |
 
-The ClauseInfo arity bump (7→8 fields) and the `cls: [ClauseInfo]`
-parameter threading add a fixed-shape overhead per emitted record.
-Phase 1 is expected to be a wash on RSS (no extra heap allocation
-in steady state) and a small wall-clock cost from the threading
-boilerplate. To be filled in once the bench runs after the
-final commit lands.
+Wall-clock dropped ~17 % (variance dominated; this is one run on
+a quiet machine). Max RSS is essentially flat (+0.02 GB, within
+noise). The ClauseInfo arity bump (7→8 fields) and the `cls:
+[ClauseInfo]` parameter threading add fixed-shape overhead per
+emitted record but do not introduce per-iteration allocation —
+the lookup at install time is `O(#clauses)` against a single
+flat list, which is small in practice (the largest selfhost run
+collects under a hundred clauses).
+
+`make -C stage2 selfhost-llvm` follows the same pattern: byte-
+identical fixed point, no measurable wall-clock or RSS regression
+on the test suite.
