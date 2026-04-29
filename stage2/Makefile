@@ -1231,6 +1231,22 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (supervision pattern: workers report through Actor mailbox)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
 	done; \
+	for f in ../examples/effects/m8_12_self_delegating_handler.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  set_count=$$(grep -c "_node_op->in_dispatch = 1" build/s2-$$name.c || true); \
+	  clear_count=$$(grep -c "_node_op->in_dispatch = 0" build/s2-$$name.c || true); \
+	  test "$$set_count" -gt 0 \
+	    || { echo "effects FAIL $$name (no in_dispatch sets emitted — bug #12 fix regressed?)"; exit 1; }; \
+	  test "$$set_count" = "$$clear_count" \
+	    || { echo "effects FAIL $$name (in_dispatch invariant broken: $$set_count sets vs $$clear_count clears)"; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name \
+	    && echo "effects OK $$name (m8 bug #12: self-delegating handler resolves to outer + in_dispatch set/clear paired)" \
+	    || { echo "effects FAIL $$name (binary exit non-zero — infinite-loop regression?)"; exit 1; }; \
+	done; \
 	for f in ../examples/effects/m12_8_y_phase4_*.kai; do \
 	  [ -e $$f ] || continue; \
 	  name=$$(basename $$f .kai); \
