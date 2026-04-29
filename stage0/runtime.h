@@ -323,6 +323,16 @@ struct KaiFiber {
      * site saves the previous value, sets this to its own node,
      * runs the clause, then restores. */
     KaiEvidence    *in_dispatch_node;
+    /* R4 fix — back-pointer to the KaiValue wrapper that owns this
+     * fiber struct. Set in kai_fiber_value when the wrapper is
+     * allocated; the scheduler holds an incref on the wrapper from
+     * spawn-enqueue until the trampoline's DONE/CANCELLED tail, which
+     * `kai_decref`s `value`. Pairing the scheduler-side ref with the
+     * caller-side ref makes `let _ = fiber_spawn(…)` (discarding the
+     * Fiber value) safe: the wrapper stays alive while the struct is
+     * still referenced from the run queue. NULL on `kai_main_fiber`,
+     * which has no wrapper (it represents the OS thread). */
+    KaiValue       *value;
 };
 
 /* m7a #5 + m8.x: kai_main_fiber starts as the OS-thread context,
@@ -342,7 +352,8 @@ static KaiFiber kai_main_fiber = {
     NULL, NULL,          /* awaiters_head, awaiters_next */
     {0}, 0,              /* cancel_pad, cancel_pad_set — main has no pad */
     NULL,                /* linked_head */
-    NULL                 /* in_dispatch_node */
+    NULL,                /* in_dispatch_node */
+    NULL                 /* value — main has no wrapper */
 };
 
 static KaiFiber *kai_active_fiber = &kai_main_fiber;
@@ -360,12 +371,33 @@ static KaiFiber *kai_ready_head = NULL;
 static KaiFiber *kai_ready_tail = NULL;
 static int       kai_parked_count = 0;  /* deadlock detection */
 
+/* R4 fix — single-slot pending-free for fiber structs whose wrappers
+ * went to RC=0 while the fiber itself was still the current fiber
+ * (the trampoline tail's `kai_decref(self->value)` is the producer).
+ * Drained at every entry point that follows a context switch (top of
+ * trampoline, post-swapcontext in yield/park) so the freed stack is
+ * never the one we are running on. */
+static KaiFiber *kai_pending_free = NULL;
+
+static void kai_drain_pending_free(void) {
+    KaiFiber *f = kai_pending_free;
+    if (!f) return;
+    kai_pending_free = NULL;
+    /* thunk / result / linked_head were handled at wrapper-free time;
+     * only stack + struct remain. */
+    if (f->stack_base) free(f->stack_base);
+    free(f);
+}
+
 /* m8 #3: wrap a heap-allocated KaiFiber in an opaque KAI_FIBER
  * value. The KaiFiber struct's lifetime is tied to the value's RC
- * (kai_free_value frees both together). */
+ * (kai_free_value frees both together). The struct's `value`
+ * back-pointer lets the scheduler retain its own incref on the
+ * wrapper from spawn-enqueue until the trampoline tail (R4 fix). */
 static KaiValue *kai_fiber_value(KaiFiber *f) {
     KaiValue *v = kai_alloc(KAI_FIBER);
     v->as.fib = f;
+    f->value  = v;
     return v;
 }
 
@@ -626,14 +658,30 @@ static void kai_free_value(KaiValue *v) {
                     }
                     v->as.fib->linked_head = NULL;
                 }
-                /* m8.x: free the heap-allocated private stack. main
-                 * fiber has stack_base == NULL (uses the OS thread
-                 * stack) and is statically allocated; spawned fibers
-                 * own their stacks. */
-                if (v->as.fib->stack_base) {
-                    free(v->as.fib->stack_base);
+                /* R4 fix — when the trampoline drops the scheduler's
+                 * ref on its own wrapper at DONE/CANCELLED, the wrapper
+                 * may go to RC=0 here while we are still running on
+                 * the fiber's private stack. Freeing the stack now
+                 * would yank the ground out from under the trampoline
+                 * tail. Defer the struct + stack free to the next
+                 * fiber's drain hook (top of trampoline / post-swap
+                 * in yield/park). The single-slot pending pointer is
+                 * sufficient because the only producer is the
+                 * trampoline tail, and every consumer drains before
+                 * any other produce can run. */
+                if (v->as.fib == kai_current_fiber()) {
+                    v->as.fib->value = NULL;
+                    kai_pending_free = v->as.fib;
+                } else {
+                    /* m8.x: free the heap-allocated private stack.
+                     * main fiber has stack_base == NULL (uses the OS
+                     * thread stack) and is statically allocated;
+                     * spawned fibers own their stacks. */
+                    if (v->as.fib->stack_base) {
+                        free(v->as.fib->stack_base);
+                    }
+                    free(v->as.fib);
                 }
-                free(v->as.fib);
             }
             break;
         case KAI_PID:
@@ -2464,7 +2512,10 @@ static void kai_sched_yield(void) {
     swapcontext(&current->ctx, &next->ctx);
     /* Resumed: another fiber yielded/parked back to us; the swap
      * source (current->ctx) holds the state that was just restored.
-     * No further bookkeeping needed. */
+     * R4 fix — if the fiber that swapped to us was the trampoline
+     * tail of a now-discarded fiber, `kai_pending_free` carries its
+     * deferred struct + stack. Reap before continuing. */
+    kai_drain_pending_free();
 }
 
 /* Park: caller goes PARKED, control swaps to the head of the run
@@ -2488,6 +2539,8 @@ static void kai_sched_park(void) {
     next->state = KAI_FIBER_RUNNING;
     kai_active_fiber = next;
     swapcontext(&current->ctx, &next->ctx);
+    /* R4 fix — see kai_sched_yield: drain pending free on resume. */
+    kai_drain_pending_free();
 }
 
 /* Unpark: target PARKED → READY, enqueue at run queue tail. Caller
@@ -2518,6 +2571,11 @@ static void kai_sched_unpark(KaiFiber *target) {
  * touch RC on either. */
 static void kai_fiber_trampoline(void) {
     KaiFiber *self = kai_active_fiber;
+    /* First entry follows a setcontext from another fiber's
+     * trampoline tail or a swap from yield/park. Drain any pending
+     * struct free left behind by the previous fiber's
+     * `kai_decref(self->value)` before we touch our own state. */
+    kai_drain_pending_free();
     if (setjmp(self->cancel_pad) == 0) {
         self->cancel_pad_set = 1;
         self->result = kai_apply(self->thunk, 0, NULL);
@@ -2549,6 +2607,19 @@ static void kai_fiber_trampoline(void) {
         a->awaiters_next = NULL;
         kai_sched_unpark(a);
         a = nx;
+    }
+
+    /* R4 fix — drop the scheduler-side incref on our wrapper, taken
+     * by `kai_default_spawn_spawn` before enqueue. Pairs `enqueue`
+     * with this single decref. If the user already discarded their
+     * Fiber[T] handle, this brings RC to 0 and `kai_free_value`
+     * defers the struct/stack free into `kai_pending_free` (we are
+     * still standing on this fiber's stack); the next fiber's drain
+     * hook reaps it. If awaiters or the user still hold the handle,
+     * the wrapper survives this decref and is freed later by their
+     * own drops. */
+    if (self->value) {
+        kai_decref(self->value);
     }
 
     /* Hand control to the next ready fiber. Awaiters we just woke
@@ -2615,9 +2686,19 @@ static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k
      * cannot pop while the spawned fiber is still live. */
     f->evidence_top = f->parent->evidence_top;
     kai_fiber_init_ctx(f);
+    /* R4 fix — allocate the wrapper before enqueue so the scheduler
+     * can hold its own incref on the value. Without this second ref a
+     * `let _ = fiber_spawn(…)` discard would drop the wrapper to
+     * RC=0 while the struct is still in the ready queue, and the
+     * trampoline would later run on freed memory. The wrapper RC
+     * therefore starts at 2: one for the caller (the user-visible
+     * Fiber[T] handle) and one for the scheduler (released in the
+     * trampoline's DONE/CANCELLED tail via `kai_decref(self->value)`). */
+    KaiValue *v = kai_fiber_value(f);  /* RC=1, sets f->value */
+    kai_incref(v);                     /* RC=2, scheduler's own ref */
     f->state = KAI_FIBER_READY;
     kai_sched_enqueue(f);
-    return kai_cont_resume(k, kai_fiber_value(f));
+    return kai_cont_resume(k, v);
 }
 
 static KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiCont *k) {
