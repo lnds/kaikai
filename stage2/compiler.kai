@@ -845,8 +845,42 @@ fn diag_error(file: String, line: Int, col: Int, msg: String) : Unit / Console {
   emit_source_caret(file, line, col)
 }
 
+# m4c Phase 3 invariant report types. Defined here so
+# `report_mono_leaks` (next fn) can reference `LR` / `LL` despite
+# stage 1's order-sensitive type resolution. The walkers that build
+# these values live near `monomorphise` (single-source-of-truth for
+# the Phase 3 invariant pass).
+type LeakLoc = MLeakAt(Int, Int, String)
+type MLeakRecord = MLeakRec(String, Int, Option[LeakLoc])
+
 fn diag_note(msg: String) : Unit / Console = eprint("  = note: #{msg}")
 fn diag_help(msg: String) : Unit / Console = eprint("  = help: #{msg}")
+
+# m4c Phase 3 invariant reporter: print one diag per spec leak,
+# return total leak count (0 = clean). Lives near `diag_error` so
+# its row is `Console`-only and the caller's row inference picks it
+# up cleanly.
+fn report_mono_leaks(file: String, rs: [MLeakRecord]) : Int / Console {
+  match rs {
+    [] -> 0
+    [r, ...rest] -> match r {
+      MLeakRec(name, n, loc) -> {
+        let loc_s = match loc {
+          Some(MLeakAt(line, col, ty_s)) ->
+            concat_all([" first at ", int_to_string(line), ":",
+                        int_to_string(col), " ty=", ty_s])
+          None -> ""
+        }
+        diag_error(file, 0, 0,
+          concat_all(["m4c Phase 3 invariant: spec '", name,
+                       "' has ", int_to_string(n),
+                       " TyVarT/UVar leak(s) in body Expr.ty",
+                       loc_s]))
+        n + report_mono_leaks(file, rest)
+      }
+    }
+  }
+}
 
 # Levenshtein edit distance for "did you mean?" suggestions. Plain
 # DP over rows, immutable — each row is a freshly-built list. Small
@@ -14594,12 +14628,20 @@ fn canon_uvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyVarT(_) -> t
     TyListT(inner) -> TyListT(canon_uvars_ty(inner, m))
     TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => canon_uvars_ty(p, m)),
-                                  canon_uvars_ty(ret, m), row)
+                                  canon_uvars_ty(ret, m), canon_uvars_row(row, m))
     TyCon(name, tas) -> TyCon(name, map(tas, (a) => canon_uvars_ty(a, m)))
     TyDimT(base, u) -> TyDimT(canon_uvars_ty(base, m), canon_uvars_unit(u, m))
     TyRefineT(base, p) -> TyRefineT(canon_uvars_ty(base, m), p)
   }
 }
+
+fn canon_uvars_row(r: Row, m: [IntPair]) : Row {
+  let new_labels = map(r.labels, (l) => canon_uvars_label(l, m))
+  Row { labels: new_labels, tail: r.tail, display_alias: r.display_alias }
+}
+
+fn canon_uvars_label(l: Label, m: [IntPair]) : Label =
+  Label { eff: l.eff, ty_args: map(l.ty_args, (a) => canon_uvars_ty(a, m)) }
 
 fn canon_uvars_unit(u: UnitExprT, m: [IntPair]) : UnitExprT {
   match u {
@@ -14642,12 +14684,20 @@ fn canon_tvars_ty(t: Ty, m: [IntPair]) : Ty {
     }
     TyListT(inner) -> TyListT(canon_tvars_ty(inner, m))
     TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => canon_tvars_ty(p, m)),
-                                  canon_tvars_ty(ret, m), row)
+                                  canon_tvars_ty(ret, m), canon_tvars_row(row, m))
     TyCon(name, tas) -> TyCon(name, map(tas, (a) => canon_tvars_ty(a, m)))
     TyDimT(base, u) -> TyDimT(canon_tvars_ty(base, m), u)
     TyRefineT(base, p) -> TyRefineT(canon_tvars_ty(base, m), p)
   }
 }
+
+fn canon_tvars_row(r: Row, m: [IntPair]) : Row {
+  let new_labels = map(r.labels, (l) => canon_tvars_label(l, m))
+  Row { labels: new_labels, tail: r.tail, display_alias: r.display_alias }
+}
+
+fn canon_tvars_label(l: Label, m: [IntPair]) : Label =
+  Label { eff: l.eff, ty_args: map(l.ty_args, (a) => canon_tvars_ty(a, m)) }
 
 # Canonicalise a list of ResolvedCS records by applying the bound-id
 # redirect maps to each CS's tys / units. Mirrors the canon_*_expr
@@ -20511,7 +20561,403 @@ fn dump_mono_out(file: String, decls: [Decl]) : Int {
 # USD` and `u := EUR` therefore key into distinct specialisations
 # even though their type-tparam tuple is empty.
 
-fn monomorphise(tp: TypedProgram) : [Decl] {
+# ---- m4c Phase 3 invariant: no leftover TyVarT / UVar in specs ----
+#
+# Walks the post-monomorphise `[Decl]` and reports any specialised
+# DFn (one whose name carries the `__mono__` / `__umono__` mangling
+# infix) whose body still references a `TyVarT` or `UVar` in any
+# `Expr.ty`. A leak here means body subst missed a node — the spec
+# would behave like a polymorphic copy at the consumer side. Returns
+# the count of leaks for diagnostics.
+# Per-spec invariant: walk a specialised DFn body counting only
+# `TyVarT(n)` / `UVar(n)` whose `n` is in the spec's substitution
+# domain (i.e., would have been replaced by `subst_decl` if the
+# walker reached that node). Free typer tyvars whose ids fall
+# outside both lists are unrelated artefacts (clause answer types
+# the typer left open, etc.) and do not count as leaks.
+fn count_spec_leaks(body: Expr, atv: [Int], auv: [Int]) : Int =
+  count_tyvar_in_expr(body, atv, auv, 0)
+
+fn first_spec_leak(body: Expr, atv: [Int], auv: [Int]) : Option[LeakLoc] =
+  find_first_leak_in_expr(body, atv, auv)
+
+fn subst_map_tvar_ids(sm: SubstMap) : [Int] =
+  match sm { SM(tvars, _) -> stp_ids(tvars, []) }
+
+fn stp_ids(ps: [SubstPairTy], acc: [Int]) : [Int] {
+  match ps {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      STP(i, _) -> stp_ids(rest, [i, ...acc])
+    }
+  }
+}
+
+fn subst_map_uvar_ids(sm: SubstMap) : [Int] =
+  match sm { SM(_, uvars) -> sup_ids(uvars, []) }
+
+fn sup_ids(ps: [SubstPairUnit], acc: [Int]) : [Int] {
+  match ps {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      SUP(i, _) -> sup_ids(rest, [i, ...acc])
+    }
+  }
+}
+
+fn count_tyvar_in_expr(e: Expr, allowed_tvars: [Int], allowed_uvars: [Int],
+                        acc: Int) : Int {
+  let n_self = match e.ty {
+    Some(t) -> count_tyvar_in_ty(t, allowed_tvars, allowed_uvars)
+    None    -> 0
+  }
+  let n_kind = count_tyvar_in_kind(e.kind, allowed_tvars, allowed_uvars)
+  acc + n_self + n_kind
+}
+
+# Locate the first leak in a spec body — returns (line, col,
+# rendered ty) for diagnostics. Allowed lists scope the check to
+# the spec's own substitution domain (typer-introduced free tyvars
+# whose ids fall outside both lists are ignored). `LeakLoc` is
+# defined near `diag_error` so the diagnostic helper can reference
+# it before this section.
+fn find_first_leak_in_expr(e: Expr, atv: [Int], auv: [Int]) : Option[LeakLoc] {
+  match e.ty {
+    Some(t) -> if count_tyvar_in_ty(t, atv, auv) > 0 {
+      Some(MLeakAt(e.line, e.col, ty_to_string(t)))
+    } else { find_first_leak_in_kind(e.kind, atv, auv) }
+    None -> find_first_leak_in_kind(e.kind, atv, auv)
+  }
+}
+
+fn find_first_leak_in_kind(k: ExprKind, atv: [Int], auv: [Int]) : Option[LeakLoc] {
+  match k {
+    ECall(callee, args_) -> match find_first_leak_in_expr(callee, atv, auv) {
+      Some(l) -> Some(l)
+      None -> find_first_leak_in_args(args_, atv, auv)
+    }
+    EField(base, _) -> find_first_leak_in_expr(base, atv, auv)
+    EIndex(a, b) -> match find_first_leak_in_expr(a, atv, auv) {
+      Some(l) -> Some(l) None -> find_first_leak_in_expr(b, atv, auv)
+    }
+    EBinop(_, a, b) -> match find_first_leak_in_expr(a, atv, auv) {
+      Some(l) -> Some(l) None -> find_first_leak_in_expr(b, atv, auv)
+    }
+    EUnop(_, x) -> find_first_leak_in_expr(x, atv, auv)
+    EIf(c, t_, eo) -> match find_first_leak_in_expr(c, atv, auv) {
+      Some(l) -> Some(l)
+      None -> match find_first_leak_in_expr(t_, atv, auv) {
+        Some(l) -> Some(l)
+        None -> match eo { Some(eb) -> find_first_leak_in_expr(eb, atv, auv) None -> None }
+      }
+    }
+    EMatch(scr, arms) -> match find_first_leak_in_expr(scr, atv, auv) {
+      Some(l) -> Some(l) None -> find_first_leak_in_arms(arms, atv, auv)
+    }
+    ELambda(_, b) -> find_first_leak_in_expr(b, atv, auv)
+    ELitUnit(inner, _) -> find_first_leak_in_expr(inner, atv, auv)
+    EBang(inner) -> find_first_leak_in_expr(inner, atv, auv)
+    EBlock(stmts, tail) -> match find_first_leak_in_stmts(stmts, atv, auv) {
+      Some(l) -> Some(l) None -> match tail { Some(e) -> find_first_leak_in_expr(e, atv, auv) None -> None }
+    }
+    EPipe(a, b) -> match find_first_leak_in_expr(a, atv, auv) {
+      Some(l) -> Some(l) None -> find_first_leak_in_expr(b, atv, auv)
+    }
+    ERange(a, b, opt_step) -> match find_first_leak_in_expr(a, atv, auv) {
+      Some(l) -> Some(l)
+      None -> match find_first_leak_in_expr(b, atv, auv) {
+        Some(l) -> Some(l)
+        None -> match opt_step { Some(s) -> find_first_leak_in_expr(s, atv, auv) None -> None }
+      }
+    }
+    ERecordLit(_, fs) -> find_first_leak_in_fields(fs, atv, auv)
+    EList(els) -> find_first_leak_in_elems(els, atv, auv)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> match find_first_leak_in_expr(body, atv, auv) {
+      Some(l) -> Some(l)
+      None -> match init_opt {
+        Some(ie) -> match find_first_leak_in_expr(ie, atv, auv) {
+          Some(l) -> Some(l) None -> find_first_leak_in_clauses_then_ret(clauses, ret_opt, atv, auv)
+        }
+        None -> find_first_leak_in_clauses_then_ret(clauses, ret_opt, atv, auv)
+      }
+    }
+    _ -> None
+  }
+}
+
+fn find_first_leak_in_args(args: [Expr], atv: [Int], auv: [Int]) : Option[LeakLoc] {
+  match args {
+    [] -> None
+    [a, ...rest] -> match find_first_leak_in_expr(a, atv, auv) {
+      Some(l) -> Some(l) None -> find_first_leak_in_args(rest, atv, auv)
+    }
+  }
+}
+
+fn find_first_leak_in_arms(arms: [Arm], atv: [Int], auv: [Int]) : Option[LeakLoc] {
+  match arms {
+    [] -> None
+    [a, ...rest] -> match a {
+      Arm(_, g, b) -> {
+        let r1 = match g { Some(ge) -> find_first_leak_in_expr(ge, atv, auv) None -> None }
+        match r1 {
+          Some(l) -> Some(l)
+          None -> match find_first_leak_in_expr(b, atv, auv) {
+            Some(l) -> Some(l) None -> find_first_leak_in_arms(rest, atv, auv)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn find_first_leak_in_fields(fs: [FieldInit], atv: [Int], auv: [Int]) : Option[LeakLoc] {
+  match fs {
+    [] -> None
+    [f, ...rest] -> match f {
+      FI(_, v) -> match find_first_leak_in_expr(v, atv, auv) {
+        Some(l) -> Some(l) None -> find_first_leak_in_fields(rest, atv, auv)
+      }
+    }
+  }
+}
+
+fn find_first_leak_in_elems(els: [ListElem], atv: [Int], auv: [Int]) : Option[LeakLoc] {
+  match els {
+    [] -> None
+    [el, ...rest] -> {
+      let r = match el {
+        ElPlain(x)  -> find_first_leak_in_expr(x, atv, auv)
+        ElSpread(x) -> find_first_leak_in_expr(x, atv, auv)
+      }
+      match r {
+        Some(l) -> Some(l) None -> find_first_leak_in_elems(rest, atv, auv)
+      }
+    }
+  }
+}
+
+fn find_first_leak_in_stmts(stmts: [Stmt], atv: [Int], auv: [Int]) : Option[LeakLoc] {
+  match stmts {
+    [] -> None
+    [s, ...rest] -> {
+      let r = match s {
+        SLet(_, _, rhs) -> find_first_leak_in_expr(rhs, atv, auv)
+        SAssert(c, m) -> match find_first_leak_in_expr(c, atv, auv) {
+          Some(l) -> Some(l)
+          None -> match m { Some(me) -> find_first_leak_in_expr(me, atv, auv) None -> None }
+        }
+        SExprStmt(x) -> find_first_leak_in_expr(x, atv, auv)
+        SIndexAssign(b, i, v, _, _) -> match find_first_leak_in_expr(b, atv, auv) {
+          Some(l) -> Some(l)
+          None -> match find_first_leak_in_expr(i, atv, auv) {
+            Some(l) -> Some(l) None -> find_first_leak_in_expr(v, atv, auv)
+          }
+        }
+        SVar(_, _, rhs, _, _) -> find_first_leak_in_expr(rhs, atv, auv)
+        SUse(_, _, _) -> None
+      }
+      match r {
+        Some(l) -> Some(l) None -> find_first_leak_in_stmts(rest, atv, auv)
+      }
+    }
+  }
+}
+
+fn find_first_leak_in_clauses_then_ret(cs: [HClause], ret: Option[HReturn], atv: [Int], auv: [Int]) : Option[LeakLoc] {
+  match find_first_leak_in_clauses(cs, atv, auv) {
+    Some(l) -> Some(l)
+    None -> match ret {
+      Some(r) -> match r { HR(_, b, _, _) -> find_first_leak_in_expr(b, atv, auv) }
+      None -> None
+    }
+  }
+}
+
+fn find_first_leak_in_clauses(cs: [HClause], atv: [Int], auv: [Int]) : Option[LeakLoc] {
+  match cs {
+    [] -> None
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) -> match find_first_leak_in_expr(b, atv, auv) {
+        Some(l) -> Some(l) None -> find_first_leak_in_clauses(rest, atv, auv)
+      }
+    }
+  }
+}
+
+fn count_tyvar_in_ty(t: Ty, atv: [Int], auv: [Int]) : Int {
+  match t {
+    TyVarT(n) -> if list_has_int(atv, n) { 1 } else { 0 }
+    TyListT(inner) -> count_tyvar_in_ty(inner, atv, auv)
+    TyFnT(ps, ret, row) -> {
+      let np = sum_count_tyvar_tys(ps, atv, auv)
+      let nr = count_tyvar_in_ty(ret, atv, auv)
+      let nrow = count_tyvar_in_row(row, atv, auv)
+      np + nr + nrow
+    }
+    TyCon(_, tas) -> sum_count_tyvar_tys(tas, atv, auv)
+    TyDimT(b, u) -> count_tyvar_in_ty(b, atv, auv) + count_tyvar_in_unit(u, auv)
+    TyRefineT(b, _) -> count_tyvar_in_ty(b, atv, auv)
+    _ -> 0
+  }
+}
+
+fn count_tyvar_in_row(r: Row, atv: [Int], auv: [Int]) : Int =
+  sum_count_tyvar_labels(r.labels, atv, auv)
+
+fn sum_count_tyvar_labels(ls: [Label], atv: [Int], auv: [Int]) : Int {
+  match ls {
+    [] -> 0
+    [l, ...rest] -> {
+      let here = sum_count_tyvar_tys(l.ty_args, atv, auv)
+      let after = sum_count_tyvar_labels(rest, atv, auv)
+      here + after
+    }
+  }
+}
+
+fn sum_count_tyvar_tys(ts: [Ty], atv: [Int], auv: [Int]) : Int {
+  match ts {
+    [] -> 0
+    [h, ...rest] -> {
+      let here = count_tyvar_in_ty(h, atv, auv)
+      let after = sum_count_tyvar_tys(rest, atv, auv)
+      here + after
+    }
+  }
+}
+
+fn count_tyvar_in_unit(u: UnitExprT, auv: [Int]) : Int {
+  match u {
+    UVar(n) -> if list_has_int(auv, n) { 1 } else { 0 }
+    UMul(a, b) -> count_tyvar_in_unit(a, auv) + count_tyvar_in_unit(b, auv)
+    UInv(a) -> count_tyvar_in_unit(a, auv)
+    UPow(a, _) -> count_tyvar_in_unit(a, auv)
+    _ -> 0
+  }
+}
+
+fn count_tyvar_in_kind(k: ExprKind, atv: [Int], auv: [Int]) : Int {
+  match k {
+    EInt(_)        -> 0
+    EReal(_)       -> 0
+    EBool(_)       -> 0
+    EChar(_)       -> 0
+    EStr(_, _)     -> 0
+    EUnit          -> 0
+    EVar(_)        -> 0
+    EUnder         -> 0
+    EPlaceholder   -> 0
+    EHole(_)       -> 0
+    ETodo(_)       -> 0
+    EVariantsOf(_, _) -> 0
+    EModCall(_, _) -> 0
+    ECall(callee, args_) -> count_tyvar_in_expr(callee, atv, auv, 0) + sum_count_tyvar_args(args_, atv, auv)
+    EField(base, _)   -> count_tyvar_in_expr(base, atv, auv, 0)
+    EIndex(a, b)      -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EBinop(_, a, b)   -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EUnop(_, x)       -> count_tyvar_in_expr(x, atv, auv, 0)
+    EIf(c, t_, eo)    -> {
+      let n0 = count_tyvar_in_expr(c, atv, auv, 0) + count_tyvar_in_expr(t_, atv, auv, 0)
+      match eo { Some(eb) -> n0 + count_tyvar_in_expr(eb, atv, auv, 0) None -> n0 }
+    }
+    EMatch(scr, arms) -> count_tyvar_in_expr(scr, atv, auv, 0) + sum_count_tyvar_arms(arms, atv, auv)
+    ELambda(_, b)     -> count_tyvar_in_expr(b, atv, auv, 0)
+    ERecordLit(_, fs) -> sum_count_tyvar_fields(fs, atv, auv)
+    EList(els)        -> sum_count_tyvar_elems(els, atv, auv)
+    ERange(a, b, opt_step) -> {
+      let n0 = count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+      match opt_step { Some(e3) -> n0 + count_tyvar_in_expr(e3, atv, auv, 0) None -> n0 }
+    }
+    EBlock(stmts, tail) -> {
+      let n0 = sum_count_tyvar_stmts(stmts, atv, auv)
+      match tail { Some(e3) -> n0 + count_tyvar_in_expr(e3, atv, auv, 0) None -> n0 }
+    }
+    EPipe(a, b) -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let n0 = count_tyvar_in_expr(body, atv, auv, 0)
+      let n1 = match init_opt { Some(e3) -> n0 + count_tyvar_in_expr(e3, atv, auv, 0) None -> n0 }
+      let n2 = n1 + sum_count_tyvar_clauses(clauses, atv, auv)
+      match ret_opt {
+        Some(r) -> match r { HR(_, b, _, _) -> n2 + count_tyvar_in_expr(b, atv, auv, 0) }
+        None -> n2
+      }
+    }
+    ELitUnit(inner, _) -> count_tyvar_in_expr(inner, atv, auv, 0)
+    EBang(inner)       -> count_tyvar_in_expr(inner, atv, auv, 0)
+  }
+}
+
+fn sum_count_tyvar_args(args: [Expr], atv: [Int], auv: [Int]) : Int {
+  match args {
+    [] -> 0
+    [a, ...rest] -> count_tyvar_in_expr(a, atv, auv, 0) + sum_count_tyvar_args(rest, atv, auv)
+  }
+}
+
+fn sum_count_tyvar_arms(arms: [Arm], atv: [Int], auv: [Int]) : Int {
+  match arms {
+    [] -> 0
+    [arm, ...rest] -> match arm {
+      Arm(_, g, b) -> {
+        let ng = match g { Some(ge) -> count_tyvar_in_expr(ge, atv, auv, 0) None -> 0 }
+        ng + count_tyvar_in_expr(b, atv, auv, 0) + sum_count_tyvar_arms(rest, atv, auv)
+      }
+    }
+  }
+}
+
+fn sum_count_tyvar_fields(fs: [FieldInit], atv: [Int], auv: [Int]) : Int {
+  match fs {
+    [] -> 0
+    [f, ...rest] -> match f {
+      FI(_, v) -> count_tyvar_in_expr(v, atv, auv, 0) + sum_count_tyvar_fields(rest, atv, auv)
+    }
+  }
+}
+
+fn sum_count_tyvar_elems(els: [ListElem], atv: [Int], auv: [Int]) : Int {
+  match els {
+    [] -> 0
+    [el, ...rest] -> {
+      let n = match el {
+        ElPlain(x)  -> count_tyvar_in_expr(x, atv, auv, 0)
+        ElSpread(x) -> count_tyvar_in_expr(x, atv, auv, 0)
+      }
+      n + sum_count_tyvar_elems(rest, atv, auv)
+    }
+  }
+}
+
+fn sum_count_tyvar_stmts(stmts: [Stmt], atv: [Int], auv: [Int]) : Int {
+  match stmts {
+    [] -> 0
+    [s, ...rest] -> {
+      let n = match s {
+        SLet(_, _, rhs)             -> count_tyvar_in_expr(rhs, atv, auv, 0)
+        SAssert(c, m)               -> match m { Some(me) -> count_tyvar_in_expr(c, atv, auv, 0) + count_tyvar_in_expr(me, atv, auv, 0) None -> count_tyvar_in_expr(c, atv, auv, 0) }
+        SExprStmt(x)                -> count_tyvar_in_expr(x, atv, auv, 0)
+        SIndexAssign(b, i, v, _, _) -> count_tyvar_in_expr(b, atv, auv, 0) + count_tyvar_in_expr(i, atv, auv, 0) + count_tyvar_in_expr(v, atv, auv, 0)
+        SVar(_, _, rhs, _, _)       -> count_tyvar_in_expr(rhs, atv, auv, 0)
+        SUse(_, _, _)               -> 0
+      }
+      n + sum_count_tyvar_stmts(rest, atv, auv)
+    }
+  }
+}
+
+fn sum_count_tyvar_clauses(cs: [HClause], atv: [Int], auv: [Int]) : Int {
+  match cs {
+    [] -> 0
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) -> count_tyvar_in_expr(b, atv, auv, 0) + sum_count_tyvar_clauses(rest, atv, auv)
+    }
+  }
+}
+
+type MonoOutput = MonoOut([Decl], [MLeakRecord])
+
+fn monomorphise(tp: TypedProgram) : MonoOutput {
   let polys = collect_poly_fns(tp.decls)
   # `resolve_protocol_calls` renames `__proto_<op>(arg)` call sites
   # to `__pimpl_<P>_<T>_<op>(arg)` AFTER `infer_program` has populated
@@ -20533,14 +20979,15 @@ fn monomorphise(tp: TypedProgram) : [Decl] {
   # promote previously-polymorphic flow-through call sites to
   # concrete tuples (e.g., `f__mono__Int`'s body calls `g(x : Int)`
   # which now mangles to `g__mono__Int`); those new tuples enter
-  # the worklist and produce additional specs.
-  let r = generate_specs_iter(polys, initial_tuples, tp.insts, [], initial_tuples)
+  # the worklist and produce additional specs. Each spec also
+  # accumulates a per-spec leak record (m4c Phase 3 invariant).
+  let r = generate_specs_iter(polys, initial_tuples, tp.insts, [], initial_tuples, [])
   match r {
-    GenSpecsOut(specs, _) -> list_append(rewritten, specs)
+    GenSpecsOut(specs, _, leaks) -> MonoOut(list_append(rewritten, specs), leaks)
   }
 }
 
-type GenSpecsResult = GenSpecsOut([Decl], [MonoTuple])
+type GenSpecsResult = GenSpecsOut([Decl], [MonoTuple], [MLeakRecord])
 
 # Synthesise a ResolvedCS for a call to a polymorphic DFn by
 # walking the impl's formal param types in parallel with the actual
@@ -20923,12 +21370,26 @@ fn subst_ty(t: Ty, sm: SubstMap) : Ty {
     }
     TyListT(inner) -> TyListT(subst_ty(inner, sm))
     TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => subst_ty(p, sm)),
-                                  subst_ty(ret, sm), row)
+                                  subst_ty(ret, sm), subst_row(row, sm))
     TyCon(name, tas) -> TyCon(name, map(tas, (a) => subst_ty(a, sm)))
     TyDimT(base, u) -> dim_collapse(subst_ty(base, sm), unit_canon(subst_unit(u, sm)))
     TyRefineT(base, p) -> TyRefineT(subst_ty(base, sm), p)
   }
 }
+
+# Subst through a Row's effect-label `ty_args` (which carry resolved
+# Ty per parametric effect — `State[T]`, `Reader[T]`, ...). Tails
+# (row vars) live in their own namespace and pass through unchanged.
+fn subst_row(r: Row, sm: SubstMap) : Row {
+  Row {
+    labels: map(r.labels, (l) => subst_label(l, sm)),
+    tail: r.tail,
+    display_alias: r.display_alias
+  }
+}
+
+fn subst_label(l: Label, sm: SubstMap) : Label =
+  Label { eff: l.eff, ty_args: map(l.ty_args, (a) => subst_ty(a, sm)) }
 
 # Walker `subst_unit(u, sm)` — recurses through every UnitExprT
 # constructor. `UVar(id)` substitutes via `sm.uvars` (canonicalised
@@ -20977,7 +21438,7 @@ fn subst_decl(d: Decl, sm: SubstMap) : Decl {
 # inline at each call site (so internal polymorphic-flow-through
 # calls retarget to their spec mangled names), and return the
 # rewritten DFn alongside the list of newly-discovered tuples.
-type SpecEmitOut = SEO(Decl, [MonoTuple])
+type SpecEmitOut = SEO(Decl, [MonoTuple], [MLeakRecord])
 
 fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
               all_tuples: [MonoTuple]) : SpecEmitOut {
@@ -20991,7 +21452,22 @@ fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
     let new_tuples = discover_new_tuples_decl(spec1, insts, polys, all_tuples, sm)
     let updated_tuples = list_append(all_tuples, new_tuples)
     let spec2 = rewrite_callsites_decl_sm(spec1, insts, updated_tuples, polys, sm)
-    SEO(spec2, new_tuples)
+    # m4c Phase 3 invariant: count any TyVarT/UVar in the spec body
+    # whose id is in `sm`'s domain (i.e., should have been replaced
+    # by `subst_decl`). Out-of-domain ids belong to unrelated free
+    # typer tyvars and are skipped. The spec's name + first leak
+    # location go into the diag report at compile_source level.
+    let atv = subst_map_tvar_ids(sm)
+    let auv = subst_map_uvar_ids(sm)
+    let leaks = match spec2 {
+      DFn(_, sname, _, _, _, _, sbody, _, _, _) ->
+        match first_spec_leak(sbody, atv, auv) {
+          Some(loc) -> [MLeakRec(sname, count_spec_leaks(sbody, atv, auv), Some(loc))]
+          None -> []
+        }
+      _ -> []
+    }
+    SEO(spec2, new_tuples, leaks)
   } }
 }
 
@@ -21326,23 +21802,32 @@ fn resolve_call_inst(insts: [ResolvedCS], polys: [PolyFn], name: String,
 # by per-spec rewrite to know which retargets are reachable.
 fn generate_specs_iter(polys: [PolyFn], worklist: [MonoTuple],
                         insts: [ResolvedCS], specs_acc: [Decl],
-                        all_tuples: [MonoTuple]) : GenSpecsResult {
+                        all_tuples: [MonoTuple],
+                        leaks_acc: [MLeakRecord]) : GenSpecsResult {
   match worklist {
-    [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples)
+    [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples, list_reverse(leaks_acc))
     [t, ...rest] -> match lookup_poly_fn(polys, mt_name(t)) {
-      None -> generate_specs_iter(polys, rest, insts, specs_acc, all_tuples)
+      None -> generate_specs_iter(polys, rest, insts, specs_acc, all_tuples, leaks_acc)
       Some(d) -> {
         let r = emit_spec(d, t, insts, polys, all_tuples)
         match r {
-          SEO(spec, new_ts) -> {
+          SEO(spec, new_ts, new_leaks) -> {
             let next_worklist = list_append(rest, new_ts)
             let next_all = list_append(all_tuples, new_ts)
+            let next_leaks = prepend_leaks(new_leaks, leaks_acc)
             generate_specs_iter(polys, next_worklist, insts,
-                                 [spec, ...specs_acc], next_all)
+                                 [spec, ...specs_acc], next_all, next_leaks)
           }
         }
       }
     }
+  }
+}
+
+fn prepend_leaks(xs: [MLeakRecord], acc: [MLeakRecord]) : [MLeakRecord] {
+  match xs {
+    [] -> acc
+    [h, ...rest] -> prepend_leaks(rest, [h, ...acc])
   }
 }
 
@@ -29751,22 +30236,36 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                     let hole_errs = if strict_holes { strict_holes_check(path, all_decls) } else { 0 }
                     if hole_errs != 0 { hole_errs }
                     else {
-                      # m4c #1 — identity monomorphise. Hands typed decls
-                      # to the next pass; semantics unchanged because the
-                      # emitter does not read `Expr.ty`.
-                      let mono_decls = monomorphise(typed_prog)
+                      # m4c — monomorphise (Phase 1 + 2 full + 3).
+                      # See `docs/m4c-real-specialisation.md` for the
+                      # full plan. Phase 3 adds body type / unit
+                      # substitution per spec, which retires the
+                      # `try_rewrite_show_dim_real` workaround.
+                      let mono_out = monomorphise(typed_prog)
+                      let mono_decls = match mono_out { MonoOut(ds, _) -> ds }
+                      # m4c Phase 3 invariant: per-spec leak records
+                      # carry only TyVarT/UVar ids in the spec's
+                      # SubstMap domain — any leak means body subst
+                      # missed a node and the spec would behave like
+                      # a polymorphic copy. Free typer tyvars whose
+                      # ids fall outside the domain are skipped.
+                      let mono_leaks = match mono_out { MonoOut(_, ls) -> ls }
+                      let mono_inv_errs = report_mono_leaks(path, mono_leaks)
                       # m5 #1 — basic Perceus walker (identity).
                       # m5 #2-#4 fill in last-use analysis + dup/drop.
                       let perceus_decls = perceus_pass(mono_decls)
                       let test_mode = match mode { MTest -> true _ -> false }
                       let use_llvm = match mode { MEmitLlvm -> true _ -> false }
-                      let out = if use_llvm {
-                        emit_program_llvm(path, src, perceus_decls, test_mode)
-                      } else {
-                        emit_program(path, src, perceus_decls, test_mode)
+                      if mono_inv_errs != 0 { mono_inv_errs }
+                      else {
+                        let out = if use_llvm {
+                          emit_program_llvm(path, src, perceus_decls, test_mode)
+                        } else {
+                          emit_program(path, src, perceus_decls, test_mode)
+                        }
+                        print(out)
+                        0
                       }
-                      print(out)
-                      0
                     }
                   }
                 }
