@@ -1305,48 +1305,80 @@ static KaiValue *kai_prelude_list_reverse(KaiValue *xs) {
 
 /* ---------- prelude: higher order ---------- */
 /*
+ * Iterative refactor (Perceus Tier 2 part 3, 2026-04-29). Pre-flip
+ * these were recursive over `xs->as.cons.tail`, which forced the
+ * helpers to *borrow* `xs` (the recursion holds aliased pointers
+ * to every cell while the closure runs). Now they walk iteratively
+ * with `KaiValue *p = xs; p = p->as.cons.tail;` so the entire
+ * cons-chain stays alive under `xs`'s single reference until the
+ * helper exits, and we can decref `xs` once at the end.
+ *
  * kai_apply contract under m5.x flip: every arg slot holds an OWNED
  * reference that the callee consumes (the closure body is perceus-
- * compiled and decrefs each arg through normal use). Callers that
- * want to retain their reference must `kai_incref` before passing.
- * The four helpers below borrow `xs->as.cons.head` from the caller's
- * list cell, so each kai_apply arg gets a fresh incref to give the
- * closure its own ownership; the original cons cell stays alive
- * for the recursive tail traversal and for the `kai_cons(...)`
- * reconstruction in `_filter`.
+ * compiled and decrefs each arg through normal use). The helpers
+ * `kai_incref(p->as.cons.head)` to give the closure its own
+ * ownership of each element while the cons cell stays alive under
+ * `xs`. `kai_apply` itself does NOT consume `f` — the helper does
+ * that once, post-loop.
+ *
+ * `_map` / `_filter` build their result reversed (each iteration
+ * cons-prepends) and call `kai_prelude_list_reverse` once to
+ * restore order. `list_reverse` consumes its arg, so the
+ * intermediate reversed list is freed in the same step that
+ * produces the final list — no extra retention.
  */
 
 static KaiValue *kai_prelude_map(KaiValue *xs, KaiValue *f) {
-    if (!xs || xs->tag == KAI_NIL) return kai_nil();
-    KaiValue *arg0 = kai_incref(xs->as.cons.head);
-    KaiValue *head = kai_apply(f, 1, &arg0);
-    KaiValue *rest = kai_prelude_map(xs->as.cons.tail, f);
-    return kai_cons(head, rest);
+    KaiValue *acc = kai_nil();
+    KaiValue *p = xs;
+    while (p && p->tag == KAI_CONS) {
+        KaiValue *arg0 = kai_incref(p->as.cons.head);
+        KaiValue *head = kai_apply(f, 1, &arg0);
+        acc = kai_cons(head, acc);
+        p = p->as.cons.tail;
+    }
+    KaiValue *result = kai_prelude_list_reverse(acc);  /* consumes acc */
+    if (xs) kai_decref(xs);
+    if (f)  kai_decref(f);
+    return result;
 }
 
-static KaiValue *kai_prelude_filter(KaiValue *xs, KaiValue *p) {
-    if (!xs || xs->tag == KAI_NIL) return kai_nil();
-    KaiValue *arg0 = kai_incref(xs->as.cons.head);
-    KaiValue *keep = kai_apply(p, 1, &arg0);
-    int yes = kai_truthy(keep);
-    kai_decref(keep);
-    KaiValue *rest = kai_prelude_filter(xs->as.cons.tail, p);
-    if (yes) return kai_cons(kai_incref(xs->as.cons.head), rest);
-    return rest;
+static KaiValue *kai_prelude_filter(KaiValue *xs, KaiValue *pred) {
+    KaiValue *acc = kai_nil();
+    KaiValue *p = xs;
+    while (p && p->tag == KAI_CONS) {
+        KaiValue *arg0 = kai_incref(p->as.cons.head);
+        KaiValue *keep = kai_apply(pred, 1, &arg0);
+        int yes = kai_truthy(keep);
+        kai_decref(keep);
+        if (yes) {
+            acc = kai_cons(kai_incref(p->as.cons.head), acc);
+        }
+        p = p->as.cons.tail;
+    }
+    KaiValue *result = kai_prelude_list_reverse(acc);  /* consumes acc */
+    if (xs)   kai_decref(xs);
+    if (pred) kai_decref(pred);
+    return result;
 }
 
 static KaiValue *kai_prelude_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
-    KaiValue *acc = kai_incref(init);
-    KaiValue *p   = xs;
+    /* acc starts as the caller's `init` ref (transferred). Each
+     * iteration hands acc to the closure (which consumes it) and
+     * receives a freshly-owned `next` back. If `xs` is empty we
+     * return init unchanged — its single ref flows out to the
+     * caller. */
+    KaiValue *acc = init;
+    KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) {
         KaiValue *args[2];
-        args[0] = kai_incref(acc);              /* closure consumes */
-        args[1] = kai_incref(p->as.cons.head);  /* closure consumes */
-        KaiValue *next = kai_apply(f, 2, args);
-        kai_decref(acc);                        /* release prior owned ref */
-        acc = next;
+        args[0] = acc;                              /* transfer to closure */
+        args[1] = kai_incref(p->as.cons.head);      /* closure consumes */
+        acc = kai_apply(f, 2, args);                /* closure produces fresh acc */
         p = p->as.cons.tail;
     }
+    if (xs) kai_decref(xs);
+    if (f)  kai_decref(f);
     return acc;
 }
 
@@ -1358,6 +1390,8 @@ static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
         kai_decref(r);
         p = p->as.cons.tail;
     }
+    if (xs) kai_decref(xs);
+    if (f)  kai_decref(f);
     return kai_unit();
 }
 
