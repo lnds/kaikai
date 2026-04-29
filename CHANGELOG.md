@@ -14,6 +14,79 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 - Versioning infrastructure: tags v0.1.0 → v0.7.2; `bin/kai --version`
   reads `VERSION` dynamically.
 
+## [0.12.0] — 2026-04-29 (Fibers Tier 1 — close R4 fiber-discard)
+
+**Minor: scheduler-side fiber RC discipline closes R4.** Discarding a
+spawned fiber via `let _ = fiber_spawn(…)` no longer deadlocks the
+scheduler. The wrapper `KaiValue` now starts at RC=2 — one ref for
+the caller (the user-visible `Fiber[T]` handle) and one for the
+scheduler — and the trampoline's DONE/CANCELLED tail
+`kai_decref`s the scheduler ref before dispatching the next ready
+fiber. Because the decref can bring RC to 0 while we are still
+running on the fiber's private stack, `kai_free_value`'s `KAI_FIBER`
+branch detects `v->as.fib == kai_current_fiber()` and defers the
+struct + stack free into a single-slot `kai_pending_free`; the next
+fiber drains the slot at trampoline entry and post-`swapcontext` in
+`kai_sched_yield` / `kai_sched_park`.
+
+This is the first item of the **Fibers Tier 1** scope pinned in
+`docs/fibers-honesty-targets.md` — the two bugs a curious visitor
+trips over in five minutes. Stack guard pages remain open as the
+second Tier 1 item, in a separate lane.
+
+### Added
+
+- `KaiValue *value` back-pointer on `KaiFiber` (`stage0/runtime.h`),
+  set by `kai_fiber_value(f)` so the trampoline tail can decref the
+  scheduler-side ref via `self->value`.
+- `kai_pending_free` single-slot global + `kai_drain_pending_free()`
+  helper that reaps the deferred struct + stack at the next entry
+  point following a context switch.
+- `examples/effects/m8_fiber_discard_yields.kai` regression fixture —
+  combines `let _ = fiber_spawn(…)` with `fiber_yield()` between
+  sends to exercise the discard path through a context switch and a
+  resume that drains `kai_pending_free`.
+
+### Changed
+
+- `kai_default_spawn_spawn` allocates the wrapper before enqueue and
+  takes its own incref before placing the fiber on the ready queue;
+  the old code returned `kai_fiber_value(f)` inside `kai_cont_resume`,
+  which left the scheduler holding a raw `KaiFiber *` while the
+  wrapper's RC was still 1.
+- `kai_fiber_trampoline` drains `kai_pending_free` at entry and runs
+  `kai_decref(self->value)` after walking awaiters / link chains and
+  before the dequeue + setcontext to the next ready fiber.
+- `kai_sched_yield` / `kai_sched_park` drain `kai_pending_free`
+  immediately after `swapcontext` returns.
+- `kai_free_value`'s `KAI_FIBER` branch defers the struct + stack
+  free when `v->as.fib == kai_current_fiber()` (the trampoline tail's
+  decref-on-self), and falls back to the immediate-free path when
+  the wrapper is dropped from a different fiber.
+- `examples/effects/m8_fiber_discard.kai` is no longer aspirational
+  — promoted from the `make stress-fixtures` expected-fail block
+  into `make test-effects`.
+- `demos/ping_pong/main.kai` simplified: the third worker is now
+  `let _ = fiber_spawn(…)` so the demo exercises both the discard
+  path and the await + result-flow path in a single run. Long
+  comment about the R4 workaround removed; round-robin output
+  unchanged.
+
+### Fixed
+
+- **R4 — discarding a `Fiber[T]` value (`let _ = fiber_spawn(…)`)
+  deadlocks the scheduler.** Documented in
+  `docs/known-regressions.md` since 2026-04-29 evening; status
+  flipped to FIXED today.
+
+### Internal
+
+- `docs/known-regressions.md` §R4 carries the FIXED writeup with
+  root-cause and the verification artifacts (both fixtures + the
+  ping_pong demo edit).
+- `docs/fibers-honesty-targets.md` Tier 1 row crossed out for R4;
+  Tier 2 carry-over row mirrored.
+
 ## [0.11.0] — 2026-04-29 (m4c #4 Phase 2 full — call-site rewrite)
 
 **Minor: monomorphisation now retargets call sites.** The previous
