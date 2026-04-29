@@ -212,7 +212,36 @@ typer be fixed.
 
 ## R2 — `m8x_2_yield_interleave` SIGSEGVs at runtime
 
-**Status**: **OPEN** as of 2026-04-29 evening. Predates today's commits;
+**Status**: **FIXED** 2026-04-29 evening. Bisect localised the
+regression to commit `4a77d49` (m8 bug #12 in_dispatch fix). Root
+cause: the `in_dispatch` flag lived on the evidence node, but
+spawned fibers inherit the parent's `evidence_top` and therefore
+share the same nodes — fiber A's "I'm dispatching X" flag skipped
+X for *every* fiber, so when fiber B (running after a swapcontext)
+looked up the same effect, the lookup walked past X and returned
+NULL. The op-call site then dereferenced NULL.
+
+**Fix**: moved `in_dispatch` from `KaiEvidence` to `KaiFiber`
+(`in_dispatch_node`, a pointer to the node currently being
+dispatched on this fiber). The lookups compare
+`node == kai_current_fiber()->in_dispatch_node` instead of reading
+a flag on the node. The op-call emitter saves the previous value,
+sets `in_dispatch_node` to its own node, runs the clause, then
+restores — preserves nesting via per-call-site C locals
+(`_saved_disp`). Fiber B sees its own `in_dispatch_node` (NULL on
+spawn from `calloc`), so X is visible to it even while A is
+dispatching X.
+
+`m8_12_self_delegating_handler` still passes (per-fiber state
+covers the same self-recursion case as the global flag); m8x_2
+now interleaves correctly (`A0 B0 A1 B1 A2 B2`); selfhost
+byte-identical, `make demos-no-regression` baseline 23.
+
+Original report below.
+
+---
+
+**Original status**: OPEN as of 2026-04-29 evening. Predates today's commits;
 reproducible at v0.4.0 (commit `af384cb`, R2 m8.x scheduler land).
 
 **Severity**: medium. `make test-effects` fails on this fixture and
@@ -294,6 +323,56 @@ None for users — the fixture is internal. Until the bug is fixed,
 `m8_12_self_delegating_handler` target lives after `m8_9_supervision`
 and before `m12_8_y_phase4_*`, so it never executes under the broken
 target run; verification is via the manual command above.
+
+---
+
+## R3 — `examples/minimal/interp.kai` panics with `non-exhaustive match` under stage 2
+
+**Status**: **OPEN** as of 2026-04-29 evening. Predates the
+in_dispatch fix (reproducible on `12bce96` before any of the
+local commits). `make selfhost` is unaffected (byte-identical
+codegen between stage 1 and stage 2 even when both produce a
+panicking binary), so the gate stayed green; `make test`'s
+`test-run` target catches it and aborts.
+
+### Symptom
+
+```
+$ ./stage2/kaic2 examples/minimal/interp.kai > /tmp/i.c
+$ cc -std=c99 -I stage0 /tmp/i.c -o /tmp/i
+$ /tmp/i
+panic: non-exhaustive match
+```
+
+The same source compiled with `stage1/kaic1` runs cleanly and
+prints `(2 + (3 * 4)) = 14`. So the bug is in the stage 2 emitter
+(or runtime path it triggers), not in `interp.kai`.
+
+### Hypothesis
+
+Likely candidate: the match-scrutinee leak plug in `9fe6f6d`
+(`runtime,emit: plug match-scrutinee + short-circuit + prelude
+leaks`) changed how match arms decref the scrutinee. If a code
+path now extracts a variant payload after the scrutinee was already
+released, the runtime sees garbage and lands in the catch-all
+"non-exhaustive" branch. Stage 1 doesn't carry that plug yet, so
+its emit avoids the issue.
+
+### Verification path
+
+Bisect with `git bisect start HEAD v0.4.0 --
+stage2/compiler.kai stage0/runtime.h examples/minimal/interp.kai`
+and the test runner:
+
+```
+cd stage2 && rm -f kaic2 build/stage2.c && make kaic2 \
+  && ./kaic2 ../examples/minimal/interp.kai > /tmp/i.c \
+  && cc -std=c99 -I ../stage0 /tmp/i.c -o /tmp/i \
+  && /tmp/i 2>&1 | grep -q "panic" && exit 1; exit 0
+```
+
+Not blocking r4-mc-specialisation. Deserves its own bisect lane
+once m4c lands.
 
 ---
 
