@@ -1435,6 +1435,18 @@ test-m4c: $(TARGET) build
 	  && grep -q "_kai_process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.c \
 	  && echo "m4c OK m4c_handler_in_body collision-free clause symbols" \
 	  || { echo "m4c FAIL m4c_handler_in_body — distinct clause symbols missing"; exit 1; }
+	@grep -q "= kai_run_with__mono__Int__Int(" build/s2-m4c_run_with.c \
+	  && grep -q "= kai_run_with__mono__String__Int(" build/s2-m4c_run_with.c \
+	  && echo "m4c OK m4c_run_with C call sites rewritten to mangled names" \
+	  || { echo "m4c FAIL m4c_run_with — main still calls polymorphic kai_run_with"; exit 1; }
+	@grep -q "call %KaiValue\* @kai_run_with__mono__Int__Int(" build/s2-m4c_run_with.ll \
+	  && grep -q "call %KaiValue\* @kai_run_with__mono__String__Int(" build/s2-m4c_run_with.ll \
+	  && echo "m4c OK m4c_run_with LLVM call sites rewritten to mangled names" \
+	  || { echo "m4c FAIL m4c_run_with — LLVM main still calls polymorphic kai_run_with"; exit 1; }
+	@grep -q "= kai_process_with_log__mono__Int__Int(" build/s2-m4c_handler_in_body.c \
+	  && grep -q "= kai_process_with_log__mono__String__Int(" build/s2-m4c_handler_in_body.c \
+	  && echo "m4c OK m4c_handler_in_body C call sites rewritten to mangled names" \
+	  || { echo "m4c FAIL m4c_handler_in_body — main still calls polymorphic kai_process_with_log"; exit 1; }
 
 # m7a #9: régime-cost benchmark. Trivial-clause Counter.tick() loop
 # vs a C-direct call with the same side effect. Threshold 5× ns/op
