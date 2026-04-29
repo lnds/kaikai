@@ -182,22 +182,48 @@ in `kai_free_value`'s KAI_CLOSURE branch. Inert under the loose
 runtime — nothing decrefs primitive args mid-flight — and ready to
 balance the closure-capture rc once step 1 above lands.
 
-### 3. m4c retrofit — `clause_fn_name` should be fn-name aware *(BLOCKED)*
+### 3. m4c retrofit — `clause_fn_name` should be fn-name aware *(LANDED 2026-04-29)*
 
-`_kai_clause_<line>_<col>_<op>` mints C symbol names by source position
-without awareness of the enclosing function. Duplicating polymorphic
-function bodies that contain `EHandle` produces colliding symbol
-names, which the C linker rejects.
+Pre-fix: `_kai_clause_<line>_<col>_<op>` minted C symbol names by
+source position without awareness of the enclosing function.
+Duplicating polymorphic function bodies that contain `EHandle`
+produced colliding symbol names, which the C linker rejected. That
+was why `monomorphise` shipped as identity (m4c #1/#2 in
+`stage2-design.md`).
 
-**Fix path**: thread the enclosing fn name through `collect_decls` /
-`lc_new` / clause-info plumbing. Once done, the **real m4c
-specialisation** (post-monomorph specialisation per call-site type
-tuple) can re-land — currently m4c #1/#2 ship only an identity pass.
+Landed (`m4c #4`, this lane). The clause-info plumbing now threads
+the **enclosing fn name** through both the C and LLVM emit paths:
 
-**Cost**: ~1-2 days.
+- `ClauseInfo` gained an 8th `String` field carrying the enclosing
+  fn name, populated by `lc_record_clauses` from
+  `LamCollect.cur_enc_fn`. The collect walker tracks `cur_enc_fn`
+  at scope boundaries (DFn / DTest entry, ELambda recursion).
+- `clause_fn_name(enc_fn, line, col, op)` mints
+  `_kai_<enc>__clause_<line>_<col>_<op>`.
+- The two install sites
+  (`emit_clause_assignments` / `llvm_emit_handle_clause_assigns`)
+  look up `enc_fn` from the matching `ClauseInfo` via
+  `lookup_clause_enc_fn` so install code matches the body's symbol.
+- `monomorphise` now appends specialised copies of polymorphic
+  DFns per distinct call-site type tuple. Originals stay live
+  (call-site rewrite is deferred — see `docs/m4c-real-specialisation.md`
+  Phase 2 follow-up). The collision-avoidance is exercised end-to-end
+  by `examples/effects/m4c_handler_in_body.kai`, which has a
+  polymorphic body with an embedded `EHandle` called at two
+  distinct (a, b) tuples — three clause symbols emitted (one for
+  the original polymorphic body, two for the specialisations) and
+  the binary links and runs on both backends.
 
-Order of operations: lands when m4c real specialisation is back on
-the critical path, which is post-stage-1-perceus.
+Selfhost C + LLVM byte-identical. `make test` clean modulo R-interp
+and R-m8x2 (both pre-existing on `main` HEAD; pinned in
+`docs/known-regressions.md`).
+
+Deferred to follow-up lanes:
+- Real call-site rewrite (today the specialisations are emitted
+  alongside the original but the original is what gets called).
+- Body type substitution to remove `try_rewrite_show_dim_real`.
+- Generic prune (drop the polymorphic decl when every reference
+  has been redirected). See `docs/m4c-real-specialisation.md`.
 
 ### 4. LLVM emit mirror of m5 #3 *(LANDED 2026-04-28)*
 

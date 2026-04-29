@@ -694,8 +694,8 @@ test-effects: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "_ev.tick = &_kai_clause_" build/s2-$$name.c \
-	    && grep -q "_ev.get = &_kai_clause_" build/s2-$$name.c \
+	  grep -q "_ev.tick = &_kai_main__clause_" build/s2-$$name.c \
+	    && grep -q "_ev.get = &_kai_main__clause_" build/s2-$$name.c \
 	    && grep -q "kai_evidence_lookup_node(\"Counter\")" build/s2-$$name.c \
 	    && grep -q "_ev_op->tick(_ev_op, &_k)" build/s2-$$name.c \
 	    && grep -q "_ev_op->get(_ev_op, &_k)"  build/s2-$$name.c \
@@ -1402,6 +1402,40 @@ test-link-runtime: build
 	  && echo "link-runtime OK" \
 	  || { echo "link-runtime FAIL"; exit 1; }
 
+# m4c #4 — real specialisation regression. Each demo exercises a
+# polymorphic body called with two distinct call-site type tuples;
+# the gate is "both backends emit, link, and run, and the C output
+# carries the post-monomorph mangled symbols". Pre-fix the embedded
+# `EHandle` clause symbols collided across the two specialisations
+# and the C linker rejected the binary. Pinned in
+# `docs/m4c-real-specialisation.md`.
+test-m4c: $(TARGET) build
+	@$(STACK) set -e; \
+	for f in ../examples/effects/m4c_run_with.kai ../examples/effects/m4c_handler_in_body.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "m4c FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "m4c FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out \
+	    || { echo "m4c FAIL $$name (C binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  ./$(TARGET) --emit=llvm $$f > build/s2-$$name.ll 2> build/s2-$$name-llvm.err \
+	    || { echo "m4c FAIL $$name (LLVM emit errored)"; cat build/s2-$$name-llvm.err; exit 1; }; \
+	  clang -w -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm \
+	    || { echo "m4c FAIL $$name (LLVM compile failed)"; exit 1; }; \
+	  ./build/s2-$$name-llvm > build/s2-$$name-llvm.out \
+	    || { echo "m4c FAIL $$name (LLVM binary exit non-zero)"; cat build/s2-$$name-llvm.out; exit 1; }; \
+	  echo "m4c OK $$name (C + LLVM)"; \
+	done
+	@grep -q "kai_run_with__mono__Int__Int" build/s2-m4c_run_with.c \
+	  && grep -q "kai_run_with__mono__String__Int" build/s2-m4c_run_with.c \
+	  && echo "m4c OK m4c_run_with monomorph specialisations emitted" \
+	  || { echo "m4c FAIL m4c_run_with — specialisations missing"; exit 1; }
+	@grep -q "_kai_process_with_log__mono__Int__Int__clause_" build/s2-m4c_handler_in_body.c \
+	  && grep -q "_kai_process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.c \
+	  && echo "m4c OK m4c_handler_in_body collision-free clause symbols" \
+	  || { echo "m4c FAIL m4c_handler_in_body — distinct clause symbols missing"; exit 1; }
+
 # m7a #9: régime-cost benchmark. Trivial-clause Counter.tick() loop
 # vs a C-direct call with the same side effect. Threshold 5× ns/op
 # (Doc C §*Open questions* #6). Compiled at -O2 to match how kaikai
@@ -1519,7 +1553,7 @@ test-aspirational: $(TARGET) build
 	    || { echo "aspirational DIFF $$name (LLVM)"; diff $$exp build/asp-$$name-llvm.out; exit 1; }; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
