@@ -8343,17 +8343,28 @@ fn emit_match_arm(src: String, a: Arm, lcs: [String], fns: [EFn], variants: [EVa
 
 fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   let sc = emit_expr(src,scrut, lcs, fns, variants, lams)
-  # m5.x flip Phase 3 closeout: decref `_scr` at every exit path
-  # of the match. `emit_pat_binds` already runs with is_alias=true
-  # at the top-level match-arm call (m5.x Step A), so every PBind
-  # got an `incref(_scr)` for its own reference; decreffing the
-  # producer slot here releases the match's own ownership without
-  # disturbing the binding's. The arm's `_r` value either was
-  # produced fresh inside the arm body (owns its own ref) or came
-  # from a PBind (which already increfed). Either way `_r` keeps
-  # its ref count intact across the post-match drop.
+  # m5.x flip Phase 3 closeout, R3 amend (2026-04-29 evening):
+  # the match takes its own incref of the scrutinee on entry and
+  # drops it on exit. Net zero on the producer's refcount, which
+  # is the only safe shape today because perceus_pass does not yet
+  # dup let-bound vars when they are read multiple times across
+  # an expression tree (e.g. `print("#{show(e)} = #{eval(e)}")`).
+  # Without the entry incref, the original 9fe6f6d shape decref'd
+  # whatever the scrutinee expression returned — fine when sc is
+  # `__perceus_dup(x)` (transferred ownership) but a UAF when sc
+  # is a bare read of a still-live binding. `examples/minimal/
+  # interp.kai` triggered the latter and panicked with
+  # `non-exhaustive match` because the second call's scrutinee
+  # had already been freed by the first call's match exit.
+  # Step A's PBind incref still gives each binding its own ref;
+  # the entry incref + exit decref pair just keeps the match
+  # itself non-disturbing of the producer. The leak savings of
+  # the original closeout are reduced (the match-scrutinee piece
+  # specifically — and/or short-circuit and the 12 prelude
+  # helpers still pay their way) but correctness wins until
+  # perceus_pass learns to dup multi-read let bindings.
   concat_all([
-    "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
+    "({ KaiValue *_scr = kai_incref(", sc, "); KaiValue *_r = kai_unit(); do {\n",
     emit_match_arms(src, arms, lcs, fns, variants, lams),
     "    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n",
     "} while (0); kai_decref(_scr); _r; })"

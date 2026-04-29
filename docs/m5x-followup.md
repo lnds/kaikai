@@ -217,6 +217,36 @@ Selfhost C + LLVM byte-identical, `make test` clean,
 self-emit (`kaic2 --emit=llvm stage2/compiler.kai`) now contains 11
 `kaix_decref` call sites, confirming the pass is active.
 
+### 4b. perceus_pass should dup let-bound vars read multiple times across an expression tree *(R3 follow-up, OPEN 2026-04-29)*
+
+`emit_match_expr` currently brackets the match in
+`KaiValue *_scr = kai_incref(<scrutinee>)` … `kai_decref(_scr)`
+because perceus_pass does not yet emit `__perceus_dup` for
+let-bound variables that appear more than once across an
+expression tree such as
+
+```
+print("#{show(e)} = #{int_to_string(eval(e))}")
+```
+
+`e` is read twice (in `show(e)` and in `eval(e)`), but neither
+call site wraps it in `__perceus_dup`. The match decref in
+`9fe6f6d` exposed this — see R3 in `docs/known-regressions.md`
+for the full root-cause writeup.
+
+**Fix path**: extend perceus_pass to count reads of every
+let-bound name across the whole expression tree (not just the
+immediate stmt list). When count ≥ 2, every read except the last
+becomes `__perceus_dup(<name>)`. The "dup all ≥ 2 non-lam uses"
+rule in `pcs_count_non_lam_uses` is the right shape; it currently
+visits a single stmt list per scope, which misses uses that live
+inside nested expression children of the same parent.
+
+**Cost**: ~1d. Once it lands, `emit_match_expr`'s entry incref
+can drop again and the match-scrutinee piece of `9fe6f6d`'s leak
+savings comes back (~0.7M allocs on kaic2 self-compile, rough
+estimate from the original commit's numbers).
+
 ### 5. Full Perceus (post-m5 milestone)
 
 The m5 lane scope was *basic* Perceus: walker scaffold + last-use

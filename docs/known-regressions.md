@@ -328,7 +328,55 @@ target run; verification is via the manual command above.
 
 ## R3 — `examples/minimal/interp.kai` panics with `non-exhaustive match` under stage 2
 
-**Status**: **OPEN** as of 2026-04-29 evening. Predates the
+**Status**: **FIXED** 2026-04-29 evening. Bisect localised the
+regression to `9fe6f6d` (`runtime,emit: plug match-scrutinee +
+short-circuit + prelude leaks`) — the hypothesis below was
+correct.
+
+**Root cause**: that commit added `kai_decref(_scr)` at every
+match-exit path, on the premise that perceus_pass would dup
+let-bound variables before they reached the match. Inspection of
+the emitted C for `interp.kai`'s `main` showed otherwise:
+
+```c
+KaiValue *kai_e = kai_variant(...);   /* RC=1 */
+kai_prelude_print(kai_string_concat(
+  kai_to_string(kai_show(kai_e)),     /* call 1: kai_e raw */
+  kai_string_concat(kai_str(" = "),
+    kai_to_string(kai_prelude_int_to_string(
+      kai_eval(kai_e))))));            /* call 2: kai_e raw */
+```
+
+Neither call site wrapped `kai_e` in `kai_internal_dup`. Pre-fix
+the match leaked the scrutinee, masking the missing dup. Post-fix
+the match's `kai_decref(_scr)` released `kai_e` after `kai_show`
+ran, and `kai_eval` read freed memory whose variant tag pointed
+to garbage — dropping into the `panic("non-exhaustive match")`
+branch.
+
+**Fix**: `emit_match_expr` now emits `kai_incref` on entry to the
+match so the scrutinee's refcount is net-zero across the match.
+Each PBind still gets its own incref (m5.x Step A); the entry
+incref + exit decref pair just keeps the producer slot intact
+while the match runs. The leak savings of `9fe6f6d` for the
+match-scrutinee piece are reduced back to zero, but the and/or
+short-circuit fix and the 12 prelude helpers from the same
+commit still pay their way.
+
+The deeper bug — perceus_pass not duping let-bound variables that
+are read more than once across an expression tree — is now pinned
+under `docs/m5x-followup.md` as a follow-up. Once perceus_pass
+learns to dup, the entry incref here can drop again to recover
+the savings.
+
+`make test` clean (`test-run` no longer aborts), `make selfhost`
+byte-identical, `make demos-no-regression` baseline 23.
+
+Original report below.
+
+---
+
+**Original status**: OPEN as of 2026-04-29 evening. Predates the
 in_dispatch fix (reproducible on `12bce96` before any of the
 local commits). `make selfhost` is unaffected (byte-identical
 codegen between stage 1 and stage 2 even when both produce a
@@ -348,7 +396,7 @@ The same source compiled with `stage1/kaic1` runs cleanly and
 prints `(2 + (3 * 4)) = 14`. So the bug is in the stage 2 emitter
 (or runtime path it triggers), not in `interp.kai`.
 
-### Hypothesis
+### Hypothesis (confirmed)
 
 Likely candidate: the match-scrutinee leak plug in `9fe6f6d`
 (`runtime,emit: plug match-scrutinee + short-circuit + prelude
@@ -357,22 +405,6 @@ path now extracts a variant payload after the scrutinee was already
 released, the runtime sees garbage and lands in the catch-all
 "non-exhaustive" branch. Stage 1 doesn't carry that plug yet, so
 its emit avoids the issue.
-
-### Verification path
-
-Bisect with `git bisect start HEAD v0.4.0 --
-stage2/compiler.kai stage0/runtime.h examples/minimal/interp.kai`
-and the test runner:
-
-```
-cd stage2 && rm -f kaic2 build/stage2.c && make kaic2 \
-  && ./kaic2 ../examples/minimal/interp.kai > /tmp/i.c \
-  && cc -std=c99 -I ../stage0 /tmp/i.c -o /tmp/i \
-  && /tmp/i 2>&1 | grep -q "panic" && exit 1; exit 0
-```
-
-Not blocking r4-mc-specialisation. Deserves its own bisect lane
-once m4c lands.
 
 ---
 
