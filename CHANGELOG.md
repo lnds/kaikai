@@ -14,6 +14,46 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 - Versioning infrastructure: tags v0.1.0 → v0.6.0; `bin/kai --version`
   reads `VERSION` dynamically.
 
+## [0.7.2] — 2026-04-29 (resolver: arity-aware overload resolution)
+
+**Patch: compiler-deep resolver fix.** The pre-resolve dispatcher
+rewrite (`rename_proto_calls_kind` in `stage2/compiler.kai`) is now
+arity-aware: when the callee of `ECall(EVar(name), args)` matches a
+protocol op name but the call's argument count does not match a
+declared arity for that op, the rewrite is skipped and the typer
+falls back to the regular EFn lookup. Same-named module functions
+with a different arity now coexist with protocol ops. This unblocks
+adding `min(a, b)` / `max(a, b)` to the `Ord` protocol alongside the
+existing `pub fn min(xs: [Int])` / `pub fn max(xs: [Int])` in
+`stdlib/core/list.kai`. Before the fix the rewrite was unconditional
+and `max(xs)` mis-dispatched to `__proto_max` (arity 2), surfacing as
+the misleading `error: no impl of \`Ord\` for type \`List\``.
+
+### Added
+
+- **`stage2/compiler.kai`**:
+  - `type OpAr = OpAr(String, Int)` records each protocol op's
+    declared arity.
+  - `op_arities_from_ops`, `op_ar_has_name`, `op_ar_match` helpers.
+  - `rename_proto_calls_kind` adds an explicit `ECall(EVar(name), args)`
+    branch: when `name` is a protocol op and the call's arity does
+    not match, the callee is preserved verbatim so normal name
+    resolution can find a same-named module function.
+  - `lower_protocols` projects `reg.ops` into `[OpAr]` once and
+    threads it through the rewriter (replacing `reg.op_names`).
+- **`stdlib/protocols.kai`**: `protocol Ord` gains `min(a, b)` and
+  `max(a, b)`; impls extended for `Int` / `Real` / `String` / `Char`.
+- **`examples/protocols/resolver_arity_overload.kai`** + golden:
+  declares a protocol op + module function sharing a name with
+  different arities; both call sites compile and run.
+
+### Validation
+
+- `make -C stage2 selfhost`: byte-identical fixed point in 1 round.
+- `make -C stage2 selfhost-llvm`: byte-identical fixed point.
+- `make -C stage2 test`: clean.
+- `make demos-no-regression`: 20 passing (baseline 20).
+
 ## [0.7.1] — 2026-04-29 (--effect-holes-json — typed effect-hole resolutions)
 
 **Patch: developer-facing CLI flag.** Adds `--effect-holes-json` to
