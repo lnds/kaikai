@@ -14,6 +14,52 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 - Versioning infrastructure: tags v0.1.0 → v0.6.0; `bin/kai --version`
   reads `VERSION` dynamically.
 
+## [0.7.1] — 2026-04-29 (--effect-holes-json — typed effect-hole resolutions)
+
+**Patch: developer-facing CLI flag.** Adds `--effect-holes-json` to
+the compiler driver. Emits a JSON array describing every typed effect
+hole (`?` or `?name` in row tail position) the program contains plus
+how the inferencer resolved each one. Closes the `?e` reporter half
+of Phase L (LLM authorability — the L1 cross-call effect propagation
+half is still pending).
+
+### Added
+
+- **`stage2/compiler.kai`**:
+  - `ResolvedRowHole(name, line, col, fn_name, resolved_row,
+    body_row)` recorded per `?` / `?name` occurrence.
+  - `TypedDecl` + `TypedProgram` extended with `row_holes` field.
+  - `infer_decl` extracts row-hole resolutions after the per-decl
+    substitution is final.
+  - Placeholder parser (`split_row_hole_name`,
+    `find_last_underscore`, `substring_range`, `parse_decimal`)
+    recovers source name + position from the parser-minted
+    `__rowhole_<name>_<line>_<col>` placeholders.
+  - `dump_effect_holes_json` + `json_row_hole_report` emit the JSON.
+  - Driver: new `MEffectHolesJson` mode + `--effect-holes-json`
+    flag + help line. Existing `--effects-json` help line was
+    missing too — added alongside.
+- **Schema** (stable, per element):
+  `{file, fn, line, col, name, labels, open, tail_var, body_row}`.
+  - `name`: source-written name (`"e"` for `?e`) or `null` for
+    bare `?`.
+  - `labels`: effect labels actually unified into the row var. In
+    practice usually empty: `check_body_row` treats `ROpen` rows as
+    unconstrained and never unifies the tail.
+  - `body_row`: the *useful* field for an LLM consumer — labels
+    actually performed by the fn body, in declaration order. This
+    is what would replace `?e` to produce a closed signature.
+  - `open` + `tail_var`: explicit signal that the row var is still
+    free and what its compiler-internal id is.
+- **`examples/sugars/effect_holes_json_basic.kai`** + golden:
+  exercises three shapes (`?e` with Stdout, `?eff` with
+  Stdout+Stderr, `?p` with no effects); picked up by `test-sugars`.
+
+### Validation
+
+- `make test` clean.
+- `make demos-no-regression`: 20 passing (baseline 20).
+
 ## [0.7.0] — 2026-04-29 (math/numeric — single-dispatch `Numeric` protocol)
 
 **Minor: new stdlib protocol.** Single-dispatch `protocol Numeric` in
