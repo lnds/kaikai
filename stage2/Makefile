@@ -1247,6 +1247,20 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (m8 bug #12: self-delegating handler resolves to outer + per-fiber save/restore paired)" \
 	    || { echo "effects FAIL $$name (binary exit non-zero — infinite-loop regression?)"; exit 1; }; \
 	done; \
+	for f in ../examples/effects/m8_fiber_discard.kai \
+	         ../examples/effects/m8_fiber_discard_yields.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/effects/$$name.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero — R4 fiber-discard regression?)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -u $$exp_out build/s2-$$name.out \
+	    && echo "effects OK $$name (R4: fiber-discard does not deadlock)" \
+	    || { echo "effects FAIL $$name (output diff)"; exit 1; }; \
+	done; \
 	for f in ../examples/effects/m12_8_y_phase4_*.kai; do \
 	  [ -e $$f ] || continue; \
 	  name=$$(basename $$f .kai); \

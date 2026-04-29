@@ -26,11 +26,12 @@ required for which honesty claim*. Nothing here promises a calendar.
 
 What does **not** work today:
 
-- `let _ = fiber_spawn(…)` (discard the Fiber value without
-  awaiting) deadlocks. Documented as **R4** in
-  `docs/known-regressions.md`. Workaround: bind every spawned
-  Fiber and `fiber_await` it. Cause: scheduler holds a raw
-  `KaiFiber *` while the value's RC drops to zero.
+- ~~`let _ = fiber_spawn(…)` (discard the Fiber value without
+  awaiting) deadlocks~~. **FIXED 2026-04-29** (Fibers Tier 1 lane).
+  Scheduler-side fiber RC discipline: the wrapper now carries one
+  ref for the caller and one for the scheduler; the trampoline's
+  DONE/CANCELLED tail drops the scheduler's ref. See R4 in
+  `docs/known-regressions.md`.
 - Stack overflow in a fiber body lands in unmapped memory with
   no diagnostic. Stack model has no guard page (declared in
   `docs/fibers-impl.md`).
@@ -57,7 +58,7 @@ The two bugs a curious visitor hits in five minutes:
 
 | Item | Cost | Why |
 |---|---:|---|
-| **R4 — fiber-discard deadlock** | ~0.5d | First thing anyone tries (`let _ = fiber_spawn(…)`); current behaviour deadlocks |
+| ~~**R4 — fiber-discard deadlock**~~ ✅ shipped 2026-04-29 | ~0.5d | First thing anyone tries (`let _ = fiber_spawn(…)`); fixed via scheduler-side fiber RC discipline |
 | **Stack guard pages** | ~0.5d | Stack overflow → diagnostic SIGSEGV with message instead of UB |
 
 Closes the two bugs that *would*  show up in a 30-minute live demo on
@@ -73,7 +74,7 @@ can be parallelised across short lanes.
 
 | Item | Cost | Why |
 |---|---:|---|
-| R4 — fiber-discard deadlock | ~0.5d | (carry-over from Tier 1) |
+| ~~R4 — fiber-discard deadlock~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
 | Stack guard pages | ~0.5d | (carry-over from Tier 1) |
 | **Monitor + `spawn_actor`** | ~2–3d | Phase 5.5+ in `m8x-followup.md` §5; without it the BEAM-style supervision claim is type-surface-only |
 | **Region-brand full machinery** | ~3–5d | `TyBranded` propagation through let / match / fn args; closes the sum-type-payload escape hatch from Phase 6 v1 shallow |

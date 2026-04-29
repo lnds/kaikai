@@ -410,7 +410,42 @@ its emit avoids the issue.
 
 ## R4 — discarding a `Fiber[T]` value (`let _ = fiber_spawn(…)`) deadlocks the scheduler
 
-**Status**: **OPEN** as of 2026-04-29 evening. Surfaced while writing
+**Status**: **FIXED** 2026-04-29 (Fibers Tier 1 lane). Root cause was
+exactly the hypothesis below. Fix: scheduler-side fiber RC discipline
+(Option A from the lane brief).
+
+Concretely:
+
+- `kai_default_spawn_spawn` now allocates the wrapper before enqueue
+  and `kai_incref`s it. The wrapper RC therefore starts at 2: one for
+  the caller (the user-visible `Fiber[T]` handle) and one for the
+  scheduler.
+- `kai_fiber_trampoline`'s DONE/CANCELLED tail `kai_decref`s
+  `self->value` after walking awaiters, before dequeue + setcontext.
+  That single decref pairs with the spawn-side incref.
+- The decref may bring RC to 0 while the trampoline is still running
+  on `self`'s private stack. `kai_free_value`'s `KAI_FIBER` branch
+  detects `v->as.fib == kai_current_fiber()` and defers struct + stack
+  free into a single-slot `kai_pending_free`. The next fiber drains
+  the slot at trampoline entry / post-`swapcontext` in yield/park.
+- Awaiters and `select` did not need to change: the caller's
+  borrowed `fib_v` keeps the wrapper alive for the duration of the
+  `Spawn.await(fib)` call (the caller's stack frame is suspended on
+  the park).
+
+`examples/effects/m8_fiber_discard.kai` now passes (the fixture moved
+out of `make stress-fixtures`'s expected-fail block) and a sibling
+`examples/effects/m8_fiber_discard_yields.kai` covers the same shape
+with an explicit `fiber_yield()` between sends.
+
+`make tier1` clean; `make demos-no-regression` baseline 24 holds;
+`demos/ping_pong/` round-robin output unchanged.
+
+Original report below for posterity.
+
+---
+
+**Original status**: OPEN as of 2026-04-29 evening. Surfaced while writing
 `demos/ping_pong/`. Workaround documented in the demo: bind every
 spawned Fiber to a real name and call `fiber_await` before exiting
 the `with_mailbox` body.
@@ -490,6 +525,10 @@ After a candidate fix:
 
 Out of r4-mc-callsite-rewrite scope; deserves its own runtime
 lane post-m4c.
+
+(Both verification artifacts shipped with the fix; the
+`m8_fiber_discard.kai` fixture is now part of `make test-effects`,
+and `m8_fiber_discard_yields.kai` covers the discard + yield shape.)
 
 ---
 
