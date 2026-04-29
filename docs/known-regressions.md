@@ -210,6 +210,93 @@ typer be fixed.
 
 ---
 
+## R2 — `m8x_2_yield_interleave` SIGSEGVs at runtime
+
+**Status**: **OPEN** as of 2026-04-29 evening. Predates today's commits;
+reproducible at v0.4.0 (commit `af384cb`, R2 m8.x scheduler land).
+
+**Severity**: medium. `make test-effects` fails on this fixture and
+aborts before reaching subsequent tests in the target. `make
+selfhost` and `make demos-no-regression` are unaffected.
+
+### Symptom
+
+```
+$ cd stage2 && rm -f kaic2 build/stage2.c && make kaic2 >/dev/null
+$ ./kaic2 --path ../stdlib ../examples/effects/m8x_2_yield_interleave.kai \
+    > /tmp/x.c
+$ cc -std=c99 -I ../stage0 /tmp/x.c -o /tmp/x
+$ /tmp/x ; echo "exit=$?"
+exit=139
+```
+
+`/tmp/x` runs no output and exits with SIGSEGV (139 = 128 + 11).
+
+### What the fixture does
+
+Two spawned fibers each print three marks (`A0`/`A1`/`A2` and
+`B0`/`B1`/`B2`) with `fiber_yield()` between prints. Under the
+cooperative scheduler the expected interleave is `A0 B0 A1 B1 A2 B2`.
+The crash happens before any output reaches the buffer — likely on
+the first `fiber_yield()` or the trampoline entry of the second
+fiber.
+
+### Why this matters
+
+The R2 scheduler land (v0.4.0, 2026-04-28) declared `make test
+clean` and the m8.x-followup pinned `m8x_2_yield_interleave` as
+the demo gate for Phase 2. The fixture was either never run as
+part of the gate or broke after the gate was claimed.
+
+The cumulative runtime work since v0.4.0 (in_dispatch flag in
+`4a77d49`, match-scrutinee/short-circuit/prelude leak plugs in
+`9fe6f6d`, small-int + char cache in `69c6166`) all touch
+`stage0/runtime.h` near the scheduler. Bisect across the day's
+commits would localise — but the bug also reproduces at v0.4.0
+itself, so the regression is older.
+
+### Hypothesis
+
+Three candidates, in order of likelihood:
+
+1. **Stack growth on swapcontext entry**. The fiber stack model
+   pinned in `docs/fibers-impl.md` ships without a guard page; if
+   `worker_a` / `worker_b` overflow the allocated stack on the
+   first call frame (`Stdout.print` lowers to a few helper calls),
+   the trampoline lands in unmapped memory.
+2. **Refcount underflow on the closure passed to `fiber_spawn`**.
+   The Phase 1 unboxing land (`69c6166`) changed how small-int
+   primitives interact with the singleton cache; if the closure's
+   captured row decref'd the wrong slot, the trampoline reads a
+   freed value when it tries to call the body.
+3. **`in_dispatch` flag leak**. The flag is initialized to 0 in
+   the push helpers, but if `Spawn.spawn`'s clause body sets the
+   flag without clearing it on a code path the emitter forgot,
+   subsequent ops loop or read garbage.
+
+### Verification path
+
+Bisect with: `git bisect start HEAD v0.4.0 -- stage0/runtime.h
+stage2/compiler.kai`, build kaic2 fresh at each step, run the
+fixture binary, mark good/bad. Once localised, the offending commit
+identifies which area (scheduler, refcount, dispatch).
+
+The new fixture `examples/effects/m8_12_self_delegating_handler.kai`
+exercises `in_dispatch` set/clear without going through the
+scheduler — it passes cleanly under HEAD, so the `in_dispatch` flag
+itself is sound. That narrows the suspect to scheduler interaction
+or refcount, not the flag.
+
+### Workaround
+
+None for users — the fixture is internal. Until the bug is fixed,
+`make test-effects` will fail at this point. The new
+`m8_12_self_delegating_handler` target lives after `m8_9_supervision`
+and before `m12_8_y_phase4_*`, so it never executes under the broken
+target run; verification is via the manual command above.
+
+---
+
 ## Demos failing inventory (as of v0.7.1, 2026-04-29)
 
 `make demos-no-regression` reports **20 passing (baseline 20)** plus
