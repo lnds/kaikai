@@ -176,8 +176,34 @@ proper structured-concurrency demos:
   `fn main() : Int / Console` was accepted for a body calling
   `fiber_spawn` (which has `/Spawn` in its row); runtime crashed
   on missing Spawn evidence. Workaround in m8_9 fixture: declare
-  `/ Console + Spawn` explicitly. Likely a typer bug in how
-  imported-helper rows propagate.
+  `/ Console + Spawn` explicitly.
+
+  **Root cause located 2026-04-29.** The synth_call ordinary-fn
+  path constructs `expected = TyFnT(args, ret, Row{labels:[],
+  tail:fresh})` and unifies callee against expected. The fresh-
+  tail absorbs the callee's labels through the substitution but
+  the caller's `st.row` is **never updated**. `st_add_label` is
+  invoked only by `try_op_call` (explicit `Eff.op(...)`); plain
+  fn calls leak the row. The dead helper `st_add_labels` (with
+  the apt comment "Used by `synth_call` to propagate every
+  label the callee declared into the caller's row") was the
+  intended call site that never got wired.
+
+  **Three-line fix** at the end of `synth_call`'s ordinary path:
+  apply the substitution to the callee type, pull the resolved
+  row's labels, and fold them through `st_add_labels`. Selfhost
+  break is real but contained — 57 stage 2 helpers (parser
+  diagnostics, dump_*, p_error, …) currently sub-declare their
+  rows and rely on this leak. Each needs `/ Console` (or
+  `/ Console + File` for the disk-touching subset) appended to
+  its signature, then the cascade re-runs against transitive
+  callers. Estimated ~1 day of careful editing across the
+  codebase, plus selfhost validation between every batch.
+
+  Tracked separately because the deployment is a lane, not a
+  bug fix; the row tracking gap, however, **is** a real bug
+  and a Tier 1 violation (effects in types must match what the
+  body performs).
 
 ## Sequencing
 
