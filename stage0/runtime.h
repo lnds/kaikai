@@ -670,7 +670,54 @@ static KaiValue *kai_bool(int b) {
     return b ? &kai_singleton_true : &kai_singleton_false;
 }
 
+/* m5.x flip Phase 4 (small-int + char cache). Same idea as the
+ * m5 #7 singleton pool — every cached entry carries
+ * `rc = INT32_MAX` so `kai_incref` / `kai_decref` skip them.
+ * The flag lazily initializes the table on first call so the
+ * constructor stays trivial when the program never reaches one
+ * of these constructors (e.g., a fizzbuzz that only allocates
+ * strings). The ranges are deliberately narrow:
+ *   - Int  [-128..127]: covers tight loop indices, list lengths
+ *     under ~100 elements, comparison constants, AST tag ints.
+ *   - Char [0..127]: ASCII printable + control. UTF-8 multibyte
+ *     codepoints fall through to a fresh alloc.
+ * On the kaic2 self-compile, the int+char tags account for
+ * ~39M of 66M total allocs; the cache wipes most of those out
+ * without changing any caller. */
+#define KAI_INT_CACHE_LO   ((int64_t) -128)
+#define KAI_INT_CACHE_HI   ((int64_t) 127)
+#define KAI_INT_CACHE_SIZE 256
+#define KAI_CHAR_CACHE_HI  ((uint32_t) 127)
+#define KAI_CHAR_CACHE_SIZE 128
+
+static KaiValue kai_int_cache[KAI_INT_CACHE_SIZE];
+static KaiValue kai_char_cache[KAI_CHAR_CACHE_SIZE];
+static int kai_int_cache_init  = 0;
+static int kai_char_cache_init = 0;
+
+static void kai_int_cache_warm(void) {
+    for (int k = 0; k < KAI_INT_CACHE_SIZE; k++) {
+        kai_int_cache[k].rc = INT32_MAX;
+        kai_int_cache[k].tag = KAI_INT;
+        kai_int_cache[k].as.i = (int64_t) k + KAI_INT_CACHE_LO;
+    }
+    kai_int_cache_init = 1;
+}
+
+static void kai_char_cache_warm(void) {
+    for (int k = 0; k < KAI_CHAR_CACHE_SIZE; k++) {
+        kai_char_cache[k].rc = INT32_MAX;
+        kai_char_cache[k].tag = KAI_CHAR;
+        kai_char_cache[k].as.c = (uint32_t) k;
+    }
+    kai_char_cache_init = 1;
+}
+
 static KaiValue *kai_int(int64_t i) {
+    if (i >= KAI_INT_CACHE_LO && i <= KAI_INT_CACHE_HI) {
+        if (!kai_int_cache_init) kai_int_cache_warm();
+        return &kai_int_cache[i - KAI_INT_CACHE_LO];
+    }
     KaiValue *v = kai_alloc(KAI_INT);
     v->as.i = i;
     return v;
@@ -683,6 +730,10 @@ static KaiValue *kai_real(double r) {
 }
 
 static KaiValue *kai_char(uint32_t c) {
+    if (c <= KAI_CHAR_CACHE_HI) {
+        if (!kai_char_cache_init) kai_char_cache_warm();
+        return &kai_char_cache[c];
+    }
     KaiValue *v = kai_alloc(KAI_CHAR);
     v->as.c = c;
     return v;
