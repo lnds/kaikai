@@ -7749,6 +7749,39 @@ fn unop_cname(op: String) : Option[String] {
 fn emit_call_args(src: String, args_e: [Expr], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
   join_with(map(args_e, (a) => emit_expr(src, a, lcs, fns, variants, lams)), ", ")
 
+# m8.x bug #12: emit `KaiValue *_op_arg_<i> = <expr>; ` for each
+# arg of an op call. The args are evaluated *before* the
+# `in_dispatch` flag is set, so any inner op call to the same
+# handler still finds the live node.
+fn emit_op_arg_bindings(src: String, args_e: [Expr], i: Int,
+                          lcs: [String], fns: [EFn],
+                          variants: [EVar], lams: [LamInfo]) : String {
+  match args_e {
+    [] -> ""
+    [a, ...rest] -> {
+      let expr_c = emit_expr(src, a, lcs, fns, variants, lams)
+      let head = concat_all(["KaiValue *_op_arg_", int_to_string(i), " = ", expr_c, "; "])
+      let tail = emit_op_arg_bindings(src, rest, i + 1, lcs, fns, variants, lams)
+      string_concat(head, tail)
+    }
+  }
+}
+
+# Comma-separated list `_op_arg_0, _op_arg_1, ...` that gets
+# spliced into the dispatch call site after `_ev_op`.
+fn emit_op_arg_pass_list(args_e: [Expr], i: Int) : String {
+  match args_e {
+    [] -> ""
+    [_, ...rest] -> {
+      let head = concat_all(["_op_arg_", int_to_string(i)])
+      match rest {
+        [] -> head
+        _  -> concat_all([head, ", ", emit_op_arg_pass_list(rest, i + 1)])
+      }
+    }
+  }
+}
+
 fn emit_variant_call(name: String, n_args: Int, arg_out: String) : String {
   if n_args == 0 {
     cat3("kai_variant(0, \"", name, "\", 0, NULL)")
@@ -7862,15 +7895,34 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn
           } else {
             concat_all(["kai_evidence_lookup_node(\"", eff_n, "\")"])
           }
-        let arg_str = match args_e {
+        # m8.x bug #12: mark the handler's evidence node as
+        # in-dispatch across the clause invocation. The
+        # `kai_evidence_lookup_node` walk skips flagged nodes, so
+        # a recursive `Eff.op(...)` inside the clause resolves to
+        # the *outer* handler and not back into ourselves.
+        #
+        # Args MUST be evaluated *before* the flag is set — they
+        # may themselves invoke the same op (e.g.
+        # `State.set(State.get() + 1)` evaluates `State.get()`
+        # while constructing `set`'s argument). Setting the flag
+        # before the args would make the inner `lookup_node` walk
+        # past the live handler and crash. Bind each arg to a
+        # `_op_arg_<i>` C local first; then flip the flag right
+        # before invoking the clause.
+        let arg_bindings = emit_op_arg_bindings(src, args_e, 0, lcs, fns, variants, lams)
+        let arg_passes   = emit_op_arg_pass_list(args_e, 0)
+        let pass_str     = match args_e {
           [] -> ""
-          _  -> cat2(", ", call_args)
+          _  -> cat2(", ", arg_passes)
         }
         concat_all([
           "({ KaiEvidence *_node_op = ", lookup_c, "; ",
           "Ev", eff_n, " *_ev_op = (Ev", eff_n, " *) _node_op->handler; ",
           "KaiCont _k; kai_cont_init_identity(&_k, _ev_op->handler_id); ",
-          "KaiValue *_op_r = _ev_op->", op_n, "(_ev_op", arg_str, ", &_k); ",
+          arg_bindings,
+          "_node_op->in_dispatch = 1; ",
+          "KaiValue *_op_r = _ev_op->", op_n, "(_ev_op", pass_str, ", &_k); ",
+          "_node_op->in_dispatch = 0; ",
           "if (_k.status == KAI_CONT_UNRESUMED && _node_op->handle_jmp != NULL) { ",
             "*_node_op->discard_slot = _op_r; ",
             "kai_evidence_pop(); ",
