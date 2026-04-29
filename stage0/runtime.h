@@ -2709,6 +2709,13 @@ struct KaiEvidence {
      * handlers always resume, so they never longjmp). */
     jmp_buf     *handle_jmp;
     KaiValue   **discard_slot;
+    /* m8.x bug #12: 1 while this handler's clause body is on stack;
+     * `kai_evidence_lookup_node` walks past nodes flagged as in
+     * dispatch so a `Eff.op(...)` inside the clause resolves to the
+     * outer handler instead of recursing into ourselves. The op-call
+     * site sets it just before invoking the clause and clears it on
+     * the way out (both branches: RESUMED and UNRESUMED). */
+    int          in_dispatch;
 };
 
 /* Push an Evidence node onto the current fiber's stack. The caller
@@ -2717,6 +2724,7 @@ struct KaiEvidence {
  * links it as the new top. */
 static void kai_evidence_push(KaiEvidence *node, const char *eff_label, void *handler) {
     KaiFiber *f = kai_current_fiber();
+    node->in_dispatch  = 0;
     node->parent       = f->evidence_top;
     node->eff_label    = eff_label;
     node->handler      = handler;
@@ -2734,6 +2742,7 @@ static void kai_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
                                         void *handler, jmp_buf *jmp,
                                         KaiValue **discard_slot) {
     KaiFiber *f = kai_current_fiber();
+    node->in_dispatch  = 0;
     node->parent       = f->evidence_top;
     node->eff_label    = eff_label;
     node->handler      = handler;
@@ -2805,8 +2814,13 @@ static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     while (node != NULL) {
-        if (node->eff_label == eff_label
-            || strcmp(node->eff_label, eff_label) == 0) {
+        /* m8.x bug #12: skip a node whose clause body is currently
+         * being dispatched. Without this, `Eff.op(...)` invoked
+         * inside the clause re-resolves to the same handler and
+         * recurses forever. */
+        if (!node->in_dispatch
+            && (node->eff_label == eff_label
+                || strcmp(node->eff_label, eff_label) == 0)) {
             return node;
         }
         node = node->parent;
@@ -2824,6 +2838,8 @@ static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     while (node != NULL) {
+        /* m8.x bug #12: same skip rule as the by-name lookup. */
+        if (node->in_dispatch) { node = node->parent; continue; }
         KaiHandlerId nid = ((KaiHandlerId *) node->handler)[0];
         if (nid == id) {
             return node;
