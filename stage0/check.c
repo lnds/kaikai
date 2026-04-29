@@ -90,6 +90,7 @@ static const char *PRELUDE[] = {
     "exit", "panic",
     /* conversions */
     "int_to_string", "real_to_string", "string_to_int", "string_to_real",
+    "int_to_real", "real_to_int",
     /* strings */
     "string_length", "string_concat", "string_concat_all", "string_join",
     "string_split", "string_contains", "char_at",
