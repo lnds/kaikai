@@ -310,6 +310,32 @@ in a `Pair[a, b]` record. Demo migration, not language change.
 These demos exercise stdlib or language pieces that are deferred to
 known follow-up lanes.
 
+#### `demos/forth/main.kai` — FIXED 2026-04-29
+
+Refactored to extract `token_of` from the lambda passed to `map`, so
+the `Fail` effect can propagate from a real fn body (the `!`
+postfix doesn't work inside lambdas, so the path here was
+explicit `match string_to_int(n) { Some(i) -> TNum(i); None ->
+Fail.fail("...") }`). Also switched the inner pipe from `|>`
+(apply) to `|` (map) for concision: `s |> string_split(" ") |
+token_of` reads more naturally than the previous
+`s |> string_split(" ") |> map((w) => match w { ... })`.
+
+Renamed the local `fn show(stack: [Int]) : String` to
+`fn render_stack(...)` because the bare `show` collided with the
+`Show.show` protocol method (single-dispatch picked the protocol
+even though there is no `Show for List`). Same name-clash class as
+the `resolver-arity-aware` lane targets, but at same-arity instead
+of mismatched-arity — needs a separate fix (prefer local fn over
+imported protocol when both match).
+
+The golden was wrong (`3` vs the correct `-3`) — Forth convention
+is `[7,4] -` → `4 - 7 = -3`. Updated.
+
+Original report below for posterity.
+
+##### Original report
+
 #### `demos/forth/main.kai` — `!` postfix on `Option` (demo not updated)
 
 ```kai
@@ -438,7 +464,7 @@ that lane lands, the `use Stdout` + `--path stdlib` edits become a
 | `state` | aspirational m7b #5b | post-MVP | wait for sugar lane |
 | `stack` | aspirational m7b #5b | post-MVP | wait for sugar lane |
 | `toquefama` | aspirational tuples (REJECTED) | demo migration | rewrite to `Pair` or multi-arg match |
-| `forth` | `!` blocked in lambda scope | ~30 min refactor | extract `token_of` from lambda |
+| ~~`forth`~~ | **FIXED 2026-04-29** | ~30 min refactor done | extracted `token_of`, `|` map pipe, renamed `show` → `render_stack`, fixed golden |
 | `mini_ledger` | regex anchors not parsed | 0.5d | m12.6.x #7 lane |
 | `spiral` | repeat collision (loop vs list) | blocked | wait for `resolver-arity-aware` lane |
 
