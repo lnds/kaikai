@@ -100,8 +100,6 @@ stress-fixtures: kaic2
 	    && echo "stress OK $$name" \
 	    || { echo "stress FAIL $$name (binary exit non-zero)"; cat /tmp/stress-$$name.out; exit 1; }; \
 	done
-	@echo "stress-fixtures: aspirational fixtures (expected fail until upstream lane lands):"
-	@echo "  - examples/effects/m8_fiber_discard.kai (expects R4 fix)"
 
 # Coverage probe: every section of the runtime / language docs has a
 # fixture; if not, alarm. Implemented as a shell script so it can run
