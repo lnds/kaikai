@@ -1379,6 +1379,45 @@ static KaiValue *kai_ne_v(KaiValue *a, KaiValue *b) {
     return r;
 }
 
+/* `kai_pow_int(a, b)` — integer-exponent power for the `^` operator.
+ * Lives in runtime so the operator works without requiring the
+ * Numeric protocol in scope. The unit of a dimensioned operand is
+ * metadata on the type only; the runtime value carries no unit, so
+ * the same code path serves `Real` and `Real<u>` alike.
+ *
+ * For Int: negative exponents truncate to 0 (no integer reciprocal).
+ * For Real: negative exponents compute `1.0 / base^|e|` so unit
+ * lifting at the type level (`r : Real<m>`, `r ^ -1 : Real<m^-1>`)
+ * matches a meaningful runtime result. This is intentionally more
+ * lenient than the `Numeric.pow_int` stdlib impl, which clamps
+ * negatives to 0; the discrepancy is acceptable because `^`
+ * dispatches through this helper, never through the protocol. */
+static KaiValue *kai_pow_int(KaiValue *a, KaiValue *b) {
+    if (b->tag != KAI_INT) {
+        fprintf(stderr, "kai: type mismatch in ^ (exponent must be Int)\n"); exit(1);
+    }
+    int64_t e = b->as.i;
+    KaiValue *r;
+    if (a->tag == KAI_INT) {
+        if (e < 0) { r = kai_int(0); }
+        else {
+            int64_t base = a->as.i;
+            int64_t acc = 1;
+            for (int64_t i = 0; i < e; i++) { acc *= base; }
+            r = kai_int(acc);
+        }
+    } else if (a->tag == KAI_REAL) {
+        double base = a->as.r;
+        int64_t k = e < 0 ? -e : e;
+        double acc = 1.0;
+        for (int64_t i = 0; i < k; i++) { acc *= base; }
+        if (e < 0) { acc = 1.0 / acc; }
+        r = kai_real(acc);
+    } else { fprintf(stderr, "kai: type mismatch in ^\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
 static KaiValue *kai_neg(KaiValue *a) {
     KaiValue *r;
     if (a->tag == KAI_INT)       r = kai_int(-a->as.i);

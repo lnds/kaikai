@@ -1988,7 +1988,32 @@ fn parse_unary(p: Parser) : PExpr {
       ok_e(p2, mk_expr(ECall(getter, []), t.line, t.col))
     }
   } else {
-    parse_postfix(p)
+    parse_pow(p)
+  }
+}
+
+# `^` — integer-exponent power. Higher precedence than `*`/`/` and
+# right-associative (Haskell convention): `2 ^ 3 ^ 2` parses as
+# `2 ^ (3 ^ 2)` = `2 ^ 9` = 512. The LHS is `parse_postfix` so calls
+# and field accesses bind tighter than `^`; the RHS calls back into
+# `parse_unary` so a leading sign on the exponent (`r ^ -2`) lexes
+# as `EUnop("-", EInt(2))`. The typer treats `^` specially: when the
+# base has a non-trivial unit, the exponent must be a literal Int
+# (or `-Int`) so the result unit `u^n` resolves at compile time.
+fn parse_pow(p: Parser) : PExpr {
+  let r = parse_postfix(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> {
+      let t = p_peek(r.p)
+      if tk_is(t.kind, TkCaret) {
+        let rr = parse_unary(p_skip_newlines(p_advance(r.p)))
+        match rr.r {
+          None -> err_e(rr.p)
+          Some(rhs) -> ok_e(rr.p, mk_expr(EBinop("^", lhs, rhs), t.line, t.col))
+        }
+      } else { ok_e(r.p, lhs) }
+    }
   }
 }
 
@@ -6395,12 +6420,28 @@ fn type_expr_display(t: TypeExpr) : String {
 # the canonical form (which lives as Map[Sym,Int]); it's the tree shape
 # the parser produced, with light cleanup. Use unit_canon_display for
 # canonical output.
+#
+# Style: scientific notation. Multiplication renders as a single space
+# (`kg m`), division renders with `/` and no surrounding spaces
+# (`m/s`, `kg m/s^2`). Powers use `^` with the integer literal
+# (`m^2`, `s^-1`). `UOne` factors are dropped.
 fn unit_expr_display(u: UnitExprT) : String {
   match u {
     UOne -> "1"
     USym(s) -> s
-    UMul(a, b) -> concat_all([unit_expr_display(a), " * ", unit_expr_display(b)])
-    UInv(a) -> concat_all(["1 / ", unit_expr_display(a)])
+    UMul(a, b) -> match b {
+      UInv(b_inner) -> match a {
+        UOne -> concat_all(["1/", unit_expr_display(b_inner)])
+        _    -> concat_all([unit_expr_display(a), "/", unit_expr_display(b_inner)])
+      }
+      UOne -> unit_expr_display(a)
+      _ -> match a {
+        UOne -> unit_expr_display(b)
+        UInv(a_inner) -> concat_all([unit_expr_display(b), "/", unit_expr_display(a_inner)])
+        _ -> concat_all([unit_expr_display(a), " ", unit_expr_display(b)])
+      }
+    }
+    UInv(a) -> concat_all(["1/", unit_expr_display(a)])
     UPow(a, n) -> concat_all([unit_expr_display(a), "^", int_to_string(n)])
     UVar(n) -> cat2("?u", int_to_string(n))
   }
@@ -7644,6 +7685,7 @@ fn binop_cname(op: String) : Option[String] {
   else if op == "/" { Some("kai_div") }
   else if op == "//" { Some("kai_idiv") }
   else if op == "%" { Some("kai_mod") }
+  else if op == "^" { Some("kai_pow_int") }
   else if op == "<" { Some("kai_lt") }
   else if op == ">" { Some("kai_gt") }
   else if op == "<=" { Some("kai_le") }
@@ -17326,6 +17368,14 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     # rule still requires the *base* numeric types to agree (Real*Real
     # / Int*Int) — we delegate that to synth_dim_mul_div.
     synth_dim_mul_div(rr.st, op, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
+  } else if op == "^" {
+    # Integer-exponent power. Mirrors `*`/`/`'s UoM behaviour with one
+    # twist: the result unit is `u^n`, which only resolves when `n`
+    # is a literal Int known at compile time. If the exponent is not
+    # a literal AND the base has a non-trivial unit, the rule is
+    # rejected (no dependent types). Bare numeric bases (`Int`,
+    # `Real<1>`, …) accept any `Int` exponent.
+    synth_dim_pow(rr.st, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
   } else {
     # `+` / `-` keep the unify-both-sides rule. The dim-aware unifier
     # checks the unit equality automatically.
@@ -17333,6 +17383,61 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     let s1 = st_unify(rr.st, rl.ty, rr.ty, what, line, col)
     let ty = apply_ty(s1.sub, rl.ty)
     mk_inferred(s1, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
+  }
+}
+
+# Try to extract a compile-time integer literal from an expression.
+# Recognises plain `EInt(n)` and the unary-minus form
+# `EUnop("-", EInt(n))` produced by the parser for negative literals
+# (the parser does not fold `-3` into `EInt(-3)`). Anything else —
+# including `EBinop("-", EInt(0), EInt(3))` and bound names — returns
+# `None`; the typer then refuses to lift a non-trivial unit through
+# `^`.
+fn try_int_literal(e: Expr) : Option[Int] {
+  match e.kind {
+    EInt(n) -> Some(n)
+    EUnop(uop, inner) ->
+      if uop == "-" {
+        match inner.kind {
+          EInt(n) -> Some(0 - n)
+          _ -> None
+        }
+      } else { None }
+    _ -> None
+  }
+}
+
+fn synth_dim_pow(st: InferState, lt: Ty, le: Expr,
+                  rt: Ty, re: Expr, line: Int, col: Int) : Inferred {
+  # The exponent is always Int — pin it. This catches `r ^ 3.0` or
+  # `r ^ "a"` with the standard "integer arithmetic" diagnostic.
+  let s1 = st_unify(st, rt, TyInt, "integer arithmetic", line, col)
+  let ls = ty_split_dim(apply_ty(s1.sub, lt), s1.sub)
+  let lit = try_int_literal(re)
+  match lit {
+    Some(n) -> {
+      # Literal exponent: lift the unit. `unit_canon` simplifies
+      # `m^0` → 1 and `m^1` → m so trivial cases collapse cleanly.
+      let new_unit = unit_canon(UPow(ls.dim, n))
+      let ty = dim_collapse(apply_ty(s1.sub, ls.base), new_unit)
+      mk_inferred(s1, ty, binop_root("^", le, re, line, col, ty))
+    }
+    None -> {
+      # Non-literal exponent. Only safe when the base has a trivial
+      # unit; otherwise we would owe a dependent type.
+      let canon_dim = unit_canon(ls.dim)
+      if not unit_is_one(canon_dim) {
+        diag_error(st.file, line, col,
+          "operator `^` requires a literal Int exponent when the base has a non-trivial unit")
+        diag_help("annotate the exponent as a literal (e.g. `r ^ 3`) or strip the unit on the base before the call")
+        let ty = apply_ty(s1.sub, ls.base)
+        mk_inferred(st_bump_err(s1), ty, binop_root("^", le, re, line, col, ty))
+      } else {
+        # Bare numeric base: result keeps the base type.
+        let ty = apply_ty(s1.sub, ls.base)
+        mk_inferred(s1, ty, binop_root("^", le, re, line, col, ty))
+      }
+    }
   }
 }
 
@@ -21125,6 +21230,7 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_le(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_ge(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_neg(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_pow_int(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_not(%KaiValue*)\n",
     "declare %KaiValue* @kaix_string_concat(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_to_string(%KaiValue*)\n",
@@ -21502,6 +21608,7 @@ fn llvm_binop_helper(op: String) : Option[String] {
   else if op == "/"  { Some("@kaix_div") }
   else if op == "//" { Some("@kaix_idiv") }
   else if op == "%"  { Some("@kaix_mod") }
+  else if op == "^"  { Some("@kaix_pow_int") }
   else if op == "==" { Some("@kaix_eq") }
   else if op == "!=" { Some("@kaix_ne") }
   else if op == "<"  { Some("@kaix_lt") }

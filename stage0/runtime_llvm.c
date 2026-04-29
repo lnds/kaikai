@@ -38,6 +38,7 @@ KaiValue *kaix_gt(KaiValue *a, KaiValue *b)    { return kai_gt(a, b); }
 KaiValue *kaix_le(KaiValue *a, KaiValue *b)    { return kai_le(a, b); }
 KaiValue *kaix_ge(KaiValue *a, KaiValue *b)    { return kai_ge(a, b); }
 KaiValue *kaix_neg(KaiValue *a)                { return kai_neg(a); }
+KaiValue *kaix_pow_int(KaiValue *a, KaiValue *b) { return kai_pow_int(a, b); }
 /* Route through kai_boolnot so the LLVM backend's `not` matches the
  * C backend's `!` operator: same type-check + consuming semantics. */
 KaiValue *kaix_not(KaiValue *a)                { return kai_boolnot(a); }
