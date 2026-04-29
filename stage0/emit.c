@@ -184,6 +184,8 @@ static const struct {
     { "exit",           "kai_prelude_exit",           1 },
     { "int_to_string",  "kai_prelude_int_to_string",  1 },
     { "real_to_string", "kai_prelude_real_to_string", 1 },
+    { "int_to_real",    "kai_prelude_int_to_real",    1 },
+    { "real_to_int",    "kai_prelude_real_to_int",    1 },
     { "string_length",  "kai_prelude_string_length",  1 },
     { "string_concat",  "kai_prelude_string_concat",  2 },
     { "string_concat_all", "kai_prelude_string_concat_all", 1 },

@@ -169,6 +169,8 @@ KaiValue *kaix_prelude_read_file(KaiValue *p)               { return kai_prelude
 KaiValue *kaix_prelude_write_file(KaiValue *p, KaiValue *c) { return kai_prelude_write_file(p, c); }
 KaiValue *kaix_prelude_read_line(void)                      { return kai_prelude_read_line(); }
 KaiValue *kaix_prelude_real_to_string(KaiValue *v)          { return kai_prelude_real_to_string(v); }
+KaiValue *kaix_prelude_int_to_real(KaiValue *v)             { return kai_prelude_int_to_real(v); }
+KaiValue *kaix_prelude_real_to_int(KaiValue *v)             { return kai_prelude_real_to_int(v); }
 KaiValue *kaix_prelude_string_to_int(KaiValue *s)           { return kai_prelude_string_to_int(s); }
 KaiValue *kaix_prelude_string_to_real(KaiValue *s)          { return kai_prelude_string_to_real(s); }
 KaiValue *kaix_prelude_string_length(KaiValue *s)           { return kai_prelude_string_length(s); }
