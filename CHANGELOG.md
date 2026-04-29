@@ -14,6 +14,61 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 - Versioning infrastructure: tags v0.1.0 → v0.7.2; `bin/kai --version`
   reads `VERSION` dynamically.
 
+## [0.9.0] — 2026-04-29 (`^` value-level operator + canonical unit pretty-print)
+
+**Minor: new operator surface and prettier UoM render.** Resolves
+the asymmetry where `^` parsed only inside unit expressions
+(`Real<m^2>`) but not at the value level: now `r ^ n` works on
+`Int`, `Real`, and dimensioned `Real<u>`. The unit pretty-printer
+also drops the spurious `* 1` sandwich it produced for `m / s` —
+the same change improves `unit_name`, `impl Show for Real<u>`,
+typer diagnostics, and any AST/IR dump that surfaces unit text.
+
+### Added
+
+- **`^` operator at expression level** (`stage2/compiler.kai`):
+  - Parser: new `parse_pow` between unary and postfix; right-
+    associative (`2 ^ 3 ^ 2 = 512`), higher precedence than
+    `*`/`/`. Negative literal exponents lex via `EUnop("-",
+    EInt(n))` so `r ^ -1` parses correctly.
+  - Typer: `synth_dim_pow` extends `synth_binop` with UoM-aware
+    rules. When the base has a non-trivial unit, the exponent
+    must be a compile-time literal Int (positive or negative);
+    `Real<u> ^ N` lifts to `Real<u^N>`. Bare numeric bases accept
+    any Int exponent. Non-literal exponent + dimensioned base is
+    rejected with a targeted diagnostic.
+  - Runtime: `kai_pow_int(a, b)` in `stage0/runtime.h` and the
+    `kaix_pow_int` LLVM bridge in `stage0/runtime_llvm.c`. Int
+    bases clamp negative exponents to 0; Real bases compute
+    `1.0 / base^|n|` so the unit lift at the type level matches
+    a meaningful runtime value.
+  - Codegen: `binop_cname` and `llvm_binop_helper` route `^`
+    through the runtime helper without protocol dispatch (the
+    operator does not depend on `Numeric` being in scope).
+- `examples/protocols/pow_operator.kai` (+ golden) and
+  `pow_operator_neg.kai` (+ `.err.expected`): cover bare numerics,
+  unit lift, right-associativity, negative literal exponent, and
+  the non-literal-exponent rejection.
+- `demos/free_fall/`: physics demo (`h(t) = h0 - (1/2) g t^2`)
+  showcasing `^` and UoM together. Demo baseline 21 → 22.
+
+### Changed
+
+- **Pretty-print of canonical unit expressions** (`unit_expr_display`,
+  `stage2/compiler.kai`): scientific style. Multiplication is a
+  single space (`kg m`), division `/` is unspaced (`m/s`,
+  `kg m/s^2`). `UMul(a, UInv(b))` collapses to `a/b` directly so
+  `m / s` no longer surfaces as `m * 1 / s`. Trivial `UOne`
+  factors drop out. Refresh of three goldens
+  (`examples/usd_to_eur/`, `examples/protocols/m12_8_phase2_show_real_compound`,
+  and any future fixtures using compound units).
+
+### Validation
+
+- selfhost (C + LLVM) byte-identical fixed point.
+- `make test` clean (test-protocols includes both new fixtures).
+- `make demos-no-regression` 22 (baseline 22, raised from 21).
+
 ## [0.8.1] — 2026-04-29 (resolver — local DFn shadows same-arity protocol op)
 
 **Patch: resolver-local-shadow.** Companion to v0.7.2's resolver-arity
