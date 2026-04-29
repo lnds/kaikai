@@ -14,6 +14,75 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 - Versioning infrastructure: tags v0.1.0 → v0.7.2; `bin/kai --version`
   reads `VERSION` dynamically.
 
+## [0.11.0] — 2026-04-29 (m4c #4 Phase 2 full — call-site rewrite)
+
+**Minor: monomorphisation now retargets call sites.** The previous
+release (0.10.0) emitted specialised copies of every polymorphic
+DFn but left every `ECall(EVar(name), args)` pointing at the
+polymorphic original — the specialisations were dead code modulo
+linker DCE. This release adds the AST walker that rewrites
+`ECall(EVar(name), args)` to `ECall(EVar(mangle_name(name, tys)),
+args)` whenever the call site's `(name, line, col)` matches a
+`ResolvedCS` with concrete tys that produced a specialisation.
+After the patch, both the C and LLVM backends route every
+concrete-typed call to its specialised body; the polymorphic
+original stays in the decl list to support function-as-value
+references that `ResolvedCS` does not track. The
+`try_rewrite_show_dim_real` workaround around `Show<Real<u>>`
+remains in place — removing it depends on body-type substitution
+(deferred — the impl-body's `unit_name(x)` still reads the
+impl-level uvar even after the body is cloned).
+
+### Added
+
+- `rewrite_callsites_decls` / `rewrite_callsites_decl` /
+  `rewrite_callsites_expr` / `rewrite_callsites_kind` /
+  `find_mono_tys` in `stage2/compiler.kai`. Mirrors the shape of
+  `rename_proto_calls_*` and `resolve_protocol_calls_*`; the only
+  rewrite case is `ECall(EVar(name), args)` against the recorded
+  `ResolvedCS` table. All other ExprKind variants delegate to
+  `map_expr_kind` so adding a new variant fails compilation
+  rather than silently leaking through.
+- `monomorphise` rewrites `tp.decls` *before* cloning the
+  specialised copies, so each spec inherits the rewritten body via
+  structural sharing — calls inside a polymorphic body that
+  resolved to a concrete `g(...)` retarget to `g__mono__T` in
+  every clone, without an extra pass.
+- `make -C stage2 test-m4c` adds three new structural-grep gates
+  on the C and LLVM emission of `m4c_run_with.kai` and
+  `m4c_handler_in_body.kai` that fail if the call sites still
+  point at the polymorphic name.
+
+### Fixed
+
+- Specialised copies are now actually invoked. Pre-fix the
+  `kai_run_with__mono__Int__Int` / `kai_run_with__mono__String__Int`
+  symbols were emitted but every call still went to
+  `kai_run_with`; post-fix the specialisations are reached at
+  every concrete call site.
+
+### Deferred (unchanged from 0.10.0)
+
+- **Body type substitution**: required to remove the
+  `try_rewrite_show_dim_real` workaround around `Show<Real<u>>`.
+  The impl body's `unit_name(x)` reads the impl-level uvar after
+  identity monomorphisation; substituting Expr.ty across the
+  cloned body lets the parametric impl produce the unit suffix
+  natively. Today the body is byte-identical across
+  specialisations (only the top-level symbol differs).
+- **Generic prune**: dropping the polymorphic original once every
+  reference is redirected. Today pruning would break
+  function-as-value patterns the `ResolvedCS` table doesn't index
+  (`let f = my_poly_fn; f(42)` records no CS for the bare-name
+  reference).
+
+### Documentation
+
+- `docs/m4c-real-specialisation.md` — Phase 2 — call-site rewrite
+  moved from "Deferred" to "What landed in this lane", with the
+  keying decision (`(name, line, col)` lookup against
+  `tp.insts`), gate evidence, and measurements.
+
 ## [0.10.0] — 2026-04-29 (m4c #4 — clause-info plumbing + minimal real specialisation)
 
 **Minor: monomorphisation unblocked.** The `monomorphise` pipeline
