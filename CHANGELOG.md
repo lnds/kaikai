@@ -11,12 +11,42 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Added
 
-- Versioning infrastructure: `VERSION` file at repo root, this `CHANGELOG.md`,
-  retroactive git tags `v0.1.0` / `v0.1.1` / `v0.1.2` / `v0.1.3` / `v0.2.0`
-  / `v0.2.1` / `v0.2.2` / `v0.3.0` / `v0.4.0` / `v0.4.1` / `v0.5.0` and the
-  current `v0.5.1`. The compiler's own `kaic2 --version` flag still reports
-  the legacy `kaic2 stage 2 (self-hosted)` string; the `bin/kai --version`
-  wrapper reads VERSION dynamically.
+- Versioning infrastructure: tags v0.1.0 → v0.6.0; `bin/kai --version`
+  reads `VERSION` dynamically.
+
+## [0.6.0] — 2026-04-28 (stdlib/math/float — Real math helpers)
+
+**Minor: new stdlib module.** Pure-kaikai `Real` math helpers mirroring
+`stdlib/math/int.kai`'s shape. No new runtime builtins; v1 ships what's
+expressible from `+`, `-`, `*`, `/`, comparisons.
+
+### Added
+
+- **`stdlib/math/float.kai`** (`addf6a3`, PR #14):
+  - 3 constants: `real_pi`, `real_e`, `real_tau` (18 significant digits).
+  - 6 functions: `real_abs`, `real_sign`, `real_min`, `real_max`,
+    `real_clamp`, `real_pow_int`.
+- **`bin/kai`** loads the new module in its prelude chain alongside
+  `stdlib/math/int.kai`.
+- **`stage2/Makefile`**: `EXTRA_PRELUDE_FLAGS` includes
+  `--prelude ../stdlib/math/float.kai` so `test-stdlib` picks it up.
+- **`examples/stdlib/math_float_basic`** + golden: 25 OK lines with
+  ε = 1e-4 closeness check.
+
+### Deferred
+
+Functions needing new runtime intrinsics or libm via FFI:
+- `real_floor` / `real_ceil` / `real_round` / `real_trunc` — need
+  `int_to_real` + `real_to_int` runtime builtins.
+- `real_sqrt` / `real_sin` / `real_cos` / `real_log` / `real_exp` —
+  need libm via FFI (would also feed `Crypto` / `Net` effects).
+
+### Validation
+
+- Selfhost C + LLVM byte-identical.
+- `make -C stage2 test-stdlib`: math_float_basic OK + 19 other
+  fixtures still green.
+- demos-no-regression: 20 passing (baseline 20).
 
 ## [0.5.1] — 2026-04-28 (m14 v1.E — char module rename to bare names)
 
@@ -553,7 +583,8 @@ is closed:
    `try_rewrite_show_dim_real` shortcut in m12.8 Phase 2 confirms it;
    polymorphics with `EHandle` in the body collide on `clause_fn_name`.
 
-[Unreleased]: https://github.com/lnds/kaikai/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/lnds/kaikai/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/lnds/kaikai/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/lnds/kaikai/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/lnds/kaikai/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/lnds/kaikai/compare/v0.4.0...v0.4.1
