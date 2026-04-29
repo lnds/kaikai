@@ -321,13 +321,19 @@ Fail.fail("...") }`). Also switched the inner pipe from `|>`
 token_of` reads more naturally than the previous
 `s |> string_split(" ") |> map((w) => match w { ... })`.
 
-Renamed the local `fn show(stack: [Int]) : String` to
+Originally renamed the local `fn show(stack: [Int]) : String` to
 `fn render_stack(...)` because the bare `show` collided with the
 `Show.show` protocol method (single-dispatch picked the protocol
 even though there is no `Show for List`). Same name-clash class as
 the `resolver-arity-aware` lane targets, but at same-arity instead
-of mismatched-arity — needs a separate fix (prefer local fn over
-imported protocol when both match).
+of mismatched-arity.
+
+**Resolved separately (v0.8.1, lane: resolver-local-shadow).** The
+pre-resolve dispatcher rewrite now drops every op entry whose
+`(name, arity)` is provided by a top-level DFn in the compilation
+unit, so local fns shadow same-name same-arity protocol ops.
+`render_stack` is back to `show`; both call forms (`show(result)`
+and bare references) resolve to the local fn.
 
 The golden was wrong (`3` vs the correct `-3`) — Forth convention
 is `[7,4] -` → `4 - 7 = -3`. Updated.
