@@ -42,14 +42,19 @@ Numbers on `kaic2` self-compile (KAI_TRACE_RC):
 | wall time     | 2.15 s  | n/a     | n/a             | 5.74 s         | (untouched, expected to recover with kai_field/pat_test balance) |
 
 The flip cut RSS in half and started calling `free` (~23 M times,
-vs 37 calls pre-flip). Three Tier 2 partial-landings on
-2026-04-29 evening (commits `8bd6431`, `73a12d4`, `7ab3d64`) cut
-the residual leak roughly in half: **46.9 M → 23.8 M (−49%)**.
-The remaining ~24 M are the named sources below (perceus_pass
-multi-read, kai_field/pat_test, stage 0 deeper let/match audit).
-Wall time has not moved — the dup machinery still fires;
-recovering wall regression is paired with the kai_field balance
-work that drops redundant increfs in the match-test phase.
+vs 37 calls pre-flip). Four Tier 2 partial-landings on
+2026-04-29 (commits `8bd6431`, `73a12d4`, `7ab3d64`, and
+`b3b1e2f`) cut the residual leak roughly in half: **46.9 M → 23.8 M
+(−49%)**. The remaining ~24 M are the named sources below
+(perceus_pass multi-read, kai_field/pat_test). The stage 0 emit-
+side audit shipped with `b3b1e2f` extends `7ab3d64`'s single-use
+optimisation past parameters to let-bindings and match-arm binds:
+`stage1.c` `kai_internal_dup` count drops 1181 → 1090 (−7.7%) on
+top of the param-only baseline; selfhost stays byte-identical.
+Wall time has not moved — the dup machinery still fires for the
+multi-use majority; recovering wall regression is paired with the
+kai_field balance work that drops redundant increfs in the
+match-test phase.
 
 ## What does NOT work today
 
@@ -76,9 +81,14 @@ Five named leak sources (all in `docs/m5x-followup.md` §4b–§5):
   array & list ops). The remaining hand-written prelude
   helpers in `runtime.h` still borrow rather than consume.
 - **Stage 0 eager-dup retrofit** — `emit_ident_value` in
-  `stage0/emit.c` emits `kai_internal_dup(kai_<name>)` on every
-  local read. Brute-force way to keep the binding alive across
-  consuming primitives, but leaks one ref per local read inside
+  `stage0/emit.c` still emits `kai_internal_dup(kai_<name>)` on
+  every multi-use, captured, or unresolved local read. The
+  single-use, non-captured fast path landed in two steps
+  (`7ab3d64` for fn params, `b3b1e2f` for let-bindings and match-
+  arm binds), keyed by binding identity (`Node *`) so disjoint
+  scopes don't collapse. Lambda body lets are still on the
+  brute-force path — running a per-lambda-body counter is the
+  follow-up. Each remaining wrap leaks one ref per read inside
   `kaic1`'s emitted code.
 
 Plus one architectural debt:
@@ -112,7 +122,7 @@ claim "Tier 1 #2 (runtime-efficient) holds without footnotes".
 | **Match-scrutinee real plug** | ~0.5d | Drop the net-zero workaround once §4b lands; recover the original 9fe6f6d savings |
 | **`kai_field` / `pat_test` balance** | ~1–2d | Decref the increfed cells when the test fails its arm; biggest of the named leaks (per-arm × per-field) |
 | **Remaining `kai_prelude_*` helpers** | ~1–2d | Audit every hand-written `kai_prelude_*` in `runtime.h`; flip the borrowing helpers to callee-consume, mirror the 9fe6f6d 12-helper pattern |
-| **Stage 0 eager-dup retrofit cleanup** | ~1–2d | Replace the eager-dup with proper Perceus on stage 0's emit path; brute-force ref leak per local read goes away |
+| **Stage 0 eager-dup retrofit cleanup** | ~0.5–1d | Single-use, non-captured fast path landed in `7ab3d64` (params) + `b3b1e2f` (lets + match arms). What's left: per-lambda-body counter to extend the same fast path to lambda-local lets, and a Perceus-style decref insertion at scope exit so the multi-use majority stops leaking. |
 
 After this set, `leaked` should drop from 46.9 M to **< 5 M**
 (threshold: noise floor of constant-pool reuse). RSS stays
