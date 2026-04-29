@@ -8289,11 +8289,20 @@ fn emit_match_arm(src: String, a: Arm, lcs: [String], fns: [EFn], variants: [EVa
 
 fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   let sc = emit_expr(src,scrut, lcs, fns, variants, lams)
+  # m5.x flip Phase 3 closeout: decref `_scr` at every exit path
+  # of the match. `emit_pat_binds` already runs with is_alias=true
+  # at the top-level match-arm call (m5.x Step A), so every PBind
+  # got an `incref(_scr)` for its own reference; decreffing the
+  # producer slot here releases the match's own ownership without
+  # disturbing the binding's. The arm's `_r` value either was
+  # produced fresh inside the arm body (owns its own ref) or came
+  # from a PBind (which already increfed). Either way `_r` keeps
+  # its ref count intact across the post-match drop.
   concat_all([
     "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
     emit_match_arms(src, arms, lcs, fns, variants, lams),
     "    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n",
-    "} while (0); _r; })"
+    "} while (0); kai_decref(_scr); _r; })"
   ])
 }
 
@@ -9461,15 +9470,22 @@ fn emit_expr(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [EVar], 
     EIndex(_, _) -> "kai_unit() /* index: not used by bootstrap examples */"
     EBinop(op, a, b) -> {
       if op == "and" {
+        # m5.x flip Phase 3 closeout: `_a` is freshly allocated in
+        # most call sites; under the runtime flip it would otherwise
+        # leak — `kai_truthy` is non-consuming (the LLVM short-
+        # circuit phi needs the value alive on the skip path) and
+        # the C ternary returns either `<RHS>` or `kai_bool(0)`,
+        # both fresh, so `_a` is never reused. Drop it via the
+        # comma operator inside each branch.
         concat_all([
           "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams),
-          "; kai_truthy(_a) ? ", emit_expr(src, b, lcs, fns, variants, lams),
-          " : kai_bool(0); })"
+          "; KaiValue *_r = kai_truthy(_a) ? ", emit_expr(src, b, lcs, fns, variants, lams),
+          " : kai_bool(0); kai_decref(_a); _r; })"
         ])
       } else if op == "or" {
         concat_all([
           "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams),
-          "; kai_truthy(_a) ? kai_bool(1) : ", emit_expr(src, b, lcs, fns, variants, lams), "; })"
+          "; KaiValue *_r = kai_truthy(_a) ? kai_bool(1) : ", emit_expr(src, b, lcs, fns, variants, lams), "; kai_decref(_a); _r; })"
         ])
       } else if op == "++" {
         # m7d §23: lower `a ++ b` to either `string_concat(a, b)` or
