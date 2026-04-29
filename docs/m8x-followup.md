@@ -156,22 +156,46 @@ Tracked in `~/.claude/projects/.../memory/project_stage0_bugs.md`.
 The ones that bit m8 demos and need closing before m8.x can ship
 proper structured-concurrency demos:
 
-- **#9 Closure-capture-through-let in trailing lambdas.** Workaround
-  in m8 fixtures: inline expressions, no inner `let`. Fix: extend
-  `collect_free_vars` to subtract `SLet` introductions.
-- **#7 Closure-capture-through-pattern-bind.** Same shape but for
-  `match` arm bindings. Workaround: hoist match handlers to top
-  level. Same fix family as #9.
-- **#12 User-installed `with Spawn` delegating to outer Spawn
-  segfaults.** Currently sidestepped by making `nursery` a typed
-  pass-through. Likely interaction between TyAny-erased Spawn ops
-  and the m7a #6 CPS clause-body machinery; investigate.
-- **Lambda-row inference with "concrete + open row var".** Both
-  `nursery` and `with_mailbox` had to relax their body-arg row to
-  pure-open-var because m7b #14 doesn't pick up effects when a
-  concrete label sits next to the var. Tracked as a separate
-  m7b #14 follow-up; needed by m8.x to restore the proper Doc B
-  signatures.
+- ~~**#9 Closure-capture-through-let in trailing lambdas.**~~
+  **Closed 2026-04-29** (`f692a5c`). `stage1/compiler.kai`
+  gained scope-aware `fv_stmts_scoped` mirroring stage 2's
+  shape; each `SLet(pat, _, rhs)` walks `rhs` under the outer
+  scope and extends the scope with the pattern's bound names
+  for the next stmt. `EBlock` threads the scoped result's
+  `own` through to the trailing tail. Stage 0 had the same
+  fix already (`N_LET` walks RHS first then `pat_add_locals`).
+- ~~**#7 Closure-capture-through-pattern-bind.**~~ **Closed
+  2026-04-29** (`f692a5c`). `stage1/compiler.kai`'s
+  `fv_arms` now extends `own` with `pat_bindings(pat, own)`
+  before walking the guard and body, matching stage 2's
+  behaviour and stage 0's `N_ARM` `ls_push_mark` /
+  `pat_add_locals` / `ls_pop_mark`.
+- ~~**#12 User-installed `with Spawn` delegating to outer Spawn
+  segfaults.**~~ **Closed 2026-04-29** (`4a77d49`). Root cause
+  was the runtime's `kai_evidence_lookup_node` always
+  returning the innermost `Spawn` handler, including the one
+  whose clause body was currently being dispatched —
+  `Spawn.spawn(thunk)` inside the clause re-resolved to the
+  same handler, infinite-looping until the stack overflowed.
+  Fix: a new `int in_dispatch` field on `KaiEvidence`, set to
+  1 right before invoking the clause function pointer (after
+  args are bound to `_op_arg_<i>` C locals so inner ops still
+  see the live node) and cleared on the way out. Both
+  `lookup_node` and `lookup_node_by_id` skip flagged nodes,
+  giving the user-installed handler an Effekt-style "outer
+  handler" view from inside its own clause. The LLVM op
+  dispatch path does not yet honour the flag (it never built
+  the discard/longjmp contract); pinned as a Wave A follow-up
+  whenever LLVM grows the discard-resume shape.
+- ~~**Lambda-row inference with "concrete + open row var".**~~
+  **Closed 2026-04-29** (`9de0449`). The bug was already
+  fixed by the cumulative typer work landed between m8 #10
+  and 2026-04 (closure-capture handler-id sentinel +
+  nested-lambda free-var propagation in particular).
+  `with_mailbox` regained its strict
+  `body: () -> R / Actor[Msg] + e` signature; selfhost stays
+  byte-identical; m7b #14 follow-up no longer needs a
+  separate fix.
 - **Body-vs-declared row check missing Spawn through stdlib.**
   `fn main() : Int / Console` was accepted for a body calling
   `fiber_spawn` (which has `/Spawn` in its row); runtime crashed
