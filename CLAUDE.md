@@ -99,6 +99,56 @@ cc stage0/*.c -o kaic0
 ./fizzbuzz
 ```
 
+## Testing discipline (load-bearing — read before opening a PR)
+
+Three test tiers run at three cadences. Pin spec lives in
+`docs/testing-tiers.md`. Defaults that every agent must follow without
+being told:
+
+- **Tier 0 — every commit**: run `make tier0` before every commit
+  (`make selfhost && make demos-no-regression`). If it fails, no
+  commit happens. ~30-60s.
+- **Tier 1 — every PR**: run `make tier1` before opening a PR
+  (`tier0` + `make test`). **The PR description must include the
+  trailing line of `make tier1` output, verbatim.** Without that
+  line a reviewer should refuse the merge. The R2 / R3 / R4
+  regressions that had to be debugged late on 2026-04-29 all came
+  from commit messages claiming `make test clean` without anyone
+  having run `make test` end-to-end. Do not repeat that.  ~2-4 min.
+- **Tier 2 — `make daily`**: only the maintainer / cron runs this on
+  `main` HEAD at end-of-day. Tier 1 + stress fixtures + coverage
+  probe + RC budget. Agents do not run Tier 2 inside their lanes —
+  it would burn velocity. ~10-20 min.
+
+Adjacent rules every agent must apply:
+
+- **Working tree must be clean** at every commit. No `git status`
+  output, no stashed work tied to a different lane. The
+  2026-04-29 audit caught `stage1/compiler.kai` dirty for hours
+  because nobody noticed; that hides which gate actually ran.
+- **Lane discipline**: a worktree fixes one thing. If you find a
+  bug outside your lane, document it in `docs/known-regressions.md`
+  with repro + hypothesis, do not fix it inline. The L2 wrong-lane
+  revert from 2026-04-29 is the precedent.
+- **VERSION + CHANGELOG**: bump at *lane close*, not per commit.
+  Commits land under `## [Unreleased]` until the lane finishes;
+  the closing commit moves them to a new `## [vX.Y.Z]` section.
+- **`make daily` failures are diagnostics, not blockers.** Tier 0
+  / Tier 1 already gated every commit, so `main` stays unbroken.
+  A `daily` failure opens a lane the next morning; do not jam
+  velocity by treating it as a per-PR gate.
+- **Coverage probe ratchet**: `tools/coverage-baseline.txt` is the
+  current allowed gap count. New gaps fail the probe; closed gaps
+  bump the baseline down. Add `<!-- coverage: skip -->` after a
+  heading only when it documents a non-testable concern (design
+  rationale, references), not when you forgot to write a fixture.
+- **Honesty targets**: when you ship a runtime change that affects
+  fibers or Perceus, update the relevant tier in
+  `docs/fibers-honesty-targets.md` or
+  `docs/perceus-honesty-targets.md`. The "Tier 1 #2 holds without
+  footnotes" claim in this CLAUDE.md is verifiable only against
+  those documents.
+
 ## Things to avoid
 
 - **Do not go back to Go** for the compiler. The prior Go frontend was discarded on purpose.
