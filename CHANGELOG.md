@@ -9,10 +9,59 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-04-29 (Perceus Tier 2 partials + testing-tier guardrails)
+
+**Minor: residual leak after R1 flip drops 46.9 M → 23.8 M (−49%)
+on `kaic2` self-compile.** Four Tier 2 partial-landings paid down
+the brute-force eager-dup cost the m5.x flip introduced. None
+moves wall time on its own; recovering the +2.7× wall regression
+is paired with the still-pending `kai_field`/`pat_test` balance
+work.
+
 ### Added
 
-- Versioning infrastructure: tags v0.1.0 → v0.7.2; `bin/kai --version`
-  reads `VERSION` dynamically.
+- Three-tier testing discipline: `make tier0` (selfhost +
+  demos-no-regression, every commit), `make tier1` (`tier0` +
+  full `make test`, every PR), `make daily` (`tier1` + stress
+  fixtures + coverage probe + RC budget, on `main` HEAD only).
+  Pin spec: `docs/testing-tiers.md`. The PR description must
+  include the trailing line of `make tier1` output verbatim;
+  without it, the merge does not happen.
+- Coverage probe (`tools/coverage-probe.sh`) with a baseline file
+  (`tools/coverage-baseline.txt`) ratchet — new gaps fail the
+  probe; closed gaps bump the baseline down.
+- `LocalUseTable` in `stage0/emit.c`: binding-identity (`Node *`)
+  keyed use counter that powers the single-use, non-captured
+  fast path in `emit_ident_value` for fn parameters, let-bindings
+  (simple + destructuring), and match-arm pattern binds.
+- `count_local_uses` + `count_local_uses_in_string`: scope-aware
+  walker over the fn body that mirrors the emit-time scope shape
+  (push/pop balanced, lambdas push their params with `decl=NULL`
+  so they shadow without polluting outer counts), runs once
+  before emit, and threads through `#{...}` interpolations the
+  same way `collect_free_vars_in_string` does.
+- `ls_resolve` helper on the local scope returning the innermost
+  matching declarator `Node *`.
+
+### Changed
+
+- `kai_internal_dup` count in `stage1/build/stage1.c` drops
+  1381 → 1090 across the two stage 0 deeper-Perceus commits
+  (`7ab3d64` cut to 1181 by handling fn params; `b3b1e2f` cut
+  another 91 by extending to lets and match-arm binds). Selfhost
+  stays byte-identical.
+- 8 hand-written `kai_prelude_*` helpers in `stage0/runtime.h`
+  flip from borrow to callee-consume (`8bd6431`); the iterative
+  refactor of `map`/`filter`/`reduce`/`each` consumes its `xs`
+  argument (`73a12d4`).
+- `docs/perceus-honesty-targets.md`: numbers refreshed to reflect
+  the Tier 2 partials and the deeper-Perceus stage 0 audit.
+
+### Versioning
+
+- Tags v0.1.0 → v0.7.2 retroactive; `bin/kai --version` reads
+  `VERSION` dynamically (carried over from the [Unreleased]
+  section the v0.11.0 release left untouched).
 
 ## [0.11.0] — 2026-04-29 (m4c #4 Phase 2 full — call-site rewrite)
 
