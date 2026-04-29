@@ -1044,6 +1044,7 @@ static KaiValue *kai_prelude_print(KaiValue *arg) {
         kai_decref(s);
     }
     fputc('\n', stdout);
+    kai_decref(arg);
     return kai_unit();
 }
 
@@ -1057,6 +1058,7 @@ static KaiValue *kai_prelude_eprint(KaiValue *arg) {
         kai_decref(s);
     }
     fputc('\n', stderr);
+    kai_decref(arg);
     return kai_unit();
 }
 
@@ -1081,18 +1083,24 @@ static KaiValue *kai_prelude_exit(KaiValue *code) {
 static KaiValue *kai_prelude_int_to_string(KaiValue *v) {
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long) v->as.i);
-    return kai_str(buf);
+    KaiValue *r = kai_str(buf);
+    kai_decref(v);
+    return r;
 }
 
 static KaiValue *kai_prelude_real_to_string(KaiValue *v) {
     char buf[64];
     snprintf(buf, sizeof(buf), "%g", v->as.r);
-    return kai_str(buf);
+    KaiValue *r = kai_str(buf);
+    kai_decref(v);
+    return r;
 }
 
 static KaiValue *kai_prelude_int_to_real(KaiValue *v) {
     int64_t n = (v && v->tag == KAI_INT) ? v->as.i : 0;
-    return kai_real((double) n);
+    KaiValue *r = kai_real((double) n);
+    kai_decref(v);
+    return r;
 }
 
 /* Truncating cast toward zero. Out-of-range, NaN and Inf collapse to
@@ -1100,58 +1108,97 @@ static KaiValue *kai_prelude_int_to_real(KaiValue *v) {
  * default beats a UB conversion. Revisit when the math/real lane
  * adds NaN-aware predicates. */
 static KaiValue *kai_prelude_real_to_int(KaiValue *v) {
-    if (!v || v->tag != KAI_REAL) return kai_int(0);
+    if (!v || v->tag != KAI_REAL) { if (v) kai_decref(v); return kai_int(0); }
     double r = v->as.r;
-    if (r != r) return kai_int(0);                  /* NaN */
-    if (r >  9.2233720368547748e18) return kai_int(0); /* > INT64_MAX */
-    if (r < -9.2233720368547758e18) return kai_int(0); /* < INT64_MIN */
-    return kai_int((int64_t) r);
+    KaiValue *out;
+    if (r != r) out = kai_int(0);                       /* NaN */
+    else if (r >  9.2233720368547748e18) out = kai_int(0); /* > INT64_MAX */
+    else if (r < -9.2233720368547758e18) out = kai_int(0); /* < INT64_MIN */
+    else out = kai_int((int64_t) r);
+    kai_decref(v);
+    return out;
 }
 
 /* ---------- prelude: strings ---------- */
 
 static KaiValue *kai_prelude_string_length(KaiValue *s) {
     int64_t n = (s && s->tag == KAI_STR) ? (int64_t) s->as.s.len : 0;
-    return kai_int(n);
+    KaiValue *r = kai_int(n);
+    if (s) kai_decref(s);
+    return r;
 }
 
 static KaiValue *kai_prelude_string_concat(KaiValue *a, KaiValue *b) {
-    return kai_string_concat(a, b);
+    KaiValue *r = kai_string_concat(a, b);
+    if (a) kai_decref(a);
+    if (b) kai_decref(b);
+    return r;
 }
 
 static KaiValue *kai_prelude_string_concat_all(KaiValue *xs) {
-    return kai_string_concat_all_impl(xs);
+    KaiValue *r = kai_string_concat_all_impl(xs);
+    if (xs) kai_decref(xs);
+    return r;
 }
 
 static KaiValue *kai_prelude_string_join(KaiValue *xs, KaiValue *sep) {
-    return kai_string_join_impl(xs, sep);
+    KaiValue *r = kai_string_join_impl(xs, sep);
+    if (xs) kai_decref(xs);
+    if (sep) kai_decref(sep);
+    return r;
 }
 
 /* ---------- prelude: arrays ---------- */
 
 static KaiValue *kai_prelude_array_make(KaiValue *n, KaiValue *init) {
     int64_t len = (n && n->tag == KAI_INT) ? n->as.i : 0;
-    return kai_array_make(len, init);
+    /* impl increfs `init` once per slot; consume our own input
+     * refs (n and init) at the boundary. */
+    KaiValue *r = kai_array_make(len, init);
+    if (n) kai_decref(n);
+    if (init) kai_decref(init);
+    return r;
 }
 
 static KaiValue *kai_prelude_array_length(KaiValue *a) {
     int64_t len = (a && a->tag == KAI_ARRAY) ? a->as.arr.len : 0;
-    return kai_int(len);
+    KaiValue *r = kai_int(len);
+    if (a) kai_decref(a);
+    return r;
 }
 
 static KaiValue *kai_prelude_array_get(KaiValue *a, KaiValue *i) {
     int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
-    return kai_array_get_impl(a, idx);
+    KaiValue *r = kai_array_get_impl(a, idx);
+    if (a) kai_decref(a);
+    if (i) kai_decref(i);
+    return r;
 }
 
 static KaiValue *kai_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
     int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
-    return kai_array_set_impl(a, idx, kai_incref(v));
+    /* impl returns kai_incref(a) — a fresh ref the caller owns.
+     * Our input `a` ref is therefore redundant under the callee-
+     * consumes convention; decref it so the array's refcount only
+     * reflects (1) the slot self-ref + (2) the caller's returned
+     * ref, never the borrowed entry. */
+    KaiValue *r = kai_array_set_impl(a, idx, kai_incref(v));
+    if (a) kai_decref(a);
+    if (i) kai_decref(i);
+    if (v) kai_decref(v);
+    return r;
 }
 
 static KaiValue *kai_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) {
     int64_t new_len = (n && n->tag == KAI_INT) ? n->as.i : 0;
-    return kai_array_grow_impl(a, new_len, init);
+    /* impl returns kai_incref(a) — caller owns the new ref. The
+     * input `a` ref is consumed under the callee-consumes
+     * convention. */
+    KaiValue *r = kai_array_grow_impl(a, new_len, init);
+    if (a) kai_decref(a);
+    if (n) kai_decref(n);
+    if (init) kai_decref(init);
+    return r;
 }
 
 /* ---------- prelude: lists ---------- */
@@ -1160,13 +1207,26 @@ static KaiValue *kai_prelude_list_length(KaiValue *xs) {
     int64_t n = 0;
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) { n++; p = p->as.cons.tail; }
-    return kai_int(n);
+    KaiValue *r = kai_int(n);
+    if (xs) kai_decref(xs);
+    return r;
+}
+
+/* Recursive helper: borrows `xs` (does NOT decref it), so the
+ * recursion can walk the cons chain without consuming on the way
+ * down. The public `kai_prelude_list_append` wraps this and
+ * decrefs `xs`/`ys` after the chain is built. */
+static KaiValue *kai_list_append_borrow(KaiValue *xs, KaiValue *ys) {
+    if (!xs || xs->tag == KAI_NIL) return kai_incref(ys);
+    KaiValue *rest = kai_list_append_borrow(xs->as.cons.tail, ys);
+    return kai_cons(kai_incref(xs->as.cons.head), rest);
 }
 
 static KaiValue *kai_prelude_list_append(KaiValue *xs, KaiValue *ys) {
-    if (!xs || xs->tag == KAI_NIL) return kai_incref(ys);
-    KaiValue *rest = kai_prelude_list_append(xs->as.cons.tail, ys);
-    return kai_cons(kai_incref(xs->as.cons.head), rest);
+    KaiValue *r = kai_list_append_borrow(xs, ys);
+    if (xs) kai_decref(xs);
+    if (ys) kai_decref(ys);
+    return r;
 }
 
 static KaiValue *kai_prelude_list_reverse(KaiValue *xs) {
@@ -1176,6 +1236,7 @@ static KaiValue *kai_prelude_list_reverse(KaiValue *xs) {
         acc = kai_cons(kai_incref(p->as.cons.head), acc);
         p   = p->as.cons.tail;
     }
+    if (xs) kai_decref(xs);
     return acc;
 }
 
