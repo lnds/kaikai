@@ -102,7 +102,7 @@ $(DEMOS):
 # column; the user must explicitly acknowledge the regression by
 # editing the baseline.
 no-regression: verify
-	@expected=$$(cat baseline.txt 2>/dev/null || echo 0); \
+	@expected=$${BASELINE:-$$(cat baseline.txt 2>/dev/null || echo 0)}; \
 	pass=0; nogolden=0; \
 	for d in $(DEMOS); do \
 	  st=$$(cat $(BUILD)/$$d.status 2>/dev/null || echo "?"); \

@@ -532,6 +532,97 @@ and `m8_fiber_discard_yields.kai` covers the discard + yield shape.)
 
 ---
 
+## R5 — `demos/euler4` segfaults on Linux runtime; passes on macOS
+
+**Status**: **OPEN**, surfaced by the first GitHub Actions CI run
+on PR #33 (2026-04-30). Not Linux-distro-specific in any obvious
+way: ubuntu-latest under both gcc-13 (default `cc`) and clang-18
+(`make CC=clang`) reproduce the segfault; macOS Darwin 25.4 with
+clang passes. CI baseline on Linux is dropped to 23 (vs the local
+mac baseline of 24) until R5 is fixed; see
+`.github/workflows/tier1.yml` (`BASELINE=23`) and the local
+`demos/baseline.txt` (still 24).
+
+**Symptom**: `make demos-no-regression` reports
+`euler4 FAIL runtime: Segmentation fault (core dumped)` on Linux.
+The same compiled stage-2 self-host binary produces correct output
+for euler1 / 2 / 3 / 5 / 6 in the same run.
+
+**Repro on Linux**:
+
+```sh
+git checkout main          # at or after 7c71bbf
+make CC=clang demos-no-regression
+# euler4 line shows SIGSEGV
+```
+
+**Source under suspicion**:
+
+```
+fn search(i: Int, j: Int, best: Int) : Int = {
+  if i > 999 { best }
+  else if j > 999 { search(i + 1, i + 1, best) }
+  else {
+    let prod = i * j
+    let nb = if is_palindrome(prod) and prod > best { prod } else { best }
+    search(i, j + 1, nb)
+  }
+}
+```
+
+`search` and the inner `rev_loop` are both tail-recursive; the
+demo Makefile compiles the emitted C with `-O2`, so TCO should
+fire under either compiler. ~405 K iterations of `search` with
+log10-deep `rev_loop` per iteration (~2.5 M function calls in
+total under -O2 TCO collapse, more without).
+
+**Hypotheses, in decreasing order of likelihood**:
+
+1. **Stack guard pages (PR #28) interact poorly with Linux signal
+   handling at high call-frequency.** The mac branch of the guard
+   was implicitly tested when the lane landed; the Linux branch
+   was not, since this is the first Linux run. The signal handler
+   may not re-arm correctly after a near-miss touch, or the
+   `mprotect` page sits at the wrong offset relative to glibc's
+   stack growth direction.
+2. **`KaiFiber kai_main_fiber` static initializer (runtime.h:390)**
+   has `-Wmissing-braces` warnings on both gcc and clang on Linux.
+   The C standard zero-initializes missing fields, so the diagnosis
+   should be cosmetic, but a struct-layout difference between the
+   mac and Linux builds (e.g., a flexible-array trailing member
+   that the missing braces let drift) would explain a runtime
+   crash that compiles clean.
+3. **`__builtin_*` ABI difference** — euler4 uses arithmetic only,
+   no obvious builtin, but the `kai_int` cache + `kai_alloc`
+   constructors do go through paths that use builtins (popcount,
+   etc.). Less likely.
+
+**Fix-verification path**:
+
+1. Reproduce on Linux locally (lima, docker, or a remote Linux
+   box). `lima` is recommended — it gives a real x86_64 Linux VM
+   without leaving mac.
+2. Run under `gdb` with `set follow-fork-mode child`. Capture the
+   stack at SEGV. If the top frame is in `kai_alloc` /
+   `kai_decref`, the bug is in the runtime's per-iteration alloc
+   path. If it is in `search` itself, TCO is not firing and a
+   stack-frame fix is needed.
+3. If it's the guard-page hypothesis, the fix is in
+   `kai_fiber_install_guard` (or whatever PR #28 named it) plus
+   the signal handler. Tier 2 honest claim about fibers Tier 1
+   needs the Linux numbers updated in
+   `docs/fibers-honesty-targets.md` after the fix.
+4. Once fixed, drop `BASELINE=23` from `.github/workflows/tier1.yml`
+   and let CI use the same `demos/baseline.txt` as local mac.
+
+**Why CI ships with the gap rather than blocking on the fix**:
+the value of having CI for *new* regressions today is larger than
+the cost of a single pre-existing demo failing on Linux only. The
+gap is documented and bounded; if any other demo flips to FAIL on
+Linux, CI catches it because the baseline (23) still trips.
+
+---
+
 ## Demos failing inventory (as of v0.7.1, 2026-04-29)
 
 `make demos-no-regression` reports **20 passing (baseline 20)** plus
