@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.20.1] — 2026-04-30 (R5 fix — RLIMIT_STACK bump for tail-recursive demos on Linux)
+
 ### Fixed
 
 - **R5 — `demos/euler4` segfault on Linux is gone.** The runtime
