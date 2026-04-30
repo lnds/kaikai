@@ -9,6 +9,25 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Fixed
+
+- **R5 — `demos/euler4` segfault on Linux is gone.** The runtime
+  installs an `__attribute__((constructor))` that bumps
+  `RLIMIT_STACK` to 256 MiB (or the hard cap, whichever is
+  smaller) before `main` runs, so the kernel's automatic
+  stack-grow path keeps servicing page faults past the 8 MiB
+  glibc default. Root cause was H4 (none of the issue's three
+  ranked hypotheses) — Perceus drops emitted *after* a self-tail
+  call inhibit C-level TCO under both gcc and clang on Linux
+  (verified: `kai_search` emits `call kai_search`, not `jmp`),
+  and `search`'s ~1 M-deep recursion blew the OS stack. macOS
+  shipped a more permissive default and never tripped it. The
+  proper compiler-side fix — emitter-recognised self-tail-call
+  rewriting into a `goto` loop — stays pinned as a follow-up;
+  the runtime bump unblocks CI today. `BASELINE=23` is dropped
+  from `.github/workflows/tier1.yml`; CI now runs against the
+  same `demos/baseline.txt = 24` as local mac. Closes #34.
+
 ## [0.20.0] — 2026-04-30 (Fibers Tier 2 close — Monitor + spawn_actor + LLVM in_dispatch + Spawn cleanup + Pid region-brand)
 
 ### Added

@@ -534,7 +534,90 @@ and `m8_fiber_discard_yields.kai` covers the discard + yield shape.)
 
 ## R5 — `demos/euler4` segfaults on Linux runtime; passes on macOS
 
-**Status**: **OPEN**, surfaced by the first GitHub Actions CI run
+**Status**: **FIXED** 2026-04-30 — runtime constructor bumps
+`RLIMIT_STACK` at startup (`stage0/runtime.h:
+kai_runtime_bump_stack_rlimit`). Root cause was none of the
+three ranked hypotheses below; surfaced as H4 during local
+repro on the Ubuntu CI box.
+
+**Verification path**:
+
+```sh
+ulimit -s unlimited && demos/build/euler4-bin   # pre-fix proof: PASSES
+                                                 # → confirmed stack overflow,
+                                                 #   not guard pages / signal
+ulimit -s 8192      && demos/build/euler4-bin   # post-fix: PASSES anyway
+                                                 # → constructor in runtime.h
+                                                 #   bumps RLIMIT_STACK before
+                                                 #   `main` runs.
+```
+
+**Why H1/H2/H3 were wrong**:
+
+- H1 (stack guard pages from PR #28). Did not apply: euler4
+  spawns no fibers, so `kai_install_fiber_sigsegv_handler` was
+  never called. The handler that would have decorated a
+  guard-page hit was not even installed.
+- H2 (`kai_main_fiber` `-Wmissing-braces`). The diagnostic was
+  cosmetic; C99 zero-fills missing fields and the resulting
+  layout matched mac's. `cancel_pad` ends up zero either way,
+  and main_fiber never runs through the trampoline that uses
+  the pad.
+- H3 (`__builtin_*` ABI difference). euler4 is arithmetic-only
+  on cached `kai_int` paths; `__builtin_popcount` and friends
+  do not appear on the hot path.
+
+**Real root cause (H4)**: the C the emitter generates for
+self-tail-recursive functions wraps the recursive call in a
+statement-expression like
+
+```c
+return ({ KaiValue *_r = (cond ? base : kai_search(...));
+          kai_internal_drop(i); kai_internal_drop(j);
+          kai_internal_drop(best); _r; });
+```
+
+The Perceus drops *after* the call inhibit C-level tail-call
+optimisation under both gcc-13 and clang-18 on Linux —
+verified at `-O2`, the symbol `kai_search` is reached with
+`call kai_search` rather than `jmp`. With `search` recursing
+~1 M deep on Project Euler #4 (1000 × 1000 grid plus
+~log10(prod) `rev_loop` per iteration, no TCO collapse), the
+8 MiB glibc default main-thread stack overflows. macOS shipped
+a more permissive default that happened to fit, so the same
+binary worked there.
+
+**Fix shape**: a `__attribute__((constructor))` registered at
+runtime startup raises `RLIMIT_STACK` from the kernel default
+to 256 MiB (or `rlim_max`, whichever is smaller). Linux honours
+the new limit on subsequent automatic stack-grow page faults,
+so the kernel grows the main-thread stack as deep as the
+program needs. No-op where the soft limit is already
+permissive (most macOS configurations).
+
+**Why this is the right shape, not the right destination**: the
+proper fix is emitter-side recognition of self-tail-calls
+followed by a `goto`-loop rewrite (or moving the drops to
+*before* the recursive call wherever they can run there). That
+is invasive — touches `emit_match_expr`, the Perceus pass, and
+every fixture's expected C — and not worth blocking R5 on. The
+runtime bump is a one-liner that gets every existing demo
+passing under CI today; the proper fix moves to a follow-up
+lane (`docs/m5x-followup.md` candidate).
+
+**What changed**:
+
+- `stage0/runtime.h`: added `#include <sys/resource.h>` and the
+  `kai_runtime_bump_stack_rlimit` constructor.
+- `.github/workflows/tier1.yml`: dropped `BASELINE=23`; CI now
+  reads the same `demos/baseline.txt = 24` as local mac.
+- `CHANGELOG.md`: entry under `[Unreleased]`, `### Fixed`.
+
+Original report below for posterity.
+
+---
+
+**Original status**: OPEN, surfaced by the first GitHub Actions CI run
 on PR #33 (2026-04-30). Not Linux-distro-specific in any obvious
 way: ubuntu-latest under both gcc-13 (default `cc`) and clang-18
 (`make CC=clang`) reproduce the segfault; macOS Darwin 25.4 with
