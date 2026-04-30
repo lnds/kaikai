@@ -9,6 +9,85 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-04-30 (Fibers Tier 2 close — Monitor + spawn_actor + LLVM in_dispatch + Spawn cleanup + Pid region-brand)
+
+### Added
+
+- **`Pid[Msg]` region-brand check now symmetrises with `Fiber[T]`.**
+  `check_no_fiber_escape` rejects any non-stdlib helper that
+  returns a `Pid[Msg]` at any nesting depth, with a Pid-shaped
+  diagnostic. The producer allow-list grew to include
+  `alloc_for_policy` and `spawn_actor` from `stdlib/actor.kai`,
+  the two legitimate Pid surface helpers. The full
+  `TyBranded(Ty, BrandId)` machinery — propagation through every
+  binding form, sum-type-payload escape, brand-mismatch detection
+  between sibling nurseries — is still pending and pinned in
+  `docs/m8x-followup.md` §6. Coverage:
+  `examples/effects/m8x_6_pid_escapes.kai`.
+
+- **`Monitor.monitor(pid)` + `Monitor.demonitor(ref)` are now
+  end-to-end primitives (Tier 2 supervision).** The Monitor
+  effect was type-surface-only before; the runtime now
+  registers `(observer, target_pid)` entries on the *target*
+  fiber's `monitor_head` chain, and the trampoline's
+  termination tail walks it and pushes the original
+  `target_pid` value into each observer's mailbox — without
+  touching `cancel_requested` (monitors are fault-isolated per
+  `docs/actors.md` §*Fault propagation*). v1 simplification:
+  `MonitorRef` collapses to `Pid[Nothing]` and the
+  `MonitorDown(ref, cause)` payload becomes a bare pid push;
+  reason distinction (Normal/Crashed) is reachable today
+  through Link+trap_exit on the same target. Coverage:
+  `examples/effects/m8_monitor.kai`.
+
+- **`spawn_actor(body) : Pid[Msg]` lifts on `fiber_spawn` +
+  `with_mailbox`** so a parent fiber receives the spawned
+  fiber's pid synchronously and can immediately pass it to
+  `Monitor.monitor(pid)`, `Link.link(pid)`, or `Spawn.send(pid,
+  msg)`. Two new runtime helpers in `stage0/runtime.h`:
+  `kai_mailbox_alloc_unowned()` (no owner stamp) and
+  `kai_mailbox_assign_owner(pid, fiber)` (set
+  `pid->as.mb->owner_fiber = fiber->as.fib` AND
+  `fiber->as.fib->mailbox = pid->as.mb`). Safe under the
+  cooperative scheduler because `Spawn.spawn` does not yield,
+  so the parent's assign call is observed before the spawned
+  trampoline runs. Closes the spawn_actor + Monitor line item
+  from `docs/fibers-honesty-targets.md` Tier 2.
+
+### Fixed
+
+- **LLVM op-dispatch now mirrors the C emit's `in_dispatch_node`
+  guard (m8 bug #12 LLVM mirror).** `llvm_emit_op_dispatch` saves
+  the current fiber's `in_dispatch_node`, sets it to the looked-up
+  evidence node before the indirect call, and restores afterwards;
+  without this, a self-delegating handler under `--emit=llvm`
+  would re-resolve `Eff.op(...)` back into its own clause and
+  infinite-loop until stack overflow — same shape as the C-side
+  bug closed in commit `4a77d49`. Three new runtime helpers
+  (`kaix_evidence_lookup_node`, `kaix_evidence_node_handler`,
+  `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the
+  KaiFiber struct out of the IR. Coverage:
+  `examples/effects/m8_12_self_delegating_handler.kai` now runs
+  under both backends, with a structural grep on the IR
+  confirming enter/leave pairing. Closes the LLVM
+  `in_dispatch_node` line item from
+  `docs/fibers-honesty-targets.md` Tier 2.
+
+### Changed
+
+- **Spawn ops now carry per-op `[T]` (m7b #2a retrofitted to
+  `builtin_spawn_decl`).** `Spawn.spawn(thunk) : Fiber[T]`,
+  `Spawn.await(f) : T`, `Spawn.select(fs) : T`, `Spawn.cancel(f) :
+  Unit` — `await` / `select` no longer return `Nothing` (TyAny)
+  and the typed `Fiber[T]` flow is observable end-to-end. The
+  `spawn` op keeps `thunk: Nothing` until per-op ROW generics
+  land (`spawn[T, e](f: () -> T / e)`); without them the wrappers
+  in `stdlib/spawn.kai` would lose the row propagation they
+  provide. Coverage: `examples/effects/m8_spawn_per_op_generics.kai`.
+  Closes the Spawn-API line item from
+  `docs/fibers-honesty-targets.md` Tier 2 (partial — TYPE generics
+  done; ROW generics tracked in `docs/m8x-followup.md` §7).
+
 ## [0.19.0] — 2026-04-30 (m13 bit ops chunk — twelve compiler intrinsics on `Int`)
 
 ### Added
