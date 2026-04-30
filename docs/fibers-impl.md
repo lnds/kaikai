@@ -62,15 +62,25 @@ Each fiber owns a heap-allocated private stack. v1 ships a fixed
 size; the budget is a pure runtime parameter, no language surface.
 
 - **Default size**: 64 KB.
-- **Grow strategy**: none in v1. Stack overflow is undefined
-  behaviour; programs that need deeper recursion configure the size.
+- **Grow strategy**: none in v1. Stack overflow is detected at
+  the guard page (see *Allocation*); programs that need deeper
+  recursion configure the size.
 - **Configuration**: environment variable `KAI_FIBER_STACK_SIZE`
-  (bytes, must be a multiple of 4096). Read once on first
+  (bytes; rounded up to a page-size multiple — 4 KiB on Linux /
+  x86_64, 16 KiB on macOS arm64). Read once on first
   `Spawn.spawn`. Out-of-range values fall back to the default and
   log a warning to stderr.
-- **Allocation**: `calloc` plus a `mprotect` guard page is *not*
-  done in v1 — overflow corrupts the heap silently. A guard page is
-  a follow-up (m8.x #11 in `m8x-followup.md`).
+- **Allocation**: `mmap(MAP_PRIVATE | MAP_ANON)` of `stack_size +
+  one page`, with the bottom page (low address) flipped to
+  `PROT_NONE` via `mprotect`. Stacks grow down on x86_64 / arm64,
+  so the guard sits at the overflow target. A SIGSEGV/SIGBUS
+  handler installed on first `Spawn.spawn` runs on a `sigaltstack`,
+  detects faults inside the active fiber's guard, prints
+  `kai: fiber stack overflow at <ptr>` to stderr, and re-raises
+  with the default disposition so the process exits with the
+  standard signal-killed status. Faults outside any guard fall
+  through to default (we do not interfere with NULL derefs etc.).
+  Coverage: `examples/effects/m8_fiber_stack_overflow.kai`.
 
 Grow strategies considered and rejected for v1:
 
@@ -385,9 +395,9 @@ honest 1.0. See `docs/m8x-followup.md` item 6 for the inventory.
 - **Multi-thread parallelism**. One OS thread, one scheduler. Doc
   C §*Out of scope for v1* item *Thread-level parallelism that is
   not fiber-based*.
-- **Stack guard pages / overflow detection**. m8.x #11 follow-up.
 - **Stack grow / shrink**. v1 fixed size; pick `KAI_FIBER_STACK_SIZE`
-  per workload.
+  per workload. (Guard-page overflow detection landed 2026-04-29 —
+  see *Stack model* above.)
 - **Priority queues**. Run queue is FIFO. Priority is a
   `structured-concurrency.md` §*Non-goals* item.
 - **Fairness guarantees**. No anti-starvation. A fiber that yields
