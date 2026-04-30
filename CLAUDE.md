@@ -110,19 +110,27 @@ cc stage0/*.c -o kaic0
 ## Testing discipline (load-bearing — read before opening a PR)
 
 Three test tiers run at three cadences. Pin spec lives in
-`docs/testing-tiers.md`. Defaults that every agent must follow without
-being told:
+`docs/testing-tiers.md`. CI runs in GitHub Actions
+(`.github/workflows/tier1.yml`, ubuntu-latest); it is the source
+of truth for tier1 on every PR and on every push to `main`.
+Defaults that every agent must follow without being told:
 
-- **Tier 0 — every commit**: run `make tier0` before every commit
-  (`make selfhost && make demos-no-regression`). If it fails, no
-  commit happens. ~30-60s.
-- **Tier 1 — every PR**: run `make tier1` before opening a PR
-  (`tier0` + `make test`). **The PR description must include the
-  trailing line of `make tier1` output, verbatim.** Without that
-  line a reviewer should refuse the merge. The R2 / R3 / R4
-  regressions that had to be debugged late on 2026-04-29 all came
-  from commit messages claiming `make test clean` without anyone
-  having run `make test` end-to-end. Do not repeat that.  ~2-4 min.
+- **Tier 0 — pre-commit fast sanity** (~30–60s): `make tier0`
+  (`make selfhost && make demos-no-regression`). Run before each
+  commit when iterating on compiler code; you may skip when the
+  change is documentation-only or trivially text-edit. CI catches
+  what local skips miss; this rule is now a velocity tool, not a
+  gate.
+- **Tier 1 — gated by CI on every PR**: GitHub Actions runs
+  `make tier0 && make tier1` on every PR and on every push to
+  `main`. **CI green is the merge gate** — the PR description no
+  longer needs to paste the trailing line of `make tier1`
+  verbatim, the check status replaces that ceremony. Agents may
+  run `make tier1` locally for faster feedback (~2–4 min on mac)
+  but it is not required. The R2 / R3 / R4 regressions that
+  motivated the manual ceremony (commit messages claiming
+  `make test clean` without anyone having run `make test`) are
+  the kind of failure CI now makes structurally impossible.
 - **Tier 2 — `make daily`**: only the maintainer / cron runs this on
   `main` HEAD at end-of-day. Tier 1 + stress fixtures + coverage
   probe + RC budget. Agents do not run Tier 2 inside their lanes —
