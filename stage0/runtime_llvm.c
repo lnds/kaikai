@@ -159,7 +159,8 @@ KaiValue *kaix_record(int n, KaiValue **fields, const char **names) {
     return kai_record(n, fields, names);
 }
 
-KaiValue *kaix_field(KaiValue *rec, const char *name)     { return kai_field(rec, name); }
+KaiValue *kaix_field(KaiValue *rec, const char *name)        { return kai_field(rec, name); }
+KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_field_borrow(rec, name); }
 
 /* Full prelude set — anything the compiler (stage 2's own source)
    calls directly when compiled through the LLVM backend. */
