@@ -6742,6 +6742,10 @@ fn prelude_names() : [String] {
     # m8 #8: bounded variant takes (cap: Int, overflow_code: Int).
     "mailbox_alloc", "mailbox_alloc_bounded",
     "mailbox_send", "mailbox_recv", "mailbox_free",
+    # Tier 2 spawn_actor primitives — alloc-without-owner-stamp +
+    # owner reassignment so a parent fiber can hand a mailbox to
+    # the spawned fiber and have it observably owned by the child.
+    "mailbox_alloc_unowned", "mailbox_assign_owner",
     "Some", "None", "Ok", "Err",
     # m5 #4 — Perceus dup/drop magic names. The pass synthesises
     # ECall(EVar("__perceus_dup"), [...]) and ECall(EVar("__perceus_drop"),
@@ -7684,7 +7688,11 @@ fn prelude_table() : [EPrelude] {
     EP("mailbox_alloc_bounded", "kai_prelude_mailbox_alloc_bounded", 2),
     EP("mailbox_send",          "kai_prelude_mailbox_send",          2),
     EP("mailbox_recv",          "kai_prelude_mailbox_recv",          1),
-    EP("mailbox_free",          "kai_prelude_mailbox_free",          1)
+    EP("mailbox_free",          "kai_prelude_mailbox_free",          1),
+    # Tier 2 spawn_actor — alloc-without-stamp + reassign owner to a
+    # spawned fiber. Used by stdlib/actor.kai's `spawn_actor`.
+    EP("mailbox_alloc_unowned",  "kai_prelude_mailbox_alloc_unowned",  0),
+    EP("mailbox_assign_owner",   "kai_prelude_mailbox_assign_owner",   2)
   ]
 }
 
@@ -10919,6 +10927,26 @@ fn default_link_setup() : String =
     "    kai_evidence_push(&_kai_default_node_link, \"Link\", &_kai_default_ev_link);\n"
   ])
 
+# Tier 2 (Fibers Tier 2 lane): emit EvMonitor + push it alongside
+# Link. `monitor(target_pid)` registers the current fiber as an
+# observer on target_pid->as.mb->owner_fiber's monitor_head chain;
+# trampoline termination pushes the original target_pid value into
+# every observer's mailbox, *without* setting cancel_requested
+# (monitors are unidirectional / fault-isolated per
+# `docs/actors.md` §*Fault propagation*). `demonitor(ref)` removes
+# the entry. v1 simplification: the MonitorRef returned by `monitor`
+# is the same Pid value the user passed in, so demonitor takes
+# the same Pid.
+fn default_monitor_setup() : String =
+  concat_all([
+    "    static EvMonitor _kai_default_ev_monitor;\n",
+    "    static KaiEvidence _kai_default_node_monitor;\n",
+    "    _kai_default_ev_monitor.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_monitor.monitor   = (KaiValue *(*)(EvMonitor *, KaiValue *, KaiCont *)) &kai_default_monitor_monitor;\n",
+    "    _kai_default_ev_monitor.demonitor = (KaiValue *(*)(EvMonitor *, KaiValue *, KaiCont *)) &kai_default_monitor_demonitor;\n",
+    "    kai_evidence_push(&_kai_default_node_monitor, \"Monitor\", &_kai_default_ev_monitor);\n"
+  ])
+
 # m8 #2/#3: emit EvSpawn + push it as the innermost default-handler
 # node (Doc B §*Installation order*: Spawn sits closest to main,
 # Cancel the layer below it, the I/O group below that). Wires all
@@ -10963,6 +10991,7 @@ fn default_setups_for(main_row: [String]) : String = {
     if list_has(main_row, "Mutable") { default_mutable_setup() } else { "" },
     if list_has(main_row, "Cancel")  { default_cancel_setup() }  else { "" },
     if list_has(main_row, "Link")    { default_link_setup() }    else { "" },
+    if list_has(main_row, "Monitor") { default_monitor_setup() } else { "" },
     if list_has(main_row, "Spawn")   { default_spawn_setup() }   else { "" }
   ])
 }
@@ -10971,6 +11000,7 @@ fn default_setups_for(main_row: [String]) : String = {
 fn default_pops_for(main_row: [String]) : String =
   concat_all([
     if list_has(main_row, "Spawn")   { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "Monitor") { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Link")    { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Cancel")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Mutable") { "    kai_evidence_pop();\n" } else { "" },
@@ -14597,6 +14627,10 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "mailbox_send",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)]), tv(0)],           TyUnit)) },
     TyEntry { name: "mailbox_recv",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)])],                  tv(0))) },
     TyEntry { name: "mailbox_free",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)])],                  TyUnit)) },
+    # Tier 2 spawn_actor — alloc-without-stamp + reassign owner.
+    # Used by stdlib/actor.kai's `spawn_actor` only.
+    TyEntry { name: "mailbox_alloc_unowned", scheme: scheme([0],    fn_ty([],                                       TyCon("Pid", [tv(0)]))) },
+    TyEntry { name: "mailbox_assign_owner",  scheme: scheme([0, 1], fn_ty([TyCon("Pid", [tv(0)]), TyCon("Fiber", [tv(1)])], TyUnit)) },
     # Bug 8: `unitless` TyEntry removed. The user-facing escape was
     # leaking typer-internal erasure as a callable; design-idiomatic
     # equivalents are `print("#{x}")` (post-Bug-4 + Gap-1) for output
@@ -19851,12 +19885,24 @@ fn finalise_typed_kind(s: Subst, k: ExprKind) : ExprKind =
 # m8 #6: shallow region-brand check on Fiber[T]. Walks the type
 # annotation (the user-written TypeExpr, not the resolved Ty, so
 # the diagnostic can point at the exact text the user wrote) and
-# rejects any occurrence of `Fiber[...]` in the return-type
-# position of a fn that is NOT one of the legitimate stdlib
-# producers (`fiber_spawn` family in stdlib/spawn.kai). See the
-# comment at the call site in infer_decl for the design trade-off
+# rejects any occurrence of `Fiber[...]` (or `Pid[...]`) in the
+# return-type position of a fn that is NOT one of the legitimate
+# stdlib producers (`fiber_spawn` family in stdlib/spawn.kai). See
+# the comment at the call site in infer_decl for the design trade-off
 # (path-based exemption doesn't work because import decls inherit
 # the importer's file path through expand_imports).
+#
+# Tier 2 (2026-04-30): symmetrise the check across `Fiber[T]` and
+# `Pid[Msg]` so a stdlib-external helper can no longer return a
+# raw Pid either. The full TyBranded(Ty, BrandId) machinery from
+# `docs/structured-concurrency.md` §*Type system* — propagating a
+# brand through every binding form (let, match, list literal,
+# record field, fn arg) and rejecting brand-mismatch between
+# sibling nurseries — is still pending; the shallow check here
+# already covers (a) Fiber/Pid as a return type at any depth and
+# (b) Fiber/Pid embedded in stdlib-defined parametric types
+# (Result[_, Fiber[Int]], Option[Pid[Msg]], etc. via the
+# recursive walk).
 fn check_no_fiber_escape(st: InferState, file: String, fname: String,
                           opt_ret: Option[TypeExpr], line: Int, col: Int) : InferState {
   if is_fiber_producer_helper(fname) { st }
@@ -19874,6 +19920,16 @@ fn check_no_fiber_escape(st: InferState, file: String, fname: String,
           diag_note("returning one from a function lets it outlive that scope")
           diag_help("process the fiber inside the nursery (e.g. with `fiber_await`), or pass a thunk in and a value out instead")
           st_bump_err(st)
+        } else if ty_expr_contains_pid(rty) {
+          let lline = if rty.line > 0 { rty.line } else { line }
+          let lcol  = if rty.col  > 0 { rty.col  } else { col  }
+          diag_error(file, lline, lcol,
+            string_concat(string_concat("Pid[Msg] cannot escape `", fname),
+                          "`'s structured-concurrency scope"))
+          diag_note("a `Pid[Msg]` handle is bound to the actor scope that created it")
+          diag_note("returning one from a function lets it outlive that scope")
+          diag_help("process the pid inside the scope (e.g. with `Actor.send`), or pass a thunk in and a value out instead")
+          st_bump_err(st)
         } else {
           st
         }
@@ -19882,17 +19938,26 @@ fn check_no_fiber_escape(st: InferState, file: String, fname: String,
   }
 }
 
-# Allow-list of stdlib helpers permitted to mention Fiber[T] in
-# their return type. Kept intentionally narrow — these are the only
-# legitimate constructors / passthroughs of Fiber values today
-# (stdlib/spawn.kai). Any new helper that needs to return a Fiber
-# must be added here on purpose. Phase 6 generalised the previous
-# single hardcoded `fname == "fiber_spawn"` to this list so future
-# additions don't keep re-touching the predicate's body; the list
-# itself stays a single-entry leaf for v1. The full TyBranded(Ty,
-# BrandId) machinery from docs/structured-concurrency.md §*Type
-# system* is deferred to post-MVP (m8x-followup.md item 6).
-fn fiber_producer_helpers() : [String] = ["fiber_spawn"]
+# Allow-list of stdlib helpers permitted to mention Fiber[T] / Pid[Msg]
+# in their return type. Kept intentionally narrow — these are the only
+# legitimate constructors / passthroughs of Fiber / Pid values today
+# (stdlib/spawn.kai + stdlib/actor.kai). Any new helper that needs to
+# return either handle must be added here on purpose. The full
+# TyBranded(Ty, BrandId) machinery from
+# `docs/structured-concurrency.md` §*Type system* — proper
+# brand propagation through every binding form so an arbitrary helper
+# can be admitted without an allow-list — is still pending
+# (`docs/m8x-followup.md` §6).
+#
+# Tier 2 (2026-04-30) extension: the Pid producers `alloc_for_policy`
+# and `spawn_actor` join the list; both shape a Pid as part of the
+# `with_mailbox`/`spawn_actor` structured-concurrency surface, and
+# the v1 surface relies on the typer admitting that shape until full
+# region-brand propagation lands.
+fn fiber_producer_helpers() : [String] =
+  ["fiber_spawn",
+   # Tier 2 Pid surface helpers (stdlib/actor.kai).
+   "alloc_for_policy", "spawn_actor"]
 
 fn is_fiber_producer_helper(fname: String) : Bool =
   list_has(fiber_producer_helpers(), fname)
@@ -19922,6 +19987,37 @@ fn ty_expr_list_has_fiber(ts: [TypeExpr]) : Bool {
   match ts {
     [] -> false
     [t, ...rest] -> if ty_expr_contains_fiber(t) { true } else { ty_expr_list_has_fiber(rest) }
+  }
+}
+
+# Tier 2 (2026-04-30): same shallow walk as `ty_expr_contains_fiber`
+# but for `Pid`. Region-brand machinery (TyBranded) is still pending,
+# so this is the same syntactic approximation: any TypeExpr
+# mentioning `Pid` at any depth (list, function-arg/-ret, type-arg,
+# dimensioned base, refinement base) returns true. Producer-helper
+# allow-list (`fiber_producer_helpers`) stays intentionally narrow;
+# stdlib's `mailbox_alloc` / `Actor.self()` still go through their
+# prelude / op-call scheme entries which are not subjected to this
+# check.
+fn ty_expr_contains_pid(t: TypeExpr) : Bool {
+  match t.tkind {
+    TyName(name, tas) ->
+      if name == "Pid" { true }
+      else { ty_expr_list_has_pid(tas) }
+    TyList(inner) -> ty_expr_contains_pid(inner)
+    TyFn(ps, ret, _) -> {
+      if ty_expr_list_has_pid(ps) { true }
+      else { ty_expr_contains_pid(ret) }
+    }
+    TyDim(base, _) -> ty_expr_contains_pid(base)
+    TyRefine(base, _) -> ty_expr_contains_pid(base)
+  }
+}
+
+fn ty_expr_list_has_pid(ts: [TypeExpr]) : Bool {
+  match ts {
+    [] -> false
+    [t, ...rest] -> if ty_expr_contains_pid(t) { true } else { ty_expr_list_has_pid(rest) }
   }
 }
 
@@ -24040,6 +24136,23 @@ fn llvm_header() : String =
     # initialises the on-stack KaiCont alloca.
     "declare i8* @kaix_evidence_lookup_handler(i8*)\n",
     "declare void @kaix_cont_init_identity(i8*, i64)\n",
+    # m8 bug #12 LLVM mirror — `lookup_node` returns the matching
+    # KaiEvidence* (cast to i8*) so the IR can pass it into the
+    # in_dispatch_node guard around the indirect op call.
+    # `node_handler` extracts `node->handler` without exposing
+    # the KaiEvidence struct layout in IR.
+    "declare i8* @kaix_evidence_lookup_node(i8*)\n",
+    "declare i8* @kaix_evidence_node_handler(i8*)\n",
+    # m8 bug #12 LLVM mirror — per-fiber in_dispatch_node guard.
+    # `enter(node)` saves the current fiber's `in_dispatch_node`,
+    # sets it to `node`, returns the previous value;
+    # `leave(prev)` restores. Without this, a self-delegating
+    # handler under `--emit=llvm` would resolve `Spawn.spawn(...)`
+    # back into its own clause and infinite-loop until stack
+    # overflow — same shape as bug #12 in the C backend
+    # (commit 4a77d49 / m8_12_self_delegating_handler.kai).
+    "declare i8* @kaix_in_dispatch_enter(i8*)\n",
+    "declare void @kaix_in_dispatch_leave(i8*)\n",
     # m7c-d — clause-body helper. The LLVM IR emits each
     # `resume(v)` call as a direct `kai_cont_resume(k, v)`
     # invocation; the cont pointer comes from the clause's `%k`
@@ -24826,8 +24939,9 @@ fn llvm_emit_modcall_fn_value(e: LlvmEmit, mod: String, fname: String, line: Int
 # m7c-c — emit the LLVM IR for an `Eff.op(args)` call. Mirrors the
 # C `emit_call_expr` op-call branch minus the discard/longjmp path
 # (m7a #6e). The IR shape is:
-#   %h = call i8* @kaix_evidence_lookup_handler(i8* @effname.str)
-#   %ev = bitcast i8* %h to %EvEff*
+#   %node = call i8* @kaix_evidence_lookup_node(i8* @effname.str)
+#   %h    = call i8* @kaix_evidence_node_handler(i8* %node)
+#   %ev   = bitcast i8* %h to %EvEff*
 #   ; KaiCont alloca (32 bytes covers the C struct)
 #   %k_buf = alloca [32 x i8], align 8
 #   %k = bitcast [32 x i8]* %k_buf to i8*
@@ -24835,18 +24949,30 @@ fn llvm_emit_modcall_fn_value(e: LlvmEmit, mod: String, fname: String, line: Int
 #   %hid_p = getelementptr %EvEff, %EvEff* %ev, i32 0, i32 0
 #   %hid = load i64, i64* %hid_p
 #   call void @kaix_cont_init_identity(i8* %k, i64 %hid)
+#   ; m8 bug #12 LLVM mirror: save and overwrite the current
+#   ; fiber's in_dispatch_node before the indirect call so a
+#   ; self-delegating handler doesn't re-resolve to itself.
+#   %prev = call i8* @kaix_in_dispatch_enter(i8* %node)
 #   ; GEP fn ptr at field 3 + op_idx, load, indirect-call
 #   %op_p = getelementptr %EvEff, %EvEff* %ev, i32 0, i32 N
 #   %op = load <fn-type>, <fn-type>* %op_p
 #   %r = call %KaiValue* %op(%EvEff* %ev, args..., i8* %k)
+#   call void @kaix_in_dispatch_leave(i8* %prev)
 fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : LlvmEmit {
   let eff_n = dotted_prefix(key)
   let name_res = llvm_emit_name_constant(e, eff_n, "eff.disp.name.")
-  # 1. Lookup handler.
-  let h_reg = llvm_fresh_reg(name_res.e)
-  let h_call = concat_all([
-    "  ", h_reg.reg, " = call i8* @kaix_evidence_lookup_handler(i8* ",
+  # 1. Lookup the evidence node (carries the handler pointer + the
+  # `in_dispatch` slot we need to flag).
+  let node_reg = llvm_fresh_reg(name_res.e)
+  let node_call = concat_all([
+    "  ", node_reg.reg, " = call i8* @kaix_evidence_lookup_node(i8* ",
     name_res.gep, ")\n"
+  ])
+  let e0a = llvm_append_body(node_reg.e, node_call)
+  let h_reg = llvm_fresh_reg(e0a)
+  let h_call = concat_all([
+    "  ", h_reg.reg, " = call i8* @kaix_evidence_node_handler(i8* ",
+    node_reg.reg, ")\n"
   ])
   let e1 = llvm_append_body(h_reg.e, h_call)
   # 2. Bitcast to %EvEff*.
@@ -24881,9 +25007,23 @@ fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : Ll
   ])
   let e6 = llvm_append_body(hid_reg.e, hid_load)
   # 5. Evaluate args; build a comma-joined arg list of %KaiValue* registers.
+  # Args are evaluated *before* the in_dispatch flag is set — they may
+  # themselves invoke the same op (e.g. `State.set(State.get() + 1)`),
+  # and setting the flag too early would route the inner lookup past
+  # the live handler. Mirrors the C emit's arg-bindings + flag-flip
+  # ordering.
   let ra = llvm_emit_args(e6, xs, [])
-  # 6. GEP to op fn-ptr at field `offset`, load, indirect call.
-  let fn_ptr_p_reg = llvm_fresh_reg(ra.st)
+  # 6. m8 bug #12 LLVM mirror — set the current fiber's
+  # in_dispatch_node = %node and capture the previous value to
+  # restore after the indirect call.
+  let prev_reg = llvm_fresh_reg(ra.st)
+  let prev_call = concat_all([
+    "  ", prev_reg.reg, " = call i8* @kaix_in_dispatch_enter(i8* ",
+    node_reg.reg, ")\n"
+  ])
+  let e6b = llvm_append_body(prev_reg.e, prev_call)
+  # 7. GEP to op fn-ptr at field `offset`, load, indirect call.
+  let fn_ptr_p_reg = llvm_fresh_reg(e6b)
   # Build the fn-ptr type: %KaiValue* (%EvEff*, args..., i8*)*
   let arg_ty_list = llvm_op_arg_kaivalue_list(list_length(xs))
   let fn_ptr_ty = concat_all([
@@ -24900,13 +25040,14 @@ fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : Ll
     "  ", fn_ptr_reg.reg, " = load ", fn_ptr_ty, ", ", fn_ptr_ty, "* ", fn_ptr_p_reg.reg, "\n"
   ])
   let e8 = llvm_append_body(fn_ptr_reg.e, fn_load)
-  # 7. Indirect call.
+  # 8. Indirect call, then restore in_dispatch_node.
   let r_reg = llvm_fresh_reg(e8)
   let arg_regs_str = llvm_format_op_arg_regs(ra.regs)
   let call_instr = concat_all([
     "  ", r_reg.reg, " = call %KaiValue* ", fn_ptr_reg.reg,
     "(%Ev", eff_n, "* ", ev_reg.reg, arg_regs_str,
-    ", i8* ", k_reg.reg, ")\n"
+    ", i8* ", k_reg.reg, ")\n",
+    "  call void @kaix_in_dispatch_leave(i8* ", prev_reg.reg, ")\n"
   ])
   llvm_set_last(llvm_append_body(r_reg.e, call_instr), r_reg.reg)
 }
@@ -30399,20 +30540,30 @@ fn builtin_link_decl() : Decl =
           ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
-# m8 #9: Monitor — unidirectional supervision. `monitor(target)`
-# registers the current actor as an observer of `target`; when
-# `target` terminates, a `MonitorDown(ref, cause)` message is
-# delivered to the observer's own mailbox. `demonitor(ref)`
-# withdraws the subscription. v1 declares the type surface; the
-# runtime registry + delivery on termination land with the m8.x
-# scheduler. Demos exercise the supervision *pattern* through the
-# Actor[Msg] mailbox + spawn primitives directly.
+# m8 #9: Monitor — unidirectional supervision. `monitor(target_pid)`
+# registers the current fiber as an observer of `target_pid`'s
+# owning fiber; when that fiber terminates, the runtime pushes
+# the same target_pid value into the observer's mailbox (no
+# cancel propagation — monitors are fault-isolated per
+# `docs/actors.md` §*Fault propagation*). `demonitor(ref)` removes
+# the registration.
+#
+# v1 simplification (Fibers Tier 2 lane, 2026-04-30): the
+# `MonitorRef` from the spec is collapsed to `Pid[Nothing]` — the
+# same pid the user passed in — and the `MonitorDown(ref, cause)`
+# variant payload becomes a bare pid push. Reason distinction
+# (Normal / Crashed) is reachable today through Link + trap_exit
+# (which pushes "Normal"/"Crashed" strings into the same mailbox).
+# A richer payload waits on user-defined sum types crossing the
+# runtime/library boundary.
 fn builtin_monitor_decl() : Decl =
   DEffect(false, "Monitor", [],
     [
-      EOp("monitor", [], [param_typed_zero("target", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
-          ty_name_zero("MonitorRef"), 0, 0),
-      EOp("demonitor", [], [param_typed_zero("ref", ty_name_zero("MonitorRef"))],
+      EOp("monitor", [],
+          [param_typed_zero("target", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
+          ty_named_zero("Pid", [ty_name_zero("Nothing")]), 0, 0),
+      EOp("demonitor", [],
+          [param_typed_zero("ref", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
           ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
@@ -30432,32 +30583,41 @@ fn builtin_cancel_decl() : Decl =
 
 # m8 #2/#3: Spawn — non-parametric effect. Per Doc B §`Spawn`, the
 # user-facing API is polymorphic (`spawn[T, e]`, `await[T]`, etc.).
-# m7b #2a (per-op TYPE generics) is now in main, but Doc B's `spawn`
-# also wants a per-op ROW generic (`/ e`), which is a separate
-# extension. v1 sidesteps both by declaring spawn / await / select /
-# cancel with type-erased parameter and return types
-# (`Nothing` → TyAny in the typer); the polymorphic surface lives in
-# `stdlib/spawn.kai` as fn-level wrappers (m7b #13 + m7b #14 give
-# the type-param + lambda-row machinery the wrappers need).
-# `yield()` is the canonical pinning point per Doc B §`Cancel` /
-# Delivery points; it stays monomorphic.
+# m7b #2a (per-op TYPE generics) lets the four Fiber-shaped ops
+# carry `[T]` directly, so `await`, `select`, and `cancel` now
+# present typed `Fiber[T]` arguments and `await` / `select` return
+# `T` instead of `Nothing` (TyAny).
 #
-# EOp shape is m7b #2a's six-field form (name, op_tparams, params,
-# ret, line, col); none of these ops use per-op tparams in v1, so
-# op_tparams stays []. Migration to the proper Doc B signatures is
-# tracked in `docs/m8x-followup.md` item 7.
+# `spawn`'s thunk parameter stays `Nothing` because per-op ROW
+# generics (`spawn[T, e](f: () -> T / e)`) is a separate extension
+# that has not landed: without it, the natural `() -> T` shape
+# would only accept pure thunks, defeating the polymorphism the
+# wrappers in `stdlib/spawn.kai` provide. The `Nothing`/TyAny
+# absorption keeps `fiber_spawn[T, e](f: () -> T / e) = Spawn.spawn(f)`
+# typing through.  The remaining gap is tracked in
+# `docs/m8x-followup.md` §7.
+#
+# `yield()` and `set_trap_exit(on)` stay monomorphic — neither has
+# a polymorphic shape to expose.
 fn builtin_spawn_decl() : Decl =
   DEffect(false, "Spawn", [],
     [
       EOp("yield",  [], [], ty_name_zero("Unit"), 0, 0),
-      EOp("spawn",  [], [param_typed_zero("thunk", ty_name_zero("Nothing"))],
-                    ty_name_zero("Nothing"), 0, 0),
-      EOp("await",  [], [param_typed_zero("fiber", ty_name_zero("Nothing"))],
-                    ty_name_zero("Nothing"), 0, 0),
-      EOp("select", [], [param_typed_zero("fibers", ty_name_zero("Nothing"))],
-                    ty_name_zero("Nothing"), 0, 0),
-      EOp("cancel", [], [param_typed_zero("fiber", ty_name_zero("Nothing"))],
-                    ty_name_zero("Unit"), 0, 0),
+      EOp("spawn",  ["T"],
+          [param_typed_zero("thunk", ty_name_zero("Nothing"))],
+          ty_named_zero("Fiber", [ty_name_zero("T")]), 0, 0),
+      EOp("await",  ["T"],
+          [param_typed_zero("fiber",
+                            ty_named_zero("Fiber", [ty_name_zero("T")]))],
+          ty_name_zero("T"), 0, 0),
+      EOp("select", ["T"],
+          [param_typed_zero("fibers",
+                            ty_list_zero(ty_named_zero("Fiber", [ty_name_zero("T")])))],
+          ty_name_zero("T"), 0, 0),
+      EOp("cancel", ["T"],
+          [param_typed_zero("fiber",
+                            ty_named_zero("Fiber", [ty_name_zero("T")]))],
+          ty_name_zero("Unit"), 0, 0),
       # Tier 2 trap-exit: toggle the current fiber's trap_exit flag.
       # When `on=true`, a linked peer's termination delivers a
       # "Normal"/"Crashed" string into the current fiber's mailbox

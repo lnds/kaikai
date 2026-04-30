@@ -95,12 +95,44 @@ Spec: Doc actors.md §`Actor[Msg]` *receive()*.
 Trampoline DONE/CANCELLED branches walk the linked chain and set
 `cancel_requested` on each peer.
 
-**Monitor**: ⏳ deferred to Phase 5.5+. Pid handoff for a clean
-two-fiber `Monitor.monitor` demo needs `spawn_actor` (m8.x #6
-follow-on) or message types carrying Pid; the v1 actor surface
-(with_mailbox only) supports neither cleanly. The runtime registry
-shape (per-fiber monitor-set, MonitorDown push at termination)
-will mirror Link's; the work is small once the demo path exists.
+**Monitor**: ✅ landed 2026-04-30 (Fibers Tier 2 lane).
+`Monitor.monitor(target_pid)` registers `(observer = current
+fiber, target_pid)` on the target fiber's `monitor_head` chain;
+the trampoline's termination tail (next to
+`kai_link_propagate_terminate`) walks the chain and pushes the
+original `target_pid` into each observer's mailbox without
+touching `cancel_requested` — monitors are fault-isolated per
+`docs/actors.md` §*Fault propagation*. `Monitor.demonitor(ref)`
+removes the entry by (observer, pid) match.
+
+`spawn_actor` lifts on `fiber_spawn` + `with_mailbox` via two
+new runtime helpers in `stage0/runtime.h`:
+
+- `kai_mailbox_alloc_unowned()` — like `mailbox_alloc` but
+  does NOT stamp `mb->owner_fiber` or the parent fiber's
+  `mailbox` slot.
+- `kai_mailbox_assign_owner(pid, fiber)` — sets
+  `pid->as.mb->owner_fiber = fiber->as.fib` AND
+  `fiber->as.fib->mailbox = pid->as.mb`. Safe under the
+  cooperative scheduler because `Spawn.spawn` does not yield,
+  so the parent's call is observed before the spawned
+  trampoline runs.
+
+The v1 surface returns `Pid[Msg]` to the parent before the
+spawned body runs; the parent can immediately pass it to
+`Monitor.monitor(pid)`, `Link.link(pid)`, or `Spawn.send(pid,
+msg)`. v1 simplification: the spec's `MonitorRef` collapses to
+`Pid[Nothing]` and the `MonitorDown(ref, cause)` payload becomes
+a bare pid push — same flavour as trap-exit's
+`"Normal"`/`"Crashed"` String simplification. Reason
+distinction is reachable today by combining Monitor with
+Link+trap_exit on the same target.
+
+Coverage: `examples/effects/m8_monitor.kai` — supervisor uses
+`with_mailbox` + `spawn_actor(worker)`, monitors the worker,
+the worker crashes via `Cancel.raise()`, supervisor receives
+the worker's pid in its mailbox and exits 0 (was NOT
+cancelled).
 
 **Trap-exit semantics**: ✅ landed 2026-04-29 (Fibers Tier 2 lane).
 `Spawn.set_trap_exit(Bool)` toggles the current fiber's
@@ -118,9 +150,9 @@ unit test exercising both reasons + the no-mailbox fallback).
 
 Spec: Doc actors.md §*Supervision: links and monitors*.
 
-### 6. Full region-brand machinery for `Fiber[T]` / `Pid[Msg]` — ⚠ v1 shallow
+### 6. Full region-brand machinery for `Fiber[T]` / `Pid[Msg]` — ⚠ partial
 
-**Phase 6 v1** ships the existing shallow check
+**Phase 6 v1** shipped the existing shallow check
 (`ty_expr_contains_fiber` recursive walk through TyName / TyList /
 TyFn / TyDim / TyRefine looking for `Fiber`) plus a generalised
 allow-list (`fiber_producer_helpers` in `stage2/compiler.kai`).
@@ -128,41 +160,86 @@ Regression test `examples/effects/m8x_6_fiber_in_result.kai`
 covers the parametric-sum-type case (Fiber[T] embedded in
 `Result[String, Fiber[Int]]`).
 
-**Deferred to post-MVP**: the full machinery from
-`docs/structured-concurrency.md` §*Type system* — extend `Ty`
-with `TyBranded(Ty, BrandId)`, mint brands at handler-installation
-sites, propagate the brand through every binding form (let, match,
-list literal, record field, etc.), check escape at fn return /
-fn arg / record field. Closer to lifetime checking than to HM
-unification.
+**Tier 2 (2026-04-30) extension**: the shallow check now
+symmetrises Fiber and Pid. `ty_expr_contains_pid` mirrors
+`ty_expr_contains_fiber`; `check_no_fiber_escape` emits a
+Pid-shaped diagnostic when a non-stdlib helper returns a
+`Pid[Msg]` at any depth. The producer allow-list grew to include
+`alloc_for_policy` and `spawn_actor` from `stdlib/actor.kai`, the
+two legitimate Pid surface helpers. Coverage:
+`examples/effects/m8x_6_pid_escapes.kai`.
 
-**Known shallow-check gaps** (not caught by v1):
-- Custom sum types with Fiber in a constructor payload but no
-  `Fiber` in the type's name or args (e.g. `type Boxed = Wrapper(Fiber[Int])`
-  — return type `Boxed` hides Fiber from the walker).
-- `Pid[Msg]` escape checks (Pid would need the same brand
-  machinery; v1 only checks Fiber).
-- Brand mismatch between sibling nurseries (only the lexical-
-  walking version detects nursery scope, not the shallow check).
+**Still pending** — the full TyBranded(Ty, BrandId) machinery from
+`docs/structured-concurrency.md` §*Type system* covers two gaps
+the shallow walk cannot:
 
-### 7. Per-op type generics (m7b #2)
+- *Sum-type-wrapped escape.* A `type Boxed = Wrapper(Fiber[Int])`
+  return value hides Fiber from the TypeExpr walker (the type's
+  name is `Boxed`; constructor payloads are recorded in the
+  variant table, not in the TypeExpr the walker sees). Closing
+  this gap requires either (a) a TypeExpr-level "transitively
+  contains a banned handle" check that consults the variant
+  table, or (b) the full TyBranded propagation that tracks brands
+  through every binding form (let, match, list literal, record
+  field, fn arg, fn return). Option (a) is a tractable Tier 2
+  follow-up; option (b) is the spec'd long-term shape.
+- *Brand mismatch between sibling nurseries.* Detecting that a
+  Fiber spawned in nursery `n1` is being passed into a `n2.spawn`
+  body needs lifetime-shaped tracking — fundamentally a
+  TyBranded(Ty, BrandId) feature, not a TypeExpr walk.
+
+Reason for the partial delivery (Fibers Tier 2 lane, 2026-04-30):
+the shipping pieces (Pid symmetry, allow-list extension) are
+mechanical, hold selfhost byte-identical, and unblock honest
+"Fiber[T] / Pid[Msg] are scope-bound" claims for the docs. The
+full TyBranded machinery is a multi-day typer-deep change with
+real selfhost risk; deferring it lets the rest of Tier 2 close
+without that risk and matches the brief's
+*if-stuck-defer-with-rationale* path.
+
+### 7. Per-op type generics on the Spawn ops — ⚠ partial (Tier 2 lane)
 
 Out of m8's stated scope but materially blocks the cleanup of
-m8 #3's type-erased Spawn ops. With m7b #2 in place, the Spawn
-declaration becomes:
+m8 #3's type-erased Spawn ops. With m7b #2a in place (per-op TYPE
+generics), the four Fiber-shaped ops now carry `[T]`:
 
 ```
 effect Spawn {
-  spawn[T, e](f: () -> T / e) : Fiber[T]
-  await[T](f: Fiber[T])       : T
+  spawn[T] (thunk: Nothing)        : Fiber[T]
+  await[T] (fiber: Fiber[T])       : T
+  select[T](fibers: [Fiber[T]])    : T
+  cancel[T](fiber: Fiber[T])       : Unit
   ...
 }
 ```
 
-— matching Doc B verbatim — and `stdlib/spawn.kai`'s wrappers
-collapse to the canonical `n.spawn { ... }` cap-binding form once
-m7b #4 (`@cap` / `cap := v`) also lands. Doc C §*Per-op type
-generics* §*Implementation plan (m7b)* has the work plan.
+`stdlib/spawn.kai`'s `fiber_await` / `fiber_select` / `fiber_cancel`
+are now one-line aliases; the canonical `Spawn.await(f) : T` shape
+is reachable directly. Coverage:
+`examples/effects/m8_spawn_per_op_generics.kai`. Landed in the
+Fibers Tier 2 lane (2026-04-30).
+
+**Still pending — per-op ROW generics.** The full Doc B shape is
+
+```
+effect Spawn {
+  spawn[T, e](f: () -> T / e) : Fiber[T]
+  ...
+}
+```
+
+— `e` is a per-op *row* variable propagating the spawned thunk's
+row into the caller's row. `add_effect_op_sigs_loop` only allocates
+`mk_tpbinds_from` (TYPE binds) for `op_tparams`; there is no
+op-level `mk_rvbinds`. Until that lands, the spawn op keeps
+`thunk: Nothing` (TyAny) so the wrapper
+`fiber_spawn[T, e](f: () -> T / e) = Spawn.spawn(f)` can absorb the
+open row through TyAny. After per-op row generics
+land, the wrappers reduce to one-line aliases (or are removed) and
+`Spawn.spawn[T, e]` becomes the canonical entry point. Doc C
+§*Per-op type generics* §*Implementation plan (m7b)* has the work
+plan; the additional row-bind plumbing is the small step that
+remains.
 
 ## Bugs surfaced in m8 (also m8.x scope)
 
@@ -197,10 +274,19 @@ proper structured-concurrency demos:
   see the live node) and cleared on the way out. Both
   `lookup_node` and `lookup_node_by_id` skip flagged nodes,
   giving the user-installed handler an Effekt-style "outer
-  handler" view from inside its own clause. The LLVM op
-  dispatch path does not yet honour the flag (it never built
-  the discard/longjmp contract); pinned as a Wave A follow-up
-  whenever LLVM grows the discard-resume shape.
+  handler" view from inside its own clause. **LLVM mirror landed
+  2026-04-30** (Fibers Tier 2 lane). `llvm_emit_op_dispatch` now
+  evaluates args, then calls `kaix_in_dispatch_enter(node)` to
+  stash the previous value and overwrite the current fiber's
+  `in_dispatch_node`, performs the indirect call, and finally
+  calls `kaix_in_dispatch_leave(prev)` to restore. Three new
+  runtime helpers in `stage0/runtime_llvm.c`
+  (`kaix_evidence_lookup_node`, `kaix_evidence_node_handler`,
+  `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the
+  KaiFiber struct out of the IR. Coverage:
+  `examples/effects/m8_12_self_delegating_handler.kai` now runs
+  under both backends, with a structural grep on the IR
+  confirming enter/leave pairing.
 - ~~**Lambda-row inference with "concrete + open row var".**~~
   **Closed 2026-04-29** (`9de0449`). The bug was already
   fixed by the cumulative typer work landed between m8 #10

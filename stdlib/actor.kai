@@ -15,6 +15,10 @@
 # message arrives. Demos sequence the sends before any receive
 # (e.g., self-send patterns) to stay within the synchronous frame.
 
+# `spawn_actor` reaches the cooperative scheduler through
+# `fiber_spawn` from `stdlib/spawn.kai`.
+import spawn
+
 # Mailbox overflow policies (m8 #8). Doc B / actors.md §*Mailbox
 # policies* spec. v1 ships Unbounded + Bounded(c, DropOldest) +
 # Bounded(c, DropNewest); BlockSender requires the m8.x
@@ -70,4 +74,41 @@ pub fn with_mailbox_policy[Msg, R, e](policy: MailboxPolicy,
   }
   let _ = mailbox_free(mb)
   r
+}
+
+# Spawn a fiber that runs `body` under an `Actor[Msg]` handler.
+# Returns the spawned fiber's `Pid[Msg]` to the caller — the parent
+# can pass it to `Spawn.send`, `Monitor.monitor`, `Link.link`, etc.
+# without waiting for the child's first action.
+#
+# The mailbox is allocated via `mailbox_alloc_unowned` so the parent
+# fiber's own `mailbox` slot stays untouched, then re-stamped to
+# the spawned fiber via `mailbox_assign_owner` *after* `fiber_spawn`
+# allocates the child but *before* the child runs (the cooperative
+# scheduler does not yield inside `Spawn.spawn`, so the assign call
+# is observed by the child's first action). The spawned body then
+# routes `Actor.self()` / `Actor.send(...)` / `Actor.receive()`
+# through that mailbox via the standard `with_mailbox`-shaped
+# handler, drains it on exit, and returns Unit (the user-supplied
+# `body` returns `R` but spawn_actor's caller only sees the pid).
+#
+# v1 simplification: `spawn_actor` ships only the unbounded-mailbox
+# default. `spawn_actor_policy(policy, body)` for an explicit policy
+# is the obvious follow-up; deferred until a fixture demands it.
+# Spec: `docs/actors.md` §*Spawning actors* §*spawn_actor*.
+pub fn spawn_actor[Msg, e](body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn + e = {
+  let mb = mailbox_alloc_unowned()
+  let f  = fiber_spawn(() => {
+    let _ = handle { body() } with Actor[Msg](mb) {
+      self(resume)        -> resume(state)
+      send(p, m, resume)  -> { mailbox_send(p, m); resume(()) }
+      receive(resume)     -> resume(mailbox_recv(state))
+      return(x)           -> x
+    }
+    let _ = mailbox_free(mb)
+    ()
+  })
+  let _ = mailbox_assign_owner(mb, f)
+  let _ = f
+  mb
 }

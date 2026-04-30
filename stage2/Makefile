@@ -1125,6 +1125,33 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (trap_exit=1: linked peer DONE/CANCELLED delivers Normal/Crashed string to mailbox)" \
 	    || { echo "effects FAIL $$name (trap-exit output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
+	for f in ../examples/effects/m8_spawn_per_op_generics.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  grep -q "^41$$" build/s2-$$name.out \
+	    && grep -q "^100$$" build/s2-$$name.out \
+	    && grep -q "^7$$" build/s2-$$name.out \
+	    && grep -q "^cancelled$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (per-op [T] flows through Spawn.spawn / await / select / cancel)" \
+	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m8_monitor.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (supervisor exit non-zero — Monitor cascaded fault?)"; cat build/s2-$$name.out; exit 1; }; \
+	  grep -q "^worker monitored$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (Monitor.monitor delivery on CANCELLED termination, supervisor not cancelled)" \
+	    || { echo "effects FAIL $$name (no MonitorDown delivery)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
 	for f in ../examples/effects/m8_4_cancel_uncaught.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -1214,6 +1241,20 @@ test-effects: $(TARGET) build
 	  done < $$exp_err; \
 	  echo "effects OK $$name (Fiber escape detected through Result type-arg)"; \
 	done; \
+	for f in ../examples/effects/m8x_6_pid_escapes.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_err=../examples/effects/$$name.err.expected; \
+	  rc=0; ./$(TARGET) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
+	  fi; \
+	  while read -r line; do \
+	    grep -qF "$$line" build/s2-$$name.err \
+	      || { echo "effects FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/s2-$$name.err; exit 1; }; \
+	  done < $$exp_err; \
+	  echo "effects OK $$name (Pid escape rejected with diagnostic)"; \
+	done; \
 	for f in ../examples/effects/m8_7_actor_self_send.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -1281,8 +1322,20 @@ test-effects: $(TARGET) build
 	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
 	  ./build/s2-$$name \
-	    && echo "effects OK $$name (m8 bug #12: self-delegating handler resolves to outer + per-fiber save/restore paired)" \
-	    || { echo "effects FAIL $$name (binary exit non-zero — infinite-loop regression?)"; exit 1; }; \
+	    || { echo "effects FAIL $$name (C binary exit non-zero — infinite-loop regression?)"; exit 1; }; \
+	  ./$(TARGET) --emit=llvm $$f > build/s2-$$name.ll 2> build/s2-$$name.ll.err \
+	    || { echo "effects FAIL $$name (kaic2 --emit=llvm errored)"; cat build/s2-$$name.ll.err; exit 1; }; \
+	  enter_count=$$(grep -c "call i8\* @kaix_in_dispatch_enter" build/s2-$$name.ll || true); \
+	  leave_count=$$(grep -c "call void @kaix_in_dispatch_leave" build/s2-$$name.ll || true); \
+	  test "$$enter_count" -gt 0 \
+	    || { echo "effects FAIL $$name (LLVM in_dispatch_enter missing — bug #12 LLVM mirror regressed?)"; exit 1; }; \
+	  test "$$enter_count" = "$$leave_count" \
+	    || { echo "effects FAIL $$name (LLVM in_dispatch invariant broken: $$enter_count enter vs $$leave_count leave)"; exit 1; }; \
+	  clang -w -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm \
+	    || { echo "effects FAIL $$name (LLVM link failed)"; exit 1; }; \
+	  ./build/s2-$$name-llvm \
+	    && echo "effects OK $$name (m8 bug #12: self-delegating handler resolves to outer + per-fiber save/restore paired (C+LLVM))" \
+	    || { echo "effects FAIL $$name (LLVM binary exit non-zero — infinite-loop regression?)"; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m8_fiber_discard.kai \
 	         ../examples/effects/m8_fiber_discard_yields.kai; do \
