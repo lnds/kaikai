@@ -345,6 +345,28 @@ struct KaiFiber {
      * still referenced from the run queue. NULL on `kai_main_fiber`,
      * which has no wrapper (it represents the OS thread). */
     KaiValue       *value;
+    /* Tier 2 — trap-exit semantics. When 0 (default), a linked peer's
+     * termination sets cancel_requested on this fiber (the v1 uniform
+     * propagation). When 1, the propagation walk pushes a String into
+     * this fiber's mailbox instead — "Normal" if the peer terminated
+     * via DONE, "Crashed" if via CANCELLED — and leaves
+     * cancel_requested untouched. Toggled by Spawn.set_trap_exit;
+     * spec: docs/actors.md §*Supervision: links and monitors* /
+     * *Trap-exit semantics*. The flag is per-fiber, not per-link, so
+     * it must be set before the link that should respect it; later
+     * toggles affect future propagations only. */
+    int             trap_exit;
+    /* Tier 2 — most-recently-allocated mailbox owned by this fiber.
+     * Set by kai_mailbox_alloc[_bounded] and cleared by
+     * kai_mailbox_free. Read by kai_link_propagate_terminate when
+     * trap_exit=1 to find a delivery target for the Exit string.
+     * v1 simplification: nested with_mailbox is not tracked — the
+     * inner allocation overwrites and the inner free clears the
+     * slot, leaving the outer mailbox unreachable to the trap-exit
+     * walker until the inner scope exits. Demos do not nest.
+     * Forward-declared as struct KaiMailbox * because the full
+     * KaiMailbox typedef sits below KaiFiber in this header. */
+    struct KaiMailbox *mailbox;
 };
 
 /* m7a #5 + m8.x: kai_main_fiber starts as the OS-thread context,
@@ -365,7 +387,9 @@ static KaiFiber kai_main_fiber = {
     {0}, 0,              /* cancel_pad, cancel_pad_set — main has no pad */
     NULL,                /* linked_head */
     NULL,                /* in_dispatch_node */
-    NULL                 /* value — main has no wrapper */
+    NULL,                /* value — main has no wrapper */
+    0,                   /* trap_exit — main starts opted out */
+    NULL                 /* mailbox — set by with_mailbox if main uses one */
 };
 
 static KaiFiber *kai_active_fiber = &kai_main_fiber;
@@ -518,6 +542,10 @@ static KaiMailbox *kai_mailbox_alloc(void) {
      * and the allocating fiber IS the actor; spawn_actor (m8.x #6)
      * will set this differently. */
     mb->owner_fiber  = kai_current_fiber();
+    /* Tier 2 trap-exit: stamp the mailbox onto its owner fiber so
+     * kai_link_propagate_terminate can locate it without a global
+     * registry. Nested allocs overwrite; kai_mailbox_free clears. */
+    if (mb->owner_fiber) mb->owner_fiber->mailbox = mb;
     return mb;
 }
 
@@ -529,6 +557,7 @@ static KaiMailbox *kai_mailbox_alloc_bounded(int cap, int overflow) {
     mb->cap          = cap;
     mb->overflow     = overflow;
     mb->owner_fiber  = kai_current_fiber();
+    if (mb->owner_fiber) mb->owner_fiber->mailbox = mb;
     return mb;
 }
 
@@ -622,6 +651,13 @@ static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
 
 static void kai_mailbox_free(KaiMailbox *mb) {
     if (!mb) return;
+    /* Tier 2 trap-exit: drop the back-pointer if the owner fiber
+     * still has us as its current mailbox. Nested with_mailbox: the
+     * inner free clears the slot even though the outer mailbox is
+     * still alive — accepted v1 limitation. */
+    if (mb->owner_fiber && mb->owner_fiber->mailbox == mb) {
+        mb->owner_fiber->mailbox = NULL;
+    }
     KaiMboxNode *node = mb->head;
     while (node) {
         KaiMboxNode *next = node->next;
@@ -2573,8 +2609,14 @@ static void kai_fiber_trampoline(void);
 
 /* Phase 5 forward decl: link propagation runs in the trampoline's
  * termination tail; the helper itself is defined alongside the
- * Link default handler further down. */
-static void kai_link_propagate_terminate(KaiFiber *self);
+ * Link default handler further down. The reason argument distinguishes
+ * Normal (DONE) from Crashed (CANCELLED) for trap-exit delivery. */
+typedef enum {
+    KAI_EXIT_NORMAL  = 0,
+    KAI_EXIT_CRASHED = 1
+} KaiExitReason;
+
+static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason);
 
 /* Initialise a freshly-allocated KaiFiber's ucontext + private stack.
  * Sets f->ctx so it can be a swapcontext target; fills uc_link as a
@@ -2711,13 +2753,18 @@ static void kai_fiber_trampoline(void) {
         self->state = KAI_FIBER_CANCELLED;
     }
 
-    /* Phase 5 — Link propagation. Walk the linked chain, set each
-     * peer's cancel_requested flag (delivered at the peer's next
-     * yield-point hook), and clean up the link nodes. v1
-     * propagates on both DONE and CANCELLED (the spec
-     * distinguishes them, BEAM-style trap-exit semantics queued
-     * for post-MVP). */
-    kai_link_propagate_terminate(self);
+    /* Phase 5 — Link propagation. Walk the linked chain. For each
+     * peer, behaviour depends on the peer's trap_exit flag (Tier 2):
+     *   - trap_exit=0 (default): set cancel_requested (current
+     *     behaviour, delivered at the peer's next yield-point hook).
+     *   - trap_exit=1: push a "Normal"/"Crashed" string into the
+     *     peer's mailbox so the peer can react in user code instead
+     *     of being cancelled.
+     * The exit reason is read from `self->state` at this point —
+     * DONE → Normal, CANCELLED → Crashed (any other state would be
+     * a runtime invariant violation). */
+    kai_link_propagate_terminate(self,
+        self->state == KAI_FIBER_DONE ? KAI_EXIT_NORMAL : KAI_EXIT_CRASHED);
 
     /* Wake awaiters. Each was parked in Spawn.await (Phase 2.3) or
      * Spawn.select (Phase 2.3). Walk the chain, clearing each
@@ -2907,6 +2954,21 @@ static KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *
     return kai_cont_resume(k, kai_unit());
 }
 
+/* Tier 2 trap-exit: set the current fiber's trap_exit flag from a
+ * Bool argument. With trap_exit=1, a linked peer's termination
+ * delivers a "Normal"/"Crashed" string to the fiber's mailbox
+ * instead of setting cancel_requested. The fiber must already
+ * have a mailbox (typically via with_mailbox) for the delivery to
+ * land; without one, the propagation falls back to cancel_requested.
+ * Spec: docs/actors.md §*Trap-exit semantics*. */
+static KaiValue *kai_default_spawn_set_trap_exit(void *self, KaiValue *on, KaiCont *k) {
+    (void) self;
+    KaiFiber *f = kai_current_fiber();
+    int v = (on && on->tag == KAI_BOOL && on->as.b) ? 1 : 0;
+    f->trap_exit = v;
+    return kai_cont_resume(k, kai_unit());
+}
+
 /* m8 #4 + Phase 3: default Cancel.raise handler. Doc B §`Cancel`/
  * Default handler: an unhandled Cancel.raise() unwinds the fiber
  * cleanly (the runtime delivers "no silent survivors"). For a
@@ -2964,18 +3026,34 @@ static void kai_link_add_bidirectional(KaiFiber *a, KaiFiber *b) {
 }
 
 /* Walk a fiber's linked chain at termination. For each peer:
- *   - set cancel_requested (delivered at peer's next yield point);
- *   - remove the back-pointer from peer->linked_head so the peer's
- *     own future termination doesn't re-enter our (now-freed) chain.
- * Each KaiLinkNode is freed as the walk passes it. */
-static void kai_link_propagate_terminate(KaiFiber *self) {
+ *   - if peer has trap_exit=1 AND a current mailbox, push a
+ *     "Normal" or "Crashed" KAI_STR (per `reason`) into the
+ *     mailbox. The peer learns of the termination in user code
+ *     and is NOT cancelled.
+ *   - otherwise, set cancel_requested (the v1 default — delivered
+ *     at the peer's next yield-point hook).
+ * In either branch, remove our back-link from the peer's chain so
+ * the peer's own future termination doesn't re-enter our (now-
+ * freed) chain. Each KaiLinkNode is freed as the walk passes it. */
+static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason) {
     KaiLinkNode *ln = self->linked_head;
     self->linked_head = NULL;
     while (ln) {
         KaiLinkNode *next = ln->next;
         KaiFiber *peer = ln->peer;
         if (peer) {
-            peer->cancel_requested = 1;
+            if (peer->trap_exit && peer->mailbox) {
+                /* Trap-exit delivery: push the reason string into the
+                 * peer's mailbox. The mailbox holds an owning ref on
+                 * each msg (kai_mailbox_push convention via
+                 * mailbox_send's incref). Wake any parked receiver
+                 * — that's exactly what kai_mailbox_push already does
+                 * via its recv_waiter handoff. */
+                const char *txt = (reason == KAI_EXIT_NORMAL) ? "Normal" : "Crashed";
+                kai_mailbox_push(peer->mailbox, kai_str(txt));
+            } else {
+                peer->cancel_requested = 1;
+            }
             /* Remove our back-link from peer's chain (linear scan;
              * v1 chains are short — typically 1-2 entries). */
             KaiLinkNode **slot = &peer->linked_head;
