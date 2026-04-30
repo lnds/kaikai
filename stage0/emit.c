@@ -1183,7 +1183,14 @@ static void emit_match(E *e, Node *m) {
         ls_pop_mark(e);
     }
     fputs("    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n", e->out);
-    fputs("} while (0); _r; })", e->out);
+    /* m5.x §4b: consume `_scr` linearly. Stage 0's eager-dup retrofit
+       wraps every multi-use local read in kai_internal_dup, so when the
+       scrutinee is a bare binding read it arrives as a fresh ref;
+       single-use, non-captured reads transfer the binding's own ref
+       (whose only consumer is this match). emit_pat_binds with
+       is_alias=true increfs each PBind so the bindings hold their own
+       refs and stay live past the decref below. */
+    fputs("} while (0); kai_decref(_scr); _r; })", e->out);
 }
 
 /* ---------- string literal (with interpolation) ---------- */

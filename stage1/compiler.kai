@@ -3794,11 +3794,17 @@ fn emit_match_arm(src: String, a: Arm, fns: [EFn], variants: [EVar], lams: [LamI
 
 fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], fns: [EFn], variants: [EVar], lams: [LamInfo], locals: [String]) : String {
   let sc = emit_expr(src,scrut, fns, variants, lams, locals)
+  # m5.x §4b: consume the scrutinee linearly. PBind in match arms
+  # increfs each binding (Step A is_alias=true), so the bindings own
+  # their own refs and `_scr` is free to be decrefed at exit. Multi-
+  # read let-bound names arrive pre-wrapped in `__perceus_dup` from
+  # the perceus_pass EStr + AST rewrite, so the bare-binding case is
+  # always single-use by the time the match sees it.
   concat_all([
     "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
     emit_match_arms(src, arms, fns, variants, lams, locals),
     "    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n",
-    "} while (0); _r; })"
+    "} while (0); kai_decref(_scr); _r; })"
   ])
 }
 
@@ -4979,6 +4985,10 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
         )
       } else { EVar(nm) }
     }
+    # §4b — interp bodies hide their EVar reads inside an opaque source
+    # span; mirror stage 2's surgical token rewrite so the inner reads
+    # also get `__perceus_dup` wraps.
+    EStr(span, is_triple) -> EStr(pcs_rewrite_estr_span(span, is_triple, scope, uses, in_lam), is_triple)
     ECall(f, xs) -> ECall(pcs_rewrite_expr(f, scope, uses, in_lam),
                           pcs_rewrite_exprs(xs, scope, uses, in_lam))
     EField(x, fname) -> EField(pcs_rewrite_expr(x, scope, uses, in_lam), fname)
@@ -5141,6 +5151,237 @@ fn pcs_count_non_lam_uses(nm: String, uses: [Use], acc: Int) : Int {
         } else {
           pcs_count_non_lam_uses(nm, rest, acc)
         }
+      }
+    }
+  }
+}
+
+# ---- m5.x §4b: rewrite EVar reads inside EStr interpolation bodies ----
+#
+# Mirror of stage 2's pcs_rewrite_estr_span. See stage2/compiler.kai
+# for the strategy writeup. Stage 1 carries a smaller ExprKind surface
+# (no EHandle / EBang / ELitUnit / EHole / etc.) so the dup-mark
+# walker covers fewer cases.
+
+type DupMark = DM(Int, Int)   # line, col of an EVar that needs wrapping
+
+fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
+                          uses: [Use], in_lam: Bool) : String {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  if not has_interp(span, body_start, body_end) { span }
+  else {
+    let parts = iscan_collect(span, body_end,
+                  IScan { parts: [], lit_start: body_start, i: body_start })
+    let new_parts = pcs_rewrite_iparts(parts, scope, uses, in_lam, [])
+    let body = pcs_concat_iparts(new_parts, "")
+    let prefix = if is_triple { "\"\"\"" } else { "\"" }
+    concat_all([prefix, body, prefix])
+  }
+}
+
+fn pcs_rewrite_iparts(parts: [IPart], scope: [String], uses: [Use],
+                       in_lam: Bool, acc: [IPart]) : [IPart] {
+  match parts {
+    [] -> list_reverse(acc)
+    [p, ...rest] -> {
+      let p1 = match p {
+        IpLit(_, _) -> p
+        IpExp(esrc) -> IpExp(pcs_rewrite_interp_src(esrc, scope, uses, in_lam))
+      }
+      pcs_rewrite_iparts(rest, scope, uses, in_lam, [p1, ...acc])
+    }
+  }
+}
+
+fn pcs_concat_iparts(parts: [IPart], acc: String) : String {
+  match parts {
+    [] -> acc
+    [p, ...rest] -> match p {
+      IpLit(piece, _) -> pcs_concat_iparts(rest, concat_all([acc, piece]))
+      # Build the `#{` opener from `"#"` + `"{"` — kaikai has no escape
+      # for `#{` in literals so a single `"#{"` would lex as the start
+      # of an unterminated interpolation.
+      IpExp(esrc) -> pcs_concat_iparts(rest, concat_all([acc, "#", "{", esrc, "}"]))
+    }
+  }
+}
+
+fn pcs_rewrite_interp_src(esrc: String, scope: [String], uses: [Use],
+                           in_lam: Bool) : String {
+  let toks = tokenize(esrc)
+  let prs = parser_new("<interp>", esrc, toks)
+  let r = parse_expr(prs)
+  match r.r {
+    None -> esrc
+    Some(parsed) -> {
+      let rewritten = pcs_rewrite_expr(parsed, scope, uses, in_lam)
+      let marks = pcs_dup_marks_expr(rewritten, [])
+      match marks {
+        [] -> esrc
+        _  -> pcs_render_with_marks(esrc, toks, marks, "", 0)
+      }
+    }
+  }
+}
+
+fn pcs_dup_marks_expr(e: Expr, acc: [DupMark]) : [DupMark] {
+  let acc1 = match e.kind {
+    ECall(f, xs) -> match f.kind {
+      EVar(nm) -> if nm == "__perceus_dup" {
+        match xs {
+          [arg] -> match arg.kind {
+            EVar(_) -> [DM(arg.line, arg.col), ...acc]
+            _ -> acc
+          }
+          _ -> acc
+        }
+      } else { acc }
+      _ -> acc
+    }
+    _ -> acc
+  }
+  pcs_dup_marks_subs(e.kind, acc1)
+}
+
+fn pcs_dup_marks_subs(k: ExprKind, acc: [DupMark]) : [DupMark] {
+  match k {
+    ECall(callee, args_) -> pcs_dup_marks_exprs(args_, pcs_dup_marks_expr(callee, acc))
+    EField(base, _) -> pcs_dup_marks_expr(base, acc)
+    EIndex(a, b) -> pcs_dup_marks_expr(b, pcs_dup_marks_expr(a, acc))
+    EBinop(_, a, b) -> pcs_dup_marks_expr(b, pcs_dup_marks_expr(a, acc))
+    EUnop(_, x) -> pcs_dup_marks_expr(x, acc)
+    EIf(c, t_, opt_e) -> {
+      let a1 = pcs_dup_marks_expr(c, acc)
+      let a2 = pcs_dup_marks_expr(t_, a1)
+      match opt_e {
+        None -> a2
+        Some(e2) -> pcs_dup_marks_expr(e2, a2)
+      }
+    }
+    EMatch(s, arms) -> pcs_dup_marks_arms(arms, pcs_dup_marks_expr(s, acc))
+    ELambda(_, body) -> pcs_dup_marks_expr(body, acc)
+    ERecordLit(_, fis) -> pcs_dup_marks_field_inits(fis, acc)
+    EList(es) -> pcs_dup_marks_list_elems(es, acc)
+    ERange(a, b, opt_step) -> {
+      let a1 = pcs_dup_marks_expr(a, acc)
+      let a2 = pcs_dup_marks_expr(b, a1)
+      match opt_step {
+        None -> a2
+        Some(s) -> pcs_dup_marks_expr(s, a2)
+      }
+    }
+    EBlock(stmts, opt_tail) -> {
+      let a1 = pcs_dup_marks_stmts(stmts, acc)
+      match opt_tail {
+        None -> a1
+        Some(t_) -> pcs_dup_marks_expr(t_, a1)
+      }
+    }
+    EPipe(l, r) -> pcs_dup_marks_expr(r, pcs_dup_marks_expr(l, acc))
+    _ -> acc
+  }
+}
+
+fn pcs_dup_marks_exprs(es: [Expr], acc: [DupMark]) : [DupMark] {
+  match es {
+    [] -> acc
+    [h, ...rest] -> pcs_dup_marks_exprs(rest, pcs_dup_marks_expr(h, acc))
+  }
+}
+
+fn pcs_dup_marks_arms(arms: [Arm], acc: [DupMark]) : [DupMark] {
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, body) -> {
+        let a1 = match opt_g {
+          None -> acc
+          Some(g) -> pcs_dup_marks_expr(g, acc)
+        }
+        let a2 = pcs_dup_marks_expr(body, a1)
+        pcs_dup_marks_arms(rest, a2)
+      }
+    }
+  }
+}
+
+fn pcs_dup_marks_field_inits(fis: [FieldInit], acc: [DupMark]) : [DupMark] {
+  match fis {
+    [] -> acc
+    [h, ...rest] -> match h {
+      FI(_, e) -> pcs_dup_marks_field_inits(rest, pcs_dup_marks_expr(e, acc))
+    }
+  }
+}
+
+fn pcs_dup_marks_list_elems(es: [ListElem], acc: [DupMark]) : [DupMark] {
+  match es {
+    [] -> acc
+    [h, ...rest] -> {
+      let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+      pcs_dup_marks_list_elems(rest, pcs_dup_marks_expr(inner, acc))
+    }
+  }
+}
+
+fn pcs_dup_marks_stmts(ss: [Stmt], acc: [DupMark]) : [DupMark] {
+  match ss {
+    [] -> acc
+    [h, ...rest] -> {
+      let acc1 = match h {
+        SLet(_, _, rhs) -> pcs_dup_marks_expr(rhs, acc)
+        SAssert(c, opt_m) -> {
+          let a1 = pcs_dup_marks_expr(c, acc)
+          match opt_m {
+            None -> a1
+            Some(m) -> pcs_dup_marks_expr(m, a1)
+          }
+        }
+        SExprStmt(e) -> pcs_dup_marks_expr(e, acc)
+      }
+      pcs_dup_marks_stmts(rest, acc1)
+    }
+  }
+}
+
+fn pcs_dup_mark_has(marks: [DupMark], line: Int, col: Int) : Bool {
+  match marks {
+    [] -> false
+    [h, ...rest] -> match h {
+      DM(l, c) ->
+        if l == line and c == col { true }
+        else { pcs_dup_mark_has(rest, line, col) }
+    }
+  }
+}
+
+fn pcs_render_with_marks(esrc: String, toks: [Token], marks: [DupMark],
+                           acc: String, prev_end: Int) : String {
+  match toks {
+    [] -> concat_all([acc, string_slice(esrc, prev_end, string_length(esrc) - prev_end)])
+    [t, ...rest] -> match t.kind {
+      TkEof -> concat_all([acc, string_slice(esrc, prev_end, string_length(esrc) - prev_end)])
+      TkIdent ->
+        if pcs_dup_mark_has(marks, t.line, t.col) {
+          let between = string_slice(esrc, prev_end, t.start - prev_end)
+          let txt = string_slice(esrc, t.start, t.length)
+          let chunk = concat_all([between, "__perceus_dup(", txt, ")"])
+          pcs_render_with_marks(esrc, rest, marks,
+                                  concat_all([acc, chunk]),
+                                  t.start + t.length)
+        } else {
+          let chunk = string_slice(esrc, prev_end, (t.start + t.length) - prev_end)
+          pcs_render_with_marks(esrc, rest, marks,
+                                  concat_all([acc, chunk]),
+                                  t.start + t.length)
+        }
+      _ -> {
+        let chunk = string_slice(esrc, prev_end, (t.start + t.length) - prev_end)
+        pcs_render_with_marks(esrc, rest, marks,
+                                concat_all([acc, chunk]),
+                                t.start + t.length)
       }
     }
   }

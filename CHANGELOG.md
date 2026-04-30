@@ -9,6 +9,47 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+#### Changed
+
+- **`perceus_pass` now wraps multi-read EVar reads inside string
+  interpolation bodies in `__perceus_dup`** (stage 1 + stage 2;
+  closes `docs/m5x-followup.md` §4b and the architectural debt
+  pinned in `docs/perceus-honesty-targets.md`). The collector
+  already counted reads buried in `#{...}` correctly, but the
+  rewriter could not transform an opaque source span. The new
+  `pcs_rewrite_estr_span` re-tokenises and re-parses each interp
+  body, threads the parsed Expr through `pcs_rewrite_expr`, then
+  surgically rewrites the source by replacing wrapped ident
+  tokens with `__perceus_dup(NAME)`. The result rounds back
+  through the parser at emit time as a regular ECall.
+- **`emit_match_expr` (stages 0 + 1 + 2) now consumes the
+  scrutinee linearly** at match exit (`kai_decref(_scr)`). The
+  R3 amend's net-zero `kai_incref(_scr)` … `kai_decref(_scr)`
+  bracket in stage 2 drops after §4b made multi-read bare reads
+  always arrive pre-wrapped in `__perceus_dup`. Stages 0 and 1
+  pick up the exit decref so the kaic1 / kaic2 binaries
+  themselves stop leaking match scrutinees during their own
+  runtime.
+
+#### Numbers
+
+`kaic2` self-compile under `KAI_TRACE_RC` (compared to the
+post-Tier 2 partials baseline pinned in
+`docs/perceus-honesty-targets.md`):
+
+| metric        | partials baseline | + §4b + match scr  |
+|---------------|------------------:|-------------------:|
+| alloc_total   |             33.5M |              34.2M |
+| free_total    |              8.2M |              20.8M |
+| leaked        |             25.4M |              13.4M |
+| live_peak     |             25.4M |              13.4M |
+
+`leaked` cut by 47% (25.4M → 13.4M) on top of the partials
+landed earlier in the day. Selfhost (stage 1 + stage 2 + LLVM)
+byte-identical, `make tier0` clean, demos baseline 24 holds,
+R3 closed-loop fixture (`examples/effects/
+interp_recursive_walk.kai`) green.
+
 ## [0.16.0] — 2026-04-29 (Fibers Tier 1 #2 — stack guard pages)
 
 Closes the second and final Fibers Tier 1 item (`docs/fibers-honesty-targets.md`).
