@@ -146,20 +146,49 @@ Adjacent rules every agent must apply:
   bug outside your lane, document it in `docs/known-regressions.md`
   with repro + hypothesis, do not fix it inline. The L2 wrong-lane
   revert from 2026-04-29 is the precedent.
-- **VERSION + CHANGELOG**: do NOT bump the version yourself. Add
-  your closing-commit entry to `CHANGELOG.md` under the existing
-  `## [Unreleased]` section and **leave `VERSION` untouched**. The
-  integrator (the human merging the PR) assigns the final version
-  number at merge time, in the merge commit. This is required
-  because parallel lanes can not know each other's order of merge:
-  on 2026-04-29 three agents (PR #24 / #25 / #26) all asked for
-  the same `0.12.0` because each was opened against the same
+- **VERSION + CHANGELOG (agent side)**: do NOT bump the version
+  yourself. Add your closing-commit entry to `CHANGELOG.md` under
+  the existing `## [Unreleased]` section and **leave `VERSION`
+  untouched**. The integrator (the human merging the PR) assigns
+  the final version number after merge. This rule exists because
+  parallel lanes cannot know each other's order of merge: on
+  2026-04-29 three agents (PR #24 / #25 / #26) all asked for the
+  same `0.12.0` because each was opened against the same
   baseline; the integrator had to bump them to 0.12.0 / 0.13.0 /
   0.14.0 by hand. Leaving `VERSION` and the section header alone
-  in the PR avoids that work — the merge commit promotes the
-  Unreleased entry to a versioned section in one step. The PR
-  description may suggest the *next* number, but treat it as
-  advisory only.
+  in the PR avoids that work. The PR description may suggest the
+  *next* number, but treat it as advisory only.
+
+- **Integrator workflow (post-CI)**: the integrator no longer
+  performs a local merge dance. Once tier1 is green on the PR, the
+  flow is:
+
+      # 1. Merge via gh — gh creates the merge commit on GitHub.
+      gh pr merge <N> --merge \
+        --subject "Merge pull request #<N> from <branch>" \
+        --body "$(cat <<EOF
+      <descriptive body — same style as past merges, e.g. f9a8822>
+      EOF
+      )"
+
+      # 2. Release commit on main — promotes [Unreleased] and
+      # bumps VERSION. Goes direct to main (admin bypass on
+      # branch protection).
+      git pull --ff-only origin main
+      $EDITOR VERSION CHANGELOG.md   # bump + rename header
+      git add VERSION CHANGELOG.md
+      git commit -m "release: 0.X.Y — promote [Unreleased]"
+      git push origin main
+
+  The release commit is its own commit, not bundled inside the
+  merge commit. There is a brief window (seconds) where main
+  has the new content under `[Unreleased]` and the old
+  `VERSION`; immaterial for an MVP-stage compiler. The
+  integrator decides the version number after seeing what
+  parallel lanes already took. The advantage over the prior
+  local-merge-dance: ~30s per merge instead of ~5–7 min, no
+  manual tier1 validation (CI did it), and the flow is
+  mechanizable — an agent can perform it given a brief.
 - **`make daily` failures are diagnostics, not blockers.** Tier 0
   / Tier 1 already gated every commit, so `main` stays unbroken.
   A `daily` failure opens a lane the next morning; do not jam
