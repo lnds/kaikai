@@ -248,35 +248,47 @@ Selfhost C + LLVM byte-identical, `make test` clean,
 self-emit (`kaic2 --emit=llvm stage2/compiler.kai`) now contains 11
 `kaix_decref` call sites, confirming the pass is active.
 
-### 4b. perceus_pass should dup let-bound vars read multiple times across an expression tree *(R3 follow-up, OPEN 2026-04-29)*
+### 4b. perceus_pass should dup let-bound vars read multiple times across an expression tree *(LANDED 2026-04-29 evening — perceus-tier-2 lane)*
 
-`emit_match_expr` currently brackets the match in
-`KaiValue *_scr = kai_incref(<scrutinee>)` … `kai_decref(_scr)`
-because perceus_pass does not yet emit `__perceus_dup` for
-let-bound variables that appear more than once across an
-expression tree such as
+Root cause confirmed by inspection: the collector walked through
+each interp body's parsed Expr and counted multi-reads correctly,
+but `pcs_rewrite_kind`'s `EStr(_, _)` case fell through to
+`map_expr_kind` which treats the span as opaque and returns it
+unchanged. The inner reads inside `#{...}` were never wrapped in
+`__perceus_dup`, even though the outer use-count was ≥ 2.
 
-```
-print("#{show(e)} = #{int_to_string(eval(e))}")
-```
+**Fix landed**: `pcs_rewrite_estr_span` (stage 1 + stage 2). For
+each `#{esrc}` body, re-tokenise + re-parse the source, run
+`pcs_rewrite_expr` on the parsed Expr (which encodes wrap
+decisions in the AST), then walk the rewritten Expr to collect a
+`[DupMark]` of (line, col) for each EVar wrapped in
+`__perceus_dup`. Token positions in the original `esrc` give us
+exact source offsets, so we walk the original tokens and replace
+each marked TkIdent with `__perceus_dup(NAME)` while copying the
+surrounding source verbatim. The reassembled span rounds back
+through the parser at emit time as a regular ECall — no printer
+needed.
 
-`e` is read twice (in `show(e)` and in `eval(e)`), but neither
-call site wraps it in `__perceus_dup`. The match decref in
-`9fe6f6d` exposed this — see R3 in `docs/known-regressions.md`
-for the full root-cause writeup.
+Required spelling `"#"`+`"{"` (kaikai has no escape for `#{` in
+literals; a bare `"#{"` lexes as the start of an unterminated
+interp).
 
-**Fix path**: extend perceus_pass to count reads of every
-let-bound name across the whole expression tree (not just the
-immediate stmt list). When count ≥ 2, every read except the last
-becomes `__perceus_dup(<name>)`. The "dup all ≥ 2 non-lam uses"
-rule in `pcs_count_non_lam_uses` is the right shape; it currently
-visits a single stmt list per scope, which misses uses that live
-inside nested expression children of the same parent.
+With §4b in place, `emit_match_expr`'s entry incref / exit decref
+bracket dropped to recover the original 9fe6f6d shape (linear
+consumption of `_scr`). Stages 0 and 1 also picked up the exit
+decref so the kaic1 / kaic2 binaries themselves stop leaking
+match scrutinees during their own runtime.
 
-**Cost**: ~1d. Once it lands, `emit_match_expr`'s entry incref
-can drop again and the match-scrutinee piece of `9fe6f6d`'s leak
-savings comes back (~0.7M allocs on kaic2 self-compile, rough
-estimate from the original commit's numbers).
+Numbers (`kaic2` self-compile, `KAI_TRACE_RC`):
+
+| metric        | partials baseline | + §4b + match scr  |
+|---------------|------------------:|-------------------:|
+| alloc_total   |             33.5M |              34.2M |
+| free_total    |              8.2M |              20.8M |
+| leaked        |             25.4M |              13.4M |
+| live_peak     |             25.4M |              13.4M |
+
+`leaked` cut by 47% on top of the partials.
 
 ### 5. Full Perceus (post-m5 milestone)
 

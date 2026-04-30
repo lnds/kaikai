@@ -14,7 +14,19 @@ required for which honesty claim*.
 Sister doc: `docs/fibers-honesty-targets.md` (same shape, applied to
 the m8.x scheduler).
 
-## Where we are today (2026-04-29)
+## Where we are today (2026-04-29 evening — perceus-tier-2 lane)
+
+Tier 2 architectural debt closed. Three items landed in one lane:
+`pcs_rewrite_estr_span` (closes §4b), match-scrutinee real plug
+(stages 0 + 1 + 2), and `kai_field_borrow` for pat_test
+(record-pattern test paths). `leaked` cut from 25.4 M to
+13.4 M (−47%) on `kaic2` self-compile. Selfhost (stage 1 +
+stage 2 + LLVM) byte-identical, R3 closed-loop fixture
+(`examples/effects/interp_recursive_walk.kai`) still green
+without the workaround. Tier 2 mechanical follow-throughs left:
+remaining `kai_prelude_*` helpers + stage 0 eager-dup retrofit
+cleanup; together those should bring `leaked` under the < 5 M
+threshold.
 
 R1 atomic flip landed v0.2.0 (2026-04-28):
 
@@ -32,14 +44,14 @@ R1 atomic flip landed v0.2.0 (2026-04-28):
 
 Numbers on `kaic2` self-compile (KAI_TRACE_RC):
 
-| metric        | pre-m5  | m5 #7   | Phase 1 (inert) | Phase 3 (flip) | + Tier 2 partial (2026-04-29 evening) |
-|---------------|--------:|--------:|----------------:|---------------:|--------------------------------------:|
-| alloc_total   | 130.7 M | 29.5 M  | 33.0 M          | 69.7 M         | (similar)                             |
-| free_total    | 3.5 M   | 37      | 39              | 22.8 M         | (higher)                              |
-| leaked        | 127.2 M | 29.5 M  | 33.0 M          | 46.9 M         | **23.8 M** (−49%)                     |
-| live_peak     | 127.2 M | 29.5 M  | 33.0 M          | 46.9 M         | (similar)                             |
-| max RSS       | 6.25 GB | n/a     | n/a             | 3.02 GB        | (untouched, Tier 2 hasn't moved RSS)  |
-| wall time     | 2.15 s  | n/a     | n/a             | 5.74 s         | (untouched, expected to recover with kai_field/pat_test balance) |
+| metric        | pre-m5  | m5 #7   | Phase 1 (inert) | Phase 3 (flip) | + Tier 2 partial (2026-04-29) | + perceus-tier-2 (§4b + match + field) |
+|---------------|--------:|--------:|----------------:|---------------:|------------------------------:|--------------------------------------:|
+| alloc_total   | 130.7 M | 29.5 M  | 33.0 M          | 69.7 M         | 33.5 M                        | 34.3 M                                |
+| free_total    | 3.5 M   | 37      | 39              | 22.8 M         | 8.2 M                         | 20.8 M                                |
+| leaked        | 127.2 M | 29.5 M  | 33.0 M          | 46.9 M         | 25.4 M                        | **13.4 M** (−47%)                     |
+| live_peak     | 127.2 M | 29.5 M  | 33.0 M          | 46.9 M         | 25.4 M                        | 13.4 M                                |
+| max RSS       | 6.25 GB | n/a     | n/a             | 3.02 GB        | (similar)                     | (similar)                             |
+| wall time     | 2.15 s  | n/a     | n/a             | 5.74 s         | (similar)                     | (similar)                             |
 
 The flip cut RSS in half and started calling `free` (~23 M times,
 vs 37 calls pre-flip). Four Tier 2 partial-landings on
@@ -58,24 +70,14 @@ match-test phase.
 
 ## What does NOT work today
 
-Five named leak sources (all in `docs/m5x-followup.md` §4b–§5):
+Two named leak sources remain (`docs/m5x-followup.md` §1 step 2c
+notes + §5):
 
-- **Match scrutinee net-zero workaround** — `emit_match_expr`
-  brackets the body in `kai_incref(_scr)` … `kai_decref(_scr)`
-  to preserve callsite refcount. Net zero, no leak reduction.
-  The original 9fe6f6d shape decref'd whatever the scrutinee
-  expression returned — fine when transferred, UAF when read.
-  R3 in `docs/known-regressions.md` documents why we backed off.
 - **`kai_truthy` non-consuming** — intentional. The LLVM
   short-circuit phi returns `lhs` in the early-exit branch, so
   consuming the truthy probe's argument would alias-free a
   value still referenced downstream. Pinned in
   `m5x-followup.md` Step C.
-- **`kai_field` increfs without paired decref** — `pat_test`
-  reads call `kai_field` repeatedly on the same scrutinee; each
-  call increfs but no path decrefs the returned cells when the
-  test fails its arm. Result: every match arm leaks one ref per
-  field tested.
 - **`kai_prelude_*` C helpers leak their params** — 9fe6f6d
   closed 12 of them (print/eprint, int/real string conversion,
   array & list ops). The remaining hand-written prelude
@@ -91,13 +93,15 @@ Five named leak sources (all in `docs/m5x-followup.md` §4b–§5):
   follow-up. Each remaining wrap leaks one ref per read inside
   `kaic1`'s emitted code.
 
-Plus one architectural debt:
+Closed in the perceus-tier-2 lane (2026-04-29 evening):
 
-- **`perceus_pass` does not dup multi-read let-bound vars across
-  expression trees** — root cause of R3 (`interp.kai` panic).
-  Documented as §4b in `m5x-followup.md`. Once fixed, the
-  match-scrutinee net-zero workaround can drop and recover its
-  ~0.7 M allocs of savings.
+- ~~Match scrutinee net-zero workaround~~ — replaced by
+  linear consumption (`kai_decref(_scr)` at exit) once §4b
+  removed the precondition.
+- ~~`kai_field` increfs without paired decref in pat_test~~ —
+  added `kai_field_borrow` for read-only test paths.
+- ~~`perceus_pass` does not dup multi-read let-bound vars
+  across expression trees~~ — closed by `pcs_rewrite_estr_span`.
 
 ## Tier 1 — *Show HN honest* (~0 days)
 
@@ -116,18 +120,19 @@ debt that surfaces below the Tier 2 boundary.
 The set that lets the project drop "RC is partial" caveats and
 claim "Tier 1 #2 (runtime-efficient) holds without footnotes".
 
-| Item | Cost | Why |
+| Item | Cost | Status |
 |---|---:|---|
-| **`perceus_pass` multi-read let dup** | ~1d | Root-cause fix for R3; closes §4b in `m5x-followup.md`; recovers ~0.7 M allocs of match savings |
-| **Match-scrutinee real plug** | ~0.5d | Drop the net-zero workaround once §4b lands; recover the original 9fe6f6d savings |
-| **`kai_field` / `pat_test` balance** | ~1–2d | Decref the increfed cells when the test fails its arm; biggest of the named leaks (per-arm × per-field) |
+| ~~**`perceus_pass` multi-read let dup**~~ | ~~~1d~~ | **LANDED 2026-04-29 evening (perceus-tier-2 lane).** §4b closed: `pcs_rewrite_estr_span` walks each `#{...}` body, runs the parsed Expr through `pcs_rewrite_expr`, and surgically rewrites the span. |
+| ~~**Match-scrutinee real plug**~~ | ~~~0.5d~~ | **LANDED 2026-04-29 evening (perceus-tier-2 lane).** Workaround dropped from `emit_match_expr`; stages 0 + 1 picked up the exit decref so kaic1 / kaic2 binaries also stop leaking match scrutinees. |
+| ~~**`kai_field` / `pat_test` balance**~~ | ~~~1–2d~~ | **LANDED 2026-04-29 evening (perceus-tier-2 lane).** Added `kai_field_borrow` runtime helper + `kaix_field_borrow` LLVM symmetric; switched record-pattern test paths in stage 0 / 1 / 2 emitters. Smaller measurable impact than expected on `kaic2` self-compile (only 1 record-pattern test in stage 2's source) but a correctness win for record-heavy programs. |
 | **Remaining `kai_prelude_*` helpers** | ~1–2d | Audit every hand-written `kai_prelude_*` in `runtime.h`; flip the borrowing helpers to callee-consume, mirror the 9fe6f6d 12-helper pattern |
 | **Stage 0 eager-dup retrofit cleanup** | ~0.5–1d | Single-use, non-captured fast path landed in `7ab3d64` (params) + `b3b1e2f` (lets + match arms). What's left: per-lambda-body counter to extend the same fast path to lambda-local lets, and a Perceus-style decref insertion at scope exit so the multi-use majority stops leaking. |
 
-After this set, `leaked` should drop from 46.9 M to **< 5 M**
-(threshold: noise floor of constant-pool reuse). RSS stays
-≤ 3 GB but stable across runs; wall time recovers some of the
-+2.7× regression once the redundant dups disappear.
+After the **3 closed items**, `leaked` dropped from 25.4 M to
+**13.4 M (−47%)**. The remaining ~13 M needs the prelude helpers
+audit + stage 0 eager-dup cleanup to push under the < 5 M
+threshold; the named architectural debt (perceus_pass §4b,
+match-scrutinee, kai_field balance) is now closed.
 
 ## Tier 3 — *Full Perceus* (post-MVP)
 
