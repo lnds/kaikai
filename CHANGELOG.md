@@ -9,6 +9,21 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Changed
+
+- **Spawn ops now carry per-op `[T]` (m7b #2a retrofitted to
+  `builtin_spawn_decl`).** `Spawn.spawn(thunk) : Fiber[T]`,
+  `Spawn.await(f) : T`, `Spawn.select(fs) : T`, `Spawn.cancel(f) :
+  Unit` — `await` / `select` no longer return `Nothing` (TyAny)
+  and the typed `Fiber[T]` flow is observable end-to-end. The
+  `spawn` op keeps `thunk: Nothing` until per-op ROW generics
+  land (`spawn[T, e](f: () -> T / e)`); without them the wrappers
+  in `stdlib/spawn.kai` would lose the row propagation they
+  provide. Coverage: `examples/effects/m8_spawn_per_op_generics.kai`.
+  Closes the Spawn-API line item from
+  `docs/fibers-honesty-targets.md` Tier 2 (partial — TYPE generics
+  done; ROW generics tracked in `docs/m8x-followup.md` §7).
+
 ## [0.19.0] — 2026-04-30 (m13 bit ops chunk — twelve compiler intrinsics on `Int`)
 
 ### Added

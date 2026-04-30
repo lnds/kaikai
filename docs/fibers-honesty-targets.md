@@ -60,8 +60,15 @@ What does **not** work today:
   `"Crashed"` into the fiber's mailbox instead of setting
   `cancel_requested`. Coverage: `examples/effects/m8_trap_exit.kai`
   + `stage2/tests/link_runtime_test.c`.
-- Spawn API still uses pre-m7b #2 typing shape — per-op generics
-  were not retrofitted when m7b #2 closed.
+- ~~Spawn API still uses pre-m7b #2 typing shape — per-op generics
+  were not retrofitted when m7b #2 closed.~~ **Partial 2026-04-30**
+  (Fibers Tier 2 lane). The four Fiber-shaped ops (`spawn`,
+  `await`, `select`, `cancel`) now carry `[T]`, so `Spawn.await(f)`
+  flows back as `T` instead of TyAny. Per-op ROW generics
+  (`spawn[T, e](f: () -> T / e)`) is a separate extension still
+  pending; the wrappers in `stdlib/spawn.kai` keep absorbing the
+  thunk's open row via TyAny. Coverage:
+  `examples/effects/m8_spawn_per_op_generics.kai`.
 
 ## Tier 1 — *Show HN honest* (~1 day)
 
@@ -92,7 +99,7 @@ can be parallelised across short lanes.
 | **Region-brand full machinery** | ~3–5d | `TyBranded` propagation through let / match / fn args; closes the sum-type-payload escape hatch from Phase 6 v1 shallow |
 | **LLVM op-dispatch `in_dispatch_node`** | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend |
 | ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
-| **Per-op generics in Spawn API** | ~0.5d | m7b #2 cleanup; pinned in `docs/effects-impl.md` §m7b #2 |
+| ~~**Per-op generics in Spawn API**~~ ✅ partial 2026-04-30 | ~0.5d | TYPE generics retrofitted on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk still pending (`docs/m8x-followup.md` §7) |
 
 After this set, `docs/effects.md`, `docs/structured-concurrency.md`,
 `docs/actors.md`, and `docs/fibers-impl.md` claims are all
