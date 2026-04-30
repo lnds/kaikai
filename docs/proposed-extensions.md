@@ -957,6 +957,28 @@ and encoding stdlib modules planned for m14 lean on this; landing
 the intrinsics just before keeps that stdlib code performant
 without resorting to FFI.
 
+### Status — flat-prefix subset landed
+
+The intrinsic chunk shipped in m13 with twelve flat-prefix names
+(`bit_and` / `bit_or` / `bit_xor` / `bit_not` / `bit_shl` /
+`bit_shr` / `bit_ushr` / `bit_count` / `bit_test` / `bit_set` /
+`bit_clear` / `bit_toggle`). Registered in the typer's intrinsic
+table, lowered inline by `emit_call_value` to the matching C
+operator with zero call overhead. Documentation lives in
+`stdlib/math/bits.kai` (header-only — no bodies, since the typer
+recognises the names directly). Fixture and structural assertion
+in `examples/stdlib/bits_basic.kai` plus `stage2/Makefile`
+`test-stdlib`.
+
+The dotted `bit.*` surface and the auxiliary helpers
+(`leading_zeros`, `trailing_zeros`, `rotate_left`,
+`rotate_right`) remain open for a follow-up. `bit_count` covers
+the popcount slot. The dotted surface is one m14-style qualified
+namespace away — once a `bit` module is registered as a
+`ModuleEntry`, `bit.and(a, b)` resolves to the existing
+`bit_and` intrinsic via the prefix-fallback in
+`me_lookup_export`.
+
 ## 17. `Map[K, V]` — hash-map / associative container
 
 ```kai
