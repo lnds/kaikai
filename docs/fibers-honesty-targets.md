@@ -55,10 +55,16 @@ What does **not** work today:
   becomes a bare pid — reason distinction (Normal / Crashed)
   is reachable today through Link + trap_exit. Coverage:
   `examples/effects/m8_monitor.kai`.
-- `Fiber[T]` / `Pid[Msg]` region brand is shallow. A `Fiber`
-  embedded inside a sum-type constructor's payload escapes the
-  shallow check — full machinery (TyBranded propagation through
-  every binding form) deferred.
+- `Fiber[T]` / `Pid[Msg]` region brand is shallow. The shallow
+  walk now symmetrises Fiber and Pid (Tier 2 extension,
+  2026-04-30 — `examples/effects/m8x_6_pid_escapes.kai`), but a
+  `Fiber` / `Pid` embedded inside a *user-defined* sum-type
+  constructor's payload still escapes the shallow check. The full
+  TyBranded machinery (propagation through every binding form,
+  brand-mismatch detection between sibling nurseries) is the
+  long-term shape pinned in `docs/structured-concurrency.md`
+  §*Type system* and deferred to a future lane —
+  `docs/m8x-followup.md` §6 captures the residual work.
 - ~~LLVM op-dispatch (`llvm_emit_op_dispatch`) does not carry the
   `in_dispatch_node` flag. The same bug #12 shape exists in the
   LLVM backend, hidden until someone hits a self-delegating
@@ -116,7 +122,7 @@ can be parallelised across short lanes.
 | ~~R4 — fiber-discard deadlock~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
 | ~~Stack guard pages~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
 | ~~**Monitor + `spawn_actor`**~~ ✅ shipped 2026-04-30 | ~2–3d | Phase 5.5+ in `m8x-followup.md` §5 retrofitted; runtime walker mirrors Link + trap-exit, MonitorRef simplified to Pid[Nothing] in v1 |
-| **Region-brand full machinery** | ~3–5d | `TyBranded` propagation through let / match / fn args; closes the sum-type-payload escape hatch from Phase 6 v1 shallow |
+| **Region-brand full machinery** ⚠ partial 2026-04-30 | ~3–5d | Pid symmetric with Fiber in the shallow check; full `TyBranded` propagation (sum-type-payload escape + brand-mismatch detection) still pending — `docs/m8x-followup.md` §6 |
 | ~~**LLVM op-dispatch `in_dispatch_node`**~~ ✅ shipped 2026-04-30 | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend — three runtime helpers (`kaix_evidence_lookup_node` / `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the KaiFiber struct out of the IR |
 | ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
 | ~~**Per-op generics in Spawn API**~~ ✅ partial 2026-04-30 | ~0.5d | TYPE generics retrofitted on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk still pending (`docs/m8x-followup.md` §7) |

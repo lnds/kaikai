@@ -150,9 +150,9 @@ unit test exercising both reasons + the no-mailbox fallback).
 
 Spec: Doc actors.md §*Supervision: links and monitors*.
 
-### 6. Full region-brand machinery for `Fiber[T]` / `Pid[Msg]` — ⚠ v1 shallow
+### 6. Full region-brand machinery for `Fiber[T]` / `Pid[Msg]` — ⚠ partial
 
-**Phase 6 v1** ships the existing shallow check
+**Phase 6 v1** shipped the existing shallow check
 (`ty_expr_contains_fiber` recursive walk through TyName / TyList /
 TyFn / TyDim / TyRefine looking for `Fiber`) plus a generalised
 allow-list (`fiber_producer_helpers` in `stage2/compiler.kai`).
@@ -160,22 +160,42 @@ Regression test `examples/effects/m8x_6_fiber_in_result.kai`
 covers the parametric-sum-type case (Fiber[T] embedded in
 `Result[String, Fiber[Int]]`).
 
-**Deferred to post-MVP**: the full machinery from
-`docs/structured-concurrency.md` §*Type system* — extend `Ty`
-with `TyBranded(Ty, BrandId)`, mint brands at handler-installation
-sites, propagate the brand through every binding form (let, match,
-list literal, record field, etc.), check escape at fn return /
-fn arg / record field. Closer to lifetime checking than to HM
-unification.
+**Tier 2 (2026-04-30) extension**: the shallow check now
+symmetrises Fiber and Pid. `ty_expr_contains_pid` mirrors
+`ty_expr_contains_fiber`; `check_no_fiber_escape` emits a
+Pid-shaped diagnostic when a non-stdlib helper returns a
+`Pid[Msg]` at any depth. The producer allow-list grew to include
+`alloc_for_policy` and `spawn_actor` from `stdlib/actor.kai`, the
+two legitimate Pid surface helpers. Coverage:
+`examples/effects/m8x_6_pid_escapes.kai`.
 
-**Known shallow-check gaps** (not caught by v1):
-- Custom sum types with Fiber in a constructor payload but no
-  `Fiber` in the type's name or args (e.g. `type Boxed = Wrapper(Fiber[Int])`
-  — return type `Boxed` hides Fiber from the walker).
-- `Pid[Msg]` escape checks (Pid would need the same brand
-  machinery; v1 only checks Fiber).
-- Brand mismatch between sibling nurseries (only the lexical-
-  walking version detects nursery scope, not the shallow check).
+**Still pending** — the full TyBranded(Ty, BrandId) machinery from
+`docs/structured-concurrency.md` §*Type system* covers two gaps
+the shallow walk cannot:
+
+- *Sum-type-wrapped escape.* A `type Boxed = Wrapper(Fiber[Int])`
+  return value hides Fiber from the TypeExpr walker (the type's
+  name is `Boxed`; constructor payloads are recorded in the
+  variant table, not in the TypeExpr the walker sees). Closing
+  this gap requires either (a) a TypeExpr-level "transitively
+  contains a banned handle" check that consults the variant
+  table, or (b) the full TyBranded propagation that tracks brands
+  through every binding form (let, match, list literal, record
+  field, fn arg, fn return). Option (a) is a tractable Tier 2
+  follow-up; option (b) is the spec'd long-term shape.
+- *Brand mismatch between sibling nurseries.* Detecting that a
+  Fiber spawned in nursery `n1` is being passed into a `n2.spawn`
+  body needs lifetime-shaped tracking — fundamentally a
+  TyBranded(Ty, BrandId) feature, not a TypeExpr walk.
+
+Reason for the partial delivery (Fibers Tier 2 lane, 2026-04-30):
+the shipping pieces (Pid symmetry, allow-list extension) are
+mechanical, hold selfhost byte-identical, and unblock honest
+"Fiber[T] / Pid[Msg] are scope-bound" claims for the docs. The
+full TyBranded machinery is a multi-day typer-deep change with
+real selfhost risk; deferring it lets the rest of Tier 2 close
+without that risk and matches the brief's
+*if-stuck-defer-with-rationale* path.
 
 ### 7. Per-op type generics on the Spawn ops — ⚠ partial (Tier 2 lane)
 

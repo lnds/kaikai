@@ -11,6 +11,18 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Added
 
+- **`Pid[Msg]` region-brand check now symmetrises with `Fiber[T]`.**
+  `check_no_fiber_escape` rejects any non-stdlib helper that
+  returns a `Pid[Msg]` at any nesting depth, with a Pid-shaped
+  diagnostic. The producer allow-list grew to include
+  `alloc_for_policy` and `spawn_actor` from `stdlib/actor.kai`,
+  the two legitimate Pid surface helpers. The full
+  `TyBranded(Ty, BrandId)` machinery — propagation through every
+  binding form, sum-type-payload escape, brand-mismatch detection
+  between sibling nurseries — is still pending and pinned in
+  `docs/m8x-followup.md` §6. Coverage:
+  `examples/effects/m8x_6_pid_escapes.kai`.
+
 - **`Monitor.monitor(pid)` + `Monitor.demonitor(ref)` are now
   end-to-end primitives (Tier 2 supervision).** The Monitor
   effect was type-surface-only before; the runtime now
