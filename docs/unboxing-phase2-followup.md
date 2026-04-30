@@ -48,6 +48,45 @@ analogous to `examples/perceus/unbox_bench.kai` that asserts
 the inner loop lowers to `i64` IR with no
 `call %KaiValue* @kaix_int` inside.
 
+## Stage 1 mirror (M7 deferred work)
+
+Stage 1's `Expr` carries no `ty` field — stage 1 is the
+bootstrap intermediate compiler and does not run type
+inference. The unbox pass as written in stage 2 keys on
+`Expr.ty` (`TyInt` / `TyBool` / `TyChar`) to decide which
+nodes are unboxable. Without that information, the only
+syntactic signals available are:
+
+- `EInt` / `EBool` / `EChar` literals (trivially unboxable).
+- `EBinop` arithmetic (could be `Int` *or* `Real` — stage 1
+  does parse `Real` literals, so a blind "treat all numeric
+  binops as Int" rule would corrupt floating-point code).
+
+The faithful port would either:
+
+1. Add a tiny syntactic-only type oracle to stage 1 (look at
+   the binop's operands' literal shape) and only unbox when
+   one side is an `EInt` literal. Maybe ~120 lines, brittle.
+2. Add a real type pass to stage 1. Definitely past 80 lines
+   and conflicts with stage 1's "minimal kaikai → C bootstrap"
+   role.
+
+Per `docs/unboxing-phase2-design.md` §Risks:
+
+> If the mirror balloons past ~80 lines, that is a signal the
+> stage 2 design is too coupled; bail out and re-think the
+> pass shape rather than forcing the mirror.
+
+The mirror balloons past 80 lines on inspection. Skipping is
+the right call: stage 1 only matters for bootstrap (compiling
+`stage2/compiler.kai`); user code always runs through stage 2
+and gets the full Phase 2 speedup. Bootstrap perf is
+irrelevant.
+
+If stage 1 ever grows a real type pass for an unrelated
+reason, the unbox port is a one-day follow-up. Otherwise this
+item stays parked.
+
 ## Loop driver TCO regression (out of scope, observed during M3)
 
 The `bench_loop` recursion in

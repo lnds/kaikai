@@ -9,6 +9,44 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **Unboxing Phase 2 (Tier 2.5) — locals + arithmetic stay raw
+  inside the C backend.** A new `unbox_pass` between
+  monomorphisation and `perceus_pass` analyses every function
+  body and decides, per `Expr` node, whether the value lives as
+  a raw C scalar (`int64_t` / `int` / `uint32_t`) or as a boxed
+  `KaiValue *`. Local `let` bindings whose RHS is a numeric
+  `Int` arithmetic chain collapse to `int64_t kair_<name>` C
+  storage; comparisons, short-circuiting `and` / `or`, the
+  `EIf` condition slot, and literal-arm `match` scrutinees all
+  fall out of the same `MUnboxed` reasoning.
+  - The Phase 1 small-int + char cache stays — it pays off at
+    every `MUnboxed → MBoxed` boundary.
+  - Function parameters and return values stay boxed (Phase 2
+    non-goal #1). Closure captures stay boxed (a candidate raw
+    binding referenced from an inner ELambda is demoted to
+    `MBoxed` at the `let` site).
+  - Perceus coordination: raw locals do NOT enter the Perceus
+    tracking scope (`pat_bindings_skip_raw`), so the
+    `__perceus_dup` / `__perceus_drop` insertion never targets
+    them. Documented invariant in the `unbox_pass` comment.
+  - Coverage fixtures under `examples/perceus/`:
+    `unbox_phase2_arith.kai` (M3 — let + arith),
+    `unbox_phase2_cond.kai` (M4 — comparisons + booleans + EIf),
+    `unbox_phase2_match.kai` (M5 — switch fast path),
+    `unbox_bench.kai` + `.c.ref` (wall-clock comparison vs C).
+    Wired into `stage2/Makefile :: test-unbox-phase2`.
+  - Local timing on the bench fixture: kaikai ~5 ms vs C
+    reference ~2 ms under `-O2` (~2.5×, inside the Tier 2.5
+    target ~5–10× band). Pre-Phase-2: ~50–100×.
+  - LLVM backend mirror and stage 1 mirror are deferred and
+    documented in `docs/unboxing-phase2-followup.md`. Both
+    omissions are non-regressions: `make -C stage2 selfhost-llvm`
+    stays byte-identical at the fixed-point level, and stage 1
+    is a bootstrap-only path so its perf is irrelevant to user
+    code.
+
 ## [0.20.1] — 2026-04-30 (R5 fix — RLIMIT_STACK bump for tail-recursive demos on Linux)
 
 ### Fixed
