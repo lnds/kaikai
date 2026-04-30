@@ -9,6 +9,54 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Fibers Tier 1 #2 — stack guard pages
+
+Closes the second and final Fibers Tier 1 item (`docs/fibers-honesty-targets.md`).
+After this lane, *Fibers Show HN sin letra chica* is shipped: the two
+bugs a curious visitor would hit in five minutes — `let _ =
+fiber_spawn(...)` deadlock (R4, fixed in PR #25) and silent stack
+overflow — both now produce well-defined behaviour.
+
+#### Added
+
+- Spawned fibers' private stacks are now `mmap(MAP_PRIVATE | MAP_ANON)`
+  with one extra page reserved at the low end and flipped to
+  `PROT_NONE` via `mprotect`. Stack grows down on x86_64 / arm64, so
+  the guard sits at the overflow target — touching it raises
+  SIGSEGV/SIGBUS instead of corrupting whatever malloc happened to
+  place underneath the previous heap-allocated stack.
+- A SIGSEGV/SIGBUS handler installed on first `Spawn.spawn` runs on
+  a `sigaltstack` (so the overflowed stack is not used to format
+  the message), detects faults inside the active fiber's guard
+  range, and prints `kai: fiber stack overflow at <ptr>` to stderr
+  before re-raising with the default disposition. Faults outside
+  any guard fall through to default — NULL derefs and other
+  unrelated SIGSEGV sources keep their natural behaviour.
+- `KAI_FIBER_STACK_SIZE` is now rounded up to a page-size multiple
+  via `sysconf(_SC_PAGESIZE)`. macOS arm64 has 16 KiB pages; sub-page
+  values silently broke the env knob otherwise.
+- Coverage fixture: `examples/effects/m8_fiber_stack_overflow.kai`
+  recurses non-tail-deeply (`deep(50000)`) inside a spawned fiber.
+  Wired into `test-effects` to assert non-zero exit + the diagnostic
+  appearing on stderr.
+
+#### Changed
+
+- `docs/fibers-impl.md` *Stack model* describes the new layout +
+  handler. Pending-followup line *Stack guard pages / overflow
+  detection* removed.
+- `docs/fibers-honesty-targets.md` Tier 1 closed; both rows struck
+  through with shipped dates.
+
+#### Notes for the integrator
+
+- Tier 1 final line: `tier1 OK — full make test + demos baseline`.
+- `make -C stage2 selfhost-llvm` byte-identical.
+- `demos/ping_pong/` (R4 regression coverage) still green.
+- POSIX-only path: `<sys/mman.h>` and `<signal.h>` are the only new
+  includes pulled into stage 0; macOS and Linux covered, Windows
+  remains post-MVP per CLAUDE.md.
+
 ## [0.12.0] — 2026-04-29 (Perceus Tier 2 partials + testing-tier guardrails)
 
 **Minor: residual leak after R1 flip drops 46.9 M → 23.8 M (−49%)
