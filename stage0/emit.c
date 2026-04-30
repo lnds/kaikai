@@ -1056,12 +1056,17 @@ static void emit_pat_test(E *e, Node *pat, const char *scr) {
         }
 
         case N_PAT_RECORD: {
+            /* m5.x §4b: pat_test reads field tags / values to decide
+               the arm; it does not consume the field. Use the
+               borrowing variant so failing arms do not leak the
+               field's ref. emit_pat_binds keeps using the incref-ing
+               kai_field below. */
             fprintf(e->out, "(%s && %s->tag == KAI_RECORD", scr, scr);
             for (size_t i = 0; i < pat->n_children; ++i) {
                 Node *pf = pat->children[i];
                 char tmp[512];
                 snprintf(tmp, sizeof(tmp),
-                         "kai_field(%s, \"%.*s\")", scr,
+                         "kai_field_borrow(%s, \"%.*s\")", scr,
                          (int) pf->name_len, pf->name);
                 fputs(" && (", e->out);
                 emit_pat_test(e, pf->children[0], tmp);
@@ -1183,7 +1188,14 @@ static void emit_match(E *e, Node *m) {
         ls_pop_mark(e);
     }
     fputs("    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n", e->out);
-    fputs("} while (0); _r; })", e->out);
+    /* m5.x §4b: consume `_scr` linearly. Stage 0's eager-dup retrofit
+       wraps every multi-use local read in kai_internal_dup, so when the
+       scrutinee is a bare binding read it arrives as a fresh ref;
+       single-use, non-captured reads transfer the binding's own ref
+       (whose only consumer is this match). emit_pat_binds with
+       is_alias=true increfs each PBind so the bindings hold their own
+       refs and stay live past the decref below. */
+    fputs("} while (0); kai_decref(_scr); _r; })", e->out);
 }
 
 /* ---------- string literal (with interpolation) ---------- */
