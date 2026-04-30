@@ -145,24 +145,49 @@ unification.
 - Brand mismatch between sibling nurseries (only the lexical-
   walking version detects nursery scope, not the shallow check).
 
-### 7. Per-op type generics (m7b #2)
+### 7. Per-op type generics on the Spawn ops — ⚠ partial (Tier 2 lane)
 
 Out of m8's stated scope but materially blocks the cleanup of
-m8 #3's type-erased Spawn ops. With m7b #2 in place, the Spawn
-declaration becomes:
+m8 #3's type-erased Spawn ops. With m7b #2a in place (per-op TYPE
+generics), the four Fiber-shaped ops now carry `[T]`:
 
 ```
 effect Spawn {
-  spawn[T, e](f: () -> T / e) : Fiber[T]
-  await[T](f: Fiber[T])       : T
+  spawn[T] (thunk: Nothing)        : Fiber[T]
+  await[T] (fiber: Fiber[T])       : T
+  select[T](fibers: [Fiber[T]])    : T
+  cancel[T](fiber: Fiber[T])       : Unit
   ...
 }
 ```
 
-— matching Doc B verbatim — and `stdlib/spawn.kai`'s wrappers
-collapse to the canonical `n.spawn { ... }` cap-binding form once
-m7b #4 (`@cap` / `cap := v`) also lands. Doc C §*Per-op type
-generics* §*Implementation plan (m7b)* has the work plan.
+`stdlib/spawn.kai`'s `fiber_await` / `fiber_select` / `fiber_cancel`
+are now one-line aliases; the canonical `Spawn.await(f) : T` shape
+is reachable directly. Coverage:
+`examples/effects/m8_spawn_per_op_generics.kai`. Landed in the
+Fibers Tier 2 lane (2026-04-30).
+
+**Still pending — per-op ROW generics.** The full Doc B shape is
+
+```
+effect Spawn {
+  spawn[T, e](f: () -> T / e) : Fiber[T]
+  ...
+}
+```
+
+— `e` is a per-op *row* variable propagating the spawned thunk's
+row into the caller's row. `add_effect_op_sigs_loop` only allocates
+`mk_tpbinds_from` (TYPE binds) for `op_tparams`; there is no
+op-level `mk_rvbinds`. Until that lands, the spawn op keeps
+`thunk: Nothing` (TyAny) so the wrapper
+`fiber_spawn[T, e](f: () -> T / e) = Spawn.spawn(f)` can absorb the
+open row through TyAny. After per-op row generics
+land, the wrappers reduce to one-line aliases (or are removed) and
+`Spawn.spawn[T, e]` becomes the canonical entry point. Doc C
+§*Per-op type generics* §*Implementation plan (m7b)* has the work
+plan; the additional row-bind plumbing is the small step that
+remains.
 
 ## Bugs surfaced in m8 (also m8.x scope)
 
