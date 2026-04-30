@@ -22200,6 +22200,42 @@ fn find_mono_inst(insts: [ResolvedCS], name: String,
 # bump the refcount via dup; unused params dropped at entry.
 # Inert until step 3 lands.
 
+# ---- Unbox analysis (Tier 2.5; see docs/unboxing-phase2-design.md) ----
+#
+# Sits between monomorphisation and perceus_pass. Walks every
+# top-level fn / test body and rewrites each `Expr.mode` from the
+# parser default (`MUnknown`) to either `MBoxed` (the current
+# everywhere behaviour) or `MUnboxed` (raw C scalar — `int64_t`
+# for `Int`, `int` for `Bool`, `uint32_t` for `Char`).
+#
+# The pass is local: it does not propagate across fn boundaries.
+# Function parameters and return values stay `MBoxed` per
+# Phase 2 non-goal #1; the call boundary is the cheapest place
+# to keep boxed.
+#
+# M2 (this commit): identity pass — every node lands at `MBoxed`.
+# Selfhost stays byte-identical because the emitter does not yet
+# branch on `mode`. Subsequent milestones turn on the analysis
+# and the emitter switches.
+fn unbox_pass(decls: [Decl]) : [Decl] = map(decls, unbox_decl)
+
+fn unbox_decl(d: Decl) : Decl {
+  match d {
+    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) ->
+      DFn(is_pub, name, tparams, params, opt_ret, row,
+          unbox_expr(body), ln, cl, mo)
+    DTest(desc, body, ln, cl) -> DTest(desc, unbox_expr(body), ln, cl)
+    DImpl(name, ty, sub_decls, l, c) ->
+      DImpl(name, ty, map(sub_decls, unbox_decl), l, c)
+    DDerive(ps, inner, l, c) -> DDerive(ps, unbox_decl(inner), l, c)
+    _ -> d
+  }
+}
+
+fn unbox_expr(e: Expr) : Expr =
+  Expr { kind: map_expr_kind(e.kind, unbox_expr),
+         line: e.line, col: e.col, ty: e.ty, mode: MBoxed }
+
 fn perceus_pass(decls: [Decl]) : [Decl] = map(decls, perceus_decl)
 
 fn perceus_decl(d: Decl) : Decl {
@@ -30902,9 +30938,14 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       # ids fall outside the domain are skipped.
                       let mono_leaks = match mono_out { MonoOut(_, ls) -> ls }
                       let mono_inv_errs = report_mono_leaks(path, mono_leaks)
+                      # Tier 2.5 — unbox analysis (M2: no-op identity).
+                      # Runs between monomorphisation and perceus so
+                      # the perceus pass sees post-unbox modes (it
+                      # only inserts dup/drop on `MBoxed` nodes).
+                      let unboxed_decls = unbox_pass(mono_decls)
                       # m5 #1 — basic Perceus walker (identity).
                       # m5 #2-#4 fill in last-use analysis + dup/drop.
-                      let perceus_decls = perceus_pass(mono_decls)
+                      let perceus_decls = perceus_pass(unboxed_decls)
                       let test_mode = match mode { MTest -> true _ -> false }
                       let use_llvm = match mode { MEmitLlvm -> true _ -> false }
                       if mono_inv_errs != 0 { mono_inv_errs }
