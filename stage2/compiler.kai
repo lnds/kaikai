@@ -1023,7 +1023,22 @@ fn report_errors(path: String, src: String, tokens: [Token]) : Int {
 # stay compact. Pattern matching on expressions therefore destructures
 # the record to reach `.kind`, then matches the sum.
 
-type Expr = { kind: ExprKind, line: Int, col: Int, ty: Option[Ty] }
+# `mode` records the value representation chosen for this node by the
+# unbox analysis pass (Tier 2.5; see `docs/unboxing-phase2-design.md`).
+# Parser stamps every `Expr` with `MUnknown`; the unbox pass rewrites
+# nodes whose type is unboxable and whose consumer accepts a raw scalar
+# to `MUnboxed`, otherwise `MBoxed`. The emitter consults `mode` to
+# pick between `KaiValue *` and the underlying C scalar (`int64_t` /
+# `int` / `uint32_t`). Phase 1 of the lane (this commit) lands the
+# field with codegen unchanged; the pass + emitter switches arrive in
+# subsequent milestones.
+type Expr = { kind: ExprKind, line: Int, col: Int,
+              ty: Option[Ty], mode: ValueMode }
+
+type ValueMode
+  = MUnknown   # parser default; unbox_pass assigns one of the below
+  | MBoxed     # KaiValue * (current behaviour everywhere)
+  | MUnboxed   # raw int64_t / int / uint32_t, chosen by `ty`
 
 type ExprKind
   = EInt(Int)
@@ -1327,14 +1342,15 @@ type ImportKind
   | IkHole(String)
 
 # ---- small constructors ----
-fn mk_expr(k: ExprKind, line: Int, col: Int) : Expr = Expr { kind: k, line: line, col: col, ty: None }
+fn mk_expr(k: ExprKind, line: Int, col: Int) : Expr =
+  Expr { kind: k, line: line, col: col, ty: None, mode: MUnknown }
 
 # Return a copy of `e` with its inferred type set. Used by `synth` to
 # hand back a typed expression tree alongside its Ty. Downstream passes
 # (emitter today ignores it; M3/M4 will consume) can traverse the tree
 # and read `.ty` at each node without re-running inference.
 fn with_ty(e: Expr, t: Ty) : Expr =
-  Expr { kind: e.kind, line: e.line, col: e.col, ty: Some(t) }
+  Expr { kind: e.kind, line: e.line, col: e.col, ty: Some(t), mode: e.mode }
 fn mk_pat(k: PatKind, line: Int, col: Int) : Pattern = Pattern { pkind: k, line: line, col: col }
 fn mk_ty(k: TyKind, line: Int, col: Int) : TypeExpr = TypeExpr { tkind: k, line: line, col: col }
 
@@ -11110,7 +11126,7 @@ fn rewrite_alias_decl(d: Decl) : Decl {
 
 fn rewrite_alias_expr(e: Expr, m: AliasMap) : Expr =
   Expr { kind: rewrite_alias_kind(e.kind, m, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn rewrite_alias_opt(opt: Option[Expr], m: AliasMap) : Option[Expr] {
   match opt {
@@ -11436,7 +11452,7 @@ fn desugar_op_calls_decl(d: Decl, effs: [String]) : Decl {
 
 fn desugar_op_calls_expr(e: Expr, effs: [String]) : Expr =
   Expr { kind: desugar_op_calls_kind(e.kind, effs),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn desugar_op_calls_callee(callee: Expr, effs: [String]) : Expr {
   match callee.kind {
@@ -11498,7 +11514,7 @@ fn array_index_callee_set(line: Int, col: Int) : Expr =
 
 fn desugar_index_expr(e: Expr) : Expr =
   Expr { kind: desugar_index_kind(e.kind, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn desugar_index_opt(opt: Option[Expr]) : Option[Expr] {
   match opt {
@@ -11714,7 +11730,7 @@ fn desugar_const_refs_expr(e: Expr, const_names: [String]) : Expr {
               map(arms, (a) => desugar_const_refs_arm(a, const_names)))
     _ -> map_expr_kind(e.kind, (sub) => desugar_const_refs_expr(sub, const_names))
   }
-  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty }
+  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 }
 
 fn desugar_const_refs_arm(a: Arm, const_names: [String]) : Arm {
@@ -12367,7 +12383,7 @@ fn validate_var_in_block(stmts: [Stmt], tail: Option[Expr], caps: [String], file
 
 fn desugar_var_expr(e: Expr) : Expr =
   Expr { kind: desugar_var_kind(e.kind, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn desugar_var_opt(opt: Option[Expr]) : Option[Expr] {
   match opt {
@@ -12731,7 +12747,7 @@ fn ret_opt_contains(name: String, opt: Option[HReturn]) : Bool {
 # name is `<name>__slot`. Other expressions pass through.
 fn specialise_body(name: String, slot_name: String, e: Expr) : Expr {
   Expr { kind: specialise_kind(name, slot_name, e.kind, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 }
 
 fn specialise_kind(name: String, slot_name: String, k: ExprKind, line: Int, col: Int) : ExprKind {
@@ -12955,7 +12971,8 @@ fn use_rewrite_expr(e: Expr, table: [EffOps], opens: [String],
                       bound: [String], file: String, errs: Int) : UseRw {
   let r = use_rewrite_kind(e.kind, table, opens, bound, file, errs,
                             e.line, e.col)
-  UseRw { expr: Expr { kind: r.expr.kind, line: e.line, col: e.col, ty: e.ty },
+  UseRw { expr: Expr { kind: r.expr.kind, line: e.line, col: e.col,
+                       ty: e.ty, mode: e.mode },
           errs: r.errs }
 }
 
@@ -13454,7 +13471,7 @@ fn desugar_interp_decl(d: Decl, op_names: [String]) : Decl {
 
 fn desugar_interp_expr(e: Expr, op_names: [String]) : Expr =
   Expr { kind: desugar_interp_kind(e.kind, op_names, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn desugar_interp_kind(k: ExprKind, op_names: [String],
                         line: Int, col: Int) : ExprKind {
@@ -14797,7 +14814,8 @@ fn canon_uvars_expr(e: Expr, m: [IntPair]) : Expr {
     Some(t) -> Some(canon_uvars_ty(t, m))
     None    -> None
   }
-  Expr { kind: canon_uvars_kind(e.kind, m), line: e.line, col: e.col, ty: ty1 }
+  Expr { kind: canon_uvars_kind(e.kind, m), line: e.line, col: e.col,
+         ty: ty1, mode: e.mode }
 }
 
 fn canon_uvars_kind(k: ExprKind, m: [IntPair]) : ExprKind {
@@ -14850,7 +14868,8 @@ fn canon_tvars_expr(e: Expr, m: [IntPair]) : Expr {
     Some(t) -> Some(canon_tvars_ty(t, m))
     None    -> None
   }
-  Expr { kind: canon_tvars_kind(e.kind, m), line: e.line, col: e.col, ty: ty1 }
+  Expr { kind: canon_tvars_kind(e.kind, m), line: e.line, col: e.col,
+         ty: ty1, mode: e.mode }
 }
 
 fn canon_tvars_kind(k: ExprKind, m: [IntPair]) : ExprKind {
@@ -19871,7 +19890,7 @@ fn finalise_typed_expr(s: Subst, e: Expr) : Expr {
     None    -> None
   }
   Expr { kind: finalise_typed_kind(s, e.kind),
-         line: e.line, col: e.col, ty: ty1 }
+         line: e.line, col: e.col, ty: ty1, mode: e.mode }
 }
 
 fn finalise_typed_kind(s: Subst, k: ExprKind) : ExprKind =
@@ -20363,7 +20382,7 @@ fn expand_aliases_typeexpr(t: TypeExpr, aliases: [UAliasEntry]) : TypeExpr {
 
 fn expand_aliases_expr(e: Expr, aliases: [UAliasEntry]) : Expr {
   let new_kind = expand_aliases_exprkind(e.kind, aliases)
-  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty }
+  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 }
 
 fn expand_aliases_exprkind(k: ExprKind, aliases: [UAliasEntry]) : ExprKind {
@@ -21666,7 +21685,8 @@ fn subst_expr(e: Expr, sm: SubstMap) : Expr {
     Some(t) -> Some(subst_ty(t, sm))
     None    -> None
   }
-  Expr { kind: subst_kind(e.kind, sm), line: e.line, col: e.col, ty: ty1 }
+  Expr { kind: subst_kind(e.kind, sm), line: e.line, col: e.col,
+         ty: ty1, mode: e.mode }
 }
 
 fn subst_kind(k: ExprKind, sm: SubstMap) : ExprKind {
@@ -21979,7 +21999,7 @@ fn rewrite_callsites_expr_sm(e: Expr, insts: [ResolvedCS],
                               tuples: [MonoTuple], polys: [PolyFn],
                               sm: SubstMap) : Expr =
   Expr { kind: rewrite_callsites_kind_sm(e.kind, insts, tuples, polys, sm),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
                               tuples: [MonoTuple], polys: [PolyFn],
@@ -21994,7 +22014,7 @@ fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
               let mangled = mangle_name(name, tys, units)
               let new_callee = Expr { kind: EVar(mangled),
                                        line: callee.line, col: callee.col,
-                                       ty: callee.ty }
+                                       ty: callee.ty, mode: callee.mode }
               ECall(new_callee, new_args)
             } else {
               ECall(callee, new_args)
@@ -22432,7 +22452,7 @@ fn pcs_collect_uses_interp_parts(parts: [IPart], scope: [String], in_lam: Bool,
 
 fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool) : Expr =
   Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
                     uses: [Use], in_lam: Bool) : ExprKind {
@@ -22441,8 +22461,10 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     EVar(nm) -> {
       if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam) {
         ECall(
-          Expr { kind: EVar("__perceus_dup"), line: line, col: col, ty: None },
-          [Expr { kind: EVar(nm), line: line, col: col, ty: None }]
+          Expr { kind: EVar("__perceus_dup"), line: line, col: col,
+                 ty: None, mode: MUnknown },
+          [Expr { kind: EVar(nm), line: line, col: col,
+                  ty: None, mode: MUnknown }]
         )
       } else { EVar(nm) }
     }
@@ -22966,7 +22988,8 @@ fn pcs_prepend_unused_drops(body: Expr, params: [Param], uses: [Use]) : Expr {
 
 fn pcs_wrap_with_exit(body: Expr, entry: [Stmt], exit_: [Stmt]) : Expr {
   match exit_ {
-    [] -> Expr { kind: EBlock(entry, Some(body)), line: body.line, col: body.col, ty: body.ty }
+    [] -> Expr { kind: EBlock(entry, Some(body)), line: body.line, col: body.col,
+                 ty: body.ty, mode: body.mode }
     [_, ...__] -> {
       let ret_let = SLet(
         Pattern { pkind: PBind("__pcs_ret"), line: body.line, col: body.col },
@@ -22974,8 +22997,10 @@ fn pcs_wrap_with_exit(body: Expr, entry: [Stmt], exit_: [Stmt]) : Expr {
         body
       )
       let stmts = list_append(entry, [ret_let, ...exit_])
-      let tail = Expr { kind: EVar("__pcs_ret"), line: body.line, col: body.col, ty: body.ty }
-      Expr { kind: EBlock(stmts, Some(tail)), line: body.line, col: body.col, ty: body.ty }
+      let tail = Expr { kind: EVar("__pcs_ret"), line: body.line, col: body.col,
+                        ty: body.ty, mode: body.mode }
+      Expr { kind: EBlock(stmts, Some(tail)), line: body.line, col: body.col,
+             ty: body.ty, mode: body.mode }
     }
   }
 }
@@ -23013,10 +23038,12 @@ fn pcs_collect_exit_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
 fn pcs_make_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
   SExprStmt(Expr {
     kind: ECall(
-      Expr { kind: EVar("__perceus_drop"), line: ln, col: cl, ty: None },
-      [Expr { kind: EVar(nm), line: ln, col: cl, ty: None }]
+      Expr { kind: EVar("__perceus_drop"), line: ln, col: cl,
+             ty: None, mode: MUnknown },
+      [Expr { kind: EVar(nm), line: ln, col: cl,
+              ty: None, mode: MUnknown }]
     ),
-    line: ln, col: cl, ty: None
+    line: ln, col: cl, ty: None, mode: MUnknown
   })
 
 # ---- m5 #2 — last-use analysis (fn-param scope) ----
@@ -27132,7 +27159,8 @@ fn rqc_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console = match d
 }
 
 fn rqc_expr(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : Expr / Console =
-  Expr { kind: rqc_kind(e, locals, mt, file), line: e.line, col: e.col, ty: e.ty }
+  Expr { kind: rqc_kind(e, locals, mt, file), line: e.line, col: e.col,
+         ty: e.ty, mode: e.mode }
 
 # m6.2 diagnostics: emit a specific message when the user wrote
 # `mod.fname` against a known imported module that does not export
@@ -29028,7 +29056,7 @@ fn rename_pfields_names(fs: [PField], acc: [String]) : [String] {
 
 fn rename_proto_calls_expr(e: Expr, op_arities: [OpAr], bound: [String]) : Expr =
   Expr { kind: rename_proto_calls_kind(e.kind, op_arities, bound),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn rename_proto_calls_opt(o: Option[Expr], op_arities: [OpAr], bound: [String]) : Option[Expr] {
   match o {
@@ -29255,7 +29283,7 @@ fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg) : Decl {
 
 fn resolve_protocol_calls_expr(e: Expr, reg: ProtocolReg) : Expr =
   Expr { kind: resolve_protocol_calls_kind(e.kind, reg, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
                                 line: Int, col: Int) : ExprKind {
