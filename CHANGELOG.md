@@ -9,8 +9,42 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-04-29 (Fibers Tier 2 — trap-exit + DX polish)
+
 ### Added
 
+- **Fibers Tier 2 — trap-exit semantics.** `Spawn.set_trap_exit(Bool)`
+  toggles the current fiber's `trap_exit` flag. With `trap_exit=1`, a
+  linked peer's termination no longer cancels the fiber: instead the
+  Link propagation walk pushes a `String` (`"Normal"` if the peer's
+  state is `KAI_FIBER_DONE`, `"Crashed"` if `KAI_FIBER_CANCELLED`) into
+  the fiber's most-recently-allocated mailbox. Without trap_exit (the
+  default) the previous uniform cancel-cascade is unchanged. This
+  closes the BEAM-style `process_flag(trap_exit, true)` distinction
+  the design has long called out as post-MVP, and lets supervisor
+  patterns observe child terminations without being killed.
+  - `KaiFiber` gains two slots: `int trap_exit` (the flag) and
+    `struct KaiMailbox *mailbox` (back-pointer stamped by
+    `kai_mailbox_alloc[_bounded]`, cleared by `kai_mailbox_free`),
+    both used only by `kai_link_propagate_terminate`.
+  - `kai_link_propagate_terminate` now takes a `KaiExitReason`
+    argument (`KAI_EXIT_NORMAL` / `KAI_EXIT_CRASHED`); the trampoline
+    selects it from `self->state` at termination.
+  - Builtin `Spawn` effect grew a sixth op `set_trap_exit(on: Bool)
+    : Unit` (`stage2/compiler.kai` `builtin_spawn_decl`); the default
+    handler `kai_default_spawn_set_trap_exit` writes through to the
+    current fiber's flag.
+  - Stdlib wrapper `fiber_set_trap_exit(on: Bool) : Unit / Spawn` in
+    `stdlib/spawn.kai`.
+  - Coverage: `examples/effects/m8_trap_exit.kai` (end-to-end through
+    the Spawn effect — supervisor pattern observing both Normal and
+    Crashed children) wired into `make -C stage2 test-effects`;
+    `stage2/tests/link_runtime_test.c` extended with three new
+    scenarios (Normal/Crashed delivery, fallback when peer has no
+    mailbox, plain peer still gets `cancel_requested`).
+  - Spec: `docs/actors.md` §*Trap-exit semantics*. Status update in
+    `docs/m8x-followup.md` §5 and `docs/fibers-honesty-targets.md`
+    Tier 2.
 - `examples/quickstart/` — five short, runnable programs that
   introduce one concept each: hello, sum types + match, recursive
   AST, custom effect + handler, cooperative fibers. README gains
