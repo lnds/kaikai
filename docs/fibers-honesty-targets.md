@@ -51,9 +51,15 @@ What does **not** work today:
   `in_dispatch_node` flag. The same bug #12 shape exists in the
   LLVM backend, hidden until someone hits a self-delegating
   handler under `--emit=llvm`.
-- Trap-exit semantics collapsed to "any termination propagates"
+- ~~Trap-exit semantics collapsed to "any termination propagates"
   in v1. BEAM's `process_flag(trap_exit, true)` distinction
-  (Crashed vs Normal exit) is post-MVP.
+  (Crashed vs Normal exit) is post-MVP.~~ **FIXED 2026-04-29**
+  (Fibers Tier 2 lane). `Spawn.set_trap_exit(true)` opts the
+  current fiber into trap-exit mode; linked peers' DONE
+  terminations push `"Normal"`, CANCELLED terminations push
+  `"Crashed"` into the fiber's mailbox instead of setting
+  `cancel_requested`. Coverage: `examples/effects/m8_trap_exit.kai`
+  + `stage2/tests/link_runtime_test.c`.
 - Spawn API still uses pre-m7b #2 typing shape — per-op generics
   were not retrofitted when m7b #2 closed.
 
@@ -85,7 +91,7 @@ can be parallelised across short lanes.
 | **Monitor + `spawn_actor`** | ~2–3d | Phase 5.5+ in `m8x-followup.md` §5; without it the BEAM-style supervision claim is type-surface-only |
 | **Region-brand full machinery** | ~3–5d | `TyBranded` propagation through let / match / fn args; closes the sum-type-payload escape hatch from Phase 6 v1 shallow |
 | **LLVM op-dispatch `in_dispatch_node`** | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend |
-| **Trap-exit semantics** | ~1d | Crashed vs Normal exit distinction in Link propagation; today uniform |
+| ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
 | **Per-op generics in Spawn API** | ~0.5d | m7b #2 cleanup; pinned in `docs/effects-impl.md` §m7b #2 |
 
 After this set, `docs/effects.md`, `docs/structured-concurrency.md`,

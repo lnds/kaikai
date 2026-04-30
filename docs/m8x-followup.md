@@ -102,10 +102,19 @@ follow-on) or message types carrying Pid; the v1 actor surface
 shape (per-fiber monitor-set, MonitorDown push at termination)
 will mirror Link's; the work is small once the demo path exists.
 
-**Trap-exit semantics**: collapsed in v1 to "any termination
-propagates to linked peers". Doc spec distinguishes Crashed from
-Normal exit (BEAM-style `process_flag(trap_exit, true)`); deferred
-to post-MVP.
+**Trap-exit semantics**: ✅ landed 2026-04-29 (Fibers Tier 2 lane).
+`Spawn.set_trap_exit(Bool)` toggles the current fiber's
+`trap_exit` flag (KaiFiber struct, stage0/runtime.h). The Link
+propagation walk now reads `peer.trap_exit`: when set AND the
+peer has a current mailbox (per `kai_mailbox_alloc[_bounded]`
+back-pointer), `kai_link_propagate_terminate` pushes a String
+into the peer's mailbox — `"Normal"` if the dying fiber's state
+is `KAI_FIBER_DONE`, `"Crashed"` if `KAI_FIBER_CANCELLED` —
+instead of setting `cancel_requested`. With trap_exit=0 the
+behaviour is unchanged. Coverage:
+`examples/effects/m8_trap_exit.kai` (end-to-end through the
+Spawn effect) + `stage2/tests/link_runtime_test.c` (C-level
+unit test exercising both reasons + the no-mailbox fallback).
 
 Spec: Doc actors.md §*Supervision: links and monitors*.
 
