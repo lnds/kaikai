@@ -982,6 +982,25 @@ static KaiValue *kai_field(KaiValue *rec, const char *name) {
     fprintf(stderr, "kai: no such field `%s`\n", name); exit(1);
 }
 
+/* m5.x §4b sibling: borrow the field without incref. Used in pat_test
+   paths where the caller only reads the field's tag / value to decide
+   the arm match — no downstream consumer that would need an owned ref.
+   Pre-fix every pat_test of a record-shaped pattern leaked one ref per
+   field tested (kai_field always increfed; the test result was
+   discarded). emit_pat_binds keeps using the incref-ing kai_field so
+   bindings still own their own refs. */
+static KaiValue *kai_field_borrow(KaiValue *rec, const char *name) {
+    if (!rec || rec->tag != KAI_RECORD) {
+        fprintf(stderr, "kai: field access on non-record\n"); exit(1);
+    }
+    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
+        if (strcmp(rec->as.rec.names[i], name) == 0) {
+            return rec->as.rec.fields[i];
+        }
+    }
+    fprintf(stderr, "kai: no such field `%s`\n", name); exit(1);
+}
+
 /* ---------- equality ---------- */
 
 static int kai_eq(KaiValue *a, KaiValue *b) {

@@ -9,6 +9,16 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+#### Added
+
+- **`kai_field_borrow` runtime helper** (and LLVM symmetric
+  `kaix_field_borrow`) — like `kai_field` but does not incref
+  the returned value. Used in `emit_pat_test_record_fields`
+  (stages 0 + 1 + 2) so a record-pattern arm test no longer
+  leaks one ref per field tested. `emit_pat_binds` keeps using
+  the incref-ing `kai_field` so matched arms still get owned
+  bindings.
+
 #### Changed
 
 - **`perceus_pass` now wraps multi-read EVar reads inside string
@@ -37,18 +47,22 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 post-Tier 2 partials baseline pinned in
 `docs/perceus-honesty-targets.md`):
 
-| metric        | partials baseline | + §4b + match scr  |
-|---------------|------------------:|-------------------:|
-| alloc_total   |             33.5M |              34.2M |
-| free_total    |              8.2M |              20.8M |
-| leaked        |             25.4M |              13.4M |
-| live_peak     |             25.4M |              13.4M |
+| metric        | partials baseline | + §4b + match + field_borrow |
+|---------------|------------------:|-----------------------------:|
+| alloc_total   |             33.5M |                        34.3M |
+| free_total    |              8.2M |                        20.8M |
+| leaked        |             25.4M |                        13.4M |
+| live_peak     |             25.4M |                        13.4M |
 
 `leaked` cut by 47% (25.4M → 13.4M) on top of the partials
-landed earlier in the day. Selfhost (stage 1 + stage 2 + LLVM)
-byte-identical, `make tier0` clean, demos baseline 24 holds,
-R3 closed-loop fixture (`examples/effects/
-interp_recursive_walk.kai`) green.
+landed earlier in the day. The `kai_field_borrow` swap is a
+correctness improvement (a failing record-pattern arm no longer
+leaks per-field) — its measurable impact on `kaic2`'s self-
+compile is small because stage 2 emits exactly one record-
+pattern test in its own source. Selfhost (stage 1 + stage 2 +
+LLVM) byte-identical, `make tier0` and `make tier1` clean,
+demos baseline 24 holds, R3 closed-loop fixture (`examples/
+effects/interp_recursive_walk.kai`) green.
 
 ## [0.16.0] — 2026-04-29 (Fibers Tier 1 #2 — stack guard pages)
 
