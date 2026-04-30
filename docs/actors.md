@@ -394,6 +394,66 @@ Monitors do **not** propagate faults. The observer learns
 about the target's termination and decides what to do — retry,
 restart, cascade — without being killed itself.
 
+### Trap-exit semantics
+
+By default a Link propagates termination as cancellation: when
+either peer terminates (DONE or CANCELLED), the other receives
+`Cancel.raise()` at its next yield point. That symmetry is the
+right default for two halves of a handshake, but it makes a
+supervisor pattern impossible — the moment the first child
+crashes, the supervisor that should restart it is itself
+cancelled.
+
+`Spawn.set_trap_exit(on)` opts the current fiber out of that
+default. With `trap_exit=true`, a linked peer's termination
+delivers a `String` message into the fiber's mailbox instead of
+setting `cancel_requested`:
+
+| Peer terminated via | Message pushed |
+|---|---|
+| normal return (`KAI_FIBER_DONE`)         | `"Normal"`  |
+| `Cancel.raise()` or `Spawn.cancel(...)` (`KAI_FIBER_CANCELLED`) | `"Crashed"` |
+
+The fiber drains those messages with `Actor.receive()` exactly
+like any other mailbox traffic. Two requirements for delivery:
+
+1. The fiber must be inside a `with_mailbox { ... }` (or
+   `with_mailbox_policy`) scope when its peer terminates — the
+   runtime locates the mailbox through the fiber's most-recently-
+   allocated mailbox slot. Without one, the propagation falls
+   back to the default `cancel_requested` behaviour.
+2. The fiber's message type must be `String` (or accept
+   `String`) so the runtime's pre-built `"Normal"` /
+   `"Crashed"` payloads round-trip through the typed mailbox.
+   v1 ships String specifically — a richer
+   `type ExitReason = Normal | Crashed(...)` payload waits on
+   user-defined sum types crossing the runtime/library
+   boundary.
+
+Toggle scope: `set_trap_exit` affects propagations that happen
+*after* the call returns. Links established before the call
+still respect the flag — the read happens at termination time,
+not at link time.
+
+```kai
+fn supervisor() : Unit / Actor[String] + Spawn + Console + Link + Cancel = {
+  fiber_set_trap_exit(true)
+  let me = Actor.self()
+  let _ = fiber_spawn(() => with_mailbox { worker(me) })
+  match Actor.receive() {
+    "Normal"  -> Stdout.print("worker finished cleanly")
+    "Crashed" -> { Stdout.print("worker crashed; restarting"); restart(me) }
+    _         -> Stdout.print("unexpected message")
+  }
+}
+```
+
+Trap-exit is a per-fiber switch, not a per-link one: every link
+the fiber holds at the moment of a peer's termination respects
+the current `trap_exit` value. To revoke, call
+`fiber_set_trap_exit(false)` and links revert to the default
+cancel-cascade behaviour.
+
 ### Supervision trees
 
 A supervisor is an ordinary actor whose message type includes
