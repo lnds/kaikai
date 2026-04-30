@@ -1056,12 +1056,17 @@ static void emit_pat_test(E *e, Node *pat, const char *scr) {
         }
 
         case N_PAT_RECORD: {
+            /* m5.x §4b: pat_test reads field tags / values to decide
+               the arm; it does not consume the field. Use the
+               borrowing variant so failing arms do not leak the
+               field's ref. emit_pat_binds keeps using the incref-ing
+               kai_field below. */
             fprintf(e->out, "(%s && %s->tag == KAI_RECORD", scr, scr);
             for (size_t i = 0; i < pat->n_children; ++i) {
                 Node *pf = pat->children[i];
                 char tmp[512];
                 snprintf(tmp, sizeof(tmp),
-                         "kai_field(%s, \"%.*s\")", scr,
+                         "kai_field_borrow(%s, \"%.*s\")", scr,
                          (int) pf->name_len, pf->name);
                 fputs(" && (", e->out);
                 emit_pat_test(e, pf->children[0], tmp);
