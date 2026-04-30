@@ -1425,7 +1425,7 @@ test-link-runtime: build
 # `docs/m4c-real-specialisation.md`.
 test-m4c: $(TARGET) build
 	@$(STACK) set -e; \
-	for f in ../examples/effects/m4c_run_with.kai ../examples/effects/m4c_handler_in_body.kai; do \
+	for f in ../examples/effects/m4c_run_with.kai ../examples/effects/m4c_handler_in_body.kai ../examples/effects/m4c_flow_through.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "m4c FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
@@ -1461,6 +1461,16 @@ test-m4c: $(TARGET) build
 	  && grep -q "= kai_process_with_log__mono__String__Int(" build/s2-m4c_handler_in_body.c \
 	  && echo "m4c OK m4c_handler_in_body C call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_handler_in_body — main still calls polymorphic kai_process_with_log"; exit 1; }
+	@grep -q "kai_outer__mono__Int" build/s2-m4c_flow_through.c \
+	  && grep -q "kai_outer__mono__String" build/s2-m4c_flow_through.c \
+	  && grep -q "kai_inner__mono__Int" build/s2-m4c_flow_through.c \
+	  && grep -q "kai_inner__mono__String" build/s2-m4c_flow_through.c \
+	  && echo "m4c OK m4c_flow_through outer + inner specialisations emitted" \
+	  || { echo "m4c FAIL m4c_flow_through — outer or inner spec missing"; exit 1; }
+	@grep -A 2 "kai_outer__mono__Int(" build/s2-m4c_flow_through.c | grep -q "kai_inner__mono__Int(" \
+	  && grep -A 2 "kai_outer__mono__String(" build/s2-m4c_flow_through.c | grep -q "kai_inner__mono__String(" \
+	  && echo "m4c OK m4c_flow_through specs call matching specs (no flow-through to polymorphic inner)" \
+	  || { echo "m4c FAIL m4c_flow_through — outer__mono__T does not call inner__mono__T"; exit 1; }
 
 # m7a #9: régime-cost benchmark. Trivial-clause Counter.tick() loop
 # vs a C-direct call with the same side effect. Threshold 5× ns/op

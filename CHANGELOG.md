@@ -187,6 +187,127 @@ or selfhost path; demos baseline (24) is unchanged.
   grammar, `kai fmt` indentation rules, full LSP integration.
   Each is a separate lane.
 
+## [0.15.0] — 2026-04-29 (m4c #4 Phase 3 — body type / unit substitution)
+
+**Minor: monomorphisation now substitutes types and units in
+specialised bodies.** The previous release (0.11.0) emitted one
+cloned `DFn` per concrete call-site tuple but left every Expr.ty in
+the cloned body pointing at the source's tparam ids — so the
+`try_rewrite_show_dim_real` workaround around `Show<Real<u>>` had
+to wedge a special-case rewrite at the call site to produce the
+unit suffix. This release walks each cloned body via `subst_decl`,
+replacing every `TyVarT(id)` and `UVar(id)` whose id is a tparam
+binding with the spec's concrete tuple entry. Two consequences:
+
+1. The parametric `impl[u: Unit] Show for Real<u>` now produces one
+   spec per concrete unit (`__umono__USD`, `__umono__EUR`,
+   `__umono__m_d_s`, …), and each spec's body emits the unit suffix
+   natively via `unit_name(x)`. The `try_rewrite_show_dim_real`
+   workaround is **deleted** (function + call site).
+2. Polymorphic flow-through resolves correctly. A polymorphic
+   `outer[a]` calling another polymorphic `inner[a]` via its own
+   tparam now retargets to `inner__mono__T` per spec, instead of
+   falling back to the polymorphic original. The
+   `m4c_flow_through.kai` demo + structural-grep gates pin this
+   property.
+
+The structural lie #3 from the 2026-04-28 audit
+(`docs/runtime-debt-2026-04-28.md`) — *monomorphisation runs but
+the substitution is identity* — is closed end-to-end by this
+release.
+
+### Added
+
+- `MonoTuple = MT(String, [Ty], [UnitExprT])`. The unit tuple
+  distinguishes specialisations of `impl[u: Unit] Show for Real<u>`
+  bound to different concrete units; without it, every call site
+  collapsed onto one spec. `mangle_name` encodes the unit tuple
+  after the type tuple via `__umono__<unit_mangle>` (composite
+  units like `EUR/USD` mangle to `__umono__EUR_d_USD` after the
+  unit-ident sanitiser).
+- `ResolvedCS = RCS(String, Int, Int, [Ty], [UnitExprT])` and
+  `CallSite = CS(String, Int, Int, [Int], [Int])` gain a parallel
+  `[Int]` / `[UnitExprT]` slot for unit-tparam fresh ids and their
+  resolved values. `mk_fresh_unit_subst` returns the fresh ids;
+  `st_instantiate_report` propagates them to the CS push.
+- `subst_ty` / `subst_unit` / `subst_expr` / `subst_decl` walkers
+  in `stage2/compiler.kai`. Exhaustive over every Ty and ExprKind
+  variant — adding a new variant fails `map_expr_kind`'s match
+  rather than silently leaking through. `subst_ty` recurses through
+  `TyDimT` (substituting both base and unit), `TyFnT`'s row labels,
+  and `TyRefineT`'s base.
+- `build_subst_map` derives the per-spec `SubstMap` from the source
+  decl's tparams via `tparam_id_split`, so the body subst keys
+  align with the typer's bound ids.
+- `recover_protoimpl_insts`-style inline synthesis: `resolve_call_inst`
+  falls back to `synthesize_inst_for_decl` when the typer's CS
+  table has no record for `__pimpl_*` calls (which the
+  post-typing `resolve_protocol_calls` rewrite produces). The
+  inline synth uses the call's actual arg `.ty` per call site, so
+  multiple impl calls coalescing onto one (line, col) under string
+  interpolation each produce their own (tys, units) tuple.
+- `collect_impl_tuples_in_decls` runs at the start of
+  `monomorphise` to add inline-synthesised tuples to the worklist
+  before pre-mono rewrite. `generate_specs_iter` iterates to
+  fixpoint, picking up transitive tuples introduced by per-spec
+  body subst.
+- `examples/effects/m4c_flow_through.kai` — polymorphic `outer[a]`
+  calling polymorphic `inner[a]` via `outer`'s tparam. Two
+  structural-grep gates in `make -C stage2 test-m4c` confirm
+  `outer__mono__Int` calls `inner__mono__Int` (not the polymorphic
+  `inner`) and likewise for `String`.
+- m4c Phase 3 invariant: `count_tyvar_in_*` /
+  `find_first_leak_in_*` walkers count only TyVarT/UVar ids in the
+  spec's `SubstMap` domain. `emit_spec` records a per-spec leak
+  record in `MLeakRecord`; `compile_source` calls
+  `report_mono_leaks` after `monomorphise` — non-zero count fails
+  compilation. Out-of-domain ids (free typer tyvars from clause
+  answer types, etc.) are skipped because the codegen erases them.
+- `infer_decl` post-finalise canonicalisation pass
+  (`canon_uvars_expr` / `canon_tvars_expr` / `canon_resolved_css`):
+  for each bound tparam id, chases the typer's substitution to find
+  the chain endpoint and rewrites any UVar/TyVarT in the body's
+  `Expr.ty` and the recorded CSs back to the bound id. Without
+  this, the unifier's `utable_pick_min_var` always picks the bound
+  id and binds it to a fresh chain, leaving the body's
+  `Expr.ty` referencing fresh ids that the spec's SubstMap doesn't
+  cover. Pairs with a small `advance_unit_fresh` bump in
+  `infer_decl` so freshly minted uvars don't alias the bound ids
+  on the first call.
+
+### Removed
+
+- `try_rewrite_show_dim_real` (function + sole call site in
+  `try_rewrite_proto_call`). The four m12.8-phase2 fixtures
+  (`m12_8_phase2_show_real_unit`,
+  `m12_8_phase2_show_real_bare_and_unit`,
+  `m12_8_phase2_show_real_compound`, `m12_8_y_show_real_unit`)
+  updated their expected output: their impl bodies omit the unit
+  suffix on purpose, so the post-Phase-3 output is the bare
+  numeric. The `portfolio` and `usd_to_eur` demos keep their
+  unit-suffixed output because the stdlib `protocols.kai` impl
+  body explicitly invokes `unit_name(x)`, which Phase 3 now
+  resolves correctly.
+
+### Deferred (unchanged from 0.11.0)
+
+- **Generic prune**: dropping the polymorphic original once every
+  reference is redirected. `ResolvedCS` is keyed on call-site
+  positions, not on bare-name references, so pruning would break
+  function-as-value patterns (`let f = my_poly_fn; f(42)`,
+  `map(xs, my_poly_fn)`). Adding the missing index plus a separate
+  walker that rewrites bare references is the followup that
+  unlocks pruning.
+
+### Documentation
+
+- `docs/m4c-real-specialisation.md` — Phase 3 section (this
+  release) added under "What landed", with the SubstMap design,
+  per-unit specialisation rationale, the post-finalise
+  canonicalisation pass, the inline-synth recovery for
+  `__pimpl_*` calls, and gate evidence. Phase 4 (generic prune)
+  stays in "Deferred".
+
 ## [0.11.0] — 2026-04-29 (m4c #4 Phase 2 full — call-site rewrite)
 
 **Minor: monomorphisation now retargets call sites.** The previous
