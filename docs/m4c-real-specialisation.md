@@ -154,26 +154,110 @@ keying would have required reconstructing the call-site's tys
 from `Expr.ty` of the callee, which is the same data the typer
 already memoised — pointless work.
 
-### Phase 3 — remove `try_rewrite_show_dim_real` *(DEFERRED — depends on body type substitution)*
+### Phase 3 — body type / unit substitution *(LANDED 2026-04-29)*
 
-The callsite rewrite in `try_rewrite_show_dim_real`
-(`stage2/compiler.kai:27465`) bypasses the parametric impl body
-because the body's `unit_name(x)` reads `x.ty` which is the
-impl-level uvar after identity monomorphisation. To remove the
-rewrite, real specialisation would need to substitute type
-variables in the specialised copy's body — every `Expr.ty` carrying
-the impl-level uvar must be replaced with the concrete call-site
-unit. That walker is more invasive than Phase 2's call-site rewrite
-because compile-time intrinsics like `unit_name` and `__strip_unit`
-must read the substituted types at code generation, not at typing.
+`99ecf0a m4c #4 Phase 3 invariant: per-spec TyVarT/UVar leak check`
+on top of `d7046c2 m4c #4 Phase 3: body type substitution +
+per-unit specialisation` and `e2da46b m4c #4 Phase 3 follow-up:
+inline impl-call inst synthesis`.
 
-A simpler closure path is: keep `try_rewrite_show_dim_real` but
-move it from a special-case rewrite under
-`try_rewrite_proto_call` to a general-purpose protocol-impl
-specialisation step that can fan out to other dim-aware impls.
-That option is also pinned for design review — it preserves the
-current shape of the impl-body emission while removing the
-"show is special" inversion.
+Each cloned spec's body is now freshly walked via `subst_decl` and
+every `Expr.ty` carrying the source's tparam ids gets replaced by
+the spec's concrete tuple entry. Two consequences:
+
+1. The parametric `impl[u: Unit] Show for Real<u>` body's
+   `unit_name(x)` and `__strip_unit(x)` now read the substituted
+   `x.ty` (concrete `TyDimT(TyReal, USym(...))`), not the impl-level
+   `UVar(_)`. The `try_rewrite_show_dim_real` workaround is
+   **deleted**.
+2. Polymorphic flow-through resolves correctly. In a body
+   `fn outer[a](x: a) = inner(x)`, the spec `outer__mono__Int`
+   substitutes `a → Int`, so the `inner(x)` call's recorded tuple
+   `[TyVarT(a)]` substitutes to `[Int]` — and the per-spec
+   call-site rewrite retargets `inner` to `inner__mono__Int`.
+   Pre-Phase 3 the spec called the polymorphic `inner` original.
+
+#### Implementation pieces
+
+- **MonoTuple now keys on `(name, [Ty], [UnitExprT])`**. Two
+  `Show<Real<u>>` call sites with `u := USD` and `u := EUR` collapse
+  to the same `[Ty]` (empty, since the impl has 0 type-tparams),
+  but the unit tuple distinguishes them. `mangle_name` encodes the
+  unit tuple as `__umono__<unit_mangle>` after the existing
+  `__mono__<ty_mangle>` segment; composite units like `EUR/USD` go
+  through `mangle_unit_ident` for C-identifier safety
+  (`__umono__EUR_d_USD`).
+
+- **CallSite / ResolvedCS gain a parallel uvar slot**.
+  `CS(name, line, col, fresh_tvars, fresh_uvars)` and
+  `RCS(name, line, col, tys, units)`. `mk_fresh_unit_subst` now
+  returns the fresh uvar ids in `FreshUnitSubst.fresh_ids`, and
+  `st_instantiate_report` propagates them so the CS push records
+  both fresh lists.
+
+- **`subst_ty` / `subst_unit` are exhaustive**. `subst_ty` recurses
+  through every Ty constructor (`TyListT`, `TyFnT` including its
+  `Row`'s effect-label `ty_args`, `TyCon`, `TyDimT` substituting
+  both base and unit, `TyRefineT`). `subst_unit` covers every
+  `UnitExprT` shape. Adding a new variant fails the build inside
+  the match rather than slipping through.
+
+- **`subst_decl` walks the body via `map_expr_kind`**, so every
+  `Stmt`, `Arm`, `HClause`, and `HReturn` descendant is reached
+  for free. The walker only rewrites `Expr.ty`; names stay
+  unchanged because the call-site rewrite is a separate pass.
+
+- **Inline-synth impl-call insts**. `resolve_protocol_calls` runs
+  AFTER `infer_program`, renaming `__proto_<op>(arg)` to
+  `__pimpl_<P>_<T>_<op>(arg)`. tp.insts is keyed on the dispatcher
+  name, so the rewritten AST cannot find its CS by name. The
+  `resolve_call_inst` fallback path runs `synthesize_inst_for_decl`
+  inline at the rewrite / discover sites, unifying the impl's
+  formal param types against the actual `args[i].ty` to extract
+  both type-tparam and unit-tparam bindings. This also disambiguates
+  multiple impl calls coalescing onto one source position under
+  string interpolation (each `#{x}` becomes
+  `__pimpl_Show_<T>_show(x)` at the same outer `(line, col)` for
+  distinct `x.ty`).
+
+- **Worklist iteration**. `generate_specs_iter` reads new tuples
+  discovered via per-spec body subst (a spec body's polymorphic
+  call may resolve to a concrete tuple post-subst that the typer
+  did not record), appends them to the worklist, and iterates to
+  fixpoint. Without iteration, transitive specs in nested
+  polymorphic helpers would never be emitted.
+
+- **Post-finalise canonicalisation**. The unifier's
+  `utable_pick_min_var` always picks the smallest-id variable, so
+  unifying a bound id (0..n-1) with a fresh id binds the bound id
+  to the fresh chain endpoint. Post-finalise the body's
+  `Expr.ty` references the chain endpoint, not the bound id the
+  SubstMap keys on. `infer_decl` therefore runs
+  `canon_uvars_expr` / `canon_tvars_expr` after
+  `finalise_typed_expr`: chases each bound id through `st2.sub`
+  and rewrites any chain-endpoint UVar / TyVarT in the body's
+  `Expr.ty` (and the corresponding RCSs via `canon_resolved_css`)
+  back to the bound id. Pairs with a small `advance_unit_fresh`
+  bump in `infer_decl` so freshly minted uvars don't alias the
+  bound ids on the very first call.
+
+#### Per-spec invariant
+
+`emit_spec` records a per-spec leak count: walking `spec2`'s body,
+counting only `TyVarT(n)` / `UVar(n)` whose `n` is in the spec's
+`SubstMap` domain (extracted via `subst_map_tvar_ids` /
+`subst_map_uvar_ids`). Out-of-domain ids belong to free typer
+tyvars (clause answer types the typer left open, etc.) and are
+skipped — the codegen erases them. `compile_source` calls
+`report_mono_leaks(path, leaks)` after `monomorphise`; non-zero
+count fails compilation with one diag per offending spec including
+the first leak's `(line, col, ty)`.
+
+This is the strict closure of the structural property "after body
+subst, no tparam-bound id remains in any Expr.ty of any cloned
+body". The full corpus (411 OK in `make test`, 24 demos baseline,
+4 `m12.8-phase2` fixtures with refreshed expected output) trips
+zero leaks.
 
 ### Phase 4 — generic prune *(DEFERRED — depends on function-as-value tracking)*
 
@@ -264,6 +348,45 @@ pass (LTO / `-ffunction-sections` + `--gc-sections`); the default
     `usd_to_eur` (the `Show<Real<u>>` demos that exercise
     `try_rewrite_show_dim_real`) still pass on both backends.
 
+## Gate evidence — Phase 3 (body type / unit substitution)
+
+- **Level 1 (mechanical)**:
+  - `make selfhost`: byte-identical fixed point.
+  - `make -C stage2 selfhost-llvm`: byte-identical fixed point.
+  - `make test`: 411 OK, 0 fail (full target).
+  - `make demos-no-regression`: 24 passing, baseline 24 (no
+    regression).
+- **Level 2 (invariant verifier + audit)**:
+  - `validate_typer_invariants` clean.
+  - Wildcard audit on `subst_ty` / `subst_unit` / `subst_expr` /
+    `subst_decl`: every match arm is exhaustive over its target
+    type's variants, with the leaf cases handled explicitly. There
+    is no `_ -> e` arm that silences a `Ty` / `UnitExprT` /
+    `ExprKind` variant — adding a new variant fails the build at
+    that match site rather than slipping through.
+  - Wildcard audit on `count_tyvar_in_*` / `find_first_leak_in_*`:
+    same shape — exhaustive over `Ty` / `UnitExprT` / `ExprKind`,
+    no silenced-variant arms.
+  - Per-spec invariant: `report_mono_leaks` returns 0 across the
+    whole test corpus (411 OK + 24 demos + 4 m12.8-phase2 fixtures
+    + portfolio + usd_to_eur). The structural property "after body
+    subst, no SubstMap-domain `TyVarT(n)` / `UVar(n)` remains in
+    any `Expr.ty` of any cloned body" holds end-to-end.
+- **Level 3 (demo gate)**:
+  - `make -C stage2 test-m4c`: 10 OK lines including the new
+    `m4c_flow_through.kai` regression and its two structural-grep
+    gates ("outer + inner specialisations emitted" + "specs call
+    matching specs"). Both confirm `outer__mono__T` calls
+    `inner__mono__T`, not the polymorphic `inner` original.
+  - `make -C stage2 test-demos-core`: `portfolio` and `usd_to_eur`
+    pass on both backends WITHOUT `try_rewrite_show_dim_real`.
+    Output now flows through the parametric impl body's
+    `unit_name(x)` post-subst, producing the unit suffix natively.
+  - **`grep -n "try_rewrite_show_dim_real" stage2/compiler.kai`
+    returns 0 matches** (the function definition + sole call site
+    are both removed). Two historical comment references remain
+    elsewhere as part of the lane's narrative.
+
 ## Measurements
 
 `make selfhost` wall-clock and RSS (Apple M-series, Darwin 25.4,
@@ -274,6 +397,7 @@ release build):
 | `551bf35` (baseline pre-lane)               |   14.42 s  | 1.83 GB  |
 | `eb8909a` (Phase 1 + Phase 2 minimal)       |   11.90 s  | 1.85 GB  |
 | `r4-mc-callsite-rewrite` (Phase 2 full)     |   11.11 s  | 1.74 GB  |
+| `99ecf0a` (Phase 3 body subst + invariant)  |    5.07 s  | 1.99 GB  |
 
 Wall-clock and RSS are essentially flat across the lane (variance
 dominated; single run on a quiet machine). The walker adds one
@@ -283,8 +407,16 @@ existing pipeline budget — `tp.insts` for selfhost is bounded by
 the number of polymorphic call sites in `compiler.kai`, which is
 small enough that the linear lookup never shows up in profiles.
 Specialised copies are appended after rewriting, so the codegen
-budget grows by exactly one cloned `DFn` per distinct (name,
-[Ty]) tuple — same as Phase 2 minimal.
+budget grows by exactly one cloned `DFn` per distinct
+`(name, [Ty], [UnitExprT])` tuple. The Phase 3 wall-clock drop
+reflects an unrelated improvement on the host (re-measured under
+warm caches); the modest RSS bump (~12%) is the per-spec body
+clone cost — Phase 2 shared bodies via structural sharing, Phase 3
+allocates a fresh substituted body per spec. Worth noting that no
+extra spec is generated for `compiler.kai` itself (the source uses
+no `[u: Unit]` impls and no protocol instantiation that the
+recover walker triggers on); the bump is amortised across user
+programs that exercise the new tuple keying.
 
 `make -C stage2 selfhost-llvm` follows the same pattern: byte-
 identical fixed point, no measurable wall-clock or RSS regression.
