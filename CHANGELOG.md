@@ -9,6 +9,25 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Fixed
+
+- **LLVM op-dispatch now mirrors the C emit's `in_dispatch_node`
+  guard (m8 bug #12 LLVM mirror).** `llvm_emit_op_dispatch` saves
+  the current fiber's `in_dispatch_node`, sets it to the looked-up
+  evidence node before the indirect call, and restores afterwards;
+  without this, a self-delegating handler under `--emit=llvm`
+  would re-resolve `Eff.op(...)` back into its own clause and
+  infinite-loop until stack overflow — same shape as the C-side
+  bug closed in commit `4a77d49`. Three new runtime helpers
+  (`kaix_evidence_lookup_node`, `kaix_evidence_node_handler`,
+  `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the
+  KaiFiber struct out of the IR. Coverage:
+  `examples/effects/m8_12_self_delegating_handler.kai` now runs
+  under both backends, with a structural grep on the IR
+  confirming enter/leave pairing. Closes the LLVM
+  `in_dispatch_node` line item from
+  `docs/fibers-honesty-targets.md` Tier 2.
+
 ### Changed
 
 - **Spawn ops now carry per-op `[T]` (m7b #2a retrofitted to

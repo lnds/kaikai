@@ -24040,6 +24040,23 @@ fn llvm_header() : String =
     # initialises the on-stack KaiCont alloca.
     "declare i8* @kaix_evidence_lookup_handler(i8*)\n",
     "declare void @kaix_cont_init_identity(i8*, i64)\n",
+    # m8 bug #12 LLVM mirror — `lookup_node` returns the matching
+    # KaiEvidence* (cast to i8*) so the IR can pass it into the
+    # in_dispatch_node guard around the indirect op call.
+    # `node_handler` extracts `node->handler` without exposing
+    # the KaiEvidence struct layout in IR.
+    "declare i8* @kaix_evidence_lookup_node(i8*)\n",
+    "declare i8* @kaix_evidence_node_handler(i8*)\n",
+    # m8 bug #12 LLVM mirror — per-fiber in_dispatch_node guard.
+    # `enter(node)` saves the current fiber's `in_dispatch_node`,
+    # sets it to `node`, returns the previous value;
+    # `leave(prev)` restores. Without this, a self-delegating
+    # handler under `--emit=llvm` would resolve `Spawn.spawn(...)`
+    # back into its own clause and infinite-loop until stack
+    # overflow — same shape as bug #12 in the C backend
+    # (commit 4a77d49 / m8_12_self_delegating_handler.kai).
+    "declare i8* @kaix_in_dispatch_enter(i8*)\n",
+    "declare void @kaix_in_dispatch_leave(i8*)\n",
     # m7c-d — clause-body helper. The LLVM IR emits each
     # `resume(v)` call as a direct `kai_cont_resume(k, v)`
     # invocation; the cont pointer comes from the clause's `%k`
@@ -24826,8 +24843,9 @@ fn llvm_emit_modcall_fn_value(e: LlvmEmit, mod: String, fname: String, line: Int
 # m7c-c — emit the LLVM IR for an `Eff.op(args)` call. Mirrors the
 # C `emit_call_expr` op-call branch minus the discard/longjmp path
 # (m7a #6e). The IR shape is:
-#   %h = call i8* @kaix_evidence_lookup_handler(i8* @effname.str)
-#   %ev = bitcast i8* %h to %EvEff*
+#   %node = call i8* @kaix_evidence_lookup_node(i8* @effname.str)
+#   %h    = call i8* @kaix_evidence_node_handler(i8* %node)
+#   %ev   = bitcast i8* %h to %EvEff*
 #   ; KaiCont alloca (32 bytes covers the C struct)
 #   %k_buf = alloca [32 x i8], align 8
 #   %k = bitcast [32 x i8]* %k_buf to i8*
@@ -24835,18 +24853,30 @@ fn llvm_emit_modcall_fn_value(e: LlvmEmit, mod: String, fname: String, line: Int
 #   %hid_p = getelementptr %EvEff, %EvEff* %ev, i32 0, i32 0
 #   %hid = load i64, i64* %hid_p
 #   call void @kaix_cont_init_identity(i8* %k, i64 %hid)
+#   ; m8 bug #12 LLVM mirror: save and overwrite the current
+#   ; fiber's in_dispatch_node before the indirect call so a
+#   ; self-delegating handler doesn't re-resolve to itself.
+#   %prev = call i8* @kaix_in_dispatch_enter(i8* %node)
 #   ; GEP fn ptr at field 3 + op_idx, load, indirect-call
 #   %op_p = getelementptr %EvEff, %EvEff* %ev, i32 0, i32 N
 #   %op = load <fn-type>, <fn-type>* %op_p
 #   %r = call %KaiValue* %op(%EvEff* %ev, args..., i8* %k)
+#   call void @kaix_in_dispatch_leave(i8* %prev)
 fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : LlvmEmit {
   let eff_n = dotted_prefix(key)
   let name_res = llvm_emit_name_constant(e, eff_n, "eff.disp.name.")
-  # 1. Lookup handler.
-  let h_reg = llvm_fresh_reg(name_res.e)
-  let h_call = concat_all([
-    "  ", h_reg.reg, " = call i8* @kaix_evidence_lookup_handler(i8* ",
+  # 1. Lookup the evidence node (carries the handler pointer + the
+  # `in_dispatch` slot we need to flag).
+  let node_reg = llvm_fresh_reg(name_res.e)
+  let node_call = concat_all([
+    "  ", node_reg.reg, " = call i8* @kaix_evidence_lookup_node(i8* ",
     name_res.gep, ")\n"
+  ])
+  let e0a = llvm_append_body(node_reg.e, node_call)
+  let h_reg = llvm_fresh_reg(e0a)
+  let h_call = concat_all([
+    "  ", h_reg.reg, " = call i8* @kaix_evidence_node_handler(i8* ",
+    node_reg.reg, ")\n"
   ])
   let e1 = llvm_append_body(h_reg.e, h_call)
   # 2. Bitcast to %EvEff*.
@@ -24881,9 +24911,23 @@ fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : Ll
   ])
   let e6 = llvm_append_body(hid_reg.e, hid_load)
   # 5. Evaluate args; build a comma-joined arg list of %KaiValue* registers.
+  # Args are evaluated *before* the in_dispatch flag is set — they may
+  # themselves invoke the same op (e.g. `State.set(State.get() + 1)`),
+  # and setting the flag too early would route the inner lookup past
+  # the live handler. Mirrors the C emit's arg-bindings + flag-flip
+  # ordering.
   let ra = llvm_emit_args(e6, xs, [])
-  # 6. GEP to op fn-ptr at field `offset`, load, indirect call.
-  let fn_ptr_p_reg = llvm_fresh_reg(ra.st)
+  # 6. m8 bug #12 LLVM mirror — set the current fiber's
+  # in_dispatch_node = %node and capture the previous value to
+  # restore after the indirect call.
+  let prev_reg = llvm_fresh_reg(ra.st)
+  let prev_call = concat_all([
+    "  ", prev_reg.reg, " = call i8* @kaix_in_dispatch_enter(i8* ",
+    node_reg.reg, ")\n"
+  ])
+  let e6b = llvm_append_body(prev_reg.e, prev_call)
+  # 7. GEP to op fn-ptr at field `offset`, load, indirect call.
+  let fn_ptr_p_reg = llvm_fresh_reg(e6b)
   # Build the fn-ptr type: %KaiValue* (%EvEff*, args..., i8*)*
   let arg_ty_list = llvm_op_arg_kaivalue_list(list_length(xs))
   let fn_ptr_ty = concat_all([
@@ -24900,13 +24944,14 @@ fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : Ll
     "  ", fn_ptr_reg.reg, " = load ", fn_ptr_ty, ", ", fn_ptr_ty, "* ", fn_ptr_p_reg.reg, "\n"
   ])
   let e8 = llvm_append_body(fn_ptr_reg.e, fn_load)
-  # 7. Indirect call.
+  # 8. Indirect call, then restore in_dispatch_node.
   let r_reg = llvm_fresh_reg(e8)
   let arg_regs_str = llvm_format_op_arg_regs(ra.regs)
   let call_instr = concat_all([
     "  ", r_reg.reg, " = call %KaiValue* ", fn_ptr_reg.reg,
     "(%Ev", eff_n, "* ", ev_reg.reg, arg_regs_str,
-    ", i8* ", k_reg.reg, ")\n"
+    ", i8* ", k_reg.reg, ")\n",
+    "  call void @kaix_in_dispatch_leave(i8* ", prev_reg.reg, ")\n"
   ])
   llvm_set_last(llvm_append_body(r_reg.e, call_instr), r_reg.reg)
 }

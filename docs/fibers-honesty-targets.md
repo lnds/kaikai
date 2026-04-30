@@ -47,10 +47,18 @@ What does **not** work today:
   embedded inside a sum-type constructor's payload escapes the
   shallow check — full machinery (TyBranded propagation through
   every binding form) deferred.
-- LLVM op-dispatch (`llvm_emit_op_dispatch`) does not carry the
+- ~~LLVM op-dispatch (`llvm_emit_op_dispatch`) does not carry the
   `in_dispatch_node` flag. The same bug #12 shape exists in the
   LLVM backend, hidden until someone hits a self-delegating
-  handler under `--emit=llvm`.
+  handler under `--emit=llvm`.~~ **Closed 2026-04-30** (Fibers
+  Tier 2 lane). `llvm_emit_op_dispatch` now mirrors the C emit's
+  `_saved_disp = ...; in_dispatch_node = _node_op; <call>;
+  in_dispatch_node = _saved_disp;` envelope via three new
+  runtime helpers (`kaix_evidence_lookup_node`,
+  `kaix_in_dispatch_enter`, `kaix_in_dispatch_leave`). The
+  `m8_12_self_delegating_handler` fixture is now exercised under
+  both backends, with a structural grep on the IR confirming the
+  enter/leave pairing.
 - ~~Trap-exit semantics collapsed to "any termination propagates"
   in v1. BEAM's `process_flag(trap_exit, true)` distinction
   (Crashed vs Normal exit) is post-MVP.~~ **FIXED 2026-04-29**
@@ -97,7 +105,7 @@ can be parallelised across short lanes.
 | ~~Stack guard pages~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
 | **Monitor + `spawn_actor`** | ~2–3d | Phase 5.5+ in `m8x-followup.md` §5; without it the BEAM-style supervision claim is type-surface-only |
 | **Region-brand full machinery** | ~3–5d | `TyBranded` propagation through let / match / fn args; closes the sum-type-payload escape hatch from Phase 6 v1 shallow |
-| **LLVM op-dispatch `in_dispatch_node`** | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend |
+| ~~**LLVM op-dispatch `in_dispatch_node`**~~ ✅ shipped 2026-04-30 | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend — three runtime helpers (`kaix_evidence_lookup_node` / `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the KaiFiber struct out of the IR |
 | ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
 | ~~**Per-op generics in Spawn API**~~ ✅ partial 2026-04-30 | ~0.5d | TYPE generics retrofitted on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk still pending (`docs/m8x-followup.md` §7) |
 

@@ -222,10 +222,19 @@ proper structured-concurrency demos:
   see the live node) and cleared on the way out. Both
   `lookup_node` and `lookup_node_by_id` skip flagged nodes,
   giving the user-installed handler an Effekt-style "outer
-  handler" view from inside its own clause. The LLVM op
-  dispatch path does not yet honour the flag (it never built
-  the discard/longjmp contract); pinned as a Wave A follow-up
-  whenever LLVM grows the discard-resume shape.
+  handler" view from inside its own clause. **LLVM mirror landed
+  2026-04-30** (Fibers Tier 2 lane). `llvm_emit_op_dispatch` now
+  evaluates args, then calls `kaix_in_dispatch_enter(node)` to
+  stash the previous value and overwrite the current fiber's
+  `in_dispatch_node`, performs the indirect call, and finally
+  calls `kaix_in_dispatch_leave(prev)` to restore. Three new
+  runtime helpers in `stage0/runtime_llvm.c`
+  (`kaix_evidence_lookup_node`, `kaix_evidence_node_handler`,
+  `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the
+  KaiFiber struct out of the IR. Coverage:
+  `examples/effects/m8_12_self_delegating_handler.kai` now runs
+  under both backends, with a structural grep on the IR
+  confirming enter/leave pairing.
 - ~~**Lambda-row inference with "concrete + open row var".**~~
   **Closed 2026-04-29** (`9de0449`). The bug was already
   fixed by the cumulative typer work landed between m8 #10
