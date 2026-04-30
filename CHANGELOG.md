@@ -9,6 +9,28 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **m13 bit ops chunk — twelve compiler intrinsics on `Int`.**
+  `bit_and` / `bit_or` / `bit_xor` / `bit_not` / `bit_shl` /
+  `bit_shr` / `bit_ushr` / `bit_count` / `bit_test` / `bit_set`
+  / `bit_clear` / `bit_toggle` are registered in the typer's
+  intrinsic table (next to `unit_name` / `__strip_unit`) and
+  lowered inline by `emit_call_value` in stage 2 to the matching
+  C operator (`<<`, `>>`, `&`, `|`, `^`, `~`,
+  `__builtin_popcountll`). No runtime helper, no stage 1 mirror —
+  the emitted C never contains the intrinsic name. `bit_shr` is
+  arithmetic (sign-preserving); `bit_ushr` casts through
+  `uint64_t` for logical zero-fill; `bit_test` returns `Bool`;
+  the rest stay in `Int`.
+- `stdlib/math/bits.kai` — header-only documentation surface for
+  the intrinsics. Declares no bodies; the typer recognises the
+  names directly.
+- `examples/stdlib/bits_basic.kai` — fixture exercising all 12
+  ops. The `test-stdlib` target now greps the emitted C and
+  asserts each operator was lowered inline (and that no
+  `kai_bit_*` runtime call leaked through).
+
 ## [0.18.0] — 2026-04-29 (Perceus Tier 2 close — multi-read dup + match-scrutinee + kai_field balance)
 
 ### Added

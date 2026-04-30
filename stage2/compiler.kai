@@ -6728,6 +6728,15 @@ fn prelude_names() : [String] {
     "list_length", "list_append", "list_reverse",
     "map", "filter", "reduce", "each",
     "array_make", "array_length", "array_get", "array_set", "array_grow",
+    # m13: bit operations on Int. Compiler intrinsics — each call lowers
+    # to the corresponding C operator (`<<`, `>>`, `&`, `|`, `^`, `~`)
+    # in `emit_call_value`, mirroring the `unit_name` / `__strip_unit`
+    # pattern. Listed here so the closure-capture analyser does not
+    # promote them to free vars when used inside a lambda body.
+    "bit_and", "bit_or", "bit_xor", "bit_not",
+    "bit_shl", "bit_shr", "bit_ushr",
+    "bit_count", "bit_test",
+    "bit_set", "bit_clear", "bit_toggle",
     # m8 #7: mailbox runtime exposed as prelude functions; user-facing
     # API lives in stdlib/actor.kai's `with_mailbox` helper.
     # m8 #8: bounded variant takes (cap: Int, overflow_code: Int).
@@ -7901,6 +7910,139 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn
             "kai_internal_drop(", emit_expr(src, a, lcs, fns, variants, lams, cls), ")"
           ])
           _   -> "kai_unit() /* __perceus_drop: arity mismatch */"
+        }
+      } else if callee == "bit_and" {
+        # m13: bit ops are compiler intrinsics — each lowers inline to
+        # the matching C operator. The shape is consistent across the
+        # binary ops: read both KaiInts, apply the operator on `as.i`,
+        # box the result, decref the inputs. Refcounting matches
+        # `kai_add` in stage0/runtime.h: caller hands us values we own
+        # and must release exactly once.
+        match args_e {
+          [a, b] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_b = ", emit_expr(src, b, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_int(_a->as.i & _b->as.i); ",
+            "kai_decref(_a); kai_decref(_b); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_and: expected 2 args */"
+        }
+      } else if callee == "bit_or" {
+        match args_e {
+          [a, b] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_b = ", emit_expr(src, b, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_int(_a->as.i | _b->as.i); ",
+            "kai_decref(_a); kai_decref(_b); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_or: expected 2 args */"
+        }
+      } else if callee == "bit_xor" {
+        match args_e {
+          [a, b] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_b = ", emit_expr(src, b, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_int(_a->as.i ^ _b->as.i); ",
+            "kai_decref(_a); kai_decref(_b); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_xor: expected 2 args */"
+        }
+      } else if callee == "bit_not" {
+        # Unary: a single `~`. Refcount matches `bit_count`.
+        match args_e {
+          [a] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_int(~ _a->as.i); ",
+            "kai_decref(_a); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_not: expected 1 arg */"
+        }
+      } else if callee == "bit_shl" {
+        match args_e {
+          [a, b] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_b = ", emit_expr(src, b, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_int(_a->as.i << _b->as.i); ",
+            "kai_decref(_a); kai_decref(_b); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_shl: expected 2 args */"
+        }
+      } else if callee == "bit_shr" {
+        # Arithmetic shift: signed `>>` preserves the sign bit. The
+        # spec'd contrast with `bit_ushr` rests on `_a->as.i` staying
+        # `int64_t`.
+        match args_e {
+          [a, b] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_b = ", emit_expr(src, b, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_int(_a->as.i >> _b->as.i); ",
+            "kai_decref(_a); kai_decref(_b); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_shr: expected 2 args */"
+        }
+      } else if callee == "bit_ushr" {
+        # Logical shift: cast through `uint64_t` to zero-fill, then
+        # back to `int64_t` so the result fits the KaiInt slot.
+        match args_e {
+          [a, b] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_b = ", emit_expr(src, b, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_int((int64_t)(((uint64_t) _a->as.i) >> _b->as.i)); ",
+            "kai_decref(_a); kai_decref(_b); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_ushr: expected 2 args */"
+        }
+      } else if callee == "bit_count" {
+        # `__builtin_popcountll` is GCC/Clang. Cast through `uint64_t`
+        # so the count semantics don't depend on signed-bit handling.
+        match args_e {
+          [a] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_int((int64_t) __builtin_popcountll((uint64_t) _a->as.i)); ",
+            "kai_decref(_a); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_count: expected 1 arg */"
+        }
+      } else if callee == "bit_test" {
+        # Returns Bool — boxed via `kai_bool`.
+        match args_e {
+          [a, b] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_b = ", emit_expr(src, b, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_bool(((_a->as.i >> _b->as.i) & 1) != 0); ",
+            "kai_decref(_a); kai_decref(_b); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_test: expected 2 args */"
+        }
+      } else if callee == "bit_set" {
+        match args_e {
+          [a, b] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_b = ", emit_expr(src, b, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_int(_a->as.i | ((int64_t)1 << _b->as.i)); ",
+            "kai_decref(_a); kai_decref(_b); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_set: expected 2 args */"
+        }
+      } else if callee == "bit_clear" {
+        match args_e {
+          [a, b] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_b = ", emit_expr(src, b, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_int(_a->as.i & ~((int64_t)1 << _b->as.i)); ",
+            "kai_decref(_a); kai_decref(_b); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_clear: expected 2 args */"
+        }
+      } else if callee == "bit_toggle" {
+        match args_e {
+          [a, b] -> concat_all([
+            "({ KaiValue *_a = ", emit_expr(src, a, lcs, fns, variants, lams, cls),
+            "; KaiValue *_b = ", emit_expr(src, b, lcs, fns, variants, lams, cls),
+            "; KaiValue *_r = kai_int(_a->as.i ^ ((int64_t)1 << _b->as.i)); ",
+            "kai_decref(_a); kai_decref(_b); _r; })"
+          ])
+          _ -> "kai_unit() /* bit_toggle: expected 2 args */"
         }
       } else if string_contains_dot(callee) {
         # m7a #6c/#6d/#6e: op call `Eff.op(args)`. Look up the
@@ -14479,7 +14621,27 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     # names).
     TyEntry { name: "__strip_unit",
               scheme: scheme_uvars([], [], [0],
-                fn_ty([TyDimT(TyReal, UVar(0))], TyReal)) }
+                fn_ty([TyDimT(TyReal, UVar(0))], TyReal)) },
+    # m13: bit operations on Int as compiler intrinsics. The typer
+    # records the signatures here; `emit_call_value` lowers each call
+    # to the matching C operator (`<<`, `>>`, `&`, `|`, `^`, `~`)
+    # inline — there is no runtime helper. Schemes are monomorphic.
+    # `bit_shr` is arithmetic (sign-preserving) to match C's `>>` on
+    # signed types; `bit_ushr` casts through `uint64_t` for logical
+    # zero-fill. `bit_count` uses `__builtin_popcountll`. `bit_test`
+    # is the only op that returns Bool; the rest stay in Int.
+    TyEntry { name: "bit_and",    scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
+    TyEntry { name: "bit_or",     scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
+    TyEntry { name: "bit_xor",    scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
+    TyEntry { name: "bit_not",    scheme: mono(fn_ty([TyInt],        TyInt)) },
+    TyEntry { name: "bit_shl",    scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
+    TyEntry { name: "bit_shr",    scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
+    TyEntry { name: "bit_ushr",   scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
+    TyEntry { name: "bit_count",  scheme: mono(fn_ty([TyInt],        TyInt)) },
+    TyEntry { name: "bit_test",   scheme: mono(fn_ty([TyInt, TyInt], TyBool)) },
+    TyEntry { name: "bit_set",    scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
+    TyEntry { name: "bit_clear",  scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
+    TyEntry { name: "bit_toggle", scheme: mono(fn_ty([TyInt, TyInt], TyInt)) }
   ]
   TyEnv { entries: list_append(es, env.entries), fresh: env.fresh }
 }
