@@ -6742,6 +6742,10 @@ fn prelude_names() : [String] {
     # m8 #8: bounded variant takes (cap: Int, overflow_code: Int).
     "mailbox_alloc", "mailbox_alloc_bounded",
     "mailbox_send", "mailbox_recv", "mailbox_free",
+    # Tier 2 spawn_actor primitives — alloc-without-owner-stamp +
+    # owner reassignment so a parent fiber can hand a mailbox to
+    # the spawned fiber and have it observably owned by the child.
+    "mailbox_alloc_unowned", "mailbox_assign_owner",
     "Some", "None", "Ok", "Err",
     # m5 #4 — Perceus dup/drop magic names. The pass synthesises
     # ECall(EVar("__perceus_dup"), [...]) and ECall(EVar("__perceus_drop"),
@@ -7684,7 +7688,11 @@ fn prelude_table() : [EPrelude] {
     EP("mailbox_alloc_bounded", "kai_prelude_mailbox_alloc_bounded", 2),
     EP("mailbox_send",          "kai_prelude_mailbox_send",          2),
     EP("mailbox_recv",          "kai_prelude_mailbox_recv",          1),
-    EP("mailbox_free",          "kai_prelude_mailbox_free",          1)
+    EP("mailbox_free",          "kai_prelude_mailbox_free",          1),
+    # Tier 2 spawn_actor — alloc-without-stamp + reassign owner to a
+    # spawned fiber. Used by stdlib/actor.kai's `spawn_actor`.
+    EP("mailbox_alloc_unowned",  "kai_prelude_mailbox_alloc_unowned",  0),
+    EP("mailbox_assign_owner",   "kai_prelude_mailbox_assign_owner",   2)
   ]
 }
 
@@ -10919,6 +10927,26 @@ fn default_link_setup() : String =
     "    kai_evidence_push(&_kai_default_node_link, \"Link\", &_kai_default_ev_link);\n"
   ])
 
+# Tier 2 (Fibers Tier 2 lane): emit EvMonitor + push it alongside
+# Link. `monitor(target_pid)` registers the current fiber as an
+# observer on target_pid->as.mb->owner_fiber's monitor_head chain;
+# trampoline termination pushes the original target_pid value into
+# every observer's mailbox, *without* setting cancel_requested
+# (monitors are unidirectional / fault-isolated per
+# `docs/actors.md` §*Fault propagation*). `demonitor(ref)` removes
+# the entry. v1 simplification: the MonitorRef returned by `monitor`
+# is the same Pid value the user passed in, so demonitor takes
+# the same Pid.
+fn default_monitor_setup() : String =
+  concat_all([
+    "    static EvMonitor _kai_default_ev_monitor;\n",
+    "    static KaiEvidence _kai_default_node_monitor;\n",
+    "    _kai_default_ev_monitor.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_monitor.monitor   = (KaiValue *(*)(EvMonitor *, KaiValue *, KaiCont *)) &kai_default_monitor_monitor;\n",
+    "    _kai_default_ev_monitor.demonitor = (KaiValue *(*)(EvMonitor *, KaiValue *, KaiCont *)) &kai_default_monitor_demonitor;\n",
+    "    kai_evidence_push(&_kai_default_node_monitor, \"Monitor\", &_kai_default_ev_monitor);\n"
+  ])
+
 # m8 #2/#3: emit EvSpawn + push it as the innermost default-handler
 # node (Doc B §*Installation order*: Spawn sits closest to main,
 # Cancel the layer below it, the I/O group below that). Wires all
@@ -10963,6 +10991,7 @@ fn default_setups_for(main_row: [String]) : String = {
     if list_has(main_row, "Mutable") { default_mutable_setup() } else { "" },
     if list_has(main_row, "Cancel")  { default_cancel_setup() }  else { "" },
     if list_has(main_row, "Link")    { default_link_setup() }    else { "" },
+    if list_has(main_row, "Monitor") { default_monitor_setup() } else { "" },
     if list_has(main_row, "Spawn")   { default_spawn_setup() }   else { "" }
   ])
 }
@@ -10971,6 +11000,7 @@ fn default_setups_for(main_row: [String]) : String = {
 fn default_pops_for(main_row: [String]) : String =
   concat_all([
     if list_has(main_row, "Spawn")   { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "Monitor") { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Link")    { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Cancel")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Mutable") { "    kai_evidence_pop();\n" } else { "" },
@@ -14597,6 +14627,10 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "mailbox_send",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)]), tv(0)],           TyUnit)) },
     TyEntry { name: "mailbox_recv",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)])],                  tv(0))) },
     TyEntry { name: "mailbox_free",          scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)])],                  TyUnit)) },
+    # Tier 2 spawn_actor — alloc-without-stamp + reassign owner.
+    # Used by stdlib/actor.kai's `spawn_actor` only.
+    TyEntry { name: "mailbox_alloc_unowned", scheme: scheme([0],    fn_ty([],                                       TyCon("Pid", [tv(0)]))) },
+    TyEntry { name: "mailbox_assign_owner",  scheme: scheme([0, 1], fn_ty([TyCon("Pid", [tv(0)]), TyCon("Fiber", [tv(1)])], TyUnit)) },
     # Bug 8: `unitless` TyEntry removed. The user-facing escape was
     # leaking typer-internal erasure as a callable; design-idiomatic
     # equivalents are `print("#{x}")` (post-Bug-4 + Gap-1) for output
@@ -30444,20 +30478,30 @@ fn builtin_link_decl() : Decl =
           ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
-# m8 #9: Monitor — unidirectional supervision. `monitor(target)`
-# registers the current actor as an observer of `target`; when
-# `target` terminates, a `MonitorDown(ref, cause)` message is
-# delivered to the observer's own mailbox. `demonitor(ref)`
-# withdraws the subscription. v1 declares the type surface; the
-# runtime registry + delivery on termination land with the m8.x
-# scheduler. Demos exercise the supervision *pattern* through the
-# Actor[Msg] mailbox + spawn primitives directly.
+# m8 #9: Monitor — unidirectional supervision. `monitor(target_pid)`
+# registers the current fiber as an observer of `target_pid`'s
+# owning fiber; when that fiber terminates, the runtime pushes
+# the same target_pid value into the observer's mailbox (no
+# cancel propagation — monitors are fault-isolated per
+# `docs/actors.md` §*Fault propagation*). `demonitor(ref)` removes
+# the registration.
+#
+# v1 simplification (Fibers Tier 2 lane, 2026-04-30): the
+# `MonitorRef` from the spec is collapsed to `Pid[Nothing]` — the
+# same pid the user passed in — and the `MonitorDown(ref, cause)`
+# variant payload becomes a bare pid push. Reason distinction
+# (Normal / Crashed) is reachable today through Link + trap_exit
+# (which pushes "Normal"/"Crashed" strings into the same mailbox).
+# A richer payload waits on user-defined sum types crossing the
+# runtime/library boundary.
 fn builtin_monitor_decl() : Decl =
   DEffect(false, "Monitor", [],
     [
-      EOp("monitor", [], [param_typed_zero("target", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
-          ty_name_zero("MonitorRef"), 0, 0),
-      EOp("demonitor", [], [param_typed_zero("ref", ty_name_zero("MonitorRef"))],
+      EOp("monitor", [],
+          [param_typed_zero("target", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
+          ty_named_zero("Pid", [ty_name_zero("Nothing")]), 0, 0),
+      EOp("demonitor", [],
+          [param_typed_zero("ref", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
           ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 

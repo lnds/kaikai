@@ -40,9 +40,21 @@ What does **not** work today:
   sigaltstack prints `kai: fiber stack overflow at <ptr>` before
   re-raising with the default disposition. Coverage:
   `examples/effects/m8_fiber_stack_overflow.kai`.
-- `Monitor` is type-surface-only — Phase 5.5+ deferred in
+- ~~`Monitor` is type-surface-only — Phase 5.5+ deferred in
   `docs/m8x-followup.md` §5. Needs `spawn_actor` (Pid handoff
-  primitive) which itself is deferred.
+  primitive) which itself is deferred.~~ **Closed 2026-04-30**
+  (Fibers Tier 2 lane). `spawn_actor` lifts on `fiber_spawn` +
+  `with_mailbox` via two new runtime helpers
+  (`mailbox_alloc_unowned` + `mailbox_assign_owner`) so the
+  spawned fiber owns the mailbox; `Monitor.monitor(pid)`
+  registers an entry on the *target* fiber's `monitor_head`
+  chain and the trampoline's termination tail walks it,
+  pushing the original target_pid into each observer's
+  mailbox. v1 simplification: `MonitorRef` collapses to
+  `Pid[Nothing]` and the `MonitorDown(ref, cause)` payload
+  becomes a bare pid — reason distinction (Normal / Crashed)
+  is reachable today through Link + trap_exit. Coverage:
+  `examples/effects/m8_monitor.kai`.
 - `Fiber[T]` / `Pid[Msg]` region brand is shallow. A `Fiber`
   embedded inside a sum-type constructor's payload escapes the
   shallow check — full machinery (TyBranded propagation through
@@ -103,7 +115,7 @@ can be parallelised across short lanes.
 |---|---:|---|
 | ~~R4 — fiber-discard deadlock~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
 | ~~Stack guard pages~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
-| **Monitor + `spawn_actor`** | ~2–3d | Phase 5.5+ in `m8x-followup.md` §5; without it the BEAM-style supervision claim is type-surface-only |
+| ~~**Monitor + `spawn_actor`**~~ ✅ shipped 2026-04-30 | ~2–3d | Phase 5.5+ in `m8x-followup.md` §5 retrofitted; runtime walker mirrors Link + trap-exit, MonitorRef simplified to Pid[Nothing] in v1 |
 | **Region-brand full machinery** | ~3–5d | `TyBranded` propagation through let / match / fn args; closes the sum-type-payload escape hatch from Phase 6 v1 shallow |
 | ~~**LLVM op-dispatch `in_dispatch_node`**~~ ✅ shipped 2026-04-30 | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend — three runtime helpers (`kaix_evidence_lookup_node` / `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the KaiFiber struct out of the IR |
 | ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
