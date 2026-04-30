@@ -1023,7 +1023,22 @@ fn report_errors(path: String, src: String, tokens: [Token]) : Int {
 # stay compact. Pattern matching on expressions therefore destructures
 # the record to reach `.kind`, then matches the sum.
 
-type Expr = { kind: ExprKind, line: Int, col: Int, ty: Option[Ty] }
+# `mode` records the value representation chosen for this node by the
+# unbox analysis pass (Tier 2.5; see `docs/unboxing-phase2-design.md`).
+# Parser stamps every `Expr` with `MUnknown`; the unbox pass rewrites
+# nodes whose type is unboxable and whose consumer accepts a raw scalar
+# to `MUnboxed`, otherwise `MBoxed`. The emitter consults `mode` to
+# pick between `KaiValue *` and the underlying C scalar (`int64_t` /
+# `int` / `uint32_t`). Phase 1 of the lane (this commit) lands the
+# field with codegen unchanged; the pass + emitter switches arrive in
+# subsequent milestones.
+type Expr = { kind: ExprKind, line: Int, col: Int,
+              ty: Option[Ty], mode: ValueMode }
+
+type ValueMode
+  = MUnknown   # parser default; unbox_pass assigns one of the below
+  | MBoxed     # KaiValue * (current behaviour everywhere)
+  | MUnboxed   # raw int64_t / int / uint32_t, chosen by `ty`
 
 type ExprKind
   = EInt(Int)
@@ -1327,14 +1342,15 @@ type ImportKind
   | IkHole(String)
 
 # ---- small constructors ----
-fn mk_expr(k: ExprKind, line: Int, col: Int) : Expr = Expr { kind: k, line: line, col: col, ty: None }
+fn mk_expr(k: ExprKind, line: Int, col: Int) : Expr =
+  Expr { kind: k, line: line, col: col, ty: None, mode: MUnknown }
 
 # Return a copy of `e` with its inferred type set. Used by `synth` to
 # hand back a typed expression tree alongside its Ty. Downstream passes
 # (emitter today ignores it; M3/M4 will consume) can traverse the tree
 # and read `.ty` at each node without re-running inference.
 fn with_ty(e: Expr, t: Ty) : Expr =
-  Expr { kind: e.kind, line: e.line, col: e.col, ty: Some(t) }
+  Expr { kind: e.kind, line: e.line, col: e.col, ty: Some(t), mode: e.mode }
 fn mk_pat(k: PatKind, line: Int, col: Int) : Pattern = Pattern { pkind: k, line: line, col: col }
 fn mk_ty(k: TyKind, line: Int, col: Int) : TypeExpr = TypeExpr { tkind: k, line: line, col: col }
 
@@ -8529,7 +8545,122 @@ fn emit_match_arm(src: String, a: Arm, lcs: [String], fns: [EFn], variants: [EVa
   }
 }
 
+# M5 fast-path predicate. True iff every arm in `arms` is a
+# literal pattern (Int / Bool / Char) or a wildcard (PWild /
+# PBind), and no arm carries a guard. Strings are intentionally
+# excluded — the C `switch` only works on integral types.
+fn arms_all_literal_or_wild(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false   # need at least one arm to dispatch on
+    _  -> arms_all_literal_or_wild_loop(arms)
+  }
+}
+
+fn arms_all_literal_or_wild_loop(arms: [Arm]) : Bool {
+  match arms {
+    [] -> true
+    [Arm(p, g, _), ...rest] -> match g {
+      Some(_) -> false
+      None    -> if pat_is_unboxable_lit_or_wild(p) {
+        arms_all_literal_or_wild_loop(rest)
+      } else { false }
+    }
+  }
+}
+
+fn pat_is_unboxable_lit_or_wild(p: Pattern) : Bool {
+  match p.pkind {
+    PWild     -> true
+    # PBind would require threading a new raw local through the
+    # body's lcs/env so EVar reads of it resolve to `kair_<name>`.
+    # Out of scope for M5 v1 — fall back to the boxed match path
+    # whenever a catch-all binds a name. Pure wildcard is fine.
+    PLit(lit) -> match lit.kind {
+      EInt(_)  -> true
+      EBool(_) -> true
+      EChar(_) -> true
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
+# Emit the raw C scalar that goes inside `switch (...)` for a
+# literal pattern. `EInt` → `<n>LL`, `EBool` → `0`/`1`,
+# `EChar` → numeric codepoint.
+fn pat_lit_raw(p: Pattern) : String {
+  match p.pkind {
+    PLit(lit) -> match lit.kind {
+      EInt(n)  -> cat2(int_to_string(n), "LL")
+      EBool(b) -> if b { "1" } else { "0" }
+      EChar(c) -> int_to_string(char_to_int(c))
+      _ -> "0LL /* pat_lit_raw: unexpected lit */"
+    }
+    _ -> "0LL /* pat_lit_raw: not a literal pattern */"
+  }
+}
+
+# Lower a `match` whose scrutinee is `MUnboxed` and whose arms
+# are all literal-or-wild into a C `switch`. The wildcard /
+# bind arm becomes the `default:` clause; if no wildcard is
+# present, `default:` panics with "non-exhaustive match".
+fn emit_match_switch(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  let raw = emit_expr_raw(src, scrut, lcs, fns, variants, lams, cls)
+  let cty = raw_c_type(scrut.ty)
+  concat_all([
+    "({ ", cty, " _scr = ", raw, "; KaiValue *_r = kai_unit(); switch (_scr) {\n",
+    emit_switch_arms(src, arms, lcs, fns, variants, lams, cls, false),
+    "} _r; })"
+  ])
+}
+
+fn emit_switch_arms(src: String, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo], saw_default: Bool) : String {
+  match arms {
+    [] -> if saw_default { "" }
+          else { "    default: kai_prelude_panic(kai_str(\"non-exhaustive match\")); break;\n" }
+    [a, ...rest] -> match a {
+      Arm(p, _, body) -> {
+        # Each arm's body sees the scrutinee binding as a local
+        # name when the pattern is `PBind(name)`.
+        let arm_lcs = list_append(lcs, pat_binders(p, []))
+        let body_c = emit_expr(src, body, arm_lcs, fns, variants, lams, cls)
+        match p.pkind {
+          PWild -> {
+            let head = concat_all(["    default: _r = ", body_c, "; break;\n"])
+            cat2(head, emit_switch_arms(src, rest, lcs, fns, variants, lams, cls, true))
+          }
+          _ -> {
+            # PLit literal arm.
+            let head = concat_all(["    case ", pat_lit_raw(p), ": _r = ", body_c, "; break;\n"])
+            cat2(head, emit_switch_arms(src, rest, lcs, fns, variants, lams, cls, saw_default))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cty_for_bind(opt_ty: Option[Ty]) : String = raw_c_type(opt_ty)
+
 fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  # Tier 2.5 M5 — match scrutinee fast path. When the scrutinee is
+  # `MUnboxed` (raw int / char) and every arm is a literal-or-wild
+  # pattern of the same unboxable type with no guard, lower the
+  # match to a C `switch` on the raw scalar. Avoids the `_scr`
+  # boxed alias + per-arm `kai_eq(...)` chain.
+  match scrut.mode {
+    MUnboxed -> {
+      if arms_all_literal_or_wild(arms) {
+        emit_match_switch(src, scrut, arms, lcs, fns, variants, lams, cls)
+      } else {
+        emit_match_default(src, scrut, arms, lcs, fns, variants, lams, cls)
+      }
+    }
+    _ -> emit_match_default(src, scrut, arms, lcs, fns, variants, lams, cls)
+  }
+}
+
+fn emit_match_default(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   let sc = emit_expr(src,scrut, lcs, fns, variants, lams, cls)
   # m5.x flip Phase 3 closeout (original 9fe6f6d shape, restored after
   # §4b landed): consume the scrutinee linearly. `_scr` takes the value
@@ -8935,6 +9066,22 @@ fn pat_bindings(pat: Pattern, acc: [String]) : [String] {
     PRecord(fields) -> pfield_bindings_loop(fields, acc)
     PHole(_) -> acc
     PAs(name, sub) -> pat_bindings(sub, [name, ...acc])
+  }
+}
+
+# Like `pat_bindings`, but if the pattern is a single `PBind` and
+# the let's RHS is `MUnboxed`, the binding is a raw C scalar and
+# must NOT enter the Perceus tracking scope. All other shapes —
+# destructured lets, wildcards, literals — defer to the standard
+# `pat_bindings` walker. See `docs/unboxing-phase2-design.md` §3
+# (boundary tactic) for the coordination contract.
+fn pat_bindings_skip_raw(pat: Pattern, rhs: Expr, acc: [String]) : [String] {
+  match pat.pkind {
+    PBind(name) -> match rhs.mode {
+      MUnboxed -> acc
+      _        -> [name, ...acc]
+    }
+    _ -> pat_bindings(pat, acc)
   }
 }
 
@@ -9775,7 +9922,124 @@ fn emit_lambda_ref(x: Expr, lcs: [String], fns: [EFn], variants: [EVar], lams: [
 
 # ---- full emit_expr (with lambda support) ----
 
+# C type used for a raw local of an unboxable type. Matches the
+# `as.*` field widths in `KaiValue` (see runtime.h).
+fn raw_c_type(opt_ty: Option[Ty]) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyInt  -> "int64_t"
+      TyBool -> "int"
+      TyChar -> "uint32_t"
+      TyDimT(inner, _)    -> raw_c_type(Some(inner))
+      TyRefineT(inner, _) -> raw_c_type(Some(inner))
+      _ -> "int64_t /* raw_c_type: unexpected ty */"
+    }
+    None -> "int64_t /* raw_c_type: missing ty */"
+  }
+}
+
+# Wrap a raw C scalar into its boxed `KaiValue *` form. Picks the
+# constructor by `ty`. `kai_int` / `kai_bool` / `kai_char` are the
+# Phase 1 cache-aware constructors so small ints and chars stay
+# allocation-free at the boundary.
+fn box_wrap(opt_ty: Option[Ty], raw: String) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyInt  -> cat3("kai_int(",  raw, ")")
+      TyBool -> cat3("kai_bool(", raw, ")")
+      TyChar -> cat3("kai_char(", raw, ")")
+      TyDimT(inner, _)    -> box_wrap(Some(inner), raw)
+      TyRefineT(inner, _) -> box_wrap(Some(inner), raw)
+      _ -> cat3("kai_int(", raw, ") /* box_wrap: unexpected ty */")
+    }
+    None -> cat3("kai_int(", raw, ") /* box_wrap: missing ty */")
+  }
+}
+
+# Unbox a boxed `KaiValue *` into its raw C scalar. Used at the
+# `MBoxed → MUnboxed` boundary inside arithmetic operands.
+fn unbox_field_for(opt_ty: Option[Ty]) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyInt  -> "->as.i"
+      TyBool -> "->as.b"
+      TyChar -> "->as.c"
+      TyDimT(inner, _)    -> unbox_field_for(Some(inner))
+      TyRefineT(inner, _) -> unbox_field_for(Some(inner))
+      _ -> "->as.i /* unbox: unexpected ty */"
+    }
+    None -> "->as.i /* unbox: missing ty */"
+  }
+}
+
+# Emit the raw C scalar form of `x`. Caller has already established
+# that `x.ty` is unboxable; the result is `int64_t` / `int` /
+# `uint32_t` (depending on ty), no `KaiValue *` wrapper.
+#
+# When `x.mode` is `MUnboxed` the kind is one of the natively-raw
+# forms (literal, raw EVar, raw arith). When `x.mode` is `MBoxed`
+# we fall back to emitting boxed and tacking on the unbox field —
+# the boundary tactic from `docs/unboxing-phase2-design.md` §3.
+fn emit_expr_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
+                  variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  match x.mode {
+    MUnboxed -> emit_kind_raw(src, x, lcs, fns, variants, lams, cls)
+    _ -> {
+      let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+      cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+    }
+  }
+}
+
+fn emit_kind_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
+                  variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  match x.kind {
+    EInt(n)  -> cat2(int_to_string(n), "LL")
+    EBool(b) -> if b { "1" } else { "0" }
+    EChar(c) -> int_to_string(char_to_int(c))
+    EVar(name) -> cat2("kair_", name)
+    EBinop(op, a, b) ->
+      if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) {
+        concat_all(["(",
+                    emit_expr_raw(src, a, lcs, fns, variants, lams, cls),
+                    " ", raw_op_str(op), " ",
+                    emit_expr_raw(src, b, lcs, fns, variants, lams, cls),
+                    ")"])
+      } else {
+        # Conservative fallback: boxed expression then unbox.
+        let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+        cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+      }
+    EUnop(op, inner) ->
+      if op == "-" {
+        cat3("(-", emit_expr_raw(src, inner, lcs, fns, variants, lams, cls), ")")
+      } else if op == "not" {
+        cat3("(!", emit_expr_raw(src, inner, lcs, fns, variants, lams, cls), ")")
+      } else {
+        let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+        cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+      }
+    _ -> {
+      # Anything else: emit boxed and unwrap. The unbox_pass should
+      # not have marked these MUnboxed in the first place — defensive.
+      let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+      cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+    }
+  }
+}
+
 fn emit_expr(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  match x.mode {
+    MUnboxed -> {
+      # MUnboxed → MBoxed boundary: emit raw and wrap.
+      let raw = emit_expr_raw(src, x, lcs, fns, variants, lams, cls)
+      box_wrap(x.ty, raw)
+    }
+    _ -> emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+  }
+}
+
+fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match x.kind {
     EInt(n)      -> cat3("kai_int(", int_to_string(n), "LL)")
     EReal(r)     -> cat3("kai_real(", real_to_string(r), ")")
@@ -9841,13 +10105,21 @@ fn emit_expr(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [EVar], 
       }
     }
     EIf(c, a, opt_b) -> {
-      let cc = emit_expr(src, c, lcs, fns, variants, lams, cls)
+      # Tier 2.5 M4 — if the condition is already raw bool, skip
+      # the `kai_truthy` wrapper and use the C ternary directly.
+      let cc = match c.mode {
+        MUnboxed -> emit_expr_raw(src, c, lcs, fns, variants, lams, cls)
+        _ -> {
+          let cb = emit_expr(src, c, lcs, fns, variants, lams, cls)
+          concat_all(["kai_truthy(", cb, ")"])
+        }
+      }
       let tc = emit_expr(src, a, lcs, fns, variants, lams, cls)
       let ec = match opt_b {
         Some(eb) -> emit_expr(src, eb, lcs, fns, variants, lams, cls)
         None -> "kai_unit()"
       }
-      concat_all(["(kai_truthy(", cc, ") ? ", tc, " : ", ec, ")"])
+      concat_all(["(", cc, " ? ", tc, " : ", ec, ")"])
     }
     EMatch(scr, arms) -> emit_match_expr(src, scr, arms, lcs, fns, variants, lams, cls)
     ELambda(_, _) -> emit_lambda_ref(x, lcs, fns, variants, lams, cls)
@@ -10164,20 +10436,32 @@ fn emit_stmt_with_drops(src: String, s: Stmt, drops: [String],
 fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
                              drops: [String],
                              lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
-  let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
   match pat.pkind {
-    PBind(name) -> {
-      let bind = concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
-      if list_has(drops, name) {
-        cat2(bind, concat_all(["kai_decref(kai_", name, "); "]))
-      } else {
-        bind
+    # Tier 2.5 — raw scalar binding. The unbox pass marked the
+    # rhs `MUnboxed`, which means this binding is stored as a raw
+    # C scalar (no `KaiValue *`). RC bookkeeping does not apply
+    # — the local lives on the C stack and dies at block exit.
+    PBind(name) -> match rhs.mode {
+      MUnboxed -> {
+        let raw = emit_expr_raw(src, rhs, lcs, fns, variants, lams, cls)
+        let cty = raw_c_type(rhs.ty)
+        concat_all([cty, " kair_", name, " = ", raw, "; "])
+      }
+      _ -> {
+        let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
+        let bind = concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
+        if list_has(drops, name) {
+          cat2(bind, concat_all(["kai_decref(kai_", name, "); "]))
+        } else {
+          bind
+        }
       }
     }
     # `let _ = expr` discards the value. If RHS is a fresh
     # allocation we can decref it; otherwise the original behaviour
     # (no decref) is preserved to avoid double-freeing an alias.
     PWild -> {
+      let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
       if is_fresh_alloc(rhs) {
         cat3("{ KaiValue *_w = ", rhs_c, "; kai_decref(_w); } ")
       } else {
@@ -10190,6 +10474,7 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
       # block so the destructured names stay in scope for the rest
       # of the block. Drops do not apply to destructured names; the
       # `drops` argument here is for PBind only.
+      let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
       let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
                               int_to_string(pat.col)])
       # _letv holds the RHS's owned ref; not aliased.
@@ -10277,16 +10562,29 @@ fn is_fresh_alloc(e: Expr) : Bool {
 }
 
 fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
-  let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
   match pat.pkind {
-    PBind(name) -> concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
-    PWild -> cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
+    PBind(name) -> match rhs.mode {
+      MUnboxed -> {
+        let raw = emit_expr_raw(src, rhs, lcs, fns, variants, lams, cls)
+        let cty = raw_c_type(rhs.ty)
+        concat_all([cty, " kair_", name, " = ", raw, "; "])
+      }
+      _ -> {
+        let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
+        concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
+      }
+    }
+    PWild -> {
+      let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
+      cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
+    }
     _ -> {
       # m7d §28: destructuring let. Bind a unique temp and emit the
       # pattern's binds INTO THE ENCLOSING BLOCK (no `{...}`
       # wrapping) so the destructured names stay in scope for the
       # rest of the block. The temp name carries the source location
       # to avoid shadowing across nested let-destructurings.
+      let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
       let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
                               int_to_string(pat.col)])
       # _letv holds the RHS's owned ref; not aliased.
@@ -11110,7 +11408,7 @@ fn rewrite_alias_decl(d: Decl) : Decl {
 
 fn rewrite_alias_expr(e: Expr, m: AliasMap) : Expr =
   Expr { kind: rewrite_alias_kind(e.kind, m, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn rewrite_alias_opt(opt: Option[Expr], m: AliasMap) : Option[Expr] {
   match opt {
@@ -11436,7 +11734,7 @@ fn desugar_op_calls_decl(d: Decl, effs: [String]) : Decl {
 
 fn desugar_op_calls_expr(e: Expr, effs: [String]) : Expr =
   Expr { kind: desugar_op_calls_kind(e.kind, effs),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn desugar_op_calls_callee(callee: Expr, effs: [String]) : Expr {
   match callee.kind {
@@ -11498,7 +11796,7 @@ fn array_index_callee_set(line: Int, col: Int) : Expr =
 
 fn desugar_index_expr(e: Expr) : Expr =
   Expr { kind: desugar_index_kind(e.kind, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn desugar_index_opt(opt: Option[Expr]) : Option[Expr] {
   match opt {
@@ -11714,7 +12012,7 @@ fn desugar_const_refs_expr(e: Expr, const_names: [String]) : Expr {
               map(arms, (a) => desugar_const_refs_arm(a, const_names)))
     _ -> map_expr_kind(e.kind, (sub) => desugar_const_refs_expr(sub, const_names))
   }
-  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty }
+  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 }
 
 fn desugar_const_refs_arm(a: Arm, const_names: [String]) : Arm {
@@ -12367,7 +12665,7 @@ fn validate_var_in_block(stmts: [Stmt], tail: Option[Expr], caps: [String], file
 
 fn desugar_var_expr(e: Expr) : Expr =
   Expr { kind: desugar_var_kind(e.kind, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn desugar_var_opt(opt: Option[Expr]) : Option[Expr] {
   match opt {
@@ -12731,7 +13029,7 @@ fn ret_opt_contains(name: String, opt: Option[HReturn]) : Bool {
 # name is `<name>__slot`. Other expressions pass through.
 fn specialise_body(name: String, slot_name: String, e: Expr) : Expr {
   Expr { kind: specialise_kind(name, slot_name, e.kind, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 }
 
 fn specialise_kind(name: String, slot_name: String, k: ExprKind, line: Int, col: Int) : ExprKind {
@@ -12955,7 +13253,8 @@ fn use_rewrite_expr(e: Expr, table: [EffOps], opens: [String],
                       bound: [String], file: String, errs: Int) : UseRw {
   let r = use_rewrite_kind(e.kind, table, opens, bound, file, errs,
                             e.line, e.col)
-  UseRw { expr: Expr { kind: r.expr.kind, line: e.line, col: e.col, ty: e.ty },
+  UseRw { expr: Expr { kind: r.expr.kind, line: e.line, col: e.col,
+                       ty: e.ty, mode: e.mode },
           errs: r.errs }
 }
 
@@ -13454,7 +13753,7 @@ fn desugar_interp_decl(d: Decl, op_names: [String]) : Decl {
 
 fn desugar_interp_expr(e: Expr, op_names: [String]) : Expr =
   Expr { kind: desugar_interp_kind(e.kind, op_names, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn desugar_interp_kind(k: ExprKind, op_names: [String],
                         line: Int, col: Int) : ExprKind {
@@ -14797,7 +15096,8 @@ fn canon_uvars_expr(e: Expr, m: [IntPair]) : Expr {
     Some(t) -> Some(canon_uvars_ty(t, m))
     None    -> None
   }
-  Expr { kind: canon_uvars_kind(e.kind, m), line: e.line, col: e.col, ty: ty1 }
+  Expr { kind: canon_uvars_kind(e.kind, m), line: e.line, col: e.col,
+         ty: ty1, mode: e.mode }
 }
 
 fn canon_uvars_kind(k: ExprKind, m: [IntPair]) : ExprKind {
@@ -14850,7 +15150,8 @@ fn canon_tvars_expr(e: Expr, m: [IntPair]) : Expr {
     Some(t) -> Some(canon_tvars_ty(t, m))
     None    -> None
   }
-  Expr { kind: canon_tvars_kind(e.kind, m), line: e.line, col: e.col, ty: ty1 }
+  Expr { kind: canon_tvars_kind(e.kind, m), line: e.line, col: e.col,
+         ty: ty1, mode: e.mode }
 }
 
 fn canon_tvars_kind(k: ExprKind, m: [IntPair]) : ExprKind {
@@ -19871,7 +20172,7 @@ fn finalise_typed_expr(s: Subst, e: Expr) : Expr {
     None    -> None
   }
   Expr { kind: finalise_typed_kind(s, e.kind),
-         line: e.line, col: e.col, ty: ty1 }
+         line: e.line, col: e.col, ty: ty1, mode: e.mode }
 }
 
 fn finalise_typed_kind(s: Subst, k: ExprKind) : ExprKind =
@@ -20363,7 +20664,7 @@ fn expand_aliases_typeexpr(t: TypeExpr, aliases: [UAliasEntry]) : TypeExpr {
 
 fn expand_aliases_expr(e: Expr, aliases: [UAliasEntry]) : Expr {
   let new_kind = expand_aliases_exprkind(e.kind, aliases)
-  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty }
+  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 }
 
 fn expand_aliases_exprkind(k: ExprKind, aliases: [UAliasEntry]) : ExprKind {
@@ -21666,7 +21967,8 @@ fn subst_expr(e: Expr, sm: SubstMap) : Expr {
     Some(t) -> Some(subst_ty(t, sm))
     None    -> None
   }
-  Expr { kind: subst_kind(e.kind, sm), line: e.line, col: e.col, ty: ty1 }
+  Expr { kind: subst_kind(e.kind, sm), line: e.line, col: e.col,
+         ty: ty1, mode: e.mode }
 }
 
 fn subst_kind(k: ExprKind, sm: SubstMap) : ExprKind {
@@ -21979,7 +22281,7 @@ fn rewrite_callsites_expr_sm(e: Expr, insts: [ResolvedCS],
                               tuples: [MonoTuple], polys: [PolyFn],
                               sm: SubstMap) : Expr =
   Expr { kind: rewrite_callsites_kind_sm(e.kind, insts, tuples, polys, sm),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
                               tuples: [MonoTuple], polys: [PolyFn],
@@ -21994,7 +22296,7 @@ fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
               let mangled = mangle_name(name, tys, units)
               let new_callee = Expr { kind: EVar(mangled),
                                        line: callee.line, col: callee.col,
-                                       ty: callee.ty }
+                                       ty: callee.ty, mode: callee.mode }
               ECall(new_callee, new_args)
             } else {
               ECall(callee, new_args)
@@ -22180,6 +22482,360 @@ fn find_mono_inst(insts: [ResolvedCS], name: String,
 # bump the refcount via dup; unused params dropped at entry.
 # Inert until step 3 lands.
 
+# ---- Unbox analysis (Tier 2.5; see docs/unboxing-phase2-design.md) ----
+#
+# Sits between monomorphisation and perceus_pass. Walks every
+# top-level fn / test body and rewrites each `Expr.mode` from the
+# parser default (`MUnknown`) to either `MBoxed` (the current
+# everywhere behaviour) or `MUnboxed` (raw C scalar — `int64_t`
+# for `Int`, `int` for `Bool`, `uint32_t` for `Char`).
+#
+# The pass is local: it does not propagate across fn boundaries.
+# Function parameters and return values stay `MBoxed` per
+# Phase 2 non-goal #1; the call boundary is the cheapest place
+# to keep boxed.
+#
+# M3 (this commit): activates the analysis for `let x = <int-arith>`
+# style expressions. Local `let` bindings whose RHS is a numeric
+# `Int` arithmetic tree (`+ - * / // % ^`) collapse to raw
+# `int64_t` storage; subsequent reads stay raw inside other
+# arithmetic, and box at the call/return boundary. The emitter's
+# manual box/unbox dance for the bit-ops intrinsics
+# (`emit_call_value` lines ~7920–8060) collapses naturally because
+# the operands now carry `MUnboxed` straight through.
+#
+# Subsequent milestones extend the analysis to comparisons, EIf
+# cond, and match scrutinees.
+fn unbox_pass(decls: [Decl]) : [Decl] = map(decls, unbox_decl)
+
+fn unbox_decl(d: Decl) : Decl {
+  match d {
+    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) ->
+      DFn(is_pub, name, tparams, params, opt_ret, row,
+          unbox_expr(body, []), ln, cl, mo)
+    DTest(desc, body, ln, cl) -> DTest(desc, unbox_expr(body, []), ln, cl)
+    DImpl(name, ty, sub_decls, l, c) ->
+      DImpl(name, ty, map(sub_decls, unbox_decl), l, c)
+    DDerive(ps, inner, l, c) -> DDerive(ps, unbox_decl(inner), l, c)
+    _ -> d
+  }
+}
+
+# `LocBind` records the chosen mode for a local binding so EVar
+# references resolve to the binding's mode. Function parameters
+# and unknown names default to MBoxed (Phase 2 non-goal #1).
+type LocBind = LB(String, ValueMode)
+
+fn lb_lookup(env: [LocBind], nm: String) : ValueMode {
+  match env {
+    [] -> MBoxed
+    [LB(n, m), ...rest] -> if n == nm { m } else { lb_lookup(rest, nm) }
+  }
+}
+
+# `ty_is_unboxable` decides whether the runtime representation can
+# be a raw C scalar. Currently `Int`, `Bool`, `Char`. `Real` and
+# `String` stay boxed in v1 (see Phase 2 non-goals). Wrapper types
+# (refinement, dim) strip to their inner before checking.
+fn ty_is_unboxable(opt_t: Option[Ty]) : Bool {
+  match opt_t {
+    Some(t) -> ty_is_unboxable_t(t)
+    None    -> false
+  }
+}
+
+fn ty_is_unboxable_t(t: Ty) : Bool {
+  match t {
+    TyInt  -> true
+    TyBool -> true
+    TyChar -> true
+    TyDimT(inner, _)    -> ty_is_unboxable_t(inner)
+    TyRefineT(inner, _) -> ty_is_unboxable_t(inner)
+    _ -> false
+  }
+}
+
+# Numeric binops whose raw form is a single C operator on `int64_t`.
+# `^` (integer power) and `//` (integer division) are not native C
+# operators, so they stay boxed for now and route through `kai_pow_int`
+# / `kai_idiv` as before (M3 v1 conservative; follow-up if hot).
+fn op_is_raw_arith(op: String) : Bool {
+  op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
+}
+
+# Tier 2.5 M4 — comparison operators that produce a raw `int`
+# (0 or 1) from two raw operands. Equality / inequality on raw
+# `int64_t` reduce to native C `==` / `!=`.
+fn op_is_raw_cmp(op: String) : Bool {
+  op == "<" or op == ">" or op == "<=" or op == ">=" or
+  op == "==" or op == "!="
+}
+
+# Tier 2.5 M4 — short-circuiting boolean operators. `and` / `or`
+# in kaikai mirror C `&&` / `||` (short-circuit, evaluate left
+# first). Safe to lower as raw when both operands are raw bools.
+fn op_is_raw_logical(op: String) : Bool {
+  op == "and" or op == "or"
+}
+
+fn raw_op_str(op: String) : String {
+  if op == "and" { "&&" }
+  else if op == "or" { "||" }
+  else { op }
+}
+
+# Walk an Expr tree assigning each node its representation mode.
+# Bottom-up except for the env, which threads top-down through
+# `EBlock` / SLet to record raw locals. Children inside slots that
+# only accept boxed (calls, records, lists, closures, return) are
+# free to be `MUnboxed`; the emitter wraps at the boundary.
+fn unbox_expr(e: Expr, env: [LocBind]) : Expr {
+  let kind1 = unbox_kind(e.kind, env)
+  let mode1 = decide_mode(kind1, e.ty, env)
+  Expr { kind: kind1, line: e.line, col: e.col, ty: e.ty, mode: mode1 }
+}
+
+fn unbox_kind(k: ExprKind, env: [LocBind]) : ExprKind {
+  match k {
+    EInt(_)        -> k
+    EReal(_)       -> k
+    EBool(_)       -> k
+    EChar(_)       -> k
+    EStr(_, _)     -> k
+    EUnit          -> k
+    EVar(_)        -> k
+    EUnder         -> k
+    EPlaceholder   -> k
+    EHole(_)       -> k
+    ETodo(_)       -> k
+    EVariantsOf(_, _) -> k
+    EModCall(_, _) -> k
+    ECall(callee, args_) -> ECall(unbox_expr(callee, env),
+                                   map(args_, (a) => unbox_expr(a, env)))
+    EField(base, name)   -> EField(unbox_expr(base, env), name)
+    EIndex(a, b)         -> EIndex(unbox_expr(a, env), unbox_expr(b, env))
+    EBinop(op, a, b)     -> EBinop(op, unbox_expr(a, env), unbox_expr(b, env))
+    EUnop(op, x)         -> EUnop(op, unbox_expr(x, env))
+    EIf(c, t_, eo)       -> EIf(unbox_expr(c, env), unbox_expr(t_, env),
+                                 unbox_opt(eo, env))
+    EMatch(scr, arms)    -> EMatch(unbox_expr(scr, env),
+                                    map(arms, (a) => unbox_arm(a, env)))
+    # Closure boundary: free vars captured into the closure record
+    # are always boxed (per Phase 2 non-goal table). The lambda's
+    # own body sees no caller env — its locals are independent.
+    ELambda(ps, b)       -> ELambda(ps, unbox_expr(b, []))
+    ERecordLit(name, fs) -> ERecordLit(name, map(fs, (fi) => unbox_field(fi, env)))
+    EList(els)           -> EList(map(els, (el) => unbox_elem(el, env)))
+    ERange(a, b, opt_step) -> ERange(unbox_expr(a, env), unbox_expr(b, env),
+                                       unbox_opt(opt_step, env))
+    EBlock(stmts, tail)  -> {
+      let r = unbox_stmts(stmts, tail, env, [])
+      let stmts1 = match r { UbStmts(ss, _) -> ss }
+      let env1   = match r { UbStmts(_, e1) -> e1 }
+      EBlock(stmts1, unbox_opt(tail, env1))
+    }
+    EPipe(a, b)          -> EPipe(unbox_expr(a, env), unbox_expr(b, env))
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      # The handled body opens a fresh dynamic scope for the effect
+      # capability. v1 walks it with the outer env (no bindings
+      # leak into the handler's continuation captures).
+      EHandle(unbox_expr(body, env), eff_name, eff_tyargs,
+              unbox_opt(init_opt, env), alias_opt,
+              map(clauses, (c) => unbox_clause(c, env)),
+              unbox_opt_return(ret_opt, env))
+    ELitUnit(inner, u)   -> ELitUnit(unbox_expr(inner, env), u)
+    EBang(inner)         -> EBang(unbox_expr(inner, env))
+  }
+}
+
+fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
+  if not ty_is_unboxable(opt_ty) { MBoxed }
+  else {
+    match k {
+      EInt(_)  -> MUnboxed
+      EBool(_) -> MUnboxed
+      EChar(_) -> MUnboxed
+      EVar(nm) -> lb_lookup(env, nm)
+      # Conservative: only mark composite raw when both operands are
+      # already raw. Mixing a boxed operand into a raw arithmetic
+      # node would force the emitter to unbox via `(...)->as.i`,
+      # which leaks the boxed allocation (no decref). Keeping the
+      # whole node MBoxed routes through `kai_add` etc. which
+      # consume their args correctly.
+      EBinop(op, a, b) ->
+        if op_is_raw_arith(op) and child_is_raw(a) and child_is_raw(b) { MUnboxed }
+        # M4 — comparisons and short-circuiting booleans collapse to
+        # native C operators when both operands are raw. The result
+        # is a raw `int` (0/1) which the boundary tactic re-boxes
+        # via `kai_bool` if a consumer wants `KaiValue *`.
+        else if op_is_raw_cmp(op) and child_is_raw(a) and child_is_raw(b) { MUnboxed }
+        else if op_is_raw_logical(op) and child_is_raw(a) and child_is_raw(b) { MUnboxed }
+        else { MBoxed }
+      EUnop(op, x) ->
+        if op == "-" and child_is_raw(x) { MUnboxed }
+        else if op == "not" and child_is_raw(x) { MUnboxed }
+        else { MBoxed }
+      _ -> MBoxed
+    }
+  }
+}
+
+fn child_is_raw(e: Expr) : Bool {
+  match e.mode { MUnboxed -> true _ -> false }
+}
+
+fn unbox_opt(opt: Option[Expr], env: [LocBind]) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(unbox_expr(e, env))
+    None    -> None
+  }
+}
+
+fn unbox_arm(a: Arm, env: [LocBind]) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, unbox_opt(g, env), unbox_expr(b, env))
+  }
+}
+
+fn unbox_field(fi: FieldInit, env: [LocBind]) : FieldInit {
+  match fi {
+    FI(n, v) -> FI(n, unbox_expr(v, env))
+  }
+}
+
+fn unbox_elem(el: ListElem, env: [LocBind]) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(unbox_expr(x, env))
+    ElSpread(x) -> ElSpread(unbox_expr(x, env))
+  }
+}
+
+fn unbox_clause(c: HClause, env: [LocBind]) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, unbox_expr(b, env), l, co)
+  }
+}
+
+fn unbox_opt_return(opt: Option[HReturn], env: [LocBind]) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(unbox_return(r, env))
+    None    -> None
+  }
+}
+
+fn unbox_return(r: HReturn, env: [LocBind]) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, unbox_expr(b, env), l, c)
+  }
+}
+
+type UbStmts = UbStmts([Stmt], [LocBind])
+
+fn unbox_stmts(stmts: [Stmt], tail: Option[Expr], env: [LocBind], acc: [Stmt]) : UbStmts {
+  match stmts {
+    [] -> UbStmts(list_reverse(acc), env)
+    [s, ...rest] -> {
+      let r = unbox_stmt(s, rest, tail, env)
+      let s1 = match r { UbStmt(s_, _) -> s_ }
+      let e1 = match r { UbStmt(_, ev) -> ev }
+      unbox_stmts(rest, tail, e1, [s1, ...acc])
+    }
+  }
+}
+
+type UbStmt = UbStmt(Stmt, [LocBind])
+
+fn unbox_stmt(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind]) : UbStmt {
+  match s {
+    SLet(pat, ann, rhs) -> {
+      let rhs1 = unbox_expr(rhs, env)
+      match pat.pkind {
+        PBind(nm) -> match rhs1.mode {
+          MUnboxed -> {
+            # Closure capture stays boxed (Phase 2 non-goal table:
+            # `Closure capture (ELambda free var) → boxed`). If `nm`
+            # is referenced from within any subsequent ELambda, the
+            # capture array would expect `kai_<nm>` and find a raw
+            # `int64_t` — break the boxed convention. Demote to
+            # MBoxed so the binding lives as `KaiValue *kai_<nm>`
+            # and the unbox/wrap happens at the read site.
+            if name_captured_in_block(rest, tail, nm) {
+              let rhs_box = expr_to_boxed(rhs1)
+              UbStmt(SLet(pat, ann, rhs_box), env)
+            } else {
+              UbStmt(SLet(pat, ann, rhs1), [LB(nm, MUnboxed), ...env])
+            }
+          }
+          _ -> UbStmt(SLet(pat, ann, rhs1), env)
+        }
+        _ -> UbStmt(SLet(pat, ann, rhs1), env)
+      }
+    }
+    SVar(n, ty, rhs, l, c) -> UbStmt(SVar(n, ty, unbox_expr(rhs, env), l, c), env)
+    SAssert(cond, m) -> UbStmt(SAssert(unbox_expr(cond, env), unbox_opt(m, env)), env)
+    SExprStmt(x) -> UbStmt(SExprStmt(unbox_expr(x, env)), env)
+    SIndexAssign(b, i, v, l, c) ->
+      UbStmt(SIndexAssign(unbox_expr(b, env), unbox_expr(i, env),
+                          unbox_expr(v, env), l, c), env)
+    SUse(n, l, c) -> UbStmt(SUse(n, l, c), env)
+  }
+}
+
+# Demote an Expr's outer mode to MBoxed. Children retain their own
+# modes — emit_expr handles the boundary wrap on the way down.
+fn expr_to_boxed(e: Expr) : Expr =
+  Expr { kind: e.kind, line: e.line, col: e.col, ty: e.ty, mode: MBoxed }
+
+# True if `nm` is referenced from within any ELambda body in the
+# remainder of the block (subsequent stmts and the trailing
+# expression). Re-uses `scan_uses_expr` which already marks each
+# Use with its `in_lam` flag.
+fn name_captured_in_block(rest: [Stmt], opt_tail: Option[Expr], nm: String) : Bool {
+  if any_stmt_captures(rest, nm) { true }
+  else { match opt_tail {
+    None -> false
+    Some(e) -> uses_have_in_lam(scan_uses_expr(e, false), nm)
+  } }
+}
+
+fn any_stmt_captures(stmts: [Stmt], nm: String) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> if stmt_captures(s, nm) { true }
+                    else { any_stmt_captures(rest, nm) }
+  }
+}
+
+fn stmt_captures(s: Stmt, nm: String) : Bool {
+  match s {
+    SLet(_, _, rhs)        -> uses_have_in_lam(scan_uses_expr(rhs, false), nm)
+    SVar(_, _, rhs, _, _)  -> uses_have_in_lam(scan_uses_expr(rhs, false), nm)
+    SAssert(c, opt_m)      -> {
+      if uses_have_in_lam(scan_uses_expr(c, false), nm) { true }
+      else { match opt_m {
+        None -> false
+        Some(m) -> uses_have_in_lam(scan_uses_expr(m, false), nm)
+      } }
+    }
+    SExprStmt(e)           -> uses_have_in_lam(scan_uses_expr(e, false), nm)
+    SIndexAssign(b, i, v, _, _) ->
+      uses_have_in_lam(scan_uses_expr(b, false), nm) or
+      uses_have_in_lam(scan_uses_expr(i, false), nm) or
+      uses_have_in_lam(scan_uses_expr(v, false), nm)
+    SUse(_, _, _)          -> false
+  }
+}
+
+fn uses_have_in_lam(uses: [Use], nm: String) : Bool {
+  match uses {
+    [] -> false
+    [u, ...rest] -> match u {
+      U(n, _, _, in_lam) ->
+        if n == nm and in_lam { true } else { uses_have_in_lam(rest, nm) }
+    }
+  }
+}
+
 fn perceus_pass(decls: [Decl]) : [Decl] = map(decls, perceus_decl)
 
 fn perceus_decl(d: Decl) : Decl {
@@ -22338,7 +22994,10 @@ fn pcs_block_loop(stmts: [Stmt], scope: [String], in_lam: Bool,
       let nxt = match s {
         SLet(pat, _, rhs) -> {
           let acc1 = pcs_collect_uses_expr(rhs, scope, in_lam, acc)
-          PcsBlockState { scope: pat_bindings(pat, scope), acc: acc1 }
+          # Raw locals (Tier 2.5) are not tracked by Perceus —
+          # `int64_t` lives on the C stack and dies at block exit,
+          # there is no refcount to dup/drop. Skip them from scope.
+          PcsBlockState { scope: pat_bindings_skip_raw(pat, rhs, scope), acc: acc1 }
         }
         SVar(name, _, rhs, _, _) -> {
           let acc1 = pcs_collect_uses_expr(rhs, scope, in_lam, acc)
@@ -22432,7 +23091,7 @@ fn pcs_collect_uses_interp_parts(parts: [IPart], scope: [String], in_lam: Bool,
 
 fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool) : Expr =
   Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
                     uses: [Use], in_lam: Bool) : ExprKind {
@@ -22441,8 +23100,10 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     EVar(nm) -> {
       if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam) {
         ECall(
-          Expr { kind: EVar("__perceus_dup"), line: line, col: col, ty: None },
-          [Expr { kind: EVar(nm), line: line, col: col, ty: None }]
+          Expr { kind: EVar("__perceus_dup"), line: line, col: col,
+                 ty: None, mode: MUnknown },
+          [Expr { kind: EVar(nm), line: line, col: col,
+                  ty: None, mode: MUnknown }]
         )
       } else { EVar(nm) }
     }
@@ -22533,7 +23194,12 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool) : PcsRw
   match s {
     SLet(pat, ty_opt, rhs) -> {
       let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam)
-      PcsRwStmt { stmt: SLet(pat, ty_opt, rhs1), scope: pat_bindings(pat, scope) }
+      # See `pcs_collect_uses_in_block` SLet — raw locals stay
+      # outside the Perceus scope so EVar reads of them are not
+      # rewritten into `__perceus_dup` calls (which expect boxed
+      # arguments).
+      PcsRwStmt { stmt: SLet(pat, ty_opt, rhs1),
+                  scope: pat_bindings_skip_raw(pat, rhs, scope) }
     }
     SVar(name, ty_opt, rhs, ln, cl) -> {
       let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam)
@@ -22966,7 +23632,8 @@ fn pcs_prepend_unused_drops(body: Expr, params: [Param], uses: [Use]) : Expr {
 
 fn pcs_wrap_with_exit(body: Expr, entry: [Stmt], exit_: [Stmt]) : Expr {
   match exit_ {
-    [] -> Expr { kind: EBlock(entry, Some(body)), line: body.line, col: body.col, ty: body.ty }
+    [] -> Expr { kind: EBlock(entry, Some(body)), line: body.line, col: body.col,
+                 ty: body.ty, mode: body.mode }
     [_, ...__] -> {
       let ret_let = SLet(
         Pattern { pkind: PBind("__pcs_ret"), line: body.line, col: body.col },
@@ -22974,8 +23641,10 @@ fn pcs_wrap_with_exit(body: Expr, entry: [Stmt], exit_: [Stmt]) : Expr {
         body
       )
       let stmts = list_append(entry, [ret_let, ...exit_])
-      let tail = Expr { kind: EVar("__pcs_ret"), line: body.line, col: body.col, ty: body.ty }
-      Expr { kind: EBlock(stmts, Some(tail)), line: body.line, col: body.col, ty: body.ty }
+      let tail = Expr { kind: EVar("__pcs_ret"), line: body.line, col: body.col,
+                        ty: body.ty, mode: body.mode }
+      Expr { kind: EBlock(stmts, Some(tail)), line: body.line, col: body.col,
+             ty: body.ty, mode: body.mode }
     }
   }
 }
@@ -23013,10 +23682,12 @@ fn pcs_collect_exit_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
 fn pcs_make_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
   SExprStmt(Expr {
     kind: ECall(
-      Expr { kind: EVar("__perceus_drop"), line: ln, col: cl, ty: None },
-      [Expr { kind: EVar(nm), line: ln, col: cl, ty: None }]
+      Expr { kind: EVar("__perceus_drop"), line: ln, col: cl,
+             ty: None, mode: MUnknown },
+      [Expr { kind: EVar(nm), line: ln, col: cl,
+              ty: None, mode: MUnknown }]
     ),
-    line: ln, col: cl, ty: None
+    line: ln, col: cl, ty: None, mode: MUnknown
   })
 
 # ---- m5 #2 — last-use analysis (fn-param scope) ----
@@ -24471,6 +25142,13 @@ fn llvm_binop_helper(op: String) : Option[String] {
 
 # ---- expression emission ----
 
+# Tier 2.5 M6 — the LLVM backend currently ignores `x.mode` and
+# emits every node as boxed (calling `kaix_int` / `kaix_add` /
+# `kaix_eq` runtime helpers). This is internally consistent —
+# `make -C stage2 selfhost-llvm` still reaches its fixed point
+# byte-identically — but a `--emit-llvm` binary does not see the
+# raw `int64_t` collapse the C backend gets. The real mirror is
+# tracked in `docs/unboxing-phase2-followup.md`.
 fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
   match x.kind {
     EInt(n) -> {
@@ -27132,7 +27810,8 @@ fn rqc_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console = match d
 }
 
 fn rqc_expr(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : Expr / Console =
-  Expr { kind: rqc_kind(e, locals, mt, file), line: e.line, col: e.col, ty: e.ty }
+  Expr { kind: rqc_kind(e, locals, mt, file), line: e.line, col: e.col,
+         ty: e.ty, mode: e.mode }
 
 # m6.2 diagnostics: emit a specific message when the user wrote
 # `mod.fname` against a known imported module that does not export
@@ -29028,7 +29707,7 @@ fn rename_pfields_names(fs: [PField], acc: [String]) : [String] {
 
 fn rename_proto_calls_expr(e: Expr, op_arities: [OpAr], bound: [String]) : Expr =
   Expr { kind: rename_proto_calls_kind(e.kind, op_arities, bound),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn rename_proto_calls_opt(o: Option[Expr], op_arities: [OpAr], bound: [String]) : Option[Expr] {
   match o {
@@ -29255,7 +29934,7 @@ fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg) : Decl {
 
 fn resolve_protocol_calls_expr(e: Expr, reg: ProtocolReg) : Expr =
   Expr { kind: resolve_protocol_calls_kind(e.kind, reg, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
                                 line: Int, col: Int) : ExprKind {
@@ -30874,9 +31553,14 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       # ids fall outside the domain are skipped.
                       let mono_leaks = match mono_out { MonoOut(_, ls) -> ls }
                       let mono_inv_errs = report_mono_leaks(path, mono_leaks)
+                      # Tier 2.5 — unbox analysis (M2: no-op identity).
+                      # Runs between monomorphisation and perceus so
+                      # the perceus pass sees post-unbox modes (it
+                      # only inserts dup/drop on `MBoxed` nodes).
+                      let unboxed_decls = unbox_pass(mono_decls)
                       # m5 #1 — basic Perceus walker (identity).
                       # m5 #2-#4 fill in last-use analysis + dup/drop.
-                      let perceus_decls = perceus_pass(mono_decls)
+                      let perceus_decls = perceus_pass(unboxed_decls)
                       let test_mode = match mode { MTest -> true _ -> false }
                       let use_llvm = match mode { MEmitLlvm -> true _ -> false }
                       if mono_inv_errs != 0 { mono_inv_errs }
