@@ -8954,6 +8954,22 @@ fn pat_bindings(pat: Pattern, acc: [String]) : [String] {
   }
 }
 
+# Like `pat_bindings`, but if the pattern is a single `PBind` and
+# the let's RHS is `MUnboxed`, the binding is a raw C scalar and
+# must NOT enter the Perceus tracking scope. All other shapes —
+# destructured lets, wildcards, literals — defer to the standard
+# `pat_bindings` walker. See `docs/unboxing-phase2-design.md` §3
+# (boundary tactic) for the coordination contract.
+fn pat_bindings_skip_raw(pat: Pattern, rhs: Expr, acc: [String]) : [String] {
+  match pat.pkind {
+    PBind(name) -> match rhs.mode {
+      MUnboxed -> acc
+      _        -> [name, ...acc]
+    }
+    _ -> pat_bindings(pat, acc)
+  }
+}
+
 fn pat_bindings_loop(ps: [Pattern], acc: [String]) : [String] {
   match ps {
     [] -> acc
@@ -9791,7 +9807,122 @@ fn emit_lambda_ref(x: Expr, lcs: [String], fns: [EFn], variants: [EVar], lams: [
 
 # ---- full emit_expr (with lambda support) ----
 
+# C type used for a raw local of an unboxable type. Matches the
+# `as.*` field widths in `KaiValue` (see runtime.h).
+fn raw_c_type(opt_ty: Option[Ty]) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyInt  -> "int64_t"
+      TyBool -> "int"
+      TyChar -> "uint32_t"
+      TyDimT(inner, _)    -> raw_c_type(Some(inner))
+      TyRefineT(inner, _) -> raw_c_type(Some(inner))
+      _ -> "int64_t /* raw_c_type: unexpected ty */"
+    }
+    None -> "int64_t /* raw_c_type: missing ty */"
+  }
+}
+
+# Wrap a raw C scalar into its boxed `KaiValue *` form. Picks the
+# constructor by `ty`. `kai_int` / `kai_bool` / `kai_char` are the
+# Phase 1 cache-aware constructors so small ints and chars stay
+# allocation-free at the boundary.
+fn box_wrap(opt_ty: Option[Ty], raw: String) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyInt  -> cat3("kai_int(",  raw, ")")
+      TyBool -> cat3("kai_bool(", raw, ")")
+      TyChar -> cat3("kai_char(", raw, ")")
+      TyDimT(inner, _)    -> box_wrap(Some(inner), raw)
+      TyRefineT(inner, _) -> box_wrap(Some(inner), raw)
+      _ -> cat3("kai_int(", raw, ") /* box_wrap: unexpected ty */")
+    }
+    None -> cat3("kai_int(", raw, ") /* box_wrap: missing ty */")
+  }
+}
+
+# Unbox a boxed `KaiValue *` into its raw C scalar. Used at the
+# `MBoxed → MUnboxed` boundary inside arithmetic operands.
+fn unbox_field_for(opt_ty: Option[Ty]) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyInt  -> "->as.i"
+      TyBool -> "->as.b"
+      TyChar -> "->as.c"
+      TyDimT(inner, _)    -> unbox_field_for(Some(inner))
+      TyRefineT(inner, _) -> unbox_field_for(Some(inner))
+      _ -> "->as.i /* unbox: unexpected ty */"
+    }
+    None -> "->as.i /* unbox: missing ty */"
+  }
+}
+
+# Emit the raw C scalar form of `x`. Caller has already established
+# that `x.ty` is unboxable; the result is `int64_t` / `int` /
+# `uint32_t` (depending on ty), no `KaiValue *` wrapper.
+#
+# When `x.mode` is `MUnboxed` the kind is one of the natively-raw
+# forms (literal, raw EVar, raw arith). When `x.mode` is `MBoxed`
+# we fall back to emitting boxed and tacking on the unbox field —
+# the boundary tactic from `docs/unboxing-phase2-design.md` §3.
+fn emit_expr_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
+                  variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  match x.mode {
+    MUnboxed -> emit_kind_raw(src, x, lcs, fns, variants, lams, cls)
+    _ -> {
+      let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+      cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+    }
+  }
+}
+
+fn emit_kind_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
+                  variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  match x.kind {
+    EInt(n)  -> cat2(int_to_string(n), "LL")
+    EBool(b) -> if b { "1" } else { "0" }
+    EChar(c) -> int_to_string(char_to_int(c))
+    EVar(name) -> cat2("kair_", name)
+    EBinop(op, a, b) ->
+      if op_is_raw_arith(op) {
+        concat_all(["(",
+                    emit_expr_raw(src, a, lcs, fns, variants, lams, cls),
+                    " ", op, " ",
+                    emit_expr_raw(src, b, lcs, fns, variants, lams, cls),
+                    ")"])
+      } else {
+        # Conservative fallback: boxed expression then unbox.
+        let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+        cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+      }
+    EUnop(op, inner) ->
+      if op == "-" {
+        cat3("(-", emit_expr_raw(src, inner, lcs, fns, variants, lams, cls), ")")
+      } else {
+        let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+        cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+      }
+    _ -> {
+      # Anything else: emit boxed and unwrap. The unbox_pass should
+      # not have marked these MUnboxed in the first place — defensive.
+      let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+      cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+    }
+  }
+}
+
 fn emit_expr(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  match x.mode {
+    MUnboxed -> {
+      # MUnboxed → MBoxed boundary: emit raw and wrap.
+      let raw = emit_expr_raw(src, x, lcs, fns, variants, lams, cls)
+      box_wrap(x.ty, raw)
+    }
+    _ -> emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+  }
+}
+
+fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match x.kind {
     EInt(n)      -> cat3("kai_int(", int_to_string(n), "LL)")
     EReal(r)     -> cat3("kai_real(", real_to_string(r), ")")
@@ -10180,20 +10311,32 @@ fn emit_stmt_with_drops(src: String, s: Stmt, drops: [String],
 fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
                              drops: [String],
                              lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
-  let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
   match pat.pkind {
-    PBind(name) -> {
-      let bind = concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
-      if list_has(drops, name) {
-        cat2(bind, concat_all(["kai_decref(kai_", name, "); "]))
-      } else {
-        bind
+    # Tier 2.5 — raw scalar binding. The unbox pass marked the
+    # rhs `MUnboxed`, which means this binding is stored as a raw
+    # C scalar (no `KaiValue *`). RC bookkeeping does not apply
+    # — the local lives on the C stack and dies at block exit.
+    PBind(name) -> match rhs.mode {
+      MUnboxed -> {
+        let raw = emit_expr_raw(src, rhs, lcs, fns, variants, lams, cls)
+        let cty = raw_c_type(rhs.ty)
+        concat_all([cty, " kair_", name, " = ", raw, "; "])
+      }
+      _ -> {
+        let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
+        let bind = concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
+        if list_has(drops, name) {
+          cat2(bind, concat_all(["kai_decref(kai_", name, "); "]))
+        } else {
+          bind
+        }
       }
     }
     # `let _ = expr` discards the value. If RHS is a fresh
     # allocation we can decref it; otherwise the original behaviour
     # (no decref) is preserved to avoid double-freeing an alias.
     PWild -> {
+      let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
       if is_fresh_alloc(rhs) {
         cat3("{ KaiValue *_w = ", rhs_c, "; kai_decref(_w); } ")
       } else {
@@ -10206,6 +10349,7 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
       # block so the destructured names stay in scope for the rest
       # of the block. Drops do not apply to destructured names; the
       # `drops` argument here is for PBind only.
+      let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
       let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
                               int_to_string(pat.col)])
       # _letv holds the RHS's owned ref; not aliased.
@@ -10293,16 +10437,29 @@ fn is_fresh_alloc(e: Expr) : Bool {
 }
 
 fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
-  let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
   match pat.pkind {
-    PBind(name) -> concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
-    PWild -> cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
+    PBind(name) -> match rhs.mode {
+      MUnboxed -> {
+        let raw = emit_expr_raw(src, rhs, lcs, fns, variants, lams, cls)
+        let cty = raw_c_type(rhs.ty)
+        concat_all([cty, " kair_", name, " = ", raw, "; "])
+      }
+      _ -> {
+        let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
+        concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
+      }
+    }
+    PWild -> {
+      let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
+      cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
+    }
     _ -> {
       # m7d §28: destructuring let. Bind a unique temp and emit the
       # pattern's binds INTO THE ENCLOSING BLOCK (no `{...}`
       # wrapping) so the destructured names stay in scope for the
       # rest of the block. The temp name carries the source location
       # to avoid shadowing across nested let-destructurings.
+      let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
       let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
                               int_to_string(pat.col)])
       # _letv holds the RHS's owned ref; not aliased.
@@ -22213,18 +22370,25 @@ fn find_mono_inst(insts: [ResolvedCS], name: String,
 # Phase 2 non-goal #1; the call boundary is the cheapest place
 # to keep boxed.
 #
-# M2 (this commit): identity pass — every node lands at `MBoxed`.
-# Selfhost stays byte-identical because the emitter does not yet
-# branch on `mode`. Subsequent milestones turn on the analysis
-# and the emitter switches.
+# M3 (this commit): activates the analysis for `let x = <int-arith>`
+# style expressions. Local `let` bindings whose RHS is a numeric
+# `Int` arithmetic tree (`+ - * / // % ^`) collapse to raw
+# `int64_t` storage; subsequent reads stay raw inside other
+# arithmetic, and box at the call/return boundary. The emitter's
+# manual box/unbox dance for the bit-ops intrinsics
+# (`emit_call_value` lines ~7920–8060) collapses naturally because
+# the operands now carry `MUnboxed` straight through.
+#
+# Subsequent milestones extend the analysis to comparisons, EIf
+# cond, and match scrutinees.
 fn unbox_pass(decls: [Decl]) : [Decl] = map(decls, unbox_decl)
 
 fn unbox_decl(d: Decl) : Decl {
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) ->
       DFn(is_pub, name, tparams, params, opt_ret, row,
-          unbox_expr(body), ln, cl, mo)
-    DTest(desc, body, ln, cl) -> DTest(desc, unbox_expr(body), ln, cl)
+          unbox_expr(body, []), ln, cl, mo)
+    DTest(desc, body, ln, cl) -> DTest(desc, unbox_expr(body, []), ln, cl)
     DImpl(name, ty, sub_decls, l, c) ->
       DImpl(name, ty, map(sub_decls, unbox_decl), l, c)
     DDerive(ps, inner, l, c) -> DDerive(ps, unbox_decl(inner), l, c)
@@ -22232,9 +22396,292 @@ fn unbox_decl(d: Decl) : Decl {
   }
 }
 
-fn unbox_expr(e: Expr) : Expr =
-  Expr { kind: map_expr_kind(e.kind, unbox_expr),
-         line: e.line, col: e.col, ty: e.ty, mode: MBoxed }
+# `LocBind` records the chosen mode for a local binding so EVar
+# references resolve to the binding's mode. Function parameters
+# and unknown names default to MBoxed (Phase 2 non-goal #1).
+type LocBind = LB(String, ValueMode)
+
+fn lb_lookup(env: [LocBind], nm: String) : ValueMode {
+  match env {
+    [] -> MBoxed
+    [LB(n, m), ...rest] -> if n == nm { m } else { lb_lookup(rest, nm) }
+  }
+}
+
+# `ty_is_unboxable` decides whether the runtime representation can
+# be a raw C scalar. Currently `Int`, `Bool`, `Char`. `Real` and
+# `String` stay boxed in v1 (see Phase 2 non-goals). Wrapper types
+# (refinement, dim) strip to their inner before checking.
+fn ty_is_unboxable(opt_t: Option[Ty]) : Bool {
+  match opt_t {
+    Some(t) -> ty_is_unboxable_t(t)
+    None    -> false
+  }
+}
+
+fn ty_is_unboxable_t(t: Ty) : Bool {
+  match t {
+    TyInt  -> true
+    TyBool -> true
+    TyChar -> true
+    TyDimT(inner, _)    -> ty_is_unboxable_t(inner)
+    TyRefineT(inner, _) -> ty_is_unboxable_t(inner)
+    _ -> false
+  }
+}
+
+# Numeric binops whose raw form is a single C operator on `int64_t`.
+# `^` (integer power) and `//` (integer division) are not native C
+# operators, so they stay boxed for now and route through `kai_pow_int`
+# / `kai_idiv` as before (M3 v1 conservative; follow-up if hot).
+fn op_is_raw_arith(op: String) : Bool {
+  op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
+}
+
+# Walk an Expr tree assigning each node its representation mode.
+# Bottom-up except for the env, which threads top-down through
+# `EBlock` / SLet to record raw locals. Children inside slots that
+# only accept boxed (calls, records, lists, closures, return) are
+# free to be `MUnboxed`; the emitter wraps at the boundary.
+fn unbox_expr(e: Expr, env: [LocBind]) : Expr {
+  let kind1 = unbox_kind(e.kind, env)
+  let mode1 = decide_mode(kind1, e.ty, env)
+  Expr { kind: kind1, line: e.line, col: e.col, ty: e.ty, mode: mode1 }
+}
+
+fn unbox_kind(k: ExprKind, env: [LocBind]) : ExprKind {
+  match k {
+    EInt(_)        -> k
+    EReal(_)       -> k
+    EBool(_)       -> k
+    EChar(_)       -> k
+    EStr(_, _)     -> k
+    EUnit          -> k
+    EVar(_)        -> k
+    EUnder         -> k
+    EPlaceholder   -> k
+    EHole(_)       -> k
+    ETodo(_)       -> k
+    EVariantsOf(_, _) -> k
+    EModCall(_, _) -> k
+    ECall(callee, args_) -> ECall(unbox_expr(callee, env),
+                                   map(args_, (a) => unbox_expr(a, env)))
+    EField(base, name)   -> EField(unbox_expr(base, env), name)
+    EIndex(a, b)         -> EIndex(unbox_expr(a, env), unbox_expr(b, env))
+    EBinop(op, a, b)     -> EBinop(op, unbox_expr(a, env), unbox_expr(b, env))
+    EUnop(op, x)         -> EUnop(op, unbox_expr(x, env))
+    EIf(c, t_, eo)       -> EIf(unbox_expr(c, env), unbox_expr(t_, env),
+                                 unbox_opt(eo, env))
+    EMatch(scr, arms)    -> EMatch(unbox_expr(scr, env),
+                                    map(arms, (a) => unbox_arm(a, env)))
+    # Closure boundary: free vars captured into the closure record
+    # are always boxed (per Phase 2 non-goal table). The lambda's
+    # own body sees no caller env — its locals are independent.
+    ELambda(ps, b)       -> ELambda(ps, unbox_expr(b, []))
+    ERecordLit(name, fs) -> ERecordLit(name, map(fs, (fi) => unbox_field(fi, env)))
+    EList(els)           -> EList(map(els, (el) => unbox_elem(el, env)))
+    ERange(a, b, opt_step) -> ERange(unbox_expr(a, env), unbox_expr(b, env),
+                                       unbox_opt(opt_step, env))
+    EBlock(stmts, tail)  -> {
+      let r = unbox_stmts(stmts, tail, env, [])
+      let stmts1 = match r { UbStmts(ss, _) -> ss }
+      let env1   = match r { UbStmts(_, e1) -> e1 }
+      EBlock(stmts1, unbox_opt(tail, env1))
+    }
+    EPipe(a, b)          -> EPipe(unbox_expr(a, env), unbox_expr(b, env))
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      # The handled body opens a fresh dynamic scope for the effect
+      # capability. v1 walks it with the outer env (no bindings
+      # leak into the handler's continuation captures).
+      EHandle(unbox_expr(body, env), eff_name, eff_tyargs,
+              unbox_opt(init_opt, env), alias_opt,
+              map(clauses, (c) => unbox_clause(c, env)),
+              unbox_opt_return(ret_opt, env))
+    ELitUnit(inner, u)   -> ELitUnit(unbox_expr(inner, env), u)
+    EBang(inner)         -> EBang(unbox_expr(inner, env))
+  }
+}
+
+fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
+  if not ty_is_unboxable(opt_ty) { MBoxed }
+  else {
+    match k {
+      EInt(_)  -> MUnboxed
+      EBool(_) -> MUnboxed
+      EChar(_) -> MUnboxed
+      EVar(nm) -> lb_lookup(env, nm)
+      # Conservative: only mark composite raw when both operands are
+      # already raw. Mixing a boxed operand into a raw arithmetic
+      # node would force the emitter to unbox via `(...)->as.i`,
+      # which leaks the boxed allocation (no decref). Keeping the
+      # whole node MBoxed routes through `kai_add` etc. which
+      # consume their args correctly.
+      EBinop(op, a, b) ->
+        if op_is_raw_arith(op) and child_is_raw(a) and child_is_raw(b) { MUnboxed }
+        else { MBoxed }
+      EUnop(op, x) ->
+        if op == "-" and child_is_raw(x) { MUnboxed }
+        else { MBoxed }
+      _ -> MBoxed
+    }
+  }
+}
+
+fn child_is_raw(e: Expr) : Bool {
+  match e.mode { MUnboxed -> true _ -> false }
+}
+
+fn unbox_opt(opt: Option[Expr], env: [LocBind]) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(unbox_expr(e, env))
+    None    -> None
+  }
+}
+
+fn unbox_arm(a: Arm, env: [LocBind]) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, unbox_opt(g, env), unbox_expr(b, env))
+  }
+}
+
+fn unbox_field(fi: FieldInit, env: [LocBind]) : FieldInit {
+  match fi {
+    FI(n, v) -> FI(n, unbox_expr(v, env))
+  }
+}
+
+fn unbox_elem(el: ListElem, env: [LocBind]) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(unbox_expr(x, env))
+    ElSpread(x) -> ElSpread(unbox_expr(x, env))
+  }
+}
+
+fn unbox_clause(c: HClause, env: [LocBind]) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, unbox_expr(b, env), l, co)
+  }
+}
+
+fn unbox_opt_return(opt: Option[HReturn], env: [LocBind]) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(unbox_return(r, env))
+    None    -> None
+  }
+}
+
+fn unbox_return(r: HReturn, env: [LocBind]) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, unbox_expr(b, env), l, c)
+  }
+}
+
+type UbStmts = UbStmts([Stmt], [LocBind])
+
+fn unbox_stmts(stmts: [Stmt], tail: Option[Expr], env: [LocBind], acc: [Stmt]) : UbStmts {
+  match stmts {
+    [] -> UbStmts(list_reverse(acc), env)
+    [s, ...rest] -> {
+      let r = unbox_stmt(s, rest, tail, env)
+      let s1 = match r { UbStmt(s_, _) -> s_ }
+      let e1 = match r { UbStmt(_, ev) -> ev }
+      unbox_stmts(rest, tail, e1, [s1, ...acc])
+    }
+  }
+}
+
+type UbStmt = UbStmt(Stmt, [LocBind])
+
+fn unbox_stmt(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind]) : UbStmt {
+  match s {
+    SLet(pat, ann, rhs) -> {
+      let rhs1 = unbox_expr(rhs, env)
+      match pat.pkind {
+        PBind(nm) -> match rhs1.mode {
+          MUnboxed -> {
+            # Closure capture stays boxed (Phase 2 non-goal table:
+            # `Closure capture (ELambda free var) → boxed`). If `nm`
+            # is referenced from within any subsequent ELambda, the
+            # capture array would expect `kai_<nm>` and find a raw
+            # `int64_t` — break the boxed convention. Demote to
+            # MBoxed so the binding lives as `KaiValue *kai_<nm>`
+            # and the unbox/wrap happens at the read site.
+            if name_captured_in_block(rest, tail, nm) {
+              let rhs_box = expr_to_boxed(rhs1)
+              UbStmt(SLet(pat, ann, rhs_box), env)
+            } else {
+              UbStmt(SLet(pat, ann, rhs1), [LB(nm, MUnboxed), ...env])
+            }
+          }
+          _ -> UbStmt(SLet(pat, ann, rhs1), env)
+        }
+        _ -> UbStmt(SLet(pat, ann, rhs1), env)
+      }
+    }
+    SVar(n, ty, rhs, l, c) -> UbStmt(SVar(n, ty, unbox_expr(rhs, env), l, c), env)
+    SAssert(cond, m) -> UbStmt(SAssert(unbox_expr(cond, env), unbox_opt(m, env)), env)
+    SExprStmt(x) -> UbStmt(SExprStmt(unbox_expr(x, env)), env)
+    SIndexAssign(b, i, v, l, c) ->
+      UbStmt(SIndexAssign(unbox_expr(b, env), unbox_expr(i, env),
+                          unbox_expr(v, env), l, c), env)
+    SUse(n, l, c) -> UbStmt(SUse(n, l, c), env)
+  }
+}
+
+# Demote an Expr's outer mode to MBoxed. Children retain their own
+# modes — emit_expr handles the boundary wrap on the way down.
+fn expr_to_boxed(e: Expr) : Expr =
+  Expr { kind: e.kind, line: e.line, col: e.col, ty: e.ty, mode: MBoxed }
+
+# True if `nm` is referenced from within any ELambda body in the
+# remainder of the block (subsequent stmts and the trailing
+# expression). Re-uses `scan_uses_expr` which already marks each
+# Use with its `in_lam` flag.
+fn name_captured_in_block(rest: [Stmt], opt_tail: Option[Expr], nm: String) : Bool {
+  if any_stmt_captures(rest, nm) { true }
+  else { match opt_tail {
+    None -> false
+    Some(e) -> uses_have_in_lam(scan_uses_expr(e, false), nm)
+  } }
+}
+
+fn any_stmt_captures(stmts: [Stmt], nm: String) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> if stmt_captures(s, nm) { true }
+                    else { any_stmt_captures(rest, nm) }
+  }
+}
+
+fn stmt_captures(s: Stmt, nm: String) : Bool {
+  match s {
+    SLet(_, _, rhs)        -> uses_have_in_lam(scan_uses_expr(rhs, false), nm)
+    SVar(_, _, rhs, _, _)  -> uses_have_in_lam(scan_uses_expr(rhs, false), nm)
+    SAssert(c, opt_m)      -> {
+      if uses_have_in_lam(scan_uses_expr(c, false), nm) { true }
+      else { match opt_m {
+        None -> false
+        Some(m) -> uses_have_in_lam(scan_uses_expr(m, false), nm)
+      } }
+    }
+    SExprStmt(e)           -> uses_have_in_lam(scan_uses_expr(e, false), nm)
+    SIndexAssign(b, i, v, _, _) ->
+      uses_have_in_lam(scan_uses_expr(b, false), nm) or
+      uses_have_in_lam(scan_uses_expr(i, false), nm) or
+      uses_have_in_lam(scan_uses_expr(v, false), nm)
+    SUse(_, _, _)          -> false
+  }
+}
+
+fn uses_have_in_lam(uses: [Use], nm: String) : Bool {
+  match uses {
+    [] -> false
+    [u, ...rest] -> match u {
+      U(n, _, _, in_lam) ->
+        if n == nm and in_lam { true } else { uses_have_in_lam(rest, nm) }
+    }
+  }
+}
 
 fn perceus_pass(decls: [Decl]) : [Decl] = map(decls, perceus_decl)
 
@@ -22394,7 +22841,10 @@ fn pcs_block_loop(stmts: [Stmt], scope: [String], in_lam: Bool,
       let nxt = match s {
         SLet(pat, _, rhs) -> {
           let acc1 = pcs_collect_uses_expr(rhs, scope, in_lam, acc)
-          PcsBlockState { scope: pat_bindings(pat, scope), acc: acc1 }
+          # Raw locals (Tier 2.5) are not tracked by Perceus —
+          # `int64_t` lives on the C stack and dies at block exit,
+          # there is no refcount to dup/drop. Skip them from scope.
+          PcsBlockState { scope: pat_bindings_skip_raw(pat, rhs, scope), acc: acc1 }
         }
         SVar(name, _, rhs, _, _) -> {
           let acc1 = pcs_collect_uses_expr(rhs, scope, in_lam, acc)
@@ -22591,7 +23041,12 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool) : PcsRw
   match s {
     SLet(pat, ty_opt, rhs) -> {
       let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam)
-      PcsRwStmt { stmt: SLet(pat, ty_opt, rhs1), scope: pat_bindings(pat, scope) }
+      # See `pcs_collect_uses_in_block` SLet — raw locals stay
+      # outside the Perceus scope so EVar reads of them are not
+      # rewritten into `__perceus_dup` calls (which expect boxed
+      # arguments).
+      PcsRwStmt { stmt: SLet(pat, ty_opt, rhs1),
+                  scope: pat_bindings_skip_raw(pat, rhs, scope) }
     }
     SVar(name, ty_opt, rhs, ln, cl) -> {
       let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam)
