@@ -30,6 +30,23 @@ MVP in progress.
   §Milestones for the full list, and `docs/design.md` for the
   roadmap context.
 
+## Quickstart
+
+Five short programs that cover the language's main shapes:
+
+```sh
+kai run examples/quickstart/01_hello.kai        # hello world
+kai run examples/quickstart/02_fizzbuzz.kai     # sum types + match
+kai run examples/quickstart/03_calculator.kai   # recursive AST + match
+kai run examples/quickstart/04_effect.kai       # custom effect + handler
+kai run examples/quickstart/05_concurrent.kai   # cooperative fibers
+```
+
+Every file is ~30 lines, runnable as-is, and explained in its own
+header comment. Read them in order — each one introduces one new
+concept (sum types, then recursion + match, then algebraic effects,
+then fibers).
+
 ## Build
 
 Everything builds from the repo root with `make`:
