@@ -9884,10 +9884,10 @@ fn emit_kind_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
     EChar(c) -> int_to_string(char_to_int(c))
     EVar(name) -> cat2("kair_", name)
     EBinop(op, a, b) ->
-      if op_is_raw_arith(op) {
+      if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) {
         concat_all(["(",
                     emit_expr_raw(src, a, lcs, fns, variants, lams, cls),
-                    " ", op, " ",
+                    " ", raw_op_str(op), " ",
                     emit_expr_raw(src, b, lcs, fns, variants, lams, cls),
                     ")"])
       } else {
@@ -9898,6 +9898,8 @@ fn emit_kind_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
     EUnop(op, inner) ->
       if op == "-" {
         cat3("(-", emit_expr_raw(src, inner, lcs, fns, variants, lams, cls), ")")
+      } else if op == "not" {
+        cat3("(!", emit_expr_raw(src, inner, lcs, fns, variants, lams, cls), ")")
       } else {
         let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
         cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
@@ -9988,13 +9990,21 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
       }
     }
     EIf(c, a, opt_b) -> {
-      let cc = emit_expr(src, c, lcs, fns, variants, lams, cls)
+      # Tier 2.5 M4 — if the condition is already raw bool, skip
+      # the `kai_truthy` wrapper and use the C ternary directly.
+      let cc = match c.mode {
+        MUnboxed -> emit_expr_raw(src, c, lcs, fns, variants, lams, cls)
+        _ -> {
+          let cb = emit_expr(src, c, lcs, fns, variants, lams, cls)
+          concat_all(["kai_truthy(", cb, ")"])
+        }
+      }
       let tc = emit_expr(src, a, lcs, fns, variants, lams, cls)
       let ec = match opt_b {
         Some(eb) -> emit_expr(src, eb, lcs, fns, variants, lams, cls)
         None -> "kai_unit()"
       }
-      concat_all(["(kai_truthy(", cc, ") ? ", tc, " : ", ec, ")"])
+      concat_all(["(", cc, " ? ", tc, " : ", ec, ")"])
     }
     EMatch(scr, arms) -> emit_match_expr(src, scr, arms, lcs, fns, variants, lams, cls)
     ELambda(_, _) -> emit_lambda_ref(x, lcs, fns, variants, lams, cls)
@@ -22438,6 +22448,27 @@ fn op_is_raw_arith(op: String) : Bool {
   op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
 }
 
+# Tier 2.5 M4 — comparison operators that produce a raw `int`
+# (0 or 1) from two raw operands. Equality / inequality on raw
+# `int64_t` reduce to native C `==` / `!=`.
+fn op_is_raw_cmp(op: String) : Bool {
+  op == "<" or op == ">" or op == "<=" or op == ">=" or
+  op == "==" or op == "!="
+}
+
+# Tier 2.5 M4 — short-circuiting boolean operators. `and` / `or`
+# in kaikai mirror C `&&` / `||` (short-circuit, evaluate left
+# first). Safe to lower as raw when both operands are raw bools.
+fn op_is_raw_logical(op: String) : Bool {
+  op == "and" or op == "or"
+}
+
+fn raw_op_str(op: String) : String {
+  if op == "and" { "&&" }
+  else if op == "or" { "||" }
+  else { op }
+}
+
 # Walk an Expr tree assigning each node its representation mode.
 # Bottom-up except for the env, which threads top-down through
 # `EBlock` / SLet to record raw locals. Children inside slots that
@@ -22518,9 +22549,16 @@ fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
       # consume their args correctly.
       EBinop(op, a, b) ->
         if op_is_raw_arith(op) and child_is_raw(a) and child_is_raw(b) { MUnboxed }
+        # M4 — comparisons and short-circuiting booleans collapse to
+        # native C operators when both operands are raw. The result
+        # is a raw `int` (0/1) which the boundary tactic re-boxes
+        # via `kai_bool` if a consumer wants `KaiValue *`.
+        else if op_is_raw_cmp(op) and child_is_raw(a) and child_is_raw(b) { MUnboxed }
+        else if op_is_raw_logical(op) and child_is_raw(a) and child_is_raw(b) { MUnboxed }
         else { MBoxed }
       EUnop(op, x) ->
         if op == "-" and child_is_raw(x) { MUnboxed }
+        else if op == "not" and child_is_raw(x) { MUnboxed }
         else { MBoxed }
       _ -> MBoxed
     }
