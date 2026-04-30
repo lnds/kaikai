@@ -6,7 +6,15 @@ The project is in a **full redesign phase**. The previous history (a partial com
 
 ## Project language conventions
 
-- **Commit messages in English.** No exceptions.
+- **Commit messages in English. No exceptions.** This includes
+  commit subjects, bodies, PR titles, and PR descriptions. No
+  Spanish loanwords either, even if they were used as technical
+  jargon during agent briefing — translate them. Examples that
+  have leaked in past sessions and must be avoided: "mentira"
+  (use "structural lie" or "false claim"), "letra chica"
+  (use "fine print"), "trampa" (use "trap" or "pitfall"),
+  "aterrizó" (use "landed"). If a brief in Spanish reaches you,
+  the commit message you produce is still English.
 - **All documentation in English.** Including `README.md`, `docs/`, code comments, and any user-facing text.
 - Conversation with the user (Spanish) is not documentation and does not appear in the repo.
 
