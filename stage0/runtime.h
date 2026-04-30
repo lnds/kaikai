@@ -33,16 +33,28 @@
  * value because the static evidence nodes were laid out adjacent).
  * Spec: docs/fibers-impl.md §*macOS deprecation handling*. */
 #define _XOPEN_SOURCE 600
+/* mmap(MAP_ANON) is a BSD extension hidden by strict _XOPEN_SOURCE.
+ * Re-expose it: _DARWIN_C_SOURCE on macOS, _DEFAULT_SOURCE on glibc.
+ * The fiber stack allocator (m8.x guard pages) needs anonymous mmap. */
+#if defined(__APPLE__)
+#  define _DARWIN_C_SOURCE 1
+#endif
+#if defined(__linux__)
+#  define _DEFAULT_SOURCE 1
+#endif
 
 #ifndef KAI_RUNTIME_H
 #define KAI_RUNTIME_H
 
 #include <setjmp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
+#include <unistd.h>
 
 /* Apple deprecated ucontext in macOS 10.6 (POSIX-2008 obsoletion).
  * The functions still work; the deprecation attribute on the
@@ -379,13 +391,30 @@ static int       kai_parked_count = 0;  /* deadlock detection */
  * never the one we are running on. */
 static KaiFiber *kai_pending_free = NULL;
 
+/* Forward decl — defined alongside the m8.x fiber stack allocator
+ * later in the file, but used here by the free path (munmap needs the
+ * stack_size + page_size total). */
+static size_t kai_page_size(void);
+
+/* Linux's <sys/mman.h> exposes MAP_ANONYMOUS; older BSD-style headers
+ * (and the legacy macOS spelling) use MAP_ANON. Define whichever the
+ * platform omits in terms of the other so the fiber stack mmap call
+ * compiles on both. */
+#if !defined(MAP_ANON) && defined(MAP_ANONYMOUS)
+#  define MAP_ANON MAP_ANONYMOUS
+#endif
+
 static void kai_drain_pending_free(void) {
     KaiFiber *f = kai_pending_free;
     if (!f) return;
     kai_pending_free = NULL;
     /* thunk / result / linked_head were handled at wrapper-free time;
-     * only stack + struct remain. */
-    if (f->stack_base) free(f->stack_base);
+     * only stack + struct remain. The stack is an mmap region of
+     * size stack_size + one guard page; pair the call with munmap
+     * (free would corrupt the heap). */
+    if (f->stack_base) {
+        munmap(f->stack_base, f->stack_size + kai_page_size());
+    }
     free(f);
 }
 
@@ -673,12 +702,14 @@ static void kai_free_value(KaiValue *v) {
                     v->as.fib->value = NULL;
                     kai_pending_free = v->as.fib;
                 } else {
-                    /* m8.x: free the heap-allocated private stack.
-                     * main fiber has stack_base == NULL (uses the OS
-                     * thread stack) and is statically allocated;
-                     * spawned fibers own their stacks. */
+                    /* m8.x: release the private stack. Main fiber has
+                     * stack_base == NULL (uses the OS thread stack)
+                     * and is statically allocated; spawned fibers own
+                     * an mmap region of stack_size + guard page bytes
+                     * and must release it via munmap. */
                     if (v->as.fib->stack_base) {
-                        free(v->as.fib->stack_base);
+                        munmap(v->as.fib->stack_base,
+                               v->as.fib->stack_size + kai_page_size());
                     }
                     free(v->as.fib);
                 }
@@ -2418,10 +2449,23 @@ static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue
  * + Actor.receive parking); Phase 5 adds Link/Monitor runtime.
  */
 
+/* Page size, queried once via sysconf and cached. macOS arm64 pages
+ * are 16 KiB, x86_64 / Linux are 4 KiB; the guard arithmetic must use
+ * the runtime value or mprotect rejects the call. */
+static size_t kai_page_size(void) {
+    static size_t cached = 0;
+    if (cached == 0) {
+        long ps = sysconf(_SC_PAGESIZE);
+        cached = (ps > 0) ? (size_t) ps : 4096;
+    }
+    return cached;
+}
+
 /* Read KAI_FIBER_STACK_SIZE once and cache. Out-of-range values
- * fall back to the default and log a warning. Must be a multiple of
- * 4096 (page size) on most POSIX targets; v1 does not enforce this
- * because we do not install guard pages yet (m8.x #11 follow-up). */
+ * fall back to the default and log a warning. The result is rounded
+ * up to a page-size multiple — mmap + mprotect both require it, and
+ * 16 KiB pages on macOS arm64 silently break sub-page values
+ * otherwise. */
 static size_t kai_fiber_stack_size(void) {
     static size_t cached = 0;
     if (cached != 0) return cached;
@@ -2438,8 +2482,69 @@ static size_t kai_fiber_stack_size(void) {
                 env);
         }
     }
+    size_t ps = kai_page_size();
+    if (sz % ps != 0) sz = ((sz / ps) + 1) * ps;
     cached = sz;
     return cached;
+}
+
+/* SIGSEGV / SIGBUS handler for fiber stack overflow. The fault lands
+ * on the active fiber's guard page (PROT_NONE); we print a diagnostic
+ * and re-raise with the default disposition. Faults outside any guard
+ * (e.g. NULL deref in user code) fall through to default — we only
+ * decorate the stack-overflow case. The handler runs on a sigaltstack
+ * so the overflowed stack is never used to format the message. Spec:
+ * `docs/fibers-honesty-targets.md` Tier 1. */
+static void *kai_sigalt_stack = NULL;
+static int   kai_sigsegv_installed = 0;
+
+static void kai_fiber_sigsegv_handler(int sig, siginfo_t *info, void *ucp) {
+    (void) ucp;
+    KaiFiber *f = kai_active_fiber;
+    if (f && f->stack_base && info && info->si_addr) {
+        char *guard_lo = (char *) f->stack_base;
+        char *guard_hi = guard_lo + kai_page_size();
+        char *addr     = (char *) info->si_addr;
+        if (addr >= guard_lo && addr < guard_hi) {
+            char buf[96];
+            int n = snprintf(buf, sizeof(buf),
+                             "kai: fiber stack overflow at %p\n", (void *) f);
+            if (n > 0) {
+                ssize_t w = write(2, buf, (size_t) n);
+                (void) w;
+            }
+        }
+    }
+    /* Re-raise with default disposition so the process terminates with
+     * the original signal — preserving the standard SIGSEGV exit
+     * status for callers (shell `$?` = 139) without swallowing
+     * unrelated faults. */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void kai_install_fiber_sigsegv_handler(void) {
+    if (kai_sigsegv_installed) return;
+    kai_sigsegv_installed = 1;
+
+    size_t altsize = (size_t) SIGSTKSZ;
+    if (altsize < 32 * 1024) altsize = 32 * 1024;
+    kai_sigalt_stack = malloc(altsize);
+    if (kai_sigalt_stack) {
+        stack_t ss;
+        ss.ss_sp    = kai_sigalt_stack;
+        ss.ss_size  = altsize;
+        ss.ss_flags = 0;
+        sigaltstack(&ss, NULL);
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = kai_fiber_sigsegv_handler;
+    sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
 }
 
 static void kai_sched_enqueue(KaiFiber *f) {
@@ -2481,18 +2586,36 @@ static void kai_link_propagate_terminate(KaiFiber *self);
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
 static void kai_fiber_init_ctx(KaiFiber *f) {
+    kai_install_fiber_sigsegv_handler();
     if (getcontext(&f->ctx) != 0) {
         fprintf(stderr, "kai: getcontext failed for new fiber\n");
         exit(1);
     }
     f->stack_size = kai_fiber_stack_size();
-    f->stack_base = malloc(f->stack_size);
-    if (!f->stack_base) {
-        fprintf(stderr, "kai: out of memory allocating fiber stack (%zu bytes)\n",
-                f->stack_size);
+    /* Allocate stack + one guard page below it. Stack grows down on
+     * x86_64 / arm64, so the lowest address is the overflow target.
+     * stack_base points at the guard; the usable region starts one
+     * page above. Layout (low → high):
+     *   [ guard page (PROT_NONE) | stack_size bytes (RW) ]
+     * We store stack_base as the mmap base so munmap covers both;
+     * stack_size remains the usable size, and total = stack_size +
+     * page_size whenever we need to release the region. */
+    size_t page = kai_page_size();
+    size_t total = f->stack_size + page;
+    void *region = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (region == MAP_FAILED) {
+        fprintf(stderr, "kai: mmap failed allocating fiber stack (%zu bytes)\n",
+                total);
         exit(1);
     }
-    f->ctx.uc_stack.ss_sp   = f->stack_base;
+    if (mprotect(region, page, PROT_NONE) != 0) {
+        fprintf(stderr, "kai: mprotect guard page failed for fiber stack\n");
+        munmap(region, total);
+        exit(1);
+    }
+    f->stack_base = region;
+    f->ctx.uc_stack.ss_sp   = (char *) region + page;
     f->ctx.uc_stack.ss_size = f->stack_size;
     f->ctx.uc_link          = &kai_main_fiber.ctx;
     makecontext(&f->ctx, kai_fiber_trampoline, 0);

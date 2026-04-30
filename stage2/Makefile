@@ -1261,6 +1261,23 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (R4: fiber-discard does not deadlock)" \
 	    || { echo "effects FAIL $$name (output diff)"; exit 1; }; \
 	done; \
+	for f in ../examples/effects/m8_fiber_stack_overflow.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  rc=0; ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.stderr || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "effects FAIL $$name (expected non-zero exit from guard-page SIGSEGV, got 0)"; \
+	    cat build/s2-$$name.out; exit 1; \
+	  fi; \
+	  grep -q "fiber stack overflow" build/s2-$$name.stderr \
+	    && echo "effects OK $$name (guard page caught overflow with diagnostic, exit=$$rc)" \
+	    || { echo "effects FAIL $$name (no overflow diagnostic on stderr; exit=$$rc)"; \
+	         echo '--- stderr:'; cat build/s2-$$name.stderr; \
+	         echo '--- stdout:'; cat build/s2-$$name.out; exit 1; }; \
+	done; \
 	for f in ../examples/effects/m12_8_y_phase4_*.kai; do \
 	  [ -e $$f ] || continue; \
 	  name=$$(basename $$f .kai); \
