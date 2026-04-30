@@ -1726,6 +1726,21 @@ test-unbox-phase2: $(TARGET) build
 	@if grep -E 'kai_arith_inner_loop\(void\) \{[^}]*kai_mul\(' build/perceus-unbox_phase2_arith.c; then \
 	  echo "unbox FAIL arith (kai_mul survived inside body)"; exit 1; \
 	fi
+	@# M4 grep: cond fixture must contain raw `int` bindings for
+	@# the comparison + boolean results, and no `kai_lt(`,
+	@# `kai_eq_v(`, or `kai_truthy(` should appear inside the
+	@# `kai_cond_inner_loop` body — comparisons collapse to
+	@# native C operators on raw scalars.
+	@grep -F -q 'int kair_big' build/perceus-unbox_phase2_cond.c \
+	  || { echo "unbox FAIL cond (kair_big not raw)"; exit 1; }
+	@grep -F -q 'int kair_neq' build/perceus-unbox_phase2_cond.c \
+	  || { echo "unbox FAIL cond (kair_neq not raw)"; exit 1; }
+	@if grep -E 'kai_cond_inner_loop\(void\) \{[^}]*kai_lt\(' build/perceus-unbox_phase2_cond.c; then \
+	  echo "unbox FAIL cond (kai_lt survived inside body)"; exit 1; \
+	fi
+	@if grep -E 'kai_cond_inner_loop\(void\) \{[^}]*kai_truthy\(' build/perceus-unbox_phase2_cond.c; then \
+	  echo "unbox FAIL cond (kai_truthy survived inside body)"; exit 1; \
+	fi
 	@echo "unbox phase2 OK"
 
 test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2
