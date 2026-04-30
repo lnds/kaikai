@@ -15,7 +15,7 @@ SRC     := compiler.kai
 # SIGSEGV; 65520 KB is the macOS hard-limit ceiling and works.
 STACK := ulimit -s 65520 2>/dev/null || ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 selfhost
 
 all: $(TARGET)
 
@@ -1696,7 +1696,65 @@ test-aspirational: $(TARGET) build
 	    || { echo "aspirational DIFF $$name (LLVM)"; diff $$exp build/asp-$$name-llvm.out; exit 1; }; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c
+# Tier 2.5 unboxing fixtures (see docs/unboxing-phase2-design.md).
+# Each fixture compiles, runs, and is structurally inspected to
+# assert that arithmetic on unboxable types collapses to raw
+# `int64_t` (no `kai_int(` / `kai_add(` survives in the inner loop).
+test-unbox-phase2: $(TARGET) build
+	@set -e; \
+	for f in ../examples/perceus/unbox_phase2_*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/perceus-$$name.c \
+	    || { echo "unbox FAIL $$name (kaic2 errored)"; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/perceus-$$name.c -o build/perceus-$$name \
+	    || { echo "unbox FAIL $$name (cc errored)"; exit 1; }; \
+	  ./build/perceus-$$name > build/perceus-$$name.out \
+	    || { echo "unbox FAIL $$name (run errored)"; exit 1; }; \
+	  echo "unbox run OK $$name ($$(cat build/perceus-$$name.out | head -1))"; \
+	done
+	@# M3 grep: arith fixture must contain raw int64_t bindings
+	@# and no `kai_int(` / `kai_add(` / `kai_mul(` inside the
+	@# `kai_arith_inner_loop` body — the unbox pass must collapse
+	@# the chain into native C arithmetic.
+	@grep -F -q 'int64_t kair_a' build/perceus-unbox_phase2_arith.c \
+	  || { echo "unbox FAIL arith (kair_a not raw)"; exit 1; }
+	@grep -F -q 'int64_t kair_s' build/perceus-unbox_phase2_arith.c \
+	  || { echo "unbox FAIL arith (kair_s not raw)"; exit 1; }
+	@if grep -E 'kai_arith_inner_loop\(void\) \{[^}]*kai_add\(' build/perceus-unbox_phase2_arith.c; then \
+	  echo "unbox FAIL arith (kai_add survived inside body)"; exit 1; \
+	fi
+	@if grep -E 'kai_arith_inner_loop\(void\) \{[^}]*kai_mul\(' build/perceus-unbox_phase2_arith.c; then \
+	  echo "unbox FAIL arith (kai_mul survived inside body)"; exit 1; \
+	fi
+	@# M4 grep: cond fixture must contain raw `int` bindings for
+	@# the comparison + boolean results, and no `kai_lt(`,
+	@# `kai_eq_v(`, or `kai_truthy(` should appear inside the
+	@# `kai_cond_inner_loop` body — comparisons collapse to
+	@# native C operators on raw scalars.
+	@grep -F -q 'int kair_big' build/perceus-unbox_phase2_cond.c \
+	  || { echo "unbox FAIL cond (kair_big not raw)"; exit 1; }
+	@grep -F -q 'int kair_neq' build/perceus-unbox_phase2_cond.c \
+	  || { echo "unbox FAIL cond (kair_neq not raw)"; exit 1; }
+	@if grep -E 'kai_cond_inner_loop\(void\) \{[^}]*kai_lt\(' build/perceus-unbox_phase2_cond.c; then \
+	  echo "unbox FAIL cond (kai_lt survived inside body)"; exit 1; \
+	fi
+	@if grep -E 'kai_cond_inner_loop\(void\) \{[^}]*kai_truthy\(' build/perceus-unbox_phase2_cond.c; then \
+	  echo "unbox FAIL cond (kai_truthy survived inside body)"; exit 1; \
+	fi
+	@# M5 grep: match fixture must use a C `switch` on the raw
+	@# scalar — no `kai_decref(_scr)` (the boxed-alias cleanup) and
+	@# no `kai_eq(` (per-arm equality chain) inside the body.
+	@grep -F -q 'switch (_scr)' build/perceus-unbox_phase2_match.c \
+	  || { echo "unbox FAIL match (no raw switch found)"; exit 1; }
+	@if grep -E 'kai_classify_raw\(void\) \{[^}]*kai_eq\(' build/perceus-unbox_phase2_match.c; then \
+	  echo "unbox FAIL match (kai_eq survived inside body)"; exit 1; \
+	fi
+	@if grep -E 'kai_classify_raw\(void\) \{[^}]*kai_decref\(_scr\)' build/perceus-unbox_phase2_match.c; then \
+	  echo "unbox FAIL match (boxed _scr alias survived)"; exit 1; \
+	fi
+	@echo "unbox phase2 OK"
+
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
