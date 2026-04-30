@@ -288,6 +288,7 @@ typedef enum {
 
 typedef struct KaiFiber   KaiFiber;
 typedef struct KaiLinkNode KaiLinkNode;  /* Phase 5 — defined below */
+typedef struct KaiMonitorNode KaiMonitorNode;  /* Tier 2 Monitor — defined below */
 
 struct KaiFiber {
     KaiEvidence    *evidence_top;
@@ -367,6 +368,17 @@ struct KaiFiber {
      * Forward-declared as struct KaiMailbox * because the full
      * KaiMailbox typedef sits below KaiFiber in this header. */
     struct KaiMailbox *mailbox;
+    /* Tier 2 — intrusive list of fibers monitoring this one. Each
+     * Monitor.monitor(target_pid) call from an observer fiber
+     * appends a node here on the *target* fiber. At trampoline
+     * termination (DONE or CANCELLED) the walker pops every entry
+     * and pushes the original target_pid value into the observer's
+     * mailbox, leaving the observer's cancel_requested untouched
+     * (monitors do not propagate faults — `docs/actors.md` §*Fault
+     * propagation*). Owned by the target fiber; nodes are freed in
+     * the propagation walk and as a safety net in
+     * kai_free_value's KAI_FIBER branch. */
+    KaiMonitorNode *monitor_head;
 };
 
 /* m7a #5 + m8.x: kai_main_fiber starts as the OS-thread context,
@@ -389,7 +401,8 @@ static KaiFiber kai_main_fiber = {
     NULL,                /* in_dispatch_node */
     NULL,                /* value — main has no wrapper */
     0,                   /* trap_exit — main starts opted out */
-    NULL                 /* mailbox — set by with_mailbox if main uses one */
+    NULL,                /* mailbox — set by with_mailbox if main uses one */
+    NULL                 /* monitor_head — Monitor.monitor(...) appends here */
 };
 
 static KaiFiber *kai_active_fiber = &kai_main_fiber;
@@ -524,6 +537,22 @@ struct KaiLinkNode {
     KaiLinkNode *next;
 };
 
+/* Tier 2 Monitor — intrusive node sitting on the *target* fiber's
+ * monitor_head chain. observer = the fiber that called
+ * Monitor.monitor(target_pid); target_pid = the same KaiValue *
+ * the user passed to monitor(...) (the runtime owns one ref via
+ * kai_incref so the value survives until the target terminates).
+ * On termination, the propagate walker pushes target_pid into
+ * observer->mailbox and frees the node.
+ *
+ * The forward typedef is at the KaiFiber declaration above so
+ * KaiFiber can hold a `KaiMonitorNode *monitor_head`. */
+struct KaiMonitorNode {
+    KaiFiber       *observer;
+    KaiValue       *target_pid;
+    KaiMonitorNode *next;
+};
+
 /* Phase 4 forward decls: mailbox push/pop park/wake the calling
  * fiber via the scheduler primitives, which are defined further
  * down (after the handler-stack runtime). The decls here let the
@@ -539,13 +568,29 @@ static KaiMailbox *kai_mailbox_alloc(void) {
     mb->overflow     = KAI_OVERFLOW_UNBOUNDED;
     /* Phase 5: associate the mailbox with the allocating fiber. v1
      * actor surface (with_mailbox) is the only path to mailbox_alloc,
-     * and the allocating fiber IS the actor; spawn_actor (m8.x #6)
-     * will set this differently. */
+     * and the allocating fiber IS the actor; spawn_actor uses
+     * kai_mailbox_alloc_unowned + kai_mailbox_assign_owner to point
+     * at the spawned fiber instead of the parent. */
     mb->owner_fiber  = kai_current_fiber();
     /* Tier 2 trap-exit: stamp the mailbox onto its owner fiber so
      * kai_link_propagate_terminate can locate it without a global
      * registry. Nested allocs overwrite; kai_mailbox_free clears. */
     if (mb->owner_fiber) mb->owner_fiber->mailbox = mb;
+    return mb;
+}
+
+/* Tier 2 spawn_actor — variant of kai_mailbox_alloc that does NOT
+ * stamp owner_fiber. Used by stdlib's `spawn_actor` so the
+ * mailbox's owner can be reassigned to the spawned fiber via
+ * kai_mailbox_assign_owner before the spawned body runs. The
+ * `mailbox` slot on the parent fiber is left untouched too —
+ * spawn_actor's mailbox does not belong to the parent. */
+static KaiMailbox *kai_mailbox_alloc_unowned(void) {
+    KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
+    if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    mb->cap         = 0;
+    mb->overflow    = KAI_OVERFLOW_UNBOUNDED;
+    mb->owner_fiber = NULL;  /* set later by kai_mailbox_assign_owner */
     return mb;
 }
 
@@ -722,6 +767,21 @@ static void kai_free_value(KaiValue *v) {
                         ln = next;
                     }
                     v->as.fib->linked_head = NULL;
+                }
+                /* Tier 2 Monitor — same safety net as the link chain.
+                 * Each entry holds an owning ref on its target_pid via
+                 * kai_monitor_add; we release that ref before freeing
+                 * the node so values referenced only by the monitor
+                 * chain can be reclaimed. */
+                {
+                    KaiMonitorNode *mn = v->as.fib->monitor_head;
+                    while (mn) {
+                        KaiMonitorNode *next = mn->next;
+                        if (mn->target_pid) kai_decref(mn->target_pid);
+                        free(mn);
+                        mn = next;
+                    }
+                    v->as.fib->monitor_head = NULL;
                 }
                 /* R4 fix — when the trampoline drops the scheduler's
                  * ref on its own wrapper at DONE/CANCELLED, the wrapper
@@ -1806,6 +1866,29 @@ static KaiValue *kai_prelude_mailbox_alloc(void) {
     return kai_pid_value(kai_mailbox_alloc());
 }
 
+/* Tier 2 spawn_actor — allocate a mailbox without stamping any
+ * owner. Pair with kai_prelude_mailbox_assign_owner to wire the
+ * mailbox onto the spawned fiber before its body runs. */
+static KaiValue *kai_prelude_mailbox_alloc_unowned(void) {
+    return kai_pid_value(kai_mailbox_alloc_unowned());
+}
+
+/* Tier 2 spawn_actor — set `pid->as.mb->owner_fiber = fiber->as.fib`
+ * AND `fiber->as.fib->mailbox = pid->as.mb`. Used after
+ * kai_prelude_mailbox_alloc_unowned + fiber_spawn so the spawned
+ * fiber owns the mailbox for monitor / link / trap-exit lookups.
+ *
+ * Safe under the cooperative scheduler because fiber_spawn enqueues
+ * the spawned fiber but does not yield — the parent runs through to
+ * this assign call before the spawned trampoline gets the CPU. */
+static KaiValue *kai_prelude_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
+    if (!pid    || pid->tag    != KAI_PID    || !pid->as.mb)    return kai_unit();
+    if (!fiber  || fiber->tag  != KAI_FIBER  || !fiber->as.fib)  return kai_unit();
+    pid->as.mb->owner_fiber = fiber->as.fib;
+    fiber->as.fib->mailbox  = pid->as.mb;
+    return kai_unit();
+}
+
 static KaiValue *kai_prelude_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {
     int c = (cap && cap->tag == KAI_INT) ? (int) cap->as.i : 0;
     int o = (overflow && overflow->tag == KAI_INT) ? (int) overflow->as.i : 0;
@@ -2636,6 +2719,10 @@ typedef enum {
 } KaiExitReason;
 
 static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason);
+/* Tier 2 Monitor — observers learn about target's termination via a
+ * single push of `target_pid` into observer->mailbox. Defined
+ * alongside the Monitor default handler further down. */
+static void kai_monitor_propagate_terminate(KaiFiber *self);
 
 /* Initialise a freshly-allocated KaiFiber's ucontext + private stack.
  * Sets f->ctx so it can be a swapcontext target; fills uc_link as a
@@ -2784,6 +2871,11 @@ static void kai_fiber_trampoline(void) {
      * a runtime invariant violation). */
     kai_link_propagate_terminate(self,
         self->state == KAI_FIBER_DONE ? KAI_EXIT_NORMAL : KAI_EXIT_CRASHED);
+
+    /* Tier 2 Monitor — push our pid into each observer's mailbox.
+     * Observers do not get cancel_requested set; monitors are
+     * unidirectional and fault-isolated. */
+    kai_monitor_propagate_terminate(self);
 
     /* Wake awaiters. Each was parked in Spawn.await (Phase 2.3) or
      * Spawn.select (Phase 2.3). Walk the chain, clearing each
@@ -3095,6 +3187,107 @@ static KaiValue *kai_default_link_link(void *self, KaiValue *peer, KaiCont *k) {
     (void) self;
     if (peer && peer->tag == KAI_PID && peer->as.mb && peer->as.mb->owner_fiber) {
         kai_link_add_bidirectional(kai_current_fiber(), peer->as.mb->owner_fiber);
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* Tier 2 Monitor — append (observer, target_pid) onto target's
+ * monitor_head chain. The runtime takes one ref on target_pid via
+ * kai_incref so the value can be pushed into the observer's mailbox
+ * at termination time even if the user dropped their last
+ * reference. v1 does not deduplicate: monitoring the same pid twice
+ * produces two MonitorDown deliveries, matching the BEAM spec. */
+static void kai_monitor_add(KaiFiber *target, KaiFiber *observer, KaiValue *target_pid) {
+    KaiMonitorNode *n = (KaiMonitorNode *) malloc(sizeof(KaiMonitorNode));
+    if (!n) {
+        fprintf(stderr, "kai: out of memory (monitor)\n");
+        exit(1);
+    }
+    n->observer   = observer;
+    n->target_pid = target_pid;
+    if (target_pid) kai_incref(target_pid);
+    n->next       = target->monitor_head;
+    target->monitor_head = n;
+}
+
+/* Tier 2 Monitor — remove the *first* entry on target's chain that
+ * matches (observer, target_pid). Demonitor v1 takes the same pid
+ * value the user originally passed to monitor(...); equality is
+ * by KAI_PID mailbox-pointer identity (kai_eq_v's KAI_PID branch).
+ * Returns 1 on removal, 0 if no match. */
+static int kai_monitor_remove(KaiFiber *target, KaiFiber *observer, KaiValue *target_pid) {
+    KaiMonitorNode **slot = &target->monitor_head;
+    while (*slot) {
+        KaiMonitorNode *cur = *slot;
+        int pid_match = 1;
+        if (target_pid && cur->target_pid) {
+            /* both present — match on mailbox pointer. */
+            pid_match =
+                cur->target_pid->tag == KAI_PID &&
+                target_pid->tag == KAI_PID &&
+                cur->target_pid->as.mb == target_pid->as.mb;
+        }
+        if (cur->observer == observer && pid_match) {
+            *slot = cur->next;
+            if (cur->target_pid) kai_decref(cur->target_pid);
+            free(cur);
+            return 1;
+        }
+        slot = &cur->next;
+    }
+    return 0;
+}
+
+/* Tier 2 Monitor — walk the target fiber's monitor chain at
+ * termination. For each (observer, target_pid) entry, push
+ * target_pid into observer->mailbox and free the node.
+ * Observers without a current mailbox silently drop the
+ * delivery (matching trap-exit's "no-mailbox falls back" shape;
+ * monitors do not propagate faults so there is no cancel-side
+ * fallback to take). The cause distinction (Normal / Crashed) is
+ * not encoded in the v1 message — observers that need it can pair
+ * Monitor with Link+trap_exit, which delivers the
+ * "Normal"/"Crashed" string into the same mailbox. */
+static void kai_monitor_propagate_terminate(KaiFiber *self) {
+    KaiMonitorNode *mn = self->monitor_head;
+    self->monitor_head = NULL;
+    while (mn) {
+        KaiMonitorNode *next = mn->next;
+        KaiFiber *observer = mn->observer;
+        if (observer && observer->mailbox && mn->target_pid) {
+            /* kai_mailbox_push takes ownership of the incref we
+             * stamped at kai_monitor_add time — we hand the ref
+             * to the mailbox and don't decref locally. */
+            kai_mailbox_push(observer->mailbox, mn->target_pid);
+        } else if (mn->target_pid) {
+            /* No mailbox to deliver into — drop our owning ref so
+             * the pid value can be reclaimed. */
+            kai_decref(mn->target_pid);
+        }
+        free(mn);
+        mn = next;
+    }
+}
+
+static KaiValue *kai_default_monitor_monitor(void *self, KaiValue *target, KaiCont *k) {
+    (void) self;
+    if (target && target->tag == KAI_PID && target->as.mb && target->as.mb->owner_fiber) {
+        kai_monitor_add(target->as.mb->owner_fiber, kai_current_fiber(), target);
+    }
+    /* v1 simplification — return the same Pid as the ref. The
+     * spec's `MonitorRef` is opaque; identifying the monitored
+     * fiber by its own pid is sufficient for demonitor and for the
+     * fixture-level "which fiber died" pattern. The user-facing
+     * type alias `MonitorRef = Pid[Nothing]` is pinned in
+     * docs/actors.md §*Monitors — unidirectional* (v1 simplification).
+     */
+    return kai_cont_resume(k, target);
+}
+
+static KaiValue *kai_default_monitor_demonitor(void *self, KaiValue *ref, KaiCont *k) {
+    (void) self;
+    if (ref && ref->tag == KAI_PID && ref->as.mb && ref->as.mb->owner_fiber) {
+        kai_monitor_remove(ref->as.mb->owner_fiber, kai_current_fiber(), ref);
     }
     return kai_cont_resume(k, kai_unit());
 }

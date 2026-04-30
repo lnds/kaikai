@@ -9,6 +9,37 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **`Monitor.monitor(pid)` + `Monitor.demonitor(ref)` are now
+  end-to-end primitives (Tier 2 supervision).** The Monitor
+  effect was type-surface-only before; the runtime now
+  registers `(observer, target_pid)` entries on the *target*
+  fiber's `monitor_head` chain, and the trampoline's
+  termination tail walks it and pushes the original
+  `target_pid` value into each observer's mailbox — without
+  touching `cancel_requested` (monitors are fault-isolated per
+  `docs/actors.md` §*Fault propagation*). v1 simplification:
+  `MonitorRef` collapses to `Pid[Nothing]` and the
+  `MonitorDown(ref, cause)` payload becomes a bare pid push;
+  reason distinction (Normal/Crashed) is reachable today
+  through Link+trap_exit on the same target. Coverage:
+  `examples/effects/m8_monitor.kai`.
+
+- **`spawn_actor(body) : Pid[Msg]` lifts on `fiber_spawn` +
+  `with_mailbox`** so a parent fiber receives the spawned
+  fiber's pid synchronously and can immediately pass it to
+  `Monitor.monitor(pid)`, `Link.link(pid)`, or `Spawn.send(pid,
+  msg)`. Two new runtime helpers in `stage0/runtime.h`:
+  `kai_mailbox_alloc_unowned()` (no owner stamp) and
+  `kai_mailbox_assign_owner(pid, fiber)` (set
+  `pid->as.mb->owner_fiber = fiber->as.fib` AND
+  `fiber->as.fib->mailbox = pid->as.mb`). Safe under the
+  cooperative scheduler because `Spawn.spawn` does not yield,
+  so the parent's assign call is observed before the spawned
+  trampoline runs. Closes the spawn_actor + Monitor line item
+  from `docs/fibers-honesty-targets.md` Tier 2.
+
 ### Fixed
 
 - **LLVM op-dispatch now mirrors the C emit's `in_dispatch_node`

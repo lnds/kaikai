@@ -95,12 +95,44 @@ Spec: Doc actors.md §`Actor[Msg]` *receive()*.
 Trampoline DONE/CANCELLED branches walk the linked chain and set
 `cancel_requested` on each peer.
 
-**Monitor**: ⏳ deferred to Phase 5.5+. Pid handoff for a clean
-two-fiber `Monitor.monitor` demo needs `spawn_actor` (m8.x #6
-follow-on) or message types carrying Pid; the v1 actor surface
-(with_mailbox only) supports neither cleanly. The runtime registry
-shape (per-fiber monitor-set, MonitorDown push at termination)
-will mirror Link's; the work is small once the demo path exists.
+**Monitor**: ✅ landed 2026-04-30 (Fibers Tier 2 lane).
+`Monitor.monitor(target_pid)` registers `(observer = current
+fiber, target_pid)` on the target fiber's `monitor_head` chain;
+the trampoline's termination tail (next to
+`kai_link_propagate_terminate`) walks the chain and pushes the
+original `target_pid` into each observer's mailbox without
+touching `cancel_requested` — monitors are fault-isolated per
+`docs/actors.md` §*Fault propagation*. `Monitor.demonitor(ref)`
+removes the entry by (observer, pid) match.
+
+`spawn_actor` lifts on `fiber_spawn` + `with_mailbox` via two
+new runtime helpers in `stage0/runtime.h`:
+
+- `kai_mailbox_alloc_unowned()` — like `mailbox_alloc` but
+  does NOT stamp `mb->owner_fiber` or the parent fiber's
+  `mailbox` slot.
+- `kai_mailbox_assign_owner(pid, fiber)` — sets
+  `pid->as.mb->owner_fiber = fiber->as.fib` AND
+  `fiber->as.fib->mailbox = pid->as.mb`. Safe under the
+  cooperative scheduler because `Spawn.spawn` does not yield,
+  so the parent's call is observed before the spawned
+  trampoline runs.
+
+The v1 surface returns `Pid[Msg]` to the parent before the
+spawned body runs; the parent can immediately pass it to
+`Monitor.monitor(pid)`, `Link.link(pid)`, or `Spawn.send(pid,
+msg)`. v1 simplification: the spec's `MonitorRef` collapses to
+`Pid[Nothing]` and the `MonitorDown(ref, cause)` payload becomes
+a bare pid push — same flavour as trap-exit's
+`"Normal"`/`"Crashed"` String simplification. Reason
+distinction is reachable today by combining Monitor with
+Link+trap_exit on the same target.
+
+Coverage: `examples/effects/m8_monitor.kai` — supervisor uses
+`with_mailbox` + `spawn_actor(worker)`, monitors the worker,
+the worker crashes via `Cancel.raise()`, supervisor receives
+the worker's pid in its mailbox and exits 0 (was NOT
+cancelled).
 
 **Trap-exit semantics**: ✅ landed 2026-04-29 (Fibers Tier 2 lane).
 `Spawn.set_trap_exit(Bool)` toggles the current fiber's
