@@ -517,6 +517,21 @@ in.
     with zero call overhead). No new operators. Demand surfaced
     from `demos/9d9l/huffman` bit-packing and the planned `crypto`
     / `encoding` stdlib modules.
+
+    **bit ops chunk landed.** Twelve flat-prefix intrinsics —
+    `bit_and` / `bit_or` / `bit_xor` / `bit_not` / `bit_shl` /
+    `bit_shr` / `bit_ushr` / `bit_count` / `bit_test` / `bit_set`
+    / `bit_clear` / `bit_toggle` — registered in the typer's
+    intrinsic table and lowered inline by `emit_call_value` to
+    the matching C operator (`<<`, `>>`, `&`, `|`, `^`, `~`,
+    `__builtin_popcountll`). Same pattern as `unit_name` /
+    `__strip_unit`: no runtime helper, no stage 1 mirror — the
+    emitted C never contains the intrinsic name. Documentation
+    in `stdlib/math/bits.kai` (header-only); fixture in
+    `examples/stdlib/bits_basic.kai`; structural grep in
+    `stage2/Makefile` `test-stdlib` asserts the lowering. The
+    `check` / `bench` blocks and the dotted-`bit.*` surface
+    remain open for a future m13 chunk.
 14. **m14 — Stdlib expansion**: stage-2-native stdlib,
     module-organised under `stdlib/core/{list,string,option,result,
     char,tuple,ordering}.kai` per `docs/stdlib-layout.md`. The
