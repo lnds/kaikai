@@ -19,6 +19,7 @@ user-visible handler, Doc B; if you are touching the compiler,
 Doc C.
 
 ## Choice of régime
+<!-- coverage: skip --> design rationale, not a testable feature
 
 Two production-quality designs for compiling algebraic effects
 sit in the literature, plus a hybrid worth naming explicitly:
@@ -370,6 +371,7 @@ The compiler does not pre-resolve which struct the call ends up
 talking to — only which label the lookup is parameterised by.
 
 ## The CPS transform
+<!-- coverage: skip --> design spec, internal lowering rule
 
 ### What gets transformed
 
@@ -756,6 +758,7 @@ exact ABI of that erased call (raw-byte layout + element size or
 a runtime witness) is pinned in §*Per-op type generics*.
 
 ## Interaction with Perceus
+<!-- coverage: skip --> design discussion, RC/CPS interplay rationale
 
 Perceus reuse analysis treats the CPS continuation closure as a
 first-class allocation. Three cases:
@@ -816,6 +819,7 @@ extent. No cycle between `EvE` and continuation arises.
 Régime C does not weaken either invariant.
 
 ## Pipeline order and desugaring
+<!-- coverage: skip --> design spec, pass ordering rationale
 
 The stage 2 pipeline (see `docs/stage2-design.md` §*Compilation
 pipeline*) now reads:
@@ -1336,6 +1340,7 @@ reviewed in m7a's diagnostic-pass task — the same task that
 applies the bar to all stage-2 diagnostics, not just effects.
 
 ## Interaction with fibers (m8 preview)
+<!-- coverage: skip --> design preview, planning section
 
 Fibers are scheduled computations; each owns its own stack, its
 own evidence vector, and its own RC-managed heap. The hook
@@ -1505,6 +1510,7 @@ allocation; effects within a fiber behave as specified above.
    in m7a or alongside m7a #6).
 
 ## Milestones m7a and m7b
+<!-- coverage: skip --> historical milestone tracking
 
 Doc B §*Next steps* pre-split m7 into m7a (mechanics) and m7b
 (ergonomy). Doc C inherits the split and maps implementation

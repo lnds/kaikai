@@ -101,6 +101,7 @@ actor instance. Equality is intentional: supervision,
 monitoring, and message routing need it.
 
 ## Spawning actors
+<!-- coverage: skip --> spawn_actor primitive deferred to Fibers Tier 2 (Monitor lane); m8x_4_recv_blocking covers the Pid handoff path indirectly
 
 An actor is spawned through `Spawn` just like any other fiber,
 with an `Actor[Msg]` handler wrapped around the body so
@@ -200,6 +201,7 @@ heap-allocated, and drained when the actor returns or is
 cancelled.
 
 ## Mailbox policies
+<!-- coverage: skip --> covered by m8_8_mailbox_drop_oldest / m8_8_mailbox_drop_newest / m8x_4_block_sender (filename keying does not catch "policies" but the fixtures exercise every documented policy)
 
 Every mailbox has a policy that decides what `send` does when
 the mailbox is full. v1 ships **two policies** — one of them
@@ -265,6 +267,7 @@ real usage data exists. Both enums (`MailboxPolicy` and
 deliberate decision, not an incremental extension.
 
 ## Selective receive and future extension
+<!-- coverage: skip --> design discussion of post-MVP extension; v1 receive is FIFO only
 
 v1 `receive()` is **first-in-first-out**. Callers that need
 "receive only messages matching predicate P" write it
@@ -432,6 +435,7 @@ absorb. Once patterns stabilise, a stdlib module
 `Monitor` + `Spawn`.
 
 ## Interaction with `Cancel`
+<!-- coverage: skip --> covered by m8x_3_cancel_at_yield (cooperative Cancel delivery exercised end-to-end with a spawned worker)
 
 This section names `Actor`'s ops by their canonical effect-level
 form (`Actor.receive`, `Actor.send`, `Actor.self`). At call
