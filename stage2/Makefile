@@ -1741,6 +1741,17 @@ test-unbox-phase2: $(TARGET) build
 	@if grep -E 'kai_cond_inner_loop\(void\) \{[^}]*kai_truthy\(' build/perceus-unbox_phase2_cond.c; then \
 	  echo "unbox FAIL cond (kai_truthy survived inside body)"; exit 1; \
 	fi
+	@# M5 grep: match fixture must use a C `switch` on the raw
+	@# scalar — no `kai_decref(_scr)` (the boxed-alias cleanup) and
+	@# no `kai_eq(` (per-arm equality chain) inside the body.
+	@grep -F -q 'switch (_scr)' build/perceus-unbox_phase2_match.c \
+	  || { echo "unbox FAIL match (no raw switch found)"; exit 1; }
+	@if grep -E 'kai_classify_raw\(void\) \{[^}]*kai_eq\(' build/perceus-unbox_phase2_match.c; then \
+	  echo "unbox FAIL match (kai_eq survived inside body)"; exit 1; \
+	fi
+	@if grep -E 'kai_classify_raw\(void\) \{[^}]*kai_decref\(_scr\)' build/perceus-unbox_phase2_match.c; then \
+	  echo "unbox FAIL match (boxed _scr alias survived)"; exit 1; \
+	fi
 	@echo "unbox phase2 OK"
 
 test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2
