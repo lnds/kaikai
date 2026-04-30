@@ -9,6 +9,28 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- `examples/quickstart/` — five short, runnable programs that
+  introduce one concept each: hello, sum types + match, recursive
+  AST, custom effect + handler, cooperative fibers. README gains
+  a Quickstart section above Build pointing at them. ~150 lines
+  total, every file ships with its header comment, run command,
+  and expected output.
+- Coverage probe ratchet: `tools/coverage-baseline.txt` 17 → 0
+  after marking design / historical / non-feature / post-MVP-deferred
+  headings with `<!-- coverage: skip -->` and naming the existing
+  fixtures that already cover Spawning actors / Mailbox policies /
+  Interaction with Cancel.
+
+### Changed
+
+- `bin/kai` now passes `--path "$ROOT/stdlib"` on every `kaic2`
+  invocation, so `import spawn` (and any other stdlib module
+  beyond the default prelude chain) resolves out of the box. Fixes
+  `demos/concurrent/main.kai` running under the driver and unblocks
+  the quickstart's fibers example.
+
 ## [0.16.0] — 2026-04-29 (Fibers Tier 1 #2 — stack guard pages)
 
 Closes the second and final Fibers Tier 1 item (`docs/fibers-honesty-targets.md`).
