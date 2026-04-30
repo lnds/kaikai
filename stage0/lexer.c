@@ -69,11 +69,21 @@ static void push_token(Lexer *l, TokenKind k, size_t start, size_t end, int32_t 
     t->length = end - start;
 }
 
+/* C99 has no strdup (POSIX-only); rolling a tiny replacement keeps
+ * stage 0 buildable with -std=c99 -Wpedantic on libcs that hide
+ * strdup unless _POSIX_C_SOURCE is defined (notably glibc + clang). */
+static char *kai_strdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *r = (char *) malloc(n);
+    if (r) memcpy(r, s, n);
+    return r;
+}
+
 static void push_error(Lexer *l, const char *msg, size_t start, size_t end, int32_t line, int32_t col) {
     size_t idx = l->n;
     push_token(l, TK_ERROR, start, end, line, col);
     grow_errs(l, idx);
-    l->errs[idx] = msg ? strdup(msg) : NULL;
+    l->errs[idx] = msg ? kai_strdup(msg) : NULL;
 }
 
 static int at_end(const Lexer *l) { return l->pos >= l->len; }
