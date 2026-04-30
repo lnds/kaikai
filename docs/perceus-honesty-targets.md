@@ -134,6 +134,53 @@ audit + stage 0 eager-dup cleanup to push under the < 5 M
 threshold; the named architectural debt (perceus_pass §4b,
 match-scrutinee, kai_field balance) is now closed.
 
+## Tier 2.5 — *Unboxing Phase 2* (in-MVP, ~5–7 days)
+
+**Decision pinned 2026-04-30**: Phase 2 unboxing moves into MVP
+scope. Without it, the user-facing performance gap vs C native is
+~50–100× (every `Int` is a heap-allocated `KaiValue *`). Phase 2
+brings the gap to ~5–10×, which is in line with what OCaml /
+Haskell / Go ship as their default representation. Phase 3 (the
+full Koka feature set listed below) stays post-MVP.
+
+Phase 1 unboxing (small-int + char cache for `[-128, 127]` ints
+and `[0, 127]` chars) already landed (commit `69c6166`); Phase 2
+is the contained chunk that does **not** require the
+multi-threaded scheduler / cross-thread atomics design that
+Phase 3 needs.
+
+| Phase | What it does | Status | Performance vs C |
+|---|---|---|---:|
+| Phase 1 — small-int + char cache | Cache hits for ints in [-128, 127] / chars [0, 127] reuse singletons; no alloc | ✅ landed (`69c6166`) | 50–100× slower (cache hits free, miss boxes) |
+| **Phase 2 — locals + return values unboxed** | `Int` / `Bool` / `Char` live in C `int64_t` / `int` directly inside fn bodies; boxing only at function-call boundaries and storage edges. Escape analysis decides what gets boxed. | ⏳ in-MVP, this lane | **5–10× slower (boxing only at boundaries)** |
+| Phase 3 — full unboxing (Tier 3 below) | Reuse-in-place, drop specialisation, regions, cross-fiber unboxed messages, type-erased layouts | ⏳ post-MVP | 1–2× slower (close to C) |
+
+**Phase 2 scope** (single lane after `fibers-tier-2` closes):
+
+- Add a "value mode" tag to every Expr node in the typed AST:
+  `boxed` (current behaviour, `KaiValue *`) or `unboxed` (raw
+  `int64_t` / `int`).
+- Escape analysis: a local that flows only into other unboxed
+  contexts stays unboxed. A local that flows into a function
+  call argument, a heap store, an effect op handler, or any
+  other "boundary" boxes at the boundary.
+- Emitter generates `int64_t kai_<name>` instead of
+  `KaiValue *kai_<name>` for unboxed locals; arithmetic and bit
+  ops on unboxed values are direct C operators (no `kai_int(...)`
+  wrap).
+- Function signatures stay boxed for now (the call boundary is
+  the cheapest place to box). Inlining + C compiler LTO recover
+  some of this; full unboxed signatures move to Phase 3.
+
+**Costs**: ~5–7 days real. Design-heavy (first time kaikai
+tracks distinct representations for the same type) but contained
+— no multi-threading, no regions, no alias analysis full.
+
+**Acceptance**: `examples/quickstart/02_fizzbuzz.kai` benchmark
+under `-O2` runs within ~5–10× of a hand-written C equivalent
+of the same algorithm (today the gap is ~50–100×). Selfhost +
+demos baseline 24 hold byte-identical.
+
 ## Tier 3 — *Full Perceus* (post-MVP)
 
 The Koka feature set the m5 lane explicitly named "future
@@ -144,11 +191,12 @@ accidentally get pulled into a 1.0-scoped lane.
 |---|---:|---|
 | **Reuse-in-place** | ~1–2w | Constructor reuses consumed cell instead of `free` + `alloc`; needs alias analysis the type system can prove. Big win on linked-list rewrites; not needed for correctness. |
 | **Drop specialisation** | ~1w | Decref chains generated per-type and inlined, instead of going through runtime dispatch. Performance, not correctness. |
-| **Unboxing** | ~2–3w | Phase 1 unboxing (small-int + char cache) landed; full unboxing puts `Int` / `Bool` / `Char` / `Real` in native registers inside each fiber, heap-boxed only on the message boundary. Architectural shift; coordinates with multi-threaded scheduler tier 3 of fibers. |
+| **Unboxing Phase 3** (full Koka-style) | ~1–2w on top of Phase 2 | Cross-fiber unboxed messages, type-erased layouts, reuse-in-place coordination. Coordinates with multi-threaded scheduler. |
 | **Opt-in regions** | ~1–2w | Arena allocation for parser scratch / lexer state where RC overhead demonstrably costs more than a single arena reset. Power-user feature. |
 
-CLAUDE.md should keep "Full Perceus is post-m12" pinned alongside
-the multi-threaded scheduler decision.
+CLAUDE.md should keep "Full Perceus Phase 3 is post-m12" pinned
+alongside the multi-threaded scheduler decision. Phase 2 is
+in-MVP per the 2026-04-30 decision above.
 
 ## Sequencing recommendation
 
