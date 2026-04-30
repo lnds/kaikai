@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-04-30 (Unboxing Phase 2 — Tier 2.5 close, ~2.5× C reference on inner numeric loop)
+
 ### Added
 
 - **Unboxing Phase 2 (Tier 2.5) — locals + arithmetic stay raw
