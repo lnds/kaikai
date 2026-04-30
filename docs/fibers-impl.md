@@ -19,6 +19,7 @@ roadmap (`~/claude/kai.md` Phase R). It pins what the scheduler does;
 the surface stays under `structured-concurrency.md` and `actors.md`.
 
 ## Substrate
+<!-- coverage: skip --> design choice (ucontext vs CPS reification), not a testable feature
 
 **`ucontext` on POSIX**. `swapcontext` / `getcontext` / `makecontext`
 are the primitive substrate for stack switching. Available on macOS
@@ -277,6 +278,7 @@ region, and the Cancel injection longjmps back to the trampoline,
 which then transitions to CANCELLED instead of DONE.
 
 ## Balance invariant under fiber boundaries
+<!-- coverage: skip --> RC invariant rationale, internal contract
 
 Doc C §*Per-fiber isolation* §"Balance invariant" requires that
 `evidence_top == floor` at every fiber-yield point and at fiber

@@ -229,6 +229,7 @@ specialization"). End result: `var counter = 0; counter :=
 know the ergonomy is free.
 
 ## Syntax note: array indexing
+<!-- coverage: skip --> sugar shipping in m7b; coverage by m7b sugar fixtures
 
 `Mutable.array_get` and `Mutable.array_set` get their own
 concise spelling, because `a[i]` is universal enough that
@@ -460,6 +461,7 @@ timing decided when the first real use case pushes them:
   just new `File` ops.
 
 ## `Clock`
+<!-- coverage: skip --> effect declared, post-MVP; remove this marker when fixture lands
 
 ### Declaration
 
@@ -594,6 +596,7 @@ panic (programming error), not a `Fail`.
   deferred pending a use case that demands it.
 
 ## `SecureRandom`
+<!-- coverage: skip --> effect declared, post-MVP; remove this marker when fixture lands
 
 ### Declaration
 
@@ -648,6 +651,7 @@ cannot run if the OS cannot provide it.
   is fine through MVP-scale use cases.
 
 ## `NetTcp`, `NetUdp`, `NetDns` (alias `Net`)
+<!-- coverage: skip --> effect declared, post-MVP; remove this marker when fixture lands
 
 ### Declaration
 
@@ -1480,6 +1484,7 @@ reviewed surface — ideally consolidated inside `runtime/` or a
 single stdlib module per third-party library.
 
 ## Migration of existing builtins
+<!-- coverage: skip --> historical migration plan, not a feature
 
 The table below maps every kaikai-minimal builtin
 (`docs/kaikai-minimal.md` §*Built-in functions*) to its
