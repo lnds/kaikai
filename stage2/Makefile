@@ -493,6 +493,30 @@ test-stdlib: $(TARGET) build
 	    && echo "stdlib OK $$name" \
 	    || { echo "stdlib DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out; exit 1; }; \
 	done
+	@# m13: assert bit ops lowered as compiler intrinsics. The emitted
+	@# C must contain each raw operator inline next to `_a->as.i`, and
+	@# must NOT reference any `kai_bit_*` runtime helper (we never
+	@# declared one — a leak would be an emit-pass miss).
+	@if grep -q 'kai_bit_' build/stdlib-bits_basic.c; then \
+	  echo "stdlib FAIL bits_basic (intrinsic leaked as kai_bit_* call)"; \
+	  grep 'kai_bit_' build/stdlib-bits_basic.c; \
+	  exit 1; \
+	fi
+	@grep -F -q '_a->as.i << _b' build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (<< not inlined)"; exit 1; }
+	@grep -F -q '_a->as.i >> _b' build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (>> not inlined)"; exit 1; }
+	@grep -F -q '_a->as.i & _b'  build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (& not inlined)"; exit 1; }
+	@grep -F -q '_a->as.i | _b'  build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (| not inlined)"; exit 1; }
+	@grep -F -q '_a->as.i ^ _b'  build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (^ not inlined)"; exit 1; }
+	@grep -F -q '~ _a->as.i'     build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (~ not inlined)"; exit 1; }
+	@grep -F -q '__builtin_popcountll' build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (popcount not inlined)"; exit 1; }
+	@echo "stdlib OK bits_basic intrinsic-lowered"
 # Typed holes (M10): every example under examples/holes/ must
 # (a) produce a --holes report with at least one "type hole" entry,
 # (b) produce a valid --holes-json array,
