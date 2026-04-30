@@ -32,9 +32,14 @@ What does **not** work today:
   ref for the caller and one for the scheduler; the trampoline's
   DONE/CANCELLED tail drops the scheduler's ref. See R4 in
   `docs/known-regressions.md`.
-- Stack overflow in a fiber body lands in unmapped memory with
-  no diagnostic. Stack model has no guard page (declared in
-  `docs/fibers-impl.md`).
+- ~~Stack overflow in a fiber body lands in unmapped memory with
+  no diagnostic.~~ **FIXED 2026-04-29** (Fibers Tier 1 lane).
+  Each spawned fiber's private stack is now `mmap`ed with a
+  `PROT_NONE` guard page at the low end (stacks grow down on
+  x86_64 / arm64); a SIGSEGV/SIGBUS handler running on a
+  sigaltstack prints `kai: fiber stack overflow at <ptr>` before
+  re-raising with the default disposition. Coverage:
+  `examples/effects/m8_fiber_stack_overflow.kai`.
 - `Monitor` is type-surface-only — Phase 5.5+ deferred in
   `docs/m8x-followup.md` §5. Needs `spawn_actor` (Pid handoff
   primitive) which itself is deferred.
@@ -59,11 +64,12 @@ The two bugs a curious visitor hits in five minutes:
 | Item | Cost | Why |
 |---|---:|---|
 | ~~**R4 — fiber-discard deadlock**~~ ✅ shipped 2026-04-29 | ~0.5d | First thing anyone tries (`let _ = fiber_spawn(…)`); fixed via scheduler-side fiber RC discipline |
-| **Stack guard pages** | ~0.5d | Stack overflow → diagnostic SIGSEGV with message instead of UB |
+| ~~**Stack guard pages**~~ ✅ shipped 2026-04-29 | ~0.5d | Overflow now hits a `PROT_NONE` page; handler prints `kai: fiber stack overflow at <ptr>` and re-raises (`m8_fiber_stack_overflow.kai`) |
 
-Closes the two bugs that *would*  show up in a 30-minute live demo on
-unfamiliar code. Everything else (deferred items above) is debt the
-visitor would never trigger in a casual browse.
+**Tier 1 closed 2026-04-29.** The two bugs that *would*  show up in a
+30-minute live demo on unfamiliar code are both addressed. Everything
+else (deferred items above) is debt the visitor would never trigger in
+a casual browse.
 
 ## Tier 2 — *Production-honest 1.0* (~8–11 days)
 
@@ -75,7 +81,7 @@ can be parallelised across short lanes.
 | Item | Cost | Why |
 |---|---:|---|
 | ~~R4 — fiber-discard deadlock~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
-| Stack guard pages | ~0.5d | (carry-over from Tier 1) |
+| ~~Stack guard pages~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
 | **Monitor + `spawn_actor`** | ~2–3d | Phase 5.5+ in `m8x-followup.md` §5; without it the BEAM-style supervision claim is type-surface-only |
 | **Region-brand full machinery** | ~3–5d | `TyBranded` propagation through let / match / fn args; closes the sum-type-payload escape hatch from Phase 6 v1 shallow |
 | **LLVM op-dispatch `in_dispatch_node`** | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend |
