@@ -19885,12 +19885,24 @@ fn finalise_typed_kind(s: Subst, k: ExprKind) : ExprKind =
 # m8 #6: shallow region-brand check on Fiber[T]. Walks the type
 # annotation (the user-written TypeExpr, not the resolved Ty, so
 # the diagnostic can point at the exact text the user wrote) and
-# rejects any occurrence of `Fiber[...]` in the return-type
-# position of a fn that is NOT one of the legitimate stdlib
-# producers (`fiber_spawn` family in stdlib/spawn.kai). See the
-# comment at the call site in infer_decl for the design trade-off
+# rejects any occurrence of `Fiber[...]` (or `Pid[...]`) in the
+# return-type position of a fn that is NOT one of the legitimate
+# stdlib producers (`fiber_spawn` family in stdlib/spawn.kai). See
+# the comment at the call site in infer_decl for the design trade-off
 # (path-based exemption doesn't work because import decls inherit
 # the importer's file path through expand_imports).
+#
+# Tier 2 (2026-04-30): symmetrise the check across `Fiber[T]` and
+# `Pid[Msg]` so a stdlib-external helper can no longer return a
+# raw Pid either. The full TyBranded(Ty, BrandId) machinery from
+# `docs/structured-concurrency.md` §*Type system* — propagating a
+# brand through every binding form (let, match, list literal,
+# record field, fn arg) and rejecting brand-mismatch between
+# sibling nurseries — is still pending; the shallow check here
+# already covers (a) Fiber/Pid as a return type at any depth and
+# (b) Fiber/Pid embedded in stdlib-defined parametric types
+# (Result[_, Fiber[Int]], Option[Pid[Msg]], etc. via the
+# recursive walk).
 fn check_no_fiber_escape(st: InferState, file: String, fname: String,
                           opt_ret: Option[TypeExpr], line: Int, col: Int) : InferState {
   if is_fiber_producer_helper(fname) { st }
@@ -19908,6 +19920,16 @@ fn check_no_fiber_escape(st: InferState, file: String, fname: String,
           diag_note("returning one from a function lets it outlive that scope")
           diag_help("process the fiber inside the nursery (e.g. with `fiber_await`), or pass a thunk in and a value out instead")
           st_bump_err(st)
+        } else if ty_expr_contains_pid(rty) {
+          let lline = if rty.line > 0 { rty.line } else { line }
+          let lcol  = if rty.col  > 0 { rty.col  } else { col  }
+          diag_error(file, lline, lcol,
+            string_concat(string_concat("Pid[Msg] cannot escape `", fname),
+                          "`'s structured-concurrency scope"))
+          diag_note("a `Pid[Msg]` handle is bound to the actor scope that created it")
+          diag_note("returning one from a function lets it outlive that scope")
+          diag_help("process the pid inside the scope (e.g. with `Actor.send`), or pass a thunk in and a value out instead")
+          st_bump_err(st)
         } else {
           st
         }
@@ -19916,17 +19938,26 @@ fn check_no_fiber_escape(st: InferState, file: String, fname: String,
   }
 }
 
-# Allow-list of stdlib helpers permitted to mention Fiber[T] in
-# their return type. Kept intentionally narrow — these are the only
-# legitimate constructors / passthroughs of Fiber values today
-# (stdlib/spawn.kai). Any new helper that needs to return a Fiber
-# must be added here on purpose. Phase 6 generalised the previous
-# single hardcoded `fname == "fiber_spawn"` to this list so future
-# additions don't keep re-touching the predicate's body; the list
-# itself stays a single-entry leaf for v1. The full TyBranded(Ty,
-# BrandId) machinery from docs/structured-concurrency.md §*Type
-# system* is deferred to post-MVP (m8x-followup.md item 6).
-fn fiber_producer_helpers() : [String] = ["fiber_spawn"]
+# Allow-list of stdlib helpers permitted to mention Fiber[T] / Pid[Msg]
+# in their return type. Kept intentionally narrow — these are the only
+# legitimate constructors / passthroughs of Fiber / Pid values today
+# (stdlib/spawn.kai + stdlib/actor.kai). Any new helper that needs to
+# return either handle must be added here on purpose. The full
+# TyBranded(Ty, BrandId) machinery from
+# `docs/structured-concurrency.md` §*Type system* — proper
+# brand propagation through every binding form so an arbitrary helper
+# can be admitted without an allow-list — is still pending
+# (`docs/m8x-followup.md` §6).
+#
+# Tier 2 (2026-04-30) extension: the Pid producers `alloc_for_policy`
+# and `spawn_actor` join the list; both shape a Pid as part of the
+# `with_mailbox`/`spawn_actor` structured-concurrency surface, and
+# the v1 surface relies on the typer admitting that shape until full
+# region-brand propagation lands.
+fn fiber_producer_helpers() : [String] =
+  ["fiber_spawn",
+   # Tier 2 Pid surface helpers (stdlib/actor.kai).
+   "alloc_for_policy", "spawn_actor"]
 
 fn is_fiber_producer_helper(fname: String) : Bool =
   list_has(fiber_producer_helpers(), fname)
@@ -19956,6 +19987,37 @@ fn ty_expr_list_has_fiber(ts: [TypeExpr]) : Bool {
   match ts {
     [] -> false
     [t, ...rest] -> if ty_expr_contains_fiber(t) { true } else { ty_expr_list_has_fiber(rest) }
+  }
+}
+
+# Tier 2 (2026-04-30): same shallow walk as `ty_expr_contains_fiber`
+# but for `Pid`. Region-brand machinery (TyBranded) is still pending,
+# so this is the same syntactic approximation: any TypeExpr
+# mentioning `Pid` at any depth (list, function-arg/-ret, type-arg,
+# dimensioned base, refinement base) returns true. Producer-helper
+# allow-list (`fiber_producer_helpers`) stays intentionally narrow;
+# stdlib's `mailbox_alloc` / `Actor.self()` still go through their
+# prelude / op-call scheme entries which are not subjected to this
+# check.
+fn ty_expr_contains_pid(t: TypeExpr) : Bool {
+  match t.tkind {
+    TyName(name, tas) ->
+      if name == "Pid" { true }
+      else { ty_expr_list_has_pid(tas) }
+    TyList(inner) -> ty_expr_contains_pid(inner)
+    TyFn(ps, ret, _) -> {
+      if ty_expr_list_has_pid(ps) { true }
+      else { ty_expr_contains_pid(ret) }
+    }
+    TyDim(base, _) -> ty_expr_contains_pid(base)
+    TyRefine(base, _) -> ty_expr_contains_pid(base)
+  }
+}
+
+fn ty_expr_list_has_pid(ts: [TypeExpr]) : Bool {
+  match ts {
+    [] -> false
+    [t, ...rest] -> if ty_expr_contains_pid(t) { true } else { ty_expr_list_has_pid(rest) }
   }
 }
 
