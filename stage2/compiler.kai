@@ -8545,7 +8545,122 @@ fn emit_match_arm(src: String, a: Arm, lcs: [String], fns: [EFn], variants: [EVa
   }
 }
 
+# M5 fast-path predicate. True iff every arm in `arms` is a
+# literal pattern (Int / Bool / Char) or a wildcard (PWild /
+# PBind), and no arm carries a guard. Strings are intentionally
+# excluded — the C `switch` only works on integral types.
+fn arms_all_literal_or_wild(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false   # need at least one arm to dispatch on
+    _  -> arms_all_literal_or_wild_loop(arms)
+  }
+}
+
+fn arms_all_literal_or_wild_loop(arms: [Arm]) : Bool {
+  match arms {
+    [] -> true
+    [Arm(p, g, _), ...rest] -> match g {
+      Some(_) -> false
+      None    -> if pat_is_unboxable_lit_or_wild(p) {
+        arms_all_literal_or_wild_loop(rest)
+      } else { false }
+    }
+  }
+}
+
+fn pat_is_unboxable_lit_or_wild(p: Pattern) : Bool {
+  match p.pkind {
+    PWild     -> true
+    # PBind would require threading a new raw local through the
+    # body's lcs/env so EVar reads of it resolve to `kair_<name>`.
+    # Out of scope for M5 v1 — fall back to the boxed match path
+    # whenever a catch-all binds a name. Pure wildcard is fine.
+    PLit(lit) -> match lit.kind {
+      EInt(_)  -> true
+      EBool(_) -> true
+      EChar(_) -> true
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
+# Emit the raw C scalar that goes inside `switch (...)` for a
+# literal pattern. `EInt` → `<n>LL`, `EBool` → `0`/`1`,
+# `EChar` → numeric codepoint.
+fn pat_lit_raw(p: Pattern) : String {
+  match p.pkind {
+    PLit(lit) -> match lit.kind {
+      EInt(n)  -> cat2(int_to_string(n), "LL")
+      EBool(b) -> if b { "1" } else { "0" }
+      EChar(c) -> int_to_string(char_to_int(c))
+      _ -> "0LL /* pat_lit_raw: unexpected lit */"
+    }
+    _ -> "0LL /* pat_lit_raw: not a literal pattern */"
+  }
+}
+
+# Lower a `match` whose scrutinee is `MUnboxed` and whose arms
+# are all literal-or-wild into a C `switch`. The wildcard /
+# bind arm becomes the `default:` clause; if no wildcard is
+# present, `default:` panics with "non-exhaustive match".
+fn emit_match_switch(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  let raw = emit_expr_raw(src, scrut, lcs, fns, variants, lams, cls)
+  let cty = raw_c_type(scrut.ty)
+  concat_all([
+    "({ ", cty, " _scr = ", raw, "; KaiValue *_r = kai_unit(); switch (_scr) {\n",
+    emit_switch_arms(src, arms, lcs, fns, variants, lams, cls, false),
+    "} _r; })"
+  ])
+}
+
+fn emit_switch_arms(src: String, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo], saw_default: Bool) : String {
+  match arms {
+    [] -> if saw_default { "" }
+          else { "    default: kai_prelude_panic(kai_str(\"non-exhaustive match\")); break;\n" }
+    [a, ...rest] -> match a {
+      Arm(p, _, body) -> {
+        # Each arm's body sees the scrutinee binding as a local
+        # name when the pattern is `PBind(name)`.
+        let arm_lcs = list_append(lcs, pat_binders(p, []))
+        let body_c = emit_expr(src, body, arm_lcs, fns, variants, lams, cls)
+        match p.pkind {
+          PWild -> {
+            let head = concat_all(["    default: _r = ", body_c, "; break;\n"])
+            cat2(head, emit_switch_arms(src, rest, lcs, fns, variants, lams, cls, true))
+          }
+          _ -> {
+            # PLit literal arm.
+            let head = concat_all(["    case ", pat_lit_raw(p), ": _r = ", body_c, "; break;\n"])
+            cat2(head, emit_switch_arms(src, rest, lcs, fns, variants, lams, cls, saw_default))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cty_for_bind(opt_ty: Option[Ty]) : String = raw_c_type(opt_ty)
+
 fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  # Tier 2.5 M5 — match scrutinee fast path. When the scrutinee is
+  # `MUnboxed` (raw int / char) and every arm is a literal-or-wild
+  # pattern of the same unboxable type with no guard, lower the
+  # match to a C `switch` on the raw scalar. Avoids the `_scr`
+  # boxed alias + per-arm `kai_eq(...)` chain.
+  match scrut.mode {
+    MUnboxed -> {
+      if arms_all_literal_or_wild(arms) {
+        emit_match_switch(src, scrut, arms, lcs, fns, variants, lams, cls)
+      } else {
+        emit_match_default(src, scrut, arms, lcs, fns, variants, lams, cls)
+      }
+    }
+    _ -> emit_match_default(src, scrut, arms, lcs, fns, variants, lams, cls)
+  }
+}
+
+fn emit_match_default(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   let sc = emit_expr(src,scrut, lcs, fns, variants, lams, cls)
   # m5.x flip Phase 3 closeout (original 9fe6f6d shape, restored after
   # §4b landed): consume the scrutinee linearly. `_scr` takes the value
