@@ -210,6 +210,40 @@ void *kaix_evidence_lookup_handler(const char *eff_label) {
     return node->handler;
 }
 
+/* m8 bug #12 follow-up — LLVM mirror of the C emit's per-fiber
+ * `in_dispatch_node` save/restore around an op call. The C path
+ * captures the node from `kai_evidence_lookup_node(...)` and
+ * pokes `current_fiber->in_dispatch_node` directly across the
+ * indirect call (stage2/compiler.kai's `emit_call_expr`); the
+ * LLVM path only had `kaix_evidence_lookup_handler`, so a
+ * self-delegating handler under `--emit=llvm` would re-resolve to
+ * the same node and infinite-loop just like bug #12 in the C
+ * backend. The pair below (`kaix_in_dispatch_enter` /
+ * `kaix_in_dispatch_leave`) lets the LLVM emit set the flag and
+ * restore it without exposing the KaiFiber struct in IR. */
+void *kaix_evidence_lookup_node(const char *eff_label) {
+    return (void *) kai_evidence_lookup_node(eff_label);
+}
+
+void *kaix_evidence_node_handler(void *node_v) {
+    KaiEvidence *node = (KaiEvidence *) node_v;
+    if (node == NULL) { return NULL; }
+    return node->handler;
+}
+
+void *kaix_in_dispatch_enter(void *node_v) {
+    KaiEvidence *node = (KaiEvidence *) node_v;
+    KaiFiber *fib = kai_current_fiber();
+    KaiEvidence *prev = fib->in_dispatch_node;
+    fib->in_dispatch_node = node;
+    return (void *) prev;
+}
+
+void kaix_in_dispatch_leave(void *prev_v) {
+    KaiFiber *fib = kai_current_fiber();
+    fib->in_dispatch_node = (KaiEvidence *) prev_v;
+}
+
 void kaix_cont_init_identity(KaiCont *k, KaiHandlerId hid) {
     kai_cont_init_identity(k, hid);
 }

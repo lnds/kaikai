@@ -1296,8 +1296,20 @@ test-effects: $(TARGET) build
 	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
 	  ./build/s2-$$name \
-	    && echo "effects OK $$name (m8 bug #12: self-delegating handler resolves to outer + per-fiber save/restore paired)" \
-	    || { echo "effects FAIL $$name (binary exit non-zero — infinite-loop regression?)"; exit 1; }; \
+	    || { echo "effects FAIL $$name (C binary exit non-zero — infinite-loop regression?)"; exit 1; }; \
+	  ./$(TARGET) --emit=llvm $$f > build/s2-$$name.ll 2> build/s2-$$name.ll.err \
+	    || { echo "effects FAIL $$name (kaic2 --emit=llvm errored)"; cat build/s2-$$name.ll.err; exit 1; }; \
+	  enter_count=$$(grep -c "call i8\* @kaix_in_dispatch_enter" build/s2-$$name.ll || true); \
+	  leave_count=$$(grep -c "call void @kaix_in_dispatch_leave" build/s2-$$name.ll || true); \
+	  test "$$enter_count" -gt 0 \
+	    || { echo "effects FAIL $$name (LLVM in_dispatch_enter missing — bug #12 LLVM mirror regressed?)"; exit 1; }; \
+	  test "$$enter_count" = "$$leave_count" \
+	    || { echo "effects FAIL $$name (LLVM in_dispatch invariant broken: $$enter_count enter vs $$leave_count leave)"; exit 1; }; \
+	  clang -w -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm \
+	    || { echo "effects FAIL $$name (LLVM link failed)"; exit 1; }; \
+	  ./build/s2-$$name-llvm \
+	    && echo "effects OK $$name (m8 bug #12: self-delegating handler resolves to outer + per-fiber save/restore paired (C+LLVM))" \
+	    || { echo "effects FAIL $$name (LLVM binary exit non-zero — infinite-loop regression?)"; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m8_fiber_discard.kai \
 	         ../examples/effects/m8_fiber_discard_yields.kai; do \
