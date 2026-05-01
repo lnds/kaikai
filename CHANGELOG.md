@@ -9,6 +9,42 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Fixed
+
+- **TCO precise per-call-site dropmask (issue #43, re-land of PR #41
+  precise version).** `tcrec_compute_site_dropmask` now drops a
+  parameter `p` in the goto block when its last-use is `LUAt` with
+  `count(p) == 1` AND `p` does not appear as a plain `EVar(p)`
+  anywhere in the call site's args (rule 3). This closes the cons-
+  cell leak in `list.nth(xs, i)`-shape recursive functions where
+  `xs` is consumed by an enclosing match scrutinee that the goto
+  bypasses; without rule 3 each iteration leaked one cons cell.
+  PR #41's first attempt and PR #48's first two attempts at this
+  rule tripped a glibc tcache-integrity abort during the kaic2
+  self-compile on Linux ubuntu-clang. The bisection isolated the
+  locus to call sites that thread `args: [Expr]` through stage 1's
+  perceus dup-wrap. The shipped shape uses `map(pnames, (p) =>
+  tcrec_args_have_evar(xs, p))` directly inside `tcrec_rewrite_kind`
+  with a closure that captures `xs` (bound by the surrounding match
+  arm — NOT a function parameter), so no helper in compiler.kai
+  takes `[Expr]` as a parameter. Reuses the already-exercised
+  `map(args_e, (a) => emit_expr(...))` pattern at line ~7827.
+
+### Added
+
+- **`examples/tco/list_nth_shape.kai` regression fixture** for the
+  precise dropmask. The fixture's `nth_loop(xs, i)` is the
+  canonical rule-3 shape — `xs` read only as a match scrutinee,
+  recursive call passes `(t, i - 1)`. New `make test-tco-regression`
+  asserts the goto block emits `kai_internal_drop(kai_xs)`. Sanity
+  check (one-line revert of rule 3 inside
+  `tcrec_compute_site_dropmask`) confirmed the test fails when rule
+  3 is removed and passes when it is present. The C-text assertion
+  is the regression signal because the build-phase emitter has no
+  RC discipline (memory note: "97% of allocs leak"), which would
+  otherwise mask the per-iteration cons-cell delta in a
+  `KAI_TRACE_RC` leak count.
+
 ## [0.24.0] — 2026-05-01 (Tongariki Wave 1 — kai fmt + TCO stage 1 mirror + lane-experience retro)
 
 ### Added

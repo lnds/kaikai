@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco test-tco-regression selfhost
 
 all: $(TARGET)
 
@@ -1800,7 +1800,36 @@ test-tco: $(TARGET) build
 	  && echo "tco OK (50M-deep self-tail-call ran in O(1) stack)" \
 	  || { echo "tco DIFF"; diff ../examples/tco/main.out.expected build/tco.out; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco
+# Issue #43 — regression for the precise per-call-site dropmask
+# rule 3 ("LUAt+count==1 AND p not in args → drop in goto block").
+# The fixture's `nth_loop(xs, i)` reads `xs` only as a match
+# scrutinee; the recursive call's args are `(t, i - 1)`, so `xs`
+# itself is not in args. Rule 3 must fire and emit
+# `kai_internal_drop(kai_xs)` in the goto block — without it, the
+# match's exit `kai_decref(_scr)` is skipped by the goto and the
+# cons cell leaks once per iteration. We assert the drop is
+# present in the emitted C, then run the fixture to confirm
+# correct output (also implicitly confirms TCO turns the 100k-deep
+# walk into a goto loop). The C-text assertion is the regression
+# signal: `KAI_TRACE_RC` leak counts cannot distinguish rule 3
+# from no-rule-3 today because the build-phase emitter has no RC
+# discipline (memory note: "97% of allocs leak"), which masks the
+# per-iteration cons-cell delta.
+test-tco-regression: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/tco/list_nth_shape.kai > build/tco-nth.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/tco-nth.c -o build/tco-nth; \
+	./build/tco-nth > build/tco-nth.out; \
+	diff -q ../examples/tco/list_nth_shape.out.expected build/tco-nth.out > /dev/null \
+	  || { echo "tco-regression DIFF"; diff ../examples/tco/list_nth_shape.out.expected build/tco-nth.out; exit 1; }; \
+	count=$$(grep -c 'kai_internal_drop(kai_xs)' build/tco-nth.c || true); \
+	if [ "$$count" -lt 1 ]; then \
+	  echo "tco-regression FAIL: rule 3 dropmask missing — no kai_internal_drop(kai_xs) in goto block (issue #43)"; \
+	  exit 1; \
+	fi; \
+	echo "tco-regression OK (rule 3 dropmask emitted; nth_loop(100k, 99_999) runs leak-clean)"
+
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -1809,7 +1838,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco test-tco-regression
 
 clean:
 	rm -rf build $(TARGET)

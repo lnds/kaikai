@@ -24118,49 +24118,209 @@ fn tcrec_any_unused(params: [Param], uses: [Use]) : Bool {
   }
 }
 
-# Conservative per-call-site dropmask. The criterion for each
-# parameter p mirrors `pcs_collect_exit_drops` exactly:
+# Precise per-call-site dropmask (issue #43 — re-land of the
+# version PR #41 first attempted). The criterion for each
+# parameter p:
 #
-#   - LUBlocked              → drop.
-#   - LUAt + count(p) >= 2   → drop (every read is `__perceus_dup`-
-#                               wrapped, so the original ref is
+#   - LUBlocked              → drop (matches `pcs_collect_exit_drops`).
+#   - LUAt + count(p) >= 2   → drop (matches `pcs_collect_exit_drops`;
+#                               every read is `__perceus_dup`-wrapped
+#                               by Perceus, so the original ref is
 #                               unconsumed at the wrap's exit, which
 #                               the goto skips).
-#   - LUAt + count(p) == 1   → no drop. The single read transfers
-#                               ownership to its consumer; if the
-#                               consumer happens to live inside the
-#                               args, evaluating them already
-#                               releases p (so a goto-block drop
-#                               would double-free). If the consumer
-#                               lives *outside* the args (e.g. p
-#                               was the scrutinee of an enclosing
-#                               match — `nth`'s
+#   - LUAt + count(p) == 1   → drop iff p does not appear as a plain
+#                               `EVar(p)` anywhere in this site's
+#                               args. The single read transfers
+#                               ownership to its consumer; if that
+#                               consumer is the args themselves
+#                               (e.g. `f(g(x))`, `swap(y, x)`), the
+#                               arg evaluation already releases p
+#                               and a goto-block drop would double
+#                               free. If the consumer is *outside*
+#                               the args (e.g. p was the scrutinee
+#                               of an enclosing match — `nth`'s
 #                               `match xs { … nth(t, i-1) … }`),
 #                               the goto skips that match's exit
-#                               `kai_decref(_scr)` and we leak the
-#                               cons cell once per iteration. The
-#                               leak is bounded and documented as a
-#                               follow-up under issue #37; the
-#                               precise version that distinguished
-#                               those two cases triggered a glibc
-#                               tcache-integrity abort during stage
-#                               2's selfhost on Linux that needs
-#                               more isolation work before it can
-#                               re-land.
+#                               `kai_decref(_scr)`, so we drop p
+#                               here to cover the loss.
 #   - LUUnused               → unreachable (`tcrec_any_unused` made
 #                               us bail out before getting here).
+#
+# `has_evar` is an Int bitmask parallel to `params`: bit i is set
+# iff parameter i appears as a plain `EVar(p)` somewhere in the
+# call site's args. The flags are precomputed by
+# `tcrec_per_param_has_evar` at the caller, where `args: [Expr]`
+# is locally bound. This split is load-bearing: PR #41's first
+# attempt threaded `args: [Expr]` through this function and
+# called `tcrec_args_have_evar` from inside it. That call-site
+# emit (passing `[Expr]` through stage 1's perceus and back to
+# the helper) tripped a glibc tcache-integrity abort during the
+# kaic2 self-compile on Linux. The 8-step bisection isolated the
+# locus to the call site itself, not the walker logic. The
+# flatter API — `[Bool]`-as-Int precomputed by the caller —
+# sidesteps the suspect emit pattern.
 fn tcrec_compute_site_dropmask(params: [Param], uses: [Use],
+                                has_evar: Int,
                                 i: Int, acc: Int) : Int {
   match params {
     [] -> acc
     [p, ...rest] -> {
+      let bit = tcrec_pow2(i)
       let drop = match last_use_for(p.pname, uses) {
         LUBlocked(_) -> true
-        LUAt(_, _, _) -> pcs_count_non_lam_uses(p.pname, uses, 0) >= 2
+        LUAt(_, _, _) ->
+          if pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 { true }
+          else { (has_evar / bit) % 2 == 0 }
         LUUnused(_) -> false
       }
-      let acc1 = if drop { acc + tcrec_pow2(i) } else { acc }
-      tcrec_compute_site_dropmask(rest, uses, i + 1, acc1)
+      let acc1 = if drop { acc + bit } else { acc }
+      tcrec_compute_site_dropmask(rest, uses, has_evar, i + 1, acc1)
+    }
+  }
+}
+
+# Walks `args` once per `pname`, building an Int bitmask. Bit i is
+# set iff `pnames[i]` appears as a plain `EVar(pnames[i])` somewhere
+# in `args`. Called once per tail-call site; result feeds
+# `tcrec_compute_site_dropmask`.
+fn tcrec_per_param_has_evar(args: [Expr], pnames: [String],
+                             i: Int, acc: Int) : Int {
+  match pnames {
+    [] -> acc
+    [p, ...rest] -> {
+      let acc1 = if tcrec_args_have_evar(args, p) {
+                   acc + tcrec_pow2(i)
+                 } else { acc }
+      tcrec_per_param_has_evar(args, rest, i + 1, acc1)
+    }
+  }
+}
+
+# Walk args looking for any `EVar(p)`. Pre-Perceus there are no
+# `__perceus_dup` wrappers, so a plain EVar(p) anywhere in the arg
+# tree means the arg expression reads p (and, if count(p)==1,
+# consumes it on evaluation).
+fn tcrec_args_have_evar(args: [Expr], p: String) : Bool {
+  match args {
+    [] -> false
+    [a, ...rest] ->
+      if tcrec_expr_has_evar(a, p) { true }
+      else { tcrec_args_have_evar(rest, p) }
+  }
+}
+
+fn tcrec_expr_has_evar(e: Expr, p: String) : Bool =
+  tcrec_kind_has_evar(e.kind, p)
+
+fn tcrec_kind_has_evar(k: ExprKind, p: String) : Bool {
+  match k {
+    EVar(nm) -> nm == p
+    ECall(f, xs) ->
+      if tcrec_expr_has_evar(f, p) { true }
+      else { tcrec_args_have_evar(xs, p) }
+    EField(x, _) -> tcrec_expr_has_evar(x, p)
+    EIndex(x, i) ->
+      if tcrec_expr_has_evar(x, p) { true } else { tcrec_expr_has_evar(i, p) }
+    EBinop(_, l, r) ->
+      if tcrec_expr_has_evar(l, p) { true } else { tcrec_expr_has_evar(r, p) }
+    EUnop(_, x) -> tcrec_expr_has_evar(x, p)
+    EIf(c, t, opt_e) ->
+      if tcrec_expr_has_evar(c, p) { true }
+      else if tcrec_expr_has_evar(t, p) { true }
+      else { match opt_e {
+        None -> false
+        Some(e2) -> tcrec_expr_has_evar(e2, p)
+      } }
+    EMatch(s, arms) ->
+      if tcrec_expr_has_evar(s, p) { true }
+      else { tcrec_arms_have_evar(arms, p) }
+    EBlock(stmts, opt_tail) ->
+      if tcrec_stmts_have_evar(stmts, p) { true }
+      else { match opt_tail {
+        None -> false
+        Some(e) -> tcrec_expr_has_evar(e, p)
+      } }
+    EPipe(l, r) ->
+      if tcrec_expr_has_evar(l, p) { true } else { tcrec_expr_has_evar(r, p) }
+    ERange(lo, hi, opt_step) ->
+      if tcrec_expr_has_evar(lo, p) { true }
+      else if tcrec_expr_has_evar(hi, p) { true }
+      else { match opt_step {
+        None -> false
+        Some(s) -> tcrec_expr_has_evar(s, p)
+      } }
+    EList(elems) -> tcrec_elems_have_evar(elems, p)
+    ERecordLit(_, fis) -> tcrec_fields_have_evar(fis, p)
+    # Lambda body captures: any read of `p` inside is a closure
+    # capture, not a direct consume of p in the call's eval. The
+    # closure increfs p when it is materialised, so the consume
+    # happens later, not here. Plain reads in the lambda body have
+    # the same effect as multi-use (LUBlocked branch). Treat the
+    # lambda as not-consuming for the purposes of this scan.
+    ELambda(_, _) -> false
+    _ -> false
+  }
+}
+
+fn tcrec_arms_have_evar(arms: [Arm], p: String) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, body) ->
+        if tcrec_expr_has_evar(body, p) { true }
+        else { match opt_g {
+          None -> tcrec_arms_have_evar(rest, p)
+          Some(g) ->
+            if tcrec_expr_has_evar(g, p) { true }
+            else { tcrec_arms_have_evar(rest, p) }
+        } }
+    }
+  }
+}
+
+fn tcrec_stmts_have_evar(stmts: [Stmt], p: String) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, e) -> tcrec_expr_has_evar(e, p)
+        SVar(_, _, e, _, _) -> tcrec_expr_has_evar(e, p)
+        SAssert(c, opt_m) ->
+          if tcrec_expr_has_evar(c, p) { true }
+          else { match opt_m {
+            None -> false
+            Some(m) -> tcrec_expr_has_evar(m, p)
+          } }
+        SExprStmt(e) -> tcrec_expr_has_evar(e, p)
+        SIndexAssign(b, i, v, _, _) ->
+          if tcrec_expr_has_evar(b, p) { true }
+          else if tcrec_expr_has_evar(i, p) { true }
+          else { tcrec_expr_has_evar(v, p) }
+        SUse(_, _, _) -> false
+      }
+      if here { true } else { tcrec_stmts_have_evar(rest, p) }
+    }
+  }
+}
+
+fn tcrec_elems_have_evar(elems: [ListElem], p: String) : Bool {
+  match elems {
+    [] -> false
+    [el, ...rest] -> {
+      let inner = match el { ElPlain(e) -> e ElSpread(e) -> e }
+      if tcrec_expr_has_evar(inner, p) { true }
+      else { tcrec_elems_have_evar(rest, p) }
+    }
+  }
+}
+
+fn tcrec_fields_have_evar(fis: [FieldInit], p: String) : Bool {
+  match fis {
+    [] -> false
+    [fi, ...rest] -> match fi {
+      FI(_, e) ->
+        if tcrec_expr_has_evar(e, p) { true }
+        else { tcrec_fields_have_evar(rest, p) }
     }
   }
 }
@@ -24218,7 +24378,8 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
         if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
-          let dropmask = tcrec_compute_site_dropmask(params, uses, 0, 0)
+          let has_evar = tcrec_per_param_has_evar(xs, pnames, 0, 0)
+          let dropmask = tcrec_compute_site_dropmask(params, uses, has_evar, 0, 0)
           let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
           ECall(
             Expr { kind: EVar(sentinel), line: f.line, col: f.col,
