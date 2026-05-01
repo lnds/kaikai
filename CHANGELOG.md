@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.24.1] — 2026-05-01 (regression fixture for conservative dropmask + R6 deferral of rule 3 strict)
+
 ### Added
 
 - **`examples/tco/list_nth_shape.kai` documentation fixture for
