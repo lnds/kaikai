@@ -38,7 +38,7 @@ type TokKind
   = TkEof
   | TkNewline
   # keywords (alphabetical)
-  | TkAnd | TkAs | TkAssert | TkAxiom | TkConst | TkEffect | TkElse | TkEnsures | TkFalse | TkFn | TkFor
+  | TkAnd | TkAs | TkAssert | TkAxiom | TkBench | TkConst | TkEffect | TkElse | TkEnsures | TkFalse | TkFn | TkFor
   | TkHandle | TkIf | TkImpl | TkImport
   | TkLet | TkMatch | TkNot | TkOr | TkProtocol | TkPub | TkRequires | TkTest | TkTrue | TkType
   | TkUnitKw | TkUse | TkVar | TkWhere | TkWith
@@ -89,7 +89,7 @@ fn tk_name(k: TokKind) : String {
   match k {
     TkEof -> "EOF"
     TkNewline -> "NEWLINE"
-    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkAxiom -> "axiom" TkConst -> "const" TkEffect -> "effect" TkElse -> "else"
+    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkAxiom -> "axiom" TkBench -> "bench" TkConst -> "const" TkEffect -> "effect" TkElse -> "else"
     TkEnsures -> "ensures"
     TkFalse -> "false" TkFn -> "fn" TkFor -> "for" TkHandle -> "handle"
     TkIf -> "if" TkImpl -> "impl" TkImport -> "import"
@@ -244,6 +244,7 @@ fn keyword_kind(text: String) : TokKind {
   else if text == "as" { TkAs }
   else if text == "assert" { TkAssert }
   else if text == "axiom" { TkAxiom }   # m12.7
+  else if text == "bench" { TkBench }   # bench v1 (issue #40)
   else if text == "const" { TkConst }   # §29 / m12.6.x #const
   else if text == "effect" { TkEffect }
   else if text == "else" { TkElse }
@@ -1255,6 +1256,9 @@ type Decl
   = DFn(Bool, String, [String], [Param], Option[TypeExpr], RowExpr, Expr, Int, Int, Option[String])
   | DType(Bool, String, [String], TypeBody, Int, Int)
   | DTest(String, Expr, Int, Int)
+  # bench v1 (issue #40): mirrors DTest but the runner times the body.
+  # Fields: description (raw quoted span), body, line, col.
+  | DBench(String, Expr, Int, Int)
   | DImport(ImportKind, Int, Int)
   # m7b #11: optional type parameters on the effect declaration —
   # `effect Reader[T] { ask() : T }`. Empty list for stateless effects.
@@ -1441,6 +1445,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkAs         -> match b { TkAs -> true _ -> false }
     TkAssert     -> match b { TkAssert -> true _ -> false }
     TkAxiom      -> match b { TkAxiom -> true _ -> false }
+    TkBench      -> match b { TkBench -> true _ -> false }
     TkConst      -> match b { TkConst -> true _ -> false }
     TkEffect     -> match b { TkEffect -> true _ -> false }
     TkElse       -> match b { TkElse -> true _ -> false }
@@ -2115,7 +2120,8 @@ fn parse_postfix_rest(p: Parser, lhs: Expr) : PExpr {
     # without renaming.
     if tk_is(id.kind, TkIdent) or tk_is(id.kind, TkVar) or
        tk_is(id.kind, TkAnd)   or tk_is(id.kind, TkOr)  or
-       tk_is(id.kind, TkNot)   or tk_is(id.kind, TkTest) {
+       tk_is(id.kind, TkNot)   or tk_is(id.kind, TkTest) or
+       tk_is(id.kind, TkBench) {
       let name = tok_source(p.src, id)
       parse_postfix_rest(p_advance(p1), mk_expr(EField(lhs, name), t.line, t.col))
     } else {
@@ -4283,6 +4289,9 @@ fn parse_decl(p: Parser) : PDecl {
   } else if tk_is(hd.kind, TkTest) {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a test")) }
     else { parse_test_decl(p_advance(p1), hd) }
+  } else if tk_is(hd.kind, TkBench) {
+    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a bench")) }
+    else { parse_bench_decl(p_advance(p1), hd) }
   } else if tk_is(hd.kind, TkImport) {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on an import")) }
     else { parse_import_decl(p_advance(p1), hd) }
@@ -6058,6 +6067,28 @@ fn parse_test_decl(p: Parser, t: Token) : PDecl {
   }
 }
 
+# bench v1 (issue #40): structural mirror of parse_test_decl. The
+# runner times the body N=1000 times and reports mean ns/iter.
+fn parse_bench_decl(p: Parser, t: Token) : PDecl {
+  let desc_t = p_peek(p)
+  if not tk_is(desc_t.kind, TkString) {
+    err_d(p_error(p, desc_t, "expected string description after `bench`"))
+  } else {
+    let desc_span = tok_source(p.src, desc_t)
+    let p1 = p_skip_newlines(p_advance(p))
+    if not p_at(p1, TkLbrace) {
+      err_d(p_error_here(p1, "expected `{` for bench body"))
+    } else {
+      let tb = p_peek(p1)
+      let rb = parse_block(p1, tb)
+      match rb.r {
+        None -> err_d(rb.p)
+        Some(body) -> ok_d(rb.p, DBench(desc_span, body, t.line, t.col))
+      }
+    }
+  }
+}
+
 fn parse_import_decl(p: Parser, t: Token) : PDecl {
   # For stage 1 MVP, imports are structurally parsed but not resolved.
   # Accept: `import a.b.c`, `import a.b.c as X`, `import a.b.c.{f, g}`.
@@ -6548,6 +6579,10 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
     }
     DTest(desc, body, line, col) -> {
       emit_line(depth, "test #{desc} @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_expr(body, depth + 1)
+    }
+    DBench(desc, body, line, col) -> {
+      emit_line(depth, "bench #{desc} @#{int_to_string(line)}:#{int_to_string(col)}")
       dump_expr(body, depth + 1)
     }
     DImport(ik, line, col) -> {
@@ -7092,6 +7127,11 @@ fn chk_decl(e: Env, d: Decl) : Env {
       let e2 = chk_expr(e1, body)
       env_pop(e2)
     }
+    DBench(_, body, _, _) -> {
+      let e1 = env_push(e)
+      let e2 = chk_expr(e1, body)
+      env_pop(e2)
+    }
     DImport(_, _, _) -> e
     DEffect(_, _, _, _, _, _) -> e          # m7a #3c will register effect names
     # m12.8: protocol / impl / derive decls are stripped by
@@ -7138,6 +7178,7 @@ fn register_one(e: Env, d: Decl) : Env {
       }
     }
     DTest(_, _, _, _) -> e
+    DBench(_, _, _, _) -> e
     DImport(ik, _, _) -> register_import(e, ik)
     DEffect(_, name, _, _, _, _) -> env_add(e, name)
     # m12.8: stripped pre-resolve; never reaches register_one in
@@ -9512,6 +9553,15 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
       let st2 = collect_expr(body, st1)
       restore_enc_fn(st2, outer)
     }
+    DBench(_, body, line, col) -> {
+      let outer = st.cur_enc_fn
+      let bench_enc = concat_all([
+        "__bench__", int_to_string(line), "_", int_to_string(col)
+      ])
+      let st1 = enter_enc_fn(st, bench_enc)
+      let st2 = collect_expr(body, st1)
+      restore_enc_fn(st2, outer)
+    }
     DImport(_, _, _) -> st
     DEffect(_, _, _, _, _, _) -> st          # no expressions to walk
     # m12.8: stripped pre-resolve. No expressions to walk if one
@@ -10909,6 +10959,74 @@ fn test_call_list(n: Int, i: Int) : String {
   }
 }
 
+# ---- bench function emission (always emitted; only called from int main
+#      when bench_mode is on) ----
+#
+# bench v1 (issue #40): mirrors the test pipeline above. Each bench
+# body is wrapped in a fixed-N loop under kai_bench_now_ns(); on exit
+# we report mean ns/iter through kai_bench_report. Unlike test, we do
+# NOT install a setjmp landing pad — an assertion failure inside a
+# bench should panic the process, since timing aborted code is
+# meaningless. KAI_BENCH_ITERS is fixed at 1000 in stage0/runtime.h;
+# v1.x will turn it into an env var.
+
+fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
+                 lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  let body_c = emit_expr(src, body, lcs, fns, variants, lams, cls)
+  concat_all([
+    "static void _kai_bench_", int_to_string(id), "(void) {\n",
+    "    long long _kai_bench_t0 = kai_bench_now_ns();\n",
+    "    int _kai_bench_i;\n",
+    "    for (_kai_bench_i = 0; _kai_bench_i < KAI_BENCH_ITERS; _kai_bench_i++) {\n",
+    "        KaiValue *_body = ", body_c, ";\n",
+    "        kai_decref(_body);\n",
+    "    }\n",
+    "    long long _kai_bench_t1 = kai_bench_now_ns();\n",
+    "    kai_bench_report(", desc_span, ", _kai_bench_t1 - _kai_bench_t0, KAI_BENCH_ITERS);\n",
+    "}\n\n"
+  ])
+}
+
+fn bench_decls(decls: [Decl]) : [Decl] =
+  filter(decls, (d) => match d { DBench(_, _, _, _) -> true _ -> false })
+
+fn emit_one_bench(src: String, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
+                  id_d: DeclWithId) : String {
+  match id_d {
+    DWI(id, d) -> match d {
+      DBench(desc_span, body, _, _) -> emit_bench_fn(src, id, desc_span, body, lcs, fns, variants, lams, cls)
+      _ -> ""
+    }
+  }
+}
+
+fn number_benches_loop(decls: [Decl], id: Int, acc: [DeclWithId]) : [DeclWithId] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DBench(_, _, _, _) -> number_benches_loop(rest, id + 1, [DWI(id, d), ...acc])
+      _ -> number_benches_loop(rest, id, acc)
+    }
+  }
+}
+
+fn number_benches(decls: [Decl]) : [DeclWithId] =
+  number_benches_loop(decls, 0, [])
+
+fn emit_all_benches(src: String, decls: [Decl], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  let numbered = number_benches(decls)
+  concat_all(map(numbered, (dwi) => emit_one_bench(src, lcs, fns, variants, lams, cls, dwi)))
+}
+
+fn bench_count(decls: [Decl]) : Int = list_length(bench_decls(decls))
+
+fn bench_call_list(n: Int, i: Int) : String {
+  if i >= n { "" }
+  else {
+    concat_all(["    _kai_bench_", int_to_string(i), "();\n", bench_call_list(n, i + 1)])
+  }
+}
+
 fn has_main_decl(decls: [Decl]) : Bool {
   match decls {
     [] -> false
@@ -10919,7 +11037,7 @@ fn has_main_decl(decls: [Decl]) : Bool {
   }
 }
 
-fn emit_main_wrapper(decls: [Decl], test_mode: Bool) : String {
+fn emit_main_wrapper(decls: [Decl], test_mode: Bool, bench_mode: Bool) : String {
   if test_mode {
     let n = test_count(decls)
     concat_all([
@@ -10927,6 +11045,15 @@ fn emit_main_wrapper(decls: [Decl], test_mode: Bool) : String {
       "    kai_set_args(argc, argv);\n",
       test_call_list(n, 0),
       "    return kai_test_summary();\n",
+      "}\n"
+    ])
+  } else if bench_mode {
+    let n = bench_count(decls)
+    concat_all([
+      "int main(int argc, char **argv) {\n",
+      "    kai_set_args(argc, argv);\n",
+      bench_call_list(n, 0),
+      "    return kai_bench_summary();\n",
       "}\n"
     ])
   } else if has_main_decl(decls) {
@@ -11437,6 +11564,8 @@ fn rewrite_alias_decl(d: Decl) : Decl {
       DFn(pub_, n, tps, ps, ret, row, rewrite_alias_expr(body, alias_map_empty()), l, c, mo)
     DTest(desc, body, l, c) ->
       DTest(desc, rewrite_alias_expr(body, alias_map_empty()), l, c)
+    DBench(desc, body, l, c) ->
+      DBench(desc, rewrite_alias_expr(body, alias_map_empty()), l, c)
     _ -> d
   }
 }
@@ -11763,6 +11892,8 @@ fn desugar_op_calls_decl(d: Decl, effs: [String]) : Decl {
       DFn(pub_, n, tps, ps, ret, row, desugar_op_calls_expr(body, effs), l, c, mo)
     DTest(desc, body, l, c) ->
       DTest(desc, desugar_op_calls_expr(body, effs), l, c)
+    DBench(desc, body, l, c) ->
+      DBench(desc, desugar_op_calls_expr(body, effs), l, c)
     _ -> d
   }
 }
@@ -11819,6 +11950,7 @@ fn desugar_index_decl(d: Decl) : Decl {
     DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
       DFn(pub_, n, tps, ps, ret, row, desugar_index_expr(body), l, c, mo)
     DTest(desc, body, l, c) -> DTest(desc, desugar_index_expr(body), l, c)
+    DBench(desc, body, l, c) -> DBench(desc, desugar_index_expr(body), l, c)
     _ -> d
   }
 }
@@ -11975,6 +12107,7 @@ fn desugar_const_refs_decl(d: Decl, const_names: [String]) : Decl {
           desugar_const_refs_expr(body, const_names), l, c, mo)
     }
     DTest(desc, body, l, c) -> DTest(desc, desugar_const_refs_expr(body, const_names), l, c)
+    DBench(desc, body, l, c) -> DBench(desc, desugar_const_refs_expr(body, const_names), l, c)
     DType(p, n, tps, body, l, c) -> DType(p, n, tps,
                                             desugar_const_refs_typebody(body, const_names),
                                             l, c)
@@ -12415,6 +12548,7 @@ fn desugar_var_decl(d: Decl) : Decl {
     DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
       DFn(pub_, n, tps, ps, ret, row, desugar_var_expr(body), l, c, mo)
     DTest(desc, body, l, c) -> DTest(desc, desugar_var_expr(body), l, c)
+    DBench(desc, body, l, c) -> DBench(desc, desugar_var_expr(body), l, c)
     _ -> d
   }
 }
@@ -12448,6 +12582,7 @@ fn validate_var_decls_loop(ds: [Decl], file: String, errs: Int) : Int / Console 
           validate_var_in_expr(body, caps_minus_names([], pnames), file, errs)
         }
         DTest(_, body, _, _) -> validate_var_in_expr(body, [], file, errs)
+        DBench(_, body, _, _) -> validate_var_in_expr(body, [], file, errs)
         _ -> errs
       }
       validate_var_decls_loop(rest, file, e1)
@@ -13726,6 +13861,10 @@ fn use_rewrite_decl(d: Decl, table: [EffOps], file_opens: [String],
       let r = use_rewrite_expr(body, table, file_opens, [], file, errs)
       UseRwDecl { decl: DTest(desc, r.expr, l, c), errs: r.errs }
     }
+    DBench(desc, body, l, c) -> {
+      let r = use_rewrite_expr(body, table, file_opens, [], file, errs)
+      UseRwDecl { decl: DBench(desc, r.expr, l, c), errs: r.errs }
+    }
     DImpl(pname, target, ms, l, c) -> {
       let rms = use_rewrite_decls(ms, table, file_opens, file, errs, [])
       UseRwDecl { decl: DImpl(pname, target, rms.decls, l, c),
@@ -13782,6 +13921,8 @@ fn desugar_interp_decl(d: Decl, op_names: [String]) : Decl {
       DFn(p, n, tps, ps, ret, row, desugar_interp_expr(body, op_names), l, c, mo)
     DTest(desc, body, l, c) ->
       DTest(desc, desugar_interp_expr(body, op_names), l, c)
+    DBench(desc, body, l, c) ->
+      DBench(desc, desugar_interp_expr(body, op_names), l, c)
     _ -> d
   }
 }
@@ -13862,7 +14003,7 @@ fn interp_part_to_expr(p: IPart, op_names: [String],
   }
 }
 
-fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool) : String {
+fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, bench_mode: Bool) : String {
   # m7a #6c: rewrite `Eff.op(args)` callees from `EField(EVar(Eff), op)`
   # to `EVar("Eff.op")` before code emission. The typer (synth_op_call_with_scheme)
   # produces this form internally, but check_infer is a diagnostic-only
@@ -13899,8 +14040,9 @@ fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool) :
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants, cls)
   let clause_bodies = emit_clause_bodies(src, clauses_info, [], fns, variants, lams, cls)
   let tests = emit_all_tests(src, decls, [], fns, variants, lams, cls)
-  let main_wr = emit_main_wrapper(decls, test_mode)
-  concat_all([header, eff_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, main_wr])
+  let benches = emit_all_benches(src, decls, [], fns, variants, lams, cls)
+  let main_wr = emit_main_wrapper(decls, test_mode, bench_mode)
+  concat_all([header, eff_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, main_wr])
 }
 
 # ====================================================================
@@ -14737,6 +14879,8 @@ fn dump_decl_type(d: Decl) : Unit / Console {
     }
     DTest(desc, _, line, col) ->
       print("test #{desc} @#{int_to_string(line)}:#{int_to_string(col)}")
+    DBench(desc, _, line, col) ->
+      print("bench #{desc} @#{int_to_string(line)}:#{int_to_string(col)}")
     DImport(ik, line, col) -> {
       match ik {
         IkPath(p) -> print("import #{p} @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -20597,6 +20741,7 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     DType(p, n, tps, body, l, c) ->
       DType(p, n, tps, expand_aliases_typebody(body, aliases), l, c)
     DTest(desc, body, l, c) -> DTest(desc, expand_aliases_expr(body, aliases), l, c)
+    DBench(desc, body, l, c) -> DBench(desc, expand_aliases_expr(body, aliases), l, c)
     DImport(_, _, _) -> d
     DEffect(p, n, tps, ops, l, c) ->
       DEffect(p, n, tps, map(ops, (op) => expand_aliases_op(op, aliases)), l, c)
@@ -22016,6 +22161,8 @@ fn subst_decl(d: Decl, sm: SubstMap) : Decl {
       DFn(is_pub, name, tps, ps, ret, row, subst_expr(body, sm), ln, cl, mo)
     DTest(desc, body, ln, cl) ->
       DTest(desc, subst_expr(body, sm), ln, cl)
+    DBench(desc, body, ln, cl) ->
+      DBench(desc, subst_expr(body, sm), ln, cl)
     _ -> d
   }
 }
@@ -22088,6 +22235,8 @@ fn collect_impl_tuples_in_decls_loop(ds: [Decl], polys: [PolyFn],
           discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc)
         DTest(_, body, _, _) ->
           discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc)
+        DBench(_, body, _, _) ->
+          discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc)
         _ -> acc
       }
       collect_impl_tuples_in_decls_loop(rest, polys, existing, acc1)
@@ -22101,6 +22250,8 @@ fn discover_new_tuples_decl(d: Decl, insts: [ResolvedCS], polys: [PolyFn],
     DFn(_, _, _, _, _, _, body, _, _, _) ->
       list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
     DTest(_, body, _, _) ->
+      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
+    DBench(_, body, _, _) ->
       list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
     _ -> []
   }
@@ -22308,6 +22459,8 @@ fn rewrite_callsites_decl_sm(d: Decl, insts: [ResolvedCS],
           rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c, mo)
     DTest(desc, body, l, c) ->
       DTest(desc, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c)
+    DBench(desc, body, l, c) ->
+      DBench(desc, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c)
     _ -> d
   }
 }
@@ -22549,6 +22702,7 @@ fn unbox_decl(d: Decl) : Decl {
       DFn(is_pub, name, tparams, params, opt_ret, row,
           unbox_expr(body, []), ln, cl, mo)
     DTest(desc, body, ln, cl) -> DTest(desc, unbox_expr(body, []), ln, cl)
+    DBench(desc, body, ln, cl) -> DBench(desc, unbox_expr(body, []), ln, cl)
     DImpl(name, ty, sub_decls, l, c) ->
       DImpl(name, ty, map(sub_decls, unbox_decl), l, c)
     DDerive(ps, inner, l, c) -> DDerive(ps, unbox_decl(inner), l, c)
@@ -22892,6 +23046,11 @@ fn perceus_decl(d: Decl) : Decl {
       let uses = pcs_collect_uses_expr(body, [], false, [])
       let new_body = pcs_rewrite_expr(body, [], uses, false)
       DTest(desc, new_body, ln, cl)
+    }
+    DBench(desc, body, ln, cl) -> {
+      let uses = pcs_collect_uses_expr(body, [], false, [])
+      let new_body = pcs_rewrite_expr(body, [], uses, false)
+      DBench(desc, new_body, ln, cl)
     }
     _ -> d
   }
@@ -27826,7 +27985,7 @@ fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffse
 
 fn llvm_build_globals_names(fns: [EFn], vs: [EVar], eff_names: [String], op_quals: [String]) : [String] = build_globals(fns, vs, eff_names, op_quals)
 
-fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], test_mode: Bool) : String {
+fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], test_mode: Bool, bench_mode: Bool) : String {
   let alias_resolved = rewrite_alias_decls(raw_decls)
   let decls = alias_resolved
   let fns = register_fn_decls(decls)
@@ -28312,6 +28471,8 @@ fn rqc_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console = match d
         rqc_expr(body, fn_param_names(params), mt, file), l, c, mo)
   DTest(n, body, l, c) ->
     DTest(n, rqc_expr(body, [], mt, file), l, c)
+  DBench(n, body, l, c) ->
+    DBench(n, rqc_expr(body, [], mt, file), l, c)
   DImpl(name, ty, sub_decls, l, c) ->
     DImpl(name, ty, rqc_decls(sub_decls, mt, file), l, c)
   DDerive(ps, inner, l, c) ->
@@ -30187,6 +30348,8 @@ fn rename_proto_calls_decl(d: Decl, op_arities: [OpAr]) : Decl {
     }
     DTest(desc, body, l, c) ->
       DTest(desc, rename_proto_calls_expr(body, op_arities, []), l, c)
+    DBench(desc, body, l, c) ->
+      DBench(desc, rename_proto_calls_expr(body, op_arities, []), l, c)
     _ -> d
   }
 }
@@ -30457,6 +30620,8 @@ fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg) : Decl {
       DFn(pub_, n, tps, ps, ret, row, resolve_protocol_calls_expr(body, reg), l, c, mo)
     DTest(desc, body, l, c) ->
       DTest(desc, resolve_protocol_calls_expr(body, reg), l, c)
+    DBench(desc, body, l, c) ->
+      DBench(desc, resolve_protocol_calls_expr(body, reg), l, c)
     _ -> d
   }
 }
@@ -30509,6 +30674,8 @@ fn validate_resolved_decls(ds: [Decl], reg: ProtocolReg,
         DFn(_, _, _, _, _, _, body, _, _, _) ->
           validate_resolved_expr(body, reg, file, errs)
         DTest(_, body, _, _) ->
+          validate_resolved_expr(body, reg, file, errs)
+        DBench(_, body, _, _) ->
           validate_resolved_expr(body, reg, file, errs)
         _ -> errs
       }
@@ -30774,6 +30941,8 @@ fn validate_inv_decls(ds: [Decl], file: String, errs: Int) : Int {
           validate_inv_expr(body, file, bound0, errs)
         }
         DTest(_, body, _, _) ->
+          validate_inv_expr(body, file, [], errs)
+        DBench(_, body, _, _) ->
           validate_inv_expr(body, file, [], errs)
         _ -> errs
       }
@@ -31454,6 +31623,7 @@ fn decl_line(d: Decl) : Int {
     DFn(_, _, _, _, _, _, _, line, _, _) -> line
     DType(_, _, _, _, line, _) -> line
     DTest(_, _, line, _) -> line
+    DBench(_, _, line, _) -> line
     DImport(_, line, _) -> line
     DEffect(_, _, _, _, line, _) -> line
     DProtocol(_, _, _, line, _) -> line
@@ -31489,6 +31659,7 @@ fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
       }
     }
     DTest(label, body, _, _) -> fmt_test(label, body, s)
+    DBench(label, body, _, _) -> fmt_bench(label, body, s)
     DAttribPure(inner, _, _) -> {
       let s1 = fmt_emit(s, "[<refinement_pure>]")
       let s2 = fmt_newline(s1)
@@ -31729,6 +31900,12 @@ fn fmt_test(label: String, body: Expr, s: FmtSt) : FmtSt {
   # included), so it round-trips verbatim — single, triple, escaped
   # quotes all preserved.
   let s1 = fmt_emit(s, "test ")
+  let s2 = fmt_emit(s1, label)
+  fmt_fn_body(body, s2)
+}
+
+fn fmt_bench(label: String, body: Expr, s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, "bench ")
   let s2 = fmt_emit(s1, label)
   fmt_fn_body(body, s2)
 }
@@ -32333,6 +32510,9 @@ type Mode
   | MEffectHolesJson
   | MEmitLlvm
   | MTest
+  # bench v1 (issue #40): emits a main wrapper that runs every
+  # `bench "..." { ... }` block and reports mean ns/iter.
+  | MBench
   | MHelp
   | MVersion
   # m12.6.x #2: dump per-fn body intervals for Int-typed expressions.
@@ -32415,6 +32595,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MFmtCheck))
       } else if a == "--test" {
         parse_cli_loop(more, cli_with_mode(opts, MTest))
+      } else if a == "--bench" {
+        parse_cli_loop(more, cli_with_mode(opts, MBench))
       } else if a == "-h" or a == "--help" {
         parse_cli_loop(more, cli_with_mode(opts, MHelp))
       } else if a == "-V" or a == "--version" {
@@ -33299,6 +33481,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       # only inserts dup/drop on `MBoxed` nodes).
                       let unboxed_decls = unbox_pass(mono_decls)
                       let test_mode = match mode { MTest -> true _ -> false }
+                      let bench_mode = match mode { MBench -> true _ -> false }
                       let use_llvm = match mode { MEmitLlvm -> true _ -> false }
                       # Issue #37 — self-tail-call rewrite. Runs
                       # *before* Perceus on the C path so the
@@ -33329,9 +33512,9 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       if mono_inv_errs != 0 { mono_inv_errs }
                       else {
                         let out = if use_llvm {
-                          emit_program_llvm(path, src, perceus_decls, test_mode)
+                          emit_program_llvm(path, src, perceus_decls, test_mode, bench_mode)
                         } else {
-                          emit_program(path, src, perceus_decls, test_mode)
+                          emit_program(path, src, perceus_decls, test_mode, bench_mode)
                         }
                         print(out)
                         0

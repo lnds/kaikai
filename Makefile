@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-fmt demos-verify demos-no-regression selfhost clean tier0 tier1 daily coverage-probe rc-budget stress-fixtures
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-fmt test-bench demos-verify demos-no-regression selfhost clean tier0 tier1 daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -74,8 +74,8 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures"
+tier1: test demos-no-regression test-fmt test-bench
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke"
 
 # Tongariki — `kai fmt` fixture suite. Verifies that every fixture
 # in examples/fmt/ formats to its `.expected.kai` and is idempotent,
@@ -84,6 +84,31 @@ tier1: test demos-no-regression test-fmt
 # breaking re-parse. Cheap enough to gate every Tier 1 run.
 test-fmt: kaic2
 	@./tests/fmt_fixtures.sh
+
+# bench v1 (issue #40) — smoke for `kai bench`. Builds + runs the
+# `examples/stdlib/bench_basic.kai` fixture and verifies the output
+# format. ns/iter values vary per run so we grep for the pattern
+# rather than diffing against a golden file. Failure modes:
+#   - kai bench exits non-zero (compile / runtime error)
+#   - any of the three bench result lines is missing or malformed
+#   - the trailing `3 benches` summary line is missing
+test-bench: kaic2
+	@./bin/kai bench examples/stdlib/bench_basic.kai > /tmp/kaikai-bench-basic.out 2>&1; \
+	rc=$$?; \
+	if [ $$rc -ne 0 ]; then \
+	  echo "test-bench FAIL — kai bench exited $$rc"; \
+	  cat /tmp/kaikai-bench-basic.out; exit 1; \
+	fi; \
+	matched=$$(grep -E ': 1000 iter / [0-9]+ ns/iter$$' /tmp/kaikai-bench-basic.out | wc -l | tr -d ' '); \
+	if [ "$$matched" != "3" ]; then \
+	  echo "test-bench FAIL — expected 3 bench result lines, got $$matched"; \
+	  cat /tmp/kaikai-bench-basic.out; exit 1; \
+	fi; \
+	if ! grep -qE '^3 benches$$' /tmp/kaikai-bench-basic.out; then \
+	  echo "test-bench FAIL — missing '3 benches' summary line"; \
+	  cat /tmp/kaikai-bench-basic.out; exit 1; \
+	fi; \
+	echo "test-bench OK — $$matched benches printed in expected format"
 
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
