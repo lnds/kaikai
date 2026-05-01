@@ -53,7 +53,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -78,48 +77,6 @@
 #  pragma GCC diagnostic push
 #  pragma GCC diagnostic ignored "-Wunused-function"
 #endif
-
-/* R5 / issue #37 transitional fix — bump RLIMIT_STACK at process
- * startup so the *bootstrap chain* survives Linux's default 8 MiB
- * main-thread stack:
- *
- *   stage0/kaic0  → stage1.c    (recursive emit, no TCO)
- *   stage1/kaic1  → stage2.c    (recursive emit, no TCO)
- *   stage2/kaic2  ← built from stage2.c (so kaic2's own internal
- *                   `lex_loop`, `parse_*`, etc. are recursive C
- *                   functions, not goto-loops)
- *
- * Issue #37's emitter goto-rewrite lands in `stage2/compiler.kai`,
- * so the *programs kaic2 emits* (demos, kaic2's selfhost output)
- * use O(1) C-stack via `goto _kai_<sym>_entry`. But the kaic2
- * binary itself, and the kaic1 binary that built it, were emitted
- * by stage1 (which still uses the recursive shape). When kaic2
- * runs over `compiler.kai` (~33 k tokens), its internal `lex_loop`
- * recurses ~33 k times — fits in macOS's default but blows
- * Linux's 8 MiB.
- *
- * The proper closure is to mirror the goto rewrite into
- * `stage1/compiler.kai` so kaic1 emits goto-loops too; once that
- * lane lands, this constructor (and `<sys/resource.h>`) can come
- * out for good. Until then, keeping the runtime bump means the
- * bootstrap chain works on Linux without depending on the user
- * setting `ulimit -s` themselves. No-op on macOS where the limit
- * is already generous.
- */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((constructor))
-#endif
-static void kai_runtime_bump_stack_rlimit(void) {
-    struct rlimit rl;
-    if (getrlimit(RLIMIT_STACK, &rl) != 0) return;
-    rlim_t target = (rlim_t) (256ULL * 1024ULL * 1024ULL);  /* 256 MiB */
-    if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < target) {
-        target = rl.rlim_max;
-    }
-    if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur >= target) return;
-    rl.rlim_cur = target;
-    (void) setrlimit(RLIMIT_STACK, &rl);
-}
 
 /* ---------- types ---------- */
 

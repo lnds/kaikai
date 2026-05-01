@@ -66,6 +66,57 @@ function / type parameters, parametric or open effect rows,
 `var` bindings, `a[i] := v`, `use`, `variants[T]()`. These
 land in future Tongariki / Anga Roa lanes.
 
+- **TCO mirror for the bootstrap chain (issue #42 — fully
+  closes R5).** Issue #37 landed the self-tail-call goto
+  rewrite in `stage2/compiler.kai`, so every program kaic2
+  emits runs with O(1) C-stack. This lane mirrors the
+  rewrite into the two lower stages so the kaic1 binary
+  (built from kaic0's emit) and the kaic2 binary (built
+  from kaic1's emit) also run with O(1) C-stack on their
+  internal recursive passes (`lex_loop`, `parse_*`, etc.).
+  - `stage1/compiler.kai`: ports `tcrec_has_tail_self_call`
+    + `tcrec_rewrite_decls` + sentinel encoding from
+    `stage2/compiler.kai`. Wired into the pipeline after
+    `perceus_pass`. Reuses stage 2's per-call dropmask
+    based on `last_use_for` /
+    `pcs_count_non_lam_uses` — both already exist in
+    stage 1's Perceus lite. `emit_call_expr` recognises the
+    sentinel and emits the rebind+goto block;
+    `emit_fn_body` plants `_kai_<name>_entry:;` when the
+    body holds at least one sentinel.
+  - `stage0/emit.c`: pre-emit pass walks each fn body,
+    marks every tail-position N_CALL whose callee is the
+    enclosing fn with `TCO_TAIL_CALL` on the AST node, and
+    `emit_call` lowers each marked call to the rebind+goto
+    block. Per-param drop predicate mirrors stage 0's
+    existing single-use counter (`total_count == 1 &&
+    lambda_count == 0` → ref already transferred → no
+    drop, otherwise → drop).
+
+### Removed
+
+- `kai_runtime_bump_stack_rlimit` and the
+  `<sys/resource.h>` include in `stage0/runtime.h` —
+  the transitional R5 band-aid retained by PR #41 with a
+  narrower scope. With both lower stages emitting goto
+  loops, the bootstrap chain runs cleanly under Linux's
+  default 8 MiB main-thread stack and the constructor is
+  no longer load-bearing.
+- The `STACK := ulimit -s 65520 …` recipe prefix in
+  `stage2/Makefile` is now an empty no-op variable for the
+  same reason (kept declared so the existing `$(STACK)`
+  prefixes in recipes still expand to nothing without
+  having to edit each recipe individually).
+
+### Changed
+
+- `docs/known-regressions.md` § R5: status flipped from
+  "RESOLVED for emitted programs" (with the bootstrap
+  caveat) to "FULLY RESOLVED 2026-05-01 (issue #42)". The
+  historical sections (interim PR #36 fix, original Linux
+  CI report, hypothesis ranking H1/H2/H3/H4) are kept as
+  archive material below the new status block.
+
 ## [0.23.0] — 2026-05-01 (TCO emitter rewrite — Tier 1 #2 closure, R5 band-aid removed)
 
 ### Added
