@@ -24148,17 +24148,24 @@ fn tcrec_any_unused(params: [Param], uses: [Use]) : Bool {
 #
 # `has_evar` is an Int bitmask parallel to `params`: bit i is set
 # iff parameter i appears as a plain `EVar(p)` somewhere in the
-# call site's args. The flags are precomputed by
-# `tcrec_per_param_has_evar` at the caller, where `args: [Expr]`
-# is locally bound. This split is load-bearing: PR #41's first
+# call site's args. The flags are computed in `tcrec_rewrite_kind`
+# via `map(pnames, (p) => tcrec_args_have_evar(xs, p))` followed
+# by `tcrec_bools_to_mask`. The lambda captures `xs` (bound by
+# the surrounding match arm — NOT a function parameter), so no
+# helper function in compiler.kai takes `[Expr]` as a parameter.
+#
+# This separation is load-bearing on Linux. PR #41's first
 # attempt threaded `args: [Expr]` through this function and
-# called `tcrec_args_have_evar` from inside it. That call-site
-# emit (passing `[Expr]` through stage 1's perceus and back to
-# the helper) tripped a glibc tcache-integrity abort during the
-# kaic2 self-compile on Linux. The 8-step bisection isolated the
-# locus to the call site itself, not the walker logic. The
-# flatter API — `[Bool]`-as-Int precomputed by the caller —
-# sidesteps the suspect emit pattern.
+# called `tcrec_args_have_evar` from inside it; PR #48's first
+# attempt added a `tcrec_per_param_has_evar(args: [Expr], ...)`
+# helper. Both tripped a glibc tcache-integrity abort during the
+# kaic2 self-compile on Linux ubuntu-clang — macOS Darwin malloc
+# tolerated the imbalance. The 8-step bisection on PR #41 isolated
+# the locus to call sites that thread `[Expr]` through stage 1's
+# perceus dup-wrap. The closure-via-`map` approach reuses the
+# already-exercised pattern at line ~7827 (`map(args_e, (a) =>
+# emit_expr(...))`) — `[Expr]` enters `map` from a local match
+# binding rather than from a multi-arg function signature.
 fn tcrec_compute_site_dropmask(params: [Param], uses: [Use],
                                 has_evar: Int,
                                 i: Int, acc: Int) : Int {
@@ -24179,20 +24186,21 @@ fn tcrec_compute_site_dropmask(params: [Param], uses: [Use],
   }
 }
 
-# Walks `args` once per `pname`, building an Int bitmask. Bit i is
-# set iff `pnames[i]` appears as a plain `EVar(pnames[i])` somewhere
-# in `args`. Called once per tail-call site; result feeds
-# `tcrec_compute_site_dropmask`.
-fn tcrec_per_param_has_evar(args: [Expr], pnames: [String],
-                             i: Int, acc: Int) : Int {
-  match pnames {
+# Convert a `[Bool]` of per-param flags into an Int bitmask.
+# Used in `tcrec_rewrite_kind` after a `map(pnames, ...)` produces
+# the boolean flag list. This helper takes only `[Bool]` — never
+# `[Expr]` — so stage 1's perceus emit cannot trip the call-site
+# pattern that aborted the kaic2 self-compile under glibc on Linux
+# (PR #41 / PR #48 first attempts).
+fn tcrec_bools_to_mask(flags: [Bool], i: Int, acc: Int) : Int {
+  match flags {
     [] -> acc
-    [p, ...rest] -> {
-      let acc1 = if tcrec_args_have_evar(args, p) {
-                   acc + tcrec_pow2(i)
-                 } else { acc }
-      tcrec_per_param_has_evar(args, rest, i + 1, acc1)
-    }
+    [b, ...rest] ->
+      if b {
+        tcrec_bools_to_mask(rest, i + 1, acc + tcrec_pow2(i))
+      } else {
+        tcrec_bools_to_mask(rest, i + 1, acc)
+      }
   }
 }
 
@@ -24378,7 +24386,13 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
         if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
-          let has_evar = tcrec_per_param_has_evar(xs, pnames, 0, 0)
+          # Compute per-param has-evar flags via `map` over `pnames`.
+          # The lambda captures `xs` (bound by this match arm — NOT
+          # a function parameter), so no helper function takes
+          # `[Expr]` as a parameter and the suspect emit pattern
+          # PR #41 / PR #48-first-try hit is sidestepped.
+          let flags = map(pnames, (p) => tcrec_args_have_evar(xs, p))
+          let has_evar = tcrec_bools_to_mask(flags, 0, 0)
           let dropmask = tcrec_compute_site_dropmask(params, uses, has_evar, 0, 0)
           let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
           ECall(
