@@ -1117,3 +1117,51 @@ allowed only when:
 Demos in this section with category "aspirational" or "feature
 deferred" are NOT counted in the baseline; they fail by design
 until their upstream lane lands.
+
+---
+
+## R7 — kai fmt v1: same-line trailing comments may be promoted to the line above
+
+**Status**: **KNOWN LIMITATION** as of 2026-05-01 (Tongariki kai
+fmt v1, this lane).
+
+**Symptom**: a comment written at end-of-line on the same line as
+code, e.g.
+
+    let x = 42  # answer to everything
+
+may be re-emitted by `kai fmt` as a full-line comment placed
+immediately before the construct it was attached to:
+
+    # answer to everything
+    let x = 42
+
+The semantic content is preserved (the comment is not lost); only
+its position relative to its line shifts. Idempotency holds: a
+second `kai fmt` run is a no-op.
+
+**Why**: the lexer (`stage2/compiler.kai:lex_skip_comment`) drops
+line comments before the token stream reaches the parser, so AST
+nodes have no end-of-line attachment slot. v1 collects comments
+into a side list keyed by source line, then drains them at line-
+boundary breakpoints during pretty-printing — sufficient for
+between-decl and between-stmt comments, not for trailing ones.
+
+**Repro**:
+
+    cat > /tmp/t.kai <<EOF
+    fn main() {
+      let x = 42  # answer
+    }
+    EOF
+    kai fmt /tmp/t.kai
+    cat /tmp/t.kai
+
+**Fix path**: a future Tongariki / Anga Roa lane (probably
+combined with the m11 diagnostics-quality pass) needs to either
+(a) annotate AST nodes with their source span end and attach
+trailing comments at parse time, or (b) emit comments as
+`TkComment` tokens during lexing and have the formatter walk
+the token stream alongside the AST. Option (b) is the smaller
+change and matches how gofmt handles the same problem.
+
