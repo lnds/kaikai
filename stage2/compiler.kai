@@ -7879,7 +7879,21 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn
       # the continuation's `fn` (currently kai_cont_identity, until
       # the full CPS transform reifies the rest of the caller's
       # body). Doc C §*resume representation*.
-      if callee == "resume" {
+      if tcrec_is_sentinel(callee) {
+        # Issue #37: self-tail-call site, planted by `tcrec_rewrite_decl`.
+        # The callee carries `__kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...`;
+        # split, parse, and emit the rebind+goto block. The label
+        # `_kai_<c_sym>_entry` is planted by `emit_fn_body`.
+        let parts = tcrec_split_pipe(callee)
+        match parts {
+          [_, sym, dropmask_str, ...pnames] -> {
+            let dropmask = tcrec_parse_decimal(dropmask_str)
+            tcrec_emit_goto(src, sym, dropmask, pnames, args_e,
+                            lcs, fns, variants, lams, cls)
+          }
+          _ -> "kai_unit() /* tcrec: malformed sentinel */"
+        }
+      } else if callee == "resume" {
         match args_e {
           [a] -> concat_all([
             "kai_cont_resume(k, ", emit_expr(src, a, lcs, fns, variants, lams, cls), ")"
@@ -10763,7 +10777,18 @@ fn emit_fn_body(src: String, d: Decl, lcs: [String], fns: [EFn], variants: [EVar
       # to `loop.repeat` even when `list.repeat` is also in scope.
       let body_fns = fns_prefer_module(fns, mo)
       let body_c = emit_expr(src, body, body_lcs, body_fns, variants, lams, cls)
-      cat5(sig, " {\n    return ", body_c, ";\n", "}\n\n")
+      # Issue #37: when `tcrec_rewrite_decl` planted at least one
+      # `__kai_tcrec|...` self-tail-call sentinel inside `body`,
+      # plant the matching `_kai_<c_sym>_entry:;` label *before*
+      # the `return ({ ... });` so the goto inside the
+      # statement-expression has a target. The goto jumps out of
+      # the wrap before its exit drops run, so the per-iteration
+      # cleanup is the drop-and-rebind block emitted at the
+      # call site (`tcrec_emit_goto`).
+      let label = if tcrec_body_has_sentinel(body) {
+        concat_all(["_kai_", c_sym(name, mo), "_entry:;\n    "])
+      } else { "" }
+      concat_all([sig, " {\n    ", label, "return ", body_c, ";\n}\n\n"])
     }
     _ -> ""
   }
@@ -23943,6 +23968,484 @@ fn last_use_for_loop(nm: String, uses: [Use], blocked: Bool,
   }
 }
 
+# ---- m37 / TCO — self-tail-call detection (M1) ---------------------
+#
+# Issue #37: the Perceus exit-drop wrap places `kai_internal_drop(...)`
+# calls *after* the body's tail expression, so neither gcc nor clang
+# can fold a self-recursive call into `jmp` at the C level. The
+# compiler-side fix rewrites self-tail-calls into a `goto`-loop with
+# parameter rebinding; this walker is the recognition half.
+#
+# `tcrec_has_tail_self_call(body, nm, arity)` returns true if `body`
+# contains at least one self-recursive call to a fn named `nm` with
+# `arity` arguments in *tail position*. Tail position propagates
+# through:
+#   - EBlock(_, Some(tail))      — `tail` is tail
+#   - EIf(_, then, opt_else)     — both branches are tail
+#   - EMatch(_, arms)            — each arm body is tail
+# It does NOT propagate through:
+#   - ECall args / EBinop / EUnop / ERange / records / lists
+#   - EBlock stmts (only the trailing expression is tail)
+#   - EMatch scrutinee / EIf condition / match guards
+#   - ELambda body (different fn — never tail of the enclosing fn)
+#   - EPipe / EHandle (conservative; could be relaxed later)
+#
+# A locally-bound `let`/`var` shadowing `nm` disables the match
+# inside its scope.
+#
+# M1 lands the walker only; no caller wires it into the pipeline,
+# so selfhost stays byte-identical until M3 flips emission.
+fn tcrec_has_tail_self_call(body: Expr, nm: String, arity: Int) : Bool =
+  tcrec_walk_tail(body.kind, nm, arity, [])
+
+fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, scope: [String]) : Bool {
+  match k {
+    ECall(f, xs) -> match f.kind {
+      EVar(callee) ->
+        if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
+          true
+        } else { false }
+      _ -> false
+    }
+    EIf(_, t, opt_e) -> {
+      if tcrec_walk_tail(t.kind, nm, arity, scope) { true }
+      else { match opt_e {
+        None -> false
+        Some(e2) -> tcrec_walk_tail(e2.kind, nm, arity, scope)
+      } }
+    }
+    EMatch(_, arms) -> tcrec_walk_arms(arms, nm, arity, scope)
+    EBlock(stmts, opt_tail) -> {
+      let scope1 = tcrec_block_scope(stmts, scope)
+      match opt_tail {
+        None -> false
+        Some(e) -> tcrec_walk_tail(e.kind, nm, arity, scope1)
+      }
+    }
+    _ -> false
+  }
+}
+
+fn tcrec_walk_arms(arms: [Arm], nm: String, arity: Int, scope: [String]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(pat, _, body) -> {
+        let scope1 = pat_bindings(pat, scope)
+        if tcrec_walk_tail(body.kind, nm, arity, scope1) { true }
+        else { tcrec_walk_arms(rest, nm, arity, scope) }
+      }
+    }
+  }
+}
+
+fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
+  match stmts {
+    [] -> scope
+    [s, ...rest] -> {
+      let scope1 = match s {
+        SLet(pat, _, _) -> pat_bindings(pat, scope)
+        SVar(name, _, _, _, _) -> [name, ...scope]
+        _ -> scope
+      }
+      tcrec_block_scope(rest, scope1)
+    }
+  }
+}
+
+# ---- m37 / TCO — self-tail-call rewrite (M2) ----------------------
+#
+# Runs after `perceus_pass`. For every fn whose body contains at least
+# one self-tail-call (per M1), the callee `EVar(name)` of each such
+# tail call is replaced with `EVar(sentinel)` where `sentinel` is a
+# pipe-encoded string carrying everything `emit_call_expr` needs:
+#
+#     __kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...
+#
+# - `c_sym`     — the linker symbol of the enclosing fn (used to mint
+#                 the goto label `_kai_<c_sym>_entry`).
+# - `dropmask`  — bit `i` set iff parameter `i` should be dropped
+#                 before the rebind in the goto block. The criterion
+#                 mirrors `pcs_collect_exit_drops`: a param gets a
+#                 drop in the goto block iff `last_use_for` is
+#                 `LUBlocked` or `LUAt` with multi-use. This makes
+#                 the goto-path's drops byte-for-byte equivalent to
+#                 the wrap's exit drops, which the goto skips by
+#                 jumping out of the enclosing statement-expression.
+# - `p0..pN`    — parameter names, in declaration order, used to
+#                 emit `kai_<pname> = _t<i>;` in the goto block.
+#
+# `emit_fn_body` walks the rewritten body once and plants the goto
+# label `_kai_<c_sym>_entry:;` before `return ({ ... });` whenever a
+# sentinel call is present.
+#
+# Pipe was chosen as the separator because it cannot appear in kaikai
+# identifiers and so cannot collide with parameter names.
+#
+# M2 lands the rewrite + sentinel scanner only; no caller wires
+# `tcrec_rewrite_decls` into the pipeline yet, so selfhost stays
+# byte-identical until M3 connects the pieces.
+fn tcrec_rewrite_decls(decls: [Decl]) : [Decl] = map(decls, tcrec_rewrite_decl)
+
+fn tcrec_rewrite_decl(d: Decl) : Decl {
+  match d {
+    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
+      let arity = list_length(params)
+      if not tcrec_has_tail_self_call(body, name, arity) { d }
+      else {
+        let pnames = map(params, (p) => p.pname)
+        let uses = pcs_collect_uses_expr(body, pnames, false, [])
+        if tcrec_any_unused(params, uses) { d }
+        else {
+          let c_sym_str = c_sym(name, mo)
+          let new_body = tcrec_rewrite_body(body, name, arity, c_sym_str,
+                                            params, pnames, uses, [])
+          DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo)
+        }
+      }
+    }
+    _ -> d
+  }
+}
+
+fn tcrec_any_unused(params: [Param], uses: [Use]) : Bool {
+  match params {
+    [] -> false
+    [p, ...rest] -> match last_use_for(p.pname, uses) {
+      LUUnused(_) -> true
+      _ -> tcrec_any_unused(rest, uses)
+    }
+  }
+}
+
+# Conservative per-call-site dropmask. The criterion for each
+# parameter p mirrors `pcs_collect_exit_drops` exactly:
+#
+#   - LUBlocked              → drop.
+#   - LUAt + count(p) >= 2   → drop (every read is `__perceus_dup`-
+#                               wrapped, so the original ref is
+#                               unconsumed at the wrap's exit, which
+#                               the goto skips).
+#   - LUAt + count(p) == 1   → no drop. The single read transfers
+#                               ownership to its consumer; if the
+#                               consumer happens to live inside the
+#                               args, evaluating them already
+#                               releases p (so a goto-block drop
+#                               would double-free). If the consumer
+#                               lives *outside* the args (e.g. p
+#                               was the scrutinee of an enclosing
+#                               match — `nth`'s
+#                               `match xs { … nth(t, i-1) … }`),
+#                               the goto skips that match's exit
+#                               `kai_decref(_scr)` and we leak the
+#                               cons cell once per iteration. The
+#                               leak is bounded and documented as a
+#                               follow-up under issue #37; the
+#                               precise version that distinguished
+#                               those two cases triggered a glibc
+#                               tcache-integrity abort during stage
+#                               2's selfhost on Linux that needs
+#                               more isolation work before it can
+#                               re-land.
+#   - LUUnused               → unreachable (`tcrec_any_unused` made
+#                               us bail out before getting here).
+fn tcrec_compute_site_dropmask(params: [Param], uses: [Use],
+                                i: Int, acc: Int) : Int {
+  match params {
+    [] -> acc
+    [p, ...rest] -> {
+      let drop = match last_use_for(p.pname, uses) {
+        LUBlocked(_) -> true
+        LUAt(_, _, _) -> pcs_count_non_lam_uses(p.pname, uses, 0) >= 2
+        LUUnused(_) -> false
+      }
+      let acc1 = if drop { acc + tcrec_pow2(i) } else { acc }
+      tcrec_compute_site_dropmask(rest, uses, i + 1, acc1)
+    }
+  }
+}
+
+fn tcrec_pow2(n: Int) : Int =
+  if n <= 0 { 1 } else { 2 * tcrec_pow2(n - 1) }
+
+fn tcrec_make_sentinel(sym: String, dropmask: Int, pnames: [String]) : String =
+  string_concat("__kai_tcrec|",
+    string_concat(sym,
+      string_concat("|",
+        string_concat(int_to_string(dropmask),
+          string_concat("|", string_join(pnames, "|"))))))
+
+fn tcrec_is_sentinel(callee: String) : Bool =
+  string_starts_with_q(callee, "__kai_tcrec|")
+
+fn tcrec_split_pipe(s: String) : [String] =
+  tcrec_split_pipe_loop(s, 0, 0, string_length(s), [])
+
+fn tcrec_split_pipe_loop(s: String, start: Int, i: Int, n: Int, acc: [String]) : [String] {
+  if i >= n {
+    list_reverse([string_slice(s, start, n - start), ...acc])
+  } else {
+    match char_at(s, i) {
+      None -> list_reverse([string_slice(s, start, n - start), ...acc])
+      Some(c) ->
+        if c == '|' {
+          tcrec_split_pipe_loop(s, i + 1, i + 1, n,
+            [string_slice(s, start, i - start), ...acc])
+        } else {
+          tcrec_split_pipe_loop(s, start, i + 1, n, acc)
+        }
+    }
+  }
+}
+
+# Tail-position rewrite. Mirrors the M1 walker but produces a fresh
+# `Expr` tree where each tail-self-call's callee has been swapped
+# for a freshly-built sentinel `EVar` whose dropmask is computed
+# *per call site* by inspecting that site's args. Args are not
+# recursed into — they are non-tail and `emit_expr` evaluates
+# them normally on emit.
+fn tcrec_rewrite_body(body: Expr, nm: String, arity: Int, c_sym_str: String,
+                      params: [Param], pnames: [String], uses: [Use],
+                      scope: [String]) : Expr =
+  Expr { kind: tcrec_rewrite_kind(body.kind, body.line, body.col, nm, arity,
+                                   c_sym_str, params, pnames, uses, scope),
+         line: body.line, col: body.col, ty: body.ty, mode: body.mode }
+
+fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
+                      c_sym_str: String, params: [Param], pnames: [String],
+                      uses: [Use], scope: [String]) : ExprKind {
+  match k {
+    ECall(f, xs) -> match f.kind {
+      EVar(callee) ->
+        if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
+          let dropmask = tcrec_compute_site_dropmask(params, uses, 0, 0)
+          let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
+          ECall(
+            Expr { kind: EVar(sentinel), line: f.line, col: f.col,
+                   ty: f.ty, mode: f.mode },
+            xs)
+        } else { k }
+      _ -> k
+    }
+    EIf(c, t, opt_e) -> {
+      let t1 = tcrec_rewrite_body(t, nm, arity, c_sym_str, params, pnames, uses, scope)
+      let opt_e1 = match opt_e {
+        None -> None
+        Some(e2) -> Some(tcrec_rewrite_body(e2, nm, arity, c_sym_str, params,
+                                            pnames, uses, scope))
+      }
+      EIf(c, t1, opt_e1)
+    }
+    EMatch(s, arms) ->
+      EMatch(s, tcrec_rewrite_arms(arms, nm, arity, c_sym_str, params, pnames,
+                                    uses, scope, []))
+    EBlock(stmts, opt_tail) -> {
+      let scope1 = tcrec_block_scope(stmts, scope)
+      match opt_tail {
+        None -> k
+        Some(e) ->
+          EBlock(stmts, Some(tcrec_rewrite_body(e, nm, arity, c_sym_str, params,
+                                                 pnames, uses, scope1)))
+      }
+    }
+    _ -> k
+  }
+}
+
+fn tcrec_rewrite_arms(arms: [Arm], nm: String, arity: Int, c_sym_str: String,
+                      params: [Param], pnames: [String], uses: [Use],
+                      scope: [String], acc: [Arm]) : [Arm] {
+  match arms {
+    [] -> list_reverse(acc)
+    [a, ...rest] -> match a {
+      Arm(pat, opt_g, body) -> {
+        let scope1 = pat_bindings(pat, scope)
+        let new_body = tcrec_rewrite_body(body, nm, arity, c_sym_str, params,
+                                          pnames, uses, scope1)
+        tcrec_rewrite_arms(rest, nm, arity, c_sym_str, params, pnames, uses,
+                           scope, [Arm(pat, opt_g, new_body), ...acc])
+      }
+    }
+  }
+}
+
+# Recognition predicate used by `emit_fn_body` to decide whether to
+# plant the goto label. Recurses into every sub-expression, not just
+# tail position, because a sentinel can sit anywhere the rewrite
+# placed one (currently always tail; future relaxations may place
+# them elsewhere).
+fn tcrec_body_has_sentinel(body: Expr) : Bool =
+  tcrec_scan_kind(body.kind)
+
+fn tcrec_scan_kind(k: ExprKind) : Bool {
+  match k {
+    ECall(f, xs) -> match f.kind {
+      EVar(callee) ->
+        if tcrec_is_sentinel(callee) { true }
+        else { tcrec_scan_exprs(xs) }
+      _ -> if tcrec_body_has_sentinel(f) { true } else { tcrec_scan_exprs(xs) }
+    }
+    EIf(c, t, opt_e) ->
+      if tcrec_body_has_sentinel(c) { true }
+      else if tcrec_body_has_sentinel(t) { true }
+      else { match opt_e {
+        None -> false
+        Some(e2) -> tcrec_body_has_sentinel(e2)
+      } }
+    EMatch(s, arms) ->
+      if tcrec_body_has_sentinel(s) { true } else { tcrec_scan_arms(arms) }
+    EBlock(stmts, opt_tail) ->
+      if tcrec_scan_stmts(stmts) { true }
+      else { match opt_tail {
+        None -> false
+        Some(e) -> tcrec_body_has_sentinel(e)
+      } }
+    EBinop(_, l, r) ->
+      if tcrec_body_has_sentinel(l) { true } else { tcrec_body_has_sentinel(r) }
+    EUnop(_, x) -> tcrec_body_has_sentinel(x)
+    EField(x, _) -> tcrec_body_has_sentinel(x)
+    EIndex(x, i) ->
+      if tcrec_body_has_sentinel(x) { true } else { tcrec_body_has_sentinel(i) }
+    EPipe(l, r) ->
+      if tcrec_body_has_sentinel(l) { true } else { tcrec_body_has_sentinel(r) }
+    _ -> false
+  }
+}
+
+fn tcrec_scan_exprs(es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] ->
+      if tcrec_body_has_sentinel(h) { true } else { tcrec_scan_exprs(rest) }
+  }
+}
+
+fn tcrec_scan_arms(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, _, body) ->
+        if tcrec_body_has_sentinel(body) { true } else { tcrec_scan_arms(rest) }
+    }
+  }
+}
+
+fn tcrec_scan_stmts(stmts: [Stmt]) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, e) -> tcrec_body_has_sentinel(e)
+        SVar(_, _, e, _, _) -> tcrec_body_has_sentinel(e)
+        SAssert(c, opt_m) ->
+          if tcrec_body_has_sentinel(c) { true }
+          else { match opt_m {
+            None -> false
+            Some(m) -> tcrec_body_has_sentinel(m)
+          } }
+        SExprStmt(e) -> tcrec_body_has_sentinel(e)
+        SIndexAssign(b, i, v, _, _) ->
+          if tcrec_body_has_sentinel(b) { true }
+          else if tcrec_body_has_sentinel(i) { true }
+          else { tcrec_body_has_sentinel(v) }
+        SUse(_, _, _) -> false
+      }
+      if here { true } else { tcrec_scan_stmts(rest) }
+    }
+  }
+}
+
+# Decimal parser used by the emit-side sentinel decoder. Stops at
+# the first non-digit; returns 0 on an empty / malformed input. The
+# encoder emits via `int_to_string` so only `[0-9]+` ever reaches us.
+fn tcrec_parse_decimal(s: String) : Int =
+  tcrec_parse_decimal_loop(s, 0, string_length(s), 0)
+
+fn tcrec_parse_decimal_loop(s: String, i: Int, n: Int, acc: Int) : Int {
+  if i >= n { acc }
+  else { match char_at(s, i) {
+    None -> acc
+    Some(c) ->
+      if ch_is_digit(c) {
+        tcrec_parse_decimal_loop(s, i + 1, n, acc * 10 + (char_to_int(c) - char_to_int('0')))
+      } else { acc }
+  } }
+}
+
+# ---- m37 / TCO — goto-block emission ------------------------------
+#
+# Called from `emit_call_expr` when the callee's `EVar` carries a
+# `__kai_tcrec|...` sentinel. Emits the rebind-and-goto block
+# documented in `tcrec_rewrite_decl`. Refcount discipline:
+#
+# 1. Evaluate every arg into a fresh `_t<i>` local (each with rc=1
+#    per the Perceus contract — args may share storage with a
+#    parameter only via `kai_internal_dup`, which already bumped rc).
+# 2. Drop the params whose bit is set in the dropmask. Those are
+#    exactly the params that would have been dropped by the wrap's
+#    exit drops, which the goto skips by jumping out of the
+#    enclosing statement-expression.
+# 3. Rebind `kai_<pname> = _t<i>`, in declaration order. Each
+#    rebound variable now holds rc=1, the same invariant the wrap
+#    relies on at fn entry.
+# 4. Goto the entry label planted by `emit_fn_body`.
+# 5. Trailing `(KaiValue *)0;` so the statement-expression is a
+#    well-typed lvalue; the value is unreachable past the goto.
+fn tcrec_emit_goto(src: String, sym: String, dropmask: Int, pnames: [String],
+                   args_e: [Expr], lcs: [String], fns: [EFn], variants: [EVar],
+                   lams: [LamInfo], cls: [ClauseInfo]) : String {
+  let arg_lets = tcrec_emit_arg_lets(src, args_e, 0, lcs, fns, variants, lams, cls)
+  let drops    = tcrec_emit_drops(pnames, dropmask, 0)
+  let rebinds  = tcrec_emit_rebinds(pnames, 0)
+  concat_all([
+    "({ ", arg_lets, drops, rebinds,
+    "goto _kai_", sym, "_entry; (KaiValue *)0; })"
+  ])
+}
+
+fn tcrec_emit_arg_lets(src: String, args_e: [Expr], i: Int, lcs: [String],
+                       fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  match args_e {
+    [] -> ""
+    [a, ...rest] -> {
+      let arg_c = emit_expr(src, a, lcs, fns, variants, lams, cls)
+      let head = concat_all([
+        "KaiValue *_t", int_to_string(i), " = ", arg_c, "; "
+      ])
+      string_concat(head,
+        tcrec_emit_arg_lets(src, rest, i + 1, lcs, fns, variants, lams, cls))
+    }
+  }
+}
+
+fn tcrec_emit_drops(pnames: [String], dropmask: Int, i: Int) : String {
+  match pnames {
+    [] -> ""
+    [p, ...rest] -> {
+      let bit = tcrec_pow2(i)
+      let head =
+        if (dropmask / bit) % 2 == 1 {
+          concat_all([
+            "{ KaiValue *_ = kai_internal_drop(kai_", p, "); (void) _; } "
+          ])
+        } else { "" }
+      string_concat(head, tcrec_emit_drops(rest, dropmask, i + 1))
+    }
+  }
+}
+
+fn tcrec_emit_rebinds(pnames: [String], i: Int) : String {
+  match pnames {
+    [] -> ""
+    [p, ...rest] -> {
+      let head = concat_all([
+        "kai_", p, " = _t", int_to_string(i), "; "
+      ])
+      string_concat(head, tcrec_emit_rebinds(rest, i + 1))
+    }
+  }
+}
+
 # ---- `--dump-last-use`: per-fn-param last-use diagnostic ----
 
 fn dump_last_use_for_param(p: Param, uses: [Use]) : Unit / Console {
@@ -31583,11 +32086,34 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       # the perceus pass sees post-unbox modes (it
                       # only inserts dup/drop on `MBoxed` nodes).
                       let unboxed_decls = unbox_pass(mono_decls)
-                      # m5 #1 — basic Perceus walker (identity).
-                      # m5 #2-#4 fill in last-use analysis + dup/drop.
-                      let perceus_decls = perceus_pass(unboxed_decls)
                       let test_mode = match mode { MTest -> true _ -> false }
                       let use_llvm = match mode { MEmitLlvm -> true _ -> false }
+                      # Issue #37 — self-tail-call rewrite. Runs
+                      # *before* Perceus on the C path so the
+                      # rewrite sees an un-wrapped body (Perceus
+                      # otherwise nests the original tail
+                      # expression inside `EBlock([SLet(__pcs_ret,
+                      # ...), exit_drops], Some(EVar("__pcs_ret")))`,
+                      # hiding the tail position). The dropmask
+                      # computed here uses the same `last_use_for` /
+                      # `pcs_count_non_lam_uses` criteria that
+                      # Perceus applies when it computes the wrap's
+                      # exit drops, so the goto-path drops match
+                      # the wrap's exit drops byte-for-byte.
+                      # Sentinels survive Perceus untouched: the
+                      # sentinel callee is an `EVar(<name>)` whose
+                      # name is not in any parameter scope, so the
+                      # dup walker leaves it alone.
+                      #
+                      # The LLVM path skips the rewrite — it emits
+                      # a normal call when it sees the sentinel;
+                      # TCO via the LLVM `tail` marker is a
+                      # separate lane (issue #37 non-goals).
+                      let pre_perceus_decls = if use_llvm { unboxed_decls }
+                                              else { tcrec_rewrite_decls(unboxed_decls) }
+                      # m5 #1 — basic Perceus walker (identity).
+                      # m5 #2-#4 fill in last-use analysis + dup/drop.
+                      let perceus_decls = perceus_pass(pre_perceus_decls)
                       if mono_inv_errs != 0 { mono_inv_errs }
                       else {
                         let out = if use_llvm {
