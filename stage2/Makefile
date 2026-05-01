@@ -4,16 +4,14 @@ KAIC1   := ../stage1/kaic1
 TARGET  := kaic2
 SRC     := compiler.kai
 
-# kaic1/kaic2 run recursive passes (lex_loop and others) that stage 0's
-# emitter doesn't TCO. On stage 2's source (~9 k lines) those recurse
-# past the default 8 MB thread stack. Prepend this to any recipe that
-# feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
-# Bumped from 32 MB to 64 MB (macOS hard limit) on 2026-04-27:
-# m12.6 + m6.2 push compiler.kai past 25k lines and the recursive
-# init code at module load now needs ~32-40 MB of stack on the
-# main thread. The plain 32 MB ulimit was crashing selfhost with
-# SIGSEGV; 65520 KB is the macOS hard-limit ceiling and works.
-STACK := ulimit -s 65520 2>/dev/null || ulimit -s 32768 2>/dev/null || true;
+# Issue #42 closure (2026-05-01): the recursive lex_loop / parse_*
+# inside kaic1 / kaic2 used to need a 32-64 MB stack bump to handle
+# stage2/compiler.kai's ~32 k tokens. With both stage 0 and stage 1
+# emitting goto-form self-tail-calls, kaic1 / kaic2 run with O(1)
+# C-stack on the recursive paths and the bump is no longer needed.
+# Left as an empty variable so the existing `$(STACK)` recipe
+# prefixes still expand to a no-op and don't have to be edited.
+STACK :=
 
 .PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco selfhost
 
