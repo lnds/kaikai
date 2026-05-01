@@ -9,6 +9,36 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **m13 — dotted `bit.*` surface for the bit-operations
+  intrinsics.** `bit.and(x, y)`, `bit.or(x, y)`, `bit.xor(x, y)`,
+  `bit.not(x)`, `bit.shl(x, n)`, `bit.shr(x, n)`,
+  `bit.ushr(x, n)`, `bit.count(x)`, `bit.test(x, n)`,
+  `bit.set(x, n)`, `bit.clear(x, n)`, `bit.toggle(x, n)` are
+  now sugar for the flat-prefix names (`bit_and`, `bit_or`, ...)
+  introduced in 0.21.0. Implementation:
+  - `parse_postfix_rest` accepts `and`, `or`, `not`, and `test`
+    after `.` as field-name tokens (the keywords have no
+    production they could feed in that position, so the
+    extension is unambiguous).
+  - `rqc_kind` rewrites `EField(EVar("bit"), fname)` to
+    `EVar("bit_" ++ fname)` before the m14 ModuleEntry lookup.
+    The existing intrinsic path in `emit_call_expr` then lowers
+    each call inline to the matching C operator — no synthetic
+    `ModuleEntry`, no codegen patch, no `kai_bit_*` runtime
+    helper.
+  - Fixture `examples/stdlib/bits_dotted.kai` mirrors
+    `bits_basic.kai` through the dotted surface; the
+    `test-stdlib` target asserts the same operator-inlined
+    lowering on the dotted-form C output and rejects any
+    `kai_bit_*` leak that would mean the rewrite regressed.
+  - The seven helpers from `proposed-extensions.md` §16
+    (`leading_zeros`, `trailing_zeros`, `rotate_left`,
+    `rotate_right`, plus the ergonomic alias `bit.popcount`)
+    remain open for a follow-up — `bit.count` covers the popcount
+    slot and the rotates can build on `bit.shl` / `bit.ushr`.
+
 ## [0.21.0] — 2026-04-30 (Unboxing Phase 2 — Tier 2.5 close, ~2.5× C reference on inner numeric loop)
 
 ### Added

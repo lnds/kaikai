@@ -517,6 +517,23 @@ test-stdlib: $(TARGET) build
 	@grep -F -q '__builtin_popcountll' build/stdlib-bits_basic.c \
 	  || { echo "stdlib FAIL bits_basic (popcount not inlined)"; exit 1; }
 	@echo "stdlib OK bits_basic intrinsic-lowered"
+	@# m13 dotted surface: `bit.X(...)` rewrites to the flat-prefix
+	@# `bit_X` intrinsic in rqc_kind, so the same lowering must hold
+	@# for bits_dotted. If a `kai_bit_*` symbol leaks, the rewrite
+	@# regressed and the dotted form fell back to the EModCall codegen
+	@# path (which would mint `kai_bit__and` and break the build).
+	@if grep -q 'kai_bit_' build/stdlib-bits_dotted.c; then \
+	  echo "stdlib FAIL bits_dotted (intrinsic leaked as kai_bit_* call)"; \
+	  grep 'kai_bit_' build/stdlib-bits_dotted.c; \
+	  exit 1; \
+	fi
+	@grep -F -q '_a->as.i << _b' build/stdlib-bits_dotted.c \
+	  || { echo "stdlib FAIL bits_dotted (<< not inlined)"; exit 1; }
+	@grep -F -q '_a->as.i & _b'  build/stdlib-bits_dotted.c \
+	  || { echo "stdlib FAIL bits_dotted (& not inlined)"; exit 1; }
+	@grep -F -q '__builtin_popcountll' build/stdlib-bits_dotted.c \
+	  || { echo "stdlib FAIL bits_dotted (popcount not inlined)"; exit 1; }
+	@echo "stdlib OK bits_dotted intrinsic-lowered"
 # Typed holes (M10): every example under examples/holes/ must
 # (a) produce a --holes report with at least one "type hole" entry,
 # (b) produce a valid --holes-json array,
