@@ -2263,6 +2263,41 @@ static int kai_test_summary(void) {
     return (kai_test_count_passed == kai_test_count_total) ? 0 : 1;
 }
 
+/* ---------- bench harness hooks (used by --bench runs) ----------
+ * bench v1 (issue #40): mean ns/iter only, N fixed at 1000. The
+ * emitted main wrapper calls every _kai_bench_<id> in sequence and
+ * returns kai_bench_summary().
+ *
+ * Median + MAD-based outlier detection deferred to v1.x; selfhost-
+ * bench (the compiler measuring itself) deferred to v1.y. See
+ * issue #40 for the split plan.
+ */
+
+#define KAI_BENCH_ITERS 1000
+
+static int kai_bench_count_total = 0;
+
+static long long kai_bench_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
+}
+
+static void kai_bench_report(const char *desc, long long total_ns, int iters) {
+    /* Mean ns/iter only. desc is the raw source span of the string
+       literal (quotes included) — fprintf passes it through verbatim,
+       which is consistent with how kai_test_pass renders kai_test_current. */
+    long long per = (iters > 0) ? (total_ns / (long long)iters) : 0;
+    fprintf(stderr, "  %s: %d iter / %lld ns/iter\n",
+            desc ? desc : "(unnamed)", iters, per);
+    kai_bench_count_total++;
+}
+
+static int kai_bench_summary(void) {
+    fprintf(stderr, "\n%d benches\n", kai_bench_count_total);
+    return 0;
+}
+
 /* Runtime-aware assert: called from every emitted `assert`. Inside an
    active test (kai_test_in_progress) it prints a failure and longjmps
    back to the test harness so the next test can run. Otherwise it
