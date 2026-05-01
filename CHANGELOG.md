@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-05-01 (Tongariki Wave 1 — kai fmt + TCO stage 1 mirror + lane-experience retro)
+
 ### Added
 
 - **`kai fmt` — Tongariki MVP formatter.** Pretty-printer that
