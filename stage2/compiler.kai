@@ -23943,6 +23943,91 @@ fn last_use_for_loop(nm: String, uses: [Use], blocked: Bool,
   }
 }
 
+# ---- m37 / TCO — self-tail-call detection (M1) ---------------------
+#
+# Issue #37: the Perceus exit-drop wrap places `kai_internal_drop(...)`
+# calls *after* the body's tail expression, so neither gcc nor clang
+# can fold a self-recursive call into `jmp` at the C level. The
+# compiler-side fix rewrites self-tail-calls into a `goto`-loop with
+# parameter rebinding; this walker is the recognition half.
+#
+# `tcrec_has_tail_self_call(body, nm, arity)` returns true if `body`
+# contains at least one self-recursive call to a fn named `nm` with
+# `arity` arguments in *tail position*. Tail position propagates
+# through:
+#   - EBlock(_, Some(tail))      — `tail` is tail
+#   - EIf(_, then, opt_else)     — both branches are tail
+#   - EMatch(_, arms)            — each arm body is tail
+# It does NOT propagate through:
+#   - ECall args / EBinop / EUnop / ERange / records / lists
+#   - EBlock stmts (only the trailing expression is tail)
+#   - EMatch scrutinee / EIf condition / match guards
+#   - ELambda body (different fn — never tail of the enclosing fn)
+#   - EPipe / EHandle (conservative; could be relaxed later)
+#
+# A locally-bound `let`/`var` shadowing `nm` disables the match
+# inside its scope.
+#
+# M1 lands the walker only; no caller wires it into the pipeline,
+# so selfhost stays byte-identical until M3 flips emission.
+fn tcrec_has_tail_self_call(body: Expr, nm: String, arity: Int) : Bool =
+  tcrec_walk_tail(body.kind, nm, arity, [])
+
+fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, scope: [String]) : Bool {
+  match k {
+    ECall(f, xs) -> match f.kind {
+      EVar(callee) ->
+        if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
+          true
+        } else { false }
+      _ -> false
+    }
+    EIf(_, t, opt_e) -> {
+      if tcrec_walk_tail(t.kind, nm, arity, scope) { true }
+      else { match opt_e {
+        None -> false
+        Some(e2) -> tcrec_walk_tail(e2.kind, nm, arity, scope)
+      } }
+    }
+    EMatch(_, arms) -> tcrec_walk_arms(arms, nm, arity, scope)
+    EBlock(stmts, opt_tail) -> {
+      let scope1 = tcrec_block_scope(stmts, scope)
+      match opt_tail {
+        None -> false
+        Some(e) -> tcrec_walk_tail(e.kind, nm, arity, scope1)
+      }
+    }
+    _ -> false
+  }
+}
+
+fn tcrec_walk_arms(arms: [Arm], nm: String, arity: Int, scope: [String]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(pat, _, body) -> {
+        let scope1 = pat_bindings(pat, scope)
+        if tcrec_walk_tail(body.kind, nm, arity, scope1) { true }
+        else { tcrec_walk_arms(rest, nm, arity, scope) }
+      }
+    }
+  }
+}
+
+fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
+  match stmts {
+    [] -> scope
+    [s, ...rest] -> {
+      let scope1 = match s {
+        SLet(pat, _, _) -> pat_bindings(pat, scope)
+        SVar(name, _, _, _, _) -> [name, ...scope]
+        _ -> scope
+      }
+      tcrec_block_scope(rest, scope1)
+    }
+  }
+}
+
 # ---- `--dump-last-use`: per-fn-param last-use diagnostic ----
 
 fn dump_last_use_for_param(p: Param, uses: [Use]) : Unit / Console {
