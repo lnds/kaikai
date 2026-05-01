@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-05-01 (TCO emitter rewrite — Tier 1 #2 closure, R5 band-aid removed)
+
 ### Added
 
 - **TCO via emitter goto-loop rewrite (issue #37 — fully
