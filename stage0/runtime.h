@@ -79,20 +79,33 @@
 #  pragma GCC diagnostic ignored "-Wunused-function"
 #endif
 
-/* R5 fix — bump RLIMIT_STACK at process startup so deeply-recursive
- * kaikai programs (e.g., demos/euler4 with its ~1M-deep `search`
- * recursion) do not blow the 8 MiB main-thread stack that ships as
- * the Linux/glibc default. The post-Perceus drops emitted after a
- * recursive call inhibit C-level TCO under both gcc and clang on
- * Linux (see assembly: `call kai_search` rather than `jmp`); macOS
- * happens to ship a more permissive default, so the same binary
- * works there. The runtime fix is a constructor that raises
- * RLIMIT_STACK to the hard cap (or RLIM_INFINITY where allowed)
- * before `main` runs, so the kernel's automatic stack-grow path
- * services subsequent page faults instead of delivering SIGSEGV.
- * No-op on macOS where the limit is already generous enough. The
- * proper fix is emitter-side TCO for self-tail-calls, tracked in
- * docs/known-regressions.md and post-MVP. */
+/* R5 / issue #37 transitional fix — bump RLIMIT_STACK at process
+ * startup so the *bootstrap chain* survives Linux's default 8 MiB
+ * main-thread stack:
+ *
+ *   stage0/kaic0  → stage1.c    (recursive emit, no TCO)
+ *   stage1/kaic1  → stage2.c    (recursive emit, no TCO)
+ *   stage2/kaic2  ← built from stage2.c (so kaic2's own internal
+ *                   `lex_loop`, `parse_*`, etc. are recursive C
+ *                   functions, not goto-loops)
+ *
+ * Issue #37's emitter goto-rewrite lands in `stage2/compiler.kai`,
+ * so the *programs kaic2 emits* (demos, kaic2's selfhost output)
+ * use O(1) C-stack via `goto _kai_<sym>_entry`. But the kaic2
+ * binary itself, and the kaic1 binary that built it, were emitted
+ * by stage1 (which still uses the recursive shape). When kaic2
+ * runs over `compiler.kai` (~33 k tokens), its internal `lex_loop`
+ * recurses ~33 k times — fits in macOS's default but blows
+ * Linux's 8 MiB.
+ *
+ * The proper closure is to mirror the goto rewrite into
+ * `stage1/compiler.kai` so kaic1 emits goto-loops too; once that
+ * lane lands, this constructor (and `<sys/resource.h>`) can come
+ * out for good. Until then, keeping the runtime bump means the
+ * bootstrap chain works on Linux without depending on the user
+ * setting `ulimit -s` themselves. No-op on macOS where the limit
+ * is already generous.
+ */
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((constructor))
 #endif
