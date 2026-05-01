@@ -1,5 +1,18 @@
 CC      ?= cc
 CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g -O0
+# macOS caps the main-thread stack at the LINKED size, not the ulimit
+# soft limit (ulimit -s only matters where the kernel is the
+# allocator — i.e. Linux). The Tongariki kai fmt lane (2026-05-01)
+# tipped self-host past the 8 MB default at -O0, so on Darwin we
+# link with a 128 MB main-thread stack. Linux honours the runtime
+# ulimit -s 65520 set in the `STACK` prefix below, so it needs no
+# linker flag.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+LDFLAGS_STACK := -Wl,-stack_size,0x8000000
+else
+LDFLAGS_STACK :=
+endif
 KAIC1   := ../stage1/kaic1
 TARGET  := kaic2
 SRC     := compiler.kai
@@ -27,7 +40,7 @@ build/stage2.c: $(SRC) $(KAIC1) | build
 	$(STACK) $(KAIC1) $(SRC) > $@
 
 $(TARGET): build/stage2.c
-	$(CC) $(CFLAGS) -I ../stage0 $< -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage0 $< -o $@
 
 # Token stream must match stage 1 (which already matches stage 0).
 test-tokens: $(TARGET) build

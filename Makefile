@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos demos-verify demos-no-regression selfhost clean tier0 tier1 daily coverage-probe rc-budget stress-fixtures
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-fmt demos-verify demos-no-regression selfhost clean tier0 tier1 daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -74,8 +74,16 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression
-	@echo "tier1 OK — full make test + demos baseline"
+tier1: test demos-no-regression test-fmt
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures"
+
+# Tongariki — `kai fmt` fixture suite. Verifies that every fixture
+# in examples/fmt/ formats to its `.expected.kai` and is idempotent,
+# plus that every formattable example under examples/minimal/ /
+# quickstart/ / phase4/ round-trips through the formatter without
+# breaking re-parse. Cheap enough to gate every Tier 1 run.
+test-fmt: kaic2
+	@./tests/fmt_fixtures.sh
 
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every

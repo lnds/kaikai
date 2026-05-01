@@ -31128,6 +31128,1188 @@ fn find_impl_for(impls: [ProtoImplReg], pname: String, tname: String,
   }
 }
 
+
+# ====================================================================
+# kai fmt — pretty printer (Tongariki MVP)
+# ====================================================================
+#
+# `kai fmt` formats kaikai source canonically. The lexer discards line
+# comments, so we re-scan the source against the token stream to collect
+# them into a side list keyed by (line, col). The pretty printer walks
+# the parsed AST and interleaves comments at line boundaries.
+#
+# Scope (Tongariki MVP):
+#   Decl:   DImport, DFn (mono, no contracts), DType (record / sum /
+#           alias), DTest.
+#   Expr:   literals, EVar, ECall, EField, EIndex, EBinop, EUnop,
+#           EIf, EMatch, ELambda, ERecordLit, EList (no spread),
+#           EBlock, EPipe, EHole, ETodo, EBang, ERange, EUnit.
+#   Pat:    PWild, PLit, PBind, PList, PVariant, PVariantRecord,
+#           PRecord, PAs, PHole.
+#   Stmt:   SLet, SExprStmt, SAssert.
+#   Type:   TyName, TyList, TyFn (closed/empty rows).
+#
+# Out of scope for v1 (errors out cleanly):
+#   DEffect / EHandle, DProtocol / DImpl / DDerive, DUnit / ELitUnit /
+#   TyDim / TyRefine, DAxiom, DUse / SUse, generic tparams (DFn[T]),
+#   parametric / open effect rows, contracts (`requires` / `ensures`),
+#   `var` / `a[i] := v` (SVar, SIndexAssign), spread list patterns
+#   beyond the simple `[..., rest]` case.
+#
+# Comment placement: best-effort line-anchored merge. A comment with
+# source line L is emitted as a full-line comment immediately before
+# the next AST node whose source line is >= L. Same-line trailing
+# comments may be promoted to the line above; this is documented in
+# CHANGELOG / known-regressions as v1's cost of best-effort.
+
+# Source-level line comment captured outside the token stream.
+type Cmt
+  = Cmt(Int, Int, String)
+
+# line, col, text (stripped of
+# leading `#`, no trailing
+# newline)
+
+# Threaded fmt state. `out` accumulates emitted strings (joined at the
+# end); `cmts` is the suffix of yet-to-emit comments (sorted by line);
+# `indent` is the current nesting in 2-space units; `at_line_start`
+# tracks whether the writer is positioned at column 1 (so emit_token
+# can prepend indentation lazily).
+type FmtSt = { out: [String], cmts: [Cmt], indent: Int, at_line_start: Bool }
+
+fn fmt_init(cmts: [Cmt]) : FmtSt = FmtSt { out: [], cmts: cmts, indent: 0, at_line_start: true }
+
+fn fmt_finish(s: FmtSt) : String {
+  # The accumulator ends with one trailing newline (every decl
+  # closes its line). `print` appends its own newline, so we strip
+  # the trailing whitespace and let the caller's print add the
+  # canonical single line ending.
+  let raw = string_concat_all(list_reverse(s.out))
+  fmt_trim_trailing_newlines(raw, string_length(raw))
+}
+
+fn fmt_trim_trailing_newlines(s: String, n: Int) : String {
+  if n <= 0 {
+    ""
+  } else {
+    match char_at(s, n - 1) {
+      Some(c) -> if (((c == '\n') or (c == ' ')) or (c == '\t')) or (c == '\r') {
+        fmt_trim_trailing_newlines(s, n - 1)
+      } else {
+        string_slice(s, 0, n)
+      }
+      None -> string_slice(s, 0, n)
+    }
+  }
+}
+
+fn fmt_indent_str(s: FmtSt) : String = spaces(s.indent * 2)
+
+# Push a raw chunk into the output. Caller is responsible for
+# indentation handling — most call sites should go through
+# `fmt_emit` / `fmt_newline`.
+fn fmt_push(s: FmtSt, chunk: String) : FmtSt = FmtSt { out: [chunk, ...s.out], cmts: s.cmts, indent: s.indent, at_line_start: false }
+
+# Emit `chunk`, prepending the current indent if we are at line start.
+fn fmt_emit(s: FmtSt, chunk: String) : FmtSt {
+  if s.at_line_start {
+    fmt_push(fmt_push(s, fmt_indent_str(s)), chunk)
+  } else {
+    fmt_push(s, chunk)
+  }
+}
+
+fn fmt_newline(s: FmtSt) : FmtSt = FmtSt { out: ["\n", ...s.out], cmts: s.cmts, indent: s.indent, at_line_start: true }
+
+fn fmt_blank_line(s: FmtSt) : FmtSt {
+  if s.at_line_start {
+    fmt_newline(s)
+  } else {
+    fmt_newline(fmt_newline(s))
+  }
+}
+
+fn fmt_indent_in(s: FmtSt) : FmtSt = FmtSt { out: s.out, cmts: s.cmts, indent: s.indent + 1, at_line_start: s.at_line_start }
+
+fn fmt_indent_out(s: FmtSt) : FmtSt = FmtSt { out: s.out, cmts: s.cmts, indent: s.indent - 1, at_line_start: s.at_line_start }
+
+# Scan the source for line comments at gaps between tokens. Tokens are
+# the raw stream from `tokenize`; comments live in the gaps. `#derive`
+# is already a token (TkDerive), so it never appears in a gap. `#{...}`
+# interpolations live inside string literals — string tokens cover
+# their entire span — so they never appear in a gap either.
+fn collect_comments(src: String, tokens: [Token]) : [Cmt] {
+  collect_comments_loop(src, tokens, 0, 1, 1, [])
+}
+
+fn collect_comments_loop(src: String, tokens: [Token], pos: Int, line: Int, col: Int, acc: [Cmt]) : [Cmt] {
+  match tokens {
+    [] -> {
+      # Tail: scan the trailing gap (after the EOF token) for any
+      # final comments. EOF has length 0; in practice the last
+      # meaningful token is followed by EOF and any tail comments
+      # would have been captured before EOF was emitted, but we
+      # walk anyway for safety.
+      let tail = collect_gap(src, pos, string_length(src), line, col, acc)
+      list_reverse(tail.acc)
+    }
+    [t, ...rest] -> {
+      let scanned = collect_gap(src, pos, t.start, line, col, acc)
+      let after_line = scanned.line
+      let after_col = scanned.col
+      let after_acc = scanned.acc
+      let new_pos = t.start + t.length
+      let endloc = advance_loc(src, t.start, t.length, after_line, after_col)
+      collect_comments_loop(src, rest, new_pos, endloc.line, endloc.col, after_acc)
+    }
+  }
+}
+
+# Result of scanning one gap. Mirrors a tuple — kaikai-minimal lacks
+# multi-return so we wrap.
+type CmtScan = { line: Int, col: Int, acc: [Cmt] }
+
+fn collect_gap(src: String, from: Int, to: Int, line: Int, col: Int, acc: [Cmt]) : CmtScan {
+  if from >= to {
+    CmtScan { line: line, col: col, acc: acc }
+  } else {
+    match char_at(src, from) {
+      None -> CmtScan { line: line, col: col, acc: acc }
+      Some(c) -> {
+        if c == '\n' {
+          collect_gap(src, from + 1, to, line + 1, 1, acc)
+        } else if c == '#' {
+          # Capture from the char after `#` up to the next newline (or
+          # `to`, whichever is first).
+          let body_start = from + 1
+          let eol = scan_to_newline_bounded(src, body_start, to)
+          let text = string_slice(src, body_start, eol - body_start)
+          let acc2 = [Cmt(line, col, text), ...acc]
+          collect_gap(src, eol, to, line, col + (eol - from), acc2)
+        } else {
+          collect_gap(src, from + 1, to, line, col + 1, acc)
+        }
+      }
+    }
+  }
+}
+
+fn scan_to_newline_bounded(src: String, from: Int, hi: Int) : Int {
+  if from >= hi {
+    hi
+  } else {
+    match char_at(src, from) {
+      None -> from
+      Some(c) -> if c == '\n' {
+        from
+      } else {
+        scan_to_newline_bounded(src, from + 1, hi)
+      }
+    }
+  }
+}
+
+# Advance (line, col) over `len` chars starting at `from`. Used to
+# update the cursor after consuming a token's source span.
+type Loc = { line: Int, col: Int }
+
+fn advance_loc(src: String, from: Int, len: Int, line: Int, col: Int) : Loc {
+  if len <= 0 {
+    Loc { line: line, col: col }
+  } else {
+    match char_at(src, from) {
+      None -> Loc { line: line, col: col }
+      Some(c) -> {
+        if c == '\n' {
+          advance_loc(src, from + 1, len - 1, line + 1, 1)
+        } else {
+          advance_loc(src, from + 1, len - 1, line, col + 1)
+        }
+      }
+    }
+  }
+}
+
+# Drain every comment whose source line is < `target_line`, emitting
+# each as a full-line comment at the current indent. Used before
+# emitting an AST node at line `target_line`. `prev` is the line of
+# the previously emitted comment (or 0 when none yet); a gap >1
+# between consecutive comments preserves the blank line.
+fn fmt_drain_before(s: FmtSt, target_line: Int) : FmtSt = fmt_drain_before_loop(s, target_line, 0)
+
+fn fmt_drain_before_loop(s: FmtSt, target_line: Int, prev: Int) : FmtSt {
+  match s.cmts {
+    [] -> {
+      # No more comments. If we drained at least one, preserve a blank
+      # line between the last comment and the upcoming AST node when
+      # the source had one (target_line > prev + 1).
+      if (prev > 0) and (target_line > (prev + 1)) {
+        if s.at_line_start {
+          fmt_newline(s)
+        } else {
+          fmt_newline(fmt_newline(s))
+        }
+      } else {
+        s
+      }
+    }
+    [Cmt(cl, _, text), ...rest] -> {
+      if cl >= target_line {
+        # Same fate as the empty-list arm: bridge a blank line if the
+        # next AST node is more than one source line below the last
+        # emitted comment.
+        if (prev > 0) and (target_line > (prev + 1)) {
+          if s.at_line_start {
+            fmt_newline(s)
+          } else {
+            fmt_newline(fmt_newline(s))
+          }
+        } else {
+          s
+        }
+      } else {
+        # Position writer at column 1.
+        let s1 = if s.at_line_start {
+          s
+        } else {
+          fmt_newline(s)
+        }
+        # Preserve blank lines between non-adjacent comments.
+        let s2 = if (prev > 0) and (cl > (prev + 1)) {
+          fmt_newline(s1)
+        } else {
+          s1
+        }
+        let s3 = FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start }
+        let s4 = fmt_emit(s3, "#")
+        let s5 = fmt_emit(s4, text)
+        let s6 = fmt_newline(s5)
+        fmt_drain_before_loop(s6, target_line, cl)
+      }
+    }
+  }
+}
+
+# Drain ALL remaining comments (used at end-of-program).
+fn fmt_drain_rest(s: FmtSt) : FmtSt = fmt_drain_rest_loop(s, 0)
+
+fn fmt_drain_rest_loop(s: FmtSt, prev: Int) : FmtSt {
+  match s.cmts {
+    [] -> s
+    [Cmt(cl, _, text), ...rest] -> {
+      let s1 = if s.at_line_start {
+        s
+      } else {
+        fmt_newline(s)
+      }
+      let s2 = if (prev > 0) and (cl > (prev + 1)) {
+        fmt_newline(s1)
+      } else {
+        s1
+      }
+      let s3 = FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start }
+      let s4 = fmt_emit(s3, "#")
+      let s5 = fmt_emit(s4, text)
+      let s6 = fmt_newline(s5)
+      fmt_drain_rest_loop(s6, cl)
+    }
+  }
+}
+
+# ---- top-level entry ------------------------------------------------
+
+fn fmt_program(decls: [Decl], cmts: [Cmt]) : String {
+  let s0 = fmt_init(cmts)
+  let s1 = fmt_decls(decls, s0, true)
+  let s2 = fmt_drain_rest(s1)
+  fmt_finish(s2)
+}
+
+# Walk decls, separating each by a blank line. `first` flag suppresses
+# the leading blank line for the very first decl.
+fn fmt_decls(decls: [Decl], s: FmtSt, first: Bool) : FmtSt {
+  match decls {
+    [] -> s
+    [d, ...rest] -> {
+      let s1 = if first {
+        s
+      } else {
+        fmt_blank_line(s)
+      }
+      let s2 = fmt_drain_before(s1, decl_line(d))
+      let s3 = fmt_decl(d, s2)
+      let s4 = if s3.at_line_start {
+        s3
+      } else {
+        fmt_newline(s3)
+      }
+      fmt_decls(rest, s4, false)
+    }
+  }
+}
+
+fn decl_line(d: Decl) : Int {
+  match d {
+    DFn(_, _, _, _, _, _, _, line, _, _) -> line
+    DType(_, _, _, _, line, _) -> line
+    DTest(_, _, line, _) -> line
+    DImport(_, line, _) -> line
+    DEffect(_, _, _, _, line, _) -> line
+    DProtocol(_, _, _, line, _) -> line
+    DImpl(_, _, _, line, _) -> line
+    DDerive(_, _, line, _) -> line
+    DAttribPure(_, line, _) -> line
+    DUnit(_, _, _, line, _) -> line
+    DUse(_, line, _) -> line
+    DAxiom(_, _, _, _, _, _, line, _) -> line
+  }
+}
+
+# Emit a single decl. Unsupported variants `panic` with a clear
+# `kai fmt:` message — `panic` calls C's exit(1), so the partial
+# accumulator built into FmtSt never reaches stdout. Refusing
+# rather than dumping placeholders keeps the contract honest:
+# either kai fmt prints byte-correct kaikai source, or it errors out.
+fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
+  match d {
+    DImport(ik, _, _) -> fmt_import(ik, s)
+    DFn(is_pub, name, tparams, params, ret, row, body, line, _, _) -> {
+      if not list_is_empty(tparams) {
+        fmt_panic_unsupported("generic functions", line)
+      } else {
+        fmt_fn(is_pub, name, tparams, params, ret, row, body, s)
+      }
+    }
+    DType(is_pub, name, tparams, body, line, _) -> {
+      if not list_is_empty(tparams) {
+        fmt_panic_unsupported("generic types", line)
+      } else {
+        fmt_type_decl(is_pub, name, tparams, body, s)
+      }
+    }
+    DTest(label, body, _, _) -> fmt_test(label, body, s)
+    DAttribPure(inner, _, _) -> {
+      let s1 = fmt_emit(s, "[<refinement_pure>]")
+      let s2 = fmt_newline(s1)
+      fmt_decl(inner, s2)
+    }
+    DEffect(_, _, _, _, line, _) -> fmt_panic_unsupported("effect declarations", line)
+    DProtocol(_, _, _, line, _) -> fmt_panic_unsupported("protocol declarations", line)
+    DImpl(_, _, _, line, _) -> fmt_panic_unsupported("impl blocks", line)
+    DDerive(_, _, line, _) -> fmt_panic_unsupported("#derive annotation", line)
+    DUnit(_, _, _, line, _) -> fmt_panic_unsupported("unit declarations", line)
+    DUse(_, line, _) -> fmt_panic_unsupported("file-level `use`", line)
+    DAxiom(_, _, _, _, _, _, line, _) -> fmt_panic_unsupported("axiom declarations", line)
+  }
+}
+
+fn fmt_panic_unsupported(what: String, line: Int) : a = panic(string_concat_all(["kai fmt: ", what, " not yet supported (line ", int_to_string(line), ")"]))
+
+# ---- imports --------------------------------------------------------
+
+fn fmt_import(ik: ImportKind, s: FmtSt) : FmtSt {
+  match ik {
+    IkPath(p) -> fmt_emit(s, string_concat_all(["import ", p]))
+    IkAlias(p, alias) -> fmt_emit(s, string_concat_all(["import ", p, " as ", alias]))
+    IkSelective(p, names) -> fmt_emit(s, string_concat_all(["import ", p, ".{", string_join(names, ", "), "}"]))
+    IkHole(name) -> fmt_emit(s, string_concat_all(["import ?", name]))
+  }
+}
+
+# ---- fn decls -------------------------------------------------------
+
+fn fmt_fn(is_pub: Bool, name: String, tparams: [String], params: [Param], ret: Option[TypeExpr], row: RowExpr, body: Expr, s: FmtSt) : FmtSt {
+  let s1 = if is_pub {
+    fmt_emit(s, "pub ")
+  } else {
+    s
+  }
+  let s2 = fmt_emit(s1, "fn ")
+  let s3 = fmt_emit(s2, name)
+  let s4 = if list_is_empty(tparams) {
+    s3
+  } else {
+    fmt_emit(s3, string_concat_all(["[", string_join(tparams, ", "), "]"]))
+  }
+  let s5 = fmt_emit(s4, "(")
+  let s6 = fmt_params(params, s5)
+  let s7 = fmt_emit(s6, ")")
+  let s8 = match ret {
+    None -> s7
+    Some(t) -> {
+      let a = fmt_emit(s7, " : ")
+      fmt_type(t, a)
+    }
+  }
+  let s9 = fmt_row(row, s8)
+  fmt_fn_body(body, s9)
+}
+
+fn fmt_params(params: [Param], s: FmtSt) : FmtSt {
+  match params {
+    [] -> s
+    [p] -> fmt_param(p, s)
+    [p, ...rest] -> {
+      let s1 = fmt_param(p, s)
+      let s2 = fmt_emit(s1, ", ")
+      fmt_params(rest, s2)
+    }
+  }
+}
+
+fn fmt_param(p: Param, s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, p.pname)
+  match p.ptype {
+    None -> s1
+    Some(t) -> {
+      let a = fmt_emit(s1, ": ")
+      fmt_type(t, a)
+    }
+  }
+}
+
+fn fmt_row(row: RowExpr, s: FmtSt) : FmtSt {
+  match row {
+    REmpty -> s
+    RClosed(labels) -> {
+      if list_is_empty(labels) {
+        s
+      } else {
+        let s1 = fmt_emit(s, " / ")
+        fmt_row_labels(labels, s1)
+      }
+    }
+    ROpen(_, _) -> fmt_panic_unsupported("open / parametric effect rows", 0)
+  }
+}
+
+fn fmt_row_labels(ls: [RowLabel], s: FmtSt) : FmtSt {
+  match ls {
+    [] -> s
+    [l] -> fmt_row_label(l, s)
+    [l, ...rest] -> {
+      let s1 = fmt_row_label(l, s)
+      let s2 = fmt_emit(s1, " + ")
+      fmt_row_labels(rest, s2)
+    }
+  }
+}
+
+fn fmt_row_label(rl: RowLabel, s: FmtSt) : FmtSt {
+  match rl {
+    RL(name, ty_args) -> {
+      if list_is_empty(ty_args) {
+        fmt_emit(s, name)
+      } else {
+        fmt_panic_unsupported("parametric effect labels", 0)
+      }
+    }
+  }
+}
+
+# Function body: prefer `= expr` when the body is a single non-block
+# expression (literal, var, simple call, etc.); use `{ ... }` block
+# form when the body is an EBlock or contains multi-line constructs.
+fn fmt_fn_body(body: Expr, s: FmtSt) : FmtSt {
+  match body.kind {
+    EBlock(stmts, tail) -> {
+      let s1 = fmt_emit(s, " {")
+      let s2 = fmt_newline(s1)
+      let s3 = fmt_indent_in(s2)
+      let s4 = fmt_block_inner(stmts, tail, s3)
+      let s5 = fmt_indent_out(s4)
+      fmt_emit(s5, "}")
+    }
+    _ -> {
+      let s1 = fmt_emit(s, " = ")
+      fmt_expr(body, s1)
+    }
+  }
+}
+
+# ---- type decls -----------------------------------------------------
+
+fn fmt_type_decl(is_pub: Bool, name: String, tparams: [String], body: TypeBody, s: FmtSt) : FmtSt {
+  let s1 = if is_pub {
+    fmt_emit(s, "pub ")
+  } else {
+    s
+  }
+  let s2 = fmt_emit(s1, "type ")
+  let s3 = fmt_emit(s2, name)
+  let s4 = if list_is_empty(tparams) {
+    s3
+  } else {
+    fmt_emit(s3, string_concat_all(["[", string_join(tparams, ", "), "]"]))
+  }
+  match body {
+    TBAlias(t) -> {
+      let a = fmt_emit(s4, " = ")
+      fmt_type(t, a)
+    }
+    TBRecord(fields) -> {
+      let a = fmt_emit(s4, " = { ")
+      let b = fmt_field_decls(fields, a)
+      fmt_emit(b, " }")
+    }
+    TBSum(variants) -> fmt_sum_variants(variants, s4)
+    TBEffectAlias(labels) -> {
+      let a = fmt_emit(s4, " = ")
+      fmt_emit(a, string_join(labels, " + "))
+    }
+  }
+}
+
+fn fmt_field_decls(fs: [FieldDecl], s: FmtSt) : FmtSt {
+  match fs {
+    [] -> s
+    [f] -> fmt_field_decl(f, s)
+    [f, ...rest] -> {
+      let s1 = fmt_field_decl(f, s)
+      let s2 = fmt_emit(s1, ", ")
+      fmt_field_decls(rest, s2)
+    }
+  }
+}
+
+fn fmt_field_decl(fd: FieldDecl, s: FmtSt) : FmtSt {
+  match fd {
+    FD(name, t) -> {
+      let s1 = fmt_emit(s, name)
+      let s2 = fmt_emit(s1, ": ")
+      fmt_type(t, s2)
+    }
+  }
+}
+
+fn fmt_sum_variants(vs: [Variant], s: FmtSt) : FmtSt {
+  let s0 = fmt_newline(s)
+  let s1 = fmt_indent_in(s0)
+  let s2 = fmt_emit(s1, "= ")
+  let s3 = fmt_sum_variants_loop(vs, s2, true)
+  fmt_indent_out(s3)
+}
+
+fn fmt_sum_variants_loop(vs: [Variant], s: FmtSt, first: Bool) : FmtSt {
+  match vs {
+    [] -> s
+    [v, ...rest] -> {
+      let s1 = if first {
+        s
+      } else {
+        let n = fmt_newline(s)
+        fmt_emit(n, "| ")
+      }
+      let s2 = fmt_variant(v, s1)
+      fmt_sum_variants_loop(rest, s2, false)
+    }
+  }
+}
+
+fn fmt_variant(v: Variant, s: FmtSt) : FmtSt {
+  match v {
+    Var(name, ty_args) -> {
+      let s1 = fmt_emit(s, name)
+      if list_is_empty(ty_args) {
+        s1
+      } else {
+        let s2 = fmt_emit(s1, "(")
+        let s3 = fmt_type_args(ty_args, s2)
+        fmt_emit(s3, ")")
+      }
+    }
+  }
+}
+
+# ---- tests ----------------------------------------------------------
+
+fn fmt_test(label: String, body: Expr, s: FmtSt) : FmtSt {
+  # `label` is the raw source span of the string literal (quotes
+  # included), so it round-trips verbatim — single, triple, escaped
+  # quotes all preserved.
+  let s1 = fmt_emit(s, "test ")
+  let s2 = fmt_emit(s1, label)
+  fmt_fn_body(body, s2)
+}
+
+# ---- types ----------------------------------------------------------
+
+fn fmt_type(t: TypeExpr, s: FmtSt) : FmtSt {
+  match t.tkind {
+    TyName(name, ty_args) -> {
+      let s1 = fmt_emit(s, name)
+      if list_is_empty(ty_args) {
+        s1
+      } else {
+        let s2 = fmt_emit(s1, "[")
+        let s3 = fmt_type_args(ty_args, s2)
+        fmt_emit(s3, "]")
+      }
+    }
+    TyList(elem) -> {
+      let s1 = fmt_emit(s, "[")
+      let s2 = fmt_type(elem, s1)
+      fmt_emit(s2, "]")
+    }
+    TyFn(params, ret, row) -> {
+      let s1 = fmt_emit(s, "(")
+      let s2 = fmt_type_args(params, s1)
+      let s3 = fmt_emit(s2, ") -> ")
+      let s4 = fmt_type(ret, s3)
+      fmt_row(row, s4)
+    }
+    TyDim(_, _) -> fmt_panic_unsupported("unit-of-measure types", t.line)
+    TyRefine(_, _) -> fmt_panic_unsupported("refinement types", t.line)
+  }
+}
+
+fn fmt_type_args(ts: [TypeExpr], s: FmtSt) : FmtSt {
+  match ts {
+    [] -> s
+    [t] -> fmt_type(t, s)
+    [t, ...rest] -> {
+      let s1 = fmt_type(t, s)
+      let s2 = fmt_emit(s1, ", ")
+      fmt_type_args(rest, s2)
+    }
+  }
+}
+
+# ---- expressions ----------------------------------------------------
+
+fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
+  let s0 = fmt_drain_before(s, e.line)
+  match e.kind {
+    EInt(v) -> fmt_emit(s0, int_to_string(v))
+    EReal(_) -> fmt_emit(s0, "/* TODO real */")
+    EBool(b) -> fmt_emit(s0, if b {
+      "true"
+    } else {
+      "false"
+    })
+    EChar(c) -> fmt_emit(s0, string_concat_all(["'", char_to_escaped(c), "'"]))
+    EStr(raw, _) -> fmt_emit(s0, raw)
+    EUnit -> fmt_emit(s0, "()")
+    EVar(name) -> fmt_emit(s0, name)
+    EUnder -> fmt_emit(s0, "_")
+    EPlaceholder -> fmt_emit(s0, ".")
+    EHole(opt) -> match opt {
+      None -> fmt_emit(s0, "?")
+      Some(n) -> fmt_emit(s0, string_concat_all(["?", n]))
+    }
+    ETodo(msg) -> fmt_emit(s0, string_concat_all(["todo!(\"", msg, "\")"]))
+    EBang(inner) -> {
+      let s1 = fmt_expr_atom(inner, s0)
+      fmt_emit(s1, "!")
+    }
+    ECall(callee, call_args) -> fmt_call(callee, call_args, s0)
+    EField(obj, fld) -> {
+      let s1 = fmt_expr_atom(obj, s0)
+      let s2 = fmt_emit(s1, ".")
+      fmt_emit(s2, fld)
+    }
+    EIndex(obj, idx) -> {
+      let s1 = fmt_expr_atom(obj, s0)
+      let s2 = fmt_emit(s1, "[")
+      let s3 = fmt_expr(idx, s2)
+      fmt_emit(s3, "]")
+    }
+    EBinop(op, l, r) -> fmt_binop(op, l, r, s0)
+    EUnop(op, inner) -> {
+      let s1 = if op == "not" {
+        fmt_emit(s0, "not ")
+      } else {
+        fmt_emit(s0, op)
+      }
+      fmt_expr_atom(inner, s1)
+    }
+    EIf(c, then_e, else_opt) -> fmt_if(c, then_e, else_opt, s0)
+    EMatch(scrut, arms) -> fmt_match(scrut, arms, s0)
+    ELambda(params, body) -> fmt_lambda(params, body, s0)
+    ERecordLit(name, fields) -> fmt_record_lit(name, fields, s0)
+    EList(elems) -> fmt_list(elems, s0)
+    ERange(lo, hi, step) -> fmt_range(lo, hi, step, s0)
+    EBlock(stmts, tail) -> fmt_block(stmts, tail, s0)
+    EPipe(l, r) -> fmt_pipe(l, r, s0)
+    ELitUnit(_, _) -> fmt_panic_unsupported("unit-of-measure literals", e.line)
+    EHandle(_, _, _, _, _, _, _) -> fmt_panic_unsupported("effect handlers", e.line)
+    EVariantsOf(_, _) -> fmt_panic_unsupported("variants[T]()", e.line)
+    EModCall(m, fname) -> fmt_emit(s0, string_concat_all([m, ".", fname, "()"]))
+  }
+}
+
+# Atomic-or-paren wrapper: if `e` would print as a non-atomic
+# expression at the top level (binop, lambda, match, if, pipe), wrap
+# in parens. Used for sub-expressions of a call / field / index where
+# precedence matters.
+fn fmt_expr_atom(e: Expr, s: FmtSt) : FmtSt {
+  if expr_is_atomic(e) {
+    fmt_expr(e, s)
+  } else {
+    let s1 = fmt_emit(s, "(")
+    let s2 = fmt_expr(e, s1)
+    fmt_emit(s2, ")")
+  }
+}
+
+fn expr_is_atomic(e: Expr) : Bool {
+  match e.kind {
+    EInt(_) -> true
+    EReal(_) -> true
+    EBool(_) -> true
+    EChar(_) -> true
+    EStr(_, _) -> true
+    EUnit -> true
+    EVar(_) -> true
+    EUnder -> true
+    EPlaceholder -> true
+    EHole(_) -> true
+    ETodo(_) -> true
+    ECall(_, _) -> true
+    EField(_, _) -> true
+    EIndex(_, _) -> true
+    ERecordLit(_, _) -> true
+    EList(_) -> true
+    EBlock(_, _) -> true
+    ERange(_, _, _) -> 
+    # `[lo..hi]` form prints as a self-bounded literal, no paren needed.
+    true
+    _ -> false
+  }
+}
+
+fn fmt_ascii_table() : String = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+fn fmt_char_to_str(c: Char) : String {
+  let n = char_to_int(c)
+  if (n >= 32) and (n <= 126) {
+    string_slice(fmt_ascii_table(), n - 32, 1)
+  } else {
+    "?"
+  }
+}
+
+fn char_to_escaped(c: Char) : String {
+  let n = char_to_int(c)
+  if n == 10 {
+    "\\n"
+  } else if n == 9 {
+    "\\t"
+  } else if n == 13 {
+    "\\r"
+  } else if n == 92 {
+    "\\\\"
+  } else if n == 39 {
+    "\\'"
+  } else {
+    fmt_char_to_str(c)
+  }
+}
+
+fn fmt_call(callee: Expr, call_args: [Expr], s: FmtSt) : FmtSt {
+  let s1 = fmt_expr_atom(callee, s)
+  let s2 = fmt_emit(s1, "(")
+  let s3 = fmt_call_args(call_args, s2)
+  fmt_emit(s3, ")")
+}
+
+fn fmt_call_args(call_args: [Expr], s: FmtSt) : FmtSt {
+  match call_args {
+    [] -> s
+    [a] -> fmt_expr(a, s)
+    [a, ...rest] -> {
+      let s1 = fmt_expr(a, s)
+      let s2 = fmt_emit(s1, ", ")
+      fmt_call_args(rest, s2)
+    }
+  }
+}
+
+fn fmt_binop(op: String, l: Expr, r: Expr, s: FmtSt) : FmtSt {
+  let s1 = fmt_expr_atom(l, s)
+  let s2 = fmt_emit(s1, " ")
+  let s3 = fmt_emit(s2, op)
+  let s4 = fmt_emit(s3, " ")
+  fmt_expr_atom(r, s4)
+}
+
+fn fmt_if(c: Expr, then_e: Expr, else_opt: Option[Expr], s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, "if ")
+  let s2 = fmt_expr(c, s1)
+  let s3 = fmt_emit(s2, " ")
+  let s4 = fmt_brace_body(then_e, s3)
+  match else_opt {
+    None -> s4
+    Some(e) -> {
+      let s5 = fmt_emit(s4, " else ")
+      match e.kind {
+        EIf(_, _, _) -> fmt_expr(e, s5)
+        _ -> fmt_brace_body(e, s5)
+      }
+    }
+  }
+}
+
+# Wrap a non-block expression in `{ ... }`; pass-through if already a
+# block.
+fn fmt_brace_body(e: Expr, s: FmtSt) : FmtSt {
+  match e.kind {
+    EBlock(_, _) -> fmt_expr(e, s)
+    _ -> {
+      let s1 = fmt_emit(s, "{ ")
+      let s2 = fmt_expr(e, s1)
+      fmt_emit(s2, " }")
+    }
+  }
+}
+
+fn fmt_match(scrut: Expr, arms: [Arm], s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, "match ")
+  let s2 = fmt_expr(scrut, s1)
+  let s3 = fmt_emit(s2, " {")
+  let s4 = fmt_newline(s3)
+  let s5 = fmt_indent_in(s4)
+  let s6 = fmt_arms(arms, s5)
+  let s7 = fmt_indent_out(s6)
+  fmt_emit(s7, "}")
+}
+
+fn fmt_arms(arms: [Arm], s: FmtSt) : FmtSt {
+  match arms {
+    [] -> s
+    [a, ...rest] -> {
+      let s1 = fmt_arm(a, s)
+      let s2 = fmt_newline(s1)
+      fmt_arms(rest, s2)
+    }
+  }
+}
+
+fn fmt_arm(a: Arm, s: FmtSt) : FmtSt {
+  match a {
+    Arm(pat, guard, body) -> {
+      let s1 = fmt_pat(pat, s)
+      let s2 = match guard {
+        None -> s1
+        Some(g) -> {
+          let a1 = fmt_emit(s1, " if ")
+          fmt_expr(g, a1)
+        }
+      }
+      let s3 = fmt_emit(s2, " -> ")
+      fmt_expr(body, s3)
+    }
+  }
+}
+
+fn fmt_lambda(params: [Param], body: Expr, s: FmtSt) : FmtSt {
+  let s1 = match params {
+    [p] -> fmt_lambda_param(p, s)
+    _ -> {
+      let a = fmt_emit(s, "(")
+      let b = fmt_lambda_params(params, a)
+      fmt_emit(b, ")")
+    }
+  }
+  let s2 = fmt_emit(s1, " => ")
+  fmt_expr(body, s2)
+}
+
+fn fmt_lambda_params(ps: [Param], s: FmtSt) : FmtSt {
+  match ps {
+    [] -> s
+    [p] -> fmt_lambda_param(p, s)
+    [p, ...rest] -> {
+      let s1 = fmt_lambda_param(p, s)
+      let s2 = fmt_emit(s1, ", ")
+      fmt_lambda_params(rest, s2)
+    }
+  }
+}
+
+fn fmt_lambda_param(p: Param, s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, p.pname)
+  match p.ptype {
+    None -> s1
+    Some(t) -> {
+      let a = fmt_emit(s1, ": ")
+      fmt_type(t, a)
+    }
+  }
+}
+
+fn fmt_record_lit(name: String, fields: [FieldInit], s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, name)
+  let s2 = fmt_emit(s1, " { ")
+  let s3 = fmt_record_fields(fields, s2)
+  fmt_emit(s3, " }")
+}
+
+fn fmt_record_fields(fs: [FieldInit], s: FmtSt) : FmtSt {
+  match fs {
+    [] -> s
+    [f] -> fmt_record_field(f, s)
+    [f, ...rest] -> {
+      let s1 = fmt_record_field(f, s)
+      let s2 = fmt_emit(s1, ", ")
+      fmt_record_fields(rest, s2)
+    }
+  }
+}
+
+fn fmt_record_field(f: FieldInit, s: FmtSt) : FmtSt {
+  match f {
+    FI(name, e) -> {
+      let s1 = fmt_emit(s, name)
+      let s2 = fmt_emit(s1, ": ")
+      fmt_expr(e, s2)
+    }
+  }
+}
+
+fn fmt_list(elems: [ListElem], s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, "[")
+  let s2 = fmt_list_elems(elems, s1)
+  fmt_emit(s2, "]")
+}
+
+fn fmt_list_elems(es: [ListElem], s: FmtSt) : FmtSt {
+  match es {
+    [] -> s
+    [e] -> fmt_list_elem(e, s)
+    [e, ...rest] -> {
+      let s1 = fmt_list_elem(e, s)
+      let s2 = fmt_emit(s1, ", ")
+      fmt_list_elems(rest, s2)
+    }
+  }
+}
+
+fn fmt_list_elem(e: ListElem, s: FmtSt) : FmtSt {
+  match e {
+    ElPlain(x) -> fmt_expr(x, s)
+    ElSpread(x) -> {
+      let s1 = fmt_emit(s, "...")
+      fmt_expr(x, s1)
+    }
+  }
+}
+
+fn fmt_range(lo: Expr, hi: Expr, step: Option[Expr], s: FmtSt) : FmtSt {
+  # `..` only parses in select contexts when bare; the `[ ]` form is
+  # accepted everywhere a list literal is, so we canonicalise to it.
+  let s0 = fmt_emit(s, "[")
+  let s1 = fmt_expr_atom(lo, s0)
+  let s2 = fmt_emit(s1, "..")
+  let s3 = fmt_expr_atom(hi, s2)
+  let s4 = match step {
+    None -> s3
+    Some(st) -> {
+      let a = fmt_emit(s3, " by ")
+      fmt_expr_atom(st, a)
+    }
+  }
+  fmt_emit(s4, "]")
+}
+
+fn fmt_block(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, "{")
+  let s2 = fmt_newline(s1)
+  let s3 = fmt_indent_in(s2)
+  let s4 = fmt_block_inner(stmts, tail, s3)
+  let s5 = fmt_indent_out(s4)
+  fmt_emit(s5, "}")
+}
+
+fn fmt_block_inner(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt {
+  let s1 = fmt_stmts(stmts, s)
+  match tail {
+    None -> s1
+    Some(e) -> {
+      let s2 = if s1.at_line_start {
+        s1
+      } else {
+        fmt_newline(s1)
+      }
+      let s3 = fmt_drain_before(s2, e.line)
+      let s4 = fmt_expr(e, s3)
+      if s4.at_line_start {
+        s4
+      } else {
+        fmt_newline(s4)
+      }
+    }
+  }
+}
+
+fn fmt_stmts(stmts: [Stmt], s: FmtSt) : FmtSt {
+  match stmts {
+    [] -> s
+    [st, ...rest] -> {
+      let s1 = fmt_drain_before(s, stmt_line(st))
+      let s2 = fmt_stmt(st, s1)
+      let s3 = if s2.at_line_start {
+        s2
+      } else {
+        fmt_newline(s2)
+      }
+      fmt_stmts(rest, s3)
+    }
+  }
+}
+
+fn stmt_line(st: Stmt) : Int {
+  match st {
+    SLet(p, _, _) -> p.line
+    SAssert(e, _) -> e.line
+    SExprStmt(e) -> e.line
+    SIndexAssign(_, _, _, line, _) -> line
+    SVar(_, _, _, line, _) -> line
+    SUse(_, line, _) -> line
+  }
+}
+
+fn fmt_stmt(st: Stmt, s: FmtSt) : FmtSt {
+  match st {
+    SLet(pat, ty_opt, e) -> {
+      let s1 = fmt_emit(s, "let ")
+      let s2 = fmt_pat(pat, s1)
+      let s3 = match ty_opt {
+        None -> s2
+        Some(t) -> {
+          let a = fmt_emit(s2, ": ")
+          fmt_type(t, a)
+        }
+      }
+      let s4 = fmt_emit(s3, " = ")
+      fmt_expr(e, s4)
+    }
+    SAssert(e, _) -> {
+      let s1 = fmt_emit(s, "assert ")
+      fmt_expr(e, s1)
+    }
+    SExprStmt(e) -> fmt_expr(e, s)
+    SIndexAssign(_, _, _, l, _) -> fmt_panic_unsupported("`a[i] := v`", l)
+    SVar(_, _, _, l, _) -> fmt_panic_unsupported("`var` bindings", l)
+    SUse(_, l, _) -> fmt_panic_unsupported("block-level `use`", l)
+  }
+}
+
+# ---- patterns -------------------------------------------------------
+
+fn fmt_pat(p: Pattern, s: FmtSt) : FmtSt {
+  match p.pkind {
+    PWild -> fmt_emit(s, "_")
+    PLit(e) -> fmt_expr(e, s)
+    PBind(name) -> fmt_emit(s, name)
+    PList(subs, rest) -> {
+      let s1 = fmt_emit(s, "[")
+      let s2 = fmt_pat_list(subs, s1)
+      let s3 = match rest {
+        None -> s2
+        Some(name) -> {
+          let a = if list_is_empty(subs) {
+            s2
+          } else {
+            fmt_emit(s2, ", ")
+          }
+          fmt_emit(a, string_concat_all(["...", name]))
+        }
+      }
+      fmt_emit(s3, "]")
+    }
+    PVariant(name, subs) -> {
+      let s1 = fmt_emit(s, name)
+      if list_is_empty(subs) {
+        s1
+      } else {
+        let s2 = fmt_emit(s1, "(")
+        let s3 = fmt_pat_list(subs, s2)
+        fmt_emit(s3, ")")
+      }
+    }
+    PVariantRecord(name, fields) -> {
+      let s1 = fmt_emit(s, name)
+      let s2 = fmt_emit(s1, " { ")
+      let s3 = fmt_pfields(fields, s2)
+      fmt_emit(s3, " }")
+    }
+    PRecord(fields) -> {
+      let s1 = fmt_emit(s, "{ ")
+      let s2 = fmt_pfields(fields, s1)
+      fmt_emit(s2, " }")
+    }
+    PHole(opt) -> match opt {
+      None -> fmt_emit(s, "?")
+      Some(n) -> fmt_emit(s, string_concat_all(["?", n]))
+    }
+    PAs(name, sub) -> {
+      let s1 = fmt_emit(s, name)
+      let s2 = fmt_emit(s1, " @ ")
+      fmt_pat(sub, s2)
+    }
+  }
+}
+
+fn fmt_pat_list(ps: [Pattern], s: FmtSt) : FmtSt {
+  match ps {
+    [] -> s
+    [p] -> fmt_pat(p, s)
+    [p, ...rest] -> {
+      let s1 = fmt_pat(p, s)
+      let s2 = fmt_emit(s1, ", ")
+      fmt_pat_list(rest, s2)
+    }
+  }
+}
+
+fn fmt_pfields(fs: [PField], s: FmtSt) : FmtSt {
+  match fs {
+    [] -> s
+    [f] -> fmt_pfield(f, s)
+    [f, ...rest] -> {
+      let s1 = fmt_pfield(f, s)
+      let s2 = fmt_emit(s1, ", ")
+      fmt_pfields(rest, s2)
+    }
+  }
+}
+
+fn fmt_pfield(pf: PField, s: FmtSt) : FmtSt {
+  match pf {
+    PField(name, sub, is_short) -> {
+      if is_short {
+        fmt_emit(s, name)
+      } else {
+        let s1 = fmt_emit(s, name)
+        let s2 = fmt_emit(s1, ": ")
+        fmt_pat(sub, s2)
+      }
+    }
+  }
+}
+
+# ---- pipes ----------------------------------------------------------
+
+fn fmt_pipe(l: Expr, r: Expr, s: FmtSt) : FmtSt {
+  # `|>` is left-associative — `a |> b |> c` parses as
+  # `EPipe(EPipe(a, b), c)`, so a left-leaning EPipe needs no parens.
+  let s1 = match l.kind {
+    EPipe(_, _) -> fmt_expr(l, s)
+    _ -> fmt_expr_atom(l, s)
+  }
+  let s2 = fmt_emit(s1, " |> ")
+  fmt_expr_atom(r, s2)
+}
+
+# ---- helpers --------------------------------------------------------
+
+fn list_is_empty(xs: [a]) : Bool {
+  match xs {
+    [] -> true
+    _ -> false
+  }
+}
 # ====================================================================
 # cli + driver
 # ====================================================================
@@ -31156,6 +32338,12 @@ type Mode
   # Debug-only; lets fixtures pin the walker output before the
   # unifier reshape consumes it.
   | MDumpIntervals
+  # Tongariki: pretty-print the parsed program back as canonical
+  # kaikai source. MFmt writes formatted source to stdout; MFmtCheck
+  # prints the formatted source if it differs from input (exit 1)
+  # and otherwise emits nothing (exit 0).
+  | MFmt
+  | MFmtCheck
 
 type CliOptions = { mode: Mode, path: Option[String], preludes: [String],
                     strict_holes: Bool, search_paths: [String] }
@@ -31220,6 +32408,10 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_strict_holes(opts))
       } else if a == "--emit=llvm" {
         parse_cli_loop(more, cli_with_mode(opts, MEmitLlvm))
+      } else if a == "--fmt" {
+        parse_cli_loop(more, cli_with_mode(opts, MFmt))
+      } else if a == "--fmt-check" {
+        parse_cli_loop(more, cli_with_mode(opts, MFmtCheck))
       } else if a == "--test" {
         parse_cli_loop(more, cli_with_mode(opts, MTest))
       } else if a == "-h" or a == "--help" {
@@ -31274,6 +32466,8 @@ fn usage() : Unit / Console {
   eprint("  --effect-holes-json  report typed effect-hole resolutions (`?` / `?e` in row tail) as JSON")
   eprint("  --strict-holes     treat every unfilled hole as a compilation error (default: warning)")
   eprint("  --emit=llvm        emit LLVM IR (.ll) instead of C; link with stage0/runtime_llvm.c")
+  eprint("  --fmt              pretty-print canonical kaikai source to stdout (Tongariki)")
+  eprint("  --fmt-check        write formatted source to stdout iff different from input; exit 1")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
   eprint("  -h, --help         this help")
   eprint("  -V, --version      print version and exit")
@@ -31850,7 +33044,24 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
         let parsed = parse_program(path, src, tokens)
         match parsed.decls {
           None -> 1
-          Some(own_decls) -> {
+          Some(own_decls) -> match mode {
+            # Tongariki — `kai fmt`. Pretty-print right after parse,
+            # before any desugaring runs, so the formatted output
+            # mirrors the source as written (`var x = 1` stays
+            # `var x = 1`, not its handle-State desugaring). Short-
+            # circuit before the heavy semantic pipeline. MFmt prints
+            # to stdout; MFmtCheck prints iff different and exits 1.
+            MFmt -> {
+              let cmts = collect_comments(src, tokens)
+              print(fmt_program(own_decls, cmts))
+              0
+            }
+            MFmtCheck -> {
+              let cmts = collect_comments(src, tokens)
+              let formatted = fmt_program(own_decls, cmts)
+              if formatted == src { 0 } else { print(formatted); 1 }
+            }
+            _ -> {
             # m7f §7: report any `import ?name` holes BEFORE
             # expand_imports walks the decls. The hole is inert
             # for module loading (process_imports treats IkHole as
@@ -32128,6 +33339,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   }
                 }
               }
+            }
             }
             }
             }

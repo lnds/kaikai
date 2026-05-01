@@ -120,6 +120,7 @@ Commands:
   build <file.kai> [-o <out>]   Compile a kaikai file to a native binary.
   run   <file.kai> [args...]    Build and execute; forwards remaining args.
   test  <file.kai>              Compile with --test and run the test binary.
+  fmt   <file.kai> [--check]    Pretty-print kaikai source canonically.
   help                          Show this help.
   --version                     Print version and demo baseline.
 
@@ -187,6 +188,37 @@ Options:
 Examples:
   kai test stage2/tests/test_lex.kai
   kai test demos/poker/poker.kai
+EOF
+}
+
+usage_fmt() {
+  cat <<EOF
+usage: kai fmt <file.kai>            # rewrite file in place
+       kai fmt --check <file.kai>    # exit 0 if formatted, 1 if not
+       kai fmt --stdin               # read stdin -> formatted to stdout
+
+Pretty-print kaikai source canonically. The formatter is gofmt-style:
+no options, single output, idempotent.
+
+Tongariki MVP scope: imports, simple fns, type decls, tests, and the
+base expression / pattern / type grammar (see CHANGELOG for the exact
+list). Files using effects, handlers, protocols, impls, units, dim
+types, refinements, axioms, generic fn / type parameters, var, or
+parametric effect rows are refused with an explicit error.
+
+Options:
+  --check      Do not modify the file. Exit 0 if already formatted; 1
+               otherwise. Print the formatted output to stdout when
+               different.
+  --stdin      Read kaikai source from stdin; write formatted source
+               to stdout. The file form (kai fmt <file>) rewrites the
+               file in place; this form is for editor integrations.
+  -h, --help   Show this help.
+
+Examples:
+  kai fmt stage2/compiler.kai
+  kai fmt --check src/foo.kai && echo OK
+  cat src/foo.kai | kai fmt --stdin > /tmp/foo-fmt.kai
 EOF
 }
 
@@ -287,10 +319,70 @@ cmd_test() {
   "$bin"
 }
 
+# kai fmt — pretty-print kaikai source canonically.
+#
+# Three input modes:
+#   kai fmt <file>             -> rewrite <file> in place
+#   kai fmt --check <file>     -> exit 1 if <file> would change, else 0;
+#                                  print formatted text to stdout when
+#                                  different (matches `gofmt -l` spirit
+#                                  but with the diff in the body).
+#   kai fmt --stdin            -> read stdin, write formatted to stdout.
+#
+# The formatter is implemented as a `kaic2 --fmt` (or `--fmt-check`)
+# subcommand. The driver does NOT pass `--prelude` flags here — fmt
+# runs at the source-text level and never resolves names; the prelude
+# would only slow the parse and the unsupported-check.
+cmd_fmt() {
+  src=""; mode_check=""; stdin_mode=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_fmt; return 0 ;;
+      --check)   mode_check=1; shift ;;
+      --stdin)   stdin_mode=1; shift ;;
+      -*)        die "unknown flag: $1 (see 'kai fmt --help')" ;;
+      *)         [ -z "$src" ] || die "only one input file supported"
+                 src="$1"; shift ;;
+    esac
+  done
+  ensure_built
+
+  if [ -n "$stdin_mode" ]; then
+    [ -z "$src" ] || die "--stdin takes no file argument"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT INT TERM
+    cat > "$tmp/in.kai"
+    "$KAIC2" --fmt "$tmp/in.kai"
+    return $?
+  fi
+
+  [ -n "$src" ] || die "missing input file (see 'kai fmt --help')"
+  [ -f "$src" ] || die_file_not_found "$src" "fmt"
+
+  if [ -n "$mode_check" ]; then
+    "$KAIC2" --fmt-check "$src"
+    return $?
+  fi
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  if "$KAIC2" --fmt "$src" > "$tmp/out.kai"; then
+    # Only write back when the formatted text differs (avoids touching
+    # the file mtime on a no-op).
+    if ! cmp -s "$src" "$tmp/out.kai"; then
+      cat "$tmp/out.kai" > "$src"
+    fi
+  else
+    cat "$tmp/out.kai" >&2 2>/dev/null || true
+    return 1
+  fi
+}
+
 case "${1:-}" in
   build)     shift; cmd_build "$@" ;;
   run)       shift; cmd_run   "$@" ;;
   test)      shift; cmd_test  "$@" ;;
+  fmt)       shift; cmd_fmt   "$@" ;;
   help|-h|--help) usage ;;
   --version|-V) print_version ;;
   "")        usage >&2; exit 2 ;;
