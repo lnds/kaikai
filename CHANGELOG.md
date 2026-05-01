@@ -52,6 +52,14 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   - LLVM backend currently emits a normal call when it
     sees the sentinel; TCO via the LLVM `tail` marker is
     a separate lane (issue #37 non-goals).
+  - New `examples/tco/main.kai` fixture +
+    `make -C stage2 test-tco` target verify the rewrite
+    end-to-end: `count_down(50_000_000)` would consume
+    ~3 GiB of C-stack at no-TCO (50 M frames × ~60 B),
+    far past the runtime's 256 MiB bump; with the rewrite
+    it runs in O(1) C-stack and exits cleanly. Wired into
+    `make test`, so the regression gate is part of every
+    PR's `tier1` run.
 
 ### Notes
 
