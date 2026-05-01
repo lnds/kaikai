@@ -116,6 +116,12 @@ typedef struct {
 
     LocalScope    locals;
     LocalUseTable uses;     /* current fn's local-binding use counts; cleared between fns */
+
+    /* Issue #42 — TCO state. `cur_fn` is the N_FN node currently
+     * being emitted, so emit_call can reach the parameter list
+     * when lowering a marked tail-self-call to a rebind+goto block.
+     * NULL outside emit_fn_body. */
+    Node *cur_fn;
 } E;
 
 /* ---------- local scope ---------- */
@@ -384,8 +390,15 @@ static void count_local_uses_in_string(E *e, Node *s, int in_lambda) {
 
 /* ---------- forwards ---------- */
 
+/* Issue #42 — TCO bit on N_CALL: set by tco_mark when a call sits in
+ * tail position of the enclosing fn and targets the same fn with the
+ * same arity. emit_call recognises the bit and emits a rebind+goto
+ * block. The label `_kai_<name>_entry:;` is planted by emit_fn_body. */
+#define TCO_TAIL_CALL 0x1
+
 static void emit_expr(E *e, Node *n);
 static void emit_stmt(E *e, Node *n);
+static void emit_tco_goto(E *e, Node *call);
 static void emit_pat_test(E *e, Node *pat, const char *scr);
 /* `is_alias` = the scrutinee shares storage with its producer (variant args,
  * cons head/tail). PBind/PAs emit `kai_incref(scr)` so the binding has its
@@ -839,6 +852,10 @@ static void emit_variant_construction(E *e, const char *name, size_t name_len,
 }
 
 static void emit_call(E *e, Node *n) {
+    if ((n->v.flags & TCO_TAIL_CALL) && e->cur_fn) {
+        emit_tco_goto(e, n);
+        return;
+    }
     Node *callee = n->children[0];
     if (callee && callee->kind == N_IDENT) {
         int arity = 0;
@@ -1474,6 +1491,262 @@ static void emit_stmt(E *e, Node *n) {
 
 /* ---------- declarations ---------- */
 
+/* ---------- m37 / TCO — self-tail-call rewrite (issue #42) --------
+ *
+ * Stage-0 mirror of the rewrite implemented in stage 1 / stage 2's
+ * compiler.kai. Goal: kaic1's binary (which kaic0 emits) uses
+ * `goto _kai_<name>_entry` for self-tail-recursive fns so the
+ * bootstrap chain on Linux's 8 MiB main-thread stack survives
+ * lexing the ~33 k tokens of stage2/compiler.kai without the
+ * RLIMIT_STACK runtime constructor.
+ *
+ * Approach: a pre-emit pass walks the fn body, marks every
+ * tail-position N_CALL whose callee is the enclosing fn (matched
+ * by name, with the right arity, not shadowed by a local
+ * binding), and emit_call recognises the marker on its way out.
+ * The label `_kai_<name>_entry:;` is planted by emit_fn_body
+ * only when at least one call was marked, so non-recursive fns
+ * keep their byte-identical output.
+ *
+ * Tail position propagates through:
+ *   - N_IF then / else branches
+ *   - N_MATCH arm bodies
+ *   - N_BLOCK trailing value
+ * It does NOT propagate through N_LAMBDA bodies (different fn),
+ * N_CALL args, N_PIPE, N_BINOP, N_UNOP, etc.
+ *
+ * Refcount discipline at the goto site mirrors the stage 1 / 2
+ * port: for each parameter, drop the slot iff the slot would
+ * still own a ref at the wrap's natural exit. In stage 0 that
+ * is captured by emit_ident_value's single-use predicate
+ * (`total_count == 1 && lambda_count == 0` → bare emit, ref
+ * already transferred; otherwise → kai_internal_dup wrap, slot
+ * retains ref). Drop is therefore the negation of that predicate. */
+
+typedef struct {
+    const char **names;   /* borrowed from source, never freed */
+    size_t      *lens;
+    size_t       n, cap;
+} TcoShadows;
+
+static void tcs_push(TcoShadows *s, const char *name, size_t len) {
+    if (s->n == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 8;
+        s->names = (const char **) realloc(s->names, s->cap * sizeof(*s->names));
+        s->lens  = (size_t *)       realloc(s->lens,  s->cap * sizeof(*s->lens));
+    }
+    s->names[s->n] = name;
+    s->lens[s->n]  = len;
+    s->n++;
+}
+
+static int tcs_has(TcoShadows *s, const char *name, size_t len) {
+    for (size_t i = 0; i < s->n; ++i) {
+        if (s->lens[i] == len && memcmp(s->names[i], name, len) == 0) return 1;
+    }
+    return 0;
+}
+
+static void tco_collect_pat_binds(TcoShadows *s, Node *pat) {
+    if (!pat) return;
+    switch (pat->kind) {
+        case N_PAT_BIND:
+            tcs_push(s, pat->name, pat->name_len);
+            break;
+        case N_PAT_LIST:
+        case N_PAT_VARIANT:
+        case N_PAT_RECORD:
+            for (size_t i = 0; i < pat->n_children; ++i)
+                tco_collect_pat_binds(s, pat->children[i]);
+            break;
+        case N_PAT_FIELD: {
+            int shorthand = (pat->v.flags & 0x1) != 0;
+            if (pat->n_children >= 1) tco_collect_pat_binds(s, pat->children[0]);
+            else if (shorthand) tcs_push(s, pat->name, pat->name_len);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static int tco_walk_tail(TcoShadows *s, Node *body,
+                         const char *name, size_t name_len, int arity);
+
+static int tco_walk_block_tail(TcoShadows *s, Node *body,
+                               const char *name, size_t name_len, int arity) {
+    int has_value = (body->v.flags & 0x1) != 0;
+    if (!has_value || body->n_children == 0) return 0;
+    size_t mark = s->n;
+    for (size_t i = 0; i + 1 < body->n_children; ++i) {
+        Node *st = body->children[i];
+        if (st && st->kind == N_LET) {
+            Node *pat = st->children[0];
+            tco_collect_pat_binds(s, pat);
+        }
+    }
+    int hit = tco_walk_tail(s, body->children[body->n_children - 1],
+                            name, name_len, arity);
+    s->n = mark;
+    return hit;
+}
+
+static int tco_walk_match_arms(TcoShadows *s, Node *m,
+                               const char *name, size_t name_len, int arity) {
+    for (size_t i = 1; i < m->n_children; ++i) {
+        Node *arm = m->children[i];
+        if (!arm || arm->kind != N_ARM || arm->n_children == 0) continue;
+        size_t mark = s->n;
+        Node *pat  = arm->children[0];
+        Node *body = arm->children[arm->n_children - 1];
+        tco_collect_pat_binds(s, pat);
+        int hit = tco_walk_tail(s, body, name, name_len, arity);
+        s->n = mark;
+        if (hit) return 1;
+    }
+    return 0;
+}
+
+static int tco_walk_tail(TcoShadows *s, Node *body,
+                         const char *name, size_t name_len, int arity) {
+    if (!body) return 0;
+    switch (body->kind) {
+        case N_CALL: {
+            if (body->n_children == 0) return 0;
+            Node *callee = body->children[0];
+            if (!callee || callee->kind != N_IDENT) return 0;
+            if (callee->name_len != name_len) return 0;
+            if (memcmp(callee->name, name, name_len) != 0) return 0;
+            if (tcs_has(s, name, name_len)) return 0;
+            if ((int) (body->n_children - 1) != arity) return 0;
+            return 1;
+        }
+        case N_IF: {
+            if (body->n_children < 2) return 0;
+            int has_else = (body->v.flags & 0x1) != 0;
+            if (tco_walk_tail(s, body->children[1], name, name_len, arity)) return 1;
+            if (has_else && body->n_children >= 3 &&
+                tco_walk_tail(s, body->children[2], name, name_len, arity)) return 1;
+            return 0;
+        }
+        case N_MATCH:
+            return tco_walk_match_arms(s, body, name, name_len, arity);
+        case N_BLOCK:
+            return tco_walk_block_tail(s, body, name, name_len, arity);
+        default:
+            return 0;
+    }
+}
+
+static void tco_mark_block_tail(TcoShadows *s, Node *body,
+                                const char *name, size_t name_len, int arity);
+static void tco_mark_match_arms(TcoShadows *s, Node *m,
+                                const char *name, size_t name_len, int arity);
+
+static void tco_mark(TcoShadows *s, Node *body,
+                     const char *name, size_t name_len, int arity) {
+    if (!body) return;
+    switch (body->kind) {
+        case N_CALL: {
+            if (body->n_children == 0) return;
+            Node *callee = body->children[0];
+            if (!callee || callee->kind != N_IDENT) return;
+            if (callee->name_len != name_len) return;
+            if (memcmp(callee->name, name, name_len) != 0) return;
+            if (tcs_has(s, name, name_len)) return;
+            if ((int) (body->n_children - 1) != arity) return;
+            body->v.flags |= TCO_TAIL_CALL;
+            return;
+        }
+        case N_IF: {
+            if (body->n_children < 2) return;
+            int has_else = (body->v.flags & 0x1) != 0;
+            tco_mark(s, body->children[1], name, name_len, arity);
+            if (has_else && body->n_children >= 3)
+                tco_mark(s, body->children[2], name, name_len, arity);
+            return;
+        }
+        case N_MATCH:
+            tco_mark_match_arms(s, body, name, name_len, arity);
+            return;
+        case N_BLOCK:
+            tco_mark_block_tail(s, body, name, name_len, arity);
+            return;
+        default:
+            return;
+    }
+}
+
+static void tco_mark_match_arms(TcoShadows *s, Node *m,
+                                const char *name, size_t name_len, int arity) {
+    for (size_t i = 1; i < m->n_children; ++i) {
+        Node *arm = m->children[i];
+        if (!arm || arm->kind != N_ARM || arm->n_children == 0) continue;
+        size_t mark = s->n;
+        Node *pat  = arm->children[0];
+        Node *body = arm->children[arm->n_children - 1];
+        tco_collect_pat_binds(s, pat);
+        tco_mark(s, body, name, name_len, arity);
+        s->n = mark;
+    }
+}
+
+static void tco_mark_block_tail(TcoShadows *s, Node *body,
+                                const char *name, size_t name_len, int arity) {
+    int has_value = (body->v.flags & 0x1) != 0;
+    if (!has_value || body->n_children == 0) return;
+    size_t mark = s->n;
+    for (size_t i = 0; i + 1 < body->n_children; ++i) {
+        Node *st = body->children[i];
+        if (st && st->kind == N_LET) {
+            Node *pat = st->children[0];
+            tco_collect_pat_binds(s, pat);
+        }
+    }
+    tco_mark(s, body->children[body->n_children - 1], name, name_len, arity);
+    s->n = mark;
+}
+
+/* Emit the rebind+goto block for a tail-self-call N_CALL. The
+ * statement-expression yields `(KaiValue *)0` after the goto so it
+ * can sit inside the `return ({ ... });` shape the surrounding
+ * emit produces. */
+static void emit_tco_goto(E *e, Node *call) {
+    Node *fn = e->cur_fn;
+    fputs("({ ", e->out);
+    /* 1. Args into _t<i> in declaration order. */
+    int i = 0;
+    for (size_t a = 1; a < call->n_children; ++a, ++i) {
+        fprintf(e->out, "KaiValue *_t%d = ", i);
+        emit_expr(e, call->children[a]);
+        fputs("; ", e->out);
+    }
+    /* 2. Drop old params whose slot still owns a ref. */
+    for (size_t j = 2; j < fn->n_children; ++j) {
+        Node *p = fn->children[j];
+        if (!p || p->kind != N_PARAM) continue;
+        LocalUse *u = lu_lookup(e, p);
+        int single_use = (u && u->total_count == 1 && u->lambda_count == 0);
+        if (!single_use) {
+            fprintf(e->out,
+                    "{ KaiValue *_ = kai_internal_drop(kai_%.*s); (void) _; } ",
+                    (int) p->name_len, p->name);
+        }
+    }
+    /* 3. Rebind kai_<pname> = _t<i> in declaration order. */
+    int p_idx = 0;
+    for (size_t j = 2; j < fn->n_children; ++j) {
+        Node *p = fn->children[j];
+        if (!p || p->kind != N_PARAM) continue;
+        fprintf(e->out, "kai_%.*s = _t%d; ",
+                (int) p->name_len, p->name, p_idx);
+        ++p_idx;
+    }
+    /* 4. Goto entry. */
+    fprintf(e->out, "goto _kai_%.*s_entry; (KaiValue *)0; })",
+            (int) fn->name_len, fn->name);
+}
+
 static void emit_fn_signature(E *e, Node *fn) {
     fprintf(e->out, "static KaiValue *kai_%.*s(", (int) fn->name_len, fn->name);
     int first = 1;
@@ -1490,7 +1763,36 @@ static void emit_fn_signature(E *e, Node *fn) {
 
 static void emit_fn_body(E *e, Node *fn) {
     emit_fn_signature(e, fn);
-    fputs(" {\n    return ", e->out);
+
+    /* Issue #42 — pre-emit pass: detect tail-self-calls in `body`
+     * and mark them with TCO_TAIL_CALL so emit_call lowers each
+     * one to a rebind+goto block. The label `_kai_<name>_entry:;`
+     * is planted only when at least one call was marked, so
+     * non-recursive fns keep their byte-identical output. */
+    int arity = 0;
+    for (size_t i = 2; i < fn->n_children; ++i) {
+        Node *p = fn->children[i];
+        if (p && p->kind == N_PARAM) arity++;
+    }
+    Node *body = fn->children[1];
+    int has_tco = 0;
+    {
+        TcoShadows s = { NULL, NULL, 0, 0 };
+        if (tco_walk_tail(&s, body, fn->name, fn->name_len, arity)) {
+            tco_mark(&s, body, fn->name, fn->name_len, arity);
+            has_tco = 1;
+        }
+        free(s.names);
+        free(s.lens);
+    }
+
+    if (has_tco) {
+        fprintf(e->out, " {\n    _kai_%.*s_entry:;\n    return ",
+                (int) fn->name_len, fn->name);
+    } else {
+        fputs(" {\n    return ", e->out);
+    }
+    e->cur_fn = fn;
     ls_push_mark(e);
     lu_clear(e);
     for (size_t i = 2; i < fn->n_children; ++i) {
@@ -1508,9 +1810,10 @@ static void emit_fn_body(E *e, Node *fn) {
      * below then mirrors the same scope shape as it emits, and
      * emit_ident_value uses the resulting use counts to skip the
      * eager-dup wrap on single-use, non-captured bindings. */
-    count_local_uses(e, fn->children[1], 0);
-    emit_expr(e, fn->children[1]);
+    count_local_uses(e, body, 0);
+    emit_expr(e, body);
     ls_pop_mark(e);
+    e->cur_fn = NULL;
     fputs(";\n}\n\n", e->out);
 }
 
