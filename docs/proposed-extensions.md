@@ -43,7 +43,7 @@ on.
 | `!` postfix — `Option` / `Result` propagation | landed m7e §13 | `Option` / `Result` in prelude |
 | `@` as-pattern in `match`                  | landed m7d   | parser                 |
 | `?.` optional chaining                     | proposed     | parser + type checker   |
-| Bit ops (`bit.and` / `bit.or` / `bit.shl` / ...) | scheduled m13 | stdlib module + intrinsic recognition |
+| Bit ops (`bit.and` / `bit.or` / `bit.shl` / ...) | landed m13 (flat + dotted) | typer's intrinsic table + `rqc_kind` rewrite |
 | `Map[K, V]` + `m["key"]` indexing          | proposed     | collection design       |
 | Slice syntax `a[i..j]`                     | proposed     | `Vector[T]` landing     |
 | Method references as values (`obj.method`) | scheduled m7f | parser + brand machinery |
@@ -970,14 +970,23 @@ recognises the names directly). Fixture and structural assertion
 in `examples/stdlib/bits_basic.kai` plus `stage2/Makefile`
 `test-stdlib`.
 
-The dotted `bit.*` surface and the auxiliary helpers
-(`leading_zeros`, `trailing_zeros`, `rotate_left`,
-`rotate_right`) remain open for a follow-up. `bit_count` covers
-the popcount slot. The dotted surface is one m14-style qualified
-namespace away — once a `bit` module is registered as a
-`ModuleEntry`, `bit.and(a, b)` resolves to the existing
-`bit_and` intrinsic via the prefix-fallback in
-`me_lookup_export`.
+**Dotted `bit.*` surface landed.** `bit.and(a, b)` /
+`bit.or(a, b)` / `bit.xor(a, b)` / `bit.not(a)` /
+`bit.shl(a, n)` / `bit.shr(a, n)` / `bit.ushr(a, n)` /
+`bit.count(a)` / `bit.test(a, n)` / `bit.set(a, n)` /
+`bit.clear(a, n)` / `bit.toggle(a, n)` are sugar for the
+flat-prefix names — `rqc_kind` rewrites
+`EField(EVar("bit"), fname)` to `EVar("bit_" ++ fname)` before
+the m14 ModuleEntry lookup, so the existing intrinsic path in
+`emit_call_expr` lowers each call inline with byte-identical C.
+The parser accepts `and` / `or` / `not` / `test` after `.` as
+field-name tokens (no other production consumes them in that
+position). Fixture `examples/stdlib/bits_dotted.kai`; the same
+operator-inlined assertion in `stage2/Makefile` `test-stdlib`
+covers both surfaces. The auxiliary helpers (`leading_zeros`,
+`trailing_zeros`, `rotate_left`, `rotate_right`, plus the
+ergonomic alias `bit.popcount` for `bit.count`) remain open for
+a future m13 chunk; `bit.count` covers the popcount slot.
 
 ## 17. `Map[K, V]` — hash-map / associative container
 
