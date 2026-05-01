@@ -218,6 +218,53 @@ After Tier 2, the kaikai CLAUDE.md claim "Tier 1 #2
 (runtime-efficient) holds" is verifiable: `leaked` < 5 M on
 self-compile, no footnote.
 
+### TCO half of Tier 1 #2 — landed 2026-04-30 (issue #37)
+
+The "Mandatory tail-call optimisation" half of Tier 1 #2 was
+the second hidden footnote: until 2026-04-30, the C the
+emitter generated wrapped each recursive call in a Perceus
+exit-drop statement-expression, which inhibited gcc / clang
+TCO at `-O2`. R5 (issue #34, PR #36) papered over the
+resulting Linux SEGV with a runtime `RLIMIT_STACK` bump but
+the underlying claim — "constant C-stack for kaikai
+self-tail-recursive fns" — remained aspirational.
+
+Issue #37 (this lane) lands the proper fix: a
+`tcrec_rewrite_decls` pass between unboxing and Perceus
+rewrites every self-tail-call's callee `EVar` into a
+`__kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...` sentinel; the
+C backend emits a rebind+goto block at each call site and
+plants `_kai_<c_sym>_entry:;` before the enclosing return.
+Verified empirically: `demos/build/euler4-bin` runs to
+completion under `ulimit -s 256` on macOS (the recursion
+depth is ~1 M, which would otherwise need ~100 MB of
+C-stack), and the runtime `RLIMIT_STACK` bump has been
+removed from `stage0/runtime.h`.
+
+Caveats that survive into a follow-up:
+
+- The rewrite lives in `stage2/compiler.kai`, so it covers
+  *emitted programs* (demos, kaic2's own selfhost output).
+  The bootstrap chain `kaic0 → kaic1 → kaic2` is built by
+  stage 0 / stage 1, whose emit still uses the recursive
+  shape, so the kaic2 binary's internal `lex_loop` etc.
+  remain stack-bound. The PR #36 `RLIMIT_STACK` constructor
+  in `stage0/runtime.h` therefore stays on until the rewrite
+  is mirrored into `stage1/compiler.kai` (and `stage0/emit.c`
+  audited). The honesty claim "Tier 1 #2 holds" applies to
+  *kaikai source programs*, not to the bootstrap chain.
+- Mutual tail-recursion (`f → g → f`) is out of scope —
+  v1 only rewrites self-recursive calls, not cross-fn.
+  Trampolining or whole-program analysis would be the
+  next step if the gap becomes load-bearing.
+- LLVM backend still emits a normal call when it sees the
+  sentinel — TCO via the LLVM `tail` marker is a separate
+  lane (issue #37 non-goals).
+- Fns with any `LUUnused` parameter keep the normal-call
+  shape, because the wrap's *entry* drops would re-fire
+  on each iteration of the goto loop. Hoisting entry
+  drops above the label is a follow-up.
+
 Tier 3 stays explicitly post-MVP. Reuse-in-place and unboxing
 are the right path eventually but they require type-system
 support (alias analysis, unboxed layout) that doesn't exist yet

@@ -9,6 +9,76 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **TCO via emitter goto-loop rewrite (issue #37 — fully
+  closes R5).** A new `tcrec_rewrite_decls` pass between
+  unboxing and Perceus identifies every self-recursive call
+  in tail position and rewrites the callee `EVar` into a
+  pipe-encoded sentinel
+  (`__kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...`). The C
+  backend recognises the sentinel and emits a rebind+goto
+  block instead of a normal `kai_<sym>(...)` call, with the
+  matching `_kai_<c_sym>_entry:;` label planted before the
+  enclosing `return ({ ... });`. Net result: every kaikai
+  self-tail-recursive fn now compiles to constant C-stack
+  space; the `call kai_search` → `jmp kai_search` flip that
+  R5 (issue #34) papered over with an `RLIMIT_STACK` bump
+  now happens at the source-to-C boundary instead.
+  - Conservative dropmask: a parameter is dropped in the
+    goto block when (i) `LUBlocked` or (ii) `LUAt` with
+    multi-use — exactly the criteria
+    `pcs_collect_exit_drops` uses, so the goto-path drops
+    match the wrap's exit drops byte-for-byte. Single-use
+    `LUAt` is *not* dropped: the read transfers ownership
+    and a goto-block drop after that transfer would
+    double-free.
+  - Known leak: in `list.nth(xs, i)`-shape fns the
+    single-use param (`xs`) is consumed by an enclosing
+    match scrutinee, and the goto skips that match's
+    `kai_decref(_scr)`. One cons cell leaks per goto
+    iteration. A more precise dropmask that distinguishes
+    "consumed in args" from "consumed elsewhere" was
+    bisected to a glibc-tcache abort during stage 2's
+    Linux selfhost (the precise scanner walked the args
+    AST and triggered a refcount imbalance somewhere in
+    stage 1's emit of recursive list traversal). The
+    precise version is parked as a follow-up to issue #37.
+  - Conservative bail-out: fns with any `LUUnused`
+    parameter keep the normal-call shape (the wrap's
+    *entry* drops would re-fire on each iteration and
+    free dangling pointers; entry-drop hoisting above the
+    label is a follow-up).
+  - LLVM backend currently emits a normal call when it
+    sees the sentinel; TCO via the LLVM `tail` marker is
+    a separate lane (issue #37 non-goals).
+  - New `examples/tco/main.kai` fixture +
+    `make -C stage2 test-tco` target verify the rewrite
+    end-to-end: `count_down(50_000_000)` would consume
+    ~3 GiB of C-stack at no-TCO (50 M frames × ~60 B),
+    far past the runtime's 256 MiB bump; with the rewrite
+    it runs in O(1) C-stack and exits cleanly. Wired into
+    `make test`, so the regression gate is part of every
+    PR's `tier1` run.
+
+### Notes
+
+- `kai_runtime_bump_stack_rlimit` (the PR #36 R5 band-aid) is
+  *retained* even though the kaic2 emit now produces O(1)-stack
+  goto-loops for self-tail-calls. Reason: the rewrite lives in
+  `stage2/compiler.kai`, so the *programs kaic2 compiles*
+  (demos, kaic2's selfhost output) get TCO, but the bootstrap
+  chain `kaic0 → kaic1 → kaic2` is built by stage 0 / stage 1,
+  whose emit still uses recursive C calls. When kaic2 runs
+  over `compiler.kai` (~33 k tokens), its internal `lex_loop`
+  recurses ~33 k times, blowing Linux's default 8 MiB
+  main-thread stack. The proper closure is to mirror the
+  rewrite into `stage1/compiler.kai` (and audit
+  `stage0/emit.c`); once that lands, the constructor +
+  `<sys/resource.h>` come out for good. Tracked as a
+  follow-up to issue #37; the comment in
+  `stage0/runtime.h` calls this out explicitly.
+
 ## [0.22.0] — 2026-05-01 (m13 — dotted `bit.*` surface)
 
 ### Added

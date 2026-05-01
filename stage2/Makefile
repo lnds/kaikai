@@ -15,7 +15,7 @@ SRC     := compiler.kai
 # SIGSEGV; 65520 KB is the macOS hard-limit ceiling and works.
 STACK := ulimit -s 65520 2>/dev/null || ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco selfhost
 
 all: $(TARGET)
 
@@ -1771,7 +1771,25 @@ test-unbox-phase2: $(TARGET) build
 	fi
 	@echo "unbox phase2 OK"
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2
+# Issue #37 — verify the C emitter rewrites self-tail-calls into
+# constant-stack goto-loops. The fixture's `count_down(50_000_000)`
+# would consume ~3 GiB of C-stack at no-TCO (50 M frames at
+# ~60 B each), far past Linux's 8 MiB main-thread default and
+# even past the runtime constructor's 256 MiB bump. With the
+# rewrite, it runs in O(1) C-stack. We only run via stage 2 here
+# — kaic1 still emits recursive C calls (the rewrite has not been
+# mirrored into stage 1 yet), so a kaic1 build of this fixture
+# would deterministically blow the stack.
+test-tco: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/tco/main.kai > build/tco.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/tco.c -o build/tco; \
+	./build/tco > build/tco.out; \
+	diff -q ../examples/tco/main.out.expected build/tco.out > /dev/null \
+	  && echo "tco OK (50M-deep self-tail-call ran in O(1) stack)" \
+	  || { echo "tco DIFF"; diff ../examples/tco/main.out.expected build/tco.out; exit 1; }
+
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -1780,7 +1798,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco
 
 clean:
 	rm -rf build $(TARGET)
