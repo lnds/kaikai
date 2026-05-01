@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-05-01 (m13 — dotted `bit.*` surface)
+
 ### Added
 
 - **m13 — dotted `bit.*` surface for the bit-operations
