@@ -534,8 +534,53 @@ and `m8_fiber_discard_yields.kai` covers the discard + yield shape.)
 
 ## R5 — `demos/euler4` segfaults on Linux runtime; passes on macOS
 
-**Status**: **FIXED** 2026-04-30 — runtime constructor bumps
-`RLIMIT_STACK` at startup (`stage0/runtime.h:
+**Status**: **RESOLVED for emitted programs** 2026-04-30 (issue
+#37) — proper TCO landed in the C-emit path. The interim
+`RLIMIT_STACK` runtime bump from PR #36 is *retained* until
+the rewrite is mirrored into `stage1/compiler.kai`, because
+the bootstrap chain (kaic0 → kaic1 → kaic2) does not yet
+benefit from the rewrite (see "Why the runtime bump stays
+on" below).
+
+**Final fix for emitted programs (issue #37)**: the C emitter
+rewrites every self-tail-call into a `goto`-loop with
+parameter rebinding. A new `tcrec_rewrite_decls` pass
+between unboxing and Perceus replaces the callee `EVar` of
+every tail-position self-call with a sentinel
+(`__kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...`); the C
+backend then emits a rebind+goto block instead of a
+`kai_<sym>(...)` call, with `_kai_<c_sym>_entry:;` planted
+before the enclosing `return ({ ... });`. Every kaikai
+self-tail-recursive fn in **kaic2-compiled** code now uses
+constant C-stack space, so `demos/build/euler4-bin` runs
+with `ulimit -s 256` on macOS.
+
+**Why the runtime bump stays on**: the rewrite lives in
+`stage2/compiler.kai`, so the *programs kaic2 emits* get
+TCO. But the kaic2 binary itself was emitted by kaic1
+(stage 1), which still uses the recursive emit shape. When
+kaic2 runs over `compiler.kai` (~33 k tokens), its
+internal `lex_loop` recurses ~33 k times — fits in macOS's
+default but blows Linux's 8 MiB main-thread stack and
+trips glibc's tcache integrity check ("malloc(): unaligned
+tcache chunk detected"). Mirroring the rewrite into
+`stage1/compiler.kai` (and auditing `stage0/emit.c`) is
+the proper closure; until that follow-up lands, keeping
+the constructor means the bootstrap chain works on Linux
+without depending on `ulimit -s` from the user. The
+comment in `stage0/runtime.h` calls this out explicitly.
+
+**Why the runtime bump came first**: the runtime
+`kai_runtime_bump_stack_rlimit` constructor unblocked CI in
+~30 lines and shipped same-day. The proper fix touches
+`emit_call_expr`, `emit_fn_body`, the run pipeline, and every
+fixture's expected C — appropriate for its own lane (which
+became issue #37 / this branch).
+
+---
+
+**Interim fix (PR #36, removed by issue #37)** — runtime
+constructor bumps `RLIMIT_STACK` at startup (`stage0/runtime.h:
 kai_runtime_bump_stack_rlimit`). Root cause was none of the
 three ranked hypotheses below; surfaced as H4 during local
 repro on the Ubuntu CI box.
