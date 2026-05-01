@@ -11,6 +11,61 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Added
 
+- **`kai fmt` — Tongariki MVP formatter.** Pretty-printer that
+  converts kaikai source to a canonical layout. gofmt-style: no
+  options, deterministic, idempotent. Three CLI shapes:
+
+      kai fmt <file>             # rewrite in place
+      kai fmt --check <file>     # exit 0 if formatted, 1 if not
+      kai fmt --stdin            # stdin -> stdout
+
+  Implemented as new `kaic2 --fmt` / `--fmt-check` subcommands
+  that branch out of `compile_source` right after `parse_program`,
+  before any desugar runs — so source-level constructs (`var`,
+  `a[i] := v` lowered later, etc.) appear as written. The fmt
+  pass walks the raw AST and threads a `[Cmt]` side list (built
+  by re-scanning the source between tokens) so single-line `#`
+  comments preserve their relative position; a comment with
+  source line `L` lands as a full-line comment immediately before
+  the next AST node whose line is ≥ L. Same-line trailing
+  comments may be promoted to the line above — documented as
+  best-effort in `docs/known-regressions.md`.
+
+- **`make test-fmt` / fixture suite.** New `tests/fmt_fixtures.sh`
+  drives `examples/fmt/*.input.kai` through the formatter and
+  diffs against `*.expected.kai`. Idempotency check (`fmt(fmt) ==
+  fmt`) and round-trip (`parse(fmt(s))` succeeds) on every
+  formattable example under `examples/minimal/`,
+  `examples/quickstart/0[123]_*.kai`, and `examples/phase4/`.
+  Wired into `make tier1` so every PR runs the fixtures.
+
+- **Linker stack flag for stage 2 (`-Wl,-stack_size,0x8000000`).**
+  macOS caps the main-thread stack at link size, not at
+  `ulimit -s`. The Tongariki kai fmt lane bumped
+  `stage2/compiler.kai` past the 8 MB default (lex_loop is not
+  TCO'd at -O0 — pending TCO Tier 0 in stage 1 emitter), so the
+  binary now links with a 128 MB stack. Linux ignores the flag.
+  The `STACK := ulimit -s 65520 ...` shell prefix stays for
+  Linux/CI parity.
+
+### kai fmt scope (v1)
+
+Supported: imports, simple fns (mono, no contracts), type decls
+(record / sum / alias / effect alias), tests, base expressions
+(literals, var, call, field, index, lambda, if, match, block,
+list, record, pipe, range, binop, unop, string interpolation,
+holes, todo!, bang), patterns (wild, lit, bind, list, variant,
+variant-record, record, hole, as), let / assert / expr stmts,
+type expressions (TyName, TyList, TyFn with closed effect rows).
+
+Refused with `kai fmt: <kind> not yet supported (line N)`:
+effect declarations, effect handlers, protocols / impls /
+`#derive`, units of measure (`unit`, `<unit>` literals,
+`Real<m>`), refinement types, axiom declarations, generic
+function / type parameters, parametric or open effect rows,
+`var` bindings, `a[i] := v`, `use`, `variants[T]()`. These
+land in future Tongariki / Anga Roa lanes.
+
 - **TCO mirror for the bootstrap chain (issue #42 — fully
   closes R5).** Issue #37 landed the self-tail-call goto
   rewrite in `stage2/compiler.kai`, so every program kaic2
