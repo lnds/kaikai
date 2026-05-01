@@ -1131,6 +1131,93 @@ until their upstream lane lands.
 
 ---
 
+## R6 — TCO precise per-call-site dropmask (rule 3) cannot land under current Perceus emit
+
+**Status**: **OPEN — re-land blocked** as of 2026-05-01 (issue #43).
+
+**Symptom**: any `tcrec_compute_site_dropmask` shape that distinguishes
+`LUAt + count==1 AND p NOT in args` from `LUAt + count==1 AND p in
+args` (rule 3) makes the kaic2 self-compile abort on Linux ubuntu-clang
+with `malloc(): unaligned tcache chunk detected → core dumped`.
+Three structurally different attempts have hit the same abort:
+
+1. **PR #41 first try** (reverted before merge):
+   `tcrec_compute_site_dropmask(params, uses, args: [Expr], i, acc)` —
+   threaded `args: [Expr]` directly, called `tcrec_args_have_evar(args, p)`
+   from inside the dropmask function body.
+2. **PR #48 first commit (522b9df)**: dropped `[Expr]` from the
+   dropmask signature, added `tcrec_per_param_has_evar(args: [Expr],
+   pnames: [String], i, acc)` as a new helper called from
+   `tcrec_rewrite_kind`. The new helper still threads `[Expr]` and
+   calls `tcrec_args_have_evar`.
+3. **PR #48 second commit (bd54356)**: removed the helper entirely,
+   replaced it with `map(pnames, (p) => tcrec_args_have_evar(xs, p))`
+   inside `tcrec_rewrite_kind`. The lambda captures `xs` via closure
+   so no helper takes `[Expr]` as a parameter.
+
+All three abort identically on Linux. macOS Darwin malloc tolerates
+the imbalance and the same builds pass `make tier1` locally — the
+mac/Linux drift in glibc malloc-tcache strict mode is the same
+pattern as R5 euler4 (issue #34).
+
+**Locus** (per PR #41 8-step bisection, archived in PR #41's
+force-push history at tag `backup-r37-pre-rebase`): a refcount
+imbalance in stage 1's perceus emit for some shape involving
+`[Expr]`, walking, and the `kai_internal_dup` chain that follows.
+The PR #48 closure-via-`map` attempt suggested the suspect shape
+is broader than just "function takes `[Expr]` parameter" — even
+threading via lambda capture trips it. AddressSanitizer with
+`--ulimit stack=64MB` reproduces the abort path as a stack
+overflow in `kai_report_errors_loop`, but the mechanism is
+secondary: stack overrun corrupts heap metadata, glibc's tcache
+check fires on the next `malloc`. ASan's stack-overflow detector
+fires before the heap corruption path; without ASan, glibc's
+detector is what fails. Both signals point at the same root
+cause: under-incref of some `[Expr]`-shaped value during the
+dropmask computation, cascading through the call chain.
+
+**What's documented in tree**:
+
+- `examples/tco/list_nth_shape.kai` — canonical rule-3 shape
+  (`nth_loop(xs, i)` with `xs` as match scrutinee, recursive call
+  passing `(t, i - 1)`). Compiles + runs end-to-end under the
+  conservative dropmask. The cons-cell leak the rule would close
+  is bounded (one cell per iteration, 100k cells for a 100k
+  walk) and not visible to a stdout-only golden.
+- `make test-tco-regression` — runs the fixture, validates output.
+  Does NOT enforce rule 3 today.
+- `docs/lane-experience-tco-dropmask-regression.md` — full
+  retrospective of the PR #48 attempts.
+
+**Path forward (out of scope for this lane)**:
+
+1. **Audit stage 1's perceus emit** for `[Expr]`-typed values and
+   the dup/decref chain that wraps them. The bisection placed the
+   bug there; PR #45's stage 1 mirror added more emit complexity
+   and the abort still reproduces.
+2. **Make the imbalance visible on macOS**, e.g., by adding strict
+   alloc tracing to `runtime.h` (per-tag free counts, sentinel
+   patterns on freed chunks). This unblocks local debugging and
+   was already flagged as "not in scope" inside PR #48.
+3. **Or: change the rule-3 representation entirely** — precompute
+   a side table in a pass that runs before perceus and never
+   consults `[Expr]` values during the dropmask computation. The
+   side table key is the call site's source location; the value
+   is the per-param flag bitmask.
+
+The conservative dropmask shipped in `main` today (rules 1 + 2)
+is correct but coarse. The `nth_loop`-shape leak is bounded and
+documented as a follow-up. R6 is the inverse of "fix and ship":
+the fix is structurally clear, the *channel* to ship it through
+is broken.
+
+**Related**: issue #43, PR #41 (force-push history), PR #48
+(closed). The dropmask logic in `tcrec_compute_site_dropmask` is
+inline-commented at `stage2/compiler.kai:24121` with a forward
+pointer to this section.
+
+---
+
 ## R7 — kai fmt v1: same-line trailing comments may be promoted to the line above
 
 **Status**: **KNOWN LIMITATION** as of 2026-05-01 (Tongariki kai
