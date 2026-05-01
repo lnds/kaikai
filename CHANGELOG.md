@@ -9,6 +9,28 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **`examples/tco/list_nth_shape.kai` documentation fixture for
+  issue #43.** Canonical `list.nth(xs, i)`-shape recursive function
+  that the precise per-call-site dropmask (rule 3) would fix.
+  Under the conservative dropmask in `main` it compiles and runs
+  end-to-end; the cons-cell leak the rule would close is bounded
+  and documented in `docs/known-regressions.md` § R6. New
+  `make test-tco-regression` target validates the fixture compiles
+  and produces expected output. **Does NOT enforce rule 3** —
+  re-landing the rule has been blocked twice on Linux (see § R6).
+
+- **`docs/known-regressions.md` § R6** documenting why the precise
+  rule-3 dropmask cannot land under the current Perceus emit:
+  three structurally different attempts (PR #41 first try, PR #48
+  first commit `[Expr]`-helper, PR #48 second commit
+  closure-via-`map`) all trip the same `malloc(): unaligned tcache
+  chunk detected` abort during the kaic2 self-compile on Linux
+  ubuntu-clang. Includes the bisection trail, path-forward options,
+  and a forward pointer from the conservative
+  `tcrec_compute_site_dropmask` comment.
+
 ## [0.24.0] — 2026-05-01 (Tongariki Wave 1 — kai fmt + TCO stage 1 mirror + lane-experience retro)
 
 ### Added
