@@ -9,6 +9,26 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Changed
+
+- **`docs/roadmap.md` refreshed; m8.x promoted to Tongariki Wave 3
+  (issue #59).** The roadmap had drifted: Status snapshot still
+  pointed at `0.23.0` while `main` was at `0.30.0`, and Tongariki
+  scope listed bullets for items that already shipped at
+  `0.24.0`–`0.27.0`. Restructured the Tongariki section into
+  Wave 1 (`0.24.0` — `kai fmt` + TCO stage 1 mirror), Wave 2
+  (`0.25.0` — `bench v1`), cierre (`0.26.0`–`0.27.0` — `check
+  v1` + Real unboxing) — all marked shipped — and added
+  **Wave 3 (proposed) — m8.x cooperative scheduler**. Wave 3
+  addresses the actor-surface gap documented in
+  `stdlib/actor.kai` lines 13–16 / 23–26 (`receive` on empty
+  mailbox + `BlockSender` are runtime errors today) and is the
+  hard upstream dependency for `lnds/ahu#1`. Acceptance
+  criteria for Wave 3 are part-A doc only here; the
+  implementation lane is multi-week and remains open.
+  Definition of Done items 1–5 marked closed at the version
+  that closed them; item 6 is the Wave 3 acceptance.
+
 ## [0.30.0] — 2026-05-02 (tier1-asan daily gate + kohau/henua rename)
 
 ### Added

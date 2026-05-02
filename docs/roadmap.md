@@ -1,6 +1,6 @@
 # kaikai roadmap
 
-Pinned 2026-05-01 (post v0.23.0). Names follow the Rapa Nui
+Pinned 2026-05-02 (post v0.30.0). Names follow the Rapa Nui
 convention already in use across the project (the language
 `kaikai` itself, the framework `ahu`, the web framework
 `manutara`). Each milestone is a real Rapa Nui site; the
@@ -10,15 +10,18 @@ horizon beyond.
 
 ## Status snapshot
 
-- **HEAD**: `75d346b release: 0.23.0` (TCO emitter rewrite landed)
-- **Current target**: kaikai-Tongariki (MVP)
+- **HEAD**: `0.30.0` (tier1-asan daily gate + kohau/henua rename)
+- **Current target**: kaikai-Tongariki Wave 3 — m8.x cooperative
+  scheduler (issue #59). Waves 1, 2, and the MVP cierre already
+  shipped (0.24.0–0.27.0).
 - **Cross-cutting principles** (per CLAUDE.md):
   - Tier 1 #1 (memory safety + effects in types) — defendible
   - Tier 1 #2 (mandatory TCO) — defendible without footnote as of 0.23.0
   - Tier 1 #3 (fast compilation) — defendible
-- **Inner-loop perf**: ~2.5× C reference under -O2 (post Phase 2
-  unboxing). Target trajectory: Tongariki ~2.0× → Anga Roa ~1.5–1.7× →
-  Orongo near-C with multi-thread + Tier 3b unboxed messages.
+- **Inner-loop perf**: ~2.0× C reference under -O2 (post Real
+  unboxing in 0.27.0). Target trajectory: post-Tongariki ~2.0× →
+  Anga Roa ~1.5–1.7× → Orongo near-C with multi-thread + Tier 3b
+  unboxed messages.
 - **Selfhost**: byte-identical at fixed point under both C and LLVM
   backends.
 
@@ -32,58 +35,110 @@ the end).
 
 The 15-moai platform: the public face. Ship the language with
 the minimum testing and dev workflow that lets early adopters
-write real code.
+write real code. Delivered in waves; the MVP cierre (`0.27.0`)
+closed the original "ship a usable language" promise; **Wave 3**
+(m8.x cooperative scheduler) closes the *"early adopters write
+real code"* promise for the ecosystem-stack adopter (the
+canonical downstream consumer being `lnds/ahu`, whose initial
+design lane pinned m8.x as a hard upstream dependency — see
+issue #59).
 
-**Scope**:
+#### Wave 1 (`0.24.0`, shipped 2026-05-01) — `kai fmt` + TCO stage 1
+
+- `kai fmt` — gofmt-style deterministic formatter, no options.
+- TCO stage 1 mirror (issue #42) and precise per-call-site
+  dropmask cons-cell case (issue #43). Housekeeping from 0.23.0.
+
+#### Wave 2 (`0.25.0`, shipped 2026-05-02) — `bench` v1
+
+- `bench` v1 — bench blocks reporting mean ns/iter (no stats),
+  `kai bench` runner. Issue #40.
+
+#### Cierre (`0.26.0`–`0.27.0`, shipped 2026-05-02) — `check` v1 + Real unboxing
 
 - `check` v1 — property test blocks with intrinsic-table
   generators (no shrinking), `kai check` runner. Issue #44.
-- `bench` v1 — bench blocks reporting mean ns/iter (no stats),
-  `kai bench` runner. Issue #40.
-- `kai fmt` — gofmt-style deterministic formatter, no options.
 - Drop specialisation — per-type drop chains inlined at emit
   time instead of going through runtime dispatch.
-  **Closed 2026-05-01 as doc-only PR.** End-to-end
-  implementation measured −1.7% at `-O2` and a +5.4%
-  regression at `-O0` on `kaic2` self-compile — both well
-  below the lane's ≥10% success threshold. Phase 2 unboxing
-  had already absorbed the addressable overhead. Re-evaluation
-  is paired with the Anga Roa **reuse-in-place** lane, which
-  may shift the alloc mix enough to unlock per-tag dispatch on
+  **Closed 2026-05-01 as doc-only PR (negative result).**
+  End-to-end implementation measured −1.7% at `-O2` and a
+  +5.4% regression at `-O0` on `kaic2` self-compile — both
+  well below the lane's ≥10% success threshold. Phase 2
+  unboxing had already absorbed the addressable overhead.
+  Re-evaluation is paired with the Anga Roa
+  **reuse-in-place** lane, which may shift the alloc mix
+  enough to unlock per-tag dispatch on
   KAI_RECORD / KAI_VARIANT. Retro pinned in
   `docs/lane-experience-drop-specialisation.md`.
-  *(Original optimization thread for this milestone — closed
-  without shipping. Replaced by Real unboxing below.)*
-- **Real unboxing (Phase 2 follow-up)** — pulls forward the
-  follow-up item documented in `docs/unboxing-phase2-followup.md`.
-  Phase 2 v1 deliberately scoped to `Int` / `Bool` / `Char`
-  because adding `Real` (raw `double` in xmm registers, FP
-  operators) doubles the test surface. With drop specialisation
-  closed as negative result on 2026-05-01, the Tongariki
-  optimization thread is now Real unboxing instead. Brings
-  Real-heavy programs from the current ~50–100× C-ref gap into
+- **Real unboxing (Phase 2 follow-up)** — pulled forward
+  from `docs/unboxing-phase2-followup.md` after drop
+  specialisation closed as negative result. Brings
+  Real-heavy programs from the prior ~50–100× C-ref gap into
   the same band as Int/Bool/Char (~5–10× post Phase 2). Same
   unbox_pass machinery + new C type emission for `MUnboxed Real`.
-  *(New optimization thread for this milestone.)*
-- TCO followups — issue #42 (stage 1 mirror) and issue #43
-  (precise per-call-site dropmask cons-cell case).
-  Housekeeping from 0.23.0.
+  Replaced drop specialisation as the Tongariki optimization
+  thread.
 
-**Definition of Done**:
+#### Wave 3 (proposed) — m8.x cooperative scheduler (issue #59)
+
+The actor surface that landed in m8 is only partially usable
+today: `Actor.receive()` on an empty mailbox is a runtime error
+(the inline-eager scheduler cannot suspend the caller until a
+message arrives), and `Bounded(c, BlockSender)` mailboxes error
+at allocation. `stdlib/actor.kai` lines 13–16 and 23–26 document
+the gap. Wave 3 closes it before Anga Roa polish work begins.
+
+**Scope**:
+
+- Cooperative scheduler that suspends a fiber on
+  `Actor.receive()` when its mailbox is empty, resumes it when
+  a message arrives.
+- `BlockSender` mailbox policy delivery — sender parks on a
+  full bounded mailbox until space frees up, with cancel
+  propagation working at the yield point.
+- `Cancel.raise()` delivery at all yield points
+  (`receive`, `send` under `BlockSender`, `await`, `select`,
+  `yield`). The trap-exit path that landed in m8 needs the
+  scheduler to actually inject `Cancel` at runtime.
+- End-to-end fixture: a two-actor ping-pong where actor A
+  sends, actor B parks on `receive`, B receives, replies, A
+  parks on `receive`, A receives. Today this fails with the
+  inline-eager scheduler; under m8.x it should complete.
+
+Out of scope for Wave 3: multi-thread scheduler (Orongo),
+asm-level context switch (Orongo), preemption / fairness
+guarantees (post-MVP per `docs/structured-concurrency.md`
+§*Non-goals*), distributed actors (Orongo+).
+
+**Definition of Done** (Tongariki overall, with Wave 3 closing
+the remaining gap):
 
 1. `kai test`, `kai check`, `kai bench`, `kai fmt` all functional
    and exercised by fixtures under `examples/stdlib/` and a
-   pre-flight self-test on `stage2/`.
+   pre-flight self-test on `stage2/`. *(Closed at `0.27.0`.)*
 2. Inner-loop benchmark (`examples/perceus/unbox_bench.kai`) at
-   ~2.0× C reference under -O2 (down from current ~2.5×).
-3. All 24 demos pass; selfhost byte-identical (C + LLVM).
+   ~2.0× C reference under -O2. *(Closed at `0.27.0` — Real
+   unboxing.)*
+3. All ≥24 demos pass; selfhost byte-identical (C + LLVM).
+   *(Holds as of `0.30.0`.)*
 4. CI green; release notes for each chunk.
+   *(Tier 1 gate green via `.github/workflows/tier1.yml`;
+   tier1-asan daily gate added in `0.30.0`.)*
 5. CLAUDE.md Tier 1 closure remains defendible (no new
-   footnotes).
+   footnotes). *(Holds.)*
+6. **Wave 3 (m8.x)**: `stdlib/actor.kai` no longer needs the
+   *"receive on empty mailbox is a runtime error"* disclaimer;
+   `Bounded(c, BlockSender)` works end-to-end; two-actor
+   ping-pong fixture passes; `lnds/ahu/docs/design.md`
+   §*External dependencies on kaikai* gaps 1 and 2 closeable
+   (coordinated PR follows on the ahu side);
+   `docs/fibers-honesty-targets.md` Tier 1 / Tier 2 reflect
+   the closed gap.
 
-**Estimated cost**: ~2–3 weeks of agent work, distributed
-across ~5 lanes (TCO followups, bench v1, check v1, kai fmt,
-drop specialisation).
+**Estimated cost**: Waves 1+2+cierre shipped in ~2 weeks of
+agent work distributed across ~5 lanes. Wave 3 (m8.x) adds
+~2–3 weeks for the cooperative scheduler runtime + cancel
+delivery + fixture, comparable in scale to the original m8.
 
 ### Anga Roa — pre-1.0
 
