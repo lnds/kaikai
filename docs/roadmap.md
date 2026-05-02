@@ -52,10 +52,19 @@ write real code.
   may shift the alloc mix enough to unlock per-tag dispatch on
   KAI_RECORD / KAI_VARIANT. Retro pinned in
   `docs/lane-experience-drop-specialisation.md`.
-  *(Optimization thread for this milestone — closed without
-  shipping; the Tongariki perf trajectory below is therefore
-  paced by `bench v1` + `check v1` + TCO followups, not by
-  this item.)*
+  *(Original optimization thread for this milestone — closed
+  without shipping. Replaced by Real unboxing below.)*
+- **Real unboxing (Phase 2 follow-up)** — pulls forward the
+  follow-up item documented in `docs/unboxing-phase2-followup.md`.
+  Phase 2 v1 deliberately scoped to `Int` / `Bool` / `Char`
+  because adding `Real` (raw `double` in xmm registers, FP
+  operators) doubles the test surface. With drop specialisation
+  closed as negative result on 2026-05-01, the Tongariki
+  optimization thread is now Real unboxing instead. Brings
+  Real-heavy programs from the current ~50–100× C-ref gap into
+  the same band as Int/Bool/Char (~5–10× post Phase 2). Same
+  unbox_pass machinery + new C type emission for `MUnboxed Real`.
+  *(New optimization thread for this milestone.)*
 - TCO followups — issue #42 (stage 1 mirror) and issue #43
   (precise per-call-site dropmask cons-cell case).
   Housekeeping from 0.23.0.

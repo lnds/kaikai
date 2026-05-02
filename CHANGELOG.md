@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-05-02 (Tongariki cierre — check v1 + drop-spec retro + Real unboxing pulled forward)
+
 ### Added
 
 - **`check "..." [with p: T, ...] { body }` blocks + `kai check`
