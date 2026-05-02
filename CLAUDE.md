@@ -140,6 +140,18 @@ Defaults that every agent must follow without being told:
   motivated the manual ceremony (commit messages claiming
   `make test clean` without anyone having run `make test`) are
   the kind of failure CI now makes structurally impossible.
+- **Tier 1-ASAN — path-gated CI on PRs touching runtime / emit /
+  perceus / fiber+RC fixtures**: a separate workflow
+  (`.github/workflows/tier1-asan.yml`) runs `make tier1-asan` on
+  ubuntu-latest under ASAN+UBSan when the diff matches
+  `stage0/**`, `stage1/compiler.kai`, `stage2/compiler.kai`,
+  `stage2/Makefile`, `stdlib/**`, `examples/effects/**`, or
+  `examples/perceus/**`. Typer-only / fmt-only PRs do not pay the
+  ~5 min ASAN tax. This catches non-portable fixes that pass
+  tier1 on macOS but fail on Linux (the PR #111 mailbox
+  trap-exit segfault is the precedent). Fixtures wired into
+  `make tier1-asan` (TRACE_FIXTURES, runtime-shadow-asan, etc.)
+  are the gate.
 - **Tier 2 — `make daily`**: only the maintainer / cron runs this on
   `main` HEAD at end-of-day. Tier 1 + stress fixtures + coverage
   probe + RC budget. Agents do not run Tier 2 inside their lanes —
