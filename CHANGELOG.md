@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-05-02 (Tier 3 experiment 2 — handler composition + R9/R10/R11 surfaced)
+
 ### Added
 
 - **`stdlib/trace.kai` — `with_log_prefix` (Tier 3 arm A,

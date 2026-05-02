@@ -184,3 +184,117 @@ prompt to ask for it.
 
 Baseline established. No conclusions drawn. Next data point is m7e13
 post-cierre, with intentional capture of session transcript.
+
+---
+
+## Addendum — A/B experiments 2026-05-02 (n=2 experiments × 2 arms)
+
+The original baseline (n=6 lanes, 2026-04-26) deferred the
+acceptance question to instrumented A/B comparisons. Two such
+experiments have now run.
+
+### Headline
+
+**JSON tooling is NOT load-bearing for the slices tested.** The
+actual differentiators in the harder slice (handler composition)
+were ASAN + compiler source reading + persistence — none of which
+the bet was about. The bet's framing remains untested for one
+slice (deep row-polymorphism without codegen/runtime components)
+but no real feature has hit that slice cleanly.
+
+### Experiment 1 — stdlib mirror (`Trace` effect)
+
+| Metric | Arm A (JSON tools) | Arm B (plain text) |
+|---|---:|---:|
+| Wallclock to green tier1 | 13m 44s | 12m 26s |
+| Compiler errors hit | 2 | 1 |
+| JSON tool invocations | 3 (1 effects-json, 1 effect-holes-json, 1 types-json NOT-A-FLAG) | 0 (banned) |
+| Outcome | shipped | shipped |
+
+**Verbatim from arm A retro**: JSON invocations were "deliberate,
+**for this report**" — i.e., made after the work was complete.
+
+**Verbatim from arm B retro**: "the plain-text path was sufficient
+end-to-end for this lane".
+
+Bonus: arm A surfaced **R8** (Phase 2 unboxing × string interpolation
+regression) during the lane.
+
+Full writeup: `docs/tier3-experiment-2026-05.md` §*Experiment 1*.
+
+### Experiment 2 — handler composition (`with_log_prefix`)
+
+| Metric | Arm A (JSON tools) | Arm B (plain text) |
+|---|---:|---:|
+| Outcome | ✅ shipped | ❌ blocked, doc-only PR |
+| Bugs hit | R9 + R11 | R9 + R10 |
+| Real differentiator | ASAN + compiler source reading | (didn't pursue ASAN/source) |
+
+Both arms hit the same compiler/runtime bugs. The differential was
+**persistence + diagnostic tools (ASAN) + reading compiler internals**,
+NOT JSON tools.
+
+**Verbatim from arm A retro**: JSON tool invocations made
+"after the fix landed".
+
+**Verbatim from arm B retro**: "JSON would not have helped — the
+bug is in codegen not in the type system" / "the experiment 2
+embargo cost me [zero time]".
+
+Bonus: experiment 2 surfaced **R9** (handler-clause closure-capture
+gap), **R10** (parameterised + self-delegating handler crash), and
+**R11** (state-read UAF on second op call). All three have repros
++ hypotheses + fix paths in `docs/known-regressions.md`.
+
+Full writeup: `docs/tier3-experiment-2026-05.md` §*Experiment 2*.
+
+### Combined direction
+
+The bet "JSON tooling accelerates LLM authorability of effect-typed
+languages" is **not directionally supported** by the available data:
+
+- 2/2 experiments returned negative or null direction.
+- Both arms in both experiments converged on the same conclusion
+  in their retros.
+- The bonus value of the experiments was the surfaced bugs (R8, R9,
+  R10, R11) — none of which the JSON tools would have prevented.
+
+The bet may still be correct for an untested slice (typed-hole-
+driven type discovery in larger codebases, where the agent has no
+signature template and infers it from compiler feedback). A future
+experiment 3 could target that slice synthetically. Until such an
+experiment runs, the bet should be treated as **aspirational, not
+validated**.
+
+### Operational implications
+
+- **Do not invest in additional JSON tooling solely on the basis of
+  the bet** — the existing surface (`--effects-json`,
+  `--effect-holes-json`, typed holes) is adequate for the slices
+  where it's used; expanding it without evidence of demand is
+  premature.
+- **m11 diagnostics quality (Anga Roa)** should be justified on its
+  own merit — Elm/Rust-grade error UX for human developers — not as
+  bet validation.
+- **Fund ASAN in CI**: `make tier1-asan` gate (cron daily.yml or
+  per-PR) is the single highest-leverage operational change
+  suggested by the experiments. Catches R10/R11-class bugs before
+  users hit them.
+- **Future agent prompts in advanced lanes** should explicitly
+  suggest "read the relevant emit/perceus source if you hit codegen
+  errors" — this was the load-bearing differentiator in experiment
+  2.
+- **`--types-json` does not exist** despite Tier 3 narrative; do not
+  advertise it in agent briefs.
+
+### Limitations of the combined finding
+
+- n=2 experiments per slice = 1; direction-setting only.
+- Same agent personality (Claude) in all four arms.
+- Self-report bias acknowledged. Counter-evidence: A and B
+  converged on the same conclusion across both experiments,
+  suggesting low self-serving bias.
+- Wallclock numbers include sleep windows where the integrator was
+  unavailable; compute-time is estimated.
+- One slice remains untested (deep row-polymorphism with no
+  codegen/runtime component); the bet may hold there.
