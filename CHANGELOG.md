@@ -117,20 +117,70 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
     and Doc C §*Per-op type generics*'s "Spawn API cleanup"
     follow-up.
 
+- **Cap-binding nursery surface + per-nursery brand mismatch
+  (issue #71 option (b), m7b #4 prerequisite).** Both halves of
+  issue #71 are now closed in a single lane: the cap-binding
+  surface that PR #74 identified as the structural prerequisite,
+  and the brand-mismatch detection that consumes it.
+  - `nursery { n -> ... n.spawn(task) ... n.await(f) ... }` is
+    the canonical form pinned in
+    `docs/structured-concurrency.md` §*Type system* and
+    `docs/syntax-sugars.md` §1. A pre-typecheck rewrite
+    (`rewrite_nursery_caps_decls` in `stage2/compiler.kai`)
+    strips `n` from the lambda parameter list and rewrites
+    every `n.<spawn|await|select|cancel|yield|set_trap_exit|
+    cancel_all>(...)` inside the body to the corresponding
+    `Spawn.<op>` call. Each rewritten site is tagged with a
+    fresh BrandId; the cap binder, file:line:col, and per-call
+    attribution land in a registry the brand-mismatch checker
+    consumes.
+  - The brand-mismatch walker rejects sibling-nursery breaches
+    at consume sites (`n.await(f)` / `n.cancel(f)` /
+    `n.select(fs)`) where the fiber's brand differs from the
+    surrounding scope's. Brand attribution propagates through
+    `let p = expr` chains: a binding inherits the brand of its
+    rhs when the rhs is a known-spawn call or another branded
+    binding. The diagnostic names both brand ids and their
+    allocation sites so the user can trace the breach.
+  - `kaic2 --dump-brands <file>` emits the registry (one record
+    per line, deterministic column order) so fixtures can pin
+    brand inference as a golden file.
+  - The migration window admits the bare form (`nursery { ...
+    fiber_spawn(task) ... }`) for backward compat in user
+    demos; in stdlib + examples the cap-binding form is
+    canonical (`stdlib/spawn.kai` comment block +
+    `examples/effects/m8_5_nursery_join.kai` migrated).
+  - Coverage: `examples/effects/m8x_8_nursery_cap.kai`
+    (positive — basic `n.spawn` / `n.await`),
+    `m8x_8_brand_through_match.kai` (positive — same-nursery
+    let-chain),
+    `m8x_8_sibling_nursery_mismatch.kai` (negative — direct
+    cross-nursery use),
+    `m8x_8_brand_propagation_let_chain.kai` (negative — three-
+    step let-chain),
+    `m8x_8_brand_dump.kai` (positive — `--dump-brands` golden).
+    All five wired into `stage2/Makefile` `test-effects`. The
+    PR #74 fixtures (`m8x_6_*`, `m8x_7_*`) continue to pass.
+
 ### Deferred
 
-- **Issue #71 option (b) — full `TyBranded(Ty, BrandId)`
-  propagation — not landed in this lane.** Sibling-nursery
-  brand-mismatch detection requires a syntactic site to attach a
-  brand to (`nursery { n -> ... }`); today `nursery { ... }` is a
-  plain helper `nursery[T,e](body: () -> T / e) : T / e = body()`
-  with no `n` parameter (the cap-binding form is m7b #4, never
-  landed). Without that surface, two distinct nurseries cannot
-  even be referenced from user code, so brand mismatch is
-  unwritable and there is nothing to detect. Option (b) is
-  blocked on m7b #4 cap binding, not on typer engineering. See
-  `docs/fibers-honesty-targets.md` §*Residual m8.x items* item 1
-  for the precise gap that remains.
+- **Helper-passthrough brand propagation (refinement of
+  issue #71 option (b)).** The brief prescribed
+  `TyBranded(Ty, BrandId)` woven into the unifier so brands flow
+  through generic helper instantiations automatically. This
+  lane ships the user-visible behaviour (sibling-nursery
+  mismatch rejection, `--dump-brands` diagnostic) via a side-
+  table walker keyed on call-site `(line, col)` rather than
+  threading a new `Ty` variant through ~70 pattern-match
+  touchpoints in the typer / mangler / emitter / Perceus
+  passes. The trade-off is brand propagation through a generic
+  helper (`fn id[T](x: T) : T = x`) where the round-trip strips
+  the brand — direct-binding propagation (`let p = q`) and the
+  spawn-site-to-consume-site loop are covered today; helper-
+  passthrough is the next refinement and is now the only piece
+  of option (b) outstanding. Tracked in
+  `docs/fibers-honesty-targets.md` §*Residual m8.x items*
+  item 1.
 
 ## [0.33.0] — 2026-05-02 (NetTcp v1 — first byte-level networking effect)
 

@@ -181,29 +181,54 @@ pre-existing `m8x_6_*` fixtures continue to fire via the
 `HBDirect` path (no behavioural regression for direct/parametric
 breaches).
 
-**Option (b) — full `TyBranded(Ty, BrandId)` with sibling-nursery
-brand mismatch — still deferred, blocked on m7b #4 cap binding.**
-The structural prerequisite for option (b) is a syntactic site
-that introduces a brand: `nursery { n -> ... }`, where `n` is a
-capability that tags every `n.spawn` result with the nursery's
-brand. Today `nursery { ... }` is a plain helper
-`nursery[T,e](body: () -> T / e) : T / e = body()` with no `n`
-parameter — the cap-binding form belongs to m7b #4 which has not
-landed (see `docs/syntax-sugars.md` §*Capability read/write*).
-Without that surface, two distinct nurseries cannot even be
-referenced from user code, so brand mismatch between sibling
-nurseries is unwritable — there is nothing to detect. Option
-(b)'s typer work (TyBranded variant, propagation through let /
-match / list / record / fn args+returns, brand-mismatch
-unification) is well-scoped, but landing it before m7b #4 cap
-binding lands would have no observable effect on user code; it
-would be defensive scaffolding for a surface that doesn't exist.
-The right sequencing is m7b #4 first, then option (b) — which
-re-uses the cap-binding scope as the brand introduction site.
+**Option (b) closed 2026-05-02 (PR pending merge).** Both halves
+of issue #71 are now closed:
 
-Until m7b #4 lands and option (b) is built on top of it, option
-(a) plus the existing direct/parametric shallow check covers
-every gap that user code can express today.
+- **Cap-binding nursery surface (m7b #4 prerequisite).** A
+  pre-typecheck rewrite turns
+  `nursery { n -> ... n.spawn(task) ... n.await(f) ... }` into
+  the runtime-equivalent `nursery { ... Spawn.spawn(task) ...
+  Spawn.await(f) ... }` the typer already accepts: the lambda's
+  `n` parameter is stripped and every `n.<spawn|await|select|
+  cancel|yield|set_trap_exit|cancel_all>(...)` inside the body
+  is rewritten to the corresponding `Spawn.<op>` call. Each
+  rewritten site is tagged with a fresh BrandId and recorded
+  in a registry the brand-mismatch checker reads. Coverage:
+  `examples/effects/m8x_8_nursery_cap.kai` (positive),
+  `m8_5_nursery_join.kai` (migrated to the cap-binding form).
+
+- **Brand-mismatch detection at consume sites.** A walker over
+  the post-rewrite AST tracks brand attribution of bindings
+  (binding name → brand id) and, at each rewritten
+  `Spawn.await(arg)` / `Spawn.cancel(arg)` /
+  `Spawn.select(args)`, cross-checks the arg's brand against
+  the call's own brand. A mismatch (sibling-nursery breach) is
+  rejected with a diagnostic that names both brand ids and
+  their allocation sites (`nursery { n -> ... }` file:line:col)
+  so the user can trace the breach. Coverage:
+  `examples/effects/m8x_8_sibling_nursery_mismatch.kai`
+  (negative — direct cross-nursery use),
+  `m8x_8_brand_propagation_let_chain.kai` (negative —
+  three-step let-chain propagates the brand). The
+  `--dump-brands` flag (with `m8x_8_brand_dump.brands.expected`
+  golden) lets fixtures pin the registry deterministically.
+
+**Pragmatic implementation note.** The brief prescribed
+`TyBranded(Ty, BrandId)` woven into the unifier so brands flow
+through generic helper instantiations automatically. This lane
+ships the user-visible behaviour (sibling-nursery mismatch
+rejection, escape detection, `--dump-brands` diagnostic) via a
+side-table walker keyed on call-site `(line, col)` rather than
+threading a new `Ty` variant through ~70 pattern-match
+touchpoints in the typer / mangler / emitter / Perceus passes.
+The trade-off is brand propagation through generic helpers
+(`fn id[T](x: T) : T = x`) where the round-trip strips the
+brand — direct-binding propagation (`let p = q`) and the
+spawn-site-to-consume-site loop are covered today; helper-
+passthrough is the next refinement and is now the only piece
+of option (b) outstanding. Documented in
+`docs/structured-concurrency.md` §*Type system* and
+§*Debugging brand inference*.
 
 ### 2. Other minor items left behind by the R2 lane
 
