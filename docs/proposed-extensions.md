@@ -1,6 +1,7 @@
 # proposed extensions
 
-Catalogue of extensions for kaikai, grouped into two families:
+Catalogue of **pending** extensions for kaikai, grouped into two
+families:
 
 1. **LLM-friendly diagnostics** — extensions in the same family as
    `docs/typed-holes.md`: the compiler emits structured,
@@ -10,75 +11,51 @@ Catalogue of extensions for kaikai, grouped into two families:
    decision on concrete-syntax consolidation, not for opening new
    ones.
 
-None of these are adopted yet. They are catalogued here so that,
-when the core stabilises, we have a short list of coherent moves
-rather than a pile of ad-hoc additions.
+**Closed extensions** (whether landed or rejected) are documented
+in their corresponding milestone retrospectives, fixtures under
+`examples/`, and CHANGELOG entries — not here. This file tracks
+only what is still open.
 
 Each entry states what it buys, what it costs, and what it depends
 on.
 
 ## Status summary
 
-### LLM-friendly diagnostics family
+### LLM-friendly diagnostics family (pending)
 
-| Extension                                  | Status        | Depends on              |
-|--------------------------------------------|---------------|-------------------------|
-| `todo!(msg) : T`                           | landed m7d    | typed holes             |
-| `kai type <pos> --json`                    | proposed      | stage-2 type checker    |
-| Counterexample JSON for exhaustiveness     | proposed      | match exhaustiveness    |
-| `axiom name : T`                           | scheduled m12.7 | stage-2 type checker  |
-| `kai effects <target> --json`              | scheduled m7f | effect inference        |
-| `?e` — effect holes                        | scheduled m7f | typed holes + effects   |
-| `import ?name` — dependency holes          | scheduled m7f | module resolution       |
-| `kai lint --json` — canonical-form rules   | proposed      | canonical style guide   |
+| Extension                              | Status   | Depends on              |
+|----------------------------------------|----------|-------------------------|
+| `kai type <pos> --json`                | proposed | stage-2 type checker    |
+| Counterexample JSON for exhaustiveness | proposed | match exhaustiveness    |
+| `kai lint --json` — canonical-form rules | proposed | canonical style guide   |
 
-### Language-surface family
+### Language-surface family (pending)
 
 | Extension                                  | Status   | Depends on              |
 |--------------------------------------------|----------|-------------------------|
-| Tuples `(T1, T2, ...)`                     | gated m8.5  | m8 corpus + measurement  |
-| Record punning `{ x, y }`                  | landed m7d   | parser                 |
-| `variants[T]()` builtin                    | scheduled m7e | monomorphisation       |
-| Sum types with constant attributes         | proposed     | parser + resolution     |
-| `!` postfix — `Option` / `Result` propagation | landed m7e §13 | `Option` / `Result` in prelude |
-| `@` as-pattern in `match`                  | landed m7d   | parser                 |
-| `?.` optional chaining                     | proposed     | parser + type checker   |
-| Bit ops (`bit.and` / `bit.or` / `bit.shl` / ...) | landed m13 (flat + dotted) | typer's intrinsic table + `rqc_kind` rewrite |
-| `Map[K, V]` + `m["key"]` indexing          | proposed     | collection design       |
-| Slice syntax `a[i..j]`                     | proposed     | `Vector[T]` landing     |
-| Method references as values (`obj.method`) | scheduled m7f | parser + brand machinery |
-| `Range[T]` as a first-class iterable       | proposed     | collection design       |
-| Pipeline placeholder `_`                   | landed m7d   | parser                 |
-| Binary pattern matching `<<...>>`          | proposed     | parser + match exhaustiveness |
-| `++` operator (string + list concat)       | landed m7d   | parser + 2 typer rules |
-| `main()` row inference                     | scheduled m7e | typer + runtime default loader |
-| `use Effect` — open effect in scope        | scheduled m7e | parser + resolver scoping |
-| Protocols (single-dispatch)                | scheduled m12.8 | parser + resolver + vtable codegen |
-| Units of measure `Real<USD>` / `Int<UserId>` | landed m12.5 | parser + typer extension |
-| `const NAME : T = literal` — top-level constants | landed 2026-04-28 | parse-time desugar to zero-arg fn |
+| Sum types with constant attributes         | proposed | parser + resolution     |
+| `?.` optional chaining                     | proposed | parser + type checker   |
+| `Map[K, V]` + `m["key"]` indexing          | proposed | collection design       |
+| Slice syntax `a[i..j]`                     | proposed | `Vector[T]` landing     |
+| `Range[T]` as a first-class iterable       | proposed | collection design       |
+| Binary pattern matching `<<...>>`          | proposed | parser + match exhaustiveness |
+| Multi-arg `match` sugar — `match a, b { ... }` | scheduled (parser-only) | parser |
 
-## 1. `todo!(msg) : T` — principled unimplemented
+### Closed (for reference; details in commits / CHANGELOG)
 
-```kai
-fn parse_expr(tokens: [Token]) : Expr = todo!("pending binary ops")
-```
+- **Landed**: `todo!`, `axiom`, `kai effects --json` (`--effects-json`),
+  `?e` effect holes, `import ?name`, record punning, `variants[T]()`,
+  `!` postfix, `@` as-pattern, bit ops (flat + dotted), pipeline `_`
+  placeholder, `++` operator, `main()` row inference, `use Effect`,
+  protocols (single-dispatch m12.8), units of measure m12.5,
+  `const NAME` (2026-04-28), method references via `.field`
+  placeholder lambda (v1; receiver-bound `obj.method` deferred),
+  record destructuring in `let`.
+- **Rejected**: tuples as a second product form (m8.5 measurement
+  gate, 2026-04-27 — see *Tuples — REJECTED* below for the
+  retrospective).
 
-`todo!(msg)` is an expression of any type. Structurally a sibling
-of `?`:
-
-- Type-checks as the expected type at its position.
-- At runtime, aborts via `kai_prelude_panic("todo: #{msg}")`.
-- Reported in `--holes-json` with `"kind": "todo"` and the message.
-
-The distinction with `?` is intent. `?` means *I don't know yet*;
-`todo!` means *I know, not yet*. Persists through reformats and is
-grep-able, replacing informal `// TODO` comments with a typed marker
-that the checker tracks.
-
-**Cost**: low. One new token, reuses the hole runtime.
-**Depends on**: typed holes.
-
-## 2. `kai type <pos> --json` — queryable type-at-position
+## 1. `kai type <pos> --json` — queryable type-at-position
 
 ```
 $ kai type foo.kai:10:5 --json
@@ -101,7 +78,7 @@ any position, not just holes. The schema deliberately overlaps with
 type; the query walks to the cursor position.
 **Depends on**: stage-2 type checker.
 
-## 3. Counterexample JSON for exhaustiveness
+## 2. Counterexample JSON for exhaustiveness
 
 When a `match` is non-exhaustive, the compiler already knows which
 patterns are missing. Expose them:
@@ -130,126 +107,7 @@ for its current error text; formalising the output is a refactor
 plus a schema.
 **Depends on**: pattern-match exhaustiveness check (already planned).
 
-## 4. `axiom name : T` — postulated symbols
-
-```kai
-axiom unsafe_cast[A, B] : (A) -> B
-axiom db_layer_exists : Database / Io
-```
-
-An `axiom` declares a symbol with a type but no body. The compiler
-accepts it, type-checks its uses, and lists it in `--axioms-json`.
-
-- Unlike `todo!`, axioms live at top level and can be called from
-  anywhere. They declare *this will never have an implementation
-  here* (FFI boundary, architectural placeholder, library seam).
-- By default, calling an axiom at runtime aborts via
-  `kai_prelude_panic`. Axioms can be bound to an external symbol
-  via `Ffi` to receive a real implementation at link time.
-- Every binary carries a manifest of which axioms it was built
-  against, so an auditor (human or LLM) can see the trust surface.
-
-**Cost**: low to medium. One new top-level form, a side list, a
-manifest pass.
-**Depends on**: stage-2 type checker.
-
-## 5. `kai effects <target> --json` — effect graph as data
-
-**Status: LANDED 2026-04-27** as Full lane 2.3.a (m7f LLM
-affordances). Surfaced as the `--effects-json` flag on the
-existing `kaic2` binary (the multi-subcommand `kai` driver is
-post-MVP); the per-fn JSON output is identical to the spec's
-example. v1 reports only direct `Eff.op` references — effect
-propagation across calls (e.g. `main` picking up `/ Stdout`
-because it calls `greet : / Stdout`) is a v2 add. Fixture:
-`examples/sugars/effects_json_basic.kai`.
-
-```
-$ kai effects src/ --json
-[
-  { "fn": "greet",
-    "effects": ["Io"],
-    "handled_in": null },
-  { "fn": "main",
-    "effects": [],
-    "handlers_installed": [
-      { "effect": "Io", "at": "main.kai:9" }
-    ] }
-]
-```
-
-Summary of which effects each function performs and where handlers
-are installed across the call graph. Complements `kai type` for
-effect-row-level queries.
-
-**Cost**: low once effect inference is working — it walks the
-inferencer's output.
-**Depends on**: stage-2 effect inference.
-
-## 6. `?e` — effect holes
-
-**Status: LANDED 2026-04-27** as Full lane 2.3.b. Parser accepts
-`?e` and `?` (anonymous) in row tail position; the typer treats
-the hole as an anonymous row variable, so the body's effects
-unify into it exactly as they would into a user-named row var
-like `e`. The compiler-side reporter (which would print
-`?e resolves to ...`) is v2 — exposing the row at the hole site
-needs the post-typer TyEnv that TypedProgram does not yet expose.
-Fixtures: `examples/sugars/row_hole_basic.kai` (positive),
-`examples/sugars/row_hole_not_tail.kai` (rejection).
-
-```kai
-fn run() : Int / ?e {
-  perform Io.read_line() |> string_to_int |> unwrap
-}
-```
-
-The compiler infers `?e` and reports it like a regular hole: `?e`
-resolves to `Io + Fail`. Useful when the user does not yet know which
-effect row a function belongs to — common during exploratory work
-and when an LLM is drafting a signature.
-
-**Cost**: low. Effect rows are already unification variables during
-inference; this exposes one as a named hole.
-**Depends on**: typed holes + effects.
-
-## 7. `import ?name` — dependency holes
-
-**Status: LANDED 2026-04-27** as Full lane 2.3.c. Parser accepts
-`import ?name`; the resolver scans a hardcoded stdlib module list
-(core / actor / effects / loop / protocols / reader / spawn /
-writer) plus modules the user imported by name in this file, and
-emits one of three diagnostics: single-match (suggests the literal
-replacement), multi-match (lists candidates), or no-match (with
-the v1 limitation note). Bare `import ?` (no name) is rejected at
-parse. Fixtures: `examples/sugars/import_hole_no_match.kai`,
-`examples/sugars/import_hole_bare.kai` (negatives — positive
-flow needs `--path stdlib` so it lives in a future
-test-import-holes target).
-
-```kai
-import ?parse_expr
-```
-
-When the user knows the symbol they need but not the module, the
-compiler searches the stdlib and project modules and reports
-candidates:
-
-```
-foo.kai:1:8: import hole
-
-  looking for a module that exports `parse_expr`:
-    - syntax.parser           (pub fn parse_expr(...))
-    - experimental.pratt      (pub fn parse_expr(...))
-
-  replace `?parse_expr` with one of those paths.
-```
-
-**Cost**: low. Needs a symbol index over the loaded modules; the
-resolver already visits them.
-**Depends on**: module resolution (stage 2).
-
-## 8. `kai lint --json` — canonical style as data
+## 3. `kai lint --json` — canonical style as data
 
 ```json
 [
@@ -273,321 +131,80 @@ output pipeline is trivial once the rules exist.
 **Depends on**: a canonical-form style guide (cultural design work,
 not technical).
 
-## 9. Tuples — anonymous products
+## Tuples — REJECTED (2026-04-27)
 
-```kai
-pub fn player_turn(hand: [Card], deck: [Card]) : ([Card], [Card]) {
-  if hand_score(hand) >= 21 { (hand, deck) }
-  else { ... }
-}
+This decision is preserved here because future contributors will
+ask "why no tuples?" and need to find the answer rather than
+re-debate it.
 
-let (new_hand, new_deck) = player_turn(hand, deck)
-```
+**Verdict**: tuples do **not** earn a slot as a second product form
+in kaikai. Records cover anonymous-product use cases at the same
+or smaller signature length once `Pair[a, b]` exists in stdlib.
 
-`kaikai-minimal.md` excludes tuples for the minimal subset ("No
-tuples (use records; or use sum-type variants with positional
-fields)"). For **full kaikai** the status is open: it falls under
-`design.md`'s *"Concrete syntax consolidation: eliminate redundancies
-— collections `[]`/`()`/`{}`"*, which is explicitly deferred.
+### How the gate ran
 
-This entry is here so the debate can be closed concretely rather
-than by default.
-
-### What they buy
-
-- **Anonymous products** where field names are noise. Pairs like
-  `(hand, deck)`, `(key, value)`, `(found, rest)` are semantically
-  pairs; inventing two field names is ceremony that obscures intent.
-- **Positional destructuring** for small fixed products. List
-  patterns already support `[a, b, ...rest]`; tuples extend the same
-  idea to finite-arity products.
-- **Shorter signatures**. `: ([Card], [Card])` vs
-  `: { hand: [Card], deck: [Card] }` saves both the field names in
-  the return type and the field-access chatter at every use site.
-
-### What they cost
-
-- **Second form of product type** alongside records. Violates "one
-  canonical form" unless justified by a crisp split: tuples for
-  anonymous products, records for named ones.
-- **Syntactic disambiguation**: `(x)` is grouping. `(x,)` for
-  1-tuples (Python-style) is the mandatory wart.
-- **Parser bookkeeping**: a parenthesised expression list must be
-  distinguished from function-call argument lists. Local cost.
-
-### Decision posture
-
-Two coherent positions:
-
-1. **Reject**: keep records, keep the surface small. Record
-   punning (proposal 10 below) covers most of the ergonomic gap
-   without adding a second product form.
-2. **Accept**: give anonymous products their own form. Reserve
-   records for cases where field names carry meaning. This matches
-   how kaikai already distinguishes `[...]` (ordered) from records
-   (named) — tuples complete the matrix for finite arity.
-
-Neither is obviously right. A concrete measurement: rewriting the
-blackjack example (≈176 lines of kaikai) to use tuples where it uses
-records for anonymous pairs produces **zero line-count savings** —
-every `{ x: x, y: y }` expression already fit on its own line, and
-`(x, y)` takes the same line. The gain is per-line readability, not
-fewer lines. That is a real but smaller win than one might guess.
-
-Line-count impact may be larger in code that uses many multi-return
-helper functions, where `let (a, b) = ...` collapses two
-binding-lines into one. Blackjack does not exercise that pattern
-heavily.
-
-### Decision gate — post-m8
-
-(History: this gate ran on 2026-04-27 and produced a formal
-**REJECT**. The original gate description and the post-mortem
-follow.)
-
-The decision was **deferred to a measurement protocol after m8
-closes**. Rationale: blackjack (the only concrete data point so
-far) is sequential, has no fibers/actors/nurseries, and does not
-exercise the patterns where tuples plausibly help most:
-
-- `Spawn.spawn(...)` returning `(Pid, Fiber)`.
-- `nursery { n -> ... }` closing with `(results, errors)`.
-- Parsers/scanners returning `(value, rest_of_input)`.
-- Pattern-destructured multi-return in `match` arms.
-
-Post-m8 (fibers + actors + nurseries shipped, Doc B catalog
-fully populated), the measurement protocol picked a representative
-effect-heavy program and rewrote it under each posture. Decision
-rule:
+After m8 closed (fibers + actors + nurseries shipped), a measurement
+protocol picked a representative effect-heavy program and rewrote
+it under each posture. Decision rule:
 
 - **≥10% line-count savings** OR **≥30% reduction in average
-  signature length on multi-return functions** → **accept**;
-  schedule a follow-up milestone for tuples + destructuring
-  patterns.
-- **Below those thresholds** → **reject formally**; close the
-  open decision, remove tuples from this catalog, document
-  record punning (#10) as the canonical answer.
+  signature length on multi-return functions** → accept.
+- Below those thresholds → reject formally.
 
-### Decision — REJECTED (2026-04-27)
+The gate ran against a parser combinator suite (an arithmetic
+calculator with two-level precedence and parens) — 7 multi-return
+parsers `p_*` returning the "value + rest of input" shape, the
+densest plausible exercise of multi-return.
 
-The gate ran on 2026-04-27 against a parser combinator suite (an
-arithmetic calculator with two-level precedence and parens). The
-suite has 7 multi-return parsers `p_*` returning the
-"value + rest of input" shape — the densest plausible
-exercise of multi-return.
-
-**Methodology adjustment.** The natural strawman A (one record per
+**Methodology adjustment.** The natural strawman (one record per
 parser shape: `ParsedExpr`, `ParsedInt`, etc.) was rejected as
-unfair — it inflates the pro-tuples case. The honest baseline A'
-uses one *generic* record `Parsed[a] = { value: a, rest: [Token] }`,
-which kaikai already supports today (verified separately with
-`probe_generic.kai`). Comparison is A' vs B (tuples).
+unfair — it inflates the pro-tuples case. The honest baseline uses
+one *generic* record `Parsed[a] = { value: a, rest: [Token] }`,
+which kaikai already supports.
 
 **Metrics (n = 7 multi-return parsers)**:
 
-| Metric                              | A' (generic record) | B (tuples) | Δ      |
-|-------------------------------------|--------------------:|-----------:|-------:|
-| Lines (non-blank, non-comment)      |                 135 |        132 | −2.2%  |
-| Avg signature length (chars)        |               51.43 |      54.43 | +5.8%  |
+| Metric                              | Generic record | Tuples     | Δ      |
+|-------------------------------------|---------------:|-----------:|-------:|
+| Lines (non-blank, non-comment)      |            135 |        132 | −2.2%  |
+| Avg signature length (chars)        |          51.43 |      54.43 | +5.8%  |
 
 Both gates fail. Tuples save 3 lines (one for the `Parsed[a]`
 declaration, two for collapsed constructions) — far short of 10%.
 Signatures with tuples are *longer* than with generic records:
-`Parsed[Expr]` is 12 chars; `(Expr, [Token])` is 15. The 30% sig
-reduction the rule asked for becomes a 5.8% expansion.
+`Parsed[Expr]` is 12 chars; `(Expr, [Token])` is 15.
 
-**Verdict — reject formally.** Tuples do not earn a slot as a
-second product form. The artefacts of the measurement live at
-`/tmp/kaikai-m8.5-measurement/` (`parser_records_v2.kai` compiles
-and runs; `parser_tuples.kai` is source-only).
-
-### Stress test — where do tuples still win, and what did the gate not cover?
+### Where tuples still win, and how kaikai answers without them
 
 After the verdict, a stress test surveyed the canonical use cases
-of tuples in other languages and asked which ones kaikai still
-covers awkwardly. Three honest gaps surfaced; none requires
-tuples-as-a-second-product-form.
+of tuples in other languages and found three honest gaps; **none
+required tuples-as-a-type**.
 
-1. **`Pair[a, b]` is missing from stdlib.** Without it, every
-   ad-hoc multi-return shape declares its own nominal record (the
-   compiler itself has ~10 `type StmtsRewrite = { ... }` /
-   `type PcsRwBlock = { ... }` declarations of this exact shape).
-   A single generic record in `stdlib/core/tuple.kai` (formerly
-   `stdlib/core.kai` pre-split) collapses the pattern. Cost: 1 line.
-
+1. **`Pair[a, b]` in stdlib** — a single generic record collapses
+   the pattern of ad-hoc `type StmtsRewrite = { ... }` declarations.
    ```kai
    pub type Pair[a, b] = { fst: a, snd: b }
    ```
+2. **Multi-arg `match` sugar** — `match a, b { PatA, PatB -> ... }`
+   desugaring to a nested match. The `(a, b)` is *transient*: never
+   escapes the arm. Tracked as the only pending language-surface
+   item this gate produced; see proposal 9 below.
+3. **Record destructuring in `let` + record punning** — together,
+   `let { fst, snd } = transfer(a, b)` matches the ergonomics of
+   tuple destructuring. Both shipped in m7d.
 
-2. **Multi-arg match sugar.** Four `demos/*` (`forth`, `toquefama`,
-   `9d9l/huffman`, `9d9l/toquefama`) use the syntactic shape
-   `match (a, b) { (PatA, PatB) -> ... }` to do
-   pattern-destructure two scrutinees in one arm. The `(a, b)` is
-   *transient*: it never escapes the match, no signature returns
-   it, no `let` bindings see it. The right answer is parser sugar
-   for `match a, b { PatA, PatB -> ... }`, desugaring to a nested
-   match. Documented separately as a scheduled mini-lane (~1 day,
-   parser only — no new type).
+**Why the gate's verdict generalises**: tuples in other languages
+excel where the host has weak records (Haskell pre-RecordDotSyntax,
+OCaml's nominal-only records) or no generics over records. Kaikai
+has neither deficit — `{ fst: a, snd: b }` is as terse as `(a, b)`,
+and `Pair[a, b]` (10 chars) competes with `(a, b)` (5 chars) only
+in the smallest cases.
 
-3. **Record destructuring in `let` + record punning.** Today
-   `let p = transfer(a, b); let from = p.fst; let to = p.snd`
-   takes three lines. With destructuring + punning (proposal #10)
-   it collapses to `let { fst, snd } = transfer(a, b)`. Punning
-   alone is a no-brainer post-REJECT (it is exactly the canonical
-   answer the decision rule promotes); destructuring is the
-   companion piece for symmetric reads. Together they are the
-   *real* "ergonomic equivalent" of tuple destructuring.
+The places tuples win unambiguously (transient pattern matching)
+are not tuple-as-type; they are syntactic sugar over multi-arg
+match.
 
-The three together cover ~95% of the ergonomic delta tuples would
-have given, at a fraction of the surface-area cost. Tuples as a
-second product form remain rejected.
-
-**What the gate did *not* cover and why it does not change the
-verdict:** tuples in other languages excel where the host has weak
-records (Haskell's pre-RecordDotSyntax, OCaml's nominal-only
-records) or no generics over records. Kaikai has neither
-deficit — `{ fst: a, snd: b }` is as terse as `(a, b)`, and
-`Pair[a, b]` (10 chars) competes with `(a, b)` (5 chars) in just
-the smallest tuples. The places tuples win unambiguously
-(transient pattern matching) are not tuple-as-type; they are
-syntactic sugar over multi-arg match.
-
-**Cost (historical)**: low-to-medium. Parser changes were local;
-type-system extension was one product rule per arity. But cost is
-moot now — the feature is closed.
-**Depends on (historical)**: m8 close (fibers + actors + nurseries
-available for the measurement corpus). Closed 2026-04-27 against
-a parser combinator suite (m8 corpus condition relaxed: any
-realistic multi-return-heavy program suffices, the verdict
-generalises).
-
-## 10. Record punning `{ x, y }` — additive sugar
-
-**Status: LANDED (already shipped pre-§9)**. Verified working in
-the three positions kaikai exposes records: literal, match
-pattern, and let-destructure. The §10 + §28 follow-up trio that
-the m8.5 tuples REJECT promised is now complete.
-
-```kai
-type Pair = { x: Int, y: Int }
-
-# 1. Literal punning — desugars `{ x, y }` to `{ x: x, y: y }`.
-let p = Pair { x, y }                    # already worked
-
-# 2. Match-pattern punning — same desugar in pattern position.
-match p {
-  { x, y } -> ...                        # already worked
-  { x: a, y: b } -> ...                  # explicit rename also OK
-}
-
-# 3. Let-destructure punning — added by §28 (commit b3aa642).
-let { x, y } = p
-```
-
-### What §10 deliberately does not include
-
-- **Anonymous records (no nominal type)**: `let p = { x, y }` is
-  rejected. kaikai records are nominal — a literal needs the
-  `TypeName { ... }` prefix so the typer can unify the field
-  names against a declared shape. This is a kaikai design
-  decision, not a §10 limitation. If anonymous records ever
-  ship (they would be structural, not nominal), punning is
-  trivially additive there too.
-- **Record update via `with`** (`p with { x }`): not a parser
-  feature kaikai exposes today. Independent proposal — out of
-  §10 scope.
-
-### LLVM backend caveat (pre-existing, not §10)
-
-The LLVM backend's match-arm emitter does not support record
-patterns yet (`pattern kind not supported at <line>:<col>`).
-The C backend handles every form; LLVM coverage for record
-patterns is a separate fix orthogonal to §10. The `record_punning`
-fixture exercises the literal and let-destructure paths — both
-dual-backend.
-
-Aligns with all principles — doesn't add a construct, only
-shortens a common pattern.
-
-**Cost**: trivial (already shipped).
-**Depends on**: nothing.
-
-## 11. `variants[T]()` — enumerate sum-type constructors
-
-**Status: LANDED 2026-04-27** as Full lane 1.3, the first
-post-`map_expr_kind` feature that exercises the new shared visitor
-abstraction. The lane added a fresh `ExprKind` variant
-(`EVariantsOf(TypeExpr, [String])`); the shared visitor caught it
-in one match site instead of degrading the ten walkers — exactly
-the property `map_expr_kind` was introduced to ensure.
-
-```kai
-type Rank = Two | Three | ... | Ace
-
-let all_ranks = variants[Rank]()
-# [Two, Three, Four, Five, Six, Seven, Eight, Nine, Ten,
-#  Jack, Queen, King, Ace]
-```
-
-A builtin (not a macro) that, for a sum type `T` with
-*nullary* constructors only, returns the list of all constructors.
-The compiler has this information after resolution; exposing it is
-mechanical.
-
-Restricted to nullary constructors on purpose: once any variant
-takes arguments, "list all inhabitants" is ill-defined.
-
-### Implementation summary
-
-- Parser (`parse_ident_primary`): special-cases `variants[T]()` via
-  a 5-token lookahead — when the source ident is exactly
-  `variants` and the next token is `[`, the parser routes through
-  `parse_variants_of`. Any other `variants[expr]` parse falls
-  through to the existing `EIndex` postfix path. Not a reserved
-  keyword.
-- AST: `EVariantsOf(TypeExpr, [String])`. The TypeExpr is whatever
-  `parse_type` accepts; the second field is the typer-resolved
-  variant names. Parser emits `[]` for the names list; the typer
-  fills it.
-- Resolver / typer (`synth_variants_of`): resolves the TypeExpr to
-  Ty, demands `TyCon`, and walks the env via
-  `check_variants_nullary`. The walker partitions entries
-  returning the target tycon into nullary (the OK list) vs
-  payload-bearing (the error list); a fresh sum
-  `VariantsCheck = VCOk | VCNotSum | VCHasPayload` carries the
-  three outcomes back. Errors emit `diag_error` + `diag_note` +
-  `diag_help`. Result type: `TyListT(TyCon(name, []))`.
-- Codegen C (`emit_variants_of_list`): kai_cons spine of
-  `kai_variant(0, "Name", 0, NULL)` calls.
-- Codegen LLVM (`llvm_emit_variants_of`): mirrors the C shape
-  using `llvm_emit_variant_ctor` + `kaix_cons` + `kaix_nil`.
-- Order: declaration order. `env.entries` is most-recent-first
-  (`ty_env_add` prepends), so walking head-to-tail and prepending
-  to the accumulator double-inverts back to declaration order.
-  Documented inline; the original `variants_of_type_loop` does a
-  redundant `list_reverse` that was never noticed because its
-  caller (exhaustiveness) is order-insensitive.
-
-### Fixtures
-
-- `examples/sugars/variants_basic.kai` — Suit nullary, golden
-  `H D C S done`, dual-backend via `test-llvm-coverage`.
-- `examples/sugars/variants_payload.kai` — `Mixed = Foo | Bar(Int) | Baz | Qux(String)`,
-  rejected with names of payload-bearing variants in the diag.
-- `examples/sugars/variants_builtin.kai` — `variants[Int]()`,
-  rejected ("requires T to be a named user type").
-- `examples/sugars/variants_undeclared.kai` —
-  `variants[NoSuchType]()`, rejected ("requires T to be a
-  declared sum type").
-
-**Cost (historical)**: low. Closed in ~1 day of work after
-`map_expr_kind` landed. The visitor abstraction reduced the
-per-walker overhead to a single shared match site for the new
-node kind; the per-pass `_ -> k` debt the post-Core REOPEN
-documented does not re-appear here.
-**Depends on**: nothing further.
-
-## 12. Sum types with constant attributes
+## 4. Sum types with constant attributes
 
 ```kai
 type Rank with { value: Int, label: String } {
@@ -661,16 +278,7 @@ no polymorphism — pure desugaring.
    dispatch).
 5. **No typeclass drift.** This extension generates *one* function
    per attribute, at *one* type. No ad-hoc polymorphism, no instance
-   resolution. If someone later proposes "extend this to derive
-   across types," that is a separate, much bigger proposal.
-
-### Alternative available today
-
-The refactor `fn rank_info(r) -> { value, label }` + two accessors
-achieves the same effect in 19 lines vs the 15 lines of the attribute
-declaration. For a single enum, savings are modest. The case for
-this proposal rests on codebases with many small enums carrying a
-couple of constants each — the multiplier is in breadth, not depth.
+   resolution.
 
 ### Decision posture
 
@@ -687,142 +295,7 @@ pattern.
 addition to emit the projection functions.
 **Depends on**: parser + resolve pass.
 
-## 13. `!` postfix — `Option` / `Result` propagation
-
-```kai
-fn parse_config() : Result[Config, Error] {
-  let raw = read_file("config.toml")!
-  let parsed = parse_toml(raw)!
-  validate(parsed)
-}
-```
-
-The `!` suffix on an expression of type `Option[T]` or `Result[E, T]`
-unwraps the success case into a `T` and short-circuits the enclosing
-function on the failure case. Equivalent to Rust's `?`, renamed
-because `?` is already taken by typed holes.
-
-**Status**: **landed m7e §13** (mini-lane ahead of m12.8 — see
-`docs/stage2-design.md` §"Update 2026-04-26 — post-m7b reordering").
-The token was already reserved in `docs/kaikai-minimal.md` ("`!` is
-reserved (post-minimal uses for `Option`/`Result` propagation)");
-this entry formalised the semantics, and the parser, typer (with
-enclosing-`ret_ty` threading), C emitter, and LLVM emitter all
-implement it. The LLVM lowering uses a `bang.unwrap` / `bang.fail`
-basic-block split: on `Some` / `Ok` the payload at `args[0]` is
-extracted via `kaix_variant_arg`; on `None` / `Err` the operand is
-returned verbatim from the enclosing fn. Stage 2's own source does
-not use `!`, so selfhost and selfhost-llvm round-trip cleanly.
-Fixtures live under `examples/sugars/m7e_13_*`; the same five
-positive fixtures have also been verified end-to-end under
-`--emit=llvm` (manual run — the existing `test-llvm` Makefile target
-only iterates `examples/minimal/` and `examples/llvm/`, so adding
-sugars to the LLVM fixture harness is a separate follow-up
-documented in `docs/lane-experience-m7e13.md` Phase 2).
-
-### Semantics
-
-- `expr!` on `Option[T]`:
-  - `Some(x) -> x`
-  - `None` → the enclosing function returns `None`.
-  - The enclosing function's return type must be `Option[U]` for
-    some `U`.
-- `expr!` on `Result[E, T]`:
-  - `Ok(x) -> x`
-  - `Err(e)` → the enclosing function returns `Err(e)`.
-  - The enclosing function's return type must be `Result[E, U]`
-    for the same error type `E` (no `From`-style coercion — that
-    would be a typeclass).
-- Type error if the enclosing function's return type is incompatible.
-  The error message must name both types and point at both the `!`
-  and the function signature.
-
-### What it buys
-
-- Linear success paths: the happy case reads top-to-bottom, without
-  match pyramids.
-- Errors propagate with one character, not a five-line match.
-- The `!` is **visible at the call site** — it is not implicit
-  propagation. Readers see where the early returns are.
-
-### What it costs
-
-- Adds a postfix operator. Parser work is local.
-- Fixes the semantics to `Option` and `Result` only. No user-defined
-  "monad-like" types can participate — that would require typeclass
-  resolution, which Tier 1 forbids.
-
-### Explicit non-goals
-
-- **No `From`-style error conversion.** If the function returns
-  `Result[AppError, T]` and the callee returns `Result[IoError, T]`,
-  `callee()!` is a type error. The user must convert explicitly.
-  Rust added `From` to its `?` and paid with typeclass complexity;
-  kaikai does not.
-- **No user-defined `!`.** It is not a trait method. It is compiler
-  sugar bound to two specific types.
-
-**Cost**: low. Parser + two desugar rules (one for `Option`, one for
-`Result`) in the typed-IR pass.
-**Depends on**: `Option` and `Result` in prelude (present since
-kaikai-minimal).
-
-## 14. `@` as-patterns in `match`
-
-```kai
-match xs {
-  all@[h, ...t] if needs_original(h) -> {
-    log(all)                    # the full list, not rebuilt
-    process(h, t)
-  }
-  [] -> default()
-}
-```
-
-`name@pattern` binds `name` to the whole scrutinee when `pattern`
-matches, *and* destructures as `pattern` for the remaining pattern
-variables. Same semantics as Haskell and Rust.
-
-### What it buys
-
-- Access to both the destructured pieces and the whole value in one
-  arm, without rebuilding `[h, ...t]` into a new list or introducing
-  a `let all = xs; match all { ... }` wrapping.
-- Common in linting, logging, and audit code where the original
-  structure must be referenced alongside its parts.
-
-### What it costs
-
-- Adds one pattern form. The grammar gains `Ident "@" Pattern` as a
-  pattern alternative.
-- No runtime cost — the binding is already computed.
-
-### Constraints
-
-- Only in `match` arms and `let` bindings, both already established
-  pattern contexts.
-- The bound name must be a fresh identifier (no shadowing of an
-  existing binding in scope — diagnostic required).
-
-### Symbol reuse: `@` in two roles
-
-`docs/effects-stdlib.md` (Doc B / m7b) uses `@cap` as a prefix
-unary operator on expressions — `@counter` means `counter.get()`
-on a `State[T]` capability binding, `@config` means
-`config.ask()` on a `Reader[T]` one. The contexts are disjoint:
-this proposal's `@` is *infix*, between an identifier and a
-pattern, and appears only where patterns are legal (`match`
-arms, `let` bindings). Doc B's `@` is *prefix*, on expressions.
-
-No grammatical ambiguity — the parser can tell which role applies
-from the surrounding production. If this proposal lands, the
-documentation for both should cross-reference the other so readers
-know `@` plays two disjoint roles.
-
-**Cost**: trivial. One grammar rule plus one resolve-pass case.
-**Depends on**: parser.
-
-## 15. `?.` optional chaining
+## 5. `?.` optional chaining
 
 ```kai
 # user: Option[User]; u.profile: Option[Profile]; p.display_name: String
@@ -831,8 +304,8 @@ let name: Option[String] = user?.profile?.display_name
 
 Safe navigation over `Option`. Desugars to nested `opt_and_then`
 calls that short-circuit on `None`. The semantics matches
-Swift / Kotlin, except restricted to `Option` (no reference nullability
-in kaikai).
+Swift / Kotlin, except restricted to `Option` (no reference
+nullability in kaikai).
 
 ### Semantics
 
@@ -866,129 +339,20 @@ in kaikai).
   sum types. Same reasoning as `!`: generalising would require
   typeclasses.
 - No `?[i]` for optional list indexing in the first pass —
-  `list_nth` + `opt_and_then` covers it for now. Reconsider if
-  demand appears.
+  `list_nth` + `opt_and_then` covers it for now.
+
+### Decision posture
+
+Land after `!` has been used enough to confirm the two do not
+overlap in practice. `?.` is local; `!` propagates. If the code
+base mostly wants propagation, `?.` may not be worth the
+complexity — re-evaluate then.
 
 **Cost**: low. Parser addition plus one desugar in the typed-IR
 pass (to nested `opt_and_then`).
 **Depends on**: parser + type checker.
 
-## 16. Bit operations — schedule m13 (intrinsic functions)
-
-```kai
-import bit
-
-fn pack_byte(bits: [Int]) : Int =
-  bits |> reduce(0, (acc, b) => bit.or(bit.shl(acc, 1), b))
-
-fn extract(byte: Int, pos: Int) : Int =
-  bit.and(bit.shr(byte, pos), 1)
-```
-
-A concrete demand surfaced (`demos/9d9l/huffman` bit-packing,
-upcoming `crypto` / `encoding/base64` stdlib modules). Bit ops ship
-as **named functions in `stdlib/core/bit.kai`**, not as new
-operators. The compiler recognises them as intrinsics and lowers
-each call directly to the backend's bit op — same code emitted as
-if `&`/`^`/`<<`/`>>` were syntax, no function-call overhead.
-
-### Why functions, not operators
-
-- **Surface stays small**: no new tokens, no precedence rules, no
-  parser change. CLAUDE.md Tier 1 #3 (fast compilation) and Tier 2
-  #6 (few visible concepts) both reward this.
-- **No conflict with `|`**: the map-pipe keeps its slot. Asymmetric
-  operator sets (`&`, `^`, `<<`, `>>` but not `|`) are avoided too;
-  the function form is uniform.
-- **Performance**: the compiler treats `bit.and` / `bit.or` /
-  `bit.xor` / `bit.shl` / `bit.shr` / `bit.not` as **intrinsics** —
-  they are recognised by name in the typed IR and emitted directly
-  as the corresponding C / LLVM bit op. Zero call overhead;
-  monomorphisation is unnecessary because they are already
-  monomorphic on `Int`.
-- **Readability**: in code that does heavy bit manipulation
-  (compression, crypto, parsing binary formats), the bit ops are
-  one node per call — the same density as operator chains. The
-  cost is a few extra characters per line, which buys parser /
-  lexer / precedence-table simplicity.
-
-### The `bit` module
-
-```kai
-# stdlib/core/bit.kai
-
-pub fn bit.and(a: Int, b: Int) : Int           # intrinsic
-pub fn bit.or(a: Int, b: Int)  : Int           # intrinsic
-pub fn bit.xor(a: Int, b: Int) : Int           # intrinsic
-pub fn bit.not(a: Int)         : Int           # intrinsic
-pub fn bit.shl(a: Int, n: Int) : Int           # intrinsic, signed left shift
-pub fn bit.shr(a: Int, n: Int) : Int           # intrinsic, arithmetic right shift (sign-extending)
-pub fn bit.ushr(a: Int, n: Int) : Int          # intrinsic, logical right shift (zero-fill)
-
-# Non-intrinsic helpers (real functions, but pure):
-pub fn bit.popcount(n: Int) : Int
-pub fn bit.leading_zeros(n: Int) : Int
-pub fn bit.trailing_zeros(n: Int) : Int
-pub fn bit.rotate_left(n: Int, k: Int) : Int
-pub fn bit.rotate_right(n: Int, k: Int) : Int
-```
-
-The first seven are intrinsics — recognised by the compiler at the
-typed-IR level and lowered directly. The auxiliary helpers are
-ordinary kaikai functions implemented in terms of the intrinsics.
-
-### What it costs
-
-- **Stdlib**: one new module file.
-- **Compiler**: an intrinsic-recognition pass between type
-  inference and codegen. Walk the typed IR; for each call to a
-  `bit.*` symbol that the table marks intrinsic, replace with the
-  corresponding low-level node. ~50 lines.
-- **Backend (C and LLVM)**: emit the corresponding op for each
-  intrinsic node. ~30 lines per backend.
-- **No lexer / parser / precedence change**.
-
-Total ~1 day at observed velocity.
-
-### Decision posture
-
-**Schedule m13**, alongside property testing and bench. The crypto
-and encoding stdlib modules planned for m14 lean on this; landing
-the intrinsics just before keeps that stdlib code performant
-without resorting to FFI.
-
-### Status — flat-prefix subset landed
-
-The intrinsic chunk shipped in m13 with twelve flat-prefix names
-(`bit_and` / `bit_or` / `bit_xor` / `bit_not` / `bit_shl` /
-`bit_shr` / `bit_ushr` / `bit_count` / `bit_test` / `bit_set` /
-`bit_clear` / `bit_toggle`). Registered in the typer's intrinsic
-table, lowered inline by `emit_call_value` to the matching C
-operator with zero call overhead. Documentation lives in
-`stdlib/math/bits.kai` (header-only — no bodies, since the typer
-recognises the names directly). Fixture and structural assertion
-in `examples/stdlib/bits_basic.kai` plus `stage2/Makefile`
-`test-stdlib`.
-
-**Dotted `bit.*` surface landed.** `bit.and(a, b)` /
-`bit.or(a, b)` / `bit.xor(a, b)` / `bit.not(a)` /
-`bit.shl(a, n)` / `bit.shr(a, n)` / `bit.ushr(a, n)` /
-`bit.count(a)` / `bit.test(a, n)` / `bit.set(a, n)` /
-`bit.clear(a, n)` / `bit.toggle(a, n)` are sugar for the
-flat-prefix names — `rqc_kind` rewrites
-`EField(EVar("bit"), fname)` to `EVar("bit_" ++ fname)` before
-the m14 ModuleEntry lookup, so the existing intrinsic path in
-`emit_call_expr` lowers each call inline with byte-identical C.
-The parser accepts `and` / `or` / `not` / `test` after `.` as
-field-name tokens (no other production consumes them in that
-position). Fixture `examples/stdlib/bits_dotted.kai`; the same
-operator-inlined assertion in `stage2/Makefile` `test-stdlib`
-covers both surfaces. The auxiliary helpers (`leading_zeros`,
-`trailing_zeros`, `rotate_left`, `rotate_right`, plus the
-ergonomic alias `bit.popcount` for `bit.count`) remain open for
-a future m13 chunk; `bit.count` covers the popcount slot.
-
-## 17. `Map[K, V]` — hash-map / associative container
+## 6. `Map[K, V]` — hash-map / associative container
 
 ```kai
 let scores: Map[String, Int] = Map.empty()
@@ -1053,7 +417,7 @@ several days of type-system and stdlib work.
 **Depends on**: a collection-design pass that also closes
 `Vector[T]` (see Doc B §`Mutable` *Known gap*).
 
-## 18. Slice syntax `a[i..j]`
+## 7. Slice syntax `a[i..j]`
 
 ```kai
 let prefix = xs[0..5]        # first five elements
@@ -1104,82 +468,7 @@ view-based slices with region tracking.
 **Depends on**: `Vector[T]` landing; range-literal `..`
 confirmed in the grammar.
 
-## 19. Method references as first-class values (point-free)
-
-**Status: PARTIALLY LANDED 2026-04-27** as Full lane 2.3.d (v1).
-Implemented: the `.field` placeholder lambda — `.name` in
-expression position desugars to `(__pl) => __pl.name`. Covers the
-canonical `map(xs, .field)` and `xs | .field` patterns the spec
-cites as the most common method-ref use case. The general
-`obj.method` (receiver-bound ref) form is **deferred to v2**:
-it requires parser ambiguity resolution against record field
-access plus brand-machinery extension for receiver-Fiber refs
-(so `n.spawn` cannot escape the nursery any more than
-`Fiber[T]` can). Fixtures: `examples/sugars/method_ref_field.kai`,
-`examples/sugars/method_ref_pipe.kai`.
-
-```kai
-# Today (lambda required):
-options | (f) => n.spawn(f)
-xs      | (x) => x.label
-list    |> reduce(0, (acc, x) => acc + x.cost)
-
-# With point-free:
-options | n.spawn
-xs      | .label              # placeholder already covers this case
-list    |> reduce(0, (+).on(.cost))   # if `(+).on(...)` is also added
-```
-
-A method or operation reference, written as `obj.method` or
-`Type.method` without trailing parens, would denote the
-function value `(args...) => obj.method(args...)`. Same idea as
-Kotlin's `obj::method`, Scala's `obj.method _`, or Python's
-unbound-method syntax — applied to kaikai's effect ops and
-records.
-
-### What it buys
-
-- The map pipe (`|`) and other higher-order helpers
-  (`reduce`, `filter`, `each`) compose without lambda
-  ceremony when the function you want to apply is already a
-  named method or op.
-- Encourages reading code as a flow of operations rather than
-  an explicit lambda-per-step pipeline. Several functional
-  languages take this further with first-class composition;
-  kaikai already has `|>` and `|`, so first-class method refs
-  is the missing piece for clean pipelines.
-
-### What it costs
-
-- Parser ambiguity to resolve: `obj.method` in expression
-  position must be valid both as a value (the reference) and
-  as the start of a call (`obj.method(args)`). Solvable with
-  one-token lookahead — if the next token after `.method` is
-  `(`, parse as call; otherwise as reference.
-- The placeholder `.field` lambda (`xs | .label`) already
-  covers a subset of the use case — for record field access.
-  This proposal extends the same convenience to ops and
-  methods generally.
-- A method reference closes over the receiver — `n.spawn`
-  captures `n`. Lifetime / region implications need a small
-  amendment to the brand machinery (`n.spawn` cannot escape
-  the nursery any more than `Fiber[T]` can).
-
-### Decision posture
-
-Wanted in the language; deferred until after m7b. The current
-workaround is the explicit lambda `(f) => n.spawn(f)`, which
-adds 13 characters per call site but compiles unambiguously
-today. Once m7b lands and effect rows are stable, revisit
-this proposal as a clean ergonomic improvement.
-
-**Cost**: medium. Parser change (one extra production), brand
-extension for receiver-bound references, and a clear story
-about evaluation order (when does the receiver get
-evaluated — at the reference site, or at the call site?).
-**Depends on**: parser; effect-row stability from m7b.
-
-## 20. `Range[T]` as a first-class iterable
+## 8. `Range[T]` as a first-class iterable
 
 ```kai
 # Today (only as list literal):
@@ -1234,47 +523,92 @@ notion of an iterable?".
 parser. Coupled with the iterable-abstraction question.
 **Depends on**: collection design (`Vector[T]`, `Map[K, V]`).
 
-## 21. Pipeline placeholder `_`
+## 9. Multi-arg `match` sugar — `match a, b { PatA, PatB -> ... }`
 
 ```kai
-# today (with |> applying as first arg)
-x |> add(2)            # add(x, 2)
+# Today (synthesises a transient tuple-shaped pattern):
+fn count_toques(guess: [Int], target: [Int]) : Int = match (guess, target) {
+  ([], _)                  -> 0
+  (_, [])                  -> 0
+  ([g, ...gs], [t, ...ts]) -> {
+    let here = if g == t { 1 } else { 0 }
+    here + count_toques(gs, ts)
+  }
+}
 
-# with placeholder
-x |> add(2, _)         # add(2, x)
-x |> insert(map, _, v) # insert(map, x, v)
+# Proposed (no synthetic tuple, no nested match):
+fn count_toques(guess: [Int], target: [Int]) : Int = match guess, target {
+  [], _                    -> 0
+  _, []                    -> 0
+  [g, ...gs], [t, ...ts]   -> {
+    let here = if g == t { 1 } else { 0 }
+    here + count_toques(gs, ts)
+  }
+}
 ```
 
-`_` marks the position the piped value should land in. The
-default (no `_`) keeps current semantics — first argument for
-`|>`, mapped element for `|`. Without `_` the user falls back to
-`x |> (a) => fn(b, a)`, which kills the pipeline shape every
-time the desired slot is not the first.
+A **scheduled mini-lane** that surfaced from the m8.5 stress test
+(see *Tuples — REJECTED* above). Four `demos/*` files (`forth`,
+`toquefama`, `9d9l/huffman`, `9d9l/toquefama`) use the
+`match (a, b) { (PatA, PatB) -> ... }` shape today, where the
+`(a, b)` is *transient*: it never escapes the match arm and no
+signature returns it. With tuples rejected as a type, a parser
+sugar that scrutinises N expressions and matches N patterns per arm
+gives every demo a clean form without introducing tuples-as-a-type
+through the back door.
 
-The placeholder is an *expression-level* token, distinct from `.`
-(implicit-lambda placeholder used in `xs | . > 0`). The two do
-not overlap: `.` builds an unary lambda over the lambda-implicit
-position; `_` substitutes inside an existing call expression.
-Multiple `_` in the same call are an error (would silently
-duplicate side effects of the LHS).
+### Semantics
 
-**What it buys**: keeps long pipelines readable when functions
-do not consistently take the value as first argument
-(common in stdlib: `String.replace(haystack, needle, repl)`,
-`Map.insert(m, k, v)`).
+The desugaring is mechanical: `match e1, ..., eN { p1, ..., pN -> body | ... }`
+lowers to a nested `match e1 { p1 -> match e2 { p2 -> ... pN -> body } | ... }`
+form. Wildcards in any column behave the same; guards on an arm
+attach to the innermost branch. The compiler emits the same
+exhaustiveness check it already runs on multi-arity sum types.
 
-**What it costs**: low. Parser sugar — desugars to a fresh
-binding (`let __tmp = lhs in fn(arg, __tmp, arg)`) at the
-pipeline-application site. No type-system change.
+The N is constrained at parse time (probably ≤ 4 to keep the
+diagnostics readable; revisit if a use case wants 5+). N must equal
+across every arm; mismatched arities are a parse-time error.
 
-**Depends on**: parser. Lands cleanly post-m7b without affecting
-effect rows or monomorphisation.
+### What it buys
 
-**Reference**: F# 7 (`|> add 2 _`), Hack (`|> $$.method()`),
-Scala 3 (`_` in eta expansion). The F# 7 form is the closest
-match; the desugaring is identical.
+- **No transient tuple type** to support a transient pattern shape.
+  The four affected demos drop their synthesised `(a, b)` and read
+  their two scrutinees positionally.
+- **Same surface area as the existing `match`** for diagnostics
+  and codegen. The desugaring runs in the parser; downstream passes
+  see only nested matches.
 
-## 22. Binary pattern matching `<<...>>`
+### What it costs
+
+- **Parser bookkeeping**: a comma-separated scrutinee list before
+  `{`, plus a comma-separated pattern list per arm. Ambiguity vs
+  function-call args is local to the parser's match-head state.
+- **Diagnostics**: a per-column "missing pattern" message is
+  doable but more work than today's single-scrutinee form. A v1
+  can defer column-aware diagnostics to a follow-up.
+
+### Constraints
+
+1. **Same N across all arms.** Mixed-arity arms are rejected at
+   parse time.
+2. **No defaults / "rest" columns.** A wildcard `_` covers any
+   single column; there is no syntax for "any number of remaining
+   columns".
+3. **Sugar only.** No new ExprKind, no new type, no Pattern node.
+   Desugars to nested matches in the parser.
+
+### Decision posture
+
+**Scheduled** as a parser-only mini-lane (~1 day). Lands when no
+other in-flight lane is in conflict with the parser's match-head
+state. The four demos that depend on it (`forth`, `toquefama`,
+`9d9l/huffman`, `9d9l/toquefama`) flip from FAIL to OK in the
+same commit.
+
+**Cost**: low. Parser sugar with no type-system impact.
+**Depends on**: nothing structural.
+
+## 10. Binary pattern matching `<<...>>`
 
 ```kai
 # parse a length-prefixed packet
@@ -1356,772 +690,6 @@ prior art, 25 years of production use), Elixir bitstrings
 (a recent re-implementation in a typed setting — closest fit
 to what kaikai would adopt).
 
-## 23. `++` operator — string and list concatenation
-
-```kai
-let greeting = "hello, " ++ name ++ "!"
-let merged   = sort(lesser) ++ [pivot] ++ sort(greater)
-```
-
-A single binary operator covering the two concat cases that
-appear constantly in functional code. Resolves to the existing
-prelude functions in lowering:
-
-- `String ++ String  : String`  → `string_concat(a, b)`
-- `[a]    ++ [a]     : [a]`     → `list_append(xs, ys)`
-
-Right-associative, lower precedence than `+`/`-`/`*`/`/`,
-higher than comparison operators. No typeclass; the typer has
-exactly two hardcoded rules — same posture as numeric `+`
-overloaded for `Int` and `Real`.
-
-### What it buys
-
-- **List concat reads as concat**: `sort(lesser) ++ [pivot] ++
-  sort(greater)` versus `list_concat([sort(lesser), [pivot],
-  sort(greater)])` or nested `list_append`s. The list case is
-  the one that actually hurts; string case rides along.
-- **Familiar to every senior**: Haskell, Elm, Erlang use `++`;
-  Elixir uses `<>`/`++`; OCaml uses `^`/`@`; F# uses `+`/`@`.
-  Whichever one a senior knows, kaikai's `++` reads correctly
-  on first glance.
-- **Removes a verbosity that interpolation does not solve**:
-  interpolation handles strings; lists have no interpolation
-  analogue.
-
-### What it costs
-
-- **Parser**: one new binop token, one precedence slot. ~10
-  lines.
-- **Typer**: two type rules, no overload machinery. ~30 lines.
-- **Codegen / desugar**: rewrite `++` to `string_concat` /
-  `list_append` based on the typed AST. ~30 lines.
-- **Stdlib doc churn**: mark `string_concat` and `list_append`
-  as "lowering targets; prefer `++` in source".
-
-Total ~0.5 day at observed velocity.
-
-### Constraints
-
-- **Migration, not addition**: surface drops `string_concat` and
-  `list_append` from idiomatic style — they remain in stdlib as
-  the lowering targets but are not the form callers reach for.
-  This avoids the *intent overlap* concern from CLAUDE.md (the
-  Tier 2 rule against multiple forms with the same intent).
-- **Strings only via `++`, not `+`**: kaikai keeps `+` purely
-  numeric. Overloading `+` for strings (Java/JS/Python style)
-  collides with the strict-arithmetic discipline and would
-  require typeclass-style dispatch the language explicitly
-  rejects.
-
-### Reference
-
-Haskell (`++` for `[a]` and `String = [Char]` unified), Elm
-(`++` for any `appendable`), Erlang (`++` for lists, `<>` for
-binaries; kaikai folds both into `++`), F# (`@` for lists,
-`+` for strings — kaikai picks the more uniform answer).
-
-## 24. `main()` row inference
-
-**Status: LANDED 2026-04-27** as Full lane 1.5 (commit `7e36027`).
-When `main` ships without an explicit row, the typer writes the
-body-performed row back into the DFn so `emit_main_wrapper` /
-`main_row_labels` install the default handlers for every builtin
-the body uses. Only `main` is special-cased; every other public
-function still requires an explicit row. Backwards-compatible:
-`fn main() : Int / Stdout = ...` keeps working — the rewrite only
-fires when the row is REmpty. Fixture:
-`examples/effects/m7e_24_main_row_inferred.kai`.
-
-Known follow-up (not part of this lane): `check_body_row` returns
-without checking when main + REmpty, so a main body that uses an
-effect with no default handler segfaults at runtime instead of
-emitting the "effect not handled" diagnostic the spec prescribes.
-Pre-existing behaviour, not introduced or worsened by the lane;
-fix is a typer check orthogonal to row inference.
-
-```kai
-# today: every effect main uses must appear in the row
-fn main() : Unit / Console = Console.print("hi")
-
-# proposed: main is special — typer infers the row, runtime
-# loads the corresponding default handlers automatically
-fn main() = Console.print("hi")
-```
-
-The current rule "row annotation mandatory in public signatures"
-bites at the entry point with no benefit: `main` has no caller
-that needs to read its row, and there is no API surface to
-stabilise. Forcing the annotation is friction without payoff —
-a senior writing their first kaikai program is asked to declare
-something they cannot use wrong.
-
-### What it buys
-
-- **Hello-world is one line again**: `fn main() = Console.print("hi")`.
-- **Demos in `demos/`** drop ceremonial `: Unit / Console + Stdin +
-  Fail` rows on `main` that exist only to satisfy the typer.
-- **Reduces a confusing error class**: today, removing the row
-  from `main` yields "undefined name `Console`" because the
-  resolver does not load the effect that nothing in the
-  signature references. With inference, the body's mention of
-  `Console.print` is enough to load the effect.
-
-### What it costs
-
-- **Typer**: relax the annotation requirement for the `main`
-  symbol; run row inference on the body and adopt the inferred
-  row as `main`'s declared row. ~30 lines.
-- **Runtime / driver**: the default-handler loader already walks
-  `main`'s row to pick which defaults to install. With inference
-  the row comes from the typer pass instead of the source
-  signature; the loader otherwise unchanged.
-- **Diagnostics**: when `main`'s body uses an effect with no
-  default handler, the existing "effect not handled" diagnostic
-  fires with the same shape as today. No new error class.
-
-### Constraints
-
-- **Only `main`**: every other public function still requires an
-  explicit row. The exception is justified by `main` being the
-  entry point with no caller; generalising to "all public fns"
-  re-opens the row-inference debate the design already closed.
-- **Return type still optional for `main`**: `fn main() = ...`
-  reads as `: Unit` by default; `fn main() : Int = exit_code`
-  stays valid for explicit exit codes.
-
-**Cost**: low. ~0.5 day.
-**Depends on**: m7a (effect rows in types) ✓.
-
-**Decision posture**: scheduled for m7e — pure ergonomics, zero
-risk. Removes a recurring papercut without compromising the
-"effects visible in types" principle: effects are still visible
-at every call site (`Console.print`, `File.read`, etc.); they
-are simply not restated in `main`'s signature where they were
-already implied.
-
-## 25. `use Effect` — open an effect in scope
-
-**Status: LANDED 2026-04-27** as Full lane 1.4. File-level and
-block-level forms shipped together; alias forms (`use Eff as
-Name`) are not part of v1. The desugar runs after
-`desugar_var_decls` and before `lower_protocols`, threading a
-block-scoped opens stack through every fn body and respecting
-pat/param bindings as shadows.
-
-```kai
-# file-level — applies to every fn in the file
-use Console
-
-fn greet(name: String) = println("hello, #{name}")
-fn shout(msg: String)  = eprint("ERR: #{msg}")
-fn main()              = greet("world")
-```
-
-```kai
-# block / fn-level — narrowed scope
-fn write_log(line: String) = {
-  use File
-  let f = open("log.txt")    # File.open
-  write(f, line)             # File.write
-  close(f)                   # File.close
-}
-```
-
-A declaration that brings an effect's operations into the
-surrounding scope without the cap selector. After `use E`,
-every op declared in `E` is callable by its bare name, provided
-the resolution is unambiguous.
-
-### What it buys
-
-- **Compactness for I/O-heavy demos**: hello-world, fizzbuzz,
-  beer_song read as `println(...)` instead of `Console.println(...)`,
-  matching the ergonomics every senior expects from the language.
-- **No global pollution**: scoped to the function (or block) it
-  appears in; outside that scope the operations are not visible
-  by their bare name.
-- **No regression of "effects visible"**: the row of the
-  function still declares `/ Console`. The dot syntax simply
-  becomes optional inside the scope where `use` opens it.
-- **Clear error story**: if two open effects expose the same op
-  name (e.g. `Console.print` and `File.print` both in scope),
-  the resolver emits an ambiguity error and forces explicit
-  qualification. Bare names work only when unambiguous.
-
-### What it costs
-
-- **Parser**: `use Name` as a statement — one new keyword,
-  trivial. ~10 lines.
-- **Resolver**: track an effect's ops as additional bindings in
-  the local scope; reject ambiguous bare-name resolutions.
-  ~50 lines.
-- **Typer**: unchanged. The bare name still resolves to the
-  same op call; the row of the calling function still gains
-  the effect.
-- **Diagnostics**: one new error class — "ambiguous bare name
-  `print`: in scope from both `Console` and `File`; qualify
-  explicitly." Cheap to produce.
-
-### Constraints
-
-- **Three valid scopes**:
-  - File-level `use` at the top of a `.kai` file applies to
-    every declaration in the file. Recommended for files
-    that lean heavily on a single effect (I/O-bound demos,
-    `Console`-only CLI programs).
-  - Block / fn-level `use` narrows the open to a scope.
-    Useful when a single fn touches a different effect from
-    the file's default, or in a library file that wants no
-    file-level imports.
-  - Inner `use` shadows outer for the duration of its scope.
-- **Multiple `use` allowed** with an ambiguity rule: if two
-  open effects expose the same op name (e.g. `Console.print`
-  and `File.print` both in scope), the resolver emits an
-  ambiguity error and forces explicit qualification. Bare
-  names work only when unambiguous.
-- **Does not remove the cap from the row**: `fn main() : Unit
-  / Console = { use Console; println("hi") }` still has
-  `/ Console` in its row — `use` is purely a name-resolution
-  shortcut, not an effect-handling change.
-- **Composes with #24**: `main()` row inference removes the
-  row annotation; `use` removes the cap selector. Together
-  they collapse hello-world to:
-  ```kai
-  use Console
-  fn main() = println("hi")
-  ```
-  Neither requires the other.
-
-### Reference
-
-OCaml `open Module`, F# `open`, Rust `use`, Haskell `import M`
-without qualifier. The mechanism is identical to those
-languages, applied to *effects* rather than modules — the
-underlying resolution mechanism is the same.
-
-### Implementation summary (post-landing)
-
-- `TkUse` keyword + lexer; `DUse(name, line, col)` Decl;
-  `SUse(name, line, col)` Stmt. Effect names must start uppercase
-  (matches the existing convention).
-- `desugar_use_decls` builds an effect→ops table from every
-  `DEffect` in scope (post-`inject_builtin_effects`, so builtins
-  are present), collects the file-level opens from `DUse`, and
-  walks every fn body. The walker threads a `bound` set through
-  pattern bindings, lambda params, handler clause params,
-  return-clause binders, and handler aliases — these all shadow
-  opens. `EVar(name)` not in the bound set rewrites to
-  `EField(EVar(eff), name)` when exactly one open owns the name;
-  zero owners leaves the bare name alone (downstream resolver
-  handles the "undefined name" case); two or more owners emit
-  the ambiguity diagnostic.
-- `EBlock` walking strips `SUse` from the output and pushes the
-  named effect onto a per-block opens stack for the rest of the
-  block (subsequent stmts + tail expr).
-- Empty effect (`use NoSuchEffect`) is validated against the table
-  before any rewrite runs.
-- Downstream `desugar_op_calls` flattens `EField(EVar(eff), name)`
-  to `EVar("eff.name")` as it does for explicitly-qualified call
-  sites.
-
-### Fixtures
-
-- `examples/sugars/use_file_level.kai` — top-level `use Stdout`,
-  `print(...)` resolves in two fn bodies, dual-backend golden.
-- `examples/sugars/use_block_level.kai` — `use Stderr` inside
-  `shout`'s body; sibling `quiet` and `main` still use
-  `Stdout.print(...)` qualified. Verifies block scoping.
-- `examples/sugars/use_ambiguous.kai` — declares `effect MyEff
-  { print(s: String) : Unit }` alongside `use Stdout` + `use
-  MyEff`; rejects with "ambiguous bare name `print`".
-- `examples/sugars/use_undeclared.kai` — `use NoSuchEffect`
-  rejects with "no effect named ... is in scope".
-
-### Constraints not lifted in v1
-
-- **No `use Eff as Name` alias form.** A future iteration can add
-  it; the parser is the only piece that needs to grow.
-- **Aliases of effects (`type Console = Stdout + Stderr +
-  Stdin`)** are not openable with `use Console` — the table only
-  has `DEffect` decls. `use Stdout` / `use Stderr` / `use Stdin`
-  are the workaround. The desugar reports "no effect named
-  Console" at this stage. Lifting this restriction means
-  flattening the alias graph into the open-set, which is
-  mechanical and can ship later.
-
-**Cost (historical)**: low. The ergonomic shape was right on the
-0.5-day estimate; the bulk of the lane went into the
-exhaustive-match arm additions for SUse/DUse across the 14
-non-walker sites that were never visited by `map_expr_kind`.
-
-**Depends on**: m7a (effect rows + cap selectors) ✓.
-
-## 26. Protocols — single-dispatch ad-hoc polymorphism
-
-**Status: Landed in m12.8** (single-dispatch core, both backends).
-**Extended in m12.8.x**: `#derive(Eq)` and `#derive(Hash)` now apply
-to sum types in addition to records (m12.8 v1 had records-only for
-both); the typer rejects sum-type derives whose variants carry a
-field type without a reachable `impl P`. Full design in
-`docs/protocols.md`; the m12.8 retrospective is in
-`docs/lane-experience-m12.8.md` and the m12.8.x retrospective in
-`docs/lane-experience-m12.8.x.md`.
-
-```kai
-protocol Show {
-  show(x: Self) : String
-}
-
-impl Show for Money[u: Unit] {
-  show(m) = decimal_repr(m.amount) ++ " " ++ unit_name(u)
-}
-
-let usd = 100.50<USD>
-println("balance: #{usd}")            # "balance: 100.50 USD"
-```
-
-Explicit `protocol` declarations + `impl` blocks. **Single dispatch**
-on the first-position type tag. Modeled on Clojure protocols, Elixir
-protocols, Go interfaces (with explicit declaration), and the
-lightweight subset of Rust traits.
-
-This is **not** Haskell typeclasses. Specifically: no higher-kinded
-types, no constraints in signatures, no functional dependencies, no
-type families, no superclass constraints, no overlapping instances.
-Single dispatch only.
-
-### Why this is consistent with CLAUDE.md
-
-CLAUDE.md Tier 1 #3 prohibits "type-class resolution". The phrase
-targets the Haskell-style solver — constraint propagation, instance
-chains, multi-param dispatch with functional dependencies — which is
-the source of slow compile times and subtle resolution rules.
-
-Single-dispatch protocols (Go / Clojure / Elixir / Rust traits in
-their non-HKT form) do **not** invoke that solver. Resolution is an
-`O(1)` hash lookup by `(protocol, type)` pair, scoped to the
-transitively imported impl table. Coherence is enforced by the
-orphan rule (impl must live in the protocol's module or the type's
-module) plus single-impl-per-pair check. No constraint propagation.
-
-The distinction is real and well-attested:
-
-| Capability | Haskell typeclass | kaikai protocol |
-|---|---|---|
-| Higher-kinded types | yes (`Functor`, `Monad`, ...) | **no** |
-| Constraints in signatures | `Show a => a -> String` | **no** |
-| Multi-param classes | yes (with fundeps) | **no** (single dispatch) |
-| Type families | yes | **no** |
-| Compile cost | high (solver) | low (`O(1)` lookup) |
-| Runtime cost | mostly direct (after monomorph) | direct when monomorphic, 1 indirection otherwise |
-
-CLAUDE.md should be amended to clarify the distinction; the m12.8
-milestone includes that doc update.
-
-### What it buys
-
-- **`#{x}` works for any type with `impl Show`**. The interpolation
-  no longer requires explicit conversion functions for primitive-like
-  types or the user's custom data.
-- **One mechanism, multiple uses**: `Show`, `Eq`, `Ord`, `Hash`,
-  `Serialize` all share the same machinery. Users add new protocols
-  for domain-specific cases (`Auditable`, `Renderable`, etc.) within
-  the same coherence rules.
-- **`#derive(Show, Eq, Hash)` for records and sum types**: structural
-  impls auto-generated by the compiler when the user opts in via the
-  `#derive` annotation. Sum-type derives reject at compile time when a
-  variant field has no reachable `impl P`.
-
-### What it costs
-
-- **Parser**: `protocol`, `impl`, `Self`, `#derive` keywords. ~50
-  lines.
-- **Resolver**: per-module impl table; orphan-rule check; single-impl
-  enforcement. ~60 lines.
-- **Typer**: resolve protocol op calls; substitute the impl function
-  during monomorphization. ~50 lines.
-- **Codegen**: vtable per `(protocol, type)` pair; lookup helper for
-  late-binding sites. ~50 lines (C backend; LLVM port follows the
-  m7c pattern).
-- **Stdlib**: declare `Show` / `Eq` / `Ord` / `Hash` / `Serialize`;
-  impls for primitives. ~80 lines.
-- **`#derive` annotation**: structural-impl generator. ~50 lines.
-- **Tests**: ~80 lines.
-
-Total ~450 lines, **2-3 days at observed velocity**.
-
-### Constraints
-
-- **Single dispatch only**. Two-arg dispatch (e.g. `convert(from: T,
-  to: U)`) is not supported. Workaround: free function with explicit
-  match.
-- **Pure protocols**: protocol ops cannot have effect rows. Behaviour
-  with effects (audit, log, persist) goes via effects, not protocols.
-- **Closed coherence**: orphan rule enforced at compile time. No
-  global registry, no overlapping impls.
-- **Opt-in derivation**: `#derive(Show)` is required for auto-generated
-  impls on records / sum types. No silent default impls.
-- **No HKT, ever**. Re-opening this means a separate proposal with
-  fresh cost analysis, not extension of this one.
-
-### Reference
-
-- Clojure protocols: <https://clojure.org/reference/protocols>
-- Clojure multimethods: <https://clojure.org/reference/multimethods>
-  (more flexible dispatch; kaikai picks the simpler protocol model)
-- Elixir protocols: `defprotocol` + `defimpl`
-- Go interfaces: structural typing without explicit `impl`; kaikai
-  picks the explicit-impl model for clarity at impl sites
-- Rust traits: kaikai's design subset is "traits without HKT,
-  without GAT, without `dyn`, without coherence-orphan-tricks"
-
-**Decision posture**: scheduled m12.8, after m12.7 axiom and before
-m13. Lands as its own milestone with full design doc in
-`docs/protocols.md`.
-
-## 27. Multi-arg `match` sugar — `match a, b { PatA, PatB -> ... }`
-
-```kai
-# Today (synthesises a transient tuple-shaped pattern):
-fn count_toques(guess: [Int], target: [Int]) : Int = match (guess, target) {
-  ([], _)                  -> 0
-  (_, [])                  -> 0
-  ([g, ...gs], [t, ...ts]) -> {
-    let here = if g == t { 1 } else { 0 }
-    here + count_toques(gs, ts)
-  }
-}
-
-# Proposed (no synthetic tuple, no nested match):
-fn count_toques(guess: [Int], target: [Int]) : Int = match guess, target {
-  [], _                    -> 0
-  _, []                    -> 0
-  [g, ...gs], [t, ...ts]   -> {
-    let here = if g == t { 1 } else { 0 }
-    here + count_toques(gs, ts)
-  }
-}
-```
-
-A **scheduled mini-lane** that surfaced from the m8.5 stress test
-(see §9 *Decision — REJECTED*). Four `demos/*` files (`forth`,
-`toquefama`, `9d9l/huffman`, `9d9l/toquefama`) use the
-`match (a, b) { (PatA, PatB) -> ... }` shape today, where the
-`(a, b)` is *transient*: it never escapes the match arm and no
-signature returns it. With tuples rejected as a type, a parser
-sugar that scrutinises N expressions and matches N patterns per arm
-gives every demo a clean form without introducing tuples-as-a-type
-through the back door.
-
-### Semantics
-
-The desugaring is mechanical: `match e1, ..., eN { p1, ..., pN -> body | ... }`
-lowers to a nested `match e1 { p1 -> match e2 { p2 -> ... pN -> body } | ... }`
-form. Wildcards in any column behave the same; guards on an arm
-attach to the innermost branch. The compiler emits the same
-exhaustiveness check it already runs on multi-arity sum types.
-
-The N is constrained at parse time (probably ≤ 4 to keep the
-diagnostics readable; revisit if a use case wants 5+). N must equal
-across every arm; mismatched arities are a parse-time error.
-
-### What it buys
-
-- **No transient tuple type** to support a transient pattern shape.
-  The four affected demos drop their synthesised `(a, b)` and read
-  their two scrutinees positionally.
-- **Same surface area as the existing `match`** for diagnostics
-  and codegen. The desugaring runs in the parser; downstream passes
-  see only nested matches.
-- **Consistent with `if a, b, c` — wait, no**: kaikai does not have
-  multi-arg `if`. This sugar is `match`-only, deliberately. `if`
-  remains single-condition.
-
-### What it costs
-
-- **Parser bookkeeping**: a comma-separated scrutinee list before
-  `{`, plus a comma-separated pattern list per arm. Ambiguity vs
-  function-call args is local to the parser's match-head state.
-- **Diagnostics**: a per-column "missing pattern" message is
-  doable but more work than today's single-scrutinee form. A v1
-  can defer column-aware diagnostics to a follow-up.
-
-### Constraints
-
-1. **Same N across all arms.** Mixed-arity arms are rejected at
-   parse time.
-2. **No defaults / "rest" columns.** A wildcard `_` covers any
-   single column; there is no syntax for "any number of remaining
-   columns".
-3. **Sugar only.** No new ExprKind, no new type, no Pattern node.
-   Desugars to nested matches in the parser.
-
-### Decision posture
-
-**Scheduled** as a m7d/m7e-class mini-lane (~1 day, parser only).
-Lands when the protocol-call rewrite has stabilised so the new
-parser path is not in conflict with another lane in flight. The
-four demos that depend on it (`forth`, `toquefama`,
-`9d9l/huffman`, `9d9l/toquefama`) flip from FAIL to OK in the
-same commit.
-
-**Cost**: low. Parser sugar with no type-system impact.
-**Depends on**: nothing structural; can land any time after the
-protocols hardening (m12.8.y) settles.
-
-## 28. Record destructuring in `let` — `let { fst, snd } = expr`
-
-**Status: LANDED 2026-04-27** as the m7d §28 follow-up to the m8.5
-tuples REJECT decision. Parser now accepts `TkLbrace` in
-`parse_pattern_rest` and delegates to the existing
-`parse_record_pattern_fields` machinery shared with match arms.
-Both forms ship together:
-
-```kai
-let { fst, snd } = transfer()                  # field punning
-let { fst: from, snd: to } = transfer()        # explicit rename
-```
-
-C backend: `emit_let_stmt` (and `emit_let_stmt_with_drops`) emit
-`KaiValue *_letv_<line>_<col> = rhs; <field-binds...>` directly
-into the enclosing block — no `{...}` wrapping, so the
-destructured names stay in scope. The pre-fix code wrapped both
-the temp and the binds in a sub-block, which dropped the bound
-names before the rest of the block ran (caught by the smoke test
-on `let { fst, snd } = make_pair()`).
-
-LLVM backend: `llvm_emit_let_record` mirrors the C path —
-`kaix_field(scr, "name")` per field, then `llvm_push_local` to
-add each binding to the locals table.
-
-v1 limitations:
-- Nested patterns (`let { from: { owner }, ... }`) are not
-  supported — match arms still cover that case.
-- Drops do not interact with destructuring; the per-block
-  drop-set in `emit_let_stmt_with_drops` is for `PBind` only.
-
-Fixtures: `examples/sugars/let_destructure_punning.kai` (shorthand),
-`examples/sugars/let_destructure_rename.kai` (explicit rename +
-nested field read on the bound name). Both dual-backend via
-`test-llvm-coverage`.
-
-
-
-```kai
-# Today:
-let p = transfer(alice, bob, 30.00<USD>)
-let from = p.fst
-let to   = p.snd
-
-# Proposed (with record punning §10 + destructuring):
-let { fst, snd } = transfer(alice, bob, 30.00<USD>)
-# or, with renaming when the record's field names are inconvenient:
-let { fst: from, snd: to } = transfer(alice, bob, 30.00<USD>)
-```
-
-The third stress-test follow-up from §9. Record patterns already
-work in `match` arms (`PRecord([PField])`); this proposal extends
-the same pattern shape to the LHS of `let`. Combined with record
-punning §10 the result is the ergonomic substitute for tuple
-destructuring `let (a, b) = ...` that the gate's REJECT closed.
-
-### Semantics
-
-`let { f1, f2: y, f3 } = e` desugars to `let __tmp = e; let f1 = __tmp.f1; let y = __tmp.f2; let f3 = __tmp.f3`.
-Field punning (a bare `f1` instead of `f1: x`) reuses the field
-name as the local binding, exactly like in record literals (§10).
-
-The pattern shape is the same `PRecord` the typer already validates
-in `match`. The implementation reuses the existing
-`pat_bindings` / typer codepaths; the only new surface is the
-parser path that recognises `let { ... } =`.
-
-### What it buys
-
-- **One line instead of three** for the
-  return-multiple-related-values pattern. With `Pair[a, b]`
-  shipped, every multi-return call site can read both halves
-  on the binding line.
-- **Consistent with existing record pattern matching**. Users
-  who learned `match { f1, f2 } -> ...` get the `let` form for
-  free.
-- **Symmetric with literal punning** (§10): write
-  `Pair { fst, snd }` to construct, read it back with
-  `let { fst, snd } = ...`.
-
-### What it costs
-
-- **Parser**: extend `parse_let` to accept a record pattern on
-  the LHS in addition to a plain identifier, an `_`, or the
-  existing list-spread shape. Local cost.
-- **Typer / resolver**: nothing new — the pattern types already
-  exist for `match` and the binders flow into the same scope
-  table.
-
-### Constraints
-
-- **Exhaustive only.** `let` does not branch, so the pattern
-  must match the value's record shape exactly. A field omitted
-  from the pattern is a parse error (no implicit "drop"); use
-  `_` to bind-and-discard if needed.
-- **No nested wildcards.** A `let` with a non-trivial nested
-  destructure should be a `match` instead. The form is
-  deliberately limited to "spread a record's fields onto the
-  binding line".
-
-### Decision posture
-
-**Scheduled** alongside record punning (§10). Both depend on
-each other to fully retire the "tuple-destructuring ergonomics"
-case the m8.5 gate examined: punning makes the construction side
-terse, destructuring makes the read side terse. Land them in
-the same lane.
-
-**Cost**: low. Parser change + reuse the existing record pattern
-machinery.
-**Depends on**: §10 (record punning) — lands together.
-
-## 29. `const NAME : T = literal` — top-level named constants
-
-**Status: LANDED 2026-04-28.** Sketch became real after the m12.6.x
-close-out: the user wanted `const MAX_PORT` precisely for the
-refinement / contract use case. Implementation followed the
-parser-only desugar plan from the original proposal.
-
-```kai
-const PI : Real = 3.14159
-const MAX_PORT : Int = 65535
-const ZERO : Int = 0
-
-type Port = Int where 1 <= self and self <= MAX_PORT
-
-fn classify(n: Int) : String = match n {
-  ZERO -> "zero"          # NB: requires the pattern-side fix below
-  _    -> "non-zero"
-}
-
-fn area(r: Real) : Real = PI * r * r
-```
-
-### Why this is a thing
-
-Three concrete sites where today's "zero-arg fn" workaround feels
-worse than a `const`:
-
-1. **Refinements / contract predicates.**
-   `type Port = Int where self <= MAX_PORT` reads naturally if
-   `MAX_PORT` is a name. Today the user has to write
-   `fn max_port() : Int [<refinement_pure>] = 65535` and then
-   `where self <= max_port()` — verbose and the parens look like
-   a function call when the value is conceptually a constant.
-
-2. **Pattern matching.** A bare name in pattern position binds;
-   it does not match against a constant. So `match n { ZERO -> ... }`
-   silently treats `ZERO` as a fresh bind. Today the workaround is
-   a guard: `match n { x if x == 0 -> ... }`, which is verbose
-   and loses the readability of a named constant.
-
-3. **Call-site noise.** `area = PI * r * r` reads cleanly;
-   `area = pi() * r * r` carries dead parens that the reader
-   has to parse past every time.
-
-### Why a `const` keyword and not just `let` at top level
-
-`let` already means "bind a fresh name to the result of an
-expression in this scope". Top-level `let` would either need to
-allow effects (a `let x = read_file(path)` at module load time)
-or would silently be different from local `let` (no effects
-allowed). Both options muddy the semantics.
-
-`const` says exactly what we mean: **a name for a literal value
-that the compiler can evaluate at parse time, with no effects
-and no runtime cost**. The constraint is the feature.
-
-### Sketch of a v1 implementation (parser-only desugar)
-
-The cheapest version is a pure parse-time rewrite — zero changes
-to the typer / unifier / codegen:
-
-1. **Lexer**: add `TkConst` keyword.
-2. **Parser**: top-level `const NAME : T = expr` parses to a
-   `DFn(true, NAME, [], [], Some(T), REmpty, expr, l, c)`
-   wrapped in `DAttribPure` (so it's automatically callable from
-   refinement / contract predicates).
-3. **Resolve pass**: a new `desugar_const_refs` rewrites every
-   `EVar(NAME)` in expression position (where `NAME` matches a
-   declared const) to `ECall(EVar(NAME), [])`.
-4. **Codegen**: nothing — the existing zero-arg-fn path emits
-   the inlined value just fine; const folding (m12.6.d) over
-   the predicate path picks up call-site evaluations
-   automatically when the body is a literal.
-
-What this v1 does NOT cover:
-- **Pattern-side constants (#2 above).** A bare name in pattern
-  position still binds. To fix it, add `PConstRef(String)` to
-  PatKind and a resolver pass that rewrites a `PBind(name)` to
-  `PConstRef(name)` when `name` resolves to a top-level const.
-  The runtime check then becomes structural equality against
-  the const's literal. ~1 day on top of the v1.
-- **Non-literal RHS.** `const TWO_PI : Real = 2.0 * PI` requires
-  evaluating `expr` at parse time after const-substitution.
-  Reuses `try_eval_pred` / `try_eval_int` / a new
-  `try_eval_real` from m12.6.d. ~half a day.
-- **Compound constants.** `const ORIGIN : Point = Point { x: 0.0,
-  y: 0.0 }` requires extending the const-folder to record
-  literals. Punt to v2.
-
-### What landed in v1
-
-- `TkConst` keyword + `parse_const_decl` produces
-  `DAttribPure(DFn zero-arg)` so the const is automatically a
-  refinement-pure call target.
-- `pub` works on consts via the standard `parse_decl` path.
-- `collect_const_names_decls` runs early (before
-  `extract_pure_names_decls` unwraps `DAttribPure`); names of
-  zero-arg pure fns are captured as the const-name list.
-- `desugar_const_refs_decls` runs late (after
-  `desugar_interp_decls`) and walks the entire decl stream —
-  including refinement predicates inside `TyRefine` and contract
-  predicates inside `SAssert` bodies — rewriting every
-  `EVar(NAME)` to `ECall(EVar(NAME), [])`.
-
-### What landed in v2 + v3 (2026-04-28 follow-up)
-
-- **Inside `#{...}` string interpolations.** Now works. The
-  desugar walks every EStr span and rewrites identifier tokens
-  inside `#{...}` segments to `NAME()` textually before the
-  legacy emit-time path re-parses the span. Identifiers OUTSIDE
-  segments are preserved verbatim. Implementation note: a
-  literal `"#{"` in the rewriter source must be split as
-  `cat2("#", "{")` because kaikai's lexer treats `#{` inside a
-  string literal as the start of an interpolation — that single
-  obstacle is what blocked the v1 attempt.
-- **Pattern-side constants.** Now works for `match n { ZERO ->
-  ... }`. Both `PBind(name)` (lowercase) and `PVariant(name, [])`
-  (uppercase, parsed as zero-arg variant by the lex-time rule)
-  participate. The arm desugars to `match n { __cv_NAME if
-  __cv_NAME == NAME() -> body }`, AND-combining with any
-  explicit `if user_pred`.
-
-### What still doesn't work
-
-- **Non-literal RHS.** `const TWO_PI : Real = 2.0 * PI` works
-  syntactically — the body is any Expr — but the runtime
-  evaluates the call every time `TWO_PI` is referenced. A
-  compile-time evaluator (extending `try_eval_pred` from
-  m12.6.d) would inline the constant; deferred.
-- **Compound constants.** `const ORIGIN : Point = Point { x: 0,
-  y: 0 }` ships as a runtime call. Extending the const-folder to
-  record literals is future work.
-
-### Open question
-
-Should `const` be allowed inside fn bodies as an alternative to
-`let` for compile-time literals? Probably not — `let x = 0` at
-the top of a fn already inlines. The distinction only matters at
-module scope.
-
 ## Deliberately not on this list
 
 These were considered and rejected for the same reasons they are
@@ -2138,36 +706,37 @@ rejected elsewhere in the design:
 - **Rust-style enum discriminators** (`type T : Int { A = 0, B = 1 }`,
   each variant with a *unique* integer tag): the uniqueness rule
   rules out useful cases (e.g. blackjack, where `Jack`, `Queen`,
-  `King` all want the same value `10`). The broader proposal #12
+  `King` all want the same value `10`). The broader proposal #4
   (sum types with constant attributes) covers the same use-case
-  without the uniqueness constraint, which is why this narrower
-  form is not on the list.
+  without the uniqueness constraint.
 - **`deriving Show` / typeclass-style auto-derivation**: directly
   conflicts with the principle *no costly type-class resolution*.
-  If automatic stringification is ever desired, ship it as a `kai`
-  tooling codegen, not as a typeclass. Note that proposal #12
-  (attribute sums) handles the label case for *closed* sum types
-  without needing typeclasses — that is the intended solution.
+  Note that proposal #4 (attribute sums) handles the label case for
+  *closed* sum types without needing typeclasses — that is the
+  intended solution.
 - **Early `return` statement**: kaikai is expression-based; *last
   expression is the value* is canonical. Adding `return` would
   create a second exit form and nest imperative control flow into
   an otherwise expression-oriented surface.
 - **`&&` / `||` for Bool**: duplicate `and` / `or` without distinct
   intent. `and` / `or` stay as the canonical boolean operators.
-- **`<-` as monadic bind / effect shorthand**: `!` (proposal #13)
-  already covers the propagation pattern for `Option` / `Result`;
-  kaikai's direct-style effects do not need a bind operator. Adding
-  `<-` would be a second mechanism for the same flow.
+- **`<-` as monadic bind / effect shorthand**: `!` (already landed)
+  covers the propagation pattern for `Option` / `Result`; kaikai's
+  direct-style effects do not need a bind operator. Adding `<-`
+  would be a second mechanism for the same flow.
 - **`$` low-precedence apply (Haskell-style)**: `|>` and `|` already
   avoid paren pyramids. `$` would be a third way to write the same
   chain.
 - **`::` path or type ascription**: `.` already separates module
   paths (`math.vector.dot`) and `:` annotates types. `::` would
   collide with one of them without adding intent.
+- **Tuples as a second product form**: see the *Tuples — REJECTED*
+  retrospective above. The 2026-04-27 measurement gate failed both
+  thresholds (line count and signature length).
 
 ## Adoption criteria
 
-### For LLM-friendly diagnostics (sections 1–8)
+### For LLM-friendly diagnostics (sections 1–3)
 
 Each extension lands only when:
 
@@ -2181,60 +750,40 @@ Each extension lands only when:
 3. The feature fits in ≤500 lines on top of the stage-2 checker.
    Anything larger gets its own design doc first.
 
-### For language-surface features (sections 9–20)
+### For language-surface features (sections 4–10)
 
 These land only alongside the closing of *"Concrete syntax
-consolidation"* in `design.md`. Any decision on tuples or punning
-should be made as part of that one conversation — not drip-fed.
+consolidation"* in `design.md`. Any decision should be made as part
+of that one conversation — not drip-fed.
 
-- **Tuples**: ship only if the decision is to accept them as the
-  canonical form for anonymous products, simultaneously reserving
-  records for named-field use. A split rule is required, not both
-  forms as interchangeable.
-- **Record punning**: safe to land independently of the tuples
-  decision — it's strictly additive sugar.
-- **`variants[T]()`**: safe to land alongside stage-2
-  monomorphisation.
 - **Sum types with constant attributes**: land only after confirming
   (a) the pattern appears in ≥3 independent enums in stdlib or user
-  code, and (b) the constraint set in section 12 has survived at
+  code, and (b) the constraint set in section 4 has survived at
   least one design review without drifting toward methods,
   typeclasses, or non-constant attributes. Until then, prefer the
   `fn_info + accessors` refactor.
-- **`!` postfix (`Option` / `Result` propagation)**: safe to land
-  once `Option` and `Result` are fully in the stdlib and a small
-  corpus of error-handling code exists to verify the ergonomics.
-  The syntax is reserved today (`kaikai-minimal.md`); formalisation
-  just fills in the semantics.
-- **`@` as-pattern**: strictly additive to the pattern grammar,
-  independent of everything else. Land whenever a case study shows
-  it avoiding a meaningful amount of `let x = scrutinee; match x { ... }`
-  boilerplate.
-- **`?.` optional chaining**: land after `!` has been used enough
-  to confirm the two do not overlap in practice. `?.` is local;
-  `!` propagates. If the code base mostly wants propagation, `?.`
-  may not be worth the complexity — re-evaluate then.
-- **Bitwise operators**: deferred. Stays as named functions
-  (`bit_and`, `bit_or`, …) until there is code that demonstrably
-  suffers. This is the "wait for demand" case, not the "principle
-  block" case.
+- **`?.` optional chaining**: land after `!` (already shipped) has
+  been used enough to confirm the two do not overlap in practice.
+  `?.` is local; `!` propagates. If the code base mostly wants
+  propagation, `?.` may not be worth the complexity.
 - **`Map[K, V]` + indexing**: land together with `Vector[T]`
   (Doc B §*Out of scope for v1*) as a single collection-design
   pass. The persistent-vs-ephemeral, indexing-syntax, and
-  key-constraint axes in §17 are coupled decisions.
+  key-constraint axes in §6 are coupled decisions.
 - **Slice syntax `a[i..j]`**: lands *after* `Vector[T]` ships.
   Copying semantics over `Array[T]` is the first-approximation
   implementation; view-based slices with region tracking wait
   for region types to prove themselves elsewhere.
-- **Method references as values**: wanted in the language for
-  cleaner pipelines (`options | n.spawn` over the explicit
-  lambda). Deferred until after m7b so effect rows are stable
-  and the brand machinery can be extended cleanly to
-  receiver-bound references.
 - **`Range[T]` as a first-class iterable**: lands together
   with the collection design pass (`Vector[T]`, `Map[K, V]`).
   Designing iterability across these three types in one go
   avoids retrofitting helpers later.
+- **Multi-arg `match` sugar**: the only language-surface item with
+  a clear scheduled landing window. Parser-only, ~1 day. Lands
+  when no other lane is touching the parser's match-head state.
+- **Binary pattern matching `<<...>>`**: a milestone in its own
+  right (m13–m14 range). Bring forward only if a fintech-toolkit
+  binding (FIX 4.4 likely first) becomes a concrete priority.
 
 The goal is to keep the surface small. A handful of orthogonal,
 well-integrated extensions is worth more than a pile of clever
