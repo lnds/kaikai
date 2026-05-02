@@ -576,6 +576,34 @@ test-signal-trap-asan: $(TARGET) build
 	    || { echo "signal-trap-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
+# Issue #103 — ASAN+UBSan sibling for the trap-exit / outer Cancel
+# handler regression fixture. The fix touches the link table walk
+# and the evidence-lookup hook for the Cancel effect; ASan catches
+# UAF in either path (e.g. a stale KaiLinkNode walked at trampoline
+# tail, or a miscompiled longjmp landing pad), and UBSan catches
+# signed misuse in the link traversal. Wired into the top-level
+# `tier1-asan` rule alongside the other ASAN gates.
+TRAP_EXIT_CANCEL_FIXTURES := issue_103_trap_exit_cancel_handler
+
+test-trap-exit-cancel-asan: $(TARGET) build
+	@set -e; \
+	for name in $(TRAP_EXIT_CANCEL_FIXTURES); do \
+	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
+	    echo "trap-exit-cancel-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
+	    && echo "trap-exit-cancel-asan OK $$name" \
+	    || { echo "trap-exit-cancel-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	done
+
 # stdlib/time.kai smoke test — exercises the Clock effect (wall_now,
 # monotonic_now, sleep_ns) plus pure Duration / Instant arithmetic.
 # v0 has no default Clock handler (m8.x scope); the fixture installs
@@ -1321,6 +1349,19 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (trap_exit=1: linked peer DONE/CANCELLED delivers Normal/Crashed string to mailbox)" \
 	    || { echo "effects FAIL $$name (trap-exit output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/issue_103_trap_exit_cancel_handler.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (trap_exit overrides outer Cancel handler installed at the spawn site)" \
+	    || { echo "effects FAIL $$name (issue #103 regression: outer Cancel handler intercepted child termination)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m8_spawn_per_op_generics.kai; do \
 	  name=$$(basename $$f .kai); \
