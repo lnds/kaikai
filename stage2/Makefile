@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco test-tco-regression test-trace test-trace-asan selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco test-tco-regression test-trace test-trace-asan test-foreign-prelude selfhost
 
 all: $(TARGET)
 
@@ -420,6 +420,23 @@ test-writer: $(TARGET) build
 	diff -q ../examples/writer/main.out.expected build/writer.out > /dev/null \
 	  && echo "writer OK" \
 	  || { echo "writer DIFF"; diff ../examples/writer/main.out.expected build/writer.out; exit 1; }
+
+# Issue #80 regression — polymorphic prelude calls from a foreign file.
+# Loads `examples/effects/foreign_prelude_lib.kai` via `--prelude` and
+# compiles + runs `examples/effects/foreign_prelude.kai` against the
+# golden. The fixture exercises every scheme shape that historically
+# tripped cross-file instantiation (implicit lowercase tparams, row
+# polymorphism on a callback, parametric Reader[T]). A regression of
+# the same shape produces a deterministic stdout diff under tier1.
+test-foreign-prelude: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --prelude ../examples/effects/foreign_prelude_lib.kai \
+	            ../examples/effects/foreign_prelude.kai > build/foreign_prelude.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/foreign_prelude.c -o build/foreign_prelude-c; \
+	./build/foreign_prelude-c > build/foreign_prelude.out; \
+	diff -q ../examples/effects/foreign_prelude.out.expected build/foreign_prelude.out > /dev/null \
+	  && echo "foreign-prelude OK" \
+	  || { echo "foreign-prelude DIFF"; diff ../examples/effects/foreign_prelude.out.expected build/foreign_prelude.out; exit 1; }
 
 # stdlib/trace.kai smoke tests — exercises the user-defined `Trace`
 # effect end-to-end. `trace_basic` covers the default handler
@@ -2113,7 +2130,7 @@ test-tco-zero-arg: $(TARGET) build
 	  && echo "tco-zero-arg OK (issue #102 zero-arg self-tail-call compiles + runs to completion)" \
 	  || { echo "tco-zero-arg DIFF"; diff ../examples/perceus/r12_zero_arg_recursive.out.expected build/tco-zero.out; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-runtime-shadow
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-runtime-shadow test-foreign-prelude
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -2122,7 +2139,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-foreign-prelude
 
 clean:
 	rm -rf build $(TARGET)

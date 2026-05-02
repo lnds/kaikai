@@ -9,6 +9,30 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **Issue #80 regression fixture (Tongariki MVP-blocker closed).**
+  `kaic2 typer rejects polymorphic prelude calls from foreign
+  files` was the m5x-followup #3 inheritance from m5 #0 that the
+  PR #99 retirement migrated to GitHub Issues. The original
+  symptom (`kaic2 --prelude stdlib/core.kai` plus a foreign caller
+  of `list_take([1,2,3], 2)` failing with `expected: ([a], Int) ->
+  [a], found: ([Int], Int) -> ?t1 / ?e0`) was empirically resolved
+  by the R1 fix (`b13bc78`, implicit lowercase tparam collection)
+  and the m12.8 multi-prelude chain. This lane pins the surface as
+  a tier1-gated regression fixture so any future scheme-
+  instantiation regression of the same shape produces a
+  deterministic stdout diff instead of bit-rotting in a tracker
+  doc. Coverage: `examples/effects/foreign_prelude_lib.kai` (the
+  foreign prelude — implicit `[a]`, row-poly callback, parametric
+  `Reader[T]`, handler runner) +
+  `examples/effects/foreign_prelude.kai` (the caller — two
+  distinct instantiations per helper so a frozen-tyvar leak from
+  one call cannot pass silently into the next) + golden
+  `.out.expected`. Wired into `stage2/Makefile`'s
+  `test-foreign-prelude` target and pulled into `test:` and
+  `test-fast:`. Closes #80.
+
 ### Fixed
 
 - **Runtime symbol shadowing — kaikai user fns named after
