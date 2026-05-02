@@ -1,0 +1,116 @@
+# net-tcp-v1 — end-to-end smoke for the NetTcp default handler.
+# Spec: docs/effects-stdlib.md §`NetTcp`. Six ops, all blocking; the
+# v1 handler maps each to a POSIX socket call (stage0/runtime.h
+# §*NetTcp default handler*).
+#
+# This fixture sequences the protocol roles in a single fiber so it
+# runs cleanly under the inline-eager scheduler (m8 v1) — the
+# kernel queues the SYN at `listen`-time, so `connect` succeeds
+# even though the listening side has not yet called `accept`. Real
+# concurrent accept / recv / send via reactor-driven fiber yields
+# lands with m8.x.
+#
+# Flow:
+#   1. listen 127.0.0.1:0       — kernel picks an ephemeral port
+#   2. local_port(l)            — read it back via getsockname
+#   3. connect 127.0.0.1:port   — kernel completes the 3WHS
+#   4. accept(l)                — returns immediately (queued)
+#   5. client.send(PING)        — request fits in the kernel buffer
+#   6. server.recv()            — reads PING, length checked
+#   7. server.send(PONG)        — reply fits in the kernel buffer
+#   8. client.recv()            — reads PONG, length checked
+#   9. close both Conn handles  — Listener leaks until process exit
+#
+# `[Byte]` from the spec lands as `[Int]` in v1: kaikai has no
+# first-class Byte type yet. Values are expected in [0, 255]; the
+# runtime truncates higher bits before writing. Pinned in
+# stdlib/effects.kai's NetTcp catalog note.
+
+import net.tcp
+
+# ASCII codepoints — keeps the golden output deterministic without
+# pulling in encoding/utf8 helpers. PING = 80, 73, 78, 71. PONG
+# differs in just the second byte.
+fn ping_bytes() : [Int] = [80, 73, 78, 71]
+fn pong_bytes() : [Int] = [80, 79, 78, 71]
+
+# Tiny matcher so the fixture's golden output stays a fixed sequence
+# of "ok" lines instead of dumping byte values that depend on
+# whether the underlying recv coalesces or splits the four-byte
+# payload (which it won't on localhost loopback today, but pinning
+# the assertion to length + first byte keeps the test honest).
+fn check_payload(label: String, got: [Int], expect_first: Int, expect_len: Int) : Int / Stdout = {
+  let n = list_length(got)
+  match got {
+    []        -> { Stdout.print(string_concat(label, " FAIL: empty")); 1 }
+    [h, ...tail] ->
+      if n == expect_len and h == expect_first {
+        Stdout.print(string_concat(label, " ok"))
+        0
+      } else {
+        Stdout.print(string_concat(label, " FAIL: wrong shape"))
+        1
+      }
+  }
+}
+
+fn run_session(l: Listener) : Int / NetTcp + Stdout = {
+  let port = local_port(l)
+  match NetTcp.connect("127.0.0.1", port) {
+    Err(e) -> { Stdout.print(string_concat("connect FAIL: ", e)); 1 }
+    Ok(client) ->
+      match NetTcp.accept(l) {
+        Err(e) -> { NetTcp.close(client); Stdout.print(string_concat("accept FAIL: ", e)); 1 }
+        Ok(server) ->
+          match NetTcp.send(client, ping_bytes()) {
+            Err(e) -> {
+              NetTcp.close(client); NetTcp.close(server)
+              Stdout.print(string_concat("client.send FAIL: ", e)); 1
+            }
+            Ok(_n_sent) ->
+              match NetTcp.recv(server, 64) {
+                Err(e) -> {
+                  NetTcp.close(client); NetTcp.close(server)
+                  Stdout.print(string_concat("server.recv FAIL: ", e)); 1
+                }
+                Ok(req) -> {
+                  let r1 = check_payload("server.recv PING", req, 80, 4)
+                  match NetTcp.send(server, pong_bytes()) {
+                    Err(e) -> {
+                      NetTcp.close(client); NetTcp.close(server)
+                      Stdout.print(string_concat("server.send FAIL: ", e)); 1
+                    }
+                    Ok(_n2) ->
+                      match NetTcp.recv(client, 64) {
+                        Err(e) -> {
+                          NetTcp.close(client); NetTcp.close(server)
+                          Stdout.print(string_concat("client.recv FAIL: ", e)); 1
+                        }
+                        Ok(rep) -> {
+                          let r2 = check_payload("client.recv PONG", rep, 80, 4)
+                          NetTcp.close(client)
+                          NetTcp.close(server)
+                          Stdout.print("close ok")
+                          r1 + r2
+                        }
+                      }
+                  }
+                }
+              }
+          }
+      }
+  }
+}
+
+fn main() : Int / NetTcp + Stdout = {
+  Stdout.print("net_tcp_localhost start")
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(e) -> { Stdout.print(string_concat("listen FAIL: ", e)); 1 }
+    Ok(l) -> {
+      Stdout.print("listen ok")
+      let rc = run_session(l)
+      if rc == 0 { Stdout.print("done"); 0 }
+      else { Stdout.print("done with errors"); rc }
+    }
+  }
+}
