@@ -186,8 +186,8 @@ timestamp	cmd	outcome	elapsed_s
 
 Eduardo built a 70-line external demo (`/tmp/kaikai-portfolio-demo`)
 to exercise m12.8 + m12.5 + the Phase 1 derives, and surfaced 4
-bugs + 1 gap, documented as `docs/m12.8-followup.md` and reproduced
-here as Phase 2 of the same lane.
+bugs + 1 gap, documented at the time as the m12.8 follow-up and
+reproduced here as Phase 2 of the same lane.
 
 ### Objective metrics
 
@@ -538,9 +538,9 @@ The lane shipped:
   (Stdin / Stdout / Stderr / File / Env, with `Console` and `Io`
   aliases) for the follow-up lane to consume. Loadable via
   `--prelude` as a no-op.
-- `docs/m12.8-followup.md` Bug 6 entry documenting the
+- The m12.8 follow-up's Bug 6 entry documenting the
   investigation, the architectural blocker, and the two paths
-  forward.
+  forward (closed end-to-end in m12.8 Phase 4 retake).
 - This lane experience section.
 
 The lane did **not** ship the typer-level row enforcement,
@@ -636,8 +636,8 @@ to ship #4. #2 and #3 are non-trivial design decisions that
 deserve Eduardo's input rather than me picking. The pragmatic
 move was to revert the typer changes, ship the documentation
 catalog as a forward-compat marker, and surface the scoping
-issue in `docs/m12.8-followup.md` Bug 6 so the next lane has a
-clean handoff.
+issue in the m12.8 follow-up's Bug 6 entry so the next lane had
+a clean handoff.
 
 ### Reverted-from-disk notes
 
@@ -758,7 +758,7 @@ Shipped in this lane (commit `a251689`):
   `main_implicit`, `helper_explicit`, `subtyping`,
   `no_row_negative`.
 
-Deferred (documented in `docs/m12.8-followup.md`):
+Deferred (documented at the time in the m12.8 follow-up):
 - Main row inference. Prototyped a structural body walker
   (`prelude_eff_walk_*`) that should have fed
   `inject_builtin_effects` from main's body when `main` lacks

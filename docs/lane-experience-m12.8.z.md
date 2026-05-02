@@ -156,8 +156,9 @@ The same pattern applies to Show / Eq / Hash and could be lifted to
 all four protocols, but doing so without the lane brief's blessing
 would be scope creep. The other derives keep their v1 behaviour:
 missing impls fall through to the dispatcher's runtime panic. This
-is a documented v1 tradeoff; tightening it for Show / Eq / Hash is
-captured as a follow-up in `docs/m12.8-followup.md`.
+is a documented v1 tradeoff; tightening it for Show / Eq / Hash was
+captured as a follow-up at the time and closed end-to-end in the
+m12.8 lane.
 
 ### Recursive types whitelisted
 
@@ -227,5 +228,5 @@ rebase is expected to be empty or trivially keep-both.
   would need new dispatcher / desugaring infrastructure.
 - Single agent (Claude Opus 4.7). Not generalisable across LLMs.
 - The println / collatz failure was not investigated beyond
-  confirming it is pre-existing; root-causing it is a separate
-  ticket (likely belongs in `docs/m12.8-followup.md`).
+  confirming it is pre-existing; root-causing it was a separate
+  ticket (slated for the m12.8 follow-up at the time).

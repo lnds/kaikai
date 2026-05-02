@@ -951,15 +951,15 @@ output", concretely:
 
 Two structural items must land before either demo compiles:
 
-1. **Stdout / Stderr atomic split** (defer-on-Phase-4 from
-   `docs/m12.8-followup.md`). Today `Console` is the combined effect
+1. **Stdout / Stderr atomic split** (defer-on-Phase-4 from the
+   m12.8 follow-up tracking). Today `Console` is the combined effect
    that owns both `print` (stdout) and `eprint` (stderr). Both demos
    require declaring `/ Stdout` (and `usd_to_eur.kai` also `/ Stdin`
    alongside) as atomic effects. Migration: split `Console` into
    `Stdout` + `Stderr`, keep `Console = Stdout + Stderr` as an
    alias for over-declaration.
-2. **Parametric `impl Show for Real[u: Unit]`** (Gap 1 partial in
-   `docs/m12.8-followup.md`). Today `unit_name(x: Real<u>)` is a
+2. **Parametric `impl Show for Real[u: Unit]`** (Gap 1 partial from
+   the m12.8 follow-up tracking). Today `unit_name(x: Real<u>)` is a
    reflection intrinsic that gives the suffix string; the parametric
    impl that lets `#{balance(txs)}` of `Real<USD>` render as
    `"845 USD"` requires per-unit specialisation in the protocol-impl
@@ -1070,8 +1070,8 @@ days) + addressing the four lurking suspects Linus identified by
 inspection (`desugar_interp_decls` no scope tracking,
 `pcs_rewrite_kind` `ELitUnit` fallthrough, `rename_proto_calls_kind`
 `ELitUnit` fallthrough, `synth_lambda` doesn't clear
-`clause_resume`). See `docs/m12.8-followup.md` post-Core section
-for the live tracking.
+`clause_resume`). Live tracking handled in the m12.8 follow-up
+during the REOPEN; closed end-to-end in the Update below.
 
 **Update 2026-04-27 (post-REOPEN final) — Core RE-CLOSED.** All
 three levels of the revised gate are met:
