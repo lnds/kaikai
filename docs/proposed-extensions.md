@@ -39,7 +39,7 @@ on.
 | Slice syntax `a[i..j]`                     | proposed | `Vector[T]` landing     |
 | `Range[T]` as a first-class iterable       | proposed | collection design       |
 | Binary pattern matching `<<...>>`          | proposed | parser + match exhaustiveness |
-| Multi-arg `match` sugar — `match a, b { ... }` | scheduled (parser-only) | parser |
+| Multi-arg `match` sugar — `match a, b { ... }` | landed v1 — N ≤ 4, column-aware diagnostics deferred | parser |
 
 ### Closed (for reference; details in commits / CHANGELOG)
 
@@ -599,13 +599,37 @@ across every arm; mismatched arities are a parse-time error.
 
 ### Decision posture
 
-**Scheduled** as a parser-only mini-lane (~1 day). Lands when no
-other in-flight lane is in conflict with the parser's match-head
-state. The four demos that depend on it (`forth`, `toquefama`,
-`9d9l/huffman`, `9d9l/toquefama`) flip from FAIL to OK in the
-same commit.
+**Landed v1** in PR #129 (parser-only sugar, no typer impact, no
+new AST nodes). The desugar emits a block of `let __mm_s_i = e_i`
+bindings followed by a chain of nested `EMatch` calls; each arm
+references the same fall-through subtree at the column-1 wildcard
+branch, so an outer-pattern match whose inner pattern fails falls
+through to the *next outer arm* rather than aborting. The terminal
+"no arm matched" branch is `todo!("non-exhaustive multi-arg match")`
+(panic at runtime, any-type at inference, no `/ Fail` row pollution).
 
-**Cost**: low. Parser sugar with no type-system impact.
+Constraints in v1:
+- `2 ≤ N ≤ 4` — single-scrutinee form unchanged at N=1; N≥5 is a
+  parse-time error (`multi-arg \`match\` supports up to 4 scrutinees`).
+- Same N across every arm — mismatched arities are a parse error.
+- Wildcards behave per column; no syntax for "any number of
+  remaining columns".
+- Diagnostics report against the desugared nested form. A
+  column-aware "missing pattern in column 2" message is deferred;
+  open a follow-up issue if it bites in practice.
+
+The four demos that motivated the lane shed their synthetic tuple /
+`Pair[a, b]` workaround:
+- `demos/forth/main.kai` — `step(stack, tk)` matches `tk, stack`.
+- `demos/toquefama/main.kai` — `count_toques(guess, target)` drops
+  the `Pair { fst, snd }` wrapper.
+- `demos/9d9l/toquefama/main.kai` — `count_famas` matches
+  `guess, target` directly.
+- `demos/9d9l/huffman/main.kai` — `decode_step` matches
+  `cur, bits`.
+
+**Cost paid**: 4-line parser cap + a `test-match` fixture target
+(`examples/match/`). No selfhost regression; demo baseline holds.
 **Depends on**: nothing structural.
 
 ## 10. Binary pattern matching `<<...>>`
