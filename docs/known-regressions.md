@@ -1817,3 +1817,50 @@ are the lane's substantive output; the report in
 `docs/lane-experience-exp2-arm-b.md` walks through the full
 discovery path.
 
+---
+
+## R12 — TCO of a zero-arg recursive function emits malformed C (`kai_ = _t0;`)
+
+**Status**: **OPEN** as of 2026-05-02 (`demo-toquefama-pair` lane,
+issue #96).
+
+**Symptom**: a zero-arg recursive function whose tail-call site is
+TCO'd emits the assignment `kai_ = _t0;` followed by `goto
+_kai_<fn>_entry;`, producing a C build error:
+
+    error: use of undeclared identifier 'kai_'
+    error: use of undeclared identifier '_t0'
+
+The `kai_` is the empty-name parameter slot the TCO pass tries to
+reassign; `_t0` is a fresh temporary the same pass declared but
+never emitted because the parameter list is empty.
+
+**Repro** (extracted from the toquefama migration before the
+parameter workaround):
+
+    fn round() : Unit / Console = {
+      println("tick")
+      round()
+    }
+    fn main() = round()
+
+`kaic2` accepts the source; `cc` rejects the resulting `.c` with
+the two errors above.
+
+**Workaround** (used in `demos/toquefama/main.kai`): give the
+recursive function a single parameter (a counter is convenient,
+even when unused). The TCO pass then has a real slot to reassign
+and the emitted C is well-formed.
+
+**Hypothesis**: the TCO emit walks the parameter list to spell the
+`<param> = <fresh_t>; goto entry;` block. With zero parameters the
+loop body still runs once with empty names, producing the bare
+`kai_ = _t0;` line. A guard "skip the assignment block when arity
+== 0" should fix it; the goto-only path is otherwise legal C.
+
+**Why this is documented here, not fixed**: the
+`demo-toquefama-pair` lane is a demo migration (issue #96 — tuples
+were rejected in m8.5, the demo still used `match (a, b)`). Fixing
+the emitter pass is out of scope; the lane works around the bug
+inline and logs it for a future emit-pass visit.
+
