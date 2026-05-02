@@ -467,28 +467,29 @@ static KaiValue *kai_fiber_value(KaiFiber *f) {
     return v;
 }
 
-/* m8 #7: mailbox runtime. A KaiMailbox is a singly-linked list of
- * heap-allocated KaiValue messages (head = next-to-pop, tail =
- * next-to-enqueue). Send pushes at the tail; receive pops the head.
- * v1 is unbounded — every send succeeds, every receive on an empty
- * mailbox is a runtime error (the inline-eager scheduler can't
- * suspend the caller until a message arrives). Bounded mailboxes
- * with the three overflow policies (DropOldest / DropNewest /
- * BlockSender) land in m8 #8 once Doc B's policy enum is wired
- * through the typer; BlockSender additionally needs the m8.x
- * cooperative scheduler to actually suspend the sender. */
+/* m8 #7 + m8.x: mailbox runtime. A KaiMailbox is a singly-linked
+ * list of heap-allocated KaiValue messages (head = next-to-pop,
+ * tail = next-to-enqueue). Send pushes at the tail; receive pops
+ * the head. Receive on an empty mailbox parks the caller on
+ * recv_waiter (`kai_mailbox_pop`) and yields to the cooperative
+ * scheduler; the next push wakes the head waiter (FIFO). All four
+ * overflow policies (Unbounded / DropOldest / DropNewest /
+ * BlockSender) reach the runtime: DropOldest / DropNewest mutate
+ * the buffer in place; BlockSender parks the sender on
+ * send_waiter when full and resumes when a receiver pops a slot. */
 typedef struct KaiMboxNode KaiMboxNode;
 struct KaiMboxNode {
     KaiValue    *msg;
     KaiMboxNode *next;
 };
 
-/* m8 #8: mailbox overflow policy codes (matched in stdlib/actor.kai
- * by the MailboxPolicy enum). 0 = Unbounded, 1 = Bounded+DropOldest,
- * 2 = Bounded+DropNewest, 3 = Bounded+BlockSender. v1 ships 0/1/2;
- * BlockSender (3) errors at allocation because the inline-eager
- * scheduler can't suspend the sender on a full mailbox — that
- * lifts together with the m8.x cooperative scheduler. */
+/* m8 #8 + m8.x: mailbox overflow policy codes (matched in
+ * stdlib/actor.kai by the MailboxPolicy enum). 0 = Unbounded,
+ * 1 = Bounded+DropOldest, 2 = Bounded+DropNewest,
+ * 3 = Bounded+BlockSender. All four policies are implemented:
+ * `kai_mailbox_alloc_bounded` accepts every code; `kai_mailbox_push`
+ * dispatches on the policy and parks the sender on `send_waiter`
+ * for BlockSender via the cooperative scheduler. */
 #define KAI_OVERFLOW_UNBOUNDED    0
 #define KAI_OVERFLOW_DROP_OLDEST  1
 #define KAI_OVERFLOW_DROP_NEWEST  2
@@ -3548,7 +3549,8 @@ static void kai_evidence_pop(void) {
  * still hit kai_default_cancel_raise which exits the program. v1
  * does not run user-installed `with Cancel { raise(_) -> cleanup }`
  * handlers on runtime-triggered cancel; that interaction is queued
- * for Phase 4+ (docs/m8x-followup.md item 2 follow-on). */
+ * as a follow-up (`docs/fibers-honesty-targets.md`
+ * §*Residual m8.x items*). */
 static void kai_check_cancel_yield_point(void) {
     KaiFiber *f = kai_current_fiber();
     if (f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set) {

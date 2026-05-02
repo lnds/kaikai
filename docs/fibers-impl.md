@@ -386,7 +386,8 @@ etc.). It does NOT track:
 The full `TyBranded(Ty, BrandId)` machinery — extending the
 inferencer to mint brands at handler-installation sites and tracking
 them through every binding form — is queued for post-Production-
-honest 1.0. See `docs/m8x-followup.md` item 6 for the inventory.
+honest 1.0. See `docs/fibers-honesty-targets.md` §*Residual m8.x
+items* for the inventory.
 
 ## Out of scope for v1
 
@@ -416,7 +417,9 @@ honest 1.0. See `docs/m8x-followup.md` item 6 for the inventory.
 - `docs/actors.md` — mailbox + supervision surface.
 - `docs/effects-impl.md` — Doc C: CPS, handler-stack runtime, the
   evidence vector that this scheduler threads through.
-- `docs/m8x-followup.md` — inventory of items m8 v1 deferred.
+- `docs/fibers-honesty-targets.md` — scope decision for which
+  followups gate which honesty claim, plus the §*Residual m8.x
+  items* inventory of work left after the R2 lane closed.
 - ucontext(3), setcontext(3), makecontext(3), swapcontext(3).
 - libco, libtask, Boost.Context — prior art using the same
   POSIX substrate with the same macOS deprecation workaround.

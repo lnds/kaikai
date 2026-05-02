@@ -1,0 +1,54 @@
+# m8.x #4 — Two-actor request/reply round trip.
+#
+# main installs its own String mailbox via with_mailbox and spawns
+# an echo_server actor with its own mailbox via spawn_actor. main
+# sends a request to the server, parks on its own receive(), and
+# resumes when the server replies.
+#
+# Trace under the cooperative scheduler:
+#   1. main spawns server (READY, enqueued; server's body has not run).
+#   2. main prints "client: sending ping".
+#   3. main sends "ping" to server's mailbox. server is READY but
+#      not yet parked on receive, so the message just queues — no
+#      waiter wakeup.
+#   4. main calls Actor.receive() on its own (still empty) mailbox.
+#      kai_mailbox_pop parks main on main.mb.recv_waiter and swaps
+#      to the next ready fiber (server).
+#   5. server's body runs. Actor.receive() finds "ping" already in
+#      its mailbox; fast-path returns without parking.
+#   6. server prints "server: got ping".
+#   7. server sends "pong:ping" to main's mailbox. main is parked on
+#      main.mb.recv_waiter, so kai_mailbox_push wakes main
+#      (PARKED -> READY -> enqueued).
+#   8. server's body returns. The trampoline's DONE branch
+#      setcontexts to the next ready fiber (main).
+#   9. main resumes inside Actor.receive(), pops "pong:ping",
+#      prints the reply line, and exits.
+#
+# This exercises the cooperative scheduler symmetrically: m8x_4_recv_blocking
+# covers the receiver-parks-then-sender-wakes direction; this
+# fixture covers the full round-trip request/reply pattern that
+# real actor systems are built on.
+
+import spawn
+import actor
+
+fn echo_server(parent: Pid[String]) : Unit / Actor[String] + Console = {
+  let req = Actor.receive()
+  Stdout.print("server: got " ++ req)
+  Actor.send(parent, "pong:" ++ req)
+}
+
+fn run() : Unit / Actor[String] + Spawn + Console = {
+  let me     = Actor.self()
+  let server = spawn_actor(() => echo_server(me))
+  Stdout.print("client: sending ping")
+  Actor.send(server, "ping")
+  let reply  = Actor.receive()
+  Stdout.print("client: got reply " ++ reply)
+}
+
+fn main() : Int / Console + Spawn = {
+  with_mailbox { run() }
+  0
+}
