@@ -9,6 +9,37 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **`stdlib/trace.kai` — `with_log_prefix` (Tier 3 arm A,
+  experiment 2: handler composition).** A `Trace` handler that
+  prepends `prefix ++ ": "` to every `log` and `checkpoint` op
+  and re-emits via `Trace.log` to the outer Trace handler on the
+  evidence stack. `checkpoint` is folded into `log` so the
+  outer's `[trace] checkpoint: ` framing does not stack on top
+  of the prefix. Signature
+  `pub fn with_log_prefix[R, e](prefix: String, body: () -> R / Trace + e) : R / Trace + e`
+  — keeps `Trace` in the result row because the clause bodies
+  themselves invoke it (composed-handler row rule from
+  `docs/effects.md` §`Inference`). Self-delegation rides the m8
+  bug #12 `KaiEvidence.in_dispatch` flag so the inner clause's
+  `Trace.log` resolves to the next handler down. Smoke fixture:
+  `examples/effects/trace_prefix.kai` (wired into `test-trace`).
+- **`docs/known-regressions.md` — R9.** Stateful handler-clause
+  `state` reads emit a raw transfer when read just once, and the
+  downstream `kai_prelude_string_concat` decref releases the
+  storage backing `self->state`; the next op call observes a
+  use-after-free. The `with_log_prefix` `read` clause works
+  around it by referencing `state` lexically twice (one named
+  `let _keep_alive`, one in the resume payload), forcing
+  `pcs_is_non_last` to wrap each in `__perceus_dup`. Full ASAN
+  repro inline.
+- **`docs/lane-experience-exp2-arm-a.md`** — agent retrospective
+  on experiment 2: handler-clause closure-capture constraint, the
+  R9 use-after-free debugging arc (where ASAN beat the JSON
+  tooling), and Tier 3 evidence for handler-composition
+  authorability.
+
 ### Documented (Tier 3 experiment 2 arm B — handler-composition lane)
 
 - **`docs/known-regressions.md` — R9.** Handler clauses do not

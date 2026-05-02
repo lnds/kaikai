@@ -421,19 +421,21 @@ test-writer: $(TARGET) build
 	  && echo "writer OK" \
 	  || { echo "writer DIFF"; diff ../examples/writer/main.out.expected build/writer.out; exit 1; }
 
-# stdlib/trace.kai smoke test — exercises the user-defined `Trace`
-# effect with the default handler `with_trace_default`. Two worker fns
-# emit `log` and `checkpoint` ops; the handler turns them into
-# `[trace] ...` lines on stdout. Compiled with `--path ../stdlib` so
-# the resolver finds the module.
+# stdlib/trace.kai smoke tests — exercises the user-defined `Trace`
+# effect end-to-end. `trace_basic` covers the default handler
+# (`with_trace_default`); `trace_prefix` covers handler composition
+# (`with_log_prefix` delegating to the outer default). Compiled with
+# `--path ../stdlib` so the resolver finds the module.
 test-trace: $(TARGET) build
 	@set -e; \
-	./$(TARGET) --path ../stdlib ../examples/effects/trace_basic.kai > build/trace.c; \
-	$(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage0 build/trace.c -o build/trace-c; \
-	./build/trace-c > build/trace.out; \
-	diff -q ../examples/effects/trace_basic.out.expected build/trace.out > /dev/null \
-	  && echo "trace OK" \
-	  || { echo "trace DIFF"; diff ../examples/effects/trace_basic.out.expected build/trace.out; exit 1; }
+	for name in trace_basic trace_prefix; do \
+	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
+	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage0 build/$$name.c -o build/$$name-c; \
+	  ./build/$$name-c > build/$$name.out; \
+	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
+	    && echo "trace OK $$name" \
+	    || { echo "trace DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name.out; exit 1; }; \
+	done
 
 # stdlib/time.kai smoke test — exercises the Clock effect (wall_now,
 # monotonic_now, sleep_ns) plus pure Duration / Instant arithmetic.
