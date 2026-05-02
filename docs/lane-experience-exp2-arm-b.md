@@ -23,8 +23,8 @@ of this shape non-viable on the current compiler+runtime:
   invocation. Reproduced with `Reader[String]` (SIGBUS) and
   `State[String]` (SIGSEGV); both share the same shape.
 
-Both findings are pinned in `docs/known-regressions.md` with
-repro, hypothesis, and fix-path notes. The lane's substantive
+Both findings were filed as R9 + R10 (since closed by issues
+#60 and #61, 2026-05-02). The lane's substantive
 output is the discovery + documentation; the helper itself is
 **not** in the tree, no fixture, no Makefile target — `tier1`
 stays byte-identical except for the doc edits.
@@ -210,10 +210,9 @@ implementation changes (`stdlib/trace.kai`, `stage2/Makefile`,
 deleted `examples/effects/trace_prefix.{kai,out.expected}`).
 The deliverable became:
 
-- R9 entry in `docs/known-regressions.md` (closure capture in
-  clauses).
-- R10 entry in `docs/known-regressions.md` (parameterised outer ×
-  self-delegating inner).
+- R9 report (closure capture in clauses; closed by issue #60).
+- R10 report (parameterised outer × self-delegating inner;
+  closed by issue #61, same lane that fixed R11).
 - This lane-experience report.
 - CHANGELOG `[Unreleased]` entry that lists the documented
   regressions and notes the lane did not ship the helper.

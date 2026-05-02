@@ -706,12 +706,13 @@ reasoning** (interval propagation, subtyping, narrowing) is the
 piece that remains, and it requires reintroducing the refinement on
 the semantic Ty side.
 
-**Follow-up lane** for everything deferred from m12.6 v1 lives in
-`docs/m12-6x-followup.md`. The single load-bearing item there is
-`TyRefineT` on the semantic side; it unblocks 4 of the 8 deferred
-items directly. The rest are independent (`[<refinement-pure>]`
-enforcement, compile-time `assert false` errors, regex literals,
-diagnostics quality).
+**Follow-up lanes** for items deferred from m12.6 v1 are tracked
+as GitHub issues with the `refinements` label: issue #83
+(static interval propagation — alpha / operator / call-site
+substitution), issue #84 (`[<refinement-pure>]` inline placement),
+issue #85 (regex literals), issue #86 (predicate-aware
+diagnostics). The original load-bearing item (`TyRefineT` on the
+semantic side) landed 2026-04-27.
 
 ## Sources
 

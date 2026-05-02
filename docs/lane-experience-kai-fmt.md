@@ -186,9 +186,8 @@ The brief was specific. Three places I had to decide:
    `lex_skip_comment` discards them, so I built a
    parallel comment list keyed by `(line, col)` and drain it
    at line-boundary breakpoints. Trailing same-line comments
-   may be promoted to the line above — recorded as
-   `docs/known-regressions.md` R7 with the fix path
-   (TkComment-as-token, gofmt-style).
+   may be promoted to the line above — recorded as issue #93
+   (R7) with the fix path (TkComment-as-token, gofmt-style).
 
 ## Did the compiler help or hinder me? Was structured JSON useful?
 

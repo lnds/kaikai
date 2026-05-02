@@ -243,8 +243,8 @@ embargo cost me [zero time]".
 
 Bonus: experiment 2 surfaced **R9** (handler-clause closure-capture
 gap), **R10** (parameterised + self-delegating handler crash), and
-**R11** (state-read UAF on second op call). All three have repros
-+ hypotheses + fix paths in `docs/known-regressions.md`.
+**R11** (state-read UAF on second op call). All three since closed
+(R9 by issue #60, R10 + R11 by issue #61).
 
 Full writeup: `docs/tier3-experiment-2026-05.md` §*Experiment 2*.
 

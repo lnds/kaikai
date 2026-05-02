@@ -17,8 +17,8 @@ called with `Int` and with `String` should produce two C copies
 rewritten accordingly. Pre-m4c #4 the step was a no-op: `tp.decls`
 returned unchanged.
 
-The blocker, pinned in `docs/m5x-followup.md` §3, is symbol
-collision: `clause_fn_name(line, col, op)` minted C symbols for
+The blocker (the m4c retrofit landed 2026-04-29; `clause_fn_name`
+is now fn-name aware) was symbol collision: `clause_fn_name(line, col, op)` minted C symbols for
 effect-handler clauses keyed on source position alone. Two
 specialised copies of one source body share `(line, col, op)` for
 every embedded `EHandle` clause, so both copies emit `static
@@ -287,8 +287,8 @@ pass (LTO / `-ffunction-sections` + `--gc-sections`); the default
   - `make test`: same failures as the baseline before this lane —
     `R-interp` (test-run on `interp.kai` panics non-exhaustive
     match) and `R-m8x2` (effect-runtime stack overflow). Both
-    pre-existing on `main` HEAD; pinned in
-    `docs/known-regressions.md`.
+    pre-existing on `main` HEAD at the time of this lane; both
+    have since been fixed (R3 + R2 closed 2026-04-29).
 - **Level 2 (invariant verifier + audit)**:
   - `validate_typer_invariants` clean — invariants do not touch
     clause symbols.

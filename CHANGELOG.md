@@ -9,6 +9,23 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Changed
+
+- Retired `docs/m5x-followup.md`, `docs/m12-6x-followup.md`,
+  `docs/unboxing-phase2-followup.md`, and `docs/known-regressions.md`.
+  Open follow-up items and active regressions migrated to GitHub
+  Issues (#77–#96, plus R12 newly tracked) with topic labels
+  (`regression`, `perceus`, `runtime`, `typer`, `compiler`,
+  `stdlib`, `unboxing`, `refinements`) and tier labels (`tier1`,
+  `tier2`, `tier3`). Closed items are not migrated — their closure
+  is in `git log` and prior CHANGELOG entries. Cross-references in
+  source code, examples, and the surviving docs (CLAUDE.md,
+  stage2-design.md, perceus-honesty-targets.md,
+  refinements-and-contracts.md, roadmap.md, etc.) were updated to
+  point at issue numbers. CLAUDE.md gained a "Where pending work
+  lives" subsection so future agents do not look for the retired
+  tracking docs.
+
 ## [0.34.1] — 2026-05-02 (demo cleanup — toquefama migrated, state retired, audit archived)
 
 ### Changed
@@ -28,7 +45,7 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   predicate `(x) => x == g` per the current stdlib signature.
   `read_line()` is matched on its `Result[String, String]` shape.
   `round` carries a counter parameter to sidestep R12 (zero-arg
-  TCO emitter bug, logged in `docs/known-regressions.md`).
+  TCO emitter bug, now tracked as a separate issue).
   `make -C demos verify` reports `toquefama PASS (no golden)`; the
   total OK + PASS column rises from 25 to 26 (`demos/baseline.txt`
   bumped accordingly).
