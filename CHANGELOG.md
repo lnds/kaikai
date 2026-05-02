@@ -9,6 +9,53 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Fixed
+
+- **R10 + R11 / issue #61 — parameterised handler clause `state`
+  read no longer aliases the EvE storage past a decref-aware
+  consumer.** A single-use read of `state` (or `log`) inside a
+  handler clause used to skip `__perceus_dup` because
+  `pcs_is_non_last` returned `false` — the emitter then produced
+  a raw transfer (`KaiValue *kai_state = self->state;`) of the
+  EvE slot's storage. Downstream decref-aware sinks
+  (`kai_prelude_string_concat`, `_length`, `_join`) decrefed
+  that ref, freeing `self->state`'s storage out from under the
+  next op-call invocation; the result was either blank prefix
+  bytes / SIGBUS (R10) or `heap-use-after-free` under ASAN (R11).
+  Both regressions were the same bug — R10's hypothesis pinning
+  the crash on `in_dispatch_node` save/restore was a
+  misdiagnosis (see `docs/lane-diagnostic-r10-r11.md`). Fix:
+  `pcs_is_non_last` now special-cases the magic clause-body
+  names `state` and `log` (aliases of `self->state` / `self->log`,
+  not bindings the clause owns) and forces every read to emit
+  `__perceus_dup` regardless of use-count. Cost: one extra
+  `kai_incref` per clause-body state read, balanced by the
+  consumer's existing decref. The `_keep_alive` workaround in
+  `stdlib/trace.kai::with_log_prefix` is gone — the `read` clause
+  is now `read(resume) -> resume(state)`. Regression fixtures
+  `examples/effects/r10_repro.kai` (Reader arm) and
+  `examples/effects/r11_repro.kai` (Carrier arm) lost their
+  `# DIAGNOSTIC ONLY — KNOWN ASAN FAIL` headers, gained
+  `*.out.expected` golden files, and are wired into both
+  `make tier1` (via `stage2/Makefile::test-trace`) and
+  `make tier1-asan` (via the new `test-trace-asan` target),
+  closing the structural gap that let R10/R11 ship for ~6
+  months. What is now structurally possible that was not
+  before: handler-composition helpers can read parameterised
+  state once per clause invocation without the `_keep_alive`
+  ceremony — `with_log_prefix`, future state-reading helpers,
+  and any user code that looked at `Reader[T]("…")` / similar
+  with a single-read clause + decref-aware sink.
+
+### Removed
+
+- **`stdlib/trace.kai::with_log_prefix` `_keep_alive` workaround**
+  is gone — the dummy `let _keep_alive = state` binding existed
+  only to force `pcs_is_non_last` past its multi-use threshold,
+  and the predicate now handles `state` / `log` correctly without
+  source-side ceremony. The clause body collapsed back to
+  `read(resume) -> resume(state)`.
+
 ## [0.31.0] — 2026-05-02 (R9 closed + R10/R11 diagnostic + lane handoff auth)
 
 ### Added
