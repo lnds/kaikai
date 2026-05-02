@@ -1263,3 +1263,86 @@ trailing comments at parse time, or (b) emit comments as
 the token stream alongside the AST. Option (b) is the smaller
 change and matches how gofmt handles the same problem.
 
+---
+
+## R8 — `let n = INT_LITERAL` followed by use inside `#{int_to_string(n)}` interpolation breaks the C build
+
+**Status**: **OPEN** as of 2026-05-01 (Tier 3 arm A — Trace effect lane).
+
+**Symptom**: kaic2 emits clean C from a body like
+
+    fn main() : Unit / Stdout = {
+      let n = 42
+      Stdout.print("v=#{int_to_string(n)}")
+    }
+
+but `cc` rejects the resulting `.c` with two errors:
+
+    error: use of undeclared identifier 'kai_n'; did you mean 'kair_n'?
+    error: incompatible integer to pointer conversion passing 'int64_t' to
+           parameter of type 'KaiValue *'
+
+The let-binding is emitted as `int64_t kair_n = 42LL;` (unbox-phase 2
+chose the unboxed form because the rvalue is a literal `Int`). The
+later use, however, lives inside the desugar of the
+`#{int_to_string(n)}` interpolation segment, which calls
+`kai_prelude_int_to_string(kai_n)` — the **boxed** name. The two
+emit passes disagree on which alias to spell.
+
+**Repro** (any name; `n` and `value` reproduce identically):
+
+    cat > /tmp/repro.kai <<'EOF'
+    fn main() : Unit / Stdout = {
+      let n = 42
+      Stdout.print("v=#{int_to_string(n)}")
+    }
+    EOF
+    cd stage2
+    ./kaic2 /tmp/repro.kai > /tmp/repro.c            # OK
+    cc -I ../stage0 /tmp/repro.c -o /tmp/repro       # FAIL: kai_n vs kair_n
+
+**Workarounds that avoid the bug**:
+
+- Replace interpolation with explicit `++`:
+  `Stdout.print("v=" ++ int_to_string(n))` — works.
+- Use a function parameter instead of a let-binding:
+  `fn show(n: Int) ... Stdout.print("v=#{int_to_string(n)}")` — works.
+- Pass a non-literal arithmetic expression directly without binding:
+  `Stdout.print("v=#{int_to_string(40 + 2)}")` — works.
+
+The Trace fixture (`examples/effects/trace_basic.kai`) was rewritten
+to use `++` concatenation in the one place a `let`-bound `Int` flows
+into a string-interpolation `#{...}` segment. The interpolation form
+is kept everywhere else (function-parameter sources are fine).
+
+**Why** (hypothesis): the unbox-phase-2 emit pass rewrites
+`let n = <int_literal>` to a C `int64_t kair_<n>` local and records
+`n -> kair_n` in its alias map for downstream `Var` references in
+the same fn body. The string-interpolation desugar in the typer/lower
+expands `"...#{e}..."` into `kai_string_concat(..., kai_to_string(
+kai_prelude_int_to_string(<e>)))` *before* the unbox pass walks the
+expression — or after, but with a different alias-lookup helper that
+does not consult the unbox map. Either way the `Var` printed in the
+interpolation slot keeps the boxed name `kai_n`, while the local was
+renamed to `kair_n`.
+
+**Fix path**: belongs to the unbox-phase-2 / interpolation interaction
+work. Two paths forward:
+
+- Make the interpolation desugar run **before** the unbox pass so the
+  unbox alias map sees the synthesised arg position and either keeps
+  the binding boxed (simplest) or boxes-on-use through a
+  `kai_int(kair_n)` wrapper.
+- Or: have the unbox pass walk into `StringInterp` segments when it
+  scans for use sites of `let`-bound int locals, and emit
+  `kai_int(kair_n)` at each interpolation slot.
+
+The second is the smaller change but requires the unbox pass to know
+about every desugar that produces a fresh `Var` reference — fragile.
+The first is structural.
+
+**Why this is documented here, not fixed**: the Trace lane (Tier 3
+arm A) is stdlib-only and explicitly forbids touching emit/unbox
+internals. Per `CLAUDE.md` lane discipline, this regression is logged
+for a future emit-pass lane to pick up.
+
