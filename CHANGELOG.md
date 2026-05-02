@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-05-02 (typer hardening — #71 option (a) + #72 per-op row generics)
+
 ### Added
 
 - **Region-brand walker descends into sum-type constructor payloads
