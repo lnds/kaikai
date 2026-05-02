@@ -149,7 +149,7 @@ Adjacent rules every agent must apply:
   `unboxing`, `refinements`), do not fix it inline. The L2 wrong-
   lane revert from 2026-04-29 is the precedent. (Pending work
   used to live in `docs/*-followup.md` + `docs/known-regressions.md`;
-  those were retired in PR #76+1, see "Where pending work lives"
+  those were retired in PR #99, see "Where pending work lives"
   below.)
 - **Lane handoff — push + PR is authorized**: an agent spawned
   in a worktree (e.g. via `/wt-claude`) **is authorized to push
@@ -229,7 +229,7 @@ Adjacent rules every agent must apply:
   those documents.
 - **Where pending work lives**: open follow-ups and known
   regressions live in **GitHub Issues**, not in tracking docs.
-  PR #76+1 (2026-05-02) retired `docs/m5x-followup.md`,
+  PR #99 (2026-05-02) retired `docs/m5x-followup.md`,
   `docs/m12-6x-followup.md`, `docs/unboxing-phase2-followup.md`,
   and `docs/known-regressions.md`; their open items moved to
   issues #77–#96 with the labels `regression`, `perceus`,

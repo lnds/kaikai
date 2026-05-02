@@ -293,7 +293,7 @@ loose runtime's tolerance).
 | `stdlib/trace.kai` | `with_log_prefix` `read` clause (lines 109–112) | Collapse to `read(resume) -> resume(state)`. Drop the `_keep_alive` and the long comment justifying it (replace with a one-line pointer to the fixed predicate if anything). |
 | `examples/effects/r10_repro.kai` | header marker | Once the fix lands and ASAN passes, drop the `# DIAGNOSTIC ONLY — KNOWN ASAN FAIL` line and rename to a stable fixture name (suggested: `examples/effects/m8_13_param_state_decref_alias_via_reader.kai`). |
 | `examples/effects/r11_repro.kai` | header marker | Same — rename to e.g. `examples/effects/m8_13_param_state_decref_alias_via_carrier.kai`. |
-| (R10 + R11 regression entries) | now closed by issue #61 | Both entries were retired with the rest of `docs/known-regressions.md` in PR #76+1; the new fixtures replace the manual repros. |
+| (R10 + R11 regression entries) | now closed by issue #61 | Both entries were retired with the rest of `docs/known-regressions.md` in PR #99; the new fixtures replace the manual repros. |
 
 ### What the fix does NOT need to change
 
