@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.34.1] — 2026-05-02 (demo cleanup — toquefama migrated, state retired, audit archived)
+
 ### Changed
 
 - **`demos/toquefama` migrated to `Pair[a, b]`; demo baseline 25 →
@@ -52,6 +54,17 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   `State[Int]` handler). Issue #95 reframed to track only the
   `stack/` demo, which has a distinct blocker (handler-clause-scope
   `var`).
+
+### Documented
+
+- **`docs/lane-audit-m8x-state.md` archived (PR #76).** The 308-line
+  read-only audit produced by the `m8x-state-audit` lane on
+  2026-05-02 (against main HEAD `24f745a`) is now pinned on main as
+  historical record. The audit's TL;DR drove PR #73 (m8.x
+  disclaimer sweep, closed #59), PR #74 (#71 option (a)), PR #75
+  (#72 per-op row generics), and the active `nursery-cap-tybranded`
+  lane targeting #71 option (b). Pinning the rationale doc on main
+  keeps it co-located with the commits it informed.
 
 ## [0.34.0] — 2026-05-02 (typer hardening — #71 option (a) + #72 per-op row generics)
 
