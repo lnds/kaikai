@@ -27894,6 +27894,14 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_int(i64)\n",
     "declare %KaiValue* @kaix_bool(i32)\n",
     "declare i32           @kaix_truthy(%KaiValue*)\n",
+    # Issue #87 — Phase 2 unbox boundary readers. Borrowing — they
+    # do NOT decref the boxed argument. Used at the MBoxed →
+    # MUnboxed boundary inside `llvm_emit_expr_raw` when a raw
+    # context consumes a boxed-only producer.
+    "declare i64           @kaix_to_int(%KaiValue*)\n",
+    "declare i32           @kaix_to_bool(%KaiValue*)\n",
+    "declare double        @kaix_to_real(%KaiValue*)\n",
+    "declare i32           @kaix_to_char(%KaiValue*)\n",
     "declare %KaiValue* @kaix_internal_dup(%KaiValue*)\n",
     "declare %KaiValue* @kaix_internal_drop(%KaiValue*)\n",
     "declare %KaiValue* @kaix_add(%KaiValue*, %KaiValue*)\n",
@@ -28041,18 +28049,37 @@ fn llvm_id_new() : LlvmIdGen = LlvmIdGen { next: 0 }
 fn llvm_id_bump(g: LlvmIdGen) : LlvmIdGen = LlvmIdGen { next: g.next + 1 }
 
 # ---- local scope ----
-type LlvmLocal = LL(String, String)       # user name → LLVM register (e.g. "n" → "%p_n")
+# Issue #87 — Phase 2 unbox LLVM mirror. Raw locals carry the LLVM
+# IR scalar type alongside the SSA register so a later EVar read
+# can either re-box (boxed-context use) or copy verbatim (raw-context
+# use). The boxed lookup (`llvm_local_find`) skips raw entries so a
+# raw binding does not silently resolve to the wrong register name.
+type LlvmLocal = LL(String, String)        # boxed: user name → %KaiValue* register
+              | LRaw(String, String, Ty)   # raw: user name → raw SSA register, source ty
 
 fn llvm_local_find_loop(ls: [LlvmLocal], target: String) : Option[String] {
   match ls {
     [] -> None
     [l, ...rest] -> match l {
       LL(nm, reg) -> if nm == target { Some(reg) } else { llvm_local_find_loop(rest, target) }
+      LRaw(_, _, _) -> llvm_local_find_loop(rest, target)
     }
   }
 }
 
 fn llvm_local_find(ls: [LlvmLocal], target: String) : Option[String] = llvm_local_find_loop(ls, target)
+
+fn llvm_raw_local_find_loop(ls: [LlvmLocal], target: String) : Option[LlvmLocal] {
+  match ls {
+    [] -> None
+    [l, ...rest] -> match l {
+      LRaw(nm, _, _) -> if nm == target { Some(l) } else { llvm_raw_local_find_loop(rest, target) }
+      _ -> llvm_raw_local_find_loop(rest, target)
+    }
+  }
+}
+
+fn llvm_raw_local_find(ls: [LlvmLocal], target: String) : Option[LlvmLocal] = llvm_raw_local_find_loop(ls, target)
 
 # ---- the emit state carried through expressions ----
 #
@@ -28121,6 +28148,15 @@ fn llvm_push_local(e: LlvmEmit, nm: String, reg: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
              locals: [LL(nm, reg), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls }
+
+# Issue #87 — Phase 2 unbox LLVM mirror. A let-bound name whose
+# rhs is `MUnboxed` becomes a raw SSA register. Stored alongside
+# the boxed locals so block-scope save/restore in `llvm_emit_block`
+# / `llvm_emit_match_arms` covers raw locals automatically.
+fn llvm_push_raw_local(e: LlvmEmit, nm: String, reg: String, t: Ty) : LlvmEmit =
+  LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
+             last_val: e.last_val, cur_label: e.cur_label,
+             locals: [LRaw(nm, reg, t), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls }
 
 # Open a new LLVM basic block: emit the `<label>:` header and
 # record `label` as the active one so downstream phi nodes can
@@ -28328,16 +28364,374 @@ fn llvm_binop_helper(op: String) : Option[String] {
   else { None }
 }
 
+# ---- raw scalar lowering (issue #87 — Phase 2 unbox LLVM mirror) ----
+#
+# Symmetric to the C backend's `emit_expr_raw` / `emit_kind_raw`
+# (docs/unboxing-phase2-design.md). Returns an LLVM IR `i64` /
+# `i32` / `double` register instead of `%KaiValue*`. Used at the
+# entry points where the parent already knows the operand should
+# be raw: the operand of an MUnboxed binop, the scrutinee of a
+# MUnboxed integral switch, the rhs of a `let n = <raw>` binding.
+type LlvmRaw = { e: LlvmEmit, reg: String, ty: Option[Ty] }
+
+# LLVM IR scalar type for a raw scalar of an unboxable kaikai type.
+# Mirrors `raw_c_type` from the C backend; the bool case is `i32`
+# to match the `kaix_truthy` / `kaix_bool(i32)` convention already
+# used by the LLVM backend, so subsequent `add` / `sub` / `xor` on
+# raw bools all stay at the same bit width.
+fn llvm_raw_ir_type_t(t: Ty) : String {
+  match t {
+    TyInt  -> "i64"
+    TyReal -> "double"
+    TyBool -> "i32"
+    TyChar -> "i32"
+    TyDimT(inner, _)    -> llvm_raw_ir_type_t(inner)
+    TyRefineT(inner, _) -> llvm_raw_ir_type_t(inner)
+    _ -> "i64"
+  }
+}
+
+fn llvm_raw_ir_type(opt_ty: Option[Ty]) : String {
+  match opt_ty {
+    Some(t) -> llvm_raw_ir_type_t(t)
+    None    -> "i64"
+  }
+}
+
+# Wrap a raw scalar register into a fresh `%KaiValue*` via the
+# matching boxing constructor. Caller's `last_val` becomes the
+# boxed reg. Used at the MUnboxed → MBoxed boundary inside
+# `llvm_emit_expr` when the consumer expects boxed.
+fn llvm_box_wrap_value(e: LlvmEmit, raw: String, opt_ty: Option[Ty]) : LlvmEmit {
+  let sym = match opt_ty {
+    Some(t) -> llvm_box_ctor_t(t)
+    None    -> "@kaix_int"
+  }
+  let arg_ty = match opt_ty {
+    Some(t) -> llvm_box_arg_ir_t(t)
+    None    -> "i64"
+  }
+  let r = llvm_fresh_reg(e)
+  let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym,
+                          "(", arg_ty, " ", raw, ")\n"])
+  llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+}
+
+fn llvm_box_ctor_t(t: Ty) : String {
+  match t {
+    TyInt  -> "@kaix_int"
+    TyReal -> "@kaix_real"
+    TyBool -> "@kaix_bool"
+    TyChar -> "@kaix_char"
+    TyDimT(inner, _)    -> llvm_box_ctor_t(inner)
+    TyRefineT(inner, _) -> llvm_box_ctor_t(inner)
+    _ -> "@kaix_int"
+  }
+}
+
+fn llvm_box_arg_ir_t(t: Ty) : String {
+  match t {
+    TyInt  -> "i64"
+    TyReal -> "double"
+    TyBool -> "i32"
+    TyChar -> "i32"
+    TyDimT(inner, _)    -> llvm_box_arg_ir_t(inner)
+    TyRefineT(inner, _) -> llvm_box_arg_ir_t(inner)
+    _ -> "i64"
+  }
+}
+
+# Read the raw scalar field out of a boxed `%KaiValue*` via the
+# matching `kaix_to_*` runtime helper. Borrowing — the boxed
+# value's lifetime is the caller's responsibility, mirroring the C
+# backend's `(boxed)->as.i` field read which is also a borrow. Used
+# at the MBoxed → MUnboxed boundary in `llvm_emit_expr_raw`.
+fn llvm_unbox_value(e: LlvmEmit, boxed: String, opt_ty: Option[Ty]) : LlvmRaw {
+  let sym = match opt_ty {
+    Some(t) -> llvm_unbox_helper_t(t)
+    None    -> "@kaix_to_int"
+  }
+  let ret_ty = llvm_raw_ir_type(opt_ty)
+  let r = llvm_fresh_reg(e)
+  let instr = concat_all(["  ", r.reg, " = call ", ret_ty, " ", sym,
+                          "(%KaiValue* ", boxed, ")\n"])
+  let e1 = llvm_append_body(r.e, instr)
+  LlvmRaw { e: e1, reg: r.reg, ty: opt_ty }
+}
+
+fn llvm_unbox_helper_t(t: Ty) : String {
+  match t {
+    TyInt  -> "@kaix_to_int"
+    TyReal -> "@kaix_to_real"
+    TyBool -> "@kaix_to_bool"
+    TyChar -> "@kaix_to_char"
+    TyDimT(inner, _)    -> llvm_unbox_helper_t(inner)
+    TyRefineT(inner, _) -> llvm_unbox_helper_t(inner)
+    _ -> "@kaix_to_int"
+  }
+}
+
+# Pick the LLVM IR opcode for a raw arithmetic / comparison /
+# logical binop given the operand type. Integer ops use signed
+# divide / remainder + signed icmp predicates; Real ops route
+# through fadd / fsub / fmul / fdiv + ordered fcmp predicates.
+# Comparison operands' type comes from the children, not from the
+# binop result type (which is bool). The C backend's `raw_op_str`
+# emits the C operator literally and lets C's overloading pick;
+# LLVM IR is typed so we must dispatch explicitly.
+fn llvm_raw_arith_op(op: String, opt_ty: Option[Ty]) : String {
+  let is_real = match opt_ty {
+    Some(t) -> ty_is_real_raw(t)
+    None    -> false
+  }
+  if is_real {
+    if op == "+" { "fadd double" }
+    else if op == "-" { "fsub double" }
+    else if op == "*" { "fmul double" }
+    else if op == "/" { "fdiv double" }
+    else if op == "%" { "frem double" }
+    else { "fadd double" }
+  } else {
+    if op == "+" { "add i64" }
+    else if op == "-" { "sub i64" }
+    else if op == "*" { "mul i64" }
+    else if op == "/" { "sdiv i64" }
+    else if op == "%" { "srem i64" }
+    else { "add i64" }
+  }
+}
+
+fn ty_is_real_raw(t: Ty) : Bool {
+  match t {
+    TyReal -> true
+    TyDimT(inner, _)    -> ty_is_real_raw(inner)
+    TyRefineT(inner, _) -> ty_is_real_raw(inner)
+    _ -> false
+  }
+}
+
+# Comparison opcode + predicate pair. Operands are raw scalars of
+# `op_ty`; result is i1 (caller zext's to i32 for boolean storage).
+fn llvm_raw_cmp_op(op: String, op_ty: Option[Ty]) : String {
+  let is_real = match op_ty {
+    Some(t) -> ty_is_real_raw(t)
+    None    -> false
+  }
+  if is_real {
+    if op == "<" { "fcmp olt double" }
+    else if op == ">" { "fcmp ogt double" }
+    else if op == "<=" { "fcmp ole double" }
+    else if op == ">=" { "fcmp oge double" }
+    else if op == "==" { "fcmp oeq double" }
+    else if op == "!=" { "fcmp one double" }
+    else { "fcmp oeq double" }
+  } else {
+    let raw_ty = llvm_raw_ir_type(op_ty)
+    if op == "<" { string_concat("icmp slt ", raw_ty) }
+    else if op == ">" { string_concat("icmp sgt ", raw_ty) }
+    else if op == "<=" { string_concat("icmp sle ", raw_ty) }
+    else if op == ">=" { string_concat("icmp sge ", raw_ty) }
+    else if op == "==" { string_concat("icmp eq ", raw_ty) }
+    else if op == "!=" { string_concat("icmp ne ", raw_ty) }
+    else { string_concat("icmp eq ", raw_ty) }
+  }
+}
+
+# Emit the raw scalar form of `x`. Caller has already established
+# that `x.ty` is unboxable; the result is `i64` / `i32` / `double`,
+# no `%KaiValue*` wrapper.
+#
+# Mirrors `emit_expr_raw` from the C backend. When `x.mode` is
+# `MUnboxed` the kind is one of the natively-raw forms (literal,
+# raw EVar, raw arith). When `x.mode` is `MBoxed` we fall back to
+# emitting boxed and unwrapping via `kaix_to_*` — the same boundary
+# tactic from `docs/unboxing-phase2-design.md` §3.
+fn llvm_emit_expr_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
+  match x.mode {
+    MUnboxed -> llvm_emit_kind_raw(e, x)
+    _ -> {
+      # MBoxed → MUnboxed boundary: force the boxed path (must not
+      # re-enter the mode dispatcher, otherwise an MBoxed expression
+      # whose kind handler internally calls `llvm_emit_expr` is
+      # safe — but a defensive fallback that ends up here for an
+      # MUnboxed kind would loop. `llvm_emit_expr_boxed` always
+      # emits the kind-based boxed lowering regardless of mode.
+      let eb = llvm_emit_expr_boxed(e, x)
+      llvm_unbox_value(eb, eb.last_val, x.ty)
+    }
+  }
+}
+
+fn llvm_emit_kind_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
+  match x.kind {
+    EInt(n) -> {
+      LlvmRaw { e: e, reg: int_to_string(n), ty: x.ty }
+    }
+    EBool(b) -> {
+      let v = if b { "1" } else { "0" }
+      LlvmRaw { e: e, reg: v, ty: x.ty }
+    }
+    EChar(c) -> {
+      LlvmRaw { e: e, reg: int_to_string(char_to_int(c)), ty: x.ty }
+    }
+    EReal(v) -> {
+      let s = real_to_string(v)
+      let s_dbl = if string_contains_dot(s) { s } else { concat_all([s, ".0"]) }
+      LlvmRaw { e: e, reg: s_dbl, ty: x.ty }
+    }
+    EVar(name) -> match llvm_raw_local_find(e.locals, name) {
+      Some(r) -> match r {
+        LRaw(_, reg, t) -> LlvmRaw { e: e, reg: reg, ty: Some(t) }
+        # Defensive: filter already restricts to LRaw, but the
+        # match must be exhaustive over LlvmLocal. Force boxed
+        # emission to avoid re-entering the mode dispatcher.
+        _ -> {
+          let eb = llvm_emit_expr_boxed(e, x)
+          llvm_unbox_value(eb, eb.last_val, x.ty)
+        }
+      }
+      None -> {
+        # Boxed-only binding referenced from a raw context: emit
+        # the boxed read and unwrap via `kaix_to_*`. Defensive —
+        # `decide_mode` should not have marked this MUnboxed —
+        # but if it did, calling `llvm_emit_expr` would re-route
+        # through the mode dispatcher and infinite-recurse, so we
+        # short-circuit to `llvm_emit_expr_boxed`.
+        let eb = llvm_emit_expr_boxed(e, x)
+        llvm_unbox_value(eb, eb.last_val, x.ty)
+      }
+    }
+    EBinop(op, a, b) ->
+      if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) {
+        llvm_emit_binop_raw(e, op, a, b, x.ty)
+      } else {
+        # Conservative fallback: emit boxed and unbox via the
+        # boxed-only kind dispatcher (avoids mode-loop).
+        let eb = llvm_emit_expr_boxed(e, x)
+        llvm_unbox_value(eb, eb.last_val, x.ty)
+      }
+    EUnop(op, inner) -> llvm_emit_unop_raw(e, op, inner, x.ty)
+    _ -> {
+      # Anything else: emit boxed and unwrap. The unbox_pass should
+      # not have marked these MUnboxed in the first place — defensive.
+      let eb = llvm_emit_expr_boxed(e, x)
+      llvm_unbox_value(eb, eb.last_val, x.ty)
+    }
+  }
+}
+
+# Raw arithmetic / comparison / logical binop. Both operands are
+# raw scalars; the result is raw too. The `and` / `or` cases
+# evaluate both sides eagerly since raw operands have no side
+# effects (raw values come from literals, raw EVars, or pure raw
+# subexpressions — the unbox pass excludes function calls). This
+# mirrors the C backend's `&&` / `||` semantics: when both
+# operands are raw, short-circuit is observationally identical to
+# eager.
+fn llvm_emit_binop_raw(e: LlvmEmit, op: String, l: Expr, r: Expr, opt_ty: Option[Ty]) : LlvmRaw / Console {
+  let rl = llvm_emit_expr_raw(e, l)
+  let rr = llvm_emit_expr_raw(rl.e, r)
+  if op_is_raw_arith(op) {
+    let opc = llvm_raw_arith_op(op, opt_ty)
+    let reg = llvm_fresh_reg(rr.e)
+    let instr = concat_all(["  ", reg.reg, " = ", opc, " ", rl.reg, ", ", rr.reg, "\n"])
+    let e1 = llvm_append_body(reg.e, instr)
+    LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
+  } else if op_is_raw_cmp(op) {
+    # Comparison — operands' type comes from the children (the
+    # binop's own ty is bool). Result is i1; zext to i32 to match
+    # the rest of the LLVM backend's bool storage convention.
+    let op_ty = l.ty
+    let opc = llvm_raw_cmp_op(op, op_ty)
+    let creg = llvm_fresh_reg(rr.e)
+    let cinstr = concat_all(["  ", creg.reg, " = ", opc, " ", rl.reg, ", ", rr.reg, "\n"])
+    let e1 = llvm_append_body(creg.e, cinstr)
+    let zreg = llvm_fresh_reg(e1)
+    let zinstr = concat_all(["  ", zreg.reg, " = zext i1 ", creg.reg, " to i32\n"])
+    let e2 = llvm_append_body(zreg.e, zinstr)
+    LlvmRaw { e: e2, reg: zreg.reg, ty: opt_ty }
+  } else {
+    # Logical and / or on raw bools. Both sides are pre-evaluated
+    # raw i32 (0/1); use bitwise `and i32` / `or i32` — equivalent
+    # to short-circuit when operands are normalised 0/1 with no
+    # side effects.
+    let opc = if op == "and" { "and i32" } else { "or i32" }
+    let reg = llvm_fresh_reg(rr.e)
+    let instr = concat_all(["  ", reg.reg, " = ", opc, " ", rl.reg, ", ", rr.reg, "\n"])
+    let e1 = llvm_append_body(reg.e, instr)
+    LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
+  }
+}
+
+# Raw unary ops. Mirrors the C backend's `(-X)` / `(!X)` raw
+# emission. `not` on a raw bool flips the low bit; `-` on a raw
+# Int is `sub 0, X`; `-` on a raw Real is `fneg`.
+fn llvm_emit_unop_raw(e: LlvmEmit, op: String, inner: Expr, opt_ty: Option[Ty]) : LlvmRaw / Console {
+  let ri = llvm_emit_expr_raw(e, inner)
+  if op == "not" {
+    let reg = llvm_fresh_reg(ri.e)
+    let instr = concat_all(["  ", reg.reg, " = xor i32 ", ri.reg, ", 1\n"])
+    let e1 = llvm_append_body(reg.e, instr)
+    LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
+  } else if op == "-" {
+    let is_real = match opt_ty {
+      Some(t) -> ty_is_real_raw(t)
+      None    -> false
+    }
+    if is_real {
+      let reg = llvm_fresh_reg(ri.e)
+      let instr = concat_all(["  ", reg.reg, " = fneg double ", ri.reg, "\n"])
+      let e1 = llvm_append_body(reg.e, instr)
+      LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
+    } else {
+      let reg = llvm_fresh_reg(ri.e)
+      let instr = concat_all(["  ", reg.reg, " = sub i64 0, ", ri.reg, "\n"])
+      let e1 = llvm_append_body(reg.e, instr)
+      LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
+    }
+  } else {
+    # Conservative fallback for unrecognised unops. Force boxed
+    # emission to avoid re-entering the mode dispatcher.
+    let eb = llvm_emit_expr_boxed(e, inner)
+    llvm_unbox_value(eb, eb.last_val, opt_ty)
+  }
+}
+
+# Emit the raw scalar that goes inside `case <N>:` for a literal
+# pattern. `EInt` → `<n>`, `EBool` → `0`/`1`, `EChar` → numeric
+# codepoint. Mirror of `pat_lit_raw` from the C backend.
+fn llvm_pat_lit_raw(p: Pattern) : String {
+  match p.pkind {
+    PLit(lit) -> match lit.kind {
+      EInt(n)  -> int_to_string(n)
+      EBool(b) -> if b { "1" } else { "0" }
+      EChar(c) -> int_to_string(char_to_int(c))
+      _ -> "0"
+    }
+    _ -> "0"
+  }
+}
+
 # ---- expression emission ----
 
-# Tier 2.5 M6 — the LLVM backend currently ignores `x.mode` and
-# emits every node as boxed (calling `kaix_int` / `kaix_add` /
-# `kaix_eq` runtime helpers). This is internally consistent —
-# `make -C stage2 selfhost-llvm` still reaches its fixed point
-# byte-identically — but a `--emit-llvm` binary does not see the
-# raw `int64_t` collapse the C backend gets. The real mirror is
-# tracked in issue #87.
+# Tier 2.5 M6 / issue #87 — mode-aware top-level dispatcher. When
+# `x.mode = MUnboxed`, emit raw via `llvm_emit_expr_raw` and box
+# at the boundary so consumers see a uniform `%KaiValue*` last_val.
+# The MBoxed branch is the original `llvm_emit_expr` body, now
+# called `llvm_emit_expr_boxed`.
 fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
+  match x.mode {
+    MUnboxed -> {
+      let raw = llvm_emit_expr_raw(e, x)
+      llvm_box_wrap_value(raw.e, raw.reg, x.ty)
+    }
+    _ -> llvm_emit_expr_boxed(e, x)
+  }
+}
+
+# Original boxed emission. Every recursive call still routes through
+# `llvm_emit_expr` so the mode dispatch happens at every node.
+fn llvm_emit_expr_boxed(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
   match x.kind {
     EInt(n) -> {
       let r = llvm_fresh_reg(e)
@@ -29763,21 +30157,33 @@ fn llvm_emit_stmts_with_drops(e: LlvmEmit, stmts: [Stmt], drops: [String]) : Llv
 fn llvm_emit_stmt_with_drops(e: LlvmEmit, s: Stmt, drops: [String]) : LlvmEmit / Console {
   match s {
     SLet(pat, _, rhs) -> {
-      let er = llvm_emit_expr(e, rhs)
       match pat.pkind {
-        PBind(nm) -> {
-          let pushed = llvm_push_local(er, nm, er.last_val)
-          if list_has(drops, nm) {
-            llvm_append_body(pushed,
-              concat_all(["  call void @kaix_decref(%KaiValue* ", er.last_val, ")\n"]))
-          } else {
-            pushed
+        # Issue #87 — Phase 2 unbox LLVM mirror. A raw rhs becomes a
+        # raw SSA register; no `%KaiValue*` heap box, so RC bookkeeping
+        # does not apply. Mirrors the C backend's `emit_let_stmt_with_
+        # drops` MUnboxed branch (no `kai_decref(kai_<name>)` either).
+        PBind(nm) -> match rhs.mode {
+          MUnboxed -> {
+            let raw = llvm_emit_expr_raw(e, rhs)
+            let raw_ty = match raw.ty { Some(t) -> t None -> TyInt }
+            llvm_push_raw_local(raw.e, nm, raw.reg, raw_ty)
+          }
+          _ -> {
+            let er = llvm_emit_expr(e, rhs)
+            let pushed = llvm_push_local(er, nm, er.last_val)
+            if list_has(drops, nm) {
+              llvm_append_body(pushed,
+                concat_all(["  call void @kaix_decref(%KaiValue* ", er.last_val, ")\n"]))
+            } else {
+              pushed
+            }
           }
         }
         # `let _ = expr` discards the value. Mirrors the C-side: when
         # the RHS is a fresh allocation we can decref it; otherwise we
         # must not, to avoid double-freeing an alias.
         PWild -> {
+          let er = llvm_emit_expr(e, rhs)
           if is_fresh_alloc(rhs) {
             llvm_append_body(er,
               concat_all(["  call void @kaix_decref(%KaiValue* ", er.last_val, ")\n"]))
@@ -29785,8 +30191,12 @@ fn llvm_emit_stmt_with_drops(e: LlvmEmit, s: Stmt, drops: [String]) : LlvmEmit /
             er
           }
         }
-        PRecord(fields) -> llvm_emit_let_record(er, er.last_val, fields)
+        PRecord(fields) -> {
+          let er = llvm_emit_expr(e, rhs)
+          llvm_emit_let_record(er, er.last_val, fields)
+        }
         _ -> {
+          let er = llvm_emit_expr(e, rhs)
           eprint("llvm: let with non-trivial pattern not supported in M3b at #{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
           er
         }
@@ -29799,15 +30209,33 @@ fn llvm_emit_stmt_with_drops(e: LlvmEmit, s: Stmt, drops: [String]) : LlvmEmit /
 fn llvm_emit_stmt(e: LlvmEmit, s: Stmt) : LlvmEmit / Console {
   match s {
     SLet(pat, _, rhs) -> {
-      let er = llvm_emit_expr(e, rhs)
       match pat.pkind {
-        PBind(nm) -> llvm_push_local(er, nm, er.last_val)
-        PWild     -> er
+        # Issue #87 — Phase 2 unbox LLVM mirror. Same MUnboxed
+        # short-circuit as `llvm_emit_stmt_with_drops`.
+        PBind(nm) -> match rhs.mode {
+          MUnboxed -> {
+            let raw = llvm_emit_expr_raw(e, rhs)
+            let raw_ty = match raw.ty { Some(t) -> t None -> TyInt }
+            llvm_push_raw_local(raw.e, nm, raw.reg, raw_ty)
+          }
+          _ -> {
+            let er = llvm_emit_expr(e, rhs)
+            llvm_push_local(er, nm, er.last_val)
+          }
+        }
+        PWild -> {
+          let er = llvm_emit_expr(e, rhs)
+          er
+        }
         # m7d §28: record destructuring — bind the rhs register
         # then push one local per field via kaix_field. Sub-patterns
         # other than PBind / PWild are not supported in v1.
-        PRecord(fields) -> llvm_emit_let_record(er, er.last_val, fields)
+        PRecord(fields) -> {
+          let er = llvm_emit_expr(e, rhs)
+          llvm_emit_let_record(er, er.last_val, fields)
+        }
         _ -> {
+          let er = llvm_emit_expr(e, rhs)
           eprint("llvm: let with non-trivial pattern not supported in M3b at #{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
           er
         }
@@ -30250,6 +30678,30 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
 }
 
 fn llvm_emit_match(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : LlvmEmit / Console {
+  # Issue #87 — Phase 2 unbox LLVM mirror. Fast path mirrors C's
+  # `emit_match_switch`: when the scrutinee is `MUnboxed` of an
+  # integral raw type and every arm is a literal-or-wild pattern
+  # with no guard, lower to an LLVM `switch` on the raw scalar.
+  # The Real-unboxing extension excludes `double` because LLVM
+  # `switch` requires an integer operand; a Real scrutinee re-boxes
+  # at the boundary and routes through the generic match path.
+  # The PBind catch-all limitation from #91 carries over verbatim:
+  # `arms_all_literal_or_wild` rejects PBind at the catch-all spot,
+  # so a match that wants to bind the scrutinee falls into the
+  # boxed path.
+  match scr.mode {
+    MUnboxed -> {
+      if ty_is_integral_raw(scr.ty) and arms_all_literal_or_wild(arms) {
+        llvm_emit_match_switch(e, scr, arms, line, col)
+      } else {
+        llvm_emit_match_default(e, scr, arms, line, col)
+      }
+    }
+    _ -> llvm_emit_match_default(e, scr, arms, line, col)
+  }
+}
+
+fn llvm_emit_match_default(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : LlvmEmit / Console {
   let es = llvm_emit_expr(e, scr)
   let scr_reg = es.last_val
   let end_lbl = llvm_fresh_label(es, "match.end.")
@@ -30282,6 +30734,173 @@ fn llvm_emit_match(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : L
         "  ", phi.reg, " = phi %KaiValue* ", llvm_format_phi(arm_res.entries), "\n"
       ])
       llvm_set_last(llvm_append_body(phi.e, phi_instr), phi.reg)
+    }
+  }
+}
+
+# Issue #87 — Phase 2 unbox match fast path. Lower a match whose
+# scrutinee is MUnboxed integral and whose arms are all literal-
+# or-wild into an LLVM `switch` instruction over the raw scalar.
+# Mirrors `emit_match_switch` in the C backend.
+#
+# Layout:
+#   <eval scrutinee → raw>
+#   switch <ty> %scr, label %match.default.N [
+#     <ty> <lit_0>, label %match.case.K0
+#     <ty> <lit_1>, label %match.case.K1
+#     ...
+#   ]
+#   match.case.K0: <body> ; br %match.end.N
+#   match.case.K1: <body> ; br %match.end.N
+#   ...
+#   match.default.N: <wildcard body OR panic> ; br/unreachable
+#   match.end.N: phi %KaiValue* [...]
+fn llvm_emit_match_switch(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : LlvmEmit / Console {
+  let raw = llvm_emit_expr_raw(e, scr)
+  let raw_ty = llvm_raw_ir_type(scr.ty)
+  let end_lbl  = llvm_fresh_label(raw.e, "match.end.")
+  let dflt_lbl = llvm_fresh_label(end_lbl.e, "match.default.")
+  let coll = llvm_collect_switch_cases(dflt_lbl.e, arms, [], None)
+  let table = llvm_format_switch_table(coll.cases_to_emit, raw_ty)
+  let switch_instr = concat_all([
+    "  switch ", raw_ty, " ", raw.reg, ", label %", dflt_lbl.reg, " [\n",
+    table,
+    "  ]\n"
+  ])
+  let e1 = llvm_append_body(coll.st, switch_instr)
+  let case_emit = llvm_emit_switch_case_bodies(e1, coll.cases_to_emit, end_lbl.reg, [])
+  let e_dflt = llvm_open_block(case_emit.st, dflt_lbl.reg)
+  let dflt_done = match coll.default_arm {
+    Some(body) -> {
+      let outer_locals = e_dflt.locals
+      let eb = llvm_emit_expr(e_dflt, body)
+      let body_val = eb.last_val
+      let body_end = eb.cur_label
+      let e_br = llvm_append_body(eb, concat_all(["  br label %", end_lbl.reg, "\n"]))
+      let e_scoped = LlvmEmit {
+        ids: e_br.ids, globals: e_br.globals, body: e_br.body,
+        last_val: e_br.last_val, cur_label: e_br.cur_label,
+        locals: outer_locals, fns: e_br.fns, vars_: e_br.vars_,
+        lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls
+      }
+      LlvmSD { st: e_scoped, entries: [AE(body_val, body_end), ...case_emit.entries] }
+    }
+    None -> {
+      # No wildcard — panic in the default block.
+      let msg = concat_all([
+        "non-exhaustive match at ", int_to_string(line), ":", int_to_string(col)
+      ])
+      let msg_res = llvm_emit_name_constant(e_dflt, msg, "panic.msg.")
+      let sreg = llvm_fresh_reg(msg_res.e)
+      let s_instr = concat_all([
+        "  ", sreg.reg, " = call %KaiValue* @kaix_str(i8* ", msg_res.gep, ")\n"
+      ])
+      let e_s = llvm_append_body(sreg.e, s_instr)
+      let pcall = llvm_fresh_reg(e_s)
+      let p_instr = concat_all([
+        "  ", pcall.reg, " = call %KaiValue* @kaix_match_panic(%KaiValue* ", sreg.reg, ")\n",
+        "  unreachable\n"
+      ])
+      let e_p = llvm_append_body(pcall.e, p_instr)
+      LlvmSD { st: e_p, entries: case_emit.entries }
+    }
+  }
+  let e_end = llvm_open_block(dflt_done.st, end_lbl.reg)
+  match dflt_done.entries {
+    [] -> {
+      eprint("llvm: match with no arms")
+      llvm_set_last(e_end, "undef")
+    }
+    _ -> {
+      let phi = llvm_fresh_reg(e_end)
+      let phi_instr = concat_all([
+        "  ", phi.reg, " = phi %KaiValue* ", llvm_format_phi(dflt_done.entries), "\n"
+      ])
+      llvm_set_last(llvm_append_body(phi.e, phi_instr), phi.reg)
+    }
+  }
+}
+
+# Per-literal-arm case captured for header emission AND body
+# emission. `lit_str` is the raw scalar that goes into the
+# `case <ty> <N>, label %...` row; `case_lbl` is the per-case
+# block; `body` is the arm's body Expr.
+type SwCase = SC(String, String, Expr)
+
+type SwCollect = { st: LlvmEmit, cases_to_emit: [SwCase], default_arm: Option[Expr] }
+type SwBodies = { st: LlvmEmit, entries: [LlvmArmEntry] }
+type LlvmSD = { st: LlvmEmit, entries: [LlvmArmEntry] }
+
+# Walk the arms once, allocating a fresh case label per literal
+# arm and capturing the (lit, label, body) triple. The first
+# wildcard becomes the default; later wildcards are unreachable
+# (pattern coverage rejects them upstream).
+fn llvm_collect_switch_cases(e: LlvmEmit, arms: [Arm],
+                               cases_acc: [SwCase], default_acc: Option[Expr]) : SwCollect {
+  match arms {
+    [] -> SwCollect { st: e, cases_to_emit: list_reverse(cases_acc), default_arm: default_acc }
+    [a, ...rest] -> match a {
+      Arm(p, _, body) -> match p.pkind {
+        PWild -> {
+          let next_default = match default_acc {
+            Some(_) -> default_acc
+            None    -> Some(body)
+          }
+          llvm_collect_switch_cases(e, rest, cases_acc, next_default)
+        }
+        _ -> {
+          let case_lbl = llvm_fresh_label(e, "match.case.")
+          let lit_str = llvm_pat_lit_raw(p)
+          llvm_collect_switch_cases(case_lbl.e, rest,
+                                      [SC(lit_str, case_lbl.reg, body), ...cases_acc],
+                                      default_acc)
+        }
+      }
+    }
+  }
+}
+
+# Format the `<ty> <lit>, label %case` rows for the switch header.
+fn llvm_format_switch_table(cases: [SwCase], raw_ty: String) : String =
+  llvm_format_switch_table_loop(cases, raw_ty, "")
+
+fn llvm_format_switch_table_loop(cases: [SwCase], raw_ty: String, acc: String) : String {
+  match cases {
+    [] -> acc
+    [c, ...rest] -> match c {
+      SC(lit_str, lbl, _) -> {
+        let row = concat_all(["    ", raw_ty, " ", lit_str, ", label %", lbl, "\n"])
+        llvm_format_switch_table_loop(rest, raw_ty, string_concat(acc, row))
+      }
+    }
+  }
+}
+
+# Emit one basic block per literal arm, branching to end_lbl on
+# fall-through. Locals scope is per-arm — each arm sees its own
+# local-binding scope, restored before the next arm. Returns the
+# accumulated phi entries for the join block.
+fn llvm_emit_switch_case_bodies(e: LlvmEmit, cases: [SwCase], end_lbl: String,
+                                  acc: [LlvmArmEntry]) : SwBodies {
+  match cases {
+    [] -> SwBodies { st: e, entries: acc }
+    [c, ...rest] -> match c {
+      SC(_, case_lbl, body) -> {
+        let e_in = llvm_open_block(e, case_lbl)
+        let outer_locals = e_in.locals
+        let eb = llvm_emit_expr(e_in, body)
+        let body_val = eb.last_val
+        let body_end = eb.cur_label
+        let e_br = llvm_append_body(eb, concat_all(["  br label %", end_lbl, "\n"]))
+        let e_scoped = LlvmEmit {
+          ids: e_br.ids, globals: e_br.globals, body: e_br.body,
+          last_val: e_br.last_val, cur_label: e_br.cur_label,
+          locals: outer_locals, fns: e_br.fns, vars_: e_br.vars_,
+          lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls
+        }
+        llvm_emit_switch_case_bodies(e_scoped, rest, end_lbl,
+                                       [AE(body_val, body_end), ...acc])
+      }
     }
   }
 }

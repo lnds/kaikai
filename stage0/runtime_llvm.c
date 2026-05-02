@@ -46,6 +46,19 @@ KaiValue *kaix_not(KaiValue *a)                { return kai_op_boolnot(a); }
 /* ---------- control helpers ---------- */
 int kaix_truthy(KaiValue *v)                   { return kai_op_truthy(v); }
 
+/* ---------- issue #87 — Phase 2 unbox boundary readers ----------
+ * Mirror of the C backend's `(boxed)->as.i` / `->as.b` / `->as.r` /
+ * `->as.c` field reads used by `emit_expr_raw`'s MBoxed boundary
+ * tactic (docs/unboxing-phase2-design.md §3). Borrowing readers —
+ * they do NOT decref `v` — because the C backend's `->as.*` is also
+ * a borrow. Caller is responsible for the boxed value's lifetime.
+ * Used at the MBoxed → MUnboxed boundary inside the LLVM emitter
+ * (raw operand of an MUnboxed binop, raw scrutinee of a switch). */
+int64_t  kaix_to_int(KaiValue *v)              { return v->as.i; }
+int      kaix_to_bool(KaiValue *v)             { return v->as.b; }
+double   kaix_to_real(KaiValue *v)             { return v->as.r; }
+uint32_t kaix_to_char(KaiValue *v)             { return v->as.c; }
+
 /* ---------- m5 #4 — Perceus dup/drop wrappers for LLVM backend ---------- */
 KaiValue *kaix_internal_dup(KaiValue *v)       { return kai_internal_dup(v); }
 KaiValue *kaix_internal_drop(KaiValue *v)      { return kai_internal_drop(v); }

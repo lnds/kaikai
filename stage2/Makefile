@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude selfhost
 
 all: $(TARGET)
 
@@ -2299,7 +2299,52 @@ test-perceus-issue82-asan: $(TARGET) build
 	    || { echo "perceus-issue82-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82
+# Issue #87 — Phase 2 unbox LLVM mirror. Compiles unbox_bench.kai
+# through `--emit=llvm`, asserts the inner `pure_chain` body
+# lowers to raw `i64` arithmetic (no `kaix_int` / `kaix_add` /
+# `kaix_mul` calls inside the `pure_chain` body), and that the
+# emitted IR links cleanly through clang + the LLVM runtime
+# shim. Mirrors the C-side `test-unbox-phase2` greps. Fails
+# pre-fix (LLVM IR still emits `kaix_*` boxed calls inside the
+# loop), passes post-fix (raw `add i64` / `mul i64` / `srem i64`).
+#
+# Build-only — the bench's outer driver `bench_loop(1_000_000, 0)`
+# requires self-tail-call optimization to run in O(1) C-stack,
+# which the C backend has (`_kai_bench_loop_entry:` + `goto` —
+# issue #89, PR #121) but the LLVM backend does not yet (a
+# separate follow-up). Running the LLVM binary would stack-overflow
+# at ~50 k frames; that is independent of the unbox mirror this
+# fixture documents, so we only check the IR shape and the link.
+# When LLVM TCO lands, swap the link-only check below for a run
+# + cross-check against the C-backend output.
+test-unbox-llvm-bench: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --emit=llvm ../examples/perceus/unbox_bench.kai > build/unbox-bench.ll \
+	  || { echo "unbox-llvm-bench FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
+	clang -w -I ../stage0 build/unbox-bench.ll ../stage0/runtime_llvm.c -o build/unbox-bench-llvm \
+	  || { echo "unbox-llvm-bench FAIL (clang errored — IR ill-formed?)"; exit 1; }
+	@# Acceptance grep — `pure_chain` body must contain raw IR
+	@# arithmetic and must NOT contain boxed `kaix_*` arithmetic
+	@# calls. We extract the body between `define ... @kai_pure_chain`
+	@# and the next `define` so the asserts are local to the loop.
+	@awk '/^define %KaiValue\* @kai_pure_chain\(/,/^}/' build/unbox-bench.ll > build/unbox-bench.purechain
+	@grep -E '= (add|mul|sub|srem) i64' build/unbox-bench.purechain > /dev/null \
+	  || { echo "unbox-llvm-bench FAIL (no raw i64 arith inside pure_chain)"; \
+	       cat build/unbox-bench.purechain; exit 1; }
+	@if grep -E 'call %KaiValue\* @kaix_(add|sub|mul|mod)\(' build/unbox-bench.purechain; then \
+	  echo "unbox-llvm-bench FAIL (boxed kaix_add/sub/mul/mod survived inside pure_chain)"; exit 1; \
+	fi
+	@# At most one `kaix_int(` call survives — the boundary box
+	@# of the final raw scalar before `ret`. More than one means
+	@# the chain didn't fully collapse.
+	@n=$$(grep -c 'call %KaiValue\* @kaix_int(' build/unbox-bench.purechain); \
+	  if [ "$$n" -gt 1 ]; then \
+	    echo "unbox-llvm-bench FAIL (more than one kaix_int boundary box inside pure_chain: $$n)"; \
+	    cat build/unbox-bench.purechain; exit 1; \
+	  fi
+	@echo "unbox-llvm-bench OK (pure_chain inner loop lowers to raw i64; one boundary kaix_int; IR links cleanly)"
+
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -2308,7 +2353,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude
 
 clean:
 	rm -rf build $(TARGET)
