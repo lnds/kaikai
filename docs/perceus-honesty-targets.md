@@ -190,7 +190,7 @@ accidentally get pulled into a 1.0-scoped lane.
 | Item | Cost | Why post-MVP |
 |---|---:|---|
 | **Reuse-in-place** | ~1–2w | Constructor reuses consumed cell instead of `free` + `alloc`; needs alias analysis the type system can prove. Big win on linked-list rewrites; not needed for correctness. |
-| **Drop specialisation** | ~1w | Decref chains generated per-type and inlined, instead of going through runtime dispatch. Performance, not correctness. |
+| **Drop specialisation** | ~1w | Decref chains generated per-type and inlined, instead of going through runtime dispatch. Performance, not correctness. **Investigated 2026-05-01 (Tongariki) — closed as doc-only PR**: implementation reached end-to-end (selfhost C + LLVM byte-identical, tier1 green) but measured −1.7% wall at `-O2` and +5.4% regression at `-O0` on `kaic2` self-compile. Phase 2 unboxing already absorbed the bulk of the addressable overhead. Lane retro: `docs/lane-experience-drop-specialisation.md`. Re-evaluating belongs *after* reuse-in-place lands — the alloc mix shift may unlock per-tag dispatch wins on KAI_RECORD / KAI_VARIANT (61% of allocs) that the v1 scope deliberately left out. |
 | **Unboxing Phase 3** (full Koka-style) | ~1–2w on top of Phase 2 | Cross-fiber unboxed messages, type-erased layouts, reuse-in-place coordination. Coordinates with multi-threaded scheduler. |
 | **Opt-in regions** | ~1–2w | Arena allocation for parser scratch / lexer state where RC overhead demonstrably costs more than a single arena reset. Power-user feature. |
 
