@@ -9,6 +9,31 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **`stdlib/trace.kai` — minimal `Trace` effect with default
+  handler.** Declares `effect Trace { log(msg: String) : Unit;
+  checkpoint(name: String) : Unit }` plus a row-polymorphic helper
+  `with_trace_default[R, e](body: () -> R / Trace + e) : R / Console
+  + e` that prefixes each event with `[trace]` and routes to stdout
+  via the prelude `print` builtin. Shape mirrors
+  `stdlib/actor.kai :: with_mailbox` (residual row `e` carried
+  through, `Console` added for the handler's own output).
+- **Smoke test fixture** `examples/effects/trace_basic.kai` +
+  `.out.expected` — two worker functions emit `log`/`checkpoint`
+  events and the main wraps them under the default handler. Picked
+  up by a new `stage2/Makefile :: test-trace` target (mirrors
+  `test-time` shape, runs under `--path ../stdlib`) and wired into
+  `test` and `test-fast` aggregates.
+- **Tier 3 bet evidence — lane-experience report** at
+  `docs/lane-experience-tier3-arm-b.md` documents the
+  plain-text-only tooling experiment: lane authored
+  `stdlib/trace.kai` + fixture without invoking the JSON
+  diagnostics (`--effects-json`, `--effect-holes-json`,
+  `--types-json`) and reports where the plain-text compiler error
+  was sufficient versus where structured output would have been
+  faster.
+
 ## [0.27.0] — 2026-05-02 (Tongariki MVP closed — Real unboxing landed, 5/5)
 
 ### Added
