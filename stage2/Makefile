@@ -543,6 +543,38 @@ test-runtime-shadow-asan: $(TARGET) build
 	    || { echo "runtime-shadow-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
+# Issue #107 — ASAN+UBSan sibling for the Signal trap fixture. The
+# Signal handler manipulates a sigset_t static, allocates a Sig
+# variant inside `_kai_signal_to_variant`, and resumes through the
+# normal effect-op continuation path. ASan catches a UAF / botched
+# consume edit on any of those; UBSan catches a signed-overflow
+# regression in the signo lookup. Wired into the top-level
+# `tier1-asan` rule so it runs alongside the trace-asan and
+# runtime-shadow-asan gates.
+SIGNAL_TRAP_FIXTURES := issue_107_signal_trap
+
+test-signal-trap-asan: $(TARGET) build
+	@set -e; \
+	for name in $(SIGNAL_TRAP_FIXTURES); do \
+	  ./$(TARGET) ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        ../tests/sigharness.c -o build/$$name-asan.harness; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/$$name-asan.harness ./build/$$name-asan-c \
+	    > build/$$name-asan.out 2> build/$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
+	    echo "signal-trap-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
+	    && echo "signal-trap-asan OK $$name" \
+	    || { echo "signal-trap-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	done
+
 # stdlib/time.kai smoke test — exercises the Clock effect (wall_now,
 # monotonic_now, sleep_ns) plus pure Duration / Instant arithmetic.
 # v0 has no default Clock handler (m8.x scope); the fixture installs
@@ -1673,6 +1705,25 @@ test-effects: $(TARGET) build
 	      echo "effects OK $$name (ran clean)"; \
 	    fi; \
 	  fi; \
+	done; \
+	for f in ../examples/effects/issue_107_signal_trap.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  $(CC) $(CFLAGS) ../tests/sigharness.c -o build/s2-$$name.harness \
+	    || { echo "effects FAIL $$name (harness compile failed)"; exit 1; }; \
+	  ./build/s2-$$name.harness ./build/s2-$$name > build/s2-$$name.out 2>&1; \
+	  rc=$$?; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo "effects FAIL $$name (harness rc=$$rc — expected 0 for clean SIGINT shutdown)"; \
+	    cat build/s2-$$name.out; exit 1; \
+	  fi; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (Signal.on/off/await: SIGINT trap → clean exit 0)" \
+	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,

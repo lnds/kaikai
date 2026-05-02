@@ -3084,6 +3084,133 @@ static KaiValue *kai_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
 }
 
 /* =================================================================
+ * Signal effect — issue #107. POSIX SIGINT/SIGTERM/SIGHUP/SIGUSR1/
+ * SIGUSR2 trap for graceful shutdown.
+ *
+ * Shape (v1, on/off/await):
+ *   on(sig)  : Unit  -- block sig at the process level, mark subscribed
+ *   off(sig) : Unit  -- unblock sig, drop from subscribed set
+ *   await()  : Sig   -- sigwait on the subscribed set, return arrived
+ *
+ * Why sigwait and not an async sa_handler:
+ *   The async path is restricted to async-signal-safe calls; building a
+ *   KaiValue variant inside the handler is not. The handler would have
+ *   to set a pending bit and let the next yield-point drain it — that
+ *   matches the BEAM-faithful `on_cancel(sig)` shape sketched in the
+ *   issue, which v1 cannot honour cleanly: `kai_default_cancel_raise`
+ *   exits the program when main_fiber has no cancel_pad, so a runtime-
+ *   triggered Cancel never runs the user's `with Cancel { raise(_) ->
+ *   cleanup }`. The on/off/await shape sidesteps the async problem
+ *   entirely: signals are blocked via sigprocmask, queued by the
+ *   kernel, and synchronously dequeued by sigwait inside `await()`
+ *   where the full runtime is available.
+ *
+ * v1 limitations (mirrored in docs/effects-stdlib.md §Signal):
+ *   - Posix only. Windows / WASM are out of scope.
+ *   - `await()` blocks the OS thread. Other fibers cannot run while
+ *     it is parked. Acceptable for the v1 use case (main parks on
+ *     Signal after spawning workers).
+ *   - SIGCHLD intentionally absent — Process.wait reaps children.
+ *   - Real-time signals (SIGRTMIN+n) and siginfo_t are out of scope.
+ */
+
+typedef struct {
+    int         signo;
+    const char *name;
+} KaiSignalEntry;
+
+static const KaiSignalEntry kai_signal_entries[] = {
+    { SIGINT,  "SigInt"  },
+    { SIGTERM, "SigTerm" },
+    { SIGHUP,  "SigHup"  },
+    { SIGUSR1, "SigUsr1" },
+    { SIGUSR2, "SigUsr2" },
+    { 0,       NULL      }
+};
+
+static int _kai_signal_from_variant(KaiValue *sig_v) {
+    if (!sig_v || sig_v->tag != KAI_VARIANT) return 0;
+    const char *n = sig_v->as.var.variant_name;
+    if (!n) return 0;
+    for (const KaiSignalEntry *e = kai_signal_entries; e->name; ++e) {
+        if (strcmp(e->name, n) == 0) return e->signo;
+    }
+    return 0;
+}
+
+static KaiValue *_kai_signal_to_variant(int signo) {
+    for (const KaiSignalEntry *e = kai_signal_entries; e->name; ++e) {
+        if (e->signo == signo) {
+            return kai_variant(0, e->name, 0, NULL);
+        }
+    }
+    return NULL;
+}
+
+static sigset_t kai_signal_subscribed;
+static int      kai_signal_subscribed_init = 0;
+
+static void _kai_signal_init_subscribed(void) {
+    if (!kai_signal_subscribed_init) {
+        sigemptyset(&kai_signal_subscribed);
+        kai_signal_subscribed_init = 1;
+    }
+}
+
+static KaiValue *kai_default_signal_on(void *self, KaiValue *sig_v, KaiCont *k) {
+    (void) self;
+    _kai_signal_init_subscribed();
+    int signo = _kai_signal_from_variant(sig_v);
+    if (signo > 0) {
+        sigaddset(&kai_signal_subscribed, signo);
+        sigset_t one;
+        sigemptyset(&one);
+        sigaddset(&one, signo);
+        sigprocmask(SIG_BLOCK, &one, NULL);
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* off(sig): a pending instance that arrived while blocked is delivered
+ * with the default disposition as soon as sigprocmask unblocks —
+ * typically killing the program on SIGINT/SIGTERM. Documented in
+ * docs/effects-stdlib.md §Signal as a sharp edge. */
+static KaiValue *kai_default_signal_off(void *self, KaiValue *sig_v, KaiCont *k) {
+    (void) self;
+    _kai_signal_init_subscribed();
+    int signo = _kai_signal_from_variant(sig_v);
+    if (signo > 0) {
+        sigdelset(&kai_signal_subscribed, signo);
+        sigset_t one;
+        sigemptyset(&one);
+        sigaddset(&one, signo);
+        sigprocmask(SIG_UNBLOCK, &one, NULL);
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* await(): empty subscribed set adds SIGINT defensively so Ctrl-C
+ * still wakes the caller. EINTR / unknown signo: retry. */
+static KaiValue *kai_default_signal_await(void *self, KaiCont *k) {
+    (void) self;
+    _kai_signal_init_subscribed();
+    sigset_t wait_set = kai_signal_subscribed;
+    int any = 0;
+    for (const KaiSignalEntry *e = kai_signal_entries; e->name; ++e) {
+        if (sigismember(&wait_set, e->signo)) { any = 1; break; }
+    }
+    if (!any) sigaddset(&wait_set, SIGINT);
+    for (;;) {
+        int sig = 0;
+        int rc  = sigwait(&wait_set, &sig);
+        if (rc == 0 && sig > 0) {
+            KaiValue *v = _kai_signal_to_variant(sig);
+            if (v) return kai_cont_resume(k, v);
+        }
+    }
+}
+
+/* =================================================================
  * m8.x cooperative scheduler primitives
  * =================================================================
  *

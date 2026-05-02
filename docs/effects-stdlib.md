@@ -30,6 +30,7 @@ and used by the stdlib sparingly.
 | `NetUdp`        | UDP byte-level networking                     | yes (runtime, if in `main`'s row) |
 | `NetDns`        | DNS resolution                                | yes (runtime, if in `main`'s row) |
 | `Process`       | OS-level process spawn, wait, exit            | yes (runtime, if in `main`'s row) |
+| `Signal`        | trap POSIX signals on the running process     | yes (runtime, if in `main`'s row) — Posix only in v1 |
 | `Fail`          | abort with a message                          | no (unhandled = compile error) |
 | `State[T]`      | value-threaded mutable state                  | no (user supplies)    |
 | `Reader[T]`     | read-only ambient value                       | no (user supplies)    |
@@ -881,11 +882,108 @@ clean exit, control flows past the `with` clause and the
   `start_with_env`, `start_in_dir`. Same locality argument.
 - Process-group and session control (`setsid`, `setpgid`).
   Useful for daemonising; out of MVP scope.
-- Async signal handling: a `signal_install(sig, handler)` op so
-  a program can react to `SIGTERM` / `SIGINT` from `main`. The
-  graceful-shutdown story currently routes through the
-  runtime-installed default that converts `SIGTERM` / `SIGINT`
-  into a root-`Cancel`; user-installed handlers come post-MVP.
+- Async signal handling for the *current* process is a separate
+  effect — see `Signal` below.
+
+## `Signal`
+
+### Declaration
+
+```kai
+type Sig = SigInt | SigTerm | SigHup | SigUsr1 | SigUsr2
+
+effect Signal {
+  on(sig: Sig)  : Unit
+  off(sig: Sig) : Unit
+  await()       : Sig
+}
+```
+
+- `on(sig)` subscribes the program to `sig`. The runtime blocks
+  the underlying POSIX signal at the process level so the kernel
+  queues delivery instead of taking the default disposition.
+  Idempotent — repeat calls are no-ops.
+- `off(sig)` unsubscribes and unblocks. A signal that arrived
+  while subscribed but has not yet been drained by `await` will
+  be delivered with the default disposition as soon as `off`
+  returns; for SIGINT/SIGTERM that means the program dies. Call
+  `await` to drain the queue first when this matters.
+- `await()` blocks the current OS thread until any subscribed
+  signal arrives, then returns the corresponding `Sig` variant.
+  An empty subscription set is treated as `{SigInt}` so a
+  programmer who forgot `on()` still wakes on Ctrl-C.
+
+### Default handler
+
+Runtime-installed around `main` when `Signal` is in the row.
+Implementation: `sigprocmask(SIG_BLOCK, ...)` for `on`, the
+matching unblock for `off`, and `sigwait(2)` for `await`.
+
+`sigwait` is synchronous and runs on the calling thread. The
+implementation chose it over an async `sa_handler` + drain-on-
+yield-point because building a `KaiValue` variant in a signal
+handler is not async-signal-safe; the BEAM-style `on_cancel(sig)`
+shape sketched in issue #107 also requires Cancel to honour
+user-installed handlers on runtime-triggered cancellation, which
+v1 does not (`docs/fibers-honesty-targets.md`). Both points
+disappear once the m8.x scheduler lands; until then, `on/off/
+await` is the shape.
+
+### Platform
+
+Posix-only in v1. macOS and Linux both implement the POSIX
+signal API used here.
+
+Windows and WASM map to a smaller subset of `Sig`:
+- Windows can deliver Ctrl-C via `SetConsoleCtrlHandler` →
+  surface as `SigInt`. `SigTerm` / `SigHup` / `SigUsr*` have no
+  Windows equivalent and would map to `Result[Sig, String]` in a
+  v2 shape, or be silently absent.
+- WASI does not expose signals. The `Signal` effect would not
+  install on WASI builds; programs that need it would not link.
+
+Both ports wait on the same lane that brings non-POSIX I/O
+backends; they are out of scope for the v1 effect.
+
+### Limitations (v1)
+
+- `await()` blocks the OS thread. Other fibers cannot make
+  progress while it is parked. Acceptable when `main` parks on
+  `Signal.await()` after spawning workers; reactor-driven
+  non-blocking integration with the Spawn scheduler waits on
+  m8.x.
+- SIGCHLD is not exposed — `Process.wait` already reaps
+  children internally.
+- Real-time signals (SIGRTMIN+n) and the `siginfo_t` payload
+  (`si_pid`, `si_uid`, `si_value`) are out of scope.
+- The `on_cancel(sig)` shape from issue #107 (signal arrival
+  fires `Cancel.raise()` in the calling fiber) is queued for
+  the same lane that lets Cancel honour user-installed
+  handlers on runtime-triggered cancel.
+
+### Typical use
+
+Graceful shutdown of a long-running program:
+
+```kai
+fn run_server(...) : Unit / Spawn + NetTcp + Console = ...
+
+fn main() : Int / Signal + Spawn + NetTcp + Console = {
+  let server = Spawn.spawn(() => run_server(...))
+  Signal.on(SigInt)
+  Signal.on(SigTerm)
+  let _ = Signal.await()
+  Stdout.print("shutting down")
+  Spawn.cancel(server)
+  Signal.off(SigInt)
+  Signal.off(SigTerm)
+  0
+}
+```
+
+Drove the reopening of lnds/ahu's `run_app` Tongariki lane (issue
+#107). The shape above is what `ahu.run_app(root)` wraps once the
+nursery integration lands.
 
 ## `Fail`
 
