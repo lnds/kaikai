@@ -191,6 +191,37 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   `Int`, `Real`, `Char`, `String` — until v2 introduces an `Ord`
   protocol.
 
+### Fixed
+
+- **Parser — leading pipe on a new line (issue #130).** The
+  "Pipe across lines" example in `docs/kaikai-minimal.md`
+  showed pipes leading the continuation line:
+  ```kai
+  xs
+    |> filter(. > 0)
+    |> map(. * 2)
+    |> sum
+  ```
+  but `parse_pipe_rest` (`stage2/compiler.kai`) called
+  `p_skip_newlines` only AFTER consuming `|>` / `|`, never
+  before. The newline after `xs` therefore terminated the
+  expression and the leading `|>` started a fresh, failing
+  statement. The fix peeks past leading newlines before
+  scanning for `TkPipeApply` / `TkPipe`; if neither matches,
+  the original parser state (newlines intact) is returned so
+  the enclosing statement boundary still sees them. Trailing-
+  pipe form is unchanged. The relaxation is scoped to pipe
+  tokens — other binary operators continue to work in trailing
+  position only. New regression fixtures live under
+  `examples/pipes/` (`leading_pipe_apply`, `leading_pipe_map`,
+  `leading_pipe_mixed`, `trailing_pipe_still_works`) and are
+  wired into `make test` via the new `test-pipes` target.
+  Negative regression cases — `match` arms (newline-separated)
+  and sum-type variants on their own line (`type T = A | B`,
+  consumed by `parse_sum_body` not `parse_pipe_rest`) — are
+  unaffected because they parse `|` at their own grammar level
+  outside expression position.
+
 ## [0.37.0] — 2026-05-02 (Tongariki MVP closed — last 6 mvp-blockers landed)
 
 The Tongariki MVP claim ships without an asterisk. The last six

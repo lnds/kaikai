@@ -528,6 +528,8 @@ Rules:
   - The last token is a separator inside a composite literal or parameter list (`,`, `:`).
 - A semicolon `;` is always a valid statement terminator. Use it only when putting multiple statements on the same physical line, which is uncommon.
 
+Pipe operators (`|>`, `|`) additionally work in **leading position** on a continuation line: the parser skips leading newlines before scanning for them, so `xs\n  |> f` and `xs |>\n  f` parse identically. This applies only to pipes — other binary operators continue lines from the trailing position only.
+
 Multi-line constructs this enables:
 
 ```kai
