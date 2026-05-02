@@ -177,6 +177,8 @@ tier1-asan: kaic2
 	@echo "tier1-asan OK — trace fixtures pass under ASAN+UBSan (R10/R11 regression gate)"
 	@$(MAKE) -C stage2 test-runtime-shadow-asan
 	@echo "tier1-asan OK — issue #78 fixture passes under ASAN+UBSan (runtime helper rename gate)"
+	@$(MAKE) -C stage2 test-signal-trap-asan
+	@echo "tier1-asan OK — issue #107 fixture passes under ASAN+UBSan (Signal effect runtime gate)"
 
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every

@@ -11918,6 +11918,21 @@ fn default_nettcp_setup() : String =
     "    kai_evidence_push(&_kai_default_node_nettcp, \"NetTcp\", &_kai_default_ev_nettcp);\n"
   ])
 
+# Issue #107: default Signal handler — three ops wired to
+# `kai_default_signal_*` in stage0/runtime.h. Subscribed signals are
+# blocked at the process level via sigprocmask; `await()` synchronously
+# dequeues via sigwait. Installed when `main`'s row mentions `Signal`.
+fn default_signal_setup() : String =
+  concat_all([
+    "    static EvSignal _kai_default_ev_signal;\n",
+    "    static KaiEvidence _kai_default_node_signal;\n",
+    "    _kai_default_ev_signal.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_signal.on    = (KaiValue *(*)(EvSignal *, KaiValue *, KaiCont *)) &kai_default_signal_on;\n",
+    "    _kai_default_ev_signal.off   = (KaiValue *(*)(EvSignal *, KaiValue *, KaiCont *)) &kai_default_signal_off;\n",
+    "    _kai_default_ev_signal.await = (KaiValue *(*)(EvSignal *, KaiCont *)) &kai_default_signal_await;\n",
+    "    kai_evidence_push(&_kai_default_node_signal, \"Signal\", &_kai_default_ev_signal);\n"
+  ])
+
 # m7b #2b: default Mutable handler — wraps the prelude `array_*`
 # runtime functions with clauses that resume with the result. Each
 # slot is initialised to the matching `kai_default_mutable_*`
@@ -12026,6 +12041,7 @@ fn default_setups_for(main_row: [String]) : String = {
     if list_has(main_row, "File")    { default_file_setup() }    else { "" },
     if list_has(main_row, "Random")  { default_random_setup() }  else { "" },
     if list_has(main_row, "NetTcp")  { default_nettcp_setup() }  else { "" },
+    if list_has(main_row, "Signal")  { default_signal_setup() }  else { "" },
     if list_has(main_row, "Mutable") { default_mutable_setup() } else { "" },
     if list_has(main_row, "Cancel")  { default_cancel_setup() }  else { "" },
     if list_has(main_row, "Link")    { default_link_setup() }    else { "" },
@@ -12042,6 +12058,7 @@ fn default_pops_for(main_row: [String]) : String =
     if list_has(main_row, "Link")    { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Cancel")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Mutable") { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "Signal")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "NetTcp")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Random")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "File")    { "    kai_evidence_pop();\n" } else { "" },
@@ -35295,6 +35312,12 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   let nettcp_d   = inject_unconditional(existing,       "NetTcp",   builtin_nettcp_decl())
   let conn_d     = inject_unconditional(existing_types, "Conn",     builtin_conn_decl())
   let listener_d = inject_unconditional(existing_types, "Listener", builtin_listener_decl())
+  # Issue #107: Signal + Sig. Sig is a DType; Signal is a DEffect that
+  # references Sig in its op signatures, so the Sig decl must reach the
+  # typer alongside the effect decl. Same gating discipline as Conn /
+  # Listener — DType vs DEffect namespaces are checked separately.
+  let signal_d   = inject_unconditional(existing,       "Signal",   builtin_signal_decl())
+  let sig_d      = inject_unconditional(existing_types, "Sig",      builtin_sig_decl())
   list_append(console_d,
     list_append(stdout_d,
       list_append(stderr_d,
@@ -35314,7 +35337,9 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
                                   list_append(monitor_d,
                                     list_append(conn_d,
                                       list_append(listener_d,
-                                        list_append(nettcp_d, decls))))))))))))))))))))
+                                        list_append(nettcp_d,
+                                          list_append(sig_d,
+                                            list_append(signal_d, decls))))))))))))))))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -35409,7 +35434,7 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # still mention Console because the resolver routes through
 # `cand_ns` for aliases.
 fn builtin_effect_names() : [String] =
-  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Random", "NetTcp", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor"]
+  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Random", "NetTcp", "Signal", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor"]
 
 # m12.8 Phase 4b: `Console` is now an alias `type Console = Stdout +
 # Stderr + Stdin` (per stdlib/effects.kai's pinned catalog), not a
@@ -35555,6 +35580,35 @@ fn builtin_listener_decl() : Decl =
   DType(false, "Listener", [],
     TBRecord([FD("fd",   ty_name_zero("Int")),
               FD("port", ty_name_zero("Int"))]), 0, 0)
+
+# Issue #107: Signal effect — POSIX SIGINT/SIGTERM/SIGHUP/SIGUSR1/
+# SIGUSR2 trap for graceful shutdown. Spec: docs/effects-stdlib.md
+# §`Signal`. Three ops in v1 (on/off/await); the BEAM-faithful
+# `on_cancel(sig)` shape sketched in the issue is deferred until
+# Cancel can run user-installed handlers on runtime-triggered
+# cancellation.
+fn builtin_signal_decl() : Decl =
+  DEffect(false, "Signal", [],
+    [
+      EOp("on",    [], [param_typed_zero("sig", ty_name_zero("Sig"))],
+          ty_name_zero("Unit"), 0, 0),
+      EOp("off",   [], [param_typed_zero("sig", ty_name_zero("Sig"))],
+          ty_name_zero("Unit"), 0, 0),
+      EOp("await", [], [], ty_name_zero("Sig"), 0, 0)
+    ], 0, 0)
+
+# Issue #107: Sig sum type — closed catalog of POSIX signals the
+# Signal effect can subscribe to. Variant *names* are the runtime
+# contract — `_kai_signal_from_variant` / `_kai_signal_to_variant`
+# in stage0/runtime.h match by variant_name string. Adding a new
+# Sig requires a paired entry in `kai_signal_entries[]`.
+fn builtin_sig_decl() : Decl =
+  DType(false, "Sig", [],
+    TBSum([Var("SigInt",  []),
+           Var("SigTerm", []),
+           Var("SigHup",  []),
+           Var("SigUsr1", []),
+           Var("SigUsr2", [])]), 0, 0)
 
 # m7b #11: stdlib parameterised effects per Doc B §`State[T]` and
 # §`Reader[T] and Writer[W]`. Each one gets its own evidence struct,
