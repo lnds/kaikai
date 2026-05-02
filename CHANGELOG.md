@@ -11,6 +11,21 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Changed
 
+- **CLAUDE.md — regression-fixture discipline.** Every fix lane
+  must add at least one fixture exercising the bug shape it fixed,
+  wired into the appropriate tier (`tier1` for typer / language
+  fixes; `tier1-asan` for runtime / emit / RC fixes). Codifies the
+  R10/R11 pattern (PRs #65 + #70 — promoted diagnostic fixtures to
+  permanent regression coverage) over the R9 anti-pattern (PR #66
+  — fix landed without an in-tree fixture, repro had to be
+  reconstructed from prose).
+- **`.github/workflows/tier1.yml` — doc-only PRs skip CI.** Added
+  `paths-ignore: ['docs/**', '*.md', 'LICENSE']` so PRs that only
+  touch documentation no longer burn 4 minutes per push waiting
+  for a Tier 1 run that has no code to gate. Code paths (stage*/,
+  stdlib/, examples/, demos/, .github/, Makefile, VERSION) still
+  ALWAYS trigger tier1. Release commits land via `push` to main
+  and continue to run tier1 there.
 - Retired `docs/m5x-followup.md`, `docs/m12-6x-followup.md`,
   `docs/unboxing-phase2-followup.md`, and `docs/known-regressions.md`.
   Open follow-up items and active regressions migrated to GitHub
