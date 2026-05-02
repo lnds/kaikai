@@ -9,6 +9,66 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **Signal effect — POSIX SIGINT/SIGTERM trap for graceful
+  shutdown (issue #107).** Adds the upstream gap that blocked
+  lnds/ahu's `run_app` Tongariki lane and lnds/manutara's Ctrl-C
+  drain story: kaikai programs can now subscribe to OS signals
+  and observe them through the effect system instead of dying
+  with the kernel's default disposition.
+  - New atomic effect `Signal` declared in
+    `stage2/compiler.kai`'s `builtin_signal_decl`, with three
+    ops in v1: `on(sig: Sig) : Unit` (block + subscribe),
+    `off(sig: Sig) : Unit` (unblock), `await() : Sig`
+    (synchronously dequeue via `sigwait`). Companion sum type
+    `Sig = SigInt | SigTerm | SigHup | SigUsr1 | SigUsr2`. Both
+    inject unconditionally so user code declaring `/ Signal` in
+    a row compiles without an explicit `effect Signal {...}`
+    block, mirroring the NetTcp + Conn / Listener pattern.
+  - Default handler installed around `main` when its row
+    mentions `Signal`. Implementation in `stage0/runtime.h`
+    (`kai_default_signal_on` / `_off` / `_await`): subscription
+    set is a static `sigset_t`, blocked at the process level
+    via `sigprocmask(SIG_BLOCK, ...)`; `await` calls
+    `sigwait(2)` on the subscribed mask and maps the returned
+    signo to its `Sig` variant via the `kai_signal_entries[]`
+    table.
+  - Shape rationale: the BEAM-faithful `on_cancel(sig)` shape
+    sketched in the issue is queued for the m8.x scheduler
+    lane. v1 cannot honour user-installed Cancel handlers on
+    runtime-triggered cancellation (`kai_default_cancel_raise`
+    falls through to `exit(0)` when main_fiber has no
+    `cancel_pad`), so `on_cancel` would silently drop the
+    user's cleanup. The on/off/await shape sidesteps the issue
+    entirely — sigwait is synchronous and runs with the full
+    runtime available, no async-signal-safety constraints.
+  - Limitations (v1, mirrored in `docs/effects-stdlib.md`
+    §`Signal`): Posix only; `await()` blocks the OS thread so
+    other fibers cannot run while parked; SIGCHLD is intentionally
+    absent (Process.wait reaps); real-time signals + siginfo_t
+    out of scope.
+  - Regression fixture
+    `examples/effects/issue_107_signal_trap.kai` exercises
+    the SIGINT / SIGTERM trap end-to-end. The C-driven harness
+    `tests/sigharness.c` forks the kaikai binary, waits 500ms
+    for it to install its signal subscription, then sends
+    SIGTERM (default — overridable via `--sig`); the program
+    prints `got SigTerm` and exits 0. Wired into tier1 via
+    `stage2/Makefile`'s `test-effects` block, and into
+    `tier1-asan` via the new `test-signal-trap-asan` rule
+    so a UAF / botched consume edit on the variant-alloc /
+    sigset path is caught at the same gate as the existing
+    R10 / R11 / issue #78 ASan fixtures.
+  - Touches `stage0/runtime.h` (handler implementation),
+    `stage2/compiler.kai` (effect + sum-type decls + injection
+    + EvSignal default-setup wiring + `default_setups_for` /
+    `default_pops_for` ordering), `stdlib/effects.kai`
+    (catalog-comment block), `docs/effects-stdlib.md`
+    (`Signal` section + table-row entry), `stage2/Makefile`
+    (test-effects + test-signal-trap-asan rules), and the
+    top-level `Makefile` (tier1-asan wiring).
+
 ## [0.36.0] — 2026-05-02 (mvp-blockers #78 + #80 + #102 + #106 closed)
 
 ### Added
