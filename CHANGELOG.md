@@ -43,6 +43,35 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   `write → read → exists → metadata → delete` cycle the roadmap
   acceptance bar names lands once the follow-up runtime lane
   ships the missing primitives.
+- **stdlib `os/` module — partial Tier S1 #2 (env + args).** First
+  half of the lane pinned in `docs/stdlib-roadmap.md` Tier S1 #2.
+  Two thin wrappers over the existing `Env` effect:
+  - `stdlib/os/env.kai` — `pub fn get(name: String) : Option[String] / Env`,
+    1:1 over `Env.var(name)`.
+  - `stdlib/os/args.kai` — `pub fn argv() : [String] / Env`,
+    1:1 over `Env.args()`. Effect row is `Env`, not `Process`, to
+    match the actual handler chain (`kai_default_env_args` →
+    `kai_prelude_args` → argv[1..]).
+  - Fixture `examples/stdlib/os_basic.kai` exercises both wrappers
+    and is wired into `make test-stdlib` (and therefore tier1).
+  - `EXTRA_PRELUDE_FLAGS` in `stage2/Makefile` extended with the
+    two new modules so the `env.*` / `args.*` qualified-call
+    surface is reachable from any `examples/stdlib/*` fixture.
+
+  Surface deliberately narrower than what Tier S1 #2 names. The
+  brief assumed runtime + compiler support for the rest of the
+  surface; verification turned up two upstream gaps that warrant
+  separate lanes:
+  - **#126** — `Process` effect builtin and runtime primitives
+    (`kai_default_process_*`) entirely missing. Blocks the whole
+    `os.process.start/wait/kill/exit/...` family and `os.exit`
+    re-export. Sibling lane.
+  - **#127** — `Env` effect missing `set_var` / `unset_var` /
+    `vars` ops, and argv[0] not exposed via any prelude or effect
+    op. Blocks `os.env.set/unset/all` and `os.args.program_name`.
+
+  When #126 and #127 land, this lane reopens to add the remaining
+  surface on top.
 
 ## [0.37.0] — 2026-05-02 (Tongariki MVP closed — last 6 mvp-blockers landed)
 
