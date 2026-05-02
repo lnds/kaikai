@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-fmt test-bench test-check demos-verify demos-no-regression selfhost clean tier0 tier1 daily coverage-probe rc-budget stress-fixtures
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-fmt test-bench test-check demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -138,11 +138,47 @@ test-check: kaic2
 	fi; \
 	echo "test-check OK — $$matched property blocks passed"
 
+# Tier 2.5 — daily memory-safety gate. Rebuilds the demos/ probe set
+# with `-fsanitize=address,undefined` and runs each binary; fails on
+# any sanitizer diagnostic or if the demos baseline regresses under
+# instrumentation. Apple clang lacks LSAN support, so leak detection
+# stays disabled (`detect_leaks=0`) for portability with the Linux
+# runner; if a leak ratchet ever becomes useful, gate it separately
+# on Linux.
+#
+# Why daily and not per-PR: ASAN doubles compile + run wall, and the
+# value is structural — catch new UAF / UB regressions of the R10 /
+# R11 shape (heap-use-after-free in handler dispatch / Perceus
+# scopes) within 24h of merge — not gating. CI: invoked from
+# `make daily` so `.github/workflows/daily.yml` picks it up
+# automatically.
+tier1-asan: kaic2
+	@ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	 $(MAKE) -C demos verify \
+	    CFLAGS="-std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-unused-function -Wno-unused-variable" \
+	    > /tmp/kaikai-tier1-asan.log 2>&1; \
+	hits=$$(grep -lE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' demos/build/*.err 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$$hits" != "0" ]; then \
+	  echo "tier1-asan FAIL — sanitizer diagnostics in $$hits demo(s):"; \
+	  grep -lE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' demos/build/*.err; \
+	  echo "see /tmp/kaikai-tier1-asan.log for full kaic2 / cc output"; \
+	  exit 1; \
+	fi; \
+	expected=$${BASELINE:-$$(cat demos/baseline.txt 2>/dev/null || echo 0)}; \
+	got=$$(cat demos/build/*.status 2>/dev/null | grep -cE '^(OK|PASS)'); \
+	if [ "$$got" -lt "$$expected" ]; then \
+	  echo "tier1-asan FAIL — demos baseline regressed under ASAN: $$got < $$expected"; \
+	  echo "see /tmp/kaikai-tier1-asan.log for per-demo status"; \
+	  exit 1; \
+	fi; \
+	echo "tier1-asan OK — $$got/$$expected demos pass under ASAN+UBSan, no sanitizer diagnostics"
+
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
 # commit) but a diagnostic opens a lane the next morning.
-daily: tier1 stress-fixtures coverage-probe rc-budget
-	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget"
+daily: tier1 stress-fixtures coverage-probe rc-budget tier1-asan
+	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget + tier1-asan"
 
 # Stress fixtures: programs that exercise patterns the per-feature
 # suite does not. Some are aspirational (expected to fail until a

@@ -9,6 +9,23 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **`make tier1-asan` — daily memory-safety gate.** Recompiles
+  the `demos/` probe set with `-fsanitize=address,undefined
+  -fno-omit-frame-pointer -O1 -g`, runs each binary, and fails
+  on any AddressSanitizer / UBSan diagnostic or if the demos
+  baseline regresses under instrumentation. Plugged into
+  `make daily` (and therefore `.github/workflows/daily.yml`)
+  with no YAML changes required. Apple clang lacks LSAN, so
+  `detect_leaks=0` keeps the gate portable between macOS and
+  the Linux runner. Local mac wall: ~19 s. Motivation: R10 /
+  R11 (heap-use-after-free in handler dispatch / Perceus
+  scopes) were caught by hand-running ASAN inside the Tier 3
+  arm A lane. The gate institutionalises that probe so
+  future regressions of the same shape surface within 24 h
+  of merge instead of waiting on a user report.
+
 ## [0.29.0] — 2026-05-02 (Tier 3 experiment 2 — handler composition + R9/R10/R11 surfaced)
 
 ### Added
