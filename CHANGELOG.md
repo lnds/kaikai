@@ -40,6 +40,42 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
   When #126 and #127 land, this lane reopens to add the remaining
   surface on top.
+- **Multi-arg `match` sugar (issue #129).** Parser-only sugar:
+  `match e1, ..., eN { p1, ..., pN -> body | ... }` with `2 ≤ N ≤ 4`
+  desugars in the parser to a chain of nested single-scrutinee
+  `match` expressions over `let __mm_s_i = e_i` bindings, so
+  downstream passes (typer, exhaustiveness, codegen) see only the
+  forms they already handle. Constraints: same N across every
+  arm (parse error otherwise), no rest/wildcard column beyond
+  per-column `_`, N≥5 rejected with `multi-arg \`match\` supports
+  up to 4 scrutinees`, terminal "no arm matched" branch is
+  `todo!("non-exhaustive multi-arg match")` so it composes with
+  any inferred return type without polluting the function's
+  effect row. The desugar interleaves correctly when two arms
+  share an outer pattern: an inner-pattern miss falls through to
+  the *next outer arm* rather than aborting (the pairwise per-arm
+  shape would silently miscompile this case). The four demos that
+  motivated the lane shed their synthetic `(a, b)` /
+  `Pair[a, b]` workaround:
+  - `demos/forth/main.kai` — `step(stack, tk)` now matches
+    `tk, stack` directly.
+  - `demos/toquefama/main.kai` — `count_toques(guess, target)`
+    drops the `Pair { fst, snd }` wrapper and the
+    `stdlib/core/tuple` dependency.
+  - `demos/9d9l/toquefama/main.kai` — `count_famas` matches
+    `guess, target` without parens.
+  - `demos/9d9l/huffman/main.kai` — `decode_step` matches
+    `cur, bits` without parens.
+  Coverage: `examples/match/multi_arg_basic.kai` (positive — 2-arg
+  literals + interleaving, 3-arg with wildcard column, guards),
+  `examples/match/multi_arg_arity_mismatch.kai` (negative —
+  arm with too many patterns), and
+  `examples/match/multi_arg_too_many_scruts.kai` (negative — head
+  with N=5). New `test-match` target wired into `make test` and
+  `make test-fast`. Column-aware "missing pattern in column 2"
+  diagnostics are deferred to a follow-up issue if user feedback
+  warrants. Closes #129; `docs/proposed-extensions.md` §9 status
+  flips to "landed v1".
 
 - **stdlib `Clock` default handler (Tier S1 #4 of `docs/stdlib-roadmap.md`).**
   `stdlib/time.kai` shipped the `Clock` effect declaration + pure
