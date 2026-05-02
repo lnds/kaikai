@@ -25,26 +25,26 @@ KaiValue *kaix_int(int64_t i)                  { return kai_int(i); }
 KaiValue *kaix_bool(int b)                     { return kai_bool(b); }
 
 /* ---------- binops ---------- */
-KaiValue *kaix_add(KaiValue *a, KaiValue *b)   { return kai_add(a, b); }
-KaiValue *kaix_sub(KaiValue *a, KaiValue *b)   { return kai_sub(a, b); }
-KaiValue *kaix_mul(KaiValue *a, KaiValue *b)   { return kai_mul(a, b); }
-KaiValue *kaix_div(KaiValue *a, KaiValue *b)   { return kai_div(a, b); }
-KaiValue *kaix_idiv(KaiValue *a, KaiValue *b)  { return kai_idiv(a, b); }
-KaiValue *kaix_mod(KaiValue *a, KaiValue *b)   { return kai_mod(a, b); }
-KaiValue *kaix_eq(KaiValue *a, KaiValue *b)    { return kai_eq_v(a, b); }
-KaiValue *kaix_ne(KaiValue *a, KaiValue *b)    { return kai_ne_v(a, b); }
-KaiValue *kaix_lt(KaiValue *a, KaiValue *b)    { return kai_lt(a, b); }
-KaiValue *kaix_gt(KaiValue *a, KaiValue *b)    { return kai_gt(a, b); }
-KaiValue *kaix_le(KaiValue *a, KaiValue *b)    { return kai_le(a, b); }
-KaiValue *kaix_ge(KaiValue *a, KaiValue *b)    { return kai_ge(a, b); }
-KaiValue *kaix_neg(KaiValue *a)                { return kai_neg(a); }
-KaiValue *kaix_pow_int(KaiValue *a, KaiValue *b) { return kai_pow_int(a, b); }
-/* Route through kai_boolnot so the LLVM backend's `not` matches the
+KaiValue *kaix_add(KaiValue *a, KaiValue *b)   { return kai_op_add(a, b); }
+KaiValue *kaix_sub(KaiValue *a, KaiValue *b)   { return kai_op_sub(a, b); }
+KaiValue *kaix_mul(KaiValue *a, KaiValue *b)   { return kai_op_mul(a, b); }
+KaiValue *kaix_div(KaiValue *a, KaiValue *b)   { return kai_op_div(a, b); }
+KaiValue *kaix_idiv(KaiValue *a, KaiValue *b)  { return kai_op_idiv(a, b); }
+KaiValue *kaix_mod(KaiValue *a, KaiValue *b)   { return kai_op_mod(a, b); }
+KaiValue *kaix_eq(KaiValue *a, KaiValue *b)    { return kai_op_eq_v(a, b); }
+KaiValue *kaix_ne(KaiValue *a, KaiValue *b)    { return kai_op_ne_v(a, b); }
+KaiValue *kaix_lt(KaiValue *a, KaiValue *b)    { return kai_op_lt(a, b); }
+KaiValue *kaix_gt(KaiValue *a, KaiValue *b)    { return kai_op_gt(a, b); }
+KaiValue *kaix_le(KaiValue *a, KaiValue *b)    { return kai_op_le(a, b); }
+KaiValue *kaix_ge(KaiValue *a, KaiValue *b)    { return kai_op_ge(a, b); }
+KaiValue *kaix_neg(KaiValue *a)                { return kai_op_neg(a); }
+KaiValue *kaix_pow_int(KaiValue *a, KaiValue *b) { return kai_op_pow_int(a, b); }
+/* Route through kai_op_boolnot so the LLVM backend's `not` matches the
  * C backend's `!` operator: same type-check + consuming semantics. */
-KaiValue *kaix_not(KaiValue *a)                { return kai_boolnot(a); }
+KaiValue *kaix_not(KaiValue *a)                { return kai_op_boolnot(a); }
 
 /* ---------- control helpers ---------- */
-int kaix_truthy(KaiValue *v)                   { return kai_truthy(v); }
+int kaix_truthy(KaiValue *v)                   { return kai_op_truthy(v); }
 
 /* ---------- m5 #4 — Perceus dup/drop wrappers for LLVM backend ---------- */
 KaiValue *kaix_internal_dup(KaiValue *v)       { return kai_internal_dup(v); }
@@ -107,9 +107,9 @@ KaiValue *kaix_variant_arg(KaiValue *v, int i) {
     return kai_incref(v->as.var.args[i]);
 }
 
-/* kai_eq returns an int; wrap for direct use from the IR in match
+/* kai_op_eq returns an int; wrap for direct use from the IR in match
    guards or literal patterns that want a KaiValue* Bool. */
-KaiValue *kaix_eq_raw(KaiValue *a, KaiValue *b) { return kai_bool(kai_eq(a, b)); }
+KaiValue *kaix_eq_raw(KaiValue *a, KaiValue *b) { return kai_bool(kai_op_eq(a, b)); }
 
 /* Panic with a message. The LLVM match lowering calls this in the
    fall-through block of the last arm when no pattern matches, so the
@@ -159,8 +159,8 @@ KaiValue *kaix_record(int n, KaiValue **fields, const char **names) {
     return kai_record(n, fields, names);
 }
 
-KaiValue *kaix_field(KaiValue *rec, const char *name)        { return kai_field(rec, name); }
-KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_field_borrow(rec, name); }
+KaiValue *kaix_field(KaiValue *rec, const char *name)        { return kai_op_field(rec, name); }
+KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_op_field_borrow(rec, name); }
 
 /* Full prelude set — anything the compiler (stage 2's own source)
    calls directly when compiled through the LLVM backend. */

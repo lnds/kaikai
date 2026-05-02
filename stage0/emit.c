@@ -404,7 +404,7 @@ static void emit_pat_test(E *e, Node *pat, const char *scr);
  * cons head/tail). PBind/PAs emit `kai_incref(scr)` so the binding has its
  * own owned reference, decoupled from the producer's slot. When false, the
  * scrutinee is already owned (top-level _scr / _letv from a transferred RHS,
- * or kai_field which already increfs its return) and the binding takes the
+ * or kai_op_field which already increfs its return) and the binding takes the
  * ref directly. */
 static void emit_pat_binds(E *e, Node *pat, const char *scr, int is_alias);
 static void emit_string_expr(E *e, Node *s);
@@ -755,18 +755,18 @@ static LamInfo *find_lam_info(E *e, Node *lam) {
 
 static const char *binop_fn(int op) {
     switch (op) {
-        case TK_PLUS:        return "kai_add";
-        case TK_MINUS:       return "kai_sub";
-        case TK_STAR:        return "kai_mul";
-        case TK_SLASH:       return "kai_div";
-        case TK_SLASH_SLASH: return "kai_idiv";
-        case TK_PERCENT:     return "kai_mod";
-        case TK_LT:          return "kai_lt";
-        case TK_GT:          return "kai_gt";
-        case TK_LE:          return "kai_le";
-        case TK_GE:          return "kai_ge";
-        case TK_EQEQ:        return "kai_eq_v";
-        case TK_NEQ:         return "kai_ne_v";
+        case TK_PLUS:        return "kai_op_add";
+        case TK_MINUS:       return "kai_op_sub";
+        case TK_STAR:        return "kai_op_mul";
+        case TK_SLASH:       return "kai_op_div";
+        case TK_SLASH_SLASH: return "kai_op_idiv";
+        case TK_PERCENT:     return "kai_op_mod";
+        case TK_LT:          return "kai_op_lt";
+        case TK_GT:          return "kai_op_gt";
+        case TK_LE:          return "kai_op_le";
+        case TK_GE:          return "kai_op_ge";
+        case TK_EQEQ:        return "kai_op_eq_v";
+        case TK_NEQ:         return "kai_op_ne_v";
         default:             return NULL;
     }
 }
@@ -776,13 +776,13 @@ static void emit_binop(E *e, Node *n) {
     Node *l = n->children[0], *r = n->children[1];
     if (op == TK_AND) {
         fputs("({ KaiValue *_a = ", e->out); emit_expr(e, l);
-        fputs("; kai_truthy(_a) ? ", e->out); emit_expr(e, r);
+        fputs("; kai_op_truthy(_a) ? ", e->out); emit_expr(e, r);
         fputs(" : kai_bool(0); })", e->out);
         return;
     }
     if (op == TK_OR) {
         fputs("({ KaiValue *_a = ", e->out); emit_expr(e, l);
-        fputs("; kai_truthy(_a) ? kai_bool(1) : ", e->out); emit_expr(e, r);
+        fputs("; kai_op_truthy(_a) ? kai_bool(1) : ", e->out); emit_expr(e, r);
         fputs("; })", e->out);
         return;
     }
@@ -797,8 +797,8 @@ static void emit_binop(E *e, Node *n) {
 
 static void emit_unop(E *e, Node *n) {
     int op = n->v.op;
-    const char *fn = (op == TK_MINUS) ? "kai_neg"
-                    : (op == TK_NOT)   ? "kai_boolnot"
+    const char *fn = (op == TK_MINUS) ? "kai_op_neg"
+                    : (op == TK_NOT)   ? "kai_op_boolnot"
                     : NULL;
     if (!fn) { bug(e, n, "unknown unop"); return; }
     fprintf(e->out, "%s(", fn);
@@ -812,7 +812,7 @@ static void emit_if(E *e, Node *n) {
     Node *cond = n->children[0];
     Node *then_br = n->children[1];
     Node *else_br = (n->v.flags & 0x1) ? n->children[2] : NULL;
-    fputs("(kai_truthy(", e->out); emit_expr(e, cond); fputs(") ? ", e->out);
+    fputs("(kai_op_truthy(", e->out); emit_expr(e, cond); fputs(") ? ", e->out);
     emit_expr(e, then_br);
     fputs(" : ", e->out);
     if (else_br) emit_expr(e, else_br);
@@ -1006,7 +1006,7 @@ static void emit_record_lit(E *e, Node *n) {
 }
 
 static void emit_field_access(E *e, Node *n) {
-    fputs("kai_field(", e->out);
+    fputs("kai_op_field(", e->out);
     emit_expr(e, n->children[0]);
     fprintf(e->out, ", \"%.*s\")", (int) n->name_len, n->name);
 }
@@ -1021,7 +1021,7 @@ static void emit_pat_test(E *e, Node *pat, const char *scr) {
 
         case N_PAT_LIT: {
             Node *lit = pat->children[0];
-            fprintf(e->out, "kai_eq(%s, ", scr);
+            fprintf(e->out, "kai_op_eq(%s, ", scr);
             emit_expr(e, lit);
             fputc(')', e->out);
             return;
@@ -1077,13 +1077,13 @@ static void emit_pat_test(E *e, Node *pat, const char *scr) {
                the arm; it does not consume the field. Use the
                borrowing variant so failing arms do not leak the
                field's ref. emit_pat_binds keeps using the incref-ing
-               kai_field below. */
+               kai_op_field below. */
             fprintf(e->out, "(%s && %s->tag == KAI_RECORD", scr, scr);
             for (size_t i = 0; i < pat->n_children; ++i) {
                 Node *pf = pat->children[i];
                 char tmp[512];
                 snprintf(tmp, sizeof(tmp),
-                         "kai_field_borrow(%s, \"%.*s\")", scr,
+                         "kai_op_field_borrow(%s, \"%.*s\")", scr,
                          (int) pf->name_len, pf->name);
                 fputs(" && (", e->out);
                 emit_pat_test(e, pf->children[0], tmp);
@@ -1153,9 +1153,9 @@ static void emit_pat_binds(E *e, Node *pat, const char *scr, int is_alias) {
                 Node *pf = pat->children[i];
                 char tmp[512];
                 snprintf(tmp, sizeof(tmp),
-                         "kai_field(%s, \"%.*s\")", scr,
+                         "kai_op_field(%s, \"%.*s\")", scr,
                          (int) pf->name_len, pf->name);
-                /* kai_field already incrs its return; child is owned. */
+                /* kai_op_field already incrs its return; child is owned. */
                 emit_pat_binds(e, pf->children[0], tmp, 0);
             }
             return;
@@ -1192,7 +1192,7 @@ static void emit_match(E *e, Node *m) {
         emit_pat_binds(e, pat, "_scr", 1);
         pat_add_locals(e, pat);
         if (has_guard) {
-            fputs("if (kai_truthy(", e->out);
+            fputs("if (kai_op_truthy(", e->out);
             emit_expr(e, guard);
             fputs(")) { _r = ", e->out);
             emit_expr(e, body);
@@ -1450,7 +1450,7 @@ static void emit_stmt(E *e, Node *n) {
                 fputs("{ KaiValue *_c = ", e->out);
                 emit_expr(e, n->children[0]);
                 if (n->v.flags & 0x1) {
-                    fputs("; if (!kai_truthy(_c)) { KaiValue *_m = ", e->out);
+                    fputs("; if (!kai_op_truthy(_c)) { KaiValue *_m = ", e->out);
                     emit_expr(e, n->children[1]);
                     fputs("; kai_test_fail(", e->out);
                     if (e->cur_test_desc_start) {
@@ -1460,7 +1460,7 @@ static void emit_stmt(E *e, Node *n) {
                     }
                     fputs(", (_m && _m->tag == KAI_STR) ? _m->as.s.bytes : \"assertion failed\"); return; } }", e->out);
                 } else {
-                    fputs("; if (!kai_truthy(_c)) { kai_test_fail(", e->out);
+                    fputs("; if (!kai_op_truthy(_c)) { kai_test_fail(", e->out);
                     if (e->cur_test_desc_start) {
                         fprintf(e->out, "%.*s", (int) e->cur_test_desc_len, e->cur_test_desc_start);
                     } else {
@@ -1471,7 +1471,7 @@ static void emit_stmt(E *e, Node *n) {
             } else {
                 fputs("{ KaiValue *_c = ", e->out);
                 emit_expr(e, n->children[0]);
-                fputs("; if (!kai_truthy(_c)) { kai_prelude_panic(kai_str(\"assertion failed\")); } }", e->out);
+                fputs("; if (!kai_op_truthy(_c)) { kai_prelude_panic(kai_str(\"assertion failed\")); } }", e->out);
             }
             (void) msg_expr;
             return;
