@@ -1,0 +1,71 @@
+# DIAGNOSTIC ONLY — KNOWN ASAN FAIL (issue #61, R10)
+#
+# Standalone reproducer for R10. Same shape as R11 but with the
+# parameterised effect renamed to Reader and the read op renamed to
+# `ask` so the failure surfaces from the user-facing Reader-style
+# pattern documented in docs/known-regressions.md §R10. Identical
+# structure to r11_repro.kai — single state read in the parameterised
+# handler clause, downstream string_concat decrefs the aliased
+# storage.
+#
+# Expected behaviour today:
+#   - kaic2 compiles the file cleanly.
+#   - cc -fsanitize=address compiles the C cleanly.
+#   - At runtime: SIGBUS on the third Trace.log invocation (per the
+#     R10 lane report); first invocation prints correctly, second and
+#     third produce blank or garbage output.
+#   - With ASAN: heap-use-after-free in kai_string_concat reading
+#     the freed prefix bytes.
+#
+# The R10 hypothesis in docs/known-regressions.md attributed the
+# crash to in_dispatch_node save/restore around the inner Trace
+# clause's self-delegated Trace.log. This file is the diagnostic
+# control: removing the inner self-delegation (the negative control
+# in the R10 entry) makes the crash go away because there is no
+# string_concat consuming the Reader.ask() value. Add the inner
+# Trace handler back and the crash returns — the trigger is the
+# decref-aware sink, not the dispatch flag.
+#
+# Do NOT add this file to any tier1 or demos baseline; it is a
+# diagnostic fixture only.
+
+import trace
+
+effect Reader[T] {
+  ask() : T
+}
+
+pub fn with_log_prefix_via_reader[R, e](
+  prefix: String,
+  body: () -> R / Trace + e
+) : R / Trace + e = {
+  handle {
+    handle {
+      body()
+    } with Trace {
+      log(msg, resume) -> {
+        Trace.log(Reader.ask() ++ ": " ++ msg)
+        resume(())
+      }
+      checkpoint(name, resume) -> {
+        Trace.log(Reader.ask() ++ ": checkpoint: " ++ name)
+        resume(())
+      }
+      return(x) -> x
+    }
+  } with Reader[String](prefix) {
+    # Single read of `state` — same trigger as r11_repro.kai.
+    ask(resume) -> resume(state)
+    return(x)   -> x
+  }
+}
+
+fn worker() : Unit / Trace = {
+  Trace.log("first")
+  Trace.log("second")
+  Trace.log("third")
+}
+
+fn main() : Unit / Stdout = with_trace_default() {
+  with_log_prefix_via_reader("P", worker)
+}
