@@ -31,6 +31,28 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   total OK + PASS column rises from 25 to 26 (`demos/baseline.txt`
   bumped accordingly).
 
+### Removed
+
+- **`demos/state/` retired.** The demo's pattern (a `make_counter`
+  factory returning a `() -> Int / State[Int]` closure that reads
+  / writes a `var n = 0` cell via `@n` / `n :=`) is structurally
+  incompatible with kaikai's `var` model: `var n = 0` desugars to
+  a `with State[Int](0) as n` whose handler scope ends at the
+  closing brace of the introducing block. A returned closure
+  outlives that scope, so the captured `@n` reads / `n :=` writes
+  hit a freed handler at runtime (SIGSEGV, exit 139). This is by
+  design — `var` cells are stack-scoped, not heap-allocated. The
+  demo was filed under issue #95 as "blocked on m7b #5b var sugar"
+  (then later reframed as "blocked on m7b #4 `@cap` read"); both
+  framings were misdiagnoses. m7b #5b shipped in `8d56620` (var
+  desugar) and m7b #4 shipped in `1b8fa58` (`@cap` / `cap := v`),
+  yet the demo still segfaults — confirming the structural issue.
+  `demos/state_var/` and `demos/state_explicit/` continue to cover
+  the working forms (var cell + method-style; explicit
+  `State[Int]` handler). Issue #95 reframed to track only the
+  `stack/` demo, which has a distinct blocker (handler-clause-scope
+  `var`).
+
 ## [0.34.0] — 2026-05-02 (typer hardening — #71 option (a) + #72 per-op row generics)
 
 ### Added
