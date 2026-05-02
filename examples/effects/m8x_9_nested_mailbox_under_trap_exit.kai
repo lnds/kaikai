@@ -1,0 +1,56 @@
+# Issue #104 — nested with_mailbox of a different Msg type under
+# a trap-exit'd supervisor used to SIGSEGV when the worker fiber
+# called spawn_actor inside the nested scope. Root cause: the
+# spawned cell fiber inherited evidence_top from the worker's
+# stack, then the worker terminated and its mmap'd stack was
+# munmap'd before the cell ran — the cell's first effect lookup
+# walked the inherited evidence pointer into freed memory.
+#
+# The fix pins the parent's wrapper (kai_incref) at spawn time
+# whenever the child inherits a non-empty evidence_top; the pin
+# is released at the child's free_value, which transitively keeps
+# the entire spawn-ancestor chain alive while any descendant may
+# walk into its evidence frames.
+#
+# This fixture runs under both tier1 (test-trace) and tier1-asan
+# (test-trace-asan). The reporter's program used `body` as the
+# top-level identifier, which independently collides with the
+# `body` parameter in stdlib's `with_mailbox` / `spawn_actor`
+# (a separate, known stage 2 shadowing concern). We use `worker`
+# here so the fixture asserts the runtime fix without leaning on
+# the orthogonal symbol-resolution bug.
+
+import actor
+import spawn
+
+type CellMsg = Tick | Ack
+
+fn cell_loop() : Unit / Actor[CellMsg] + Console = {
+  Stdout.print("cell: alive")
+}
+
+fn nested_with_cell() : Unit / Spawn + Console + Actor[CellMsg] = {
+  let _pid = spawn_actor(() => cell_loop())
+  ()
+}
+
+fn worker(parent: Pid[String])
+  : Unit / Actor[String] + Link + Console + Spawn
+= {
+  Link.link(parent)
+  Stdout.print("worker: linked, opening nested mailbox")
+  let _ = with_mailbox { nested_with_cell() }
+  Stdout.print("worker: nested closed, returning")
+}
+
+fn run() : Unit / Actor[String] + Spawn + Console + Link = {
+  let _ = fiber_set_trap_exit(true)
+  let me = Actor.self()
+  let _ = fiber_spawn(() => with_mailbox { worker(me) })
+  Stdout.print("supervisor got: " ++ Actor.receive())
+}
+
+fn main() : Int / Console + Spawn + Link = {
+  with_mailbox { run() }
+  0
+}
