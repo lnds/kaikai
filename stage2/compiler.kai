@@ -17738,6 +17738,41 @@ fn collect_records_loop(ds: [Decl], acc: [RecInfo]) : [RecInfo] {
 
 fn collect_records(ds: [Decl]) : [RecInfo] = collect_records_loop(ds, [])
 
+# Sum-type registry for the region-brand walker (issue #71). The
+# shallow `ty_expr_contains_fiber/pid` walker only sees TypeExprs;
+# a `type Boxed = Wrap(Fiber[Int])` would otherwise hide the Fiber
+# inside the variant's payload, since the surface TypeExpr is just
+# `TyName("Boxed", [])`. SumInfo records (type name, tparams,
+# variants) per `DType ... TBSum`, threaded through `infer_program`
+# the same way `RecInfo` is.
+type SumInfo = SI(String, [String], [Variant])
+
+fn sum_find_loop(ss: [SumInfo], target: String) : Option[SumInfo] {
+  match ss {
+    [] -> None
+    [s, ...rest] -> match s {
+      SI(nm, _, _) -> if nm == target { Some(s) } else { sum_find_loop(rest, target) }
+    }
+  }
+}
+
+fn sum_find(ss: [SumInfo], target: String) : Option[SumInfo] = sum_find_loop(ss, target)
+
+fn collect_sums_loop(ds: [Decl], acc: [SumInfo]) : [SumInfo] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DType(_, nm, tps, body, _, _) -> match body {
+        TBSum(vs) -> collect_sums_loop(rest, [SI(nm, tps, vs), ...acc])
+        _ -> collect_sums_loop(rest, acc)
+      }
+      _ -> collect_sums_loop(rest, acc)
+    }
+  }
+}
+
+fn collect_sums(ds: [Decl]) : [SumInfo] = collect_sums_loop(ds, [])
+
 # ---- inference state ----
 
 # A single call-site that instantiated a polymorphic scheme. `fresh`
@@ -20774,6 +20809,7 @@ fn return_site_of(e: Expr) : Expr {
 fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
               op_eff_arities: [OpEffArity],
               type_aliases: [AliasResult], op_to_eff: [OpToEff],
+              sums: [SumInfo],
               d: Decl, verbose: Bool) : TypedDecl {
   match d {
     DFn(is_pub, nm, tparams, ps, opt_ret, row, body, line, col, mo) -> {
@@ -20864,7 +20900,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # the type-annotation line. Internal stdlib helpers
       # (fiber_spawn, etc.) are exempt by file-path because they are
       # the legitimate constructors of Fiber[T] values.
-      let st1b = check_no_fiber_escape(st1, file, nm, opt_ret, line, col)
+      let st1b = check_no_fiber_escape(st1, file, nm, opt_ret, sums, line, col)
       let st2 = check_body_row(st1b, nm, row, line, col)
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
@@ -20978,47 +21014,83 @@ fn finalise_typed_kind(s: Subst, k: ExprKind) : ExprKind =
 #
 # Tier 2 (2026-04-30): symmetrise the check across `Fiber[T]` and
 # `Pid[Msg]` so a stdlib-external helper can no longer return a
-# raw Pid either. The full TyBranded(Ty, BrandId) machinery from
+# raw Pid either.
+#
+# Issue #71 (option (a), 2026-05-02): the walker now also descends
+# into user-defined sum-type constructor payloads via the
+# `[SumInfo]` registry collected in `infer_program`. A
+# `type Boxed = Wrap(Fiber[Int])` return value used to escape the
+# shallow walker — its surface TypeExpr is `TyName("Boxed", [])`
+# and the Fiber lives in the variant payload, not in the TypeExpr
+# the walker saw. The deep walker substitutes the type's tparams
+# into each variant's payload TypeExprs and recurses, with a
+# `visited` set to terminate on recursive sums (`type Tree[T] =
+# Leaf(T) | Node(Tree[T], Tree[T])`).
+#
+# The full TyBranded(Ty, BrandId) machinery from
 # `docs/structured-concurrency.md` §*Type system* — propagating a
 # brand through every binding form (let, match, list literal,
 # record field, fn arg) and rejecting brand-mismatch between
-# sibling nurseries — is still pending; the shallow check here
-# already covers (a) Fiber/Pid as a return type at any depth and
-# (b) Fiber/Pid embedded in stdlib-defined parametric types
-# (Result[_, Fiber[Int]], Option[Pid[Msg]], etc. via the
-# recursive walk).
+# sibling nurseries — has not landed. Its structural prerequisite
+# is the cap-binding form `nursery { n -> ... }` (m7b #4) which
+# also has not landed: today `nursery { ... }` is a plain helper
+# with no `n` parameter, so sibling-nursery brand mismatch is
+# unwritable in user code. Until the cap binding lands, the
+# brand-mismatch detection has no surface to attach to.
 fn check_no_fiber_escape(st: InferState, file: String, fname: String,
-                          opt_ret: Option[TypeExpr], line: Int, col: Int) : InferState {
+                          opt_ret: Option[TypeExpr], sums: [SumInfo],
+                          line: Int, col: Int) : InferState {
   if is_fiber_producer_helper(fname) { st }
   else {
     match opt_ret {
       None -> st
       Some(rty) -> {
-        if ty_expr_contains_fiber(rty) {
-          let lline = if rty.line > 0 { rty.line } else { line }
-          let lcol  = if rty.col  > 0 { rty.col  } else { col  }
-          diag_error(file, lline, lcol,
-            string_concat(string_concat("Fiber[T] cannot escape `", fname),
-                          "`'s structured-concurrency scope"))
-          diag_note("a `Fiber[T]` handle is bound to the nursery that created it")
-          diag_note("returning one from a function lets it outlive that scope")
-          diag_help("process the fiber inside the nursery (e.g. with `fiber_await`), or pass a thunk in and a value out instead")
-          st_bump_err(st)
-        } else if ty_expr_contains_pid(rty) {
-          let lline = if rty.line > 0 { rty.line } else { line }
-          let lcol  = if rty.col  > 0 { rty.col  } else { col  }
-          diag_error(file, lline, lcol,
-            string_concat(string_concat("Pid[Msg] cannot escape `", fname),
-                          "`'s structured-concurrency scope"))
-          diag_note("a `Pid[Msg]` handle is bound to the actor scope that created it")
-          diag_note("returning one from a function lets it outlive that scope")
-          diag_help("process the pid inside the scope (e.g. with `Actor.send`), or pass a thunk in and a value out instead")
-          st_bump_err(st)
-        } else {
-          st
+        match ty_expr_find_handle("Fiber", rty, sums, []) {
+          Some(breach) -> {
+            let lline = if rty.line > 0 { rty.line } else { line }
+            let lcol  = if rty.col  > 0 { rty.col  } else { col  }
+            diag_error(file, lline, lcol,
+              string_concat(string_concat("Fiber[T] cannot escape `", fname),
+                            "`'s structured-concurrency scope"))
+            diag_note("a `Fiber[T]` handle is bound to the nursery that created it")
+            diag_note("returning one from a function lets it outlive that scope")
+            emit_handle_breach_note("Fiber", breach)
+            diag_help("process the fiber inside the nursery (e.g. with `fiber_await`), or pass a thunk in and a value out instead")
+            st_bump_err(st)
+          }
+          None -> match ty_expr_find_handle("Pid", rty, sums, []) {
+            Some(breach) -> {
+              let lline = if rty.line > 0 { rty.line } else { line }
+              let lcol  = if rty.col  > 0 { rty.col  } else { col  }
+              diag_error(file, lline, lcol,
+                string_concat(string_concat("Pid[Msg] cannot escape `", fname),
+                              "`'s structured-concurrency scope"))
+              diag_note("a `Pid[Msg]` handle is bound to the actor scope that created it")
+              diag_note("returning one from a function lets it outlive that scope")
+              emit_handle_breach_note("Pid", breach)
+              diag_help("process the pid inside the scope (e.g. with `Actor.send`), or pass a thunk in and a value out instead")
+              st_bump_err(st)
+            }
+            None -> st
+          }
         }
       }
     }
+  }
+}
+
+# Issue #71: when the breach goes through a user-defined sum
+# payload, surface the type + constructor name so the user can
+# see exactly which carrier smuggled the handle out. Direct
+# breaches (Fiber/Pid as a top-level type-arg or return type)
+# emit no extra note — the existing Fiber/Pid pointer is enough.
+fn emit_handle_breach_note(hname: String, breach: HandleBreach) : Unit {
+  match breach {
+    HBDirect -> ()
+    HBSum(tname, cname) ->
+      diag_note(concat_all(["`", hname,
+                            "` is wrapped by constructor `", cname,
+                            "` of sum type `", tname, "`"]))
   }
 }
 
@@ -21046,62 +21118,157 @@ fn fiber_producer_helpers() : [String] =
 fn is_fiber_producer_helper(fname: String) : Bool =
   list_has(fiber_producer_helpers(), fname)
 
-# Walks a TypeExpr looking for any TyName("Fiber", ...) at any depth
-# (list, function-arg / -ret, type-arg). Returns true on the first
-# hit. Cheap because TypeExprs are small and shallow.
-fn ty_expr_contains_fiber(t: TypeExpr) : Bool {
+# Issue #71 (option (a), 2026-05-02): a single deep walker
+# parameterised by the handle name (`Fiber` or `Pid`). Returns
+# `Some(HBDirect)` for a top-level/recursive-shallow occurrence
+# (Fiber[Int], Result[_, Fiber[Int]], Option[Pid[Msg]], …) and
+# `Some(HBSum(tname, cname))` when the handle is hidden inside a
+# user-defined sum's variant payload (`type Boxed =
+# Wrap(Fiber[Int])`). The `visited` set guards recursive sums
+# (`type Tree[T] = Leaf(T) | Node(Tree[T], Tree[T])`).
+type HandleBreach = HBDirect | HBSum(String, String)
+
+fn ty_expr_find_handle(hname: String, t: TypeExpr,
+                        sums: [SumInfo], visited: [String]) : Option[HandleBreach] {
   match t.tkind {
-    TyName(name, tas) ->
-      if name == "Fiber" { true }
-      else { ty_expr_list_has_fiber(tas) }
-    TyList(inner) -> ty_expr_contains_fiber(inner)
-    TyFn(ps, ret, _) -> {
-      if ty_expr_list_has_fiber(ps) { true }
-      else { ty_expr_contains_fiber(ret) }
+    TyName(name, tas) -> {
+      if name == hname { Some(HBDirect) }
+      else {
+        match ty_expr_list_find_handle(hname, tas, sums, visited) {
+          Some(b) -> Some(b)
+          None -> {
+            if list_has(visited, name) { None }
+            else {
+              match sum_find(sums, name) {
+                None -> None
+                Some(si) -> match si {
+                  SI(sname, tps, vs) -> {
+                    let mapping = build_tparam_mapping(tps, tas)
+                    variants_find_handle(hname, vs, mapping, sums,
+                                          [sname, ...visited], sname)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
-    # m12.5: dimensioned types never carry a Fiber — recurse into base.
-    TyDim(base, _) -> ty_expr_contains_fiber(base)
-    # m12.6.a: refinement predicates cannot mention Fiber (predicate
+    TyList(inner) -> ty_expr_find_handle(hname, inner, sums, visited)
+    TyFn(ps, ret, _) -> {
+      match ty_expr_list_find_handle(hname, ps, sums, visited) {
+        Some(b) -> Some(b)
+        None -> ty_expr_find_handle(hname, ret, sums, visited)
+      }
+    }
+    # m12.5: dimensioned types never carry a Fiber/Pid — recurse into base.
+    TyDim(base, _) -> ty_expr_find_handle(hname, base, sums, visited)
+    # m12.6.a: refinement predicates cannot mention Fiber/Pid (predicate
     # subset is data-only); only the base type matters.
-    TyRefine(base, _) -> ty_expr_contains_fiber(base)
+    TyRefine(base, _) -> ty_expr_find_handle(hname, base, sums, visited)
   }
 }
 
-fn ty_expr_list_has_fiber(ts: [TypeExpr]) : Bool {
+fn ty_expr_list_find_handle(hname: String, ts: [TypeExpr],
+                              sums: [SumInfo], visited: [String]) : Option[HandleBreach] {
   match ts {
-    [] -> false
-    [t, ...rest] -> if ty_expr_contains_fiber(t) { true } else { ty_expr_list_has_fiber(rest) }
-  }
-}
-
-# Tier 2 (2026-04-30): same shallow walk as `ty_expr_contains_fiber`
-# but for `Pid`. Region-brand machinery (TyBranded) is still pending,
-# so this is the same syntactic approximation: any TypeExpr
-# mentioning `Pid` at any depth (list, function-arg/-ret, type-arg,
-# dimensioned base, refinement base) returns true. Producer-helper
-# allow-list (`fiber_producer_helpers`) stays intentionally narrow;
-# stdlib's `mailbox_alloc` / `Actor.self()` still go through their
-# prelude / op-call scheme entries which are not subjected to this
-# check.
-fn ty_expr_contains_pid(t: TypeExpr) : Bool {
-  match t.tkind {
-    TyName(name, tas) ->
-      if name == "Pid" { true }
-      else { ty_expr_list_has_pid(tas) }
-    TyList(inner) -> ty_expr_contains_pid(inner)
-    TyFn(ps, ret, _) -> {
-      if ty_expr_list_has_pid(ps) { true }
-      else { ty_expr_contains_pid(ret) }
+    [] -> None
+    [t, ...rest] -> match ty_expr_find_handle(hname, t, sums, visited) {
+      Some(b) -> Some(b)
+      None    -> ty_expr_list_find_handle(hname, rest, sums, visited)
     }
-    TyDim(base, _) -> ty_expr_contains_pid(base)
-    TyRefine(base, _) -> ty_expr_contains_pid(base)
   }
 }
 
-fn ty_expr_list_has_pid(ts: [TypeExpr]) : Bool {
+fn variants_find_handle(hname: String, vs: [Variant],
+                          mapping: [TParamMapEntry], sums: [SumInfo],
+                          visited: [String], sname: String) : Option[HandleBreach] {
+  match vs {
+    [] -> None
+    [v, ...rest] -> match v {
+      Var(cname, payload) -> match payload_find_handle(hname, payload, mapping, sums, visited) {
+        Some(_) -> Some(HBSum(sname, cname))
+        None    -> variants_find_handle(hname, rest, mapping, sums, visited, sname)
+      }
+    }
+  }
+}
+
+fn payload_find_handle(hname: String, payload: [TypeExpr],
+                         mapping: [TParamMapEntry], sums: [SumInfo],
+                         visited: [String]) : Option[HandleBreach] {
+  match payload {
+    [] -> None
+    [te, ...rest] -> {
+      let te_subst = subst_tparams_te(te, mapping)
+      match ty_expr_find_handle(hname, te_subst, sums, visited) {
+        Some(b) -> Some(b)
+        None    -> payload_find_handle(hname, rest, mapping, sums, visited)
+      }
+    }
+  }
+}
+
+# Tparam->TypeExpr mapping built from a sum's [tparams] zipped with
+# the type-args at the use site. When the use site provides fewer
+# type-args than the type declares (rare, but possible on a not-yet-
+# fully-applied alias), the missing entries are skipped — the walker
+# treats the unbound name as opaque (no Fiber/Pid hidden behind it).
+type TParamMapEntry = TPM(String, TypeExpr)
+
+fn build_tparam_mapping(tps: [String], tas: [TypeExpr]) : [TParamMapEntry] {
+  match tps {
+    [] -> []
+    [tp, ...tps_rest] -> match tas {
+      [] -> []
+      [ta, ...tas_rest] -> [TPM(tp, ta), ...build_tparam_mapping(tps_rest, tas_rest)]
+    }
+  }
+}
+
+fn tparam_lookup(mapping: [TParamMapEntry], name: String) : Option[TypeExpr] {
+  match mapping {
+    [] -> None
+    [m, ...rest] -> match m {
+      TPM(n, te) -> if n == name { Some(te) } else { tparam_lookup(rest, name) }
+    }
+  }
+}
+
+# Issue #71: substitute tparam references in a payload TypeExpr
+# with their concrete TypeExpr at the use site. Only `TyName(n, [])`
+# entries are candidates for substitution — a higher-arity name is
+# a real type constructor, not a tparam reference. The substitution
+# is purely structural; positions are preserved.
+fn subst_tparams_te(t: TypeExpr, mapping: [TParamMapEntry]) : TypeExpr {
+  match t.tkind {
+    TyName(n, tas) -> {
+      if list_length(tas) == 0 {
+        match tparam_lookup(mapping, n) {
+          Some(replacement) -> replacement
+          None              -> t
+        }
+      } else {
+        mk_ty(TyName(n, subst_tparams_tes(tas, mapping)), t.line, t.col)
+      }
+    }
+    TyList(inner) ->
+      mk_ty(TyList(subst_tparams_te(inner, mapping)), t.line, t.col)
+    TyFn(ps, ret, row) ->
+      mk_ty(TyFn(subst_tparams_tes(ps, mapping),
+                 subst_tparams_te(ret, mapping), row), t.line, t.col)
+    TyDim(base, u) ->
+      mk_ty(TyDim(subst_tparams_te(base, mapping), u), t.line, t.col)
+    TyRefine(base, p) ->
+      mk_ty(TyRefine(subst_tparams_te(base, mapping), p), t.line, t.col)
+  }
+}
+
+fn subst_tparams_tes(ts: [TypeExpr], mapping: [TParamMapEntry]) : [TypeExpr] {
   match ts {
-    [] -> false
-    [t, ...rest] -> if ty_expr_contains_pid(t) { true } else { ty_expr_list_has_pid(rest) }
+    [] -> []
+    [t, ...rest] -> [subst_tparams_te(t, mapping),
+                     ...subst_tparams_tes(rest, mapping)]
   }
 }
 
@@ -21229,7 +21396,8 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
                    acc_holes: [ResolvedHole],
                    acc_row_holes: [ResolvedRowHole],
                    type_aliases: [AliasResult],
-                   op_to_eff: [OpToEff]) : TypedProgram {
+                   op_to_eff: [OpToEff],
+                   sums: [SumInfo]) : TypedProgram {
   match ds {
     [] -> TypedProgram {
       decls: list_reverse(acc_decls), errs: acc_errs,
@@ -21239,14 +21407,14 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
     }
     [d, ...rest] -> {
       let r = infer_decl(file, env, prelude_len, recs, op_eff_arities,
-                          type_aliases, op_to_eff, d, verbose)
+                          type_aliases, op_to_eff, sums, d, verbose)
       infer_all_loop(file, env, prelude_len, recs, op_eff_arities, rest, verbose,
                      [r.decl, ...acc_decls],
                      acc_errs + r.errs,
                      llvm_prepend_reverse(r.insts, acc_insts),
                      prepend_reverse_holes(r.holes, acc_holes),
                      prepend_reverse_row_holes(r.row_holes, acc_row_holes),
-                     type_aliases, op_to_eff)
+                     type_aliases, op_to_eff, sums)
     }
   }
 }
@@ -21594,9 +21762,11 @@ fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram {
                                           collect_effect_names(decls_a))
   let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, file)
   let op_to_eff = collect_op_to_eff(decls_a)
+  # Issue #71: sum-type registry for the region-brand walker.
+  let sums = collect_sums(decls_a)
   infer_all_loop(file, built.env, built.prelude_len, recs,
                  built.op_eff_arities, decls_a, verbose, [], 0, [], [], [],
-                 alias_res.aliases, op_to_eff)
+                 alias_res.aliases, op_to_eff, sums)
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int {

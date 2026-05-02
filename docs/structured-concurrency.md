@@ -58,18 +58,41 @@ the scheduler.
 
 ## Type system
 
-- `Fiber[T]` is a region-branded handle, not a value. It
-  **cannot** escape the nursery that produced it: the scope
-  type tags `Fiber` with a region brand and the return type
-  checker rejects carrying it out. The same brand machinery is
-  shared with `Pid[Msg]` from `docs/actors.md` — both are
-  scope-bound handles to runtime objects, not first-class
-  movable values.
+- `Fiber[T]` and `Pid[Msg]` are scope-bound handles, not
+  first-class movable values. The typer rejects any non-stdlib
+  function that mentions either handle in its return type — at
+  any depth in the TypeExpr (`Result[_, Fiber[Int]]`,
+  `Option[Pid[Msg]]`, `[Fiber[T]]`, …) **and** transitively
+  through user-defined sum-type constructor payloads
+  (`type Boxed = Wrap(Fiber[Int])`). A narrow allow-list
+  (`fiber_spawn`, `mailbox_alloc`, `spawn_actor`, …) admits the
+  legitimate stdlib producers; everything else is rejected with
+  a diagnostic that names the wrapping constructor + sum type
+  when the breach goes through a payload. Coverage:
+  `examples/effects/m8x_6_fiber_in_result.kai`,
+  `m8x_6_pid_escapes.kai` (direct / parametric),
+  `m8x_7_fiber_in_sum.kai`, `m8x_7_pid_in_sum.kai`
+  (sum-payload), `m8x_7_recursive_sum_no_breach.kai` (recursive
+  sums traverse + terminate without false positive).
 - `spawn(f: () -> T / e)` makes the **effect set `e`** part of the
   nursery's own row. A nursery that spawns only pure tasks has no
   additional effect; a nursery that spawns `Io` tasks has `Io`.
 - Cancellation is an effect, `Cancel`. A task can `handle` it to
   release resources. Unhandled `Cancel` unwinds the fiber cleanly.
+
+The full `TyBranded(Ty, BrandId)` machinery — propagating a
+per-nursery brand through every binding form (let, match, list
+literal, record field, fn arg, fn return) and rejecting brand
+mismatch between sibling nurseries (`n1.spawn`-d Fiber passed
+into a `n2.spawn` body) — is the spec'd long-term shape. It is
+deferred behind the m7b #4 cap-binding form (`nursery { n -> ... }`):
+without `n` as a syntactic introduction site, a per-nursery
+brand has nowhere to attach, and sibling-nursery mismatch is
+unwritable in user code. Tracking: `docs/fibers-honesty-targets.md`
+§*Residual m8.x items* item 1; the today-vs-aspirational gap
+is the difference between *return-type / sum-payload escape*
+(closed) and *cross-sibling brand mismatch* (deferred behind
+m7b #4).
 
 ```kai
 # Polymorphic over whatever effect the worker carries.
