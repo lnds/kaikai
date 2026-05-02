@@ -9018,7 +9018,17 @@ type LamInfo = LamInfo(Int, Int, Int, [Param], [String], Expr)
 # distinct C symbols (`_kai_<enc>__clause_<l>_<c>_<op>`). The collect
 # pass populates this from `LamCollect.cur_enc_fn`; emit and install
 # paths read it back so both ends mint the same name.
-type ClauseInfo = CI(Int, Int, String, String, [Param], Expr, Bool, String)
+# R9 (issue #60, 2026-05-02): trailing `[String]` is the per-clause
+# closure-capture set — surface names that are free in the clause body
+# given (clause params + `state` + `log`) as the local scope. The list
+# travels through the EvE's `env` slot per `docs/effects-impl.md`
+# §"Op clause as ordinary function": at install time the handle
+# allocates a per-(line,col) env struct on its frame and populates one
+# field per captured name; the clause prologue rebinds each `kai_<name>`
+# alias from `((env*) self->env)->kai_<name>`. Without this channel,
+# any clause body that names an enclosing-fn parameter triggered the
+# `use of undeclared identifier 'kai_<param>'` C error tracked as R9.
+type ClauseInfo = CI(Int, Int, String, String, [Param], Expr, Bool, String, [String])
 
 fn find_lam(lams: [LamInfo], line: Int, col: Int) : Option[LamInfo] {
   match lams {
@@ -9496,7 +9506,14 @@ fn lc_record_clauses(cs: [HClause], eff: String, stateful: Bool,
     [] -> st
     [c, ...rest] -> match c {
       HC(op_name, params, body, _, _) -> {
-        let info = CI(hline, hcol, eff, op_name, params, body, stateful, enc_fn)
+        # R9: compute the clause's free-variable set, treating its own
+        # params plus the magic `state` / `log` aliases as bound. The
+        # resulting names are the captures the env channel must thread
+        # in from the surrounding handle frame. Mirrors `fv_hclauses`.
+        let own_for_fv = list_concat_strings(map(params, (pm) => pm.pname), ["state", "log"])
+        let raw_caps = fv_expr(body, own_for_fv, st.globals, [])
+        let caps = filter_clause_captures(raw_caps)
+        let info = CI(hline, hcol, eff, op_name, params, body, stateful, enc_fn, caps)
         let st1 = LamCollect {
           next_id: st.next_id, lams: st.lams,
           clauses: [info, ...st.clauses], globals: st.globals,
@@ -9504,6 +9521,88 @@ fn lc_record_clauses(cs: [HClause], eff: String, stateful: Bool,
         }
         lc_record_clauses(rest, eff, stateful, hline, hcol, enc_fn, st1)
       }
+    }
+  }
+}
+
+# R9: drop the `__alias_id__<a>` sentinels produced by `fv_expr` for
+# tagged op calls (`Eff.op@<a>`). Lambda capture rebinds them via
+# `kai_alias_<a>_id` reads in the lambda prologue; the clause env
+# channel does not yet carry handler-id captures (a follow-up — for
+# now an alias-id needed inside a clause body must be threaded
+# through the parametric handler's `state` slot, the existing
+# workaround). Plain value captures are everything else and travel
+# through `self->env` per `docs/effects-impl.md` §"Op clause as
+# ordinary function".
+fn filter_clause_captures(caps: [String]) : [String] {
+  match caps {
+    [] -> []
+    [c, ...rest] -> {
+      let prefix = "__alias_id__"
+      if string_starts_with_q(c, prefix) {
+        filter_clause_captures(rest)
+      } else {
+        [c, ...filter_clause_captures(rest)]
+      }
+    }
+  }
+}
+
+# R9: union the per-clause capture sets of every clause that belongs
+# to a single handle (matched by hline/hcol). The handle allocates
+# one env struct shared across all its clauses, so every clause's
+# capture has to find a slot in the same struct.
+fn handle_captures_at(cls: [ClauseInfo], hline: Int, hcol: Int) : [String] {
+  match cls {
+    [] -> []
+    [c, ...rest] -> match c {
+      CI(line, col, _, _, _, _, _, _, caps) ->
+        if line == hline and col == hcol {
+          merge_string_set(caps, handle_captures_at(rest, hline, hcol))
+        } else {
+          handle_captures_at(rest, hline, hcol)
+        }
+    }
+  }
+}
+
+# Stable-order union of two string lists. Order matters because the
+# install side (`emit_handle_env_assigns`) and the read side
+# (`emit_clause_env_prologue`) must walk the same struct fields in
+# the same sequence; we lean on the C struct's field order to align
+# both.
+fn merge_string_set(a: [String], b: [String]) : [String] {
+  match a {
+    [] -> b
+    [h, ...rest] -> {
+      if list_has(b, h) { merge_string_set(rest, b) }
+      else { [h, ...merge_string_set(rest, b)] }
+    }
+  }
+}
+
+# R9: stable C symbol for a handle's env struct. Built from the same
+# (enc_fn, line, col) triple as the clause-fn names; both ends mint
+# matching identifiers off the matching `ClauseInfo` so the cast in
+# the clause prologue resolves to the same type the install site
+# allocated. `enc_fn` is the post-monomorph fn / lambda symbol.
+fn handle_env_struct_name(enc_fn: String, line: Int, col: Int) : String =
+  concat_all([
+    "_kai_", enc_fn, "__env_",
+    int_to_string(line), "_", int_to_string(col)
+  ])
+
+# Lookup the enc_fn stamped on any clause of this handle (all clauses
+# of one handle share the same enc_fn). Returns "" when no matching
+# clause is in the table — the same defensive fallback used by
+# `lookup_clause_enc_fn`.
+fn handle_enc_fn_at(cls: [ClauseInfo], hline: Int, hcol: Int) : String {
+  match cls {
+    [] -> ""
+    [c, ...rest] -> match c {
+      CI(line, col, _, _, _, _, _, enc_fn, _) ->
+        if line == hline and col == hcol { enc_fn }
+        else { handle_enc_fn_at(rest, hline, hcol) }
     }
   }
 }
@@ -9904,7 +10003,7 @@ fn clause_fn_name(enc_fn: String, line: Int, col: Int, op: String) : String =
 
 fn emit_clause_sig(c: ClauseInfo) : String {
   match c {
-    CI(line, col, eff, op_name, params, _, _, enc_fn) -> {
+    CI(line, col, eff, op_name, params, _, _, enc_fn, _) -> {
       let op_args = op_args_only(params)
       let arg_str = match op_args {
         [] -> ""
@@ -9924,6 +10023,57 @@ fn emit_clause_forward(c: ClauseInfo) : String =
 fn emit_clause_forwards(cs: [ClauseInfo]) : String =
   concat_all(map(cs, emit_clause_forward))
 
+# R9: per-handle env typedefs. One typedef per (line, col, enc_fn)
+# triple, covering the union of every clause's captures. Emitted at
+# top level (ahead of the clause forwards) so the install-site
+# allocation in `emit_handle` and the read-side cast in
+# `emit_clause_env_prologue` both resolve to the same struct type.
+# Uses a "first occurrence wins" walk: the first ClauseInfo we meet
+# for a (line, col) pair owns the typedef, later ones for the same
+# handle skip emission. Captures are unioned across all clauses of
+# the matching handle so the struct layout covers every clause body.
+fn emit_handle_env_typedefs(cs: [ClauseInfo]) : String =
+  emit_handle_env_typedefs_loop(cs, [])
+
+fn emit_handle_env_typedefs_loop(cs: [ClauseInfo], seen: [String]) : String {
+  match cs {
+    [] -> ""
+    [c, ...rest] -> match c {
+      CI(line, col, _, _, _, _, _, enc_fn, _) -> {
+        let key = handle_env_struct_name(enc_fn, line, col)
+        if list_has(seen, key) {
+          emit_handle_env_typedefs_loop(rest, seen)
+        } else {
+          let caps = handle_captures_at(cs, line, col)
+          let decl = match caps {
+            [] -> ""
+            _ -> emit_handle_env_typedef(key, caps)
+          }
+          concat_all([decl, emit_handle_env_typedefs_loop(rest, [key, ...seen])])
+        }
+      }
+    }
+  }
+}
+
+fn emit_handle_env_typedef(env_name: String, caps: [String]) : String =
+  concat_all([
+    "typedef struct ", env_name, " ", env_name, ";\n",
+    "struct ", env_name, " {\n",
+    emit_handle_env_typedef_fields(caps),
+    "};\n\n"
+  ])
+
+fn emit_handle_env_typedef_fields(caps: [String]) : String {
+  match caps {
+    [] -> ""
+    [c, ...rest] -> concat_all([
+      "    KaiValue *kai_", c, ";\n",
+      emit_handle_env_typedef_fields(rest)
+    ])
+  }
+}
+
 # m7b #11: stateful-clause prologue. `state` and `log` are aliases of
 # `self->state`. Both names are bound (the two are aliases of the same
 # slot — the spec uses `state` for `State[T]` and `log` for `Writer[W]`,
@@ -9939,23 +10089,70 @@ fn clause_state_prologue(stateful: Bool) : String {
 fn emit_clause_body(src: String, c: ClauseInfo, lcs: [String], fns: [EFn], variants: [EVar],
                      lams: [LamInfo], cls: [ClauseInfo]) : String {
   match c {
-    CI(_, _, _, _, _, body, stateful, _) -> {
+    CI(line, col, _, _, _, body, stateful, enc_fn, caps) -> {
       # Clause body sees `self` and `k` (always), `kai_state` /
-      # `kai_log` (when stateful), and the clause's params (params
-      # come into scope through the surrounding handle's lcs).
+      # `kai_log` (when stateful), the clause's params (params
+      # come into scope through the surrounding handle's lcs),
+      # and — R9 — every capture that travels through `self->env`.
       # `state` / `log` are spelled with `kai_` prefix in the
       # generated C, but the kaikai-side names are `state` / `log`.
       let stateful_locals = if stateful { ["state", "log"] } else { [] }
-      let body_lcs = list_append(list_append(lcs, ["self", "k"]), stateful_locals)
+      let body_lcs = list_append(list_append(list_append(lcs, ["self", "k"]), stateful_locals), caps)
       let body_c = emit_expr_in_clause(src, body, body_lcs, fns, variants, lams, cls, stateful)
+      let env_prologue = emit_clause_env_prologue(cls, line, col, enc_fn, caps)
       concat_all([
         emit_clause_sig(c), " {\n",
         "    (void) self; (void) k;\n",
         clause_state_prologue(stateful),
+        env_prologue,
         "    return ", body_c, ";\n",
         "}\n\n"
       ])
     }
+  }
+}
+
+# R9: rebind each captured `kai_<name>` from the handle's env struct
+# into a clause-local C variable, so the body can reference enclosing
+# bindings the same way it would inside the surrounding fn. The cast
+# target is the per-handle env typedef minted by
+# `emit_handle_env_typedefs`; field names match exactly the surface
+# names listed in `caps`. Empty when the clause captures nothing —
+# the env slot stays NULL and is never dereferenced.
+#
+# Each read goes through `kai_internal_dup` because perceus analyses
+# every clause body in isolation and assumes its `kai_<name>` locals
+# arrive with a private reference it may consume (e.g. by passing
+# the value to `kai_prelude_string_concat`). The env struct itself
+# holds a borrow scoped to the handle stmt-expression — the caller's
+# `kai_<name>` outlives the handle's body and is dropped after the
+# stmt-expr unwinds, which is the same scope the spec assigns to
+# `EvE.env`. Without the dup, a single-use capture would be freed
+# after the first clause invocation and the second would read a
+# dangling pointer (the manifestation of "Perceus needs to incref
+# captures at install / decref at pop" — solved here at clause
+# entry, where it composes with perceus's per-clause analysis).
+fn emit_clause_env_prologue(cls: [ClauseInfo], line: Int, col: Int,
+                             enc_fn: String, caps: [String]) : String {
+  match caps {
+    [] -> ""
+    _ -> {
+      let env_name = handle_env_struct_name(enc_fn, line, col)
+      concat_all([
+        "    ", env_name, " *_env = (", env_name, " *) self->env;\n",
+        emit_clause_env_reads(caps)
+      ])
+    }
+  }
+}
+
+fn emit_clause_env_reads(caps: [String]) : String {
+  match caps {
+    [] -> ""
+    [c, ...rest] -> concat_all([
+      "    KaiValue *kai_", c, " = kai_internal_dup(_env->kai_", c, ");\n",
+      emit_clause_env_reads(rest)
+    ])
   }
 }
 
@@ -9983,7 +10180,14 @@ fn llvm_emit_clause_body(c: ClauseInfo, fns: [EFn], vs: [EVar], lams: [LamInfo],
                           oo: [OpOffset], cls: [ClauseInfo],
                           start_id: Int) : LlvmDeclOut {
   match c {
-    CI(line, col, eff, op_name, params, body, stateful, enc_fn) -> {
+    # R9: the trailing `[String]` captures field is plumbed through
+    # the C backend (`emit_clause_body`) but not yet wired into the
+    # LLVM backend. The LLVM clause body still ignores it, so a
+    # clause that names an enclosing-fn binding will fail to lower
+    # under `selfhost-llvm` the same way it failed under the C
+    # backend pre-fix. Mirror is a follow-up; see CHANGELOG entry
+    # for R9 for the C-first staging note.
+    CI(line, col, eff, op_name, params, body, stateful, enc_fn, _) -> {
       let sym = clause_fn_name(enc_fn, line, col, op_name)
       let op_args = op_args_only(params)
       let arg_sig = llvm_clause_arg_sig(op_args)
@@ -10448,6 +10652,15 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
                lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   let body_c = emit_expr(src, body, lcs, fns, variants, lams, cls)
   let assigns = emit_clause_assignments(eff_name, clauses, hline, hcol, cls)
+  # R9: gather every name any clause body of this handle captures
+  # from the surrounding scope. Filtered against `lcs` so a name that
+  # is *not* in scope at the install site (e.g. a top-level fn that
+  # `fv_expr` already excluded via `globals` — defensive) does not
+  # produce an undefined assign.
+  let env_caps = list_filter_in(handle_captures_at(cls, hline, hcol), lcs)
+  let env_enc_fn = handle_enc_fn_at(cls, hline, hcol)
+  let env_alloc = emit_handle_env_alloc(env_caps, env_enc_fn, hline, hcol)
+  let env_assign = emit_handle_env_ev_assign(env_caps)
   # m7b #15 (compiler integration): expose the handle's
   # `handler_id` as a local C variable named `kai_alias_<a>_id`
   # whenever the handle declared an `as`-bound capability. The
@@ -10497,6 +10710,8 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
     "_ev.handler_id = kai_fresh_handler_id(); ",
     assigns,
     init_c,
+    env_alloc,
+    env_assign,
     "KaiEvidence _node; ",
     "jmp_buf _jmp; ",
     "KaiValue *_discard = NULL; ",
@@ -10512,6 +10727,60 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
     ret_c,
     " })"
   ])
+}
+
+# R9: keep only the names that are actually in scope at the install
+# site. `handle_captures_at` returns the union of every clause's
+# `fv_expr` result; `lcs` is the list of locals visible to
+# `emit_handle`. The install code reads each capture as a local
+# `kai_<name>` to populate the env struct, so a name not in `lcs`
+# would expand to an undeclared identifier.
+fn list_filter_in(names: [String], lcs: [String]) : [String] {
+  match names {
+    [] -> []
+    [h, ...rest] ->
+      if list_has(lcs, h) { [h, ...list_filter_in(rest, lcs)] }
+      else { list_filter_in(rest, lcs) }
+  }
+}
+
+# R9 install side: allocate one env struct per handle (zero-init,
+# stack-allocated inside the handle's stmt-expression), populate one
+# field per capture, and stash a `void *` pointer in `_ev.env`. Empty
+# when the handle has no captures — the EvE's `env` slot stays NULL
+# and clause prologues never read it. The emitted env-struct typedef
+# is minted once per (line, col) pair by `emit_handle_env_typedefs`
+# at top level, and lives ahead of every clause forward in the
+# generated C.
+fn emit_handle_env_alloc(caps: [String], enc_fn: String,
+                          hline: Int, hcol: Int) : String {
+  match caps {
+    [] -> ""
+    _ -> {
+      let env_name = handle_env_struct_name(enc_fn, hline, hcol)
+      concat_all([
+        env_name, " _env = {0}; ",
+        emit_handle_env_field_assigns(caps)
+      ])
+    }
+  }
+}
+
+fn emit_handle_env_field_assigns(caps: [String]) : String {
+  match caps {
+    [] -> ""
+    [c, ...rest] -> concat_all([
+      "_env.kai_", c, " = kai_", c, "; ",
+      emit_handle_env_field_assigns(rest)
+    ])
+  }
+}
+
+fn emit_handle_env_ev_assign(caps: [String]) : String {
+  match caps {
+    [] -> ""
+    _  -> "_ev.env = (void *) &_env; "
+  }
 }
 
 # m4c #4: install code mints `_ev.<op> = &<clause_sym>;` where
@@ -10548,7 +10817,7 @@ fn lookup_clause_enc_fn(cs: [ClauseInfo], hline: Int, hcol: Int, op_name: String
   match cs {
     [] -> ""
     [c, ...rest] -> match c {
-      CI(line, col, _, op, _, _, _, enc_fn) ->
+      CI(line, col, _, op, _, _, _, enc_fn, _) ->
         if line == hline and col == hcol and op == op_name { enc_fn }
         else { lookup_clause_enc_fn(rest, hline, hcol, op_name) }
     }
@@ -14315,6 +14584,12 @@ fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, b
   let clauses_info = st.clauses
   let header = "/* generated by kaikai stage 2 */\n#include \"runtime.h\"\n\n"
   let eff_structs = effect_struct_decls(decls)
+  # R9: env typedefs come after the EvE structs (no dependency between
+  # them — env structs are pure plain-old-data, EvE has the void *env)
+  # but before the clause forwards (whose bodies cast `self->env` to
+  # the env type) and before the install-site stmt-expressions emitted
+  # inside fn bodies.
+  let env_structs = emit_handle_env_typedefs(clauses_info)
   let clause_fwd = emit_clause_forwards(clauses_info)
   let fwd = fn_forward_decls(decls)
   let thunk_fwd = thunk_forward_decls(decls)
@@ -14334,7 +14609,7 @@ fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, b
   let benches = emit_all_benches(src, decls, [], fns, variants, lams, cls)
   let checks = emit_all_checks(src, decls, [], fns, variants, lams, cls)
   let main_wr = emit_main_wrapper(decls, test_mode, bench_mode, check_mode)
-  concat_all([header, eff_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
+  concat_all([header, eff_structs, env_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
 }
 
 # ====================================================================

@@ -426,9 +426,15 @@ test-writer: $(TARGET) build
 # (`with_trace_default`); `trace_prefix` covers handler composition
 # (`with_log_prefix` delegating to the outer default). Compiled with
 # `--path ../stdlib` so the resolver finds the module.
+# `r9_clause_capture` covers issue #60 / R9 — clause bodies capturing
+# parameters from the enclosing fn through the EvE.env channel.
+# Pre-fix, kaic2 produced an undeclared-identifier C error; the test
+# both compiles cleanly and produces a known-correct golden so a
+# capture-RC regression (the same UAF that fooled the early draft of
+# the fix) shows up as a stdout diff.
 test-trace: $(TARGET) build
 	@set -e; \
-	for name in trace_basic trace_prefix; do \
+	for name in trace_basic trace_prefix r9_clause_capture; do \
 	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage0 build/$$name.c -o build/$$name-c; \
 	  ./build/$$name-c > build/$$name.out; \
