@@ -2017,8 +2017,8 @@ test-tco: $(TARGET) build
 # `main` today, the function compiles and runs end-to-end with the
 # expected output; the cons-cell leak the rule would close lives
 # in the goto-block emit and is not visible to a stdout-only
-# golden. See `docs/known-regressions.md` § R6 for the full
-# diagnosis and the failed re-land history. This target stays
+# golden. See issue #92 (R6) for the full diagnosis and the
+# failed re-land history. This target stays
 # under `test` so any future re-land attempt has a fixed shape
 # to validate against — but it does NOT enforce rule 3 today.
 test-tco-regression: $(TARGET) build

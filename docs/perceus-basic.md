@@ -394,7 +394,7 @@ that the dup/drop discipline is finally consuming. The
 the trace counters). Wall time grew from 2.15 s to 5.74 s
 (2.7×) due to per-allocation RC bookkeeping; Full Perceus
 (drop specialisation + unboxed primitives) is the path to
-shrink that. Detail: `docs/m5x-followup.md` §1 step 2c.
+shrink that. Remaining leak inventory: issue #82.
 
 ### What unblocks step 3+
 

@@ -49,7 +49,7 @@ The cause: `let value = 42` is unboxed by phase 2 (emit:
 `#{int_to_string(value)}` desugar still spells the boxed name
 `kai_value`. Reduced minimally to a 4-line repro outside the
 Trace effect, confirmed it is independent of effects, documented
-as **R8** in `docs/known-regressions.md`, and worked around in
+as **R8** (issue #94), and worked around in
 the fixture by replacing the one offending `#{...}` segment with
 explicit `++` concatenation. Per CLAUDE.md lane discipline, the
 fix is left for a future emit-pass lane.
@@ -71,7 +71,7 @@ fix is left for a future emit-pass lane.
   `let _ = handle { ... }` of String type (works) — happen to
   not exercise the broken case, so the codebase did not have
   prior art pointing at the workaround. Logged with full repro
-  + workaround list in known-regressions.md so the next agent
+  + workaround list in issue #94 so the next agent
   who hits it does not re-derive the diagnosis.
 
 ## Spec ambiguities or interpretive choices

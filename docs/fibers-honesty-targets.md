@@ -32,8 +32,9 @@ What does **not** work today:
   awaiting) deadlocks~~. **FIXED 2026-04-29** (Fibers Tier 1 lane).
   Scheduler-side fiber RC discipline: the wrapper now carries one
   ref for the caller and one for the scheduler; the trampoline's
-  DONE/CANCELLED tail drops the scheduler's ref. See R4 in
-  `docs/known-regressions.md`.
+  DONE/CANCELLED tail drops the scheduler's ref (was R4 in the
+  retired `docs/known-regressions.md`; closure recoverable from
+  `git log` if needed).
 - ~~Stack overflow in a fiber body lands in unmapped memory with
   no diagnostic.~~ **FIXED 2026-04-29** (Fibers Tier 1 lane).
   Each spawned fiber's private stack is now `mmap`ed with a

@@ -13,8 +13,8 @@ the gap left by 17 non-instrumented PRs since 2026-04-28.
 **Outcome: option B.** Three structurally different attempts at
 re-landing rule 3 of the precise per-call-site dropmask all tripped
 the same glibc abort during the kaic2 self-compile on Linux
-ubuntu-clang. Lane closes with a documentation fixture +
-`docs/known-regressions.md` § R6, no compiler change.
+ubuntu-clang. Lane closes with a documentation fixture + the
+R6 follow-up (issue #92), no compiler change.
 
 ## Objective metrics (reconstructed)
 

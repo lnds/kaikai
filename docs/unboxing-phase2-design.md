@@ -282,8 +282,8 @@ Estimate envelope: **5.5–7 days**, matching the Tier 2.5 pin.
 - **Refinement types on `Int`** — `Int{x : x > 0}` in
   m12.6 lands as a `TyRefineT`; the unbox analysis must
   strip the refinement to find the underlying `TyInt`.
-  Confirmed mechanical (`docs/m12-6x-followup.md` already
-  treats refinement as a wrapper).
+  Confirmed mechanical (m12.6.x refinements treat refinement
+  as a wrapper; remaining items in issues #83–#86).
 - **Effect ops** — every effect op currently takes `KaiValue *`
   args. Boxing at the op call site is correct and stays. The
   question is whether the op's *result* propagates as

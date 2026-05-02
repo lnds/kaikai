@@ -99,7 +99,7 @@ function name for the failing call site.
 ## Spec ambiguities or interpretive choices
 
 **"perceus_pass active in both stages"** — the lane spec and the
-m5x-followup doc say "both stages tienen perceus_pass activo" /
+(now-retired) m5x-followup doc said "both stages tienen perceus_pass activo" /
 "Both kaic1 and kaic2 must agree". I interpreted this as "the
 kaikai-source-level pass must run in both kaic1 and kaic2, and emit
 correct C". That is true but does not address that the kaic1
