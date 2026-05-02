@@ -125,7 +125,7 @@ Two `state` references pushes the use count past the `≥ 2 non-lam
 uses` threshold, so both reads emit `kai_internal_dup(kai_state)`
 and the EvE storage stays live across op calls. Full hypothesis,
 ASAN repro, and a structural fix path for the compiler are
-documented in `docs/known-regressions.md` as **R9**.
+were documented as **R9** (since closed by issue #60, 2026-05-02).
 
 The structural fix (treat `state`/`log` as unconditionally
 non-last in `pcs_is_non_last`) is small but touches the emit
@@ -174,8 +174,8 @@ What I did *not* anticipate before opening
    transfers.** Single-read `state` references emit a raw
    pointer copy. Any consumer that decrefs (concat, length,
    join — all the string prelude) frees the EvE storage out
-   from under the next op call. This is **R9** in
-   `known-regressions.md`. Existing repo fixtures
+   from under the next op call. This was **R9** (now closed
+   by issue #60). Existing repo fixtures
    (`examples/effects/m7b_11_followup_distinct_types.kai`,
    `examples/effects/m7b_14_reader_helper.kai`,
    `examples/sugars/m7b_4_*`) all read state once into an Int
@@ -323,7 +323,8 @@ invariants the source language does not expose.
 ## Subjective summary
 
 `with_log_prefix` shipped with the spec output, three rounds
-to green, and one new entry in `known-regressions.md` (R9).
+to green, and one new regression entry (R9, since closed by
+issue #60).
 The handler composition pattern itself is sound and the result
 (`Trace + e`) types cleanly; the friction was entirely in the
 emit/runtime layer that the source language abstracts away.
@@ -338,9 +339,9 @@ correct without modifying compiler internals.
 ## Limitations / things I am not claiming
 
 - **R9's structural fix is not in this PR.** The proposed
-  `pcs_is_non_last` change in `known-regressions.md` is a
-  hypothesis that needs the test surface a future Perceus / RC
-  lane will own; this PR ships only the source-level workaround.
+  `pcs_is_non_last` change (since landed via issue #60) was a
+  hypothesis that needed the test surface a future Perceus / RC
+  lane would own; this PR ships only the source-level workaround.
 - **The two-bindings workaround leaks one ref per `read` call**
   if `pcs_rewrite`'s exit-drop pass does not reclaim
   `_keep_alive`. The emitted C *does* show an explicit

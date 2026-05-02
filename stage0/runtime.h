@@ -1807,8 +1807,8 @@ static KaiValue *kai_boolnot(KaiValue *a) {
  * returns `lhs` itself in the early-exit branch, so consuming `lhs`
  * inside the truthiness probe would alias-free a value still
  * referenced downstream. The emitted-C path leaks the temporary
- * argument; pinned in `docs/m5x-followup.md` as future cleanup
- * (predicate consumes + emit-side incref before short-circuit). */
+ * argument; tracked in issue #82 as future cleanup (predicate
+ * consumes + emit-side incref before short-circuit). */
 static int kai_truthy(KaiValue *v) {
     return v && v->tag == KAI_BOOL && v->as.b;
 }
