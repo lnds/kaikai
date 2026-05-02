@@ -11620,10 +11620,20 @@ fn emit_main_wrapper(decls: [Decl], test_mode: Bool, bench_mode: Bool, check_mod
     # pair is syntactically balanced (Doc C §*Per-fiber isolation*);
     # pop runs even if `kai_main` returns. Pops are emitted in
     # reverse-push order so the evidence stack stays LIFO-balanced.
+    #
+    # Issue #115: the shim block below is emitted at file scope,
+    # before `int main()`. Each shim has the typed signature
+    # matching the EvX struct field and forwards to the runtime
+    # void-self function. Setup assigns shim addresses without a
+    # cast, so UBSan's `-fsanitize=function` (Linux clang's
+    # `-fsanitize=undefined`, absent from Apple clang's default)
+    # sees matching types at every dispatch through `_ev_op->op`.
     let main_row = main_row_labels(decls)
+    let shims    = default_shims_for(main_row)
     let setup    = default_setups_for(main_row)
     let teardown = default_pops_for(main_row)
     concat_all([
+      shims,
       "int main(int argc, char **argv) {\n",
       "    kai_set_args(argc, argv);\n",
       setup,
@@ -11831,13 +11841,48 @@ fn main_row_labels(decls: [Decl]) : [String] {
 # so a `main` declaring `/ Console` installs BOTH the Stdout and
 # Stderr default handlers via the alias-expansion path in
 # `default_setups_for`.
+#
+# Issue #115: the runtime `kai_default_*` handlers in stage0/runtime.h
+# take `void *self` because the runtime header cannot know the
+# emitted `EvStdout` / `EvStderr` / ... types. Casting their
+# addresses to typed function pointers (`(KaiValue *(*)(EvStdout *,
+# ...))`) is a representation-equivalent cast in C, but UBSan's
+# `-fsanitize=function` (active in clang's `-fsanitize=undefined`
+# on Linux; absent from Apple clang's default `undefined` set)
+# checks at every indirect call that the *function definition's*
+# type tag equals the function pointer's static type. The cast
+# does not change the function definition's type tag, so every
+# dispatch through `_ev_op->print(...)` etc. trips the check on
+# Linux while passing on macOS.
+#
+# Fix: emit a thin typed shim per default-op at file scope
+# (`_kai_default_<eff>_<op>_shim`). The shim has the typed
+# signature matching the struct field, forwards to the runtime
+# void-self function via a regular call (not subject to
+# `-fsanitize=function`). Setup assigns the shim's address; no
+# cast required at the assignment, no UBSan diagnostic at the
+# dispatch site.
+fn default_stdout_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_stdout_print_shim(EvStdout *self, KaiValue *kai_s, KaiCont *k) {\n",
+    "    return kai_default_stdout_print(self, kai_s, k);\n",
+    "}\n"
+  ])
+
 fn default_stdout_setup() : String =
   concat_all([
     "    static EvStdout _kai_default_ev_stdout;\n",
     "    static KaiEvidence _kai_default_node_stdout;\n",
     "    _kai_default_ev_stdout.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_stdout.print = (KaiValue *(*)(EvStdout *, KaiValue *, KaiCont *)) &kai_default_stdout_print;\n",
+    "    _kai_default_ev_stdout.print = &_kai_default_stdout_print_shim;\n",
     "    kai_evidence_push(&_kai_default_node_stdout, \"Stdout\", &_kai_default_ev_stdout);\n"
+  ])
+
+fn default_stderr_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_stderr_eprint_shim(EvStderr *self, KaiValue *kai_s, KaiCont *k) {\n",
+    "    return kai_default_stderr_eprint(self, kai_s, k);\n",
+    "}\n"
   ])
 
 fn default_stderr_setup() : String =
@@ -11845,8 +11890,15 @@ fn default_stderr_setup() : String =
     "    static EvStderr _kai_default_ev_stderr;\n",
     "    static KaiEvidence _kai_default_node_stderr;\n",
     "    _kai_default_ev_stderr.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_stderr.eprint = (KaiValue *(*)(EvStderr *, KaiValue *, KaiCont *)) &kai_default_stderr_eprint;\n",
+    "    _kai_default_ev_stderr.eprint = &_kai_default_stderr_eprint_shim;\n",
     "    kai_evidence_push(&_kai_default_node_stderr, \"Stderr\", &_kai_default_ev_stderr);\n"
+  ])
+
+fn default_fail_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_fail_fail_shim(EvFail *self, KaiValue *kai_msg, KaiCont *k) {\n",
+    "    return kai_default_fail_fail(self, kai_msg, k);\n",
+    "}\n"
   ])
 
 fn default_fail_setup() : String =
@@ -11854,8 +11906,15 @@ fn default_fail_setup() : String =
     "    static EvFail _kai_default_ev_fail;\n",
     "    static KaiEvidence _kai_default_node_fail;\n",
     "    _kai_default_ev_fail.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_fail.fail = (KaiValue *(*)(EvFail *, KaiValue *, KaiCont *)) &kai_default_fail_fail;\n",
+    "    _kai_default_ev_fail.fail = &_kai_default_fail_fail_shim;\n",
     "    kai_evidence_push(&_kai_default_node_fail, \"Fail\", &_kai_default_ev_fail);\n"
+  ])
+
+fn default_stdin_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_stdin_read_line_shim(EvStdin *self, KaiCont *k) {\n",
+    "    return kai_default_stdin_read_line(self, k);\n",
+    "}\n"
   ])
 
 fn default_stdin_setup() : String =
@@ -11863,8 +11922,18 @@ fn default_stdin_setup() : String =
     "    static EvStdin _kai_default_ev_stdin;\n",
     "    static KaiEvidence _kai_default_node_stdin;\n",
     "    _kai_default_ev_stdin.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_stdin.read_line = (KaiValue *(*)(EvStdin *, KaiCont *)) &kai_default_stdin_read_line;\n",
+    "    _kai_default_ev_stdin.read_line = &_kai_default_stdin_read_line_shim;\n",
     "    kai_evidence_push(&_kai_default_node_stdin, \"Stdin\", &_kai_default_ev_stdin);\n"
+  ])
+
+fn default_env_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_env_args_shim(EvEnv *self, KaiCont *k) {\n",
+    "    return kai_default_env_args(self, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_env_var_shim(EvEnv *self, KaiValue *kai_name, KaiCont *k) {\n",
+    "    return kai_default_env_var(self, kai_name, k);\n",
+    "}\n"
   ])
 
 fn default_env_setup() : String =
@@ -11872,9 +11941,19 @@ fn default_env_setup() : String =
     "    static EvEnv _kai_default_ev_env;\n",
     "    static KaiEvidence _kai_default_node_env;\n",
     "    _kai_default_ev_env.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_env.args = (KaiValue *(*)(EvEnv *, KaiCont *)) &kai_default_env_args;\n",
-    "    _kai_default_ev_env.var  = (KaiValue *(*)(EvEnv *, KaiValue *, KaiCont *)) &kai_default_env_var;\n",
+    "    _kai_default_ev_env.args = &_kai_default_env_args_shim;\n",
+    "    _kai_default_ev_env.var  = &_kai_default_env_var_shim;\n",
     "    kai_evidence_push(&_kai_default_node_env, \"Env\", &_kai_default_ev_env);\n"
+  ])
+
+fn default_file_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_file_read_file_shim(EvFile *self, KaiValue *kai_path, KaiCont *k) {\n",
+    "    return kai_default_file_read_file(self, kai_path, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_file_write_file_shim(EvFile *self, KaiValue *kai_path, KaiValue *kai_contents, KaiCont *k) {\n",
+    "    return kai_default_file_write_file(self, kai_path, kai_contents, k);\n",
+    "}\n"
   ])
 
 fn default_file_setup() : String =
@@ -11882,20 +11961,27 @@ fn default_file_setup() : String =
     "    static EvFile _kai_default_ev_file;\n",
     "    static KaiEvidence _kai_default_node_file;\n",
     "    _kai_default_ev_file.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_file.read_file  = (KaiValue *(*)(EvFile *, KaiValue *, KaiCont *)) &kai_default_file_read_file;\n",
-    "    _kai_default_ev_file.write_file = (KaiValue *(*)(EvFile *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_file_write_file;\n",
+    "    _kai_default_ev_file.read_file  = &_kai_default_file_read_file_shim;\n",
+    "    _kai_default_ev_file.write_file = &_kai_default_file_write_file_shim;\n",
     "    kai_evidence_push(&_kai_default_node_file, \"File\", &_kai_default_ev_file);\n"
   ])
 
 # Default Random handler — non-deterministic per-process PCG64
 # seeded from time(NULL) ^ getpid() at first use. See
 # `kai_default_random_int_range` in stage0/runtime.h.
+fn default_random_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_random_int_range_shim(EvRandom *self, KaiValue *kai_lo, KaiValue *kai_hi, KaiCont *k) {\n",
+    "    return kai_default_random_int_range(self, kai_lo, kai_hi, k);\n",
+    "}\n"
+  ])
+
 fn default_random_setup() : String =
   concat_all([
     "    static EvRandom _kai_default_ev_random;\n",
     "    static KaiEvidence _kai_default_node_random;\n",
     "    _kai_default_ev_random.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_random.int_range = (KaiValue *(*)(EvRandom *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_random_int_range;\n",
+    "    _kai_default_ev_random.int_range = &_kai_default_random_int_range_shim;\n",
     "    kai_evidence_push(&_kai_default_node_random, \"Random\", &_kai_default_ev_random);\n"
   ])
 
@@ -11904,17 +11990,39 @@ fn default_random_setup() : String =
 # whenever `main`'s row mentions `NetTcp` (or expands an alias that
 # resolves to it). v1 limitations (IPv4-only, blocking, no listener
 # close) live with the spec memo in stdlib/effects.kai.
+fn default_nettcp_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_nettcp_connect_shim(EvNetTcp *self, KaiValue *kai_host, KaiValue *kai_port, KaiCont *k) {\n",
+    "    return kai_default_nettcp_connect(self, kai_host, kai_port, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_nettcp_listen_shim(EvNetTcp *self, KaiValue *kai_host, KaiValue *kai_port, KaiCont *k) {\n",
+    "    return kai_default_nettcp_listen(self, kai_host, kai_port, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_nettcp_accept_shim(EvNetTcp *self, KaiValue *kai_listener, KaiCont *k) {\n",
+    "    return kai_default_nettcp_accept(self, kai_listener, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_nettcp_send_shim(EvNetTcp *self, KaiValue *kai_conn, KaiValue *kai_bytes, KaiCont *k) {\n",
+    "    return kai_default_nettcp_send(self, kai_conn, kai_bytes, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_nettcp_recv_shim(EvNetTcp *self, KaiValue *kai_conn, KaiValue *kai_max, KaiCont *k) {\n",
+    "    return kai_default_nettcp_recv(self, kai_conn, kai_max, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_nettcp_close_shim(EvNetTcp *self, KaiValue *kai_conn, KaiCont *k) {\n",
+    "    return kai_default_nettcp_close(self, kai_conn, k);\n",
+    "}\n"
+  ])
+
 fn default_nettcp_setup() : String =
   concat_all([
     "    static EvNetTcp _kai_default_ev_nettcp;\n",
     "    static KaiEvidence _kai_default_node_nettcp;\n",
     "    _kai_default_ev_nettcp.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_nettcp.connect = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_nettcp_connect;\n",
-    "    _kai_default_ev_nettcp.listen  = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_nettcp_listen;\n",
-    "    _kai_default_ev_nettcp.accept  = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiCont *)) &kai_default_nettcp_accept;\n",
-    "    _kai_default_ev_nettcp.send    = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_nettcp_send;\n",
-    "    _kai_default_ev_nettcp.recv    = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_nettcp_recv;\n",
-    "    _kai_default_ev_nettcp.close   = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiCont *)) &kai_default_nettcp_close;\n",
+    "    _kai_default_ev_nettcp.connect = &_kai_default_nettcp_connect_shim;\n",
+    "    _kai_default_ev_nettcp.listen  = &_kai_default_nettcp_listen_shim;\n",
+    "    _kai_default_ev_nettcp.accept  = &_kai_default_nettcp_accept_shim;\n",
+    "    _kai_default_ev_nettcp.send    = &_kai_default_nettcp_send_shim;\n",
+    "    _kai_default_ev_nettcp.recv    = &_kai_default_nettcp_recv_shim;\n",
+    "    _kai_default_ev_nettcp.close   = &_kai_default_nettcp_close_shim;\n",
     "    kai_evidence_push(&_kai_default_node_nettcp, \"NetTcp\", &_kai_default_ev_nettcp);\n"
   ])
 
@@ -11922,14 +12030,27 @@ fn default_nettcp_setup() : String =
 # `kai_default_signal_*` in stage0/runtime.h. Subscribed signals are
 # blocked at the process level via sigprocmask; `await()` synchronously
 # dequeues via sigwait. Installed when `main`'s row mentions `Signal`.
+fn default_signal_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_signal_on_shim(EvSignal *self, KaiValue *kai_sig, KaiCont *k) {\n",
+    "    return kai_default_signal_on(self, kai_sig, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_signal_off_shim(EvSignal *self, KaiValue *kai_sig, KaiCont *k) {\n",
+    "    return kai_default_signal_off(self, kai_sig, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_signal_await_shim(EvSignal *self, KaiCont *k) {\n",
+    "    return kai_default_signal_await(self, k);\n",
+    "}\n"
+  ])
+
 fn default_signal_setup() : String =
   concat_all([
     "    static EvSignal _kai_default_ev_signal;\n",
     "    static KaiEvidence _kai_default_node_signal;\n",
     "    _kai_default_ev_signal.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_signal.on    = (KaiValue *(*)(EvSignal *, KaiValue *, KaiCont *)) &kai_default_signal_on;\n",
-    "    _kai_default_ev_signal.off   = (KaiValue *(*)(EvSignal *, KaiValue *, KaiCont *)) &kai_default_signal_off;\n",
-    "    _kai_default_ev_signal.await = (KaiValue *(*)(EvSignal *, KaiCont *)) &kai_default_signal_await;\n",
+    "    _kai_default_ev_signal.on    = &_kai_default_signal_on_shim;\n",
+    "    _kai_default_ev_signal.off   = &_kai_default_signal_off_shim;\n",
+    "    _kai_default_ev_signal.await = &_kai_default_signal_await_shim;\n",
     "    kai_evidence_push(&_kai_default_node_signal, \"Signal\", &_kai_default_ev_signal);\n"
   ])
 
@@ -11937,16 +12058,35 @@ fn default_signal_setup() : String =
 # runtime functions with clauses that resume with the result. Each
 # slot is initialised to the matching `kai_default_mutable_*`
 # trampoline (defined in stage0/runtime.h).
+fn default_mutable_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_mutable_array_make_shim(EvMutable *self, KaiValue *kai_n, KaiValue *kai_init, KaiCont *k) {\n",
+    "    return kai_default_mutable_array_make(self, kai_n, kai_init, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_mutable_array_length_shim(EvMutable *self, KaiValue *kai_arr, KaiCont *k) {\n",
+    "    return kai_default_mutable_array_length(self, kai_arr, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_mutable_array_get_shim(EvMutable *self, KaiValue *kai_arr, KaiValue *kai_i, KaiCont *k) {\n",
+    "    return kai_default_mutable_array_get(self, kai_arr, kai_i, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_mutable_array_set_shim(EvMutable *self, KaiValue *kai_arr, KaiValue *kai_i, KaiValue *kai_v, KaiCont *k) {\n",
+    "    return kai_default_mutable_array_set(self, kai_arr, kai_i, kai_v, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_mutable_array_grow_shim(EvMutable *self, KaiValue *kai_arr, KaiValue *kai_n, KaiValue *kai_init, KaiCont *k) {\n",
+    "    return kai_default_mutable_array_grow(self, kai_arr, kai_n, kai_init, k);\n",
+    "}\n"
+  ])
+
 fn default_mutable_setup() : String =
   concat_all([
     "    static EvMutable _kai_default_ev_mutable;\n",
     "    static KaiEvidence _kai_default_node_mutable;\n",
     "    _kai_default_ev_mutable.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_mutable.array_make   = (KaiValue *(*)(EvMutable *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_mutable_array_make;\n",
-    "    _kai_default_ev_mutable.array_length = (KaiValue *(*)(EvMutable *, KaiValue *, KaiCont *)) &kai_default_mutable_array_length;\n",
-    "    _kai_default_ev_mutable.array_get    = (KaiValue *(*)(EvMutable *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_mutable_array_get;\n",
-    "    _kai_default_ev_mutable.array_set    = (KaiValue *(*)(EvMutable *, KaiValue *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_mutable_array_set;\n",
-    "    _kai_default_ev_mutable.array_grow   = (KaiValue *(*)(EvMutable *, KaiValue *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_mutable_array_grow;\n",
+    "    _kai_default_ev_mutable.array_make   = &_kai_default_mutable_array_make_shim;\n",
+    "    _kai_default_ev_mutable.array_length = &_kai_default_mutable_array_length_shim;\n",
+    "    _kai_default_ev_mutable.array_get    = &_kai_default_mutable_array_get_shim;\n",
+    "    _kai_default_ev_mutable.array_set    = &_kai_default_mutable_array_set_shim;\n",
+    "    _kai_default_ev_mutable.array_grow   = &_kai_default_mutable_array_grow_shim;\n",
     "    kai_evidence_push(&_kai_default_node_mutable, \"Mutable\", &_kai_default_ev_mutable);\n"
   ])
 
@@ -11955,12 +12095,19 @@ fn default_mutable_setup() : String =
 # resumes by exiting the program; user-installed Cancel handlers
 # can wrap a region to run cleanup before the unwind escapes the
 # wrapping `handle` block.
+fn default_cancel_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_cancel_raise_shim(EvCancel *self, KaiCont *k) {\n",
+    "    return kai_default_cancel_raise(self, k);\n",
+    "}\n"
+  ])
+
 fn default_cancel_setup() : String =
   concat_all([
     "    static EvCancel _kai_default_ev_cancel;\n",
     "    static KaiEvidence _kai_default_node_cancel;\n",
     "    _kai_default_ev_cancel.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_cancel.raise = (KaiValue *(*)(EvCancel *, KaiCont *)) &kai_default_cancel_raise;\n",
+    "    _kai_default_ev_cancel.raise = &_kai_default_cancel_raise_shim;\n",
     "    kai_evidence_push(&_kai_default_node_cancel, \"Cancel\", &_kai_default_ev_cancel);\n"
   ])
 
@@ -11970,12 +12117,19 @@ fn default_cancel_setup() : String =
 # walks each chain and sets cancel_requested on every peer. v1's
 # Pid[Nothing]-erased peer parameter is resolved at runtime via
 # peer->as.mb->owner_fiber.
+fn default_link_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_link_link_shim(EvLink *self, KaiValue *kai_peer, KaiCont *k) {\n",
+    "    return kai_default_link_link(self, kai_peer, k);\n",
+    "}\n"
+  ])
+
 fn default_link_setup() : String =
   concat_all([
     "    static EvLink _kai_default_ev_link;\n",
     "    static KaiEvidence _kai_default_node_link;\n",
     "    _kai_default_ev_link.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_link.link = (KaiValue *(*)(EvLink *, KaiValue *, KaiCont *)) &kai_default_link_link;\n",
+    "    _kai_default_ev_link.link = &_kai_default_link_link_shim;\n",
     "    kai_evidence_push(&_kai_default_node_link, \"Link\", &_kai_default_ev_link);\n"
   ])
 
@@ -11989,13 +12143,23 @@ fn default_link_setup() : String =
 # the entry. v1 simplification: the MonitorRef returned by `monitor`
 # is the same Pid value the user passed in, so demonitor takes
 # the same Pid.
+fn default_monitor_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_monitor_monitor_shim(EvMonitor *self, KaiValue *kai_target, KaiCont *k) {\n",
+    "    return kai_default_monitor_monitor(self, kai_target, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_monitor_demonitor_shim(EvMonitor *self, KaiValue *kai_ref, KaiCont *k) {\n",
+    "    return kai_default_monitor_demonitor(self, kai_ref, k);\n",
+    "}\n"
+  ])
+
 fn default_monitor_setup() : String =
   concat_all([
     "    static EvMonitor _kai_default_ev_monitor;\n",
     "    static KaiEvidence _kai_default_node_monitor;\n",
     "    _kai_default_ev_monitor.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_monitor.monitor   = (KaiValue *(*)(EvMonitor *, KaiValue *, KaiCont *)) &kai_default_monitor_monitor;\n",
-    "    _kai_default_ev_monitor.demonitor = (KaiValue *(*)(EvMonitor *, KaiValue *, KaiCont *)) &kai_default_monitor_demonitor;\n",
+    "    _kai_default_ev_monitor.monitor   = &_kai_default_monitor_monitor_shim;\n",
+    "    _kai_default_ev_monitor.demonitor = &_kai_default_monitor_demonitor_shim;\n",
     "    kai_evidence_push(&_kai_default_node_monitor, \"Monitor\", &_kai_default_ev_monitor);\n"
   ])
 
@@ -12004,17 +12168,39 @@ fn default_monitor_setup() : String =
 # Cancel the layer below it, the I/O group below that). Wires all
 # five ops to the inline-eager v1 defaults — see stage0/runtime.h
 # for what each one does at runtime.
+fn default_spawn_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_spawn_yield_shim(EvSpawn *self, KaiCont *k) {\n",
+    "    return kai_default_spawn_yield(self, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_spawn_spawn_shim(EvSpawn *self, KaiValue *kai_thunk, KaiCont *k) {\n",
+    "    return kai_default_spawn_spawn(self, kai_thunk, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_spawn_await_shim(EvSpawn *self, KaiValue *kai_fiber, KaiCont *k) {\n",
+    "    return kai_default_spawn_await(self, kai_fiber, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_spawn_select_shim(EvSpawn *self, KaiValue *kai_fibers, KaiCont *k) {\n",
+    "    return kai_default_spawn_select(self, kai_fibers, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_spawn_cancel_shim(EvSpawn *self, KaiValue *kai_fiber, KaiCont *k) {\n",
+    "    return kai_default_spawn_cancel(self, kai_fiber, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_spawn_set_trap_exit_shim(EvSpawn *self, KaiValue *kai_on, KaiCont *k) {\n",
+    "    return kai_default_spawn_set_trap_exit(self, kai_on, k);\n",
+    "}\n"
+  ])
+
 fn default_spawn_setup() : String =
   concat_all([
     "    static EvSpawn _kai_default_ev_spawn;\n",
     "    static KaiEvidence _kai_default_node_spawn;\n",
     "    _kai_default_ev_spawn.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_spawn.yield  = (KaiValue *(*)(EvSpawn *, KaiCont *)) &kai_default_spawn_yield;\n",
-    "    _kai_default_ev_spawn.spawn  = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_spawn;\n",
-    "    _kai_default_ev_spawn.await  = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_await;\n",
-    "    _kai_default_ev_spawn.select = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_select;\n",
-    "    _kai_default_ev_spawn.cancel = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_cancel;\n",
-    "    _kai_default_ev_spawn.set_trap_exit = (KaiValue *(*)(EvSpawn *, KaiValue *, KaiCont *)) &kai_default_spawn_set_trap_exit;\n",
+    "    _kai_default_ev_spawn.yield  = &_kai_default_spawn_yield_shim;\n",
+    "    _kai_default_ev_spawn.spawn  = &_kai_default_spawn_spawn_shim;\n",
+    "    _kai_default_ev_spawn.await  = &_kai_default_spawn_await_shim;\n",
+    "    _kai_default_ev_spawn.select = &_kai_default_spawn_select_shim;\n",
+    "    _kai_default_ev_spawn.cancel = &_kai_default_spawn_cancel_shim;\n",
+    "    _kai_default_ev_spawn.set_trap_exit = &_kai_default_spawn_set_trap_exit_shim;\n",
     "    kai_evidence_push(&_kai_default_node_spawn, \"Spawn\", &_kai_default_ev_spawn);\n"
   ])
 
@@ -12047,6 +12233,34 @@ fn default_setups_for(main_row: [String]) : String = {
     if list_has(main_row, "Link")    { default_link_setup() }    else { "" },
     if list_has(main_row, "Monitor") { default_monitor_setup() } else { "" },
     if list_has(main_row, "Spawn")   { default_spawn_setup() }   else { "" }
+  ])
+}
+
+# Issue #115: aggregate the typed shim definitions for every
+# default handler that `default_setups_for` will install. Emitted
+# at file scope before `int main()` so the shim addresses are in
+# scope when the setup block assigns them. The pair-wise
+# correspondence with `default_setups_for` is load-bearing — the
+# setup expects `_kai_default_<eff>_<op>_shim` to be defined for
+# every effect in `main_row`, and a missing shim shows up as a
+# C compile error before the binary is produced (and well before
+# UBSan would otherwise catch the type mismatch at runtime).
+fn default_shims_for(main_row: [String]) : String = {
+  concat_all([
+    if list_has(main_row, "Stdout")  { default_stdout_shims() } else { "" },
+    if list_has(main_row, "Stderr")  { default_stderr_shims() } else { "" },
+    if list_has(main_row, "Fail")    { default_fail_shims() }    else { "" },
+    if list_has(main_row, "Stdin")   { default_stdin_shims() }   else { "" },
+    if list_has(main_row, "Env")     { default_env_shims() }     else { "" },
+    if list_has(main_row, "File")    { default_file_shims() }    else { "" },
+    if list_has(main_row, "Random")  { default_random_shims() }  else { "" },
+    if list_has(main_row, "NetTcp")  { default_nettcp_shims() }  else { "" },
+    if list_has(main_row, "Signal")  { default_signal_shims() }  else { "" },
+    if list_has(main_row, "Mutable") { default_mutable_shims() } else { "" },
+    if list_has(main_row, "Cancel")  { default_cancel_shims() }  else { "" },
+    if list_has(main_row, "Link")    { default_link_shims() }    else { "" },
+    if list_has(main_row, "Monitor") { default_monitor_shims() } else { "" },
+    if list_has(main_row, "Spawn")   { default_spawn_shims() }   else { "" }
   ])
 }
 

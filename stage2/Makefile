@@ -457,7 +457,8 @@ test-foreign-prelude: $(TARGET) build
 # fixtures are listed so a regression caught only via one effect-name
 # arm still fails this gate. See `docs/lane-diagnostic-r10-r11.md`.
 TRACE_FIXTURES := trace_basic trace_prefix r9_clause_capture r10_repro r11_repro \
-                  m8x_9_nested_mailbox_under_trap_exit
+                  m8x_9_nested_mailbox_under_trap_exit \
+                  issue_115_default_handler_typed_dispatch
 
 test-trace: $(TARGET) build
 	@set -e; \
