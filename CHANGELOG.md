@@ -9,6 +9,45 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **Region-brand walker descends into sum-type constructor payloads
+  (issue #71, option (a)).** Closes the sum-type-wrapped escape
+  gap: `type Boxed = Wrap(Fiber[Int])` returned from a non-stdlib
+  helper used to slip past the shallow walker because the surface
+  TypeExpr is `TyName("Boxed", [])` and the Fiber lived in the
+  variant payload, not in the TypeExpr the walker traversed.
+  `infer_program` now collects a `[SumInfo]` registry alongside
+  `[RecInfo]`, threaded through `infer_all_loop` →
+  `infer_decl` → `check_no_fiber_escape`. The new
+  `ty_expr_find_handle` walker substitutes the type's tparams into
+  each variant's payload TypeExpr and recurses, with a `visited`
+  set guarding recursive sums (`type Tree[T] = Leaf(T) |
+  Node(Tree[T], Tree[T])`). When the breach goes through a sum
+  payload the diagnostic adds `note: \`Fiber\` is wrapped by
+  constructor \`Wrap\` of sum type \`Boxed\``. Coverage:
+  `examples/effects/m8x_7_fiber_in_sum.kai` (negative, Fiber
+  wrapped in user sum), `m8x_7_pid_in_sum.kai` (negative, Pid
+  wrapped in user sum), `m8x_7_recursive_sum_no_breach.kai`
+  (positive, recursive sum traverses + terminates without false
+  positive). The pre-existing `m8x_6_*` fixtures continue to fire
+  via the `HBDirect` path (no behavioural regression).
+
+### Deferred
+
+- **Issue #71 option (b) — full `TyBranded(Ty, BrandId)`
+  propagation — not landed in this lane.** Sibling-nursery
+  brand-mismatch detection requires a syntactic site to attach a
+  brand to (`nursery { n -> ... }`); today `nursery { ... }` is a
+  plain helper `nursery[T,e](body: () -> T / e) : T / e = body()`
+  with no `n` parameter (the cap-binding form is m7b #4, never
+  landed). Without that surface, two distinct nurseries cannot
+  even be referenced from user code, so brand mismatch is
+  unwritable and there is nothing to detect. Option (b) is
+  blocked on m7b #4 cap binding, not on typer engineering. See
+  `docs/fibers-honesty-targets.md` §*Residual m8.x items* item 1
+  for the precise gap that remains.
+
 ## [0.33.0] — 2026-05-02 (NetTcp v1 — first byte-level networking effect)
 
 ### Added
