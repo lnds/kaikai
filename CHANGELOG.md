@@ -9,6 +9,30 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **R10 + R11 diagnostic doc and standalone repros (issue #61).**
+  `docs/lane-diagnostic-r10-r11.md` walks the two open regressions
+  side-by-side, captures byte-identical AddressSanitizer traces for
+  both, and concludes they are one bug with two surfaces (R10 ⊆
+  R11). The R10 hypothesis pinning the crash on `in_dispatch_node`
+  save/restore was a misdiagnosis — the actual mechanism is the
+  R11-shape RC bug: a single-use read of `state` inside a
+  parameterised handler clause emits a raw transfer of the EvE
+  state slot's storage, which downstream decref-aware sinks
+  (`kai_prelude_string_concat` / `_length` / `_join`) free out
+  from under the next op-call invocation. Companion fixtures
+  `examples/effects/r10_repro.kai` and
+  `examples/effects/r11_repro.kai` reproduce the bug under
+  `tier1-asan`-style flags with the workarounds removed; both are
+  gated `# DIAGNOSTIC ONLY — KNOWN ASAN FAIL` and not wired into
+  any tier1 / tier1-asan / demos baseline target. The doc names a
+  single fix lane (`r10-r11-fix`) that special-cases `state` /
+  `log` in `pcs_is_non_last` (`stage2/compiler.kai:23808`) and
+  retires the `_keep_alive` workaround in
+  `stdlib/trace.kai::with_log_prefix`. Issue #61 stays open; this
+  doc is the input to the fix lane.
+
 ### Changed
 
 - **`CLAUDE.md` — lane handoff (push + PR) is authorized for
