@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-match test-loop test-time test-intervals test-stdlib test-http-client-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-http-client-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude selfhost
 
 all: $(TARGET)
 
@@ -1870,6 +1870,46 @@ test-match: $(TARGET) build
 	  fi; \
 	done
 
+# issue #130 — leading-pipe regression fixtures. Each .kai under
+# `examples/pipes/` exercises the apply (`|>`) and map (`|`) pipe
+# operators in leading-line position; one fixture re-checks the
+# pre-existing trailing-pipe shape so the relaxation in
+# `parse_pipe_rest` does not regress it. Same diff/golden discipline
+# as test-sugars.
+test-pipes: $(TARGET) build
+	@$(STACK) set -e; \
+	for f in ../examples/pipes/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/pipes/$$name.out.expected; \
+	  exp_err=../examples/pipes/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    rc=0; ./$(TARGET) $$f > /dev/null 2> build/p2-$$name.err || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "pipes FAIL $$name (expected error, got success)"; exit 1; \
+	    fi; \
+	    while read -r line; do \
+	      grep -q "$$line" build/p2-$$name.err \
+	        || { echo "pipes FAIL $$name (missing diagnostic: $$line)"; \
+	             cat build/p2-$$name.err; exit 1; }; \
+	    done < $$exp_err; \
+	    echo "pipes OK $$name (rejected as expected)"; \
+	  else \
+	    ./$(TARGET) $$f > build/$$name.c \
+	      || { echo "pipes FAIL $$name (kaic2 errored)"; exit 1; }; \
+	    $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name \
+	      || { echo "pipes FAIL $$name (C compile failed)"; exit 1; }; \
+	    ./build/$$name > build/$$name.out \
+	      || { echo "pipes FAIL $$name (run errored)"; cat build/$$name.out; exit 1; }; \
+	    if [ -f $$exp_out ]; then \
+	      diff -q $$exp_out build/$$name.out > /dev/null \
+	        && echo "pipes OK $$name" \
+	        || { echo "pipes DIFF $$name"; diff $$exp_out build/$$name.out; exit 1; }; \
+	    else \
+	      echo "pipes OK $$name (no golden, ran clean)"; \
+	    fi; \
+	  fi; \
+	done
+
 # m12.8 — single-dispatch protocols. Each .kai under
 # `examples/protocols/` either compiles + runs to a known stdout
 # (positive cases — diffed against `<name>.out.expected`) or fails
@@ -2439,7 +2479,7 @@ test-unbox-llvm-bench: $(TARGET) build
 	  fi
 	@echo "unbox-llvm-bench OK (pure_chain inner loop lowers to raw i64; one boundary kaix_int; IR links cleanly)"
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-match test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -2448,7 +2488,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-match test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude
 
 clean:
 	rm -rf build $(TARGET)
