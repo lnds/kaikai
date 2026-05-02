@@ -9,6 +9,22 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Documented
+
+- **Follow-up docs refreshed against current state.**
+  `docs/m12-6x-followup.md` updated: #2 sub-steps 1–4 (Interval
+  lattice in `0a6e0f2` + interval pass / `--dump-intervals` flag
+  / fixture in `b6bd5f6`) marked landed; #7 marked partially
+  unblocked (regex stdlib half landed in `a1cdda9` /
+  `3909c71` — only the refinement-side syntax remains).
+  `docs/unboxing-phase2-followup.md` updated: Real (`double`)
+  unboxing landed in `a6f4295` and is no longer Phase 3.
+- **Prelude audit relocated.** The post-Core ergonomic-tightening
+  candidate list moved out of `docs/m12.8-followup.md` into a
+  dedicated `docs/prelude-audit.md`, since those candidates
+  (redundant `string_concat` / `array_make` / `int_to_string` /
+  etc.) outlive the m12.8 lane scope.
+
 ## [0.31.1] — 2026-05-02 (R10/R11 fix — single-state-read UAF closed)
 
 ### Fixed
