@@ -143,9 +143,14 @@ Adjacent rules every agent must apply:
   2026-04-29 audit caught `stage1/compiler.kai` dirty for hours
   because nobody noticed; that hides which gate actually ran.
 - **Lane discipline**: a worktree fixes one thing. If you find a
-  bug outside your lane, document it in `docs/known-regressions.md`
-  with repro + hypothesis, do not fix it inline. The L2 wrong-lane
-  revert from 2026-04-29 is the precedent.
+  bug outside your lane, **open a GitHub issue** with repro +
+  hypothesis (label `regression` plus the topic-specific labels
+  — `runtime`, `compiler`, `perceus`, `typer`, `stdlib`,
+  `unboxing`, `refinements`), do not fix it inline. The L2 wrong-
+  lane revert from 2026-04-29 is the precedent. (Pending work
+  used to live in `docs/*-followup.md` + `docs/known-regressions.md`;
+  those were retired in PR #99, see "Where pending work lives"
+  below.)
 - **Lane handoff — push + PR is authorized**: an agent spawned
   in a worktree (e.g. via `/wt-claude`) **is authorized to push
   its lane branch to origin and open a pull request via
@@ -222,6 +227,17 @@ Adjacent rules every agent must apply:
   `docs/perceus-honesty-targets.md`. The "Tier 1 #2 holds without
   footnotes" claim in this CLAUDE.md is verifiable only against
   those documents.
+- **Where pending work lives**: open follow-ups and known
+  regressions live in **GitHub Issues**, not in tracking docs.
+  PR #99 (2026-05-02) retired `docs/m5x-followup.md`,
+  `docs/m12-6x-followup.md`, `docs/unboxing-phase2-followup.md`,
+  and `docs/known-regressions.md`; their open items moved to
+  issues #77–#96 with the labels `regression`, `perceus`,
+  `runtime`, `typer`, `compiler`, `stdlib`, `unboxing`,
+  `refinements`, and the tier labels `tier1` / `tier2` / `tier3`.
+  When you discover a new follow-up or regression, open an issue
+  with the relevant labels — do not re-create the tracking docs.
+  Closed items are recoverable from `git log` if needed.
 
 ## Things to avoid
 

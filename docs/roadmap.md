@@ -78,8 +78,8 @@ generics on Spawn).
   KAI_RECORD / KAI_VARIANT. Retro pinned in
   `docs/lane-experience-drop-specialisation.md`.
 - **Real unboxing (Phase 2 follow-up)** — pulled forward
-  from `docs/unboxing-phase2-followup.md` after drop
-  specialisation closed as negative result. Brings
+  from the Unboxing Phase 2 inventory (now issues #87–#91)
+  after drop specialisation closed as negative result. Brings
   Real-heavy programs from the prior ~50–100× C-ref gap into
   the same band as Int/Bool/Char (~5–10× post Phase 2). Same
   unbox_pass machinery + new C type emission for `MUnboxed Real`.
@@ -289,8 +289,8 @@ platforms.
   emit constraints.
 - LLVM mirrors for Phase 2 + TCO — close the gap where
   `--emit=llvm` binaries don't yet receive the speedups that
-  `--emit=c` enjoys. Currently deferred per
-  `docs/unboxing-phase2-followup.md` and issue #42.
+  `--emit=c` enjoys. Currently deferred per issue #87 and the
+  closed issue #42.
   *(Optimization thread for this milestone.)*
 - Stage 1 mirrors for Phase 2 + TCO — bootstrap chain
   parity. Currently bootstrap-only, so user code is

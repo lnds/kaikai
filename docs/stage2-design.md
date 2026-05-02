@@ -306,7 +306,7 @@ in.
    kai_closure capture incref, m4c real specialisation, LLVM
    mirror of m5 #3 drops, full Perceus optimisations
    (reuse-in-place, drop specialisation, unboxing, regions).
-   See `docs/m5x-followup.md`.
+   Tracked as the `perceus`-labelled issues (#77–#82).
 6. **m6 — Module resolution** (split in two sub-milestones):
    - **m6.1 — concat semantics** *(landed)*: `import a.b.c`
      loads `<dir>/a/b/c.kai` and concatenates its decls into the
@@ -712,22 +712,29 @@ Rationale:
      Recognised only when `ensure(...)` is followed by `where`, so
      user-defined `ensure` functions are unaffected.
 
-   Deferred from the original m12.6 plan, formally tracked in
-   `docs/m12-6x-followup.md`:
-   - **#1 `TyRefineT` semantic type** (load-bearing — unblocks
-     #2/#3/#4 below).
-   - **#2 Static interval propagation** through refined arguments.
-   - **#3 Match-arm narrowing** (`p : RefinedT`).
-   - **#4 UoM composition** (`Decimal<USD> where >= 0`).
-   - **#5 `[<refinement-pure>]` stdlib annotations** + the
-     validation pass that enforces them.
-   - **#6 Compile-time errors** for trivially-false predicates.
-   - **#7 Regex literals** (`String where matches /.../ `) —
-     stdlib regex engine landed 2026-04-28 (`stdlib/regexp.kai`,
-     RE2-style); the refinement-side `where matches /.../` syntax
-     + lexer/parser integration is the remaining sub-lane.
-   - **#8 Diagnostics quality** (predicate-aware panic messages) —
-     lands either in m12.6.x or inside m11.
+   Deferred from the original m12.6 plan. #1, #3, #4, #6
+   landed; remaining open items tracked as GitHub issues:
+   - **#1 `TyRefineT` semantic type** — landed 2026-04-27.
+   - **#2 Static interval propagation** through refined
+     arguments — v1 landed; full version (alpha-equivalent
+     matching, operator rewriting, call-site substitution)
+     pending in issue #83.
+   - **#3 Match-arm narrowing** (`p : RefinedT`) — landed.
+   - **#4 UoM composition** (`Decimal<USD> where >= 0`) —
+     landed.
+   - **#5 `[<refinement-pure>]` stdlib annotations** —
+     enforcement + attribute parser landed; inline placement
+     (lexer disambiguation) pending in issue #84.
+   - **#6 Compile-time errors** for trivially-false
+     predicates — landed.
+   - **#7 Regex literals** (`String where matches /.../`) —
+     stdlib regex engine landed 2026-04-28
+     (`stdlib/regexp.kai`, RE2-style); the refinement-side
+     `where matches /.../` syntax + lexer/parser integration
+     is pending in issue #85.
+   - **#8 Diagnostics quality** (predicate-aware panic
+     messages) — v1 landed; structured violation context
+     pending in issue #86.
 7.5. **m12.7 (bootstrap helpers)** — `axiom name : T`. Optional,
    ~0.5 day. Useful for stubbing intrinsics and FFI declarations
    while their real definitions land. Lands here because m12

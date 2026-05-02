@@ -3,7 +3,8 @@
 **Issue**: #61
 **Lane**: r10-r11-diagnostic (this branch). Diagnostic only — no
 fix lands here.
-**Inputs**: `docs/known-regressions.md` §R10, §R11;
+**Inputs**: R10 + R11 reports (since closed by issue #61, fixture
+content migrated into the regression history below);
 `docs/effects-impl.md` §"In-dispatch flag" (m8 #12);
 `stage2/compiler.kai` (`pcs_is_non_last`, `pcs_rewrite_clauses`,
 op-call emit at line 8274);
@@ -244,10 +245,10 @@ from `stdlib/trace.kai`, which already applies the `_keep_alive`
 workaround. It demonstrates the helper *passes* under ASAN, not
 that the bug is gone. Removing the workaround (the situation
 this lane reproduces) crashes both R10's and R11's repros
-identically. The two entries in `docs/known-regressions.md` were
-authored by different lanes (Tier 3 experiment 2 arm A for R11,
-arm B for R10) with different proximate symptoms, which is why
-the same bug was logged twice with different hypotheses.
+identically. The two reports (R10 and R11) were authored by
+different lanes (Tier 3 experiment 2 arm A for R11, arm B for
+R10) with different proximate symptoms, which is why the same
+bug was logged twice with different hypotheses.
 
 ---
 
@@ -292,7 +293,7 @@ loose runtime's tolerance).
 | `stdlib/trace.kai` | `with_log_prefix` `read` clause (lines 109–112) | Collapse to `read(resume) -> resume(state)`. Drop the `_keep_alive` and the long comment justifying it (replace with a one-line pointer to the fixed predicate if anything). |
 | `examples/effects/r10_repro.kai` | header marker | Once the fix lands and ASAN passes, drop the `# DIAGNOSTIC ONLY — KNOWN ASAN FAIL` line and rename to a stable fixture name (suggested: `examples/effects/m8_13_param_state_decref_alias_via_reader.kai`). |
 | `examples/effects/r11_repro.kai` | header marker | Same — rename to e.g. `examples/effects/m8_13_param_state_decref_alias_via_carrier.kai`. |
-| `docs/known-regressions.md` | §R10, §R11 | Move both entries to a "fixed" section or strike them out with the fix-lane PR number. The new fixtures replace the manual repros. |
+| (R10 + R11 regression entries) | now closed by issue #61 | Both entries were retired with the rest of `docs/known-regressions.md` in PR #99; the new fixtures replace the manual repros. |
 
 ### What the fix does NOT need to change
 

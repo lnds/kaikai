@@ -7,9 +7,10 @@ concretely, and which followups belong in which tier. Cost numbers
 are real-day estimates with the runtime-engineering velocity
 calibration (~5–10× faster than spec).
 
-This is a **scope decision**, not a roadmap. The roadmap proper lives
-in `docs/m5x-followup.md`; this file says *which followups are
-required for which honesty claim*.
+This is a **scope decision**, not a roadmap. The pending Perceus
+follow-ups live as GitHub Issues (`perceus` label — issues #77, #78,
+#82); this file says *which followups are required for which honesty
+claim*.
 
 Sister doc: `docs/fibers-honesty-targets.md` (same shape, applied to
 the m8.x scheduler).
@@ -70,14 +71,13 @@ match-test phase.
 
 ## What does NOT work today
 
-Two named leak sources remain (`docs/m5x-followup.md` §1 step 2c
-notes + §5):
+Two named leak sources remain (issue #82 inventory + issue #77
+Full Perceus):
 
 - **`kai_truthy` non-consuming** — intentional. The LLVM
   short-circuit phi returns `lhs` in the early-exit branch, so
   consuming the truthy probe's argument would alias-free a
-  value still referenced downstream. Pinned in
-  `m5x-followup.md` Step C.
+  value still referenced downstream. Tracked in issue #82.
 - **`kai_prelude_*` C helpers leak their params** — 9fe6f6d
   closed 12 of them (print/eprint, int/real string conversion,
   array & list ops). The remaining hand-written prelude
@@ -275,9 +275,10 @@ and shouldn't be designed pre-1.0.
 - Not a calendar. Cost estimates assume nothing else competes
   for attention; `kai_field`/`pat_test` balance has REOPEN-ed
   before (lane-experience-m5x-1-2.md) so add 1–2d buffer.
-- Not a list of all m5x-followup items — only those that
+- Not a list of all Perceus follow-up items — only those that
   affect honesty claims. Internal scaffolding work that doesn't
-  surface to user code lives in `m5x-followup.md` proper.
+  surface to user code lives in the `perceus`-labelled issues
+  (#77–#82).
 - Not an excuse to defer Tier 2. The +2.7× wall regression and
   46.9 M residual leaks are the cost of the flip without the
   follow-throughs; paying this debt is what makes the v0.2.0

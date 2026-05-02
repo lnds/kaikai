@@ -145,8 +145,8 @@ While building the fixture, Arm A hit R8 — a Phase 2 unboxing ×
 string interpolation regression. `let value = 42` unboxed to
 `int64_t kair_value`, but the desugared `#{int_to_string(value)}`
 still spelled the boxed name `kai_value`. C compile error.
-Diagnosed, minimally reproduced, documented in
-`docs/known-regressions.md` as **R8**, worked around by switching
+Diagnosed, minimally reproduced, documented as **R8**
+(issue #94), worked around by switching
 the fixture to use `++` concatenation. Lane discipline preserved
 (no inline fix; pinned for a future emit-pass lane).
 
@@ -328,8 +328,8 @@ bugs:
   manifestation of R10 or a distinct Perceus bug — open until a
   follow-up lane unifies the analyses.
 
-All three documented in `docs/known-regressions.md` with repro,
-hypothesis, and fix path.
+All three were documented as R8/R9/R10/R11; R9 (#60), R10 + R11
+(#61) closed 2026-05-02; R8 remains open as issue #94.
 
 ## Refinement of the Tier 3 bet
 

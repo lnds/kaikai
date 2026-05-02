@@ -36,9 +36,9 @@ sanity gates.
 
 ## Investigation (M0)
 
-Read of `docs/unboxing-phase2-design.md` + `unboxing-phase2-followup.md`
-established that the v1 lane shipped Int / Bool / Char with `Real`
-explicitly deferred:
+Read of `docs/unboxing-phase2-design.md` + the `unboxing` issue
+inventory (#87–#91) established that the v1 lane shipped Int / Bool /
+Char with `Real` explicitly deferred:
 
 > `Real` is in scope architecturally but skipped in v1 because it
 > doubles the test surface; tracked as a Phase 2 follow-up item
@@ -144,7 +144,7 @@ extension inherits that posture. A binary compiled via
 `--emit-llvm` does not see the raw `double` collapse and remains at
 the pre-extension ratio. Lifting LLVM into mode-aware emit is a
 ~1d follow-up, exactly mirroring the v1 LLVM-mirror item already
-parked in `docs/unboxing-phase2-followup.md`.
+parked as issue #87.
 
 Selfhost (C) was rebuilt twice intentionally to support the
 pre/post bench measurement (see *Measurement* §). Both rounds
@@ -287,8 +287,9 @@ Exactly one, captured above:
    runs, ~30% of total wall-clock is process startup. The signal
    is strong enough that it doesn't matter for a 6.7× ratio, but
    for sub-3× signals the noise floor would matter. Raising
-   N runs into the R6 TCO regression cap noted in
-   `unboxing-phase2-followup.md`. Out of scope for this lane.
+   N runs into the R6 TCO regression cap (issue #92) and the
+   loop-driver TCO regression in perceus-wrapped blocks (issue
+   #89). Out of scope for this lane.
 3. **`real_to_string` formatting.** kaikai's `print(real_to_string(r))`
    uses `snprintf("%g", ...)` (runtime.h:1173). The C reference
    uses `printf("%g\n", r)`. The exact formatting is identical for
@@ -379,10 +380,9 @@ Exactly one, captured above:
   A user running `kai build --emit-llvm` on a Real-heavy
   workload still pays the pre-extension cost. The C backend is
   the default; LLVM is opt-in at the bin/kai layer.
-- Bench N capped at 20_000 by the R6 TCO regression
-  (`docs/unboxing-phase2-followup.md` §"Loop driver TCO regression").
-  A larger N would improve signal-to-noise; the R6 fix would
-  need to land first.
+- Bench N capped at 20_000 by the loop-driver TCO regression
+  inside perceus-wrapped blocks (issue #89). A larger N would
+  improve signal-to-noise; that fix would need to land first.
 
 ## Raw build log
 
