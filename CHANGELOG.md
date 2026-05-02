@@ -24,6 +24,15 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   dedicated `docs/prelude-audit.md`, since those candidates
   (redundant `string_concat` / `array_make` / `int_to_string` /
   etc.) outlive the m12.8 lane scope.
+- **`docs/m12.8-followup.md` retired (replaced by stub).** All
+  items in the m12.8 follow-up tracker closed end-to-end (8 bugs
+  + Gap 1, post-Core REOPEN, `map_expr_kind` shared visitor).
+  The file's content was reduced to a short stub naming the
+  closing commits; existing references from the
+  `lane-experience-m12.8*.md` writeups and from `stage2-design.md`
+  / `protocols.md` continue to resolve. Lane-experience docs are
+  historical narratives and were left untouched. Pre-retirement
+  content available via `git show HEAD~<N>:docs/m12.8-followup.md`.
 
 ## [0.31.1] — 2026-05-02 (R10/R11 fix — single-state-read UAF closed)
 
