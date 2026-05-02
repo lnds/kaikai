@@ -4416,15 +4416,23 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
     EIndex(_, _) -> "kai_unit() /* index: not used by bootstrap examples */"
     EBinop(op, a, b) -> {
       if op == "and" {
+        # Issue #82: capture lhs in `_a`, ternary into a fresh `_r`,
+        # then drop `_a` before returning. The C ternary never returns
+        # `_a` itself (truthy path → fresh RHS, falsy path → fresh
+        # `kai_bool(0)`), so the decref is safe and balances the fresh
+        # allocation that fed `kai_op_truthy`.
         concat_all([
           "({ KaiValue *_a = ", emit_expr(src, a, fns, variants, lams, locals),
-          "; kai_op_truthy(_a) ? ", emit_expr(src, b, fns, variants, lams, locals),
-          " : kai_bool(0); })"
+          "; KaiValue *_r = kai_op_truthy(_a) ? ", emit_expr(src, b, fns, variants, lams, locals),
+          " : kai_bool(0); kai_decref(_a); _r; })"
         ])
       } else if op == "or" {
+        # Issue #82: same shape as `and`. Truthy path returns a fresh
+        # `kai_bool(1)`, falsy path returns the fresh RHS — `_a` is
+        # never aliased into the result, so dropping it is safe.
         concat_all([
           "({ KaiValue *_a = ", emit_expr(src, a, fns, variants, lams, locals),
-          "; kai_op_truthy(_a) ? kai_bool(1) : ", emit_expr(src, b, fns, variants, lams, locals), "; })"
+          "; KaiValue *_r = kai_op_truthy(_a) ? kai_bool(1) : ", emit_expr(src, b, fns, variants, lams, locals), "; kai_decref(_a); _r; })"
         ])
       } else {
         match binop_cname(op) {
@@ -4444,13 +4452,23 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
       }
     }
     EIf(c, a, opt_b) -> {
-      let cc = emit_expr(src, c, fns, variants, lams, locals)
+      # Issue #82: capture cond in `_c`, decref after the ternary.
+      # `kai_op_truthy` is non-consuming (intentional, see
+      # docs/perceus-honesty-targets.md), so without this drop the
+      # fresh cond expression leaked one ref per `if`. The branches
+      # return their own fresh values — `_c` is never aliased — so
+      # the decref is safe.
+      let cb = emit_expr(src, c, fns, variants, lams, locals)
       let tc = emit_expr(src, a, fns, variants, lams, locals)
       let ec = match opt_b {
         Some(eb) -> emit_expr(src, eb, fns, variants, lams, locals)
         None -> "kai_unit()"
       }
-      concat_all(["(kai_op_truthy(", cc, ") ? ", tc, " : ", ec, ")"])
+      concat_all([
+        "({ KaiValue *_c = ", cb,
+        "; KaiValue *_r = kai_op_truthy(_c) ? ", tc, " : ", ec,
+        "; kai_decref(_c); _r; })"
+      ])
     }
     EMatch(scr, arms) -> emit_match_expr(src, scr, arms, fns, variants, lams, locals)
     ELambda(_, _) -> emit_lambda_ref(x, fns, variants, lams, locals)

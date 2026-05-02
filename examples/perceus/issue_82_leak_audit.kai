@@ -1,0 +1,82 @@
+# Issue #82 — Perceus leak audit fixture.
+#
+# Closes the four leak sources that survived the m5.x runtime flip
+# (2026-04-28). Each block exercises a specific RC discipline gap so
+# a regression of any one shape would surface on tier1-asan as a
+# UAF (decref of a singly-held value the runtime later double-frees)
+# or as a stdout diff against the golden.
+#
+# 1. Match scrutinee `_scr` decref at match exit. The first block
+#    matches a `String` against literal arms + a wildcard so neither
+#    arm binds the scrutinee through PBind. The closing
+#    `kai_decref(_scr)` plant in `emit_match_default` (stages 0/1/2)
+#    consumes the fresh string allocation; pre-fix the scrutinee
+#    leaked one ref per match.
+#
+# 2. `kai_op_truthy` on fresh expressions. The second block calls
+#    `make_bool()` (returns a fresh boxed Bool the small-int cache
+#    cannot intern) directly inside an `if` cond. Stage 1/2 now wrap
+#    the boxed branch in a stmt-expr that captures the cond into a
+#    local and decrefs after the ternary; the LLVM emitter likewise
+#    plants `kaix_decref` after the `kaix_truthy` probe.
+#
+# 3. `kai_field` test-phase reads no longer incref. The third block
+#    matches a record-shaped variant against literal-field arms so
+#    `emit_pat_test_record_fields` runs the borrow-only field reader.
+#    The non-matching arm keeps the record alive for the next test
+#    via the borrowing variant; the matched arm still owns its
+#    bindings via `kai_op_field`.
+#
+# 4. `kai_prelude_mailbox_*` helpers consume their KaiValue * params.
+#    The fourth block sends a fresh string into a mailbox and recvs
+#    it back. Pre-fix `kai_prelude_mailbox_send` increfed the message
+#    and never decrefed the caller's `pid` ref; `mailbox_recv` /
+#    `mailbox_free` likewise leaked their `pid`. Each helper now
+#    consumes its inputs (mailbox_send transfers the message ref
+#    directly into the mailbox).
+
+import actor
+
+fn make_bool() : Bool = true
+
+type Pair = MkPair(Int, Int)
+
+fn matched_pair(p: Pair) : String = match p {
+  MkPair(0, _) -> "zero-left"
+  MkPair(_, 0) -> "zero-right"
+  _            -> "non-zero"
+}
+
+fn classify_word(s: String) : String = match s {
+  "hello" -> "greeting"
+  "world" -> "place"
+  _       -> "other"
+}
+
+fn main() : Int / Console = {
+  # 1: match scrutinee — fresh String fed into a non-PBind match.
+  print(classify_word("hello"))
+  print(classify_word("world"))
+  print(classify_word("nope"))
+
+  # 2: kai_op_truthy on fresh — boxed cond per branch.
+  if make_bool() { print("truthy-branch") } else { print("false-branch") }
+  if not make_bool() { print("unreached") } else { print("not-truthy-branch") }
+
+  # 3: kai_field test-phase reads — record-shaped variant matched
+  # against literal-field arms so the test path runs.
+  print(matched_pair(MkPair(0, 1)))
+  print(matched_pair(MkPair(1, 0)))
+  print(matched_pair(MkPair(2, 3)))
+
+  # 4: prelude mailbox helpers — send / recv with fresh
+  # message and pid. with_mailbox installs the Actor[String]
+  # handler on this fiber, allocates the mailbox via
+  # `mailbox_alloc`, and routes through `mailbox_send` / `_recv`
+  # / `_free` on exit.
+  with_mailbox {
+    Actor.send(Actor.self(), "ping")
+    print(Actor.receive())
+    0
+  }
+}
