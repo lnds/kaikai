@@ -1490,10 +1490,21 @@ today; the structural fix belongs to a future Perceus / RC lane.
 
 ## R9 — handler clauses do not capture parameters of the enclosing fn
 
-**Status**: **OPEN** as of 2026-05-01 (Tier 3 experiment 2 arm B —
-`with_log_prefix` lane). Blocks any handler-composition helper that
-needs to thread a *value* (not a previously-installed effect) into
-its clause bodies.
+**Status**: **CLOSED** 2026-05-02 by lane `r9-clause-env` (issue
+\#60). Captures detected in `lc_record_clauses`, threaded through a
+per-handle env struct allocated at the install site and read back via
+`((env *) self->env)->kai_<name>` in the clause prologue. Each read
+goes through `kai_internal_dup` so per-clause perceus accounting
+stays valid across clause invocations. Fixture at
+`examples/effects/r9_clause_capture.kai`. The C backend is the only
+fixed half; the LLVM backend (`llvm_emit_clause_body`) still ignores
+the captures field — same R9 symptom under `--emit=llvm`, scheduled
+as a mirror follow-up after the C selfhost is stable.
+
+**Status (historical)**: OPEN as of 2026-05-01 (Tier 3 experiment 2
+arm B — `with_log_prefix` lane). Blocked any handler-composition
+helper that needed to thread a *value* (not a previously-installed
+effect) into its clause bodies.
 
 **Symptom**: kaic2 accepts and emits
 
@@ -1591,23 +1602,43 @@ handler today**:
    to thread the value into the helper, and the value comes from
    the enclosing fn's params, which the clause cannot see.
 
-**Fix path** (out of scope for this lane — Tier 3 experiment 2 is
-stdlib-shaped, must not touch emit):
+**Fix path** (delivered 2026-05-02 in lane `r9-clause-env`):
 
-The emitter needs to detect free vars in clause bodies during the
-lower-effect pass, plumb them into a generated `EvE.env` slot
-(struct field of pointers to the captured values), and rewrite
-the bare `kai_<name>` references in the clause body to
-`((CapturedT *) self->env)->name`. The Perceus pass also needs to
-incref each captured value at handler-install time and decref at
-handler-pop time. Bigger than a one-day patch; appropriate as its
-own emit-pass lane.
+The collect pass (`lc_record_clauses`) computes per-clause free vars
+via the existing `fv_expr` walker, treating the clause's own params
+plus the magic `state` / `log` aliases as bound. The captures field
+on `ClauseInfo` accumulates the result (with `__alias_id__<a>`
+sentinels filtered — alias-id capture in clauses is a follow-up).
+At code-gen, `emit_handle_env_typedefs` mints one env struct per
+`(enc_fn, line, col)` triple covering the union of every clause's
+captures; `emit_handle` allocates the struct on the install-site
+stmt-expression frame, populates one field per capture from the
+surrounding `lcs`, and stashes a `void *` pointer in `_ev.env`.
+The clause prologue (`emit_clause_env_prologue`) casts `self->env`
+back to the env type and rebinds each `kai_<name>` via
+`kai_internal_dup` — the dup is what makes per-clause perceus
+accounting compose with the env's borrow scope (one shared env-side
+borrow + one fresh refcount per clause invocation, vs. the early
+draft that omitted the dup and freed captured strings after the
+first invocation).
 
-**Why this is documented here, not fixed**: lane discipline. The
-Tier 3 experiment 2 arm B brief explicitly forbids compiler work;
-the lane's deliverable was a stdlib helper plus a fixture, and the
-finding *is* "this helper cannot be built today without compiler
-changes." Pinning it for a follow-up lane.
+**RC contract**: the env struct holds a borrow scoped to the handle
+stmt-expression. The caller's `kai_<name>` outlives the handle
+body and is dropped in the surrounding fn's perceus epilogue.
+The clause body's prologue dup gives perceus's per-clause analysis
+a fresh reference it may consume freely; nothing else in the env
+path runs incref / decref.
+
+**Workarounds left in place**: `stdlib/trace.kai` still ships the
+parameterised-handler workaround (`with_log_prefix` threads
+`prefix` through a `TracePrefix[String]` state slot). The fix lets
+that helper be rewritten to capture `prefix` directly, which is a
+follow-up. Pointer left in the closing-commit message of the lane;
+no in-line deletion in this PR.
+
+**LLVM mirror**: `llvm_emit_clause_body` ignores the captures
+field. The same R9 symptom reproduces under `--emit=llvm`. Spec'd
+as a follow-up so the C backend can stabilise first.
 
 ---
 
