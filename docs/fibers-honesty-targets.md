@@ -133,7 +133,7 @@ can be parallelised across short lanes.
 | **Region-brand full machinery** ⚠ partial 2026-05-02 | ~3–5d | Pid symmetric with Fiber in the shallow check (2026-04-30); sum-type-payload escape closed via `SumInfo` registry + `ty_expr_find_handle` walker (2026-05-02 commit `c18cd4b`, issue #71 option (a)). Full `TyBranded(Ty, BrandId)` propagation with sibling-nursery brand mismatch is option (b), gated on m7b #4 cap-binding form not yet landing — see §*Residual m8.x items* |
 | ~~**LLVM op-dispatch `in_dispatch_node`**~~ ✅ shipped 2026-04-30 | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend — three runtime helpers (`kaix_evidence_lookup_node` / `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the KaiFiber struct out of the IR |
 | ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
-| ~~**Per-op generics in Spawn API**~~ ✅ partial 2026-04-30 | ~0.5d | TYPE generics retrofitted on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk still pending — see §*Residual m8.x items* |
+| ~~**Per-op generics in Spawn API**~~ ✅ shipped 2026-05-02 | ~0.5d | TYPE generics retrofitted 2026-04-30 on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk closed in issue #72 — `Spawn.spawn[T, e](f: () -> T / e)` is the canonical entry point, wrappers in `stdlib/spawn.kai` reduced to one-line aliases |
 
 After this set, `docs/effects.md`, `docs/structured-concurrency.md`,
 `docs/actors.md`, and `docs/fibers-impl.md` claims are all
@@ -157,11 +157,12 @@ single-threaded model is locked in.
 
 ## Residual m8.x items
 
-After the R2 lane closed (`0.4.0`) and the 2026-04-30 Tier 2 retrofit
-landed, two items from the original m8.x scope remain open. Both are
-typer-side, both are independent of the runtime, and both are tracked
-by GitHub issues. Neither blocks the disclaimer sweep that closes
-issue #59 — they were always scoped as separate lanes.
+After the R2 lane closed (`0.4.0`), the 2026-04-30 Tier 2 retrofit
+landed, and issue #72 closed on 2026-05-02, one typer-side item from
+the original m8.x scope remains open. It is independent of the
+runtime and tracked by a GitHub issue. It does not block the
+disclaimer sweep that closes issue #59 — it was always scoped as a
+separate lane.
 
 ### 1. Full `TyBranded` region brand (issue #71)
 
@@ -204,33 +205,7 @@ Until m7b #4 lands and option (b) is built on top of it, option
 (a) plus the existing direct/parametric shallow check covers
 every gap that user code can express today.
 
-### 2. Per-op ROW generics on Spawn (issue #72)
-
-The four Fiber-shaped Spawn ops carry per-op `[T]` (TYPE generics)
-since Tier 2 (`m8_spawn_per_op_generics.kai`). The full Doc B shape
-
-```
-effect Spawn {
-  spawn[T, e](f: () -> T / e) : Fiber[T]
-  ...
-}
-```
-
-— with `e` a per-op *row* variable propagating the spawned thunk's
-row into the caller's row — has not landed.
-`add_effect_op_sigs_loop` only allocates `mk_tpbinds_from` (TYPE
-binds) for `op_tparams`; there is no op-level `mk_rvbinds`. Until
-that lands, the spawn op keeps `thunk: Nothing` (TyAny) so the
-wrappers in `stdlib/spawn.kai`
-(`fiber_spawn[T, e](f: () -> T / e) = Spawn.spawn(f)`) can absorb
-the open row through TyAny. After per-op row generics land, the
-wrappers reduce to one-line aliases (or are removed) and
-`Spawn.spawn[T, e]` becomes the canonical entry point. Doc C
-§*Per-op type generics* §*Implementation plan (m7b)* has the work
-plan; the additional row-bind plumbing is the small step that
-remains.
-
-### 3. Other minor items left behind by the R2 lane
+### 2. Other minor items left behind by the R2 lane
 
 - Real race + cancel-losers semantics for `Spawn.select`. v1
   (Phase 2) returns the head deterministically; the spec's race
