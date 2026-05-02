@@ -1931,17 +1931,25 @@ static KaiValue *kai_prelude_mailbox_alloc_unowned(void) {
  * the spawned fiber but does not yield — the parent runs through to
  * this assign call before the spawned trampoline gets the CPU. */
 static KaiValue *kai_prelude_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
-    if (!pid    || pid->tag    != KAI_PID    || !pid->as.mb)    return kai_unit();
-    if (!fiber  || fiber->tag  != KAI_FIBER  || !fiber->as.fib)  return kai_unit();
-    pid->as.mb->owner_fiber = fiber->as.fib;
-    fiber->as.fib->mailbox  = pid->as.mb;
+    if (pid && pid->tag == KAI_PID && pid->as.mb &&
+        fiber && fiber->tag == KAI_FIBER && fiber->as.fib) {
+        pid->as.mb->owner_fiber = fiber->as.fib;
+        fiber->as.fib->mailbox  = pid->as.mb;
+    }
+    /* m5.x flip Phase 3 closeout (issue #82): consume input refs. */
+    if (pid)   kai_decref(pid);
+    if (fiber) kai_decref(fiber);
     return kai_unit();
 }
 
 static KaiValue *kai_prelude_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {
     int c = (cap && cap->tag == KAI_INT) ? (int) cap->as.i : 0;
     int o = (overflow && overflow->tag == KAI_INT) ? (int) overflow->as.i : 0;
-    return kai_pid_value(kai_mailbox_alloc_bounded(c, o));
+    KaiValue *r = kai_pid_value(kai_mailbox_alloc_bounded(c, o));
+    /* m5.x flip Phase 3 closeout (issue #82): consume input refs. */
+    if (cap)      kai_decref(cap);
+    if (overflow) kai_decref(overflow);
+    return r;
 }
 
 static KaiValue *kai_prelude_mailbox_send(KaiValue *pid, KaiValue *msg) {
@@ -1949,7 +1957,12 @@ static KaiValue *kai_prelude_mailbox_send(KaiValue *pid, KaiValue *msg) {
         fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
         exit(1);
     }
-    kai_mailbox_push(pid->as.mb, kai_incref(msg));
+    /* m5.x flip Phase 3 closeout (issue #82): transfer the caller's
+     * `msg` ref directly into the mailbox (kai_mailbox_push takes
+     * ownership) and consume the `pid` ref. Pre-fix the helper did
+     * `kai_incref(msg)` then dropped the caller's ref on the floor. */
+    kai_mailbox_push(pid->as.mb, msg);
+    kai_decref(pid);
     return kai_unit();
 }
 
@@ -1958,7 +1971,12 @@ static KaiValue *kai_prelude_mailbox_recv(KaiValue *pid) {
         fprintf(stderr, "kai: mailbox_recv: argument is not a Pid\n");
         exit(1);
     }
-    return kai_mailbox_pop(pid->as.mb);
+    /* kai_mailbox_pop returns the stored ref (mailbox transferred its
+     * ownership to the caller). Consume the input `pid` ref so the
+     * helper is callee-consumes-clean. */
+    KaiValue *msg = kai_mailbox_pop(pid->as.mb);
+    kai_decref(pid);
+    return msg;
 }
 
 /* Free the mailbox attached to a Pid. Called by `with_mailbox` when
@@ -1968,6 +1986,8 @@ static KaiValue *kai_prelude_mailbox_free(KaiValue *pid) {
         kai_mailbox_free(pid->as.mb);
         pid->as.mb = NULL;
     }
+    /* m5.x flip Phase 3 closeout (issue #82): consume input ref. */
+    if (pid) kai_decref(pid);
     return kai_unit();
 }
 

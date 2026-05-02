@@ -10508,19 +10508,37 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
     EIf(c, a, opt_b) -> {
       # Tier 2.5 M4 — if the condition is already raw bool, skip
       # the `kai_op_truthy` wrapper and use the C ternary directly.
-      let cc = match c.mode {
-        MUnboxed -> emit_expr_raw(src, c, lcs, fns, variants, lams, cls)
+      # Issue #82: when the cond is boxed, capture it in a local and
+      # decref after the ternary. `kai_op_truthy` is non-consuming
+      # (the LLVM short-circuit phi keeps lhs alive on the skip path,
+      # so the runtime predicate cannot blindly consume), and the
+      # branches return either the then- or else-arm fresh value —
+      # never `_c` itself — so dropping `_c` after the ternary is
+      # safe and balances the fresh allocation that fed it.
+      match c.mode {
+        MUnboxed -> {
+          let cc = emit_expr_raw(src, c, lcs, fns, variants, lams, cls)
+          let tc = emit_expr(src, a, lcs, fns, variants, lams, cls)
+          let ec = match opt_b {
+            Some(eb) -> emit_expr(src, eb, lcs, fns, variants, lams, cls)
+            None -> "kai_unit()"
+          }
+          concat_all(["(", cc, " ? ", tc, " : ", ec, ")"])
+        }
         _ -> {
           let cb = emit_expr(src, c, lcs, fns, variants, lams, cls)
-          concat_all(["kai_op_truthy(", cb, ")"])
+          let tc = emit_expr(src, a, lcs, fns, variants, lams, cls)
+          let ec = match opt_b {
+            Some(eb) -> emit_expr(src, eb, lcs, fns, variants, lams, cls)
+            None -> "kai_unit()"
+          }
+          concat_all([
+            "({ KaiValue *_c = ", cb,
+            "; KaiValue *_r = kai_op_truthy(_c) ? ", tc, " : ", ec,
+            "; kai_decref(_c); _r; })"
+          ])
         }
       }
-      let tc = emit_expr(src, a, lcs, fns, variants, lams, cls)
-      let ec = match opt_b {
-        Some(eb) -> emit_expr(src, eb, lcs, fns, variants, lams, cls)
-        None -> "kai_unit()"
-      }
-      concat_all(["(", cc, " ? ", tc, " : ", ec, ")"])
     }
     EMatch(scr, arms) -> emit_match_expr(src, scr, arms, lcs, fns, variants, lams, cls)
     ELambda(_, _) -> emit_lambda_ref(x, lcs, fns, variants, lams, cls)
@@ -29270,12 +29288,19 @@ fn llvm_emit_unop(e: LlvmEmit, op: String, inner: Expr) : LlvmEmit {
 # predecessor labels come from `cur_label` at the end of each arm,
 # not the block header — a nested if in either arm may end control
 # flow in a different block than the one the arm opened.
+#
+# Issue #82: `kaix_truthy` is non-consuming (mirrors the C predicate),
+# so the cond value's ref must be released after the probe. The cond
+# is dead in both arms (neither references `cv`), so a single
+# `kaix_decref` between the truthy probe and the conditional branch
+# balances the fresh allocation that fed it.
 fn llvm_emit_if(e: LlvmEmit, c: Expr, t: Expr, eo: Option[Expr]) : LlvmEmit {
   let ec = llvm_emit_expr(e, c)
   let cv = ec.last_val
   let tri = llvm_fresh_reg(ec)
   let e1 = llvm_append_body(tri.e, concat_all(["  ", tri.reg, " = call i32 @kaix_truthy(%KaiValue* ", cv, ")\n"]))
-  let cond = llvm_fresh_reg(e1)
+  let e1d = llvm_append_body(e1, concat_all(["  call void @kaix_decref(%KaiValue* ", cv, ")\n"]))
+  let cond = llvm_fresh_reg(e1d)
   let e2 = llvm_append_body(cond.e, concat_all(["  ", cond.reg, " = icmp ne i32 ", tri.reg, ", 0\n"]))
   let th  = llvm_fresh_label(e2, "if.then.")
   let el  = llvm_fresh_label(th.e, "if.else.")
