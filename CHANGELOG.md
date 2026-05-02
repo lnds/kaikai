@@ -9,6 +9,21 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.37.0] — 2026-05-02 (Tongariki MVP closed — last 6 mvp-blockers landed)
+
+The Tongariki MVP claim ships without an asterisk. The last six
+mvp-blockers (#78, #89, #102, #103, #104, #107) closed in this
+release alongside the path-gated `tier1-asan` CI workflow that
+revealed and resolved seven preexisting Linux-only ASAN failures
+(#115). The runtime now honors trap-exit at the cancellation
+boundary so OTP-style layered supervision composes cleanly,
+unblocking ahu's Layer 3 restart helpers; Posix signals (SIGINT /
+SIGTERM) are observable through the effect system; nested mailbox
++ trap-exit no longer segfaults on Linux; the m5.x perceus flip's
+remaining four leak sources are closed; the LLVM backend mirrors
+the C backend's Phase 2 unbox lowering so `--emit=llvm` binaries
+finally see the raw-scalar speedup.
+
 ### Added
 
 - **LLVM backend — Phase 2 unbox mirror (issue #87).** The C
