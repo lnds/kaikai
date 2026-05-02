@@ -9,6 +9,66 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **`bench "..." { ... }` blocks + `kai bench` subcommand
+  (issue #40).** New top-level decl form mirrors the existing
+  `test "..."` shape: parser, `DBench(String, Expr, Int, Int)`
+  AST node, `bench` keyword (`TkBench`), and ~20 walker arms
+  thread the body through every pass that already handles
+  `DTest` (alias rewrite, op-call / index / const-ref / var
+  desugar, validation, monomorphisation, Perceus, protocol
+  resolution, fmt, dump). New stage-2 emit pipeline
+  (`emit_bench_fn` / `bench_decls` / `number_benches` /
+  `emit_all_benches` / `bench_call_list`) wraps the body in a
+  fixed `KAI_BENCH_ITERS = 1000` loop under
+  `clock_gettime(CLOCK_MONOTONIC)` and reports mean ns/iter
+  through `kai_bench_report`. Runtime helpers
+  (`kai_bench_now_ns` / `kai_bench_report` / `kai_bench_summary`)
+  live in `stage0/runtime.h` next to the existing test harness;
+  bench bodies do **not** install a setjmp landing pad — an
+  assertion failure inside a bench panics the process, since
+  timing aborted code is meaningless. New `MBench` mode and
+  `--bench` CLI flag drive `emit_main_wrapper` to emit a main
+  that calls every `_kai_bench_<id>()` and returns
+  `kai_bench_summary()`. `bin/kai` grows a `cmd_bench`
+  subcommand parallel to `cmd_test`.
+
+  Output format per bench block:
+
+      <desc>: 1000 iter / <ns> ns/iter
+
+  followed by a `<N> benches` summary line.
+
+- **`examples/stdlib/bench_basic.kai` smoke fixture.** Three
+  benches covering primitive arithmetic, list construction +
+  traversal, and recursive arithmetic (`fib(10)`). Lives under
+  `examples/stdlib/` per the issue split plan; the
+  `stage2/Makefile` `test-stdlib` loop now skips
+  `bench_*.kai` files (they have no `main` outside `--bench`
+  mode, so the regular smoke would link-fail).
+
+- **`make test-bench` Make target.** Builds + runs the fixture,
+  greps the output for the `: 1000 iter / [0-9]+ ns/iter`
+  pattern (ns values vary per run, so format-shape — not
+  golden-diff — is the assertion), and verifies the
+  `3 benches` summary line. Wired into `make tier1` so every
+  PR runs the bench smoke.
+
+### bench v1 scope (issue #40)
+
+Shipped: parser, walkers, emit, runtime, `--bench` flag,
+`kai bench` driver, smoke fixture, `make test-bench`. Mean
+ns/iter only, N fixed at 1000.
+
+Deferred:
+
+- **v1.x — outlier-robust stats**: median, MAD-based outlier
+  detection, configurable iteration count via env var or flag.
+- **v1.y — selfhost-bench**: bench blocks under `stage2/`
+  measuring lex / parse / typer / emit on a representative
+  source. No new language work.
+
 ## [0.24.1] — 2026-05-01 (regression fixture for conservative dropmask + R6 deferral of rule 3 strict)
 
 ### Added
