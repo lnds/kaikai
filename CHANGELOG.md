@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.36.0] — 2026-05-02 (mvp-blockers #78 + #80 + #102 + #106 closed)
+
 ### Added
 
 - **`core.list` canonical higher-order helpers (issue #106).**
