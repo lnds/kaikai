@@ -83,6 +83,53 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Fixed
 
+- **Issue #103 — trap-exit bypassed when an outer Cancel handler
+  was in scope at child termination.** A supervisor with
+  `fiber_set_trap_exit(true)` watching a linked child that crashed
+  via `Cancel.raise()` never woke from `Actor.receive()` if any
+  intermediate frame between the `with_mailbox` scope and the
+  spawn point had installed a `with Cancel { raise(_) -> ... }`
+  handler. The child's `Cancel.raise()` walked the inherited
+  evidence chain (cloned at spawn per #104) and landed in that
+  outer handler, short-circuiting the trampoline-tail link
+  propagation that should have pushed `"Crashed"` into the
+  supervisor's mailbox. The bug forced lnds/ahu's Layer 3 restart
+  helper to model escalation as an `Outcome.Escalated` enum
+  return value rather than via `Cancel.raise()`, breaking
+  recursive composition of OTP-style layered supervision.
+
+  Fix: at the `kai_evidence_lookup_node` /
+  `kai_evidence_lookup_node_by_id` call site for the `Cancel`
+  effect, when the active fiber is linked to any peer with
+  `trap_exit=true` and its trampoline cancel pad is live,
+  longjmp directly to the cancel pad — bypassing every user
+  Cancel handler in scope. The trampoline tail then runs the
+  link-propagation walk, which pushes `"Normal"` / `"Crashed"`
+  into the trap-exit'd peer's mailbox per the BEAM-faithful
+  contract documented in `docs/actors.md` §*Trap-exit semantics*.
+  Plain `Cancel.raise()` inside a fiber that holds no trap-exit'd
+  link still dispatches through user handlers as before, so the
+  cleanup-on-cancel idiom for non-supervised work is preserved.
+
+  New helpers in `stage0/runtime.h`:
+  `kai_fiber_has_trap_exit_link` (linear walk over the link
+  chain — typically 1-2 entries per the v1 simplifications) and
+  `kai_check_trap_exit_cancel_bypass` (the longjmp gate).
+  Documentation updated in `docs/actors.md` (Trap-exit semantics
+  section) and `docs/structured-concurrency.md` (Cancellation
+  section). Regression fixture
+  `examples/effects/issue_103_trap_exit_cancel_handler.kai`
+  exercises the exact reproducer from the issue (supervisor +
+  outer Cancel handler + child that links and raises Cancel) and
+  is wired into both `test-effects` (output diff in tier1) and
+  the new `test-trap-exit-cancel-asan` rule (UAF / UB diagnostic
+  in tier1-asan). Pre-existing `m8_trap_exit` fixture continues
+  to pass (no Cancel handler in scope, cancel-cascade and
+  trap-exit conversion semantics unchanged).
+
+  Unblocks lnds/ahu's Layer 3 supervision composability; the
+  Tongariki `Outcome.Escalated` workaround can now be retired in
+  a follow-up lane on the ahu repo.
 - **Issue #89 — last open mvp-blocker: `bench_loop` recursion in
   `examples/perceus/unbox_bench.kai` was capped at `N = 20_000`
   by a stale comment claiming TCO did not fire on tail calls

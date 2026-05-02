@@ -3854,6 +3854,52 @@ static KaiValue *kai_default_link_link(void *self, KaiValue *peer, KaiCont *k) {
     return kai_cont_resume(k, kai_unit());
 }
 
+/* Issue #103 — return 1 if `f` is bidirectionally linked to any
+ * peer with `trap_exit=true`. Used by the Cancel-lookup hook below
+ * to decide whether `Cancel.raise()` must bypass user handlers and
+ * unwind the fiber directly so the trampoline tail can convert
+ * termination into a `"Crashed"` mailbox push on the trap-exit'd
+ * peer. The walk is short (link chains are typically 1-2 entries
+ * per the v1 simplifications above) so the per-op overhead of this
+ * check is negligible. */
+static int kai_fiber_has_trap_exit_link(KaiFiber *f) {
+    if (!f) return 0;
+    KaiLinkNode *ln = f->linked_head;
+    while (ln) {
+        if (ln->peer && ln->peer->trap_exit) return 1;
+        ln = ln->next;
+    }
+    return 0;
+}
+
+/* Issue #103 — bypass user-installed Cancel handlers when the
+ * current fiber is linked to a trap-exit'd peer. The contract
+ * documented in docs/actors.md §*Trap-exit semantics* requires
+ * that a supervisor with `fiber_set_trap_exit(true)` observes a
+ * linked child's termination through its mailbox, not through a
+ * Cancel handler in the call chain between the spawn point and
+ * the receive point. Without this hook, the child's `Cancel.raise()`
+ * walks the inherited evidence chain (cloned at spawn time per
+ * issue #104) and lands in any outer `with Cancel { raise(_) -> ... }`
+ * the parent installed before the spawn — short-circuiting the
+ * trampoline-tail link propagation that would have pushed
+ * `"Crashed"` into the supervisor's mailbox.
+ *
+ * The check fires only when the cancel_pad is live (so we have
+ * somewhere to longjmp) and the fiber actually has a trap-exit'd
+ * link (so this is the linkage-relevant case the issue scopes the
+ * fix to). Plain Cancel.raise() inside a fiber that holds no
+ * trap-exit'd link still dispatches through user handlers as before,
+ * preserving the cleanup-on-cancel idiom for non-supervised work. */
+static void kai_check_trap_exit_cancel_bypass(void) {
+    KaiFiber *f = kai_active_fiber;
+    if (!f || !f->cancel_pad_set) return;
+    if (!kai_fiber_has_trap_exit_link(f)) return;
+    f->cancel_delivered = 1;
+    longjmp(f->cancel_pad, 1);
+    /* Unreachable. */
+}
+
 /* Tier 2 Monitor — append (observer, target_pid) onto target's
  * monitor_head chain. The runtime takes one ref on target_pid via
  * kai_incref so the value can be pushed into the observer's mailbox
@@ -4080,6 +4126,11 @@ static void kai_check_cancel_yield_point(void) {
 
 static void *kai_evidence_lookup(const char *eff_label) {
     kai_check_cancel_yield_point();
+    /* Issue #103 — Cancel-on-linked-trap-exit'd-peer must bypass
+     * user handlers (see kai_check_trap_exit_cancel_bypass). */
+    if (eff_label && strcmp(eff_label, "Cancel") == 0) {
+        kai_check_trap_exit_cancel_bypass();
+    }
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     while (node != NULL) {
@@ -4096,6 +4147,12 @@ static void *kai_evidence_lookup(const char *eff_label) {
  * site can reach the handle's jmp_buf if a discard happens. */
 static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
     kai_check_cancel_yield_point();
+    /* Issue #103 — bypass user Cancel handlers when the current
+     * fiber is linked to a trap-exit'd peer (see
+     * kai_check_trap_exit_cancel_bypass for rationale). */
+    if (eff_label && strcmp(eff_label, "Cancel") == 0) {
+        kai_check_trap_exit_cancel_bypass();
+    }
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     while (node != NULL) {
@@ -4127,6 +4184,13 @@ static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
         if (node == f->in_dispatch_node) { node = node->parent; continue; }
         KaiHandlerId nid = ((KaiHandlerId *) node->handler)[0];
         if (nid == id) {
+            /* Issue #103 — same Cancel bypass as the by-name path:
+             * an aliased `with Cancel as e` op call on a fiber linked
+             * to a trap-exit'd peer must unwind directly. */
+            if (node->eff_label
+                && strcmp(node->eff_label, "Cancel") == 0) {
+                kai_check_trap_exit_cancel_bypass();
+            }
             return node;
         }
         node = node->parent;

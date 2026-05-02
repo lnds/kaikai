@@ -187,6 +187,16 @@ cleanly. There are no silent survivors. Doc B §`Cancel`
 *Handling for cleanup* and *Unwind through nested handlers*
 pin the wider semantics.
 
+One exception applies in the actor model: when a fiber is linked
+to a peer with `trap_exit=true` (set via `fiber_set_trap_exit`),
+its `Cancel.raise()` bypasses any `with Cancel { raise(_) -> ... }`
+handler in the call chain — including handlers inherited from the
+parent fiber's evidence chain at spawn time — and unwinds straight
+to the trampoline cancel pad so the link-propagation walk can push
+a `"Crashed"` string into the supervisor's mailbox. See
+docs/actors.md §*Trap-exit semantics* for the BEAM-faithful
+contract this enforces (issue #103).
+
 ## Patterns
 
 ### Race (first result wins)
