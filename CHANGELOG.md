@@ -9,6 +9,75 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **Real unboxing — Phase 2 unbox pass extended to `Real`
+  (Tongariki 5/5).** The unbox analysis from PR #38 (Phase 2 v1)
+  classified `Int` / `Bool` / `Char` operands as raw C scalars;
+  `Real` was deliberately deferred. This change adds the missing
+  row: `TyReal -> double` in the type-lookup tables
+  (`raw_c_type`, `box_wrap`, `unbox_field_for`), an `EReal(r)`
+  case in `emit_kind_raw`, and an `EReal(_) -> MUnboxed` decision
+  arm. Inner `+ - * /` chains on `Real` now collapse to native C
+  arithmetic on `double`; comparison binops collapse to native C
+  `<` / `==` / `!=`; the boundary `kai_real(...)` wrap is the
+  single allocation per chain.
+- Two type-aware gates handle the v1 boundaries: `decide_mode`
+  for `EBinop` keeps `%` boxed when the result type is non-
+  integral (`double` has no native C modulo), and
+  `emit_match_expr` only takes the M5 switch fast path when the
+  scrutinee is integral (`Real` cannot drive a C `switch`). The
+  helper `ty_is_integral_raw` (mirrors `ty_is_unboxable_t` minus
+  `TyReal`) drives both gates.
+- Fixture peers under `examples/perceus/`:
+  - `unbox_phase2_arith_real.kai` — `+ - * /` chain.
+  - `unbox_phase2_cond_real.kai` — comparison + boolean +
+    `EIf` cond chain.
+  - `unbox_bench_real.kai` + `unbox_bench_real.c.ref` —
+    floating-point performance benchmark mirroring
+    `unbox_bench.kai`'s shape (27 binops × 20_000 iterations,
+    `+ - * /` only).
+  `stage2/Makefile :: test-unbox-phase2` picks them up via the
+  existing glob and adds parallel structural greps that assert
+  raw `double kair_*` locals + no `kai_add(` / `kai_mul(` /
+  `kai_sub(` / `kai_div(` / `kai_lt(` / `kai_truthy(` /
+  `kai_eq_v(` survives in the bodies.
+
+### Changed
+
+- `unbox_pass` now classifies `Real`-typed expressions as
+  `MUnboxed` candidates. Selfhost C is byte-identical for every
+  file in the tree that did not previously contain Real
+  arithmetic; the only diffs in selfhost output land where the
+  emitted C now uses `double` arithmetic instead of
+  `kai_add(kai_real(...), kai_real(...))` style — strict
+  simplifications (allocations down).
+- The selfhost LLVM backend stays byte-identical at the
+  fixed-point level. The Real-unboxing extension does not change
+  the LLVM emit path; a binary compiled via `--emit-llvm` still
+  sees the pre-extension boxed-Real lowering. LLVM mode-aware
+  emit is parked as a follow-up alongside the equivalent v1
+  item in `docs/unboxing-phase2-followup.md`.
+
+### Performance
+
+- `examples/perceus/unbox_bench_real.kai` (Real-heavy 27-binop
+  inner chain × 20_000 iterations, `cc -O2`, average of 2_000
+  runs):
+  - Pre-extension (Real boxed): ~18.4 ms/run (~14.5× C ref).
+  - Post-extension (Real unboxed): **~2.75 ms/run (~2.2× C ref)**.
+  - Wall-clock speedup: **~6.7×** vs Real-boxed.
+  Brings Real-heavy code into the same ~5–10× C-reference band
+  Phase 2 v1 reached for `Int` / `Bool` / `Char`. Closes the
+  `runtime-efficient` (Tier 1 #2) defence for Real workloads.
+
+### Documentation
+
+- `docs/lane-experience-real-unboxing.md` — full lane
+  retrospective with TSV instrumentation, bench numbers, parser
+  friction notes, and Tier 3 LLM-friendly bet evidence. Tongariki
+  closes 5/5 with this report.
+
 ## [0.26.0] — 2026-05-02 (Tongariki cierre — check v1 + drop-spec retro + Real unboxing pulled forward)
 
 ### Added
