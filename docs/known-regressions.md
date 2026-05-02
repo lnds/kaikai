@@ -1490,12 +1490,13 @@ today; the structural fix belongs to a future Perceus / RC lane.
 
 ## R9 — handler clauses do not capture parameters of the enclosing fn
 
-**Status**: **CLOSED** 2026-05-02 by lane `r9-clause-env` (issue
-\#60). Captures detected in `lc_record_clauses`, threaded through a
-per-handle env struct allocated at the install site and read back via
-`((env *) self->env)->kai_<name>` in the clause prologue. Each read
-goes through `kai_internal_dup` so per-clause perceus accounting
-stays valid across clause invocations. Fixture at
+**Status**: **CLOSED** 2026-05-02 by commit `d3a4184` on lane
+`r9-clause-env` (issue \#60). Captures detected in
+`lc_record_clauses`, threaded through a per-handle env struct
+allocated at the install site and read back via
+`((env *) self->env)->kai_<name>` in the clause prologue. Each
+read goes through `kai_internal_dup` so per-clause perceus
+accounting stays valid across clause invocations. Fixture at
 `examples/effects/r9_clause_capture.kai`. The C backend is the only
 fixed half; the LLVM backend (`llvm_emit_clause_body`) still ignores
 the captures field — same R9 symptom under `--emit=llvm`, scheduled
