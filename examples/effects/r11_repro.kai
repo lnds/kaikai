@@ -1,0 +1,63 @@
+# DIAGNOSTIC ONLY — KNOWN ASAN FAIL (issue #61, R11)
+#
+# Standalone reproducer for R11. Mirrors the with_log_prefix shape
+# in stdlib/trace.kai but inlines the parameterised handler with the
+# `_keep_alive` workaround REMOVED, so the bug surfaces under ASAN.
+#
+# Expected behaviour today:
+#   - kaic2 compiles the file cleanly.
+#   - cc -fsanitize=address compiles the C cleanly.
+#   - At runtime, the second/third Trace.log invocation reads freed
+#     memory from the EvE state slot (`self->state`).
+#   - Without ASAN: blank or garbage prefix, possibly SIGSEGV.
+#   - With ASAN: heap-use-after-free in kai_string_concat reading
+#     the freed prefix bytes.
+#
+# The bug is fixed by the same change that fixes R10 (see
+# docs/lane-diagnostic-r10-r11.md). Do NOT add this file to any
+# tier1 or demos baseline; it is a diagnostic fixture only.
+
+import trace
+
+effect Carrier[T] {
+  read() : T
+}
+
+pub fn with_log_prefix_buggy[R, e](
+  prefix: String,
+  body: () -> R / Trace + e
+) : R / Trace + e = {
+  handle {
+    handle {
+      body()
+    } with Trace {
+      log(msg, resume) -> {
+        Trace.log(Carrier.read() ++ ": " ++ msg)
+        resume(())
+      }
+      checkpoint(name, resume) -> {
+        Trace.log(Carrier.read() ++ ": checkpoint: " ++ name)
+        resume(())
+      }
+      return(x) -> x
+    }
+  } with Carrier[String](prefix) {
+    # NO _keep_alive — single read of `state` per clause invocation.
+    # pcs_is_non_last returns false; emit produces a raw transfer
+    # `kai_state` that the downstream `kai_prelude_string_concat`
+    # decrefs, freeing self->state's storage before the next op
+    # call needs it.
+    read(resume) -> resume(state)
+    return(x)    -> x
+  }
+}
+
+fn worker() : Unit / Trace = {
+  Trace.log("first")
+  Trace.log("second")
+  Trace.log("third")
+}
+
+fn main() : Unit / Stdout = with_trace_default() {
+  with_log_prefix_buggy("P", worker)
+}
