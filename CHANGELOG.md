@@ -11,6 +11,99 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Added
 
+- **LLVM backend — Phase 2 unbox mirror (issue #87).** The C
+  backend has emitted unboxed scalars for `MUnboxed` expressions
+  since the Tier 2.5 unbox lane (`docs/unboxing-phase2-design.md`),
+  but the LLVM backend ignored `Expr.mode` and emitted every node
+  as boxed via `kaix_int` / `kaix_add` / `kaix_eq`. A
+  `--emit=llvm` binary therefore did not see the raw `int64_t`
+  collapse the C backend gets — `make selfhost-llvm` stayed
+  byte-identical because the LLVM emitter was internally
+  consistent, but a hot numeric loop compiled through the LLVM
+  backend stayed at the pre-Phase-2 ratio. This lane closes the
+  five acceptance items in the issue body:
+  - **#1 — `llvm_emit_expr_raw` helper.** New mode-aware
+    dispatcher (`stage2/compiler.kai :: llvm_emit_expr`) routes
+    `MUnboxed` expressions through `llvm_emit_expr_raw` and
+    `MBoxed` through the renamed `llvm_emit_expr_boxed` (the
+    original kind-based emit body). The raw helper returns an
+    `LlvmRaw { reg, ty }` carrying an LLVM IR `i64` / `i32` /
+    `double` register instead of `%KaiValue*`. Box-back happens
+    at the consumer boundary via `llvm_box_wrap_value` →
+    `kaix_int` / `kaix_bool` / `kaix_real` / `kaix_char`.
+    Symmetric to the C backend's `emit_expr_raw` /
+    `emit_kind_raw` / `box_wrap` trio.
+  - **#2 — `llvm_emit_let` MUnboxed branch.** When `rhs.mode =
+    MUnboxed`, the SLet handler in both `llvm_emit_stmt` and
+    `llvm_emit_stmt_with_drops` emits `let raw =
+    llvm_emit_expr_raw(...)` and pushes a new `LRaw(name, reg,
+    ty)` onto the local scope (extension of the `LlvmLocal` sum
+    type). No `%KaiValue*` heap box, no Perceus drop emission —
+    raw scalars have no rc. Mirror of the C backend's
+    `kair_<name>` convention; the raw register is the LLVM SSA
+    name (`%t<N>`), so no `kair_` prefix is needed in IR.
+  - **#3 — `llvm_emit_binop_typed` MUnboxed branch.** Reached
+    via the top-level mode dispatcher. The raw path
+    (`llvm_emit_binop_raw`) emits native LLVM `add` / `sub` /
+    `mul` / `sdiv` / `srem i64`, `fadd` / `fsub` / `fmul` /
+    `fdiv` / `frem double`, signed `icmp` (`slt` / `sgt` /
+    `sle` / `sge` / `eq` / `ne`) and ordered `fcmp` (`olt` /
+    `ogt` / `ole` / `oge` / `oeq` / `one`), plus bitwise `and
+    i32` / `or i32` for `and` / `or` (raw-bool operands are
+    normalised 0/1 with no side effects, so eager evaluation is
+    observationally identical to short-circuit). The `^` (power)
+    and `//` (integer div) ops stay boxed per `decide_mode`'s
+    exclusion (issue #90's territory).
+  - **#4 — `llvm_emit_match` fast path.** Mirrors C's
+    `emit_match_switch`: when `scr.mode = MUnboxed`,
+    `ty_is_integral_raw(scr.ty)`, and `arms_all_literal_or_wild`,
+    lower to an LLVM `switch` on the raw scalar with a
+    per-literal-arm basic block and a default block (wildcard
+    body or `kaix_match_panic` + `unreachable`). The PBind
+    catch-all limitation from issue #91 carries over — a match
+    binding the scrutinee falls into the boxed path. Real
+    scrutinee re-boxes at the boundary because LLVM `switch`
+    requires an integer operand.
+  - **#5 — Perceus coordination contract.** Read-only — the
+    LLVM backend reads the post-`pcs_rewrite_*` tree, raw
+    locals already have their `__perceus_dup` / `__perceus_drop`
+    skipped by the rewrite pass. No LLVM-side perceus change
+    needed; the IR dump of `pure_chain` in the bench fixture
+    confirms (no `kaix_internal_dup` / `_drop` inside the raw
+    chain).
+  - **Runtime helpers — `kaix_to_int` / `_to_bool` / `_to_real`
+    / `_to_char`.** Borrowing readers in `stage0/runtime_llvm.c`
+    that mirror the C backend's `(boxed)->as.i` field reads.
+    Used at the MBoxed → MUnboxed defensive fallback in
+    `llvm_emit_expr_raw`. Non-decref'ing — the boxed value's
+    lifetime is the caller's responsibility, mirroring the C
+    backend's `->as.*` borrow semantics.
+  - **Acceptance fixture — `test-unbox-llvm-bench` in
+    `stage2/Makefile`.** Compiles `examples/perceus/unbox_bench.kai`
+    through `--emit=llvm`, links the IR via clang + the LLVM
+    runtime shim (proves the IR is well-formed), and greps the
+    emitted IR for raw arithmetic inside `pure_chain`: `add` /
+    `mul` / `sub` / `srem i64` must appear, no boxed `kaix_add`
+    / `sub` / `mul` / `mod` may survive, and at most one
+    `kaix_int` call (the boundary box of the chain's final
+    value before `ret`) is allowed. Wired into both `test`
+    (stage 2 tier 1 gate) and `test-fast`. The pre-fix IR for
+    `pure_chain` was 50 boxed `kaix_*` calls; the post-fix IR
+    is 49 raw `i64` ops + one `kaix_int` boundary box. PR #66
+    / R9 is the precedent for a fixture that fails without the
+    fix. Build-only — the bench's outer driver
+    `bench_loop(1_000_000, 0)` requires self-tail-call
+    optimization (the C backend has it via PR #121's
+    `_kai_bench_loop_entry:` + `goto`, the LLVM backend does
+    not yet — separate follow-up). Running the LLVM binary
+    would stack-overflow at ~50 k frames; the IR-shape +
+    link-only checks document what #87 actually fixes without
+    conflating with that follow-up.
+  - **Selfhost-LLVM contract.** `make -C stage2 selfhost-llvm`
+    stays byte-identical at the fixed-point level — kaic2
+    compiled via `--emit=llvm` compiles `compiler.kai` and
+    produces an IR that recompiles itself byte-identically. The
+    LLVM emitter remains a pure function of the typed AST.
 - **Signal effect — POSIX SIGINT/SIGTERM trap for graceful
   shutdown (issue #107).** Adds the upstream gap that blocked
   lnds/ahu's `run_app` Tongariki lane and lnds/manutara's Ctrl-C
