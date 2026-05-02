@@ -11,6 +11,48 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Fixed
 
+- **Runtime symbol shadowing — kaikai user fns named after
+  runtime arithmetic / comparison helpers no longer collide
+  (issue #78, mvp-blocker).** Pre-fix the C name-mangler emitted
+  `kai_<user_fn>` for top-level kaikai fns, which overlapped the
+  runtime helper namespace defined in `stage0/runtime.h`
+  (`kai_add` / `kai_sub` / `kai_mul` / `kai_div` / `kai_idiv` /
+  `kai_mod` / `kai_neg` / `kai_pow_int` / `kai_lt` / `kai_gt` /
+  `kai_le` / `kai_ge` / `kai_eq` / `kai_eq_v` / `kai_ne_v` /
+  `kai_boolnot` / `kai_truthy` / `kai_field` /
+  `kai_field_borrow`). Legitimate code like
+  `fn add(x: Int, y: Int) : Int = x + y` failed at the C link
+  step with a duplicate-symbol error that did not point back at
+  the kaikai source — Tier 1 #1 (safe at compile time) took the
+  asterisk.
+  - Fix renames the 19 colliding runtime helpers to the
+    `kai_op_*` prefix so the `kai_<user_fn>` namespace is
+    structurally collision-free. Touches `stage0/runtime.h`
+    (definitions + internal call sites), `stage0/runtime_llvm.c`
+    (`kaix_*` LLVM-visible wrappers re-route to the new names;
+    the externally-linkable `kaix_*` symbols themselves are
+    unchanged), `stage0/emit.c` + `stage1/compiler.kai` +
+    `stage2/compiler.kai` (binop / unop / pattern-test emit
+    sites), `stage2/Makefile` (unbox phase 2 structural greps),
+    and the documentation comments in `examples/perceus/` /
+    `examples/effects/` / `stdlib/protocols.kai` that mentioned
+    the helpers by name.
+  - Selfhost + selfhost-llvm fixed-point byte-identical: kaic1
+    (built with the new emit) compiles `compiler.kai` and emits
+    the new symbols; kaic2 recompiles itself and the result is
+    bit-for-bit identical. The runtime header rename + emitter
+    rename land in the same commit, so the bootstrap chain is
+    consistent at every step.
+  - Regression fixture
+    `examples/effects/issue_78_runtime_name_shadow.kai` (wired
+    into `make tier1` via `stage2/Makefile`'s
+    `test-runtime-shadow` target and into `make tier1-asan` via
+    `test-runtime-shadow-asan`) defines user fns for every
+    previously-colliding name (arithmetic + comparison +
+    boolean) and asserts the program compiles, links, and
+    produces the expected output. Any future regression of the
+    same shape now produces a deterministic diff instead of a
+    cc-time link error.
 - **R12 — TCO emit pass produced malformed C for zero-arg
   recursive functions (issue #102, mvp-blocker).** A function with
   no parameters whose body had a self-tail-call emitted
