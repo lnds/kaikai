@@ -337,7 +337,7 @@ on sum types (m12.8.x); the gap remaining is records with `Show` /
 `Eq` / `Hash` annotations referencing missing field impls — those still
 fall through to the dispatcher's runtime `panic`. Tightening that
 case to a compile-time error is a follow-up captured in
-`docs/m12.8-followup.md`.
+`docs/m12.8-followup.md` (retired 2026-05-02; see git history).
 
 ## Composition with other features
 
