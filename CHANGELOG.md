@@ -33,6 +33,38 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   `stdlib/trace.kai::with_log_prefix`. Issue #61 stays open; this
   doc is the input to the fix lane.
 
+### Fixed
+
+- **R9 / issue #60 — handler clause bodies can now capture
+  parameters of the enclosing fn.** Pre-fix, every clause body
+  was emitted as a top-level C function whose only inputs were
+  `(*EvE self, op_args..., k)`; any reference to a binding from
+  the surrounding scope expanded to an undeclared `kai_<name>`
+  and `cc` rejected the emitted C. Captures are detected at
+  collect time (`fv_expr` over each clause body, treating the
+  clause's own params plus `state` / `log` as bound), unioned per
+  handle, and threaded through a generated env struct allocated
+  on the install-site stmt-expression frame. The clause prologue
+  reads each `kai_<name>` back from
+  `((env *) self->env)->kai_<name>` via `kai_internal_dup` — the
+  dup keeps perceus's per-clause refcount accounting valid across
+  multiple clause invocations without changing the borrow
+  semantics of the env channel (scoped to the handle
+  stmt-expression and dropped in the surrounding fn's perceus
+  epilogue). Fixture at `examples/effects/r9_clause_capture.kai`
+  covers a single capture (`make_logger(prefix, ...)`) and a
+  multi-capture union (`make_tagged_logger(tag, level, ...)`);
+  the diff against `r9_clause_capture.out.expected` catches the
+  early-draft RC bug where the missing per-clause dup freed
+  captured strings after the first invocation. C backend only —
+  the LLVM clause body (`llvm_emit_clause_body`) still ignores
+  the new captures field, the same R9 symptom reproduces under
+  `--emit=llvm`, mirror is a follow-up. `stdlib/trace.kai`'s
+  `with_log_prefix` workaround (threading `prefix` through a
+  `TracePrefix[String]` state slot) is now structurally
+  unnecessary; left in place this lane per the brief — a
+  follow-up can delete it.
+
 ### Changed
 
 - **`CLAUDE.md` — lane handoff (push + PR) is authorized for
