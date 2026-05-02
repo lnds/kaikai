@@ -19,16 +19,11 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   `3909c71` — only the refinement-side syntax remains).
   `docs/unboxing-phase2-followup.md` updated: Real (`double`)
   unboxing landed in `a6f4295` and is no longer Phase 3.
-- **Prelude audit relocated; m12.8 follow-up doc retired.** The
-  post-Core ergonomic-tightening candidate list moved out of the
-  m12.8 follow-up tracking into a dedicated `docs/prelude-audit.md`,
-  since those candidates (redundant `string_concat` /
-  `array_make` / `int_to_string` / etc.) outlive the m12.8 lane
-  scope. The m12.8 follow-up doc itself is retired (all 8 bugs +
-  Gap 1 fixed end-to-end, post-Core REOPEN closed); 13
-  cross-references across `stage2-design.md`, `protocols.md`, and
-  three `lane-experience-m12.8*.md` files reworded to point to
-  the closed m12.8 lane by name rather than by path.
+- **Prelude audit relocated.** The post-Core ergonomic-tightening
+  candidate list moved out of `docs/m12.8-followup.md` into a
+  dedicated `docs/prelude-audit.md`, since those candidates
+  (redundant `string_concat` / `array_make` / `int_to_string` /
+  etc.) outlive the m12.8 lane scope.
 
 ## [0.31.1] — 2026-05-02 (R10/R11 fix — single-state-read UAF closed)
 

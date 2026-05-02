@@ -336,10 +336,8 @@ The same kind of validation runs for `#derive(Eq)` and `#derive(Hash)`
 on sum types (m12.8.x); the gap remaining is records with `Show` /
 `Eq` / `Hash` annotations referencing missing field impls — those still
 fall through to the dispatcher's runtime `panic`. Tightening that
-case to a compile-time error is an open follow-up: the
-`validate_resolved_protocols` walker landed in m12.8.x covers
-top-level missing-impl calls, but does not yet recurse through
-record-field references inside `#derive`-synthesised impl bodies.
+case to a compile-time error is a follow-up captured in
+`docs/m12.8-followup.md`.
 
 ## Composition with other features
 

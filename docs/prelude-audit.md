@@ -5,11 +5,10 @@ features that subsume them are stable. **Not bug fixes** — these
 are candidates for removal or deprecation when the surface area
 of the prelude is audited as a single lane.
 
-Originated as the `## Possible audit` section of the m12.8
-follow-up tracking, relocated here 2026-05-02 so it stops
+Originated as the `## Possible audit` section of
+`docs/m12.8-followup.md`, relocated here 2026-05-02 so it stops
 masquerading as m12.8 deferred work — the m12.8 lane is closed
-end-to-end and these candidates outlive its scope. The original
-follow-up doc was retired in the same change.
+end-to-end and these candidates outlive its scope.
 
 ## Candidates
 
