@@ -1991,6 +1991,25 @@ test-unbox-phase2: $(TARGET) build
 	@if grep -E 'kai_cond_inner_loop_real\(void\) \{[^}]*kai_eq_v\(' build/perceus-unbox_phase2_cond_real.c; then \
 	  echo "unbox FAIL cond_real (kai_eq_v survived inside body)"; exit 1; \
 	fi
+	@# Issue #94 / R8 — let-bound Int referenced through a `#{...}`
+	@# interpolation slot must NOT collapse to raw `int64_t kair_n`,
+	@# because emit re-parses the segment without consulting the unbox
+	@# alias map and would emit `kai_n` (boxed). The unbox_stmt SLet
+	@# branch demotes such bindings to MBoxed; the fixture's run output
+	@# must match `unbox_phase2_r8_let_in_interp.out.expected`, and the
+	@# binding must surface as `KaiValue *kai_n`.
+	@diff -q ../examples/perceus/unbox_phase2_r8_let_in_interp.out.expected \
+	        build/perceus-unbox_phase2_r8_let_in_interp.out > /dev/null \
+	  || { echo "unbox FAIL r8_let_in_interp (output mismatch)"; \
+	       diff ../examples/perceus/unbox_phase2_r8_let_in_interp.out.expected \
+	            build/perceus-unbox_phase2_r8_let_in_interp.out; exit 1; }
+	@grep -F -q 'KaiValue *kai_n = kai_int(42LL)' \
+	        build/perceus-unbox_phase2_r8_let_in_interp.c \
+	  || { echo "unbox FAIL r8_let_in_interp (kai_n not boxed — bug returned?)"; exit 1; }
+	@if grep -F -q 'int64_t kair_n' \
+	        build/perceus-unbox_phase2_r8_let_in_interp.c; then \
+	  echo "unbox FAIL r8_let_in_interp (raw kair_n survived; demote did not fire)"; exit 1; \
+	fi
 	@echo "unbox phase2 OK"
 
 # Issue #37 — verify the C emitter rewrites self-tail-calls into

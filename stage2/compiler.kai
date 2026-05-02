@@ -24987,6 +24987,17 @@ fn unbox_stmt(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind]) : UbStm
             if name_captured_in_block(rest, tail, nm) {
               let rhs_box = expr_to_boxed(rhs1)
               UbStmt(SLet(pat, ann, rhs_box), env)
+            }
+            # Issue #94 / R8: emit re-parses `#{...}` interp segments at
+            # codegen time without consulting this pass's alias map, so
+            # an EVar(nm) inside an interp slot would resolve via
+            # `emit_ident_value` to `kai_<nm>` — the boxed alias the
+            # MUnboxed branch never produces (it produces `kair_<nm>`
+            # instead). Demote the binding to MBoxed so the read site
+            # finds an actual `KaiValue *kai_<nm>` in scope.
+            else if name_in_interp_in_block(rest, tail, nm) {
+              let rhs_box = expr_to_boxed(rhs1)
+              UbStmt(SLet(pat, ann, rhs_box), env)
             } else {
               UbStmt(SLet(pat, ann, rhs1), [LB(nm, MUnboxed), ...env])
             }
@@ -25057,6 +25068,176 @@ fn uses_have_in_lam(uses: [Use], nm: String) : Bool {
     [u, ...rest] -> match u {
       U(n, _, _, in_lam) ->
         if n == nm and in_lam { true } else { uses_have_in_lam(rest, nm) }
+    }
+  }
+}
+
+# Issue #94 / R8 — true if `nm` appears as a free-var reference inside
+# any `#{...}` interpolation slot reachable from the remainder of the
+# block. The unbox_stmt SLet branch consults this to keep let-bindings
+# boxed when their only escape route lands in an EStr interp segment;
+# `emit_string_expr` re-parses those segments at codegen time and has
+# no awareness of this pass's alias map (`kair_<nm>` for MUnboxed,
+# `kai_<nm>` for MBoxed), so a raw read would surface as undeclared
+# `kai_<nm>` in the generated C.
+fn name_in_interp_in_block(rest: [Stmt], opt_tail: Option[Expr],
+                            nm: String) : Bool {
+  if any_stmt_has_interp_use(rest, nm) { true }
+  else { match opt_tail {
+    None -> false
+    Some(e) -> expr_has_interp_use(e, nm)
+  } }
+}
+
+fn any_stmt_has_interp_use(stmts: [Stmt], nm: String) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> if stmt_has_interp_use(s, nm) { true }
+                    else { any_stmt_has_interp_use(rest, nm) }
+  }
+}
+
+fn stmt_has_interp_use(s: Stmt, nm: String) : Bool {
+  match s {
+    SLet(_, _, rhs)        -> expr_has_interp_use(rhs, nm)
+    SVar(_, _, rhs, _, _)  -> expr_has_interp_use(rhs, nm)
+    SAssert(c, opt_m)      -> {
+      if expr_has_interp_use(c, nm) { true }
+      else { match opt_m {
+        None -> false
+        Some(m) -> expr_has_interp_use(m, nm)
+      } }
+    }
+    SExprStmt(e)           -> expr_has_interp_use(e, nm)
+    SIndexAssign(b, i, v, _, _) ->
+      expr_has_interp_use(b, nm) or
+      expr_has_interp_use(i, nm) or
+      expr_has_interp_use(v, nm)
+    SUse(_, _, _)          -> false
+  }
+}
+
+fn expr_has_interp_use(e: Expr, nm: String) : Bool =
+  kind_has_interp_use(e.kind, nm)
+
+fn opt_expr_has_interp_use(opt: Option[Expr], nm: String) : Bool {
+  match opt {
+    None -> false
+    Some(e) -> expr_has_interp_use(e, nm)
+  }
+}
+
+fn kind_has_interp_use(k: ExprKind, nm: String) : Bool {
+  match k {
+    EStr(span, is_triple) ->
+      uses_have_name(scan_uses_in_interp(span, is_triple, false), nm)
+    ECall(f, xs) -> {
+      if expr_has_interp_use(f, nm) { true }
+      else { exprs_have_interp_use(xs, nm) }
+    }
+    EField(x, _)     -> expr_has_interp_use(x, nm)
+    EIndex(x, i)     -> expr_has_interp_use(x, nm) or expr_has_interp_use(i, nm)
+    EBinop(_, l, r)  -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
+    EUnop(_, x)      -> expr_has_interp_use(x, nm)
+    EIf(c, t, opt_e) ->
+      expr_has_interp_use(c, nm) or
+      expr_has_interp_use(t, nm) or
+      opt_expr_has_interp_use(opt_e, nm)
+    EMatch(s, arms)  ->
+      expr_has_interp_use(s, nm) or arms_have_interp_use(arms, nm)
+    ELambda(_, body) -> expr_has_interp_use(body, nm)
+    ERecordLit(_, fis) -> field_inits_have_interp_use(fis, nm)
+    EList(elems)     -> list_elems_have_interp_use(elems, nm)
+    ERange(lo, hi, opt_by) ->
+      expr_has_interp_use(lo, nm) or
+      expr_has_interp_use(hi, nm) or
+      opt_expr_has_interp_use(opt_by, nm)
+    EBlock(stmts, opt_tail) ->
+      any_stmt_has_interp_use(stmts, nm) or
+      opt_expr_has_interp_use(opt_tail, nm)
+    EPipe(l, r)      -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      if expr_has_interp_use(body, nm) { true }
+      else if opt_expr_has_interp_use(init_opt, nm) { true }
+      else if clauses_have_interp_use(clauses, nm) { true }
+      else { match ret_opt {
+        None -> false
+        Some(hr) -> match hr {
+          HR(_, body2, _, _) -> expr_has_interp_use(body2, nm)
+        }
+      } }
+    }
+    ELitUnit(inner, _) -> expr_has_interp_use(inner, nm)
+    EBang(inner)       -> expr_has_interp_use(inner, nm)
+    _ -> false
+  }
+}
+
+fn exprs_have_interp_use(es: [Expr], nm: String) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if expr_has_interp_use(h, nm) { true }
+                    else { exprs_have_interp_use(rest, nm) }
+  }
+}
+
+fn arms_have_interp_use(arms: [Arm], nm: String) : Bool {
+  match arms {
+    [] -> false
+    [h, ...rest] -> match h {
+      Arm(_, opt_g, body) -> {
+        let g_hit = match opt_g {
+          None -> false
+          Some(g) -> expr_has_interp_use(g, nm)
+        }
+        if g_hit { true }
+        else if expr_has_interp_use(body, nm) { true }
+        else { arms_have_interp_use(rest, nm) }
+      }
+    }
+  }
+}
+
+fn field_inits_have_interp_use(fis: [FieldInit], nm: String) : Bool {
+  match fis {
+    [] -> false
+    [h, ...rest] -> match h {
+      FI(_, e) -> if expr_has_interp_use(e, nm) { true }
+                  else { field_inits_have_interp_use(rest, nm) }
+    }
+  }
+}
+
+fn list_elems_have_interp_use(es: [ListElem], nm: String) : Bool {
+  match es {
+    [] -> false
+    [el, ...rest] -> {
+      let hit = match el {
+        ElPlain(x)  -> expr_has_interp_use(x, nm)
+        ElSpread(x) -> expr_has_interp_use(x, nm)
+      }
+      if hit { true } else { list_elems_have_interp_use(rest, nm) }
+    }
+  }
+}
+
+fn clauses_have_interp_use(cs: [HClause], nm: String) : Bool {
+  match cs {
+    [] -> false
+    [h, ...rest] -> match h {
+      HC(_, _, body, _, _) ->
+        if expr_has_interp_use(body, nm) { true }
+        else { clauses_have_interp_use(rest, nm) }
+    }
+  }
+}
+
+fn uses_have_name(uses: [Use], nm: String) : Bool {
+  match uses {
+    [] -> false
+    [u, ...rest] -> match u {
+      U(n, _, _, _) ->
+        if n == nm { true } else { uses_have_name(rest, nm) }
     }
   }
 }
