@@ -32,6 +32,31 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   (positive, recursive sum traverses + terminates without false
   positive). The pre-existing `m8x_6_*` fixtures continue to fire
   via the `HBDirect` path (no behavioural regression).
+- **Per-op ROW generics on the four Spawn ops (issue #72).**
+  `add_effect_op_sigs_loop` now collects op-level row variables
+  from `ROpen` tails inside parameter and return types — the
+  `mk_rvbinds_from` analog of `mk_tpbinds_from` — and quantifies
+  the op's scheme over them. `builtin_spawn_decl` declares
+  `spawn`'s thunk as the proper `() -> T / e` shape rather than
+  the previous `Nothing` (TyAny) absorption, so per-op row
+  polymorphism is now first-class on the canonical
+  `Spawn.spawn[T, e]` entry point. The wrappers in
+  `stdlib/spawn.kai` are now one-line aliases retained only to
+  keep `fiber_spawn` and friends compiling for in-tree fixtures
+  and demos.
+  - `examples/effects/m8_spawn_per_op_row_generics.kai` — positive
+    end-to-end fixture: a `Stdout`-performing thunk passed
+    directly to `Spawn.spawn` runs under the inferred-main row's
+    auto-installed `Stdout` handler.
+  - `examples/effects/m8_spawn_row_mismatch.kai` — negative
+    fixture: passing a non-thunk to `Spawn.spawn` produces a
+    function-shape diagnostic with the per-op row variable
+    rendered (`expected: (() -> ?t / ?e) -> Fiber[?t]`), which
+    the previous TyAny-erased shape silently accepted.
+  - Closes the last typer-side residual from
+    `docs/fibers-honesty-targets.md` §*Residual m8.x items* item 2
+    and Doc C §*Per-op type generics*'s "Spawn API cleanup"
+    follow-up.
 
 ### Deferred
 

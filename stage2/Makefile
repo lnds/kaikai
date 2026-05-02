@@ -1239,6 +1239,28 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (per-op [T] flows through Spawn.spawn / await / select / cancel)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
 	done; \
+	for f in ../examples/effects/m8_spawn_per_op_row_generics.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  grep -q "^inside thunk$$" build/s2-$$name.out \
+	    && grep -q "^42$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (per-op [T, e] row flows through Spawn.spawn directly)" \
+	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m8_spawn_row_mismatch.kai; do \
+	  name=$$(basename $$f .kai); \
+	  if ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err; then \
+	    echo "effects FAIL $$name (typer accepted Int as a thunk)"; exit 1; \
+	  fi; \
+	  grep -q "() -> " build/s2-$$name.err \
+	    && echo "effects OK $$name (Spawn.spawn requires a thunk; per-op [T, e] surface rejects bare Int)" \
+	    || { echo "effects FAIL $$name (no thunk-shape diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
 	for f in ../examples/effects/m8_monitor.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \

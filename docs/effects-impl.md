@@ -1063,18 +1063,21 @@ bare and `Mutable.*` paths share the runtime, so the
 distinction is purely surface; pinned in `docs/effects-stdlib.md`
 §`Mutable` §*Migration plan*.
 
-What's still open in this section is the *next* per-op
-generics consumer:
-
-- **Spawn API cleanup** (`docs/fibers-honesty-targets.md`
-  §*Residual m8.x items* — per-op ROW generics on Spawn):
-  `builtin_spawn_decl` still uses `Nothing → TyAny` for the
-  thunk and the result. Migrating to `spawn[T, e]` per Doc B
-  would need *per-op row* generics that Doc C explicitly leaves
-  out of scope; the path forward is either (a) per-op row poly
-  (a separate spec lane) or (b) accept the typed wrappers in
-  `stdlib/spawn.kai` as the canonical user surface and leave
-  the effect declaration TyAny-erased. No decision yet.
+**Spawn API cleanup landed 2026-05-02 (issue #72).** The four
+Fiber-shaped Spawn ops now carry per-op `[T, e]` directly:
+`spawn[T](thunk: () -> T / e) : Fiber[T]` is the canonical entry
+point. Implementation: `add_effect_op_sigs_loop` collects op-level
+row-variable names from `ROpen` tails inside parameter and return
+types (mirroring `collect_decl_rvars` for fns) and quantifies the
+op's scheme over them via `mk_rvbinds_from` — the row-bind analog
+of `mk_tpbinds_from`. `builtin_spawn_decl`'s thunk parameter
+became the proper `() -> T / e` shape; the wrappers in
+`stdlib/spawn.kai` reduce to one-line aliases retained for
+in-tree compatibility (`fiber_spawn[T, e](f) = Spawn.spawn(f)`).
+Coverage: `examples/effects/m8_spawn_per_op_row_generics.kai`
+(positive end-to-end) and `examples/effects/m8_spawn_row_mismatch.kai`
+(negative — non-thunk argument is rejected with the per-op row
+variable rendered in the diagnostic).
 
 The historical work plan from when m7b #2 was *Pending* is
 preserved below for posterity.
