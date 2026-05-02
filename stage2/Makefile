@@ -1781,6 +1781,45 @@ test-unbox-phase2: $(TARGET) build
 	@if grep -E 'kai_classify_raw\(void\) \{[^}]*kai_decref\(_scr\)' build/perceus-unbox_phase2_match.c; then \
 	  echo "unbox FAIL match (boxed _scr alias survived)"; exit 1; \
 	fi
+	@# Tongariki Real-unboxing — arith fixture. The chain must lower
+	@# to raw `double kair_*` locals with no `kai_add(` / `kai_mul(` /
+	@# `kai_sub(` / `kai_div(` survival inside the body. The single
+	@# `kai_real(` call is the boundary wrap on the return value.
+	@grep -F -q 'double kair_a' build/perceus-unbox_phase2_arith_real.c \
+	  || { echo "unbox FAIL arith_real (kair_a not raw double)"; exit 1; }
+	@grep -F -q 'double kair_s' build/perceus-unbox_phase2_arith_real.c \
+	  || { echo "unbox FAIL arith_real (kair_s not raw double)"; exit 1; }
+	@if grep -E 'kai_arith_inner_loop_real\(void\) \{[^}]*kai_add\(' build/perceus-unbox_phase2_arith_real.c; then \
+	  echo "unbox FAIL arith_real (kai_add survived inside body)"; exit 1; \
+	fi
+	@if grep -E 'kai_arith_inner_loop_real\(void\) \{[^}]*kai_mul\(' build/perceus-unbox_phase2_arith_real.c; then \
+	  echo "unbox FAIL arith_real (kai_mul survived inside body)"; exit 1; \
+	fi
+	@if grep -E 'kai_arith_inner_loop_real\(void\) \{[^}]*kai_sub\(' build/perceus-unbox_phase2_arith_real.c; then \
+	  echo "unbox FAIL arith_real (kai_sub survived inside body)"; exit 1; \
+	fi
+	@if grep -E 'kai_arith_inner_loop_real\(void\) \{[^}]*kai_div\(' build/perceus-unbox_phase2_arith_real.c; then \
+	  echo "unbox FAIL arith_real (kai_div survived inside body)"; exit 1; \
+	fi
+	@# Tongariki Real-unboxing — cond fixture. Comparisons on `double`
+	@# operands must collapse to native C `<` / `==` / `!=`; the boolean
+	@# results are raw `int kair_<name>`. No `kai_lt(` / `kai_truthy(`
+	@# / `kai_eq_v(` may survive inside the body.
+	@grep -F -q 'double kair_a' build/perceus-unbox_phase2_cond_real.c \
+	  || { echo "unbox FAIL cond_real (kair_a not raw double)"; exit 1; }
+	@grep -F -q 'int kair_big' build/perceus-unbox_phase2_cond_real.c \
+	  || { echo "unbox FAIL cond_real (kair_big not raw)"; exit 1; }
+	@grep -F -q 'int kair_neq' build/perceus-unbox_phase2_cond_real.c \
+	  || { echo "unbox FAIL cond_real (kair_neq not raw)"; exit 1; }
+	@if grep -E 'kai_cond_inner_loop_real\(void\) \{[^}]*kai_lt\(' build/perceus-unbox_phase2_cond_real.c; then \
+	  echo "unbox FAIL cond_real (kai_lt survived inside body)"; exit 1; \
+	fi
+	@if grep -E 'kai_cond_inner_loop_real\(void\) \{[^}]*kai_truthy\(' build/perceus-unbox_phase2_cond_real.c; then \
+	  echo "unbox FAIL cond_real (kai_truthy survived inside body)"; exit 1; \
+	fi
+	@if grep -E 'kai_cond_inner_loop_real\(void\) \{[^}]*kai_eq_v\(' build/perceus-unbox_phase2_cond_real.c; then \
+	  echo "unbox FAIL cond_real (kai_eq_v survived inside body)"; exit 1; \
+	fi
 	@echo "unbox phase2 OK"
 
 # Issue #37 — verify the C emitter rewrites self-tail-calls into
