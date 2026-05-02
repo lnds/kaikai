@@ -14483,6 +14483,1172 @@ fn use_rewrite_decls(decls: [Decl], table: [EffOps], file_opens: [String],
 }
 
 # ====================================================================
+# Cap-binding nursery rewrite (issue #71 option (b) prerequisite, m7b #4)
+# ====================================================================
+#
+# `nursery { n -> ... n.spawn(task) ... n.await(f) ... }` is the
+# canonical form pinned in `docs/structured-concurrency.md` §*Type
+# system* and `docs/syntax-sugars.md` §1. The previous surface
+# `nursery { ... fiber_spawn(task) ... }` had no cap binder, which
+# meant a per-nursery brand had nowhere to attach (PR #74 deferred
+# section). This pass turns the cap-binding form into the runtime-
+# equivalent `nursery { ... Spawn.spawn(task) ... Spawn.await(f) ... }`
+# the typer already accepts:
+#
+#   1. Each `ECall(EVar("nursery"), [..., ELambda([Param(n, ...)], body)])`
+#      mints a fresh BrandId and rewrites the body so every
+#      `EField(EVar(n), op)` whose op is a Spawn primitive becomes
+#      `EField(EVar("Spawn"), op)`. The brand is recorded in a side
+#      registry (`brand_registry` below) keyed by the lambda's
+#      file:line:col so `--dump-brands` and the brand-mismatch
+#      diagnostic can resolve allocation sites.
+#   2. The lambda's `n` parameter is stripped, so the rewritten
+#      lambda is a `() -> T / e` thunk matching the existing
+#      `nursery[T, e](body: () -> T / e + Spawn + Cancel)` signature
+#      in stdlib/spawn.kai. No signature change is needed.
+#   3. Nested nurseries shadow per the innermost cap binder. The
+#      walker tracks a stack of `(name, brand_id)` pairs; the
+#      innermost match wins. Outer caps are still in scope via
+#      capture if the lambda body refers to them by their original
+#      name (which the user's source code reflects).
+#   4. Bodies without a `n -> ` prefix (`nursery { fiber_spawn(...) }`)
+#      pass through untouched — there is no cap binder to rewrite.
+#
+# Shadowing safety: a `let n = ...` inside the body that re-binds
+# the cap name is respected by re-walking with the binder dropped
+# from the stack, mirroring `rewrite_alias_*`'s shadow handling.
+
+# A brand record carries everything `--dump-brands` and the brand-
+# mismatch diagnostic need to surface. `bid` is the unique brand id;
+# `cap_name` is the source-level name the user wrote (`n`, `outer`,
+# etc.); `file/line/col` point at the lambda's `{` token (where the
+# cap binder appears).
+type BrandRec = BR(Int, String, String, Int, Int)
+
+# Per-call attribution: every `n.<op>(args)` rewritten by this pass
+# records its (file, line, col, brand_id, op_name) so the post-rewrite
+# brand-mismatch check (issue #71 option (b)) can tell which scope
+# each call belongs to. The same registry feeds `--dump-brands`.
+type BrandCall = BC(String, Int, Int, Int, String)
+
+# Set of Spawn ops legal on a NurseryCap. Mirrors `builtin_spawn_decl`
+# in this file. Update both lists in lockstep when a new Spawn op
+# lands.
+fn nursery_cap_op_names() : [String] =
+  ["spawn", "await", "select", "cancel", "yield", "set_trap_exit", "cancel_all"]
+
+fn is_nursery_cap_op(name: String) : Bool =
+  list_has(nursery_cap_op_names(), name)
+
+# Stack of active cap binders. Innermost first.
+type NCapStack = NCS([NCapBinding])
+type NCapBinding = NCB(String, Int)   # (cap_name, brand_id)
+
+fn ncs_empty() : NCapStack = NCS([])
+
+fn ncs_push(s: NCapStack, name: String, bid: Int) : NCapStack {
+  match s { NCS(xs) -> NCS([NCB(name, bid), ...xs]) }
+}
+
+# A `let name = ...` (or other binder) that re-binds the cap name
+# shadows the outer entry. Drop the head occurrence of `name`.
+fn ncs_remove(s: NCapStack, name: String) : NCapStack {
+  match s { NCS(xs) -> NCS(ncs_remove_loop(xs, name, [])) }
+}
+
+fn ncs_remove_loop(xs: [NCapBinding], name: String,
+                     acc: [NCapBinding]) : [NCapBinding] {
+  match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      NCB(n, _) ->
+        if n == name { ncs_remove_loop(rest, name, acc) }
+        else        { ncs_remove_loop(rest, name, [h, ...acc]) }
+    }
+  }
+}
+
+fn ncs_remove_all(s: NCapStack, names: [String]) : NCapStack {
+  match names {
+    [] -> s
+    [h, ...rest] -> ncs_remove_all(ncs_remove(s, h), rest)
+  }
+}
+
+# Look up the innermost active brand id for `name`. None when no
+# binding matches.
+fn ncs_lookup(s: NCapStack, name: String) : Option[Int] {
+  match s { NCS(xs) -> ncs_lookup_loop(xs, name) }
+}
+
+fn ncs_lookup_loop(xs: [NCapBinding], name: String) : Option[Int] {
+  match xs {
+    [] -> None
+    [h, ...rest] -> match h {
+      NCB(n, b) -> if n == name { Some(b) } else { ncs_lookup_loop(rest, name) }
+    }
+  }
+}
+
+# The walker threads a brand counter so each visit produces a fresh
+# id. Side-effecting registry accumulation happens by returning the
+# growing list alongside the rewritten expression. `calls` records
+# per-call attributions so the post-rewrite brand-mismatch check can
+# tell which scope each `Spawn.<op>` call originated in.
+type BrandWalk = { bnext: Int, registry: [BrandRec], calls: [BrandCall] }
+
+type BrandAlloc = { bw: BrandWalk, bid: Int }
+
+fn bw_alloc(bw: BrandWalk, name: String, file: String,
+             line: Int, col: Int) : BrandAlloc {
+  let bid = bw.bnext
+  BrandAlloc { bw: BrandWalk { bnext: bid + 1,
+                    registry: [BR(bid, name, file, line, col),
+                                ...bw.registry],
+                    calls: bw.calls },
+                bid: bid }
+}
+
+fn bw_record_call(bw: BrandWalk, file: String, line: Int, col: Int,
+                   bid: Int, op_name: String) : BrandWalk {
+  BrandWalk { bnext: bw.bnext,
+              registry: bw.registry,
+              calls: [BC(file, line, col, bid, op_name), ...bw.calls] }
+}
+
+# Top-level entry. Walks every Decl body and returns the rewritten
+# program plus the brand registry collected during the walk.
+type NurseryRwProgram = { decls: [Decl], brands: [BrandRec], calls: [BrandCall] }
+
+fn rewrite_nursery_caps_decls(decls: [Decl], file: String) : NurseryRwProgram {
+  let bw0 = BrandWalk { bnext: 0, registry: [], calls: [] }
+  let res = rewrite_nursery_caps_loop(decls, file, bw0, [])
+  NurseryRwProgram { decls: res.decls,
+                      brands: list_reverse(res.bw.registry),
+                      calls: list_reverse(res.bw.calls) }
+}
+
+type NurseryRwLoop = { decls: [Decl], bw: BrandWalk }
+
+fn rewrite_nursery_caps_loop(decls: [Decl], file: String, bw: BrandWalk,
+                               acc: [Decl]) : NurseryRwLoop {
+  match decls {
+    [] -> NurseryRwLoop { decls: list_reverse(acc), bw: bw }
+    [d, ...rest] -> {
+      let r = rewrite_nursery_caps_decl(d, file, bw)
+      rewrite_nursery_caps_loop(rest, file, r.bw, [r.decl, ...acc])
+    }
+  }
+}
+
+type NurseryRwDecl = { decl: Decl, bw: BrandWalk }
+
+fn rewrite_nursery_caps_decl(d: Decl, file: String, bw: BrandWalk) : NurseryRwDecl {
+  match d {
+    DFn(p_, n, tps, ps, ret, row, body, l, c, mo) -> {
+      let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
+      NurseryRwDecl { decl: DFn(p_, n, tps, ps, ret, row, r.expr, l, c, mo),
+                       bw: r.bw }
+    }
+    DTest(desc, body, l, c) -> {
+      let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
+      NurseryRwDecl { decl: DTest(desc, r.expr, l, c), bw: r.bw }
+    }
+    DBench(desc, body, l, c) -> {
+      let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
+      NurseryRwDecl { decl: DBench(desc, r.expr, l, c), bw: r.bw }
+    }
+    DCheck(desc, ps, body, l, c) -> {
+      let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
+      NurseryRwDecl { decl: DCheck(desc, ps, r.expr, l, c), bw: r.bw }
+    }
+    DImpl(pname, target, ms, l, c) -> {
+      let rms = rewrite_nursery_caps_loop(ms, file, bw, [])
+      NurseryRwDecl { decl: DImpl(pname, target, rms.decls, l, c),
+                       bw: rms.bw }
+    }
+    DDerive(names, inner, l, c) -> {
+      let r = rewrite_nursery_caps_decl(inner, file, bw)
+      NurseryRwDecl { decl: DDerive(names, r.decl, l, c), bw: r.bw }
+    }
+    _ -> NurseryRwDecl { decl: d, bw: bw }
+  }
+}
+
+type NurseryRwExpr = { expr: Expr, bw: BrandWalk }
+
+fn rewrite_nursery_caps_expr(e: Expr, s: NCapStack, file: String,
+                               bw: BrandWalk) : NurseryRwExpr {
+  let r = rewrite_nursery_caps_kind(e.kind, s, file, bw, e.line, e.col)
+  NurseryRwExpr { expr: Expr { kind: r.kind, line: e.line, col: e.col,
+                                ty: e.ty, mode: e.mode },
+                   bw: r.bw }
+}
+
+type NurseryRwKind = { kind: ExprKind, bw: BrandWalk }
+
+# Rewrite an expression kind. The cap rewrite proper handles three
+# cases: (1) a `nursery` call with a 1-arg trailing lambda (mints a
+# brand and recurses with cap pushed), (2) a `EField(EVar(n), op)`
+# whose `n` matches an active cap and `op` is a Spawn primitive
+# (rewrites to `EField(EVar("Spawn"), op)`), and (3) every other
+# kind, which recurses structurally.
+fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
+                               bw: BrandWalk, line: Int, col: Int) : NurseryRwKind {
+  match k {
+    ECall(callee, args_) -> {
+      # Detect three shapes:
+      #   (a) `nursery { n -> body }` — the cap-binding scope.
+      #   (b) `n.<op>(args)` where `n` is an active cap binder —
+      #       rewrite the callee + record the (line, col, brand) so
+      #       the post-rewrite brand-mismatch check can attribute
+      #       this call to its scope.
+      #   (c) anything else — recurse structurally.
+      match callee.kind {
+        EVar(callee_name) ->
+          if callee_name == "nursery" {
+            rewrite_nursery_call(callee, args_, s, file, bw, line, col)
+          } else {
+            let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
+            let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
+            NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
+          }
+        EField(base, op_name) -> match base.kind {
+          EVar(name) -> {
+            if is_nursery_cap_op(op_name) {
+              match ncs_lookup(s, name) {
+                Some(bid) -> {
+                  # Record this call site's brand attribution.
+                  let bw1 = bw_record_call(bw, file, line, col, bid, op_name)
+                  let ar = rewrite_nursery_caps_exprs(args_, s, file, bw1, [])
+                  let new_callee = mk_expr(
+                    EField(mk_expr(EVar("Spawn"), base.line, base.col), op_name),
+                    callee.line, callee.col)
+                  NurseryRwKind { kind: ECall(new_callee, ar.exprs), bw: ar.bw }
+                }
+                None -> {
+                  let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
+                  let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
+                  NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
+                }
+              }
+            } else {
+              let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
+              let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
+              NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
+            }
+          }
+          _ -> {
+            let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
+            let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
+            NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
+          }
+        }
+        _ -> {
+          let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
+          let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
+          NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
+        }
+      }
+    }
+    EField(base, op_name) -> {
+      # Bare `n.op` (without call): rewrite to `Spawn.op` if `n` is
+      # an active cap. The typer rejects bare effect ops at use
+      # sites, so this branch is mostly defensive; we still rewrite
+      # so the diagnostic surface is consistent.
+      match base.kind {
+        EVar(name) -> {
+          if is_nursery_cap_op(op_name) {
+            match ncs_lookup(s, name) {
+              Some(_) ->
+                NurseryRwKind {
+                  kind: EField(mk_expr(EVar("Spawn"), base.line, base.col), op_name),
+                  bw: bw }
+              None -> {
+                let br = rewrite_nursery_caps_expr(base, s, file, bw)
+                NurseryRwKind { kind: EField(br.expr, op_name), bw: br.bw }
+              }
+            }
+          } else {
+            let br = rewrite_nursery_caps_expr(base, s, file, bw)
+            NurseryRwKind { kind: EField(br.expr, op_name), bw: br.bw }
+          }
+        }
+        _ -> {
+          let br = rewrite_nursery_caps_expr(base, s, file, bw)
+          NurseryRwKind { kind: EField(br.expr, op_name), bw: br.bw }
+        }
+      }
+    }
+    ELambda(ps, body) -> {
+      # Lambda params shadow outer caps with the same name.
+      let pnames = map(ps, (p) => p.pname)
+      let s1 = ncs_remove_all(s, pnames)
+      let r = rewrite_nursery_caps_expr(body, s1, file, bw)
+      NurseryRwKind { kind: ELambda(ps, r.expr), bw: r.bw }
+    }
+    EBlock(stmts, tail) -> {
+      let sr = rewrite_nursery_caps_stmts(stmts, s, file, bw, [])
+      let tr = rewrite_nursery_caps_opt(tail, sr.s, file, sr.bw)
+      NurseryRwKind { kind: EBlock(sr.stmts, tr.expr), bw: tr.bw }
+    }
+    EMatch(scr, arms) -> {
+      let sr = rewrite_nursery_caps_expr(scr, s, file, bw)
+      let ar = rewrite_nursery_caps_arms(arms, s, file, sr.bw, [])
+      NurseryRwKind { kind: EMatch(sr.expr, ar.arms), bw: ar.bw }
+    }
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+      let br = rewrite_nursery_caps_expr(body, s, file, bw)
+      let ir = rewrite_nursery_caps_opt(init_opt, s, file, br.bw)
+      let cr = rewrite_nursery_caps_clauses(clauses, s, file, ir.bw, [])
+      let rr = rewrite_nursery_caps_opt_return(ret_opt, s, file, cr.bw)
+      NurseryRwKind { kind: EHandle(br.expr, eff_name, eff_tyargs,
+                                      ir.expr, alias_opt, cr.clauses, rr.ret),
+                       bw: rr.bw }
+    }
+    # All other composites: fold sub-expressions through map_expr_kind
+    # by hand — but we need to thread `bw`. The simplest path is to
+    # emulate map_expr_kind here for composites that may carry sub-
+    # exprs. We handle them explicitly to keep the brand counter
+    # threaded.
+    EIf(c, t_, eo) -> {
+      let cr = rewrite_nursery_caps_expr(c, s, file, bw)
+      let tr = rewrite_nursery_caps_expr(t_, s, file, cr.bw)
+      let er = rewrite_nursery_caps_opt(eo, s, file, tr.bw)
+      NurseryRwKind { kind: EIf(cr.expr, tr.expr, er.expr), bw: er.bw }
+    }
+    EBinop(op, a, b) -> {
+      let ar = rewrite_nursery_caps_expr(a, s, file, bw)
+      let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
+      NurseryRwKind { kind: EBinop(op, ar.expr, br.expr), bw: br.bw }
+    }
+    EUnop(op, x) -> {
+      let r = rewrite_nursery_caps_expr(x, s, file, bw)
+      NurseryRwKind { kind: EUnop(op, r.expr), bw: r.bw }
+    }
+    EIndex(a, b) -> {
+      let ar = rewrite_nursery_caps_expr(a, s, file, bw)
+      let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
+      NurseryRwKind { kind: EIndex(ar.expr, br.expr), bw: br.bw }
+    }
+    EPipe(a, b) -> {
+      let ar = rewrite_nursery_caps_expr(a, s, file, bw)
+      let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
+      NurseryRwKind { kind: EPipe(ar.expr, br.expr), bw: br.bw }
+    }
+    ERecordLit(name, fs) -> {
+      let r = rewrite_nursery_caps_fields(fs, s, file, bw, [])
+      NurseryRwKind { kind: ERecordLit(name, r.fields), bw: r.bw }
+    }
+    EList(els) -> {
+      let r = rewrite_nursery_caps_elems(els, s, file, bw, [])
+      NurseryRwKind { kind: EList(r.elems), bw: r.bw }
+    }
+    ERange(a, b, opt_step) -> {
+      let ar = rewrite_nursery_caps_expr(a, s, file, bw)
+      let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
+      let stepr = rewrite_nursery_caps_opt(opt_step, s, file, br.bw)
+      NurseryRwKind { kind: ERange(ar.expr, br.expr, stepr.expr), bw: stepr.bw }
+    }
+    ELitUnit(inner, u) -> {
+      let r = rewrite_nursery_caps_expr(inner, s, file, bw)
+      NurseryRwKind { kind: ELitUnit(r.expr, u), bw: r.bw }
+    }
+    EBang(inner) -> {
+      let r = rewrite_nursery_caps_expr(inner, s, file, bw)
+      NurseryRwKind { kind: EBang(r.expr), bw: r.bw }
+    }
+    # Leaves and forms with no sub-Exprs.
+    _ -> NurseryRwKind { kind: k, bw: bw }
+  }
+}
+
+type NurseryRwExprs   = { exprs: [Expr], bw: BrandWalk }
+type NurseryRwOpt     = { expr: Option[Expr], bw: BrandWalk }
+type NurseryRwStmts   = { stmts: [Stmt], s: NCapStack, bw: BrandWalk }
+type NurseryRwArms    = { arms: [Arm], bw: BrandWalk }
+type NurseryRwClauses = { clauses: [HClause], bw: BrandWalk }
+type NurseryRwRet     = { ret: Option[HReturn], bw: BrandWalk }
+type NurseryRwFields  = { fields: [FieldInit], bw: BrandWalk }
+type NurseryRwElems   = { elems: [ListElem], bw: BrandWalk }
+
+fn rewrite_nursery_caps_exprs(es: [Expr], s: NCapStack, file: String,
+                                bw: BrandWalk, acc: [Expr]) : NurseryRwExprs {
+  match es {
+    [] -> NurseryRwExprs { exprs: list_reverse(acc), bw: bw }
+    [h, ...rest] -> {
+      let r = rewrite_nursery_caps_expr(h, s, file, bw)
+      rewrite_nursery_caps_exprs(rest, s, file, r.bw, [r.expr, ...acc])
+    }
+  }
+}
+
+fn rewrite_nursery_caps_opt(opt: Option[Expr], s: NCapStack, file: String,
+                              bw: BrandWalk) : NurseryRwOpt {
+  match opt {
+    None -> NurseryRwOpt { expr: None, bw: bw }
+    Some(e) -> {
+      let r = rewrite_nursery_caps_expr(e, s, file, bw)
+      NurseryRwOpt { expr: Some(r.expr), bw: r.bw }
+    }
+  }
+}
+
+# Statement-list walk. Tracks SLet / SVar bindings to drop them from
+# the cap stack so a re-bind of `n` inside the body shadows.
+fn rewrite_nursery_caps_stmts(ss: [Stmt], s: NCapStack, file: String,
+                                bw: BrandWalk, acc: [Stmt]) : NurseryRwStmts {
+  match ss {
+    [] -> NurseryRwStmts { stmts: list_reverse(acc), s: s, bw: bw }
+    [stmt, ...rest] -> match stmt {
+      SLet(pat, ann, rhs) -> {
+        let r = rewrite_nursery_caps_expr(rhs, s, file, bw)
+        let s1 = ncs_remove_all(s, pat_bindings(pat, []))
+        rewrite_nursery_caps_stmts(rest, s1, file, r.bw, [SLet(pat, ann, r.expr), ...acc])
+      }
+      SVar(n, ty, rhs, l, c) -> {
+        let r = rewrite_nursery_caps_expr(rhs, s, file, bw)
+        let s1 = ncs_remove(s, n)
+        rewrite_nursery_caps_stmts(rest, s1, file, r.bw, [SVar(n, ty, r.expr, l, c), ...acc])
+      }
+      SAssert(c, m) -> {
+        let cr = rewrite_nursery_caps_expr(c, s, file, bw)
+        let mr = rewrite_nursery_caps_opt(m, s, file, cr.bw)
+        rewrite_nursery_caps_stmts(rest, s, file, mr.bw, [SAssert(cr.expr, mr.expr), ...acc])
+      }
+      SExprStmt(x) -> {
+        let r = rewrite_nursery_caps_expr(x, s, file, bw)
+        rewrite_nursery_caps_stmts(rest, s, file, r.bw, [SExprStmt(r.expr), ...acc])
+      }
+      SIndexAssign(b, i, v, l, c) -> {
+        let br = rewrite_nursery_caps_expr(b, s, file, bw)
+        let ir = rewrite_nursery_caps_expr(i, s, file, br.bw)
+        let vr = rewrite_nursery_caps_expr(v, s, file, ir.bw)
+        rewrite_nursery_caps_stmts(rest, s, file, vr.bw,
+          [SIndexAssign(br.expr, ir.expr, vr.expr, l, c), ...acc])
+      }
+      SUse(n, l, c) ->
+        rewrite_nursery_caps_stmts(rest, s, file, bw, [SUse(n, l, c), ...acc])
+    }
+  }
+}
+
+fn rewrite_nursery_caps_arms(arms: [Arm], s: NCapStack, file: String,
+                               bw: BrandWalk, acc: [Arm]) : NurseryRwArms {
+  match arms {
+    [] -> NurseryRwArms { arms: list_reverse(acc), bw: bw }
+    [a, ...rest] -> match a {
+      Arm(p, g, b) -> {
+        let s1 = ncs_remove_all(s, pat_bindings(p, []))
+        let gr = rewrite_nursery_caps_opt(g, s1, file, bw)
+        let br = rewrite_nursery_caps_expr(b, s1, file, gr.bw)
+        rewrite_nursery_caps_arms(rest, s, file, br.bw, [Arm(p, gr.expr, br.expr), ...acc])
+      }
+    }
+  }
+}
+
+fn rewrite_nursery_caps_clauses(cs: [HClause], s: NCapStack, file: String,
+                                  bw: BrandWalk, acc: [HClause]) : NurseryRwClauses {
+  match cs {
+    [] -> NurseryRwClauses { clauses: list_reverse(acc), bw: bw }
+    [c, ...rest] -> match c {
+      HC(n, ps, b, l, co) -> {
+        let pnames = map(ps, (pm) => pm.pname)
+        let s1 = ncs_remove_all(s, pnames)
+        let r = rewrite_nursery_caps_expr(b, s1, file, bw)
+        rewrite_nursery_caps_clauses(rest, s, file, r.bw, [HC(n, ps, r.expr, l, co), ...acc])
+      }
+    }
+  }
+}
+
+fn rewrite_nursery_caps_opt_return(opt: Option[HReturn], s: NCapStack,
+                                     file: String, bw: BrandWalk) : NurseryRwRet {
+  match opt {
+    None -> NurseryRwRet { ret: None, bw: bw }
+    Some(r) -> match r {
+      HR(p, b, l, c) -> {
+        let s1 = ncs_remove(s, p)
+        let br = rewrite_nursery_caps_expr(b, s1, file, bw)
+        NurseryRwRet { ret: Some(HR(p, br.expr, l, c)), bw: br.bw }
+      }
+    }
+  }
+}
+
+fn rewrite_nursery_caps_fields(fs: [FieldInit], s: NCapStack, file: String,
+                                 bw: BrandWalk, acc: [FieldInit]) : NurseryRwFields {
+  match fs {
+    [] -> NurseryRwFields { fields: list_reverse(acc), bw: bw }
+    [f, ...rest] -> match f {
+      FI(n, v) -> {
+        let r = rewrite_nursery_caps_expr(v, s, file, bw)
+        rewrite_nursery_caps_fields(rest, s, file, r.bw, [FI(n, r.expr), ...acc])
+      }
+    }
+  }
+}
+
+fn rewrite_nursery_caps_elems(els: [ListElem], s: NCapStack, file: String,
+                                bw: BrandWalk, acc: [ListElem]) : NurseryRwElems {
+  match els {
+    [] -> NurseryRwElems { elems: list_reverse(acc), bw: bw }
+    [el, ...rest] -> match el {
+      ElPlain(x) -> {
+        let r = rewrite_nursery_caps_expr(x, s, file, bw)
+        rewrite_nursery_caps_elems(rest, s, file, r.bw, [ElPlain(r.expr), ...acc])
+      }
+      ElSpread(x) -> {
+        let r = rewrite_nursery_caps_expr(x, s, file, bw)
+        rewrite_nursery_caps_elems(rest, s, file, r.bw, [ElSpread(r.expr), ...acc])
+      }
+    }
+  }
+}
+
+# `nursery { n -> body }` → mint a brand, push `(n, brand)`, walk
+# body, strip `n` from the lambda. The trailing-lambda parser
+# always leaves the lambda as the LAST argument (per
+# parse_trailing_lambdas), and `nursery` takes only the body, so
+# args is typically `[lam]` — we still loop over args so a future
+# multi-arg `nursery(extra) { n -> body }` form would not silently
+# misbehave.
+fn rewrite_nursery_call(callee: Expr, args_: [Expr], s: NCapStack,
+                          file: String, bw: BrandWalk,
+                          line: Int, col: Int) : NurseryRwKind {
+  let lr = split_last_arg(args_)
+  match lr {
+    NoLast -> {
+      let ar = rewrite_nursery_caps_exprs(args_, s, file, bw, [])
+      NurseryRwKind { kind: ECall(callee, ar.exprs), bw: ar.bw }
+    }
+    HasLast(prefix, last) -> match last.kind {
+      ELambda(ps, body) -> match ps {
+        [p0] -> {
+          let p_name = p0.pname
+          let alloc = bw_alloc(bw, p_name, file, last.line, last.col)
+          let s1 = ncs_push(s, p_name, alloc.bid)
+          let pr = rewrite_nursery_caps_exprs(prefix, s, file, alloc.bw, [])
+          let br = rewrite_nursery_caps_expr(body, s1, file, pr.bw)
+          let stripped_lam = mk_expr(ELambda([], br.expr), last.line, last.col)
+          let new_args = list_append(pr.exprs, [stripped_lam])
+          NurseryRwKind { kind: ECall(callee, new_args), bw: br.bw }
+        }
+        _ -> {
+          let pr = rewrite_nursery_caps_exprs(prefix, s, file, bw, [])
+          let lr2 = rewrite_nursery_caps_expr(last, s, file, pr.bw)
+          NurseryRwKind { kind: ECall(callee, list_append(pr.exprs, [lr2.expr])),
+                           bw: lr2.bw }
+        }
+      }
+      _ -> {
+        let pr = rewrite_nursery_caps_exprs(prefix, s, file, bw, [])
+        let lr2 = rewrite_nursery_caps_expr(last, s, file, pr.bw)
+        NurseryRwKind { kind: ECall(callee, list_append(pr.exprs, [lr2.expr])),
+                         bw: lr2.bw }
+      }
+    }
+  }
+}
+
+type SplitLast = NoLast | HasLast([Expr], Expr)
+
+fn split_last_arg(args_: [Expr]) : SplitLast {
+  match args_ {
+    [] -> NoLast
+    _  -> split_last_loop(args_, [])
+  }
+}
+
+fn split_last_loop(args_: [Expr], acc: [Expr]) : SplitLast {
+  match args_ {
+    [] -> NoLast
+    [h] -> HasLast(list_reverse(acc), h)
+    [h, ...rest] -> split_last_loop(rest, [h, ...acc])
+  }
+}
+
+# ====================================================================
+# Brand-mismatch check (issue #71 option (b))
+# ====================================================================
+#
+# The cap-binding rewrite above tags every `n.<op>(args)` it
+# rewrites with a (file, line, col, brand_id, op_name) entry in
+# `BrandWalk.calls`. This check walks the post-rewrite AST and
+# tracks brand attribution of bindings:
+#
+#   - At each rewritten `Spawn.spawn(...)` call (registered with a
+#     known brand), the result is "branded": when bound by
+#     `let f = <call>`, the binding `f` inherits the brand.
+#   - Brand attribution propagates through `let g = f` chains and
+#     through `let g = some_let_chain_var`.
+#   - At each rewritten `Spawn.await(arg)` / `Spawn.cancel(arg)` /
+#     `Spawn.select(args)`, the arg's brand attribution is checked
+#     against the call's own brand. A mismatch is a sibling-
+#     nursery brand violation (issue #71 option (b)). The
+#     diagnostic includes both brand IDs and where each was
+#     allocated (`nursery { n -> ... }`'s file:line:col), so the
+#     user can trace the breach.
+#
+# Limitations of this lane (documented in the PR body):
+#   - Brand propagation through generic helper fns
+#     (`fn id[T](x: T) : T = x`) is not yet wired through the
+#     typer's TyVarT instantiation; the brief's full
+#     TyBranded(Ty, BrandId) Ty extension would carry brands
+#     through unification automatically. Today the check sees
+#     direct let-chains (`let g = f`); a helper round-trip
+#     strips the brand.
+#   - Escape detection at the nursery boundary (returning a
+#     branded fiber as the body's value) is still served by the
+#     existing `check_no_fiber_escape` walker (PR #74's
+#     option (a) that catches Fiber/Pid in return types and sum
+#     payloads). The "brand outlives its scope" form requires the
+#     same TyBranded threading deferred above.
+#
+# Both gaps are tracked in `docs/fibers-honesty-targets.md`
+# §*Residual m8.x items* item 1.
+
+# Lookup: did this call get rewritten by the cap-binding pass?
+# Returns `Some((bid, op_name))` keyed on (file, line, col).
+fn brand_call_lookup(calls: [BrandCall], file: String,
+                       line: Int, col: Int) : Option[BrandCall] {
+  match calls {
+    [] -> None
+    [c, ...rest] -> match c {
+      BC(cf, cl, cc, _, _) ->
+        if cf == file and cl == line and cc == col { Some(c) }
+        else { brand_call_lookup(rest, file, line, col) }
+    }
+  }
+}
+
+fn brand_rec_lookup(brs: [BrandRec], bid: Int) : Option[BrandRec] {
+  match brs {
+    [] -> None
+    [b, ...rest] -> match b {
+      BR(b_id, _, _, _, _) ->
+        if b_id == bid { Some(b) } else { brand_rec_lookup(rest, bid) }
+    }
+  }
+}
+
+# Brand environment: a list of (binding name, brand id) pairs.
+# Innermost entries first so shadowing works naturally.
+type BrandBinding = BB(String, Int)
+type BrandEnv = BEnv([BrandBinding])
+
+fn benv_empty() : BrandEnv = BEnv([])
+
+fn benv_push(e: BrandEnv, name: String, bid: Int) : BrandEnv {
+  match e { BEnv(xs) -> BEnv([BB(name, bid), ...xs]) }
+}
+
+fn benv_remove(e: BrandEnv, name: String) : BrandEnv {
+  match e { BEnv(xs) -> BEnv(benv_remove_loop(xs, name, [])) }
+}
+
+fn benv_remove_loop(xs: [BrandBinding], name: String,
+                      acc: [BrandBinding]) : [BrandBinding] {
+  match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      BB(n, _) ->
+        if n == name { benv_remove_loop(rest, name, acc) }
+        else        { benv_remove_loop(rest, name, [h, ...acc]) }
+    }
+  }
+}
+
+fn benv_remove_all(e: BrandEnv, names: [String]) : BrandEnv {
+  match names {
+    [] -> e
+    [h, ...rest] -> benv_remove_all(benv_remove(e, h), rest)
+  }
+}
+
+fn benv_lookup(e: BrandEnv, name: String) : Option[Int] {
+  match e { BEnv(xs) -> benv_lookup_loop(xs, name) }
+}
+
+fn benv_lookup_loop(xs: [BrandBinding], name: String) : Option[Int] {
+  match xs {
+    [] -> None
+    [h, ...rest] -> match h {
+      BB(n, b) -> if n == name { Some(b) } else { benv_lookup_loop(rest, name) }
+    }
+  }
+}
+
+# Look up the brand attribution of an expression. Recognises:
+#   - A rewritten `Spawn.spawn(args)` call (looks the call up in
+#     the registry by line:col).
+#   - A bare `EVar(name)` binding (looks `name` up in the env).
+#   - Otherwise the expression has no brand attribution.
+#
+# Returns `Some(bid)` when the brand can be determined statically.
+# The `None` case is intentionally permissive — a fiber that lost
+# its brand through a non-let path (e.g., a list element retrieved
+# by index, a record field) is treated as unbranded for the v1 of
+# this check.
+fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int] {
+  match e.kind {
+    EVar(name) -> benv_lookup(env, name)
+    ECall(callee, _) -> match callee.kind {
+      EField(base, op_name) -> match base.kind {
+        EVar(eff_name) ->
+          if eff_name == "Spawn" and op_name == "spawn" {
+            match brand_call_lookup(calls, "", e.line, e.col) {
+              Some(c) -> match c {
+                BC(_, _, _, bid, _) -> Some(bid)
+              }
+              # The registry stores file as recorded at rewrite. Try
+              # without filtering on file (the brand check runs per
+              # decl, all from the same source file).
+              None -> brand_call_first_at(calls, e.line, e.col)
+            }
+          } else { None }
+        _ -> None
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+# Match a call by (line, col) regardless of file — every call in
+# the registry comes from the file currently being checked.
+fn brand_call_first_at(calls: [BrandCall], line: Int, col: Int) : Option[Int] {
+  match calls {
+    [] -> None
+    [c, ...rest] -> match c {
+      BC(_, cl, cc, bid, _) ->
+        if cl == line and cc == col { Some(bid) }
+        else { brand_call_first_at(rest, line, col) }
+    }
+  }
+}
+
+# Diagnostic emitter. The two sides of the mismatch carry
+# `(brand_id, allocation_site)` so the user can see which two
+# nurseries produced the conflicting brands.
+fn emit_brand_mismatch(file: String, line: Int, col: Int,
+                         expected_bid: Int, found_bid: Int,
+                         brs: [BrandRec], op_name: String) : Unit {
+  diag_error(file, line, col,
+    concat_all(["sibling-nursery brand mismatch on `", op_name,
+                "`: fiber from a different nursery scope"]))
+  match brand_rec_lookup(brs, expected_bid) {
+    Some(b) -> match b {
+      BR(_, name, bf, bl, bc) ->
+        diag_note(concat_all(["expected brand from nursery `",
+                               name, "` at ", bf, ":",
+                               int_to_string(bl), ":",
+                               int_to_string(bc)]))
+    }
+    None -> ()
+  }
+  match brand_rec_lookup(brs, found_bid) {
+    Some(b) -> match b {
+      BR(_, name, bf, bl, bc) ->
+        diag_note(concat_all(["fiber argument carries brand from nursery `",
+                               name, "` at ", bf, ":",
+                               int_to_string(bl), ":",
+                               int_to_string(bc)]))
+    }
+    None -> ()
+  }
+  diag_help("each `n.spawn(...)` returns a Fiber bound to that nursery; pass it only to the same nursery's await/select/cancel — or restructure so the consume site shares the spawn site's `n` cap")
+}
+
+# Top-level entry — one error count for the whole program.
+fn check_nursery_brand_mismatch_decls(ds: [Decl], file: String,
+                                        calls: [BrandCall],
+                                        brs: [BrandRec]) : Int / Console {
+  check_brand_decls_loop(ds, file, calls, brs, 0)
+}
+
+# `--dump-brands`: print the brand registry plus per-call
+# attributions in a deterministic, grep-friendly form. Mirrors
+# `--dump-intervals`'s shape (one record per line, fixed column
+# order) so fixtures can pin the output as a golden file.
+fn dump_brands(brs: [BrandRec], calls: [BrandCall]) : Unit / Console {
+  print("# kaic2 --dump-brands")
+  print("# brand allocations (one per `nursery { n -> ... }` site):")
+  dump_brand_recs(brs)
+  print("# call attributions (one per rewritten `n.<op>` site):")
+  dump_brand_calls(calls)
+}
+
+fn dump_brand_recs(brs: [BrandRec]) : Unit / Console {
+  match brs {
+    [] -> ()
+    [b, ...rest] -> match b {
+      BR(bid, name, file, line, col) -> {
+        print(concat_all(["brand ", int_to_string(bid),
+                            " cap=", name,
+                            " at=", file, ":",
+                            int_to_string(line), ":",
+                            int_to_string(col)]))
+        dump_brand_recs(rest)
+      }
+    }
+  }
+}
+
+fn dump_brand_calls(calls: [BrandCall]) : Unit / Console {
+  match calls {
+    [] -> ()
+    [c, ...rest] -> match c {
+      BC(file, line, col, bid, op_name) -> {
+        print(concat_all(["call op=", op_name,
+                            " brand=", int_to_string(bid),
+                            " at=", file, ":",
+                            int_to_string(line), ":",
+                            int_to_string(col)]))
+        dump_brand_calls(rest)
+      }
+    }
+  }
+}
+
+fn check_brand_decls_loop(ds: [Decl], file: String, calls: [BrandCall],
+                            brs: [BrandRec], errs: Int) : Int / Console {
+  match ds {
+    [] -> errs
+    [d, ...rest] -> {
+      let e1 = check_brand_decl(d, file, calls, brs, errs)
+      check_brand_decls_loop(rest, file, calls, brs, e1)
+    }
+  }
+}
+
+fn check_brand_decl(d: Decl, file: String, calls: [BrandCall],
+                      brs: [BrandRec], errs: Int) : Int / Console {
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) ->
+      check_brand_expr(body, benv_empty(), file, calls, brs, errs)
+    DTest(_, body, _, _) ->
+      check_brand_expr(body, benv_empty(), file, calls, brs, errs)
+    DBench(_, body, _, _) ->
+      check_brand_expr(body, benv_empty(), file, calls, brs, errs)
+    DCheck(_, _, body, _, _) ->
+      check_brand_expr(body, benv_empty(), file, calls, brs, errs)
+    DImpl(_, _, ms, _, _) ->
+      check_brand_decls_loop(ms, file, calls, brs, errs)
+    DDerive(_, inner, _, _) ->
+      check_brand_decl(inner, file, calls, brs, errs)
+    _ -> errs
+  }
+}
+
+fn check_brand_expr(e: Expr, env: BrandEnv, file: String,
+                      calls: [BrandCall], brs: [BrandRec],
+                      errs: Int) : Int / Console {
+  check_brand_kind(e.kind, env, file, calls, brs, errs, e.line, e.col)
+}
+
+fn check_brand_opt(o: Option[Expr], env: BrandEnv, file: String,
+                     calls: [BrandCall], brs: [BrandRec],
+                     errs: Int) : Int / Console {
+  match o {
+    None -> errs
+    Some(e) -> check_brand_expr(e, env, file, calls, brs, errs)
+  }
+}
+
+fn check_brand_exprs(es: [Expr], env: BrandEnv, file: String,
+                       calls: [BrandCall], brs: [BrandRec],
+                       errs: Int) : Int / Console {
+  match es {
+    [] -> errs
+    [h, ...rest] -> {
+      let e1 = check_brand_expr(h, env, file, calls, brs, errs)
+      check_brand_exprs(rest, env, file, calls, brs, e1)
+    }
+  }
+}
+
+fn check_brand_kind(k: ExprKind, env: BrandEnv, file: String,
+                      calls: [BrandCall], brs: [BrandRec],
+                      errs: Int, line: Int, col: Int) : Int / Console {
+  match k {
+    ECall(callee, args_) -> {
+      # Recognise rewritten cap-binding op calls by their registry
+      # entry. For consume ops, cross-check the arg's brand.
+      match brand_call_first_at(calls, line, col) {
+        Some(bid) -> {
+          # Look up the actual op name to pick the right arg index.
+          let op = call_op_name(calls, line, col)
+          let e1 = check_brand_consume(op, args_, bid, env, file, calls, brs, errs)
+          check_brand_exprs(args_, env, file, calls, brs, e1)
+        }
+        None -> {
+          let e1 = check_brand_expr(callee, env, file, calls, brs, errs)
+          check_brand_exprs(args_, env, file, calls, brs, e1)
+        }
+      }
+    }
+    EBlock(stmts, tail) -> {
+      let r = check_brand_stmts(stmts, env, file, calls, brs, errs)
+      check_brand_opt(tail, r.env, file, calls, brs, r.errs)
+    }
+    EMatch(scr, arms) -> {
+      let e1 = check_brand_expr(scr, env, file, calls, brs, errs)
+      check_brand_arms(arms, env, file, calls, brs, e1)
+    }
+    EIf(c, t_, eo) -> {
+      let e1 = check_brand_expr(c, env, file, calls, brs, errs)
+      let e2 = check_brand_expr(t_, env, file, calls, brs, e1)
+      check_brand_opt(eo, env, file, calls, brs, e2)
+    }
+    EBinop(_, a, b) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      check_brand_expr(b, env, file, calls, brs, e1)
+    }
+    EUnop(_, x) -> check_brand_expr(x, env, file, calls, brs, errs)
+    EField(base, _) -> check_brand_expr(base, env, file, calls, brs, errs)
+    EIndex(a, b) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      check_brand_expr(b, env, file, calls, brs, e1)
+    }
+    EPipe(a, b) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      check_brand_expr(b, env, file, calls, brs, e1)
+    }
+    ELambda(ps, body) -> {
+      let pnames = map(ps, (p) => p.pname)
+      check_brand_expr(body, benv_remove_all(env, pnames), file, calls, brs, errs)
+    }
+    ERecordLit(_, fs) -> check_brand_fields(fs, env, file, calls, brs, errs)
+    EList(els) -> check_brand_elems(els, env, file, calls, brs, errs)
+    ERange(a, b, opt_step) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      let e2 = check_brand_expr(b, env, file, calls, brs, e1)
+      check_brand_opt(opt_step, env, file, calls, brs, e2)
+    }
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let e1 = check_brand_expr(body, env, file, calls, brs, errs)
+      let e2 = check_brand_opt(init_opt, env, file, calls, brs, e1)
+      let e3 = check_brand_clauses(clauses, env, file, calls, brs, e2)
+      check_brand_opt_return(ret_opt, env, file, calls, brs, e3)
+    }
+    ELitUnit(inner, _) -> check_brand_expr(inner, env, file, calls, brs, errs)
+    EBang(inner) -> check_brand_expr(inner, env, file, calls, brs, errs)
+    _ -> errs
+  }
+}
+
+fn call_op_name(calls: [BrandCall], line: Int, col: Int) : String {
+  match calls {
+    [] -> ""
+    [c, ...rest] -> match c {
+      BC(_, cl, cc, _, op) ->
+        if cl == line and cc == col { op } else { call_op_name(rest, line, col) }
+    }
+  }
+}
+
+# Consume-op brand check. For await/cancel/select the first arg
+# carries the fiber(s); for the other ops there is nothing to
+# check (spawn produces a brand, set_trap_exit/yield/cancel_all
+# don't take a fiber).
+fn check_brand_consume(op_name: String, args_: [Expr], expected_bid: Int,
+                        env: BrandEnv, file: String, calls: [BrandCall],
+                        brs: [BrandRec], errs: Int) : Int / Console {
+  if op_name == "await" or op_name == "cancel" {
+    match args_ {
+      [arg, ...other_args] -> match expr_brand(arg, env, calls) {
+        Some(found) ->
+          if found == expected_bid { errs }
+          else {
+            emit_brand_mismatch(file, arg.line, arg.col,
+                                  expected_bid, found, brs, op_name)
+            errs + 1
+          }
+        None -> errs
+      }
+      _ -> errs
+    }
+  } else if op_name == "select" {
+    match args_ {
+      [arg, ...other_args] -> match arg.kind {
+        EList(els) -> check_brand_select_elems(els, expected_bid, env, file, calls, brs, errs)
+        _ -> match expr_brand(arg, env, calls) {
+          Some(found) ->
+            if found == expected_bid { errs }
+            else {
+              emit_brand_mismatch(file, arg.line, arg.col,
+                                    expected_bid, found, brs, op_name)
+              errs + 1
+            }
+          None -> errs
+        }
+      }
+      _ -> errs
+    }
+  } else { errs }
+}
+
+fn check_brand_select_elems(els: [ListElem], expected_bid: Int,
+                              env: BrandEnv, file: String,
+                              calls: [BrandCall], brs: [BrandRec],
+                              errs: Int) : Int / Console {
+  match els {
+    [] -> errs
+    [el, ...rest] -> {
+      let e1 = match el {
+        ElPlain(x) -> match expr_brand(x, env, calls) {
+          Some(found) ->
+            if found == expected_bid { errs }
+            else {
+              emit_brand_mismatch(file, x.line, x.col,
+                                    expected_bid, found, brs, "select")
+              errs + 1
+            }
+          None -> errs
+        }
+        ElSpread(_) -> errs
+      }
+      check_brand_select_elems(rest, expected_bid, env, file, calls, brs, e1)
+    }
+  }
+}
+
+# Statement walk. SLet propagates brand attribution from RHS to
+# the bound name when the RHS expression has a brand. Other
+# binders (SVar, lambda params, match patterns) do not carry
+# brands today.
+type BrandStmtsRes = { env: BrandEnv, errs: Int }
+
+fn check_brand_stmts(ss: [Stmt], env: BrandEnv, file: String,
+                       calls: [BrandCall], brs: [BrandRec],
+                       errs: Int) : BrandStmtsRes {
+  match ss {
+    [] -> BrandStmtsRes { env: env, errs: errs }
+    [stmt, ...rest] -> match stmt {
+      SLet(pat, _, rhs) -> {
+        let e1 = check_brand_expr(rhs, env, file, calls, brs, errs)
+        let env1 = bind_brand_pat(pat, rhs, env, calls)
+        check_brand_stmts(rest, env1, file, calls, brs, e1)
+      }
+      SVar(n, _, rhs, _, _) -> {
+        let e1 = check_brand_expr(rhs, env, file, calls, brs, errs)
+        let env1 = benv_remove(env, n)
+        check_brand_stmts(rest, env1, file, calls, brs, e1)
+      }
+      SAssert(c, m) -> {
+        let e1 = check_brand_expr(c, env, file, calls, brs, errs)
+        let e2 = check_brand_opt(m, env, file, calls, brs, e1)
+        check_brand_stmts(rest, env, file, calls, brs, e2)
+      }
+      SExprStmt(x) -> {
+        let e1 = check_brand_expr(x, env, file, calls, brs, errs)
+        check_brand_stmts(rest, env, file, calls, brs, e1)
+      }
+      SIndexAssign(b, i, v, _, _) -> {
+        let e1 = check_brand_expr(b, env, file, calls, brs, errs)
+        let e2 = check_brand_expr(i, env, file, calls, brs, e1)
+        let e3 = check_brand_expr(v, env, file, calls, brs, e2)
+        check_brand_stmts(rest, env, file, calls, brs, e3)
+      }
+      SUse(_, _, _) -> check_brand_stmts(rest, env, file, calls, brs, errs)
+    }
+  }
+}
+
+# Bind a pattern's name(s) with brand attribution lifted from the
+# RHS. Today only PBind directly carries the brand; other patterns
+# strip the brand (matches consumer behaviour).
+fn bind_brand_pat(pat: Pattern, rhs: Expr, env: BrandEnv,
+                    calls: [BrandCall]) : BrandEnv {
+  let names = pat_bindings(pat, [])
+  let env1 = benv_remove_all(env, names)
+  match pat.pkind {
+    PBind(n) -> match expr_brand(rhs, env, calls) {
+      Some(bid) -> benv_push(env1, n, bid)
+      None -> env1
+    }
+    _ -> env1
+  }
+}
+
+fn check_brand_arms(arms: [Arm], env: BrandEnv, file: String,
+                      calls: [BrandCall], brs: [BrandRec],
+                      errs: Int) : Int / Console {
+  match arms {
+    [] -> errs
+    [a, ...rest] -> match a {
+      Arm(p, g, b) -> {
+        let env1 = benv_remove_all(env, pat_bindings(p, []))
+        let e1 = check_brand_opt(g, env1, file, calls, brs, errs)
+        let e2 = check_brand_expr(b, env1, file, calls, brs, e1)
+        check_brand_arms(rest, env, file, calls, brs, e2)
+      }
+    }
+  }
+}
+
+fn check_brand_clauses(cs: [HClause], env: BrandEnv, file: String,
+                        calls: [BrandCall], brs: [BrandRec],
+                        errs: Int) : Int / Console {
+  match cs {
+    [] -> errs
+    [c, ...rest] -> match c {
+      HC(_, ps, b, _, _) -> {
+        let pnames = map(ps, (pm) => pm.pname)
+        let env1 = benv_remove_all(env, pnames)
+        let e1 = check_brand_expr(b, env1, file, calls, brs, errs)
+        check_brand_clauses(rest, env, file, calls, brs, e1)
+      }
+    }
+  }
+}
+
+fn check_brand_opt_return(opt: Option[HReturn], env: BrandEnv, file: String,
+                            calls: [BrandCall], brs: [BrandRec],
+                            errs: Int) : Int / Console {
+  match opt {
+    None -> errs
+    Some(r) -> match r {
+      HR(p, b, _, _) -> {
+        let env1 = benv_remove(env, p)
+        check_brand_expr(b, env1, file, calls, brs, errs)
+      }
+    }
+  }
+}
+
+fn check_brand_fields(fs: [FieldInit], env: BrandEnv, file: String,
+                        calls: [BrandCall], brs: [BrandRec],
+                        errs: Int) : Int / Console {
+  match fs {
+    [] -> errs
+    [f, ...rest] -> match f {
+      FI(_, v) -> {
+        let e1 = check_brand_expr(v, env, file, calls, brs, errs)
+        check_brand_fields(rest, env, file, calls, brs, e1)
+      }
+    }
+  }
+}
+
+fn check_brand_elems(els: [ListElem], env: BrandEnv, file: String,
+                       calls: [BrandCall], brs: [BrandRec],
+                       errs: Int) : Int / Console {
+  match els {
+    [] -> errs
+    [el, ...rest] -> {
+      let e1 = match el {
+        ElPlain(x) -> check_brand_expr(x, env, file, calls, brs, errs)
+        ElSpread(x) -> check_brand_expr(x, env, file, calls, brs, errs)
+      }
+      check_brand_elems(rest, env, file, calls, brs, e1)
+    }
+  }
+}
+
+# ====================================================================
 # m12.8.x phase 2 (Bug 4): lift `"...#{x}..."` interpolation parts
 # into the pre-inference AST so the typer + protocol-call rewrite see
 # them. Without this the interp body is parsed at emit time and
@@ -33500,6 +34666,14 @@ type Mode
   # Debug-only; lets fixtures pin the walker output before the
   # unifier reshape consumes it.
   | MDumpIntervals
+  # Issue #71 option (b): dump the brand registry collected by the
+  # cap-binding nursery rewrite. For each minted brand id prints
+  # the cap binder name and allocation site (file:line:col) plus
+  # the per-call attributions (`Spawn.<op>` calls tagged with the
+  # owning brand). Output is deterministic and grep-friendly,
+  # mirroring `--dump-intervals`. Lets fixtures pin the brand
+  # propagation before the brand-mismatch check consumes it.
+  | MDumpBrands
   # Tongariki: pretty-print the parsed program back as canonical
   # kaikai source. MFmt writes formatted source to stdout; MFmtCheck
   # prints the formatted source if it differs from input (exit 1)
@@ -33558,6 +34732,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MDumpLastUse))
       } else if a == "--dump-intervals" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpIntervals))
+      } else if a == "--dump-brands" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpBrands))
       } else if a == "--holes" {
         parse_cli_loop(more, cli_with_mode(opts, MHoles))
       } else if a == "--holes-json" {
@@ -33627,6 +34803,7 @@ fn usage() : Unit / Console {
   eprint("  --dump-mono-out    list call-site instantiations with planned mangled monomorphic names")
   eprint("  --dump-last-use    list each fn parameter's last-use position (m5 #2 diagnostic)")
   eprint("  --holes            report every typed hole (`?` / `?name`) with expected type + scope")
+  eprint("  --dump-brands      list nursery cap-binding brand allocations + per-call attributions (issue #71 option (b))")
   eprint("  --holes-json       same as --holes, but JSON array for machine consumption")
   eprint("  --effects-json     report per-fn effects + handlers as JSON")
   eprint("  --effect-holes-json  report typed effect-hole resolutions (`?` / `?e` in row tail) as JSON")
@@ -34433,7 +35610,27 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # surfaced from the interpolation desugar above) to
             # `ECall(EVar(NAME), [])`. const_names was collected
             # earlier from DAttribPure-wrapped zero-arg fns.
-            let all_decls = desugar_const_refs_decls(interp_decls, const_names)
+            let const_decls = desugar_const_refs_decls(interp_decls, const_names)
+            # Cap-binding nursery rewrite (m7b #4 prerequisite for
+            # issue #71 option (b)): expand `nursery { n -> body }`
+            # by stripping `n` from the lambda param list and
+            # rewriting `n.<spawn|await|select|cancel|...>` inside
+            # `body` to `Spawn.<op>`. Mints a fresh BrandId per
+            # nursery scope; the resulting `[BrandRec]` is the
+            # registry the typer reads for sibling-nursery
+            # brand-mismatch detection (issue #71 option (b)).
+            let nursery_rw = rewrite_nursery_caps_decls(const_decls, path)
+            let all_decls = nursery_rw.decls
+            let brand_registry = nursery_rw.brands
+            let brand_calls = nursery_rw.calls
+            # Issue #71 option (b): brand-mismatch check on the
+            # post-rewrite AST. Walks every fn body with a brand-
+            # attribution environment (binding name → brand) and
+            # rejects sibling-nursery mismatches at consume sites
+            # (`n.await(f)` / `n.cancel(f)` / `n.select(fs)`) where
+            # `f`'s brand differs from the surrounding scope's.
+            let nursery_brand_errs = check_nursery_brand_mismatch_decls(
+              all_decls, path, brand_calls, brand_registry)
             let proto_reg = lowered.reg
             let proto_errs = lowered.errs
             if alias_res.errs > 0 { alias_res.errs }
@@ -34441,6 +35638,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             else if proto_errs > 0 { proto_errs }
             else if import_hole_errs > 0 { import_hole_errs }
             else if pred_errs > 0 { pred_errs }
+            else if nursery_brand_errs > 0 { nursery_brand_errs }
             else {
             match mode {
               MAst -> { dump_program(raw_decls); 0 }
@@ -34470,6 +35668,13 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               MDumpIntervals -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_intervals(path, all_decls) }
+              }
+              MDumpBrands -> {
+                # No type-check needed: the brand registry is collected
+                # at the cap-binding rewrite, before inference. Emit the
+                # registry directly and exit 0 so fixtures can pin the
+                # output as a golden file.
+                dump_brands(brand_registry, brand_calls); 0
               }
               MHoles -> {
                 let chk = check_program(path, all_decls)
