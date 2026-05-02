@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.32.0] — 2026-05-02 (Tongariki Wave 3 closed — m8.x docs alignment + follow-up tracker refresh)
+
 ### Added
 
 - **`examples/effects/m8x_4_request_reply.kai` — two-actor
