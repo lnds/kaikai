@@ -20,6 +20,9 @@
  * a stub return value would mismatch.
  */
 
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
+
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
