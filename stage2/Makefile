@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco test-tco-regression selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco test-tco-regression test-trace selfhost
 
 all: $(TARGET)
 
@@ -420,6 +420,20 @@ test-writer: $(TARGET) build
 	diff -q ../examples/writer/main.out.expected build/writer.out > /dev/null \
 	  && echo "writer OK" \
 	  || { echo "writer DIFF"; diff ../examples/writer/main.out.expected build/writer.out; exit 1; }
+
+# stdlib/trace.kai smoke test — exercises the user-defined `Trace`
+# effect with the default handler `with_trace_default`. Two worker fns
+# emit `log` and `checkpoint` ops; the handler turns them into
+# `[trace] ...` lines on stdout. Compiled with `--path ../stdlib` so
+# the resolver finds the module.
+test-trace: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --path ../stdlib ../examples/effects/trace_basic.kai > build/trace.c; \
+	$(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage0 build/trace.c -o build/trace-c; \
+	./build/trace-c > build/trace.out; \
+	diff -q ../examples/effects/trace_basic.out.expected build/trace.out > /dev/null \
+	  && echo "trace OK" \
+	  || { echo "trace DIFF"; diff ../examples/effects/trace_basic.out.expected build/trace.out; exit 1; }
 
 # stdlib/time.kai smoke test — exercises the Clock effect (wall_now,
 # monotonic_now, sleep_ns) plus pure Duration / Instant arithmetic.
@@ -1859,7 +1873,7 @@ test-tco-regression: $(TARGET) build
 	  && echo "tco-regression OK (issue #43 list.nth-shape fixture compiles + runs; conservative dropmask, R6 leak documented but not enforced)" \
 	  || { echo "tco-regression DIFF"; diff ../examples/tco/list_nth_shape.out.expected build/tco-nth.out; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -1868,7 +1882,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco test-tco-regression
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco test-tco-regression
 
 clean:
 	rm -rf build $(TARGET)
