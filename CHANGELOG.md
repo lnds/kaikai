@@ -11,6 +11,32 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Fixed
 
+- **R12 — TCO emit pass produced malformed C for zero-arg
+  recursive functions (issue #102, mvp-blocker).** A function with
+  no parameters whose body had a self-tail-call emitted
+  `kai_ = _t0; goto _kai_<sym>_entry;`, against an empty-name
+  parameter slot and a temporary that was never declared. `cc`
+  rejected the generated source with `use of undeclared identifier
+  'kai_'` / `'_t0'`, refusing valid kaikai source.
+  - Root cause: `tcrec_make_sentinel` (`stage2/compiler.kai`)
+    unconditionally emitted a trailing `|` before the joined
+    pname list. For a zero-param fn the join was the empty string,
+    so the encoded sentinel ended in `|`. The decoder
+    `tcrec_split_pipe` then yielded a 4-element list whose last
+    element was `""`, which leaked into `pnames` and drove
+    `tcrec_emit_rebinds` to emit the malformed reassignment.
+  - Fix: make the trailing `|` conditional on a non-empty pname
+    list. The fix is symmetric — the encoder now produces exactly
+    what the decoder pattern `[_, sym, mask, ...pnames]` expects
+    in both the zero-param and N-param cases. Non-zero-arg fns
+    keep the existing emit shape; selfhost / selfhost-llvm stay
+    byte-identical.
+  - Regression coverage: `examples/perceus/r12_zero_arg_recursive.kai`
+    — a zero-arg `round_n()` whose tail self-call is bounded by a
+    `State[Int]` handler so the test cannot hang. Wired into
+    `stage2/Makefile` `test-tco-zero-arg` (and the `test` /
+    `test-fast` targets), so any future regression of this exact
+    shape produces a deterministic diff under tier1.
 - **R8 (issue #94, mvp-blocker) — let-bound unboxable
   reference inside `#{...}` interpolation slot now compiles.**
   A body like
