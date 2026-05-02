@@ -69,6 +69,56 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
     (test-effects + test-signal-trap-asan rules), and the
     top-level `Makefile` (tier1-asan wiring).
 
+### Fixed
+
+- **Issue #115 — `make tier1-asan` failed on Linux/clang for
+  every demo that dispatched through a default effect handler
+  (Stdout / Stderr / Fail / Stdin / Env / File / Random / NetTcp /
+  Signal / Mutable / Cancel / Link / Monitor / Spawn).** All
+  seven demos flagged in #115 (`state_explicit`, `state_var`,
+  `blackjack`, `concurrent`, `net_tcp_localhost`, `ping_pong`,
+  `poker_dealer`) now pass under ASAN+UBSan on Ubuntu/clang with
+  the same gate green on macOS.
+
+  Root cause: the runtime `kai_default_<eff>_<op>` handlers in
+  `stage0/runtime.h` declare the first parameter as `void *self`
+  because the runtime header cannot reference the
+  compiler-emitted `EvStdout` / `EvStderr` / ... struct types.
+  The emitter then cast each address to the typed struct-field
+  pointer (e.g. `(KaiValue *(*)(EvStdout *, KaiValue *, KaiCont *))
+  &kai_default_stdout_print`). The cast is representation-
+  equivalent in C and silently links, but UBSan's
+  `-fsanitize=function` (active in clang's
+  `-fsanitize=undefined` on Linux; absent from Apple clang's
+  default `undefined` set) checks at every indirect call that
+  the *function definition's* type tag matches the function
+  pointer's static type. The cast does not change the function
+  definition's type tag, so every `_ev_op->print(_ev_op, ...)`
+  etc. tripped a `runtime error: call to function (unknown)
+  through pointer to incorrect function type` diagnostic.
+
+  Fix: emit a typed shim per default op
+  (`_kai_default_<eff>_<op>_shim`) at file scope before
+  `int main()`. The shim has the typed signature matching the
+  EvX struct field and forwards to the runtime void-self
+  function via a regular call (not subject to
+  `-fsanitize=function`). Setup assigns the shim address with
+  no cast. New `default_shims_for(main_row)` aggregator in
+  `stage2/compiler.kai` mirrors `default_setups_for` and is
+  emitted before `int main()` from `emit_main_wrapper`. The
+  Signal effect added by #107 / PR #116 is covered by the
+  same shim discipline.
+
+  Regression fixture
+  `examples/effects/issue_115_default_handler_typed_dispatch.kai`
+  exercises Stdout + Stderr default-shim dispatch and is wired
+  into `TRACE_FIXTURES`, so it runs under both `test-trace`
+  (semantic regression — output diff in tier1) and
+  `test-trace-asan` (UBSan diagnostic regression in tier1-asan).
+
+  Closes acceptance items 1–7 on issue #115; PR #114
+  (path-gated tier1-asan workflow) can now be marked ready.
+
 ## [0.36.0] — 2026-05-02 (mvp-blockers #78 + #80 + #102 + #106 closed)
 
 ### Added
