@@ -80,19 +80,60 @@ the scheduler.
 - Cancellation is an effect, `Cancel`. A task can `handle` it to
   release resources. Unhandled `Cancel` unwinds the fiber cleanly.
 
-The full `TyBranded(Ty, BrandId)` machinery — propagating a
-per-nursery brand through every binding form (let, match, list
-literal, record field, fn arg, fn return) and rejecting brand
-mismatch between sibling nurseries (`n1.spawn`-d Fiber passed
-into a `n2.spawn` body) — is the spec'd long-term shape. It is
-deferred behind the m7b #4 cap-binding form (`nursery { n -> ... }`):
-without `n` as a syntactic introduction site, a per-nursery
-brand has nowhere to attach, and sibling-nursery mismatch is
-unwritable in user code. Tracking: `docs/fibers-honesty-targets.md`
-§*Residual m8.x items* item 1; the today-vs-aspirational gap
-is the difference between *return-type / sum-payload escape*
-(closed) and *cross-sibling brand mismatch* (deferred behind
-m7b #4).
+The cap-binding form `nursery { n -> ... }` is the syntactic
+introduction site for the per-nursery brand. The kaikai stage 2
+compiler runs a pre-typecheck rewrite that strips `n` from the
+lambda parameter list, rewrites every `n.<spawn|await|select|...>`
+in the body to the corresponding `Spawn.<op>` call, and tags each
+rewritten call with a fresh BrandId (one per nursery site). The
+brand-mismatch checker walks the rewritten AST with a brand-
+attribution environment (binding name → brand) and rejects
+sibling-nursery breaches at consume sites (`n.await(f)` /
+`n.cancel(f)` / `n.select(fs)`) where the fiber's brand differs
+from the surrounding scope's. Brand attribution propagates
+through `let p = expr` chains: a binding inherits the brand of
+its rhs when the rhs is a known-spawn call or another branded
+binding. Coverage:
+`examples/effects/m8x_8_nursery_cap.kai` (positive — basic
+cap-binding spawn/await),
+`m8x_8_brand_through_match.kai` (positive — same-nursery
+let-chain),
+`m8x_8_sibling_nursery_mismatch.kai` (negative — direct
+cross-nursery use),
+`m8x_8_brand_propagation_let_chain.kai` (negative — chain
+through three lets).
+
+The pragmatic v1 of this lane (issue #71 option (b)) lives as a
+side-table walker keyed on call-site `(line, col)`; the brief's
+spec'd long-term shape — `TyBranded(Ty, BrandId)` woven into the
+unifier so brands flow through generic helper instantiations — is
+documented in `docs/fibers-honesty-targets.md` §*Residual m8.x
+items* item 1 as the next refinement (helper-passthrough cases
+where a generic `fn id[T](x: T) : T = x` round-trip strips the
+brand). Direct-binding propagation (`let p = q`) and the
+spawn-site-to-consume-site loop are covered today.
+
+### Debugging brand inference
+
+`kaic2 --dump-brands <file>` emits the brand registry collected
+by the cap-binding rewrite. Output is deterministic (one record
+per line, fixed column order) and grep-friendly:
+
+```text
+# kaic2 --dump-brands
+# brand allocations (one per `nursery { n -> ... }` site):
+brand 0 cap=outer at=examples/effects/m8x_8_brand_dump.kai:12:23
+brand 1 cap=inner at=examples/effects/m8x_8_brand_dump.kai:14:31
+# call attributions (one per rewritten `n.<op>` site):
+call op=spawn brand=0 at=examples/effects/m8x_8_brand_dump.kai:13:24
+call op=spawn brand=1 at=examples/effects/m8x_8_brand_dump.kai:15:26
+call op=await brand=1 at=examples/effects/m8x_8_brand_dump.kai:16:18
+call op=await brand=0 at=examples/effects/m8x_8_brand_dump.kai:18:16
+```
+
+The flag does not run inference, so it is cheap to consult on a
+file whose typer would otherwise reject the program. Pinned by
+the `m8x_8_brand_dump.brands.expected` golden under tier 1.
 
 ```kai
 # Polymorphic over whatever effect the worker carries.
