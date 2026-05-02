@@ -433,13 +433,15 @@ in.
 
    **m8 v1 (landed)** ships the full *type surface* and an
    inline-eager scheduler — every spawned thunk runs to
-   completion synchronously inside `Spawn.spawn`. Genuine
-   fiber suspension (real cooperative scheduler, cooperative
-   `Cancel` delivery, `BlockSender`, blocking `receive()`,
-   cross-fiber Link/Monitor delivery, full region brand)
-   defers to **m8.x**, tracked in `docs/m8x-followup.md`.
-   The user-facing API is the final shape; m8.x is a runtime
-   swap, invisible to user code.
+   completion synchronously inside `Spawn.spawn`. The runtime
+   swap (real cooperative scheduler, cooperative `Cancel`
+   delivery, `BlockSender`, blocking `receive()`, cross-fiber
+   Link/Monitor delivery, region brand v1) landed in `0.4.0`–
+   `0.21.0` (R2 lane + Tier 2 retrofit); residual typer-side
+   items are inventoried in `docs/fibers-honesty-targets.md`
+   §*Residual m8.x items*. The user-facing API was the final
+   shape from the start, so the runtime swap was invisible to
+   user code.
 8.5. **m8.5 — Tuples decision gate** *(landed 2026-04-27 — verdict
     REJECT)*: one-day measurement task against the open
     `proposed-extensions.md` §9 decision. Ran over a parser
