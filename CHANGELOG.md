@@ -9,6 +9,37 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Documented (Tier 3 experiment 2 arm B — handler-composition lane)
+
+- **`docs/known-regressions.md` — R9.** Handler clauses do not
+  capture parameters of the enclosing fn. `cc` rejects the emitted
+  C with `use of undeclared identifier 'kai_<name>'` whenever a
+  clause body references a value bound by the surrounding fn.
+  `docs/effects-impl.md` §*Op clause as ordinary function*
+  specifies `self.env` as the channel for closure captures; the
+  emitter does not (yet) install or read it. Bounded — string
+  literals, `Eff.op(...)` calls, the `state` keyword in
+  parameterised handlers, and ordinary lambdas all keep working.
+- **`docs/known-regressions.md` — R10.** Parameterised handler
+  outer + self-delegating handler inner crashes the runtime on
+  the second op invocation (SIGSEGV with `State[T]`, SIGBUS with
+  `Reader[T]`, blank-line corruption with three Trace ops).
+  Reproduced in two flavours sharing the same shape; the
+  m8 #12 in_dispatch fix likely needs to clear/reinstate around
+  parameterised resume entries. Self-delegation alone (negative
+  control: `delegating_helper` over a non-parameterised outer)
+  and parameterised outer alone both work in isolation.
+- **`docs/lane-experience-exp2-arm-b.md`.** Full retro of the
+  Tier 3 experiment 2 arm B lane: the lane's nominal target was
+  `with_log_prefix` in `stdlib/trace.kai`, blocked by R9 + R10.
+  Documents the attempt sequence (direct capture → Reader
+  workaround → State workaround), the plain-text-vs-JSON tooling
+  experience under the experiment 2 embargo, and the synthesis:
+  handler-composition lanes that need to thread a *value* into
+  clause bodies (i.e., not just delegate already-installed
+  effects) are not viable on the current emitter+runtime,
+  regardless of which tooling the agent is allowed to use.
+
 ## [0.28.0] — 2026-05-02 (post-Tongariki — Trace effect + Tier 3 experiment 1)
 
 ### Added
