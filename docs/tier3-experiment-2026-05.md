@@ -254,3 +254,172 @@ synthesis:
   (forbidden from JSON tools)
 
 Both include their TSV instrumentation logs verbatim.
+
+---
+
+# Experiment 2 — handler composition (`with_log_prefix`)
+
+Second A/B test, scope deliberately chosen to exercise effect-row
+composition where the bet should plausibly differentiate. Both arms
+target `with_log_prefix(prefix, body)`: a `Trace` handler that
+prepends a prefix to every message and re-raises to the outer
+`Trace` handler.
+
+## Outcome diferencial
+
+| | Arm A (JSON tools) | Arm B (plain-text only) |
+|---|---|---|
+| Result | ✅ shipped (PR #58) | ❌ blocked, doc-only PR (#57) |
+| Bugs hit | R9 + R11 (both arms) | R9 + R10 (same surface, different framing) |
+| R9 workaround | private parameterised effect `TracePrefix[String]` | tried 3 shapes, all hit R9 |
+| R10/R11 workaround | `let _keep_alive = state` to force `pcs_is_non_last` → emit `__perceus_dup` | none found before lane closure |
+| Wallclock to PR | ~5h (with sleep windows) | ~5h (with sleep windows) |
+| Compute time | ~30–60 min | ~30–60 min |
+
+Both arms hit the **same two compiler/runtime bugs**. The differential
+was **persistence + use of ASAN + reading compiler source**, not JSON
+tools.
+
+## Both arms converge on the JSON-tools-not-load-bearing finding
+
+### Arm A — verbatim from `lane-experience-exp2-arm-a.md`
+
+> "After the fix landed, `kaic2 --path stdlib --effects-json
+> examples/effects/trace_prefix.kai` reported [the row]"
+
+JSON tools invoked **after the fix**, not during. What carried the
+work:
+
+- Reading `emit_clause_body` + `clause_state_prologue` source code
+  in `stage2/compiler.kai`
+- ASAN exposing the heap-use-after-free signal
+- Reading `pcs_is_non_last` comment block
+
+### Arm B — verbatim from `lane-experience-exp2-arm-b.md`
+
+> "JSON would not have helped — the bug is in codegen not in the
+> type system" (R9)
+>
+> "JSON tooling does not address this" (R10/runtime crashes)
+>
+> "The R9 / R10 blockers are downstream of the type system entirely;
+> no JSON tool addresses them. The experiment 2 embargo cost me
+> [zero time]"
+
+## What R9, R10, R11 are
+
+The experiment surfaced two (possibly three) real compiler/runtime
+bugs:
+
+- **R9** — handler clauses do not capture parameters of the
+  enclosing fn. `cc` rejects emitted C with `use of undeclared
+  identifier 'kai_<name>'`. `effects-impl.md` §*Op clause as
+  ordinary function* names `self.env` as the channel; the emitter
+  does not implement it.
+- **R10** — parameterised handler outer + self-delegating handler
+  inner crashes runtime on second op invocation. SIGSEGV with
+  `State[T]`, SIGBUS with `Reader[T]`, blank-line corruption with
+  three Trace ops. Likely the m8 #12 `in_dispatch_node`
+  save/restore needs to handle parameterised resume entries.
+- **R11** — single-read of a stateful handler clause's `state`
+  aliases the EvE storage; downstream decref-aware sinks
+  (`string_concat`, etc.) free the prefix mid-handler. Worked
+  around with `let _keep_alive = state`. May be a specific
+  manifestation of R10 or a distinct Perceus bug — open until a
+  follow-up lane unifies the analyses.
+
+All three documented in `docs/known-regressions.md` with repro,
+hypothesis, and fix path.
+
+## Refinement of the Tier 3 bet
+
+Combined Experiment 1 + Experiment 2 results:
+
+| Slice | Direction | Evidence |
+|---|---|---|
+| Stdlib mirror lanes (abundant prior art) | JSON tools NOT load-bearing | Exp 1: both arms shipped equally |
+| Handler composition (no obvious prior art, requires navigating effect dispatch + Perceus + emit) | JSON tools NOT load-bearing — actual differentiator was ASAN + compiler source reading | Exp 2: A shipped, B couldn't, but JSON wasn't the lever |
+| Hypothetical: deep row-polymorphism puzzle (3+ nested helpers contributing different effects to the inferred row) | Plausibly load-bearing — Arm B explicitly says "the shape I hit did not exercise that scope" | Not yet tested |
+
+**The bet "JSON tools accelerate LLM authorability" is not
+directionally supported by either of the two experiments**. The
+hypothesis remains open for one untested slice (deep row-polymorphism
+without any codegen/runtime component) but no real-world kaikai
+feature has hit that slice cleanly.
+
+## Real differentiators (per both retros)
+
+What actually carried the work in handler composition:
+
+1. **ASAN** (`-fsanitize=address`) — decisive for diagnosing R11.
+   Without it, arm A would have spent significantly longer on the
+   "two empty `[trace]` lines + intermittent SIGSEGV" surface. ASAN
+   pointed exactly at the use-after-free site + the freed-from
+   site, both with `file:line`.
+2. **Compiler source reading** — `emit_clause_body`,
+   `clause_state_prologue`, `pcs_is_non_last` in
+   `stage2/compiler.kai`. Both arms had access; Arm A pursued the
+   read, Arm B did not.
+3. **Plain-text "did you mean X?" suggestions** — sufficient for
+   the typical compiler error (e.g., `println` → `print`).
+4. **Persistence + scope decision** — Arm A persisted through 4
+   debugging attempts; Arm B made a lane-discipline call at attempt
+   3 to stop and document. The choice point was not tooling-driven.
+
+## Bonus: this experiment produced unbudgeted value
+
+R9, R10, R11 are real bugs that any future user attempting
+parameterised handler composition will hit. The experiment surfaced
+them with full repros + hypotheses + fix paths months before they
+would have surfaced organically. The doc-only PR #57 from arm B is
+genuine value for the project beyond the bet question.
+
+## Operational recommendations (refined)
+
+1. **Continue the experiment series**, but pivot the next scope to
+   the **untested slice**: a feature whose blockers live entirely
+   in the type system / effect-row inference, with no codegen or
+   runtime component. Candidate: a typed-hole-driven feature where
+   the agent has to discover the type signature from compiler
+   feedback (e.g., implement a polymorphic helper given only the
+   call sites, no signature template).
+2. **Do not invest in m11 / new JSON tooling solely on the basis of
+   the Tier 3 bet** — n=2 experiments, both directionally negative,
+   both with explicit verbatim agent claims that JSON was not load-
+   bearing.
+3. **Fund ASAN in CI** — `make tier1-asan` gate (cron, daily.yml)
+   would catch R10/R11-class bugs before users hit them. Highest-
+   leverage operational change suggested by this experiment.
+4. **Reading compiler source code is load-bearing for non-trivial
+   lanes** — both arms benefited (or could have benefited) from
+   `emit_clause_body` + `pcs_is_non_last` reading. Future agent
+   prompts in advanced lanes should explicitly suggest "read the
+   relevant emit/perceus source if you hit codegen errors".
+
+## Updated implications for `docs/llm-authorship-baseline.md`
+
+Combined experiment 1 + 2 = n=2 experiments, n=4 lanes (2 per arm).
+Headline for the addendum:
+
+> **JSON tooling is not load-bearing for the slices tested
+> (n=2 experiments × 2 arms each). The actual differentiators in
+> the harder slice (handler composition) were ASAN + compiler
+> source reading + persistence — none of which the bet was about.
+> The bet's framing remains untested for one slice (deep row-
+> polymorphism without codegen/runtime components) but no real
+> feature has hit that slice cleanly.**
+
+## Limitations of the combined finding
+
+- **n=2 experiments per slice = 1**. Direction-setting only.
+- **Same agent personality (Claude)** in all four arms.
+- **Self-report bias** — agents wrote their own retros. Counter-
+  evidence: the convergence of A's and B's retros on the same
+  conclusion ("JSON not load-bearing") suggests low self-serving
+  bias.
+- **Wallclock dominated by sleep windows** (integrator unavailable
+  at moments) — compute-time numbers are estimated.
+- **The bet may still be correct for the untested slice** — a
+  feature whose work lives 100% in effect-row inference. No real
+  kaikai feature naturally restricts to that slice; the experiment
+  series may need to construct one synthetically.
