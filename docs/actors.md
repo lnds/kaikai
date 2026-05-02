@@ -454,6 +454,25 @@ the current `trap_exit` value. To revoke, call
 `fiber_set_trap_exit(false)` and links revert to the default
 cancel-cascade behaviour.
 
+Trap-exit converts at the runtime boundary, before any user-level
+`Cancel` handler can intercept. When a fiber is linked to a peer
+with `trap_exit=true`, its `Cancel.raise()` bypasses any
+`with Cancel { raise(_) -> ... }` handler that lives in the call
+chain between the spawn point and the receive point — including
+handlers that the child inherited from the parent's evidence chain
+at spawn time. The fiber unwinds straight to the trampoline's
+cancel pad, the link-propagation walk fires, and the trap-exit'd
+peer learns of the termination through its mailbox. Without this
+rule, OTP-style layered supervision would not compose: the moment
+any intermediate frame between the supervisor's spawn and the
+worker's `Cancel.raise()` installed an outer `Cancel` handler (for
+cleanup, escalation, etc.), the supervisor's `Actor.receive()`
+would never wake. Plain `Cancel.raise()` inside a fiber that holds
+no trap-exit'd link still dispatches through user handlers as
+before, preserving the cleanup-on-cancel idiom for non-supervised
+work. Spec: `stage0/runtime.h` §`kai_check_trap_exit_cancel_bypass`,
+issue #103.
+
 ### Supervision trees
 
 A supervisor is an ordinary actor whose message type includes
