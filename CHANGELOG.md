@@ -11,6 +11,50 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Added
 
+- **`core.list` canonical higher-order helpers (issue #106).**
+  `stdlib/core/list.kai` now exports the nine helpers documented
+  in `docs/stdlib-layout.md` §`core` that were previously
+  missing: `map`, `filter`, `foldl`, `foreach`, `length`,
+  `reverse`, `foldr`, `zip`, `unzip`. The four effectful
+  workhorses (`map`, `filter`, `foldl`, `foreach`) carry the
+  open row variable `e` so the callback's effects flow out to
+  the caller — the kaikai idiom for free functions taking
+  effectful callbacks (`docs/protocols.md` §With effects).
+  Inspection helpers (`length`, `reverse`, `zip`, `unzip`) take
+  no callback and use no row variable; `foldr` mirrors `foldl`
+  with right-fold semantics. Implementation is pure-kaikai
+  recursion, mirroring the existing `nth` / `take` / `count`
+  shape in the file: `length` and `reverse` use tail-recursive
+  `_loop` accumulators; `foldr` is a left-fold over `reverse(xs)`
+  with the args to `f` flipped, keeping the recursion
+  TCO-eligible at one extra O(n) reverse pass; `zip` truncates
+  to the shorter list per Haskell convention; `unzip` walks once
+  with two reverse-order accumulators reversed at the call site.
+
+  Discovered while implementing ahu Layer 1 (streams /
+  pipeline combinators). `map` and `filter` collide nominally
+  with the runtime prelude's row-poly builtins of the same
+  shape (`prelude_table` in `stage2/compiler.kai`). Name
+  resolution lets the prelude win at unqualified call sites —
+  `map(xs, f)` always reaches the runtime implementation and
+  the new pure-kaikai definitions serve qualified callers
+  (`list.map(xs, f)` / `list.filter(xs, p)`), keeping the
+  `core.list` export surface honest with `docs/stdlib-layout.md`
+  §`core`. `foldl` / `foreach` are the kaikai-idiomatic
+  spellings of the prelude's `reduce` / `each` and reach both
+  qualified and unqualified.
+
+  Regression coverage: `examples/stdlib/list_pipeline.kai`
+  exercises `range |> list.map |> list.filter |> list.foldl`
+  with `println` inside the map's lambda (effectful callback
+  flowing out via the row variable). `examples/stdlib/list_helpers.kai`
+  covers the five pure helpers with empty / single / multi
+  inputs and a zip→unzip round-trip. Both gated by the existing
+  `test-stdlib` glob in `stage2/Makefile`. Closes issue #106.
+
+  `docs/stdlib-layout.md` §`core` `core.list` line updated to
+  include `foreach` so the documented inventory matches the
+  file's exports.
 - **Issue #80 regression fixture (Tongariki MVP-blocker closed).**
   `kaic2 typer rejects polymorphic prelude calls from foreign
   files` was the m5x-followup #3 inheritance from m5 #0 that the
