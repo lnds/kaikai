@@ -430,15 +430,25 @@ land, every "handler composition" lane will hit the same wall.
 
 ## Raw build log
 
-Appended in a separate commit per the brief's instrumentation
-discipline.
-
 **Note on instrumentation**: the per-build TSV script in the
 brief used `${PIPESTATUS[0]}` against a chain that didn't expose
 the make exit code reliably (the make target itself runs in a
 sub-shell pipeline that changes directories); several FAILs were
 initially recorded as OK in `/tmp/lane-exp2-arm-b-builds.tsv`.
-The TSV appended below has been corrected to reflect the actual
-outcomes, cross-checked against my command history. Future
-agents: use `make ... ; rc=$?` (no pipeline) or capture exit code
-inside the make recipe itself.
+The TSV below has been corrected to reflect the actual outcomes,
+cross-checked against my command history. Future agents: use
+`make ... ; rc=$?` (no pipeline) or capture exit code inside the
+make recipe itself.
+
+```
+timestamp	cmd	outcome	elapsed_s	note
+2026-05-01T23:35:38-04:00	test-trace-prefix	FAIL	6	attempt-1: direct capture; cc rejects kai_prefix (R9)
+2026-05-01T23:38:33-04:00	test-trace-prefix	FAIL	0	attempt-2a: with_reader import; typer rejects row mismatch (with_reader v1 not row-poly)
+2026-05-01T23:39:42-04:00	test-trace-prefix	FAIL	0	make invoked from wrong dir (no rule to make target)
+2026-05-01T23:43:13-04:00	test-trace-prefix	FAIL	1	attempt-2b: inline Reader[String](prefix); compiles, output diff blank-lines (R10 Reader variant)
+2026-05-01T23:43:26-04:00	test-trace-prefix	FAIL	1	attempt-3: State[String](prefix); compiles, SIGSEGV exit 139 (R10 State variant)
+2026-05-01T23:48:33-04:00	tier1	OK	~210	final tier1 after revert + docs-only changes; selfhost byte-identical
+```
+
+Lane window: 2026-05-01T23:33:19-04:00 → 2026-05-01T23:48:33-04:00
+(~15 min wall-clock).
