@@ -146,6 +146,24 @@ Adjacent rules every agent must apply:
   bug outside your lane, document it in `docs/known-regressions.md`
   with repro + hypothesis, do not fix it inline. The L2 wrong-lane
   revert from 2026-04-29 is the precedent.
+- **Lane handoff — push + PR is authorized**: an agent spawned
+  in a worktree (e.g. via `/wt-claude`) **is authorized to push
+  its lane branch to origin and open a pull request via
+  `gh pr create` once its acceptance gate is green** (Tier 0 +
+  Tier 1, plus `tier1-asan` if the lane touches the runtime or
+  emit pass). This is the standing exception to the global
+  Claude Code rule "do not push to the remote repository unless
+  the user explicitly asks." Rationale: the worktree spawn
+  itself is the explicit authorization for the lane's full
+  push-to-PR loop; making the user also re-confirm push at the
+  end of every lane burns turns and breaks the parallel-lane
+  flow this repo's worktree pattern is built around. **Merge
+  stays with the integrator** — agents do NOT run
+  `gh pr merge`, do NOT bump `VERSION`, and do NOT promote
+  `## [Unreleased]` (those are integrator steps per the
+  workflow below). If CI fails, the agent fixes the failure on
+  the same branch and pushes again; force-push is fine for
+  lane branches that have not been reviewed yet.
 - **VERSION + CHANGELOG (agent side)**: do NOT bump the version
   yourself. Add your closing-commit entry to `CHANGELOG.md` under
   the existing `## [Unreleased]` section and **leave `VERSION`

@@ -9,6 +9,24 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Changed
+
+- **`CLAUDE.md` — lane handoff (push + PR) is authorized for
+  spawned worktree agents.** Added an explicit standing
+  exception to the global Claude Code "do not push without
+  explicit ask" rule: an agent spawned in a worktree (via
+  `/wt-claude` or equivalent) is authorized to push its lane
+  branch and open a pull request via `gh pr create` once its
+  acceptance gate is green (Tier 0 + Tier 1, plus `tier1-asan`
+  if the lane touches runtime or emit). Rationale: the worktree
+  spawn itself is the authorization for the full push-to-PR
+  loop; re-confirming at the end of every lane breaks the
+  parallel-lane flow this repo is built around. Merge, VERSION
+  bump, and `[Unreleased]` promotion stay with the integrator
+  per the existing workflow. Pairs with the
+  `permissions.defaultMode: "auto"` setting at the user-config
+  layer so spawned agents start in auto mode by default.
+
 ## [0.30.1] — 2026-05-02 (roadmap refresh — m8.x → Tongariki Wave 3)
 
 ### Changed
