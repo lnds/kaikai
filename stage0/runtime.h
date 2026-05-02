@@ -56,6 +56,18 @@
 #include <time.h>
 #include <unistd.h>
 
+/* net-tcp-v1 — sockets API for the NetTcp default handler.
+ * POSIX everywhere we ship: macOS, Linux, *BSD. The handler is
+ * blocking-only in v1 (the inline-eager scheduler can't suspend a
+ * fiber on a readiness event yet); kqueue / epoll integration lands
+ * with m8.x alongside the rest of the cooperative scheduler. */
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+
 /* Apple deprecated ucontext in macOS 10.6 (POSIX-2008 obsoletion).
  * The functions still work; the deprecation attribute on the
  * prototypes triggers -Wdeprecated-declarations, which the local
@@ -2745,6 +2757,294 @@ static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue
         draw = ((hi32 << 32) | lo32) % delta;
     }
     return kai_cont_resume(k, kai_int(lo_v + (int64_t) draw));
+}
+
+/* =================================================================
+ * NetTcp default handler (net-tcp-v1)
+ * =================================================================
+ *
+ * Spec: docs/effects-stdlib.md §`NetTcp`. Six ops, all blocking in
+ * v1. Maps directly to POSIX sockets via libc — same FFI-to-libc
+ * pattern as the File / Random defaults above. Errors return
+ * `Err(strerror(errno))`; success wraps the handle in a record
+ * matching the surface types declared by the compiler:
+ *
+ *   Conn      = { fd: Int }
+ *   Listener  = { fd: Int, port: Int }
+ *
+ * The `port` slot on Listener carries the kernel-assigned port back
+ * to the caller (the `bind(port=0)` use case). It is populated by
+ * the listen op via getsockname; ordinary `bind(port=N)` callers
+ * see the same N echoed back.
+ *
+ * v1 keeps to AF_INET (IPv4). AF_INET6 fallback waits on a separate
+ * lane — calling out IPv4-only as a v1 limitation in the spec note.
+ */
+
+static KaiValue *_kai_net_err(KaiCont *k, int saved_errno) {
+    const char *msg = strerror(saved_errno);
+    if (!msg) msg = "unknown error";
+    KaiValue *m = kai_str(msg);
+    KaiValue *err = kai_variant(0, "Err", 1, &m);
+    return kai_cont_resume(k, err);
+}
+
+static KaiValue *_kai_net_err_msg(KaiCont *k, const char *msg) {
+    KaiValue *m = kai_str(msg);
+    KaiValue *err = kai_variant(0, "Err", 1, &m);
+    return kai_cont_resume(k, err);
+}
+
+/* Build a Conn record `{ fd }`. Static field-name strings match
+ * what the kaikai-side `type Conn = { fd: Int }` declaration
+ * produces from emit_record_constructor — kai_field reads by
+ * strcmp on the name pointer's contents, so any pointer to a
+ * matching cstring works. */
+static KaiValue *_kai_net_make_conn(int fd) {
+    KaiValue *fd_kv = kai_int((int64_t) fd);
+    KaiValue *fields[1] = { fd_kv };
+    static const char *names[1] = { "fd" };
+    return kai_record(1, fields, names);
+}
+
+static KaiValue *_kai_net_make_listener(int fd, int port) {
+    KaiValue *fd_kv   = kai_int((int64_t) fd);
+    KaiValue *port_kv = kai_int((int64_t) port);
+    KaiValue *fields[2] = { fd_kv, port_kv };
+    static const char *names[2] = { "fd", "port" };
+    return kai_record(2, fields, names);
+}
+
+/* Pull the `fd` slot out of a Conn / Listener record. Returns -1 if
+ * the value is the wrong shape (caller falls through to an error
+ * return); v1 trusts the typer to keep this honest. */
+static int _kai_net_record_fd(KaiValue *v) {
+    if (!v || v->tag != KAI_RECORD) return -1;
+    for (int i = 0; i < v->as.rec.n_fields; ++i) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "fd") == 0) {
+            KaiValue *f = v->as.rec.fields[i];
+            if (!f || f->tag != KAI_INT) return -1;
+            return (int) f->as.i;
+        }
+    }
+    return -1;
+}
+
+/* connect(host, port) -> Result[Conn, String]. host is a hostname
+ * or IPv4 dotted-quad; getaddrinfo handles both. Restricted to
+ * AF_INET in v1. */
+static KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
+    (void) self;
+    if (!host || host->tag != KAI_STR || !port || port->tag != KAI_INT) {
+        return _kai_net_err_msg(k, "connect: bad arguments");
+    }
+    char host_buf[256];
+    size_t hlen = host->as.s.len < sizeof(host_buf) - 1 ? host->as.s.len : sizeof(host_buf) - 1;
+    memcpy(host_buf, host->as.s.bytes, hlen);
+    host_buf[hlen] = '\0';
+    char port_buf[16];
+    snprintf(port_buf, sizeof(port_buf), "%lld", (long long) port->as.i);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    struct addrinfo *res = NULL;
+    int gai = getaddrinfo(host_buf, port_buf, &hints, &res);
+    if (gai != 0) {
+        const char *msg = gai_strerror(gai);
+        return _kai_net_err_msg(k, msg ? msg : "getaddrinfo failed");
+    }
+    int fd = -1;
+    int saved_errno = 0;
+    for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
+        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) { saved_errno = errno; continue; }
+        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) {
+            break;
+        }
+        saved_errno = errno;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) {
+        return _kai_net_err(k, saved_errno ? saved_errno : ECONNREFUSED);
+    }
+    KaiValue *conn = _kai_net_make_conn(fd);
+    KaiValue *ok   = kai_variant(0, "Ok", 1, &conn);
+    return kai_cont_resume(k, ok);
+}
+
+/* listen(host, port) -> Result[Listener, String]. host = "" or
+ * "0.0.0.0" binds INADDR_ANY; specific IPv4 string also works.
+ * port = 0 asks the kernel for an ephemeral port; we read it back
+ * via getsockname so callers don't need a separate effect op. */
+static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
+    (void) self;
+    if (!host || host->tag != KAI_STR || !port || port->tag != KAI_INT) {
+        return _kai_net_err_msg(k, "listen: bad arguments");
+    }
+    char host_buf[256];
+    size_t hlen = host->as.s.len < sizeof(host_buf) - 1 ? host->as.s.len : sizeof(host_buf) - 1;
+    memcpy(host_buf, host->as.s.bytes, hlen);
+    host_buf[hlen] = '\0';
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return _kai_net_err(k, errno);
+
+    /* SO_REUSEADDR mirrors the convention every server example sets
+     * — without it a listener that crashed seconds ago can't rebind
+     * because the kernel still holds the port in TIME_WAIT. The
+     * fixture's `bind(0)` path ignores the assigned port across
+     * runs anyway, but explicit servers benefit. */
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t) port->as.i);
+    if (host_buf[0] == '\0') {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, host_buf, &addr.sin_addr) != 1) {
+        /* Fall back to getaddrinfo for hostnames. */
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo *res = NULL;
+        int gai = getaddrinfo(host_buf, NULL, &hints, &res);
+        if (gai != 0) {
+            close(fd);
+            const char *msg = gai_strerror(gai);
+            return _kai_net_err_msg(k, msg ? msg : "getaddrinfo failed");
+        }
+        struct sockaddr_in *sin = (struct sockaddr_in *) res->ai_addr;
+        addr.sin_addr = sin->sin_addr;
+        freeaddrinfo(res);
+    }
+
+    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        int e = errno; close(fd); return _kai_net_err(k, e);
+    }
+    if (listen(fd, 128) < 0) {
+        int e = errno; close(fd); return _kai_net_err(k, e);
+    }
+
+    /* Read back the assigned port (kernel may have picked one when
+     * the caller passed 0). */
+    struct sockaddr_in bound;
+    socklen_t blen = sizeof(bound);
+    int actual_port = (int) port->as.i;
+    if (getsockname(fd, (struct sockaddr *) &bound, &blen) == 0) {
+        actual_port = (int) ntohs(bound.sin_port);
+    }
+
+    KaiValue *l  = _kai_net_make_listener(fd, actual_port);
+    KaiValue *ok = kai_variant(0, "Ok", 1, &l);
+    return kai_cont_resume(k, ok);
+}
+
+/* accept(l) -> Result[Conn, String]. Blocks until a peer connects;
+ * v1 has no scheduler suspension, so the fiber is genuinely parked
+ * in the syscall. The fixture sequences listen → connect → accept
+ * so the connection is queued before accept is called. */
+static KaiValue *kai_default_nettcp_accept(void *self, KaiValue *l, KaiCont *k) {
+    (void) self;
+    int lfd = _kai_net_record_fd(l);
+    if (lfd < 0) return _kai_net_err_msg(k, "accept: invalid listener");
+    struct sockaddr_in peer;
+    socklen_t plen = sizeof(peer);
+    int cfd = accept(lfd, (struct sockaddr *) &peer, &plen);
+    if (cfd < 0) return _kai_net_err(k, errno);
+    KaiValue *conn = _kai_net_make_conn(cfd);
+    KaiValue *ok   = kai_variant(0, "Ok", 1, &conn);
+    return kai_cont_resume(k, ok);
+}
+
+/* send(c, data) -> Result[Int, String]. data is a [Byte] = [Int]
+ * cons list; each element is taken mod 256. v1 walks the list once
+ * to assemble a contiguous buffer, then issues a single send(2);
+ * partial sends short-circuit and return the byte count actually
+ * written, matching the POSIX contract that callers may have to
+ * loop. */
+static KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data, KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd < 0) return _kai_net_err_msg(k, "send: invalid conn");
+    if (!data) return _kai_net_err_msg(k, "send: null data");
+
+    /* Count the cons cells; a [Byte] of millions of bytes is out of
+     * scope for v1 — chunked send via streaming is a follow-up. */
+    size_t n = 0;
+    for (KaiValue *p = data; p && p->tag == KAI_CONS; p = p->as.cons.tail) ++n;
+    unsigned char *buf = NULL;
+    if (n > 0) {
+        buf = (unsigned char *) malloc(n);
+        if (!buf) return _kai_net_err_msg(k, "send: out of memory");
+        size_t i = 0;
+        for (KaiValue *p = data; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+            KaiValue *h = p->as.cons.head;
+            int64_t b = (h && h->tag == KAI_INT) ? h->as.i : 0;
+            buf[i++] = (unsigned char) (b & 0xff);
+        }
+    }
+    ssize_t wrote = (n == 0) ? 0 : send(fd, buf, n, 0);
+    int saved_errno = errno;
+    free(buf);
+    if (wrote < 0) return _kai_net_err(k, saved_errno);
+
+    KaiValue *cnt = kai_int((int64_t) wrote);
+    KaiValue *ok  = kai_variant(0, "Ok", 1, &cnt);
+    return kai_cont_resume(k, ok);
+}
+
+/* recv(c, max) -> Result[[Byte], String]. max = 0 panics per spec
+ * (no useful "read zero bytes"); negative max is treated the same.
+ * Peer clean-close (recv == 0) returns Ok([]) so callers can
+ * distinguish from "not yet" via the empty list. */
+static KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max, KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd < 0) return _kai_net_err_msg(k, "recv: invalid conn");
+    int64_t cap = (max && max->tag == KAI_INT) ? max->as.i : 0;
+    if (cap <= 0) {
+        fputs("kai: NetTcp.recv: max must be > 0\n", stderr);
+        exit(1);
+    }
+    if (cap > (1 << 20)) cap = 1 << 20;  /* 1 MiB ceiling for v1 */
+    unsigned char *buf = (unsigned char *) malloc((size_t) cap);
+    if (!buf) return _kai_net_err_msg(k, "recv: out of memory");
+    ssize_t got = recv(fd, buf, (size_t) cap, 0);
+    int saved_errno = errno;
+    if (got < 0) {
+        free(buf);
+        return _kai_net_err(k, saved_errno);
+    }
+    KaiValue *acc = kai_nil();
+    for (ssize_t i = got; i > 0;) { --i; acc = kai_cons(kai_int((int64_t) buf[i]), acc); }
+    free(buf);
+    KaiValue *ok = kai_variant(0, "Ok", 1, &acc);
+    return kai_cont_resume(k, ok);
+}
+
+/* close(c) -> Unit. Spec says errors from close(2) are logged and
+ * swallowed — the user can do nothing useful with the value, and
+ * shutdown() is the right tool for "did everything flush?" anyway.
+ * Returns kai_unit(). */
+static KaiValue *kai_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd >= 0) {
+        if (close(fd) < 0) {
+            /* Stderr only — the surface op returns Unit. */
+            fprintf(stderr, "kai: NetTcp.close: %s\n", strerror(errno));
+        }
+    }
+    return kai_cont_resume(k, kai_unit());
 }
 
 /* =================================================================
