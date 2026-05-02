@@ -11127,6 +11127,163 @@ fn bench_call_list(n: Int, i: Int) : String {
   }
 }
 
+# ---- check function emission (always emitted; only called from int main
+#      when check_mode is on) ----
+#
+# check v1 (issue #44): mirrors the test/bench pipelines above. Each
+# check body is wrapped in a fixed-N (=KAI_CHECK_ITERS, 100) loop.
+# Each iteration:
+#
+#   1. Records the description in the runtime via kai_check_begin
+#      (only on iter 0).
+#   2. Resets the counterexample buffer.
+#   3. Generates a fresh value for every with-clause param via
+#      kai_arbitrary_<T>() and records it for the counterexample.
+#   4. Evaluates the body. The body must produce a Bool. true keeps
+#      the loop running; false records a counterexample at the
+#      current iter index and breaks early.
+#
+# After the loop, kai_check_pass / kai_check_fail prints the
+# per-block result.
+#
+# The C-level local for each param is `kai_<name>` so the body's
+# `EVar(name)` resolves to it through emit_ident_value's lcs lookup.
+# The lcs argument passed to emit_expr therefore lists every
+# with-clause param name.
+
+# Picks the runtime arbitrary-helper name for a parameter type. v1
+# supports primitives (Int / Bool / Char / String) and lists of those
+# primitives. Anything else collapses to a panic stub so the failure
+# is loud rather than silent — protocol-based / structural derivation
+# lands in v1.x and v2.
+fn check_arbitrary_for_ty(ty: TypeExpr) : String {
+  match ty.tkind {
+    TyName(name, args) -> {
+      if name == "Int" { "kai_arbitrary_int()" }
+      else if name == "Bool" { "kai_arbitrary_bool()" }
+      else if name == "Char" { "kai_arbitrary_char()" }
+      else if name == "String" { "kai_arbitrary_string()" }
+      else { check_arbitrary_panic(name) }
+    }
+    TyList(inner) -> match inner.tkind {
+      TyName(iname, _) -> {
+        if iname == "Int" { "kai_arbitrary_list_int()" }
+        else if iname == "Bool" { "kai_arbitrary_list_bool()" }
+        else if iname == "Char" { "kai_arbitrary_list_char()" }
+        else if iname == "String" { "kai_arbitrary_list_string()" }
+        else { check_arbitrary_panic(concat_all(["[", iname, "]"])) }
+      }
+      _ -> check_arbitrary_panic("[<complex>]")
+    }
+    _ -> check_arbitrary_panic("<complex>")
+  }
+}
+
+fn check_arbitrary_panic(label: String) : String =
+  concat_all([
+    "kai_prelude_panic(kai_str(\"check v1: no generator for type ",
+    label,
+    " — supported types are Int, Bool, Char, String, and lists of those\"))"
+  ])
+
+fn emit_check_param_inits(params: [Param]) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let tyc = match p.ptype {
+        Some(t) -> check_arbitrary_for_ty(t)
+        None -> check_arbitrary_panic("<missing>")
+      }
+      concat_all([
+        "        KaiValue *kai_", p.pname, " = ", tyc, ";\n",
+        "        kai_check_record_param(\"", p.pname, "\", kai_", p.pname, ");\n",
+        emit_check_param_inits(rest)
+      ])
+    }
+  }
+}
+
+fn emit_check_param_drops(params: [Param]) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> concat_all([
+      "        kai_decref(kai_", p.pname, ");\n",
+      emit_check_param_drops(rest)
+    ])
+  }
+}
+
+fn check_param_names(params: [Param]) : [String] = match params {
+  [] -> []
+  [p, ...rest] -> [p.pname, ...check_param_names(rest)]
+}
+
+fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body: Expr,
+                 lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  let lcs2 = list_append(check_param_names(params), lcs)
+  let body_c = emit_expr(src, body, lcs2, fns, variants, lams, cls)
+  let inits = emit_check_param_inits(params)
+  let drops = emit_check_param_drops(params)
+  concat_all([
+    "static void _kai_check_", int_to_string(id), "(void) {\n",
+    "    kai_check_begin(", desc_span, ");\n",
+    "    int _kai_check_i;\n",
+    "    int _kai_check_failed_at = -1;\n",
+    "    for (_kai_check_i = 0; _kai_check_i < KAI_CHECK_ITERS; _kai_check_i++) {\n",
+    "        kai_check_cx_reset();\n",
+    inits,
+    "        KaiValue *_body = ", body_c, ";\n",
+    "        int _ok = kai_truthy(_body);\n",
+    "        kai_decref(_body);\n",
+    drops,
+    "        if (!_ok) { _kai_check_failed_at = _kai_check_i; break; }\n",
+    "    }\n",
+    "    if (_kai_check_failed_at >= 0) { kai_check_fail(_kai_check_failed_at); }\n",
+    "    else { kai_check_pass(KAI_CHECK_ITERS); }\n",
+    "}\n\n"
+  ])
+}
+
+fn check_decls(decls: [Decl]) : [Decl] =
+  filter(decls, (d) => match d { DCheck(_, _, _, _, _) -> true _ -> false })
+
+fn emit_one_check(src: String, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
+                  id_d: DeclWithId) : String {
+  match id_d {
+    DWI(id, d) -> match d {
+      DCheck(desc_span, ps, body, _, _) -> emit_check_fn(src, id, desc_span, ps, body, lcs, fns, variants, lams, cls)
+      _ -> ""
+    }
+  }
+}
+
+fn number_checks_loop(decls: [Decl], id: Int, acc: [DeclWithId]) : [DeclWithId] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DCheck(_, _, _, _, _) -> number_checks_loop(rest, id + 1, [DWI(id, d), ...acc])
+      _ -> number_checks_loop(rest, id, acc)
+    }
+  }
+}
+
+fn number_checks(decls: [Decl]) : [DeclWithId] =
+  number_checks_loop(decls, 0, [])
+
+fn emit_all_checks(src: String, decls: [Decl], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  let numbered = number_checks(decls)
+  concat_all(map(numbered, (dwi) => emit_one_check(src, lcs, fns, variants, lams, cls, dwi)))
+}
+
+fn check_count(decls: [Decl]) : Int = list_length(check_decls(decls))
+
+fn check_call_list(n: Int, i: Int) : String {
+  if i >= n { "" }
+  else {
+    concat_all(["    _kai_check_", int_to_string(i), "();\n", check_call_list(n, i + 1)])
+  }
+}
+
 fn has_main_decl(decls: [Decl]) : Bool {
   match decls {
     [] -> false
@@ -11137,7 +11294,7 @@ fn has_main_decl(decls: [Decl]) : Bool {
   }
 }
 
-fn emit_main_wrapper(decls: [Decl], test_mode: Bool, bench_mode: Bool) : String {
+fn emit_main_wrapper(decls: [Decl], test_mode: Bool, bench_mode: Bool, check_mode: Bool) : String {
   if test_mode {
     let n = test_count(decls)
     concat_all([
@@ -11154,6 +11311,15 @@ fn emit_main_wrapper(decls: [Decl], test_mode: Bool, bench_mode: Bool) : String 
       "    kai_set_args(argc, argv);\n",
       bench_call_list(n, 0),
       "    return kai_bench_summary();\n",
+      "}\n"
+    ])
+  } else if check_mode {
+    let n = check_count(decls)
+    concat_all([
+      "int main(int argc, char **argv) {\n",
+      "    kai_set_args(argc, argv);\n",
+      check_call_list(n, 0),
+      "    return kai_check_summary();\n",
       "}\n"
     ])
   } else if has_main_decl(decls) {
@@ -14120,7 +14286,7 @@ fn interp_part_to_expr(p: IPart, op_names: [String],
   }
 }
 
-fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, bench_mode: Bool) : String {
+fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, bench_mode: Bool, check_mode: Bool) : String {
   # m7a #6c: rewrite `Eff.op(args)` callees from `EField(EVar(Eff), op)`
   # to `EVar("Eff.op")` before code emission. The typer (synth_op_call_with_scheme)
   # produces this form internally, but check_infer is a diagnostic-only
@@ -14158,8 +14324,9 @@ fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, b
   let clause_bodies = emit_clause_bodies(src, clauses_info, [], fns, variants, lams, cls)
   let tests = emit_all_tests(src, decls, [], fns, variants, lams, cls)
   let benches = emit_all_benches(src, decls, [], fns, variants, lams, cls)
-  let main_wr = emit_main_wrapper(decls, test_mode, bench_mode)
-  concat_all([header, eff_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, main_wr])
+  let checks = emit_all_checks(src, decls, [], fns, variants, lams, cls)
+  let main_wr = emit_main_wrapper(decls, test_mode, bench_mode, check_mode)
+  concat_all([header, eff_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
 }
 
 # ====================================================================
@@ -28125,7 +28292,7 @@ fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffse
 
 fn llvm_build_globals_names(fns: [EFn], vs: [EVar], eff_names: [String], op_quals: [String]) : [String] = build_globals(fns, vs, eff_names, op_quals)
 
-fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], test_mode: Bool, bench_mode: Bool) : String {
+fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], test_mode: Bool, bench_mode: Bool, check_mode: Bool) : String {
   let alias_resolved = rewrite_alias_decls(raw_decls)
   let decls = alias_resolved
   let fns = register_fn_decls(decls)
@@ -32683,6 +32850,14 @@ type Mode
   # bench v1 (issue #40): emits a main wrapper that runs every
   # `bench "..." { ... }` block and reports mean ns/iter.
   | MBench
+  # check v1 (issue #44): emits a main wrapper that runs every
+  # `check "..." [with p: T, ...] { body }` property block.
+  # Distinct from MCheck (the typecheck-only dump triggered by
+  # `--check`) — that mode predates property-checks and stays at
+  # its existing flag. Property-check uses `--prop-check` to avoid
+  # the collision; the user-facing entry is `kai check <file.kai>`,
+  # which the bin/kai shell wrapper translates.
+  | MPropCheck
   | MHelp
   | MVersion
   # m12.6.x #2: dump per-fn body intervals for Int-typed expressions.
@@ -32767,6 +32942,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MTest))
       } else if a == "--bench" {
         parse_cli_loop(more, cli_with_mode(opts, MBench))
+      } else if a == "--prop-check" {
+        parse_cli_loop(more, cli_with_mode(opts, MPropCheck))
       } else if a == "-h" or a == "--help" {
         parse_cli_loop(more, cli_with_mode(opts, MHelp))
       } else if a == "-V" or a == "--version" {
@@ -33652,6 +33829,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       let unboxed_decls = unbox_pass(mono_decls)
                       let test_mode = match mode { MTest -> true _ -> false }
                       let bench_mode = match mode { MBench -> true _ -> false }
+                      let check_mode = match mode { MPropCheck -> true _ -> false }
                       let use_llvm = match mode { MEmitLlvm -> true _ -> false }
                       # Issue #37 — self-tail-call rewrite. Runs
                       # *before* Perceus on the C path so the
@@ -33682,9 +33860,9 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       if mono_inv_errs != 0 { mono_inv_errs }
                       else {
                         let out = if use_llvm {
-                          emit_program_llvm(path, src, perceus_decls, test_mode, bench_mode)
+                          emit_program_llvm(path, src, perceus_decls, test_mode, bench_mode, check_mode)
                         } else {
-                          emit_program(path, src, perceus_decls, test_mode, bench_mode)
+                          emit_program(path, src, perceus_decls, test_mode, bench_mode, check_mode)
                         }
                         print(out)
                         0
