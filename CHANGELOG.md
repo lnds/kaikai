@@ -9,6 +9,53 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **`examples/effects/m8x_4_request_reply.kai` — two-actor
+  request/reply round-trip fixture (issue #59).** Exercises the
+  cooperative scheduler symmetrically: client sends a request,
+  parks on `Actor.receive()`, server's `Actor.send` wakes it back
+  up. Wired into `stage2/Makefile`'s `test-effects` target. Closes
+  the explicit "two-actor ping-pong" acceptance criterion from
+  issue #59 §Definition of Done.
+
+### Changed
+
+- **`stdlib/actor.kai`, `stdlib/spawn.kai`, `stage0/runtime.h`
+  disclaimer sweep (issue #59).** Header paragraphs in the two
+  stdlib files and two paragraphs in the runtime header still
+  described the pre-`0.4.0` inline-eager runtime — `Actor.receive()`
+  on empty mailbox erroring at runtime, `Bounded(_, BlockSender)`
+  erroring at allocation, `Spawn.yield()` being a no-op,
+  `Spawn.spawn` running the thunk synchronously. Rewritten to match
+  the cooperative scheduler that has been in `main` since `0.4.0`
+  (R2 lane). The `nursery` body is honestly described as a typed
+  pass-through: children outlive the spawn call site, but the
+  cancel-on-fail-and-rethrow semantics from
+  `docs/structured-concurrency.md` is its own follow-up lane.
+- **`docs/roadmap.md` Wave 3 reframed.** Wave 3 is no longer "the
+  multi-week implementation lane for the cooperative scheduler" —
+  the runtime landed in `0.4.0`–`0.21.0`. Wave 3 now covers the
+  documentation alignment (this PR) plus two residual typer-side
+  items (full `TyBranded` region brand, per-op ROW generics on
+  Spawn) tracked in `docs/fibers-honesty-targets.md`
+  §*Residual m8.x items* and as separate GitHub issues.
+
+### Removed
+
+- **`docs/m8x-followup.md` deleted (issue #59).** The R2 runtime
+  lane that this file inventoried closed at `0.4.0`; the Tier 2
+  retrofit for `Monitor`, trap-exit, LLVM `in_dispatch_node`, and
+  per-op TYPE generics on Spawn closed by `0.21.0`. The two
+  remaining items migrated to `docs/fibers-honesty-targets.md`
+  §*Residual m8.x items* and have dedicated GitHub issues:
+  full `TyBranded` region brand (issue #71) and per-op ROW
+  generics on Spawn (issue #72). Active cross-references in
+  `docs/`, `examples/`, `stdlib/`, and `stage2/compiler.kai`
+  updated to point at the honesty-targets doc; CHANGELOG entries
+  from `0.4.0`–`0.29.0` retain their original `m8x-followup.md`
+  references as historical record.
+
 ### Documented
 
 - **Follow-up docs refreshed against current state.**

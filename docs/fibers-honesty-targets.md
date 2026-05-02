@@ -7,9 +7,11 @@ real-day estimates with the runtime-engineering velocity calibration
 (~5–10× faster than spec, not the 20–50× ratio that applied to
 mechanical lanes).
 
-This is a **scope decision**, not a roadmap. The roadmap proper lives
-in `docs/m8x-followup.md`; this file says *which followups are
-required for which honesty claim*. Nothing here promises a calendar.
+This is a **scope decision**, not a roadmap: it says *which
+followups are required for which honesty claim*. Nothing here
+promises a calendar. The §*Residual m8.x items* section below
+inventories what is left after the R2 lane closed (`0.4.0`) and the
+2026-04-30 Tier 2 retrofit landed.
 
 ## Where we are today (2026-04-29)
 
@@ -40,9 +42,9 @@ What does **not** work today:
   sigaltstack prints `kai: fiber stack overflow at <ptr>` before
   re-raising with the default disposition. Coverage:
   `examples/effects/m8_fiber_stack_overflow.kai`.
-- ~~`Monitor` is type-surface-only — Phase 5.5+ deferred in
-  `docs/m8x-followup.md` §5. Needs `spawn_actor` (Pid handoff
-  primitive) which itself is deferred.~~ **Closed 2026-04-30**
+- ~~`Monitor` is type-surface-only — Phase 5.5+ deferred. Needs
+  `spawn_actor` (Pid handoff primitive) which itself is
+  deferred.~~ **Closed 2026-04-30**
   (Fibers Tier 2 lane). `spawn_actor` lifts on `fiber_spawn` +
   `with_mailbox` via two new runtime helpers
   (`mailbox_alloc_unowned` + `mailbox_assign_owner`) so the
@@ -63,8 +65,7 @@ What does **not** work today:
   TyBranded machinery (propagation through every binding form,
   brand-mismatch detection between sibling nurseries) is the
   long-term shape pinned in `docs/structured-concurrency.md`
-  §*Type system* and deferred to a future lane —
-  `docs/m8x-followup.md` §6 captures the residual work.
+  §*Type system* and deferred — see §*Residual m8.x items* below.
 - ~~LLVM op-dispatch (`llvm_emit_op_dispatch`) does not carry the
   `in_dispatch_node` flag. The same bug #12 shape exists in the
   LLVM backend, hidden until someone hits a self-delegating
@@ -92,9 +93,9 @@ What does **not** work today:
   `await`, `select`, `cancel`) now carry `[T]`, so `Spawn.await(f)`
   flows back as `T` instead of TyAny. Per-op ROW generics
   (`spawn[T, e](f: () -> T / e)`) is a separate extension still
-  pending; the wrappers in `stdlib/spawn.kai` keep absorbing the
-  thunk's open row via TyAny. Coverage:
-  `examples/effects/m8_spawn_per_op_generics.kai`.
+  pending — see §*Residual m8.x items* below; the wrappers in
+  `stdlib/spawn.kai` keep absorbing the thunk's open row via TyAny.
+  Coverage: `examples/effects/m8_spawn_per_op_generics.kai`.
 
 ## Tier 1 — *Show HN honest* (~1 day)
 
@@ -121,11 +122,11 @@ can be parallelised across short lanes.
 |---|---:|---|
 | ~~R4 — fiber-discard deadlock~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
 | ~~Stack guard pages~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
-| ~~**Monitor + `spawn_actor`**~~ ✅ shipped 2026-04-30 | ~2–3d | Phase 5.5+ in `m8x-followup.md` §5 retrofitted; runtime walker mirrors Link + trap-exit, MonitorRef simplified to Pid[Nothing] in v1 |
-| **Region-brand full machinery** ⚠ partial 2026-04-30 | ~3–5d | Pid symmetric with Fiber in the shallow check; full `TyBranded` propagation (sum-type-payload escape + brand-mismatch detection) still pending — `docs/m8x-followup.md` §6 |
+| ~~**Monitor + `spawn_actor`**~~ ✅ shipped 2026-04-30 | ~2–3d | Phase 5.5+ retrofitted; runtime walker mirrors Link + trap-exit, MonitorRef simplified to Pid[Nothing] in v1 |
+| **Region-brand full machinery** ⚠ partial 2026-04-30 | ~3–5d | Pid symmetric with Fiber in the shallow check; full `TyBranded` propagation (sum-type-payload escape + brand-mismatch detection) still pending — see §*Residual m8.x items* |
 | ~~**LLVM op-dispatch `in_dispatch_node`**~~ ✅ shipped 2026-04-30 | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend — three runtime helpers (`kaix_evidence_lookup_node` / `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the KaiFiber struct out of the IR |
 | ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
-| ~~**Per-op generics in Spawn API**~~ ✅ partial 2026-04-30 | ~0.5d | TYPE generics retrofitted on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk still pending (`docs/m8x-followup.md` §7) |
+| ~~**Per-op generics in Spawn API**~~ ✅ partial 2026-04-30 | ~0.5d | TYPE generics retrofitted on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk still pending — see §*Residual m8.x items* |
 
 After this set, `docs/effects.md`, `docs/structured-concurrency.md`,
 `docs/actors.md`, and `docs/fibers-impl.md` claims are all
@@ -146,6 +147,89 @@ CLAUDE.md should keep "do not design against multi-threaded scheduler
 now" pinned for the same reason it pins WASM and Windows: the cost of
 designing for it pre-1.0 dwarfs the cost of doing it after the
 single-threaded model is locked in.
+
+## Residual m8.x items
+
+After the R2 lane closed (`0.4.0`) and the 2026-04-30 Tier 2 retrofit
+landed, two items from the original m8.x scope remain open. Both are
+typer-side, both are independent of the runtime, and both are tracked
+by GitHub issues. Neither blocks the disclaimer sweep that closes
+issue #59 — they were always scoped as separate lanes.
+
+### 1. Full `TyBranded` region brand (issue #71)
+
+The shallow `ty_expr_contains_fiber` / `ty_expr_contains_pid` walk
+catches a Fiber or Pid handle only when it appears in a TypeExpr
+the walker can see (TyName / TyList / TyFn / TyDim / TyRefine
+recursive descent). Two gaps remain:
+
+- *Sum-type-wrapped escape.* A `type Boxed = Wrapper(Fiber[Int])`
+  return value hides Fiber from the TypeExpr walker — the type's
+  surface name is `Boxed`; the constructor's payload is recorded in
+  the variant table, not in the TypeExpr the walker sees. Closing
+  this gap requires either (a) a TypeExpr-level "transitively
+  contains a banned handle" check that consults the variant table,
+  or (b) the full `TyBranded` propagation that tracks brands
+  through every binding form (let, match, list literal, record
+  field, fn arg, fn return). Option (a) is a tractable Tier 2
+  follow-up; option (b) is the spec'd long-term shape pinned in
+  `docs/structured-concurrency.md` §*Type system*.
+- *Brand mismatch between sibling nurseries.* Detecting that a
+  Fiber spawned in nursery `n1` is being passed into a `n2.spawn`
+  body needs lifetime-shaped tracking — fundamentally a
+  `TyBranded(Ty, BrandId)` feature, not a TypeExpr walk.
+
+Negative-test fixtures already in tree: `m8x_6_fiber_in_result.kai`,
+`m8x_6_pid_escapes.kai`. The sum-type-wrapped escape is the natural
+acceptance criterion for option (a); option (b) needs its own design
+doc lane.
+
+### 2. Per-op ROW generics on Spawn (issue #72)
+
+The four Fiber-shaped Spawn ops carry per-op `[T]` (TYPE generics)
+since Tier 2 (`m8_spawn_per_op_generics.kai`). The full Doc B shape
+
+```
+effect Spawn {
+  spawn[T, e](f: () -> T / e) : Fiber[T]
+  ...
+}
+```
+
+— with `e` a per-op *row* variable propagating the spawned thunk's
+row into the caller's row — has not landed.
+`add_effect_op_sigs_loop` only allocates `mk_tpbinds_from` (TYPE
+binds) for `op_tparams`; there is no op-level `mk_rvbinds`. Until
+that lands, the spawn op keeps `thunk: Nothing` (TyAny) so the
+wrappers in `stdlib/spawn.kai`
+(`fiber_spawn[T, e](f: () -> T / e) = Spawn.spawn(f)`) can absorb
+the open row through TyAny. After per-op row generics land, the
+wrappers reduce to one-line aliases (or are removed) and
+`Spawn.spawn[T, e]` becomes the canonical entry point. Doc C
+§*Per-op type generics* §*Implementation plan (m7b)* has the work
+plan; the additional row-bind plumbing is the small step that
+remains.
+
+### 3. Other minor items left behind by the R2 lane
+
+- Real race + cancel-losers semantics for `Spawn.select`. v1
+  (Phase 2) returns the head deterministically; the spec's race
+  semantics (lose-then-cancel-the-rest) is queued.
+- User-installed `with Cancel { raise(_) -> cleanup }` handlers on
+  runtime-triggered cancel. Phase 3 longjmps through the
+  trampoline `cancel_pad` directly; user cleanup clauses are not
+  invoked. Documented in the `kai_check_cancel_yield_point`
+  comment.
+- Structured cancel-on-fail in `nursery`. The `nursery` body in
+  `stdlib/spawn.kai` is currently a typed pass-through; the full
+  cancel-failed-siblings-and-rethrow shape from
+  `docs/structured-concurrency.md` requires the nursery to install
+  its own `Spawn` handler that observes child terminations through
+  Link.
+
+These three are notes for future agents — none of them surface to
+user code as runtime errors today, and none of them block the issue
+#59 close.
 
 ## Sequencing recommendation
 
@@ -170,10 +254,12 @@ multi-threaded scheduling comes in pre-1.0, the answer is "after
 - Not a calendar. Cost estimates assume nothing else competes for
   attention; in practice runtime engineering frequently REOPEN-s
   on first try (m12.8 precedent), add 1–2d per lane.
-- Not a list of all m8x-followup items — only the ones that
-  affect honesty claims. Spec-compliance items that don't
-  surface to user code (e.g. internal RC bookkeeping in the
-  scheduler queue) live in `m8x-followup.md` proper.
+- Not a complete inventory of every m8.x deferred item — only the
+  ones that affect honesty claims and the typer-side residuals
+  that survived after the runtime lane closed (see §*Residual
+  m8.x items*). Spec-compliance items that don't surface to user
+  code (e.g. internal RC bookkeeping in the scheduler queue) are
+  not tracked here.
 - Not an excuse to defer Tier 1. Show HN honesty is one day of
   work; not paying it means the next external reader gets a bad
   impression on minute 5.

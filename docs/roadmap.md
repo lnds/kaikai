@@ -10,10 +10,16 @@ horizon beyond.
 
 ## Status snapshot
 
-- **HEAD**: `0.30.0` (tier1-asan daily gate + kohau/henua rename)
-- **Current target**: kaikai-Tongariki Wave 3 — m8.x cooperative
-  scheduler (issue #59). Waves 1, 2, and the MVP cierre already
-  shipped (0.24.0–0.27.0).
+- **HEAD**: `0.31.0` (R9 closed + R10/R11 diagnostic + lane handoff
+  authorization)
+- **Current target**: kaikai-Tongariki Wave 3 — m8.x disclaimer
+  sweep + residual items (issue #59). The runtime side of m8.x —
+  cooperative scheduler, cancel delivery, blocking mailbox
+  primitives, Link / Monitor / trap-exit — landed in `0.4.0`–
+  `0.21.0`; the open work is documentation alignment plus two
+  smaller residual items (full TyBranded region brand, per-op ROW
+  generics on Spawn). Waves 1, 2, and the MVP cierre shipped at
+  `0.24.0`–`0.27.0`.
 - **Cross-cutting principles** (per CLAUDE.md):
   - Tier 1 #1 (memory safety + effects in types) — defendible
   - Tier 1 #2 (mandatory TCO) — defendible without footnote as of 0.23.0
@@ -36,12 +42,13 @@ the end).
 The 15-moai platform: the public face. Ship the language with
 the minimum testing and dev workflow that lets early adopters
 write real code. Delivered in waves; the MVP cierre (`0.27.0`)
-closed the original "ship a usable language" promise; **Wave 3**
-(m8.x cooperative scheduler) closes the *"early adopters write
-real code"* promise for the ecosystem-stack adopter (the
-canonical downstream consumer being `lnds/ahu`, whose initial
-design lane pinned m8.x as a hard upstream dependency — see
-issue #59).
+closed the original "ship a usable language" promise. The m8.x
+cooperative scheduler runtime that backs the actor and structured-
+concurrency surfaces shipped in `0.4.0` (R2 lane); **Wave 3**
+(issue #59) is the documentation sweep that brings stdlib and
+roadmap text in line with that runtime, plus the residual
+typer-side items (full `TyBranded` region brand, per-op ROW
+generics on Spawn).
 
 #### Wave 1 (`0.24.0`, shipped 2026-05-01) — `kai fmt` + TCO stage 1
 
@@ -79,39 +86,62 @@ issue #59).
   Replaced drop specialisation as the Tongariki optimization
   thread.
 
-#### Wave 3 (proposed) — m8.x cooperative scheduler (issue #59)
+#### Wave 3 — m8.x disclaimer sweep + residual items (issue #59)
 
-The actor surface that landed in m8 is only partially usable
-today: `Actor.receive()` on an empty mailbox is a runtime error
-(the inline-eager scheduler cannot suspend the caller until a
-message arrives), and `Bounded(c, BlockSender)` mailboxes error
-at allocation. `stdlib/actor.kai` lines 13–16 and 23–26 document
-the gap. Wave 3 closes it before Anga Roa polish work begins.
+The cooperative scheduler runtime landed in `0.4.0` (R2 lane,
+2026-04-28): `swapcontext`-based fiber substrate, intrusive ready
+queue, blocking mailbox primitives (Phase 4 — `Actor.receive()` on
+empty mailbox parks the caller; `Bounded(c, BlockSender)` parks the
+sender on full), Cancel delivery at every effect-op lookup
+(Phase 3 — `kai_check_cancel_yield_point` + trampoline `cancel_pad`),
+Link runtime (Phase 5), region-brand v1 (Phase 6 shallow check). The
+Tier 2 items (Monitor, trap-exit, LLVM `in_dispatch_node` mirror,
+per-op TYPE generics on Spawn) followed in `0.5.0`–`0.21.0`. End-to-
+end fixtures cover every cooperative semantic: see
+`examples/effects/m8x_2_yield_interleave.kai`,
+`m8x_3_cancel_at_yield.kai`, `m8x_4_recv_blocking.kai`,
+`m8x_4_request_reply.kai`, `m8x_4_block_sender.kai`,
+`m8_monitor.kai`, `m8_trap_exit.kai`, `m8_spawn_per_op_generics.kai`,
+`m8_fiber_stack_overflow.kai`, plus the multi-actor `demos/ping_pong/`
+demo (`demos/baseline.txt = 24` no-regression gate).
+
+What was open after `0.21.0` was a documentation gap: the headers in
+`stdlib/actor.kai`, `stdlib/spawn.kai`, and a pair of paragraphs in
+`stage0/runtime.h` still described the pre-`0.4.0` inline-eager
+runtime. That gap drives Wave 3.
 
 **Scope**:
 
-- Cooperative scheduler that suspends a fiber on
-  `Actor.receive()` when its mailbox is empty, resumes it when
-  a message arrives.
-- `BlockSender` mailbox policy delivery — sender parks on a
-  full bounded mailbox until space frees up, with cancel
-  propagation working at the yield point.
-- `Cancel.raise()` delivery at all yield points
-  (`receive`, `send` under `BlockSender`, `await`, `select`,
-  `yield`). The trap-exit path that landed in m8 needs the
-  scheduler to actually inject `Cancel` at runtime.
-- End-to-end fixture: a two-actor ping-pong where actor A
-  sends, actor B parks on `receive`, B receives, replies, A
-  parks on `receive`, A receives. Today this fails with the
-  inline-eager scheduler; under m8.x it should complete.
+- **Disclaimer sweep**. Bring `stdlib/actor.kai`, `stdlib/spawn.kai`,
+  and the leftover paragraphs in `stage0/runtime.h` (above
+  `KaiMboxNode` and the `KAI_OVERFLOW_*` defines) in line with the
+  cooperative scheduler that has been in `main` since `0.4.0`.
+  Same PR adds `examples/effects/m8x_4_request_reply.kai` for
+  explicit two-actor request/reply round-trip coverage.
+- **Residual item — full `TyBranded` region brand.** The shallow
+  `ty_expr_contains_fiber` / `ty_expr_contains_pid` walk catches
+  Fiber and Pid handles only when they are surface-level in the
+  return type. Sum-type-wrapped escapes (e.g.
+  `type Boxed = Wrapper(Fiber[Int])` returned from a non-stdlib
+  helper) and brand-mismatch detection between sibling nurseries
+  need the `TyBranded(Ty, BrandId)` propagation pinned in
+  `docs/structured-concurrency.md` §*Type system*. Tracked in
+  `docs/fibers-honesty-targets.md` §*Residual m8.x items*.
+- **Residual item — per-op ROW generics on Spawn.** The four
+  Fiber-shaped Spawn ops carry per-op `[T]` (TYPE generics) since
+  Tier 2; the spawned thunk's row variable still flows through the
+  `thunk: Nothing` (TyAny) erasure rather than via a per-op
+  `[T, e]` row binding. Reduces the wrappers in `stdlib/spawn.kai`
+  to one-line aliases. Tracked in
+  `docs/fibers-honesty-targets.md` §*Residual m8.x items*.
 
-Out of scope for Wave 3: multi-thread scheduler (Orongo),
-asm-level context switch (Orongo), preemption / fairness
-guarantees (post-MVP per `docs/structured-concurrency.md`
-§*Non-goals*), distributed actors (Orongo+).
+Out of scope for Wave 3: multi-thread scheduler (Orongo), asm-level
+context switch (Orongo), preemption / fairness guarantees (post-MVP
+per `docs/structured-concurrency.md` §*Non-goals*), distributed
+actors (Orongo+).
 
-**Definition of Done** (Tongariki overall, with Wave 3 closing
-the remaining gap):
+**Definition of Done** (Tongariki overall, with Wave 3 closing the
+remaining gap):
 
 1. `kai test`, `kai check`, `kai bench`, `kai fmt` all functional
    and exercised by fixtures under `examples/stdlib/` and a
@@ -126,19 +156,18 @@ the remaining gap):
    tier1-asan daily gate added in `0.30.0`.)*
 5. CLAUDE.md Tier 1 closure remains defendible (no new
    footnotes). *(Holds.)*
-6. **Wave 3 (m8.x)**: `stdlib/actor.kai` no longer needs the
-   *"receive on empty mailbox is a runtime error"* disclaimer;
-   `Bounded(c, BlockSender)` works end-to-end; two-actor
-   ping-pong fixture passes; `lnds/ahu/docs/design.md`
-   §*External dependencies on kaikai* gaps 1 and 2 closeable
-   (coordinated PR follows on the ahu side);
-   `docs/fibers-honesty-targets.md` Tier 1 / Tier 2 reflect
-   the closed gap.
+6. **Wave 3 (m8.x)**: stdlib disclaimers no longer describe the
+   pre-`0.4.0` inline-eager runtime; the two-actor request/reply
+   fixture (`m8x_4_request_reply.kai`) is wired and passes;
+   `lnds/ahu/docs/design.md` §*External dependencies on kaikai*
+   gaps 1 and 2 closeable (coordinated PR follows on the ahu side);
+   `docs/fibers-honesty-targets.md` Tier 1 / Tier 2 reflect the
+   closed gap and the residual items have GitHub issues.
 
-**Estimated cost**: Waves 1+2+cierre shipped in ~2 weeks of
-agent work distributed across ~5 lanes. Wave 3 (m8.x) adds
-~2–3 weeks for the cooperative scheduler runtime + cancel
-delivery + fixture, comparable in scale to the original m8.
+**Estimated cost**: Waves 1+2+cierre shipped in ~2 weeks of agent
+work distributed across ~5 lanes. Wave 3 disclaimer sweep is one
+small lane (~1 day); the two residual typer items are independent
+lanes (~3–5d each) that can land in parallel with Anga Roa.
 
 ### Anga Roa — pre-1.0
 
