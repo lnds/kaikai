@@ -121,6 +121,15 @@ Defaults that every agent must follow without being told:
   change is documentation-only or trivially text-edit. CI catches
   what local skips miss; this rule is now a velocity tool, not a
   gate.
+- **Doc-only changes skip every tier — locally AND in CI.** A lane
+  whose diff is confined to `docs/`, root-level `*.md`
+  (CLAUDE.md, README.md), or `LICENSE` does NOT run `make tier0` /
+  `make tier1` / `make tier1-asan` locally, and the
+  `tier1.yml` workflow's `paths-ignore` makes CI skip those PRs
+  too. Burning ~4 minutes of CI on a doc-only push is wasted
+  velocity. Code paths (`stage*/`, `stdlib/`, `examples/`,
+  `demos/`, `.github/`, `Makefile`, `VERSION`, build scripts)
+  ALWAYS trigger every tier, locally and in CI.
 - **Tier 1 — gated by CI on every PR**: GitHub Actions runs
   `make tier0 && make tier1` on every PR and on every push to
   `main`. **CI green is the merge gate** — the PR description no
@@ -151,6 +160,24 @@ Adjacent rules every agent must apply:
   used to live in `docs/*-followup.md` + `docs/known-regressions.md`;
   those were retired in PR #99, see "Where pending work lives"
   below.)
+- **Regression-fixture discipline**: every fix lane must add at
+  least one fixture that exercises the bug shape it fixed, wired
+  into the appropriate tier (`make tier1` for typer / language
+  fixes; `make tier1-asan` for runtime / emit / RC fixes). The
+  fixture lives in `examples/effects/` (effect-shaped bugs),
+  `examples/perceus/` (RC bugs), `examples/sugars/` (sugar
+  desugar bugs), or wherever the closest existing precedent
+  sits. Negative fixtures (compile / runtime errors) get a
+  `.err.expected` golden; positive fixtures get a `.out.expected`.
+  The R9 fix (PR #66) that landed without an in-tree fixture is
+  the precedent: the bug had a 25-line repro that took agents
+  hours to reconstruct from the regression-tracker text; R10/R11's
+  lane (PR #65 + PR #70) avoided that by promoting its diagnostic
+  fixtures into permanent regression coverage. Any future
+  regression of the same shape now produces a deterministic diff
+  under tier1 / tier1-asan instead of bit-rotting in a doc. The
+  closing PR's body must explicitly name the new fixture(s) so the
+  integrator can verify the discipline was followed.
 - **Lane handoff — push + PR is authorized**: an agent spawned
   in a worktree (e.g. via `/wt-claude`) **is authorized to push
   its lane branch to origin and open a pull request via
