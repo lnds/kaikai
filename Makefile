@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-fmt test-bench demos-verify demos-no-regression selfhost clean tier0 tier1 daily coverage-probe rc-budget stress-fixtures
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-fmt test-bench test-check demos-verify demos-no-regression selfhost clean tier0 tier1 daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -74,8 +74,8 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-bench
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke"
+tier1: test demos-no-regression test-fmt test-bench test-check
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke"
 
 # Tongariki — `kai fmt` fixture suite. Verifies that every fixture
 # in examples/fmt/ formats to its `.expected.kai` and is idempotent,
@@ -109,6 +109,34 @@ test-bench: kaic2
 	  cat /tmp/kaikai-bench-basic.out; exit 1; \
 	fi; \
 	echo "test-bench OK — $$matched benches printed in expected format"
+
+# check v1 (issue #44) — smoke for `kai check`. Builds + runs the
+# `examples/stdlib/check_basic.kai` fixture and verifies the output
+# format. The fixture is constructed so every property holds for
+# every value the generators can produce; if a counterexample
+# appears it indicates a real regression in the runtime, the
+# emitter, or the generator range, not just an unlucky seed.
+# Failure modes:
+#   - kai check exits non-zero (compile / runtime / counterexample)
+#   - any of the four check result lines is missing or malformed
+#   - the trailing `4/4 checks passed` summary is missing
+test-check: kaic2
+	@./bin/kai check examples/stdlib/check_basic.kai > /tmp/kaikai-check-basic.out 2>&1; \
+	rc=$$?; \
+	if [ $$rc -ne 0 ]; then \
+	  echo "test-check FAIL — kai check exited $$rc"; \
+	  cat /tmp/kaikai-check-basic.out; exit 1; \
+	fi; \
+	matched=$$(grep -E ': 100 iter, OK$$' /tmp/kaikai-check-basic.out | wc -l | tr -d ' '); \
+	if [ "$$matched" != "4" ]; then \
+	  echo "test-check FAIL — expected 4 OK lines, got $$matched"; \
+	  cat /tmp/kaikai-check-basic.out; exit 1; \
+	fi; \
+	if ! grep -qE '^4/4 checks passed$$' /tmp/kaikai-check-basic.out; then \
+	  echo "test-check FAIL — missing '4/4 checks passed' summary"; \
+	  cat /tmp/kaikai-check-basic.out; exit 1; \
+	fi; \
+	echo "test-check OK — $$matched property blocks passed"
 
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
