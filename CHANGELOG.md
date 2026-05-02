@@ -149,6 +149,64 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
     `stage2/Makefile` `test-tco-zero-arg` (and the `test` /
     `test-fast` targets), so any future regression of this exact
     shape produces a deterministic diff under tier1.
+- **Nested `with_mailbox` + `spawn_actor` under trap-exit no longer
+  SIGSEGVs (issue #104, mvp-blocker).** A fiber spawned inside a
+  trap-exit'd supervisor that opened a nested `with_mailbox` of a
+  different `Msg` type and called `spawn_actor` inside that nested
+  scope used to crash silently at runtime (exit 139, no diagnostic).
+  The reporter framed it as mailbox bookkeeping; the real root cause
+  was the evidence-stack inheritance.
+  `kai_default_spawn_spawn` set `child->evidence_top =
+  parent->evidence_top` as a shared pointer, but the lexical
+  guarantee held only at the level of "stack memory mapping", not
+  "stack memory contents". Once the parent's code returns past the
+  inherited frames, any subsequent call the parent makes (a
+  `Stdout.print` after closing the inner `with_mailbox`, the
+  link/monitor propagate walks at trampoline tail, etc.) writes its
+  locals into the SAME stack slots the popped `KaiEvidence` frames
+  lived in. Their `eff_label` / `parent` fields turn into garbage
+  long before the spawned child runs, so the child's first effect
+  lookup walks the inherited pointer into corrupted memory.
+  - At spawn time the runtime now clones the inherited evidence
+    chain into heap-allocated `KaiEvidence` nodes
+    (`kai_clone_evidence_chain`). The child's `evidence_top`
+    points at the heap chain head; lookup-walk navigation reads
+    only memory the child owns. The chain is owned solely by this
+    fiber and freed in `kai_free_value`'s KAI_FIBER branch via
+    `kai_free_cloned_evidence_chain`. The clone is shallow:
+    `handler` / `handle_jmp` / `discard_slot` still point at the
+    original `*Ev` structs, which is fine for default handlers
+    (their `*Ev` lives in static storage from the main wrapper)
+    and accepted as a known limitation for inherited *user*
+    handlers — those `*Ev` structs sit on a parent's stack and
+    face the same overwrite hazard regardless of the chain
+    representation.
+  - The first attempt at this fix pinned the parent's wrapper
+    (`kai_incref`) at spawn so the parent's mmap'd stack stayed
+    alive. Local macOS tier1 + tier1-asan went green, but CI on
+    Ubuntu segfaulted: keeping the stack mmap'd was not enough,
+    because the pop-and-reuse pattern above clobbers the *contents*
+    at the inherited frame addresses long before the parent's
+    stack would be reclaimed. Reproduced under
+    `docker run --platform linux/amd64 ubuntu:22.04` and traced
+    the lookup walk to confirm the corrupted frame; the heap-clone
+    model side-steps it entirely.
+  - Regression fixture
+    `examples/effects/m8x_9_nested_mailbox_under_trap_exit.kai`
+    pins the exact composition (worker linked to a trap-exit'd
+    supervisor, nested mailbox of a different `Msg` type,
+    `spawn_actor` inside that nested scope, supervisor receives
+    `"Normal"`). Wired into `TRACE_FIXTURES` so it runs under
+    both `make tier1` (`test-trace`) and `make tier1-asan`
+    (`test-trace-asan`) — the bug was heap territory and ASAN is
+    the appropriate gate.
+  - Out of scope: the v1 mailbox-slot simplification at
+    `stage0/runtime.h` (a fiber's `mailbox` slot is overwritten
+    by inner `with_mailbox` allocs and not restored on inner
+    free) remains; trap-exit delivery to a peer currently inside
+    an inner `with_mailbox` of a different `Msg` type still
+    lands in the inner mailbox of the wrong type. Separate
+    type-confusion concern, not a crash; follow-up.
 - **R8 (issue #94, mvp-blocker) — let-bound unboxable
   reference inside `#{...}` interpolation slot now compiles.**
   A body like
