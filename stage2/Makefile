@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco test-tco-regression test-trace test-trace-asan test-foreign-prelude selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude selfhost
 
 all: $(TARGET)
 
@@ -2183,7 +2183,36 @@ test-tco-zero-arg: $(TARGET) build
 	  && echo "tco-zero-arg OK (issue #102 zero-arg self-tail-call compiles + runs to completion)" \
 	  || { echo "tco-zero-arg DIFF"; diff ../examples/perceus/r12_zero_arg_recursive.out.expected build/tco-zero.out; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-runtime-shadow test-foreign-prelude
+# Issue #89 — perceus-wrap TCO regression fixture. The
+# `bench_loop` driver in unbox_bench.kai is a self-tail-recursive
+# fn whose body has multi-use parameters that perceus wraps in
+# `EBlock([SLet("__pcs_ret", body), exit_drops], Some(EVar("__pcs_ret")))`.
+# Pre-fix the TCO walker ran AFTER perceus and missed the tail
+# position because of the wrap, so the loop allocated a stack
+# frame per iteration and overflowed past ~50 k iterations. The
+# fix that landed via issues #42 / #102 runs the TCO rewrite
+# BEFORE perceus; the sentinel callee survives the wrap (its
+# name is not in any param scope) and `emit_fn_body` plants
+# `_kai_<sym>_entry:` ahead of the wrap's `return`. N is set to
+# 1_000_000 — well past the pre-fix overflow point — so any
+# future regression of the same shape produces a deterministic
+# stack overflow under tier1 instead of bit-rotting in a doc.
+# We also grep the emitted C to assert the goto-loop label
+# actually lands on `kai_bench_loop`.
+test-tco-perceus-wrap: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/perceus/unbox_bench.kai > build/tco-perceus.c; \
+	grep -F -q '_kai_bench_loop_entry:;' build/tco-perceus.c \
+	  || { echo "tco-perceus-wrap FAIL (no _kai_bench_loop_entry label in emitted C)"; exit 1; }; \
+	grep -F -q 'goto _kai_bench_loop_entry;' build/tco-perceus.c \
+	  || { echo "tco-perceus-wrap FAIL (no goto _kai_bench_loop_entry in emitted C)"; exit 1; }; \
+	$(CC) $(CFLAGS) -I ../stage0 build/tco-perceus.c -o build/tco-perceus; \
+	./build/tco-perceus > build/tco-perceus.out; \
+	diff -q ../examples/perceus/unbox_bench.out.expected build/tco-perceus.out > /dev/null \
+	  && echo "tco-perceus-wrap OK (issue #89 1M-deep self-tail-call through perceus wrap; goto label emitted; runs to completion)" \
+	  || { echo "tco-perceus-wrap DIFF"; diff ../examples/perceus/unbox_bench.out.expected build/tco-perceus.out; exit 1; }
+
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -2192,7 +2221,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-foreign-prelude
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude
 
 clean:
 	rm -rf build $(TARGET)
