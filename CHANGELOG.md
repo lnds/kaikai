@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-05-02 (post-Tongariki — Trace effect + Tier 3 experiment 1)
+
 ### Added
 
 - **`stdlib/trace.kai` — minimal `Trace` effect with default
