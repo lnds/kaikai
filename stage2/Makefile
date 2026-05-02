@@ -1404,6 +1404,57 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (recursive sum traversal terminates, no false positive)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
 	done; \
+	for f in ../examples/effects/m8x_8_nursery_cap.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored on cap-binding fixture)"; \
+	         cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^33$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (cap-binding nursery n.spawn / n.await, issue #71 prereq)" \
+	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m8x_8_brand_through_match.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored on positive same-nursery fixture)"; \
+	         cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^123$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (same-nursery let-chain through brand check)" \
+	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m8x_8_sibling_nursery_mismatch.kai \
+	         ../examples/effects/m8x_8_brand_propagation_let_chain.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_err=../examples/effects/$$name.err.expected; \
+	  rc=0; ./$(TARGET) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
+	  fi; \
+	  while read -r line; do \
+	    grep -qF "$$line" build/s2-$$name.err \
+	      || { echo "effects FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/s2-$$name.err; exit 1; }; \
+	  done < $$exp_err; \
+	  echo "effects OK $$name (sibling-nursery brand mismatch, issue #71 option (b))"; \
+	done; \
+	for f in ../examples/effects/m8x_8_brand_dump.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=../examples/effects/$$name.brands.expected; \
+	  ./$(TARGET) --dump-brands --path ../stdlib $$f > build/s2-$$name.brands 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored on --dump-brands)"; \
+	         cat build/s2-$$name.err; exit 1; }; \
+	  diff -u $$exp build/s2-$$name.brands \
+	    && echo "effects OK $$name (--dump-brands golden, issue #71 option (b))" \
+	    || { echo "effects FAIL $$name (--dump-brands diverged from golden)"; exit 1; }; \
+	done; \
 	for f in ../examples/effects/m8_7_actor_self_send.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
