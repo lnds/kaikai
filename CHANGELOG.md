@@ -83,6 +83,40 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Fixed
 
+- **Issue #89 — last open mvp-blocker: `bench_loop` recursion in
+  `examples/perceus/unbox_bench.kai` was capped at `N = 20_000`
+  by a stale comment claiming TCO did not fire on tail calls
+  inside a perceus-wrapped block (`({ ... drop ...; ret; })`).**
+  The underlying bug was already fixed: the TCO rewrite has run
+  BEFORE perceus since issue #42 (PR #45 / #149aa52, the M1
+  fixup that flipped the order in stage 2 + stage 1), and the
+  zero-arg sentinel edge case was closed by issue #102 / PR
+  #109. Today's `stage2/kaic2 examples/perceus/unbox_bench.kai`
+  emits `_kai_bench_loop_entry:;` and `goto _kai_bench_loop_entry`
+  inside `kai_bench_loop`, so the loop runs in O(1) C-stack space
+  and 1_000_000 iterations finish in ~80 ms with the default
+  8 MiB stack on macOS.
+  - `examples/perceus/unbox_bench.kai` and
+    `examples/perceus/unbox_bench_real.kai` raise `N` from
+    `20_000` to `1_000_000` — well past the pre-fix overflow
+    point of ~50 k — so the bench actually exercises stack
+    safety. Stale comments in both files removed; the `main`
+    docstring now points at issue #89 and explains the
+    pre-perceus / post-perceus pipeline order.
+  - `examples/perceus/unbox_bench.c.ref` and
+    `examples/perceus/unbox_bench_real.c.ref` raise their `N`
+    to match so the ratio comparison stays meaningful.
+  - New regression-fixture gate `test-tco-perceus-wrap` in
+    `stage2/Makefile` builds + runs `unbox_bench.kai`, greps
+    the emitted C for the `_kai_bench_loop_entry` label and
+    the matching `goto`, and diffs the output against the new
+    `unbox_bench.out.expected` (`757654000000\n`). Wired into
+    `test` and `test-fast`, so any future regression of the
+    same shape produces a deterministic tier1 failure
+    instead of bit-rotting in a follow-up doc.
+  - Closes the last open mvp-blocker; the next release can
+    drop the asterisk on Tongariki MVP claims.
+
 - **Issue #115 — `make tier1-asan` failed on Linux/clang for
   every demo that dispatched through a default effect handler
   (Stdout / Stderr / Fail / Stdin / Env / File / Random / NetTcp /
