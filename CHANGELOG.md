@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-05-02 (tier1-asan daily gate + kohau/henua rename)
+
 ### Added
 
 - **`make tier1-asan` — daily memory-safety gate.** Recompiles
