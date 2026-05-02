@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.30.1] — 2026-05-02 (roadmap refresh — m8.x → Tongariki Wave 3)
+
 ### Changed
 
 - **`docs/roadmap.md` refreshed; m8.x promoted to Tongariki Wave 3
