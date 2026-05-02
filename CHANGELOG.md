@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.33.0] — 2026-05-02 (NetTcp v1 — first byte-level networking effect)
+
 ### Added
 
 - **NetTcp v1 — byte-level TCP networking effect.** First lane of
