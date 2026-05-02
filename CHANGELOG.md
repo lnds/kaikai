@@ -9,6 +9,53 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Fixed
+
+- **R8 (issue #94, mvp-blocker) — let-bound unboxable
+  reference inside `#{...}` interpolation slot now compiles.**
+  A body like
+
+      fn main() : Unit / Stdout = {
+        let n = 42
+        Stdout.print("v=#{int_to_string(n)}")
+      }
+
+  used to emit a `.c` that `cc` rejected with `use of undeclared
+  identifier 'kai_n'; did you mean 'kair_n'?`. The unbox pass
+  marked the let-binding `MUnboxed` (raw `int64_t kair_n`), but
+  the emit-time interpolation re-parses the `#{...}` segment
+  without consulting the unbox alias map and resolved the EVar
+  via `emit_ident_value` to the boxed name `kai_n`. The two
+  passes disagreed on which alias to spell.
+
+  Fix: `unbox_stmt`'s `SLet` branch now mirrors its
+  closure-capture demote check with a parallel
+  `name_in_interp_in_block` walker. When `nm` is referenced
+  inside any `#{...}` slot in the rest of the block, the
+  binding is demoted to `MBoxed` (`KaiValue *kai_<nm>`) so the
+  read site finds an actual symbol in scope. Type-agnostic —
+  same fix covers Int, Real, Bool, Char.
+
+  Issue #94 named two fix paths: (a) lift the interpolation
+  desugar before the unbox pass so `EVar(n)` lands inside a
+  visible call-arg slot; (b) demote the binding when its only
+  escape route is interpolation. (a) is structurally heavier:
+  the existing interpolation desugar lifts to
+  `__proto_show(...)` and is gated on a `Show` protocol
+  declaration, so making it always run would require a
+  different shape for the no-`Show` case (the legacy
+  `kai_to_string` helper is a runtime-only symbol, not a
+  kaikai-callable function). (b) is one localised walker that
+  mirrors an existing precedent (closure-capture demote) and
+  reuses `scan_uses_in_interp` for the leaf check.
+
+  Regression coverage:
+  `examples/perceus/unbox_phase2_r8_let_in_interp.kai` with
+  structural assertions (`KaiValue *kai_n = kai_int(42LL)` must
+  appear; `int64_t kair_n` must not). The Trace fixture
+  `examples/effects/trace_basic.kai` reverted from its `++`
+  workaround back to natural `#{int_to_string(value)}` form.
+
 ## [0.35.0] — 2026-05-02 (#71 option (b) closed + tracker docs retired + infra discipline)
 
 ### Added
