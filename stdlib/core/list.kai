@@ -399,6 +399,133 @@ pub fn sort_by(xs: [a], cmp: (a, a) -> Int) : [a] {
 pub fn sort(xs: [Int]) : [Int] = sort_by(xs, int_cmp)
 
 # ===================================================================
+# Canonical higher-order list helpers — issue #106.
+# ===================================================================
+# The four effectful workhorses (`map`, `filter`, `foldl`, `foreach`)
+# carry an open row variable `e` so the callback's effects flow out
+# to the caller — the kaikai idiom for free functions taking
+# effectful callbacks (`docs/protocols.md` §With effects). The
+# inspection helpers (`length`, `reverse`, `zip`, `unzip`) take no
+# callback and use no row variable.
+#
+# `map` and `filter` collide with the prelude's row-poly runtime
+# builtins of the same shape (`prelude_table` in
+# `stage2/compiler.kai`). Name resolution lets the prelude win at
+# unqualified call sites — `map(xs, f)` always reaches the runtime
+# implementation. The pure-kaikai definitions here serve qualified
+# callers (`list.map(xs, f)` / `list.filter(xs, p)`) and keep the
+# `core.list` export surface honest with `docs/stdlib-layout.md`
+# §`core`. `foldl` / `foreach` are the kaikai-idiomatic spellings
+# of the prelude's `reduce` / `each` and are reachable both
+# qualified and unqualified.
+
+# Tail-recursive accumulator for `length`.
+fn length_loop(xs: [a], acc: Int) : Int {
+  match xs {
+    [] -> acc
+    [_, ...t] -> length_loop(t, acc + 1)
+  }
+}
+
+# Number of cons cells in `xs`. O(n), no allocation.
+pub fn length(xs: [a]) : Int = length_loop(xs, 0)
+
+# Tail-recursive accumulator for `reverse`. `out` carries the
+# already-reversed prefix; the final `out` is the full reversal.
+fn reverse_loop(xs: [a], out: [a]) : [a] {
+  match xs {
+    [] -> out
+    [h, ...t] -> reverse_loop(t, [h, ...out])
+  }
+}
+
+# Returns `xs` reversed. O(n) cons cells; the head element of the
+# input becomes the last cell of the output.
+pub fn reverse(xs: [a]) : [a] = reverse_loop(xs, [])
+
+# Maps `f` over `xs`, propagating any effects in `f` through the
+# row variable `e`. Empty input yields `[]`; `f` is invoked exactly
+# once per element, in left-to-right order.
+pub fn map[a, b, e](xs: [a], f: (a) -> b / e) : [b] / e {
+  match xs {
+    [] -> []
+    [h, ...t] -> [f(h), ...map(t, f)]
+  }
+}
+
+# Returns the elements of `xs` for which `p` returns true,
+# preserving order. `p` is invoked exactly once per element.
+pub fn filter[a, e](xs: [a], p: (a) -> Bool / e) : [a] / e {
+  match xs {
+    [] -> []
+    [h, ...t] -> if p(h) { [h, ...filter(t, p)] } else { filter(t, p) }
+  }
+}
+
+# Tail-recursive left fold. `f` is invoked once per element with
+# the running accumulator on the left and the element on the
+# right. Effects in `f` flow out via `e`. Empty input returns
+# `init` unchanged.
+pub fn foldl[a, r, e](xs: [a], init: r, f: (r, a) -> r / e) : r / e {
+  match xs {
+    [] -> init
+    [h, ...t] -> foldl(t, f(init, h), f)
+  }
+}
+
+# Right fold. Implemented as a left fold over `reverse(xs)` with
+# the arguments to `f` flipped, so the recursion stays in tail
+# position and TCO-eligible. Side-effect order matches the natural
+# `f(x1, f(x2, ..., f(xn, init)))` shape: the rightmost call (which
+# evaluates `f(xn, init)` first under strict semantics) maps to the
+# first iteration of the reversed left-fold. Costs one extra O(n)
+# `reverse` pass over a stack-naive recursive `foldr`.
+pub fn foldr[a, r, e](xs: [a], init: r, f: (a, r) -> r / e) : r / e =
+  foldl(reverse(xs), init, (acc, x) => f(x, acc))
+
+# Iterates `f` over `xs` for its effects, discarding return values.
+# Returns `Unit`; effects in `f` flow out via `e`. Empty input is a
+# no-op. The kaikai-idiomatic spelling of the prelude's `each`.
+pub fn foreach[a, e](xs: [a], f: (a) -> Unit / e) : Unit / e {
+  match xs {
+    [] -> ()
+    [h, ...t] -> { f(h); foreach(t, f) }
+  }
+}
+
+# Element-wise pair of `xs` and `ys`, truncated to the shorter list
+# (Haskell convention). The leftover suffix of the longer input is
+# discarded silently. Pure — `zip_with` is the variant that takes a
+# combiner.
+pub fn zip(xs: [a], ys: [b]) : [Pair[a, b]] {
+  match xs {
+    [] -> []
+    [hx, ...tx] -> match ys {
+      [] -> []
+      [hy, ...ty] -> [Pair { fst: hx, snd: hy }, ...zip(tx, ty)]
+    }
+  }
+}
+
+# Tail-recursive accumulator for `unzip`. `as_acc` and `bs_acc`
+# carry the already-split fst/snd projections in reverse cons
+# order; both are reversed at the call site so the result preserves
+# the input order.
+fn unzip_loop(xs: [Pair[a, b]], as_acc: [a], bs_acc: [b]) : Pair[[a], [b]] {
+  match xs {
+    [] -> Pair { fst: reverse(as_acc), snd: reverse(bs_acc) }
+    [h, ...t] -> unzip_loop(t, [h.fst, ...as_acc], [h.snd, ...bs_acc])
+  }
+}
+
+# Splits a list of pairs into a pair of parallel lists. Inverse of
+# `zip` for equal-length inputs:
+# `unzip(zip(xs, ys)) == Pair { fst: xs, snd: ys }` when
+# `length(xs) == length(ys)`. Pure.
+pub fn unzip(xs: [Pair[a, b]]) : Pair[[a], [b]] =
+  unzip_loop(xs, [], [])
+
+# ===================================================================
 # Legacy aliases — pre-m14 flat-prefix surface.
 # ===================================================================
 # These thin wrappers keep callers that still spell `list_*` (the

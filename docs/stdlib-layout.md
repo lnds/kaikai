@@ -205,7 +205,7 @@ land in each module's own spec when implemented.
 
 ### core (pure, stage 1)
 
-- `core.list` — map, filter, foldl, foldr, length, reverse, nth, take, drop, zip, unzip, concat, any, all, find, index_of, sum, product
+- `core.list` — map, filter, foldl, foldr, foreach, length, reverse, nth, take, drop, zip, unzip, concat, any, all, find, index_of, sum, product
 - `core.string` — starts_with, ends_with, trim, split, join, repeat, slice, length, to_lower, to_upper, replace, contains, chars
 - `core.option` — is_some, is_none, map, and_then, unwrap_or, or_else
 - `core.result` — is_ok, is_err, map, map_err, and_then, unwrap_or
