@@ -26,6 +26,25 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   future regressions of the same shape surface within 24 h
   of merge instead of waiting on a user report.
 
+### Changed
+
+- **Rename `ahu-db` → `kohau` and `ahu-ddd` → `henua` (issue #56).**
+  The placeholder `ahu-` prefix implied submodule status, but
+  each is a separate framework with its own repository, roadmap,
+  release cycle, and (eventually) team — Phoenix's stack model
+  (Phoenix / Ecto / Plug as separate repos) over Akka's monorepo
+  style. The new names are standalone Rapa Nui terms: `kohau`
+  ("inscribed wooden tablet" — substrate that carried rongorongo,
+  maps to a persistence layer's substrate role) and `henua`
+  ("land / territory / domain" — direct mapping to DDD's
+  "domain"). Affects `docs/roadmap.md` (ecosystem stack diagram,
+  sequencing table, "What this doc is NOT") and
+  `docs/stage2-design.md` (banking demos reference). The
+  `lnds/ahu` side already landed in `lnds/ahu#1` (`5548b5f`).
+  No code or repo-level renames are involved (the `lnds/kohau`
+  and `lnds/henua` repos do not exist yet; they will be named
+  `kohau` / `henua` from day one when created).
+
 ## [0.29.0] — 2026-05-02 (Tier 3 experiment 2 — handler composition + R9/R10/R11 surfaced)
 
 ### Added

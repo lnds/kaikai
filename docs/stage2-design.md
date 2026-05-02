@@ -971,8 +971,8 @@ with `.out.expected` golden files and harness wiring. The
 `m12_8_compiler_shapes.kai` fixture stays as a smoke test for the
 derive surface.
 
-Banking-style demos (`/tmp/ahu-ddd-example/`) are NOT in Core scope —
-they require `ahu` (OTP-analog) and `ahu-ddd` framework layers that
+Banking-style demos (`/tmp/henua-example/`) are NOT in Core scope —
+they require `ahu` (OTP-analog) and `henua` framework layers that
 land post-Core (~5-6 weeks total). Banking is validation of "Core +
 framework", not Core alone.
 

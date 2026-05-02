@@ -240,9 +240,9 @@ kaikai (the language)
    ↓
 ahu (OTP-style framework: supervision, gen-server, BEAM-style)
    ↓
-ahu-db (database / persistence layer)
+kohau (database / persistence layer)
    ↓
-ahu-ddd (DDD building blocks: aggregates, repositories, domain events)
+henua (DDD building blocks: aggregates, repositories, domain events)
    ↓
 manutara (Phoenix-LiveView-style web framework)
 ```
@@ -263,9 +263,9 @@ manutara (Phoenix-LiveView-style web framework)
 | ahu       | effects + actors + structured concurrency in main; **already true today**.           |
 |           | Recommended to wait for `kaikai-Tongariki` so `kai fmt` / `kai test` / `check`       |
 |           | are available for ahu development from day one.                                      |
-| ahu-db    | post `ahu-Tongariki`                                                                 |
-| ahu-ddd   | post `ahu-db-Tongariki`                                                              |
-| manutara  | post `ahu-ddd-Tongariki` — manutara needs ahu + ahu-db + ahu-ddd at least at MVP.    |
+| kohau     | post `ahu-Tongariki`                                                                 |
+| henua     | post `kohau-Tongariki`                                                               |
+| manutara  | post `henua-Tongariki` — manutara needs ahu + kohau + henua at least at MVP.         |
 
 Each downstream project does not wait for 1.0.0 of its
 dependency. It waits for that dependency's Tongariki (MVP).
@@ -274,7 +274,7 @@ This unlocks parallelism: once `kaikai-Tongariki` ships,
 
 ### What this doc is NOT
 
-- Not the roadmap for ahu, ahu-db, ahu-ddd, or manutara.
+- Not the roadmap for ahu, kohau, henua, or manutara.
   Those projects own their own `docs/roadmap.md` once they
   start. This doc only mentions them to make the
   layering explicit.
