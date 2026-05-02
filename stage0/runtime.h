@@ -2298,6 +2298,148 @@ static int kai_bench_summary(void) {
     return 0;
 }
 
+/* ---------- check harness hooks (used by --check runs) ----------
+ * check v1 (issue #44): property-based testing. Each `check "..."
+ * [with p: T, ...] { body }` block is executed KAI_CHECK_ITERS
+ * times. Each iteration generates random values for the with-clause
+ * params via kai_arbitrary_<T>() and runs the body. The body must
+ * produce a Bool — true means the property held for that input,
+ * false records a counterexample and exits early.
+ *
+ * v1 reports the FIRST counterexample only (no shrinking). Shrinking
+ * + median-based outlier-counterexample selection deferred to v1.x;
+ * protocol-based generators (impl Arbitrary for T) deferred to v2
+ * post-protocols maturity (see issue #44 split plan).
+ */
+
+#define KAI_CHECK_ITERS 100
+
+static int kai_check_count_total = 0;
+static int kai_check_count_passed = 0;
+static const char *kai_check_current_desc = NULL;
+
+#define KAI_CHECK_CX_BUF 1024
+static char kai_check_cx_buf[KAI_CHECK_CX_BUF];
+static size_t kai_check_cx_len = 0;
+
+/* xorshift64* PRNG. Seeded once per process with a constant so
+   counterexample reports are reproducible run-to-run; reseed via
+   KAI_CHECK_SEED env var lands in v1.x. */
+static uint64_t kai_check_seed = 0xC0DECAFE12345678ULL;
+
+static uint64_t kai_check_rand_u64(void) {
+    kai_check_seed ^= kai_check_seed >> 12;
+    kai_check_seed ^= kai_check_seed << 25;
+    kai_check_seed ^= kai_check_seed >> 27;
+    return kai_check_seed * 0x2545F4914F6CDD1DULL;
+}
+
+static void kai_check_cx_reset(void) {
+    kai_check_cx_buf[0] = '\0';
+    kai_check_cx_len = 0;
+}
+
+static void kai_check_cx_append_raw(const char *s, size_t n) {
+    if (!s || n == 0) return;
+    if (kai_check_cx_len + n + 1 >= KAI_CHECK_CX_BUF) {
+        n = KAI_CHECK_CX_BUF - 1 - kai_check_cx_len;
+        if (n == 0) return;
+    }
+    memcpy(kai_check_cx_buf + kai_check_cx_len, s, n);
+    kai_check_cx_len += n;
+    kai_check_cx_buf[kai_check_cx_len] = '\0';
+}
+
+static void kai_check_cx_append(const char *s) {
+    if (!s) return;
+    kai_check_cx_append_raw(s, strlen(s));
+}
+
+/* Records "name=<repr>" in the counterexample buffer. Called by the
+   emitted check fn after each kai_arbitrary_<T> generator inside the
+   per-iter loop, before evaluating the body, so that on failure the
+   buffer already holds every input the predicate saw. v repr uses
+   kai_to_string (borrow). */
+static void kai_check_record_param(const char *name, KaiValue *v) {
+    if (kai_check_cx_len > 0) kai_check_cx_append(", ");
+    kai_check_cx_append(name);
+    kai_check_cx_append("=");
+    KaiValue *s = kai_to_string(v);
+    if (s && s->tag == KAI_STR) {
+        kai_check_cx_append_raw(s->as.s.bytes, s->as.s.len);
+    }
+    kai_decref(s);
+}
+
+static void kai_check_begin(const char *desc) {
+    kai_check_count_total++;
+    kai_check_current_desc = desc;
+}
+
+static void kai_check_pass(int iters) {
+    kai_check_count_passed++;
+    fprintf(stderr, "  %s: %d iter, OK\n",
+            kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
+            iters);
+}
+
+static void kai_check_fail(int iter_at) {
+    fprintf(stderr, "  %s: counterexample at iter %d: %s\n",
+            kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
+            iter_at, kai_check_cx_buf);
+}
+
+static int kai_check_summary(void) {
+    fprintf(stderr, "\n%d/%d checks passed\n",
+            kai_check_count_passed, kai_check_count_total);
+    return (kai_check_count_passed == kai_check_count_total) ? 0 : 1;
+}
+
+/* Intrinsic generators (issue #44 path b). Each returns a fresh
+   KaiValue * with rc=1 ready for the body to consume or drop. The
+   ranges are kept small so counterexamples are human-readable
+   (Int in [-50, 50], String len in [0, 10], list len in [0, 7]). */
+
+static KaiValue *kai_arbitrary_int(void) {
+    int64_t r = (int64_t)(kai_check_rand_u64() % 101) - 50;
+    return kai_int(r);
+}
+
+static KaiValue *kai_arbitrary_bool(void) {
+    return kai_bool((int)(kai_check_rand_u64() & 1));
+}
+
+static KaiValue *kai_arbitrary_char(void) {
+    /* printable ASCII ('!' .. '~') */
+    uint32_t c = (uint32_t)(0x21 + (kai_check_rand_u64() % 0x5E));
+    return kai_char(c);
+}
+
+static KaiValue *kai_arbitrary_string(void) {
+    int len = (int)(kai_check_rand_u64() % 11);
+    char buf[16];
+    for (int i = 0; i < len; i++) {
+        buf[i] = (char)(0x21 + (kai_check_rand_u64() % 0x5E));
+    }
+    return kai_str_from_bytes(buf, (size_t) len);
+}
+
+/* List generators by element kind. v1 supports primitive elements
+   only. Structural sum/record/list-of-non-primitive lands in v1.x
+   together with the typer-side derivation. */
+#define KAI_DEFINE_ARBITRARY_LIST(NAME, ELEM)                          \
+    static KaiValue *NAME(void) {                                      \
+        int len = (int)(kai_check_rand_u64() % 8);                     \
+        KaiValue *acc = kai_nil();                                     \
+        for (int i = 0; i < len; i++) acc = kai_cons(ELEM(), acc);     \
+        return acc;                                                    \
+    }
+KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_int,    kai_arbitrary_int)
+KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_bool,   kai_arbitrary_bool)
+KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_char,   kai_arbitrary_char)
+KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_string, kai_arbitrary_string)
+#undef KAI_DEFINE_ARBITRARY_LIST
+
 /* Runtime-aware assert: called from every emitted `assert`. Inside an
    active test (kai_test_in_progress) it prints a failure and longjmps
    back to the test harness so the next test can run. Otherwise it
