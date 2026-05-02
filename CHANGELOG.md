@@ -9,6 +9,32 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **`stdlib/trace.kai` — minimal `Trace` effect with default
+  handler (Tier 3 arm A).** Two operations — `log(msg)` and
+  `checkpoint(name)`, both returning `Unit` — plus
+  `with_trace_default[R, e](body) : R / Stdout + e` which runs
+  `body` under a handler that prefixes every op with `[trace] `
+  (and `[trace] checkpoint: ` for `checkpoint`) and writes via
+  `Stdout.print`. Output is deterministic (no timestamps) so
+  fixtures can golden-match it; user code can override the
+  handler by writing its own `handle ... with Trace { ... }`.
+  Wired into `stage2/Makefile` as `test-trace` (`test` and
+  `test-fast`). Smoke fixture: `examples/effects/trace_basic.kai`.
+- **`docs/known-regressions.md` — R8.** Documents an unbox-phase-2
+  / string-interpolation interaction discovered while authoring
+  the Trace fixture: `let n = INT_LITERAL` followed by use inside
+  `#{int_to_string(n)}` produces a C build that references both
+  `kair_n` (unboxed local) and `kai_n` (boxed-name expected by
+  the prelude call generated for the interpolation slot). The
+  Trace fixture works around it with explicit `++` concat in the
+  one affected slot; full repro and fix-path notes inline.
+- **`docs/lane-experience-tier3-arm-a.md`** — agent retrospective
+  on the Trace lane covering JSON tooling usage (`--effects-json`
+  / `--effect-holes-json`), the R8 detour, and Tier 3 evidence
+  for the LLM-authorability bet.
+
 ## [0.27.0] — 2026-05-02 (Tongariki MVP closed — Real unboxing landed, 5/5)
 
 ### Added
