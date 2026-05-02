@@ -8,8 +8,20 @@ without ever surfacing the refinement in the typer's `Ty`.
 **Update 2026-04-27/28 (m12.6.x closed end-to-end):** items #1, #2
 (param-refinement entailment v1), #3 (match-arm narrowing), #4,
 #5 (enforcement + attribute parser), #6, and #8 (positional msg)
-all landed. The only remaining item is #7 regex literals, which
-is blocked on a separate regex stdlib lane.
+all landed.
+
+**Update 2026-04-28 (#2 deepened, #7 unblocked):**
+- #2 progressed beyond v1: the `Interval` lattice (`ITop | IBot |
+  Ival(Int, Int)`) landed in `0a6e0f2`, and the interval pass +
+  `--dump-intervals` flag + `examples/intervals/basic.kai`
+  fixture landed in `b6bd5f6`. Alpha-equivalent matching,
+  operator rewriting, and call-site substitution still pending —
+  see "Still pending under #2" below.
+- #7 is **partially unblocked**: the regex stdlib (RE2-style NFA,
+  Phases 1–7) shipped in `a1cdda9`, and `3909c71` pinned the
+  status. The refinement-side syntax (`String where matches
+  /.../`, lexer/parser integration, subsumption check) remains as
+  the m12.6.x sub-lane.
 
 ## What landed in m12.6 v1 (for context)
 
@@ -66,21 +78,28 @@ but each arm is small. The biggest risk is the unifier — get the
 direction wrong and either every refinement leaks into every base
 type, or every assignment to a base needs an explicit cast.
 
-### 2. Static interval propagation through refined args *(v1 LANDED 2026-04-27, FULL VERSION STILL PENDING)*
+### 2. Static interval propagation through refined args *(v1 LANDED 2026-04-27; sub-steps 1–4 LANDED 2026-04-28; FULL VERSION STILL PENDING)*
 
-**v1**: preds_to_asserts now drops a contract assert that is
-**structurally identical** to one of the fn's parameter refinements
-(`fn divide(a: Int, b: Int where b != 0) requires b != 0` → zero
-asserts emitted). Match: literals by value, EVar by name,
-EBinop/EUnop by op + recursive sub-equality. ~70 lines including
-the Expr-walker.
+**v1** (2026-04-27, `413e1eb`): preds_to_asserts now drops a
+contract assert that is **structurally identical** to one of the
+fn's parameter refinements (`fn divide(a: Int, b: Int where b !=
+0) requires b != 0` → zero asserts emitted). Match: literals by
+value, EVar by name, EBinop/EUnop by op + recursive
+sub-equality. ~70 lines including the Expr-walker.
+
+**Sub-step 1** (2026-04-28, `0a6e0f2`): `Interval = ITop | IBot |
+Ival(Int, Int)` lattice as foundation for interval reasoning.
+~188 lines in `stage2/compiler.kai`.
+
+**Sub-steps 2+3+4** (2026-04-28, `b6bd5f6`): interval pass +
+`--dump-intervals` flag + `examples/intervals/basic.kai` fixture.
+Real interval reasoning (`x >= 1` entailed by `x > 0` on Int) is
+now mechanically supported by the lattice.
 
 **Still pending under #2**:
 - Alpha-equivalent matching: `requires b > 0` against
   `Int where x > 0` (different variable names) doesn't fire.
 - Operator rewriting: `x > 0` not entailed by `0 < x`.
-- Real interval reasoning: `x >= 1` not entailed by `x > 0` even
-  on Int. Needs a lattice.
 - Substitution at the call site: omitting an assert when the
   caller passes a literal (`divide(10, 5)` would entail
   `requires b != 0` since `5 != 0` folds to true). The v1
@@ -197,9 +216,15 @@ instead of the runtime trap.
 
 Cost: ~half a day. Just a different sink in `preds_to_asserts`.
 
-### 7. Regex predicates — `String where matches /.../ `
+### 7. Regex predicates — `String where matches /.../ ` *(PARTIALLY UNBLOCKED 2026-04-28)*
 
-Requires:
+**Stdlib half landed** (`a1cdda9`, regex Phases 1–7): RE2-style
+NFA, public API `regex_compile / match / find_all / replace /
+split`, ASCII subset (no backrefs / no lookaround). `3909c71`
+pins the status in `docs/stdlib-layout.md` and
+`docs/stage2-design.md`.
+
+**Refinement-side half still pending** as the m12.6.x sub-lane:
 - A regex literal in the lexer (`/.../`, anchored only, no
   backreferences, no lookaheads — Pony / Ada Static_Predicate
   subset).
@@ -207,11 +232,10 @@ Requires:
 - A subsumption check in the static-proof pass (regex containment
   for the literals supported).
 
-Cost: 1–2 days. Most of the cost is the regex evaluator; the
-spec is explicit that we **reuse the runtime regex library** at
-compile time rather than write a new one. Until that library
-exists, this item is also blocked on a separate "regex stdlib"
-lane.
+Cost: ~1 day now that the runtime evaluator exists. The
+compile-time path can call into the same `regex_compile` /
+`regex_match` runtime helpers directly; no separate evaluator
+needed.
 
 ### 8. Diagnostics quality *(v1 LANDED 2026-04-27, FULL VERSION STILL PENDING)*
 
@@ -260,8 +284,10 @@ Items #5, #6 are independent of #1–#4 and could land as
 prerequisites if the refinement-pure validation shows up in early
 demos. Estimate ~half a day each.
 
-Items #7, #8 are largest and most isolated. #7 blocks on a regex
-stdlib lane; #8 lands inside m11 if not before.
+Items #7, #8 are largest and most isolated. #7's stdlib half
+landed 2026-04-28 (`a1cdda9` + `3909c71`); only the
+refinement-side syntax + subsumption remain. #8 lands inside m11
+if not before.
 
 ## Relation to the Tier 3 LLM-affordances bet
 

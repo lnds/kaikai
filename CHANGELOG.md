@@ -9,6 +9,33 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Documented
+
+- **Follow-up docs refreshed against current state.**
+  `docs/m12-6x-followup.md` updated: #2 sub-steps 1–4 (Interval
+  lattice in `0a6e0f2` + interval pass / `--dump-intervals` flag
+  / fixture in `b6bd5f6`) marked landed; #7 marked partially
+  unblocked (regex stdlib half landed in `a1cdda9` /
+  `3909c71` — only the refinement-side syntax remains).
+  `docs/unboxing-phase2-followup.md` updated: Real (`double`)
+  unboxing landed in `a6f4295` and is no longer Phase 3.
+- **Prelude audit relocated.** The post-Core ergonomic-tightening
+  candidate list moved out of `docs/m12.8-followup.md` into a
+  dedicated `docs/prelude-audit.md`, since those candidates
+  (redundant `string_concat` / `array_make` / `int_to_string` /
+  etc.) outlive the m12.8 lane scope.
+- **`docs/m12.8-followup.md` retired (deleted).** All items in
+  the m12.8 follow-up tracker closed end-to-end (8 bugs + Gap 1,
+  post-Core REOPEN, `map_expr_kind` shared visitor). The file
+  was deleted to reduce file noise; pre-retirement content
+  available via `git log -- docs/m12.8-followup.md`. Existing
+  references from the `lane-experience-m12.8*.md` writeups
+  (kept intentionally as frozen historical narratives), from
+  `stage2-design.md` / `protocols.md` / `prelude-audit.md`, and
+  from this CHANGELOG entry now carry an inline
+  `(retired 2026-05-02; see git history)` annotation rather than
+  resolving to a live file.
+
 ## [0.31.1] — 2026-05-02 (R10/R11 fix — single-state-read UAF closed)
 
 ### Fixed

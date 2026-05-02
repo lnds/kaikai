@@ -121,6 +121,17 @@ when present.
 
 ## Real / String / Array / `var` / cross-fiber messages
 
-All explicitly Phase 3 per
-`docs/unboxing-phase2-design.md` §Non-goals. No follow-up
+**Real LANDED 2026-05-01** (`a6f4295` — Tongariki M1+M2
+extension). `decide_mode` classifies `TyReal` as `MUnboxed`;
+`raw_c_type` / `box_wrap` / `unbox_field_for` grew a `double`
+row each; `emit_kind_raw` lowers `EReal(r)` directly via
+`real_to_string(r)`. Two type-aware gates protect the v1
+boundaries: `%` (modulo) stays boxed when the result type is
+non-integral (no native C `double` modulo), and the M5 match
+switch fast path only fires for integral scrutinees (a raw
+`double` cannot drive a C `switch`). Selfhost stays
+byte-identical when no Real value reaches the unbox pass.
+
+**String / Array / `var` / cross-fiber messages** remain Phase 3
+per `docs/unboxing-phase2-design.md` §Non-goals. No follow-up
 needed inside this doc; the design pin already covers them.

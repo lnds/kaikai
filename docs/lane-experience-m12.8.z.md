@@ -157,7 +157,8 @@ all four protocols, but doing so without the lane brief's blessing
 would be scope creep. The other derives keep their v1 behaviour:
 missing impls fall through to the dispatcher's runtime panic. This
 is a documented v1 tradeoff; tightening it for Show / Eq / Hash is
-captured as a follow-up in `docs/m12.8-followup.md`.
+captured as a follow-up in `docs/m12.8-followup.md` (retired
+2026-05-02; see git history).
 
 ### Recursive types whitelisted
 
@@ -228,4 +229,5 @@ rebase is expected to be empty or trivially keep-both.
 - Single agent (Claude Opus 4.7). Not generalisable across LLMs.
 - The println / collatz failure was not investigated beyond
   confirming it is pre-existing; root-causing it is a separate
-  ticket (likely belongs in `docs/m12.8-followup.md`).
+  ticket (likely belongs in `docs/m12.8-followup.md` — retired
+  2026-05-02; see git history).
