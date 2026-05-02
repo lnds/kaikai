@@ -71,6 +71,30 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   output prefixes (`OK`, `FAIL`) come from the body, not the
   function name — `.out.expected` files are unchanged.
 
+### Docs
+
+- **Drop specialisation lane closed as doc-only PR (Tongariki
+  optimisation thread).** Per-tag `kai_decref_<tag>` /
+  `kai_internal_drop_<tag>` helpers in `stage0/runtime.h` and
+  emitter dispatch in `stage2/compiler.kai` (`drop_fn_name_for` /
+  `decref_fn_name_for`, plus `pcs_make_drop_stmt` propagating the
+  param's resolved `Ty`) were implemented end-to-end. Selfhost
+  C + LLVM byte-identical, tier1 green, no UB signal — but the
+  wall-clock improvement on `kaic2` self-compile measured
+  **−1.7% at `-O2`** and **+5.4% (regression) at `-O0`**, both
+  well below the lane's ≥10% success threshold. Phase 2
+  unboxing (PR #38) had already eliminated the bulk of the
+  boxing/dispatch overhead this optimisation targets; static
+  inline helpers do not inline at `-O0` and the per-tag dispatch
+  win is too narrow to absorb the source-size growth at the
+  default build. Per the project's "ship measurable or nothing"
+  discipline, the code changes are reverted; full investigation
+  and measurements are pinned in
+  `docs/lane-experience-drop-specialisation.md`. The next
+  high-ROI Perceus optimisation is **reuse-in-place** (Anga Roa,
+  `docs/perceus-honesty-targets.md` Tier 3a) — drop
+  specialisation is not a prerequisite.
+
 ## [0.25.0] — 2026-05-02 (Tongariki Wave 2 — bench v1)
 
 ### Added

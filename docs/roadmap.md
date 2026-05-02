@@ -42,8 +42,20 @@ write real code.
   `kai bench` runner. Issue #40.
 - `kai fmt` — gofmt-style deterministic formatter, no options.
 - Drop specialisation — per-type drop chains inlined at emit
-  time instead of going through runtime dispatch. Reduces
-  alloc churn. *(Optimization thread for this milestone.)*
+  time instead of going through runtime dispatch.
+  **Closed 2026-05-01 as doc-only PR.** End-to-end
+  implementation measured −1.7% at `-O2` and a +5.4%
+  regression at `-O0` on `kaic2` self-compile — both well
+  below the lane's ≥10% success threshold. Phase 2 unboxing
+  had already absorbed the addressable overhead. Re-evaluation
+  is paired with the Anga Roa **reuse-in-place** lane, which
+  may shift the alloc mix enough to unlock per-tag dispatch on
+  KAI_RECORD / KAI_VARIANT. Retro pinned in
+  `docs/lane-experience-drop-specialisation.md`.
+  *(Optimization thread for this milestone — closed without
+  shipping; the Tongariki perf trajectory below is therefore
+  paced by `bench v1` + `check v1` + TCO followups, not by
+  this item.)*
 - TCO followups — issue #42 (stage 1 mirror) and issue #43
   (precise per-call-site dropmask cons-cell case).
   Housekeeping from 0.23.0.
