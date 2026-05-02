@@ -183,6 +183,19 @@ matched?" query, distinct from typed holes.
   per-milestone) is reconstructed from the TSV, not measured.
 - Single agent (Claude). Not generalisable.
 
+## Protocol divergence — single-commit lane
+
+The instrumentation template (the M6 step in the lane brief) asks
+for the lane-experience report and CHANGELOG entry to be committed
+*separately* from the feature commit. I interpreted M6 as the
+*closing step* of a single bench-v1 commit and bundled all eight
+file changes (six modified + two new, including this retro and
+`CHANGELOG.md`) into one commit (`3ebca4b`). The integrator
+flagged this as a non-blocking deviation post-fact; recording it
+here as data for the LLM-authorship baseline. Future lanes should
+follow the template literally: feature commit first, then a
+docs-only commit with the retro.
+
 ## Raw build log
 
 ```
