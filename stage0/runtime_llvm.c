@@ -293,6 +293,28 @@ KaiValue *kaix_default_random_int_range(void *self, KaiValue *lo, KaiValue *hi, 
     return kai_default_random_int_range(self, lo, hi, k);
 }
 
+/* net-tcp-v1 — LLVM-visible wrappers around the static NetTcp
+ * default handlers in runtime.h. The LLVM emitter installs these
+ * by name from `kai_main_install_defaults`. */
+KaiValue *kaix_default_nettcp_connect(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
+    return kai_default_nettcp_connect(self, host, port, k);
+}
+KaiValue *kaix_default_nettcp_listen(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
+    return kai_default_nettcp_listen(self, host, port, k);
+}
+KaiValue *kaix_default_nettcp_accept(void *self, KaiValue *l, KaiCont *k) {
+    return kai_default_nettcp_accept(self, l, k);
+}
+KaiValue *kaix_default_nettcp_send(void *self, KaiValue *c, KaiValue *data, KaiCont *k) {
+    return kai_default_nettcp_send(self, c, data, k);
+}
+KaiValue *kaix_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max, KaiCont *k) {
+    return kai_default_nettcp_recv(self, c, max, k);
+}
+KaiValue *kaix_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
+    return kai_default_nettcp_close(self, c, k);
+}
+
 /* m7c-d — install/teardown default handlers for builtins that
  * appear in main's row. The LLVM emitter generates the body of
  * these two functions per program (filling in the right

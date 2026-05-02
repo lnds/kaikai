@@ -9,6 +9,41 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **NetTcp v1 — byte-level TCP networking effect.** First lane of
+  the broader Net surface; UDP / DNS / URL / HTTP defer to follow-up
+  lanes (`net-udp-v1`, `net-dns-v1`, `net-url-v1`, `net-http-v1`).
+  - `effect NetTcp` ships in the compiler's builtin catalog
+    (`stage2/compiler.kai builtin_nettcp_decl`), with the six
+    spec ops `connect / listen / accept / send / recv / close`
+    pinned in `docs/effects-stdlib.md` §`NetTcp`.
+  - Companion type decls for the opaque handles `Conn = { fd:
+    Int }` and `Listener = { fd: Int, port: Int }`. The `port`
+    slot lets a server bound to `127.0.0.1:0` discover the
+    kernel-assigned port via `net.tcp.local_port` without a
+    seventh effect op.
+  - Runtime default handler in `stage0/runtime.h` (six
+    `kai_default_nettcp_*` functions, AF_INET, blocking) wired
+    through both the C and LLVM emit paths via
+    `default_nettcp_setup` / `llvm_emit_main_install_defaults`.
+    Mirrors the existing FFI-to-libc pattern used by Random /
+    File. Errors map to `Err(strerror(errno))`; `recv(_, max=0)`
+    panics; `recv == 0` returns `Ok([])` for clean peer close.
+  - Stdlib helper module `stdlib/net/tcp.kai` (importable as
+    `import net.tcp`) exposes `local_port(l: Listener) : Int`.
+  - Fixture `examples/effects/net_tcp_localhost.kai` (mirrored
+    at `demos/net_tcp_localhost/main.kai` so `tier1-asan`
+    exercises it). Sequences listen → connect → accept → ping
+    / pong → close in a single fiber under the inline-eager
+    scheduler; v1 demos baseline bumped from 24 → 25.
+  - v1 limitations pinned in `stdlib/effects.kai`'s NetTcp
+    catalog memo: IPv4 only, blocking ops (reactor-driven async
+    is m8.x scope), no `Listener.close` op, `Net` alias waits on
+    NetUdp + NetDns lanes, `[Byte]` lands as `[Int]` until
+    kaikai grows a real Byte type, `Result` type-arg order
+    flipped to kaikai's Err-first / Ok-second convention.
+
 ## [0.32.0] — 2026-05-02 (Tongariki Wave 3 closed — m8.x docs alignment + follow-up tracker refresh)
 
 ### Added

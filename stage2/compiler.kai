@@ -7419,6 +7419,20 @@ fn collect_effect_names(decls: [Decl]) : [String] {
   }
 }
 
+# net-tcp-v1: walk the declared types so the NetTcp / Conn / Listener
+# / Byte builtin injection in `inject_builtin_effects` can defer to
+# any user-supplied decl with the same name. Mirrors
+# `collect_effect_names` for DType.
+fn collect_type_names(decls: [Decl]) : [String] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DType(_, name, _, _, _, _) -> [name, ...collect_type_names(rest)]
+      _ -> collect_type_names(rest)
+    }
+  }
+}
+
 fn check_row_labels(decls: [Decl], file: String, eff_names: [String],
                      arities: [EffArity]) : Int {
   match decls {
@@ -11884,6 +11898,25 @@ fn default_random_setup() : String =
     "    kai_evidence_push(&_kai_default_node_random, \"Random\", &_kai_default_ev_random);\n"
   ])
 
+# net-tcp-v1: default NetTcp handler — POSIX sockets, blocking. Six
+# ops wired to `kai_default_nettcp_*` in stage0/runtime.h. Installed
+# whenever `main`'s row mentions `NetTcp` (or expands an alias that
+# resolves to it). v1 limitations (IPv4-only, blocking, no listener
+# close) live with the spec memo in stdlib/effects.kai.
+fn default_nettcp_setup() : String =
+  concat_all([
+    "    static EvNetTcp _kai_default_ev_nettcp;\n",
+    "    static KaiEvidence _kai_default_node_nettcp;\n",
+    "    _kai_default_ev_nettcp.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_nettcp.connect = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_nettcp_connect;\n",
+    "    _kai_default_ev_nettcp.listen  = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_nettcp_listen;\n",
+    "    _kai_default_ev_nettcp.accept  = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiCont *)) &kai_default_nettcp_accept;\n",
+    "    _kai_default_ev_nettcp.send    = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_nettcp_send;\n",
+    "    _kai_default_ev_nettcp.recv    = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_nettcp_recv;\n",
+    "    _kai_default_ev_nettcp.close   = (KaiValue *(*)(EvNetTcp *, KaiValue *, KaiCont *)) &kai_default_nettcp_close;\n",
+    "    kai_evidence_push(&_kai_default_node_nettcp, \"NetTcp\", &_kai_default_ev_nettcp);\n"
+  ])
+
 # m7b #2b: default Mutable handler — wraps the prelude `array_*`
 # runtime functions with clauses that resume with the result. Each
 # slot is initialised to the matching `kai_default_mutable_*`
@@ -11991,6 +12024,7 @@ fn default_setups_for(main_row: [String]) : String = {
     if list_has(main_row, "Env")     { default_env_setup() }     else { "" },
     if list_has(main_row, "File")    { default_file_setup() }    else { "" },
     if list_has(main_row, "Random")  { default_random_setup() }  else { "" },
+    if list_has(main_row, "NetTcp")  { default_nettcp_setup() }  else { "" },
     if list_has(main_row, "Mutable") { default_mutable_setup() } else { "" },
     if list_has(main_row, "Cancel")  { default_cancel_setup() }  else { "" },
     if list_has(main_row, "Link")    { default_link_setup() }    else { "" },
@@ -12007,6 +12041,7 @@ fn default_pops_for(main_row: [String]) : String =
     if list_has(main_row, "Link")    { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Cancel")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Mutable") { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "NetTcp")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Random")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "File")    { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Env")     { "    kai_evidence_pop();\n" } else { "" },
@@ -26162,6 +26197,14 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_default_mutable_array_set(i8*, %KaiValue*, %KaiValue*, %KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_default_mutable_array_grow(i8*, %KaiValue*, %KaiValue*, %KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_default_random_int_range(i8*, %KaiValue*, %KaiValue*, i8*)\n",
+    # net-tcp-v1 — default NetTcp handler wrappers (see
+    # stage0/runtime_llvm.c).
+    "declare %KaiValue* @kaix_default_nettcp_connect(i8*, %KaiValue*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_nettcp_listen(i8*, %KaiValue*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_nettcp_accept(i8*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_nettcp_send(i8*, %KaiValue*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_nettcp_recv(i8*, %KaiValue*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_nettcp_close(i8*, %KaiValue*, i8*)\n",
     "\n"
   ])
 
@@ -27545,6 +27588,13 @@ fn llvm_default_builtin_decls(main_row: [String]) : String {
         "@_kai_default_node_random = internal global [48 x i8] zeroinitializer\n",
         "@_kai_default_random_name = private unnamed_addr constant [7 x i8] c\"Random\\00\"\n"
       ])
+    } else { "" },
+    if list_has(main_row, "NetTcp") {
+      concat_all([
+        "@_kai_default_ev_nettcp = internal global %EvNetTcp zeroinitializer\n",
+        "@_kai_default_node_nettcp = internal global [48 x i8] zeroinitializer\n",
+        "@_kai_default_nettcp_name = private unnamed_addr constant [7 x i8] c\"NetTcp\\00\"\n"
+      ])
     } else { "" }
   ])
 }
@@ -27623,6 +27673,29 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
       "  call void @kaix_evidence_push(i8* %node_random_p, i8* getelementptr inbounds ([7 x i8], [7 x i8]* @_kai_default_random_name, i64 0, i64 0), i8* %ev_random_void)\n"
     ])
   } else { "" }
+  let nettcp_ = if list_has(main_row, "NetTcp") {
+    concat_all([
+      "  ; install NetTcp default handler (net-tcp-v1)\n",
+      "  %hid_nettcp = call i64 @kaix_fresh_handler_id()\n",
+      "  %ev_nettcp_hid_p = getelementptr %EvNetTcp, %EvNetTcp* @_kai_default_ev_nettcp, i32 0, i32 0\n",
+      "  store i64 %hid_nettcp, i64* %ev_nettcp_hid_p\n",
+      "  %ev_nettcp_connect_p = getelementptr %EvNetTcp, %EvNetTcp* @_kai_default_ev_nettcp, i32 0, i32 3\n",
+      "  store %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, %KaiValue*, i8*)* @kaix_default_nettcp_connect to %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)** %ev_nettcp_connect_p\n",
+      "  %ev_nettcp_listen_p = getelementptr %EvNetTcp, %EvNetTcp* @_kai_default_ev_nettcp, i32 0, i32 4\n",
+      "  store %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, %KaiValue*, i8*)* @kaix_default_nettcp_listen to %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)** %ev_nettcp_listen_p\n",
+      "  %ev_nettcp_accept_p = getelementptr %EvNetTcp, %EvNetTcp* @_kai_default_ev_nettcp, i32 0, i32 5\n",
+      "  store %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_nettcp_accept to %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiCont*)** %ev_nettcp_accept_p\n",
+      "  %ev_nettcp_send_p = getelementptr %EvNetTcp, %EvNetTcp* @_kai_default_ev_nettcp, i32 0, i32 6\n",
+      "  store %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, %KaiValue*, i8*)* @kaix_default_nettcp_send to %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)** %ev_nettcp_send_p\n",
+      "  %ev_nettcp_recv_p = getelementptr %EvNetTcp, %EvNetTcp* @_kai_default_ev_nettcp, i32 0, i32 7\n",
+      "  store %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, %KaiValue*, i8*)* @kaix_default_nettcp_recv to %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiValue*, %KaiCont*)** %ev_nettcp_recv_p\n",
+      "  %ev_nettcp_close_p = getelementptr %EvNetTcp, %EvNetTcp* @_kai_default_ev_nettcp, i32 0, i32 8\n",
+      "  store %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_nettcp_close to %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvNetTcp*, %KaiValue*, %KaiCont*)** %ev_nettcp_close_p\n",
+      "  %node_nettcp_p = getelementptr [48 x i8], [48 x i8]* @_kai_default_node_nettcp, i32 0, i32 0\n",
+      "  %ev_nettcp_void = bitcast %EvNetTcp* @_kai_default_ev_nettcp to i8*\n",
+      "  call void @kaix_evidence_push(i8* %node_nettcp_p, i8* getelementptr inbounds ([7 x i8], [7 x i8]* @_kai_default_nettcp_name, i64 0, i64 0), i8* %ev_nettcp_void)\n"
+    ])
+  } else { "" }
   concat_all([
     llvm_default_builtin_decls(main_row),
     "\ndefine void @kai_main_install_defaults() {\n",
@@ -27630,6 +27703,7 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
     stderr_,
     fail,
     random_,
+    nettcp_,
     mutable_,
     "  ret void\n",
     "}\n\n"
@@ -27639,6 +27713,7 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
 fn llvm_emit_main_teardown_defaults(main_row: [String]) : String {
   let pops = concat_all([
     if list_has(main_row, "Mutable") { "  call void @kaix_evidence_pop()\n" } else { "" },
+    if list_has(main_row, "NetTcp")  { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Random")  { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Fail")    { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Stderr")  { "  call void @kaix_evidence_pop()\n" } else { "" },
@@ -33505,6 +33580,16 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   # users always install their own (typically via stdlib/actor.kai's
   # `with_mailbox` helper).
   let actor_d   = inject_unconditional(existing, "Actor",  builtin_actor_decl())
+  # net-tcp-v1: NetTcp ships with two companion type decls — the
+  # opaque handles `Conn` and `Listener` the effect signatures carry
+  # in their parameter / return positions. Gated on "not already
+  # user-declared" via a separate `existing_types` check: `existing`
+  # from `collect_effect_names` only catches DEffect names, while
+  # these are DType.
+  let existing_types = collect_type_names(decls)
+  let nettcp_d   = inject_unconditional(existing,       "NetTcp",   builtin_nettcp_decl())
+  let conn_d     = inject_unconditional(existing_types, "Conn",     builtin_conn_decl())
+  let listener_d = inject_unconditional(existing_types, "Listener", builtin_listener_decl())
   list_append(console_d,
     list_append(stdout_d,
       list_append(stderr_d,
@@ -33521,7 +33606,10 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
                             list_append(cancel_d,
                               list_append(actor_d,
                                 list_append(link_d,
-                                  list_append(monitor_d, decls)))))))))))))))))
+                                  list_append(monitor_d,
+                                    list_append(conn_d,
+                                      list_append(listener_d,
+                                        list_append(nettcp_d, decls))))))))))))))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -33616,7 +33704,7 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # still mention Console because the resolver routes through
 # `cand_ns` for aliases.
 fn builtin_effect_names() : [String] =
-  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Random", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor"]
+  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Random", "NetTcp", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor"]
 
 # m12.8 Phase 4b: `Console` is now an alias `type Console = Stdout +
 # Stderr + Stdin` (per stdlib/effects.kai's pinned catalog), not a
@@ -33688,6 +33776,80 @@ fn builtin_random_decl() : Decl =
                    pline: 0, pcol: 0 }],
           ty_name_zero("Int"), 0, 0)
     ], 0, 0)
+
+# net-tcp-v1: NetTcp effect — six byte-level TCP ops. Spec:
+# docs/effects-stdlib.md §`NetTcp`. Default handler in stage0/runtime.h
+# (`kai_default_nettcp_*`); install_default_handlers wiring above.
+#
+# Two divergences from the spec, both pinned in stdlib/effects.kai:
+#
+#   1. `[Byte]` -> `[Int]`. Kaikai has no first-class Byte type yet,
+#      and the stage 2 typer (resolve_ty) does not substitute
+#      non-effect type aliases — `type Byte = Int` would leave Byte
+#      a distinct nominal. Using `[Int]` directly keeps user code
+#      compiling without a typer extension that is out of scope for
+#      this lane.
+#
+#   2. Result type-arg order. The spec writes `Result[Conn, String]`
+#      Rust-style (Ok first, Err second), but kaikai's `Result[e, a]`
+#      is Err-first / Ok-second (see add_builtin_variant_sigs above
+#      — `Ok` carries the second tparam). The decl flips the order
+#      so `match NetTcp.connect(...) { Ok(c) -> ... Err(msg) -> ... }`
+#      typechecks with `c: Conn` and `msg: String`.
+fn builtin_nettcp_decl() : Decl =
+  DEffect(false, "NetTcp", [],
+    [
+      EOp("connect", [],
+          [param_string_zero("host"),
+           Param { pname: "port", ptype: Some(ty_name_zero("Int")),
+                   pline: 0, pcol: 0 }],
+          ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Conn")]),
+          0, 0),
+      EOp("listen", [],
+          [param_string_zero("host"),
+           Param { pname: "port", ptype: Some(ty_name_zero("Int")),
+                   pline: 0, pcol: 0 }],
+          ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Listener")]),
+          0, 0),
+      EOp("accept", [],
+          [param_typed_zero("l", ty_name_zero("Listener"))],
+          ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Conn")]),
+          0, 0),
+      EOp("send", [],
+          [param_typed_zero("c", ty_name_zero("Conn")),
+           param_typed_zero("data", ty_list_zero(ty_name_zero("Int")))],
+          ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Int")]),
+          0, 0),
+      EOp("recv", [],
+          [param_typed_zero("c", ty_name_zero("Conn")),
+           Param { pname: "max", ptype: Some(ty_name_zero("Int")),
+                   pline: 0, pcol: 0 }],
+          ty_named_zero("Result", [ty_name_zero("String"),
+                                    ty_list_zero(ty_name_zero("Int"))]),
+          0, 0),
+      EOp("close", [],
+          [param_typed_zero("c", ty_name_zero("Conn"))],
+          ty_name_zero("Unit"), 0, 0)
+    ], 0, 0)
+
+# net-tcp-v1: opaque connection handle. Single-field record carrying
+# the OS file descriptor; the runtime's `_kai_net_record_fd` reads
+# the slot by name, so the field name is load-bearing — must stay
+# "fd" in lockstep with stage0/runtime.h's `_kai_net_make_conn`.
+fn builtin_conn_decl() : Decl =
+  DType(false, "Conn", [],
+    TBRecord([FD("fd", ty_name_zero("Int"))]), 0, 0)
+
+# net-tcp-v1: opaque listener handle. Two slots — `fd` for the
+# socket descriptor (same contract as Conn), `port` for the
+# kernel-assigned port read back via getsockname after listen.
+# `port` is what `net.tcp.local_port` exposes to user code so a
+# server bound to `port = 0` can discover the ephemeral port the
+# kernel picked.
+fn builtin_listener_decl() : Decl =
+  DType(false, "Listener", [],
+    TBRecord([FD("fd",   ty_name_zero("Int")),
+              FD("port", ty_name_zero("Int"))]), 0, 0)
 
 # m7b #11: stdlib parameterised effects per Doc B §`State[T]` and
 # §`Reader[T] and Writer[W]`. Each one gets its own evidence struct,
