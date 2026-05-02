@@ -9,6 +9,8 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+## [0.31.0] — 2026-05-02 (R9 closed + R10/R11 diagnostic + lane handoff auth)
+
 ### Added
 
 - **R10 + R11 diagnostic doc and standalone repros (issue #61).**
