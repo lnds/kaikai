@@ -1346,3 +1346,133 @@ arm A) is stdlib-only and explicitly forbids touching emit/unbox
 internals. Per `CLAUDE.md` lane discipline, this regression is logged
 for a future emit-pass lane to pick up.
 
+---
+
+## R9 — Single-read of a stateful handler clause's `state` aliases the EvE storage; downstream decref-aware sinks (`string_concat`, `string_length`, …) free the prefix mid-handler
+
+**Status**: open. Discovered 2026-05-01 in the Tier 3 arm A
+experiment 2 lane while authoring `with_log_prefix` in
+`stdlib/trace.kai`. Worked around at the source level; runtime
+semantics need a compiler fix.
+
+### Symptom
+
+A parametric handler clause that reads `state` once and forwards
+it to a consumer that decrefs (e.g. `kai_prelude_string_concat`,
+`kai_prelude_string_length`, `kai_prelude_string_join`) frees the
+storage backing `self->state` after the FIRST op call. The next
+op call lookups the same evidence node, reads the freed slot, and
+either prints empty / garbage or segfaults — order-dependent
+based on heap reuse.
+
+ASAN repro from the lane (commit prior to the workaround):
+
+    AddressSanitizer: heap-use-after-free … 4 bytes inside of 40-byte region
+    READ of size 4 at … in kai_string_concat runtime.h:1216
+      #1 kai_prelude_string_concat runtime.h:1389
+      #2 _kai_trace__with_log_prefix__…__clause_84_5_checkpoint tp.c:267
+    freed by thread T0 here:
+      #2 kai_decref runtime.h:830
+      #3 kai_prelude_string_concat runtime.h:1390
+      #4 _kai_trace__with_log_prefix__…__clause_84_5_log tp.c:272
+
+The `_log` clause runs first and decrefs the value the EvE state
+slot still aliases; the `_checkpoint` clause runs next and reads
+the same now-freed pointer.
+
+### Minimal repro (logical)
+
+    effect P[T] { read() : T }
+
+    fn use_twice(body: () -> Unit / Trace) : Unit / Trace = {
+      handle {
+        handle { body() } with Trace {
+          log(msg, resume) -> {
+            Trace.log(P.read() ++ ": " ++ msg)   # consumes P.read()
+            resume(())
+          }
+          ...
+        }
+      } with P[String]("hello") {
+        read(resume) -> resume(state)            # SINGLE state read
+        return(x) -> x
+      }
+    }
+
+The fixture in `examples/effects/trace_prefix.kai` exercises this
+exact shape; before the source-level workaround, it produced two
+empty `[trace] ` lines instead of the second/third prefixed
+messages, and ASAN flagged the UAF as above.
+
+### Hypothesis
+
+`pcs_is_non_last` (`stage2/compiler.kai:23808`) wraps an `EVar`
+read in `__perceus_dup` only when it has ≥2 non-lam uses (or any
+in-lam use). A clause body with a single `state` read therefore
+emits a *raw transfer* — `KaiValue *kai_p = self->state` — and
+the consumer's decref bookkeeping reduces the EvE state slot's
+refcount below 1, freeing the storage even though the EvE
+itself is still on the evidence stack and will be read again by
+the next op call.
+
+The implicit invariant the perceus pass relies on is "the binding
+owns its reference and the consumer is the last reader." For
+ordinary locals this is sound. For `state` it is wrong: `state`
+is an *alias* of `self->state`, and the storage's lifetime is the
+handler's, not the clause's. The single-read case needs an
+implicit dup, the same way the closure-capture path does
+(`pcs_is_non_last` returns true unconditionally when `in_lam_here`).
+
+### Workarounds (source-level, no compiler change)
+
+The `with_log_prefix` `read` clause forces multi-use:
+
+    read(resume) -> {
+      let _keep_alive = state    # use 1 of state — perceus wraps in __perceus_dup
+      resume(state)              # use 2 — perceus wraps in __perceus_dup
+    }
+
+Emitted C (relevant slice):
+
+    return ({
+      KaiValue *kai__keep_alive = kai_internal_dup(kai_state);
+      kai_decref(kai__keep_alive);
+      kai_cont_resume(k, kai_internal_dup(kai_state));
+    });
+
+Each read bumps `state`'s refcount; the dummy binding is dropped
+immediately by perceus's exit-pass; the value passed to `resume`
+carries the +1 the consumer's decref will burn off. Net per call
+is +0 on `self->state` (and possibly a small leak on the dummy if
+the exit drop is missing, which is acceptable under the loose
+runtime per `pcs_is_non_last`'s comment).
+
+A second workaround that also avoids the UAF: change the consumer
+chain to one that does **not** decref its inputs. The string
+prelude does — concat / length / join all decref. The arithmetic
+prelude does not (Int + Int reads operands without decref), which
+is why `Reader[Int]` plus `+ 1` (e.g.
+`examples/effects/m7b_11_followup_distinct_types.kai`) has not
+caught this bug for ~6 months.
+
+### Fix path (compiler)
+
+Make `pcs_is_non_last` treat the special clause names `state` and
+`log` as always non-last (even with one use), so every read pays
+a `kai_internal_dup`. The change is local to
+`pcs_rewrite_clauses` (`stage2/compiler.kai:23772`): pass a flag
+through the clause-scope extension and consult it in the dup
+predicate. Stable runtime cost: one extra `kai_incref` per
+stateful-clause `state` read, balanced by the consumer's existing
+decref. No pre-existing fixtures regress because the only paths
+that exercised stateful clauses with non-trivial state types
+(Int, primitive) had RC sinks that did not decref.
+
+### Why this is documented here, not fixed
+
+The experiment 2 lane is stdlib-only — `with_log_prefix` lives in
+`stdlib/trace.kai`. Modifying `pcs_is_non_last` would touch the
+emit-pass internals, outside the lane's scope per `CLAUDE.md`.
+The source-level workaround keeps `with_log_prefix` shippable
+today; the structural fix belongs to a future Perceus / RC lane.
+
