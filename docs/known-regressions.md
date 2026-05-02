@@ -1350,22 +1350,27 @@ for a future emit-pass lane to pick up.
 
 ## R11 — Single-read of a stateful handler clause's `state` aliases the EvE storage; downstream decref-aware sinks (`string_concat`, `string_length`, …) free the prefix mid-handler
 
-(Discovered separately in the Tier 3 arm A experiment 2 lane.
-May be a more specific manifestation of R10's "parameterised
-outer + self-delegating inner crashes on 2nd op call" surface,
-or a distinct Perceus-pass bug. Diagnosis differs: this entry
-attributes the crash to `pcs_is_non_last` returning false on a
-single state read, leading to a raw pointer transfer that
-downstream `kai_decref` chains then free out from under the
-next op call. R10's diagnosis attributes the crash to
-`in_dispatch_node` save/restore not handling parameterised
-resume entries. Two-bug or one-bug-two-views is open until a
-follow-up lane unifies the analyses.)
+**Status**: **CLOSED** 2026-05-02 by the `r10-r11-fix` lane (issue
+\#61). The closing-commit SHA pins the fix; cross-reference the
+diagnostic doc `docs/lane-diagnostic-r10-r11.md` for the full
+analysis (R10 ⊆ R11 — one bug, two surfaces; the R10 entry below
+is closed by the same lane). Fix: `pcs_is_non_last` now special-
+cases the magic clause-body names `state` and `log` so a single
+read inside a clause body always emits `__perceus_dup`, balancing
+the consumer's burn-off. The `_keep_alive` workaround in
+`stdlib/trace.kai::with_log_prefix` was deleted at the same time;
+`with_log_prefix`'s `read` clause is now `read(resume) ->
+resume(state)` — what it should always have been. Regression
+fixtures: `examples/effects/r10_repro.kai` and
+`examples/effects/r11_repro.kai`, wired into both `make tier1`
+(via `stage2/Makefile::test-trace`) and `make tier1-asan` (via
+`stage2/Makefile::test-trace-asan`).
 
-**Status**: open. Discovered 2026-05-01 in the Tier 3 arm A
+**Status (historical)**: open as of 2026-05-01 (Tier 3 arm A
 experiment 2 lane while authoring `with_log_prefix` in
-`stdlib/trace.kai`. Worked around at the source level; runtime
-semantics need a compiler fix.
+`stdlib/trace.kai`). Worked around at the source level via the
+`_keep_alive` dummy binding; runtime semantics needed the
+compiler fix delivered in this lane.
 
 ### Symptom
 
@@ -1645,8 +1650,25 @@ as a follow-up so the C backend can stabilise first.
 
 ## R10 — parameterised handler outer + self-delegating handler inner crashes/corrupts
 
-**Status**: **OPEN** as of 2026-05-01 (Tier 3 experiment 2 arm B).
-Surfaced while attempting to use R9's documented workaround
+**Status**: **CLOSED** 2026-05-02 by the `r10-r11-fix` lane (issue
+\#61, same PR that closed R11). The hypothesis recorded below
+(`in_dispatch_node` save/restore around parameterised resume
+entries) was a misdiagnosis — the diagnostic lane proved the
+mechanism is exactly R11's: `pcs_is_non_last` returning false for
+a single-use read of `state` inside a parameterised handler clause,
+the emit pass producing a raw transfer of the EvE state slot's
+storage, and a downstream decref-aware sink
+(`kai_prelude_string_concat`) freeing that storage out from under
+the next op-call invocation. See `docs/lane-diagnostic-r10-r11.md`
+for the side-by-side ASAN traces and the negative-control logic
+that ruled out the dispatch-machinery hypothesis. Regression
+fixture: `examples/effects/r10_repro.kai` (the "Reader" arm),
+plus its sibling `examples/effects/r11_repro.kai` (the "Carrier"
+arm). Both are wired into `make tier1` and `make tier1-asan` via
+the `test-trace` / `test-trace-asan` targets.
+
+**Status (historical)**: OPEN as of 2026-05-01 (Tier 3 experiment 2
+arm B). Surfaced while attempting to use R9's documented workaround
 (parameterised handler `state` slot in place of closure capture).
 
 **Symptom**: a `handle ... with Eff[T](init) { ... }` outer wrap

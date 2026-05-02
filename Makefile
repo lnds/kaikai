@@ -173,6 +173,8 @@ tier1-asan: kaic2
 	  exit 1; \
 	fi; \
 	echo "tier1-asan OK — $$got/$$expected demos pass under ASAN+UBSan, no sanitizer diagnostics"
+	@$(MAKE) -C stage2 test-trace-asan
+	@echo "tier1-asan OK — trace fixtures pass under ASAN+UBSan (R10/R11 regression gate)"
 
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
