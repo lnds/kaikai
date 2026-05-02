@@ -2049,7 +2049,24 @@ test-tco-regression: $(TARGET) build
 	  && echo "tco-regression OK (issue #43 list.nth-shape fixture compiles + runs; conservative dropmask, R6 leak documented but not enforced)" \
 	  || { echo "tco-regression DIFF"; diff ../examples/tco/list_nth_shape.out.expected build/tco-nth.out; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression
+# Issue #102 — R12 regression fixture. A zero-arg fn whose body has
+# a self-tail-call. Before the fix, `tcrec_make_sentinel` emitted a
+# trailing `|` for empty pnames, leaking an empty-string element
+# into the goto block's rebinds and producing `kai_ = _t0;` against
+# undeclared identifiers. The fixture's `round_n()` is exactly the
+# shape the bug needs; termination is bounded via a `State[Int]`
+# handler so the test cannot hang. Lives under `examples/perceus/`
+# because TCO's per-call-site dropmask is a Perceus output.
+test-tco-zero-arg: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/perceus/r12_zero_arg_recursive.kai > build/tco-zero.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/tco-zero.c -o build/tco-zero; \
+	./build/tco-zero > build/tco-zero.out; \
+	diff -q ../examples/perceus/r12_zero_arg_recursive.out.expected build/tco-zero.out > /dev/null \
+	  && echo "tco-zero-arg OK (issue #102 zero-arg self-tail-call compiles + runs to completion)" \
+	  || { echo "tco-zero-arg DIFF"; diff ../examples/perceus/r12_zero_arg_recursive.out.expected build/tco-zero.out; exit 1; }
+
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -2058,7 +2075,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco test-tco-regression
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg
 
 clean:
 	rm -rf build $(TARGET)
