@@ -83,6 +83,78 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Fixed
 
+- **Issue #82 — Perceus leak audit closes the four named sources
+  that survived the m5.x runtime flip (2026-04-28).** The
+  `perceus`-tier 2 lane on 2026-04-29 closed three architectural
+  items (perceus_pass §4b, match-scrutinee real plug, kai_field /
+  pat_test balance via `kai_field_borrow`); this lane closes the
+  four remaining mechanical RC discipline gaps the m5.x flip left
+  in its wake. Tier 1 #2 ("runtime-efficient") inches closer to
+  holding without footnotes; the `perceus-honesty-targets.md`
+  Tier 2 punch list now has only the stage-0 eager-dup retrofit
+  cleanup outstanding, which is bootstrap-only and tracked
+  separately if it ever becomes load-bearing.
+
+  Sources closed (each plus the emit / runtime shape of the fix):
+
+  1. **Match scrutinee `_scr` decref at exit** — already plumbed
+     in stages 0/1/2 by the perceus-tier-2 lane; this lane
+     verifies the `kai_decref(_scr)` plant in
+     `emit_match_default` is reached by the new fixture's
+     non-PBind arms (literal pattern + wildcard) so a regression
+     would surface as a tier1-asan UAF rather than bit-rotting
+     in a doc.
+  2. **`kai_op_truthy` non-consuming on fresh `if` conds** —
+     `EIf` C emit (stages 1 + 2) now wraps the boxed-cond branch
+     in a stmt-expr that captures the cond into `_c`, evaluates
+     `kai_op_truthy(_c)` for the ternary, and decrefs `_c`
+     before yielding the result. The unboxed-cond branch
+     (Tier 2.5 M4) is unchanged. Stage 1's `EBinop and/or`
+     emit was likewise missing the `kai_decref(_a)` after the
+     ternary (stage 2 had it since the m5.x flip closeout); now
+     mirrored. LLVM `llvm_emit_if` plants
+     `call void @kaix_decref(%KaiValue* cv)` between the
+     `kaix_truthy` probe and the conditional branch — `cv` is
+     dead in both arms, so the drop balances the fresh
+     allocation that fed the probe. LLVM `and`/`or` short-
+     circuit stays as-is (the phi keeps `lhs` alive on the skip
+     path; pinning that fix needs an emit-side incref + phi
+     restructure that exceeds this lane).
+  3. **`kai_field` test-phase reads no longer incref** — closed
+     in the perceus-tier-2 lane via `kai_op_field_borrow`;
+     verified live by the new fixture's record-pattern arms.
+  4. **`kai_prelude_mailbox_*` helpers consume their KaiValue
+     params** — `mailbox_alloc_bounded(cap, overflow)`,
+     `mailbox_assign_owner(pid, fiber)`, `mailbox_send(pid,
+     msg)`, `mailbox_recv(pid)`, and `mailbox_free(pid)` in
+     `stage0/runtime.h` now decref every input that crossed the
+     callee-consumes boundary post-flip. `mailbox_send`
+     additionally drops the redundant `kai_incref(msg)` and
+     transfers the caller's ref straight into
+     `kai_mailbox_push` (the mailbox already takes ownership);
+     pre-fix the helper held two refs (one inside the mailbox,
+     one borrowed-and-dropped on the floor) and leaked the
+     caller's per send.
+
+  Item 5 from the issue inventory (stage 0's eager-dup leaks one
+  ref per local read in kaic1) is bootstrap-only — kaic1 is
+  emitted by stage 0's C compiler, but every shipping user
+  binary is emitted by stage 2 — so it is intentionally out of
+  scope for this lane.
+
+  Regression fixture
+  `examples/perceus/issue_82_leak_audit.kai` exercises all four
+  shapes in one program (literal-arm match, fresh-cond `if`,
+  record-pattern test path, with_mailbox send/recv/free) and is
+  wired into both `test-perceus-issue82` (tier1) and
+  `test-perceus-issue82-asan` (tier1-asan). A regression of any
+  of the four shapes now surfaces deterministically: stdout diff
+  on tier1, UAF / UBSan diagnostic on tier1-asan. RC budget
+  threshold (`make rc-budget`, 50 M leaked ceiling) holds at
+  23.4 M post-fix; the pre-tier-2-lane baseline of 46.9 M
+  documented in `docs/perceus-honesty-targets.md` remains
+  comfortably under.
+
 - **Issue #103 — trap-exit bypassed when an outer Cancel handler
   was in scope at child termination.** A supervisor with
   `fiber_set_trap_exit(true)` watching a linked child that crashed
