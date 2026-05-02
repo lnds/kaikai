@@ -24079,10 +24079,33 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
 # bumps rc before the primitive consumes it. The single-use case stays
 # raw — no dup, no drop, transferring the binding's existing reference.
 # LUUnused names cannot reach this predicate (they have no uses).
+#
+# Carve-out for the magic clause-body names `state` and `log`
+# (`pcs_rewrite_clauses` injects them into the local scope so this
+# predicate fires for them): both are *aliases* of `self->state` /
+# `self->log`, not bindings the clause owns. The clause prologue
+# (`clause_state_prologue`, `emit_clause_body`) emits
+# `KaiValue *kai_state = self->state;` — a raw aliased pointer
+# whose storage's lifetime is the *handler's*, not the clause's.
+# Treating either name as "last use" and emitting a raw transfer
+# hands the EvE slot's only outstanding ref to a downstream
+# decref-aware sink (`kai_prelude_string_concat`,
+# `kai_prelude_string_length`, `kai_prelude_string_join`); the sink
+# decrefs it, the storage is freed, and the next op call into the
+# same parameterised handler reads the freed slot. The fix forces
+# every read of `state` / `log` to emit `__perceus_dup`, balancing
+# the consumer's burn-off with one extra `kai_internal_dup` per
+# read. Cost: one `kai_incref` per state/log read (well within the
+# loose runtime's tolerance); this is the smallest correct change
+# until the Perceus exit-pass closes the broader RC story (see
+# `docs/lane-diagnostic-r10-r11.md` for the full analysis and
+# `docs/m5x-followup.md` for the Perceus follow-up). Closes R10
+# and R11 in `docs/known-regressions.md`.
 
 fn pcs_is_non_last(nm: String, line: Int, col: Int, uses: [Use],
                    in_lam_here: Bool) : Bool {
-  if in_lam_here { true }
+  if nm == "state" or nm == "log" { true }
+  else if in_lam_here { true }
   else {
     match last_use_for(nm, uses) {
       LUAt(_, _, _) -> pcs_count_non_lam_uses(nm, uses, 0) >= 2

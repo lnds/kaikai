@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco test-tco-regression test-trace selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-tco test-tco-regression test-trace test-trace-asan selfhost
 
 all: $(TARGET)
 
@@ -432,15 +432,50 @@ test-writer: $(TARGET) build
 # both compiles cleanly and produces a known-correct golden so a
 # capture-RC regression (the same UAF that fooled the early draft of
 # the fix) shows up as a stdout diff.
+# `r10_repro` and `r11_repro` cover issue #61 / R10 + R11 — single
+# read of a parameterised handler clause's `state` was raw-transferred
+# to a decref-aware sink, freeing the EvE state slot's storage before
+# the next op call could read it. Fix carved out `state` / `log` in
+# `pcs_is_non_last` so every read pays a `__perceus_dup`. Both
+# fixtures are listed so a regression caught only via one effect-name
+# arm still fails this gate. See `docs/lane-diagnostic-r10-r11.md`.
+TRACE_FIXTURES := trace_basic trace_prefix r9_clause_capture r10_repro r11_repro
+
 test-trace: $(TARGET) build
 	@set -e; \
-	for name in trace_basic trace_prefix r9_clause_capture; do \
+	for name in $(TRACE_FIXTURES); do \
 	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage0 build/$$name.c -o build/$$name-c; \
 	  ./build/$$name-c > build/$$name.out; \
 	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
 	    && echo "trace OK $$name" \
 	    || { echo "trace DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name.out; exit 1; }; \
+	done
+
+# ASAN+UBSan variant of test-trace. Wired into the top-level
+# `tier1-asan` target so the R10 / R11 regression fixtures
+# (parameterised handler `state` aliasing) run under sanitizers; the
+# rest of the trace suite comes along for free at no extra
+# maintenance cost. CFLAGS swap O0 → O1 so ASAN's frame-pointer
+# unwind has something to walk; -fsanitize=address,undefined is the
+# same flag set tier1-asan uses for demos/.
+test-trace-asan: $(TARGET) build
+	@set -e; \
+	for name in $(TRACE_FIXTURES); do \
+	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
+	    echo "trace-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
+	    && echo "trace-asan OK $$name" \
+	    || { echo "trace-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
 # stdlib/time.kai smoke test — exercises the Clock effect (wall_now,
