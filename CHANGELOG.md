@@ -68,6 +68,18 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
     (`Signal` section + table-row entry), `stage2/Makefile`
     (test-effects + test-signal-trap-asan rules), and the
     top-level `Makefile` (tier1-asan wiring).
+- **Tier 1-ASAN CI gate** (`.github/workflows/tier1-asan.yml`).
+  Runs `make tier1-asan` on ubuntu-latest under ASAN+UBSan for
+  PRs that touch runtime / emit / perceus / fiber+RC fixtures.
+  Path-gated so typer-only or fmt-only PRs don't pay the ~5 min
+  tax. Catches non-portable fixes that pass tier1 on macOS but
+  segfault on Linux — the PR #111 mailbox trap-exit segfault on
+  the new `m8x_9_nested_mailbox_under_trap_exit` fixture is the
+  precedent that motivated this gate. Filter:
+  `stage0/**`, `stage1/compiler.kai`, `stage2/compiler.kai`,
+  `stage2/Makefile`, `stdlib/**`, `examples/effects/**`,
+  `examples/perceus/**`. CLAUDE.md "Testing discipline" updated
+  with the new tier and its trigger conditions.
 
 ### Fixed
 
