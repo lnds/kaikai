@@ -33630,19 +33630,26 @@ fn find_impl_for(impls: [ProtoImplReg], pname: String, tname: String,
 #   `var` / `a[i] := v` (SVar, SIndexAssign), spread list patterns
 #   beyond the simple `[..., rest]` case.
 #
-# Comment placement: best-effort line-anchored merge. A comment with
-# source line L is emitted as a full-line comment immediately before
-# the next AST node whose source line is >= L. Same-line trailing
-# comments may be promoted to the line above; tracked in issue #93
-# (R7) as v1's cost of best-effort.
+# Comment placement: comments are classified at collect time as
+# trailing (source line had non-whitespace before the `#`) or
+# leading (the `#` opened the line). Trailings drain inline after
+# their owning construct; leadings drain as full-line comments
+# before the next AST node. The classification fixes issue #93
+# (R7) — single trailings on stmts/decls now keep their inline
+# position. Lossy edge cases remain (multiple trailings on one
+# multi-line construct, trailings on inner-record-fields when the
+# record collapses to a single output line); those demote to
+# leading-position rather than throwing.
 
 # Source-level line comment captured outside the token stream.
+# The trailing flag distinguishes `code  # this` (true) from
+# `# this` opening a fresh line (false).
 type Cmt
-  = Cmt(Int, Int, String)
+  = Cmt(Int, Int, String, Bool)
 
 # line, col, text (stripped of
 # leading `#`, no trailing
-# newline)
+# newline), is_trailing
 
 # Threaded fmt state. `out` accumulates emitted strings (joined at the
 # end); `cmts` is the suffix of yet-to-emit comments (sorted by line);
@@ -33758,10 +33765,41 @@ fn collect_gap(src: String, from: Int, to: Int, line: Int, col: Int, acc: [Cmt])
           let body_start = from + 1
           let eol = scan_to_newline_bounded(src, body_start, to)
           let text = string_slice(src, body_start, eol - body_start)
-          let acc2 = [Cmt(line, col, text), ...acc]
+          let is_tr = cmt_is_trailing(src, from)
+          let acc2 = [Cmt(line, col, text, is_tr), ...acc]
           collect_gap(src, eol, to, line, col + (eol - from), acc2)
         } else {
           collect_gap(src, from + 1, to, line, col + 1, acc)
+        }
+      }
+    }
+  }
+}
+
+# A `#` is a trailing comment if the same source line — read from
+# the byte just before the `#` back to the previous `\n` or
+# beginning of file — contains any non-whitespace character. We
+# scan source rather than threading state through the lexer's
+# token stream because TkNewline is a real token (its `\n` lives
+# inside the token's span, not in collect_gap's gap), so a
+# gap-local "did we cross a newline" flag would mis-classify
+# every comment that follows a TkNewline token. Reading source
+# directly sidesteps the question entirely.
+fn cmt_is_trailing(src: String, from: Int) : Bool = cmt_is_trailing_loop(src, from - 1)
+
+fn cmt_is_trailing_loop(src: String, idx: Int) : Bool {
+  if idx < 0 {
+    false
+  } else {
+    match char_at(src, idx) {
+      None -> false
+      Some(c) -> {
+        if c == '\n' {
+          false
+        } else if ch_is_space(c) {
+          cmt_is_trailing_loop(src, idx - 1)
+        } else {
+          true
         }
       }
     }
@@ -33827,7 +33865,7 @@ fn fmt_drain_before_loop(s: FmtSt, target_line: Int, prev: Int) : FmtSt {
         s
       }
     }
-    [Cmt(cl, _, text), ...rest] -> {
+    [Cmt(cl, _, text, _), ...rest] -> {
       if cl >= target_line {
         # Same fate as the empty-list arm: bridge a blank line if the
         # next AST node is more than one source line below the last
@@ -33870,7 +33908,7 @@ fn fmt_drain_rest(s: FmtSt) : FmtSt = fmt_drain_rest_loop(s, 0)
 fn fmt_drain_rest_loop(s: FmtSt, prev: Int) : FmtSt {
   match s.cmts {
     [] -> s
-    [Cmt(cl, _, text), ...rest] -> {
+    [Cmt(cl, _, text, _), ...rest] -> {
       let s1 = if s.at_line_start {
         s
       } else {
@@ -33886,6 +33924,37 @@ fn fmt_drain_rest_loop(s: FmtSt, prev: Int) : FmtSt {
       let s5 = fmt_emit(s4, text)
       let s6 = fmt_newline(s5)
       fmt_drain_rest_loop(s6, cl)
+    }
+  }
+}
+
+# Drain a single trailing comment if the next pending comment is
+# a trailing one (had code preceding it on the same source line)
+# whose source line is < `limit`. Emits inline with two leading
+# spaces then `#`, then the body — never a newline, so the caller
+# is still positioned mid-line and can close with its own
+# `fmt_newline`. Issue #93 fix: stmts/decls call this between
+# their content and the closing newline so single-line trailings
+# stay inline rather than being promoted to leading-above by the
+# next iteration's `fmt_drain_before`.
+#
+# Only one trailing is drained per call. If multiple trailings
+# remain pending in the gap (rare: inner-record + outer
+# trailings), the rest fall back to leading-position via
+# `fmt_drain_before`. v1 design — fixing inner-position trailings
+# would require walking the token stream alongside the AST, the
+# bigger refactor option (a) the issue mentioned.
+fn fmt_drain_trailing_after(s: FmtSt, limit: Int) : FmtSt {
+  match s.cmts {
+    [] -> s
+    [Cmt(cl, _, text, is_tr), ...rest] -> {
+      if is_tr and (cl < limit) {
+        let s1 = fmt_emit(s, "  #")
+        let s2 = fmt_emit(s1, text)
+        FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start }
+      } else {
+        s
+      }
     }
   }
 }
@@ -33912,13 +33981,34 @@ fn fmt_decls(decls: [Decl], s: FmtSt, first: Bool) : FmtSt {
       }
       let s2 = fmt_drain_before(s1, decl_line(d))
       let s3 = fmt_decl(d, s2)
-      let s4 = if s3.at_line_start {
-        s3
+      let s3a = fmt_drain_trailing_after(s3, decls_trailing_limit(d, rest))
+      let s4 = if s3a.at_line_start {
+        s3a
       } else {
-        fmt_newline(s3)
+        fmt_newline(s3a)
       }
       fmt_decls(rest, s4, false)
     }
+  }
+}
+
+# Upper bound for `fmt_drain_trailing_after` between the just-
+# emitted decl and what follows. Two cases:
+#   non-last  → the next decl's start line; any trailing in the
+#               gap belongs to `d` (gap can't carry a leading on a
+#               line that has code).
+#   last      → `decl_line(d) + 1`. Single-line trailings (the
+#               common shape `fn double(x) = x * 2  # ...`) drain
+#               inline; trailings on a multi-line decl's last
+#               source line do NOT drain — same demotion as v1
+#               had, no regression. Going wider than +1 risks
+#               grabbing a comment that semantically belongs to
+#               something below the decl, with no decl after to
+#               anchor it against.
+fn decls_trailing_limit(d: Decl, rest: [Decl]) : Int {
+  match rest {
+    [] -> decl_line(d) + 1
+    [next, ...tail] -> decl_line(next)
   }
 }
 
@@ -34622,7 +34712,11 @@ fn fmt_block(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt {
 }
 
 fn fmt_block_inner(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt {
-  let s1 = fmt_stmts(stmts, s)
+  let last_limit = match tail {
+    None -> 0
+    Some(e) -> e.line
+  }
+  let s1 = fmt_stmts(stmts, s, last_limit)
   match tail {
     None -> s1
     Some(e) -> {
@@ -34633,28 +34727,50 @@ fn fmt_block_inner(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt {
       }
       let s3 = fmt_drain_before(s2, e.line)
       let s4 = fmt_expr(e, s3)
-      if s4.at_line_start {
-        s4
+      let s5 = fmt_drain_trailing_after(s4, e.line + 1)
+      if s5.at_line_start {
+        s5
       } else {
-        fmt_newline(s4)
+        fmt_newline(s5)
       }
     }
   }
 }
 
-fn fmt_stmts(stmts: [Stmt], s: FmtSt) : FmtSt {
+fn fmt_stmts(stmts: [Stmt], s: FmtSt, last_limit: Int) : FmtSt {
   match stmts {
     [] -> s
     [st, ...rest] -> {
       let s1 = fmt_drain_before(s, stmt_line(st))
       let s2 = fmt_stmt(st, s1)
-      let s3 = if s2.at_line_start {
-        s2
+      let s2a = fmt_drain_trailing_after(s2, stmts_trailing_limit(st, rest, last_limit))
+      let s3 = if s2a.at_line_start {
+        s2a
       } else {
-        fmt_newline(s2)
+        fmt_newline(s2a)
       }
-      fmt_stmts(rest, s3)
+      fmt_stmts(rest, s3, last_limit)
     }
+  }
+}
+
+# Same shape as `decls_trailing_limit` — see that comment for the
+# rationale. For the last stmt, callers pass `last_limit`:
+#   > 0   = the line of the next AST anchor after the block (e.g.
+#            the tail expression's line). Lets multi-line trailings
+#            on the last stmt drain inline.
+#   == 0  = no anchor known (block has no tail). Falls back to
+#            `stmt_line(st) + 1` — single-line trailings still
+#            drain, multi-line trailings on the last stmt of a
+#            tail-less block stay full-line-demoted (same as v1).
+fn stmts_trailing_limit(st: Stmt, rest: [Stmt], last_limit: Int) : Int {
+  match rest {
+    [] -> if last_limit > 0 {
+      last_limit
+    } else {
+      stmt_line(st) + 1
+    }
+    [next, ...tail] -> stmt_line(next)
   }
 }
 

@@ -55,6 +55,34 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   appear; `int64_t kair_n` must not). The Trace fixture
   `examples/effects/trace_basic.kai` reverted from its `++`
   workaround back to natural `#{int_to_string(value)}` form.
+- **`kai fmt` preserves same-line trailing comments (issue #93,
+  R7).** v1 of the formatter dropped line comments at the lexer
+  and rebuilt them from a side list keyed by `(line, col)`,
+  which only had a between-decl / between-stmt drainpoint —
+  trailing comments like `let x = 42  # answer` were demoted to
+  full-line comments above the construct, corrupting code review
+  diffs on the first `kai fmt` pass. The fix classifies each
+  comment as trailing or leading at collection time
+  (`cmt_is_trailing` scans source backward from the `#` to the
+  prior newline; non-whitespace before `#` ⇒ trailing) and adds
+  a `fmt_drain_trailing_after` hook called between
+  `fmt_decl` / `fmt_stmt` / tail-`fmt_expr` and their closing
+  newline. The hook drains a single trailing inline whose source
+  line precedes the next AST anchor; the rest fall back to
+  leading-position via the existing `fmt_drain_before`. `kai
+  fmt` is still idempotent (verified by `tests/fmt_fixtures.sh`
+  on every fixture), and selfhost is byte-identical (the
+  classification only changes which comments take the inline
+  path, not how source-tokens emit). Two new fixtures wired
+  into tier1: `examples/fmt/trailing_simple.{input,expected}.kai`
+  exercises trailings on single-line stmts and a short-fn body;
+  `examples/fmt/trailing_multiline.{input,expected}.kai`
+  exercises trailings after a multi-line record literal and
+  function call. v1 limitations carried forward: trailings on
+  the closing `}` of a block, and trailings on multi-line
+  last-stmt-of-no-tail-block, still demote to full-line — those
+  need fmt to walk the token stream alongside the AST (option
+  (a) in the issue body), out of scope for this lane.
 
 ## [0.35.0] — 2026-05-02 (#71 option (b) closed + tracker docs retired + infra discipline)
 
