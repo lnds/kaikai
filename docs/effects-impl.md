@@ -1066,7 +1066,8 @@ distinction is purely surface; pinned in `docs/effects-stdlib.md`
 What's still open in this section is the *next* per-op
 generics consumer:
 
-- **Spawn API cleanup** (`docs/m8x-followup.md` item 7):
+- **Spawn API cleanup** (`docs/fibers-honesty-targets.md`
+  §*Residual m8.x items* — per-op ROW generics on Spawn):
   `builtin_spawn_decl` still uses `Nothing → TyAny` for the
   thunk and the result. Migrating to `spawn[T, e]` per Doc B
   would need *per-op row* generics that Doc C explicitly leaves

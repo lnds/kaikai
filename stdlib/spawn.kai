@@ -2,27 +2,30 @@
 #
 # Doc B §`Spawn` declares the user-facing API as polymorphic
 # (`spawn[T, e]`, `await[T]`, etc.). m7b #2a (per-op TYPE generics)
-# now lets the four Fiber-shaped ops carry `[T]` directly, so
+# lets the four Fiber-shaped ops carry `[T]` directly, so
 # `Spawn.await(f) : T`, `Spawn.select(fs) : T`, and `Spawn.cancel(f)`
 # all observe a typed `Fiber[T]` end-to-end. The wrappers below stay
 # because (a) `fiber_spawn` still has to widen the spawned thunk's
 # row variable into the caller's row (per-op ROW generics — the
 # `f: () -> T / e` shape — is a separate extension tracked in
-# `docs/m8x-followup.md` §7), and (b) the `fiber_*` names are the
-# documented surface that user demos and tests have settled on.
+# `docs/fibers-honesty-targets.md` §*Residual m8.x items*), and (b)
+# the `fiber_*` names are the documented surface that user demos and
+# tests have settled on.
 #
 # Today the spawn op parameter is still `thunk: Nothing` (TyAny)
 # so the wrapper's `() -> T / e` argument can flow through. Once
 # per-op row generics land, the wrappers reduce to one-line aliases
 # and `Spawn.spawn[T, e]` becomes the canonical entry point.
 #
-# Runtime: m8 #3 ships an inline-eager scheduler — `spawn(f)` runs
-# `f` synchronously and stores the result in an opaque KaiFiber;
-# `await(fib)` returns the cached result; `yield()` is a no-op;
-# `select(fs)` picks the head; `cancel(f)` sets a flag (delivery
-# arrives in m8 #4). True mid-fiber suspension (ucontext or full
-# CPS reification) is a future m8.x — the wrappers' polymorphic
-# signature is the final shape, so the migration is runtime-only.
+# Runtime: the m8.x cooperative scheduler (`stage0/runtime.h`
+# §m8.x cooperative scheduler primitives, landed v0.4.0) backs every
+# Spawn op. `spawn(f)` allocates a fiber with a private mmap'd stack
+# (`PROT_NONE` guard page below) and enqueues it READY; the thunk
+# runs when the dispatcher swaps in via `setcontext`. `await(fib)`
+# parks the caller on the target's awaiter chain. `yield()` rotates
+# the run queue (`swapcontext` to the head). `cancel(f)` sets the
+# `cancel_requested` flag; the runtime delivers `Cancel.raise()` at
+# the target's next effect-op lookup (`kai_check_cancel_yield_point`).
 
 # Spawn a new fiber that runs `f`. Effects of `f` propagate through
 # the open row variable `e` into the caller's row.
@@ -33,19 +36,26 @@ pub fn fiber_spawn[T, e](f: () -> T / e) : Fiber[T] / Spawn + e =
 pub fn fiber_await[T](f: Fiber[T]) : T / Spawn =
   Spawn.await(f)
 
-# Wait for any of the listed fibers; v1 picks the head deterministically
-# (every fiber is already DONE under the inline-eager scheduler).
+# Wait for any of the listed fibers. Phase 2 v1 simplification:
+# returns the result of the first `Fiber[T]` already DONE on entry;
+# otherwise parks on the head and returns its result on wakeup. Real
+# race + cancel-losers semantics is a follow-up
+# (`docs/fibers-honesty-targets.md` §*Residual m8.x items*).
 pub fn fiber_select[T](fs: [Fiber[T]]) : T / Spawn =
   Spawn.select(fs)
 
-# Request cancellation of a child fiber. Delivery happens at the next
-# op-call boundary on that fiber (m8 #4).
+# Request cancellation of a child fiber. Delivery happens at the
+# target's next effect-op lookup: the runtime's yield-point hook
+# longjmps to the target's trampoline `cancel_pad`, unwinding the
+# body and marking the fiber `KAI_FIBER_CANCELLED`.
 pub fn fiber_cancel[T](f: Fiber[T]) : Unit / Spawn =
   Spawn.cancel(f)
 
-# Canonical pinning point — call this inside CPU loops to give the
-# scheduler a chance to inject Cancel.raise() (Doc B §Cancel/Delivery
-# points). Under the v1 inline-eager scheduler it is a no-op.
+# Rotate the run queue: the caller goes back on the tail and the head
+# ready fiber resumes via `swapcontext`. No-op when the caller is the
+# lone ready fiber. Use this inside CPU loops with no other yield
+# points to give the scheduler a chance to inject `Cancel.raise()`
+# (Doc B §Cancel/Delivery points).
 pub fn fiber_yield() : Unit / Spawn =
   Spawn.yield()
 
@@ -61,21 +71,22 @@ pub fn fiber_yield() : Unit / Spawn =
 pub fn fiber_set_trap_exit(on: Bool) : Unit / Spawn =
   Spawn.set_trap_exit(on)
 
-# Structured-concurrency scope. v1 ships a typed pass-through:
-# the body must declare `/ Spawn` in its row, and `nursery` adds
-# `Cancel` to the caller's row because Doc B §`Spawn` says spawn /
-# await / select carry Cancel as yield points (m8.x is where the
-# scheduler actually starts injecting Cancel.raise() at those points).
-# The doc-spec cap binding form `nursery { n -> ... }` requires
-# m7b #4 (`@cap` / `cap := v`) which has not landed; v1 fixtures use
-# the bare `nursery { ... }` form and reach the runtime via
-# `fiber_spawn` / `fiber_await` directly.
+# Structured-concurrency scope. v1 ships a typed pass-through: the
+# body must declare `/ Spawn` in its row, and `nursery` adds `Cancel`
+# to the caller's row because Doc B §`Spawn` says spawn / await /
+# select carry Cancel as yield points (the cooperative scheduler
+# already injects `Cancel.raise()` at those points). The doc-spec cap
+# binding form `nursery { n -> ... }` requires m7b #4 (`@cap` /
+# `cap := v`) which has not landed; v1 fixtures use the bare
+# `nursery { ... }` form and reach the runtime via `fiber_spawn` /
+# `fiber_await` directly.
 #
-# Cancel-on-fail (per `docs/structured-concurrency.md`: a child crash
-# cancels live siblings, then the nursery re-raises the cause) is
-# observable only when children can outlive the spawn call site —
-# which they can't under the inline-eager scheduler. The semantics
-# is in scope for m8.x; the API shape here matches it so user code
-# does not change.
+# Children outlive the spawn call site under the cooperative
+# scheduler, but the nursery body itself does not yet implement the
+# structured cancel-on-fail-and-rethrow semantics from
+# `docs/structured-concurrency.md` — it is still a typed
+# pass-through. That follow-up needs the nursery handler to wrap
+# `Spawn` and observe child terminations through Link; tracked in
+# `docs/fibers-honesty-targets.md` §*Residual m8.x items*.
 pub fn nursery[T, e](body: () -> T / e) : T / e =
   body()
