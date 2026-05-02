@@ -671,7 +671,9 @@ EXTRA_PRELUDE_FLAGS := --prelude ../stdlib/protocols.kai \
                        --prelude ../stdlib/money.kai \
                        --prelude ../stdlib/uuid.kai \
                        --prelude ../stdlib/regexp.kai \
-                       --prelude ../stdlib/path.kai
+                       --prelude ../stdlib/path.kai \
+                       --prelude ../stdlib/os/env.kai \
+                       --prelude ../stdlib/os/args.kai
 
 test-stdlib: $(TARGET) build
 	@set -e; \
