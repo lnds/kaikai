@@ -1346,3 +1346,280 @@ arm A) is stdlib-only and explicitly forbids touching emit/unbox
 internals. Per `CLAUDE.md` lane discipline, this regression is logged
 for a future emit-pass lane to pick up.
 
+---
+
+## R9 — handler clauses do not capture parameters of the enclosing fn
+
+**Status**: **OPEN** as of 2026-05-01 (Tier 3 experiment 2 arm B —
+`with_log_prefix` lane). Blocks any handler-composition helper that
+needs to thread a *value* (not a previously-installed effect) into
+its clause bodies.
+
+**Symptom**: kaic2 accepts and emits
+
+    fn make_logger[e](
+      prefix: String,
+      body: () -> Unit / Trace + e
+    ) : Unit / Stdout + e = handle {
+      body()
+    } with Trace {
+      log(msg, resume) -> {
+        Stdout.print("[" ++ prefix ++ "] " ++ msg)
+        resume(())
+      }
+      ...
+    }
+
+but `cc` rejects the resulting C with
+
+    error: use of undeclared identifier 'kai_prefix'
+
+at every clause-body site that names `prefix`. The emitter spells
+the var as `kai_prefix` (the boxed alias of the outer parameter)
+inside a stmt-expr that has no `prefix` in scope — handler clauses
+are emitted as standalone C functions whose only inputs are
+`(*EvE self, op_args..., k)` and the closure-env capture path is
+not threaded.
+
+**Repro** (any helper-with-param shape reproduces; this one is the
+shortest):
+
+    cat > /tmp/r9.kai <<'EOF'
+    fn make_logger[e](
+      prefix: String, body: () -> Unit / Trace + e
+    ) : Unit / Stdout + e = handle {
+      body()
+    } with Trace {
+      log(msg, resume) -> {
+        Stdout.print("[" ++ prefix ++ "] " ++ msg)
+        resume(())
+      }
+      checkpoint(name, resume) -> {
+        Stdout.print("[" ++ prefix ++ "] cp: " ++ name)
+        resume(())
+      }
+      return(x) -> x
+    }
+
+    import trace
+    fn worker() : Unit / Trace = { Trace.log("hello") }
+    fn main() : Unit / Stdout = make_logger("P", worker)
+    EOF
+    cd stage2
+    ./kaic2 --path ../stdlib /tmp/r9.kai > /tmp/r9.c           # OK
+    cc -I ../stage0 /tmp/r9.c -o /tmp/r9                       # FAIL: kai_prefix
+
+**What the spec says should happen**: `docs/effects-impl.md`
+§*Op clause as ordinary function* (lines 612–616) is explicit:
+
+> Each op clause is compiled as an ordinary function with signature
+> `(self: *EvE, op_args..., k: Cont[Ret]) -> Answer`. The `EvE`
+> struct stores the function pointers and any per-handler state;
+> **closure captures of the enclosing scope go through `self.env`**.
+
+The `self.env` path is the spec'd channel for closing over the
+enclosing fn's locals/params from inside a clause. The current
+emitter emits the bare boxed name as if it were already in scope
+and never installs anything in `self.env`.
+
+**What works today** (so the blast radius is bounded):
+
+- Plain effect-op calls inside a clause body (`Stdout.print(...)`,
+  `Trace.log(...)`) — these resolve through the runtime evidence
+  stack, not through closure capture.
+- Parameterised handler `state` (e.g., `with State[Int](init) { get(resume)
+  -> resume(state) }`) — the `state` keyword is part of the handler
+  protocol, accessed via `*EvE`'s state slot, not a capture.
+- String literals in clause bodies — no capture needed.
+- Lambda capture *inside ordinary fns* (e.g., `(x) => prefix ++ x`
+  bound to a let in the same fn) — works correctly. The bug is
+  specifically about the **handler clause body**, not lambdas in
+  general.
+
+**Workarounds the spec leaves you, if you must build a stateful
+handler today**:
+
+1. **Push the value into a parameterised handler's `state`**, then
+   read it via `Eff.op()` from the clause body. Conceptually this
+   is what the spec means by "no closure capture needed if the
+   value lives in `state`"; it works in isolation but trips R10
+   below when combined with an inner self-delegating handler.
+2. **Pass the value as the op's argument at every call site**,
+   bypassing the helper entirely. Defeats the purpose of a helper.
+3. **Emit a top-level helper fn that takes the value**, then call
+   it from the clause body. Same problem — the call site still has
+   to thread the value into the helper, and the value comes from
+   the enclosing fn's params, which the clause cannot see.
+
+**Fix path** (out of scope for this lane — Tier 3 experiment 2 is
+stdlib-shaped, must not touch emit):
+
+The emitter needs to detect free vars in clause bodies during the
+lower-effect pass, plumb them into a generated `EvE.env` slot
+(struct field of pointers to the captured values), and rewrite
+the bare `kai_<name>` references in the clause body to
+`((CapturedT *) self->env)->name`. The Perceus pass also needs to
+incref each captured value at handler-install time and decref at
+handler-pop time. Bigger than a one-day patch; appropriate as its
+own emit-pass lane.
+
+**Why this is documented here, not fixed**: lane discipline. The
+Tier 3 experiment 2 arm B brief explicitly forbids compiler work;
+the lane's deliverable was a stdlib helper plus a fixture, and the
+finding *is* "this helper cannot be built today without compiler
+changes." Pinning it for a follow-up lane.
+
+---
+
+## R10 — parameterised handler outer + self-delegating handler inner crashes/corrupts
+
+**Status**: **OPEN** as of 2026-05-01 (Tier 3 experiment 2 arm B).
+Surfaced while attempting to use R9's documented workaround
+(parameterised handler `state` slot in place of closure capture).
+
+**Symptom**: a `handle ... with Eff[T](init) { ... }` outer wrap
+around a `handle ... with Eff2 { ... }` inner whose clause body
+*self-delegates* (calls `Eff2.op(...)` from inside an `Eff2.op`
+clause) crashes the runtime on the second op invocation. The
+specific shape that reproduces:
+
+    handle {
+      handle {
+        body()                                       # body: () -> R / Eff2 + e
+      } with Eff2 {
+        op(arg, resume) -> {
+          let v = Eff[T].read()                      # read outer state
+          Eff2.op(v ++ ": " ++ arg)                  # delegate to next outer Eff2
+          resume(())
+        }
+        ...
+      }
+    } with Eff[T](init) { ... }                      # parameterised outer
+
+Tested in two flavours, identical end state:
+
+- `Eff[T] = Reader[String]`, `Eff2 = Trace`. SIGBUS on the third
+  `Trace.log` invocation; first invocation produces correct output;
+  second and third produce blank lines preceded by garbage memory.
+- `Eff[T] = State[String]`, `Eff2 = Trace`. SIGSEGV on the second
+  `Trace.log` invocation.
+
+**Repro** (Reader variant):
+
+    cat > /tmp/r10.kai <<'EOF'
+    import trace
+
+    pub fn with_log_prefix[R, e](
+      prefix: String, body: () -> R / Trace + e
+    ) : R / Trace + e = handle {
+      handle { body() } with Trace {
+        log(msg, resume) -> {
+          Trace.log(Reader.ask() ++ ": " ++ msg)
+          resume(())
+        }
+        checkpoint(name, resume) -> {
+          Trace.log(Reader.ask() ++ ": checkpoint: " ++ name)
+          resume(())
+        }
+        return(x) -> x
+      }
+    } with Reader[String](prefix) {
+      ask(resume) -> resume(state)
+      return(x)   -> x
+    }
+
+    fn worker() : Unit / Trace = {
+      Trace.log("first"); Trace.log("second"); Trace.log("third")
+    }
+
+    fn main() : Unit / Stdout = with_trace_default() {
+      with_log_prefix("P", worker)
+    }
+    EOF
+    cd stage2
+    ./kaic2 --path ../stdlib /tmp/r10.kai > /tmp/r10.c          # OK
+    cc -std=c99 -Wl,-stack_size,0x8000000 -I ../stage0 /tmp/r10.c -o /tmp/r10
+    /tmp/r10                                                    # SIGBUS / blank lines
+
+State variant: replace `Reader[String](prefix) { ask(resume) ->
+resume(state); return(x) -> x }` with `State[String](prefix) {
+get(resume) -> resume(state); set(v, resume) -> resume((), v);
+return(x) -> x }` and `Reader.ask()` with `State.get()`. Same
+shape, also crashes (SIGSEGV on the second invocation rather than
+the third).
+
+**Negative control** (works correctly — confirms self-delegation
+without parameterised outer is fine):
+
+    fn delegating_helper[R, e](
+      body: () -> R / Trace + e
+    ) : R / Trace + e = handle {
+      body()
+    } with Trace {
+      log(msg, resume) -> {
+        Trace.log("X: " ++ msg); resume(())
+      }
+      checkpoint(name, resume) -> {
+        Trace.log("X: cp: " ++ name); resume(())
+      }
+      return(x) -> x
+    }
+
+`fn main() : Unit / Stdout = with_trace_default() {
+delegating_helper(worker) }` produces three correct lines and exits
+0. The bug is specifically the **interaction** between a
+parameterised handler at one stack level and a self-delegating
+handler at a deeper level.
+
+**Hypothesis** (from looking at the emitted C and the in_dispatch
+machinery): R2's fix (`in_dispatch_node` lives on the fiber, set
+around clause execution) interacts badly with the resume path of a
+parameterised handler. When the inner Trace clause calls
+`Reader.ask()` (or `State.get()`), the lookup walks past the
+in_dispatch'd inner Trace to find Reader. Reader's clause runs
+`resume(state)` which one-shots back. But somewhere between the
+restored stack and the next `Trace.log("...")` re-entry, either
+the in_dispatch_node or the evidence_top has been corrupted —
+subsequent ops either see a missing handler (crash) or call into
+freed memory (blank string output).
+
+The `examples/effects/m8_12_self_delegating_handler.kai` regression
+covers the *same-effect* self-delegation case (works); what it
+does NOT cover is **mixing self-delegation with a parameterised
+outer handler** where the inner clause reads outer state via a
+*different* effect lookup.
+
+**Fix path** (out of scope for this lane):
+
+1. Audit `kai_evidence_lookup_node` and the `in_dispatch_node`
+   save/restore around resume entries. Likely the parameterised-
+   handler resume path needs to clear/reinstate `in_dispatch_node`
+   relative to the *innermost handler that owns the suspended
+   continuation*, not the fiber's current top.
+2. Add a fixture under `examples/effects/` that minimally
+   reproduces the shape (this entry's repro, trimmed).
+3. The `m8_12_self_delegating_handler` fixture should grow a
+   parameterised-outer sibling so the regression is gated by CI.
+
+**What works today** (the surface where R10 does not bite):
+
+- Parameterised handler outer + non-self-delegating inner
+  (`with State[Int](0) { ... }` outer, plain `Stdout.print` inside
+  body — fine).
+- Self-delegating inner + non-parameterised outer
+  (`delegating_helper` above + `with_trace_default` — fine).
+- Two parameterised handlers stacked, no self-delegation
+  (`State[Int](0)` outer, `Reader[String]("foo")` inner — fine in
+  isolation, not directly tested in this lane).
+
+The bug is the *combination*. The matrix needs explicit fixtures
+once the runtime fix lands.
+
+**Why this is documented here, not fixed**: the Tier 3 experiment 2
+arm B brief is stdlib-shaped (no compiler/runtime changes); the
+combination R9 + R10 makes the lane's nominal target
+(`with_log_prefix` ship to stdlib) non-viable today. Both findings
+are the lane's substantive output; the report in
+`docs/lane-experience-exp2-arm-b.md` walks through the full
+discovery path.
+
