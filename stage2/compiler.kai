@@ -8803,10 +8803,14 @@ fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: [E
   # `MUnboxed` (raw int / char) and every arm is a literal-or-wild
   # pattern of the same unboxable type with no guard, lower the
   # match to a C `switch` on the raw scalar. Avoids the `_scr`
-  # boxed alias + per-arm `kai_eq(...)` chain.
+  # boxed alias + per-arm `kai_eq(...)` chain. The Real-unboxing
+  # extension restricts this fast path to integral scrutinee types
+  # — `double` is not a valid `switch` operand in C, so a raw Real
+  # scrutinee routes through the boxed path (re-boxing once at the
+  # boundary).
   match scrut.mode {
     MUnboxed -> {
-      if arms_all_literal_or_wild(arms) {
+      if ty_is_integral_raw(scrut.ty) and arms_all_literal_or_wild(arms) {
         emit_match_switch(src, scrut, arms, lcs, fns, variants, lams, cls)
       } else {
         emit_match_default(src, scrut, arms, lcs, fns, variants, lams, cls)
@@ -10102,6 +10106,7 @@ fn raw_c_type(opt_ty: Option[Ty]) : String {
   match opt_ty {
     Some(t) -> match t {
       TyInt  -> "int64_t"
+      TyReal -> "double"
       TyBool -> "int"
       TyChar -> "uint32_t"
       TyDimT(inner, _)    -> raw_c_type(Some(inner))
@@ -10120,6 +10125,7 @@ fn box_wrap(opt_ty: Option[Ty], raw: String) : String {
   match opt_ty {
     Some(t) -> match t {
       TyInt  -> cat3("kai_int(",  raw, ")")
+      TyReal -> cat3("kai_real(", raw, ")")
       TyBool -> cat3("kai_bool(", raw, ")")
       TyChar -> cat3("kai_char(", raw, ")")
       TyDimT(inner, _)    -> box_wrap(Some(inner), raw)
@@ -10136,6 +10142,7 @@ fn unbox_field_for(opt_ty: Option[Ty]) : String {
   match opt_ty {
     Some(t) -> match t {
       TyInt  -> "->as.i"
+      TyReal -> "->as.r"
       TyBool -> "->as.b"
       TyChar -> "->as.c"
       TyDimT(inner, _)    -> unbox_field_for(Some(inner))
@@ -10169,6 +10176,7 @@ fn emit_kind_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
                   variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match x.kind {
     EInt(n)  -> cat2(int_to_string(n), "LL")
+    EReal(r) -> real_to_string(r)
     EBool(b) -> if b { "1" } else { "0" }
     EChar(c) -> int_to_string(char_to_int(c))
     EVar(name) -> cat2("kair_", name)
@@ -23019,9 +23027,11 @@ fn lb_lookup(env: [LocBind], nm: String) : ValueMode {
 }
 
 # `ty_is_unboxable` decides whether the runtime representation can
-# be a raw C scalar. Currently `Int`, `Bool`, `Char`. `Real` and
-# `String` stay boxed in v1 (see Phase 2 non-goals). Wrapper types
-# (refinement, dim) strip to their inner before checking.
+# be a raw C scalar. `Int`, `Bool`, `Char` lower to integral
+# (`int64_t` / `int` / `uint32_t`); `Real` lowers to `double` (Tongariki
+# Real-unboxing extension). `String` stays boxed (no unboxed form
+# exists for length-prefixed bytes). Wrapper types (refinement, dim)
+# strip to their inner before checking.
 fn ty_is_unboxable(opt_t: Option[Ty]) : Bool {
   match opt_t {
     Some(t) -> ty_is_unboxable_t(t)
@@ -23032,10 +23042,33 @@ fn ty_is_unboxable(opt_t: Option[Ty]) : Bool {
 fn ty_is_unboxable_t(t: Ty) : Bool {
   match t {
     TyInt  -> true
+    TyReal -> true
     TyBool -> true
     TyChar -> true
     TyDimT(inner, _)    -> ty_is_unboxable_t(inner)
     TyRefineT(inner, _) -> ty_is_unboxable_t(inner)
+    _ -> false
+  }
+}
+
+# True iff `t` is one of the integral unboxable types — `Int`,
+# `Bool`, `Char`. `Real` is a `double`, which has no `%` operator
+# and cannot be a C `switch` operand. Used to gate operations that
+# only apply to integral raw scalars.
+fn ty_is_integral_raw(opt_t: Option[Ty]) : Bool {
+  match opt_t {
+    Some(t) -> ty_is_integral_raw_t(t)
+    None    -> false
+  }
+}
+
+fn ty_is_integral_raw_t(t: Ty) : Bool {
+  match t {
+    TyInt  -> true
+    TyBool -> true
+    TyChar -> true
+    TyDimT(inner, _)    -> ty_is_integral_raw_t(inner)
+    TyRefineT(inner, _) -> ty_is_integral_raw_t(inner)
     _ -> false
   }
 }
@@ -23138,6 +23171,7 @@ fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
   else {
     match k {
       EInt(_)  -> MUnboxed
+      EReal(_) -> MUnboxed
       EBool(_) -> MUnboxed
       EChar(_) -> MUnboxed
       EVar(nm) -> lb_lookup(env, nm)
@@ -23148,7 +23182,13 @@ fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
       # whole node MBoxed routes through `kai_add` etc. which
       # consume their args correctly.
       EBinop(op, a, b) ->
-        if op_is_raw_arith(op) and child_is_raw(a) and child_is_raw(b) { MUnboxed }
+        # `%` (modulo) has no C-native form on `double`; for `Real`
+        # operands the binop stays boxed and routes through `kai_mod`.
+        # `+` `-` `*` `/` are valid for both `int64_t` and `double`.
+        if op_is_raw_arith(op) and child_is_raw(a) and child_is_raw(b) {
+          if op == "%" and not ty_is_integral_raw(opt_ty) { MBoxed }
+          else { MUnboxed }
+        }
         # M4 — comparisons and short-circuiting booleans collapse to
         # native C operators when both operands are raw. The result
         # is a raw `int` (0/1) which the boundary tactic re-boxes
