@@ -9,6 +9,68 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **`check "..." [with p: T, ...] { body }` blocks + `kai check`
+  subcommand (issue #44).** Property-based test form mirrors
+  `test` / `bench` plus an optional `with`-clause for the
+  generators. Parser: `check` keyword (`TkCheck`),
+  `DCheck(String, [Param], Expr, Int, Int)` AST node, and ~25
+  walker arms thread the body + params through every existing
+  decl-walking pass (alias rewrite, op-call / index / const-ref
+  / var desugar, validation, monomorphisation, Perceus, protocol
+  resolution, fmt, dump). Param-aware passes (chk_decl,
+  validate_var, validate_inv, perceus, rqc, rename_proto_calls)
+  scope the with-clause params like fn params.
+- **Stage-2 emit pipeline** (`emit_check_fn` / `check_decls` /
+  `number_checks` / `emit_all_checks` / `check_call_list`) wraps
+  the body in a fixed `KAI_CHECK_ITERS = 100` loop. Each iter
+  resets the counterexample buffer, generates a fresh value for
+  every with-clause param via `kai_arbitrary_<T>()`, records
+  `name=<repr>` for the counterexample, evaluates the body as a
+  Bool predicate, and either continues (true) or records the
+  failing inputs and breaks early (false). Shrinking is deferred
+  to v1.x.
+- **Runtime helpers** in `stage0/runtime.h`: `kai_check_begin`,
+  `kai_check_pass`, `kai_check_fail`, `kai_check_summary`,
+  `kai_check_record_param`, `kai_check_cx_reset`, plus an
+  xorshift64* PRNG (`kai_check_rand_u64`) seeded from a fixed
+  constant (`KAI_CHECK_SEED` env-var override defers to v1.x).
+- **Intrinsic generators** (issue #44 path b): `kai_arbitrary_int`
+  (Int in [-50, 50]), `kai_arbitrary_bool`, `kai_arbitrary_char`
+  (printable ASCII), `kai_arbitrary_string` (len 0..10), and
+  `kai_arbitrary_list_<T>` for the four primitive `T`s
+  (len 0..7). Sum / record / non-primitive list element types
+  fall through to a panic stub at compile time so the gap is
+  loud rather than silently producing zero values; structural
+  derivation lands in v1.x and protocol-based generators
+  (`impl Arbitrary for T`) defer to v2 post-protocol maturity.
+- **CLI**: new `MPropCheck` mode + `--prop-check` flag in
+  stage 2 (the existing `--check` flag stays at its current
+  typecheck-only semantics — `stage2/Makefile` and prior
+  workflow depend on it). `bin/kai` grows a `cmd_check` parallel
+  to `cmd_test` / `cmd_bench` that translates `kai check
+  <file>` into the underlying `--prop-check` invocation.
+- **Smoke fixture** `examples/stdlib/check_basic.kai` covers a
+  parameterless tautology, a single-Int property, a `[Int]`
+  property, and a multi-param property. `make test-check` builds
+  + runs the fixture and grep-verifies the output format
+  (per-block `: 100 iter, OK` and the trailing
+  `4/4 checks passed` summary). Wired into `make tier1` so every
+  PR runs the property-check smoke.
+
+### Changed
+
+- **`check` is now a reserved keyword.** Eleven existing
+  fixtures (`examples/stdlib/{decimal,set,queue,math_int,
+  math_real,json,money,uuid,map,stack}_basic.kai` and
+  `examples/protocols/m12_8_x_derive_hash_sum_consistent.kai`)
+  defined a helper `fn check(label: String, ok: Bool) : Unit /
+  Stdout = ...` that prints `OK <label>` / `FAIL <label>`. All
+  renamed to `verify` since the helper is fixture-internal and
+  output prefixes (`OK`, `FAIL`) come from the body, not the
+  function name — `.out.expected` files are unchanged.
+
 ### Docs
 
 - **Drop specialisation lane closed as doc-only PR (Tongariki
