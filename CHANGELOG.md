@@ -9,6 +9,28 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Changed
+
+- **`demos/toquefama` migrated to `Pair[a, b]`; demo baseline 25 →
+  26 (issue #96).** The demo's `count_toques` used a tuple match
+  `match (guess, target) { ([], _) -> ... }` that the m8.5 gate
+  rejected on 2026-04-27 (tuples are not coming back; canonical
+  anonymous product is `Pair[a, b]` from `stdlib/core/tuple.kai`).
+  `count_toques` now takes a `Pair[[Int], [Int]]` and matches via
+  anonymous record patterns over `fst` / `snd`; the single call
+  site wraps its arguments in `Pair { fst, snd }`. Two pre-existing
+  bugs hidden behind the parse failure also fixed inline so the
+  demo could move from FAIL to PASS: `Option<[Int]>` → `Option[[Int]]`
+  (kaikai uses square brackets for type application), and the
+  `list_index_of(target, g)` calls in `count_famas` now pass the
+  predicate `(x) => x == g` per the current stdlib signature.
+  `read_line()` is matched on its `Result[String, String]` shape.
+  `round` carries a counter parameter to sidestep R12 (zero-arg
+  TCO emitter bug, logged in `docs/known-regressions.md`).
+  `make -C demos verify` reports `toquefama PASS (no golden)`; the
+  total OK + PASS column rises from 25 to 26 (`demos/baseline.txt`
+  bumped accordingly).
+
 ## [0.34.0] — 2026-05-02 (typer hardening — #71 option (a) + #72 per-op row generics)
 
 ### Added
