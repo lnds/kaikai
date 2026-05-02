@@ -2253,7 +2253,53 @@ test-tco-perceus-wrap: $(TARGET) build
 	  && echo "tco-perceus-wrap OK (issue #89 1M-deep self-tail-call through perceus wrap; goto label emitted; runs to completion)" \
 	  || { echo "tco-perceus-wrap DIFF"; diff ../examples/perceus/unbox_bench.out.expected build/tco-perceus.out; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude
+# Issue #82 — Perceus leak-audit fixture. Exercises four RC
+# discipline gaps that survived the m5.x flip: match-scrutinee
+# decref at exit, kai_op_truthy on fresh `if` conds, kai_field
+# borrowing reads in record-pattern test paths, and the
+# kai_prelude_mailbox_* helpers consuming their KaiValue * params.
+# A regression in any of these surfaces under the asan sibling as
+# a UAF (decref of a singly-held value the runtime later double-
+# frees) or as a stdout diff against the golden.
+PERCEUS_ISSUE82_FIXTURES := issue_82_leak_audit
+
+test-perceus-issue82: $(TARGET) build
+	@set -e; \
+	for name in $(PERCEUS_ISSUE82_FIXTURES); do \
+	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name; \
+	  ./build/$$name > build/$$name.out; \
+	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
+	    && echo "perceus-issue82 OK $$name (4 leak sources closed)" \
+	    || { echo "perceus-issue82 DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
+	done
+
+# ASAN+UBSan sibling for the issue #82 leak-audit. The fixes
+# touch emit-side decref discipline (stages 1/2 plus LLVM if) and
+# the kai_prelude_mailbox_* helpers in stage0/runtime.h; ASan
+# catches a regression that double-frees the cond / scrutinee /
+# message, UBSan flags any signed-overflow that slips through the
+# new mailbox transfer paths.
+test-perceus-issue82-asan: $(TARGET) build
+	@set -e; \
+	for name in $(PERCEUS_ISSUE82_FIXTURES); do \
+	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
+	    echo "perceus-issue82-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
+	    && echo "perceus-issue82-asan OK $$name" \
+	    || { echo "perceus-issue82-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	done
+
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
