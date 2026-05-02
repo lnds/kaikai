@@ -57,15 +57,22 @@ What does **not** work today:
   becomes a bare pid — reason distinction (Normal / Crashed)
   is reachable today through Link + trap_exit. Coverage:
   `examples/effects/m8_monitor.kai`.
-- `Fiber[T]` / `Pid[Msg]` region brand is shallow. The shallow
+- ~~`Fiber[T]` / `Pid[Msg]` region brand is shallow. The shallow
   walk now symmetrises Fiber and Pid (Tier 2 extension,
   2026-04-30 — `examples/effects/m8x_6_pid_escapes.kai`), but a
   `Fiber` / `Pid` embedded inside a *user-defined* sum-type
-  constructor's payload still escapes the shallow check. The full
-  TyBranded machinery (propagation through every binding form,
-  brand-mismatch detection between sibling nurseries) is the
-  long-term shape pinned in `docs/structured-concurrency.md`
-  §*Type system* and deferred — see §*Residual m8.x items* below.
+  constructor's payload still escapes the shallow check.~~
+  **Sum-payload escape closed 2026-05-02 (issue #71 option (a)).**
+  The walker now consults a `[SumInfo]` registry collected per
+  `infer_program`, substitutes the type's tparams into each
+  variant's payload TypeExpr and recurses. Coverage:
+  `examples/effects/m8x_7_fiber_in_sum.kai`,
+  `m8x_7_pid_in_sum.kai`, `m8x_7_recursive_sum_no_breach.kai`.
+  The remaining gap is option (b) — full `TyBranded(Ty, BrandId)`
+  propagation with sibling-nursery brand-mismatch detection —
+  pinned in `docs/structured-concurrency.md` §*Type system*
+  and gated on the m7b #4 cap-binding form (`nursery { n -> ... }`)
+  not yet landing; see §*Residual m8.x items* item 1 below.
 - ~~LLVM op-dispatch (`llvm_emit_op_dispatch`) does not carry the
   `in_dispatch_node` flag. The same bug #12 shape exists in the
   LLVM backend, hidden until someone hits a self-delegating
@@ -123,7 +130,7 @@ can be parallelised across short lanes.
 | ~~R4 — fiber-discard deadlock~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
 | ~~Stack guard pages~~ ✅ shipped 2026-04-29 | ~0.5d | (carry-over from Tier 1) |
 | ~~**Monitor + `spawn_actor`**~~ ✅ shipped 2026-04-30 | ~2–3d | Phase 5.5+ retrofitted; runtime walker mirrors Link + trap-exit, MonitorRef simplified to Pid[Nothing] in v1 |
-| **Region-brand full machinery** ⚠ partial 2026-04-30 | ~3–5d | Pid symmetric with Fiber in the shallow check; full `TyBranded` propagation (sum-type-payload escape + brand-mismatch detection) still pending — see §*Residual m8.x items* |
+| **Region-brand full machinery** ⚠ partial 2026-05-02 | ~3–5d | Pid symmetric with Fiber in the shallow check (2026-04-30); sum-type-payload escape closed via `SumInfo` registry + `ty_expr_find_handle` walker (2026-05-02 commit `c18cd4b`, issue #71 option (a)). Full `TyBranded(Ty, BrandId)` propagation with sibling-nursery brand mismatch is option (b), gated on m7b #4 cap-binding form not yet landing — see §*Residual m8.x items* |
 | ~~**LLVM op-dispatch `in_dispatch_node`**~~ ✅ shipped 2026-04-30 | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend — three runtime helpers (`kaix_evidence_lookup_node` / `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the KaiFiber struct out of the IR |
 | ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
 | ~~**Per-op generics in Spawn API**~~ ✅ partial 2026-04-30 | ~0.5d | TYPE generics retrofitted on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk still pending — see §*Residual m8.x items* |
@@ -158,31 +165,44 @@ issue #59 — they were always scoped as separate lanes.
 
 ### 1. Full `TyBranded` region brand (issue #71)
 
-The shallow `ty_expr_contains_fiber` / `ty_expr_contains_pid` walk
-catches a Fiber or Pid handle only when it appears in a TypeExpr
-the walker can see (TyName / TyList / TyFn / TyDim / TyRefine
-recursive descent). Two gaps remain:
+**Option (a) closed 2026-05-02 (commit `c18cd4b`).** The walker now descends into
+user-defined sum-type constructor payloads via a `[SumInfo]`
+registry collected during `infer_program` and threaded through
+`infer_all_loop` → `infer_decl` → `check_no_fiber_escape`. The
+`ty_expr_find_handle` predicate substitutes the sum's tparams
+into each variant's payload TypeExpr and recurses, with a
+`visited` set guarding recursive sums (`type Tree[T] = Leaf(T) |
+Node(Tree[T], Tree[T])`). When the breach goes through a sum
+payload the diagnostic adds a note citing the constructor +
+sum type. Coverage: `examples/effects/m8x_7_fiber_in_sum.kai`,
+`m8x_7_pid_in_sum.kai`, `m8x_7_recursive_sum_no_breach.kai`. The
+pre-existing `m8x_6_*` fixtures continue to fire via the
+`HBDirect` path (no behavioural regression for direct/parametric
+breaches).
 
-- *Sum-type-wrapped escape.* A `type Boxed = Wrapper(Fiber[Int])`
-  return value hides Fiber from the TypeExpr walker — the type's
-  surface name is `Boxed`; the constructor's payload is recorded in
-  the variant table, not in the TypeExpr the walker sees. Closing
-  this gap requires either (a) a TypeExpr-level "transitively
-  contains a banned handle" check that consults the variant table,
-  or (b) the full `TyBranded` propagation that tracks brands
-  through every binding form (let, match, list literal, record
-  field, fn arg, fn return). Option (a) is a tractable Tier 2
-  follow-up; option (b) is the spec'd long-term shape pinned in
-  `docs/structured-concurrency.md` §*Type system*.
-- *Brand mismatch between sibling nurseries.* Detecting that a
-  Fiber spawned in nursery `n1` is being passed into a `n2.spawn`
-  body needs lifetime-shaped tracking — fundamentally a
-  `TyBranded(Ty, BrandId)` feature, not a TypeExpr walk.
+**Option (b) — full `TyBranded(Ty, BrandId)` with sibling-nursery
+brand mismatch — still deferred, blocked on m7b #4 cap binding.**
+The structural prerequisite for option (b) is a syntactic site
+that introduces a brand: `nursery { n -> ... }`, where `n` is a
+capability that tags every `n.spawn` result with the nursery's
+brand. Today `nursery { ... }` is a plain helper
+`nursery[T,e](body: () -> T / e) : T / e = body()` with no `n`
+parameter — the cap-binding form belongs to m7b #4 which has not
+landed (see `docs/syntax-sugars.md` §*Capability read/write*).
+Without that surface, two distinct nurseries cannot even be
+referenced from user code, so brand mismatch between sibling
+nurseries is unwritable — there is nothing to detect. Option
+(b)'s typer work (TyBranded variant, propagation through let /
+match / list / record / fn args+returns, brand-mismatch
+unification) is well-scoped, but landing it before m7b #4 cap
+binding lands would have no observable effect on user code; it
+would be defensive scaffolding for a surface that doesn't exist.
+The right sequencing is m7b #4 first, then option (b) — which
+re-uses the cap-binding scope as the brand introduction site.
 
-Negative-test fixtures already in tree: `m8x_6_fiber_in_result.kai`,
-`m8x_6_pid_escapes.kai`. The sum-type-wrapped escape is the natural
-acceptance criterion for option (a); option (b) needs its own design
-doc lane.
+Until m7b #4 lands and option (b) is built on top of it, option
+(a) plus the existing direct/parametric shallow check covers
+every gap that user code can express today.
 
 ### 2. Per-op ROW generics on Spawn (issue #72)
 

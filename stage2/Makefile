@@ -1354,6 +1354,34 @@ test-effects: $(TARGET) build
 	  done < $$exp_err; \
 	  echo "effects OK $$name (Pid escape rejected with diagnostic)"; \
 	done; \
+	for f in ../examples/effects/m8x_7_fiber_in_sum.kai \
+	         ../examples/effects/m8x_7_pid_in_sum.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_err=../examples/effects/$$name.err.expected; \
+	  rc=0; ./$(TARGET) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
+	  fi; \
+	  while read -r line; do \
+	    grep -qF "$$line" build/s2-$$name.err \
+	      || { echo "effects FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/s2-$$name.err; exit 1; }; \
+	  done < $$exp_err; \
+	  echo "effects OK $$name (sum-payload Fiber/Pid escape detected, issue #71)"; \
+	done; \
+	for f in ../examples/effects/m8x_7_recursive_sum_no_breach.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored on positive sum fixture)"; \
+	         cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^7$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (recursive sum traversal terminates, no false positive)" \
+	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
 	for f in ../examples/effects/m8_7_actor_self_send.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
