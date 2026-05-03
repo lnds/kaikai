@@ -771,3 +771,107 @@ Trailing lambdas (single and double), the lambda-block
 expression form, `@` / `:=`, `var`, and `a[i]` all land together
 in milestone **m7b**. None has a hard dependency on another, so
 the order inside m7b is by convenience.
+
+## Landed sugars (post-m12.8)
+
+The following sugars landed after the m7b set and after
+m12.8.x — they are documented here because they ride on the same
+desugar-before-typecheck principle as the original five.
+
+### Regex sigil (`~r/.../`)
+
+**Landed**: 2026-05-03, PR #159 (closes #85).
+
+A regex literal is written `~r/PATTERN/`. The `~r/` prefix is a
+two-character sigil recognised by the lexer; it produces a
+`TkRegex(String)` token carrying the raw pattern body. The
+closing `/` ends the literal. The body is single-line, ASCII
+subset, and does not support backreferences or lookaround (the
+constraints of `stdlib/regexp.kai`, the RE2-style engine).
+
+```kai
+let email_re : Regex = ~r/^[^@]+@[^@]+\.[^@]+$/
+let stripped = re_replace(s, ~r/\s+/, " ")
+```
+
+**Why a sigil rather than bare `/.../`**: kaikai's lexer is
+LL(1)-friendly and the `/` character already serves as the
+division operator. A bare `/.../` literal would force the lexer
+to disambiguate by context (Ruby/JavaScript-style lookback),
+which the design refuses (see Tier 1 §3 — fast compilation,
+single-pass parse). The `~r/` sigil is unambiguous regardless of
+context.
+
+**Desugar in expression position**: `~r/PAT/` parses to a
+`Regex` value. It is interchangeable with any other expression
+producing a `Regex`.
+
+**Desugar in refinement-predicate position**: inside a `where`
+clause the expression `matches ~r/PAT/` is a refinement-pure
+call to the prelude `matches : (String, Regex) -> Bool` (see
+`docs/refinements-and-contracts.md` §"Predicate language" and
+§"Regex predicates"). The clause type-checks identically to any
+other refinement-pure predicate.
+
+Cross-link: `docs/stdlib-regex-design.md` for the engine; PR #159
+for the sigil + token + `matches` integration.
+
+### Hex and binary integer literals
+
+**Landed**: 2026-05-03, PR #160 (closes #156).
+
+Integer literals may be written in hexadecimal (`0x` prefix) or
+binary (`0b` prefix) in addition to decimal. The literal type is
+`Int` and the AST node is `EInt` — no new type, no new AST node,
+no new operator. The parser branches on the second character
+after a leading `0`.
+
+```kai
+let mask : Int = 0xFF
+let cafe : Int = 0xCAFE
+let max_signed_64 : Int = 0x7FFFFFFFFFFFFFFF
+let bits : Int = 0b11111111
+```
+
+Range: signed 64-bit (`Int` is `i64` throughout the runtime).
+There is no support for:
+
+- Underscore digit separators (`0x_FF_FF` does not parse).
+- Octal `0o` literals.
+- Hex floating-point literals (`0x1.8p3` does not parse).
+
+Cross-link: PR #160. Lexer change is in the integer-literal
+branch of the tokeniser.
+
+### n-tuple sugar (`(a, b)`, `(a, b, c)`, `(a, b, c, d)`)
+
+**Landed**: 2026-05-03, PR #155 (closes #154).
+
+A parenthesised comma-separated expression of length 2, 3, or 4
+is sugar for the stdlib records `Pair[a, b]`, `Triple[a, b, c]`,
+and `Quad[a, b, c, d]` respectively. The cap is **N = 4**;
+`(a, b, c, d, e)` is a parse error. Field accessors stay named
+(`.fst`, `.snd`, `.trd`, `.frt`); there is no positional
+`.0`/`.1`. The `(a)` form is a parenthesised expression as
+before — the n-tuple sugar starts at N = 2.
+
+The sugar applies in all four positions:
+
+- **Expression**: `(1, "x")` → `Pair[Int, String] { fst: 1, snd: "x" }`.
+- **Type**: `(Int, String)` → `Pair[Int, String]`.
+- **Pattern**: `match v { (a, b) -> ... }` → `Pair { fst: a, snd: b }`.
+- **Let-destructure**: `let (a, b) = call_returning_pair()`.
+
+The existing record-literal form `Pair { fst: x, snd: y }`
+continues to parse identically to the sugar.
+
+**Why the cap at N = 4**: matches the receipt of the
+*Tuples — REJECTED* gate in `docs/proposed-extensions.md`. The
+sugar adds a short construction/type/pattern form without
+introducing a new `TyCtor` or a new field-access surface — both
+of which the gate ruled out and continues to rule out.
+
+Cross-link: `stdlib/core/tuple.kai` for the `Pair`, `Triple`,
+`Quad` definitions; PR #155 for the parser desugar;
+`docs/proposed-extensions.md` §"Tuples (sugar) — LANDED" for the
+relationship with the older "Tuples — REJECTED" decision.

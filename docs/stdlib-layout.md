@@ -210,7 +210,11 @@ land in each module's own spec when implemented.
 - `core.option` — is_some, is_none, map, and_then, unwrap_or, or_else
 - `core.result` — is_ok, is_err, map, map_err, and_then, unwrap_or
 - `core.char` — is_digit, is_alpha, is_alnum, is_space, to_lower, to_upper
-- `core.tuple` — swap, fst, snd for 2-tuples
+- `core.tuple` — `Pair[a, b]`, `Triple[a, b, c]`, `Quad[a, b, c, d]`
+  records with named accessors `.fst`, `.snd`, `.trd`, `.frt`, plus
+  `swap`, `fst`, `snd` helpers for 2-tuples. Also the target of the
+  n-tuple parser sugar `(a, b)` / `(a, b, c)` / `(a, b, c, d)`
+  (cap N = 4) — see `docs/syntax-sugars.md` §"n-tuple sugar".
 - `core.ordering` — `Ordering` type, chain, reverse
 
 ### collections (pure, stage 2)
@@ -360,6 +364,15 @@ End-to-end fixture: `examples/stdlib/regex_basic.kai` (38-line
 golden covering match / captures / find_all / replace / split).
 Validation: `make test-stdlib` passes; selfhost OK on both C and
 LLVM backends.
+
+**Regex sigil + `matches` predicate** — landed 2026-05-03 (PR
+#159, closes #85). The lexer recognises `~r/PATTERN/` as a
+`Regex`-typed literal (`TkRegex` token), unambiguous regardless
+of context. The prelude function `matches : (String, Regex) -> Bool`
+joins the `[<refinement-pure>]` set, so `String where matches ~r/.../`
+is a valid refinement-type predicate. See `docs/syntax-sugars.md`
+§"Regex sigil (`~r/.../`)" and `docs/refinements-and-contracts.md`
+§"Regex predicates".
 
 ### crypto (pure, stage 2)
 

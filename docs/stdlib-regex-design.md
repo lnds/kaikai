@@ -9,7 +9,7 @@ Land `stdlib/regexp.kai` per `docs/stdlib-layout.md` §`regexp`:
 - RE2-style deterministic engine (no backreferences, linear time).
 - Pure full kaikai (no FFI in v1).
 
-Unblocks **m12.6.x #7** (regex refinement predicates `String where matches /.../`) and removes one of the largest gaps vs Go (`regexp` package) and Elixir (`Regex` module).
+Unblocks **m12.6.x #7** (regex refinement predicates `String where matches ~r/.../`) and removes one of the largest gaps vs Go (`regexp` package) and Elixir (`Regex` module).
 
 ## Scope (in)
 
@@ -102,7 +102,7 @@ Match function returns the leftmost-longest match (greedy semantics).
 5. **Public API + module** (`stdlib/regexp.kai`) ~50 LOC wrappers. `regex_compile` returns `Result`; `regex_replace` builds output with substitution syntax (`$1`, `$2`).
 6. **Fixtures end-to-end** (`examples/stdlib/regex_basic.kai`, plus a battery against RFC test cases — IPv4, email subset, URL parsing).
 7. **Wire in** `bin/kai` + `stage2/Makefile` `EXTRA_PRELUDE_FLAGS` + `test-stdlib`.
-8. **Docs**: update `stdlib-layout.md` to mark `regexp` as landed; mark m12.6.x #7 as unblocked (still requires regex literal syntax `where matches /.../` integration).
+8. **Docs**: update `stdlib-layout.md` to mark `regexp` as landed; mark m12.6.x #7 as unblocked (still requires regex literal syntax `where matches ~r/.../` integration).
 
 ## Estimated effort
 
@@ -129,7 +129,7 @@ Match function returns the leftmost-longest match (greedy semantics).
 | `stage2/Makefile` | +1 line in `EXTRA_PRELUDE_FLAGS`. |
 | `docs/stdlib-layout.md` | Mark landed. |
 
-**Zero changes** to `stage2/compiler.kai` — pure stdlib lane. The `where matches /.../` regex literal *syntax* needs lexer/parser integration but that lands as **m12.6.x #7 lane**, separate from this one. Lane B unblocks it.
+**Zero changes** to `stage2/compiler.kai` — pure stdlib lane. The `where matches ~r/.../` regex literal *syntax* needs lexer/parser integration but that lands as **m12.6.x #7 lane**, separate from this one. Lane B unblocks it.
 
 ## Risks
 

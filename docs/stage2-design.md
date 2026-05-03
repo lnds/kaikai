@@ -481,7 +481,7 @@ in.
     2026-04-27, sub-lanes a–e; see the "Recommended ordering"
     section §7 for what shipped and what remains deferred)*.
     Pony/Ada-style refinement types lite (`Int where >= 0`,
-    `String where matches /.../`) + Eiffel/Ada 2012-style
+    `String where matches ~r/.../`) + Eiffel/Ada 2012-style
     `requires` / `ensures` clauses on functions. Decidable
     subset, no SMT; static proof where reducible to interval
     propagation + regex subsumption, runtime checks otherwise.
@@ -727,11 +727,11 @@ Rationale:
      (lexer disambiguation) pending in issue #84.
    - **#6 Compile-time errors** for trivially-false
      predicates — landed.
-   - **#7 Regex literals** (`String where matches /.../`) —
+   - **#7 Regex literals** (`String where matches ~r/.../`) —
      stdlib regex engine landed 2026-04-28
-     (`stdlib/regexp.kai`, RE2-style); the refinement-side
-     `where matches /.../` syntax + lexer/parser integration
-     is pending in issue #85.
+     (`stdlib/regexp.kai`, RE2-style); regex sigil literal
+     `~r/.../` + `TkRegex` token + `matches` refinement-pure
+     predicate **landed 2026-05-03 (PR #159, closes #85)**.
    - **#8 Diagnostics quality** (predicate-aware panic
      messages) — v1 landed; structured violation context
      pending in issue #86.
@@ -868,6 +868,42 @@ with or without unit annotations. Roughly +1100 lines added to
 `stage2/compiler.kai`. Fixtures land in `examples/units/`. Full
 landing notes in `docs/units-of-measure.md` (Status: Landed at the
 top); lane experience report in `docs/lane-experience-m12.5.md`.
+
+### Update 2026-05-03 — landed sugars: regex sigil, hex/binary literals, n-tuple sugar
+
+Three independent parser-side sugars landed in quick succession.
+None changes the type system; none introduces a new `TyCtor`. All
+three are documented in `docs/syntax-sugars.md` §"Landed sugars
+(post-m12.8)".
+
+- **`TkRegex(String)` token** (PR #159, closes #85). The lexer
+  recognises a `~r/.../` sigil and emits a `TkRegex` token
+  carrying the raw pattern body. The sigil is unambiguous
+  regardless of context — no contextual lookback needed. Used in
+  expression position (a first-class `Regex` value) and inside
+  `where matches ~r/.../` refinement clauses (`matches` is now in
+  the `[<refinement-pure>]` prelude set).
+- **Integer-literal parser branches** (PR #160, closes #156). On
+  a leading `0`, the tokeniser checks the next character: `x`
+  enters the hex branch (`0xFF`), `b` the binary branch
+  (`0b1010`). The result is the same `Int` type and the same
+  `EInt` AST node — no new node, no new type, no new operator.
+  Range is signed 64-bit. No underscore separators, no octal
+  `0o`, no hex floats.
+- **n-tuple parser sugar** (PR #155, closes #154). A
+  parenthesised comma-separated list of length 2/3/4 desugars at
+  parse time to `Pair`/`Triple`/`Quad` record literals
+  (cap N = 4). Applies in expression, type, pattern, and
+  let-destructure positions. The original "Tuples — REJECTED"
+  gate (no new `TyCtor`, no positional `.0` access) still holds —
+  see `docs/proposed-extensions.md` §"Tuples (sugar) — LANDED"
+  for the consistency argument.
+
+UoM annotation in record field positions (issue #158, PR #163) is
+still in flight at the time of this update — when it lands the
+type parser will accept `Decimal<USD>` / `Real<m^2>` inside
+record-field type slots in addition to the existing fn-param /
+fn-return / `let` slots. Update this section once #163 merges.
 
 ### Milestone naming: Core language vs Full language
 

@@ -204,6 +204,38 @@ The places tuples win unambiguously (transient pattern matching)
 are not tuple-as-type; they are syntactic sugar over multi-arg
 match.
 
+## Tuples (sugar) — LANDED 2026-05-03 (PR #155, closes #154)
+
+**What landed**: parser-only desugar that recognises `(a, b)`,
+`(a, b, c)`, and `(a, b, c, d)` as **n-tuple sugar** for the
+existing stdlib records `Pair[a, b]`, `Triple[a, b, c]`, and
+`Quad[a, b, c, d]`. Cap at N = 4. Field accessors stay named
+(`.fst`, `.snd`, `.trd`, `.frt`); no positional `.0`/`.1` access.
+The sugar works in all four positions:
+
+- **Expression**: `let p = (1, "x")` → `Pair[Int, String] { fst: 1, snd: "x" }`.
+- **Type**: `fn f() : (Int, String) = ...` → `Pair[Int, String]`.
+- **Pattern**: `match v { (a, b) -> ... }` → `Pair { fst: a, snd: b }`.
+- **Let-destructure**: `let (a, b) = pair_returning_call()`.
+
+The existing `Pair { fst: x, snd: y }` literal continues to parse
+identically — both forms produce the same AST shape after desugar.
+
+**What stayed rejected**: tuples-as-a-type (a distinct `TyCtor`
+with positional accessors). The original gate above rules that
+out and the rule still holds.
+
+**Why both decisions are consistent**: the sugar form rides on the
+existing record types `Pair`/`Triple`/`Quad`. No new `TyCtor` is
+introduced and no new field-access syntax is added — the
+measurement gate that ruled out tuples-as-a-type ruled out exactly
+those two additions. The sugar buys the ergonomic short form
+(`(a, b)` for construction, type, pattern, destructure) without
+touching the type system or the access surface.
+
+Cross-link: `stdlib/core/tuple.kai` for the `Pair`, `Triple`,
+`Quad` definitions; PR #155 for the parser desugar.
+
 ## 4. Sum types with constant attributes
 
 ```kai
