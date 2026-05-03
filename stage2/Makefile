@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-match test-loop test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-match test-loop test-time test-intervals test-stdlib test-http-client-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude selfhost
 
 all: $(TARGET)
 
@@ -674,7 +674,8 @@ EXTRA_PRELUDE_FLAGS := --prelude ../stdlib/protocols.kai \
                        --prelude ../stdlib/path.kai \
                        --prelude ../stdlib/os/env.kai \
                        --prelude ../stdlib/os/args.kai \
-                       --prelude ../stdlib/time.kai
+                       --prelude ../stdlib/time.kai \
+                       --prelude ../stdlib/net/http.kai
 
 test-stdlib: $(TARGET) build
 	@set -e; \
@@ -2357,6 +2358,40 @@ test-perceus-issue82-asan: $(TARGET) build
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
 	    && echo "perceus-issue82-asan OK $$name" \
 	    || { echo "perceus-issue82-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	done
+
+# Tier S1 lane #3 — net.http client. The pure helpers
+# (`http_serialize_request`, `http_parse_response`, `http_parse_url`)
+# manipulate Strings and HttpHeader records, and the
+# `drain_client` recv loop in the fixture allocates a [Int]
+# accumulator across many short recvs. Both shapes have surfaced
+# RC-discipline regressions in past stdlib lanes (issue #82
+# match-scrutinee, issue #115 default-handler typed dispatch).
+# This ASAN sibling exercises the fixture under ASan+UBSan so a
+# botched decref / consume edit lands as a sanitizer diagnostic
+# instead of a quiet leak. Wired into the root `tier1-asan`
+# alongside the runtime-shadow / Signal / trap-exit gates.
+HTTP_CLIENT_FIXTURES := http_client_basic
+
+test-http-client-asan: $(TARGET) build
+	@set -e; \
+	for name in $(HTTP_CLIENT_FIXTURES); do \
+	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
+	    || { echo "http-client-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
+	    || { echo "http-client-asan FAIL $$name (C compile failed)"; exit 1; }; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/stdlib-$$name-asan-c > build/stdlib-$$name-asan.out 2> build/stdlib-$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/stdlib-$$name-asan.err; then \
+	    echo "http-client-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/stdlib-$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
+	    && echo "http-client-asan OK $$name" \
+	    || { echo "http-client-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }; \
 	done
 
 # Issue #87 — Phase 2 unbox LLVM mirror. Compiles unbox_bench.kai
