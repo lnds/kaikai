@@ -481,7 +481,7 @@ in.
     2026-04-27, sub-lanes a–e; see the "Recommended ordering"
     section §7 for what shipped and what remains deferred)*.
     Pony/Ada-style refinement types lite (`Int where >= 0`,
-    `String where matches /.../`) + Eiffel/Ada 2012-style
+    `String where matches ~r/.../`) + Eiffel/Ada 2012-style
     `requires` / `ensures` clauses on functions. Decidable
     subset, no SMT; static proof where reducible to interval
     propagation + regex subsumption, runtime checks otherwise.
@@ -727,11 +727,13 @@ Rationale:
      (lexer disambiguation) pending in issue #84.
    - **#6 Compile-time errors** for trivially-false
      predicates — landed.
-   - **#7 Regex literals** (`String where matches /.../`) —
+   - **#7 Regex literals** (`String where matches ~r/.../`) —
      stdlib regex engine landed 2026-04-28
-     (`stdlib/regexp.kai`, RE2-style); the refinement-side
-     `where matches /.../` syntax + lexer/parser integration
-     is pending in issue #85.
+     (`stdlib/regexp.kai`, RE2-style); the Elixir-style sigil
+     `~r/.../` + `matches` predicate-pure helper landed
+     2026-05-03 (lane closing issue #85). Subsumption (static
+     containment between regex literals) deferred to a
+     follow-up issue.
    - **#8 Diagnostics quality** (predicate-aware panic
      messages) — v1 landed; structured violation context
      pending in issue #86.
