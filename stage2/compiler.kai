@@ -20863,6 +20863,19 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
     }
     TyCon(an, aa) -> match b {
       TyCon(bn, ba) -> if an == bn { unify_list(aa, ba, s) } else { None }
+      # issue #162: a bare named record on the LHS unifies with the
+      # same record on the RHS decorated by a unit, when the unit
+      # collapses to UOne. Mirrors the `Real ≡ Real<1>` / `Int ≡ Int<1>`
+      # rules above. v1 lights this up only for `Decimal` — the other
+      # named records have no UoM-decorated form yet.
+      TyDimT(bb, bu) -> match bb {
+        TyCon(bn, ba) ->
+          if an == bn { match unify_list(aa, ba, s) {
+            None -> None
+            Some(s1) -> unify_unit(UOne, bu, s1)
+          } } else { None }
+        _ -> None
+      }
       _ -> None
     }
     TyVarT(_) -> None                                  # handled in unify
@@ -20876,6 +20889,18 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
       }
       TyInt    -> match ab { TyInt -> unify_unit(au, UOne, s) _ -> None }
       TyReal   -> match ab { TyReal -> unify_unit(au, UOne, s) _ -> None }
+      # issue #162: `Decimal<u>` ≡ bare `Decimal` when u collapses to 1,
+      # mirroring the bare-numeric arms. Lets a `Decimal<USD>` value
+      # flow into a fn expecting bare `Decimal` only when the units
+      # cancel — anything else is a unit mismatch.
+      TyCon(bn, ba) -> match ab {
+        TyCon(an, aa) ->
+          if an == bn { match unify_list(aa, ba, s) {
+            None -> None
+            Some(s1) -> unify_unit(au, UOne, s1)
+          } } else { None }
+        _ -> None
+      }
       TyRefineT(bbase, _) -> unify(a, bbase, s)
       _ -> None
     }
@@ -23300,21 +23325,142 @@ fn synth_record_lit(st: InferState, nm: String, fis: [FieldInit], line: Int, col
   }
 }
 
+# issue #162: lower a `4.0<USD>` / `42<sec>`-style numeric UoM literal
+# into an inline `Decimal { raw, scale }` record-literal when the
+# surrounding context expects `Decimal<u>`. The rewrite is narrow on
+# purpose:
+#
+#   • Expected type must canonicalise to `Decimal<u_field>`.
+#   • Source AST must be `ELitUnit(EInt | EReal, u_lit)`.
+#   • Units must match (`unit_eq(u_lit, u_field)`); when they don't,
+#     we leave the original AST and let the regular unifier produce
+#     the unit-mismatch diagnostic at the call site.
+#
+# The lowering decodes the numeric value at compile time:
+#   • `n<u>`         → `Decimal { raw: n,  scale: 0 }`
+#   • `4.0<u>`       → `Decimal { raw: 4,  scale: 0 }` (the `%g`
+#     formatter strips trailing zeros, so the source-level scale-2
+#     intent is not preserved — see the `dec_lit` note in
+#     stdlib/decimal.kai for the same trade-off).
+#
+# Returns the rewritten Expr (typed as `Decimal<u_field>`) on a
+# match, the original expression untouched otherwise. The existing
+# unifier picks up from there: on success it sees equal types and
+# produces the empty substitution; on a unit mismatch (or any other
+# fall-through) it surfaces the same diagnostic it produced before
+# this lane landed.
+fn try_lower_decimal_uom_lit(value: Expr, expected: Ty) : Expr {
+  match expected {
+    TyDimT(TyCon("Decimal", _), u_field) -> match value.kind {
+      ELitUnit(inner, u_lit) ->
+        if unit_eq(u_lit, u_field) {
+          let target_ty = TyDimT(TyCon("Decimal", []), unit_canon(u_field))
+          match inner.kind {
+            EInt(n)  -> mk_decimal_record(n, 0, value.line, value.col, target_ty)
+            EReal(r) -> {
+              let parts = real_to_dec_parts(r)
+              mk_decimal_record(parts.raw, parts.scale, value.line, value.col, target_ty)
+            }
+            _ -> value
+          }
+        } else { value }
+      _ -> value
+    }
+    _ -> value
+  }
+}
+
+# Build the `Decimal { raw, scale }` record-literal AST node and
+# stamp it with the unit-decorated type. Unit info is erased at the
+# carrier level — this is the same pattern existing UoM literals
+# follow (`Real<USD>` is a TyDimT decoration over a plain Real).
+fn mk_decimal_record(raw: Int, scale: Int, line: Int, col: Int, ty: Ty) : Expr {
+  let raw_lit = mk_expr(EInt(raw), line, col)
+  let scale_lit = mk_expr(EInt(scale), line, col)
+  let fields = [FI("raw", raw_lit), FI("scale", scale_lit)]
+  with_ty(mk_expr(ERecordLit("Decimal", fields), line, col), ty)
+}
+
+# Decode an EReal value into the carrier's `(raw, scale)` parts via
+# the platform's `%g` formatter (re-using the same path the runtime
+# uses for `dec_parse`). `%g` strips trailing zeros, so a source
+# literal `4.00<USD>` lowers as `{ raw: 4, scale: 0 }` rather than
+# `{ raw: 400, scale: 2 }` — mathematically equivalent under
+# `dec_align`/`dec_eq`, lossy on stringification scale. A
+# scale-preserving variant is a follow-up that needs source-span
+# preservation on numeric literals.
+type DecParts = { raw: Int, scale: Int }
+
+fn real_to_dec_parts(r: Real) : DecParts {
+  let s = real_to_string(r)
+  let n = string_length(s)
+  let neg_check = match char_at(s, 0) { Some(c) -> c == '-' None -> false }
+  let body_start = if neg_check { 1 } else { 0 }
+  let dot = real_dec_find_dot(s, body_start, n)
+  if dot < 0 {
+    let mag = parse_decimal_or_zero(string_slice(s, body_start, n - body_start))
+    let signed = if neg_check { 0 - mag } else { mag }
+    DecParts { raw: signed, scale: 0 }
+  } else {
+    let int_str = string_slice(s, body_start, dot - body_start)
+    let frac_str = string_slice(s, dot + 1, n - dot - 1)
+    let frac_len = string_length(frac_str)
+    let int_mag = parse_decimal_or_zero(int_str)
+    let frac_v = parse_decimal_or_zero(frac_str)
+    let mag = int_mag * pow10_int(frac_len) + frac_v
+    let signed = if neg_check { 0 - mag } else { mag }
+    DecParts { raw: signed, scale: frac_len }
+  }
+}
+
+fn real_dec_find_dot(s: String, i: Int, n: Int) : Int {
+  if i >= n { 0 - 1 }
+  else { match char_at(s, i) {
+    None    -> 0 - 1
+    Some(c) -> if c == '.' { i } else { real_dec_find_dot(s, i + 1, n) }
+  } }
+}
+
+fn parse_decimal_or_zero(s: String) : Int =
+  match parse_decimal(s) { Some(v) -> v None -> 0 }
+
+fn pow10_int(n: Int) : Int =
+  if n <= 0 { 1 } else { pow10_int_loop(1, n) }
+
+fn pow10_int_loop(acc: Int, n: Int) : Int =
+  if n <= 0 { acc } else { pow10_int_loop(acc * 10, n - 1) }
+
+# Same rewrite, threading the resulting type back to the caller so
+# downstream unify sees equal types. Returned ty is the input
+# `value_ty` when no rewrite applies, otherwise the lowered
+# `Decimal<u>` shape.
+fn maybe_lower_decimal_lit(value: Expr, value_ty: Ty, expected: Ty) : ExprTy {
+  let rewritten = try_lower_decimal_uom_lit(value, expected)
+  let new_ty = match rewritten.ty { Some(t) -> t None -> value_ty }
+  ExprTy { expr: rewritten, ty: new_ty }
+}
+
+type ExprTy = { expr: Expr, ty: Ty }
+
 fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int, col: Int) : InferredFInits {
   match fis {
     [] -> InferredFInits { st: st, fis: [] }
     [fi, ...rest] -> match fi {
       FI(fnm, ex) -> {
         let r = synth(st, ex)
+        let lower_pair = match fty_find(fields, fnm) {
+          None -> ExprTy { expr: r.expr, ty: r.ty }
+          Some(ft) -> maybe_lower_decimal_lit(r.expr, r.ty, apply_ty(r.st.sub, ft))
+        }
         let s1 = match fty_find(fields, fnm) {
           None -> r.st
           Some(ft) -> {
             let what = string_concat("record field '", string_concat(fnm, "'"))
-            st_unify(r.st, ft, r.ty, what, line, col)
+            st_unify(r.st, ft, lower_pair.ty, what, line, col)
           }
         }
         let rr = synth_field_inits(s1, rest, fields, line, col)
-        InferredFInits { st: rr.st, fis: [FI(fnm, r.expr), ...rr.fis] }
+        InferredFInits { st: rr.st, fis: [FI(fnm, lower_pair.expr), ...rr.fis] }
       }
     }
   }
@@ -23358,19 +23504,27 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt {
   match stmt {
     SLet(pat, ann, rhs) -> {
       let rr = synth(st, rhs)
+      # issue #162: when the let binding is annotated `Decimal<u>` and
+      # the RHS is a UoM-literal `<u>`, lower it to a typed
+      # `Decimal { raw, scale }` carrier so the unifier sees equal
+      # types instead of a `Real<u>` vs `Decimal<u>` shape clash.
+      let lower_pair = match ann {
+        None -> ExprTy { expr: rr.expr, ty: rr.ty }
+        Some(te) -> maybe_lower_decimal_lit(rr.expr, rr.ty, apply_ty(rr.st.sub, resolve_ty(te)))
+      }
       let binding_st = match ann {
         None -> rr.st
         Some(te) -> {
           let declared = resolve_ty(te)
-          st_unify(rr.st, declared, rr.ty, "let annotation", pat.line, pat.col)
+          st_unify(rr.st, declared, lower_pair.ty, "let annotation", pat.line, pat.col)
         }
       }
       let binding_ty = match ann {
-        None -> rr.ty
+        None -> lower_pair.ty
         Some(te) -> resolve_ty(te)
       }
       let after = check_pattern(binding_st, pat, binding_ty)
-      OneStmt { st: after, stmt: SLet(pat, ann, rr.expr) }
+      OneStmt { st: after, stmt: SLet(pat, ann, lower_pair.expr) }
     }
     SAssert(cond, msg) -> {
       let rc = synth(st, cond)
