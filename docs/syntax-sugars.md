@@ -460,20 +460,39 @@ The parser picks the correct desugar from the LHS shape: a
 plain identifier is a capability write (§2); an `IndexLhs`
 followed by `[...]` is an array write.
 
+### Map dispatch (issue #128)
+
+When `e1 : Map[K, V]`, the same `e1[e2]` postfix lowers instead
+to `map_get(e1, e2) : Option[V]`. The typer picks the lowering
+by inspecting the inferred type of `e1` at the index site;
+`Array[T]` keeps the `array_get` semantics above unchanged, and
+unresolved type variables default to `Array[T]` so the existing
+"expected `Array[T]`" diagnostic still fires when an unannotated
+local is indexed without a constructor hint.
+
+```kai
+let registry : Map[String, Pid[Cmd]] = registry_empty()
+let pid = registry["worker-3"]   #  ≡  map_get(registry, "worker-3") : Option[Pid[Cmd]]
+```
+
+The write-side sugar `m[k] := v` is **not** supported on
+`Map[K, V]` in v1. The typer emits a diagnostic that points
+at `map_put(m, k, v)`; supporting an indexed write over a
+persistent container needs a separate design pass and ships
+alongside the HAMT carrier in v2 (issue #128's *Out of scope*
+list, mirrored in `docs/proposed-extensions.md` §6's
+retrospective).
+
 ### What it does **not** extend to
 
-Three deliberate non-targets:
+Two deliberate non-targets:
 
 - **`Ref[T]`** — reading and writing refs stays as the
   explicit `Mutable.ref_*` op form. `Ref` is a low-level tool
   used mostly by stdlib / FFI adapters, where explicit ops
   double as documentation (Doc B §`Mutable` *Idiomatic usage*).
-- **Non-integer indexing** — `map["key"]` is not added in v1.
-  `Map[K, V]` is tracked in `docs/proposed-extensions.md` §17,
-  together with the indexing-syntax decision; for now maps
-  use explicit method calls.
 - **Slice syntax** — `a[i..j]` is not in v1. Tracked in
-  `docs/proposed-extensions.md` §18; lands alongside
+  `docs/proposed-extensions.md` §7; lands alongside
   `Vector[T]` post-MVP, with a separate grammar rule.
 
 ## 5. Double trailing lambdas
