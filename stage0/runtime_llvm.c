@@ -340,6 +340,23 @@ KaiValue *kaix_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
     return kai_default_nettcp_close(self, c, k);
 }
 
+/* Issue #141 — LLVM-visible wrappers around the static Log default
+ * handlers in runtime.h. The LLVM emitter installs these by name
+ * from `kai_main_install_defaults` when `Log` appears in main's
+ * row. */
+KaiValue *kaix_default_log_debug(void *self, KaiValue *msg, KaiCont *k) {
+    return kai_default_log_debug(self, msg, k);
+}
+KaiValue *kaix_default_log_info(void *self, KaiValue *msg, KaiCont *k) {
+    return kai_default_log_info(self, msg, k);
+}
+KaiValue *kaix_default_log_warn(void *self, KaiValue *msg, KaiCont *k) {
+    return kai_default_log_warn(self, msg, k);
+}
+KaiValue *kaix_default_log_error(void *self, KaiValue *msg, KaiCont *k) {
+    return kai_default_log_error(self, msg, k);
+}
+
 /* m7c-d — install/teardown default handlers for builtins that
  * appear in main's row. The LLVM emitter generates the body of
  * these two functions per program (filling in the right
