@@ -883,35 +883,43 @@ test-stdlib-crypto-asan: $(TARGET) build
 	  && echo "stdlib-crypto-asan OK $$name" \
 	  || { echo "stdlib-crypto-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }
 
-# Issue #85 — regex_predicate_basic under ASAN+UBSan. The
-# refinement-side regex path goes through three RC-sensitive shapes
-# in one fixture: the `~r/.../` sigil's compile-time-built pattern
-# string, the `Regex` carrier value crossing the `matches` call
-# boundary, and the synthesised `__ref_pred_Slug` fn dispatching
-# through a match-arm narrowing guard. The runtime has no Perceus
-# discipline yet (cf. `project_emitter_no_rc_discipline`), so a
-# regression that double-frees the pattern string or leaks the
-# compiled NFA would surface here first.
+# Issue #85 / #157 — regex predicate fixtures under ASAN+UBSan. The
+# refinement-side regex path crosses three RC-sensitive shapes per
+# fixture: the `~r/.../` sigil's compile-time-built pattern string,
+# the `Regex` carrier value crossing the `matches` call boundary,
+# and the synthesised `__ref_pred_<Type>` fn dispatching through a
+# match-arm narrowing guard. The runtime has no Perceus discipline
+# yet (cf. `project_emitter_no_rc_discipline`), so a regression that
+# double-frees the pattern string or leaks the compiled NFA would
+# surface here first.
+#
+# regex_predicate_basic gates the v1 sigil + matches predicate
+# (issue #85). regex_subsume_basic / _alpha gate the typer-side
+# subsumption check (issue #157) — when the requires assert is
+# proven redundant the runtime path drops it but the
+# refinement-side check from match-arm narrowing still fires; ASAN
+# verifies the surviving path doesn't leak after the drop.
 test-stdlib-regex-predicate-asan: $(TARGET) build
 	@set -e; \
-	name=regex_predicate_basic; \
-	./$(TARGET) $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
-	  ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
-	  || { echo "stdlib-regex-predicate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
-	  || { echo "stdlib-regex-predicate-asan FAIL $$name (cc errored)"; exit 1; }; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/stdlib-$$name-asan-c > build/stdlib-$$name-asan.out 2> build/stdlib-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/stdlib-$$name-asan.err; then \
-	  echo "stdlib-regex-predicate-asan FAIL $$name — sanitizer diagnostic:"; \
-	  cat build/stdlib-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
-	  && echo "stdlib-regex-predicate-asan OK $$name" \
-	  || { echo "stdlib-regex-predicate-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }
+	for name in regex_predicate_basic regex_subsume_basic regex_subsume_alpha; do \
+	  ./$(TARGET) $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	    ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
+	    || { echo "stdlib-regex-predicate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
+	    || { echo "stdlib-regex-predicate-asan FAIL $$name (cc errored)"; exit 1; }; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/stdlib-$$name-asan-c > build/stdlib-$$name-asan.out 2> build/stdlib-$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/stdlib-$$name-asan.err; then \
+	    echo "stdlib-regex-predicate-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/stdlib-$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
+	    && echo "stdlib-regex-predicate-asan OK $$name" \
+	    || { echo "stdlib-regex-predicate-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }; \
+	done
 
 # Typed holes (M10): every example under examples/holes/ must
 # (a) produce a --holes report with at least one "type hole" entry,

@@ -5393,7 +5393,7 @@ fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
 }
 
 fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
-                     param_preds: [Expr]) : [Stmt] {
+                     param_preds: [ParamPred]) : [Stmt] {
   match preds {
     [] -> list_reverse(acc)
     # m12.6.d: drop trivially-true predicates at parse time.
@@ -5422,14 +5422,20 @@ fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
 }
 
 # m12.6.x #2: collect every refinement predicate that appears on a
-# fn parameter's TypeExpr. Used by preds_to_asserts to omit a
-# `requires` clause that just restates a param's refinement.
-fn collect_param_preds(params: [Param], acc: [Expr]) : [Expr] {
+# fn parameter's TypeExpr, paired with the owning parameter's name.
+# Used by preds_to_asserts to omit a `requires` clause that just
+# restates a param's refinement. The owning name lets the regex
+# subsumption check (m12.6.x #7b) tie a param-side `self` reference
+# back to the user-written param name on the requires side.
+type ParamPred = PPair(String, Expr)
+#                       ^pname  ^pred ast
+
+fn collect_param_preds(params: [Param], acc: [ParamPred]) : [ParamPred] {
   match params {
     [] -> list_reverse(acc)
     [p, ...rest] -> match p.ptype {
       Some(t) -> match t.tkind {
-        TyRefine(_, pred) -> collect_param_preds(rest, [pred, ...acc])
+        TyRefine(_, pred) -> collect_param_preds(rest, [PPair(p.pname, pred), ...acc])
         _ -> collect_param_preds(rest, acc)
       }
       None -> collect_param_preds(rest, acc)
@@ -5437,11 +5443,467 @@ fn collect_param_preds(params: [Param], acc: [Expr]) : [Expr] {
   }
 }
 
-fn pred_entailed_by_params(pred: Expr, param_preds: [Expr]) : Bool {
+fn pred_entailed_by_params(pred: Expr, param_preds: [ParamPred]) : Bool {
   match param_preds {
     [] -> false
-    [pp, ...rest] -> if expr_struct_eq(pred, pp) { true }
-                     else { pred_entailed_by_params(pred, rest) }
+    [pp, ...rest] -> match pp {
+      PPair(pname, pp_expr) ->
+        if expr_struct_eq(pred, pp_expr) { true }
+        else if regex_pred_subsumed(pred, pname, pp_expr) { true }
+        else { pred_entailed_by_params(pred, rest) }
+    }
+  }
+}
+
+# m12.6.x #7b — regex predicate subsumption (closes #157).
+#
+# When the requires-clause's `pred` is `matches(self, ~r/loose/)` and
+# some param refinement `pp` is `matches(self, ~r/strict/)`, the
+# requires assert is redundant iff L(strict) ⊆ L(loose). The full DFA-
+# difference algorithm is decidable for the v1 regex subset (no
+# backrefs, no lookaround); a future extension can lift the
+# stdlib `regex_compile` engine into the typer for general
+# containment.
+#
+# v1 ships a structural shape matcher: each side must match the
+# anchored grammar `^ <atom> <quant>? $`, where atom is a single
+# character class (or built-in escape) and quant is one of `+`, `*`,
+# `?`, or `{n,m}`. Both sides must use the same quant. Containment
+# then reduces to ASCII charset containment over 0..127. Anything
+# outside this shape — alternation, concat, groups, anchored prefix
+# `^acc_`, etc. — bails to false (the runtime assert is preserved,
+# which is sound — we just don't drop it).
+#
+# The bound is the ~256-element shape (one ASCII charset per side);
+# DFAs in the general algorithm are bounded at 1024 states. Since the
+# structural matcher does no NFA->DFA construction, the bound never
+# fires in v1 — but the entry point keeps the same fail-closed
+# contract: `false` (= keep the assert) when in doubt.
+fn regex_pred_subsumed(pred: Expr, pname: String, param_pred: Expr) : Bool {
+  # Requires-side: the user-written receiver must equal the parameter
+  # name. Param-side: the receiver is the parser-inserted `self`.
+  match pred_regex_pattern_named(pred, pname) {
+    None -> false
+    Some(loose) -> match pred_regex_pattern_named(param_pred, "self") {
+      None -> false
+      Some(strict) -> regex_pattern_contains(loose, strict)
+    }
+  }
+}
+
+
+# Recognise an Expr of the shape `matches(<recv>, regex_compile_or_panic
+# ("..."))` where `<recv>` is the bare ident `expected_recv`. Returns
+# the raw pattern (sigil-body bytes) on a hit, None otherwise. The
+# explicit receiver name keeps the regex-subsumption path sound when a
+# function has multiple refined parameters: a param-side `self`
+# refinement on `x` only entails a requires-side `matches(x, …)`,
+# never `matches(y, …)`.
+fn pred_regex_pattern_named(e: Expr, expected_recv: String) : Option[String] {
+  match e.kind {
+    ECall(callee, cargs) -> match callee.kind {
+      EVar(name) ->
+        if name == "matches" {
+          match cargs {
+            [recv, re] -> match recv.kind {
+              EVar(rn) -> if rn == expected_recv { extract_regex_literal(re) } else { None }
+              _ -> None
+            }
+            _ -> None
+          }
+        } else { None }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+# `regex_compile_or_panic("...")` over a literal `EStr` pattern is the
+# only shape the sigil desugar emits. Reach inside, strip the outer
+# `"..."` quotes, and decode the two backslash escapes the sigil
+# parser introduces (`\\` -> `\`, `\"` -> `"`).
+fn extract_regex_literal(re: Expr) : Option[String] {
+  match re.kind {
+    ECall(callee, cargs) -> match callee.kind {
+      EVar(name) ->
+        if name == "regex_compile_or_panic" {
+          match cargs {
+            [arg0] -> match arg0.kind {
+              EStr(span, false) -> Some(decode_regex_str_span(span))
+              _ -> None
+            }
+            _ -> None
+          }
+        } else { None }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+# Strip leading/trailing `"` and decode `\\`/`\"` back to literal `\`
+# and `"`. Mirrors the encoding done by `regex_pattern_to_kai_str_body`
+# in the sigil parser. Returns the empty string when the span is
+# malformed (which `EStr(_, false)` never is in practice — the
+# parser would have rejected it).
+fn decode_regex_str_span(span: String) : String {
+  let n = string_length(span)
+  if n < 2 { "" } else { decode_regex_loop(span, 1, n - 1, "") }
+}
+
+fn decode_regex_loop(span: String, i: Int, end: Int, acc: String) : String {
+  if i >= end { acc } else {
+    let c = char_at_or_zero(span, i)
+    if c == '\\' and i + 1 < end {
+      let c2 = char_at_or_zero(span, i + 1)
+      decode_regex_loop(span, i + 2, end, string_concat(acc, "#{c2}"))
+    } else {
+      decode_regex_loop(span, i + 1, end, string_concat(acc, "#{c}"))
+    }
+  }
+}
+
+# Top-level containment on raw pattern strings. Returns true iff
+# every string accepted by `strict` is also accepted by `loose`.
+# Conservative: returns false when either side falls outside the
+# anchored-class shape the typer recognises in v1.
+fn regex_pattern_contains(loose: String, strict: String) : Bool {
+  match parse_anchored_class(loose) {
+    None -> false
+    Some(la) -> match parse_anchored_class(strict) {
+      None -> false
+      Some(sa) -> ac_contains(la, sa)
+    }
+  }
+}
+
+# Anchored-class shape: `^ <class> <quant>? $`. The class is a
+# 128-bool ASCII mask (string of '0'/'1'). The quant is one of "+",
+# "*", "?", "1" (no quant — must match exactly one char), or a
+# `{n,m}` rendered as "n,m" (or "n," for unbounded). For v1 the
+# matcher only proves containment when both sides share an
+# *identical* quant string — strictly the same shape.
+type AnchoredClass = RxAC(String, String)
+#                       ^mask  ^quant
+
+fn parse_anchored_class(pat: String) : Option[AnchoredClass] {
+  let n = string_length(pat)
+  # Require leading `^` and trailing `$`.
+  if n < 2 { None }
+  else if char_at_or_zero(pat, 0) != '^' { None }
+  else if char_at_or_zero(pat, n - 1) != '$' { None }
+  else {
+    # Parse the class atom starting at position 1.
+    match parse_class_atom(pat, 1, n - 1) {
+      None -> None
+      Some(atom) -> match atom {
+        # PCA(mask, after) = mask, position after the atom
+        PCA(mask, after) -> {
+          let q = parse_quant(pat, after, n - 1)
+          match q {
+            QErr -> None
+            QShape(quant, after_q) ->
+              if after_q == n - 1 { Some(RxAC(mask, quant)) }
+              else { None }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Parse a single class atom: either `[...]` (with optional `^`
+# negation), or one of the built-in escapes `\d \w \s \D \W \S`, or a
+# bare ASCII printable that is not a regex metachar. Returns the
+# resulting 128-byte mask and the byte offset just past the atom.
+type ParsedClassAtom = PCA(String, Int)
+
+fn parse_class_atom(pat: String, i: Int, end: Int) : Option[ParsedClassAtom] {
+  if i >= end { None } else {
+    let c = char_at_or_zero(pat, i)
+    if c == '[' { parse_bracket_class(pat, i + 1, end) }
+    else if c == '\\' { parse_escape_atom(pat, i + 1, end) }
+    else if c == '.' { Some(PCA(mask_dot(), i + 1)) }
+    else if is_regex_meta(c) { None }
+    else { Some(PCA(mask_single(c), i + 1)) }
+  }
+}
+
+fn is_regex_meta(c: Char) : Bool =
+  c == '^' or c == '$' or c == '|' or c == '(' or c == ')' or
+  c == '[' or c == ']' or c == '{' or c == '}' or
+  c == '*' or c == '+' or c == '?' or c == '.' or c == '\\'
+
+# Parse the body of `[...]`, beginning at position `i` (just past the
+# `[`). Returns the assembled mask and the position just past the
+# closing `]`. Bails on malformed classes or anything beyond
+# `[abc]` / `[^abc]` / `[a-z0-9]` shapes.
+fn parse_bracket_class(pat: String, i: Int, end: Int) : Option[ParsedClassAtom] {
+  let neg = if i < end and char_at_or_zero(pat, i) == '^' { true } else { false }
+  let i1 = if neg { i + 1 } else { i }
+  parse_bracket_body(pat, i1, end, mask_empty(), neg)
+}
+
+fn parse_bracket_body(pat: String, i: Int, end: Int, acc: String, neg: Bool) : Option[ParsedClassAtom] {
+  if i >= end { None } else {
+    let c = char_at_or_zero(pat, i)
+    if c == ']' {
+      let final_mask = if neg { mask_invert(acc) } else { acc }
+      Some(PCA(final_mask, i + 1))
+    } else {
+      match parse_bracket_item(pat, i, end) {
+        None -> None
+        Some(item) -> match item {
+          BItem(item_mask, after) ->
+            parse_bracket_body(pat, after, end, mask_or(acc, item_mask), neg)
+        }
+      }
+    }
+  }
+}
+
+# A single item inside `[...]`: a char, an escape, or a range `a-z`.
+type BracketItem = BItem(String, Int)
+
+fn parse_bracket_item(pat: String, i: Int, end: Int) : Option[BracketItem] {
+  if i >= end { None } else {
+    let c = char_at_or_zero(pat, i)
+    let first = if c == '\\' {
+      match parse_class_escape(pat, i + 1, end) {
+        None -> None
+        Some(esc) -> Some(esc)
+      }
+    } else if c == ']' or c == '[' { None }
+    else { Some(BFirst(mask_single(c), i + 1, c)) }
+    match first {
+      None -> None
+      Some(f) -> match f {
+        BFirst(m1, after1, lo) ->
+          if after1 < end and char_at_or_zero(pat, after1) == '-' and
+             after1 + 1 < end and char_at_or_zero(pat, after1 + 1) != ']' {
+            let c2 = char_at_or_zero(pat, after1 + 1)
+            if c2 == '\\' { None }
+            else if char_to_int(c2) < char_to_int(lo) { None }
+            else { Some(BItem(mask_range(lo, c2), after1 + 2)) }
+          } else { Some(BItem(m1, after1)) }
+        BClass(m1, after1) -> Some(BItem(m1, after1))
+      }
+    }
+  }
+}
+
+# Wrapper for a parsed first-token inside a class. Either a single
+# char (which may extend into a range) or a `\d`/`\w`/`\s` class
+# (which never extends). The `Char` field is meaningful only for
+# `BFirst` and is ignored for `BClass`.
+type BracketFirst
+  = BFirst(String, Int, Char)
+  | BClass(String, Int)
+
+fn parse_class_escape(pat: String, i: Int, end: Int) : Option[BracketFirst] {
+  if i >= end { None } else {
+    let c = char_at_or_zero(pat, i)
+    if c == 'd' { Some(BClass(mask_digit(), i + 1)) }
+    else if c == 'D' { Some(BClass(mask_invert(mask_digit()), i + 1)) }
+    else if c == 'w' { Some(BClass(mask_word(), i + 1)) }
+    else if c == 'W' { Some(BClass(mask_invert(mask_word()), i + 1)) }
+    else if c == 's' { Some(BClass(mask_space(), i + 1)) }
+    else if c == 'S' { Some(BClass(mask_invert(mask_space()), i + 1)) }
+    else if c == 'n' { Some(BFirst(mask_single('\n'), i + 1, '\n')) }
+    else if c == 't' { Some(BFirst(mask_single('\t'), i + 1, '\t')) }
+    else if c == 'r' { Some(BFirst(mask_single('\r'), i + 1, '\r')) }
+    else { Some(BFirst(mask_single(c), i + 1, c)) }
+  }
+}
+
+# Outside a class: `\d \w \s` etc. produce a class atom with no
+# follow-on range. Other escape chars produce a single-char atom.
+fn parse_escape_atom(pat: String, i: Int, end: Int) : Option[ParsedClassAtom] {
+  if i >= end { None } else {
+    let c = char_at_or_zero(pat, i)
+    if c == 'd' { Some(PCA(mask_digit(), i + 1)) }
+    else if c == 'D' { Some(PCA(mask_invert(mask_digit()), i + 1)) }
+    else if c == 'w' { Some(PCA(mask_word(), i + 1)) }
+    else if c == 'W' { Some(PCA(mask_invert(mask_word()), i + 1)) }
+    else if c == 's' { Some(PCA(mask_space(), i + 1)) }
+    else if c == 'S' { Some(PCA(mask_invert(mask_space()), i + 1)) }
+    else if c == 'n' { Some(PCA(mask_single('\n'), i + 1)) }
+    else if c == 't' { Some(PCA(mask_single('\t'), i + 1)) }
+    else if c == 'r' { Some(PCA(mask_single('\r'), i + 1)) }
+    else { Some(PCA(mask_single(c), i + 1)) }
+  }
+}
+
+# Parse an optional quantifier just past a class atom. Returns
+# QErr on a malformed `{n,m}`, QShape("1", i) when no quant is
+# present (the atom matches exactly one occurrence), and
+# QShape("+"|"*"|"?"|"n,m"|"n,", i + width) for the supported forms.
+type QuantParse
+  = QShape(String, Int)
+  | QErr
+
+fn parse_quant(pat: String, i: Int, end: Int) : QuantParse {
+  if i >= end { QShape("1", i) } else {
+    let c = char_at_or_zero(pat, i)
+    if c == '+' { QShape("+", i + 1) }
+    else if c == '*' { QShape("*", i + 1) }
+    else if c == '?' { QShape("?", i + 1) }
+    else if c == '{' { parse_repeat_quant(pat, i + 1, end) }
+    else { QShape("1", i) }
+  }
+}
+
+fn parse_repeat_quant(pat: String, i: Int, end: Int) : QuantParse {
+  match parse_pat_int(pat, i, end) {
+    None -> QErr
+    Some(lo_p) -> match lo_p {
+      IntParse(lo, after_lo) ->
+        if after_lo >= end { QErr } else {
+          let c = char_at_or_zero(pat, after_lo)
+          if c == '}' { QShape(concat_all([int_to_string(lo), ",", int_to_string(lo)]), after_lo + 1) }
+          else if c == ',' {
+            if after_lo + 1 < end and char_at_or_zero(pat, after_lo + 1) == '}' {
+              QShape(concat_all([int_to_string(lo), ","]), after_lo + 2)
+            } else { match parse_pat_int(pat, after_lo + 1, end) {
+              None -> QErr
+              Some(hi_p) -> match hi_p {
+                IntParse(hi, after_hi) ->
+                  if hi < lo { QErr }
+                  else if after_hi >= end { QErr }
+                  else if char_at_or_zero(pat, after_hi) != '}' { QErr }
+                  else { QShape(concat_all([int_to_string(lo), ",", int_to_string(hi)]), after_hi + 1) }
+              }
+            } }
+          } else { QErr }
+        }
+    }
+  }
+}
+
+type IntParse = IntParse(Int, Int)
+
+fn parse_pat_int(pat: String, i: Int, end: Int) : Option[IntParse] {
+  parse_pat_int_loop(pat, i, end, 0, false)
+}
+
+fn parse_pat_int_loop(pat: String, i: Int, end: Int, acc: Int, any: Bool) : Option[IntParse] {
+  if i >= end {
+    if any { Some(IntParse(acc, i)) } else { None }
+  } else {
+    let c = char_at_or_zero(pat, i)
+    if ch_is_digit(c) {
+      parse_pat_int_loop(pat, i + 1, end, acc * 10 + char_to_int(c) - char_to_int('0'), true)
+    } else {
+      if any { Some(IntParse(acc, i)) } else { None }
+    }
+  }
+}
+
+# ASCII charset masks. Stored as a string of length 128 — '1' at
+# position k means code point k is in the set.
+fn mask_empty() : String = mask_const_loop(0, '0', "")
+fn mask_full() : String = mask_const_loop(0, '1', "")
+
+fn mask_const_loop(i: Int, ch: Char, acc: String) : String {
+  if i >= 128 { acc }
+  else { mask_const_loop(i + 1, ch, string_concat(acc, "#{ch}")) }
+}
+
+fn mask_single(c: Char) : String {
+  let cp = char_to_int(c)
+  if cp < 0 or cp >= 128 { mask_empty() }
+  else { mask_set_bit(mask_empty(), cp) }
+}
+
+fn mask_range(lo: Char, hi: Char) : String {
+  let lo_i = char_to_int(lo)
+  let hi_i = char_to_int(hi)
+  mask_range_loop(mask_empty(), lo_i, hi_i)
+}
+
+fn mask_range_loop(acc: String, i: Int, hi: Int) : String {
+  if i > hi or i >= 128 { acc }
+  else if i < 0 { mask_range_loop(acc, i + 1, hi) }
+  else { mask_range_loop(mask_set_bit(acc, i), i + 1, hi) }
+}
+
+fn mask_set_bit(m: String, pos: Int) : String {
+  if pos < 0 or pos >= 128 { m }
+  else {
+    let prefix = string_slice(m, 0, pos)
+    let suffix = string_slice(m, pos + 1, 128 - pos - 1)
+    concat_all([prefix, "1", suffix])
+  }
+}
+
+fn mask_or(a: String, b: String) : String = mask_or_loop(a, b, 0, "")
+
+fn mask_or_loop(a: String, b: String, i: Int, acc: String) : String {
+  if i >= 128 { acc }
+  else {
+    let ca = char_at_or_zero(a, i)
+    let cb = char_at_or_zero(b, i)
+    let merged = if ca == '1' or cb == '1' { '1' } else { '0' }
+    mask_or_loop(a, b, i + 1, string_concat(acc, "#{merged}"))
+  }
+}
+
+fn mask_invert(m: String) : String = mask_invert_loop(m, 0, "")
+
+fn mask_invert_loop(m: String, i: Int, acc: String) : String {
+  if i >= 128 { acc }
+  else {
+    let c = char_at_or_zero(m, i)
+    let flipped = if c == '1' { '0' } else { '1' }
+    mask_invert_loop(m, i + 1, string_concat(acc, "#{flipped}"))
+  }
+}
+
+# `[a-z]` ⊆ `[a-z0-9]` iff every '1' in the strict mask is also '1'
+# in the loose mask. Linear scan over 128 positions.
+fn mask_subset(strict: String, loose: String) : Bool = mask_subset_loop(strict, loose, 0)
+
+fn mask_subset_loop(strict: String, loose: String, i: Int) : Bool {
+  if i >= 128 { true }
+  else {
+    let s = char_at_or_zero(strict, i)
+    let l = char_at_or_zero(loose, i)
+    if s == '1' and l != '1' { false }
+    else { mask_subset_loop(strict, loose, i + 1) }
+  }
+}
+
+# `\d` -> [0-9].
+fn mask_digit() : String = mask_range('0', '9')
+
+# `\w` -> [A-Za-z0-9_].
+fn mask_word() : String =
+  mask_set_bit(mask_or(mask_or(mask_range('A', 'Z'), mask_range('a', 'z')),
+                       mask_range('0', '9')),
+               char_to_int('_'))
+
+# `\s` -> [ \t\n\r\v\f]. We only mask the ASCII ones the v1 engine
+# actually recognises (`rx_space_ranges` in stdlib/regexp.kai).
+fn mask_space() : String =
+  mask_set_bit(mask_set_bit(mask_set_bit(mask_set_bit(mask_empty(),
+                                                       char_to_int(' ')),
+                                          char_to_int('\t')),
+                            char_to_int('\n')),
+               char_to_int('\r'))
+
+# `.` matches any non-newline ASCII char (RE2 default semantics).
+fn mask_dot() : String = mask_invert(mask_single('\n'))
+
+# Containment of two parsed AnchoredClass shapes. v1: identical
+# quantifier strings + strict charset ⊆ loose charset is the
+# only path that returns true. Anything else is conservative.
+fn ac_contains(loose: AnchoredClass, strict: AnchoredClass) : Bool {
+  match loose {
+    RxAC(loose_mask, loose_q) -> match strict {
+      RxAC(strict_mask, strict_q) ->
+        if loose_q != strict_q { false }
+        else { mask_subset(strict_mask, loose_mask) }
+    }
   }
 }
 
