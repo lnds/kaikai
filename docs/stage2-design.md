@@ -481,7 +481,7 @@ in.
     2026-04-27, sub-lanes a–e; see the "Recommended ordering"
     section §7 for what shipped and what remains deferred)*.
     Pony/Ada-style refinement types lite (`Int where >= 0`,
-    `String where matches /.../`) + Eiffel/Ada 2012-style
+    `String where matches ~r/.../`) + Eiffel/Ada 2012-style
     `requires` / `ensures` clauses on functions. Decidable
     subset, no SMT; static proof where reducible to interval
     propagation + regex subsumption, runtime checks otherwise.
@@ -727,11 +727,13 @@ Rationale:
      (lexer disambiguation) pending in issue #84.
    - **#6 Compile-time errors** for trivially-false
      predicates — landed.
-   - **#7 Regex literals** (`String where matches /.../`) —
+   - **#7 Regex literals** (`String where matches ~r/.../`) —
      stdlib regex engine landed 2026-04-28
-     (`stdlib/regexp.kai`, RE2-style); the refinement-side
-     `where matches /.../` syntax + lexer/parser integration
-     is pending in issue #85.
+     (`stdlib/regexp.kai`, RE2-style); the Elixir-style sigil
+     `~r/.../` + `matches` predicate-pure helper landed
+     2026-05-03 (lane closing issue #85). Subsumption (static
+     containment between regex literals) deferred to a
+     follow-up issue.
    - **#8 Diagnostics quality** (predicate-aware panic
      messages) — v1 landed; structured violation context
      pending in issue #86.
@@ -868,6 +870,24 @@ with or without unit annotations. Roughly +1100 lines added to
 `stage2/compiler.kai`. Fixtures land in `examples/units/`. Full
 landing notes in `docs/units-of-measure.md` (Status: Landed at the
 top); lane experience report in `docs/lane-experience-m12.5.md`.
+
+### Update 2026-05-03 — hex and binary integer literals landed
+
+PR #160 (closes #156) added `0x` and `0b` lexer branches to the
+integer-literal token. Same `Int` type, same `EInt` AST node — no
+new node, no new type, no new operator, no parser change. Range
+is signed 64-bit. No underscore digit separators in the hex/bin
+branches, no octal `0o`, no hex floating-point literals. Full
+spec in `docs/syntax-sugars.md` §7; lexer code in
+`stage2/compiler.kai` (`lex_hex_or_bin_int`); fixtures in
+`examples/literals/`.
+
+The companion landings on the same day — regex sigil `~r/.../`
+(PR #159, closes #85) and n-tuple parser sugar `(a, b)` /
+`(a, b, c)` / `(a, b, c, d)` (PR #155, closes #154) — already
+update their respective docs in place. UoM annotation in record
+field positions (issue #158, PR #163) is still in flight and
+will be documented when it merges.
 
 ### Milestone naming: Core language vs Full language
 

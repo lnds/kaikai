@@ -205,6 +205,34 @@ The places tuples win unambiguously (transient pattern matching)
 are not tuple-as-type; they are syntactic sugar over multi-arg
 match.
 
+### Follow-up — n-tuple parser sugar shipped (2026-05-03, issue #154)
+
+The 2026-04-27 verdict rejected **tuples-as-a-type** (a new TyCtor
+distinct from `Pair[a, b]`). It did **not** measure parser-only
+sugar that desugars to existing record types. Issue #154 reopened
+that narrower question and shipped the sugar:
+
+- `(a, b)` ≡ `Pair { fst: a, snd: b }`
+- `(a, b, c)` ≡ `Triple { fst: a, snd: b, trd: c }`
+- `(a, b, c, d)` ≡ `Quad { fst: a, snd: b, trd: c, frt: d }`
+- `(A, B)` ≡ `Pair[A, B]` in type position; same for arity 3 / 4.
+- `let (a, b) = pair` ≡ `let Pair { fst: a, snd: b } = pair`.
+
+**Why both decisions are consistent**: the rejected proposal
+introduced a second product form (a TyCtor with cost on every
+signature, monomorphisation, RC, and printer). The sugar adds
+**zero** typer or runtime cost — the inferred type is still
+`Pair[Expr, [Token]]`, only the literal/pattern shape is shorter.
+The 2026-04-27 metrics measured a different artifact than the one
+that shipped.
+
+**Cap and accessors**: arity 2..4 (covers the 99% transient
+multi-return case; wider products use named records). Field
+accessors stay nominal — `.fst / .snd / .trd / .frt` — to keep
+consistency with the existing `Pair` and avoid a lexer rule for
+`.0 / .1` numeric field names. See `docs/syntax-sugars.md` §
+"n-tuples" for the canonical surface.
+
 ## 4. Sum types with constant attributes
 
 ```kai

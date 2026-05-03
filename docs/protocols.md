@@ -366,7 +366,7 @@ the `unit_name` runtime helper provides the symbol.
 ### With refinements (m12.6)
 
 ```kai
-type Email = String where matches /^[^@]+@[^@]+$/
+type Email = String where matches ~r/^[^@]+@[^@]+$/
 
 impl Show for Email {
   show(e) = e   # already a string
