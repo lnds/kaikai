@@ -21149,9 +21149,11 @@ fn partition_walk(a: [Label], b_remain: [Label],
 # Unify the ty_args of every (left, right) pair where the labels share
 # an effect symbol.
 fn unify_label_pairs(pairs: [LabelPair], s: Subst) : Option[Subst] {
+  # Effect label ty_args do not participate in D3 union upcast: empty
+  # env is fine and avoids reshaping the row-unification API.
   match pairs {
     [] -> Some(s)
-    [LPair(la, lb), ...rest] -> match unify_list(la.ty_args, lb.ty_args, s) {
+    [LPair(la, lb), ...rest] -> match unify_list(ty_env_empty(), la.ty_args, lb.ty_args, s) {
       None -> None
       Some(s1) -> unify_label_pairs(rest, s1)
     }
@@ -21265,7 +21267,15 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
 # `sub`, it would pollute unrelated TyVars through later lookups and
 # turn clean `[?t1]` inferences into `[?]` noise. So short-circuit it
 # at the top of unify, before the var-binding branches.
-fn unify(t1: Ty, t2: Ty, s: Subst) : Option[Subst] {
+fn unify(t1: Ty, t2: Ty, s: Subst) : Option[Subst] = unify_env(ty_env_empty(), t1, t2, s)
+
+# issue #187 phase 4: env-threaded unify. The env carries the type
+# environment so `unify_heads` can consult `variants_of_type` for
+# the Decision-3 implicit upcast (`docs/unions-design.md`): a value
+# of a component type is usable wherever its parent union is
+# expected. Calls without env access (e.g. hole-synthesis) pass
+# `ty_env_empty()` and lose only the upcast-acceptance behaviour.
+fn unify_env(env: TyEnv, t1: Ty, t2: Ty, s: Subst) : Option[Subst] {
   # m12.6.x #1: refinements are transparent for unify in v1 — peel
   # them off both sides before head-unification so neither direction
   # gets blocked. The predicate stays attached at the declaration
@@ -21284,7 +21294,7 @@ fn unify(t1: Ty, t2: Ty, s: Subst) : Option[Subst] {
         }
         _ -> match b {
           TyVarT(m) -> if occurs(m, a, s) { None } else { Some(subst_extend(s, m, a)) }
-          _ -> unify_heads(a, b, s)
+          _ -> unify_heads(env, a, b, s)
         }
       }
     }
@@ -21300,20 +21310,20 @@ fn unwrap_refines(t: Ty) : Ty {
 }
 
 # Neither side is a var: must match head-symbol + structure.
-fn unify_list(xs: [Ty], ys: [Ty], s: Subst) : Option[Subst] {
+fn unify_list(env: TyEnv, xs: [Ty], ys: [Ty], s: Subst) : Option[Subst] {
   match xs {
     [] -> match ys { [] -> Some(s) _ -> None }
     [x, ...xr] -> match ys {
       [] -> None
-      [y, ...yr] -> match unify(x, y, s) {
+      [y, ...yr] -> match unify_env(env, x, y, s) {
         None -> None
-        Some(s1) -> unify_list(xr, yr, s1)
+        Some(s1) -> unify_list(env, xr, yr, s1)
       }
     }
   }
 }
 
-fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
+fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] {
   match a {
     # m12.5: bare numerics on the LHS treat the RHS dim case specially
     # — `Real` ≡ `Real<1>`. Any other unit is a mismatch (`Real` vs
@@ -21336,13 +21346,13 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
     # land; it's the "I don't know yet" placeholder.
     TyAny    -> Some(s)
     TyListT(a1) -> match b {
-      TyListT(b1) -> unify(a1, b1, s)
+      TyListT(b1) -> unify_env(env, a1, b1, s)
       _ -> None
     }
     TyFnT(ap, ar, arow) -> match b {
-      TyFnT(bp, br, brow) -> match unify_list(ap, bp, s) {
+      TyFnT(bp, br, brow) -> match unify_list(env, ap, bp, s) {
         None -> None
-        Some(s1) -> match unify(ar, br, s1) {
+        Some(s1) -> match unify_env(env, ar, br, s1) {
           None -> None
           Some(s2) -> unify_row(arow, brow, s2)
         }
@@ -21350,7 +21360,21 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
       _ -> None
     }
     TyCon(an, aa) -> match b {
-      TyCon(bn, ba) -> if an == bn { unify_list(aa, ba, s) } else { None }
+      TyCon(bn, ba) -> {
+        if an == bn { unify_list(env, aa, ba, s) }
+        # issue #187 phase 4 (D3): implicit upcast inside structural
+        # unification. When the two TyCons disagree, accept the
+        # mismatch if `b` is a component of the union `a` per the env
+        # (`type a = ... | b | ...`). Direction matters: only the
+        # found-side type may be a component of the expected-side
+        # union (`unify` is called with the *expected* side first
+        # via st_unify; here we mirror that contract). Empty arg
+        # lists ensure we are looking at bare nominal types, not
+        # generic instances. No chains: only the immediate parent
+        # accepts.
+        else if list_length(aa) == 0 and list_length(ba) == 0 and list_has(variants_of_type(env, an), bn) { Some(s) }
+        else { None }
+      }
       # issue #162: a bare named record on the LHS unifies with the
       # same record on the RHS decorated by a unit, when the unit
       # collapses to UOne. Mirrors the `Real ≡ Real<1>` / `Int ≡ Int<1>`
@@ -21358,7 +21382,7 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
       # named records have no UoM-decorated form yet.
       TyDimT(bb, bu) -> match bb {
         TyCon(bn, ba) ->
-          if an == bn { match unify_list(aa, ba, s) {
+          if an == bn { match unify_list(env, aa, ba, s) {
             None -> None
             Some(s1) -> unify_unit(UOne, bu, s1)
           } } else { None }
@@ -21371,7 +21395,7 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
     # primitive uses the `Real ≡ Real<1>` rule above (the bare-side
     # arms catch this via the dim-aware match arms).
     TyDimT(ab, au) -> match b {
-      TyDimT(bb, bu) -> match unify(ab, bb, s) {
+      TyDimT(bb, bu) -> match unify_env(env, ab, bb, s) {
         None -> None
         Some(s1) -> unify_unit(au, bu, s1)
       }
@@ -21383,13 +21407,13 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
       # cancel — anything else is a unit mismatch.
       TyCon(bn, ba) -> match ab {
         TyCon(an, aa) ->
-          if an == bn { match unify_list(aa, ba, s) {
+          if an == bn { match unify_list(env, aa, ba, s) {
             None -> None
             Some(s1) -> unify_unit(au, UOne, s1)
           } } else { None }
         _ -> None
       }
-      TyRefineT(bbase, _) -> unify(a, bbase, s)
+      TyRefineT(bbase, _) -> unify_env(env, a, bbase, s)
       _ -> None
     }
     # m12.6.x #1: refinements are transparent to unify in v1 — both
@@ -21399,7 +21423,7 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
     # narrowing, ensure() desugar) consume it from there. A future
     # refinement-aware unify could distinguish argument-flow direction
     # to reject downcasts, but it requires reshape of unify's API.
-    TyRefineT(abase, _) -> unify(abase, b, s)
+    TyRefineT(abase, _) -> unify_env(env, abase, b, s)
     # issue #187 phase 1: two unions unify only when their canonical
     # component lists agree component-wise. Subsumption between a
     # union and one of its components — the implicit upcast described
@@ -21408,7 +21432,7 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
     # selfhost remains observationally identical (no path constructs
     # `TyUnion`, so this arm never fires).
     TyUnion(aps) -> match b {
-      TyUnion(bps) -> unify_list(aps, bps, s)
+      TyUnion(bps) -> unify_list(env, aps, bps, s)
       _ -> None
     }
   }
@@ -22078,7 +22102,7 @@ fn st_fresh_ty(st: InferState) : TyRes {
 }
 
 fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : InferState {
-  match unify(a, b, st.sub) {
+  match unify_env(st.env, a, b, st.sub) {
     Some(s2) -> st_set_sub(st, s2)
     None -> {
       let a1 = apply_ty(st.sub, a)
@@ -22960,7 +22984,13 @@ fn bang_finish_result(st: InferState, inner_typed: Expr, e_ty: Ty, t: Ty,
           if rname == "Result" {
             match rargs {
               [ret_e_ty, _] -> {
-                let st1 = st_unify(st, e_ty, ret_e_ty,
+                # issue #187 phase 4: pass the enclosing function's
+                # error type as `expected` so the unifier's D3 arm can
+                # accept `e_ty <: ret_e_ty` when `e_ty` is a component
+                # of the union `ret_e_ty`. Same-type Result use is
+                # unaffected (head-unification succeeds before the
+                # upcast arm fires).
+                let st1 = st_unify(st, ret_e_ty, e_ty,
                   "`!` propagation requires the same error type as the enclosing function",
                   line, col)
                 mk_inferred(st1, t, with_ty(mk_expr(EBang(inner_typed), line, col), t))
