@@ -6933,6 +6933,7 @@ fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env {
 fn prelude_names() : [String] {
   [
     "print", "eprint", "read_file", "write_file", "read_line", "args",
+    "program_name",
     "exit", "panic",
     "int_to_string", "real_to_string", "string_to_int", "string_to_real",
     "int_to_real", "real_to_int",
@@ -7908,6 +7909,12 @@ fn prelude_table() : [EPrelude] {
     EP("reduce",           "kai_prelude_reduce",           3),
     EP("each",             "kai_prelude_each",             2),
     EP("args",             "kai_prelude_args",             0),
+    # Issue #127: argv[0] as a flat prelude (path (a) in the issue
+    # body, mirroring how `args()` is also a prelude even though
+    # `Env.args()` exists as an op). `stdlib/os/args.kai` re-exports
+    # this as `program_name()` so the dotted-call surface stays
+    # uniform with the rest of `os.args`.
+    EP("program_name",     "kai_prelude_program_name",     0),
     EP("read_file",        "kai_prelude_read_file",        1),
     EP("write_file",       "kai_prelude_write_file",       2),
     EP("read_line",        "kai_prelude_read_line",        0),
@@ -10460,6 +10467,31 @@ fn emit_expr_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
   }
 }
 
+# Issue #90 — unroll `b ^ n` into `n` repeated multiplications.
+# Caller has already gated `n` to `[0, 64]` and `base_c` is a pure
+# raw C expression (literal / EVar / pure raw arith). For `n == 0`
+# the result is `1` (matches `kai_op_pow_int`). For `n == 1`,
+# emit just `(base_c)`. For `n >= 2`, emit `((base_c)*(base_c)*…)`
+# with `n` factors. Squaring would emit fewer factors but produces
+# the same constant-folded code under any optimizer; the linear
+# form keeps the emitted IR easy to grep for in regression tests.
+fn emit_pow_unroll(base_c: String, n: Int) : String {
+  if n == 0 { "1LL" }
+  else if n == 1 { cat3("(", base_c, ")") }
+  else { cat3("(", emit_pow_unroll_loop(base_c, n, ""), ")") }
+}
+
+fn emit_pow_unroll_loop(base_c: String, k: Int, acc: String) : String {
+  if k == 0 { acc }
+  else if k == 1 { if acc == "" { cat3("(", base_c, ")") }
+                   else { concat_all([acc, " * (", base_c, ")"]) } }
+  else {
+    let next = if acc == "" { cat3("(", base_c, ")") }
+               else { concat_all([acc, " * (", base_c, ")"]) }
+    emit_pow_unroll_loop(base_c, k - 1, next)
+  }
+}
+
 fn emit_kind_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
                   variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match x.kind {
@@ -10475,6 +10507,22 @@ fn emit_kind_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
                     " ", raw_op_str(op), " ",
                     emit_expr_raw(src, b, lcs, fns, variants, lams, cls),
                     ")"])
+      } else if op == "//" {
+        # Issue #90 — signed integer division. Both operands are
+        # `int64_t`; the typer rejected non-Int operands earlier.
+        concat_all(["(",
+                    emit_expr_raw(src, a, lcs, fns, variants, lams, cls),
+                    " / ",
+                    emit_expr_raw(src, b, lcs, fns, variants, lams, cls),
+                    ")"])
+      } else if op == "^" {
+        # Issue #90 — integer power, exponent is a compile-time
+        # literal in `[0, 64]` (gated by `pow_exp_is_inlinable`).
+        # Unroll into repeated multiplications. Base is pure raw
+        # (no calls) so duplication is safe.
+        let n = match try_eval_int(b) { Some(v) -> v None -> 0 }
+        let base_c = emit_expr_raw(src, a, lcs, fns, variants, lams, cls)
+        emit_pow_unroll(base_c, n)
       } else {
         # Conservative fallback: boxed expression then unbox.
         let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
@@ -12020,6 +12068,18 @@ fn default_env_shims() : String =
     "}\n",
     "static KaiValue *_kai_default_env_var_shim(EvEnv *self, KaiValue *kai_name, KaiCont *k) {\n",
     "    return kai_default_env_var(self, kai_name, k);\n",
+    "}\n",
+    # Issue #127: write side + full block enumeration. Same EvEnv*
+    # / KaiCont* shape as the existing args/var shims so the typed
+    # dispatch table stays UBSan-clean.
+    "static KaiValue *_kai_default_env_set_var_shim(EvEnv *self, KaiValue *kai_name, KaiValue *kai_value, KaiCont *k) {\n",
+    "    return kai_default_env_set_var(self, kai_name, kai_value, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_env_unset_var_shim(EvEnv *self, KaiValue *kai_name, KaiCont *k) {\n",
+    "    return kai_default_env_unset_var(self, kai_name, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_env_vars_shim(EvEnv *self, KaiCont *k) {\n",
+    "    return kai_default_env_vars(self, k);\n",
     "}\n"
   ])
 
@@ -12028,8 +12088,11 @@ fn default_env_setup() : String =
     "    static EvEnv _kai_default_ev_env;\n",
     "    static KaiEvidence _kai_default_node_env;\n",
     "    _kai_default_ev_env.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_env.args = &_kai_default_env_args_shim;\n",
-    "    _kai_default_ev_env.var  = &_kai_default_env_var_shim;\n",
+    "    _kai_default_ev_env.args      = &_kai_default_env_args_shim;\n",
+    "    _kai_default_ev_env.var       = &_kai_default_env_var_shim;\n",
+    "    _kai_default_ev_env.set_var   = &_kai_default_env_set_var_shim;\n",
+    "    _kai_default_ev_env.unset_var = &_kai_default_env_unset_var_shim;\n",
+    "    _kai_default_ev_env.vars      = &_kai_default_env_vars_shim;\n",
     "    kai_evidence_push(&_kai_default_node_env, \"Env\", &_kai_default_ev_env);\n"
   ])
 
@@ -12239,6 +12302,30 @@ fn default_log_setup() : String =
     "    kai_evidence_push(&_kai_default_node_log, \"Log\", &_kai_default_ev_log);\n"
   ])
 
+# Issue #140: default SecureRandom handler — two ops wired to
+# `kai_default_securerandom_*` in stage0/runtime.h. Platform dispatch
+# (Linux getrandom / macOS arc4random_buf) lives in the runtime
+# helpers. Installed when `main`'s row mentions `SecureRandom`.
+fn default_securerandom_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_securerandom_int_range_shim(EvSecureRandom *self, KaiValue *kai_min, KaiValue *kai_max, KaiCont *k) {\n",
+    "    return kai_default_securerandom_int_range(self, kai_min, kai_max, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_securerandom_bytes_shim(EvSecureRandom *self, KaiValue *kai_n, KaiCont *k) {\n",
+    "    return kai_default_securerandom_bytes(self, kai_n, k);\n",
+    "}\n"
+  ])
+
+fn default_securerandom_setup() : String =
+  concat_all([
+    "    static EvSecureRandom _kai_default_ev_securerandom;\n",
+    "    static KaiEvidence _kai_default_node_securerandom;\n",
+    "    _kai_default_ev_securerandom.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_securerandom.int_range = &_kai_default_securerandom_int_range_shim;\n",
+    "    _kai_default_ev_securerandom.bytes = &_kai_default_securerandom_bytes_shim;\n",
+    "    kai_evidence_push(&_kai_default_node_securerandom, \"SecureRandom\", &_kai_default_ev_securerandom);\n"
+  ])
+
 # m7b #2b: default Mutable handler — wraps the prelude `array_*`
 # runtime functions with clauses that resume with the result. Each
 # slot is initialised to the matching `kai_default_mutable_*`
@@ -12412,6 +12499,7 @@ fn default_setups_for(main_row: [String]) : String = {
     if list_has(main_row, "File")    { default_file_setup() }    else { "" },
     if list_has(main_row, "Clock")   { default_clock_setup() }   else { "" },
     if list_has(main_row, "Random")  { default_random_setup() }  else { "" },
+    if list_has(main_row, "SecureRandom") { default_securerandom_setup() } else { "" },
     if list_has(main_row, "NetTcp")  { default_nettcp_setup() }  else { "" },
     if list_has(main_row, "Signal")  { default_signal_setup() }  else { "" },
     if list_has(main_row, "Process") { default_process_setup() } else { "" },
@@ -12443,6 +12531,7 @@ fn default_shims_for(main_row: [String]) : String = {
     if list_has(main_row, "File")    { default_file_shims() }    else { "" },
     if list_has(main_row, "Clock")   { default_clock_shims() }   else { "" },
     if list_has(main_row, "Random")  { default_random_shims() }  else { "" },
+    if list_has(main_row, "SecureRandom") { default_securerandom_shims() } else { "" },
     if list_has(main_row, "NetTcp")  { default_nettcp_shims() }  else { "" },
     if list_has(main_row, "Signal")  { default_signal_shims() }  else { "" },
     if list_has(main_row, "Process") { default_process_shims() } else { "" },
@@ -12467,6 +12556,7 @@ fn default_pops_for(main_row: [String]) : String =
     if list_has(main_row, "Process") { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Signal")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "NetTcp")  { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "SecureRandom") { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Random")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Clock")   { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "File")    { "    kai_evidence_pop();\n" } else { "" },
@@ -17227,6 +17317,9 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "print",          scheme: mono(fn_ty([TyString], TyUnit)) },
     TyEntry { name: "eprint",         scheme: mono(fn_ty([TyString], TyUnit)) },
     TyEntry { name: "args",           scheme: mono(fn_ty([], list_ty(TyString))) },
+    # Issue #127: argv[0] as a flat prelude. Total — empty string
+    # when the runtime hasn't seen `kai_set_args` yet.
+    TyEntry { name: "program_name",   scheme: mono(fn_ty([], TyString)) },
     TyEntry { name: "read_file",      scheme: mono(fn_ty([TyString], TyCon("Result", [TyString, TyString]))) },
     TyEntry { name: "write_file",     scheme: mono(fn_ty([TyString, TyString], TyCon("Result", [TyUnit, TyString]))) },
     TyEntry { name: "read_line",      scheme: mono(fn_ty([], TyCon("Result", [TyString, TyString]))) },
@@ -25353,6 +25446,27 @@ fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
           if op == "%" and not ty_is_integral_raw(opt_ty) { MBoxed }
           else { MUnboxed }
         }
+        # Issue #90 — `//` (integer division) and `^` (integer power)
+        # were previously routed through `kai_op_idiv` / `kai_op_pow_int`
+        # even when both operands were raw. Lift them inline:
+        #
+        #   - `//` is signed integer division. The typer pins both
+        #     operands to `Int` (synth_binop), so a raw / raw `//`
+        #     lowers to native C `/` on `int64_t` (or `sdiv i64` on
+        #     LLVM). Identical semantics to `kai_op_idiv` for the
+        #     Int path; the helper's Real-coercion path is unreachable
+        #     post-typer for `//`.
+        #
+        #   - `^` is integer-exponent power. We inline only when the
+        #     exponent is a compile-time literal in `[0, 64]` and the
+        #     result type is integral-raw. The emitter unrolls the
+        #     loop into `(b * b * ... * b)` — no statement-expression,
+        #     no loop construct, identical IR shape on both backends.
+        #     Other shapes (Real base, non-literal exponent, negative
+        #     exponent, or `n > 64`) keep the boxed path through
+        #     `kai_op_pow_int`.
+        else if op == "//" and child_is_raw(a) and child_is_raw(b) and ty_is_integral_raw(opt_ty) { MUnboxed }
+        else if op == "^" and child_is_raw(a) and child_is_raw(b) and ty_is_integral_raw(opt_ty) and pow_exp_is_inlinable(b) { MUnboxed }
         # M4 — comparisons and short-circuiting booleans collapse to
         # native C operators when both operands are raw. The result
         # is a raw `int` (0/1) which the boundary tactic re-boxes
@@ -25371,6 +25485,26 @@ fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
 
 fn child_is_raw(e: Expr) : Bool {
   match e.mode { MUnboxed -> true _ -> false }
+}
+
+# Issue #90 — `^` raw-inline gate. The C / LLVM emitters unroll
+# `b ^ n` into `n` repeated multiplications when `n` is a small
+# compile-time-known non-negative Int. Larger or non-literal `n`
+# would require a runtime loop (statement-expression in C, basic
+# blocks in LLVM); v1 keeps those boxed. The unbox pass excludes
+# function calls from raw operands, so the base `b` is pure and
+# safe to duplicate `n` times in the emitted code without
+# observable side effects.
+#
+# Bound at 64: an int64 base raised to an exponent above 63 is
+# guaranteed to overflow except for trivial bases (0, 1, -1), and
+# 64 multiplications keep the emitted expression well under the
+# size threshold the C compiler / LLVM optimizer handles cheaply.
+fn pow_exp_is_inlinable(e: Expr) : Bool {
+  match try_eval_int(e) {
+    Some(n) -> n >= 0 and n <= 64
+    None    -> false
+  }
 }
 
 fn unbox_opt(opt: Option[Expr], env: [LocBind]) : Option[Expr] {
@@ -28173,6 +28307,7 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_record(i32, %KaiValue**, i8**)\n",
     "declare %KaiValue* @kaix_field(%KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_prelude_args()\n",
+    "declare %KaiValue* @kaix_prelude_program_name()\n",
     "declare %KaiValue* @kaix_prelude_exit(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_panic_fn(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_panic(%KaiValue*)\n",
@@ -28264,6 +28399,11 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_default_log_info(i8*, %KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_default_log_warn(i8*, %KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_default_log_error(i8*, %KaiValue*, i8*)\n",
+    # Issue #140: SecureRandom default handler wrappers (see
+    # stage0/runtime_llvm.c). Two ops, both infallible from the
+    # caller's perspective.
+    "declare %KaiValue* @kaix_default_securerandom_int_range(i8*, %KaiValue*, %KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_default_securerandom_bytes(i8*, %KaiValue*, i8*)\n",
     "\n"
   ])
 
@@ -28524,6 +28664,7 @@ fn llvm_prelude_table() : [LlvmPrelude] {
     LP("list_length",      1, None),
     LP("list_reverse",     1, None),
     LP("args",             0, None),
+    LP("program_name",     0, None),
     LP("exit",             1, None),
     LP("panic",            1, None),
     LP("read_file",        1, None),
@@ -28826,7 +28967,7 @@ fn llvm_emit_kind_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
       }
     }
     EBinop(op, a, b) ->
-      if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) {
+      if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) or op == "//" or op == "^" {
         llvm_emit_binop_raw(e, op, a, b, x.ty)
       } else {
         # Conservative fallback: emit boxed and unbox via the
@@ -28852,6 +28993,23 @@ fn llvm_emit_kind_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
 # mirrors the C backend's `&&` / `||` semantics: when both
 # operands are raw, short-circuit is observationally identical to
 # eager.
+# Issue #90 — emit `n` chained `mul i64` instructions to unroll
+# `base ^ (k+1)` where `k = n` is the number of additional
+# multiplications past the first factor. Caller passes the base
+# register as both `acc_reg` and `base_reg`; this function emits
+# `acc_reg = mul i64 acc_reg, base_reg` `k` times. `n` is gated to
+# `<= 63` upstream (caller subtracts 1 from the exponent), so the
+# emitted IR length is bounded.
+fn llvm_pow_unroll(e: LlvmEmit, acc_reg: String, k: Int, base_reg: String, opt_ty: Option[Ty]) : LlvmRaw / Console {
+  if k == 0 { LlvmRaw { e: e, reg: acc_reg, ty: opt_ty } }
+  else {
+    let reg = llvm_fresh_reg(e)
+    let instr = concat_all(["  ", reg.reg, " = mul i64 ", acc_reg, ", ", base_reg, "\n"])
+    let e1 = llvm_append_body(reg.e, instr)
+    llvm_pow_unroll(e1, reg.reg, k - 1, base_reg, opt_ty)
+  }
+}
+
 fn llvm_emit_binop_raw(e: LlvmEmit, op: String, l: Expr, r: Expr, opt_ty: Option[Ty]) : LlvmRaw / Console {
   let rl = llvm_emit_expr_raw(e, l)
   let rr = llvm_emit_expr_raw(rl.e, r)
@@ -28861,6 +29019,29 @@ fn llvm_emit_binop_raw(e: LlvmEmit, op: String, l: Expr, r: Expr, opt_ty: Option
     let instr = concat_all(["  ", reg.reg, " = ", opc, " ", rl.reg, ", ", rr.reg, "\n"])
     let e1 = llvm_append_body(reg.e, instr)
     LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
+  } else if op == "//" {
+    # Issue #90 — signed integer division on raw `i64`. Mirrors
+    # the C backend's native `/` lowering. Both operands typed Int.
+    let reg = llvm_fresh_reg(rr.e)
+    let instr = concat_all(["  ", reg.reg, " = sdiv i64 ", rl.reg, ", ", rr.reg, "\n"])
+    let e1 = llvm_append_body(reg.e, instr)
+    LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
+  } else if op == "^" {
+    # Issue #90 — integer power, exponent literal in `[0, 64]`
+    # (gated by `pow_exp_is_inlinable` before reaching here).
+    # Unroll into repeated `mul i64` instructions. `n == 0`
+    # yields a constant `1`; `n == 1` yields the base register.
+    let n = match try_eval_int(r) { Some(v) -> v None -> 0 }
+    if n == 0 {
+      let reg = llvm_fresh_reg(rr.e)
+      let instr = concat_all(["  ", reg.reg, " = add i64 0, 1\n"])
+      let e1 = llvm_append_body(reg.e, instr)
+      LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
+    } else if n == 1 {
+      LlvmRaw { e: rr.e, reg: rl.reg, ty: opt_ty }
+    } else {
+      llvm_pow_unroll(rr.e, rl.reg, n - 1, rl.reg, opt_ty)
+    }
   } else if op_is_raw_cmp(op) {
     # Comparison — operands' type comes from the children (the
     # binop's own ty is bool). Result is i1; zext to i32 to match
@@ -30061,6 +30242,13 @@ fn llvm_default_builtin_decls(main_row: [String]) : String {
         "@_kai_default_node_log = internal global [48 x i8] zeroinitializer\n",
         "@_kai_default_log_name = private unnamed_addr constant [4 x i8] c\"Log\\00\"\n"
       ])
+    } else { "" },
+    if list_has(main_row, "SecureRandom") {
+      concat_all([
+        "@_kai_default_ev_securerandom = internal global %EvSecureRandom zeroinitializer\n",
+        "@_kai_default_node_securerandom = internal global [48 x i8] zeroinitializer\n",
+        "@_kai_default_securerandom_name = private unnamed_addr constant [13 x i8] c\"SecureRandom\\00\"\n"
+      ])
     } else { "" }
   ])
 }
@@ -30198,6 +30386,21 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
       "  call void @kaix_evidence_push(i8* %node_log_p, i8* getelementptr inbounds ([4 x i8], [4 x i8]* @_kai_default_log_name, i64 0, i64 0), i8* %ev_log_void)\n"
     ])
   } else { "" }
+  let securerandom_ = if list_has(main_row, "SecureRandom") {
+    concat_all([
+      "  ; install SecureRandom default handler (issue #140)\n",
+      "  %hid_securerandom = call i64 @kaix_fresh_handler_id()\n",
+      "  %ev_securerandom_hid_p = getelementptr %EvSecureRandom, %EvSecureRandom* @_kai_default_ev_securerandom, i32 0, i32 0\n",
+      "  store i64 %hid_securerandom, i64* %ev_securerandom_hid_p\n",
+      "  %ev_securerandom_int_range_p = getelementptr %EvSecureRandom, %EvSecureRandom* @_kai_default_ev_securerandom, i32 0, i32 3\n",
+      "  store %KaiValue* (%EvSecureRandom*, %KaiValue*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, %KaiValue*, i8*)* @kaix_default_securerandom_int_range to %KaiValue* (%EvSecureRandom*, %KaiValue*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvSecureRandom*, %KaiValue*, %KaiValue*, %KaiCont*)** %ev_securerandom_int_range_p\n",
+      "  %ev_securerandom_bytes_p = getelementptr %EvSecureRandom, %EvSecureRandom* @_kai_default_ev_securerandom, i32 0, i32 4\n",
+      "  store %KaiValue* (%EvSecureRandom*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_securerandom_bytes to %KaiValue* (%EvSecureRandom*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvSecureRandom*, %KaiValue*, %KaiCont*)** %ev_securerandom_bytes_p\n",
+      "  %node_securerandom_p = getelementptr [48 x i8], [48 x i8]* @_kai_default_node_securerandom, i32 0, i32 0\n",
+      "  %ev_securerandom_void = bitcast %EvSecureRandom* @_kai_default_ev_securerandom to i8*\n",
+      "  call void @kaix_evidence_push(i8* %node_securerandom_p, i8* getelementptr inbounds ([13 x i8], [13 x i8]* @_kai_default_securerandom_name, i64 0, i64 0), i8* %ev_securerandom_void)\n"
+    ])
+  } else { "" }
   concat_all([
     llvm_default_builtin_decls(main_row),
     "\ndefine void @kai_main_install_defaults() {\n",
@@ -30205,6 +30408,7 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
     stderr_,
     fail,
     random_,
+    securerandom_,
     clock_,
     nettcp_,
     log_,
@@ -30220,6 +30424,7 @@ fn llvm_emit_main_teardown_defaults(main_row: [String]) : String {
     if list_has(main_row, "Log")     { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "NetTcp")  { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Clock")   { "  call void @kaix_evidence_pop()\n" } else { "" },
+    if list_has(main_row, "SecureRandom") { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Random")  { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Fail")    { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Stderr")  { "  call void @kaix_evidence_pop()\n" } else { "" },
@@ -36469,6 +36674,8 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   # Log. The default-handler push is gated on main's row in
   # default_setups_for / install_log on the LLVM side.
   let log_d      = inject_unconditional(existing,       "Log",      builtin_log_decl())
+  # Issue #140: SecureRandom — atomic effect, no companion type decls.
+  let securerandom_d = inject_unconditional(existing, "SecureRandom", builtin_securerandom_decl())
   list_append(console_d,
     list_append(stdout_d,
       list_append(stderr_d,
@@ -36494,7 +36701,8 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
                                               list_append(child_d,
                                                 list_append(exit_d,
                                                   list_append(process_d,
-                                                    list_append(log_d, decls))))))))))))))))))))))))))
+                                                    list_append(log_d,
+                                                      list_append(securerandom_d, decls)))))))))))))))))))))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -36564,6 +36772,19 @@ fn ty_result_string_string_zero() : TypeExpr =
 fn ty_result_unit_string_zero() : TypeExpr =
   ty_named_zero("Result", [ty_name_zero("Unit"), ty_name_zero("String")])
 
+# Issue #127: kaikai's `Result[e, a]` is Err-first / Ok-second
+# (see add_builtin_variant_sigs above and the divergence note on
+# builtin_nettcp_decl). For ops where success returns `Unit` and
+# failure returns a `String` error message, the typer-correct
+# decl is `Result[String, Unit]`. This helper exists so the
+# Env write-side ops (`set_var`, `unset_var`) read naturally as
+# `Ok(())` / `Err(msg)` in user code, matching the runtime
+# contract. Do not reuse `ty_result_unit_string_zero` for new
+# ops — it has the inverted shape used by the legacy `File`
+# decl (existing bug, see stdlib/fs/file.kai for the workaround).
+fn ty_result_string_unit_zero() : TypeExpr =
+  ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Unit")])
+
 fn ty_list_string_zero() : TypeExpr =
   ty_list_zero(ty_name_zero("String"))
 
@@ -36589,7 +36810,7 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # still mention Console because the resolver routes through
 # `cand_ns` for aliases.
 fn builtin_effect_names() : [String] =
-  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Random", "NetTcp", "Signal", "Process", "Log", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor"]
+  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Random", "SecureRandom", "NetTcp", "Signal", "Process", "Log", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor"]
 
 # m12.8 Phase 4b: `Console` is now an alias `type Console = Stdout +
 # Stderr + Stdin` (per stdlib/effects.kai's pinned catalog), not a
@@ -36630,8 +36851,23 @@ fn builtin_stdin_decl() : Decl =
 fn builtin_env_decl() : Decl =
   DEffect(false, "Env", [],
     [
-      EOp("args", [], [], ty_list_string_zero(), 0, 0),
-      EOp("var",  [], [param_string_zero("name")], ty_option_string_zero(), 0, 0)
+      EOp("args",       [], [], ty_list_string_zero(), 0, 0),
+      EOp("var",        [], [param_string_zero("name")], ty_option_string_zero(), 0, 0),
+      # Issue #127: write side + full block enumeration. Writes
+      # stay on `Env` (rejected the alternative of routing through
+      # `Mutable` — see the issue body's "stay on Env" decision).
+      EOp("set_var",    [], [param_string_zero("name"), param_string_zero("value")],
+                        ty_result_string_unit_zero(), 0, 0),
+      EOp("unset_var",  [], [param_string_zero("name")],
+                        ty_result_string_unit_zero(), 0, 0),
+      # `vars()` lists every entry of the process environment block.
+      # Pair fields use `fst`/`snd` to match `core.tuple` (kaikai
+      # has no first-class tuples; `[(String, String)]` in the issue
+      # text materialises as `[Pair[String, String]]`).
+      EOp("vars",       [], [],
+                        ty_list_zero(ty_named_zero("Pair",
+                          [ty_name_zero("String"), ty_name_zero("String")])),
+                        0, 0)
     ], 0, 0)
 
 fn builtin_file_decl() : Decl =
@@ -36845,6 +37081,40 @@ fn builtin_log_decl() : Decl =
       EOp("info",  [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0),
       EOp("warn",  [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0),
       EOp("error", [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0)
+    ], 0, 0)
+
+# Issue #140: SecureRandom effect — cryptographically-secure RNG,
+# deliberately separate from `Random` so a test handler stubbing
+# Random cannot weaken security-sensitive paths. Spec:
+# docs/effects-stdlib.md §`SecureRandom`. Two ops in v1:
+#
+#   int_range(min: Int, max: Int) : Int   -- uniform in [min, max] inclusive
+#   bytes(n: Int)                 : [Int] -- surface-typed [Byte], but stage 2
+#                                            has no first-class Byte (same
+#                                            divergence NetTcp documents)
+#
+# Op named `int_range` rather than the doc's `int()` because
+# `int` is a C keyword and the C backend emits each op as a struct
+# field by name (see emit_effect_struct). Mirroring `Random.int_range`
+# also keeps the surface symmetric across the two RNG effects. The
+# user-facing public wrapper is still `random_secure.int(min, max)`
+# per issue #140.
+#
+# Default handler: getrandom(2) on Linux, arc4random_buf(3) on
+# macOS/BSD. POSIX-only in v1; Windows BCryptGenRandom is post-MVP.
+fn builtin_securerandom_decl() : Decl =
+  DEffect(false, "SecureRandom", [],
+    [
+      EOp("int_range", [],
+          [Param { pname: "min", ptype: Some(ty_name_zero("Int")),
+                   pline: 0, pcol: 0 },
+           Param { pname: "max", ptype: Some(ty_name_zero("Int")),
+                   pline: 0, pcol: 0 }],
+          ty_name_zero("Int"), 0, 0),
+      EOp("bytes", [],
+          [Param { pname: "n", ptype: Some(ty_name_zero("Int")),
+                   pline: 0, pcol: 0 }],
+          ty_list_zero(ty_name_zero("Int")), 0, 0)
     ], 0, 0)
 
 # m7b #11: stdlib parameterised effects per Doc B §`State[T]` and
