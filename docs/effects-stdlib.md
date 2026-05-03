@@ -462,7 +462,6 @@ timing decided when the first real use case pushes them:
   just new `File` ops.
 
 ## `Clock`
-<!-- coverage: skip --> effect declared, post-MVP; remove this marker when fixture lands
 
 ### Declaration
 

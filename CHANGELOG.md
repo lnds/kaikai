@@ -9,6 +9,219 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **`stdlib/fs/` v1 — Tier S1 lane #1.** First instalment of
+  `docs/stdlib-roadmap.md`'s Tier S1 (the four modules that
+  unblock `ahu` and `manutara`). Three new files under
+  `stdlib/fs/`, callable via `import fs.<module>`:
+  - `stdlib/fs/file.kai` — `file.read_file`, `file.write_file`,
+    `file.append`. Wraps the existing `kai_prelude_read_file` /
+    `kai_prelude_write_file` builtins; the panicking surface that
+    the catalog (`docs/stdlib-layout.md` §`fs`) calls for.
+    `file.append` is a read+concat+write polyfill — not atomic,
+    not safe under concurrent writers; the file's header pins
+    that limitation against the follow-up runtime issue that
+    backs it with `fopen("ab")` + `fwrite`.
+  - `stdlib/fs/dir.kai` — doc-only stub. The four directory ops
+    (`list_dir`, `create_dir`, `remove_dir`, `walk`) all need
+    runtime primitives that `stage0/runtime.h` does not yet
+    expose (`opendir` / `readdir` / `mkdir` / `rmdir`). The stub
+    documents the deferred surface and the follow-up issue label
+    (`stdlib`+`runtime`).
+  - `stdlib/fs/path.kai` — doc-only stub. The existing `path_*`
+    helpers from `stdlib/path.kai` are already loaded as a
+    prelude and accessible as `path.join` / `path_join` /
+    similar; a `fs.path.*` re-export shim waits on the m14
+    module-system rename lane.
+- **`examples/stdlib/fs_basic.kai` regression fixture** — covers
+  the four cases the v1 surface guarantees (`write+read`,
+  `append+read`, `append-onto-empty`, `overwrite-after-append`).
+  Wired into `make test-stdlib` (and therefore `make tier1`)
+  through `stage2/Makefile`'s addition of `--path ../stdlib` to
+  the test-stdlib invocation. The full
+  `write → read → exists → metadata → delete` cycle the roadmap
+  acceptance bar names lands once the follow-up runtime lane
+  ships the missing primitives.
+- **stdlib `os/` module — partial Tier S1 #2 (env + args).** First
+  half of the lane pinned in `docs/stdlib-roadmap.md` Tier S1 #2.
+  Two thin wrappers over the existing `Env` effect:
+  - `stdlib/os/env.kai` — `pub fn get(name: String) : Option[String] / Env`,
+    1:1 over `Env.var(name)`.
+  - `stdlib/os/args.kai` — `pub fn argv() : [String] / Env`,
+    1:1 over `Env.args()`. Effect row is `Env`, not `Process`, to
+    match the actual handler chain (`kai_default_env_args` →
+    `kai_prelude_args` → argv[1..]).
+  - Fixture `examples/stdlib/os_basic.kai` exercises both wrappers
+    and is wired into `make test-stdlib` (and therefore tier1).
+  - `EXTRA_PRELUDE_FLAGS` in `stage2/Makefile` extended with the
+    two new modules so the `env.*` / `args.*` qualified-call
+    surface is reachable from any `examples/stdlib/*` fixture.
+
+  Surface deliberately narrower than what Tier S1 #2 names. The
+  brief assumed runtime + compiler support for the rest of the
+  surface; verification turned up two upstream gaps that warrant
+  separate lanes:
+  - **#126** — `Process` effect builtin and runtime primitives
+    (`kai_default_process_*`) entirely missing. Blocks the whole
+    `os.process.start/wait/kill/exit/...` family and `os.exit`
+    re-export. Sibling lane.
+  - **#127** — `Env` effect missing `set_var` / `unset_var` /
+    `vars` ops, and argv[0] not exposed via any prelude or effect
+    op. Blocks `os.env.set/unset/all` and `os.args.program_name`.
+
+  When #126 and #127 land, this lane reopens to add the remaining
+  surface on top.
+- **Multi-arg `match` sugar (issue #129).** Parser-only sugar:
+  `match e1, ..., eN { p1, ..., pN -> body | ... }` with `2 ≤ N ≤ 4`
+  desugars in the parser to a chain of nested single-scrutinee
+  `match` expressions over `let __mm_s_i = e_i` bindings, so
+  downstream passes (typer, exhaustiveness, codegen) see only the
+  forms they already handle. Constraints: same N across every
+  arm (parse error otherwise), no rest/wildcard column beyond
+  per-column `_`, N≥5 rejected with `multi-arg \`match\` supports
+  up to 4 scrutinees`, terminal "no arm matched" branch is
+  `todo!("non-exhaustive multi-arg match")` so it composes with
+  any inferred return type without polluting the function's
+  effect row. The desugar interleaves correctly when two arms
+  share an outer pattern: an inner-pattern miss falls through to
+  the *next outer arm* rather than aborting (the pairwise per-arm
+  shape would silently miscompile this case). The four demos that
+  motivated the lane shed their synthetic `(a, b)` /
+  `Pair[a, b]` workaround:
+  - `demos/forth/main.kai` — `step(stack, tk)` now matches
+    `tk, stack` directly.
+  - `demos/toquefama/main.kai` — `count_toques(guess, target)`
+    drops the `Pair { fst, snd }` wrapper and the
+    `stdlib/core/tuple` dependency.
+  - `demos/9d9l/toquefama/main.kai` — `count_famas` matches
+    `guess, target` without parens.
+  - `demos/9d9l/huffman/main.kai` — `decode_step` matches
+    `cur, bits` without parens.
+  Coverage: `examples/match/multi_arg_basic.kai` (positive — 2-arg
+  literals + interleaving, 3-arg with wildcard column, guards),
+  `examples/match/multi_arg_arity_mismatch.kai` (negative —
+  arm with too many patterns), and
+  `examples/match/multi_arg_too_many_scruts.kai` (negative — head
+  with N=5). New `test-match` target wired into `make test` and
+  `make test-fast`. Column-aware "missing pattern in column 2"
+  diagnostics are deferred to a follow-up issue if user feedback
+  warrants. Closes #129; `docs/proposed-extensions.md` §9 status
+  flips to "landed v1".
+
+- **stdlib `Clock` default handler (Tier S1 #4 of `docs/stdlib-roadmap.md`).**
+  `stdlib/time.kai` shipped the `Clock` effect declaration + pure
+  `Duration` / `Instant` arithmetic earlier; the default handler that
+  bridges `wall_now` / `monotonic_now` / `sleep_ns` to the OS was the
+  last gap. With this lane, `time.now()` / `time.monotonic()` /
+  `time.sleep(d)` "just work" without the caller installing a
+  handler — required for `ahu` timers and `manutara` request
+  deadlines.
+  - **C-side wrappers (`stage0/runtime.h`).** Three new
+    `kai_default_clock_*` statics: `wall_now` calls
+    `clock_gettime(CLOCK_REALTIME, ...)` and resumes with a
+    `WallTime { secs, nanos }` record; `monotonic_now` mirrors with
+    `CLOCK_MONOTONIC` → `Instant`; `sleep_ns` runs `nanosleep` in an
+    `EINTR` loop and resumes with `Unit`. POSIX `<time.h>` only — no
+    new external dependencies. `clock_gettime` failure panics with a
+    banner on stderr, matching `Console`'s error model
+    (`docs/effects-stdlib.md` §`Clock` / *Error model*). LLVM-side
+    extern wrappers (`kaix_default_clock_*`) added in
+    `stage0/runtime_llvm.c`.
+  - **Compiler installer wiring (`stage2/compiler.kai`).** Mirrors
+    `Random` / `NetTcp`: `default_clock_shims` / `default_clock_setup`
+    register a typed shim per op and push an `EvClock` node onto the
+    evidence stack inside the `kai_main` wrapper when `Clock` appears
+    in `main`'s row. The atomic effect declaration lives in
+    `stdlib/time.kai` (not as a compiler builtin), so user code
+    reaches the handler via `import time` + writing `time.now()` /
+    `time.monotonic()` / `time.sleep(d)`. LLVM backend mirrors the C
+    path in `llvm_emit_main_install_defaults` +
+    `llvm_emit_main_teardown_defaults`.
+  - **Fixture (`examples/stdlib/time_clock_default.kai`).** Calls
+    `monotonic()`, `sleep(millis(10))`, `monotonic()` again, and
+    asserts the elapsed `Duration` sits in `[10ms, 1000ms]`. The
+    fixture deliberately installs no `Clock` handler — that is what
+    proves the runtime default works. The upper bound is generous so
+    loaded CI runners do not flake; the lower bound is the
+    load-bearing assertion (the handler actually slept rather than
+    no-op'd). Wired into `stage2/Makefile`'s `test-stdlib` target via
+    the new `--prelude ../stdlib/time.kai` entry in
+    `EXTRA_PRELUDE_FLAGS`, mirroring how `Random` is loaded for other
+    stdlib fixtures.
+  - **`sleep` is not yet `Cancel`-aware.** Under the m8 v1
+    inline-eager scheduler `sleep_ns` blocks the OS thread; a
+    cancellation delivered while a fiber sleeps is observed only
+    after wake-up. The cooperative scheduler in m8.x upgrades the
+    handler to register the fiber on a timer wheel and yield through
+    `Spawn.yield` so `Cancel` interrupts mid-sleep. Tracked in the
+    m8.x follow-up.
+- **`m[k]` read-side indexing sugar over `Map[K, V]` (issue #128).**
+  The typer now dispatches `e1[e2]` by inspecting the inferred
+  type of `e1`: `Map[K, V]` lowers to `map_get(e1, e2) : Option[V]`,
+  while `Array[T]` keeps its existing `array_get` lowering. The
+  sugar specification lives in `docs/syntax-sugars.md` §4 (new
+  *Map dispatch* subsection); the v1 retrospective in
+  `docs/proposed-extensions.md` §6 captures the pinned decisions.
+  The write-side sugar `m[k] := v` is **rejected** with a
+  diagnostic pointing at `map_put`; the v2 design lands alongside
+  the HAMT carrier. New regression fixtures
+  `examples/stdlib/map_tree_basic.kai` (positive — exercises the
+  sugar plus the AVL carrier at N=1000) and
+  `examples/stdlib/map_assign_error.kai` (negative — typer must
+  reject the indexed write) are wired into `make test-stdlib`.
+  Closes the unblock for `ahu`'s Registry primitive.
+
+### Changed
+
+- **`Map[K, V]` carrier upgraded from association-list to AVL
+  tree (issue #128).** `stdlib/collections/map.kai` now wraps a
+  height-balanced binary search tree keyed by `<`. Lookup, insert,
+  and remove are `O(log n)` instead of `O(n)`. The public surface
+  (`map_empty`, `map_size`, `map_is_empty`, `map_get`,
+  `map_contains`, `map_put`, `map_remove`, `map_keys`,
+  `map_values`, `map_to_pairs`, `map_from_pairs`) is preserved at
+  the signature level. **Insert order is no longer preserved** —
+  `map_keys` / `map_values` / `map_to_pairs` walk the tree
+  in-order and return keys sorted under `<`. Callers that needed
+  insert order (the JWT encoder demo at
+  `examples/stdlib/jwt_encoder.kai`) adapted to the sorted
+  output; the golden was updated accordingly. Key types are
+  restricted to those for which the runtime's `<` is total —
+  `Int`, `Real`, `Char`, `String` — until v2 introduces an `Ord`
+  protocol.
+
+### Fixed
+
+- **Parser — leading pipe on a new line (issue #130).** The
+  "Pipe across lines" example in `docs/kaikai-minimal.md`
+  showed pipes leading the continuation line:
+  ```kai
+  xs
+    |> filter(. > 0)
+    |> map(. * 2)
+    |> sum
+  ```
+  but `parse_pipe_rest` (`stage2/compiler.kai`) called
+  `p_skip_newlines` only AFTER consuming `|>` / `|`, never
+  before. The newline after `xs` therefore terminated the
+  expression and the leading `|>` started a fresh, failing
+  statement. The fix peeks past leading newlines before
+  scanning for `TkPipeApply` / `TkPipe`; if neither matches,
+  the original parser state (newlines intact) is returned so
+  the enclosing statement boundary still sees them. Trailing-
+  pipe form is unchanged. The relaxation is scoped to pipe
+  tokens — other binary operators continue to work in trailing
+  position only. New regression fixtures live under
+  `examples/pipes/` (`leading_pipe_apply`, `leading_pipe_map`,
+  `leading_pipe_mixed`, `trailing_pipe_still_works`) and are
+  wired into `make test` via the new `test-pipes` target.
+  Negative regression cases — `match` arms (newline-separated)
+  and sum-type variants on their own line (`type T = A | B`,
+  consumed by `parse_sum_body` not `parse_pipe_rest`) — are
+  unaffected because they parse `|` at their own grammar level
+  outside expression position.
+
 ## [0.37.0] — 2026-05-02 (Tongariki MVP closed — last 6 mvp-blockers landed)
 
 The Tongariki MVP claim ships without an asterisk. The last six

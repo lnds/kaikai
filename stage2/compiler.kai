@@ -1834,15 +1834,22 @@ fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
   # `parse_sum_body`, not the expression grammar, so there is no
   # ambiguity here.
   #
+  # Issue #130: pipe operators may also lead a continuation line. The
+  # peeked parser skips leading newlines so `xs\n  |> f\n  |> g` parses
+  # the same as `xs |>\n  f |>\n  g`. If the next non-newline token is
+  # NOT a pipe we return the ORIGINAL `p` — those newlines belong to
+  # the enclosing statement boundary, not the pipe chain.
+  #
   # The synthetic call binds the prelude's `map`. That contract has
   # three load-bearing entries that must move together: the runtime
   # symbol in `prelude_table` (`EP("map", "kai_prelude_map", 2)`), the
   # type scheme `([a], (a) -> b) -> [b]` in the type env (search
   # `TyEntry { name: "map"`), and the literal `"map"` here. Renaming
   # any one without the others silently breaks this desugar.
-  if p_at(p, TkPipeApply) {
-    let t = p_peek(p)
-    let p1 = p_skip_newlines(p_advance(p))
+  let p_look = p_skip_newlines(p)
+  if p_at(p_look, TkPipeApply) {
+    let t = p_peek(p_look)
+    let p1 = p_skip_newlines(p_advance(p_look))
     let r = parse_or(p1)
     match r.r {
       None -> err_e(r.p)
@@ -1862,9 +1869,9 @@ fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
         }
       }
     }
-  } else if p_at(p, TkPipe) {
-    let t = p_peek(p)
-    let p1 = p_skip_newlines(p_advance(p))
+  } else if p_at(p_look, TkPipe) {
+    let t = p_peek(p_look)
+    let p1 = p_skip_newlines(p_advance(p_look))
     let r = parse_or(p1)
     match r.r {
       None -> err_e(r.p)
@@ -3359,6 +3366,12 @@ fn parse_match(p: Parser, t: Token) : PExpr {
         let n = list_length(scruts)
         if n == 1 {
           parse_match_arms(p_skip_newlines(p_advance(p2)), [], scrut1, t)
+        } else if n > 4 {
+          # Issue #129: cap multi-arg `match` at 4 columns. Higher
+          # arities exist (revisit if a use case wants 5+) but in
+          # practice they push the desugared nesting past what stays
+          # readable in diagnostics. Re-evaluate with concrete need.
+          err_e(p_error_here(p2, "multi-arg `match` supports up to 4 scrutinees"))
         } else {
           parse_multi_match_arms(p_skip_newlines(p_advance(p2)), [], scruts, n, t)
         }
@@ -11984,6 +11997,40 @@ fn default_file_setup() : String =
     "    kai_evidence_push(&_kai_default_node_file, \"File\", &_kai_default_ev_file);\n"
   ])
 
+# Default Clock handler — three ops bridging to OS clocks via
+# `clock_gettime(CLOCK_REALTIME, ...)` (wall_now), `clock_gettime
+# (CLOCK_MONOTONIC, ...)` (monotonic_now), and `nanosleep` (sleep_ns).
+# Installed when `main`'s row mentions `Clock`. The Clock effect
+# itself is declared in stdlib/time.kai (not as a compiler builtin),
+# so user code reaches this handler by `import time` + writing
+# `time.now()` / `time.monotonic()` / `time.sleep(d)`. See
+# `kai_default_clock_*` in stage0/runtime.h. m8.x follow-up: under
+# the m8 v1 inline-eager scheduler `sleep_ns` blocks the OS thread
+# and is not Cancel-aware; the cooperative scheduler upgrades it.
+fn default_clock_shims() : String =
+  concat_all([
+    "static KaiValue *_kai_default_clock_wall_now_shim(EvClock *self, KaiCont *k) {\n",
+    "    return kai_default_clock_wall_now(self, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_clock_monotonic_now_shim(EvClock *self, KaiCont *k) {\n",
+    "    return kai_default_clock_monotonic_now(self, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_clock_sleep_ns_shim(EvClock *self, KaiValue *kai_ns, KaiCont *k) {\n",
+    "    return kai_default_clock_sleep_ns(self, kai_ns, k);\n",
+    "}\n"
+  ])
+
+fn default_clock_setup() : String =
+  concat_all([
+    "    static EvClock _kai_default_ev_clock;\n",
+    "    static KaiEvidence _kai_default_node_clock;\n",
+    "    _kai_default_ev_clock.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_clock.wall_now      = &_kai_default_clock_wall_now_shim;\n",
+    "    _kai_default_ev_clock.monotonic_now = &_kai_default_clock_monotonic_now_shim;\n",
+    "    _kai_default_ev_clock.sleep_ns      = &_kai_default_clock_sleep_ns_shim;\n",
+    "    kai_evidence_push(&_kai_default_node_clock, \"Clock\", &_kai_default_ev_clock);\n"
+  ])
+
 # Default Random handler — non-deterministic per-process PCG64
 # seeded from time(NULL) ^ getpid() at first use. See
 # `kai_default_random_int_range` in stage0/runtime.h.
@@ -12243,6 +12290,7 @@ fn default_setups_for(main_row: [String]) : String = {
     if list_has(main_row, "Stdin")   { default_stdin_setup() }   else { "" },
     if list_has(main_row, "Env")     { default_env_setup() }     else { "" },
     if list_has(main_row, "File")    { default_file_setup() }    else { "" },
+    if list_has(main_row, "Clock")   { default_clock_setup() }   else { "" },
     if list_has(main_row, "Random")  { default_random_setup() }  else { "" },
     if list_has(main_row, "NetTcp")  { default_nettcp_setup() }  else { "" },
     if list_has(main_row, "Signal")  { default_signal_setup() }  else { "" },
@@ -12271,6 +12319,7 @@ fn default_shims_for(main_row: [String]) : String = {
     if list_has(main_row, "Stdin")   { default_stdin_shims() }   else { "" },
     if list_has(main_row, "Env")     { default_env_shims() }     else { "" },
     if list_has(main_row, "File")    { default_file_shims() }    else { "" },
+    if list_has(main_row, "Clock")   { default_clock_shims() }   else { "" },
     if list_has(main_row, "Random")  { default_random_shims() }  else { "" },
     if list_has(main_row, "NetTcp")  { default_nettcp_shims() }  else { "" },
     if list_has(main_row, "Signal")  { default_signal_shims() }  else { "" },
@@ -12293,6 +12342,7 @@ fn default_pops_for(main_row: [String]) : String =
     if list_has(main_row, "Signal")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "NetTcp")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Random")  { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "Clock")   { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "File")    { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Env")     { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Stdin")   { "    kai_evidence_pop();\n" } else { "" },
@@ -12762,19 +12812,13 @@ fn desugar_op_calls_kind(k: ExprKind, effs: [String]) : ExprKind {
   }
 }
 
-# m7b #6: pre-resolve desugar of the array-indexing sugars.
-#
-# `a[i]`        ≡  Mutable.array_get(a, i)
-# `a[i] := v`   ≡  Mutable.array_set(a, i, v)
-#
-# `docs/syntax-sugars.md` §4 phrases the desugaring as `Mutable.<op>`
-# calls; the migration of `array_get` / `array_set` behind the
-# `Mutable` effect lands together with the rest of m7a's `Mutable`
-# retrofit. Until that arrives the bare prelude functions of the same
-# name carry the same operational semantics (mutate-in-place +
-# panic-on-OOB), so this pass emits them directly. Switching the
-# desugar target from `array_get` → `Mutable.array_get` is one
-# rewrite each in `array_index_callee_get` / `_set`.
+# Pre-typer recursion over `EIndex` and `SIndexAssign`. The pass no
+# longer rewrites either form (issue #128 moved the dispatch to the
+# typer so `Map[K, V]` and `Array[T]` can pick different lowerings).
+# What the pass *does* do is walk every body so any sugar layered
+# above this one — `EBlock` rewrites, var-cell desugar — sees the
+# stmts in their original shape; an unmodified visitor would miss
+# the `SIndexAssign` arm because it survives the typer too.
 fn desugar_index_decls(ds: [Decl]) : [Decl] = map(ds, desugar_index_decl)
 
 fn desugar_index_decl(d: Decl) : Decl {
@@ -12787,12 +12831,6 @@ fn desugar_index_decl(d: Decl) : Decl {
     _ -> d
   }
 }
-
-fn array_index_callee_get(line: Int, col: Int) : Expr =
-  mk_expr(EVar("array_get"), line, col)
-
-fn array_index_callee_set(line: Int, col: Int) : Expr =
-  mk_expr(EVar("array_set"), line, col)
 
 fn desugar_index_expr(e: Expr) : Expr =
   Expr { kind: desugar_index_kind(e.kind, e.line, e.col),
@@ -12812,14 +12850,13 @@ fn desugar_index_stmt(s: Stmt) : Stmt {
     SLet(pat, ann, rhs) -> SLet(pat, ann, desugar_index_expr(rhs))
     SAssert(c, m) -> SAssert(desugar_index_expr(c), desugar_index_opt(m))
     SExprStmt(x) -> SExprStmt(desugar_index_expr(x))
-    SIndexAssign(b, i, v, line, col) -> {
-      let bd = desugar_index_expr(b)
-      let id = desugar_index_expr(i)
-      let vd = desugar_index_expr(v)
-      let call = mk_expr(ECall(array_index_callee_set(line, col), [bd, id, vd]),
-                         line, col)
-      SExprStmt(call)
-    }
+    # issue #128: SIndexAssign now flows through to the typer, which
+    # dispatches on the container's inferred type (Array → array_set
+    # call; Map → typed error). Sub-exprs still recurse so any nested
+    # sugars below this layer are picked up.
+    SIndexAssign(b, i, v, line, col) ->
+      SIndexAssign(desugar_index_expr(b), desugar_index_expr(i),
+                   desugar_index_expr(v), line, col)
     # m7b #5: pass through; the var-desugar pass below transforms SVar
     # into a `handle ... with State[T](init)` form. Until that pass runs
     # we still need to recurse into `init` so any nested `a[i]` inside
@@ -12832,16 +12869,11 @@ fn desugar_index_stmt(s: Stmt) : Stmt {
 
 fn desugar_index_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
   match k {
-    # `a[i]` becomes `array_get(a, i)`. Sub-expressions still need to
-    # recurse so a nested `b[j]` inside `a` or `i` is also lowered.
-    EIndex(a, b) -> {
-      let ad = desugar_index_expr(a)
-      let bd = desugar_index_expr(b)
-      ECall(array_index_callee_get(line, col), [ad, bd])
-    }
-    # EBlock stays explicit because desugar_index_stmt transforms
-    # SIndexAssign → SExprStmt; the shared visitor only maps Exprs
-    # inside Stmts and would not change the Stmt's variant.
+    # issue #128: EIndex now flows through to the typer, which
+    # dispatches by the container's inferred type (Array → array_get
+    # call; Map → map_get call returning Option[V]). The pass still
+    # walks sub-expressions because EBlock stmt-bodies carry the
+    # SIndexAssign variant we now also leave intact.
     EBlock(stmts, tail) -> EBlock(desugar_index_stmts(stmts),
                                    desugar_index_opt(tail))
     _ -> map_expr_kind(k, desugar_index_expr)
@@ -20987,15 +21019,26 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
   }
 }
 
+# issue #128: `e1[e2]` dispatches on the container's inferred type.
+# `Map[K, V]` lowers to `map_get(coll, ix)` (returns `Option[V]`);
+# any other container — including unresolved type variables — falls
+# back to `array_get(coll, ix)` so the unifier produces the existing
+# "expected `Array[T]`" error message at the call site. The dispatch
+# walks `coll` once with `synth` to read its inferred type, then
+# constructs an `ECall` AST and re-synthesises it so the prelude
+# scheme of `map_get` / `array_get` is the source of truth for the
+# argument types and return type. Re-walking `coll` is cheap and
+# avoids us reimplementing the call-typing rule inline.
 fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Inferred {
-  let rc = synth(st, coll)
-  let ri = synth(rc.st, ix)
-  let st1 = st_unify(ri.st, ri.ty, TyInt, "list index", line, col)
-  let rv = st_fresh_ty(st1)
-  let st2 = st_unify(rv.st, rc.ty, TyListT(rv.ty), "list indexing", line, col)
-  let ty = apply_ty(st2.sub, rv.ty)
-  let root = with_ty(mk_expr(EIndex(rc.expr, ri.expr), line, col), ty)
-  mk_inferred(st2, ty, root)
+  let probe = synth(st, coll)
+  let coll_ty = apply_ty(probe.st.sub, probe.ty)
+  let callee_name = match coll_ty {
+    TyCon(name, _) -> if name == "Map" { "map_get" } else { "array_get" }
+    _              -> "array_get"
+  }
+  let callee = mk_expr(EVar(callee_name), line, col)
+  let call_node = mk_expr(ECall(callee, [coll, ix]), line, col)
+  synth(st, call_node)
 }
 
 # Binop typing is deliberately coarse: numeric operators unify their
@@ -21486,13 +21529,31 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt {
       let r = synth(st, ex)
       OneStmt { st: r.st, stmt: SExprStmt(r.expr) }
     }
-    # m7b #6: index-assign desugars away pre-resolve; this arm is dead
-    # code in normal compilation but keeps the match exhaustive.
+    # issue #128: dispatch the indexed write by container type.
+    # `Array[T]` lowers to `array_set(b, i, v)` (the legacy m7b
+    # behaviour). `Map[K, V]` is rejected with a typed error that
+    # points at `map_put` and references the v2 follow-up; the
+    # node returned is harmless filler so downstream passes never
+    # see a typed `SIndexAssign` survive.
     SIndexAssign(b, i, v, line, col) -> {
-      let rb = synth(st, b)
-      let ri = synth(rb.st, i)
-      let rv = synth(ri.st, v)
-      OneStmt { st: rv.st, stmt: SIndexAssign(rb.expr, ri.expr, rv.expr, line, col) }
+      let probe = synth(st, b)
+      let base_ty = apply_ty(probe.st.sub, probe.ty)
+      match base_ty {
+        TyCon("Map", _) -> {
+          let ri = synth(probe.st, i)
+          let rv = synth(ri.st, v)
+          diag_error(st.file, line, col,
+            "indexed write `m[k] := v` is not supported for `Map[K, V]` in v1")
+          diag_help("use `map_put(m, k, v)` and rebind; the v2 design lands alongside the HAMT carrier")
+          OneStmt { st: st_bump_err(rv.st), stmt: SExprStmt(probe.expr) }
+        }
+        _ -> {
+          let callee = mk_expr(EVar("array_set"), line, col)
+          let call_node = mk_expr(ECall(callee, [b, i, v]), line, col)
+          let rc = synth(st, call_node)
+          OneStmt { st: rc.st, stmt: SExprStmt(rc.expr) }
+        }
+      }
     }
     # m7b #5: `var name = init` — desugar pass not yet implemented.
     # The resolve pass (chk_stmt) already emits the explicit "not yet
@@ -28032,6 +28093,10 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_default_mutable_array_set(i8*, %KaiValue*, %KaiValue*, %KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_default_mutable_array_grow(i8*, %KaiValue*, %KaiValue*, %KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_default_random_int_range(i8*, %KaiValue*, %KaiValue*, i8*)\n",
+    # Clock default-handler wrappers (see stage0/runtime_llvm.c).
+    "declare %KaiValue* @kaix_default_clock_wall_now(i8*, i8*)\n",
+    "declare %KaiValue* @kaix_default_clock_monotonic_now(i8*, i8*)\n",
+    "declare %KaiValue* @kaix_default_clock_sleep_ns(i8*, %KaiValue*, i8*)\n",
     # net-tcp-v1 — default NetTcp handler wrappers (see
     # stage0/runtime_llvm.c).
     "declare %KaiValue* @kaix_default_nettcp_connect(i8*, %KaiValue*, %KaiValue*, i8*)\n",
@@ -29817,6 +29882,13 @@ fn llvm_default_builtin_decls(main_row: [String]) : String {
         "@_kai_default_random_name = private unnamed_addr constant [7 x i8] c\"Random\\00\"\n"
       ])
     } else { "" },
+    if list_has(main_row, "Clock") {
+      concat_all([
+        "@_kai_default_ev_clock = internal global %EvClock zeroinitializer\n",
+        "@_kai_default_node_clock = internal global [48 x i8] zeroinitializer\n",
+        "@_kai_default_clock_name = private unnamed_addr constant [6 x i8] c\"Clock\\00\"\n"
+      ])
+    } else { "" },
     if list_has(main_row, "NetTcp") {
       concat_all([
         "@_kai_default_ev_nettcp = internal global %EvNetTcp zeroinitializer\n",
@@ -29901,6 +29973,23 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
       "  call void @kaix_evidence_push(i8* %node_random_p, i8* getelementptr inbounds ([7 x i8], [7 x i8]* @_kai_default_random_name, i64 0, i64 0), i8* %ev_random_void)\n"
     ])
   } else { "" }
+  let clock_ = if list_has(main_row, "Clock") {
+    concat_all([
+      "  ; install Clock default handler\n",
+      "  %hid_clock = call i64 @kaix_fresh_handler_id()\n",
+      "  %ev_clock_hid_p = getelementptr %EvClock, %EvClock* @_kai_default_ev_clock, i32 0, i32 0\n",
+      "  store i64 %hid_clock, i64* %ev_clock_hid_p\n",
+      "  %ev_clock_wall_p = getelementptr %EvClock, %EvClock* @_kai_default_ev_clock, i32 0, i32 3\n",
+      "  store %KaiValue* (%EvClock*, %KaiCont*)* bitcast (%KaiValue* (i8*, i8*)* @kaix_default_clock_wall_now to %KaiValue* (%EvClock*, %KaiCont*)*), %KaiValue* (%EvClock*, %KaiCont*)** %ev_clock_wall_p\n",
+      "  %ev_clock_mono_p = getelementptr %EvClock, %EvClock* @_kai_default_ev_clock, i32 0, i32 4\n",
+      "  store %KaiValue* (%EvClock*, %KaiCont*)* bitcast (%KaiValue* (i8*, i8*)* @kaix_default_clock_monotonic_now to %KaiValue* (%EvClock*, %KaiCont*)*), %KaiValue* (%EvClock*, %KaiCont*)** %ev_clock_mono_p\n",
+      "  %ev_clock_sleep_p = getelementptr %EvClock, %EvClock* @_kai_default_ev_clock, i32 0, i32 5\n",
+      "  store %KaiValue* (%EvClock*, %KaiValue*, %KaiCont*)* bitcast (%KaiValue* (i8*, %KaiValue*, i8*)* @kaix_default_clock_sleep_ns to %KaiValue* (%EvClock*, %KaiValue*, %KaiCont*)*), %KaiValue* (%EvClock*, %KaiValue*, %KaiCont*)** %ev_clock_sleep_p\n",
+      "  %node_clock_p = getelementptr [48 x i8], [48 x i8]* @_kai_default_node_clock, i32 0, i32 0\n",
+      "  %ev_clock_void = bitcast %EvClock* @_kai_default_ev_clock to i8*\n",
+      "  call void @kaix_evidence_push(i8* %node_clock_p, i8* getelementptr inbounds ([6 x i8], [6 x i8]* @_kai_default_clock_name, i64 0, i64 0), i8* %ev_clock_void)\n"
+    ])
+  } else { "" }
   let nettcp_ = if list_has(main_row, "NetTcp") {
     concat_all([
       "  ; install NetTcp default handler (net-tcp-v1)\n",
@@ -29931,6 +30020,7 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
     stderr_,
     fail,
     random_,
+    clock_,
     nettcp_,
     mutable_,
     "  ret void\n",
@@ -29942,6 +30032,7 @@ fn llvm_emit_main_teardown_defaults(main_row: [String]) : String {
   let pops = concat_all([
     if list_has(main_row, "Mutable") { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "NetTcp")  { "  call void @kaix_evidence_pop()\n" } else { "" },
+    if list_has(main_row, "Clock")   { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Random")  { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Fail")    { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Stderr")  { "  call void @kaix_evidence_pop()\n" } else { "" },
