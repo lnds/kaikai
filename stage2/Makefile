@@ -907,7 +907,7 @@ test-stdlib: $(TARGET) build
 # C-emit + cc + run pipeline.
 test-stdlib-core-intrinsic: $(TARGET) build
 	@set -e; \
-	for mod in option result string char tuple; do \
+	for mod in option result string char tuple list; do \
 	  out=build/stdlib-core-$$mod.test.out; \
 	  cfile=build/stdlib-core-$$mod.test.c; \
 	  binfile=build/stdlib-core-$$mod.test.bin; \
