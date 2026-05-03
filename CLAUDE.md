@@ -208,22 +208,49 @@ Adjacent rules every agent must apply:
   workflow below). If CI fails, the agent fixes the failure on
   the same branch and pushes again; force-push is fine for
   lane branches that have not been reviewed yet.
-- **VERSION + CHANGELOG (agent side)**: do NOT bump the version
-  yourself. Add your closing-commit entry to `CHANGELOG.md` under
-  the existing `## [Unreleased]` section and **leave `VERSION`
-  untouched**. The integrator (the human merging the PR) assigns
-  the final version number after merge. This rule exists because
-  parallel lanes cannot know each other's order of merge: on
-  2026-04-29 three agents (PR #24 / #25 / #26) all asked for the
-  same `0.12.0` because each was opened against the same
-  baseline; the integrator had to bump them to 0.12.0 / 0.13.0 /
-  0.14.0 by hand. Leaving `VERSION` and the section header alone
-  in the PR avoids that work. The PR description may suggest the
-  *next* number, but treat it as advisory only.
+- **VERSION + CHANGELOG (agent side)**: do NOT touch
+  `CHANGELOG.md` and do NOT touch `VERSION`. Both are regenerated
+  by `cz bump` at release time from your commit messages — that
+  is the integrator's step (see "Integrator workflow" below).
+  Your contract is the **commit message format**, not the
+  changelog file. This rule replaces the prior "add an entry
+  under `## [Unreleased]`" rule retired 2026-05-02 when commitizen
+  (`cz`) automation landed; the rationale was that
+  per-agent CHANGELOG entries created mechanical conflicts on
+  every parallel-lane merge for zero added information beyond
+  the commit message itself.
+- **Commit messages — Conventional Commits**: every commit must
+  follow `<type>(<scope>)?: <subject>`. The `<type>` is one of:
+  - `feat` — new user-visible capability (lands in CHANGELOG
+    "Added").
+  - `fix` — bug fix (lands in CHANGELOG "Fixed").
+  - `perf` — performance change (lands in "Changed").
+  - `refactor` — code shape change with no behaviour change
+    (lands in "Changed").
+  - `docs` — documentation only (excluded from CHANGELOG).
+  - `chore` — repo housekeeping, deps, build config (excluded).
+  - `ci` — CI workflow changes (excluded).
+  - `test` — test-only changes (excluded).
+  - `build` — build-system changes (excluded).
+  Domain areas — `typer`, `runtime`, `perceus`, `emit`, `tco`,
+  `stdlib`, `demos`, `fmt`, `unbox`, `sigharness`, etc. — are
+  **scopes**, not types. Write `fix(typer): correct row
+  inference for nested handlers`, not `typer: correct row
+  inference for nested handlers`. The scope is what cz uses to
+  group the bullet under its area. The legacy bare-domain-prefix
+  style (`typer:`, `runtime:`, `perceus:` etc.) was retired
+  2026-05-02 and is invisible to cz.
+- **Breaking changes**: add `!` after the type/scope and a
+  `BREAKING CHANGE:` footer in the commit body. Example:
+  `feat(typer)!: drop implicit row defaulting` with body
+  `BREAKING CHANGE: programs that relied on implicit row
+  defaulting must add an explicit handler.`. cz reads the footer
+  to bump the major version (or minor while pre-1.0).
 
 - **Integrator workflow (post-CI)**: the integrator no longer
-  performs a local merge dance. Once tier1 is green on the PR, the
-  flow is:
+  performs a local merge dance, and as of 2026-05-02 no longer
+  hand-edits `VERSION` / `CHANGELOG.md`. Once tier1 is green on
+  the PR, the flow is:
 
       # 1. Merge via gh — gh creates the merge commit on GitHub.
       gh pr merge <N> --merge \
@@ -233,24 +260,27 @@ Adjacent rules every agent must apply:
       EOF
       )"
 
-      # 2. Release commit on main — promotes [Unreleased] and
-      # bumps VERSION. Goes direct to main (admin bypass on
-      # branch protection).
+      # 2. Release via cz — bumps VERSION, prepends a new
+      # changelog section from conventional commits since the
+      # last tag, and creates the v0.X.Y annotated tag.
       git pull --ff-only origin main
-      $EDITOR VERSION CHANGELOG.md   # bump + rename header
-      git add VERSION CHANGELOG.md
-      git commit -m "release: 0.X.Y — promote [Unreleased]"
-      git push origin main
+      cz changelog --dry-run | head -40   # eyeball the section
+      cz bump --yes                       # writes VERSION + CHANGELOG.md + tag
+      git push origin main --follow-tags
 
-  The release commit is its own commit, not bundled inside the
-  merge commit. There is a brief window (seconds) where main
-  has the new content under `[Unreleased]` and the old
-  `VERSION`; immaterial for an MVP-stage compiler. The
-  integrator decides the version number after seeing what
-  parallel lanes already took. The advantage over the prior
-  local-merge-dance: ~30s per merge instead of ~5–7 min, no
-  manual tier1 validation (CI did it), and the flow is
-  mechanizable — an agent can perform it given a brief.
+  cz reads `.cz.toml` (`change_type_map = { feat = "Added",
+  fix = "Fixed", … }`) and walks commits since the most recent
+  matching `v$version` tag. The bump rule is `feat → MINOR` and
+  `fix → PATCH` while `major_version_zero = true`; a commit with
+  `BREAKING CHANGE:` in its body bumps MINOR (still pre-1.0).
+  The integrator can edit the generated section before
+  committing if a release wants a hand-written narrative on top
+  of the bullet list — `cz bump --files-only` writes the diff
+  without committing it, leaving the door open. The advantage
+  over the prior hand-edit flow: zero merge conflicts on
+  `CHANGELOG.md` between parallel lanes (lanes never touch the
+  file), and the version number falls out mechanically from
+  commit types instead of being decided manually.
 - **`make daily` failures are diagnostics, not blockers.** Tier 0
   / Tier 1 already gated every commit, so `main` stays unbroken.
   A `daily` failure opens a lane the next morning; do not jam
