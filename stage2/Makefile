@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
 
 all: $(TARGET)
 
@@ -719,15 +719,15 @@ test-time: $(TARGET) build
 	  && echo "time OK" \
 	  || { echo "time DIFF"; diff ../examples/time/main.out.expected build/time.out; exit 1; }
 
-# m12.6.x #2 — interval propagation walker pinning. Compiles each
-# fixture under examples/intervals/ with `--dump-intervals` and
-# diffs the output against the golden. The walker is dead code as
-# far as user programs are concerned; the diff is what gives us
-# confidence the next sub-step (unifier reshape) reads correct
-# bounds.
+# m12.6.x #2 — interval propagation walker pinning. Only the
+# `basic.kai` fixture pins `--dump-intervals` output; the other
+# fixtures (alpha_equiv, operator_flip, call_site_*) target the
+# call-site analysis (Issue #83) and pin `--dump-call-elision` /
+# `--check` instead — see test-call-elision and test-call-elision-neg
+# below.
 test-intervals: $(TARGET) build
 	@set -e; \
-	for f in ../examples/intervals/*.kai; do \
+	for f in ../examples/intervals/basic.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
 	  ./$(TARGET) --dump-intervals $$f > build/iv-$$name.out 2>&1 \
@@ -736,6 +736,45 @@ test-intervals: $(TARGET) build
 	    && echo "intervals OK $$name" \
 	    || { echo "intervals DIFF $$name"; diff $$exp build/iv-$$name.out; exit 1; }; \
 	done
+
+# Issue #83 — call-site contract elision report. For each positive
+# fixture, run `--dump-call-elision` and diff against the golden.
+# The fixture set covers alpha-matching (alpha_equiv), operator
+# canonicalisation (operator_flip), literal call-site (call_site_literal),
+# refined-binding call-site (call_site_refined), and the unrefined
+# fall-through (call_site_unproven). The negative fixture lives in
+# test-call-elision-neg below.
+test-call-elision: $(TARGET) build
+	@set -e; \
+	for f in ../examples/intervals/alpha_equiv.kai \
+	         ../examples/intervals/operator_flip.kai \
+	         ../examples/intervals/call_site_literal.kai \
+	         ../examples/intervals/call_site_refined.kai \
+	         ../examples/intervals/call_site_unproven.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) --dump-call-elision $$f > build/ce-$$name.out 2>&1 \
+	    || { echo "call-elision FAIL $$name (kaic2 errored)"; cat build/ce-$$name.out; exit 1; }; \
+	  diff -q $$exp build/ce-$$name.out > /dev/null \
+	    && echo "call-elision OK $$name" \
+	    || { echo "call-elision DIFF $$name"; diff $$exp build/ce-$$name.out; exit 1; }; \
+	done
+
+# Issue #83 — negative call-site fixture. The caller's refinement
+# is strictly weaker than the callee's pre, so the typer rejects
+# it at compile time. The fixture pins stderr (and a non-zero exit)
+# via `kaic2 --check`.
+test-call-elision-neg: $(TARGET) build
+	@f=../examples/intervals/call_site_too_loose.kai; \
+	exp=$${f%.kai}.err.expected; \
+	./$(TARGET) --check $$f > build/ce-too-loose.out 2> build/ce-too-loose.err; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+	  echo "call-elision-neg FAIL too_loose (expected non-zero exit)"; exit 1; \
+	fi; \
+	diff -q $$exp build/ce-too-loose.err > /dev/null \
+	  && echo "call-elision-neg OK too_loose" \
+	  || { echo "call-elision-neg DIFF too_loose"; diff $$exp build/ce-too-loose.err; exit 1; }
 
 # m14-pre — stdlib/core/*.kai list-op smoke tests. Each fixture under
 # examples/stdlib/ is compiled with kaic2 + the full split core
@@ -2837,7 +2876,7 @@ test-unbox-llvm-bench: $(TARGET) build
 	  fi
 	@echo "unbox-llvm-bench OK (pure_chain inner loop lowers to raw i64; one boundary kaix_int; IR links cleanly)"
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -2846,7 +2885,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude
 
 clean:
 	rm -rf build $(TARGET)
