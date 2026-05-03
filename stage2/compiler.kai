@@ -46,6 +46,13 @@ type TokKind
   # specifically (instead of treating it as a comment) so the parser can
   # consume it as a prefix to a `type` declaration.
   | TkDerive
+  # m12.6.x #7: regex literal `/pattern/`, only emitted when the
+  # previous non-newline token is the identifier `matches` (the
+  # refinement-pure predicate). Outside that narrow context, `/` keeps
+  # its arithmetic meaning as TkSlash. The token's source span covers
+  # both delimiters so the parser can carve out the inner pattern with
+  # `tok_source` + `string_slice`.
+  | TkRegex
   # literals
   | TkInt | TkReal | TkChar | TkString
   # identifiers
@@ -98,6 +105,7 @@ fn tk_name(k: TokKind) : String {
     TkTest -> "test" TkTrue -> "true" TkType -> "type"
     TkUnitKw -> "unit" TkUse -> "use" TkVar -> "var" TkWhere -> "where" TkWith -> "with"
     TkDerive -> "#derive"
+    TkRegex -> "REGEX"
     TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
     TkIdent -> "IDENT" TkUnderscore -> "_"
     TkLparen -> "(" TkRparen -> ")" TkLbracket -> "[" TkRbracket -> "]"
@@ -470,6 +478,58 @@ fn lex_string(l: Lexer) : LexStep {
 }
 
 # ====================================================================
+# regex literals (m12.6.x #7)
+# ====================================================================
+#
+# Elixir-style sigil: `~r/pattern/` lexes as a single `TkRegex` token
+# whose source span covers the full sigil including delimiters. The
+# `~` route in `lex_punct` handles the prefix; this helper takes
+# over once the cursor is positioned at the opening `/`. Because
+# the prefix is unambiguous, `/` keeps its arithmetic meaning
+# everywhere else — no contextual lookback in the lexer, no parser
+# backtracking.
+#
+# Pattern body rules: any byte except an unescaped `/` or unescaped
+# newline; `\` escapes the next byte; inside `[...]` a `/` is a
+# literal class element, not a terminator (mirrors JS / Pony / Perl
+# regex literal lexing).
+
+fn lex_regex(l: Lexer, sl: Int, sc: Int, start: Int) : LexStep {
+  let l1 = lex_advance(l)                  # consume opening /
+  match lex_regex_body(l1, false) {
+    StrOk(l2) -> Step(l2, tok(TkRegex, sl, sc, start, l2.pos))
+    StrErr(l2, msg) -> Step(l2, tok(TkError(msg), sl, sc, start, l2.pos))
+  }
+}
+
+# `in_class` is true when the cursor is inside a `[...]` character
+# class, where `/` and `]` swap their meaning relative to the outer
+# state.
+fn lex_regex_body(l: Lexer, in_class: Bool) : StrResult {
+  match lex_peek(l) {
+    None -> StrErr(l, "unterminated regex literal")
+    Some(c) -> {
+      if c == '\\' {
+        let l1 = lex_advance(l)
+        match lex_peek(l1) {
+          None -> StrErr(l1, "unterminated regex literal")
+          Some(_) -> lex_regex_body(lex_advance(l1), in_class)
+        }
+      } else if c == '\n' {
+        StrErr(l, "unterminated regex literal (newline before closing `/`)")
+      } else if in_class {
+        if c == ']' { lex_regex_body(lex_advance(l), false) }
+        else { lex_regex_body(lex_advance(l), true) }
+      } else {
+        if c == '/' { StrOk(lex_advance(l)) }
+        else if c == '[' { lex_regex_body(lex_advance(l), true) }
+        else { lex_regex_body(lex_advance(l), false) }
+      }
+    }
+  }
+}
+
+# ====================================================================
 # char literals
 # ====================================================================
 
@@ -661,6 +721,23 @@ fn lex_punct(l: Lexer) : LexStep {
         # immediately followed by `derive` and a non-alphanumeric tail.
         let l_end = lex_advance_n(l1, 6)
         Step(l_end, tok(TkDerive, sl, sc, start, l_end.pos))
+      }
+      else if c == '~' {
+        # m12.6.x #7: Elixir-style sigils. Currently only `~r/pattern/`
+        # is recognised — opens a regex literal that lexes as a single
+        # `TkRegex` token spanning `~r/.../`. The sigil family is
+        # designed for future growth (`~s`, `~w`, etc.) but those
+        # require their own runtime carriers and are out of scope
+        # for this lane. Anything other than `~r` followed by a
+        # delimiter falls through as an error so tildes don't silently
+        # turn into a junk-drawer prefix.
+        if lex_peek_is(l1, 'r') and lex_peek_at(l1, 1) == Some('/') {
+          let l_r = lex_advance(l1)            # consume `r`
+          lex_regex(l_r, sl, sc, start)
+        } else {
+          let msg = string_concat("unexpected character '~' (only `~r/.../` regex sigil is supported)", "")
+          Step(l1, tok(TkError(msg), sl, sc, start, l1.pos))
+        }
       }
       else {
         let msg = string_concat("unexpected character '", string_concat("#{c}", "'"))
@@ -1524,6 +1601,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkTodoBang   -> match b { TkTodoBang -> true _ -> false }
     TkPlusPlus   -> match b { TkPlusPlus -> true _ -> false }
     TkDerive     -> match b { TkDerive -> true _ -> false }
+    TkRegex      -> match b { TkRegex -> true _ -> false }
     TkError(_)   -> false
   }
 }
@@ -2406,6 +2484,7 @@ fn parse_primary(p: Parser) : PExpr {
     TkHole -> ok_e(p_advance(p), mk_expr(EHole(None), t.line, t.col))
     TkHoleName(nm) -> ok_e(p_advance(p), mk_expr(EHole(Some(nm)), t.line, t.col))
     TkTodoBang -> parse_todo_bang(p, t)
+    TkRegex -> parse_regex_sigil(p, t)
     TkIdent -> parse_ident_primary(p, t)
     TkLparen -> parse_paren_or_lambda(p, t)
     TkLbracket -> parse_list_or_range(p, t)
@@ -2847,6 +2926,71 @@ fn parse_ensure_primary(p: Parser, t: Token) : PExpr {
           }
         }
       }
+    }
+  }
+}
+
+# m12.6.x #7: parse a `~r/pattern/` sigil token into an expression.
+# The lexer has already validated the delimiter shape and stored the
+# full sigil source span on the token. We desugar to a runtime call
+# `regex_compile_or_panic("<pattern>")` whose result is a `Regex`
+# value — meaning `~r/pat/` works as a first-class expression in any
+# position, not just inside refinement predicates.
+#
+# The pattern body is wrapped as a kaikai string literal with two
+# byte-level escapes (`\` -> `\\`, `"` -> `\"`) so the post-decode
+# bytes match the regex source verbatim. v1 forbids `#` in the body
+# because it would collide with kaikai's `#{...}` string
+# interpolation; users wanting `#` in v1 can build the regex via
+# `regex_compile` directly.
+fn parse_regex_sigil(p: Parser, t: Token) : PExpr {
+  let span = tok_source(p.src, t)
+  let n = string_length(span)
+  # Span shape: `~r/pattern/`. Strip the 3-char prefix `~r/` and the
+  # trailing `/`. The lexer guarantees both delimiters are present
+  # (otherwise it emitted TkError, never TkRegex).
+  let pattern = string_slice(span, 3, n - 4)
+  if regex_pattern_has_hash(pattern, 0, string_length(pattern)) {
+    err_e(p_error_here(p,
+      "regex sigil contains `#`, which v1 forbids (would collide with kaikai string interpolation); use `regex_compile` directly for patterns containing `#`"))
+  } else {
+    let escaped = regex_pattern_to_kai_str_body(pattern, 0, string_length(pattern), "")
+    let str_span = concat_all(["\"", escaped, "\""])
+    let pat_str = mk_expr(EStr(str_span, false), t.line, t.col)
+    let callee = mk_expr(EVar("regex_compile_or_panic"), t.line, t.col)
+    let call = mk_expr(ECall(callee, [pat_str]), t.line, t.col)
+    ok_e(p_advance(p), call)
+  }
+}
+
+# Walk the regex pattern body byte-by-byte, escaping the two
+# characters that have a load-bearing meaning inside a kaikai
+# string literal: `\` (escape introducer) and `"` (terminator).
+# Every other byte passes through verbatim — including bytes that
+# would be metacharacters at the regex level. The result is the
+# *body* of a kaikai string literal; the caller wraps it in `"..."`.
+fn regex_pattern_to_kai_str_body(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        let piece =
+          if c == '\\' { "\\\\" }
+          else if c == '"' { "\\\"" }
+          else { "#{c}" }
+        regex_pattern_to_kai_str_body(s, i + 1, n, string_concat(acc, piece))
+      }
+    }
+  }
+}
+
+fn regex_pattern_has_hash(s: String, i: Int, n: Int) : Bool {
+  if i >= n { false }
+  else {
+    match char_at(s, i) {
+      None -> false
+      Some(c) -> if c == '#' { true } else { regex_pattern_has_hash(s, i + 1, n) }
     }
   }
 }
@@ -4283,14 +4427,60 @@ fn parse_optional_refinement(base: PTy) : PTy {
 # the LHS so that `where >= 0` desugars to `self >= 0`. Validation that
 # the resulting Expr lies in the decidable subset is the typer's job
 # (m12.6.b).
+#
+# m12.6.x #7: a second receiver-elision sugar — `where matches <expr>`
+# desugars to `matches(self, <expr>)`. This is the refinement-side
+# counterpart to the regex sigil: typical use is `String where matches
+# ~r/^[a-z]+$/`. The desugar applies whenever the predicate begins
+# with the bare identifier `matches` and the next non-`(` token is an
+# expression starter — that excludes `matches(s, p)` (an explicit
+# call) and `matches.field` (a member access on a value bound to
+# `matches`), so user code that already names a function `matches` is
+# unaffected.
 fn parse_refinement_predicate(p: Parser, line: Int, col: Int) : PExpr {
   let t = p_peek(p)
   if is_cmp_token(t.kind) {
     let lhs = mk_expr(EVar("self"), line, col)
     parse_refinement_cmp_with(p, lhs, line, col)
+  } else if is_matches_sugar_start(p, t) {
+    parse_refinement_matches_with(p, t, line, col)
   } else {
     parse_expr(p)
   }
+}
+
+fn is_matches_sugar_start(p: Parser, t: Token) : Bool {
+  if not tk_is(t.kind, TkIdent) { false }
+  else if tok_source(p.src, t) != "matches" { false }
+  else { refinement_matches_sugar_at(p_advance(p)) }
+}
+
+fn parse_refinement_matches_with(p: Parser, t: Token, line: Int, col: Int) : PExpr {
+  let p1 = p_advance(p)
+  let rhs = parse_expr(p1)
+  match rhs.r {
+    None -> rhs
+    Some(rv) -> {
+      let self_e = mk_expr(EVar("self"), line, col)
+      let callee = mk_expr(EVar("matches"), t.line, t.col)
+      let call = mk_expr(ECall(callee, [self_e, rv]), t.line, t.col)
+      PExpr { p: rhs.p, r: Some(call) }
+    }
+  }
+}
+
+# True when the token after `matches` looks like the start of an
+# expression argument (rather than `(` — which signals an explicit
+# call — or `.` — a member access on a value named `matches`). Used
+# to gate the `where matches <expr>` receiver-elision sugar.
+fn refinement_matches_sugar_at(p: Parser) : Bool {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkLparen) { false }
+  else if tk_is(t.kind, TkDot) { false }
+  else if tk_is(t.kind, TkRegex) { true }
+  else if tk_is(t.kind, TkIdent) { true }
+  else if tk_is(t.kind, TkString) { true }
+  else { false }
 }
 
 fn is_cmp_token(k: TokKind) : Bool {
@@ -4981,7 +5171,14 @@ fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts {
 # prelude list below is the entirety of the allowed call surface.
 fn refinement_pure_names() : [String] = [
   "is_some", "is_none", "is_finite", "is_nan",
-  "string_length", "list_length", "matches"
+  "string_length", "list_length",
+  # m12.6.x #7: `matches` is the refinement-side regex predicate;
+  # `regex_compile_or_panic` is the runtime carrier the parser
+  # desugars `~r/.../` sigils into. Both are predicate-pure: the
+  # compile is deterministic in the pattern, and a parse-failure
+  # panics rather than returning, so the refinement either evaluates
+  # or aborts the program — never observes a half-state.
+  "matches", "regex_compile_or_panic"
 ]
 
 # Walk an Expr looking for the first ECall whose callee is an EVar

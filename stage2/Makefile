@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
 
 all: $(TARGET)
 
@@ -882,6 +882,36 @@ test-stdlib-crypto-asan: $(TARGET) build
 	diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
 	  && echo "stdlib-crypto-asan OK $$name" \
 	  || { echo "stdlib-crypto-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }
+
+# Issue #85 — regex_predicate_basic under ASAN+UBSan. The
+# refinement-side regex path goes through three RC-sensitive shapes
+# in one fixture: the `~r/.../` sigil's compile-time-built pattern
+# string, the `Regex` carrier value crossing the `matches` call
+# boundary, and the synthesised `__ref_pred_Slug` fn dispatching
+# through a match-arm narrowing guard. The runtime has no Perceus
+# discipline yet (cf. `project_emitter_no_rc_discipline`), so a
+# regression that double-frees the pattern string or leaks the
+# compiled NFA would surface here first.
+test-stdlib-regex-predicate-asan: $(TARGET) build
+	@set -e; \
+	name=regex_predicate_basic; \
+	./$(TARGET) $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	  ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
+	  || { echo "stdlib-regex-predicate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
+	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	      -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
+	  || { echo "stdlib-regex-predicate-asan FAIL $$name (cc errored)"; exit 1; }; \
+	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	  ./build/stdlib-$$name-asan-c > build/stdlib-$$name-asan.out 2> build/stdlib-$$name-asan.err; \
+	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/stdlib-$$name-asan.err; then \
+	  echo "stdlib-regex-predicate-asan FAIL $$name — sanitizer diagnostic:"; \
+	  cat build/stdlib-$$name-asan.err; exit 1; \
+	fi; \
+	diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
+	  && echo "stdlib-regex-predicate-asan OK $$name" \
+	  || { echo "stdlib-regex-predicate-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }
 
 # Typed holes (M10): every example under examples/holes/ must
 # (a) produce a --holes report with at least one "type hole" entry,

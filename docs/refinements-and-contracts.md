@@ -16,11 +16,18 @@ two.**
 ### Refinement types — restrict the valid values of a type
 
 ```kai
-type CurrencyCode = String where matches /^[A-Z]{3}$/
+type CurrencyCode = String where matches ~r/^[A-Z]{3}$/
 type NonNegative  = Int    where >= 0
 type Percent      = Real   where 0.0 <= self <= 1.0
 type Port         = Int    where 1 <= self <= 65535
 ```
+
+Regex predicates use the `~r/.../` sigil (Elixir-style — `~r`
+followed by a delimiter pair). The sigil is an expression in its
+own right (typed `Regex`); `where matches ~r/.../` desugars to
+`matches(self, ~r/.../)`, mirroring the `where >= 0` →
+`self >= 0` receiver-elision sugar already familiar from numeric
+predicates.
 
 A refinement type is `BaseType where Predicate(self)`. The
 predicate references `self` — the value being constrained.
@@ -184,8 +191,8 @@ that UoM enables extends naturally: refinement types add value
 constraints to those brands.
 
 ```kai
-type Email     = String where matches /^[^@]+@[^@]+\.[^@]+$/
-type UserId    = String where matches /^u_[a-zA-Z0-9]{16}$/
+type Email     = String where matches ~r/^[^@]+@[^@]+\.[^@]+$/
+type UserId    = String where matches ~r/^u_[a-zA-Z0-9]{16}$/
 type Sanitized = String where ... # post-sanitiser invariant
 
 fn send_welcome(email: Email, name: String<Sanitized>) : Unit / Net = ...
@@ -206,7 +213,7 @@ referencing the value.
 
 ```kai
 type Port         = Int    where 1 <= self <= 65535
-type CurrencyCode = String where matches /^[A-Z]{3}$/
+type CurrencyCode = String where matches ~r/^[A-Z]{3}$/
 type NonNegative  = Int    where self >= 0    # self explicit
 type NonNegative2 = Int    where >= 0         # self elided (unary comparison)
 ```
@@ -260,7 +267,8 @@ Allowed:
 - Field access on records (`acc.balance`).
 - Prelude predicates marked `[<refinement-pure>]`: `is_finite`,
   `is_nan`, `length` (on lists/strings), `is_some`, `is_none`,
-  string `matches /regex/`.
+  string `matches ~r/regex/` (regex literals lex as the
+  Elixir-style sigil `~r/.../`; full-match semantics).
 - Arithmetic operations between constants and refined values
   (so the typer can interval-propagate).
 
@@ -435,9 +443,9 @@ catches it before any caller observes the broken state.
 ### Domain types throughout an app
 
 ```kai
-type Email      = String where matches /^[^@\s]+@[^@\s]+\.[^@\s]+$/
-type Username   = String where matches /^[a-z][a-z0-9_]{2,31}$/
-type IPv4       = String where matches /^\d{1,3}(\.\d{1,3}){3}$/
+type Email      = String where matches ~r/^[^@\s]+@[^@\s]+\.[^@\s]+$/
+type Username   = String where matches ~r/^[a-z][a-z0-9_]{2,31}$/
+type IPv4       = String where matches ~r/^\d{1,3}(\.\d{1,3}){3}$/
 type HttpStatus = Int    where 100 <= self < 600
 type SafeAge    = Int    where 0 <= self <= 150
 
@@ -695,10 +703,12 @@ What is **not** done yet (deferred from the original plan):
 - **Compile-time errors for trivially-false predicates.** The
   const folder sees `assert false` but emits the runtime assert
   anyway; promoting to a compile-time diagnostic is a future pass.
-- **Regex predicates** (`String where matches /.../`). The grammar
-  accepts arbitrary Expr in the `where` clause, so a regex literal
-  is rejected by the standard expression parser. Adding regex
-  literals is a separate feature.
+- **Regex predicate subsumption.** Regex literals lex + parse +
+  evaluate at runtime via the `~r/.../` sigil + `matches` predicate
+  (m12.6.x #7 lane, 2026-05-03). Static *containment* — proving
+  `String where matches ~r/^[a-z]+$/` ⊑ `String where matches
+  ~r/^[a-z0-9]+$/` at the typer level — is the remaining piece and
+  follows the same trajectory as numeric interval subsumption.
 
 The honest one-line summary: kaikai now has the **syntax** and the
 **runtime semantics** of refinements + contracts. The **type-level
