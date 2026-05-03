@@ -178,6 +178,7 @@ KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_op_fie
 /* Full prelude set — anything the compiler (stage 2's own source)
    calls directly when compiled through the LLVM backend. */
 KaiValue *kaix_prelude_args(void)                           { return kai_prelude_args(); }
+KaiValue *kaix_prelude_program_name(void)                   { return kai_prelude_program_name(); }
 KaiValue *kaix_prelude_exit(KaiValue *v)                    { return kai_prelude_exit(v); }
 /* kaix_prelude_panic is defined above near kaix_match_panic. */
 KaiValue *kaix_prelude_read_file(KaiValue *p)               { return kai_prelude_read_file(p); }
