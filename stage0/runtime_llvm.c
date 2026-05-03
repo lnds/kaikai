@@ -306,6 +306,18 @@ KaiValue *kaix_default_random_int_range(void *self, KaiValue *lo, KaiValue *hi, 
     return kai_default_random_int_range(self, lo, hi, k);
 }
 
+/* Clock default handler — LLVM-visible wrappers around the static
+ * Clock default handlers in runtime.h. */
+KaiValue *kaix_default_clock_wall_now(void *self, KaiCont *k) {
+    return kai_default_clock_wall_now(self, k);
+}
+KaiValue *kaix_default_clock_monotonic_now(void *self, KaiCont *k) {
+    return kai_default_clock_monotonic_now(self, k);
+}
+KaiValue *kaix_default_clock_sleep_ns(void *self, KaiValue *ns, KaiCont *k) {
+    return kai_default_clock_sleep_ns(self, ns, k);
+}
+
 /* net-tcp-v1 — LLVM-visible wrappers around the static NetTcp
  * default handlers in runtime.h. The LLVM emitter installs these
  * by name from `kai_main_install_defaults`. */

@@ -118,7 +118,7 @@ while IFS=$'\t' read -r doc heading; do
   fi
 
   found=0
-  for fx in examples/effects/*.kai examples/holes/*.kai examples/sugars/*.kai; do
+  for fx in examples/effects/*.kai examples/holes/*.kai examples/sugars/*.kai examples/stdlib/*.kai; do
     [ -f "$fx" ] || continue
     # Look in the comment block (first 30 lines) and in the filename.
     if head -30 "$fx" 2>/dev/null | grep -iq "$longest" \

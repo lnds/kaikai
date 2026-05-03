@@ -2816,6 +2816,76 @@ static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue
 }
 
 /* =================================================================
+ * Clock default handler
+ * =================================================================
+ *
+ * Spec: docs/effects-stdlib.md §`Clock`. Three ops:
+ *   wall_now()       -> WallTime { secs, nanos } via CLOCK_REALTIME
+ *   monotonic_now()  -> Instant  { secs, nanos } via CLOCK_MONOTONIC
+ *   sleep_ns(ns)     -> Unit     via nanosleep
+ *
+ * v1 sleep blocks the OS thread; the m8 v1 inline-eager scheduler has
+ * no cooperative yield to deliver `Cancel` mid-sleep. Once m8.x ships
+ * the cooperative scheduler, this handler upgrades to register the
+ * fiber on a timer wheel and yield through `Spawn.yield`. Tracked in
+ * the m8.x follow-up.
+ *
+ * Field names ("secs", "nanos") are load-bearing: kai_op_field reads
+ * the slot by strcmp on the name pointer's contents, so the static
+ * cstrings here must match the kaikai-side `WallTime` / `Instant`
+ * declarations in stdlib/time.kai exactly. */
+static KaiValue *_kai_clock_make_record(int64_t secs, int64_t nanos) {
+    KaiValue *secs_kv  = kai_int(secs);
+    KaiValue *nanos_kv = kai_int(nanos);
+    KaiValue *fields[2] = { secs_kv, nanos_kv };
+    static const char *names[2] = { "secs", "nanos" };
+    return kai_record(2, fields, names);
+}
+
+static KaiValue *kai_default_clock_wall_now(void *self, KaiCont *k) {
+    (void) self;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        fprintf(stderr, "kai: Clock.wall_now: clock_gettime failed: %s\n",
+                strerror(errno));
+        exit(1);
+    }
+    return kai_cont_resume(k, _kai_clock_make_record(
+        (int64_t) ts.tv_sec, (int64_t) ts.tv_nsec));
+}
+
+static KaiValue *kai_default_clock_monotonic_now(void *self, KaiCont *k) {
+    (void) self;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        fprintf(stderr, "kai: Clock.monotonic_now: clock_gettime failed: %s\n",
+                strerror(errno));
+        exit(1);
+    }
+    return kai_cont_resume(k, _kai_clock_make_record(
+        (int64_t) ts.tv_sec, (int64_t) ts.tv_nsec));
+}
+
+static KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiCont *k) {
+    (void) self;
+    int64_t ns_v = (ns && ns->tag == KAI_INT) ? ns->as.i : 0;
+    if (ns_v > 0) {
+        struct timespec req;
+        req.tv_sec  = (time_t) (ns_v / 1000000000LL);
+        req.tv_nsec = (long)   (ns_v % 1000000000LL);
+        struct timespec rem;
+        /* Loop on EINTR so a stray signal doesn't shorten the sleep.
+         * v1 is not Cancel-aware (m8.x scope) — Cancel-delivered while
+         * a fiber sleeps will be observed only after wake-up. */
+        while (nanosleep(&req, &rem) != 0) {
+            if (errno != EINTR) break;
+            req = rem;
+        }
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* =================================================================
  * NetTcp default handler (net-tcp-v1)
  * =================================================================
  *
