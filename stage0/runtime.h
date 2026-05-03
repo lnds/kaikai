@@ -1904,6 +1904,16 @@ static KaiValue *kai_prelude_args(void) {
     return acc;
 }
 
+/* Issue #127: argv[0] as a kaikai String. Mirrors `kai_prelude_args`
+ * in routing through the `kai_g_argv` snapshot installed by
+ * `kai_set_args` at process entry. Returns the empty string when
+ * argv was never captured (unit tests linking the runtime without
+ * a generated `int main` wrapper) — leaves the surface total. */
+static KaiValue *kai_prelude_program_name(void) {
+    if (kai_g_argv == NULL || kai_g_argv[0] == NULL) return kai_str("");
+    return kai_str(kai_g_argv[0]);
+}
+
 /* ---------- prelude: mailbox runtime (m8 #7) ---------- */
 
 /* User code reaches the mailbox runtime through these prelude
@@ -2286,6 +2296,7 @@ static KaiValue *_kai_prelude_filter_thunk(KaiValue *s, KaiValue **a, int n)    
 static KaiValue *_kai_prelude_reduce_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_reduce(a[0], a[1], a[2]); }
 static KaiValue *_kai_prelude_each_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_prelude_each(a[0], a[1]); }
 static KaiValue *_kai_prelude_args_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) a; (void) n; return kai_prelude_args(); }
+static KaiValue *_kai_prelude_program_name_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_prelude_program_name(); }
 static KaiValue *_kai_prelude_read_file_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_read_file(a[0]); }
 static KaiValue *_kai_prelude_write_file_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_write_file(a[0], a[1]); }
 static KaiValue *_kai_prelude_read_line_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) a; (void) n; return kai_prelude_read_line(); }
@@ -2705,6 +2716,103 @@ static KaiValue *kai_default_env_var(void *self, KaiValue *name, KaiCont *k) {
     KaiValue *s = kai_str(got);
     KaiValue *some = kai_variant(0, "Some", 1, &s);
     return kai_cont_resume(k, some);
+}
+
+/* Issue #127: Env write side + full block enumeration. POSIX
+ * `setenv(name, value, 1)` copies its arguments into libc-owned
+ * storage on both glibc and Apple libc, so the local stack buffers
+ * here are safe to release on return — no buffer-ownership leak
+ * across the FFI boundary. Errors lift `strerror(errno)` into a
+ * fresh `Err(String)`. `vars()` walks the POSIX `environ` array,
+ * splitting each `KEY=VALUE` entry into a `Pair { fst, snd }` so
+ * the surface type lines up with `[(String, String)]`. */
+extern char **environ;
+
+static KaiValue *kai_default_env_set_var(void *self, KaiValue *name,
+                                          KaiValue *value, KaiCont *k) {
+    (void) self;
+    if (!name || name->tag != KAI_STR || !value || value->tag != KAI_STR) {
+        KaiValue *m = kai_str("set_var: name and value must be Strings");
+        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        return kai_cont_resume(k, err);
+    }
+    char nbuf[1024];
+    size_t nlen = name->as.s.len < sizeof(nbuf) - 1 ? name->as.s.len : sizeof(nbuf) - 1;
+    memcpy(nbuf, name->as.s.bytes, nlen);
+    nbuf[nlen] = '\0';
+    /* setenv copies value too; an arbitrarily-long content string can
+     * outgrow the stack buffer, so heap-dup once and free after the
+     * call returns. */
+    char *vbuf = (char *) malloc(value->as.s.len + 1);
+    if (!vbuf) {
+        KaiValue *m = kai_str("set_var: out of memory");
+        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        return kai_cont_resume(k, err);
+    }
+    if (value->as.s.len > 0) memcpy(vbuf, value->as.s.bytes, value->as.s.len);
+    vbuf[value->as.s.len] = '\0';
+    int rc = setenv(nbuf, vbuf, 1);
+    int saved_errno = errno;
+    free(vbuf);
+    if (rc != 0) {
+        const char *msg = strerror(saved_errno);
+        if (!msg) msg = "set_var failed";
+        KaiValue *m = kai_str(msg);
+        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        return kai_cont_resume(k, err);
+    }
+    KaiValue *u = kai_unit();
+    KaiValue *ok = kai_variant(0, "Ok", 1, &u);
+    return kai_cont_resume(k, ok);
+}
+
+static KaiValue *kai_default_env_unset_var(void *self, KaiValue *name, KaiCont *k) {
+    (void) self;
+    if (!name || name->tag != KAI_STR) {
+        KaiValue *m = kai_str("unset_var: name must be a String");
+        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        return kai_cont_resume(k, err);
+    }
+    char nbuf[1024];
+    size_t nlen = name->as.s.len < sizeof(nbuf) - 1 ? name->as.s.len : sizeof(nbuf) - 1;
+    memcpy(nbuf, name->as.s.bytes, nlen);
+    nbuf[nlen] = '\0';
+    if (unsetenv(nbuf) != 0) {
+        const char *msg = strerror(errno);
+        if (!msg) msg = "unset_var failed";
+        KaiValue *m = kai_str(msg);
+        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        return kai_cont_resume(k, err);
+    }
+    KaiValue *u = kai_unit();
+    KaiValue *ok = kai_variant(0, "Ok", 1, &u);
+    return kai_cont_resume(k, ok);
+}
+
+static KaiValue *kai_default_env_vars(void *self, KaiCont *k) {
+    (void) self;
+    /* Build the list head-down via list_append so the surface order
+     * matches the libc enumeration order (first entry of `environ`
+     * appears as head). cons-then-reverse would also work; this
+     * shape mirrors how `kai_prelude_args` walks argv. */
+    KaiValue *acc = kai_nil();
+    int count = 0;
+    for (char **ep = environ; ep && *ep; ++ep) ++count;
+    for (int i = count - 1; i >= 0; --i) {
+        const char *entry = environ[i];
+        if (!entry) continue;
+        const char *eq = strchr(entry, '=');
+        size_t name_len  = eq ? (size_t) (eq - entry) : strlen(entry);
+        const char *vstart = eq ? eq + 1 : "";
+        size_t value_len = eq ? strlen(vstart) : 0;
+        KaiValue *name_kv  = kai_str_from_bytes(entry, name_len);
+        KaiValue *value_kv = kai_str_from_bytes(vstart, value_len);
+        KaiValue *fields[2] = { name_kv, value_kv };
+        static const char *names[2] = { "fst", "snd" };
+        KaiValue *pair = kai_record(2, fields, names);
+        acc = kai_cons(pair, acc);
+    }
+    return kai_cont_resume(k, acc);
 }
 
 /* m7a #7: default File handlers. Both reuse the prelude helpers

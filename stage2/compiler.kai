@@ -6877,6 +6877,7 @@ fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env {
 fn prelude_names() : [String] {
   [
     "print", "eprint", "read_file", "write_file", "read_line", "args",
+    "program_name",
     "exit", "panic",
     "int_to_string", "real_to_string", "string_to_int", "string_to_real",
     "int_to_real", "real_to_int",
@@ -7852,6 +7853,12 @@ fn prelude_table() : [EPrelude] {
     EP("reduce",           "kai_prelude_reduce",           3),
     EP("each",             "kai_prelude_each",             2),
     EP("args",             "kai_prelude_args",             0),
+    # Issue #127: argv[0] as a flat prelude (path (a) in the issue
+    # body, mirroring how `args()` is also a prelude even though
+    # `Env.args()` exists as an op). `stdlib/os/args.kai` re-exports
+    # this as `program_name()` so the dotted-call surface stays
+    # uniform with the rest of `os.args`.
+    EP("program_name",     "kai_prelude_program_name",     0),
     EP("read_file",        "kai_prelude_read_file",        1),
     EP("write_file",       "kai_prelude_write_file",       2),
     EP("read_line",        "kai_prelude_read_line",        0),
@@ -11964,6 +11971,18 @@ fn default_env_shims() : String =
     "}\n",
     "static KaiValue *_kai_default_env_var_shim(EvEnv *self, KaiValue *kai_name, KaiCont *k) {\n",
     "    return kai_default_env_var(self, kai_name, k);\n",
+    "}\n",
+    # Issue #127: write side + full block enumeration. Same EvEnv*
+    # / KaiCont* shape as the existing args/var shims so the typed
+    # dispatch table stays UBSan-clean.
+    "static KaiValue *_kai_default_env_set_var_shim(EvEnv *self, KaiValue *kai_name, KaiValue *kai_value, KaiCont *k) {\n",
+    "    return kai_default_env_set_var(self, kai_name, kai_value, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_env_unset_var_shim(EvEnv *self, KaiValue *kai_name, KaiCont *k) {\n",
+    "    return kai_default_env_unset_var(self, kai_name, k);\n",
+    "}\n",
+    "static KaiValue *_kai_default_env_vars_shim(EvEnv *self, KaiCont *k) {\n",
+    "    return kai_default_env_vars(self, k);\n",
     "}\n"
   ])
 
@@ -11972,8 +11991,11 @@ fn default_env_setup() : String =
     "    static EvEnv _kai_default_ev_env;\n",
     "    static KaiEvidence _kai_default_node_env;\n",
     "    _kai_default_ev_env.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_env.args = &_kai_default_env_args_shim;\n",
-    "    _kai_default_ev_env.var  = &_kai_default_env_var_shim;\n",
+    "    _kai_default_ev_env.args      = &_kai_default_env_args_shim;\n",
+    "    _kai_default_ev_env.var       = &_kai_default_env_var_shim;\n",
+    "    _kai_default_ev_env.set_var   = &_kai_default_env_set_var_shim;\n",
+    "    _kai_default_ev_env.unset_var = &_kai_default_env_unset_var_shim;\n",
+    "    _kai_default_ev_env.vars      = &_kai_default_env_vars_shim;\n",
     "    kai_evidence_push(&_kai_default_node_env, \"Env\", &_kai_default_ev_env);\n"
   ])
 
@@ -17159,6 +17181,9 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "print",          scheme: mono(fn_ty([TyString], TyUnit)) },
     TyEntry { name: "eprint",         scheme: mono(fn_ty([TyString], TyUnit)) },
     TyEntry { name: "args",           scheme: mono(fn_ty([], list_ty(TyString))) },
+    # Issue #127: argv[0] as a flat prelude. Total — empty string
+    # when the runtime hasn't seen `kai_set_args` yet.
+    TyEntry { name: "program_name",   scheme: mono(fn_ty([], TyString)) },
     TyEntry { name: "read_file",      scheme: mono(fn_ty([TyString], TyCon("Result", [TyString, TyString]))) },
     TyEntry { name: "write_file",     scheme: mono(fn_ty([TyString, TyString], TyCon("Result", [TyUnit, TyString]))) },
     TyEntry { name: "read_line",      scheme: mono(fn_ty([], TyCon("Result", [TyString, TyString]))) },
@@ -28089,6 +28114,7 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_record(i32, %KaiValue**, i8**)\n",
     "declare %KaiValue* @kaix_field(%KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_prelude_args()\n",
+    "declare %KaiValue* @kaix_prelude_program_name()\n",
     "declare %KaiValue* @kaix_prelude_exit(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_panic_fn(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_panic(%KaiValue*)\n",
@@ -28440,6 +28466,7 @@ fn llvm_prelude_table() : [LlvmPrelude] {
     LP("list_length",      1, None),
     LP("list_reverse",     1, None),
     LP("args",             0, None),
+    LP("program_name",     0, None),
     LP("exit",             1, None),
     LP("panic",            1, None),
     LP("read_file",        1, None),
@@ -36480,6 +36507,19 @@ fn ty_result_string_string_zero() : TypeExpr =
 fn ty_result_unit_string_zero() : TypeExpr =
   ty_named_zero("Result", [ty_name_zero("Unit"), ty_name_zero("String")])
 
+# Issue #127: kaikai's `Result[e, a]` is Err-first / Ok-second
+# (see add_builtin_variant_sigs above and the divergence note on
+# builtin_nettcp_decl). For ops where success returns `Unit` and
+# failure returns a `String` error message, the typer-correct
+# decl is `Result[String, Unit]`. This helper exists so the
+# Env write-side ops (`set_var`, `unset_var`) read naturally as
+# `Ok(())` / `Err(msg)` in user code, matching the runtime
+# contract. Do not reuse `ty_result_unit_string_zero` for new
+# ops — it has the inverted shape used by the legacy `File`
+# decl (existing bug, see stdlib/fs/file.kai for the workaround).
+fn ty_result_string_unit_zero() : TypeExpr =
+  ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Unit")])
+
 fn ty_list_string_zero() : TypeExpr =
   ty_list_zero(ty_name_zero("String"))
 
@@ -36546,8 +36586,23 @@ fn builtin_stdin_decl() : Decl =
 fn builtin_env_decl() : Decl =
   DEffect(false, "Env", [],
     [
-      EOp("args", [], [], ty_list_string_zero(), 0, 0),
-      EOp("var",  [], [param_string_zero("name")], ty_option_string_zero(), 0, 0)
+      EOp("args",       [], [], ty_list_string_zero(), 0, 0),
+      EOp("var",        [], [param_string_zero("name")], ty_option_string_zero(), 0, 0),
+      # Issue #127: write side + full block enumeration. Writes
+      # stay on `Env` (rejected the alternative of routing through
+      # `Mutable` — see the issue body's "stay on Env" decision).
+      EOp("set_var",    [], [param_string_zero("name"), param_string_zero("value")],
+                        ty_result_string_unit_zero(), 0, 0),
+      EOp("unset_var",  [], [param_string_zero("name")],
+                        ty_result_string_unit_zero(), 0, 0),
+      # `vars()` lists every entry of the process environment block.
+      # Pair fields use `fst`/`snd` to match `core.tuple` (kaikai
+      # has no first-class tuples; `[(String, String)]` in the issue
+      # text materialises as `[Pair[String, String]]`).
+      EOp("vars",       [], [],
+                        ty_list_zero(ty_named_zero("Pair",
+                          [ty_name_zero("String"), ty_name_zero("String")])),
+                        0, 0)
     ], 0, 0)
 
 fn builtin_file_decl() : Decl =
