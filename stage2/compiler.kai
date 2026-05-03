@@ -17969,6 +17969,20 @@ type Ty
   # transparently recurse on `b`. Predicates are pure (no effects,
   # no rows) so the row machinery is untouched.
   | TyRefineT(Ty, Expr)
+  # issue #187 phase 1: union of types. `TyUnion([T1, T2, ..., Tn])`
+  # represents the union of `n` component types. Components are kept
+  # in normalised form (flattened, deduplicated, sorted by mangle_ty)
+  # whenever the typer compares unions for equality — see
+  # `normalize_union`. Phase 1 only adds the AST node and threads it
+  # through every Ty-walker; no resolver / parser path constructs
+  # `TyUnion` yet (that is Phase 2). Selfhost is byte-identical
+  # because every existing program produces an AST that contains no
+  # `TyUnion` node, so every new arm is dead until Phase 2 lights it
+  # up. Singleton unions and empty unions never appear in the
+  # representation: callers should collapse `TyUnion([T])` to `T`
+  # before constructing the node, and `TyUnion([])` is unreachable
+  # (Phase 2's resolver rejects it at parse time).
+  | TyUnion([Ty])
 
 # Effect row, per docs/effects-impl.md §*Types: row slot on TyFnT*.
 # The slot is reserved here in m7a #1; row unification (m7a #2) and
@@ -18582,6 +18596,10 @@ fn ty_to_string(t: Ty) : String {
     # is left as `<pred>` to keep the line short; full predicate text
     # lands with the diagnostics-quality pass (m12.6.x #8).
     TyRefineT(base, _) -> concat_all([ty_to_string(base), " where <pred>"])
+    # issue #187 phase 1: render unions inline as `A | B | C` to match
+    # surface syntax. Components are already in canonical order when
+    # the walker receives them via `normalize_union`.
+    TyUnion(parts) -> join_with(map(parts, ty_to_string), " | ")
   }
 }
 
@@ -18661,6 +18679,19 @@ fn mangle_ty(t: Ty) : String {
     # `Int` mangle the same — they share monomorphisations and
     # protocol-impl dispatch entries.
     TyRefineT(base, _) -> mangle_ty(base)
+    # issue #187 phase 1: mangle a union as `U_<part1>_<part2>_..._E`
+    # using the canonical component order. The leading `U_` and
+    # trailing `_E` bracket the spec the same way `L_..._E` brackets
+    # a list, so distinct unions never collide with each other or
+    # with primitive mangles even when their component manglings
+    # rearrange. Phase 1 never invokes the mangler on a `TyUnion` in
+    # selfhost (no resolver path constructs one) so this arm is dead
+    # until Phase 2 wires it up; the implementation is provided now
+    # to keep the walker exhaustive without `_` fallbacks that would
+    # mask future bugs.
+    TyUnion(parts) -> concat_all(["U_",
+                                  join_with(map(parts, mangle_ty), "_"),
+                                  "_E"])
   }
 }
 
@@ -19194,6 +19225,11 @@ fn canon_uvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyCon(name, tas) -> TyCon(name, map(tas, (a) => canon_uvars_ty(a, m)))
     TyDimT(base, u) -> TyDimT(canon_uvars_ty(base, m), canon_uvars_unit(u, m))
     TyRefineT(base, p) -> TyRefineT(canon_uvars_ty(base, m), p)
+    # issue #187 phase 1: a union's components are unit-vars-free
+    # at the top level by construction (Phase 2's resolver only
+    # composes nominal types) but their inner Tys may carry unit
+    # vars; recurse and re-normalise so the canonical form survives.
+    TyUnion(parts) -> normalize_union(map(parts, (a) => canon_uvars_ty(a, m)))
   }
 }
 
@@ -19251,6 +19287,10 @@ fn canon_tvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyCon(name, tas) -> TyCon(name, map(tas, (a) => canon_tvars_ty(a, m)))
     TyDimT(base, u) -> TyDimT(canon_tvars_ty(base, m), u)
     TyRefineT(base, p) -> TyRefineT(canon_tvars_ty(base, m), p)
+    # issue #187 phase 1: see `canon_uvars_ty`. Renumbering tvars
+    # inside components can change their `mangle_ty` strings, so
+    # we re-normalise to keep the canonical sort order.
+    TyUnion(parts) -> normalize_union(map(parts, (a) => canon_tvars_ty(a, m)))
   }
 }
 
@@ -20526,6 +20566,11 @@ fn apply_ty(s: Subst, t: Ty) : Ty {
     # references value-level identifiers, not Ty vars); just recurse
     # through the base.
     TyRefineT(base, p) -> TyRefineT(apply_ty(s, base), p)
+    # issue #187 phase 1: substitute through each component then
+    # re-normalise. A substitution can change a component's mangled
+    # form (e.g. `?t0` → `Int`), which can re-order the canonical
+    # list and uncover new duplicates that idempotence collapses.
+    TyUnion(parts) -> normalize_union(map(parts, (p) => apply_ty(s, p)))
   }
 }
 
@@ -20552,6 +20597,100 @@ fn apply_tys(s: Subst, ts: [Ty]) : [Ty] {
   match ts {
     [] -> []
     [t, ...rest] -> [apply_ty(s, t), ...apply_tys(s, rest)]
+  }
+}
+
+# issue #187 phase 1: canonicalise a list of union components.
+# Applies the three algebraic laws of `|` (D6 in `docs/unions-design.md`):
+#
+#   - associative: nested `TyUnion` flattens (`(A | B) | C` → `A | B | C`).
+#   - idempotent:  duplicates collapse (`A | A` → `A`).
+#   - commutative: the result is sorted by `mangle_ty` so component
+#                  order does not affect type identity (`A | B ≡ B | A`).
+#
+# The sort key is `mangle_ty(t)` — already deterministic, already used
+# for monomorphisation, and stable across compilations because it is
+# a pure function of the resolved Ty. Using the existing mangler also
+# means two semantically equal types (e.g. `Decimal<USD>` and
+# `Decimal` post-unit-erasure under codegen monomorphisation) sort
+# adjacently, but unification still distinguishes them at the type
+# level via `unify` / `ty_eq` — normalisation is purely about
+# canonical ordering for equality, not about merging distinct types.
+#
+# Returns the bare component when the normalised list collapses to a
+# singleton (`TyUnion([T])` ≡ `T`). The `TyUnion([])` case is
+# unreachable in Phase 1 (no constructor produces it) and rejected by
+# Phase 2's resolver; if it nevertheless arises here we return
+# `TyAny` as a safe placeholder rather than crash, matching the
+# "I don't know yet" semantics elsewhere in this file.
+fn normalize_union(components: [Ty]) : Ty {
+  let flat = union_flatten(components)
+  let sorted = union_sort_by_mangle(flat)
+  let deduped = union_dedup_sorted(sorted)
+  match deduped {
+    [] -> TyAny
+    [only] -> only
+    _ -> TyUnion(deduped)
+  }
+}
+
+# Flatten any `TyUnion` directly inside the input — single level is
+# enough because the invariant is that every constructed `TyUnion`
+# was itself built via `normalize_union`, so its components are never
+# unions. We still recurse to absorb a `TyUnion` from a caller that
+# bypassed the helper.
+fn union_flatten(ts: [Ty]) : [Ty] {
+  match ts {
+    [] -> []
+    [h, ...rest] -> match h {
+      TyUnion(inner) -> append_ty_lists(union_flatten(inner), union_flatten(rest))
+      _ -> [h, ...union_flatten(rest)]
+    }
+  }
+}
+
+fn append_ty_lists(a: [Ty], b: [Ty]) : [Ty] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...append_ty_lists(rest, b)]
+  }
+}
+
+# Insertion sort keyed by `mangle_ty`. The expected union arity is
+# small (a handful of bounded-context errors in the DDD use case)
+# so insertion sort beats merge sort here in both code size and
+# constant factor.
+fn union_sort_by_mangle(ts: [Ty]) : [Ty] {
+  match ts {
+    [] -> []
+    [h, ...rest] -> union_sort_insert(h, union_sort_by_mangle(rest))
+  }
+}
+
+fn union_sort_insert(t: Ty, sorted: [Ty]) : [Ty] {
+  match sorted {
+    [] -> [t]
+    [h, ...rest] -> {
+      if string_lt(mangle_ty(t), mangle_ty(h)) { [t, h, ...rest] }
+      else { [h, ...union_sort_insert(t, rest)] }
+    }
+  }
+}
+
+# Dedup adjacent equal entries. Input must already be sorted by
+# `mangle_ty` so `ty_eq` only fires on neighbours. `ty_eq` is the
+# semantic equality from later in this file; forward references work
+# because top-level fn definitions are not order-dependent.
+fn union_dedup_sorted(ts: [Ty]) : [Ty] {
+  match ts {
+    [] -> []
+    [h, ...rest] -> match rest {
+      [] -> [h]
+      [n, ...trail] -> {
+        if ty_eq(h, n) { union_dedup_sorted(rest) }
+        else { [h, ...union_dedup_sorted(rest)] }
+      }
+    }
   }
 }
 
@@ -20763,6 +20902,10 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
     # m12.6.x #1: predicates carry value-level identifiers, not Ty
     # vars; only the base contributes to occurs.
     TyRefineT(base, _) -> occurs(v, base, s)
+    # issue #187 phase 1: a tvar `v` occurs in a union iff it occurs
+    # in any component. Required so unify's occurs check stays sound
+    # the moment Phase 2 introduces a union containing `?t0`.
+    TyUnion(parts) -> occurs_any(v, parts, s)
     _ -> false
   }
 }
@@ -20912,6 +21055,17 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
     # refinement-aware unify could distinguish argument-flow direction
     # to reject downcasts, but it requires reshape of unify's API.
     TyRefineT(abase, _) -> unify(abase, b, s)
+    # issue #187 phase 1: two unions unify only when their canonical
+    # component lists agree component-wise. Subsumption between a
+    # union and one of its components — the implicit upcast described
+    # in `docs/unions-design.md` Decision 3 — lands in Phase 2 with
+    # the resolver; Phase 1 keeps unify symmetric so today's
+    # selfhost remains observationally identical (no path constructs
+    # `TyUnion`, so this arm never fires).
+    TyUnion(aps) -> match b {
+      TyUnion(bps) -> unify_list(aps, bps, s)
+      _ -> None
+    }
   }
 }
 
@@ -21410,6 +21564,14 @@ fn ty_eq_shape(a: Ty, b: Ty) : Bool {
     }
     TyCon(an, atas) -> match bx {
       TyCon(bn, btas) -> an == bn and ty_list_eq_shape(atas, btas)
+      _ -> false
+    }
+    # issue #187 phase 1: shape-equality on unions is point-wise on
+    # the canonical component list — same rule as `ty_eq` minus the
+    # refinement-stripping the caller already did at the top of this
+    # function. Different union arities never compare equal.
+    TyUnion(aps) -> match bx {
+      TyUnion(bps) -> ty_list_eq_shape(aps, bps)
       _ -> false
     }
     _ -> false
@@ -25847,6 +26009,10 @@ fn count_tyvar_in_ty(t: Ty, atv: [Int], auv: [Int]) : Int {
     TyCon(_, tas) -> sum_count_tyvar_tys(tas, atv, auv)
     TyDimT(b, u) -> count_tyvar_in_ty(b, atv, auv) + count_tyvar_in_unit(u, auv)
     TyRefineT(b, _) -> count_tyvar_in_ty(b, atv, auv)
+    # issue #187 phase 1: count contributions from each component
+    # — same shape as the TyCon arm, since a union is structurally
+    # a list of types and each one can carry tvars independently.
+    TyUnion(parts) -> sum_count_tyvar_tys(parts, atv, auv)
     _ -> 0
   }
 }
@@ -26247,6 +26413,12 @@ fn ty_eq(a: Ty, b: Ty) : Bool {
     }
     TyDimT(ab, _) -> match b { TyDimT(bb, _) -> ty_eq(ab, bb) _ -> false }
     TyRefineT(ab, _) -> match b { TyRefineT(bb, _) -> ty_eq(ab, bb) _ -> false }
+    # issue #187 phase 1: two unions are equal iff their canonical
+    # component lists are point-wise equal. Callers that hand us a
+    # `TyUnion` constructed via `normalize_union` get this for free;
+    # any caller that bypasses normalisation falls through and is
+    # rejected — that's the bug, not the equality check.
+    TyUnion(aps) -> match b { TyUnion(bps) -> ty_list_eq(aps, bps) _ -> false }
   }
 }
 
@@ -26299,6 +26471,11 @@ fn ty_concrete(t: Ty) : Bool {
     TyCon(_, tas) -> tuple_concrete(tas)
     TyDimT(b, u) -> ty_concrete(b) and unit_concrete(u)
     TyRefineT(b, _) -> ty_concrete(b)
+    # issue #187 phase 1: a union is concrete iff every component
+    # is — same rule as TyCon's tuple. Lets the monomorphisation
+    # pipeline classify a union'd return type the same way it
+    # classifies a record return.
+    TyUnion(parts) -> tuple_concrete(parts)
     _ -> true   # primitive types and TyAny are concrete
   }
 }
@@ -26422,6 +26599,9 @@ fn subst_ty(t: Ty, sm: SubstMap) : Ty {
                                   subst_ty(ret, sm), subst_row(row, sm))
     TyCon(name, tas) -> TyCon(name, map(tas, (a) => subst_ty(a, sm)))
     TyDimT(base, u) -> dim_collapse(subst_ty(base, sm), unit_canon(subst_unit(u, sm)))
+    # issue #187 phase 1: same shape as `apply_ty` — substitute
+    # inside each component and re-normalise.
+    TyUnion(parts) -> normalize_union(map(parts, (p) => subst_ty(p, sm)))
     TyRefineT(base, p) -> TyRefineT(subst_ty(base, sm), p)
   }
 }
@@ -36768,6 +36948,12 @@ fn ty_head_name(t: Ty) : Option[String] {
     TyVarT(_)      -> None
     TyFnT(_, _, _) -> None
     TyAny          -> None
+    # issue #187 phase 1: a union has no single head type, so
+    # protocol dispatch declines — Phase 2's resolver is what
+    # forbids `impl P for Union` declarations; here we just signal
+    # "no canonical head" the same way TyVarT does so callers fall
+    # back to the diagnostic path.
+    TyUnion(_)     -> None
   }
 }
 
