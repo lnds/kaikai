@@ -322,14 +322,19 @@ disambiguates.
 ```
 kaikai (the language)
    ↓
-ahu (OTP-style framework: supervision, gen-server, BEAM-style)
+ahu (concurrency + fault-tolerance framework: streams, cells, restart helpers)
    ↓
 kohau (database / persistence layer)
    ↓
 henua (DDD building blocks: aggregates, repositories, domain events)
    ↓
-manutara (Phoenix-LiveView-style web framework)
+   ├──▶ manutara (Phoenix-LiveView-style web framework)
+   └──▶ hopu (background jobs / queue / scheduler — Oban-style)
 ```
+
+`manutara` and `hopu` are sibling consumers of the lower stack:
+manutara handles the synchronous web face, hopu handles the
+asynchronous background-job face. Neither depends on the other.
 
 ### Disambiguation by project
 
@@ -338,6 +343,7 @@ manutara (Phoenix-LiveView-style web framework)
 - `ahu-Tongariki` = the ahu framework MVP. Separate repo,
   separate `docs/roadmap.md` once that project starts.
 - `manutara-Tongariki` = the manutara web framework MVP.
+- `hopu-Tongariki` = the hopu jobs framework MVP.
 
 ### Sequencing
 
@@ -350,6 +356,8 @@ manutara (Phoenix-LiveView-style web framework)
 | kohau     | post `ahu-Tongariki`                                                                 |
 | henua     | post `kohau-Tongariki`                                                               |
 | manutara  | post `henua-Tongariki` — manutara needs ahu + kohau + henua at least at MVP.         |
+| hopu      | post `kohau-Tongariki` — hopu needs ahu (workers) + kohau (persistent queue).        |
+|           | henua is optional; jobs without DDD aggregates are fine.                             |
 
 Each downstream project does not wait for 1.0.0 of its
 dependency. It waits for that dependency's Tongariki (MVP).
@@ -358,7 +366,7 @@ This unlocks parallelism: once `kaikai-Tongariki` ships,
 
 ### What this doc is NOT
 
-- Not the roadmap for ahu, kohau, henua, or manutara.
+- Not the roadmap for ahu, kohau, henua, manutara, or hopu.
   Those projects own their own `docs/roadmap.md` once they
   start. This doc only mentions them to make the
   layering explicit.
