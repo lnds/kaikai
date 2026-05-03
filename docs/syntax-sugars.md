@@ -378,6 +378,14 @@ Rules that follow from the desugar:
   sibling statements of the outer block.
 - The cell's name shadows outer bindings per the usual
   scoping rules, and pollutes nothing beyond its block.
+- A `var` declaration may also appear at the top of a
+  handler-clause list (before all operation clauses, sibling
+  to them inside `handle { ... } with Eff { ... }`). It
+  desugars to a sibling `with State[T](init) as name` wrapping
+  the handler. Reads inside clause bodies use the same
+  `@name` / `name.get()` forms as anywhere else; `var` and
+  `let` must precede every operation clause inside one
+  handler block (interleaving is a parse error).
 
 ### Effect-row impact
 
