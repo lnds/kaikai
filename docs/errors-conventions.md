@@ -111,7 +111,14 @@ Multiple subsystems each have their own error type
 that orchestrates them needs **one error type** for its return
 value. Two patterns:
 
-### Pattern A — wrapper sum type (canonical)
+**Three patterns**, listed in order of preference for new code:
+
+- **Pattern C — unions** (canonical for new code; landed in
+  issue #187, 2026-05-03).
+- **Pattern A — wrapper sum type** (legacy, still valid).
+- **Pattern B — `!` with auto-`From`** (deferred to post-#180).
+
+### Pattern A — wrapper sum type (legacy)
 
 ```kai
 type AppError =
@@ -127,17 +134,20 @@ fn process_payment(req: PayReq) : Result[AppError, Receipt] = {
 }
 ```
 
-This is the **standard kaikai pattern** for cross-subsystem error
-composition. Three pieces:
+This was the standard kaikai pattern before issue #187. Three
+pieces:
 
 1. A wrapper sum type (`AppError`) with one variant per subsystem.
 2. `expr.map_err(Wrapper)!` at every cross-subsystem boundary.
 3. Pattern matching on `AppError` at the outermost handler.
 
-The wrapper is **explicit by design** — kaikai prefers visible
-type structure over invisible coercions (Tier 2 #5). Adding a new
-subsystem requires extending `AppError`, which the typer enforces
-exhaustively at every match.
+The wrapper is **explicit** — adding a new subsystem requires
+extending `AppError`, which the typer enforces exhaustively at
+every match. Pattern A is still appropriate when the wrapper
+variant carries **additional structure** beyond the inner error
+(a request id, a retry count, a context tag). For pure
+"forward the inner error verbatim" cases, Pattern C (unions) is
+strictly better.
 
 `map_err` is part of the proposed `Result` API expansion (issue
 #182). Until it lands, the workaround is a manual `match`:
@@ -170,20 +180,85 @@ fn process_payment(req: PayReq) : Result[AppError, Receipt] = {
 ```
 
 This is the Rust idiom (`?` + `From` trait). Tracked as a follow-up
-to #180. **Not** available today; pattern A is the current path.
+to #180. **Not** available today; Pattern C (below) covers most of
+the same ground without `From` impls.
+
+### Pattern C — unions (canonical, since 2026-05-03)
+
+Issue #187 unified algebraic types so that `|` always means
+"union of types". A subsystem error type is composed by listing
+its constituents:
+
+```kai
+type ValidationError = InvalidAmount | SourceFrozen | DestinationFrozen
+type ApprovalError   = OverDailyLimit | KycRequired
+type ExecutionError  = SettlementBackendDown | DoubleSpendDetected
+
+type AppError = ValidationError | ApprovalError | ExecutionError
+
+fn process_payment(req: PayReq) : Result[AppError, Receipt] = {
+  let v = validate(req)!       # Result[ValidationError, _] — D3 upcast
+  let a = approve(v)!          # Result[ApprovalError, _]   — D3 upcast
+  let e = execute(a)!           # Result[ExecutionError, _]  — D3 upcast
+  Ok(receipt(e))
+}
+```
+
+- No wrapper variants per subsystem.
+- No `map_err(Wrapper)` at every boundary — the **implicit upcast**
+  (D3 in `docs/unions-design.md`) accepts a value of a component
+  type wherever the union is expected.
+- `!` propagates through the upcast: a `Result[ValidationError, _]`
+  flows into a function returning `Result[AppError, _]` directly.
+- Pattern matching uses `bind : ComponentType` to delegate per
+  subsystem:
+
+```kai
+match err : AppError {
+  ve : ValidationError -> render_validation(ve)
+  ae : ApprovalError   -> render_approval(ae)
+  ee : ExecutionError  -> render_execution(ee)
+}
+```
+
+Adding a new subsystem requires extending `AppError`'s union and
+adding one match arm. The compiler enforces exhaustiveness at the
+arm level and types each component-typed handler as if it lived
+in its own bounded context.
+
+See `docs/unions.md` for the full reference and
+`examples/unions/ddd_ledger_demo.kai` for an end-to-end demo
+across three bounded contexts.
+
+#### When to use Pattern A vs Pattern C
+
+| Situation | Use |
+|---|---|
+| Forward the inner error verbatim across a bounded-context boundary | **Pattern C** |
+| Wrap the inner error with extra structure (request id, retry count, layer tag) | Pattern A |
+| Errors from disjoint subsystems compose in one return type | **Pattern C** |
+| The same component error participates in many app-level unions | **Pattern C** (no name mangling needed) |
+| You need a single-tag runtime layout (FFI, serialisation pinned to a tag enum) | Pattern A |
+| The wrapper is purely for type identity with no extra payload | **Pattern C** wins (less boilerplate) |
+| Generic over the error type (`F[T] = Option[T] | Result[String, T]`) | Neither yet — generic unions deferred |
+
+Default to Pattern C for new code. Migrate Pattern A code only
+when the wrapper carries no extra structure and the migration is
+in the natural path of other work (do not chase a clean-up).
 
 ### What kaikai deliberately does NOT have
 
-- **Union types** (TypeScript / Scala 3 style: `ErrA | ErrB`).
-  kaikai requires a nominal wrapper sum type. The wrapper is
-  more verbose but visible — adding a new error variant is a
-  type change the compiler enforces.
+- **Structural unions** of the TypeScript flavour (`{x: int}` is
+  *automatically* a subtype of `{x: int, y: string}` because of
+  field shape). kaikai's unions are **nominal**: `T <: U` only
+  when `U`'s declaration explicitly lists `T` as a component.
 - **Anonymous error types** (OCaml polymorphic variants:
-  `` [`ErrA | `ErrB ]``). Same reason — kaikai picks one
-  sum-type system (nominal) and stays with it.
-- **Implicit error coercion** without `From`. Even when #180
-  + auto-`From` lands, the conversion is a typed call to
-  `From::from`, not a structural subtype check.
+  `` [`ErrA | `ErrB ]``). Unions are introduced by `type`
+  declarations only; there is no row-typed inference.
+- **Chained upcast** (`T <: U <: V` does not imply `T <: V`).
+  The user names the intermediate union explicitly.
+- **Implicit downcast** (union → component). The narrowing is
+  always explicit via the `bind : ComponentType` pattern.
 
 ## Rule 6 — Validation and accumulating errors
 
@@ -261,8 +336,10 @@ Is the failure value worth keeping for the caller?
 ├── No, "absent" is enough → Option[T]
 └── Yes, motive matters
     ├── Caller can recover meaningfully → Result[E, T]
-    │   └── Multiple subsystems' errors compose? → wrapper sum + map_err + !
-    │       (or auto-From + ! once #180 lands)
+    │   └── Multiple subsystems' errors compose? → union (Pattern C, since #187)
+    │       (Pattern A — wrapper sum + map_err — when the wrapper
+    │        carries extra structure; Pattern B — auto-From — once
+    │        #180 lands and only if a per-conversion impl is wanted.)
     └── Caller cannot recover (broken terminal, OOM, ...) → Fail.fail(msg)
 
 Does it indicate a programming bug or invariant violation?
@@ -280,6 +357,9 @@ Does it indicate a programming bug or invariant violation?
 - `docs/typed-holes.md` — `?` and `?name` are typed holes, not
   error handling.
 - `docs/syntax-sugars.md` — `!` postfix.
+- `docs/unions.md` — user-facing reference for Pattern C.
+- `docs/unions-design.md` — design rationale and decision log.
+- Issue #187 — milestone issue that introduced Pattern C.
 - Issue #182 — `Result` / `Option` stdlib API expansion (`map_err`,
   `or_else`, `transpose`, `collect`, ...).
 - Issue #180 — `protocol P[A]` (enables auto-`From` on `!` as a
