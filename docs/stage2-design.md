@@ -871,6 +871,24 @@ with or without unit annotations. Roughly +1100 lines added to
 landing notes in `docs/units-of-measure.md` (Status: Landed at the
 top); lane experience report in `docs/lane-experience-m12.5.md`.
 
+### Update 2026-05-03 — hex and binary integer literals landed
+
+PR #160 (closes #156) added `0x` and `0b` lexer branches to the
+integer-literal token. Same `Int` type, same `EInt` AST node — no
+new node, no new type, no new operator, no parser change. Range
+is signed 64-bit. No underscore digit separators in the hex/bin
+branches, no octal `0o`, no hex floating-point literals. Full
+spec in `docs/syntax-sugars.md` §7; lexer code in
+`stage2/compiler.kai` (`lex_hex_or_bin_int`); fixtures in
+`examples/literals/`.
+
+The companion landings on the same day — regex sigil `~r/.../`
+(PR #159, closes #85) and n-tuple parser sugar `(a, b)` /
+`(a, b, c)` / `(a, b, c, d)` (PR #155, closes #154) — already
+update their respective docs in place. UoM annotation in record
+field positions (issue #158, PR #163) is still in flight and
+will be documented when it merges.
+
 ### Milestone naming: Core language vs Full language
 
 The project adopts two named milestones to disambiguate from the

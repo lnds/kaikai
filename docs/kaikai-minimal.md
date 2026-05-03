@@ -18,6 +18,8 @@ To make the scope explicit:
 - No full Perceus — a simple reference counter is used.
 - No string format beyond interpolation. No regex.
 - No m7b sugars (trailing lambdas, double trailing, `@cap`, `:=`, `var`, `a[i]`, lambda-block as expression). They appear in stage 1+; their grammar lives in §*Post-stage-0 grammar additions* below.
+- No hex / binary integer literals (`0xFF`, `0b1010`); decimal only. The `0x`/`0b` lexer branches land in full kaikai (see `docs/syntax-sugars.md` §7).
+- No regex sigil `~r/.../`, no n-tuple sugar `(a, b)`. Both are full-kaikai; see `docs/syntax-sugars.md` §6 and §"Regex sigil".
 
 These all appear in **full kaikai** (the language stage 1 compiles), but stage 0 does not need them.
 
