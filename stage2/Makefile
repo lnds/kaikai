@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
 
 all: $(TARGET)
 
@@ -890,6 +890,28 @@ test-stdlib: $(TARGET) build
 	@grep -F -q '__builtin_popcountll' build/stdlib-bits_dotted.c \
 	  || { echo "stdlib FAIL bits_dotted (popcount not inlined)"; exit 1; }
 	@echo "stdlib OK bits_dotted intrinsic-lowered"
+
+# Issue #170 phase 1a — intrinsic `test "..." { ... }` blocks living
+# directly inside stdlib/core/option.kai and stdlib/core/result.kai.
+# Runs the test binary via `bin/kai test` for each module. Gated by
+# `.github/workflows/tier1-stdlib-core.yml` (paths: stdlib/core/**),
+# so PRs that don't touch stdlib/core pay zero seconds for this.
+# KAI_NO_STDLIB=1 prevents bin/kai from auto-loading the module under
+# test as a prelude — without it, the source is parsed twice (once
+# as prelude, once as the test source) and every test block runs
+# twice with duplicated definitions.
+test-stdlib-core-intrinsic: $(TARGET) build
+	@set -e; \
+	for mod in option result; do \
+	  out=build/stdlib-core-$$mod.test.out; \
+	  KAI_NO_STDLIB=1 ../bin/kai test ../stdlib/core/$$mod.kai > $$out 2>&1 \
+	    || { echo "stdlib-core-intrinsic FAIL $$mod (kai test errored)"; cat $$out; exit 1; }; \
+	  awk '/^[0-9]+\/[0-9]+ tests passed$$/ { split($$1, p, "/"); \
+	         if (p[1] > 0 && p[1] == p[2]) { ok = 1 } } \
+	       END { exit ok ? 0 : 1 }' $$out \
+	    || { echo "stdlib-core-intrinsic FAIL $$mod (no all-pass tests-passed line)"; cat $$out; exit 1; }; \
+	  echo "stdlib-core-intrinsic OK $$mod"; \
+	done
 
 # Issue #139 — crypto_hash_basic under ASAN+UBSan. SHA-2 + HMAC are
 # heavy on byte-buffer churn (per-block 64-element message schedules,
