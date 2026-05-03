@@ -181,6 +181,8 @@ tier1-asan: kaic2
 	@echo "tier1-asan OK — issue #107 fixture passes under ASAN+UBSan (Signal effect runtime gate)"
 	@$(MAKE) -C stage2 test-trap-exit-cancel-asan
 	@echo "tier1-asan OK — issue #103 fixture passes under ASAN+UBSan (trap-exit / outer Cancel handler gate)"
+	@$(MAKE) -C stage2 test-process-basic-asan
+	@echo "tier1-asan OK — issue #126 fixture passes under ASAN+UBSan (Process effect runtime gate)"
 	@$(MAKE) -C stage2 test-perceus-issue82-asan
 	@echo "tier1-asan OK — issue #82 fixture passes under ASAN+UBSan (Perceus leak-audit gate)"
 	@$(MAKE) -C stage2 test-http-client-asan
