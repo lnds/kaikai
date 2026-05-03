@@ -156,6 +156,40 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
     handler to register the fiber on a timer wheel and yield through
     `Spawn.yield` so `Cancel` interrupts mid-sleep. Tracked in the
     m8.x follow-up.
+- **`m[k]` read-side indexing sugar over `Map[K, V]` (issue #128).**
+  The typer now dispatches `e1[e2]` by inspecting the inferred
+  type of `e1`: `Map[K, V]` lowers to `map_get(e1, e2) : Option[V]`,
+  while `Array[T]` keeps its existing `array_get` lowering. The
+  sugar specification lives in `docs/syntax-sugars.md` §4 (new
+  *Map dispatch* subsection); the v1 retrospective in
+  `docs/proposed-extensions.md` §6 captures the pinned decisions.
+  The write-side sugar `m[k] := v` is **rejected** with a
+  diagnostic pointing at `map_put`; the v2 design lands alongside
+  the HAMT carrier. New regression fixtures
+  `examples/stdlib/map_tree_basic.kai` (positive — exercises the
+  sugar plus the AVL carrier at N=1000) and
+  `examples/stdlib/map_assign_error.kai` (negative — typer must
+  reject the indexed write) are wired into `make test-stdlib`.
+  Closes the unblock for `ahu`'s Registry primitive.
+
+### Changed
+
+- **`Map[K, V]` carrier upgraded from association-list to AVL
+  tree (issue #128).** `stdlib/collections/map.kai` now wraps a
+  height-balanced binary search tree keyed by `<`. Lookup, insert,
+  and remove are `O(log n)` instead of `O(n)`. The public surface
+  (`map_empty`, `map_size`, `map_is_empty`, `map_get`,
+  `map_contains`, `map_put`, `map_remove`, `map_keys`,
+  `map_values`, `map_to_pairs`, `map_from_pairs`) is preserved at
+  the signature level. **Insert order is no longer preserved** —
+  `map_keys` / `map_values` / `map_to_pairs` walk the tree
+  in-order and return keys sorted under `<`. Callers that needed
+  insert order (the JWT encoder demo at
+  `examples/stdlib/jwt_encoder.kai`) adapted to the sorted
+  output; the golden was updated accordingly. Key types are
+  restricted to those for which the runtime's `<` is total —
+  `Int`, `Real`, `Char`, `String` — until v2 introduces an `Ord`
+  protocol.
 
 ## [0.37.0] — 2026-05-02 (Tongariki MVP closed — last 6 mvp-blockers landed)
 
