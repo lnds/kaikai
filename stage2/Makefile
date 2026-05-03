@@ -2442,6 +2442,26 @@ test-unbox-phase2: $(TARGET) build
 	        build/perceus-unbox_phase2_r8_let_in_interp.c; then \
 	  echo "unbox FAIL r8_let_in_interp (raw kair_n survived; demote did not fire)"; exit 1; \
 	fi
+	@# Issue #90 — `^` (integer power) and `//` (integer division) on
+	@# raw operands must inline. The C emit unrolls `b ^ n` into
+	@# `(b)*(b)*…` and lowers `a // b` to native `/`. Diff against the
+	@# expected output, then grep the inner-loop body to assert no
+	@# `kai_op_pow_int(` / `kai_op_idiv(` calls survived.
+	@diff -q ../examples/perceus/unbox_phase2_pow_idiv.out.expected \
+	        build/perceus-unbox_phase2_pow_idiv.out > /dev/null \
+	  || { echo "unbox FAIL pow_idiv (output mismatch)"; \
+	       diff ../examples/perceus/unbox_phase2_pow_idiv.out.expected \
+	            build/perceus-unbox_phase2_pow_idiv.out; exit 1; }
+	@grep -F -q 'int64_t kair_b' build/perceus-unbox_phase2_pow_idiv.c \
+	  || { echo "unbox FAIL pow_idiv (kair_b not raw; ^ stayed boxed)"; exit 1; }
+	@grep -F -q 'int64_t kair_c' build/perceus-unbox_phase2_pow_idiv.c \
+	  || { echo "unbox FAIL pow_idiv (kair_c not raw; // stayed boxed)"; exit 1; }
+	@if grep -E 'kai_pow_idiv_inner_loop\(void\) \{[^}]*kai_op_pow_int\(' build/perceus-unbox_phase2_pow_idiv.c; then \
+	  echo "unbox FAIL pow_idiv (kai_op_pow_int survived inside body)"; exit 1; \
+	fi
+	@if grep -E 'kai_pow_idiv_inner_loop\(void\) \{[^}]*kai_op_idiv\(' build/perceus-unbox_phase2_pow_idiv.c; then \
+	  echo "unbox FAIL pow_idiv (kai_op_idiv survived inside body)"; exit 1; \
+	fi
 	@echo "unbox phase2 OK"
 
 # Issue #37 — verify the C emitter rewrites self-tail-calls into
