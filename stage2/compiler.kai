@@ -1312,6 +1312,15 @@ type PatKind
   # remain visible in the arm body. Disjoint from m7b §2's prefix
   # `@cap` (an expression), which never appears in pattern position.
   | PAs(String, Pattern)
+  # issue #187 phase 3: type-narrowing pattern `name : T`. Used over a
+  # union scrutinee to bind `name` at component type `T`; covers every
+  # variant of `T` for exhaustiveness purposes. The parser emits this
+  # for every `name : TyName(t, ...)` arm-pattern suffix, including
+  # refinement-type aliases — `lower_pattern_narrow_decls` rewrites
+  # the alias case back into `PBind` + `__ref_pred_t(name)` guard so
+  # m12.6.x semantics are preserved. What survives into the typer is
+  # always a non-refinement narrowing over a union component.
+  | PNarrow(String, TypeExpr)
 
 type PField = PField(String, Pattern, Bool) # field name, sub-pattern, is_shorthand
 
@@ -3987,6 +3996,8 @@ fn parse_arm(p: Parser) : PArm {
       # PBind patterns participate; other shapes ignore the suffix.
       let p_after_ty = p_skip_newlines(rp.p)
       let nr = parse_optional_arm_refine(p_after_ty, pat)
+      # issue #187 phase 3: arm-refine may rewrite the pattern (PNarrow).
+      let pat_eff = match nr.new_pat { Some(np) -> np  None -> pat }
       let p1 = p_skip_newlines(nr.p)
       # Optional guard: `if expr`. Same discipline as `parse_if` /
       # `parse_match`: the guard expression cannot eat the `->` (or
@@ -4008,9 +4019,9 @@ fn parse_arm(p: Parser) : PArm {
       let combined_guard = combine_guards(nr.guard, guard_opt_r.r)
       match guard_opt_r.r {
         None -> if guard_opt_r.p.had_error { err_a(guard_opt_r.p) } else {
-          parse_arm_body(guard_opt_r.p, pat, combined_guard)
+          parse_arm_body(guard_opt_r.p, pat_eff, combined_guard)
         }
-        Some(_) -> parse_arm_body(guard_opt_r.p, pat, combined_guard)
+        Some(_) -> parse_arm_body(guard_opt_r.p, pat_eff, combined_guard)
       }
     }
   }
@@ -4019,16 +4030,19 @@ fn parse_arm(p: Parser) : PArm {
 # m12.6.x #3 result: parser state after consuming an optional `: Type`
 # refinement-narrowing suffix on a match arm pattern. `guard` holds
 # the synthesised predicate (or None when no suffix was present).
-type ArmRefine = { p: Parser, guard: Option[Expr] }
+# issue #187 phase 3: `new_pat` overrides the original pattern when
+# the suffix lowers to a `PNarrow` instead of a guard. `None` means
+# leave the caller's pattern unchanged.
+type ArmRefine = { p: Parser, guard: Option[Expr], new_pat: Option[Pattern] }
 
 fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine {
-  if not p_at(p, TkColon) { ArmRefine { p: p, guard: None } }
+  if not p_at(p, TkColon) { ArmRefine { p: p, guard: None, new_pat: None } }
   else { match pat.pkind {
     PBind(name) -> {
       let p1 = p_skip_newlines(p_advance(p))
       let rt = parse_type(p1)
       match rt.r {
-        None -> ArmRefine { p: rt.p, guard: None }
+        None -> ArmRefine { p: rt.p, guard: None, new_pat: None }
         Some(ty) -> match ty.tkind {
           TyRefine(_, pred) -> {
             # Lower to `{ let self = <name>; pred }`. The let binding
@@ -4040,28 +4054,28 @@ fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine {
                                 None, var_e)
             let block = mk_expr(EBlock([self_let], Some(pred)),
                                  pat.line, pat.col)
-            ArmRefine { p: rt.p, guard: Some(block) }
+            ArmRefine { p: rt.p, guard: Some(block), new_pat: None }
           }
-          # m12.6.x #3 v2: refinement-type aliases. `p : Port` lowers
-          # to `__ref_pred_Port(p)`. The synthesised pred fn lives in
-          # the post-parse pass `synthesize_refine_pred_fns`, which
-          # walks every `type X = Base where pred` and emits
-          # `fn __ref_pred_X(self: Base) : Bool [<refinement_pure>] = pred`.
-          # If the alias never resolves (e.g. typo), the resolver will
-          # report "undefined name `__ref_pred_<name>`" at this site —
-          # acceptable v1 diagnostic; a future iteration could pre-
-          # check at parse time.
-          TyName(tyname, []) -> {
-            let var_e = mk_expr(EVar(name), pat.line, pat.col)
-            let pred_fn = mk_expr(EVar(synth_refine_pred_fn_name(tyname)),
-                                   pat.line, pat.col)
-            let call = mk_expr(ECall(pred_fn, [var_e]), pat.line, pat.col)
-            ArmRefine { p: rt.p, guard: Some(call) }
+          # issue #187 phase 3 + m12.6.x #3 v2: `name : TyName(t, ...)`.
+          # Parser cannot tell whether `t` is a refinement-type alias
+          # (m12.6.x) or a union-component nominal type (#187), so it
+          # emits a uniform `PNarrow(name, ty)` pattern with no guard.
+          # `lower_pattern_narrow_decls` later splits the cases: for
+          # every refinement alias declared in the program, the
+          # narrowing is rewritten back into `PBind(name)` + a guard
+          # call to `__ref_pred_t(name)` (preserving the m12.6.x
+          # behaviour); narrowings whose target is not a refinement
+          # alias survive as `PNarrow` for the typer, which checks
+          # the scrutinee is a union containing the component.
+          TyName(_, _) -> ArmRefine {
+            p: rt.p,
+            guard: None,
+            new_pat: Some(mk_pat(PNarrow(name, ty), pat.line, pat.col))
           }
           _ -> ArmRefine {
             p: p_error(rt.p, p_peek(p),
                        "match-arm narrowing `: Type` requires either an inline `Int where ...` or a refinement-type alias name"),
-            guard: None
+            guard: None, new_pat: None
           }
         }
       }
@@ -4069,7 +4083,7 @@ fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine {
     _ -> ArmRefine {
       p: p_error(p, p_peek(p),
                  "match-arm narrowing `: Type` only applies to a binding pattern (a bare name)"),
-      guard: None
+      guard: None, new_pat: None
     }
   } }
 }
@@ -8147,6 +8161,10 @@ fn dump_pat(pat: Pattern, depth: Int) : Unit {
       emit_line(depth, "pat_as #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
       dump_pat(sub, depth + 1)
     }
+    PNarrow(name, ty) -> {
+      emit_line(depth, "pat_narrow #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      dump_type(ty, depth + 1)
+    }
   }
 }
 
@@ -8585,6 +8603,7 @@ fn bind_pat(e: Env, pat: Pattern) : Env {
     PRecord(fields) -> bind_pfields_loop(e, fields)
     PHole(_) -> e
     PAs(name, sub) -> bind_pat(env_add(e, name), sub)
+    PNarrow(name, _) -> env_add(e, name)
   }
 }
 
@@ -10150,6 +10169,11 @@ fn emit_pat_test(src: String, pat: Pattern, scr: String, lcs: [String], fns: [EF
     # m7d §14: `name @ sub` matches iff `sub` matches; the binding
     # is performed by emit_pat_binds.
     PAs(_, sub) -> emit_pat_test(src, sub, scr, lcs, fns, variants, lams, cls)
+    # issue #187 phase 3: PNarrow is rewritten to PAs+PVariant in
+    # synth_match before codegen runs; this arm only fires if a
+    # `match` outside the typer's scope reaches codegen with a raw
+    # narrowing pattern. Treat as unconditional match (no test).
+    PNarrow(_, _) -> "1"
   }
 }
 
@@ -10285,6 +10309,15 @@ fn emit_pat_binds(src: String, pat: Pattern, scr: String, is_alias: Bool,
       }
       cat2(head_bind, emit_pat_binds(src, sub, scr, true, lcs, fns, variants, lams, cls))
     }
+    # issue #187 phase 3: defensive arm; PNarrow is rewritten to
+    # PAs+PVariant before codegen. If reached, bind the name like
+    # PBind so the body sees the scrutinee under its narrow name.
+    PNarrow(name, _) ->
+      if is_alias {
+        concat_all(["KaiValue *kai_", name, " = kai_incref(", scr, "); "])
+      } else {
+        concat_all(["KaiValue *kai_", name, " = ", scr, "; "])
+      }
   }
 }
 
@@ -10939,6 +10972,7 @@ fn pat_bindings(pat: Pattern, acc: [String]) : [String] {
     PRecord(fields) -> pfield_bindings_loop(fields, acc)
     PHole(_) -> acc
     PAs(name, sub) -> pat_bindings(sub, [name, ...acc])
+    PNarrow(name, _) -> [name, ...acc]
   }
 }
 
@@ -15062,6 +15096,95 @@ fn build_refine_pred_fn(tyname: String, base: TypeExpr, pred: Expr,
   let dfn = DFn(false, fn_name, [], [self_param], Some(ret_ty),
                  REmpty, pred, l, c, None)
   DAttribPure(dfn, l, c)
+}
+
+# issue #187 phase 3: lower `PNarrow(name, TyName(t, []))` whose
+# `t` is a refinement-type alias (m12.6.x) back into the legacy
+# shape `PBind(name) + guard __ref_pred_t(name)`. The parser emits
+# `PNarrow` uniformly because at parse time we can't tell whether
+# `t` names a refinement alias or a union-component nominal type;
+# this pass disambiguates after `synthesize_refine_pred_fns` has
+# populated the alias namespace. Non-refinement narrowings stay as
+# `PNarrow` for the typer's union-component check.
+fn collect_refine_alias_names(decls: [Decl]) : [String] =
+  collect_refine_alias_loop(decls, [])
+
+fn collect_refine_alias_loop(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DType(_, name, _, body, _, _) -> match body {
+        TBAlias(t) -> match t.tkind {
+          TyRefine(_, _) -> collect_refine_alias_loop(rest, [name, ...acc])
+          _ -> collect_refine_alias_loop(rest, acc)
+        }
+        _ -> collect_refine_alias_loop(rest, acc)
+      }
+      _ -> collect_refine_alias_loop(rest, acc)
+    }
+  }
+}
+
+fn lower_pattern_narrow_decls(decls: [Decl], aliases: [String]) : [Decl] =
+  map(decls, (d) => lower_narrow_decl(d, aliases))
+
+fn lower_narrow_decl(d: Decl, aliases: [String]) : Decl {
+  match d {
+    DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(p, n, tps, ps, ret, row, lower_narrow_expr(body, aliases), l, c, mo)
+    DTest(desc, body, l, c) -> DTest(desc, lower_narrow_expr(body, aliases), l, c)
+    DBench(desc, body, l, c) -> DBench(desc, lower_narrow_expr(body, aliases), l, c)
+    DCheck(desc, params, body, l, c) -> DCheck(desc, params, lower_narrow_expr(body, aliases), l, c)
+    DAttribPure(inner, l, c) -> DAttribPure(lower_narrow_decl(inner, aliases), l, c)
+    _ -> d
+  }
+}
+
+fn lower_narrow_expr(e: Expr, aliases: [String]) : Expr {
+  match e.kind {
+    EMatch(scr, arms) -> {
+      let scr2 = lower_narrow_expr(scr, aliases)
+      let arms2 = map(arms, (a) => lower_narrow_arm(a, aliases))
+      mk_expr(EMatch(scr2, arms2), e.line, e.col)
+    }
+    _ -> {
+      let new_kind = map_expr_kind(e.kind, (sub) => lower_narrow_expr(sub, aliases))
+      mk_expr(new_kind, e.line, e.col)
+    }
+  }
+}
+
+fn lower_narrow_arm(a: Arm, aliases: [String]) : Arm {
+  match a {
+    Arm(pat, guard, body) -> {
+      let body1 = lower_narrow_expr(body, aliases)
+      let guard1 = match guard {
+        None -> None
+        Some(g) -> Some(lower_narrow_expr(g, aliases))
+      }
+      match pat.pkind {
+        PNarrow(name, ty) -> match ty.tkind {
+          TyName(tyname, []) ->
+            if list_has(aliases, tyname) {
+              # Restore the m12.6.x shape: bind + synthesised pred call.
+              let var_e = mk_expr(EVar(name), pat.line, pat.col)
+              let pred_fn = mk_expr(EVar(synth_refine_pred_fn_name(tyname)),
+                                     pat.line, pat.col)
+              let call = mk_expr(ECall(pred_fn, [var_e]), pat.line, pat.col)
+              let new_guard = match guard1 {
+                None -> Some(call)
+                Some(g) -> Some(mk_expr(EBinop("and", call, g), call.line, call.col))
+              }
+              Arm(mk_pat(PBind(name), pat.line, pat.col), new_guard, body1)
+            } else {
+              Arm(pat, guard1, body1)
+            }
+          _ -> Arm(pat, guard1, body1)
+        }
+        _ -> Arm(pat, guard1, body1)
+      }
+    }
+  }
 }
 
 # m12.6.x #5(a) result: extracted refinement-pure fn names + the
@@ -21960,12 +22083,40 @@ fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : I
     None -> {
       let a1 = apply_ty(st.sub, a)
       let b1 = apply_ty(st.sub, b)
-      diag_error(st.file, line, col, "type mismatch in #{what}")
-      diag_note("expected: #{ty_to_string(a1)}")
-      diag_note("found:    #{ty_to_string(b1)}")
-      emit_type_hint(a1, b1)
-      st_bump_err(st)
+      # issue #187 phase 3: bounded subtyping for `T <: U` when `U`
+      # is a `type U = A | B | ...` decl whose variants list contains
+      # `T` as a component name. The upcast is the implicit promotion
+      # described in `docs/unions-design.md` Decision 3 — a value of a
+      # component type is usable wherever the union is expected. We
+      # accept it after the symmetric `unify` failed, with no
+      # substitution side-effects: the runtime layout is identical.
+      if union_upcast_ok(st.env, a1, b1) { st }
+      else {
+        diag_error(st.file, line, col, "type mismatch in #{what}")
+        diag_note("expected: #{ty_to_string(a1)}")
+        diag_note("found:    #{ty_to_string(b1)}")
+        emit_type_hint(a1, b1)
+        st_bump_err(st)
+      }
     }
+  }
+}
+
+# issue #187 phase 3: accept `expected = TyCon(U, [])` and
+# `found = TyCon(T, [])` when `T` is registered as a variant of `U`
+# in the env. This is the union-of-types upcast under today's dual
+# representation (Phase 2): `type U = A | B` adds `A` and `B` as
+# zero-arg variants of `U`, so a value of type `A` lifts to `U`.
+fn union_upcast_ok(env: TyEnv, expected: Ty, found: Ty) : Bool {
+  match expected {
+    TyCon(u_name, _) -> match found {
+      TyCon(t_name, _) -> {
+        let comps = variants_of_type(env, u_name)
+        list_has(comps, t_name)
+      }
+      _ -> false
+    }
+    _ -> false
   }
 }
 
@@ -24008,6 +24159,72 @@ fn check_pattern(st: InferState, pat: Pattern, expected: Ty) : InferState {
       let env2 = ty_env_add(st.env, nm, mono(apply_ty(st.sub, expected)))
       check_pattern(st_set_env(st, env2), sub, expected)
     }
+    # issue #187 phase 3: type-narrowing pattern. The scrutinee must
+    # be a `TyUnion` containing the narrow type as a component; bind
+    # `name` at the narrow type so the arm body can call APIs that
+    # accept the component directly. Exhaustiveness treats this as
+    # full coverage of the component's variants (see
+    # `check_exhaustive`). Codegen never sees `PNarrow` — it is
+    # rewritten to a sequence of `PAs(name, PVariant(Vi, []))` arms
+    # in `expand_narrow_arms` after typing.
+    PNarrow(name, ty_expr) -> check_narrow_pattern(st, name, ty_expr, expected, pat.line, pat.col)
+  }
+}
+
+# issue #187 phase 3: validate `name : T` against the scrutinee type.
+# Two scrutinee shapes are accepted:
+#   - `TyUnion(parts)` (Phase 2 first-class form, not yet produced
+#     anywhere in stage 2 but kept symmetric for forward compat).
+#   - `TyCon(u, [])` whose env-recorded variants include the narrow
+#     type's tycon name as a "component" (today's dual-representation
+#     path: `type T = A | B` registers `A` and `B` as zero-arg
+#     variants of `T`, and Phase 2 confirmed those variant names
+#     reference pre-declared types via `validate_union_collisions`).
+fn check_narrow_pattern(st: InferState, name: String, ty_expr: TypeExpr,
+                         expected: Ty, line: Int, col: Int) : InferState {
+  let narrow_ty = resolve_ty(ty_expr)
+  let scrut_now = apply_ty(st.sub, expected)
+  match scrut_now {
+    TyUnion(parts) -> if ty_list_contains(parts, narrow_ty) {
+      let env2 = ty_env_add(st.env, name, mono(narrow_ty))
+      st_set_env(st, env2)
+    } else {
+      diag_error(st.file, line, col,
+        "type-narrowing pattern targets `#{ty_to_string(narrow_ty)}`, which is not a component of `#{ty_to_string(scrut_now)}`")
+      diag_help("the narrow type must appear as one of the union's components, declared via `type T = A | B`")
+      let env2 = ty_env_add(st.env, name, mono(narrow_ty))
+      st_bump_err(st_set_env(st, env2))
+    }
+    TyCon(u_name, _) -> {
+      let narrow_name = match narrow_ty {
+        TyCon(n, _) -> n
+        _           -> ""
+      }
+      let comps = if narrow_name == "" { [] } else { variants_of_type(st.env, u_name) }
+      if narrow_name != "" and list_has(comps, narrow_name) {
+        let env2 = ty_env_add(st.env, name, mono(narrow_ty))
+        st_set_env(st, env2)
+      } else {
+        diag_error(st.file, line, col,
+          "type-narrowing pattern targets `#{ty_to_string(narrow_ty)}`, which is not a component of `#{ty_to_string(scrut_now)}`")
+        diag_help("the narrow type must appear as one of the union's components, declared via `type T = A | B`")
+        let env2 = ty_env_add(st.env, name, mono(narrow_ty))
+        st_bump_err(st_set_env(st, env2))
+      }
+    }
+    _ -> {
+      diag_error(st.file, line, col,
+        "type-narrowing pattern `#{name} : #{ty_to_string(narrow_ty)}` requires a union scrutinee, found `#{ty_to_string(scrut_now)}`")
+      let env2 = ty_env_add(st.env, name, mono(narrow_ty))
+      st_bump_err(st_set_env(st, env2))
+    }
+  }
+}
+
+fn ty_list_contains(tys: [Ty], target: Ty) : Bool {
+  match tys {
+    [] -> false
+    [t, ...rest] -> if ty_eq(t, target) { true } else { ty_list_contains(rest, target) }
   }
 }
 
@@ -24173,9 +24390,65 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
   let ra = synth_arms(rv.st, arms, rs_.ty, rv.ty, line, col)
   let ty = apply_ty(ra.st.sub, rv.ty)
   let scr_final = apply_ty(ra.st.sub, rs_.ty)
-  let st_post = check_exhaustive(ra.st, arms, scr_final, line, col)
-  let root = with_ty(mk_expr(EMatch(rs_.expr, ra.arms), line, col), ty)
+  let st_post = check_exhaustive(ra.st, ra.arms, scr_final, line, col)
+  # issue #187 phase 3: expand `PNarrow(name, T)` arms into one
+  # `PAs(name, PVariant(Vi, []))` arm per variant of T so codegen
+  # never sees `PNarrow`. Variants come from the post-resolve env
+  # (same accessor used by exhaustiveness). The rewrite is purely
+  # structural — `name`'s narrow type was bound during typing in
+  # `check_narrow_pattern`, so the body's typed AST is already
+  # consistent.
+  let arms_codegen = expand_narrow_arms(ra.arms, st_post.env)
+  let root = with_ty(mk_expr(EMatch(rs_.expr, arms_codegen), line, col), ty)
   mk_inferred(st_post, ty, root)
+}
+
+# issue #187 phase 3: rewrite every `PNarrow(name, T)` arm into a
+# sequence of `PAs(name, PVariant(Vi, []))` arms — one per variant
+# of T plus one for the component's own dual-rep ctor name. Under
+# Phase 2's "option A" coexistence the parent `type U = A | B`
+# decl registers `A` and `B` as zero-arg ctors of `U`, so a value
+# may carry either the parent's variant tag (`A`) OR an inner-type
+# variant tag (any variant of `A`'s own decl). Dispatching on both
+# keeps narrowing observably correct under whichever runtime layout
+# the user constructed the value with — Phase 4 will collapse the
+# two paths into a single representation.
+fn expand_narrow_arms(arms: [Arm], env: TyEnv) : [Arm] {
+  match arms {
+    [] -> []
+    [a, ...rest] -> match a {
+      Arm(pat, guard, body) -> match pat.pkind {
+        PNarrow(name, ty_expr) -> {
+          let narrow_ty = resolve_ty(ty_expr)
+          let tycon_name = match narrow_ty {
+            TyCon(n, _) -> n
+            _           -> ""
+          }
+          let inner_vs = if tycon_name == "" { [] } else { variants_of_type(env, tycon_name) }
+          # Cover both the dual-rep ctor name (matches values built
+          # via the parent union's own variant ctor) and each inner
+          # variant (matches values built via the component type's
+          # own ctors).
+          let all_vs = if tycon_name == "" { inner_vs } else { [tycon_name, ...inner_vs] }
+          let expanded = expand_narrow_one(all_vs, name, guard, body, pat.line, pat.col)
+          list_append(expanded, expand_narrow_arms(rest, env))
+        }
+        _ -> [a, ...expand_narrow_arms(rest, env)]
+      }
+    }
+  }
+}
+
+fn expand_narrow_one(vs: [String], name: String, guard: Option[Expr],
+                      body: Expr, line: Int, col: Int) : [Arm] {
+  match vs {
+    [] -> []
+    [v, ...rest] -> {
+      let inner = mk_pat(PVariant(v, []), line, col)
+      let pas = mk_pat(PAs(name, inner), line, col)
+      [Arm(pas, guard, body), ...expand_narrow_one(rest, name, guard, body, line, col)]
+    }
+  }
 }
 
 # ---- exhaustiveness checking ----
@@ -24381,24 +24654,179 @@ fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int
         match needed {
           [] -> st                     # unknown sum (e.g. Int, lists): skip
           _  -> {
-            let missing = find_missing_variants(needed, arms, [])
-            match missing {
-              [] -> st
-              _  -> {
-                diag_error(st.file, line, col,
-                  "non-exhaustive match on #{tycon}: missing #{join_with(missing, ", ")}")
-                diag_help("add an arm for each missing variant, or a wildcard `_` arm")
-                st_bump_err(st)
+            # issue #187 phase 3: under dual representation a `type
+            # T = A | B` decl registers `A` and `B` as zero-arg
+            # variants of `T`. When the user wrote a `PNarrow(_,C)`
+            # arm targeting one of those names, the match is a
+            # union-of-types form; recurse per-component so a
+            # narrowing arm covers every variant of that component
+            # transparently. When NO arm is a PNarrow we keep
+            # today's flat exhaustiveness — narrowing has not been
+            # used and reverting protects existing match shapes
+            # (regular sum types whose variant names happen to
+            # collide with other top-level type names — e.g.
+            # `ExprKind`'s variant `EVar` and the unrelated
+            # `type EVar = EV(...)` decl).
+            if any_arm_is_narrow(arms) {
+              check_union_components_under_tycon(st, arms, tycon, needed, line, col)
+            } else {
+              let missing = find_missing_variants(needed, arms, [])
+              match missing {
+                [] -> st
+                _  -> {
+                  diag_error(st.file, line, col,
+                    "non-exhaustive match on #{tycon}: missing #{join_with(missing, ", ")}")
+                  diag_help("add an arm for each missing variant, or a wildcard `_` arm")
+                  st_bump_err(st)
+                }
               }
             }
           }
         }
       }
       TyListT(_) -> check_list_exhaustive(st, arms, line, col)
+      # issue #187 phase 3: walk union components. A component is
+      # covered if (a) a `PNarrow(_, T)` arm targets the whole
+      # component, or (b) every variant of that component is covered
+      # by a `PVariant`-style arm. Diagnostics name the
+      # component-of-origin so the user knows which `type T = ...`
+      # declaration the missing variant belongs to.
+      TyUnion(parts) -> check_union_exhaustive(st, arms, parts, line, col)
       _ -> st
     }
   }
 }
+
+# issue #187 phase 3: per-component exhaustiveness over a union
+# scrutinee. Iterates each component; for components fully covered
+# by a `PNarrow` arm we are done; otherwise we walk the component's
+# variants and report any not covered by an arm.
+fn check_union_exhaustive(st: InferState, arms: [Arm], parts: [Ty],
+                            line: Int, col: Int) : InferState {
+  match parts {
+    [] -> st
+    [p, ...rest] -> {
+      let st1 = check_union_component(st, arms, p, line, col)
+      check_union_exhaustive(st1, arms, rest, line, col)
+    }
+  }
+}
+
+fn check_union_component(st: InferState, arms: [Arm], comp: Ty,
+                           line: Int, col: Int) : InferState {
+  match comp {
+    TyCon(tycon, _) -> {
+      if arms_cover_narrow(arms, tycon) { st }
+      else {
+        let needed = variants_of_type(st.env, tycon)
+        match needed {
+          [] -> st       # not a sum component (record / primitive); skip
+          _  -> {
+            let missing = find_missing_variants(needed, arms, [])
+            match missing {
+              [] -> st
+              _  -> {
+                diag_error(st.file, line, col,
+                  "non-exhaustive match: missing #{join_with(missing, ", ")} (component of #{tycon})")
+                diag_help("add an arm for each missing variant, a `name : #{tycon}` narrowing arm covering the whole component, or a wildcard `_` arm")
+                st_bump_err(st)
+              }
+            }
+          }
+        }
+      }
+    }
+    _ -> st              # non-nominal component (record / primitive / nested union): skip
+  }
+}
+
+# issue #187 phase 3: trigger for the per-component recursive
+# exhaustiveness check. Returns true iff any arm uses a `PNarrow`
+# pattern, which is the signal that the user is matching on a
+# union-of-types and wants per-component coverage.
+fn any_arm_is_narrow(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(pat, _, _) -> match pat.pkind {
+        PNarrow(_, _) -> true
+        _             -> any_arm_is_narrow(rest)
+      }
+    }
+  }
+}
+
+# issue #187 phase 3: walk the variants of a top-level TyCon. For
+# each variant name `c` we ask: is `c` itself a declared type with
+# its own sub-variants (a component of a union-of-types parent)? If
+# so, treat it as a component — covered iff a PNarrow arm targets
+# it OR all of its sub-variants are covered. Otherwise it's an
+# atomic variant and we check direct arm coverage.
+fn check_union_components_under_tycon(st: InferState, arms: [Arm], parent: String,
+                                        comps: [String], line: Int, col: Int) : InferState {
+  match comps {
+    [] -> st
+    [c, ...rest] -> {
+      let st1 = check_one_union_comp(st, arms, parent, c, line, col)
+      check_union_components_under_tycon(st1, arms, parent, rest, line, col)
+    }
+  }
+}
+
+fn check_one_union_comp(st: InferState, arms: [Arm], parent: String, comp: String,
+                          line: Int, col: Int) : InferState {
+  if arms_cover_narrow(arms, comp) { st }
+  else {
+    # If `comp` is itself a declared type with its own variants,
+    # this is a component of a union-of-types decl. Walk its
+    # variants and require each to be covered.
+    let sub_variants = variants_of_type(st.env, comp)
+    match sub_variants {
+      [] -> {
+        # Atomic variant of `parent` — direct coverage required.
+        if arms_cover_variant(arms, comp) { st }
+        else {
+          diag_error(st.file, line, col,
+            "non-exhaustive match on #{parent}: missing #{comp}")
+          diag_help("add an arm for each missing variant, or a wildcard `_` arm")
+          st_bump_err(st)
+        }
+      }
+      _ -> {
+        let missing = find_missing_variants(sub_variants, arms, [])
+        match missing {
+          [] -> st
+          _  -> {
+            diag_error(st.file, line, col,
+              "non-exhaustive match: missing #{join_with(missing, ", ")} (component of #{comp})")
+            diag_help("add an arm for each missing variant, a `name : #{comp}` narrowing arm covering the whole component, or a wildcard `_` arm")
+            st_bump_err(st)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn arms_cover_narrow(arms: [Arm], tycon: String) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(pat, guard, _) -> {
+        let unguarded = match guard { None -> true Some(_) -> false }
+        let hit = match pat.pkind {
+          PNarrow(_, ty) -> match ty.tkind {
+            TyName(nm, _) -> nm == tycon
+            _             -> false
+          }
+          _ -> false
+        }
+        if hit and unguarded { true } else { arms_cover_narrow(rest, tycon) }
+      }
+    }
+  }
+}
+
 
 # A list match is exhaustive when (a) some unguarded arm matches the
 # empty list `[]` and (b) some unguarded arm matches at least one
@@ -34330,6 +34758,7 @@ fn pat_binders(pat: Pattern, acc: [String]) : [String] = match pat.pkind {
   PRecord(fs)              -> pat_binders_pfields(fs, acc)
   PHole(_)                 -> acc
   PAs(name, inner)         -> pat_binders(inner, [name, ...acc])
+  PNarrow(name, _)         -> [name, ...acc]
 }
 
 fn pat_binders_list(ps: [Pattern], acc: [String]) : [String] = match ps {
@@ -36271,6 +36700,7 @@ fn rename_pat_names(p: Pattern, acc: [String]) : [String] {
     PRecord(fs)              -> rename_pfields_names(fs, acc)
     PHole(_)                 -> acc
     PAs(name, sub)           -> rename_pat_names(sub, [name, ...acc])
+    PNarrow(name, _)         -> [name, ...acc]
   }
 }
 
@@ -36875,6 +37305,7 @@ fn inv_pat_names(p: Pattern, acc: [String]) : [String] {
     PRecord(fs)              -> inv_pfields_names(fs, acc)
     PHole(_)                 -> acc
     PAs(name, sub)           -> inv_pat_names(sub, [name, ...acc])
+    PNarrow(name, _)         -> [name, ...acc]
   }
 }
 
@@ -38467,6 +38898,11 @@ fn fmt_pat(p: Pattern, s: FmtSt) : FmtSt {
       let s2 = fmt_emit(s1, " @ ")
       fmt_pat(sub, s2)
     }
+    PNarrow(name, ty) -> {
+      let s1 = fmt_emit(s, name)
+      let s2 = fmt_emit(s1, " : ")
+      fmt_type(ty, s2)
+    }
   }
 }
 
@@ -39634,7 +40070,15 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # emits an ECall to this name). Runs before
             # extract_pure_names_decls so the synthesised fns'
             # DAttribPure wrappers are picked up too.
-            let merged_raw_synth = synthesize_refine_pred_fns(merged_raw)
+            let merged_raw_synth0 = synthesize_refine_pred_fns(merged_raw)
+            # issue #187 phase 3: rewrite `PNarrow(name, T)` where
+            # `T` is a refinement-type alias back into
+            # `PBind(name)` + `__ref_pred_T(name)` guard so m12.6.x
+            # match-arm narrowing keeps working under the unified
+            # parser path. Non-alias `PNarrow` survives for the
+            # typer's union-component check.
+            let ref_alias_names = collect_refine_alias_names(merged_raw_synth0)
+            let merged_raw_synth = lower_pattern_narrow_decls(merged_raw_synth0, ref_alias_names)
             # §29 const desugar: collect names early (before extract
             # unwraps DAttribPure) but apply the EVar→ECall rewrite
             # late (after desugar_interp_decls so interpolated string
