@@ -392,6 +392,169 @@ impl Show for Money[u: Unit] {
 This keeps protocols compositional and predictable. A future protocol
 extension to support effect rows is possible but explicitly out of v1.
 
+#### Why the rule (the four reasons)
+
+The hard rule exists for four reasons, ordered by load-bearing:
+
+1. **Single-dispatch + effect rows = combinatorial complexity in the
+   vtable.** Today `kai_show_vtable` is a struct with one function
+   pointer. With per-impl effect rows, the vtable would need to carry
+   row information so the runtime can know what handlers must be
+   installed at the dispatch site. The clean monomorphic path lost.
+2. **Cross-impl row inference fights Tier 1 #3.** If `impl Audit for
+   Account { log(a) : Unit / Log + Time }` and `impl Audit for
+   Transaction { log(a) : Unit / Log }`, then a generic call
+   `log(x)` where `x: T` has a row that depends on the resolved impl
+   — that is row polymorphism, which the current typer does not
+   propagate.
+3. **Caller predictability.** A user who writes `log(x)` wants to
+   know which handlers to install in `handle { ... } with X { ... }`.
+   If the row varies per impl, the caller cannot know what to expect
+   without seeing the concrete type — defeats local reasoning.
+4. **Conceptual cleanliness.** Protocols describe *what a value is*
+   (Show, Eq, Ord). Effects describe *what a computation does*
+   (Console, File, Net). Mixing them blurs the line that the rest of
+   the language depends on.
+
+Reasons (1)–(3) are technical and load-bearing. Reason (4) is
+cultural and informs which use-cases are actually a misfit (effects
+that *describe* a value belong in `Show` / `Serialize`; effects that
+*do* something belong in an effect declaration).
+
+#### Use cases that pressure the rule
+
+Four shapes have been considered for kaikai. None is acute today;
+documented here so future contributors can match a real case to a
+proposal rather than re-derive the catalog.
+
+1. **Structured logging.** `protocol Logable { to_log_event(x: Self)
+   : LogEvent / Log }` — every type decides how it serialises into a
+   log event. Today: free function `to_log_event_account(a) : ... /
+   Log` per type, with manual dispatch.
+2. **Serialization with effects.** `Serialize.to_string` is pure
+   today. A type whose serialisation reads `Time.now()` for a
+   timestamp, or `Random.uuid()` for an ID, must compute those
+   effects beforehand and pass values in.
+3. **Iterators backed by I/O.** `protocol Iterator[T] { next(self:
+   Self) : Option[T] / Io }` — a stream over a file or socket would
+   want this. Today these are written as effects directly, no
+   protocol.
+4. **Validation with external lookups.** `protocol Validate {
+   check(x: Self) : Result[Unit, Error] / DbLookup }` for
+   validations that consult a database. Today: free function.
+
+Cases 2–4 imply an effect row that varies per impl (different types
+need different effects to validate / serialise / iterate). Case 1 is
+uniform — every `Logable` impl needs the same `Log` row.
+
+#### The four design alternatives (none chosen, all evaluated)
+
+For any future revisit, four families have been considered. They
+differ in expressiveness vs. typer cost.
+
+##### A. Status quo (the current rule)
+
+`impl P for T` is pure. Use-cases above are written as free
+functions with manual dispatch.
+
+- **Pros**: zero typer cost, zero runtime cost, single-dispatch
+  surface remains the simplest possible. No risk of slipping toward
+  typeclasses or row polymorphism.
+- **Cons**: loses dispatch ergonomics for cases 1–4. The user
+  matches manually on the type or threads function pointers.
+- **When this is right**: when no case of 1–4 dominates real code.
+  Today's posture.
+
+##### B. Uniform effect row declared by the protocol
+
+```kai
+protocol Logable / Log {
+  to_log_event(x: Self) : LogEvent
+}
+```
+
+The protocol declares its row at declaration site. Every `impl
+Logable for T` must have *exactly* that row — no more, no less.
+The vtable layout is unchanged because the row is fixed in advance,
+not per-impl.
+
+- **Pros**: caller predictability is total (every site sees the
+  protocol's declared row). Vtable simplicity preserved. No
+  cross-impl row inference. Closest to "protocol describes a
+  uniform contract".
+- **Cons**: rigid — case 2 (serialisation that needs `Time` for
+  one type, `Random` for another) does not fit. Forces the
+  protocol's row to the union, polluting impls that do not use all
+  of it.
+- **When this is right**: case 1 (logging) is the only real case;
+  the implementations are uniform across types.
+
+##### C. Per-impl effect row, monomorphic-only
+
+Each impl declares its own row:
+
+```kai
+impl Logable for Account     { to_log_event(a) : LogEvent / Log + Time }
+impl Logable for Transaction { to_log_event(t) : LogEvent / Log }
+```
+
+At monomorphic call sites (the typer knows `T = Account`), the row
+is instantiated from the resolved impl. Polymorphic call sites
+(`fn debug[T : Logable](x: T)`) carry a row hole that must be closed
+at the next monomorph step or rejected.
+
+- **Pros**: covers cases 2–4 cleanly when call sites are monomorphic
+  (the dominant case). Zero runtime cost.
+- **Cons**: introduces row polymorphism at protocol boundaries. The
+  typer must close the row at every monomorph site — a non-trivial
+  pass. Risk of typer slowdown.
+- **When this is right**: cases 2 or 3 dominate, and most call sites
+  are monomorphic.
+
+##### D. Per-impl row bounded by a declared upper bound
+
+```kai
+protocol Logable / e where e ⊆ Log + Time + Io {
+  to_log_event(x: Self) : LogEvent / e
+}
+
+impl Logable for Account     { to_log_event(a) : LogEvent / Log + Time }
+impl Logable for Transaction { to_log_event(t) : LogEvent / Log }
+```
+
+The protocol declares the *maximum* row any impl may take; each
+impl picks a subset. Callers see the upper bound conservatively —
+worst-case row is known at the declaration.
+
+- **Pros**: caller can install handlers for the upper bound and be
+  safe. Per-impl flexibility preserved. No full row polymorphism —
+  only subset checking, decidable.
+- **Cons**: heavier syntax (`/ e where e ⊆ ...`). The protocol
+  author must think about the row at declaration time.
+- **When this is right**: cases 2–4 dominate AND callers want
+  predictability. The closest to "row polymorphism without the
+  cost".
+
+#### Recommendation if the rule is reopened
+
+If a real case from (1)–(4) becomes load-bearing in kaikai or in a
+downstream framework (`ahu`, `kohau`, `henua`, `manutara`),
+re-evaluate in this order:
+
+1. Does case 1 (uniform logging) cover the need? If yes, **B** is
+   the safest reopening — minimum typer impact, maximum caller
+   predictability.
+2. Do cases 2–3 (per-type variation) dominate? Pick **C** if most
+   call sites are monomorphic, **D** if callers need to plan
+   handler installation in advance.
+3. Otherwise, A (status quo) wins by default. The cost of opening
+   the rule must be justified by a concrete case, not "it would be
+   nice to have".
+
+This sub-section is documentation of analysis, not a commitment.
+v1 ships with **A** (no effects in protocols). Reopening requires a
+fresh proposal with a concrete use case from the catalog above.
+
 ## What this is not
 
 To make the boundary with Haskell typeclasses unambiguous:
