@@ -41,7 +41,6 @@ on.
 | Binary pattern matching `<<...>>`          | proposed | parser + match exhaustiveness |
 | Multi-arg `match` sugar — `match a, b { ... }` | landed v1 — N ≤ 4, column-aware diagnostics deferred | parser |
 | `\|\|` flat-map pipe + `Sequence` protocol | proposed | parser + protocol dispatch in typer |
-| `protocol P requires Q` (impl-site coherence check) | proposed (#172) | m12.8 protocols (landed) |
 
 ### Closed (for reference; details in commits / CHANGELOG)
 
