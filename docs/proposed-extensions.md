@@ -40,6 +40,7 @@ on.
 | `Range[T]` as a first-class iterable       | proposed | collection design       |
 | Binary pattern matching `<<...>>`          | proposed | parser + match exhaustiveness |
 | Multi-arg `match` sugar — `match a, b { ... }` | landed v1 — N ≤ 4, column-aware diagnostics deferred | parser |
+| `\|\|` flat-map pipe + `Sequence` protocol | proposed | parser + protocol dispatch in typer |
 
 ### Closed (for reference; details in commits / CHANGELOG)
 
@@ -796,6 +797,182 @@ prior art, 25 years of production use), Elixir bitstrings
 (a recent re-implementation in a typed setting — closest fit
 to what kaikai would adopt).
 
+## 11. `||` flat-map pipe + `Sequence` protocol
+
+```kai
+# map (today, hardcoded for [T]):
+[1, 2, 3] | { x -> x * 2 }                    # [2, 4, 6]
+
+# flat-map (proposed):
+[1, 2, 3] || { x -> [x, x * 10] }             # [1, 10, 2, 20, 3, 30]
+
+# parser tokens out of CSV-shaped input, one token per line:
+read_lines(input) || split_csv | trim
+```
+
+A second pipe operator `||` for **flat-map**, paired with a
+`Sequence[F[_]]` protocol that defines the dispatch target for both
+`|` (map) and `||` (flat-map). The protocol unifies eager
+collections (`[T]` today) with lazy / streaming containers (`Stream[T]`
+when ahu introduces it) under one uniform surface.
+
+### Surface
+
+| Operator | Today                          | Proposed                              |
+|----------|--------------------------------|---------------------------------------|
+| `\|>`    | apply-pipe (first-arg threading) | unchanged — still the general pipe  |
+| `\|`     | map-pipe, hardcoded for `[T]`  | `Sequence.map` dispatched by the inferred LHS type |
+| `\|\|`   | (unused; available — `or` covers boolean OR) | `Sequence.flat_map` dispatched by the inferred LHS type |
+
+`||` is free in kaikai's surface because boolean OR is spelled
+`or` (Python-style). No collision with the existing grammar.
+
+### The `Sequence` protocol
+
+```kai
+protocol Sequence[F[_]] {
+  fn map[A, B](self: F[A], f: A -> B) : F[B]
+  fn flat_map[A, B](self: F[A], f: A -> F[B]) : F[B]
+}
+
+# v1 stdlib impl:
+impl Sequence for [_] {
+  fn map(xs, f)      = list.map(xs, f)
+  fn flat_map(xs, f) = list.flat_map(xs, f)
+}
+```
+
+A single protocol carries both methods because every type that
+sensibly implements one implements the other in this ecosystem
+(`[T]`, future `Stream[T]`, future `Vector[T]`). Splitting `Map`
+and `FlatMap` apart pays the cost of two protocols today for a
+hypothetical `Validation`-style accumulator that is **not** on
+the roadmap. If such a type ever lands, it lives outside
+`Sequence` with its own surface — same posture as `Option` /
+`Result` keeping `!` instead of joining `Sequence`.
+
+The protocol is **single-dispatch** (`docs/protocols.md`,
+m12.8) — `O(1)` impl-table lookup, no HKT propagation, no
+constraint resolution. It composes cleanly with kaikai's Tier
+1 #3 commitment.
+
+### Why `||` doubles `|`
+
+The visual family reads top-to-bottom: `|>` apply, `|` map (one
+level), `||` flat-map (one level deeper, hence "doubled"). The
+mental rule is one sentence: *one bar maps, two bars flatten*.
+
+This is **not** the same flow as the rejected `<-` monadic bind
+(see *Deliberately not on this list*). `<-` proposed a generic
+binding form for `Option` / `Result` / effects with do-notation
+semantics; `||` is a binary pipe over containers in the
+`Sequence` family, with `Option` / `Result` *explicitly outside*
+the protocol. The `!` postfix continues to cover propagation;
+`||` covers in-pipe flat-map over sequences. Different problems,
+different surface.
+
+### What it buys
+
+- **Fills the gap that `|` leaves**: today, flat-map over a list
+  inside a pipeline forces a break in the chain
+  (`xs |> list.flat_map { x -> ... }`), which reads worse than
+  the `|`-style code around it. `||` keeps the pipeline visually
+  uniform.
+- **Strategic alignment with ahu**: ahu is the natural home for
+  `Stream[T]` (lazy, possibly infinite, with backpressure —
+  Elixir GenStage / Flow analogue). The day ahu introduces
+  `Stream[T]`, it adds `impl Sequence for Stream[_]` and the
+  pipe surface works without changes to the language. No
+  retrofit, no breaking change.
+- **Names the concept honestly**: `Sequence` is a domain word
+  (a type that produces elements one at a time, in order). It
+  carries no theoretical baggage (`Functor` / `Monad` / `Bind`),
+  no laws to promise, no do-notation pendant. Aligns with
+  *approachable core, novel where it pays off* (CLAUDE.md Tier
+  2 #5).
+- **LLM benefit (Tier 3)**: one protocol with two operators is
+  easier for an LLM to use correctly than ad-hoc helpers or
+  two hardcoded built-ins. The dispatch rule is local to the
+  LHS type and visible in `--holes-json`.
+
+### What it costs
+
+- **Typer dispatch for `|` migrates from hardcoded to protocolar.**
+  Today `EMapPipe` is hardcoded to `list.map`; the typer would
+  learn to look up `Sequence.map` for the inferred LHS type.
+  For `[T]` this is one protocol-table entry — the codegen lowers
+  to the same `list.map` call, so runtime cost is unchanged.
+  For tagged unions where the tag is unresolved, the typer
+  defaults to `[T]` (same fallback rule that the `Map[K, V]` v1
+  uses for `e1[e2]` indexing).
+- **A v1 with one impl can read as over-engineered.** Mitigation:
+  the v1 lane lands `Sequence` *with the migration of `|`*, so
+  the protocol carries its weight from day one (two operators,
+  one dispatch path) rather than sitting alongside a hardcoded
+  `|` until a second impl arrives.
+- **Operator ergonomics on shift-less keyboards.** `||` is
+  shift-bar twice; some non-US layouts make it awkward. Same
+  cost as boolean `||` in C-family languages; not a blocker.
+- **Parser**: `||` is two `|` tokens with no whitespace between.
+  LL(1)-friendly: the lexer tokenises `||` as a single `BARBAR`
+  token; same precedence as `|`, left-associative. Same precedence
+  rule as `|`, so chains read left-to-right uniformly.
+
+### Constraints (explicit, to keep the surface tight)
+
+1. **`Option` / `Result` do NOT implement `Sequence`.** They keep
+   `!` for propagation. This is a hard rule — it prevents the
+   pipe operators from drifting into a generic monadic bind.
+2. **The protocol's two methods land together.** A `Sequence`
+   impl provides both `map` and `flat_map`; partial impls are
+   rejected at resolve time. This avoids a slow drift into two
+   separate protocols.
+3. **No `pure` / `return` in the protocol.** `Sequence` does not
+   provide a way to lift a single value into the container. Each
+   container exposes its own constructor (`[x]`, `Stream.of(x)`,
+   etc.). This is what keeps the protocol non-monadic.
+4. **No do-notation, no `for` comprehension over `Sequence`.**
+   The pipe operators are the surface; comprehensions and bind
+   blocks would be a third mechanism.
+5. **Same-line attachment rule applies.** `xs || { x -> ... }`
+   parses as flat-map only when `||` and `{` are on the same
+   line, mirroring the existing rule for `|` (see
+   `docs/syntax-sugars.md` §1).
+
+### Decision posture
+
+Land as a single lane that bundles:
+1. The `Sequence` protocol declaration in stdlib.
+2. `impl Sequence for [_]`.
+3. Lexer tokenisation of `||` as `BARBAR`.
+4. Parser entry for the `||` binop at the same precedence as
+   `|`, left-associative.
+5. Typer migration of `|` from hardcoded `EMapPipe` to
+   `Sequence.map` dispatch (with the unresolved-LHS default to
+   `[T]`).
+6. Codegen unchanged for `[T]` (lowers to the same `list.map` /
+   `list.flat_map` calls).
+7. Regression fixtures in `examples/sequence/` (positive: round
+   trips over `[T]`; negative: `Option` rejected with a typed
+   error pointing at `!` and `opt_and_then`).
+
+The lane is independent of any milestone in flight (m12.6
+refinement waves, Anga Roa Perceus). It can land any time after
+m12.8 protocols (already closed). The natural window is the
+"language-surface consolidation" pass that closes
+`design.md`'s open decision.
+
+**Cost**: medium. Parser + lexer (small), typer dispatch
+migration (the bulk of the work), one stdlib impl, fixtures.
+**Depends on**: nothing structural; protocols (m12.8) already
+landed.
+
+**Reference**: Elixir `Stream` + `Enum` (the same operations
+work over both, dispatched by protocol; closest analog), F#
+`seq` computation expression (same idea, different surface),
+Rust `Iterator::flat_map` (single trait, two methods —
+structurally the same as `Sequence`).
+
 ## Deliberately not on this list
 
 These were considered and rejected for the same reasons they are
@@ -826,10 +1003,17 @@ rejected elsewhere in the design:
   an otherwise expression-oriented surface.
 - **`&&` / `||` for Bool**: duplicate `and` / `or` without distinct
   intent. `and` / `or` stay as the canonical boolean operators.
+  Note: `||` is *not* unused — it is reserved for the flat-map pipe
+  proposal (§11). The point here is only that it does **not** duplicate
+  boolean `or`.
 - **`<-` as monadic bind / effect shorthand**: `!` (already landed)
   covers the propagation pattern for `Option` / `Result`; kaikai's
   direct-style effects do not need a bind operator. Adding `<-`
-  would be a second mechanism for the same flow.
+  would be a second mechanism for the same flow. The flat-map pipe
+  `||` (§11) is **not** the same proposal: `||` is a binary pipe
+  over containers in the `Sequence` family (`[T]`, future `Stream[T]`),
+  with `Option` / `Result` explicitly outside the protocol. Different
+  problems, different surface.
 - **`$` low-precedence apply (Haskell-style)**: `|>` and `|` already
   avoid paren pyramids. `$` would be a third way to write the same
   chain.
@@ -856,7 +1040,7 @@ Each extension lands only when:
 3. The feature fits in ≤500 lines on top of the stage-2 checker.
    Anything larger gets its own design doc first.
 
-### For language-surface features (sections 4–10)
+### For language-surface features (sections 4–11)
 
 These land only alongside the closing of *"Concrete syntax
 consolidation"* in `design.md`. Any decision should be made as part
@@ -891,6 +1075,15 @@ of that one conversation — not drip-fed.
 - **Binary pattern matching `<<...>>`**: a milestone in its own
   right (m13–m14 range). Bring forward only if a fintech-toolkit
   binding (FIX 4.4 likely first) becomes a concrete priority.
+- **`||` flat-map pipe + `Sequence` protocol**: lands as a single
+  bundled lane (protocol + `[T]` impl + `|` migration to protocol
+  dispatch + lexer/parser + fixtures). Independent of milestones in
+  flight; depends only on m12.8 protocols (already closed). Natural
+  window is the language-surface consolidation pass that closes
+  `design.md`'s open decision. Defer if no concrete pipeline pain
+  has surfaced — but the strategic case (ahu `Stream[T]` arriving
+  without a retrofit) is the main reason to land it before ahu
+  needs it.
 
 The goal is to keep the surface small. A handful of orthogonal,
 well-integrated extensions is worth more than a pile of clever
