@@ -109,6 +109,54 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   warrants. Closes #129; `docs/proposed-extensions.md` §9 status
   flips to "landed v1".
 
+- **stdlib `Clock` default handler (Tier S1 #4 of `docs/stdlib-roadmap.md`).**
+  `stdlib/time.kai` shipped the `Clock` effect declaration + pure
+  `Duration` / `Instant` arithmetic earlier; the default handler that
+  bridges `wall_now` / `monotonic_now` / `sleep_ns` to the OS was the
+  last gap. With this lane, `time.now()` / `time.monotonic()` /
+  `time.sleep(d)` "just work" without the caller installing a
+  handler — required for `ahu` timers and `manutara` request
+  deadlines.
+  - **C-side wrappers (`stage0/runtime.h`).** Three new
+    `kai_default_clock_*` statics: `wall_now` calls
+    `clock_gettime(CLOCK_REALTIME, ...)` and resumes with a
+    `WallTime { secs, nanos }` record; `monotonic_now` mirrors with
+    `CLOCK_MONOTONIC` → `Instant`; `sleep_ns` runs `nanosleep` in an
+    `EINTR` loop and resumes with `Unit`. POSIX `<time.h>` only — no
+    new external dependencies. `clock_gettime` failure panics with a
+    banner on stderr, matching `Console`'s error model
+    (`docs/effects-stdlib.md` §`Clock` / *Error model*). LLVM-side
+    extern wrappers (`kaix_default_clock_*`) added in
+    `stage0/runtime_llvm.c`.
+  - **Compiler installer wiring (`stage2/compiler.kai`).** Mirrors
+    `Random` / `NetTcp`: `default_clock_shims` / `default_clock_setup`
+    register a typed shim per op and push an `EvClock` node onto the
+    evidence stack inside the `kai_main` wrapper when `Clock` appears
+    in `main`'s row. The atomic effect declaration lives in
+    `stdlib/time.kai` (not as a compiler builtin), so user code
+    reaches the handler via `import time` + writing `time.now()` /
+    `time.monotonic()` / `time.sleep(d)`. LLVM backend mirrors the C
+    path in `llvm_emit_main_install_defaults` +
+    `llvm_emit_main_teardown_defaults`.
+  - **Fixture (`examples/stdlib/time_clock_default.kai`).** Calls
+    `monotonic()`, `sleep(millis(10))`, `monotonic()` again, and
+    asserts the elapsed `Duration` sits in `[10ms, 1000ms]`. The
+    fixture deliberately installs no `Clock` handler — that is what
+    proves the runtime default works. The upper bound is generous so
+    loaded CI runners do not flake; the lower bound is the
+    load-bearing assertion (the handler actually slept rather than
+    no-op'd). Wired into `stage2/Makefile`'s `test-stdlib` target via
+    the new `--prelude ../stdlib/time.kai` entry in
+    `EXTRA_PRELUDE_FLAGS`, mirroring how `Random` is loaded for other
+    stdlib fixtures.
+  - **`sleep` is not yet `Cancel`-aware.** Under the m8 v1
+    inline-eager scheduler `sleep_ns` blocks the OS thread; a
+    cancellation delivered while a fiber sleeps is observed only
+    after wake-up. The cooperative scheduler in m8.x upgrades the
+    handler to register the fiber on a timer wheel and yield through
+    `Spawn.yield` so `Cancel` interrupts mid-sleep. Tracked in the
+    m8.x follow-up.
+
 ## [0.37.0] — 2026-05-02 (Tongariki MVP closed — last 6 mvp-blockers landed)
 
 The Tongariki MVP claim ships without an asterisk. The last six
