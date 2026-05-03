@@ -604,6 +604,39 @@ test-trap-exit-cancel-asan: $(TARGET) build
 	    || { echo "trap-exit-cancel-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
+# Issue #126 — ASAN+UBSan sibling for the Process default-handler
+# fixture. The handler does fork(2) + execvp(3) + waitpid(2): the
+# argv-build path malloc's per-element strdup'd C strings, and the
+# parent's recovery path frees them after the child has been
+# spawned. ASan catches a UAF / double-free in either path; UBSan
+# catches a signed-overflow regression in the WIFEXITED /
+# WEXITSTATUS macros. The parent process is what is instrumented;
+# /bin/echo runs as a separate process and is not under ASan, so
+# the harness pattern matches the runtime-shadow-asan / signal-
+# trap-asan precedents — diagnostics on the parent are what gate
+# the lane. Wired into the top-level `tier1-asan` rule alongside
+# the other ASAN gates.
+PROCESS_BASIC_FIXTURES := process_basic
+
+test-process-basic-asan: $(TARGET) build
+	@set -e; \
+	for name in $(PROCESS_BASIC_FIXTURES); do \
+	  ./$(TARGET) ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
+	    echo "process-basic-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
+	    && echo "process-basic-asan OK $$name" \
+	    || { echo "process-basic-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	done
+
 # stdlib/time.kai smoke test — exercises the Clock effect (wall_now,
 # monotonic_now, sleep_ns) plus pure Duration / Instant arithmetic.
 # v0 has no default Clock handler (m8.x scope); the fixture installs
@@ -1784,6 +1817,23 @@ test-effects: $(TARGET) build
 	  fi; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Signal.on/off/await: SIGINT trap → clean exit 0)" \
+	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/process_basic.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_default_process_start" build/s2-$$name.c \
+	    && grep -q "kai_default_process_wait"  build/s2-$$name.c \
+	    && grep -q "kai_evidence_push(&_kai_default_node_process" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (default-Process wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (Process.start + wait: /bin/echo hello → Exited(0))" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done
 
