@@ -40,7 +40,7 @@ on.
 | `Range[T]` as a first-class iterable       | proposed | collection design       |
 | Binary pattern matching `<<...>>`          | proposed | parser + match exhaustiveness |
 | Multi-arg `match` sugar — `match a, b { ... }` | landed v1 — N ≤ 4, column-aware diagnostics deferred | parser |
-| `\|\|` flat-map pipe + `Sequence` protocol | proposed | parser + protocol dispatch in typer |
+| `\|\|` flat-map pipe + naming-convention dispatch (revised 2026-05-03) | proposed | parser + head-type-to-module map in typer |
 
 ### Closed (for reference; details in commits / CHANGELOG)
 
@@ -797,7 +797,17 @@ prior art, 25 years of production use), Elixir bitstrings
 (a recent re-implementation in a typed setting — closest fit
 to what kaikai would adopt).
 
-## 11. `||` flat-map pipe + `Sequence` protocol
+## 11. `||` flat-map pipe + naming-convention dispatch for `|` and `||`
+
+> **Revision note (2026-05-03)**: the original proposal in this section
+> targeted a `protocol Sequence[F[_]]` with higher-kinded type
+> parameter. Empirical verification confirmed that **HKT is rejected
+> by Tier 1 #3** (`docs/protocols.md` *No higher-kinded types*) and
+> the protocol form does not parse. The proposal has been rewritten
+> below to use **naming-convention dispatch** — a built-in compiler
+> mechanism that resolves `|` and `||` by looking up `map` /
+> `flat_map` in the module canonically associated with the LHS's
+> head type. No HKT, no protocol changes, no Tier 1 #3 revision.
 
 ```kai
 # map (today, hardcoded for [T]):
@@ -810,11 +820,13 @@ to what kaikai would adopt).
 read_lines(input) || split_csv | trim
 ```
 
-A second pipe operator `||` for **flat-map**, paired with a
-`Sequence[F[_]]` protocol that defines the dispatch target for both
-`|` (map) and `||` (flat-map). The protocol unifies eager
-collections (`[T]` today) with lazy / streaming containers (`Stream[T]`
-when ahu introduces it) under one uniform surface.
+A second pipe operator `||` for **flat-map**, paired with a unified
+**naming-convention dispatch** mechanism that drives both `|` (map)
+and `||` (flat-map). The compiler resolves `xs | f` and `xs || f` by
+looking up `map` and `flat_map` in the module canonically associated
+with the head type of `xs`. This unifies eager collections (`[T]`
+today) with lazy / streaming containers (`Stream[T]` when ahu
+introduces it) under one uniform surface, **without HKT**.
 
 ### Surface
 
@@ -827,34 +839,47 @@ when ahu introduces it) under one uniform surface.
 `||` is free in kaikai's surface because boolean OR is spelled
 `or` (Python-style). No collision with the existing grammar.
 
-### The `Sequence` protocol
+### Naming-convention dispatch
 
-```kai
-protocol Sequence[F[_]] {
-  fn map[A, B](self: F[A], f: A -> B) : F[B]
-  fn flat_map[A, B](self: F[A], f: A -> F[B]) : F[B]
-}
+The compiler does not introduce a new protocol. Instead, both
+operators desugar via a built-in dispatch rule:
 
-# v1 stdlib impl:
-impl Sequence for [_] {
-  fn map(xs, f)      = list.map(xs, f)
-  fn flat_map(xs, f) = list.flat_map(xs, f)
-}
+```
+xs | f  ≡ <module-of-head(xs)>.map(xs, f)
+xs || f ≡ <module-of-head(xs)>.flat_map(xs, f)
 ```
 
-A single protocol carries both methods because every type that
-sensibly implements one implements the other in this ecosystem
-(`[T]`, future `Stream[T]`, future `Vector[T]`). Splitting `Map`
-and `FlatMap` apart pays the cost of two protocols today for a
+Where `module-of-head(xs)` is the module that declares the head
+type of `xs`. For `[T]`, the head type is `List` (already tracked
+by `ty_head_name` in stage 2), declared in `stdlib/core/list.kai`,
+exposing `pub fn map` and `pub fn flat_map`. For a user type
+`MyContainer[T]`, the head module is the file declaring
+`MyContainer`.
+
+ahu's future `Stream[T]` participates without compiler changes:
+
+```kai
+# ahu/stream.kai (future):
+pub type Stream[T] = ...
+pub fn map(s: Stream[a], f: (a) -> b) : Stream[b] = ...
+pub fn flat_map(s: Stream[a], f: (a) -> Stream[b]) : Stream[b] = ...
+```
+
+`s : Stream[Int]` then makes `s | f` and `s || f` work transparently.
+
+A single dispatch mechanism covers both methods because every type
+that sensibly implements one implements the other in this ecosystem
+(`[T]`, future `Stream[T]`, future `Vector[T]`). Splitting `map`
+and `flat_map` apart pays the cost of two lookups today for a
 hypothetical `Validation`-style accumulator that is **not** on
 the roadmap. If such a type ever lands, it lives outside
 `Sequence` with its own surface — same posture as `Option` /
 `Result` keeping `!` instead of joining `Sequence`.
 
-The protocol is **single-dispatch** (`docs/protocols.md`,
-m12.8) — `O(1)` impl-table lookup, no HKT propagation, no
-constraint resolution. It composes cleanly with kaikai's Tier
-1 #3 commitment.
+The mechanism is **single-dispatch by head type** with module
+lookup. The vtable is the module table itself — `O(1)` lookup, no
+HKT, no constraint resolution. It composes cleanly with kaikai's
+Tier 1 #3 commitment.
 
 ### Why `||` doubles `|`
 
@@ -865,11 +890,10 @@ mental rule is one sentence: *one bar maps, two bars flatten*.
 This is **not** the same flow as the rejected `<-` monadic bind
 (see *Deliberately not on this list*). `<-` proposed a generic
 binding form for `Option` / `Result` / effects with do-notation
-semantics; `||` is a binary pipe over containers in the
-`Sequence` family, with `Option` / `Result` *explicitly outside*
-the protocol. The `!` postfix continues to cover propagation;
-`||` covers in-pipe flat-map over sequences. Different problems,
-different surface.
+semantics; `||` is a binary pipe over sequence-shaped containers,
+with `Option` / `Result` *explicitly outside* the dispatch table.
+The `!` postfix continues to cover propagation; `||` covers in-pipe
+flat-map over sequences. Different problems, different surface.
 
 ### What it buys
 
@@ -881,59 +905,61 @@ different surface.
 - **Strategic alignment with ahu**: ahu is the natural home for
   `Stream[T]` (lazy, possibly infinite, with backpressure —
   Elixir GenStage / Flow analogue). The day ahu introduces
-  `Stream[T]`, it adds `impl Sequence for Stream[_]` and the
-  pipe surface works without changes to the language. No
-  retrofit, no breaking change.
-- **Names the concept honestly**: `Sequence` is a domain word
-  (a type that produces elements one at a time, in order). It
-  carries no theoretical baggage (`Functor` / `Monad` / `Bind`),
-  no laws to promise, no do-notation pendant. Aligns with
-  *approachable core, novel where it pays off* (CLAUDE.md Tier
-  2 #5).
-- **LLM benefit (Tier 3)**: one protocol with two operators is
-  easier for an LLM to use correctly than ad-hoc helpers or
-  two hardcoded built-ins. The dispatch rule is local to the
-  LHS type and visible in `--holes-json`.
+  `Stream[T]`, it adds the type and exports `pub fn map` /
+  `pub fn flat_map` in the same module — and the pipe surface
+  works without changes to the compiler. No retrofit, no breaking
+  change.
+- **No HKT, no Tier 1 #3 revision.** The dispatch is by head type
+  (kind `*` on the type level), not by type constructor (kind
+  `* -> *`). The lookup is in a module table the compiler already
+  maintains, not in a synthesized higher-kinded protocol.
+- **LLM benefit (Tier 3)**: the dispatch rule is local, public, and
+  discoverable. An LLM that wants to add `||` support to a new
+  type sees that it must (a) declare the type in a module, (b)
+  export `pub fn map` and `pub fn flat_map` with the canonical
+  signatures, (c) ensure the head type matches `ty_head_name`'s
+  output. All visible in JSON via `--holes-json`.
 
 ### What it costs
 
-- **Typer dispatch for `|` migrates from hardcoded to protocolar.**
-  Today `EMapPipe` is hardcoded to `list.map`; the typer would
-  learn to look up `Sequence.map` for the inferred LHS type.
-  For `[T]` this is one protocol-table entry — the codegen lowers
-  to the same `list.map` call, so runtime cost is unchanged.
-  For tagged unions where the tag is unresolved, the typer
-  defaults to `[T]` (same fallback rule that the `Map[K, V]` v1
-  uses for `e1[e2]` indexing).
-- **A v1 with one impl can read as over-engineered.** Mitigation:
-  the v1 lane lands `Sequence` *with the migration of `|`*, so
-  the protocol carries its weight from day one (two operators,
-  one dispatch path) rather than sitting alongside a hardcoded
-  `|` until a second impl arrives.
+- **Typer dispatch for `|` migrates from hardcoded to module-lookup.**
+  Today `EMapPipe` is hardcoded to `list.map`; the typer learns to
+  call `<module>.map(xs, f)` where `<module>` is the head type's
+  declaring module. For `[T]` this is `stdlib/core/list.kai` —
+  codegen produces the same call, runtime cost unchanged.
+- **Type-to-module mapping infrastructure.** Today the typer has
+  `ty_head_name` returning the head type's name (`"List"`, `"Stream"`,
+  user-defined `TyCon` names). It does **not** have a "head name →
+  declaring module" map. The lane adds this map (populated during
+  resolve) and exposes lookup to the typer's pipe-dispatch path.
+  Estimated: ~50 additional lines.
 - **Operator ergonomics on shift-less keyboards.** `||` is
   shift-bar twice; some non-US layouts make it awkward. Same
   cost as boolean `||` in C-family languages; not a blocker.
 - **Parser**: `||` is two `|` tokens with no whitespace between.
   LL(1)-friendly: the lexer tokenises `||` as a single `BARBAR`
-  token; same precedence as `|`, left-associative. Same precedence
-  rule as `|`, so chains read left-to-right uniformly.
+  token; same precedence as `|`, left-associative.
 
 ### Constraints (explicit, to keep the surface tight)
 
-1. **`Option` / `Result` do NOT implement `Sequence`.** They keep
-   `!` for propagation. This is a hard rule — it prevents the
+1. **`Option` / `Result` do NOT participate in pipe dispatch.** They
+   keep `!` for propagation. The compiler rejects `opt | f` with a
+   typed error pointing at `opt_and_then` / `!`. This prevents the
    pipe operators from drifting into a generic monadic bind.
-2. **The protocol's two methods land together.** A `Sequence`
-   impl provides both `map` and `flat_map`; partial impls are
-   rejected at resolve time. This avoids a slow drift into two
-   separate protocols.
-3. **No `pure` / `return` in the protocol.** `Sequence` does not
-   provide a way to lift a single value into the container. Each
-   container exposes its own constructor (`[x]`, `Stream.of(x)`,
-   etc.). This is what keeps the protocol non-monadic.
-4. **No do-notation, no `for` comprehension over `Sequence`.**
-   The pipe operators are the surface; comprehensions and bind
-   blocks would be a third mechanism.
+2. **A type opts in by exporting both `map` and `flat_map` from
+   its declaring module.** Half-impls (only `map`) cause `||` to
+   fail at the call site with "missing `flat_map` in module
+   `<module>`". The diagnostic suggests adding the function or not
+   using `||` for that type.
+3. **Canonical signatures are enforced.** The typer checks that
+   `<module>.map` has signature `(<HeadType>[a], (a) -> b) ->
+   <HeadType>[b]` and `<module>.flat_map` has `(<HeadType>[a],
+   (a) -> <HeadType>[b]) -> <HeadType>[b]`. Off-shape signatures
+   are rejected (the function is fine for direct call, just not
+   pipe-eligible).
+4. **One module per head type.** The "head type → module" map is
+   one-to-one. The typer rejects ambiguity at registration time
+   if two modules try to claim the same head type.
 5. **Same-line attachment rule applies.** `xs || { x -> ... }`
    parses as flat-map only when `||` and `{` are on the same
    line, mirroring the existing rule for `|` (see
@@ -942,36 +968,76 @@ different surface.
 ### Decision posture
 
 Land as a single lane that bundles:
-1. The `Sequence` protocol declaration in stdlib.
-2. `impl Sequence for [_]`.
-3. Lexer tokenisation of `||` as `BARBAR`.
-4. Parser entry for the `||` binop at the same precedence as
+1. Lexer tokenisation of `||` as `BARBAR`.
+2. Parser entry for the `||` binop at the same precedence as
    `|`, left-associative.
-5. Typer migration of `|` from hardcoded `EMapPipe` to
-   `Sequence.map` dispatch (with the unresolved-LHS default to
-   `[T]`).
-6. Codegen unchanged for `[T]` (lowers to the same `list.map` /
-   `list.flat_map` calls).
+3. Resolver: build the head-type-to-module map from each module's
+   exported types.
+4. Typer: extend pipe-dispatch (`EMapPipe` and new `EFlatMapPipe`)
+   to look up `<module>.map` / `<module>.flat_map` by the LHS's
+   head type. Validate signatures match the canonical shape.
+5. Migration of `|` from hardcoded `list.map` to module lookup.
+   For `[T]`, the resolved module is `stdlib/core/list`, and
+   `list.map` is what gets called — same as today.
+6. Codegen unchanged for `[T]` (same `list.map` / `list.flat_map`
+   calls). New head types lower to their respective modules'
+   functions.
 7. Regression fixtures in `examples/sequence/` (positive: round
    trips over `[T]`; negative: `Option` rejected with a typed
-   error pointing at `!` and `opt_and_then`).
+   error pointing at `!` and `opt_and_then`; negative: type with
+   only `map` rejected when `||` is used).
 
 The lane is independent of any milestone in flight (m12.6
-refinement waves, Anga Roa Perceus). It can land any time after
-m12.8 protocols (already closed). The natural window is the
-"language-surface consolidation" pass that closes
-`design.md`'s open decision.
+refinement waves, Anga Roa Perceus, unions milestone #184). It can
+land any time after m12.8 protocols (already closed). Recommended
+to land **after unions (#184)** so the typer changes from unions
+have stabilized — the head-type-to-module map can reuse the same
+module-tracking infrastructure if useful.
 
 **Cost**: medium. Parser + lexer (small), typer dispatch
-migration (the bulk of the work), one stdlib impl, fixtures.
+migration + head-to-module map infrastructure (the bulk of the
+work). No new stdlib types — `[T]`'s existing `list.map` /
+`list.flat_map` are sufficient for v1.
 **Depends on**: nothing structural; protocols (m12.8) already
 landed.
 
-**Reference**: Elixir `Stream` + `Enum` (the same operations
-work over both, dispatched by protocol; closest analog), F#
-`seq` computation expression (same idea, different surface),
-Rust `Iterator::flat_map` (single trait, two methods —
-structurally the same as `Sequence`).
+**Reference**: Go method dispatch (resolves `xs.method(...)` by
+looking in the package of the receiver type — the closest mainstream
+analog to naming-convention dispatch). Clojure protocols dispatch
+by type tag with a similar single-arg lookup model, though they
+add an explicit `defprotocol`. The kaikai approach is **dispatch
+without protocol declaration** — the module is the protocol
+implicit registry.
+
+### What was rejected (HKT-based design)
+
+The original proposal in this section (PR #169) targeted
+`protocol Sequence[F[_]]` with higher-kinded type parameter:
+
+```kai
+# Originally proposed (REJECTED 2026-05-03):
+protocol Sequence[F[_]] {
+  fn map[A, B](self: F[A], f: A -> B) : F[B]
+  fn flat_map[A, B](self: F[A], f: A -> F[B]) : F[B]
+}
+```
+
+This form was rejected after empirical verification that:
+
+1. `protocol Foo[F[_]]` does **not parse** in stage 2 — kaikai
+   commits to "no HKT" per Tier 1 #3 and `docs/protocols.md`
+   §*What protocols cannot do*.
+2. Implementing HKT would require higher-order pattern unification
+   in the typer (Miller pattern unification: ~300-500 lines plus
+   diagnostics) and would revise Tier 1 #3 — a strategic-level
+   change, not a feature.
+3. The risk of incremental drift toward typeclasses (constraint
+   propagation, functional dependencies, type families) makes the
+   reopening costly even if technically scoped.
+
+The naming-convention dispatch above achieves the same user-facing
+goal (transparent `||` over `[T]` and future `Stream[T]`) without
+introducing HKT or modifying any Tier 1 commit.
 
 ## Deliberately not on this list
 
