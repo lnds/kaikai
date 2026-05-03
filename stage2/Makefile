@@ -681,7 +681,7 @@ test-stdlib: $(TARGET) build
 	for f in ../examples/stdlib/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  case "$$name" in bench_*|check_*) continue ;; esac; \
-	  ./$(TARGET) $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f > build/stdlib-$$name.c \
+	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f > build/stdlib-$$name.c \
 	    || { echo "stdlib FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) -I ../stage0 build/stdlib-$$name.c -o build/stdlib-$$name \
 	    || { echo "stdlib FAIL $$name (C compile failed)"; exit 1; }; \
