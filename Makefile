@@ -193,6 +193,8 @@ tier1-asan: kaic2
 	@echo "tier1-asan OK — issue #139 fixture passes under ASAN+UBSan (crypto byte-buffer + 64-bit modular gate)"
 	@$(MAKE) -C stage2 test-env-mutate-asan
 	@echo "tier1-asan OK — issue #127 fixture passes under ASAN+UBSan (Env set/unset/vars buffer-ownership gate)"
+	@$(MAKE) -C stage2 test-securerandom-asan
+	@echo "tier1-asan OK — issue #140 fixture passes under ASAN+UBSan (SecureRandom default-handler gate)"
 
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
