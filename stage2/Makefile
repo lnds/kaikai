@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
 
 all: $(TARGET)
 
@@ -2462,6 +2462,36 @@ test-unbox-phase2: $(TARGET) build
 	@if grep -E 'kai_pow_idiv_inner_loop\(void\) \{[^}]*kai_op_idiv\(' build/perceus-unbox_phase2_pow_idiv.c; then \
 	  echo "unbox FAIL pow_idiv (kai_op_idiv survived inside body)"; exit 1; \
 	fi
+	@# Issue #91 — PBind catch-all in the M5 fast path. The fixture
+	@# lives outside the `unbox_phase2_*.kai` glob (its scope is
+	@# match-emit, not the broader unboxing fixtures), so it gets an
+	@# explicit compile + run + grep here. The body of a PBind
+	@# catch-all must bind the raw scrutinee as `int64_t kair_n` in
+	@# the `default:` block, and the body must use `kair_n` (raw)
+	@# inside `n + 1` instead of routing through `kai_op_eq` /
+	@# `kai_op_add`. The boxed match path's per-arm `kai_op_eq` chain
+	@# and `kai_decref(_scr)` cleanup must not appear inside the body.
+	./$(TARGET) ../examples/perceus/match_pbind_catchall_raw.kai > build/perceus-match_pbind_catchall_raw.c \
+	  || { echo "unbox FAIL match_pbind_catchall_raw (kaic2 errored)"; exit 1; }
+	$(CC) $(CFLAGS) -I ../stage0 build/perceus-match_pbind_catchall_raw.c -o build/perceus-match_pbind_catchall_raw \
+	  || { echo "unbox FAIL match_pbind_catchall_raw (cc errored)"; exit 1; }
+	./build/perceus-match_pbind_catchall_raw > build/perceus-match_pbind_catchall_raw.out \
+	  || { echo "unbox FAIL match_pbind_catchall_raw (run errored)"; exit 1; }
+	@diff -q ../examples/perceus/match_pbind_catchall_raw.out.expected \
+	        build/perceus-match_pbind_catchall_raw.out > /dev/null \
+	  || { echo "unbox FAIL match_pbind_catchall_raw (output mismatch)"; \
+	       diff ../examples/perceus/match_pbind_catchall_raw.out.expected \
+	            build/perceus-match_pbind_catchall_raw.out; exit 1; }
+	@grep -F -q 'switch (_scr)' build/perceus-match_pbind_catchall_raw.c \
+	  || { echo "unbox FAIL match_pbind_catchall_raw (no raw switch found)"; exit 1; }
+	@grep -F -q 'int64_t kair_n = _scr' build/perceus-match_pbind_catchall_raw.c \
+	  || { echo "unbox FAIL match_pbind_catchall_raw (kair_n binding missing in default block)"; exit 1; }
+	@if grep -E 'kai_classify_raw_pure\(void\) \{[^}]*kai_op_eq\(' build/perceus-match_pbind_catchall_raw.c; then \
+	  echo "unbox FAIL match_pbind_catchall_raw (kai_op_eq survived inside body — fast path missed)"; exit 1; \
+	fi
+	@if grep -E 'kai_classify_raw_pure\(void\) \{[^}]*kai_decref\(_scr\)' build/perceus-match_pbind_catchall_raw.c; then \
+	  echo "unbox FAIL match_pbind_catchall_raw (boxed _scr alias survived inside body)"; exit 1; \
+	fi
 	@echo "unbox phase2 OK"
 
 # Issue #37 — verify the C emitter rewrites self-tail-calls into
@@ -2592,6 +2622,32 @@ test-perceus-issue82-asan: $(TARGET) build
 	    && echo "perceus-issue82-asan OK $$name" \
 	    || { echo "perceus-issue82-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
+
+# Issue #91 — PBind catch-all in the M5 fast path. ASAN+UBSan
+# sibling for `match_pbind_catchall_raw.kai`. Match emit + raw
+# locals is exactly the surface where RC discipline gaps
+# manifest: a raw local treated as boxed leaks a `kair_<n>`
+# scalar wrapped in a `kai_int` that's never decrefed; a boxed
+# local treated as raw segfaults under ASan when the runtime
+# tries to chase a pointer through what is in fact an int64.
+test-match-pbind-catchall-asan: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/perceus/match_pbind_catchall_raw.kai > build/match_pbind_catchall_raw-asan.c \
+	  || { echo "match-pbind-catchall-asan FAIL (kaic2 errored)"; exit 1; }; \
+	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	      -I ../stage0 build/match_pbind_catchall_raw-asan.c -o build/match_pbind_catchall_raw-asan-c \
+	  || { echo "match-pbind-catchall-asan FAIL (C compile failed)"; exit 1; }; \
+	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	  ./build/match_pbind_catchall_raw-asan-c > build/match_pbind_catchall_raw-asan.out 2> build/match_pbind_catchall_raw-asan.err; \
+	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/match_pbind_catchall_raw-asan.err; then \
+	  echo "match-pbind-catchall-asan FAIL — sanitizer diagnostic:"; \
+	  cat build/match_pbind_catchall_raw-asan.err; exit 1; \
+	fi; \
+	diff -q ../examples/perceus/match_pbind_catchall_raw.out.expected build/match_pbind_catchall_raw-asan.out > /dev/null \
+	  && echo "match-pbind-catchall-asan OK" \
+	  || { echo "match-pbind-catchall-asan DIFF"; diff ../examples/perceus/match_pbind_catchall_raw.out.expected build/match_pbind_catchall_raw-asan.out; exit 1; }
 
 # Tier S1 lane #3 — net.http client. The pure helpers
 # (`http_serialize_request`, `http_parse_response`, `http_parse_url`)

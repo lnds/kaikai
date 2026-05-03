@@ -8759,13 +8759,38 @@ fn arms_all_literal_or_wild_loop(arms: [Arm]) : Bool {
   }
 }
 
+# Issue #91 — fast-path eligibility check for `PBind(name)`
+# catch-all arms. When the body of a PBind catch-all reads
+# `name` from inside a `#{...}` interp slot OR from inside a
+# captured ELambda body, the read site bypasses the unbox
+# pass's alias map and resolves to `kai_<name>` — but the
+# fast path only binds `kair_<name>`. Disqualify the whole
+# match in that case so it routes through the boxed path
+# (which always binds `kai_<name>`). Mirrors the R8 / lambda-
+# capture guards in `unbox_stmt` SLet.
+fn arms_pbind_safe_for_fast_path(arms: [Arm]) : Bool {
+  match arms {
+    [] -> true
+    [Arm(p, _, b), ...rest] -> {
+      let ok = match p.pkind {
+        PBind(nm) ->
+          not expr_has_interp_use(b, nm) and
+          not uses_have_in_lam(scan_uses_expr(b, false), nm)
+        _ -> true
+      }
+      if ok { arms_pbind_safe_for_fast_path(rest) } else { false }
+    }
+  }
+}
+
 fn pat_is_unboxable_lit_or_wild(p: Pattern) : Bool {
   match p.pkind {
     PWild     -> true
-    # PBind would require threading a new raw local through the
-    # body's lcs/env so EVar reads of it resolve to `kair_<name>`.
-    # Out of scope for M5 v1 — fall back to the boxed match path
-    # whenever a catch-all binds a name. Pure wildcard is fine.
+    # Issue #91 — PBind catch-all is now in the fast path. The
+    # unbox pass marks the body's EVar reads of the bound name as
+    # MUnboxed (see `unbox_arm_with_scr`); the C / LLVM emit
+    # binds `kair_<name>` in the default block before the body.
+    PBind(_)  -> true
     PLit(lit) -> match lit.kind {
       EInt(_)  -> true
       EBool(_) -> true
@@ -8800,12 +8825,12 @@ fn emit_match_switch(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: 
   let cty = raw_c_type(scrut.ty)
   concat_all([
     "({ ", cty, " _scr = ", raw, "; KaiValue *_r = kai_unit(); switch (_scr) {\n",
-    emit_switch_arms(src, arms, lcs, fns, variants, lams, cls, false),
+    emit_switch_arms(src, arms, cty, lcs, fns, variants, lams, cls, false),
     "} _r; })"
   ])
 }
 
-fn emit_switch_arms(src: String, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo], saw_default: Bool) : String {
+fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo], saw_default: Bool) : String {
   match arms {
     [] -> if saw_default { "" }
           else { "    default: kai_prelude_panic(kai_str(\"non-exhaustive match\")); break;\n" }
@@ -8818,12 +8843,23 @@ fn emit_switch_arms(src: String, arms: [Arm], lcs: [String], fns: [EFn], variant
         match p.pkind {
           PWild -> {
             let head = concat_all(["    default: _r = ", body_c, "; break;\n"])
-            cat2(head, emit_switch_arms(src, rest, lcs, fns, variants, lams, cls, true))
+            cat2(head, emit_switch_arms(src, rest, scr_cty, lcs, fns, variants, lams, cls, true))
+          }
+          # Issue #91 — `PBind(name)` catch-all binds the raw
+          # scalar `_scr` as `kair_<name>` for the body. Body
+          # EVar reads of `name` resolve raw via the env extension
+          # in `unbox_arm_with_scr`.
+          PBind(name) -> {
+            let head = concat_all([
+              "    default: { ", scr_cty, " kair_", name, " = _scr; _r = ",
+              body_c, "; } break;\n"
+            ])
+            cat2(head, emit_switch_arms(src, rest, scr_cty, lcs, fns, variants, lams, cls, true))
           }
           _ -> {
             # PLit literal arm.
             let head = concat_all(["    case ", pat_lit_raw(p), ": _r = ", body_c, "; break;\n"])
-            cat2(head, emit_switch_arms(src, rest, lcs, fns, variants, lams, cls, saw_default))
+            cat2(head, emit_switch_arms(src, rest, scr_cty, lcs, fns, variants, lams, cls, saw_default))
           }
         }
       }
@@ -8845,7 +8881,7 @@ fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: [E
   # boundary).
   match scrut.mode {
     MUnboxed -> {
-      if ty_is_integral_raw(scrut.ty) and arms_all_literal_or_wild(arms) {
+      if ty_is_integral_raw(scrut.ty) and arms_all_literal_or_wild(arms) and arms_pbind_safe_for_fast_path(arms) {
         emit_match_switch(src, scrut, arms, lcs, fns, variants, lams, cls)
       } else {
         emit_match_default(src, scrut, arms, lcs, fns, variants, lams, cls)
@@ -25309,8 +25345,20 @@ fn unbox_kind(k: ExprKind, env: [LocBind]) : ExprKind {
     EUnop(op, x)         -> EUnop(op, unbox_expr(x, env))
     EIf(c, t_, eo)       -> EIf(unbox_expr(c, env), unbox_expr(t_, env),
                                  unbox_opt(eo, env))
-    EMatch(scr, arms)    -> EMatch(unbox_expr(scr, env),
-                                    map(arms, (a) => unbox_arm(a, env)))
+    EMatch(scr, arms)    -> {
+      # Issue #91 — PBind catch-all in the M5 fast path. When the
+      # scrutinee unboxes to a raw integral scalar, the emitter will
+      # take the `switch` fast path. A `PBind(name)` catch-all in
+      # that path stores the raw scrutinee as `kair_<name>`, so the
+      # body's EVar reads of `name` must be marked MUnboxed here —
+      # otherwise `decide_mode` falls back to MBoxed and the emit
+      # routes to a non-existent `kai_<name>`. Other arms (and
+      # boxed-scrut matches) keep the outer env unchanged.
+      let scr1 = unbox_expr(scr, env)
+      let raw_scr = ty_is_unboxable(scr1.ty) and ty_is_integral_raw(scr1.ty) and (match scr1.mode { MUnboxed -> true _ -> false })
+      EMatch(scr1,
+             map(arms, (a) => unbox_arm_with_scr(a, env, raw_scr)))
+    }
     # Closure boundary: free vars captured into the closure record
     # are always boxed (per Phase 2 non-goal table). The lambda's
     # own body sees no caller env — its locals are independent.
@@ -25433,6 +25481,31 @@ fn unbox_opt(opt: Option[Expr], env: [LocBind]) : Option[Expr] {
 fn unbox_arm(a: Arm, env: [LocBind]) : Arm {
   match a {
     Arm(p, g, b) -> Arm(p, unbox_opt(g, env), unbox_expr(b, env))
+  }
+}
+
+# Issue #91 — variant of `unbox_arm` that knows whether the
+# scrutinee is a raw integral. When the arm pattern is `PBind(nm)`
+# and the scrutinee is raw, extend the env with `LB(nm, MUnboxed)`
+# so EVar reads of `nm` in the body resolve to `kair_<nm>` (the
+# raw alias the C/LLVM fast path emits). The same R8 / lambda
+# capture guards used by `unbox_stmt` SLet apply here: a `nm`
+# reference inside a `#{...}` interp slot or inside a captured
+# ELambda body forces the binding to stay boxed, because those
+# read sites bypass this pass's alias map.
+fn unbox_arm_with_scr(a: Arm, env: [LocBind], raw_scr: Bool) : Arm {
+  match a {
+    Arm(p, g, b) -> {
+      let env_b = match p.pkind {
+        PBind(nm) -> {
+          if raw_scr and not expr_has_interp_use(b, nm) and not uses_have_in_lam(scan_uses_expr(b, false), nm) {
+            [LB(nm, MUnboxed), ...env]
+          } else { env }
+        }
+        _ -> env
+      }
+      Arm(p, unbox_opt(g, env), unbox_expr(b, env_b))
+    }
   }
 }
 
@@ -31084,13 +31157,15 @@ fn llvm_emit_match(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : L
   # The Real-unboxing extension excludes `double` because LLVM
   # `switch` requires an integer operand; a Real scrutinee re-boxes
   # at the boundary and routes through the generic match path.
-  # The PBind catch-all limitation from #91 carries over verbatim:
-  # `arms_all_literal_or_wild` rejects PBind at the catch-all spot,
-  # so a match that wants to bind the scrutinee falls into the
-  # boxed path.
+  # Issue #91 closed 2026-05-02: PBind catch-all is now in the
+  # fast path. `arms_all_literal_or_wild` accepts `PBind(name)`
+  # and `arms_pbind_safe_for_fast_path` filters bodies whose
+  # `name` reads cross an interp / lambda boundary. The default
+  # block pushes `LRaw(name, raw_reg, scr_ty)` so EVar reads of
+  # `name` inside the body resolve via `llvm_raw_local_find`.
   match scr.mode {
     MUnboxed -> {
-      if ty_is_integral_raw(scr.ty) and arms_all_literal_or_wild(arms) {
+      if ty_is_integral_raw(scr.ty) and arms_all_literal_or_wild(arms) and arms_pbind_safe_for_fast_path(arms) {
         llvm_emit_match_switch(e, scr, arms, line, col)
       } else {
         llvm_emit_match_default(e, scr, arms, line, col)
@@ -31170,9 +31245,20 @@ fn llvm_emit_match_switch(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: I
   let case_emit = llvm_emit_switch_case_bodies(e1, coll.cases_to_emit, end_lbl.reg, [])
   let e_dflt = llvm_open_block(case_emit.st, dflt_lbl.reg)
   let dflt_done = match coll.default_arm {
-    Some(body) -> {
+    Some(sd) -> match sd { SD(body, opt_name) -> {
       let outer_locals = e_dflt.locals
-      let eb = llvm_emit_expr(e_dflt, body)
+      # Issue #91 — PBind catch-all: bind the raw scrutinee
+      # register as a raw local before emitting the body, so
+      # `EVar(name)` reads inside the body resolve to `raw.reg`
+      # via `llvm_raw_local_find`. The locals stack is restored
+      # to `outer_locals` after the body emit, matching how
+      # arm-local scope is unwound for literal arms.
+      let scr_raw_ty = match scr.ty { Some(t) -> t None -> TyInt }
+      let e_pre = match opt_name {
+        Some(nm) -> llvm_push_raw_local(e_dflt, nm, raw.reg, scr_raw_ty)
+        None     -> e_dflt
+      }
+      let eb = llvm_emit_expr(e_pre, body)
       let body_val = eb.last_val
       let body_end = eb.cur_label
       let e_br = llvm_append_body(eb, concat_all(["  br label %", end_lbl.reg, "\n"]))
@@ -31183,7 +31269,7 @@ fn llvm_emit_match_switch(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: I
         lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls
       }
       LlvmSD { st: e_scoped, entries: [AE(body_val, body_end), ...case_emit.entries] }
-    }
+    } }
     None -> {
       # No wildcard — panic in the default block.
       let msg = concat_all([
@@ -31226,16 +31312,21 @@ fn llvm_emit_match_switch(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: I
 # block; `body` is the arm's body Expr.
 type SwCase = SC(String, String, Expr)
 
-type SwCollect = { st: LlvmEmit, cases_to_emit: [SwCase], default_arm: Option[Expr] }
+# Issue #91 — the default arm carries an optional binder name. When
+# present, the LLVM fast path pushes the raw scrutinee register as
+# `LRaw(name, raw_reg, ty)` before emitting the default body.
+type SwDefault = SD(Expr, Option[String])
+
+type SwCollect = { st: LlvmEmit, cases_to_emit: [SwCase], default_arm: Option[SwDefault] }
 type SwBodies = { st: LlvmEmit, entries: [LlvmArmEntry] }
 type LlvmSD = { st: LlvmEmit, entries: [LlvmArmEntry] }
 
 # Walk the arms once, allocating a fresh case label per literal
 # arm and capturing the (lit, label, body) triple. The first
-# wildcard becomes the default; later wildcards are unreachable
-# (pattern coverage rejects them upstream).
+# wildcard or PBind becomes the default; later catch-alls are
+# unreachable (pattern coverage rejects them upstream).
 fn llvm_collect_switch_cases(e: LlvmEmit, arms: [Arm],
-                               cases_acc: [SwCase], default_acc: Option[Expr]) : SwCollect {
+                               cases_acc: [SwCase], default_acc: Option[SwDefault]) : SwCollect {
   match arms {
     [] -> SwCollect { st: e, cases_to_emit: list_reverse(cases_acc), default_arm: default_acc }
     [a, ...rest] -> match a {
@@ -31243,7 +31334,17 @@ fn llvm_collect_switch_cases(e: LlvmEmit, arms: [Arm],
         PWild -> {
           let next_default = match default_acc {
             Some(_) -> default_acc
-            None    -> Some(body)
+            None    -> Some(SD(body, None))
+          }
+          llvm_collect_switch_cases(e, rest, cases_acc, next_default)
+        }
+        # Issue #91 — PBind catch-all. Same default-slot semantics
+        # as PWild; the binder name rides along so the body emit
+        # can push it as a raw local.
+        PBind(name) -> {
+          let next_default = match default_acc {
+            Some(_) -> default_acc
+            None    -> Some(SD(body, Some(name)))
           }
           llvm_collect_switch_cases(e, rest, cases_acc, next_default)
         }
