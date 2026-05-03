@@ -1,0 +1,626 @@
+# stdlib/crypto/hash.kai — SHA-256 + SHA-512.
+#
+# Pure functional reference implementations of the FIPS 180-4
+# secure hash algorithms. No FFI, no runtime helpers — every
+# operation reduces to a `bit_*` intrinsic plus list/record
+# manipulation. Suitable for JWT signing (HS256/HS512), session
+# token integrity, and content addressing at JWT-scale inputs
+# (kilobytes). Throughput is well below libcrypto for megabyte
+# payloads; the design trade is zero-dep portability.
+#
+# Surface (flat-prefix until m14 namespaced migration):
+#
+#   pub fn sha256(bytes: [Int]) : [Int]   # 32-byte digest
+#   pub fn sha512(bytes: [Int]) : [Int]   # 64-byte digest
+#
+# Each input element is treated as a byte in [0, 255]. Inputs
+# outside that range are not validated; the masks inside the
+# algorithm clamp them implicitly. Compose with
+# `stdlib/encoding/hex.kai`'s `hex_encode` for a printable digest:
+#
+#   hex_encode(sha256(bytes_of("abc")))
+#     == "ba7816bf8f01cfea414140de5dae2223b00361a3396177a9cb410ff61f20015a"
+#
+# Why decimal constants below: the lexer parses decimal integers
+# only — no `0x` prefix support. Each FIPS 180-4 constant is
+# annotated with its hexadecimal source so future readers can
+# cross-check against §4.2.2 (SHA-256 K) and §4.2.3 (SHA-512 K).
+#
+# Why so many helper functions: kaikai's `Int` is signed 64-bit.
+# `bit_shl(x, n)` lowers to C `<<` on `int64_t`, which is
+# undefined behaviour when the shift overflows into the sign bit
+# (bit 63). SHA-512 routinely needs that overflow as part of its
+# 64-bit modular semantics; we work around it by decomposing
+# every wide shift into two 32-bit shifts and recombining via
+# `bit_or`. SHA-256 stays inside 32 bits and never approaches
+# the sign bit, so its inner loop is direct.
+
+# ---- Common 32-bit helpers ---------------------------------------
+
+# Mask `x` to its low 32 bits. Used everywhere SHA-256 needs
+# modular-2^32 arithmetic. `4294967295` is `2^32 - 1`.
+fn sha_mask32(x: Int) : Int = bit_and(x, 4294967295)
+
+# Logical right shift, fed to SHR^n in σ0/σ1. `bit_ushr` already
+# treats the operand as `uint64_t`, so masking afterwards is
+# unnecessary as long as `x` was masked into 32 bits beforehand.
+fn sha_shr32(x: Int, n: Int) : Int = bit_ushr(x, n)
+
+# Right rotation of a 32-bit value by `n` positions.
+# Pre-condition: `x` is in [0, 2^32-1] and `n` in [1, 31].
+# Both halves of the OR mask back into 32 bits implicitly:
+#   - `bit_ushr(x, n)` keeps bits in positions 0..(31-n).
+#   - `bit_shl(x, 32 - n)` could leak above bit 31; mask explicitly.
+# `bit_shl(x, 32 - n)` never overflows the sign bit because
+# x < 2^32 and (32 - n) <= 30 → result < 2^62.
+fn sha_rotr32(x: Int, n: Int) : Int =
+  bit_or(bit_ushr(x, n), sha_mask32(bit_shl(x, 32 - n)))
+
+# `Ch(x, y, z) = (x AND y) XOR (NOT x AND z)`. The intermediate
+# `bit_not(x)` has the high 32 bits set, but `bit_and(_, z)`
+# clears them because `z` is already in 32 bits.
+fn sha_ch(x: Int, y: Int, z: Int) : Int =
+  bit_xor(bit_and(x, y), bit_and(bit_not(x), z))
+
+fn sha_maj(x: Int, y: Int, z: Int) : Int =
+  bit_xor(bit_xor(bit_and(x, y), bit_and(x, z)), bit_and(y, z))
+
+# Pull byte at `i` from a list. Caller guarantees `i` is in range;
+# we return 0 on overflow rather than panic. Each call is O(i),
+# so byte-level helpers walk the input rather than re-indexing.
+fn sha_byte_at(bs: [Int], i: Int) : Int = match bs {
+  []           -> 0
+  [b, ...rest] -> if i == 0 { b } else { sha_byte_at(rest, i - 1) }
+}
+
+# Length-of-list specialised to bytes. Tail-recursive accumulator
+# form — `list_length` from core walks the same shape but boxes a
+# fresh Int per cons; this version stays inline-friendly.
+fn sha_byte_len_loop(bs: [Int], acc: Int) : Int = match bs {
+  []           -> acc
+  [_, ...rest] -> sha_byte_len_loop(rest, acc + 1)
+}
+
+fn sha_byte_len(bs: [Int]) : Int = sha_byte_len_loop(bs, 0)
+
+# Try to take the first `n` bytes; return Some(prefix, rest) when
+# at least `n` bytes available, None otherwise.
+type SplitN = SplitOk([Int], [Int]) | SplitShort([Int])
+
+fn sha_take_n_loop(bs: [Int], n: Int, acc_rev: [Int]) : SplitN = {
+  if n == 0 { SplitOk(list_reverse(acc_rev), bs) }
+  else { match bs {
+    []           -> SplitShort(list_reverse(acc_rev))
+    [b, ...rest] -> sha_take_n_loop(rest, n - 1, [b, ...acc_rev])
+  } }
+}
+
+fn sha_take_n(bs: [Int], n: Int) : SplitN = sha_take_n_loop(bs, n, [])
+
+# Convert a list of N bytes to (N/4) big-endian 32-bit words.
+# Trailing bytes that don't fill a word are dropped — callers
+# either pad to a multiple of 4 first or accept the truncation.
+fn sha_bytes_to_words32_loop(bs: [Int], acc_rev: [Int]) : [Int] = match bs {
+  []                          -> list_reverse(acc_rev)
+  [b0, b1, b2, b3, ...rest]   -> {
+    let w = bit_or(bit_or(bit_shl(b0, 24), bit_shl(b1, 16)),
+                   bit_or(bit_shl(b2, 8), b3))
+    sha_bytes_to_words32_loop(rest, [w, ...acc_rev])
+  }
+  _                           -> list_reverse(acc_rev)
+}
+
+fn sha_bytes_to_words32(bs: [Int]) : [Int] =
+  sha_bytes_to_words32_loop(bs, [])
+
+# Encode a 32-bit word as 4 big-endian bytes, prepending to `acc_rev`.
+fn sha_word32_to_bytes_be(w: Int, acc_rev: [Int]) : [Int] = {
+  let b0 = sha_mask32(bit_ushr(w, 24)) % 256
+  let b1 = bit_and(bit_ushr(w, 16), 255)
+  let b2 = bit_and(bit_ushr(w, 8), 255)
+  let b3 = bit_and(w, 255)
+  [b3, b2, b1, b0, ...acc_rev]
+}
+
+# ---- 64-bit helpers (SHA-512 only) -------------------------------
+
+# Width split: `xhi = x >>> 32`, `xlo = x AND 0xFFFFFFFF`. Each
+# half lives in [0, 2^32-1] and stays comfortably positive when
+# stored back as `int64_t`, so subsequent shifts of `xhi`/`xlo`
+# never trip the sign-bit overflow that direct `bit_shl(x, k)` on
+# the full 64-bit value would.
+fn sha_lo32(x: Int) : Int = bit_and(x, 4294967295)
+fn sha_hi32(x: Int) : Int = bit_ushr(x, 32)
+
+# Rebuild a 64-bit value from two 32-bit halves. The naive
+# `bit_or(bit_shl(hi, 32), lo)` is undefined when `hi` has bit 31
+# set: shifting that 1 into bit 63 is signed-overflow UB. Strip
+# the top bit of `hi` first; OR it back in via `bit_not(2^63 - 1)`,
+# which lights bit 63 without ever performing a shift that crosses it.
+fn sha_top64() : Int = bit_not(9223372036854775807)
+
+fn sha_combine64(hi: Int, lo: Int) : Int = {
+  let hi_top = bit_and(hi, 2147483648)        # bit 31 of hi (= bit 63 of result)
+  let hi_lo  = bit_and(hi, 2147483647)        # remaining bits 0..30
+  let mid    = bit_or(bit_shl(hi_lo, 32), lo) # safe: hi_lo < 2^31, hi_lo << 32 < 2^63
+  if hi_top == 0 { mid } else { bit_or(mid, sha_top64()) }
+}
+
+# 64-bit modular addition. C `int64_t + int64_t` wraps under
+# two's-complement on every mainstream target, but UBSan will
+# flag signed-overflow. Decompose into a 32-bit sum (which fits
+# in 33 bits, well below the sign bit) plus a carry-propagated
+# 32-bit sum to keep both intermediates in safe ranges.
+fn sha_add64(a: Int, b: Int) : Int = {
+  let alo = sha_lo32(a)
+  let ahi = sha_hi32(a)
+  let blo = sha_lo32(b)
+  let bhi = sha_hi32(b)
+  let lo_full = alo + blo                 # max ≈ 2^33, safe
+  let new_lo  = sha_lo32(lo_full)
+  let carry   = bit_ushr(lo_full, 32)
+  let new_hi  = sha_lo32(ahi + bhi + carry) # max ≈ 2^33 + 1, safe
+  sha_combine64(new_hi, new_lo)
+}
+
+# Three-, four-, five-, and six-operand wrappers. The chain of
+# `sha_add64`s is what the compression step needs the most often;
+# inlining the boilerplate at every call site obscured the math.
+fn sha_add64_3(a: Int, b: Int, c: Int) : Int = sha_add64(sha_add64(a, b), c)
+fn sha_add64_4(a: Int, b: Int, c: Int, d: Int) : Int =
+  sha_add64(sha_add64(a, b), sha_add64(c, d))
+fn sha_add64_5(a: Int, b: Int, c: Int, d: Int, e: Int) : Int =
+  sha_add64(sha_add64_4(a, b, c, d), e)
+
+# 64-bit unsigned left shift, modulo 2^64. `n` in [1, 63]. Avoids
+# any direct `bit_shl` of a 64-bit value whose top bit might be
+# set; instead splits into 32-bit halves and recombines.
+fn sha_shl64(x: Int, n: Int) : Int = {
+  let xlo = sha_lo32(x)
+  let xhi = sha_hi32(x)
+  if n == 0 { x }
+  else { if n < 32 {
+    let new_lo = sha_lo32(bit_shl(xlo, n))
+    let new_hi = sha_lo32(bit_or(bit_shl(xhi, n), bit_ushr(xlo, 32 - n)))
+    sha_combine64(new_hi, new_lo)
+  } else { if n == 32 {
+    sha_combine64(xlo, 0)
+  } else {
+    let k = n - 32
+    let new_hi = sha_lo32(bit_shl(xlo, k))
+    sha_combine64(new_hi, 0)
+  } } }
+}
+
+# 64-bit logical right shift. `bit_ushr` already gives unsigned
+# semantics, so this is a thin alias for naming consistency.
+fn sha_shr64(x: Int, n: Int) : Int = bit_ushr(x, n)
+
+# 64-bit right rotation. `n` in [1, 63].
+fn sha_rotr64(x: Int, n: Int) : Int =
+  bit_or(sha_shr64(x, n), sha_shl64(x, 64 - n))
+
+# Convert a list of N bytes to (N/8) big-endian 64-bit words.
+fn sha_bytes_to_words64_loop(bs: [Int], acc_rev: [Int]) : [Int] = match bs {
+  []                                                   -> list_reverse(acc_rev)
+  [b0, b1, b2, b3, b4, b5, b6, b7, ...rest]           -> {
+    let hi = bit_or(bit_or(bit_shl(b0, 24), bit_shl(b1, 16)),
+                    bit_or(bit_shl(b2, 8), b3))
+    let lo = bit_or(bit_or(bit_shl(b4, 24), bit_shl(b5, 16)),
+                    bit_or(bit_shl(b6, 8), b7))
+    let w = sha_combine64(hi, lo)
+    sha_bytes_to_words64_loop(rest, [w, ...acc_rev])
+  }
+  _                                                    -> list_reverse(acc_rev)
+}
+
+fn sha_bytes_to_words64(bs: [Int]) : [Int] =
+  sha_bytes_to_words64_loop(bs, [])
+
+# Encode a 64-bit word as 8 big-endian bytes, prepending to `acc_rev`.
+fn sha_word64_to_bytes_be(w: Int, acc_rev: [Int]) : [Int] = {
+  let hi = sha_hi32(w)
+  let lo = sha_lo32(w)
+  let b0 = bit_and(bit_ushr(hi, 24), 255)
+  let b1 = bit_and(bit_ushr(hi, 16), 255)
+  let b2 = bit_and(bit_ushr(hi, 8), 255)
+  let b3 = bit_and(hi, 255)
+  let b4 = bit_and(bit_ushr(lo, 24), 255)
+  let b5 = bit_and(bit_ushr(lo, 16), 255)
+  let b6 = bit_and(bit_ushr(lo, 8), 255)
+  let b7 = bit_and(lo, 255)
+  [b7, b6, b5, b4, b3, b2, b1, b0, ...acc_rev]
+}
+
+# ====================================================================
+# SHA-256 (FIPS 180-4 §6.2)
+# ====================================================================
+
+type Sha256State = {
+  a: Int, b: Int, c: Int, d: Int,
+  e: Int, f: Int, g: Int, h: Int
+}
+
+# H^(0) per §5.3.3.
+fn sha256_initial() : Sha256State = Sha256State {
+  a: 1779033703,    # 0x6a09e667
+  b: 3144134277,    # 0xbb67ae85
+  c: 1013904242,    # 0x3c6ef372
+  d: 2773480762,    # 0xa54ff53a
+  e: 1359893119,    # 0x510e527f
+  f: 2600822924,    # 0x9b05688c
+  g: 528734635,     # 0x1f83d9ab
+  h: 1541459225     # 0x5be0cd19
+}
+
+# K_0..63 per §4.2.2. Decimal because the lexer rejects `0x`.
+# Each line keeps the row from the FIPS table for diff-friendliness.
+fn sha256_k() : [Int] = [
+  1116352408, 1899447441, 3049323471, 3921009573,
+  961987163,  1508970993, 2453635748, 2870763221,
+  3624381080, 310598401,  607225278,  1426881987,
+  1925078388, 2162078206, 2614888103, 3248222580,
+  3835390401, 4022224774, 264347078,  604807628,
+  770255983,  1249150122, 1555081692, 1996064986,
+  2554220882, 2821834349, 2952996808, 3210313671,
+  3336571891, 3584528711, 113926993,  338241895,
+  666307205,  773529912,  1294757372, 1396182291,
+  1695183700, 1986661051, 2177026350, 2456956037,
+  2730485921, 2820302411, 3259730800, 3345764771,
+  3516065817, 3600352804, 4094571909, 275423344,
+  430227734,  506948616,  659060556,  883997877,
+  958139571,  1322822218, 1537002063, 1747873779,
+  1955562222, 2024104815, 2227730452, 2361852424,
+  2428436474, 2756734187, 3204031479, 3329325298
+]
+
+fn sha256_big_sigma0(x: Int) : Int =
+  bit_xor(bit_xor(sha_rotr32(x, 2), sha_rotr32(x, 13)), sha_rotr32(x, 22))
+
+fn sha256_big_sigma1(x: Int) : Int =
+  bit_xor(bit_xor(sha_rotr32(x, 6), sha_rotr32(x, 11)), sha_rotr32(x, 25))
+
+fn sha256_small_sigma0(x: Int) : Int =
+  bit_xor(bit_xor(sha_rotr32(x, 7), sha_rotr32(x, 18)), sha_shr32(x, 3))
+
+fn sha256_small_sigma1(x: Int) : Int =
+  bit_xor(bit_xor(sha_rotr32(x, 17), sha_rotr32(x, 19)), sha_shr32(x, 10))
+
+# Read the value at index `i` of a list of ints; 0 on overflow.
+# Used only for fixed-shape windows of length 16/64; not exposed.
+fn sha_word_at(ws: [Int], i: Int) : Int = match ws {
+  []           -> 0
+  [w, ...rest] -> if i == 0 { w } else { sha_word_at(rest, i - 1) }
+}
+
+# Drop the first element. `[]` returns `[]` rather than panicking.
+fn sha_drop1(ws: [Int]) : [Int] = match ws {
+  []           -> []
+  [_, ...rest] -> rest
+}
+
+# Append a single int to the end. Linear in the length of `ws`,
+# but `ws` is bounded at 16 here.
+fn sha_append1(ws: [Int], x: Int) : [Int] = match ws {
+  []           -> [x]
+  [w, ...rest] -> [w, ...sha_append1(rest, x)]
+}
+
+# Extend the message schedule W from the initial 16 words to the
+# full 64. The window holds the 16 most-recent W values in forward
+# order (W[t-16] at index 0, W[t-1] at index 15); each step
+# computes W[t], drops W[t-16], and appends W[t]. `acc_rev` collects
+# the new entries (W[16..63]) in reverse so the final concat is one
+# `list_append`.
+fn sha256_extend_loop(window: [Int], remaining: Int, acc_rev: [Int]) : [Int] = {
+  if remaining == 0 { list_reverse(acc_rev) }
+  else {
+    let w_tm16 = sha_word_at(window, 0)
+    let w_tm15 = sha_word_at(window, 1)
+    let w_tm7  = sha_word_at(window, 9)
+    let w_tm2  = sha_word_at(window, 14)
+    let wt = sha_mask32(
+      sha256_small_sigma1(w_tm2) + w_tm7 +
+      sha256_small_sigma0(w_tm15) + w_tm16)
+    sha256_extend_loop(sha_append1(sha_drop1(window), wt),
+                       remaining - 1, [wt, ...acc_rev])
+  }
+}
+
+fn sha256_extend(w0_15: [Int]) : [Int] =
+  list_append(w0_15, sha256_extend_loop(w0_15, 48, []))
+
+# One compression round: a..h ← f(a..h, k_t, w_t) per §6.2.2.
+fn sha256_round(s: Sha256State, k: Int, w: Int) : Sha256State = {
+  let t1 = sha_mask32(s.h + sha256_big_sigma1(s.e) + sha_ch(s.e, s.f, s.g) + k + w)
+  let t2 = sha_mask32(sha256_big_sigma0(s.a) + sha_maj(s.a, s.b, s.c))
+  Sha256State {
+    a: sha_mask32(t1 + t2),
+    b: s.a, c: s.b, d: s.c,
+    e: sha_mask32(s.d + t1),
+    f: s.e, g: s.f, h: s.g
+  }
+}
+
+# 64 rounds, walking W[0..63] and K[0..63] in lockstep.
+fn sha256_rounds(s: Sha256State, ws: [Int], ks: [Int]) : Sha256State = match ws {
+  []         -> s
+  [w, ...wt] -> match ks {
+    []         -> s
+    [k, ...kt] -> sha256_rounds(sha256_round(s, k, w), wt, kt)
+  }
+}
+
+# Process one 64-byte block.
+fn sha256_compress_block(s: Sha256State, block_bytes: [Int]) : Sha256State = {
+  let w_init = sha_bytes_to_words32(block_bytes)
+  let w_full = sha256_extend(w_init)
+  let s2     = sha256_rounds(s, w_full, sha256_k())
+  Sha256State {
+    a: sha_mask32(s.a + s2.a), b: sha_mask32(s.b + s2.b),
+    c: sha_mask32(s.c + s2.c), d: sha_mask32(s.d + s2.d),
+    e: sha_mask32(s.e + s2.e), f: sha_mask32(s.f + s2.f),
+    g: sha_mask32(s.g + s2.g), h: sha_mask32(s.h + s2.h)
+  }
+}
+
+# Build the trailing pad block(s) for the final partial block.
+# Per §5.1.1: append 0x80, then zero-pad until (length % 64) ==
+# 56, then append the 64-bit big-endian message length in bits.
+# `partial` is the leftover < 64 bytes; `total_bytes` is the full
+# message byte count (used to compute the appended bit length).
+fn sha_zeros_loop(n: Int, acc: [Int]) : [Int] =
+  if n == 0 { acc } else { sha_zeros_loop(n - 1, [0, ...acc]) }
+
+# Big-endian 64-bit length-in-bits as 8 bytes.
+fn sha_length_bytes_be(total_bits: Int) : [Int] = {
+  let b7 = bit_and(total_bits, 255)
+  let b6 = bit_and(bit_ushr(total_bits, 8), 255)
+  let b5 = bit_and(bit_ushr(total_bits, 16), 255)
+  let b4 = bit_and(bit_ushr(total_bits, 24), 255)
+  let b3 = bit_and(bit_ushr(total_bits, 32), 255)
+  let b2 = bit_and(bit_ushr(total_bits, 40), 255)
+  let b1 = bit_and(bit_ushr(total_bits, 48), 255)
+  let b0 = bit_and(bit_ushr(total_bits, 56), 255)
+  [b0, b1, b2, b3, b4, b5, b6, b7]
+}
+
+# Build the padded final block(s). `partial` has 0..63 bytes; the
+# result is either 64 bytes (when partial < 56) or 128 bytes (when
+# partial >= 56, because the appended 0x80 + 8-byte length can no
+# longer fit in the same block).
+fn sha256_finalize_pad(partial: [Int], total_bytes: Int) : [Int] = {
+  let part_len = sha_byte_len(partial)
+  let total_bits = total_bytes * 8
+  let after_one = list_append(partial, [128])    # append 0x80
+  let used = part_len + 1
+  let target_zero_block = if part_len < 56 { 56 - used } else { 56 + 64 - used }
+  list_append(list_append(after_one, sha_zeros_loop(target_zero_block, [])),
+              sha_length_bytes_be(total_bits))
+}
+
+# Drive the message through the compression function. Each
+# iteration extracts a 64-byte block; when fewer than 64 bytes
+# remain, switch to the padded finalisation path.
+fn sha256_drive(s: Sha256State, bs: [Int], total_bytes: Int) : Sha256State = {
+  match sha_take_n(bs, 64) {
+    SplitOk(block, rest) ->
+      sha256_drive(sha256_compress_block(s, block), rest, total_bytes)
+    SplitShort(partial)  -> {
+      let padded = sha256_finalize_pad(partial, total_bytes)
+      # `padded` is either 64 or 128 bytes. Re-enter via the same
+      # take-64 path; finalisation cannot recurse further because
+      # the padded length is always a multiple of 64 with no extra.
+      sha256_drive_padded(s, padded)
+    }
+  }
+}
+
+fn sha256_drive_padded(s: Sha256State, padded: [Int]) : Sha256State =
+  match sha_take_n(padded, 64) {
+    SplitOk(block, rest) ->
+      sha256_drive_padded(sha256_compress_block(s, block), rest)
+    SplitShort(_)        -> s
+  }
+
+# Pack the final state into a 32-byte big-endian digest.
+fn sha256_pack_digest(s: Sha256State) : [Int] = {
+  let r0 = sha_word32_to_bytes_be(s.a, [])
+  let r1 = sha_word32_to_bytes_be(s.b, r0)
+  let r2 = sha_word32_to_bytes_be(s.c, r1)
+  let r3 = sha_word32_to_bytes_be(s.d, r2)
+  let r4 = sha_word32_to_bytes_be(s.e, r3)
+  let r5 = sha_word32_to_bytes_be(s.f, r4)
+  let r6 = sha_word32_to_bytes_be(s.g, r5)
+  let r7 = sha_word32_to_bytes_be(s.h, r6)
+  list_reverse(r7)
+}
+
+# Public entry point.
+pub fn sha256(bytes: [Int]) : [Int] = {
+  let total = sha_byte_len(bytes)
+  sha256_pack_digest(sha256_drive(sha256_initial(), bytes, total))
+}
+
+# ====================================================================
+# SHA-512 (FIPS 180-4 §6.4)
+# ====================================================================
+
+type Sha512State = {
+  a: Int, b: Int, c: Int, d: Int,
+  e: Int, f: Int, g: Int, h: Int
+}
+
+# H^(0) per §5.3.5. Constants exceed `INT64_MAX` when interpreted
+# unsigned, so values whose top bit is set parse as negative
+# decimals — the bit pattern is what the algorithm consumes.
+fn sha512_initial() : Sha512State = Sha512State {
+  a: 7640891576956012808,     # 0x6a09e667f3bcc908
+  b: -4942790177534073029,    # 0xbb67ae8584caa73b
+  c: 4354685564936845355,     # 0x3c6ef372fe94f82b
+  d: -6534734903238641935,    # 0xa54ff53a5f1d36f1
+  e: 5840696475078001361,     # 0x510e527fade682d1
+  f: -7276294671716946913,    # 0x9b05688c2b3e6c1f
+  g: 2270897969802886507,     # 0x1f83d9abfb41bd6b
+  h: 6620516959819538809      # 0x5be0cd19137e2179
+}
+
+# K_0..79 per §4.2.3 (decimal, as above).
+fn sha512_k() : [Int] = [
+  4794697086780616226,  8158064640168781261,
+  -5349999486874862801, -1606136188198331460,
+  4131703408338449720,  6480981068601479193,
+  -7908458776815382629, -6116909921290321640,
+  -2880145864133508542, 1334009975649890238,
+  2608012711638119052,  6128411473006802146,
+  8268148722764581231,  -9160688886553864527,
+  -7215885187991268811, -4495734319001033068,
+  -1973867731355612462, -1171420211273849373,
+  1135362057144423861,  2597628984639134821,
+  3308224258029322869,  5365058923640841347,
+  6679025012923562964,  8573033837759648693,
+  -7476448914759557205, -6327057829258317296,
+  -5763719355590565569, -4658551843659510044,
+  -4116276920077217854, -3051310485924567259,
+  489312712824947311,   1452737877330783856,
+  2861767655752347644,  3322285676063803686,
+  5560940570517711597,  5996557281743188959,
+  7280758554555802590,  8532644243296465576,
+  -9096487096722542874, -7894198246740708037,
+  -6719396339535248540, -6333637450476146687,
+  -4446306890439682159, -4076793802049405392,
+  -3345356375505022440, -2983346525034927856,
+  -860691631967231958,  1182934255886127544,
+  1847814050463011016,  2177327727835720531,
+  2830643537854262169,  3796741975233480872,
+  4115178125766777443,  5681478168544905931,
+  6601373596472566643,  7507060721942968483,
+  8399075790359081724,  8693463985226723168,
+  -8878714635349349518, -8302665154208450068,
+  -8016688836872298968, -6606660893046293015,
+  -4685533653050689259, -4147400797238176981,
+  -3880063495543823972, -3348786107499101689,
+  -1523767162380948706, -757361751448694408,
+  500013540394364858,   748580250866718886,
+  1242879168328830382,  1977374033974150939,
+  2944078676154940804,  3659926193048069267,
+  4368137639120453308,  4836135668995329356,
+  5532061633213252278,  6448918945643986474,
+  6902733635092675308,  7801388544844847127
+]
+
+fn sha512_big_sigma0(x: Int) : Int =
+  bit_xor(bit_xor(sha_rotr64(x, 28), sha_rotr64(x, 34)), sha_rotr64(x, 39))
+
+fn sha512_big_sigma1(x: Int) : Int =
+  bit_xor(bit_xor(sha_rotr64(x, 14), sha_rotr64(x, 18)), sha_rotr64(x, 41))
+
+fn sha512_small_sigma0(x: Int) : Int =
+  bit_xor(bit_xor(sha_rotr64(x, 1), sha_rotr64(x, 8)), sha_shr64(x, 7))
+
+fn sha512_small_sigma1(x: Int) : Int =
+  bit_xor(bit_xor(sha_rotr64(x, 19), sha_rotr64(x, 61)), sha_shr64(x, 6))
+
+# Same window protocol as SHA-256, but 80 rounds and 64-bit words.
+fn sha512_extend_loop(window: [Int], remaining: Int, acc_rev: [Int]) : [Int] = {
+  if remaining == 0 { list_reverse(acc_rev) }
+  else {
+    let w_tm16 = sha_word_at(window, 0)
+    let w_tm15 = sha_word_at(window, 1)
+    let w_tm7  = sha_word_at(window, 9)
+    let w_tm2  = sha_word_at(window, 14)
+    let wt = sha_add64_4(sha512_small_sigma1(w_tm2), w_tm7,
+                         sha512_small_sigma0(w_tm15), w_tm16)
+    sha512_extend_loop(sha_append1(sha_drop1(window), wt),
+                       remaining - 1, [wt, ...acc_rev])
+  }
+}
+
+fn sha512_extend(w0_15: [Int]) : [Int] =
+  list_append(w0_15, sha512_extend_loop(w0_15, 64, []))
+
+fn sha512_round(s: Sha512State, k: Int, w: Int) : Sha512State = {
+  let t1 = sha_add64_5(s.h, sha512_big_sigma1(s.e),
+                       sha_ch(s.e, s.f, s.g), k, w)
+  let t2 = sha_add64(sha512_big_sigma0(s.a), sha_maj(s.a, s.b, s.c))
+  Sha512State {
+    a: sha_add64(t1, t2),
+    b: s.a, c: s.b, d: s.c,
+    e: sha_add64(s.d, t1),
+    f: s.e, g: s.f, h: s.g
+  }
+}
+
+fn sha512_rounds(s: Sha512State, ws: [Int], ks: [Int]) : Sha512State = match ws {
+  []         -> s
+  [w, ...wt] -> match ks {
+    []         -> s
+    [k, ...kt] -> sha512_rounds(sha512_round(s, k, w), wt, kt)
+  }
+}
+
+fn sha512_compress_block(s: Sha512State, block_bytes: [Int]) : Sha512State = {
+  let w_init = sha_bytes_to_words64(block_bytes)
+  let w_full = sha512_extend(w_init)
+  let s2     = sha512_rounds(s, w_full, sha512_k())
+  Sha512State {
+    a: sha_add64(s.a, s2.a), b: sha_add64(s.b, s2.b),
+    c: sha_add64(s.c, s2.c), d: sha_add64(s.d, s2.d),
+    e: sha_add64(s.e, s2.e), f: sha_add64(s.f, s2.f),
+    g: sha_add64(s.g, s2.g), h: sha_add64(s.h, s2.h)
+  }
+}
+
+# SHA-512 padding: same shape as SHA-256 but with 128-byte blocks
+# and a 16-byte (128-bit) length field. We only support inputs
+# whose bit-length fits in 64 bits (the upper 8 bytes are always
+# zero). Any [Int] under ~2 EiB satisfies this — a hard ceiling
+# for any practical kaikai program.
+fn sha512_finalize_pad(partial: [Int], total_bytes: Int) : [Int] = {
+  let part_len = sha_byte_len(partial)
+  let total_bits = total_bytes * 8
+  let after_one = list_append(partial, [128])
+  let used = part_len + 1
+  # length field is 16 bytes; align such that after appending it
+  # the total is a multiple of 128. So zero-pad to length 112 mod 128.
+  let target_zero_block = if part_len < 112 { 112 - used } else { 112 + 128 - used }
+  let zero_pad = sha_zeros_loop(target_zero_block, [])
+  let length_field = list_append(sha_zeros_loop(8, []),
+                                 sha_length_bytes_be(total_bits))
+  list_append(list_append(after_one, zero_pad), length_field)
+}
+
+fn sha512_drive(s: Sha512State, bs: [Int], total_bytes: Int) : Sha512State = {
+  match sha_take_n(bs, 128) {
+    SplitOk(block, rest) ->
+      sha512_drive(sha512_compress_block(s, block), rest, total_bytes)
+    SplitShort(partial)  -> {
+      let padded = sha512_finalize_pad(partial, total_bytes)
+      sha512_drive_padded(s, padded)
+    }
+  }
+}
+
+fn sha512_drive_padded(s: Sha512State, padded: [Int]) : Sha512State =
+  match sha_take_n(padded, 128) {
+    SplitOk(block, rest) ->
+      sha512_drive_padded(sha512_compress_block(s, block), rest)
+    SplitShort(_)        -> s
+  }
+
+fn sha512_pack_digest(s: Sha512State) : [Int] = {
+  let r0 = sha_word64_to_bytes_be(s.a, [])
+  let r1 = sha_word64_to_bytes_be(s.b, r0)
+  let r2 = sha_word64_to_bytes_be(s.c, r1)
+  let r3 = sha_word64_to_bytes_be(s.d, r2)
+  let r4 = sha_word64_to_bytes_be(s.e, r3)
+  let r5 = sha_word64_to_bytes_be(s.f, r4)
+  let r6 = sha_word64_to_bytes_be(s.g, r5)
+  let r7 = sha_word64_to_bytes_be(s.h, r6)
+  list_reverse(r7)
+}
+
+pub fn sha512(bytes: [Int]) : [Int] = {
+  let total = sha_byte_len(bytes)
+  sha512_pack_digest(sha512_drive(sha512_initial(), bytes, total))
+}
