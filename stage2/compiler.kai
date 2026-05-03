@@ -321,10 +321,70 @@ fn lex_scan_digits(l: Lexer) : Lexer {
   }
 }
 
+fn ch_is_hex_digit(c: Char) : Bool {
+  ch_is_digit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+}
+
+fn lex_scan_hex_digits(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if ch_is_hex_digit(c) { lex_scan_hex_digits(lex_advance(l)) }
+      else { l }
+    }
+  }
+}
+
+fn lex_scan_bin_digits(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if c == '0' or c == '1' { lex_scan_bin_digits(lex_advance(l)) }
+      else { l }
+    }
+  }
+}
+
+# Recognise `0x[0-9a-fA-F]+` and `0b[01]+` as TkInt.
+# Caller has confirmed `lex_peek(l) == Some('0')` and the next char
+# is one of x/X/b/B. Emits TkError if no digits follow the prefix.
+fn lex_hex_or_bin_int(l: Lexer, is_hex: Bool, sl: Int, sc: Int, start: Int) : LexStep {
+  # Skip the `0` and the base marker.
+  let l_after_prefix = lex_advance(lex_advance(l))
+  let l_end = if is_hex { lex_scan_hex_digits(l_after_prefix) }
+              else { lex_scan_bin_digits(l_after_prefix) }
+  if l_end.pos == l_after_prefix.pos {
+    let msg = if is_hex { "malformed number: expected hex digits after 0x" }
+              else { "malformed number: expected binary digits after 0b" }
+    Step(l_end, tok(TkError(msg), sl, sc, start, l_end.pos))
+  } else {
+    Step(l_end, tok(TkInt, sl, sc, start, l_end.pos))
+  }
+}
+
 fn lex_number(l: Lexer) : LexStep {
   let start = l.pos
   let sl = l.line
   let sc = l.col
+  # Hex (`0x`/`0X`) and binary (`0b`/`0B`) literals branch off here so
+  # they share TkInt with decimal and skip the float/exponent path below.
+  let is_zero_prefix =
+    match lex_peek(l) { Some(c) -> c == '0' _ -> false }
+  if is_zero_prefix {
+    match lex_peek_at(l, 1) {
+      Some(n) -> {
+        if n == 'x' or n == 'X' { lex_hex_or_bin_int(l, true, sl, sc, start) }
+        else if n == 'b' or n == 'B' { lex_hex_or_bin_int(l, false, sl, sc, start) }
+        else { lex_number_decimal(l, sl, sc, start) }
+      }
+      None -> lex_number_decimal(l, sl, sc, start)
+    }
+  } else {
+    lex_number_decimal(l, sl, sc, start)
+  }
+}
+
+fn lex_number_decimal(l: Lexer, sl: Int, sc: Int, start: Int) : LexStep {
   let l1 = lex_scan_digits(l)
   # Fractional part: only when `.` is followed by a digit. `x..y` (range)
   # and `x.field` (access) must be left alone.
@@ -1688,13 +1748,58 @@ fn decode_int_loop(s: String, i: Int, n: Int, acc: Int, neg: Bool) : Int {
   }
 }
 
+fn decode_bin_loop(s: String, i: Int, n: Int, acc: Int) : Int {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        if c == '0' { decode_bin_loop(s, i + 1, n, acc * 2) }
+        else if c == '1' { decode_bin_loop(s, i + 1, n, acc * 2 + 1) }
+        else { acc }
+      }
+    }
+  }
+}
+
+fn decode_int_after_sign(span: String, i: Int, n: Int, neg: Bool) : Int {
+  # Detect 0x / 0b base prefixes; otherwise fall back to decimal.
+  let has_prefix =
+    if i + 1 < n {
+      match char_at(span, i) {
+        Some(c0) -> {
+          if c0 == '0' {
+            match char_at(span, i + 1) {
+              Some(c1) -> c1 == 'x' or c1 == 'X' or c1 == 'b' or c1 == 'B'
+              None -> false
+            }
+          } else { false }
+        }
+        None -> false
+      }
+    } else { false }
+  if has_prefix {
+    match char_at(span, i + 1) {
+      Some(c1) -> {
+        let is_hex = c1 == 'x' or c1 == 'X'
+        let v = if is_hex { decode_hex_loop(span, i + 2, n, 0) }
+                else { decode_bin_loop(span, i + 2, n, 0) }
+        if neg { 0 - v } else { v }
+      }
+      None -> if neg { 0 } else { 0 }
+    }
+  } else {
+    decode_int_loop(span, i, n, 0, neg)
+  }
+}
+
 fn decode_int(span: String) : Int {
   let n = string_length(span)
   if n == 0 { 0 }
   else {
     match char_at(span, 0) {
-      Some(c) -> if c == '-' { decode_int_loop(span, 1, n, 0, true) }
-                 else { decode_int_loop(span, 0, n, 0, false) }
+      Some(c) -> if c == '-' { decode_int_after_sign(span, 1, n, true) }
+                 else { decode_int_after_sign(span, 0, n, false) }
       None -> 0
     }
   }

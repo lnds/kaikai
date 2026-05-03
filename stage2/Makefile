@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
 
 all: $(TARGET)
 
@@ -2073,6 +2073,44 @@ test-match: $(TARGET) build
 	  fi; \
 	done
 
+# issue #156 — hex (`0x[0-9a-fA-F]+`) and binary (`0b[01]+`) integer
+# literal fixtures. Same diff / `.err.expected` discipline as test-sugars.
+# Positive cases verify round-trip values up to signed 64-bit max;
+# negative cases assert the lexer's malformed-literal diagnostic.
+test-literals: $(TARGET) build
+	@$(STACK) set -e; \
+	for f in ../examples/literals/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/literals/$$name.out.expected; \
+	  exp_err=../examples/literals/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    rc=0; ./$(TARGET) $$f > /dev/null 2> build/lit-$$name.err || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "literals FAIL $$name (expected error, got success)"; exit 1; \
+	    fi; \
+	    while read -r line; do \
+	      grep -q "$$line" build/lit-$$name.err \
+	        || { echo "literals FAIL $$name (missing diagnostic: $$line)"; \
+	             cat build/lit-$$name.err; exit 1; }; \
+	    done < $$exp_err; \
+	    echo "literals OK $$name (rejected as expected)"; \
+	  else \
+	    ./$(TARGET) $$f > build/lit-$$name.c \
+	      || { echo "literals FAIL $$name (kaic2 errored)"; exit 1; }; \
+	    $(CC) $(CFLAGS) -I ../stage0 build/lit-$$name.c -o build/lit-$$name \
+	      || { echo "literals FAIL $$name (C compile failed)"; exit 1; }; \
+	    ./build/lit-$$name > build/lit-$$name.out \
+	      || { echo "literals FAIL $$name (run errored)"; cat build/lit-$$name.out; exit 1; }; \
+	    if [ -f $$exp_out ]; then \
+	      diff -q $$exp_out build/lit-$$name.out > /dev/null \
+	        && echo "literals OK $$name" \
+	        || { echo "literals DIFF $$name"; diff $$exp_out build/lit-$$name.out; exit 1; }; \
+	    else \
+	      echo "literals OK $$name (no golden, ran clean)"; \
+	    fi; \
+	  fi; \
+	done
+
 # issue #130 — leading-pipe regression fixtures. Each .kai under
 # `examples/pipes/` exercises the apply (`|>`) and map (`|`) pipe
 # operators in leading-line position; one fixture re-checks the
@@ -2791,7 +2829,7 @@ test-unbox-llvm-bench: $(TARGET) build
 	  fi
 	@echo "unbox-llvm-bench OK (pure_chain inner loop lowers to raw i64; one boundary kaix_int; IR links cleanly)"
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -2800,7 +2838,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude
 
 clean:
 	rm -rf build $(TARGET)
