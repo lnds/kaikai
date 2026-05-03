@@ -88,7 +88,8 @@ The design breaks if any of these is compromised.
 6. **Few visible concepts, layered**
    - The floor for basic code is about ten concepts: types,
      functions, `let`, `match`, `if`, records, sum types, lists,
-     pipes, strings.
+     pipes, strings. Algebraic types compose via `|` (union); see
+     `docs/unions.md` for the user-facing reference.
    - Advanced features (effects, handlers, fibers, nursery, holes)
      layer on top and are adopted when needed. A program that does
      not use them pays no cognitive cost for them.

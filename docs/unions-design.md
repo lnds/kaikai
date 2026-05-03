@@ -1,12 +1,22 @@
 # Design: union types for kaikai
 
-Status: **proposed** (2026-05-03). Implementation deferred to a
-dedicated milestone (see *Decision posture*).
+Status: **implemented** (2026-05-03). Issue #187 superseded the
+original "additive `union` keyword" proposal (issue #184) and
+implemented a unified model where `|` always means union; see
+`docs/unions.md` for the user-facing reference.
 
-This document is the design specification for adding **union types**
-to kaikai as an additive feature alongside the existing nominal sum
-types. Implementation is intentionally **not** in this document —
-that is a separate lane covered by the milestone issue.
+> **Historical note**: this document is preserved as the design
+> specification of record. The original *Proposal* and
+> *Implementation phases* sections describe the additive-keyword
+> approach (issue #184). The shipped feature (issue #187, PRs
+> #189–#193) replaced that with the unified `|`-always-means-union
+> model documented in `docs/unions.md`. Decisions D1–D6 in this
+> doc were re-litigated for the unified model and re-recorded in
+> issue #187's body. Consult `docs/unions.md` for what shipped;
+> consult this doc for the alternatives that were rejected and
+> the risk register that informed phasing.
+
+Original document follows.
 
 ## Motivation
 
