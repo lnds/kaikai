@@ -378,6 +378,14 @@ Rules that follow from the desugar:
   sibling statements of the outer block.
 - The cell's name shadows outer bindings per the usual
   scoping rules, and pollutes nothing beyond its block.
+- A `var` declaration may also appear at the top of a
+  handler-clause list (before all operation clauses, sibling
+  to them inside `handle { ... } with Eff { ... }`). It
+  desugars to a sibling `with State[T](init) as name` wrapping
+  the handler. Reads inside clause bodies use the same
+  `@name` / `name.get()` forms as anywhere else; `var` and
+  `let` must precede every operation clause inside one
+  handler block (interleaving is a parse error).
 
 ### Effect-row impact
 
@@ -585,6 +593,71 @@ f
 The first `{` after the callable starts a trailing lambda only
 when same-line; the second `{` is consumed greedily under the
 same rule. Newlines terminate.
+
+## 6. n-tuples — `(a, b, ..., n)` parser sugar
+
+**Issue #154**, shipped 2026-05-03. Parser-only desugar to existing
+stdlib record types — no new TyCtor, zero typer/RC cost.
+
+```kai
+# Construction
+(a, b)                ≡  Pair  { fst: a, snd: b }
+(a, b, c)             ≡  Triple { fst: a, snd: b, trd: c }
+(a, b, c, d)          ≡  Quad  { fst: a, snd: b, trd: c, frt: d }
+
+# Type
+(A, B)                ≡  Pair[A, B]
+(A, B, C)             ≡  Triple[A, B, C]
+(A, B, C, D)          ≡  Quad[A, B, C, D]
+
+# Pattern (let-destructure or match arm)
+let (a, b) = pair     ≡  let Pair { fst: a, snd: b } = pair
+let (a, b, c) = trip
+let (a, b, c, d) = q
+
+# Field access stays nominal — same as Pair today.
+pair.fst  pair.snd
+trip.fst  trip.snd  trip.trd
+quad.fst  quad.snd  quad.trd  quad.frt
+```
+
+**Cap**: arity 2..4. Wider products should be a named record,
+not a tuple. Arity 5+ is rejected at parse time with a
+diagnostic naming the cap.
+
+**Single-paren form `(e)` stays grouping**, never a 1-tuple
+(same as Rust, OCaml). `()` keeps its existing meaning: unit
+expression / zero-arg lambda head / `() -> T` function type.
+
+**Disambiguation**:
+
+- *Type position* — after parsing comma-separated types and
+  consuming `)`, peek for `->`. If `->` follows, it's a
+  function type `(A, B) -> C`. Otherwise it's a tuple type.
+  Single-element `(A)` with no `->` is grouping (returns `A`).
+- *Expression position* — `parse_paren_or_lambda` first tries
+  the lambda-params scan, then falls back to expression. If
+  after the first expression a `,` appears (and we did not
+  open a lambda), accumulate further comma-separated exprs and
+  desugar on `)`.
+- *Pattern position* — new entry from `parse_pattern_rest`:
+  `(` opens either a grouping `(p)` (single inner pattern, no
+  comma) or an n-tuple pattern `(p1, p2, ...)` desugaring to
+  `PVariantRecord("Pair" | "Triple" | "Quad", [...])`.
+
+**Backward compat**: the existing record-literal form
+`Pair { fst: x, snd: y }` continues to parse and typecheck
+unchanged. The sugar is purely additive.
+
+**Stdlib types**: `stdlib/core/tuple.kai` declares
+`Pair[a, b]`, `Triple[a, b, c]`, `Quad[a, b, c, d]`. They
+load automatically as part of the core prelude.
+
+**Why named accessors, not `.0 / .1`**: the lexer accepts
+only identifiers (and a few keywords) after `.`; numeric
+field access would need a new lexer rule. Named accessors
+stay consistent with the existing `Pair.fst / Pair.snd`
+surface and don't add a third way to read a tuple.
 
 ## Cross-sugar interaction
 

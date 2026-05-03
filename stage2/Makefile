@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
 
 all: $(TARGET)
 
@@ -882,6 +882,44 @@ test-stdlib-crypto-asan: $(TARGET) build
 	diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
 	  && echo "stdlib-crypto-asan OK $$name" \
 	  || { echo "stdlib-crypto-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }
+
+# Issue #85 / #157 — regex predicate fixtures under ASAN+UBSan. The
+# refinement-side regex path crosses three RC-sensitive shapes per
+# fixture: the `~r/.../` sigil's compile-time-built pattern string,
+# the `Regex` carrier value crossing the `matches` call boundary,
+# and the synthesised `__ref_pred_<Type>` fn dispatching through a
+# match-arm narrowing guard. The runtime has no Perceus discipline
+# yet (cf. `project_emitter_no_rc_discipline`), so a regression that
+# double-frees the pattern string or leaks the compiled NFA would
+# surface here first.
+#
+# regex_predicate_basic gates the v1 sigil + matches predicate
+# (issue #85). regex_subsume_basic / _alpha gate the typer-side
+# subsumption check (issue #157) — when the requires assert is
+# proven redundant the runtime path drops it but the
+# refinement-side check from match-arm narrowing still fires; ASAN
+# verifies the surviving path doesn't leak after the drop.
+test-stdlib-regex-predicate-asan: $(TARGET) build
+	@set -e; \
+	for name in regex_predicate_basic regex_subsume_basic regex_subsume_alpha; do \
+	  ./$(TARGET) $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	    ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
+	    || { echo "stdlib-regex-predicate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
+	    || { echo "stdlib-regex-predicate-asan FAIL $$name (cc errored)"; exit 1; }; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/stdlib-$$name-asan-c > build/stdlib-$$name-asan.out 2> build/stdlib-$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/stdlib-$$name-asan.err; then \
+	    echo "stdlib-regex-predicate-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/stdlib-$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
+	    && echo "stdlib-regex-predicate-asan OK $$name" \
+	    || { echo "stdlib-regex-predicate-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }; \
+	done
 
 # Typed holes (M10): every example under examples/holes/ must
 # (a) produce a --holes report with at least one "type hole" entry,
@@ -2043,6 +2081,44 @@ test-match: $(TARGET) build
 	  fi; \
 	done
 
+# issue #156 — hex (`0x[0-9a-fA-F]+`) and binary (`0b[01]+`) integer
+# literal fixtures. Same diff / `.err.expected` discipline as test-sugars.
+# Positive cases verify round-trip values up to signed 64-bit max;
+# negative cases assert the lexer's malformed-literal diagnostic.
+test-literals: $(TARGET) build
+	@$(STACK) set -e; \
+	for f in ../examples/literals/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/literals/$$name.out.expected; \
+	  exp_err=../examples/literals/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    rc=0; ./$(TARGET) $$f > /dev/null 2> build/lit-$$name.err || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "literals FAIL $$name (expected error, got success)"; exit 1; \
+	    fi; \
+	    while read -r line; do \
+	      grep -q "$$line" build/lit-$$name.err \
+	        || { echo "literals FAIL $$name (missing diagnostic: $$line)"; \
+	             cat build/lit-$$name.err; exit 1; }; \
+	    done < $$exp_err; \
+	    echo "literals OK $$name (rejected as expected)"; \
+	  else \
+	    ./$(TARGET) $$f > build/lit-$$name.c \
+	      || { echo "literals FAIL $$name (kaic2 errored)"; exit 1; }; \
+	    $(CC) $(CFLAGS) -I ../stage0 build/lit-$$name.c -o build/lit-$$name \
+	      || { echo "literals FAIL $$name (C compile failed)"; exit 1; }; \
+	    ./build/lit-$$name > build/lit-$$name.out \
+	      || { echo "literals FAIL $$name (run errored)"; cat build/lit-$$name.out; exit 1; }; \
+	    if [ -f $$exp_out ]; then \
+	      diff -q $$exp_out build/lit-$$name.out > /dev/null \
+	        && echo "literals OK $$name" \
+	        || { echo "literals DIFF $$name"; diff $$exp_out build/lit-$$name.out; exit 1; }; \
+	    else \
+	      echo "literals OK $$name (no golden, ran clean)"; \
+	    fi; \
+	  fi; \
+	done
+
 # issue #130 — leading-pipe regression fixtures. Each .kai under
 # `examples/pipes/` exercises the apply (`|>`) and map (`|`) pipe
 # operators in leading-line position; one fixture re-checks the
@@ -2761,7 +2837,7 @@ test-unbox-llvm-bench: $(TARGET) build
 	  fi
 	@echo "unbox-llvm-bench OK (pure_chain inner loop lowers to raw i64; one boundary kaix_int; IR links cleanly)"
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -2770,7 +2846,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude
 
 clean:
 	rm -rf build $(TARGET)
