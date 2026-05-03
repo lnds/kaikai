@@ -891,21 +891,37 @@ test-stdlib: $(TARGET) build
 	  || { echo "stdlib FAIL bits_dotted (popcount not inlined)"; exit 1; }
 	@echo "stdlib OK bits_dotted intrinsic-lowered"
 
-# Issue #170 phase 1a — intrinsic `test "..." { ... }` blocks living
-# directly inside stdlib/core/option.kai and stdlib/core/result.kai.
-# Runs the test binary via `bin/kai test` for each module. Gated by
+# Issue #170 phase 1 — intrinsic `test "..." { ... }` blocks living
+# directly inside stdlib/core/*.kai. Gated by
 # `.github/workflows/tier1-stdlib-core.yml` (paths: stdlib/core/**),
 # so PRs that don't touch stdlib/core pay zero seconds for this.
-# KAI_NO_STDLIB=1 prevents bin/kai from auto-loading the module under
-# test as a prelude — without it, the source is parsed twice (once
-# as prelude, once as the test source) and every test block runs
-# twice with duplicated definitions.
+#
+# Cross-file dependencies inside stdlib/core (e.g. string.kai calls
+# `ch_is_space` from char.kai) require the *other* core modules to
+# be present as preludes when compiling the module under test. The
+# module under test must NOT be in its own prelude set — otherwise
+# its source is parsed twice (once as prelude, once as the test
+# source) and every test block runs twice with duplicated definitions.
+# Solution: invoke kaic2 directly with the prelude set computed as
+# (CORE − module-under-test), then drive --test through the regular
+# C-emit + cc + run pipeline.
 test-stdlib-core-intrinsic: $(TARGET) build
 	@set -e; \
-	for mod in option result; do \
+	for mod in option result string char tuple; do \
 	  out=build/stdlib-core-$$mod.test.out; \
-	  KAI_NO_STDLIB=1 ../bin/kai test ../stdlib/core/$$mod.kai > $$out 2>&1 \
-	    || { echo "stdlib-core-intrinsic FAIL $$mod (kai test errored)"; cat $$out; exit 1; }; \
+	  cfile=build/stdlib-core-$$mod.test.c; \
+	  binfile=build/stdlib-core-$$mod.test.bin; \
+	  preludes=""; \
+	  for core_file in $(sort $(wildcard ../stdlib/core/*.kai)); do \
+	    case $$core_file in *core/$$mod.kai) ;; *) preludes="$$preludes --prelude $$core_file" ;; esac; \
+	  done; \
+	  ./$(TARGET) --path ../stdlib $$preludes --test ../stdlib/core/$$mod.kai > $$cfile 2> $$out \
+	    || { echo "stdlib-core-intrinsic FAIL $$mod (kaic2 errored)"; cat $$out; exit 1; }; \
+	  $(CC) -std=c99 -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 $$cfile -o $$binfile \
+	    || { echo "stdlib-core-intrinsic FAIL $$mod (cc errored)"; exit 1; }; \
+	  ./$$binfile > $$out 2>&1 \
+	    || { echo "stdlib-core-intrinsic FAIL $$mod (test binary errored)"; cat $$out; exit 1; }; \
 	  awk '/^[0-9]+\/[0-9]+ tests passed$$/ { split($$1, p, "/"); \
 	         if (p[1] > 0 && p[1] == p[2]) { ok = 1 } } \
 	       END { exit ok ? 0 : 1 }' $$out \
