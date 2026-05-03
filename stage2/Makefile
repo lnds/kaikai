@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-http-client-asan test-env-mutate-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
 
 all: $(TARGET)
 
@@ -614,6 +614,35 @@ test-log-asan: $(TARGET) build
 	  echo "log-asan OK $$name"; \
 	done
 
+# Issue #140 — ASAN+UBSan sibling for the SecureRandom basic
+# fixture. The default handler heap-allocates a buffer per draw,
+# fills it via getrandom / arc4random_buf, walks back to build a
+# `[Int]` cons list, then frees. ASan catches a UAF / botched
+# free if the buffer lifetime ever broke; UBSan catches signed
+# overflow in the int_range modulo arithmetic. Wired into the
+# top-level `tier1-asan` rule alongside the other ASAN gates.
+SECURERANDOM_FIXTURES := random_secure_basic
+
+test-securerandom-asan: $(TARGET) build
+	@set -e; \
+	for name in $(SECURERANDOM_FIXTURES); do \
+	  ./$(TARGET) $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	    ../examples/stdlib/$$name.kai > build/$$name-asan.c; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
+	    echo "securerandom-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/stdlib/$$name.out.expected build/$$name-asan.out > /dev/null \
+	    && echo "securerandom-asan OK $$name" \
+	    || { echo "securerandom-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	done
+
 # Issue #103 — ASAN+UBSan sibling for the trap-exit / outer Cancel
 # handler regression fixture. The fix touches the link table walk
 # and the evidence-lookup hook for the Cancel effect; ASan catches
@@ -728,6 +757,7 @@ CORE_PRELUDE_FLAGS := $(patsubst %,--prelude %,$(sort $(wildcard ../stdlib/core/
 EXTRA_PRELUDE_FLAGS := --prelude ../stdlib/protocols.kai \
                        --prelude ../stdlib/effects.kai \
                        --prelude ../stdlib/random.kai \
+                       --prelude ../stdlib/random_secure.kai \
                        --prelude ../stdlib/encoding/base64.kai \
                        --prelude ../stdlib/encoding/hex.kai \
                        --prelude ../stdlib/encoding/json.kai \
