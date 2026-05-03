@@ -344,6 +344,11 @@ than what a primitive module should expose.
 - `regexp` — `regex_compile`, `regex_match`, `regex_find_all`,
   `regex_replace`, `regex_split` (top-level module). Pre-m14
   flat-prefix names; rename to `regexp.match` etc. lands in m14.
+- `matches`, `regex_compile_or_panic` — refinement-side helpers
+  added 2026-05-03 to support the `~r/.../` sigil + `where matches
+  ~r/.../` predicate (m12.6.x #7, closing issue #85). Both are
+  marked refinement-pure so they compose with `Type where ...`
+  declarations.
 
 RE2-style deterministic engine. Linear-time set-of-states (Pike)
 simulation; no backreferences, no lookaround, no Unicode property
