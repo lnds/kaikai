@@ -11,6 +11,38 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ### Added
 
+- **`stdlib/fs/` v1 — Tier S1 lane #1.** First instalment of
+  `docs/stdlib-roadmap.md`'s Tier S1 (the four modules that
+  unblock `ahu` and `manutara`). Three new files under
+  `stdlib/fs/`, callable via `import fs.<module>`:
+  - `stdlib/fs/file.kai` — `file.read_file`, `file.write_file`,
+    `file.append`. Wraps the existing `kai_prelude_read_file` /
+    `kai_prelude_write_file` builtins; the panicking surface that
+    the catalog (`docs/stdlib-layout.md` §`fs`) calls for.
+    `file.append` is a read+concat+write polyfill — not atomic,
+    not safe under concurrent writers; the file's header pins
+    that limitation against the follow-up runtime issue that
+    backs it with `fopen("ab")` + `fwrite`.
+  - `stdlib/fs/dir.kai` — doc-only stub. The four directory ops
+    (`list_dir`, `create_dir`, `remove_dir`, `walk`) all need
+    runtime primitives that `stage0/runtime.h` does not yet
+    expose (`opendir` / `readdir` / `mkdir` / `rmdir`). The stub
+    documents the deferred surface and the follow-up issue label
+    (`stdlib`+`runtime`).
+  - `stdlib/fs/path.kai` — doc-only stub. The existing `path_*`
+    helpers from `stdlib/path.kai` are already loaded as a
+    prelude and accessible as `path.join` / `path_join` /
+    similar; a `fs.path.*` re-export shim waits on the m14
+    module-system rename lane.
+- **`examples/stdlib/fs_basic.kai` regression fixture** — covers
+  the four cases the v1 surface guarantees (`write+read`,
+  `append+read`, `append-onto-empty`, `overwrite-after-append`).
+  Wired into `make test-stdlib` (and therefore `make tier1`)
+  through `stage2/Makefile`'s addition of `--path ../stdlib` to
+  the test-stdlib invocation. The full
+  `write → read → exists → metadata → delete` cycle the roadmap
+  acceptance bar names lands once the follow-up runtime lane
+  ships the missing primitives.
 - **stdlib `os/` module — partial Tier S1 #2 (env + args).** First
   half of the lane pinned in `docs/stdlib-roadmap.md` Tier S1 #2.
   Two thin wrappers over the existing `Env` effect:
