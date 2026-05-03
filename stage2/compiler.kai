@@ -10404,6 +10404,31 @@ fn emit_expr_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
   }
 }
 
+# Issue #90 — unroll `b ^ n` into `n` repeated multiplications.
+# Caller has already gated `n` to `[0, 64]` and `base_c` is a pure
+# raw C expression (literal / EVar / pure raw arith). For `n == 0`
+# the result is `1` (matches `kai_op_pow_int`). For `n == 1`,
+# emit just `(base_c)`. For `n >= 2`, emit `((base_c)*(base_c)*…)`
+# with `n` factors. Squaring would emit fewer factors but produces
+# the same constant-folded code under any optimizer; the linear
+# form keeps the emitted IR easy to grep for in regression tests.
+fn emit_pow_unroll(base_c: String, n: Int) : String {
+  if n == 0 { "1LL" }
+  else if n == 1 { cat3("(", base_c, ")") }
+  else { cat3("(", emit_pow_unroll_loop(base_c, n, ""), ")") }
+}
+
+fn emit_pow_unroll_loop(base_c: String, k: Int, acc: String) : String {
+  if k == 0 { acc }
+  else if k == 1 { if acc == "" { cat3("(", base_c, ")") }
+                   else { concat_all([acc, " * (", base_c, ")"]) } }
+  else {
+    let next = if acc == "" { cat3("(", base_c, ")") }
+               else { concat_all([acc, " * (", base_c, ")"]) }
+    emit_pow_unroll_loop(base_c, k - 1, next)
+  }
+}
+
 fn emit_kind_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
                   variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match x.kind {
@@ -10419,6 +10444,22 @@ fn emit_kind_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
                     " ", raw_op_str(op), " ",
                     emit_expr_raw(src, b, lcs, fns, variants, lams, cls),
                     ")"])
+      } else if op == "//" {
+        # Issue #90 — signed integer division. Both operands are
+        # `int64_t`; the typer rejected non-Int operands earlier.
+        concat_all(["(",
+                    emit_expr_raw(src, a, lcs, fns, variants, lams, cls),
+                    " / ",
+                    emit_expr_raw(src, b, lcs, fns, variants, lams, cls),
+                    ")"])
+      } else if op == "^" {
+        # Issue #90 — integer power, exponent is a compile-time
+        # literal in `[0, 64]` (gated by `pow_exp_is_inlinable`).
+        # Unroll into repeated multiplications. Base is pure raw
+        # (no calls) so duplication is safe.
+        let n = match try_eval_int(b) { Some(v) -> v None -> 0 }
+        let base_c = emit_expr_raw(src, a, lcs, fns, variants, lams, cls)
+        emit_pow_unroll(base_c, n)
       } else {
         # Conservative fallback: boxed expression then unbox.
         let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
@@ -25269,6 +25310,27 @@ fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
           if op == "%" and not ty_is_integral_raw(opt_ty) { MBoxed }
           else { MUnboxed }
         }
+        # Issue #90 — `//` (integer division) and `^` (integer power)
+        # were previously routed through `kai_op_idiv` / `kai_op_pow_int`
+        # even when both operands were raw. Lift them inline:
+        #
+        #   - `//` is signed integer division. The typer pins both
+        #     operands to `Int` (synth_binop), so a raw / raw `//`
+        #     lowers to native C `/` on `int64_t` (or `sdiv i64` on
+        #     LLVM). Identical semantics to `kai_op_idiv` for the
+        #     Int path; the helper's Real-coercion path is unreachable
+        #     post-typer for `//`.
+        #
+        #   - `^` is integer-exponent power. We inline only when the
+        #     exponent is a compile-time literal in `[0, 64]` and the
+        #     result type is integral-raw. The emitter unrolls the
+        #     loop into `(b * b * ... * b)` — no statement-expression,
+        #     no loop construct, identical IR shape on both backends.
+        #     Other shapes (Real base, non-literal exponent, negative
+        #     exponent, or `n > 64`) keep the boxed path through
+        #     `kai_op_pow_int`.
+        else if op == "//" and child_is_raw(a) and child_is_raw(b) and ty_is_integral_raw(opt_ty) { MUnboxed }
+        else if op == "^" and child_is_raw(a) and child_is_raw(b) and ty_is_integral_raw(opt_ty) and pow_exp_is_inlinable(b) { MUnboxed }
         # M4 — comparisons and short-circuiting booleans collapse to
         # native C operators when both operands are raw. The result
         # is a raw `int` (0/1) which the boundary tactic re-boxes
@@ -25287,6 +25349,26 @@ fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
 
 fn child_is_raw(e: Expr) : Bool {
   match e.mode { MUnboxed -> true _ -> false }
+}
+
+# Issue #90 — `^` raw-inline gate. The C / LLVM emitters unroll
+# `b ^ n` into `n` repeated multiplications when `n` is a small
+# compile-time-known non-negative Int. Larger or non-literal `n`
+# would require a runtime loop (statement-expression in C, basic
+# blocks in LLVM); v1 keeps those boxed. The unbox pass excludes
+# function calls from raw operands, so the base `b` is pure and
+# safe to duplicate `n` times in the emitted code without
+# observable side effects.
+#
+# Bound at 64: an int64 base raised to an exponent above 63 is
+# guaranteed to overflow except for trivial bases (0, 1, -1), and
+# 64 multiplications keep the emitted expression well under the
+# size threshold the C compiler / LLVM optimizer handles cheaply.
+fn pow_exp_is_inlinable(e: Expr) : Bool {
+  match try_eval_int(e) {
+    Some(n) -> n >= 0 and n <= 64
+    None    -> false
+  }
 }
 
 fn unbox_opt(opt: Option[Expr], env: [LocBind]) : Option[Expr] {
@@ -28742,7 +28824,7 @@ fn llvm_emit_kind_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
       }
     }
     EBinop(op, a, b) ->
-      if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) {
+      if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) or op == "//" or op == "^" {
         llvm_emit_binop_raw(e, op, a, b, x.ty)
       } else {
         # Conservative fallback: emit boxed and unbox via the
@@ -28768,6 +28850,23 @@ fn llvm_emit_kind_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
 # mirrors the C backend's `&&` / `||` semantics: when both
 # operands are raw, short-circuit is observationally identical to
 # eager.
+# Issue #90 — emit `n` chained `mul i64` instructions to unroll
+# `base ^ (k+1)` where `k = n` is the number of additional
+# multiplications past the first factor. Caller passes the base
+# register as both `acc_reg` and `base_reg`; this function emits
+# `acc_reg = mul i64 acc_reg, base_reg` `k` times. `n` is gated to
+# `<= 63` upstream (caller subtracts 1 from the exponent), so the
+# emitted IR length is bounded.
+fn llvm_pow_unroll(e: LlvmEmit, acc_reg: String, k: Int, base_reg: String, opt_ty: Option[Ty]) : LlvmRaw / Console {
+  if k == 0 { LlvmRaw { e: e, reg: acc_reg, ty: opt_ty } }
+  else {
+    let reg = llvm_fresh_reg(e)
+    let instr = concat_all(["  ", reg.reg, " = mul i64 ", acc_reg, ", ", base_reg, "\n"])
+    let e1 = llvm_append_body(reg.e, instr)
+    llvm_pow_unroll(e1, reg.reg, k - 1, base_reg, opt_ty)
+  }
+}
+
 fn llvm_emit_binop_raw(e: LlvmEmit, op: String, l: Expr, r: Expr, opt_ty: Option[Ty]) : LlvmRaw / Console {
   let rl = llvm_emit_expr_raw(e, l)
   let rr = llvm_emit_expr_raw(rl.e, r)
@@ -28777,6 +28876,29 @@ fn llvm_emit_binop_raw(e: LlvmEmit, op: String, l: Expr, r: Expr, opt_ty: Option
     let instr = concat_all(["  ", reg.reg, " = ", opc, " ", rl.reg, ", ", rr.reg, "\n"])
     let e1 = llvm_append_body(reg.e, instr)
     LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
+  } else if op == "//" {
+    # Issue #90 — signed integer division on raw `i64`. Mirrors
+    # the C backend's native `/` lowering. Both operands typed Int.
+    let reg = llvm_fresh_reg(rr.e)
+    let instr = concat_all(["  ", reg.reg, " = sdiv i64 ", rl.reg, ", ", rr.reg, "\n"])
+    let e1 = llvm_append_body(reg.e, instr)
+    LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
+  } else if op == "^" {
+    # Issue #90 — integer power, exponent literal in `[0, 64]`
+    # (gated by `pow_exp_is_inlinable` before reaching here).
+    # Unroll into repeated `mul i64` instructions. `n == 0`
+    # yields a constant `1`; `n == 1` yields the base register.
+    let n = match try_eval_int(r) { Some(v) -> v None -> 0 }
+    if n == 0 {
+      let reg = llvm_fresh_reg(rr.e)
+      let instr = concat_all(["  ", reg.reg, " = add i64 0, 1\n"])
+      let e1 = llvm_append_body(reg.e, instr)
+      LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
+    } else if n == 1 {
+      LlvmRaw { e: rr.e, reg: rl.reg, ty: opt_ty }
+    } else {
+      llvm_pow_unroll(rr.e, rl.reg, n - 1, rl.reg, opt_ty)
+    }
   } else if op_is_raw_cmp(op) {
     # Comparison — operands' type comes from the children (the
     # binop's own ty is bool). Result is i1; zext to i32 to match
