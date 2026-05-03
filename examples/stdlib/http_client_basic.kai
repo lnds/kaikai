@@ -1,0 +1,248 @@
+# stdlib/net/http.kai — HTTP/1.1 client smoke. Two halves:
+#
+#   1. Pure helpers (`http_parse_url`, `http_serialize_request`,
+#      `http_parse_response`, `http_header_lookup`) on canned
+#      strings.  Locks the wire format to the current spec.
+#
+#   2. End-to-end round-trip through the NetTcp loopback pattern
+#      from examples/effects/net_tcp_localhost.kai. Single fiber,
+#      kernel-buffer-fits ordering: connect → accept → client.send
+#      → server.recv → server.send → server.close → client.recv →
+#      parse. We exercise the http helpers on real socket bytes
+#      without spawning a sibling fiber, because v1's NetTcp is
+#      blocking-only (no kqueue / epoll yet) and a parked recv
+#      would deadlock the OS thread before the parallel server
+#      could write its reply. The convenience constructors
+#      (`http_get`, etc.) are therefore tested at the *typecheck*
+#      level here — they reach codegen by being compiled into the
+#      module, but a live `http_get` against a sibling-fiber
+#      server is queued for the m8.x reactor lane that lets a
+#      blocking syscall yield.
+
+# ---- pure: parse_url ---------------------------------------------
+
+fn show_url(label: String, r: Result[String, HttpUrl]) : Unit / Stdout = match r {
+  Err(e) -> Stdout.print(string_concat_all([label, " FAIL: ", e]))
+  Ok(u)  -> Stdout.print(string_concat_all([
+    label, " ok scheme=", u.scheme, " host=", u.host,
+    " port=", int_to_string(u.port), " path=", u.path
+  ]))
+}
+
+fn show_url_err(label: String, r: Result[String, HttpUrl]) : Unit / Stdout = match r {
+  Ok(_)  -> Stdout.print(string_concat(label, " FAIL: parser accepted bad URL"))
+  Err(_) -> Stdout.print(string_concat(label, " ok"))
+}
+
+# ---- pure: serialize_request -------------------------------------
+
+fn check_contains(label: String, hay: String, needle: String) : Unit / Stdout =
+  if string_contains(hay, needle) { Stdout.print(string_concat(label, " ok")) }
+  else { Stdout.print(string_concat_all([label, " FAIL: missing '", needle, "'"])) }
+
+# ---- pure: parse_response ----------------------------------------
+
+fn check_status(label: String, r: Result[String, Response], want: Int) : Unit / Stdout = match r {
+  Err(e) -> Stdout.print(string_concat_all([label, " FAIL: ", e]))
+  Ok(rsp) ->
+    if rsp.status == want { Stdout.print(string_concat(label, " ok")) }
+    else { Stdout.print(string_concat_all([
+      label, " FAIL: status=", int_to_string(rsp.status),
+      " want=", int_to_string(want)])) }
+}
+
+fn check_body(label: String, r: Result[String, Response], want: String) : Unit / Stdout = match r {
+  Err(e) -> Stdout.print(string_concat_all([label, " FAIL: ", e]))
+  Ok(rsp) ->
+    if rsp.body == want { Stdout.print(string_concat(label, " ok")) }
+    else { Stdout.print(string_concat_all([
+      label, " FAIL: body='", rsp.body, "' want='", want, "'"])) }
+}
+
+fn check_header(label: String, r: Result[String, Response], name: String, want: String) : Unit / Stdout =
+  match r {
+    Err(e) -> Stdout.print(string_concat_all([label, " FAIL: ", e]))
+    Ok(rsp) -> match http_header_lookup(rsp.headers, name) {
+      None -> Stdout.print(string_concat_all([label, " FAIL: missing header ", name]))
+      Some(v) ->
+        if v == want { Stdout.print(string_concat(label, " ok")) }
+        else { Stdout.print(string_concat_all([
+          label, " FAIL: ", name, "='", v, "' want='", want, "'"])) }
+    }
+  }
+
+fn check_response_err(label: String, r: Result[String, Response]) : Unit / Stdout = match r {
+  Ok(_)  -> Stdout.print(string_concat(label, " FAIL: parser accepted malformed bytes"))
+  Err(_) -> Stdout.print(string_concat(label, " ok"))
+}
+
+# ---- end-to-end: canned server in a single fiber -----------------
+#
+# The server response — `HTTP/1.1 200 OK` with a 14-byte body
+# `hello, world!\n`. Built once and reused as the canned reply.
+fn canned_response() : String =
+  string_concat_all([
+    "HTTP/1.1 200 OK\r\n",
+    "Content-Type: text/plain\r\n",
+    "Content-Length: 14\r\n",
+    "\r\n",
+    "hello, world!\n"
+  ])
+
+# Build the request the fixture sends across the loopback. Mirrors
+# what `http_get(url)` would emit, but constructed from a Request
+# value so the assertion below pins the wire format.
+fn canned_request(port: Int) : Request =
+  Request {
+    method: "GET",
+    url: string_concat_all(["http://127.0.0.1:", int_to_string(port), "/"]),
+    headers: [HttpHeader { name: "Accept", value: "text/plain" }],
+    body: ""
+  }
+
+# Drain the client conn until the kernel returns Ok([]) (peer
+# closed). Pure NetTcp loop, mirroring `http_recv_all_loop` from
+# stdlib/net/http.kai but inlined here because the fixture stays
+# below `http_request` so there is no Spawn dependency.
+fn drain_client(c: Conn, acc: [Int]) : [Int] / NetTcp = match NetTcp.recv(c, 4096) {
+  Err(_)    -> list_reverse(acc)
+  Ok(chunk) -> match chunk {
+    [] -> list_reverse(acc)
+    _  -> drain_client(c, drain_prepend(chunk, acc))
+  }
+}
+
+fn drain_prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
+  [] -> acc
+  [b, ...rest] -> drain_prepend(rest, [b, ...acc])
+}
+
+# Run the protocol roles in the order the loopback kernel happens
+# to permit without a parallel fiber: client connect (kernel
+# queues SYN), server accept (returns), client send (kernel
+# buffers), server recv (returns), server send (kernel buffers),
+# server close (FIN queued), client recv (Ok([])), parse.
+fn run_round_trip(l: Listener) : Int / NetTcp + Stdout = {
+  let port = l.port
+  # Port is kernel-picked (`listen` with port 0); we don't print
+  # it so the golden output stays deterministic across runs.
+  Stdout.print("listen ok")
+  match NetTcp.connect("127.0.0.1", port) {
+    Err(e) -> { Stdout.print(string_concat("connect FAIL: ", e)); 1 }
+    Ok(client) -> {
+      Stdout.print("connect ok")
+      match NetTcp.accept(l) {
+        Err(e) -> { NetTcp.close(client); Stdout.print(string_concat("accept FAIL: ", e)); 1 }
+        Ok(server) -> {
+          Stdout.print("accept ok")
+          let req       = canned_request(port)
+          let req_bytes = http_string_to_bytes(http_serialize_request(req))
+          match NetTcp.send(client, req_bytes) {
+            Err(e) -> {
+              NetTcp.close(client); NetTcp.close(server)
+              Stdout.print(string_concat("client.send FAIL: ", e)); 1
+            }
+            Ok(_) -> {
+              Stdout.print("client.send ok")
+              # Server reads the request — single recv is enough
+              # because the request fits in 4 KiB. The bytes are
+              # discarded after a smoke-level shape check.
+              match NetTcp.recv(server, 4096) {
+                Err(e) -> {
+                  NetTcp.close(client); NetTcp.close(server)
+                  Stdout.print(string_concat("server.recv FAIL: ", e)); 1
+                }
+                Ok(req_recv) -> {
+                  let req_str = http_bytes_to_string(req_recv)
+                  if string_contains(req_str, "GET / HTTP/1.1") {
+                    Stdout.print("server.recv ok")
+                  } else {
+                    Stdout.print(string_concat_all(["server.recv FAIL: req='", req_str, "'"]))
+                  }
+                  let rep_bytes = http_string_to_bytes(canned_response())
+                  match NetTcp.send(server, rep_bytes) {
+                    Err(e) -> {
+                      NetTcp.close(client); NetTcp.close(server)
+                      Stdout.print(string_concat("server.send FAIL: ", e)); 1
+                    }
+                    Ok(_) -> {
+                      Stdout.print("server.send ok")
+                      NetTcp.close(server)
+                      Stdout.print("server.close ok")
+                      let raw_bytes = drain_client(client, [])
+                      Stdout.print("client.recv ok")
+                      let parsed = http_parse_response(http_bytes_to_string(raw_bytes))
+                      check_status("parsed status 200", parsed, 200)
+                      check_body  ("parsed body",       parsed, "hello, world!\n")
+                      check_header("parsed Content-Length", parsed, "Content-Length", "14")
+                      NetTcp.close(client)
+                      0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn main() : Int / NetTcp + Cancel + Stdout = {
+  Stdout.print("== url ==")
+  show_url    ("parse_url",          http_parse_url("http://example.com/index.html"))
+  show_url    ("parse_url default",  http_parse_url("http://example.com"))
+  show_url    ("parse_url port",     http_parse_url("http://example.com:8080/api"))
+  show_url_err("parse_url https",    http_parse_url("https://example.com/"))
+  show_url_err("parse_url unsupported", http_parse_url("ftp://example.com/"))
+  show_url_err("parse_url no scheme",   http_parse_url("example.com/"))
+
+  Stdout.print("== serialize ==")
+  let req_get = Request {
+    method: "GET", url: "http://example.com:80/index.html",
+    headers: [HttpHeader { name: "Accept", value: "*/*" }], body: ""
+  }
+  let wire_get = http_serialize_request(req_get)
+  check_contains("serialize GET line",     wire_get, "GET /index.html HTTP/1.1\r\n")
+  check_contains("serialize GET host",     wire_get, "Host: example.com\r\n")
+  check_contains("serialize GET clen",     wire_get, "Content-Length: 0\r\n")
+  check_contains("serialize GET extra hdr", wire_get, "Accept: */*\r\n")
+
+  let req_post = Request {
+    method: "POST", url: "http://example.com:8080/api",
+    headers: [], body: "{\"x\":42}"
+  }
+  let wire_post = http_serialize_request(req_post)
+  check_contains("serialize POST line",  wire_post, "POST /api HTTP/1.1\r\n")
+  check_contains("serialize POST host",  wire_post, "Host: example.com:8080\r\n")
+  check_contains("serialize POST clen",  wire_post, "Content-Length: 8\r\n")
+  check_contains("serialize POST body",  wire_post, "\r\n\r\n{\"x\":42}")
+
+  Stdout.print("== parse_response ==")
+  let raw_ok = string_concat_all([
+    "HTTP/1.1 200 OK\r\n",
+    "Content-Type: text/plain\r\n",
+    "Content-Length: 14\r\n",
+    "\r\n",
+    "hello, world!\n"
+  ])
+  let parsed_ok = http_parse_response(raw_ok)
+  check_status("parse status 200", parsed_ok, 200)
+  check_body  ("parse body",       parsed_ok, "hello, world!\n")
+  check_header("parse header CT",  parsed_ok, "Content-Type", "text/plain")
+
+  let raw_404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+  check_status("parse status 404", http_parse_response(raw_404), 404)
+
+  check_response_err("parse missing sep", http_parse_response("HTTP/1.1 200 OK no separator"))
+
+  Stdout.print("== net round-trip ==")
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(e) -> { Stdout.print(string_concat("listen FAIL: ", e)); 1 }
+    Ok(l) -> {
+      let rc = run_round_trip(l)
+      if rc == 0 { Stdout.print("done"); 0 } else { 1 }
+    }
+  }
+}

@@ -1,0 +1,84 @@
+# stdlib/fs/file.kai — file-level wrappers on top of the prelude
+# `read_file` / `write_file` builtins (`stage0/runtime.h`
+# `kai_prelude_read_file` / `kai_prelude_write_file`).
+#
+# Module path: `import fs.file`. The catalog and naming convention
+# live in `docs/stdlib-layout.md` §`fs` and `docs/stdlib-roadmap.md`
+# Tier S1 #1.
+#
+# v1 surface (this lane):
+#   - `file.read_file(path)`     — bytes-as-String, panics on Err
+#   - `file.write_file(path, c)` — overwrite, panics on Err
+#   - `file.append(path, c)`     — read+concat+write polyfill (NOT atomic)
+#
+# v1 gap (deferred to a separate runtime lane):
+#   The roadmap also lists `exists`, `delete`, `rename`, `metadata`,
+#   plus the `fs.dir` directory ops (`list_dir`, `create_dir`,
+#   `remove_dir`, `walk`). None of those have backing primitives in
+#   `stage0/runtime.h` today, so they cannot ship from a stdlib-only
+#   lane — adding them is a runtime extension that needs its own
+#   `tier1-asan` gate. The follow-up issue (label `stdlib` + `runtime`)
+#   tracks the nine missing C bodies and the matching prelude /
+#   typer / LLVM wiring; once it lands the wrappers below grow to
+#   the full surface and `examples/stdlib/fs_basic.kai` round-trips
+#   the `write → read → exists → metadata → delete` cycle the
+#   roadmap names as the acceptance bar.
+#
+# Naming. `pub fn` names use the `file_*` prefix so the
+# qualified-call resolver (`me_lookup_export` in stage2/compiler.kai)
+# rewrites `file.read_file(path)` to the flat export
+# `file_read_file(path)`. Bare `read_file` / `write_file` stay
+# bound to the prelude builtins (`Result`-returning); the wrappers
+# here are the panicking, ergonomic surface.
+
+# ---- public surface ----------------------------------------------
+
+# Read the entire file at `path` and return its contents as a
+# `String`. Panics on any I/O failure (file missing, permission
+# denied, read short). Use the prelude `read_file(path)` directly
+# when you want to handle errors.
+pub fn file_read_file(path: String) : String / File =
+  match read_file(path) {
+    Ok(s) -> s
+    Err(e) -> panic(string_concat("file.read_file: ", e))
+  }
+
+# Write `content` to `path`, overwriting any existing contents.
+# Panics on any I/O failure. Use the prelude `write_file(path, c)`
+# directly when you want to handle errors.
+#
+# v1 NOTE: the prelude `write_file` returns `Result[Unit, String]`
+# in `add_prelude_sigs` / `builtin_file_decl` (`stage2/compiler.kai`),
+# but the kaikai `Result[e, a]` convention places the Err type
+# first — meaning the typer reads that signature as Err=Unit /
+# Ok=String, which inverts the runtime contract (Ok=Unit /
+# Err=String). The mismatch is invisible to today's only caller
+# (`examples/effects/m7a_7_default_file.kai`) because its Err
+# branch is unreachable in normal runs. This wrapper sidesteps the
+# inconsistency by binding the Err payload as `_` — any payload
+# type passes — and emitting a static panic message rather than
+# threading the runtime String back into another `string_concat`.
+# A real fix lives in the same follow-up runtime issue that adds
+# the missing fs primitives.
+pub fn file_write_file(path: String, content: String) : Unit / File =
+  match write_file(path, content) {
+    Ok(_)  -> ()
+    Err(_) -> panic("file.write_file: write failed")
+  }
+
+# Append `content` to the end of `path`. Creates the file when it
+# does not exist by writing only `content`. Panics on any I/O
+# failure.
+#
+# v1 LIMITATION: this is a read-modify-write polyfill on top of the
+# existing `read_file` / `write_file` primitives — it is **not
+# atomic** and **not safe under concurrent writers**. The follow-up
+# runtime lane (label `stdlib`+`runtime`) replaces this body with a
+# call into a new `kai_prelude_file_append` backed by
+# `fopen(path, "ab") + fwrite`, which fixes both at zero ergonomic
+# cost.
+pub fn file_append(path: String, content: String) : Unit / File =
+  match read_file(path) {
+    Ok(existing) -> file_write_file(path, string_concat(existing, content))
+    Err(_)       -> file_write_file(path, content)
+  }
