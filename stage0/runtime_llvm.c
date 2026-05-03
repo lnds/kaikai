@@ -358,6 +358,15 @@ KaiValue *kaix_default_log_error(void *self, KaiValue *msg, KaiCont *k) {
     return kai_default_log_error(self, msg, k);
 }
 
+/* issue #140 — LLVM-visible wrappers around the static SecureRandom
+ * default handlers in runtime.h. */
+KaiValue *kaix_default_securerandom_int_range(void *self, KaiValue *min_v, KaiValue *max_v, KaiCont *k) {
+    return kai_default_securerandom_int_range(self, min_v, max_v, k);
+}
+KaiValue *kaix_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCont *k) {
+    return kai_default_securerandom_bytes(self, n_v, k);
+}
+
 /* m7c-d — install/teardown default handlers for builtins that
  * appear in main's row. The LLVM emitter generates the body of
  * these two functions per program (filling in the right

@@ -3729,6 +3729,109 @@ static KaiValue *kai_default_log_error(void *self, KaiValue *msg, KaiCont *k) {
 }
 
 /* =================================================================
+ * SecureRandom effect — issue #140. Cryptographically-secure RNG
+ * deliberately separated from Random so test handlers stubbing the
+ * latter cannot weaken security-sensitive paths.
+ *
+ * Default handler uses the platform CSPRNG, never a userspace PRNG:
+ *   - Linux: getrandom(2) syscall (works pre-prng-init; we loop on
+ *     EINTR but otherwise treat any failure as fatal — the kernel
+ *     pool being unavailable is catastrophic and there is no
+ *     meaningful Result for callers who already opted into crypto-
+ *     grade randomness).
+ *   - macOS / *BSD: arc4random_buf(3) — returns void; the libc
+ *     implementation reseeds itself from /dev/urandom and panics
+ *     internally on failure, matching the same "infallible from
+ *     callers' perspective" contract.
+ *
+ * v1 limitations (mirrored in docs/effects-stdlib.md §SecureRandom):
+ *   - POSIX only. Windows BCryptGenRandom is post-MVP.
+ *   - No /dev/urandom fallback. getrandom is the entire Linux story.
+ *   - No userspace ChaCha20 CSPRNG layer. Each draw hits the kernel.
+ *   - Uniform `int(min, max)` uses `% delta` reduction. The modulo
+ *     bias is acceptable for v1 (security-grade rejection sampling
+ *     is a follow-up); cryptographic-protocol callers that need a
+ *     strictly-uniform integer should draw `bytes` and reduce
+ *     themselves.
+ */
+
+#if defined(__linux__)
+#  include <sys/random.h>
+#elif defined(__APPLE__) || defined(__MACH__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+   /* arc4random_buf is in <stdlib.h> on macOS/BSD, already included
+    * above. No extra header needed. */
+#else
+#  error "kai SecureRandom: platform unsupported (POSIX getrandom / arc4random_buf required)"
+#endif
+
+static void _kai_securerandom_fill(unsigned char *buf, size_t n) {
+#if defined(__linux__)
+    size_t off = 0;
+    while (off < n) {
+        ssize_t got = getrandom(buf + off, n - off, 0);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "kai: SecureRandom: getrandom failed: %s\n", strerror(errno));
+            exit(1);
+        }
+        off += (size_t) got;
+    }
+#else
+    arc4random_buf(buf, n);
+#endif
+}
+
+/* int_range(min, max) -> Int in [min, max] (inclusive). Pulls 8
+ * bytes from the platform CSPRNG, interprets them as a uint64,
+ * reduces modulo (max - min + 1), and adds min. min > max is a
+ * panic: there is no meaningful uniform draw over an empty range.
+ * Op named `int_range` (not the doc's `int()`) because `int` is a
+ * C keyword and the C backend emits each effect op as a struct
+ * field by name. */
+static KaiValue *kai_default_securerandom_int_range(void *self, KaiValue *min_v, KaiValue *max_v, KaiCont *k) {
+    (void) self;
+    int64_t lo = (min_v && min_v->tag == KAI_INT) ? min_v->as.i : 0;
+    int64_t hi = (max_v && max_v->tag == KAI_INT) ? max_v->as.i : 0;
+    if (lo > hi) {
+        fprintf(stderr, "kai: SecureRandom.int: min (%lld) > max (%lld)\n",
+                (long long) lo, (long long) hi);
+        exit(1);
+    }
+    unsigned char buf[8];
+    _kai_securerandom_fill(buf, sizeof(buf));
+    uint64_t draw = 0;
+    for (int i = 0; i < 8; ++i) draw = (draw << 8) | (uint64_t) buf[i];
+    uint64_t span = (uint64_t) (hi - lo) + 1ULL;
+    uint64_t pick = (span == 0) ? draw : (draw % span);
+    return kai_cont_resume(k, kai_int(lo + (int64_t) pick));
+}
+
+/* bytes(n) -> [Int] (each in [0, 256), surface-typed [Byte] but
+ * stage 2 has no first-class Byte yet — same divergence the NetTcp
+ * decl documents). n <= 0 returns the empty list; n > 1 MiB is
+ * capped (matches NetTcp.recv's v1 ceiling — multi-megabyte single
+ * draws are out of scope and almost always wrong for crypto use,
+ * which is happier with smaller, repeated draws). */
+static KaiValue *kai_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCont *k) {
+    (void) self;
+    int64_t n = (n_v && n_v->tag == KAI_INT) ? n_v->as.i : 0;
+    if (n <= 0) {
+        return kai_cont_resume(k, kai_nil());
+    }
+    if (n > (1 << 20)) n = 1 << 20;
+    unsigned char *buf = (unsigned char *) malloc((size_t) n);
+    if (!buf) {
+        fputs("kai: SecureRandom.bytes: out of memory\n", stderr);
+        exit(1);
+    }
+    _kai_securerandom_fill(buf, (size_t) n);
+    KaiValue *acc = kai_nil();
+    for (int64_t i = n; i > 0;) { --i; acc = kai_cons(kai_int((int64_t) buf[i]), acc); }
+    free(buf);
+    return kai_cont_resume(k, acc);
+}
+
+/* =================================================================
  * m8.x cooperative scheduler primitives
  * =================================================================
  *
