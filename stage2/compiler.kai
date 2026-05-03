@@ -19461,6 +19461,228 @@ fn add_variants_loop(env: TyEnv, tname: String, tparams: [String], vs: [Variant]
   }
 }
 
+# === issue #187 phase 2: TyUnion construction + D2 collision check ===
+#
+# Phase 2 lights up the `TyUnion` AST node added in phase 1 (PR #190)
+# by walking every `type T = A | B | ...` declaration and constructing
+# the corresponding `TyUnion(components)`. This is "option A"
+# coexistence (per the lane brief): the existing TyCon + variant-table
+# representation continues to drive pattern matching, codegen, and
+# protocol dispatch unchanged — phase 2 only *adds* a parallel union
+# view and a user-visible D2 collision diagnostic. Phase 3 will
+# consume the union view; phase 4 reworks codegen.
+#
+# Components resolve as `TyCon(component_name, [])` — opaque nominal
+# types in the existing model. `resolve_ty_with_tparams` already
+# accepts any uppercase name as a TyCon, so a downstream `: ColorRed`
+# annotation works through the same path used today by `: Color`.
+# Auto-declaration of unit-like nominal types is therefore implicit:
+# the resolver does not synthesise new `DType` decls; the variant
+# constructor entry registered by `add_variants_loop` is the runtime
+# value, and the `TyCon(name, [])` form is the type-level handle.
+# Phase 3 / 4 add the structural side (record-shaped components,
+# subsumption rule) on top of this foundation.
+
+# A union view of one source-level sum-type declaration. Components
+# are stored in their post-`normalize_union` canonical form; `parent`
+# is the declared type name; `line`/`col` point at the declaration's
+# token for diagnostic anchoring.
+type UnionInfo = UI(String, [Ty], Int, Int)
+
+# Walk every declaration and emit a `UnionInfo` per `TBSum` body.
+# `TBRecord` / `TBAlias` / `TBEffectAlias` are skipped — only the
+# sum shape participates in the unified-algebraic-type model.
+fn collect_unions(ds: [Decl]) : [UnionInfo] = collect_unions_loop(ds, [])
+
+fn collect_unions_loop(ds: [Decl], acc: [UnionInfo]) : [UnionInfo] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DType(_, name, _, body, line, col) -> match body {
+        TBSum(vs) -> {
+          let comps = variants_to_component_tys(vs)
+          collect_unions_loop(rest, [UI(name, comps, line, col), ...acc])
+        }
+        _ -> collect_unions_loop(rest, acc)
+      }
+      _ -> collect_unions_loop(rest, acc)
+    }
+  }
+}
+
+# Each `Var(cname, _)` becomes the type `TyCon(cname, [])` — a
+# nominal handle for the component. Phase 2 deliberately erases the
+# variant payload at the type level: the parent's TyCon-result is
+# what makes payload-bearing variants type-check today, and phase 4
+# is what reshapes codegen into a per-component record. Singleton
+# unions collapse to the bare component (per `normalize_union`).
+fn variants_to_component_tys(vs: [Variant]) : [Ty] {
+  match vs {
+    [] -> []
+    [v, ...rest] -> match v {
+      Var(cname, _) -> [TyCon(cname, []), ...variants_to_component_tys(rest)]
+    }
+  }
+}
+
+# Lift a `UnionInfo` into the canonical `Ty` shape from phase 1.
+# `normalize_union` flattens, sorts, and dedups, so two source
+# declarations with reordered or duplicated components yield equal
+# `Ty` values — D6 algebraic laws.
+fn union_info_to_ty(u: UnionInfo) : Ty {
+  match u { UI(_, comps, _, _) -> normalize_union(comps) }
+}
+
+# === D2: name-collision error semantics ===
+#
+# `type A = Foo | Bar` and `type B = Foo | Baz` are both attempting
+# to *implicitly declare* a nominal type `Foo`. D2 says: refuse, and
+# instruct the user to pre-declare `type Foo = ...` once and
+# reference it from both unions. The phase-0 audit (PR #189 §2)
+# found zero in-tree collisions, so this diagnostic fires only on
+# new code — it is the user-visible feature of phase 2.
+#
+# Detection rule:
+#   - Walk every `TBSum` decl in source order.
+#   - For each variant name `v`:
+#       - If `v` is the name of *some* `DType` in the program (any
+#         shape — record, sum, alias, effect-alias), it is
+#         pre-declared. The TBSum *references* it. No error.
+#       - Else if `v` was already claimed by an EARLIER `TBSum` decl
+#         with a *different* parent name, that's D2 — emit an error
+#         pointing at the current decl, with a note pointing at the
+#         earlier one and a hint to pre-declare.
+#       - Else record the claim and continue.
+#   - `A | A` (same parent claiming `A` twice) is D6 idempotence,
+#     not D2 — `normalize_union` collapses the duplicate, no error.
+
+type VariantClaim = VC(String, String, Int, Int)
+#                       ^vname  ^parent ^line ^col   (line/col of the
+#                                                     claiming TBSum)
+
+# Names of every top-level `DType` in the program. Record /
+# alias / effect-alias names count: pre-declaring `type Foo = { ... }`
+# and then writing `type A = Foo | Bar` is an explicit reference,
+# not an implicit declaration.
+fn collect_top_type_names(ds: [Decl]) : [String] = collect_top_type_names_loop(ds, [])
+
+fn collect_top_type_names_loop(ds: [Decl], acc: [String]) : [String] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DType(_, name, _, _, _, _) -> collect_top_type_names_loop(rest, [name, ...acc])
+      _ -> collect_top_type_names_loop(rest, acc)
+    }
+  }
+}
+
+# Find the first claim of `vname` whose parent differs from `parent`.
+# Same-parent claims are not collisions (D6 idempotence; the union
+# normalises to a singleton).
+fn find_other_claim(claims: [VariantClaim], vname: String, parent: String) : Option[VariantClaim] {
+  match claims {
+    [] -> None
+    [c, ...rest] -> match c {
+      VC(n, p, _, _) -> {
+        if n == vname and p != parent { Some(c) }
+        else { find_other_claim(rest, vname, parent) }
+      }
+    }
+  }
+}
+
+# Public entry: validate every TBSum's variants against earlier
+# claims. Returns the count of D2 errors (0 means clean). Plumbed
+# into `compile_source` next to `pred_errs` and `var_use_errs`.
+fn validate_union_collisions_decls(ds: [Decl], file: String) : Int / Console {
+  let top_names = collect_top_type_names(ds)
+  validate_union_collisions_loop(ds, top_names, file, 0, [])
+}
+
+fn validate_union_collisions_loop(remaining: [Decl], top_names: [String],
+                                    file: String, errs: Int,
+                                    claims: [VariantClaim]) : Int / Console {
+  match remaining {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DType(_, parent, _, body, line, col) -> match body {
+        TBSum(vs) -> {
+          let r = check_variants_for_collision(vs, parent, line, col,
+                                                  top_names, claims, file, errs)
+          validate_union_collisions_loop(rest, top_names, file, r.errs, r.claims)
+        }
+        _ -> validate_union_collisions_loop(rest, top_names, file, errs, claims)
+      }
+      _ -> validate_union_collisions_loop(rest, top_names, file, errs, claims)
+    }
+  }
+}
+
+type CollisionResult = { errs: Int, claims: [VariantClaim] }
+
+fn check_variants_for_collision(vs: [Variant], parent: String, line: Int, col: Int,
+                                  top_names: [String], claims: [VariantClaim],
+                                  file: String, errs: Int) : CollisionResult / Console {
+  match vs {
+    [] -> CollisionResult { errs: errs, claims: claims }
+    [v, ...rest] -> match v {
+      Var(vname, _) -> {
+        if list_has(top_names, vname) {
+          # `vname` is pre-declared as a top-level type. The TBSum
+          # references it; no implicit declaration, no D2.
+          check_variants_for_collision(rest, parent, line, col,
+                                          top_names, claims, file, errs)
+        } else {
+          match find_other_claim(claims, vname, parent) {
+            Some(prev) -> {
+              report_d2_collision(file, vname, parent, line, col, prev)
+              # Continue scanning with the same claim list so a single
+              # multi-collision file produces all diagnostics in one run.
+              check_variants_for_collision(rest, parent, line, col,
+                                              top_names, claims, file, errs + 1)
+            }
+            None -> {
+              let nc = VC(vname, parent, line, col)
+              check_variants_for_collision(rest, parent, line, col,
+                                              top_names, [nc, ...claims], file, errs)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Render the D2 diagnostic. The first line names the offending
+# component and points at the *current* decl (the second site to
+# claim the name); the note points at the *earlier* decl; the hint
+# tells the user how to fix it. The wording matches the spec in the
+# lane brief verbatim modulo file paths.
+fn report_d2_collision(file: String, vname: String, parent: String,
+                        line: Int, col: Int, prev: VariantClaim) : Unit / Console {
+  match prev {
+    VC(_, prev_parent, prev_line, prev_col) -> {
+      let msg = concat_all(["type '", vname,
+                            "' is declared by both 'type ",
+                            prev_parent,
+                            " = ...' (",
+                            file, ":",
+                            int_to_string(prev_line), ":",
+                            int_to_string(prev_col),
+                            ") and 'type ",
+                            parent,
+                            " = ...' (",
+                            file, ":",
+                            int_to_string(line), ":",
+                            int_to_string(col),
+                            ")"])
+      diag_error(file, line, col, msg)
+      diag_help(concat_all(["pre-declare 'type ", vname,
+                             " = ...' once and reference it from both unions"]))
+    }
+  }
+}
+
 # m7b #12 — collect all distinct row-variable names appearing in the
 # row positions of a function declaration's signature: the outer
 # return-row plus every nested `TyFn` row inside parameter types and
@@ -39436,6 +39658,13 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # exit code further below.
             let pred_errs = validate_contract_predicates_decls(
               merged, user_pure_names, path)
+            # issue #187 phase 2: D2 collision check on `type T = A | B`
+            # declarations. Walks every TBSum and reports any variant
+            # name claimed implicitly by two different parents (with
+            # neither parent pre-declaring the variant as its own
+            # `type`). The counter folds into the exit-code aggregator
+            # below. See `validate_union_collisions_decls`.
+            let union_collision_errs = validate_union_collisions_decls(merged, path)
             # m7b #1b + m12.8 Phase 4b — closed effect aliases. Resolve
             # every `type Foo = Eff1 + Eff2 + ...` (and `type Foo = Eff`
             # single-name form) into a flat label set and rewrite every
@@ -39528,6 +39757,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             else if proto_errs > 0 { proto_errs }
             else if import_hole_errs > 0 { import_hole_errs }
             else if pred_errs > 0 { pred_errs }
+            else if union_collision_errs > 0 { union_collision_errs }
             else if nursery_brand_errs > 0 { nursery_brand_errs }
             else {
             match mode {
