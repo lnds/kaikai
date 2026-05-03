@@ -19002,12 +19002,31 @@ type TyScheme = Scheme([Int], [Int], [Int], Ty)
 
 type TyEntry = { name: String, scheme: TyScheme }
 
-type TyEnv = { entries: [TyEntry], fresh: Int }
+# Issue #198: a per-decl summary of `type T = A | B` declarations.
+# Originally introduced by Phase 2 of #187 and left dead until
+# #198/#197 consumed it. Today the summary lives on `TyEnv.unions`
+# and acts as the canonical "components of T" map for the typer:
+# `variants_of_type` falls back to it (the #197 shadow case where
+# the component is a pre-declared top-level type) and
+# `union_upcast_ok` consults it to validate D3 upcasts.
+# Components are stored in their post-`normalize_union` canonical
+# form; `parent` is the declared type name; `line`/`col` point at
+# the declaration's token for diagnostic anchoring (used by #199).
+type UnionInfo = UI(String, [Ty], Int, Int)
 
-fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0 }
+# Issue #198: `unions` carries the per-decl union summary harvested
+# at env-build time. It coexists with the variant-table dual rep
+# (Phase 2): the table still drives runtime ctor lookup, while
+# `unions` is the typer-side authority for "which types compose this
+# union?" — needed once #197 stops registering shadow components
+# under their nominal name.
+type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo] }
+
+fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [] }
 
 fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv =
-  TyEnv { entries: [TyEntry { name: name, scheme: sc }, ...env.entries], fresh: env.fresh }
+  TyEnv { entries: [TyEntry { name: name, scheme: sc }, ...env.entries],
+          fresh: env.fresh, unions: env.unions }
 
 fn ty_env_lookup_loop(es: [TyEntry], target: String) : Option[TyScheme] {
   match es {
@@ -19204,7 +19223,7 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "bit_clear",  scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
     TyEntry { name: "bit_toggle", scheme: mono(fn_ty([TyInt, TyInt], TyInt)) }
   ]
-  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh }
+  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh, unions: env.unions }
 }
 
 # ---- built-in variant constructors ----
@@ -19218,7 +19237,7 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "Ok",   scheme: scheme([0, 1], fn_ty([tv(1)], TyCon("Result", [tv(0), tv(1)]))) },
     TyEntry { name: "Err",  scheme: scheme([0, 1], fn_ty([tv(0)], TyCon("Result", [tv(0), tv(1)]))) }
   ]
-  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh }
+  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh, unions: env.unions }
 }
 
 # ---- user-defined signatures ----
@@ -19562,23 +19581,45 @@ fn scheme_of_variant(type_name: String, tparams: [String], v: Variant) : TySchem
   }
 }
 
-fn add_variants_of_decl(env: TyEnv, d: Decl) : TyEnv {
+fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String]) : TyEnv {
   match d {
     DType(_, tname, tparams, body, _, _) -> match body {
-      TBSum(vs) -> add_variants_loop(env, tname, tparams, vs)
+      TBSum(vs) -> add_variants_loop(env, tname, tparams, vs, top_names)
       _ -> env
     }
     _ -> env
   }
 }
 
-fn add_variants_loop(env: TyEnv, tname: String, tparams: [String], vs: [Variant]) : TyEnv {
+# Issue #197: when a variant name `cname` shadows an already-declared
+# top-level type, skip the zero-arg constructor registration. The
+# pre-declared decl is the canonical handle; re-registering it as a
+# variant of `tname` would create a constructor scheme returning
+# `tname` — confusing for value-position lookups (a user typing
+# `Color` as an expression in a `Mixed`-expecting hole would resolve
+# to the ctor instead of failing cleanly). The component relationship
+# is still recorded in `env.unions` so `variants_of_type` and the D3
+# upcast keep working through `union_components_of`.
+# The skip only kicks in when the variant carries no payload; a
+# payload-bearing variant `Foo(Int)` still needs its constructor
+# scheme even if `Foo` is also a type, since pattern matching there
+# goes through the variant-as-callable path.
+fn add_variants_loop(env: TyEnv, tname: String, tparams: [String],
+                       vs: [Variant], top_names: [String]) : TyEnv {
   match vs {
     [] -> env
     [v, ...rest] -> match v {
-      Var(cname, _) -> {
-        let sc = scheme_of_variant(tname, tparams, v)
-        add_variants_loop(ty_env_add(env, cname, sc), tname, tparams, rest)
+      Var(cname, vargs) -> {
+        let shadows = match vargs {
+          [] -> list_has(top_names, cname)
+          _  -> false
+        }
+        if shadows {
+          add_variants_loop(env, tname, tparams, rest, top_names)
+        } else {
+          let sc = scheme_of_variant(tname, tparams, v)
+          add_variants_loop(ty_env_add(env, cname, sc), tname, tparams, rest, top_names)
+        }
       }
     }
   }
@@ -19606,15 +19647,9 @@ fn add_variants_loop(env: TyEnv, tname: String, tparams: [String], vs: [Variant]
 # Phase 3 / 4 add the structural side (record-shaped components,
 # subsumption rule) on top of this foundation.
 
-# A union view of one source-level sum-type declaration. Components
-# are stored in their post-`normalize_union` canonical form; `parent`
-# is the declared type name; `line`/`col` point at the declaration's
-# token for diagnostic anchoring.
-type UnionInfo = UI(String, [Ty], Int, Int)
+# `UnionInfo` is declared near `TyEnv` (issue #198 wires it into the
+# env). The helpers below populate and consume it.
 
-# Walk every declaration and emit a `UnionInfo` per `TBSum` body.
-# `TBRecord` / `TBAlias` / `TBEffectAlias` are skipped — only the
-# sum shape participates in the unified-algebraic-type model.
 fn collect_unions(ds: [Decl]) : [UnionInfo] = collect_unions_loop(ds, [])
 
 fn collect_unions_loop(ds: [Decl], acc: [UnionInfo]) : [UnionInfo] {
@@ -19654,6 +19689,54 @@ fn variants_to_component_tys(vs: [Variant]) : [Ty] {
 # `Ty` values — D6 algebraic laws.
 fn union_info_to_ty(u: UnionInfo) : Ty {
   match u { UI(_, comps, _, _) -> normalize_union(comps) }
+}
+
+# Component names listed in declaration order, dropping payload.
+# Returned as plain strings so callers can `list_has` directly.
+fn union_info_component_names(u: UnionInfo) : [String] {
+  match u { UI(_, comps, _, _) -> ty_names(comps) }
+}
+
+fn ty_names(ts: [Ty]) : [String] {
+  match ts {
+    [] -> []
+    [t, ...rest] -> match t {
+      TyCon(n, _) -> [n, ...ty_names(rest)]
+      _           -> ty_names(rest)
+    }
+  }
+}
+
+# Look up the components of a union by parent name.
+fn union_components_of(unions: [UnionInfo], parent: String) : [String] {
+  match unions {
+    [] -> []
+    [u, ...rest] -> match u {
+      UI(name, _, _, _) -> if name == parent {
+        union_info_component_names(u)
+      } else {
+        union_components_of(rest, parent)
+      }
+    }
+  }
+}
+
+# Reverse lookup: which parent unions list `child` as a component?
+# (Used by #199 to identify a found type's component-of-origin.)
+fn union_parents_of(unions: [UnionInfo], child: String) : [String] =
+  union_parents_of_loop(unions, child, [])
+
+fn union_parents_of_loop(unions: [UnionInfo], child: String, acc: [String]) : [String] {
+  match unions {
+    [] -> list_reverse(acc)
+    [u, ...rest] -> match u {
+      UI(name, _, _, _) -> if list_has(union_info_component_names(u), child) {
+        union_parents_of_loop(rest, child, [name, ...acc])
+      } else {
+        union_parents_of_loop(rest, child, acc)
+      }
+    }
+  }
 }
 
 # === D2: name-collision error semantics ===
@@ -20172,7 +20255,8 @@ fn is_implicit_tparam_candidate(name: String) : Bool {
   } }
 }
 
-fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl]) : EnvWithArities {
+fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
+                    top_names: [String]) : EnvWithArities {
   match ds {
     [] -> EnvWithArities { env: env, arities: ar_acc }
     [d, ...rest] -> {
@@ -20181,7 +20265,7 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl]) : EnvWithArities
           Some(sc) -> EnvWithArities { env: ty_env_add(env, fname, sc), arities: ar_acc }
           None     -> EnvWithArities { env: env, arities: ar_acc }
         }
-        DType(_, _, _, _, _, _) -> EnvWithArities { env: add_variants_of_decl(env, d), arities: ar_acc }
+        DType(_, _, _, _, _, _) -> EnvWithArities { env: add_variants_of_decl(env, d, top_names), arities: ar_acc }
         DEffect(_, eff_name, tparams, ops, _, _) -> {
           let r2 = add_effect_op_sigs(env, eff_name, tparams, ops)
           # m7b #2: merge per-effect arities into the running accumulator.
@@ -20189,7 +20273,7 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl]) : EnvWithArities
         }
         _ -> EnvWithArities { env: env, arities: ar_acc }
       }
-      add_decls_loop(r.env, r.arities, rest)
+      add_decls_loop(r.env, r.arities, rest, top_names)
     }
   }
 }
@@ -20328,8 +20412,16 @@ type BuiltEnv = { env: TyEnv, prelude_len: Int, op_eff_arities: [OpEffArity] }
 fn build_ty_env(decls: [Decl]) : BuiltEnv {
   let e0 = ty_env_empty()
   let e1 = add_prelude_sigs(e0)
-  let e2 = add_builtin_variant_sigs(e1)
-  let r = add_decls_loop(e2, [], decls)
+  let e2_pre = add_builtin_variant_sigs(e1)
+  # Issue #198: harvest the union summary once and stash it on the
+  # env so every downstream typer query (`variants_of_type`,
+  # `union_upcast_ok`, the #199 diagnostic) sees the same data.
+  let unions = collect_unions(decls)
+  let e2 = TyEnv { entries: e2_pre.entries, fresh: e2_pre.fresh, unions: unions }
+  # Issue #197: pre-compute top-level type names so variant
+  # registration can skip ctor entries whose name shadows.
+  let top_names = collect_top_type_names(decls)
+  let r = add_decls_loop(e2, [], decls, top_names)
   BuiltEnv { env: r.env, prelude_len: list_length(e2.entries),
              op_eff_arities: r.arities }
 }
@@ -21446,7 +21538,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] {
 # id. The env's `fresh` counter advances by one per bound var.
 
 fn fresh_var(env: TyEnv) : TyEnv =
-  TyEnv { entries: env.entries, fresh: env.fresh + 1 }
+  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions }
 
 fn advance_fresh(env: TyEnv, n: Int) : TyEnv =
   if n <= 0 { env } else { advance_fresh(fresh_var(env), n - 1) }
@@ -21483,7 +21575,7 @@ fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if env.fresh >= need { env.fresh } else { need }
-      let env1 = TyEnv { entries: env.entries, fresh: start + n }
+      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions }
       let sub = mk_fresh_subst(vars, start)
       Instantiated { env: env1, ty: apply_ty(sub, body) }
     }
@@ -22117,12 +22209,128 @@ fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : I
       if union_upcast_ok(st.env, a1, b1) { st }
       else {
         diag_error(st.file, line, col, "type mismatch in #{what}")
-        diag_note("expected: #{ty_to_string(a1)}")
-        diag_note("found:    #{ty_to_string(b1)}")
+        emit_union_aware_notes(st.env, a1, b1)
         emit_type_hint(a1, b1)
         st_bump_err(st)
       }
     }
+  }
+}
+
+# Issue #199: when either side of a failed unification is a union
+# (or a component of one), augment the generic `expected:` / `found:`
+# notes with structural context — the union's component list and the
+# found type's parent union, plus a concrete remediation hint. The
+# plain notes still fire when neither side is union-flavoured.
+fn emit_union_aware_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console {
+  diag_note("expected: #{ty_to_string(expected)}")
+  diag_note("found:    #{ty_to_string(found)}")
+  # Drill through matching wrappers (TyFn, TyCon-of-same-name with
+  # mismatched args) to surface the first divergent TyCon pair. That
+  # is where the union/component context is meaningful — at the
+  # surface a function-shape mismatch hides whether the inner
+  # divergence is a leaf-vs-leaf union upcast that almost-but-didn't
+  # land.
+  match find_mismatched_tycons(expected, found) {
+    Some(pair) -> emit_union_focus_notes(env, pair.exp, pair.fnd)
+    None       -> ()
+  }
+}
+
+type TyConPair = { exp: Ty, fnd: Ty }
+
+fn find_mismatched_tycons(expected: Ty, found: Ty) : Option[TyConPair] {
+  match expected {
+    TyFnT(eps, eret, _) -> match found {
+      TyFnT(fps, fret, _) -> {
+        match find_mismatch_in_list(eps, fps) {
+          Some(p) -> Some(p)
+          None    -> find_mismatched_tycons(eret, fret)
+        }
+      }
+      _ -> tycon_pair_or_none(expected, found)
+    }
+    TyCon(en, eas) -> match found {
+      TyCon(fname, fas) -> if en == fname {
+        find_mismatch_in_list(eas, fas)
+      } else {
+        Some(TyConPair { exp: expected, fnd: found })
+      }
+      _ -> tycon_pair_or_none(expected, found)
+    }
+    _ -> tycon_pair_or_none(expected, found)
+  }
+}
+
+fn find_mismatch_in_list(es: [Ty], fs: [Ty]) : Option[TyConPair] {
+  match es {
+    [] -> None
+    [e, ...erest] -> match fs {
+      [] -> None
+      [f, ...frest] -> match find_mismatched_tycons(e, f) {
+        Some(p) -> Some(p)
+        None    -> find_mismatch_in_list(erest, frest)
+      }
+    }
+  }
+}
+
+fn tycon_pair_or_none(expected: Ty, found: Ty) : Option[TyConPair] {
+  match expected {
+    TyCon(_, _) -> match found {
+      TyCon(_, _) -> Some(TyConPair { exp: expected, fnd: found })
+      _           -> None
+    }
+    _ -> None
+  }
+}
+
+# Print the union-flavoured notes for a focused TyCon vs TyCon pair.
+# Stays silent when neither side has union context — the caller has
+# already emitted the generic expected/found notes, so no value in
+# repeating them.
+fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console {
+  let exp_name = tycon_name_or_empty(expected)
+  let fnd_name = tycon_name_or_empty(found)
+  let exp_comps = if exp_name == "" { [] } else { variants_of_type(env, exp_name) }
+  let fnd_comps = if fnd_name == "" { [] } else { variants_of_type(env, fnd_name) }
+  let fnd_parents = if fnd_name == "" { [] } else { union_parents_of(env.unions, fnd_name) }
+  match exp_comps {
+    [] -> ()
+    _  -> diag_note("union: `#{exp_name}` = #{join_with(exp_comps, " | ")}")
+  }
+  match fnd_comps {
+    [] -> match fnd_parents {
+      [] -> ()
+      [p, ...rest] -> diag_note("`#{fnd_name}` is a component of `#{p}`")
+    }
+    _ -> diag_note("union: `#{fnd_name}` = #{join_with(fnd_comps, " | ")}")
+  }
+  match exp_comps {
+    [] -> ()
+    _ -> match fnd_parents {
+      [p, ...rest] -> {
+        if list_has(exp_comps, p) {
+          # The expected union already lists the found's parent — so
+          # the failure is the no-chains rule (D3 does not transit
+          # through intermediate unions). Tell the user how to bridge.
+          diag_help("the D3 upcast does not chain; lift through `#{p}` first (e.g. `let x: #{p} = ...`)")
+        } else {
+          diag_help("extend `#{exp_name}` to include `#{fnd_name}` (or its parent `#{p}`), or narrow via `match` before the call")
+        }
+      }
+      # Found is itself a union (or a free TyCon with no parent).
+      # Suggest the structural fix: include the found type, or narrow
+      # via pattern matching at the call site.
+      [] -> diag_help("extend `#{exp_name}` to include `#{fnd_name}`, or narrow via `match` before the call")
+    }
+  }
+}
+
+fn tycon_name_or_empty(t: Ty) : String {
+  match t {
+    TyCon(n, _) -> n
+    _           -> ""
   }
 }
 
@@ -22237,7 +22445,7 @@ fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes {
 fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
   InferState {
     file: outer.file,
-    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh },
+    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions },
     prelude_len: outer.prelude_len,
     sub: inner.sub,
     recs: inner.recs,
@@ -24584,8 +24792,26 @@ fn variants_of_type_loop(es: [TyEntry], target: String, acc: [String]) : [String
   }
 }
 
-fn variants_of_type(env: TyEnv, tycon: String) : [String] =
-  variants_of_type_loop(env.entries, tycon, [])
+# Issue #198: components recorded in `env.unions` (the per-decl
+# summary) are merged with the env-entry walk so shadow components
+# (`#197`: a variant whose name matches an existing top-level type
+# and is therefore not registered as a zero-arg ctor) still surface
+# as components. Names from the variant table win when both lists
+# would otherwise duplicate; the merge preserves the entry-side
+# order to avoid spurious selfhost output diffs.
+fn variants_of_type(env: TyEnv, tycon: String) : [String] = {
+  let from_entries = variants_of_type_loop(env.entries, tycon, [])
+  let from_summary = union_components_of(env.unions, tycon)
+  union_merge_unique(from_entries, from_summary)
+}
+
+fn union_merge_unique(a: [String], b: [String]) : [String] {
+  match b {
+    [] -> a
+    [n, ...rest] -> if list_has(a, n) { union_merge_unique(a, rest) }
+                    else { union_merge_unique(list_append(a, [n]), rest) }
+  }
+}
 
 # m7e §11: classify a type's variants for `variants[T]()`. The
 # builtin restricts T to *nullary-only* sum types (Doc:
@@ -30296,7 +30522,7 @@ fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: 
       if list_has_string(avoid, te.name) or (not synth_return_structural(te.scheme)) {
         synth_find_arg(rest, want, fresh, avoid, sub)
       } else {
-        let inst = instantiate(TyEnv { entries: [], fresh: fresh }, te.scheme)
+        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [] }, te.scheme)
         match unify(inst.ty, want, sub) {
           Some(sub1) -> Some(ArgMatch { name: te.name, sub: sub1, fresh: inst.env.fresh })
           None       -> synth_find_arg(rest, want, fresh, avoid, sub)
@@ -30325,7 +30551,7 @@ fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
 # Try entry `te` as a direct match or a 1-level application against
 # `expected`. Returns rendered candidate text or None.
 fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) : Option[String] {
-  let inst = instantiate(TyEnv { entries: [], fresh: fresh }, te.scheme)
+  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [] }, te.scheme)
   match unify(inst.ty, expected, subst_empty()) {
     Some(_) -> Some(te.name)
     None    -> match inst.ty {
