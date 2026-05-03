@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-http-client-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-stdlib-crypto-asan test-http-client-asan test-env-mutate-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
 
 all: $(TARGET)
 
@@ -2575,6 +2575,39 @@ test-http-client-asan: $(TARGET) build
 	  diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
 	    && echo "http-client-asan OK $$name" \
 	    || { echo "http-client-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }; \
+	done
+
+# Issue #127 — `Env.set_var` / `Env.unset_var` / `Env.vars` round
+# trip under ASAN+UBSan. POSIX `setenv` / `unsetenv` have a long
+# history of buffer-ownership footguns on macOS (libsystem holds
+# the original pointer, kaikai's local stack-buffer copy plus the
+# heap-duplicated value buffer line up with that contract) and on
+# glibc (older versions leak on overwrite). The fixture exercises
+# set / overwrite / `vars()` walk / unset / unset-of-absent in one
+# pass so a botched lifetime lands as a sanitizer diagnostic
+# instead of a silent leak. Wired into the root `tier1-asan`
+# alongside the http-client / runtime-shadow / Signal gates.
+ENV_MUTATE_FIXTURES := os_env_mutate
+
+test-env-mutate-asan: $(TARGET) build
+	@set -e; \
+	for name in $(ENV_MUTATE_FIXTURES); do \
+	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
+	    || { echo "env-mutate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
+	    || { echo "env-mutate-asan FAIL $$name (C compile failed)"; exit 1; }; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/stdlib-$$name-asan-c > build/stdlib-$$name-asan.out 2> build/stdlib-$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/stdlib-$$name-asan.err; then \
+	    echo "env-mutate-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/stdlib-$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
+	    && echo "env-mutate-asan OK $$name" \
+	    || { echo "env-mutate-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }; \
 	done
 
 # Issue #87 — Phase 2 unbox LLVM mirror. Compiles unbox_bench.kai
