@@ -681,6 +681,21 @@ test-stdlib: $(TARGET) build
 	for f in ../examples/stdlib/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  case "$$name" in bench_*|check_*) continue ;; esac; \
+	  exp_err=../examples/stdlib/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    rc=0; ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f \
+	      > /dev/null 2> build/stdlib-$$name.err || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "stdlib FAIL $$name (expected error, got success)"; exit 1; \
+	    fi; \
+	    while read -r line; do \
+	      grep -qF "$$line" build/stdlib-$$name.err \
+	        || { echo "stdlib FAIL $$name (missing diagnostic: $$line)"; \
+	             cat build/stdlib-$$name.err; exit 1; }; \
+	    done < $$exp_err; \
+	    echo "stdlib OK $$name (rejected as expected)"; \
+	    continue; \
+	  fi; \
 	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f > build/stdlib-$$name.c \
 	    || { echo "stdlib FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) -I ../stage0 build/stdlib-$$name.c -o build/stdlib-$$name \

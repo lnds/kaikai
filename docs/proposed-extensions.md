@@ -35,7 +35,7 @@ on.
 |--------------------------------------------|----------|-------------------------|
 | Sum types with constant attributes         | proposed | parser + resolution     |
 | `?.` optional chaining                     | proposed | parser + type checker   |
-| `Map[K, V]` + `m["key"]` indexing          | proposed | collection design       |
+| `Map[K, V]` + `m["key"]` indexing          | landed v1 (read-only sugar; tree carrier) — write sugar deferred to v2 alongside HAMT | — |
 | Slice syntax `a[i..j]`                     | proposed | `Vector[T]` landing     |
 | `Range[T]` as a first-class iterable       | proposed | collection design       |
 | Binary pattern matching `<<...>>`          | proposed | parser + match exhaustiveness |
@@ -352,16 +352,25 @@ complexity — re-evaluate then.
 pass (to nested `opt_and_then`).
 **Depends on**: parser + type checker.
 
-## 6. `Map[K, V]` — hash-map / associative container
+## 6. `Map[K, V]` — landed v1 (issue #128, 2026-05-02)
+
+`Map[K, V]` shipped as a v1 with the read-side indexing sugar.
+The retrospective lives at the end of this section; the original
+proposal text below stays for context. Write-side `m[k] := v`
+and HAMT are deferred to v2 (out of scope for v1).
 
 ```kai
-let scores: Map[String, Int] = Map.empty()
-    |> Map.insert("alice", 10)
-    |> Map.insert("bob",   7)
+let scores: Map[String, Int] = map_empty()
+    |> map_put("alice", 10)
+    |> map_put("bob",   7)
 
-# With indexing sugar (shipped with this proposal):
-let n = scores["alice"]                    # Option[Int]
-scores["charlie"] := 42                    # insert-or-update
+# Read indexing sugar (v1):
+let n = scores["alice"]            # Option[Int]
+
+# Write indexing sugar — DEFERRED. The typer rejects this with
+# a diagnostic pointing at map_put. v2 (alongside HAMT) brings
+# it back with the right semantics over a persistent container.
+# scores["charlie"] := 42         # error in v1
 ```
 
 kaikai has no general-purpose associative container in v1 —
@@ -416,6 +425,51 @@ together rather than drifting independently.
 several days of type-system and stdlib work.
 **Depends on**: a collection-design pass that also closes
 `Vector[T]` (see Doc B §`Mutable` *Known gap*).
+
+### Retrospective — v1 landed 2026-05-02 (issue #128)
+
+The three coupled axes resolved as:
+
+1. **Persistent vs ephemeral**: persistent. The carrier is a
+   height-balanced AVL tree keyed by `<` (`O(log n)` lookup,
+   insert, remove). HAMT was deferred to v2 — it wants a
+   `Hashable` protocol kaikai does not have today.
+2. **Indexing syntax**: same `[]` as `Array`, **read-only**.
+   The typer dispatches `e1[e2]` by inspecting the inferred
+   container type at the index site:
+   - `Array[T]` keeps lowering to `array_get(e1, e2)`.
+   - `Map[K, V]` lowers to `map_get(e1, e2) : Option[V]`.
+   - Unresolved type variables default to `Array[T]` so
+     existing diagnostics stay intact.
+   `m[k] := v` is **rejected** with a typed error pointing at
+   `map_put(m, k, v)`. The write semantics over a persistent
+   container needs its own design; that lane lands alongside
+   the HAMT carrier in v2.
+3. **Key constraints**: any type for which the runtime's `<` /
+   `==` operators are total — `Int`, `Real`, `Char`, `String`
+   in the v1 runtime. Records and sum types as keys panic at
+   runtime on the first comparison; lifting them to a primitive
+   key is the recommended workaround until v2 introduces an
+   `Ord` protocol. `Hashable` was not pulled into v1.
+
+What lives where after the lane:
+- Carrier + public surface — `stdlib/collections/map.kai`.
+- Typer dispatch — `stage2/compiler.kai` `synth_index` /
+  `SIndexAssign` arm.
+- Sugar specification — `docs/syntax-sugars.md` §4.
+- Regression fixtures — `examples/stdlib/map_tree_basic.kai`
+  (positive, includes a 1000-element round-trip) and
+  `examples/stdlib/map_assign_error.kai` (negative — typer
+  must reject `m[k] := v`).
+- Insert order is **no longer preserved**. `map_keys`,
+  `map_values`, and `map_to_pairs` walk the tree in key order.
+  Callers that needed insert order moved to a `[Pair[K, V]]`
+  list (or stayed where they were — see the JWT encoder demo
+  for an example that adapted to sorted output).
+
+The unblock target was `ahu`'s Registry primitive (named-actor
+lookup at production scale). v1 closes that block; v2 follows
+when HAMT and a `Hashable` protocol come together.
 
 ## 7. Slice syntax `a[i..j]`
 
@@ -790,10 +844,11 @@ of that one conversation — not drip-fed.
   been used enough to confirm the two do not overlap in practice.
   `?.` is local; `!` propagates. If the code base mostly wants
   propagation, `?.` may not be worth the complexity.
-- **`Map[K, V]` + indexing**: land together with `Vector[T]`
-  (Doc B §*Out of scope for v1*) as a single collection-design
-  pass. The persistent-vs-ephemeral, indexing-syntax, and
-  key-constraint axes in §6 are coupled decisions.
+- **`Map[K, V]` + indexing**: **landed v1** (issue #128,
+  2026-05-02) — see §6's retrospective for what shipped and
+  what stayed deferred. v2 (HAMT carrier + `Hashable` protocol +
+  write-side `m[k] := v` sugar) is still tied to the broader
+  collection-design pass alongside `Vector[T]`.
 - **Slice syntax `a[i..j]`**: lands *after* `Vector[T]` ships.
   Copying semantics over `Array[T]` is the first-approximation
   implementation; view-based slices with region tracking wait
