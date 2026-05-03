@@ -178,6 +178,7 @@ KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_op_fie
 /* Full prelude set — anything the compiler (stage 2's own source)
    calls directly when compiled through the LLVM backend. */
 KaiValue *kaix_prelude_args(void)                           { return kai_prelude_args(); }
+KaiValue *kaix_prelude_program_name(void)                   { return kai_prelude_program_name(); }
 KaiValue *kaix_prelude_exit(KaiValue *v)                    { return kai_prelude_exit(v); }
 /* kaix_prelude_panic is defined above near kaix_match_panic. */
 KaiValue *kaix_prelude_read_file(KaiValue *p)               { return kai_prelude_read_file(p); }
@@ -355,6 +356,15 @@ KaiValue *kaix_default_log_warn(void *self, KaiValue *msg, KaiCont *k) {
 }
 KaiValue *kaix_default_log_error(void *self, KaiValue *msg, KaiCont *k) {
     return kai_default_log_error(self, msg, k);
+}
+
+/* issue #140 — LLVM-visible wrappers around the static SecureRandom
+ * default handlers in runtime.h. */
+KaiValue *kaix_default_securerandom_int_range(void *self, KaiValue *min_v, KaiValue *max_v, KaiCont *k) {
+    return kai_default_securerandom_int_range(self, min_v, max_v, k);
+}
+KaiValue *kaix_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCont *k) {
+    return kai_default_securerandom_bytes(self, n_v, k);
 }
 
 /* m7c-d — install/teardown default handlers for builtins that
