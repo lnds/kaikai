@@ -189,6 +189,8 @@ tier1-asan: kaic2
 	@echo "tier1-asan OK — issue #82 fixture passes under ASAN+UBSan (Perceus leak-audit gate)"
 	@$(MAKE) -C stage2 test-http-client-asan
 	@echo "tier1-asan OK — net.http client fixture passes under ASAN+UBSan (Tier S1 lane #3 gate)"
+	@$(MAKE) -C stage2 test-stdlib-crypto-asan
+	@echo "tier1-asan OK — issue #139 fixture passes under ASAN+UBSan (crypto byte-buffer + 64-bit modular gate)"
 
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
