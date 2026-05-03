@@ -215,9 +215,17 @@ commit message names the milestone number.
 4. **Comparisons + boolean ops + `EIf` cond** — closes the rest
    of the inner loop body. Benchmark hits target ~5–10×.
    ~1 day.
-5. **Match scrutinee fast path (literal arms only)** — the only
-   v1 pattern-match optimisation. Skips if any arm is non-trivial.
-   ~half day.
+5. **Match scrutinee fast path (literal + wildcard + PBind catch-all)**
+   — the only v1 pattern-match optimisation. Skips if any arm is
+   non-trivial. As of issue #91 (closed 2026-05-02), a
+   `PBind(name)` catch-all also stays in the fast path: the body
+   binds the raw scrutinee as `kair_<name>` and EVar reads of
+   `name` resolve to the raw scalar via an env extension threaded
+   by the unbox pass. Hazard guard: if the body references `name`
+   inside a `#{...}` interp slot or inside a captured ELambda body,
+   the whole match falls back to the boxed path (those read sites
+   bypass the alias map and would resolve to a non-existent
+   `kai_<name>`). ~half day.
 6. **LLVM backend mirror** — same analysis output, symmetric
    IR. `make -C stage2 selfhost-llvm` byte-identical. ~1 day.
 7. **Stage 1 mirror** — slimmer port. ~half day.
