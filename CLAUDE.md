@@ -1,69 +1,33 @@
 # kaikai
 
-A functional programming language with static typing, compiled to native code via LLVM, with algebraic effects as a first-class primitive and Elixir-style pipelines.
+A functional language with static typing, LLVM native compilation, algebraic effects as a first-class primitive, and Elixir-style pipelines. Full design lives in `docs/design.md`.
 
-The project is in a **full redesign phase**. The previous history (a partial compiler in Go) was discarded. The current design lives in `docs/design.md`.
+## Project language
 
-## Project language conventions
-
-- **Commit messages in English. No exceptions.** This includes
-  commit subjects, bodies, PR titles, and PR descriptions. No
-  Spanish loanwords either, even if they were used as technical
-  jargon during agent briefing — translate them. Examples that
-  have leaked in past sessions and must be avoided: "mentira"
-  (use "structural lie" or "false claim"), "letra chica"
-  (use "fine print"), "trampa" (use "trap" or "pitfall"),
-  "aterrizó" (use "landed"). If a brief in Spanish reaches you,
-  the commit message you produce is still English.
-- **All documentation in English.** Including `README.md`, `docs/`, code comments, and any user-facing text.
+- Commit messages, PR titles/bodies, and all documentation are **English only** — no Spanish loanwords, even when the briefing is in Spanish.
 - Conversation with the user (Spanish) is not documentation and does not appear in the repo.
 
 ## Cross-cutting principles
 
-Three tiers, ordered by how non-negotiable they are. When principles conflict, the higher tier wins.
+Three tiers; the higher tier wins on conflict.
 
 ### Tier 1 — Load-bearing
 
-1. **Safe at compile time**
-   - Memory safety by default.
-   - No null; `Option[T]` always.
-   - Effects visible in types: every effect a function uses appears in its row (`/ Console + File + Cancel`, etc.). A function cannot be called from a context that does not handle its effects. Catalog and defaults pinned in `docs/effects-stdlib.md` (Doc B).
-   - Explicit runtime escapes, audited not incidental: `panic`, unfilled `?`, `todo!`, unbound `axiom`, FFI crossings, **opaque mutable `Array[T]`**.
-   - The Array escape is provisional: `array_make / get / set / grow` mutate in place and the mutation is not visible in the type. It exists so the stage 2 inferencer can index its substitution by TyVar id in O(1). Migration specified in `docs/effects-stdlib.md` §`Mutable`: `array_*` retrofits behind the `Mutable` effect in m7a, with the array-indexing sugar (`a[i]`, `a[i] := v`) shipping in m7b. Must not be used as a general-purpose container in new code.
+1. **Safe at compile time.** Memory-safe by default; `Option[T]` instead of null; effects visible in row types (catalog in `docs/effects-stdlib.md`); explicit runtime escapes (`panic`, `?`, `todo!`, `axiom`, FFI, opaque mutable `Array[T]`) are audited, not incidental. The `Array` escape is provisional and migrates behind the `Mutable` effect per `docs/effects-stdlib.md` §`Mutable`.
+2. **Runtime-efficient.** Generics monomorphised; mandatory TCO; primitives unboxed inside fibers; effects compile to one-shot continuations as the zero-cost default.
+3. **Fast compilation.** Single-pass parse, LL(1) with minor bookkeeping; HM extended with effect rows, decidable; **no Haskell-style type-class resolution** (no HKT, no constraint propagation, no functional dependencies, no type families). Single-dispatch protocols Go/Clojure/Elixir-style — `O(1)` impl-table lookup — are permitted (`docs/protocols.md`). Pipeline `lex → parse → resolve → infer → monomorph → perceus → lower`, dumpable between any two passes.
 
-2. **Runtime-efficient**
-   - Monomorphisation of generics.
-   - Mandatory tail-call optimisation.
-   - Primitives unboxed inside fibers; heap boxing only for compound immutables.
-   - Effects compiled with one-shot continuations as the zero-cost default; multi-shot pays on use.
+### Tier 2 — Aspirational (Tier 1 wins ties)
 
-3. **Fast compilation**
-   - Single-pass parse, LL(1) grammar with minor bookkeeping.
-   - HM-extended types with effect rows; decidable; **no Haskell-style type-class resolution** (no HKT, no constraint propagation in signatures, no functional dependencies, no type families). Single-dispatch protocols Go/Clojure/Elixir-style — `O(1)` impl-table lookup, no constraint solver — are permitted (m12.8, see `docs/protocols.md`).
-   - Pipeline `lex → parse → resolve → infer → monomorph → perceus → lower`, dumpable between any two passes.
+4. **Structured compiler output.** Diagnostics + queries come as stable JSON alongside human text. Typed holes + `--holes-json` are the prototype. **Not** "one canonical form per construct" — the language has intentional redundancies (`=` vs `{}` bodies, `|>` vs `|`, multiple lambda forms); the rule is *few forms, each with clear intent*.
+5. **Approachable core, novel where it pays off.** Day-to-day syntax (declarations, `let`, `if`, `match`, pipes, patterns) stays close to Python/JS/Elixir. Advanced surface — effects, handlers, nursery, fibers, holes — is novel on purpose.
+6. **Few visible concepts, layered.** ~10 concepts for basic code; advanced features stack on top.
 
-### Tier 2 — Aspirational (trade-offs allowed; Tier 1 wins ties)
+### Tier 3 — Strategic bet
 
-4. **Structured compiler output**
-   - Diagnostics and queries come as stable JSON alongside human text. Typed holes + `--holes-json` are the prototype; `kai type --json` and siblings extend the contract.
-   - **Not** "one canonical form per construct". The language has intentional redundancies (`=` vs `{}` bodies, `|>` vs `|`, multiple lambda forms) — each form signals intent. The real rule is *few forms, each with clear intent*.
+7. **LLM authorability.** Bet that typed holes + structured JSON + stable rules let LLMs author kaikai despite weak prior exposure. Acceptance: an LLM with JSON access completes the top 80% of typical functions within one round of compilation.
 
-5. **Approachable core, novel where it pays off**
-   - Day-to-day syntax (declarations, `let`, `if`, `match`, pipes, pattern matching) stays close to Python / JS / Elixir.
-   - Advanced surface — effects, handlers, nursery, fibers, holes — is **novel on purpose**. Expect a one-day ramp for sequential kaikai and a week to internalise the effect model.
-
-6. **Few visible concepts, layered**
-   - Floor: ~10 concepts for basic code (types, functions, `let`, `match`, `if`, records, sum types, lists, pipes, strings).
-   - Advanced features stack on top; no program pays for every concept.
-
-### Tier 3 — Strategic bet (depends on future conditions)
-
-7. **LLM authorability**
-   - Bet: with typed holes + structured JSON + stable rules, LLMs can author kaikai, even though current models know Python / Rust far better than effect-typed languages.
-   - Mechanism: shift weight from *the model knowing kaikai* to *the compiler telling the model what goes where* — holes, effect queries, exhaustiveness counterexamples.
-   - Acceptance criterion: an LLM with JSON access completes the top 80% of typical functions within one round of compilation.
-
-## Tie-breakers when principles conflict
+### Tie-breakers
 
 - Safety beats ergonomics.
 - Fast compilation beats generality.
@@ -71,34 +35,30 @@ Three tiers, ordered by how non-negotiable they are. When principles conflict, t
 - Approachability beats one-canonical-form.
 - LLM-friendliness is not a veto: a feature good for LLMs but bad for humans does not ship.
 
-## Not principles
+### Not principles (do not cite)
 
-Do not cite these in design arguments:
 - *One canonical form per construct* — already violated four times deliberately; see #4.
-- *Never surprise a Python programmer* — effects surprise them, by design; see #5.
-- *Zero-cost abstractions* — effects, fibers, and RC have small but non-zero costs.
+- *Never surprise a Python programmer* — effects surprise them, by design.
+- *Zero-cost abstractions* — effects, fibers, RC have small but non-zero costs.
 - *Backward compatibility* — not promised until post-MVP.
 
-## Baseline architectural decisions
+## Baseline architecture
 
-- **Backend**: LLVM directly (stage 2). Stages 0 and 1 emit portable C.
-- **Memory**: hybrid **Perceus** (compile-time optimized RC, Koka-style) inside each fiber + **isolated fibers** BEAM-style (private heap, messages copied). No borrow checker.
-- **Effects**: capability-passing **Effekt + inference**. Effects as an explicit set; inferred in local bodies; mandatory annotation in public signatures. Three pinned design docs: `docs/effects.md` (Doc A — semantics), `docs/effects-stdlib.md` (Doc B — catalog and defaults), `docs/effects-impl.md` (Doc C — CPS transform and runtime). Sugars (trailing lambdas, `@cap` / `cap := v`, `var`, `a[i]`) live in `docs/syntax-sugars.md` and ship in m7b.
-- **Concurrency**: fibers and actors live entirely inside the effect system.
-  - `spawn` / `await` / `select` / `cancel` are ops of the **`Spawn`** effect (`docs/structured-concurrency.md`).
-  - `send` / `receive` / `self` are ops of the parameterised **`Actor[Msg]`** effect (`docs/actors.md`).
-  - `Cancel` is a separate effect for cooperative cancellation.
-- **FFI**: crossing to C via the `Ffi` effect capability. Declarations use `extern "C" fn name(args) : T`.
-- **Tooling**: single `kai` binary with subcommands (`build`/`run`/`test`/`fmt`/`repl`/`lsp`/`doc`).
-- **Tests**: builtin syntax (`test "..." { ... }` + `assert`), integrated with `kai test`.
+- **Backend**: LLVM directly (stage 2). Stages 0–1 emit portable C.
+- **Memory**: Perceus (compile-time-optimised RC, Koka-style) inside each fiber + isolated fibers BEAM-style (private heap, messages copied). No borrow checker.
+- **Effects**: capability-passing Effekt + inference. Inferred in local bodies; mandatory annotation in public signatures. Three pinned docs: `docs/effects.md` (semantics), `docs/effects-stdlib.md` (catalog + defaults), `docs/effects-impl.md` (CPS + runtime). Sugars in `docs/syntax-sugars.md`.
+- **Concurrency**: fibers and actors live inside the effect system. `spawn/await/select/cancel` are ops of `Spawn` (`docs/structured-concurrency.md`); `send/receive/self` are ops of `Actor[Msg]` (`docs/actors.md`); `Cancel` is a separate cooperative-cancellation effect.
+- **FFI**: crosses to C via the `Ffi` capability. `extern "C" fn name(args) : T`.
+- **Tooling**: single `kai` binary (`build`/`run`/`test`/`fmt`/`repl`/`lsp`/`doc`).
+- **Tests**: builtin syntax (`test "..." { ... }` + `assert`), via `kai test`.
 
 ## Three-stage bootstrap
 
-- **Stage 0** — minimal C compiler. Zero dependencies. Compiles **kaikai-minimal** → portable C.
-- **Stage 1** — intermediate compiler in kaikai-minimal. Compiles **enough of full kaikai to compile stage 2** (basic effects + handlers + basic Perceus + monomorphisation) → C. Full effect catalog, m7b sugars, fibers, and actors land in stage 2 (`docs/stage2-design.md`).
-- **Stage 2** — definitive compiler in full kaikai. Direct LLVM backend. Self-hosted.
+- **Stage 0** — minimal C compiler, zero deps. Compiles kaikai-minimal → portable C.
+- **Stage 1** — intermediate compiler in kaikai-minimal. Compiles enough of full kaikai to produce stage 2 → C.
+- **Stage 2** — definitive compiler in full kaikai, direct LLVM backend, self-hosted (`docs/stage2-design.md`).
 
-Any machine with `cc` can bootstrap from scratch:
+Bootstrap from any machine with `cc`:
 
 ```sh
 cc stage0/*.c -o kaic0
@@ -107,216 +67,65 @@ cc stage0/*.c -o kaic0
 ./fizzbuzz
 ```
 
-## Testing discipline (load-bearing — read before opening a PR)
+## Testing discipline
 
-Three test tiers run at three cadences. Pin spec lives in
-`docs/testing-tiers.md`. CI runs in GitHub Actions
-(`.github/workflows/tier1.yml`, ubuntu-latest); it is the source
-of truth for tier1 on every PR and on every push to `main`.
-Defaults that every agent must follow without being told:
+Three tiers, three cadences. Spec in `docs/testing-tiers.md`; CI in `.github/workflows/tier1.yml` (and `tier1-asan.yml`).
 
-- **Tier 0 — pre-commit fast sanity** (~30–60s): `make tier0`
-  (`make selfhost && make demos-no-regression`). Run before each
-  commit when iterating on compiler code; you may skip when the
-  change is documentation-only or trivially text-edit. CI catches
-  what local skips miss; this rule is now a velocity tool, not a
-  gate.
-- **Doc-only changes skip every tier — locally AND in CI.** A lane
-  whose diff is confined to `docs/`, root-level `*.md`
-  (CLAUDE.md, README.md), or `LICENSE` does NOT run `make tier0` /
-  `make tier1` / `make tier1-asan` locally, and the
-  `tier1.yml` workflow's `paths-ignore` makes CI skip those PRs
-  too. Burning ~4 minutes of CI on a doc-only push is wasted
-  velocity. Code paths (`stage*/`, `stdlib/`, `examples/`,
-  `demos/`, `.github/`, `Makefile`, `VERSION`, build scripts)
-  ALWAYS trigger every tier, locally and in CI.
-- **Tier 1 — gated by CI on every PR**: GitHub Actions runs
-  `make tier0 && make tier1` on every PR and on every push to
-  `main`. **CI green is the merge gate** — the PR description no
-  longer needs to paste the trailing line of `make tier1`
-  verbatim, the check status replaces that ceremony. Agents may
-  run `make tier1` locally for faster feedback (~2–4 min on mac)
-  but it is not required. The R2 / R3 / R4 regressions that
-  motivated the manual ceremony (commit messages claiming
-  `make test clean` without anyone having run `make test`) are
-  the kind of failure CI now makes structurally impossible.
-- **Tier 1-ASAN — path-gated CI on PRs touching runtime / emit /
-  perceus / fiber+RC fixtures**: a separate workflow
-  (`.github/workflows/tier1-asan.yml`) runs `make tier1-asan` on
-  ubuntu-latest under ASAN+UBSan when the diff matches
-  `stage0/**`, `stage1/compiler.kai`, `stage2/compiler.kai`,
-  `stage2/Makefile`, `stdlib/**`, `examples/effects/**`, or
-  `examples/perceus/**`. Typer-only / fmt-only PRs do not pay the
-  ~5 min ASAN tax. This catches non-portable fixes that pass
-  tier1 on macOS but fail on Linux (the PR #111 mailbox
-  trap-exit segfault is the precedent). Fixtures wired into
-  `make tier1-asan` (TRACE_FIXTURES, runtime-shadow-asan, etc.)
-  are the gate.
-- **Tier 2 — `make daily`**: only the maintainer / cron runs this on
-  `main` HEAD at end-of-day. Tier 1 + stress fixtures + coverage
-  probe + RC budget. Agents do not run Tier 2 inside their lanes —
-  it would burn velocity. ~10-20 min.
+- **Tier 0** — pre-commit fast sanity (~30–60 s): `make tier0`. Run before each commit when iterating on compiler code; CI catches what local skips miss.
+- **Tier 1** — gated by CI on every PR: `make tier0 && make tier1` runs on `ubuntu-latest` for every PR and every push to `main`. **CI green is the merge gate.** Optional locally for faster feedback (~2–4 min on mac).
+- **Tier 1-ASAN** — path-gated CI on PRs touching `stage0/**`, `stage1/compiler.kai`, `stage2/compiler.kai`, `stage2/Makefile`, `stdlib/**`, `examples/effects/**`, or `examples/perceus/**`. Catches non-portable fixes that pass on macOS but fail on Linux.
+- **Tier 2** — `make daily`: maintainer / cron only, ~10–20 min. Tier 1 + stress + coverage probe + RC budget. Failures are diagnostics, not blockers — `main` already gated by Tier 1.
+- **Doc-only changes** (diff confined to `docs/`, root `*.md`, `LICENSE`) skip every tier locally AND in CI via `paths-ignore`. Code paths (`stage*/`, `stdlib/`, `examples/`, `demos/`, `.github/`, `Makefile`, `VERSION`, build scripts) always trigger tiers.
 
-Adjacent rules every agent must apply:
+## Lane discipline
 
-- **Working tree must be clean** at every commit. No `git status`
-  output, no stashed work tied to a different lane. The
-  2026-04-29 audit caught `stage1/compiler.kai` dirty for hours
-  because nobody noticed; that hides which gate actually ran.
-- **Lane discipline**: a worktree fixes one thing. If you find a
-  bug outside your lane, **open a GitHub issue** with repro +
-  hypothesis (label `regression` plus the topic-specific labels
-  — `runtime`, `compiler`, `perceus`, `typer`, `stdlib`,
-  `unboxing`, `refinements`), do not fix it inline. The L2 wrong-
-  lane revert from 2026-04-29 is the precedent. (Pending work
-  used to live in `docs/*-followup.md` + `docs/known-regressions.md`;
-  those were retired in PR #99, see "Where pending work lives"
-  below.)
-- **Regression-fixture discipline**: every fix lane must add at
-  least one fixture that exercises the bug shape it fixed, wired
-  into the appropriate tier (`make tier1` for typer / language
-  fixes; `make tier1-asan` for runtime / emit / RC fixes). The
-  fixture lives in `examples/effects/` (effect-shaped bugs),
-  `examples/perceus/` (RC bugs), `examples/sugars/` (sugar
-  desugar bugs), or wherever the closest existing precedent
-  sits. Negative fixtures (compile / runtime errors) get a
-  `.err.expected` golden; positive fixtures get a `.out.expected`.
-  The R9 fix (PR #66) that landed without an in-tree fixture is
-  the precedent: the bug had a 25-line repro that took agents
-  hours to reconstruct from the regression-tracker text; R10/R11's
-  lane (PR #65 + PR #70) avoided that by promoting its diagnostic
-  fixtures into permanent regression coverage. Any future
-  regression of the same shape now produces a deterministic diff
-  under tier1 / tier1-asan instead of bit-rotting in a doc. The
-  closing PR's body must explicitly name the new fixture(s) so the
-  integrator can verify the discipline was followed.
-- **Lane handoff — push + PR is authorized**: an agent spawned
-  in a worktree (e.g. via `/wt-claude`) **is authorized to push
-  its lane branch to origin and open a pull request via
-  `gh pr create` once its acceptance gate is green** (Tier 0 +
-  Tier 1, plus `tier1-asan` if the lane touches the runtime or
-  emit pass). This is the standing exception to the global
-  Claude Code rule "do not push to the remote repository unless
-  the user explicitly asks." Rationale: the worktree spawn
-  itself is the explicit authorization for the lane's full
-  push-to-PR loop; making the user also re-confirm push at the
-  end of every lane burns turns and breaks the parallel-lane
-  flow this repo's worktree pattern is built around. **Merge
-  stays with the integrator** — agents do NOT run
-  `gh pr merge`, do NOT bump `VERSION`, and do NOT promote
-  `## [Unreleased]` (those are integrator steps per the
-  workflow below). If CI fails, the agent fixes the failure on
-  the same branch and pushes again; force-push is fine for
-  lane branches that have not been reviewed yet.
-- **VERSION + CHANGELOG (agent side)**: do NOT touch
-  `CHANGELOG.md` and do NOT touch `VERSION`. Both are regenerated
-  by `cz bump` at release time from your commit messages — that
-  is the integrator's step (see "Integrator workflow" below).
-  Your contract is the **commit message format**, not the
-  changelog file. This rule replaces the prior "add an entry
-  under `## [Unreleased]`" rule retired 2026-05-02 when commitizen
-  (`cz`) automation landed; the rationale was that
-  per-agent CHANGELOG entries created mechanical conflicts on
-  every parallel-lane merge for zero added information beyond
-  the commit message itself.
-- **Commit messages — Conventional Commits**: every commit must
-  follow `<type>(<scope>)?: <subject>`. The `<type>` is one of:
-  - `feat` — new user-visible capability (lands in CHANGELOG
-    "Added").
-  - `fix` — bug fix (lands in CHANGELOG "Fixed").
-  - `perf` — performance change (lands in "Changed").
-  - `refactor` — code shape change with no behaviour change
-    (lands in "Changed").
-  - `docs` — documentation only (excluded from CHANGELOG).
-  - `chore` — repo housekeeping, deps, build config (excluded).
-  - `ci` — CI workflow changes (excluded).
-  - `test` — test-only changes (excluded).
-  - `build` — build-system changes (excluded).
-  Domain areas — `typer`, `runtime`, `perceus`, `emit`, `tco`,
-  `stdlib`, `demos`, `fmt`, `unbox`, `sigharness`, etc. — are
-  **scopes**, not types. Write `fix(typer): correct row
-  inference for nested handlers`, not `typer: correct row
-  inference for nested handlers`. The scope is what cz uses to
-  group the bullet under its area. The legacy bare-domain-prefix
-  style (`typer:`, `runtime:`, `perceus:` etc.) was retired
-  2026-05-02 and is invisible to cz.
-- **Breaking changes**: add `!` after the type/scope and a
-  `BREAKING CHANGE:` footer in the commit body. Example:
-  `feat(typer)!: drop implicit row defaulting` with body
-  `BREAKING CHANGE: programs that relied on implicit row
-  defaulting must add an explicit handler.`. cz reads the footer
-  to bump the major version (or minor while pre-1.0).
+- **One worktree fixes one thing.** If you find a bug outside your lane, open a GitHub Issue with repro + hypothesis (label `regression` plus topic labels: `runtime`, `compiler`, `perceus`, `typer`, `stdlib`, `unboxing`, `refinements`). Do not fix it inline.
+- **Working tree clean at every commit** — no uncommitted leftovers, no stashes tied to other lanes.
+- **Regression-fixture discipline.** Every fix lane adds at least one fixture exercising the bug shape, wired into the right tier. Live in `examples/effects/` (effect-shaped), `examples/perceus/` (RC), `examples/sugars/` (sugar desugar), or the closest precedent. Negative fixtures get `.err.expected` goldens; positive fixtures get `.out.expected`. The closing PR must name the new fixture(s).
+- **Lane handoff (push + PR is authorized).** Worktree-spawned agents (e.g. via `/wt-claude`) may push the lane branch and open a PR via `gh pr create` once the acceptance gate is green. Standing exception to the global "do not push without explicit ask" rule. **Merge stays with the integrator** — agents do NOT run `gh pr merge`. If CI fails, fix on the same branch and push again; force-push is fine for unreviewed lane branches.
+- **Pending work lives in GitHub Issues.** Tracking docs were retired in PR #99; do not recreate them.
 
-- **Integrator workflow (post-CI)**: the integrator no longer
-  performs a local merge dance, and as of 2026-05-02 no longer
-  hand-edits `VERSION` / `CHANGELOG.md`. Once tier1 is green on
-  the PR, the flow is:
+## Commit messages — Conventional Commits
 
-      # 1. Merge via gh — gh creates the merge commit on GitHub.
-      gh pr merge <N> --merge \
-        --subject "Merge pull request #<N> from <branch>" \
-        --body "$(cat <<EOF
-      <descriptive body — same style as past merges, e.g. f9a8822>
-      EOF
-      )"
+`<type>(<scope>)?: <subject>`. Type drives changelog placement and version bump:
 
-      # 2. Release via cz — bumps VERSION, prepends a new
-      # changelog section from conventional commits since the
-      # last tag, and creates the v0.X.Y annotated tag.
-      git pull --ff-only origin main
-      cz changelog --dry-run | head -40   # eyeball the section
-      cz bump --yes                       # writes VERSION + CHANGELOG.md + tag
-      git push origin main --follow-tags
+- `feat` → CHANGELOG "Added", MINOR bump (pre-1.0).
+- `fix` → "Fixed", PATCH.
+- `perf` / `refactor` → "Changed", PATCH.
+- `docs`, `chore`, `ci`, `test`, `build` → excluded from changelog, no bump.
 
-  cz reads `.cz.toml` (`change_type_map = { feat = "Added",
-  fix = "Fixed", … }`) and walks commits since the most recent
-  matching `v$version` tag. The bump rule is `feat → MINOR` and
-  `fix → PATCH` while `major_version_zero = true`; a commit with
-  `BREAKING CHANGE:` in its body bumps MINOR (still pre-1.0).
-  The integrator can edit the generated section before
-  committing if a release wants a hand-written narrative on top
-  of the bullet list — `cz bump --files-only` writes the diff
-  without committing it, leaving the door open. The advantage
-  over the prior hand-edit flow: zero merge conflicts on
-  `CHANGELOG.md` between parallel lanes (lanes never touch the
-  file), and the version number falls out mechanically from
-  commit types instead of being decided manually.
-- **`make daily` failures are diagnostics, not blockers.** Tier 0
-  / Tier 1 already gated every commit, so `main` stays unbroken.
-  A `daily` failure opens a lane the next morning; do not jam
-  velocity by treating it as a per-PR gate.
-- **Coverage probe ratchet**: `tools/coverage-baseline.txt` is the
-  current allowed gap count. New gaps fail the probe; closed gaps
-  bump the baseline down. Add `<!-- coverage: skip -->` after a
-  heading only when it documents a non-testable concern (design
-  rationale, references), not when you forgot to write a fixture.
-- **Honesty targets**: when you ship a runtime change that affects
-  fibers or Perceus, update the relevant tier in
-  `docs/fibers-honesty-targets.md` or
-  `docs/perceus-honesty-targets.md`. The "Tier 1 #2 holds without
-  footnotes" claim in this CLAUDE.md is verifiable only against
-  those documents.
-- **Where pending work lives**: open follow-ups and known
-  regressions live in **GitHub Issues**, not in tracking docs.
-  PR #99 (2026-05-02) retired `docs/m5x-followup.md`,
-  `docs/m12-6x-followup.md`, `docs/unboxing-phase2-followup.md`,
-  and `docs/known-regressions.md`; their open items moved to
-  issues #77–#96 with the labels `regression`, `perceus`,
-  `runtime`, `typer`, `compiler`, `stdlib`, `unboxing`,
-  `refinements`, and the tier labels `tier1` / `tier2` / `tier3`.
-  When you discover a new follow-up or regression, open an issue
-  with the relevant labels — do not re-create the tracking docs.
-  Closed items are recoverable from `git log` if needed.
+Domain areas (`typer`, `runtime`, `perceus`, `emit`, `tco`, `stdlib`, `demos`, `fmt`, `unbox`, `sigharness`, …) are **scopes**, not types: `fix(typer): correct row inference`, never `typer: correct row inference`. The legacy bare-domain-prefix style is invisible to cz.
+
+**Breaking changes**: `feat(typer)!: drop X` plus `BREAKING CHANGE: <why>` footer. cz reads the footer to bump MINOR (pre-1.0) or MAJOR (post-1.0).
+
+## VERSION + CHANGELOG (agent side)
+
+Do **NOT** touch `CHANGELOG.md` or `VERSION`. Both are regenerated by `cz bump` at release time from commit messages.
+
+## Integrator workflow (post-CI)
+
+Once tier1 is green:
+
+```sh
+gh pr merge <N> --merge --subject "..." --body "..."
+git pull --ff-only origin main
+cz changelog --dry-run | head -40    # eyeball the section
+cz bump --yes                         # writes VERSION + CHANGELOG.md + tag
+git push origin main --follow-tags
+```
+
+cz reads `.cz.toml` (`change_type_map = { feat = "Added", fix = "Fixed", … }`, `major_version_zero = true`), walks commits since the most recent `v$version` tag, and bumps the version mechanically from commit types. `cz bump --files-only` writes the diff without committing if a hand-written narrative is wanted on top.
+
+## Coverage + honesty
+
+- **Coverage probe ratchet**: `tools/coverage-baseline.txt` is the current allowed gap count. New gaps fail the probe; closed gaps bump the baseline down. Add `<!-- coverage: skip -->` only for non-testable concerns (design rationale, references), not for forgotten fixtures.
+- **Honesty targets**: runtime changes affecting fibers or Perceus update the relevant tier in `docs/fibers-honesty-targets.md` or `docs/perceus-honesty-targets.md`.
 
 ## Things to avoid
 
 - **Do not go back to Go** for the compiler. The prior Go frontend was discarded on purpose.
-- **Do not introduce a Rust-style borrow checker**. Perceus + fibers resolves memory at compile time without cognitive cost.
-- **Do not add forms whose intent overlaps with an existing one**. Two bodies for functions is fine (short vs block); two pipes is fine (apply vs map); a third way to do the same thing with no new intent is not. The standard is *few forms, each carrying distinct intent* — not *one form, full stop*.
-- **Do not add dependencies to stage 0**. It must build on any system with an ANSI `cc`.
-- **Do not design against WASM, Windows, or other post-MVP targets**, but do not invest effort in them now either.
-- **Do not cite retired principles** in design arguments (see the "Not principles" section above).
-
-## Current state
-
-See `docs/design.md` for the full plan, phased roadmap, and MVP specification.
+- **Do not introduce a Rust-style borrow checker.** Perceus + fibers resolves memory at compile time without cognitive cost.
+- **Do not add forms whose intent overlaps an existing one.** Two function bodies (short vs block) is fine; two pipes (apply vs map) is fine; a third way to do the same thing with no new intent is not.
+- **Do not add dependencies to stage 0.** It must build on any system with an ANSI `cc`.
+- **Do not design against WASM, Windows, or other post-MVP targets.**
+- **Do not cite retired principles** in design arguments (see *Not principles*).

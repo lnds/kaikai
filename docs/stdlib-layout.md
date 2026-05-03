@@ -286,7 +286,9 @@ declare `/ Stdin`.
 
 ### os (`/ Env + Process`)
 
-- `os.env` — `get`, `set`, `unset`, `all`
+- `os.env` — `get`, `set`, `unset`, `entries` (renamed from
+  `all` in issue #127 — the bare `all` name collided with
+  `list.all` in any caller importing both)
 - `os.args` — `argv`, `program_name`
 - `os.process` — `start(cmd, args)`, `wait`, `wait_or_kill`, `pipe_stdout`, `pipe_stdin`, `signal`, `kill`
 - `os.exit` — top-level helper exposed directly under `os`,
