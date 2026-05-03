@@ -1,0 +1,444 @@
+# stdlib/net/http.kai — HTTP/1.1 client over the NetTcp effect.
+#
+# Spec: docs/effects-stdlib.md §`NetTcp` notes that "Higher-level
+# protocols (HTTP, WebSocket, gRPC) live in stdlib modules that
+# *use* the relevant effects". docs/stdlib-layout.md §`net` pins
+# net.http as **client only** — server-side HTTP belongs to the
+# manutara web framework, not stdlib.
+#
+# Module path: `import net.http`. The catalog and naming convention
+# live in docs/stdlib-layout.md §`net`. The flat `http_*` prefix
+# matches the rest of stdlib while the m14 module system is still
+# being designed; `http.get(url)` becomes the canonical surface
+# once dotted dispatch lands.
+#
+# What ships in v1:
+#   - HTTP/1.1 only.
+#   - Plaintext `http://` scheme. `https://` is rejected at parse
+#     time with a clear error message — TLS waits on a separate
+#     `Tls` effect (see docs/effects-stdlib.md §`NetTcp` "What's not
+#     in v1").
+#   - Convenience constructors (`http_get`, `http_post`, `http_put`,
+#     `http_delete`) plus a lower-level `http_request` builder over
+#     a fully-typed `Request` value.
+#   - Pure helpers (`http_serialize_request`, `http_parse_response`,
+#     `http_parse_url`) exposed so callers — and the regression
+#     fixture under `examples/stdlib/http_client_basic.kai` — can
+#     exercise the format roundtrip without a live socket.
+#
+# What's intentionally deferred (each defer matches docs/stdlib-layout.md
+# §`net` "post-MVP" or docs/effects-stdlib.md §`NetTcp` "What's not
+# in v1"):
+#   - TLS / `https://`. Lands as a separate `Tls` effect; the v1
+#     parser surfaces the gap as an explicit Err so the call site
+#     fails loudly instead of silently downgrading.
+#   - Chunked transfer encoding. v1 reads the body strictly by
+#     `Content-Length`; a missing header means "read until peer
+#     close" (HTTP/1.0 fallback). Chunked decoding lands when a
+#     real-world workload demands it.
+#   - Redirects (3xx). The caller inspects `response.status` and
+#     re-issues the request against `Location` if desired. An
+#     automatic follow surface waits for the cookie / redirect
+#     policy design.
+#   - Compression (gzip / deflate / br). The `Accept-Encoding`
+#     header is not set automatically; servers that honour it
+#     would need a decoder this lane does not ship.
+#   - Content-negotiation helpers (`Accept`, `Accept-Language`).
+#     Set by the caller via `req.headers` when needed.
+#   - HTTP/2 and HTTP/3. Tier S3 per docs/stdlib-roadmap layout —
+#     module add-ons over the same NetTcp (and NetUdp for QUIC),
+#     no new effect.
+#   - Connection pooling / keep-alive. Each `http_request` opens
+#     a fresh `Conn`, sends, reads the response, closes. The
+#     server-side `Connection: close` is implied.
+#   - Cookies, auth helpers (Basic / Bearer pre-cooked headers),
+#     multipart bodies. Composable on top of the v1 surface.
+#   - A first-class `net.url` module. The minimal URL parser here
+#     is inlined; it migrates out as soon as a URL surface beyond
+#     "scheme + host + port + path" is needed (query params,
+#     userinfo, fragments). Tracked alongside the URI lane.
+#
+# Effect row: every network-touching helper carries
+# `/ NetTcp + Cancel`. NetTcp is the byte-level capability;
+# Cancel is the cooperative-cancellation discipline shared by
+# every blocking-shaped op in the catalog. The current v1
+# NetTcp default handler is fully blocking (no kqueue / epoll
+# yet — see docs/effects-stdlib.md §`NetTcp` "Default handler"),
+# so a Cancel raised mid-call cannot interrupt a syscall in
+# flight today; the row stays declared so the surface is
+# forward-compatible with the m8.x reactor lane.
+#
+# DNS: `NetTcp.connect` already calls `getaddrinfo(3)` on the
+# host string (see stage0/runtime.h §"NetTcp default handler" /
+# `kai_default_nettcp_connect`), so this module passes the
+# parsed host through verbatim — both numeric IPv4 and hostname
+# inputs work. A separate `NetDns` effect arrives with that lane
+# (docs/effects-stdlib.md §`NetTcp`); the row will gain it then.
+
+# ---- types --------------------------------------------------------
+
+# Parsed URL — `http://host[:port][/path]`. `port` is filled in from
+# the scheme default (80) when the URL omits it. `path` always begins
+# with `/`; an empty path component is normalised to `/`.
+pub type HttpUrl = { scheme: String, host: String, port: Int, path: String }
+
+# Authority split — `host[:port]` decomposed for connect. Carrier
+# record (rather than `Pair[String, Int]`) so the typer can pin
+# the field types from the constructor literal at every call site
+# without extra annotations. The same reasoning applies to
+# `HttpHeader` below.
+pub type HttpHostPort = { host: String, port: Int }
+
+# One header line — `name: value` with the value already trimmed
+# of surrounding whitespace per RFC 7230 §3.2.4.
+pub type HttpHeader = { name: String, value: String }
+
+# Outbound request. `method` is the verb (uppercase: "GET" / "POST"
+# / "PUT" / "DELETE"). `url` is the absolute URL the request is
+# directed at; `http_request` parses it to derive the connect target
+# and the request-line path. `headers` is a list of name/value
+# pairs appended after the auto-emitted `Host` and `Content-Length`
+# (in user-provided order). `body` is the raw request body — empty
+# for GET / DELETE, application-defined bytes for POST / PUT.
+pub type Request  = { method: String, url: String,
+                      headers: [HttpHeader], body: String }
+
+# Inbound response. `status` is the integer status code (200, 404,
+# …). `headers` is the parsed header block in receive order. `body`
+# is the response body; v1 reads it by `Content-Length` when set,
+# otherwise drains until the peer closes the connection (HTTP/1.0
+# fallback).
+pub type Response = { status: Int,
+                      headers: [HttpHeader], body: String }
+
+# ---- string helpers ----------------------------------------------
+
+# Index of the first occurrence of `needle` in `haystack`, or -1.
+# Linear-scan implementation; acceptable for response headers (a
+# few KB at most). A faster O(n+m) variant lands when stdlib
+# acquires a real string library.
+fn http_str_index_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Int =
+  if nn == 0 { 0 }
+  else if i + nn > hn { 0 - 1 }
+  else if string_slice(hay, i, nn) == needle { i }
+  else { http_str_index_loop(hay, needle, i + 1, hn, nn) }
+
+fn http_str_index(hay: String, needle: String) : Int =
+  http_str_index_loop(hay, needle, 0, string_length(hay), string_length(needle))
+
+# Trim ASCII whitespace from both ends — used on header values
+# where servers may emit `Header:   value` with extra spaces.
+# Reuses `string_trim` from stdlib/core/string.kai when in scope;
+# we re-derive locally to avoid the cross-module dependency the
+# stage 2 prelude chain already enforces.
+fn http_is_ws(c: Char) : Bool =
+  c == ' ' or c == '\t' or c == '\r' or c == '\n'
+
+fn http_ltrim_loop(s: String, i: Int, n: Int) : Int =
+  if i >= n { i }
+  else { match char_at(s, i) {
+    Some(c) -> if http_is_ws(c) { http_ltrim_loop(s, i + 1, n) } else { i }
+    None    -> i
+  } }
+
+fn http_rtrim_loop(s: String, i: Int) : Int =
+  if i <= 0 { 0 }
+  else { match char_at(s, i - 1) {
+    Some(c) -> if http_is_ws(c) { http_rtrim_loop(s, i - 1) } else { i }
+    None    -> i
+  } }
+
+fn http_trim(s: String) : String = {
+  let n  = string_length(s)
+  let lo = http_ltrim_loop(s, 0, n)
+  let hi = http_rtrim_loop(s, n)
+  if hi <= lo { "" } else { string_slice(s, lo, hi - lo) }
+}
+
+# String → [Int] (byte list) for `NetTcp.send`. Each Char is taken
+# verbatim — the protocol is ASCII for header bytes and
+# caller-supplied bytes for the body, so a 1:1 codepoint→byte
+# mapping is honest enough for v1 (multi-byte UTF-8 in the body
+# round-trips because each byte is already in [0, 255] when
+# kaikai's String is UTF-8 internally; bytes ≥ 128 keep their
+# high bit through char_to_int).
+fn http_string_to_bytes_loop(s: String, i: Int, n: Int, acc: [Int]) : [Int] =
+  if i >= n { list_reverse(acc) }
+  else { match char_at(s, i) {
+    Some(c) -> http_string_to_bytes_loop(s, i + 1, n, [char_to_int(c), ...acc])
+    None    -> list_reverse(acc)
+  } }
+
+pub fn http_string_to_bytes(s: String) : [Int] =
+  http_string_to_bytes_loop(s, 0, string_length(s), [])
+
+# [Int] → String. Intended for the response stream where each Int
+# is a byte the runtime read off the socket. Builds a list of
+# 1-char strings then concatenates once via `string_concat_all`,
+# avoiding the O(n²) repeated-concat trap.
+fn http_byte_to_str(b: Int) : String = "#{int_to_char(b)}"
+
+pub fn http_bytes_to_string(bs: [Int]) : String =
+  string_concat_all(map(bs, http_byte_to_str))
+
+# ---- URL parsing -------------------------------------------------
+
+# Split an `authority` (`host[:port]`) into (host, port). When
+# the `:port` is missing or unparseable, `port` is 0 — callers
+# substitute a scheme default.
+fn http_split_authority(auth: String) : HttpHostPort = {
+  let i = http_str_index(auth, ":")
+  if i < 0 { HttpHostPort { host: auth, port: 0 } }
+  else {
+    let h = string_slice(auth, 0, i)
+    let rest = string_slice(auth, i + 1, string_length(auth) - i - 1)
+    match string_to_int(rest) {
+      Some(p) -> HttpHostPort { host: h, port: p }
+      None    -> HttpHostPort { host: h, port: 0 }
+    }
+  }
+}
+
+fn http_default_port(scheme: String) : Int =
+  if scheme == "http" { 80 }
+  else if scheme == "https" { 443 }
+  else { 0 }
+
+# Minimal URL parser: `http://<host>[:<port>][/<path>]`.
+# `https://` is recognised so the error message can name TLS
+# specifically; any other scheme is reported as unsupported.
+pub fn http_parse_url(s: String) : Result[String, HttpUrl] = {
+  let sep = "://"
+  let i   = http_str_index(s, sep)
+  if i < 0 {
+    Err("http_parse_url: missing scheme separator '://' in URL")
+  } else {
+    let scheme = string_slice(s, 0, i)
+    let rest   = string_slice(s, i + 3, string_length(s) - i - 3)
+    if scheme == "https" {
+      Err("http_parse_url: https:// requires TLS, which is not in net.http v1 (see stdlib/net/http.kai header)")
+    } else if scheme == "http" {
+      let path_at = http_str_index(rest, "/")
+      let auth = if path_at < 0 { rest } else { string_slice(rest, 0, path_at) }
+      let path = if path_at < 0 { "/" }
+                 else { string_slice(rest, path_at, string_length(rest) - path_at) }
+      let hp   = http_split_authority(auth)
+      let host = hp.host
+      let port = if hp.port == 0 { http_default_port(scheme) } else { hp.port }
+      if string_length(host) == 0 {
+        Err("http_parse_url: empty host")
+      } else {
+        Ok(HttpUrl { scheme: scheme, host: host, port: port, path: path })
+      }
+    } else {
+      Err(string_concat_all(["http_parse_url: unsupported scheme '", scheme, "' (only http:// is supported in v1)"]))
+    }
+  }
+}
+
+# ---- request serialiser -------------------------------------------
+
+fn http_format_header(h: HttpHeader) : String =
+  string_concat_all([h.name, ": ", h.value, "\r\n"])
+
+fn http_format_headers(hs: [HttpHeader]) : String =
+  string_concat_all(map(hs, http_format_header))
+
+# Authority string for the `Host` header: bare host when the port
+# is the scheme default, `host:port` otherwise. The HTTP/1.1 spec
+# allows either; servers that virtual-host on default ports do
+# not require the explicit `:80`.
+fn http_host_header(u: HttpUrl) : String =
+  if u.port == http_default_port(u.scheme) { u.host }
+  else { string_concat_all([u.host, ":", int_to_string(u.port)]) }
+
+# Serialise a `Request` to wire bytes (HTTP/1.1 framing). The
+# emitted block is:
+#   <METHOD> <PATH> HTTP/1.1\r\n
+#   Host: <authority>\r\n
+#   Content-Length: <body.len>\r\n
+#   <user header lines>
+#   \r\n
+#   <body>
+# `Host` and `Content-Length` are auto-emitted; user headers are
+# appended verbatim. `Connection: close` is NOT emitted — the v1
+# read loop drains the socket until peer close anyway, and adding
+# the header would surprise callers who supplied their own.
+pub fn http_serialize_request(req: Request) : String = {
+  match http_parse_url(req.url) {
+    Err(e) -> string_concat_all(["INVALID_URL: ", e])
+    Ok(u)  -> {
+      let path  = if string_length(u.path) == 0 { "/" } else { u.path }
+      let line1 = string_concat_all([req.method, " ", path, " HTTP/1.1\r\n"])
+      let host  = string_concat_all(["Host: ", http_host_header(u), "\r\n"])
+      let clen  = string_concat_all(["Content-Length: ", int_to_string(string_length(req.body)), "\r\n"])
+      let extra = http_format_headers(req.headers)
+      string_concat_all([line1, host, clen, extra, "\r\n", req.body])
+    }
+  }
+}
+
+# ---- response parser ---------------------------------------------
+
+fn http_parse_status_line(line: String) : Result[String, Int] = {
+  # `HTTP/1.1 200 OK` → split into 3 pieces, take the middle.
+  let parts = string_split(line, " ")
+  match parts {
+    [_proto, code, ..._reason] -> match string_to_int(code) {
+      Some(n) -> Ok(n)
+      None    -> Err(string_concat("http_parse_response: bad status code: ", code))
+    }
+    _ -> Err(string_concat("http_parse_response: malformed status line: ", line))
+  }
+}
+
+# Parse a single header line `Name: Value`. Values may have
+# surrounding whitespace per RFC 7230 §3.2.4; we trim both sides.
+# Lines without `:` are reported as a parse error so the caller
+# can surface a clear diagnostic instead of silently dropping
+# malformed headers.
+fn http_parse_header_line(line: String) : Result[String, HttpHeader] = {
+  let i = http_str_index(line, ":")
+  if i < 0 { Err(string_concat("http_parse_response: header missing ':': ", line)) }
+  else {
+    let nm  = string_slice(line, 0, i)
+    let raw = string_slice(line, i + 1, string_length(line) - i - 1)
+    Ok(HttpHeader { name: nm, value: http_trim(raw) })
+  }
+}
+
+fn http_parse_header_lines_loop(lines: [String], acc: [HttpHeader])
+    : Result[String, [HttpHeader]] = match lines {
+  [] -> Ok(list_reverse(acc))
+  [l, ...rest] ->
+    if string_length(l) == 0 { http_parse_header_lines_loop(rest, acc) }
+    else { match http_parse_header_line(l) {
+      Err(e) -> Err(e)
+      Ok(h)  -> http_parse_header_lines_loop(rest, [h, ...acc])
+    } }
+}
+
+fn http_parse_header_lines(lines: [String]) : Result[String, [HttpHeader]] =
+  http_parse_header_lines_loop(lines, [])
+
+# Case-insensitive lookup is overkill for v1 — we ship a
+# case-sensitive helper and document the convention (callers use
+# canonical names: `Content-Length`, `Content-Type`). A real
+# case-insensitive layer arrives with the protocol-level Headers
+# type once it earns its keep.
+pub fn http_header_lookup(hs: [HttpHeader], name: String) : Option[String] = match hs {
+  [] -> None
+  [h, ...rest] -> if h.name == name { Some(h.value) } else { http_header_lookup(rest, name) }
+}
+
+# Parse a complete HTTP/1.1 response: status line + headers +
+# body. Body length is read from `Content-Length`; absent header
+# means "everything after the blank line" (the v1 read loop drains
+# until peer close, so the body String already holds the full
+# tail of the stream). Chunked encoding is not implemented — a
+# server that emits `Transfer-Encoding: chunked` will leave the
+# raw chunk framing in `body` and the caller will need to decode
+# it itself; documented in the file header.
+pub fn http_parse_response(raw: String) : Result[String, Response] = {
+  let sep = "\r\n\r\n"
+  let i   = http_str_index(raw, sep)
+  if i < 0 {
+    Err("http_parse_response: missing header/body separator (\\r\\n\\r\\n)")
+  } else {
+    let head_block = string_slice(raw, 0, i)
+    let body_start = i + string_length(sep)
+    let body_all   = string_slice(raw, body_start, string_length(raw) - body_start)
+    let lines      = string_split(head_block, "\r\n")
+    match lines {
+      [] -> Err("http_parse_response: empty header block")
+      [status_line, ...rest] -> match http_parse_status_line(status_line) {
+        Err(e) -> Err(e)
+        Ok(code) -> match http_parse_header_lines(rest) {
+          Err(e) -> Err(e)
+          Ok(hs) -> {
+            # When Content-Length pins the length, slice exactly that
+            # many bytes — anything past that is the *next* response on
+            # a keep-alive stream (which v1 doesn't multiplex anyway).
+            let body = match http_header_lookup(hs, "Content-Length") {
+              Some(v) -> match string_to_int(http_trim(v)) {
+                Some(n) ->
+                  if n <= 0 { "" }
+                  else if n >= string_length(body_all) { body_all }
+                  else { string_slice(body_all, 0, n) }
+                None -> body_all
+              }
+              None -> body_all
+            }
+            Ok(Response { status: code, headers: hs, body: body })
+          }
+        }
+      }
+    }
+  }
+}
+
+# ---- network surface ---------------------------------------------
+
+# Drain a Conn until the peer closes (`recv` returns `Ok([])` per
+# docs/effects-stdlib.md §`NetTcp` "Error model"). v1 reads in
+# 4096-byte chunks; a future version with Content-Length-aware
+# pre-reads can stop earlier without waiting on the peer to FIN.
+fn http_recv_all_loop(c: Conn, acc: [Int]) : [Int] / NetTcp + Cancel = {
+  match NetTcp.recv(c, 4096) {
+    Err(_)    -> list_reverse(acc)
+    Ok(chunk) -> match chunk {
+      [] -> list_reverse(acc)
+      _  -> http_recv_all_loop(c, http_recv_all_prepend(chunk, acc))
+    }
+  }
+}
+
+# Reverse-prepend `chunk` onto `acc` (caller will list_reverse
+# the whole thing once at the end). Avoids allocating an O(n)
+# `list_append` per chunk.
+fn http_recv_all_prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
+  [] -> acc
+  [b, ...rest] -> http_recv_all_prepend(rest, [b, ...acc])
+}
+
+# Lower-level builder. Opens a fresh Conn to the URL's host:port,
+# writes the serialised request, drains the response, closes the
+# Conn, and parses. Errors at any layer collapse to a synthetic
+# Response with a `0 / "0 ERR"` placeholder so the caller can see
+# the failure without a Result wrapper layered over every call;
+# real-world callers who need per-step diagnostics use
+# `NetTcp.*` directly.
+pub fn http_request(req: Request) : Response / NetTcp + Cancel = {
+  match http_parse_url(req.url) {
+    Err(e) -> Response { status: 0, headers: [], body: e }
+    Ok(u)  -> match NetTcp.connect(u.host, u.port) {
+      Err(e) -> Response { status: 0, headers: [], body: string_concat("connect: ", e) }
+      Ok(c)  -> {
+        let wire = http_serialize_request(req)
+        let _    = NetTcp.send(c, http_string_to_bytes(wire))
+        let raw  = http_bytes_to_string(http_recv_all_loop(c, []))
+        NetTcp.close(c)
+        match http_parse_response(raw) {
+          Ok(r)  -> r
+          Err(e) -> Response { status: 0, headers: [], body: e }
+        }
+      }
+    }
+  }
+}
+
+# Convenience constructors. Each builds a `Request` value with
+# the matching method and an empty header list, then routes
+# through `http_request`. Callers that need custom headers fall
+# through to `http_request` directly.
+pub fn http_get(url: String) : Response / NetTcp + Cancel =
+  http_request(Request { method: "GET", url: url, headers: [], body: "" })
+
+pub fn http_post(url: String, body: String) : Response / NetTcp + Cancel =
+  http_request(Request { method: "POST", url: url, headers: [], body: body })
+
+pub fn http_put(url: String, body: String) : Response / NetTcp + Cancel =
+  http_request(Request { method: "PUT", url: url, headers: [], body: body })
+
+pub fn http_delete(url: String) : Response / NetTcp + Cancel =
+  http_request(Request { method: "DELETE", url: url, headers: [], body: "" })
