@@ -2531,13 +2531,29 @@ fn parse_handle(p: Parser, t: Token) : PExpr {
                   err_e(p_error_here(p4, "expected `{` to start handler clauses"))
                 } else {
                   let p5 = p_skip_newlines(p_advance(p4))
-                  let cr = parse_handle_clauses(p5, [], None)
+                  let cr = parse_handle_clauses(p5, [], None, [])
                   match cr.r {
                     None -> err_e(cr.p)
-                    Some(_) -> ok_e(cr.p,
-                      mk_expr(EHandle(body, eff_name, eff_tyargs, init_r.r,
-                                       alias_r.r, cr.clauses, cr.return_clause),
-                              t.line, t.col))
+                    Some(_) -> {
+                      let handle_e = mk_expr(
+                        EHandle(body, eff_name, eff_tyargs, init_r.r,
+                                alias_r.r, cr.clauses, cr.return_clause),
+                        t.line, t.col)
+                      # m7b #5b extension (issue #148, Option A): a `var`
+                      # or `let` decl at the top of the clause list lifts
+                      # to a sibling block whose tail is the handler. The
+                      # existing `desugar_var_block` pass then converts
+                      # each `SVar` into a wrapping `with State[T] as
+                      # name` handler. When the prelude is empty we emit
+                      # the bare `EHandle` so handlers without `var` pay
+                      # no wrapping overhead.
+                      match cr.prelude {
+                        [] -> ok_e(cr.p, handle_e)
+                        _  -> ok_e(cr.p,
+                                mk_expr(EBlock(cr.prelude, Some(handle_e)),
+                                        t.line, t.col))
+                      }
+                    }
                   }
                 }
                 }
@@ -2605,54 +2621,94 @@ type PClauses = {
   p: Parser,
   clauses: [HClause],
   return_clause: Option[HReturn],
+  prelude: [Stmt],
   r: Option[Bool]
 }
 
-fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn]) : PClauses {
+# m7b #5b extension (issue #148, Option A): a `var` or `let` decl
+# may appear at the top of the clause list, before all operation
+# clauses. The parser collects them into a `prelude` and the
+# caller wraps the `EHandle` in an `EBlock(prelude, Some(EHandle))`.
+# The existing `desugar_var_block` pass then lifts each `SVar`
+# into a sibling `with State[T](init) as name` that wraps the
+# handler. Once an operation clause has been seen, any further
+# `var` / `let` is a parse error — the rule is "var/let must
+# precede all operation clauses inside one handler block."
+fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn], prelude: [Stmt]) : PClauses {
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
     PClauses { p: p_advance(p0), clauses: list_reverse(acc),
-               return_clause: rret, r: Some(true) }
+               return_clause: rret, prelude: list_reverse(prelude), r: Some(true) }
   } else {
     let id_t = p_peek(p0)
-    if not tk_is(id_t.kind, TkIdent) {
+    if tk_is(id_t.kind, TkVar) {
+      match acc {
+        [] -> {
+          let sr = parse_var(p0, id_t)
+          match sr.r {
+            None -> PClauses { p: sr.p, clauses: [], return_clause: None,
+                               prelude: [], r: None }
+            Some(s) -> parse_handle_clauses(sr.p, acc, rret, [s, ...prelude])
+          }
+        }
+        _ -> PClauses { p: p_error(p0, id_t,
+               "`var` and `let` must precede all operation clauses inside a handler"),
+               clauses: [], return_clause: None, prelude: [], r: None }
+      }
+    } else if tk_is(id_t.kind, TkLet) {
+      match acc {
+        [] -> {
+          let sr = parse_let(p0, id_t)
+          match sr.r {
+            None -> PClauses { p: sr.p, clauses: [], return_clause: None,
+                               prelude: [], r: None }
+            Some(s) -> parse_handle_clauses(sr.p, acc, rret, [s, ...prelude])
+          }
+        }
+        _ -> PClauses { p: p_error(p0, id_t,
+               "`var` and `let` must precede all operation clauses inside a handler"),
+               clauses: [], return_clause: None, prelude: [], r: None }
+      }
+    } else if not tk_is(id_t.kind, TkIdent) {
       PClauses { p: p_error(p0, id_t, "expected operation name in handler"),
-                 clauses: [], return_clause: None, r: None }
+                 clauses: [], return_clause: None, prelude: [], r: None }
     } else {
       let name = tok_source(p0.src, id_t)
       let p1 = p_advance(p0)
       if not p_at(p1, TkLparen) {
         PClauses { p: p_error_here(p1, "expected `(` after operation name"),
-                   clauses: [], return_clause: None, r: None }
+                   clauses: [], return_clause: None, prelude: [], r: None }
       } else {
         let p2 = p_skip_newlines(p_advance(p1))
         let params_r = parse_clause_params(p2, [])
         match params_r.r {
-          None -> PClauses { p: params_r.p, clauses: [], return_clause: None, r: None }
+          None -> PClauses { p: params_r.p, clauses: [], return_clause: None,
+                             prelude: [], r: None }
           Some(params) -> {
             let p3 = p_skip_newlines(params_r.p)
             if not p_at(p3, TkArrow) {
               PClauses { p: p_error_here(p3, "expected `->` after operation parameters"),
-                         clauses: [], return_clause: None, r: None }
+                         clauses: [], return_clause: None, prelude: [], r: None }
             } else {
               let p4 = p_skip_newlines(p_advance(p3))
               let rb = parse_expr(p4)
               match rb.r {
-                None -> PClauses { p: rb.p, clauses: [], return_clause: None, r: None }
+                None -> PClauses { p: rb.p, clauses: [], return_clause: None,
+                                   prelude: [], r: None }
                 Some(body) -> {
                   if name == "return" {
                     match params {
                       [pp] -> {
                         let hr = HR(pp.pname, body, id_t.line, id_t.col)
-                        parse_handle_clauses(rb.p, acc, Some(hr))
+                        parse_handle_clauses(rb.p, acc, Some(hr), prelude)
                       }
                       _ -> PClauses { p: p_error(p3, id_t,
                              "return clause takes exactly one parameter"),
-                             clauses: [], return_clause: None, r: None }
+                             clauses: [], return_clause: None, prelude: [], r: None }
                     }
                   } else {
                     let hc = HC(name, params, body, id_t.line, id_t.col)
-                    parse_handle_clauses(rb.p, [hc, ...acc], rret)
+                    parse_handle_clauses(rb.p, [hc, ...acc], rret, prelude)
                   }
                 }
               }
@@ -12722,7 +12778,15 @@ fn rewrite_alias_clause(c: HClause, m: AliasMap) : HClause {
       # shadow outer aliases inside the clause body.
       let names = map(ps, (pm) => pm.pname)
       let m1 = alias_map_remove_all(m, names)
-      HC(n, ps, rewrite_alias_expr(b, m1), l, co)
+      # Issue #148 (Option A): a clause body compiles to a separate
+      # C function, so any `kai_alias_<a>_id` declared in an outer
+      # `EHandle` prologue is out of scope here — same situation as
+      # a lambda body. Disable tag emission so cross-handler reads
+      # of an outer-bound capability fall back to the legacy
+      # name-keyed lookup. The bindings stay live so the
+      # `cap.op` → `Eff.op` substitution keeps working.
+      let m2 = alias_map_disable_tag(m1)
+      HC(n, ps, rewrite_alias_expr(b, m2), l, co)
     }
   }
 }
@@ -12742,7 +12806,11 @@ fn rewrite_alias_return(r: HReturn, m: AliasMap) : HReturn {
     # rewrite pass — only `p` is user-visible here).
     HR(p, b, l, c) -> {
       let m1 = alias_map_remove(m, p)
-      HR(p, rewrite_alias_expr(b, m1), l, c)
+      # Issue #148 (Option A): the return clause also compiles to a
+      # separate C function, so disable tag emission for the same
+      # cross-handler reason as `rewrite_alias_clause`.
+      let m2 = alias_map_disable_tag(m1)
+      HR(p, rewrite_alias_expr(b, m2), l, c)
     }
   }
 }
@@ -20418,7 +20486,12 @@ fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
                        "log", mono(sty))
           } else { env1 }
         let st1 = st_set_env(st, env2)
-        let rr = synth(st1, rexpr)
+        # Issue #148 (Option A): same alias-tag boundary as the
+        # op clauses — the return clause also compiles to a
+        # separate C function with no access to outer
+        # `kai_alias_<a>_id` C locals.
+        let st1_no_tag = st_disable_alias_tag(st1)
+        let rr = synth(st1_no_tag, rexpr)
         let st_out = st_restore_entries(outer, rr.st)
         let ty = apply_ty(st_out.sub, rr.ty)
         RetTyped { st: st_out, ty: ty, ret_opt: Some(HR(pname, rr.expr, line, col)) }
@@ -20473,7 +20546,18 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
             None -> st_env
           }
         } else { st_env }
-        let rb = synth(st_resume, body)
+        # Issue #148 (Option A): a clause body compiles to a
+        # separate C function and `filter_clause_captures` strips
+        # the `__alias_id__<a>` sentinels that would otherwise
+        # thread an outer-bound capability's handler id into the
+        # clause env. Disable alias tagging across the clause
+        # body so op calls on those caps emit a bare dispatch key
+        # (legacy name-keyed lookup) instead of the tagged form
+        # that requires a `kai_alias_<a>_id` C local that is not
+        # in scope here. Same boundary the rewrite-pass enforces
+        # in `rewrite_alias_clause`.
+        let st_clause_in = st_disable_alias_tag(st_resume)
+        let rb = synth(st_clause_in, body)
         let st_out0 = st_restore_entries(outer, rb.st)
         let st_out = st_set_clause_resume(st_out0, outer.clause_resume)
         # m12.8 Phase 4b followup: keep the typed body so the
