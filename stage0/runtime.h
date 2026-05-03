@@ -3533,6 +3533,94 @@ static KaiValue *kai_default_process_exit(void *self, KaiValue *code, KaiCont *k
 }
 
 /* =================================================================
+ * Log effect — issue #141. Tier S2 #7 of `docs/stdlib-roadmap.md`.
+ *
+ * Four leveled ops (debug / info / warn / error) routed through the
+ * Log effect. The default handler installed by `kai_main_install_
+ * defaults` writes to stderr in
+ *
+ *     [YYYY-MM-DDTHH:MM:SSZ] LEVEL message\n
+ *
+ * form. The level field is left-padded to 5 chars so the column
+ * after it is aligned across all four ops:
+ *     "DEBUG", "INFO ", "WARN ", "ERROR".
+ *
+ * Timestamp source: `clock_gettime(CLOCK_REALTIME)` + `gmtime_r`
+ * + `strftime`. Calling `clock_gettime` directly here (rather than
+ * routing through the kaikai-side `Clock` effect) keeps the `Log`
+ * row free of `Clock` — a program can declare `: Unit / Log` and
+ * have its main install the Log default without also pulling
+ * `Clock`'s default handler into the row.
+ *
+ * The runtime flushes stderr after each write so test harnesses
+ * see the output deterministically (no buffer hold-back if a
+ * later abort kills the process before exit-time flushing fires).
+ *
+ * v1 limitations (mirrored in stdlib/log.kai):
+ *   - No level filtering. All four levels write unconditionally.
+ *   - No structured fields, redaction, rotation, color, async
+ *     batching, or trace-context propagation. All of those are
+ *     ahu.log territory (a higher layer that wraps Log). */
+
+static void _kai_log_emit(const char *level_padded, KaiValue *msg) {
+    /* Format the timestamp into a stack buffer. clock_gettime /
+     * gmtime_r failure is rare; fall back to a sentinel rather
+     * than swallow the message — the user should still see what
+     * level + body was intended. */
+    char ts[32];
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) == 0) {
+        struct tm tm;
+        if (gmtime_r(&now.tv_sec, &tm) != NULL &&
+            strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm) > 0) {
+            /* ok */
+        } else {
+            memcpy(ts, "?????", 6);
+        }
+    } else {
+        memcpy(ts, "?????", 6);
+    }
+
+    /* Header `[<ts>] <LEVEL> ` then the message bytes then newline.
+     * fputs on the prefix, fwrite on the message body so embedded
+     * NULs in user strings don't truncate the line. */
+    fputc('[', stderr);
+    fputs(ts, stderr);
+    fputs("] ", stderr);
+    fputs(level_padded, stderr);
+    fputc(' ', stderr);
+    if (msg && msg->tag == KAI_STR && msg->as.s.bytes && msg->as.s.len > 0) {
+        fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+static KaiValue *kai_default_log_debug(void *self, KaiValue *msg, KaiCont *k) {
+    (void) self;
+    _kai_log_emit("DEBUG", msg);
+    return kai_cont_resume(k, kai_unit());
+}
+
+static KaiValue *kai_default_log_info(void *self, KaiValue *msg, KaiCont *k) {
+    (void) self;
+    _kai_log_emit("INFO ", msg);
+    return kai_cont_resume(k, kai_unit());
+}
+
+static KaiValue *kai_default_log_warn(void *self, KaiValue *msg, KaiCont *k) {
+    (void) self;
+    _kai_log_emit("WARN ", msg);
+    return kai_cont_resume(k, kai_unit());
+}
+
+static KaiValue *kai_default_log_error(void *self, KaiValue *msg, KaiCont *k) {
+    (void) self;
+    _kai_log_emit("ERROR", msg);
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* =================================================================
  * m8.x cooperative scheduler primitives
  * =================================================================
  *
