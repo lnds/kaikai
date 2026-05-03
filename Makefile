@@ -179,6 +179,8 @@ tier1-asan: kaic2
 	@echo "tier1-asan OK — issue #78 fixture passes under ASAN+UBSan (runtime helper rename gate)"
 	@$(MAKE) -C stage2 test-signal-trap-asan
 	@echo "tier1-asan OK — issue #107 fixture passes under ASAN+UBSan (Signal effect runtime gate)"
+	@$(MAKE) -C stage2 test-log-asan
+	@echo "tier1-asan OK — issue #141 fixture passes under ASAN+UBSan (Log default handler / clock_gettime / strftime gate)"
 	@$(MAKE) -C stage2 test-trap-exit-cancel-asan
 	@echo "tier1-asan OK — issue #103 fixture passes under ASAN+UBSan (trap-exit / outer Cancel handler gate)"
 	@$(MAKE) -C stage2 test-process-basic-asan
