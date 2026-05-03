@@ -193,6 +193,8 @@ tier1-asan: kaic2
 	@echo "tier1-asan OK — net.http client fixture passes under ASAN+UBSan (Tier S1 lane #3 gate)"
 	@$(MAKE) -C stage2 test-stdlib-crypto-asan
 	@echo "tier1-asan OK — issue #139 fixture passes under ASAN+UBSan (crypto byte-buffer + 64-bit modular gate)"
+	@$(MAKE) -C stage2 test-stdlib-regex-predicate-asan
+	@echo "tier1-asan OK — issue #85 fixture passes under ASAN+UBSan (regex sigil + matches predicate runtime gate)"
 	@$(MAKE) -C stage2 test-env-mutate-asan
 	@echo "tier1-asan OK — issue #127 fixture passes under ASAN+UBSan (Env set/unset/vars buffer-ownership gate)"
 	@$(MAKE) -C stage2 test-securerandom-asan

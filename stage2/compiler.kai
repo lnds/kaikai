@@ -46,6 +46,13 @@ type TokKind
   # specifically (instead of treating it as a comment) so the parser can
   # consume it as a prefix to a `type` declaration.
   | TkDerive
+  # m12.6.x #7: regex literal `/pattern/`, only emitted when the
+  # previous non-newline token is the identifier `matches` (the
+  # refinement-pure predicate). Outside that narrow context, `/` keeps
+  # its arithmetic meaning as TkSlash. The token's source span covers
+  # both delimiters so the parser can carve out the inner pattern with
+  # `tok_source` + `string_slice`.
+  | TkRegex
   # literals
   | TkInt | TkReal | TkChar | TkString
   # identifiers
@@ -98,6 +105,7 @@ fn tk_name(k: TokKind) : String {
     TkTest -> "test" TkTrue -> "true" TkType -> "type"
     TkUnitKw -> "unit" TkUse -> "use" TkVar -> "var" TkWhere -> "where" TkWith -> "with"
     TkDerive -> "#derive"
+    TkRegex -> "REGEX"
     TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
     TkIdent -> "IDENT" TkUnderscore -> "_"
     TkLparen -> "(" TkRparen -> ")" TkLbracket -> "[" TkRbracket -> "]"
@@ -313,10 +321,70 @@ fn lex_scan_digits(l: Lexer) : Lexer {
   }
 }
 
+fn ch_is_hex_digit(c: Char) : Bool {
+  ch_is_digit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+}
+
+fn lex_scan_hex_digits(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if ch_is_hex_digit(c) { lex_scan_hex_digits(lex_advance(l)) }
+      else { l }
+    }
+  }
+}
+
+fn lex_scan_bin_digits(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if c == '0' or c == '1' { lex_scan_bin_digits(lex_advance(l)) }
+      else { l }
+    }
+  }
+}
+
+# Recognise `0x[0-9a-fA-F]+` and `0b[01]+` as TkInt.
+# Caller has confirmed `lex_peek(l) == Some('0')` and the next char
+# is one of x/X/b/B. Emits TkError if no digits follow the prefix.
+fn lex_hex_or_bin_int(l: Lexer, is_hex: Bool, sl: Int, sc: Int, start: Int) : LexStep {
+  # Skip the `0` and the base marker.
+  let l_after_prefix = lex_advance(lex_advance(l))
+  let l_end = if is_hex { lex_scan_hex_digits(l_after_prefix) }
+              else { lex_scan_bin_digits(l_after_prefix) }
+  if l_end.pos == l_after_prefix.pos {
+    let msg = if is_hex { "malformed number: expected hex digits after 0x" }
+              else { "malformed number: expected binary digits after 0b" }
+    Step(l_end, tok(TkError(msg), sl, sc, start, l_end.pos))
+  } else {
+    Step(l_end, tok(TkInt, sl, sc, start, l_end.pos))
+  }
+}
+
 fn lex_number(l: Lexer) : LexStep {
   let start = l.pos
   let sl = l.line
   let sc = l.col
+  # Hex (`0x`/`0X`) and binary (`0b`/`0B`) literals branch off here so
+  # they share TkInt with decimal and skip the float/exponent path below.
+  let is_zero_prefix =
+    match lex_peek(l) { Some(c) -> c == '0' _ -> false }
+  if is_zero_prefix {
+    match lex_peek_at(l, 1) {
+      Some(n) -> {
+        if n == 'x' or n == 'X' { lex_hex_or_bin_int(l, true, sl, sc, start) }
+        else if n == 'b' or n == 'B' { lex_hex_or_bin_int(l, false, sl, sc, start) }
+        else { lex_number_decimal(l, sl, sc, start) }
+      }
+      None -> lex_number_decimal(l, sl, sc, start)
+    }
+  } else {
+    lex_number_decimal(l, sl, sc, start)
+  }
+}
+
+fn lex_number_decimal(l: Lexer, sl: Int, sc: Int, start: Int) : LexStep {
   let l1 = lex_scan_digits(l)
   # Fractional part: only when `.` is followed by a digit. `x..y` (range)
   # and `x.field` (access) must be left alone.
@@ -466,6 +534,58 @@ fn lex_string(l: Lexer) : LexStep {
   match lex_string_body(l2, triple) {
     StrOk(l3) -> Step(l3, tok(TkString, sl, sc, start, l3.pos))
     StrErr(l3, msg) -> Step(l3, tok(TkError(msg), sl, sc, start, l3.pos))
+  }
+}
+
+# ====================================================================
+# regex literals (m12.6.x #7)
+# ====================================================================
+#
+# Elixir-style sigil: `~r/pattern/` lexes as a single `TkRegex` token
+# whose source span covers the full sigil including delimiters. The
+# `~` route in `lex_punct` handles the prefix; this helper takes
+# over once the cursor is positioned at the opening `/`. Because
+# the prefix is unambiguous, `/` keeps its arithmetic meaning
+# everywhere else — no contextual lookback in the lexer, no parser
+# backtracking.
+#
+# Pattern body rules: any byte except an unescaped `/` or unescaped
+# newline; `\` escapes the next byte; inside `[...]` a `/` is a
+# literal class element, not a terminator (mirrors JS / Pony / Perl
+# regex literal lexing).
+
+fn lex_regex(l: Lexer, sl: Int, sc: Int, start: Int) : LexStep {
+  let l1 = lex_advance(l)                  # consume opening /
+  match lex_regex_body(l1, false) {
+    StrOk(l2) -> Step(l2, tok(TkRegex, sl, sc, start, l2.pos))
+    StrErr(l2, msg) -> Step(l2, tok(TkError(msg), sl, sc, start, l2.pos))
+  }
+}
+
+# `in_class` is true when the cursor is inside a `[...]` character
+# class, where `/` and `]` swap their meaning relative to the outer
+# state.
+fn lex_regex_body(l: Lexer, in_class: Bool) : StrResult {
+  match lex_peek(l) {
+    None -> StrErr(l, "unterminated regex literal")
+    Some(c) -> {
+      if c == '\\' {
+        let l1 = lex_advance(l)
+        match lex_peek(l1) {
+          None -> StrErr(l1, "unterminated regex literal")
+          Some(_) -> lex_regex_body(lex_advance(l1), in_class)
+        }
+      } else if c == '\n' {
+        StrErr(l, "unterminated regex literal (newline before closing `/`)")
+      } else if in_class {
+        if c == ']' { lex_regex_body(lex_advance(l), false) }
+        else { lex_regex_body(lex_advance(l), true) }
+      } else {
+        if c == '/' { StrOk(lex_advance(l)) }
+        else if c == '[' { lex_regex_body(lex_advance(l), true) }
+        else { lex_regex_body(lex_advance(l), false) }
+      }
+    }
   }
 }
 
@@ -661,6 +781,23 @@ fn lex_punct(l: Lexer) : LexStep {
         # immediately followed by `derive` and a non-alphanumeric tail.
         let l_end = lex_advance_n(l1, 6)
         Step(l_end, tok(TkDerive, sl, sc, start, l_end.pos))
+      }
+      else if c == '~' {
+        # m12.6.x #7: Elixir-style sigils. Currently only `~r/pattern/`
+        # is recognised — opens a regex literal that lexes as a single
+        # `TkRegex` token spanning `~r/.../`. The sigil family is
+        # designed for future growth (`~s`, `~w`, etc.) but those
+        # require their own runtime carriers and are out of scope
+        # for this lane. Anything other than `~r` followed by a
+        # delimiter falls through as an error so tildes don't silently
+        # turn into a junk-drawer prefix.
+        if lex_peek_is(l1, 'r') and lex_peek_at(l1, 1) == Some('/') {
+          let l_r = lex_advance(l1)            # consume `r`
+          lex_regex(l_r, sl, sc, start)
+        } else {
+          let msg = string_concat("unexpected character '~' (only `~r/.../` regex sigil is supported)", "")
+          Step(l1, tok(TkError(msg), sl, sc, start, l1.pos))
+        }
       }
       else {
         let msg = string_concat("unexpected character '", string_concat("#{c}", "'"))
@@ -1524,6 +1661,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkTodoBang   -> match b { TkTodoBang -> true _ -> false }
     TkPlusPlus   -> match b { TkPlusPlus -> true _ -> false }
     TkDerive     -> match b { TkDerive -> true _ -> false }
+    TkRegex      -> match b { TkRegex -> true _ -> false }
     TkError(_)   -> false
   }
 }
@@ -1610,13 +1748,58 @@ fn decode_int_loop(s: String, i: Int, n: Int, acc: Int, neg: Bool) : Int {
   }
 }
 
+fn decode_bin_loop(s: String, i: Int, n: Int, acc: Int) : Int {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        if c == '0' { decode_bin_loop(s, i + 1, n, acc * 2) }
+        else if c == '1' { decode_bin_loop(s, i + 1, n, acc * 2 + 1) }
+        else { acc }
+      }
+    }
+  }
+}
+
+fn decode_int_after_sign(span: String, i: Int, n: Int, neg: Bool) : Int {
+  # Detect 0x / 0b base prefixes; otherwise fall back to decimal.
+  let has_prefix =
+    if i + 1 < n {
+      match char_at(span, i) {
+        Some(c0) -> {
+          if c0 == '0' {
+            match char_at(span, i + 1) {
+              Some(c1) -> c1 == 'x' or c1 == 'X' or c1 == 'b' or c1 == 'B'
+              None -> false
+            }
+          } else { false }
+        }
+        None -> false
+      }
+    } else { false }
+  if has_prefix {
+    match char_at(span, i + 1) {
+      Some(c1) -> {
+        let is_hex = c1 == 'x' or c1 == 'X'
+        let v = if is_hex { decode_hex_loop(span, i + 2, n, 0) }
+                else { decode_bin_loop(span, i + 2, n, 0) }
+        if neg { 0 - v } else { v }
+      }
+      None -> if neg { 0 } else { 0 }
+    }
+  } else {
+    decode_int_loop(span, i, n, 0, neg)
+  }
+}
+
 fn decode_int(span: String) : Int {
   let n = string_length(span)
   if n == 0 { 0 }
   else {
     match char_at(span, 0) {
-      Some(c) -> if c == '-' { decode_int_loop(span, 1, n, 0, true) }
-                 else { decode_int_loop(span, 0, n, 0, false) }
+      Some(c) -> if c == '-' { decode_int_after_sign(span, 1, n, true) }
+                 else { decode_int_after_sign(span, 0, n, false) }
       None -> 0
     }
   }
@@ -2406,6 +2589,7 @@ fn parse_primary(p: Parser) : PExpr {
     TkHole -> ok_e(p_advance(p), mk_expr(EHole(None), t.line, t.col))
     TkHoleName(nm) -> ok_e(p_advance(p), mk_expr(EHole(Some(nm)), t.line, t.col))
     TkTodoBang -> parse_todo_bang(p, t)
+    TkRegex -> parse_regex_sigil(p, t)
     TkIdent -> parse_ident_primary(p, t)
     TkLparen -> parse_paren_or_lambda(p, t)
     TkLbracket -> parse_list_or_range(p, t)
@@ -2531,13 +2715,29 @@ fn parse_handle(p: Parser, t: Token) : PExpr {
                   err_e(p_error_here(p4, "expected `{` to start handler clauses"))
                 } else {
                   let p5 = p_skip_newlines(p_advance(p4))
-                  let cr = parse_handle_clauses(p5, [], None)
+                  let cr = parse_handle_clauses(p5, [], None, [])
                   match cr.r {
                     None -> err_e(cr.p)
-                    Some(_) -> ok_e(cr.p,
-                      mk_expr(EHandle(body, eff_name, eff_tyargs, init_r.r,
-                                       alias_r.r, cr.clauses, cr.return_clause),
-                              t.line, t.col))
+                    Some(_) -> {
+                      let handle_e = mk_expr(
+                        EHandle(body, eff_name, eff_tyargs, init_r.r,
+                                alias_r.r, cr.clauses, cr.return_clause),
+                        t.line, t.col)
+                      # m7b #5b extension (issue #148, Option A): a `var`
+                      # or `let` decl at the top of the clause list lifts
+                      # to a sibling block whose tail is the handler. The
+                      # existing `desugar_var_block` pass then converts
+                      # each `SVar` into a wrapping `with State[T] as
+                      # name` handler. When the prelude is empty we emit
+                      # the bare `EHandle` so handlers without `var` pay
+                      # no wrapping overhead.
+                      match cr.prelude {
+                        [] -> ok_e(cr.p, handle_e)
+                        _  -> ok_e(cr.p,
+                                mk_expr(EBlock(cr.prelude, Some(handle_e)),
+                                        t.line, t.col))
+                      }
+                    }
                   }
                 }
                 }
@@ -2605,54 +2805,94 @@ type PClauses = {
   p: Parser,
   clauses: [HClause],
   return_clause: Option[HReturn],
+  prelude: [Stmt],
   r: Option[Bool]
 }
 
-fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn]) : PClauses {
+# m7b #5b extension (issue #148, Option A): a `var` or `let` decl
+# may appear at the top of the clause list, before all operation
+# clauses. The parser collects them into a `prelude` and the
+# caller wraps the `EHandle` in an `EBlock(prelude, Some(EHandle))`.
+# The existing `desugar_var_block` pass then lifts each `SVar`
+# into a sibling `with State[T](init) as name` that wraps the
+# handler. Once an operation clause has been seen, any further
+# `var` / `let` is a parse error — the rule is "var/let must
+# precede all operation clauses inside one handler block."
+fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn], prelude: [Stmt]) : PClauses {
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
     PClauses { p: p_advance(p0), clauses: list_reverse(acc),
-               return_clause: rret, r: Some(true) }
+               return_clause: rret, prelude: list_reverse(prelude), r: Some(true) }
   } else {
     let id_t = p_peek(p0)
-    if not tk_is(id_t.kind, TkIdent) {
+    if tk_is(id_t.kind, TkVar) {
+      match acc {
+        [] -> {
+          let sr = parse_var(p0, id_t)
+          match sr.r {
+            None -> PClauses { p: sr.p, clauses: [], return_clause: None,
+                               prelude: [], r: None }
+            Some(s) -> parse_handle_clauses(sr.p, acc, rret, [s, ...prelude])
+          }
+        }
+        _ -> PClauses { p: p_error(p0, id_t,
+               "`var` and `let` must precede all operation clauses inside a handler"),
+               clauses: [], return_clause: None, prelude: [], r: None }
+      }
+    } else if tk_is(id_t.kind, TkLet) {
+      match acc {
+        [] -> {
+          let sr = parse_let(p0, id_t)
+          match sr.r {
+            None -> PClauses { p: sr.p, clauses: [], return_clause: None,
+                               prelude: [], r: None }
+            Some(s) -> parse_handle_clauses(sr.p, acc, rret, [s, ...prelude])
+          }
+        }
+        _ -> PClauses { p: p_error(p0, id_t,
+               "`var` and `let` must precede all operation clauses inside a handler"),
+               clauses: [], return_clause: None, prelude: [], r: None }
+      }
+    } else if not tk_is(id_t.kind, TkIdent) {
       PClauses { p: p_error(p0, id_t, "expected operation name in handler"),
-                 clauses: [], return_clause: None, r: None }
+                 clauses: [], return_clause: None, prelude: [], r: None }
     } else {
       let name = tok_source(p0.src, id_t)
       let p1 = p_advance(p0)
       if not p_at(p1, TkLparen) {
         PClauses { p: p_error_here(p1, "expected `(` after operation name"),
-                   clauses: [], return_clause: None, r: None }
+                   clauses: [], return_clause: None, prelude: [], r: None }
       } else {
         let p2 = p_skip_newlines(p_advance(p1))
         let params_r = parse_clause_params(p2, [])
         match params_r.r {
-          None -> PClauses { p: params_r.p, clauses: [], return_clause: None, r: None }
+          None -> PClauses { p: params_r.p, clauses: [], return_clause: None,
+                             prelude: [], r: None }
           Some(params) -> {
             let p3 = p_skip_newlines(params_r.p)
             if not p_at(p3, TkArrow) {
               PClauses { p: p_error_here(p3, "expected `->` after operation parameters"),
-                         clauses: [], return_clause: None, r: None }
+                         clauses: [], return_clause: None, prelude: [], r: None }
             } else {
               let p4 = p_skip_newlines(p_advance(p3))
               let rb = parse_expr(p4)
               match rb.r {
-                None -> PClauses { p: rb.p, clauses: [], return_clause: None, r: None }
+                None -> PClauses { p: rb.p, clauses: [], return_clause: None,
+                                   prelude: [], r: None }
                 Some(body) -> {
                   if name == "return" {
                     match params {
                       [pp] -> {
                         let hr = HR(pp.pname, body, id_t.line, id_t.col)
-                        parse_handle_clauses(rb.p, acc, Some(hr))
+                        parse_handle_clauses(rb.p, acc, Some(hr), prelude)
                       }
                       _ -> PClauses { p: p_error(p3, id_t,
                              "return clause takes exactly one parameter"),
-                             clauses: [], return_clause: None, r: None }
+                             clauses: [], return_clause: None, prelude: [], r: None }
                     }
                   } else {
                     let hc = HC(name, params, body, id_t.line, id_t.col)
-                    parse_handle_clauses(rb.p, [hc, ...acc], rret)
+                    parse_handle_clauses(rb.p, [hc, ...acc], rret, prelude)
                   }
                 }
               }
@@ -2795,6 +3035,71 @@ fn parse_ensure_primary(p: Parser, t: Token) : PExpr {
   }
 }
 
+# m12.6.x #7: parse a `~r/pattern/` sigil token into an expression.
+# The lexer has already validated the delimiter shape and stored the
+# full sigil source span on the token. We desugar to a runtime call
+# `regex_compile_or_panic("<pattern>")` whose result is a `Regex`
+# value — meaning `~r/pat/` works as a first-class expression in any
+# position, not just inside refinement predicates.
+#
+# The pattern body is wrapped as a kaikai string literal with two
+# byte-level escapes (`\` -> `\\`, `"` -> `\"`) so the post-decode
+# bytes match the regex source verbatim. v1 forbids `#` in the body
+# because it would collide with kaikai's `#{...}` string
+# interpolation; users wanting `#` in v1 can build the regex via
+# `regex_compile` directly.
+fn parse_regex_sigil(p: Parser, t: Token) : PExpr {
+  let span = tok_source(p.src, t)
+  let n = string_length(span)
+  # Span shape: `~r/pattern/`. Strip the 3-char prefix `~r/` and the
+  # trailing `/`. The lexer guarantees both delimiters are present
+  # (otherwise it emitted TkError, never TkRegex).
+  let pattern = string_slice(span, 3, n - 4)
+  if regex_pattern_has_hash(pattern, 0, string_length(pattern)) {
+    err_e(p_error_here(p,
+      "regex sigil contains `#`, which v1 forbids (would collide with kaikai string interpolation); use `regex_compile` directly for patterns containing `#`"))
+  } else {
+    let escaped = regex_pattern_to_kai_str_body(pattern, 0, string_length(pattern), "")
+    let str_span = concat_all(["\"", escaped, "\""])
+    let pat_str = mk_expr(EStr(str_span, false), t.line, t.col)
+    let callee = mk_expr(EVar("regex_compile_or_panic"), t.line, t.col)
+    let call = mk_expr(ECall(callee, [pat_str]), t.line, t.col)
+    ok_e(p_advance(p), call)
+  }
+}
+
+# Walk the regex pattern body byte-by-byte, escaping the two
+# characters that have a load-bearing meaning inside a kaikai
+# string literal: `\` (escape introducer) and `"` (terminator).
+# Every other byte passes through verbatim — including bytes that
+# would be metacharacters at the regex level. The result is the
+# *body* of a kaikai string literal; the caller wraps it in `"..."`.
+fn regex_pattern_to_kai_str_body(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        let piece =
+          if c == '\\' { "\\\\" }
+          else if c == '"' { "\\\"" }
+          else { "#{c}" }
+        regex_pattern_to_kai_str_body(s, i + 1, n, string_concat(acc, piece))
+      }
+    }
+  }
+}
+
+fn regex_pattern_has_hash(s: String, i: Int, n: Int) : Bool {
+  if i >= n { false }
+  else {
+    match char_at(s, i) {
+      None -> false
+      Some(c) -> if c == '#' { true } else { regex_pattern_has_hash(s, i + 1, n) }
+    }
+  }
+}
+
 fn parse_record_lit(p: Parser, type_name: String, tname: Token) : PExpr {
   # `{` is next. Consume it.
   let p1 = p_skip_newlines(p_advance(p))
@@ -2886,18 +3191,75 @@ fn parse_paren_or_lambda(p: Parser, t: Token) : PExpr {
         }
       }
       None -> {
-        # Fall back to `( expr )`.
+        # Fall back to `( expr )` or `( a, b, ... )` n-tuple sugar (#154).
         let r = parse_expr(p1)
         match r.r {
           None -> err_e(r.p)
           Some(e) -> {
             let p2 = p_skip_newlines(r.p)
             if p_at(p2, TkRparen) { ok_e(p_advance(p2), e) }
+            else if p_at(p2, TkComma) {
+              # n-tuple expression sugar: (a, b) => Pair { fst: a, snd: b },
+              # (a, b, c) => Triple { ... }, (a, b, c, d) => Quad { ... }.
+              # N capped at 4 — wider products should be a named record.
+              parse_tuple_expr_rest(p_skip_newlines(p_advance(p2)), [e], t)
+            }
             else { err_e(p_error_here(p2, "expected `)` after expression")) }
           }
         }
       }
     }
+  }
+}
+
+# n-tuple expression sugar (#154). Called once the leading expr and a
+# trailing `,` have been consumed. Accumulates further comma-separated
+# exprs (in reverse) until `)`. On close, desugars to a record literal
+# of the appropriate stdlib type (Pair / Triple / Quad). Arity > 4 is
+# rejected with a diagnostic naming the cap.
+fn parse_tuple_expr_rest(p: Parser, acc: [Expr], t: Token) : PExpr {
+  let r = parse_expr(p)
+  match r.r {
+    None -> err_e(r.p)
+    Some(e) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_tuple_expr_rest(p_skip_newlines(p_advance(p1)), [e, ...acc], t)
+      } else if p_at(p1, TkRparen) {
+        let elems = list_reverse([e, ...acc])
+        let p2 = p_advance(p1)
+        match tuple_type_for_arity(list_length(elems)) {
+          None -> err_e(p_error_here(p1, "n-tuple sugar supports arity 2..4 only — use a named record for wider products"))
+          Some(name) -> ok_e(p2, mk_expr(ERecordLit(name, build_tuple_field_inits(elems, 0, [])), t.line, t.col))
+        }
+      } else {
+        err_e(p_error_here(p1, "expected `,` or `)` in tuple expression"))
+      }
+    }
+  }
+}
+
+# Map arity → stdlib tuple type name. `None` for unsupported arities.
+fn tuple_type_for_arity(n: Int) : Option[String] {
+  if n == 2 { Some("Pair") }
+  else if n == 3 { Some("Triple") }
+  else if n == 4 { Some("Quad") }
+  else { None }
+}
+
+# Map positional index → tuple field name. Same convention across
+# Pair / Triple / Quad: fst, snd, trd, frt.
+fn tuple_field_name(i: Int) : String {
+  if i == 0 { "fst" }
+  else if i == 1 { "snd" }
+  else if i == 2 { "trd" }
+  else { "frt" }
+}
+
+fn build_tuple_field_inits(elems: [Expr], i: Int, acc: [FieldInit]) : [FieldInit] {
+  match elems {
+    [] -> list_reverse(acc)
+    [e, ...rest] -> build_tuple_field_inits(rest, i + 1, [FI(tuple_field_name(i), e), ...acc])
   }
 }
 
@@ -3792,6 +4154,14 @@ fn parse_pattern_rest(p: Parser, t: Token) : PPat {
     }
   } else if tk_is(t.kind, TkLbracket) {
     parse_list_pattern(p, t)
+  } else if tk_is(t.kind, TkLparen) {
+    # n-tuple pattern sugar (#154). `(a, b)` desugars to a record
+    # pattern matching the corresponding stdlib type — `Pair` for
+    # arity 2, `Triple` for 3, `Quad` for 4. Single-element parens
+    # `(p)` are grouping (returns `p` unchanged); zero-element `()`
+    # is reserved for the unit pattern (rejected here as a parse
+    # error to keep the surface small until a use case appears).
+    parse_tuple_pattern(p, t)
   } else if tk_is(t.kind, TkLbrace) {
     # m7d §28: anonymous record pattern. `{ fst, snd }` (with field
     # punning) or `{ fst: a, snd: b }`. The typer + bind_pat +
@@ -3849,6 +4219,63 @@ fn parse_list_pattern_loop(p: Parser, acc: [Pattern], rest: Option[String], t: T
         }
       }
     }
+  }
+}
+
+# n-tuple pattern sugar (#154). Mirrors parse_tuple_expr_rest: starts
+# with `(`, parses N≥2 comma-separated sub-patterns, closes with `)`,
+# desugars to a `PVariantRecord` of the corresponding stdlib type
+# (`Pair` / `Triple` / `Quad`). Single-paren `(p)` is grouping —
+# returns the inner pattern unchanged. Empty `()` is rejected.
+fn parse_tuple_pattern(p: Parser, t: Token) : PPat {
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRparen) {
+    err_p(p_error_here(p1, "empty tuple pattern `()` not supported"))
+  } else {
+    let r = parse_pattern(p1)
+    match r.r {
+      None -> err_p(r.p)
+      Some(first) -> {
+        let p2 = p_skip_newlines(r.p)
+        if p_at(p2, TkRparen) {
+          # Single-pattern parens: grouping.
+          ok_p(p_advance(p2), first)
+        } else if p_at(p2, TkComma) {
+          parse_tuple_pattern_rest(p_skip_newlines(p_advance(p2)), [first], t)
+        } else {
+          err_p(p_error_here(p2, "expected `,` or `)` in tuple pattern"))
+        }
+      }
+    }
+  }
+}
+
+fn parse_tuple_pattern_rest(p: Parser, acc: [Pattern], t: Token) : PPat {
+  let r = parse_pattern(p)
+  match r.r {
+    None -> err_p(r.p)
+    Some(pat) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_tuple_pattern_rest(p_skip_newlines(p_advance(p1)), [pat, ...acc], t)
+      } else if p_at(p1, TkRparen) {
+        let pats = list_reverse([pat, ...acc])
+        let p2 = p_advance(p1)
+        match tuple_type_for_arity(list_length(pats)) {
+          None -> err_p(p_error_here(p1, "n-tuple sugar supports arity 2..4 only — use a named record for wider products"))
+          Some(name) -> ok_p(p2, mk_pat(PVariantRecord(name, build_tuple_pfields(pats, 0, [])), t.line, t.col))
+        }
+      } else {
+        err_p(p_error_here(p1, "expected `,` or `)` in tuple pattern"))
+      }
+    }
+  }
+}
+
+fn build_tuple_pfields(pats: [Pattern], i: Int, acc: [PField]) : [PField] {
+  match pats {
+    [] -> list_reverse(acc)
+    [pat, ...rest] -> build_tuple_pfields(rest, i + 1, [PField(tuple_field_name(i), pat, false), ...acc])
   }
 }
 
@@ -4105,14 +4532,60 @@ fn parse_optional_refinement(base: PTy) : PTy {
 # the LHS so that `where >= 0` desugars to `self >= 0`. Validation that
 # the resulting Expr lies in the decidable subset is the typer's job
 # (m12.6.b).
+#
+# m12.6.x #7: a second receiver-elision sugar — `where matches <expr>`
+# desugars to `matches(self, <expr>)`. This is the refinement-side
+# counterpart to the regex sigil: typical use is `String where matches
+# ~r/^[a-z]+$/`. The desugar applies whenever the predicate begins
+# with the bare identifier `matches` and the next non-`(` token is an
+# expression starter — that excludes `matches(s, p)` (an explicit
+# call) and `matches.field` (a member access on a value bound to
+# `matches`), so user code that already names a function `matches` is
+# unaffected.
 fn parse_refinement_predicate(p: Parser, line: Int, col: Int) : PExpr {
   let t = p_peek(p)
   if is_cmp_token(t.kind) {
     let lhs = mk_expr(EVar("self"), line, col)
     parse_refinement_cmp_with(p, lhs, line, col)
+  } else if is_matches_sugar_start(p, t) {
+    parse_refinement_matches_with(p, t, line, col)
   } else {
     parse_expr(p)
   }
+}
+
+fn is_matches_sugar_start(p: Parser, t: Token) : Bool {
+  if not tk_is(t.kind, TkIdent) { false }
+  else if tok_source(p.src, t) != "matches" { false }
+  else { refinement_matches_sugar_at(p_advance(p)) }
+}
+
+fn parse_refinement_matches_with(p: Parser, t: Token, line: Int, col: Int) : PExpr {
+  let p1 = p_advance(p)
+  let rhs = parse_expr(p1)
+  match rhs.r {
+    None -> rhs
+    Some(rv) -> {
+      let self_e = mk_expr(EVar("self"), line, col)
+      let callee = mk_expr(EVar("matches"), t.line, t.col)
+      let call = mk_expr(ECall(callee, [self_e, rv]), t.line, t.col)
+      PExpr { p: rhs.p, r: Some(call) }
+    }
+  }
+}
+
+# True when the token after `matches` looks like the start of an
+# expression argument (rather than `(` — which signals an explicit
+# call — or `.` — a member access on a value named `matches`). Used
+# to gate the `where matches <expr>` receiver-elision sugar.
+fn refinement_matches_sugar_at(p: Parser) : Bool {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkLparen) { false }
+  else if tk_is(t.kind, TkDot) { false }
+  else if tk_is(t.kind, TkRegex) { true }
+  else if tk_is(t.kind, TkIdent) { true }
+  else if tk_is(t.kind, TkString) { true }
+  else { false }
 }
 
 fn is_cmp_token(k: TokKind) : Bool {
@@ -4190,9 +4663,13 @@ fn parse_named_type(p: Parser, t: Token) : PTy {
     # Generic type: Name[T1, T2, ...]
     let p2 = p_skip_newlines(p_advance(p1))
     parse_type_args_loop(p2, [], name, t)
-  } else if (name == "Real" or name == "Int") and p_at(p1, TkLt) {
-    # m12.5: dimensioned numeric — `Real<unit-expr>` / `Int<unit-expr>`.
-    # Restricted to the two primitive eligible types per spec §3.
+  } else if (name == "Real" or name == "Int" or name == "Decimal") and p_at(p1, TkLt) {
+    # m12.5: dimensioned numeric — `Real<unit-expr>` / `Int<unit-expr>` /
+    # `Decimal<unit-expr>`. `Decimal` is the stdlib alias that ledger /
+    # finance demos reach for; the parser accepts the annotation here so
+    # record fields (`balance: Decimal<USD>`) and top-level positions
+    # share one route. The typer collapses TyDim to the head TyName at
+    # protocol-dispatch time (see `proto_type_name`).
     let p2 = p_skip_newlines(p_advance(p1))
     let ru = parse_unit_expr(p2)
     match ru.r {
@@ -4250,6 +4727,13 @@ fn parse_fn_type(p: Parser, t: Token) : PTy {
   }
 }
 
+# Function-type args OR n-tuple type sugar (#154). The disambiguation
+# is local: parse a comma-separated list of types until `)`. If `->`
+# follows, it's a function type. Otherwise it's a tuple type and we
+# desugar to `Pair[A, B]` / `Triple[A, B, C]` / `Quad[A, B, C, D]`.
+# A single type in parens (`(A)`) followed by no `->` is grouping —
+# returns the inner type unchanged. Zero-arg `()` keeps the existing
+# function-type contract (handled in parse_fn_type, must be `() -> T`).
 fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy {
   let r = parse_type(p)
   match r.r {
@@ -4260,9 +4744,7 @@ fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy {
         parse_fn_type_args(p_skip_newlines(p_advance(p1)), [arg, ...acc], t)
       } else if p_at(p1, TkRparen) {
         let p2 = p_advance(p1)
-        if not p_at(p2, TkArrow) {
-          err_t(p_error_here(p2, "expected `->` in function type"))
-        } else {
+        if p_at(p2, TkArrow) {
           let rr = parse_type(p_advance(p2))
           match rr.r {
             None -> err_t(rr.p)
@@ -4271,9 +4753,22 @@ fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy {
               ok_t(row_r.p, mk_ty(TyFn(list_reverse([arg, ...acc]), ret, row_r.r), t.line, t.col))
             }
           }
+        } else {
+          # Not a function type: re-interpret as tuple-type sugar or grouping.
+          let args = list_reverse([arg, ...acc])
+          let n = list_length(args)
+          if n == 1 {
+            # Single type in parens: grouping. `(A)` ≡ `A`.
+            ok_t(p2, arg)
+          } else {
+            match tuple_type_for_arity(n) {
+              None -> err_t(p_error_here(p1, "n-tuple type sugar supports arity 2..4 only — use a named record for wider products"))
+              Some(name) -> ok_t(p2, mk_ty(TyName(name, args), t.line, t.col))
+            }
+          }
         }
       } else {
-        err_t(p_error_here(p1, "expected `,` or `)` in function type args"))
+        err_t(p_error_here(p1, "expected `,` or `)` in type"))
       }
     }
   }
@@ -4785,7 +5280,14 @@ fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts {
 # prelude list below is the entirety of the allowed call surface.
 fn refinement_pure_names() : [String] = [
   "is_some", "is_none", "is_finite", "is_nan",
-  "string_length", "list_length", "matches"
+  "string_length", "list_length",
+  # m12.6.x #7: `matches` is the refinement-side regex predicate;
+  # `regex_compile_or_panic` is the runtime carrier the parser
+  # desugars `~r/.../` sigils into. Both are predicate-pure: the
+  # compile is deterministic in the pattern, and a parse-failure
+  # panics rather than returning, so the refinement either evaluates
+  # or aborts the program — never observes a half-state.
+  "matches", "regex_compile_or_panic"
 ]
 
 # Walk an Expr looking for the first ECall whose callee is an EVar
@@ -4895,7 +5397,7 @@ fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
 }
 
 fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
-                     param_preds: [Expr]) : [Stmt] {
+                     param_preds: [ParamPred]) : [Stmt] {
   match preds {
     [] -> list_reverse(acc)
     # m12.6.d: drop trivially-true predicates at parse time.
@@ -4924,14 +5426,22 @@ fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
 }
 
 # m12.6.x #2: collect every refinement predicate that appears on a
-# fn parameter's TypeExpr. Used by preds_to_asserts to omit a
-# `requires` clause that just restates a param's refinement.
-fn collect_param_preds(params: [Param], acc: [Expr]) : [Expr] {
+# fn parameter's TypeExpr, paired with the owning parameter's name.
+# Used by preds_to_asserts to omit a `requires` clause that just
+# restates a param's refinement. The owning name lets the regex
+# subsumption check (m12.6.x #7b) tie a param-side `self` reference
+# back to the user-written param name on the requires side, and lets
+# Issue #83's alpha + operator + interval entailment rewrite `self`
+# to the param name on the fly before comparing canonical forms.
+type ParamPred = PPair(String, Expr)
+#                       ^pname  ^pred ast
+
+fn collect_param_preds(params: [Param], acc: [ParamPred]) : [ParamPred] {
   match params {
     [] -> list_reverse(acc)
     [p, ...rest] -> match p.ptype {
       Some(t) -> match t.tkind {
-        TyRefine(_, pred) -> collect_param_preds(rest, [pred, ...acc])
+        TyRefine(_, pred) -> collect_param_preds(rest, [PPair(p.pname, pred), ...acc])
         _ -> collect_param_preds(rest, acc)
       }
       None -> collect_param_preds(rest, acc)
@@ -4939,13 +5449,628 @@ fn collect_param_preds(params: [Param], acc: [Expr]) : [Expr] {
   }
 }
 
-fn pred_entailed_by_params(pred: Expr, param_preds: [Expr]) : Bool {
+# Issue #83: a `requires P` predicate is entailed by a refined-param
+# predicate when any of the following discharges fires:
+#   - bare structural equality (legacy m12.6.x #2 v1 case);
+#   - regex subsumption (m12.6.x #7b — closes #157);
+#   - canonical comparison + `self ↦ pname` substitution
+#     (Issue #83 sub-cases 1 alpha + 2 operator);
+#   - interval lattice (Issue #83, e.g. `requires x > 0` discharged
+#     by `Int where x >= 1`).
+# Sound by construction: every arm only returns `true` when the
+# requires-side predicate is provably implied by the param-side one.
+# When in doubt the runtime assert is preserved.
+fn pred_entailed_by_params(pred: Expr, param_preds: [ParamPred]) : Bool {
   match param_preds {
     [] -> false
-    [pp, ...rest] -> if expr_struct_eq(pred, pp) { true }
-                     else { pred_entailed_by_params(pred, rest) }
+    [pp, ...rest] -> match pp {
+      PPair(pname, pp_expr) -> {
+        if expr_struct_eq(pred, pp_expr) { true }
+        else if regex_pred_subsumed(pred, pname, pp_expr) { true }
+        else {
+          let canon_req = pred_canon(pred)
+          let canon_ref = pred_canon(subst_self(pp_expr, pname))
+          if expr_struct_eq(canon_req, canon_ref) { true }
+          else if pred_entailed_by_refinement(canon_req, pname, canon_ref) { true }
+          else { pred_entailed_by_params(pred, rest) }
+        }
+      }
+    }
   }
 }
+
+# m12.6.x #7b — regex predicate subsumption (closes #157).
+#
+# When the requires-clause's `pred` is `matches(self, ~r/loose/)` and
+# some param refinement `pp` is `matches(self, ~r/strict/)`, the
+# requires assert is redundant iff L(strict) ⊆ L(loose). The full DFA-
+# difference algorithm is decidable for the v1 regex subset (no
+# backrefs, no lookaround); a future extension can lift the
+# stdlib `regex_compile` engine into the typer for general
+# containment.
+#
+# v1 ships a structural shape matcher: each side must match the
+# anchored grammar `^ <atom> <quant>? $`, where atom is a single
+# character class (or built-in escape) and quant is one of `+`, `*`,
+# `?`, or `{n,m}`. Both sides must use the same quant. Containment
+# then reduces to ASCII charset containment over 0..127. Anything
+# outside this shape — alternation, concat, groups, anchored prefix
+# `^acc_`, etc. — bails to false (the runtime assert is preserved,
+# which is sound — we just don't drop it).
+#
+# The bound is the ~256-element shape (one ASCII charset per side);
+# DFAs in the general algorithm are bounded at 1024 states. Since the
+# structural matcher does no NFA->DFA construction, the bound never
+# fires in v1 — but the entry point keeps the same fail-closed
+# contract: `false` (= keep the assert) when in doubt.
+fn regex_pred_subsumed(pred: Expr, pname: String, param_pred: Expr) : Bool {
+  # Requires-side: the user-written receiver must equal the parameter
+  # name. Param-side: the receiver is the parser-inserted `self`.
+  match pred_regex_pattern_named(pred, pname) {
+    None -> false
+    Some(loose) -> match pred_regex_pattern_named(param_pred, "self") {
+      None -> false
+      Some(strict) -> regex_pattern_contains(loose, strict)
+    }
+  }
+}
+
+
+# Recognise an Expr of the shape `matches(<recv>, regex_compile_or_panic
+# ("..."))` where `<recv>` is the bare ident `expected_recv`. Returns
+# the raw pattern (sigil-body bytes) on a hit, None otherwise. The
+# explicit receiver name keeps the regex-subsumption path sound when a
+# function has multiple refined parameters: a param-side `self`
+# refinement on `x` only entails a requires-side `matches(x, …)`,
+# never `matches(y, …)`.
+fn pred_regex_pattern_named(e: Expr, expected_recv: String) : Option[String] {
+  match e.kind {
+    ECall(callee, cargs) -> match callee.kind {
+      EVar(name) ->
+        if name == "matches" {
+          match cargs {
+            [recv, re] -> match recv.kind {
+              EVar(rn) -> if rn == expected_recv { extract_regex_literal(re) } else { None }
+              _ -> None
+            }
+            _ -> None
+          }
+        } else { None }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+# `regex_compile_or_panic("...")` over a literal `EStr` pattern is the
+# only shape the sigil desugar emits. Reach inside, strip the outer
+# `"..."` quotes, and decode the two backslash escapes the sigil
+# parser introduces (`\\` -> `\`, `\"` -> `"`).
+fn extract_regex_literal(re: Expr) : Option[String] {
+  match re.kind {
+    ECall(callee, cargs) -> match callee.kind {
+      EVar(name) ->
+        if name == "regex_compile_or_panic" {
+          match cargs {
+            [arg0] -> match arg0.kind {
+              EStr(span, false) -> Some(decode_regex_str_span(span))
+              _ -> None
+            }
+            _ -> None
+          }
+        } else { None }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+# Strip leading/trailing `"` and decode `\\`/`\"` back to literal `\`
+# and `"`. Mirrors the encoding done by `regex_pattern_to_kai_str_body`
+# in the sigil parser. Returns the empty string when the span is
+# malformed (which `EStr(_, false)` never is in practice — the
+# parser would have rejected it).
+fn decode_regex_str_span(span: String) : String {
+  let n = string_length(span)
+  if n < 2 { "" } else { decode_regex_loop(span, 1, n - 1, "") }
+}
+
+fn decode_regex_loop(span: String, i: Int, end: Int, acc: String) : String {
+  if i >= end { acc } else {
+    let c = char_at_or_zero(span, i)
+    if c == '\\' and i + 1 < end {
+      let c2 = char_at_or_zero(span, i + 1)
+      decode_regex_loop(span, i + 2, end, string_concat(acc, "#{c2}"))
+    } else {
+      decode_regex_loop(span, i + 1, end, string_concat(acc, "#{c}"))
+    }
+  }
+}
+
+# Top-level containment on raw pattern strings. Returns true iff
+# every string accepted by `strict` is also accepted by `loose`.
+# Conservative: returns false when either side falls outside the
+# anchored-class shape the typer recognises in v1.
+fn regex_pattern_contains(loose: String, strict: String) : Bool {
+  match parse_anchored_class(loose) {
+    None -> false
+    Some(la) -> match parse_anchored_class(strict) {
+      None -> false
+      Some(sa) -> ac_contains(la, sa)
+    }
+  }
+}
+
+# Anchored-class shape: `^ <class> <quant>? $`. The class is a
+# 128-bool ASCII mask (string of '0'/'1'). The quant is one of "+",
+# "*", "?", "1" (no quant — must match exactly one char), or a
+# `{n,m}` rendered as "n,m" (or "n," for unbounded). For v1 the
+# matcher only proves containment when both sides share an
+# *identical* quant string — strictly the same shape.
+type AnchoredClass = RxAC(String, String)
+#                       ^mask  ^quant
+
+fn parse_anchored_class(pat: String) : Option[AnchoredClass] {
+  let n = string_length(pat)
+  # Require leading `^` and trailing `$`.
+  if n < 2 { None }
+  else if char_at_or_zero(pat, 0) != '^' { None }
+  else if char_at_or_zero(pat, n - 1) != '$' { None }
+  else {
+    # Parse the class atom starting at position 1.
+    match parse_class_atom(pat, 1, n - 1) {
+      None -> None
+      Some(atom) -> match atom {
+        # PCA(mask, after) = mask, position after the atom
+        PCA(mask, after) -> {
+          let q = parse_quant(pat, after, n - 1)
+          match q {
+            QErr -> None
+            QShape(quant, after_q) ->
+              if after_q == n - 1 { Some(RxAC(mask, quant)) }
+              else { None }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Parse a single class atom: either `[...]` (with optional `^`
+# negation), or one of the built-in escapes `\d \w \s \D \W \S`, or a
+# bare ASCII printable that is not a regex metachar. Returns the
+# resulting 128-byte mask and the byte offset just past the atom.
+type ParsedClassAtom = PCA(String, Int)
+
+fn parse_class_atom(pat: String, i: Int, end: Int) : Option[ParsedClassAtom] {
+  if i >= end { None } else {
+    let c = char_at_or_zero(pat, i)
+    if c == '[' { parse_bracket_class(pat, i + 1, end) }
+    else if c == '\\' { parse_escape_atom(pat, i + 1, end) }
+    else if c == '.' { Some(PCA(mask_dot(), i + 1)) }
+    else if is_regex_meta(c) { None }
+    else { Some(PCA(mask_single(c), i + 1)) }
+  }
+}
+
+fn is_regex_meta(c: Char) : Bool =
+  c == '^' or c == '$' or c == '|' or c == '(' or c == ')' or
+  c == '[' or c == ']' or c == '{' or c == '}' or
+  c == '*' or c == '+' or c == '?' or c == '.' or c == '\\'
+
+# Parse the body of `[...]`, beginning at position `i` (just past the
+# `[`). Returns the assembled mask and the position just past the
+# closing `]`. Bails on malformed classes or anything beyond
+# `[abc]` / `[^abc]` / `[a-z0-9]` shapes.
+fn parse_bracket_class(pat: String, i: Int, end: Int) : Option[ParsedClassAtom] {
+  let neg = if i < end and char_at_or_zero(pat, i) == '^' { true } else { false }
+  let i1 = if neg { i + 1 } else { i }
+  parse_bracket_body(pat, i1, end, mask_empty(), neg)
+}
+
+fn parse_bracket_body(pat: String, i: Int, end: Int, acc: String, neg: Bool) : Option[ParsedClassAtom] {
+  if i >= end { None } else {
+    let c = char_at_or_zero(pat, i)
+    if c == ']' {
+      let final_mask = if neg { mask_invert(acc) } else { acc }
+      Some(PCA(final_mask, i + 1))
+    } else {
+      match parse_bracket_item(pat, i, end) {
+        None -> None
+        Some(item) -> match item {
+          BItem(item_mask, after) ->
+            parse_bracket_body(pat, after, end, mask_or(acc, item_mask), neg)
+        }
+      }
+    }
+  }
+}
+
+# A single item inside `[...]`: a char, an escape, or a range `a-z`.
+type BracketItem = BItem(String, Int)
+
+fn parse_bracket_item(pat: String, i: Int, end: Int) : Option[BracketItem] {
+  if i >= end { None } else {
+    let c = char_at_or_zero(pat, i)
+    let first = if c == '\\' {
+      match parse_class_escape(pat, i + 1, end) {
+        None -> None
+        Some(esc) -> Some(esc)
+      }
+    } else if c == ']' or c == '[' { None }
+    else { Some(BFirst(mask_single(c), i + 1, c)) }
+    match first {
+      None -> None
+      Some(f) -> match f {
+        BFirst(m1, after1, lo) ->
+          if after1 < end and char_at_or_zero(pat, after1) == '-' and
+             after1 + 1 < end and char_at_or_zero(pat, after1 + 1) != ']' {
+            let c2 = char_at_or_zero(pat, after1 + 1)
+            if c2 == '\\' { None }
+            else if char_to_int(c2) < char_to_int(lo) { None }
+            else { Some(BItem(mask_range(lo, c2), after1 + 2)) }
+          } else { Some(BItem(m1, after1)) }
+        BClass(m1, after1) -> Some(BItem(m1, after1))
+      }
+    }
+  }
+}
+
+# Wrapper for a parsed first-token inside a class. Either a single
+# char (which may extend into a range) or a `\d`/`\w`/`\s` class
+# (which never extends). The `Char` field is meaningful only for
+# `BFirst` and is ignored for `BClass`.
+type BracketFirst
+  = BFirst(String, Int, Char)
+  | BClass(String, Int)
+
+fn parse_class_escape(pat: String, i: Int, end: Int) : Option[BracketFirst] {
+  if i >= end { None } else {
+    let c = char_at_or_zero(pat, i)
+    if c == 'd' { Some(BClass(mask_digit(), i + 1)) }
+    else if c == 'D' { Some(BClass(mask_invert(mask_digit()), i + 1)) }
+    else if c == 'w' { Some(BClass(mask_word(), i + 1)) }
+    else if c == 'W' { Some(BClass(mask_invert(mask_word()), i + 1)) }
+    else if c == 's' { Some(BClass(mask_space(), i + 1)) }
+    else if c == 'S' { Some(BClass(mask_invert(mask_space()), i + 1)) }
+    else if c == 'n' { Some(BFirst(mask_single('\n'), i + 1, '\n')) }
+    else if c == 't' { Some(BFirst(mask_single('\t'), i + 1, '\t')) }
+    else if c == 'r' { Some(BFirst(mask_single('\r'), i + 1, '\r')) }
+    else { Some(BFirst(mask_single(c), i + 1, c)) }
+  }
+}
+
+# Outside a class: `\d \w \s` etc. produce a class atom with no
+# follow-on range. Other escape chars produce a single-char atom.
+fn parse_escape_atom(pat: String, i: Int, end: Int) : Option[ParsedClassAtom] {
+  if i >= end { None } else {
+    let c = char_at_or_zero(pat, i)
+    if c == 'd' { Some(PCA(mask_digit(), i + 1)) }
+    else if c == 'D' { Some(PCA(mask_invert(mask_digit()), i + 1)) }
+    else if c == 'w' { Some(PCA(mask_word(), i + 1)) }
+    else if c == 'W' { Some(PCA(mask_invert(mask_word()), i + 1)) }
+    else if c == 's' { Some(PCA(mask_space(), i + 1)) }
+    else if c == 'S' { Some(PCA(mask_invert(mask_space()), i + 1)) }
+    else if c == 'n' { Some(PCA(mask_single('\n'), i + 1)) }
+    else if c == 't' { Some(PCA(mask_single('\t'), i + 1)) }
+    else if c == 'r' { Some(PCA(mask_single('\r'), i + 1)) }
+    else { Some(PCA(mask_single(c), i + 1)) }
+  }
+}
+
+# Parse an optional quantifier just past a class atom. Returns
+# QErr on a malformed `{n,m}`, QShape("1", i) when no quant is
+# present (the atom matches exactly one occurrence), and
+# QShape("+"|"*"|"?"|"n,m"|"n,", i + width) for the supported forms.
+type QuantParse
+  = QShape(String, Int)
+  | QErr
+
+fn parse_quant(pat: String, i: Int, end: Int) : QuantParse {
+  if i >= end { QShape("1", i) } else {
+    let c = char_at_or_zero(pat, i)
+    if c == '+' { QShape("+", i + 1) }
+    else if c == '*' { QShape("*", i + 1) }
+    else if c == '?' { QShape("?", i + 1) }
+    else if c == '{' { parse_repeat_quant(pat, i + 1, end) }
+    else { QShape("1", i) }
+  }
+}
+
+fn parse_repeat_quant(pat: String, i: Int, end: Int) : QuantParse {
+  match parse_pat_int(pat, i, end) {
+    None -> QErr
+    Some(lo_p) -> match lo_p {
+      IntParse(lo, after_lo) ->
+        if after_lo >= end { QErr } else {
+          let c = char_at_or_zero(pat, after_lo)
+          if c == '}' { QShape(concat_all([int_to_string(lo), ",", int_to_string(lo)]), after_lo + 1) }
+          else if c == ',' {
+            if after_lo + 1 < end and char_at_or_zero(pat, after_lo + 1) == '}' {
+              QShape(concat_all([int_to_string(lo), ","]), after_lo + 2)
+            } else { match parse_pat_int(pat, after_lo + 1, end) {
+              None -> QErr
+              Some(hi_p) -> match hi_p {
+                IntParse(hi, after_hi) ->
+                  if hi < lo { QErr }
+                  else if after_hi >= end { QErr }
+                  else if char_at_or_zero(pat, after_hi) != '}' { QErr }
+                  else { QShape(concat_all([int_to_string(lo), ",", int_to_string(hi)]), after_hi + 1) }
+              }
+            } }
+          } else { QErr }
+        }
+    }
+  }
+}
+
+type IntParse = IntParse(Int, Int)
+
+fn parse_pat_int(pat: String, i: Int, end: Int) : Option[IntParse] {
+  parse_pat_int_loop(pat, i, end, 0, false)
+}
+
+fn parse_pat_int_loop(pat: String, i: Int, end: Int, acc: Int, any: Bool) : Option[IntParse] {
+  if i >= end {
+    if any { Some(IntParse(acc, i)) } else { None }
+  } else {
+    let c = char_at_or_zero(pat, i)
+    if ch_is_digit(c) {
+      parse_pat_int_loop(pat, i + 1, end, acc * 10 + char_to_int(c) - char_to_int('0'), true)
+    } else {
+      if any { Some(IntParse(acc, i)) } else { None }
+    }
+  }
+}
+
+# ASCII charset masks. Stored as a string of length 128 — '1' at
+# position k means code point k is in the set.
+fn mask_empty() : String = mask_const_loop(0, '0', "")
+fn mask_full() : String = mask_const_loop(0, '1', "")
+
+fn mask_const_loop(i: Int, ch: Char, acc: String) : String {
+  if i >= 128 { acc }
+  else { mask_const_loop(i + 1, ch, string_concat(acc, "#{ch}")) }
+}
+
+fn mask_single(c: Char) : String {
+  let cp = char_to_int(c)
+  if cp < 0 or cp >= 128 { mask_empty() }
+  else { mask_set_bit(mask_empty(), cp) }
+}
+
+fn mask_range(lo: Char, hi: Char) : String {
+  let lo_i = char_to_int(lo)
+  let hi_i = char_to_int(hi)
+  mask_range_loop(mask_empty(), lo_i, hi_i)
+}
+
+fn mask_range_loop(acc: String, i: Int, hi: Int) : String {
+  if i > hi or i >= 128 { acc }
+  else if i < 0 { mask_range_loop(acc, i + 1, hi) }
+  else { mask_range_loop(mask_set_bit(acc, i), i + 1, hi) }
+}
+
+fn mask_set_bit(m: String, pos: Int) : String {
+  if pos < 0 or pos >= 128 { m }
+  else {
+    let prefix = string_slice(m, 0, pos)
+    let suffix = string_slice(m, pos + 1, 128 - pos - 1)
+    concat_all([prefix, "1", suffix])
+  }
+}
+
+fn mask_or(a: String, b: String) : String = mask_or_loop(a, b, 0, "")
+
+fn mask_or_loop(a: String, b: String, i: Int, acc: String) : String {
+  if i >= 128 { acc }
+  else {
+    let ca = char_at_or_zero(a, i)
+    let cb = char_at_or_zero(b, i)
+    let merged = if ca == '1' or cb == '1' { '1' } else { '0' }
+    mask_or_loop(a, b, i + 1, string_concat(acc, "#{merged}"))
+  }
+}
+
+fn mask_invert(m: String) : String = mask_invert_loop(m, 0, "")
+
+fn mask_invert_loop(m: String, i: Int, acc: String) : String {
+  if i >= 128 { acc }
+  else {
+    let c = char_at_or_zero(m, i)
+    let flipped = if c == '1' { '0' } else { '1' }
+    mask_invert_loop(m, i + 1, string_concat(acc, "#{flipped}"))
+  }
+}
+
+# `[a-z]` ⊆ `[a-z0-9]` iff every '1' in the strict mask is also '1'
+# in the loose mask. Linear scan over 128 positions.
+fn mask_subset(strict: String, loose: String) : Bool = mask_subset_loop(strict, loose, 0)
+
+fn mask_subset_loop(strict: String, loose: String, i: Int) : Bool {
+  if i >= 128 { true }
+  else {
+    let s = char_at_or_zero(strict, i)
+    let l = char_at_or_zero(loose, i)
+    if s == '1' and l != '1' { false }
+    else { mask_subset_loop(strict, loose, i + 1) }
+  }
+}
+
+# `\d` -> [0-9].
+fn mask_digit() : String = mask_range('0', '9')
+
+# `\w` -> [A-Za-z0-9_].
+fn mask_word() : String =
+  mask_set_bit(mask_or(mask_or(mask_range('A', 'Z'), mask_range('a', 'z')),
+                       mask_range('0', '9')),
+               char_to_int('_'))
+
+# `\s` -> [ \t\n\r\v\f]. We only mask the ASCII ones the v1 engine
+# actually recognises (`rx_space_ranges` in stdlib/regexp.kai).
+fn mask_space() : String =
+  mask_set_bit(mask_set_bit(mask_set_bit(mask_set_bit(mask_empty(),
+                                                       char_to_int(' ')),
+                                          char_to_int('\t')),
+                            char_to_int('\n')),
+               char_to_int('\r'))
+
+# `.` matches any non-newline ASCII char (RE2 default semantics).
+fn mask_dot() : String = mask_invert(mask_single('\n'))
+
+# Containment of two parsed AnchoredClass shapes. v1: identical
+# quantifier strings + strict charset ⊆ loose charset is the
+# only path that returns true. Anything else is conservative.
+fn ac_contains(loose: AnchoredClass, strict: AnchoredClass) : Bool {
+  match loose {
+    RxAC(loose_mask, loose_q) -> match strict {
+      RxAC(strict_mask, strict_q) ->
+        if loose_q != strict_q { false }
+        else { mask_subset(strict_mask, loose_mask) }
+    }
+  }
+}
+
+# Substitute every free `self` in `e` with `EVar(name)`. The
+# refinement grammar only uses `self` as a stand-in for the value
+# being refined, so we do not chase shadowing — `self` is never
+# rebound by `let` / lambda / match inside a predicate.
+fn subst_self(e: Expr, name: String) : Expr = match e.kind {
+  EVar(s) -> if s == "self" { mk_expr(EVar(name), e.line, e.col) } else { e }
+  EBinop(op, a, b) -> mk_expr(EBinop(op, subst_self(a, name), subst_self(b, name)), e.line, e.col)
+  EUnop(op, x) -> mk_expr(EUnop(op, subst_self(x, name)), e.line, e.col)
+  ECall(f, xs) -> mk_expr(ECall(subst_self(f, name), subst_self_list(xs, name)), e.line, e.col)
+  _ -> e
+}
+
+fn subst_self_list(es: [Expr], name: String) : [Expr] = match es {
+  [] -> []
+  [h, ...t] -> [subst_self(h, name), ...subst_self_list(t, name)]
+}
+
+# Issue #83 sub-case 2: predicate canonicaliser. Normalises a
+# comparison Expr so structurally-different but semantically-equal
+# forms compare equal: `0 < x` → `x > 0`, `<=` ↔ flipped `>=`,
+# `==` / `!=` argument order normalised lexicographically. Any
+# non-comparison Expr is recursed into so a top-level `and` / `or`
+# of comparisons is canonicalised arm-wise.
+fn pred_canon(e: Expr) : Expr = match e.kind {
+  EBinop(op, a, b) -> {
+    let ca = pred_canon(a)
+    let cb = pred_canon(b)
+    if op == "<" { mk_expr(EBinop(">", cb, ca), e.line, e.col) }
+    else if op == "<=" { mk_expr(EBinop(">=", cb, ca), e.line, e.col) }
+    else if op == "==" or op == "!=" {
+      if cmp_lt(ca, cb) { mk_expr(EBinop(op, ca, cb), e.line, e.col) }
+      else { mk_expr(EBinop(op, cb, ca), e.line, e.col) }
+    }
+    else if op == "and" or op == "or" {
+      mk_expr(EBinop(op, ca, cb), e.line, e.col)
+    }
+    else { mk_expr(EBinop(op, ca, cb), e.line, e.col) }
+  }
+  EUnop(op, x) -> mk_expr(EUnop(op, pred_canon(x)), e.line, e.col)
+  _ -> e
+}
+
+# Total ordering used by `pred_canon` to break ties on symmetric
+# operators. Variables sort by name; literals sort by value. An
+# EVar always sorts before an EInt so `x == 0` canonicalises to
+# `x == 0` (variable on the LHS), and two variables sort
+# alphabetically.
+fn cmp_lt(a: Expr, b: Expr) : Bool = match a.kind {
+  EVar(an) -> match b.kind {
+    EVar(bn) -> string_lt(an, bn)
+    _ -> true
+  }
+  EInt(av) -> match b.kind {
+    EVar(_) -> false
+    EInt(bv) -> av < bv
+    _ -> true
+  }
+  _ -> false
+}
+
+# Issue #83 sub-case 3 partial: when both predicates compare the
+# same variable to a literal, use the interval lattice to decide
+# entailment. Captures `x > 0` ⊢ `x > -1`, `x >= 1` ⊢ `x > 0`,
+# `x != 0` ⊢ `x != 0` (already covered by struct_eq), etc. Both
+# inputs are in canonical form (variable on the LHS for ordered
+# comparisons).
+fn pred_entailed_by_refinement(req: Expr, pname: String, ref_pred: Expr) : Bool {
+  match interval_of_pred(ref_pred, pname) {
+    None -> false
+    Some(iv) -> match check_pred_with_interval(req, pname, iv) {
+      Some(true) -> true
+      _ -> false
+    }
+  }
+}
+
+# Read a refinement predicate as an interval over `pname`. Only
+# the closed shapes we care about — `pname OP literal` — produce
+# a non-trivial interval; anything else collapses to `None` so the
+# caller falls back to structural matching.
+fn interval_of_pred(e: Expr, pname: String) : Option[Interval] = match e.kind {
+  EBinop(op, a, b) -> match a.kind {
+    EVar(n) -> if n == pname {
+      match try_eval_int(b) {
+        None -> None
+        Some(k) -> interval_from_cmp(op, k)
+      }
+    } else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
+# Turn `x OP k` into the tightest Int interval that satisfies it.
+# `!=` is not expressible as a single closed interval; we return
+# `None` so the caller defers to structural / call-site checks.
+fn interval_from_cmp(op: String, k: Int) : Option[Interval] {
+  if op == ">"  { Some(Ival(k + 1, ival_int_max_const())) }
+  else if op == ">=" { Some(Ival(k, ival_int_max_const())) }
+  else if op == "<"  { Some(Ival(ival_int_min_const(), k - 1)) }
+  else if op == "<=" { Some(Ival(ival_int_min_const(), k)) }
+  else if op == "==" { Some(Ival(k, k)) }
+  else { None }
+}
+
+# Saturating sentinels for the interval lattice. The lattice does
+# not track unbounded ranges precisely; these constants stand in for
+# `+∞` / `-∞` and are large enough that any realistic Int comparison
+# folds before reaching them.
+fn ival_int_max_const() : Int = 9223372036854775807
+fn ival_int_min_const() : Int = 0 - 9223372036854775807 - 1
+
+# Discharge a `requires` predicate against a known interval for the
+# refined param. Returns `Some(true)` when the request is provable,
+# `Some(false)` if the interval witnesses a contradiction (caller
+# treats it as "not entailed" — a `false` requires would have been
+# rejected at parse time), and `None` when the predicate's shape
+# escapes our analysis.
+fn check_pred_with_interval(req: Expr, pname: String, iv: Interval) : Option[Bool] = match req.kind {
+  EBinop(op, a, b) -> match a.kind {
+    EVar(n) -> if n == pname {
+      match try_eval_int(b) {
+        None -> None
+        Some(k) -> {
+          let kiv = Ival(k, k)
+          if op == ">"  { ival_gt(iv, kiv) }
+          else if op == ">=" { ival_ge(iv, kiv) }
+          else if op == "<"  { ival_lt(iv, kiv) }
+          else if op == "<=" { ival_le(iv, kiv) }
+          else if op == "==" { ival_eq(iv, kiv) }
+          else if op == "!=" { ival_ne(iv, kiv) }
+          else { None }
+        }
+      }
+    } else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
 
 # Structural equality on Expr, ignoring line/col. Conservative: only
 # the shapes the predicate-pure subset can produce are compared in
@@ -5444,6 +6569,512 @@ fn ival_of_decl(d: Decl) : Interval = match d {
 fn ival_seed_params(params: [Param], env: IntervalEnv) : IntervalEnv = match params {
   [] -> env
   [p, ...rest] -> ival_seed_params(rest, ie_extend(env, p.pname, ITop))
+}
+
+# ====================================================================
+# Issue #83 sub-case 3 — call-site substitution analysis
+# ====================================================================
+#
+# Walks every user fn looking for `ECall(EVar(callee), args)` whose
+# callee's `requires` clauses (or refined-param predicates) can be
+# discharged at compile time from what we know about the args:
+#
+#   1. **Literal arg**: substitute the integer into the callee's
+#      predicate and run `try_eval_pred`.
+#   2. **Refined-binding arg**: when the arg is an `EVar(x)` whose
+#      type is `TyRefine` in the caller's signature, the caller's
+#      refinement (with `self ↦ x`) is checked against the callee's
+#      predicate (with `param ↦ x`) using the same canonical /
+#      interval-based entailment as the in-callee path.
+#   3. **Unrefined-binding arg**: no info, leave the runtime assert
+#      in place. Status quo.
+#
+# The analysis is intentionally a syntactic AST pass — it sees the
+# parser's `TyRefine` shape directly, with no need for the
+# `infer_program` substitution. Two outputs:
+#
+#   - `--dump-call-elision`: per call-site report, useful for
+#     fixtures.
+#   - `check_call_site_refinements`: when the caller passes a refined
+#     binding whose refinement is strictly weaker than the callee's
+#     pre, that's a static error pointing at the call site. No flag
+#     needed; refining a parameter is opt-in already.
+
+# A callee's contract entry: param name + predicate the caller must
+# discharge for that param. For `requires P` the param is the special
+# `__contract` (P uses param names directly); for refined params the
+# param's name is the refinement's `self` stand-in.
+type CalleeReq = CR(String, Expr)
+
+type CalleeSig = CSig(String, [String], [CalleeReq])  # name, param names, requirements
+
+# Build the table of fns with non-empty contracts. Tparam-rewritten
+# fns (`with_protocol_tparams`) are skipped — protocol impls are
+# resolved later in the pipeline and their contracts get re-emitted
+# at that point.
+fn collect_callee_sigs(decls: [Decl]) : [CalleeSig] {
+  collect_callee_sigs_loop(decls, [])
+}
+
+fn collect_callee_sigs_loop(decls: [Decl], acc: [CalleeSig]) : [CalleeSig] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DFn(_, name, _, params, _, _, body, _, _, _) -> {
+        let reqs = extract_callee_reqs(params, body)
+        if list_is_empty(reqs) { collect_callee_sigs_loop(rest, acc) }
+        else {
+          let pnames = collect_param_names(params, [])
+          collect_callee_sigs_loop(rest, [CSig(name, pnames, reqs), ...acc])
+        }
+      }
+      _ -> collect_callee_sigs_loop(rest, acc)
+    }
+  }
+}
+
+fn collect_param_names(params: [Param], acc: [String]) : [String] = match params {
+  [] -> list_reverse(acc)
+  [p, ...rest] -> collect_param_names(rest, [p.pname, ...acc])
+}
+
+# Walk the body's leading asserts to recover the original `requires`
+# predicates `wrap_with_contracts` desugared. They live at the front
+# of an EBlock as `SAssert(pred, Some("requires violated..."))`. We
+# stop at the first non-`requires` assert (so `ensures` asserts after
+# `let result = body` aren't picked up). Refined-param predicates
+# also produce a CalleeReq (with `self ↦ pname` already applied so
+# downstream entailment treats them as ordinary predicates over the
+# parameter).
+fn extract_callee_reqs(params: [Param], body: Expr) : [CalleeReq] {
+  let from_params = extract_param_refinement_reqs(params, [])
+  let from_asserts = extract_requires_asserts(body)
+  list_append(from_asserts, from_params)
+}
+
+fn extract_param_refinement_reqs(params: [Param], acc: [CalleeReq]) : [CalleeReq] {
+  match params {
+    [] -> list_reverse(acc)
+    [p, ...rest] -> match p.ptype {
+      Some(t) -> match t.tkind {
+        TyRefine(_, pred) ->
+          extract_param_refinement_reqs(rest, [CR(p.pname, subst_self(pred, p.pname)), ...acc])
+        _ -> extract_param_refinement_reqs(rest, acc)
+      }
+      None -> extract_param_refinement_reqs(rest, acc)
+    }
+  }
+}
+
+fn extract_requires_asserts(body: Expr) : [CalleeReq] = match body.kind {
+  EBlock(stmts, _) -> extract_requires_loop(stmts, [])
+  _ -> []
+}
+
+fn extract_requires_loop(stmts: [Stmt], acc: [CalleeReq]) : [CalleeReq] {
+  match stmts {
+    [] -> list_reverse(acc)
+    [s, ...rest] -> match s {
+      SAssert(pred, Some(msg)) -> if assert_msg_is_requires(msg) {
+        extract_requires_loop(rest, [CR("__requires", pred), ...acc])
+      } else { list_reverse(acc) }
+      _ -> list_reverse(acc)
+    }
+  }
+}
+
+fn assert_msg_is_requires(msg: Expr) : Bool = match msg.kind {
+  EStr(s, _) -> string_starts_with_requires(s)
+  _ -> false
+}
+
+# The desugared message is a quoted string of the form
+# `"requires violated at line N"` (quotes included in EStr's raw
+# span). Match the prefix `"requires` rather than calling
+# string_starts_with_q which is defined later in the file but is
+# semantically what we want.
+fn string_starts_with_requires(s: String) : Bool {
+  let n = string_length(s)
+  if n < 10 { false } else {
+    let c0 = char_at(s, 0)
+    let c1 = char_at(s, 1)
+    match c0 { Some(q) -> match c1 {
+      Some(r) -> q == '"' and r == 'r' and starts_with_after_quote(s, 1, "requires")
+      None -> false
+    } None -> false }
+  }
+}
+
+fn starts_with_after_quote(s: String, off: Int, prefix: String) : Bool {
+  let n = string_length(prefix)
+  pred_starts_with_loop(s, off, prefix, 0, n)
+}
+
+fn pred_starts_with_loop(s: String, soff: Int, prefix: String, poff: Int, n: Int) : Bool {
+  if poff >= n { true }
+  else {
+    match char_at(s, soff) {
+      Some(cs) -> match char_at(prefix, poff) {
+        Some(cp) -> if cs == cp { pred_starts_with_loop(s, soff + 1, prefix, poff + 1, n) } else { false }
+        None -> false
+      }
+      None -> false
+    }
+  }
+}
+
+# Refinement bindings visible inside a function body: each entry
+# pairs a binding name with the (canonicalised, self-substituted)
+# predicate the typer would attach to its TyRefine. Built from the
+# enclosing fn's parameter list; `let` bindings without explicit
+# refinement annotations contribute nothing (interval inference is
+# the lattice's job, not this analysis).
+type RefBinding = RBind(String, Expr)
+
+fn collect_caller_refinements(params: [Param], acc: [RefBinding]) : [RefBinding] {
+  match params {
+    [] -> list_reverse(acc)
+    [p, ...rest] -> match p.ptype {
+      Some(t) -> match t.tkind {
+        TyRefine(_, pred) ->
+          collect_caller_refinements(rest, [RBind(p.pname, subst_self(pred, p.pname)), ...acc])
+        _ -> collect_caller_refinements(rest, acc)
+      }
+      None -> collect_caller_refinements(rest, acc)
+    }
+  }
+}
+
+fn lookup_caller_refinement(refs: [RefBinding], name: String) : Option[Expr] {
+  match refs {
+    [] -> None
+    [r, ...rest] -> match r {
+      RBind(n, p) -> if n == name { Some(p) } else { lookup_caller_refinement(rest, name) }
+    }
+  }
+}
+
+# A single classification of a call-site relative to one of the
+# callee's requirements. Fixtures pin these via `--dump-call-elision`.
+type CallSiteStatus = CSElided | CSRuntime | CSLoose(String)
+
+# Outcome record: callee name, param name (or "__requires"), the
+# discharged predicate as it was tested, and the status.
+type CallSiteReport = CSR(String, String, Expr, CallSiteStatus, Int, Int)
+
+# Classify one (callee_param, caller_arg) discharge attempt.
+#
+# `req_pred` is the callee's predicate with the formal parameter
+# name baked in (already substituted from `self`). `arg` is the AST
+# expression at the call site. `caller_refs` is the refinement
+# environment built from the enclosing fn's parameters.
+fn classify_arg_vs_pred(req_pred: Expr, pname: String, arg: Expr,
+                        caller_refs: [RefBinding]) : CallSiteStatus {
+  match try_eval_int(arg) {
+    Some(k) -> {
+      let folded = pred_canon(subst_var(req_pred, pname, mk_int(k, arg.line, arg.col)))
+      match try_eval_pred(folded) {
+        Some(true) -> CSElided
+        Some(false) -> CSLoose(concat_all(["literal ", int_to_string(k), " violates `", expr_show_pred(req_pred), "`"]))
+        None -> CSRuntime
+      }
+    }
+    None -> match arg.kind {
+      EVar(arg_name) -> match lookup_caller_refinement(caller_refs, arg_name) {
+        Some(caller_pred) -> {
+          # Substitute both predicates to talk about the same name
+          # (the arg's name) so structural / interval entailment
+          # works without per-pair alpha matching.
+          let req_in_arg = pred_canon(subst_var(req_pred, pname, mk_var(arg_name, arg.line, arg.col)))
+          let caller_in_arg = pred_canon(caller_pred)
+          if expr_struct_eq(req_in_arg, caller_in_arg) { CSElided }
+          else if pred_entailed_by_refinement(req_in_arg, arg_name, caller_in_arg) { CSElided }
+          else { CSLoose(concat_all([
+                  "caller refinement `", expr_show_pred(caller_pred),
+                  "` does not entail callee precondition `",
+                  expr_show_pred(req_pred), "`"])) }
+        }
+        None -> CSRuntime
+      }
+      _ -> CSRuntime
+    }
+  }
+}
+
+fn mk_int(n: Int, line: Int, col: Int) : Expr = mk_expr(EInt(n), line, col)
+fn mk_var(s: String, line: Int, col: Int) : Expr = mk_expr(EVar(s), line, col)
+
+# Substitute every free `EVar(from)` in `e` with `to`. Mirrors
+# `subst_self` but for an arbitrary name. Used to push a literal /
+# binding into a callee's predicate before discharging it.
+fn subst_var(e: Expr, from: String, to: Expr) : Expr = match e.kind {
+  EVar(s) -> if s == from { to } else { e }
+  EBinop(op, a, b) -> mk_expr(EBinop(op, subst_var(a, from, to), subst_var(b, from, to)), e.line, e.col)
+  EUnop(op, x) -> mk_expr(EUnop(op, subst_var(x, from, to)), e.line, e.col)
+  ECall(f, xs) -> mk_expr(ECall(subst_var(f, from, to), subst_var_list(xs, from, to)), e.line, e.col)
+  _ -> e
+}
+
+fn subst_var_list(es: [Expr], from: String, to: Expr) : [Expr] = match es {
+  [] -> []
+  [h, ...t] -> [subst_var(h, from, to), ...subst_var_list(t, from, to)]
+}
+
+# Pretty-print a predicate Expr in the canonical comparison form used
+# by `--dump-call-elision`. Falls back to `<expr>` for shapes outside
+# the decidable subset so the output stays grep-friendly.
+fn expr_show_pred(e: Expr) : String = match e.kind {
+  EInt(n) -> int_to_string(n)
+  EVar(s) -> s
+  EBool(b) -> if b { "true" } else { "false" }
+  EBinop(op, a, b) -> concat_all([expr_show_pred(a), " ", op, " ", expr_show_pred(b)])
+  EUnop(op, x) -> concat_all([op, " ", expr_show_pred(x)])
+  _ -> "<expr>"
+}
+
+# Walk a body expression collecting reports for every ECall(EVar, ...).
+# Calls into anonymous lambdas, method calls, etc. are skipped — the
+# entailment table is keyed by fn name and we don't track higher-order
+# values.
+fn analyze_calls(e: Expr, sigs: [CalleeSig], caller_refs: [RefBinding],
+                 acc: [CallSiteReport]) : [CallSiteReport] = match e.kind {
+  ECall(callee, call_args) -> {
+    let acc1 = analyze_calls_in_args(call_args, sigs, caller_refs, acc)
+    match callee.kind {
+      EVar(fname) -> match lookup_callee_sig(sigs, fname) {
+        None -> acc1
+        Some(cs) -> match cs {
+          CSig(_, pnames, reqs) -> classify_call(fname, pnames, call_args, reqs, caller_refs, acc1, callee.line, callee.col)
+        }
+      }
+      _ -> analyze_calls(callee, sigs, caller_refs, acc1)
+    }
+  }
+  EBinop(_, a, b) -> analyze_calls(b, sigs, caller_refs, analyze_calls(a, sigs, caller_refs, acc))
+  EUnop(_, x) -> analyze_calls(x, sigs, caller_refs, acc)
+  EIf(c, t, eo) -> {
+    let a1 = analyze_calls(c, sigs, caller_refs, acc)
+    let a2 = analyze_calls(t, sigs, caller_refs, a1)
+    match eo { None -> a2 Some(el) -> analyze_calls(el, sigs, caller_refs, a2) }
+  }
+  EBlock(stmts, tail) -> {
+    let a1 = analyze_calls_in_stmts(stmts, sigs, caller_refs, acc)
+    match tail { None -> a1 Some(t) -> analyze_calls(t, sigs, caller_refs, a1) }
+  }
+  EMatch(scr, arms) -> analyze_calls_in_arms(arms, sigs, caller_refs, analyze_calls(scr, sigs, caller_refs, acc))
+  EField(b, _) -> analyze_calls(b, sigs, caller_refs, acc)
+  EIndex(a, i) -> analyze_calls(i, sigs, caller_refs, analyze_calls(a, sigs, caller_refs, acc))
+  EPipe(a, b) -> analyze_calls(b, sigs, caller_refs, analyze_calls(a, sigs, caller_refs, acc))
+  EBang(x) -> analyze_calls(x, sigs, caller_refs, acc)
+  ELambda(_, body) -> analyze_calls(body, sigs, caller_refs, acc)
+  EList(elems) -> analyze_calls_in_list_elems(elems, sigs, caller_refs, acc)
+  ERange(a, b, _) -> analyze_calls(b, sigs, caller_refs, analyze_calls(a, sigs, caller_refs, acc))
+  ELitUnit(inner, _) -> analyze_calls(inner, sigs, caller_refs, acc)
+  _ -> acc
+}
+
+fn analyze_calls_in_args(call_args: [Expr], sigs: [CalleeSig], caller_refs: [RefBinding],
+                          acc: [CallSiteReport]) : [CallSiteReport] = match call_args {
+  [] -> acc
+  [a, ...rest] -> analyze_calls_in_args(rest, sigs, caller_refs, analyze_calls(a, sigs, caller_refs, acc))
+}
+
+fn analyze_calls_in_stmts(stmts: [Stmt], sigs: [CalleeSig], caller_refs: [RefBinding],
+                           acc: [CallSiteReport]) : [CallSiteReport] = match stmts {
+  [] -> acc
+  [s, ...rest] -> {
+    let acc1 = match s {
+      SLet(_, _, e) -> analyze_calls(e, sigs, caller_refs, acc)
+      SExprStmt(e) -> analyze_calls(e, sigs, caller_refs, acc)
+      SAssert(c, opt_m) -> {
+        let a1 = analyze_calls(c, sigs, caller_refs, acc)
+        match opt_m { None -> a1 Some(m) -> analyze_calls(m, sigs, caller_refs, a1) }
+      }
+      _ -> acc
+    }
+    analyze_calls_in_stmts(rest, sigs, caller_refs, acc1)
+  }
+}
+
+fn analyze_calls_in_arms(arms: [Arm], sigs: [CalleeSig], caller_refs: [RefBinding],
+                          acc: [CallSiteReport]) : [CallSiteReport] = match arms {
+  [] -> acc
+  [a, ...rest] -> match a {
+    Arm(_, _, body) -> analyze_calls_in_arms(rest, sigs, caller_refs, analyze_calls(body, sigs, caller_refs, acc))
+  }
+}
+
+fn analyze_calls_in_list_elems(elems: [ListElem], sigs: [CalleeSig], caller_refs: [RefBinding],
+                                acc: [CallSiteReport]) : [CallSiteReport] = match elems {
+  [] -> acc
+  [el, ...rest] -> {
+    let acc1 = match el {
+      ElPlain(e) -> analyze_calls(e, sigs, caller_refs, acc)
+      ElSpread(e) -> analyze_calls(e, sigs, caller_refs, acc)
+    }
+    analyze_calls_in_list_elems(rest, sigs, caller_refs, acc1)
+  }
+}
+
+fn lookup_callee_sig(sigs: [CalleeSig], name: String) : Option[CalleeSig] = match sigs {
+  [] -> None
+  [s, ...rest] -> match s {
+    CSig(n, _, _) -> if n == name { Some(s) } else { lookup_callee_sig(rest, name) }
+  }
+}
+
+# Drive the per-arg classification. For each requirement, find the
+# arg the callee param it refers to maps to (positional, by name) and
+# classify. `__requires` predicates are checked by substituting EVERY
+# param name in the predicate with its corresponding arg before
+# folding.
+fn classify_call(fname: String, pnames: [String], call_args: [Expr], reqs: [CalleeReq],
+                 caller_refs: [RefBinding], acc: [CallSiteReport],
+                 line: Int, col: Int) : [CallSiteReport] = match reqs {
+  [] -> acc
+  [r, ...rest] -> match r {
+    CR(pname, pred) -> {
+      let status = if pname == "__requires" {
+        classify_requires_clause(pred, pnames, call_args, caller_refs)
+      } else {
+        match arg_for_param(pnames, call_args, pname) {
+          Some(arg) -> classify_arg_vs_pred(pred, pname, arg, caller_refs)
+          None -> CSRuntime
+        }
+      }
+      let rep = CSR(fname, pname, pred, status, line, col)
+      classify_call(fname, pnames, call_args, rest, caller_refs, [rep, ...acc], line, col)
+    }
+  }
+}
+
+# A `requires` predicate may mention any param; substitute each param
+# name with the corresponding arg expression (literal or refined
+# binding) and either fold or check entailment.
+fn classify_requires_clause(pred: Expr, pnames: [String], call_args: [Expr],
+                             caller_refs: [RefBinding]) : CallSiteStatus {
+  let subst = subst_params(pred, pnames, call_args)
+  let folded = pred_canon(subst)
+  match try_eval_pred(folded) {
+    Some(true) -> CSElided
+    Some(false) -> CSLoose(concat_all(["literal args violate `", expr_show_pred(pred), "`"]))
+    None -> {
+      # Try refinement-based discharge: if the substituted predicate
+      # is a comparison whose only free var is a refined caller
+      # binding, ask the lattice.
+      match free_var_of_pred(folded) {
+        Some(vname) -> match lookup_caller_refinement(caller_refs, vname) {
+          Some(caller_pred) -> {
+            let caller_canon = pred_canon(caller_pred)
+            if expr_struct_eq(folded, caller_canon) { CSElided }
+            else if pred_entailed_by_refinement(folded, vname, caller_canon) { CSElided }
+            else { CSLoose(concat_all([
+                    "caller refinement `", expr_show_pred(caller_pred),
+                    "` does not entail callee precondition `",
+                    expr_show_pred(pred), "`"])) }
+          }
+          None -> CSRuntime
+        }
+        None -> CSRuntime
+      }
+    }
+  }
+}
+
+fn subst_params(pred: Expr, pnames: [String], call_args: [Expr]) : Expr = match pnames {
+  [] -> pred
+  [n, ...rest_n] -> match call_args {
+    [] -> pred
+    [a, ...rest_a] -> subst_params(subst_var(pred, n, a), rest_n, rest_a)
+  }
+}
+
+fn arg_for_param(pnames: [String], call_args: [Expr], target: String) : Option[Expr] = match pnames {
+  [] -> None
+  [n, ...rest_n] -> match call_args {
+    [] -> None
+    [a, ...rest_a] -> if n == target { Some(a) } else { arg_for_param(rest_n, rest_a, target) }
+  }
+}
+
+# Find the unique free variable of a comparison predicate, or None
+# if it has zero or more than one. Used by classify_requires_clause
+# to decide which caller refinement to consult.
+fn free_var_of_pred(e: Expr) : Option[String] = match e.kind {
+  EBinop(_, a, b) -> match free_var_of_pred(a) {
+    Some(an) -> match free_var_of_pred(b) {
+      Some(bn) -> if an == bn { Some(an) } else { None }
+      None -> Some(an)
+    }
+    None -> free_var_of_pred(b)
+  }
+  EUnop(_, x) -> free_var_of_pred(x)
+  EVar(s) -> Some(s)
+  _ -> None
+}
+
+# Drive analyze_calls over a whole program. Each fn body is walked
+# with the fn's own param refinements as the caller environment.
+fn analyze_program_calls(decls: [Decl], sigs: [CalleeSig]) : [CallSiteReport] {
+  analyze_program_calls_loop(decls, sigs, [])
+}
+
+fn analyze_program_calls_loop(decls: [Decl], sigs: [CalleeSig],
+                                acc: [CallSiteReport]) : [CallSiteReport] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DFn(_, _, _, params, _, _, body, _, _, _) -> {
+      let refs = collect_caller_refinements(params, [])
+      let acc1 = analyze_calls(body, sigs, refs, acc)
+      analyze_program_calls_loop(rest, sigs, acc1)
+    }
+    _ -> analyze_program_calls_loop(rest, sigs, acc)
+  }
+}
+
+# `--dump-call-elision`: per-call-site report, one line per
+# (callee, param) pair, in source order. Format mirrors
+# `--dump-intervals`: `callee.param @line:col -> status`.
+fn dump_call_elision(file: String, decls: [Decl]) : Int / Console {
+  let sigs = collect_callee_sigs(decls)
+  let reports = analyze_program_calls(decls, sigs)
+  reports |> each(dump_call_elision_one)
+  0
+}
+
+fn dump_call_elision_one(r: CallSiteReport) : Unit / Console = match r {
+  CSR(fname, pname, pred, status, line, col) -> {
+    let prefix = concat_all([fname, ".", pname, " @", int_to_string(line), ":",
+                             int_to_string(col), " `", expr_show_pred(pred), "`"])
+    match status {
+      CSElided -> print("#{prefix} -> elided")
+      CSRuntime -> print("#{prefix} -> runtime")
+      CSLoose(reason) -> print("#{prefix} -> loose (#{reason})")
+    }
+  }
+}
+
+# Compile-time strictness: a refined binding passed where the callee
+# wants a strictly stronger predicate is a static error. The reason
+# string surfaces via the diagnostic so the user sees `>= 0 doesn't
+# entail > 0`. Returns the number of errors emitted.
+fn check_call_site_refinements(file: String, decls: [Decl]) : Int / Console {
+  let sigs = collect_callee_sigs(decls)
+  let reports = analyze_program_calls(decls, sigs)
+  check_call_site_loop(file, reports, 0)
+}
+
+fn check_call_site_loop(file: String, reports: [CallSiteReport], errs: Int) : Int / Console = match reports {
+  [] -> errs
+  [r, ...rest] -> match r {
+    CSR(fname, _, _, status, line, col) -> match status {
+      CSLoose(reason) -> {
+        eprint("#{file}:#{int_to_string(line)}:#{int_to_string(col)}: error: call to `#{fname}`: #{reason}\n")
+        check_call_site_loop(file, rest, errs + 1)
+      }
+      _ -> check_call_site_loop(file, rest, errs)
+    }
+  }
 }
 
 # `effect Eff[T1, T2] { op_decl ... }` — m7a #3a + m7b #11.
@@ -7339,7 +8970,7 @@ fn register_import(e: Env, ik: ImportKind) : Env {
 
 # ---- entry point ----
 
-fn check_program(file: String, decls: [Decl]) : Int {
+fn check_program(file: String, decls: [Decl]) : Int / Console {
   let e0 = env_new(file)
   let e1 = add_all(e0, prelude_names())
   let e2 = register_decls(e1, decls)
@@ -7347,7 +8978,8 @@ fn check_program(file: String, decls: [Decl]) : Int {
   let eff_names = collect_effect_names(decls)
   let arities = collect_effect_arities(decls)
   let row_errs = check_row_labels(decls, file, eff_names, arities)
-  if e3.had_error or row_errs > 0 { 1 } else { 0 }
+  let strict_errs = check_call_site_refinements(file, decls)
+  if e3.had_error or row_errs > 0 or strict_errs > 0 { 1 } else { 0 }
 }
 
 # m7b #11j — arity table built from every DEffect in the program.
@@ -12722,7 +14354,15 @@ fn rewrite_alias_clause(c: HClause, m: AliasMap) : HClause {
       # shadow outer aliases inside the clause body.
       let names = map(ps, (pm) => pm.pname)
       let m1 = alias_map_remove_all(m, names)
-      HC(n, ps, rewrite_alias_expr(b, m1), l, co)
+      # Issue #148 (Option A): a clause body compiles to a separate
+      # C function, so any `kai_alias_<a>_id` declared in an outer
+      # `EHandle` prologue is out of scope here — same situation as
+      # a lambda body. Disable tag emission so cross-handler reads
+      # of an outer-bound capability fall back to the legacy
+      # name-keyed lookup. The bindings stay live so the
+      # `cap.op` → `Eff.op` substitution keeps working.
+      let m2 = alias_map_disable_tag(m1)
+      HC(n, ps, rewrite_alias_expr(b, m2), l, co)
     }
   }
 }
@@ -12742,7 +14382,11 @@ fn rewrite_alias_return(r: HReturn, m: AliasMap) : HReturn {
     # rewrite pass — only `p` is user-visible here).
     HR(p, b, l, c) -> {
       let m1 = alias_map_remove(m, p)
-      HR(p, rewrite_alias_expr(b, m1), l, c)
+      # Issue #148 (Option A): the return clause also compiles to a
+      # separate C function, so disable tag emission for the same
+      # cross-handler reason as `rewrite_alias_clause`.
+      let m2 = alias_map_disable_tag(m1)
+      HR(p, rewrite_alias_expr(b, m2), l, c)
     }
   }
 }
@@ -19219,6 +20863,19 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
     }
     TyCon(an, aa) -> match b {
       TyCon(bn, ba) -> if an == bn { unify_list(aa, ba, s) } else { None }
+      # issue #162: a bare named record on the LHS unifies with the
+      # same record on the RHS decorated by a unit, when the unit
+      # collapses to UOne. Mirrors the `Real ≡ Real<1>` / `Int ≡ Int<1>`
+      # rules above. v1 lights this up only for `Decimal` — the other
+      # named records have no UoM-decorated form yet.
+      TyDimT(bb, bu) -> match bb {
+        TyCon(bn, ba) ->
+          if an == bn { match unify_list(aa, ba, s) {
+            None -> None
+            Some(s1) -> unify_unit(UOne, bu, s1)
+          } } else { None }
+        _ -> None
+      }
       _ -> None
     }
     TyVarT(_) -> None                                  # handled in unify
@@ -19232,6 +20889,18 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
       }
       TyInt    -> match ab { TyInt -> unify_unit(au, UOne, s) _ -> None }
       TyReal   -> match ab { TyReal -> unify_unit(au, UOne, s) _ -> None }
+      # issue #162: `Decimal<u>` ≡ bare `Decimal` when u collapses to 1,
+      # mirroring the bare-numeric arms. Lets a `Decimal<USD>` value
+      # flow into a fn expecting bare `Decimal` only when the units
+      # cancel — anything else is a unit mismatch.
+      TyCon(bn, ba) -> match ab {
+        TyCon(an, aa) ->
+          if an == bn { match unify_list(aa, ba, s) {
+            None -> None
+            Some(s1) -> unify_unit(au, UOne, s1)
+          } } else { None }
+        _ -> None
+      }
       TyRefineT(bbase, _) -> unify(a, bbase, s)
       _ -> None
     }
@@ -20418,7 +22087,12 @@ fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
                        "log", mono(sty))
           } else { env1 }
         let st1 = st_set_env(st, env2)
-        let rr = synth(st1, rexpr)
+        # Issue #148 (Option A): same alias-tag boundary as the
+        # op clauses — the return clause also compiles to a
+        # separate C function with no access to outer
+        # `kai_alias_<a>_id` C locals.
+        let st1_no_tag = st_disable_alias_tag(st1)
+        let rr = synth(st1_no_tag, rexpr)
         let st_out = st_restore_entries(outer, rr.st)
         let ty = apply_ty(st_out.sub, rr.ty)
         RetTyped { st: st_out, ty: ty, ret_opt: Some(HR(pname, rr.expr, line, col)) }
@@ -20473,7 +22147,18 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
             None -> st_env
           }
         } else { st_env }
-        let rb = synth(st_resume, body)
+        # Issue #148 (Option A): a clause body compiles to a
+        # separate C function and `filter_clause_captures` strips
+        # the `__alias_id__<a>` sentinels that would otherwise
+        # thread an outer-bound capability's handler id into the
+        # clause env. Disable alias tagging across the clause
+        # body so op calls on those caps emit a bare dispatch key
+        # (legacy name-keyed lookup) instead of the tagged form
+        # that requires a `kai_alias_<a>_id` C local that is not
+        # in scope here. Same boundary the rewrite-pass enforces
+        # in `rewrite_alias_clause`.
+        let st_clause_in = st_disable_alias_tag(st_resume)
+        let rb = synth(st_clause_in, body)
         let st_out0 = st_restore_entries(outer, rb.st)
         let st_out = st_set_clause_resume(st_out0, outer.clause_resume)
         # m12.8 Phase 4b followup: keep the typed body so the
@@ -21640,21 +23325,142 @@ fn synth_record_lit(st: InferState, nm: String, fis: [FieldInit], line: Int, col
   }
 }
 
+# issue #162: lower a `4.0<USD>` / `42<sec>`-style numeric UoM literal
+# into an inline `Decimal { raw, scale }` record-literal when the
+# surrounding context expects `Decimal<u>`. The rewrite is narrow on
+# purpose:
+#
+#   • Expected type must canonicalise to `Decimal<u_field>`.
+#   • Source AST must be `ELitUnit(EInt | EReal, u_lit)`.
+#   • Units must match (`unit_eq(u_lit, u_field)`); when they don't,
+#     we leave the original AST and let the regular unifier produce
+#     the unit-mismatch diagnostic at the call site.
+#
+# The lowering decodes the numeric value at compile time:
+#   • `n<u>`         → `Decimal { raw: n,  scale: 0 }`
+#   • `4.0<u>`       → `Decimal { raw: 4,  scale: 0 }` (the `%g`
+#     formatter strips trailing zeros, so the source-level scale-2
+#     intent is not preserved — see the `dec_lit` note in
+#     stdlib/decimal.kai for the same trade-off).
+#
+# Returns the rewritten Expr (typed as `Decimal<u_field>`) on a
+# match, the original expression untouched otherwise. The existing
+# unifier picks up from there: on success it sees equal types and
+# produces the empty substitution; on a unit mismatch (or any other
+# fall-through) it surfaces the same diagnostic it produced before
+# this lane landed.
+fn try_lower_decimal_uom_lit(value: Expr, expected: Ty) : Expr {
+  match expected {
+    TyDimT(TyCon("Decimal", _), u_field) -> match value.kind {
+      ELitUnit(inner, u_lit) ->
+        if unit_eq(u_lit, u_field) {
+          let target_ty = TyDimT(TyCon("Decimal", []), unit_canon(u_field))
+          match inner.kind {
+            EInt(n)  -> mk_decimal_record(n, 0, value.line, value.col, target_ty)
+            EReal(r) -> {
+              let parts = real_to_dec_parts(r)
+              mk_decimal_record(parts.raw, parts.scale, value.line, value.col, target_ty)
+            }
+            _ -> value
+          }
+        } else { value }
+      _ -> value
+    }
+    _ -> value
+  }
+}
+
+# Build the `Decimal { raw, scale }` record-literal AST node and
+# stamp it with the unit-decorated type. Unit info is erased at the
+# carrier level — this is the same pattern existing UoM literals
+# follow (`Real<USD>` is a TyDimT decoration over a plain Real).
+fn mk_decimal_record(raw: Int, scale: Int, line: Int, col: Int, ty: Ty) : Expr {
+  let raw_lit = mk_expr(EInt(raw), line, col)
+  let scale_lit = mk_expr(EInt(scale), line, col)
+  let fields = [FI("raw", raw_lit), FI("scale", scale_lit)]
+  with_ty(mk_expr(ERecordLit("Decimal", fields), line, col), ty)
+}
+
+# Decode an EReal value into the carrier's `(raw, scale)` parts via
+# the platform's `%g` formatter (re-using the same path the runtime
+# uses for `dec_parse`). `%g` strips trailing zeros, so a source
+# literal `4.00<USD>` lowers as `{ raw: 4, scale: 0 }` rather than
+# `{ raw: 400, scale: 2 }` — mathematically equivalent under
+# `dec_align`/`dec_eq`, lossy on stringification scale. A
+# scale-preserving variant is a follow-up that needs source-span
+# preservation on numeric literals.
+type DecParts = { raw: Int, scale: Int }
+
+fn real_to_dec_parts(r: Real) : DecParts {
+  let s = real_to_string(r)
+  let n = string_length(s)
+  let neg_check = match char_at(s, 0) { Some(c) -> c == '-' None -> false }
+  let body_start = if neg_check { 1 } else { 0 }
+  let dot = real_dec_find_dot(s, body_start, n)
+  if dot < 0 {
+    let mag = parse_decimal_or_zero(string_slice(s, body_start, n - body_start))
+    let signed = if neg_check { 0 - mag } else { mag }
+    DecParts { raw: signed, scale: 0 }
+  } else {
+    let int_str = string_slice(s, body_start, dot - body_start)
+    let frac_str = string_slice(s, dot + 1, n - dot - 1)
+    let frac_len = string_length(frac_str)
+    let int_mag = parse_decimal_or_zero(int_str)
+    let frac_v = parse_decimal_or_zero(frac_str)
+    let mag = int_mag * pow10_int(frac_len) + frac_v
+    let signed = if neg_check { 0 - mag } else { mag }
+    DecParts { raw: signed, scale: frac_len }
+  }
+}
+
+fn real_dec_find_dot(s: String, i: Int, n: Int) : Int {
+  if i >= n { 0 - 1 }
+  else { match char_at(s, i) {
+    None    -> 0 - 1
+    Some(c) -> if c == '.' { i } else { real_dec_find_dot(s, i + 1, n) }
+  } }
+}
+
+fn parse_decimal_or_zero(s: String) : Int =
+  match parse_decimal(s) { Some(v) -> v None -> 0 }
+
+fn pow10_int(n: Int) : Int =
+  if n <= 0 { 1 } else { pow10_int_loop(1, n) }
+
+fn pow10_int_loop(acc: Int, n: Int) : Int =
+  if n <= 0 { acc } else { pow10_int_loop(acc * 10, n - 1) }
+
+# Same rewrite, threading the resulting type back to the caller so
+# downstream unify sees equal types. Returned ty is the input
+# `value_ty` when no rewrite applies, otherwise the lowered
+# `Decimal<u>` shape.
+fn maybe_lower_decimal_lit(value: Expr, value_ty: Ty, expected: Ty) : ExprTy {
+  let rewritten = try_lower_decimal_uom_lit(value, expected)
+  let new_ty = match rewritten.ty { Some(t) -> t None -> value_ty }
+  ExprTy { expr: rewritten, ty: new_ty }
+}
+
+type ExprTy = { expr: Expr, ty: Ty }
+
 fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int, col: Int) : InferredFInits {
   match fis {
     [] -> InferredFInits { st: st, fis: [] }
     [fi, ...rest] -> match fi {
       FI(fnm, ex) -> {
         let r = synth(st, ex)
+        let lower_pair = match fty_find(fields, fnm) {
+          None -> ExprTy { expr: r.expr, ty: r.ty }
+          Some(ft) -> maybe_lower_decimal_lit(r.expr, r.ty, apply_ty(r.st.sub, ft))
+        }
         let s1 = match fty_find(fields, fnm) {
           None -> r.st
           Some(ft) -> {
             let what = string_concat("record field '", string_concat(fnm, "'"))
-            st_unify(r.st, ft, r.ty, what, line, col)
+            st_unify(r.st, ft, lower_pair.ty, what, line, col)
           }
         }
         let rr = synth_field_inits(s1, rest, fields, line, col)
-        InferredFInits { st: rr.st, fis: [FI(fnm, r.expr), ...rr.fis] }
+        InferredFInits { st: rr.st, fis: [FI(fnm, lower_pair.expr), ...rr.fis] }
       }
     }
   }
@@ -21698,19 +23504,27 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt {
   match stmt {
     SLet(pat, ann, rhs) -> {
       let rr = synth(st, rhs)
+      # issue #162: when the let binding is annotated `Decimal<u>` and
+      # the RHS is a UoM-literal `<u>`, lower it to a typed
+      # `Decimal { raw, scale }` carrier so the unifier sees equal
+      # types instead of a `Real<u>` vs `Decimal<u>` shape clash.
+      let lower_pair = match ann {
+        None -> ExprTy { expr: rr.expr, ty: rr.ty }
+        Some(te) -> maybe_lower_decimal_lit(rr.expr, rr.ty, apply_ty(rr.st.sub, resolve_ty(te)))
+      }
       let binding_st = match ann {
         None -> rr.st
         Some(te) -> {
           let declared = resolve_ty(te)
-          st_unify(rr.st, declared, rr.ty, "let annotation", pat.line, pat.col)
+          st_unify(rr.st, declared, lower_pair.ty, "let annotation", pat.line, pat.col)
         }
       }
       let binding_ty = match ann {
-        None -> rr.ty
+        None -> lower_pair.ty
         Some(te) -> resolve_ty(te)
       }
       let after = check_pattern(binding_st, pat, binding_ty)
-      OneStmt { st: after, stmt: SLet(pat, ann, rr.expr) }
+      OneStmt { st: after, stmt: SLet(pat, ann, lower_pair.expr) }
     }
     SAssert(cond, msg) -> {
       let rc = synth(st, cond)
@@ -36346,6 +38160,11 @@ type Mode
   # Debug-only; lets fixtures pin the walker output before the
   # unifier reshape consumes it.
   | MDumpIntervals
+  # Issue #83 sub-case 3: dump per-call-site contract elision report
+  # — `callee.param @line:col -> elided | runtime | loose(reason)`.
+  # Lets fixtures pin which call-sites the analysis discharges
+  # statically before any future codegen pass consumes it.
+  | MDumpCallElision
   # Issue #71 option (b): dump the brand registry collected by the
   # cap-binding nursery rewrite. For each minted brand id prints
   # the cap binder name and allocation site (file:line:col) plus
@@ -36412,6 +38231,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MDumpLastUse))
       } else if a == "--dump-intervals" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpIntervals))
+      } else if a == "--dump-call-elision" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpCallElision))
       } else if a == "--dump-brands" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpBrands))
       } else if a == "--holes" {
@@ -37551,6 +39372,10 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               MDumpIntervals -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_intervals(path, all_decls) }
+              }
+              MDumpCallElision -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_call_elision(path, all_decls) }
               }
               MDumpBrands -> {
                 # No type-check needed: the brand registry is collected
