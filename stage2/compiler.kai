@@ -2531,13 +2531,29 @@ fn parse_handle(p: Parser, t: Token) : PExpr {
                   err_e(p_error_here(p4, "expected `{` to start handler clauses"))
                 } else {
                   let p5 = p_skip_newlines(p_advance(p4))
-                  let cr = parse_handle_clauses(p5, [], None)
+                  let cr = parse_handle_clauses(p5, [], None, [])
                   match cr.r {
                     None -> err_e(cr.p)
-                    Some(_) -> ok_e(cr.p,
-                      mk_expr(EHandle(body, eff_name, eff_tyargs, init_r.r,
-                                       alias_r.r, cr.clauses, cr.return_clause),
-                              t.line, t.col))
+                    Some(_) -> {
+                      let handle_e = mk_expr(
+                        EHandle(body, eff_name, eff_tyargs, init_r.r,
+                                alias_r.r, cr.clauses, cr.return_clause),
+                        t.line, t.col)
+                      # m7b #5b extension (issue #148, Option A): a `var`
+                      # or `let` decl at the top of the clause list lifts
+                      # to a sibling block whose tail is the handler. The
+                      # existing `desugar_var_block` pass then converts
+                      # each `SVar` into a wrapping `with State[T] as
+                      # name` handler. When the prelude is empty we emit
+                      # the bare `EHandle` so handlers without `var` pay
+                      # no wrapping overhead.
+                      match cr.prelude {
+                        [] -> ok_e(cr.p, handle_e)
+                        _  -> ok_e(cr.p,
+                                mk_expr(EBlock(cr.prelude, Some(handle_e)),
+                                        t.line, t.col))
+                      }
+                    }
                   }
                 }
                 }
@@ -2605,54 +2621,94 @@ type PClauses = {
   p: Parser,
   clauses: [HClause],
   return_clause: Option[HReturn],
+  prelude: [Stmt],
   r: Option[Bool]
 }
 
-fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn]) : PClauses {
+# m7b #5b extension (issue #148, Option A): a `var` or `let` decl
+# may appear at the top of the clause list, before all operation
+# clauses. The parser collects them into a `prelude` and the
+# caller wraps the `EHandle` in an `EBlock(prelude, Some(EHandle))`.
+# The existing `desugar_var_block` pass then lifts each `SVar`
+# into a sibling `with State[T](init) as name` that wraps the
+# handler. Once an operation clause has been seen, any further
+# `var` / `let` is a parse error — the rule is "var/let must
+# precede all operation clauses inside one handler block."
+fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn], prelude: [Stmt]) : PClauses {
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
     PClauses { p: p_advance(p0), clauses: list_reverse(acc),
-               return_clause: rret, r: Some(true) }
+               return_clause: rret, prelude: list_reverse(prelude), r: Some(true) }
   } else {
     let id_t = p_peek(p0)
-    if not tk_is(id_t.kind, TkIdent) {
+    if tk_is(id_t.kind, TkVar) {
+      match acc {
+        [] -> {
+          let sr = parse_var(p0, id_t)
+          match sr.r {
+            None -> PClauses { p: sr.p, clauses: [], return_clause: None,
+                               prelude: [], r: None }
+            Some(s) -> parse_handle_clauses(sr.p, acc, rret, [s, ...prelude])
+          }
+        }
+        _ -> PClauses { p: p_error(p0, id_t,
+               "`var` and `let` must precede all operation clauses inside a handler"),
+               clauses: [], return_clause: None, prelude: [], r: None }
+      }
+    } else if tk_is(id_t.kind, TkLet) {
+      match acc {
+        [] -> {
+          let sr = parse_let(p0, id_t)
+          match sr.r {
+            None -> PClauses { p: sr.p, clauses: [], return_clause: None,
+                               prelude: [], r: None }
+            Some(s) -> parse_handle_clauses(sr.p, acc, rret, [s, ...prelude])
+          }
+        }
+        _ -> PClauses { p: p_error(p0, id_t,
+               "`var` and `let` must precede all operation clauses inside a handler"),
+               clauses: [], return_clause: None, prelude: [], r: None }
+      }
+    } else if not tk_is(id_t.kind, TkIdent) {
       PClauses { p: p_error(p0, id_t, "expected operation name in handler"),
-                 clauses: [], return_clause: None, r: None }
+                 clauses: [], return_clause: None, prelude: [], r: None }
     } else {
       let name = tok_source(p0.src, id_t)
       let p1 = p_advance(p0)
       if not p_at(p1, TkLparen) {
         PClauses { p: p_error_here(p1, "expected `(` after operation name"),
-                   clauses: [], return_clause: None, r: None }
+                   clauses: [], return_clause: None, prelude: [], r: None }
       } else {
         let p2 = p_skip_newlines(p_advance(p1))
         let params_r = parse_clause_params(p2, [])
         match params_r.r {
-          None -> PClauses { p: params_r.p, clauses: [], return_clause: None, r: None }
+          None -> PClauses { p: params_r.p, clauses: [], return_clause: None,
+                             prelude: [], r: None }
           Some(params) -> {
             let p3 = p_skip_newlines(params_r.p)
             if not p_at(p3, TkArrow) {
               PClauses { p: p_error_here(p3, "expected `->` after operation parameters"),
-                         clauses: [], return_clause: None, r: None }
+                         clauses: [], return_clause: None, prelude: [], r: None }
             } else {
               let p4 = p_skip_newlines(p_advance(p3))
               let rb = parse_expr(p4)
               match rb.r {
-                None -> PClauses { p: rb.p, clauses: [], return_clause: None, r: None }
+                None -> PClauses { p: rb.p, clauses: [], return_clause: None,
+                                   prelude: [], r: None }
                 Some(body) -> {
                   if name == "return" {
                     match params {
                       [pp] -> {
                         let hr = HR(pp.pname, body, id_t.line, id_t.col)
-                        parse_handle_clauses(rb.p, acc, Some(hr))
+                        parse_handle_clauses(rb.p, acc, Some(hr), prelude)
                       }
                       _ -> PClauses { p: p_error(p3, id_t,
                              "return clause takes exactly one parameter"),
-                             clauses: [], return_clause: None, r: None }
+                             clauses: [], return_clause: None, prelude: [], r: None }
                     }
                   } else {
                     let hc = HC(name, params, body, id_t.line, id_t.col)
-                    parse_handle_clauses(rb.p, [hc, ...acc], rret)
+                    parse_handle_clauses(rb.p, [hc, ...acc], rret, prelude)
                   }
                 }
               }
@@ -8759,13 +8815,38 @@ fn arms_all_literal_or_wild_loop(arms: [Arm]) : Bool {
   }
 }
 
+# Issue #91 — fast-path eligibility check for `PBind(name)`
+# catch-all arms. When the body of a PBind catch-all reads
+# `name` from inside a `#{...}` interp slot OR from inside a
+# captured ELambda body, the read site bypasses the unbox
+# pass's alias map and resolves to `kai_<name>` — but the
+# fast path only binds `kair_<name>`. Disqualify the whole
+# match in that case so it routes through the boxed path
+# (which always binds `kai_<name>`). Mirrors the R8 / lambda-
+# capture guards in `unbox_stmt` SLet.
+fn arms_pbind_safe_for_fast_path(arms: [Arm]) : Bool {
+  match arms {
+    [] -> true
+    [Arm(p, _, b), ...rest] -> {
+      let ok = match p.pkind {
+        PBind(nm) ->
+          not expr_has_interp_use(b, nm) and
+          not uses_have_in_lam(scan_uses_expr(b, false), nm)
+        _ -> true
+      }
+      if ok { arms_pbind_safe_for_fast_path(rest) } else { false }
+    }
+  }
+}
+
 fn pat_is_unboxable_lit_or_wild(p: Pattern) : Bool {
   match p.pkind {
     PWild     -> true
-    # PBind would require threading a new raw local through the
-    # body's lcs/env so EVar reads of it resolve to `kair_<name>`.
-    # Out of scope for M5 v1 — fall back to the boxed match path
-    # whenever a catch-all binds a name. Pure wildcard is fine.
+    # Issue #91 — PBind catch-all is now in the fast path. The
+    # unbox pass marks the body's EVar reads of the bound name as
+    # MUnboxed (see `unbox_arm_with_scr`); the C / LLVM emit
+    # binds `kair_<name>` in the default block before the body.
+    PBind(_)  -> true
     PLit(lit) -> match lit.kind {
       EInt(_)  -> true
       EBool(_) -> true
@@ -8800,12 +8881,12 @@ fn emit_match_switch(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: 
   let cty = raw_c_type(scrut.ty)
   concat_all([
     "({ ", cty, " _scr = ", raw, "; KaiValue *_r = kai_unit(); switch (_scr) {\n",
-    emit_switch_arms(src, arms, lcs, fns, variants, lams, cls, false),
+    emit_switch_arms(src, arms, cty, lcs, fns, variants, lams, cls, false),
     "} _r; })"
   ])
 }
 
-fn emit_switch_arms(src: String, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo], saw_default: Bool) : String {
+fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo], saw_default: Bool) : String {
   match arms {
     [] -> if saw_default { "" }
           else { "    default: kai_prelude_panic(kai_str(\"non-exhaustive match\")); break;\n" }
@@ -8818,12 +8899,23 @@ fn emit_switch_arms(src: String, arms: [Arm], lcs: [String], fns: [EFn], variant
         match p.pkind {
           PWild -> {
             let head = concat_all(["    default: _r = ", body_c, "; break;\n"])
-            cat2(head, emit_switch_arms(src, rest, lcs, fns, variants, lams, cls, true))
+            cat2(head, emit_switch_arms(src, rest, scr_cty, lcs, fns, variants, lams, cls, true))
+          }
+          # Issue #91 — `PBind(name)` catch-all binds the raw
+          # scalar `_scr` as `kair_<name>` for the body. Body
+          # EVar reads of `name` resolve raw via the env extension
+          # in `unbox_arm_with_scr`.
+          PBind(name) -> {
+            let head = concat_all([
+              "    default: { ", scr_cty, " kair_", name, " = _scr; _r = ",
+              body_c, "; } break;\n"
+            ])
+            cat2(head, emit_switch_arms(src, rest, scr_cty, lcs, fns, variants, lams, cls, true))
           }
           _ -> {
             # PLit literal arm.
             let head = concat_all(["    case ", pat_lit_raw(p), ": _r = ", body_c, "; break;\n"])
-            cat2(head, emit_switch_arms(src, rest, lcs, fns, variants, lams, cls, saw_default))
+            cat2(head, emit_switch_arms(src, rest, scr_cty, lcs, fns, variants, lams, cls, saw_default))
           }
         }
       }
@@ -8845,7 +8937,7 @@ fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], lcs: [String], fns: [E
   # boundary).
   match scrut.mode {
     MUnboxed -> {
-      if ty_is_integral_raw(scrut.ty) and arms_all_literal_or_wild(arms) {
+      if ty_is_integral_raw(scrut.ty) and arms_all_literal_or_wild(arms) and arms_pbind_safe_for_fast_path(arms) {
         emit_match_switch(src, scrut, arms, lcs, fns, variants, lams, cls)
       } else {
         emit_match_default(src, scrut, arms, lcs, fns, variants, lams, cls)
@@ -12686,7 +12778,15 @@ fn rewrite_alias_clause(c: HClause, m: AliasMap) : HClause {
       # shadow outer aliases inside the clause body.
       let names = map(ps, (pm) => pm.pname)
       let m1 = alias_map_remove_all(m, names)
-      HC(n, ps, rewrite_alias_expr(b, m1), l, co)
+      # Issue #148 (Option A): a clause body compiles to a separate
+      # C function, so any `kai_alias_<a>_id` declared in an outer
+      # `EHandle` prologue is out of scope here — same situation as
+      # a lambda body. Disable tag emission so cross-handler reads
+      # of an outer-bound capability fall back to the legacy
+      # name-keyed lookup. The bindings stay live so the
+      # `cap.op` → `Eff.op` substitution keeps working.
+      let m2 = alias_map_disable_tag(m1)
+      HC(n, ps, rewrite_alias_expr(b, m2), l, co)
     }
   }
 }
@@ -12706,7 +12806,11 @@ fn rewrite_alias_return(r: HReturn, m: AliasMap) : HReturn {
     # rewrite pass — only `p` is user-visible here).
     HR(p, b, l, c) -> {
       let m1 = alias_map_remove(m, p)
-      HR(p, rewrite_alias_expr(b, m1), l, c)
+      # Issue #148 (Option A): the return clause also compiles to a
+      # separate C function, so disable tag emission for the same
+      # cross-handler reason as `rewrite_alias_clause`.
+      let m2 = alias_map_disable_tag(m1)
+      HR(p, rewrite_alias_expr(b, m2), l, c)
     }
   }
 }
@@ -20382,7 +20486,12 @@ fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
                        "log", mono(sty))
           } else { env1 }
         let st1 = st_set_env(st, env2)
-        let rr = synth(st1, rexpr)
+        # Issue #148 (Option A): same alias-tag boundary as the
+        # op clauses — the return clause also compiles to a
+        # separate C function with no access to outer
+        # `kai_alias_<a>_id` C locals.
+        let st1_no_tag = st_disable_alias_tag(st1)
+        let rr = synth(st1_no_tag, rexpr)
         let st_out = st_restore_entries(outer, rr.st)
         let ty = apply_ty(st_out.sub, rr.ty)
         RetTyped { st: st_out, ty: ty, ret_opt: Some(HR(pname, rr.expr, line, col)) }
@@ -20437,7 +20546,18 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
             None -> st_env
           }
         } else { st_env }
-        let rb = synth(st_resume, body)
+        # Issue #148 (Option A): a clause body compiles to a
+        # separate C function and `filter_clause_captures` strips
+        # the `__alias_id__<a>` sentinels that would otherwise
+        # thread an outer-bound capability's handler id into the
+        # clause env. Disable alias tagging across the clause
+        # body so op calls on those caps emit a bare dispatch key
+        # (legacy name-keyed lookup) instead of the tagged form
+        # that requires a `kai_alias_<a>_id` C local that is not
+        # in scope here. Same boundary the rewrite-pass enforces
+        # in `rewrite_alias_clause`.
+        let st_clause_in = st_disable_alias_tag(st_resume)
+        let rb = synth(st_clause_in, body)
         let st_out0 = st_restore_entries(outer, rb.st)
         let st_out = st_set_clause_resume(st_out0, outer.clause_resume)
         # m12.8 Phase 4b followup: keep the typed body so the
@@ -25309,8 +25429,20 @@ fn unbox_kind(k: ExprKind, env: [LocBind]) : ExprKind {
     EUnop(op, x)         -> EUnop(op, unbox_expr(x, env))
     EIf(c, t_, eo)       -> EIf(unbox_expr(c, env), unbox_expr(t_, env),
                                  unbox_opt(eo, env))
-    EMatch(scr, arms)    -> EMatch(unbox_expr(scr, env),
-                                    map(arms, (a) => unbox_arm(a, env)))
+    EMatch(scr, arms)    -> {
+      # Issue #91 — PBind catch-all in the M5 fast path. When the
+      # scrutinee unboxes to a raw integral scalar, the emitter will
+      # take the `switch` fast path. A `PBind(name)` catch-all in
+      # that path stores the raw scrutinee as `kair_<name>`, so the
+      # body's EVar reads of `name` must be marked MUnboxed here —
+      # otherwise `decide_mode` falls back to MBoxed and the emit
+      # routes to a non-existent `kai_<name>`. Other arms (and
+      # boxed-scrut matches) keep the outer env unchanged.
+      let scr1 = unbox_expr(scr, env)
+      let raw_scr = ty_is_unboxable(scr1.ty) and ty_is_integral_raw(scr1.ty) and (match scr1.mode { MUnboxed -> true _ -> false })
+      EMatch(scr1,
+             map(arms, (a) => unbox_arm_with_scr(a, env, raw_scr)))
+    }
     # Closure boundary: free vars captured into the closure record
     # are always boxed (per Phase 2 non-goal table). The lambda's
     # own body sees no caller env — its locals are independent.
@@ -25433,6 +25565,31 @@ fn unbox_opt(opt: Option[Expr], env: [LocBind]) : Option[Expr] {
 fn unbox_arm(a: Arm, env: [LocBind]) : Arm {
   match a {
     Arm(p, g, b) -> Arm(p, unbox_opt(g, env), unbox_expr(b, env))
+  }
+}
+
+# Issue #91 — variant of `unbox_arm` that knows whether the
+# scrutinee is a raw integral. When the arm pattern is `PBind(nm)`
+# and the scrutinee is raw, extend the env with `LB(nm, MUnboxed)`
+# so EVar reads of `nm` in the body resolve to `kair_<nm>` (the
+# raw alias the C/LLVM fast path emits). The same R8 / lambda
+# capture guards used by `unbox_stmt` SLet apply here: a `nm`
+# reference inside a `#{...}` interp slot or inside a captured
+# ELambda body forces the binding to stay boxed, because those
+# read sites bypass this pass's alias map.
+fn unbox_arm_with_scr(a: Arm, env: [LocBind], raw_scr: Bool) : Arm {
+  match a {
+    Arm(p, g, b) -> {
+      let env_b = match p.pkind {
+        PBind(nm) -> {
+          if raw_scr and not expr_has_interp_use(b, nm) and not uses_have_in_lam(scan_uses_expr(b, false), nm) {
+            [LB(nm, MUnboxed), ...env]
+          } else { env }
+        }
+        _ -> env
+      }
+      Arm(p, unbox_opt(g, env), unbox_expr(b, env_b))
+    }
   }
 }
 
@@ -31084,13 +31241,15 @@ fn llvm_emit_match(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : L
   # The Real-unboxing extension excludes `double` because LLVM
   # `switch` requires an integer operand; a Real scrutinee re-boxes
   # at the boundary and routes through the generic match path.
-  # The PBind catch-all limitation from #91 carries over verbatim:
-  # `arms_all_literal_or_wild` rejects PBind at the catch-all spot,
-  # so a match that wants to bind the scrutinee falls into the
-  # boxed path.
+  # Issue #91 closed 2026-05-02: PBind catch-all is now in the
+  # fast path. `arms_all_literal_or_wild` accepts `PBind(name)`
+  # and `arms_pbind_safe_for_fast_path` filters bodies whose
+  # `name` reads cross an interp / lambda boundary. The default
+  # block pushes `LRaw(name, raw_reg, scr_ty)` so EVar reads of
+  # `name` inside the body resolve via `llvm_raw_local_find`.
   match scr.mode {
     MUnboxed -> {
-      if ty_is_integral_raw(scr.ty) and arms_all_literal_or_wild(arms) {
+      if ty_is_integral_raw(scr.ty) and arms_all_literal_or_wild(arms) and arms_pbind_safe_for_fast_path(arms) {
         llvm_emit_match_switch(e, scr, arms, line, col)
       } else {
         llvm_emit_match_default(e, scr, arms, line, col)
@@ -31170,9 +31329,20 @@ fn llvm_emit_match_switch(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: I
   let case_emit = llvm_emit_switch_case_bodies(e1, coll.cases_to_emit, end_lbl.reg, [])
   let e_dflt = llvm_open_block(case_emit.st, dflt_lbl.reg)
   let dflt_done = match coll.default_arm {
-    Some(body) -> {
+    Some(sd) -> match sd { SD(body, opt_name) -> {
       let outer_locals = e_dflt.locals
-      let eb = llvm_emit_expr(e_dflt, body)
+      # Issue #91 — PBind catch-all: bind the raw scrutinee
+      # register as a raw local before emitting the body, so
+      # `EVar(name)` reads inside the body resolve to `raw.reg`
+      # via `llvm_raw_local_find`. The locals stack is restored
+      # to `outer_locals` after the body emit, matching how
+      # arm-local scope is unwound for literal arms.
+      let scr_raw_ty = match scr.ty { Some(t) -> t None -> TyInt }
+      let e_pre = match opt_name {
+        Some(nm) -> llvm_push_raw_local(e_dflt, nm, raw.reg, scr_raw_ty)
+        None     -> e_dflt
+      }
+      let eb = llvm_emit_expr(e_pre, body)
       let body_val = eb.last_val
       let body_end = eb.cur_label
       let e_br = llvm_append_body(eb, concat_all(["  br label %", end_lbl.reg, "\n"]))
@@ -31183,7 +31353,7 @@ fn llvm_emit_match_switch(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: I
         lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls
       }
       LlvmSD { st: e_scoped, entries: [AE(body_val, body_end), ...case_emit.entries] }
-    }
+    } }
     None -> {
       # No wildcard — panic in the default block.
       let msg = concat_all([
@@ -31226,16 +31396,21 @@ fn llvm_emit_match_switch(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: I
 # block; `body` is the arm's body Expr.
 type SwCase = SC(String, String, Expr)
 
-type SwCollect = { st: LlvmEmit, cases_to_emit: [SwCase], default_arm: Option[Expr] }
+# Issue #91 — the default arm carries an optional binder name. When
+# present, the LLVM fast path pushes the raw scrutinee register as
+# `LRaw(name, raw_reg, ty)` before emitting the default body.
+type SwDefault = SD(Expr, Option[String])
+
+type SwCollect = { st: LlvmEmit, cases_to_emit: [SwCase], default_arm: Option[SwDefault] }
 type SwBodies = { st: LlvmEmit, entries: [LlvmArmEntry] }
 type LlvmSD = { st: LlvmEmit, entries: [LlvmArmEntry] }
 
 # Walk the arms once, allocating a fresh case label per literal
 # arm and capturing the (lit, label, body) triple. The first
-# wildcard becomes the default; later wildcards are unreachable
-# (pattern coverage rejects them upstream).
+# wildcard or PBind becomes the default; later catch-alls are
+# unreachable (pattern coverage rejects them upstream).
 fn llvm_collect_switch_cases(e: LlvmEmit, arms: [Arm],
-                               cases_acc: [SwCase], default_acc: Option[Expr]) : SwCollect {
+                               cases_acc: [SwCase], default_acc: Option[SwDefault]) : SwCollect {
   match arms {
     [] -> SwCollect { st: e, cases_to_emit: list_reverse(cases_acc), default_arm: default_acc }
     [a, ...rest] -> match a {
@@ -31243,7 +31418,17 @@ fn llvm_collect_switch_cases(e: LlvmEmit, arms: [Arm],
         PWild -> {
           let next_default = match default_acc {
             Some(_) -> default_acc
-            None    -> Some(body)
+            None    -> Some(SD(body, None))
+          }
+          llvm_collect_switch_cases(e, rest, cases_acc, next_default)
+        }
+        # Issue #91 — PBind catch-all. Same default-slot semantics
+        # as PWild; the binder name rides along so the body emit
+        # can push it as a raw local.
+        PBind(name) -> {
+          let next_default = match default_acc {
+            Some(_) -> default_acc
+            None    -> Some(SD(body, Some(name)))
           }
           llvm_collect_switch_cases(e, rest, cases_acc, next_default)
         }
