@@ -2886,18 +2886,75 @@ fn parse_paren_or_lambda(p: Parser, t: Token) : PExpr {
         }
       }
       None -> {
-        # Fall back to `( expr )`.
+        # Fall back to `( expr )` or `( a, b, ... )` n-tuple sugar (#154).
         let r = parse_expr(p1)
         match r.r {
           None -> err_e(r.p)
           Some(e) -> {
             let p2 = p_skip_newlines(r.p)
             if p_at(p2, TkRparen) { ok_e(p_advance(p2), e) }
+            else if p_at(p2, TkComma) {
+              # n-tuple expression sugar: (a, b) => Pair { fst: a, snd: b },
+              # (a, b, c) => Triple { ... }, (a, b, c, d) => Quad { ... }.
+              # N capped at 4 — wider products should be a named record.
+              parse_tuple_expr_rest(p_skip_newlines(p_advance(p2)), [e], t)
+            }
             else { err_e(p_error_here(p2, "expected `)` after expression")) }
           }
         }
       }
     }
+  }
+}
+
+# n-tuple expression sugar (#154). Called once the leading expr and a
+# trailing `,` have been consumed. Accumulates further comma-separated
+# exprs (in reverse) until `)`. On close, desugars to a record literal
+# of the appropriate stdlib type (Pair / Triple / Quad). Arity > 4 is
+# rejected with a diagnostic naming the cap.
+fn parse_tuple_expr_rest(p: Parser, acc: [Expr], t: Token) : PExpr {
+  let r = parse_expr(p)
+  match r.r {
+    None -> err_e(r.p)
+    Some(e) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_tuple_expr_rest(p_skip_newlines(p_advance(p1)), [e, ...acc], t)
+      } else if p_at(p1, TkRparen) {
+        let elems = list_reverse([e, ...acc])
+        let p2 = p_advance(p1)
+        match tuple_type_for_arity(list_length(elems)) {
+          None -> err_e(p_error_here(p1, "n-tuple sugar supports arity 2..4 only — use a named record for wider products"))
+          Some(name) -> ok_e(p2, mk_expr(ERecordLit(name, build_tuple_field_inits(elems, 0, [])), t.line, t.col))
+        }
+      } else {
+        err_e(p_error_here(p1, "expected `,` or `)` in tuple expression"))
+      }
+    }
+  }
+}
+
+# Map arity → stdlib tuple type name. `None` for unsupported arities.
+fn tuple_type_for_arity(n: Int) : Option[String] {
+  if n == 2 { Some("Pair") }
+  else if n == 3 { Some("Triple") }
+  else if n == 4 { Some("Quad") }
+  else { None }
+}
+
+# Map positional index → tuple field name. Same convention across
+# Pair / Triple / Quad: fst, snd, trd, frt.
+fn tuple_field_name(i: Int) : String {
+  if i == 0 { "fst" }
+  else if i == 1 { "snd" }
+  else if i == 2 { "trd" }
+  else { "frt" }
+}
+
+fn build_tuple_field_inits(elems: [Expr], i: Int, acc: [FieldInit]) : [FieldInit] {
+  match elems {
+    [] -> list_reverse(acc)
+    [e, ...rest] -> build_tuple_field_inits(rest, i + 1, [FI(tuple_field_name(i), e), ...acc])
   }
 }
 
@@ -3792,6 +3849,14 @@ fn parse_pattern_rest(p: Parser, t: Token) : PPat {
     }
   } else if tk_is(t.kind, TkLbracket) {
     parse_list_pattern(p, t)
+  } else if tk_is(t.kind, TkLparen) {
+    # n-tuple pattern sugar (#154). `(a, b)` desugars to a record
+    # pattern matching the corresponding stdlib type — `Pair` for
+    # arity 2, `Triple` for 3, `Quad` for 4. Single-element parens
+    # `(p)` are grouping (returns `p` unchanged); zero-element `()`
+    # is reserved for the unit pattern (rejected here as a parse
+    # error to keep the surface small until a use case appears).
+    parse_tuple_pattern(p, t)
   } else if tk_is(t.kind, TkLbrace) {
     # m7d §28: anonymous record pattern. `{ fst, snd }` (with field
     # punning) or `{ fst: a, snd: b }`. The typer + bind_pat +
@@ -3849,6 +3914,63 @@ fn parse_list_pattern_loop(p: Parser, acc: [Pattern], rest: Option[String], t: T
         }
       }
     }
+  }
+}
+
+# n-tuple pattern sugar (#154). Mirrors parse_tuple_expr_rest: starts
+# with `(`, parses N≥2 comma-separated sub-patterns, closes with `)`,
+# desugars to a `PVariantRecord` of the corresponding stdlib type
+# (`Pair` / `Triple` / `Quad`). Single-paren `(p)` is grouping —
+# returns the inner pattern unchanged. Empty `()` is rejected.
+fn parse_tuple_pattern(p: Parser, t: Token) : PPat {
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRparen) {
+    err_p(p_error_here(p1, "empty tuple pattern `()` not supported"))
+  } else {
+    let r = parse_pattern(p1)
+    match r.r {
+      None -> err_p(r.p)
+      Some(first) -> {
+        let p2 = p_skip_newlines(r.p)
+        if p_at(p2, TkRparen) {
+          # Single-pattern parens: grouping.
+          ok_p(p_advance(p2), first)
+        } else if p_at(p2, TkComma) {
+          parse_tuple_pattern_rest(p_skip_newlines(p_advance(p2)), [first], t)
+        } else {
+          err_p(p_error_here(p2, "expected `,` or `)` in tuple pattern"))
+        }
+      }
+    }
+  }
+}
+
+fn parse_tuple_pattern_rest(p: Parser, acc: [Pattern], t: Token) : PPat {
+  let r = parse_pattern(p)
+  match r.r {
+    None -> err_p(r.p)
+    Some(pat) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_tuple_pattern_rest(p_skip_newlines(p_advance(p1)), [pat, ...acc], t)
+      } else if p_at(p1, TkRparen) {
+        let pats = list_reverse([pat, ...acc])
+        let p2 = p_advance(p1)
+        match tuple_type_for_arity(list_length(pats)) {
+          None -> err_p(p_error_here(p1, "n-tuple sugar supports arity 2..4 only — use a named record for wider products"))
+          Some(name) -> ok_p(p2, mk_pat(PVariantRecord(name, build_tuple_pfields(pats, 0, [])), t.line, t.col))
+        }
+      } else {
+        err_p(p_error_here(p1, "expected `,` or `)` in tuple pattern"))
+      }
+    }
+  }
+}
+
+fn build_tuple_pfields(pats: [Pattern], i: Int, acc: [PField]) : [PField] {
+  match pats {
+    [] -> list_reverse(acc)
+    [pat, ...rest] -> build_tuple_pfields(rest, i + 1, [PField(tuple_field_name(i), pat, false), ...acc])
   }
 }
 
@@ -4250,6 +4372,13 @@ fn parse_fn_type(p: Parser, t: Token) : PTy {
   }
 }
 
+# Function-type args OR n-tuple type sugar (#154). The disambiguation
+# is local: parse a comma-separated list of types until `)`. If `->`
+# follows, it's a function type. Otherwise it's a tuple type and we
+# desugar to `Pair[A, B]` / `Triple[A, B, C]` / `Quad[A, B, C, D]`.
+# A single type in parens (`(A)`) followed by no `->` is grouping —
+# returns the inner type unchanged. Zero-arg `()` keeps the existing
+# function-type contract (handled in parse_fn_type, must be `() -> T`).
 fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy {
   let r = parse_type(p)
   match r.r {
@@ -4260,9 +4389,7 @@ fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy {
         parse_fn_type_args(p_skip_newlines(p_advance(p1)), [arg, ...acc], t)
       } else if p_at(p1, TkRparen) {
         let p2 = p_advance(p1)
-        if not p_at(p2, TkArrow) {
-          err_t(p_error_here(p2, "expected `->` in function type"))
-        } else {
+        if p_at(p2, TkArrow) {
           let rr = parse_type(p_advance(p2))
           match rr.r {
             None -> err_t(rr.p)
@@ -4271,9 +4398,22 @@ fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy {
               ok_t(row_r.p, mk_ty(TyFn(list_reverse([arg, ...acc]), ret, row_r.r), t.line, t.col))
             }
           }
+        } else {
+          # Not a function type: re-interpret as tuple-type sugar or grouping.
+          let args = list_reverse([arg, ...acc])
+          let n = list_length(args)
+          if n == 1 {
+            # Single type in parens: grouping. `(A)` ≡ `A`.
+            ok_t(p2, arg)
+          } else {
+            match tuple_type_for_arity(n) {
+              None -> err_t(p_error_here(p1, "n-tuple type sugar supports arity 2..4 only — use a named record for wider products"))
+              Some(name) -> ok_t(p2, mk_ty(TyName(name, args), t.line, t.col))
+            }
+          }
         }
       } else {
-        err_t(p_error_here(p1, "expected `,` or `)` in function type args"))
+        err_t(p_error_here(p1, "expected `,` or `)` in type"))
       }
     }
   }
