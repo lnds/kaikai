@@ -578,6 +578,32 @@ Clojure protocols + Elixir protocols support: **single dispatch by
 type tag, with explicit declaration, on a closed set of impls per
 compilation unit**.
 
+### Interaction with union types (issue #187)
+
+`impl P for U` where `U` is a union (`type U = A | B | C`) is **not
+allowed in v1**. Single-dispatch resolves on a head type tag; a
+union has no single head. Implement `P` for each component
+separately, and narrow at the call site:
+
+```kai
+type IdentityError = AccountNotFound | KycExpired
+type AuthError     = InsufficientBalance | OverDailyLimit
+type QueryErr      = IdentityError | AuthError
+
+impl Show for IdentityError { ... }
+impl Show for AuthError     { ... }
+
+fn render(err: QueryErr) : String = match err {
+  ie : IdentityError -> show(ie)     # dispatches on IdentityError
+  ae : AuthError     -> show(ae)     # dispatches on AuthError
+}
+```
+
+A future `impl P for U` semantics that walks each variant of each
+component is conceivable but not proposed; v1 keeps unions and
+protocols orthogonal. See `docs/unions-design.md` *With protocols*
+and `docs/unions.md` *Out of scope (v1)* for the rationale.
+
 ## Multi-method dispatch — analysis
 
 A real fintech / domain-modeling target (ahu Q3) raises the question:
