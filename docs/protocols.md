@@ -164,7 +164,10 @@ imported. No global registry.
 - **No multi-method dispatch**: dispatch always uses `Self` (the
   first-position type). For two-arg dispatch (e.g. `convert(from:
   T, to: U)`), the user writes a free function and dispatches manually
-  via match.
+  via match. **However**, single-dispatch *parametrized* protocols
+  (`protocol P[A] { ... }`) cover the most common multi-type use
+  cases without violating single-dispatch — see §*Multi-method
+  dispatch — analysis* below.
 
 - **No overlapping impls**: the orphan rule plus single-impl coherence
   rules out the situation Haskell `OverlappingInstances` has to handle.
@@ -574,6 +577,188 @@ What kaikai protocols **do** support is exactly what Go interfaces +
 Clojure protocols + Elixir protocols support: **single dispatch by
 type tag, with explicit declaration, on a closed set of impls per
 compilation unit**.
+
+## Multi-method dispatch — analysis
+
+A real fintech / domain-modeling target (ahu Q3) raises the question:
+how does kaikai handle dispatch by more than one type? Currency
+conversion (`USD → EUR`), wire format encoding (`(Entity, FixMsg)`),
+context-sensitive serialization, cross-type validation — all involve
+two or more types in the dispatch decision.
+
+This section documents the analysis. **kaikai chose B** (single-
+dispatch parametrized) over **C** (multi-method dispatch real). The
+reasoning is preserved here so future contributors and downstream
+framework authors (`ahu`, `kohau`, `henua`, `manutara`) can match a
+concrete case to a proposal rather than re-derive the catalog.
+
+### The four alternatives
+
+#### A. Status quo — free functions
+
+Every conversion / cross-type operation is a free function with a
+naming convention (`money_usd_to_eur`, `decode_fix_to_transaction`).
+No dispatch.
+
+- **Pros**: zero language cost. Predictable. Already works.
+- **Cons**: zero discoverability. `O(N²)` explosion when many
+  type pairs are involved. No polymorphism.
+- **When right**: small, fixed sets of conversions.
+
+#### B. Single-dispatch parametrized — `protocol P[A]` (chosen)
+
+```kai
+protocol From[A] {
+  fn from(a: A) : Self
+}
+
+impl From[Money[USD]] for Money[EUR] { ... }
+impl From[Money[EUR]] for Money[USD] { ... }
+
+let eur : Money[EUR] = from(my_usd)   # Self resolved by annotation
+```
+
+The protocol carries a type parameter `A` alongside the implicit
+`Self`. Dispatch remains single-dispatch by `Self`. `A` is
+monomorphized at impl-site. Vtable layout `(P, Self) -> fn`
+unchanged.
+
+- **Pros**: covers fintech cases 1, 3, 4, 5 (currency conversion,
+  wire format decode, context-sensitive serialization, cross-type
+  validation). No vtable change, no orphan-rule complication.
+  Bidirectional inference at the call site (same machinery typed
+  holes use). Precedent: Rust `From<A> for B`.
+- **Cons**: requires call-site annotation when `Self` is not
+  determined by the arguments. Syntactically asymmetric for
+  bidirectional cases (two impls `From[USD] for EUR` and
+  `From[EUR] for USD`).
+- **When right**: most fintech use cases. The chosen path.
+
+Implementation tracked in **issue #180**.
+
+#### C. Multi-method dispatch — `protocol P { op(a: A, b: B) }` real
+
+```kai
+protocol Convert[From, To] {
+  convert(x: From) : To
+}
+
+impl Convert[Money[USD], Money[EUR]] { fn convert(m) = ... }
+```
+
+The vtable is keyed by `(P, T1, T2)`. Lookup is `O(1)` but the
+table grows with the cross-product of type pairs.
+
+- **Pros**: mathematically correct for multi-type dispatch. Covers
+  truly bidirectional comparators (`cmp(USD, EUR)` and `cmp(EUR,
+  USD)` as one mechanism, not two impls).
+- **Cons**:
+  - Breaks "single-dispatch by `Self`" — Tier 1 #3 commit.
+  - Orphan rule generalises poorly: who owns `Convert[USD, EUR]`?
+    The USD module, the EUR module, neither?
+  - Resolution complexity grows with parametrized types
+    (`impl Convert[Money[USD], Money[EUR]]` vs `impl
+    Convert[Money[u], Money[v]]` ambiguity).
+  - Dispatch by-value-of-arbitrary-fn (Clojure's actual strength)
+    requires runtime dispatch tables, not vtables.
+- **When right**: domains where every operation depends on multiple
+  types symmetrically. Empirically rare — see §*Why not C* below.
+
+#### D. Convention + helper — manual dispatch with type witness
+
+```kai
+fn convert[A, B](x: A, target: TypeOf[B]) : B = match (x, target) {
+  ...
+}
+```
+
+Equivalent to A but with a runtime type witness. Adds nothing
+over A.
+
+- **Pros**: none over A.
+- **Cons**: hides the dispatch in a switch.
+- **When right**: never.
+
+### Why not C — empirical evidence from Clojure
+
+Clojure has both single-dispatch protocols (which kaikai's m12.8
+imitated) and multimethods (`defmulti` / `defmethod` with arbitrary
+dispatch functions). Fifteen years of community practice show six
+dominant use cases for multimethods:
+
+| Domain | Multi-dispatch genuinely needed? | kaikai covers with B + sum types? |
+|---|---|---|
+| 1. Event-driven / state machines | partial — by value, not by type | yes, exhaustive pattern matching |
+| 2. Polymorphic serialization (per-context) | partial | partial — B covers, not extensible post-hoc |
+| 3. Compiler / AST passes | no — closed sum type | yes, pattern matching is superior |
+| 4. Math / unit conversion | no — UoM is type-level | yes, UoM (m12.5) + B |
+| 5. Visitor / tree transforms | no | yes, pattern matching |
+| 6. Plugin extensibility | partial — open-world dispatch | partial with B (orphan-rule-bounded) |
+
+Four of six dominant Clojure-multimethod patterns are **better
+covered** by kaikai's existing pattern matching + sum types. The
+remaining two are **adequately covered** by B with a small
+ergonomic gap.
+
+The genuinely irreducible case where C wins over B is **dispatch by
+runtime value (not type) extensible post-hoc** — and that is
+expressible in kaikai with `Map[K, V]` + first-class functions
+(`Map.from_pairs([(Compact, ser_compact), ...])`), not a language
+feature.
+
+### Why C costs more than it gains for kaikai
+
+Even setting aside Tier 1 #3, C carries technical costs that B
+avoids:
+
+1. **Vtable layout change.** From `(P, Self) -> fn` to `(P, T1,
+   T2, ..., Tn) -> fn`. The lookup is still `O(1)` by hash, but
+   every caller site needs to compute an n-tuple key. Not free.
+2. **Orphan rule generalises poorly.** With single-arg dispatch,
+   `impl P for T` is allowed when `P` or `T` is local. With
+   multi-arg dispatch, "local" must extend to "at least one of P,
+   T1, T2, ... is local" — and that breaks the cleanest version
+   of the rule (any of the participants gives ownership). Two
+   third-party libraries can both legitimately claim ownership of
+   `Convert[A, B]` if they own `A` and `B` respectively.
+3. **Resolution with parametrized types becomes ambiguous.** `impl
+   Convert[Money[USD], Money[EUR]]` and `impl Convert[Money[u],
+   Money[v]]` both apply to a call `convert(usd_amount, eur_amount)`.
+   The "most specific" rule (Haskell's `OverlappingInstances`,
+   Julia's method ambiguity) is exactly the complexity kaikai
+   chose to avoid in m12.8.
+4. **Code navigation cost.** "Which impl runs at this call?"
+   becomes harder when the answer depends on the cross-product of
+   inferred types at the call site. LSP / `kai type --json`
+   queries become more expensive.
+
+### When C should be reopened
+
+Reopen the multi-method discussion **only when** a concrete kaikai
+or downstream-framework use case shows that B + sum types + pattern
+matching is genuinely insufficient. Specifically:
+
+- A documented fintech (or other domain) operation that has no
+  clean expression as `protocol P[A]` with `A` resolved by
+  bidirectional inference.
+- A documented case where dispatch must depend on two or more
+  *open-world* type sets simultaneously (third-party library
+  authors extending in both directions independently).
+- Performance evidence that B's per-conversion impl explosion
+  dominates compile time or binary size.
+
+Until one of these manifests, C remains rejected. B (issue #180) is
+the path forward.
+
+### Cross-references
+
+- **Issue #180** — implementation of B (`protocol P[A]`,
+  bidirectional inference at call site, fintech Q3 motivation).
+- **Issue #174** — polymorphic-impl runtime panic. Affects B's
+  impls whose body dispatches on `A`. May need to land first.
+- **m12.5 UoM** — covers cases where the multi-type dispatch is at
+  the *value-arithmetic* level (`Decimal<USD> + Decimal<USD>` vs
+  `Decimal<USD> + Decimal<EUR>`).
 
 ## Implementation cost
 
