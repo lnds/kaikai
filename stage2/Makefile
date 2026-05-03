@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-http-client-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-loop test-time test-intervals test-stdlib test-http-client-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan selfhost
 
 all: $(TARGET)
 
@@ -574,6 +574,44 @@ test-signal-trap-asan: $(TARGET) build
 	  diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
 	    && echo "signal-trap-asan OK $$name" \
 	    || { echo "signal-trap-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	done
+
+# Issue #141 — ASAN+UBSan sibling for the Log default-handler
+# fixture. The default handler chains `clock_gettime` +
+# `gmtime_r` + `strftime` + `fputs(stderr)` + `fflush(stderr)` per
+# call; ASan catches a UAF on the message KaiValue's `as.s.bytes`
+# (e.g. a botched consume edit elsewhere returning a dropped
+# string into the op call), and UBSan catches signed-overflow /
+# misaligned-load regressions in the strftime path. Wired into
+# the top-level `tier1-asan` rule so it runs alongside the
+# trace-asan and signal-trap-asan gates.
+LOG_DEFAULT_FIXTURES := issue_141_log_default
+
+test-log-asan: $(TARGET) build
+	@set -e; \
+	for name in $(LOG_DEFAULT_FIXTURES); do \
+	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
+	    echo "log-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
+	    || { echo "log-asan FAIL $$name (stdout mismatch)"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	  grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\] DEBUG default-d$$' build/$$name-asan.err \
+	    || { echo "log-asan FAIL $$name (DEBUG line missing or malformed)"; cat build/$$name-asan.err; exit 1; }; \
+	  grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\] INFO  default-i$$' build/$$name-asan.err \
+	    || { echo "log-asan FAIL $$name (INFO line missing or malformed)"; cat build/$$name-asan.err; exit 1; }; \
+	  grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\] WARN  default-w$$' build/$$name-asan.err \
+	    || { echo "log-asan FAIL $$name (WARN line missing or malformed)"; cat build/$$name-asan.err; exit 1; }; \
+	  grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\] ERROR default-e$$' build/$$name-asan.err \
+	    || { echo "log-asan FAIL $$name (ERROR line missing or malformed)"; cat build/$$name-asan.err; exit 1; }; \
+	  echo "log-asan OK $$name"; \
 	done
 
 # Issue #103 — ASAN+UBSan sibling for the trap-exit / outer Cancel
@@ -1835,6 +1873,27 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Process.start + wait: /bin/echo hello → Exited(0))" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/issue_141_log_default.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.stderr \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.stderr; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    || { echo "effects FAIL $$name (stdout mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	  grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\] DEBUG default-d$$' build/s2-$$name.stderr \
+	    || { echo "effects FAIL $$name (DEBUG line missing or malformed)"; cat build/s2-$$name.stderr; exit 1; }; \
+	  grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\] INFO  default-i$$' build/s2-$$name.stderr \
+	    || { echo "effects FAIL $$name (INFO line missing or malformed)"; cat build/s2-$$name.stderr; exit 1; }; \
+	  grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\] WARN  default-w$$' build/s2-$$name.stderr \
+	    || { echo "effects FAIL $$name (WARN line missing or malformed)"; cat build/s2-$$name.stderr; exit 1; }; \
+	  grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\] ERROR default-e$$' build/s2-$$name.stderr \
+	    || { echo "effects FAIL $$name (ERROR line missing or malformed)"; cat build/s2-$$name.stderr; exit 1; }; \
+	  echo "effects OK $$name (issue #141: default Log handler → ISO 8601 + level + msg on stderr, all 4 levels)"; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,
