@@ -67,6 +67,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 
 /* Apple deprecated ucontext in macOS 10.6 (POSIX-2008 obsoletion).
  * The functions still work; the deprecation attribute on the
@@ -3298,6 +3299,237 @@ static KaiValue *kai_default_signal_await(void *self, KaiCont *k) {
             if (v) return kai_cont_resume(k, v);
         }
     }
+}
+
+/* =================================================================
+ * Process effect — issue #126. POSIX subprocess primitives.
+ *
+ * Shape (v1):
+ *   start(cmd, args)  : Child                       -- fork + execvp
+ *   wait(c)           : Result[Exit, String]        -- waitpid blocking
+ *   kill(c, sig: Int) : Result[Unit, String]        -- kill(2)
+ *   exit(code)        : Nothing                     -- _exit(2)
+ *
+ * `Child = { pid: Int }` and `Exit = Exited(Int) | Signaled(Int)`
+ * are declared by the compiler's `builtin_child_decl` /
+ * `builtin_exit_decl` (stage2/compiler.kai) and minted here by
+ * name, same convention as Conn / Listener for NetTcp.
+ *
+ * Divergences from docs/effects-stdlib.md §Process pinned in the
+ * compiler's `builtin_process_decl` comment:
+ *   1. start returns Child, not Result[Child, String]. fork/exec
+ *      failure surfaces through `kai_panic`, matching the
+ *      "primitive failure" convention used elsewhere in the runtime.
+ *   2. kill takes a raw signo Int rather than the issue #107 Sig
+ *      sum type — kill needs the full POSIX signal set including
+ *      SIGKILL, which Sig deliberately excludes.
+ *
+ * v1 limitations (mirrored in docs/effects-stdlib.md §Process
+ * *What's not in v1*):
+ *   - POSIX only. Windows / WASM out of scope.
+ *   - All ops blocking; the inline-eager scheduler (m8 v1) parks the
+ *     OS thread inside waitpid. Reactor-driven cancellation-aware
+ *     wait (the `wait_or_kill` shape) lands with m8.x.
+ *   - No stdio pipe plumbing. `pipe_stdout` / `pipe_stdin` and the
+ *     surface helpers (wait_or_kill, signal) live in the follow-up
+ *     `stdlib/os/process.kai` lane on top of these four ops.
+ *   - SIGCHLD handling is implicit through blocking waitpid; the
+ *     Signal effect intentionally omits SIGCHLD per its catalog
+ *     comment so the two effects don't fight over the disposition.
+ */
+
+/* Build a Child record `{ pid: Int }`. The "pid" field name is
+ * load-bearing — `_kai_process_record_pid` reads the slot by
+ * strcmp on the name pointer's contents, in lockstep with
+ * `builtin_child_decl` in stage2/compiler.kai. */
+static KaiValue *_kai_process_make_child(int pid) {
+    KaiValue *pid_kv = kai_int((int64_t) pid);
+    KaiValue *fields[1] = { pid_kv };
+    static const char *names[1] = { "pid" };
+    return kai_record(1, fields, names);
+}
+
+/* Pull the `pid` slot out of a Child record. Returns -1 on shape
+ * mismatch — the caller surfaces that as an error path; v1 trusts
+ * the typer to keep this honest in normal flows. */
+static int _kai_process_record_pid(KaiValue *v) {
+    if (!v || v->tag != KAI_RECORD) return -1;
+    for (int i = 0; i < v->as.rec.n_fields; ++i) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "pid") == 0) {
+            KaiValue *f = v->as.rec.fields[i];
+            if (!f || f->tag != KAI_INT) return -1;
+            return (int) f->as.i;
+        }
+    }
+    return -1;
+}
+
+/* Mint Exited(code) / Signaled(signo) — variant *names* are the
+ * runtime contract with `builtin_exit_decl`. */
+static KaiValue *_kai_process_make_exit_exited(int code) {
+    KaiValue *n = kai_int((int64_t) code);
+    return kai_variant(0, "Exited", 1, &n);
+}
+
+static KaiValue *_kai_process_make_exit_signaled(int signo) {
+    KaiValue *n = kai_int((int64_t) signo);
+    return kai_variant(1, "Signaled", 1, &n);
+}
+
+static KaiValue *_kai_process_err(KaiCont *k, int saved_errno) {
+    const char *msg = strerror(saved_errno);
+    if (!msg) msg = "unknown error";
+    KaiValue *m = kai_str(msg);
+    KaiValue *err = kai_variant(0, "Err", 1, &m);
+    return kai_cont_resume(k, err);
+}
+
+/* Walk a [String] cons list once to count entries, then again to
+ * copy the C strings into a NULL-terminated argv vector. The
+ * vector and its element copies are owned by the caller and freed
+ * after execvp returns / does not return. argv[0] is `cmd`; the
+ * supplied `args` list fills argv[1..n]. */
+static char **_kai_process_build_argv(const char *cmd, KaiValue *args, int *out_n) {
+    int n = 1;  /* slot 0 is cmd */
+    for (KaiValue *p = args; p && p->tag == KAI_CONS; p = p->as.cons.tail) ++n;
+    char **argv = (char **) malloc(((size_t) n + 1) * sizeof(char *));
+    if (!argv) return NULL;
+    argv[0] = strdup(cmd ? cmd : "");
+    int i = 1;
+    for (KaiValue *p = args; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+        KaiValue *h = p->as.cons.head;
+        if (h && h->tag == KAI_STR) {
+            argv[i] = strdup(h->as.s.bytes ? h->as.s.bytes : "");
+        } else {
+            argv[i] = strdup("");
+        }
+        ++i;
+    }
+    argv[n] = NULL;
+    *out_n = n;
+    return argv;
+}
+
+static void _kai_process_free_argv(char **argv, int n) {
+    if (!argv) return;
+    for (int i = 0; i < n; ++i) free(argv[i]);
+    free(argv);
+}
+
+/* start(cmd, args) -> Child. fork + execvp; on failure of either
+ * primitive, panic with strerror — start has no Result wrapper in
+ * v1 (see the divergence note in builtin_process_decl). */
+static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *args, KaiCont *k) {
+    (void) self;
+    if (!cmd || cmd->tag != KAI_STR) {
+        fputs("kai: Process.start: cmd must be a String\n", stderr);
+        exit(1);
+    }
+    /* cmd is heap-allocated by kai_str_from_bytes with a trailing
+     * NUL, so passing bytes directly to execvp is safe. */
+    const char *cmd_cstr = cmd->as.s.bytes ? cmd->as.s.bytes : "";
+    int argc = 0;
+    char **argv = _kai_process_build_argv(cmd_cstr, args, &argc);
+    if (!argv) {
+        fputs("kai: Process.start: out of memory building argv\n", stderr);
+        exit(1);
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        int e = errno;
+        _kai_process_free_argv(argv, argc);
+        fprintf(stderr, "kai: Process.start: fork: %s\n", strerror(e));
+        exit(1);
+    }
+    if (pid == 0) {
+        /* Child: replace image. execvp searches PATH for relative
+         * names; absolute paths bypass the search. On any failure
+         * exit 127, the shell convention for "command not found". */
+        execvp(cmd_cstr, argv);
+        /* execvp only returns on failure. Async-signal-safe writers
+         * only — keep the message minimal. */
+        const char *prefix = "kai: Process.start: execvp: ";
+        const char *msg    = strerror(errno);
+        ssize_t w;
+        w = write(2, prefix, strlen(prefix)); (void) w;
+        if (msg) { w = write(2, msg, strlen(msg)); (void) w; }
+        w = write(2, "\n", 1); (void) w;
+        _exit(127);
+    }
+    /* Parent: clean up argv copies and resume with the Child
+     * handle. The Child borrows nothing from argv — it carries
+     * just the pid. */
+    _kai_process_free_argv(argv, argc);
+    KaiValue *child = _kai_process_make_child((int) pid);
+    return kai_cont_resume(k, child);
+}
+
+/* wait(c) -> Result[Exit, String]. waitpid blocks until the child
+ * terminates; EINTR retries (cooperative-scheduler integration is
+ * m8.x scope). WIFEXITED → Exited(status); WIFSIGNALED →
+ * Signaled(signo). Other states (stopped, continued) cannot occur
+ * with `options=0`, so we only branch on the two terminal cases. */
+static KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *k) {
+    (void) self;
+    int pid = _kai_process_record_pid(child);
+    if (pid <= 0) {
+        KaiValue *m = kai_str("wait: invalid Child");
+        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        return kai_cont_resume(k, err);
+    }
+    int status = 0;
+    pid_t rc;
+    do {
+        rc = waitpid((pid_t) pid, &status, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) {
+        return _kai_process_err(k, errno);
+    }
+    KaiValue *exit_v;
+    if (WIFEXITED(status)) {
+        exit_v = _kai_process_make_exit_exited(WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        exit_v = _kai_process_make_exit_signaled(WTERMSIG(status));
+    } else {
+        /* options=0 should preclude this; treat as Exited(-1) so
+         * the user can still match. */
+        exit_v = _kai_process_make_exit_exited(-1);
+    }
+    KaiValue *ok = kai_variant(0, "Ok", 1, &exit_v);
+    return kai_cont_resume(k, ok);
+}
+
+/* kill(c, sig) -> Result[Unit, String]. Maps directly to kill(2);
+ * sig is taken as a raw signo Int (full POSIX set including
+ * SIGKILL — see the builtin_process_decl divergence note). */
+static KaiValue *kai_default_process_kill(void *self, KaiValue *child, KaiValue *sig, KaiCont *k) {
+    (void) self;
+    int pid = _kai_process_record_pid(child);
+    if (pid <= 0) {
+        KaiValue *m = kai_str("kill: invalid Child");
+        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        return kai_cont_resume(k, err);
+    }
+    int signo = (sig && sig->tag == KAI_INT) ? (int) sig->as.i : 0;
+    if (kill((pid_t) pid, signo) < 0) {
+        return _kai_process_err(k, errno);
+    }
+    KaiValue *u  = kai_unit();
+    KaiValue *ok = kai_variant(0, "Ok", 1, &u);
+    return kai_cont_resume(k, ok);
+}
+
+/* exit(code) -> Nothing. _exit(2) — skip libc atexit / stdio flush
+ * to match the doc spec contract. The `: Nothing` return type is
+ * load-bearing: we never resume k. */
+static KaiValue *kai_default_process_exit(void *self, KaiValue *code, KaiCont *k) {
+    (void) self;
+    (void) k;
+    int c = (code && code->tag == KAI_INT) ? (int) code->as.i : 0;
+    _exit(c);
+    /* unreachable */
+    return NULL;
 }
 
 /* =================================================================
