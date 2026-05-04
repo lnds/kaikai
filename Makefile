@@ -39,22 +39,35 @@ test-demos: kaic1
 	done
 
 # issue #233 — `bin/kai run` auto-discovers sibling modules and
-# nested directories under the entry file. Run from a foreign cwd
-# with absolute paths so the test exercises the driver contract
-# (--path "$(dirname "$src")"), not cwd-relative resolution.
+# nested directories under the entry file.
+#
+# Two invocation modes per fixture:
+#   abs: from a foreign cwd (`/`) with an absolute source path. Exercises
+#        the original PR #236 contract — `--path "$(dirname "$src")"`
+#        evaluated to an absolute string.
+#   rel: cd into the fixture dir and run `kai run main.kai`. Exercises
+#        the user-facing flow from issue #237 — `dirname` returning `.`
+#        and the cd+pwd absolutization in `bin/kai`.
 test-multi-module: kaic2
 	@set -e; \
 	root=$$(pwd); \
 	kai="$$root/bin/kai"; \
 	for case in multi-module multi-module/issue-237; do \
-	  src="$$root/examples/$$case/main.kai"; \
-	  exp="$$root/examples/$$case/main.out.expected"; \
-	  out=$$(mktemp); \
-	  (cd / && "$$kai" run "$$src") > "$$out" \
-	    || { echo "$$case FAIL (kai run)"; rm -f "$$out"; exit 1; }; \
-	  diff -q "$$exp" "$$out" > /dev/null \
-	    && { echo "$$case OK"; rm -f "$$out"; } \
-	    || { echo "$$case DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
+	  src_dir="$$root/examples/$$case"; \
+	  exp="$$src_dir/main.out.expected"; \
+	  out_abs=$$(mktemp); \
+	  (cd / && "$$kai" run "$$src_dir/main.kai") > "$$out_abs" \
+	    || { echo "$$case FAIL (abs kai run)"; rm -f "$$out_abs"; exit 1; }; \
+	  diff -q "$$exp" "$$out_abs" > /dev/null \
+	    || { echo "$$case DIFF (abs)"; diff "$$exp" "$$out_abs"; rm -f "$$out_abs"; exit 1; }; \
+	  rm -f "$$out_abs"; \
+	  out_rel=$$(mktemp); \
+	  (cd "$$src_dir" && "$$kai" run main.kai) > "$$out_rel" \
+	    || { echo "$$case FAIL (rel kai run)"; rm -f "$$out_rel"; exit 1; }; \
+	  diff -q "$$exp" "$$out_rel" > /dev/null \
+	    || { echo "$$case DIFF (rel)"; diff "$$exp" "$$out_rel"; rm -f "$$out_rel"; exit 1; }; \
+	  rm -f "$$out_rel"; \
+	  echo "$$case OK (abs+rel)"; \
 	done
 
 # m12.8 Phase 3 — Core demo gate. Delegates to stage2's
