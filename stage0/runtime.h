@@ -184,6 +184,9 @@ static int64_t kai_rc_free_total  = 0;
 static int64_t kai_rc_live_now    = 0;
 static int64_t kai_rc_live_peak   = 0;
 static int64_t kai_rc_alloc_by_tag[16] = {0};
+/* issue #118 — Perceus reuse-in-place counter. Bumped by every
+ * successful in-place rewrite in kai_reuse_or_alloc_* (further down). */
+static int64_t kai_rc_reuse_total = 0;
 
 static const char *kai_rc_tag_name(int t) {
     switch (t) {
@@ -218,6 +221,11 @@ static void kai_rc_report(void) {
                     kai_rc_tag_name(i),
                     (long long) kai_rc_alloc_by_tag[i]);
         }
+    }
+    /* issue #118 — Perceus reuse-in-place counter. */
+    if (kai_rc_reuse_total > 0) {
+        fprintf(stderr, "[KAI_TRACE_RC]   reuse_in_place=%lld\n",
+                (long long) kai_rc_reuse_total);
     }
 }
 
@@ -1023,6 +1031,98 @@ static KaiValue *kai_variant(int32_t tag, const char *name, int n, KaiValue **ar
         v->as.var.args = NULL;
     }
     return v;
+}
+
+/* ---------- Perceus reuse-in-place (issue #118 / Anga Roa wave) ----------
+ *
+ * Koka-style reuse-in-place: when a constructor consumes a value the
+ * Perceus pass can prove uniquely owned (RC == 1), reuse the consumed
+ * cell as the storage for the new value instead of paired free + alloc.
+ *
+ * Calling convention — these helpers are invoked from inside a
+ * `match` arm body. The match emitter (`emit_match_default`) wraps
+ * the scrutinee as `_scr` and *always* `kai_decref(_scr)`s on exit.
+ * To avoid a double-free / use-after-free on a reused cell, these
+ * helpers `kai_incref` the cell on the unique branch — the extra
+ * ref balances the post-arm `kai_decref(_scr)`, leaving the caller
+ * with a unique (RC=1) cell. The fallback branch leaves `_scr`
+ * untouched; the match exit reclaims it normally.
+ *
+ * Discipline summary (per branch):
+ *   - Unique: rewrite children in place, `kai_incref(_scr)`, return
+ *     `_scr`. Net RC after match exit: 1.
+ *   - Not unique / wrong shape: leave `_scr` alone, allocate fresh
+ *     via the existing `kai_<shape>` constructor. Net RC after match
+ *     exit: original_rc - 1.
+ *
+ * `head` / `tail` / `fields` / `args` are owning refs on entry — the
+ * allocator branch hands them straight to `kai_<shape>` (which does
+ * not incref); the reuse branch decref's the outgoing children
+ * before storing the incoming ones, exactly as `kai_free_value`
+ * would have during a paired free + alloc.
+ *
+ * The trace counter `kai_rc_reuse_total` increments on every
+ * successful in-place rewrite (see top of file).
+ */
+static int kai_check_unique(KaiValue *v) {
+    /* Singletons (rc == INT32_MAX) are NEVER unique — they are
+     * shared, immutable, and live in .data. The recogniser only
+     * fires on KAI_CONS / KAI_RECORD / KAI_VARIANT, none of which
+     * are pooled today, so the singleton check is defensive but
+     * cheap and keeps the predicate honest. */
+    return v != NULL && v->rc == 1 && v->rc != INT32_MAX;
+}
+
+static KaiValue *kai_reuse_or_alloc_cons(KaiValue *_scr,
+                                         KaiValue *head, KaiValue *tail) {
+    if (_scr != NULL && _scr->tag == KAI_CONS && kai_check_unique(_scr)) {
+        kai_decref(_scr->as.cons.head);
+        kai_decref(_scr->as.cons.tail);
+        _scr->as.cons.head = head;
+        _scr->as.cons.tail = tail;
+        kai_rc_reuse_total++;
+        return kai_incref(_scr);   /* survive enclosing match-exit decref */
+    }
+    return kai_cons(head, tail);
+}
+
+static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr,
+                                           int n, KaiValue **fields,
+                                           const char **names) {
+    if (_scr != NULL && _scr->tag == KAI_RECORD &&
+        _scr->as.rec.n_fields == n && kai_check_unique(_scr)) {
+        /* Decref the existing field values then overwrite. The
+         * fields[] / names[] pointer arrays are reused — both have
+         * the same length n, so no realloc is needed. names[]
+         * usually points at the same static-string literals across
+         * rebuilds (parsers thread the same record shape), so
+         * overwriting is idempotent in the common case. */
+        for (int i = 0; i < n; ++i) {
+            kai_decref(_scr->as.rec.fields[i]);
+            _scr->as.rec.fields[i] = fields[i];
+            _scr->as.rec.names[i]  = names[i];
+        }
+        kai_rc_reuse_total++;
+        return kai_incref(_scr);
+    }
+    return kai_record(n, fields, names);
+}
+
+static KaiValue *kai_reuse_or_alloc_variant(KaiValue *_scr,
+                                            int32_t tag, const char *name,
+                                            int n, KaiValue **args) {
+    if (_scr != NULL && _scr->tag == KAI_VARIANT &&
+        _scr->as.var.n_args == n && kai_check_unique(_scr)) {
+        for (int i = 0; i < n; ++i) {
+            kai_decref(_scr->as.var.args[i]);
+            _scr->as.var.args[i] = args[i];
+        }
+        _scr->as.var.variant_tag  = tag;
+        _scr->as.var.variant_name = name;
+        kai_rc_reuse_total++;
+        return kai_incref(_scr);
+    }
+    return kai_variant(tag, name, n, args);
 }
 
 /* Allocate an array of `len` slots, each initialised to `init`
