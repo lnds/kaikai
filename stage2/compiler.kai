@@ -10497,33 +10497,145 @@ fn emit_pat_binds_record(src: String, fields: [PField], scr: String,
 fn emit_match_arms(src: String, arms: [Arm], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String =
   concat_all(map(arms, (a) => emit_match_arm(src, a, lcs, fns, variants, lams, cls)))
 
+# Issue #209 — detect a cons reuse-arm whose body is the synthetic
+# `__perceus_reuse_cons(__pcs_scr, h_new, t_new)` produced by
+# `pcs_recognise_reuse_*`. When detected, the arm is emitted via the
+# dual-path layout in `emit_match_arm_reuse_cons` instead of the
+# default incref-the-binds layout: the unique branch borrows head/tail
+# (no incref) so the recursive consumer sees the children at their
+# actual RC, enabling spine-deep reuse instead of one-cell-only.
+fn try_reuse_cons_arm(pat: Pattern, body: Expr) : Option[ReuseConsArm] {
+  match pat.pkind {
+    PList(pats, opt_rest) -> match opt_rest {
+      Some(rest_name) -> match pats {
+        [head_pat] -> match body.kind {
+          ECall(callee, call_args) -> match callee.kind {
+            EVar(callee_name) ->
+              if callee_name == "__perceus_reuse_cons" {
+                match call_args {
+                  [_scr_arg, h_new, t_new] -> Some(ReuseConsArm(head_pat, rest_name, h_new, t_new))
+                  _ -> None
+                }
+              } else { None }
+            _ -> None
+          }
+          _ -> None
+        }
+        _ -> None
+      }
+      None -> None
+    }
+    _ -> None
+  }
+}
+
+type ReuseConsArm = ReuseConsArm(Pattern, String, Expr, Expr)
+
+# Emit a single reuse-arm with the dual-path layout. Pre-condition: the
+# scrutinee value is in the C local `_scr`, and the test
+# `_scr->tag == KAI_CONS` already passed (encoded by `emit_pat_test`).
+#
+# Unique branch (kai_check_unique(_scr) == 1):
+#   - bind head/tail by *borrow* (no incref). The body's consumer of
+#     each binding (e.g. `f(h)`, `recur(t)`) sees the child at its
+#     real RC — typically 1 for a fresh spine — so the recursive call
+#     also enters its own unique branch. This is what amplifies the
+#     reuse from "outermost cell only" to L-per-call.
+#   - evaluate `h_new` / `t_new` (which consume the borrowed binds).
+#     After this point the slots `_scr->cons.{head,tail}` point at
+#     freed memory, so the path is committed.
+#   - overwrite the slots in place, incref `_scr` so it survives the
+#     match-exit `kai_decref(_scr)`, return `_scr`.
+#
+# Fallback branch (cell shared, not unique):
+#   - bind head/tail by `kai_incref` (the standard pat-binds path).
+#   - evaluate `h_new` / `t_new` and allocate a fresh cell via
+#     `kai_cons`. The original `_scr` and its children remain intact;
+#     match exit's `kai_decref(_scr)` reclaims them normally.
+#
+# The body's `h_new` / `t_new` are emitted under bindings keyed on the
+# pattern names (head_pat's PBind, rest_name); each branch issues its
+# own bindings before the same body emit, so the body code is
+# duplicated textually but evaluated exactly once at runtime.
+fn emit_match_arm_reuse_cons(src: String, arm_lcs: [String], rca: ReuseConsArm,
+                             lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  match rca {
+    ReuseConsArm(head_pat, rest_name, h_new, t_new) -> {
+      # Borrowed-binds path: emit pat_binds with raw cons child slots
+      # and *no* incref wrappers.
+      let head_borrow = match head_pat.pkind {
+        PBind(hn) -> concat_all(["KaiValue *kai_", hn, " = _scr->as.cons.head; "])
+        PWild     -> ""
+        _         -> emit_pat_binds(src, head_pat, "_scr->as.cons.head", true, lcs, fns, variants, lams, cls)
+      }
+      let tail_borrow = concat_all(["KaiValue *kai_", rest_name, " = _scr->as.cons.tail; "])
+      # Owned-binds path (fallback / shared): same shape as the
+      # default `emit_pat_binds_list` produces.
+      let head_owned = match head_pat.pkind {
+        PBind(hn) -> concat_all(["KaiValue *kai_", hn, " = kai_incref(_scr->as.cons.head); "])
+        PWild     -> ""
+        _         -> emit_pat_binds(src, head_pat, "_scr->as.cons.head", true, lcs, fns, variants, lams, cls)
+      }
+      let tail_owned = concat_all(["KaiValue *kai_", rest_name, " = kai_incref(_scr->as.cons.tail); "])
+      let h_new_c = emit_expr(src, h_new, arm_lcs, fns, variants, lams, cls)
+      let t_new_c = emit_expr(src, t_new, arm_lcs, fns, variants, lams, cls)
+      concat_all([
+        "if (kai_check_unique(_scr)) { ",
+        head_borrow, tail_borrow,
+        "KaiValue *_h_new = ", h_new_c, "; ",
+        "KaiValue *_t_new = ", t_new_c, "; ",
+        "_scr->as.cons.head = _h_new; _scr->as.cons.tail = _t_new; ",
+        "kai_rc_reuse_total++; ",
+        "_r = kai_incref(_scr); ",
+        "} else { ",
+        head_owned, tail_owned,
+        "KaiValue *_h_new2 = ", h_new_c, "; ",
+        "KaiValue *_t_new2 = ", t_new_c, "; ",
+        "_r = kai_cons(_h_new2, _t_new2); ",
+        "}"
+      ])
+    }
+  }
+}
+
 fn emit_match_arm(src: String, a: Arm, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match a {
     Arm(pat, opt_guard, body) -> {
       let pt = emit_pat_test(src, pat, "_scr", lcs, fns, variants, lams, cls)
-      # _scr is shared across all match arms — subsequent arms re-read
-      # it after this one's pat_test/guard rejects, and a guard inside
-      # this arm may consume the binding (e.g. const-pattern desugar's
-      # `__cv_NAME == NAME()`). Treat as alias so PBind increfs.
-      let binds = emit_pat_binds(src, pat, "_scr", true, lcs, fns, variants, lams, cls)
       # The arm's guard and body see this pattern's bound names as
       # locals, so an `EVar(p)` with `p` matching a pattern binder
       # (e.g. `match xs { [drop, ...rest] -> drop }` where `drop` is
       # also a top-level fn name) emits a local read instead of a
       # closure-thunk reference.
       let arm_lcs = list_append(lcs, pat_binders(pat, []))
-      let body_c = emit_expr(src,body, arm_lcs, fns, variants, lams, cls)
+      # Issue #209 — reuse-arm dual-path emit. Only viable when there
+      # is no guard (a guard might reject the unique branch after we
+      # already committed to overwriting `_scr`'s slots).
       match opt_guard {
+        None -> match try_reuse_cons_arm(pat, body) {
+          Some(rca) -> {
+            let arm_body = emit_match_arm_reuse_cons(src, arm_lcs, rca, lcs, fns, variants, lams, cls)
+            concat_all(["    if (", pt, ") { ", arm_body, " break; }\n"])
+          }
+          None -> {
+            # _scr is shared across all match arms — subsequent arms re-read
+            # it after this one's pat_test/guard rejects, and a guard inside
+            # this arm may consume the binding (e.g. const-pattern desugar's
+            # `__cv_NAME == NAME()`). Treat as alias so PBind increfs.
+            let binds = emit_pat_binds(src, pat, "_scr", true, lcs, fns, variants, lams, cls)
+            let body_c = emit_expr(src, body, arm_lcs, fns, variants, lams, cls)
+            concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
+          }
+        }
         Some(g) -> {
-          let gc = emit_expr(src,g, arm_lcs, fns, variants, lams, cls)
+          let binds = emit_pat_binds(src, pat, "_scr", true, lcs, fns, variants, lams, cls)
+          let body_c = emit_expr(src, body, arm_lcs, fns, variants, lams, cls)
+          let gc = emit_expr(src, g, arm_lcs, fns, variants, lams, cls)
           concat_all([
             "    if (", pt, ") { ", binds,
             "if (kai_op_truthy(", gc, ")) { _r = ", body_c, "; break; } }\n"
           ])
         }
-        None -> concat_all([
-          "    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"
-        ])
       }
     }
   }
