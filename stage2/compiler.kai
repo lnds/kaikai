@@ -35901,17 +35901,15 @@ fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
 
 # m14 v1: per-module legacy prefix overrides. Most stdlib core
 # files declare functions with a prefix that matches the module
-# name (`list_take` in list.kai), but two diverge: option.kai uses
-# `opt_*` and char.kai uses `ch_*`. Until the per-module rename
-# lane retires the prefixed surface, the qualified-call resolver
-# needs to know how to map `option.map` -> `opt_map`,
-# `char.is_digit` -> `ch_is_digit`. Other modules fall back to the
-# verbatim `<module>_<fname>` form. The list is closed (one entry
-# per stdlib core module that needed it); new modules pick names
-# matching their basename and need no entry here.
+# name (`list_take` in list.kai), but char.kai still uses `ch_*`.
+# The qualified-call resolver maps `char.is_digit` -> `ch_is_digit`
+# until char.kai's exports migrate. Other modules fall back to the
+# verbatim `<module>_<fname>` form. Issues #219 + #230 retired
+# option.kai's `opt_*` overrides and the bulk of result.kai's /
+# string.kai's `<mod>_*` aliases, so most lookups today hit the
+# verbatim fname directly without falling back.
 fn module_legacy_prefix(mod_name: String) : Option[String] =
-  if mod_name == "option" { Some("opt") }
-  else if mod_name == "char" { Some("ch") }
+  if mod_name == "char" { Some("ch") }
   else { None }
 
 # m14 v1: resolve a qualified-call field name to the real exported
@@ -40474,6 +40472,45 @@ fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
   _ -> d
 }
 
+# Issue #230: tag the target file's PUB DFns with the target's
+# basename — the same way `tag_decls_module_origin` tags every DFn in
+# a prelude, but restricted to the public surface. Three carve-outs:
+#
+# 1. Only `pub` DFns get tagged. Non-pub helpers in the target stay
+#    `module_origin = None`, so their C symbol stays bare
+#    (`kai_<name>`). Test gates that grep for literal `kai_<helper>`
+#    symbols (e.g. `test-m4c`'s `kai_run_with__mono__Int__Int`) keep
+#    working without per-test bookkeeping. Non-pub helpers are not
+#    callable via a qualified `module.helper(...)` from anywhere
+#    anyway, so the qualified-key registration `add_decls_loop`
+#    would do for them is unreachable.
+#
+# 2. `main` stays untagged even when `pub`. The C harness emitted by
+#    `emit_main_wrapper` calls `kai_main()` literally, and the LLVM
+#    emitter has a hard-coded `if nm == "main"` for the entry symbol.
+#
+# 3. DFns that ALREADY carry a `module_origin = Some(_)` stay
+#    untouched. Those came from `expand_imports` (an `import foo`
+#    brings in `foo.kai`'s decls already tagged with `Some("foo")`),
+#    so re-tagging would rename `kai_foo__bar` to `kai_<target>__bar`
+#    and break the qualified call from the user's `foo.bar()` site,
+#    which still emits `kai_foo__bar` from `EModCall("foo", "bar")`.
+fn tag_target_decls_module_origin(ds: [Decl], mod: String) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [tag_target_decl(d, mod), ...tag_target_decls_module_origin(rest, mod)]
+}
+
+fn tag_target_decl(d: Decl, mod: String) : Decl = match d {
+  DFn(p, n, _, _, _, _, _, _, _, mo) ->
+    match mo {
+      Some(_) -> d
+      None    -> if p and n != "main" { tag_decl_module_origin(d, mod) } else { d }
+    }
+  DAttribPure(inner, l, c) -> DAttribPure(tag_target_decl(inner, mod), l, c)
+  DDerive(ps, inner, l, c) -> DDerive(ps, tag_target_decl(inner, mod), l, c)
+  _ -> d
+}
+
 type PreludesLoaded = PLS([Decl], [ModuleEntry])
 
 # Load every prelude file in `paths`, concatenating their decls in
@@ -41293,14 +41330,37 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # `EField(EVar(mod), fn)` to `EModCall(mod, fn)` when
             # `mod` is in the module table and not shadowed locally.
             let expanded = expand_imports(path, search_paths, own_decls_no_holes)
-            let expanded_decls = match expanded { EP_Mod(ds, _) -> ds }
+            let expanded_decls_raw = match expanded { EP_Mod(ds, _) -> ds }
+            # Issue #230: register the target file itself in the module
+            # table under its own basename, mirroring what `load_prelude`
+            # does for `--prelude` files. Without this, an intrinsic
+            # test block inside `stdlib/core/option.kai` cannot say
+            # `option.map(o, f)` — rqc rejected the qualifier because
+            # only `--prelude` files were registered. Tag the target's
+            # DFns with `module_origin = Some(<basename>)` (skipping
+            # only `main` so the C harness's `kai_main()` call still
+            # links) so `add_decls_loop` registers them under the
+            # qualified key `<mod>::<fname>` (PR #229), matching the
+            # prelude path. This makes self-qualified calls inside the
+            # target route through the qualified env without depending
+            # on bare-name shadow ordering — and unblocks retiring the
+            # `<mod>_*` flat aliases that previously kept their unique
+            # bare name only because the qualifier did not resolve.
+            let target_mod_name = prelude_module_name(path)
+            let target_exports = collect_pub_exports(expanded_decls_raw, [])
+            let target_me = ME(target_mod_name, target_exports, path)
+            let expanded_decls = tag_target_decls_module_origin(expanded_decls_raw, target_mod_name)
             # m14 v0: every `--prelude` file is also registered as a
             # module under its basename, so qualified calls into the
             # stdlib (`list.take(xs, n)`, `string.trim(s)`) resolve
             # without an explicit `import list`. Prelude entries come
             # first so an `import` of a module of the same name (none
-            # in practice today) can still shadow with rule B.
-            let module_table = list_append(prelude_mods, match expanded { EP_Mod(_, mt) -> mt })
+            # in practice today) can still shadow with rule B. The
+            # target's own ME comes last so its bare name shadows any
+            # same-named prelude (intentional: the file is "itself").
+            let module_table = list_append(
+              list_append(prelude_mods, match expanded { EP_Mod(_, mt) -> mt }),
+              [target_me])
             # Issue #216: `--prelude` files used to bypass `rqc_decls`
             # — they were merged in raw, so `list.foo` calls inside a
             # prelude file never reached the EField->EModCall rewrite
