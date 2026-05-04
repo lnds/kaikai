@@ -130,6 +130,8 @@ Commands:
   check <file.kai>              Compile with --prop-check and run property
                                 blocks (issue #44).
   fmt   <file.kai> [--check]    Pretty-print kaikai source canonically.
+  watch <file.kai>              Recompile + run on every save (live demo).
+  repl                          Interactive prompt (Level-1 prototype).
   help                          Show this help.
   --version                     Print version and demo baseline.
 
@@ -248,6 +250,74 @@ Options:
 
 Examples:
   kai check examples/stdlib/check_basic.kai
+EOF
+}
+
+usage_watch() {
+  cat <<EOF
+usage: kai watch <file.kai> [args...]
+
+Watch a kaikai source file and recompile + run it on every save.
+Useful for live demos: edit in one pane, see output in the other.
+
+Behavior:
+  - On entry, the file is compiled and run once.
+  - On each save, the screen prints a timestamped header followed by
+    the compile result. Build errors keep the watch loop alive.
+  - Press Ctrl+C to exit.
+
+Backend:
+  - If fswatch is on PATH, kai uses it (one event per save).
+  - Otherwise, kai falls back to a 500 ms mtime poll. Install
+    fswatch (brew install fswatch) for lower latency.
+
+Options:
+  -h, --help   Show this help.
+
+Examples:
+  kai watch demo.kai
+  kai watch examples/minimal/hello.kai
+EOF
+}
+
+usage_repl() {
+  cat <<EOF
+usage: kai repl
+
+Interactive prototype REPL. Accumulates input lines into a buffer
+and evaluates the buffer when you press Enter on an empty line.
+
+Meta-commands:
+  :quit, :q       exit the repl
+  :show, :s       print the current buffer
+  :clear, :c      discard the current buffer
+  :run,  :r       same as an empty line (evaluate now)
+  :help, :h       list meta-commands
+
+Wrap rule:
+  - If the buffer already contains 'fn main(', it is compiled
+    verbatim.
+  - Otherwise the buffer is wrapped in 'fn main() { <buffer> }'.
+
+Level-1 limitations:
+  - Each evaluation recompiles from scratch — there is NO state
+    carried across evaluations. Bindings, fn defs, and imports
+    only live until the next eval.
+  - No line editing / history (use a wrapper like rlwrap if you
+    need it). No multi-line paste detection beyond the empty-line
+    rule.
+  - Errors print and the buffer is reset; fix and retype.
+
+Examples:
+  \$ kai repl
+  >>> let x = 7
+  >>> print("x = #{int_to_string(x)}")
+  >>>
+  ===> evaluating buffer (2 lines)
+  x = 7
+
+Options:
+  -h, --help   Show this help.
 EOF
 }
 
@@ -482,6 +552,161 @@ cmd_fmt() {
   fi
 }
 
+# kai watch — recompile + run on every save.
+#
+# Two backends:
+#   1. fswatch -o "$src"   → one line per change event (lowest latency).
+#   2. mtime poll (500 ms) → portable fallback when fswatch is absent.
+#
+# The compile/run cycle runs once immediately on entry so the audience
+# sees output before they touch the file. Build failures do not exit
+# the loop — the watcher keeps running so the next save retries.
+file_mtime() {
+  if stat -f %m "$1" 2>/dev/null; then
+    return 0
+  fi
+  stat -c %Y "$1" 2>/dev/null || echo 0
+}
+
+watch_run_once() {
+  src="$1"; tmp="$2"
+  bin="$tmp/$(basename "$src" .kai)"
+  ts="$(date '+%H:%M:%S')"
+  if compile_to_binary "$src" "$tmp" "$bin" "watch" 2>"$tmp/err"; then
+    printf '\n[%s] Build OK\n' "$ts"
+    "$bin" || printf '\n[%s] Program exited with status %d\n' "$ts" "$?"
+  else
+    printf '\n[%s] Build FAILED\n' "$ts"
+    cat "$tmp/err" >&2
+  fi
+}
+
+cmd_watch() {
+  case "${1:-}" in
+    -h|--help) usage_watch; return 0 ;;
+    "") die "missing input file (see 'kai watch --help')" ;;
+  esac
+  src="$1"; shift
+  [ -f "$src" ] || die_file_not_found "$src" "watch"
+  abs_src="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+
+  printf 'kaikai watch — recompiling on every save\n'
+  printf 'Watching: %s\n' "$abs_src"
+  if command -v fswatch >/dev/null 2>&1; then
+    printf '(backend: fswatch)\n'
+  else
+    printf '(backend: mtime poll @ 500ms — install fswatch for lower latency)\n'
+  fi
+
+  watch_run_once "$abs_src" "$tmp"
+
+  if command -v fswatch >/dev/null 2>&1; then
+    fswatch -o "$abs_src" | while read -r _; do
+      watch_run_once "$abs_src" "$tmp"
+    done
+  else
+    last="$(file_mtime "$abs_src")"
+    while :; do
+      sleep 0.5 2>/dev/null || sleep 1
+      cur="$(file_mtime "$abs_src")"
+      if [ "$cur" != "$last" ]; then
+        last="$cur"
+        watch_run_once "$abs_src" "$tmp"
+      fi
+    done
+  fi
+}
+
+# kai repl — Level 1 prototype.
+#
+# Reads lines into a buffer; an empty line (or :run) evaluates by
+# wrapping the buffer in fn main() and compiling. NO state persists
+# across evaluations — see usage_repl for the limitations.
+repl_eval() {
+  buffer_file="$1"; tmp="$2"
+  if [ ! -s "$buffer_file" ]; then
+    printf '(buffer empty)\n'
+    return 0
+  fi
+  lines=$(wc -l < "$buffer_file" | tr -d ' ')
+  printf '===> evaluating buffer (%s lines)\n' "$lines"
+  src="$tmp/repl.kai"
+  if grep -q 'fn main(' "$buffer_file"; then
+    cp "$buffer_file" "$src"
+  else
+    {
+      printf 'fn main() {\n'
+      cat "$buffer_file"
+      printf '\n}\n'
+    } > "$src"
+  fi
+  bin="$tmp/repl"
+  if compile_to_binary "$src" "$tmp" "$bin" "repl" 2>"$tmp/err"; then
+    "$bin" || printf '(exit status %d)\n' "$?"
+  else
+    cat "$tmp/err" >&2
+  fi
+}
+
+cmd_repl() {
+  case "${1:-}" in
+    -h|--help) usage_repl; return 0 ;;
+  esac
+  ensure_built
+  tmp="$(mktemp -d)"
+  buffer="$tmp/buffer.kai"
+  : > "$buffer"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+
+  v="$(read_version)"
+  printf 'kaikai %s — repl (prototype)\n' "$v"
+  printf 'Type kaikai code. Empty line evaluates the buffer.\n'
+  printf 'Meta: :quit :show :clear :run :help\n'
+  printf '(no state persists across evaluations)\n\n'
+
+  while :; do
+    printf '>>> '
+    if ! IFS= read -r line; then
+      printf '\n'
+      return 0
+    fi
+    case "$line" in
+      ':quit'|':q')
+        return 0 ;;
+      ':help'|':h')
+        printf 'Meta-commands:\n'
+        printf '  :quit, :q    exit\n'
+        printf '  :show, :s    print buffer\n'
+        printf '  :clear, :c   discard buffer\n'
+        printf '  :run,  :r    evaluate now (same as empty line)\n'
+        printf '  :help, :h    this help\n'
+        continue ;;
+      ':show'|':s')
+        if [ -s "$buffer" ]; then
+          printf '%s\n' '----- buffer -----'
+          cat "$buffer"
+          printf '%s\n' '------------------'
+        else
+          printf '(buffer empty)\n'
+        fi
+        continue ;;
+      ':clear'|':c')
+        : > "$buffer"
+        printf '(buffer cleared)\n'
+        continue ;;
+      ':run'|':r'|'')
+        repl_eval "$buffer" "$tmp"
+        : > "$buffer"
+        printf '\n'
+        continue ;;
+      *)
+        printf '%s\n' "$line" >> "$buffer" ;;
+    esac
+  done
+}
+
 case "${1:-}" in
   build)     shift; cmd_build "$@" ;;
   run)       shift; cmd_run   "$@" ;;
@@ -489,6 +714,8 @@ case "${1:-}" in
   bench)     shift; cmd_bench "$@" ;;
   check)     shift; cmd_check "$@" ;;
   fmt)       shift; cmd_fmt   "$@" ;;
+  watch)     shift; cmd_watch "$@" ;;
+  repl)      shift; cmd_repl  "$@" ;;
   help|-h|--help) usage ;;
   --version|-V) print_version ;;
   "")        usage >&2; exit 2 ;;
