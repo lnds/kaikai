@@ -19703,6 +19703,65 @@ fn ty_entry_split_mod(key: String, fname: String) : Option[String] {
   }
 }
 
+# Issue #235: a candidate from `ty_env_collect_candidates`. Carries
+# the registered scheme plus its declaring module name. Only entries
+# registered under the qualified `<mod>::<fname>` key contribute
+# candidates; bare prelude entries (the hardcoded list-typed
+# `map` / `filter` / `each` etc. from `add_prelude_sigs`) are
+# excluded so the receiver-type narrowing does not have to compete
+# against schemes that share a name but were never module-tagged.
+# When narrowing fires, callers rewrite `EVar(fname)` to
+# `EModCall(mod, fname)` so codegen mints `kai_<mod>__<fname>`
+# directly, bypassing `efn_resolve`'s load-order tie-break.
+type TyCandidate = { scheme: TyScheme, mod: String }
+
+# Issue #235: collect every qualified scheme registered for
+# `target`. Walks `env.entries` newest-first so picks honour the
+# same tie-break the legacy `ty_env_lookup` used.
+fn ty_env_collect_candidates(env: TyEnv, target: String) : [TyCandidate] =
+  ty_env_collect_candidates_loop(env.entries,
+                                 string_concat("::", target), [])
+
+fn ty_env_collect_candidates_loop(es: [TyEntry],
+                                   suffix: String,
+                                   acc: [TyCandidate]) : [TyCandidate] {
+  match es {
+    [] -> list_reverse(acc)
+    [e, ...rest] -> match ty_entry_extract_mod(e.name, suffix) {
+      None -> ty_env_collect_candidates_loop(rest, suffix, acc)
+      Some(m) -> {
+        let cand = TyCandidate { scheme: e.scheme, mod: m }
+        ty_env_collect_candidates_loop(rest, suffix, [cand, ...acc])
+      }
+    }
+  }
+}
+
+# Returns `Some(<mod>)` if `key` ends with `suffix` (which is
+# `::<target>`) AND there is at least one byte before the `::`.
+# Avoids a string scan by reusing the slice computation that
+# `ty_entry_split_mod` already does for diagnostics.
+fn ty_entry_extract_mod(key: String, suffix: String) : Option[String] {
+  let kn = string_length(key)
+  let sn = string_length(suffix)
+  if kn <= sn { None }
+  else {
+    let tail = string_slice(key, kn - sn, sn)
+    if tail == suffix { Some(string_slice(key, 0, kn - sn)) } else { None }
+  }
+}
+
+# True when `key` ends with `suffix` AND the suffix is preceded by at
+# least one character (so `::name` itself doesn't match — the bare
+# `target` arm above handles bare keys). Mirrors `ty_entry_split_mod`'s
+# length check.
+fn ty_entry_key_has_suffix(key: String, suffix: String) : Bool {
+  let kn = string_length(key)
+  let sn = string_length(suffix)
+  if kn <= sn { false }
+  else { string_slice(key, kn - sn, sn) == suffix }
+}
+
 # Names of entries whose first byte is uppercase ASCII. Used to
 # filter down to variant constructors (`Some`, `Ok`, `Err`, user
 # variants) when suggesting alternatives for unknown variants.
@@ -24006,29 +24065,95 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
         Some(inf) -> inf
         None -> match try_ufcs_call(st_p, callee, args_, line, col) {
           Some(inf) -> inf
-          None -> {
-          let rc = synth(st_p, callee)
-          let ra = synth_many(rc.st, args_)
-          let rv = st_fresh_ty(ra.st)
-          # m7b #12: build the expected function type with an *open*
-          # row (a fresh row variable in the tail) so that calling a
-          # function whose declared row is non-empty or carries its
-          # own row variable doesn't force-bind the callee's tail to
-          # the empty row at the call site. The fresh row var absorbs
-          # whatever residual labels the callee carries; the caller's
-          # effect tracking is handled separately by `st_add_label`
-          # for op calls.
-          let fr = subst_fresh_row(rv.st.sub)
-          let st_fresh = st_set_sub(rv.st, fr.subst)
-          let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
-          let expected = TyFnT(ra.tys, rv.ty, expected_row)
-          let st2 = st_unify(st_fresh, rc.ty, expected, "function call", line, col)
-          let ty = apply_ty(st2.sub, rv.ty)
-          let root = with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), ty)
-          mk_inferred(st2, ty, root)
+          None -> match try_bare_call_narrow(st_p, callee, args_, line, col) {
+            Some(inf) -> inf
+            None -> {
+            let rc = synth(st_p, callee)
+            let ra = synth_many(rc.st, args_)
+            let rv = st_fresh_ty(ra.st)
+            # m7b #12: build the expected function type with an *open*
+            # row (a fresh row variable in the tail) so that calling a
+            # function whose declared row is non-empty or carries its
+            # own row variable doesn't force-bind the callee's tail to
+            # the empty row at the call site. The fresh row var absorbs
+            # whatever residual labels the callee carries; the caller's
+            # effect tracking is handled separately by `st_add_label`
+            # for op calls.
+            let fr = subst_fresh_row(rv.st.sub)
+            let st_fresh = st_set_sub(rv.st, fr.subst)
+            let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+            let expected = TyFnT(ra.tys, rv.ty, expected_row)
+            let st2 = st_unify(st_fresh, rc.ty, expected, "function call", line, col)
+            let ty = apply_ty(st2.sub, rv.ty)
+            let root = with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), ty)
+            mk_inferred(st2, ty, root)
+            }
           }
         }
       }
+  }
+}
+
+# Issue #235: when a bare-name callee resolves to multiple candidate
+# schemes (`option.map`, `list.map`, `result.map`, ...), narrow by
+# the type of the FIRST argument before instantiating. Without this
+# step the default arm calls `synth(callee)` which routes through
+# `ty_env_lookup` and picks the most-recently-prepended scheme by
+# load order — which fails when the receiver/first-arg type doesn't
+# match.
+#
+# Returns Some only when:
+#   - callee is `EVar(nm)`,
+#   - `nm` has 2+ candidates in the env (otherwise the default arm
+#     does the right thing already),
+#   - args_ is non-empty (we need a first-arg type to narrow on),
+#   - some candidate's first param unifies with the first arg's type.
+# Otherwise returns None and the caller falls through to the legacy
+# default arm so existing diagnostics for missing names / arity
+# mismatches keep firing unchanged.
+fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
+                         line: Int, col: Int) : Option[Inferred] {
+  match callee.kind {
+    EVar(nm) -> {
+      let candidates = ty_env_collect_candidates(st.env, nm)
+      let n_cand = list_length(candidates)
+      if n_cand < 2 { None }
+      else {
+        match args_ {
+          [] -> None
+          [first_arg, ...rest_args] -> {
+            let r0 = synth(st, first_arg)
+            let first_ty = apply_ty(r0.st.sub, r0.ty)
+            match pick_by_first_arg(r0.st, candidates, first_ty) {
+              None -> None
+              Some(pick) -> {
+                let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
+                  pick.st
+                } else {
+                  st_push_inst(pick.st, CS(nm, line, col, pick.fresh, pick.unit_fresh))
+                }
+                let ra_rest = synth_many(st_inst, rest_args)
+                let all_arg_tys = [first_ty, ...ra_rest.tys]
+                let all_arg_exprs = [r0.expr, ...ra_rest.exprs]
+                let rv = st_fresh_ty(ra_rest.st)
+                let fr = subst_fresh_row(rv.st.sub)
+                let st_fresh = st_set_sub(rv.st, fr.subst)
+                let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+                let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
+                let st2 = st_unify(st_fresh, pick.inst_ty, expected, "function call", line, col)
+                let ty = apply_ty(st2.sub, rv.ty)
+                # Issue #235: emit `EModCall(<mod>, nm)` so codegen
+                # mints `kai_<mod>__<nm>` directly.
+                let callee_node = with_ty(mk_expr(EModCall(pick.mod, nm), callee.line, callee.col), pick.inst_ty)
+                let root = with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty)
+                Some(mk_inferred(st2, ty, root))
+              }
+            }
+          }
+        }
+      }
+    }
+    _ -> None
   }
 }
 
@@ -24242,6 +24367,128 @@ fn record_has_field(st: InferState, obj_ty: Ty, ident: String) : Bool {
   }
 }
 
+# Issue #235: result of `pick_by_first_arg`. The picked scheme has
+# already been instantiated (state's `fresh` and `sub` advanced); the
+# caller proceeds with the standard unify-arg-then-emit pipeline.
+# `mod` carries the declaring module so the caller rewrites the
+# callee to `EModCall(mod, fname)` and codegen mints
+# `kai_<mod>__<fname>` directly, bypassing `efn_resolve`'s load-
+# order tie-break.
+type PickResult = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
+                    mod: String }
+
+# Issue #235: shared shape used by `synth_ufcs_dispatch`. Pairs the
+# instantiated state with the resolved callee form — `EModCall(m,
+# fname)` for module-qualified picks, `EVar(fname)` for the bare-
+# name fallback (root-file user fns with no `module_origin`).
+type UfcsPick = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
+                  callee_kind: ExprKind }
+
+# Issue #235: choose the candidate whose first parameter unifies
+# with `target_ty`, preferring CONCRETE-headed matches over
+# tyvar-headed ones.
+#
+# A scheme's first param can be either:
+#   - concrete-headed: TyCon("Result", [...]), TyListT(...), TyString,
+#     etc. These match `target_ty` only when the heads agree, so a
+#     `Result[String, Int]` arg never accidentally picks `list.map`.
+#   - tyvar-headed: TyVarT(_), TyAny. Vacuously unifies with any
+#     `target_ty` because instantiation refreshed the var. The
+#     classic case is `pub fn repeat(x: a, n: Int) : [a]` whose
+#     first param is `a` — given a `String` arg, list.repeat would
+#     win the race against `string.repeat` even though the intent
+#     is string.repeat.
+#
+# Walk strategy: a single pass that records two best candidates —
+# the first concrete-headed match and the first tyvar-headed match.
+# Concrete wins if any was found. Within each kind the most-recently-
+# registered match wins (env order is newest first). This matches
+# the legacy `ty_env_lookup` tie-break on the bare side and gives
+# correct dispatch on the qualified side.
+#
+# Each tried candidate bumps the inference state's fresh counter
+# (instantiation mints fresh tyvars). On a match the `sub` is *not*
+# extended by the probe — `synth_ufcs_dispatch` and `synth_call`
+# re-do the unify against the call's full expected fn type, which is
+# what records the receiver / arg constraints into the substitution.
+# So this helper only commits the instantiation, not the probe.
+fn pick_by_first_arg(st: InferState, candidates: [TyCandidate],
+                      target_ty: Ty) : Option[PickResult] =
+  pick_by_first_arg_loop(st, candidates, target_ty, None, None)
+
+# Two-pick walker: the first arg slot is for the leading concrete
+# match, the second for the leading tyvar match. After exhausting
+# the candidates, prefer concrete; fall back to tyvar.
+fn pick_by_first_arg_loop(st: InferState, candidates: [TyCandidate],
+                            target_ty: Ty,
+                            best_concrete: Option[PickResult],
+                            best_tyvar: Option[PickResult]) : Option[PickResult] {
+  match candidates {
+    [] -> match best_concrete {
+      Some(_) -> best_concrete
+      None    -> best_tyvar
+    }
+    [c, ...rest] -> {
+      let inst = st_instantiate_report(st, c.scheme)
+      let probe = match inst.ty {
+        TyFnT(params, _, _) -> match params {
+          [] -> ProbeNoMatch
+          [first, ..._rest_params] -> {
+            let head_concrete = first_param_head_is_concrete(first)
+            match unify_env(inst.st.env, first, target_ty, inst.st.sub) {
+              None    -> ProbeNoMatch
+              Some(_) -> if head_concrete { ProbeConcrete } else { ProbeTyvar }
+            }
+          }
+        }
+        _ -> ProbeNoMatch
+      }
+      let pick = PickResult { st: inst.st, inst_ty: inst.ty,
+                               fresh: inst.fresh, unit_fresh: inst.unit_fresh,
+                               mod: c.mod }
+      let new_concrete = match probe {
+        ProbeConcrete -> match best_concrete {
+          Some(_) -> best_concrete
+          None    -> Some(pick)
+        }
+        _ -> best_concrete
+      }
+      let new_tyvar = match probe {
+        ProbeTyvar -> match best_tyvar {
+          Some(_) -> best_tyvar
+          None    -> Some(pick)
+        }
+        _ -> best_tyvar
+      }
+      pick_by_first_arg_loop(inst.st, rest, target_ty, new_concrete, new_tyvar)
+    }
+  }
+}
+
+type ProbeOutcome = ProbeNoMatch | ProbeTyvar | ProbeConcrete
+
+# True when the head of `t` is a concrete type constructor (TyCon,
+# TyListT, primitive). Tyvars (TyVarT) and TyAny match anything and
+# count as ambiguous — the caller routes them to the tyvar bucket.
+# `TyFnT` first params (a higher-order arg) are concrete: distinct
+# arities or shapes won't accidentally unify with a `TyListT`-headed
+# first param.
+fn first_param_head_is_concrete(t: Ty) : Bool = match t {
+  TyVarT(_)    -> false
+  TyAny        -> false
+  TyInt        -> true
+  TyReal       -> true
+  TyBool       -> true
+  TyString     -> true
+  TyChar       -> true
+  TyUnit       -> true
+  TyListT(_)   -> true
+  TyFnT(_, _, _) -> true
+  TyCon(_, _)  -> true
+  TyDimT(_, _) -> true
+  _            -> false
+}
+
 # Lowers `obj.ident(args)` to `ident(obj, args)`. Looks up `ident`
 # in the type env; if missing or its first param doesn't unify with
 # `obj_ty`, emits the Q4 method-not-found diagnostic and returns a
@@ -24256,16 +24503,46 @@ fn record_has_field(st: InferState, obj_ty: Ty, ident: String) : Bool {
 fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
                         obj_ty: Ty, args_: [Expr],
                         line: Int, col: Int) : Inferred {
-  match ty_env_lookup(st.env, ident) {
-    None -> ufcs_method_not_found(st, ident, obj_expr, obj_ty, args_, line, col)
-    Some(sc) -> {
-      let inst = st_instantiate_report(st, sc)
-      let st_inst = if inst.fresh == [] and inst.unit_fresh == [] {
-        inst.st
-      } else {
-        st_push_inst(inst.st, CS(ident, line, col, inst.fresh, inst.unit_fresh))
+  # Issue #235: walk every `<mod>::<ident>` qualified candidate and
+  # pick the first whose first parameter unifies with the receiver
+  # type. Without this, two modules exporting `map` (option, list,
+  # ...) collide and the legacy `ty_env_lookup` returns the most-
+  # recently-prepended scheme — load-order, not receiver type.
+  # On a match the callee is rewritten to `EModCall(mod, ident)` so
+  # codegen mints `kai_<mod>__<ident>` directly and bypasses
+  # `efn_resolve`'s name-only lookup.
+  #
+  # Fallback: when `ident` has no qualified candidates (a user-
+  # defined fn in the root file with `module_origin = None`, e.g.
+  # `paint(c: Color)` in `examples/ufcs/over_union_component.kai`),
+  # consult the legacy bare-name `ty_env_lookup` path so root-file
+  # UFCS dispatch keeps working unchanged.
+  let candidates = ty_env_collect_candidates(st.env, ident)
+  let picked = match pick_by_first_arg(st, candidates, obj_ty) {
+    Some(p) -> Some(UfcsPick { st: p.st, inst_ty: p.inst_ty,
+                                fresh: p.fresh, unit_fresh: p.unit_fresh,
+                                callee_kind: EModCall(p.mod, ident) })
+    None -> match ty_env_lookup(st.env, ident) {
+      None -> None
+      Some(sc) -> {
+        let inst = st_instantiate_report(st, sc)
+        Some(UfcsPick { st: inst.st, inst_ty: inst.ty,
+                         fresh: inst.fresh, unit_fresh: inst.unit_fresh,
+                         callee_kind: EVar(ident) })
       }
-      match inst.ty {
+    }
+  }
+  match picked {
+    None -> ufcs_method_not_found(st, ident, obj_expr, obj_ty, args_, line, col)
+    Some(pick) -> {
+      let inst_st = pick.st
+      let inst_ty = pick.inst_ty
+      let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
+        inst_st
+      } else {
+        st_push_inst(inst_st, CS(ident, line, col, pick.fresh, pick.unit_fresh))
+      }
+      match inst_ty {
         TyFnT(params, _, _) -> match params {
           [] -> ufcs_method_not_found(st_inst, ident, obj_expr, obj_ty, args_, line, col)
           [first, ..._rest] -> match unify_env(st_inst.env, first, obj_ty, st_inst.sub) {
@@ -24284,9 +24561,9 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
               let st_fresh = st_set_sub(rv.st, fr.subst)
               let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
               let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
-              let st2 = st_unify(st_fresh, inst.ty, expected, "function call", line, col)
+              let st2 = st_unify(st_fresh, inst_ty, expected, "function call", line, col)
               let ty = apply_ty(st2.sub, rv.ty)
-              let callee_node = with_ty(mk_expr(EVar(ident), line, col), inst.ty)
+              let callee_node = with_ty(mk_expr(pick.callee_kind, line, col), inst_ty)
               let root = with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty)
               mk_inferred(st2, ty, root)
             }
@@ -24884,7 +25161,34 @@ fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Infer
   let rl = synth(st, lhs)
   let res = match rhs.kind {
     ECall(f, pa) -> {
-      let rf = synth(rl.st, f)
+      # Issue #235: when the callee is a bare-name `EVar(nm)` whose
+      # qualified env has multiple candidates (e.g. `filter` exported
+      # by both `option` and `list`), narrow by the LHS's type — the
+      # LHS becomes the callee's first argument under the pipe
+      # rewrite. Fall back to the legacy `synth(f)` path when the
+      # callee is not bare or has a single candidate.
+      let rf = match f.kind {
+        EVar(nm) -> {
+          let candidates = ty_env_collect_candidates(rl.st.env, nm)
+          if list_length(candidates) < 2 { synth(rl.st, f) }
+          else {
+            let lhs_ty = apply_ty(rl.st.sub, rl.ty)
+            match pick_by_first_arg(rl.st, candidates, lhs_ty) {
+              None -> synth(rl.st, f)
+              Some(pick) -> {
+                let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
+                  pick.st
+                } else {
+                  st_push_inst(pick.st, CS(nm, f.line, f.col, pick.fresh, pick.unit_fresh))
+                }
+                let callee_node = with_ty(mk_expr(EModCall(pick.mod, nm), f.line, f.col), pick.inst_ty)
+                mk_inferred(st_inst, pick.inst_ty, callee_node)
+              }
+            }
+          }
+        }
+        _ -> synth(rl.st, f)
+      }
       let ra = synth_many(rf.st, pa)
       let rv = st_fresh_ty(ra.st)
       # m12.8.x phase 4 (Bug 6): same open-row trick `synth_call`
@@ -24930,8 +25234,8 @@ fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Infer
 # The lookup returns:
 #   * `Some(module_name)` when the head type is dispatch-eligible.
 #   * `None` for `Option` / `Result` (Constraint #1, rejected with a
-#     dedicated diagnostic pointing at `!` and `opt_and_then` /
-#     `result_and_then`).
+#     dedicated diagnostic pointing at `!` and `option.and_then` /
+#     `result.and_then`).
 #   * `None` for any other head name (Constraint #2 — the type opted
 #     out by not exporting `map` / `flat_map` in a registered module).
 #
@@ -24952,12 +25256,12 @@ fn pipe_rejection_reason(head: String, op: String) : Option[String] {
   if head == "Option" {
     Some(concat_all([
       op, "-pipe is not supported on `Option`. Use `!` for ",
-      "propagation (`x!`) or `opt_and_then` for explicit chaining."
+      "propagation (`x!`) or `option.and_then` for explicit chaining."
     ]))
   } else if head == "Result" {
     Some(concat_all([
       op, "-pipe is not supported on `Result`. Use `!` for ",
-      "propagation (`x!`) or `result_and_then` for explicit chaining."
+      "propagation (`x!`) or `result.and_then` for explicit chaining."
     ]))
   } else {
     None
@@ -25001,22 +25305,17 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
           mk_inferred(st_bump_err(rl.st), TyAny, root)
         }
         Some(module_name) -> {
-          # Build the rewritten call: `<module_name>.<op>(lhs, rhs)`.
-          # The `EVar(op)` callee resolves through the env's bare-name
-          # entry — for the builtin `list` module, `op` is `"map"` or
-          # `"flat_map"`, both shipped as prelude entries (see
-          # `prelude_table` and the `TyEntry` block in
-          # `core_baseline_env`). When ahu's `Stream` lands and brings
-          # `Stream → ahu.stream`, the same lookup will resolve through
-          # the imported decl stream because m6.2 v1 collapses
-          # qualified calls to the bare-name TyEnv key. Once m6.2 v2
-          # introduces module-prefixed env keys, this site will switch
-          # to `EModCall(module_name, op)` and reuse the qualified-call
-          # codegen unchanged.
-          let _ = module_name
-          let callee = with_ty(mk_expr(EVar(op), line, col), TyAny)
+          # Issue #235: emit an `EModCall(module_name, op)` callee
+          # so the resolution is module-direct rather than going
+          # through bare-name lookup (which picks the newest
+          # registered `map`/`flat_map` — option's, list's, or
+          # result's — by load order rather than receiver type).
+          # The qualified-call typer arm (`EModCall` in `synth`)
+          # consults `<module>::<op>` first and falls back to bare
+          # only when no qualified entry exists.
+          let callee_kind = EModCall(module_name, op)
           let rf = synth(rl.st, rhs)
-          let rc = synth(rf.st, callee)
+          let rc = synth(rf.st, with_ty(mk_expr(callee_kind, line, col), TyAny))
           let rv = st_fresh_ty(rc.st)
           let fr = subst_fresh_row(rv.st.sub)
           let st_fresh = st_set_sub(rv.st, fr.subst)
