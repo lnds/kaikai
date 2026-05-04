@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan test-unions selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan test-unions test-sequence selfhost
 
 all: $(TARGET)
 
@@ -2922,6 +2922,48 @@ test-unbox-llvm-bench: $(TARGET) build
 # Mirrors `test-sugars` / `test-match` mechanically; lives in its own
 # target so a regression in the union resolver / D2 collision check
 # shows up under a clearly named gate.
+# issue #201 — fixtures for the `|` map-pipe + `||` flat-map-pipe
+# operators with naming-convention dispatch. Mirrors `test-unions`
+# mechanically: each `.kai` either compiles + runs to a known stdout
+# (positive — diffed against `<name>.out.expected`) or fails with a
+# specific diagnostic (negative — every line of `<name>.err.expected`
+# must be a substring of the compiler's stderr). Lives in its own
+# target so a regression in the head-type-to-module dispatch path or
+# the rejection diagnostics shows up under a clearly-named gate.
+test-sequence: $(TARGET) build
+	@$(STACK) set -e; \
+	for f in ../examples/sequence/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/sequence/$$name.out.expected; \
+	  exp_err=../examples/sequence/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    rc=0; ./$(TARGET) $$f > /dev/null 2> build/seq-$$name.err || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "sequence FAIL $$name (expected error, got success)"; exit 1; \
+	    fi; \
+	    while read -r line; do \
+	      grep -q "$$line" build/seq-$$name.err \
+	        || { echo "sequence FAIL $$name (missing diagnostic: $$line)"; \
+	             cat build/seq-$$name.err; exit 1; }; \
+	    done < $$exp_err; \
+	    echo "sequence OK $$name (rejected as expected)"; \
+	  else \
+	    ./$(TARGET) $$f > build/seq-$$name.c \
+	      || { echo "sequence FAIL $$name (kaic2 errored)"; exit 1; }; \
+	    $(CC) $(CFLAGS) -I ../stage0 build/seq-$$name.c -o build/seq-$$name \
+	      || { echo "sequence FAIL $$name (C compile failed)"; exit 1; }; \
+	    ./build/seq-$$name > build/seq-$$name.out \
+	      || { echo "sequence FAIL $$name (run errored)"; cat build/seq-$$name.out; exit 1; }; \
+	    if [ -f $$exp_out ]; then \
+	      diff -q $$exp_out build/seq-$$name.out > /dev/null \
+	        && echo "sequence OK $$name" \
+	        || { echo "sequence DIFF $$name"; diff $$exp_out build/seq-$$name.out; exit 1; }; \
+	    else \
+	      echo "sequence OK $$name (no golden, ran clean)"; \
+	    fi; \
+	  fi; \
+	done
+
 test-unions: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/unions/*.kai; do \
@@ -2956,7 +2998,7 @@ test-unions: $(TARGET) build
 	  fi; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82 test-unions
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82 test-unions test-sequence
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -2965,7 +3007,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude test-unions
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude test-unions test-sequence
 
 clean:
 	rm -rf build $(TARGET)
