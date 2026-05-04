@@ -23610,7 +23610,9 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
     None ->
       match try_op_call(st_p, callee, args_, line, col) {
         Some(inf) -> inf
-        None -> {
+        None -> match try_ufcs_call(st_p, callee, args_, line, col) {
+          Some(inf) -> inf
+          None -> {
           let rc = synth(st_p, callee)
           let ra = synth_many(rc.st, args_)
           let rv = st_fresh_ty(ra.st)
@@ -23630,6 +23632,7 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
           let ty = apply_ty(st2.sub, rv.ty)
           let root = with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), ty)
           mk_inferred(st2, ty, root)
+          }
         }
       }
   }
@@ -23786,6 +23789,139 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
     }
     _ -> None
   }
+}
+
+# issue #205: UFCS dispatch for `receiver.method(args)` callees.
+#
+# Fires from `synth_call` when the callee shape is `EField(obj, ident)`
+# and `try_op_call` already declined (so `obj` is not an effect-name
+# reference). Walks `obj` once to learn its type, then applies the
+# precedence rule from #205:
+#
+#   1. If `obj` is a record value AND `ident` names a field of that
+#      record, returns None — let `synth_call`'s generic path run
+#      `synth(st, callee)` (which dispatches `synth_field`) so field
+#      access wins on ties (Constraint #1).
+#   2. Else if `ident` resolves in the type env to a function whose
+#      first parameter unifies with `obj`'s type, lowers the call to
+#      `ECall(EVar(ident), [obj, ...args])` and finishes typing it
+#      with the same expected-row pattern `synth_call`/`synth_pipe_dispatch`
+#      use, so call-site row-tracking and unify diagnostics stay
+#      identical to the prefix form.
+#   3. Else, emits a Q4-style diagnostic naming the receiver type and
+#      hinting at scope candidates whose first arg matches, then
+#      stamps `TyAny` to keep cascade graceful.
+#
+# Returning Some always means "we handled this call site". Returning
+# None always means "let the generic `synth(st, callee)` path run" —
+# used for the field-wins precedence step.
+fn try_ufcs_call(st: InferState, callee: Expr, args_: [Expr],
+                  line: Int, col: Int) : Option[Inferred] {
+  match callee.kind {
+    EField(obj, ident) -> {
+      let r = synth(st, obj)
+      let obj_ty = apply_ty(r.st.sub, r.ty)
+      if record_has_field(r.st, obj_ty, ident) { None }
+      else { Some(synth_ufcs_dispatch(r.st, ident, r.expr, obj_ty, args_, line, col)) }
+    }
+    _ -> None
+  }
+}
+
+# Returns true when `obj_ty` resolves to a record type that declares
+# a field named `ident`. Used by `try_ufcs_call` to honour the
+# field-wins-on-ties precedence rule (#205 Constraint #1) before
+# attempting UFCS lookup.
+fn record_has_field(st: InferState, obj_ty: Ty, ident: String) : Bool {
+  match obj_ty {
+    TyCon(cname, _) -> match rec_find(st.recs, cname) {
+      None -> false
+      Some(ri) -> {
+        let inst = rec_instantiate(st, ri)
+        match fty_find(inst.fields, ident) {
+          Some(_) -> true
+          None    -> false
+        }
+      }
+    }
+    _ -> false
+  }
+}
+
+# Lowers `obj.ident(args)` to `ident(obj, args)`. Looks up `ident`
+# in the type env; if missing or its first param doesn't unify with
+# `obj_ty`, emits the Q4 method-not-found diagnostic and returns a
+# TyAny stamp. Mirrors `synth_pipe_dispatch`'s open-row pattern so
+# the dispatched call's effect labels and unify diagnostics match
+# the prefix-form call (`ident(obj, args)`).
+#
+# `obj_expr` has already been walked by `try_ufcs_call`; we walk
+# `args_` ourselves to avoid double-walking `obj` (the args may
+# carry their own effect labels and CallSite entries which must
+# stamp the final InferState).
+fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
+                        obj_ty: Ty, args_: [Expr],
+                        line: Int, col: Int) : Inferred {
+  match ty_env_lookup(st.env, ident) {
+    None -> ufcs_method_not_found(st, ident, obj_expr, obj_ty, args_, line, col)
+    Some(sc) -> {
+      let inst = st_instantiate_report(st, sc)
+      let st_inst = if inst.fresh == [] and inst.unit_fresh == [] {
+        inst.st
+      } else {
+        st_push_inst(inst.st, CS(ident, line, col, inst.fresh, inst.unit_fresh))
+      }
+      match inst.ty {
+        TyFnT(params, _, _) -> match params {
+          [] -> ufcs_method_not_found(st_inst, ident, obj_expr, obj_ty, args_, line, col)
+          [first, ..._rest] -> match unify_env(st_inst.env, first, obj_ty, st_inst.sub) {
+            None -> ufcs_method_not_found(st_inst, ident, obj_expr, obj_ty, args_, line, col)
+            Some(_) -> {
+              # Walk the remaining args (obj is already typed in obj_expr).
+              let ra = synth_many(st_inst, args_)
+              let all_arg_tys = [obj_ty, ...ra.tys]
+              let all_arg_exprs = [obj_expr, ...ra.exprs]
+              # Same expected-row pattern `synth_call` and
+              # `synth_pipe_dispatch` use: open-row tail so the
+              # callee's declared row variables don't force-bind the
+              # call site's row.
+              let rv = st_fresh_ty(ra.st)
+              let fr = subst_fresh_row(rv.st.sub)
+              let st_fresh = st_set_sub(rv.st, fr.subst)
+              let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+              let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
+              let st2 = st_unify(st_fresh, inst.ty, expected, "function call", line, col)
+              let ty = apply_ty(st2.sub, rv.ty)
+              let callee_node = with_ty(mk_expr(EVar(ident), line, col), inst.ty)
+              let root = with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty)
+              mk_inferred(st2, ty, root)
+            }
+          }
+        }
+        _ -> ufcs_method_not_found(st_inst, ident, obj_expr, obj_ty, args_, line, col)
+      }
+    }
+  }
+}
+
+# Q4 diagnostic — the receiver's type is statically known (or `TyAny`
+# from a cascade), no field of that type matches, and no scope
+# function `ident(receiver_ty, ...)` was found. Cascade-friendly: we
+# stamp `TyAny` and bump the error counter so downstream passes don't
+# crash on a missing call lowering.
+fn ufcs_method_not_found(st: InferState, ident: String, obj_expr: Expr,
+                          obj_ty: Ty, args_: [Expr],
+                          line: Int, col: Int) : Inferred {
+  let head_msg = match ty_head_name(obj_ty) {
+    Some(name) -> concat_all(["method `", ident, "` not found for type `", name, "`"])
+    None       -> concat_all(["method `", ident, "` not found (receiver type unresolved)"])
+  }
+  diag_error(st.file, line, col, head_msg)
+  diag_help(concat_all(["if `", ident, "` is a free function, ensure its first parameter ",
+                        "type matches the receiver; otherwise check the spelling."]))
+  let bare_callee = with_ty(mk_expr(EField(obj_expr, ident), line, col), TyAny)
+  let root = with_ty(mk_expr(ECall(bare_callee, args_), line, col), TyAny)
+  mk_inferred(st_bump_err(st), TyAny, root)
 }
 
 fn is_effect_in_env(env: TyEnv, eff_name: String) : Bool =
@@ -23960,7 +24096,7 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
   let applied = apply_ty(r.st.sub, r.ty)
   match applied {
     TyCon(cname, _) -> match rec_find(r.st.recs, cname) {
-      None -> mk_inferred(r.st, TyAny, field_root(r.expr, fnm, line, col, TyAny))
+      None -> field_non_record_or_partial_app(r.st, r.expr, fnm, line, col)
       Some(ri) -> {
         let inst = rec_instantiate(r.st, ri)
         let st1 = st_unify(inst.st, inst.result_ty, r.ty, "record field access", line, col)
@@ -23976,7 +24112,34 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
         }
       }
     }
-    _ -> mk_inferred(r.st, TyAny, field_root(r.expr, fnm, line, col, TyAny))
+    _ -> field_non_record_or_partial_app(r.st, r.expr, fnm, line, col)
+  }
+}
+
+# issue #205 Q5 — when `EField(obj, fnm)` reaches `synth_field` with
+# a non-record receiver, the original code stamped TyAny and passed
+# silently (relying on the runtime's "field access on non-record"
+# panic to surface the error). With UFCS landed, the cleaner failure
+# is at type-check time, mirroring `try_ufcs_call`'s diagnostic but
+# pointing the user at the call-site rule: UFCS only fires when the
+# field-access shape is the callee of an `ECall`. A bare `r.fnm`
+# (no parens) is rejected unconditionally — implicit partial
+# application would force a closure decision out of context.
+#
+# We still stamp TyAny so cascade is graceful and downstream emit
+# passes don't crash (they would otherwise emit `kai_op_field`,
+# which crashes at runtime).
+fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, fnm: String,
+                                     line: Int, col: Int) : Inferred {
+  match ty_env_lookup(st.env, fnm) {
+    Some(_) -> {
+      diag_error(st.file, line, col,
+        concat_all(["`", fnm, "` is a function in scope, not a field. ",
+                    "UFCS only fires at call sites — write `expr.", fnm, "(args)`, ",
+                    "not a bare `expr.", fnm, "`."]))
+      mk_inferred(st_bump_err(st), TyAny, field_root(obj_expr, fnm, line, col, TyAny))
+    }
+    None -> mk_inferred(st, TyAny, field_root(obj_expr, fnm, line, col, TyAny))
   }
 }
 
