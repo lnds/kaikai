@@ -40,15 +40,24 @@ in general: when the target lives among many preludes that re-export
 common names, the typer chooses the wrong scheme by alphabetical/load
 order.
 
-So the fix tags the target's DFns too — with two carve-outs:
+So the fix tags the target's `pub` DFns too — with three carve-outs:
 
-1. **`main` stays untagged**. Tagging would mint `kai_<basename>__main`,
-   but `emit_main_wrapper` plants a literal `kai_main()` call in the C
-   harness and the LLVM emitter has a hard-coded `if nm == "main"`
-   special case (`@kai_main`). Both paths assume the entry symbol is
-   bare.
+1. **Only `pub` DFns get tagged**. Non-pub helpers in the target stay
+   `module_origin = None`, so their C symbol stays bare
+   (`kai_<name>`). Test gates that grep for literal `kai_<helper>`
+   symbols (`test-m4c`'s `kai_run_with__mono__Int__Int`,
+   `kai_outer__mono__Int`, etc.) keep working without per-test
+   bookkeeping. Non-pub helpers are also unreachable via a qualified
+   `module.helper(...)` from outside the file, so the qualified-key
+   registration `add_decls_loop` would do for them is dead weight.
 
-2. **DFns that already carry `Some(_)` stay untagged**. `expand_imports`
+2. **`main` stays untagged** even when `pub`. Tagging would mint
+   `kai_<basename>__main`, but `emit_main_wrapper` plants a literal
+   `kai_main()` call in the C harness and the LLVM emitter has a
+   hard-coded `if nm == "main"` special case (`@kai_main`). Both
+   paths assume the entry symbol is bare.
+
+3. **DFns that already carry `Some(_)` stay untagged**. `expand_imports`
    includes `import foo` decls in `expanded_decls`, already tagged with
    `Some("foo")`. Re-tagging with the target's basename would rename
    `kai_foo__bar` to `kai_<target>__bar` and break the qualified call
@@ -73,8 +82,9 @@ let module_table = list_append(
   [target_me])
 ```
 
-The helper skips `main` and skips already-tagged DFns; everything else
-gets `Some(target_mod_name)`. No struct changes, no signature churn.
+The helper restricts tagging to `pub` non-`main` DFns and skips
+already-tagged DFns; everything else passes through unchanged. No
+struct changes, no signature churn, no Makefile edits.
 
 ## Migration inventory
 
@@ -142,6 +152,14 @@ path remains as the lookup-collision footgun.
 - `kai_main()` undeclared in `build/kaic2b.c` selfhost — the entry
   point got renamed to `kai_compiler__main` because I tagged every
   DFn including `main`. The skip-`main` carve-out fixed it.
+- `m4c FAIL m4c_run_with — specialisations missing` from the
+  `test-m4c` gate on CI Linux. The grep was looking for
+  `kai_run_with__mono__Int__Int` literal, but my second tagging pass
+  prefixed it to `kai_m4c_run_with__run_with__mono__Int__Int`. The
+  pub-only carve-out fixed it: `run_with` is `fn` (not `pub fn`), so
+  it stays bare and the gate's literal grep keeps matching. Surfaced
+  in CI rather than locally because tier1 is path-gated and macOS
+  signal_trap noise hid the m4c FAIL line on the local terminal.
 
 ## Friction points
 
