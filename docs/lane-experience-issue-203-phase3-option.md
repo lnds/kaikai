@@ -128,6 +128,37 @@ Phase 2's one — three more entries on the post-#219 cleanup list
 captured at the bottom of this report. **No new evidence filed
 on #219**; this is the same shape Phase 2 already documented.
 
+### Class 1.5 — `test-stdlib-core-intrinsic` harness: target file is NOT a module
+
+The first push to PR #221 caught a CI-only failure that local
+`tier1` did not surface: `test-stdlib-core-intrinsic` (gated by
+the `stdlib/core/**` path filter, runs in a separate workflow job).
+The harness compiles each `core/*.kai` file as the `--test` target
+while loading every other `core/*.kai` as `--prelude`. When the
+target was `option.kai`, `result.kai` was a prelude — and its
+test blocks called `option.is_none(...)` / `option.is_some(...)`,
+which my Phase 3 patch had introduced. The qualified-call
+resolver reported "undefined name `option`" because the target
+file is NOT registered as a module under its basename — only
+`--prelude` files are (`stage2/compiler.kai:41219` comment makes
+this explicit). Local tier1 ran the cross-file test (`make
+test-stdlib-core-intrinsic` lives in stage2/Makefile:926) and I
+ran it just now, post-fix, but I had not run it pre-push — and
+the broader `tier1` target does not chain to it.
+
+**Fix:** drop the `option.` qualifier in `result.kai`'s test
+blocks. `is_some` / `is_none` are bare-name exports of option.kai;
+when option.kai is itself the target, those exports are visible
+without a qualifier. When result.kai is the target, option.kai
+loads as a prelude and its bare exports are also visible without
+a qualifier. So `is_none(result_ok(r))` works in both directions.
+
+**Lesson for future phases:** if a `core/*.kai` file's tests call
+helpers from another `core/*.kai`, prefer bare-name calls over
+qualified calls. The intrinsic-tests harness specifically
+excludes the target file from its own module table, so qualified
+self-references break.
+
 ### Class 2 — Reserved-keyword collision: `or`
 
 Independently of #219, `or` is a reserved keyword (`TkOr`).
