@@ -57,6 +57,11 @@ int kaix_truthy(KaiValue *v)                   { return kai_op_truthy(v); }
 int64_t  kaix_to_int(KaiValue *v)              { return v->as.i; }
 int      kaix_to_bool(KaiValue *v)             { return v->as.b; }
 double   kaix_to_real(KaiValue *v)             { return v->as.r; }
+/* m12.7.x FFI v1: read the raw C-string pointer out of a boxed
+ * KaiValue. Used by the LLVM-side FFI shim to forward `String`
+ * params straight to the extern. The pointer aliases the boxed
+ * value's storage, so the caller must not free it. */
+const char *kaix_to_str_data(KaiValue *v)      { return v->as.s.bytes; }
 uint32_t kaix_to_char(KaiValue *v)             { return v->as.c; }
 
 /* ---------- m5 #4 — Perceus dup/drop wrappers for LLVM backend ---------- */
