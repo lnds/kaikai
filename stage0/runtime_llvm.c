@@ -153,6 +153,14 @@ int       kaix_is_nil(KaiValue *v)                        { return !v || v->tag 
 KaiValue *kaix_cons_head(KaiValue *v)                     { return kai_incref(v->as.cons.head); }
 KaiValue *kaix_cons_tail(KaiValue *v)                     { return kai_incref(v->as.cons.tail); }
 
+/* issue #118 — LLVM mirror of the C-side reuse-in-place runtime.
+ * Stage 2's recogniser emits `__perceus_reuse_cons` calls inside
+ * match arms; both backends lower to the same `kai_reuse_or_alloc_cons`
+ * helper, so the shape mirrors the existing `kaix_cons` thin wrapper. */
+KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t) {
+  return kai_reuse_or_alloc_cons(scr, h, t);
+}
+
 /* Used by lambda thunks to read their captured values from the
    closure's self parameter. i is the capture's index. */
 KaiValue *kaix_capture(KaiValue *self, int i)             { return kai_incref(self->as.clo.captures[i]); }
