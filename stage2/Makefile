@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan test-unions test-sequence selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence selfhost
 
 all: $(TARGET)
 
@@ -2776,6 +2776,61 @@ test-perceus-issue82-asan: $(TARGET) build
 	    || { echo "perceus-issue82-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
+# Issue #118 — Perceus reuse-in-place (Anga Roa wave v1).
+# Fixtures cover:
+#   - reuse_cons_basic       cons recogniser fires on the textbook
+#                            `[h+1, ...recur(t)]` shape (positive).
+#   - reuse_alias_aborts     aliased input ⇒ `kai_check_unique`
+#                            blocks reuse, fallback to `kai_cons`
+#                            (negative-ish; ASAN catches a missed
+#                            guard as UAF).
+#   - reuse_pass_ordering    chained reuse calls; the `kai_incref`
+#                            inside `kai_reuse_or_alloc_cons`
+#                            balances the match-exit `kai_decref`
+#                            (RC discipline check).
+#   - reuse_record_basic     placeholder until the variant + record
+#                            recogniser arms re-enable; exercises
+#                            the standard `kai_record` allocator
+#                            path.
+#   - reuse_variant_basic    same shape, KAI_VARIANT.
+PERCEUS_ISSUE118_FIXTURES := reuse_cons_basic reuse_alias_aborts \
+                              reuse_pass_ordering reuse_record_basic \
+                              reuse_variant_basic
+
+test-perceus-issue118: $(TARGET) build
+	@set -e; \
+	for name in $(PERCEUS_ISSUE118_FIXTURES); do \
+	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name; \
+	  ./build/$$name > build/$$name.out; \
+	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
+	    && echo "perceus-issue118 OK $$name" \
+	    || { echo "perceus-issue118 DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
+	done
+
+# ASAN+UBSan sibling — required by issue #118 (RC-discipline-critical;
+# the runtime additions add a new alloc-vs-reuse branch on every
+# constructor-after-deconsume site, and a missed `kai_incref` in the
+# unique branch lands as a use-after-free at the next match exit).
+test-perceus-issue118-asan: $(TARGET) build
+	@set -e; \
+	for name in $(PERCEUS_ISSUE118_FIXTURES); do \
+	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
+	    echo "perceus-issue118-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
+	    && echo "perceus-issue118-asan OK $$name" \
+	    || { echo "perceus-issue118-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	done
+
 # Issue #91 — PBind catch-all in the M5 fast path. ASAN+UBSan
 # sibling for `match_pbind_catchall_raw.kai`. Match emit + raw
 # locals is exactly the surface where RC discipline gaps
@@ -2998,7 +3053,7 @@ test-unions: $(TARGET) build
 	  fi; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82 test-unions test-sequence
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82 test-perceus-issue118 test-unions test-sequence
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
