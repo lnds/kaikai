@@ -9544,29 +9544,166 @@ fn ambig_mods_of(cands: [EFn], acc: [String]) : [String] {
   }
 }
 
-# m6.2 v2: emit a stderr warning for each ambiguous bare-name. The
-# warning fires at the start of every kaic2 invocation that loads a
-# prelude chain in which two modules export the same bare name with
-# no root-file shadow. It does NOT depend on the user's program
-# actually using the name — that filtering would cost a body walk
-# we do not want to pay on every compile. If the warning fires and
-# the user code does not reference the name, the diagnostic is
-# harmless (no link error follows); if the user code does reference
-# it, the link will fail with `undefined reference to 'kai_<name>'`
-# and the warning explains why.
-fn report_ambig_efns(amb: [AmbigEntry]) : Unit / Console = match amb {
+# issue #243: emit a stderr warning for each ambiguous bare-name
+# that the user's root file ACTUALLY calls without a qualifier. The
+# m6.2 v2 design fired one warning per ambiguous export regardless
+# of usage; that produced 9 spurious warnings on hello-world after
+# the prelude grew to two modules exporting `map`/`repeat`/etc.
+# (PR #241 retired the colliding aliases, but two-module overlaps
+# remain by design — `option.map` and `result.map` are intentionally
+# both exported). The body walk we now perform is bounded by the
+# root file's AST, not the prelude, so it stays cheap.
+fn report_ambig_efns(amb: [AmbigEntry], used: [String]) : Unit / Console = match amb {
   [] -> ()
   [a, ...rest] -> match a {
     AmbE(name, mods) -> {
-      eprint(concat_all([
-        "warning: bare name '", name,
-        "' is exported by multiple modules with no root-file shadow: ",
-        join_with(mods, ", "),
-        "; use a qualified call (e.g. ", list_head_or(mods, "<mod>"),
-        ".", name, "(...)) to disambiguate"
-      ]))
-      report_ambig_efns(rest)
+      if list_has(used, name) {
+        eprint(concat_all([
+          "warning: bare name '", name,
+          "' is exported by multiple modules with no root-file shadow: ",
+          join_with(mods, ", "),
+          "; use a qualified call (e.g. ", list_head_or(mods, "<mod>"),
+          ".", name, "(...)) to disambiguate"
+        ]))
+      } else { () }
+      report_ambig_efns(rest, used)
     }
+  }
+}
+
+# issue #243: collect the set of bare-name callees used in the root
+# file's decls. A "bare-name callee" is `ECall(callee, _)` where the
+# callee node is `EVar(name)` — i.e. an unqualified function call.
+# Qualified calls (`m.f(...)`) parse as `ECall(EField(EVar(m), f), _)`
+# or are rewritten to `EModCall` post-resolution; both are skipped.
+# Module-origin filtering happens at the caller (only root decls are
+# walked), so this returns the nameset for the active root file alone.
+fn collect_root_bare_callees(decls: [Decl], acc: [String]) : [String] = match decls {
+  []           -> acc
+  [d, ...rest] -> collect_root_bare_callees(rest, collect_root_bare_callees_decl(d, acc))
+}
+
+fn collect_root_bare_callees_decl(d: Decl, acc: [String]) : [String] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, mo) -> match mo {
+    None    -> walk_bare_callees(body, acc)
+    Some(_) -> acc
+  }
+  DTest(_, body, _, _)        -> walk_bare_callees(body, acc)
+  DBench(_, body, _, _)       -> walk_bare_callees(body, acc)
+  DCheck(_, _, body, _, _)    -> walk_bare_callees(body, acc)
+  _ -> acc
+}
+
+fn walk_bare_callees(e: Expr, acc: [String]) : [String] = match e.kind {
+  EInt(_)             -> acc
+  EReal(_)            -> acc
+  EBool(_)            -> acc
+  EChar(_)            -> acc
+  EStr(_, _)          -> acc
+  EUnit               -> acc
+  EVar(_)             -> acc
+  EUnder              -> acc
+  EPlaceholder        -> acc
+  EHole(_)            -> acc
+  ETodo(_)            -> acc
+  EVariantsOf(_, _)   -> acc
+  EModCall(_, _)      -> acc
+  ECall(callee, args_) -> {
+    let acc1 = match callee.kind {
+      EVar(name) -> if list_has(acc, name) { acc } else { [name, ...acc] }
+      _          -> walk_bare_callees(callee, acc)
+    }
+    walk_bare_callees_list(args_, acc1)
+  }
+  EField(base, _)     -> walk_bare_callees(base, acc)
+  EIndex(a, b)        -> walk_bare_callees(b, walk_bare_callees(a, acc))
+  EBinop(_, a, b)     -> walk_bare_callees(b, walk_bare_callees(a, acc))
+  EUnop(_, x)         -> walk_bare_callees(x, acc)
+  EIf(c, t, eo)       -> {
+    let a1 = walk_bare_callees(t, walk_bare_callees(c, acc))
+    match eo { Some(b) -> walk_bare_callees(b, a1) None -> a1 }
+  }
+  EMatch(scr, arms)   -> walk_bare_callees_arms(arms, walk_bare_callees(scr, acc))
+  ELambda(_, body)    -> walk_bare_callees(body, acc)
+  ERecordLit(_, fs)   -> walk_bare_callees_fields(fs, acc)
+  EList(els)          -> walk_bare_callees_elems(els, acc)
+  ERange(a, b, opt)   -> {
+    let a1 = walk_bare_callees(b, walk_bare_callees(a, acc))
+    match opt { Some(s) -> walk_bare_callees(s, a1) None -> a1 }
+  }
+  EBlock(stmts, tail) -> {
+    let a1 = walk_bare_callees_stmts(stmts, acc)
+    match tail { Some(t) -> walk_bare_callees(t, a1) None -> a1 }
+  }
+  EPipe(a, b)         -> walk_bare_callees(b, walk_bare_callees(a, acc))
+  EMapPipe(a, b)      -> walk_bare_callees(b, walk_bare_callees(a, acc))
+  EFlatMapPipe(a, b)  -> walk_bare_callees(b, walk_bare_callees(a, acc))
+  EBang(inner)        -> walk_bare_callees(inner, acc)
+  ELitUnit(inner, _)  -> walk_bare_callees(inner, acc)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    let a1 = walk_bare_callees(body, acc)
+    let a2 = match init_opt { Some(i) -> walk_bare_callees(i, a1) None -> a1 }
+    let a3 = walk_bare_callees_clauses(clauses, a2)
+    match ret_opt {
+      Some(r) -> match r { HR(_, b, _, _) -> walk_bare_callees(b, a3) }
+      None    -> a3
+    }
+  }
+}
+
+fn walk_bare_callees_list(es: [Expr], acc: [String]) : [String] = match es {
+  []           -> acc
+  [h, ...rest] -> walk_bare_callees_list(rest, walk_bare_callees(h, acc))
+}
+
+fn walk_bare_callees_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []           -> acc
+  [a, ...rest] -> match a {
+    Arm(_, opt_guard, body) -> {
+      let a1 = match opt_guard { Some(g) -> walk_bare_callees(g, acc) None -> acc }
+      walk_bare_callees_arms(rest, walk_bare_callees(body, a1))
+    }
+  }
+}
+
+fn walk_bare_callees_fields(fs: [FieldInit], acc: [String]) : [String] = match fs {
+  []           -> acc
+  [f, ...rest] -> match f {
+    FI(_, e) -> walk_bare_callees_fields(rest, walk_bare_callees(e, acc))
+  }
+}
+
+fn walk_bare_callees_elems(els: [ListElem], acc: [String]) : [String] = match els {
+  []           -> acc
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> walk_bare_callees_elems(rest, walk_bare_callees(e, acc))
+    ElSpread(e) -> walk_bare_callees_elems(rest, walk_bare_callees(e, acc))
+  }
+}
+
+fn walk_bare_callees_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+  []           -> acc
+  [s, ...rest] -> match s {
+    SLet(_, _, e)        -> walk_bare_callees_stmts(rest, walk_bare_callees(e, acc))
+    SVar(_, _, e, _, _)  -> walk_bare_callees_stmts(rest, walk_bare_callees(e, acc))
+    SAssert(e, og)       -> {
+      let a1 = walk_bare_callees(e, acc)
+      let a2 = match og { Some(g) -> walk_bare_callees(g, a1) None -> a1 }
+      walk_bare_callees_stmts(rest, a2)
+    }
+    SExprStmt(e)         -> walk_bare_callees_stmts(rest, walk_bare_callees(e, acc))
+    SIndexAssign(a, b, c, _, _) -> {
+      let a1 = walk_bare_callees(c, walk_bare_callees(b, walk_bare_callees(a, acc)))
+      walk_bare_callees_stmts(rest, a1)
+    }
+    SUse(_, _, _)        -> walk_bare_callees_stmts(rest, acc)
+  }
+}
+
+fn walk_bare_callees_clauses(cs: [HClause], acc: [String]) : [String] = match cs {
+  []           -> acc
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> walk_bare_callees_clauses(rest, walk_bare_callees(body, acc))
   }
 }
 
@@ -42442,16 +42579,17 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   # the three structural properties is violated. See
                   # `validate_typer_invariants` for the catalog.
                   let inv_errs = validate_typer_invariants(typed_prog, path)
-                  # m6.2 v2: emit a warning at the start of every
-                  # codegen run for each bare-name that two or more
-                  # imported modules export without a root-file shadow
-                  # (e.g. `pub fn map` in both option.kai and
-                  # result.kai once their bare-name renames land).
-                  # The warning is non-fatal; a real linker error
-                  # follows if any caller actually uses the bare
-                  # form. Fired once per name regardless of usage —
-                  # cheap, no body walk needed.
-                  let _ = report_ambig_efns(find_ambig_efns(register_fn_decls(typed_prog.decls)))
+                  # issue #243: emit a warning for each ambiguous
+                  # bare-name that the root file ACTUALLY references.
+                  # Original m6.2 v2 design fired one per ambiguous
+                  # export regardless of usage, which produced 9
+                  # spurious warnings on hello-world after the
+                  # prelude grew to two modules exporting `map`,
+                  # `repeat`, etc. The body walk is bounded by the
+                  # root file's AST (decls with mo == None).
+                  let _ = report_ambig_efns(
+                    find_ambig_efns(register_fn_decls(typed_prog.decls)),
+                    collect_root_bare_callees(typed_prog.decls, []))
                   if typed_prog.errs != 0 { typed_prog.errs }
                   else if dispatch_errs != 0 { dispatch_errs }
                   else if inv_errs != 0 { inv_errs }
