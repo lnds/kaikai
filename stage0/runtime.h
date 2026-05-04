@@ -1587,6 +1587,38 @@ static KaiValue *kai_prelude_map(KaiValue *xs, KaiValue *f) {
     return result;
 }
 
+/* issue #201: runtime backing for the flat-map-pipe operator (`||`).
+ * Mirrors `kai_prelude_map` but each `f(elem)` produces a list that
+ * gets cons-prepended onto the reversed accumulator; the per-element
+ * piece is decref'd in the same step. The final reverse + decref loop
+ * matches `_map`'s ownership story so RC stays balanced regardless of
+ * the input shape. Empty pieces are a no-op for the inner loop.
+ */
+static KaiValue *kai_prelude_flat_map(KaiValue *xs, KaiValue *f) {
+    KaiValue *acc = kai_nil();
+    KaiValue *p = xs;
+    while (p && p->tag == KAI_CONS) {
+        KaiValue *arg0 = kai_incref(p->as.cons.head);
+        KaiValue *piece = kai_apply(f, 1, &arg0);
+        /* Each `piece` is owned; append it onto `acc` (which is in
+         * reverse order). `kai_prelude_list_append` consumes both
+         * arguments. We append `acc` onto the front of `piece`'s
+         * reversed form by reversing piece into acc cons-by-cons.
+         */
+        KaiValue *q = piece;
+        while (q && q->tag == KAI_CONS) {
+            acc = kai_cons(kai_incref(q->as.cons.head), acc);
+            q = q->as.cons.tail;
+        }
+        if (piece) kai_decref(piece);
+        p = p->as.cons.tail;
+    }
+    KaiValue *result = kai_prelude_list_reverse(acc);  /* consumes acc */
+    if (xs) kai_decref(xs);
+    if (f)  kai_decref(f);
+    return result;
+}
+
 static KaiValue *kai_prelude_filter(KaiValue *xs, KaiValue *pred) {
     KaiValue *acc = kai_nil();
     KaiValue *p = xs;
@@ -2292,6 +2324,7 @@ static KaiValue *_kai_prelude_list_length_thunk(KaiValue *s, KaiValue **a, int n
 static KaiValue *_kai_prelude_list_append_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_list_append(a[0], a[1]); }
 static KaiValue *_kai_prelude_list_reverse_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_list_reverse(a[0]); }
 static KaiValue *_kai_prelude_map_thunk(KaiValue *s, KaiValue **a, int n)            { (void) s; (void) n; return kai_prelude_map(a[0], a[1]); }
+static KaiValue *_kai_prelude_flat_map_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_flat_map(a[0], a[1]); }
 static KaiValue *_kai_prelude_filter_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_filter(a[0], a[1]); }
 static KaiValue *_kai_prelude_reduce_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_reduce(a[0], a[1], a[2]); }
 static KaiValue *_kai_prelude_each_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_prelude_each(a[0], a[1]); }
