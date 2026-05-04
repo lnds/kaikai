@@ -19332,6 +19332,20 @@ fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv =
   TyEnv { entries: [TyEntry { name: name, scheme: sc }, ...env.entries],
           fresh: env.fresh, unions: env.unions }
 
+# Issue #219: composite key for module-qualified scheme entries.
+# When the same bare `fname` is exported from two prelude modules
+# (e.g. `repeat` from `list.kai` and `string.kai`), the bare-name
+# entries shadow each other in `entries`. Modules also register
+# under this `<mod>::<fname>` key so the EModCall branch can pick
+# the correct scheme by qualifier instead of guessing from arg
+# types after a wrong scheme was instantiated. Mirrors the
+# codegen-side `c_sym(name, Some(mod))` discipline.
+fn ty_mod_key(mod: String, fname: String) : String =
+  string_concat(mod, string_concat("::", fname))
+
+fn ty_env_add_qualified(env: TyEnv, mod: String, name: String, sc: TyScheme) : TyEnv =
+  ty_env_add(env, ty_mod_key(mod, name), sc)
+
 fn ty_env_lookup_loop(es: [TyEntry], target: String) : Option[TyScheme] {
   match es {
     [] -> None
@@ -19341,6 +19355,46 @@ fn ty_env_lookup_loop(es: [TyEntry], target: String) : Option[TyScheme] {
 
 fn ty_env_lookup(env: TyEnv, target: String) : Option[TyScheme] =
   ty_env_lookup_loop(env.entries, target)
+
+# Issue #219: qualifier-aware lookup. Returns the scheme registered
+# under `<mod>::<fname>` if present; the EModCall branch consults
+# this BEFORE falling back to a bare lookup so two modules exporting
+# the same bare name resolve unambiguously to their declaring module.
+fn ty_env_lookup_qualified(env: TyEnv, mod: String, fname: String) : Option[TyScheme] =
+  ty_env_lookup(env, ty_mod_key(mod, fname))
+
+# Issue #219: walk the env collecting modules that export `fname`.
+# Used to suggest "did you mean `<other_mod>.<fname>`?" when the
+# user qualifies a name with the wrong module.
+fn ty_env_modules_exporting(env: TyEnv, fname: String) : [String] =
+  modules_exporting_loop(env.entries, fname, [])
+
+fn modules_exporting_loop(es: [TyEntry], fname: String, acc: [String]) : [String] {
+  match es {
+    [] -> list_reverse(acc)
+    [e, ...rest] -> {
+      let mod_opt = ty_entry_split_mod(e.name, fname)
+      match mod_opt {
+        Some(m) -> if list_has(acc, m) { modules_exporting_loop(rest, fname, acc) }
+                   else { modules_exporting_loop(rest, fname, [m, ...acc]) }
+        None    -> modules_exporting_loop(rest, fname, acc)
+      }
+    }
+  }
+}
+
+# Returns Some(<mod>) if `key` is `<mod>::<fname>`, else None. Used
+# only by `ty_env_modules_exporting` for diagnostic suggestions.
+fn ty_entry_split_mod(key: String, fname: String) : Option[String] {
+  let suffix = string_concat("::", fname)
+  let kn = string_length(key)
+  let sn = string_length(suffix)
+  if kn <= sn { None }
+  else {
+    let tail = string_slice(key, kn - sn, sn)
+    if tail == suffix { Some(string_slice(key, 0, kn - sn)) } else { None }
+  }
+}
 
 # Names of entries whose first byte is uppercase ASCII. Used to
 # filter down to variant constructors (`Some`, `Ok`, `Err`, user
@@ -20572,8 +20626,25 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
     [] -> EnvWithArities { env: env, arities: ar_acc }
     [d, ...rest] -> {
       let r = match d {
-        DFn(_, fname, _, _, _, _, _, _, _, _) -> match fn_scheme_of_decl(d) {
-          Some(sc) -> EnvWithArities { env: ty_env_add(env, fname, sc), arities: ar_acc }
+        # Issue #219: register the scheme under the bare `fname`
+        # (today's behaviour — newest registration shadows earlier
+        # ones in `ty_env_lookup`) AND, when the decl carries a
+        # module origin, under the composite `<mod>::<fname>` so
+        # the EModCall branch can pick the correct scheme by
+        # qualifier instead of guessing from arg types after a
+        # wrong scheme was instantiated. Bare lookups are
+        # unaffected — the EModCall branch consults the qualified
+        # key first and falls back to bare only for prelude-only
+        # schemes registered by `add_prelude_sigs`.
+        DFn(_, fname, _, _, _, _, _, _, _, mo) -> match fn_scheme_of_decl(d) {
+          Some(sc) -> {
+            let env1 = ty_env_add(env, fname, sc)
+            let env2 = match mo {
+              Some(m) -> ty_env_add_qualified(env1, m, fname, sc)
+              None    -> env1
+            }
+            EnvWithArities { env: env2, arities: ar_acc }
+          }
           None     -> EnvWithArities { env: env, arities: ar_acc }
         }
         DType(_, _, _, _, _, _) -> EnvWithArities { env: add_variants_of_decl(env, d, top_names), arities: ar_acc }
@@ -22971,35 +23042,42 @@ fn synth(st: InferState, e: Expr) : Inferred {
     # has them without re-walking the env. Errors yield a TyAny
     # stub so cascade is graceful.
     EVariantsOf(ty_expr, _) -> synth_variants_of(st, ty_expr, e)
-    # m6.2 Phase 2.4: qualified call. Phase 2.3 only rewrites
+    # m6.2 Phase 2.4 / Issue #219: qualified call. rqc rewrites
     # `EField(EVar(mod), fname)` to `EModCall(mod, fname)` after
-    # checking that `mod` is in the module table and `fname` is in
-    # its exports — which means the function decl is concatenated
-    # into the global decl stream (M6.1 semantics) and its scheme
-    # lives in TyEnv under the bare `fname` key. v1 shares the
-    # symbol with legacy unqualified callers; v2 will universalise
-    # the prefixed `kai_<module>__<name>` minting and use this
-    # variant to disambiguate two modules that export the same
-    # name. Until then, the lookup is the same as `EVar(fname)`.
-    EModCall(m, fname) -> match ty_env_lookup(st.env, fname) {
-      Some(sc) -> {
-        let r = st_instantiate_report(st, sc)
-        let st2 = if r.fresh == [] and r.unit_fresh == [] {
-          r.st
-        } else {
-          st_push_inst(r.st, CS(fname, e.line, e.col, r.fresh, r.unit_fresh))
-        }
-        inferred_leaf(st2, r.ty, e)
+    # checking `fname` is in `mod`'s exports. Module fns register
+    # under both the bare `fname` and a `<mod>::<fname>` key
+    # (`add_decls_loop`); we consult the qualified key first so
+    # two modules exporting the same name resolve unambiguously
+    # to their declaring module instead of shadowing via insert
+    # order. Bare lookup remains as a fallback for legacy
+    # prelude-only schemes (`add_prelude_sigs`) that do not flow
+    # through `add_decls_loop` and therefore have no qualified
+    # entry.
+    EModCall(m, fname) -> {
+      let scheme_opt = match ty_env_lookup_qualified(st.env, m, fname) {
+        Some(sc) -> Some(sc)
+        None     -> ty_env_lookup(st.env, fname)
       }
-      None -> {
-        # Should not happen — rqc only rewrites when fname is in
-        # the module's exports. If we land here, the table and the
-        # decl stream got out of sync; surface as a diagnostic
-        # rather than a panic so the user sees a concrete location.
-        diag_error(st.file, e.line, e.col,
-          concat_all(["module '", m, "' does not export '", fname,
-                      "' at the typer (rqc / TyEnv mismatch — internal)"]))
-        inferred_leaf(st_bump_err(st), TyAny, e)
+      match scheme_opt {
+        Some(sc) -> {
+          let r = st_instantiate_report(st, sc)
+          let st2 = if r.fresh == [] and r.unit_fresh == [] {
+            r.st
+          } else {
+            st_push_inst(r.st, CS(fname, e.line, e.col, r.fresh, r.unit_fresh))
+          }
+          inferred_leaf(st2, r.ty, e)
+        }
+        None -> {
+          # Should not happen — rqc only rewrites when fname is in
+          # the module's exports. If we land here, the table and the
+          # decl stream got out of sync; surface as a diagnostic
+          # rather than a panic so the user sees a concrete location.
+          diag_error(st.file, e.line, e.col,
+            concat_all(["module '", m, "' does not export '", fname,
+                        "' at the typer (rqc / TyEnv mismatch — internal)"]))
+          inferred_leaf(st_bump_err(st), TyAny, e)
+        }
       }
     }
   }
