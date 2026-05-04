@@ -46,14 +46,16 @@ test-multi-module: kaic2
 	@set -e; \
 	root=$$(pwd); \
 	kai="$$root/bin/kai"; \
-	src="$$root/examples/multi-module/main.kai"; \
-	exp="$$root/examples/multi-module/main.out.expected"; \
-	out=$$(mktemp); \
-	(cd / && "$$kai" run "$$src") > "$$out" \
-	  || { echo "multi-module FAIL (kai run)"; rm -f "$$out"; exit 1; }; \
-	diff -q "$$exp" "$$out" > /dev/null \
-	  && { echo "multi-module OK"; rm -f "$$out"; } \
-	  || { echo "multi-module DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }
+	for case in multi-module multi-module/issue-237; do \
+	  src="$$root/examples/$$case/main.kai"; \
+	  exp="$$root/examples/$$case/main.out.expected"; \
+	  out=$$(mktemp); \
+	  (cd / && "$$kai" run "$$src") > "$$out" \
+	    || { echo "$$case FAIL (kai run)"; rm -f "$$out"; exit 1; }; \
+	  diff -q "$$exp" "$$out" > /dev/null \
+	    && { echo "$$case OK"; rm -f "$$out"; } \
+	    || { echo "$$case DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
+	done
 
 # m12.8 Phase 3 — Core demo gate. Delegates to stage2's
 # `test-demos-core` which builds each demo under examples/portfolio/
