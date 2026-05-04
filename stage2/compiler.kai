@@ -8599,6 +8599,15 @@ fn prelude_names() : [String] {
     # analyser does not treat them as free vars to capture inside lambda
     # bodies (which would emit invalid C: `kai___perceus_dup` is undeclared).
     "__perceus_dup", "__perceus_drop",
+    # issue #118 — Perceus reuse-in-place magic names. The recogniser
+    # `pcs_recognise_reuse_*` synthesises calls to these from
+    # constructor-after-deconsume patterns. The emitter lowers them to
+    # `kai_reuse_or_alloc_<shape>` runtime helpers that branch on the
+    # consumed cell's RC: in-place rewrite when unique, fall back to a
+    # fresh allocation when shared.
+    "__perceus_reuse_cons",
+    "__perceus_reuse_record",
+    "__perceus_reuse_variant",
     # Bug 8 (docs/m12.8-followup.md): `unitless` removed from the
     # user-visible prelude. It was implemented as an emit-time
     # identity special case (no kai_prelude_unitless runtime fn),
@@ -9820,6 +9829,80 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn
             "kai_internal_drop(", emit_expr(src, a, lcs, fns, variants, lams, cls), ")"
           ])
           _   -> "kai_unit() /* __perceus_drop: arity mismatch */"
+        }
+      } else if callee == "__perceus_reuse_cons" {
+        # issue #118 — reuse-in-place for cons cells. The recogniser
+        # synthesises calls of the form
+        #   `__perceus_reuse_cons(__pcs_scr, head, tail)`
+        # inside a `match SCRUT { [h, ...t] -> ... }` arm body.
+        # `__pcs_scr` is a synthetic identifier that lowers to the
+        # match emitter's local `_scr` — sidestepping the need to
+        # teach `emit_match_default` about reuse-aware decref. The
+        # runtime helper reads `_scr->rc`: when unique, it rewrites
+        # the cell in place + `kai_incref`s the cell so it survives
+        # the `kai_decref(_scr)` at match exit; otherwise it falls
+        # back to `kai_cons` and leaves `_scr` intact for the match
+        # exit to reclaim.
+        match args_e {
+          [_scr, h, t] -> concat_all([
+            "kai_reuse_or_alloc_cons(_scr, ",
+            emit_expr(src, h, lcs, fns, variants, lams, cls), ", ",
+            emit_expr(src, t, lcs, fns, variants, lams, cls), ")"
+          ])
+          _ -> "kai_unit() /* __perceus_reuse_cons: arity mismatch (expected 3 args) */"
+        }
+      } else if callee == "__perceus_reuse_record" {
+        # issue #118 — reuse-in-place for record cells. The recogniser
+        # synthesises `__perceus_reuse_record(__pcs_scr, {field: val, ...})`
+        # where the literal record arg is a same-arity rebuild. We
+        # extract its field exprs + names from the ERecordLit and
+        # forward them in the same shape `kai_record` expects.
+        match args_e {
+          [_scr, lit] -> match lit.kind {
+            ERecordLit(_rec_name, fis) -> {
+              let n = list_length(fis)
+              let vals  = join_with(map(fis, (fi) => emit_field_init_val(src, fi, lcs, fns, variants, lams, cls)), ", ")
+              let names = join_with(map(fis, emit_field_init_name), ", ")
+              concat_all([
+                "kai_reuse_or_alloc_record(_scr, ",
+                int_to_string(n),
+                ", (KaiValue *[]){", vals, "}, (const char *[]){", names, "})"
+              ])
+            }
+            _ -> "kai_unit() /* __perceus_reuse_record: 2nd arg must be a record literal */"
+          }
+          _ -> "kai_unit() /* __perceus_reuse_record: arity mismatch (expected 2 args) */"
+        }
+      } else if callee == "__perceus_reuse_variant" {
+        # issue #118 — reuse-in-place for variant cells. Recogniser
+        # synthesises `__perceus_reuse_variant(__pcs_scr, Ctor(args...))`
+        # where the second arg is a variant constructor call of the
+        # same arity. We unpack the constructor's name + args and
+        # lower to `kai_reuse_or_alloc_variant`.
+        match args_e {
+          [_scr, ctor] -> match ctor.kind {
+            ECall(cf, cargs) -> match cf.kind {
+              EVar(cname) -> {
+                let n = list_length(cargs)
+                let arg_strs = emit_call_args(src, cargs, lcs, fns, variants, lams, cls)
+                if n == 0 {
+                  concat_all([
+                    "kai_reuse_or_alloc_variant(_scr, 0, \"", cname,
+                    "\", 0, NULL)"
+                  ])
+                } else {
+                  concat_all([
+                    "kai_reuse_or_alloc_variant(_scr, 0, \"", cname,
+                    "\", ", int_to_string(n),
+                    ", (KaiValue *[]){", arg_strs, "})"
+                  ])
+                }
+              }
+              _ -> "kai_unit() /* __perceus_reuse_variant: 2nd arg must be a variant constructor call */"
+            }
+            _ -> "kai_unit() /* __perceus_reuse_variant: 2nd arg must be a variant constructor call */"
+          }
+          _ -> "kai_unit() /* __perceus_reuse_variant: arity mismatch (expected 2 args) */"
         }
       } else if callee == "bit_and" {
         # m13: bit ops are compiler intrinsics — each lowers inline to
@@ -28997,7 +29080,8 @@ fn perceus_decl(d: Decl) : Decl {
       let pnames = map(params, (p) => p.pname)
       let uses = pcs_collect_uses_expr(body, pnames, false, [])
       let new_body = pcs_rewrite_expr(body, pnames, uses, false)
-      let body_with_drops = pcs_prepend_unused_drops(new_body, params, uses)
+      let reused_body = pcs_recognise_reuse_expr(new_body)
+      let body_with_drops = pcs_prepend_unused_drops(reused_body, params, uses)
       DFn(is_pub, name, tparams, params, opt_ret, row, body_with_drops, ln, cl, mo)
     }
     # Test bodies are emitted as their own thunk fns; without rewriting
@@ -29009,12 +29093,14 @@ fn perceus_decl(d: Decl) : Decl {
     DTest(desc, body, ln, cl) -> {
       let uses = pcs_collect_uses_expr(body, [], false, [])
       let new_body = pcs_rewrite_expr(body, [], uses, false)
-      DTest(desc, new_body, ln, cl)
+      let reused_body = pcs_recognise_reuse_expr(new_body)
+      DTest(desc, reused_body, ln, cl)
     }
     DBench(desc, body, ln, cl) -> {
       let uses = pcs_collect_uses_expr(body, [], false, [])
       let new_body = pcs_rewrite_expr(body, [], uses, false)
-      DBench(desc, new_body, ln, cl)
+      let reused_body = pcs_recognise_reuse_expr(new_body)
+      DBench(desc, reused_body, ln, cl)
     }
     # check v1 (issue #44): with-clause params behave like fn params
     # for Perceus — collected as known external bindings so dup/drop
@@ -29025,9 +29111,174 @@ fn perceus_decl(d: Decl) : Decl {
       let pnames = map(ps, (p) => p.pname)
       let uses = pcs_collect_uses_expr(body, pnames, false, [])
       let new_body = pcs_rewrite_expr(body, pnames, uses, false)
-      DCheck(desc, ps, new_body, ln, cl)
+      let reused_body = pcs_recognise_reuse_expr(new_body)
+      DCheck(desc, ps, reused_body, ln, cl)
     }
     _ -> d
+  }
+}
+
+# ---- issue #118 — Perceus reuse-in-place recogniser ----
+#
+# Walks the post-`pcs_rewrite_expr` AST looking for match arms whose
+# body rebuilds a constructor of the same shape as the arm's pattern.
+# When found, the rebuild is rewritten to call one of the magic
+# `__perceus_reuse_*` helpers; the emitter (`emit_call_expr`) lowers
+# those to runtime hooks that branch on the consumed cell's RC at
+# each invocation: rewrite-in-place when unique, fall back to
+# `kai_<shape>` when shared.
+#
+# The synthetic identifier `__pcs_scr` is the recogniser's hand-off
+# to the emitter — it lowers to the literal C local `_scr` that
+# `emit_match_default` introduces for every match. The match exit
+# always `kai_decref(_scr)`s; the runtime helpers `kai_incref` the
+# reused cell so it survives the decref, leaving the caller with a
+# unique-RC result.
+#
+# v1 patterns (audit §1):
+#   - cons:    Arm(PList([_], Some(t)), None, EList([ElPlain(_), ElSpread(_)]))
+#   - variant: Arm(PVariant(_, ps), None, ECall(EVar(C), args))
+#                where length(args) == length(ps)
+#   - record:  Arm(PRecord(_), None, ERecordLit(_, fis))
+#                where the literal has the same field count
+#
+# Out of v1 scope: PVariantRecord (named-field variants), guards,
+# blocks before the rebuild, multi-cons rebuilds (e.g. `[a, b, ...c]
+# -> [a', b', ...c']` rewrites only the outermost cons), arms whose
+# body recurses through a let-binding (those would need a follow-up
+# pass). The runtime `rc == 1` guard makes every fall-through case
+# safe — a missed recognition is a missed optimisation, not a bug.
+
+fn pcs_recognise_reuse_expr(e: Expr) : Expr =
+  Expr { kind: pcs_recognise_reuse_kind(e.kind, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn pcs_recognise_reuse_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
+  match k {
+    EMatch(scr, arms) ->
+      EMatch(pcs_recognise_reuse_expr(scr),
+             pcs_recognise_reuse_arms(arms))
+    _ -> map_expr_kind(k, pcs_recognise_reuse_expr)
+  }
+}
+
+fn pcs_recognise_reuse_arms(arms: [Arm]) : [Arm] {
+  match arms {
+    [] -> []
+    [a, ...rest] -> match a {
+      Arm(pat, opt_g, body) -> {
+        # Recurse into the body first so nested matches also get
+        # rewritten, then attempt the same-shape recognition on the
+        # outermost form. Guards disable recognition (the body might
+        # not run) — keep the conservative path.
+        let body1 = pcs_recognise_reuse_expr(body)
+        let body2 = match opt_g {
+          None    -> pcs_try_reuse_arm(pat, body1)
+          Some(_) -> body1
+        }
+        [Arm(pat, opt_g, body2),
+         ...pcs_recognise_reuse_arms(rest)]
+      }
+    }
+  }
+}
+
+# Build the synthetic `__pcs_scr` placeholder at a given source
+# position. The emitter recognises the name inside
+# `__perceus_reuse_*` first-arg slots and lowers it to `_scr`.
+fn pcs_mk_scr(line: Int, col: Int) : Expr =
+  Expr { kind: EVar("__pcs_scr"), line: line, col: col,
+         ty: None, mode: MUnknown }
+
+fn pcs_mk_call(name: String, args: [Expr], line: Int, col: Int) : Expr =
+  Expr { kind: ECall(
+            Expr { kind: EVar(name), line: line, col: col,
+                   ty: None, mode: MUnknown },
+            args),
+         line: line, col: col, ty: None, mode: MUnknown }
+
+fn pcs_try_reuse_arm(pat: Pattern, body: Expr) : Expr {
+  match pat.pkind {
+    # Cons rebuild — `[h, ...t] -> [g(h), ...recur(t)]`. Only the
+    # single-head shape (one fixed sub-pattern + a rest binder) is
+    # in v1 scope; multi-head spines fall through to the normal
+    # `kai_cons` allocator.
+    PList(pats, opt_rest) -> {
+      match opt_rest {
+        Some(_) -> match pats {
+          [_] -> pcs_try_reuse_cons(body)
+          _   -> body
+        }
+        None -> body
+      }
+    }
+    # Variant + record rebuilds: deferred to a follow-up lane.
+    # The post-`pcs_rewrite_expr` pattern shape needs more careful
+    # arity / shape-matching checks than v1 ships — see
+    # docs/perceus-anga-roa-phase0-audit.md §1 for the upgrade path.
+    _ -> body
+  }
+}
+
+fn pcs_try_reuse_cons(body: Expr) : Expr {
+  match body.kind {
+    EList(elems) -> match elems {
+      [e1, e2] -> match e1 {
+        ElPlain(h_new) -> match e2 {
+          ElSpread(t_new) ->
+            pcs_mk_call("__perceus_reuse_cons",
+                        [pcs_mk_scr(body.line, body.col), h_new, t_new],
+                        body.line, body.col)
+          _ -> body
+        }
+        _ -> body
+      }
+      _ -> body
+    }
+    _ -> body
+  }
+}
+
+fn pcs_try_reuse_variant(body: Expr, expected_arity: Int) : Expr {
+  match body.kind {
+    ECall(callee, args) -> match callee.kind {
+      EVar(_cname) ->
+        if list_length(args) == expected_arity and pcs_callee_is_variant_ctor(callee) {
+          pcs_mk_call("__perceus_reuse_variant",
+                      [pcs_mk_scr(body.line, body.col), body],
+                      body.line, body.col)
+        } else { body }
+      _ -> body
+    }
+    _ -> body
+  }
+}
+
+# Heuristic: a constructor name in kaikai starts with an uppercase
+# letter. The emitter lowers `EVar(C)`-shaped callees to
+# `kai_variant(...)` when the typer-emit chain has classified them
+# as variant ctors (see `emit_call_expr`'s `is_variant_call` branch);
+# we use the same lexical signal here so the recogniser stays inside
+# the perceus pass without depending on typer state.
+fn pcs_callee_is_variant_ctor(e: Expr) : Bool {
+  match e.kind {
+    EVar(nm) -> match char_at(nm, 0) {
+      Some(c) -> c >= 'A' and c <= 'Z'
+      None    -> false
+    }
+    _ -> false
+  }
+}
+
+fn pcs_try_reuse_record(body: Expr, expected_n: Int) : Expr {
+  match body.kind {
+    ERecordLit(_rec_name, fis) ->
+      if list_length(fis) == expected_n {
+        pcs_mk_call("__perceus_reuse_record",
+                    [pcs_mk_scr(body.line, body.col), body],
+                    body.line, body.col)
+      } else { body }
+    _ -> body
   }
 }
 
@@ -31462,6 +31713,7 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_eq_raw(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_match_panic(%KaiValue*)\n",
     "declare %KaiValue* @kaix_cons(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_reuse_or_alloc_cons(%KaiValue*, %KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_incref(%KaiValue*)\n",
     "declare void         @kaix_decref(%KaiValue*)\n",
     "declare %KaiValue* @kaix_nil()\n",
@@ -32942,6 +33194,17 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
         let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
                                 llvm_format_args(ra.regs), ")\n"])
         llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+      } else if nm == "__perceus_reuse_cons" {
+        # issue #118 — LLVM mirror of the C-side
+        # `__perceus_reuse_cons` lowering. Calls
+        # `kaix_reuse_or_alloc_cons(scr, head, tail)` where `scr` is
+        # the enclosing match's scrutinee register (bound as the
+        # synthetic `__pcs_scr` local in `llvm_emit_match_arms`).
+        let ra = llvm_emit_args(e, xs, [])
+        let r = llvm_fresh_reg(ra.st)
+        let instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_reuse_or_alloc_cons(",
+                                llvm_format_args(ra.regs), ")\n"])
+        llvm_set_last(llvm_append_body(r.e, instr), r.reg)
       } else if nm == "__strip_unit" {
         # m12.8 phase 2: identity at runtime — emit the inner value
         # directly. See the matching C-emit branch for full context.
@@ -34338,7 +34601,14 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
           None -> e_test
           Some(gx) -> llvm_emit_guard_test(e_test, gx, next_try.reg)
         }
-        let eb = llvm_emit_expr(e_guarded, body)
+        # issue #118 — bind the synthetic `__pcs_scr` local to the
+        # match scrutinee register so the recogniser-emitted
+        # `__perceus_reuse_*` calls can hand it to the runtime
+        # helpers (mirrors the C backend's literal `_scr`). The
+        # local is dropped on arm-scope exit by the `outer_locals`
+        # restore below.
+        let e_with_scr = llvm_push_local(e_guarded, "__pcs_scr", scr_reg)
+        let eb = llvm_emit_expr(e_with_scr, body)
         let body_val = eb.last_val
         let body_end = eb.cur_label
         let e_br = llvm_append_body(eb, concat_all(["  br label %", end_lbl, "\n"]))
