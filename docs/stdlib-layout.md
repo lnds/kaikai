@@ -78,14 +78,52 @@ are types declared with `effect Name { ... }`; effect ops read
 distinction is *what is on the left*, not *how it is called*.
 
 The flat-prefix style (`list_take`, `string_concat`, `opt_map`) used
-in early stdlib drafts is **deprecated**: it pre-dates m6 module
-resolution and exists only because nothing else worked. Migration is
-agendada en m14 (Stdlib expansion).
+in early stdlib drafts is **retired** as the canonical user-facing
+form. Module-relative names (`list.take`, `option.map`) are now the
+canonical surface. The m14 milestone (#203) carried out the rename
+across `stdlib/core/{list,string,option,result,char}.kai` and their
+consumers in `examples/` + `stdlib/` non-core; see the *Migration
+status* section below for the per-module summary and the small set
+of flat aliases that survive on a typer-resolver gap (#219).
 
 The four ubiquitous list operations — `map`, `filter`, `reduce`,
 `each` — keep a flat prelude alias post-migration so common pipelines
 read short (`xs |> map(f) |> filter(p)`). The aliases re-export
 `list.map` / etc. The full set is reached only via `list.*`.
+
+### Migration status (m14, #203)
+
+| Module                  | Bare-name surface | Flat aliases removed | Flat aliases surviving | Reason for survivors                                              |
+| ----------------------- | ----------------: | -------------------: | ---------------------: | ----------------------------------------------------------------- |
+| `stdlib/core/list.kai`  |               24+ |                   24 |                      5 | `list_is_empty`, `list_nth`, `list_take`, `list_contains`, `list_sum` — prelude-scope resolver gap (4) + string-interpolation gap (1) |
+| `stdlib/core/string.kai`|               13+ |                  ~14 |                      1 | `string_repeat` — typer EModCall name-only lookup (#219) collides with `list.repeat` |
+| `stdlib/core/option.kai`|                10 |                    6 |                      4 | `opt_map`, `opt_filter`, `opt_zip` — typer EModCall (#219) collides with `list.{map,filter,zip}`; `opt_or` — `or` is a reserved keyword (`TkOr`) |
+| `stdlib/core/result.kai`|                12 |                    6 |                      6 | `result_map`, `result_and_then`, `result_unwrap_or`, `result_or_else`, `result_unwrap_or_else`, `result_collect` — all #219 collisions with `list` / `option` exports |
+| `stdlib/core/char.kai`  |                 8 |                    8 |                      0 | none — character-domain names are unique across `stdlib/core/`    |
+| `stdlib/core/tuple.kai` |               n/a |                  n/a |                    n/a | exports types only (`Pair`/`Triple`/`Quad`); no flat-named functions to migrate |
+| `stdlib/core/io.kai`    |               n/a |                  n/a |                    n/a | exports a single `pub fn println`; already module-relative shape  |
+
+**Issue #219** (typer EModCall lookup is name-only) is the gating
+follow-up for the 11 `opt_*` / `result_*` survivors and the lone
+`string_repeat`. Once the typer resolves `module.fname` against
+the explicit module qualifier instead of doing a flat
+`ty_env_lookup(fname)`, the remaining flat aliases can be deleted
+in a mechanical follow-up. The `opt_or` survivor is independent
+— it is blocked by parser-level keyword reservation, not by #219.
+
+The 5 `list_*` survivors are blocked by separate compiler gaps
+documented in the m14 Phase 1 retro
+(`docs/lane-experience-issue-203-phase1-list.md`): four hit a
+prelude-scope resolver gap that prevents a bare `is_empty` /
+`nth` / `take` / `contains` from being reached qualified, and
+`list_sum` hits a string-interpolation lowering gap. These are
+out of scope for m14 and tracked separately.
+
+Stage 0 PRELUDE builtins (`string_concat`, `string_length`,
+`string_slice`, `string_split`, `string_contains`, `list_length`,
+`list_reverse`, `char_at`, `char_to_int`, `int_to_char`, …) are
+*below* the user-facing language and were never part of the m14
+migration; see `docs/m14-bootstrap-audit.md` Risk 5.
 
 ## Bootstrap layering
 
@@ -403,16 +441,19 @@ spec lands, it is added to this header.
 - **Import paths in code**: dot-separated (`import net.http`).
 - **Function calls**: `module.function` (`net.http.get(url)`). No
   package-level prefixes inside function names.
-- **Migration from today's `list_*` / `string_*`**: those are a
+- **Migration from today's `list_*` / `string_*`**: those were a
   stopgap for kaikai-minimal, which lacks modules. **m6.2 —
-  qualified calls** landed 2026-04-27, so `list.map(xs, f)` and
-  similar qualified shapes are now callable. The mechanical
-  rename (`list_map` → `list.map`, `string_trim` →
-  `string.trim`, etc.) runs under **m14**: every flat-prefix
-  surface retires once `stage2/compiler.kai` re-validates
-  selfhost on the new names. Stage 1 code (kaikai-minimal) keeps
-  the `list_*` / `string_*` prefixes — the migration only applies
-  to stage 2 code where qualified module calls exist.
+  qualified calls** landed 2026-04-27, and the mechanical rename
+  (`list_map` → `list.map`, `string_trim` → `string.trim`, etc.)
+  ran under **m14** (#203, closed). The *Migration status* table
+  above lists the per-module result. The handful of surviving
+  flat aliases (16 total across `list` / `string` / `option` /
+  `result`) are blocked on resolver gaps (#219 for typer
+  EModCall, plus prelude-scope and string-interpolation gaps for
+  the `list_*` survivors) and retire once those gaps close.
+  Stage 1 code (kaikai-minimal) keeps the `list_*` / `string_*`
+  prefixes — the migration only applies to stage 2 code where
+  qualified module calls exist.
 - **Type constructors**: PascalCase (`Some`, `None`, `Ok`, `Err`).
   Unchanged.
 - **Type names**: PascalCase (`List`, `String`, `Option`, `Instant`,
@@ -489,13 +530,17 @@ Once this doc is reviewed and pinned:
    / Default handler / Error model / Stdlib helpers).
 2. ~~Move the current `stdlib/core.kai` monolith into the `core/*`
    subdirectory~~ — **landed 2026-04-27** as `stdlib/core/{list,
-   string,option,result,char,tuple,io}.kai`. Function names
-   unchanged (still `list_*` / `string_*` / `opt_*` / `result_*` /
-   `ch_*` / `println` / `Pair`). m6.2 (qualified module calls)
-   **also landed 2026-04-27**, so the rename to `list.map` /
-   `string.trim` is now mechanical and runs as part of m14
-   proper. See `docs/stage2-design.md` §m6 for the m6.1/m6.2
-   split and `docs/m6.2-design.md` for the full design.
+   string,option,result,char,tuple,io}.kai`. The follow-up
+   rename of function names to module-relative form
+   (`list.map`, `string.trim`, `option.map`, `result.and_then`,
+   `char.is_digit`, …) **landed under m14** (#203, closed
+   2026-05-04) across six PRs. See the *Migration status*
+   table above for the per-module summary, and
+   `docs/m14-bootstrap-audit.md` for the audit that reframed
+   the milestone away from a bootstrap-split into a direct
+   single-tree migration. See `docs/stage2-design.md` §m6 for
+   the m6.1/m6.2 split and `docs/m6.2-design.md` for the
+   qualified-call design.
 3. Land one stage-2 module end-to-end (candidate: `time`) as the
    template for the rest. Drives whatever compiler plumbing the
    effect requires and validates the `Clock` handler contract before
