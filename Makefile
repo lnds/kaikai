@@ -219,6 +219,8 @@ tier1-asan: kaic2
 	@echo "tier1-asan OK — issue #126 fixture passes under ASAN+UBSan (Process effect runtime gate)"
 	@$(MAKE) -C stage2 test-perceus-issue82-asan
 	@echo "tier1-asan OK — issue #82 fixture passes under ASAN+UBSan (Perceus leak-audit gate)"
+	@$(MAKE) -C stage2 test-ffi-extern-c-asan
+	@echo "tier1-asan OK — m12.7.x FFI fixture passes under ASAN+UBSan (extern_c shim memory gate)"
 	@$(MAKE) -C stage2 test-perceus-issue118-asan
 	@echo "tier1-asan OK — issue #118 fixtures pass under ASAN+UBSan (Perceus reuse-in-place gate)"
 	@$(MAKE) -C stage2 test-match-pbind-catchall-asan

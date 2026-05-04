@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-log-asan test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-log-asan test-ffi-extern-c test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs selfhost
 
 all: $(TARGET)
 
@@ -437,6 +437,45 @@ test-foreign-prelude: $(TARGET) build
 	diff -q ../examples/effects/foreign_prelude.out.expected build/foreign_prelude.out > /dev/null \
 	  && echo "foreign-prelude OK" \
 	  || { echo "foreign-prelude DIFF"; diff ../examples/effects/foreign_prelude.out.expected build/foreign_prelude.out; exit 1; }
+
+# m12.7.x FFI v1 regression — `[<extern_c>]` axiom lowers to a
+# direct `extern "C"` call. Compiles + runs the fixture on the C
+# backend and the LLVM backend so a regression on either path
+# (parser, lower_axiom_one, perceus skip, emit_fn_body detection,
+# llvm_emit_ffi_shim) shows up under tier1. The fixture stays
+# libc-only so it links without extra `cc` flags.
+test-ffi-extern-c: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic.c; \
+	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage0 build/ffi_extern_c_basic.c -o build/ffi_extern_c_basic-c; \
+	./build/ffi_extern_c_basic-c > build/ffi_extern_c_basic.out; \
+	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic.out > /dev/null \
+	  && echo "ffi-extern-c OK (C backend)" \
+	  || { echo "ffi-extern-c DIFF (C backend)"; diff ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic.out; exit 1; }; \
+	./$(TARGET) --emit=llvm ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic.ll; \
+	clang -w -I ../stage0 build/ffi_extern_c_basic.ll ../stage0/runtime_llvm.c -o build/ffi_extern_c_basic-llvm; \
+	./build/ffi_extern_c_basic-llvm > build/ffi_extern_c_basic-llvm.out; \
+	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-llvm.out > /dev/null \
+	  && echo "ffi-extern-c OK (LLVM backend)" \
+	  || { echo "ffi-extern-c DIFF (LLVM backend)"; diff ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-llvm.out; exit 1; }
+
+# Tier 1-ASAN counterpart: same fixture, but the linked binary is
+# instrumented with AddressSanitizer + UndefinedBehaviorSanitizer
+# so any memory misuse in the FFI shim (un-balanced kai_decref, off-
+# by-one extraction of the bytes pointer, etc.) trips the sanitizer
+# at the exact site instead of corrupting heap state silently.
+test-ffi-extern-c-asan: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic-asan.c; \
+	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	      -Wno-unused-function -Wno-unused-variable -Wno-absolute-value \
+	      -I ../stage0 build/ffi_extern_c_basic-asan.c -o build/ffi_extern_c_basic-c-asan; \
+	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	  ./build/ffi_extern_c_basic-c-asan > build/ffi_extern_c_basic-asan.out 2>&1; \
+	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-asan.out > /dev/null \
+	  && echo "ffi-extern-c-asan OK (C backend, ASAN+UBSan clean)" \
+	  || { echo "ffi-extern-c-asan DIFF (C backend, ASAN+UBSan)"; cat build/ffi_extern_c_basic-asan.out; exit 1; }
 
 # Issue #216 regression — qualified-call resolver inside a
 # `--prelude`-loaded file. The helper `qualified_call_in_prelude_lib`
@@ -3126,7 +3165,7 @@ test-unions: $(TARGET) build
 	  fi; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs test-ffi-extern-c
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of

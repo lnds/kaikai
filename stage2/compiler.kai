@@ -1478,7 +1478,16 @@ type Decl
   # `lower_axioms` rewrites every DAxiom to a DFn with the panic
   # body BEFORE any other Decl walker runs, so downstream passes
   # only see DFn. Doc: `docs/proposed-extensions.md` §4.
-  | DAxiom(Bool, String, [String], [Param], TypeExpr, RowExpr, Int, Int)
+  #
+  # m12.7.x FFI v1: a `[<extern_c>]` attribute prefix flips the
+  # second `Bool` field on. When set, `lower_axiom_one` synthesises
+  # a real FFI shim body (an `ETodo` whose message is the magic
+  # tag `__kai_ffi__`) instead of the panic. The C / LLVM emitters
+  # detect that tag inside `emit_fn_body` and lower the body to a
+  # direct `extern "C"` call against the named symbol, so call
+  # sites of the form `puts("hi")` link straight to libc without
+  # any wrapper allocation.
+  | DAxiom(Bool, Bool, String, [String], [Param], TypeExpr, RowExpr, Int, Int)
 
 # m12.8: a single operation declared inside a `protocol P { ... }`
 # block. Mirrors EffectOp's shape (no body, with optional generic
@@ -4816,7 +4825,16 @@ fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy {
 # ====================================================================
 
 fn parse_decl(p: Parser) : PDecl {
-  let p0 = p_skip_newlines(p)
+  let p_pre = p_skip_newlines(p)
+  # m12.7.x FFI v1: optional `[<extern_c>]` decl-level attribute. When
+  # present, we consume the bracketed attribute here and forward the
+  # `extern_c` flag to `parse_axiom_decl`. Any decl other than `axiom`
+  # following `[<extern_c>]` is an error — surfaced after we know what
+  # the next keyword is.
+  let attr_r = parse_optional_extern_c_attribute(p_pre)
+  let p_after_attr = attr_r.p
+  let extern_c = attr_r.is_extern_c
+  let p0 = p_skip_newlines(p_after_attr)
   let t = p_peek(p0)
   let is_pub_r =
     if tk_is(t.kind, TkPub) { PTy { p: p_advance(p0), r: Some(mk_ty(TyName("", []), 0, 0)) } }
@@ -4857,7 +4875,9 @@ fn parse_decl(p: Parser) : PDecl {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a `use` declaration")) }
     else { parse_use_decl(p_advance(p1), hd) }
   } else if tk_is(hd.kind, TkAxiom) {
-    parse_axiom_decl(p_advance(p1), is_pub, hd)
+    parse_axiom_decl(p_advance(p1), is_pub, extern_c, hd)
+  } else if extern_c {
+    err_d(p_error_here(p1, "`[<extern_c>]` is only allowed on `axiom` declarations (m12.7.x FFI v1)"))
   } else if tk_is(hd.kind, TkConst) {
     parse_const_decl(p_advance(p1), is_pub, hd)
   } else {
@@ -4921,7 +4941,12 @@ fn parse_const_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
 # clause — `=` or `{` after the row annotation is rejected. The
 # Decl carries everything `lower_axioms` needs to synthesise a
 # `todo!` body in the desugar pass.
-fn parse_axiom_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
+#
+# m12.7.x FFI v1: `extern_c` is true when the parser saw a
+# `[<extern_c>]` attribute prefix. The flag rides on the DAxiom and
+# `lower_axiom_one` reads it to switch between the panic-stub and
+# FFI-shim body forms.
+fn parse_axiom_decl(p: Parser, is_pub: Bool, extern_c: Bool, t: Token) : PDecl {
   let id = p_peek(p)
   if not tk_is(id.kind, TkIdent) {
     err_d(p_error(p, id, "expected axiom name"))
@@ -4959,7 +4984,7 @@ fn parse_axiom_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
                     if p_at(p4, TkEq) or p_at(p4, TkLbrace) {
                       err_d(p_error_here(p4, "axiom must not have a body — drop the `=` / `{` and trailing block"))
                     } else {
-                      ok_d(row_r.p, DAxiom(is_pub, name, tparams, params, ty, row_r.r, t.line, t.col))
+                      ok_d(row_r.p, DAxiom(is_pub, extern_c, name, tparams, params, ty, row_r.r, t.line, t.col))
                     }
                   }
                 }
@@ -5252,6 +5277,54 @@ fn parse_optional_pure_attribute(p: Parser) : PureAttr {
 
 fn maybe_wrap_pure(is_pure: Bool, dfn: Decl, line: Int, col: Int) : Decl =
   if is_pure { DAttribPure(dfn, line, col) } else { dfn }
+
+# m12.7.x FFI v1: result of attempting to parse the optional
+# `[<extern_c>]` decl-level attribute that precedes an `axiom`. The
+# shape mirrors `PureAttr`/`parse_optional_pure_attribute` so the
+# bracket-with-angle attribute grammar stays consistent across the
+# language. Peek-2 lookahead so a bare `[` (e.g. a list literal at
+# the top of a const) does not trigger.
+type ExternCAttr = { p: Parser, is_extern_c: Bool }
+
+fn parse_optional_extern_c_attribute(p: Parser) : ExternCAttr {
+  if not p_at(p, TkLbracket) { ExternCAttr { p: p, is_extern_c: false } }
+  else if not tk_is(p_peek1(p).kind, TkLt) {
+    ExternCAttr { p: p, is_extern_c: false }
+  } else {
+    let p1 = p_skip_newlines(p_advance(p))
+    let p2 = p_skip_newlines(p_advance(p1))
+    let id = p_peek(p2)
+    if not tk_is(id.kind, TkIdent) {
+      ExternCAttr { p: p, is_extern_c: false }
+    } else {
+      let attr_name = tok_source(p2.src, id)
+      if not (attr_name == "extern_c") {
+        # Not our attribute — leave the parser untouched so other
+        # paths (`parse_optional_pure_attribute` after a fn signature)
+        # still see the brackets.
+        ExternCAttr { p: p, is_extern_c: false }
+      } else {
+        let p3 = p_skip_newlines(p_advance(p2))
+        if not p_at(p3, TkGt) {
+          ExternCAttr {
+            p: p_error_here(p3, "expected `>` to close `[<extern_c>]` attribute"),
+            is_extern_c: false
+          }
+        } else {
+          let p4 = p_skip_newlines(p_advance(p3))
+          if not p_at(p4, TkRbracket) {
+            ExternCAttr {
+              p: p_error_here(p4, "expected `]` to close `[<extern_c>]` attribute"),
+              is_extern_c: false
+            }
+          } else {
+            ExternCAttr { p: p_advance(p4), is_extern_c: true }
+          }
+        }
+      }
+    }
+  }
+}
 
 # m12.6.b: contract-clause result. Carries the parser advanced past
 # all `requires` / `ensures` clauses plus the accumulated predicates.
@@ -8341,9 +8414,10 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
       dump_row_expr(row, depth + 1)
       dump_expr(body, depth + 1)
     }
-    DAxiom(is_pub, name, tparams, params, ret_ty, row, line, col) -> {
+    DAxiom(is_pub, extern_c, name, tparams, params, ret_ty, row, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
-      emit_line(depth, "axiom #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      let ext_s = if extern_c { "extern_c " } else { "" }
+      emit_line(depth, "axiom #{ext_s}#{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
       tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
       params |> each((pm) => dump_param(pm, depth + 1))
       dump_type(ret_ty, depth + 1)
@@ -8948,7 +9022,7 @@ fn chk_decl(e: Env, d: Decl) : Env {
     DDerive(_, _, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit declarations introduce no value bindings
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before chk runs
-    DAxiom(_, _, _, _, _, _, _, _) -> e     # m12.7: rewritten to DFn by lower_axioms before chk runs
+    DAxiom(_, _, _, _, _, _, _, _, _) -> e     # m12.7: rewritten to DFn by lower_axioms before chk runs
     DAttribPure(inner, _, _) -> chk_decl(e, inner)  # m12.6.x #5(a)
   }
 }
@@ -8991,7 +9065,7 @@ fn register_one(e: Env, d: Decl) : Env {
     DDerive(_, _, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit names live in their own namespace, validated at type-resolve time
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before register_one runs
-    DAxiom(_, name, _, _, _, _, _, _) -> env_add(e, name)  # m12.7: also rewritten to DFn by lower_axioms; case kept for completeness
+    DAxiom(_, _, name, _, _, _, _, _, _) -> env_add(e, name)  # m12.7: also rewritten to DFn by lower_axioms; case kept for completeness
     DAttribPure(inner, _, _) -> register_one(e, inner)  # m12.6.x #5(a)
   }
 }
@@ -9082,7 +9156,13 @@ fn builtin_effect_arities_filtered(known: [EffArity]) : [EffArity] {
     EA("Console", 0), EA("Fail", 0), EA("Stdin", 0),
     EA("Env", 0), EA("File", 0),
     EA("State", 1), EA("Reader", 1), EA("Writer", 1),
-    EA("Mutable", 0)
+    EA("Mutable", 0),
+    # m12.7.x FFI v1: `Ffi` is the capability tag carried by every
+    # `[<extern_c>]` axiom row. The runtime has no handler for it —
+    # the codegen lowers extern_c calls to direct C symbols, which
+    # never trap into the effect dispatcher — so the row label
+    # exists only to keep public signatures honest.
+    EA("Ffi", 0)
   ]
   filter_unknown_arities(all, known)
 }
@@ -9190,7 +9270,7 @@ fn check_row_labels_loop(labels: [RowLabel], file: String, line: Int, col: Int,
           if not list_has(eff_names, name) {
             let _ = diag_error(file, line, col,
               string_concat("unknown effect: ", name))
-            let _ = diag_note("only declared `effect Foo { ... }` names and the catalog (Console, Fail, Stdin, Env, File, State, Reader, Writer, Mutable) are valid in a row")
+            let _ = diag_note("only declared `effect Foo { ... }` names and the catalog (Console, Fail, Stdin, Env, File, State, Reader, Writer, Mutable, Ffi) are valid in a row")
             let _ = diag_help("declare `effect #{name} { ... }` first, or fix the spelling")
             1
           } else {
@@ -11755,7 +11835,7 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
     DDerive(_, _, _, _) -> st
     DUnit(_, _, _, _, _) -> st               # m12.5: no expressions in a unit decl
     DUse(_, _, _) -> st                       # m7e §25: stripped by desugar_use_decls; no expressions
-    DAxiom(_, _, _, _, _, _, _, _) -> st     # m12.7: rewritten to DFn by lower_axioms; no expressions on the bare form
+    DAxiom(_, _, _, _, _, _, _, _, _) -> st     # m12.7: rewritten to DFn by lower_axioms; no expressions on the bare form
     DAttribPure(inner, _, _) -> collect_decl(inner, st)  # m12.6.x #5(a)
   }
 }
@@ -13237,34 +13317,240 @@ fn emit_thunk_forward(d: Decl) : String {
 
 fn emit_fn_body(src: String, d: Decl, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match d {
-    DFn(_, name, _, params, _, _, body, _, _, mo) -> {
+    DFn(_, name, _, params, ret_ty_opt, _, body, _, _, mo) -> {
       let sig = emit_fn_signature(c_sym(name, mo), params)
-      # Seed the local-name scope with the fn's parameters so an
-      # `EVar(pname)` reference inside the body emits the local C
-      # variable read (`kai_<pname>`) rather than a closure-thunk
-      # over a same-named top-level fn.
-      let body_lcs = list_append(lcs, fn_param_names(params))
-      # Same-module preference: when this DFn lives in a module,
-      # rotate the EFn table so entries from that same module come
-      # first. `efn_resolve`'s ambiguous-fallback returns the first
-      # match, so a recursive call inside `loop.repeat` resolves
-      # to `loop.repeat` even when `list.repeat` is also in scope.
-      let body_fns = fns_prefer_module(fns, mo)
-      let body_c = emit_expr(src, body, body_lcs, body_fns, variants, lams, cls)
-      # Issue #37: when `tcrec_rewrite_decl` planted at least one
-      # `__kai_tcrec|...` self-tail-call sentinel inside `body`,
-      # plant the matching `_kai_<c_sym>_entry:;` label *before*
-      # the `return ({ ... });` so the goto inside the
-      # statement-expression has a target. The goto jumps out of
-      # the wrap before its exit drops run, so the per-iteration
-      # cleanup is the drop-and-rebind block emitted at the
-      # call site (`tcrec_emit_goto`).
-      let label = if tcrec_body_has_sentinel(body) {
-        concat_all(["_kai_", c_sym(name, mo), "_entry:;\n    "])
-      } else { "" }
-      concat_all([sig, " {\n    ", label, "return ", body_c, ";\n}\n\n"])
+      # m12.7.x FFI v1: a `[<extern_c>]` axiom lowered into a DFn
+      # whose body is the magic ETodo tag. Emit the FFI shim instead
+      # of the standard body — the shim unboxes each parameter to
+      # the matching C scalar, calls the extern symbol, and re-boxes
+      # the return value. The shim does its own `extern` forward decl
+      # inline so callers don't need a separate header pass.
+      if body_is_ffi_extern(body) {
+        emit_ffi_shim_body(sig, name, params, ret_ty_opt)
+      } else {
+        # Seed the local-name scope with the fn's parameters so an
+        # `EVar(pname)` reference inside the body emits the local C
+        # variable read (`kai_<pname>`) rather than a closure-thunk
+        # over a same-named top-level fn.
+        let body_lcs = list_append(lcs, fn_param_names(params))
+        # Same-module preference: when this DFn lives in a module,
+        # rotate the EFn table so entries from that same module come
+        # first. `efn_resolve`'s ambiguous-fallback returns the first
+        # match, so a recursive call inside `loop.repeat` resolves
+        # to `loop.repeat` even when `list.repeat` is also in scope.
+        let body_fns = fns_prefer_module(fns, mo)
+        let body_c = emit_expr(src, body, body_lcs, body_fns, variants, lams, cls)
+        # Issue #37: when `tcrec_rewrite_decl` planted at least one
+        # `__kai_tcrec|...` self-tail-call sentinel inside `body`,
+        # plant the matching `_kai_<c_sym>_entry:;` label *before*
+        # the `return ({ ... });` so the goto inside the
+        # statement-expression has a target. The goto jumps out of
+        # the wrap before its exit drops run, so the per-iteration
+        # cleanup is the drop-and-rebind block emitted at the
+        # call site (`tcrec_emit_goto`).
+        let label = if tcrec_body_has_sentinel(body) {
+          concat_all(["_kai_", c_sym(name, mo), "_entry:;\n    "])
+        } else { "" }
+        concat_all([sig, " {\n    ", label, "return ", body_c, ";\n}\n\n"])
+      }
     }
     _ -> ""
+  }
+}
+
+# m12.7.x FFI v1: the C body of an `[<extern_c>]` axiom. The shim
+# - forward-declares the extern symbol with the matching C signature,
+# - unboxes each kaikai parameter into its C-side equivalent,
+# - calls the extern, releases the input args, and
+# - boxes the return value back into a `KaiValue *` (or `kai_unit()`
+#   for a `void`-returning extern).
+#
+# Type translation v1 (per `docs/m12.7-ffi.md` §*Type table*):
+#   Int    ↔ int64_t        Real   ↔ double
+#   Bool   ↔ int             String ↔ const char *
+#   Unit   ↔ void   (return only)
+# Anything else surfaces as an `#error` so the C compiler flags it
+# at build time — silently emitting a wrong shim would be worse than
+# refusing the cast.
+fn emit_ffi_shim_body(sig: String, name: String, params: [Param],
+                      ret_ty_opt: Option[TypeExpr]) : String {
+  let ret_kind = ffi_ret_kind_of(ret_ty_opt)
+  # FFI v1 deliberately does NOT mint a fresh `extern` declaration
+  # for the named symbol. The user is expected to either rely on a
+  # libc symbol already declared by `<stdio.h>` / `<stdlib.h>` /
+  # `<string.h>` / `<unistd.h>` / `<time.h>` (all pulled in by
+  # `runtime.h`), or to feed an `#include` for their FFI library
+  # via the user-supplied wrapper.c that the build links in. A
+  # local extern declaration here would conflict with libc's
+  # canonical signature whenever the kaikai-side type mapping does
+  # not match the C-side native (e.g. kaikai `Int` → `int64_t` vs
+  # libc `puts`'s `int` return).
+  let arg_setup = ffi_emit_arg_setup(params, 0)
+  let arg_list = ffi_emit_arg_list(params, 0)
+  let call_expr = concat_all([name, "(", arg_list, ")"])
+  let arg_decrefs = ffi_emit_arg_decrefs(params, 0)
+  let body = match ret_kind {
+    FfiRetUnit -> concat_all([
+      arg_setup,
+      "    ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_unit();\n"
+    ])
+    FfiRetInt -> concat_all([
+      arg_setup,
+      "    int64_t _kai_ffi_ret = (int64_t) ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_int(_kai_ffi_ret);\n"
+    ])
+    FfiRetReal -> concat_all([
+      arg_setup,
+      "    double _kai_ffi_ret = (double) ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_real(_kai_ffi_ret);\n"
+    ])
+    FfiRetBool -> concat_all([
+      arg_setup,
+      "    int _kai_ffi_ret = (int) ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_bool(_kai_ffi_ret != 0);\n"
+    ])
+    FfiRetString -> concat_all([
+      arg_setup,
+      "    const char *_kai_ffi_ret = ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_str(_kai_ffi_ret == NULL ? \"\" : _kai_ffi_ret);\n"
+    ])
+    FfiRetUnknown(t) -> concat_all([
+      "#error \"FFI return type `", t,
+      "` is not supported in m12.7.x — use Int / Real / Bool / String / Unit\"\n"
+    ])
+  }
+  concat_all([sig, " {\n", body, "}\n\n"])
+}
+
+# m12.7.x FFI v1: enumeration of the supported return kinds plus an
+# escape hatch (`FfiRetUnknown`) carrying the offending type name so
+# the emitted `#error` can name it back to the user.
+type FfiRetKind
+  = FfiRetUnit
+  | FfiRetInt
+  | FfiRetReal
+  | FfiRetBool
+  | FfiRetString
+  | FfiRetUnknown(String)
+
+fn ffi_ret_kind_of(opt: Option[TypeExpr]) : FfiRetKind {
+  match opt {
+    None -> FfiRetUnit
+    Some(t) -> ffi_kind_of_ty(t)
+  }
+}
+
+fn ffi_kind_of_ty(t: TypeExpr) : FfiRetKind {
+  match t.tkind {
+    TyName(n, _) ->
+      if n == "Int" { FfiRetInt }
+      else if n == "Real" { FfiRetReal }
+      else if n == "Bool" { FfiRetBool }
+      else if n == "String" { FfiRetString }
+      else if n == "Unit" { FfiRetUnit }
+      else { FfiRetUnknown(n) }
+    _ -> FfiRetUnknown("non-named type")
+  }
+}
+
+fn ffi_c_ret_type_str(k: FfiRetKind) : String {
+  match k {
+    FfiRetUnit -> "void"
+    FfiRetInt -> "int64_t"
+    FfiRetReal -> "double"
+    FfiRetBool -> "int"
+    FfiRetString -> "const char *"
+    FfiRetUnknown(_) -> "void"  # body is `#error`, never compiled
+  }
+}
+
+fn ffi_c_param_type_str(p: Param) : String {
+  match p.ptype {
+    None -> "/* missing type */ void *"
+    Some(t) -> match ffi_kind_of_ty(t) {
+      FfiRetInt -> "int64_t"
+      FfiRetReal -> "double"
+      FfiRetBool -> "int"
+      FfiRetString -> "const char *"
+      FfiRetUnit -> "/* Unit param not supported */ void *"
+      FfiRetUnknown(_) -> "/* unsupported FFI param */ void *"
+    }
+  }
+}
+
+fn ffi_c_param_list(params: [Param]) : String {
+  match params {
+    [] -> "void"
+    _ -> join_with(map(params, ffi_c_param_type_str), ", ")
+  }
+}
+
+# Emit a sequence of local C bindings that unbox each kaikai
+# parameter into the matching C scalar. The shim stores the inputs
+# in `_kai_ffi_argN` so they survive across the extern call long
+# enough for the caller to release the boxed inputs after the call.
+fn ffi_emit_arg_setup(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let kind = match p.ptype {
+        None -> FfiRetUnknown("missing")
+        Some(t) -> ffi_kind_of_ty(t)
+      }
+      let arg_name = concat_all(["_kai_ffi_arg", int_to_string(i)])
+      let stmt = match kind {
+        FfiRetInt -> concat_all([
+          "    int64_t ", arg_name, " = kai_", p.pname, "->as.i;\n"
+        ])
+        FfiRetReal -> concat_all([
+          "    double ", arg_name, " = kai_", p.pname, "->as.r;\n"
+        ])
+        FfiRetBool -> concat_all([
+          "    int ", arg_name, " = kai_", p.pname, "->as.b ? 1 : 0;\n"
+        ])
+        FfiRetString -> concat_all([
+          "    const char *", arg_name, " = kai_", p.pname, "->as.s.bytes;\n"
+        ])
+        FfiRetUnit -> concat_all([
+          "    /* Unit FFI arg #", int_to_string(i), " elided */\n"
+        ])
+        FfiRetUnknown(t) -> concat_all([
+          "#error \"FFI arg type `", t, "` is not supported\"\n"
+        ])
+      }
+      cat2(stmt, ffi_emit_arg_setup(rest, i + 1))
+    }
+  }
+}
+
+fn ffi_emit_arg_list(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [_, ...rest] -> {
+      let head = concat_all(["_kai_ffi_arg", int_to_string(i)])
+      match rest {
+        [] -> head
+        _ -> concat_all([head, ", ", ffi_emit_arg_list(rest, i + 1)])
+      }
+    }
+  }
+}
+
+# After the extern returns we must release the boxed kaikai inputs;
+# the calling convention hands ownership to the callee.
+fn ffi_emit_arg_decrefs(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> cat2(
+      concat_all(["    kai_decref(kai_", p.pname, ");\n"]),
+      ffi_emit_arg_decrefs(rest, i + 1)
+    )
   }
 }
 
@@ -15048,12 +15334,33 @@ fn lower_axioms(ds: [Decl]) : [Decl] = map(ds, lower_axiom_one)
 
 fn lower_axiom_one(d: Decl) : Decl {
   match d {
-    DAxiom(is_pub, name, tparams, params, ret_ty, row, l, c) -> {
-      let msg = string_concat("axiom ", string_concat(name, " not bound"))
+    DAxiom(is_pub, extern_c, name, tparams, params, ret_ty, row, l, c) -> {
+      # m12.7.x FFI v1: an `[<extern_c>]` axiom lowers to a DFn
+      # whose body is a magic `ETodo` whose message tags it as an
+      # FFI shim. The C / LLVM `emit_fn_body` paths detect the tag
+      # and synthesise a real `extern "C"` call instead of the
+      # default `kai_prelude_panic` body. Typer-side `ETodo` still
+      # type-checks as "any type fits", so the FFI shim's typed
+      # signature is what flows into call sites.
+      let msg =
+        if extern_c { ffi_extern_tag() }
+        else { string_concat("axiom ", string_concat(name, " not bound")) }
       let body = mk_expr(ETodo(msg), l, c)
       DFn(is_pub, name, tparams, params, Some(ret_ty), row, body, l, c, None)
     }
     _ -> d
+  }
+}
+
+# m12.7.x FFI v1: the magic `ETodo` payload that flags a DFn body
+# as the FFI shim form. `emit_fn_body` (C and LLVM) match on this
+# string before falling through to the default ETodo lowering.
+fn ffi_extern_tag() : String = "__kai_ffi__"
+
+fn body_is_ffi_extern(body: Expr) : Bool {
+  match body.kind {
+    ETodo(msg) -> msg == ffi_extern_tag()
+    _ -> false
   }
 }
 
@@ -18976,7 +19283,7 @@ fn sig_of_decl(d: Decl) : Option[Ty] {
     # m12.7: axiom signature has the same shape as a fn — params,
     # return type, row. The body's row is replaced by the declared
     # row directly (no body to read row_of_expr from).
-    DAxiom(_, _, _, params, ret_ty, row, _, _) -> {
+    DAxiom(_, _, _, _, params, ret_ty, row, _, _) -> {
       let pts = map(params, param_ty)
       let ret = resolve_ty(ret_ty)
       Some(TyFnT(pts, ret, row_of_expr(row)))
@@ -19260,7 +19567,7 @@ fn dump_decl_type(d: Decl) : Unit / Console {
     }
     DUse(name, line, col) ->
       print("use #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
-    DAxiom(is_pub, name, _, _, _, _, line, col) -> {
+    DAxiom(is_pub, _, name, _, _, _, _, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       match sig_of_decl(d) {
         Some(ty) -> print("#{pub_s}axiom #{name} : #{ty_to_string(ty)} @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -26823,7 +27130,7 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     # m12.7: DAxiom is rewritten to DFn by lower_axioms before this
     # pass; the case is kept for completeness when expand_aliases_decl
     # is invoked on a pre-lowering decl stream (e.g., via --ast).
-    DAxiom(_, _, _, _, _, _, _, _) -> d
+    DAxiom(_, _, _, _, _, _, _, _, _) -> d
     # m12.6.x #5(a): DAttribPure unwraps before this pass runs in
     # the driver; case kept for `--ast` and other early-pipeline
     # callers that work on the raw decl stream.
@@ -29439,12 +29746,21 @@ fn perceus_pass(decls: [Decl]) : [Decl] = map(decls, perceus_decl)
 fn perceus_decl(d: Decl) : Decl {
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
-      let pnames = map(params, (p) => p.pname)
-      let uses = pcs_collect_uses_expr(body, pnames, false, [])
-      let new_body = pcs_rewrite_expr(body, pnames, uses, false)
-      let reused_body = pcs_recognise_reuse_expr(new_body)
-      let body_with_drops = pcs_prepend_unused_drops(reused_body, params, uses)
-      DFn(is_pub, name, tparams, params, opt_ret, row, body_with_drops, ln, cl, mo)
+      # m12.7.x FFI v1: an `[<extern_c>]` axiom's body is the magic
+      # ETodo tag that signals the C / LLVM emitters to inline an
+      # FFI shim. Skip Perceus rewriting — the shim handles its own
+      # arg-decref discipline (it `kai_decref`s every boxed input
+      # after the extern returns), so prepending unused-param drops
+      # would double-free.
+      if body_is_ffi_extern(body) { d }
+      else {
+        let pnames = map(params, (p) => p.pname)
+        let uses = pcs_collect_uses_expr(body, pnames, false, [])
+        let new_body = pcs_rewrite_expr(body, pnames, uses, false)
+        let reused_body = pcs_recognise_reuse_expr(new_body)
+        let body_with_drops = pcs_prepend_unused_drops(reused_body, params, uses)
+        DFn(is_pub, name, tparams, params, opt_ret, row, body_with_drops, ln, cl, mo)
+      }
     }
     # Test bodies are emitted as their own thunk fns; without rewriting
     # them here, multi-use let-bindings inside test bodies (especially
@@ -32035,6 +32351,12 @@ fn llvm_header() : String =
     "declare i32           @kaix_to_bool(%KaiValue*)\n",
     "declare double        @kaix_to_real(%KaiValue*)\n",
     "declare i32           @kaix_to_char(%KaiValue*)\n",
+    # m12.7.x FFI v1: read the C-string bytes pointer out of a
+    # boxed `String`. Borrowing — the pointer aliases the boxed
+    # storage, so the FFI shim must call `@kaix_decref` only after
+    # the extern returns (so the pointer remains valid for the
+    # duration of the call).
+    "declare i8*           @kaix_to_str_data(%KaiValue*)\n",
     "declare %KaiValue* @kaix_internal_dup(%KaiValue*)\n",
     "declare %KaiValue* @kaix_internal_drop(%KaiValue*)\n",
     "declare %KaiValue* @kaix_add(%KaiValue*, %KaiValue*)\n",
@@ -35371,7 +35693,20 @@ type LlvmDeclOut = { text: String, next_id: Int }
 
 fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], start_id: Int) : LlvmDeclOut {
   match d {
-    DFn(_, nm, _, ps, _, _, body, _, _, mo) -> {
+    DFn(_, nm, _, ps, ret_ty_opt, _, body, _, _, mo) -> {
+      let csuffix = c_sym(nm, mo)
+      let sym = if nm == "main" { "@kai_main" } else { string_concat("@kai_", csuffix) }
+      let arity = list_length(ps)
+      let thunk = llvm_emit_thunk(csuffix, arity)
+      # m12.7.x FFI v1: an `[<extern_c>]` axiom's body is the magic
+      # ETodo tag. Synthesise an LLVM shim that mirrors the C-side
+      # output: the extern is declared at module scope and the
+      # kaikai-visible wrapper unboxes args, calls the extern, and
+      # re-boxes the result.
+      if body_is_ffi_extern(body) {
+        let shim = llvm_emit_ffi_shim(sym, nm, ps, ret_ty_opt, start_id)
+        LlvmDeclOut { text: concat_all([shim.text, thunk]), next_id: shim.next_id }
+      } else {
       let locals0 = llvm_init_locals_from_params(ps)
       # Same-module preference: rotate `fns` so DFns from this DFn's
       # module come first. `efn_resolve`'s ambiguous fallback returns
@@ -35389,10 +35724,6 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
       # `@kai_main` (the runtime calls it directly), so a hypothetical
       # `pub fn main` defined in a prelude file (none exist today)
       # would still emit unprefixed.
-      let csuffix = c_sym(nm, mo)
-      let sym = if nm == "main" { "@kai_main" } else { string_concat("@kai_", csuffix) }
-      let arity = list_length(ps)
-      let thunk = llvm_emit_thunk(csuffix, arity)
       let text = concat_all([
         e1.globals,
         "\n",
@@ -35403,8 +35734,179 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
         thunk
       ])
       LlvmDeclOut { text: text, next_id: e1.ids.next }
+      }
     }
     _ -> LlvmDeclOut { text: "", next_id: start_id }
+  }
+}
+
+# m12.7.x FFI v1: the LLVM IR side of the FFI shim. Mirrors
+# `emit_ffi_shim_body` (C backend). For each kaikai parameter, the
+# IR loads the relevant scalar field out of the `%KaiValue` (i64
+# at offset 16 for Int / Bool, double for Real, the bytes pointer
+# for String) and packages them into a single direct call against
+# the extern C symbol. The extern is `declare`d with the resolved
+# C signature. The result is re-boxed via the matching runtime
+# constructor (`@kaix_int`, `@kaix_real`, `@kaix_bool`, `@kaix_str`,
+# `@kaix_unit`) and returned. The shim assumes the input KaiValues
+# are non-NULL and well-typed — the same invariants the rest of the
+# emitter relies on.
+fn llvm_emit_ffi_shim(sym: String, name: String, params: [Param],
+                       ret_ty_opt: Option[TypeExpr],
+                       start_id: Int) : LlvmDeclOut {
+  let ret_kind = ffi_ret_kind_of(ret_ty_opt)
+  let extern_decl = concat_all([
+    "declare ", llvm_ffi_ret_ty(ret_kind), " @", name,
+    "(", llvm_ffi_param_list(params), ")\n"
+  ])
+  # Per-param load + cast sequence. We start in the entry block
+  # so each param `%kai_<name>` is in scope — `llvm_param_list` on
+  # a normal kaikai DFn names them that way.
+  let unbox = llvm_ffi_unbox_params(params, 0, start_id)
+  let arg_csv = llvm_ffi_arg_list(params, 0)
+  # The body emits as a single basic block. Calls to runtime
+  # `kaix_decref` after the extern release the boxed inputs; the
+  # extern's return value is freshly produced by the runtime
+  # constructor we wrap with so the caller owns exactly one
+  # reference.
+  let arg_decrefs = llvm_ffi_param_decrefs(params, 0)
+  let call_body = match ret_kind {
+    FfiRetUnit -> concat_all([
+      "  call void @", name, "(", arg_csv, ")\n",
+      arg_decrefs,
+      "  %_kai_ffi_ret = call %KaiValue* @kaix_unit()\n"
+    ])
+    FfiRetInt -> concat_all([
+      "  %_kai_ffi_raw = call i64 @", name, "(", arg_csv, ")\n",
+      arg_decrefs,
+      "  %_kai_ffi_ret = call %KaiValue* @kaix_int(i64 %_kai_ffi_raw)\n"
+    ])
+    FfiRetReal -> concat_all([
+      "  %_kai_ffi_raw = call double @", name, "(", arg_csv, ")\n",
+      arg_decrefs,
+      "  %_kai_ffi_ret = call %KaiValue* @kaix_real(double %_kai_ffi_raw)\n"
+    ])
+    FfiRetBool -> concat_all([
+      "  %_kai_ffi_raw = call i32 @", name, "(", arg_csv, ")\n",
+      arg_decrefs,
+      "  %_kai_ffi_ret = call %KaiValue* @kaix_bool(i32 %_kai_ffi_raw)\n"
+    ])
+    FfiRetString -> concat_all([
+      "  %_kai_ffi_raw = call i8* @", name, "(", arg_csv, ")\n",
+      arg_decrefs,
+      "  %_kai_ffi_ret = call %KaiValue* @kaix_str(i8* %_kai_ffi_raw)\n"
+    ])
+    FfiRetUnknown(t) -> concat_all([
+      "  ; FFI: unsupported return type `", t, "`\n",
+      "  %_kai_ffi_ret = call %KaiValue* @kaix_unit()\n"
+    ])
+  }
+  let text = concat_all([
+    extern_decl, "\n",
+    "define %KaiValue* ", sym, "(", llvm_param_list(params), ") {\n",
+    "entry:\n",
+    unbox.body,
+    call_body,
+    "  ret %KaiValue* %_kai_ffi_ret\n",
+    "}\n"
+  ])
+  LlvmDeclOut { text: text, next_id: unbox.next_id }
+}
+
+fn llvm_ffi_ret_ty(k: FfiRetKind) : String {
+  match k {
+    FfiRetUnit -> "void"
+    FfiRetInt -> "i64"
+    FfiRetReal -> "double"
+    FfiRetBool -> "i32"
+    FfiRetString -> "i8*"
+    FfiRetUnknown(_) -> "void"
+  }
+}
+
+fn llvm_ffi_param_ty(p: Param) : String {
+  match p.ptype {
+    None -> "i8*"
+    Some(t) -> match ffi_kind_of_ty(t) {
+      FfiRetInt -> "i64"
+      FfiRetReal -> "double"
+      FfiRetBool -> "i32"
+      FfiRetString -> "i8*"
+      FfiRetUnit -> "i8*"
+      FfiRetUnknown(_) -> "i8*"
+    }
+  }
+}
+
+fn llvm_ffi_param_list(params: [Param]) : String =
+  join_with(map(params, llvm_ffi_param_ty), ", ")
+
+fn llvm_ffi_arg_list(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let ty = llvm_ffi_param_ty(p)
+      let head = concat_all([ty, " %_kai_ffi_arg", int_to_string(i)])
+      match rest {
+        [] -> head
+        _ -> concat_all([head, ", ", llvm_ffi_arg_list(rest, i + 1)])
+      }
+    }
+  }
+}
+
+# Per-param: emit IR that reads the scalar field out of the boxed
+# KaiValue. Uses dedicated runtime helpers (`@kaix_int_value`,
+# `@kaix_real_value`, `@kaix_bool_value`, `@kaix_str_data`) so the
+# IR doesn't need to know the concrete struct layout. `next_id` is
+# threaded only because the caller's id generator advances; the
+# helpers themselves use named SSA registers so they collide-resist
+# by name not number.
+type FfiUnboxOut = { body: String, next_id: Int }
+
+fn llvm_ffi_unbox_params(params: [Param], i: Int, next_id: Int) : FfiUnboxOut {
+  match params {
+    [] -> FfiUnboxOut { body: "", next_id: next_id }
+    [p, ...rest] -> {
+      let arg_name = concat_all(["%_kai_ffi_arg", int_to_string(i)])
+      let kv = concat_all(["%p_", p.pname])
+      let kind = match p.ptype {
+        None -> FfiRetUnknown("missing")
+        Some(t) -> ffi_kind_of_ty(t)
+      }
+      let stmt = match kind {
+        FfiRetInt -> concat_all([
+          "  ", arg_name, " = call i64 @kaix_to_int(%KaiValue* ", kv, ")\n"
+        ])
+        FfiRetReal -> concat_all([
+          "  ", arg_name, " = call double @kaix_to_real(%KaiValue* ", kv, ")\n"
+        ])
+        FfiRetBool -> concat_all([
+          "  ", arg_name, " = call i32 @kaix_to_bool(%KaiValue* ", kv, ")\n"
+        ])
+        FfiRetString -> concat_all([
+          "  ", arg_name, " = call i8* @kaix_to_str_data(%KaiValue* ", kv, ")\n"
+        ])
+        FfiRetUnit -> concat_all([
+          "  ; FFI Unit param elided at index ", int_to_string(i), "\n"
+        ])
+        FfiRetUnknown(t) -> concat_all([
+          "  ; FFI unsupported param type: ", t, "\n"
+        ])
+      }
+      let tail = llvm_ffi_unbox_params(rest, i + 1, next_id)
+      FfiUnboxOut { body: cat2(stmt, tail.body), next_id: tail.next_id }
+    }
+  }
+}
+
+fn llvm_ffi_param_decrefs(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> cat2(
+      concat_all(["  call void @kaix_decref(%KaiValue* %p_", p.pname, ")\n"]),
+      llvm_ffi_param_decrefs(rest, i + 1)
+    )
   }
 }
 
@@ -35653,7 +36155,7 @@ fn collect_pub_exports(decls: [Decl], acc: [String]) : [String] {
         DType(true, name, _, _, _, _) -> [name, ...acc]
         DEffect(true, name, _, _, _, _) -> [name, ...acc]
         DProtocol(true, name, _, _, _) -> [name, ...acc]
-        DAxiom(true, name, _, _, _, _, _, _) -> [name, ...acc]
+        DAxiom(true, _, name, _, _, _, _, _, _) -> [name, ...acc]
         DUnit(true, name, _, _, _) -> [name, ...acc]
         _ -> acc
       }
@@ -39280,7 +39782,7 @@ fn decl_line(d: Decl) : Int {
     DAttribPure(_, line, _) -> line
     DUnit(_, _, _, line, _) -> line
     DUse(_, line, _) -> line
-    DAxiom(_, _, _, _, _, _, line, _) -> line
+    DAxiom(_, _, _, _, _, _, _, line, _) -> line
   }
 }
 
@@ -39320,7 +39822,7 @@ fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
     DDerive(_, _, line, _) -> fmt_panic_unsupported("#derive annotation", line)
     DUnit(_, _, _, line, _) -> fmt_panic_unsupported("unit declarations", line)
     DUse(_, line, _) -> fmt_panic_unsupported("file-level `use`", line)
-    DAxiom(_, _, _, _, _, _, line, _) -> fmt_panic_unsupported("axiom declarations", line)
+    DAxiom(_, _, _, _, _, _, _, line, _) -> fmt_panic_unsupported("axiom declarations", line)
   }
 }
 
@@ -40644,6 +41146,12 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   let log_d      = inject_unconditional(existing,       "Log",      builtin_log_decl())
   # Issue #140: SecureRandom — atomic effect, no companion type decls.
   let securerandom_d = inject_unconditional(existing, "SecureRandom", builtin_securerandom_decl())
+  # m12.7.x FFI v1: `Ffi` is the capability tag carried by every
+  # `[<extern_c>]` axiom row. The decl has no ops — the typer only
+  # needs to know the name + arity (zero) for row labels to type-
+  # check. Codegen routes around the effect dispatcher entirely
+  # (the FFI shim `extern`-calls the C symbol directly).
+  let ffi_d      = inject_unconditional(existing,       "Ffi",      builtin_ffi_decl())
   list_append(console_d,
     list_append(stdout_d,
       list_append(stderr_d,
@@ -40670,7 +41178,8 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
                                                 list_append(exit_d,
                                                   list_append(process_d,
                                                     list_append(log_d,
-                                                      list_append(securerandom_d, decls)))))))))))))))))))))))))))
+                                                      list_append(securerandom_d,
+                                                        list_append(ffi_d, decls))))))))))))))))))))))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -40778,7 +41287,7 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # still mention Console because the resolver routes through
 # `cand_ns` for aliases.
 fn builtin_effect_names() : [String] =
-  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Random", "SecureRandom", "NetTcp", "Signal", "Process", "Log", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor"]
+  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Random", "SecureRandom", "NetTcp", "Signal", "Process", "Log", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor", "Ffi"]
 
 # m12.8 Phase 4b: `Console` is now an alias `type Console = Stdout +
 # Stderr + Stdin` (per stdlib/effects.kai's pinned catalog), not a
@@ -40811,6 +41320,14 @@ fn builtin_fail_decl() : Decl =
     [
       EOp("fail", [], [param_string_zero("msg")], ty_name_zero("Nothing"), 0, 0)
     ], 0, 0)
+
+# m12.7.x FFI v1: `Ffi` is the capability tag carried by every
+# `[<extern_c>]` axiom signature. It declares zero ops — the only
+# reason the effect exists at the type level is so public signatures
+# can mention `/ Ffi` honestly. There is no runtime handler;
+# the FFI codegen path bypasses the effect dispatcher entirely.
+fn builtin_ffi_decl() : Decl =
+  DEffect(false, "Ffi", [], [], 0, 0)
 
 fn builtin_stdin_decl() : Decl =
   DEffect(false, "Stdin", [],
