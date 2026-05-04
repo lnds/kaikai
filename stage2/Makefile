@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs selfhost
 
 all: $(TARGET)
 
@@ -3019,6 +3019,41 @@ test-sequence: $(TARGET) build
 	  fi; \
 	done
 
+test-ufcs: $(TARGET) build
+	@$(STACK) set -e; \
+	for f in ../examples/ufcs/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/ufcs/$$name.out.expected; \
+	  exp_err=../examples/ufcs/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    rc=0; ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $$f \
+	      > /dev/null 2> build/ufcs-$$name.err || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "ufcs FAIL $$name (expected error, got success)"; exit 1; \
+	    fi; \
+	    while read -r line; do \
+	      grep -qF "$$line" build/ufcs-$$name.err \
+	        || { echo "ufcs FAIL $$name (missing diagnostic: $$line)"; \
+	             cat build/ufcs-$$name.err; exit 1; }; \
+	    done < $$exp_err; \
+	    echo "ufcs OK $$name (rejected as expected)"; \
+	  else \
+	    ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $$f > build/ufcs-$$name.c \
+	      || { echo "ufcs FAIL $$name (kaic2 errored)"; exit 1; }; \
+	    $(CC) $(CFLAGS) -I ../stage0 build/ufcs-$$name.c -o build/ufcs-$$name \
+	      || { echo "ufcs FAIL $$name (C compile failed)"; exit 1; }; \
+	    ./build/ufcs-$$name > build/ufcs-$$name.out \
+	      || { echo "ufcs FAIL $$name (run errored)"; cat build/ufcs-$$name.out; exit 1; }; \
+	    if [ -f $$exp_out ]; then \
+	      diff -q $$exp_out build/ufcs-$$name.out > /dev/null \
+	        && echo "ufcs OK $$name" \
+	        || { echo "ufcs DIFF $$name"; diff $$exp_out build/ufcs-$$name.out; exit 1; }; \
+	    else \
+	      echo "ufcs OK $$name (no golden, ran clean)"; \
+	    fi; \
+	  fi; \
+	done
+
 test-unions: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/unions/*.kai; do \
@@ -3053,7 +3088,7 @@ test-unions: $(TARGET) build
 	  fi; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82 test-perceus-issue118 test-unions test-sequence
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -3062,7 +3097,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude test-unions test-sequence
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude test-unions test-sequence test-ufcs
 
 clean:
 	rm -rf build $(TARGET)
