@@ -95,7 +95,7 @@ read short (`xs |> map(f) |> filter(p)`). The aliases re-export
 
 | Module                  | Bare-name surface | Flat aliases removed | Flat aliases surviving | Reason for survivors                                              |
 | ----------------------- | ----------------: | -------------------: | ---------------------: | ----------------------------------------------------------------- |
-| `stdlib/core/list.kai`  |               24+ |                   24 |                      5 | `list_is_empty`, `list_nth`, `list_take`, `list_contains`, `list_sum` — prelude-scope resolver gap (4) + string-interpolation gap (1) |
+| `stdlib/core/list.kai`  |               29+ |                   29 |                      0 | none — final 5 retired in #227 after PR #218 closed the prelude-scope (#216) and string-interpolation (#217) resolver gaps |
 | `stdlib/core/string.kai`|               13+ |                  ~14 |                      1 | `string_repeat` — typer EModCall name-only lookup (#219) collides with `list.repeat` |
 | `stdlib/core/option.kai`|                10 |                    6 |                      4 | `opt_map`, `opt_filter`, `opt_zip` — typer EModCall (#219) collides with `list.{map,filter,zip}`; `opt_or` — `or` is a reserved keyword (`TkOr`) |
 | `stdlib/core/result.kai`|                12 |                    6 |                      6 | `result_map`, `result_and_then`, `result_unwrap_or`, `result_or_else`, `result_unwrap_or_else`, `result_collect` — all #219 collisions with `list` / `option` exports |
@@ -111,13 +111,11 @@ the explicit module qualifier instead of doing a flat
 in a mechanical follow-up. The `opt_or` survivor is independent
 — it is blocked by parser-level keyword reservation, not by #219.
 
-The 5 `list_*` survivors are blocked by separate compiler gaps
-documented in the m14 Phase 1 retro
-(`docs/lane-experience-issue-203-phase1-list.md`): four hit a
-prelude-scope resolver gap that prevents a bare `is_empty` /
-`nth` / `take` / `contains` from being reached qualified, and
-`list_sum` hits a string-interpolation lowering gap. These are
-out of scope for m14 and tracked separately.
+The 5 `list_*` survivors documented in the m14 Phase 1 retro
+(`docs/lane-experience-issue-203-phase1-list.md`) were retired
+in #227 once PR #218 closed the prelude-scope (#216) and
+string-interpolation (#217) resolver gaps that had blocked the
+qualified form. `stdlib/core/list.kai` now has zero flat aliases.
 
 Stage 0 PRELUDE builtins (`string_concat`, `string_length`,
 `string_slice`, `string_split`, `string_contains`, `list_length`,
