@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-log-asan test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-log-asan test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs selfhost
 
 all: $(TARGET)
 
@@ -438,6 +438,24 @@ test-foreign-prelude: $(TARGET) build
 	  && echo "foreign-prelude OK" \
 	  || { echo "foreign-prelude DIFF"; diff ../examples/effects/foreign_prelude.out.expected build/foreign_prelude.out; exit 1; }
 
+# Issue #216 regression — qualified-call resolver inside a
+# `--prelude`-loaded file. The helper `qualified_call_in_prelude_lib`
+# defines bodies like `list.nth(xs, 1)`; before the fix the prelude
+# parse tree skipped the EField->EModCall rewrite and the typer
+# rejected the call as "undefined name `list`". Compiled with the
+# core stdlib preludes plus the helper file as an extra `--prelude`.
+test-prelude-qualified-call: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	            --prelude ../examples/stdlib/qualified_call_in_prelude_lib.kai \
+	            ../examples/stdlib/qualified_call_in_prelude.kai \
+	            > build/qualified_call_in_prelude.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/qualified_call_in_prelude.c -o build/qualified_call_in_prelude; \
+	./build/qualified_call_in_prelude > build/qualified_call_in_prelude.out; \
+	diff -q ../examples/stdlib/qualified_call_in_prelude.out.expected build/qualified_call_in_prelude.out > /dev/null \
+	  && echo "prelude-qualified-call OK (issue #216)" \
+	  || { echo "prelude-qualified-call DIFF"; diff ../examples/stdlib/qualified_call_in_prelude.out.expected build/qualified_call_in_prelude.out; exit 1; }
+
 # stdlib/trace.kai smoke tests — exercises the user-defined `Trace`
 # effect end-to-end. `trace_basic` covers the default handler
 # (`with_trace_default`); `trace_prefix` covers handler composition
@@ -823,7 +841,7 @@ test-stdlib: $(TARGET) build
 	@set -e; \
 	for f in ../examples/stdlib/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  case "$$name" in bench_*|check_*) continue ;; esac; \
+	  case "$$name" in bench_*|check_*|*_lib|qualified_call_in_prelude) continue ;; esac; \
 	  exp_err=../examples/stdlib/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
 	    rc=0; ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f \
@@ -3088,7 +3106,7 @@ test-unions: $(TARGET) build
 	  fi; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -3097,7 +3115,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude test-unions test-sequence test-ufcs
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-unions test-sequence test-ufcs
 
 clean:
 	rm -rf build $(TARGET)
