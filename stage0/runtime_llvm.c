@@ -76,6 +76,7 @@ KaiValue *kaix_range(KaiValue *from, KaiValue *to)              { return kai_ran
 KaiValue *kaix_range_step(KaiValue *f, KaiValue *t, KaiValue *s){ return kai_range_step(f, t, s); }
 
 KaiValue *kaix_prelude_map(KaiValue *xs, KaiValue *f)          { return kai_prelude_map(xs, f); }
+KaiValue *kaix_prelude_flat_map(KaiValue *xs, KaiValue *f)     { return kai_prelude_flat_map(xs, f); }
 KaiValue *kaix_prelude_each(KaiValue *xs, KaiValue *f)         { return kai_prelude_each(xs, f); }
 KaiValue *kaix_prelude_filter(KaiValue *xs, KaiValue *p)       { return kai_prelude_filter(xs, p); }
 KaiValue *kaix_prelude_reduce(KaiValue *xs, KaiValue *i, KaiValue *f) { return kai_prelude_reduce(xs, i, f); }
