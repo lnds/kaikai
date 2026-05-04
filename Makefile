@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-fmt test-bench test-check demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-fmt test-bench test-check demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -17,7 +17,7 @@ bin/kai:
 	@chmod +x bin/kai
 	@echo "kai driver: $$(realpath bin/kai 2>/dev/null || pwd)/bin/kai"
 
-test: test-stage0 test-stage1 test-stage2 test-demos
+test: test-stage0 test-stage1 test-stage2 test-demos test-multi-module
 
 test-stage0:
 	$(MAKE) -C stage0 test
@@ -37,6 +37,23 @@ test-demos: kaic1
 	  ./bin/kai test $$f > /tmp/kaikai-$$name-t.out 2>&1 || true; \
 	  echo "demo OK $$name"; \
 	done
+
+# issue #233 — `bin/kai run` auto-discovers sibling modules and
+# nested directories under the entry file. Run from a foreign cwd
+# with absolute paths so the test exercises the driver contract
+# (--path "$(dirname "$src")"), not cwd-relative resolution.
+test-multi-module: kaic2
+	@set -e; \
+	root=$$(pwd); \
+	kai="$$root/bin/kai"; \
+	src="$$root/examples/multi-module/main.kai"; \
+	exp="$$root/examples/multi-module/main.out.expected"; \
+	out=$$(mktemp); \
+	(cd / && "$$kai" run "$$src") > "$$out" \
+	  || { echo "multi-module FAIL (kai run)"; rm -f "$$out"; exit 1; }; \
+	diff -q "$$exp" "$$out" > /dev/null \
+	  && { echo "multi-module OK"; rm -f "$$out"; } \
+	  || { echo "multi-module DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }
 
 # m12.8 Phase 3 — Core demo gate. Delegates to stage2's
 # `test-demos-core` which builds each demo under examples/portfolio/
