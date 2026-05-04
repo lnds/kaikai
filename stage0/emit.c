@@ -442,6 +442,7 @@ static const struct {
     { "list_append",    "kai_prelude_list_append",    2 },
     { "list_reverse",   "kai_prelude_list_reverse",   1 },
     { "map",            "kai_prelude_map",            2 },
+    { "flat_map",       "kai_prelude_flat_map",       2 },
     { "filter",         "kai_prelude_filter",         2 },
     { "reduce",         "kai_prelude_reduce",         3 },
     { "each",           "kai_prelude_each",           2 },

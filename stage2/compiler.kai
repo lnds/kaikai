@@ -61,7 +61,7 @@ type TokKind
   | TkLparen | TkRparen | TkLbracket | TkRbracket | TkLbrace | TkRbrace
   | TkComma | TkColon | TkColonEq | TkSemi | TkDot | TkDotDot | TkEllipsis
   # operators
-  | TkEq | TkArrow | TkFatArrow | TkPipe | TkPipeApply
+  | TkEq | TkArrow | TkFatArrow | TkPipe | TkPipeApply | TkBarBar
   | TkPlus | TkMinus | TkStar | TkSlash | TkSlashSlash | TkPercent
   # m7d §23: `++` is the string / list concatenation operator.
   # Right-associative, lower precedence than `+`/`-`/`*`/`/`,
@@ -113,7 +113,7 @@ fn tk_name(k: TokKind) : String {
     TkComma -> "," TkColon -> ":" TkColonEq -> ":=" TkSemi -> ";"
     TkDot -> "." TkDotDot -> ".." TkEllipsis -> "..."
     TkEq -> "=" TkArrow -> "->" TkFatArrow -> "=>"
-    TkPipe -> "|" TkPipeApply -> "|>"
+    TkPipe -> "|" TkPipeApply -> "|>" TkBarBar -> "||"
     TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
     TkSlashSlash -> "//" TkPercent -> "%" TkPlusPlus -> "++"
     TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">"
@@ -760,6 +760,12 @@ fn lex_punct(l: Lexer) : LexStep {
         if lex_peek_is(l1, '>') {
           let l2 = lex_advance(l1)
           Step(l2, tok(TkPipeApply, sl, sc, start, l2.pos))
+        } else if lex_peek_is(l1, '|') {
+          # issue #201: `||` (no whitespace between bars) is the
+          # flat-map pipe. Single token so the parser sees one symbol
+          # at the operator slot, mirroring how `|>` is one token.
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkBarBar, sl, sc, start, l2.pos))
         } else {
           Step(l1, tok(TkPipe, sl, sc, start, l1.pos))
         }
@@ -1202,6 +1208,17 @@ type ExprKind
   | ERange(Expr, Expr, Option[Expr])
   | EBlock([Stmt], Option[Expr])
   | EPipe(Expr, Expr)
+  # issue #201: `xs | f` — map-pipe. Until #201 the parser desugared
+  # `|` straight to `ECall(EVar("map"), [xs, f])`. The new shape keeps
+  # the surface visible to the typer so `|` and `||` can dispatch by
+  # the LHS's head type via the head-type-to-module map. The typer
+  # rewrites `EMapPipe` into `ECall(EModCall(<module>, "map"), …)` once
+  # the head type is known. Codegen never sees `EMapPipe` directly —
+  # it sees the rewritten ECall.
+  | EMapPipe(Expr, Expr)
+  # issue #201: `xs || f` — flat-map-pipe. Same dispatch rule as
+  # `EMapPipe` but looks up `flat_map` in the head's declaring module.
+  | EFlatMapPipe(Expr, Expr)
   # Typed hole (M10). `None` payload → anonymous `?`. `Some(name)` →
   # `?name`. Checker reports at each hole site; emitter falls back
   # to a runtime panic so unfilled holes in a binary are loud.
@@ -1650,6 +1667,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkFatArrow   -> match b { TkFatArrow -> true _ -> false }
     TkPipe       -> match b { TkPipe -> true _ -> false }
     TkPipeApply  -> match b { TkPipeApply -> true _ -> false }
+    TkBarBar     -> match b { TkBarBar -> true _ -> false }
     TkPlus       -> match b { TkPlus -> true _ -> false }
     TkMinus      -> match b { TkMinus -> true _ -> false }
     TkStar       -> match b { TkStar -> true _ -> false }
@@ -2019,12 +2037,10 @@ fn subst_underscores(es: [Expr], replacement: Expr) : [Expr] {
 }
 
 fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
-  # Both `|>` (apply pipe) and `|` (map pipe) sit at the lowest binop
-  # level, left-associative. `|` is m7b #9: `xs | f` lowers at parse
-  # time to `map(xs, f)` so the rest of the pipeline sees a plain call.
-  # The `|` variant separator in `type T = A | B` is parsed by
-  # `parse_sum_body`, not the expression grammar, so there is no
-  # ambiguity here.
+  # `|>` (apply), `|` (map), and `||` (flat-map) all sit at the lowest
+  # binop level, left-associative. The `|` variant separator in
+  # `type T = A | B` is parsed by `parse_sum_body`, not the expression
+  # grammar, so there is no ambiguity here.
   #
   # Issue #130: pipe operators may also lead a continuation line. The
   # peeked parser skips leading newlines so `xs\n  |> f\n  |> g` parses
@@ -2032,12 +2048,15 @@ fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
   # NOT a pipe we return the ORIGINAL `p` — those newlines belong to
   # the enclosing statement boundary, not the pipe chain.
   #
-  # The synthetic call binds the prelude's `map`. That contract has
-  # three load-bearing entries that must move together: the runtime
-  # symbol in `prelude_table` (`EP("map", "kai_prelude_map", 2)`), the
-  # type scheme `([a], (a) -> b) -> [b]` in the type env (search
-  # `TyEntry { name: "map"`), and the literal `"map"` here. Renaming
-  # any one without the others silently breaks this desugar.
+  # Issue #201: `|` and `||` are typed as `EMapPipe` / `EFlatMapPipe`
+  # AST nodes. The typer dispatches them against the head type of the
+  # LHS via the head-type-to-module map (see `head_type_module` and
+  # `synth_map_pipe` / `synth_flat_map_pipe`) and rewrites the node
+  # into a `<module>.map(xs, f)` / `<module>.flat_map(xs, f)` call.
+  # Pre-#201, the parser desugared `|` straight into
+  # `ECall(EVar("map"), [xs, f])` against a hardcoded prelude `map`
+  # entry; the new shape lets `[T]` and any future container-shaped
+  # head type share one surface without a hardcoded receiver.
   let p_look = p_skip_newlines(p)
   if p_at(p_look, TkPipeApply) {
     let t = p_peek(p_look)
@@ -2067,11 +2086,15 @@ fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
     let r = parse_or(p1)
     match r.r {
       None -> err_e(r.p)
-      Some(rhs) -> {
-        let map_callee = mk_expr(EVar("map"), t.line, t.col)
-        let call = mk_expr(ECall(map_callee, [lhs, rhs]), t.line, t.col)
-        parse_pipe_rest(r.p, call)
-      }
+      Some(rhs) -> parse_pipe_rest(r.p, mk_expr(EMapPipe(lhs, rhs), t.line, t.col))
+    }
+  } else if p_at(p_look, TkBarBar) {
+    let t = p_peek(p_look)
+    let p1 = p_skip_newlines(p_advance(p_look))
+    let r = parse_or(p1)
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> parse_pipe_rest(r.p, mk_expr(EFlatMapPipe(lhs, rhs), t.line, t.col))
     }
   } else {
     ok_e(p, lhs)
@@ -6474,6 +6497,8 @@ fn ival_of_expr(e: Expr, env: IntervalEnv) : Interval = match e.kind {
   ERange(_, _, _)   -> ITop
   EBlock(stmts, tail) -> ival_of_block(stmts, tail, env)
   EPipe(_, _)       -> ITop
+  EMapPipe(_, _)     -> ITop
+  EFlatMapPipe(_, _) -> ITop
   EBang(_)          -> ITop
   EHandle(_, _, _, _, _, _, _) -> ITop
   ELitUnit(_, _)    -> ITop
@@ -6879,6 +6904,8 @@ fn analyze_calls(e: Expr, sigs: [CalleeSig], caller_refs: [RefBinding],
   EField(b, _) -> analyze_calls(b, sigs, caller_refs, acc)
   EIndex(a, i) -> analyze_calls(i, sigs, caller_refs, analyze_calls(a, sigs, caller_refs, acc))
   EPipe(a, b) -> analyze_calls(b, sigs, caller_refs, analyze_calls(a, sigs, caller_refs, acc))
+  EMapPipe(a, b) -> analyze_calls(b, sigs, caller_refs, analyze_calls(a, sigs, caller_refs, acc))
+  EFlatMapPipe(a, b) -> analyze_calls(b, sigs, caller_refs, analyze_calls(a, sigs, caller_refs, acc))
   EBang(x) -> analyze_calls(x, sigs, caller_refs, acc)
   ELambda(_, body) -> analyze_calls(body, sigs, caller_refs, acc)
   EList(elems) -> analyze_calls_in_list_elems(elems, sigs, caller_refs, acc)
@@ -8011,6 +8038,16 @@ fn dump_expr(e: Expr, depth: Int) : Unit {
       dump_expr(a, depth + 1)
       dump_expr(b, depth + 1)
     }
+    EMapPipe(a, b) -> {
+      emit_line(depth, "map_pipe @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(a, depth + 1)
+      dump_expr(b, depth + 1)
+    }
+    EFlatMapPipe(a, b) -> {
+      emit_line(depth, "flat_map_pipe @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(a, depth + 1)
+      dump_expr(b, depth + 1)
+    }
     EHole(nm_opt) -> {
       let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
       emit_line(depth, "hole #{label} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
@@ -8689,6 +8726,8 @@ fn chk_expr(e: Env, x: Expr) : Env {
       env_pop(e3)
     }
     EPipe(a, b) -> chk_expr(chk_expr(e, a), b)
+    EMapPipe(a, b) -> chk_expr(chk_expr(e, a), b)
+    EFlatMapPipe(a, b) -> chk_expr(chk_expr(e, a), b)
     EHole(_) -> e          # holes bind no names; checker lets them pass silently
     ETodo(_) -> e          # m7d §1: same posture as a hole
     EBang(inner) -> chk_expr(e, inner)   # m7e §13: scope-walk the operand
@@ -9500,6 +9539,12 @@ fn prelude_table() : [EPrelude] {
     EP("list_append",      "kai_prelude_list_append",      2),
     EP("list_reverse",     "kai_prelude_list_reverse",     1),
     EP("map",              "kai_prelude_map",              2),
+    # issue #201: paired runtime entry for the `||` flat-map pipe.
+    # Same shape as `map`; head-type-to-module dispatch in
+    # `synth_flat_map_pipe` resolves to `<module>.flat_map`, and the
+    # module bound to head-type `List` is `list` whose `flat_map` lands
+    # on this prelude symbol so `[T]` works without an explicit import.
+    EP("flat_map",         "kai_prelude_flat_map",         2),
     EP("filter",           "kai_prelude_filter",           2),
     EP("reduce",           "kai_prelude_reduce",           3),
     EP("each",             "kai_prelude_each",             2),
@@ -10853,6 +10898,8 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
       match opt_final { Some(f) -> fv_expr(f, r.own, globals, r.acc) None -> r.acc }
     }
     EPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EMapPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EFlatMapPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
     EHole(_) -> acc
     EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
       # m7b #11: free vars in the handler-state init expression
@@ -11174,6 +11221,8 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
       match opt_final { Some(f) -> collect_expr(f, s1) None -> s1 }
     }
     EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
+    EMapPipe(a, b) -> collect_expr(b, collect_expr(a, st))
+    EFlatMapPipe(a, b) -> collect_expr(b, collect_expr(a, st))
     EHole(_) -> st
     ETodo(_) -> st
     EBang(inner) -> collect_expr(inner, st)
@@ -12338,6 +12387,13 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
       }
     }
     EPipe(a, b) -> emit_pipe_expr(src, a, b, lcs, fns, variants, lams, cls)
+    # issue #201: `|` and `||` are rewritten by the typer (synth_map_pipe /
+    # synth_flat_map_pipe) into a `<module>.<op>(lhs, f)` ECall before
+    # codegen runs, so these arms are unreachable in practice. They exist
+    # to keep the exhaustive match valid; a fall-through here is a typer
+    # bug — emit a panic so the regression is loud at runtime.
+    EMapPipe(_, _)     -> "kai_prelude_panic(kai_str(\"unreachable: EMapPipe survived typer\"))"
+    EFlatMapPipe(_, _) -> "kai_prelude_panic(kai_str(\"unreachable: EFlatMapPipe survived typer\"))"
     EHole(nm_opt) -> {
       # Unfilled holes are runtime-panicky but syntactically valid:
       # the checker reports them and emission leaves a panic stub,
@@ -13505,6 +13561,8 @@ fn collect_call_labels(e: Expr, acc: [Label]) : [Label] = match e.kind {
     match tail { Some(t) -> collect_call_labels(t, a1) None -> a1 }
   }
   EPipe(a, b)         -> collect_call_labels(b, collect_call_labels(a, acc))
+  EMapPipe(a, b)      -> collect_call_labels(b, collect_call_labels(a, acc))
+  EFlatMapPipe(a, b)  -> collect_call_labels(b, collect_call_labels(a, acc))
   EBang(inner)        -> collect_call_labels(inner, acc)
   ELitUnit(inner, _)  -> collect_call_labels(inner, acc)
   EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
@@ -14491,6 +14549,8 @@ fn map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => map_stmt_exprs(s, f)),
                                     map_opt_expr(tail, f))
     EPipe(a, b)          -> EPipe(f(a), f(b))
+    EMapPipe(a, b)       -> EMapPipe(f(a), f(b))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(f(a), f(b))
     EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
       EHandle(f(body), eff_name, eff_tyargs,
               map_opt_expr(init_opt, f), alias_opt,
@@ -15616,6 +15676,14 @@ fn validate_var_in_kind(k: ExprKind, caps: [String], line: Int, col: Int, file: 
       let e1 = validate_var_in_expr(a, caps, file, errs)
       validate_var_in_expr(b, caps, file, e1)
     }
+    EMapPipe(a, b) -> {
+      let e1 = validate_var_in_expr(a, caps, file, errs)
+      validate_var_in_expr(b, caps, file, e1)
+    }
+    EFlatMapPipe(a, b) -> {
+      let e1 = validate_var_in_expr(a, caps, file, errs)
+      validate_var_in_expr(b, caps, file, e1)
+    }
     ERange(a, b, opt_step) -> {
       let e1 = validate_var_in_expr(a, caps, file, errs)
       let e2 = validate_var_in_expr(b, caps, file, e1)
@@ -15825,6 +15893,8 @@ fn body_escapes(name: String, e: Expr) : Bool {
     EIf(c, t_, eo) -> body_escapes(name, c) or body_escapes(name, t_) or opt_escapes(name, eo)
     EBlock(stmts, tail) -> stmts_escape(name, stmts) or opt_escapes(name, tail)
     EPipe(a, b) -> body_escapes(name, a) or body_escapes(name, b)
+    EMapPipe(a, b) -> body_escapes(name, a) or body_escapes(name, b)
+    EFlatMapPipe(a, b) -> body_escapes(name, a) or body_escapes(name, b)
     EMatch(scr, arms) -> body_escapes(name, scr) or arms_escape(name, arms)
     ELambda(_, _) -> contains_var(name, e)
     EList(elems) -> elems_escape(name, elems)
@@ -15946,6 +16016,8 @@ fn contains_var(name: String, e: Expr) : Bool {
       contains_var(name, a) or contains_var(name, b) or opt_contains(name, opt_step)
     ERecordLit(_, fields) -> fields_contain(name, fields)
     EPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
+    EMapPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
+    EFlatMapPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> contains_var(name, body) or opt_contains(name, init_opt) or clauses_contain(name, clauses) or ret_opt_contains(name, ret_opt)
     EBang(inner) -> contains_var(name, inner)
     _ -> false
@@ -16420,6 +16492,16 @@ fn use_rewrite_recurse(k: ExprKind, table: [EffOps], opens: [String],
       let ra = use_rewrite_expr(a, table, opens, bound, file, acc.errs)
       let rb = use_rewrite_expr(b, table, opens, bound, file, ra.errs)
       UseKindAcc { kind: EPipe(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
+    }
+    EMapPipe(a, b) -> {
+      let ra = use_rewrite_expr(a, table, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, table, opens, bound, file, ra.errs)
+      UseKindAcc { kind: EMapPipe(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
+    }
+    EFlatMapPipe(a, b) -> {
+      let ra = use_rewrite_expr(a, table, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, table, opens, bound, file, ra.errs)
+      UseKindAcc { kind: EFlatMapPipe(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
     }
     ELitUnit(inner, u) -> {
       let r = use_rewrite_expr(inner, table, opens, bound, file, acc.errs)
@@ -17081,6 +17163,16 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
       let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
       NurseryRwKind { kind: EPipe(ar.expr, br.expr), bw: br.bw }
     }
+    EMapPipe(a, b) -> {
+      let ar = rewrite_nursery_caps_expr(a, s, file, bw)
+      let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
+      NurseryRwKind { kind: EMapPipe(ar.expr, br.expr), bw: br.bw }
+    }
+    EFlatMapPipe(a, b) -> {
+      let ar = rewrite_nursery_caps_expr(a, s, file, bw)
+      let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
+      NurseryRwKind { kind: EFlatMapPipe(ar.expr, br.expr), bw: br.bw }
+    }
     ERecordLit(name, fs) -> {
       let r = rewrite_nursery_caps_fields(fs, s, file, bw, [])
       NurseryRwKind { kind: ERecordLit(name, r.fields), bw: r.bw }
@@ -17658,6 +17750,14 @@ fn check_brand_kind(k: ExprKind, env: BrandEnv, file: String,
       check_brand_expr(b, env, file, calls, brs, e1)
     }
     EPipe(a, b) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      check_brand_expr(b, env, file, calls, brs, e1)
+    }
+    EMapPipe(a, b) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      check_brand_expr(b, env, file, calls, brs, e1)
+    }
+    EFlatMapPipe(a, b) -> {
       let e1 = check_brand_expr(a, env, file, calls, brs, errs)
       check_brand_expr(b, env, file, calls, brs, e1)
     }
@@ -19152,6 +19252,13 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     # row-bearing dump helpers can't be passed to each/map/filter
     # at all.
     TyEntry { name: "map",    scheme: scheme_full([0, 1], [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], tv(1), row_with_tail(0))], list_ty(tv(1)), row_with_tail(0))) },
+    # issue #201: `flat_map` pairs with the `||` flat-map-pipe operator.
+    # Canonical signature is `([a], (a) -> [b]) -> [b]`; the row-poly
+    # callback lets effects in the per-element function flow out
+    # through the outer row, mirroring `map`. The `synth_flat_map_pipe`
+    # dispatch validates this exact shape (Constraint #3 in
+    # `docs/proposed-extensions.md` §11) before rewriting the pipe.
+    TyEntry { name: "flat_map", scheme: scheme_full([0, 1], [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], list_ty(tv(1)), row_with_tail(0))], list_ty(tv(1)), row_with_tail(0))) },
     TyEntry { name: "filter", scheme: scheme_full([0],    [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], TyBool, row_with_tail(0))], list_ty(tv(0)), row_with_tail(0))) },
     TyEntry { name: "reduce", scheme: scheme_full([0, 1], [0], TyFnT([list_ty(tv(0)), tv(1), TyFnT([tv(1), tv(0)], tv(1), row_with_tail(0))], tv(1), row_with_tail(0))) },
     TyEntry { name: "each",   scheme: scheme_full([0],    [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], TyUnit, row_with_tail(0))], TyUnit, row_with_tail(0))) },
@@ -22644,6 +22751,8 @@ fn synth(st: InferState, e: Expr) : Inferred {
     ERange(lo, hi, stp)        -> synth_range(st, lo, hi, stp, e.line, e.col)
     EBlock(stmts, tail)        -> synth_block(st, stmts, tail, e.line, e.col)
     EPipe(lhs, rhs)            -> synth_pipe(st, lhs, rhs, e.line, e.col)
+    EMapPipe(lhs, rhs)         -> synth_map_pipe(st, lhs, rhs, e.line, e.col)
+    EFlatMapPipe(lhs, rhs)     -> synth_flat_map_pipe(st, lhs, rhs, e.line, e.col)
     EHole(nm_opt)              -> synth_hole(st, nm_opt, e)
     ETodo(msg)                 -> synth_todo(st, msg, e)
     EBang(inner)               -> synth_bang(st, inner, e.line, e.col)
@@ -24054,6 +24163,133 @@ fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Infer
   let root = with_ty(mk_expr(EPipe(rl.expr, res.rhs), line, col), res.ty)
   mk_inferred(res.st, res.ty, root)
 }
+
+# issue #201: head-type-to-module map.
+#
+# The map is one-to-one: each head type name resolves to at most one
+# module that owns its `map` / `flat_map` implementations. v1 ships
+# only the builtin `List → list` entry because `[T]` is the only
+# container type with both `map` and `flat_map` in the standard
+# library today. ahu's future `Stream[T]` participates by adding a
+# second entry (and a `pub fn map` / `pub fn flat_map` in the
+# `ahu/stream.kai` module) — no compiler change required beyond the
+# table extension.
+#
+# The lookup returns:
+#   * `Some(module_name)` when the head type is dispatch-eligible.
+#   * `None` for `Option` / `Result` (Constraint #1, rejected with a
+#     dedicated diagnostic pointing at `!` and `opt_and_then` /
+#     `result_and_then`).
+#   * `None` for any other head name (Constraint #2 — the type opted
+#     out by not exporting `map` / `flat_map` in a registered module).
+#
+# A `None` return at the call site is the typer's signal to issue
+# the right error and stamp `TyAny`. The map is queried twice per
+# pipe call site (once for `head_module_for` and once via the
+# `ty_env_lookup` for the operation), so keeping it tiny matters.
+fn head_module_for(head: String) : Option[String] {
+  if head == "List" { Some("list") }
+  else { None }
+}
+
+# issue #201 Constraint #1: explicit, typed rejection for the
+# `Option` / `Result` heads. Returns `Some(diagnostic)` for the
+# rejected heads and `None` otherwise so callers can tell apart
+# "rejected by name" from "no module mapping".
+fn pipe_rejection_reason(head: String, op: String) : Option[String] {
+  if head == "Option" {
+    Some(concat_all([
+      op, "-pipe is not supported on `Option`. Use `!` for ",
+      "propagation (`x!`) or `opt_and_then` for explicit chaining."
+    ]))
+  } else if head == "Result" {
+    Some(concat_all([
+      op, "-pipe is not supported on `Result`. Use `!` for ",
+      "propagation (`x!`) or `result_and_then` for explicit chaining."
+    ]))
+  } else {
+    None
+  }
+}
+
+# issue #201: shared lowering for `EMapPipe` and `EFlatMapPipe`.
+# Resolves the LHS's head type, dispatches via `head_module_for`,
+# rewrites to `<module>.<op>(lhs, f)`, and runs the standard call
+# inference path (`synth_call` against an `EModCall` callee — same
+# arms the explicit `list.map(xs, f)` qualified-call form uses).
+#
+# Errors stamp `TyAny` and bump `st.errs` so cascade is graceful and
+# downstream passes don't crash on a missing pipe lowering.
+fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
+                        line: Int, col: Int) : Inferred {
+  let rl = synth(st, lhs)
+  let lhs_ty = apply_ty(rl.st.sub, rl.ty)
+  match ty_head_name(lhs_ty) {
+    None -> {
+      diag_error(rl.st.file, line, col,
+        concat_all([op, "-pipe requires a concrete head type on the ",
+          "left-hand side; got an unresolved type variable. Annotate ",
+          "the LHS or restructure the pipeline."]))
+      let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
+      mk_inferred(st_bump_err(rl.st), TyAny, root)
+    }
+    Some(head) -> match pipe_rejection_reason(head, op) {
+      Some(msg) -> {
+        diag_error(rl.st.file, line, col, msg)
+        let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
+        mk_inferred(st_bump_err(rl.st), TyAny, root)
+      }
+      None -> match head_module_for(head) {
+        None -> {
+          diag_error(rl.st.file, line, col,
+            concat_all(["no `", op, "` registered for head type `", head,
+              "`. The head type's module must export `pub fn ", op,
+              "` with the canonical signature for `", op, "`-pipe to dispatch."]))
+          let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
+          mk_inferred(st_bump_err(rl.st), TyAny, root)
+        }
+        Some(module_name) -> {
+          # Build the rewritten call: `<module_name>.<op>(lhs, rhs)`.
+          # The `EVar(op)` callee resolves through the env's bare-name
+          # entry — for the builtin `list` module, `op` is `"map"` or
+          # `"flat_map"`, both shipped as prelude entries (see
+          # `prelude_table` and the `TyEntry` block in
+          # `core_baseline_env`). When ahu's `Stream` lands and brings
+          # `Stream → ahu.stream`, the same lookup will resolve through
+          # the imported decl stream because m6.2 v1 collapses
+          # qualified calls to the bare-name TyEnv key. Once m6.2 v2
+          # introduces module-prefixed env keys, this site will switch
+          # to `EModCall(module_name, op)` and reuse the qualified-call
+          # codegen unchanged.
+          let _ = module_name
+          let callee = with_ty(mk_expr(EVar(op), line, col), TyAny)
+          let rf = synth(rl.st, rhs)
+          let rc = synth(rf.st, callee)
+          let rv = st_fresh_ty(rc.st)
+          let fr = subst_fresh_row(rv.st.sub)
+          let st_fresh = st_set_sub(rv.st, fr.subst)
+          let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+          let expected = TyFnT([rl.ty, rf.ty], rv.ty, expected_row)
+          # Use the same unify-message label as `synth_call` so existing
+          # diagnostics-pinning fixtures (e.g.
+          # `examples/sugars/map_pipe_type_mismatch.err.expected`)
+          # match identically — the surface-level lane should not
+          # change unrelated diagnostic strings.
+          let st2 = st_unify(st_fresh, rc.ty, expected, "function call", line, col)
+          let ty = apply_ty(st2.sub, rv.ty)
+          let root = with_ty(mk_expr(ECall(rc.expr, [rl.expr, rf.expr]), line, col), ty)
+          mk_inferred(st2, ty, root)
+        }
+      }
+    }
+  }
+}
+
+fn synth_map_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred =
+  synth_pipe_dispatch(st, "map", lhs, rhs, line, col)
+
+fn synth_flat_map_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred =
+  synth_pipe_dispatch(st, "flat_map", lhs, rhs, line, col)
 
 # m12.8.x phase 4 (Bug 6): for the syntactically-bare prelude IO
 # builtins, accumulate the matching effect label on the caller's
@@ -26269,6 +26505,10 @@ fn expand_aliases_exprkind(k: ExprKind, aliases: [UAliasEntry]) : ExprKind {
              match opt_final { Some(fe) -> Some(expand_aliases_expr(fe, aliases)) None -> None })
     EPipe(a, b) -> EPipe(expand_aliases_expr(a, aliases),
                          expand_aliases_expr(b, aliases))
+    EMapPipe(a, b) -> EMapPipe(expand_aliases_expr(a, aliases),
+                               expand_aliases_expr(b, aliases))
+    EFlatMapPipe(a, b) -> EFlatMapPipe(expand_aliases_expr(a, aliases),
+                                       expand_aliases_expr(b, aliases))
     EHole(_) -> k
     ETodo(_) -> k
     EBang(inner) -> EBang(expand_aliases_expr(inner, aliases))
@@ -26429,6 +26669,8 @@ fn tag_of_kind(k: ExprKind) : String {
     ERange(_, _, _) -> "range"
     EBlock(_, _)   -> "block"
     EPipe(_, _)    -> "pipe"
+    EMapPipe(_, _) -> "map_pipe"
+    EFlatMapPipe(_, _) -> "flat_map_pipe"
     EHole(nm_opt)  -> match nm_opt {
       Some(nm) -> concat_all(["hole ?", nm])
       None     -> "hole ?"
@@ -26542,6 +26784,8 @@ fn dump_typed_subexprs(k: ExprKind, depth: Int) : Unit {
       match tail { Some(t) -> dump_typed_expr(t, depth) None -> () }
     }
     EPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    EMapPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    EFlatMapPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
     EBang(inner) -> dump_typed_expr(inner, depth)
     _ -> ()
   }
@@ -26780,6 +27024,12 @@ fn find_first_leak_in_kind(k: ExprKind, atv: [Int], auv: [Int]) : Option[LeakLoc
     EPipe(a, b) -> match find_first_leak_in_expr(a, atv, auv) {
       Some(l) -> Some(l) None -> find_first_leak_in_expr(b, atv, auv)
     }
+    EMapPipe(a, b) -> match find_first_leak_in_expr(a, atv, auv) {
+      Some(l) -> Some(l) None -> find_first_leak_in_expr(b, atv, auv)
+    }
+    EFlatMapPipe(a, b) -> match find_first_leak_in_expr(a, atv, auv) {
+      Some(l) -> Some(l) None -> find_first_leak_in_expr(b, atv, auv)
+    }
     ERange(a, b, opt_step) -> match find_first_leak_in_expr(a, atv, auv) {
       Some(l) -> Some(l)
       None -> match find_first_leak_in_expr(b, atv, auv) {
@@ -26995,6 +27245,8 @@ fn count_tyvar_in_kind(k: ExprKind, atv: [Int], auv: [Int]) : Int {
       match tail { Some(e3) -> n0 + count_tyvar_in_expr(e3, atv, auv, 0) None -> n0 }
     }
     EPipe(a, b) -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EMapPipe(a, b) -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EFlatMapPipe(a, b) -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
       let n0 = count_tyvar_in_expr(body, atv, auv, 0)
       let n1 = match init_opt { Some(e3) -> n0 + count_tyvar_in_expr(e3, atv, auv, 0) None -> n0 }
@@ -27759,6 +28011,10 @@ fn discover_new_tuples_kind(k: ExprKind, insts: [ResolvedCS], polys: [PolyFn],
     }
     EPipe(a, b)      -> discover_new_tuples_expr(b, insts, polys, existing, sm,
                          discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+    EMapPipe(a, b)   -> discover_new_tuples_expr(b, insts, polys, existing, sm,
+                         discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+    EFlatMapPipe(a, b) -> discover_new_tuples_expr(b, insts, polys, existing, sm,
+                            discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
       let a1 = discover_new_tuples_expr(body, insts, polys, existing, sm, acc)
       let a2 = match init_opt { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a1) None -> a1 }
@@ -28274,6 +28530,8 @@ fn unbox_kind(k: ExprKind, env: [LocBind]) : ExprKind {
       EBlock(stmts1, unbox_opt(tail, env1))
     }
     EPipe(a, b)          -> EPipe(unbox_expr(a, env), unbox_expr(b, env))
+    EMapPipe(a, b)       -> EMapPipe(unbox_expr(a, env), unbox_expr(b, env))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(unbox_expr(a, env), unbox_expr(b, env))
     EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
       # The handled body opens a fresh dynamic scope for the effect
       # capability. v1 walks it with the outer env (no bindings
@@ -28643,6 +28901,8 @@ fn kind_has_interp_use(k: ExprKind, nm: String) : Bool {
       any_stmt_has_interp_use(stmts, nm) or
       opt_expr_has_interp_use(opt_tail, nm)
     EPipe(l, r)      -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
+    EMapPipe(l, r)   -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
+    EFlatMapPipe(l, r) -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
       if expr_has_interp_use(body, nm) { true }
       else if opt_expr_has_interp_use(init_opt, nm) { true }
@@ -28816,6 +29076,10 @@ fn pcs_collect_uses_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     EBlock(stmts, opt_tail) -> pcs_collect_uses_in_block(stmts, opt_tail, scope, in_lam, acc)
     EPipe(l, r) -> pcs_collect_uses_expr(r, scope, in_lam,
                       pcs_collect_uses_expr(l, scope, in_lam, acc))
+    EMapPipe(l, r) -> pcs_collect_uses_expr(r, scope, in_lam,
+                         pcs_collect_uses_expr(l, scope, in_lam, acc))
+    EFlatMapPipe(l, r) -> pcs_collect_uses_expr(r, scope, in_lam,
+                            pcs_collect_uses_expr(l, scope, in_lam, acc))
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
       let a1 = pcs_collect_uses_expr(body, scope, in_lam, acc)
       let a2 = match init_opt {
@@ -29379,6 +29643,8 @@ fn pcs_dup_marks_subs(k: ExprKind, acc: [DupMark]) : [DupMark] {
       }
     }
     EPipe(l, r) -> pcs_dup_marks_expr(r, pcs_dup_marks_expr(l, acc))
+    EMapPipe(l, r) -> pcs_dup_marks_expr(r, pcs_dup_marks_expr(l, acc))
+    EFlatMapPipe(l, r) -> pcs_dup_marks_expr(r, pcs_dup_marks_expr(l, acc))
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
       let a1 = pcs_dup_marks_expr(body, acc)
       let a2 = match init_opt {
@@ -29701,6 +29967,10 @@ fn scan_uses_kind(k: ExprKind, line: Int, col: Int, in_lam: Bool) : [Use] {
     }
     EPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
                                 scan_uses_expr(r, in_lam))
+    EMapPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
+                                   scan_uses_expr(r, in_lam))
+    EFlatMapPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
+                                       scan_uses_expr(r, in_lam))
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
       let p1 = scan_uses_expr(body, in_lam)
       let p2 = match init_opt {
@@ -30212,6 +30482,10 @@ fn tcrec_scan_kind(k: ExprKind) : Bool {
     EIndex(x, i) ->
       if tcrec_body_has_sentinel(x) { true } else { tcrec_body_has_sentinel(i) }
     EPipe(l, r) ->
+      if tcrec_body_has_sentinel(l) { true } else { tcrec_body_has_sentinel(r) }
+    EMapPipe(l, r) ->
+      if tcrec_body_has_sentinel(l) { true } else { tcrec_body_has_sentinel(r) }
+    EFlatMapPipe(l, r) ->
       if tcrec_body_has_sentinel(l) { true } else { tcrec_body_has_sentinel(r) }
     _ -> false
   }
@@ -30913,6 +31187,14 @@ fn effects_collect_kind(k: ExprKind, line: Int, col: Int,
       let a1 = effects_collect_expr(a, acc)
       effects_collect_expr(b, a1)
     }
+    EMapPipe(a, b) -> {
+      let a1 = effects_collect_expr(a, acc)
+      effects_collect_expr(b, a1)
+    }
+    EFlatMapPipe(a, b) -> {
+      let a1 = effects_collect_expr(a, acc)
+      effects_collect_expr(b, a1)
+    }
     ELitUnit(inner, _) -> effects_collect_expr(inner, acc)
     EBang(inner) -> effects_collect_expr(inner, acc)
     _ -> acc
@@ -31167,6 +31449,7 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_prelude_eprint(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_int_to_string(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_map(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_flat_map(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_each(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_filter(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_reduce(%KaiValue*, %KaiValue*, %KaiValue*)\n",
@@ -31546,6 +31829,7 @@ fn llvm_prelude_table() : [LlvmPrelude] {
     LP("eprint",           1, Some("@kaix_eprint_thunk")),
     LP("int_to_string",    1, Some("@kaix_int_to_string_thunk")),
     LP("map",              2, None),
+    LP("flat_map",         2, None),
     LP("each",             2, None),
     LP("filter",           2, None),
     LP("reduce",           3, None),
@@ -32090,6 +32374,27 @@ fn llvm_emit_expr_boxed(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
     EBlock(stmts, tail) -> llvm_emit_block(e, stmts, tail)
     ERange(lo, hi, stp) -> llvm_emit_range(e, lo, hi, stp)
     EPipe(lhs, rhs) -> llvm_emit_pipe(e, lhs, rhs)
+    # issue #201: rewritten by typer to ECall before LLVM emission.
+    # Reaching either arm signals a typer bug; emit the same panic
+    # stub `EHole` uses so the regression is loud at runtime.
+    EMapPipe(_, _) -> {
+      let name_res = llvm_emit_name_constant(e, "unreachable: EMapPipe survived typer", "pipe.msg.")
+      let sreg = llvm_fresh_reg(name_res.e)
+      let s_instr = concat_all(["  ", sreg.reg, " = call %KaiValue* @kaix_str(i8* ", name_res.gep, ")\n"])
+      let e_s = llvm_append_body(sreg.e, s_instr)
+      let r = llvm_fresh_reg(e_s)
+      let p_instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_match_panic(%KaiValue* ", sreg.reg, ")\n"])
+      llvm_set_last(llvm_append_body(r.e, p_instr), r.reg)
+    }
+    EFlatMapPipe(_, _) -> {
+      let name_res = llvm_emit_name_constant(e, "unreachable: EFlatMapPipe survived typer", "pipe.msg.")
+      let sreg = llvm_fresh_reg(name_res.e)
+      let s_instr = concat_all(["  ", sreg.reg, " = call %KaiValue* @kaix_str(i8* ", name_res.gep, ")\n"])
+      let e_s = llvm_append_body(sreg.e, s_instr)
+      let r = llvm_fresh_reg(e_s)
+      let p_instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_match_panic(%KaiValue* ", sreg.reg, ")\n"])
+      llvm_set_last(llvm_append_body(r.e, p_instr), r.reg)
+    }
     EMatch(scr, arms) -> llvm_emit_match(e, scr, arms, x.line, x.col)
     EList(elems) -> llvm_emit_list(e, elems)
     ELambda(_, _) -> llvm_emit_lambda_ref(e, x)
@@ -32197,6 +32502,8 @@ fn expr_kind_name(k: ExprKind) : String {
     ERange(_, _, _) -> "ERange"
     EBlock(_, _)   -> "EBlock"
     EPipe(_, _)    -> "EPipe"
+    EMapPipe(_, _) -> "EMapPipe"
+    EFlatMapPipe(_, _) -> "EFlatMapPipe"
     EHole(_)       -> "EHole"
     ETodo(_)       -> "ETodo"
     EBang(_)       -> "EBang"
@@ -37416,6 +37723,14 @@ fn validate_resolved_kind(k: ExprKind, reg: ProtocolReg, file: String,
       let e1 = validate_resolved_expr(a, reg, file, errs)
       validate_resolved_expr(b, reg, file, e1)
     }
+    EMapPipe(a, b) -> {
+      let e1 = validate_resolved_expr(a, reg, file, errs)
+      validate_resolved_expr(b, reg, file, e1)
+    }
+    EFlatMapPipe(a, b) -> {
+      let e1 = validate_resolved_expr(a, reg, file, errs)
+      validate_resolved_expr(b, reg, file, e1)
+    }
     EField(base, _) -> validate_resolved_expr(base, reg, file, errs)
     EIndex(a, b) -> {
       let e1 = validate_resolved_expr(a, reg, file, errs)
@@ -37673,6 +37988,14 @@ fn validate_inv_subexprs(k: ExprKind, file: String, bound: [String], errs: Int) 
       match tail { Some(t) -> validate_inv_expr(t, file, r.bound, r.errs) None -> r.errs }
     }
     EPipe(a, b) -> {
+      let e1 = validate_inv_expr(a, file, bound, errs)
+      validate_inv_expr(b, file, bound, e1)
+    }
+    EMapPipe(a, b) -> {
+      let e1 = validate_inv_expr(a, file, bound, errs)
+      validate_inv_expr(b, file, bound, e1)
+    }
+    EFlatMapPipe(a, b) -> {
       let e1 = validate_inv_expr(a, file, bound, errs)
       validate_inv_expr(b, file, bound, e1)
     }
@@ -38711,6 +39034,8 @@ fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
     ERange(lo, hi, step) -> fmt_range(lo, hi, step, s0)
     EBlock(stmts, tail) -> fmt_block(stmts, tail, s0)
     EPipe(l, r) -> fmt_pipe(l, r, s0)
+    EMapPipe(l, r) -> fmt_map_pipe(l, r, s0)
+    EFlatMapPipe(l, r) -> fmt_flat_map_pipe(l, r, s0)
     ELitUnit(_, _) -> fmt_panic_unsupported("unit-of-measure literals", e.line)
     EHandle(_, _, _, _, _, _, _) -> fmt_panic_unsupported("effect handlers", e.line)
     EVariantsOf(_, _) -> fmt_panic_unsupported("variants[T]()", e.line)
@@ -39210,6 +39535,32 @@ fn fmt_pipe(l: Expr, r: Expr, s: FmtSt) : FmtSt {
     _ -> fmt_expr_atom(l, s)
   }
   let s2 = fmt_emit(s1, " |> ")
+  fmt_expr_atom(r, s2)
+}
+
+# issue #201: `|` and `||` mirror `|>`'s left-leaning shape so a
+# left-EMapPipe nested inside an outer EMapPipe (or EFlatMapPipe)
+# stays paren-free. Parentheses around any *other* shape on the
+# left keep the formatter idempotent against future grammar changes.
+fn fmt_map_pipe(l: Expr, r: Expr, s: FmtSt) : FmtSt {
+  let s1 = match l.kind {
+    EPipe(_, _) -> fmt_expr(l, s)
+    EMapPipe(_, _) -> fmt_expr(l, s)
+    EFlatMapPipe(_, _) -> fmt_expr(l, s)
+    _ -> fmt_expr_atom(l, s)
+  }
+  let s2 = fmt_emit(s1, " | ")
+  fmt_expr_atom(r, s2)
+}
+
+fn fmt_flat_map_pipe(l: Expr, r: Expr, s: FmtSt) : FmtSt {
+  let s1 = match l.kind {
+    EPipe(_, _) -> fmt_expr(l, s)
+    EMapPipe(_, _) -> fmt_expr(l, s)
+    EFlatMapPipe(_, _) -> fmt_expr(l, s)
+    _ -> fmt_expr_atom(l, s)
+  }
+  let s2 = fmt_emit(s1, " || ")
   fmt_expr_atom(r, s2)
 }
 
