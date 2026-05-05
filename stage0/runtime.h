@@ -1608,6 +1608,44 @@ static KaiValue *kai_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init
     return r;
 }
 
+/* ---------- prelude: refs (issue #257) ----------
+ *
+ * `Ref[T]` is a single-cell mutable reference in the `Mutable`
+ * effect (docs/effects-stdlib.md §Mutable). Surface ops:
+ *   ref_make[T](init: T)        : Ref[T]
+ *   ref_get[T](r: Ref[T])       : T
+ *   ref_set[T](r: Ref[T], v: T) : Unit
+ *
+ * Runtime layout: a Ref is a 1-slot KAI_ARRAY. Reusing the array
+ * representation avoids a new tag plus parallel branches in
+ * kai_decref / kai_to_string / kai_op_eq while preserving the
+ * surface-level distinction enforced by the typer. */
+static KaiValue *kai_prelude_ref_make(KaiValue *init) {
+    /* kai_array_make increfs `init` once for the slot; we still
+     * decref our own input ref under the callee-consumes
+     * convention, mirroring kai_prelude_array_make. */
+    KaiValue *r = kai_array_make(1, init);
+    if (init) kai_decref(init);
+    return r;
+}
+
+static KaiValue *kai_prelude_ref_get(KaiValue *r) {
+    KaiValue *v = kai_array_get_impl(r, 0);
+    if (r) kai_decref(r);
+    return v;
+}
+
+static KaiValue *kai_prelude_ref_set(KaiValue *r, KaiValue *v) {
+    /* kai_array_set_impl steals `v` (inserts into the slot) and
+     * returns kai_incref(r). Surface contract is Unit-typed, so
+     * drop the returned array ref and synthesise unit. */
+    KaiValue *a = kai_array_set_impl(r, 0, kai_incref(v));
+    if (a) kai_decref(a);
+    if (r) kai_decref(r);
+    if (v) kai_decref(v);
+    return kai_unit();
+}
+
 /* ---------- prelude: lists ---------- */
 
 static KaiValue *kai_prelude_list_length(KaiValue *xs) {
@@ -2420,6 +2458,9 @@ static KaiValue *_kai_prelude_array_length_thunk(KaiValue *s, KaiValue **a, int 
 static KaiValue *_kai_prelude_array_get_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_array_get(a[0], a[1]); }
 static KaiValue *_kai_prelude_array_set_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_array_set(a[0], a[1], a[2]); }
 static KaiValue *_kai_prelude_array_grow_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_array_grow(a[0], a[1], a[2]); }
+static KaiValue *_kai_prelude_ref_make_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_ref_make(a[0]); }
+static KaiValue *_kai_prelude_ref_get_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_ref_get(a[0]); }
+static KaiValue *_kai_prelude_ref_set_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_ref_set(a[0], a[1]); }
 static KaiValue *_kai_prelude_list_length_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_list_length(a[0]); }
 static KaiValue *_kai_prelude_list_append_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_list_append(a[0], a[1]); }
 static KaiValue *_kai_prelude_list_reverse_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_list_reverse(a[0]); }
@@ -2995,6 +3036,25 @@ static KaiValue *kai_default_mutable_array_grow(void *self, KaiValue *a,
                                                  KaiValue *n, KaiValue *init, KaiCont *k) {
     (void) self;
     return kai_cont_resume(k, kai_prelude_array_grow(a, n, init));
+}
+
+/* Issue #257: Ref[T] ops in the default Mutable handler. Each
+ * trampolines to its prelude helper and resumes with the result,
+ * mirroring the array_* clauses above. */
+static KaiValue *kai_default_mutable_ref_make(void *self, KaiValue *init, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_ref_make(init));
+}
+
+static KaiValue *kai_default_mutable_ref_get(void *self, KaiValue *r, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_ref_get(r));
+}
+
+static KaiValue *kai_default_mutable_ref_set(void *self, KaiValue *r,
+                                              KaiValue *v, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_ref_set(r, v));
 }
 
 /* Default Random handler — PCG32 (M.E.O'Neill 2014). Per-process
