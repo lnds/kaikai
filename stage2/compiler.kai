@@ -21464,7 +21464,7 @@ fn subst_lookup(s: Subst, v: Int) : Option[Ty] {
   else { array_get(s.slots, v) }
 }
 
-fn subst_extend(s: Subst, v: Int, ty: Ty) : Subst {
+fn subst_extend(s: Subst, v: Int, ty: Ty) : Subst / Mutable {
   let len = array_length(s.slots)
   let slots1 = if v >= len {
     let grown = if v + 1 > len * 2 { v + 1 } else { len * 2 }
@@ -21484,7 +21484,7 @@ fn subst_row_lookup(s: Subst, v: Int) : Option[Row] {
   else { array_get(s.row_slots, v) }
 }
 
-fn subst_row_extend(s: Subst, v: Int, r: Row) : Subst {
+fn subst_row_extend(s: Subst, v: Int, r: Row) : Subst / Mutable {
   let len = array_length(s.row_slots)
   let rs1 = if v >= len {
     let grown = if v + 1 > len * 2 { v + 1 } else { len * 2 }
@@ -21513,7 +21513,7 @@ fn subst_unit_lookup(s: Subst, v: Int) : Option[UnitExprT] {
   else { array_get(s.unit_slots, v) }
 }
 
-fn subst_unit_extend(s: Subst, v: Int, u: UnitExprT) : Subst {
+fn subst_unit_extend(s: Subst, v: Int, u: UnitExprT) : Subst / Mutable {
   let len = array_length(s.unit_slots)
   let us1 = if v >= len {
     let grown = if v + 1 > len * 2 { v + 1 } else { len * 2 }
@@ -25613,7 +25613,629 @@ fn prelude_effect_for(name: String) : Option[String] {
   else if name == "eprint" { Some("Stderr") }
   else if name == "read_line" { Some("Stdin") }
   else if name == "read_file" or name == "write_file" { Some("File") }
+  # issue #251: bare prelude `array_set` / `array_grow` raise the
+  # `Mutable` demand on the caller's row. Provenance masking
+  # (issue #252) — implemented in `mask_local_mutable_demand`,
+  # invoked at the end of `infer_decl` — drops `Mutable` again when
+  # every demand targets a locally-constructed Array. `array_make`,
+  # `array_length`, `array_get` stay bare (constructors and reads).
+  else if name == "array_set" or name == "array_grow" { Some("Mutable") }
   else { None }
+}
+
+# issue #251 + #252 — Mutable provenance / masking pass.
+#
+# `add_prelude_effect_label` raises `Mutable` whenever the body
+# calls bare `array_set` / `array_grow` (the desugar of
+# `a[i] := v`). That over-approximates: a function that
+# constructs an Array locally, mutates it before returning, and
+# never lets the caller observe the act of mutation is
+# semantically pure from the caller's POV (the Koka observable-
+# effects discipline pinned in #251 / `docs/effects-stdlib.md`
+# §`Mutable`). This pass walks the typed body, classifies each
+# Mutable demand as local-non-escaping vs external, and drops
+# `Mutable` from the inferred row when every demand is local.
+#
+# Algorithm (Pass 1 + Pass 2):
+#   Pass 1 — provenance scan. Walks every `let n = rhs` binding
+#     and records `n` as "local" iff `rhs` is a direct call to
+#     `array_make`, or a call to `array_set` / `array_grow`
+#     whose first arg is itself a previously-recorded local
+#     name. Names introduced via `var x = init` desugar to
+#     `let x__slot = array_make(1, init)` and pick up the same
+#     local label for free.
+#   Escape scan. A name escapes if it appears as an argument
+#     position of any call other than `array_make`,
+#     `array_length`, `array_get`, `array_set`, `array_grow`.
+#     Returning the name as the function's tail value is NOT an
+#     escape (the caller receives a settled value, not a
+#     witnessable mutation). Per #251's "out of scope for v1"
+#     note, passing a local Array to ANOTHER function that may
+#     mutate it is conservatively treated as escape.
+#   Pass 2 — demand classification. Walks every
+#     `array_set(first, ...)` / `array_grow(first, ...)` call
+#     site. The demand is "local" iff `first` is `EVar(n)`,
+#     `n` is in the local set, and `n` is not in the escaped
+#     set. Otherwise the demand is "external".
+#   If every demand is local, `Mutable` is removed from
+#   `st.row` (and from `st.eff_uses` to keep diagnostics
+#   consistent). Otherwise the row is left untouched.
+fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : InferState {
+  if not list_has_label(st.row, "Mutable") { st }
+  else {
+    let local_set = collect_local_arrays(body, [])
+    let param_names = mut_collect_param_names(params, [])
+    let escaped_set = collect_escaped_names(body, [])
+    if all_demands_local(body, local_set, escaped_set, param_names) {
+      st_drop_label(st, "Mutable")
+    } else { st }
+  }
+}
+
+fn list_has_label(row: [Label], eff: String) : Bool {
+  match row {
+    []           -> false
+    [h, ...rest] -> if h.eff == eff { true } else { list_has_label(rest, eff) }
+  }
+}
+
+fn st_drop_label(st: InferState, eff: String) : InferState {
+  let row1 = drop_labels_named(st.row, eff)
+  let uses1 = drop_eff_uses_named(st.eff_uses, eff)
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: row1, eff_uses: uses1, aliases: st.aliases,
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+}
+
+fn drop_labels_named(row: [Label], eff: String) : [Label] {
+  match row {
+    []           -> []
+    [h, ...rest] ->
+      if h.eff == eff { drop_labels_named(rest, eff) }
+      else { [h, ...drop_labels_named(rest, eff)] }
+  }
+}
+
+fn drop_eff_uses_named(uses: [EffUse], eff: String) : [EffUse] {
+  match uses {
+    []           -> []
+    [h, ...rest] -> match h {
+      EU(name, _, _) ->
+        if name == eff { drop_eff_uses_named(rest, eff) }
+        else { [h, ...drop_eff_uses_named(rest, eff)] }
+    }
+  }
+}
+
+fn mut_collect_param_names(ps: [Param], acc: [String]) : [String] {
+  match ps {
+    []           -> acc
+    [p, ...rest] -> mut_collect_param_names(rest, [p.pname, ...acc])
+  }
+}
+
+# Walk the typed body and accumulate names bound by
+# `let n = array_make(...)` (or rebindings via array_set / array_grow
+# of already-local names). Recurses through every sub-expression so
+# locals introduced inside if/match/block branches are caught.
+fn collect_local_arrays(e: Expr, acc: [String]) : [String] =
+  collect_local_arrays_kind(e.kind, acc)
+
+fn collect_local_arrays_kind(k: ExprKind, acc: [String]) : [String] {
+  match k {
+    EBlock(stmts, tail) -> {
+      let acc1 = collect_local_in_stmts(stmts, acc)
+      match tail {
+        Some(t) -> collect_local_arrays(t, acc1)
+        None    -> acc1
+      }
+    }
+    EIf(c, t_, eo) -> {
+      let a1 = collect_local_arrays(c, acc)
+      let a2 = collect_local_arrays(t_, a1)
+      match eo {
+        Some(e2) -> collect_local_arrays(e2, a2)
+        None     -> a2
+      }
+    }
+    EMatch(scr, arms) -> {
+      let a1 = collect_local_arrays(scr, acc)
+      collect_local_in_arms(arms, a1)
+    }
+    ECall(callee, args_) -> {
+      let a1 = collect_local_arrays(callee, acc)
+      collect_local_in_exprs(args_, a1)
+    }
+    EBinop(_, a, b)   -> collect_local_arrays(b, collect_local_arrays(a, acc))
+    EUnop(_, x)       -> collect_local_arrays(x, acc)
+    EField(b, _)      -> collect_local_arrays(b, acc)
+    EIndex(a, b)      -> collect_local_arrays(b, collect_local_arrays(a, acc))
+    EPipe(a, b)       -> collect_local_arrays(b, collect_local_arrays(a, acc))
+    EMapPipe(a, b)    -> collect_local_arrays(b, collect_local_arrays(a, acc))
+    EFlatMapPipe(a, b)-> collect_local_arrays(b, collect_local_arrays(a, acc))
+    ELambda(_, b)     -> collect_local_arrays(b, acc)
+    ERecordLit(_, fs) -> collect_local_in_field_inits(fs, acc)
+    EList(els)        -> collect_local_in_list_elems(els, acc)
+    ERange(a, b, oc)  -> {
+      let a1 = collect_local_arrays(b, collect_local_arrays(a, acc))
+      match oc { Some(c) -> collect_local_arrays(c, a1) None -> a1 }
+    }
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let a1 = collect_local_arrays(body, acc)
+      let a2 = match init_opt { Some(i) -> collect_local_arrays(i, a1) None -> a1 }
+      let a3 = collect_local_in_hclauses(clauses, a2)
+      match ret_opt {
+        Some(HR(_, body, _, _)) -> collect_local_arrays(body, a3)
+        None              -> a3
+      }
+    }
+    ELitUnit(inner, _) -> collect_local_arrays(inner, acc)
+    EBang(inner)       -> collect_local_arrays(inner, acc)
+    _ -> acc
+  }
+}
+
+fn collect_local_in_exprs(es: [Expr], acc: [String]) : [String] = match es {
+  []           -> acc
+  [h, ...rest] -> collect_local_in_exprs(rest, collect_local_arrays(h, acc))
+}
+
+fn collect_local_in_field_inits(fs: [FieldInit], acc: [String]) : [String] = match fs {
+  []           -> acc
+  [h, ...rest] -> match h {
+    FI(_, v) -> collect_local_in_field_inits(rest, collect_local_arrays(v, acc))
+  }
+}
+
+fn collect_local_in_list_elems(els: [ListElem], acc: [String]) : [String] = match els {
+  []           -> acc
+  [h, ...rest] -> match h {
+    ElPlain(x)  -> collect_local_in_list_elems(rest, collect_local_arrays(x, acc))
+    ElSpread(x) -> collect_local_in_list_elems(rest, collect_local_arrays(x, acc))
+  }
+}
+
+fn collect_local_in_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []           -> acc
+  [h, ...rest] -> match h {
+    Arm(_, g, b) -> {
+      let a1 = match g { Some(gx) -> collect_local_arrays(gx, acc) None -> acc }
+      collect_local_in_arms(rest, collect_local_arrays(b, a1))
+    }
+  }
+}
+
+fn collect_local_in_hclauses(cs: [HClause], acc: [String]) : [String] = match cs {
+  []           -> acc
+  [h, ...rest] -> match h {
+    HC(_, _, b, _, _) -> collect_local_in_hclauses(rest, collect_local_arrays(b, acc))
+  }
+}
+
+fn collect_local_in_stmts(stmts: [Stmt], acc: [String]) : [String] = match stmts {
+  []           -> acc
+  [s, ...rest] -> collect_local_in_stmts(rest, collect_local_in_stmt(s, acc))
+}
+
+fn collect_local_in_stmt(s: Stmt, acc: [String]) : [String] {
+  match s {
+    SLet(p, _, rhs) -> {
+      # Recurse into rhs first (a let RHS may itself contain nested
+      # array_make bindings inside an if/match branch with sub-lets).
+      let acc1 = collect_local_arrays(rhs, acc)
+      match p.pkind {
+        PBind(name) ->
+          if rhs_is_local_array_origin(rhs.kind, acc1) {
+            [name, ...acc1]
+          } else { acc1 }
+        _ -> acc1
+      }
+    }
+    SAssert(c, m) -> {
+      let a1 = collect_local_arrays(c, acc)
+      match m { Some(mx) -> collect_local_arrays(mx, a1) None -> a1 }
+    }
+    SExprStmt(x)                -> collect_local_arrays(x, acc)
+    SIndexAssign(b, i, v, _, _) ->
+      collect_local_arrays(v, collect_local_arrays(i, collect_local_arrays(b, acc)))
+    SVar(_, _, rhs, _, _)       -> collect_local_arrays(rhs, acc)
+    SUse(_, _, _)               -> acc
+  }
+}
+
+# True iff `rhs` originates a fresh local Array reference. Three
+# shapes count: a direct `array_make(...)` call, an `array_set`
+# of an already-local Array (in-place mutation + return), or an
+# `array_grow` of an already-local Array. `local_so_far` carries
+# names recorded earlier in this scan, so chained `let xs2 =
+# array_set(xs1, ...)` continues to track xs2 as local when xs1
+# was local.
+fn rhs_is_local_array_origin(k: ExprKind, local_so_far: [String]) : Bool {
+  match k {
+    ECall(callee, args_) -> match callee.kind {
+      EVar(name) ->
+        if name == "array_make" { true }
+        else if (name == "array_set" or name == "array_grow") {
+          match args_ {
+            [first, ...ignore] -> match first.kind {
+              EVar(n) -> list_has(local_so_far, n)
+              _       -> false
+            }
+            [] -> false
+          }
+        } else { false }
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
+# Collect names that appear as argument positions of any call other
+# than the safe array_* whitelist. Conservative escape: passing a
+# locally-constructed Array to a helper assumes the helper might
+# mutate it (#251 v1 scope). The whitelist covers reads
+# (array_get / array_length) and writes the demand pass already
+# inspects (array_set / array_grow / array_make).
+fn collect_escaped_names(e: Expr, acc: [String]) : [String] =
+  collect_escaped_names_kind(e.kind, acc)
+
+fn collect_escaped_names_kind(k: ExprKind, acc: [String]) : [String] {
+  match k {
+    ECall(callee, args_) -> {
+      let safe = match callee.kind {
+        EVar(n) -> is_array_safe_callee(n)
+        _       -> false
+      }
+      let a0 = collect_escaped_names(callee, acc)
+      if safe { collect_escaped_in_exprs_safe(args_, a0) }
+      else    { collect_escaped_in_exprs(args_, a0) }
+    }
+    EBlock(stmts, tail) -> {
+      let a1 = collect_escaped_in_stmts(stmts, acc)
+      match tail { Some(t) -> collect_escaped_names(t, a1) None -> a1 }
+    }
+    EIf(c, t_, eo) -> {
+      let a1 = collect_escaped_names(c, acc)
+      let a2 = collect_escaped_names(t_, a1)
+      match eo { Some(e2) -> collect_escaped_names(e2, a2) None -> a2 }
+    }
+    EMatch(scr, arms) -> {
+      let a1 = collect_escaped_names(scr, acc)
+      collect_escaped_in_arms(arms, a1)
+    }
+    EBinop(_, a, b)   -> collect_escaped_names(b, collect_escaped_names(a, acc))
+    EUnop(_, x)       -> collect_escaped_names(x, acc)
+    EField(b, _)      -> collect_escaped_names(b, acc)
+    EIndex(a, b)      -> collect_escaped_names(b, collect_escaped_names(a, acc))
+    EPipe(a, b)       -> collect_escaped_via_pipe(a, b, acc)
+    EMapPipe(a, b)    -> collect_escaped_via_pipe(a, b, acc)
+    EFlatMapPipe(a, b)-> collect_escaped_via_pipe(a, b, acc)
+    ELambda(_, b)     -> collect_escaped_names(b, acc)
+    # A record literal stores values into fields — that hands the
+    # reference to a structured carrier the caller may inspect or
+    # mutate. Treat field-init args as escaping.
+    ERecordLit(_, fs) -> collect_escaped_in_field_inits(fs, acc)
+    EList(els)        -> collect_escaped_in_list_elems(els, acc)
+    ERange(a, b, oc)  -> {
+      let a1 = collect_escaped_names(b, collect_escaped_names(a, acc))
+      match oc { Some(c) -> collect_escaped_names(c, a1) None -> a1 }
+    }
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let a1 = collect_escaped_names(body, acc)
+      let a2 = match init_opt { Some(i) -> collect_escaped_names(i, a1) None -> a1 }
+      let a3 = collect_escaped_in_hclauses(clauses, a2)
+      match ret_opt {
+        Some(HR(_, body, _, _)) -> collect_escaped_names(body, a3)
+        None              -> a3
+      }
+    }
+    ELitUnit(inner, _) -> collect_escaped_names(inner, acc)
+    EBang(inner)       -> collect_escaped_names(inner, acc)
+    _ -> acc
+  }
+}
+
+# Pipe `a |> b` desugars to `b(a)` — the LHS is in argument position
+# of the RHS callee. Treat as escaping unless the RHS is a safe
+# array_* prelude name. This matches the user's intuition that
+# `arr |> some_helper` lets the helper mutate `arr`.
+fn collect_escaped_via_pipe(a: Expr, b: Expr, acc: [String]) : [String] {
+  let safe = match b.kind {
+    EVar(n) -> is_array_safe_callee(n)
+    _       -> false
+  }
+  let a1 = collect_escaped_names(b, acc)
+  if safe { collect_escaped_names(a, a1) }
+  else { match a.kind {
+    EVar(n) -> [n, ...collect_escaped_names(a, a1)]
+    _       -> collect_escaped_names(a, a1)
+  } }
+}
+
+fn is_array_safe_callee(name: String) : Bool {
+  if name == "array_make" { true }
+  else if name == "array_length" { true }
+  else if name == "array_get" { true }
+  else if name == "array_set" { true }
+  else if name == "array_grow" { true }
+  else { false }
+}
+
+# Variant for argument lists of safe (whitelisted) callees:
+# argument names that are direct `EVar` references DO NOT escape,
+# but we still recurse structurally so deeper calls inside e.g.
+# `array_set(local, idx, helper(local))` register `helper(local)`'s
+# escape correctly.
+fn collect_escaped_in_exprs_safe(es: [Expr], acc: [String]) : [String] = match es {
+  []           -> acc
+  [h, ...rest] -> match h.kind {
+    EVar(_) -> collect_escaped_in_exprs_safe(rest, acc)
+    _       -> collect_escaped_in_exprs_safe(rest, collect_escaped_names(h, acc))
+  }
+}
+
+# Variant for argument lists of NON-whitelisted callees: every direct
+# `EVar(n)` argument escapes (the callee may mutate it). Otherwise
+# recurse.
+fn collect_escaped_in_exprs(es: [Expr], acc: [String]) : [String] = match es {
+  []           -> acc
+  [h, ...rest] -> match h.kind {
+    EVar(n) -> collect_escaped_in_exprs(rest, [n, ...acc])
+    _       -> collect_escaped_in_exprs(rest, collect_escaped_names(h, acc))
+  }
+}
+
+fn collect_escaped_in_stmts(stmts: [Stmt], acc: [String]) : [String] = match stmts {
+  []           -> acc
+  [s, ...rest] -> collect_escaped_in_stmts(rest, collect_escaped_in_stmt(s, acc))
+}
+
+fn collect_escaped_in_stmt(s: Stmt, acc: [String]) : [String] {
+  match s {
+    SLet(_, _, rhs)             -> collect_escaped_names(rhs, acc)
+    SAssert(c, m) -> {
+      let a1 = collect_escaped_names(c, acc)
+      match m { Some(mx) -> collect_escaped_names(mx, a1) None -> a1 }
+    }
+    SExprStmt(x)                -> collect_escaped_names(x, acc)
+    SIndexAssign(b, i, v, _, _) ->
+      collect_escaped_names(v, collect_escaped_names(i, collect_escaped_names(b, acc)))
+    SVar(_, _, rhs, _, _)       -> collect_escaped_names(rhs, acc)
+    SUse(_, _, _)               -> acc
+  }
+}
+
+fn collect_escaped_in_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []           -> acc
+  [h, ...rest] -> match h {
+    Arm(_, g, b) -> {
+      let a1 = match g { Some(gx) -> collect_escaped_names(gx, acc) None -> acc }
+      collect_escaped_in_arms(rest, collect_escaped_names(b, a1))
+    }
+  }
+}
+
+fn collect_escaped_in_hclauses(cs: [HClause], acc: [String]) : [String] = match cs {
+  []           -> acc
+  [h, ...rest] -> match h {
+    HC(_, _, b, _, _) -> collect_escaped_in_hclauses(rest, collect_escaped_names(b, acc))
+  }
+}
+
+fn collect_escaped_in_field_inits(fs: [FieldInit], acc: [String]) : [String] = match fs {
+  []           -> acc
+  [h, ...rest] -> match h {
+    FI(_, v) -> match v.kind {
+      EVar(n) -> collect_escaped_in_field_inits(rest, [n, ...acc])
+      _       -> collect_escaped_in_field_inits(rest, collect_escaped_names(v, acc))
+    }
+  }
+}
+
+fn collect_escaped_in_list_elems(els: [ListElem], acc: [String]) : [String] = match els {
+  []           -> acc
+  [h, ...rest] -> match h {
+    ElPlain(x) -> match x.kind {
+      EVar(n) -> collect_escaped_in_list_elems(rest, [n, ...acc])
+      _       -> collect_escaped_in_list_elems(rest, collect_escaped_names(x, acc))
+    }
+    ElSpread(x) -> collect_escaped_in_list_elems(rest, collect_escaped_names(x, acc))
+  }
+}
+
+# Pass 2: walk every `array_set(first, ...)` / `array_grow(first, ...)`
+# call site and decide whether the demand is local or external.
+# Returns true iff EVERY demand encountered is local-non-escaping.
+# An empty body (no demands) returns true vacuously — but the caller
+# only invokes us when `Mutable` is actually in the row, so the body
+# must contain at least one demand.
+fn all_demands_local(body: Expr, locals: [String], escaped: [String],
+                     params: [String]) : Bool =
+  all_demands_local_kind(body.kind, locals, escaped, params)
+
+fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
+                           params: [String]) : Bool {
+  match k {
+    ECall(callee, args_) -> {
+      let here = match callee.kind {
+        EVar(name) ->
+          if name == "array_set" or name == "array_grow" {
+            demand_is_local(args_, locals, escaped, params)
+          } else { true }
+        _ -> true
+      }
+      if not here { false }
+      else if not all_demands_local(callee, locals, escaped, params) { false }
+      else { all_demands_local_in_exprs(args_, locals, escaped, params) }
+    }
+    EBlock(stmts, tail) -> {
+      if not all_demands_local_in_stmts(stmts, locals, escaped, params) { false }
+      else { match tail {
+        Some(t) -> all_demands_local(t, locals, escaped, params)
+        None    -> true
+      } }
+    }
+    EIf(c, t_, eo) -> {
+      if not all_demands_local(c, locals, escaped, params) { false }
+      else if not all_demands_local(t_, locals, escaped, params) { false }
+      else { match eo {
+        Some(e2) -> all_demands_local(e2, locals, escaped, params)
+        None     -> true
+      } }
+    }
+    EMatch(scr, arms) ->
+      if not all_demands_local(scr, locals, escaped, params) { false }
+      else { all_demands_local_in_arms(arms, locals, escaped, params) }
+    EBinop(_, a, b)   ->
+      if not all_demands_local(a, locals, escaped, params) { false }
+      else { all_demands_local(b, locals, escaped, params) }
+    EUnop(_, x)       -> all_demands_local(x, locals, escaped, params)
+    EField(b, _)      -> all_demands_local(b, locals, escaped, params)
+    EIndex(a, b)      ->
+      if not all_demands_local(a, locals, escaped, params) { false }
+      else { all_demands_local(b, locals, escaped, params) }
+    EPipe(a, b)       ->
+      if not all_demands_local(a, locals, escaped, params) { false }
+      else { all_demands_local(b, locals, escaped, params) }
+    EMapPipe(a, b)    ->
+      if not all_demands_local(a, locals, escaped, params) { false }
+      else { all_demands_local(b, locals, escaped, params) }
+    EFlatMapPipe(a, b)->
+      if not all_demands_local(a, locals, escaped, params) { false }
+      else { all_demands_local(b, locals, escaped, params) }
+    ELambda(_, b)     -> all_demands_local(b, locals, escaped, params)
+    ERecordLit(_, fs) -> all_demands_local_in_field_inits(fs, locals, escaped, params)
+    EList(els)        -> all_demands_local_in_list_elems(els, locals, escaped, params)
+    ERange(a, b, oc)  -> {
+      if not all_demands_local(a, locals, escaped, params) { false }
+      else if not all_demands_local(b, locals, escaped, params) { false }
+      else { match oc {
+        Some(c) -> all_demands_local(c, locals, escaped, params)
+        None    -> true
+      } }
+    }
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      if not all_demands_local(body, locals, escaped, params) { false }
+      else if not (match init_opt {
+        Some(i) -> all_demands_local(i, locals, escaped, params)
+        None    -> true
+      }) { false }
+      else if not all_demands_local_in_hclauses(clauses, locals, escaped, params) { false }
+      else { match ret_opt {
+        Some(HR(_, b, _, _)) -> all_demands_local(b, locals, escaped, params)
+        None           -> true
+      } }
+    }
+    ELitUnit(inner, _) -> all_demands_local(inner, locals, escaped, params)
+    EBang(inner)       -> all_demands_local(inner, locals, escaped, params)
+    _ -> true
+  }
+}
+
+fn demand_is_local(args_: [Expr], locals: [String], escaped: [String],
+                   params: [String]) : Bool {
+  match args_ {
+    [first, ...ignore] -> match first.kind {
+      EVar(n) ->
+        # Parameter mutation is observable by definition. Even if the
+        # name happens to alias a local-construction binding (which
+        # can't happen given lexical scoping, but be explicit),
+        # parameters always count as external.
+        if list_has(params, n) { false }
+        else if list_has(escaped, n) { false }
+        else { list_has(locals, n) }
+      _ -> false
+    }
+    [] -> false
+  }
+}
+
+fn all_demands_local_in_exprs(es: [Expr], locals: [String], escaped: [String],
+                              params: [String]) : Bool = match es {
+  []           -> true
+  [h, ...rest] ->
+    if not all_demands_local(h, locals, escaped, params) { false }
+    else { all_demands_local_in_exprs(rest, locals, escaped, params) }
+}
+
+fn all_demands_local_in_stmts(stmts: [Stmt], locals: [String],
+                              escaped: [String], params: [String]) : Bool = match stmts {
+  []           -> true
+  [s, ...rest] ->
+    if not all_demands_local_in_stmt(s, locals, escaped, params) { false }
+    else { all_demands_local_in_stmts(rest, locals, escaped, params) }
+}
+
+fn all_demands_local_in_stmt(s: Stmt, locals: [String], escaped: [String],
+                              params: [String]) : Bool {
+  match s {
+    SLet(_, _, rhs)             -> all_demands_local(rhs, locals, escaped, params)
+    SAssert(c, m) -> {
+      if not all_demands_local(c, locals, escaped, params) { false }
+      else { match m {
+        Some(mx) -> all_demands_local(mx, locals, escaped, params)
+        None     -> true
+      } }
+    }
+    SExprStmt(x)                -> all_demands_local(x, locals, escaped, params)
+    SIndexAssign(b, i, v, _, _) ->
+      if not all_demands_local(b, locals, escaped, params) { false }
+      else if not all_demands_local(i, locals, escaped, params) { false }
+      else { all_demands_local(v, locals, escaped, params) }
+    SVar(_, _, rhs, _, _)       -> all_demands_local(rhs, locals, escaped, params)
+    SUse(_, _, _)               -> true
+  }
+}
+
+fn all_demands_local_in_arms(arms: [Arm], locals: [String], escaped: [String],
+                              params: [String]) : Bool = match arms {
+  []           -> true
+  [h, ...rest] -> match h {
+    Arm(_, g, b) -> {
+      let g_ok = match g {
+        Some(gx) -> all_demands_local(gx, locals, escaped, params)
+        None     -> true
+      }
+      if not g_ok { false }
+      else if not all_demands_local(b, locals, escaped, params) { false }
+      else { all_demands_local_in_arms(rest, locals, escaped, params) }
+    }
+  }
+}
+
+fn all_demands_local_in_hclauses(cs: [HClause], locals: [String],
+                                  escaped: [String], params: [String]) : Bool = match cs {
+  []           -> true
+  [h, ...rest] -> match h {
+    HC(_, _, b, _, _) ->
+      if not all_demands_local(b, locals, escaped, params) { false }
+      else { all_demands_local_in_hclauses(rest, locals, escaped, params) }
+  }
+}
+
+fn all_demands_local_in_field_inits(fs: [FieldInit], locals: [String],
+                                     escaped: [String], params: [String]) : Bool = match fs {
+  []           -> true
+  [h, ...rest] -> match h {
+    FI(_, v) ->
+      if not all_demands_local(v, locals, escaped, params) { false }
+      else { all_demands_local_in_field_inits(rest, locals, escaped, params) }
+  }
+}
+
+fn all_demands_local_in_list_elems(els: [ListElem], locals: [String],
+                                    escaped: [String], params: [String]) : Bool = match els {
+  []           -> true
+  [h, ...rest] -> match h {
+    ElPlain(x) ->
+      if not all_demands_local(x, locals, escaped, params) { false }
+      else { all_demands_local_in_list_elems(rest, locals, escaped, params) }
+    ElSpread(x) ->
+      if not all_demands_local(x, locals, escaped, params) { false }
+      else { all_demands_local_in_list_elems(rest, locals, escaped, params) }
+  }
 }
 
 fn synth_record_lit(st: InferState, nm: String, fis: [FieldInit], line: Int, col: Int) : Inferred {
@@ -27048,7 +27670,14 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # (fiber_spawn, etc.) are exempt by file-path because they are
       # the legitimate constructors of Fiber[T] values.
       let st1b = check_no_fiber_escape(st1, file, nm, opt_ret, sums, line, col)
-      let st2 = check_body_row(st1b, nm, row, line, col)
+      # issue #251 + #252 — Mutable masking. Drop `Mutable` from the
+      # inferred row when every `array_set` / `array_grow` demand
+      # the body raised targets a locally-constructed Array that
+      # never escapes to a helper. Walks the typed body once via
+      # `mask_local_mutable_demand` and is a no-op when `Mutable`
+      # is not in the row to begin with.
+      let st1c = mask_local_mutable_demand(st1b, ps, rb.expr)
+      let st2 = check_body_row(st1c, nm, row, line, col)
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
       } else { () }

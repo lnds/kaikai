@@ -508,6 +508,15 @@ algebraic-effects literature. It generalises to `Reader[T]`,
 `Writer[W]`, exception handlers that collect context, etc. —
 covered effect-by-effect in `docs/effects-stdlib.md`.
 
+The same *masking-at-scope-boundary* idea extends from `State[T]`
+(masked at the `var x = init` block) to `Mutable` (masked at the
+function boundary when the `Array[T]` is constructed locally and
+never escapes — see `docs/effects-stdlib.md` §`Mutable`
+*Observable-effects discipline*). In both cases the row tracks
+what the *caller* observes, not what the function does
+internally — this is what the observable-effects school (Koka,
+Eff) calls *handler-scope* masking.
+
 ### Composed handlers
 
 ```kai
