@@ -218,6 +218,9 @@ KaiValue *kaix_prelude_array_length(KaiValue *a)                         { retur
 KaiValue *kaix_prelude_array_get(KaiValue *a, KaiValue *i)               { return kai_prelude_array_get(a, i); }
 KaiValue *kaix_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v)  { return kai_prelude_array_set(a, i, v); }
 KaiValue *kaix_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) { return kai_prelude_array_grow(a, n, init); }
+KaiValue *kaix_prelude_ref_make(KaiValue *init)                          { return kai_prelude_ref_make(init); }
+KaiValue *kaix_prelude_ref_get(KaiValue *r)                              { return kai_prelude_ref_get(r); }
+KaiValue *kaix_prelude_ref_set(KaiValue *r, KaiValue *v)                 { return kai_prelude_ref_set(r, v); }
 
 /* m7c-c / m7c-d — kaix_* wrappers around the static runtime
  * helpers in runtime.h. The LLVM IR can only see externally-
@@ -316,6 +319,15 @@ KaiValue *kaix_default_mutable_array_set(void *self, KaiValue *a, KaiValue *i, K
 }
 KaiValue *kaix_default_mutable_array_grow(void *self, KaiValue *a, KaiValue *n, KaiValue *init, KaiCont *k) {
     return kai_default_mutable_array_grow(self, a, n, init, k);
+}
+KaiValue *kaix_default_mutable_ref_make(void *self, KaiValue *init, KaiCont *k) {
+    return kai_default_mutable_ref_make(self, init, k);
+}
+KaiValue *kaix_default_mutable_ref_get(void *self, KaiValue *r, KaiCont *k) {
+    return kai_default_mutable_ref_get(self, r, k);
+}
+KaiValue *kaix_default_mutable_ref_set(void *self, KaiValue *r, KaiValue *v, KaiCont *k) {
+    return kai_default_mutable_ref_set(self, r, v, k);
 }
 KaiValue *kaix_default_random_int_range(void *self, KaiValue *lo, KaiValue *hi, KaiCont *k) {
     return kai_default_random_int_range(self, lo, hi, k);
