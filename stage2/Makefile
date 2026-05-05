@@ -2287,8 +2287,12 @@ test-sugars: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/sugars/$$name.out.expected; \
 	  exp_err=../examples/sugars/$$name.err.expected; \
+	  case "$$name" in \
+	    complex_literal_*) extra_flags="--path ../stdlib --prelude ../stdlib/protocols.kai --prelude ../stdlib/math/numeric.kai --prelude ../stdlib/math/real.kai --prelude ../stdlib/math/complex.kai" ;; \
+	    *) extra_flags="" ;; \
+	  esac; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	    rc=0; ./$(TARGET) $$extra_flags $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "sugars FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -2299,7 +2303,7 @@ test-sugars: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "sugars OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $$f > build/$$name.c \
+	    ./$(TARGET) $$extra_flags $$f > build/$$name.c \
 	      || { echo "sugars FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name \
 	      || { echo "sugars FAIL $$name (C compile failed)"; exit 1; }; \
