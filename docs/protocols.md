@@ -28,7 +28,7 @@ Three concrete pain points in current kaikai:
 
 1. **`Money<USD>` printing**: `decimal_to_string(m.amount) ++ " USD"`
    on every interpolation. With `protocol Show` + `impl Show for
-   Decimal[u: Unit]`, becomes `#{m.amount}` automatic.
+   Decimal[u: Measure]`, becomes `#{m.amount}` automatic.
 2. **Generic equality / comparison / hashing**: every record / sum
    type written today needs ad-hoc `eq_<type>`, `hash_<type>`,
    `cmp_<type>` functions. With `protocol Eq` / `Ord` / `Hash`,
@@ -89,7 +89,7 @@ impl Show for Int {
   show(n) = int_to_string(n)
 }
 
-impl Show for Money[u: Unit] {
+impl Show for Money[u: Measure] {
   show(m) = decimal_repr(m.amount) ++ " " ++ unit_name(u)
 }
 
@@ -159,7 +159,7 @@ imported. No global registry.
 - **No higher-kinded types**: `protocol Functor[F[_]]` does not parse.
   Type parameters of protocols are first-order (`protocol P[T]`), and
   the only way `Self` is parametric is when the impl target is
-  parametric (`impl Show for Money[u: Unit]`).
+  parametric (`impl Show for Money[u: Measure]`).
 
 - **No multi-method dispatch**: dispatch always uses `Self` (the
   first-position type). For two-arg dispatch (e.g. `convert(from:
@@ -350,7 +350,7 @@ case to a compile-time error is a follow-up captured in
 unit USD
 unit EUR
 
-impl Show for Decimal[u: Unit] {
+impl Show for Decimal[u: Measure] {
   show(d) = decimal_repr(d) ++ " " ++ unit_name(u)
 }
 
@@ -383,7 +383,7 @@ If a use case needs effects (e.g. `print` to console), the operation
 goes via an effect, not a protocol.
 
 ```kai
-impl Show for Money[u: Unit] {
+impl Show for Money[u: Measure] {
   show(m) = ...   # pure: returns String
 }
 
