@@ -818,6 +818,107 @@ compile so downstream invariant walkers never see a tagged AST.
   semantics, not in v1.
 - **Auto-derived positional `Show`/`Eq`** — independent proposal.
 
+## 9. Complex literals — `<digits>i` suffix
+
+**Issue #267 (Phase 1)**, shipped 2026-05-05. Lexer + parser
+extension that lets numeric literals carry a trailing `i` to
+denote a pure-imaginary `Complex` value. No new AST node — the
+parser desugars the literal to a call against the stdlib
+`complex.mk` constructor.
+
+### Rule
+
+A numeric literal followed *immediately* (no whitespace, no
+intervening character) by `i` lexes as `TkComplex`:
+
+```kai
+let a = 3i        # → complex.mk(0.0, 3.0)
+let b = 2.5i      # → complex.mk(0.0, 2.5)
+let c = 1e10i     # → complex.mk(0.0, 1.0e10)
+```
+
+The literal's type is `Complex` (the record `{ re: Real, im:
+Real }` from `stdlib/math/complex.kai`). The integer form `3i`
+yields `re = 0.0, im = 3.0` — `Complex` has no integer
+component.
+
+### Identifier `i` keeps working
+
+The contiguity rule preserves `i` as a free identifier — only
+`<digits>i` (with the `i` directly after the digit/exponent
+scan) attaches:
+
+```kai
+let i = 5
+let x = i + 1      # `i` is the int variable, `i + 1` = 6
+let y = 3 + i      # whitespace breaks the suffix → 8
+let z = 3+i        # `i` after `+` is still an ident → 8
+```
+
+The lexer numeric scan stops at the first non-digit / non-`.` /
+non-exponent character. Whitespace, operators, and parens all
+terminate the scan before the suffix peek runs.
+
+### Grammar delta
+
+```
+ComplexLit ::= IntLit "i"
+             | RealLit "i"
+```
+
+The `i` is consumed only when adjacent to a numeric token at
+lex time; the parser sees a single `TkComplex` whose span
+covers `digits + i`.
+
+### Desugar shape
+
+`TkComplex` parses as a primary expression that produces:
+
+```
+ECall(EField(EVar("complex"), "mk"), [EReal(0.0), EReal(im)])
+```
+
+— exactly the same AST a user gets from writing
+`complex.mk(0.0, im)` by hand. The resolver later rewrites the
+qualified call to an `EModCall` once the `complex` module is
+bound. `bin/kai` auto-imports `stdlib/math/complex.kai` as part
+of the prelude (issue #245), so the desugared call resolves
+without an explicit `import math.complex`.
+
+### What is **not** supported (Phase 2 of #267, blocked by #180)
+
+- **Heterogeneous arithmetic.** `2.0 + 3.0i` does *not* parse-
+  through into a working `Complex` because `2.0 : Real` and
+  `3.0i : Complex` need a `Real + Complex` operator dispatch.
+  That requires `protocol P[A]` (#180). Until #180 lands, mix
+  with an explicit lift:
+
+  ```kai
+  let z = complex.from_real(2.0) + 3.0i   # works (Complex + Complex)
+  let w = 2.0 + 3.0i                       # FAILS — needs #180
+  ```
+
+- **`i` as a method or accessor on Real**. `2.0.i` would be
+  field access on a Real, which has no `i` field — error.
+
+### Why no new AST node
+
+The whole point is to stay lightweight: lexer + 8-line parser
+arm; the rest of the compiler (typer, Perceus, emit) sees a
+plain `ECall` of `complex.mk` and threads everything through
+the same paths used by hand-written `complex.mk(0.0, 3.0)`.
+
+### Fixtures
+
+- `examples/sugars/complex_literal_basic.kai` — `3i`, `2.5i`,
+  `1e10i` lex and produce `Complex` values with the expected
+  fields.
+- `examples/sugars/complex_literal_with_complex.kai` —
+  `complex.from_real(2.0) + 3.0i` works through the existing
+  `impl Add for Complex`.
+- `examples/sugars/complex_literal_ident_i.kai` — pins the
+  identifier-`i` boundary so the lexer never over-attaches.
+
 ## Cross-sugar interaction
 
 All five sugars compose without ambiguity because their grammar
