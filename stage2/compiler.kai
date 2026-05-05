@@ -12129,11 +12129,45 @@ fn fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [Strin
 # EHandle case to stamp each `ClauseInfo` so install/emit paths can
 # mint matching prefixed clause symbols.
 type LamCollect = { next_id: Int, lams: [LamInfo], clauses: [ClauseInfo],
-                    globals: [String], cur_enc_fn: String }
+                    globals: [String], cur_enc_fn: String,
+                    # issue #285: enclosing-fn parameter and let/var binding
+                    # names visible at the current walk position. Shadows
+                    # `globals` when computing a nested lambda's caps so a
+                    # captured `Ref[T]` parameter named after a stdlib fn
+                    # (e.g. `count`, colliding with `list.count`) is added
+                    # to the closure's capture array instead of being
+                    # silently re-resolved to the global function value.
+                    local_scope: [String] }
 
 fn lc_new(globals: [String]) : LamCollect =
   LamCollect { next_id: 0, lams: [], clauses: [], globals: globals,
-                cur_enc_fn: "" }
+                cur_enc_fn: "", local_scope: [] }
+
+# issue #285: state-passing scope helpers. Snapshot at entry of a
+# scope-introducing form (DFn body, EBlock, ELambda body); restore
+# on exit. Kept tiny so the walker stays a one-line state-tweak per
+# scope frame.
+fn lc_set_locals(st: LamCollect, locals: [String]) : LamCollect =
+  LamCollect { next_id: st.next_id, lams: st.lams,
+                clauses: st.clauses, globals: st.globals,
+                cur_enc_fn: st.cur_enc_fn, local_scope: locals }
+
+fn lc_extend_locals(st: LamCollect, names: [String]) : LamCollect =
+  lc_set_locals(st, list_append(st.local_scope, names))
+
+# issue #285: filter names out of `globals` so `fv_expr` records them
+# as captures. O(|globals| × |locals|) is acceptable: |locals| stays
+# tiny (a handful per fn), and lambda lifting runs once per emit.
+fn list_minus(xs: [String], ys: [String]) : [String] = list_minus_loop(xs, ys, [])
+
+fn list_minus_loop(xs: [String], ys: [String], acc: [String]) : [String] {
+  match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] ->
+      if list_has(ys, h) { list_minus_loop(rest, ys, acc) }
+      else               { list_minus_loop(rest, ys, [h, ...acc]) }
+  }
+}
 
 fn params_to_names(ps: [Param]) : [String] =
   map(ps, (pm) => pm.pname)
@@ -12162,7 +12196,14 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     ELambda(params, body) -> {
       let id = st.next_id
       let own = params_to_names(params)
-      let caps = fv_expr(body, own, st.globals, [])
+      # issue #285: an enclosing fn parameter or let/var binding whose
+      # name happens to match a stdlib fn (e.g. a `count: Ref[Int]`
+      # parameter while `list.count` is in scope) must be captured by
+      # the lambda, not silently re-resolved to the global. Filter the
+      # globals fed to `fv_expr` so any name shadowed by the current
+      # `local_scope` is treated as a free variable and added to caps.
+      let effective_globals = list_minus(st.globals, st.local_scope)
+      let caps = fv_expr(body, own, effective_globals, [])
       let info = LamInfo(id, x.line, x.col, params, caps, body)
       # m4c #4: the lambda body is its own enclosing scope for clause
       # symbols (lifted to `_kai_lam_<id>` at emit). Push the new
@@ -12170,14 +12211,20 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
       # out so a sibling expression keeps stamping against its own
       # enclosing fn.
       let outer_enc_fn = st.cur_enc_fn
+      let outer_locals = st.local_scope
       let lam_enc_fn = concat_all(["_kai_lam_", int_to_string(id)])
+      # Inside the lambda body, the lambda's own params shadow outer
+      # globals too — extend `local_scope` so a nested lambda nested
+      # again inside this body sees the shadowing chain.
       let st1 = LamCollect { next_id: id + 1, lams: [info, ...st.lams],
                               clauses: st.clauses, globals: st.globals,
-                              cur_enc_fn: lam_enc_fn }
+                              cur_enc_fn: lam_enc_fn,
+                              local_scope: list_append(outer_locals, own) }
       let st2 = collect_expr(body, st1)
       LamCollect { next_id: st2.next_id, lams: st2.lams,
                     clauses: st2.clauses, globals: st2.globals,
-                    cur_enc_fn: outer_enc_fn }
+                    cur_enc_fn: outer_enc_fn,
+                    local_scope: outer_locals }
     }
     ERecordLit(_, fields) -> collect_field_inits(fields, st)
     EList(elems) -> collect_list_elems(elems, st)
@@ -12186,8 +12233,14 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
       match opt_step { Some(s) -> collect_expr(s, s1) None -> s1 }
     }
     EBlock(stmts, opt_final) -> {
+      # issue #285: SLet / SVar inside the block extend `local_scope`;
+      # restore the outer scope on exit so siblings (and the lambda
+      # lifter's caller) don't see the block's bindings as still in
+      # scope.
+      let outer_locals = st.local_scope
       let s1 = collect_stmts(stmts, st)
-      match opt_final { Some(f) -> collect_expr(f, s1) None -> s1 }
+      let s2 = match opt_final { Some(f) -> collect_expr(f, s1) None -> s1 }
+      lc_set_locals(s2, outer_locals)
     }
     EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
     EMapPipe(a, b) -> collect_expr(b, collect_expr(a, st))
@@ -12221,7 +12274,7 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
         Some(a) -> LamCollect {
           next_id: s0.next_id, lams: s0.lams,
           clauses: s0.clauses, globals: [a, ...outer_globals],
-          cur_enc_fn: s0.cur_enc_fn
+          cur_enc_fn: s0.cur_enc_fn, local_scope: s0.local_scope
         }
         None -> s0
       }
@@ -12229,7 +12282,7 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
       let s1 = LamCollect {
         next_id: s1_ext.next_id, lams: s1_ext.lams,
         clauses: s1_ext.clauses, globals: outer_globals,
-        cur_enc_fn: s1_ext.cur_enc_fn
+        cur_enc_fn: s1_ext.cur_enc_fn, local_scope: s1_ext.local_scope
       }
       let s2 = collect_hclauses(clauses, s1)
       match ret_opt { Some(r) -> collect_hreturn(r, s2) None -> s2 }
@@ -12266,13 +12319,17 @@ fn lc_record_clauses(cs: [HClause], eff: String, stateful: Bool,
         # resulting names are the captures the env channel must thread
         # in from the surrounding handle frame. Mirrors `fv_hclauses`.
         let own_for_fv = list_concat_strings(map(params, (pm) => pm.pname), ["state", "log"])
-        let raw_caps = fv_expr(body, own_for_fv, st.globals, [])
+        # issue #285: filter globals shadowed by enclosing-fn / outer
+        # let-var bindings, so a clause body capturing e.g. `count`
+        # (parameter shadowing `list.count`) is added to env captures.
+        let effective_globals = list_minus(st.globals, st.local_scope)
+        let raw_caps = fv_expr(body, own_for_fv, effective_globals, [])
         let caps = filter_clause_captures(raw_caps)
         let info = CI(hline, hcol, eff, op_name, params, body, stateful, enc_fn, caps)
         let st1 = LamCollect {
           next_id: st.next_id, lams: st.lams,
           clauses: [info, ...st.clauses], globals: st.globals,
-          cur_enc_fn: st.cur_enc_fn
+          cur_enc_fn: st.cur_enc_fn, local_scope: st.local_scope
         }
         lc_record_clauses(rest, eff, stateful, hline, hcol, enc_fn, st1)
       }
@@ -12424,7 +12481,13 @@ fn collect_stmts(ss: [Stmt], st: LamCollect) : LamCollect {
 
 fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect {
   match s {
-    SLet(_, _, rhs) -> collect_expr(rhs, st)
+    SLet(pat, _, rhs) -> {
+      # issue #285: walk RHS in the *outer* scope, then extend
+      # `local_scope` with the pattern's bound names so subsequent
+      # stmts and a trailing tail expression treat them as captures.
+      let s1 = collect_expr(rhs, st)
+      lc_set_locals(s1, pat_bindings(pat, s1.local_scope))
+    }
     SAssert(c, opt_m) -> {
       let s1 = collect_expr(c, st)
       match opt_m { Some(m) -> collect_expr(m, s1) None -> s1 }
@@ -12435,8 +12498,14 @@ fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect {
       let s2 = collect_expr(i, s1)
       collect_expr(v, s2)
     }
-    # m7b #5: `var name = init` — desugared away pre-resolve.
-    SVar(_, _, rhs, _, _) -> collect_expr(rhs, st)
+    # m7b #5: `var name = init` — desugared into `EHandle` upstream of
+    # this walker (`desugar_var_block`), so an `SVar` reaching here is
+    # rare; nonetheless mirror SLet so a lone surviving `var` still
+    # shadows globals correctly (issue #285).
+    SVar(name, _, rhs, _, _) -> {
+      let s1 = collect_expr(rhs, st)
+      lc_extend_locals(s1, [name])
+    }
     # m7e §25: stripped by desugar_use_decls before lambda lift runs.
     SUse(_, _, _) -> st
   }
@@ -12473,24 +12542,31 @@ fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect {
 fn enter_enc_fn(st: LamCollect, name: String) : LamCollect =
   LamCollect { next_id: st.next_id, lams: st.lams,
                 clauses: st.clauses, globals: st.globals,
-                cur_enc_fn: name }
+                cur_enc_fn: name, local_scope: st.local_scope }
 
 fn restore_enc_fn(st: LamCollect, name: String) : LamCollect =
   LamCollect { next_id: st.next_id, lams: st.lams,
                 clauses: st.clauses, globals: st.globals,
-                cur_enc_fn: name }
+                cur_enc_fn: name, local_scope: st.local_scope }
 
 fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
   match d {
-    DFn(_, name, _, _, _, _, body, _, _, mo) -> {
+    DFn(_, name, _, ps, _, _, body, _, _, mo) -> {
       let outer = st.cur_enc_fn
-      let st1 = enter_enc_fn(st, c_sym(name, mo))
+      let outer_locals = st.local_scope
+      # issue #285: seed `local_scope` with the fn's parameter names so
+      # any nested ELambda's free-variable analysis treats a parameter
+      # whose name collides with a stdlib fn (e.g. `count` shadowing
+      # `list.count`) as a captured local instead of a global.
+      let st1 = enter_enc_fn(lc_set_locals(st, params_to_names(ps)),
+                              c_sym(name, mo))
       let st2 = collect_expr(body, st1)
-      restore_enc_fn(st2, outer)
+      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
     }
     DType(_, _, _, _, _, _) -> st
     DTest(_, body, line, col) -> {
       let outer = st.cur_enc_fn
+      let outer_locals = st.local_scope
       # m4c #4: the synthesised name has to match the prefix
       # `emit_test_fn` will use so install code emitted inside a test
       # body's `EHandle` and the corresponding clause's top-level C
@@ -12498,27 +12574,30 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
       let test_enc = concat_all([
         "__test__", int_to_string(line), "_", int_to_string(col)
       ])
-      let st1 = enter_enc_fn(st, test_enc)
+      let st1 = enter_enc_fn(lc_set_locals(st, []), test_enc)
       let st2 = collect_expr(body, st1)
-      restore_enc_fn(st2, outer)
+      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
     }
     DBench(_, body, line, col) -> {
       let outer = st.cur_enc_fn
+      let outer_locals = st.local_scope
       let bench_enc = concat_all([
         "__bench__", int_to_string(line), "_", int_to_string(col)
       ])
-      let st1 = enter_enc_fn(st, bench_enc)
+      let st1 = enter_enc_fn(lc_set_locals(st, []), bench_enc)
       let st2 = collect_expr(body, st1)
-      restore_enc_fn(st2, outer)
+      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
     }
-    DCheck(_, _, body, line, col) -> {
+    DCheck(_, ps, body, line, col) -> {
       let outer = st.cur_enc_fn
+      let outer_locals = st.local_scope
       let check_enc = concat_all([
         "__check__", int_to_string(line), "_", int_to_string(col)
       ])
-      let st1 = enter_enc_fn(st, check_enc)
+      let st1 = enter_enc_fn(lc_set_locals(st, params_to_names(ps)),
+                              check_enc)
       let st2 = collect_expr(body, st1)
-      restore_enc_fn(st2, outer)
+      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
     }
     DImport(_, _, _) -> st
     DEffect(_, _, _, _, _, _) -> st          # no expressions to walk
