@@ -33142,17 +33142,163 @@ fn tcrec_any_unused(params: [Param], uses: [Use]) : Bool {
 #   - LUUnused               → unreachable (`tcrec_any_unused` made
 #                               us bail out before getting here).
 fn tcrec_compute_site_dropmask(params: [Param], uses: [Use],
+                                has_evar: Int,
                                 i: Int, acc: Int) : Int {
   match params {
     [] -> acc
     [p, ...rest] -> {
+      let bit = tcrec_pow2(i)
       let drop = match last_use_for(p.pname, uses) {
         LUBlocked(_) -> true
-        LUAt(_, _, _) -> pcs_count_non_lam_uses(p.pname, uses, 0) >= 2
+        LUAt(_, _, _) ->
+          if pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 { true }
+          else { (has_evar / bit) % 2 == 0 }
         LUUnused(_) -> false
       }
-      let acc1 = if drop { acc + tcrec_pow2(i) } else { acc }
-      tcrec_compute_site_dropmask(rest, uses, i + 1, acc1)
+      let acc1 = if drop { acc + bit } else { acc }
+      tcrec_compute_site_dropmask(rest, uses, has_evar, i + 1, acc1)
+    }
+  }
+}
+
+# Issue #92 experiment (re-introducing PR #48 bd54356 onto current
+# main): convert a `[Bool]` of per-param flags into an Int bitmask.
+# Used in `tcrec_rewrite_kind` after a `map(pnames, ...)` produces
+# the boolean flag list. This helper takes only `[Bool]` — never
+# `[Expr]` — so stage 1's perceus emit cannot trip the call-site
+# pattern that aborted the kaic2 self-compile under glibc on Linux
+# (PR #41 / PR #48 first attempts).
+fn tcrec_bools_to_mask(flags: [Bool], i: Int, acc: Int) : Int {
+  match flags {
+    [] -> acc
+    [b, ...rest] ->
+      if b {
+        tcrec_bools_to_mask(rest, i + 1, acc + tcrec_pow2(i))
+      } else {
+        tcrec_bools_to_mask(rest, i + 1, acc)
+      }
+  }
+}
+
+# Walk args looking for any `EVar(p)`. Pre-Perceus there are no
+# `__perceus_dup` wrappers, so a plain EVar(p) anywhere in the arg
+# tree means the arg expression reads p (and, if count(p)==1,
+# consumes it on evaluation).
+fn tcrec_args_have_evar(args: [Expr], p: String) : Bool {
+  match args {
+    [] -> false
+    [a, ...rest] ->
+      if tcrec_expr_has_evar(a, p) { true }
+      else { tcrec_args_have_evar(rest, p) }
+  }
+}
+
+fn tcrec_expr_has_evar(e: Expr, p: String) : Bool =
+  tcrec_kind_has_evar(e.kind, p)
+
+fn tcrec_kind_has_evar(k: ExprKind, p: String) : Bool {
+  match k {
+    EVar(nm) -> nm == p
+    ECall(f, xs) ->
+      if tcrec_expr_has_evar(f, p) { true }
+      else { tcrec_args_have_evar(xs, p) }
+    EField(x, _) -> tcrec_expr_has_evar(x, p)
+    EIndex(x, i) ->
+      if tcrec_expr_has_evar(x, p) { true } else { tcrec_expr_has_evar(i, p) }
+    EBinop(_, l, r) ->
+      if tcrec_expr_has_evar(l, p) { true } else { tcrec_expr_has_evar(r, p) }
+    EUnop(_, x) -> tcrec_expr_has_evar(x, p)
+    EIf(c, t, opt_e) ->
+      if tcrec_expr_has_evar(c, p) { true }
+      else if tcrec_expr_has_evar(t, p) { true }
+      else { match opt_e {
+        None -> false
+        Some(e2) -> tcrec_expr_has_evar(e2, p)
+      } }
+    EMatch(s, arms) ->
+      if tcrec_expr_has_evar(s, p) { true }
+      else { tcrec_arms_have_evar(arms, p) }
+    EBlock(stmts, opt_tail) ->
+      if tcrec_stmts_have_evar(stmts, p) { true }
+      else { match opt_tail {
+        None -> false
+        Some(e) -> tcrec_expr_has_evar(e, p)
+      } }
+    EPipe(l, r) ->
+      if tcrec_expr_has_evar(l, p) { true } else { tcrec_expr_has_evar(r, p) }
+    ERange(lo, hi, opt_step) ->
+      if tcrec_expr_has_evar(lo, p) { true }
+      else if tcrec_expr_has_evar(hi, p) { true }
+      else { match opt_step {
+        None -> false
+        Some(s) -> tcrec_expr_has_evar(s, p)
+      } }
+    EList(elems) -> tcrec_elems_have_evar(elems, p)
+    ERecordLit(_, fis) -> tcrec_fields_have_evar(fis, p)
+    ELambda(_, _) -> false
+    _ -> false
+  }
+}
+
+fn tcrec_arms_have_evar(arms: [Arm], p: String) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, body) ->
+        if tcrec_expr_has_evar(body, p) { true }
+        else { match opt_g {
+          None -> tcrec_arms_have_evar(rest, p)
+          Some(g) ->
+            if tcrec_expr_has_evar(g, p) { true }
+            else { tcrec_arms_have_evar(rest, p) }
+        } }
+    }
+  }
+}
+
+fn tcrec_stmts_have_evar(stmts: [Stmt], p: String) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, e) -> tcrec_expr_has_evar(e, p)
+        SVar(_, _, e, _, _) -> tcrec_expr_has_evar(e, p)
+        SAssert(c, opt_m) ->
+          if tcrec_expr_has_evar(c, p) { true }
+          else { match opt_m {
+            None -> false
+            Some(m) -> tcrec_expr_has_evar(m, p)
+          } }
+        SExprStmt(e) -> tcrec_expr_has_evar(e, p)
+        SIndexAssign(b, i, v, _, _) ->
+          if tcrec_expr_has_evar(b, p) { true }
+          else if tcrec_expr_has_evar(i, p) { true }
+          else { tcrec_expr_has_evar(v, p) }
+        SUse(_, _, _) -> false
+      }
+      if here { true } else { tcrec_stmts_have_evar(rest, p) }
+    }
+  }
+}
+
+fn tcrec_elems_have_evar(elems: [ListElem], p: String) : Bool {
+  match elems {
+    [] -> false
+    [el, ...rest] -> {
+      let inner = match el { ElPlain(e) -> e ElSpread(e) -> e }
+      if tcrec_expr_has_evar(inner, p) { true }
+      else { tcrec_elems_have_evar(rest, p) }
+    }
+  }
+}
+
+fn tcrec_fields_have_evar(fis: [FieldInit], p: String) : Bool {
+  match fis {
+    [] -> false
+    [fi, ...rest] -> match fi {
+      FI(_, e) ->
+        if tcrec_expr_has_evar(e, p) { true }
+        else { tcrec_fields_have_evar(rest, p) }
     }
   }
 }
@@ -33216,7 +33362,14 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
         if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
-          let dropmask = tcrec_compute_site_dropmask(params, uses, 0, 0)
+          # Issue #92 experiment: compute per-param has-evar flags via
+          # `map` over `pnames`. The lambda captures `xs` (bound by
+          # this match arm — NOT a function parameter), so no helper
+          # function takes `[Expr]` as a parameter and the suspect
+          # emit pattern PR #41 / PR #48-first-try hit is sidestepped.
+          let flags = map(pnames, (p) => tcrec_args_have_evar(xs, p))
+          let has_evar = tcrec_bools_to_mask(flags, 0, 0)
+          let dropmask = tcrec_compute_site_dropmask(params, uses, has_evar, 0, 0)
           let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
           ECall(
             Expr { kind: EVar(sentinel), line: f.line, col: f.col,
