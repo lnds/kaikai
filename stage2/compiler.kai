@@ -25100,11 +25100,23 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     let s2 = st_unify(s1, rr.ty, TyInt, "integer arithmetic", line, col)
     mk_inferred(s2, TyInt, binop_root(op, rl.expr, rr.expr, line, col, TyInt))
   } else if op == "*" or op == "/" {
-    # m12.5: multiplication and division of dimensioned values
-    # combine units rather than requiring equality. The operand-type
-    # rule still requires the *base* numeric types to agree (Real*Real
-    # / Int*Int) — we delegate that to synth_dim_mul_div.
-    synth_dim_mul_div(rr.st, op, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
+    # Issue #246: when neither operand is primitive numeric (Int/Real,
+    # optionally dim-wrapped) but both have concrete head TyCon (e.g.
+    # Complex), desugar to a Mul/Div protocol-method call so the
+    # post-inference rewrite can dispatch to `__pimpl_<P>_<T>_<op>`.
+    # Falls through to the dim-aware path otherwise (keeps primitive
+    # arithmetic on the zero-overhead unify-and-emit fast path).
+    let lty_now = apply_ty(rr.st.sub, rl.ty)
+    let rty_now = apply_ty(rr.st.sub, rr.ty)
+    if binop_should_dispatch_proto(lty_now, rty_now) {
+      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+    } else {
+      # m12.5: multiplication and division of dimensioned values
+      # combine units rather than requiring equality. The operand-type
+      # rule still requires the *base* numeric types to agree (Real*Real
+      # / Int*Int) — we delegate that to synth_dim_mul_div.
+      synth_dim_mul_div(rr.st, op, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
+    }
   } else if op == "^" {
     # Integer-exponent power. Mirrors `*`/`/`'s UoM behaviour with one
     # twist: the result unit is `u^n`, which only resolves when `n`
@@ -25114,13 +25126,65 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     # `Real<1>`, …) accept any `Int` exponent.
     synth_dim_pow(rr.st, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
   } else {
-    # `+` / `-` keep the unify-both-sides rule. The dim-aware unifier
-    # checks the unit equality automatically.
-    let what = string_concat("arithmetic operator '", string_concat(op, "'"))
-    let s1 = st_unify(rr.st, rl.ty, rr.ty, what, line, col)
-    let ty = apply_ty(s1.sub, rl.ty)
-    mk_inferred(s1, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
+    # Issue #246: protocol-method dispatch fall-through for `+` / `-`
+    # when both operands resolve to a non-primitive concrete type.
+    # Primitive `Int + Int` / `Real + Real` arithmetic still goes
+    # through the unify-and-emit path; only user types (Complex,
+    # Vector, ...) take the protocol detour.
+    let lty_now = apply_ty(rr.st.sub, rl.ty)
+    let rty_now = apply_ty(rr.st.sub, rr.ty)
+    if binop_should_dispatch_proto(lty_now, rty_now) {
+      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+    } else {
+      # `+` / `-` keep the unify-both-sides rule. The dim-aware unifier
+      # checks the unit equality automatically.
+      let what = string_concat("arithmetic operator '", string_concat(op, "'"))
+      let s1 = st_unify(rr.st, rl.ty, rr.ty, what, line, col)
+      let ty = apply_ty(s1.sub, rl.ty)
+      mk_inferred(s1, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
+    }
   }
+}
+
+# Issue #246: predicate gating the operator → protocol-method
+# rewrite. Returns true iff BOTH operands have a concrete non-primitive
+# head type. Concrete = not a `TyVar` after substitution; non-primitive
+# = not `Int`, `Real`, or one of those wrapped in `TyDimT` /
+# `TyRefineT`. Mixed cases (`Int + Complex`) fall through to the
+# unify-both-sides rule, which produces the standard mismatch
+# diagnostic — heterogeneous arithmetic is out of scope until #180.
+fn binop_should_dispatch_proto(lt: Ty, rt: Ty) : Bool =
+  ty_is_concrete_nonprim(lt) and ty_is_concrete_nonprim(rt)
+
+fn ty_is_concrete_nonprim(t: Ty) : Bool {
+  match t {
+    TyInt           -> false
+    TyReal          -> false
+    TyVarT(_)       -> false
+    TyDimT(inner, _)    -> ty_is_concrete_nonprim(inner)
+    TyRefineT(inner, _) -> ty_is_concrete_nonprim(inner)
+    TyCon(_, _)     -> true
+    _               -> false
+  }
+}
+
+# Issue #246: build `ECall(EVar("__proto_<method>"), [l, r])` and walk
+# it through `synth_call`. The lower-protocols pass has already
+# generated the dispatcher fn under that name (when the matching
+# protocol is declared); the post-inference rewrite then redirects to
+# `__pimpl_<P>_<T>_<op>`.
+fn binop_proto_method(op: String) : String {
+  if op == "+" { "add" }
+  else if op == "-" { "sub" }
+  else if op == "*" { "mul" }
+  else { "div" }
+}
+
+fn synth_binop_proto(st: InferState, op: String, le: Expr, re: Expr,
+                      line: Int, col: Int) : Inferred {
+  let dispatcher = proto_dispatcher_name(binop_proto_method(op))
+  let callee = mk_expr(EVar(dispatcher), line, col)
+  synth_call(st, callee, [le, re], line, col)
 }
 
 # Try to extract a compile-time integer literal from an expression.
