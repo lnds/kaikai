@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-fmt test-bench test-check demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-fmt test-bench test-check demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -17,7 +17,7 @@ bin/kai:
 	@chmod +x bin/kai
 	@echo "kai driver: $$(realpath bin/kai 2>/dev/null || pwd)/bin/kai"
 
-test: test-stage0 test-stage1 test-stage2 test-demos test-multi-module
+test: test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib
 
 test-stage0:
 	$(MAKE) -C stage0 test
@@ -69,6 +69,27 @@ test-multi-module: kaic2
 	  rm -f "$$out_rel"; \
 	  echo "$$case OK (abs+rel)"; \
 	done
+
+# Issue #279 regression — exercises bin/kai's `--path "$$STDLIB_ROOT"`
+# resolution end-to-end. The bug fixed in this lane was that line 469
+# of bin/kai hardcoded `--path "$$ROOT/stdlib"` instead of using the
+# already-resolved `$$STDLIB_ROOT`, breaking `import loop` (and any
+# non-prelude stdlib import) in the brew-installed layout where
+# `$$ROOT/stdlib` does not exist. We invoke `bin/kai run` (not kaic2
+# directly) so the wrapper's argument construction is exercised.
+test-import-stdlib: kaic2
+	@set -e; \
+	root=$$(pwd); \
+	kai="$$root/bin/kai"; \
+	src="$$root/examples/imports/import_loop_basic.kai"; \
+	exp="$$root/examples/imports/import_loop_basic.out.expected"; \
+	out=$$(mktemp); \
+	"$$kai" run "$$src" > "$$out" \
+	  || { echo "import_loop_basic FAIL (kai run)"; rm -f "$$out"; exit 1; }; \
+	diff -q "$$exp" "$$out" > /dev/null \
+	  || { echo "import_loop_basic DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
+	rm -f "$$out"; \
+	echo "import_loop_basic OK"
 
 # m12.8 Phase 3 — Core demo gate. Delegates to stage2's
 # `test-demos-core` which builds each demo under examples/portfolio/
