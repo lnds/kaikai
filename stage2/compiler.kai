@@ -1465,13 +1465,20 @@ type Decl
   # polymorphism. Each ProtoOp carries a parameter list using `Self`
   # as the first-position dispatch type. Defaults are not parsed in
   # the v1 (the parser only accepts bodyless op signatures).
-  | DProtocol(Bool, String, [ProtoOp], Int, Int)
+  # Issue #180: optional [A1, A2, ...] type parameter list bound at
+  # protocol declaration scope (alongside the implicit `Self`). The
+  # impl-table key remains `(P, Self)` — `Ai` resolve at impl-site.
+  | DProtocol(Bool, String, [String], [ProtoOp], Int, Int)
   # m12.8: `impl P for T { fn op(args) = body ... }` — supplies the
   # ops of protocol `pname` for the concrete type `target`. The body
   # decls live as ordinary DFns whose name is the op name (no
   # mangling at parse time; the lower-protocols pass renames them to
   # `__pimpl_<P>_<T>_<op>`).
-  | DImpl(String, TypeExpr, [Decl], Int, Int)
+  # Issue #180: optional [T1, T2, ...] type-arg list (the protocol's
+  # `[A1, ...]` parameters monomorphised at this impl-site). Empty
+  # list means the legacy un-parametrised form `impl P for X`, which
+  # the resolver treats as `impl P[X] for X` (`Ai := Self`).
+  | DImpl(String, [TypeExpr], TypeExpr, [Decl], Int, Int)
   # m12.8: `#derive(P, ...) type T = ...` — opt-in structural impl
   # generator. The lower-protocols pass walks the type body and
   # synthesises one DImpl per derived protocol. The parser keeps the
@@ -7599,15 +7606,29 @@ fn parse_protocol_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
   } else {
     let name = tok_source(p.src, id)
     let p1 = p_advance(p)
-    let p1n = p_skip_newlines(p1)
-    if not p_at(p1n, TkLbrace) {
-      err_d(p_error_here(p1n, "expected `{` to start protocol body"))
-    } else {
-      let p2 = p_skip_newlines(p_advance(p1n))
-      let ops_r = parse_protocol_ops(p2, [])
-      match ops_r.r {
-        None -> err_d(ops_r.p)
-        Some(ops) -> ok_d(ops_r.p, DProtocol(is_pub, name, ops, t.line, t.col))
+    # Issue #180: optional `[A1, A2, ...]` type-parameter list bound at
+    # protocol declaration scope. Reuses the standard tparam parser
+    # (same shape as `effect Reader[T]` and `fn[T]`).
+    let proto_tps_r =
+      if p_at(p1, TkLbracket) {
+        parse_type_params_loop(p_skip_newlines(p_advance(p1)), [])
+      } else {
+        PTParams { p: p1, r: Some([]) }
+      }
+    match proto_tps_r.r {
+      None -> err_d(proto_tps_r.p)
+      Some(proto_tparams) -> {
+        let p1n = p_skip_newlines(proto_tps_r.p)
+        if not p_at(p1n, TkLbrace) {
+          err_d(p_error_here(p1n, "expected `{` to start protocol body"))
+        } else {
+          let p2 = p_skip_newlines(p_advance(p1n))
+          let ops_r = parse_protocol_ops(p2, [])
+          match ops_r.r {
+            None -> err_d(ops_r.p)
+            Some(ops) -> ok_d(ops_r.p, DProtocol(is_pub, name, proto_tparams, ops, t.line, t.col))
+          }
+        }
       }
     }
   }
@@ -7692,26 +7713,42 @@ fn parse_impl_decl(p: Parser, t: Token) : PDecl {
       } else {
         let pname = tok_source(p_after_tps.src, id)
         let p1 = p_advance(p_after_tps)
-        let p1n = p_skip_newlines(p1)
-        if not p_at(p1n, TkFor) {
-          err_d(p_error_here(p1n, "expected `for` after protocol name in `impl`"))
-        } else {
-          let p2 = p_skip_newlines(p_advance(p1n))
-          let target_r = parse_type(p2)
-          match target_r.r {
-            None -> err_d(target_r.p)
-            Some(target_ty) -> {
-              let p3 = p_skip_newlines(target_r.p)
-              if not p_at(p3, TkLbrace) {
-                err_d(p_error_here(p3, "expected `{` to start impl body"))
-              } else {
-                let p4 = p_skip_newlines(p_advance(p3))
-                let methods_r = parse_impl_methods(p4, [])
-                match methods_r.r {
-                  None -> err_d(methods_r.p)
-                  Some(ms) -> {
-                    let ms2 = prepend_impl_tparams_to_methods(impl_tparams, ms)
-                    ok_d(methods_r.p, DImpl(pname, target_ty, ms2, t.line, t.col))
+        # Issue #180: optional `[T1, T2, ...]` after the protocol name
+        # binds the protocol's type-parameters at this impl-site
+        # (`impl Add[Real] for Complex`). Each Ti is a concrete
+        # TypeExpr — polymorphism in `Ai` is out of scope (see #174).
+        let pa_args_r =
+          if p_at(p1, TkLbracket) {
+            parse_impl_proto_args(p_skip_newlines(p_advance(p1)), [])
+          } else {
+            PImplArgs { p: p1, r: Some([]) }
+          }
+        match pa_args_r.r {
+          None -> err_d(pa_args_r.p)
+          Some(proto_args) -> {
+            let p1b = pa_args_r.p
+            let p1n = p_skip_newlines(p1b)
+            if not p_at(p1n, TkFor) {
+              err_d(p_error_here(p1n, "expected `for` after protocol name in `impl`"))
+            } else {
+              let p2 = p_skip_newlines(p_advance(p1n))
+              let target_r = parse_type(p2)
+              match target_r.r {
+                None -> err_d(target_r.p)
+                Some(target_ty) -> {
+                  let p3 = p_skip_newlines(target_r.p)
+                  if not p_at(p3, TkLbrace) {
+                    err_d(p_error_here(p3, "expected `{` to start impl body"))
+                  } else {
+                    let p4 = p_skip_newlines(p_advance(p3))
+                    let methods_r = parse_impl_methods(p4, [])
+                    match methods_r.r {
+                      None -> err_d(methods_r.p)
+                      Some(ms) -> {
+                        let ms2 = prepend_impl_tparams_to_methods(impl_tparams, ms)
+                        ok_d(methods_r.p, DImpl(pname, proto_args, target_ty, ms2, t.line, t.col))
+                      }
+                    }
                   }
                 }
               }
@@ -7738,6 +7775,33 @@ fn prepend_impl_tparams_to_method(impl_tps: [String], d: Decl) : Decl {
     DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
       DFn(pub_, n, list_append(impl_tps, tps), ps, ret, row, body, l, c, mo)
     _ -> d
+  }
+}
+
+type PImplArgs = { p: Parser, r: Option[[TypeExpr]] }
+
+# Issue #180: parse comma-separated TypeExpr list inside `[...]` after
+# the protocol name in `impl P[T1, T2, ...] for U`. Each Ti is a
+# fully-elaborated TypeExpr (including `Money[USD]`, `Real<m>`, etc.).
+fn parse_impl_proto_args(p: Parser, acc: [TypeExpr]) : PImplArgs {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbracket) {
+    PImplArgs { p: p_advance(p0), r: Some(list_reverse(acc)) }
+  } else {
+    let ty_r = parse_type(p0)
+    match ty_r.r {
+      None -> PImplArgs { p: ty_r.p, r: None }
+      Some(ty) -> {
+        let p1 = p_skip_newlines(ty_r.p)
+        if p_at(p1, TkComma) {
+          parse_impl_proto_args(p_advance(p1), [ty, ...acc])
+        } else if p_at(p1, TkRbracket) {
+          PImplArgs { p: p_advance(p1), r: Some(list_reverse([ty, ...acc])) }
+        } else {
+          PImplArgs { p: p_error_here(p1, "expected `,` or `]` in impl protocol arguments"), r: None }
+        }
+      }
+    }
   }
 }
 
@@ -8741,13 +8805,15 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
       tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
       ops |> each((op) => dump_effect_op(op, depth + 1))
     }
-    DProtocol(is_pub, name, ops, line, col) -> {
+    DProtocol(is_pub, name, tparams, ops, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       emit_line(depth, "protocol #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
       ops |> each((op) => dump_proto_op(op, depth + 1))
     }
-    DImpl(pname, target, ms, line, col) -> {
+    DImpl(pname, proto_args, target, ms, line, col) -> {
       emit_line(depth, "impl \"#{pname}\" for @#{int_to_string(line)}:#{int_to_string(col)}")
+      proto_args |> each((pa) => dump_type(pa, depth + 1))
       dump_type(target, depth + 1)
       ms |> each((m) => dump_decl(m, depth + 1))
     }
@@ -9299,8 +9365,8 @@ fn chk_decl(e: Env, d: Decl) : Env {
     # caller that forgot to lower first). Treat as a no-op rather than
     # a fatal error so the selfhost path continues to validate the
     # post-lowering decl stream.
-    DProtocol(_, _, _, _, _) -> e
-    DImpl(_, _, _, _, _) -> e
+    DProtocol(_, _, _, _, _, _) -> e
+    DImpl(_, _, _, _, _, _) -> e
     DDerive(_, _, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit declarations introduce no value bindings
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before chk runs
@@ -9346,8 +9412,8 @@ fn register_one(e: Env, d: Decl) : Env {
     DEffect(_, name, _, _, _, _) -> env_add(e, name)
     # m12.8: stripped pre-resolve; never reaches register_one in
     # practice. No-op for completeness so the match stays exhaustive.
-    DProtocol(_, _, _, _, _) -> e
-    DImpl(_, _, _, _, _) -> e
+    DProtocol(_, _, _, _, _, _) -> e
+    DImpl(_, _, _, _, _, _) -> e
     DDerive(_, _, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit names live in their own namespace, validated at type-resolve time
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before register_one runs
@@ -12276,8 +12342,8 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
     DEffect(_, _, _, _, _, _) -> st          # no expressions to walk
     # m12.8: stripped pre-resolve. No expressions to walk if one
     # somehow survives.
-    DProtocol(_, _, _, _, _) -> st
-    DImpl(_, _, _, _, _) -> st
+    DProtocol(_, _, _, _, _, _) -> st
+    DImpl(_, _, _, _, _, _) -> st
     DDerive(_, _, _, _) -> st
     DUnit(_, _, _, _, _) -> st               # m12.5: no expressions in a unit decl
     DUse(_, _, _) -> st                       # m7e §25: stripped by desugar_use_decls; no expressions
@@ -18276,9 +18342,9 @@ fn use_rewrite_decl(d: Decl, table: [EffOps], file_opens: [String],
       let r = use_rewrite_expr(body, table, file_opens, [], file, errs)
       UseRwDecl { decl: DCheck(desc, ps, r.expr, l, c), errs: r.errs }
     }
-    DImpl(pname, target, ms, l, c) -> {
+    DImpl(pname, proto_args, target, ms, l, c) -> {
       let rms = use_rewrite_decls(ms, table, file_opens, file, errs, [])
-      UseRwDecl { decl: DImpl(pname, target, rms.decls, l, c),
+      UseRwDecl { decl: DImpl(pname, proto_args, target, rms.decls, l, c),
                   errs: rms.errs }
     }
     DDerive(names, inner, l, c) -> {
@@ -18480,9 +18546,9 @@ fn rewrite_nursery_caps_decl(d: Decl, file: String, bw: BrandWalk) : NurseryRwDe
       let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
       NurseryRwDecl { decl: DCheck(desc, ps, r.expr, l, c), bw: r.bw }
     }
-    DImpl(pname, target, ms, l, c) -> {
+    DImpl(pname, proto_args, target, ms, l, c) -> {
       let rms = rewrite_nursery_caps_loop(ms, file, bw, [])
-      NurseryRwDecl { decl: DImpl(pname, target, rms.decls, l, c),
+      NurseryRwDecl { decl: DImpl(pname, proto_args, target, rms.decls, l, c),
                        bw: rms.bw }
     }
     DDerive(names, inner, l, c) -> {
@@ -19162,7 +19228,7 @@ fn check_brand_decl(d: Decl, file: String, calls: [BrandCall],
       check_brand_expr(body, benv_empty(), file, calls, brs, errs)
     DCheck(_, _, body, _, _) ->
       check_brand_expr(body, benv_empty(), file, calls, brs, errs)
-    DImpl(_, _, ms, _, _) ->
+    DImpl(_, _, _, ms, _, _) ->
       check_brand_decls_loop(ms, file, calls, brs, errs)
     DDerive(_, inner, _, _) ->
       check_brand_decl(inner, file, calls, brs, errs)
@@ -20539,11 +20605,11 @@ fn dump_decl_type(d: Decl) : Unit / Console {
       let pub_s = if is_pub { "pub " } else { "" }
       print("#{pub_s}effect #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
-    DProtocol(is_pub, name, _, line, col) -> {
+    DProtocol(is_pub, name, _, _, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       print("#{pub_s}protocol #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
-    DImpl(pname, _, _, line, col) ->
+    DImpl(pname, _, _, _, line, col) ->
       print("impl #{pname} @#{int_to_string(line)}:#{int_to_string(col)}")
     DDerive(_, inner, _, _) -> dump_decl_type(inner)
     DUnit(is_pub, name, alias_opt, line, col) -> {
@@ -29206,8 +29272,8 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     # m12.8: protocols are stripped by `lower_protocols` before
     # `infer_program` runs, so reaching one here means the unit-alias
     # pass executed on a pre-lowering decl stream — pass through.
-    DProtocol(_, _, _, _, _) -> d
-    DImpl(_, _, _, _, _) -> d
+    DProtocol(_, _, _, _, _, _) -> d
+    DImpl(_, _, _, _, _, _) -> d
     DDerive(_, _, _, _) -> d
     # m7e §25: DUse has no TypeExpr to expand; pass through. The
     # desugar_use_decls pass handles it later.
@@ -31218,8 +31284,8 @@ fn unbox_decl(d: Decl) : Decl {
     DTest(desc, body, ln, cl) -> DTest(desc, unbox_expr(body, []), ln, cl)
     DBench(desc, body, ln, cl) -> DBench(desc, unbox_expr(body, []), ln, cl)
     DCheck(desc, ps, body, ln, cl) -> DCheck(desc, ps, unbox_expr(body, []), ln, cl)
-    DImpl(name, ty, sub_decls, l, c) ->
-      DImpl(name, ty, map(sub_decls, unbox_decl), l, c)
+    DImpl(name, proto_args, ty, sub_decls, l, c) ->
+      DImpl(name, proto_args, ty, map(sub_decls, unbox_decl), l, c)
     DDerive(ps, inner, l, c) -> DDerive(ps, unbox_decl(inner), l, c)
     _ -> d
   }
@@ -38272,7 +38338,7 @@ fn collect_pub_exports(decls: [Decl], acc: [String]) : [String] {
           _ -> [name, ...acc]
         }
         DEffect(true, name, _, _, _, _) -> [name, ...acc]
-        DProtocol(true, name, _, _, _) -> [name, ...acc]
+        DProtocol(true, name, _, _, _, _) -> [name, ...acc]
         DAxiom(true, _, name, _, _, _, _, _, _, _) -> [name, ...acc]
         DUnit(true, name, _, _, _) -> [name, ...acc]
         _ -> acc
@@ -38908,10 +38974,11 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console = ma
     DType(p, n, tps, qualtype_body(body, mt, file), l, c)
   DEffect(p, n, tps, ops, l, c) ->
     DEffect(p, n, tps, qualtype_eops(ops, mt, file), l, c)
-  DProtocol(p, n, ops, l, c) ->
-    DProtocol(p, n, qualtype_pops(ops, mt, file), l, c)
-  DImpl(name, ty, sub_decls, l, c) ->
-    DImpl(name, qualtype_te(ty, mt, file),
+  DProtocol(p, n, tps, ops, l, c) ->
+    DProtocol(p, n, tps, qualtype_pops(ops, mt, file), l, c)
+  DImpl(name, proto_args, ty, sub_decls, l, c) ->
+    DImpl(name, map(proto_args, (te) => qualtype_te(te, mt, file)),
+          qualtype_te(ty, mt, file),
           qualtype_decls(sub_decls, mt, file), l, c)
   DDerive(ps, inner, l, c) ->
     DDerive(ps, qualtype_decl(inner, mt, file), l, c)
@@ -39041,8 +39108,10 @@ fn qtchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
     qtchk_row(row, mt)
   DType(_, _, _, body, _, _) -> qtchk_body(body, mt)
   DEffect(_, _, _, ops, _, _) -> qtchk_eops(ops, mt)
-  DProtocol(_, _, ops, _, _) -> qtchk_pops(ops, mt)
-  DImpl(_, ty, sub_decls, _, _) -> qtchk_te(ty, mt) + qtchk_decls(sub_decls, mt)
+  DProtocol(_, _, _, ops, _, _) -> qtchk_pops(ops, mt)
+  DImpl(_, proto_args, ty, sub_decls, _, _) ->
+    qtchk_te_list(proto_args, mt) +
+    qtchk_te(ty, mt) + qtchk_decls(sub_decls, mt)
   DDerive(_, inner, _, _) -> qtchk_decl(inner, mt)
   DAttribPure(inner, _, _) -> qtchk_decl(inner, mt)
   DAxiom(_, _, _, _, _, ps, ret, row, _, _) ->
@@ -39071,8 +39140,8 @@ fn rqc_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console = match d
     DBench(n, rqc_expr(body, [], mt, file), l, c)
   DCheck(n, ps, body, l, c) ->
     DCheck(n, ps, rqc_expr(body, fn_param_names(ps), mt, file), l, c)
-  DImpl(name, ty, sub_decls, l, c) ->
-    DImpl(name, ty, rqc_decls(sub_decls, mt, file), l, c)
+  DImpl(name, proto_args, ty, sub_decls, l, c) ->
+    DImpl(name, proto_args, ty, rqc_decls(sub_decls, mt, file), l, c)
   DDerive(ps, inner, l, c) ->
     DDerive(ps, rqc_decl(inner, mt, file), l, c)
   # DType / DEffect / DProtocol / DUnit / DAxiom / DUse / DImport
@@ -39570,7 +39639,7 @@ fn collect_proto_decls(ds: [Decl], reg: ProtocolReg) : ProtocolReg {
   match ds {
     [] -> reg
     [d, ...rest] -> match d {
-      DProtocol(_, name, ops, _, _) ->
+      DProtocol(_, name, _, ops, _, _) ->
         collect_proto_decls(rest, register_proto_ops(reg, name, ops))
       DDerive(_, inner, _, _) -> collect_proto_decls([inner, ...rest], reg)
       _ -> collect_proto_decls(rest, reg)
@@ -39619,7 +39688,7 @@ fn collect_proto_names(ds: [Decl], acc: [String]) : [String] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DProtocol(_, name, _, _, _) -> collect_proto_names(rest, [name, ...acc])
+      DProtocol(_, name, _, _, _, _) -> collect_proto_names(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
       _ -> collect_proto_names(rest, acc)
     }
@@ -39660,7 +39729,7 @@ fn validate_impls_loop(ds: [Decl], file: String,
   match ds {
     [] -> errs
     [d, ...rest] -> match d {
-      DImpl(pname, target, _, line, col) -> {
+      DImpl(pname, _, target, _, line, col) -> {
         let tname = proto_type_name(target)
         let key = concat_all([pname, "/", tname])
         let proto_local = list_has(proto_names, pname)
@@ -39709,7 +39778,7 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
   match ds {
     [] -> LowerImplsRes { reg: reg, fns: list_reverse(acc_fns) }
     [d, ...rest] -> match d {
-      DImpl(pname, target, methods, _, _) -> {
+      DImpl(pname, _, target, methods, _, _) -> {
         let tname = proto_type_name(target)
         let r = lower_impl_methods(pname, tname, methods, reg, acc_fns)
         lower_impls(rest, r.reg, r.fns)
@@ -39856,7 +39925,7 @@ fn collect_future_impl_keys(ds: [Decl], acc: [String]) : [String] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DImpl(pname, target, _, _, _) ->
+      DImpl(pname, _, target, _, _, _) ->
         collect_future_impl_keys(rest,
           [concat_all([pname, "/", proto_type_name(target)]), ...acc])
       DDerive(names, inner, _, _) -> {
@@ -40012,8 +40081,8 @@ fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DProtocol(_, _, _, _, _) -> strip_protocols_loop(rest, acc)
-      DImpl(_, _, _, _, _)     -> strip_protocols_loop(rest, acc)
+      DProtocol(_, _, _, _, _, _) -> strip_protocols_loop(rest, acc)
+      DImpl(_, _, _, _, _, _)     -> strip_protocols_loop(rest, acc)
       DDerive(_, _, _, _)      -> strip_protocols_loop(rest, acc)
       _ -> strip_protocols_loop(rest, [d, ...acc])
     }
@@ -40615,7 +40684,7 @@ fn make_derived_impl(pname: String, tname: String, opname: String,
                       params: [Param], ret: TypeExpr, body: Expr,
                       line: Int, col: Int) : Decl {
   let method = DFn(false, opname, [], params, Some(ret), REmpty, body, line, col, None)
-  DImpl(pname, mk_ty(TyName(tname, []), line, col), [method], line, col)
+  DImpl(pname, [], mk_ty(TyName(tname, []), line, col), [method], line, col)
 }
 
 # m12.8.z: pre-expansion validation for `#derive(Ord)`. Walks the
@@ -40637,7 +40706,7 @@ fn collect_ord_providers(decls: [Decl], acc: [String]) : [String] {
   match decls {
     [] -> acc
     [d, ...rest] -> match d {
-      DImpl(pname, target, _, _, _) ->
+      DImpl(pname, _, target, _, _, _) ->
         if pname == "Ord" {
           collect_ord_providers(rest, [proto_type_name(target), ...acc])
         } else {
@@ -42359,8 +42428,8 @@ fn decl_line(d: Decl) : Int {
     DCheck(_, _, _, line, _) -> line
     DImport(_, line, _) -> line
     DEffect(_, _, _, _, line, _) -> line
-    DProtocol(_, _, _, line, _) -> line
-    DImpl(_, _, _, line, _) -> line
+    DProtocol(_, _, _, _, line, _) -> line
+    DImpl(_, _, _, _, line, _) -> line
     DDerive(_, _, line, _) -> line
     DAttribPure(_, line, _) -> line
     DUnit(_, _, _, line, _) -> line
@@ -42401,8 +42470,8 @@ fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
       fmt_decl(inner, s2)
     }
     DEffect(_, _, _, _, line, _) -> fmt_panic_unsupported("effect declarations", line)
-    DProtocol(_, _, _, line, _) -> fmt_panic_unsupported("protocol declarations", line)
-    DImpl(_, _, _, line, _) -> fmt_panic_unsupported("impl blocks", line)
+    DProtocol(_, _, _, _, line, _) -> fmt_panic_unsupported("protocol declarations", line)
+    DImpl(_, _, _, _, line, _) -> fmt_panic_unsupported("impl blocks", line)
     DDerive(_, _, line, _) -> fmt_panic_unsupported("#derive annotation", line)
     DUnit(_, _, _, line, _) -> fmt_panic_unsupported("unit declarations", line)
     DUse(_, line, _) -> fmt_panic_unsupported("file-level `use`", line)
