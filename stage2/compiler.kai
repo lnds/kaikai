@@ -1527,6 +1527,17 @@ type Decl
   # (e.g. "InitWindow") means "emit that C symbol instead". Only
   # meaningful when `extern_c` is true.
   | DAxiom(Bool, Bool, String, String, [String], [Param], TypeExpr, RowExpr, Int, Int)
+  # Issue #269: `const NAME : T = expr` — top-level named constant.
+  # Replaces the earlier `DAttribPure(DFn arity-0)` desugar that
+  # treated every const as a parameterless function and pushed it
+  # into bare-name dispatch ranking. DConst binds the name
+  # monomorphically (`name : T`, no scheme, no instantiation) so
+  # const reads are global loads, not function calls, and consts
+  # never become dispatch candidates. Fields: is_pub, name,
+  # declared type, body expression, line, col. Today body is always
+  # a literal (number / string / list literal) — the kaikai const
+  # surface only allows literals.
+  | DConst(Bool, String, TypeExpr, Expr, Int, Int)
 
 # m12.8: a single operation declared inside a `protocol P { ... }`
 # block. Mirrors EffectOp's shape (no body, with optional generic
@@ -5058,11 +5069,14 @@ fn parse_decl(p: Parser) : PDecl {
 }
 
 # §29 const NAME : T = expr — top-level named constant. Parses to
-# `pub fn NAME() : T = expr` wrapped in DAttribPure so it's
-# automatically callable from contract / refinement predicates.
-# A post-parse pass `desugar_const_refs_decls` rewrites every
-# `EVar(NAME)` reference to `ECall(EVar(NAME), [])` so call sites
-# read paren-free.
+# the dedicated `DConst` variant (issue #269). The `lower_consts`
+# pass converts it to `DAttribPure(DFn arity-0)` early in the
+# pipeline so downstream walkers (typer, monomorphiser, emitters)
+# keep seeing the legacy shape until the structural typer/emitter
+# integration lands. Const reads still go through the `desugar_const_refs_decls`
+# pass that rewrites `EVar(NAME)` to `ECall(EVar(NAME), [])`; that
+# pass is now scope-aware so a fn parameter named `NAME` shadows
+# the const correctly (the bug filed in #269).
 fn parse_const_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
   let id = p_peek(p)
   if not tk_is(id.kind, TkIdent) {
@@ -5088,8 +5102,7 @@ fn parse_const_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
             match re.r {
               None -> err_d(re.p)
               Some(body) -> {
-                let dfn = DFn(is_pub, name, [], [], Some(ty), REmpty, body, t.line, t.col, None)
-                ok_d(re.p, DAttribPure(dfn, t.line, t.col))
+                ok_d(re.p, DConst(is_pub, name, ty, body, t.line, t.col))
               }
             }
           }
@@ -8686,6 +8699,12 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
       dump_type(ret_ty, depth + 1)
       dump_row_expr(row, depth + 1)
     }
+    DConst(is_pub, name, ty, body, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      emit_line(depth, "const #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_type(ty, depth + 1)
+      dump_expr(body, depth + 1)
+    }
     DType(is_pub, name, tparams, body, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       emit_line(depth, "type #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -9287,6 +9306,10 @@ fn chk_decl(e: Env, d: Decl) : Env {
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before chk runs
     DAxiom(_, _, _, _, _, _, _, _, _, _) -> e     # m12.7: rewritten to DFn by lower_axioms before chk runs
     DAttribPure(inner, _, _) -> chk_decl(e, inner)  # m12.6.x #5(a)
+    DConst(_, name, _, body, _, _) -> {           # issue #269
+      let e1 = env_add(e, name)
+      chk_expr(e1, body)
+    }
   }
 }
 
@@ -9330,6 +9353,7 @@ fn register_one(e: Env, d: Decl) : Env {
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before register_one runs
     DAxiom(_, _, name, _, _, _, _, _, _, _) -> env_add(e, name)  # m12.7: also rewritten to DFn by lower_axioms; case kept for completeness
     DAttribPure(inner, _, _) -> register_one(e, inner)  # m12.6.x #5(a)
+    DConst(_, name, _, _, _, _) -> env_add(e, name)  # issue #269
   }
 }
 
@@ -12259,6 +12283,9 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
     DUse(_, _, _) -> st                       # m7e §25: stripped by desugar_use_decls; no expressions
     DAxiom(_, _, _, _, _, _, _, _, _, _) -> st     # m12.7: rewritten to DFn by lower_axioms; no expressions on the bare form
     DAttribPure(inner, _, _) -> collect_decl(inner, st)  # m12.6.x #5(a)
+    DConst(_, _, _, body, _, _) -> {              # issue #269: literal-only body, but walk for safety
+      collect_expr(body, st)
+    }
   }
 }
 
@@ -16148,6 +16175,26 @@ fn rename_pos_fields(fis: [FieldInit], fds: [FieldDecl]) : [FieldInit] {
 # and need no DAxiom-specific handling.
 fn lower_axioms(ds: [Decl]) : [Decl] = map(ds, lower_axiom_one)
 
+# Issue #269: lower every `DConst(is_pub, name, ty, body, l, c)` to
+# the legacy `DAttribPure(DFn arity-0)` shape so the rest of the
+# pipeline (typer, monomorphiser, emitters) keeps seeing the form
+# it was already wired for. The dedicated `DConst` variant exists at
+# the parser surface to give consts a structural identity (the
+# downstream typer/emitter integration that drops the function-call
+# indirection is intentionally deferred — see the variant's comment
+# in the Decl enum). Runs early in the driver, alongside `lower_axioms`.
+fn lower_consts(ds: [Decl]) : [Decl] = map(ds, lower_const_one)
+
+fn lower_const_one(d: Decl) : Decl {
+  match d {
+    DConst(is_pub, name, ty, body, l, c) -> {
+      let dfn = DFn(is_pub, name, [], [], Some(ty), REmpty, body, l, c, None)
+      DAttribPure(dfn, l, c)
+    }
+    _ -> d
+  }
+}
+
 fn lower_axiom_one(d: Decl) : Decl {
   match d {
     DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, l, c) -> {
@@ -16251,17 +16298,40 @@ fn desugar_const_refs_decl(d: Decl, const_names: [String]) : Decl {
         Some(t) -> Some(desugar_const_refs_typeexpr(t, const_names))
         None -> None
       }
+      # Issue #269: a fn parameter `x` shadows any `const x` in scope.
+      # Subtract param names from `const_names` before walking the body
+      # so `EVar(x)` in the body resolves to the parameter, not a
+      # zero-arg call to the const. Without this filter, `repeat(x: a, ...)`
+      # in stdlib breaks any program that declares `const x`.
+      let body_names = list_minus_names(const_names, fn_param_names(ps))
       DFn(p, n, tps, ps2, ret2, row,
-          desugar_const_refs_expr(body, const_names), l, c, mo)
+          desugar_const_refs_expr(body, body_names), l, c, mo)
     }
     DTest(desc, body, l, c) -> DTest(desc, desugar_const_refs_expr(body, const_names), l, c)
     DBench(desc, body, l, c) -> DBench(desc, desugar_const_refs_expr(body, const_names), l, c)
-    DCheck(desc, params, body, l, c) -> DCheck(desc, params, desugar_const_refs_expr(body, const_names), l, c)
+    DCheck(desc, params, body, l, c) -> {
+      let body_names = list_minus_names(const_names, fn_param_names(params))
+      DCheck(desc, params, desugar_const_refs_expr(body, body_names), l, c)
+    }
     DType(p, n, tps, body, l, c) -> DType(p, n, tps,
                                             desugar_const_refs_typebody(body, const_names),
                                             l, c)
     DAttribPure(inner, l, c) -> DAttribPure(desugar_const_refs_decl(inner, const_names), l, c)
     _ -> d
+  }
+}
+
+# Issue #269: subtract `removed` from `names`. Used to drop locally-
+# bound names from the const-rewrite list when entering a binding
+# scope (fn params, lambda params, SLet binders, match-arm pattern
+# binders). Linear in `names * removed`; the lists stay tiny so a
+# more-clever set is not worth the complexity.
+fn list_minus_names(names: [String], removed: [String]) : [String] {
+  match names {
+    [] -> []
+    [h, ...rest] ->
+      if list_has(removed, h) { list_minus_names(rest, removed) }
+      else { [h, ...list_minus_names(rest, removed)] }
   }
 }
 
@@ -16323,21 +16393,93 @@ fn desugar_const_refs_expr(e: Expr, const_names: [String]) : Expr {
     # bare `PBind(name)` matching a const into a wildcard bind plus
     # a synthesised guard `__cv == NAME()`. AND-combines with any
     # explicit `if user_pred`. This makes `match n { ZERO -> ... }`
-    # work as comparison instead of silently binding.
+    # work as comparison instead of silently binding. Pattern binders
+    # are subtracted from `const_names` before walking the arm body
+    # / guard so a parameter-like binder shadows the const correctly
+    # (issue #269).
     EMatch(scr, arms) ->
       EMatch(desugar_const_refs_expr(scr, const_names),
               map(arms, (a) => desugar_const_refs_arm(a, const_names)))
+    # Issue #269: lambda params shadow consts in the body. Subtract
+    # before recursing.
+    ELambda(ps, body) -> {
+      let inner_names = list_minus_names(const_names, fn_param_names(ps))
+      ELambda(ps, desugar_const_refs_expr(body, inner_names))
+    }
+    # Issue #269: walk a block left-to-right, growing the shadow set
+    # as we encounter `let pat = rhs` / `var name = init` / `use Eff`
+    # binders. The RHS of an SLet/SVar is evaluated BEFORE the bind
+    # takes effect, so it sees the pre-binding name set; subsequent
+    # statements (and the tail expression) see the post-binding set.
+    EBlock(stmts, tail) -> {
+      let r = desugar_const_refs_block_stmts(stmts, const_names, [])
+      let final_names = r.names
+      let tail2 = match tail {
+        None -> None
+        Some(te) -> Some(desugar_const_refs_expr(te, final_names))
+      }
+      EBlock(r.stmts, tail2)
+    }
     _ -> map_expr_kind(e.kind, (sub) => desugar_const_refs_expr(sub, const_names))
   }
   Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 }
 
+# Issue #269: scope-aware traversal of a block's statement list.
+# Returns the rewritten statements plus the (post-block) const-name
+# set that the block's tail expression should see. Each binding
+# statement narrows the set going forward.
+type ConstStmtsRes = { stmts: [Stmt], names: [String] }
+
+fn desugar_const_refs_block_stmts(stmts: [Stmt], names: [String],
+                                    acc: [Stmt]) : ConstStmtsRes {
+  match stmts {
+    [] -> ConstStmtsRes { stmts: list_reverse(acc), names: names }
+    [s, ...rest] -> {
+      let s2 = desugar_const_refs_stmt(s, names)
+      let names2 = match s {
+        SLet(pat, _, _) -> list_minus_names(names, pat_binders(pat, []))
+        SVar(n, _, _, _, _) -> list_minus_names(names, [n])
+        _ -> names
+      }
+      desugar_const_refs_block_stmts(rest, names2, [s2, ...acc])
+    }
+  }
+}
+
+fn desugar_const_refs_stmt(s: Stmt, names: [String]) : Stmt {
+  match s {
+    SLet(pat, ann, rhs) ->
+      SLet(pat, ann, desugar_const_refs_expr(rhs, names))
+    SAssert(c, om) ->
+      SAssert(desugar_const_refs_expr(c, names),
+               match om { None -> None Some(m) -> Some(desugar_const_refs_expr(m, names)) })
+    SExprStmt(e) -> SExprStmt(desugar_const_refs_expr(e, names))
+    SIndexAssign(b, i, v, l, c) ->
+      SIndexAssign(desugar_const_refs_expr(b, names),
+                    desugar_const_refs_expr(i, names),
+                    desugar_const_refs_expr(v, names), l, c)
+    SVar(n, ty, rhs, l, c) ->
+      SVar(n, ty, desugar_const_refs_expr(rhs, names), l, c)
+    SUse(n, l, c) -> SUse(n, l, c)
+  }
+}
+
 fn desugar_const_refs_arm(a: Arm, const_names: [String]) : Arm {
   match a {
     Arm(pat, opt_g, body) -> {
-      let body2 = desugar_const_refs_expr(body, const_names)
+      # Issue #269: pattern binders shadow consts in the arm body
+      # and guard. Subtract before recursing. The const-comparison
+      # rewrite (`arm_for_const_or_pass`) still inspects the
+      # pre-shadow `const_names` so a `match n { ZERO -> ... }` arm
+      # whose pattern matches a const name still synthesises the
+      # equality guard — the synthesised binder (`__cv_NAME`) is
+      # not a kaikai-visible name and never collides with a
+      # parameter shadow.
+      let inner_names = list_minus_names(const_names, pat_binders(pat, []))
+      let body2 = desugar_const_refs_expr(body, inner_names)
       let g2_orig = match opt_g {
-        Some(g) -> Some(desugar_const_refs_expr(g, const_names))
+        Some(g) -> Some(desugar_const_refs_expr(g, inner_names))
         None -> None
       }
       desugar_const_refs_arm_pat(pat, g2_orig, body2, const_names)
@@ -20422,6 +20564,10 @@ fn dump_decl_type(d: Decl) : Unit / Console {
       }
     }
     DAttribPure(inner, _, _) -> dump_decl_type(inner)  # m12.6.x #5(a)
+    DConst(is_pub, name, ty, _, line, col) -> {        # issue #269
+      let pub_s = if is_pub { "pub " } else { "" }
+      print("#{pub_s}const #{name} : #{ty_to_string(resolve_ty(ty))} @#{int_to_string(line)}:#{int_to_string(col)}")
+    }
   }
 }
 
@@ -29029,6 +29175,15 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     # the driver; case kept for `--ast` and other early-pipeline
     # callers that work on the raw decl stream.
     DAttribPure(inner, l, c) -> DAttribPure(expand_unit_aliases_decl(inner, aliases), l, c)
+    # Issue #269: DConst is lowered to DAttribPure(DFn) by
+    # `lower_consts` before this pass runs in the driver; arm kept
+    # for completeness so any early-pipeline caller (e.g. `--ast`)
+    # does not panic. Walks the type expression for unit aliases and
+    # the body for any nested literals; consts always have literal
+    # bodies today but the recursion is harmless.
+    DConst(p, n, ty, body, l, c) ->
+      DConst(p, n, expand_aliases_typeexpr(ty, aliases),
+              expand_aliases_expr(body, aliases), l, c)
   }
 }
 
@@ -38720,6 +38875,14 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console = ma
   DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
     DAxiom(p, sm, n, cso, tps, qualtype_params(ps, mt, file),
             qualtype_te(ret, mt, file), qualtype_row(row, mt, file), l, c)
+  # Issue #269: rewrite the declared type's qualifiers and the body
+  # expression. `lower_consts` runs before this in the driver, but
+  # the arm exists for completeness so any pre-lowering caller (e.g.
+  # `--ast` of a future entry point) does not blow up. Mirrors what
+  # the DFn arm above does for the body + return type.
+  DConst(p, n, ty, body, l, c) ->
+    DConst(p, n, qualtype_te(ty, mt, file),
+            qualtype_expr(body, mt, file), l, c)
   DTest(n, body, l, c) -> DTest(n, qualtype_expr(body, mt, file), l, c)
   DBench(n, body, l, c) -> DBench(n, qualtype_expr(body, mt, file), l, c)
   DCheck(n, ps, body, l, c) ->
@@ -42158,6 +42321,7 @@ fn decl_line(d: Decl) : Int {
     DUnit(_, _, _, line, _) -> line
     DUse(_, line, _) -> line
     DAxiom(_, _, _, _, _, _, _, _, line, _) -> line
+    DConst(_, _, _, _, line, _) -> line       # issue #269
   }
 }
 
@@ -42198,7 +42362,24 @@ fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
     DUnit(_, _, _, line, _) -> fmt_panic_unsupported("unit declarations", line)
     DUse(_, line, _) -> fmt_panic_unsupported("file-level `use`", line)
     DAxiom(_, _, _, _, _, _, _, _, line, _) -> fmt_panic_unsupported("axiom declarations", line)
+    # Issue #269: dedicated fmt arm matching the parser surface.
+    # Round-trips `[pub] const NAME : T = body`. The body is emitted
+    # via `fmt_expr` (the same printer used by `let pat = expr`
+    # initialisers) so the produced source survives a re-parse.
+    DConst(is_pub, name, ty, body, _, _) -> fmt_const_decl(is_pub, name, ty, body, s)
   }
+}
+
+# Issue #269: format a `[pub] const NAME : T = body` declaration.
+fn fmt_const_decl(is_pub: Bool, name: String, ty: TypeExpr, body: Expr, s: FmtSt) : FmtSt {
+  let s1 = if is_pub { fmt_emit(s, "pub ") } else { s }
+  let s2 = fmt_emit(s1, "const ")
+  let s3 = fmt_emit(s2, name)
+  let s4 = fmt_emit(s3, " : ")
+  let s5 = fmt_type(ty, s4)
+  let s6 = fmt_emit(s5, " = ")
+  let s7 = fmt_expr(body, s6)
+  fmt_newline(s7)
 }
 
 fn fmt_panic_unsupported(what: String, line: Int) : a = panic(string_concat_all(["kai fmt: ", what, " not yet supported (line ", int_to_string(line), ")"]))
@@ -44315,10 +44496,18 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # them — `qualtype_decls` itself emits the diagnostic
             # and produces a best-effort rewrite (qualifier dropped)
             # so downstream passes don't cascade additional noise.
-            let qualtype_errs = qtchk_decls(prelude_decls, module_table) +
-                                qtchk_decls(expanded_decls, module_table)
-            let qt_prelude = qualtype_decls(prelude_decls, module_table, path)
-            let qt_expanded = qualtype_decls(expanded_decls, module_table, path)
+            # Issue #269: lower every parser-emitted `DConst` to the
+            # legacy `DAttribPure(DFn arity-0)` form *before* the
+            # qualified-type rewrite (`qualtype_decls` is exhaustive
+            # and would panic on DConst) and before every downstream
+            # decl walker runs. Applied to prelude + expanded user
+            # decls so DConst never escapes the parser layer.
+            let prelude_decls_lc = lower_consts(prelude_decls)
+            let expanded_decls_lc = lower_consts(expanded_decls)
+            let qualtype_errs = qtchk_decls(prelude_decls_lc, module_table) +
+                                qtchk_decls(expanded_decls_lc, module_table)
+            let qt_prelude = qualtype_decls(prelude_decls_lc, module_table, path)
+            let qt_expanded = qualtype_decls(expanded_decls_lc, module_table, path)
             let qualified_prelude = rqc_decls(qt_prelude, module_table, path)
             let qualified_decls = rqc_decls(qt_expanded, module_table, path)
             let merged_raw = list_append(qualified_prelude, qualified_decls)
