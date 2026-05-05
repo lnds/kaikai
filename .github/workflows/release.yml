@@ -1,0 +1,115 @@
+name: release
+
+# Triggered by version tag pushes (`v*`) — produces a GitHub Release with
+# platform-specific tarballs as assets. Manual dispatch is also allowed
+# for re-running against an existing tag if a build needs to be redone.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.39.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            os_name: darwin
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Read version
+        id: meta
+        run: |
+          ver="$(cat VERSION)"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          tag="${{ steps.tag.outputs.tag }}"
+          if [ "v$ver" != "$tag" ]; then
+            echo "::error::tag $tag does not match VERSION $ver"
+            exit 1
+          fi
+
+      - name: Build release tarball
+        run: ./scripts/build-release.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaikai-v${{ steps.meta.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch }}
+          path: |
+            dist/kaikai-v${{ steps.meta.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch }}.tar.gz
+            dist/kaikai-v${{ steps.meta.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          # If a release already exists for this tag (e.g. when re-running via
+          # workflow_dispatch), upload assets to it; otherwise create a new
+          # release with auto-generated notes.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag exists; uploading new assets with --clobber"
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber dist/*
+          else
+            echo "creating release $tag"
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "kaikai $tag" \
+              --generate-notes \
+              dist/*
+          fi
