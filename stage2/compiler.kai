@@ -39764,16 +39764,24 @@ fn strip_import_holes(decls: [Decl], acc: [Decl]) : [Decl] {
 type ProtoOpReg = POR(String, String, [Param], TypeExpr, Int, Int)
 #                     proto    op_name params  ret      line col
 
+# Issue #180: ProtoTPReg lets `find_proto_impl_for_args` know whether
+# a protocol declared `[A]` parameters. When empty, only the legacy
+# (Self,Self) homogeneous match is valid — `pow_int(self: Self, exp:
+# Int)`'s second argument is not a proto-arg.
+type ProtoTPReg = PTPR(String, [String])
+#                      proto    tparam names
+
 type ProtoImplReg = PIR(String, String, String, String, [String])
 #                       proto    type    op_name impl_fn_name [proto_arg_names]
 # Issue #180: proto_arg_names is the list of monomorphised type names
 # for each `Ai` parameter at the impl-site. Empty list means
 # legacy un-parametrised `impl P for X` (treated as `Ai = Self`).
 
-type ProtocolReg = { ops: [ProtoOpReg], impls: [ProtoImplReg], op_names: [String] }
+type ProtocolReg = { ops: [ProtoOpReg], impls: [ProtoImplReg],
+                      op_names: [String], tparams: [ProtoTPReg] }
 
 fn proto_reg_empty() : ProtocolReg =
-  ProtocolReg { ops: [], impls: [], op_names: [] }
+  ProtocolReg { ops: [], impls: [], op_names: [], tparams: [] }
 
 # m12.8: the type-mangling used in the impl-fn name. Walks a
 # TypeExpr, collapsing it down to the head TyName (so `Money[u]`,
@@ -39842,8 +39850,13 @@ fn collect_proto_decls(ds: [Decl], reg: ProtocolReg) : ProtocolReg {
   match ds {
     [] -> reg
     [d, ...rest] -> match d {
-      DProtocol(_, name, _, ops, _, _) ->
-        collect_proto_decls(rest, register_proto_ops(reg, name, ops))
+      DProtocol(_, name, tparams, ops, _, _) -> {
+        let reg1 = ProtocolReg {
+          ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
+          tparams: [PTPR(name, tparams), ...reg.tparams]
+        }
+        collect_proto_decls(rest, register_proto_ops(reg1, name, ops))
+      }
       DDerive(_, inner, _, _) -> collect_proto_decls([inner, ...rest], reg)
       _ -> collect_proto_decls(rest, reg)
     }
@@ -39862,7 +39875,8 @@ fn register_proto_ops(reg: ProtocolReg, proto: String, ops: [ProtoOp]) : Protoco
         let reg1 = ProtocolReg {
           ops: [entry, ...reg.ops],
           impls: reg.impls,
-          op_names: names1
+          op_names: names1,
+          tparams: reg.tparams
         }
         register_proto_ops(reg1, proto, rest)
       }
@@ -40027,7 +40041,8 @@ fn lower_impl_methods(pname: String, tname: String, arg_names: [String],
         let reg1 = ProtocolReg {
           ops: reg.ops,
           impls: [entry, ...reg.impls],
-          op_names: reg.op_names
+          op_names: reg.op_names,
+          tparams: reg.tparams
         }
         lower_impl_methods(pname, tname, arg_names, rest, reg1, [new_fn, ...acc_fns])
       }
@@ -42198,22 +42213,26 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
         # Issue #180: with heterogeneous P[A] dispatch, the receiver
         # is no longer always args[0]. We need to consider every
         # argument as a candidate Self and find the impl whose
-        # arg-name list matches the OTHER arguments. Order of
-        # preference: first argument as receiver, then second.
-        # Beyond two-arg ops we keep the legacy first-arg lookup
-        # (existing single-arg ops like `show`, `to_string` are
-        # unaffected because their proto_args list is empty).
-        let pname = match proto_op_lookup(reg, opname) {
-          Some(po) -> match po { POR(pn, _, _, _, _, _) -> pn }
-          None -> ""
-        }
-        if pname == "" { None }
-        else {
-          match find_proto_impl_for_args(reg, pname, opname, args_) {
-            None -> None
-            Some(impl_fn) -> {
-              let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
-              Some(ECall(new_callee, args_))
+        # arg-name list matches the OTHER arguments.
+        let pop = proto_op_lookup(reg, opname)
+        match pop {
+          None -> None
+          Some(po) -> match po {
+            POR(pname, _, params, ret, _, _) -> {
+              # When Self appears only in the op's return position
+              # (e.g. `from(x: a) : Self`), the args carry no Self
+              # information — defer to the caller-provided ret_ty
+              # (handled by the `_with_ret` wrapper above).
+              if proto_op_self_only_in_return(params, ret) { None }
+              else {
+                match find_proto_impl_for_args(reg, pname, opname, args_) {
+                  None -> None
+                  Some(impl_fn) -> {
+                    let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
+                    Some(ECall(new_callee, args_))
+                  }
+                }
+              }
             }
           }
         }
@@ -42223,31 +42242,127 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
   }
 }
 
+# Issue #180: returns true when none of the op's parameter types
+# contains `Self`, i.e. Self is only informed by the return type.
+# Such ops can only be dispatched via the surrounding expected type
+# (typed-hole error otherwise).
+fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr) : Bool {
+  not list_any(params, (p) => match p.ptype {
+    Some(te) -> te_mentions_self(te)
+    None -> false
+  })
+}
+
+fn list_any(xs: [Param], f: (Param) -> Bool) : Bool = match xs {
+  [] -> false
+  [x, ...rest] -> if f(x) { true } else { list_any(rest, f) }
+}
+
+fn te_mentions_self(te: TypeExpr) : Bool = te_kind_mentions_self(te.tkind)
+
+fn te_kind_mentions_self(k: TyKind) : Bool {
+  match k {
+    TyName(name, targs) ->
+      if name == "Self" { true }
+      else { te_list_mentions_self(targs) }
+    TyList(inner) -> te_mentions_self(inner)
+    TyFn(ps, r, _) -> te_list_mentions_self(ps) or te_mentions_self(r)
+    TyDim(base, _) -> te_mentions_self(base)
+    TyRefine(base, _) -> te_mentions_self(base)
+  }
+}
+
+fn te_list_mentions_self(tes: [TypeExpr]) : Bool = match tes {
+  [] -> false
+  [t, ...rest] -> if te_mentions_self(t) { true } else { te_list_mentions_self(rest) }
+}
+
 # Issue #180: walk the impl table looking for the impl whose
 # (receiver, [arg names]) matches the typed argument expressions.
-# Tries argument 0 as receiver first (legacy preference); falls back
-# to argument 1 if no impl with that pairing exists.
+# Pass 1 honours the proto-arg list on the impl entry — this catches
+# both the homogeneous default (arg_names=[] treated as [recv]) AND
+# heterogeneous matches (`impl Add[Real] for Complex`). Pass 2 (only
+# for 2-arg binops) flips the receiver and tries the mirror impl.
+# Beyond two args (single-dispatch ops with multiple non-receiver
+# parameters like `pow_int(self, exp)`), only Pass 1 with
+# `arg_names_match` against [recv] applies — `find_impl_legacy`
+# does that. The legacy `find_impl_for` (no arg-name filter) is
+# kept around for unrelated callers.
 fn find_proto_impl_for_args(reg: ProtocolReg, pname: String, opname: String,
                              args_: [Expr]) : Option[String] {
-  # Collect head names for every typed argument.
   let names = args_head_names(args_)
   match names {
     None -> None
     Some(ns) -> match ns {
       [] -> None
-      [a] -> find_impl(reg, opname, a)
+      [a] -> find_impl_homogeneous(reg.impls, pname, opname, a)
       [a, b] -> {
-        # Try (recv = a, arg_names = [b]) first.
-        match find_impl_with_args(reg.impls, pname, opname, a, [b]) {
-          Some(fn_name) -> Some(fn_name)
-          None -> match find_impl_with_args(reg.impls, pname, opname, b, [a]) {
+        let proto_takes_args = proto_has_tparams(reg.tparams, pname)
+        if not proto_takes_args {
+          # Single-dispatch op whose second parameter is part of the
+          # op shape (`Numeric.pow_int(Self, Int)` etc.). Only the
+          # homogeneous (recv=a) lookup applies; the second arg is
+          # not a proto-arg.
+          find_impl_homogeneous(reg.impls, pname, opname, a)
+        } else {
+          # Pass 1a: heterogeneous (recv=a, proto_args=[b]) — covers
+          #          `impl Add[Real] for Complex` for Complex + Real.
+          # Pass 1b: homogeneous (recv=a) — covers `impl Add for
+          #          Complex` for Complex + Complex.
+          match find_impl_with_args(reg.impls, pname, opname, a, [b]) {
             Some(fn_name) -> Some(fn_name)
-            None -> None
+            None -> {
+              match find_impl_homogeneous(reg.impls, pname, opname, a) {
+                Some(fn_name) ->
+                  if a == b { Some(fn_name) }
+                  else { find_impl_with_args(reg.impls, pname, opname, b, [a]) }
+                None -> find_impl_with_args(reg.impls, pname, opname, b, [a])
+              }
+            }
           }
         }
       }
-      [a, ..._rest] -> find_impl(reg, opname, a)
+      [a, ..._rest] -> find_impl_homogeneous(reg.impls, pname, opname, a)
     }
+  }
+}
+
+# Find the impl entry whose `arg_names` is empty (legacy default) or
+# is exactly `[recv]` (homogeneous parametrised form). Heterogeneous
+# entries are skipped.
+fn find_impl_homogeneous(impls: [ProtoImplReg], pname: String,
+                          opname: String, recv: String) : Option[String] {
+  match impls {
+    [] -> None
+    [it, ...rest] -> match it {
+      PIR(p, t, o, fn_name, ans) ->
+        if p == pname and t == recv and o == opname and is_homogeneous_args(ans, recv) {
+          Some(fn_name)
+        } else {
+          find_impl_homogeneous(rest, pname, opname, recv)
+        }
+    }
+  }
+}
+
+fn is_homogeneous_args(reg_args: [String], recv: String) : Bool = match reg_args {
+  [] -> true
+  [a] -> a == recv
+  _ -> false
+}
+
+# Issue #180: returns true when the protocol declared one or more
+# `[A]` type parameters. `protocol Add[a]` returns true; `protocol
+# Numeric` returns false.
+fn proto_has_tparams(tps: [ProtoTPReg], pname: String) : Bool = match tps {
+  [] -> false
+  [t, ...rest] -> match t {
+    PTPR(p, params) ->
+      if p == pname {
+        match params { [] -> false _ -> true }
+      } else {
+        proto_has_tparams(rest, pname)
+      }
   }
 }
 
