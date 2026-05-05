@@ -24604,6 +24604,30 @@ fn pick_by_first_arg(st: InferState, candidates: [TyCandidate],
 # Two-pick walker: the first arg slot is for the leading concrete
 # match, the second for the leading tyvar match. After exhausting
 # the candidates, prefer concrete; fall back to tyvar.
+#
+# Issue #248: each iteration's `st_instantiate_report` advances the
+# inferencer's `env.fresh` and writes fresh tyvar slots. Subsequent
+# iterations' probe `unify_env` may extend the (mutable) `slots`
+# array with bindings — those bindings persist even though the
+# returned Subst is discarded, because kaikai's stage 2 substitution
+# arrays are opaque-mutable.
+#
+# Consequence: a `pick.st` captured early carries the stale
+# `env.fresh` from before later candidates were probed. When the
+# caller eventually allocates a fresh tyvar with `st_fresh_ty`, it
+# reuses a slot ID that a later candidate's discarded probe already
+# bound to a concrete type, and `apply_ty` returns that concrete
+# type instead of an unconstrained var. This previously caused
+# `loop.repeat`'s recursive call to be inferred as `Int` (leftover
+# from `list.repeat(x: a, n: Int)` whose `a` was probe-unified to
+# `Int`).
+#
+# Fix: after every iteration, refresh each pending pick's `st` to
+# carry the LATEST `env.fresh` and `Subst` counters. The pick keeps
+# its instantiation type (which only references slot IDs from its
+# own iteration), but its state is bumped past any later
+# instantiation. The caller's `st_fresh_ty` then never collides with
+# a discarded-probe-binding slot.
 fn pick_by_first_arg_loop(st: InferState, candidates: [TyCandidate],
                             target_ty: Ty,
                             best_concrete: Option[PickResult],
@@ -24633,20 +24657,39 @@ fn pick_by_first_arg_loop(st: InferState, candidates: [TyCandidate],
                                mod: c.mod }
       let new_concrete = match probe {
         ProbeConcrete -> match best_concrete {
-          Some(_) -> best_concrete
+          Some(_) -> Some(pick_advance_st(best_concrete, inst.st))
           None    -> Some(pick)
         }
-        _ -> best_concrete
+        _ -> match best_concrete {
+          Some(_) -> Some(pick_advance_st(best_concrete, inst.st))
+          None    -> best_concrete
+        }
       }
       let new_tyvar = match probe {
         ProbeTyvar -> match best_tyvar {
-          Some(_) -> best_tyvar
+          Some(_) -> Some(pick_advance_st(best_tyvar, inst.st))
           None    -> Some(pick)
         }
-        _ -> best_tyvar
+        _ -> match best_tyvar {
+          Some(_) -> Some(pick_advance_st(best_tyvar, inst.st))
+          None    -> best_tyvar
+        }
       }
       pick_by_first_arg_loop(inst.st, rest, target_ty, new_concrete, new_tyvar)
     }
+  }
+}
+
+# Issue #248: replace a pending pick's `st` with `latest_st` so the
+# fresh-counters advance past every candidate's instantiation. The
+# pick's `inst_ty`, `fresh`, `unit_fresh`, and `mod` are preserved
+# unchanged. Returns the input verbatim when it's `None` (caller
+# only invokes this on `Some(_)`).
+fn pick_advance_st(p: Option[PickResult], latest_st: InferState) : PickResult {
+  match p {
+    None -> PickResult { st: latest_st, inst_ty: TyAny, fresh: [], unit_fresh: [], mod: "" }
+    Some(pp) -> PickResult { st: latest_st, inst_ty: pp.inst_ty,
+                              fresh: pp.fresh, unit_fresh: pp.unit_fresh, mod: pp.mod }
   }
 }
 
@@ -41941,6 +41984,16 @@ fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
   # but the lower pass synthesises further DFns from it later, after
   # this point). Tag whatever's inside.
   DDerive(ps, inner, l, c) -> DDerive(ps, tag_decl_module_origin(inner, mod), l, c)
+  # Issue #244: a `pub axiom` (with or without `[<extern_c>]`) needs
+  # the same module_origin stamp as a regular DFn so the lowered FFI
+  # shim's C symbol becomes `kai_<mod>__<name>` — the symbol that
+  # cross-module call sites resolve through `EModCall`. `lower_axioms`
+  # runs later in the pipeline; without this case the lowered DFn
+  # would carry `module_origin = None` and link as the bare
+  # `kai_<name>`, which the importer cannot find. We lower the axiom
+  # in place here so the produced DFn picks up the same `Some(mod)`
+  # stamp the DFn arm above writes.
+  DAxiom(_, _, _, _, _, _, _, _, _) -> tag_decl_module_origin(lower_axiom_one(d), mod)
   _ -> d
 }
 
@@ -41980,6 +42033,13 @@ fn tag_target_decl(d: Decl, mod: String) : Decl = match d {
     }
   DAttribPure(inner, l, c) -> DAttribPure(tag_target_decl(inner, mod), l, c)
   DDerive(ps, inner, l, c) -> DDerive(ps, tag_target_decl(inner, mod), l, c)
+  # Issue #244: same carve-out as tag_target_decl's DFn arm — only
+  # `pub` axioms get the module stamp. A non-pub axiom (rare, but
+  # legal as an in-file FFI helper) keeps the bare `kai_<name>` symbol
+  # so its call site (within the same module) does not synthesise a
+  # `kai_<mod>__<name>` form.
+  DAxiom(p, _, _, _, _, _, _, _, _) ->
+    if p { tag_decl_module_origin(d, mod) } else { d }
   _ -> d
 }
 
