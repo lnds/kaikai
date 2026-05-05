@@ -58,9 +58,11 @@
 
 /* net-tcp-v1 — sockets API for the NetTcp default handler.
  * POSIX everywhere we ship: macOS, Linux, *BSD. The handler is
- * blocking-only in v1 (the inline-eager scheduler can't suspend a
- * fiber on a readiness event yet); kqueue / epoll integration lands
- * with m8.x alongside the rest of the cooperative scheduler. */
+ * blocking-only: the m8.x cooperative scheduler (landed v0.4.0)
+ * suspends fibers on mailbox / await / yield, but we have no
+ * readiness reactor yet, so socket reads/writes park the OS thread
+ * rather than the fiber. kqueue / epoll integration is a Tier 2
+ * follow-up tracked in docs/fibers-honesty-targets.md §Reactor. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
@@ -300,13 +302,14 @@ typedef struct KaiEvidence KaiEvidence;
 static void         kai_free_cloned_evidence_chain(KaiEvidence *head);
 static KaiEvidence *kai_clone_evidence_chain(KaiEvidence *src);
 
-/* m8 #3 + m8.x: fiber lifecycle states. m8 v1 used only NEW/DONE
- * (the inline-eager scheduler ran spawn synchronously); m8.x adds
- * READY (enqueued in the run queue), RUNNING (currently dispatched),
- * and PARKED (blocked on await / receive / send). Spec:
- * docs/fibers-impl.md §*Fiber state machine*. The numeric values are
- * not stable across versions — no ABI commitment yet (CLAUDE.md
- * "Backward compatibility — not promised until post-MVP"). */
+/* m8 #3 + m8.x: fiber lifecycle states. The pre-v0.4.0 runtime ran
+ * `spawn` synchronously and only ever needed NEW/DONE; the m8.x
+ * cooperative scheduler (landed v0.4.0) adds READY (enqueued in the
+ * run queue), RUNNING (currently dispatched), and PARKED (blocked
+ * on await / receive / send). Spec: docs/fibers-impl.md §*Fiber
+ * state machine*. The numeric values are not stable across versions
+ * — no ABI commitment yet (CLAUDE.md "Backward compatibility — not
+ * promised until post-MVP"). */
 typedef enum {
     KAI_FIBER_NEW       = 0,
     KAI_FIBER_READY     = 1,  /* m8.x */
@@ -3126,11 +3129,14 @@ static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue
  *   monotonic_now()  -> Instant  { secs, nanos } via CLOCK_MONOTONIC
  *   sleep_ns(ns)     -> Unit     via nanosleep
  *
- * v1 sleep blocks the OS thread; the m8 v1 inline-eager scheduler has
- * no cooperative yield to deliver `Cancel` mid-sleep. Once m8.x ships
- * the cooperative scheduler, this handler upgrades to register the
- * fiber on a timer wheel and yield through `Spawn.yield`. Tracked in
- * the m8.x follow-up.
+ * sleep_ns blocks the OS thread inside `nanosleep` and is therefore
+ * not a yield point: `Cancel.raise` cannot be delivered mid-sleep
+ * because no reactor is registered to wake the fiber on a timer
+ * event. The m8.x cooperative scheduler (landed v0.4.0) has the
+ * suspend / resume primitives in place; the missing piece is a
+ * timer-wheel reactor that parks the fiber and resumes it via the
+ * scheduler's existing wake path. Tier 2 follow-up tracked in
+ * docs/fibers-honesty-targets.md §Reactor.
  *
  * Field names ("secs", "nanos") are load-bearing: kai_op_field reads
  * the slot by strcmp on the name pointer's contents, so the static
@@ -3628,9 +3634,14 @@ static KaiValue *kai_default_signal_await(void *self, KaiCont *k) {
  * v1 limitations (mirrored in docs/effects-stdlib.md §Process
  * *What's not in v1*):
  *   - POSIX only. Windows / WASM out of scope.
- *   - All ops blocking; the inline-eager scheduler (m8 v1) parks the
- *     OS thread inside waitpid. Reactor-driven cancellation-aware
- *     wait (the `wait_or_kill` shape) lands with m8.x.
+ *   - All ops are blocking: `Process.wait` parks the OS thread
+ *     inside `waitpid` rather than the calling fiber. The m8.x
+ *     cooperative scheduler (landed v0.4.0) provides the suspend /
+ *     resume primitives, but reactor-driven cancellation-aware
+ *     waiting (`wait_or_kill`) still needs a SIGCHLD-aware reactor
+ *     plug that registers the pid and wakes the fiber when the
+ *     child terminates. Tier 2 follow-up tracked in
+ *     docs/fibers-honesty-targets.md §Reactor.
  *   - No stdio pipe plumbing. `pipe_stdout` / `pipe_stdin` and the
  *     surface helpers (wait_or_kill, signal) live in the follow-up
  *     `stdlib/os/process.kai` lane on top of these four ops.
