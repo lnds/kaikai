@@ -84,6 +84,17 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.43.0 (2026-05-05)
+
+### Added
+
+- **stdlib**: Default protocol + 6 impls (closes #258)
+- **stdlib**: polymorphic impls Show/Eq/Ord/Hash for [T]/Option[T]/Result[E,T] (closes #175)
+
+### Fixed
+
+- **emit**: track enclosing scope so closures capture shadowed names (closes #285)
+
 ## v0.42.0 (2026-05-05)
 
 ### Added
