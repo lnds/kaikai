@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.40.0 (2026-05-05)
+
+### Added
+
+- **typer**: := / @ sugar over Ref[T] (closes #275)
+- **release**: macOS arm64 distribution tarball + GH Actions workflow
+
 ## v0.39.0 (2026-05-05)
 
 ### Added
