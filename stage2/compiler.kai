@@ -25334,8 +25334,53 @@ fn try_ufcs_call(st: InferState, callee: Expr, args_: [Expr],
       let r = synth(st, obj)
       let obj_ty = apply_ty(r.st.sub, r.ty)
       if record_has_field(r.st, obj_ty, ident) { None }
-      else { Some(synth_ufcs_dispatch(r.st, ident, r.expr, obj_ty, args_, line, col)) }
+      else {
+        # issue #275: `c := v` and `@c` for `c : Ref[T]` desugar in
+        # the parser to `c.set(v)` / `c.get()`. `Ref[T]` is the
+        # return type of `Mutable.ref_make[T]`; `get`/`set` aren't
+        # inherent methods, but `Mutable` carries `ref_get`/`ref_set`
+        # ops with matching signatures. Bridge here, mirroring the
+        # `a[i] := v` → `Mutable.array_set(a, i, v)` precedent (#265).
+        # Effect-row injection rides for free: `synth_op_call_with_scheme`
+        # already labels the row with `Mutable` for op calls.
+        match try_ref_sugar_op(st, obj, obj_ty, ident, args_, line, col) {
+          Some(inf) -> Some(inf)
+          None -> Some(synth_ufcs_dispatch(r.st, ident, r.expr, obj_ty, args_, line, col))
+        }
+      }
     }
+    _ -> None
+  }
+}
+
+# issue #275: rewrite `c.get()` / `c.set(v)` to `Mutable.ref_get(c)` /
+# `Mutable.ref_set(c, v)` when `c : Ref[T]`. Returns None when the
+# receiver is not a `Ref` or the ident is not `get` / `set`, so the
+# caller falls back to the regular UFCS path (preserving the existing
+# "method not found" diagnostic for unrelated names).
+fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
+                     args_: [Expr], line: Int, col: Int) : Option[Inferred] {
+  match obj_ty {
+    TyCon(name, _) ->
+      if name == "Ref" {
+        let key_opt =
+          if ident == "get" { Some("Mutable.ref_get") }
+          else if ident == "set" { Some("Mutable.ref_set") }
+          else { None }
+        match key_opt {
+          None -> None
+          Some(key) -> match ty_env_lookup(st.env, key) {
+            None -> None
+            Some(sc) -> {
+              # `obj` re-walks once inside `synth_op_call_with_scheme`
+              # (via `synth_many`); `synth` on `EVar(name)` is a pure
+              # env lookup, so a second walk is idempotent.
+              let all_args = [obj, ...args_]
+              Some(synth_op_call_with_scheme(st, sc, all_args, key, line, col))
+            }
+          }
+        }
+      } else { None }
     _ -> None
   }
 }
