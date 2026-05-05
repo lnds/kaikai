@@ -39592,8 +39592,11 @@ fn strip_import_holes(decls: [Decl], acc: [Decl]) : [Decl] {
 type ProtoOpReg = POR(String, String, [Param], TypeExpr, Int, Int)
 #                     proto    op_name params  ret      line col
 
-type ProtoImplReg = PIR(String, String, String, String)
-#                       proto    type    op_name impl_fn_name
+type ProtoImplReg = PIR(String, String, String, String, [String])
+#                       proto    type    op_name impl_fn_name [proto_arg_names]
+# Issue #180: proto_arg_names is the list of monomorphised type names
+# for each `Ai` parameter at the impl-site. Empty list means
+# legacy un-parametrised `impl P for X` (treated as `Ai = Self`).
 
 type ProtocolReg = { ops: [ProtoOpReg], impls: [ProtoImplReg], op_names: [String] }
 
@@ -39624,6 +39627,34 @@ fn proto_type_name(te: TypeExpr) : String {
 
 fn proto_mangled_fn(proto: String, type_name: String, op: String) : String =
   concat_all(["__pimpl_", proto, "_", type_name, "_", op])
+
+# Issue #180: heterogeneous-aware mangling. The legacy un-parametrised
+# form `impl Show for Int` (arg_names == []) keeps the original
+# `__pimpl_<P>_<T>_<op>` symbol. The homogeneous parametrised form
+# `impl Add[Complex] for Complex` (arg_names == [type_name]) also keeps
+# it (so it stays interchangeable with the un-parametrised form). Only
+# heterogeneous impls (e.g. `impl Add[Real] for Complex`) get a
+# `__a_<arg_name>...` suffix that disambiguates the dispatch table.
+fn proto_impl_mangled_with_args(proto: String, type_name: String,
+                                  op: String, arg_names: [String]) : String {
+  let needs_suffix = match arg_names {
+    [] -> false
+    [a] -> a != type_name
+    _  -> true
+  }
+  if needs_suffix {
+    concat_all(["__pimpl_", proto, "_", type_name, "_", op,
+                "__a_", arg_names_mangle(arg_names)])
+  } else {
+    proto_mangled_fn(proto, type_name, op)
+  }
+}
+
+fn arg_names_mangle(args: [String]) : String = match args {
+  [] -> ""
+  [a] -> a
+  [a, ...rest] -> concat_all([a, "_", arg_names_mangle(rest)])
+}
 
 # m12.8: kaikai-side name for the *dispatcher* function the lower
 # pass synthesises for each protocol op. Prefixing with `__proto_`
@@ -39778,9 +39809,15 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
   match ds {
     [] -> LowerImplsRes { reg: reg, fns: list_reverse(acc_fns) }
     [d, ...rest] -> match d {
-      DImpl(pname, _, target, methods, _, _) -> {
+      DImpl(pname, proto_args, target, methods, _, _) -> {
         let tname = proto_type_name(target)
-        let r = lower_impl_methods(pname, tname, methods, reg, acc_fns)
+        # Issue #180: derive the per-impl proto-arg name list. Empty
+        # input list = legacy form, treated as `Ai = Self` (= [tname]).
+        let arg_names = match proto_args {
+          [] -> []
+          _  -> map(proto_args, proto_type_name)
+        }
+        let r = lower_impl_methods(pname, tname, arg_names, methods, reg, acc_fns)
         lower_impls(rest, r.reg, r.fns)
       }
       DDerive(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
@@ -39793,23 +39830,28 @@ type LowerImplsRes = { reg: ProtocolReg, fns: [Decl] }
 
 # `acc_fns` accumulates in reverse; the caller list_reverses on
 # return.
-fn lower_impl_methods(pname: String, tname: String, methods: [Decl],
+fn lower_impl_methods(pname: String, tname: String, arg_names: [String],
+                      methods: [Decl],
                       reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
   match methods {
     [] -> LowerImplsRes { reg: reg, fns: acc_fns }
     [d, ...rest] -> match d {
       DFn(_, op_name, tparams, params, ret, row, body, line, col, mo) -> {
-        let mangled = proto_mangled_fn(pname, tname, op_name)
+        # Issue #180: only the heterogeneous case (Ai != Self) augments
+        # the mangled name. The default-Self form keeps the legacy
+        # mangling so `impl Add for Complex` and `impl Add[Complex] for
+        # Complex` produce the same impl-fn name.
+        let mangled = proto_impl_mangled_with_args(pname, tname, op_name, arg_names)
         let new_fn = DFn(false, mangled, tparams, params, ret, row, body, line, col, mo)
-        let entry = PIR(pname, tname, op_name, mangled)
+        let entry = PIR(pname, tname, op_name, mangled, arg_names)
         let reg1 = ProtocolReg {
           ops: reg.ops,
           impls: [entry, ...reg.impls],
           op_names: reg.op_names
         }
-        lower_impl_methods(pname, tname, rest, reg1, [new_fn, ...acc_fns])
+        lower_impl_methods(pname, tname, arg_names, rest, reg1, [new_fn, ...acc_fns])
       }
-      _ -> lower_impl_methods(pname, tname, rest, reg, acc_fns)
+      _ -> lower_impl_methods(pname, tname, arg_names, rest, reg, acc_fns)
     }
   }
 }
@@ -42002,7 +42044,7 @@ fn find_impl_for(impls: [ProtoImplReg], pname: String, tname: String,
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, t, op, fn_name) ->
+      PIR(p, t, op, fn_name, _) ->
         if p == pname and t == tname and op == opname { Some(fn_name) }
         else { find_impl_for(rest, pname, tname, opname) }
     }
