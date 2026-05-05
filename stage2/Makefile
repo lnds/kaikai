@@ -311,8 +311,8 @@ test-modules: $(TARGET) build
 # rqc has an empty module table and every EField stays as a
 # record-field projection (M6.1 + record-projection legacy
 # behaviour preserved).
-QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection
-QUALIFIED_NEG_DIRS := unknown_export
+QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig
+QUALIFIED_NEG_DIRS := unknown_export qualified_type_negative
 
 test-modules-qualified: $(TARGET) build
 	@set -e; \
