@@ -84,6 +84,21 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.41.0 (2026-05-05)
+
+### Added
+
+- **typer+stdlib**: protocol P[a] dispatch tracks tparam arity (#180)
+- **typer**: bidirectional Self inference from let-binding annotation (#180)
+- **stdlib**: heterogeneous Complex arithmetic via P[a] (#180)
+- **typer**: heterogeneous synth_binop dispatch via proto_impls (#180)
+- **typer**: per-impl proto-arg names tracked in ProtocolReg (#180)
+- **parser+ast**: accept protocol P[A] and impl P[T1,...] for U (#180)
+
+### Fixed
+
+- **driver**: bin/kai uses $STDLIB_ROOT for --path resolution (closes #279)
+
 ## v0.40.0 (2026-05-05)
 
 ### Added
