@@ -344,7 +344,7 @@ boundary and defeat the auditability.
 **Decision**: orthogonal, naturally composable.
 
 ```kai
-type PositiveMoney[u: Unit] = { amount: Decimal<u> where >= 0 }
+type PositiveMoney[u: Measure] = { amount: Decimal<u> where >= 0 }
 
 fn deposit(acc: Account, amount: PositiveMoney<USD>) : Account
   requires amount.amount > 0.0   # not just >= 0; deposit needs strict positive

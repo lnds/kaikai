@@ -471,7 +471,7 @@ in.
 12.5. **m12.5 — Units of Measure**: F#-style first-class units
     on numeric primitives (`Real<USD>`, `Int<Seconds>`,
     `Real<m / sec^2>`), unit-polymorphic functions
-    (`fn area[u: Unit](w: Real<u>, h: Real<u>) : Real<u^2>`),
+    (`fn area[u: Measure](w: Real<u>, h: Real<u>) : Real<u^2>`),
     abelian-group unification in the typer, units erased before
     codegen. Independent of effects/fibers; benefits the C2
     Fintech toolkit (`Money<USD>` ≠ `Money<EUR>` as a compile
@@ -988,7 +988,7 @@ Two structural items must land before either demo compiles:
    alongside) as atomic effects. Migration: split `Console` into
    `Stdout` + `Stderr`, keep `Console = Stdout + Stderr` as an
    alias for over-declaration.
-2. **Parametric `impl Show for Real[u: Unit]`** (Gap 1 partial in
+2. **Parametric `impl Show for Real[u: Measure]`** (Gap 1 partial in
    `docs/m12.8-followup.md` — retired 2026-05-02; see git history).
    Today `unit_name(x: Real<u>)` is a
    reflection intrinsic that gives the suffix string; the parametric
@@ -1014,7 +1014,7 @@ Both structural items above are in. The Stdout / Stderr atomic split
 landed in m12.8 Phase 4b (`8b134bb`, `54d5364`, `ee49db2`), with
 `Console = Stdout + Stderr + Stdin` and `Io = Console + Env + File`
 shipping as effect aliases plus alias-aware op resolution. The
-parametric `impl[u: Unit] Show for Real<u>` landed in m12.8 Phase 2
+parametric `impl[u: Measure] Show for Real<u>` landed in m12.8 Phase 2
 (`81e0306`) — the v1 takes a call-site rewrite shortcut around the
 still-identity m4c monomorphiser, but the user-visible behaviour
 matches the original ask (`#{x : Real<USD>}` renders as `"100 USD"`).
