@@ -103,6 +103,61 @@ parameters are concrete instances of `Unit` / `Int` / etc.; the
 compiler monomorphizes per concrete instantiation just like any
 generic function.
 
+### Polymorphic impls with bounded type parameters (issue #174)
+
+A polymorphic impl whose body recurses on the type variable —
+`impl[T] Show for [T]` calling `show(x : T)` per element — needs to
+know `T` itself implements `Show`. Family 2 (impl-site bounded
+constraint) makes that requirement explicit:
+
+```kai
+impl[T : Show] Show for [T] {
+  fn show(xs : [T]) : String = match xs {
+    []  -> "[]"
+    [x] -> "[" ++ show(x) ++ "]"
+    [x, ...rest] -> "[" ++ show(x) ++ ", " ++ show(rest) ++ "]"
+  }
+}
+```
+
+Bounds stack with `+`:
+
+```kai
+impl[T : Show + Eq] Show for [T] { ... }
+```
+
+**Where bounds are allowed.** Constraints exist only inside the
+impl-site type-parameter list — the brackets after `impl`. They do
+NOT propagate into ordinary function signatures: `fn foo[T : Show](x
+: T)` is **not** valid kaikai. This boundary is the line that keeps
+single-dispatch protocols (Tier 1 #3 in `CLAUDE.md`) clear of
+Haskell-style typeclasses, HKT, and constraint propagation.
+
+**How dispatch resolves.** The monomorphiser specialises the impl
+once per concrete `T'` (e.g. `Int`, `String`, ...). Inside each
+specialisation the call to `show(x : T)` becomes `show(x : T')`,
+which the post-specialisation rewrite redirects to the matching
+`__pimpl_Show_<T'>_show` direct call. No dictionary, no hidden
+parameter — every dispatch is a direct call, preserving Tier 1 #2.
+
+**When the bound is missing.** A polymorphic impl whose body recurses
+on the type variable but does NOT carry the corresponding bound is
+accepted by the parser; the post-monomorphisation dispatch validator
+then reports a typed compile-time error pointing at the offending
+`show(x)` call inside the impl body for any concrete `T'` without
+the required impl. Pre-#174 this case panicked at runtime with the
+opaque `__protocol_dispatch_Show_show` message.
+
+**Non-recursive polymorphic impls** (the body never dispatches a
+protocol op on `T`) do not need a bound and continue to work as
+before:
+
+```kai
+impl[T] Show for [T] {
+  fn show(xs : [T]) : String = "list-of-something"   # OK, no recursion on T
+}
+```
+
 ### Use sites
 
 Protocol ops are called as ordinary functions:
