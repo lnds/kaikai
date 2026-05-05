@@ -39932,9 +39932,17 @@ fn validate_impls_loop(ds: [Decl], file: String,
   match ds {
     [] -> errs
     [d, ...rest] -> match d {
-      DImpl(pname, _, target, _, line, col) -> {
+      DImpl(pname, proto_args, target, _, line, col) -> {
         let tname = proto_type_name(target)
-        let key = concat_all([pname, "/", tname])
+        # Issue #180: duplicate-impl key includes the proto-arg names so
+        # `impl Add[Real] for Complex` and `impl Add[Complex] for Complex`
+        # coexist. Legacy `impl P for T` (proto_args == []) maps to the
+        # homogeneous default `[T]` for keying.
+        let arg_names = match proto_args {
+          [] -> [tname]
+          _  -> map(proto_args, proto_type_name)
+        }
+        let key = concat_all([pname, "/", tname, "[", arg_names_mangle(arg_names), "]"])
         let proto_local = list_has(proto_names, pname)
         let type_local = list_has(local_types, tname) or
                          list_has(proto_builtin_type_names(), tname)
@@ -42129,25 +42137,88 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
       let opname = strip_proto_dispatcher_prefix(name)
       if not list_has(reg.op_names, opname) { None }
       else {
-        match args_ {
-          [] -> None
-          [self_arg, ...rest_] -> match self_arg.ty {
+        # Issue #180: with heterogeneous P[A] dispatch, the receiver
+        # is no longer always args[0]. We need to consider every
+        # argument as a candidate Self and find the impl whose
+        # arg-name list matches the OTHER arguments. Order of
+        # preference: first argument as receiver, then second.
+        # Beyond two-arg ops we keep the legacy first-arg lookup
+        # (existing single-arg ops like `show`, `to_string` are
+        # unaffected because their proto_args list is empty).
+        let pname = match proto_op_lookup(reg, opname) {
+          Some(po) -> match po { POR(pn, _, _, _, _, _) -> pn }
+          None -> ""
+        }
+        if pname == "" { None }
+        else {
+          match find_proto_impl_for_args(reg, pname, opname, args_) {
             None -> None
-            Some(ty) -> match ty_head_name(ty) {
-              None -> None
-              Some(tname) -> match find_impl(reg, opname, tname) {
-                None -> None
-                Some(impl_fn) -> {
-                  let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
-                  Some(ECall(new_callee, args_))
-                }
-              }
+            Some(impl_fn) -> {
+              let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
+              Some(ECall(new_callee, args_))
             }
           }
         }
       }
     }
     _ -> None
+  }
+}
+
+# Issue #180: walk the impl table looking for the impl whose
+# (receiver, [arg names]) matches the typed argument expressions.
+# Tries argument 0 as receiver first (legacy preference); falls back
+# to argument 1 if no impl with that pairing exists.
+fn find_proto_impl_for_args(reg: ProtocolReg, pname: String, opname: String,
+                             args_: [Expr]) : Option[String] {
+  # Collect head names for every typed argument.
+  let names = args_head_names(args_)
+  match names {
+    None -> None
+    Some(ns) -> match ns {
+      [] -> None
+      [a] -> find_impl(reg, opname, a)
+      [a, b] -> {
+        # Try (recv = a, arg_names = [b]) first.
+        match find_impl_with_args(reg.impls, pname, opname, a, [b]) {
+          Some(fn_name) -> Some(fn_name)
+          None -> match find_impl_with_args(reg.impls, pname, opname, b, [a]) {
+            Some(fn_name) -> Some(fn_name)
+            None -> None
+          }
+        }
+      }
+      [a, ..._rest] -> find_impl(reg, opname, a)
+    }
+  }
+}
+
+fn args_head_names(args_: [Expr]) : Option[[String]] = match args_ {
+  [] -> Some([])
+  [e, ...rest] -> match e.ty {
+    None -> None
+    Some(ty) -> match ty_head_name(ty) {
+      None -> None
+      Some(n) -> match args_head_names(rest) {
+        None -> None
+        Some(ns) -> Some([n, ...ns])
+      }
+    }
+  }
+}
+
+fn find_impl_with_args(impls: [ProtoImplReg], pname: String, opname: String,
+                        recv: String, args: [String]) : Option[String] {
+  match impls {
+    [] -> None
+    [it, ...rest] -> match it {
+      PIR(p, t, o, fn_name, ans) ->
+        if p == pname and t == recv and o == opname and arg_names_match(ans, recv, args) {
+          Some(fn_name)
+        } else {
+          find_impl_with_args(rest, pname, opname, recv, args)
+        }
+    }
   }
 }
 
