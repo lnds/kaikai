@@ -1297,27 +1297,144 @@ to *observe* or *intercept* mutation — test harnesses that want
 to log every `array_set`, for instance. Doc C defines the exact
 wire format for such observers.
 
-### Idiomatic usage
+### Observable-effects discipline (issue #251 + #252)
 
-Direct op names work, but the array-indexing sugar (§*Syntax
-note: array indexing*) makes common code read like
-conventional imperative code:
+`Mutable` follows the *observable-effects* school (Koka, Eff):
+the row captures what the *caller* observes during the call, not
+what the function does internally. For `Array[T]`, this gives
+two precise rules:
+
+1. **`array_set` requires `Mutable` IF AND ONLY IF the mutation
+   is observable to the caller.** The mutation is observable
+   when the caller shares a reference to the mutated Array — the
+   Array is a parameter, captured from an enclosing scope, or
+   read from a global / record field originating outside the
+   function. The mutation is NOT observable when the Array was
+   constructed locally inside the function (`array_make`, or a
+   chained `array_set` / `array_grow` of an already-local
+   binding) and the function never passes the Array to another
+   helper before returning. Returning the Array as the
+   function's tail value is fine — the caller receives a
+   settled value, not a witnessable mutation.
+
+2. **`array_get` and `array_length` NEVER require `Mutable`,
+   regardless of the Array's provenance.** Reading is pure from
+   the caller's POV; the same is true for `array_make` (a
+   constructor, not a write).
+
+The typer enforces this by collecting Mutable demand at every
+`array_set` / `array_grow` call site, then walking the typed
+function body once to classify each demand as local (the target
+Array was constructed in this function and never escapes via a
+non-`array_*` call) or external (anything else). A function
+whose every demand is local has `Mutable` *masked* from its
+inferred row — the same way `var x = init` masks `State[T]` at
+the surrounding block boundary. A function with even one
+external demand keeps `Mutable` and must declare it.
+
+### Three worked examples
+
+#### Example 1 — Local construction, NOT observable, NO `Mutable`
 
 ```kai
-fn fill_squares(n: Int) : Array[Int] / Mutable {
-  let xs = Mutable.array_make(n, 0)
-  each(range(0, n), (i) => {
-    xs[i] := i * i
-  })
+fn build_circle(verts: Int) : Array[Real] {
+  let f = array_make(verts * 2, 0.0)   # local
+  var i = 0
+  repeat(verts) {
+    f[@i * 2]     := raylib.cos(...)   # array_set on LOCAL f
+    f[@i * 2 + 1] := raylib.sin(...)
+    i := @i + 1
+  }
+  f                                     # returned; caller never witnesses the mutation
+}
+```
+
+`Array[Real]` (no `/ Mutable`) — the masking pass classifies
+every demand as local because `f` originates from `array_make`
+and never crosses a function-call boundary inside the body.
+
+#### Example 2 — Parameter mutation, IS observable, REQUIRES `Mutable`
+
+```kai
+fn set_vertex(f: Array[Real], i: Int, x: Real, y: Real) : Unit / Mutable {
+  f[i * 2]     := x   # array_set on PARAMETER f
+  f[i * 2 + 1] := y
+}
+```
+
+`/ Mutable` is required: the caller's `f` has new values after
+the call returns. Omitting the row is a type error with the
+`array_set`-call site pinpointed in the diagnostic.
+
+#### Example 3 — Read-only, NO `Mutable` regardless of provenance
+
+```kai
+fn draw_buffer(buf: Array[Int]) : Unit / Ffi {
+  var i = 0
+  repeat(buf_len) {
+    let n = buf[@i]   # array_get — pure read, never observable
+    if n < max_iter {
+      raylib.draw_rectangle(..., color_for(n))
+    }
+    i := @i + 1
+  }
+}
+```
+
+`/ Ffi` only. No `Mutable`. `array_get` is pure regardless of
+`buf`'s provenance.
+
+### Conservative escape rule (v1 scope)
+
+Edge case explicitly out of scope for v1: passing a
+locally-constructed Array to ANOTHER function that mutates it.
+The conservative classification treats every Array passed as an
+argument to a non-`array_*` callee as escaping (the callee
+might mutate it), forcing `Mutable` in the caller's row even if
+the binding originated from `array_make` here. A future
+refinement may track callee purity. Today the workaround is to
+keep mutation inline inside the constructing function.
+
+### Why this discipline
+
+- **Approachable surface (Tier 2 #5)**: a function returning a
+  freshly-built Array reads as pure to the user, the same way
+  `let xs = [1, 2, 3]` does. Threading `/ Mutable` through every
+  helper that uses a local scratchpad would be needless friction.
+- **Effects visible (Tier 1 #1)**: the row still captures every
+  observable effect — the caller's mental model is intact.
+  Mutation through a parameter / capture / global is observable
+  and therefore in the row.
+- **`var` precedent**: kaikai already masks `State[T]` for
+  `var x = init` because the State doesn't escape the block. The
+  same logic applies to `Array[T]` whose lifetime is bounded by
+  the function body.
+
+### Idiomatic usage
+
+```kai
+fn fill_squares(n: Int) : Array[Int] {
+  let xs = array_make(n, 0)
+  var i = 0
+  repeat(n) {
+    xs[@i] := @i * @i   # local Array — Mutable masked
+    i := @i + 1
+  }
   xs
 }
 
-fn sum(xs: Array[Int]) : Int / Mutable {
+fn sum(xs: Array[Int]) : Int {
   var total = 0
-  each(range(0, Mutable.array_length(xs)), (i) => {
-    total := @total + xs[i]
-  })
+  var i = 0
+  repeat(array_length(xs)) {
+    total := @total + xs[@i]   # array_get — never raises Mutable
+    i := @i + 1
+  }
   @total
+}
+
+fn set_first(xs: Array[Int], v: Int) : Unit / Mutable {
+  xs[0] := v   # parameter mutation — Mutable required
 }
 ```
 
@@ -1334,47 +1451,25 @@ In practice `Ref[T]` is rare in application code — `var` plus
 block and be passed across functions without being threaded
 through `State[T]`'s handler.
 
-### Known gap: read-only O(1) access
-
-Every op on `Array[T]` — including plain reads like `xs[i]` and
-`Mutable.array_length(xs)` — pays `Mutable` in the caller's row.
-There is no way to express "this function only reads an array"
-without admitting the mutation capability. This is intentional
-per CLAUDE.md ("Array... must not be used as a general-purpose
-container in new code"): `Array[T]` is the mutable-O(1)
-container, not the default collection.
-
-Consequence: functions that want O(1) random access without
-mutation have no good answer in v1. `List[T]` is pure but O(n)
-for access; `Array[T]` is O(1) but `Mutable`-tainted. A
-post-MVP effort will add `Vector[T]` — an immutable persistent
-structure with O(log n) access and structural sharing (HAMT or
-RRB-tree style) — as the default O(1)-ish pure container,
-analogous to Clojure / Scala / Elixir. Until then, the
-idiomatic answer is to pick `List[T]` for pure pipelines and
-accept `Mutable` on boundary functions that use `Array[T]`.
-
 ### Migration plan for existing code
 
 `Mutable` landed in m7b #2b (2026). Stage 2's inferencer now
 ships the effect as a real `DEffect` declaration (see
 `builtin_mutable_decl`) with per-op generics over `T`, and a
 default handler whose clauses delegate to the existing
-`kai_prelude_array_*` runtime entry points. Call sites such as
-`array_get(a, i)` are routed through the `Mutable` row uniformly
-— a function that touches an array acquires `Mutable` in its
-declared row and the default handler installs at `main`'s
-boundary like `Console` / `Stdin`.
+`kai_prelude_array_*` runtime entry points.
 
-Bare `array_make / array_length / array_get / array_set /
-array_grow` are kept reachable as prelude builtins because the
-desugars for array-index sugar (`a[i]` / `a[i] := v`, m7b #6)
-and the `var` specialisation (m7b #16) emit bare calls and
-their call site already lives inside a `Mutable`-row context.
-Removing the bare builtins would force every desugar to mint
-`Mutable.array_*` calls without changing observable semantics;
-not worth the churn. Users should still prefer `Mutable.array_*`
-when writing source by hand for clarity and tooling.
+Issue #251 + #252 (2026-05) added the demand-collection +
+provenance-masking pass: bare `array_set` / `array_grow` calls
+raise a Mutable demand, the masking pass at the end of each
+function body classifies the demand as local-non-escaping or
+external, and the row is computed accordingly. Bare
+`array_make / array_length / array_get / array_set / array_grow`
+remain reachable as prelude builtins because the desugars for
+array-index sugar (`a[i]` / `a[i] := v`, m7b #6) and the `var`
+specialisation (m7b #16) emit bare calls. Users may still write
+the explicit `Mutable.array_*` form — it routes through the
+op-call pathway and adds the same label.
 
 ## `Cancel`
 
