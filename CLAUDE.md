@@ -13,7 +13,7 @@ Three tiers; the higher tier wins on conflict.
 
 ### Tier 1 — Load-bearing
 
-1. **Safe at compile time.** Memory-safe by default; `Option[T]` instead of null; effects visible in row types (catalog in `docs/effects-stdlib.md`); explicit runtime escapes (`panic`, `?`, `todo!`, `axiom`, FFI, opaque mutable `Array[T]`) are audited, not incidental. The `Array` escape is provisional and migrates behind the `Mutable` effect per `docs/effects-stdlib.md` §`Mutable`.
+1. **Safe at compile time.** Memory-safe by default; `Option[T]` instead of null; effects visible in row types (catalog in `docs/effects-stdlib.md`); explicit runtime escapes (`panic`, `?`, `todo!`, `axiom`, FFI) are audited, not incidental. `Array[T]` writes ride the `Mutable` effect per `docs/effects-stdlib.md` §`Mutable` on the observable-effects discipline (issue #251 + #252): observable mutations require `Mutable`, locally-constructed Arrays mask it.
 2. **Runtime-efficient.** Generics monomorphised; mandatory TCO; primitives unboxed inside fibers; effects compile to one-shot continuations as the zero-cost default.
 3. **Fast compilation.** Single-pass parse, LL(1) with minor bookkeeping; HM extended with effect rows, decidable; **no Haskell-style type-class resolution** (no HKT, no constraint propagation, no functional dependencies, no type families). Single-dispatch protocols Go/Clojure/Elixir-style — `O(1)` impl-table lookup — are permitted (`docs/protocols.md`). Pipeline `lex → parse → resolve → infer → monomorph → perceus → lower`, dumpable between any two passes.
 
