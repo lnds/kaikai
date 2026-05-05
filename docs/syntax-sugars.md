@@ -732,6 +732,92 @@ typer, monomorphiser, Perceus pass, and codegen all see
 narrow: `0xFF` and `255` are interchangeable at every stage
 after lexing.
 
+## 8. Positional record construction — `T { v1, v2 }`
+
+**Issue #266**, shipped 2026-05-05. Parser-only desugar to the
+existing named-field record literal — no new AST node, no typer
+change.
+
+### Rule
+
+A record-literal `T { ... }` may supply its field values
+positionally, in declaration order, instead of by name:
+
+```kai
+type Complex = { re: Real, im: Real }
+type Point   = { x: Int, y: Int }
+
+let z = Complex { 1.0, 2.0 }     #  ≡  Complex { re: 1.0, im: 2.0 }
+let p = Point   { 0, 0 }         #  ≡  Point   { x: 0, y: 0 }
+
+# Named form keeps working unchanged:
+let zn = Complex { re: 1.0, im: 2.0 }
+```
+
+### Disambiguation
+
+The parser inspects the **first item** after `T {`:
+
+- `IDENT :`  → named-field literal (existing path).
+- `IDENT (, | })` → bare-ident punning (existing §10 form: `T { x, y }`
+  desugars to `T { x: x, y: y }`).
+- anything else (literal, call, expression, parenthesised expr, an
+  ident followed by `+`, `(`, `.`, …) → positional list. Each
+  comma-separated item is a full expression.
+
+Intermediate items in the positional list cannot reintroduce
+named-field syntax: `T { 1.0, im: 2.0 }` is rejected at parse time
+with `expected positional or all-named record fields, found mixed
+forms`.
+
+### Desugar shape
+
+The parser tags each positional value with a `__pos_<i>__` field-name
+sentinel. A pre-typer pass (`desugar_pos_records_decls`) consults the
+record-decl table and rewrites the sentinels into the real field
+names in declaration order:
+
+```
+T { v1, v2, v3 }   →   T { f1: v1, f2: v2, f3: v3 }
+```
+
+After this rewrite the typer + emitter see the same AST shape as the
+named form. The sentinel is the only piece of new state that exists
+between parse and the desugar pass; no later walker needs to know
+about positional construction.
+
+### Validation
+
+Two diagnostics:
+
+- **Unknown record name** — `unknown record type \`T\` for positional
+  construction; declare the type or use named-field form`.
+- **Arity mismatch** — `\`T\` expects N positional fields, got M`.
+
+Both fire at the desugar boundary and short-circuit the rest of the
+compile so downstream invariant walkers never see a tagged AST.
+
+### Editorial preference
+
+- **Positional**: short, fixed-shape records where field order is
+  obvious from the type name and the call site. `Complex { 1.0, 2.0 }`,
+  `Point { x, y }`, `Pair { fst, snd }` (though §6's tuple sugar
+  `(fst, snd)` reads better for Pair).
+- **Named**: records with three or more fields, fields whose meaning
+  is not order-obvious, or a refactor-prone shape (where reordering
+  the type's declaration would silently rewire the call). `Color { r:
+  255, g: 128, b: 0, a: 255 }` keeps named.
+
+### What is **not** in v1
+
+- **Function-style `T(v1, v2)`** — separate proposal, conflicts with
+  the type-ctor model and with generic type application.
+- **Partial positional with `..rest`** — n-tuple-style spread is a
+  separate discussion.
+- **With-update positional** (`{ z | 5.0, _ }`) — confusing
+  semantics, not in v1.
+- **Auto-derived positional `Show`/`Eq`** — independent proposal.
+
 ## Cross-sugar interaction
 
 All five sugars compose without ambiguity because their grammar
