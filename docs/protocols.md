@@ -290,7 +290,8 @@ direct.
 
 ## Stdlib protocols (the v1 set)
 
-Five protocols ship with the m12.8 milestone:
+The m12.8 milestone shipped five protocols; issue #258 added
+`Default` for type-driven default values:
 
 | Protocol | Ops | Use cases |
 |---|---|---|
@@ -299,6 +300,7 @@ Five protocols ship with the m12.8 milestone:
 | `Ord` | `cmp(a: Self, b: Self) : Int` | sort, min, max, ordered containers |
 | `Hash` | `hash(x: Self) : Int` | hash maps (m14), hash sets, memoization |
 | `Serialize` | `to_string(x: Self) : String`, `from_string(s: String) : Result[Self, String]` | json/csv/fix bindings via wrappers |
+| `Default` | `default() : Self` | accumulators, container clearing, generic zero values |
 
 Stdlib provides default impls for all primitives (`Int`, `Real`,
 `Bool`, `Char`, `String`, `Unit`, `[a]`, `Option[a]`, `Result[e, a]`,
@@ -308,8 +310,47 @@ opaque types must `impl` themselves. The parametric containers carry
 on parametric containers needs return-type-driven dispatch and is
 deferred to a later increment.
 
-Adding a sixth protocol to stdlib in v1 (e.g. `Numeric`, `Monoid`)
-requires a separate proposal — the v1 set is intentionally tight.
+Adding another protocol to stdlib in v1 (e.g. `Numeric`, `Monoid`)
+requires a separate proposal — the v1 set stays intentionally tight.
+
+### `Default` (issue #258)
+
+```kai
+protocol Default {
+  default() : Self
+}
+
+impl Default for Int    { fn default() : Int    = 0 }
+impl Default for Real   { fn default() : Real   = 0.0 }
+impl Default for Bool   { fn default() : Bool   = false }
+impl Default for String { fn default() : String = "" }
+impl[T] Default for [T]       { fn default() : [T]       = [] }
+impl[T] Default for Option[T] { fn default() : Option[T] = None }
+```
+
+Canonical defaults: numeric zero, false, empty string, empty list,
+absent option. `Result[E, T]` is intentionally absent — neither
+`Ok(default()) : Result[_, T]` nor `Err(default()) : Result[E, _]`
+is a privileged choice, so callers construct results explicitly.
+
+`default() : Self` has Self only in the return position, so v1
+single-dispatch resolves it the same way `Serialize.from_string` and
+`From[a].from` do — via a `let x : T = default()` annotation that
+pins Self before the dispatcher runs. Generic free-fn helpers like
+`fn make[T : Default]() : T = default()` are out of reach until
+free-function tparam bounds gain protocol awareness; the bound is
+already accepted in `impl[T : ...]` headers, so polymorphic impls
+that recurse through `default()` work today.
+
+The polymorphic impls intentionally drop the `T : Default` bound —
+the bodies (`[]`, `None`) are constants in `T` and never recurse,
+which matches issue #174 case 3. The Show/Eq/Ord/Hash impls in #175
+keep their bound only because their bodies do recurse on `T`.
+
+Use cases: accumulator initial values, generic record clearing
+(`uira/boids.kai` has `iclear` / `rclear` exactly because this was
+missing), and the post-v1 `Array[T]` zero-fill helper. Auto-derive
+for user records is a separate feature and not part of v1.
 
 ## Auto-derivation via `#derive` annotation
 
