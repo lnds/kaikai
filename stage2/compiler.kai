@@ -3151,7 +3151,82 @@ fn parse_record_lit(p: Parser, type_name: String, tname: Token) : PExpr {
   if p_at(p1, TkRbrace) {
     ok_e(p_advance(p1), mk_expr(ERecordLit(type_name, []), tname.line, tname.col))
   } else {
-    parse_record_fields_loop(p1, [], type_name, tname)
+    # issue #266 dispatch: peek the first item to choose between the
+    # named-field path (existing) and the positional-sugar path. The
+    # named path also covers `{ x, y }` punning, where the first item
+    # is a bare ident followed by `,` or `}` — keeping legacy
+    # behavior. Anything else (literal, call, expression, or an ident
+    # followed by an expression-continuation token) routes to the
+    # positional path. The positional fields are tagged with a
+    # `__pos_<i>__` sentinel name; `desugar_pos_records_decls`
+    # rewrites them into real field names using the record's
+    # declared field order before any other pre-typer pass runs.
+    let tk0 = p_peek(p1)
+    let tk1 = p_peek1(p1)
+    let tk1_named_follow = tk_is(tk1.kind, TkColon) or tk_is(tk1.kind, TkComma) or tk_is(tk1.kind, TkRbrace)
+    let is_named_first = tk_is(tk0.kind, TkIdent) and tk1_named_follow
+    if is_named_first {
+      parse_record_fields_loop(p1, [], type_name, tname)
+    } else {
+      parse_record_pos_loop(p1, [], 0, type_name, tname)
+    }
+  }
+}
+
+# issue #266 — positional record sugar. Accumulates positional
+# expressions tagged with `__pos_<i>__` field-name sentinels. Each
+# item is a full Expr; intermixing `IDENT :` is a parse error.
+fn parse_record_pos_loop(p: Parser, acc: [FieldInit], i: Int, type_name: String, tname: Token) : PExpr {
+  let p0 = p_skip_newlines(p)
+  # Reject mixed forms: any subsequent item starting with `IDENT :`
+  # signals named-field syntax inside a positional list.
+  let tk0 = p_peek(p0)
+  let tk1 = p_peek1(p0)
+  if tk_is(tk0.kind, TkIdent) and tk_is(tk1.kind, TkColon) {
+    err_e(p_error_here(p0, "expected positional or all-named record fields, found mixed forms"))
+  } else {
+    let r = parse_expr(p0)
+    match r.r {
+      None -> err_e(r.p)
+      Some(val) -> {
+        let acc1 = [FI(pos_field_marker(i), val), ...acc]
+        let p1 = p_skip_newlines(r.p)
+        if p_at(p1, TkComma) {
+          parse_record_pos_loop(p_skip_newlines(p_advance(p1)), acc1, i + 1, type_name, tname)
+        } else if p_at(p1, TkRbrace) {
+          ok_e(p_advance(p1), mk_expr(ERecordLit(type_name, list_reverse(acc1)), tname.line, tname.col))
+        } else {
+          err_e(p_error_here(p1, "expected `,` or `}` in positional record literal"))
+        }
+      }
+    }
+  }
+}
+
+# Sentinel field-name builder. Resolved by `desugar_pos_records_decls`
+# back to the record's declared field name in declaration order. Any
+# leak into a downstream pass is a bug — the sentinel is never a
+# legal record-field identifier (real ones cannot start with `__`).
+fn pos_field_marker(i: Int) : String =
+  string_concat("__pos_", string_concat(int_to_string(i), "__"))
+
+fn is_pos_field_marker(s: String) : Bool {
+  let n = string_length(s)
+  if n < 8 { false }
+  else {
+    match char_at(s, 0) { Some(c0) -> if c0 != '_' { false } else {
+      match char_at(s, 1) { Some(c1) -> if c1 != '_' { false } else {
+        match char_at(s, 2) { Some(c2) -> if c2 != 'p' { false } else {
+          match char_at(s, 3) { Some(c3) -> if c3 != 'o' { false } else {
+            match char_at(s, 4) { Some(c4) -> if c4 != 's' { false } else {
+              match char_at(s, 5) { Some(c5) -> c5 == '_'
+                None -> false
+              }
+              } None -> false }
+            } None -> false }
+          } None -> false }
+        } None -> false }
+      } None -> false }
   }
 }
 
@@ -15501,6 +15576,383 @@ fn desugar_index_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
     EBlock(stmts, tail) -> EBlock(desugar_index_stmts(stmts),
                                    desugar_index_opt(tail))
     _ -> map_expr_kind(k, desugar_index_expr)
+  }
+}
+
+# ====================================================================
+# issue #266 — positional record construction sugar
+# ====================================================================
+#
+# `T { v1, v2 }` desugars to `T { f1: v1, f2: v2 }` using `T`'s
+# declared field order. The parser (parse_record_pos_loop) tags each
+# positional value with a `__pos_<i>__` field-name sentinel; this
+# pass rewrites those sentinels into the real field names by
+# consulting the record-decl table.
+#
+# Validation is reported here and gated upstream of all later passes
+# so a downstream walker never sees a sentinel field name. Two
+# diagnostics:
+#   * unknown record name → "unknown record type T"
+#   * arity mismatch → "T expects N positional fields, got M"
+# Mixed positional + named is rejected by the parser before it ever
+# reaches this pass.
+
+type DPRDecls = { decls: [Decl], errs: Int }
+
+fn desugar_pos_records_decls(ds: [Decl], file: String) : DPRDecls / Console {
+  let recs = collect_records(ds)
+  desugar_pos_records_loop(ds, recs, file, [], 0)
+}
+
+fn desugar_pos_records_loop(ds: [Decl], recs: [RecInfo], file: String, acc: [Decl], errs: Int) : DPRDecls / Console {
+  match ds {
+    [] -> DPRDecls { decls: list_reverse(acc), errs: errs }
+    [d, ...rest] -> {
+      let r = desugar_pos_records_decl(d, recs, file, errs)
+      desugar_pos_records_loop(rest, recs, file, [r.decl, ...acc], r.errs)
+    }
+  }
+}
+
+type DPRDecl = { decl: Decl, errs: Int }
+
+fn desugar_pos_records_decl(d: Decl, recs: [RecInfo], file: String, errs: Int) : DPRDecl / Console {
+  match d {
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) -> {
+      let r = dpr_expr(body, recs, file, errs)
+      DPRDecl { decl: DFn(pub_, n, tps, ps, ret, row, r.expr, l, c, mo), errs: r.errs }
+    }
+    DTest(desc, body, l, c) -> {
+      let r = dpr_expr(body, recs, file, errs)
+      DPRDecl { decl: DTest(desc, r.expr, l, c), errs: r.errs }
+    }
+    DBench(desc, body, l, c) -> {
+      let r = dpr_expr(body, recs, file, errs)
+      DPRDecl { decl: DBench(desc, r.expr, l, c), errs: r.errs }
+    }
+    DCheck(desc, params, body, l, c) -> {
+      let r = dpr_expr(body, recs, file, errs)
+      DPRDecl { decl: DCheck(desc, params, r.expr, l, c), errs: r.errs }
+    }
+    _ -> DPRDecl { decl: d, errs: errs }
+  }
+}
+
+type DPRExpr = { expr: Expr, errs: Int }
+type DPRStmts = { stmts: [Stmt], errs: Int }
+type DPRStmt = { stmt: Stmt, errs: Int }
+type DPROpt = { opt: Option[Expr], errs: Int }
+type DPRExprs = { exprs: [Expr], errs: Int }
+type DPRFields = { fields: [FieldInit], errs: Int }
+type DPRArm = { arm: Arm, errs: Int }
+type DPRArms = { arms: [Arm], errs: Int }
+
+fn dpr_expr(e: Expr, recs: [RecInfo], file: String, errs: Int) : DPRExpr / Console {
+  let kr = dpr_kind(e.kind, e.line, e.col, recs, file, errs)
+  DPRExpr { expr: Expr { kind: kr.expr.kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode },
+            errs: kr.errs }
+}
+
+fn dpr_opt(o: Option[Expr], recs: [RecInfo], file: String, errs: Int) : DPROpt / Console {
+  match o {
+    Some(e) -> {
+      let r = dpr_expr(e, recs, file, errs)
+      DPROpt { opt: Some(r.expr), errs: r.errs }
+    }
+    None -> DPROpt { opt: None, errs: errs }
+  }
+}
+
+fn dpr_exprs(es: [Expr], recs: [RecInfo], file: String, errs: Int) : DPRExprs / Console {
+  match es {
+    [] -> DPRExprs { exprs: [], errs: errs }
+    [h, ...rest] -> {
+      let rh = dpr_expr(h, recs, file, errs)
+      let rt = dpr_exprs(rest, recs, file, rh.errs)
+      DPRExprs { exprs: [rh.expr, ...rt.exprs], errs: rt.errs }
+    }
+  }
+}
+
+fn dpr_fields(fs: [FieldInit], recs: [RecInfo], file: String, errs: Int) : DPRFields / Console {
+  match fs {
+    [] -> DPRFields { fields: [], errs: errs }
+    [f, ...rest] -> match f {
+      FI(nm, val) -> {
+        let rv = dpr_expr(val, recs, file, errs)
+        let rt = dpr_fields(rest, recs, file, rv.errs)
+        DPRFields { fields: [FI(nm, rv.expr), ...rt.fields], errs: rt.errs }
+      }
+    }
+  }
+}
+
+fn dpr_stmts(ss: [Stmt], recs: [RecInfo], file: String, errs: Int) : DPRStmts / Console {
+  match ss {
+    [] -> DPRStmts { stmts: [], errs: errs }
+    [h, ...rest] -> {
+      let rh = dpr_stmt(h, recs, file, errs)
+      let rt = dpr_stmts(rest, recs, file, rh.errs)
+      DPRStmts { stmts: [rh.stmt, ...rt.stmts], errs: rt.errs }
+    }
+  }
+}
+
+fn dpr_stmt(s: Stmt, recs: [RecInfo], file: String, errs: Int) : DPRStmt / Console {
+  match s {
+    SLet(p, ann, rhs) -> {
+      let r = dpr_expr(rhs, recs, file, errs)
+      DPRStmt { stmt: SLet(p, ann, r.expr), errs: r.errs }
+    }
+    SAssert(c, m) -> {
+      let rc = dpr_expr(c, recs, file, errs)
+      let rm = dpr_opt(m, recs, file, rc.errs)
+      DPRStmt { stmt: SAssert(rc.expr, rm.opt), errs: rm.errs }
+    }
+    SExprStmt(x) -> {
+      let r = dpr_expr(x, recs, file, errs)
+      DPRStmt { stmt: SExprStmt(r.expr), errs: r.errs }
+    }
+    SIndexAssign(b, i, v, l, c) -> {
+      let rb = dpr_expr(b, recs, file, errs)
+      let ri = dpr_expr(i, recs, file, rb.errs)
+      let rv = dpr_expr(v, recs, file, ri.errs)
+      DPRStmt { stmt: SIndexAssign(rb.expr, ri.expr, rv.expr, l, c), errs: rv.errs }
+    }
+    SVar(n, ty, rhs, l, c) -> {
+      let r = dpr_expr(rhs, recs, file, errs)
+      DPRStmt { stmt: SVar(n, ty, r.expr, l, c), errs: r.errs }
+    }
+    SUse(n, l, c) -> DPRStmt { stmt: SUse(n, l, c), errs: errs }
+  }
+}
+
+fn dpr_arm(a: Arm, recs: [RecInfo], file: String, errs: Int) : DPRArm / Console {
+  match a {
+    Arm(p, g, b) -> {
+      let rg = dpr_opt(g, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, rg.errs)
+      DPRArm { arm: Arm(p, rg.opt, rb.expr), errs: rb.errs }
+    }
+  }
+}
+
+fn dpr_arms(arms: [Arm], recs: [RecInfo], file: String, errs: Int) : DPRArms / Console {
+  match arms {
+    [] -> DPRArms { arms: [], errs: errs }
+    [h, ...rest] -> {
+      let rh = dpr_arm(h, recs, file, errs)
+      let rt = dpr_arms(rest, recs, file, rh.errs)
+      DPRArms { arms: [rh.arm, ...rt.arms], errs: rt.errs }
+    }
+  }
+}
+
+# Returned from dpr_kind so we can co-thread the kind and an error
+# count without using `map_expr_kind` (which has no error channel).
+type DPRKind = { expr: Expr, errs: Int }
+
+fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: [RecInfo], file: String, errs: Int) : DPRKind / Console {
+  match k {
+    # The interesting case: rewrite positional record literals using
+    # the record's declared field order.
+    ERecordLit(name, fis) -> {
+      # Recurse into sub-exprs FIRST so nested positional records
+      # already have real field names by the time we look at this
+      # node's own arity.
+      let rfis = dpr_fields(fis, recs, file, errs)
+      let renamed = dpr_record_lit(name, rfis.fields, line, col, recs, file, rfis.errs)
+      DPRKind { expr: mk_expr(ERecordLit(name, renamed.fields), line, col), errs: renamed.errs }
+    }
+    EBlock(stmts, tail) -> {
+      let rs = dpr_stmts(stmts, recs, file, errs)
+      let rt = dpr_opt(tail, recs, file, rs.errs)
+      DPRKind { expr: mk_expr(EBlock(rs.stmts, rt.opt), line, col), errs: rt.errs }
+    }
+    ECall(callee, args_) -> {
+      let rc = dpr_expr(callee, recs, file, errs)
+      let ra = dpr_exprs(args_, recs, file, rc.errs)
+      DPRKind { expr: mk_expr(ECall(rc.expr, ra.exprs), line, col), errs: ra.errs }
+    }
+    EField(base, nm) -> {
+      let r = dpr_expr(base, recs, file, errs)
+      DPRKind { expr: mk_expr(EField(r.expr, nm), line, col), errs: r.errs }
+    }
+    EIndex(a, b) -> {
+      let ra = dpr_expr(a, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, ra.errs)
+      DPRKind { expr: mk_expr(EIndex(ra.expr, rb.expr), line, col), errs: rb.errs }
+    }
+    EBinop(op, a, b) -> {
+      let ra = dpr_expr(a, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, ra.errs)
+      DPRKind { expr: mk_expr(EBinop(op, ra.expr, rb.expr), line, col), errs: rb.errs }
+    }
+    EUnop(op, x) -> {
+      let r = dpr_expr(x, recs, file, errs)
+      DPRKind { expr: mk_expr(EUnop(op, r.expr), line, col), errs: r.errs }
+    }
+    EIf(c, t_, eo) -> {
+      let rc = dpr_expr(c, recs, file, errs)
+      let rt = dpr_expr(t_, recs, file, rc.errs)
+      let re = dpr_opt(eo, recs, file, rt.errs)
+      DPRKind { expr: mk_expr(EIf(rc.expr, rt.expr, re.opt), line, col), errs: re.errs }
+    }
+    EMatch(scr, arms) -> {
+      let rs = dpr_expr(scr, recs, file, errs)
+      let ra = dpr_arms(arms, recs, file, rs.errs)
+      DPRKind { expr: mk_expr(EMatch(rs.expr, ra.arms), line, col), errs: ra.errs }
+    }
+    ELambda(ps, body) -> {
+      let r = dpr_expr(body, recs, file, errs)
+      DPRKind { expr: mk_expr(ELambda(ps, r.expr), line, col), errs: r.errs }
+    }
+    EList(els) -> {
+      let r = dpr_list_elems(els, recs, file, errs)
+      DPRKind { expr: mk_expr(EList(r.elems), line, col), errs: r.errs }
+    }
+    ERange(a, b, opt_step) -> {
+      let ra = dpr_expr(a, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, ra.errs)
+      let rs = dpr_opt(opt_step, recs, file, rb.errs)
+      DPRKind { expr: mk_expr(ERange(ra.expr, rb.expr, rs.opt), line, col), errs: rs.errs }
+    }
+    EPipe(a, b) -> {
+      let ra = dpr_expr(a, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, ra.errs)
+      DPRKind { expr: mk_expr(EPipe(ra.expr, rb.expr), line, col), errs: rb.errs }
+    }
+    EMapPipe(a, b) -> {
+      let ra = dpr_expr(a, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, ra.errs)
+      DPRKind { expr: mk_expr(EMapPipe(ra.expr, rb.expr), line, col), errs: rb.errs }
+    }
+    EFlatMapPipe(a, b) -> {
+      let ra = dpr_expr(a, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, ra.errs)
+      DPRKind { expr: mk_expr(EFlatMapPipe(ra.expr, rb.expr), line, col), errs: rb.errs }
+    }
+    ELitUnit(inner, u) -> {
+      let r = dpr_expr(inner, recs, file, errs)
+      DPRKind { expr: mk_expr(ELitUnit(r.expr, u), line, col), errs: r.errs }
+    }
+    EBang(inner) -> {
+      let r = dpr_expr(inner, recs, file, errs)
+      DPRKind { expr: mk_expr(EBang(r.expr), line, col), errs: r.errs }
+    }
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+      let rb = dpr_expr(body, recs, file, errs)
+      let ri = dpr_opt(init_opt, recs, file, rb.errs)
+      let rc = dpr_clauses(clauses, recs, file, ri.errs)
+      let rr = dpr_opt_ret(ret_opt, recs, file, rc.errs)
+      DPRKind {
+        expr: mk_expr(EHandle(rb.expr, eff_name, eff_tyargs, ri.opt, alias_opt, rc.clauses, rr.ret), line, col),
+        errs: rr.errs
+      }
+    }
+    _ -> DPRKind { expr: mk_expr(k, line, col), errs: errs }
+  }
+}
+
+type DPRElems = { elems: [ListElem], errs: Int }
+
+fn dpr_list_elems(els: [ListElem], recs: [RecInfo], file: String, errs: Int) : DPRElems / Console {
+  match els {
+    [] -> DPRElems { elems: [], errs: errs }
+    [el, ...rest] -> {
+      let rh = match el {
+        ElPlain(e)  -> {
+          let r = dpr_expr(e, recs, file, errs)
+          DPRElems { elems: [ElPlain(r.expr)], errs: r.errs }
+        }
+        ElSpread(e) -> {
+          let r = dpr_expr(e, recs, file, errs)
+          DPRElems { elems: [ElSpread(r.expr)], errs: r.errs }
+        }
+      }
+      let rt = dpr_list_elems(rest, recs, file, rh.errs)
+      DPRElems { elems: list_append(rh.elems, rt.elems), errs: rt.errs }
+    }
+  }
+}
+
+type DPRClauses = { clauses: [HClause], errs: Int }
+
+fn dpr_clauses(cs: [HClause], recs: [RecInfo], file: String, errs: Int) : DPRClauses / Console {
+  match cs {
+    [] -> DPRClauses { clauses: [], errs: errs }
+    [c, ...rest] -> match c {
+      HC(n, ps, body, l, co) -> {
+        let rb = dpr_expr(body, recs, file, errs)
+        let rt = dpr_clauses(rest, recs, file, rb.errs)
+        DPRClauses { clauses: [HC(n, ps, rb.expr, l, co), ...rt.clauses], errs: rt.errs }
+      }
+    }
+  }
+}
+
+type DPROptRet = { ret: Option[HReturn], errs: Int }
+
+fn dpr_opt_ret(or_: Option[HReturn], recs: [RecInfo], file: String, errs: Int) : DPROptRet / Console {
+  match or_ {
+    Some(r) -> match r {
+      HR(p, b, l, c) -> {
+        let rb = dpr_expr(b, recs, file, errs)
+        DPROptRet { ret: Some(HR(p, rb.expr, l, c)), errs: rb.errs }
+      }
+    }
+    None -> DPROptRet { ret: None, errs: errs }
+  }
+}
+
+# Rewrite `[FI("__pos_0__", e0), ...]` into named `[FI(field0, e0), ...]`
+# using the record's declared field order. Reports diagnostics for
+# unknown record names and arity mismatches.
+fn dpr_record_lit(name: String, fis: [FieldInit], line: Int, col: Int, recs: [RecInfo], file: String, errs: Int) : DPRFields / Console {
+  let is_pos = match fis {
+    [] -> false
+    [f, ...rest] -> match f { FI(nm, _) -> is_pos_field_marker(nm) }
+  }
+  if not is_pos {
+    DPRFields { fields: fis, errs: errs }
+  } else {
+    match rec_find(recs, name) {
+      None -> {
+        diag_error(file, line, col,
+          string_concat("unknown record type `",
+            string_concat(name,
+              "` for positional construction; declare the type or use named-field form")))
+        DPRFields { fields: fis, errs: errs + 1 }
+      }
+      Some(ri) -> match ri {
+        RI(_, _, fds) -> {
+          let n_pos = list_length(fis)
+          let n_decl = list_length(fds)
+          if n_pos != n_decl {
+            diag_error(file, line, col,
+              concat_all([ "`", name, "` expects ", int_to_string(n_decl),
+                           " positional fields, got ", int_to_string(n_pos) ]))
+            DPRFields { fields: fis, errs: errs + 1 }
+          } else {
+            DPRFields { fields: rename_pos_fields(fis, fds), errs: errs }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn rename_pos_fields(fis: [FieldInit], fds: [FieldDecl]) : [FieldInit] {
+  match fis {
+    [] -> []
+    [fi, ...frest] -> match fds {
+      [] -> [fi, ...frest]
+      [fd, ...drest] -> match fi {
+        FI(_, val) -> match fd {
+          FD(real_name, _) -> [FI(real_name, val), ...rename_pos_fields(frest, drest)]
+        }
+      }
+    }
   }
 }
 
@@ -43738,7 +44190,18 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             let eff_names_for_alias = list_append(builtin_effect_names(), declared_effs)
             let alias_cands = collect_alias_cands(injected)
             let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, path)
-            let raw_decls = expand_aliases_in_decls(injected, alias_res.aliases)
+            let raw_decls_pre_pos = expand_aliases_in_decls(injected, alias_res.aliases)
+            # issue #266: rewrite `T { v1, v2 }` (parser tags fields
+            # with `__pos_<i>__` sentinels) into `T { f1: v1, f2: v2 }`
+            # using the record's declared field order. Runs before any
+            # other pre-typer pass so no downstream walker observes a
+            # sentinel field name. Reports unknown-record + arity
+            # diagnostics; on errs > 0 we short-circuit before
+            # invariants downstream can panic on the still-tagged AST.
+            let pos_rec = desugar_pos_records_decls(raw_decls_pre_pos, path)
+            let raw_decls = pos_rec.decls
+            let pos_rec_errs = pos_rec.errs
+            if pos_rec_errs > 0 { pos_rec_errs } else {
             # m7b #6: pre-resolve desugar of `a[i]` and `a[i] := v` into
             # the underlying array_get / array_set calls. Runs before
             # name resolution so every downstream pass sees only the
@@ -43993,6 +44456,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   }
                 }
               }
+            }
             }
             }
             }
