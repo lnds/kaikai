@@ -38,7 +38,7 @@ type TokKind
   = TkEof
   | TkNewline
   # keywords (alphabetical)
-  | TkAnd | TkAs | TkAssert | TkAxiom | TkBench | TkCheck | TkConst | TkEffect | TkElse | TkEnsures | TkFalse | TkFn | TkFor
+  | TkAnd | TkAs | TkAssert | TkAxiom | TkBench | TkCheck | TkConst | TkEffect | TkElse | TkEnsures | TkExtern | TkFalse | TkFn | TkFor
   | TkHandle | TkIf | TkImpl | TkImport
   | TkLet | TkMatch | TkNot | TkOr | TkProtocol | TkPub | TkRequires | TkTest | TkTrue | TkType
   | TkUnitKw | TkUse | TkVar | TkWhere | TkWith
@@ -98,6 +98,7 @@ fn tk_name(k: TokKind) : String {
     TkNewline -> "NEWLINE"
     TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkAxiom -> "axiom" TkBench -> "bench" TkCheck -> "check" TkConst -> "const" TkEffect -> "effect" TkElse -> "else"
     TkEnsures -> "ensures"
+    TkExtern -> "extern"
     TkFalse -> "false" TkFn -> "fn" TkFor -> "for" TkHandle -> "handle"
     TkIf -> "if" TkImpl -> "impl" TkImport -> "import"
     TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
@@ -258,6 +259,7 @@ fn keyword_kind(text: String) : TokKind {
   else if text == "effect" { TkEffect }
   else if text == "else" { TkElse }
   else if text == "ensures" { TkEnsures }   # m12.6.b
+  else if text == "extern" { TkExtern }     # issue #260: FFI extern "C" fn
   else if text == "false" { TkFalse }
   else if text == "fn" { TkFn }
   else if text == "for" { TkFor }
@@ -1491,7 +1493,18 @@ type Decl
   # direct `extern "C"` call against the named symbol, so call
   # sites of the form `puts("hi")` link straight to libc without
   # any wrapper allocation.
-  | DAxiom(Bool, Bool, String, [String], [Param], TypeExpr, RowExpr, Int, Int)
+  #
+  # Issue #260: the surface syntax for FFI is now `extern "C" fn
+  # name(...) : T / Ffi`, equivalent to the old `[<extern_c>] axiom`
+  # form (which is rejected with a migration error). The `extern_c`
+  # flag stays as the underlying mechanism.
+  #
+  # Issue #261: the third `String` field carries an optional
+  # C-symbol override. Empty string means "no override — emit the
+  # kaikai identifier verbatim as the C symbol". A non-empty value
+  # (e.g. "InitWindow") means "emit that C symbol instead". Only
+  # meaningful when `extern_c` is true.
+  | DAxiom(Bool, Bool, String, String, [String], [Param], TypeExpr, RowExpr, Int, Int)
 
 # m12.8: a single operation declared inside a `protocol P { ... }`
 # block. Mirrors EffectOp's shape (no body, with optional generic
@@ -1634,6 +1647,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkEffect     -> match b { TkEffect -> true _ -> false }
     TkElse       -> match b { TkElse -> true _ -> false }
     TkEnsures    -> match b { TkEnsures -> true _ -> false }
+    TkExtern     -> match b { TkExtern -> true _ -> false }
     TkFalse      -> match b { TkFalse -> true _ -> false }
     TkFn         -> match b { TkFn -> true _ -> false }
     TkFor        -> match b { TkFor -> true _ -> false }
@@ -4931,16 +4945,23 @@ fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy {
 
 fn parse_decl(p: Parser) : PDecl {
   let p_pre = p_skip_newlines(p)
-  # m12.7.x FFI v1: optional `[<extern_c>]` decl-level attribute. When
-  # present, we consume the bracketed attribute here and forward the
-  # `extern_c` flag to `parse_axiom_decl`. Any decl other than `axiom`
-  # following `[<extern_c>]` is an error — surfaced after we know what
-  # the next keyword is.
-  let attr_r = parse_optional_extern_c_attribute(p_pre)
-  let p_after_attr = attr_r.p
-  let extern_c = attr_r.is_extern_c
-  let p0 = p_skip_newlines(p_after_attr)
+  # Issue #260: the legacy `[<extern_c>]` attribute prefix is
+  # rejected before any other parsing happens — the spec syntax is
+  # now `extern "C" fn ...` (and the override variant from issue
+  # #261). We surface a migration error pointing at the new form.
+  if parse_at_legacy_extern_c_attribute(p_pre) {
+    let line_msg = "`[<extern_c>] axiom` is removed (issue #260) — use `extern \"C\" fn name(...) : T / Ffi` instead"
+    err_d(p_error_here(p_pre, line_msg))
+  } else {
+  let p0 = p_pre
   let t = p_peek(p0)
+  # Issue #260: `extern` is a top-level keyword introducing an FFI
+  # declaration. It binds tighter than `pub`, so the surface form
+  # is `extern "C" pub fn ...`. The optional name override (issue
+  # #261) sits between the ABI literal and the `pub`/`fn`.
+  if tk_is(t.kind, TkExtern) {
+    parse_extern_decl(p_advance(p0), t)
+  } else {
   let is_pub_r =
     if tk_is(t.kind, TkPub) { PTy { p: p_advance(p0), r: Some(mk_ty(TyName("", []), 0, 0)) } }
     else { PTy { p: p0, r: None } }
@@ -4980,9 +5001,7 @@ fn parse_decl(p: Parser) : PDecl {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a `use` declaration")) }
     else { parse_use_decl(p_advance(p1), hd) }
   } else if tk_is(hd.kind, TkAxiom) {
-    parse_axiom_decl(p_advance(p1), is_pub, extern_c, hd)
-  } else if extern_c {
-    err_d(p_error_here(p1, "`[<extern_c>]` is only allowed on `axiom` declarations (m12.7.x FFI v1)"))
+    parse_axiom_decl(p_advance(p1), is_pub, false, "", hd)
   } else if tk_is(hd.kind, TkConst) {
     parse_const_decl(p_advance(p1), is_pub, hd)
   } else {
@@ -4995,6 +5014,8 @@ fn parse_decl(p: Parser) : PDecl {
       }
     } else { base }
     err_d(p_error(p1, hd, msg))
+  }
+  }
   }
 }
 
@@ -5040,6 +5061,140 @@ fn parse_const_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
   }
 }
 
+# Issue #260: detect the legacy `[<extern_c>]` attribute prefix
+# without consuming any tokens. We peek for the exact 3-token shape
+# `[`, `<`, `extern_c` so the much-more-common `[` (a list literal
+# at the top of a const) does not trigger. Returns true only when
+# the migration error should fire. The parser then surfaces a
+# diagnostic without trying to recover.
+fn parse_at_legacy_extern_c_attribute(p: Parser) : Bool {
+  if not p_at(p, TkLbracket) { false }
+  else if not tk_is(p_peek1(p).kind, TkLt) { false }
+  else {
+    # Peek the third token (the attribute name). `p_peek1` is +1, so
+    # we advance once into the `<` and peek1 from there to get the
+    # ident slot. `extern_c` is the only attribute that lived inside
+    # `[<...>]` to date; other names are likely typos and still get
+    # the same migration message (cheaper than enumerating valid
+    # alternatives, none of which exist).
+    let p1 = p_advance(p)
+    let id = p_peek1(p1)
+    if not tk_is(id.kind, TkIdent) { false }
+    else { tok_source(p1.src, id) == "extern_c" }
+  }
+}
+
+# Issue #260: parse the new spec form
+#   extern STRING_LIT [ "(" STRING_LIT ")" ] [ "pub" ] "fn" name(...) : T [ / row ]
+# Routes into `parse_axiom_decl` so the rest of the pipeline keeps
+# seeing a uniform `DAxiom(extern_c=true, c_sym_over=...)` shape.
+# `t` is the `extern` token, used for line/col on the resulting
+# decl.
+#
+# Issue #261 hooks in here too: the optional `("symbol")` after the
+# ABI literal becomes the `c_sym_over` argument. The override must
+# be a valid C identifier (`[A-Za-z_][A-Za-z0-9_]*`); anything else
+# is rejected so a typo'd quote does not silently link a symbol the
+# user did not intend.
+fn parse_extern_decl(p: Parser, t: Token) : PDecl {
+  let p_abi = p_skip_newlines(p)
+  let abi_tok = p_peek(p_abi)
+  if not tk_is(abi_tok.kind, TkString) {
+    err_d(p_error(p_abi, abi_tok, "expected an ABI string literal after `extern` (only `\"C\"` is supported)"))
+  } else {
+    let abi_span = tok_source(p_abi.src, abi_tok)
+    if not (abi_span == "\"C\"") {
+      err_d(p_error(p_abi, abi_tok,
+        concat_all(["unsupported FFI ABI ", abi_span, " — only \"C\" is supported"])))
+    } else {
+      let p1 = p_advance(p_abi)
+      # Optional `("real_symbol")` name override (issue #261). Sits
+      # immediately after the ABI literal with no intervening
+      # newline so the parser cannot mistake a list literal that
+      # follows on the next line for the override.
+      let over_r = parse_optional_extern_c_override(p1)
+      match over_r.r {
+        None -> err_d(over_r.p)
+        Some(c_sym_over) -> {
+          let p2 = p_skip_newlines(over_r.p)
+          let is_pub_tok = p_peek(p2)
+          let is_pub = tk_is(is_pub_tok.kind, TkPub)
+          let p3 = if is_pub { p_skip_newlines(p_advance(p2)) } else { p2 }
+          let fn_tok = p_peek(p3)
+          if not tk_is(fn_tok.kind, TkFn) {
+            err_d(p_error(p3, fn_tok, "expected `fn` after `extern \"C\"` (FFI declarations look like `extern \"C\" fn name(...) : T / Ffi`)"))
+          } else {
+            parse_axiom_decl(p_advance(p3), is_pub, true, c_sym_over, t)
+          }
+        }
+      }
+    }
+  }
+}
+
+type PStr = { p: Parser, r: Option[String] }
+
+# Issue #261: parse the optional `("real_symbol")` override after
+# the ABI literal. Returns:
+#   - `None` parser-error on a malformed override (unmatched paren,
+#     non-string token inside, or a non-C-identifier symbol);
+#   - `Some("")` when there is no override (caller will use the
+#     kaikai identifier as the C symbol);
+#   - `Some(s)` when the override is `s`.
+fn parse_optional_extern_c_override(p: Parser) : PStr {
+  if not p_at(p, TkLparen) { PStr { p: p, r: Some("") } }
+  else {
+    let p1 = p_advance(p)
+    let sym_tok = p_peek(p1)
+    if not tk_is(sym_tok.kind, TkString) {
+      PStr { p: p_error(p1, sym_tok, "expected a C-symbol string literal inside `extern \"C\"(...)`"), r: None }
+    } else {
+      let sym_span = tok_source(p1.src, sym_tok)
+      let n = string_length(sym_span)
+      # The span includes the surrounding quotes — strip them.
+      let sym_clean = if n >= 2 { string_slice(sym_span, 1, n - 2) } else { "" }
+      if not is_valid_c_identifier(sym_clean) {
+        PStr {
+          p: p_error(p1, sym_tok,
+            concat_all(["invalid C symbol override ", sym_span,
+                        " — must match `[A-Za-z_][A-Za-z0-9_]*`"])),
+          r: None
+        }
+      } else {
+        let p2 = p_advance(p1)
+        if not p_at(p2, TkRparen) {
+          PStr { p: p_error_here(p2, "expected `)` to close `extern \"C\"(\"<symbol>\")` override"), r: None }
+        } else {
+          PStr { p: p_advance(p2), r: Some(sym_clean) }
+        }
+      }
+    }
+  }
+}
+
+# Issue #261: the override must be a syntactically valid C
+# identifier so the emitted call site survives the C compiler. We
+# do not try to validate that the symbol actually links — that is
+# a build-time concern, not a parse-time one.
+fn is_valid_c_identifier(s: String) : Bool {
+  let n = string_length(s)
+  if n == 0 { false }
+  else {
+    let c0 = char_at_or_zero(s, 0)
+    if not (ch_is_alpha(c0) or c0 == '_') { false }
+    else { is_valid_c_identifier_rest(s, 1, n) }
+  }
+}
+
+fn is_valid_c_identifier_rest(s: String, i: Int, n: Int) : Bool {
+  if i >= n { true }
+  else {
+    let c = char_at_or_zero(s, i)
+    if ch_is_alnum(c) or c == '_' { is_valid_c_identifier_rest(s, i + 1, n) }
+    else { false }
+  }
+}
+
 # m12.7: parse `axiom name[tparams](params) : T / row`. Mirrors
 # `parse_fn_decl`'s prologue (name + tparams + params) but the
 # return type is REQUIRED (no default `Unit`) and there is no body
@@ -5047,11 +5202,15 @@ fn parse_const_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
 # Decl carries everything `lower_axioms` needs to synthesise a
 # `todo!` body in the desugar pass.
 #
-# m12.7.x FFI v1: `extern_c` is true when the parser saw a
-# `[<extern_c>]` attribute prefix. The flag rides on the DAxiom and
-# `lower_axiom_one` reads it to switch between the panic-stub and
-# FFI-shim body forms.
-fn parse_axiom_decl(p: Parser, is_pub: Bool, extern_c: Bool, t: Token) : PDecl {
+# m12.7.x FFI v1: `extern_c` was historically set by the legacy
+# `[<extern_c>]` attribute prefix (removed in issue #260). After
+# the migration, `extern_c` is only set via `parse_extern_decl`
+# routing through `parse_axiom_decl_inner`; bare `axiom` decls
+# always pass `extern_c=false, c_sym_over=""`.
+#
+# Issue #261: `c_sym_over` carries the optional C-symbol override
+# (empty string when absent). Only meaningful when `extern_c` is true.
+fn parse_axiom_decl(p: Parser, is_pub: Bool, extern_c: Bool, c_sym_over: String, t: Token) : PDecl {
   let id = p_peek(p)
   if not tk_is(id.kind, TkIdent) {
     err_d(p_error(p, id, "expected axiom name"))
@@ -5089,7 +5248,7 @@ fn parse_axiom_decl(p: Parser, is_pub: Bool, extern_c: Bool, t: Token) : PDecl {
                     if p_at(p4, TkEq) or p_at(p4, TkLbrace) {
                       err_d(p_error_here(p4, "axiom must not have a body — drop the `=` / `{` and trailing block"))
                     } else {
-                      ok_d(row_r.p, DAxiom(is_pub, extern_c, name, tparams, params, ty, row_r.r, t.line, t.col))
+                      ok_d(row_r.p, DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ty, row_r.r, t.line, t.col))
                     }
                   }
                 }
@@ -5382,54 +5541,6 @@ fn parse_optional_pure_attribute(p: Parser) : PureAttr {
 
 fn maybe_wrap_pure(is_pure: Bool, dfn: Decl, line: Int, col: Int) : Decl =
   if is_pure { DAttribPure(dfn, line, col) } else { dfn }
-
-# m12.7.x FFI v1: result of attempting to parse the optional
-# `[<extern_c>]` decl-level attribute that precedes an `axiom`. The
-# shape mirrors `PureAttr`/`parse_optional_pure_attribute` so the
-# bracket-with-angle attribute grammar stays consistent across the
-# language. Peek-2 lookahead so a bare `[` (e.g. a list literal at
-# the top of a const) does not trigger.
-type ExternCAttr = { p: Parser, is_extern_c: Bool }
-
-fn parse_optional_extern_c_attribute(p: Parser) : ExternCAttr {
-  if not p_at(p, TkLbracket) { ExternCAttr { p: p, is_extern_c: false } }
-  else if not tk_is(p_peek1(p).kind, TkLt) {
-    ExternCAttr { p: p, is_extern_c: false }
-  } else {
-    let p1 = p_skip_newlines(p_advance(p))
-    let p2 = p_skip_newlines(p_advance(p1))
-    let id = p_peek(p2)
-    if not tk_is(id.kind, TkIdent) {
-      ExternCAttr { p: p, is_extern_c: false }
-    } else {
-      let attr_name = tok_source(p2.src, id)
-      if not (attr_name == "extern_c") {
-        # Not our attribute — leave the parser untouched so other
-        # paths (`parse_optional_pure_attribute` after a fn signature)
-        # still see the brackets.
-        ExternCAttr { p: p, is_extern_c: false }
-      } else {
-        let p3 = p_skip_newlines(p_advance(p2))
-        if not p_at(p3, TkGt) {
-          ExternCAttr {
-            p: p_error_here(p3, "expected `>` to close `[<extern_c>]` attribute"),
-            is_extern_c: false
-          }
-        } else {
-          let p4 = p_skip_newlines(p_advance(p3))
-          if not p_at(p4, TkRbracket) {
-            ExternCAttr {
-              p: p_error_here(p4, "expected `]` to close `[<extern_c>]` attribute"),
-              is_extern_c: false
-            }
-          } else {
-            ExternCAttr { p: p_advance(p4), is_extern_c: true }
-          }
-        }
-      }
-    }
-  }
-}
 
 # m12.6.b: contract-clause result. Carries the parser advanced past
 # all `requires` / `ensures` clauses plus the accumulated predicates.
@@ -8524,9 +8635,13 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
       dump_row_expr(row, depth + 1)
       dump_expr(body, depth + 1)
     }
-    DAxiom(is_pub, extern_c, name, tparams, params, ret_ty, row, line, col) -> {
+    DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
-      let ext_s = if extern_c { "extern_c " } else { "" }
+      let ext_s = if extern_c {
+        if string_length(c_sym_over) > 0 {
+          string_concat("extern_c(\"", string_concat(c_sym_over, "\") "))
+        } else { "extern_c " }
+      } else { "" }
       emit_line(depth, "axiom #{ext_s}#{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
       tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
       params |> each((pm) => dump_param(pm, depth + 1))
@@ -9132,7 +9247,7 @@ fn chk_decl(e: Env, d: Decl) : Env {
     DDerive(_, _, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit declarations introduce no value bindings
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before chk runs
-    DAxiom(_, _, _, _, _, _, _, _, _) -> e     # m12.7: rewritten to DFn by lower_axioms before chk runs
+    DAxiom(_, _, _, _, _, _, _, _, _, _) -> e     # m12.7: rewritten to DFn by lower_axioms before chk runs
     DAttribPure(inner, _, _) -> chk_decl(e, inner)  # m12.6.x #5(a)
   }
 }
@@ -9175,7 +9290,7 @@ fn register_one(e: Env, d: Decl) : Env {
     DDerive(_, _, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit names live in their own namespace, validated at type-resolve time
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before register_one runs
-    DAxiom(_, _, name, _, _, _, _, _, _) -> env_add(e, name)  # m12.7: also rewritten to DFn by lower_axioms; case kept for completeness
+    DAxiom(_, _, name, _, _, _, _, _, _, _) -> env_add(e, name)  # m12.7: also rewritten to DFn by lower_axioms; case kept for completeness
     DAttribPure(inner, _, _) -> register_one(e, inner)  # m12.6.x #5(a)
   }
 }
@@ -12104,7 +12219,7 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
     DDerive(_, _, _, _) -> st
     DUnit(_, _, _, _, _) -> st               # m12.5: no expressions in a unit decl
     DUse(_, _, _) -> st                       # m7e §25: stripped by desugar_use_decls; no expressions
-    DAxiom(_, _, _, _, _, _, _, _, _) -> st     # m12.7: rewritten to DFn by lower_axioms; no expressions on the bare form
+    DAxiom(_, _, _, _, _, _, _, _, _, _) -> st     # m12.7: rewritten to DFn by lower_axioms; no expressions on the bare form
     DAttribPure(inner, _, _) -> collect_decl(inner, st)  # m12.6.x #5(a)
   }
 }
@@ -13595,7 +13710,9 @@ fn emit_fn_body(src: String, d: Decl, lcs: [String], fns: [EFn], variants: [EVar
       # the return value. The shim does its own `extern` forward decl
       # inline so callers don't need a separate header pass.
       if body_is_ffi_extern(body) {
-        emit_ffi_shim_body(sig, name, params, ret_ty_opt)
+        # Issue #261: the C-side symbol is either the override
+        # baked into the body's tag or the kaikai identifier.
+        emit_ffi_shim_body(sig, ffi_extern_symbol_of(body, name), params, ret_ty_opt)
       } else {
         # Seed the local-name scope with the fn's parameters so an
         # `EVar(pname)` reference inside the body emits the local C
@@ -15995,16 +16112,25 @@ fn lower_axioms(ds: [Decl]) : [Decl] = map(ds, lower_axiom_one)
 
 fn lower_axiom_one(d: Decl) : Decl {
   match d {
-    DAxiom(is_pub, extern_c, name, tparams, params, ret_ty, row, l, c) -> {
-      # m12.7.x FFI v1: an `[<extern_c>]` axiom lowers to a DFn
-      # whose body is a magic `ETodo` whose message tags it as an
-      # FFI shim. The C / LLVM `emit_fn_body` paths detect the tag
-      # and synthesise a real `extern "C"` call instead of the
-      # default `kai_prelude_panic` body. Typer-side `ETodo` still
-      # type-checks as "any type fits", so the FFI shim's typed
-      # signature is what flows into call sites.
+    DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, l, c) -> {
+      # m12.7.x FFI v1: an `extern "C" fn` (or legacy `[<extern_c>]`
+      # axiom) lowers to a DFn whose body is a magic `ETodo` whose
+      # message tags it as an FFI shim. The C / LLVM `emit_fn_body`
+      # paths detect the tag and synthesise a real `extern "C"`
+      # call instead of the default `kai_prelude_panic` body.
+      # Typer-side `ETodo` still type-checks as "any type fits", so
+      # the FFI shim's typed signature is what flows into call sites.
+      #
+      # Issue #261: when `c_sym_over` is non-empty, encode it inside
+      # the magic tag (`__kai_ffi__:<override>`) so the C / LLVM
+      # emitters can read it back when synthesising the call site
+      # without a second AST field carrying the override.
       let msg =
-        if extern_c { ffi_extern_tag() }
+        if extern_c {
+          if string_length(c_sym_over) > 0 {
+            string_concat(ffi_extern_tag_prefix(), c_sym_over)
+          } else { ffi_extern_tag() }
+        }
         else { string_concat("axiom ", string_concat(name, " not bound")) }
       let body = mk_expr(ETodo(msg), l, c)
       DFn(is_pub, name, tparams, params, Some(ret_ty), row, body, l, c, None)
@@ -16016,12 +16142,34 @@ fn lower_axiom_one(d: Decl) : Decl {
 # m12.7.x FFI v1: the magic `ETodo` payload that flags a DFn body
 # as the FFI shim form. `emit_fn_body` (C and LLVM) match on this
 # string before falling through to the default ETodo lowering.
+#
+# Issue #261: when the FFI declaration carries a name override
+# (`extern "C"("real_symbol") fn ...`), the lowering writes
+# `__kai_ffi__:real_symbol` into the tag so the emitters can carve
+# the override back out without a second AST field.
 fn ffi_extern_tag() : String = "__kai_ffi__"
+fn ffi_extern_tag_prefix() : String = "__kai_ffi__:"
 
 fn body_is_ffi_extern(body: Expr) : Bool {
   match body.kind {
-    ETodo(msg) -> msg == ffi_extern_tag()
+    ETodo(msg) -> msg == ffi_extern_tag() or string_starts_with_q(msg, ffi_extern_tag_prefix())
     _ -> false
+  }
+}
+
+# Issue #261: extract the C-side symbol from an FFI shim body's
+# tag. Returns the override (`__kai_ffi__:strlen` → `strlen`) if
+# present, otherwise `default_name` (the kaikai identifier acts as
+# the C symbol when no override was given). Caller must have
+# already established the body is an FFI shim via `body_is_ffi_extern`.
+fn ffi_extern_symbol_of(body: Expr, default_name: String) : String {
+  match body.kind {
+    ETodo(msg) ->
+      if string_starts_with_q(msg, ffi_extern_tag_prefix()) {
+        string_slice(msg, string_length(ffi_extern_tag_prefix()),
+                     string_length(msg) - string_length(ffi_extern_tag_prefix()))
+      } else { default_name }
+    _ -> default_name
   }
 }
 
@@ -19944,7 +20092,7 @@ fn sig_of_decl(d: Decl) : Option[Ty] {
     # m12.7: axiom signature has the same shape as a fn — params,
     # return type, row. The body's row is replaced by the declared
     # row directly (no body to read row_of_expr from).
-    DAxiom(_, _, _, _, params, ret_ty, row, _, _) -> {
+    DAxiom(_, _, _, _, _, params, ret_ty, row, _, _) -> {
       let pts = map(params, param_ty)
       let ret = resolve_ty(ret_ty)
       Some(TyFnT(pts, ret, row_of_expr(row)))
@@ -20228,7 +20376,7 @@ fn dump_decl_type(d: Decl) : Unit / Console {
     }
     DUse(name, line, col) ->
       print("use #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
-    DAxiom(is_pub, _, name, _, _, _, _, line, col) -> {
+    DAxiom(is_pub, _, name, _, _, _, _, _, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       match sig_of_decl(d) {
         Some(ty) -> print("#{pub_s}axiom #{name} : #{ty_to_string(ty)} @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -28838,7 +28986,7 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     # m12.7: DAxiom is rewritten to DFn by lower_axioms before this
     # pass; the case is kept for completeness when expand_aliases_decl
     # is invoked on a pre-lowering decl stream (e.g., via --ast).
-    DAxiom(_, _, _, _, _, _, _, _, _) -> d
+    DAxiom(_, _, _, _, _, _, _, _, _, _) -> d
     # m12.6.x #5(a): DAttribPure unwraps before this pass runs in
     # the driver; case kept for `--ast` and other early-pipeline
     # callers that work on the raw decl stream.
@@ -37423,7 +37571,13 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
       # kaikai-visible wrapper unboxes args, calls the extern, and
       # re-boxes the result.
       if body_is_ffi_extern(body) {
-        let shim = llvm_emit_ffi_shim(sym, nm, ps, ret_ty_opt, start_id)
+        # Issue #261: the symbol passed to the LLVM shim is either
+        # the override baked into the body's tag or the kaikai
+        # identifier. The kaikai-side wrapper symbol (`sym`) stays
+        # the kaikai name — only the call target inside the shim
+        # changes.
+        let c_sym_target = ffi_extern_symbol_of(body, nm)
+        let shim = llvm_emit_ffi_shim(sym, c_sym_target, ps, ret_ty_opt, start_id)
         LlvmDeclOut { text: concat_all([shim.text, thunk]), next_id: shim.next_id }
       } else {
       let locals0 = llvm_init_locals_from_params(ps)
@@ -37881,7 +38035,7 @@ fn collect_pub_exports(decls: [Decl], acc: [String]) : [String] {
         }
         DEffect(true, name, _, _, _, _) -> [name, ...acc]
         DProtocol(true, name, _, _, _) -> [name, ...acc]
-        DAxiom(true, _, name, _, _, _, _, _, _) -> [name, ...acc]
+        DAxiom(true, _, name, _, _, _, _, _, _, _) -> [name, ...acc]
         DUnit(true, name, _, _, _) -> [name, ...acc]
         _ -> acc
       }
@@ -38525,8 +38679,8 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console = ma
     DDerive(ps, qualtype_decl(inner, mt, file), l, c)
   DAttribPure(inner, l, c) ->
     DAttribPure(qualtype_decl(inner, mt, file), l, c)
-  DAxiom(p, sm, n, tps, ps, ret, row, l, c) ->
-    DAxiom(p, sm, n, tps, qualtype_params(ps, mt, file),
+  DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
+    DAxiom(p, sm, n, cso, tps, qualtype_params(ps, mt, file),
             qualtype_te(ret, mt, file), qualtype_row(row, mt, file), l, c)
   DTest(n, body, l, c) -> DTest(n, qualtype_expr(body, mt, file), l, c)
   DBench(n, body, l, c) -> DBench(n, qualtype_expr(body, mt, file), l, c)
@@ -38645,7 +38799,7 @@ fn qtchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
   DImpl(_, ty, sub_decls, _, _) -> qtchk_te(ty, mt) + qtchk_decls(sub_decls, mt)
   DDerive(_, inner, _, _) -> qtchk_decl(inner, mt)
   DAttribPure(inner, _, _) -> qtchk_decl(inner, mt)
-  DAxiom(_, _, _, _, ps, ret, row, _, _) ->
+  DAxiom(_, _, _, _, _, ps, ret, row, _, _) ->
     qtchk_params(ps, mt) + qtchk_te(ret, mt) + qtchk_row(row, mt)
   DCheck(_, ps, _, _, _) -> qtchk_params(ps, mt)
   _ -> 0
@@ -41965,7 +42119,7 @@ fn decl_line(d: Decl) : Int {
     DAttribPure(_, line, _) -> line
     DUnit(_, _, _, line, _) -> line
     DUse(_, line, _) -> line
-    DAxiom(_, _, _, _, _, _, _, line, _) -> line
+    DAxiom(_, _, _, _, _, _, _, _, line, _) -> line
   }
 }
 
@@ -42005,7 +42159,7 @@ fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
     DDerive(_, _, line, _) -> fmt_panic_unsupported("#derive annotation", line)
     DUnit(_, _, _, line, _) -> fmt_panic_unsupported("unit declarations", line)
     DUse(_, line, _) -> fmt_panic_unsupported("file-level `use`", line)
-    DAxiom(_, _, _, _, _, _, _, line, _) -> fmt_panic_unsupported("axiom declarations", line)
+    DAxiom(_, _, _, _, _, _, _, _, line, _) -> fmt_panic_unsupported("axiom declarations", line)
   }
 }
 
@@ -43173,7 +43327,7 @@ fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
   # `kai_<name>`, which the importer cannot find. We lower the axiom
   # in place here so the produced DFn picks up the same `Some(mod)`
   # stamp the DFn arm above writes.
-  DAxiom(_, _, _, _, _, _, _, _, _) -> tag_decl_module_origin(lower_axiom_one(d), mod)
+  DAxiom(_, _, _, _, _, _, _, _, _, _) -> tag_decl_module_origin(lower_axiom_one(d), mod)
   _ -> d
 }
 
@@ -43218,7 +43372,7 @@ fn tag_target_decl(d: Decl, mod: String) : Decl = match d {
   # legal as an in-file FFI helper) keeps the bare `kai_<name>` symbol
   # so its call site (within the same module) does not synthesise a
   # `kai_<mod>__<name>` form.
-  DAxiom(p, _, _, _, _, _, _, _, _) ->
+  DAxiom(p, _, _, _, _, _, _, _, _, _) ->
     if p { tag_decl_module_origin(d, mod) } else { d }
   _ -> d
 }
