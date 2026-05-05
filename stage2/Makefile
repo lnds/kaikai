@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-log-asan test-ffi-extern-c test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs selfhost
 
 all: $(TARGET)
 
@@ -458,6 +458,67 @@ test-ffi-extern-c: $(TARGET) build
 	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-llvm.out > /dev/null \
 	  && echo "ffi-extern-c OK (LLVM backend)" \
 	  || { echo "ffi-extern-c DIFF (LLVM backend)"; diff ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-llvm.out; exit 1; }
+
+# Issue #244 fixture — `pub axiom` wrapper symbol export across
+# modules. The defining module's `[<extern_c>] pub axiom abs(...)`
+# is imported by `main.kai` via `import myffi`; the call site emits
+# `kai_myffi__abs(...)` and the linker only finds it because the
+# lowered FFI shim's `module_origin` was stamped pre-lower (issue
+# #244 fix). Without the fix the link step fails with an undefined
+# `kai_myffi__abs` reference. Two-file fixture compiled with `--path`
+# pointed at the fixture directory so the resolver finds `myffi.kai`
+# next to `main.kai`.
+test-ffi-pub-axiom-cross-module: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --path ../examples/effects/ffi_pub_axiom_cross_module \
+	  ../examples/effects/ffi_pub_axiom_cross_module/main.kai \
+	  > build/ffi_pub_axiom_cross_module.c; \
+	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage0 \
+	  build/ffi_pub_axiom_cross_module.c -o build/ffi_pub_axiom_cross_module-c; \
+	./build/ffi_pub_axiom_cross_module-c > build/ffi_pub_axiom_cross_module.out; \
+	diff -q ../examples/effects/ffi_pub_axiom_cross_module/main.out.expected \
+	  build/ffi_pub_axiom_cross_module.out > /dev/null \
+	  && echo "ffi-pub-axiom-cross-module OK (C backend)" \
+	  || { echo "ffi-pub-axiom-cross-module DIFF (C backend)"; \
+	       diff ../examples/effects/ffi_pub_axiom_cross_module/main.out.expected \
+	            build/ffi_pub_axiom_cross_module.out; exit 1; }; \
+	./$(TARGET) --emit=llvm --path ../examples/effects/ffi_pub_axiom_cross_module \
+	  ../examples/effects/ffi_pub_axiom_cross_module/main.kai \
+	  > build/ffi_pub_axiom_cross_module.ll; \
+	clang -w -I ../stage0 build/ffi_pub_axiom_cross_module.ll \
+	  ../stage0/runtime_llvm.c -o build/ffi_pub_axiom_cross_module-llvm; \
+	./build/ffi_pub_axiom_cross_module-llvm > build/ffi_pub_axiom_cross_module-llvm.out; \
+	diff -q ../examples/effects/ffi_pub_axiom_cross_module/main.out.expected \
+	  build/ffi_pub_axiom_cross_module-llvm.out > /dev/null \
+	  && echo "ffi-pub-axiom-cross-module OK (LLVM backend)" \
+	  || { echo "ffi-pub-axiom-cross-module DIFF (LLVM backend)"; \
+	       diff ../examples/effects/ffi_pub_axiom_cross_module/main.out.expected \
+	            build/ffi_pub_axiom_cross_module-llvm.out; exit 1; }
+
+# Issue #248 fixtures — stdlib `loop` helpers under the m7b §5
+# double-trailing-lambda sugar. Three positive fixtures exercise
+# `until { cond } { body }`, `while { cond } { body }`, and the
+# `repeat(n) { body }` single-trailing form. Each compiles with
+# `--path ../stdlib` so `import loop` resolves; the compile + run
+# is the regression — the bug closed here was a typer fault that
+# made `import loop` itself fail to typecheck whenever any `repeat`
+# from the auto-loaded core preludes (list / string) was a
+# candidate. Output diffed against the golden.
+test-issue-248-loop-sugars: $(TARGET) build
+	@set -e; \
+	for f in m7b_5_until_basic m7b_5_while_var m7b_5_repeat_basic; do \
+	  src=../examples/sugars/loop/$$f.kai; \
+	  exp=../examples/sugars/loop/$$f.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$src > build/$$f.c \
+	    || { echo "$$f FAIL (kaic2)"; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$f.c -o build/$$f-c \
+	    || { echo "$$f FAIL (cc)"; exit 1; }; \
+	  ./build/$$f-c > build/$$f.out \
+	    || { echo "$$f FAIL (run)"; exit 1; }; \
+	  diff -q $$exp build/$$f.out > /dev/null \
+	    && echo "$$f OK" \
+	    || { echo "$$f DIFF"; diff $$exp build/$$f.out; exit 1; }; \
+	done
 
 # Tier 1-ASAN counterpart: same fixture, but the linked binary is
 # instrumented with AddressSanitizer + UndefinedBehaviorSanitizer
@@ -3173,7 +3234,7 @@ test-unions: $(TARGET) build
 	  fi; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs test-ffi-extern-c
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-248-loop-sugars
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -3182,7 +3243,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-unions test-sequence test-ufcs
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-unions test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-248-loop-sugars
 
 clean:
 	rm -rf build $(TARGET)
