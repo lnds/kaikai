@@ -1621,17 +1621,32 @@ The escape hatch for calling into C. Every `extern "C" fn`
 declaration installs a synthetic operation on `Ffi`:
 
 ```kai
-extern "C" fn abs(n: Int) : Int                 # uses Ffi
+extern "C" fn abs(n: Int) : Int / Ffi
 
 fn absolute(x: Int) : Int / Ffi {
   abs(x)
 }
 ```
 
-The example uses `Int` to keep the surface minimal; interop
-involving strings, pointers, or compound structs requires an
-additional type layer (`CString` and friends) specified in a
-future dedicated FFI doc.
+The kaikai-side identifier is, by default, also the C symbol the
+linker resolves. To bind a kaikai name to a differently-named C
+symbol — typical for libraries that expose `CamelCase` or
+namespaced identifiers — add the override after the ABI literal:
+
+```kai
+extern "C"("InitWindow") fn init_window(w: Int, h: Int, title: String) : Unit / Ffi
+extern "C"("strlen")     fn c_strlen(s: String) : Int / Ffi
+```
+
+The override symbol must be a valid C identifier
+(`[A-Za-z_][A-Za-z0-9_]*`); anything else is a parse error. The
+ABI literal is mandatory and currently must be `"C"` — any other
+ABI is rejected.
+
+The supported types in v1 are `Int`, `Real`, `Bool`, `String`,
+and `Unit` (return only). Interop involving pointers or compound
+structs requires an additional type layer (`CString` and friends)
+specified in a future dedicated FFI doc.
 
 ### Default handler
 
