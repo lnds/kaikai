@@ -84,6 +84,25 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.39.0 (2026-05-05)
+
+### Added
+
+- **parser**: complex literal i suffix (Phase 1 of #267)
+- **parser**: positional record construction T { v1, v2 } (closes #266)
+- **stdlib+typer**: Ref[T] in Mutable effect (closes #257)
+- **parser+ffi**: extern "C" fn syntax + name override (closes #260, closes #261)
+- **typer+stdlib**: operator overloading via protocols + Complex stdlib (closes #246, closes #245)
+
+### Fixed
+
+- **parser+typer**: scope-aware const desugar + DConst variant (closes #269)
+- **typer+stdlib**: enforce Mutable for observable Array writes + Koka-style masking (closes #251, closes #252)
+
+### Changed
+
+- **typer+docs**: rename Unit kind to Measure (closes #253)
+
 ## v0.38.0 (2026-05-04)
 
 ### Added
