@@ -243,13 +243,13 @@ clamps negatives to 0 on `Int`.
 
 ### 5. Generic units
 
-**Decision**: introduce a `Unit` kind for type parameters; do not
-reuse the `Type` kind.
+**Decision**: introduce a `Measure` kind for type parameters; do
+not reuse the `Type` kind.
 
 ```kai
-fn double[u: Unit](x: Real<u>) : Real<u> = x * 2.0
-fn area[u: Unit](w: Real<u>, h: Real<u>) : Real<u^2> = w * h
-fn divide[u: Unit, v: Unit](a: Real<u>, b: Real<v>) : Real<u/v> = a / b
+fn double[u: Measure](x: Real<u>) : Real<u> = x * 2.0
+fn area[u: Measure](w: Real<u>, h: Real<u>) : Real<u^2> = w * h
+fn divide[u: Measure, v: Measure](a: Real<u>, b: Real<v>) : Real<u/v> = a / b
 ```
 
 Reasons:
@@ -257,6 +257,11 @@ Reasons:
   is a type, not a unit).
 - F# uses `[<Measure>] 'u`, which is essentially this but with
   attribute syntax.
+
+> Historical note (#253): the kind was originally named `Unit`,
+> which collided with `Unit` the void return type. Renamed to
+> `Measure` in the m12.6+ window. See `docs/kinds.md` for the
+> full kind-system reference and disambiguation table.
 
 ### 6. Dimensionless
 
@@ -287,7 +292,7 @@ let h_cm : Real<cm> = h_m * cm_per_m   # OK: m * cm/m = cm
 let raw : Real = unitless(h_m)         # explicit drop
 ```
 
-`unitless` is a prelude function (`unitless[u: Unit](x: Real<u>) : Real`).
+`unitless` is a prelude function (`unitless[u: Measure](x: Real<u>) : Real`).
 There is NO implicit unit→no-unit conversion.
 
 ### 8. Pretty-printing
@@ -312,7 +317,7 @@ error: type mismatch in operator `+`
 have an effect row at the same time.
 
 ```kai
-fn log_price[u: Unit](p: Real<u>) : Unit / Console = {
+fn log_price[u: Measure](p: Real<u>) : Unit / Console = {
   Console.print("price: #{real_to_string(unitless(p))}")
 }
 ```
@@ -337,8 +342,8 @@ fn add(a: Money, b: Money) : Result[Money, String] = {
 # With UoM (compiler does the check)
 unit USD
 unit EUR
-type Money[u: Unit] = { amount: Decimal<u> }
-fn add[u: Unit](a: Money<u>, b: Money<u>) : Money<u> = {
+type Money[u: Measure] = { amount: Decimal<u> }
+fn add[u: Measure](a: Money<u>, b: Money<u>) : Money<u> = {
   Money { amount: a.amount + b.amount }
 }
 # Use:
@@ -402,8 +407,9 @@ let usd_amount  : Money<USD>    = Money { amount: eur_amount.amount * usd_per_eu
 3. **Type syntax**: `Real<unit-expr>` parses as a dimensioned
    type.
 4. **Declaration syntax**: `unit Foo` and `unit Foo = expr`.
-5. **Generics syntax**: `[u: Unit]` as a kind annotation on type
-   parameters.
+5. **Generics syntax**: `[u: Measure]` as a kind annotation on
+   type parameters. (The keyword was `Unit` before #253; renamed
+   to disambiguate from `Unit` the void return type.)
 
 ### Codegen changes
 

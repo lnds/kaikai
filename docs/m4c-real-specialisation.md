@@ -165,7 +165,7 @@ Each cloned spec's body is now freshly walked via `subst_decl` and
 every `Expr.ty` carrying the source's tparam ids gets replaced by
 the spec's concrete tuple entry. Two consequences:
 
-1. The parametric `impl[u: Unit] Show for Real<u>` body's
+1. The parametric `impl[u: Measure] Show for Real<u>` body's
    `unit_name(x)` and `__strip_unit(x)` now read the substituted
    `x.ty` (concrete `TyDimT(TyReal, USym(...))`), not the impl-level
    `UVar(_)`. The `try_rewrite_show_dim_real` workaround is
@@ -414,7 +414,7 @@ warm caches); the modest RSS bump (~12%) is the per-spec body
 clone cost — Phase 2 shared bodies via structural sharing, Phase 3
 allocates a fresh substituted body per spec. Worth noting that no
 extra spec is generated for `compiler.kai` itself (the source uses
-no `[u: Unit]` impls and no protocol instantiation that the
+no `[u: Measure]` impls and no protocol instantiation that the
 recover walker triggers on); the bump is amortised across user
 programs that exercise the new tuple keying.
 

@@ -20,7 +20,7 @@ its scope.
   constructor (`array_make`) might still be needed.
 - `int_to_string` / `real_to_string` — if `Show.show(x)` is
   ergonomic enough post-Bug-4 (auto-Show in `#{x}`) and Gap-1
-  (`impl[u: Unit] Show for Real<u>`), these become obsolete at
+  (`impl[u: Measure] Show for Real<u>`), these become obsolete at
   user-call sites — still needed inside `impl Show` bodies.
 - `string_to_int` / `string_to_real` — analogous, replaced by
   `Serialize.from_string(s)` in the Serialize protocol once
