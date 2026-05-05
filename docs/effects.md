@@ -179,6 +179,48 @@ fn add(a: Int, b: Int) : Int
 Not `Int / {}`. Kaikai has one form; redundant braces do not
 compile.
 
+### Omitting the return type
+
+The return type is **inferred** when the function body's natural
+type is unambiguous. The most common case is `Unit`:
+
+```kai
+fn greet(name: String) / Stdout = print(name)
+fn greet(name: String) : Unit / Stdout = print(name)   # equivalent
+```
+
+The first form is preferred when the function returns `Unit` —
+it removes the noise from one-line procedures. The typer infers
+`Unit` from the body and only complains if the inferred type
+disagrees with the row.
+
+The **effect row is NOT inferred** at the public-signature level.
+A function that uses any effect must declare the row explicitly:
+
+```kai
+fn greet(name: String) = print(name)            # ERROR: missing / Stdout
+fn greet(name: String) / Stdout = print(name)   # OK
+```
+
+Tier 1 #1 (effects visible in row types) requires every public
+function to expose its effects in the signature. Letting the row
+disappear by inference would defeat the principle. The return
+type, on the other hand, is a transparent local inference — the
+body determines it, the row stays explicit.
+
+This applies uniformly:
+
+| Form                                         | Inference                |
+|----------------------------------------------|--------------------------|
+| `fn f(x: Int) = body`                        | return inferred, no row  |
+| `fn f(x: Int) : T = body`                    | return explicit, no row  |
+| `fn f(x: Int) / E = body`                    | return inferred, row explicit |
+| `fn f(x: Int) : T / E = body`                | both explicit            |
+
+`Unit`-returning functions written as `fn f(x) / E = body` are
+the canonical short form for procedural helpers in stdlib and
+demos.
+
 ### Declaring an effect
 
 ```kai
