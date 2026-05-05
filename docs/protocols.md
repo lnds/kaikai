@@ -303,7 +303,10 @@ Five protocols ship with the m12.8 milestone:
 Stdlib provides default impls for all primitives (`Int`, `Real`,
 `Bool`, `Char`, `String`, `Unit`, `[a]`, `Option[a]`, `Result[e, a]`,
 records auto-derived via #derive, sum types auto-derived). User-defined
-opaque types must `impl` themselves.
+opaque types must `impl` themselves. The parametric containers carry
+`Show` / `Eq` / `Ord` / `Hash` (see `stdlib/protocols.kai`); `Serialize`
+on parametric containers needs return-type-driven dispatch and is
+deferred to a later increment.
 
 Adding a sixth protocol to stdlib in v1 (e.g. `Numeric`, `Monoid`)
 requires a separate proposal — the v1 set is intentionally tight.
