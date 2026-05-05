@@ -41531,10 +41531,11 @@ fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg) : Decl {
 }
 
 fn resolve_protocol_calls_expr(e: Expr, reg: ProtocolReg) : Expr =
-  Expr { kind: resolve_protocol_calls_kind(e.kind, reg, e.line, e.col),
+  Expr { kind: resolve_protocol_calls_kind(e.kind, reg, e.ty, e.line, e.col),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
+                                ret_ty: Option[Ty],
                                 line: Int, col: Int) : ExprKind {
   match k {
     # The only kind that needs special handling: a typed `ECall` whose
@@ -41545,7 +41546,12 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
     ECall(callee, args_) -> {
       let new_args = map(args_, (a) => resolve_protocol_calls_expr(a, reg))
       let new_callee = resolve_protocol_calls_expr(callee, reg)
-      let rewritten = try_rewrite_proto_call(new_callee, new_args, reg)
+      # Issue #180: pass the call's inferred return type so dispatchers
+      # whose only Self informant is the return position (e.g.
+      # `from(x) : Self` against a `let x : T = from(...)` annotation)
+      # can resolve `Self` from that pin.
+      let rewritten = try_rewrite_proto_call_with_ret(new_callee, new_args,
+                                                       reg, ret_ty)
       match rewritten {
         Some(rk) -> rk
         None     -> ECall(new_callee, new_args)
@@ -42125,6 +42131,58 @@ fn validate_inv_clauses(cs: [HClause], file: String, bound: [String],
         let bound1 = inv_param_names(ps, bound)
         let e1 = validate_inv_expr(b, file, bound1, errs)
         validate_inv_clauses(rest, file, bound, e1)
+      }
+    }
+  }
+}
+
+# Issue #180: variant accepting the call's surrounding return type so
+# `from(x) : Self`-style ops can resolve Self via the expected type
+# rather than the (absent) Self argument. Falls back to the legacy
+# arg-driven dispatch when ret_ty is None or Self is informed by args.
+fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
+                                     reg: ProtocolReg,
+                                     ret_ty: Option[Ty]) : Option[ExprKind] {
+  match try_rewrite_proto_call(callee, args_, reg) {
+    Some(rk) -> Some(rk)
+    None -> {
+      # Last-ditch: try the return type as Self.
+      match ret_ty {
+        None -> None
+        Some(ty) -> match ty_head_name(ty) {
+          None -> None
+          Some(self_name) -> match callee.kind {
+            EVar(name) -> {
+              let opname = strip_proto_dispatcher_prefix(name)
+              if not list_has(reg.op_names, opname) { None }
+              else {
+                let pname = match proto_op_lookup(reg, opname) {
+                  Some(po) -> match po { POR(pn, _, _, _, _, _) -> pn }
+                  None -> ""
+                }
+                if pname == "" { None }
+                else {
+                  let arg_names_opt = args_head_names(args_)
+                  match arg_names_opt {
+                    None -> None
+                    Some(arg_names) -> {
+                      match find_impl_with_args(reg.impls, pname, opname,
+                                                  self_name, arg_names) {
+                        None -> None
+                        Some(impl_fn) -> {
+                          let new_callee = mk_expr(EVar(impl_fn),
+                                                    callee.line, callee.col)
+                          Some(ECall(new_callee, args_))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            _ -> None
+          }
+        }
       }
     }
   }
