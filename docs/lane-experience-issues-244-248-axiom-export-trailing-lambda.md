@@ -31,16 +31,25 @@ default `_ -> d` and the axiom decl kept its parser-set `mo = None`.
 DFn(is_pub, name, tparams, params, Some(ret_ty), row, body, l, c, None)
 ```
 
-it always passed `None` for `module_origin`. So the lowered FFI shim emitted
-under the bare `kai_<name>` C symbol while the importer's call site emitted
-`kai_<mod>__<name>` (because the importer side resolves the module and
-qualifies the call). Linker fail.
+it always passed `None` for `module_origin`. The cross-module typer
+rejected the import because the axiom carried no module-origin stamp,
+even though the codegen ultimately emits the bare `kai_<name>` (or even
+just the bare axiom name) for FFI shims regardless.
 
 The fix lowers `DAxiom` *during* tagging (so the produced `DFn` immediately
 carries the module-origin stamp) and adds the same arm to `tag_target_decl`
-with the standard `pub`-only carve-out (a non-`pub` axiom is module-internal
-and stays bare). `lower_axioms` later runs over decls that are already `DFn`,
-so its `DAxiom` arm becomes a no-op for the tagged ones — no duplication.
+with the standard `pub`-only carve-out (a non-`pub` axiom is module-internal).
+`lower_axioms` later runs over decls that are already `DFn`, so its `DAxiom`
+arm becomes a no-op for the tagged ones — no duplication.
+
+**Honesty correction (per #259, retro updated 2026-05-05)**: the C symbol
+emitted for an FFI shim is the **axiom name verbatim**, not the
+`kai_<module>__<name>` qualified form. The fixture
+`examples/effects/ffi_pub_axiom_cross_module/` happens to link only because
+libc exports a literal `abs` symbol; a user-defined shim must match the
+kaikai-side identifier exactly. See #260 for the planned `extern "C" fn`
+syntax migration and #261 for the name-override attribute that decouples
+kaikai identifier from C symbol.
 
 ### #248 — `loop` sugar fails to typecheck under multi-candidate names
 
