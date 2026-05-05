@@ -256,18 +256,41 @@ standalone block expression).
 
 ## 2. Capability read/write: `@cap` and `cap := v`
 
+### Receiver classes
+
+Three receiver shapes accept this sugar today; the desugar dispatches
+on the receiver's type:
+
+| Receiver shape | `@cap` lowers to | `cap := v` lowers to |
+|---|---|---|
+| `State[T]` (an `as`-bound handler capability) | `cap.get()` (resolves to `State.get`) | `cap.set(v)` |
+| `Reader[T]` (an `as`-bound handler capability) | `cap.get()` (alias-rewritten to `Reader.ask`) | rejected — `Reader` has no `set` op |
+| `Ref[T]` (a value of type `Ref[T]`, e.g. a `let` or fn parameter) | `Mutable.ref_get(cap)` | `Mutable.ref_set(cap, v)` |
+
+The first two require an `as`-bound name (rule 4 below). The third —
+added in issue #275 — works on any value typed `Ref[T]` regardless of
+how it was bound, including a function parameter, mirroring the way
+`a[i] := v` auto-injects `Mutable` into the row for arrays (issue
+#265). `Ref[T]` itself comes from `Mutable.ref_make[T](init)` and
+crosses function boundaries, which `var` cannot.
+
 ### Rules
 
 Four restrictions, lifted verbatim from Doc B:
 
-1. `@cap` applies **only to `State[T].get()` and
-   `Reader[T].ask()`**.
-2. `cap := v` applies **only to `State[T].set(v)`**.
+1. `@cap` applies **only to `State[T].get()`,
+   `Reader[T].ask()`, and `Mutable.ref_get(c)` for `c : Ref[T]`**.
+2. `cap := v` applies **only to `State[T].set(v)` and
+   `Mutable.ref_set(c, v)` for `c : Ref[T]`**.
 3. The identifier after `@` must be **a simple capability
    binding** (`@counter`, not `@config.section.level`).
-4. `@` and `:=` require **an `as`-bound capability name**.
-   Using the default capability name (`State` itself) keeps
-   the explicit `State.get()` / `State.set(v)` form.
+4. `@` and `:=` on a `State[T]` / `Reader[T]` capability require
+   **an `as`-bound capability name**. Using the default
+   capability name (`State` itself) keeps the explicit
+   `State.get()` / `State.set(v)` form. (`Ref[T]` has no
+   "default name" — every `Ref[T]` value is bound by an
+   ordinary `let` or parameter, so this rule does not apply
+   to the `Ref` shape.)
 
    Reason for rule 4: without `as`, the default capability's
    identifier is also the effect's name (`State`). Allowing
@@ -293,10 +316,14 @@ the internal types the compiler assigns to `as`-bound
 capabilities of the corresponding effects — they are checker
 implementation details, not names users spell in source code.
 
-- `@x` legal iff `x : StateCap[T]` (for any `T`) or
-  `x : ReaderCap[T]`.
-- `x := v` legal iff `x : StateCap[T]` and `v : T`, **or** the
-  array-indexing form below.
+- `@x` legal iff `x : StateCap[T]` (for any `T`),
+  `x : ReaderCap[T]`, or `x : Ref[T]`.
+- `x := v` legal iff `x : StateCap[T]` and `v : T`, or
+  `x : Ref[T]` and `v : T`, **or** the array-indexing form below.
+
+When `x : Ref[T]`, the call site adds `Mutable` to the enclosing
+function's effect row (issue #275, mirroring the `a[i] := v` /
+`Mutable.array_set` row injection from issue #265).
 
 If `x` does not have a capability type, the error points at
 the sugar site and suggests either the method call
