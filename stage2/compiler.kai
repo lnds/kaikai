@@ -10451,6 +10451,20 @@ fn emit_range_expr(src: String, from: Expr, to: Expr, opt_step: Option[Expr],
 
 # ---- list literal emission ----
 
+# issue #212 — when the spread argument is already wrapped in a
+# `__perceus_dup` (e.g. on a non-last-use read of a list-typed
+# parameter), the dup already incref'd the value. Wrapping that in
+# the structural `kai_incref` of the tail-spread emit double-incref's
+# the cell, blocking `kai_check_unique` on the recursive accumulator
+# spine and leaking +1 reference per iteration.
+fn is_perceus_dup_call(e: Expr) : Bool = match e.kind {
+  ECall(callee, _) -> match callee.kind {
+    EVar(nm) -> nm == "__perceus_dup"
+    _ -> false
+  }
+  _ -> false
+}
+
 fn emit_list_tail(src: String, elems: [ListElem], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match elems {
     [] -> "kai_nil()"
@@ -10461,7 +10475,15 @@ fn emit_list_tail(src: String, elems: [ListElem], lcs: [String], fns: [EFn], var
     # blowup of the `[x, ...acc]` parser prepend pattern.
     [el] -> match el {
       ElPlain(x) -> concat_all(["kai_cons(", emit_expr(src,x, lcs, fns, variants, lams, cls), ", kai_nil())"])
-      ElSpread(x) -> concat_all(["kai_incref(", emit_expr(src, x, lcs, fns, variants, lams, cls), ")"])
+      ElSpread(x) ->
+        # issue #212: if `x` is `__perceus_dup(...)`, the dup already
+        # produces an owned reference; an outer `kai_incref` would
+        # double-bump. Emit the dup's lowering on its own.
+        if is_perceus_dup_call(x) {
+          emit_expr(src, x, lcs, fns, variants, lams, cls)
+        } else {
+          concat_all(["kai_incref(", emit_expr(src, x, lcs, fns, variants, lams, cls), ")"])
+        }
     }
     [el, ...rest] -> match el {
       ElPlain(x) -> concat_all([

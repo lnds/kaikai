@@ -2870,9 +2870,17 @@ test-perceus-issue82-asan: $(TARGET) build
 #                            the standard `kai_record` allocator
 #                            path.
 #   - reuse_variant_basic    same shape, KAI_VARIANT.
+#   - tco_double_incref_repro
+#                            issue #212 — TCO + Perceus dup
+#                            interaction on `[n, ...acc]`. Pre-fix
+#                            the spread tail emit double-incref'd
+#                            the accumulator. Wired here so any
+#                            future regression of the same shape
+#                            lands in tier1 + tier1-asan.
 PERCEUS_ISSUE118_FIXTURES := reuse_cons_basic reuse_alias_aborts \
                               reuse_pass_ordering reuse_record_basic \
-                              reuse_variant_basic
+                              reuse_variant_basic \
+                              tco_double_incref_repro
 
 test-perceus-issue118: $(TARGET) build
 	@set -e; \
