@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.42.0 (2026-05-05)
+
+### Added
+
+- **typer**: polymorphic impl bounded constraints (closes #174)
+
 ## v0.41.0 (2026-05-05)
 
 ### Added
