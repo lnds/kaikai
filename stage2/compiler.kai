@@ -1465,13 +1465,20 @@ type Decl
   # polymorphism. Each ProtoOp carries a parameter list using `Self`
   # as the first-position dispatch type. Defaults are not parsed in
   # the v1 (the parser only accepts bodyless op signatures).
-  | DProtocol(Bool, String, [ProtoOp], Int, Int)
+  # Issue #180: optional [A1, A2, ...] type parameter list bound at
+  # protocol declaration scope (alongside the implicit `Self`). The
+  # impl-table key remains `(P, Self)` — `Ai` resolve at impl-site.
+  | DProtocol(Bool, String, [String], [ProtoOp], Int, Int)
   # m12.8: `impl P for T { fn op(args) = body ... }` — supplies the
   # ops of protocol `pname` for the concrete type `target`. The body
   # decls live as ordinary DFns whose name is the op name (no
   # mangling at parse time; the lower-protocols pass renames them to
   # `__pimpl_<P>_<T>_<op>`).
-  | DImpl(String, TypeExpr, [Decl], Int, Int)
+  # Issue #180: optional [T1, T2, ...] type-arg list (the protocol's
+  # `[A1, ...]` parameters monomorphised at this impl-site). Empty
+  # list means the legacy un-parametrised form `impl P for X`, which
+  # the resolver treats as `impl P[X] for X` (`Ai := Self`).
+  | DImpl(String, [TypeExpr], TypeExpr, [Decl], Int, Int)
   # m12.8: `#derive(P, ...) type T = ...` — opt-in structural impl
   # generator. The lower-protocols pass walks the type body and
   # synthesises one DImpl per derived protocol. The parser keeps the
@@ -7599,15 +7606,29 @@ fn parse_protocol_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
   } else {
     let name = tok_source(p.src, id)
     let p1 = p_advance(p)
-    let p1n = p_skip_newlines(p1)
-    if not p_at(p1n, TkLbrace) {
-      err_d(p_error_here(p1n, "expected `{` to start protocol body"))
-    } else {
-      let p2 = p_skip_newlines(p_advance(p1n))
-      let ops_r = parse_protocol_ops(p2, [])
-      match ops_r.r {
-        None -> err_d(ops_r.p)
-        Some(ops) -> ok_d(ops_r.p, DProtocol(is_pub, name, ops, t.line, t.col))
+    # Issue #180: optional `[A1, A2, ...]` type-parameter list bound at
+    # protocol declaration scope. Reuses the standard tparam parser
+    # (same shape as `effect Reader[T]` and `fn[T]`).
+    let proto_tps_r =
+      if p_at(p1, TkLbracket) {
+        parse_type_params_loop(p_skip_newlines(p_advance(p1)), [])
+      } else {
+        PTParams { p: p1, r: Some([]) }
+      }
+    match proto_tps_r.r {
+      None -> err_d(proto_tps_r.p)
+      Some(proto_tparams) -> {
+        let p1n = p_skip_newlines(proto_tps_r.p)
+        if not p_at(p1n, TkLbrace) {
+          err_d(p_error_here(p1n, "expected `{` to start protocol body"))
+        } else {
+          let p2 = p_skip_newlines(p_advance(p1n))
+          let ops_r = parse_protocol_ops(p2, [])
+          match ops_r.r {
+            None -> err_d(ops_r.p)
+            Some(ops) -> ok_d(ops_r.p, DProtocol(is_pub, name, proto_tparams, ops, t.line, t.col))
+          }
+        }
       }
     }
   }
@@ -7692,26 +7713,42 @@ fn parse_impl_decl(p: Parser, t: Token) : PDecl {
       } else {
         let pname = tok_source(p_after_tps.src, id)
         let p1 = p_advance(p_after_tps)
-        let p1n = p_skip_newlines(p1)
-        if not p_at(p1n, TkFor) {
-          err_d(p_error_here(p1n, "expected `for` after protocol name in `impl`"))
-        } else {
-          let p2 = p_skip_newlines(p_advance(p1n))
-          let target_r = parse_type(p2)
-          match target_r.r {
-            None -> err_d(target_r.p)
-            Some(target_ty) -> {
-              let p3 = p_skip_newlines(target_r.p)
-              if not p_at(p3, TkLbrace) {
-                err_d(p_error_here(p3, "expected `{` to start impl body"))
-              } else {
-                let p4 = p_skip_newlines(p_advance(p3))
-                let methods_r = parse_impl_methods(p4, [])
-                match methods_r.r {
-                  None -> err_d(methods_r.p)
-                  Some(ms) -> {
-                    let ms2 = prepend_impl_tparams_to_methods(impl_tparams, ms)
-                    ok_d(methods_r.p, DImpl(pname, target_ty, ms2, t.line, t.col))
+        # Issue #180: optional `[T1, T2, ...]` after the protocol name
+        # binds the protocol's type-parameters at this impl-site
+        # (`impl Add[Real] for Complex`). Each Ti is a concrete
+        # TypeExpr — polymorphism in `Ai` is out of scope (see #174).
+        let pa_args_r =
+          if p_at(p1, TkLbracket) {
+            parse_impl_proto_args(p_skip_newlines(p_advance(p1)), [])
+          } else {
+            PImplArgs { p: p1, r: Some([]) }
+          }
+        match pa_args_r.r {
+          None -> err_d(pa_args_r.p)
+          Some(proto_args) -> {
+            let p1b = pa_args_r.p
+            let p1n = p_skip_newlines(p1b)
+            if not p_at(p1n, TkFor) {
+              err_d(p_error_here(p1n, "expected `for` after protocol name in `impl`"))
+            } else {
+              let p2 = p_skip_newlines(p_advance(p1n))
+              let target_r = parse_type(p2)
+              match target_r.r {
+                None -> err_d(target_r.p)
+                Some(target_ty) -> {
+                  let p3 = p_skip_newlines(target_r.p)
+                  if not p_at(p3, TkLbrace) {
+                    err_d(p_error_here(p3, "expected `{` to start impl body"))
+                  } else {
+                    let p4 = p_skip_newlines(p_advance(p3))
+                    let methods_r = parse_impl_methods(p4, [])
+                    match methods_r.r {
+                      None -> err_d(methods_r.p)
+                      Some(ms) -> {
+                        let ms2 = prepend_impl_tparams_to_methods(impl_tparams, ms)
+                        ok_d(methods_r.p, DImpl(pname, proto_args, target_ty, ms2, t.line, t.col))
+                      }
+                    }
                   }
                 }
               }
@@ -7738,6 +7775,33 @@ fn prepend_impl_tparams_to_method(impl_tps: [String], d: Decl) : Decl {
     DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
       DFn(pub_, n, list_append(impl_tps, tps), ps, ret, row, body, l, c, mo)
     _ -> d
+  }
+}
+
+type PImplArgs = { p: Parser, r: Option[[TypeExpr]] }
+
+# Issue #180: parse comma-separated TypeExpr list inside `[...]` after
+# the protocol name in `impl P[T1, T2, ...] for U`. Each Ti is a
+# fully-elaborated TypeExpr (including `Money[USD]`, `Real<m>`, etc.).
+fn parse_impl_proto_args(p: Parser, acc: [TypeExpr]) : PImplArgs {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbracket) {
+    PImplArgs { p: p_advance(p0), r: Some(list_reverse(acc)) }
+  } else {
+    let ty_r = parse_type(p0)
+    match ty_r.r {
+      None -> PImplArgs { p: ty_r.p, r: None }
+      Some(ty) -> {
+        let p1 = p_skip_newlines(ty_r.p)
+        if p_at(p1, TkComma) {
+          parse_impl_proto_args(p_advance(p1), [ty, ...acc])
+        } else if p_at(p1, TkRbracket) {
+          PImplArgs { p: p_advance(p1), r: Some(list_reverse([ty, ...acc])) }
+        } else {
+          PImplArgs { p: p_error_here(p1, "expected `,` or `]` in impl protocol arguments"), r: None }
+        }
+      }
+    }
   }
 }
 
@@ -8741,13 +8805,15 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
       tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
       ops |> each((op) => dump_effect_op(op, depth + 1))
     }
-    DProtocol(is_pub, name, ops, line, col) -> {
+    DProtocol(is_pub, name, tparams, ops, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       emit_line(depth, "protocol #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
       ops |> each((op) => dump_proto_op(op, depth + 1))
     }
-    DImpl(pname, target, ms, line, col) -> {
+    DImpl(pname, proto_args, target, ms, line, col) -> {
       emit_line(depth, "impl \"#{pname}\" for @#{int_to_string(line)}:#{int_to_string(col)}")
+      proto_args |> each((pa) => dump_type(pa, depth + 1))
       dump_type(target, depth + 1)
       ms |> each((m) => dump_decl(m, depth + 1))
     }
@@ -9299,8 +9365,8 @@ fn chk_decl(e: Env, d: Decl) : Env {
     # caller that forgot to lower first). Treat as a no-op rather than
     # a fatal error so the selfhost path continues to validate the
     # post-lowering decl stream.
-    DProtocol(_, _, _, _, _) -> e
-    DImpl(_, _, _, _, _) -> e
+    DProtocol(_, _, _, _, _, _) -> e
+    DImpl(_, _, _, _, _, _) -> e
     DDerive(_, _, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit declarations introduce no value bindings
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before chk runs
@@ -9346,8 +9412,8 @@ fn register_one(e: Env, d: Decl) : Env {
     DEffect(_, name, _, _, _, _) -> env_add(e, name)
     # m12.8: stripped pre-resolve; never reaches register_one in
     # practice. No-op for completeness so the match stays exhaustive.
-    DProtocol(_, _, _, _, _) -> e
-    DImpl(_, _, _, _, _) -> e
+    DProtocol(_, _, _, _, _, _) -> e
+    DImpl(_, _, _, _, _, _) -> e
     DDerive(_, _, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit names live in their own namespace, validated at type-resolve time
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before register_one runs
@@ -12276,8 +12342,8 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
     DEffect(_, _, _, _, _, _) -> st          # no expressions to walk
     # m12.8: stripped pre-resolve. No expressions to walk if one
     # somehow survives.
-    DProtocol(_, _, _, _, _) -> st
-    DImpl(_, _, _, _, _) -> st
+    DProtocol(_, _, _, _, _, _) -> st
+    DImpl(_, _, _, _, _, _) -> st
     DDerive(_, _, _, _) -> st
     DUnit(_, _, _, _, _) -> st               # m12.5: no expressions in a unit decl
     DUse(_, _, _) -> st                       # m7e §25: stripped by desugar_use_decls; no expressions
@@ -18276,9 +18342,9 @@ fn use_rewrite_decl(d: Decl, table: [EffOps], file_opens: [String],
       let r = use_rewrite_expr(body, table, file_opens, [], file, errs)
       UseRwDecl { decl: DCheck(desc, ps, r.expr, l, c), errs: r.errs }
     }
-    DImpl(pname, target, ms, l, c) -> {
+    DImpl(pname, proto_args, target, ms, l, c) -> {
       let rms = use_rewrite_decls(ms, table, file_opens, file, errs, [])
-      UseRwDecl { decl: DImpl(pname, target, rms.decls, l, c),
+      UseRwDecl { decl: DImpl(pname, proto_args, target, rms.decls, l, c),
                   errs: rms.errs }
     }
     DDerive(names, inner, l, c) -> {
@@ -18480,9 +18546,9 @@ fn rewrite_nursery_caps_decl(d: Decl, file: String, bw: BrandWalk) : NurseryRwDe
       let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
       NurseryRwDecl { decl: DCheck(desc, ps, r.expr, l, c), bw: r.bw }
     }
-    DImpl(pname, target, ms, l, c) -> {
+    DImpl(pname, proto_args, target, ms, l, c) -> {
       let rms = rewrite_nursery_caps_loop(ms, file, bw, [])
-      NurseryRwDecl { decl: DImpl(pname, target, rms.decls, l, c),
+      NurseryRwDecl { decl: DImpl(pname, proto_args, target, rms.decls, l, c),
                        bw: rms.bw }
     }
     DDerive(names, inner, l, c) -> {
@@ -19162,7 +19228,7 @@ fn check_brand_decl(d: Decl, file: String, calls: [BrandCall],
       check_brand_expr(body, benv_empty(), file, calls, brs, errs)
     DCheck(_, _, body, _, _) ->
       check_brand_expr(body, benv_empty(), file, calls, brs, errs)
-    DImpl(_, _, ms, _, _) ->
+    DImpl(_, _, _, ms, _, _) ->
       check_brand_decls_loop(ms, file, calls, brs, errs)
     DDerive(_, inner, _, _) ->
       check_brand_decl(inner, file, calls, brs, errs)
@@ -20539,11 +20605,11 @@ fn dump_decl_type(d: Decl) : Unit / Console {
       let pub_s = if is_pub { "pub " } else { "" }
       print("#{pub_s}effect #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
-    DProtocol(is_pub, name, _, line, col) -> {
+    DProtocol(is_pub, name, _, _, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       print("#{pub_s}protocol #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
-    DImpl(pname, _, _, line, col) ->
+    DImpl(pname, _, _, _, line, col) ->
       print("impl #{pname} @#{int_to_string(line)}:#{int_to_string(col)}")
     DDerive(_, inner, _, _) -> dump_decl_type(inner)
     DUnit(is_pub, name, alias_opt, line, col) -> {
@@ -23572,7 +23638,14 @@ type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs
                     # consulted alongside `type_aliases` so
                     # `try_op_call` can answer "which component of
                     # this alias declares this op?" in O(n*m).
-                    op_to_eff: [OpToEff] }
+                    op_to_eff: [OpToEff],
+                    # Issue #180: snapshot of the protocol impl table
+                    # at lower-protocols time. `synth_binop` consults
+                    # it to decide whether a (prim, nonprim) /
+                    # (nonprim, prim) / (nonprim, nonprim cross) pair
+                    # has a matching `impl P[A] for T` registered.
+                    # Empty when no protocols are loaded.
+                    proto_impls: [ProtoImplReg] }
 
 type OpEffArity = OEA(String, Int)
 
@@ -23637,28 +23710,36 @@ fn infer_state_new_full_aliases(file: String, env: TyEnv, prelude_len: Int,
                recs: recs, errs: 0, insts: [], holes: [], row: [],
                eff_uses: [], aliases: [], clause_resume: None,
                op_eff_arities: op_eff_arities, ret_ty: None,
-               type_aliases: type_aliases, op_to_eff: op_to_eff }
+               type_aliases: type_aliases, op_to_eff: op_to_eff, proto_impls: [] }
+
+fn st_set_proto_impls(st: InferState, pis: [ProtoImplReg]) : InferState =
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff,
+               proto_impls: pis }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
   InferState { file: st.file, env: new_env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: new_sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
 
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
 
 # m7a #4c / m7b #11i: mark that the current body has performed an op
 # of `eff` with the given type-arg instantiation. Labels with the same
@@ -23674,7 +23755,7 @@ fn st_add_label(st: InferState, lab: Label, line: Int, col: Int) : InferState {
                  eff_uses: [EU(lab.eff, line, col), ...st.eff_uses],
                  aliases: st.aliases,
                  clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                 ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+                 ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
   }
 }
 
@@ -23799,7 +23880,7 @@ fn st_set_row(st: InferState, new_row: [Label]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: new_row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
 
 # m7a #4e: push/pop the alias stack as we enter/leave a handle's body.
 # m7b #15: a freshly-pushed alias starts taggable; descending into a
@@ -23813,7 +23894,7 @@ fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
                row: st.row, eff_uses: st.eff_uses,
                aliases: [AB(alias, eff, true), ...st.aliases],
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
 
 fn st_pop_alias(st: InferState) : InferState {
   match st.aliases {
@@ -23823,7 +23904,7 @@ fn st_pop_alias(st: InferState) : InferState {
                    recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                    row: st.row, eff_uses: st.eff_uses, aliases: rest,
                    clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                   ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+                   ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
   }
 }
 
@@ -23833,7 +23914,7 @@ fn st_set_clause_resume(st: InferState, rb: Option[ResumeBind]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: rb, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
 
 # m7e §13: stash/clear/restore the enclosing function's declared
 # return type for `e!` propagation. Set by `infer_decl` before walking
@@ -23844,7 +23925,7 @@ fn st_set_ret_ty(st: InferState, rt: Option[Ty]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: rt, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+               ret_ty: rt, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
 
 fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
   match aliases {
@@ -23881,21 +23962,21 @@ fn st_disable_alias_tag(st: InferState) : InferState =
                row: st.row, eff_uses: st.eff_uses,
                aliases: aliases_disable_tag(st.aliases),
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
 
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
 
 fn st_push_hole(st: InferState, h: HoleSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes],
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
 
 # m7a #8: lookup the recorded first-use line/col of an effect label.
 # Returns (-1, -1) when the effect was never tracked — that should
@@ -24200,7 +24281,8 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     op_eff_arities: outer.op_eff_arities,
     ret_ty: outer.ret_ty,
     type_aliases: outer.type_aliases,
-    op_to_eff: outer.op_to_eff
+    op_to_eff: outer.op_to_eff,
+    proto_impls: outer.proto_impls
   }
 
 # ---- parameter typing ----
@@ -25954,6 +26036,10 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     let rty_now = apply_ty(rr.st.sub, rr.ty)
     if binop_should_dispatch_proto(lty_now, rty_now) {
       synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+    } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty_now, rty_now) {
+      # Issue #180: heterogeneous prim<->nonprim or cross-nonprim
+      # routing, gated on impl-existence in the snapshot.
+      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
     } else {
       # m12.5: multiplication and division of dimensioned values
       # combine units rather than requiring equality. The operand-type
@@ -25979,6 +26065,9 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     let rty_now = apply_ty(rr.st.sub, rr.ty)
     if binop_should_dispatch_proto(lty_now, rty_now) {
       synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+    } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty_now, rty_now) {
+      # Issue #180: heterogeneous routing.
+      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
     } else {
       # `+` / `-` keep the unify-both-sides rule. The dim-aware unifier
       # checks the unit equality automatically.
@@ -25986,6 +26075,62 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
       let s1 = st_unify(rr.st, rl.ty, rr.ty, what, line, col)
       let ty = apply_ty(s1.sub, rl.ty)
       mk_inferred(s1, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
+    }
+  }
+}
+
+# Issue #180: returns true when (lt, rt) form a heterogeneous pair
+# (prim<->nonprim or two distinct nonprim heads) for which a matching
+# `impl P[A] for T` is registered in `st.proto_impls`. Same-prim pairs
+# (`Int + Int`, `Real + Real`) and same-nonprim pairs already
+# captured by `binop_should_dispatch_proto` are NOT matched here.
+fn binop_dispatch_proto_heterogeneous(st: InferState, op: String,
+                                        lt: Ty, rt: Ty) : Bool {
+  let proto = binop_proto_name(op)
+  if proto == "" { false }
+  else {
+    let l_prim = ty_is_concrete_prim(lt)
+    let r_prim = ty_is_concrete_prim(rt)
+    let l_user = ty_is_concrete_nonprim(lt)
+    let r_user = ty_is_concrete_nonprim(rt)
+    let pair_prim_user = (l_prim and r_user) or (r_prim and l_user)
+    let pair_user_user_diff = l_user and r_user and not ty_same_head(lt, rt)
+    if not (pair_prim_user or pair_user_user_diff) {
+      false
+    } else {
+      match binop_pick_proto_dispatch(st.proto_impls, proto, binop_proto_method(op),
+                                       lt, rt, st.sub) {
+        Some(_) -> true
+        None -> false
+      }
+    }
+  }
+}
+
+fn binop_proto_name(op: String) : String {
+  if op == "+" { "Add" }
+  else if op == "-" { "Sub" }
+  else if op == "*" { "Mul" }
+  else if op == "/" { "Div" }
+  else { "" }
+}
+
+fn ty_is_concrete_prim(t: Ty) : Bool {
+  match t {
+    TyInt -> true
+    TyReal -> true
+    TyDimT(inner, _) -> ty_is_concrete_prim(inner)
+    TyRefineT(inner, _) -> ty_is_concrete_prim(inner)
+    _ -> false
+  }
+}
+
+fn ty_same_head(a: Ty, b: Ty) : Bool {
+  match ty_head_name(a) {
+    None -> false
+    Some(an) -> match ty_head_name(b) {
+      None -> false
+      Some(bn) -> an == bn
     }
   }
 }
@@ -25999,6 +26144,86 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
 # diagnostic — heterogeneous arithmetic is out of scope until #180.
 fn binop_should_dispatch_proto(lt: Ty, rt: Ty) : Bool =
   ty_is_concrete_nonprim(lt) and ty_is_concrete_nonprim(rt)
+
+# Issue #180: heterogeneous-friendly variant. Returns the head type
+# name of the dispatch receiver (`Self`) when an impl matching the
+# (lhs, rhs) pair exists in the post-lower-protocols snapshot, or
+# None when no such impl is registered. The choice between
+# `(receiver=lhs, arg=rhs)` and `(receiver=rhs, arg=lhs)` is
+# stable: the left operand wins iff `impl P[Rhs] for Lhs` is
+# registered; otherwise the mirror `impl P[Lhs] for Rhs` is tried.
+# Returning Some signals "route to __proto_<op>(l, r) and let the
+# resolver pick the impl". Returning None lets the caller fall
+# through to the unify-and-emit primitive arithmetic path (for
+# matching primitive pairs) or the standard mismatch diagnostic
+# (for everything else).
+type BinopProtoChoice = BPC(String, [String])
+#                          recv     proto_args (head names)
+
+fn binop_pick_proto_dispatch(impls: [ProtoImplReg], proto: String, op: String,
+                              lt: Ty, rt: Ty, sub: Subst) : Option[BinopProtoChoice] {
+  let l = apply_ty(sub, lt)
+  let r = apply_ty(sub, rt)
+  let l_name = ty_head_name(l)
+  let r_name = ty_head_name(r)
+  match l_name {
+    None -> None
+    Some(ln) -> match r_name {
+      None -> None
+      Some(rn) -> {
+        # Try (receiver = lhs, arg = rhs) first.
+        if impl_pair_exists(impls, proto, op, ln, [rn]) {
+          Some(BPC(ln, [rn]))
+        # Mirror: (receiver = rhs, arg = lhs).
+        } else if impl_pair_exists(impls, proto, op, rn, [ln]) {
+          Some(BPC(rn, [ln]))
+        } else {
+          None
+        }
+      }
+    }
+  }
+}
+
+fn impl_pair_exists(impls: [ProtoImplReg], proto: String, op: String,
+                     recv: String, args: [String]) : Bool {
+  match impls {
+    [] -> false
+    [it, ...rest] -> match it {
+      PIR(p, t, o, _, ans) ->
+        if p == proto and t == recv and o == op and arg_names_match(ans, recv, args) {
+          true
+        } else {
+          impl_pair_exists(rest, proto, op, recv, args)
+        }
+    }
+  }
+}
+
+# Issue #180: legacy `impl P for X` is registered with arg_names = [].
+# For matching purposes treat it as `impl P[X] for X` (i.e. the
+# homogeneous default). The new heterogeneous form
+# `impl P[Y] for X` registers arg_names = [Y]; matching is exact.
+fn arg_names_match(reg_args: [String], recv: String, want: [String]) : Bool {
+  match reg_args {
+    [] -> match want {
+      [] -> true
+      [w] -> w == recv
+      _ -> false
+    }
+    _ -> string_lists_eq(reg_args, want)
+  }
+}
+
+fn string_lists_eq(a: [String], b: [String]) : Bool {
+  match a {
+    [] -> match b { [] -> true _ -> false }
+    [x, ...xrest] -> match b {
+      [] -> false
+      [y, ...yrest] -> x == y and string_lists_eq(xrest, yrest)
+    }
+  }
+}
 
 fn ty_is_concrete_nonprim(t: Ty) : Bool {
   match t {
@@ -26594,7 +26819,7 @@ fn st_drop_label(st: InferState, eff: String) : InferState {
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: row1, eff_uses: uses1, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
 }
 
 fn drop_labels_named(row: [Label], eff: String) : [Label] {
@@ -28487,6 +28712,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
               op_eff_arities: [OpEffArity],
               type_aliases: [AliasResult], op_to_eff: [OpToEff],
               sums: [SumInfo],
+              proto_impls: [ProtoImplReg],
               d: Decl, verbose: Bool) : TypedDecl {
   match d {
     DFn(is_pub, nm, tparams, ps, opt_ret, row, body, line, col, mo) -> {
@@ -28506,8 +28732,12 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       let implicit = collect_implicit_tparams_in_decl(d, tparams)
       let effective_tparams = list_append(tparams, implicit)
       let tpbinds = mk_tpbinds(effective_tparams)
-      let st_init = infer_state_new_full_aliases(file, env, prelude_len, recs,
+      let st_init0 = infer_state_new_full_aliases(file, env, prelude_len, recs,
                                                     op_eff_arities, type_aliases, op_to_eff)
+      # Issue #180: install the protocol impl table snapshot so
+      # `synth_binop` can decide whether a (prim, nonprim) /
+      # (nonprim, nonprim cross) pair routes to a registered impl.
+      let st_init = st_set_proto_impls(st_init0, proto_impls)
       let st0 = advance_row_fresh(st_init, list_length(rbinds))
       # m7b #13 follow-up (surfaced by m8 #3's typed Spawn wrappers):
       # mk_tpbinds allocates ids 0..n-1 for the fn-level tparams, but
@@ -29081,7 +29311,8 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
                    acc_row_holes: [ResolvedRowHole],
                    type_aliases: [AliasResult],
                    op_to_eff: [OpToEff],
-                   sums: [SumInfo]) : TypedProgram {
+                   sums: [SumInfo],
+                   proto_impls: [ProtoImplReg]) : TypedProgram {
   match ds {
     [] -> TypedProgram {
       decls: list_reverse(acc_decls), errs: acc_errs,
@@ -29091,14 +29322,14 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
     }
     [d, ...rest] -> {
       let r = infer_decl(file, env, prelude_len, recs, op_eff_arities,
-                          type_aliases, op_to_eff, sums, d, verbose)
+                          type_aliases, op_to_eff, sums, proto_impls, d, verbose)
       infer_all_loop(file, env, prelude_len, recs, op_eff_arities, rest, verbose,
                      [r.decl, ...acc_decls],
                      acc_errs + r.errs,
                      llvm_prepend_reverse(r.insts, acc_insts),
                      prepend_reverse_holes(r.holes, acc_holes),
                      prepend_reverse_row_holes(r.row_holes, acc_row_holes),
-                     type_aliases, op_to_eff, sums)
+                     type_aliases, op_to_eff, sums, proto_impls)
     }
   }
 }
@@ -29206,8 +29437,8 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     # m12.8: protocols are stripped by `lower_protocols` before
     # `infer_program` runs, so reaching one here means the unit-alias
     # pass executed on a pre-lowering decl stream — pass through.
-    DProtocol(_, _, _, _, _) -> d
-    DImpl(_, _, _, _, _) -> d
+    DProtocol(_, _, _, _, _, _) -> d
+    DImpl(_, _, _, _, _, _) -> d
     DDerive(_, _, _, _) -> d
     # m7e §25: DUse has no TypeExpr to expand; pass through. The
     # desugar_use_decls pass handles it later.
@@ -29441,7 +29672,14 @@ fn expand_aliases_hreturn(r: HReturn, aliases: [UAliasEntry]) : HReturn {
   }
 }
 
-fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram {
+fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram =
+  infer_program_with_protos(file, decls, verbose, [])
+
+# Issue #180: variant accepting a snapshot of the protocol impl table
+# from `lower_protocols`. `synth_binop` consults it to gate dispatch
+# on impl existence (heterogeneous `Real + Complex` etc.).
+fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
+                               proto_impls: [ProtoImplReg]) : TypedProgram {
   # m12.5: expand `unit Newton = kg * m / sec^2` aliases at the AST
   # level before any pass that calls resolve_ty. After this pass no
   # USym in any TyDim or ELitUnit refers to an alias name.
@@ -29463,7 +29701,7 @@ fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram {
   let sums = collect_sums(decls_a)
   infer_all_loop(file, built.env, built.prelude_len, recs,
                  built.op_eff_arities, decls_a, verbose, [], 0, [], [], [],
-                 alias_res.aliases, op_to_eff, sums)
+                 alias_res.aliases, op_to_eff, sums, proto_impls)
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int {
@@ -31218,8 +31456,8 @@ fn unbox_decl(d: Decl) : Decl {
     DTest(desc, body, ln, cl) -> DTest(desc, unbox_expr(body, []), ln, cl)
     DBench(desc, body, ln, cl) -> DBench(desc, unbox_expr(body, []), ln, cl)
     DCheck(desc, ps, body, ln, cl) -> DCheck(desc, ps, unbox_expr(body, []), ln, cl)
-    DImpl(name, ty, sub_decls, l, c) ->
-      DImpl(name, ty, map(sub_decls, unbox_decl), l, c)
+    DImpl(name, proto_args, ty, sub_decls, l, c) ->
+      DImpl(name, proto_args, ty, map(sub_decls, unbox_decl), l, c)
     DDerive(ps, inner, l, c) -> DDerive(ps, unbox_decl(inner), l, c)
     _ -> d
   }
@@ -38272,7 +38510,7 @@ fn collect_pub_exports(decls: [Decl], acc: [String]) : [String] {
           _ -> [name, ...acc]
         }
         DEffect(true, name, _, _, _, _) -> [name, ...acc]
-        DProtocol(true, name, _, _, _) -> [name, ...acc]
+        DProtocol(true, name, _, _, _, _) -> [name, ...acc]
         DAxiom(true, _, name, _, _, _, _, _, _, _) -> [name, ...acc]
         DUnit(true, name, _, _, _) -> [name, ...acc]
         _ -> acc
@@ -38908,10 +39146,11 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console = ma
     DType(p, n, tps, qualtype_body(body, mt, file), l, c)
   DEffect(p, n, tps, ops, l, c) ->
     DEffect(p, n, tps, qualtype_eops(ops, mt, file), l, c)
-  DProtocol(p, n, ops, l, c) ->
-    DProtocol(p, n, qualtype_pops(ops, mt, file), l, c)
-  DImpl(name, ty, sub_decls, l, c) ->
-    DImpl(name, qualtype_te(ty, mt, file),
+  DProtocol(p, n, tps, ops, l, c) ->
+    DProtocol(p, n, tps, qualtype_pops(ops, mt, file), l, c)
+  DImpl(name, proto_args, ty, sub_decls, l, c) ->
+    DImpl(name, map(proto_args, (te) => qualtype_te(te, mt, file)),
+          qualtype_te(ty, mt, file),
           qualtype_decls(sub_decls, mt, file), l, c)
   DDerive(ps, inner, l, c) ->
     DDerive(ps, qualtype_decl(inner, mt, file), l, c)
@@ -39041,8 +39280,10 @@ fn qtchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
     qtchk_row(row, mt)
   DType(_, _, _, body, _, _) -> qtchk_body(body, mt)
   DEffect(_, _, _, ops, _, _) -> qtchk_eops(ops, mt)
-  DProtocol(_, _, ops, _, _) -> qtchk_pops(ops, mt)
-  DImpl(_, ty, sub_decls, _, _) -> qtchk_te(ty, mt) + qtchk_decls(sub_decls, mt)
+  DProtocol(_, _, _, ops, _, _) -> qtchk_pops(ops, mt)
+  DImpl(_, proto_args, ty, sub_decls, _, _) ->
+    qtchk_te_list(proto_args, mt) +
+    qtchk_te(ty, mt) + qtchk_decls(sub_decls, mt)
   DDerive(_, inner, _, _) -> qtchk_decl(inner, mt)
   DAttribPure(inner, _, _) -> qtchk_decl(inner, mt)
   DAxiom(_, _, _, _, _, ps, ret, row, _, _) ->
@@ -39071,8 +39312,8 @@ fn rqc_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console = match d
     DBench(n, rqc_expr(body, [], mt, file), l, c)
   DCheck(n, ps, body, l, c) ->
     DCheck(n, ps, rqc_expr(body, fn_param_names(ps), mt, file), l, c)
-  DImpl(name, ty, sub_decls, l, c) ->
-    DImpl(name, ty, rqc_decls(sub_decls, mt, file), l, c)
+  DImpl(name, proto_args, ty, sub_decls, l, c) ->
+    DImpl(name, proto_args, ty, rqc_decls(sub_decls, mt, file), l, c)
   DDerive(ps, inner, l, c) ->
     DDerive(ps, rqc_decl(inner, mt, file), l, c)
   # DType / DEffect / DProtocol / DUnit / DAxiom / DUse / DImport
@@ -39523,13 +39764,24 @@ fn strip_import_holes(decls: [Decl], acc: [Decl]) : [Decl] {
 type ProtoOpReg = POR(String, String, [Param], TypeExpr, Int, Int)
 #                     proto    op_name params  ret      line col
 
-type ProtoImplReg = PIR(String, String, String, String)
-#                       proto    type    op_name impl_fn_name
+# Issue #180: ProtoTPReg lets `find_proto_impl_for_args` know whether
+# a protocol declared `[A]` parameters. When empty, only the legacy
+# (Self,Self) homogeneous match is valid — `pow_int(self: Self, exp:
+# Int)`'s second argument is not a proto-arg.
+type ProtoTPReg = PTPR(String, [String])
+#                      proto    tparam names
 
-type ProtocolReg = { ops: [ProtoOpReg], impls: [ProtoImplReg], op_names: [String] }
+type ProtoImplReg = PIR(String, String, String, String, [String])
+#                       proto    type    op_name impl_fn_name [proto_arg_names]
+# Issue #180: proto_arg_names is the list of monomorphised type names
+# for each `Ai` parameter at the impl-site. Empty list means
+# legacy un-parametrised `impl P for X` (treated as `Ai = Self`).
+
+type ProtocolReg = { ops: [ProtoOpReg], impls: [ProtoImplReg],
+                      op_names: [String], tparams: [ProtoTPReg] }
 
 fn proto_reg_empty() : ProtocolReg =
-  ProtocolReg { ops: [], impls: [], op_names: [] }
+  ProtocolReg { ops: [], impls: [], op_names: [], tparams: [] }
 
 # m12.8: the type-mangling used in the impl-fn name. Walks a
 # TypeExpr, collapsing it down to the head TyName (so `Money[u]`,
@@ -39556,6 +39808,34 @@ fn proto_type_name(te: TypeExpr) : String {
 fn proto_mangled_fn(proto: String, type_name: String, op: String) : String =
   concat_all(["__pimpl_", proto, "_", type_name, "_", op])
 
+# Issue #180: heterogeneous-aware mangling. The legacy un-parametrised
+# form `impl Show for Int` (arg_names == []) keeps the original
+# `__pimpl_<P>_<T>_<op>` symbol. The homogeneous parametrised form
+# `impl Add[Complex] for Complex` (arg_names == [type_name]) also keeps
+# it (so it stays interchangeable with the un-parametrised form). Only
+# heterogeneous impls (e.g. `impl Add[Real] for Complex`) get a
+# `__a_<arg_name>...` suffix that disambiguates the dispatch table.
+fn proto_impl_mangled_with_args(proto: String, type_name: String,
+                                  op: String, arg_names: [String]) : String {
+  let needs_suffix = match arg_names {
+    [] -> false
+    [a] -> a != type_name
+    _  -> true
+  }
+  if needs_suffix {
+    concat_all(["__pimpl_", proto, "_", type_name, "_", op,
+                "__a_", arg_names_mangle(arg_names)])
+  } else {
+    proto_mangled_fn(proto, type_name, op)
+  }
+}
+
+fn arg_names_mangle(args: [String]) : String = match args {
+  [] -> ""
+  [a] -> a
+  [a, ...rest] -> concat_all([a, "_", arg_names_mangle(rest)])
+}
+
 # m12.8: kaikai-side name for the *dispatcher* function the lower
 # pass synthesises for each protocol op. Prefixing with `__proto_`
 # keeps the emitted C symbol (`kai___proto_<op>`) clear of runtime
@@ -39570,8 +39850,13 @@ fn collect_proto_decls(ds: [Decl], reg: ProtocolReg) : ProtocolReg {
   match ds {
     [] -> reg
     [d, ...rest] -> match d {
-      DProtocol(_, name, ops, _, _) ->
-        collect_proto_decls(rest, register_proto_ops(reg, name, ops))
+      DProtocol(_, name, tparams, ops, _, _) -> {
+        let reg1 = ProtocolReg {
+          ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
+          tparams: [PTPR(name, tparams), ...reg.tparams]
+        }
+        collect_proto_decls(rest, register_proto_ops(reg1, name, ops))
+      }
       DDerive(_, inner, _, _) -> collect_proto_decls([inner, ...rest], reg)
       _ -> collect_proto_decls(rest, reg)
     }
@@ -39590,7 +39875,8 @@ fn register_proto_ops(reg: ProtocolReg, proto: String, ops: [ProtoOp]) : Protoco
         let reg1 = ProtocolReg {
           ops: [entry, ...reg.ops],
           impls: reg.impls,
-          op_names: names1
+          op_names: names1,
+          tparams: reg.tparams
         }
         register_proto_ops(reg1, proto, rest)
       }
@@ -39619,7 +39905,7 @@ fn collect_proto_names(ds: [Decl], acc: [String]) : [String] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DProtocol(_, name, _, _, _) -> collect_proto_names(rest, [name, ...acc])
+      DProtocol(_, name, _, _, _, _) -> collect_proto_names(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
       _ -> collect_proto_names(rest, acc)
     }
@@ -39660,9 +39946,17 @@ fn validate_impls_loop(ds: [Decl], file: String,
   match ds {
     [] -> errs
     [d, ...rest] -> match d {
-      DImpl(pname, target, _, line, col) -> {
+      DImpl(pname, proto_args, target, _, line, col) -> {
         let tname = proto_type_name(target)
-        let key = concat_all([pname, "/", tname])
+        # Issue #180: duplicate-impl key includes the proto-arg names so
+        # `impl Add[Real] for Complex` and `impl Add[Complex] for Complex`
+        # coexist. Legacy `impl P for T` (proto_args == []) maps to the
+        # homogeneous default `[T]` for keying.
+        let arg_names = match proto_args {
+          [] -> [tname]
+          _  -> map(proto_args, proto_type_name)
+        }
+        let key = concat_all([pname, "/", tname, "[", arg_names_mangle(arg_names), "]"])
         let proto_local = list_has(proto_names, pname)
         let type_local = list_has(local_types, tname) or
                          list_has(proto_builtin_type_names(), tname)
@@ -39709,9 +40003,15 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
   match ds {
     [] -> LowerImplsRes { reg: reg, fns: list_reverse(acc_fns) }
     [d, ...rest] -> match d {
-      DImpl(pname, target, methods, _, _) -> {
+      DImpl(pname, proto_args, target, methods, _, _) -> {
         let tname = proto_type_name(target)
-        let r = lower_impl_methods(pname, tname, methods, reg, acc_fns)
+        # Issue #180: derive the per-impl proto-arg name list. Empty
+        # input list = legacy form, treated as `Ai = Self` (= [tname]).
+        let arg_names = match proto_args {
+          [] -> []
+          _  -> map(proto_args, proto_type_name)
+        }
+        let r = lower_impl_methods(pname, tname, arg_names, methods, reg, acc_fns)
         lower_impls(rest, r.reg, r.fns)
       }
       DDerive(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
@@ -39724,23 +40024,29 @@ type LowerImplsRes = { reg: ProtocolReg, fns: [Decl] }
 
 # `acc_fns` accumulates in reverse; the caller list_reverses on
 # return.
-fn lower_impl_methods(pname: String, tname: String, methods: [Decl],
+fn lower_impl_methods(pname: String, tname: String, arg_names: [String],
+                      methods: [Decl],
                       reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
   match methods {
     [] -> LowerImplsRes { reg: reg, fns: acc_fns }
     [d, ...rest] -> match d {
       DFn(_, op_name, tparams, params, ret, row, body, line, col, mo) -> {
-        let mangled = proto_mangled_fn(pname, tname, op_name)
+        # Issue #180: only the heterogeneous case (Ai != Self) augments
+        # the mangled name. The default-Self form keeps the legacy
+        # mangling so `impl Add for Complex` and `impl Add[Complex] for
+        # Complex` produce the same impl-fn name.
+        let mangled = proto_impl_mangled_with_args(pname, tname, op_name, arg_names)
         let new_fn = DFn(false, mangled, tparams, params, ret, row, body, line, col, mo)
-        let entry = PIR(pname, tname, op_name, mangled)
+        let entry = PIR(pname, tname, op_name, mangled, arg_names)
         let reg1 = ProtocolReg {
           ops: reg.ops,
           impls: [entry, ...reg.impls],
-          op_names: reg.op_names
+          op_names: reg.op_names,
+          tparams: reg.tparams
         }
-        lower_impl_methods(pname, tname, rest, reg1, [new_fn, ...acc_fns])
+        lower_impl_methods(pname, tname, arg_names, rest, reg1, [new_fn, ...acc_fns])
       }
-      _ -> lower_impl_methods(pname, tname, rest, reg, acc_fns)
+      _ -> lower_impl_methods(pname, tname, arg_names, rest, reg, acc_fns)
     }
   }
 }
@@ -39856,7 +40162,7 @@ fn collect_future_impl_keys(ds: [Decl], acc: [String]) : [String] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DImpl(pname, target, _, _, _) ->
+      DImpl(pname, _, target, _, _, _) ->
         collect_future_impl_keys(rest,
           [concat_all([pname, "/", proto_type_name(target)]), ...acc])
       DDerive(names, inner, _, _) -> {
@@ -40012,8 +40318,8 @@ fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DProtocol(_, _, _, _, _) -> strip_protocols_loop(rest, acc)
-      DImpl(_, _, _, _, _)     -> strip_protocols_loop(rest, acc)
+      DProtocol(_, _, _, _, _, _) -> strip_protocols_loop(rest, acc)
+      DImpl(_, _, _, _, _, _)     -> strip_protocols_loop(rest, acc)
       DDerive(_, _, _, _)      -> strip_protocols_loop(rest, acc)
       _ -> strip_protocols_loop(rest, [d, ...acc])
     }
@@ -40615,7 +40921,7 @@ fn make_derived_impl(pname: String, tname: String, opname: String,
                       params: [Param], ret: TypeExpr, body: Expr,
                       line: Int, col: Int) : Decl {
   let method = DFn(false, opname, [], params, Some(ret), REmpty, body, line, col, None)
-  DImpl(pname, mk_ty(TyName(tname, []), line, col), [method], line, col)
+  DImpl(pname, [], mk_ty(TyName(tname, []), line, col), [method], line, col)
 }
 
 # m12.8.z: pre-expansion validation for `#derive(Ord)`. Walks the
@@ -40637,7 +40943,7 @@ fn collect_ord_providers(decls: [Decl], acc: [String]) : [String] {
   match decls {
     [] -> acc
     [d, ...rest] -> match d {
-      DImpl(pname, target, _, _, _) ->
+      DImpl(pname, _, target, _, _, _) ->
         if pname == "Ord" {
           collect_ord_providers(rest, [proto_type_name(target), ...acc])
         } else {
@@ -41240,10 +41546,11 @@ fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg) : Decl {
 }
 
 fn resolve_protocol_calls_expr(e: Expr, reg: ProtocolReg) : Expr =
-  Expr { kind: resolve_protocol_calls_kind(e.kind, reg, e.line, e.col),
+  Expr { kind: resolve_protocol_calls_kind(e.kind, reg, e.ty, e.line, e.col),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
+                                ret_ty: Option[Ty],
                                 line: Int, col: Int) : ExprKind {
   match k {
     # The only kind that needs special handling: a typed `ECall` whose
@@ -41254,7 +41561,12 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
     ECall(callee, args_) -> {
       let new_args = map(args_, (a) => resolve_protocol_calls_expr(a, reg))
       let new_callee = resolve_protocol_calls_expr(callee, reg)
-      let rewritten = try_rewrite_proto_call(new_callee, new_args, reg)
+      # Issue #180: pass the call's inferred return type so dispatchers
+      # whose only Self informant is the return position (e.g.
+      # `from(x) : Self` against a `let x : T = from(...)` annotation)
+      # can resolve `Self` from that pin.
+      let rewritten = try_rewrite_proto_call_with_ret(new_callee, new_args,
+                                                       reg, ret_ty)
       match rewritten {
         Some(rk) -> rk
         None     -> ECall(new_callee, new_args)
@@ -41839,6 +42151,58 @@ fn validate_inv_clauses(cs: [HClause], file: String, bound: [String],
   }
 }
 
+# Issue #180: variant accepting the call's surrounding return type so
+# `from(x) : Self`-style ops can resolve Self via the expected type
+# rather than the (absent) Self argument. Falls back to the legacy
+# arg-driven dispatch when ret_ty is None or Self is informed by args.
+fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
+                                     reg: ProtocolReg,
+                                     ret_ty: Option[Ty]) : Option[ExprKind] {
+  match try_rewrite_proto_call(callee, args_, reg) {
+    Some(rk) -> Some(rk)
+    None -> {
+      # Last-ditch: try the return type as Self.
+      match ret_ty {
+        None -> None
+        Some(ty) -> match ty_head_name(ty) {
+          None -> None
+          Some(self_name) -> match callee.kind {
+            EVar(name) -> {
+              let opname = strip_proto_dispatcher_prefix(name)
+              if not list_has(reg.op_names, opname) { None }
+              else {
+                let pname = match proto_op_lookup(reg, opname) {
+                  Some(po) -> match po { POR(pn, _, _, _, _, _) -> pn }
+                  None -> ""
+                }
+                if pname == "" { None }
+                else {
+                  let arg_names_opt = args_head_names(args_)
+                  match arg_names_opt {
+                    None -> None
+                    Some(arg_names) -> {
+                      match find_impl_with_args(reg.impls, pname, opname,
+                                                  self_name, arg_names) {
+                        None -> None
+                        Some(impl_fn) -> {
+                          let new_callee = mk_expr(EVar(impl_fn),
+                                                    callee.line, callee.col)
+                          Some(ECall(new_callee, args_))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            _ -> None
+          }
+        }
+      }
+    }
+  }
+}
+
 fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
                             reg: ProtocolReg) : Option[ExprKind] {
   match callee.kind {
@@ -41846,17 +42210,27 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
       let opname = strip_proto_dispatcher_prefix(name)
       if not list_has(reg.op_names, opname) { None }
       else {
-        match args_ {
-          [] -> None
-          [self_arg, ...rest_] -> match self_arg.ty {
-            None -> None
-            Some(ty) -> match ty_head_name(ty) {
-              None -> None
-              Some(tname) -> match find_impl(reg, opname, tname) {
-                None -> None
-                Some(impl_fn) -> {
-                  let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
-                  Some(ECall(new_callee, args_))
+        # Issue #180: with heterogeneous P[A] dispatch, the receiver
+        # is no longer always args[0]. We need to consider every
+        # argument as a candidate Self and find the impl whose
+        # arg-name list matches the OTHER arguments.
+        let pop = proto_op_lookup(reg, opname)
+        match pop {
+          None -> None
+          Some(po) -> match po {
+            POR(pname, _, params, ret, _, _) -> {
+              # When Self appears only in the op's return position
+              # (e.g. `from(x: a) : Self`), the args carry no Self
+              # information — defer to the caller-provided ret_ty
+              # (handled by the `_with_ret` wrapper above).
+              if proto_op_self_only_in_return(params, ret) { None }
+              else {
+                match find_proto_impl_for_args(reg, pname, opname, args_) {
+                  None -> None
+                  Some(impl_fn) -> {
+                    let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
+                    Some(ECall(new_callee, args_))
+                  }
                 }
               }
             }
@@ -41865,6 +42239,159 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
       }
     }
     _ -> None
+  }
+}
+
+# Issue #180: returns true when none of the op's parameter types
+# contains `Self`, i.e. Self is only informed by the return type.
+# Such ops can only be dispatched via the surrounding expected type
+# (typed-hole error otherwise).
+fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr) : Bool {
+  not list_any(params, (p) => match p.ptype {
+    Some(te) -> te_mentions_self(te)
+    None -> false
+  })
+}
+
+fn list_any(xs: [Param], f: (Param) -> Bool) : Bool = match xs {
+  [] -> false
+  [x, ...rest] -> if f(x) { true } else { list_any(rest, f) }
+}
+
+fn te_mentions_self(te: TypeExpr) : Bool = te_kind_mentions_self(te.tkind)
+
+fn te_kind_mentions_self(k: TyKind) : Bool {
+  match k {
+    TyName(name, targs) ->
+      if name == "Self" { true }
+      else { te_list_mentions_self(targs) }
+    TyList(inner) -> te_mentions_self(inner)
+    TyFn(ps, r, _) -> te_list_mentions_self(ps) or te_mentions_self(r)
+    TyDim(base, _) -> te_mentions_self(base)
+    TyRefine(base, _) -> te_mentions_self(base)
+  }
+}
+
+fn te_list_mentions_self(tes: [TypeExpr]) : Bool = match tes {
+  [] -> false
+  [t, ...rest] -> if te_mentions_self(t) { true } else { te_list_mentions_self(rest) }
+}
+
+# Issue #180: walk the impl table looking for the impl whose
+# (receiver, [arg names]) matches the typed argument expressions.
+# Pass 1 honours the proto-arg list on the impl entry — this catches
+# both the homogeneous default (arg_names=[] treated as [recv]) AND
+# heterogeneous matches (`impl Add[Real] for Complex`). Pass 2 (only
+# for 2-arg binops) flips the receiver and tries the mirror impl.
+# Beyond two args (single-dispatch ops with multiple non-receiver
+# parameters like `pow_int(self, exp)`), only Pass 1 with
+# `arg_names_match` against [recv] applies — `find_impl_legacy`
+# does that. The legacy `find_impl_for` (no arg-name filter) is
+# kept around for unrelated callers.
+fn find_proto_impl_for_args(reg: ProtocolReg, pname: String, opname: String,
+                             args_: [Expr]) : Option[String] {
+  let names = args_head_names(args_)
+  match names {
+    None -> None
+    Some(ns) -> match ns {
+      [] -> None
+      [a] -> find_impl_homogeneous(reg.impls, pname, opname, a)
+      [a, b] -> {
+        let proto_takes_args = proto_has_tparams(reg.tparams, pname)
+        if not proto_takes_args {
+          # Single-dispatch op whose second parameter is part of the
+          # op shape (`Numeric.pow_int(Self, Int)` etc.). Only the
+          # homogeneous (recv=a) lookup applies; the second arg is
+          # not a proto-arg.
+          find_impl_homogeneous(reg.impls, pname, opname, a)
+        } else {
+          # Pass 1a: heterogeneous (recv=a, proto_args=[b]) — covers
+          #          `impl Add[Real] for Complex` for Complex + Real.
+          # Pass 1b: homogeneous (recv=a) — covers `impl Add for
+          #          Complex` for Complex + Complex.
+          match find_impl_with_args(reg.impls, pname, opname, a, [b]) {
+            Some(fn_name) -> Some(fn_name)
+            None -> {
+              match find_impl_homogeneous(reg.impls, pname, opname, a) {
+                Some(fn_name) ->
+                  if a == b { Some(fn_name) }
+                  else { find_impl_with_args(reg.impls, pname, opname, b, [a]) }
+                None -> find_impl_with_args(reg.impls, pname, opname, b, [a])
+              }
+            }
+          }
+        }
+      }
+      [a, ..._rest] -> find_impl_homogeneous(reg.impls, pname, opname, a)
+    }
+  }
+}
+
+# Find the impl entry whose `arg_names` is empty (legacy default) or
+# is exactly `[recv]` (homogeneous parametrised form). Heterogeneous
+# entries are skipped.
+fn find_impl_homogeneous(impls: [ProtoImplReg], pname: String,
+                          opname: String, recv: String) : Option[String] {
+  match impls {
+    [] -> None
+    [it, ...rest] -> match it {
+      PIR(p, t, o, fn_name, ans) ->
+        if p == pname and t == recv and o == opname and is_homogeneous_args(ans, recv) {
+          Some(fn_name)
+        } else {
+          find_impl_homogeneous(rest, pname, opname, recv)
+        }
+    }
+  }
+}
+
+fn is_homogeneous_args(reg_args: [String], recv: String) : Bool = match reg_args {
+  [] -> true
+  [a] -> a == recv
+  _ -> false
+}
+
+# Issue #180: returns true when the protocol declared one or more
+# `[A]` type parameters. `protocol Add[a]` returns true; `protocol
+# Numeric` returns false.
+fn proto_has_tparams(tps: [ProtoTPReg], pname: String) : Bool = match tps {
+  [] -> false
+  [t, ...rest] -> match t {
+    PTPR(p, params) ->
+      if p == pname {
+        match params { [] -> false _ -> true }
+      } else {
+        proto_has_tparams(rest, pname)
+      }
+  }
+}
+
+fn args_head_names(args_: [Expr]) : Option[[String]] = match args_ {
+  [] -> Some([])
+  [e, ...rest] -> match e.ty {
+    None -> None
+    Some(ty) -> match ty_head_name(ty) {
+      None -> None
+      Some(n) -> match args_head_names(rest) {
+        None -> None
+        Some(ns) -> Some([n, ...ns])
+      }
+    }
+  }
+}
+
+fn find_impl_with_args(impls: [ProtoImplReg], pname: String, opname: String,
+                        recv: String, args: [String]) : Option[String] {
+  match impls {
+    [] -> None
+    [it, ...rest] -> match it {
+      PIR(p, t, o, fn_name, ans) ->
+        if p == pname and t == recv and o == opname and arg_names_match(ans, recv, args) {
+          Some(fn_name)
+        } else {
+          find_impl_with_args(rest, pname, opname, recv, args)
+        }
+    }
   }
 }
 
@@ -41933,7 +42460,7 @@ fn find_impl_for(impls: [ProtoImplReg], pname: String, tname: String,
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, t, op, fn_name) ->
+      PIR(p, t, op, fn_name, _) ->
         if p == pname and t == tname and op == opname { Some(fn_name) }
         else { find_impl_for(rest, pname, tname, opname) }
     }
@@ -42359,8 +42886,8 @@ fn decl_line(d: Decl) : Int {
     DCheck(_, _, _, line, _) -> line
     DImport(_, line, _) -> line
     DEffect(_, _, _, _, line, _) -> line
-    DProtocol(_, _, _, line, _) -> line
-    DImpl(_, _, _, line, _) -> line
+    DProtocol(_, _, _, _, line, _) -> line
+    DImpl(_, _, _, _, line, _) -> line
     DDerive(_, _, line, _) -> line
     DAttribPure(_, line, _) -> line
     DUnit(_, _, _, line, _) -> line
@@ -42401,8 +42928,8 @@ fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
       fmt_decl(inner, s2)
     }
     DEffect(_, _, _, _, line, _) -> fmt_panic_unsupported("effect declarations", line)
-    DProtocol(_, _, _, line, _) -> fmt_panic_unsupported("protocol declarations", line)
-    DImpl(_, _, _, line, _) -> fmt_panic_unsupported("impl blocks", line)
+    DProtocol(_, _, _, _, line, _) -> fmt_panic_unsupported("protocol declarations", line)
+    DImpl(_, _, _, _, line, _) -> fmt_panic_unsupported("impl blocks", line)
     DDerive(_, _, line, _) -> fmt_panic_unsupported("#derive annotation", line)
     DUnit(_, _, _, line, _) -> fmt_panic_unsupported("unit declarations", line)
     DUse(_, line, _) -> fmt_panic_unsupported("file-level `use`", line)
@@ -44779,7 +45306,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk }
                 else {
-                  let typed_prog0 = infer_program(path, all_decls, false)
+                  let typed_prog0 = infer_program_with_protos(path, all_decls, false, lowered.reg.impls)
                   # m12.8: post-inference protocol-call rewrite.
                   # `Expr.ty` is populated for every node now, so each
                   # `op(x, ...)` call can be redirected to the matching

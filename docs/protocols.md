@@ -157,9 +157,14 @@ imported. No global registry.
   compile times stay flat.
 
 - **No higher-kinded types**: `protocol Functor[F[_]]` does not parse.
-  Type parameters of protocols are first-order (`protocol P[T]`), and
-  the only way `Self` is parametric is when the impl target is
-  parametric (`impl Show for Money[u: Measure]`).
+  Type parameters of protocols are first-order (`protocol P[a]`,
+  lowercase per kaikai's tparam convention), and the only way `Self`
+  is parametric is when the impl target is parametric (`impl Show for
+  Money[u: Measure]`). Issue #180 implements `protocol P[a]` for
+  single-dispatch parametrized protocols — the impl table key remains
+  `(P, Self)`, so adding `[a]` does NOT introduce multi-method
+  dispatch (see §*Single-dispatch parametrized protocols (#180)*
+  below).
 
 - **No multi-method dispatch**: dispatch always uses `Self` (the
   first-position type). For two-arg dispatch (e.g. `convert(from:
@@ -836,3 +841,83 @@ milestone with a fresh worktree.
 Cost: 2-3 days. Lower-bound for serious value: stdlib's 5 protocols
 ship with primitive impls, `#derive` works, demos can use `#{...}`
 freely.
+
+## Single-dispatch parametrized protocols (#180)
+
+Issue #180 lands `protocol P[a]` — a protocol declares one or more
+type parameters (alongside the implicit `Self`) bound at impl-site:
+
+```kai
+protocol From[a] {
+  from(x: a) : Self
+}
+
+impl From[Money[USD]] for Money[EUR] {
+  fn from(m: Money[USD]) : Money[EUR] = ...
+}
+```
+
+Surface contract:
+
+- **Tparam names**: lowercase (`a`, `other`, `ctx`, …). Uppercase
+  forms (`A`, `Other`) are valid syntax but are rejected later by
+  the implicit-tparam classifier — keep to lowercase.
+- **Impl-site arguments are concrete**. Polymorphism in `a`
+  (`impl[T] From[T] for X`) is out of scope for v1; that requires
+  #174 work and is deferred.
+- **Default-Self backwards compat**. Legacy `impl P for X` parses
+  unchanged and is treated as `impl P[X] for X` (the homogeneous
+  case). Existing primitive impls do NOT need migration.
+- **Dispatch table key stays `(P, Self)`**. The proto-arg list lives
+  inside the impl's mangled C name (`__pimpl_<P>_<T>_<op>__a_<arg>`)
+  so multiple `impl P[A] for T` instances with different `A` coexist
+  in the same compilation unit.
+
+### Bidirectional inference
+
+When `Self` does not appear in any of an op's parameter types
+(`from(x: a) : Self`), the call site has no Self informant in its
+argument list. The compiler resolves Self from the surrounding
+**expected type** — typically a let-binding annotation:
+
+```kai
+let eur : Money[EUR] = from(my_usd)   # OK: Self pinned to Money[EUR]
+let eur = from(my_usd)                # error: no impl of From for Money[USD]
+```
+
+The unification step in `synth_stmt SLet` already pins the call's
+return type when an annotation is present; the post-inference
+rewrite (`try_rewrite_proto_call_with_ret`) then reads that pinned
+type and dispatches accordingly. Function return positions and
+explicit type ascriptions on sub-expressions provide the same hook
+in their respective phases (today's implementation only honours
+let-binding annotations; broader bidirectional inference is a
+follow-up).
+
+### Heterogeneous arithmetic
+
+`Add[a] for X` lets `synth_binop` route across types:
+
+```kai
+impl Add[Real]    for Complex { ... }
+impl Add[Complex] for Real    { ... }
+
+let z = 2.0 + 3.0i              # Real + Complex
+let w = complex.mk(0.0, 3.0) + 2.0   # Complex + Real
+```
+
+`synth_binop` consults a snapshot of the post-`lower_protocols` impl
+table (carried in `InferState.proto_impls`) and routes to
+`__proto_<op>` whenever a (lhs, rhs) pair has a registered impl
+(homogeneous, prim/nonprim, or two distinct nonprim heads). When no
+impl exists the binop falls through to the standard mismatch
+diagnostic.
+
+### Out of scope (v1)
+
+- Polymorphic impl in `a` (`impl[T] From[T] for X`) — issue #174.
+- Multi-method dispatch (`(P, T1, T2, ...) -> fn`) — Tier 1 #3 commit.
+- `#derive` synthesis for parametrised protocols — follow-up.
+- Bidirectional inference beyond let-binding annotations (function
+  return type, explicit type ascriptions on sub-expressions) —
+  follow-up.
