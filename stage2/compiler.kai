@@ -7699,7 +7699,11 @@ fn parse_protocol_ops(p: Parser, acc: [ProtoOp]) : PProtoOps {
 fn parse_impl_decl(p: Parser, t: Token) : PDecl {
   let imp_tps_r =
     if p_at(p, TkLbracket) {
-      parse_type_params_loop(p_skip_newlines(p_advance(p)), [])
+      # Issue #174: impl-site tparams accept protocol bounds
+      # (`[T : Show + Eq, U]`) in addition to the legacy `Measure`
+      # kind annotation. Bounds are encoded as `T#b:Show,Eq` in the
+      # stored tparam string; see `tp_bounds_of` / `tp_strip_bounds`.
+      parse_impl_type_params_loop(p_skip_newlines(p_advance(p)), [])
     } else {
       PTParams { p: p, r: Some([]) }
     }
@@ -7766,7 +7770,16 @@ fn parse_impl_decl(p: Parser, t: Token) : PDecl {
 fn prepend_impl_tparams_to_methods(impl_tps: [String], ms: [Decl]) : [Decl] {
   match impl_tps {
     [] -> ms
-    _  -> map(ms, (d) => prepend_impl_tparams_to_method(impl_tps, d))
+    _  -> {
+      # Issue #174: tparams may carry bound suffixes (`T#b:Show`).
+      # Strip them before injecting into the method's tparam list so
+      # the rest of the pipeline (which uses these strings as plain
+      # ident keys) sees only `T`. Bounds inform compile-time
+      # diagnostics through a separate mechanism — they do not
+      # change the method's typing.
+      let stripped = map(impl_tps, tp_strip_bounds)
+      map(ms, (d) => prepend_impl_tparams_to_method(stripped, d))
+    }
   }
 }
 
@@ -7929,6 +7942,175 @@ fn parse_type_params_loop(p: Parser, acc: [String]) : PTParams {
       PTParams { p: p_advance(p2), r: Some(list_reverse([stored, ...acc])) }
     } else {
       PTParams { p: p_error_here(p2, "expected `,` or `]` after type parameter"), r: None }
+    }
+  }
+}
+
+# Issue #174: impl-site variant of parse_type_params_loop. Accepts the
+# same `Measure` kind annotation as before AND, additionally, a list
+# of uppercase protocol-name bounds: `T : Show`, `T : Show + Eq`. The
+# bound list is encoded as a `#b:Name1,Name2` suffix in the stored
+# tparam string. The `#` is collision-free against kaikai identifiers
+# (lexer rejects `#` inside ident).
+fn parse_impl_type_params_loop(p: Parser, acc: [String]) : PTParams {
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) {
+    PTParams { p: p_error(p, t, "expected type parameter name"), r: None }
+  } else {
+    let raw_name = tok_source(p.src, t)
+    let p1 = p_skip_newlines(p_advance(p))
+    let kbr = parse_optional_kind_or_bounds(p1)
+    let stored = tp_make_with_bounds(raw_name, kbr.kind, kbr.bounds)
+    let p2 = p_skip_newlines(kbr.p)
+    if p_at(p2, TkComma) {
+      parse_impl_type_params_loop(p_skip_newlines(p_advance(p2)), [stored, ...acc])
+    } else if p_at(p2, TkRbracket) {
+      PTParams { p: p_advance(p2), r: Some(list_reverse([stored, ...acc])) }
+    } else {
+      PTParams { p: p_error_here(p2, "expected `,` or `]` after type parameter"), r: None }
+    }
+  }
+}
+
+# Issue #174: impl-site colon-suffix parser. Distinguishes:
+#   `: Measure`              → kind annotation (legacy)
+#   `: Type`                 → kind annotation (legacy, no-op default)
+#   `: Show`                 → bound list `[Show]`
+#   `: Show + Eq + Ord`      → multi-bound list
+# Mixing kinds and bounds is rejected: `: Measure + Show` makes no
+# sense since `Measure` is a kind, not a protocol.
+type PKindBounds = { p: Parser, kind: Kind, bounds: [String] }
+
+fn parse_optional_kind_or_bounds(p: Parser) : PKindBounds {
+  if p_at(p, TkColon) {
+    let p1 = p_skip_newlines(p_advance(p))
+    let t = p_peek(p1)
+    if not tk_is(t.kind, TkIdent) {
+      PKindBounds { p: p_error_here(p1, "expected protocol name, `Type`, or `Measure` after `:` in type parameter"),
+                    kind: KType, bounds: [] }
+    } else {
+      let kw = tok_source(p1.src, t)
+      let p2 = p_advance(p1)
+      if kw == "Measure" { PKindBounds { p: p2, kind: KUnit, bounds: [] } }
+      else if kw == "Type" { PKindBounds { p: p2, kind: KType, bounds: [] } }
+      else if kw == "Unit" {
+        PKindBounds { p: p_error(p1, t, "expected kind `Measure`; `Unit` is the void return type, not a kind (renamed in #253)"),
+                      kind: KType, bounds: [] }
+      } else if is_upper_ident(p1.src, t) {
+        # First bound — accumulate further `+ Bound` entries.
+        parse_more_bounds_loop(p2, [kw])
+      } else {
+        PKindBounds { p: p_error(p1, t, "type-parameter annotation must be `Type`, `Measure`, or an uppercase protocol name"),
+                      kind: KType, bounds: [] }
+      }
+    }
+  } else {
+    PKindBounds { p: p, kind: KType, bounds: [] }
+  }
+}
+
+fn parse_more_bounds_loop(p: Parser, acc: [String]) : PKindBounds {
+  let p_n = p_skip_newlines(p)
+  if p_at(p_n, TkPlus) {
+    let p1 = p_skip_newlines(p_advance(p_n))
+    let t = p_peek(p1)
+    if not tk_is(t.kind, TkIdent) or not is_upper_ident(p1.src, t) {
+      PKindBounds { p: p_error_here(p1, "expected uppercase protocol name after `+` in bound list"),
+                    kind: KType, bounds: list_reverse(acc) }
+    } else {
+      let nm = tok_source(p1.src, t)
+      parse_more_bounds_loop(p_advance(p1), [nm, ...acc])
+    }
+  } else {
+    PKindBounds { p: p, kind: KType, bounds: list_reverse(acc) }
+  }
+}
+
+# Issue #174: encode a tparam name plus optional protocol bound list
+# into the legacy `String` slot. Format:
+#   "T"               (no kind, no bounds)
+#   "T#Unit"          (kind = Measure, no bounds)
+#   "T#b:Show"        (no kind, single bound)
+#   "T#b:Show,Eq"     (no kind, multi-bound)
+# Kind and bounds never coexist (parser rejects the combo), so a
+# tparam string contains at most one of `#Unit` or `#b:...`.
+fn tp_make_with_bounds(name: String, k: Kind, bounds: [String]) : String {
+  let with_kind = tp_make(name, k)
+  match bounds {
+    [] -> with_kind
+    _  -> concat_all([with_kind, "#b:", tp_bounds_join(bounds)])
+  }
+}
+
+fn tp_bounds_join(bs: [String]) : String = match bs {
+  [] -> ""
+  [b] -> b
+  [b, ...rest] -> concat_all([b, ",", tp_bounds_join(rest)])
+}
+
+# Decoder helpers — used by lower_protocols / monomorpher to walk an
+# impl's tparam list and extract bounds.
+fn tp_bounds_marker_index(s: String) : Int =
+  tp_bounds_marker_loop(s, 0, string_length(s))
+
+fn tp_bounds_marker_loop(s: String, i: Int, n: Int) : Int {
+  if i + 3 > n { -1 }
+  else {
+    match char_at(s, i) {
+      Some(c0) -> if c0 == '#' {
+        match char_at(s, i + 1) {
+          Some(c1) -> if c1 == 'b' {
+            match char_at(s, i + 2) {
+              Some(c2) -> if c2 == ':' { i }
+                          else { tp_bounds_marker_loop(s, i + 1, n) }
+              None -> -1
+            }
+          } else { tp_bounds_marker_loop(s, i + 1, n) }
+          None -> -1
+        }
+      } else { tp_bounds_marker_loop(s, i + 1, n) }
+      None -> -1
+    }
+  }
+}
+
+fn tp_has_bounds(stored: String) : Bool = tp_bounds_marker_index(stored) >= 0
+
+fn tp_strip_bounds(stored: String) : String {
+  let i = tp_bounds_marker_index(stored)
+  if i < 0 { stored } else { string_slice(stored, 0, i) }
+}
+
+fn tp_bounds_of(stored: String) : [String] {
+  let i = tp_bounds_marker_index(stored)
+  if i < 0 { [] }
+  else {
+    let start = i + 3
+    let suf = string_slice(stored, start, string_length(stored) - start)
+    split_csv(suf, [])
+  }
+}
+
+fn split_csv_index(s: String, i: Int, n: Int) : Int {
+  if i >= n { -1 }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == ',' { i } else { split_csv_index(s, i + 1, n) }
+      None -> -1
+    }
+  }
+}
+
+fn split_csv(s: String, acc: [String]) : [String] {
+  let n = string_length(s)
+  if n == 0 { list_reverse(acc) }
+  else {
+    let i = split_csv_index(s, 0, n)
+    if i < 0 { list_reverse([s, ...acc]) }
+    else {
+      let head = string_slice(s, 0, i)
+      let rest = string_slice(s, i + 1, n - i - 1)
+      split_csv(rest, [head, ...acc])
     }
   }
 }
@@ -30414,7 +30596,7 @@ fn sum_count_tyvar_clauses(cs: [HClause], atv: [Int], auv: [Int]) : Int {
 
 type MonoOutput = MonoOut([Decl], [MLeakRecord])
 
-fn monomorphise(tp: TypedProgram) : MonoOutput {
+fn monomorphise(tp: TypedProgram, reg: ProtocolReg) : MonoOutput {
   let polys = collect_poly_fns(tp.decls)
   # `resolve_protocol_calls` renames `__proto_<op>(arg)` call sites
   # to `__pimpl_<P>_<T>_<op>(arg)` AFTER `infer_program` has populated
@@ -30438,7 +30620,7 @@ fn monomorphise(tp: TypedProgram) : MonoOutput {
   # which now mangles to `g__mono__Int`); those new tuples enter
   # the worklist and produce additional specs. Each spec also
   # accumulates a per-spec leak record (m4c Phase 3 invariant).
-  let r = generate_specs_iter(polys, initial_tuples, tp.insts, [], initial_tuples, [])
+  let r = generate_specs_iter(polys, initial_tuples, tp.insts, [], initial_tuples, [], reg)
   match r {
     GenSpecsOut(specs, _, leaks) -> MonoOut(list_append(rewritten, specs), leaks)
   }
@@ -30917,11 +31099,20 @@ fn subst_decl(d: Decl, sm: SubstMap) : Decl {
 type SpecEmitOut = SEO(Decl, [MonoTuple], [MLeakRecord])
 
 fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
-              all_tuples: [MonoTuple]) : SpecEmitOut {
+              all_tuples: [MonoTuple], reg: ProtocolReg) : SpecEmitOut {
   match mt { MT(_, tys, units) -> {
     let sm = build_subst_map(d, tys, units)
     let spec0 = specialise_decl(d, tys, units)
-    let spec1 = subst_decl(spec0, sm)
+    let spec1a = subst_decl(spec0, sm)
+    # Issue #174: post-subst, the spec body's `Expr.ty` annotations
+    # are now concrete (TyVar `T` substituted to e.g. `Int`).
+    # Re-run the protocol-call resolver so any `__proto_<op>(x)` call
+    # inside the spec body retargets to the matching
+    # `__pimpl_<P>_<concrete>_<op>` direct call. Without this step
+    # polymorphic impls that recurse on the type parameter (e.g.
+    # `impl[T: Show] Show for [T]` calling `show(x: T)` per element)
+    # leave the renamed dispatcher in place and panic at runtime.
+    let spec1 = resolve_protocol_calls_decl(spec1a, reg)
     # Discover transitive tuples introduced by body subst: for each
     # ECall(EVar(name)) inside the spec body, look up the original
     # CS, apply sm, and collect concrete poly tuples not yet known.
@@ -31295,20 +31486,21 @@ fn resolve_call_inst(insts: [ResolvedCS], polys: [PolyFn], name: String,
 fn generate_specs_iter(polys: [PolyFn], worklist: [MonoTuple],
                         insts: [ResolvedCS], specs_acc: [Decl],
                         all_tuples: [MonoTuple],
-                        leaks_acc: [MLeakRecord]) : GenSpecsResult {
+                        leaks_acc: [MLeakRecord],
+                        reg: ProtocolReg) : GenSpecsResult {
   match worklist {
     [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples, list_reverse(leaks_acc))
     [t, ...rest] -> match lookup_poly_fn(polys, mt_name(t)) {
-      None -> generate_specs_iter(polys, rest, insts, specs_acc, all_tuples, leaks_acc)
+      None -> generate_specs_iter(polys, rest, insts, specs_acc, all_tuples, leaks_acc, reg)
       Some(d) -> {
-        let r = emit_spec(d, t, insts, polys, all_tuples)
+        let r = emit_spec(d, t, insts, polys, all_tuples, reg)
         match r {
           SEO(spec, new_ts, new_leaks) -> {
             let next_worklist = list_append(rest, new_ts)
             let next_all = list_append(all_tuples, new_ts)
             let next_leaks = prepend_leaks(new_leaks, leaks_acc)
             generate_specs_iter(polys, next_worklist, insts,
-                                 [spec, ...specs_acc], next_all, next_leaks)
+                                 [spec, ...specs_acc], next_all, next_leaks, reg)
           }
         }
       }
@@ -45350,7 +45542,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       # full plan. Phase 3 adds body type / unit
                       # substitution per spec, which retires the
                       # `try_rewrite_show_dim_real` workaround.
-                      let mono_out = monomorphise(typed_prog)
+                      let mono_out = monomorphise(typed_prog, proto_reg)
                       let mono_decls = match mono_out { MonoOut(ds, _) -> ds }
                       # m4c Phase 3 invariant: per-spec leak records
                       # carry only TyVarT/UVar ids in the spec's
@@ -45360,6 +45552,20 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       # ids fall outside the domain are skipped.
                       let mono_leaks = match mono_out { MonoOut(_, ls) -> ls }
                       let mono_inv_errs = report_mono_leaks(path, mono_leaks)
+                      # Issue #174: post-mono protocol-dispatch
+                      # validation. After monomorphisation each
+                      # specialised body has concrete `Expr.ty`
+                      # annotations and the per-spec call-rewrite has
+                      # retargeted what it could to `__pimpl_*`
+                      # entries. Anything that survives as
+                      # `__proto_<op>(x : ConcreteT)` reflects a
+                      # polymorphic impl whose body recurses on a
+                      # type parameter that lacks a corresponding
+                      # impl for the concrete instantiation. Report
+                      # it as a compile-time error instead of letting
+                      # the dispatcher panic at runtime.
+                      let mono_dispatch_errs =
+                        validate_resolved_decls(mono_decls, proto_reg, path, 0)
                       # Tier 2.5 — unbox analysis (M2: no-op identity).
                       # Runs between monomorphisation and perceus so
                       # the perceus pass sees post-unbox modes (it
@@ -45396,6 +45602,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       # m5 #2-#4 fill in last-use analysis + dup/drop.
                       let perceus_decls = perceus_pass(pre_perceus_decls)
                       if mono_inv_errs != 0 { mono_inv_errs }
+                      else if mono_dispatch_errs != 0 { mono_dispatch_errs }
                       else {
                         let out = if use_llvm {
                           emit_program_llvm(path, src, perceus_decls, test_mode, bench_mode, check_mode)
