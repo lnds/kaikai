@@ -1433,6 +1433,91 @@ static void kai_nullary_install(int32_t tag, const char *name, KaiValue *v) {
      * this branch is unreachable in practice. */
 }
 
+/* Issue #293 next-tier — variants whose every arg is itself an
+ * immortal singleton (rc==INT32_MAX) are themselves morally
+ * immortal: they can never be mutated and have no observable
+ * identity. Cache them just like nullary variants. The dominant
+ * win is `Some(<immortal>)` and `Ok(<immortal>)`, which the
+ * compiler builds by the millions when threading typer/parser
+ * results that are themselves nullary variants or cached scalars.
+ *
+ * Storage — open-addressed table keyed on (tag, name, n, args[0..n]).
+ * Capped at n <= 4 to bound the key size. 16384 buckets gives
+ * ample room for the realistic combination space (Some/Ok/Err
+ * × ~tens of payload singletons). Collisions degrade to a fresh
+ * non-cached alloc — same behaviour as a full nullary table.
+ */
+#define KAI_IMMORTAL_VAR_BUCKETS 16384
+#define KAI_IMMORTAL_VAR_MAXN 4
+typedef struct {
+    int32_t       tag;
+    int           n;
+    const char   *name;     /* NULL ⇒ empty bucket */
+    KaiValue     *args[KAI_IMMORTAL_VAR_MAXN];
+    KaiValue     *value;
+} KaiImmortalVarBucket;
+static KaiImmortalVarBucket
+    kai_immortal_vars[KAI_IMMORTAL_VAR_BUCKETS];
+
+static inline size_t kai_immortal_var_hash(int32_t tag, const char *name,
+                                           int n, KaiValue **args) {
+    uintptr_t h = (uintptr_t) name;
+    h = (h * 1315423911u) ^ ((uintptr_t) tag);
+    h = (h * 1315423911u) ^ (uintptr_t) n;
+    for (int i = 0; i < n; i++) {
+        h = (h * 1315423911u) ^ (uintptr_t) args[i];
+    }
+    h ^= h >> 13;
+    return (size_t) (h & (KAI_IMMORTAL_VAR_BUCKETS - 1));
+}
+
+static int kai_immortal_var_match(KaiImmortalVarBucket *b, int32_t tag,
+                                  const char *name, int n, KaiValue **args) {
+    if (b->name != name || b->tag != tag || b->n != n) return 0;
+    for (int i = 0; i < n; i++) {
+        if (b->args[i] != args[i]) return 0;
+    }
+    return 1;
+}
+
+static KaiValue *kai_immortal_var_lookup(int32_t tag, const char *name,
+                                         int n, KaiValue **args) {
+    size_t i = kai_immortal_var_hash(tag, name, n, args);
+    for (size_t probe = 0; probe < KAI_IMMORTAL_VAR_BUCKETS; probe++) {
+        KaiImmortalVarBucket *b = &kai_immortal_vars[i];
+        if (b->name == NULL) return NULL;
+        if (kai_immortal_var_match(b, tag, name, n, args)) return b->value;
+        i = (i + 1) & (KAI_IMMORTAL_VAR_BUCKETS - 1);
+    }
+    return NULL;
+}
+
+static void kai_immortal_var_install(int32_t tag, const char *name, int n,
+                                     KaiValue **args, KaiValue *v) {
+    size_t i = kai_immortal_var_hash(tag, name, n, args);
+    for (size_t probe = 0; probe < KAI_IMMORTAL_VAR_BUCKETS; probe++) {
+        KaiImmortalVarBucket *b = &kai_immortal_vars[i];
+        if (b->name == NULL) {
+            b->tag = tag;
+            b->name = name;
+            b->n = n;
+            for (int j = 0; j < n; j++) b->args[j] = args[j];
+            b->value = v;
+            return;
+        }
+        i = (i + 1) & (KAI_IMMORTAL_VAR_BUCKETS - 1);
+    }
+    /* Table full — fall back to non-cached behaviour. */
+}
+
+static int kai_args_all_immortal(int n, KaiValue **args) {
+    if (n <= 0 || n > KAI_IMMORTAL_VAR_MAXN) return 0;
+    for (int i = 0; i < n; i++) {
+        if (args[i] == NULL || args[i]->rc != INT32_MAX) return 0;
+    }
+    return 1;
+}
+
 static KAI_RC_NOINLINE KaiValue *kai_variant(int32_t tag, const char *name, int n, KaiValue **args) {
     if (n == 0 && name != NULL) {
         KaiValue *cached = kai_nullary_lookup(tag, name);
@@ -1444,6 +1529,19 @@ static KAI_RC_NOINLINE KaiValue *kai_variant(int32_t tag, const char *name, int 
         v->as.var.args = NULL;
         v->rc = INT32_MAX;
         kai_nullary_install(tag, name, v);
+        return v;
+    }
+    if (name != NULL && kai_args_all_immortal(n, args)) {
+        KaiValue *cached = kai_immortal_var_lookup(tag, name, n, args);
+        if (cached) return cached;
+        KaiValue *v = kai_alloc(KAI_VARIANT);
+        v->as.var.variant_tag = tag;
+        v->as.var.variant_name = name;
+        v->as.var.n_args = n;
+        v->as.var.args = (KaiValue **) malloc(n * sizeof(KaiValue *));
+        for (int i = 0; i < n; ++i) v->as.var.args[i] = args[i];
+        v->rc = INT32_MAX;
+        kai_immortal_var_install(tag, name, n, args, v);
         return v;
     }
     KaiValue *v = kai_alloc(KAI_VARIANT);
