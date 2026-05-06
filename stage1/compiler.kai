@@ -4410,8 +4410,17 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
     EPlaceholder -> "kai_unit() /* placeholder */"
     ECall(f, args_e) -> emit_call_expr(src, f, args_e, fns, variants, lams, locals)
     EField(base, fname) -> {
+      # #293 Phase 1.2 — record field access RC discipline.
+      # `base` is owned by the time it lands here: perceus_pass wraps
+      # non-last reads of in-scope EVar in __perceus_dup, single-use
+      # reads transfer their ref, and ctor/call expressions return
+      # rc=1. `kai_op_field` increfs the field on read, so the base
+      # is no longer reachable through the result. Drop it to balance.
       let b = emit_expr(src, base, fns, variants, lams, locals)
-      cat5("kai_op_field(", b, ", \"", fname, "\")")
+      concat_all([
+        "({ KaiValue *_b = ", b,
+        "; KaiValue *_f = kai_op_field(_b, \"", fname, "\"); kai_decref(_b); _f; })"
+      ])
     }
     EIndex(_, _) -> "kai_unit() /* index: not used by bootstrap examples */"
     EBinop(op, a, b) -> {
@@ -4577,9 +4586,12 @@ fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, fns: [EFn], variants: [EV
     PWild -> cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
     _ -> {
       # Destructuring let: bind a temp, then run pattern binds.
-      # _letv holds the RHS's owned ref; not aliased.
-      let binds = emit_pat_binds(src, pat, "_letv", false, fns, variants, lams, locals)
-      concat_all(["{ KaiValue *_letv = ", rhs_c, "; ", binds, "} "])
+      # `_letv` holds the RHS's owned ref. With is_alias=false, PBind
+      # transfers raw and `kai_op_field` increfs each child, so each
+      # binder owns its own ref. The composite `_letv` is no longer
+      # reachable — drop it (#293 Phase 1.3) so its alloc balances.
+      let binds = emit_pat_binds(src, pat, "_letv", true, fns, variants, lams, locals)
+      concat_all(["{ KaiValue *_letv = ", rhs_c, "; ", binds, "kai_decref(_letv); } "])
     }
   }
 }
