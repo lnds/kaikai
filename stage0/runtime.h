@@ -120,6 +120,14 @@ typedef KaiValue *(*KaiFn)(KaiValue *self, KaiValue **args, int n_args);
 struct KaiValue {
     int32_t rc;
     int32_t tag;
+#ifdef KAI_TRACE_RC
+    /* issue #296 — call-site attribution. Captured at kai_alloc as
+     * __builtin_return_address(0); decremented from the per-site
+     * histogram at kai_free_value. Only present under -DKAI_TRACE_RC=1
+     * (vanilla builds keep the original two-word header — runtime
+     * layout is otherwise unchanged). */
+    void   *alloc_site;
+#endif
     union {
         int      b;                                 /* KAI_BOOL */
         int64_t  i;                                 /* KAI_INT */
@@ -362,9 +370,183 @@ static void kai_rc_strict_register_once(void) {
     atexit(kai_rc_strict_report);
 }
 
+/* ---------- issue #296: per-call-site leak attribution ----------
+ *
+ * Open-addressing hash table from caller return-address to per-site
+ * (alloc, free) counters. Keyed by `void *` (the return address of
+ * the kai_alloc invocation, captured via __builtin_return_address(0)
+ * inside each wrapper that calls kai_alloc — wrappers are marked
+ * KAI_RC_NOINLINE so the address is the real emit site, not an
+ * inlined parent).
+ *
+ * Sized at 16 K buckets — empirically the kaic2 selfhost emits
+ * fewer than ~3 K distinct alloc sites, so load factor stays under
+ * 20 %. Linear probing; the table is never resized. Saturates if
+ * full (drops the site silently — the histogram becomes lossy
+ * rather than corrupt).
+ *
+ * Per-chunk attribution: the alloc site is stored in the chunk's
+ * `alloc_site` field (added under #ifdef KAI_TRACE_RC at the top
+ * of struct KaiValue). On free, kai_free_value reads it back to
+ * decrement the matching site's free counter. Cost: one extra word
+ * per chunk under KAI_TRACE_RC (vanilla builds keep the original
+ * two-word header). */
+
+#define KAI_RC_SITE_BUCKETS 16384
+
+typedef struct {
+    void   *site;     /* return address; NULL = empty bucket */
+    int32_t tag;      /* dominant tag observed at this site */
+    int64_t allocs;
+    int64_t frees;
+} KaiRcSite;
+
+static KaiRcSite kai_rc_sites[KAI_RC_SITE_BUCKETS];
+static int       kai_rc_sites_count = 0;
+static int       kai_rc_sites_full  = 0;  /* sticky: a probe overflowed */
+
+/* Hash a pointer using a fast mix (Knuth-style). The high bits of
+ * a return address carry the most variance, so we shift before
+ * masking. */
+static uint32_t kai_rc_site_hash(void *p) {
+    uintptr_t x = (uintptr_t) p;
+    x ^= x >> 33;
+    x *= (uintptr_t) 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return (uint32_t) (x & (KAI_RC_SITE_BUCKETS - 1));
+}
+
+/* Find or insert. Returns NULL on overflow (table saturated).
+ * Otherwise returns a pointer to the bucket (caller may mutate). */
+static KaiRcSite *kai_rc_site_lookup(void *site, int32_t tag, int insert) {
+    if (site == NULL) return NULL;
+    uint32_t mask = KAI_RC_SITE_BUCKETS - 1;
+    uint32_t h = kai_rc_site_hash(site);
+    for (uint32_t i = 0; i < KAI_RC_SITE_BUCKETS; i++) {
+        uint32_t k = (h + i) & mask;
+        KaiRcSite *b = &kai_rc_sites[k];
+        if (b->site == site) return b;
+        if (b->site == NULL) {
+            if (!insert) return NULL;
+            b->site = site;
+            b->tag  = tag;
+            kai_rc_sites_count++;
+            return b;
+        }
+    }
+    kai_rc_sites_full = 1;
+    return NULL;
+}
+
+static void kai_rc_site_record_alloc(void *site, int32_t tag) {
+    KaiRcSite *b = kai_rc_site_lookup(site, tag, 1);
+    if (b) b->allocs++;
+}
+
+static void kai_rc_site_record_free(void *site) {
+    KaiRcSite *b = kai_rc_site_lookup(site, 0, 0);
+    if (b) b->frees++;
+}
+
+/* qsort comparator: descending by leak count (allocs - frees). */
+static int kai_rc_site_cmp_leak(const void *a, const void *b) {
+    const KaiRcSite *x = (const KaiRcSite *) a;
+    const KaiRcSite *y = (const KaiRcSite *) b;
+    int64_t lx = x->allocs - x->frees;
+    int64_t ly = y->allocs - y->frees;
+    if (ly > lx) return 1;
+    if (ly < lx) return -1;
+    return 0;
+}
+
+/* On macOS, addresses captured via __builtin_return_address(0) are
+ * post-ASLR. Print the dyld slide so post-mortem symbolization with
+ * `atos -l <load>` can recover symbol names. On other platforms the
+ * slide is treated as 0. */
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+static intptr_t kai_rc_aslr_slide(void) {
+    return _dyld_get_image_vmaddr_slide(0);
+}
+#else
+static intptr_t kai_rc_aslr_slide(void) { return 0; }
+#endif
+
+static void kai_rc_site_report(void) {
+    if (getenv("KAI_TRACE_RC_QUIET")) return;
+    if (kai_rc_sites_count == 0) return;
+
+    /* Default top 20; KAI_TRACE_RC_TOP=N overrides. */
+    int top_n = 20;
+    const char *e = getenv("KAI_TRACE_RC_TOP");
+    if (e && e[0]) {
+        int n = atoi(e);
+        if (n > 0) top_n = n;
+    }
+
+    /* Compact non-empty buckets into a contiguous array for sort. */
+    KaiRcSite *flat = (KaiRcSite *) malloc(
+        (size_t) kai_rc_sites_count * sizeof(KaiRcSite));
+    if (!flat) return;
+    int n = 0;
+    int64_t total_leak = 0;
+    for (int i = 0; i < KAI_RC_SITE_BUCKETS; i++) {
+        if (kai_rc_sites[i].site != NULL) {
+            flat[n++] = kai_rc_sites[i];
+            int64_t live = kai_rc_sites[i].allocs - kai_rc_sites[i].frees;
+            if (live > 0) total_leak += live;
+        }
+    }
+    qsort(flat, (size_t) n, sizeof(KaiRcSite), kai_rc_site_cmp_leak);
+
+    fprintf(stderr,
+        "[KAI_TRACE_RC] top sites by leak (showing %d of %d distinct sites; total_leak=%lld%s)\n",
+        top_n < n ? top_n : n, n, (long long) total_leak,
+        kai_rc_sites_full ? "; TABLE SATURATED" : "");
+    fprintf(stderr,
+        "[KAI_TRACE_RC] aslr_slide=%p (subtract from site addresses for static symbolization)\n",
+        (void *) kai_rc_aslr_slide());
+    int limit = top_n < n ? top_n : n;
+    for (int i = 0; i < limit; i++) {
+        KaiRcSite *s = &flat[i];
+        int64_t live = s->allocs - s->frees;
+        double pct = s->allocs > 0
+            ? (100.0 * (double) live / (double) s->allocs) : 0.0;
+        double share = total_leak > 0
+            ? (100.0 * (double) live / (double) total_leak) : 0.0;
+        fprintf(stderr,
+            "[KAI_TRACE_RC] site %2d %p tag=%-7s allocs=%lld frees=%lld leak=%lld leak%%=%.1f share%%=%.1f\n",
+            i + 1, s->site, kai_rc_tag_name(s->tag),
+            (long long) s->allocs, (long long) s->frees, (long long) live,
+            pct, share);
+    }
+    free(flat);
+}
+
+static int kai_rc_site_registered = 0;
+static void kai_rc_site_register_once(void) {
+    if (kai_rc_site_registered) return;
+    kai_rc_site_registered = 1;
+    atexit(kai_rc_site_report);
+}
+
+/* Wrappers that ultimately call kai_alloc must NOT be inlined when
+ * tracing is enabled — otherwise __builtin_return_address(0) inside
+ * the wrapper points at the wrapper's parent's parent, not the
+ * real emit site. Vanilla builds drop the attribute (zero overhead). */
+#define KAI_RC_NOINLINE __attribute__((noinline))
+
 #endif /* KAI_TRACE_RC */
 
+#ifndef KAI_TRACE_RC
+#define KAI_RC_NOINLINE
+#endif
+
+#ifdef KAI_TRACE_RC
+static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
+#else
 static KaiValue *kai_alloc(KaiTag tag) {
+#endif
     KaiValue *v = (KaiValue *) calloc(1, sizeof(KaiValue));
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     v->rc = 1;
@@ -375,10 +557,21 @@ static KaiValue *kai_alloc(KaiTag tag) {
     if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
     if ((int) tag >= 0 && (int) tag < 16) kai_rc_alloc_by_tag[(int) tag]++;
 #ifdef KAI_TRACE_RC
+    v->alloc_site = site;
+    kai_rc_site_record_alloc(site, (int32_t) tag);
+    kai_rc_site_register_once();
     kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) tag);
 #endif
     return v;
 }
+
+#ifdef KAI_TRACE_RC
+/* Macro shim: every call to kai_alloc(tag) inside a wrapper captures
+ * the wrapper's caller (the real emit site) via
+ * __builtin_return_address(0). Wrappers must be marked
+ * KAI_RC_NOINLINE for this to point at the right frame. */
+#define kai_alloc(tag) kai_alloc_traced((tag), __builtin_return_address(0))
+#endif
 
 /* m5 #7: constant pool for nullary primitives.
  *
@@ -401,10 +594,10 @@ static KaiValue *kai_alloc(KaiTag tag) {
  * Selfhost stays byte-identical because the emitted text is
  * unchanged — only the runtime semantics shift.
  */
-static KaiValue kai_singleton_unit  = { INT32_MAX, KAI_UNIT, { .b = 0 } };
-static KaiValue kai_singleton_true  = { INT32_MAX, KAI_BOOL, { .b = 1 } };
-static KaiValue kai_singleton_false = { INT32_MAX, KAI_BOOL, { .b = 0 } };
-static KaiValue kai_singleton_nil   = { INT32_MAX, KAI_NIL,  { .b = 0 } };
+static KaiValue kai_singleton_unit  = { .rc = INT32_MAX, .tag = KAI_UNIT, .as = { .b = 0 } };
+static KaiValue kai_singleton_true  = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 1 } };
+static KaiValue kai_singleton_false = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 0 } };
+static KaiValue kai_singleton_nil   = { .rc = INT32_MAX, .tag = KAI_NIL,  .as = { .b = 0 } };
 
 static KaiValue *kai_incref(KaiValue *v) {
     if (v && v->rc != INT32_MAX) v->rc++;
@@ -644,7 +837,7 @@ static void kai_drain_pending_free(void) {
  * (kai_free_value frees both together). The struct's `value`
  * back-pointer lets the scheduler retain its own incref on the
  * wrapper from spawn-enqueue until the trampoline tail (R4 fix). */
-static KaiValue *kai_fiber_value(KaiFiber *f) {
+static KAI_RC_NOINLINE KaiValue *kai_fiber_value(KaiFiber *f) {
     KaiValue *v = kai_alloc(KAI_FIBER);
     v->as.fib = f;
     f->value  = v;
@@ -902,7 +1095,7 @@ static void kai_mailbox_free(KaiMailbox *mb) {
  * mailbox itself is owned by the with_mailbox / spawn_actor scope
  * that allocated it; Pid values are non-owning handles that just
  * carry the address. */
-static KaiValue *kai_pid_value(KaiMailbox *mb) {
+static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
     KaiValue *v = kai_alloc(KAI_PID);
     v->as.mb = mb;
     return v;
@@ -1015,6 +1208,8 @@ static void kai_free_value(KaiValue *v) {
     {
         int32_t freed_tag = v->tag;
         if (freed_tag >= 0 && freed_tag < 16) kai_rc_free_by_tag[freed_tag]++;
+        /* issue #296 — credit the matching alloc site. */
+        kai_rc_site_record_free(v->alloc_site);
         kai_rc_history_log(v, /* op=free */ 3, freed_tag);
         /* Stamp poison over the whole struct so a stale read after
          * free surfaces the recognizable 0xDEADBEEF... pattern on
@@ -1111,7 +1306,7 @@ static void kai_char_cache_warm(void) {
     kai_char_cache_init = 1;
 }
 
-static KaiValue *kai_int(int64_t i) {
+static KAI_RC_NOINLINE KaiValue *kai_int(int64_t i) {
     if (i >= KAI_INT_CACHE_LO && i <= KAI_INT_CACHE_HI) {
         if (!kai_int_cache_init) kai_int_cache_warm();
         return &kai_int_cache[i - KAI_INT_CACHE_LO];
@@ -1121,13 +1316,13 @@ static KaiValue *kai_int(int64_t i) {
     return v;
 }
 
-static KaiValue *kai_real(double r) {
+static KAI_RC_NOINLINE KaiValue *kai_real(double r) {
     KaiValue *v = kai_alloc(KAI_REAL);
     v->as.r = r;
     return v;
 }
 
-static KaiValue *kai_char(uint32_t c) {
+static KAI_RC_NOINLINE KaiValue *kai_char(uint32_t c) {
     if (c <= KAI_CHAR_CACHE_HI) {
         if (!kai_char_cache_init) kai_char_cache_warm();
         return &kai_char_cache[c];
@@ -1137,7 +1332,7 @@ static KaiValue *kai_char(uint32_t c) {
     return v;
 }
 
-static KaiValue *kai_str_from_bytes(const char *bytes, size_t len) {
+static KAI_RC_NOINLINE KaiValue *kai_str_from_bytes(const char *bytes, size_t len) {
     KaiValue *v = kai_alloc(KAI_STR);
     v->as.s.len = len;
     v->as.s.bytes = (char *) malloc(len + 1);
@@ -1147,20 +1342,20 @@ static KaiValue *kai_str_from_bytes(const char *bytes, size_t len) {
     return v;
 }
 
-static KaiValue *kai_str(const char *cstr) {
+static KAI_RC_NOINLINE KaiValue *kai_str(const char *cstr) {
     return kai_str_from_bytes(cstr, strlen(cstr));
 }
 
 static KaiValue *kai_nil(void) { return &kai_singleton_nil; }
 
-static KaiValue *kai_cons(KaiValue *head, KaiValue *tail) {
+static KAI_RC_NOINLINE KaiValue *kai_cons(KaiValue *head, KaiValue *tail) {
     KaiValue *v = kai_alloc(KAI_CONS);
     v->as.cons.head = head;
     v->as.cons.tail = tail;
     return v;
 }
 
-static KaiValue *kai_record(int n, KaiValue **fields, const char **names) {
+static KAI_RC_NOINLINE KaiValue *kai_record(int n, KaiValue **fields, const char **names) {
     KaiValue *v = kai_alloc(KAI_RECORD);
     v->as.rec.n_fields = n;
     v->as.rec.fields = (KaiValue **) malloc(n * sizeof(KaiValue *));
@@ -1172,7 +1367,7 @@ static KaiValue *kai_record(int n, KaiValue **fields, const char **names) {
     return v;
 }
 
-static KaiValue *kai_variant(int32_t tag, const char *name, int n, KaiValue **args) {
+static KAI_RC_NOINLINE KaiValue *kai_variant(int32_t tag, const char *name, int n, KaiValue **args) {
     KaiValue *v = kai_alloc(KAI_VARIANT);
     v->as.var.variant_tag = tag;
     v->as.var.variant_name = name;
@@ -1280,7 +1475,7 @@ static KaiValue *kai_reuse_or_alloc_variant(KaiValue *_scr,
 
 /* Allocate an array of `len` slots, each initialised to `init`
    (incref'd once per slot). Caller owns the returned array. */
-static KaiValue *kai_array_make(int64_t len, KaiValue *init) {
+static KAI_RC_NOINLINE KaiValue *kai_array_make(int64_t len, KaiValue *init) {
     if (len < 0) { fprintf(stderr, "kai: array_make: negative length\n"); exit(1); }
     KaiValue *v = kai_alloc(KAI_ARRAY);
     v->as.arr.len = len;
@@ -1344,7 +1539,7 @@ static KaiValue *kai_array_set_impl(KaiValue *a, int64_t i, KaiValue *v) {
  * closure stores raw aliases of caller-owned bindings; the alias goes
  * dangling as soon as the caller's scope decrefs them — latent under
  * the loose runtime, a use-after-free under linear consumption. */
-static KaiValue *kai_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures) {
+static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures) {
     KaiValue *v = kai_alloc(KAI_CLOSURE);
     v->as.clo.fn = fn;
     v->as.clo.arity = arity;
@@ -1441,7 +1636,7 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
 
 /* ---------- to-string ---------- */
 
-static KaiValue *kai_string_concat(KaiValue *a, KaiValue *b);
+static KAI_RC_NOINLINE KaiValue *kai_string_concat(KaiValue *a, KaiValue *b);
 
 static KaiValue *kai_to_string(KaiValue *v);
 
@@ -1515,7 +1710,7 @@ static KaiValue *kai_to_string(KaiValue *v) {
     return kai_str("?");
 }
 
-static KaiValue *kai_string_concat(KaiValue *a, KaiValue *b) {
+static KAI_RC_NOINLINE KaiValue *kai_string_concat(KaiValue *a, KaiValue *b) {
     size_t la = (a && a->tag == KAI_STR) ? a->as.s.len : 0;
     size_t lb = (b && b->tag == KAI_STR) ? b->as.s.len : 0;
     KaiValue *v = kai_alloc(KAI_STR);
@@ -1531,7 +1726,7 @@ static KaiValue *kai_string_concat(KaiValue *a, KaiValue *b) {
    length, allocate once, memcpy each piece in. Avoids the O(n²)
    accumulation that a naive fold of kai_string_concat produces, which
    dominates emit-heavy workloads like the self-hosting compiler. */
-static KaiValue *kai_string_concat_all_impl(KaiValue *xs) {
+static KAI_RC_NOINLINE KaiValue *kai_string_concat_all_impl(KaiValue *xs) {
     size_t total = 0;
     for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
         KaiValue *s = p->as.cons.head;
@@ -1554,7 +1749,7 @@ static KaiValue *kai_string_concat_all_impl(KaiValue *xs) {
 }
 
 /* Two-pass join: like concat_all but interleaves `sep` between pieces. */
-static KaiValue *kai_string_join_impl(KaiValue *xs, KaiValue *sep) {
+static KAI_RC_NOINLINE KaiValue *kai_string_join_impl(KaiValue *xs, KaiValue *sep) {
     size_t slen = (sep && sep->tag == KAI_STR) ? sep->as.s.len : 0;
     size_t total = 0;
     int count = 0;
@@ -2330,7 +2525,7 @@ static KaiValue *kai_prelude_mailbox_free(KaiValue *pid) {
 
 /* ---------- prelude: file io ---------- */
 
-static KaiValue *kai_prelude_read_file(KaiValue *path) {
+static KAI_RC_NOINLINE KaiValue *kai_prelude_read_file(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("read_file: argument is not a String");
