@@ -4,6 +4,13 @@ The austere subset of kaikai compiled by **stage 0** (the C bootstrap compiler).
 
 Goal: be just expressive enough to write a compiler for the full language in itself, and no more. Simplicity over power. Every feature here must earn its place by being necessary to build stage 1.
 
+> **Canonical full grammar**: `docs/grammar.md` is the single
+> reference for the full-kaikai surface grammar. This document
+> describes the **stage 0 subset only** — every production here is
+> also accepted by full kaikai, but the reverse does not hold (full
+> kaikai adds effects, sugars, protocols, UoM, and more). Where the
+> two diverge, this doc names the divergence inline.
+
 ## What is **not** in kaikai-minimal
 
 To make the scope explicit:
