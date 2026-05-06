@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-unions test-sequence test-ufcs test-rc-trace-callsite selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-unions test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire
 
 all: $(TARGET)
 
@@ -3041,6 +3041,48 @@ test-tco-perceus-wrap: $(TARGET) build
 	  && echo "tco-perceus-wrap OK (issue #89 1M-deep self-tail-call through perceus wrap; goto label emitted; runs to completion)" \
 	  || { echo "tco-perceus-wrap DIFF"; diff ../examples/perceus/unbox_bench.out.expected build/tco-perceus.out; exit 1; }
 
+# Issue #92 — rule 3 fires. The `walk` fn matches on `xs` (single
+# scrutinee read, count==1) and recurses with `(t, acc + h)`. `xs`
+# does not appear anywhere in the recursive call's args, so rule 3
+# (LUAt + count==1 + p NOT in args) drops `xs` in the goto block.
+# The C-side assertion is the explicit `kai_internal_drop(kai_xs)`
+# inside the goto-block emission; without rule 3 the drop is absent
+# and a cons cell leaks per iteration. The runtime check confirms
+# the program still completes with the expected sum.
+test-tco-rule3-basic: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/tco/rule3_basic.kai > build/tco-r3b.c; \
+	grep -F -q 'goto _kai_walk_entry' build/tco-r3b.c \
+	  || { echo "tco-rule3-basic FAIL (no walk goto label)"; exit 1; }; \
+	awk '/_kai_walk_entry/,/__pcs_ret/' build/tco-r3b.c | grep -F -q 'kai_internal_drop(kai_xs)' \
+	  || { echo "tco-rule3-basic FAIL (rule 3 did not emit kai_internal_drop(kai_xs) in walk goto)"; exit 1; }; \
+	$(CC) $(CFLAGS) -I ../stage0 build/tco-r3b.c -o build/tco-r3b; \
+	./build/tco-r3b > build/tco-r3b.out; \
+	diff -q ../examples/tco/rule3_basic.out.expected build/tco-r3b.out > /dev/null \
+	  && echo "tco-rule3-basic OK (issue #92 rule 3 drops xs in goto block; sum matches)" \
+	  || { echo "tco-rule3-basic DIFF"; diff ../examples/tco/rule3_basic.out.expected build/tco-r3b.out; exit 1; }
+
+# Issue #92 — rule 3 does NOT misfire. The `id_walk` fn reads `xs`
+# exactly once — as the recursive call's first arg — so count==1 and
+# p IS in args. Rule 3 must NOT fire (otherwise the goto-block drop
+# would double-free the head cell evaluated by the arg). The C-side
+# assertion is the absence of `kai_internal_drop(kai_xs)` inside the
+# `id_walk` goto block. The runtime check confirms the program runs
+# to completion under glibc strict-malloc without abort.
+test-tco-rule3-no-misfire: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/tco/rule3_no_misfire.kai > build/tco-r3n.c; \
+	grep -F -q 'goto _kai_id_walk_entry' build/tco-r3n.c \
+	  || { echo "tco-rule3-no-misfire FAIL (no id_walk goto label)"; exit 1; }; \
+	if awk '/_kai_id_walk_entry/,/__pcs_ret/' build/tco-r3n.c | grep -F -q 'kai_internal_drop(kai_xs)'; then \
+	  echo "tco-rule3-no-misfire FAIL (rule 3 misfired: kai_internal_drop(kai_xs) present in id_walk goto)"; exit 1; \
+	fi; \
+	$(CC) $(CFLAGS) -I ../stage0 build/tco-r3n.c -o build/tco-r3n; \
+	./build/tco-r3n > build/tco-r3n.out; \
+	diff -q ../examples/tco/rule3_no_misfire.out.expected build/tco-r3n.out > /dev/null \
+	  && echo "tco-rule3-no-misfire OK (issue #92 rule 3 correctly skips xs when in args; runs without abort)" \
+	  || { echo "tco-rule3-no-misfire DIFF"; diff ../examples/tco/rule3_no_misfire.out.expected build/tco-r3n.out; exit 1; }
+
 # Issue #82 — Perceus leak-audit fixture. Exercises four RC
 # discipline gaps that survived the m5.x flip: match-scrutinee
 # decref at exit, kai_op_truthy on fresh `if` conds, kai_field
@@ -3487,7 +3529,7 @@ test-rc-trace-callsite: $(TARGET) build
 	  || { echo "rc-trace-callsite NO site rows"; cat build/rc_trace_callsite.err; exit 1; }; \
 	echo "rc-trace-callsite OK"
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-unions test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-unions test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -3496,7 +3538,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-unions test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-unions test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire
 
 clean:
 	rm -rf build $(TARGET)
