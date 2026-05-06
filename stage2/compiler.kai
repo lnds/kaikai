@@ -11185,10 +11185,21 @@ fn emit_pat_test_variant_record(src: String, name: String, fields: [PField], scr
 fn emit_pat_binds(src: String, pat: Pattern, scr: String, is_alias: Bool,
                   lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match pat.pkind {
-    PWild -> ""
+    PWild ->
+      # #293 Phase 2.3/2.4: when scr is an owned (non-alias) ref the
+      # value would otherwise leak. Drop it. For alias paths the
+      # parent's decref reclaims it.
+      if is_alias { "" }
+      else { concat_all(["kai_decref(", scr, "); "]) }
     PLit(_) -> ""
     PBind(name) ->
-      if is_alias {
+      # #293 Phase 2.3/2.4: `_`-prefixed names are unused-by-convention.
+      # Treat them as wildcards so cons head / variant arg / record
+      # field allocations balance.
+      if name_is_unused(name) {
+        if is_alias { "" }
+        else { concat_all(["kai_decref(", scr, "); "]) }
+      } else if is_alias {
         concat_all(["KaiValue *kai_", name, " = kai_incref(", scr, "); "])
       } else {
         concat_all(["KaiValue *kai_", name, " = ", scr, "; "])
@@ -11281,6 +11292,20 @@ fn emit_pat_binds_record(src: String, fields: [PField], scr: String,
         }
       }
     }
+  }
+}
+
+fn name_is_unused(name: String) : Bool {
+  # `_`-prefixed user-facing names signal "unused" by convention.
+  # Excludes `__`-prefixed compiler-internal names (e.g. `__cv_*` from
+  # m12.6 const-pattern desugar, `__pcs_ret` / `__perceus_*` from
+  # perceus_pass) which the body still references.
+  match char_at(name, 0) {
+    Some(c0) -> c0 == '_' and match char_at(name, 1) {
+      Some(c1) -> c1 != '_'
+      None -> true
+    }
+    None -> false
   }
 }
 
@@ -13771,7 +13796,7 @@ fn emit_stmt(src: String, s: Stmt, lcs: [String], fns: [EFn], variants: [EVar], 
   match s {
     SLet(pat, _, rhs) -> emit_let_stmt(src, pat, rhs, lcs, fns, variants, lams, cls)
     SAssert(cond, opt_msg) -> emit_assert_stmt(src, cond, opt_msg, lcs, fns, variants, lams, cls)
-    SExprStmt(x) -> cat3("{ KaiValue *_ = ", emit_expr(src, x, lcs, fns, variants, lams, cls), "; (void) _; } ")
+    SExprStmt(x) -> cat3("{ KaiValue *_ = ", emit_expr(src, x, lcs, fns, variants, lams, cls), "; kai_decref(_); } ")
     # m7b #6: index-assign desugars away pre-resolve; this arm is dead
     # code in normal compilation but keeps the match exhaustive.
     SIndexAssign(_, _, _, _, _) -> "/* SIndexAssign: should have been desugared */ "
@@ -13851,16 +13876,12 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
         }
       }
     }
-    # `let _ = expr` discards the value. If RHS is a fresh
-    # allocation we can decref it; otherwise the original behaviour
-    # (no decref) is preserved to avoid double-freeing an alias.
+    # `let _ = expr` discards the value. #293 Phase 2.1: emit_expr
+    # always returns an owned reference (perceus_pass dups non-last
+    # reads), so the discard site can unconditionally decref.
     PWild -> {
       let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
-      if is_fresh_alloc(rhs) {
-        cat3("{ KaiValue *_w = ", rhs_c, "; kai_decref(_w); } ")
-      } else {
-        cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
-      }
+      cat3("{ KaiValue *_w = ", rhs_c, "; kai_decref(_w); } ")
     }
     _ -> {
       # m7d §28: same shape as emit_let_stmt's destructuring path —
@@ -13971,7 +13992,7 @@ fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, lcs: [String], fns: [EFn]
     }
     PWild -> {
       let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
-      cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
+      cat3("{ KaiValue *_w = ", rhs_c, "; kai_decref(_w); } ")
     }
     _ -> {
       # m7d §28: destructuring let. Bind a unique temp and emit the
@@ -37627,17 +37648,14 @@ fn llvm_emit_stmt_with_drops(e: LlvmEmit, s: Stmt, drops: [String]) : LlvmEmit /
             }
           }
         }
-        # `let _ = expr` discards the value. Mirrors the C-side: when
-        # the RHS is a fresh allocation we can decref it; otherwise we
-        # must not, to avoid double-freeing an alias.
+        # `let _ = expr` discards the value. #293 Phase 2.1:
+        # emit_expr always returns an owned reference (perceus_pass
+        # dups non-last reads), so the discard site can
+        # unconditionally decref.
         PWild -> {
           let er = llvm_emit_expr(e, rhs)
-          if is_fresh_alloc(rhs) {
-            llvm_append_body(er,
-              concat_all(["  call void @kaix_decref(%KaiValue* ", er.last_val, ")\n"]))
-          } else {
-            er
-          }
+          llvm_append_body(er,
+            concat_all(["  call void @kaix_decref(%KaiValue* ", er.last_val, ")\n"]))
         }
         PRecord(fields) -> {
           let er = llvm_emit_expr(e, rhs)
@@ -37693,7 +37711,14 @@ fn llvm_emit_stmt(e: LlvmEmit, s: Stmt) : LlvmEmit / Console {
       # Evaluate for side effects; assert-message handling is M3b+.
       llvm_emit_expr(e, cond)
     }
-    SExprStmt(ex) -> llvm_emit_expr(e, ex)
+    SExprStmt(ex) -> {
+      # #293 Phase 2.1: a stmt-position expression is always
+      # discarded — emit_expr returns an owned ref (perceus_pass
+      # dups non-last reads), so decref it.
+      let er = llvm_emit_expr(e, ex)
+      llvm_append_body(er,
+        concat_all(["  call void @kaix_decref(%KaiValue* ", er.last_val, ")\n"]))
+    }
     # m7b #6: index-assign desugars away pre-resolve; this arm is dead
     # code in normal compilation but keeps the match exhaustive.
     SIndexAssign(_, _, _, line, col) -> {

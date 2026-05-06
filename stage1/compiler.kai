@@ -3720,10 +3720,23 @@ fn emit_pat_test_variant_record(src: String, name: String, fields: [PField], scr
 fn emit_pat_binds(src: String, pat: Pattern, scr: String, is_alias: Bool,
                   fns: [EFn], variants: [EVar], lams: [LamInfo], locals: [String]) : String {
   match pat.pkind {
-    PWild -> ""
+    PWild ->
+      # #293 Phase 2.3/2.4: when the binder is wildcard and `scr` is
+      # an owned (non-alias) reference (record field via kai_op_field
+      # or destructuring let composite), the value would otherwise
+      # leak. Drop it. For alias paths (cons head/tail, variant arg,
+      # match _scr) the parent's decref reclaims it.
+      if is_alias { "" }
+      else { concat_all(["kai_decref(", scr, "); "]) }
     PLit(_) -> ""
     PBind(name) ->
-      if is_alias {
+      # #293 Phase 2.3/2.4: `_`-prefixed names are unused-by-convention.
+      # Treat them as wildcards so they do not take ownership (alias
+      # path) or leak the owned value (non-alias path).
+      if name_is_unused(name) {
+        if is_alias { "" }
+        else { concat_all(["kai_decref(", scr, "); "]) }
+      } else if is_alias {
         concat_all(["KaiValue *kai_", name, " = kai_incref(", scr, "); "])
       } else {
         concat_all(["KaiValue *kai_", name, " = ", scr, "; "])
@@ -3800,6 +3813,20 @@ fn emit_pat_binds_record(src: String, fields: [PField], scr: String,
         }
       }
     }
+  }
+}
+
+fn name_is_unused(name: String) : Bool {
+  # `_`-prefixed user-facing names signal "unused" by convention.
+  # Excludes `__`-prefixed compiler-internal names (e.g. `__cv_*` from
+  # m12.6 const-pattern desugar, `__pcs_ret` / `__perceus_*` from
+  # perceus_pass) which the body still references.
+  match char_at(name, 0) {
+    Some(c0) -> c0 == '_' and match char_at(name, 1) {
+      Some(c1) -> c1 != '_'
+      None -> true
+    }
+    None -> false
   }
 }
 
@@ -4548,7 +4575,7 @@ fn emit_stmt(src: String, s: Stmt, fns: [EFn], variants: [EVar], lams: [LamInfo]
   match s {
     SLet(pat, _, rhs) -> emit_let_stmt(src, pat, rhs, fns, variants, lams, locals)
     SAssert(cond, opt_msg) -> emit_assert_stmt(src, cond, opt_msg, fns, variants, lams, locals)
-    SExprStmt(x) -> cat3("{ KaiValue *_ = ", emit_expr(src, x, fns, variants, lams, locals), "; (void) _; } ")
+    SExprStmt(x) -> cat3("{ KaiValue *_ = ", emit_expr(src, x, fns, variants, lams, locals), "; kai_decref(_); } ")
   }
 }
 
@@ -4618,7 +4645,7 @@ fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, fns: [EFn], variants: [EV
   let rhs_c = emit_expr(src, rhs, fns, variants, lams, locals)
   match pat.pkind {
     PBind(name) -> concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
-    PWild -> cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
+    PWild -> cat3("{ KaiValue *_w = ", rhs_c, "; kai_decref(_w); } ")
     _ -> {
       # Destructuring let: bind a temp, then run pattern binds.
       # `_letv` holds the RHS's owned ref. With is_alias=false, PBind
