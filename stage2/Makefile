@@ -3017,7 +3017,8 @@ PERCEUS_ISSUE118_FIXTURES := reuse_cons_basic reuse_alias_aborts \
                               reuse_pass_ordering reuse_record_basic \
                               reuse_variant_basic \
                               reuse_variant_no_misfire \
-                              tco_double_incref_repro
+                              tco_double_incref_repro \
+                              nullary_variant_singleton
 
 test-perceus-issue118: $(TARGET) build
 	@set -e; \
