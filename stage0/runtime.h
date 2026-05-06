@@ -238,6 +238,132 @@ static void kai_rc_register_once(void) {
     atexit(kai_rc_report);
 }
 
+/* Strict alloc tracing — Track #2 of issue #291.
+ *
+ * Build with `-DKAI_TRACE_RC=1` to enable diagnostics that surface RC
+ * imbalances on macOS the same way glibc's tcache strict check does on
+ * Linux (`malloc(): unaligned tcache chunk detected`). Without the
+ * flag, the runtime keeps the cheap always-on counters above and adds
+ * zero overhead.
+ *
+ * Three facilities, layered:
+ *
+ * 1. Per-tag free counters (kai_rc_free_by_tag). Pairs with
+ *    kai_rc_alloc_by_tag so the report can show allocs/frees/live
+ *    per tag at exit. live != 0 → leak. frees > allocs → double-free.
+ *
+ * 2. Sentinel-on-free. Just before free(v) in kai_free_value the
+ *    chunk's bytes are stamped with 0xDEADBEEFDEADBEEF. macOS's
+ *    malloc happily reuses the chunk, but any read through a stale
+ *    pointer that was already decref'd surfaces the recognizable
+ *    poison pattern (e.g. `tag = 0xEFBE...`, `rc = 0xDEADBEEF`)
+ *    instead of stale-but-plausible content.
+ *
+ * 3. Optional per-chunk history (KAI_RC_HISTORY=1 env var). Records
+ *    a small ring buffer of (chunk, op, tag) tuples covering alloc /
+ *    incref / decref / free. Heavy — opt-in only — but lets a post
+ *    mortem trace which tag's RC drifted.
+ *
+ * Reporting:
+ * - Without -DKAI_TRACE_RC=1: existing env-gated KAI_TRACE_RC=1
+ *   report (allocs only).
+ * - With -DKAI_TRACE_RC=1: report fires unconditionally at exit
+ *   unless KAI_TRACE_RC_QUIET=1 is set; per-tag allocs, frees, and
+ *   live are all printed.
+ */
+#ifdef KAI_TRACE_RC
+
+static int64_t kai_rc_free_by_tag[16] = {0};
+
+#define KAI_RC_SENTINEL_U64 ((uint64_t) 0xDEADBEEFDEADBEEFULL)
+
+/* Optional per-chunk history. Ring buffer; KAI_RC_HISTORY=1 enables
+ * recording. Capacity is generous enough for the kaic2 self-compile
+ * working set without ballooning memory. Indexed by (counter %
+ * KAI_RC_HISTORY_CAP) so older entries get overwritten. */
+#define KAI_RC_HISTORY_CAP 65536
+typedef struct {
+    void   *chunk;
+    int32_t op;     /* 0=alloc, 1=incref, 2=decref, 3=free */
+    int32_t tag;
+} KaiRcHistoryEntry;
+static KaiRcHistoryEntry kai_rc_history[KAI_RC_HISTORY_CAP];
+static uint64_t kai_rc_history_count = 0;
+static int      kai_rc_history_enabled_cached = -1; /* lazy: -1 unread, 0 off, 1 on */
+
+static int kai_rc_history_enabled(void) {
+    if (kai_rc_history_enabled_cached < 0) {
+        const char *e = getenv("KAI_RC_HISTORY");
+        kai_rc_history_enabled_cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return kai_rc_history_enabled_cached;
+}
+
+static void kai_rc_history_log(void *chunk, int32_t op, int32_t tag) {
+    if (!kai_rc_history_enabled()) return;
+    uint64_t i = kai_rc_history_count++ % KAI_RC_HISTORY_CAP;
+    kai_rc_history[i].chunk = chunk;
+    kai_rc_history[i].op    = op;
+    kai_rc_history[i].tag   = tag;
+}
+
+static const char *kai_rc_op_name(int32_t op) {
+    switch (op) {
+        case 0: return "alloc";
+        case 1: return "incref";
+        case 2: return "decref";
+        case 3: return "free";
+        default: return "?";
+    }
+}
+
+static void kai_rc_strict_report(void) {
+    if (getenv("KAI_TRACE_RC_QUIET")) return;
+    int64_t leaked = kai_rc_alloc_total - kai_rc_free_total;
+    fprintf(stderr,
+        "[KAI_TRACE_RC] STRICT alloc_total=%lld free_total=%lld leaked=%lld live_peak=%lld\n",
+        (long long) kai_rc_alloc_total,
+        (long long) kai_rc_free_total,
+        (long long) leaked,
+        (long long) kai_rc_live_peak);
+    for (int i = 0; i < 16; i++) {
+        int64_t a = kai_rc_alloc_by_tag[i];
+        int64_t f = kai_rc_free_by_tag[i];
+        if (a == 0 && f == 0) continue;
+        int64_t live = a - f;
+        const char *flag =
+            (live != 0)              ? " LEAK"     :
+            (f > a)                  ? " DOUBLE"   : "";
+        fprintf(stderr,
+            "[KAI_TRACE_RC] tag=%-7s allocs=%lld frees=%lld live=%lld%s\n",
+            kai_rc_tag_name(i),
+            (long long) a, (long long) f, (long long) live, flag);
+    }
+    if (kai_rc_history_enabled() && kai_rc_history_count > 0) {
+        uint64_t total = kai_rc_history_count;
+        uint64_t shown = total < KAI_RC_HISTORY_CAP ? total : KAI_RC_HISTORY_CAP;
+        fprintf(stderr,
+            "[KAI_TRACE_RC] history total=%llu showing last=%llu\n",
+            (unsigned long long) total, (unsigned long long) shown);
+        uint64_t start = total > KAI_RC_HISTORY_CAP ? total - KAI_RC_HISTORY_CAP : 0;
+        for (uint64_t k = start; k < total; k++) {
+            KaiRcHistoryEntry *e = &kai_rc_history[k % KAI_RC_HISTORY_CAP];
+            fprintf(stderr, "[KAI_TRACE_RC] hist %s chunk=%p tag=%s\n",
+                kai_rc_op_name(e->op), e->chunk,
+                kai_rc_tag_name(e->tag));
+        }
+    }
+}
+
+static int kai_rc_strict_registered = 0;
+static void kai_rc_strict_register_once(void) {
+    if (kai_rc_strict_registered) return;
+    kai_rc_strict_registered = 1;
+    atexit(kai_rc_strict_report);
+}
+
+#endif /* KAI_TRACE_RC */
+
 static KaiValue *kai_alloc(KaiTag tag) {
     KaiValue *v = (KaiValue *) calloc(1, sizeof(KaiValue));
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
@@ -248,6 +374,9 @@ static KaiValue *kai_alloc(KaiTag tag) {
     kai_rc_live_now++;
     if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
     if ((int) tag >= 0 && (int) tag < 16) kai_rc_alloc_by_tag[(int) tag]++;
+#ifdef KAI_TRACE_RC
+    kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) tag);
+#endif
     return v;
 }
 
@@ -279,6 +408,9 @@ static KaiValue kai_singleton_nil   = { INT32_MAX, KAI_NIL,  { .b = 0 } };
 
 static KaiValue *kai_incref(KaiValue *v) {
     if (v && v->rc != INT32_MAX) v->rc++;
+#ifdef KAI_TRACE_RC
+    if (v) kai_rc_history_log(v, /* op=incref */ 1, v->tag);
+#endif
     return v;
 }
 static void       kai_decref(KaiValue *v);
@@ -879,6 +1011,21 @@ static void kai_free_value(KaiValue *v) {
             break;
         default: break;
     }
+#ifdef KAI_TRACE_RC
+    {
+        int32_t freed_tag = v->tag;
+        if (freed_tag >= 0 && freed_tag < 16) kai_rc_free_by_tag[freed_tag]++;
+        kai_rc_history_log(v, /* op=free */ 3, freed_tag);
+        /* Stamp poison over the whole struct so a stale read after
+         * free surfaces the recognizable 0xDEADBEEF... pattern on
+         * macOS instead of stale-but-plausible content. We touch
+         * sizeof(KaiValue) bytes; safe because we still own the
+         * chunk until the free(v) below. */
+        uint64_t *p64 = (uint64_t *) v;
+        size_t   nq   = sizeof(KaiValue) / sizeof(uint64_t);
+        for (size_t i = 0; i < nq; i++) p64[i] = KAI_RC_SENTINEL_U64;
+    }
+#endif
     free(v);
     /* trace */
     kai_rc_free_total++;
@@ -888,6 +1035,9 @@ static void kai_free_value(KaiValue *v) {
 static void kai_decref(KaiValue *v) {
     if (!v) return;
     if (v->rc == INT32_MAX) return;   /* m5 #7 — singleton, saturated */
+#ifdef KAI_TRACE_RC
+    kai_rc_history_log(v, /* op=decref */ 2, v->tag);
+#endif
     if (--v->rc == 0) kai_free_value(v);
 }
 
@@ -2067,6 +2217,9 @@ static void kai_set_args(int argc, char **argv) {
        gates a report, so the side effect is harmless when tracing is
        off. Keeps the emitter unchanged — no new emit site needed. */
     kai_rc_register_once();
+#ifdef KAI_TRACE_RC
+    kai_rc_strict_register_once();
+#endif
 }
 
 static KaiValue *kai_prelude_args(void) {
