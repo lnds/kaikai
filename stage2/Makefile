@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs test-rc-trace-callsite selfhost
 
 all: $(TARGET)
 
@@ -3310,7 +3310,28 @@ test-unions: $(TARGET) build
 	  fi; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars
+# issue #296 — per-call-site leak attribution. Compiles the fixture
+# under `-DKAI_TRACE_RC=1`, verifies the program prints the expected
+# stdout AND the runtime emits a `top sites by leak` line on stderr
+# with a non-empty `aslr_slide=` and at least one `site` row. Vanilla
+# tier1 only verifies the stdout golden via test-run; this target is
+# the gate that catches regressions in the per-site instrumentation.
+test-rc-trace-callsite: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/effects/rc_trace_callsite.kai > build/rc_trace_callsite.c; \
+	$(CC) $(CFLAGS) -DKAI_TRACE_RC=1 -I ../stage0 build/rc_trace_callsite.c -o build/rc_trace_callsite-c; \
+	./build/rc_trace_callsite-c > build/rc_trace_callsite.out 2> build/rc_trace_callsite.err; \
+	diff -q ../examples/effects/rc_trace_callsite.out.expected build/rc_trace_callsite.out > /dev/null \
+	  || { echo "rc-trace-callsite STDOUT DIFF"; diff ../examples/effects/rc_trace_callsite.out.expected build/rc_trace_callsite.out; exit 1; }; \
+	grep -q "top sites by leak" build/rc_trace_callsite.err \
+	  || { echo "rc-trace-callsite MISSING top-sites line"; cat build/rc_trace_callsite.err; exit 1; }; \
+	grep -q "aslr_slide=" build/rc_trace_callsite.err \
+	  || { echo "rc-trace-callsite MISSING aslr_slide line"; cat build/rc_trace_callsite.err; exit 1; }; \
+	grep -q "^\[KAI_TRACE_RC\] site " build/rc_trace_callsite.err \
+	  || { echo "rc-trace-callsite NO site rows"; cat build/rc_trace_callsite.err; exit 1; }; \
+	echo "rc-trace-callsite OK"
+
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars test-rc-trace-callsite
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
