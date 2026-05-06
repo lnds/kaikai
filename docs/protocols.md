@@ -1020,3 +1020,28 @@ diagnostic.
 - Bidirectional inference beyond let-binding annotations (function
   return type, explicit type ascriptions on sub-expressions) —
   follow-up.
+
+## Operator-overload protocols (Wave Op series)
+
+The arithmetic-style operators promote to single-dispatch protocols
+following the same recipe as `Add` / `Sub` / `Mul` / `Div` (#246):
+
+| Operator | Protocol | Method | Notes |
+|---|---|---|---|
+| `+`  | `Add` | `add` | issue #246 / #180 |
+| `-`  | `Sub` | `sub` | issue #246 / #180 |
+| `*`  | `Mul` | `mul` | issue #246 / #180 |
+| `/`  | `Div` | `div` | issue #246 / #180 |
+| `%`  | `Rem` | `rem` | Wave Op-1 — Int impl only in v1 (no `fmod` in runtime) |
+
+Primitive `Int <op> Int` and `Real <op> Real` arithmetic stays on
+the unify-and-emit fast path — the typer rewrites to the protocol
+method only when both operands resolve to a concrete non-primitive
+type (or when issue #180's heterogeneous routing matches a
+registered impl). `//` (integer division) intentionally does **not**
+overload — modulo is the protocol case for user types (rationals,
+modular integers, residue rings); `//` keeps its Int-only contract.
+
+`Real % Real` is currently rejected (no `fmod` shim in stage0
+runtime); add the libc binding plus `impl Rem for Real` together
+when a use case appears.
