@@ -10,16 +10,28 @@ horizon beyond.
 
 ## Status snapshot
 
-- **HEAD**: `0.31.0` (R9 closed + R10/R11 diagnostic + lane handoff
-  authorization)
-- **Current target**: kaikai-Tongariki Wave 3 — m8.x disclaimer
-  sweep + residual items (issue #59). The runtime side of m8.x —
-  cooperative scheduler, cancel delivery, blocking mailbox
-  primitives, Link / Monitor / trap-exit — landed in `0.4.0`–
-  `0.21.0`; the open work is documentation alignment plus two
-  smaller residual items (full TyBranded region brand, per-op ROW
-  generics on Spawn). Waves 1, 2, and the MVP cierre shipped at
-  `0.24.0`–`0.27.0`.
+- **HEAD**: `0.43.0` (post protocols + ergonomics chain; #285
+  Ref-loop closure capture fix shipped 2026-05-05).
+- **Current target**: **kaikai-Anga Roa** — de-facto since
+  ~2026-05-03 with the protocols + ergonomics precondition chain.
+  Tongariki MVP closed 2026-05-02 via PR #73 (issue #59 — m8.x
+  disclaimer sweep). The chain that opened Anga Roa de facto:
+  - **Anga Roa precondition work (landed early)**: #246 / #245
+    (operator overloading via protocols + Complex stdlib),
+    #266 (positional record construction), #257 (Ref[T] in
+    Mutable effect), #260 / #261 (extern "C" fn syntax + name
+    override), #275 (`@` / `:=` Ref sugar), #267 phase 1
+    (Complex `i` literal), #180 (`protocol P[A]` single-dispatch
+    parametrised), #267 phase 2 (heterogeneous Complex
+    arithmetic), #174 (polymorphic impl bounded constraints),
+    #175 (stdlib polymorphic impls Show/Eq/Ord/Hash for
+    [T]/Option/Result), #258 (Default protocol + 6 impls).
+    These are prerequisites for the remaining Anga Roa scope
+    (LSP, REPL, m11 diagnostics quality, bench v1.x, check
+    shrinking, reuse-in-place, `check` v2 Arbitrary).
+  - **Distribution**: macOS arm64 tarball + GH Actions release
+    pipeline shipped at `0.39.0` (PR #278); private brew tap
+    available.
 - **Cross-cutting principles** (per CLAUDE.md):
   - Tier 1 #1 (memory safety + effects in types) — defendible
   - Tier 1 #2 (mandatory TCO) — defendible without footnote as of 0.23.0
@@ -37,18 +49,21 @@ Each milestone has scope, definition-of-done, estimated cost,
 and one optimization thread (so perf debt does not pile up to
 the end).
 
-### Tongariki — MVP
+### Tongariki — MVP — **CLOSED 2026-05-02**
 
 The 15-moai platform: the public face. Ship the language with
 the minimum testing and dev workflow that lets early adopters
-write real code. Delivered in waves; the MVP cierre (`0.27.0`)
-closed the original "ship a usable language" promise. The m8.x
-cooperative scheduler runtime that backs the actor and structured-
-concurrency surfaces shipped in `0.4.0` (R2 lane); **Wave 3**
-(issue #59) is the documentation sweep that brings stdlib and
-roadmap text in line with that runtime, plus the residual
-typer-side items (full `TyBranded` region brand, per-op ROW
-generics on Spawn).
+write real code. **Closed 2026-05-02** with PR #73 (issue #59 —
+Wave 3 m8.x disclaimer sweep). Today's PR #283 (2026-05-05) was
+a residual cleanup of secondary disclaimers in demos and
+`stdlib/effects.kai`; it shipped after Wave 3 was already closed
+and is not part of the gate.
+
+Delivered in waves; the MVP cierre (`0.27.0`) closed the original
+"ship a usable language" promise. The m8.x cooperative scheduler
+runtime that backs the actor and structured-concurrency surfaces
+shipped in `0.4.0` (R2 lane); **Wave 3** closed the documentation
+sweep plus the residual typer-side items.
 
 #### Wave 1 (`0.24.0`, shipped 2026-05-01) — `kai fmt` + TCO stage 1
 
@@ -86,7 +101,7 @@ generics on Spawn).
   Replaced drop specialisation as the Tongariki optimization
   thread.
 
-#### Wave 3 — m8.x disclaimer sweep + residual items (issue #59)
+#### Wave 3 — m8.x disclaimer sweep + residual items (issue #59) — **CLOSED 2026-05-02 (PR #73)**
 
 The cooperative scheduler runtime landed in `0.4.0` (R2 lane,
 2026-04-28): `swapcontext`-based fiber substrate, intrusive ready
@@ -140,8 +155,7 @@ context switch (Orongo), preemption / fairness guarantees (post-MVP
 per `docs/structured-concurrency.md` §*Non-goals*), distributed
 actors (Orongo+).
 
-**Definition of Done** (Tongariki overall, with Wave 3 closing the
-remaining gap):
+**Definition of Done** (Tongariki overall, all six items closed):
 
 1. `kai test`, `kai check`, `kai bench`, `kai fmt` all functional
    and exercised by fixtures under `examples/stdlib/` and a
@@ -163,19 +177,47 @@ remaining gap):
    gaps 1 and 2 closeable (coordinated PR follows on the ahu side);
    `docs/fibers-honesty-targets.md` Tier 1 / Tier 2 reflect the
    closed gap and the residual items have GitHub issues.
+   *(Closed 2026-05-02 via PR #73; secondary residuals swept by
+   PR #283 on 2026-05-05.)*
 
 **Estimated cost**: Waves 1+2+cierre shipped in ~2 weeks of agent
 work distributed across ~5 lanes. Wave 3 disclaimer sweep is one
 small lane (~1 day); the two residual typer items are independent
 lanes (~3–5d each) that can land in parallel with Anga Roa.
 
-### Anga Roa — pre-1.0
+### Anga Roa — pre-1.0 — **STARTED ~2026-05-03 (de facto)**
 
 "Hanga Roa" — the village where life happens. Polish the
 developer experience to the level where teams (not just
 hobbyists) can build with kaikai.
 
-**Scope**:
+**Started ~2026-05-03** with the protocols + ergonomics
+precondition chain (see *Status snapshot*); the remaining scope
+below tracks against issues #86 (m11 diagnostics), #210 (variant
++ record reuse-in-place), #92 (kai lsp), #120 (kai repl), and
+#264 (canonical grammar.md, doc-only — closes with this PR).
+
+**Scope — precondition work (landed early, 2026-05-03 → 2026-05-05)**:
+
+- Operator overloading via protocols + Complex stdlib (#246, #245).
+- Positional record construction `T { v1, v2 }` (#266).
+- `Ref[T]` in `Mutable` effect (#257).
+- `extern "C" fn` syntax + name override (#260, #261).
+- `@` / `:=` Ref sugar (#275).
+- Complex literal `i` suffix — phase 1 (#267).
+- `protocol P[A]` single-dispatch parametrised + heterogeneous
+  arithmetic — phase 2 (#180, #267 phase 2).
+- Polymorphic impl bounded constraints (#174).
+- Stdlib polymorphic impls Show/Eq/Ord/Hash for
+  [T]/Option/Result (#175).
+- Default protocol + 6 impls (#258).
+
+These unblock the rest of the scope below: m11 needs the
+diagnostic surface stabilised, LSP needs the protocol resolver,
+and `check` v2 (`Arbitrary`) needs `protocol P[A]` plus the
+polymorphic-impl machinery.
+
+**Scope — remaining**:
 
 - m11 diagnostics quality pass — Elm/Rust-grade error
   messages: "expected `Int`, found `String` at line N" with
@@ -214,7 +256,10 @@ hobbyists) can build with kaikai.
    produces a message at the bar set by the m11 acceptance
    fixtures (TBD as part of m11 design).
 
-**Estimated cost**: ~4–6 weeks. m11 + lsp are the heaviest
+**Estimated cost**: original 4–6 weeks; the precondition chain
+above already absorbed roughly two of those weeks. The six
+remaining items are estimated at **~3–5 weeks** at the agent-pace
+observed since 2026-05-03 — m11 + lsp are still the heaviest
 items; reuse-in-place is the optimization sub-lane.
 
 ### Orongo — 1.0.0

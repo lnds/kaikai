@@ -254,6 +254,12 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 
 ## Open decisions
 
+- **Canonical syntax reference**: `docs/grammar.md` is the single
+  reference for the full-kaikai surface grammar (BNF/EBNF) — lexical
+  structure, productions, precedence, sugar deltas, ambiguity rules,
+  reserved tokens. Stage 0's grammar is a strict subset and continues
+  to live in `docs/kaikai-minimal.md`.
+
 - **Concrete syntax consolidation** (kaikai-minimal stabilised; resolved item-by-item):
   - `let` vs `:=` — **resolved**: not redundant. `let` introduces an immutable binding; `:=` mutates a `var` cell or array slot (m7b #5, #6). Distinct operations.
   - `switch` / `cond` / `match` — **resolved**: `match` is the only form. Neither `switch` nor `cond` exist in kaikai-minimal (`kaikai-minimal.md` §`match`). No redundancy to remove.
