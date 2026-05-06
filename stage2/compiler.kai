@@ -13316,8 +13316,17 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
     EPlaceholder -> "kai_unit() /* placeholder */"
     ECall(f, args_e) -> emit_call_expr(src, f, args_e, lcs, fns, variants, lams, cls)
     EField(base, fname) -> {
+      # #293 Phase 1.2 — record field access RC discipline.
+      # `base` is owned by the time it lands here: perceus_pass wraps
+      # non-last reads of in-scope EVar in __perceus_dup, single-use
+      # reads transfer their ref, and ctor/call expressions return
+      # rc=1. `kai_op_field` increfs the field on read, so the base
+      # is no longer reachable through the result. Drop it to balance.
       let b = emit_expr(src, base, lcs, fns, variants, lams, cls)
-      cat5("kai_op_field(", b, ", \"", fname, "\")")
+      concat_all([
+        "({ KaiValue *_b = ", b,
+        "; KaiValue *_f = kai_op_field(_b, \"", fname, "\"); kai_decref(_b); _f; })"
+      ])
     }
     EIndex(_, _) -> "kai_unit() /* index: not used by bootstrap examples */"
     EBinop(op, a, b) -> {
@@ -13828,12 +13837,13 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
       # block so the destructured names stay in scope for the rest
       # of the block. Drops do not apply to destructured names; the
       # `drops` argument here is for PBind only.
+      # #293 Phase 1.3: same RC discipline as the no-drops path —
+      # alias=true so each binder increfs, then drop the composite.
       let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
       let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
                               int_to_string(pat.col)])
-      # _letv holds the RHS's owned ref; not aliased.
-      let binds = emit_pat_binds(src, pat, tmp, false, lcs, fns, variants, lams, cls)
-      concat_all(["KaiValue *", tmp, " = ", rhs_c, "; ", binds])
+      let binds = emit_pat_binds(src, pat, tmp, true, lcs, fns, variants, lams, cls)
+      concat_all(["KaiValue *", tmp, " = ", rhs_c, "; ", binds, "kai_decref(", tmp, "); "])
     }
   }
 }
@@ -13941,9 +13951,15 @@ fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, lcs: [String], fns: [EFn]
       let rhs_c = emit_expr(src, rhs, lcs, fns, variants, lams, cls)
       let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
                               int_to_string(pat.col)])
-      # _letv holds the RHS's owned ref; not aliased.
-      let binds = emit_pat_binds(src, pat, tmp, false, lcs, fns, variants, lams, cls)
-      concat_all(["KaiValue *", tmp, " = ", rhs_c, "; ", binds])
+      # #293 Phase 1.3 — destructuring let RC discipline. Treat children
+      # as alias storage (is_alias=true) so each PBind increfs, then
+      # drop `tmp` so the composite alloc balances. Field-typed children
+      # already incref via `kai_op_field`; the alias flip only changes
+      # cons.head/tail and var.args[i] sites which previously aliased
+      # without bumping the rc. The `kai_decref(tmp)` at the end of the
+      # binds releases the ownership transferred from the RHS.
+      let binds = emit_pat_binds(src, pat, tmp, true, lcs, fns, variants, lams, cls)
+      concat_all(["KaiValue *", tmp, " = ", rhs_c, "; ", binds, "kai_decref(", tmp, "); "])
     }
   }
 }
