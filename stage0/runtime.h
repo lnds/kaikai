@@ -1367,7 +1367,85 @@ static KAI_RC_NOINLINE KaiValue *kai_record(int n, KaiValue **fields, const char
     return v;
 }
 
+/* Issue #300 — nullary variant singletons.
+ *
+ * `None` alone accounts for 50.7M allocations / 50.0M leaked in
+ * the kaic2 self-compile (63.8% of total live count). Every
+ * `kai_variant(_, "None", 0, NULL)` call freshly allocs a chunk
+ * structurally identical to every other `None` chunk: same tag,
+ * same name pointer (string literal in .rodata), no payload. They
+ * differ only in identity, which kaikai source code never observes
+ * (variants don't have referential equality).
+ *
+ * The fix is the same trick already used for unit/bool/nil/cached
+ * ints/chars: keep one immortal chunk per `(tag, name_ptr)` pair,
+ * mark it `rc = INT32_MAX`, and return that pointer on every call.
+ * `kai_incref` / `kai_decref` already short-circuit on INT32_MAX
+ * so the singleton survives every RC operation unchanged and
+ * `kai_free_value` is never reached with a singleton.
+ *
+ * Storage — open-addressed table keyed on (tag, name_ptr). The
+ * name pointer is the address of a string literal in the binary's
+ * .rodata segment, so it's stable across calls and unique per
+ * distinct constructor. kaikai has on the order of 20-30 distinct
+ * nullary variants; 64 buckets gives ample headroom.
+ */
+#define KAI_NULLARY_SINGLETON_BUCKETS 64
+typedef struct {
+    int32_t       tag;
+    const char   *name;     /* NULL ⇒ empty bucket */
+    KaiValue     *value;
+} KaiNullarySingletonBucket;
+static KaiNullarySingletonBucket
+    kai_nullary_singletons[KAI_NULLARY_SINGLETON_BUCKETS];
+
+static inline size_t kai_nullary_hash(int32_t tag, const char *name) {
+    uintptr_t p = (uintptr_t) name;
+    return (size_t) (((p >> 4) ^ (p >> 12) ^ (uintptr_t) tag)
+                     & (KAI_NULLARY_SINGLETON_BUCKETS - 1));
+}
+
+static KaiValue *kai_nullary_lookup(int32_t tag, const char *name) {
+    size_t i = kai_nullary_hash(tag, name);
+    for (size_t probe = 0; probe < KAI_NULLARY_SINGLETON_BUCKETS; probe++) {
+        KaiNullarySingletonBucket *b = &kai_nullary_singletons[i];
+        if (b->name == NULL) return NULL;
+        if (b->tag == tag && b->name == name) return b->value;
+        i = (i + 1) & (KAI_NULLARY_SINGLETON_BUCKETS - 1);
+    }
+    return NULL;
+}
+
+static void kai_nullary_install(int32_t tag, const char *name, KaiValue *v) {
+    size_t i = kai_nullary_hash(tag, name);
+    for (size_t probe = 0; probe < KAI_NULLARY_SINGLETON_BUCKETS; probe++) {
+        KaiNullarySingletonBucket *b = &kai_nullary_singletons[i];
+        if (b->name == NULL) {
+            b->tag = tag;
+            b->name = name;
+            b->value = v;
+            return;
+        }
+        i = (i + 1) & (KAI_NULLARY_SINGLETON_BUCKETS - 1);
+    }
+    /* Table full — fall back to non-singleton behaviour. With 64
+     * buckets and a known cap of ~30 distinct nullary variants
+     * this branch is unreachable in practice. */
+}
+
 static KAI_RC_NOINLINE KaiValue *kai_variant(int32_t tag, const char *name, int n, KaiValue **args) {
+    if (n == 0 && name != NULL) {
+        KaiValue *cached = kai_nullary_lookup(tag, name);
+        if (cached) return cached;
+        KaiValue *v = kai_alloc(KAI_VARIANT);
+        v->as.var.variant_tag = tag;
+        v->as.var.variant_name = name;
+        v->as.var.n_args = 0;
+        v->as.var.args = NULL;
+        v->rc = INT32_MAX;
+        kai_nullary_install(tag, name, v);
+        return v;
+    }
     KaiValue *v = kai_alloc(KAI_VARIANT);
     v->as.var.variant_tag = tag;
     v->as.var.variant_name = name;
