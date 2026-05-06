@@ -2991,11 +2991,21 @@ test-perceus-issue82-asan: $(TARGET) build
 #                            inside `kai_reuse_or_alloc_cons`
 #                            balances the match-exit `kai_decref`
 #                            (RC discipline check).
-#   - reuse_record_basic     placeholder until the variant + record
-#                            recogniser arms re-enable; exercises
-#                            the standard `kai_record` allocator
-#                            path.
-#   - reuse_variant_basic    same shape, KAI_VARIANT.
+#   - reuse_record_basic     issue #210 — record recogniser fires on
+#                            `{ x, y, z } -> Point { x: f(x), y, z }`
+#                            shape; typer-aware predicate confirms
+#                            same-TyCon scrutinee and rebuild.
+#   - reuse_variant_basic    issue #210 — variant recogniser fires on
+#                            `TNode(...) -> TNode(...)` rebuild over
+#                            same-TyCon scrutinee.
+#   - reuse_variant_no_misfire
+#                            issue #210 — typer-aware shape predicate
+#                            rejects `Some(d) -> Some(false)` over a
+#                            `Maybe[Int]` scrutinee (would rebuild a
+#                            `Maybe[Bool]`, distinct mangle); the
+#                            sibling `Some(d) -> Some(d+1)` arm DOES
+#                            fire. Pins the regression that the
+#                            pre-#210 lexical predicate hit.
 #   - tco_double_incref_repro
 #                            issue #212 — TCO + Perceus dup
 #                            interaction on `[n, ...acc]`. Pre-fix
@@ -3006,6 +3016,7 @@ test-perceus-issue82-asan: $(TARGET) build
 PERCEUS_ISSUE118_FIXTURES := reuse_cons_basic reuse_alias_aborts \
                               reuse_pass_ordering reuse_record_basic \
                               reuse_variant_basic \
+                              reuse_variant_no_misfire \
                               tco_double_incref_repro
 
 test-perceus-issue118: $(TARGET) build
