@@ -32436,14 +32436,20 @@ fn pcs_recognise_reuse_expr(e: Expr) : Expr =
 
 fn pcs_recognise_reuse_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
   match k {
-    EMatch(scr, arms) ->
-      EMatch(pcs_recognise_reuse_expr(scr),
-             pcs_recognise_reuse_arms(arms))
+    EMatch(scr, arms) -> {
+      # The scrutinee's resolved type is the typer-aware shape
+      # predicate's anchor for variant + record arms (issue #210):
+      # a same-shape rebuild must produce a value whose
+      # `mangle_ty` matches the scrutinee's. `scr.ty` is populated
+      # by the typer + monomorphiser before perceus runs.
+      let new_scr = pcs_recognise_reuse_expr(scr)
+      EMatch(new_scr, pcs_recognise_reuse_arms(new_scr.ty, arms))
+    }
     _ -> map_expr_kind(k, pcs_recognise_reuse_expr)
   }
 }
 
-fn pcs_recognise_reuse_arms(arms: [Arm]) : [Arm] {
+fn pcs_recognise_reuse_arms(scr_ty: Option[Ty], arms: [Arm]) : [Arm] {
   match arms {
     [] -> []
     [a, ...rest] -> match a {
@@ -32454,11 +32460,11 @@ fn pcs_recognise_reuse_arms(arms: [Arm]) : [Arm] {
         # not run) — keep the conservative path.
         let body1 = pcs_recognise_reuse_expr(body)
         let body2 = match opt_g {
-          None    -> pcs_try_reuse_arm(pat, body1)
+          None    -> pcs_try_reuse_arm(scr_ty, pat, body1)
           Some(_) -> body1
         }
         [Arm(pat, opt_g, body2),
-         ...pcs_recognise_reuse_arms(rest)]
+         ...pcs_recognise_reuse_arms(scr_ty, rest)]
       }
     }
   }
@@ -32478,7 +32484,7 @@ fn pcs_mk_call(name: String, args: [Expr], line: Int, col: Int) : Expr =
             args),
          line: line, col: col, ty: None, mode: MUnknown }
 
-fn pcs_try_reuse_arm(pat: Pattern, body: Expr) : Expr {
+fn pcs_try_reuse_arm(scr_ty: Option[Ty], pat: Pattern, body: Expr) : Expr {
   match pat.pkind {
     # Cons rebuild — `[h, ...t] -> [g(h), ...recur(t)]`. Only the
     # single-head shape (one fixed sub-pattern + a rest binder) is
@@ -32493,11 +32499,54 @@ fn pcs_try_reuse_arm(pat: Pattern, body: Expr) : Expr {
         None -> body
       }
     }
-    # Variant + record rebuilds: deferred to a follow-up lane.
-    # The post-`pcs_rewrite_expr` pattern shape needs more careful
-    # arity / shape-matching checks than v1 ships — see
-    # docs/perceus-anga-roa-phase0-audit.md §1 for the upgrade path.
+    # Variant rebuild — `Some(d) -> Some(g(d))`. Issue #210: the
+    # shape predicate compares the resolved scrutinee type to the
+    # rebuild expression's resolved type. Both must be `TyCon`s
+    # with the same head name and tparams (equal `mangle_ty`); a
+    # rebuild like `Some(d) -> Some(false)` over `Maybe[Int]`
+    # produces `Maybe[Bool]` and is rejected.
+    PVariant(_cname, ps) ->
+      if pcs_shape_matches(scr_ty, body.ty) {
+        pcs_try_reuse_variant(body, list_length(ps))
+      } else { body }
+    # Record rebuild — `{ a, b } -> Rec { a: f(a), b }`. Same shape
+    # predicate as variants; field count must also match (already
+    # enforced inside `pcs_try_reuse_record`).
+    PRecord(pfs) ->
+      if pcs_shape_matches(scr_ty, body.ty) {
+        pcs_try_reuse_record(body, list_length(pfs))
+      } else { body }
     _ -> body
+  }
+}
+
+# Issue #210 typer-aware shape predicate. Both the scrutinee and the
+# rebuild expression must have a resolved type, and the canonical
+# `mangle_ty` must match (head TyCon name + tparams). This blocks
+# the original lexical-predicate failure mode (`Some(d) -> Some(false)`
+# over `Maybe[Int]` rebuilds a `Maybe[Bool]` cell) without depending
+# on lexer-level heuristics. Conservative on `None` / unresolved
+# types (`TyAny`, `TyVarT`): no reuse fires when the typer didn't
+# pin a concrete shape.
+fn pcs_shape_matches(t1: Option[Ty], t2: Option[Ty]) : Bool {
+  match t1 {
+    None -> false
+    Some(a) -> match t2 {
+      None -> false
+      Some(b) -> {
+        if pcs_ty_concrete(a) and pcs_ty_concrete(b) {
+          mangle_ty(a) == mangle_ty(b)
+        } else { false }
+      }
+    }
+  }
+}
+
+fn pcs_ty_concrete(t: Ty) : Bool {
+  match t {
+    TyVarT(_) -> false
+    TyAny     -> false
+    _         -> true
   }
 }
 
@@ -32522,9 +32571,15 @@ fn pcs_try_reuse_cons(body: Expr) : Expr {
 
 fn pcs_try_reuse_variant(body: Expr, expected_arity: Int) : Expr {
   match body.kind {
-    ECall(callee, args) -> match callee.kind {
-      EVar(_cname) ->
-        if list_length(args) == expected_arity and pcs_callee_is_variant_ctor(callee) {
+    ECall(callee, cargs) -> match callee.kind {
+      EVar(cname) ->
+        # The shape predicate (mangle_ty match) confirms the rebuild
+        # produces the same TyCon as the scrutinee, but it does not
+        # distinguish a variant constructor from a function call that
+        # returns the same type (e.g. `fn make_some(x: Int) : Maybe[Int]`).
+        # The lexical uppercase check filters out non-ctor callees;
+        # combined with the typer-aware shape match it is sound.
+        if list_length(cargs) == expected_arity and pcs_name_is_ctor(cname) {
           pcs_mk_call("__perceus_reuse_variant",
                       [pcs_mk_scr(body.line, body.col), body],
                       body.line, body.col)
@@ -32535,19 +32590,10 @@ fn pcs_try_reuse_variant(body: Expr, expected_arity: Int) : Expr {
   }
 }
 
-# Heuristic: a constructor name in kaikai starts with an uppercase
-# letter. The emitter lowers `EVar(C)`-shaped callees to
-# `kai_variant(...)` when the typer-emit chain has classified them
-# as variant ctors (see `emit_call_expr`'s `is_variant_call` branch);
-# we use the same lexical signal here so the recogniser stays inside
-# the perceus pass without depending on typer state.
-fn pcs_callee_is_variant_ctor(e: Expr) : Bool {
-  match e.kind {
-    EVar(nm) -> match char_at(nm, 0) {
-      Some(c) -> c >= 'A' and c <= 'Z'
-      None    -> false
-    }
-    _ -> false
+fn pcs_name_is_ctor(nm: String) : Bool {
+  match char_at(nm, 0) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None    -> false
   }
 }
 
@@ -35001,6 +35047,8 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_match_panic(%KaiValue*)\n",
     "declare %KaiValue* @kaix_cons(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_reuse_or_alloc_cons(%KaiValue*, %KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_reuse_or_alloc_record(%KaiValue*, i32, %KaiValue**, i8**)\n",
+    "declare %KaiValue* @kaix_reuse_or_alloc_variant(%KaiValue*, i32, i8*, i32, %KaiValue**)\n",
     "declare %KaiValue* @kaix_incref(%KaiValue*)\n",
     "declare void         @kaix_decref(%KaiValue*)\n",
     "declare %KaiValue* @kaix_nil()\n",
@@ -36239,6 +36287,89 @@ fn llvm_emit_record_lit(e: LlvmEmit, nm: String, fis: [FieldInit]) : LlvmEmit {
   }
 }
 
+# issue #210 — LLVM lowering for the record reuse-in-place magic call.
+# Mirrors `llvm_emit_record_lit` but routes through
+# `kaix_reuse_or_alloc_record(scr, n, fields, names)`. The recogniser
+# guarantees the field-init list is non-empty (zero-arity records
+# never trigger the rebuild-shape match in `pcs_try_reuse_arm`).
+fn llvm_emit_reuse_record(e: LlvmEmit, scr_e: Expr, fis: [FieldInit]) : LlvmEmit {
+  let n = list_length(fis)
+  let r_scr = llvm_emit_expr(e, scr_e)
+  if n == 0 {
+    let r = llvm_fresh_reg(r_scr)
+    let instr = concat_all([
+      "  ", r.reg,
+      " = call %KaiValue* @kaix_reuse_or_alloc_record(%KaiValue* ",
+      r_scr.last_val,
+      ", i32 0, %KaiValue** null, i8** null)\n"
+    ])
+    llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+  } else {
+    let fb = llvm_fresh_reg(r_scr)
+    let fb_i = concat_all([
+      "  ", fb.reg, " = alloca %KaiValue*, i32 ", int_to_string(n), "\n"
+    ])
+    let e1 = llvm_append_body(fb.e, fb_i)
+    let nb = llvm_fresh_reg(e1)
+    let nb_i = concat_all([
+      "  ", nb.reg, " = alloca i8*, i32 ", int_to_string(n), "\n"
+    ])
+    let e2 = llvm_append_body(nb.e, nb_i)
+    let e3 = llvm_emit_rec_fill(e2, fb.reg, nb.reg, fis, 0)
+    let r = llvm_fresh_reg(e3)
+    let instr = concat_all([
+      "  ", r.reg,
+      " = call %KaiValue* @kaix_reuse_or_alloc_record(%KaiValue* ",
+      r_scr.last_val,
+      ", i32 ", int_to_string(n),
+      ", %KaiValue** ", fb.reg, ", i8** ", nb.reg, ")\n"
+    ])
+    llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+  }
+}
+
+# issue #210 — LLVM lowering for the variant reuse-in-place magic call.
+# Same shape as `llvm_emit_variant_ctor` but routes through
+# `kaix_reuse_or_alloc_variant(scr, 0, name, n, args)`.
+fn llvm_emit_reuse_variant(e: LlvmEmit, scr_e: Expr,
+                            cname: String, xs: [Expr]) : LlvmEmit {
+  let n = list_length(xs)
+  let r_scr = llvm_emit_expr(e, scr_e)
+  let name_label_id = llvm_fresh_label(r_scr, "var.")
+  let name_label = name_label_id.reg
+  let name_body = cname
+  let name_len = string_length(name_body) + 1
+  let e1 = llvm_append_global(name_label_id.e, llvm_emit_string_const(name_label, name_body))
+  if n == 0 {
+    let r = llvm_fresh_reg(e1)
+    let instr = concat_all([
+      "  ", r.reg,
+      " = call %KaiValue* @kaix_reuse_or_alloc_variant(%KaiValue* ",
+      r_scr.last_val,
+      ", i32 0, i8* ", llvm_gep_str(name_label, name_len),
+      ", i32 0, %KaiValue** null)\n"
+    ])
+    llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+  } else {
+    let ra = llvm_emit_args(e1, xs, [])
+    let buf = llvm_fresh_reg(ra.st)
+    let alloc_instr = concat_all([
+      "  ", buf.reg, " = alloca %KaiValue*, i32 ", int_to_string(n), "\n"
+    ])
+    let e2 = llvm_append_body(buf.e, alloc_instr)
+    let e3 = llvm_emit_variant_stores(e2, buf.reg, ra.regs, 0)
+    let r = llvm_fresh_reg(e3)
+    let call_instr = concat_all([
+      "  ", r.reg,
+      " = call %KaiValue* @kaix_reuse_or_alloc_variant(%KaiValue* ",
+      r_scr.last_val,
+      ", i32 0, i8* ", llvm_gep_str(name_label, name_len),
+      ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"
+    ])
+    llvm_set_last(llvm_append_body(r.e, call_instr), r.reg)
+  }
+}
+
 fn llvm_emit_rec_fill(e: LlvmEmit, fb: String, nb: String, fis: [FieldInit], i: Int) : LlvmEmit {
   match fis {
     [] -> e
@@ -36496,6 +36627,36 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
         let instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_reuse_or_alloc_cons(",
                                 llvm_format_args(ra.regs), ")\n"])
         llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+      } else if nm == "__perceus_reuse_record" {
+        # issue #210 — LLVM mirror of the record reuse-in-place
+        # lowering. Recogniser synthesises
+        # `__perceus_reuse_record(__pcs_scr, {f: v, ...})` with the
+        # 2nd arg always an ERecordLit; we extract its fields and
+        # call `kaix_reuse_or_alloc_record(scr, n, fields, names)`.
+        match xs {
+          [scr_e, lit] -> match lit.kind {
+            ERecordLit(_, fis) -> llvm_emit_reuse_record(e, scr_e, fis)
+            _ -> llvm_set_last(e, "undef")
+          }
+          _ -> llvm_set_last(e, "undef")
+        }
+      } else if nm == "__perceus_reuse_variant" {
+        # issue #210 — LLVM mirror of the variant reuse-in-place
+        # lowering. Recogniser synthesises
+        # `__perceus_reuse_variant(__pcs_scr, Ctor(args...))` with
+        # the 2nd arg always an `ECall(EVar(cname), cargs)`; we
+        # unpack the ctor name + args and call
+        # `kaix_reuse_or_alloc_variant(scr, 0, name, n, args)`.
+        match xs {
+          [scr_e, ctor] -> match ctor.kind {
+            ECall(cf, cargs) -> match cf.kind {
+              EVar(cname) -> llvm_emit_reuse_variant(e, scr_e, cname, cargs)
+              _ -> llvm_set_last(e, "undef")
+            }
+            _ -> llvm_set_last(e, "undef")
+          }
+          _ -> llvm_set_last(e, "undef")
+        }
       } else if nm == "__strip_unit" {
         # m12.8 phase 2: identity at runtime — emit the inner value
         # directly. See the matching C-emit branch for full context.

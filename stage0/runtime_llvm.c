@@ -166,6 +166,19 @@ KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t) {
   return kai_reuse_or_alloc_cons(scr, h, t);
 }
 
+/* issue #210 — record + variant reuse-in-place. Same shape as the
+ * cons wrapper: the LLVM emit synthesises a call with the same
+ * argument layout as `kai_record` / `kai_variant`, with the consumed
+ * scrutinee as the leading parameter. */
+KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n,
+                                     KaiValue **fields, const char **names) {
+  return kai_reuse_or_alloc_record(scr, n, fields, names);
+}
+KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag,
+                                      const char *name, int n, KaiValue **args) {
+  return kai_reuse_or_alloc_variant(scr, tag, name, n, args);
+}
+
 /* Used by lambda thunks to read their captured values from the
    closure's self parameter. i is the capture's index. */
 KaiValue *kaix_capture(KaiValue *self, int i)             { return kai_incref(self->as.clo.captures[i]); }
