@@ -84,6 +84,22 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.44.1 (2026-05-07)
+
+### Fixed
+
+- **runtime**: bump KAI_IMMORTAL_VAR_BUCKETS 16384 -> 262144
+- **perceus**: closure capture lifecycle — drop leak rate from 27.97% to 1.14%
+- **test-runner**: exclude prelude-origin tests from `kai test <file>` (closes #318)
+- **emit**: escape triple-quote string contents in C codegen (closes #311)
+- **typer**: Real literals stay Real through binop typing (closes #312)
+- **emit**: inject pre-goto _scr decref when match-arm tail is tcrec sentinel
+
+### Changed
+
+- **pipeline**: reorder perceus before tcrec — eliminate implicit coupling (Eric review 2026-05-06)
+- **compiler**: remove redundant // integer-division operator (closes #315)
+
 ## v0.44.0 (2026-05-06)
 
 ### Added
