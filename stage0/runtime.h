@@ -1552,8 +1552,78 @@ static KAI_RC_NOINLINE KaiValue *kai_str_from_bytes(const char *bytes, size_t le
     return v;
 }
 
+/* Lane FIX (top-3 leak sites): short-string interning.
+ *
+ * `prelude_table()` (DIAG rank #1) reallocates ~50 strings per call —
+ * every call to `prelude_find` rebuilds the same `.rodata`-pointed
+ * literals. The strings are content-deduped by the C compiler, so
+ * repeat `kai_str("print")` calls receive the *same* `cstr` pointer.
+ * Interning by pointer-then-content gives an immortal singleton per
+ * literal, eliminating the per-call alloc/leak the same way
+ * #300 / #304 did for nullary and immortal-payload variants.
+ *
+ * Two-stage lookup (open-addressed, 1024 buckets):
+ *   1. Pointer match — hits 100% of compiler-emitted literal calls
+ *      because identical literals share a single .rodata entry.
+ *   2. Content match (≤ 64 bytes) — backstop for cstr's that arrive
+ *      via stack buffers (`int_to_string`, `kai_cat2(...)`) and
+ *      happen to repeat content.
+ *
+ * Misses (long strings, full table, transient content unique per
+ * call) fall through to `kai_str_from_bytes` unchanged.
+ *
+ * Cached values carry `rc = INT32_MAX` so `kai_incref` / `kai_decref`
+ * short-circuit; `kai_free_value` is never reached. */
+#define KAI_STR_INTERN_BUCKETS 1024
+#define KAI_STR_INTERN_MAXLEN  64
+typedef struct {
+    const char *cstr;       /* NULL ⇒ empty bucket. Owned via strdup. */
+    size_t      len;
+    KaiValue   *value;
+} KaiStrInternBucket;
+static KaiStrInternBucket kai_str_intern_table[KAI_STR_INTERN_BUCKETS];
+
+static inline size_t kai_str_intern_hash(const char *cstr, size_t len) {
+    /* FNV-1a, len-bounded. */
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t) (uint8_t) cstr[i];
+        h *= 1099511628211ull;
+    }
+    return (size_t) (h & (KAI_STR_INTERN_BUCKETS - 1));
+}
+
 static KAI_RC_NOINLINE KaiValue *kai_str(const char *cstr) {
-    return kai_str_from_bytes(cstr, strlen(cstr));
+    size_t len = strlen(cstr);
+    if (len > KAI_STR_INTERN_MAXLEN) return kai_str_from_bytes(cstr, len);
+    size_t i = kai_str_intern_hash(cstr, len);
+    for (size_t probe = 0; probe < KAI_STR_INTERN_BUCKETS; probe++) {
+        KaiStrInternBucket *b = &kai_str_intern_table[i];
+        if (b->cstr == NULL) {
+            /* Insert. Allocate the immortal value + own a copy of cstr
+             * (cstr arg may be a stack buffer that gets reused). */
+            KaiValue *v = kai_str_from_bytes(cstr, len);
+            v->rc = INT32_MAX;
+            char *owned = (char *) malloc(len + 1);
+            if (owned) {
+                memcpy(owned, cstr, len);
+                owned[len] = '\0';
+                b->cstr = owned;
+                b->len = len;
+                b->value = v;
+            }
+            /* Even if strdup failed, the value is still valid (just
+             * not cacheable). Subsequent calls re-alloc but stay
+             * correct. */
+            return v;
+        }
+        if (b->len == len && (b->cstr == cstr || memcmp(b->cstr, cstr, len) == 0)) {
+            return b->value;
+        }
+        i = (i + 1) & (KAI_STR_INTERN_BUCKETS - 1);
+    }
+    /* Table full — fall back to non-cached. */
+    return kai_str_from_bytes(cstr, len);
 }
 
 static KaiValue *kai_nil(void) { return &kai_singleton_nil; }
