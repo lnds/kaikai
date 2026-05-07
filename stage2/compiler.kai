@@ -28445,9 +28445,79 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
   # structural — `name`'s narrow type was bound during typing in
   # `check_narrow_pattern`, so the body's typed AST is already
   # consistent.
-  let arms_codegen = expand_narrow_arms(ra.arms, st_post.env)
+  let arms_narrowed = expand_narrow_arms(ra.arms, st_post.env)
+  # issue #325: the parser emits `PVariantRecord(name, fields)` for
+  # any `Name { ... }` pattern, even when `Name` is a record alias
+  # (`type P = { x: Int, y: Int }`) rather than a sum-type ctor with
+  # named fields. The typer accepts both shapes via
+  # `check_variant_record_pattern`, but the emitter's
+  # `emit_pat_test_variant_record` always tests `KAI_VARIANT` — which
+  # never matches a `KAI_RECORD` value, so the arm falls through to
+  # the runtime "non-exhaustive match" panic. Rewriting to `PRecord`
+  # post-typing routes codegen through `emit_pat_test_record` (the
+  # `KAI_RECORD` check) without touching the typer.
+  let arms_codegen = rewrite_record_alias_arms(arms_narrowed, st_post.recs)
   let root = with_ty(mk_expr(EMatch(rs_.expr, arms_codegen), line, col), ty)
   mk_inferred(st_post, ty, root)
+}
+
+# issue #325: walk arms and rewrite `PVariantRecord(name, fields)` to
+# `PRecord(fields)` whenever `name` is a record-alias declaration
+# (registered in `recs` via `collect_records`). Recurses into nested
+# patterns so a `PVariantRecord` buried inside `PAs` / `PList` /
+# another record field is also rewritten.
+fn rewrite_record_alias_arms(arms: [Arm], recs: [RecInfo]) : [Arm] {
+  match arms {
+    [] -> []
+    [a, ...rest] -> match a {
+      Arm(pat, guard, body) ->
+        [Arm(rewrite_record_alias_pat(pat, recs), guard, body),
+         ...rewrite_record_alias_arms(rest, recs)]
+    }
+  }
+}
+
+fn rewrite_record_alias_pat(pat: Pattern, recs: [RecInfo]) : Pattern {
+  match pat.pkind {
+    PVariantRecord(name, fs) -> {
+      let fs_r = rewrite_record_alias_pfields(fs, recs)
+      match rec_find(recs, name) {
+        Some(_) -> Pattern { pkind: PRecord(fs_r), line: pat.line, col: pat.col }
+        None    -> Pattern { pkind: PVariantRecord(name, fs_r), line: pat.line, col: pat.col }
+      }
+    }
+    PRecord(fs) ->
+      Pattern { pkind: PRecord(rewrite_record_alias_pfields(fs, recs)),
+                line: pat.line, col: pat.col }
+    PVariant(name, subs) ->
+      Pattern { pkind: PVariant(name, rewrite_record_alias_pat_list(subs, recs)),
+                line: pat.line, col: pat.col }
+    PList(subs, rest) ->
+      Pattern { pkind: PList(rewrite_record_alias_pat_list(subs, recs), rest),
+                line: pat.line, col: pat.col }
+    PAs(name, inner) ->
+      Pattern { pkind: PAs(name, rewrite_record_alias_pat(inner, recs)),
+                line: pat.line, col: pat.col }
+    _ -> pat
+  }
+}
+
+fn rewrite_record_alias_pat_list(ps: [Pattern], recs: [RecInfo]) : [Pattern] {
+  match ps {
+    [] -> []
+    [p, ...rest] -> [rewrite_record_alias_pat(p, recs),
+                     ...rewrite_record_alias_pat_list(rest, recs)]
+  }
+}
+
+fn rewrite_record_alias_pfields(fs: [PField], recs: [RecInfo]) : [PField] {
+  match fs {
+    [] -> []
+    [f, ...rest] -> match f {
+      PField(name, sub, sh) -> [PField(name, rewrite_record_alias_pat(sub, recs), sh),
+                                ...rewrite_record_alias_pfields(rest, recs)]
+    }
+  }
 }
 
 # issue #187 phase 3: rewrite every `PNarrow(name, T)` arm into a
