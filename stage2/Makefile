@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs test-rc-trace-callsite selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs test-rc-trace-callsite selfhost
 
 all: $(TARGET)
 
@@ -458,6 +458,23 @@ test-ffi-extern-c: $(TARGET) build
 	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-llvm.out > /dev/null \
 	  && echo "ffi-extern-c OK (LLVM backend)" \
 	  || { echo "ffi-extern-c DIFF (LLVM backend)"; diff ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-llvm.out; exit 1; }
+
+# Issue #315 fixture — the `//` integer-division operator was
+# retired in favour of plain `/` (which already truncates on `Int`
+# operands via the `Div[Int]` primitive impl, post-#246). Source
+# still using `//` must be rejected at lex time with a migration
+# message pointing at `/`.
+test-issue-315-no-double-slash: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/aspirational/issue_315_no_double_slash.err.kai \
+	    > build/issue_315_no_double_slash.out 2>&1 \
+	  && { echo "issue_315 DID NOT FAIL — `//` should be rejected"; exit 1; } \
+	  || true; \
+	grep -F "$$(head -1 ../examples/aspirational/issue_315_no_double_slash.err.expected)" \
+	     build/issue_315_no_double_slash.out > /dev/null \
+	  && echo "issue_315 OK (rejection diagnostic matches)" \
+	  || { echo "issue_315 DIFF — expected migration message not in output"; \
+	       cat build/issue_315_no_double_slash.out; exit 1; }
 
 # Issue #260 / #261 fixtures — the spec-aligned `extern "C" fn`
 # syntax and the optional `("real_symbol")` name override. The basic
@@ -2821,11 +2838,14 @@ test-unbox-phase2: $(TARGET) build
 	        build/perceus-unbox_phase2_r8_let_in_interp.c; then \
 	  echo "unbox FAIL r8_let_in_interp (raw kair_n survived; demote did not fire)"; exit 1; \
 	fi
-	@# Issue #90 — `^` (integer power) and `//` (integer division) on
-	@# raw operands must inline. The C emit unrolls `b ^ n` into
-	@# `(b)*(b)*…` and lowers `a // b` to native `/`. Diff against the
-	@# expected output, then grep the inner-loop body to assert no
-	@# `kai_op_pow_int(` / `kai_op_idiv(` calls survived.
+	@# Issue #90 — `^` (integer power) and integer division on raw
+	@# operands must inline. The C emit unrolls `b ^ n` into
+	@# `(b)*(b)*…` and lowers `a / b` (Int / Int) to native `/`. Diff
+	@# against the expected output, then grep the inner-loop body to
+	@# assert no `kai_op_pow_int(` / `kai_op_div(` calls survived.
+	@# (Post-#315 the dedicated `//` operator is gone; `Int / Int`
+	@# already produces truncating division via the `Div[Int]` impl,
+	@# and the unbox pass routes raw-Int `/` to native C `/` directly.)
 	@diff -q ../examples/perceus/unbox_phase2_pow_idiv.out.expected \
 	        build/perceus-unbox_phase2_pow_idiv.out > /dev/null \
 	  || { echo "unbox FAIL pow_idiv (output mismatch)"; \
@@ -2834,12 +2854,12 @@ test-unbox-phase2: $(TARGET) build
 	@grep -F -q 'int64_t kair_b' build/perceus-unbox_phase2_pow_idiv.c \
 	  || { echo "unbox FAIL pow_idiv (kair_b not raw; ^ stayed boxed)"; exit 1; }
 	@grep -F -q 'int64_t kair_c' build/perceus-unbox_phase2_pow_idiv.c \
-	  || { echo "unbox FAIL pow_idiv (kair_c not raw; // stayed boxed)"; exit 1; }
+	  || { echo "unbox FAIL pow_idiv (kair_c not raw; / stayed boxed)"; exit 1; }
 	@if grep -E 'kai_pow_idiv_inner_loop\(void\) \{[^}]*kai_op_pow_int\(' build/perceus-unbox_phase2_pow_idiv.c; then \
 	  echo "unbox FAIL pow_idiv (kai_op_pow_int survived inside body)"; exit 1; \
 	fi
-	@if grep -E 'kai_pow_idiv_inner_loop\(void\) \{[^}]*kai_op_idiv\(' build/perceus-unbox_phase2_pow_idiv.c; then \
-	  echo "unbox FAIL pow_idiv (kai_op_idiv survived inside body)"; exit 1; \
+	@if grep -E 'kai_pow_idiv_inner_loop\(void\) \{[^}]*kai_op_div\(' build/perceus-unbox_phase2_pow_idiv.c; then \
+	  echo "unbox FAIL pow_idiv (kai_op_div survived inside body)"; exit 1; \
 	fi
 	@# Issue #91 — PBind catch-all in the M5 fast path. The fixture
 	@# lives outside the `unbox_phase2_*.kai` glob (its scope is
@@ -3383,7 +3403,7 @@ test-rc-trace-callsite: $(TARGET) build
 	  || { echo "rc-trace-callsite NO site rows"; cat build/rc_trace_callsite.err; exit 1; }; \
 	echo "rc-trace-callsite OK"
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars test-rc-trace-callsite
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -3392,7 +3412,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-unions test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-unions test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars
 
 clean:
 	rm -rf build $(TARGET)
