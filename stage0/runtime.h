@@ -1836,12 +1836,21 @@ static void kai_nullary_install(int32_t tag, const char *name, KaiValue *v) {
  * results that are themselves nullary variants or cached scalars.
  *
  * Storage — open-addressed table keyed on (tag, name, n, args[0..n]).
- * Capped at n <= 4 to bound the key size. 16384 buckets gives
- * ample room for the realistic combination space (Some/Ok/Err
- * × ~tens of payload singletons). Collisions degrade to a fresh
- * non-cached alloc — same behaviour as a full nullary table.
+ * Capped at n <= 4 to bound the key size. Once the table fills,
+ * subsequent lookups walk every bucket without finding the empty
+ * sentinel, so installs silently fail and every later invocation
+ * falls back to a fresh alloc. The 16384-bucket sizing originally
+ * landed for #293 turned out to be ~16x too small for kaic2's
+ * self-compile: the typer's `prelude_table` rebuilds 47 EP variants
+ * per call × ~13K calls (issue #297 EP wave, 2026-05-07), and
+ * Some/Ok/TyCon-shaped immortal-payload combinations push the
+ * working set past 16K well before the prelude entries land. The
+ * larger 262144-bucket sizing absorbs the EP table outright (642K
+ * leaks → 45 cached chunks, 99.99% drop) and adds ~16 MB of static
+ * .bss to the binary. Collisions still degrade to a fresh non-cached
+ * alloc — same behaviour as a full nullary table.
  */
-#define KAI_IMMORTAL_VAR_BUCKETS 16384
+#define KAI_IMMORTAL_VAR_BUCKETS 262144
 #define KAI_IMMORTAL_VAR_MAXN 4
 typedef struct {
     int32_t       tag;
