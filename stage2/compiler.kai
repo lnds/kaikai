@@ -44730,29 +44730,40 @@ type Mode
   | MFmtCheck
 
 type CliOptions = { mode: Mode, path: Option[String], preludes: [String],
-                    strict_holes: Bool, search_paths: [String] }
+                    strict_holes: Bool, search_paths: [String],
+                    include_prelude_tests: Bool }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
   CliOptions { mode: m, path: opts.path, preludes: opts.preludes,
-               strict_holes: opts.strict_holes, search_paths: opts.search_paths }
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               include_prelude_tests: opts.include_prelude_tests }
 
 fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, path: Some(p), preludes: opts.preludes,
-               strict_holes: opts.strict_holes, search_paths: opts.search_paths }
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               include_prelude_tests: opts.include_prelude_tests }
 
 fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path,
                preludes: list_append(opts.preludes, [p]),
-               strict_holes: opts.strict_holes, search_paths: opts.search_paths }
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               include_prelude_tests: opts.include_prelude_tests }
 
 fn cli_with_strict_holes(opts: CliOptions) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
-               strict_holes: true, search_paths: opts.search_paths }
+               strict_holes: true, search_paths: opts.search_paths,
+               include_prelude_tests: opts.include_prelude_tests }
 
 fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                strict_holes: opts.strict_holes,
-               search_paths: list_append(opts.search_paths, [sp]) }
+               search_paths: list_append(opts.search_paths, [sp]),
+               include_prelude_tests: opts.include_prelude_tests }
+
+fn cli_with_include_prelude_tests(opts: CliOptions) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               include_prelude_tests: true }
 
 fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
   match rest {
@@ -44806,6 +44817,16 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MBench))
       } else if a == "--prop-check" {
         parse_cli_loop(more, cli_with_mode(opts, MPropCheck))
+      } else if a == "--include-prelude-tests" {
+        # Issue #318: by default, `--prelude` files contribute their
+        # decls but their `test "..."` blocks are dropped at load
+        # time so `kai test <file>` only runs the file's own tests.
+        # This flag opts into the legacy behaviour — used by the
+        # kaikai project's own `make test-stdlib-core-intrinsic`
+        # gate (already passes the target file as the source, so
+        # the flag is a no-op there) and any tooling that wants
+        # prelude tests counted in.
+        parse_cli_loop(more, cli_with_include_prelude_tests(opts))
       } else if a == "-h" or a == "--help" {
         parse_cli_loop(more, cli_with_mode(opts, MHelp))
       } else if a == "-V" or a == "--version" {
@@ -44835,7 +44856,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
 
 fn parse_cli(argv: [String]) : CliOptions {
   parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, preludes: [],
-                                    strict_holes: false, search_paths: [] })
+                                    strict_holes: false, search_paths: [],
+                                    include_prelude_tests: false })
 }
 
 fn usage() : Unit / Console {
@@ -44862,6 +44884,7 @@ fn usage() : Unit / Console {
   eprint("  --fmt              pretty-print canonical kaikai source to stdout (Tongariki)")
   eprint("  --fmt-check        write formatted source to stdout iff different from input; exit 1")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
+  eprint("  --include-prelude-tests  also run test blocks defined inside --prelude files (default: drop them; issue #318)")
   eprint("  -h, --help         this help")
   eprint("  -V, --version      print version and exit")
 }
@@ -44890,7 +44913,17 @@ fn prelude_module_name(path: String) : String {
 
 # Parse a prelude file and return its decl list paired with a
 # ModuleEntry. On any error report to stderr and return None.
-fn load_prelude(path: String) : Option[PreludeLoaded] / Console + File {
+#
+# Issue #318: when `include_prelude_tests` is false (the default),
+# every `DTest` / `DBench` / `DCheck` block authored in the prelude
+# file is dropped here. Without this filter `kai test <user.kai>`
+# also runs every stdlib test block, since the prelude is parsed
+# and concatenated into the same flat decl stream the test runner
+# walks. The kaikai project's own `make test-stdlib-core-intrinsic`
+# gate is unaffected: it passes the stdlib file as the *target*
+# (which keeps its own test blocks intact through `compile_source`)
+# and only the OTHER core modules sit in `--prelude`.
+fn load_prelude(path: String, include_tests: Bool) : Option[PreludeLoaded] / Console + File {
   match read_file(path) {
     Err(msg) -> { eprint("kaic1: #{path}: #{msg}"); None }
     Ok(src) -> {
@@ -44903,17 +44936,32 @@ fn load_prelude(path: String) : Option[PreludeLoaded] / Console + File {
           None -> None
           Some(ds) -> {
             let mod_name = prelude_module_name(path)
-            let exports = collect_pub_exports(ds, [])
+            let kept = if include_tests { ds } else { strip_prelude_tests(ds, []) }
+            let exports = collect_pub_exports(kept, [])
             # m6.2 v2: tag every DFn coming from this prelude file
             # with `module_origin = Some(<basename>)` so the codegen
             # mints `kai_<basename>__<name>` for it. Decls authored
             # in the root file keep `None` (set by the parser).
-            let tagged = tag_decls_module_origin(ds, mod_name)
+            let tagged = tag_decls_module_origin(kept, mod_name)
             Some(PL(tagged, ME(mod_name, exports, path)))
           }
         }
       }
     }
+  }
+}
+
+# Issue #318: drop every `test`/`bench`/`check` block from a prelude
+# file's parsed decls. Public exports, types, effects, protocols,
+# imports etc. all pass through untouched. Tail-recursive accumulator
+# keeps the original order.
+fn strip_prelude_tests(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DTest(_, _, _, _)         -> strip_prelude_tests(rest, acc)
+    DBench(_, _, _, _)        -> strip_prelude_tests(rest, acc)
+    DCheck(_, _, _, _, _)     -> strip_prelude_tests(rest, acc)
+    _                          -> strip_prelude_tests(rest, [d, ...acc])
   }
 }
 
@@ -45001,12 +45049,12 @@ type PreludesLoaded = PLS([Decl], [ModuleEntry])
 # Load every prelude file in `paths`, concatenating their decls in
 # argument order and accumulating one ModuleEntry per file. Returns
 # None if any single load fails. Empty list yields Some(PLS([], [])).
-fn load_preludes(paths: [String], acc_decls: [Decl], acc_mods: [ModuleEntry]) : Option[PreludesLoaded] = match paths {
+fn load_preludes(paths: [String], include_tests: Bool, acc_decls: [Decl], acc_mods: [ModuleEntry]) : Option[PreludesLoaded] = match paths {
   [] -> Some(PLS(acc_decls, acc_mods))
-  [p, ...rest] -> match load_prelude(p) {
+  [p, ...rest] -> match load_prelude(p, include_tests) {
     None -> None
     Some(pl) -> match pl {
-      PL(ds, me) -> load_preludes(rest, list_append(acc_decls, ds), list_append(acc_mods, [me]))
+      PL(ds, me) -> load_preludes(rest, include_tests, list_append(acc_decls, ds), list_append(acc_mods, [me]))
     }
   }
 }
@@ -46294,7 +46342,7 @@ fn run(opts: CliOptions) : Int / Console + File {
         # and concatenate the loaded decls in argument order. Names
         # in later preludes shadow earlier ones (intentional —
         # callers pass `--prelude` in dependency order).
-        let prelude_loaded = load_preludes(opts.preludes, [], [])
+        let prelude_loaded = load_preludes(opts.preludes, opts.include_prelude_tests, [], [])
         match prelude_loaded {
           None -> 1
           Some(pls) -> match pls {
