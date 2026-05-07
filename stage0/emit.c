@@ -869,10 +869,13 @@ static void emit_call(E *e, Node *n) {
             emit_args_with_prepend(e, n, NULL);
             return;
         }
-        /* Variable holding a closure. */
+        /* Variable holding a closure. Issue #298: kai_apply consumes
+         * its closure argument; route the callee identifier through
+         * emit_ident_value so multi-use bindings get the eager-dup
+         * wrapper and single-use bindings transfer their original ref. */
         fputs("kai_apply(", e->out);
-        fprintf(e->out, "kai_%.*s, %d, (KaiValue *[]){",
-                (int) callee->name_len, callee->name,
+        emit_ident_value(e, callee->name, callee->name_len);
+        fprintf(e->out, ", %d, (KaiValue *[]){",
                 (int) (n->n_children - 1));
         for (size_t i = 1; i < n->n_children; ++i) {
             if (i > 1) fputs(", ", e->out);

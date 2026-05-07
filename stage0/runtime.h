@@ -2136,13 +2136,33 @@ static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures
     return v;
 }
 
-/* Invoke a closure dynamically. */
+/* Invoke a closure dynamically.
+ *
+ * Issue #298 — kai_apply consumes its closure argument. Pre-fix the
+ * helper borrowed `clo`; emitters at every callsite (stage0 emit.c,
+ * stage1/stage2 compiler.kai, LLVM kaix_apply) handed it the binding
+ * raw and assumed the surrounding scope owned the ref. For let-bound
+ * closures invoked exactly once (e.g. `let f = make_adder(n); f(10)`),
+ * Perceus picked the `LUAt + count == 1 -> raw transfer` branch and
+ * never inserted a drop — so the closure leaked one ref per call. The
+ * 27.97% closure leak in kaic2 self-compile was driven by this shape.
+ *
+ * Post-fix the contract is symmetric with the rest of m5.x: every
+ * KaiValue * passed to kai_apply is OWNED by the call. The dispatched
+ * fn body cannot read `self` after its own return (it cannot — that
+ * pointer is freed before the result hits the caller), and runtime
+ * helpers (kai_prelude_map / _filter / _flat_map / _reduce / _each,
+ * kai_fiber_trampoline) now incref the closure ahead of every loop
+ * iteration so each kai_apply gets its own ref to consume; their
+ * post-loop decref releases the original ref the helper was handed. */
 static KaiValue *kai_apply(KaiValue *clo, int argc, KaiValue **argv) {
     if (!clo || clo->tag != KAI_CLOSURE) {
         fprintf(stderr, "kai: attempted to call a non-callable value\n");
         exit(1);
     }
-    return clo->as.clo.fn(clo, argv, argc);
+    KaiValue *r = clo->as.clo.fn(clo, argv, argc);
+    kai_decref(clo);
+    return r;
 }
 
 /* ---------- field access helpers ---------- */
@@ -2646,7 +2666,8 @@ static KaiValue *kai_prelude_map(KaiValue *xs, KaiValue *f) {
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) {
         KaiValue *arg0 = kai_incref(p->as.cons.head);
-        KaiValue *head = kai_apply(f, 1, &arg0);
+        /* kai_apply consumes (#298): give it its own ref each iter. */
+        KaiValue *head = kai_apply(kai_incref(f), 1, &arg0);
         acc = kai_cons(head, acc);
         p = p->as.cons.tail;
     }
@@ -2668,7 +2689,8 @@ static KaiValue *kai_prelude_flat_map(KaiValue *xs, KaiValue *f) {
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) {
         KaiValue *arg0 = kai_incref(p->as.cons.head);
-        KaiValue *piece = kai_apply(f, 1, &arg0);
+        /* kai_apply consumes (#298): incref f for each iter. */
+        KaiValue *piece = kai_apply(kai_incref(f), 1, &arg0);
         /* Each `piece` is owned; append it onto `acc` (which is in
          * reverse order). `kai_prelude_list_append` consumes both
          * arguments. We append `acc` onto the front of `piece`'s
@@ -2693,7 +2715,8 @@ static KaiValue *kai_prelude_filter(KaiValue *xs, KaiValue *pred) {
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) {
         KaiValue *arg0 = kai_incref(p->as.cons.head);
-        KaiValue *keep = kai_apply(pred, 1, &arg0);
+        /* kai_apply consumes (#298): incref pred for each iter. */
+        KaiValue *keep = kai_apply(kai_incref(pred), 1, &arg0);
         int yes = kai_op_truthy(keep);
         kai_decref(keep);
         if (yes) {
@@ -2719,7 +2742,8 @@ static KaiValue *kai_prelude_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
         KaiValue *args[2];
         args[0] = acc;                              /* transfer to closure */
         args[1] = kai_incref(p->as.cons.head);      /* closure consumes */
-        acc = kai_apply(f, 2, args);                /* closure produces fresh acc */
+        /* kai_apply consumes (#298): incref f for each iter. */
+        acc = kai_apply(kai_incref(f), 2, args);    /* closure produces fresh acc */
         p = p->as.cons.tail;
     }
     if (xs) kai_decref(xs);
@@ -2731,7 +2755,8 @@ static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) {
         KaiValue *arg0 = kai_incref(p->as.cons.head);
-        KaiValue *r = kai_apply(f, 1, &arg0);
+        /* kai_apply consumes (#298): incref f for each iter. */
+        KaiValue *r = kai_apply(kai_incref(f), 1, &arg0);
         kai_decref(r);
         p = p->as.cons.tail;
     }
@@ -5234,9 +5259,10 @@ static void kai_sched_unpark(KaiFiber *target) {
  * gate the hook reads before attempting the longjmp.
  *
  * RC contract: f->thunk is owned by f for f's entire lifetime;
- * kai_apply borrows. kai_free_value's KAI_FIBER branch decrefs both
- * thunk and result when f's RC drops, so the trampoline does not
- * touch RC on either. */
+ * kai_apply consumes (#298), so the trampoline incref's the thunk
+ * before each invocation to keep f->thunk's lifetime independent of
+ * the call. kai_free_value's KAI_FIBER branch decrefs both thunk and
+ * result when f's RC drops. */
 static void kai_fiber_trampoline(void) {
     KaiFiber *self = kai_active_fiber;
     /* First entry follows a setcontext from another fiber's
@@ -5246,7 +5272,8 @@ static void kai_fiber_trampoline(void) {
     kai_drain_pending_free();
     if (setjmp(self->cancel_pad) == 0) {
         self->cancel_pad_set = 1;
-        self->result = kai_apply(self->thunk, 0, NULL);
+        /* kai_apply consumes (#298): give it its own ref, keep f->thunk. */
+        self->result = kai_apply(kai_incref(self->thunk), 0, NULL);
         self->cancel_pad_set = 0;
         self->state  = KAI_FIBER_DONE;
     } else {
