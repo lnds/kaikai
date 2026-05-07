@@ -602,7 +602,7 @@ pattern     ::= '_'                                    (* wildcard *)
               | qualified_ctor type_args?
                   ('(' pattern_list ')')?              (* ctor pattern *)
               | qualified_ctor '{' field_pat_list '}'  (* record/variant pattern *)
-              | '[' (pattern (',' pattern)* (',' '...' IDENT)?)? ']'
+              | '[' (pattern (',' pattern)* (',' list_spread)?)? ']'
               | '(' pattern (',' pattern){1,3} ')'     (* n-tuple pattern *)
               | INT_LIT '..' INT_LIT                   (* range pattern *)
 qualified_ctor ::= IDENT
@@ -612,7 +612,15 @@ literal_pattern ::= INT_LIT | REAL_LIT | BOOL_LIT
 pattern_list ::= pattern (',' pattern)*
 field_pat_list ::= field_pat (',' field_pat)* ','?
 field_pat   ::= IDENT (':' pattern)?                   (* punning if no ':' *)
+list_spread ::= '...'                                  (* tail discarded — preferred *)
+              | '...' '_'                              (* tail discarded — uniform-with-`_` *)
+              | '...' IDENT                            (* tail bound to name *)
 ```
+
+The bare `...` is the preferred spelling for "match any list with this
+prefix, tail unused"; `..._` and `...IDENT` remain accepted for the
+"uniform-with-`_`" reading and for binding the tail respectively
+(issue #328).
 
 ### 2.8 Refinements
 
