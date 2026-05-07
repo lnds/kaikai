@@ -3054,12 +3054,13 @@ test-tco-rule3-basic: $(TARGET) build
 	./$(TARGET) ../examples/tco/rule3_basic.kai > build/tco-r3b.c; \
 	grep -F -q 'goto _kai_walk_entry' build/tco-r3b.c \
 	  || { echo "tco-rule3-basic FAIL (no walk goto label)"; exit 1; }; \
-	awk '/_kai_walk_entry/,/__pcs_ret/' build/tco-r3b.c | grep -F -q 'kai_internal_drop(kai_xs)' \
-	  || { echo "tco-rule3-basic FAIL (rule 3 did not emit kai_internal_drop(kai_xs) in walk goto)"; exit 1; }; \
+	if awk '/_kai_walk_entry/,/__pcs_ret/' build/tco-r3b.c | grep -F -q 'kai_internal_drop(kai_xs)'; then \
+	  echo "tco-rule3-basic FAIL (rule 3 misfired on match scrutinee xs; would double-free under perceus tcrec-tail-always-sentinel early-decref)"; exit 1; \
+	fi; \
 	$(CC) $(CFLAGS) -I ../stage0 build/tco-r3b.c -o build/tco-r3b; \
 	./build/tco-r3b > build/tco-r3b.out; \
 	diff -q ../examples/tco/rule3_basic.out.expected build/tco-r3b.out > /dev/null \
-	  && echo "tco-rule3-basic OK (issue #92 rule 3 drops xs in goto block; sum matches)" \
+	  && echo "tco-rule3-basic OK (issue #92: rule 3 correctly skips match-scrutinee xs; perceus early-decref closes the leak; sum matches)" \
 	  || { echo "tco-rule3-basic DIFF"; diff ../examples/tco/rule3_basic.out.expected build/tco-r3b.out; exit 1; }
 
 # Issue #92 — rule 3 does NOT misfire. The `id_walk` fn reads `xs`

@@ -2,6 +2,36 @@
 
 Best-effort retrospective by the implementing agent.
 
+## Update — FIX LANDED 2026-05-07 (post-pivot)
+
+After the initial STOP signal below, the brief was updated to pivot
+into fix mode. The fix lives in the next commit on this branch as
+`fix(perceus): extend tcrec rule 3 with single_use_is_borrow
+predicate`. The predicate is conservative — it gates rule 3 firing
+to **list-tail-spread** positions only. Match-scrutinee positions
+(`match p { ... }`) are deliberately treated as non-borrow because
+their leak status depends on perceus's `tcrec_tail_always_sentinel`
+arm-shape decision (issue #309): when every tail leaf is a self-
+tail-call, perceus injects an early `kai_decref(_scr)` before the
+goto, and rule 3's drop becomes a double-decref. List-tail-spread
+positions (`[..., ...p]`) are unconditionally safe to drop in the
+goto; the cons cell's `kai_incref(p)` leaves the original ref alive
+and only the goto-skipped exit-drops would release it.
+
+Acceptance:
+- ASAN selfhost cycle clean (was use-after-free in `kai_lex_skip_ws`).
+- Selfhost byte-identical at vanilla flags.
+- Tier 0 + Tier 1 + Tier 1-ASAN green.
+- The `nth_loop` canonical leak fixture (one cons cell per
+  iteration) remains under the conservative dropmask. Closing it
+  requires per-call-site borrow-vs-consume reasoning that
+  considers the enclosing match-arm shape; explicitly out of
+  scope for this fix.
+
+The bisection below remains accurate as a record of how the wrong
+hypothesis was disproven. The "Recommended next step" section is
+superseded by the landed fix.
+
 ## Goal
 
 Per the brief: audit stage 1's perceus emit for `[Expr]` walks,
@@ -15,7 +45,14 @@ The brief explicitly identified failure mode 1:
 > perceus emit … STOP and report. The hypothesis (option #1 from
 > #92) is wrong; rethink before patching.
 
-## Outcome — STOP, hypothesis is wrong
+## Outcome — STOP signal raised, then fix landed after pivot
+
+Initial diagnosis (below) raised the STOP per the failure mode
+clause. The brief was then updated to pivot into fix mode with the
+locus + framing already in hand. The pivot section above
+documents the landed fix.
+
+## Original outcome — STOP, hypothesis is wrong
 
 The diag retro's bisection was incomplete and its conclusion is
 wrong. The bug is **NOT** in stage 1's perceus emit for `[Expr]`
