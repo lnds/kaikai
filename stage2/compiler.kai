@@ -11543,7 +11543,22 @@ fn emit_match_arm(src: String, a: Arm, lcs: [String], fns: [EFn], variants: [EVa
             # `__cv_NAME == NAME()`). Treat as alias so PBind increfs.
             let binds = emit_pat_binds(src, pat, "_scr", true, lcs, fns, variants, lams, cls)
             let body_c = emit_expr(src, body, arm_lcs, fns, variants, lams, cls)
-            concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
+            # Issue #309 — when every tail leaf of `body` is a tcrec
+            # sentinel call, the goto leaves the enclosing
+            # statement-expression and the post-do-while
+            # `kai_decref(_scr)` is unreachable. Pre-inject the drop
+            # inside the body's statement-expression so it executes
+            # before the goto fires. Safe because the predicate
+            # guarantees control NEVER reaches the post-do-while
+            # decref via this arm — no double-decref is possible.
+            if tcrec_tail_always_sentinel(body) {
+              concat_all([
+                "    if (", pt, ") { ", binds,
+                "_r = ({ kai_decref(_scr); ", body_c, "; }); break; }\n"
+              ])
+            } else {
+              concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
+            }
           }
         }
         Some(g) -> {
@@ -34210,6 +34225,55 @@ fn tcrec_rewrite_arms(arms: [Arm], nm: String, arity: Int, c_sym_str: String,
 # them elsewhere).
 fn tcrec_body_has_sentinel(body: Expr) : Bool =
   tcrec_scan_kind(body.kind)
+
+# Issue #309 — recognise expressions whose every tail position is a
+# tcrec sentinel call. Stricter than `tcrec_body_has_sentinel`: only
+# returns true when control-flow guarantees the goto fires (i.e. no
+# tail leaf evaluates to a normal value). Used by `emit_match_arm`
+# to decide whether it is safe to inject a `kai_decref(_scr)` before
+# evaluating the arm body — when the goto is guaranteed, the arm's
+# normal post-do-while `kai_decref(_scr)` is unreachable and the
+# pre-injected drop closes the leak without risking a double-decref.
+# Conservative: ECall checks only the head EVar; recurses through
+# EIf / EMatch / EBlock tail. Anything else returns false.
+fn tcrec_tail_always_sentinel(body: Expr) : Bool =
+  tcrec_tail_is_sentinel_kind(body.kind)
+
+fn tcrec_tail_is_sentinel_kind(k: ExprKind) : Bool {
+  match k {
+    ECall(f, _) -> match f.kind {
+      EVar(callee) -> tcrec_is_sentinel(callee)
+      _ -> false
+    }
+    EIf(_, t, opt_e) -> match opt_e {
+      None -> false
+      Some(e2) -> if tcrec_tail_always_sentinel(t) {
+        tcrec_tail_always_sentinel(e2)
+      } else { false }
+    }
+    EMatch(_, arms) -> tcrec_tail_arms_always_sentinel(arms)
+    EBlock(_, opt_tail) -> match opt_tail {
+      None -> false
+      Some(e) -> tcrec_tail_always_sentinel(e)
+    }
+    _ -> false
+  }
+}
+
+fn tcrec_tail_arms_always_sentinel(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, _, body) ->
+        if tcrec_tail_always_sentinel(body) {
+          match rest {
+            [] -> true
+            _  -> tcrec_tail_arms_always_sentinel(rest)
+          }
+        } else { false }
+    }
+  }
+}
 
 fn tcrec_scan_kind(k: ExprKind) : Bool {
   match k {

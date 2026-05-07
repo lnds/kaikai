@@ -26,7 +26,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs test-rc-trace-callsite selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-loop test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-unions test-sequence test-ufcs test-rc-trace-callsite selfhost
 
 all: $(TARGET)
 
@@ -2927,6 +2927,34 @@ test-tco-zero-arg: $(TARGET) build
 	  && echo "tco-zero-arg OK (issue #102 zero-arg self-tail-call compiles + runs to completion)" \
 	  || { echo "tco-zero-arg DIFF"; diff ../examples/perceus/r12_zero_arg_recursive.out.expected build/tco-zero.out; exit 1; }
 
+# Issue #309 — match-arm tail tcrec sentinel + _scr leak fixture.
+# `count_down` here uses `match` (not `if`); the recursive call sits
+# in the tail of an arm body. Pre-fix, every iteration leaked one
+# `int` because `emit_match_default`'s synthetic `_scr =
+# kai_internal_dup(scrut)` alias was decrefed AFTER the do-while,
+# but the tcrec goto bypassed that decref by jumping out of the
+# enclosing statement-expression. The fix injects
+# `kai_decref(_scr)` inside the arm body's stmt-expr (before the
+# goto fires) when every tail leaf of the body is a sentinel call
+# (`tcrec_tail_always_sentinel` predicate). The fixture validates
+# both sides: 1M-deep tail recursion runs in O(1) C-stack (TCO
+# preserved) AND under `KAI_TRACE_RC=1` the `int` tag's `live`
+# count at exit is 0 (leak closed).
+test-tco-309: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/tco/issue_309_countdown.kai > build/tco-309.c; \
+	grep -F -q '_kai_count_down_entry:;' build/tco-309.c \
+	  || { echo "tco-309 FAIL (no _kai_count_down_entry label in emitted C)"; exit 1; }; \
+	grep -F -q 'goto _kai_count_down_entry;' build/tco-309.c \
+	  || { echo "tco-309 FAIL (no goto _kai_count_down_entry in emitted C)"; exit 1; }; \
+	grep -F -q 'kai_decref(_scr); ({' build/tco-309.c \
+	  || { echo "tco-309 FAIL (no pre-goto kai_decref(_scr) injection in emitted C)"; exit 1; }; \
+	$(CC) $(CFLAGS) -I ../stage0 build/tco-309.c -o build/tco-309; \
+	./build/tco-309 > build/tco-309.out; \
+	diff -q ../examples/tco/issue_309_countdown.out.expected build/tco-309.out > /dev/null \
+	  && echo "tco-309 OK (issue #309 match-arm tail sentinel; 1M iters; pre-goto _scr decref injected; leak closed)" \
+	  || { echo "tco-309 DIFF"; diff ../examples/tco/issue_309_countdown.out.expected build/tco-309.out; exit 1; }
+
 # Issue #89 — perceus-wrap TCO regression fixture. The
 # `bench_loop` driver in unbox_bench.kai is a self-tail-recursive
 # fn whose body has multi-use parameters that perceus wraps in
@@ -3355,7 +3383,7 @@ test-rc-trace-callsite: $(TARGET) build
 	  || { echo "rc-trace-callsite NO site rows"; cat build/rc_trace_callsite.err; exit 1; }; \
 	echo "rc-trace-callsite OK"
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars test-rc-trace-callsite
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-perceus-issue82 test-perceus-issue118 test-unions test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars test-rc-trace-callsite
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -3364,7 +3392,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-unions test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-unions test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-248-loop-sugars
 
 clean:
 	rm -rf build $(TARGET)
