@@ -34074,25 +34074,129 @@ fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
 # byte-identical until M3 connects the pieces.
 fn tcrec_rewrite_decls(decls: [Decl]) : [Decl] = map(decls, tcrec_rewrite_decl)
 
+# Pipeline reorder (Eric review 2026-05-06):
+# tcrec runs AFTER perceus_pass, so the body it receives may be
+# wrapped in `EBlock([...entry_drops, SLet(__pcs_ret, INNER),
+# ...exit_drops], Some(EVar(__pcs_ret)))` (`pcs_wrap_with_exit`).
+# `tcrec_is_pcs_ret_wrap` recognises the shape; when present,
+# `tcrec_rewrite_pcs_ret_wrap` rebuilds the wrap around a rewritten
+# inner body. Self-tail-calls in the wrap-less case (no exit drops,
+# body unchanged or `EBlock(entry, Some(body))` with entry-only
+# drops) work without any unwrap because the structural walker
+# already descends through `EBlock(_, Some(tail))`. Only the exit-
+# drops shape needs special handling because its tail is
+# `EVar(__pcs_ret)` instead of the original body.
 fn tcrec_rewrite_decl(d: Decl) : Decl {
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
       let arity = list_length(params)
-      if not tcrec_has_tail_self_call(body, name, arity) { d }
-      else {
-        let pnames = map(params, (p) => p.pname)
-        let uses = pcs_collect_uses_expr(body, pnames, false, [])
-        if tcrec_any_unused(params, uses) { d }
+      if tcrec_is_pcs_ret_wrap(body) {
+        match body.kind {
+          EBlock(stmts, _) ->
+            tcrec_rewrite_pcs_ret_wrap(d, is_pub, name, tparams, params,
+                                        opt_ret, row, body, stmts, ln, cl, mo,
+                                        arity)
+          _ -> d
+        }
+      } else {
+        if not tcrec_has_tail_self_call(body, name, arity) { d }
         else {
-          let c_sym_str = c_sym(name, mo)
-          let new_body = tcrec_rewrite_body(body, name, arity, c_sym_str,
-                                            params, pnames, uses, [])
-          DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo)
+          let pnames = map(params, (p) => p.pname)
+          let uses = pcs_collect_uses_expr(body, pnames, false, [])
+          if tcrec_any_unused(params, uses) { d }
+          else {
+            let c_sym_str = c_sym(name, mo)
+            let new_body = tcrec_rewrite_body(body, name, arity, c_sym_str,
+                                              params, pnames, uses, [])
+            DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo)
+          }
         }
       }
     }
     _ -> d
   }
+}
+
+# Recognise the perceus exit-drop wrap shape:
+# `EBlock(stmts, Some(EVar("__pcs_ret")))`. Cheap structural test —
+# only allocates if the shape matches, in which case the caller
+# proceeds to extract the SLet and rebuild.
+fn tcrec_is_pcs_ret_wrap(body: Expr) : Bool {
+  match body.kind {
+    EBlock(_, opt_tail) -> match opt_tail {
+      Some(t) -> match t.kind {
+        EVar(nm) -> nm == "__pcs_ret"
+        _ -> false
+      }
+      None -> false
+    }
+    _ -> false
+  }
+}
+
+fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
+                              tparams: [String], params: [Param],
+                              opt_ret: Option[TypeExpr], row: RowExpr,
+                              body: Expr, stmts: [Stmt],
+                              ln: Int, cl: Int, mo: Option[String],
+                              arity: Int) : Decl {
+  match tcrec_find_pcs_ret_let(stmts, []) {
+    None -> d
+    Some(triple) -> match triple {
+      TcrecPcsTriple(before, inner, after) ->
+        if not tcrec_has_tail_self_call(inner, name, arity) { d }
+        else {
+          let pnames = map(params, (p) => p.pname)
+          let uses = pcs_collect_uses_expr(inner, pnames, false, [])
+          if tcrec_any_unused(params, uses) { d }
+          else {
+            let c_sym_str = c_sym(name, mo)
+            let new_inner = tcrec_rewrite_body(inner, name, arity, c_sym_str,
+                                                params, pnames, uses, [])
+            let new_body = tcrec_rebuild_pcs_ret_wrap(body, before, new_inner, after)
+            DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo)
+          }
+        }
+    }
+  }
+}
+
+# Decomposition of `EBlock(stmts, Some(EVar("__pcs_ret")))` into the
+# entry stmts before the SLet, the SLet's RHS (the original body),
+# and the exit stmts after the SLet. Returns None if no
+# `SLet(PBind("__pcs_ret"), _, _)` is found in stmts.
+type TcrecPcsTriple = TcrecPcsTriple([Stmt], Expr, [Stmt])
+
+fn tcrec_find_pcs_ret_let(stmts: [Stmt], before_acc: [Stmt]) : Option[TcrecPcsTriple] {
+  match stmts {
+    [] -> None
+    [s, ...rest] -> match s {
+      SLet(pat, _, rhs) -> match pat.pkind {
+        PBind(nm) ->
+          if nm == "__pcs_ret" {
+            Some(TcrecPcsTriple(list_reverse(before_acc), rhs, rest))
+          } else {
+            tcrec_find_pcs_ret_let(rest, [s, ...before_acc])
+          }
+        _ -> tcrec_find_pcs_ret_let(rest, [s, ...before_acc])
+      }
+      _ -> tcrec_find_pcs_ret_let(rest, [s, ...before_acc])
+    }
+  }
+}
+
+fn tcrec_rebuild_pcs_ret_wrap(orig: Expr, before: [Stmt], new_inner: Expr,
+                              after: [Stmt]) : Expr {
+  let ret_let = SLet(
+    Pattern { pkind: PBind("__pcs_ret"), line: new_inner.line, col: new_inner.col },
+    None,
+    new_inner
+  )
+  let stmts = list_append(before, [ret_let, ...after])
+  let tail = Expr { kind: EVar("__pcs_ret"), line: new_inner.line, col: new_inner.col,
+                    ty: new_inner.ty, mode: new_inner.mode }
+  Expr { kind: EBlock(stmts, Some(tail)),
+         line: orig.line, col: orig.col, ty: orig.ty, mode: orig.mode }
 }
 
 fn tcrec_any_unused(params: [Param], uses: [Use]) : Bool {
@@ -46132,11 +46236,28 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       # a normal call when it sees the sentinel;
                       # TCO via the LLVM `tail` marker is a
                       # separate lane (issue #37 non-goals).
-                      let pre_perceus_decls = if use_llvm { unboxed_decls }
-                                              else { tcrec_rewrite_decls(unboxed_decls) }
-                      # m5 #1 — basic Perceus walker (identity).
-                      # m5 #2-#4 fill in last-use analysis + dup/drop.
-                      let perceus_decls = perceus_pass(pre_perceus_decls)
+                      # Pipeline order (Eric review 2026-05-06):
+                      # `parse → typer → perceus → tcrec → emit_c`.
+                      # Perceus runs first so the AST already carries
+                      # explicit `__perceus_dup` / `__perceus_drop`
+                      # nodes by the time tcrec plants its sentinels.
+                      # Tcrec then descends into the perceus wrap
+                      # (`EBlock([entry, SLet(__pcs_ret, body),
+                      # exit_drops], Some(EVar(__pcs_ret)))`) and
+                      # operates on the inner body — the wrap stays
+                      # intact, the goto fires before the wrap's
+                      # exit drops, and the dropmask is computed
+                      # from the same `uses` set perceus consumed.
+                      # See `tcrec_unwrap_pcs_ret` for the shape
+                      # detector. The previous order coupled the
+                      # passes implicitly: tcrec emulated perceus's
+                      # exit-drop computation in its own dropmask
+                      # logic, so any change to one had to be
+                      # mirrored in the other (issue #92 R6 four-
+                      # time failure mode).
+                      let post_perceus_decls = perceus_pass(unboxed_decls)
+                      let perceus_decls = if use_llvm { post_perceus_decls }
+                                          else { tcrec_rewrite_decls(post_perceus_decls) }
                       if mono_inv_errs != 0 { mono_inv_errs }
                       else if mono_dispatch_errs != 0 { mono_dispatch_errs }
                       else {
