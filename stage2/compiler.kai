@@ -9747,6 +9747,95 @@ fn collect_effect_names(decls: [Decl]) : [String] {
   }
 }
 
+# Issue #308: look up the in-scope decl for an effect by name and
+# return its op-name list. None if no DEffect with that name is
+# present.
+fn lookup_effect_op_names(decls: [Decl], name: String) : Option[[String]] {
+  match decls {
+    [] -> None
+    [d, ...rest] -> match d {
+      DEffect(_, dname, _, ops, _, _) ->
+        if dname == name { Some(effect_op_names(ops)) }
+        else { lookup_effect_op_names(rest, name) }
+      _ -> lookup_effect_op_names(rest, name)
+    }
+  }
+}
+
+fn effect_op_names(ops: [EffectOp]) : [String] {
+  match ops {
+    [] -> []
+    [o, ...rest] -> match o {
+      EOp(n, _, _, _, _, _) -> [n, ...effect_op_names(rest)]
+    }
+  }
+}
+
+# Issue #308: per-effect expected op shape for the runtime's default
+# handler. The `EvX` struct field layout in stage0/runtime.h is
+# co-designed with these op lists; if a user `effect X { ... }`
+# shadows the canonical decl with a different shape, the
+# `_kai_default_ev_x.<op> = ...` wiring would assign through fields
+# that do not exist (or sit at the wrong offset). Returning false
+# from `effect_default_compatible` makes the C and LLVM backends
+# skip wiring for that effect, just as if it were absent from
+# `main_row`.
+fn effect_default_compatible(decls: [Decl], name: String) : Bool = {
+  let expected = expected_default_op_names(name)
+  match expected {
+    None -> true                          # not a default-handler effect
+    Some(exp_ops) -> match lookup_effect_op_names(decls, name) {
+      None -> true                        # no decl in scope; pass-through
+      Some(found_ops) -> eff_op_names_eq(found_ops, exp_ops)
+    }
+  }
+}
+
+# Op-name shape expected by the runtime's default handler for each
+# effect. Order must match the stage0 `EvX` struct field order. Names
+# that have no default handler (or no shadowing risk) return None and
+# pass through unchanged.
+fn expected_default_op_names(name: String) : Option[[String]] {
+  if      name == "Stdout"       { Some(["print"]) }
+  else if name == "Stderr"       { Some(["eprint"]) }
+  else if name == "Fail"         { Some(["fail"]) }
+  else if name == "Stdin"        { Some(["read_line"]) }
+  else if name == "Env"          { Some(["args", "var", "set_var", "unset_var", "vars"]) }
+  else if name == "File"         { Some(["read_file", "write_file"]) }
+  else if name == "Clock"        { Some(["wall_now", "monotonic_now", "sleep_ns"]) }
+  else if name == "Random"       { Some(["int_range"]) }
+  else if name == "SecureRandom" { Some(["int_range", "bytes"]) }
+  else if name == "NetTcp"       { Some(["connect", "listen", "accept", "send", "recv", "close"]) }
+  else if name == "Signal"       { Some(["on", "off", "await"]) }
+  else if name == "Process"      { Some(["start", "wait", "kill", "exit"]) }
+  else if name == "Log"          { Some(["debug", "info", "warn", "error"]) }
+  else if name == "Mutable"      { Some(["array_make", "array_length", "array_get", "array_set", "array_grow", "ref_make", "ref_get", "ref_set"]) }
+  else if name == "Cancel"       { Some(["raise"]) }
+  else if name == "Link"         { Some(["link"]) }
+  else if name == "Monitor"      { Some(["monitor", "demonitor"]) }
+  else if name == "Spawn"        { Some(["yield", "spawn", "await", "select", "cancel", "set_trap_exit"]) }
+  else { None }
+}
+
+# Issue #308: filter `main_row` to drop effects whose in-scope decl
+# does not match the runtime's expected op shape for that name. The
+# default-handler wiring (setup/shim/pop emit + LLVM mirror) keys on
+# builtin EvX struct layout; emitting it for a user-shadowed effect
+# whose ops differ produces invalid C (e.g.
+# `_kai_default_ev_log.debug = ...` against a user EvLog that only
+# has `.log`).
+fn row_minus_user_effects(main_row: [String], decls: [Decl]) : [String] {
+  match main_row {
+    [] -> []
+    [x, ...rest] ->
+      if effect_default_compatible(decls, x) {
+        [x, ...row_minus_user_effects(rest, decls)]
+      } else {
+        row_minus_user_effects(rest, decls)
+      }
+  }
+}
+
 # net-tcp-v1: walk the declared types so the NetTcp / Conn / Listener
 # / Byte builtin injection in `inject_builtin_effects` can defer to
 # any user-supplied decl with the same name. Mirrors
@@ -14792,7 +14881,11 @@ fn emit_main_wrapper(decls: [Decl], test_mode: Bool, bench_mode: Bool, check_mod
     # cast, so UBSan's `-fsanitize=function` (Linux clang's
     # `-fsanitize=undefined`, absent from Apple clang's default)
     # sees matching types at every dispatch through `_ev_op->op`.
-    let main_row = main_row_labels(decls)
+    # Issue #308: drop any effect name whose decl is user-supplied
+    # (line/col != 0). The default-handler emit assumes the builtin
+    # EvX layout — emitting it for a user `effect Log { ... }` shape
+    # produces invalid C against the user's struct.
+    let main_row = row_minus_user_effects(main_row_labels(decls), decls)
     let shims    = default_shims_for(main_row)
     let setup    = default_setups_for(main_row)
     let teardown = default_pops_for(main_row)
@@ -26559,16 +26652,16 @@ fn arg_names_match(reg_args: [String], recv: String, want: [String]) : Bool {
       [w] -> w == recv
       _ -> false
     }
-    _ -> string_lists_eq(reg_args, want)
+    _ -> eff_op_names_eq(reg_args, want)
   }
 }
 
-fn string_lists_eq(a: [String], b: [String]) : Bool {
+fn eff_op_names_eq(a: [String], b: [String]) : Bool {
   match a {
     [] -> match b { [] -> true _ -> false }
     [x, ...xrest] -> match b {
       [] -> false
-      [y, ...yrest] -> x == y and string_lists_eq(xrest, yrest)
+      [y, ...yrest] -> x == y and eff_op_names_eq(xrest, yrest)
     }
   }
 }
@@ -38913,7 +39006,9 @@ fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], test_mode: Bo
   # nodes for any builtin (Console / Fail / Stdin / Env / File /
   # Mutable) that appears in main's row. When main has no
   # builtins the functions are no-ops.
-  let main_row = main_row_labels(decls)
+  # Issue #308: same shadowing filter as the C backend — see
+  # row_minus_user_effects.
+  let main_row = row_minus_user_effects(main_row_labels(decls), decls)
   let install = llvm_emit_main_install_defaults(main_row)
   let teardown = llvm_emit_main_teardown_defaults(main_row)
   concat_all([llvm_header(), eff_structs, "\n",
