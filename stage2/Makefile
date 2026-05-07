@@ -2272,6 +2272,29 @@ test-effects: $(TARGET) build
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "effects OK $$name (issue #251 parameter-mutation rejected)"; \
+	done; \
+	for f in ../examples/effects/issue_308_user_log_effect.kai \
+	         ../examples/effects/issue_308_stdlib_log_unchanged.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (issue #308: user effect shadows stdlib)" \
+	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	  ./$(TARGET) --emit=llvm --path ../stdlib $$f > build/s2-$$name.ll 2> build/s2-$$name-llvm.err \
+	    || { echo "effects FAIL $$name (LLVM emit errored)"; cat build/s2-$$name-llvm.err; exit 1; }; \
+	  clang -w -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm \
+	    || { echo "effects FAIL $$name (LLVM compile failed)"; exit 1; }; \
+	  ./build/s2-$$name-llvm > build/s2-$$name-llvm.out 2>&1 \
+	    || { echo "effects FAIL $$name (LLVM binary exit non-zero)"; cat build/s2-$$name-llvm.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name-llvm.out > /dev/null \
+	    && echo "effects OK $$name (issue #308: LLVM backend matches)" \
+	    || { echo "effects FAIL $$name (LLVM output mismatch)"; diff $$exp build/s2-$$name-llvm.out; exit 1; }; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,
