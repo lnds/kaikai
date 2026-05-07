@@ -741,6 +741,119 @@ static void kai_leaksite_register_once(void) {
 #define KAI_RC_NOINLINE
 #endif
 
+/* ---------- variant_name histogram (issue #300, lane #297/#298 validation)
+ *
+ * Independent of KAI_TRACE_RC. Counts variant alloc/free traffic keyed on
+ * the `variant_name` string-literal pointer (stable across runs, immune to
+ * the tail-call ABI bug that contaminates address-keyed attribution).
+ *
+ * Opt-in: build with `-DKAI_TRACE_VAR_NAMES=1`. Vanilla builds compile to
+ * empty hooks; emitted IR (and selfhost byte-identity) is unchanged.
+ *
+ * Output: at exit a destructor dumps `[VAR_NAME] <name> allocs=A frees=F
+ * leak=A-F` lines sorted by leak desc to stderr. Suppressed by
+ * KAI_TRACE_RC_QUIET=1 (shared with the address-keyed tracer).
+ */
+#ifdef KAI_TRACE_VAR_NAMES
+
+#define KAI_VAR_NAME_BUCKETS 4096
+
+typedef struct {
+    const char *name;
+    int64_t allocs;       /* invocation count: every kai_variant(_, name, ...) call */
+    int64_t real_allocs;  /* physical allocs: invocations that miss singleton/immortal cache */
+    int64_t frees;
+} KaiVarNameBucket;
+
+static KaiVarNameBucket kai_var_names[KAI_VAR_NAME_BUCKETS];
+static int kai_var_names_count;
+
+static KaiVarNameBucket *kai_var_name_lookup(const char *name) {
+    if (name == NULL) return NULL;
+    uintptr_t k = (uintptr_t) name;
+    uint32_t h = (uint32_t) ((k ^ (k >> 16)) * 0x9e3779b1u);
+    for (int probe = 0; probe < KAI_VAR_NAME_BUCKETS; ++probe) {
+        int i = (int) ((h + probe) & (KAI_VAR_NAME_BUCKETS - 1));
+        if (kai_var_names[i].name == NULL) {
+            kai_var_names[i].name = name;
+            kai_var_names_count++;
+            return &kai_var_names[i];
+        }
+        if (kai_var_names[i].name == name) return &kai_var_names[i];
+    }
+    return NULL; /* table full — silently drop */
+}
+
+static void kai_var_name_record_alloc(const char *name) {
+    KaiVarNameBucket *b = kai_var_name_lookup(name);
+    if (b) b->allocs++;
+}
+
+static void kai_var_name_record_real_alloc(const char *name) {
+    KaiVarNameBucket *b = kai_var_name_lookup(name);
+    if (b) b->real_allocs++;
+}
+
+static void kai_var_name_record_free(const char *name) {
+    KaiVarNameBucket *b = kai_var_name_lookup(name);
+    if (b) b->frees++;
+}
+
+static int kai_var_name_cmp_leak_desc(const void *a, const void *b) {
+    const KaiVarNameBucket *x = (const KaiVarNameBucket *) a;
+    const KaiVarNameBucket *y = (const KaiVarNameBucket *) b;
+    int64_t lx = x->real_allocs - x->frees;
+    int64_t ly = y->real_allocs - y->frees;
+    if (ly != lx) return (ly > lx) - (ly < lx);
+    return (y->real_allocs > x->real_allocs) - (y->real_allocs < x->real_allocs);
+}
+
+__attribute__((destructor))
+static void kai_var_name_report_at_exit(void) {
+    if (getenv("KAI_TRACE_RC_QUIET")) return;
+    KaiVarNameBucket snapshot[KAI_VAR_NAME_BUCKETS];
+    int n = 0;
+    for (int i = 0; i < KAI_VAR_NAME_BUCKETS; ++i) {
+        if (kai_var_names[i].name != NULL) snapshot[n++] = kai_var_names[i];
+    }
+    if (n == 0) return;
+    qsort(snapshot, (size_t) n, sizeof(snapshot[0]), kai_var_name_cmp_leak_desc);
+    int64_t total_invs = 0, total_real = 0, total_frees = 0;
+    for (int i = 0; i < n; ++i) {
+        total_invs += snapshot[i].allocs;
+        total_real += snapshot[i].real_allocs;
+        total_frees += snapshot[i].frees;
+    }
+    fprintf(stderr,
+        "[VAR_NAME] total distinct=%d invocations=%lld real_allocs=%lld frees=%lld leak=%lld\n",
+        n, (long long) total_invs, (long long) total_real,
+        (long long) total_frees, (long long) (total_real - total_frees));
+    fprintf(stderr,
+        "[VAR_NAME] columns: name | invocations | real_allocs | frees | leak\n");
+    for (int i = 0; i < n; ++i) {
+        int64_t leak = snapshot[i].real_allocs - snapshot[i].frees;
+        fprintf(stderr,
+            "[VAR_NAME] %-24s inv=%-12lld real=%-10lld frees=%-10lld leak=%lld\n",
+            snapshot[i].name,
+            (long long) snapshot[i].allocs,
+            (long long) snapshot[i].real_allocs,
+            (long long) snapshot[i].frees,
+            (long long) leak);
+    }
+}
+
+#define KAI_VAR_NAME_ALLOC(name)      kai_var_name_record_alloc(name)
+#define KAI_VAR_NAME_REAL_ALLOC(name) kai_var_name_record_real_alloc(name)
+#define KAI_VAR_NAME_FREE(name)       kai_var_name_record_free(name)
+
+#else /* !KAI_TRACE_VAR_NAMES */
+
+#define KAI_VAR_NAME_ALLOC(name)      ((void) 0)
+#define KAI_VAR_NAME_REAL_ALLOC(name) ((void) 0)
+#define KAI_VAR_NAME_FREE(name)       ((void) 0)
+
+#endif /* KAI_TRACE_VAR_NAMES */
+
 #ifdef KAI_TRACE_RC
 static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
 #else
@@ -1320,6 +1433,7 @@ static void kai_free_value(KaiValue *v) {
             free((void *) v->as.rec.names);
             break;
         case KAI_VARIANT:
+            KAI_VAR_NAME_FREE(v->as.var.variant_name);
             for (int i = 0; i < v->as.var.n_args; ++i) kai_decref(v->as.var.args[i]);
             free(v->as.var.args);
             break;
@@ -1799,9 +1913,11 @@ static int kai_args_all_immortal(int n, KaiValue **args) {
 }
 
 static KAI_RC_NOINLINE KaiValue *kai_variant(int32_t tag, const char *name, int n, KaiValue **args) {
+    KAI_VAR_NAME_ALLOC(name);
     if (n == 0 && name != NULL) {
         KaiValue *cached = kai_nullary_lookup(tag, name);
         if (cached) return cached;
+        KAI_VAR_NAME_REAL_ALLOC(name);
         KaiValue *v = kai_alloc(KAI_VARIANT);
         v->as.var.variant_tag = tag;
         v->as.var.variant_name = name;
@@ -1814,6 +1930,7 @@ static KAI_RC_NOINLINE KaiValue *kai_variant(int32_t tag, const char *name, int 
     if (name != NULL && kai_args_all_immortal(n, args)) {
         KaiValue *cached = kai_immortal_var_lookup(tag, name, n, args);
         if (cached) return cached;
+        KAI_VAR_NAME_REAL_ALLOC(name);
         KaiValue *v = kai_alloc(KAI_VARIANT);
         v->as.var.variant_tag = tag;
         v->as.var.variant_name = name;
@@ -1824,6 +1941,7 @@ static KAI_RC_NOINLINE KaiValue *kai_variant(int32_t tag, const char *name, int 
         kai_immortal_var_install(tag, name, n, args, v);
         return v;
     }
+    KAI_VAR_NAME_REAL_ALLOC(name);
     KaiValue *v = kai_alloc(KAI_VARIANT);
     v->as.var.variant_tag = tag;
     v->as.var.variant_name = name;
