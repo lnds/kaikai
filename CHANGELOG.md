@@ -84,6 +84,26 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.44.0 (2026-05-06)
+
+### Added
+
+- **runtime+emit**: per-leak-site attribution for KAI_TRACE_RC (DIAG for Perceus emitter discipline)
+- **runtime**: nullary variant singletons (closes ~63% of leak in kaic2 self-compile)
+- **typer+stdlib**: % operator overloading via Rem protocol
+- **runtime**: per-call-site leak attribution for KAI_TRACE_RC (closes #296)
+- **emit**: RC discipline for discards — Phase 2 of #293
+- **emit**: nested record destructuring drops field temp + Phase 1 fixture
+- **emit**: record field access + destructuring let RC discipline (#293 Phase 1)
+- **runtime**: KAI_TRACE_RC strict alloc tracing for diagnostics (Track #2 of #291)
+- **perceus**: typer-aware shape predicate enables variant + record reuse-in-place (closes #210)
+
+### Fixed
+
+- **typer+emit**: user effect shadows stdlib (closes #308)
+- **runtime**: short-string interning for top-1 leak site (Lane FIX of Perceus)
+- **runtime**: immortal-payload variant singletons
+
 ## v0.43.0 (2026-05-05)
 
 ### Added
