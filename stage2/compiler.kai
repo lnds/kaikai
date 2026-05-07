@@ -68,7 +68,7 @@ type TokKind
   | TkComma | TkColon | TkColonEq | TkSemi | TkDot | TkDotDot | TkEllipsis
   # operators
   | TkEq | TkArrow | TkFatArrow | TkPipe | TkPipeApply | TkBarBar
-  | TkPlus | TkMinus | TkStar | TkSlash | TkSlashSlash | TkPercent
+  | TkPlus | TkMinus | TkStar | TkSlash | TkPercent
   # m7d §23: `++` is the string / list concatenation operator.
   # Right-associative, lower precedence than `+`/`-`/`*`/`/`,
   # higher than comparison.
@@ -123,7 +123,7 @@ fn tk_name(k: TokKind) : String {
     TkEq -> "=" TkArrow -> "->" TkFatArrow -> "=>"
     TkPipe -> "|" TkPipeApply -> "|>" TkBarBar -> "||"
     TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
-    TkSlashSlash -> "//" TkPercent -> "%" TkPlusPlus -> "++"
+    TkPercent -> "%" TkPlusPlus -> "++"
     TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">"
     TkLe -> "<=" TkGe -> ">=" TkBang -> "!" TkAt -> "@" TkCaret -> "^"
     TkHole -> "?" TkHoleName(_) -> "?NAME"
@@ -722,8 +722,11 @@ fn lex_punct(l: Lexer) : LexStep {
       }
       else if c == '/' {
         if lex_peek_is(l1, '/') {
+          # Issue #315 — `//` integer division operator is removed.
+          # Post-#246, `Int / Int` already truncates via `Div[Int]`.
           let l2 = lex_advance(l1)
-          Step(l2, tok(TkSlashSlash, sl, sc, start, l2.pos))
+          Step(l2, tok(TkError("`//` operator is removed (issue #315) — use `/` instead (Int / Int truncates)"),
+                       sl, sc, start, l2.pos))
         } else {
           Step(l1, tok(TkSlash, sl, sc, start, l1.pos))
         }
@@ -1740,7 +1743,6 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkMinus      -> match b { TkMinus -> true _ -> false }
     TkStar       -> match b { TkStar -> true _ -> false }
     TkSlash      -> match b { TkSlash -> true _ -> false }
-    TkSlashSlash -> match b { TkSlashSlash -> true _ -> false }
     TkPercent    -> match b { TkPercent -> true _ -> false }
     TkEqEq       -> match b { TkEqEq -> true _ -> false }
     TkNeq        -> match b { TkNeq -> true _ -> false }
@@ -1990,7 +1992,7 @@ fn decode_char(span: String) : Char {
 #  parse_and    -> parse_cmp ("and" parse_cmp)*
 #  parse_cmp    -> parse_add (cmpop parse_add)?        (no chains)
 #  parse_add    -> parse_mul ([+-] parse_mul)*
-#  parse_mul    -> parse_unary ([*/%//] parse_unary)*
+#  parse_mul    -> parse_unary ([*/%] parse_unary)*
 #  parse_unary  -> ("-" | "not")? parse_postfix
 #  parse_postfix-> parse_primary (call | field | index)*
 #  parse_primary-> literal | ident | "(" expr ")" | if | match | block | record | list | lambda
@@ -1998,7 +2000,7 @@ fn decode_char(span: String) : Char {
 fn op_of_tok(k: TokKind) : String {
   match k {
     TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
-    TkSlashSlash -> "//" TkPercent -> "%" TkPlusPlus -> "++"
+    TkPercent -> "%" TkPlusPlus -> "++"
     TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">" TkLe -> "<=" TkGe -> ">="
     TkAnd -> "and" TkOr -> "or"
     _ -> "?"
@@ -2300,7 +2302,7 @@ fn parse_mul(p: Parser) : PExpr {
 
 fn parse_mul_rest(p: Parser, lhs: Expr) : PExpr {
   let t = p_peek(p)
-  if tk_is(t.kind, TkStar) or tk_is(t.kind, TkSlash) or tk_is(t.kind, TkSlashSlash) or tk_is(t.kind, TkPercent) {
+  if tk_is(t.kind, TkStar) or tk_is(t.kind, TkSlash) or tk_is(t.kind, TkPercent) {
     let op = op_of_tok(t.kind)
     let r = parse_unary(p_skip_newlines(p_advance(p)))
     match r.r {
@@ -10517,7 +10519,6 @@ fn binop_cname(op: String) : Option[String] {
   else if op == "-" { Some("kai_op_sub") }
   else if op == "*" { Some("kai_op_mul") }
   else if op == "/" { Some("kai_op_div") }
-  else if op == "//" { Some("kai_op_idiv") }
   else if op == "%" { Some("kai_op_mod") }
   else if op == "^" { Some("kai_op_pow_int") }
   else if op == "<" { Some("kai_op_lt") }
@@ -13456,14 +13457,6 @@ fn emit_kind_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
         concat_all(["(",
                     emit_expr_raw(src, a, lcs, fns, variants, lams, cls),
                     " ", raw_op_str(op), " ",
-                    emit_expr_raw(src, b, lcs, fns, variants, lams, cls),
-                    ")"])
-      } else if op == "//" {
-        # Issue #90 — signed integer division. Both operands are
-        # `int64_t`; the typer rejected non-Int operands earlier.
-        concat_all(["(",
-                    emit_expr_raw(src, a, lcs, fns, variants, lams, cls),
-                    " / ",
                     emit_expr_raw(src, b, lcs, fns, variants, lams, cls),
                     ")"])
       } else if op == "^" {
@@ -26484,7 +26477,9 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
 # Binop typing is deliberately coarse: numeric operators unify their
 # two operands and return the shared type (usually `Int`); comparison
 # operators unify operands and return `Bool`; logical `and`/`or` pin
-# both sides to `Bool`; `//` and `%` pin operands to `Int`.
+# both sides to `Bool`; `%` pins operands to `Int` (issue #315 retired
+# the dedicated `//` operator — `Int / Int` already truncates via the
+# `Div[Int]` impl).
 fn binop_root(op: String, l_expr: Expr, r_expr: Expr, line: Int, col: Int, ty: Ty) : Expr =
   with_ty(mk_expr(EBinop(op, l_expr, r_expr), line, col), ty)
 
@@ -26503,11 +26498,6 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
   } else if op == "<" or op == ">" or op == "<=" or op == ">=" {
     let s1 = st_unify(rr.st, rl.ty, rr.ty, "comparison", line, col)
     mk_inferred(s1, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
-  } else if op == "//" {
-    # Integer division stays Int-only; no protocol overload in v1.
-    let s1 = st_unify(rr.st, rl.ty, TyInt, "integer arithmetic", line, col)
-    let s2 = st_unify(s1, rr.ty, TyInt, "integer arithmetic", line, col)
-    mk_inferred(s2, TyInt, binop_root(op, rl.expr, rr.expr, line, col, TyInt))
   } else if op == "%" {
     # Issue #-rem: modulo over a `Rem` protocol. Primitive `Int % Int`
     # keeps the unify-and-emit fast path; concrete non-primitive
@@ -32035,9 +32025,10 @@ fn ty_is_integral_raw_t(t: Ty) : Bool {
 }
 
 # Numeric binops whose raw form is a single C operator on `int64_t`.
-# `^` (integer power) and `//` (integer division) are not native C
-# operators, so they stay boxed for now and route through `kai_op_pow_int`
-# / `kai_op_idiv` as before (M3 v1 conservative; follow-up if hot).
+# `^` (integer power) is not a native C operator, so it stays boxed
+# for now and routes through `kai_op_pow_int` (M3 v1 conservative;
+# follow-up if hot). Integer division on `Int / Int` lowers to native
+# C `/` directly (issue #315 retired the dedicated `//` operator).
 fn op_is_raw_arith(op: String) : Bool {
   op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
 }
@@ -32164,26 +32155,17 @@ fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
           if op == "%" and not ty_is_integral_raw(opt_ty) { MBoxed }
           else { MUnboxed }
         }
-        # Issue #90 — `//` (integer division) and `^` (integer power)
-        # were previously routed through `kai_op_idiv` / `kai_op_pow_int`
-        # even when both operands were raw. Lift them inline:
-        #
-        #   - `//` is signed integer division. The typer pins both
-        #     operands to `Int` (synth_binop), so a raw / raw `//`
-        #     lowers to native C `/` on `int64_t` (or `sdiv i64` on
-        #     LLVM). Identical semantics to `kai_op_idiv` for the
-        #     Int path; the helper's Real-coercion path is unreachable
-        #     post-typer for `//`.
-        #
-        #   - `^` is integer-exponent power. We inline only when the
-        #     exponent is a compile-time literal in `[0, 64]` and the
-        #     result type is integral-raw. The emitter unrolls the
-        #     loop into `(b * b * ... * b)` — no statement-expression,
-        #     no loop construct, identical IR shape on both backends.
-        #     Other shapes (Real base, non-literal exponent, negative
-        #     exponent, or `n > 64`) keep the boxed path through
-        #     `kai_op_pow_int`.
-        else if op == "//" and child_is_raw(a) and child_is_raw(b) and ty_is_integral_raw(opt_ty) { MUnboxed }
+        # Issue #90 — `^` (integer power) was previously routed
+        # through `kai_op_pow_int` even when both operands were raw.
+        # Lift it inline when the exponent is a compile-time literal
+        # in `[0, 64]` and the result type is integral-raw. The
+        # emitter unrolls the loop into `(b * b * ... * b)` — no
+        # statement-expression, no loop construct, identical IR shape
+        # on both backends. Other shapes (Real base, non-literal
+        # exponent, negative exponent, or `n > 64`) keep the boxed
+        # path through `kai_op_pow_int`. (Issue #315: integer division
+        # no longer needs a dedicated branch — raw-Int `/` is already
+        # handled by the `op_is_raw_arith` arm above.)
         else if op == "^" and child_is_raw(a) and child_is_raw(b) and ty_is_integral_raw(opt_ty) and pow_exp_is_inlinable(b) { MUnboxed }
         # M4 — comparisons and short-circuiting booleans collapse to
         # native C operators when both operands are raw. The result
@@ -35302,7 +35284,6 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_sub(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_mul(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_div(%KaiValue*, %KaiValue*)\n",
-    "declare %KaiValue* @kaix_idiv(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_mod(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_eq(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_ne(%KaiValue*, %KaiValue*)\n",
@@ -35771,7 +35752,6 @@ fn llvm_binop_helper(op: String) : Option[String] {
   else if op == "-"  { Some("@kaix_sub") }
   else if op == "*"  { Some("@kaix_mul") }
   else if op == "/"  { Some("@kaix_div") }
-  else if op == "//" { Some("@kaix_idiv") }
   else if op == "%"  { Some("@kaix_mod") }
   else if op == "^"  { Some("@kaix_pow_int") }
   else if op == "==" { Some("@kaix_eq") }
@@ -36021,7 +36001,7 @@ fn llvm_emit_kind_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
       }
     }
     EBinop(op, a, b) ->
-      if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) or op == "//" or op == "^" {
+      if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) or op == "^" {
         llvm_emit_binop_raw(e, op, a, b, x.ty)
       } else {
         # Conservative fallback: emit boxed and unbox via the
@@ -36071,13 +36051,6 @@ fn llvm_emit_binop_raw(e: LlvmEmit, op: String, l: Expr, r: Expr, opt_ty: Option
     let opc = llvm_raw_arith_op(op, opt_ty)
     let reg = llvm_fresh_reg(rr.e)
     let instr = concat_all(["  ", reg.reg, " = ", opc, " ", rl.reg, ", ", rr.reg, "\n"])
-    let e1 = llvm_append_body(reg.e, instr)
-    LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
-  } else if op == "//" {
-    # Issue #90 — signed integer division on raw `i64`. Mirrors
-    # the C backend's native `/` lowering. Both operands typed Int.
-    let reg = llvm_fresh_reg(rr.e)
-    let instr = concat_all(["  ", reg.reg, " = sdiv i64 ", rl.reg, ", ", rr.reg, "\n"])
     let e1 = llvm_append_body(reg.e, instr)
     LlvmRaw { e: e1, reg: reg.reg, ty: opt_ty }
   } else if op == "^" {
