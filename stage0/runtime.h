@@ -128,6 +128,16 @@ struct KaiValue {
      * layout is otherwise unchanged). */
     void   *alloc_site;
 #endif
+#ifdef KAI_TRACE_RC_LEAKSITE
+    /* Lane DIAG (#293) — kaikai-source attribution. Captured at
+     * kai_alloc as the value of `kai_current_scope_fn`, set by the
+     * stage-1 emitter at the top of every generated kaikai function
+     * via `kai_set_scope_fn(<name>)`. Pairs with `alloc_site`
+     * (return-address) to map every leaked chunk to the kaikai fn
+     * whose body emitted (or should have emitted) the matching
+     * decref. Only present under -DKAI_TRACE_RC_LEAKSITE=1. */
+    const char *scope_fn;
+#endif
     union {
         int      b;                                 /* KAI_BOOL */
         int64_t  i;                                 /* KAI_INT */
@@ -536,6 +546,195 @@ static void kai_rc_site_register_once(void) {
  * real emit site. Vanilla builds drop the attribute (zero overhead). */
 #define KAI_RC_NOINLINE __attribute__((noinline))
 
+/* ---------- Lane DIAG (#293): per-leak-site attribution ----------
+ *
+ * Aim: map every leaked chunk back to the kaikai source function that
+ * allocated it, so the fix lane (Lane FIX) can rank scope_fns by leak
+ * volume and patch the missing decrefs in their emit shapes.
+ *
+ * Two pieces of state at alloc time:
+ *  - `kai_current_scope_fn`: the kaikai fn currently executing,
+ *    set by the emitter via `kai_set_scope_fn(<name>)` at the top
+ *    of every generated body. Static (the kaic2 self-compile is
+ *    single-threaded). Inherits from the caller for fns that don't
+ *    yet carry the hook (dispatch from prelude / FFI), so the
+ *    attribution remains stable across mixed call paths.
+ *  - allocator tag (KAI_VARIANT, KAI_RECORD, …): captured from
+ *    `kai_alloc_traced`'s `tag` parameter.
+ *
+ * Aggregation is keyed on `(scope_fn, tag)`. Per-chunk metadata stays
+ * to one extra pointer (`scope_fn` field on KaiValue under
+ * KAI_TRACE_RC_LEAKSITE); the agg table is a fixed open-addressed
+ * hash sized at 8 K buckets — empirically the kaic2 self-compile
+ * has ≤ ~600 unique kaikai fn names, so worst-case load factor is
+ * ~8 % across (fn × 13 tags). */
+#ifdef KAI_TRACE_RC_LEAKSITE
+
+static const char *kai_current_scope_fn = "<root>";
+
+static void kai_set_scope_fn(const char *name) {
+    kai_current_scope_fn = (name != NULL) ? name : "<root>";
+}
+
+#define KAI_LEAKSITE_BUCKETS 8192
+
+typedef struct {
+    const char *scope_fn;   /* NULL = empty bucket */
+    int32_t     tag;
+    int64_t     allocs;
+    int64_t     frees;
+} KaiLeakSite;
+
+static KaiLeakSite kai_leaksites[KAI_LEAKSITE_BUCKETS];
+static int         kai_leaksites_count = 0;
+static int         kai_leaksites_full  = 0;
+
+static uint32_t kai_leaksite_hash(const char *scope, int32_t tag) {
+    uintptr_t x = (uintptr_t) scope;
+    x ^= (uintptr_t) ((uint32_t) tag * 0x9E3779B1u);
+    x ^= x >> 33;
+    x *= (uintptr_t) 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return (uint32_t) (x & (KAI_LEAKSITE_BUCKETS - 1));
+}
+
+static KaiLeakSite *kai_leaksite_lookup(const char *scope, int32_t tag, int insert) {
+    if (scope == NULL) scope = "<unknown>";
+    uint32_t mask = KAI_LEAKSITE_BUCKETS - 1;
+    uint32_t h = kai_leaksite_hash(scope, tag);
+    for (uint32_t i = 0; i < KAI_LEAKSITE_BUCKETS; i++) {
+        uint32_t k = (h + i) & mask;
+        KaiLeakSite *b = &kai_leaksites[k];
+        if (b->scope_fn == scope && b->tag == tag) return b;
+        if (b->scope_fn == NULL) {
+            if (!insert) return NULL;
+            b->scope_fn = scope;
+            b->tag      = tag;
+            kai_leaksites_count++;
+            return b;
+        }
+    }
+    kai_leaksites_full = 1;
+    return NULL;
+}
+
+static void kai_leaksite_record_alloc(const char *scope, int32_t tag) {
+    KaiLeakSite *b = kai_leaksite_lookup(scope, tag, 1);
+    if (b) b->allocs++;
+}
+
+static void kai_leaksite_record_free(const char *scope, int32_t tag) {
+    KaiLeakSite *b = kai_leaksite_lookup(scope, tag, 0);
+    if (b) b->frees++;
+}
+
+static const char *kai_leaksite_alloc_fn(int32_t tag) {
+    switch (tag) {
+        case KAI_VARIANT: return "kai_variant";
+        case KAI_RECORD:  return "kai_record";
+        case KAI_CONS:    return "kai_cons";
+        case KAI_STR:     return "kai_str";
+        case KAI_INT:     return "kai_int";
+        case KAI_REAL:    return "kai_real";
+        case KAI_CHAR:    return "kai_char";
+        case KAI_CLOSURE: return "kai_closure";
+        case KAI_ARRAY:   return "kai_array";
+        case KAI_BOOL:    return "kai_bool";
+        case KAI_UNIT:    return "kai_unit";
+        case KAI_NIL:     return "kai_nil";
+        case KAI_FIBER:   return "kai_fiber";
+        case KAI_PID:     return "kai_pid";
+        default:          return "kai_alloc";
+    }
+}
+
+static int kai_leaksite_cmp_leak(const void *a, const void *b) {
+    const KaiLeakSite *x = (const KaiLeakSite *) a;
+    const KaiLeakSite *y = (const KaiLeakSite *) b;
+    int64_t lx = x->allocs - x->frees;
+    int64_t ly = y->allocs - y->frees;
+    if (ly > lx) return 1;
+    if (ly < lx) return -1;
+    return 0;
+}
+
+static void kai_leaksite_report(void) {
+    if (getenv("KAI_TRACE_RC_QUIET")) return;
+    if (kai_leaksites_count == 0) return;
+
+    int top_n = 20;
+    const char *e = getenv("KAI_TRACE_RC_LEAKSITE_TOP");
+    if (e && e[0]) {
+        int n = atoi(e);
+        if (n > 0) top_n = n;
+    }
+
+    KaiLeakSite *flat = (KaiLeakSite *) malloc(
+        (size_t) kai_leaksites_count * sizeof(KaiLeakSite));
+    if (!flat) return;
+    int n = 0;
+    int64_t total_leak = 0;
+    int64_t per_tag_leak[16] = {0};
+    for (int i = 0; i < KAI_LEAKSITE_BUCKETS; i++) {
+        if (kai_leaksites[i].scope_fn != NULL) {
+            flat[n++] = kai_leaksites[i];
+            int64_t live = kai_leaksites[i].allocs - kai_leaksites[i].frees;
+            if (live > 0) {
+                total_leak += live;
+                int t = kai_leaksites[i].tag;
+                if (t >= 0 && t < 16) per_tag_leak[t] += live;
+            }
+        }
+    }
+    qsort(flat, (size_t) n, sizeof(KaiLeakSite), kai_leaksite_cmp_leak);
+
+    int limit = top_n < n ? top_n : n;
+    fprintf(stderr,
+        "[KAI_TRACE_RC_LEAKSITE] top sites by leak (showing %d of %d distinct (scope_fn,tag); total_leak=%lld%s)\n",
+        limit, n, (long long) total_leak,
+        kai_leaksites_full ? "; TABLE SATURATED" : "");
+    fprintf(stderr,
+        "[KAI_TRACE_RC_LEAKSITE] columns: rank | alloc_fn | scope_fn | allocs | frees | leak | leak%% | share%%\n");
+    for (int i = 0; i < limit; i++) {
+        KaiLeakSite *s = &flat[i];
+        int64_t live = s->allocs - s->frees;
+        double pct = s->allocs > 0
+            ? (100.0 * (double) live / (double) s->allocs) : 0.0;
+        double share = total_leak > 0
+            ? (100.0 * (double) live / (double) total_leak) : 0.0;
+        fprintf(stderr,
+            "[KAI_TRACE_RC_LEAKSITE] %2d | %-11s | %-40s | %10lld | %10lld | %10lld | %5.1f | %5.1f\n",
+            i + 1,
+            kai_leaksite_alloc_fn(s->tag),
+            s->scope_fn,
+            (long long) s->allocs,
+            (long long) s->frees,
+            (long long) live,
+            pct, share);
+    }
+    /* Per-tag totals so checkpoint 2 (sum-by-alloc_fn vs per-tag totals)
+     * can be verified at a glance from the same dump. */
+    fprintf(stderr,
+        "[KAI_TRACE_RC_LEAKSITE] per-tag leak totals (sum across all scope_fns):\n");
+    for (int t = 0; t < 16; t++) {
+        if (per_tag_leak[t] != 0) {
+            fprintf(stderr,
+                "[KAI_TRACE_RC_LEAKSITE]   tag=%-7s leak=%lld\n",
+                kai_rc_tag_name(t), (long long) per_tag_leak[t]);
+        }
+    }
+    free(flat);
+}
+
+static int kai_leaksite_registered = 0;
+static void kai_leaksite_register_once(void) {
+    if (kai_leaksite_registered) return;
+    kai_leaksite_registered = 1;
+    atexit(kai_leaksite_report);
+}
+
+#endif /* KAI_TRACE_RC_LEAKSITE */
+
 #endif /* KAI_TRACE_RC */
 
 #ifndef KAI_TRACE_RC
@@ -561,6 +760,11 @@ static KaiValue *kai_alloc(KaiTag tag) {
     kai_rc_site_record_alloc(site, (int32_t) tag);
     kai_rc_site_register_once();
     kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) tag);
+#endif
+#ifdef KAI_TRACE_RC_LEAKSITE
+    v->scope_fn = kai_current_scope_fn;
+    kai_leaksite_record_alloc(kai_current_scope_fn, (int32_t) tag);
+    kai_leaksite_register_once();
 #endif
     return v;
 }
@@ -1211,6 +1415,12 @@ static void kai_free_value(KaiValue *v) {
         /* issue #296 — credit the matching alloc site. */
         kai_rc_site_record_free(v->alloc_site);
         kai_rc_history_log(v, /* op=free */ 3, freed_tag);
+#ifdef KAI_TRACE_RC_LEAKSITE
+        /* Lane DIAG (#293) — credit the matching scope_fn. Read
+         * before the poison stamp below so we don't read back
+         * 0xDEADBEEF as the scope pointer. */
+        kai_leaksite_record_free(v->scope_fn, freed_tag);
+#endif
         /* Stamp poison over the whole struct so a stale read after
          * free surfaces the recognizable 0xDEADBEEF... pattern on
          * macOS instead of stale-but-plausible content. We touch
