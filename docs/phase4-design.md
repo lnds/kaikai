@@ -25,7 +25,12 @@ checkpoint; this phase turns the compiler into something usable.
    - `kai run <file.kai> [args...]` — build then execute the resulting
      binary; forward any arguments.
    - `kai test <file.kai>` — compile the file with `--test` and run it,
-     propagating the pass/fail exit code.
+     propagating the pass/fail exit code. Only `test "..." { ... }`
+     blocks defined in `<file.kai>` (and any user-imported modules)
+     run; `test` blocks defined inside the auto-loaded stdlib preludes
+     are dropped at load time so the count reflects only the user's
+     tests (issue #318). Pass `--include-prelude-tests` to opt into
+     the legacy behaviour where every prelude test is also counted.
    - `kai --version`, `kai help` — informational.
    The driver lives at `bin/kai`. On first call it ensures `stage0/kaic0`
    and `stage1/kaic1` are built.
@@ -34,6 +39,12 @@ checkpoint; this phase turns the compiler into something usable.
    every declaration of `<file>` before the input module's own decls.
    The prelude's decls land in the same global scope, available for
    name resolution and emission. Makes a stdlib usable without imports.
+   `test`/`bench`/`check` blocks from prelude files are dropped at load
+   time so they do not contaminate `kai test`/`kai bench`/`kai check`
+   on the user's file (issue #318). `--include-prelude-tests` keeps
+   them — used by stdlib developers running prelude-side test suites
+   and by the kaikai project's own integration gates that need the
+   full pre-fix behaviour.
 
 3. **`stdlib/core/`** — a small set of files (one per topic) with
    convenience wrappers over the builtin prelude. Kept small and
