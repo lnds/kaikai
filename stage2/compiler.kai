@@ -11779,6 +11779,14 @@ fn interp_is_triple(span: String) : Bool {
 # grow the current literal span.
 type IScan = { parts: [IPart], lit_start: Int, i: Int }
 
+# issue #311: triple-quote bodies may carry literal newlines / tabs /
+# unescaped `"`; emitting the raw slice produces invalid C. The lit
+# pieces between `#{...}` boundaries are routed through the same
+# `escape_str_body_for_c` helper as the non-interp fast path. For a
+# regular string the helper is identity, so behavior is unchanged.
+fn raw_lit_for_c(piece: String) : String =
+  cat3("\"", escape_str_body_for_c(piece), "\"")
+
 # `st.parts` accumulates in REVERSE here for O(1) prepend; the public
 # iscan_collect entry point reverses once at the end.
 fn iscan_collect_rev(span: String, end: Int, st: IScan) : [IPart] {
@@ -11792,7 +11800,7 @@ fn iscan_collect_rev(span: String, end: Int, st: IScan) : [IPart] {
           let with_lit =
             if st.i > st.lit_start {
               let piece = string_slice(span, st.lit_start, st.i - st.lit_start)
-              [IpLit(piece, cat3("\"", piece, "\"")), ...st.parts]
+              [IpLit(piece, raw_lit_for_c(piece)), ...st.parts]
             } else { st.parts }
           let expr_start = st.i + 2
           let expr_end = iscan_expr_end(span, expr_start, end, 1)
@@ -11831,7 +11839,7 @@ fn iscan_expr_end(span: String, i: Int, end: Int, depth: Int) : Int {
 fn finish_iscan_rev(span: String, end: Int, st: IScan) : [IPart] {
   if st.lit_start < end {
     let piece = string_slice(span, st.lit_start, end - st.lit_start)
-    [IpLit(piece, cat3("\"", piece, "\"")), ...st.parts]
+    [IpLit(piece, raw_lit_for_c(piece)), ...st.parts]
   } else {
     st.parts
   }
@@ -11866,13 +11874,50 @@ fn emit_interp_part(src: String, p: IPart, lcs: [String], fns: [EFn], variants: 
   }
 }
 
+# issue #311: triple-quote string spans contain unescaped chars
+# (literal newline, tab, `"`) that the C preprocessor can't handle.
+# Walk the body once, emitting a C-escape for each problem char.
+# Source-level escapes (`\\<x>`) pass through verbatim, matching the
+# lexer's treatment in `lex_string_body`. For regular strings the
+# lexer guarantees no literal newline / `\r` / `\t` / unescaped `"`,
+# so the output is identical to the input — safe to apply uniformly.
+fn escape_str_body_for_c(body: String) : String =
+  esc_body_loop(body, string_length(body), 0, "")
+
+fn esc_body_loop(body: String, n: Int, i: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(body, i) {
+      None -> acc
+      Some(c) -> {
+        if c == '\\' and i + 1 < n {
+          match char_at(body, i + 1) {
+            None -> esc_body_loop(body, n, i + 1, append_char(acc, c))
+            Some(nx) -> esc_body_loop(body, n, i + 2, append_char(append_char(acc, c), nx))
+          }
+        }
+        else if char_to_int(c) == 10 { esc_body_loop(body, n, i + 1, cat2(acc, "\\n")) }
+        else if char_to_int(c) == 13 { esc_body_loop(body, n, i + 1, cat2(acc, "\\r")) }
+        else if char_to_int(c) == 9  { esc_body_loop(body, n, i + 1, cat2(acc, "\\t")) }
+        else if c == '"'             { esc_body_loop(body, n, i + 1, cat2(acc, "\\\"")) }
+        else                         { esc_body_loop(body, n, i + 1, append_char(acc, c)) }
+      }
+    }
+  }
+}
+
 fn emit_string_expr(src: String, span: String, is_triple: Bool, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   let n = string_length(span)
   let body_start = if is_triple { 3 } else { 1 }
   let body_end = if is_triple { n - 3 } else { n - 1 }
   # Fast path: if no `#{` appears, emit as a plain C literal.
   if not has_interp(span, body_start, body_end) {
-    cat3("kai_str(", span, ")")
+    if is_triple {
+      let body = string_slice(span, body_start, body_end - body_start)
+      cat3("kai_str(\"", escape_str_body_for_c(body), "\")")
+    } else {
+      cat3("kai_str(", span, ")")
+    }
   } else {
     let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
     emit_interp_parts(src, parts, lcs, fns, variants, lams, cls)
