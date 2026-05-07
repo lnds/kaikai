@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  tier1:
+  tier0:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -27,6 +27,75 @@ jobs:
       # main lists tier1 as required, so this workflow MUST always
       # produce a tier1 status — if we paths-ignored it instead, doc
       # PRs would get stuck in BLOCKED forever.
+      - name: Detect doc-only diff
+        id: doc-only
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          if [ -z "$CHANGED" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          NON_DOC=$(echo "$CHANGED" | grep -Ev '^(docs/|[^/]+\.md$|LICENSE$)' || true)
+          if [ -z "$NON_DOC" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Doc-only PR; skipping tier0 build."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install toolchain (clang for LLVM backend tests)
+        if: steps.doc-only.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang
+
+      - name: Toolchain versions
+        if: steps.doc-only.outputs.skip != 'true'
+        run: |
+          cc --version
+          clang --version
+          make --version | head -1
+
+      # Pin CC=clang so the runner uses the same compiler family
+      # as the macOS dev environment (clang). R5 (the euler4
+      # main-thread stack overflow that was previously gated by
+      # `BASELINE=23`) is now resolved for *emitted programs*
+      # by issue #37 — the emitter rewrites every self-tail-call
+      # into a goto-loop at the C-emit boundary, so deep
+      # self-recursion in kaikai source uses O(1) C-stack. The
+      # PR #36 `RLIMIT_STACK` constructor in `stage0/runtime.h`
+      # is retained until the rewrite is mirrored into
+      # `stage1/compiler.kai` (the kaic2 binary's own internal
+      # `lex_loop` etc. are emitted by stage 1, which still
+      # uses recursive C calls). CI reads `demos/baseline.txt = 24`
+      # like local mac.
+      - name: tier0 (selfhost byte-identical + demos baseline)
+        if: steps.doc-only.outputs.skip != 'true'
+        run: make CC=clang tier0
+
+      - name: Working tree clean check
+        if: steps.doc-only.outputs.skip != 'true'
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after tier0; build artifacts leaked into tracked paths"
+            git status
+            exit 1
+          fi
+
+  tier1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Detect doc-only diff
         id: doc-only
         run: |
@@ -61,23 +130,6 @@ jobs:
           cc --version
           clang --version
           make --version | head -1
-
-      # Pin CC=clang so the runner uses the same compiler family
-      # as the macOS dev environment (clang). R5 (the euler4
-      # main-thread stack overflow that was previously gated by
-      # `BASELINE=23`) is now resolved for *emitted programs*
-      # by issue #37 — the emitter rewrites every self-tail-call
-      # into a goto-loop at the C-emit boundary, so deep
-      # self-recursion in kaikai source uses O(1) C-stack. The
-      # PR #36 `RLIMIT_STACK` constructor in `stage0/runtime.h`
-      # is retained until the rewrite is mirrored into
-      # `stage1/compiler.kai` (the kaic2 binary's own internal
-      # `lex_loop` etc. are emitted by stage 1, which still
-      # uses recursive C calls). CI reads `demos/baseline.txt = 24`
-      # like local mac.
-      - name: tier0 (selfhost byte-identical + demos baseline)
-        if: steps.doc-only.outputs.skip != 'true'
-        run: make CC=clang tier0
 
       - name: tier1 (full make test + demos baseline)
         if: steps.doc-only.outputs.skip != 'true'
