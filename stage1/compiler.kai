@@ -6074,16 +6074,24 @@ type Mode
   | MTest
   | MHelp
 
-type CliOptions = { mode: Mode, path: Option[String], prelude: Option[String] }
+type CliOptions = { mode: Mode, path: Option[String], prelude: Option[String],
+                    include_prelude_tests: Bool }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
-  CliOptions { mode: m, path: opts.path, prelude: opts.prelude }
+  CliOptions { mode: m, path: opts.path, prelude: opts.prelude,
+               include_prelude_tests: opts.include_prelude_tests }
 
 fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: Some(p), prelude: opts.prelude }
+  CliOptions { mode: opts.mode, path: Some(p), prelude: opts.prelude,
+               include_prelude_tests: opts.include_prelude_tests }
 
 fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path, prelude: Some(p) }
+  CliOptions { mode: opts.mode, path: opts.path, prelude: Some(p),
+               include_prelude_tests: opts.include_prelude_tests }
+
+fn cli_with_include_prelude_tests(opts: CliOptions) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path, prelude: opts.prelude,
+               include_prelude_tests: true }
 
 fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
   match rest {
@@ -6095,6 +6103,11 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
         parse_cli_loop(more, cli_with_mode(opts, MAst))
       } else if a == "--test" {
         parse_cli_loop(more, cli_with_mode(opts, MTest))
+      } else if a == "--include-prelude-tests" {
+        # Issue #318: keep test blocks defined in `--prelude` files.
+        # Without this flag the prelude's tests are dropped at load
+        # time so `kai test <file>` runs only the file's own tests.
+        parse_cli_loop(more, cli_with_include_prelude_tests(opts))
       } else if a == "-h" or a == "--help" {
         parse_cli_loop(more, cli_with_mode(opts, MHelp))
       } else if a == "--prelude" {
@@ -6113,7 +6126,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
 }
 
 fn parse_cli(argv: [String]) : CliOptions {
-  parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, prelude: None })
+  parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, prelude: None,
+                                    include_prelude_tests: false })
 }
 
 fn usage() : Unit {
@@ -6122,12 +6136,18 @@ fn usage() : Unit {
   eprint("  --tokens           print the token stream and exit")
   eprint("  --ast              parse and print the AST and exit")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
+  eprint("  --include-prelude-tests  also run test blocks from --prelude (default: drop them; issue #318)")
   eprint("  -h, --help         this help")
 }
 
 # Parse a prelude file and return its decl list. On any error report
 # to stderr and return None.
-fn load_prelude(path: String) : Option[[Decl]] {
+#
+# Issue #318: when `include_tests` is false (the default), strip
+# every `DTest` block from the prelude before returning it. This
+# matches stage 2's behaviour: `kai test <user.kai>` should run
+# only the user file's own tests, not the stdlib's.
+fn load_prelude(path: String, include_tests: Bool) : Option[[Decl]] {
   match read_file(path) {
     Err(msg) -> { eprint("kaic1: #{path}: #{msg}"); None }
     Ok(src) -> {
@@ -6136,9 +6156,22 @@ fn load_prelude(path: String) : Option[[Decl]] {
       if errs != 0 { None }
       else {
         let parsed = parse_program(path, src, tokens)
-        parsed.decls
+        match parsed.decls {
+          None -> None
+          Some(ds) -> if include_tests { Some(ds) } else { Some(strip_prelude_tests(ds, [])) }
+        }
       }
     }
+  }
+}
+
+# Issue #318: drop every `test` block from a prelude file's decls.
+# Stage 1 does not parse `bench`/`check`, so DTest is the only case.
+fn strip_prelude_tests(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DTest(_, _, _, _) -> strip_prelude_tests(rest, acc)
+    _                  -> strip_prelude_tests(rest, [d, ...acc])
   }
 }
 
@@ -6200,7 +6233,7 @@ fn run(opts: CliOptions) : Int {
         let prelude_decls =
           match opts.prelude {
             None -> Some([])
-            Some(pp) -> load_prelude(pp)
+            Some(pp) -> load_prelude(pp, opts.include_prelude_tests)
           }
         match prelude_decls {
           None -> 1
