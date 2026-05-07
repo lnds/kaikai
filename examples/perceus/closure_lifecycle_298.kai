@@ -1,0 +1,76 @@
+# Issue #298 — closure capture lifecycle.
+#
+# Pre-fix `kai_apply` borrowed its closure argument and the emitter at
+# every callsite (stage0 emit.c, stage1/stage2 compiler.kai, the LLVM
+# kaix_apply path) handed it the binding raw. For let-bound closures
+# invoked exactly once (`let f = make_adder(n); f(10)`), Perceus picked
+# the `LUAt + count == 1 -> raw transfer` branch and never inserted a
+# drop, so the closure leaked one ref per call. Self-compile of kaic2
+# leaked 27.97% of all closure allocations (487,390 of 1,742,333).
+#
+# Post-fix `kai_apply` consumes its closure (kai_decref after dispatch).
+# Runtime helpers (kai_prelude_map / _filter / _flat_map / _reduce /
+# _each, kai_fiber_trampoline) incref the closure ahead of every
+# kai_apply so each call gets its own ref to consume; their post-loop
+# decref releases the original ref the helper was handed. Stage 0
+# emit's `kai_apply(<ident>, ...)` callee path now routes through
+# `emit_ident_value` so multi-use closure bindings get the eager-dup
+# wrapper that stage 0 already had for value-position reads.
+#
+# Each block below exercises a closure shape that leaked pre-fix:
+#
+# 1. Single-use let-bound closure: `let f = make_adder(n); f(10)`.
+#    Perceus marks the read raw-transfer; the closure is consumed by
+#    kai_apply and reclaimed.
+#
+# 2. Multi-use let-bound closure: same `f` invoked three times. Each
+#    non-last read is dup-wrapped and consumed by kai_apply; the
+#    last-use raw transfer drops the original.
+#
+# 3. High-churn closures fed through stdlib helpers: chained
+#    `xs |> map(...) |> map(...) |> filter(...)` allocates one closure
+#    per stage; each helper consumes its closure once and decrefs it
+#    after the loop.
+#
+# 4. Recursive churn: a fn that allocates a fresh closure per
+#    iteration via make_adder, invokes it, and recurses. Pre-fix this
+#    leaked one closure per iteration.
+
+fn make_adder(n: Int) : (Int) -> Int = (x) => x + n
+
+fn churn(n: Int, acc: Int) : Int = {
+  if n == 0 { acc }
+  else {
+    let f = make_adder(n)
+    let r = f(10)
+    churn(n - 1, acc + r)
+  }
+}
+
+fn list_sum(xs: [Int]) : Int = match xs {
+  []        -> 0
+  [h, ...t] -> h + list_sum(t)
+}
+
+fn main() : Int / Console = {
+  # 1. Single-use let-bound closure.
+  let add3 = make_adder(3)
+  print(int_to_string(add3(10)))
+
+  # 2. Multi-use let-bound closure.
+  let f = make_adder(100)
+  print(int_to_string(f(1)))
+  print(int_to_string(f(2)))
+  print(int_to_string(f(3)))
+
+  # 3. Chained higher-order helpers.
+  let xs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  let bumped = map(xs, (x) => x + 1)
+  let doubled = map(bumped, (x) => x * 2)
+  let evens = filter(doubled, (x) => x > 10)
+  print(int_to_string(list_sum(evens)))
+
+  # 4. Recursive closure churn.
+  print(int_to_string(churn(10, 0)))
+  0
+}
