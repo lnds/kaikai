@@ -36,10 +36,13 @@ horizon beyond.
   - Tier 1 #1 (memory safety + effects in types) — defendible
   - Tier 1 #2 (mandatory TCO) — defendible without footnote as of 0.23.0
   - Tier 1 #3 (fast compilation) — defendible
-- **Inner-loop perf**: ~2.0× C reference under -O2 (post Real
-  unboxing in 0.27.0). Target trajectory: post-Tongariki ~2.0× →
-  Anga Roa ~1.5–1.7× → Orongo near-C with multi-thread + Tier 3b
-  unboxed messages.
+- **Inner-loop perf**: ~2.0× C reference under -O2 on
+  compute-bound code (post Real unboxing in 0.27.0). Target
+  trajectory bifurcates at Anga Roa by workload class
+  (see DoD #4 below): compute-bound code → ≤ 1.5–2× C in-MVP;
+  structural data traversal → ≤ 5–10× C in-MVP, ≤ 2× post-MVP
+  via Phase 3. Orongo: near-C on compute-bound with multi-thread
+  + Tier 3b unboxed messages.
 - **Selfhost**: byte-identical at fixed point under both C and LLVM
   backends.
 
@@ -239,8 +242,9 @@ polymorphic-impl machinery.
 - Reuse-in-place (Perceus Tier 3a) — constructors reuse
   consumed cells when alias analysis can prove the old value
   is dead at the construction site. Big win on linked-list
-  rewrites (`map`, `filter`, `fold`-into-list). Brings inner
-  loop to ~1.5–1.7× C reference.
+  rewrites (`map`, `filter`, `fold`-into-list). Closes the
+  compute-bound side of DoD #4 (gate 4a) and contributes to
+  gate 4b on structural-data traversal.
   *(Optimization thread for this milestone.)*
 
 **Definition of Done**:
@@ -251,7 +255,35 @@ polymorphic-impl machinery.
    call it, observe effect).
 3. Property test runner reports the minimal counterexample
    (post-shrink) on failure.
-4. Inner-loop benchmark at ~1.5–1.7× C reference.
+4. **Performance, bifurcated by workload class.** Both gates
+   below are required for Anga Roa to close. The split reflects
+   the architecture: kaikai represents locals unboxed and storage
+   edges boxed; a single performance target cannot honestly cover
+   both unless they share a representation.
+
+   4a. **Compute-bound code** (locals + return values, in scope
+       of Phase 2 unboxing): ≤ 1.5–2× C reference under -O2.
+       Acceptance benchmarks: fizzbuzz
+       (`examples/quickstart/02_fizzbuzz.kai`), euler problems,
+       sieve. Phase 2 already landed (M1+M2+M3); gate is
+       achievable in-MVP.
+
+   4b. **Structural data traversal** (records, variants,
+       recursive tree algorithms with mutation-as-rebuild):
+       ≤ 5–10× C reference under -O2 in-MVP, with a roadmap to
+       ≤ 2× post-MVP via Phase 3 (field unboxing + reuse-in-place
+       for variants). Acceptance benchmark: red-black tree
+       (`examples/perceus/rb_tree_bench.kai`).
+
+   Empirical evidence motivating the bifurcation:
+   `docs/benchmarks/rb_tree_2026-05-08.md` (re-measure on 0.44.1
+   post-#342) records 9.94×–11.90× C on the red-black tree
+   benchmark under the original single-number target; PR #305
+   (closed) is the prior measurement that originally surfaced the
+   gap. Locals-unboxed/storage-edges-boxed split formalised in
+   `docs/unboxing-phase2-design.md`. Issues #350 (RC discipline
+   in tail-recursive helpers) and #353 (Okasaki rotation reuse)
+   contribute to gate 4b.
 5. Diagnostic quality: a representative ill-typed program
    produces a message at the bar set by the m11 acceptance
    fixtures (TBD as part of m11 design).
