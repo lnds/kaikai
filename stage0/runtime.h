@@ -46,6 +46,7 @@
 #ifndef KAI_RUNTIME_H
 #define KAI_RUNTIME_H
 
+#include <math.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
@@ -2477,6 +2478,82 @@ static KaiValue *kai_prelude_real_to_int(KaiValue *v) {
     return out;
 }
 
+/* ---------- prelude: math/real libm bindings (issue #343) ----------
+ * IEEE-754 pass-through: NaN / Inf propagate per C99 <math.h>.
+ * Inspect with kai_prelude_real_is_nan / kai_prelude_real_is_inf. */
+
+#define KAI_LIBM_REAL1(name, fn)                                         \
+    static KaiValue *kai_prelude_real_##name(KaiValue *x) {              \
+        double r = (x && x->tag == KAI_REAL) ? fn(x->as.r) : 0.0;        \
+        KaiValue *out = kai_real(r);                                     \
+        if (x) kai_decref(x);                                            \
+        return out;                                                      \
+    }
+
+#define KAI_LIBM_REAL2(name, fn)                                         \
+    static KaiValue *kai_prelude_real_##name(KaiValue *a, KaiValue *b) { \
+        double av = (a && a->tag == KAI_REAL) ? a->as.r : 0.0;           \
+        double bv = (b && b->tag == KAI_REAL) ? b->as.r : 0.0;           \
+        KaiValue *out = kai_real(fn(av, bv));                            \
+        if (a) kai_decref(a);                                            \
+        if (b) kai_decref(b);                                            \
+        return out;                                                      \
+    }
+
+KAI_LIBM_REAL1(sqrt,  sqrt)
+KAI_LIBM_REAL1(cbrt,  cbrt)
+KAI_LIBM_REAL1(exp,   exp)
+KAI_LIBM_REAL1(log,   log)
+KAI_LIBM_REAL1(log2,  log2)
+KAI_LIBM_REAL1(log10, log10)
+KAI_LIBM_REAL1(sin,   sin)
+KAI_LIBM_REAL1(cos,   cos)
+KAI_LIBM_REAL1(tan,   tan)
+KAI_LIBM_REAL1(asin,  asin)
+KAI_LIBM_REAL1(acos,  acos)
+KAI_LIBM_REAL1(atan,  atan)
+KAI_LIBM_REAL1(sinh,  sinh)
+KAI_LIBM_REAL1(cosh,  cosh)
+KAI_LIBM_REAL1(tanh,  tanh)
+
+KAI_LIBM_REAL2(pow,   pow)
+KAI_LIBM_REAL2(atan2, atan2)
+
+#undef KAI_LIBM_REAL1
+#undef KAI_LIBM_REAL2
+
+/* signum: -1.0 / 0.0 / +1.0; NaN passes through as NaN. */
+static KaiValue *kai_prelude_real_signum(KaiValue *x) {
+    double r = (x && x->tag == KAI_REAL) ? x->as.r : 0.0;
+    double s;
+    if (r != r)        s = r;          /* NaN */
+    else if (r > 0.0)  s = 1.0;
+    else if (r < 0.0)  s = -1.0;
+    else               s = 0.0;
+    KaiValue *out = kai_real(s);
+    if (x) kai_decref(x);
+    return out;
+}
+
+static KaiValue *kai_prelude_real_is_nan(KaiValue *x) {
+    int yes = 0;
+    if (x && x->tag == KAI_REAL) { double r = x->as.r; yes = (r != r); }
+    KaiValue *out = kai_bool(yes);
+    if (x) kai_decref(x);
+    return out;
+}
+
+static KaiValue *kai_prelude_real_is_inf(KaiValue *x) {
+    int yes = 0;
+    if (x && x->tag == KAI_REAL) {
+        double r = x->as.r;
+        yes = (r > 1.7976931348623157e308) || (r < -1.7976931348623157e308);
+    }
+    KaiValue *out = kai_bool(yes);
+    if (x) kai_decref(x);
+    return out;
+}
+
 /* ---------- prelude: strings ---------- */
 
 static KaiValue *kai_prelude_string_length(KaiValue *s) {
@@ -3408,6 +3485,26 @@ static KaiValue *_kai_prelude_int_to_string_thunk(KaiValue *s, KaiValue **a, int
 static KaiValue *_kai_prelude_real_to_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_real_to_string(a[0]); }
 static KaiValue *_kai_prelude_int_to_real_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_int_to_real(a[0]); }
 static KaiValue *_kai_prelude_real_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_real_to_int(a[0]); }
+static KaiValue *_kai_prelude_real_sqrt_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_sqrt(a[0]); }
+static KaiValue *_kai_prelude_real_cbrt_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_cbrt(a[0]); }
+static KaiValue *_kai_prelude_real_exp_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_exp(a[0]); }
+static KaiValue *_kai_prelude_real_log_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_log(a[0]); }
+static KaiValue *_kai_prelude_real_log2_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_log2(a[0]); }
+static KaiValue *_kai_prelude_real_log10_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_real_log10(a[0]); }
+static KaiValue *_kai_prelude_real_sin_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_sin(a[0]); }
+static KaiValue *_kai_prelude_real_cos_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_cos(a[0]); }
+static KaiValue *_kai_prelude_real_tan_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_tan(a[0]); }
+static KaiValue *_kai_prelude_real_asin_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_asin(a[0]); }
+static KaiValue *_kai_prelude_real_acos_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_acos(a[0]); }
+static KaiValue *_kai_prelude_real_atan_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_atan(a[0]); }
+static KaiValue *_kai_prelude_real_sinh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_sinh(a[0]); }
+static KaiValue *_kai_prelude_real_cosh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_cosh(a[0]); }
+static KaiValue *_kai_prelude_real_tanh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_tanh(a[0]); }
+static KaiValue *_kai_prelude_real_signum_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_real_signum(a[0]); }
+static KaiValue *_kai_prelude_real_is_nan_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_real_is_nan(a[0]); }
+static KaiValue *_kai_prelude_real_is_inf_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_real_is_inf(a[0]); }
+static KaiValue *_kai_prelude_real_pow_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_pow(a[0], a[1]); }
+static KaiValue *_kai_prelude_real_atan2_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_real_atan2(a[0], a[1]); }
 static KaiValue *_kai_prelude_string_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_length(a[0]); }
 static KaiValue *_kai_prelude_string_concat_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_concat(a[0], a[1]); }
 static KaiValue *_kai_prelude_string_concat_all_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_concat_all(a[0]); }
