@@ -33064,7 +33064,13 @@ fn perceus_decl(d: Decl) : Decl {
         let pnames = map(params, (p) => p.pname)
         let uses = pcs_collect_uses_expr(body, pnames, false, [])
         let new_body = pcs_rewrite_expr(body, pnames, uses, false)
-        let reused_body = pcs_recognise_reuse_expr(new_body)
+        # Issue #350 — emit `__perceus_drop` for multi-use pattern
+        # bindings introduced by match arms (mirror of the SLet
+        # exit-drop pass from #342). Runs BEFORE reuse recognition so
+        # the synthetic `__perceus_reuse_*` rewrites see the drops as
+        # part of the canonicalised arm body.
+        let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
+        let reused_body = pcs_recognise_reuse_expr(arm_dropped)
         let body_with_drops = pcs_prepend_unused_drops(reused_body, params, uses)
         DFn(is_pub, name, tparams, params, opt_ret, row, body_with_drops, ln, cl, mo)
       }
@@ -34279,6 +34285,288 @@ fn pcs_make_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
     ),
     line: ln, col: cl, ty: None, mode: MUnknown
   })
+
+# Issue #350 — Gap 3: emit `__perceus_drop` for multi-use pattern
+# bindings introduced by match arms. Mirror of the SLet exit-drop
+# pass landed in #342, but for the arm-binding shape that drives
+# the RB tree leak (`balance` / `insert_loop` rotation arms).
+#
+# Each match arm extracts cells from the scrutinee with `kai_incref`
+# at the binding site (`emit_pat_binds`). When a binding has ≥ 2
+# non-lambda uses inside the arm, every read is wrapped in
+# `__perceus_dup` (each consumer takes a fresh ref); the original
+# extract ref is left dangling without an explicit drop, leaking
+# the underlying child cell every time the arm fires.
+#
+# The pass walks the post-`pcs_rewrite_expr` AST, finds each EMatch
+# arm whose pattern introduces multi-use bindings, and inserts a
+# `__perceus_drop(nm)` between the body's statements and its tail.
+# Conservative gates (preserve TCO + avoid use-after-free):
+#   - Skip names already visible in the outer scope (owned upstream).
+#   - Skip names whose `last_use_for` is `LUUnused` or single-use
+#     `LUAt` (the lexically-last raw read transfers the ref).
+#   - Skip names that appear in the body's tail-leaf positions —
+#     a drop fires before the tail evaluates, so a tail-position
+#     read would see a freed cell when the binding's last live ref
+#     was the original.
+#   - For non-EBlock bodies, skip drops when the body is a tail-call
+#     to the enclosing fn (`fn_name`); wrapping such a body in an
+#     EBlock with `__pcs_arm_ret` would hide the self-tail-call from
+#     `tcrec_rewrite_decls` and break TCO (same risk #342 hit).
+#
+# The pass runs *after* `pcs_rewrite_expr` so it sees the
+# `__perceus_dup`-wrapped reads and the canonicalised structure;
+# it runs *before* `pcs_recognise_reuse_expr` so the reuse rewrite
+# operates on the post-drop arm body.
+fn pcs_arm_drop_pass(e: Expr, fn_name: String, outer_scope: [String],
+                     uses: [Use]) : Expr =
+  Expr { kind: pcs_arm_drop_kind(e.kind, e.line, e.col, fn_name, outer_scope, uses),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn pcs_arm_drop_kind(k: ExprKind, line: Int, col: Int, fn_name: String,
+                     outer_scope: [String], uses: [Use]) : ExprKind {
+  match k {
+    EMatch(scr, arms) -> {
+      let scr1 = pcs_arm_drop_pass(scr, fn_name, outer_scope, uses)
+      let arms1 = pcs_arm_drop_arms(arms, fn_name, outer_scope, uses)
+      EMatch(scr1, arms1)
+    }
+    EBlock(stmts, opt_tail) -> {
+      let stmts1 = pcs_arm_drop_stmts(stmts, fn_name, outer_scope, uses)
+      let tail1 = match opt_tail {
+        None -> None
+        Some(e2) -> Some(pcs_arm_drop_pass(e2, fn_name, outer_scope, uses))
+      }
+      EBlock(stmts1, tail1)
+    }
+    ELambda(ps, body) -> {
+      let pn = map(ps, (p) => p.pname)
+      ELambda(ps, pcs_arm_drop_pass(body, fn_name, list_append(outer_scope, pn), uses))
+    }
+    EHandle(body, eff, eff_tas, init_opt, alias, clauses, ret_opt) -> {
+      let body1 = pcs_arm_drop_pass(body, fn_name, outer_scope, uses)
+      let init1 = match init_opt {
+        None -> None
+        Some(e2) -> Some(pcs_arm_drop_pass(e2, fn_name, outer_scope, uses))
+      }
+      let cls1 = pcs_arm_drop_clauses(clauses, fn_name, outer_scope, uses)
+      let ret1 = match ret_opt {
+        None -> None
+        Some(hr) -> match hr {
+          HR(pname, body2, hl, hc) ->
+            Some(HR(pname,
+                    pcs_arm_drop_pass(body2, fn_name, [pname, ...outer_scope], uses),
+                    hl, hc))
+        }
+      }
+      EHandle(body1, eff, eff_tas, init1, alias, cls1, ret1)
+    }
+    _ -> map_expr_kind(k, (sub) => pcs_arm_drop_pass(sub, fn_name, outer_scope, uses))
+  }
+}
+
+fn pcs_arm_drop_stmts(stmts: [Stmt], fn_name: String, outer_scope: [String],
+                       uses: [Use]) : [Stmt] {
+  match stmts {
+    [] -> []
+    [s, ...rest] -> {
+      let s1 = match s {
+        SLet(pat, ty_opt, rhs) ->
+          SLet(pat, ty_opt, pcs_arm_drop_pass(rhs, fn_name, outer_scope, uses))
+        SVar(name, ty_opt, rhs, ln, cl) ->
+          SVar(name, ty_opt, pcs_arm_drop_pass(rhs, fn_name, outer_scope, uses), ln, cl)
+        SAssert(c, opt_m) -> {
+          let c1 = pcs_arm_drop_pass(c, fn_name, outer_scope, uses)
+          let m1 = match opt_m {
+            None -> None
+            Some(m) -> Some(pcs_arm_drop_pass(m, fn_name, outer_scope, uses))
+          }
+          SAssert(c1, m1)
+        }
+        SExprStmt(e) -> SExprStmt(pcs_arm_drop_pass(e, fn_name, outer_scope, uses))
+        SIndexAssign(b, i, v, ln, cl) ->
+          SIndexAssign(pcs_arm_drop_pass(b, fn_name, outer_scope, uses),
+                       pcs_arm_drop_pass(i, fn_name, outer_scope, uses),
+                       pcs_arm_drop_pass(v, fn_name, outer_scope, uses), ln, cl)
+        SUse(n, ln, cl) -> SUse(n, ln, cl)
+      }
+      [s1, ...pcs_arm_drop_stmts(rest, fn_name, outer_scope, uses)]
+    }
+  }
+}
+
+fn pcs_arm_drop_clauses(cs: [HClause], fn_name: String, outer_scope: [String],
+                         uses: [Use]) : [HClause] {
+  match cs {
+    [] -> []
+    [h, ...rest] -> match h {
+      HC(op, params, body, ln, cl) -> {
+        let pn = pcs_filter_non_resume(map(params, (p) => p.pname), [])
+        let scope1 = list_append(outer_scope, ["state", "log", ...pn])
+        let body1 = pcs_arm_drop_pass(body, fn_name, scope1, uses)
+        [HC(op, params, body1, ln, cl),
+         ...pcs_arm_drop_clauses(rest, fn_name, outer_scope, uses)]
+      }
+    }
+  }
+}
+
+fn pcs_arm_drop_arms(arms: [Arm], fn_name: String, outer_scope: [String],
+                      uses: [Use]) : [Arm] {
+  match arms {
+    [] -> []
+    [a, ...rest] -> match a {
+      Arm(pat, opt_g, body) -> {
+        let bound = pat_binders(pat, [])
+        let scope1 = list_append(outer_scope, bound)
+        let body1 = pcs_arm_drop_pass(body, fn_name, scope1, uses)
+        # For EBlock bodies the drop site sits between stmts and
+        # tail (pre-tail), so a binding read in the tail would see
+        # a freed cell — we must skip those names. For non-block
+        # bodies the drop site sits AFTER the body via the
+        # `__pcs_arm_ret` wrap, so any read inside body is safe
+        # because body fully evaluates first; in that case the
+        # only unsafe bindings are ones tied to a self-tail-call
+        # (handled by `pcs_inject_arm_drops`).
+        let pre_tail = pcs_body_is_block_with_tail(body1)
+        let drops = pcs_collect_arm_drops(bound, pat.line, pat.col, body1,
+                                            outer_scope, uses, pre_tail, [])
+        let body2 = match drops {
+          [] -> body1
+          [_, ...__] -> pcs_inject_arm_drops(body1, drops, fn_name)
+        }
+        [Arm(pat, opt_g, body2),
+         ...pcs_arm_drop_arms(rest, fn_name, outer_scope, uses)]
+      }
+    }
+  }
+}
+
+# Build a `[Stmt]` list of `__perceus_drop(nm)` calls for the arm's
+# pattern-introduced bindings that need a drop. Order is reverse-of-
+# bound (head-first accumulation + `pcs_inject_arm_drops` appends).
+fn pcs_collect_arm_drops(bound: [String], ln: Int, cl: Int, body: Expr,
+                          outer_scope: [String], uses: [Use], pre_tail: Bool,
+                          acc: [Stmt]) : [Stmt] {
+  match bound {
+    [] -> list_reverse(acc)
+    [nm, ...rest] -> {
+      let acc1 =
+        if list_has(outer_scope, nm) { acc }
+        else if pre_tail and pcs_name_in_body_tail(nm, body) { acc }
+        else {
+          # Re-scan the arm body for `nm` to get arm-local uses.
+          # The fn-wide `uses` table can over-count `nm` when sibling
+          # arms or unrelated scopes also bind a name `nm`; mirroring
+          # the rule against the global table would emit a drop on a
+          # single-use binding (the lexically-last raw read transfers
+          # the ref, so a drop here would over-decref). The local
+          # rescan is bounded by the arm body's size and runs only
+          # for arms that introduce bindings.
+          let arm_uses = pcs_collect_uses_expr(body, [nm], false, [])
+          let arm_count = pcs_count_non_lam_uses(nm, arm_uses, 0)
+          let in_lam = pcs_uses_have_in_lam(arm_uses, nm)
+          if in_lam {
+            [pcs_make_drop_stmt(nm, ln, cl), ...acc]
+          } else if arm_count >= 2 {
+            [pcs_make_drop_stmt(nm, ln, cl), ...acc]
+          } else { acc }
+        }
+      pcs_collect_arm_drops(rest, ln, cl, body, outer_scope, uses, pre_tail, acc1)
+    }
+  }
+}
+
+fn pcs_uses_have_in_lam(uses: [Use], nm: String) : Bool {
+  match uses {
+    [] -> false
+    [h, ...rest] -> match h {
+      U(uname, _, _, in_lam) ->
+        if uname == nm and in_lam { true }
+        else { pcs_uses_have_in_lam(rest, nm) }
+    }
+  }
+}
+
+fn pcs_body_is_block_with_tail(body: Expr) : Bool {
+  match body.kind {
+    EBlock(_, opt_tail) -> match opt_tail {
+      None -> false
+      Some(_) -> true
+    }
+    _ -> false
+  }
+}
+
+# Insert drops into the arm body. Three shapes:
+#   - body is `EBlock(stmts, opt_tail)`: append drops between stmts
+#     and tail. The tail position is preserved so `tcrec_rewrite_decls`
+#     can still detect a self-tail-call inside the tail expression.
+#   - body is a non-block expression that itself is a self-tail-call
+#     (`ECall(EVar(fn_name), args)`): leave alone. Wrapping it would
+#     hide the call from the TCO rewrite and risk a stack overflow
+#     (same regression #342 worked around). The drops are skipped —
+#     bindings appearing in tail are filtered upstream, so this
+#     only fires when the body has no draftable drops anyway.
+#   - body is any other non-block expression: wrap as
+#     `EBlock([SLet(__pcs_arm_ret, body), ...drops], Some(EVar(__pcs_arm_ret)))`.
+#     The body executes first (with its bindings live), the drops run
+#     before the wrapped block returns the saved value.
+fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr {
+  match body.kind {
+    EBlock(stmts, opt_tail) ->
+      Expr { kind: EBlock(list_append(stmts, drops), opt_tail),
+             line: body.line, col: body.col, ty: body.ty, mode: body.mode }
+    _ -> {
+      if pcs_is_self_tail_call(body, fn_name) { body }
+      else {
+        let ret_name = "__pcs_arm_ret"
+        let ret_let = SLet(
+          Pattern { pkind: PBind(ret_name), line: body.line, col: body.col },
+          None,
+          body
+        )
+        let stmts = [ret_let, ...drops]
+        let tail = Expr { kind: EVar(ret_name), line: body.line, col: body.col,
+                          ty: body.ty, mode: body.mode }
+        Expr { kind: EBlock(stmts, Some(tail)),
+               line: body.line, col: body.col, ty: body.ty, mode: body.mode }
+      }
+    }
+  }
+}
+
+fn pcs_is_self_tail_call(e: Expr, fn_name: String) : Bool {
+  match e.kind {
+    ECall(callee, _) -> match callee.kind {
+      EVar(nm) -> nm == fn_name
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
+# True iff `nm` appears anywhere in the body's tail expression.
+# For EBlock bodies the drop site sits between stmts and tail, so
+# any read of `nm` in the tail expression (regardless of how deeply
+# nested) would see a decremented binding. For non-block bodies
+# the whole expression is treated as the tail. A scan over the
+# expression with `[nm]` as the in-scope filter spots every read.
+fn pcs_name_in_body_tail(nm: String, body: Expr) : Bool {
+  match body.kind {
+    EBlock(_, opt_tail) -> match opt_tail {
+      None -> false
+      Some(t) -> {
+        let us = pcs_collect_uses_expr(t, [nm], false, [])
+        pcs_uses_has_name(us, nm)
+      }
+    }
+    _ -> {
+      let us = pcs_collect_uses_expr(body, [nm], false, [])
+      pcs_uses_has_name(us, nm)
+    }
+  }
+}
 
 # ---- m5 #2 — last-use analysis (fn-param scope) ----
 #
