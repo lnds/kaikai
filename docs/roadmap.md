@@ -196,9 +196,16 @@ hobbyists) can build with kaikai.
 
 **Started ~2026-05-03** with the protocols + ergonomics
 precondition chain (see *Status snapshot*); the remaining scope
-below tracks against issues #86 (m11 diagnostics), #210 (variant
-+ record reuse-in-place), #92 (kai lsp), #120 (kai repl), and
-#264 (canonical grammar.md, doc-only — closes with this PR).
+below tracks against issues #86 (m12.6 diagnostics quality —
+title was "m11 diagnostics" pre-rename), #210 (variant + record
+reuse-in-place — closed 2026-05-06), and #264 (canonical
+grammar.md, closed 2026-05-06). LSP and REPL **do not have
+tracking issues** as of 2026-05-08; the previous citations of
+#92 and #120 were ghost references (#92 is `R6 — TCO precise
+per-call-site dropmask`, closed; #120 is `Perceus: opt-in
+regions for parser/lexer scratch buffers`, open) and have been
+removed. Open tracking issues for LSP / REPL when those lanes
+actually start.
 
 **Scope — precondition work (landed early, 2026-05-03 → 2026-05-05)**:
 

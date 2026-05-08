@@ -85,6 +85,24 @@ Three tiers, three cadences. Spec in `docs/testing-tiers.md`; CI in `.github/wor
 - **Lane handoff (push + PR is authorized).** Worktree-spawned agents (e.g. via `/wt-claude`) may push the lane branch and open a PR via `gh pr create` once the acceptance gate is green. Standing exception to the global "do not push without explicit ask" rule. **Merge stays with the integrator** — agents do NOT run `gh pr merge`. If CI fails, fix on the same branch and push again; force-push is fine for unreviewed lane branches.
 - **Pending work lives in GitHub Issues.** Tracking docs were retired in PR #99; do not recreate them.
 
+## Doc discipline
+
+Catalog docs (`docs/stdlib-roadmap.md`, `docs/stdlib-layout.md`, `docs/effects-stdlib.md`, `docs/roadmap.md`) drift away from reality unless lanes update them at close. Issue #367 catalogued the last round of drift; this section exists to prevent the next round.
+
+The closing PR for any feature lane MUST update:
+
+- `docs/stdlib-layout.md` catalog entry — flip the operation's marker from `(planned: #N)` to `(shipped)`.
+- `docs/stdlib-roadmap.md` *Current inventory* table — cite the closing PR number on the affected row.
+- Any aspirational sentence in `docs/effects-stdlib.md` that the lane has now made factual — drop or trim the v1-status sidebar.
+- The closing GitHub issue body if it lists out-of-scope work that the lane in fact covered.
+
+Two further rules:
+
+- **Issue numbers in roadmaps must verify.** Before citing `#N` in `docs/roadmap.md` (or any other doc), run `gh issue view N --json title` and confirm the title matches the citation context. Ghost references (#92, #120 in the pre-#367 Anga Roa text) waste downstream readers' time.
+- **Aspirational text gets a v1-status sidebar.** When a doc describes runtime behaviour that has not yet shipped (reactor, suspend, scheduler), pin a `> **v1 status (YYYY-MM-DD):** …` callout next to the aspirational paragraph stating what actually runs today and which lane closes the gap. The sidebar comes off when the lane closes.
+
+Without this discipline, doc → reality drift recurs and downstream analysis (Linus / Eric strategic consults, new-contributor onboarding, agent prompts) draws wrong conclusions because the catalog lies. The audit triggered by #367 was launched after a strategic consultation reached a wrong recommendation because Phase 2 was documented as "not landed" while M1+M2+M3 were live in `stdlib/`.
+
 ## Commit messages — Conventional Commits
 
 `<type>(<scope>)?: <subject>`. Type drives changelog placement and version bump:

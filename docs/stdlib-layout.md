@@ -6,6 +6,18 @@ what effects they declare, and where the line runs between stdlib and
 the forthcoming `ahu` layer. It is **not** an API reference — each
 module gets its own spec when implemented.
 
+**Status markers (refreshed 2026-05-08, issue #367).** Operations in
+the per-module catalog below are tagged inline:
+
+- *(shipped)* — `pub fn` exists in the named `stdlib/<module>.kai`.
+- *(planned: #N)* — tracked in an open GitHub issue; not yet in `stdlib/`.
+- *(stub)* — file is committed but exposes no public surface yet
+  (typically because the runtime primitives it would call have not
+  landed). `stdlib/fs/dir.kai` is the canonical example.
+
+Without these markers the catalog reads as a promise that everything
+listed already exists; that drift was the trigger for #367.
+
 Pinned decisions come from the stdlib discussion of 2026-04-24.
 Doc A (`effects.md`), Doc B (`effects-stdlib.md`), and Doc C
 (`effects-impl.md`) remain the sources of truth for effect semantics,
@@ -194,44 +206,51 @@ stdlib/
     map.kai
     set.kai
   math/          pure, stage 2
-    int.kai
-    float.kai
-  decimal.kai    pure, stage 2 (top-level module)
-  money.kai      pure, stage 2 (top-level module; depends on decimal)
-  loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever)
-  reader.kai     effect: Reader[T] (top-level module: with_reader)
-  writer.kai     effect: Writer[W] (top-level module: with_writer)
-  io.kai         effects: Console, Stdin (top-level module)
+    int.kai      (shipped; bit ops + abs/pow/clamp planned via #347)
+    real.kai     (shipped; libm bindings via PR #359, closes #343 — was `float.kai` pre-rename, `math.float` does NOT exist)
+    bits.kai     (shipped — intrinsic bit ops live here, NOT in `math.int`)
+    numeric.kai  (shipped)
+    complex.kai  (shipped)
+  decimal.kai    pure, stage 2 (top-level module — shipped)
+  money.kai      pure, stage 2 (top-level module; depends on decimal — shipped)
+  loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever — shipped)
+  reader.kai     effect: Reader[T] (top-level module: with_reader — shipped)
+  writer.kai     effect: Writer[W] (top-level module: with_writer — shipped)
+  io.kai         (NOTE: lives in `stdlib/core/io.kai`, not at top level; effects: Console, Stdin)
   fs/            effect: File
-    file.kai
-    dir.kai
-    path.kai     pure helpers (could live in core; grouped here for locality)
+    file.kai     (shipped via PR #132 — `read_file`, `write_file`, `append`; rest planned via #345)
+    dir.kai      (stub — runtime primitives planned via #344)
+    path.kai     pure helpers — shipped, currently lives at `stdlib/path.kai` (top-level), not `stdlib/fs/path.kai`
   os/            effects: Env, Process
-    env.kai
-    args.kai
-    process.kai
-  time.kai       effect: Clock (top-level module: WallTime, Instant, Duration, now, monotonic, sleep, deadline_in)
-  random.kai     effect: Random (top-level module)
-  random_secure.kai  effect: SecureRandom (top-level module; separate effect for safety)
-  net/           effects: NetTcp, NetUdp, NetDns (alias Net = NetTcp + NetUdp + NetDns)
-    tcp.kai      uses NetTcp
-    udp.kai      uses NetUdp
-    dns.kai      uses NetDns
-    url.kai      pure URL parsing
-    http.kai     client only, uses NetTcp + NetDns; server-side belongs to the web framework
+    env.kai      (shipped via PR #131 + PR #143)
+    args.kai     (shipped via PR #131 + PR #143)
+    process.kai  (planned: #346 — runtime + effect already in via PR #142)
+  time.kai       effect: Clock (top-level module — shipped; default handler via PR #134)
+  random.kai     effect: Random (top-level module — shipped)
+  random_secure.kai  effect: SecureRandom (top-level — shipped via PR #144, closes #140)
+  log.kai        effect: Log (top-level module — shipped via PR #145, closes #141)
+  net/           effects: NetTcp (NetUdp + NetDns NOT shipped; alias `Net = NetTcp + NetUdp + NetDns` is aspirational)
+    tcp.kai      uses NetTcp (shipped — v1: blocking, no reactor; see effects-stdlib.md sidebar)
+    udp.kai      (planned, no tracking issue — Tier S3)
+    dns.kai      (planned, no tracking issue — Tier S3)
+    url.kai      pure URL parsing (planned — folded into http.kai parser today)
+    http.kai     (shipped, client only — `http_get/post/put/delete/request`; uses NetTcp + Cancel; libc `getaddrinfo` for DNS until net.dns lands)
   encoding/      pure, stage 2
-    json.kai
-    utf8.kai
-    base64.kai
-    hex.kai
-  regexp.kai     pure, stage 2 (top-level module)
-  crypto/        pure, stage 2
-    hash.kai     sha256, sha512, blake3
-    mac.kai      hmac
+    json.kai     (shipped)
+    utf8.kai     (planned — no tracking issue)
+    base64.kai   (shipped)
+    hex.kai      (shipped)
+  regexp.kai     pure, stage 2 (top-level — shipped 2026-04-28)
+  crypto/        pure, stage 2 (shipped via PR #146)
+    hash.kai     sha256, sha512 (blake3 NOT shipped — deferred to S3)
+    mac.kai      hmac_sha256, hmac_sha512
   concurrent/    effects: Spawn, Cancel (Actor[Msg] deferred to docs/actors.md)
-    nursery.kai
-    actor.kai
-  testing.kai    integrates with `kai test` (top-level module)
+                 NOTE: `concurrent/` subdirectory does NOT exist on disk;
+                 `nursery` lives at `stdlib/spawn.kai:95`, `actor` at
+                 `stdlib/actor.kai`. Both shipped.
+    nursery.kai  (shipped — physical path is `stdlib/spawn.kai`)
+    actor.kai    (shipped — physical path is `stdlib/actor.kai`)
+  testing.kai    integrates with `kai test` (planned — test syntax is shipped, no `testing.kai` module file yet)
 ```
 
 ## Per-module summary
@@ -256,8 +275,8 @@ land in each module's own spec when implemented.
 
 ### math (pure, stage 2)
 
-- `math.int` — abs, min, max, pow, gcd, div_mod, shl, shr, and, or, xor, not, popcount, leading_zeros, trailing_zeros
-- `math.float` — sqrt, pow, exp, log, sin/cos/tan/atan2, floor, ceil, round, is_nan, is_inf
+- `math.int` — `min`, `max`, `gcd`, `lcm`, `factorial`, `fib`, `is_prime` *(shipped)*; `abs`, `signum`, `pow`, `log2`, `clamp`, `div_mod` *(planned: #347)*. Bit ops (`shl`, `shr`, `and`, `or`, `xor`, `not`, `popcount`, `leading_zeros`, `trailing_zeros`) are intrinsic — they live in `math/bits.kai`, NOT in `math/int.kai`.
+- `math.real` *(shipped — was `math.float` in earlier drafts; the module file is `stdlib/math/real.kai` and the namespace is `math.real`. `math.float` does not exist.)* — `min`, `max`, `floor`, `ceil`, `round`, `round_half_even`, `trunc` *(shipped)*; libm bindings — `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log`, `log2`, `log10`, `pow` — *(shipped via PR #359, closes #343)*. `is_nan` / `is_inf` *(planned, no tracking issue)*.
 
 ### decimal (pure, stage 2)
 
@@ -316,22 +335,16 @@ declare `/ Stdin`.
 
 ### fs (`/ File`)
 
-- `fs.file` — `read_file`, `write_file`, `append`, `exists`, `delete`, `rename`, `metadata`
-- `fs.dir` — `list_dir`, `create_dir`, `remove_dir`, `walk`
-- `fs.path` — pure: `join`, `split`, `basename`, `dirname`, `extension`, `normalize`
+- `fs.file` — `read_file`, `write_file`, `append` *(shipped via PR #132)*; `exists`, `delete`, `rename`, `metadata`, `read_bytes` *(planned: #345 — no runtime primitives yet)*
+- `fs.dir` — `list_dir`, `create_dir`, `remove_dir`, `walk` *(planned: #344 — `stdlib/fs/dir.kai` is a doc-only stub; runtime primitives required)*
+- `fs.path` — pure helpers: `is_absolute`, `basename`, `dirname`, `split`, `ext`, `strip_ext`, `join` *(shipped — but the file lives at `stdlib/path.kai`, not `stdlib/fs/path.kai`; the catalog name `fs.path` reflects the planned move, not today's import path. Today: `import path`.)*
 
 ### os (`/ Env + Process`)
 
-- `os.env` — `get`, `set`, `unset`, `entries` (renamed from
-  `all` in issue #127 — the bare `all` name collided with
-  `list.all` in any caller importing both)
-- `os.args` — `argv`, `program_name`
-- `os.process` — `start(cmd, args)`, `wait`, `wait_or_kill`, `pipe_stdout`, `pipe_stdin`, `signal`, `kill`
-- `os.exit` — top-level helper exposed directly under `os`,
-  physically inside `process.kai`. Takes an exit code. Effect:
-  `/ Process` (exiting is observable). Mechanism for surfacing it
-  at the top level (re-export, package-level body, …) is a
-  module-system design decision pending in stage 2.
+- `os.env` — `get`, `set`, `unset`, `entries` *(shipped via PR #131 + PR #143; closes #127 — `entries` was renamed from `all` because the bare `all` collided with `list.all` for any caller importing both)*
+- `os.args` — `argv`, `program_name` *(shipped via PR #131 + PR #143)*
+- `os.process` — `start(cmd, args)`, `wait`, `wait_or_kill`, `pipe_stdout`, `pipe_stdin`, `signal`, `kill` *(planned: #346 — runtime + `Process` effect already shipped via PR #142; only the public Kai wrapper module is missing. `stdlib/os/process.kai` does not exist on disk yet.)*
+- `os.exit` — *(planned: #346)* — top-level helper exposed directly under `os`, physically inside `process.kai`. Takes an exit code. Effect: `/ Process` (exiting is observable). Mechanism for surfacing it at the top level (re-export, package-level body, …) is a module-system design decision pending in stage 2.
 
 ### time (`/ Clock`)
 
@@ -355,13 +368,15 @@ security-sensitive code paths.
 - `random_secure` — `int`, `bytes`, cryptographic-grade primitives;
   not seedable
 
-### net (`/ NetTcp`, `/ NetUdp`, `/ NetDns`; alias `Net = NetTcp + NetUdp + NetDns`)
+### net (`/ NetTcp` shipped; `/ NetUdp`, `/ NetDns` aspirational)
 
-- `net.tcp` — `connect`, `listen`, `accept`, read/write (`/ NetTcp`)
-- `net.udp` — `bind`, `send`, `recv` (`/ NetUdp`)
-- `net.dns` — `resolve`, `resolve_all`, `reverse_lookup` (`/ NetDns`)
-- `net.url` — pure: `parse`, `format`, `join`, `query_*`
-- `net.http` — client only: `get`, `post`, `put`, `delete`, `request`; headers, body, timeouts (`/ NetTcp + NetDns`)
+> **v1 caveat (2026-05-08).** The `Net = NetTcp + NetUdp + NetDns` alias is forward-looking. Only `NetTcp` exists as a builtin and a runtime handler today; `NetUdp` and `NetDns` have no compiler builtin, no runtime, no module file. See `docs/effects-stdlib.md` §`NetTcp` v1-status sidebar for the reactor status.
+
+- `net.tcp` — `connect`, `listen`, `accept`, read/write *(shipped — PR #68; v1 default handler blocks the OS thread, no kqueue/epoll reactor — see effects-stdlib.md sidebar)*
+- `net.udp` — `bind`, `send`, `recv` *(planned, no tracking issue — Tier S3, post-1.0)*
+- `net.dns` — `resolve`, `resolve_all`, `reverse_lookup` *(planned, no tracking issue — Tier S3; today `net.http` falls back to libc `getaddrinfo` via FFI)*
+- `net.url` — pure: `parse`, `format`, `join`, `query_*` *(planned — `http_parse_url` exists inside `net/http.kai` as a private helper but is not exposed as a `net.url` module)*
+- `net.http` — client only: `http_get`, `http_post`, `http_put`, `http_delete`, `http_request` *(shipped, `/ NetTcp + Cancel`)*; headers, body, timeouts available via the request builder. Uses libc `getaddrinfo` for DNS (no `NetDns` effect yet).
 
 Server-side HTTP (`net.http.server`) is deferred — it belongs with the
 web framework product (C1 in the roadmap), not in stdlib, because its
@@ -370,10 +385,10 @@ than what a primitive module should expose.
 
 ### encoding (pure, stage 2)
 
-- `encoding.json` — `encode`, `decode`
-- `encoding.utf8` — `validate`, `decode`, `encode`, `chars`
-- `encoding.base64` — `encode`, `decode` (standard + URL-safe)
-- `encoding.hex` — `encode`, `decode`
+- `encoding.json` — `encode`, `decode` *(shipped)*
+- `encoding.utf8` — `validate`, `decode`, `encode`, `chars` *(planned — no `stdlib/encoding/utf8.kai` file)*
+- `encoding.base64` — `encode`, `decode` (standard + URL-safe) *(shipped)*
+- `encoding.hex` — `encode`, `decode` *(shipped)*
 
 ### regexp (pure, stage 2) — **landed 2026-04-28**
 
@@ -402,12 +417,10 @@ golden covering match / captures / find_all / replace / split).
 Validation: `make test-stdlib` passes; selfhost OK on both C and
 LLVM backends.
 
-### crypto (pure, stage 2)
+### crypto (pure, stage 2 — shipped via PR #146)
 
-- `crypto.hash` — `sha256`, `sha512`, `blake3`. Legacy hashes
-  (`sha1`, `md5`) are also available for interop with existing
-  systems but flagged in the spec as not for new security work.
-- `crypto.mac` — `hmac_sha256`, `hmac_sha512`
+- `crypto.hash` — `sha256`, `sha512` *(shipped)*. `blake3` and the legacy hashes (`sha1`, `md5`) *(planned — no tracking issue; deferred to S3)*.
+- `crypto.mac` — `hmac_sha256`, `hmac_sha512` *(shipped)*
 
 Symmetric and asymmetric ciphers deferred to post-MVP — the design
 surface (key management, nonces, AEAD) is deep enough to warrant its
@@ -419,19 +432,14 @@ tokens.
 The `Actor[Msg]` effect is deferred to `docs/actors.md`; once that
 spec lands, it is added to this header.
 
-- `concurrent.nursery` — scoped `spawn` / `await` / `select` with
-  cancel-on-failure. The stdlib-provided safe scope over `Spawn`.
-  Policy detailed in its own spec; restart policies live in
-  `ahu.supervisor`.
-- `concurrent.actor` — mailbox primitive: `send`, `receive`, `self`.
-  Spec detail lives in `docs/actors.md`.
+> **Physical layout note.** No `stdlib/concurrent/` directory exists. The catalog uses the `concurrent.*` namespace as the **target** shape; the actual `pub fn` lives at the top level today.
+
+- `concurrent.nursery` — scoped `spawn` / `await` / `select` with cancel-on-failure *(shipped — `pub fn nursery[T, e]` lives at `stdlib/spawn.kai:95`, not at `stdlib/concurrent/nursery.kai`)*. Policy detailed in its own spec; restart policies live in `ahu.supervisor`.
+- `concurrent.actor` — mailbox primitive: `send`, `receive`, `self` *(shipped — `stdlib/actor.kai`, not `stdlib/concurrent/actor.kai`)*. Spec detail lives in `docs/actors.md`.
 
 ### testing
 
-- `testing` — assertions (`assert`, `assert_eq`, `assert_ne`,
-  `assert_raises`) and integration with the `test "..." { ... }`
-  block syntax and `kai test` subcommand. Effect: `/ Fail` for
-  failing assertions (caught by the test runner handler).
+- `testing` *(planned — no `stdlib/testing.kai` module file exists; the `test "..." { ... }` block syntax and the `assert` builtin are wired in the compiler/runtime, but a stdlib module exposing assertion helpers does not exist yet)* — assertions (`assert`, `assert_eq`, `assert_ne`, `assert_raises`) and integration with the `test "..." { ... }` block syntax and `kai test` subcommand. Effect: `/ Fail` for failing assertions (caught by the test runner handler).
 
 ## Naming conventions
 
