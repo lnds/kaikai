@@ -379,6 +379,26 @@ Neither participates in effect inference.
 specialised messages with the predicate text, the offending
 value, and the call site.
 
+> **v2 status (2026-05-08, refs #86):** the runtime panic now
+> emits clause kind, function name, rendered predicate, and
+> decl-site line/col. Call-site span and runtime value of the
+> offending binding are still pending. Concretely, today's
+> output is:
+>
+> ```
+> panic: requires violated in `divide`
+> required: b != 0
+> declared at line 15, col 14
+> ```
+>
+> The aspirational form below — call-site `--> file:line:col`
+> caret, "argument `b` was: 0.0", and the help suggestion — is
+> the v3 target. Issue #86 stays open to track it; threading the
+> caller's span into the assert insertion is the load-bearing
+> piece that v2 deferred.
+
+Aspirational target (v3, tracked under #86):
+
 ```
 error: precondition violated in `divide`
   --> src/foo.kai:42:5
@@ -597,7 +617,10 @@ is doc duplication.
 5. **Diagnostics quality**. "Predicate violated at line 42"
    without context is useless. **Mitigation**: budget ~0.5-1
    day specifically for diagnostics — show the predicate text,
-   the offending value, suggest a narrowing helper.
+   the offending value, suggest a narrowing helper. *v2 (refs
+   #86) shipped predicate text + clause kind + function name +
+   decl-site line/col; runtime value + call-site span are the
+   v3 target tracked under the same issue.*
 
 6. **Composition with UoM**. `Decimal<USD> where >= 0`
    composes correctly when canonicalised; but error messages
