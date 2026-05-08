@@ -527,7 +527,8 @@ starts a block expression.
 
 ```
 record_lit  ::= IDENT ('{' field_init_list? '}')
-field_init_list ::= named_inits | pun_inits | positional_inits
+field_init_list ::= spread_inits | named_inits | pun_inits | positional_inits
+spread_inits ::= '...' expr (',' named_init)* ','?     (* issue #326 *)
 named_inits ::= named_init (',' named_init)* ','?
 named_init  ::= IDENT ':' expr
 pun_inits   ::= IDENT (',' IDENT)* ','?
@@ -536,13 +537,25 @@ positional_inits ::= expr (',' expr)*                  (* issue #266 *)
 
 The parser inspects the first element after `T {`:
 
+- `'...'`            — record-spread sugar (issue #326). Only named
+                       overrides may follow; pun and positional are
+                       rejected. A pre-typer pass expands
+                       `T { ...src, x: 10 }` into
+                       `{ let s = src; T { f1: s.f1, ..., x: 10, ... } }`,
+                       filling unnamed declared fields from `src`. The
+                       expansion uses a sentinel `__spread__` field
+                       name internally; it never leaks to a downstream
+                       pass.
 - `IDENT ':'`        — named-field literal.
 - `IDENT (, | })`    — bare-ident punning (`{ x, y }` ≡ `{ x: x, y: y }`).
 - otherwise          — positional list. A pre-typer pass rewrites
                        sentinels `__pos_<i>__` into the real field
                        names in declaration order.
 
-Mixed positional-and-named is rejected at parse time.
+Mixed positional-and-named is rejected at parse time. The spread MUST
+be the first item: `{ x: 10, ...p }` is rejected. A second `...` in
+the same literal is rejected. Spread is not allowed inside positional
+record literals (mixing the two sugars is out of scope for v1).
 
 #### Lists and ranges
 

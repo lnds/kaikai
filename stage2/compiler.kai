@@ -3222,6 +3222,30 @@ fn parse_record_lit(p: Parser, type_name: String, tname: Token) : PExpr {
   let p1 = p_skip_newlines(p_advance(p))
   if p_at(p1, TkRbrace) {
     ok_e(p_advance(p1), mk_expr(ERecordLit(type_name, []), tname.line, tname.col))
+  } else if p_at(p1, TkEllipsis) {
+    # issue #326 — record-spread sugar: `T { ...src, x: 10, y: 20 }`.
+    # The `...src` MUST be the first item; only named-field overrides
+    # may follow. The source is captured as the first FieldInit with
+    # the `__spread__` sentinel name and resolved by
+    # `dpr_record_lit` against the record's declared field list.
+    let dotsTok = p_peek(p1)
+    let p2 = p_skip_newlines(p_advance(p1))
+    let r = parse_expr(p2)
+    match r.r {
+      None -> err_e(r.p)
+      Some(src) -> {
+        let acc0 = [FI(spread_field_marker(), src)]
+        let p3 = p_skip_newlines(r.p)
+        if p_at(p3, TkRbrace) {
+          ok_e(p_advance(p3), mk_expr(ERecordLit(type_name, list_reverse(acc0)),
+                                      tname.line, tname.col))
+        } else if p_at(p3, TkComma) {
+          parse_record_spread_loop(p_skip_newlines(p_advance(p3)), acc0, type_name, tname)
+        } else {
+          err_e(p_error_here(p3, "expected `,` or `}` after `...` source in record literal"))
+        }
+      }
+    }
   } else {
     # issue #266 dispatch: peek the first item to choose between the
     # named-field path (existing) and the positional-sugar path. The
@@ -3241,6 +3265,54 @@ fn parse_record_lit(p: Parser, type_name: String, tname: Token) : PExpr {
       parse_record_fields_loop(p1, [], type_name, tname)
     } else {
       parse_record_pos_loop(p1, [], 0, type_name, tname)
+    }
+  }
+}
+
+# issue #326 — parse named-field overrides after `...src,`. The
+# spread already lives at `acc[0]` with the `__spread__` sentinel.
+# Pun and positional are rejected explicitly: pun would silently
+# bind `x: x` from the local scope, which the proposal forbids;
+# positional would conflict with #266. A second `...` is also
+# rejected — v1 admits a single spread per literal.
+fn parse_record_spread_loop(p: Parser, acc: [FieldInit], type_name: String, tname: Token) : PExpr {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    ok_e(p_advance(p0), mk_expr(ERecordLit(type_name, list_reverse(acc)),
+                                tname.line, tname.col))
+  } else if p_at(p0, TkEllipsis) {
+    err_e(p_error_here(p0,
+      "record literal admits a single `...` spread; remove the second one"))
+  } else {
+    let tk = p_peek(p0)
+    if not tk_is(tk.kind, TkIdent) {
+      err_e(p_error(p0, tk,
+        "expected named field override (`x: expr`) after `...` in record literal"))
+    } else {
+      let fname = tok_source(p0.src, tk)
+      let p1 = p_advance(p0)
+      if p_at(p1, TkColon) {
+        let p2 = p_skip_newlines(p_advance(p1))
+        let r = parse_expr(p2)
+        match r.r {
+          None -> err_e(r.p)
+          Some(val) -> {
+            let acc1 = [FI(fname, val), ...acc]
+            let p3 = p_skip_newlines(r.p)
+            if p_at(p3, TkComma) {
+              parse_record_spread_loop(p_skip_newlines(p_advance(p3)), acc1, type_name, tname)
+            } else if p_at(p3, TkRbrace) {
+              ok_e(p_advance(p3), mk_expr(ERecordLit(type_name, list_reverse(acc1)),
+                                          tname.line, tname.col))
+            } else {
+              err_e(p_error_here(p3, "expected `,` or `}` in record literal"))
+            }
+          }
+        }
+      } else {
+        err_e(p_error(p1, p_peek(p1),
+          "spread record overrides must use named field syntax `x: expr`; pun shorthand is not allowed after `...`"))
+      }
     }
   }
 }
@@ -3282,6 +3354,16 @@ fn parse_record_pos_loop(p: Parser, acc: [FieldInit], i: Int, type_name: String,
 fn pos_field_marker(i: Int) : String =
   string_concat("__pos_", string_concat(int_to_string(i), "__"))
 
+# issue #326 — sentinel field name used by the parser when the
+# first item in a record literal is `...src`. `dpr_record_lit`
+# detects this marker, captures the source expression, and expands
+# it against the record's declared fields before any later pass
+# sees the literal. As with `__pos_<i>__`, real field names
+# cannot start with `__`, so the sentinel is unambiguous.
+fn spread_field_marker() : String = "__spread__"
+
+fn is_spread_field_marker(s: String) : Bool = s == "__spread__"
+
 fn is_pos_field_marker(s: String) : Bool {
   let n = string_length(s)
   if n < 8 { false }
@@ -3305,7 +3387,10 @@ fn is_pos_field_marker(s: String) : Bool {
 fn parse_record_fields_loop(p: Parser, acc: [FieldInit], type_name: String, tname: Token) : PExpr {
   let p0 = p_skip_newlines(p)
   let tk = p_peek(p0)
-  if not tk_is(tk.kind, TkIdent) {
+  if tk_is(tk.kind, TkEllipsis) {
+    err_e(p_error(p0, tk,
+      "`...` must be the first item in a record literal — found a field before the spread"))
+  } else if not tk_is(tk.kind, TkIdent) {
     err_e(p_error(p0, tk, "expected field name in record literal"))
   } else {
     let fname = tok_source(p0.src, tk)
@@ -16498,14 +16583,26 @@ type DPRKind = { expr: Expr, errs: Int }
 fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: [RecInfo], file: String, errs: Int) : DPRKind / Console {
   match k {
     # The interesting case: rewrite positional record literals using
-    # the record's declared field order.
+    # the record's declared field order. issue #326 also intercepts
+    # the `...src, x: 10, ...` spread sugar here — a spread literal
+    # is rewritten into `{ let s = src; T { f1: s.f1, ..., x: 10, ... } }`
+    # so the expanded record-lit lands in the existing emit path.
     ERecordLit(name, fis) -> {
       # Recurse into sub-exprs FIRST so nested positional records
       # already have real field names by the time we look at this
       # node's own arity.
       let rfis = dpr_fields(fis, recs, file, errs)
-      let renamed = dpr_record_lit(name, rfis.fields, line, col, recs, file, rfis.errs)
-      DPRKind { expr: mk_expr(ERecordLit(name, renamed.fields), line, col), errs: renamed.errs }
+      let is_spread = match rfis.fields {
+        [] -> false
+        [f0, ...rest_] -> match f0 { FI(nm0, _) -> is_spread_field_marker(nm0) }
+      }
+      if is_spread {
+        let r = dpr_record_spread(name, rfis.fields, line, col, recs, file, rfis.errs)
+        DPRKind { expr: r.expr, errs: r.errs }
+      } else {
+        let renamed = dpr_record_lit(name, rfis.fields, line, col, recs, file, rfis.errs)
+        DPRKind { expr: mk_expr(ERecordLit(name, renamed.fields), line, col), errs: renamed.errs }
+      }
     }
     EBlock(stmts, tail) -> {
       let rs = dpr_stmts(stmts, recs, file, errs)
@@ -16696,6 +16793,192 @@ fn rename_pos_fields(fis: [FieldInit], fds: [FieldDecl]) : [FieldInit] {
         }
       }
     }
+  }
+}
+
+# issue #326 — expand `T { ...src, x: 10, y: 20 }` into a let-block:
+#
+#     {
+#       let __spread_src_<line>_<col>__ = src
+#       T { f1: __spread_src_*.f1, ..., x: 10, y: 20, ... }
+#     }
+#
+# The let captures `src` once so a side-effecting source expression
+# isn't replayed across N field accesses. The fields are emitted
+# in declared order: an override wins over the spread copy. Errors:
+#   * unknown record type for `T` → "unknown record type T"
+#   * any override field that isn't a declared field of `T`
+#   * duplicate override of the same field
+
+fn dpr_record_spread(
+  name: String,
+  fis: [FieldInit],
+  line: Int,
+  col: Int,
+  recs: [RecInfo],
+  file: String,
+  errs: Int
+) : DPRSpread / Console {
+  # Split: head FI is the spread sentinel carrying `src`; rest are
+  # named overrides (parser already rejected pun / positional /
+  # second-spread, so each FI here pairs a real field name with an
+  # already-recursed expression).
+  match fis {
+    [] -> DPRSpread { expr: mk_expr(ERecordLit(name, fis), line, col), errs: errs }
+    [head, ...overrides] -> match head {
+      FI(_marker, src) -> {
+        match rec_find(recs, name) {
+          None -> {
+            diag_error(file, line, col,
+              concat_all(["unknown record type `", name,
+                          "` in `...` spread; declare the type before constructing it"]))
+            DPRSpread { expr: mk_expr(ERecordLit(name, fis), line, col), errs: errs + 1 }
+          }
+          Some(ri) -> match ri {
+            RI(_, tparams, fds) -> {
+              # Diagnose duplicate overrides (same field listed twice).
+              let dup_errs = check_spread_dup_overrides(overrides, [], file, line, col, 0)
+              # Diagnose overrides naming a field not declared on `T`.
+              let bad_errs = check_spread_unknown_overrides(overrides, fds, name, file, line, col, 0)
+              let errs1 = errs + dup_errs + bad_errs
+              if dup_errs + bad_errs > 0 {
+                DPRSpread { expr: mk_expr(ERecordLit(name, fis), line, col), errs: errs1 }
+              } else {
+                let var_name = spread_src_var_name(line, col)
+                let bind_pat = mk_pat(PBind(var_name), line, col)
+                # Annotate the let with `T` for non-generic records so
+                # the existing nominal let-annotation check fires when
+                # `src : Q` with `Q != T` — spec's "spread source must
+                # match record type" reusing the typer's normal error
+                # path. Skipped for generic records: `T[a, b]` cannot
+                # be spelled without committing to a concrete arg
+                # tuple, so we let the typer infer and rely on its
+                # field-by-field check instead.
+                let ann_opt = match tparams {
+                  []           -> Some(mk_ty(TyName(name, []), line, col))
+                  [_, ...rest] -> None
+                }
+                let bind_stmt = SLet(bind_pat, ann_opt, src)
+                let var_ref = mk_expr(EVar(var_name), line, col)
+                let expanded = expand_spread_fields(fds, overrides, var_ref, line, col)
+                let lit = mk_expr(ERecordLit(name, expanded), line, col)
+                DPRSpread { expr: mk_expr(EBlock([bind_stmt], Some(lit)), line, col), errs: errs1 }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+type DPRSpread = { expr: Expr, errs: Int }
+
+# Build a stable, position-derived var name for the spread source.
+# Two literals on the same line/col can't collide because the parser
+# rules them out at the source level; nesting is fine because each
+# spread sits inside its own EBlock scope.
+fn spread_src_var_name(line: Int, col: Int) : String =
+  concat_all(["__spread_src_", int_to_string(line), "_", int_to_string(col), "__"])
+
+# Walk declared field order; for each field, prefer the override
+# expression if present, else `var_ref.field_name`.
+fn expand_spread_fields(
+  fds: [FieldDecl],
+  overrides: [FieldInit],
+  var_ref: Expr,
+  line: Int,
+  col: Int
+) : [FieldInit] {
+  match fds {
+    [] -> []
+    [fd, ...rest] -> match fd {
+      FD(fname, _) -> {
+        let val = match find_override(overrides, fname) {
+          Some(ov) -> ov
+          None -> mk_expr(EField(var_ref, fname), line, col)
+        }
+        [FI(fname, val), ...expand_spread_fields(rest, overrides, var_ref, line, col)]
+      }
+    }
+  }
+}
+
+fn find_override(overrides: [FieldInit], name: String) : Option[Expr] {
+  match overrides {
+    [] -> None
+    [h, ...rest] -> match h {
+      FI(n, val) -> if n == name { Some(val) } else { find_override(rest, name) }
+    }
+  }
+}
+
+# Returns an error count. Each duplicated override name is reported
+# once (subsequent occurrences are flagged at their first repeat).
+fn check_spread_dup_overrides(
+  overrides: [FieldInit],
+  seen: [String],
+  file: String,
+  line: Int,
+  col: Int,
+  errs: Int
+) : Int / Console {
+  match overrides {
+    [] -> errs
+    [h, ...rest] -> match h {
+      FI(n, _) -> {
+        if str_in_list(n, seen) {
+          diag_error(file, line, col,
+            concat_all(["record-spread override `", n,
+                        "` listed more than once"]))
+          check_spread_dup_overrides(rest, seen, file, line, col, errs + 1)
+        } else {
+          check_spread_dup_overrides(rest, [n, ...seen], file, line, col, errs)
+        }
+      }
+    }
+  }
+}
+
+fn check_spread_unknown_overrides(
+  overrides: [FieldInit],
+  fds: [FieldDecl],
+  rec_name: String,
+  file: String,
+  line: Int,
+  col: Int,
+  errs: Int
+) : Int / Console {
+  match overrides {
+    [] -> errs
+    [h, ...rest] -> match h {
+      FI(n, _) -> {
+        if field_decl_has(fds, n) {
+          check_spread_unknown_overrides(rest, fds, rec_name, file, line, col, errs)
+        } else {
+          diag_error(file, line, col,
+            concat_all(["record-spread override `", n,
+                        "` is not a field of `", rec_name, "`"]))
+          check_spread_unknown_overrides(rest, fds, rec_name, file, line, col, errs + 1)
+        }
+      }
+    }
+  }
+}
+
+fn field_decl_has(fds: [FieldDecl], name: String) : Bool {
+  match fds {
+    [] -> false
+    [h, ...rest] -> match h {
+      FD(n, _) -> if n == name { true } else { field_decl_has(rest, name) }
+    }
+  }
+}
+
+fn str_in_list(s: String, xs: [String]) : Bool {
+  match xs {
+    [] -> false
+    [h, ...rest] -> if h == s { true } else { str_in_list(s, rest) }
   }
 }
 
