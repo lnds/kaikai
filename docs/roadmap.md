@@ -288,9 +288,18 @@ polymorphic-impl machinery.
    benchmark under the original single-number target; PR #305
    (closed) is the prior measurement that originally surfaced the
    gap. Locals-unboxed/storage-edges-boxed split formalised in
-   `docs/unboxing-phase2-design.md`. Issues #350 (RC discipline
-   in tail-recursive helpers) and #353 (Okasaki rotation reuse)
-   contribute to gate 4b.
+   `docs/unboxing-phase2-design.md`. Issue #350 (RC discipline in
+   tail-recursive helpers) closed via PR #368 and contributes to
+   gate 4b: post-#368 RB tree has leaked 21.96M → 3.58M (−83.7%),
+   live_peak −80.2%, RSS 1929 MB → 325 MB. Issue #371 (arm-specific
+   consume/dup discipline in match emit, formerly the incorrectly
+   scoped #353) closes the alloc side. **v1 status (2026-05-08):**
+   gate 4b is **not reachable in the current cycle** because #371
+   is a 1-2 week match-emit refactor (per Eric review 2026-05-08)
+   rather than the 1-2 day predicate relaxation the original #353
+   assumed. The wall ratio post-#368 is ~21× C; closing to ≤ 2× C
+   requires #371 to land. DoD #4b is recalified as a next-cycle
+   target; this cycle ships gate 4b's leak side via #350/#368 only.
 5. Diagnostic quality: a representative ill-typed program
    produces a message at the bar set by the m11 acceptance
    fixtures (TBD as part of m11 design).
