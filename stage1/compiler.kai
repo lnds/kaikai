@@ -5172,10 +5172,19 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     )
     EBlock(stmts, opt_tail) -> {
       let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [])
-      EBlock(r.stmts, match opt_tail {
+      let new_tail = match opt_tail {
         None -> None
         Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam))
-      })
+      }
+      # Issue #297 (partial) — block-scope exit drops for SLet PBind
+      # bindings that took a `__perceus_dup` per non-last read. Mirror
+      # of the stage 2 fix. Conservative: only emit a drop when the
+      # binding does not appear in the block's tail (otherwise we'd
+      # have to wrap the tail and lose tail-call position, breaking
+      # TCO on self-tail-recursive bodies).
+      let exit_drops = pcs_collect_block_let_exit_drops(stmts, scope, uses,
+                                                         opt_tail, [])
+      EBlock(pcs_append_drops(r.stmts, exit_drops), new_tail)
     }
     EPipe(l, r) -> EPipe(pcs_rewrite_expr(l, scope, uses, in_lam),
                           pcs_rewrite_expr(r, scope, uses, in_lam))
@@ -5641,6 +5650,66 @@ fn pcs_collect_exit_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
         _ -> acc
       }
       pcs_collect_exit_drops(rest, uses, acc1)
+    }
+  }
+}
+
+# Issue #297 (partial) — block-scope let-binding exit drops.
+# Mirror of stage 2's `pcs_collect_block_let_exit_drops`. Stage 1 has
+# no raw locals (Tier 2.5), so plain `pat_bindings` suffices and we
+# never have to skip an `int64_t` shadow.
+fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
+                                     uses: [Use], opt_tail: Option[Expr],
+                                     acc: [Stmt]) : [Stmt] {
+  match stmts {
+    [] -> list_reverse(acc)
+    [s, ...rest] -> {
+      let acc1 = match s {
+        SLet(pat, _, _) -> match pat.pkind {
+          PBind(nm) -> {
+            let in_tail = pcs_name_in_tail(nm, opt_tail)
+            if not list_has(outer, nm) and not in_tail {
+              match last_use_for(nm, uses) {
+                LUBlocked(_) -> [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
+                LUAt(_, _, _) ->
+                  if pcs_count_non_lam_uses(nm, uses, 0) >= 2 {
+                    [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
+                  } else { acc }
+                _ -> acc
+              }
+            } else { acc }
+          }
+          _ -> acc
+        }
+        _ -> acc
+      }
+      pcs_collect_block_let_exit_drops(rest, outer, uses, opt_tail, acc1)
+    }
+  }
+}
+
+fn pcs_name_in_tail(nm: String, opt_tail: Option[Expr]) : Bool {
+  match opt_tail {
+    None -> false
+    Some(e) -> {
+      let us = pcs_collect_uses_expr(e, [nm], false, [])
+      pcs_uses_has_name(us, nm)
+    }
+  }
+}
+
+fn pcs_append_drops(stmts: [Stmt], drops: [Stmt]) : [Stmt] {
+  match drops {
+    [] -> stmts
+    [_, ...__] -> list_append(stmts, list_reverse(drops))
+  }
+}
+
+fn pcs_uses_has_name(uses: [Use], nm: String) : Bool {
+  match uses {
+    [] -> false
+    [h, ...rest] -> match h {
+      U(uname, _, _, _) -> if uname == nm { true } else { pcs_uses_has_name(rest, nm) }
     }
   }
 }
