@@ -266,6 +266,23 @@ type: under the default handler, the common recoverable fault
 (pipe closed on the other side, `EPIPE`) is absorbed silently,
 and any remaining fault is catastrophic enough to panic.
 
+> **v1 vs target shape (2026-05-08).** The monolithic `Console`
+> declaration above is the **v1** shape — a single effect with
+> `print` + `eprint`. The post-Phase-4b target is a 3-way split
+> documented in `stdlib/effects.kai:36-46`:
+>
+> ```kai
+> effect Stdout { print(s: String) : Unit }
+> effect Stderr { eprint(s: String) : Unit }
+> effect Stdin  { read_line() : Result[String, String] }
+> type Console = Stdout + Stderr + Stdin
+> ```
+>
+> The split lets a test harness capture stdout without affecting
+> stderr writes. Tracking issue: #360. Until that lands, treat
+> `Console` here as the canonical declaration; do not import
+> `Stdout` / `Stderr` as if they were already separate effects.
+
 ### Default handler
 
 Runtime-installed around `main` when `Console` is in the row.
@@ -386,6 +403,19 @@ timing decided when the first real use case pushes them:
   `chdir`.
 
 ## `File`
+
+> **Cross-cutting note on `Result` type-arg order.** Throughout this
+> doc, ops return `Result[Ok, Err]` Rust-style (Ok-first). kaikai's
+> actual `Result[e, a]` type is **Err-first** — `e` is the error
+> payload, `a` is the success payload. See `stdlib/effects.kai:97-105`.
+> So the runtime emits `Result[String, String]` for `read_file` as
+> Err=String / Ok=String (which collapses), but `Result[Unit, String]`
+> for `write_file` actually means Err=Unit / Ok=String — the inverse
+> of what a Rust reader expects. Pattern-match `Ok`/`Err` by
+> constructor name (always unambiguous), do NOT rely on positional
+> type-arg order copied from this doc. The type-arg-order rewrite is
+> tracked separately and is not gating any user code today; the
+> constructors are the source of truth.
 
 ### Declaration
 
@@ -746,6 +776,8 @@ fires, exactly the same mechanism as `Clock.sleep`. A `Cancel`
 raised mid-call unwinds out of the op with no half-written
 state visible to user code.
 
+> **v1 status (as of 2026-05-08).** The paragraph above describes the **target** runtime. Today: the `NetTcp` default handler **blocks the OS thread**. There is no kqueue/epoll reactor wired; `O_NONBLOCK` is not set on the fd; a `Cancel` raised mid-syscall does NOT unwind the op (the syscall completes first). `NetUdp` and `NetDns` are not even installed — there is no compiler builtin, no runtime handler, and no `stdlib/net/{udp,dns}.kai` module. Reactor integration is queued for the m8.x.x lane (see `docs/fibers-honesty-targets.md` §Reactor and `stage0/runtime.h:61-64`). The honesty memo `project_runtime_debt_2026-04-28` lists this as one of the three structural gaps between docs and runtime.
+
 ### Stdlib helper
 
 The "abort if anything goes wrong" pattern lifts `Result` into
@@ -789,6 +821,17 @@ effect Process {
 }
 ```
 
+> **v1 status (signal type, as of 2026-05-08).** The runtime
+> `kai_default_process_kill` takes `sig: Int` (raw POSIX signo). The
+> `Signal` type shown above is the m8.x.x target shape — `os.process`
+> would expose a closed `Signal` enum and the typer would refine
+> `Process.kill`'s second argument to it. Today, user code passes an
+> `Int`; passing a kaikai `Signal` value will not type-check against
+> the actual builtin signature in `stage2/compiler.kai
+> :builtin_process_decl`. Track in #346 (the `os.process` Kai
+> wrapper) — it is the natural place to introduce the `Signal` type
+> alongside the public surface.
+
 - `start` launches a child process and returns a handle.
   Deliberately not named `spawn` to avoid clash with the `Spawn`
   effect (kaikai fibers); see §*Why `Process` and not `Spawn`*.
@@ -798,6 +841,11 @@ effect Process {
 - `wait` blocks until the child exits and returns its exit
   status. The fiber suspends via the scheduler's reactor
   (`pidfd_open` on Linux; SIGCHLD-driven on macOS / *BSD).
+  > **v1 status:** `kai_default_process_wait` blocks via
+  > `waitpid(pid, &status, 0)` — it parks the OS thread, not the
+  > fiber. `pidfd_open` (Linux) and SIGCHLD-driven dispatch (macOS /
+  > *BSD) are post-MVP and queued for m8.x.x alongside the NetTcp
+  > reactor work. Same pattern as the `NetTcp` sidebar above.
 - `kill` delivers a signal to the child. The signal set is the
   POSIX-canonical subset (`SIGTERM`, `SIGKILL`, `SIGINT`, …)
   declared by the `os.process` module.
@@ -843,6 +891,10 @@ Runtime-installed around `main` when `Process` is in the row.
   SIGCHLD handler wakes the awaiting fiber. Cancellation
   unwinds out of the wait without reaping the child — see
   `wait_or_kill` below for the canonical cancel-aware pattern.
+  > **v1 status (2026-05-08):** see the v1 sidebar under §`Process`
+  > *Declaration*. The current implementation is plain
+  > `waitpid(pid, &status, 0)`; the `pidfd`/SIGCHLD path is
+  > post-MVP and Cancel does NOT unwind a wait in flight.
 - `kill` is `kill(2)`.
 - `exit` is libc `_exit(code)`. No flushing of stdio buffers; the
   caller must `print` everything they want printed before
