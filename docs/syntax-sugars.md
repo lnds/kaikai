@@ -946,6 +946,147 @@ the same paths used by hand-written `complex.mk(0.0, 3.0)`.
 - `examples/sugars/complex_literal_ident_i.kai` — pins the
   identifier-`i` boundary so the lexer never over-attaches.
 
+## 10. Record-spread sugar — `T { ...p, x: 10 }`
+
+**Issue #326**, shipped 2026-05-07. Parser + pre-typer desugar that
+fills missing record fields from a source value. The emitter sees
+the existing `ERecordLit` shape — no new AST node, no new emit path.
+
+### Rule
+
+A record literal whose first item is `...expr` builds a new value
+of `T` whose fields default to those of the source, with named
+overrides replacing selected fields:
+
+```kai
+type Color = { r: Int, g: Int, b: Int, a: Int }
+
+let red       = Color { r: 255, g: 0, b: 0, a: 255 }
+let translucent = Color { ...red, a: 128 }
+#                ≡ Color { r: 255, g: 0, b: 0, a: 128 }
+
+let inverted  = Color { ...red, r: 0, g: 255, b: 255 }
+#                ≡ Color { r: 0,   g: 255, b: 255, a: 255 }
+```
+
+This is the language's **functional update** form: every other path
+to "same record but with one field different" was a hand-copy of
+every untouched field.
+
+### Restrictions in v1
+
+- The spread MUST be the first item. `T { x: 10, ...p }` is rejected
+  with `\`...\` must be the first item in a record literal — found a
+  field before the spread`. Keeps the rule "spread first, overrides
+  after" and avoids debate about override-direction precedence.
+- Only **named** overrides may follow the spread. Pun (`{ ...p, x }`)
+  and positional (`{ ...p, 10, 20 }`) are rejected. Pun would silently
+  bind `x: x` from the local scope; v1 requires the explicit `x: x`.
+- A second spread is rejected: `record literal admits a single \`...\`
+  spread`.
+- The source must match the outer record type. `P { ...q, ... }` where
+  `q : Q` is rejected by the typer's nominal `let`-annotation check
+  (the desugarer wraps the source in `let __spread_src__ : T = src`).
+- No spread in record patterns. Pattern spread is a separate
+  proposal — out of scope for this issue.
+- No spread inside the positional record sugar (#266) — mixing the
+  two is rejected.
+
+### Desugar shape
+
+The parser tags the spread's source with the `__spread__` field-name
+sentinel, leaving the rest of the named overrides untouched. A
+pre-typer pass (`dpr_record_spread` inside
+`desugar_pos_records_decls`) detects the sentinel, looks up `T`'s
+declared field list, and rewrites the literal into a let-block:
+
+```
+T { ...src, x: 10, y: 20 }
+
+   →
+
+{
+  let __spread_src_<line>_<col>__ : T = src
+  T {
+    f1: __spread_src_<line>_<col>__.f1,
+    f2: __spread_src_<line>_<col>__.f2,
+    ...
+    x: 10,
+    y: 20,
+    ...
+  }
+}
+```
+
+The let captures `src` once so a side-effecting source isn't replayed
+across N field accesses (`{ ...make(), x: 1 }` calls `make()` exactly
+once). Fields are emitted in `T`'s declared order; an override wins
+over the corresponding spread copy. If `T` is generic, the let
+annotation is omitted (the typer infers via the field-by-field check
+instead — `T[a, b]` cannot be spelled without committing to concrete
+type args).
+
+After this rewrite the typer + emitter see the same AST shape as a
+hand-written named record literal. The sentinel never reaches a
+later pass.
+
+### Validation
+
+The desugarer reports four diagnostics; everything else falls through
+to the existing record-literal pipeline:
+
+- **Unknown record name** — `unknown record type \`T\` in \`...\`
+  spread; declare the type before constructing it`.
+- **Override of an undeclared field** — `record-spread override \`z\`
+  is not a field of \`T\``.
+- **Duplicate override** — `record-spread override \`x\` listed more
+  than once`.
+- **Source type mismatch** — `type mismatch in let annotation /
+  expected: T / found: Q`. (Reuses the typer's existing nominal
+  check; no new code path.)
+
+The first three short-circuit before the typer runs; the fourth fires
+during type-check on the synthetic `let` annotation.
+
+### Editorial preference
+
+- Use the spread when more than half of the new value's fields come
+  from a single existing record. `Color { ...red, a: 128 }` and
+  `Settings { ...defaults, theme: "dark" }` are the canonical shapes.
+- For a brand-new value where every field is fresh, the named or
+  positional form is clearer than `T { ...zero, ... }`.
+- Don't use spread for "merging two records of the same type" — there
+  is no second-spread form, and emulating it (`T { ...a, x: b.x, y:
+  b.y, ... }`) defeats the purpose. If real demand surfaces we can
+  add multi-spread later.
+
+### What is **not** in v1
+
+- **Override-then-spread** (`{ x: 10, ...p }`) — single direction
+  simplifies the mental model. May revisit if real demand surfaces.
+- **Multiple spreads** (`{ ...p, ...q, x: 10 }`) — composition
+  semantics need their own design pass.
+- **Pattern spread** (`P { ...rest }` to capture remaining fields) —
+  separate proposal, out of scope.
+- **Type inference for `T`** (`{ ...p, x: 10 }` with no leading type
+  name) — separate enhancement; v1 follows the existing record-lit
+  rule that always names the type.
+
+### Fixtures
+
+- `examples/records/spread_basic.kai` — single override, two fields
+  copied from the source.
+- `examples/records/spread_no_override.kai` — `P { ...p }` with zero
+  overrides; structural copy.
+- `examples/records/spread_all_overridden.kai` — every field
+  overridden; observable result is identical to the bare named form.
+- `examples/records/spread_type_mismatch.kai` — spreading a `Q` into a
+  `P` literal; rejected with `type mismatch in let annotation`.
+- `examples/records/spread_must_be_first.kai` — `{ x: 10, ...p }`;
+  rejected at parse time.
+- `examples/records/spread_pun_rejected.kai` — `{ ...p, x }`;
+  rejected at parse time.
+
 ## Cross-sugar interaction
 
 All five sugars compose without ambiguity because their grammar
