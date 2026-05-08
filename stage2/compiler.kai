@@ -21111,6 +21111,477 @@ fn expand_aliases_in_decls(decls: [Decl], aliases: [AliasResult]) : [Decl] {
   }
 }
 
+# === issue #376: transparent type aliases for `type Foo = T` ===
+#
+# Restores the alias contract from `docs/kaikai-minimal.md`: when the
+# RHS of a `type Foo = T` declaration is a single TypeExpr (no `|`),
+# `Foo` is interchangeable with `T` in every type position. The
+# regression introduced by issue #187 (sum/union unification) treated
+# these as nominal one-component unions, breaking
+# `type Age = Int`, `type Env = [(String, Real)]`, etc.
+#
+# Rule: single-component (`TBAlias`) bodies that are NOT effect aliases
+# and NOT refinement aliases (`TyRefine`) are expanded structurally.
+#   - Effect aliases: `type Console = Stdout + Stderr` (`TBEffectAlias`)
+#     plus the single-name form `type Foo = SomeEffect` already
+#     resolved as effect by `resolve_alias_cands`. Filtered by name.
+#   - Refinement aliases: `type Pos = Int where _ > 0` are handled by
+#     `synthesize_refine_pred_fns` and pattern lowering. We leave them
+#     as-is so the synth fn can locate the alias name.
+# Multi-component `type X = A | B` (`TBSum`) keeps #187 semantics.
+#
+# The expansion is iterative: each pass walks every TypeExpr in the
+# decl stream and rewrites a `TyName(name, args)` whose `name` is a
+# transparent alias into the alias body, substituting the alias's
+# tparams. Aliases that mention other aliases on their RHS resolve
+# transitively via repeated passes until a fixpoint or a cycle bound
+# is hit. A simple iteration cap (length of the alias table) bounds
+# work under cycles; cycle errors are reported by the caller via the
+# `infer_program` cascade if any TyCon survives.
+
+# `TAEntry` records one transparent alias.
+#   name     — the alias type name (e.g. "Age")
+#   tparams  — declared type parameter names (e.g. ["T"] for
+#              `type Predicate[T] = (T) -> Bool`); empty for
+#              `type Age = Int`
+#   body     — the right-hand TypeExpr
+type TAEntry = TAE(String, [String], TypeExpr)
+
+fn collect_transparent_aliases(decls: [Decl], eff_names: [String]) : [TAEntry] =
+  collect_transparent_aliases_loop(decls, eff_names, [])
+
+fn collect_transparent_aliases_loop(decls: [Decl], eff_names: [String],
+                                     acc: [TAEntry]) : [TAEntry] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let here = transparent_alias_of_decl(d, eff_names)
+      let acc1 = match here {
+        Some(e) -> [e, ...acc]
+        None -> acc
+      }
+      collect_transparent_aliases_loop(rest, eff_names, acc1)
+    }
+  }
+}
+
+fn transparent_alias_of_decl(d: Decl, eff_names: [String]) : Option[TAEntry] {
+  match d {
+    DType(_, name, tparams, body, _, _) -> match body {
+      TBAlias(t) -> match t.tkind {
+        # Refinement aliases are handled by synthesize_refine_pred_fns
+        # plus lower_pattern_narrow_decls; expansion would erase the
+        # refinement layer the synth fn binds against.
+        TyRefine(_, _) -> None
+        # Single-name body that resolves to an effect: skip. Effect
+        # aliasing is the legacy semantics of TBAlias single-name
+        # form, threaded by `resolve_alias_cands` + the row pass.
+        TyName(n, []) -> if list_has(eff_names, n) { None }
+                         else { Some(TAE(name, tparams, t)) }
+        _ -> Some(TAE(name, tparams, t))
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+fn ta_lookup(table: [TAEntry], name: String) : Option[TAEntry] {
+  match table {
+    [] -> None
+    [e, ...rest] -> match e {
+      TAE(n, _, _) -> if n == name { Some(e) } else { ta_lookup(rest, name) }
+    }
+  }
+}
+
+# Substitute tparams in a body TypeExpr with the supplied args. The
+# tparam map associates each declared tparam name with the
+# instantiation TypeExpr at the use site.
+type TPSubst = TPS(String, TypeExpr)
+
+fn build_tp_subst(tparams: [String], args: [TypeExpr]) : [TPSubst] {
+  match tparams {
+    [] -> []
+    [p, ...prest] -> match args {
+      [] -> []
+      [a, ...arest] -> [TPS(p, a), ...build_tp_subst(prest, arest)]
+    }
+  }
+}
+
+fn tp_subst_lookup(subst: [TPSubst], name: String) : Option[TypeExpr] {
+  match subst {
+    [] -> None
+    [s, ...rest] -> match s {
+      TPS(n, te) -> if n == name { Some(te) } else { tp_subst_lookup(rest, name) }
+    }
+  }
+}
+
+fn apply_tp_subst_te(te: TypeExpr, subst: [TPSubst]) : TypeExpr {
+  match te.tkind {
+    TyName(name, targs) -> {
+      let targs1 = apply_tp_subst_te_list(targs, subst)
+      match tp_subst_lookup(subst, name) {
+        Some(rep) -> if targs1 == [] { rep }
+                     else {
+                       # `Predicate[T] = (T) -> Bool` instantiated with
+                       # `Predicate[Int]` plain-name lookup substitutes
+                       # `T` itself, not a TyName-with-args. Higher-kinded
+                       # aliases are out of scope; the type-args-on-tparam
+                       # case is not supported and falls through.
+                       TypeExpr { tkind: TyName(name, targs1), line: te.line, col: te.col }
+                     }
+        None -> TypeExpr { tkind: TyName(name, targs1), line: te.line, col: te.col }
+      }
+    }
+    TyList(inner) ->
+      TypeExpr { tkind: TyList(apply_tp_subst_te(inner, subst)),
+                  line: te.line, col: te.col }
+    TyFn(ps, ret, row) ->
+      TypeExpr { tkind: TyFn(apply_tp_subst_te_list(ps, subst),
+                              apply_tp_subst_te(ret, subst),
+                              row),
+                  line: te.line, col: te.col }
+    TyDim(base, u) ->
+      TypeExpr { tkind: TyDim(apply_tp_subst_te(base, subst), u),
+                  line: te.line, col: te.col }
+    TyRefine(base, p) ->
+      TypeExpr { tkind: TyRefine(apply_tp_subst_te(base, subst), p),
+                  line: te.line, col: te.col }
+  }
+}
+
+fn apply_tp_subst_te_list(tes: [TypeExpr], subst: [TPSubst]) : [TypeExpr] {
+  match tes {
+    [] -> []
+    [t, ...rest] -> [apply_tp_subst_te(t, subst), ...apply_tp_subst_te_list(rest, subst)]
+  }
+}
+
+# Single-step expansion of a TypeExpr against the alias table. Returns
+# the rewritten TypeExpr. Recursion bound by `fuel` caps cycles.
+fn expand_ta_te(te: TypeExpr, table: [TAEntry], fuel: Int) : TypeExpr {
+  if fuel <= 0 { te }
+  else { match te.tkind {
+    TyName(name, targs) -> {
+      let targs1 = expand_ta_te_list(targs, table, fuel)
+      match ta_lookup(table, name) {
+        Some(TAE(_, tparams, body)) -> {
+          let subst = build_tp_subst(tparams, targs1)
+          let inst = apply_tp_subst_te(body, subst)
+          # Re-walk the instantiated body so a chain `type A = B; type B = Int`
+          # collapses to Int. Decrement fuel on each unfold.
+          expand_ta_te(inst, table, fuel - 1)
+        }
+        None -> TypeExpr { tkind: TyName(name, targs1), line: te.line, col: te.col }
+      }
+    }
+    TyList(inner) ->
+      TypeExpr { tkind: TyList(expand_ta_te(inner, table, fuel)),
+                  line: te.line, col: te.col }
+    TyFn(ps, ret, row) ->
+      TypeExpr { tkind: TyFn(expand_ta_te_list(ps, table, fuel),
+                              expand_ta_te(ret, table, fuel),
+                              row),
+                  line: te.line, col: te.col }
+    TyDim(base, u) ->
+      TypeExpr { tkind: TyDim(expand_ta_te(base, table, fuel), u),
+                  line: te.line, col: te.col }
+    TyRefine(base, p) ->
+      TypeExpr { tkind: TyRefine(expand_ta_te(base, table, fuel), p),
+                  line: te.line, col: te.col }
+  } }
+}
+
+fn expand_ta_te_list(tes: [TypeExpr], table: [TAEntry], fuel: Int) : [TypeExpr] {
+  match tes {
+    [] -> []
+    [t, ...rest] -> [expand_ta_te(t, table, fuel),
+                     ...expand_ta_te_list(rest, table, fuel)]
+  }
+}
+
+# Walk every Decl, expanding transparent aliases in every TypeExpr.
+# Mirrors qualtype_decl shape but rewrites TypeExprs only — no Console
+# diagnostics (all errors deferred to downstream typer cascade).
+fn expand_ta_decls(decls: [Decl], table: [TAEntry]) : [Decl] {
+  let fuel = list_length(table) + 1
+  expand_ta_decls_loop(decls, table, fuel)
+}
+
+fn expand_ta_decls_loop(decls: [Decl], table: [TAEntry], fuel: Int) : [Decl] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> [expand_ta_decl(d, table, fuel),
+                     ...expand_ta_decls_loop(rest, table, fuel)]
+  }
+}
+
+fn expand_ta_decl(d: Decl, table: [TAEntry], fuel: Int) : Decl {
+  match d {
+    DFn(p, n, tps, ps, ret_opt, row, body, l, c, mo) ->
+      DFn(p, n, tps, expand_ta_params(ps, table, fuel),
+          match ret_opt { None -> None Some(te) -> Some(expand_ta_te(te, table, fuel)) },
+          row,
+          expand_ta_expr(body, table, fuel), l, c, mo)
+    DType(p, n, tps, body, l, c) ->
+      # Skip rewriting the alias's own DType body: keeping the original
+      # decl preserves the alias name in `--ast` output and lets later
+      # passes that consult it (refinement synth, dump) see the surface
+      # form. Nominal record/sum bodies still get their field/variant
+      # TypeExprs walked so a record field typed with an alias resolves.
+      match body {
+        TBAlias(_) -> d
+        TBEffectAlias(_) -> d
+        TBRecord(fs) ->
+          DType(p, n, tps, TBRecord(expand_ta_fields(fs, table, fuel)), l, c)
+        TBSum(vs) ->
+          DType(p, n, tps, TBSum(expand_ta_variants(vs, table, fuel)), l, c)
+      }
+    DEffect(p, n, tps, ops, l, c) ->
+      DEffect(p, n, tps, expand_ta_eops(ops, table, fuel), l, c)
+    DProtocol(p, n, tps, ops, l, c) ->
+      DProtocol(p, n, tps, expand_ta_pops(ops, table, fuel), l, c)
+    DImpl(name, proto_args, ty, sub_decls, l, c) ->
+      DImpl(name, expand_ta_te_list(proto_args, table, fuel),
+            expand_ta_te(ty, table, fuel),
+            expand_ta_decls_loop(sub_decls, table, fuel), l, c)
+    DDerive(ps, inner, l, c) ->
+      DDerive(ps, expand_ta_decl(inner, table, fuel), l, c)
+    DAttribPure(inner, l, c) ->
+      DAttribPure(expand_ta_decl(inner, table, fuel), l, c)
+    DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
+      DAxiom(p, sm, n, cso, tps, expand_ta_params(ps, table, fuel),
+             expand_ta_te(ret, table, fuel), row, l, c)
+    DConst(p, n, ty, body, l, c) ->
+      DConst(p, n, expand_ta_te(ty, table, fuel),
+              expand_ta_expr(body, table, fuel), l, c)
+    DTest(n, body, l, c) -> DTest(n, expand_ta_expr(body, table, fuel), l, c)
+    DBench(n, body, l, c) -> DBench(n, expand_ta_expr(body, table, fuel), l, c)
+    DCheck(n, ps, body, l, c) ->
+      DCheck(n, expand_ta_params(ps, table, fuel),
+              expand_ta_expr(body, table, fuel), l, c)
+    DImport(_, _, _) -> d
+    DUnit(_, _, _, _, _) -> d
+    DUse(_, _, _) -> d
+    # DProtoImpl shape, registry-only nodes, etc. fall through if any
+    # exist; the resolver is conservative about leaving unknown decl
+    # shapes untouched.
+  }
+}
+
+fn expand_ta_params(ps: [Param], table: [TAEntry], fuel: Int) : [Param] {
+  match ps {
+    [] -> []
+    [p, ...rest] -> [expand_ta_param(p, table, fuel),
+                     ...expand_ta_params(rest, table, fuel)]
+  }
+}
+
+fn expand_ta_param(pm: Param, table: [TAEntry], fuel: Int) : Param =
+  Param { pname: pm.pname,
+          ptype: match pm.ptype {
+            None -> None
+            Some(te) -> Some(expand_ta_te(te, table, fuel))
+          },
+          pline: pm.pline, pcol: pm.pcol }
+
+fn expand_ta_fields(fs: [FieldDecl], table: [TAEntry], fuel: Int) : [FieldDecl] {
+  match fs {
+    [] -> []
+    [f, ...rest] -> match f {
+      FD(name, te) -> [FD(name, expand_ta_te(te, table, fuel)),
+                       ...expand_ta_fields(rest, table, fuel)]
+    }
+  }
+}
+
+fn expand_ta_variants(vs: [Variant], table: [TAEntry], fuel: Int) : [Variant] {
+  match vs {
+    [] -> []
+    [v, ...rest] -> match v {
+      Var(cname, vargs) -> [Var(cname, expand_ta_te_list(vargs, table, fuel)),
+                             ...expand_ta_variants(rest, table, fuel)]
+    }
+  }
+}
+
+fn expand_ta_eops(ops: [EffectOp], table: [TAEntry], fuel: Int) : [EffectOp] {
+  match ops {
+    [] -> []
+    [op, ...rest] -> match op {
+      EOp(name, tps, ps, ret, l, c) ->
+        [EOp(name, tps, expand_ta_params(ps, table, fuel),
+              expand_ta_te(ret, table, fuel), l, c),
+         ...expand_ta_eops(rest, table, fuel)]
+    }
+  }
+}
+
+fn expand_ta_pops(ops: [ProtoOp], table: [TAEntry], fuel: Int) : [ProtoOp] {
+  match ops {
+    [] -> []
+    [op, ...rest] -> match op {
+      POp(name, tps, ps, ret, l, c) ->
+        [POp(name, tps, expand_ta_params(ps, table, fuel),
+              expand_ta_te(ret, table, fuel), l, c),
+         ...expand_ta_pops(rest, table, fuel)]
+    }
+  }
+}
+
+fn expand_ta_expr(e: Expr, table: [TAEntry], fuel: Int) : Expr =
+  Expr { kind: expand_ta_expr_kind(e.kind, table, fuel),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn expand_ta_expr_kind(k: ExprKind, table: [TAEntry], fuel: Int) : ExprKind {
+  match k {
+    EBlock(stmts, opt_final) ->
+      EBlock(expand_ta_stmts(stmts, table, fuel),
+             match opt_final {
+               None -> None
+               Some(fe) -> Some(expand_ta_expr(fe, table, fuel))
+             })
+    EMatch(scrut, arms) ->
+      EMatch(expand_ta_expr(scrut, table, fuel),
+             expand_ta_arms(arms, table, fuel))
+    EVariantsOf(te, ns) ->
+      EVariantsOf(expand_ta_te(te, table, fuel), ns)
+    ELambda(ps, body) ->
+      ELambda(expand_ta_params(ps, table, fuel),
+              expand_ta_expr(body, table, fuel))
+    EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(expand_ta_expr(body, table, fuel), eff,
+              expand_ta_te_list(ty_args, table, fuel),
+              match init_opt { None -> None Some(ie) -> Some(expand_ta_expr(ie, table, fuel)) },
+              alias_opt,
+              expand_ta_hclauses(clauses, table, fuel),
+              match ret_opt {
+                None -> None
+                Some(r) -> Some(expand_ta_hreturn(r, table, fuel))
+              })
+    _ -> map_expr_kind(k, (sub) => expand_ta_expr(sub, table, fuel))
+  }
+}
+
+fn expand_ta_arms(arms: [Arm], table: [TAEntry], fuel: Int) : [Arm] {
+  match arms {
+    [] -> []
+    [a, ...rest] -> [expand_ta_arm(a, table, fuel),
+                     ...expand_ta_arms(rest, table, fuel)]
+  }
+}
+
+fn expand_ta_arm(a: Arm, table: [TAEntry], fuel: Int) : Arm {
+  match a {
+    Arm(pat, opt_guard, body) ->
+      Arm(expand_ta_pat(pat, table, fuel),
+          match opt_guard {
+            None -> None
+            Some(g) -> Some(expand_ta_expr(g, table, fuel))
+          },
+          expand_ta_expr(body, table, fuel))
+  }
+}
+
+fn expand_ta_pat(pat: Pattern, table: [TAEntry], fuel: Int) : Pattern {
+  match pat.pkind {
+    PNarrow(name, te) ->
+      Pattern { pkind: PNarrow(name, expand_ta_te(te, table, fuel)),
+                 line: pat.line, col: pat.col }
+    PVariant(name, subs) ->
+      Pattern { pkind: PVariant(name, expand_ta_pat_list(subs, table, fuel)),
+                 line: pat.line, col: pat.col }
+    PVariantRecord(name, fs) ->
+      Pattern { pkind: PVariantRecord(name, expand_ta_pfields(fs, table, fuel)),
+                 line: pat.line, col: pat.col }
+    PRecord(fs) ->
+      Pattern { pkind: PRecord(expand_ta_pfields(fs, table, fuel)),
+                 line: pat.line, col: pat.col }
+    PList(subs, rest) ->
+      Pattern { pkind: PList(expand_ta_pat_list(subs, table, fuel), rest),
+                 line: pat.line, col: pat.col }
+    PAs(name, inner) ->
+      Pattern { pkind: PAs(name, expand_ta_pat(inner, table, fuel)),
+                 line: pat.line, col: pat.col }
+    _ -> pat
+  }
+}
+
+fn expand_ta_pat_list(ps: [Pattern], table: [TAEntry], fuel: Int) : [Pattern] {
+  match ps {
+    [] -> []
+    [p, ...rest] -> [expand_ta_pat(p, table, fuel),
+                     ...expand_ta_pat_list(rest, table, fuel)]
+  }
+}
+
+fn expand_ta_pfields(fs: [PField], table: [TAEntry], fuel: Int) : [PField] {
+  match fs {
+    [] -> []
+    [f, ...rest] -> match f {
+      PField(name, sub, sh) -> [PField(name, expand_ta_pat(sub, table, fuel), sh),
+                                 ...expand_ta_pfields(rest, table, fuel)]
+    }
+  }
+}
+
+fn expand_ta_stmts(ss: [Stmt], table: [TAEntry], fuel: Int) : [Stmt] {
+  match ss {
+    [] -> []
+    [s, ...rest] -> [expand_ta_stmt(s, table, fuel),
+                     ...expand_ta_stmts(rest, table, fuel)]
+  }
+}
+
+fn expand_ta_stmt(s: Stmt, table: [TAEntry], fuel: Int) : Stmt {
+  match s {
+    SLet(pat, ty_opt, e) ->
+      SLet(expand_ta_pat(pat, table, fuel),
+           match ty_opt {
+             None -> None
+             Some(te) -> Some(expand_ta_te(te, table, fuel))
+           },
+           expand_ta_expr(e, table, fuel))
+    SVar(name, ty_opt, init, l, c) ->
+      SVar(name,
+           match ty_opt {
+             None -> None
+             Some(te) -> Some(expand_ta_te(te, table, fuel))
+           },
+           expand_ta_expr(init, table, fuel), l, c)
+    SAssert(e, om) ->
+      SAssert(expand_ta_expr(e, table, fuel),
+              match om { None -> None Some(m) -> Some(expand_ta_expr(m, table, fuel)) })
+    SExprStmt(e) -> SExprStmt(expand_ta_expr(e, table, fuel))
+    SIndexAssign(t, ix, v, l, c) ->
+      SIndexAssign(expand_ta_expr(t, table, fuel),
+                    expand_ta_expr(ix, table, fuel),
+                    expand_ta_expr(v, table, fuel), l, c)
+    SUse(eff, l, c) -> SUse(eff, l, c)
+  }
+}
+
+fn expand_ta_hclauses(cs: [HClause], table: [TAEntry], fuel: Int) : [HClause] {
+  match cs {
+    [] -> []
+    [c, ...rest] -> match c {
+      HC(name, ps, body, l, col) ->
+        [HC(name, expand_ta_params(ps, table, fuel),
+             expand_ta_expr(body, table, fuel), l, col),
+         ...expand_ta_hclauses(rest, table, fuel)]
+    }
+  }
+}
+
+fn expand_ta_hreturn(r: HReturn, table: [TAEntry], fuel: Int) : HReturn {
+  match r {
+    HR(name, body, l, c) -> HR(name, expand_ta_expr(body, table, fuel), l, c)
+  }
+}
+
 # m7b #1d — display-time alias preservation (Doc A §*Open questions*
 # #5). Render a label set using the largest alias that fully covers
 # it; remaining labels (those outside the alias) are appended with
@@ -47435,7 +47906,18 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             let eff_names_for_alias = list_append(builtin_effect_names(), declared_effs)
             let alias_cands = collect_alias_cands(injected)
             let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, path)
-            let raw_decls_pre_pos = expand_aliases_in_decls(injected, alias_res.aliases)
+            let raw_decls_post_eff = expand_aliases_in_decls(injected, alias_res.aliases)
+            # issue #376: expand transparent type aliases. `type Foo = T`
+            # (single-component, RHS not refinement, name not an effect)
+            # is structural — every TyName("Foo", args) rewrites to the
+            # alias body with tparams substituted. Multi-component
+            # `type X = A | B` (TBSum) keeps #187 nominal-union semantics.
+            # Refinement-aliases (`type Pos = Int where _ > 0`) are
+            # filtered out so synthesize_refine_pred_fns + pattern
+            # narrowing keep working.
+            let ta_table = collect_transparent_aliases(raw_decls_post_eff,
+                                                        eff_names_for_alias)
+            let raw_decls_pre_pos = expand_ta_decls(raw_decls_post_eff, ta_table)
             # issue #266: rewrite `T { v1, v2 }` (parser tags fields
             # with `__pos_<i>__` sentinels) into `T { f1: v1, f2: v2 }`
             # using the record's declared field order. Runs before any
