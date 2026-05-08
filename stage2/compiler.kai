@@ -5622,7 +5622,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
               match rb.r {
                 None -> err_d(rb.p)
                 Some(body) -> {
-                  let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, t.line, t.col)
+                  let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
                   let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
                   ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
                 }
@@ -5633,7 +5633,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
               match rb.r {
                 None -> err_d(rb.p)
                 Some(body) -> {
-                  let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, t.line, t.col)
+                  let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
                   let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
                   ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
                 }
@@ -5863,10 +5863,11 @@ fn check_pred_not_false(p: Parser, pred: Expr, kind: String, kw: Token) : Parser
 # returns the body's value. When both lists are empty, the body is
 # returned unchanged so functions without contracts cost nothing.
 fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
-                       params: [Param], line: Int, col: Int) : Expr {
+                       params: [Param], fn_name: String,
+                       line: Int, col: Int) : Expr {
   if reqs == [] and enss == [] { body } else {
     let pp = collect_param_preds(params, [])
-    let req_stmts = preds_to_asserts(reqs, [], "requires", pp)
+    let req_stmts = preds_to_asserts(reqs, [], "requires", pp, fn_name)
     if enss == [] {
       if req_stmts == [] { body }
       else { mk_expr(EBlock(req_stmts, Some(body)), line, col) }
@@ -5876,7 +5877,7 @@ fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
       #   { req_asserts; let result = body; ens_asserts; result }
       let bind_pat = mk_pat(PBind("result"), line, col)
       let bind = SLet(bind_pat, None, body)
-      let ens_stmts = preds_to_asserts(enss, [], "ensures", pp)
+      let ens_stmts = preds_to_asserts(enss, [], "ensures", pp, fn_name)
       if req_stmts == [] and ens_stmts == [] { body }
       else {
         let res_var = mk_expr(EVar("result"), line, col)
@@ -5888,7 +5889,7 @@ fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
 }
 
 fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
-                     param_preds: [ParamPred]) : [Stmt] {
+                     param_preds: [ParamPred], fn_name: String) : [Stmt] {
   match preds {
     [] -> list_reverse(acc)
     # m12.6.d: drop trivially-true predicates at parse time.
@@ -5896,24 +5897,49 @@ fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
     # some param's refinement — the type-system already guarantees
     # it. (Caller-side narrowing into the refined type is the proof
     # obligation; the callee body inherits the refinement for free.)
-    # m12.6.x #8: build a positional msg so panic shows the clause
-    # kind + line.
+    # m12.6.x #8 v2 (#86): build a structured message containing the
+    # clause kind, the function name, the rendered predicate text, and
+    # the decl-site line/col. The leading `"requires violated` /
+    # `"ensures violated` prefix is preserved so contract_assert_kind
+    # / extract_requires_asserts (which key off the prefix) keep
+    # working. Call-site span and runtime value formatting are
+    # follow-up (see docs/refinements-and-contracts.md v2 sidebar).
     [p, ...rest] -> {
       if pred_entailed_by_params(p, param_preds) {
-        preds_to_asserts(rest, acc, kind, param_preds)
+        preds_to_asserts(rest, acc, kind, param_preds, fn_name)
       } else { match try_eval_pred(p) {
-        Some(true) -> preds_to_asserts(rest, acc, kind, param_preds)
+        Some(true) -> preds_to_asserts(rest, acc, kind, param_preds, fn_name)
         _          -> {
-          let msg_span = concat_all([
-            "\"", kind, " violated at line ",
-            int_to_string(p.line), "\""
-          ])
+          let msg_span = build_violation_msg_span(kind, fn_name, p)
           let msg = mk_expr(EStr(msg_span, false), p.line, p.col)
-          preds_to_asserts(rest, [SAssert(p, Some(msg)), ...acc], kind, param_preds)
+          preds_to_asserts(rest, [SAssert(p, Some(msg)), ...acc], kind, param_preds, fn_name)
         }
       } }
     }
   }
+}
+
+# m12.6.x #8 v2 (#86): assemble the multi-line panic message for a
+# contract violation. The result is the *raw* EStr span (including
+# surrounding double quotes and backslash-escaped newlines) so the
+# emitter can pass it through as a C string literal unchanged. Format:
+#
+#   "requires violated in `<fn>`\nrequired: <pred>\ndeclared at line N, col C"
+#
+# When printed by `kai_prelude_panic` the `\n` escapes render as real
+# line breaks, producing a multi-line diagnostic. The leading
+# `"requires violated` / `"ensures violated` prefix is kept so the
+# detectors at extract_requires_asserts / contract_assert_kind still
+# classify the assert as contract-derived.
+fn build_violation_msg_span(kind: String, fn_name: String, p: Expr) : String {
+  let pred_text = escape_str_body_for_c(expr_show_pred(p))
+  let fn_text = escape_str_body_for_c(fn_name)
+  concat_all([
+    "\"", kind, " violated in `", fn_text, "`",
+    "\\nrequired: ", pred_text,
+    "\\ndeclared at line ", int_to_string(p.line),
+    ", col ", int_to_string(p.col), "\""
+  ])
 }
 
 # m12.6.x #2: collect every refinement predicate that appears on a
