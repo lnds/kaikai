@@ -33528,10 +33528,33 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     }
     EBlock(stmts, opt_tail) -> {
       let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [])
-      EBlock(r.stmts, match opt_tail {
+      let new_tail = match opt_tail {
         None -> None
         Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam))
-      })
+      }
+      # Issue #297 (partial) — block-scope exit drops for SLet PBind
+      # bindings that took a `__perceus_dup` per non-last read above.
+      # Symmetric with `pcs_collect_exit_drops` for fn params: an
+      # SLet whose binder has ≥ 2 non-lam uses (or LUBlocked) carries
+      # an unbalanced original ref at block exit; without an explicit
+      # `__perceus_drop` the chunk leaks.
+      #
+      # Conservative scope: only emit a drop when the binding does
+      # NOT appear in the block's tail expression. Tail-position
+      # readings would force the drop AFTER the tail (via a
+      # `__pcs_block_ret` wrap) which hides any self-tail-call from
+      # `tcrec_rewrite_decls` and breaks TCO; the demo-side regression
+      # was a stack overflow on `search` (#issue-294-style). Skipping
+      # the drop in those cases preserves TCO and leaves the leak
+      # intact — acceptable for this partial scope; the issue stays
+      # open for the broader audit.
+      #
+      # LUAt-with-count==1 stays raw (lexically-last consumer
+      # transfers the ref). LUUnused is handled by `block_unused_lets`
+      # via inline decref.
+      let exit_drops = pcs_collect_block_let_exit_drops(stmts, scope, uses,
+                                                         opt_tail, [])
+      EBlock(pcs_append_drops(r.stmts, exit_drops), new_tail)
     }
     EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam),
                               pcs_rewrite_arms(arms, scope, uses, in_lam))
@@ -34104,6 +34127,92 @@ fn pcs_collect_exit_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
         _ -> acc
       }
       pcs_collect_exit_drops(rest, uses, acc1)
+    }
+  }
+}
+
+# Issue #297 (partial) — block-scope let-binding exit drops.
+#
+# For each `SLet(PBind(name), _, rhs)` introduced by this block,
+# decide whether the binding needs a `__perceus_drop` at block exit.
+# The rule mirrors `pcs_collect_exit_drops` for fn params:
+#   - `LUBlocked` (closure capture) → drop.
+#   - `LUAt` with ≥ 2 non-lam uses → drop.
+#   - `LUAt` with exactly 1 non-lam use → no drop (the lexically-last
+#     read transfers the ref raw to its consumer).
+#   - `LUUnused` → no drop here. `block_unused_lets` in the emitter
+#     attaches an inline `kai_decref` right after the SLet; emitting
+#     a second `__perceus_drop` would double-free.
+#
+# Names already visible in `outer` (the scope at block entry) are
+# skipped — those are owned by an enclosing scope's drop discipline.
+#
+# Destructuring SLet (PRecord, PVariant, PTuple, ...) is handled by
+# `emit_let_stmt`'s destructuring arm (decrefs the composite temp),
+# so we ignore non-PBind patterns here. `pat_bindings_skip_raw`
+# excludes Tier 2.5 raw locals (`int64_t`, etc.) which have no rc.
+fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
+                                     uses: [Use], opt_tail: Option[Expr],
+                                     acc: [Stmt]) : [Stmt] {
+  match stmts {
+    [] -> list_reverse(acc)
+    [s, ...rest] -> {
+      let acc1 = match s {
+        SLet(pat, _, rhs) -> match pat.pkind {
+          PBind(nm) -> {
+            let names_in = pat_bindings_skip_raw(pat, rhs, [])
+            let in_block = list_has(names_in, nm) and not list_has(outer, nm)
+            let in_tail = pcs_name_in_tail(nm, opt_tail)
+            if in_block and not in_tail {
+              match last_use_for(nm, uses) {
+                LUBlocked(_) -> [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
+                LUAt(_, _, _) ->
+                  if pcs_count_non_lam_uses(nm, uses, 0) >= 2 {
+                    [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
+                  } else { acc }
+                _ -> acc
+              }
+            } else { acc }
+          }
+          _ -> acc
+        }
+        _ -> acc
+      }
+      pcs_collect_block_let_exit_drops(rest, outer, uses, opt_tail, acc1)
+    }
+  }
+}
+
+# True iff `nm` appears in the block's tail expression. Re-runs
+# `pcs_collect_uses_expr` with `[nm]` as scope so the result lists
+# the EVar reads of `nm` and only those.
+fn pcs_name_in_tail(nm: String, opt_tail: Option[Expr]) : Bool {
+  match opt_tail {
+    None -> false
+    Some(e) -> {
+      let us = pcs_collect_uses_expr(e, [nm], false, [])
+      pcs_uses_has_name(us, nm)
+    }
+  }
+}
+
+# Splice exit-drop SExprStmts into the block. Drops fire LIFO (last
+# let entered → first dropped); the collector accumulates head-first
+# then reverses, so we reverse again here. Drops sit *between* the
+# trailing SLets and the tail, leaving the tail position untouched
+# so `tcrec_rewrite_decls` can detect a self-tail-call.
+fn pcs_append_drops(stmts: [Stmt], drops: [Stmt]) : [Stmt] {
+  match drops {
+    [] -> stmts
+    [_, ...__] -> list_append(stmts, list_reverse(drops))
+  }
+}
+
+fn pcs_uses_has_name(uses: [Use], nm: String) : Bool {
+  match uses {
+    [] -> false
+    [h, ...rest] -> match h {
+      U(uname, _, _, _) -> if uname == nm { true } else { pcs_uses_has_name(rest, nm) }
     }
   }
 }
