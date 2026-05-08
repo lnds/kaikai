@@ -12,6 +12,14 @@ same date as **option (b)**: a minimal `log` lives in stdlib over
 a dedicated `Log` effect; structured `ahu.log` / `ahu.trace`
 sit on top.
 
+**Refreshed 2026-05-08** (issue #367 — doc reconciliation). The
+*Current inventory* table below is the corrected snapshot; most of
+Tier S1 and S2 shipped between 2026-05-02 and 2026-05-04 and the
+old "not started" markers no longer reflect reality. The Tier
+plan sections that follow describe the design intent of each lane
+at the time it was queued — read those alongside the inventory
+above to see which acceptance bars have been met.
+
 ## Why now
 
 Tongariki (m1–m13 + m14 partial) closed at 0.37.0. The language
@@ -30,34 +38,51 @@ products depend directly on stdlib reaching parity:
 
 Both products are post-MVP. Stdlib gaps are what gates them.
 
-## Current inventory (2026-05-02)
+## Current inventory (refreshed 2026-05-08)
 
 What ships in `stdlib/` today:
 
 ```
 core/   list.kai string.kai option.kai result.kai char.kai tuple.kai io.kai
 collections/  map.kai set.kai stack.kai queue.kai
-math/  int.kai real.kai numeric.kai bits.kai
+math/  int.kai real.kai numeric.kai bits.kai complex.kai
+crypto/  hash.kai mac.kai
 encoding/  json.kai base64.kai hex.kai
-net/  tcp.kai
-top-level: actor.kai decimal.kai effects.kai loop.kai money.kai
-           path.kai protocols.kai random.kai reader.kai regexp.kai
-           spawn.kai time.kai trace.kai uuid.kai writer.kai
+fs/  file.kai dir.kai path.kai
+net/  tcp.kai http.kai
+os/  args.kai env.kai
+top-level: actor.kai decimal.kai effects.kai log.kai loop.kai money.kai
+           path.kai protocols.kai random.kai random_secure.kai
+           reader.kai regexp.kai spawn.kai time.kai trace.kai
+           uuid.kai writer.kai
 ```
 
-What's planned in Layout but **not yet implemented**:
+What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 
-| Module                | Status                                         |
-|-----------------------|------------------------------------------------|
-| `fs/file`, `fs/dir`   | not started — only `path.kai` exists           |
-| `os/env`, `os/process`, `os/args` | not started                        |
-| `time` Clock handler  | declarations only; default handler m8.x scope |
-| `net/udp`, `net/dns`  | not started                                    |
-| `net/http` (client)   | not started                                    |
-| `random_secure`       | not started — only `random.kai` (seedable)     |
-| `crypto/hash`, `crypto/mac` | not started                              |
-| `concurrent/nursery`  | partial — `spawn.kai` exists but no nursery scope |
-| `log` (stdlib minimal)| not started — Q2 decision pending until 2026-05-02 |
+| Module                                  | Status                                                                                                                         |
+|-----------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
+| `fs/file`                               | shipped via PR #132 (84 LOC, 3 public fns: `file_read_file`, `file_write_file`, `file_append`); gaps tracked in #345           |
+| `fs/dir`                                | doc-only stub committed; runtime primitives queued in #344 (no `pub fn` yet)                                                   |
+| `os/env`                                | shipped via PR #131 (partial) + PR #143 (close, closes #127); 4 public fns                                                     |
+| `os/args`                               | shipped via PR #131 + PR #143; 2 public fns (`args_argv`, `args_program_name`)                                                 |
+| `os/process` (runtime + effect)         | shipped via PR #142 (closes the runtime side of #126); public Kai wrapper still missing — tracked in #346                      |
+| `time` Clock default handler            | shipped via PR #134 — `kai_default_clock_wall_now`, `kai_default_clock_monotonic_now`, `kai_default_clock_sleep_ns` are wired  |
+| `crypto/hash`, `crypto/mac`             | shipped via PR #146 (S2 #5): 626 LOC pure-Kai SHA-256/SHA-512 + 83 LOC HMAC                                                    |
+| `random_secure`                         | shipped via PR #144 (closes #140): 44 LOC, 2 public fns over `getrandom(2)` / `arc4random_buf`                                 |
+| `log` (stdlib minimal)                  | shipped via PR #145 (S2 #7, closes #141): 52 LOC, 4 public fns (`log_debug/info/warn/error`) over a default `Log` handler      |
+| `concurrent/nursery`                    | shipped — `pub fn nursery[T, e]` lives in `stdlib/spawn.kai:95` (top-level, not a `concurrent/` subdir)                        |
+| `math/real` libm bindings               | shipped via PR #359 (closes #343): sqrt, trig, exp/log, pow, atan2 over libm                                                   |
+
+What's still open (planned-but-not-shipped):
+
+| Module                          | Issue   | Notes                                                                                            |
+|---------------------------------|---------|--------------------------------------------------------------------------------------------------|
+| `os/process.kai` (Kai wrapper)  | #346    | runtime + effect already in place via #142; only the public `pub fn` surface is missing          |
+| `fs/dir` runtime primitives     | #344    | `kai_prelude_dir_*` C bodies + prelude/typer wiring; `stdlib/fs/dir.kai` is a doc-only stub      |
+| `fs/file` extras                | #345    | `exists`, `delete`, `rename`, `metadata`, `read_bytes` — not in `stage0/runtime.h` yet           |
+| `math/int` extension            | #347    | missing `abs`, `signum`, `pow`, `log2`, `clamp`, `div_mod`                                       |
+| `net/udp`, `net/dns`            | (none)  | Tier S3 — no compiler builtin, no runtime handler, no module file                                |
+| `net/http` server-side          | n/a     | belongs **inside** `manutara`, not stdlib (Layout §`net`)                                        |
 
 ## Tier plan
 
