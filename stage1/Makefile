@@ -1,5 +1,10 @@
 CC      ?= cc
 CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g -O0
+# issue #343 — math/real libm bindings live in stage0/runtime.h.
+# Linux glibc requires explicit `-lm` after the .c inputs; macOS
+# libSystem already exposes those symbols. Trailed at the end of
+# every $(CC) compile-and-link line that consumes runtime.h.
+LDLIBS_M := -lm
 STAGE0  := ../stage0/kaic0
 TARGET  := kaic1
 SRC     := compiler.kai
@@ -18,7 +23,7 @@ build/stage1.c: $(SRC) $(STAGE0) | build
 	$(STAGE0) $(SRC) > $@
 
 $(TARGET): build/stage1.c
-	$(CC) $(CFLAGS) -I ../stage0 $< -o $@
+	$(CC) $(CFLAGS) -I ../stage0 $< -o $@ $(LDLIBS_M)
 
 # Compare stage 1's --tokens output against stage 0's (normalized to
 # ignore whitespace differences, since stage 0 uses fixed-width columns).
@@ -66,10 +71,10 @@ test-run: $(TARGET) build
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/$$name.c; \
-	  $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	  ./build/$$name > build/$$name.out; \
 	  $(STAGE0) $$f > build/$$name-s0.c; \
-	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-s0.c -o build/$$name-s0; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-s0.c -o build/$$name-s0 $(LDLIBS_M); \
 	  ./build/$$name-s0 > build/$$name-s0.out; \
 	  diff -q build/$$name.out build/$$name-s0.out > /dev/null \
 	    && echo "run OK $$name" \
@@ -83,10 +88,10 @@ test-blocks: $(TARGET) build
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) --test $$f > build/$$name-t.c; \
-	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t.c -o build/$$name-t; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t.c -o build/$$name-t $(LDLIBS_M); \
 	  ./build/$$name-t 2> build/$$name-t.err || true; \
 	  $(STAGE0) --test $$f > build/$$name-t-s0.c; \
-	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t-s0.c -o build/$$name-t-s0; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t-s0.c -o build/$$name-t-s0 $(LDLIBS_M); \
 	  ./build/$$name-t-s0 2> build/$$name-t-s0.err || true; \
 	  diff -q build/$$name-t.err build/$$name-t-s0.err > /dev/null \
 	    && echo "tests OK $$name" \
@@ -99,7 +104,7 @@ test-blocks: $(TARGET) build
 selfhost: $(TARGET) build
 	@set -e; \
 	./$(TARGET) compiler.kai > build/kaic1b.c; \
-	$(CC) $(CFLAGS) -I ../stage0 build/kaic1b.c -o build/kaic1b; \
+	$(CC) $(CFLAGS) -I ../stage0 build/kaic1b.c -o build/kaic1b $(LDLIBS_M); \
 	./build/kaic1b compiler.kai > build/kaic1c.c; \
 	diff -q build/kaic1b.c build/kaic1c.c > /dev/null \
 	  && echo "self-hosting fixed point: OK" \

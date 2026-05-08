@@ -276,7 +276,7 @@ stress-fixtures: kaic2
 	  name=$$(basename $$f .kai); \
 	  stage2/kaic2 $$f > /tmp/stress-$$name.c 2> /tmp/stress-$$name.err \
 	    || { echo "stress FAIL $$name (kaic2 errored)"; cat /tmp/stress-$$name.err; exit 1; }; \
-	  cc -std=c99 -I stage0 /tmp/stress-$$name.c -o /tmp/stress-$$name 2>> /tmp/stress-$$name.err \
+	  cc -std=c99 -I stage0 /tmp/stress-$$name.c -o /tmp/stress-$$name -lm 2>> /tmp/stress-$$name.err \
 	    || { echo "stress FAIL $$name (cc errored)"; cat /tmp/stress-$$name.err; exit 1; }; \
 	  /tmp/stress-$$name > /tmp/stress-$$name.out 2>&1 \
 	    && echo "stress OK $$name" \
