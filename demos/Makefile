@@ -28,6 +28,10 @@ STDLIB    := ../stdlib
 RT_INC    := -I ../stage0
 CC        := cc
 CFLAGS    := -std=c99 -O2 -Wno-unused-function -Wno-unused-variable
+# issue #343 — math/real libm bindings live in stage0/runtime.h.
+# Linux glibc requires explicit `-lm` after the .c inputs; macOS
+# libSystem already exposes those symbols.
+LDLIBS_M  := -lm
 
 BUILD     := build
 DEMOS     := $(patsubst %/,%,$(dir $(wildcard */main.kai)))
@@ -50,7 +54,7 @@ verify:
 	    echo "FAIL kaikai: $$err" > $(BUILD)/$$d.status; \
 	    continue; \
 	  fi; \
-	  if ! $(CC) $(CFLAGS) $(RT_INC) $(BUILD)/$$d.c -o $(BUILD)/$$d-bin 2>> $(BUILD)/$$d.err; then \
+	  if ! $(CC) $(CFLAGS) $(RT_INC) $(BUILD)/$$d.c -o $(BUILD)/$$d-bin $(LDLIBS_M) 2>> $(BUILD)/$$d.err; then \
 	    echo "FAIL cc: see $(BUILD)/$$d.err" > $(BUILD)/$$d.status; \
 	    continue; \
 	  fi; \

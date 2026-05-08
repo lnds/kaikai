@@ -1,5 +1,10 @@
 CC      ?= cc
 CFLAGS  ?= -std=c99 -Wall -Wextra -Wpedantic -g -O0
+# issue #343 — math/real libm bindings live in stage0/runtime.h.
+# Linux glibc requires explicit `-lm` after the .c inputs; macOS
+# libSystem already exposes those symbols. Trailed at the end of
+# every $(CC) compile-and-link line that consumes runtime.h.
+LDLIBS_M := -lm
 SRCS    := main.c lexer.c ast.c parser.c check.c emit.c
 OBJS    := $(SRCS:.c=.o)
 TARGET  := kaic0
@@ -28,7 +33,7 @@ test-run: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  echo "=== run $$name ==="; \
 	  ./$(TARGET) $$f > build/$$name.c; \
-	  $(CC) build/$$name.c -I . -o build/$$name; \
+	  $(CC) build/$$name.c -I . -o build/$$name $(LDLIBS_M); \
 	  ./build/$$name; \
 	done
 
@@ -39,7 +44,7 @@ test-blocks: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  echo "=== tests $$name ==="; \
 	  ./$(TARGET) --test $$f > build/$$name-t.c; \
-	  $(CC) build/$$name-t.c -I . -o build/$$name-t; \
+	  $(CC) build/$$name-t.c -I . -o build/$$name-t $(LDLIBS_M); \
 	  ./build/$$name-t; \
 	done
 
