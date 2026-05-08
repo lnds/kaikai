@@ -10236,25 +10236,33 @@ type AmbigEntry = AmbE(String, [String])
 # silently; when only one module exports the name, the resolution
 # is unique. Iteration is O(|fns|^2) — fine, |fns| stays in the
 # low thousands even with the full prelude chain loaded.
-fn find_ambig_efns(fns: [EFn]) : [AmbigEntry] = find_ambig_loop(fns, [], [])
+fn find_ambig_efns(fns: [EFn], target_origin: Option[String]) : [AmbigEntry] =
+  find_ambig_loop(fns, target_origin, [], [])
 
-fn find_ambig_loop(fns: [EFn], seen: [String], acc: [AmbigEntry]) : [AmbigEntry] {
+fn find_ambig_loop(fns: [EFn], target_origin: Option[String], seen: [String], acc: [AmbigEntry]) : [AmbigEntry] {
   match fns {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
       EFn(n, _, _) ->
-        if list_has(seen, n) { find_ambig_loop(rest, seen, acc) }
+        if list_has(seen, n) { find_ambig_loop(rest, target_origin, seen, acc) }
         else {
           let cands = efn_collect_matching(fns, n, [])
           let count = list_length(cands)
-          if count <= 1 { find_ambig_loop(rest, [n, ...seen], acc) }
+          if count <= 1 { find_ambig_loop(rest, target_origin, [n, ...seen], acc) }
           else {
             match efn_pick_root(cands) {
-              Some(_) -> find_ambig_loop(rest, [n, ...seen], acc)
+              Some(_) -> find_ambig_loop(rest, target_origin, [n, ...seen], acc)
               None    -> {
                 let mods = ambig_mods_of(cands, [])
-                let entry = AmbE(n, mods)
-                find_ambig_loop(rest, [n, ...seen], [entry, ...acc])
+                # Issue #335: if the calling file (the target) exports
+                # this name itself, the file-local rule resolves the
+                # ambiguity inside that file's bodies — no warning.
+                if mods_contain_target(mods, target_origin) {
+                  find_ambig_loop(rest, target_origin, [n, ...seen], acc)
+                } else {
+                  let entry = AmbE(n, mods)
+                  find_ambig_loop(rest, target_origin, [n, ...seen], [entry, ...acc])
+                }
               }
             }
           }
@@ -10262,6 +10270,12 @@ fn find_ambig_loop(fns: [EFn], seen: [String], acc: [AmbigEntry]) : [AmbigEntry]
     }
   }
 }
+
+fn mods_contain_target(mods: [String], target_origin: Option[String]) : Bool =
+  match target_origin {
+    None    -> false
+    Some(m) -> list_has(mods, m)
+  }
 
 fn ambig_mods_of(cands: [EFn], acc: [String]) : [String] {
   match cands {
@@ -14697,12 +14711,19 @@ fn fn_bodies(src: String, decls: [Decl], lcs: [String], fns: [EFn], variants: [E
 #      when test_mode is on) ----
 
 fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
-                lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+                lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
+                target_origin: Option[String]) : String {
   # desc_span is the raw source of the description including its quotes,
   # so it's already a valid C string literal. We wrap the body in
   # setjmp/longjmp: kai_assert_check inside the body can longjmp us out
   # on failure, and the test still counts as a tried test.
-  let body_c = emit_expr(src, body, lcs, fns, variants, lams, cls)
+  # Issue #335: rotate the EFn table so the target file's own module
+  # entries come first. `efn_resolve`'s ambiguous fallback then
+  # resolves a bare name (e.g. `concat([])`) to the same-module entry
+  # rather than a sibling prelude's clashing export. Mirrors the rotate
+  # `emit_fn_body` already does for DFn bodies.
+  let body_fns = fns_prefer_module(fns, target_origin)
+  let body_c = emit_expr(src, body, lcs, body_fns, variants, lams, cls)
   concat_all([
     "static void _kai_test_", int_to_string(id), "(void) {\n",
     "    kai_test_begin(", desc_span, ");\n",
@@ -14723,10 +14744,10 @@ fn test_decls(decls: [Decl]) : [Decl] =
   filter(decls, (d) => match d { DTest(_, _, _, _) -> true _ -> false })
 
 fn emit_one_test(src: String, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
-                 id_d: DeclWithId) : String {
+                 target_origin: Option[String], id_d: DeclWithId) : String {
   match id_d {
     DWI(id, d) -> match d {
-      DTest(desc_span, body, _, _) -> emit_test_fn(src, id, desc_span, body, lcs, fns, variants, lams, cls)
+      DTest(desc_span, body, _, _) -> emit_test_fn(src, id, desc_span, body, lcs, fns, variants, lams, cls, target_origin)
       _ -> ""
     }
   }
@@ -14748,9 +14769,10 @@ fn number_tests_loop(decls: [Decl], id: Int, acc: [DeclWithId]) : [DeclWithId] {
 fn number_tests(decls: [Decl]) : [DeclWithId] =
   number_tests_loop(decls, 0, [])
 
-fn emit_all_tests(src: String, decls: [Decl], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+fn emit_all_tests(src: String, decls: [Decl], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
+                  target_origin: Option[String]) : String {
   let numbered = number_tests(decls)
-  concat_all(map(numbered, (dwi) => emit_one_test(src, lcs, fns, variants, lams, cls, dwi)))
+  concat_all(map(numbered, (dwi) => emit_one_test(src, lcs, fns, variants, lams, cls, target_origin, dwi)))
 }
 
 fn test_count(decls: [Decl]) : Int = list_length(test_decls(decls))
@@ -14774,8 +14796,11 @@ fn test_call_list(n: Int, i: Int) : String {
 # v1.x will turn it into an env var.
 
 fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
-                 lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
-  let body_c = emit_expr(src, body, lcs, fns, variants, lams, cls)
+                 lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
+                 target_origin: Option[String]) : String {
+  # Issue #335: same file-local rotate as emit_test_fn.
+  let body_fns = fns_prefer_module(fns, target_origin)
+  let body_c = emit_expr(src, body, lcs, body_fns, variants, lams, cls)
   concat_all([
     "static void _kai_bench_", int_to_string(id), "(void) {\n",
     "    long long _kai_bench_t0 = kai_bench_now_ns();\n",
@@ -14794,10 +14819,10 @@ fn bench_decls(decls: [Decl]) : [Decl] =
   filter(decls, (d) => match d { DBench(_, _, _, _) -> true _ -> false })
 
 fn emit_one_bench(src: String, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
-                  id_d: DeclWithId) : String {
+                  target_origin: Option[String], id_d: DeclWithId) : String {
   match id_d {
     DWI(id, d) -> match d {
-      DBench(desc_span, body, _, _) -> emit_bench_fn(src, id, desc_span, body, lcs, fns, variants, lams, cls)
+      DBench(desc_span, body, _, _) -> emit_bench_fn(src, id, desc_span, body, lcs, fns, variants, lams, cls, target_origin)
       _ -> ""
     }
   }
@@ -14816,9 +14841,10 @@ fn number_benches_loop(decls: [Decl], id: Int, acc: [DeclWithId]) : [DeclWithId]
 fn number_benches(decls: [Decl]) : [DeclWithId] =
   number_benches_loop(decls, 0, [])
 
-fn emit_all_benches(src: String, decls: [Decl], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+fn emit_all_benches(src: String, decls: [Decl], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
+                    target_origin: Option[String]) : String {
   let numbered = number_benches(decls)
-  concat_all(map(numbered, (dwi) => emit_one_bench(src, lcs, fns, variants, lams, cls, dwi)))
+  concat_all(map(numbered, (dwi) => emit_one_bench(src, lcs, fns, variants, lams, cls, target_origin, dwi)))
 }
 
 fn bench_count(decls: [Decl]) : Int = list_length(bench_decls(decls))
@@ -14922,9 +14948,12 @@ fn check_param_names(params: [Param]) : [String] = match params {
 }
 
 fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body: Expr,
-                 lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+                 lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
+                 target_origin: Option[String]) : String {
   let lcs2 = list_append(check_param_names(params), lcs)
-  let body_c = emit_expr(src, body, lcs2, fns, variants, lams, cls)
+  # Issue #335: same file-local rotate as emit_test_fn.
+  let body_fns = fns_prefer_module(fns, target_origin)
+  let body_c = emit_expr(src, body, lcs2, body_fns, variants, lams, cls)
   let inits = emit_check_param_inits(params)
   let drops = emit_check_param_drops(params)
   concat_all([
@@ -14951,10 +14980,10 @@ fn check_decls(decls: [Decl]) : [Decl] =
   filter(decls, (d) => match d { DCheck(_, _, _, _, _) -> true _ -> false })
 
 fn emit_one_check(src: String, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
-                  id_d: DeclWithId) : String {
+                  target_origin: Option[String], id_d: DeclWithId) : String {
   match id_d {
     DWI(id, d) -> match d {
-      DCheck(desc_span, ps, body, _, _) -> emit_check_fn(src, id, desc_span, ps, body, lcs, fns, variants, lams, cls)
+      DCheck(desc_span, ps, body, _, _) -> emit_check_fn(src, id, desc_span, ps, body, lcs, fns, variants, lams, cls, target_origin)
       _ -> ""
     }
   }
@@ -14973,9 +15002,10 @@ fn number_checks_loop(decls: [Decl], id: Int, acc: [DeclWithId]) : [DeclWithId] 
 fn number_checks(decls: [Decl]) : [DeclWithId] =
   number_checks_loop(decls, 0, [])
 
-fn emit_all_checks(src: String, decls: [Decl], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+fn emit_all_checks(src: String, decls: [Decl], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
+                   target_origin: Option[String]) : String {
   let numbered = number_checks(decls)
-  concat_all(map(numbered, (dwi) => emit_one_check(src, lcs, fns, variants, lams, cls, dwi)))
+  concat_all(map(numbered, (dwi) => emit_one_check(src, lcs, fns, variants, lams, cls, target_origin, dwi)))
 }
 
 fn check_count(decls: [Decl]) : Int = list_length(check_decls(decls))
@@ -20453,7 +20483,7 @@ fn interp_part_to_expr(p: IPart, op_names: [String],
   }
 }
 
-fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, bench_mode: Bool, check_mode: Bool) : String {
+fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, bench_mode: Bool, check_mode: Bool, target_origin: Option[String]) : String {
   # m7a #6c: rewrite `Eff.op(args)` callees from `EField(EVar(Eff), op)`
   # to `EVar("Eff.op")` before code emission. The typer (synth_op_call_with_scheme)
   # produces this form internally, but check_infer is a diagnostic-only
@@ -20495,9 +20525,9 @@ fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, b
   let bodies = fn_bodies(src, decls, [], fns, variants, lams, cls)
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants, cls)
   let clause_bodies = emit_clause_bodies(src, clauses_info, [], fns, variants, lams, cls)
-  let tests = emit_all_tests(src, decls, [], fns, variants, lams, cls)
-  let benches = emit_all_benches(src, decls, [], fns, variants, lams, cls)
-  let checks = emit_all_checks(src, decls, [], fns, variants, lams, cls)
+  let tests = emit_all_tests(src, decls, [], fns, variants, lams, cls, target_origin)
+  let benches = emit_all_benches(src, decls, [], fns, variants, lams, cls, target_origin)
+  let checks = emit_all_checks(src, decls, [], fns, variants, lams, cls, target_origin)
   let main_wr = emit_main_wrapper(decls, test_mode, bench_mode, check_mode)
   concat_all([header, eff_structs, env_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
 }
@@ -47092,7 +47122,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   # `repeat`, etc. The body walk is bounded by the
                   # root file's AST (decls with mo == None).
                   let _ = report_ambig_efns(
-                    find_ambig_efns(register_fn_decls(typed_prog.decls)),
+                    find_ambig_efns(register_fn_decls(typed_prog.decls), Some(target_mod_name)),
                     collect_root_bare_callees(typed_prog.decls, []))
                   if typed_prog.errs != 0 { typed_prog.errs }
                   else if dispatch_errs != 0 { dispatch_errs }
@@ -47188,7 +47218,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                         let out = if use_llvm {
                           emit_program_llvm(path, src, perceus_decls, test_mode, bench_mode, check_mode)
                         } else {
-                          emit_program(path, src, perceus_decls, test_mode, bench_mode, check_mode)
+                          emit_program(path, src, perceus_decls, test_mode, bench_mode, check_mode, Some(target_mod_name))
                         }
                         print(out)
                         0
