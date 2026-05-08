@@ -38,8 +38,15 @@ propagates each subsystem's error through the implicit upcast.
 type T = A | B | C
 ```
 
-`|` always means union of types. The compiler resolves each
-component by **three rules**, in order:
+`|` always means union of types. **The rules below apply to the
+multi-component form** (two or more components separated by `|`).
+The single-component form `type Foo = T` (no `|`) is a *transparent
+type alias*: `Foo` and `T` are interchangeable in every type
+position. See `docs/kaikai-minimal.md` lines 194-195 and issue
+#376 for the alias contract.
+
+In the multi-component form, the compiler resolves each component
+by **three rules**, in order:
 
 1. **Pre-existing type** — if `A` is already declared as a type
    (sum, record, primitive, or another union), the union references
