@@ -112,7 +112,7 @@ read short (`xs |> map(f) |> filter(p)`). The aliases re-export
 | `stdlib/core/option.kai`|                10 |                    6 |                      4 | `opt_map`, `opt_filter`, `opt_zip` — typer EModCall (#219) collides with `list.{map,filter,zip}`; `opt_or` — `or` is a reserved keyword (`TkOr`) |
 | `stdlib/core/result.kai`|                12 |                    6 |                      6 | `result_map`, `result_and_then`, `result_unwrap_or`, `result_or_else`, `result_unwrap_or_else`, `result_collect` — all #219 collisions with `list` / `option` exports |
 | `stdlib/core/char.kai`  |                 8 |                    8 |                      0 | none — character-domain names are unique across `stdlib/core/`    |
-| `stdlib/core/tuple.kai` |               n/a |                  n/a |                    n/a | exports types only (`Pair`/`Triple`/`Quad`); no flat-named functions to migrate |
+| `stdlib/core/tuple.kai` |                 7 |                    7 |                      0 | helpers landed module-qualified only (`tuple.swap`, `tuple.map_fst`, `tuple.map_snd`, `tuple.map_pair`, `tuple.first`, `tuple.second`, `tuple.third`) — issue #348 |
 | `stdlib/core/io.kai`    |               n/a |                  n/a |                    n/a | exports a single `pub fn println`; already module-relative shape  |
 
 **Issue #219** (typer EModCall lookup is name-only) is the gating
@@ -265,7 +265,7 @@ land in each module's own spec when implemented.
 - `core.option` — is_some, is_none, map, and_then, unwrap_or, or_else
 - `core.result` — is_ok, is_err, map, map_err, and_then, unwrap_or
 - `core.char` — is_digit, is_alpha, is_alnum, is_space, to_lower, to_upper
-- `core.tuple` — swap, fst, snd for 2-tuples
+- `core.tuple` — `Pair`/`Triple`/`Quad` types; helpers `swap`, `map_fst`, `map_snd`, `map_pair` (Pair) and `first`/`second`/`third` (Triple) (shipped via #348). `fst`/`snd` projections are field-access only (`p.fst`) — see module header for the function-vs-field shadowing rationale.
 - `core.ordering` — `Ordering` type, chain, reverse
 
 ### collections (pure, stage 2)
