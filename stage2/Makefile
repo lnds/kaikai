@@ -3151,12 +3151,17 @@ test-tco-309: $(TARGET) build
 	  || { echo "tco-309 FAIL (no _kai_count_down_entry label in emitted C)"; exit 1; }; \
 	grep -F -q 'goto _kai_count_down_entry;' build/tco-309.c \
 	  || { echo "tco-309 FAIL (no goto _kai_count_down_entry in emitted C)"; exit 1; }; \
-	grep -F -q 'kai_decref(_scr); ({' build/tco-309.c \
-	  || { echo "tco-309 FAIL (no pre-goto kai_decref(_scr) injection in emitted C)"; exit 1; }; \
+	if grep -F -q 'int64_t _scr =' build/tco-309.c; then \
+	  : "Phase 3 unboxing — raw int64_t scrutinee carries no RC; pre-goto decref is unnecessary"; \
+	elif grep -F -q 'kai_decref(_scr); ({' build/tco-309.c; then \
+	  : "boxed scrutinee path — pre-goto _scr decref injected as before"; \
+	else \
+	  echo "tco-309 FAIL (boxed scrut without pre-goto kai_decref(_scr) injection)"; exit 1; \
+	fi; \
 	$(CC) $(CFLAGS) -I ../stage0 build/tco-309.c -o build/tco-309 $(LDLIBS_M) ; \
 	./build/tco-309 > build/tco-309.out; \
 	diff -q ../examples/tco/issue_309_countdown.out.expected build/tco-309.out > /dev/null \
-	  && echo "tco-309 OK (issue #309 match-arm tail sentinel; 1M iters; pre-goto _scr decref injected; leak closed)" \
+	  && echo "tco-309 OK (issue #309 match-arm tail sentinel; 1M iters; raw or boxed scrut path validated; leak closed)" \
 	  || { echo "tco-309 DIFF"; diff ../examples/tco/issue_309_countdown.out.expected build/tco-309.out; exit 1; }
 
 # Issue #89 — perceus-wrap TCO regression fixture. The
