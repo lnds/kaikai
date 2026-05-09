@@ -112,15 +112,18 @@ This is intentional. Chained subtyping makes inference brittle and
 diagnostics hard to phrase; the user writes the intermediate
 binding when composing across more than one layer.
 
-### Propagation into `match` arms
+### Propagation into `match` arms and `if/else` branches
 
-The upcast also fires inside `match` arms when the match's result
-type is constrained externally — the **annotated return type** of
-the enclosing function or the **annotation on a `let`** whose RHS
-is the match. The typer drives those positions in check-mode
-(`check_match`), so the expected union shape is in scope when each
-arm's body unifies. A narrower component-typed arm flows into the
-wider declared type without a `let` lift:
+The upcast also fires inside `match` arms — and, by the same rule,
+inside `if/else` branches — when the surrounding expression's
+result type is constrained externally. Both the **annotated return
+type** of the enclosing function and the **annotation on a `let`**
+whose RHS is a `match` or `if/else` are propagation sites. The
+typer drives those positions in check-mode (`check_match` for
+`EMatch`, `check_if` for `EIf`), so the expected union shape is in
+scope when each arm or branch body unifies. A narrower
+component-typed result flows into the wider declared type without a
+`let` lift:
 
 ```kai
 type ErrorA  = NoDefinida(String)
@@ -139,13 +142,30 @@ fn lookup(xs: [(String, Real)], k: String) : Result[ErrorAB, Real] =
   }
 ```
 
-Synthesise mode (`match` in unannotated position) is unchanged: the
-typer still infers the arm result bottom-up, and arms with
-genuinely incompatible synthesised types are still rejected. The
-bidirectional check is purely additive — it only fires when an
-expected type is in scope. Argument-position propagation
-(`f(match { ... })` where the parameter type is known) is out of
-scope for #379 and tracked separately.
+The same shape applies to `if/else`:
+
+```kai
+# Before #382: the typer pinned the if's result type from the `then`
+# branch (`Result[ErrorA, _]`), and the recursive call's
+# `Result[ErrorAB, Real]` failed to unify against it.
+# After #382: the annotated return type reaches both branches, so
+# `Result[ErrorA, _]` upcasts to `Result[ErrorAB, Real]` per D3.
+fn lookup(xs: [Real], i: Int) : Result[ErrorAB, Real] =
+  if i < 0 {
+    Err(NoDefinida("neg"))
+  } else {
+    lookup(xs, i - 1)
+  }
+```
+
+Synthesise mode (`match` or `if/else` in unannotated position) is
+unchanged: the typer still infers the result bottom-up, and arms /
+branches with genuinely incompatible synthesised types are still
+rejected. The bidirectional check is purely additive — it only
+fires when an expected type is in scope. Argument-position
+propagation (`f(match { ... })` or `f(if cond { ... } else { ... })`
+where the parameter type is known) is out of scope for #379 / #382
+and tracked separately.
 
 ## Pattern matching
 
