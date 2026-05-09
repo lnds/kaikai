@@ -84,6 +84,29 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.47.0 (2026-05-09)
+
+### BREAKING CHANGE
+
+- kai repl is removed. Programs that ran via kai repl
+must use kai run with a script file. kai watch is the closest
+"evaluate on every save" workflow.
+
+### Added
+
+- **tools**: kai-pkg CLI skeleton (init + show) (refs #405)
+- **stdlib**: toml decoder for package manifest subset (refs #405)
+- **emit**: Phase 3 unboxing for all primitives at call boundaries (closes #383)
+- **stdlib**: fx — currency conversion module (closes #365)
+
+### Fixed
+
+- **emit**: pipe + UFn callee emits raw args (closes #383 follow-up)
+
+### Changed
+
+- **emit**: skip redundant decref after __perceus_drop SExprStmt (refs #403)
+
 ## v0.46.0 (2026-05-09)
 
 ### BREAKING CHANGE
