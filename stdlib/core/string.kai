@@ -115,6 +115,114 @@ pub fn join(xs: [String], sep: String) : String {
   }
 }
 
+# --- issue #338: surface expansion (partial) -------------------------
+# Seven helpers below address the gap noted in #338 without
+# introducing new bare-name collisions across `core/*`.
+#
+# Five originally proposed helpers (`index_of`, `to_upper`,
+# `to_lower`, `is_empty`, `reverse`) are deliberately *not* in this
+# lane. Each collides with an existing core export under the same
+# bare name (`list.index_of`, `char.to_upper`/`to_lower`,
+# `list.is_empty`, `list.reverse`); `--include-prelude-tests` walks
+# every prelude's intrinsic test block, where bare-name resolution
+# at runtime cannot distinguish the colliding schemes (the typer's
+# first-arg-type narrowing per #235 stops resolving across modules
+# in that mode). Per the issue's "Notes for the implementer", such
+# collisions block the lane — they are deferred to #396 (after the
+# resolver fix lands, mirroring the #335 → #336 sequencing).
+#
+# Helpers shipped here are byte-indexed and ASCII-aware where it
+# matters. `pad_left`/`pad_right` count bytes, not Unicode code
+# points (kaikai strings are byte-indexed today).
+
+# `split(s, sep)` returns the list of pieces produced by cutting `s`
+# at every non-overlapping occurrence of `sep`. An empty separator
+# panics — the runtime's `string_split` would otherwise return the
+# whole string in a single-element list, which masks the caller's
+# bug. Trailing/leading empty pieces are preserved (`split(",a,",
+# ",")` → `["", "a", ""]`).
+pub fn split(s: String, sep: String) : [String] {
+  if string_length(sep) == 0 { panic("string.split: separator is empty") }
+  else { string_split(s, sep) }
+}
+
+# `replace(s, from, to)` rewrites every non-overlapping occurrence
+# of `from` with `to`. Replacing an empty `from` is a no-op (would
+# otherwise spin forever inserting `to` between every byte).
+pub fn replace(s: String, from: String, to: String) : String {
+  if string_length(from) == 0 { s }
+  else { join(split(s, from), to) }
+}
+
+# `pad_left(s, width, fill)` left-pads `s` with `fill` so the result
+# has at least `width` *bytes* (not Unicode code points — kaikai
+# strings are byte-indexed). When `length(s) >= width` the input is
+# returned unchanged.
+fn string_pad_loop(fill: String, k: Int, acc: String) : String {
+  if k <= 0 { acc }
+  else { string_pad_loop(fill, k - 1, string_concat(acc, fill)) }
+}
+
+pub fn pad_left(s: String, width: Int, fill: Char) : String {
+  let n = string_length(s)
+  if n >= width { s }
+  else { string_concat(string_pad_loop("#{fill}", width - n, ""), s) }
+}
+
+pub fn pad_right(s: String, width: Int, fill: Char) : String {
+  let n = string_length(s)
+  if n >= width { s }
+  else { string_concat(s, string_pad_loop("#{fill}", width - n, "")) }
+}
+
+# `lines(s)` splits on `'\n'` and drops a trailing empty entry when
+# `s` ends with a newline (so `"a\nb\n"` and `"a\nb"` both yield
+# `["a", "b"]`). Empty interior lines are preserved. `lines("")` is
+# the empty list — matches Python `"".splitlines()` and Rust
+# `"".lines()`, both of which yield no lines for an empty input.
+fn lines_drop_trailing_empty(xs: [String]) : [String] {
+  match xs {
+    [] -> []
+    [""] -> []
+    [x] -> [x]
+    [x, ...rest] -> [x, ...lines_drop_trailing_empty(rest)]
+  }
+}
+
+pub fn lines(s: String) : [String] = lines_drop_trailing_empty(string_split(s, "\n"))
+
+# `chars(s)` returns the list of bytes in `s` as `Char`s. The list
+# preserves source order. ASCII semantics — multibyte sequences are
+# split into their constituent bytes.
+fn string_chars_loop(s: String, i: Int, acc: [Char]) : [Char] {
+  if i < 0 { acc }
+  else {
+    match char_at(s, i) {
+      Some(c) -> string_chars_loop(s, i - 1, [c, ...acc])
+      None    -> string_chars_loop(s, i - 1, acc)
+    }
+  }
+}
+
+pub fn chars(s: String) : [Char] = string_chars_loop(s, string_length(s) - 1, [])
+
+# `is_blank(s)` is `true` for the empty string and for any string
+# whose bytes are all whitespace per the same rule used by `trim`
+# (`is_space(c) or c == '\n' or c == '\r' or c == '\t'`).
+fn string_is_blank_loop(s: String, i: Int, n: Int) : Bool {
+  if i >= n { true }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if is_space(c) or c == '\n' or c == '\r' or c == '\t' {
+                   string_is_blank_loop(s, i + 1, n)
+                 } else { false }
+      None -> true
+    }
+  }
+}
+
+pub fn is_blank(s: String) : Bool = string_is_blank_loop(s, 0, string_length(s))
+
 # Intrinsic tests (issue #170 phase 1b). Run with
 # `KAI_NO_STDLIB=1 bin/kai test stdlib/core/string.kai` — same
 # rationale as option/result: KAI_NO_STDLIB=1 prevents bin/kai from
@@ -158,4 +266,59 @@ test "join — empty list, singleton, multi, empty separator" {
   assert join(["a", "b", "c"], ",") == "a,b,c"
   assert join(["a", "b"], "") == "ab"
   assert join(["x", "y", "z"], " - ") == "x - y - z"
+}
+
+test "split — separator hits, leading/trailing/empty/no-match" {
+  assert split("a,b,c", ",") == ["a", "b", "c"]
+  assert split(",a,", ",") == ["", "a", ""]
+  assert split("hello", ",") == ["hello"]
+  assert split("", ",") == [""]
+  assert split("a::b::c", "::") == ["a", "b", "c"]
+}
+
+test "replace — multiple hits, no-op, empty from, into-empty" {
+  assert replace("hello world", "o", "0") == "hell0 w0rld"
+  assert replace("aaa", "a", "bb") == "bbbbbb"
+  assert replace("hello", "x", "y") == "hello"
+  assert replace("hello", "", "x") == "hello"
+  assert replace("a,b,c", ",", "") == "abc"
+}
+
+test "pad_left — short, exact, longer, empty input" {
+  assert pad_left("42", 5, '0') == "00042"
+  assert pad_left("hello", 5, ' ') == "hello"
+  assert pad_left("hello", 3, ' ') == "hello"
+  assert pad_left("", 3, '*') == "***"
+  assert pad_left("x", 4, '-') == "---x"
+}
+
+test "pad_right — short, exact, longer, empty input" {
+  assert pad_right("42", 5, '0') == "42000"
+  assert pad_right("hello", 5, ' ') == "hello"
+  assert pad_right("hello", 3, ' ') == "hello"
+  assert pad_right("", 3, '*') == "***"
+  assert pad_right("x", 4, '-') == "x---"
+}
+
+test "lines — basic, trailing newline, embedded blanks, empty" {
+  assert lines("a\nb\nc") == ["a", "b", "c"]
+  assert lines("a\nb\nc\n") == ["a", "b", "c"]
+  assert lines("a\n\nb") == ["a", "", "b"]
+  assert lines("") == []
+  assert lines("hello") == ["hello"]
+}
+
+test "chars — empty, single, multi" {
+  assert chars("") == []
+  assert chars("a") == ['a']
+  assert chars("abc") == ['a', 'b', 'c']
+  assert chars("ab\n") == ['a', 'b', '\n']
+}
+
+test "is_blank — empty/spaces/tabs/newlines true; with content false" {
+  assert is_blank("") == true
+  assert is_blank("   ") == true
+  assert is_blank("\t\n\r ") == true
+  assert is_blank("a") == false
+  assert is_blank("  a  ") == false
 }
