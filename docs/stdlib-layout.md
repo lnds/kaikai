@@ -213,6 +213,7 @@ stdlib/
     complex.kai  (shipped)
   decimal.kai    pure, stage 2 (top-level module — shipped)
   money.kai      pure, stage 2 (top-level module; depends on decimal — shipped)
+  fx.kai         pure, stage 2 (top-level module; depends on decimal + money — shipped via #365)
   loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever — shipped)
   reader.kai     effect: Reader[T] (top-level module: with_reader — shipped)
   writer.kai     effect: Writer[W] (top-level module: with_writer — shipped)
@@ -290,6 +291,19 @@ land in each module's own spec when implemented.
 
 - `money` — `Money[Currency]` with precision per currency, safe
   arithmetic (no implicit cross-currency ops); depends on `decimal`
+
+### fx (pure, stage 2 — shipped via #365)
+
+- `fx` — currency conversion on top of `Money` + `Decimal`. Carriers
+  `FxPair`, `FxRate`, `FxTable`, `FxTimestamp`. Operations:
+  `fx_pair`, `fx_rate_make`, `fx_rate_at`, `fx_table_empty`,
+  `fx_table_put`, `fx_lookup`, `fx_convert`. Composition wrappers:
+  `money_add_via_fx`, `money_sub_via_fx`, `money_cmp_via_fx`.
+  Inverse rates are NOT auto-derived (real-world bid/ask spreads
+  are asymmetric); callers register both directions explicitly or
+  derive an inverse via `dec_div`. v1 has no transitive lookup,
+  no rate aging, no live feed — those follow up in
+  `stdlib/fx-extras.kai` once a use case appears.
 
 ### array (pure, stage 2 — shipped via #366)
 
