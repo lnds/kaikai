@@ -61,7 +61,7 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 
 | Module                                  | Status                                                                                                                         |
 |-----------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
-| `fs/file`                               | shipped via PR #132 (84 LOC, 3 public fns: `file_read_file`, `file_write_file`, `file_append`); gaps tracked in #345           |
+| `fs/file`                               | shipped via PR #132 (3 public fns: `file_read_file`, `file_write_file`, `file_append`); minimum-viable extras shipped via #345 (`file_exists`, `file_delete`, `file_rename` as prelude builtins riding `File`); `metadata`/`read_bytes`/`write_bytes` deferred (need record type / `[Int]` byte-array conversion) |
 | `fs/dir`                                | doc-only stub committed; runtime primitives queued in #344 (no `pub fn` yet)                                                   |
 | `os/env`                                | shipped via PR #131 (partial) + PR #143 (close, closes #127); 4 public fns                                                     |
 | `os/args`                               | shipped via PR #131 + PR #143; 2 public fns (`args_argv`, `args_program_name`)                                                 |
@@ -85,7 +85,7 @@ What's still open (planned-but-not-shipped):
 | Module                          | Issue   | Notes                                                                                            |
 |---------------------------------|---------|--------------------------------------------------------------------------------------------------|
 | `fs/dir` runtime primitives     | #344    | `kai_prelude_dir_*` C bodies + prelude/typer wiring; `stdlib/fs/dir.kai` is a doc-only stub      |
-| `fs/file` extras                | #345    | `exists`, `delete`, `rename`, `metadata`, `read_bytes` — not in `stage0/runtime.h` yet           |
+| `fs/file` extras (M2)           | #345 follow-up | `metadata` (`FileMetadata` record + `stat(2)`), `read_bytes`/`write_bytes` (`[Int]` byte arrays). M1 (`file_exists`, `file_delete`, `file_rename`) shipped via #345 |
 | `net/udp`, `net/dns`            | (none)  | Tier S3 — no compiler builtin, no runtime handler, no module file                                |
 | `net/http` server-side          | n/a     | belongs **inside** `manutara`, not stdlib (Layout §`net`)                                        |
 
