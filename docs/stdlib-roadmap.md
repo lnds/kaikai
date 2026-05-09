@@ -72,6 +72,7 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `log` (stdlib minimal)                  | shipped via PR #145 (S2 #7, closes #141): 52 LOC, 4 public fns (`log_debug/info/warn/error`) over a default `Log` handler      |
 | `concurrent/nursery`                    | shipped — `pub fn nursery[T, e]` lives in `stdlib/spawn.kai:95` (top-level, not a `concurrent/` subdir)                        |
 | `math/real` libm bindings               | shipped via PR #359 (closes #343): sqrt, trig, exp/log, pow, atan2 over libm                                                   |
+| `encoding/json` Real numbers            | shipped (closes #361): decoder accepts decimals + scientific notation; new `JReal(Real)` variant alongside `JNum(Int)`         |
 
 What's still open (planned-but-not-shipped):
 
