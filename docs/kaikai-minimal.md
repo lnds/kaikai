@@ -599,9 +599,11 @@ Notes:
   with `and` / `or` needs explicit parentheses.
 - **Postfix chains associate left**: `a.b.c` = `(a.b).c`,
   `f(x)(y)` = `(f(x))(y)`.
-- **Full kaikai (stage 1+) extends level 8** with `|` (map pipe) at
-  the same precedence as `|>`, left-associative. A chain like
-  `xs | f |> g` parses as `(xs | f) |> g`.
+- **Full kaikai (stage 1+) extends level 8** with `|` (map pipe),
+  `||` (flat-map pipe), and `|?` (filter pipe) at the same
+  precedence as `|>`, all left-associative. A chain like
+  `xs | f |> g` parses as `(xs | f) |> g`; `xs |? p | f` parses
+  as `(xs |? p) | f`.
 
 The hand-written recursive-descent parser implements this with
 standard precedence climbing — each level is a function that parses
