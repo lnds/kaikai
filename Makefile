@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-fmt test-bench test-check demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-fmt test-bench test-check demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -17,7 +17,7 @@ bin/kai:
 	@chmod +x bin/kai
 	@echo "kai driver: $$(realpath bin/kai 2>/dev/null || pwd)/bin/kai"
 
-test: test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib
+test: test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup
 
 test-stage0:
 	$(MAKE) -C stage0 test
@@ -90,6 +90,27 @@ test-import-stdlib: kaic2
 	  || { echo "import_loop_basic DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
 	rm -f "$$out"; \
 	echo "import_loop_basic OK"
+
+# Issue #425 regression: importing a prelude-loaded module
+# (`encoding.toml`, `encoding.json`, `core.list`) must be a no-op
+# instead of producing duplicate `kai_<mod>__*` symbols in the C
+# output. Drives the fix end-to-end through `bin/kai run` so the
+# prelude wiring + the resolver dedup both participate.
+test-import-prelude-dedup: kaic2
+	@set -e; \
+	root=$$(pwd); \
+	kai="$$root/bin/kai"; \
+	for case in double_import_prelude_toml double_import_prelude_json double_import_prelude_list; do \
+	  src="$$root/examples/imports/$$case.kai"; \
+	  exp="$$root/examples/imports/$$case.out.expected"; \
+	  out=$$(mktemp); \
+	  "$$kai" run "$$src" > "$$out" \
+	    || { echo "$$case FAIL (kai run)"; rm -f "$$out"; exit 1; }; \
+	  diff -q "$$exp" "$$out" > /dev/null \
+	    || { echo "$$case DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
+	  rm -f "$$out"; \
+	  echo "$$case OK"; \
+	done
 
 # m12.8 Phase 3 — Core demo gate. Delegates to stage2's
 # `test-demos-core` which builds each demo under examples/portfolio/
