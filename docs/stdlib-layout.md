@@ -260,7 +260,7 @@ land in each module's own spec when implemented.
 
 ### core (pure, stage 1)
 
-- `core.list` — map, filter, foldl, foldr, foreach, length, reverse, nth, take, drop, zip, unzip, concat, any, all, find, index_of, sum, product
+- `core.list` — map, filter, foldl, foldr, foreach, length, reverse, nth, take, drop, zip, unzip, concat, any, all, find, index_of, sum, product; surface expansion (#340 — shipped): `last`, `init`, `partition`, `split_at`, `span`, `chunk`, `windows`, `intersperse`, `enumerate`, `zip3`, `scan`, `group_by`, `find_map`. `group_by` uses Erlang/Elixir consecutive-key semantics (NOT Haskell's all-equal-regardless-of-position) — the consecutive variant stays linear without an `Eq` map and is the v1 choice while generic free fns can't carry `: Eq` bounds.
 - `core.string` — starts_with, ends_with, trim, split, join, repeat, slice, length, to_lower, to_upper, replace, contains, chars
 - `core.option` — is_some, is_none, map, and_then, unwrap_or, or_else
 - `core.result` — is_ok, is_err, map, map_err, and_then, unwrap_or
