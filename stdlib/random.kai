@@ -1,38 +1,74 @@
 # stdlib/random.kai — sampling helpers built on top of the `Random`
-# effect (see Doc B §`Random`). Loaded after `stdlib/core/*.kai` by
-# the `kai` driver so `list_*` helpers are in scope. Pure full kaikai —
-# uses generic functions and effect rows; does NOT need to compile
-# under kaic1 (it never goes through the bootstrap path).
+# effect (see Doc B §`Random`). Loaded after `stdlib/core/*.kai` and
+# `stdlib/array.kai` by the `kai` driver so `list.*` helpers and the
+# `[T]`/`Array[T]` bridge are in scope. Pure full kaikai — uses
+# generic functions and effect rows; does NOT need to compile under
+# kaic1 (it never goes through the bootstrap path).
 #
-# Algorithm choice: selection-sampling Fisher-Yates. Picks one
-# element at random per step, removes it from the remainder, recurses.
-# O(n²) on list copies; for typical game-sized decks (52 cards or so)
-# the constant factor is dominated by the per-call PCG32 draw, not
-# the list traversals.
+# Algorithm choice: in-place Fisher-Yates over a locally-built
+# `Array[a]`. Bridges through `array_from_list` / `array_to_list`
+# from `stdlib/array.kai`. O(n) operations and one Array allocation
+# beyond the input/output lists. The previous selection-sampling
+# implementation cost O(n²) operations and O(n²) cons-cell
+# allocations and was removed in this lane (issue #366).
 
-# Drop the i-th element of `xs`. `i` outside `[0, length(xs))`
-# returns `xs` unchanged. Internal helper.
-fn list_remove_at(xs: [a], i: Int) : [a] = {
-  match xs {
-    [] -> []
-    [h, ...t] -> if i <= 0 { t } else { [h, ...list_remove_at(t, i - 1)] }
-  }
-}
+# Build the index list `[hi, hi - 1, ..., lo]` (descending from
+# `hi` to `lo`). Walked head-first by `list.foldl`, this drives the
+# canonical "from n-1 downto 1" Fisher-Yates swap loop with
+# `lo = 1`. Used a second time inside `shuffle` to walk the settled
+# Array back into a list with `lo = 0`: each `[a[k], ...acc]`
+# prepend on a descending `k` produces a list in original index
+# order. Tail-recursive in `acc`; the iteration walks ascending so
+# that successive `[cur, ...acc]` cons cells leave the result in
+# descending order at the end (`acc` reverses iteration order
+# under `[h, ...t]` accumulation). O(n) cons cells total.
+fn shuffle_indices(hi: Int, lo: Int) : [Int] =
+  shuffle_indices_loop(lo, hi, [])
+
+fn shuffle_indices_loop(cur: Int, hi: Int, acc: [Int]) : [Int] =
+  if cur > hi { acc } else { shuffle_indices_loop(cur + 1, hi, [cur, ...acc]) }
 
 # Random permutation of `xs`. The output has the same elements as the
 # input, in random order. Empty and singleton lists are returned
-# unchanged (the call to int_range is skipped).
+# unchanged (the call to int_range is skipped). The imperative inner
+# loop is masked at the function boundary: the `Array[a]` is built
+# locally via `array_from_list`, mutated only through `array_set`
+# call sites that the masking pass classifies as local-non-escaping
+# (issue #252), and consumed by `array_to_list` before returning. The
+# observable signature stays `[a] -> [a] / Random`.
 pub fn shuffle(xs: [a]) : [a] / Random = {
   match xs {
-    []  -> []
-    [_] -> xs
-    _   -> {
+    []        -> []
+    [_]       -> xs
+    [head, ...rest] -> {
+      # Build the carrier directly via `array_make` so the masking
+      # pass tags `a` as a local-construction binding (issue #252:
+      # only `let n = array_make(...)` qualifies, not a wrapper
+      # call). Filling and shuffling are then both `array_set`
+      # demands on `a`, which the pass classifies as local.
       let n = list_length(xs)
-      let i = Random.int_range(0, n)
-      match list.nth(xs, i) {
-        None    -> []
-        Some(x) -> [x, ...shuffle(list_remove_at(xs, i))]
-      }
+      let a = array_make(n, head)
+      let _ = list.foldl(xs, 0, (i, x) => {
+        a[i] := x
+        i + 1
+      })
+      let _ = list.foldl(shuffle_indices(n - 1, 1), 0, (_acc, i) => {
+        let j = Random.int_range(0, i + 1)
+        let tmp = a[i]
+        a[i] := a[j]
+        a[j] := tmp
+        _acc
+      })
+      # Walk `a` back to a list by index. Inlined rather than
+      # delegated to `stdlib/array.kai`'s `array_to_list` so the
+      # masking pass keeps `a` classified as local: any user-fn
+      # call with `a` in argument position would mark `a` as
+      # escaped (#251 v1 conservative scope). Both `list.foldl`
+      # (the higher-order traversal — `a` does not appear as a
+      # direct EVar arg, the lambda only captures it) and the
+      # lambda's `a[k]` (= `array_get`, whitelisted) are
+      # mask-friendly.
+      list.foldl(shuffle_indices(n - 1, 0), [], (acc, k) => [a[k], ...acc])
     }
   }
 }

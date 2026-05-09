@@ -226,6 +226,7 @@ stdlib/
     args.kai     (shipped via PR #131 + PR #143)
     process.kai  (shipped — closes #346; 4 public fns: `start`, `wait`, `kill`, `exit`)
   time.kai       effect: Clock (top-level module — shipped; default handler via PR #134)
+  array.kai      pure (Array[T] / [T] bridge — shipped via #366)
   random.kai     effect: Random (top-level module — shipped)
   random_secure.kai  effect: SecureRandom (top-level — shipped via PR #144, closes #140)
   log.kai        effect: Log (top-level module — shipped via PR #145, closes #141)
@@ -287,6 +288,31 @@ land in each module's own spec when implemented.
 
 - `money` — `Money[Currency]` with precision per currency, safe
   arithmetic (no implicit cross-currency ops); depends on `decimal`
+
+### array (pure, stage 2 — shipped via #366)
+
+Top-level module bridging the linked-list `[T]` carrier to the
+contiguous `Array[T]` carrier. The runtime ships `array_make`,
+`array_get`, `array_set`, `array_length`, `array_grow` plus the
+indexing sugars (`a[i]`, `a[i] := v`); this module fills the
+gap between the two carriers so consumers don't roll their own
+loops.
+
+- `array.from_list[a](xs: [a], default: a) : Array[a]` — copy a
+  linked list into a fresh Array. `default` is the runtime's
+  reified-element slot for `array_make`; for non-empty inputs it
+  is overwritten on the same pass.
+- `array.to_list[a](a: Array[a]) : [a]` — copy an Array into a
+  linked list in index order. Pure read; no `Mutable` demand.
+- `array.copy[a](src: Array[a], default: a) : Array[a]` — element
+  copy. Result is a distinct allocation; mutating either side
+  does not affect the other.
+
+The `default: a` thread is a v1 contract: `array_make(0, init)`
+needs an `init: T` to reify the element type even when `n == 0`,
+and an empty input list has no element to lift. The cleaner
+`[a : Default]` form waits for #341 Form 3 (free-fn tparam
+bounds with protocol dispatch).
 
 ### loop (row-polymorphic, stage 2)
 
@@ -364,7 +390,12 @@ security-sensitive code paths.
 
 - `random` — `int_range`, `float`, `bytes`, plus pure helpers
   (`shuffle`, `choice`, `sample`) built on top; the default
-  handler is seedable for tests
+  handler is seedable for tests. `shuffle` runs in-place
+  Fisher-Yates over a locally-built `Array[T]` (O(n), one Array
+  allocation beyond the input/output lists) — the previous
+  selection-sampling implementation cost O(n²) and was retired in
+  PR #366. The masking discipline keeps `shuffle`'s observable row
+  at `[T] -> [T] / Random`.
 - `random_secure` — `int`, `bytes`, cryptographic-grade primitives;
   not seedable
 
