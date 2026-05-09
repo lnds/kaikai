@@ -1087,6 +1087,41 @@ during type-check on the synthetic `let` annotation.
 - `examples/records/spread_pun_rejected.kai` — `{ ...p, x }`;
   rejected at parse time.
 
+## 11. Pipe family — `|`, `||`, `|?`
+
+In addition to the apply pipe `|>` (which threads its left operand
+into the *first argument position* of a call on the right), full
+kaikai (stage 1+) provides three single-token pipes that desugar
+to a known operation on the head type's declaring module.
+
+| Operator | Operation        | Desugar (head `[T]`)              | Issue |
+|----------|------------------|-----------------------------------|-------|
+| `\|`     | map pipe         | `list.map(xs, f)`                 | #201  |
+| `\|\|`   | flat-map pipe    | `list.flat_map(xs, f)`            | #201  |
+| `\|?`    | filter pipe      | `list.filter(xs, p)`              | #412  |
+
+All three are left-associative and share a single-token form (no
+whitespace between the bars or between `|` and `?`) so the parser
+sees one symbol at the operator slot. They sit at the same
+precedence as `|>` (level 8 in §*Precedence and associativity*),
+so `xs |? even | (n) => n * 2` parses as
+`(xs |? even) | ((n) => n * 2)`.
+
+The right-hand side accepts every lambda surface that `|` accepts:
+a bare name, a paren-form arrow (`(x) => body`), a block lambda
+(`{ x -> body }`), or a `.field` / `.method` placeholder (#385 /
+m7f §19) — `xs |? .active` desugars to
+`xs |? ((__pl) => __pl.active)`.
+
+Effects on the predicate are captured at the call site exactly as
+for `|` and `||`: a `Console`-effecting predicate makes the whole
+pipe expression carry `Console` in its inferred row.
+
+Constraint #1 from #201 still holds: `Option` and `Result` heads
+are rejected with a typed diagnostic pointing the user at `!` or
+`option.and_then` / `result.and_then` for explicit chaining. The
+pipes are list-shaped sugar, not a generic monadic chain.
+
 ## Cross-sugar interaction
 
 All five sugars compose without ambiguity because their grammar
