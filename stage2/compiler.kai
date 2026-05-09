@@ -1074,7 +1074,7 @@ fn row_at(xs: [Int], i: Int) : Int {
 fn row_head(xs: [Int]) : Int {
   match xs {
     [] -> 0
-    [h, ...rest] -> h
+    [h, ..._rest] -> h
   }
 }
 
@@ -1655,21 +1655,21 @@ fn eof_tok() : Token = Token { kind: TkEof, line: 0, col: 0, start: 0, length: 0
 
 fn p_peek(p: Parser) : Token {
   match p.rest {
-    [t, ...rs] -> t
+    [t, ..._rs] -> t
     [] -> eof_tok()
   }
 }
 
 fn p_peek1(p: Parser) : Token {
   match p.rest {
-    [_, t, ...rs] -> t
+    [_, t, ..._rs] -> t
     _ -> eof_tok()
   }
 }
 
 fn p_peek2(p: Parser) : Token {
   match p.rest {
-    [_, _, t, ...rs] -> t
+    [_, _, t, ..._rs] -> t
     _ -> eof_tok()
   }
 }
@@ -3474,7 +3474,7 @@ fn parse_record_lit(p: Parser, type_name: String, tname: Token) : PExpr {
     # may follow. The source is captured as the first FieldInit with
     # the `__spread__` sentinel name and resolved by
     # `dpr_record_lit` against the record's declared field list.
-    let dotsTok = p_peek(p1)
+    let _dotsTok = p_peek(p1)
     let p2 = p_skip_newlines(p_advance(p1))
     let r = parse_expr(p2)
     match r.r {
@@ -9898,7 +9898,7 @@ fn chk_stmt(e: Env, s: Stmt) : Env {
     # if a future debug mode skips the desugar, treat the binding like
     # `let` so the match stays exhaustive and follow-on resolution
     # still produces useful diagnostics.
-    SVar(name, _, rhs, line, col) -> {
+    SVar(name, _, rhs, _line, _col) -> {
       let e1 = chk_expr(e, rhs)
       env_add(e1, name)
     }
@@ -10396,7 +10396,7 @@ fn efn_resolve(fns: [EFn], target: String) : Option[EFn] {
   match candidates {
     []     -> None
     [one]  -> Some(one)
-    [first, ...rest] -> match efn_pick_root(candidates) {
+    [first, ..._rest] -> match efn_pick_root(candidates) {
                 Some(r) -> Some(r)
                 # Same-module preference: when several modules export
                 # the same name AND no root-file shadow exists, fall
@@ -10750,9 +10750,329 @@ fn walk_bare_callees_clauses(cs: [HClause], acc: [String]) : [String] = match cs
   }
 }
 
+# issue #381: warn on unused local `let` and pattern bindings.
+#
+# Policy (validated in the issue body):
+#   - Local `let name = …` whose `name` is never referenced inside its
+#     lexical scope: warn.
+#   - Pattern binding (e.g. `Some(v) -> body` without `v` in body): warn.
+#   - Function parameter unused: never warn (interface / protocol /
+#     contract with caller).
+#   - Any binder whose name starts with `_` (including `__`-prefixed
+#     compiler-internal names like `__cv_*`, `__pcs_ret`): never warn.
+#     `name_is_unused` already encodes the user-facing convention; we
+#     extend the silence to `__`-prefixed names here because every
+#     desugar that synthesises locals uses that namespace.
+#
+# The walker runs post-typer / pre-monomorphise (alongside
+# `report_ambig_efns`). Running pre-mono avoids duplicate diagnostics
+# from per-spec body copies; running post-typer means the AST has
+# already been resolved (no spurious "use" via alias names).
+#
+# Reference detection uses `fv_expr` with empty `own` and `globals`,
+# which yields the set of every free `EVar(name)` reachable from the
+# sub-AST modulo scope rules already encoded in `fv_stmts_scoped`
+# (so a re-binding of `name` inside the rest correctly shadows our
+# binder for refs after the shadow). This is over-approximating in
+# the conservative direction — when in doubt we mark the binding
+# *used*, not unused.
+
+fn diag_warning(file: String, line: Int, col: Int, msg: String) : Unit / Console {
+  eprint("warning: #{msg}")
+  eprint("  --> #{file}:#{int_to_string(line)}:#{int_to_string(col)}")
+  emit_source_caret(file, line, col)
+}
+
+fn name_is_silenced(name: String) : Bool {
+  # `_`-prefixed (including `__`-prefixed compiler-internal names) =
+  # intentionally unused. `name_is_unused` only matches `_x` (not
+  # `__x`); for diagnostics we silence the broader `_*` family.
+  match char_at(name, 0) {
+    Some(c0) -> c0 == '_'
+    None -> false
+  }
+}
+
+# Collect (name, line, col) triples for every binder a pattern
+# introduces. Uses the pattern's own line/col — for destructuring
+# patterns (`(x, y)`, `Some(v)`) all sub-binders share the outer
+# pattern's location, which is the closest stable anchor stage 1
+# preserves.
+type UBind = UB(String, Int, Int)
+
+fn pat_ubinds(pat: Pattern, acc: [UBind]) : [UBind] {
+  let line = pat.line
+  let col = pat.col
+  match pat.pkind {
+    PWild -> acc
+    PLit(_) -> acc
+    PBind(name) -> [UB(name, line, col), ...acc]
+    PList(pats, opt_rest) -> {
+      let acc1 = pat_ubinds_loop(pats, acc)
+      match opt_rest {
+        Some(rname) -> [UB(rname, line, col), ...acc1]
+        None -> acc1
+      }
+    }
+    PVariant(_, subs) -> pat_ubinds_loop(subs, acc)
+    PVariantRecord(_, fields) -> pfield_ubinds_loop(fields, acc)
+    PRecord(fields) -> pfield_ubinds_loop(fields, acc)
+    PHole(_) -> acc
+    PAs(name, sub) -> pat_ubinds(sub, [UB(name, line, col), ...acc])
+    PNarrow(name, _) -> [UB(name, line, col), ...acc]
+  }
+}
+
+fn pat_ubinds_loop(ps: [Pattern], acc: [UBind]) : [UBind] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> pat_ubinds_loop(rest, pat_ubinds(p, acc))
+  }
+}
+
+fn pfield_ubinds_loop(fs: [PField], acc: [UBind]) : [UBind] {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      PField(_, sub, _) -> pfield_ubinds_loop(rest, pat_ubinds(sub, acc))
+    }
+  }
+}
+
+fn report_unused_ubinds(file: String, ubs: [UBind], refs: [String]) : Unit / Console {
+  match ubs {
+    [] -> ()
+    [u, ...rest] -> match u {
+      UB(name, line, col) -> {
+        if name_is_silenced(name) { () }
+        else if list_has(refs, name) { () }
+        else {
+          diag_warning(file, line, col,
+            concat_all(["unused binding `", name, "`"]))
+          diag_help("prefix with `_` to mark as intentionally unused")
+        }
+        report_unused_ubinds(file, rest, refs)
+      }
+    }
+  }
+}
+
+# Walk a decl looking for unused local bindings. Skips parameter
+# names entirely — interface compliance, protocol dispatch, and
+# axiom signatures all justify silent unused params.
+fn report_unused_in_decls(file: String, decls: [Decl]) : Unit / Console {
+  match decls {
+    [] -> ()
+    [d, ...rest] -> {
+      report_unused_in_decl(file, d)
+      report_unused_in_decls(file, rest)
+    }
+  }
+}
+
+fn report_unused_in_decl(file: String, d: Decl) : Unit / Console {
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, mo) -> match mo {
+      None    -> report_unused_in_expr(file, body)
+      Some(_) -> ()
+    }
+    DTest(_, body, _, _)        -> report_unused_in_expr(file, body)
+    DBench(_, body, _, _)       -> report_unused_in_expr(file, body)
+    DCheck(_, _, body, _, _)    -> report_unused_in_expr(file, body)
+    _ -> ()
+  }
+}
+
+fn report_unused_in_expr(file: String, e: Expr) : Unit / Console {
+  match e.kind {
+    EInt(_) -> ()
+    EReal(_) -> ()
+    EBool(_) -> ()
+    EChar(_) -> ()
+    EStr(_, _) -> ()
+    EUnit -> ()
+    EVar(_) -> ()
+    EUnder -> ()
+    EPlaceholder -> ()
+    EHole(_) -> ()
+    ETodo(_) -> ()
+    EVariantsOf(_, _) -> ()
+    EModCall(_, _) -> ()
+    ECall(f, xs) -> {
+      report_unused_in_expr(file, f)
+      report_unused_in_exprs(file, xs)
+    }
+    EField(base, _) -> report_unused_in_expr(file, base)
+    EIndex(a, b) -> {
+      report_unused_in_expr(file, a)
+      report_unused_in_expr(file, b)
+    }
+    EBinop(_, a, b) -> {
+      report_unused_in_expr(file, a)
+      report_unused_in_expr(file, b)
+    }
+    EUnop(_, x) -> report_unused_in_expr(file, x)
+    EIf(c, t, eo) -> {
+      report_unused_in_expr(file, c)
+      report_unused_in_expr(file, t)
+      match eo { Some(b) -> report_unused_in_expr(file, b) None -> () }
+    }
+    EMatch(scr, arms) -> {
+      report_unused_in_expr(file, scr)
+      report_unused_in_arms(file, arms)
+    }
+    ELambda(_, body) -> report_unused_in_expr(file, body)
+    ERecordLit(_, fs) -> report_unused_in_field_inits(file, fs)
+    EList(els) -> report_unused_in_list_elems(file, els)
+    ERange(a, b, opt) -> {
+      report_unused_in_expr(file, a)
+      report_unused_in_expr(file, b)
+      match opt { Some(s) -> report_unused_in_expr(file, s) None -> () }
+    }
+    EBlock(stmts, tail) -> report_unused_in_block(file, stmts, tail)
+    EPipe(a, b) -> {
+      report_unused_in_expr(file, a)
+      report_unused_in_expr(file, b)
+    }
+    EMapPipe(a, b) -> {
+      report_unused_in_expr(file, a)
+      report_unused_in_expr(file, b)
+    }
+    EFlatMapPipe(a, b) -> {
+      report_unused_in_expr(file, a)
+      report_unused_in_expr(file, b)
+    }
+    EBang(inner) -> report_unused_in_expr(file, inner)
+    ELitUnit(inner, _) -> report_unused_in_expr(file, inner)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      report_unused_in_expr(file, body)
+      match init_opt { Some(i) -> report_unused_in_expr(file, i) None -> () }
+      report_unused_in_hclauses(file, clauses)
+      match ret_opt {
+        Some(r) -> match r { HR(_, b, _, _) -> report_unused_in_expr(file, b) }
+        None -> ()
+      }
+    }
+  }
+}
+
+fn report_unused_in_exprs(file: String, es: [Expr]) : Unit / Console {
+  match es {
+    [] -> ()
+    [h, ...rest] -> {
+      report_unused_in_expr(file, h)
+      report_unused_in_exprs(file, rest)
+    }
+  }
+}
+
+fn report_unused_in_arms(file: String, arms: [Arm]) : Unit / Console {
+  match arms {
+    [] -> ()
+    [a, ...rest] -> match a {
+      Arm(pat, opt_g, body) -> {
+        # An arm's pattern binders are visible in the (optional)
+        # guard and the body. Collect references from both, then
+        # warn on any binder absent from the union.
+        let ubs = pat_ubinds(pat, [])
+        let refs0 = match opt_g {
+          Some(g) -> fv_expr(g, [], [], [])
+          None    -> []
+        }
+        let refs = fv_expr(body, [], [], refs0)
+        report_unused_ubinds(file, ubs, refs)
+        match opt_g { Some(g) -> report_unused_in_expr(file, g) None -> () }
+        report_unused_in_expr(file, body)
+        report_unused_in_arms(file, rest)
+      }
+    }
+  }
+}
+
+fn report_unused_in_field_inits(file: String, fs: [FieldInit]) : Unit / Console {
+  match fs {
+    [] -> ()
+    [f, ...rest] -> match f {
+      FI(_, e) -> {
+        report_unused_in_expr(file, e)
+        report_unused_in_field_inits(file, rest)
+      }
+    }
+  }
+}
+
+fn report_unused_in_list_elems(file: String, els: [ListElem]) : Unit / Console {
+  match els {
+    [] -> ()
+    [el, ...rest] -> {
+      match el {
+        ElPlain(e)  -> report_unused_in_expr(file, e)
+        ElSpread(e) -> report_unused_in_expr(file, e)
+      }
+      report_unused_in_list_elems(file, rest)
+    }
+  }
+}
+
+fn report_unused_in_hclauses(file: String, cs: [HClause]) : Unit / Console {
+  match cs {
+    [] -> ()
+    [c, ...rest] -> match c {
+      HC(_, _, body, _, _) -> {
+        report_unused_in_expr(file, body)
+        report_unused_in_hclauses(file, rest)
+      }
+    }
+  }
+}
+
+# Walk a block in source order. For each `SLet(pat, _, rhs)`:
+#   1. Recurse into `rhs` (its body cannot reference the pattern's
+#      binders — they aren't in scope yet).
+#   2. Compute the set of free names referenced in the rest of the
+#      block (subsequent stmts + optional tail). `fv_stmts_scoped`
+#      respects shadowing — a later `SLet` of the same name kicks
+#      that name out of `acc` for refs after the shadow point.
+#   3. Warn on any pat-binder absent from that ref set.
+fn report_unused_in_block(file: String, stmts: [Stmt], tail: Option[Expr]) : Unit / Console {
+  match stmts {
+    [] -> match tail {
+      Some(t) -> report_unused_in_expr(file, t)
+      None    -> ()
+    }
+    [s, ...rest] -> {
+      match s {
+        SLet(pat, _, rhs) -> {
+          report_unused_in_expr(file, rhs)
+          let ubs = pat_ubinds(pat, [])
+          let rest_refs = fv_stmts(rest, [], [], [])
+          let refs = match tail {
+            Some(t) -> fv_expr(t, [], [], rest_refs)
+            None    -> rest_refs
+          }
+          report_unused_ubinds(file, ubs, refs)
+        }
+        SVar(_, _, rhs, _, _) -> report_unused_in_expr(file, rhs)
+        SAssert(c, opt_m) -> {
+          report_unused_in_expr(file, c)
+          match opt_m { Some(m) -> report_unused_in_expr(file, m) None -> () }
+        }
+        SExprStmt(x) -> report_unused_in_expr(file, x)
+        SIndexAssign(b, i, v, _, _) -> {
+          report_unused_in_expr(file, b)
+          report_unused_in_expr(file, i)
+          report_unused_in_expr(file, v)
+        }
+        SUse(_, _, _) -> ()
+      }
+      report_unused_in_block(file, rest, tail)
+    }
+  }
+}
+
 fn list_head_or(xs: [String], fallback: String) : String = match xs {
   [] -> fallback
-  [h, ...rest] -> h
+  [h, ..._rest] -> h
 }
 
 fn builtin_variants() : [EVar] =
@@ -15207,7 +15527,7 @@ fn bench_call_list(n: Int, i: Int) : String {
 # lands in v1.x and v2.
 fn check_arbitrary_for_ty(ty: TypeExpr) : String {
   match ty.tkind {
-    TyName(name, args) -> {
+    TyName(name, _args) -> {
       if name == "Int" { "kai_arbitrary_int()" }
       else if name == "Bool" { "kai_arbitrary_bool()" }
       else if name == "Char" { "kai_arbitrary_char()" }
@@ -16944,7 +17264,7 @@ fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: [RecInfo], file: String, err
       let rfis = dpr_fields(fis, recs, file, errs)
       let is_spread = match rfis.fields {
         [] -> false
-        [f0, ...rest_] -> match f0 { FI(nm0, _) -> is_spread_field_marker(nm0) }
+        [f0, ..._rest_] -> match f0 { FI(nm0, _) -> is_spread_field_marker(nm0) }
       }
       if is_spread {
         let r = dpr_record_spread(name, rfis.fields, line, col, recs, file, rfis.errs)
@@ -17101,7 +17421,7 @@ fn dpr_opt_ret(or_: Option[HReturn], recs: [RecInfo], file: String, errs: Int) :
 fn dpr_record_lit(name: String, fis: [FieldInit], line: Int, col: Int, recs: [RecInfo], file: String, errs: Int) : DPRFields / Console {
   let is_pos = match fis {
     [] -> false
-    [f, ...rest] -> match f { FI(nm, _) -> is_pos_field_marker(nm) }
+    [f, ..._rest] -> match f { FI(nm, _) -> is_pos_field_marker(nm) }
   }
   if not is_pos {
     DPRFields { fields: fis, errs: errs }
@@ -17206,7 +17526,7 @@ fn dpr_record_spread(
                 # field-by-field check instead.
                 let ann_opt = match tparams {
                   []           -> Some(mk_ty(TyName(name, []), line, col))
-                  [_, ...rest] -> None
+                  [_, ..._rest] -> None
                 }
                 let bind_stmt = SLet(bind_pat, ann_opt, src)
                 let var_ref = mk_expr(EVar(var_name), line, col)
@@ -18820,7 +19140,7 @@ fn specialise_kind(name: String, slot_name: String, k: ExprKind, line: Int, col:
             # `name.set(v)`: emit `{ let _ = array_set(slot, 0, v); () }`
             # so the result type stays Unit (matches the canonical clause).
             let v = match args_ {
-              [a, ...ignore] -> specialise_body(name, slot_name, a)
+              [a, ..._ignore] -> specialise_body(name, slot_name, a)
               [] -> mk_expr(EUnit, line, col)
             }
             let set_call = mk_expr(
@@ -19079,7 +19399,7 @@ fn use_rewrite_kind(k: ExprKind, table: [EffOps], opens: [String],
       }
     }
     _ -> {
-      let st = UseRw { expr: mk_expr(k, line, col), errs: errs }
+      let _st = UseRw { expr: mk_expr(k, line, col), errs: errs }
       let rk = map_expr_kind(k, (sub) => sub)   # placeholder to avoid recursion
       let _ = rk
       let mapped = use_rewrite_kind_default(k, table, opens, bound, file,
@@ -20488,7 +20808,7 @@ fn check_brand_consume(op_name: String, args_: [Expr], expected_bid: Int,
                         brs: [BrandRec], errs: Int) : Int / Console {
   if op_name == "await" or op_name == "cancel" {
     match args_ {
-      [arg, ...other_args] -> match expr_brand(arg, env, calls) {
+      [arg, ..._other_args] -> match expr_brand(arg, env, calls) {
         Some(found) ->
           if found == expected_bid { errs }
           else {
@@ -20502,7 +20822,7 @@ fn check_brand_consume(op_name: String, args_: [Expr], expected_bid: Int,
     }
   } else if op_name == "select" {
     match args_ {
-      [arg, ...other_args] -> match arg.kind {
+      [arg, ..._other_args] -> match arg.kind {
         EList(els) -> check_brand_select_elems(els, expected_bid, env, file, calls, brs, errs)
         _ -> match expr_brand(arg, env, calls) {
           Some(found) ->
@@ -22050,7 +22370,7 @@ fn mangle_ty(t: Ty) : String {
     TyCon(cname, tas) -> {
       match tas {
         [] -> cname
-        [h, ...rest] -> concat_all([cname, "_O_",
+        [_h, ..._rest] -> concat_all([cname, "_O_",
                                     join_with(map(tas, mangle_ty), "_"),
                                     "_C"])
       }
@@ -22086,7 +22406,7 @@ fn mangle_ty(t: Ty) : String {
 fn mangle_name(name: String, tys: [Ty], units: [UnitExprT]) : String {
   let ty_part = match tys {
     [] -> ""
-    [h, ...rest] -> concat_all(["__mono__", join_with(map(tys, mangle_ty), "__")])
+    [_h, ..._rest] -> concat_all(["__mono__", join_with(map(tys, mangle_ty), "__")])
   }
   # m4c Phase 3: encode the unit-tparam tuple after the type-tparam
   # tuple. Empty units means no per-unit specialisation (the common
@@ -22097,7 +22417,7 @@ fn mangle_name(name: String, tys: [Ty], units: [UnitExprT]) : String {
   # agree on the suffix string.
   let u_part = match units {
     [] -> ""
-    [h, ...rest] -> concat_all(["__umono__", join_with(map(units, mangle_unit), "__")])
+    [_h, ..._rest] -> concat_all(["__umono__", join_with(map(units, mangle_unit), "__")])
   }
   if string_length(ty_part) == 0 and string_length(u_part) == 0 {
     name
@@ -22982,7 +23302,7 @@ fn append_ints(a: [Int], b: [Int]) : [Int] {
 
 fn scheme_of_variant(type_name: String, tparams: [String], v: Variant) : TyScheme {
   match v {
-    Var(ctor_name, vargs) -> {
+    Var(_ctor_name, vargs) -> {
       let binds = mk_tpbinds(tparams)
       let ids = tparam_ids(tparams)
       let arg_tys = map(vargs, (a) => resolve_ty_with_tparams(a, binds))
@@ -24554,7 +24874,7 @@ fn union_dedup_sorted(ts: [Ty]) : [Ty] {
     [] -> []
     [h, ...rest] -> match rest {
       [] -> [h]
-      [n, ...trail] -> {
+      [n, ..._trail] -> {
         if ty_eq(h, n) { union_dedup_sorted(rest) }
         else { [h, ...union_dedup_sorted(rest)] }
       }
@@ -25748,14 +26068,14 @@ fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console 
   match fnd_comps {
     [] -> match fnd_parents {
       [] -> ()
-      [p, ...rest] -> diag_note("`#{fnd_name}` is a component of `#{p}`")
+      [p, ..._rest] -> diag_note("`#{fnd_name}` is a component of `#{p}`")
     }
     _ -> diag_note("union: `#{fnd_name}` = #{join_with(fnd_comps, " | ")}")
   }
   match exp_comps {
     [] -> ()
     _ -> match fnd_parents {
-      [p, ...rest] -> {
+      [p, ..._rest] -> {
         if list_has(exp_comps, p) {
           # The expected union already lists the found's parent — so
           # the failure is the no-chains rule (D3 does not transit
@@ -28686,7 +29006,7 @@ fn rhs_is_local_array_origin(k: ExprKind, local_so_far: [String]) : Bool {
         if name == "array_make" { true }
         else if (name == "array_set" or name == "array_grow") {
           match args_ {
-            [first, ...ignore] -> match first.kind {
+            [first, ..._ignore] -> match first.kind {
               EVar(n) -> list_has(local_so_far, n)
               _       -> false
             }
@@ -28964,7 +29284,7 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
 fn demand_is_local(args_: [Expr], locals: [String], escaped: [String],
                    params: [String]) : Bool {
   match args_ {
-    [first, ...ignore] -> match first.kind {
+    [first, ..._ignore] -> match first.kind {
       EVar(n) ->
         # Parameter mutation is observable by definition. Even if the
         # name happens to alias a local-construction binding (which
@@ -39669,14 +39989,14 @@ fn llvm_emit_binop(e: LlvmEmit, op: String, l: Expr, r: Expr) : LlvmEmit / Conso
 fn llvm_emit_short_circuit(e: LlvmEmit, op: String, l: Expr, r: Expr) : LlvmEmit {
   let el = llvm_emit_expr(e, l)
   let lhs_val = el.last_val
-  let lhs_end_label = el.cur_label
+  let _lhs_end_label = el.cur_label
   let tri = llvm_fresh_reg(el)
   let tr_instr = concat_all(["  ", tri.reg, " = call i32 @kaix_truthy(%KaiValue* ", lhs_val, ")\n"])
   let e1 = llvm_append_body(tri.e, tr_instr)
   let cond = llvm_fresh_reg(e1)
   let cond_instr = concat_all(["  ", cond.reg, " = icmp ne i32 ", tri.reg, ", 0\n"])
   let e2 = llvm_append_body(cond.e, cond_instr)
-  let lhs_end_after_cond = e2.cur_label
+  let _lhs_end_after_cond = e2.cur_label
   let rhs_lbl  = llvm_fresh_label(e2, "sc.rhs.")
   let skip_lbl = llvm_fresh_label(rhs_lbl.e, "sc.skip.")
   let end_lbl  = llvm_fresh_label(skip_lbl.e, "sc.end.")
@@ -44960,7 +45280,7 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, file: String,
         else {
           match args_ {
             [] -> errs
-            [self_arg, ...rest_args] -> match self_arg.ty {
+            [self_arg, ..._rest_args] -> match self_arg.ty {
               None -> errs
               Some(ty) -> match ty_head_name(ty) {
                 None -> errs
@@ -46033,7 +46353,7 @@ fn fmt_decls(decls: [Decl], s: FmtSt, first: Bool) : FmtSt {
 fn decls_trailing_limit(d: Decl, rest: [Decl]) : Int {
   match rest {
     [] -> decl_line(d) + 1
-    [next, ...tail] -> decl_line(next)
+    [next, ..._tail] -> decl_line(next)
   }
 }
 
@@ -46815,7 +47135,7 @@ fn stmts_trailing_limit(st: Stmt, rest: [Stmt], last_limit: Int) : Int {
     } else {
       stmt_line(st) + 1
     }
-    [next, ...tail] -> stmt_line(next)
+    [next, ..._tail] -> stmt_line(next)
   }
 }
 
@@ -47403,7 +47723,7 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   # to inject is the union of every fn's declared row, not just
   # main's. Helper fns that declare `: Unit / Console` need Console
   # as a known effect even when main doesn't mention it.
-  let used_row = collect_used_row_labels(decls)
+  let _used_row = collect_used_row_labels(decls)
   # m12.8 Phase 4b: Stdout / Stderr / Stdin are atomic DEffect
   # builtins; Console is the alias `Stdout + Stderr + Stdin` (per
   # stdlib/effects.kai's pinned catalog). User-declared aliases
@@ -48557,6 +48877,12 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   let _ = report_ambig_efns(
                     find_ambig_efns(register_fn_decls(typed_prog.decls), Some(target_mod_name)),
                     collect_root_bare_callees(typed_prog.decls, []))
+                  # issue #381: warn on unused local `let` and pattern
+                  # bindings in the root file's decls. Scoped to root
+                  # decls (mo == None) by `report_unused_in_decl` so
+                  # prelude code can keep its own conventions. Warnings
+                  # only — they never fail compilation.
+                  report_unused_in_decls(path, typed_prog.decls)
                   if typed_prog.errs != 0 { typed_prog.errs }
                   else if dispatch_errs != 0 { dispatch_errs }
                   else if inv_errs != 0 { inv_errs }
