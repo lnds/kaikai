@@ -43458,9 +43458,17 @@ type ExpandedProgram = EP_Mod([Decl], [ModuleEntry])
 # decl list with every (transitively-)imported module's decls
 # prepended in topological order and with every DImport stripped,
 # plus the module table for the qualified-call resolver.
-fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl]) : ExpandedProgram {
+#
+# Issue #425: `prelude_paths` carries the absolute paths of every
+# `--prelude` file already merged into the program. Pre-seeding the
+# resolver's `visited` set with those paths makes any user `import X`
+# whose resolved file matches a prelude entry a no-op, instead of
+# concatenating the same module a second time and producing a
+# duplicate-symbol C output (`import encoding.toml` against the
+# prelude-loaded `stdlib/encoding/toml.kai` was the trigger).
+fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl], prelude_paths: [String]) : ExpandedProgram {
   let base_dir = dir_of(root_path)
-  let rs0 = ResolveState { visited: [root_path], decls: [], modules: [] }
+  let rs0 = ResolveState { visited: [root_path, ...prelude_paths], decls: [], modules: [] }
   let rs1 = process_imports(base_dir, root_decls, search_paths, rs0)
   let all_decls = list_append(rs1.decls, non_import_decls(root_decls))
   EP_Mod(all_decls, rs1.modules)
@@ -43500,6 +43508,17 @@ fn mt_lookup(mt: [ModuleEntry], name: String) : Option[ModuleEntry] {
 
 fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
   ME(_, exports, _) -> list_has(exports, fn_name)
+}
+
+# Issue #425: collect the absolute origin path of every ModuleEntry
+# in `mes`. Used to pre-seed the import resolver's `visited` set with
+# the paths of every `--prelude` file so a user `import` of the same
+# module is a no-op instead of a duplicate-symbol link error.
+fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String] = match mes {
+  [] -> list_reverse(acc)
+  [me, ...rest] -> match me {
+    ME(_, _, origin) -> collect_module_origins(rest, [origin, ...acc])
+  }
 }
 
 # m14 v1: per-module legacy prefix overrides. Most stdlib core
@@ -49829,7 +49848,12 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # rqc_decls then walks every body and rewrites
             # `EField(EVar(mod), fn)` to `EModCall(mod, fn)` when
             # `mod` is in the module table and not shadowed locally.
-            let expanded = expand_imports(path, search_paths, own_decls_no_holes)
+            # Issue #425: prelude-module paths feed into the
+            # resolver's `visited` set so `import encoding.toml`
+            # (or any other prelude-loaded module) does not load the
+            # same file twice.
+            let prelude_paths = collect_module_origins(prelude_mods, [])
+            let expanded = expand_imports(path, search_paths, own_decls_no_holes, prelude_paths)
             let expanded_decls_raw = match expanded { EP_Mod(ds, _) -> ds }
             # Issue #230: register the target file itself in the module
             # table under its own basename, mirroring what `load_prelude`
