@@ -73,6 +73,17 @@ Naming conventions enforced by `kai fmt` and the resolver:
   effects, units of measure.
 - `_` alone is the wildcard pattern token (`UNDERSCORE`), not an
   identifier.
+- `_name` (leading underscore on an identifier) — convention for
+  *intentionally unused* local bindings. The typer warns on any
+  unused `let` or pattern binding (issue #381) and silences the
+  warning when the name starts with `_`. Function parameters never
+  warn regardless of name (interface compliance, protocol dispatch,
+  contract with caller).
+- `__name` (double underscore prefix) — reserved for compiler-
+  internal synthetics produced by desugars (`__cv_*` from m12.6
+  const-pattern desugar, `__pcs_ret` from Perceus, etc.). User code
+  should avoid this prefix; it is also silenced by the unused-
+  binding check.
 - `kai_*` is reserved for the runtime / FFI shim layer.
 - `Self` is reserved inside protocol declarations as the implicit
   self-type parameter.
