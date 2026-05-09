@@ -527,6 +527,284 @@ pub fn unzip(xs: [Pair[a, b]]) : Pair[[a], [b]] =
   unzip_loop(xs, [], [])
 
 # ===================================================================
+# Surface expansion — issue #340.
+# ===================================================================
+# Standard helpers commonly missing from the v1 surface. Each walks
+# `xs` once with a tail-recursive accumulator (where applicable);
+# none introduce new effects, all are pure data transforms.
+
+# Returns `Some(last)` for a non-empty list, `None` for `[]`.
+# Symmetric to `head`. O(n) — must walk to the end.
+pub fn last(xs: [a]) : Option[a] {
+  match xs {
+    [] -> None
+    [h, ...t] -> match t {
+      [] -> Some(h)
+      _  -> last(t)
+    }
+  }
+}
+
+# Tail-recursive worker for `init`. `acc` carries the already-seen
+# prefix (everything except `prev`) in reverse cons order; `prev`
+# holds the candidate-last element. When the tail empties out,
+# `prev` is the last element and `acc` reversed is the answer.
+fn init_loop(prev: a, xs: [a], acc: [a]) : [a] {
+  match xs {
+    [] -> reverse(acc)
+    [h, ...t] -> init_loop(h, t, [prev, ...acc])
+  }
+}
+
+# Returns `Some(prefix)` of everything but the last element for a
+# non-empty list, `None` for `[]`. Symmetric to `tail`: preserves the
+# empty-vs-non-empty distinction. O(n) — must traverse to detect the
+# last element.
+pub fn init(xs: [a]) : Option[[a]] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(init_loop(h, t, []))
+  }
+}
+
+# Tail-recursive worker for `partition`. `yes` and `no` carry the
+# matched / unmatched elements in reverse cons order; both are
+# reversed at the call site so the result preserves input order.
+fn partition_loop(xs: [a], p: (a) -> Bool, yes: [a], no: [a]) : Pair[[a], [a]] {
+  match xs {
+    [] -> Pair { fst: reverse(yes), snd: reverse(no) }
+    [h, ...t] -> if p(h) { partition_loop(t, p, [h, ...yes], no) }
+                 else    { partition_loop(t, p, yes, [h, ...no]) }
+  }
+}
+
+# Splits `xs` into (matched, rest): `fst` is the elements
+# satisfying `p`, `snd` is the rest. Both preserve input order
+# (Haskell / Elixir convention). `p` is invoked exactly once per
+# element. Empty input yields `Pair { fst: [], snd: [] }`.
+pub fn partition(xs: [a], p: (a) -> Bool) : Pair[[a], [a]] =
+  partition_loop(xs, p, [], [])
+
+# Tail-recursive worker for `split_at`. `taken` carries the prefix
+# in reverse cons order until the count is exhausted; the remaining
+# list becomes `snd` as-is (sharing structure with the input).
+fn split_at_loop(xs: [a], n: Int, taken: [a]) : Pair[[a], [a]] {
+  if n <= 0 { Pair { fst: reverse(taken), snd: xs } }
+  else {
+    match xs {
+      [] -> Pair { fst: reverse(taken), snd: [] }
+      [h, ...t] -> split_at_loop(t, n - 1, [h, ...taken])
+    }
+  }
+}
+
+# Splits `xs` at index `n`: `fst` is the first `n` elements
+# (truncated to the list length), `snd` is the rest. Equivalent to
+# `Pair { fst: take(xs, n), snd: drop(xs, n) }` but walks the list
+# only once. `n <= 0` yields `Pair { fst: [], snd: xs }`.
+pub fn split_at(xs: [a], n: Int) : Pair[[a], [a]] =
+  split_at_loop(xs, n, [])
+
+# Tail-recursive worker for `span`. `taken` carries the satisfying
+# prefix in reverse cons order; once `p(h)` is false the remaining
+# list becomes `snd` as-is.
+fn span_loop(xs: [a], p: (a) -> Bool, taken: [a]) : Pair[[a], [a]] {
+  match xs {
+    [] -> Pair { fst: reverse(taken), snd: [] }
+    [h, ...t] -> if p(h) { span_loop(t, p, [h, ...taken]) }
+                 else    { Pair { fst: reverse(taken), snd: xs } }
+  }
+}
+
+# Splits `xs` at the first element that fails `p`: `fst` is the
+# longest `p`-satisfying prefix, `snd` is the rest (including the
+# first failure, if any). Equivalent to
+# `Pair { fst: take_while(xs, p), snd: drop_while(xs, p) }` but
+# walks the list only once. `p` is invoked at most
+# `length(prefix) + 1` times.
+pub fn span(xs: [a], p: (a) -> Bool) : Pair[[a], [a]] =
+  span_loop(xs, p, [])
+
+# Tail-recursive worker for `chunk`. Pulls `n` elements off `xs`
+# via `split_at`, accumulates the chunk in reverse, recurses on
+# the remainder. `out` carries the already-emitted chunks in
+# reverse cons order.
+fn chunk_loop(xs: [a], n: Int, out: [[a]]) : [[a]] {
+  match xs {
+    [] -> reverse(out)
+    _  -> {
+      let parts = split_at(xs, n)
+      chunk_loop(parts.snd, n, [parts.fst, ...out])
+    }
+  }
+}
+
+# Splits `xs` into fixed-size blocks of length `n`. The last chunk
+# is shorter when `length(xs) % n != 0`. `n <= 0` yields `[]`
+# (no useful partitioning is possible). `n > length(xs)` yields
+# `[xs]`. Empty input yields `[]`.
+pub fn chunk(xs: [a], n: Int) : [[a]] {
+  if n <= 0 { [] }
+  else {
+    match xs {
+      [] -> []
+      _  -> chunk_loop(xs, n, [])
+    }
+  }
+}
+
+# Tail-recursive worker for `windows`. Each iteration takes the
+# first `n` elements and recurses on `tail(xs)`. Stops when the
+# remaining list is shorter than `n` (the next `take` would
+# truncate, which is not the windows contract).
+fn windows_loop(xs: [a], n: Int, out: [[a]]) : [[a]] {
+  if length(xs) < n { reverse(out) }
+  else {
+    match xs {
+      [] -> reverse(out)
+      [_, ...t] -> windows_loop(t, n, [take(xs, n), ...out])
+    }
+  }
+}
+
+# Sliding windows of size `n` over `xs`, in order. Each window
+# overlaps the previous by `n - 1` elements. `n <= 0` yields `[]`;
+# `length(xs) < n` yields `[]` (no full window fits, matching
+# Rust's `slice::windows`). Cost is O(n * (length(xs) - n + 1))
+# because each window allocates a fresh prefix.
+pub fn windows(xs: [a], n: Int) : [[a]] {
+  if n <= 0 { [] }
+  else { windows_loop(xs, n, []) }
+}
+
+# Tail-recursive worker for `intersperse`. After the first element
+# is emitted, every subsequent element is preceded by `sep`. The
+# output is built in reverse cons order in `out` and reversed at
+# the call site.
+fn intersperse_loop(xs: [a], sep: a, out: [a]) : [a] {
+  match xs {
+    [] -> reverse(out)
+    [h, ...t] -> intersperse_loop(t, sep, [h, sep, ...out])
+  }
+}
+
+# Inserts `sep` between consecutive elements of `xs`. Empty list
+# yields `[]`; singleton yields the singleton (no separator
+# emitted). Mirrors `string.join` for arbitrary list elements.
+pub fn intersperse(xs: [a], sep: a) : [a] {
+  match xs {
+    [] -> []
+    [h, ...t] -> intersperse_loop(t, sep, [h])
+  }
+}
+
+# Tail-recursive worker for `enumerate`. Walks `xs` while emitting
+# `Pair(i, x)` for each element; `out` accumulates the result in
+# reverse cons order.
+fn enumerate_loop(xs: [a], i: Int, out: [Pair[Int, a]]) : [Pair[Int, a]] {
+  match xs {
+    [] -> reverse(out)
+    [h, ...t] -> enumerate_loop(t, i + 1, [Pair { fst: i, snd: h }, ...out])
+  }
+}
+
+# Pairs each element of `xs` with its 0-based index. Equivalent to
+# `map_indexed(xs, (i, x) => Pair { fst: i, snd: x })` but reads
+# better at call sites (Python / Rust convention).
+pub fn enumerate(xs: [a]) : [Pair[Int, a]] = enumerate_loop(xs, 0, [])
+
+# Element-wise triple of `xs`, `ys`, `zs`. Truncates to the shortest
+# input (matches `zip`'s convention). The leftover suffix of any
+# longer input is discarded silently.
+pub fn zip3(xs: [a], ys: [b], zs: [c]) : [Triple[a, b, c]] {
+  match xs {
+    [] -> []
+    [hx, ...tx] -> match ys {
+      [] -> []
+      [hy, ...ty] -> match zs {
+        [] -> []
+        [hz, ...tz] -> [Triple { fst: hx, snd: hy, trd: hz }, ...zip3(tx, ty, tz)]
+      }
+    }
+  }
+}
+
+# Tail-recursive worker for `scan`. `acc` is the running fold state;
+# `out` carries the already-emitted intermediates in reverse cons
+# order. The seed `init` is included as the first element of the
+# output (Haskell convention) so `length(scan(xs, init, f))` is
+# `length(xs) + 1`.
+fn scan_loop(xs: [a], acc: r, f: (r, a) -> r, out: [r]) : [r] {
+  match xs {
+    [] -> reverse(out)
+    [h, ...t] -> {
+      let next = f(acc, h)
+      scan_loop(t, next, f, [next, ...out])
+    }
+  }
+}
+
+# Left fold that retains every intermediate accumulator value.
+# Output starts with `init` followed by each successive `f(acc, x)`.
+# `length(scan(xs, init, f))` is `length(xs) + 1`. `f` is invoked
+# exactly once per element. `examples/phase4/collatz.kai:18` had a
+# local copy of this shape — issue #340 promotes it to the stdlib.
+pub fn scan(xs: [a], init: r, f: (r, a) -> r) : [r] =
+  scan_loop(xs, init, f, [init])
+
+# Tail-recursive worker for `group_by`. `cur_key` and `cur` track
+# the in-progress group's key and accumulated elements (reversed);
+# `out` is the list of completed groups (also reversed). When the
+# next element's key differs from `cur_key`, the current group is
+# closed (reversed and pushed onto `out`) and a new group is opened.
+fn group_by_loop(xs: [a], key: (a) -> Int, cur_key: Int, cur: [a], out: [[a]]) : [[a]] {
+  match xs {
+    [] -> reverse([reverse(cur), ...out])
+    [h, ...t] -> {
+      let k = key(h)
+      if k == cur_key {
+        group_by_loop(t, key, cur_key, [h, ...cur], out)
+      } else {
+        group_by_loop(t, key, k, [h], [reverse(cur), ...out])
+      }
+    }
+  }
+}
+
+# Groups *consecutive* elements of `xs` that share the same `key`.
+# Erlang / Elixir semantics, NOT Haskell's `Data.List.groupBy`
+# (which clusters all keys regardless of position). Choosing
+# consecutive-only keeps the implementation linear and avoids the
+# need for an `Eq` map. Empty input yields `[]`. `key` is invoked
+# exactly once per element.
+#
+# Key type is `Int` for v1 because generic free fns can't carry
+# `: Eq` bounds yet (same dispatch limit that pins `uniq` to
+# `[Int]`). Callers projecting to a non-Int key should hash to
+# `Int` themselves.
+pub fn group_by(xs: [a], key: (a) -> Int) : [[a]] {
+  match xs {
+    [] -> []
+    [h, ...t] -> group_by_loop(t, key, key(h), [h], [])
+  }
+}
+
+# Maps `f` over `xs` and returns the first `Some` result, short-
+# circuiting. `None` is returned only when every element produces
+# `None` (or `xs` is empty). `f` is invoked at most `length(xs)`
+# times. Rust convention; the standard "find + transform in one
+# pass" shape.
+pub fn find_map(xs: [a], f: (a) -> Option[b]) : Option[b] {
+  match xs {
+    [] -> None
+    [h, ...t] -> match f(h) {
+      Some(y) -> Some(y)
+      None    -> find_map(t, f)
+    }
+  }
+}
+
+# ===================================================================
 # Intrinsic tests (issue #170 phase 1c).
 # ===================================================================
 # Same shape as the option/result/string/char/tuple coverage that
@@ -635,4 +913,131 @@ test "sort_by — custom comparator, descending order" {
   assert sort_by([1, 3, 2], (a, b) => b - a) == [3, 2, 1]
   assert sort_by([], (a, b) => a - b) == []
   assert sort_by([5, 5, 5], int_cmp) == [5, 5, 5]
+}
+
+# Issue #340 — surface expansion intrinsic tests.
+
+test "last — empty, single, multi" {
+  assert last([]) == None
+  assert last([42]) == Some(42)
+  assert last([1, 2, 3]) == Some(3)
+}
+
+test "init — empty, single, multi" {
+  assert init([]) == None
+  assert init([42]) == Some([])
+  assert init([1, 2, 3]) == Some([1, 2])
+  assert init([1, 2, 3, 4]) == Some([1, 2, 3])
+}
+
+test "partition — predicate splits in order" {
+  let p = partition([1, 2, 3, 4, 5], (x) => x % 2 == 0)
+  assert p.fst == [2, 4]
+  assert p.snd == [1, 3, 5]
+  let q = partition([], (x) => x > 0)
+  assert q.fst == []
+  assert q.snd == []
+  let r = partition([1, 2, 3], (x) => x > 100)
+  assert r.fst == []
+  assert r.snd == [1, 2, 3]
+}
+
+test "split_at — within, at boundary, beyond" {
+  let p = split_at([1, 2, 3, 4, 5], 2)
+  assert p.fst == [1, 2]
+  assert p.snd == [3, 4, 5]
+  let q = split_at([1, 2, 3], 0)
+  assert q.fst == []
+  assert q.snd == [1, 2, 3]
+  let r = split_at([1, 2, 3], 10)
+  assert r.fst == [1, 2, 3]
+  assert r.snd == []
+  let s = split_at([], 5)
+  assert s.fst == []
+  assert s.snd == []
+  let t = split_at([1, 2, 3], 0 - 1)
+  assert t.fst == []
+  assert t.snd == [1, 2, 3]
+}
+
+test "span — splits at first failure" {
+  let p = span([1, 2, 3, 4, 5], (x) => x < 3)
+  assert p.fst == [1, 2]
+  assert p.snd == [3, 4, 5]
+  let q = span([1, 2, 3], (x) => x < 100)
+  assert q.fst == [1, 2, 3]
+  assert q.snd == []
+  let r = span([1, 2, 3], (x) => x > 100)
+  assert r.fst == []
+  assert r.snd == [1, 2, 3]
+  let s = span([], (x) => x > 0)
+  assert s.fst == []
+  assert s.snd == []
+}
+
+test "chunk — fixed-size blocks, last chunk shorter" {
+  assert chunk([1, 2, 3, 4, 5, 6], 2) == [[1, 2], [3, 4], [5, 6]]
+  assert chunk([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]
+  assert chunk([1, 2, 3], 5) == [[1, 2, 3]]
+  assert chunk([], 3) == []
+  assert chunk([1, 2, 3], 0) == []
+  assert chunk([1, 2, 3], 0 - 1) == []
+}
+
+test "windows — sliding views of size n" {
+  assert windows([1, 2, 3, 4], 2) == [[1, 2], [2, 3], [3, 4]]
+  assert windows([1, 2, 3, 4], 3) == [[1, 2, 3], [2, 3, 4]]
+  assert windows([1, 2, 3], 4) == []
+  assert windows([1, 2, 3], 3) == [[1, 2, 3]]
+  assert windows([], 2) == []
+  assert windows([1, 2, 3], 0) == []
+}
+
+test "intersperse — sep between elements only" {
+  assert intersperse([1, 2, 3], 0) == [1, 0, 2, 0, 3]
+  assert intersperse([42], 0) == [42]
+  assert intersperse([], 0) == []
+  assert intersperse([1, 2], 99) == [1, 99, 2]
+}
+
+test "enumerate — pairs each element with its index" {
+  assert enumerate(["a", "b", "c"]) == [Pair { fst: 0, snd: "a" },
+                                          Pair { fst: 1, snd: "b" },
+                                          Pair { fst: 2, snd: "c" }]
+  assert enumerate([]) == []
+  assert enumerate([10]) == [Pair { fst: 0, snd: 10 }]
+}
+
+test "zip3 — truncates to shortest" {
+  assert zip3([1, 2, 3], [10, 20, 30], [100, 200, 300]) ==
+         [Triple { fst: 1, snd: 10, trd: 100 },
+          Triple { fst: 2, snd: 20, trd: 200 },
+          Triple { fst: 3, snd: 30, trd: 300 }]
+  assert zip3([1, 2], [10, 20, 30], [100, 200, 300]) ==
+         [Triple { fst: 1, snd: 10, trd: 100 },
+          Triple { fst: 2, snd: 20, trd: 200 }]
+  assert zip3([1, 2, 3], [], [100, 200]) == []
+  assert zip3([], [10], [100]) == []
+}
+
+test "scan — retains intermediates including init" {
+  assert scan([1, 2, 3, 4], 0, (acc, x) => acc + x) == [0, 1, 3, 6, 10]
+  assert scan([], 7, (acc, x) => acc + x) == [7]
+  assert scan([5], 10, (acc, x) => acc * x) == [10, 50]
+}
+
+test "group_by — clusters consecutive equal keys" {
+  assert group_by([1, 1, 2, 2, 2, 3, 1, 1], (x) => x) ==
+         [[1, 1], [2, 2, 2], [3], [1, 1]]
+  assert group_by([], (x) => x) == []
+  assert group_by([7], (x) => x) == [[7]]
+  assert group_by([1, 2, 3], (x) => 0) == [[1, 2, 3]]
+  assert group_by([1, 3, 5, 2, 4, 7], (x) => x % 2) == [[1, 3, 5], [2, 4], [7]]
+}
+
+test "find_map — first Some wins, all None yields None" {
+  assert find_map([1, 2, 3, 4], (x) => if x > 2 { Some(x * 10) } else { None }) == Some(30)
+  assert find_map([1, 2, 3], (x) => if x > 100 { Some(x) } else { None }) == None
+  assert find_map([], (x) => Some(x)) == None
+  assert find_map([1, 2, 3], (x) => Some(x + 100)) == Some(101)
 }
