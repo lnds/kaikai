@@ -24,7 +24,7 @@ MVP in progress.
   `docs/effects.md`, `docs/effects-stdlib.md`,
   `docs/effects-impl.md`, and `docs/syntax-sugars.md`. Fibers,
   actors, and the structured-concurrency runtime ship in m8;
-  the LLVM IR backend, `kai fmt` / `kai repl` / `kai lsp`, and
+  the LLVM IR backend, `kai fmt` / `kai lsp`, and
   the `Map[K, V]` / `Vector[T]` collection family are
   scheduled later milestones — see `docs/stage2-design.md`
   §Milestones for the full list, and `docs/design.md` for the

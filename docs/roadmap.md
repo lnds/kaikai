@@ -27,7 +27,7 @@ horizon beyond.
     #175 (stdlib polymorphic impls Show/Eq/Ord/Hash for
     [T]/Option/Result), #258 (Default protocol + 6 impls).
     These are prerequisites for the remaining Anga Roa scope
-    (LSP, REPL, m11 diagnostics quality, bench v1.x, check
+    (LSP, m11 diagnostics quality, bench v1.x, check
     shrinking, reuse-in-place, `check` v2 Arbitrary).
   - **Distribution**: macOS arm64 tarball + GH Actions release
     pipeline shipped at `0.39.0` (PR #278); private brew tap
@@ -39,7 +39,7 @@ horizon beyond.
 - **Inner-loop perf**: ~2.0× C reference under -O2 on
   compute-bound code (post Real unboxing in 0.27.0). Target
   trajectory bifurcates at Anga Roa by workload class
-  (see DoD #4 below): compute-bound code → ≤ 1.5–2× C in-MVP;
+  (see DoD #3 below): compute-bound code → ≤ 1.5–2× C in-MVP;
   structural data traversal → ≤ 5–10× C in-MVP, ≤ 2× post-MVP
   via Phase 3. Orongo: near-C on compute-bound with multi-thread
   + Tier 3b unboxed messages.
@@ -199,13 +199,15 @@ precondition chain (see *Status snapshot*); the remaining scope
 below tracks against issues #86 (m12.6 diagnostics quality —
 title was "m11 diagnostics" pre-rename), #210 (variant + record
 reuse-in-place — closed 2026-05-06), and #264 (canonical
-grammar.md, closed 2026-05-06). LSP and REPL **do not have
-tracking issues** as of 2026-05-08; the previous citations of
-#92 and #120 were ghost references (#92 is `R6 — TCO precise
+grammar.md, closed 2026-05-06). LSP **does not have a tracking
+issue** as of 2026-05-09; the previous citations of #92 and
+#120 were ghost references (#92 is `R6 — TCO precise
 per-call-site dropmask`, closed; #120 is `Perceus: opt-in
 regions for parser/lexer scratch buffers`, open) and have been
-removed. Open tracking issues for LSP / REPL when those lanes
-actually start.
+removed. Open a tracking issue for LSP when that lane actually
+starts. **REPL is removed from v1.0** — see #406 and
+`docs/decisions/repl-removal-2026-05-09.md`; it may return as a
+post-1.0 ergonomic, not as a v1 deliverable.
 
 **Scope — precondition work (landed early, 2026-05-03 → 2026-05-05)**:
 
@@ -238,9 +240,6 @@ polymorphic-impl machinery.
   on hover, completions, go-to-definition, diagnostics push,
   symbol renaming. Reuses the typed-hole + diagnostic JSON
   surface.
-- `kai repl` — interactive eval loop. Persists scope across
-  expressions; honours effect handlers; integrates with
-  `kai test` for in-REPL test execution.
 - `bench` v1.x — median + MAD outlier detection,
   configurable iteration count.
 - `check` v1.x — shrinking. Per-type halving for `Int`,
@@ -250,32 +249,30 @@ polymorphic-impl machinery.
   consumed cells when alias analysis can prove the old value
   is dead at the construction site. Big win on linked-list
   rewrites (`map`, `filter`, `fold`-into-list). Closes the
-  compute-bound side of DoD #4 (gate 4a) and contributes to
-  gate 4b on structural-data traversal.
+  compute-bound side of DoD #3 (gate 3a) and contributes to
+  gate 3b on structural-data traversal.
   *(Optimization thread for this milestone.)*
 
 **Definition of Done**:
 
 1. Editor with `kai lsp` running shows type on hover, completes
    record fields, surfaces diagnostics inline.
-2. `kai repl` round-trips a non-trivial session (define fn,
-   call it, observe effect).
-3. Property test runner reports the minimal counterexample
+2. Property test runner reports the minimal counterexample
    (post-shrink) on failure.
-4. **Performance, bifurcated by workload class.** Both gates
+3. **Performance, bifurcated by workload class.** Both gates
    below are required for Anga Roa to close. The split reflects
    the architecture: kaikai represents locals unboxed and storage
    edges boxed; a single performance target cannot honestly cover
    both unless they share a representation.
 
-   4a. **Compute-bound code** (locals + return values, in scope
+   3a. **Compute-bound code** (locals + return values, in scope
        of Phase 2 unboxing): ≤ 1.5–2× C reference under -O2.
        Acceptance benchmarks: fizzbuzz
        (`examples/quickstart/02_fizzbuzz.kai`), euler problems,
        sieve. Phase 2 already landed (M1+M2+M3); gate is
        achievable in-MVP.
 
-   4b. **Structural data traversal** (records, variants,
+   3b. **Structural data traversal** (records, variants,
        recursive tree algorithms with mutation-as-rebuild):
        ≤ 5–10× C reference under -O2 in-MVP, with a roadmap to
        ≤ 2× post-MVP via Phase 3 (field unboxing + reuse-in-place
@@ -290,9 +287,9 @@ polymorphic-impl machinery.
    gap. Locals-unboxed/storage-edges-boxed split formalised in
    `docs/unboxing-phase2-design.md`. Issue #350 (RC discipline in
    tail-recursive helpers) closed via PR #368 and contributes to
-   gate 4b: post-#368 RB tree has leaked 21.96M → 3.58M (−83.7%),
+   gate 3b: post-#368 RB tree has leaked 21.96M → 3.58M (−83.7%),
    live_peak −80.2%, RSS 1929 MB → 325 MB. **v1 status
-   (2026-05-09):** gate 4b is **explicitly v1.0-trajectory, not
+   (2026-05-09):** gate 3b is **explicitly v1.0-trajectory, not
    v0.45.0**. Empirical lane on #371 (closed not-planned) showed
    the dup chain has three accumulating sources, not one as the
    original Phase A diagnosis assumed; full fix needs #383
