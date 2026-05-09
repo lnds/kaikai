@@ -342,3 +342,44 @@ Estimate envelope: **5.5–7 days**, matching the Tier 2.5 pin.
   Phase 1. Cache + unbox are complementary: cache wipes the
   cost of boxing back at boundaries; unbox wipes the boxing
   inside the loop.
+
+## Phase 3 follow-up — call boundaries unboxed (issue #383, landed 2026-05-09)
+
+This document's non-goal #1 (*unboxed function signatures*) was
+the Phase 3 follow-up. The lane closing PR for **issue #383**
+lifts that restriction for fns whose params + return are in
+{Int, Bool, Char, Real} concretely:
+
+- A new `UFnSig` payload on `EFn` records the unboxed signature
+  classification at registry construction time.
+- `classify_unbox_sig` excludes generics, FFI shims, fns with a
+  declared effect row, fns whose body installs a runtime handler
+  (`var x = init` desugar, op calls, EHandle), top-level `main`,
+  and any signature with a non-primitive ty.
+- `unbox_decl` seeds the body's `LocBind` env with each param
+  marked `MUnboxed` for classified fns; `decide_mode_aware`
+  promotes ECall to `MUnboxed` when the callee resolves to a
+  UFn entry, and EIf / single-tail EBlock follow.
+- Codegen mints `static int64_t kai_<name>(int64_t kair_<p>, ...)`
+  signatures, raw call sites at all UFn-targeted ECall expressions,
+  and adapts the closure thunk + tcrec self-tail-call sentinel
+  to the raw calling convention. Perceus skips dup/drop emission
+  for UFn bodies (raw scalars carry no RC).
+
+After Phase 3, `fib(35)` and Euler #4 run at ~1× C native — see
+`docs/benchmarks/compute_2026-05-09.md` for the full table. The
+remaining gap on the RB-tree / variant-heavy benchmarks is
+issue #384 (variant reuse-in-place), which Phase 3 deliberately
+does not touch.
+
+Fixtures (under `examples/perceus/phase3/`):
+
+- `fib35_bench.kai` + companion `_c.c` — main perf benchmark.
+- `euler4_bench.kai` + companion `_c.c` — secondary perf bench.
+- `unbox_signature_int.kai` — Int param + Int return shape.
+- `unbox_signature_real.kai` — Real param + Real return.
+- `unbox_signature_bool.kai` — Bool predicate.
+- `unbox_signature_char.kai` — Char dispatch through a match.
+- `unbox_signature_mixed.kai` — mixed Int/Bool/Real signature.
+- `unbox_signature_generic_kept.kai` — generic fn stays boxed.
+- `unbox_signature_protocol.kai` — protocol method stays boxed.

@@ -10369,14 +10369,28 @@ fn join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 # load_prelude). Codegen reads the field to mint `kai_<m>__<name>`
 # vs `kai_<name>`, and to disambiguate two-modules-export-same-name
 # at bare-name call sites.
-type EFn  = EFn(String, Int, Option[String])
+#
+# Phase 3 unboxing (issue #383): the fourth slot is the unboxed-
+# signature classification. `None` means the classical
+# `static KaiValue *kai_<name>(KaiValue *...)` calling convention.
+# `Some(US([Ty], Ty))` means the fn was classified by `unbox_classify`
+# as taking + returning raw C scalars (`int64_t` / `double` /
+# `int` / `uint32_t`); the emitter mints a raw signature, EVar reads
+# of the fn's parameters resolve to `kair_<name>`, and call sites
+# emit raw arguments via `emit_expr_raw`. The classifier requires
+# every param ty + return ty to be in {Int, Bool, Char, Real}
+# (concretely; not parametric T), no FFI shim, no protocol-impl
+# child, no effect row, no closure parameters. See
+# `unbox_classify_decl`.
+type UFnSig = US([Ty], Ty)
+type EFn  = EFn(String, Int, Option[String], Option[UFnSig])
 type EVar = EV(String, Int)
 
 fn efn_find(fns: [EFn], target: String) : Option[EFn] {
   match fns {
     [] -> None
     [h, ...rest] -> match h {
-      EFn(n, _, _) -> if n == target { Some(h) } else { efn_find(rest, target) }
+      EFn(n, _, _, _) -> if n == target { Some(h) } else { efn_find(rest, target) }
     }
   }
 }
@@ -10430,7 +10444,7 @@ fn fns_filter_same_module(fns: [EFn], m: String, acc: [EFn]) : [EFn] {
   match fns {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
-      EFn(_, _, Some(em)) ->
+      EFn(_, _, Some(em), _) ->
         if em == m { fns_filter_same_module(rest, m, [h, ...acc]) }
         else       { fns_filter_same_module(rest, m, acc) }
       _ -> fns_filter_same_module(rest, m, acc)
@@ -10442,7 +10456,7 @@ fn fns_filter_other_module(fns: [EFn], m: String, acc: [EFn]) : [EFn] {
   match fns {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
-      EFn(_, _, Some(em)) ->
+      EFn(_, _, Some(em), _) ->
         if em == m { fns_filter_other_module(rest, m, acc) }
         else       { fns_filter_other_module(rest, m, [h, ...acc]) }
       _ -> fns_filter_other_module(rest, m, [h, ...acc])
@@ -10454,7 +10468,7 @@ fn efn_collect_matching(fns: [EFn], target: String, acc: [EFn]) : [EFn] {
   match fns {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
-      EFn(n, _, _) ->
+      EFn(n, _, _, _) ->
         if n == target { efn_collect_matching(rest, target, [h, ...acc]) }
         else           { efn_collect_matching(rest, target, acc) }
     }
@@ -10465,7 +10479,7 @@ fn efn_pick_root(cands: [EFn]) : Option[EFn] {
   match cands {
     [] -> None
     [h, ...rest] -> match h {
-      EFn(_, _, None) -> Some(h)
+      EFn(_, _, None, _) -> Some(h)
       _ -> efn_pick_root(rest)
     }
   }
@@ -10474,8 +10488,8 @@ fn efn_pick_root(cands: [EFn]) : Option[EFn] {
 # m6.2 v2: arity helper that wraps the new resolver. Codegen call
 # sites that previously consumed `Option[Int]` keep working unchanged.
 fn efn_find_arity(fns: [EFn], target: String) : Option[Int] = match efn_resolve(fns, target) {
-  Some(EFn(_, ar, _)) -> Some(ar)
-  None                -> None
+  Some(EFn(_, ar, _, _)) -> Some(ar)
+  None                   -> None
 }
 
 # m6.2 v2: produce the C-symbol suffix (everything after the `kai_`
@@ -10493,8 +10507,8 @@ fn c_sym(name: String, mo: Option[String]) : String = match mo {
 # the callee is a closure variable held in a local that gets routed
 # through `kai_apply` instead).
 fn c_sym_of_callee(fns: [EFn], callee: String) : String = match efn_resolve(fns, callee) {
-  Some(EFn(_, _, mo)) -> c_sym(callee, mo)
-  None                -> callee
+  Some(EFn(_, _, mo, _)) -> c_sym(callee, mo)
+  None                   -> callee
 }
 
 fn evar_find(vs: [EVar], target: String) : Option[Int] {
@@ -10508,8 +10522,182 @@ fn evar_find(vs: [EVar], target: String) : Option[Int] {
 
 fn fn_of_decl(d: Decl) : Option[EFn] {
   match d {
-    DFn(_, name, _, params, _, _, _, _, _, mo) -> Some(EFn(name, list_length(params), mo))
+    DFn(_, name, tparams, params, opt_ret, row, body, _, _, mo) ->
+      Some(EFn(name, list_length(params), mo, classify_unbox_sig(name, mo, tparams, params, opt_ret, row, body)))
     _ -> None
+  }
+}
+
+# Phase 3 unboxing (issue #383): classify a top-level DFn as
+# unboxed-signature candidate. Returns `Some(US(param_tys, ret_ty))`
+# when every param + return is in {Int, Bool, Char, Real} concretely
+# (post-Dim / Refinement strip), with no parametric type variables,
+# no declared effect row, and no FFI-shim body. Otherwise returns
+# None — the callee keeps the classical `KaiValue *` calling
+# convention.
+#
+# Excluded:
+#   - Generic functions (`tparams != []`): the parametric T cannot
+#     be unboxed without monomorphisation tweaks (post-1.0).
+#   - FFI shims: `body_is_ffi_extern(body)` already produces the
+#     unbox/box dance internally; the shim signature is fixed.
+#   - Functions with non-empty effect row (e.g. `Console`, `Mutable`,
+#     `State[T]`): op call sites + handler clauses pass `KaiValue *`,
+#     and the kaic1-emitted closure thunk shape relies on boxed
+#     args. v1 keeps these boxed; the call-site cost there is
+#     amortised by the handler-dispatch path itself.
+#   - Functions with closure-typed or non-primitive params /
+#     returns: not in the classify set; stays boxed.
+fn classify_unbox_sig(name: String, mo: Option[String], tparams: [String], params: [Param],
+                      opt_ret: Option[TypeExpr], row: RowExpr, body: Expr) : Option[UFnSig] {
+  # Top-level `main` keeps its boxed signature: the runtime
+  # entry-point shim `int main(argc, argv)` calls `kai_main()` and
+  # casts the result to `KaiValue *` for the closing decref. A
+  # raw-Int main would clash with that ABI.
+  if name == "main" and (match mo { None -> true _ -> false }) { None }
+  else if list_length(tparams) > 0 { None }
+  else if body_is_ffi_extern(body) { None }
+  else if not row_is_empty(row_of_expr(row)) { None }
+  else if body_is_effectful(body) { None }
+  else if not all_params_unboxable(params) { None }
+  else {
+    match opt_ret {
+      None -> None
+      Some(rty) -> {
+        let ret_t = resolve_ty(rty)
+        if ty_is_unboxable_t(ret_t) {
+          Some(US(map(params, param_ty), ret_t))
+        } else { None }
+      }
+    }
+  }
+}
+
+# Phase 3 unboxing — recognise body shapes that pull in handler
+# evidence even when the user did not declare an effect row. v1
+# is conservative: any `EHandle`, `var` desugar (SVar), or
+# `Eff.op(...)` call (EModCall to a known effect, or EVar to a
+# qualified op name) disqualifies the fn. This catches the
+# `fn run(b: Bool) : Int { var inner = 100; ... }` shape where
+# the row is empty syntactically but the body installs a
+# `State[Int]` handler at run time.
+fn body_is_effectful(e: Expr) : Bool = body_kind_is_effectful(e.kind)
+
+fn body_kind_is_effectful(k: ExprKind) : Bool {
+  match k {
+    EHandle(_, _, _, _, _, _, _) -> true
+    EBang(_) -> true
+    EVar(nm) -> string_contains_dot(nm) or is_mutable_intrinsic_name(nm)
+    ECall(callee, args_) -> {
+      if body_is_effectful(callee) { true }
+      else { any_arg_effectful(args_) }
+    }
+    EBinop(_, a, b) -> body_is_effectful(a) or body_is_effectful(b)
+    EUnop(_, x) -> body_is_effectful(x)
+    EIf(c, t_, eo) -> body_is_effectful(c) or body_is_effectful(t_) or body_opt_is_effectful(eo)
+    EMatch(scr, arms) -> body_is_effectful(scr) or any_arm_effectful(arms)
+    EBlock(stmts, tail) -> any_stmt_effectful(stmts) or body_opt_is_effectful(tail)
+    ELambda(_, _) -> false
+    EField(b, _) -> body_is_effectful(b)
+    EIndex(a, b) -> body_is_effectful(a) or body_is_effectful(b)
+    ERecordLit(_, fs) -> any_field_effectful(fs)
+    EList(els) -> any_elem_effectful(els)
+    ERange(a, b, opt_step) -> body_is_effectful(a) or body_is_effectful(b) or body_opt_is_effectful(opt_step)
+    EPipe(a, b) -> body_is_effectful(a) or body_is_effectful(b)
+    EMapPipe(a, b) -> body_is_effectful(a) or body_is_effectful(b)
+    EFlatMapPipe(a, b) -> body_is_effectful(a) or body_is_effectful(b)
+    ELitUnit(inner, _) -> body_is_effectful(inner)
+    EModCall(_, _) -> true
+    _ -> false
+  }
+}
+
+fn body_opt_is_effectful(opt: Option[Expr]) : Bool {
+  match opt {
+    Some(e) -> body_is_effectful(e)
+    None    -> false
+  }
+}
+
+fn any_arg_effectful(es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if body_is_effectful(h) { true } else { any_arg_effectful(rest) }
+  }
+}
+
+fn any_arm_effectful(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [Arm(_, g, b), ...rest] -> {
+      if body_opt_is_effectful(g) { true }
+      else if body_is_effectful(b) { true }
+      else { any_arm_effectful(rest) }
+    }
+  }
+}
+
+fn any_field_effectful(fs: [FieldInit]) : Bool {
+  match fs {
+    [] -> false
+    [FI(_, v), ...rest] -> if body_is_effectful(v) { true } else { any_field_effectful(rest) }
+  }
+}
+
+fn any_elem_effectful(els: [ListElem]) : Bool {
+  match els {
+    [] -> false
+    [ElPlain(x), ...rest] -> if body_is_effectful(x) { true } else { any_elem_effectful(rest) }
+    [ElSpread(x), ...rest] -> if body_is_effectful(x) { true } else { any_elem_effectful(rest) }
+  }
+}
+
+fn any_stmt_effectful(ss: [Stmt]) : Bool {
+  match ss {
+    [] -> false
+    [s, ...rest] -> if stmt_is_effectful(s) { true } else { any_stmt_effectful(rest) }
+  }
+}
+
+fn stmt_is_effectful(s: Stmt) : Bool {
+  match s {
+    SLet(_, _, rhs) -> body_is_effectful(rhs)
+    # `var x = init` desugars into a `State[T]` handler at codegen.
+    # That handler installs evidence at run time even when the
+    # declared row is empty, so any SVar disqualifies the enclosing
+    # fn from raw-signature classification.
+    SVar(_, _, _, _, _) -> true
+    SAssert(cond, m) -> body_is_effectful(cond) or body_opt_is_effectful(m)
+    SExprStmt(x) -> body_is_effectful(x)
+    SIndexAssign(b, i, v, _, _) -> body_is_effectful(b) or body_is_effectful(i) or body_is_effectful(v)
+    SUse(_, _, _) -> false
+  }
+}
+
+# Phase 3 unboxing — `array_*` and `ref_*` are post-desugar
+# remnants of `var x = init` (m7b #5b). The desugar lowers `var`
+# into a let-bound slot (`let x__slot = array_make(1, init)`)
+# whose subsequent `x.get()`/`x.set()` reads become
+# `array_get(slot, 0)` / `array_set(slot, 0, v)`. Detecting any
+# of these names in the body of an otherwise-empty-row fn guards
+# against a UFn classification that would mishandle the slot's
+# RC + handler installation.
+fn is_mutable_intrinsic_name(nm: String) : Bool =
+  nm == "array_make" or nm == "array_get" or nm == "array_set" or
+  nm == "array_length" or nm == "array_grow" or
+  nm == "ref_make" or nm == "ref_get" or nm == "ref_set"
+
+fn row_is_empty(r: Row) : Bool =
+  list_length(r.labels) == 0 and (match r.tail { None -> true _ -> false })
+
+fn all_params_unboxable(ps: [Param]) : Bool {
+  match ps {
+    [] -> true
+    [p, ...rest] -> {
+      let pt = param_ty(p)
+      if ty_is_unboxable_t(pt) { all_params_unboxable(rest) }
+      else { false }
+    }
   }
 }
 
@@ -10543,7 +10731,7 @@ fn find_ambig_loop(fns: [EFn], target_origin: Option[String], seen: [String], ac
   match fns {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
-      EFn(n, _, _) ->
+      EFn(n, _, _, _) ->
         if list_has(seen, n) { find_ambig_loop(rest, target_origin, seen, acc) }
         else {
           let cands = efn_collect_matching(fns, n, [])
@@ -10581,8 +10769,8 @@ fn ambig_mods_of(cands: [EFn], acc: [String]) : [String] {
   match cands {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
-      EFn(_, _, None)    -> ambig_mods_of(rest, acc)
-      EFn(_, _, Some(m)) ->
+      EFn(_, _, None, _)    -> ambig_mods_of(rest, acc)
+      EFn(_, _, Some(m), _) ->
         if list_has(acc, m) { ambig_mods_of(rest, acc) }
         else                { ambig_mods_of(rest, [m, ...acc]) }
     }
@@ -11248,7 +11436,7 @@ fn emit_ident_value(name: String, lcs: [String], fns: [EFn], variants: [EVar]) :
           cat5("kai_closure(&_", cname, "_thunk, ", int_to_string(ar), ", 0, NULL)")
       }
       None -> match efn_resolve(fns, name) {
-        Some(EFn(_, ar, mo)) ->
+        Some(EFn(_, ar, mo, _)) ->
           cat5("kai_closure(&_kai_", c_sym(name, mo), "_thunk, ", int_to_string(ar), ", 0, NULL)")
         None -> cat2("kai_", name)
       }
@@ -11304,6 +11492,15 @@ fn unop_cname(op: String) : Option[String] {
 fn emit_call_args(src: String, args_e: [Expr], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String =
   join_with(map(args_e, (a) => emit_expr(src, a, lcs, fns, variants, lams, cls)), ", ")
 
+# Phase 3 unboxing — emit each call argument as a raw C scalar
+# matching the UFn signature's slot ty. `emit_expr_raw` falls back
+# to the boxed-then-unbox boundary form if the arg is MBoxed; for
+# raw children (literal / EVar to a raw param / nested UFn call /
+# raw arith) it emits the native scalar directly. The result is
+# the comma-joined argument list ready for the call site.
+fn emit_call_args_raw(src: String, args_e: [Expr], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String =
+  join_with(map(args_e, (a) => emit_expr_raw(src, a, lcs, fns, variants, lams, cls)), ", ")
+
 # m8.x bug #12: emit `KaiValue *_op_arg_<i> = <expr>; ` for each
 # arg of an op call. The args are evaluated *before* the
 # `in_dispatch` flag is set, so any inner op call to the same
@@ -11349,6 +11546,50 @@ fn emit_variant_call(name: String, n_args: Int, arg_out: String) : String {
 }
 
 fn emit_call_expr(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  # Phase 3 unboxing — when the callee resolves to a UFn (raw C
+  # signature), emit the call against raw args and wrap the
+  # result with `kai_int` / `kai_bool` / `kai_char` / `kai_real`
+  # so the boxed-context caller still sees a `KaiValue *`. This
+  # short-circuits the regular dispatch chain (variant / prelude /
+  # closure-thunk fallback) because UFns are exclusively
+  # user-declared top-level fns and cannot be overridden by an
+  # `lcs` shadow with the same name (a let-bound closure shadowing
+  # a UFn keeps the boxed call site — `lcs.has(name)` test wins).
+  match emit_ufn_boxed_call(src, f, args_e, lcs, fns, variants, lams, cls) {
+    Some(s) -> s
+    None    -> emit_call_expr_default(src, f, args_e, lcs, fns, variants, lams, cls)
+  }
+}
+
+# Phase 3 unboxing — try to emit the call as a raw-call boxed
+# (`kai_<T>(callee(raw_args))`). Returns None when the callee
+# does not resolve to a UFn; the caller falls back to the
+# original boxed-only dispatch.
+fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : Option[String] {
+  match f.kind {
+    EVar(callee) ->
+      if list_has(lcs, callee) { None }
+      else { match efn_resolve(fns, callee) {
+        Some(EFn(_, _, mo, Some(US(_, rt)))) -> {
+          let raw_args = emit_call_args_raw(src, args_e, lcs, fns, variants, lams, cls)
+          let raw_call = cat5("kai_", c_sym(callee, mo), "(", raw_args, ")")
+          Some(box_wrap(Some(rt), raw_call))
+        }
+        _ -> None
+      } }
+    EModCall(mod, fname) -> match lookup_ufn_sig(fns, fname, Some(mod)) {
+      Some(US(_, rt)) -> {
+        let raw_args = emit_call_args_raw(src, args_e, lcs, fns, variants, lams, cls)
+        let raw_call = cat5("kai_", c_sym(fname, Some(mod)), "(", raw_args, ")")
+        Some(box_wrap(Some(rt), raw_call))
+      }
+      None -> None
+    }
+    _ -> None
+  }
+}
+
+fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   let call_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
   match f.kind {
     EVar(callee) -> {
@@ -11739,6 +11980,19 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn
 # local has to win. When `callee` is in lcs we drop straight to the
 # kai_apply branch over the local C variable; the variant / prelude
 # / efn lookups only fire for genuinely-global names.
+# Phase 3 unboxing — when `callee` resolves to a UFn entry in the
+# EFn table, the call site swaps to the raw calling convention.
+# `emit_pipe_named_lookup` (and its sibling `emit_named_call_lookup`)
+# stay the gateway for both raw and boxed paths so the lookup
+# discipline (lcs shadowing, variant dispatch, prelude inlining) is
+# centralised. The raw arg string is built lazily inside the UFn
+# arm via `emit_call_args_raw_pipe` (LHS already raw + the rest).
+# The result of the raw call is itself a raw scalar; the parent
+# emit_expr already wraps it via `box_wrap` when it sees the ECall
+# node tagged MUnboxed (set in `ufn_promote_calls`). We re-wrap
+# here as a defensive identity-on-raw boundary because the pipe
+# path may inline through emit_pipe_expr's match without first
+# going through `emit_expr`.
 fn emit_pipe_named_lookup(callee: String, arity: Int, args_all: String, lcs: [String], fns: [EFn], variants: [EVar]) : String =
   if list_has(lcs, callee) {
     concat_all([
@@ -11752,7 +12006,7 @@ fn emit_pipe_named_lookup(callee: String, arity: Int, args_all: String, lcs: [St
         EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
       }
       None -> match efn_resolve(fns, callee) {
-        Some(EFn(_, _, mo)) -> cat5("kai_", c_sym(callee, mo), "(", args_all, ")")
+        Some(EFn(_, _, mo, _)) -> cat5("kai_", c_sym(callee, mo), "(", args_all, ")")
         None -> concat_all([
           "kai_apply(kai_", callee, ", ", int_to_string(arity),
           ", (KaiValue *[]){", args_all, "})"
@@ -11779,7 +12033,7 @@ fn emit_named_call_lookup(callee: String, args_e: [Expr], call_args: String, lcs
         EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
       }
       None -> match efn_resolve(fns, callee) {
-        Some(EFn(_, _, mo)) -> cat5("kai_", c_sym(callee, mo), "(", call_args, ")")
+        Some(EFn(_, _, mo, _)) -> cat5("kai_", c_sym(callee, mo), "(", call_args, ")")
         None -> concat_all([
           "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e)),
           ", (KaiValue *[]){", call_args, "})"
@@ -11789,23 +12043,58 @@ fn emit_named_call_lookup(callee: String, args_e: [Expr], call_args: String, lcs
   } }
 
 fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
-  let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
   match rhs.kind {
     ECall(f, args_e) -> match f.kind {
+      # Phase 3 unboxing — pipe into a UFn callee. The piped LHS
+      # becomes the first arg; both LHS and the trailing args are
+      # emitted raw via `emit_expr_raw`. Without this branch the
+      # default `emit_call_args` produces boxed args and the
+      # `kai_<sym>` call site (which has the raw signature post-
+      # Phase-3) takes `KaiValue *` — a hard C type error caught
+      # by tier1 on `m7d_21_pipe_placeholder_basic`.
       EVar(callee) -> {
-        let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
-        let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-        emit_pipe_named_lookup(callee, list_length(args_e) + 1, args_all, lcs, fns, variants)
+        if list_has(lcs, callee) {
+          let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+          let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
+          let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
+          emit_pipe_named_lookup(callee, list_length(args_e) + 1, args_all, lcs, fns, variants)
+        } else { match efn_resolve(fns, callee) {
+          Some(EFn(_, _, mo, Some(US(_, rt)))) -> {
+            let lhs_raw = emit_expr_raw(src, lhs, lcs, fns, variants, lams, cls)
+            let rest_raw = emit_call_args_raw(src, args_e, lcs, fns, variants, lams, cls)
+            let args_all = if list_length(args_e) == 0 { lhs_raw } else { cat3(lhs_raw, ", ", rest_raw) }
+            let raw_call = cat5("kai_", c_sym(callee, mo), "(", args_all, ")")
+            box_wrap(Some(rt), raw_call)
+          }
+          _ -> {
+            let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+            let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
+            let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
+            emit_pipe_named_lookup(callee, list_length(args_e) + 1, args_all, lcs, fns, variants)
+          }
+        } }
       }
       # m6.2 Phase 3 / v2: piped qualified call `x |> mod.f(args)`.
       # Mint the prefixed symbol directly — same logic as the
-      # non-piped EModCall branch in emit_call_expr.
-      EModCall(mod, fname) -> {
-        let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
-        let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-        cat5("kai_", c_sym(fname, Some(mod)), "(", args_all, ")")
+      # non-piped EModCall branch in emit_call_expr. Phase 3
+      # routes UFn-classified targets through the raw shape too.
+      EModCall(mod, fname) -> match lookup_ufn_sig(fns, fname, Some(mod)) {
+        Some(US(_, rt)) -> {
+          let lhs_raw = emit_expr_raw(src, lhs, lcs, fns, variants, lams, cls)
+          let rest_raw = emit_call_args_raw(src, args_e, lcs, fns, variants, lams, cls)
+          let args_all = if list_length(args_e) == 0 { lhs_raw } else { cat3(lhs_raw, ", ", rest_raw) }
+          let raw_call = cat5("kai_", c_sym(fname, Some(mod)), "(", args_all, ")")
+          box_wrap(Some(rt), raw_call)
+        }
+        None -> {
+          let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+          let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
+          let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
+          cat5("kai_", c_sym(fname, Some(mod)), "(", args_all, ")")
+        }
       }
       _ -> {
+        let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
         let fc = emit_expr(src, f, lcs, fns, variants, lams, cls)
         let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
         let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
@@ -11815,14 +12104,42 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, lcs: [String], fns: [EFn], 
         ])
       }
     }
-    EVar(callee) -> emit_pipe_named_lookup(callee, 1, lhs_c, lcs, fns, variants)
+    EVar(callee) -> {
+      if list_has(lcs, callee) {
+        let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+        emit_pipe_named_lookup(callee, 1, lhs_c, lcs, fns, variants)
+      } else { match efn_resolve(fns, callee) {
+        Some(EFn(_, _, mo, Some(US(_, rt)))) -> {
+          let lhs_raw = emit_expr_raw(src, lhs, lcs, fns, variants, lams, cls)
+          let raw_call = cat5("kai_", c_sym(callee, mo), "(", lhs_raw, ")")
+          box_wrap(Some(rt), raw_call)
+        }
+        _ -> {
+          let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+          emit_pipe_named_lookup(callee, 1, lhs_c, lcs, fns, variants)
+        }
+      } }
+    }
     # m6.2 Phase 3 / v2: piped qualified-call shorthand `x |> mod.f`
     # (no parens) — same direct mint as the parens form.
-    EModCall(mod, fname) -> cat5("kai_", c_sym(fname, Some(mod)), "(", lhs_c, ")")
-    _ -> concat_all([
-      "kai_apply(", emit_expr(src, rhs, lcs, fns, variants, lams, cls),
-      ", 1, (KaiValue *[]){", lhs_c, "})"
-    ])
+    EModCall(mod, fname) -> match lookup_ufn_sig(fns, fname, Some(mod)) {
+      Some(US(_, rt)) -> {
+        let lhs_raw = emit_expr_raw(src, lhs, lcs, fns, variants, lams, cls)
+        let raw_call = cat5("kai_", c_sym(fname, Some(mod)), "(", lhs_raw, ")")
+        box_wrap(Some(rt), raw_call)
+      }
+      None -> {
+        let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+        cat5("kai_", c_sym(fname, Some(mod)), "(", lhs_c, ")")
+      }
+    }
+    _ -> {
+      let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+      concat_all([
+        "kai_apply(", emit_expr(src, rhs, lcs, fns, variants, lams, cls),
+        ", 1, (KaiValue *[]){", lhs_c, "})"
+      ])
+    }
   }
 }
 
@@ -13596,7 +13913,7 @@ fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect {
 
 # Globals: prelude names + user fn names + variant ctor names. Used as a
 # cheap "this ident does not need to be captured" test.
-fn efn_name(e: EFn) : String = match e { EFn(n, _, _) -> n }
+fn efn_name(e: EFn) : String = match e { EFn(n, _, _, _) -> n }
 fn evar_name(v: EVar) : String = match v { EV(n, _) -> n }
 
 fn build_globals(fns: [EFn], variants: [EVar], eff_names: [String], op_quals: [String]) : [String] {
@@ -14246,12 +14563,107 @@ fn emit_kind_raw(src: String, x: Expr, lcs: [String], fns: [EFn],
         let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
         cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
       }
+    # Phase 3 unboxing — when the callee resolves to a UFn, emit
+    # the raw call inline (`<callee>(<raw args>)`) so the result
+    # stays a raw scalar without a kai_int wrap-and-unwrap. The
+    # tcrec sentinel callee is special — it always lowers to the
+    # `goto`-block which `tcrec_emit_goto` already produces in raw
+    # form when the surrounding fn is UFn. Other callees fall back
+    # to the boxed-then-unbox boundary form.
+    ECall(callee_e, args_e) -> match callee_e.kind {
+      EVar(callee) ->
+        if tcrec_is_sentinel(callee) {
+          let parts = tcrec_split_pipe(callee)
+          match parts {
+            [_, sym, dropmask_str, ...pnames] -> {
+              let dropmask = tcrec_parse_decimal(dropmask_str)
+              tcrec_emit_goto(src, sym, dropmask, pnames, args_e,
+                              lcs, fns, variants, lams, cls)
+            }
+            _ -> "0 /* tcrec: malformed sentinel */"
+          }
+        } else { match emit_ufn_raw_call(src, callee_e, args_e, lcs, fns, variants, lams, cls) {
+          Some(s) -> s
+          None    -> {
+            let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+            cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+          }
+        } }
+      _ -> match emit_ufn_raw_call(src, callee_e, args_e, lcs, fns, variants, lams, cls) {
+        Some(s) -> s
+        None    -> {
+          let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+          cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+        }
+      }
+    }
+    # Phase 3 unboxing — `if cond { a } else { b }` where every
+    # branch is itself emit-raw-able lowers to the C ternary
+    # `(cond ? a : b)`. Caller has already gated `x.mode = MUnboxed`
+    # via `decide_mode`'s EIf clause (not yet enabled — kept boxed
+    # for now). Defensive: when present, both arms must agree on
+    # type and the cond must be raw-bool.
+    EIf(cnd, ath, opt_eth) -> match opt_eth {
+      Some(eth) -> {
+        let cnd_c = emit_expr_raw(src, cnd, lcs, fns, variants, lams, cls)
+        let a_c = emit_expr_raw(src, ath, lcs, fns, variants, lams, cls)
+        let b_c = emit_expr_raw(src, eth, lcs, fns, variants, lams, cls)
+        concat_all(["(", cnd_c, " ? ", a_c, " : ", b_c, ")"])
+      }
+      None -> {
+        let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+        cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+      }
+    }
+    # Phase 3 unboxing — single-tail EBlock with no preceding
+    # statements simply wraps a raw tail expression. Emit the
+    # tail directly without the surrounding `({ ... })`.
+    EBlock(stmts, opt_tail) -> match stmts {
+      [] -> match opt_tail {
+        Some(t) -> emit_expr_raw(src, t, lcs, fns, variants, lams, cls)
+        None -> {
+          let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+          cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+        }
+      }
+      _ -> {
+        let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
+        cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
+      }
+    }
     _ -> {
       # Anything else: emit boxed and unwrap. The unbox_pass should
       # not have marked these MUnboxed in the first place — defensive.
       let boxed = emit_expr_boxed(src, x, lcs, fns, variants, lams, cls)
       cat3("(", boxed, cat2(")", unbox_field_for(x.ty)))
     }
+  }
+}
+
+# Phase 3 unboxing — when the callee `f` resolves to a UFn entry
+# in the EFn table, emit the call against raw args without any
+# `kai_<T>` wrap. Returns None when the callee is not a UFn. The
+# caller (emit_kind_raw ECall arm) falls back to the boxed-then-
+# unbox boundary form.
+fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : Option[String] {
+  match f.kind {
+    EVar(callee) ->
+      if list_has(lcs, callee) { None }
+      else { match efn_resolve(fns, callee) {
+        Some(EFn(_, _, mo, Some(_))) -> {
+          let raw_args = emit_call_args_raw(src, args_e, lcs, fns, variants, lams, cls)
+          Some(cat5("kai_", c_sym(callee, mo), "(", raw_args, ")"))
+        }
+        _ -> None
+      } }
+    EModCall(mod, fname) -> match lookup_ufn_sig(fns, fname, Some(mod)) {
+      Some(_) -> {
+        let raw_args = emit_call_args_raw(src, args_e, lcs, fns, variants, lams, cls)
+        Some(cat5("kai_", c_sym(fname, Some(mod)), "(", raw_args, ")"))
+      }
+      None -> None
+    }
+    _ -> None
   }
 }
 
@@ -14452,7 +14864,7 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
     # `emit_ident_value(fname, ...)` would lose the qualified context
     # and pick the wrong entry in the ambiguous-name case.
     EModCall(mod, fname) -> match efn_resolve(fns, fname) {
-      Some(EFn(_, ar, _)) ->
+      Some(EFn(_, ar, _, _)) ->
         cat5("kai_closure(&_kai_", c_sym(fname, Some(mod)), "_thunk, ", int_to_string(ar), ", 0, NULL)")
       None -> cat2("kai_", fname)
     }
@@ -15075,12 +15487,107 @@ fn emit_param_list(params: [Param]) : String {
   }
 }
 
+# Phase 3 unboxing — emit the raw parameter list for a UFn.
+# Each parameter is a raw C scalar named `kair_<pname>`; the
+# emitter's MUnboxed EVar reads of `pname` resolve via
+# `emit_ident_value` to that name.
+fn emit_param_list_unboxed(params: [Param], param_tys: [Ty]) : String {
+  match params {
+    [] -> "void"
+    _ -> join_with(emit_param_list_unboxed_each(params, param_tys, []), ", ")
+  }
+}
+
+fn emit_param_list_unboxed_each(params: [Param], tys: [Ty], acc: [String]) : [String] {
+  match params {
+    [] -> list_reverse(acc)
+    [p, ...rest] -> {
+      let pty = match tys {
+        [t, ...trest] -> t
+        []            -> param_ty(p)
+      }
+      let trest = match tys {
+        [_, ...r] -> r
+        []        -> []
+      }
+      let entry = concat_all([raw_c_type(Some(pty)), " kair_", p.pname])
+      emit_param_list_unboxed_each(rest, trest, [entry, ...acc])
+    }
+  }
+}
+
 fn emit_fn_signature(name: String, params: [Param]) : String =
   cat5("static KaiValue *kai_", name, "(", emit_param_list(params), ")")
 
-fn emit_fn_forward(d: Decl) : String {
+# Phase 3 unboxing — raw signature for a UFn. Return type is the
+# raw C scalar matching `ret_ty`; param list mints `kair_<name>`
+# locals typed to each `param_ty`.
+fn emit_fn_signature_unboxed(name: String, params: [Param], sig: UFnSig) : String =
+  match sig {
+    US(pts, rt) -> concat_all([
+      "static ", raw_c_type(Some(rt)),
+      " kai_", name, "(", emit_param_list_unboxed(params, pts), ")"
+    ])
+  }
+
+# Decide whether a DFn declared `name`/`mo` was classified as a
+# UFn in the EFn registry. Returns the UFnSig payload so callers
+# can dispatch on raw vs boxed signature in one match. Iterates
+# all matching entries (two modules can export the same bare name
+# under v2 — e.g. `box_a.wrap` and `box_b.wrap`) and picks the one
+# whose module-of-origin matches `mo` exactly.
+fn lookup_ufn_sig(fns: [EFn], name: String, mo: Option[String]) : Option[UFnSig] {
+  match fns {
+    [] -> None
+    [h, ...rest] -> match h {
+      EFn(n, _, m2, sig) ->
+        if n == name and mo_eq(mo, m2) { sig }
+        else { lookup_ufn_sig(rest, name, mo) }
+    }
+  }
+}
+
+fn is_ufn_decl(fns: [EFn], name: String, mo: Option[String]) : Bool {
+  match lookup_ufn_sig(fns, name, mo) {
+    Some(_) -> true
+    None    -> false
+  }
+}
+
+# Phase 3 unboxing — find a UFn entry by its emitted C symbol
+# (e.g. `numeric__real_pow_int_loop`). Iterates the EFn registry
+# and compares `c_sym(name, mo)` against the target string.
+fn lookup_ufn_by_csym(fns: [EFn], csym: String) : Option[UFnSig] {
+  match fns {
+    [] -> None
+    [h, ...rest] -> match h {
+      EFn(n, _, mo, Some(us)) ->
+        if c_sym(n, mo) == csym { Some(us) }
+        else { lookup_ufn_by_csym(rest, csym) }
+      _ -> lookup_ufn_by_csym(rest, csym)
+    }
+  }
+}
+
+fn mo_eq(a: Option[String], b: Option[String]) : Bool {
+  match a {
+    None -> match b { None -> true _ -> false }
+    Some(x) -> match b {
+      Some(y) -> x == y
+      None    -> false
+    }
+  }
+}
+
+fn emit_fn_forward(d: Decl, fns: [EFn]) : String {
   match d {
-    DFn(_, name, _, params, _, _, _, _, _, mo) -> cat2(emit_fn_signature(c_sym(name, mo), params), ";\n")
+    DFn(_, name, _, params, _, _, _, _, _, mo) -> {
+      let sig = match lookup_ufn_sig(fns, name, mo) {
+        Some(us) -> emit_fn_signature_unboxed(c_sym(name, mo), params, us)
+        None     -> emit_fn_signature(c_sym(name, mo), params)
+      }
+      cat2(sig, ";\n")
+    }
     _ -> ""
   }
 }
@@ -15096,7 +15603,11 @@ fn emit_thunk_forward(d: Decl) : String {
 fn emit_fn_body(src: String, d: Decl, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match d {
     DFn(_, name, _, params, ret_ty_opt, _, body, _, _, mo) -> {
-      let sig = emit_fn_signature(c_sym(name, mo), params)
+      let opt_sig = lookup_ufn_sig(fns, name, mo)
+      let sig = match opt_sig {
+        Some(us) -> emit_fn_signature_unboxed(c_sym(name, mo), params, us)
+        None     -> emit_fn_signature(c_sym(name, mo), params)
+      }
       # m12.7.x FFI v1: a `[<extern_c>]` axiom lowered into a DFn
       # whose body is the magic ETodo tag. Emit the FFI shim instead
       # of the standard body — the shim unboxes each parameter to
@@ -15119,19 +15630,35 @@ fn emit_fn_body(src: String, d: Decl, lcs: [String], fns: [EFn], variants: [EVar
         # match, so a recursive call inside `loop.repeat` resolves
         # to `loop.repeat` even when `list.repeat` is also in scope.
         let body_fns = fns_prefer_module(fns, mo)
-        let body_c = emit_expr(src, body, body_lcs, body_fns, variants, lams, cls)
-        # Issue #37: when `tcrec_rewrite_decl` planted at least one
-        # `__kai_tcrec|...` self-tail-call sentinel inside `body`,
-        # plant the matching `_kai_<c_sym>_entry:;` label *before*
-        # the `return ({ ... });` so the goto inside the
-        # statement-expression has a target. The goto jumps out of
-        # the wrap before its exit drops run, so the per-iteration
-        # cleanup is the drop-and-rebind block emitted at the
-        # call site (`tcrec_emit_goto`).
-        let label = if tcrec_body_has_sentinel(body) {
-          concat_all(["_kai_", c_sym(name, mo), "_entry:;\n    "])
-        } else { "" }
-        concat_all([sig, " {\n    ", label, "return ", body_c, ";\n}\n\n"])
+        # Phase 3 unboxing — UFn body emits a raw return expression
+        # whose value is the raw scalar matching `ret_ty`. The
+        # body's `mode` is set by `unbox_pass`/`ufn_promote_calls`;
+        # `emit_expr_raw` handles the MBoxed→raw boundary if the
+        # body somehow stayed boxed (defensive for partial
+        # promotions). The TCO sentinel goto path stays compatible:
+        # `tcrec_emit_goto` writes `goto _kai_<sym>_entry;` which
+        # ignores the surrounding return-expression shape.
+        match opt_sig {
+          Some(_) -> {
+            let body_c = emit_expr_raw(src, body, body_lcs, body_fns, variants, lams, cls)
+            let label = if tcrec_body_has_sentinel(body) {
+              concat_all(["_kai_", c_sym(name, mo), "_entry:;\n    "])
+            } else { "" }
+            concat_all([sig, " {\n    ", label, "return ", body_c, ";\n}\n\n"])
+          }
+          None -> {
+            let body_c = emit_expr(src, body, body_lcs, body_fns, variants, lams, cls)
+            # Issue #37: when `tcrec_rewrite_decl` planted at least one
+            # `__kai_tcrec|...` self-tail-call sentinel inside `body`,
+            # plant the matching `_kai_<c_sym>_entry:;` label *before*
+            # the `return ({ ... });` so the goto inside the
+            # statement-expression has a target.
+            let label = if tcrec_body_has_sentinel(body) {
+              concat_all(["_kai_", c_sym(name, mo), "_entry:;\n    "])
+            } else { "" }
+            concat_all([sig, " {\n    ", label, "return ", body_c, ";\n}\n\n"])
+          }
+        }
       }
     }
     _ -> ""
@@ -15347,27 +15874,90 @@ fn emit_param_reads(params: [Param], start: Int) : String {
   }
 }
 
-fn emit_fn_thunk(d: Decl) : String {
+fn emit_fn_thunk(d: Decl, fns: [EFn]) : String {
   match d {
     DFn(_, name, _, params, _, _, _, _, _, mo) -> {
       let sym = c_sym(name, mo)
-      let param_reads = emit_param_reads(params, 0)
-      let named_args = emit_param_args(params)
       let hdr = concat_all([
         "static KaiValue *_kai_", sym,
         "_thunk(KaiValue *self, KaiValue **args, int n) {\n    (void) self; (void) n;\n"
       ])
-      let call = concat_all(["    return kai_", sym, "(", named_args, ");\n}\n\n"])
-      concat_all([hdr, param_reads, call])
+      # Phase 3 unboxing — when the named fn is a UFn, the thunk
+      # marshals each boxed `args[i]` into the matching raw scalar
+      # via `->as.X` and wraps the raw return in `kai_<T>` so the
+      # closure-call indirection (`kai_apply` / `kai_closure`)
+      # still hands back a `KaiValue *`. This is the dispatch
+      # bridge between the boxed first-class-fn world and the
+      # raw direct-call world.
+      match lookup_ufn_sig(fns, name, mo) {
+        Some(US(pts, rt)) -> {
+          let arg_unbox = emit_thunk_unbox_args(params, pts, 0)
+          let arg_list = emit_thunk_raw_arg_list(params, 0)
+          let call_raw = concat_all(["kai_", sym, "(", arg_list, ")"])
+          let body = concat_all([
+            arg_unbox,
+            "    return ", box_wrap(Some(rt), call_raw), ";\n}\n\n"
+          ])
+          concat_all([hdr, body])
+        }
+        None -> {
+          let param_reads = emit_param_reads(params, 0)
+          let named_args = emit_param_args(params)
+          let call = concat_all(["    return kai_", sym, "(", named_args, ");\n}\n\n"])
+          concat_all([hdr, param_reads, call])
+        }
+      }
     }
     _ -> ""
   }
 }
 
+# Phase 3 unboxing — emit per-param `<raw_ty> kair_<name> = args[i]->as.X;`
+# bindings inside a UFn thunk. The boxed arg slot is dropped as soon
+# as the raw scalar is read; the caller (`kai_apply`) owns its
+# argument array's references but the thunk takes ownership of each
+# slot as it consumes it (matching the boxed thunk's
+# `KaiValue *kai_<n> = args[i]; ...; kai_decref(...)` discipline).
+fn emit_thunk_unbox_args(params: [Param], tys: [Ty], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let pty = match tys {
+        [t, ...trest] -> t
+        []            -> param_ty(p)
+      }
+      let trest = match tys {
+        [_, ...r] -> r
+        []        -> []
+      }
+      let ix = int_to_string(i)
+      let line = concat_all([
+        "    ", raw_c_type(Some(pty)), " kair_", p.pname,
+        " = args[", ix, "]", unbox_field_for(Some(pty)), ";\n",
+        "    kai_decref(args[", ix, "]);\n"
+      ])
+      cat2(line, emit_thunk_unbox_args(rest, trest, i + 1))
+    }
+  }
+}
+
+fn emit_thunk_raw_arg_list(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let head = concat_all(["kair_", p.pname])
+      match rest {
+        [] -> head
+        _  -> concat_all([head, ", ", emit_thunk_raw_arg_list(rest, i + 1)])
+      }
+    }
+  }
+}
+
 # ---- top-level passes ----
 
-fn fn_forward_decls(decls: [Decl]) : String =
-  concat_all(map(decls, emit_fn_forward))
+fn fn_forward_decls(decls: [Decl], fns: [EFn]) : String =
+  concat_all(map(decls, (d) => emit_fn_forward(d, fns)))
 
 fn thunk_forward_decls(decls: [Decl]) : String =
   concat_all(map(decls, emit_thunk_forward))
@@ -15375,7 +15965,7 @@ fn thunk_forward_decls(decls: [Decl]) : String =
 fn fn_bodies(src: String, decls: [Decl], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String =
   concat_all(map(decls, (d) => {
     match d {
-      DFn(_, _, _, _, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, lcs, fns, variants, lams, cls), emit_fn_thunk(d))
+      DFn(_, _, _, _, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, lcs, fns, variants, lams, cls), emit_fn_thunk(d, fns))
       _ -> ""
     }
   }))
@@ -21184,7 +21774,7 @@ fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, b
   # inside fn bodies.
   let env_structs = emit_handle_env_typedefs(clauses_info)
   let clause_fwd = emit_clause_forwards(clauses_info)
-  let fwd = fn_forward_decls(decls)
+  let fwd = fn_forward_decls(decls, fns)
   let thunk_fwd = thunk_forward_decls(decls)
   let lam_fwd = emit_lam_forward_decls(lams)
   # Top-level emission runs with an empty lexical scope; each fn /
@@ -33724,20 +34314,201 @@ fn find_mono_inst(insts: [ResolvedCS], name: String,
 #
 # Subsequent milestones extend the analysis to comparisons, EIf
 # cond, and match scrutinees.
-fn unbox_pass(decls: [Decl]) : [Decl] = map(decls, unbox_decl)
+fn unbox_pass(decls: [Decl]) : [Decl] = {
+  let fns = register_fn_decls(decls)
+  map(decls, (d) => unbox_decl(d, fns))
+}
 
-fn unbox_decl(d: Decl) : Decl {
+fn unbox_decl(d: Decl, fns: [EFn]) : Decl {
   match d {
-    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) ->
-      DFn(is_pub, name, tparams, params, opt_ret, row,
-          unbox_expr(body, []), ln, cl, mo)
-    DTest(desc, body, ln, cl) -> DTest(desc, unbox_expr(body, []), ln, cl)
-    DBench(desc, body, ln, cl) -> DBench(desc, unbox_expr(body, []), ln, cl)
-    DCheck(desc, ps, body, ln, cl) -> DCheck(desc, ps, unbox_expr(body, []), ln, cl)
+    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
+      # Phase 3 unboxing: when this DFn is itself a UFn, seed the
+      # local-binding env with each parameter marked MUnboxed so
+      # EVar reads of `pname` in the body resolve to the raw alias
+      # `kair_<pname>` (planted by emit_fn_body) instead of the
+      # boxed `kai_<pname>`. The body's tail return inherits its
+      # mode from the body itself; emit_fn_body emits the raw
+      # `return <raw>;` form when the fn is UFn.
+      let env0 = match efn_resolve(fns, name) {
+        Some(EFn(_, _, _, Some(_))) -> ufn_param_env(params, [])
+        _ -> []
+      }
+      let body1 = unbox_expr_aware(body, env0, fns)
+      DFn(is_pub, name, tparams, params, opt_ret, row, body1, ln, cl, mo)
+    }
+    DTest(desc, body, ln, cl) -> DTest(desc, unbox_expr_aware(body, [], fns), ln, cl)
+    DBench(desc, body, ln, cl) -> DBench(desc, unbox_expr_aware(body, [], fns), ln, cl)
+    DCheck(desc, ps, body, ln, cl) -> DCheck(desc, ps, unbox_expr_aware(body, [], fns), ln, cl)
     DImpl(name, proto_args, ty, sub_decls, l, c) ->
-      DImpl(name, proto_args, ty, map(sub_decls, unbox_decl), l, c)
-    DDerive(ps, inner, l, c) -> DDerive(ps, unbox_decl(inner), l, c)
+      DImpl(name, proto_args, ty, map(sub_decls, (sd) => unbox_decl(sd, fns)), l, c)
+    DDerive(ps, inner, l, c) -> DDerive(ps, unbox_decl(inner, fns), l, c)
     _ -> d
+  }
+}
+
+# Phase 3 unboxing: build the initial env for a UFn body. Every
+# param is bound MUnboxed; the body's EVar reads of these names
+# emit `kair_<name>` via `emit_kind_raw`.
+fn ufn_param_env(params: [Param], acc: [LocBind]) : [LocBind] {
+  match params {
+    [] -> list_reverse(acc)
+    [p, ...rest] -> ufn_param_env(rest, [LB(p.pname, MUnboxed), ...acc])
+  }
+}
+
+# Phase 3 unboxing: post-walk that flips the mode of every ECall
+# whose callee resolves to a UFn (Some(US(...)) in the EFn table)
+# and whose own `ty` is unboxable. The unbox_pass's main walk
+# already left every node with a defensible mode; this second
+# pass only widens MBoxed→MUnboxed at unbox-aware call sites.
+#
+# The promotion is *aware* but conservative:
+#   - Only EVar / EModCall callees are considered (named call sites);
+#     `kai_apply` indirect calls keep boxed conventions.
+#   - The result ty must be unboxable; otherwise the called fn's
+#     return is materially boxed (e.g. String).
+#   - The args themselves can stay any mode — `emit_kind_raw`'s
+#     ECall arm will call `emit_expr_raw` on each arg, which falls
+#     back to the boxed-then-unbox boundary tactic when the child
+#     is MBoxed (matches the existing M3 / M4 handling).
+fn ufn_promote_calls(e: Expr, fns: [EFn]) : Expr {
+  let kind1 = ufn_promote_calls_kind(e.kind, fns)
+  # Phase 3 — promote ECall to MUnboxed when callee resolves UFn
+  # and result type is unboxable. Promote EIf to MUnboxed when
+  # both arms are already MUnboxed (post-promotion) and the cond
+  # is raw — this lets the emit_kind_raw EIf branch lower to a C
+  # ternary rather than the box-and-unwrap fallback. EBlock is
+  # promoted similarly when its tail is MUnboxed and there are no
+  # interleaved boxed-side-effect statements (conservative: only
+  # when stmts is empty, i.e. pure tail expression — covers the
+  # post-perceus shape for raw-only bodies).
+  let mode1 = match kind1 {
+    ECall(callee, _) -> {
+      if call_resolves_to_ufn(callee, fns) and ty_is_unboxable(e.ty) { MUnboxed }
+      else { e.mode }
+    }
+    EIf(cnd, ath, Some(eth)) -> {
+      if ty_is_unboxable(e.ty) and child_is_raw(cnd) and child_is_raw(ath) and child_is_raw(eth) {
+        MUnboxed
+      } else { e.mode }
+    }
+    EBlock(stmts, Some(tail)) -> {
+      match stmts {
+        [] -> if ty_is_unboxable(e.ty) and child_is_raw(tail) { MUnboxed } else { e.mode }
+        _ -> e.mode
+      }
+    }
+    _ -> e.mode
+  }
+  Expr { kind: kind1, line: e.line, col: e.col, ty: e.ty, mode: mode1 }
+}
+
+fn ufn_promote_calls_kind(k: ExprKind, fns: [EFn]) : ExprKind {
+  match k {
+    ECall(callee, args_) -> ECall(ufn_promote_calls(callee, fns),
+                                   map(args_, (a) => ufn_promote_calls(a, fns)))
+    EField(base, name)   -> EField(ufn_promote_calls(base, fns), name)
+    EIndex(a, b)         -> EIndex(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
+    EBinop(op, a, b)     -> EBinop(op, ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
+    EUnop(op, x)         -> EUnop(op, ufn_promote_calls(x, fns))
+    EIf(c, t_, eo)       -> EIf(ufn_promote_calls(c, fns), ufn_promote_calls(t_, fns),
+                                 ufn_promote_calls_opt(eo, fns))
+    EMatch(scr, arms)    -> EMatch(ufn_promote_calls(scr, fns),
+                                    map(arms, (a) => ufn_promote_calls_arm(a, fns)))
+    ELambda(ps, b)       -> ELambda(ps, ufn_promote_calls(b, fns))
+    ERecordLit(name, fs) -> ERecordLit(name, map(fs, (fi) => ufn_promote_calls_field(fi, fns)))
+    EList(els)           -> EList(map(els, (el) => ufn_promote_calls_elem(el, fns)))
+    ERange(a, b, opt_step) -> ERange(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns),
+                                       ufn_promote_calls_opt(opt_step, fns))
+    EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => ufn_promote_calls_stmt(s, fns)),
+                                    ufn_promote_calls_opt(tail, fns))
+    EPipe(a, b)          -> EPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
+    EMapPipe(a, b)       -> EMapPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(ufn_promote_calls(body, fns), eff_name, eff_tyargs,
+              ufn_promote_calls_opt(init_opt, fns), alias_opt,
+              map(clauses, (c) => ufn_promote_calls_clause(c, fns)),
+              ufn_promote_calls_opt_return(ret_opt, fns))
+    ELitUnit(inner, u)   -> ELitUnit(ufn_promote_calls(inner, fns), u)
+    EBang(inner)         -> EBang(ufn_promote_calls(inner, fns))
+    _ -> k
+  }
+}
+
+fn ufn_promote_calls_opt(opt: Option[Expr], fns: [EFn]) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(ufn_promote_calls(e, fns))
+    None    -> None
+  }
+}
+
+fn ufn_promote_calls_arm(a: Arm, fns: [EFn]) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, ufn_promote_calls_opt(g, fns), ufn_promote_calls(b, fns))
+  }
+}
+
+fn ufn_promote_calls_field(fi: FieldInit, fns: [EFn]) : FieldInit {
+  match fi {
+    FI(n, v) -> FI(n, ufn_promote_calls(v, fns))
+  }
+}
+
+fn ufn_promote_calls_elem(el: ListElem, fns: [EFn]) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(ufn_promote_calls(x, fns))
+    ElSpread(x) -> ElSpread(ufn_promote_calls(x, fns))
+  }
+}
+
+fn ufn_promote_calls_stmt(s: Stmt, fns: [EFn]) : Stmt {
+  match s {
+    SLet(p, ann, rhs) -> SLet(p, ann, ufn_promote_calls(rhs, fns))
+    SVar(n, ty, rhs, l, c) -> SVar(n, ty, ufn_promote_calls(rhs, fns), l, c)
+    SAssert(cond, m) -> SAssert(ufn_promote_calls(cond, fns), ufn_promote_calls_opt(m, fns))
+    SExprStmt(x) -> SExprStmt(ufn_promote_calls(x, fns))
+    SIndexAssign(b, i, v, l, c) ->
+      SIndexAssign(ufn_promote_calls(b, fns), ufn_promote_calls(i, fns),
+                    ufn_promote_calls(v, fns), l, c)
+    SUse(n, l, c) -> SUse(n, l, c)
+  }
+}
+
+fn ufn_promote_calls_clause(c: HClause, fns: [EFn]) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, ufn_promote_calls(b, fns), l, co)
+  }
+}
+
+fn ufn_promote_calls_opt_return(opt: Option[HReturn], fns: [EFn]) : Option[HReturn] {
+  match opt {
+    Some(r) -> match r {
+      HR(p, b, l, c) -> Some(HR(p, ufn_promote_calls(b, fns), l, c))
+    }
+    None -> None
+  }
+}
+
+# Decide whether the callee Expr resolves to a UFn entry. v1 only
+# recognises EVar(name) and EModCall(mod, fname); anything else
+# (closure-typed local, lambda) keeps the boxed convention. The
+# EModCall arm picks the entry whose module-of-origin equals
+# `mod` exactly so two modules that both export the same bare
+# name as a UFn (e.g. `box_a.wrap` + `box_b.wrap`) are routed
+# correctly without round-tripping through `efn_resolve`'s
+# first-match fallback.
+fn call_resolves_to_ufn(callee: Expr, fns: [EFn]) : Bool {
+  match callee.kind {
+    EVar(name) -> match efn_resolve(fns, name) {
+      Some(EFn(_, _, _, Some(_))) -> true
+      _ -> false
+    }
+    EModCall(mod, fname) -> match lookup_ufn_sig(fns, fname, Some(mod)) {
+      Some(_) -> true
+      None    -> false
+    }
+    _ -> false
   }
 }
 
@@ -33835,13 +34606,17 @@ fn raw_op_str(op: String) : String {
 # `EBlock` / SLet to record raw locals. Children inside slots that
 # only accept boxed (calls, records, lists, closures, return) are
 # free to be `MUnboxed`; the emitter wraps at the boundary.
-fn unbox_expr(e: Expr, env: [LocBind]) : Expr {
-  let kind1 = unbox_kind(e.kind, env)
-  let mode1 = decide_mode(kind1, e.ty, env)
+fn unbox_expr(e: Expr, env: [LocBind]) : Expr = unbox_expr_aware(e, env, [])
+
+fn unbox_expr_aware(e: Expr, env: [LocBind], fns: [EFn]) : Expr {
+  let kind1 = unbox_kind_aware(e.kind, env, fns)
+  let mode1 = decide_mode_aware(kind1, e.ty, env, fns)
   Expr { kind: kind1, line: e.line, col: e.col, ty: e.ty, mode: mode1 }
 }
 
-fn unbox_kind(k: ExprKind, env: [LocBind]) : ExprKind {
+fn unbox_kind(k: ExprKind, env: [LocBind]) : ExprKind = unbox_kind_aware(k, env, [])
+
+fn unbox_kind_aware(k: ExprKind, env: [LocBind], fns: [EFn]) : ExprKind {
   match k {
     EInt(_)        -> k
     EReal(_)       -> k
@@ -33856,14 +34631,14 @@ fn unbox_kind(k: ExprKind, env: [LocBind]) : ExprKind {
     ETodo(_)       -> k
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
-    ECall(callee, args_) -> ECall(unbox_expr(callee, env),
-                                   map(args_, (a) => unbox_expr(a, env)))
-    EField(base, name)   -> EField(unbox_expr(base, env), name)
-    EIndex(a, b)         -> EIndex(unbox_expr(a, env), unbox_expr(b, env))
-    EBinop(op, a, b)     -> EBinop(op, unbox_expr(a, env), unbox_expr(b, env))
-    EUnop(op, x)         -> EUnop(op, unbox_expr(x, env))
-    EIf(c, t_, eo)       -> EIf(unbox_expr(c, env), unbox_expr(t_, env),
-                                 unbox_opt(eo, env))
+    ECall(callee, args_) -> ECall(unbox_expr_aware(callee, env, fns),
+                                   map(args_, (a) => unbox_expr_aware(a, env, fns)))
+    EField(base, name)   -> EField(unbox_expr_aware(base, env, fns), name)
+    EIndex(a, b)         -> EIndex(unbox_expr_aware(a, env, fns), unbox_expr_aware(b, env, fns))
+    EBinop(op, a, b)     -> EBinop(op, unbox_expr_aware(a, env, fns), unbox_expr_aware(b, env, fns))
+    EUnop(op, x)         -> EUnop(op, unbox_expr_aware(x, env, fns))
+    EIf(c, t_, eo)       -> EIf(unbox_expr_aware(c, env, fns), unbox_expr_aware(t_, env, fns),
+                                 unbox_opt_aware(eo, env, fns))
     EMatch(scr, arms)    -> {
       # Issue #91 — PBind catch-all in the M5 fast path. When the
       # scrutinee unboxes to a raw integral scalar, the emitter will
@@ -33873,42 +34648,44 @@ fn unbox_kind(k: ExprKind, env: [LocBind]) : ExprKind {
       # otherwise `decide_mode` falls back to MBoxed and the emit
       # routes to a non-existent `kai_<name>`. Other arms (and
       # boxed-scrut matches) keep the outer env unchanged.
-      let scr1 = unbox_expr(scr, env)
+      let scr1 = unbox_expr_aware(scr, env, fns)
       let raw_scr = ty_is_unboxable(scr1.ty) and ty_is_integral_raw(scr1.ty) and (match scr1.mode { MUnboxed -> true _ -> false })
       EMatch(scr1,
-             map(arms, (a) => unbox_arm_with_scr(a, env, raw_scr)))
+             map(arms, (a) => unbox_arm_with_scr_aware(a, env, raw_scr, fns)))
     }
     # Closure boundary: free vars captured into the closure record
     # are always boxed (per Phase 2 non-goal table). The lambda's
     # own body sees no caller env — its locals are independent.
-    ELambda(ps, b)       -> ELambda(ps, unbox_expr(b, []))
-    ERecordLit(name, fs) -> ERecordLit(name, map(fs, (fi) => unbox_field(fi, env)))
-    EList(els)           -> EList(map(els, (el) => unbox_elem(el, env)))
-    ERange(a, b, opt_step) -> ERange(unbox_expr(a, env), unbox_expr(b, env),
-                                       unbox_opt(opt_step, env))
+    ELambda(ps, b)       -> ELambda(ps, unbox_expr_aware(b, [], fns))
+    ERecordLit(name, fs) -> ERecordLit(name, map(fs, (fi) => unbox_field_aware(fi, env, fns)))
+    EList(els)           -> EList(map(els, (el) => unbox_elem_aware(el, env, fns)))
+    ERange(a, b, opt_step) -> ERange(unbox_expr_aware(a, env, fns), unbox_expr_aware(b, env, fns),
+                                       unbox_opt_aware(opt_step, env, fns))
     EBlock(stmts, tail)  -> {
-      let r = unbox_stmts(stmts, tail, env, [])
+      let r = unbox_stmts_aware(stmts, tail, env, [], fns)
       let stmts1 = match r { UbStmts(ss, _) -> ss }
       let env1   = match r { UbStmts(_, e1) -> e1 }
-      EBlock(stmts1, unbox_opt(tail, env1))
+      EBlock(stmts1, unbox_opt_aware(tail, env1, fns))
     }
-    EPipe(a, b)          -> EPipe(unbox_expr(a, env), unbox_expr(b, env))
-    EMapPipe(a, b)       -> EMapPipe(unbox_expr(a, env), unbox_expr(b, env))
-    EFlatMapPipe(a, b)   -> EFlatMapPipe(unbox_expr(a, env), unbox_expr(b, env))
+    EPipe(a, b)          -> EPipe(unbox_expr_aware(a, env, fns), unbox_expr_aware(b, env, fns))
+    EMapPipe(a, b)       -> EMapPipe(unbox_expr_aware(a, env, fns), unbox_expr_aware(b, env, fns))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(unbox_expr_aware(a, env, fns), unbox_expr_aware(b, env, fns))
     EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
       # The handled body opens a fresh dynamic scope for the effect
       # capability. v1 walks it with the outer env (no bindings
       # leak into the handler's continuation captures).
-      EHandle(unbox_expr(body, env), eff_name, eff_tyargs,
-              unbox_opt(init_opt, env), alias_opt,
-              map(clauses, (c) => unbox_clause(c, env)),
-              unbox_opt_return(ret_opt, env))
-    ELitUnit(inner, u)   -> ELitUnit(unbox_expr(inner, env), u)
-    EBang(inner)         -> EBang(unbox_expr(inner, env))
+      EHandle(unbox_expr_aware(body, env, fns), eff_name, eff_tyargs,
+              unbox_opt_aware(init_opt, env, fns), alias_opt,
+              map(clauses, (c) => unbox_clause_aware(c, env, fns)),
+              unbox_opt_return_aware(ret_opt, env, fns))
+    ELitUnit(inner, u)   -> ELitUnit(unbox_expr_aware(inner, env, fns), u)
+    EBang(inner)         -> EBang(unbox_expr_aware(inner, env, fns))
   }
 }
 
-fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
+fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode = decide_mode_aware(k, opt_ty, env, [])
+
+fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: [EFn]) : ValueMode {
   if not ty_is_unboxable(opt_ty) { MBoxed }
   else {
     match k {
@@ -33917,6 +34694,15 @@ fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
       EBool(_) -> MUnboxed
       EChar(_) -> MUnboxed
       EVar(nm) -> lb_lookup(env, nm)
+      # Phase 3 unboxing — when the callee resolves to a UFn entry
+      # and the call result type is unboxable, mark the call as
+      # MUnboxed. The emitter (`emit_kind_raw` ECall arm) then
+      # lowers to `<callee>(<raw args>)` directly; without this
+      # promotion the call would round-trip through `kai_<T>`
+      # boxing.
+      ECall(callee, _) ->
+        if call_resolves_to_ufn(callee, fns) { MUnboxed }
+        else { MBoxed }
       # Conservative: only mark composite raw when both operands are
       # already raw. Mixing a boxed operand into a raw arithmetic
       # node would force the emitter to unbox via `(...)->as.i`,
@@ -33954,6 +34740,21 @@ fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode {
         if op == "-" and child_is_raw(x) { MUnboxed }
         else if op == "not" and child_is_raw(x) { MUnboxed }
         else { MBoxed }
+      # Phase 3 unboxing — `if cond { a } else { b }` lowers to a C
+      # ternary when every operand is raw. The cond must be a raw
+      # bool; both arms must be raw scalars of the result ty.
+      EIf(cnd, ath, Some(eth)) ->
+        if child_is_raw(cnd) and child_is_raw(ath) and child_is_raw(eth) { MUnboxed }
+        else { MBoxed }
+      # Phase 3 unboxing — single-tail EBlock (no preceding stmts)
+      # forwards its tail's mode. Multi-stmt blocks stay boxed; the
+      # interleaved drops/dups would interact with raw locals in
+      # ways v1 does not yet model.
+      EBlock(stmts, Some(tail)) ->
+        match stmts {
+          [] -> tail.mode
+          _  -> MBoxed
+        }
       _ -> MBoxed
     }
   }
@@ -33983,16 +34784,20 @@ fn pow_exp_is_inlinable(e: Expr) : Bool {
   }
 }
 
-fn unbox_opt(opt: Option[Expr], env: [LocBind]) : Option[Expr] {
+fn unbox_opt(opt: Option[Expr], env: [LocBind]) : Option[Expr] = unbox_opt_aware(opt, env, [])
+
+fn unbox_opt_aware(opt: Option[Expr], env: [LocBind], fns: [EFn]) : Option[Expr] {
   match opt {
-    Some(e) -> Some(unbox_expr(e, env))
+    Some(e) -> Some(unbox_expr_aware(e, env, fns))
     None    -> None
   }
 }
 
-fn unbox_arm(a: Arm, env: [LocBind]) : Arm {
+fn unbox_arm(a: Arm, env: [LocBind]) : Arm = unbox_arm_aware(a, env, [])
+
+fn unbox_arm_aware(a: Arm, env: [LocBind], fns: [EFn]) : Arm {
   match a {
-    Arm(p, g, b) -> Arm(p, unbox_opt(g, env), unbox_expr(b, env))
+    Arm(p, g, b) -> Arm(p, unbox_opt_aware(g, env, fns), unbox_expr_aware(b, env, fns))
   }
 }
 
@@ -34005,7 +34810,9 @@ fn unbox_arm(a: Arm, env: [LocBind]) : Arm {
 # reference inside a `#{...}` interp slot or inside a captured
 # ELambda body forces the binding to stay boxed, because those
 # read sites bypass this pass's alias map.
-fn unbox_arm_with_scr(a: Arm, env: [LocBind], raw_scr: Bool) : Arm {
+fn unbox_arm_with_scr(a: Arm, env: [LocBind], raw_scr: Bool) : Arm = unbox_arm_with_scr_aware(a, env, raw_scr, [])
+
+fn unbox_arm_with_scr_aware(a: Arm, env: [LocBind], raw_scr: Bool, fns: [EFn]) : Arm {
   match a {
     Arm(p, g, b) -> {
       let env_b = match p.pkind {
@@ -34016,63 +34823,79 @@ fn unbox_arm_with_scr(a: Arm, env: [LocBind], raw_scr: Bool) : Arm {
         }
         _ -> env
       }
-      Arm(p, unbox_opt(g, env), unbox_expr(b, env_b))
+      Arm(p, unbox_opt_aware(g, env, fns), unbox_expr_aware(b, env_b, fns))
     }
   }
 }
 
-fn unbox_field(fi: FieldInit, env: [LocBind]) : FieldInit {
+fn unbox_field(fi: FieldInit, env: [LocBind]) : FieldInit = unbox_field_aware(fi, env, [])
+
+fn unbox_field_aware(fi: FieldInit, env: [LocBind], fns: [EFn]) : FieldInit {
   match fi {
-    FI(n, v) -> FI(n, unbox_expr(v, env))
+    FI(n, v) -> FI(n, unbox_expr_aware(v, env, fns))
   }
 }
 
-fn unbox_elem(el: ListElem, env: [LocBind]) : ListElem {
+fn unbox_elem(el: ListElem, env: [LocBind]) : ListElem = unbox_elem_aware(el, env, [])
+
+fn unbox_elem_aware(el: ListElem, env: [LocBind], fns: [EFn]) : ListElem {
   match el {
-    ElPlain(x)  -> ElPlain(unbox_expr(x, env))
-    ElSpread(x) -> ElSpread(unbox_expr(x, env))
+    ElPlain(x)  -> ElPlain(unbox_expr_aware(x, env, fns))
+    ElSpread(x) -> ElSpread(unbox_expr_aware(x, env, fns))
   }
 }
 
-fn unbox_clause(c: HClause, env: [LocBind]) : HClause {
+fn unbox_clause(c: HClause, env: [LocBind]) : HClause = unbox_clause_aware(c, env, [])
+
+fn unbox_clause_aware(c: HClause, env: [LocBind], fns: [EFn]) : HClause {
   match c {
-    HC(n, ps, b, l, co) -> HC(n, ps, unbox_expr(b, env), l, co)
+    HC(n, ps, b, l, co) -> HC(n, ps, unbox_expr_aware(b, env, fns), l, co)
   }
 }
 
-fn unbox_opt_return(opt: Option[HReturn], env: [LocBind]) : Option[HReturn] {
+fn unbox_opt_return(opt: Option[HReturn], env: [LocBind]) : Option[HReturn] = unbox_opt_return_aware(opt, env, [])
+
+fn unbox_opt_return_aware(opt: Option[HReturn], env: [LocBind], fns: [EFn]) : Option[HReturn] {
   match opt {
-    Some(r) -> Some(unbox_return(r, env))
+    Some(r) -> Some(unbox_return_aware(r, env, fns))
     None    -> None
   }
 }
 
-fn unbox_return(r: HReturn, env: [LocBind]) : HReturn {
+fn unbox_return(r: HReturn, env: [LocBind]) : HReturn = unbox_return_aware(r, env, [])
+
+fn unbox_return_aware(r: HReturn, env: [LocBind], fns: [EFn]) : HReturn {
   match r {
-    HR(p, b, l, c) -> HR(p, unbox_expr(b, env), l, c)
+    HR(p, b, l, c) -> HR(p, unbox_expr_aware(b, env, fns), l, c)
   }
 }
 
 type UbStmts = UbStmts([Stmt], [LocBind])
 
-fn unbox_stmts(stmts: [Stmt], tail: Option[Expr], env: [LocBind], acc: [Stmt]) : UbStmts {
+fn unbox_stmts(stmts: [Stmt], tail: Option[Expr], env: [LocBind], acc: [Stmt]) : UbStmts =
+  unbox_stmts_aware(stmts, tail, env, acc, [])
+
+fn unbox_stmts_aware(stmts: [Stmt], tail: Option[Expr], env: [LocBind], acc: [Stmt], fns: [EFn]) : UbStmts {
   match stmts {
     [] -> UbStmts(list_reverse(acc), env)
     [s, ...rest] -> {
-      let r = unbox_stmt(s, rest, tail, env)
+      let r = unbox_stmt_aware(s, rest, tail, env, fns)
       let s1 = match r { UbStmt(s_, _) -> s_ }
       let e1 = match r { UbStmt(_, ev) -> ev }
-      unbox_stmts(rest, tail, e1, [s1, ...acc])
+      unbox_stmts_aware(rest, tail, e1, [s1, ...acc], fns)
     }
   }
 }
 
 type UbStmt = UbStmt(Stmt, [LocBind])
 
-fn unbox_stmt(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind]) : UbStmt {
+fn unbox_stmt(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind]) : UbStmt =
+  unbox_stmt_aware(s, rest, tail, env, [])
+
+fn unbox_stmt_aware(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind], fns: [EFn]) : UbStmt {
   match s {
     SLet(pat, ann, rhs) -> {
-      let rhs1 = unbox_expr(rhs, env)
+      let rhs1 = unbox_expr_aware(rhs, env, fns)
       match pat.pkind {
         PBind(nm) -> match rhs1.mode {
           MUnboxed -> {
@@ -34106,12 +34929,12 @@ fn unbox_stmt(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind]) : UbStm
         _ -> UbStmt(SLet(pat, ann, rhs1), env)
       }
     }
-    SVar(n, ty, rhs, l, c) -> UbStmt(SVar(n, ty, unbox_expr(rhs, env), l, c), env)
-    SAssert(cond, m) -> UbStmt(SAssert(unbox_expr(cond, env), unbox_opt(m, env)), env)
-    SExprStmt(x) -> UbStmt(SExprStmt(unbox_expr(x, env)), env)
+    SVar(n, ty, rhs, l, c) -> UbStmt(SVar(n, ty, unbox_expr_aware(rhs, env, fns), l, c), env)
+    SAssert(cond, m) -> UbStmt(SAssert(unbox_expr_aware(cond, env, fns), unbox_opt_aware(m, env, fns)), env)
+    SExprStmt(x) -> UbStmt(SExprStmt(unbox_expr_aware(x, env, fns)), env)
     SIndexAssign(b, i, v, l, c) ->
-      UbStmt(SIndexAssign(unbox_expr(b, env), unbox_expr(i, env),
-                          unbox_expr(v, env), l, c), env)
+      UbStmt(SIndexAssign(unbox_expr_aware(b, env, fns), unbox_expr_aware(i, env, fns),
+                          unbox_expr_aware(v, env, fns), l, c), env)
     SUse(n, l, c) -> UbStmt(SUse(n, l, c), env)
   }
 }
@@ -34343,9 +35166,12 @@ fn uses_have_name(uses: [Use], nm: String) : Bool {
   }
 }
 
-fn perceus_pass(decls: [Decl]) : [Decl] = map(decls, perceus_decl)
+fn perceus_pass(decls: [Decl]) : [Decl] = {
+  let fns = register_fn_decls(decls)
+  map(decls, (d) => perceus_decl(d, fns))
+}
 
-fn perceus_decl(d: Decl) : Decl {
+fn perceus_decl(d: Decl, fns: [EFn]) : Decl {
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
       # m12.7.x FFI v1: an `[<extern_c>]` axiom's body is the magic
@@ -34355,6 +35181,12 @@ fn perceus_decl(d: Decl) : Decl {
       # after the extern returns), so prepending unused-param drops
       # would double-free.
       if body_is_ffi_extern(body) { d }
+      # Phase 3 unboxing — UFn params are raw C scalars (`int64_t`
+      # etc.) with no reference count. dup/drop emission against
+      # `kai_<pname>` would refer to a non-existent boxed alias.
+      # Skip Perceus for unboxed-signature decls; the body has no
+      # RC obligations on its own params.
+      else if is_ufn_decl(fns, name, mo) { d }
       else {
         let pnames = map(params, (p) => p.pname)
         let uses = pcs_collect_uses_expr(body, pnames, false, [])
@@ -37238,13 +38070,29 @@ fn tcrec_parse_decimal_loop(s: String, i: Int, n: Int, acc: Int) : Int {
 fn tcrec_emit_goto(src: String, sym: String, dropmask: Int, pnames: [String],
                    args_e: [Expr], lcs: [String], fns: [EFn], variants: [EVar],
                    lams: [LamInfo], cls: [ClauseInfo]) : String {
-  let arg_lets = tcrec_emit_arg_lets(src, args_e, 0, lcs, fns, variants, lams, cls)
-  let drops    = tcrec_emit_drops(pnames, dropmask, 0)
-  let rebinds  = tcrec_emit_rebinds(pnames, 0)
-  concat_all([
-    "({ ", arg_lets, drops, rebinds,
-    "goto _kai_", sym, "_entry; (KaiValue *)0; })"
-  ])
+  # Phase 3 unboxing — when the recursive callee is a UFn, the
+  # rebound parameters are raw scalars (`kair_<name>`) and the
+  # arg values are evaluated as raw expressions. Drops collapse
+  # to no-ops since raw scalars carry no reference count.
+  match lookup_ufn_by_csym(fns, sym) {
+    Some(US(pts, _)) -> {
+      let arg_lets = tcrec_emit_arg_lets_raw(src, args_e, pts, 0, lcs, fns, variants, lams, cls)
+      let rebinds  = tcrec_emit_rebinds_raw(pnames, 0)
+      concat_all([
+        "({ ", arg_lets, rebinds,
+        "goto _kai_", sym, "_entry; 0; })"
+      ])
+    }
+    None -> {
+      let arg_lets = tcrec_emit_arg_lets(src, args_e, 0, lcs, fns, variants, lams, cls)
+      let drops    = tcrec_emit_drops(pnames, dropmask, 0)
+      let rebinds  = tcrec_emit_rebinds(pnames, 0)
+      concat_all([
+        "({ ", arg_lets, drops, rebinds,
+        "goto _kai_", sym, "_entry; (KaiValue *)0; })"
+      ])
+    }
+  }
 }
 
 fn tcrec_emit_arg_lets(src: String, args_e: [Expr], i: Int, lcs: [String],
@@ -37258,6 +38106,36 @@ fn tcrec_emit_arg_lets(src: String, args_e: [Expr], i: Int, lcs: [String],
       ])
       string_concat(head,
         tcrec_emit_arg_lets(src, rest, i + 1, lcs, fns, variants, lams, cls))
+    }
+  }
+}
+
+# Phase 3 unboxing — same shape as `tcrec_emit_arg_lets` but each
+# `_tN` is a raw scalar matching the corresponding UFn param ty,
+# and the rhs is built by `emit_expr_raw`. The decoupling between
+# arg evaluation (into temporaries) and rebind (back to param
+# locals) preserves the original sequencing — the prior args may
+# have referenced the old param values, so all temporaries are
+# computed before any rebind fires.
+fn tcrec_emit_arg_lets_raw(src: String, args_e: [Expr], pts: [Ty], i: Int, lcs: [String],
+                            fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
+  match args_e {
+    [] -> ""
+    [a, ...rest] -> {
+      let pty = match pts {
+        [t, ...trest] -> t
+        []            -> match a.ty { Some(t) -> t None -> TyInt }
+      }
+      let trest = match pts {
+        [_, ...r] -> r
+        []        -> []
+      }
+      let arg_c = emit_expr_raw(src, a, lcs, fns, variants, lams, cls)
+      let head = concat_all([
+        raw_c_type(Some(pty)), " _t", int_to_string(i), " = ", arg_c, "; "
+      ])
+      string_concat(head,
+        tcrec_emit_arg_lets_raw(src, rest, trest, i + 1, lcs, fns, variants, lams, cls))
     }
   }
 }
@@ -37286,6 +38164,20 @@ fn tcrec_emit_rebinds(pnames: [String], i: Int) : String {
         "kai_", p, " = _t", int_to_string(i), "; "
       ])
       string_concat(head, tcrec_emit_rebinds(rest, i + 1))
+    }
+  }
+}
+
+# Phase 3 unboxing — rebind raw param locals (`kair_<name>`) from
+# the temporaries computed by `tcrec_emit_arg_lets_raw`.
+fn tcrec_emit_rebinds_raw(pnames: [String], i: Int) : String {
+  match pnames {
+    [] -> ""
+    [p, ...rest] -> {
+      let head = concat_all([
+        "kair_", p, " = _t", int_to_string(i), "; "
+      ])
+      string_concat(head, tcrec_emit_rebinds_raw(rest, i + 1))
     }
   }
 }
@@ -39522,7 +40414,7 @@ fn llvm_emit_fn_value(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit {
       _ -> llvm_closure_error(e, nm, line, col)
     }
     None -> match efn_resolve(e.fns, nm) {
-      Some(EFn(_, arity, mo)) -> {
+      Some(EFn(_, arity, mo, _)) -> {
         let thunk = concat_all(["@_kai_", c_sym(nm, mo), "_thunk"])
         llvm_build_closure(e, thunk, arity)
       }
@@ -39553,7 +40445,7 @@ fn llvm_closure_error(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit /
 # the module name carried in EModCall.
 fn llvm_emit_modcall_fn_value(e: LlvmEmit, mod: String, fname: String, line: Int, col: Int) : LlvmEmit / Console {
   match efn_resolve(e.fns, fname) {
-    Some(EFn(_, arity, _)) -> {
+    Some(EFn(_, arity, _, _)) -> {
       let thunk = concat_all(["@_kai_", c_sym(fname, Some(mod)), "_thunk"])
       llvm_build_closure(e, thunk, arity)
     }
