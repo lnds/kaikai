@@ -1,0 +1,78 @@
+# fx inverse — exercise the asymmetric-rate stance and a manual
+# round-trip via dec_div for callers that DO want a derived inverse.
+#
+# Issue #365 v1 deliberately does NOT auto-derive inverse rates
+# because real bid/ask spreads make them asymmetric. This fixture
+# proves both halves of that contract:
+#  - fx_lookup(EUR -> USD) on a table that only knows USD -> EUR
+#    returns None.
+#  - Callers who want a derived round-trip can compute the inverse
+#    via the new `dec_div : Option[Decimal]` (PR #400) and register
+#    the result themselves.
+
+fn check_eq_str(label: String, got: String, want: String) : Unit / Stdout =
+  if got == want { Stdout.print(label ++ ": ok") }
+  else { Stdout.print(label ++ ": MISMATCH got='" ++ got ++ "' want='" ++ want ++ "'") }
+
+fn main() = {
+  let t0 = fx_table_empty()
+
+  # Register only USD -> EUR @ 0.80. The reverse is NOT derived.
+  let usd_eur = fx_rate_make("USD", "EUR", dec_from_parts(0, 80, 2))
+  let t1 = fx_table_put(t0, usd_eur)
+
+  # EUR -> USD lookup must miss.
+  match fx_lookup(t1, "EUR", "USD") {
+    None    -> Stdout.print("EUR->USD missing: ok (None)")
+    Some(_) -> Stdout.print("EUR->USD missing: FAIL (auto-inverse leak)")
+  }
+
+  # And fx_convert mirrors it: EUR 50 -> USD has no path.
+  let eur_50 = money_from_parts(50, 0, 2, "EUR")
+  match fx_convert(t1, eur_50, "USD", 2) {
+    None    -> Stdout.print("convert EUR -> USD without rate: ok (None)")
+    Some(_) -> Stdout.print("convert EUR -> USD without rate: FAIL")
+  }
+
+  # Caller-side derivation: compute 1 / 0.80 with 4dp and register
+  # the result as EUR -> USD. dec_div now returns Option[Decimal];
+  # we propagate the Option through the rate registration.
+  let one = dec_from_int(1)
+  let usd_eur_rate = dec_from_parts(0, 80, 2)
+  match dec_div(one, usd_eur_rate, 4) {
+    None       -> Stdout.print("derived inverse: FAIL (dec_div returned None)")
+    Some(inv)  -> {
+      check_eq_str("derived inverse rate", dec_to_string(inv), "1.2500")
+      let t2 = fx_table_put(t1, fx_rate_make("EUR", "USD", inv))
+
+      # Now the round-trip works.
+      match fx_convert(t2, eur_50, "USD", 2) {
+        None    -> Stdout.print("EUR 50 -> USD via derived inverse: FAIL")
+        Some(m) -> check_eq_str("EUR 50 -> USD via derived inverse",
+                                money_to_string(m), "USD 62.50")
+      }
+
+      # And USD 100 -> EUR -> USD round-trips back to USD 100 (the
+      # rate algebra cancels exactly on whole-cent inputs because
+      # 0.80 * 1.2500 = 1.0000).
+      let usd_100 = money_from_parts(100, 0, 2, "USD")
+      match fx_convert(t2, usd_100, "EUR", 2) {
+        None       -> Stdout.print("round-trip leg 1: FAIL")
+        Some(eur)  -> match fx_convert(t2, eur, "USD", 2) {
+          None         -> Stdout.print("round-trip leg 2: FAIL")
+          Some(back)   -> check_eq_str("USD 100 round-trip", money_to_string(back), "USD 100.00")
+        }
+      }
+    }
+  }
+
+  # dec_div None is propagated honestly: registering a zero rate
+  # would not auto-fail at the FX layer, but a caller that tries
+  # to derive its inverse via dec_div gets None.
+  let zero_rate = dec_zero()
+  match dec_div(one, zero_rate, 4) {
+    None    -> Stdout.print("dec_div by zero rate: ok (None)")
+    Some(_) -> Stdout.print("dec_div by zero rate: FAIL (silent zero leak)")
+  }
+  0
+}

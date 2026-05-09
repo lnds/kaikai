@@ -1093,6 +1093,7 @@ EXTRA_PRELUDE_FLAGS := --prelude ../stdlib/protocols.kai \
                        --prelude ../stdlib/math/complex.kai \
                        --prelude ../stdlib/decimal.kai \
                        --prelude ../stdlib/money.kai \
+                       --prelude ../stdlib/fx.kai \
                        --prelude ../stdlib/uuid.kai \
                        --prelude ../stdlib/regexp.kai \
                        --prelude ../stdlib/path.kai \
