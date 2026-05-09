@@ -84,6 +84,14 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.48.0 (2026-05-09)
+
+### Added
+
+- **driver**: git deps + lockfile + cache + transitive resolution (closes #405)
+- **driver**: kai init/install/show + local-path deps (refs #405)
+- **parser,typer**: add |? filter-pipe operator (closes #412)
+
 ## v0.47.0 (2026-05-09)
 
 ### BREAKING CHANGE
