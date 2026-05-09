@@ -28967,7 +28967,22 @@ fn synth_stmts(st: InferState, stmts: [Stmt]) : InferredStmts {
 fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt {
   match stmt {
     SLet(pat, ann, rhs) -> {
-      let rr = synth(st, rhs)
+      # issue #379: when the let is annotated and the RHS is an
+      # `EMatch`, drive the RHS in check-mode so the expected
+      # type reaches every arm via `check_match`. The non-match
+      # path is unchanged (synth + post-hoc unify against `declared`
+      # below). Decimal-literal lowering relies on `rr.ty` being the
+      # synthesised RHS type, which is preserved in both paths.
+      let rr = match ann {
+        Some(te) -> match rhs.kind {
+          EMatch(_, _) -> {
+            let exp_resolved = resolve_ty(te)
+            check_expr_against(st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
+          }
+          _ -> synth(st, rhs)
+        }
+        None -> synth(st, rhs)
+      }
       # issue #162: when the let binding is annotated `Decimal<u>` and
       # the RHS is a UoM-literal `<u>`, lower it to a typed
       # `Decimal { raw, scale }` carrier so the unifier sees equal
@@ -29341,6 +29356,73 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
   let arms_codegen = rewrite_record_alias_arms(arms_narrowed, st_post.recs)
   let root = with_ty(mk_expr(EMatch(rs_.expr, arms_codegen), line, col), ty)
   mk_inferred(st_post, ty, root)
+}
+
+# issue #379: bidirectional check variant of `synth_match`. When the
+# match appears in a position with a known expected type — annotated
+# function return, annotated `let` RHS — the caller passes that type
+# in as `expected`, and each arm is unified against it directly
+# instead of against a freshly-fabricated TyVar. The change restores
+# the implicit-upcast promise of #187 across match arms: with the
+# expected union shape in scope when the first arm unifies, the
+# `union_upcast_ok` rule in `unify_heads` (line ~24631) accepts a
+# narrower component type without the typer pinning `body_ty` to it.
+# Synthesise mode (`synth_match`) is preserved verbatim for
+# unannotated positions so existing inference is unchanged.
+fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
+               line: Int, col: Int) : Inferred {
+  let rs_ = synth(st, scr)
+  let ra = synth_arms(rs_.st, arms, rs_.ty, expected, line, col)
+  let ty = apply_ty(ra.st.sub, expected)
+  let scr_final = apply_ty(ra.st.sub, rs_.ty)
+  let st_post = check_exhaustive(ra.st, ra.arms, scr_final, line, col)
+  let arms_narrowed = expand_narrow_arms(ra.arms, st_post.env)
+  let arms_codegen  = rewrite_record_alias_arms(arms_narrowed, st_post.recs)
+  let root = with_ty(mk_expr(EMatch(rs_.expr, arms_codegen), line, col), ty)
+  mk_inferred(st_post, ty, root)
+}
+
+# issue #379: route an expression through `check_match` when its
+# AST head is `EMatch`, otherwise fall back to synth. The post-hoc
+# unify in the caller (`infer_decl`, `synth_stmt` for SLet) handles
+# the non-match case; for match the propagation already happened
+# inside `check_match`.
+fn check_expr_against(st: InferState, e: Expr, expected: Ty,
+                      what: String, line: Int, col: Int) : Inferred {
+  match e.kind {
+    EMatch(scr, arms) -> check_match(st, scr, arms, expected, e.line, e.col)
+    _ -> synth(st, e)
+  }
+}
+
+# issue #379: same idea but threaded through an EBlock when the tail
+# is itself an EMatch. The fn-body case `fn f(...) : T = match { ... }`
+# parses as a bare EMatch (handled by `check_expr_against`), but
+# `fn f(...) : T { ...stmts... match { ... } }` parses as an EBlock
+# whose tail is an EMatch — synth_block ignores the expected type, so
+# we recreate just enough of synth_block here to route the tail
+# through check_match while the prefix stmts still synth normally.
+fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
+                          what: String, line: Int, col: Int) : Inferred {
+  match body.kind {
+    EMatch(scr, arms) -> check_match(st, scr, arms, expected, body.line, body.col)
+    EBlock(stmts, tail) -> match tail {
+      Some(te) -> match te.kind {
+        EMatch(scr, arms) -> {
+          let outer = st
+          let is_ = synth_stmts(st, stmts)
+          let r = check_match(is_.st, scr, arms, expected, te.line, te.col)
+          let st2 = st_restore_entries(outer, r.st)
+          let ty = apply_ty(st2.sub, r.ty)
+          let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
+          mk_inferred(st2, ty, root)
+        }
+        _ -> synth(st, body)
+      }
+      None -> synth(st, body)
+    }
+    _ -> synth(st, body)
+  }
 }
 
 # issue #325: walk arms and rewrite `PVariantRecord(name, fields)` to
@@ -30254,9 +30336,19 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # to lambda bodies (synth_lambda) — `!` does not propagate from
       # closures.
       let st_ready = st_set_ret_ty(added.st, opt_declared)
-      let rb = synth(st_ready, body)
       let what = string_concat("return type of ", nm)
       let ret_site = return_site_of(body)
+      # issue #379: when the fn has an annotated return type, drive the
+      # body in check-mode so the expected type reaches every match-arm
+      # via `check_match`. The post-hoc unify below collapses to a
+      # no-op (`apply_ty(sub, expected)` is already pinned), but is
+      # kept for non-match bodies whose synthesised type still needs
+      # the unification step. Pre-issue-#379 behaviour is preserved
+      # exactly when `opt_declared = None`.
+      let rb = match opt_declared {
+        Some(rty) -> check_body_against_ret(st_ready, body, rty, what, ret_site.line, ret_site.col)
+        None      -> synth(st_ready, body)
+      }
       let declared_ret = match opt_declared {
         Some(rty) -> rty
         None      -> rb.ty
