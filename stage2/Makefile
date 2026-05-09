@@ -1034,6 +1034,30 @@ test-call-elision-neg: $(TARGET) build
 	  && echo "call-elision-neg OK too_loose" \
 	  || { echo "call-elision-neg DIFF too_loose"; diff $$exp build/ce-too-loose.err; exit 1; }
 
+# Issue #381 — unused-binding warning fixtures. Each `<name>.kai`
+# under `examples/typer/` ships a `<name>.warn.expected` golden that
+# pins the diagnostic stream emitted on stderr. Compilation must
+# always succeed (warnings never fail the build); the gate is the
+# stderr diff. An empty `.warn.expected` proves the silent cases
+# (`_x` prefix, unused param, `__internal`) emit nothing.
+test-unused-bindings: $(TARGET) build
+	@set -e; \
+	for f in ../examples/typer/*.kai; do \
+	  [ -e $$f ] || continue; \
+	  name=$$(basename $$f .kai); \
+	  exp=../examples/typer/$$name.warn.expected; \
+	  rc=0; ./$(TARGET) $$f > build/typer-$$name.c 2> build/typer-$$name.err || rc=$$?; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo "unused-bindings FAIL $$name (kaic2 exit=$$rc)"; cat build/typer-$$name.err; exit 1; \
+	  fi; \
+	  if [ ! -f $$exp ]; then \
+	    echo "unused-bindings FAIL $$name (missing $$exp)"; exit 1; \
+	  fi; \
+	  diff -q $$exp build/typer-$$name.err > /dev/null \
+	    && echo "unused-bindings OK $$name" \
+	    || { echo "unused-bindings DIFF $$name"; diff $$exp build/typer-$$name.err; exit 1; }; \
+	done
+
 # m14-pre — stdlib/core/*.kai list-op smoke tests. Each fixture under
 # examples/stdlib/ is compiled with kaic2 + the full split core
 # preludes and its stdout is diffed against `<name>.out.expected`.
@@ -3778,7 +3802,7 @@ test-violations: $(TARGET) build
 	  fi; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-335 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-violations
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-335 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-violations test-unused-bindings
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -3787,7 +3811,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-335 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-335 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-unused-bindings
 
 clean:
 	rm -rf build $(TARGET)
