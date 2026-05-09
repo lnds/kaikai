@@ -1122,6 +1122,104 @@ are rejected with a typed diagnostic pointing the user at `!` or
 `option.and_then` / `result.and_then` for explicit chaining. The
 pipes are list-shaped sugar, not a generic monadic chain.
 
+## 12. Multi-clause function bodies — `case`-led arms
+
+Issue #415. A third form of `fn` body, alongside `= expr`
+(single-expression) and `{ stmts }` (statement-block). The body block
+is composed entirely of `case`-led arms; each arm pattern-matches
+against the implicit tuple of arguments and may carry an optional
+`when` guard.
+
+```kai
+fn classify(n: Int) : String {
+  case 0          -> "zero"
+  case n when n < 0 -> "neg"
+  case _          -> "pos"
+}
+
+fn classify2(a: Int, b: Int) : String {
+  case 0, 0 -> "both-zero"
+  case 0, _ -> "first-zero"
+  case _, 0 -> "second-zero"
+  case _, _ -> "neither"
+}
+```
+
+### Decision rule
+
+When `parse_fn_decl` reaches a `{`, it peeks past the brace and any
+newlines/semicolons. If the first significant token is `case`, the
+block is parsed as multi-clause; every subsequent arm must also be
+`case`-led until the closing `}`. Otherwise the body falls into the
+existing statement-block parser. LL(1) with one token of lookahead.
+
+### Pure-block rule
+
+A body block is **either** a sequence of statements **or** a sequence
+of `case` arms. Mixing is a hard parse error, regardless of order.
+Once stmt-mode is committed (the first token was `let`/`var`/expr/etc.)
+a stray `case` produces "case-block must contain only `case` arms".
+Once case-mode is committed (the first token was `case`) a non-`case`
+non-`}` token produces the same diagnostic. There is no warning-only
+mode; the rule is enforced unconditionally.
+
+If you need setup before discrimination, extract a helper or use the
+single-expression body wrapping a `match`:
+
+```kai
+fn lookup(xs: [Entry], k: String) : Lookup =
+  let cache = compute() {
+    match (xs, k) { ... }
+  }
+```
+
+### Desugar
+
+For a 1-arg fn the scrutinee is the parameter directly:
+
+```
+fn f(a: T) : R { case p1 -> b1 ; case p2 -> b2 }
+# desugars to
+fn f(a: T) : R = match a { p1 -> b1 ; p2 -> b2 }
+```
+
+For an N-arg fn (2 ≤ N ≤ 4) the scrutinee is the implicit tuple of
+parameters; surface kaikai has no tuple expression so the desugar
+reuses the existing multi-arg `match a, b { p, q -> ... }` machinery
+(`desugar_multi_match`) — each arm carries N comma-separated patterns,
+mirroring issue #129. The N=4 cap matches `parse_match`; raising it
+requires re-evaluating the nested-match blowup.
+
+### Why `case` keyword
+
+- `|` is already overloaded as a variant separator and as the map-pipe
+  operator; a third overload would compound the disambiguation cost.
+- A bare-pattern leader would force backtracking to disambiguate
+  stmt-block from arm-block, breaking the LL(1) discipline.
+- A `match { ... }` block-of-arms (no scrutinee) was viable but adds
+  ceremony that does not pay off; the per-arm `case` reads more
+  naturally.
+
+### Why `{}` is mandatory
+
+Every block in kaikai uses `{}`. Allowing case-arms without braces
+would be a unique exception. The closing `}` also gives the parser a
+precise anchor for the "expected `case` or `}`" diagnostic.
+
+### Fixtures
+
+- `examples/sugars/case_block_single_arg.kai` — 1-arg form with a
+  `when` guard.
+- `examples/sugars/case_block_multi_arg.kai` — 2-arg form, all literal
+  patterns, four arms.
+- `examples/sugars/case_block_with_guard.kai` — multi-arg `when` guard.
+- `examples/sugars/case_block_recursive_list.kai` — recursive list
+  traversal with list-spread patterns and a guard.
+- `examples/sugars/case_block_non_exhaustive.kai` — exhaustiveness
+  check fires through the desugared `match`.
+- `examples/sugars/case_block_mixed_stmt.kai` — pure-block rule
+  rejects `let` interleaved with `case`.
+
 ## Cross-sugar interaction
 
 All five sugars compose without ambiguity because their grammar
