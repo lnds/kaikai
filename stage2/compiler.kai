@@ -9335,7 +9335,7 @@ fn prelude_names() : [String] {
     "real_asin", "real_acos", "real_atan",
     "real_sinh", "real_cosh", "real_tanh",
     "real_signum", "real_is_nan", "real_is_inf",
-    "real_pow", "real_atan2",
+    "real_pow", "real_atan2", "real_rem",
     "string_length", "string_concat", "string_concat_all", "string_join",
     "string_split", "string_contains", "char_at",
     "string_slice", "char_to_int", "int_to_char",
@@ -10581,6 +10581,7 @@ fn prelude_table() : [EPrelude] {
     EP("real_is_inf",      "kai_prelude_real_is_inf",      1),
     EP("real_pow",         "kai_prelude_real_pow",         2),
     EP("real_atan2",       "kai_prelude_real_atan2",       2),
+    EP("real_rem",         "kai_prelude_real_rem",         2),
     EP("string_length",    "kai_prelude_string_length",    1),
     EP("string_concat",    "kai_prelude_string_concat",    2),
     EP("string_concat_all","kai_prelude_string_concat_all",1),
@@ -22292,6 +22293,7 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "real_is_inf",    scheme: mono(fn_ty([TyReal],   TyBool)) },
     TyEntry { name: "real_pow",       scheme: mono(fn_ty([TyReal, TyReal], TyReal)) },
     TyEntry { name: "real_atan2",     scheme: mono(fn_ty([TyReal, TyReal], TyReal)) },
+    TyEntry { name: "real_rem",       scheme: mono(fn_ty([TyReal, TyReal], TyReal)) },
 
     # Strings
     TyEntry { name: "string_length",  scheme: mono(fn_ty([TyString],                TyInt)) },
@@ -27436,12 +27438,16 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     # keeps the unify-and-emit fast path; concrete non-primitive
     # operands desugar to a `Rem.rem` protocol-method call so user
     # types can supply `impl Rem for T`. Heterogeneous routing follows
-    # the same shape as `*` / `/` (issue #180).
+    # the same shape as `*` / `/` (issue #180). Issue #364: `Real %
+    # Real` also routes through the protocol, which dispatches to
+    # `impl Rem for Real` and lowers to the `fmod` libm binding.
     let lty_now = apply_ty(rr.st.sub, rl.ty)
     let rty_now = apply_ty(rr.st.sub, rr.ty)
     if binop_should_dispatch_proto(lty_now, rty_now) {
       synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
     } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty_now, rty_now) {
+      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+    } else if ty_is_real_head(lty_now) and ty_is_real_head(rty_now) {
       synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
     } else {
       let s1 = st_unify(rr.st, rl.ty, TyInt, "integer arithmetic", line, col)
@@ -27545,6 +27551,18 @@ fn ty_is_concrete_prim(t: Ty) : Bool {
     TyReal -> true
     TyDimT(inner, _) -> ty_is_concrete_prim(inner)
     TyRefineT(inner, _) -> ty_is_concrete_prim(inner)
+    _ -> false
+  }
+}
+
+# Issue #364: same-prim Real detection used by the `%` typer rule to
+# route `Real % Real` through `impl Rem for Real` (libm `fmod`).
+# Strips Dim / Refine wrappers like `ty_is_concrete_prim` does.
+fn ty_is_real_head(t: Ty) : Bool {
+  match t {
+    TyReal -> true
+    TyDimT(inner, _) -> ty_is_real_head(inner)
+    TyRefineT(inner, _) -> ty_is_real_head(inner)
     _ -> false
   }
 }
@@ -37498,6 +37516,8 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_prelude_char_at(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_char_to_int(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_int_to_char(%KaiValue*)\n",
+    # Issue #364: `impl Rem for Real` in stdlib/protocols.kai.
+    "declare %KaiValue* @kaix_prelude_real_rem(%KaiValue*, %KaiValue*)\n",
     # m7c-b: runtime helpers for the effects ABI. The C backend
     # invokes these via in-line statement-expressions; the LLVM
     # backend declares them as external and emits the same calls.
@@ -37858,7 +37878,14 @@ fn llvm_prelude_table() : [LlvmPrelude] {
     LP("array_length",     1, None),
     LP("array_get",        2, None),
     LP("array_set",        3, None),
-    LP("array_grow",       3, None)
+    LP("array_grow",       3, None),
+    # Issue #364: `impl Rem for Real` in `stdlib/protocols.kai`
+    # delegates to `real_rem` (libm `fmod`). The prelude impl is
+    # monomorphised into every program that loads `protocols.kai`,
+    # so the LLVM backend needs a callable symbol even when user
+    # code never reaches `Real % Real`. Routes to
+    # `@kaix_prelude_real_rem` defined in `stage0/runtime_llvm.c`.
+    LP("real_rem",         2, None)
   ]
 }
 
