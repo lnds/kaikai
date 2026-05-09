@@ -112,6 +112,41 @@ This is intentional. Chained subtyping makes inference brittle and
 diagnostics hard to phrase; the user writes the intermediate
 binding when composing across more than one layer.
 
+### Propagation into `match` arms
+
+The upcast also fires inside `match` arms when the match's result
+type is constrained externally — the **annotated return type** of
+the enclosing function or the **annotation on a `let`** whose RHS
+is the match. The typer drives those positions in check-mode
+(`check_match`), so the expected union shape is in scope when each
+arm's body unifies. A narrower component-typed arm flows into the
+wider declared type without a `let` lift:
+
+```kai
+type ErrorA  = NoDefinida(String)
+type ErrorB  = DivCero
+type ErrorAB = ErrorA | ErrorB
+
+# Before #379: the typer pinned the match's result type from the
+# first arm (`Result[ErrorA, _]`), and the recursive call's
+# `Result[ErrorAB, Real]` failed to unify.
+# After #379: the annotated return type reaches the match arms, so
+# `Result[ErrorA, _]` upcasts to `Result[ErrorAB, Real]` per D3.
+fn lookup(xs: [(String, Real)], k: String) : Result[ErrorAB, Real] =
+  match xs {
+    []                  -> Err(NoDefinida(k))
+    [(n, v), ...rest]   -> if n == k { Ok(v) } else { lookup(rest, k) }
+  }
+```
+
+Synthesise mode (`match` in unannotated position) is unchanged: the
+typer still infers the arm result bottom-up, and arms with
+genuinely incompatible synthesised types are still rejected. The
+bidirectional check is purely additive — it only fires when an
+expected type is in scope. Argument-position propagation
+(`f(match { ... })` where the parameter type is known) is out of
+scope for #379 and tracked separately.
+
 ## Pattern matching
 
 Two pattern shapes work over union scrutinees, and they
