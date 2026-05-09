@@ -80,7 +80,6 @@ What's still open (planned-but-not-shipped):
 | `os/process.kai` (Kai wrapper)  | #346    | runtime + effect already in place via #142; only the public `pub fn` surface is missing          |
 | `fs/dir` runtime primitives     | #344    | `kai_prelude_dir_*` C bodies + prelude/typer wiring; `stdlib/fs/dir.kai` is a doc-only stub      |
 | `fs/file` extras                | #345    | `exists`, `delete`, `rename`, `metadata`, `read_bytes` — not in `stage0/runtime.h` yet           |
-| `math/int` extension            | #347    | `log2` + `div_mod` shipped (PR refs #347); `abs`/`signum`/`clamp`/`pow` already via `Numeric for Int` |
 | `net/udp`, `net/dns`            | (none)  | Tier S3 — no compiler builtin, no runtime handler, no module file                                |
 | `net/http` server-side          | n/a     | belongs **inside** `manutara`, not stdlib (Layout §`net`)                                        |
 
