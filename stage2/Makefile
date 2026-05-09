@@ -1053,6 +1053,7 @@ CORE_PRELUDE_FLAGS := $(patsubst %,--prelude %,$(sort $(wildcard ../stdlib/core/
 # when new top-level stdlib modules land.
 EXTRA_PRELUDE_FLAGS := --prelude ../stdlib/protocols.kai \
                        --prelude ../stdlib/effects.kai \
+                       --prelude ../stdlib/array.kai \
                        --prelude ../stdlib/random.kai \
                        --prelude ../stdlib/random_secure.kai \
                        --prelude ../stdlib/encoding/base64.kai \
