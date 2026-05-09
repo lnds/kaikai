@@ -2518,6 +2518,7 @@ KAI_LIBM_REAL1(tanh,  tanh)
 
 KAI_LIBM_REAL2(pow,   pow)
 KAI_LIBM_REAL2(atan2, atan2)
+KAI_LIBM_REAL2(rem,   fmod)
 
 #undef KAI_LIBM_REAL1
 #undef KAI_LIBM_REAL2
@@ -3505,6 +3506,7 @@ static KaiValue *_kai_prelude_real_is_nan_thunk(KaiValue *s, KaiValue **a, int n
 static KaiValue *_kai_prelude_real_is_inf_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_real_is_inf(a[0]); }
 static KaiValue *_kai_prelude_real_pow_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_pow(a[0], a[1]); }
 static KaiValue *_kai_prelude_real_atan2_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_real_atan2(a[0], a[1]); }
+static KaiValue *_kai_prelude_real_rem_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_rem(a[0], a[1]); }
 static KaiValue *_kai_prelude_string_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_length(a[0]); }
 static KaiValue *_kai_prelude_string_concat_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_concat(a[0], a[1]); }
 static KaiValue *_kai_prelude_string_concat_all_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_concat_all(a[0]); }
