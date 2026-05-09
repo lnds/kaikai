@@ -182,8 +182,8 @@ that lands with its message text, not a TODO.
 
 - `kai fmt`: canonical formatter. Single style, no options. LLM-
   friendly deterministic output.
-- `kai repl`: online session with module reload and `?`-hole
-  completion.
+- `kai repl`: deferred to post-1.0 per #406 (was: online session
+  with module reload and `?`-hole completion).
 - `kai lsp`: LSP server talking diagnostics + hover + completion +
   go-to-definition. `--holes-json` doubles as completion source.
 - `kai doc`: extract `pub` signatures and doc comments; emit HTML.
@@ -591,7 +591,8 @@ in.
 15. **m15 — `kai fmt`** using the stage 2 parser. Canonical,
     no options (gofmt-style discipline).
 16. **m16 — `kai lsp`** using the stage 2 pipeline.
-17. **m17 — `kai repl`** using the stage 2 pipeline + holes.
+17. **m17 — `kai repl`** *(deferred to post-1.0 per #406)* using
+    the stage 2 pipeline + holes.
 
 ## Recommended ordering — the direct path
 
