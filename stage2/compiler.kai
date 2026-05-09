@@ -38,10 +38,10 @@ type TokKind
   = TkEof
   | TkNewline
   # keywords (alphabetical)
-  | TkAnd | TkAs | TkAssert | TkAxiom | TkBench | TkCheck | TkConst | TkEffect | TkElse | TkEnsures | TkExtern | TkFalse | TkFn | TkFor
+  | TkAnd | TkAs | TkAssert | TkAxiom | TkBench | TkCase | TkCheck | TkConst | TkEffect | TkElse | TkEnsures | TkExtern | TkFalse | TkFn | TkFor
   | TkHandle | TkIf | TkImpl | TkImport
   | TkLet | TkMatch | TkNot | TkOr | TkProtocol | TkPub | TkRequires | TkTest | TkTrue | TkType
-  | TkUnitKw | TkUse | TkVar | TkWhere | TkWith
+  | TkUnitKw | TkUse | TkVar | TkWhen | TkWhere | TkWith
   # m12.8: `#derive(P, ...)` annotation. The lexer recognises `#derive`
   # specifically (instead of treating it as a comment) so the parser can
   # consume it as a prefix to a `type` declaration.
@@ -102,7 +102,7 @@ fn tk_name(k: TokKind) : String {
   match k {
     TkEof -> "EOF"
     TkNewline -> "NEWLINE"
-    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkAxiom -> "axiom" TkBench -> "bench" TkCheck -> "check" TkConst -> "const" TkEffect -> "effect" TkElse -> "else"
+    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkAxiom -> "axiom" TkBench -> "bench" TkCase -> "case" TkCheck -> "check" TkConst -> "const" TkEffect -> "effect" TkElse -> "else"
     TkEnsures -> "ensures"
     TkExtern -> "extern"
     TkFalse -> "false" TkFn -> "fn" TkFor -> "for" TkHandle -> "handle"
@@ -110,7 +110,7 @@ fn tk_name(k: TokKind) : String {
     TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
     TkProtocol -> "protocol" TkPub -> "pub" TkRequires -> "requires"
     TkTest -> "test" TkTrue -> "true" TkType -> "type"
-    TkUnitKw -> "unit" TkUse -> "use" TkVar -> "var" TkWhere -> "where" TkWith -> "with"
+    TkUnitKw -> "unit" TkUse -> "use" TkVar -> "var" TkWhen -> "when" TkWhere -> "where" TkWith -> "with"
     TkDerive -> "#derive"
     TkRegex -> "REGEX"
     TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
@@ -261,6 +261,7 @@ fn keyword_kind(text: String) : TokKind {
   else if text == "assert" { TkAssert }
   else if text == "axiom" { TkAxiom }   # m12.7
   else if text == "bench" { TkBench }   # bench v1 (issue #40)
+  else if text == "case" { TkCase }     # issue #415: multi-clause fn body
   else if text == "check" { TkCheck }   # check v1 (issue #44)
   else if text == "const" { TkConst }   # §29 / m12.6.x #const
   else if text == "effect" { TkEffect }
@@ -287,6 +288,7 @@ fn keyword_kind(text: String) : TokKind {
   else if text == "unit" { TkUnitKw }   # m12.5
   else if text == "use" { TkUse }       # m7e §25
   else if text == "var" { TkVar }
+  else if text == "when" { TkWhen }     # issue #415: multi-clause guard
   else if text == "where" { TkWhere }   # m12.6
   else if text == "with" { TkWith }
   else { TkIdent }
@@ -1695,6 +1697,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkAssert     -> match b { TkAssert -> true _ -> false }
     TkAxiom      -> match b { TkAxiom -> true _ -> false }
     TkBench      -> match b { TkBench -> true _ -> false }
+    TkCase       -> match b { TkCase -> true _ -> false }
     TkCheck      -> match b { TkCheck -> true _ -> false }
     TkConst      -> match b { TkConst -> true _ -> false }
     TkEffect     -> match b { TkEffect -> true _ -> false }
@@ -1721,6 +1724,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkUnitKw     -> match b { TkUnitKw -> true _ -> false }
     TkUse        -> match b { TkUse -> true _ -> false }
     TkVar        -> match b { TkVar -> true _ -> false }
+    TkWhen       -> match b { TkWhen -> true _ -> false }
     TkWhere      -> match b { TkWhere -> true _ -> false }
     TkWith       -> match b { TkWith -> true _ -> false }
     TkInt        -> match b { TkInt -> true _ -> false }
@@ -4021,6 +4025,13 @@ fn parse_stmt(p: Parser) : PStmt {
     parse_let(p, t)
   } else if tk_is(t.kind, TkVar) {
     parse_var(p, t)
+  } else if tk_is(t.kind, TkCase) {
+    # issue #415: `case` inside a stmt-block is the second half of a
+    # mixed stmt + case body. The opening of the block was a stmt, so
+    # the parser took the stmt-block path. Surface the pure-block
+    # rule explicitly here instead of letting the user chase a stale
+    # "expected expression" error.
+    err_s(p_error(p, t, "case-block must contain only `case` arms; mix with stmt-block by extracting a helper or using `= match { ... }`"))
   } else if tk_is(t.kind, TkAssert) {
     parse_assert(p, t)
   } else if tk_is(t.kind, TkUse) {
@@ -5916,13 +5927,31 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
               }
             } else if p_at(p4, TkLbrace) {
               let tb = p_peek(p4)
-              let rb = parse_block(p4, tb)
-              match rb.r {
-                None -> err_d(rb.p)
-                Some(body) -> {
-                  let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
-                  let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
-                  ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
+              # issue #415: peek past `{` and any newlines/semis. If
+              # the first significant token is `case`, parse a
+              # multi-clause body that desugars to a `match` over the
+              # implicit tuple of args. Otherwise, fall through to the
+              # existing statement-block form.
+              let after_lbrace = p_skip_newlines_and_semis(p_advance(p4))
+              if p_at(after_lbrace, TkCase) {
+                let rb = parse_clause_block(after_lbrace, params, tb)
+                match rb.r {
+                  None -> err_d(rb.p)
+                  Some(body) -> {
+                    let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
+                    let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
+                    ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
+                  }
+                }
+              } else {
+                let rb = parse_block(p4, tb)
+                match rb.r {
+                  None -> err_d(rb.p)
+                  Some(body) -> {
+                    let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
+                    let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
+                    ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
+                  }
                 }
               }
             } else {
@@ -5931,6 +5960,177 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
           }
         }
       }
+        }
+      }
+    }
+  }
+}
+
+# issue #415: parse a multi-clause function body. The opening `{`
+# has already been consumed; `p` points at the first `case` keyword
+# (or whatever follows `{` and any newlines/semis — caller verified
+# `p_at(p, TkCase)`). Each arm is `case <pat> (when <guard>)? -> <body>`.
+# For a 1-arg fn the scrutinee is `EVar(arg_name)` and arms carry a
+# single pattern (reuses `parse_match_arms`). For an N-arg fn (N>=2)
+# the scrutinee tuple is `(arg1, ..., argN)` represented as N parallel
+# scrutinees and arms carry N comma-separated patterns (reuses
+# `parse_multi_match_arms`). After collection the result is an
+# `EMatch` indistinguishable from a hand-written `match` body, so the
+# typer / codegen / perceus see no new shape.
+#
+# Pure-block rule: if any non-`case` token appears between arms, the
+# arm-collection loop fails with "expected `case` or `}`" and the
+# whole fn body is rejected — stmt-block mixed with case-arms is a
+# hard parse error, never a warning.
+fn parse_clause_block(p: Parser, params: [Param], t: Token) : PExpr {
+  let n = list_length(params)
+  if n == 0 {
+    # Zero-arg fn with case-arms: there's nothing to discriminate
+    # on. Reject explicitly so the diagnostic points at the keyword.
+    err_e(p_error_here(p, "case-block requires at least one parameter to discriminate on"))
+  } else if n == 1 {
+    let scrut = make_param_scrut(list_head(params))
+    parse_case_arms(p, [], scrut, t)
+  } else if n > 4 {
+    # Issue #129 cap on multi-arg match also bounds the desugared
+    # tuple here; raising it requires re-evaluating the nested-match
+    # blowup as in `parse_match`.
+    err_e(p_error_here(p, "case-block supports up to 4 parameters"))
+  } else {
+    let scruts = make_param_scruts(params, [])
+    parse_case_multi_arms(p, [], scruts, n, t)
+  }
+}
+
+fn list_head(xs: [Param]) : Param {
+  match xs {
+    [] -> Param { pname: "_", ptype: None, pline: 0, pcol: 0 }
+    [h, ..._] -> h
+  }
+}
+
+fn make_param_scrut(pm: Param) : Expr =
+  mk_expr(EVar(pm.pname), pm.pline, pm.pcol)
+
+fn make_param_scruts(params: [Param], acc: [Expr]) : [Expr] {
+  match params {
+    [] -> list_reverse(acc)
+    [pm, ...rest] -> make_param_scruts(rest, [make_param_scrut(pm), ...acc])
+  }
+}
+
+# issue #415: arm collector for the 1-arg case-block. Mirrors
+# `parse_match_arms` but expects each arm to be led by `case`. Stops
+# at `}`. Errors point at the offending token when neither `case`
+# nor `}` appears next.
+fn parse_case_arms(p: Parser, acc: [Arm], scrut: Expr, t: Token) : PExpr {
+  let p0 = p_skip_newlines_and_semis(p)
+  if p_at(p0, TkRbrace) {
+    if list_is_empty(acc) {
+      err_e(p_error_here(p0, "case-block must have at least one `case` arm"))
+    } else {
+      ok_e(p_advance(p0), mk_expr(EMatch(scrut, list_reverse(acc)), t.line, t.col))
+    }
+  } else if not p_at(p0, TkCase) {
+    err_e(p_error_here(p0, "case-block must contain only `case` arms; mix with stmt-block by extracting a helper or using `= match { ... }`"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p0))
+    let ra = parse_case_arm_tail(p1)
+    match ra.r {
+      None -> err_e(ra.p)
+      Some(arm) -> parse_case_arms(ra.p, [arm, ...acc], scrut, t)
+    }
+  }
+}
+
+# issue #415: parse the tail of a `case` arm — pattern, optional
+# `when` guard, `->`, body. The leading `case` keyword has already
+# been consumed by the caller.
+fn parse_case_arm_tail(p: Parser) : PArm {
+  let rp = parse_pattern(p)
+  match rp.r {
+    None -> err_a(rp.p)
+    Some(pat) -> {
+      let p1 = p_skip_newlines(rp.p)
+      let guard_opt_r =
+        if p_at(p1, TkWhen) {
+          let prev_atl = p1.allow_trailing_lambda
+          let pg = p_with_trailing_lambda(p_advance(p1), false)
+          let rg = parse_expr(pg)
+          let rg_p = p_with_trailing_lambda(rg.p, prev_atl)
+          match rg.r {
+            None -> PExpr { p: rg_p, r: None }
+            Some(g) -> PExpr { p: rg_p, r: Some(g) }
+          }
+        } else {
+          PExpr { p: p1, r: None }
+        }
+      match guard_opt_r.r {
+        None -> if guard_opt_r.p.had_error { err_a(guard_opt_r.p) } else {
+          parse_arm_body(guard_opt_r.p, pat, None)
+        }
+        Some(_) -> parse_arm_body(guard_opt_r.p, pat, guard_opt_r.r)
+      }
+    }
+  }
+}
+
+# issue #415: arm collector for N-arg case-block. Mirrors
+# `parse_multi_match_arms`. Each arm is `case p1, ..., pN (when g)? -> body`.
+fn parse_case_multi_arms(p: Parser, acc: [MArm], scruts: [Expr], n: Int, t: Token) : PExpr {
+  let p0 = p_skip_newlines_and_semis(p)
+  if p_at(p0, TkRbrace) {
+    if list_is_empty(acc) {
+      err_e(p_error_here(p0, "case-block must have at least one `case` arm"))
+    } else {
+      let p1 = p_advance(p0)
+      let arms_in_order = list_reverse(acc)
+      let desugared = desugar_multi_match(scruts, arms_in_order, t.line, t.col)
+      ok_e(p1, desugared)
+    }
+  } else if not p_at(p0, TkCase) {
+    err_e(p_error_here(p0, "case-block must contain only `case` arms; mix with stmt-block by extracting a helper or using `= match { ... }`"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p0))
+    let ra = parse_case_multi_arm(p1, n)
+    match ra.r {
+      None -> err_e(ra.p)
+      Some(arm) -> parse_case_multi_arms(ra.p, [arm, ...acc], scruts, n, t)
+    }
+  }
+}
+
+# issue #415: parse `pat1, ..., patN (when guard)? -> body` after the
+# leading `case` has been consumed. Mirrors `parse_multi_arm` but
+# uses `when` instead of `if` for the guard.
+fn parse_case_multi_arm(p: Parser, n: Int) : PMArm {
+  let r_pats = parse_n_patterns(p, n, [])
+  match r_pats.r {
+    None -> err_marm(r_pats.p)
+    Some(pats) -> {
+      let p1 = p_skip_newlines(r_pats.p)
+      let guard_opt_r =
+        if p_at(p1, TkWhen) {
+          let prev_atl = p1.allow_trailing_lambda
+          let pg = p_with_trailing_lambda(p_advance(p1), false)
+          let rg = parse_expr(pg)
+          let rg_p = p_with_trailing_lambda(rg.p, prev_atl)
+          match rg.r {
+            None -> PExpr { p: rg_p, r: None }
+            Some(g) -> PExpr { p: rg_p, r: Some(g) }
+          }
+        } else {
+          PExpr { p: p1, r: None }
+        }
+      let p2 = p_skip_newlines(guard_opt_r.p)
+      if not p_at(p2, TkArrow) {
+        err_marm(p_error_here(p2, "expected `->` in case-arm"))
+      } else {
+        let p3 = p_skip_newlines(p_advance(p2))
+        let rb = parse_expr(p3)
+        match rb.r {
+          None -> err_marm(rb.p)
+          Some(body) -> ok_marm(rb.p, MArm(pats, guard_opt_r.r, body))
         }
       }
     }
