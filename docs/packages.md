@@ -253,9 +253,127 @@ bin/kai run examples/packages/transitive/main.kai
 - **Semver-aware ref comparison**. Current MVS is lexicographic
   on the ref string.
 
+## Publishing a package — migration guide
+
+For an existing kaikai project that wants to become a publishable
+package others can `kai add`, the migration is mostly file layout.
+
+### Recommended layout
+
+```
+mypkg/
+├── kai.toml              # manifest of the package
+├── README.md
+├── LICENSE
+├── lib/                  # importable code; this is what consumers see
+│   ├── core.kai
+│   ├── parser.kai
+│   └── ...
+└── examples/             # demos using the package locally
+    ├── kai.toml          # manifest with `mypkg = { path = ".." }`
+    └── basic/
+        └── main.kai
+```
+
+The resolver looks for the package's importable code under `lib/`.
+When a consumer runs `kai add github.com/<owner>/mypkg@<ref>`, the
+driver injects `<cache>/mypkg/<sha>/lib` into the compile path, so
+`import mypkg.core` resolves to `<cache>/mypkg/<sha>/lib/core.kai`.
+
+If your project today has lib + demos at the repo root (a common
+pre-package-manager pattern), the migration is:
+
+1. Move every `.kai` file that is part of the public surface into
+   `lib/`.
+2. Move demos / showcases into `examples/<name>/main.kai`.
+3. Write a `kai.toml` at the repo root with `name`, `version`, and
+   any dependencies the library itself needs.
+4. Write `examples/kai.toml` declaring the package as a local-path
+   dependency: `mypkg = { path = ".." }`. This lets your demos
+   compile during development against the in-tree code, using the
+   same import paths an external consumer will use.
+5. Verify a demo compiles: `cd examples/basic && kai run main.kai`.
+6. Tag the release: `git tag v0.1.0 && git push origin v0.1.0`.
+7. Announce the source URL: `github.com/<owner>/mypkg@v0.1.0`.
+
+Source code does **not** change — `import mypkg.core` works
+identically pre- and post-migration. Only the file layout shifts.
+
+### Internal imports inside the package
+
+A file in `lib/parser.kai` that needs `lib/core.kai` writes
+`import mypkg.core` — same as an external consumer would. The
+package always names itself by the manifest `name`. This keeps
+your code uniform: no special "internal" import paths.
+
+### Versioning
+
+Pre-1.0, follow `0.MINOR.PATCH` with breaking changes bumping
+MINOR (cz convention). Tag every release. Consumers pin to a tag
+(`@v0.2.0`), a branch (`@main`), or a SHA (`@abc1234`). Tags are
+the convention; branches and SHAs are escape hatches.
+
+## Consuming a package — quick reference
+
+### New project from scratch
+
+```sh
+mkdir myapp && cd myapp
+kai init myapp                                      # writes kai.toml
+kai add github.com/<owner>/uira@v0.1.0              # adds dep + writes lock
+echo 'import uira.core
+fn main() = println("hi")' > main.kai
+kai run main.kai                                    # auto-resolves
+```
+
+`kai run` and `kai build` walk up from the entry file looking for
+`kai.toml`. When found, they read `kai.lock` (running `kai install`
+first if it is missing or stale) and inject every cached
+dependency's `lib/` directory into the compile path.
+
+### Local-path dependency for cross-development
+
+Editing `uira` and `myapp` simultaneously? Skip the cache by
+using a path override:
+
+```toml
+# myapp/kai.toml
+[dependencies]
+uira = { path = "../uira" }
+```
+
+`kai run main.kai` compiles against the live source tree of
+`../uira/lib/`. Edits in `uira` show up immediately in `myapp`
+without reinstall, retag, or recommit.
+
+When ready for release, swap the path entry for a git source
+entry. Code does not change; only the manifest does.
+
+### Updating
+
+```sh
+kai update              # refetches all deps to latest matching ref
+kai update uira         # refetches just uira
+kai add github.com/<owner>/uira@v0.2.0    # explicit version bump
+```
+
+`kai update` rewrites `kai.lock`. Commit the new lock to share
+the resolution with your team.
+
+### Transitive resolution
+
+If `uira` depends on `kupenga`, your project pulls both
+automatically. Minimum-version selection picks the highest
+required ref string lexicographically across the graph. Pin
+specific versions in your own manifest to override.
+
 ## See also
 
 - `docs/effects-stdlib.md` §`File` and §`Process` — the effects
   the package manager rides on.
 - `stdlib/encoding/toml.kai` (header) — supported TOML subset.
 - `tools/kai-pkg/main.kai` (header) — CLI subcommand catalog.
+- `examples/packages/local_path/` — minimal worked example of a
+  package + consumer pair, useful as a template.
+- `examples/packages/transitive/` — multi-level dependency
+  resolution example.
