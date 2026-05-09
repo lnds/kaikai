@@ -49,7 +49,7 @@ modulo the `|` reinterpretation, so they don't appear below.
 | `actor.kai:29` | `MailboxPolicy` | mixed | 2 | `Unbounded`, `Bounded(Int, Overflow)` |
 | `collections/map.kai:61` | `Tree[k,v]` | mixed | 2 | `TEmpty`, `TNode(k, v, Int, Tree[k,v], Tree[k,v])` |
 | `crypto/hash.kai:88` | `SplitN` | payload-only | 2 | `SplitOk([Int],[Int])`, `SplitShort([Int])` |
-| `encoding/json.kai:32` | `JsonValue` | mixed | 6 | `JNull`, `JBool(Bool)`, `JNum(Int)`, `JStr(String)`, `JArr([JsonValue])`, `JObj([Pair[String,JsonValue]])` |
+| `encoding/json.kai:32` | `JsonValue` | mixed | 7 | `JNull`, `JBool(Bool)`, `JNum(Int)`, `JReal(Real)`, `JStr(String)`, `JArr([JsonValue])`, `JObj([Pair[String,JsonValue]])` |
 | `regexp.kai:28` | `CharRange` | payload-only | 1 | `CR(Char, Char)` |
 | `regexp.kai:32` | `Anchor` | unit-only | 2 | `AnchorStart`, `AnchorEnd` |
 | `regexp.kai:52` | `RxAst` | mixed | 11 | `RxChar(Char)`, `RxAny`, `RxClass(...)`, `RxAnchor(Anchor)`, `RxConcat([RxAst])`, `RxAlt([RxAst])`, `RxStar(RxAst)`, `RxPlus(RxAst)`, `RxOpt(RxAst)`, `RxRepeat(...)`, `RxGroup(Int, RxAst)` |

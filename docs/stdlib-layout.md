@@ -236,7 +236,7 @@ stdlib/
     url.kai      pure URL parsing (planned — folded into http.kai parser today)
     http.kai     (shipped, client only — `http_get/post/put/delete/request`; uses NetTcp + Cancel; libc `getaddrinfo` for DNS until net.dns lands)
   encoding/      pure, stage 2
-    json.kai     (shipped)
+    json.kai     (shipped — Real number parsing landed via #361)
     utf8.kai     (planned — no tracking issue)
     base64.kai   (shipped)
     hex.kai      (shipped)
@@ -385,7 +385,7 @@ than what a primitive module should expose.
 
 ### encoding (pure, stage 2)
 
-- `encoding.json` — `encode`, `decode` *(shipped)*
+- `encoding.json` — `encode`, `decode` *(shipped — Real number parsing via #361 adds `JReal(Real)` alongside `JNum(Int)`)*
 - `encoding.utf8` — `validate`, `decode`, `encode`, `chars` *(planned — no `stdlib/encoding/utf8.kai` file)*
 - `encoding.base64` — `encode`, `decode` (standard + URL-safe) *(shipped)*
 - `encoding.hex` — `encode`, `decode` *(shipped)*
