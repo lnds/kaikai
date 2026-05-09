@@ -1,12 +1,126 @@
 # FFI — Foreign Function Interface
 
-kaikai talks to existing C libraries through an `extern "C"`
-declaration plus the `Ffi` effect capability. This document
-covers what FFI v1 supports, what it doesn't, the canonical
-workaround for the gap (C shims), and the planned scope for
-FFI v2.
+kaikai bridges to C through two distinct mechanisms:
 
-## Quick reference
+1. **Prelude primitives** — compiler-internal C bindings used by
+   the standard library (libm, filesystem, process, time, …).
+   Wired in `stage0/runtime.h`, registered in the resolver as
+   globally-available identifiers. Users do not see them; the
+   compiler-dev does. This is how `real_sqrt`, `read_file`,
+   `int_to_string`, etc. reach C code.
+
+2. **`extern "C"` declarations** (FFI v1) — user-facing FFI.
+   How a kaikai program binds to an external C library it
+   doesn't own (raylib, sqlite3, libcurl, your own .so).
+   Carries the `Ffi` effect capability.
+
+This document covers both paths: the prelude primitives mechanism
+for compiler-dev, and the `extern "C"` user-facing surface
+including its current limits, the canonical workaround (C
+shims), and the planned scope for FFI v2.
+
+## Path 1 — Prelude primitives (compiler-internal)
+
+Used by every stdlib module that needs to call C: `stdlib/math/real.kai`
+(libm), `stdlib/fs/file.kai` (POSIX file ops), `stdlib/os/process.kai`
+(fork/exec/wait), `stdlib/time.kai` (clock_gettime), and so on.
+Users never write `extern "C"` for these — the names are
+**globally available** because the resolver pre-loads them as
+prelude-level identifiers.
+
+### Mechanism
+
+Three pieces wire a prelude primitive end-to-end:
+
+1. **Runtime function** in `stage0/runtime.h`:
+
+   ```c
+   static KaiValue *kai_prelude_real_sqrt(KaiValue *x) {
+     return kai_real(sqrt(kai_real_get(x)));
+   }
+   ```
+
+2. **Thunk** registered in `stage0/runtime.h`'s prelude table so
+   the call site can dispatch:
+
+   ```c
+   static KaiValue *_kai_prelude_real_sqrt_thunk(KaiValue *s, KaiValue **a, int n) {
+     (void) s; (void) n;
+     return kai_prelude_real_sqrt(a[0]);
+   }
+   ```
+
+3. **Compiler entry** in `stage2/compiler.kai` registering the
+   identifier in the prelude environment with its `Ty` schema:
+
+   ```kai
+   TyEntry { name: "real_sqrt", scheme: mono(fn_ty([TyReal], TyReal)) }
+   EP("real_sqrt", "kai_prelude_real_sqrt", 1)
+   ```
+
+   Three locations to keep in sync: the prelude name list, the
+   type-environment entry (so the typer knows the schema), and
+   the EP (Emit-Prelude) record (so the C emit dispatches to the
+   right thunk).
+
+### libm bindings macro
+
+For trig / log / pow families, the runtime uses macros to
+collapse the boilerplate:
+
+```c
+KAI_LIBM_REAL1(sqrt, sqrt)
+KAI_LIBM_REAL1(sin,  sin)
+KAI_LIBM_REAL2(pow,  pow)
+KAI_LIBM_REAL2(rem,  fmod)
+```
+
+Each `KAI_LIBM_REAL1(name, c_fn)` expands into a thunk plus a
+prelude-table entry. Adding a new libm binding is a 3-line
+change in `stage0/runtime.h` plus the compiler-side prelude
+registration.
+
+### When to add a prelude primitive
+
+Add one when:
+
+- The function is **standard / portable** (libc, libm, POSIX) and
+  belongs in stdlib.
+- Stdlib needs it directly and the alternative is the user-facing
+  `extern "C"` (which would force the user to declare it
+  themselves — wrong for stdlib).
+- The cost is a single C function with primitive args and return.
+
+Do **not** add a prelude primitive when:
+
+- It's a third-party library (raylib, sqlite3) — that's
+  user-facing FFI v1, the user declares the `extern "C"`.
+- The signature uses structs by value or out-parameters — neither
+  mechanism supports that today (see FFI v2 below).
+
+### Examples in stdlib
+
+| stdlib module | Prelude primitives it uses |
+| --- | --- |
+| `stdlib/math/real.kai` | `real_sqrt`, `real_sin`, `real_pow`, `real_rem`, … (libm) |
+| `stdlib/math/int.kai` | `int_to_string`, arithmetic builtins |
+| `stdlib/fs/file.kai` | `kai_prelude_read_file`, `kai_prelude_write_file`, `kai_prelude_file_exists`, `kai_prelude_file_delete`, `kai_prelude_file_rename`, `kai_prelude_file_append` |
+| `stdlib/os/process.kai` | `kai_default_process_start`, `kai_default_process_wait`, `kai_default_process_kill`, `kai_default_process_exit` |
+| `stdlib/encoding/json.kai` | `string_to_real`, `string_to_int` |
+| `stdlib/time.kai` | clock primitives |
+| `stdlib/crypto/hash.kai` | hashing primitives |
+
+This path is **not** documented as a stable surface for users.
+The names are pre-bound for stdlib's convenience; if you write a
+program that calls `real_sqrt(2.0)` directly, it works (the
+identifier is in scope), but the contract is the stdlib's, not
+the language's.
+
+## Path 2 — `extern "C"` (FFI v1, user-facing)
+
+How user code binds to an external C library it doesn't own.
+
+### Quick reference
 
 ```kai
 extern "C" fn libm_sqrt(x: Real) : Real / Ffi
@@ -32,9 +146,9 @@ Three things are happening:
    has `Ffi` in its row. The handler is compiler-synthesised —
    `Ffi` operations lower directly to a C ABI call.
 
-## What FFI v1 supports
+### What FFI v1 supports
 
-### Argument and return types (primitives only)
+#### Argument and return types (primitives only)
 
 - `Int`  → `int64_t`
 - `Real` → `double`
@@ -44,7 +158,7 @@ Three things are happening:
   caller-side lifetime, do not free from C)
 - `Unit` → `void` (return only)
 
-### Calling conventions
+#### Calling conventions
 
 - C ABI of the host platform (System V AMD64 or AAPCS AArch64
   on supported targets). The C compiler handles register vs.
@@ -53,7 +167,7 @@ Three things are happening:
   unboxing arguments from `KaiValue *` to raw scalars. Return
   values are wrapped back to `KaiValue *` at the boundary.
 
-### Linking
+#### Linking
 
 The C source you bind against compiles independently and links
 into the kaikai binary as a normal `.o` / `.a` / `.so`. The
@@ -61,7 +175,7 @@ package manager does not automate C source compilation; the
 consumer's build (`Makefile`, shell script, etc.) must produce
 the C object before invoking `kai build`.
 
-## What FFI v1 does NOT support
+### What FFI v1 does NOT support
 
 | Feature | Status | Tracking |
 | --- | --- | --- |
@@ -75,7 +189,7 @@ the C object before invoking `kai build`.
 | Bitfields | Not planned | — |
 | Fixed-width integer types (`U8`, `I32`, …) | **Not supported** | #417 |
 
-## The C shim pattern
+### The C shim pattern
 
 When binding a library that uses small structs by value (raylib's
 `Color` and `Vector2`, SDL2's `SDL_Rect`, etc.), the canonical
@@ -83,7 +197,7 @@ workaround is a **C shim** that flattens aggregates into
 primitives at the boundary, reconstructing them inside C before
 calling the real library.
 
-### Example: raylib `Color`
+#### Example: raylib `Color`
 
 raylib's signature:
 
@@ -120,7 +234,7 @@ pub fn draw_circle_v(cx: Real, cy: Real,
                      radius: Real, rgba: Int) : Unit / Ffi
 ```
 
-### Building the shim
+#### Building the shim
 
 The shim is a regular C source file. It compiles with the host
 C compiler, linked into the kaikai binary as part of the
@@ -138,7 +252,7 @@ working example: `uira/raylib.kai` (kaikai-side bindings) +
 `uira/raylib_shim.c` (the C shim) + `Makefile` (link
 orchestration).
 
-### Cost of the workaround
+#### Cost of the workaround
 
 The shim approach works but has real costs:
 
