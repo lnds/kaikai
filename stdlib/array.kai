@@ -1,0 +1,98 @@
+# stdlib/array.kai — bridge helpers between [T] (linked list) and
+# Array[T] (contiguous, indexable, mutable).
+#
+# The runtime ships `array_make`, `array_get`, `array_set`,
+# `array_length`, `array_grow` plus the `a[i]` / `a[i] := v`
+# sugars. This module covers the missing piece: copying between the
+# functional carrier `[T]` and the imperative carrier `Array[T]`.
+#
+# Public surface (flat-prefix; the namespaced rename to `array.*`
+# waits for the m14 phase-2 migration that already covers `list.*`):
+#
+#   pub fn array_from_list[a](xs: [a], default: a) : Array[a]
+#   pub fn array_to_list[a](a: Array[a]) : [a]
+#   pub fn array_copy[a](src: Array[a], default: a) : Array[a]
+#
+# The `default: a` thread on `array_from_list` / `array_copy` is
+# the v1 contract: `array_make(n, init)` requires an `init: a` even
+# when `n == 0`, because the runtime needs a `T`-shaped slot for the
+# allocation. Empty inputs have no element to lift, so callers pass
+# one explicitly. Once #341 Form 3 (free-fn tparam bounds with
+# protocol dispatch) lands, `default` can be replaced by an
+# `[a : Default]` constraint.
+#
+# Mutable masking: every `array_set` here writes to an Array
+# constructed locally inside the same function. Per docs/effects-
+# stdlib.md §`Mutable` (issues #251 + #252), the masking pass keeps
+# `Mutable` out of the inferred row in that case. The discipline
+# requires the local Array to never escape via a non-`array_*` call,
+# so the writes are routed through `list.foldl` closures whose body
+# emits the only `array_set` call directly on the captured local
+# Array. The masking pass walks the lambda body and classifies the
+# demand as local; `Mutable` is dropped from the public row.
+#
+# This module is loaded via `--prelude`, which (unlike a regular
+# import target) does NOT run `expand_imports` on its own decls. So
+# `import loop` would not pull `stdlib/loop.kai` in — the
+# `while`/`until`/`var`-style sugars are unavailable here. Iteration
+# is expressed via `list.foldl` from `stdlib/core/list.kai`, which
+# the prelude chain has already loaded.
+
+# ---- [a] -> Array[a] --------------------------------------------
+
+# Allocates a fresh Array of length `list_length(xs)`, walks `xs`
+# once writing each element to the matching index, returns the
+# Array. `default` is used only as the runtime's reified-element
+# slot for the `array_make` call — every position is overwritten on
+# the same pass for non-empty inputs, and an empty list returns the
+# zero-length Array straight from `array_make`.
+pub fn array_from_list(xs: [a], default: a) : Array[a] = {
+  let n = list_length(xs)
+  let a = array_make(n, default)
+  let _ = list.foldl(xs, 0, (i, h) => {
+    a[i] := h
+    i + 1
+  })
+  a
+}
+
+# ---- Array[a] -> [a] --------------------------------------------
+
+# Walks the Array tail-to-head accumulating onto a list so the
+# result is in index order with no intermediate reverse. Pure read;
+# no `Mutable` demand on the declared row. Uses plain recursion
+# rather than `var` + `while` because mixing two `var`s of
+# different element types in one `while` block clashes the row's
+# `State[T]` parameter (a single shared `e` in `while`'s signature
+# can carry only one element type).
+fn array_to_list_loop(a: Array[a], i: Int, acc: [a]) : [a] = {
+  if i < 0 { acc }
+  else { array_to_list_loop(a, i - 1, [a[i], ...acc]) }
+}
+
+pub fn array_to_list(a: Array[a]) : [a] =
+  array_to_list_loop(a, array_length(a) - 1, [])
+
+# ---- Array[a] -> Array[a] (deep copy) ---------------------------
+
+# Element-by-element copy. Aliasing semantics match `array_make`:
+# the new Array is a distinct allocation; mutating either side does
+# not affect the other.
+pub fn array_copy(src: Array[a], default: a) : Array[a] = {
+  let n = array_length(src)
+  let dst = array_make(n, default)
+  let _ = list.foldl(array_to_list(src), 0, (i, x) => {
+    dst[i] := x
+    i + 1
+  })
+  dst
+}
+
+# Tests for these helpers live in `examples/stdlib/array_basic.kai`.
+# They are not embedded as `test` blocks in this prelude file
+# because the test-block harness drops the `Mutable` effect from the
+# inferred row before running, so any `array_set` inside a `test`
+# body becomes a no-op at runtime even when the masking pass would
+# normally classify the demand as local. Round-trip + aliasing
+# coverage stays in the example fixture instead, where the helper
+# runs from a regular `fn main` body.
