@@ -7,13 +7,17 @@ import os.args
 #
 #   kai-pkg show         Read kai.toml from the cwd, print pairs.
 #   kai-pkg init <name>  Write a stub kai.toml in the cwd.
+#   kai-pkg install      Resolve local-path deps; warn on git deps.
+#   kai-pkg paths        One line per resolved dep (name + path),
+#                        consumed by `bin/kai` to inject `--path`
+#                        flags when compiling user code.
 #
-# `kai add`, `kai install`, `kai update` will route through the
-# driver in a follow-up commit; they need git clone + lockfile
-# resolution which depend on the `Process` effect.
+# `kai add` / `kai update` and the git-clone resolver land in
+# follow-up commits. v1 ships with local-path deps only — enough
+# for the workspace-style `path = "../foo"` use case.
 #
-# The driver shells out to this binary: `bin/kai` invokes the
-# compiled `kai-pkg` and forwards subcommand + args.
+# The driver (`bin/kai`) shells out to this binary: it builds and
+# caches `kai-pkg` on first use, then invokes subcommands.
 
 fn main() : Unit / Stdout + Env + File {
   let av = args.argv()
@@ -34,6 +38,8 @@ fn dispatch(sub: String, rest: [String]) : Unit / Stdout + Env + File = {
       }
     }
   }
+  else if sub == "install" { cmd_install() }
+  else if sub == "paths"   { cmd_paths() }
   else if sub == "help" or sub == "-h" or sub == "--help" { usage() }
   else {
     Stdout.print(string_concat("kai-pkg: unknown subcommand: ", sub))
@@ -49,6 +55,8 @@ fn usage() : Unit / Stdout = {
   Stdout.print("Subcommands:")
   Stdout.print("  show         Read kai.toml from the cwd and print parsed pairs.")
   Stdout.print("  init <name>  Write a stub kai.toml with the given package name.")
+  Stdout.print("  install      Resolve local-path deps; warn on git deps (v1).")
+  Stdout.print("  paths        Emit one line per resolved dep (name<TAB>path).")
   Stdout.print("  help         Show this help.")
 }
 
@@ -126,4 +134,179 @@ fn cmd_init(name: String) : Unit / Stdout + File = {
   file.write_file("kai.toml", body)
   Stdout.print(string_concat(string_concat(
     "kai-pkg: wrote kai.toml for package '", name), "'"))
+}
+
+# ---- Dependency model --------------------------------------------
+#
+# A `Dep` is one entry under `[dependencies]`. `kind` distinguishes
+# the three accepted forms:
+#
+#   - DepGit       { source = "...", ref = "..." } — or the string
+#                  shorthand "<source>@<ref>".
+#   - DepLocal     { path = "..." }
+#   - DepUnknown   anything else (parse-recognised but unsupported).
+
+type DepKind
+  = DepGit(String, String)        # source, ref
+  | DepLocal(String)              # path
+  | DepUnknown(String)            # raw render for diagnostics
+
+type Dep = {
+  name: String,
+  kind: DepKind,
+}
+
+fn parse_dep(name: String, v: TomlValue) : Dep = {
+  match v {
+    TStr(s) -> match split_at_char(s, '@') {
+      Some(p) -> Dep { name: name, kind: DepGit(p.fst, p.snd) }
+      None    -> Dep { name: name,
+                       kind: DepUnknown(string_concat("\"", string_concat(s, "\""))) }
+    }
+    TTbl(ps) -> {
+      match toml_pairs_get(ps, "path") {
+        Some(pv) -> match pv {
+          TStr(p) -> Dep { name: name, kind: DepLocal(p) }
+          _       -> Dep { name: name, kind: DepUnknown("(non-string path)") }
+        }
+        None -> {
+          let src = toml_pairs_get(ps, "source")
+          let rf  = toml_pairs_get(ps, "ref")
+          match src {
+            Some(sv) -> match sv {
+              TStr(ss) -> match rf {
+                Some(rv) -> match rv {
+                  TStr(rs) -> Dep { name: name, kind: DepGit(ss, rs) }
+                  _ -> Dep { name: name, kind: DepUnknown("(non-string ref)") }
+                }
+                None -> Dep { name: name, kind: DepUnknown("(missing ref)") }
+              }
+              _ -> Dep { name: name, kind: DepUnknown("(non-string source)") }
+            }
+            None -> Dep { name: name, kind: DepUnknown("(no source/path)") }
+          }
+        }
+      }
+    }
+    _ -> Dep { name: name, kind: DepUnknown("(not a string or table)") }
+  }
+}
+
+# Split `s` at the FIRST occurrence of `c`. Returns Some(before, after)
+# on a hit, None if `c` does not appear.
+fn split_at_char(s: String, c: Char) : Option[Pair[String, String]] = {
+  split_at_char_loop(s, c, 0)
+}
+
+fn split_at_char_loop(s: String, c: Char, i: Int) : Option[Pair[String, String]] = {
+  if i >= string_length(s) { None }
+  else { match char_at(s, i) {
+    None    -> None
+    Some(ch) -> {
+      if ch == c {
+        Some(Pair {
+          fst: string_slice(s, 0, i),
+          snd: string_slice(s, i + 1, string_length(s) - i - 1),
+        })
+      } else { split_at_char_loop(s, c, i + 1) }
+    }
+  } }
+}
+
+# Read kai.toml from the cwd and pull out the dependency list.
+# Returns [] if the manifest has no [dependencies] table.
+fn read_deps() : [Dep] / File = {
+  let src = file.read_file("kai.toml")
+  match toml_decode(src) {
+    None -> []
+    Some(v) -> match v {
+      TTbl(ps) -> match toml_pairs_get(ps, "dependencies") {
+        Some(dv) -> match dv {
+          TTbl(deps) -> deps_from_pairs(deps)
+          _ -> []
+        }
+        None -> []
+      }
+      _ -> []
+    }
+  }
+}
+
+fn deps_from_pairs(ps: [Pair[String, TomlValue]]) : [Dep] = {
+  match ps {
+    [] -> []
+    [p, ...rest] -> [parse_dep(p.fst, p.snd), ...deps_from_pairs(rest)]
+  }
+}
+
+# ---- install ------------------------------------------------------
+#
+# v1: walks the dep list. Local-path deps are reported as resolved.
+# Git-source deps emit a "deferred" note (real clone lands in a
+# follow-up commit). Unknown forms abort with a non-zero summary
+# message but do not exit non-zero — keeping diagnostics composable
+# with the driver's higher-level error handling.
+
+fn cmd_install() : Unit / Stdout + File = {
+  let deps = read_deps()
+  match deps {
+    [] -> Stdout.print("kai-pkg: no dependencies")
+    _  -> {
+      Stdout.print(string_concat(
+        "kai-pkg: resolving ",
+        string_concat(int_to_string(list_length(deps)), " dependency(ies)")))
+      install_each(deps)
+    }
+  }
+}
+
+fn install_each(ds: [Dep]) : Unit / Stdout = {
+  match ds {
+    [] -> ()
+    [d, ...rest] -> {
+      install_one(d)
+      install_each(rest)
+    }
+  }
+}
+
+fn install_one(d: Dep) : Unit / Stdout = {
+  match d.kind {
+    DepLocal(p) -> Stdout.print(string_concat(
+      "  resolved local: ",
+      string_concat(d.name, string_concat(" -> ", p))))
+    DepGit(src, rf) -> Stdout.print(string_concat(
+      "  deferred git: ",
+      string_concat(d.name,
+        string_concat(" (", string_concat(src,
+          string_concat(" @ ", string_concat(rf, ") — git fetch lands in a follow-up")))))))
+    DepUnknown(why) -> Stdout.print(string_concat(
+      "  skipped (malformed): ",
+      string_concat(d.name, string_concat(" ", why))))
+  }
+}
+
+# ---- paths --------------------------------------------------------
+#
+# Emit one line per resolved dep: `<name>\t<path>`. Only local-path
+# deps emit; git deps are silently skipped until the resolver lands.
+# The driver consumes this output and turns each line into a
+# `--path` flag for kaic2.
+
+fn cmd_paths() : Unit / Stdout + File = {
+  let deps = read_deps()
+  paths_each(deps)
+}
+
+fn paths_each(ds: [Dep]) : Unit / Stdout = {
+  match ds {
+    [] -> ()
+    [d, ...rest] -> {
+      match d.kind {
+        DepLocal(p) -> Stdout.print(string_concat(d.name, string_concat("\t", p)))
+        _           -> ()
+      }
+      paths_each(rest)
+    }
+  }
 }
