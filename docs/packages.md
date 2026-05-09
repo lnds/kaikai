@@ -130,6 +130,18 @@ dropped from the lock and re-resolved.
 Reads `kai.toml` and prints its parsed contents. Useful for
 debugging the parser; not part of the long-term command surface.
 
+### Manifest parse errors
+
+When `kai.toml` fails to parse, every kai-pkg subcommand
+(`show`, `install`, `add`, `update`, `paths`) prints a one-line
+diagnostic of the form `kai-pkg: kai.toml: parse error` to stderr
+and exits with status 2. The manifest is never silently treated
+as empty — a broken manifest is a hard error, not a fallback into
+"no dependencies", because masking the parse failure leads CI
+scripts to believe `kai install` succeeded and proceed to a
+downstream `kai run` / `kai build` that fails with a less obvious
+error elsewhere (issue #420).
+
 ### `kai run` / `kai build` (auto-resolution)
 
 `kai run` and `kai build` walk up from the entry file looking

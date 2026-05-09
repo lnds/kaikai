@@ -80,16 +80,33 @@ fn usage() : Unit / Stdout = {
 
 # ---- show ---------------------------------------------------------
 
-fn cmd_show() : Unit / Stdout + File = {
-  let src = file.read_file("kai.toml")
+fn cmd_show() : Unit / Stdout + Stderr + File + Process = {
+  let v = read_manifest_or_exit("kai.toml")
+  match v {
+    TTbl(ps) -> {
+      Stdout.print("kai-pkg: parsed kai.toml:")
+      show_pairs(ps, "  ")
+    }
+    _ -> {
+      Stderr.eprint("kai-pkg: kai.toml: top-level is not a table")
+      process.exit(2)
+    }
+  }
+}
+
+# Read `path` and TOML-decode it. On read or parse failure, print a
+# one-line diagnostic to stderr and exit 2. Issue #420: every kai-pkg
+# command must bail loudly on a broken manifest instead of treating
+# it as empty (CI/scripting hazard otherwise).
+fn read_manifest_or_exit(path: String) : TomlValue / Stderr + File + Process = {
+  let src = file.read_file(path)
   match toml_decode(src) {
-    None -> Stdout.print("kai-pkg: kai.toml: parse error")
-    Some(v) -> match v {
-      TTbl(ps) -> {
-        Stdout.print("kai-pkg: parsed kai.toml:")
-        show_pairs(ps, "  ")
-      }
-      _ -> Stdout.print("kai-pkg: kai.toml: top-level is not a table")
+    Some(v) -> v
+    None    -> {
+      Stderr.eprint(string_concat(
+        string_concat("kai-pkg: ", path),
+        ": parse error"))
+      process.exit(2)
     }
   }
 }
@@ -265,20 +282,18 @@ fn split_at_char_loop(s: String, c: Char, i: Int) : Option[Pair[String, String]]
 
 # Read kai.toml from the cwd and pull out the dependency list.
 # Returns [] if the manifest has no [dependencies] table.
-fn read_deps() : [Dep] / File = {
-  let src = file.read_file("kai.toml")
-  match toml_decode(src) {
-    None -> []
-    Some(v) -> match v {
-      TTbl(ps) -> match toml_pairs_get(ps, "dependencies") {
-        Some(dv) -> match dv {
-          TTbl(deps) -> deps_from_pairs(deps)
-          _ -> []
-        }
-        None -> []
+# Bails (exit 2) on parse error — see `read_manifest_or_exit`.
+fn read_deps() : [Dep] / Stderr + File + Process = {
+  let v = read_manifest_or_exit("kai.toml")
+  match v {
+    TTbl(ps) -> match toml_pairs_get(ps, "dependencies") {
+      Some(dv) -> match dv {
+        TTbl(deps) -> deps_from_pairs(deps)
+        _ -> []
       }
-      _ -> []
+      None -> []
     }
+    _ -> []
   }
 }
 
@@ -335,21 +350,30 @@ fn pkgs_to_toml_loop(pkgs: [Pkg]) : [TomlValue] = {
   }
 }
 
-fn read_lockfile() : [Pkg] / Env + File = {
+fn read_lockfile() : [Pkg] / Stderr + Env + File + Process = {
   match read_file("kai.lock") {
     Err(_) -> []
-    Ok(src) -> match toml_decode(src) {
-      None -> []
-      Some(v) -> match v {
-        TTbl(ps) -> match toml_pairs_get(ps, "package") {
-          Some(pv) -> match pv {
-            TArr(xs) -> pkgs_from_toml(xs)
-            _ -> []
-          }
-          None -> []
+    Ok(src) -> {
+      # Empty lock is normal (created by `kai install` with zero deps
+      # or by `kai update` to force a refresh); only a non-empty body
+      # that fails to parse is fatal.
+      if string_length(string_trim(src)) == 0 { [] }
+      else { match toml_decode(src) {
+        None -> {
+          Stderr.eprint("kai-pkg: kai.lock: parse error")
+          process.exit(2)
         }
-        _ -> []
-      }
+        Some(v) -> match v {
+          TTbl(ps) -> match toml_pairs_get(ps, "package") {
+            Some(pv) -> match pv {
+              TArr(xs) -> pkgs_from_toml(xs)
+              _ -> []
+            }
+            None -> []
+          }
+          _ -> []
+        }
+      } }
     }
   }
 }
@@ -794,13 +818,21 @@ fn sha_short(sha: String) : String = {
 }
 
 # Read transitive deps from the cloned repo's kai.toml. Returns []
-# when the dep has no kai.toml of its own.
-fn transitive_deps(p: Pkg) : [Dep] / File = {
+# when the dep has no kai.toml of its own. Bails (exit 2) if a
+# transitive manifest IS present but fails to parse — silently
+# ignoring it would mask a corrupted upstream and produce a
+# lockfile with missing transitive entries (issue #420).
+fn transitive_deps(p: Pkg) : [Dep] / Stderr + File + Process = {
   let manifest = string_concat(p.cache, "/kai.toml")
   match read_file(manifest) {
     Err(_) -> []
     Ok(src) -> match toml_decode(src) {
-      None -> []
+      None -> {
+        Stderr.eprint(string_concat(
+          string_concat("kai-pkg: ", manifest),
+          ": parse error"))
+        process.exit(2)
+      }
       Some(v) -> match v {
         TTbl(ps) -> match toml_pairs_get(ps, "dependencies") {
           Some(dv) -> match dv {
@@ -864,6 +896,10 @@ fn cmd_add(spec: String) : Unit / Stdout + Stderr + Env + File + Process = {
   Stdout.print(string_concat("kai-pkg: adding ",
     string_concat(name, string_concat(" = ",
       string_concat(source, string_concat("@", ref))))))
+  # Issue #420: validate the manifest BEFORE the clone so a broken
+  # kai.toml surfaces the parse error as the root cause instead of
+  # masking it behind a downstream "git clone failed" diagnostic.
+  let _ = read_manifest_or_exit("kai.toml")
   # Probe-then-commit: clone first, mutate kai.toml only on success.
   # Issue #418: a failed clone must leave the manifest untouched and
   # exit non-zero, otherwise kai.lock and kai.toml drift apart.
@@ -899,21 +935,18 @@ fn pkg_name_loop(s: String, i: Int, n: Int) : String = {
 # under [dependencies], rewrite the file. Round-trips via the
 # parser so formatting normalises but content is preserved.
 fn append_dep_to_manifest(name: String, source: String, ref: String)
-                          : Unit / File = {
-  let src = file.read_file("kai.toml")
-  match toml_decode(src) {
-    None -> () # parse failure already reported elsewhere
-    Some(v) -> match v {
-      TTbl(ps) -> {
-        let new_dep = TTbl([
-          Pair { fst: "source", snd: TStr(source) },
-          Pair { fst: "ref",    snd: TStr(ref) },
-        ])
-        let new_root = update_dependencies(ps, name, new_dep)
-        file.write_file("kai.toml", toml_encode(TTbl(new_root)))
-      }
-      _ -> ()
+                          : Unit / Stderr + File + Process = {
+  let v = read_manifest_or_exit("kai.toml")
+  match v {
+    TTbl(ps) -> {
+      let new_dep = TTbl([
+        Pair { fst: "source", snd: TStr(source) },
+        Pair { fst: "ref",    snd: TStr(ref) },
+      ])
+      let new_root = update_dependencies(ps, name, new_dep)
+      file.write_file("kai.toml", toml_encode(TTbl(new_root)))
     }
+    _ -> ()
   }
 }
 
@@ -963,7 +996,7 @@ fn filter_out_named(pkgs: [Pkg], name: String) : [Pkg] = {
 # Local-path deps emit their declared path (driver resolves
 # absolute). Git deps emit their cache path from the lockfile.
 
-fn cmd_paths() : Unit / Stdout + Env + File = {
+fn cmd_paths() : Unit / Stdout + Stderr + Env + File + Process = {
   let deps = read_deps()
   let pkgs = read_lockfile()
   paths_local(deps)
