@@ -14699,11 +14699,38 @@ fn lookup_clause_enc_fn(cs: [ClauseInfo], hline: Int, hcol: Int, op_name: String
   }
 }
 
+# Issue #403: cheap structural test for `ECall(EVar("__perceus_drop"), _)`.
+# `__perceus_drop` lowers to `kai_internal_drop`, which decrefs and returns
+# the unit singleton — the SExprStmt fast path skips the redundant trailing
+# `kai_decref` when this fires.
+fn expr_is_perceus_drop_call(x: Expr) : Bool {
+  match x.kind {
+    ECall(callee, _) -> match callee.kind {
+      EVar(nm) -> nm == "__perceus_drop"
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
 fn emit_stmt(src: String, s: Stmt, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match s {
     SLet(pat, _, rhs) -> emit_let_stmt(src, pat, rhs, lcs, fns, variants, lams, cls)
     SAssert(cond, opt_msg) -> emit_assert_stmt(src, cond, opt_msg, lcs, fns, variants, lams, cls)
-    SExprStmt(x) -> cat3("{ KaiValue *_ = ", emit_expr(src, x, lcs, fns, variants, lams, cls), "; kai_decref(_); } ")
+    # Issue #403: when the SExprStmt is `__perceus_drop(name)`,
+    # `kai_internal_drop` already decrements the value's rc and
+    # returns the unit singleton (rc == INT32_MAX). The general
+    # path's trailing `kai_decref(_)` short-circuits on that
+    # singleton, but the call + branch still cost on every
+    # invocation — and the issue-#350 arm-drop pass emits ~18 M
+    # of these on the RB-tree workload. Mirrors the `(void) _;`
+    # pattern the tcrec rule-3 emission already uses.
+    SExprStmt(x) ->
+      if expr_is_perceus_drop_call(x) {
+        cat3("{ KaiValue *_ = ", emit_expr(src, x, lcs, fns, variants, lams, cls), "; (void) _; } ")
+      } else {
+        cat3("{ KaiValue *_ = ", emit_expr(src, x, lcs, fns, variants, lams, cls), "; kai_decref(_); } ")
+      }
     # m7b #6: index-assign desugars away pre-resolve; this arm is dead
     # code in normal compilation but keeps the match exhaustive.
     SIndexAssign(_, _, _, _, _) -> "/* SIndexAssign: should have been desugared */ "
