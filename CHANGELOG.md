@@ -84,6 +84,30 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.45.0 (2026-05-08)
+
+### Added
+
+- **stdlib**: math/int — add log2 and div_mod (refs #347)
+- **stdlib**: add libm bindings to math/real (sqrt, trig, exp/log, pow, atan2)
+- **stdlib**: re-introduce string.concat now that resolver supports file-local precedence (closes #336)
+- **stdlib**: expose string.length / slice / to_int as public wrappers (closes #332)
+- **typer**: record spread sugar — `T { ...p, x: 10 }` for functional update (closes #326)
+- **parser**: allow bare `...` and `..._` in list spread patterns (closes #328)
+- **tco**: rule 3 precise per-call-site dropmask via side table (closes #92)
+
+### Fixed
+
+- **typer**: restore transparent aliases for type X = T (closes #376)
+- **typer**: structured violation context for contract panics (refs #86)
+- **perceus**: widen self-tail-call detection in arm-drop pass (refs #350)
+- **perceus**: emit decref for matched scrutinee in tail-rebuild rotation arms (closes #350)
+- **build**: link -lm so libm bindings resolve on Linux glibc
+- **perceus**: emit exit-drops for SLet bindings with dup-detected pass-through
+- **resolver**: file-local precedence for bare-name lookup in test/bench/check bodies (closes #335)
+- **perceus**: extend tcrec rule 3 with single_use_is_borrow predicate (closes #92)
+- **typer**: rewrite PVariantRecord to PRecord for record-alias names (closes #325)
+
 ## v0.44.1 (2026-05-07)
 
 ### Fixed
