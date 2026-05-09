@@ -65,7 +65,8 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `fs/dir`                                | doc-only stub committed; runtime primitives queued in #344 (no `pub fn` yet)                                                   |
 | `os/env`                                | shipped via PR #131 (partial) + PR #143 (close, closes #127); 4 public fns                                                     |
 | `os/args`                               | shipped via PR #131 + PR #143; 2 public fns (`args_argv`, `args_program_name`)                                                 |
-| `os/process` (runtime + effect)         | shipped via PR #142 (closes the runtime side of #126); public Kai wrapper still missing — tracked in #346                      |
+| `os/process` (runtime + effect)         | shipped via PR #142 (closes the runtime side of #126)                                                                          |
+| `os/process` (Kai wrapper)              | shipped (closes #346): 4 public fns (`process.start`, `process.wait`, `process.kill`, `process.exit`) over `builtin_process_decl` |
 | `time` Clock default handler            | shipped via PR #134 — `kai_default_clock_wall_now`, `kai_default_clock_monotonic_now`, `kai_default_clock_sleep_ns` are wired  |
 | `crypto/hash`, `crypto/mac`             | shipped via PR #146 (S2 #5): 626 LOC pure-Kai SHA-256/SHA-512 + 83 LOC HMAC                                                    |
 | `random_secure`                         | shipped via PR #144 (closes #140): 44 LOC, 2 public fns over `getrandom(2)` / `arc4random_buf`                                 |
@@ -79,7 +80,6 @@ What's still open (planned-but-not-shipped):
 
 | Module                          | Issue   | Notes                                                                                            |
 |---------------------------------|---------|--------------------------------------------------------------------------------------------------|
-| `os/process.kai` (Kai wrapper)  | #346    | runtime + effect already in place via #142; only the public `pub fn` surface is missing          |
 | `fs/dir` runtime primitives     | #344    | `kai_prelude_dir_*` C bodies + prelude/typer wiring; `stdlib/fs/dir.kai` is a doc-only stub      |
 | `fs/file` extras                | #345    | `exists`, `delete`, `rename`, `metadata`, `read_bytes` — not in `stage0/runtime.h` yet           |
 | `net/udp`, `net/dns`            | (none)  | Tier S3 — no compiler builtin, no runtime handler, no module file                                |
