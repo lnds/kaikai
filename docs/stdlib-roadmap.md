@@ -76,6 +76,7 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `encoding/json` Real numbers            | shipped (closes #361): decoder accepts decimals + scientific notation; new `JReal(Real)` variant alongside `JNum(Int)`         |
 | `core/tuple` helpers                    | shipped (closes #348): `tuple.swap`, `tuple.map_fst`, `tuple.map_snd`, `tuple.map_pair`, `tuple.first`/`second`/`third`. `fst`/`snd` projections stay field-access only — adding bare `pub fn fst`/`snd` poisons every existing `record.fst` access whose receiver type isn't yet pinned by inference (see module header) |
 | `core/list` surface expansion           | shipped (closes #340): `last`, `init`, `partition`, `split_at`, `span`, `chunk`, `windows`, `intersperse`, `enumerate`, `zip3`, `scan`, `group_by`, `find_map`. `group_by` uses Erlang/Elixir consecutive-key semantics; key type is `Int` for v1 (same dispatch limit as `uniq`) |
+| `core/string` surface expansion         | shipped partially against #338: `split`, `replace`, `pad_left`, `pad_right`, `lines`, `chars`, `is_blank`. `split(s, "")` panics; `lines("")` returns `[]` (Python/Rust convention). Five proposed helpers (`index_of`, `to_upper`/`to_lower`, `is_empty`, `reverse`) deferred to #396 — each collides on bare name with an existing core export, and `--include-prelude-tests` does not honor the typer's first-arg-type narrowing across modules (resolver fix → surface, mirroring #335 → #336) |
 
 What's still open (planned-but-not-shipped):
 
