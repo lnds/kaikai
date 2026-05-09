@@ -84,6 +84,36 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.46.0 (2026-05-09)
+
+### BREAKING CHANGE
+
+- dec_div returns Option[Decimal] instead of silent
+dec_zero on division by zero. Direct callers must wrap with `match`
+or `?`. money_divide_scalar's return type flips from Money to
+Option[Money] for the same reason.
+
+### Added
+
+- **stdlib**: json surrogate pair encode/decode for non-BMP (closes #362)
+- **stdlib**: fs/file exists/delete/rename + runtime primitives (closes #345)
+- **typer**: warn on unused local bindings (closes #381)
+- **stdlib**: array module + flip random.shuffle to O(n) Fisher-Yates (closes #366)
+- **stdlib**: core.string — split/replace/pad_left/pad_right/lines/chars/is_blank (partial #338)
+- **stdlib**: core.list — last/init/partition/split_at/span/chunk/windows/intersperse/enumerate/zip3/scan/group_by/find_map (closes #340)
+- **stdlib**: add os/process public wrappers (closes #346)
+- **stdlib**: add tuple helpers swap/map_fst/map_snd/map_pair/first/second/third (closes #348)
+- **stdlib**: impl Rem for Real via fmod (closes #364)
+- **stdlib**: json parse Real numbers (decimals + scientific) (closes #361)
+
+### Fixed
+
+- **stdlib**: dec_div returns Option[Decimal] (closes #363)
+- **typer**: propagate expected type into if/else branches (closes #382)
+- **typer**: expand placeholder desugar to top-of-arg expressions (closes #385)
+- **parser**: accept trailing commas in list/record/tuple/call args (closes #386)
+- **typer**: propagate expected type into match arms (closes #379)
+
 ## v0.45.0 (2026-05-08)
 
 ### Added
