@@ -137,6 +137,25 @@ import math.vector.{dot, cross}         # bring specific names into scope
 
 No wildcard import.
 
+### Package management
+
+Minimal does not embed a package format. Full kaikai uses `kai.toml`
+(documented in [`docs/packages.md`](packages.md)). The resolver
+walks up from the entry file, handles local-path and
+git-source dependencies, pins commits in `kai.lock`, and injects
+`--path` flags so the same `import` syntax above works for
+external modules.
+
+```toml
+# kai.toml — full-kaikai package manifest, NOT used by minimal.
+name = "myapp"
+version = "0.1.0"
+
+[dependencies]
+greet = { source = "github.com/lnds/greet", ref = "v0.1.0" }
+local = { path = "../local-thing" }
+```
+
 ### Entry point
 
 The file passed to stage 0 must declare `fn main()`. Stage 0 compiles it as the program entry.

@@ -104,6 +104,19 @@ STDLIB_PATH="$STDLIB_ROOT/path.kai"
 STDLIB_CRYPTO_HASH="$STDLIB_ROOT/crypto/hash.kai"
 STDLIB_CRYPTO_MAC="$STDLIB_ROOT/crypto/mac.kai"
 
+# Package manager helper (issue #405). The driver shells out to a
+# kaikai-compiled CLI for kai.toml read/write, dependency
+# resolution, and the user-facing init/install/show commands. Dev
+# layout: source at tools/kai-pkg/main.kai, binary auto-built next
+# to it. Installed layout: prebuilt at libexec/kaikai/kai-pkg.
+if [ "$KAI_LAYOUT" = "installed" ]; then
+  KAIPKG_SRC=""
+  KAIPKG_BIN="$ROOT/libexec/kaikai/kai-pkg"
+else
+  KAIPKG_SRC="$ROOT/tools/kai-pkg/main.kai"
+  KAIPKG_BIN="$ROOT/tools/kai-pkg/kai-pkg"
+fi
+
 CC="${CC:-cc}"
 CFLAGS="${CFLAGS:--std=c99 -Wno-unused-function -Wno-unused-variable -O2}"
 
@@ -158,6 +171,123 @@ ensure_built() {
   fi
 }
 
+# Build tools/kai-pkg on first use; idempotent. Installed layout
+# ships the binary, so we only re-check existence.
+ensure_kaipkg() {
+  if [ "$KAI_LAYOUT" = "installed" ]; then
+    if [ ! -x "$KAIPKG_BIN" ]; then
+      die "kai-pkg binary missing at $KAIPKG_BIN — installation is corrupt"
+    fi
+    return 0
+  fi
+  if [ ! -x "$KAIPKG_BIN" ] || [ "$KAIPKG_SRC" -nt "$KAIPKG_BIN" ]; then
+    ensure_built
+    echo "kai: building tools/kai-pkg ..." >&2
+    "$0" build "$KAIPKG_SRC" -o "$KAIPKG_BIN" >&2
+  fi
+}
+
+# Resolve the cache root for package downloads. Precedence:
+#   1. $KAIKAI_CACHE     — explicit override (CI / sandboxes).
+#   2. $XDG_CACHE_HOME   — Linux convention.
+#   3. ~/Library/Caches  — macOS convention.
+#   4. ~/.cache          — fallback.
+# Sub-path is always `kai/pkg`. Issue #405.
+resolve_cache_root() {
+  if [ -n "${KAIKAI_CACHE:-}" ]; then
+    printf '%s' "$KAIKAI_CACHE"
+    return 0
+  fi
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    printf '%s/kai/pkg' "$XDG_CACHE_HOME"
+    return 0
+  fi
+  case "$(uname -s)" in
+    Darwin) printf '%s/Library/Caches/kai/pkg' "$HOME" ;;
+    *)      printf '%s/.cache/kai/pkg' "$HOME" ;;
+  esac
+}
+
+# Walk up from $1 looking for a kai.toml. Echoes the directory
+# containing the manifest, or empty if none found before /.
+find_manifest_dir() {
+  d="$1"
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    if [ -f "$d/kai.toml" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+    d="$(dirname "$d")"
+  done
+}
+
+# Emit `--path <abs>` flags for each dep in $1/kai.toml.
+# Resolves relative local-path deps against $1; git deps come from
+# the lockfile's cache field. Silent if no manifest.
+#
+# Auto-installs on first compile when the manifest declares deps
+# but kai.lock is missing or any pinned cache dir is gone.
+manifest_path_flags() {
+  manifest_dir="$1"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    return 0
+  fi
+  ensure_kaipkg
+  cache_root="$(resolve_cache_root)"
+  mkdir -p "$cache_root"
+  # If the manifest references git deps and either kai.lock is
+  # missing or any pinned cache dir vanished, auto-install before
+  # emitting paths. This makes `kai run app.kai` work the first
+  # time without an explicit `kai install` step.
+  if needs_auto_install "$manifest_dir" "$cache_root"; then
+    ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" install ) >&2
+  fi
+  # `kai-pkg paths` emits one `<name>\t<path>` line per resolved dep.
+  # Resolve each path relative to the manifest dir, absolute-ising it
+  # so kaic2's --path resolver does not depend on the user's cwd.
+  ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" paths ) | while IFS="$(printf '\t')" read -r name dep_path; do
+    [ -n "$dep_path" ] || continue
+    case "$dep_path" in
+      /*) abs="$dep_path" ;;
+      *)  abs="$(cd "$manifest_dir" && cd "$dep_path" 2>/dev/null && pwd)" ;;
+    esac
+    [ -n "$abs" ] && printf -- '--path %s ' "$abs"
+  done
+}
+
+# Returns 0 (true) if the manifest needs `kai install` to run
+# before paths are usable. Heuristics:
+#   - manifest mentions `[dependencies]` AND kai.lock is missing.
+#   - kai.lock exists but at least one git dep's cache dir is gone.
+needs_auto_install() {
+  manifest_dir="$1"
+  cache_root="$2"
+  has_deps="$(grep -c '^\[dependencies\]' "$manifest_dir/kai.toml" 2>/dev/null || echo 0)"
+  if [ "$has_deps" = "0" ]; then return 1; fi
+  # Local-path-only manifests don't need a lock.
+  if ! grep -q 'source[[:space:]]*=' "$manifest_dir/kai.toml" 2>/dev/null \
+       && ! grep -qE '"[^"]*@[^"]*"' "$manifest_dir/kai.toml" 2>/dev/null; then
+    return 1
+  fi
+  if [ ! -f "$manifest_dir/kai.lock" ]; then return 0; fi
+  # Walk the lock for missing cache dirs (lock keeps source + ref;
+  # cache dir derives from cache_root + slug + ref).
+  awk -v root="$cache_root" '
+    /^source =/ { gsub(/"/, "", $3); s=$3 }
+    /^ref =/    { gsub(/"/, "", $3); r=$3
+                  # mirror slug logic: strip protocol prefix, leading /, replace bad chars with _
+                  gsub(/^https?:\/\//, "", s); gsub(/^ssh:\/\//, "", s); gsub(/^file:\/\//, "", s)
+                  gsub(/^\//, "", s)
+                  gsub(/[^A-Za-z0-9_./-]/, "_", s)
+                  gsub(/[^A-Za-z0-9_.-]/, "_", r)
+                  print root "/" s "/" r
+                  s=""; r="" }
+  ' "$manifest_dir/kai.lock" | while read -r dir; do
+    [ -d "$dir/.git" ] || { echo missing; break; }
+  done | grep -q missing && return 0
+  return 1
+}
+
 usage() {
   v="$(read_version)"
   cat <<EOF
@@ -177,6 +307,11 @@ Commands:
                                 blocks (issue #44).
   fmt   <file.kai> [--check]    Pretty-print kaikai source canonically.
   watch <file.kai>              Recompile + run on every save (live demo).
+  init  <name>                  Create a kai.toml manifest in the cwd.
+  add   <source>[@<ref>]        Fetch a dep and append it to kai.toml.
+  install                       Resolve dependencies (git fetch + lock).
+  update [<name>]               Re-fetch deps; refresh kai.lock.
+  show                          Print the parsed kai.toml.
   help                          Show this help.
   --version                     Print version and demo baseline.
 
@@ -436,7 +571,16 @@ compile_to_binary() {
   # `hello.kai` would otherwise alias the user's CWD and conflict with
   # the resolver's CWD-relative lookup (issue #237).
   src_dir="$(cd "$(dirname "$src")" && pwd)"
-  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $prelude_flags "$@" "$src") > "$tmp/out.c"
+  # Walk up from src_dir looking for kai.toml; if found, emit
+  # `--path <abs>` flags for each local-path dependency. Silent and
+  # zero-cost when no manifest exists (issue #405).
+  manifest_dir="$(find_manifest_dir "$src_dir")"
+  pkg_path_flags=""
+  if [ -n "$manifest_dir" ]; then
+    pkg_path_flags="$(manifest_path_flags "$manifest_dir")"
+  fi
+  # shellcheck disable=SC2086
+  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $prelude_flags "$@" "$src") > "$tmp/out.c"
   # shellcheck disable=SC2086
   # `-lm` (issue #343): math/real libm bindings (sqrt, sin, log, …)
   # are unresolved on Linux glibc without an explicit link line.
@@ -654,6 +798,124 @@ cmd_watch() {
   fi
 }
 
+# Package manager commands (issue #405). All shell out to
+# tools/kai-pkg, which is auto-built on first use via ensure_kaipkg.
+cmd_init() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai init <name>
+
+Write a stub kai.toml in the current directory with the given
+package name and version 0.1.0. Errors out if kai.toml already
+exists.
+EOF
+      return 0 ;;
+    "") die "missing package name (see 'kai init --help')" ;;
+  esac
+  if [ -f kai.toml ]; then
+    die "kai.toml already exists in $(pwd)"
+  fi
+  ensure_kaipkg
+  "$KAIPKG_BIN" init "$@"
+}
+
+cmd_install() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai install
+
+Read kai.toml in the current directory (or the nearest ancestor)
+and resolve dependencies. v1: local-path deps are reported as
+resolved; git deps are deferred to a follow-up release.
+EOF
+      return 0 ;;
+  esac
+  manifest_dir="$(find_manifest_dir "$(pwd)")"
+  if [ -z "$manifest_dir" ]; then
+    die "no kai.toml found in $(pwd) or any parent directory"
+  fi
+  ensure_kaipkg
+  cache_root="$(resolve_cache_root)"
+  mkdir -p "$cache_root"
+  ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" install )
+}
+
+cmd_add() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai add <source>[@<ref>]
+
+Fetch a dependency, add it to kai.toml, and update kai.lock.
+
+Source forms:
+  github.com/owner/repo@v1.0      shorthand (string-form)
+  github.com/owner/repo           ref defaults to HEAD/main
+  ../local-thing                  local path override
+
+Examples:
+  kai add github.com/lnds/manutara@v0.1
+  kai add github.com/lnds/kohau
+
+Cache: \$KAIKAI_CACHE or ~/.cache/kai/pkg/.
+EOF
+      return 0 ;;
+    "") die "missing source argument (see 'kai add --help')" ;;
+  esac
+  manifest_dir="$(find_manifest_dir "$(pwd)")"
+  if [ -z "$manifest_dir" ]; then
+    die "no kai.toml found in $(pwd) or any parent directory"
+  fi
+  ensure_kaipkg
+  cache_root="$(resolve_cache_root)"
+  mkdir -p "$cache_root"
+  ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" add "$@" )
+}
+
+cmd_update() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai update [<name>]
+
+Re-fetch the named dependency (or all of them if no name given)
+and refresh kai.lock with the latest commit on the declared ref.
+EOF
+      return 0 ;;
+  esac
+  manifest_dir="$(find_manifest_dir "$(pwd)")"
+  if [ -z "$manifest_dir" ]; then
+    die "no kai.toml found in $(pwd) or any parent directory"
+  fi
+  ensure_kaipkg
+  cache_root="$(resolve_cache_root)"
+  mkdir -p "$cache_root"
+  ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" update "$@" )
+}
+
+cmd_show_pkg() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai show
+
+Read kai.toml in the current directory (or the nearest ancestor)
+and print its parsed contents.
+EOF
+      return 0 ;;
+  esac
+  manifest_dir="$(find_manifest_dir "$(pwd)")"
+  if [ -z "$manifest_dir" ]; then
+    die "no kai.toml found in $(pwd) or any parent directory"
+  fi
+  ensure_kaipkg
+  cache_root="$(resolve_cache_root)"
+  mkdir -p "$cache_root"
+  ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" show )
+}
+
 case "${1:-}" in
   build)     shift; cmd_build "$@" ;;
   run)       shift; cmd_run   "$@" ;;
@@ -662,6 +924,11 @@ case "${1:-}" in
   check)     shift; cmd_check "$@" ;;
   fmt)       shift; cmd_fmt   "$@" ;;
   watch)     shift; cmd_watch "$@" ;;
+  init)      shift; cmd_init    "$@" ;;
+  install)   shift; cmd_install "$@" ;;
+  add)       shift; cmd_add     "$@" ;;
+  update)    shift; cmd_update  "$@" ;;
+  show)      shift; cmd_show_pkg "$@" ;;
   help|-h|--help) usage ;;
   --version|-V) print_version ;;
   "")        usage >&2; exit 2 ;;
