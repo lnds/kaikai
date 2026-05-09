@@ -5,8 +5,10 @@
 #
 # Coverage of RFC 8259:
 #   - null, true, false: yes
-#   - numbers: integers only in v1 (no decimals, no exponents — the
-#     stage 2 prelude has no `Real` parser yet).
+#   - numbers: integers (`JNum`) and reals (`JReal`). Integers are
+#     parsed when the lexeme has no `.` / `e` / `E`; otherwise the
+#     full RFC 8259 number grammar (fraction + exponent) is parsed
+#     into a `Real` via the prelude `string_to_real`.
 #   - strings: full escape table (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`,
 #     `\r`, `\t`, `\uXXXX`); the decoder folds `\uXXXX` to the raw
 #     codepoint when it fits in a single byte (BMP-only — surrogate
@@ -20,6 +22,7 @@
 #     = JNull
 #     | JBool(Bool)
 #     | JNum(Int)
+#     | JReal(Real)
 #     | JStr(String)
 #     | JArr([JsonValue])
 #     | JObj([Pair[String, JsonValue]])
@@ -33,6 +36,7 @@ pub type JsonValue
   = JNull
   | JBool(Bool)
   | JNum(Int)
+  | JReal(Real)
   | JStr(String)
   | JArr([JsonValue])
   | JObj([Pair[String, JsonValue]])
@@ -92,6 +96,7 @@ pub fn json_encode(v: JsonValue) : String = match v {
   JNull       -> "null"
   JBool(b)    -> if b { "true" } else { "false" }
   JNum(n)     -> int_to_string(n)
+  JReal(r)    -> real_to_string(r)
   JStr(s)     -> string_concat(string_concat("\"", json_escape_loop(s, 0, "")), "\"")
   JArr(xs)    -> string_concat(string_concat("[", string.join(list.map(xs, json_encode), ",")), "]")
   JObj(ps)    -> string_concat(string_concat("{", string.join(list.map(ps, json_encode_pair), ",")), "}")
@@ -182,22 +187,44 @@ fn json_parse_bool(s: String, i: Int) : Option[JParse] = match json_match_lit(s,
   }
 }
 
-# Number: optional `-`, then a non-empty digit run. v1 parses
-# integers only — fractions and exponents return None.
+# Number: RFC 8259 grammar — optional `-`, integer part, optional
+# fractional part, optional exponent. If neither `.` nor `e/E`
+# appears, the lexeme parses as `JNum(Int)`; otherwise as
+# `JReal(Real)` via the prelude `string_to_real`.
 fn json_parse_number(s: String, i: Int) : Option[JParse] = {
   let neg = match char_at(s, i) {
     Some(c) -> c == '-'
     None    -> false
   }
-  let start = if neg { i + 1 } else { i }
-  let n_end = json_digits_end(s, start)
-  if n_end == start { None }
+  let int_start = if neg { i + 1 } else { i }
+  let int_end = json_digits_end(s, int_start)
+  if int_end == int_start { None }
   else {
-    # Reject decimals and exponents in v1.
-    match char_at(s, n_end) {
-      Some(c) -> if c == '.' or c == 'e' or c == 'E' { None }
-                 else { json_finish_number(s, i, n_end, neg, start) }
-      None -> json_finish_number(s, i, n_end, neg, start)
+    let frac_end = json_scan_frac(s, int_end)
+    match frac_end {
+      None    -> None
+      Some(fe) -> {
+        let exp_end = json_scan_exp(s, fe)
+        match exp_end {
+          None     -> None
+          Some(ee) -> {
+            let is_real = ee != int_end
+            if is_real {
+              let lex = string_slice(s, i, ee - i)
+              match string_to_real(lex) {
+                None    -> None
+                Some(r) -> jp_some(JReal(r), ee)
+              }
+            } else {
+              let mag_str = string_slice(s, int_start, int_end - int_start)
+              match string_to_int(mag_str) {
+                None    -> None
+                Some(m) -> jp_some(JNum(if neg { 0 - m } else { m }), int_end)
+              }
+            }
+          }
+        }
+      }
     }
   }
 }
@@ -210,11 +237,31 @@ fn json_digits_end(s: String, i: Int) : Int = {
   } }
 }
 
-fn json_finish_number(s: String, _i_start: Int, i_end: Int, neg: Bool, mag_start: Int) : Option[JParse] = {
-  let mag_str = string_slice(s, mag_start, i_end - mag_start)
-  match string_to_int(mag_str) {
-    None    -> None
-    Some(m) -> jp_some(JNum(if neg { 0 - m } else { m }), i_end)
+# Optional `.` followed by one or more digits. Returns the cursor
+# after the fractional part if present (or unchanged if absent),
+# `None` if a `.` is not followed by at least one digit.
+fn json_scan_frac(s: String, i: Int) : Option[Int] = {
+  match char_at(s, i) {
+    Some('.') -> {
+      let d_end = json_digits_end(s, i + 1)
+      if d_end == i + 1 { None } else { Some(d_end) }
+    }
+    _ -> Some(i)
+  }
+}
+
+# Optional `[eE][+-]?` followed by one or more digits.
+fn json_scan_exp(s: String, i: Int) : Option[Int] = {
+  match char_at(s, i) {
+    Some(c) -> if c == 'e' or c == 'E' {
+      let after_sign = match char_at(s, i + 1) {
+        Some(c2) -> if c2 == '+' or c2 == '-' { i + 2 } else { i + 1 }
+        None     -> i + 1
+      }
+      let d_end = json_digits_end(s, after_sign)
+      if d_end == after_sign { None } else { Some(d_end) }
+    } else { Some(i) }
+    None -> Some(i)
   }
 }
 
