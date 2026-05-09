@@ -276,7 +276,7 @@ land in each module's own spec when implemented.
 ### math (pure, stage 2)
 
 - `math.int` — `min`, `max`, `gcd`, `lcm`, `factorial`, `fib`, `is_prime`, `log2`, `div_mod` *(all shipped; `log2` and `div_mod` via #347)*. `abs`, `signum`, `clamp`, `pow` are NOT here — they dispatch through `Numeric for Int` (`stdlib/math/numeric.kai`); `signum` is `Numeric.sign` and `pow` is `Numeric.pow_int`. Coverage for the four Numeric ops over Int lives in `examples/stdlib/math_int_basic.kai`. Bit ops (`shl`, `shr`, `and`, `or`, `xor`, `not`, `popcount`, `leading_zeros`, `trailing_zeros`) are intrinsic — they live in `math/bits.kai`, NOT in `math/int.kai`.
-- `math.real` *(shipped — was `math.float` in earlier drafts; the module file is `stdlib/math/real.kai` and the namespace is `math.real`. `math.float` does not exist.)* — `min`, `max`, `floor`, `ceil`, `round`, `round_half_even`, `trunc` *(shipped)*; libm bindings — `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log`, `log2`, `log10`, `pow` — *(shipped via PR #359, closes #343)*. `is_nan` / `is_inf` *(planned, no tracking issue)*.
+- `math.real` *(shipped — was `math.float` in earlier drafts; the module file is `stdlib/math/real.kai` and the namespace is `math.real`. `math.float` does not exist.)* — `min`, `max`, `floor`, `ceil`, `round`, `round_half_even`, `trunc` *(shipped)*; libm bindings — `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log`, `log2`, `log10`, `pow` — *(shipped via PR #359, closes #343)*; `rem` (`fmod`) wires `impl Rem for Real` so `r1 % r2` type-checks — *(shipped, closes #364)*. `is_nan` / `is_inf` *(planned, no tracking issue)*.
 
 ### decimal (pure, stage 2)
 
