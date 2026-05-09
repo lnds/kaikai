@@ -282,7 +282,9 @@ land in each module's own spec when implemented.
 ### decimal (pure, stage 2)
 
 - `decimal` — arbitrary-precision decimal arithmetic with rounding
-  modes (top-level module: `decimal.add`, `decimal.from_string`, …)
+  modes (top-level module: `decimal.add`, `decimal.from_string`, …).
+  `dec_div(a, b, target_scale)` returns `Option[Decimal]`: `None` on
+  division by zero, `Some(q)` otherwise *(closes #363)*.
 
 ### money (pure, stage 2)
 
