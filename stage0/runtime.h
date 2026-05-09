@@ -3290,6 +3290,73 @@ static KaiValue *kai_prelude_write_file(KaiValue *path, KaiValue *content) {
     return r;
 }
 
+/* Issue #345: file_exists / file_delete / file_rename. Each consumes
+ * its String args linearly (kai_decref before allocating the result),
+ * matching the prelude convention used by read_file/write_file above. */
+
+static KaiValue *kai_prelude_file_exists(KaiValue *path) {
+    int present = 0;
+    if (path && path->tag == KAI_STR) {
+        char pbuf[4096];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        present = (access(pbuf, F_OK) == 0) ? 1 : 0;
+    }
+    if (path) kai_decref(path);
+    return kai_bool(present);
+}
+
+static KaiValue *kai_prelude_file_delete(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_delete: path is not a String");
+        r = kai_variant(0, "Err", 1, &msg);
+    } else {
+        char pbuf[4096];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        if (unlink(pbuf) == 0) {
+            KaiValue *u = kai_unit();
+            r = kai_variant(0, "Ok", 1, &u);
+        } else {
+            KaiValue *msg = kai_str("file_delete: unlink failed");
+            r = kai_variant(0, "Err", 1, &msg);
+        }
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+static KaiValue *kai_prelude_file_rename(KaiValue *from, KaiValue *to) {
+    KaiValue *r = NULL;
+    if (!from || from->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_rename: from is not a String");
+        r = kai_variant(0, "Err", 1, &msg);
+    } else if (!to || to->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_rename: to is not a String");
+        r = kai_variant(0, "Err", 1, &msg);
+    } else {
+        char fbuf[4096];
+        char tbuf[4096];
+        size_t flen = from->as.s.len < sizeof(fbuf) - 1 ? from->as.s.len : sizeof(fbuf) - 1;
+        size_t tlen = to->as.s.len   < sizeof(tbuf) - 1 ? to->as.s.len   : sizeof(tbuf) - 1;
+        memcpy(fbuf, from->as.s.bytes, flen); fbuf[flen] = '\0';
+        memcpy(tbuf, to->as.s.bytes,   tlen); tbuf[tlen] = '\0';
+        if (rename(fbuf, tbuf) == 0) {
+            KaiValue *u = kai_unit();
+            r = kai_variant(0, "Ok", 1, &u);
+        } else {
+            KaiValue *msg = kai_str("file_rename: rename failed");
+            r = kai_variant(0, "Err", 1, &msg);
+        }
+    }
+    if (from) kai_decref(from);
+    if (to)   kai_decref(to);
+    return r;
+}
+
 static KaiValue *kai_prelude_read_line(void) {
     size_t cap = 128, n = 0;
     char *buf = (char *) malloc(cap);
@@ -3531,6 +3598,9 @@ static KaiValue *_kai_prelude_args_thunk(KaiValue *s, KaiValue **a, int n)      
 static KaiValue *_kai_prelude_program_name_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_prelude_program_name(); }
 static KaiValue *_kai_prelude_read_file_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_read_file(a[0]); }
 static KaiValue *_kai_prelude_write_file_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_write_file(a[0], a[1]); }
+static KaiValue *_kai_prelude_file_exists_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_exists(a[0]); }
+static KaiValue *_kai_prelude_file_delete_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_delete(a[0]); }
+static KaiValue *_kai_prelude_file_rename_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_rename(a[0], a[1]); }
 static KaiValue *_kai_prelude_read_line_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) a; (void) n; return kai_prelude_read_line(); }
 static KaiValue *_kai_prelude_string_to_int_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_to_int(a[0]); }
 static KaiValue *_kai_prelude_string_to_real_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_to_real(a[0]); }

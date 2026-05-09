@@ -210,6 +210,9 @@ KaiValue *kaix_prelude_exit(KaiValue *v)                    { return kai_prelude
 /* kaix_prelude_panic is defined above near kaix_match_panic. */
 KaiValue *kaix_prelude_read_file(KaiValue *p)               { return kai_prelude_read_file(p); }
 KaiValue *kaix_prelude_write_file(KaiValue *p, KaiValue *c) { return kai_prelude_write_file(p, c); }
+KaiValue *kaix_prelude_file_exists(KaiValue *p)             { return kai_prelude_file_exists(p); }
+KaiValue *kaix_prelude_file_delete(KaiValue *p)             { return kai_prelude_file_delete(p); }
+KaiValue *kaix_prelude_file_rename(KaiValue *f, KaiValue *t){ return kai_prelude_file_rename(f, t); }
 KaiValue *kaix_prelude_read_line(void)                      { return kai_prelude_read_line(); }
 KaiValue *kaix_prelude_real_to_string(KaiValue *v)          { return kai_prelude_real_to_string(v); }
 KaiValue *kaix_prelude_int_to_real(KaiValue *v)             { return kai_prelude_int_to_real(v); }
