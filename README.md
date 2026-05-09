@@ -97,6 +97,20 @@ The driver auto-builds `stage0/kaic0` and `stage1/kaic1` on first use
 and prepends every file under `stdlib/core/` to every compilation
 (set `KAI_NO_STDLIB=1` to turn this off).
 
+Declare dependencies in a `kai.toml` next to your source:
+
+```sh
+kai init myapp                      # writes kai.toml
+# edit kai.toml to add dependencies
+kai install                         # resolve them
+kai run src/main.kai                # auto-injects --path for local-path deps
+```
+
+See [`docs/packages.md`](docs/packages.md) for the manifest format,
+the supported dependency forms (string shorthand, inline table,
+local path), and the v1 status (local-path deps are live; git-based
+deps are deferred to a follow-up).
+
 ## Layout
 
 ```
