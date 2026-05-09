@@ -47,10 +47,10 @@ These all appear in **full kaikai** (the language stage 1 compiles), but stage 0
 ### Keywords
 
 ```
-and       as        assert    else      false
-fn        if        import    let       match
-not       or        pub       test      true
-type
+and       as        assert    case      else
+false     fn        if        import    let
+match     not       or        pub       test
+true      type      when
 ```
 
 ### Literals
@@ -166,19 +166,27 @@ Full kaikai extends this with a `main.kai` convention and script mode (`kai run 
 
 ### Functions
 
-Two body forms, canonical for each case:
+Three body forms:
 
 ```kai
-# Expression body — use `=`
+# 1. Expression body — use `=`
 fn square(x: Int) : Int = x * x
 fn abs(x: Int) : Int = if x < 0 { -x } else { x }
 
-# Block body — no `=`, last expression is the return value
+# 2. Statement-block body — no `=`, last expression is the return value
 fn classify(n: Int) : String {
   let abs_n = if n < 0 { -n } else { n }
   if abs_n == 0 { "zero" }
   else if abs_n < 10 { "small" }
   else { "big" }
+}
+
+# 3. Multi-clause body — `case`-led arms over the implicit tuple of args.
+#    Each arm: `case <pattern> (when <guard>)? -> <body>`.
+fn sign(n: Int) : String {
+  case 0          -> "zero"
+  case n when n < 0 -> "neg"
+  case _          -> "pos"
 }
 
 # Unit return can be omitted from the signature
@@ -193,6 +201,11 @@ fn main() {
 ```
 
 Return-type annotations are mandatory except on `main`.
+
+The multi-clause form (3) desugars at parse time to a `match` over
+the implicit tuple of args; see `docs/syntax-sugars.md` §11. A body
+block is **either** all statements **or** all `case` arms — mixing is
+a hard parse error.
 
 ### Let bindings
 
