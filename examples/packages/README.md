@@ -50,6 +50,15 @@ and are gitignored — regenerate them whenever the source under
   examples/packages/lockfile_reproducibility/check.sh
   ```
 
+- **`add_failure/`** — `check.sh` asserts `kai add` is atomic on
+  git-clone failure (issue #418): a bad source exits non-zero,
+  leaves `kai.toml` unchanged, and never writes a `[[package]]`
+  entry into `kai.lock`.
+
+  ```sh
+  examples/packages/add_failure/check.sh
+  ```
+
 ## Coverage in tier 1
 
 Driver-level fixtures don't fit `test-llvm-coverage` (which
