@@ -51,8 +51,8 @@ encoding/  json.kai base64.kai hex.kai
 fs/  file.kai dir.kai path.kai
 net/  tcp.kai http.kai
 os/  args.kai env.kai
-top-level: actor.kai decimal.kai effects.kai log.kai loop.kai money.kai
-           path.kai protocols.kai random.kai random_secure.kai
+top-level: actor.kai array.kai decimal.kai effects.kai log.kai loop.kai
+           money.kai path.kai protocols.kai random.kai random_secure.kai
            reader.kai regexp.kai spawn.kai time.kai trace.kai
            uuid.kai writer.kai
 ```
@@ -77,6 +77,7 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `core/tuple` helpers                    | shipped (closes #348): `tuple.swap`, `tuple.map_fst`, `tuple.map_snd`, `tuple.map_pair`, `tuple.first`/`second`/`third`. `fst`/`snd` projections stay field-access only — adding bare `pub fn fst`/`snd` poisons every existing `record.fst` access whose receiver type isn't yet pinned by inference (see module header) |
 | `core/list` surface expansion           | shipped (closes #340): `last`, `init`, `partition`, `split_at`, `span`, `chunk`, `windows`, `intersperse`, `enumerate`, `zip3`, `scan`, `group_by`, `find_map`. `group_by` uses Erlang/Elixir consecutive-key semantics; key type is `Int` for v1 (same dispatch limit as `uniq`) |
 | `core/string` surface expansion         | shipped partially against #338: `split`, `replace`, `pad_left`, `pad_right`, `lines`, `chars`, `is_blank`. `split(s, "")` panics; `lines("")` returns `[]` (Python/Rust convention). Five proposed helpers (`index_of`, `to_upper`/`to_lower`, `is_empty`, `reverse`) deferred to #396 — each collides on bare name with an existing core export, and `--include-prelude-tests` does not honor the typer's first-arg-type narrowing across modules (resolver fix → surface, mirroring #335 → #336) |
+| `array` bridge module                   | shipped (closes #366): top-level `stdlib/array.kai` with `array_from_list`, `array_to_list`, `array_copy`. `random.shuffle` flipped from O(n²) selection-sampling to O(n) in-place Fisher-Yates over a locally-built `Array[T]`; observable row stays `[T] -> [T] / Random` (masking pass drops the inner `Mutable`) |
 
 What's still open (planned-but-not-shipped):
 
