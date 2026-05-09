@@ -2106,6 +2106,239 @@ fn subst_underscores(es: [Expr], replacement: Expr) : [Expr] {
   }
 }
 
+# Issue #385 — `.` placeholder desugar at call-argument position.
+#
+# `f(. < 3)` desugars to `f((__pl) => __pl < 3)` so the placeholder
+# sugar documented in `docs/kaikai-minimal.md` §"Placeholder rules"
+# works wherever a function value is expected. The walk stops at
+# inner `ELambda` / `EHandle` boundaries: `.` inside a nested
+# explicit-arrow lambda binds to that nested scope (and per the
+# docs, multi-arg / nested-scope cases must use named arrows — a
+# stray `.` that survives the desugar is rejected by the typer).
+#
+# Multiple `.` occurrences in the same argument all refer to the
+# same `__pl` parameter (unary), per docs.
+
+fn arg_has_placeholder(e: Expr) : Bool {
+  match e.kind {
+    EPlaceholder        -> true
+    EInt(_)             -> false
+    EReal(_)            -> false
+    EBool(_)            -> false
+    EChar(_)            -> false
+    EStr(_, _)          -> false
+    EUnit               -> false
+    EVar(_)             -> false
+    EUnder              -> false
+    EHole(_)            -> false
+    ETodo(_)            -> false
+    EVariantsOf(_, _)   -> false
+    EModCall(_, _)      -> false
+    # `ELambda` introduces a fresh scope. Per docs, `.` does NOT
+    # reach into a nested arrow lambda — that's the multi-arg /
+    # nested case the spec rejects.
+    ELambda(_, _)       -> false
+    # `EHandle` clauses are themselves lambdas; treat the whole
+    # node as a scope barrier. The handler body is a normal
+    # expression but mixing `.` with effect handlers in argument
+    # position is not in the documented sugar surface.
+    EHandle(_, _, _, _, _, _, _) -> false
+    ECall(callee, args_) ->
+      arg_has_placeholder(callee) or any_arg_has_placeholder(args_)
+    EField(base, _)     -> arg_has_placeholder(base)
+    EIndex(a, b)        -> arg_has_placeholder(a) or arg_has_placeholder(b)
+    EBinop(_, a, b)     -> arg_has_placeholder(a) or arg_has_placeholder(b)
+    EUnop(_, x)         -> arg_has_placeholder(x)
+    EIf(c, t_, eo)      ->
+      arg_has_placeholder(c) or arg_has_placeholder(t_) or
+      opt_arg_has_placeholder(eo)
+    EMatch(scr, arms)   ->
+      arg_has_placeholder(scr) or any_arm_has_placeholder(arms)
+    ERecordLit(_, fs)   -> any_field_has_placeholder(fs)
+    EList(els)          -> any_elem_has_placeholder(els)
+    ERange(a, b, opt_step) ->
+      arg_has_placeholder(a) or arg_has_placeholder(b) or
+      opt_arg_has_placeholder(opt_step)
+    EBlock(stmts, tail) ->
+      any_stmt_has_placeholder(stmts) or opt_arg_has_placeholder(tail)
+    EPipe(a, b)         -> arg_has_placeholder(a) or arg_has_placeholder(b)
+    EMapPipe(a, b)      -> arg_has_placeholder(a) or arg_has_placeholder(b)
+    EFlatMapPipe(a, b)  -> arg_has_placeholder(a) or arg_has_placeholder(b)
+    ELitUnit(inner, _)  -> arg_has_placeholder(inner)
+    EBang(inner)        -> arg_has_placeholder(inner)
+  }
+}
+
+fn any_arg_has_placeholder(es: [Expr]) : Bool = match es {
+  []           -> false
+  [h, ...rest] -> if arg_has_placeholder(h) { true } else { any_arg_has_placeholder(rest) }
+}
+
+fn opt_arg_has_placeholder(o: Option[Expr]) : Bool = match o {
+  None    -> false
+  Some(e) -> arg_has_placeholder(e)
+}
+
+fn any_arm_has_placeholder(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [h, ...rest] -> match h {
+    Arm(_, g, b) ->
+      if opt_arg_has_placeholder(g) { true }
+      else if arg_has_placeholder(b) { true }
+      else { any_arm_has_placeholder(rest) }
+  }
+}
+
+fn any_field_has_placeholder(fs: [FieldInit]) : Bool = match fs {
+  []           -> false
+  [h, ...rest] -> match h {
+    FI(_, v) -> if arg_has_placeholder(v) { true } else { any_field_has_placeholder(rest) }
+  }
+}
+
+fn any_elem_has_placeholder(els: [ListElem]) : Bool = match els {
+  []           -> false
+  [h, ...rest] -> match h {
+    ElPlain(x)  -> if arg_has_placeholder(x) { true } else { any_elem_has_placeholder(rest) }
+    ElSpread(x) -> if arg_has_placeholder(x) { true } else { any_elem_has_placeholder(rest) }
+  }
+}
+
+fn any_stmt_has_placeholder(ss: [Stmt]) : Bool = match ss {
+  []           -> false
+  [h, ...rest] -> if stmt_has_placeholder(h) { true } else { any_stmt_has_placeholder(rest) }
+}
+
+fn stmt_has_placeholder(s: Stmt) : Bool = match s {
+  SLet(_, _, rhs)             -> arg_has_placeholder(rhs)
+  SAssert(c, m)               -> arg_has_placeholder(c) or opt_arg_has_placeholder(m)
+  SExprStmt(x)                -> arg_has_placeholder(x)
+  SIndexAssign(b, i, v, _, _) ->
+    arg_has_placeholder(b) or arg_has_placeholder(i) or arg_has_placeholder(v)
+  SVar(_, _, rhs, _, _)       -> arg_has_placeholder(rhs)
+  SUse(_, _, _)               -> false
+}
+
+fn subst_placeholder_expr(e: Expr, repl: Expr) : Expr {
+  match e.kind {
+    EPlaceholder -> repl
+    # ELambda / EHandle are scope barriers — leave them alone.
+    ELambda(_, _) -> e
+    EHandle(_, _, _, _, _, _, _) -> e
+    _ -> {
+      let new_kind = subst_placeholder_kind(e.kind, repl)
+      Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+    }
+  }
+}
+
+fn subst_placeholder_kind(k: ExprKind, repl: Expr) : ExprKind {
+  match k {
+    EInt(_)             -> k
+    EReal(_)            -> k
+    EBool(_)            -> k
+    EChar(_)            -> k
+    EStr(_, _)          -> k
+    EUnit               -> k
+    EVar(_)             -> k
+    EUnder              -> k
+    EHole(_)            -> k
+    ETodo(_)            -> k
+    EVariantsOf(_, _)   -> k
+    EModCall(_, _)      -> k
+    EPlaceholder        -> k    # handled by subst_placeholder_expr
+    ELambda(_, _)       -> k    # scope barrier
+    EHandle(_, _, _, _, _, _, _) -> k    # scope barrier
+    ECall(callee, args_) ->
+      ECall(subst_placeholder_expr(callee, repl),
+            map(args_, (a) => subst_placeholder_expr(a, repl)))
+    EField(base, name)  -> EField(subst_placeholder_expr(base, repl), name)
+    EIndex(a, b)        -> EIndex(subst_placeholder_expr(a, repl),
+                                    subst_placeholder_expr(b, repl))
+    EBinop(op, a, b)    -> EBinop(op, subst_placeholder_expr(a, repl),
+                                       subst_placeholder_expr(b, repl))
+    EUnop(op, x)        -> EUnop(op, subst_placeholder_expr(x, repl))
+    EIf(c, t_, eo)      ->
+      EIf(subst_placeholder_expr(c, repl),
+          subst_placeholder_expr(t_, repl),
+          subst_placeholder_opt(eo, repl))
+    EMatch(scr, arms)   ->
+      EMatch(subst_placeholder_expr(scr, repl),
+              map(arms, (a) => subst_placeholder_arm(a, repl)))
+    ERecordLit(name, fs) ->
+      ERecordLit(name, map(fs, (fi) => subst_placeholder_field(fi, repl)))
+    EList(els)          -> EList(map(els, (el) => subst_placeholder_elem(el, repl)))
+    ERange(a, b, opt_step) ->
+      ERange(subst_placeholder_expr(a, repl),
+              subst_placeholder_expr(b, repl),
+              subst_placeholder_opt(opt_step, repl))
+    EBlock(stmts, tail) ->
+      EBlock(map(stmts, (s) => subst_placeholder_stmt(s, repl)),
+              subst_placeholder_opt(tail, repl))
+    EPipe(a, b)         -> EPipe(subst_placeholder_expr(a, repl),
+                                  subst_placeholder_expr(b, repl))
+    EMapPipe(a, b)      -> EMapPipe(subst_placeholder_expr(a, repl),
+                                      subst_placeholder_expr(b, repl))
+    EFlatMapPipe(a, b)  -> EFlatMapPipe(subst_placeholder_expr(a, repl),
+                                          subst_placeholder_expr(b, repl))
+    ELitUnit(inner, u)  -> ELitUnit(subst_placeholder_expr(inner, repl), u)
+    EBang(inner)        -> EBang(subst_placeholder_expr(inner, repl))
+  }
+}
+
+fn subst_placeholder_opt(o: Option[Expr], repl: Expr) : Option[Expr] = match o {
+  None    -> None
+  Some(e) -> Some(subst_placeholder_expr(e, repl))
+}
+
+fn subst_placeholder_arm(a: Arm, repl: Expr) : Arm = match a {
+  Arm(p, g, b) ->
+    Arm(p, subst_placeholder_opt(g, repl), subst_placeholder_expr(b, repl))
+}
+
+fn subst_placeholder_field(fi: FieldInit, repl: Expr) : FieldInit = match fi {
+  FI(n, v) -> FI(n, subst_placeholder_expr(v, repl))
+}
+
+fn subst_placeholder_elem(el: ListElem, repl: Expr) : ListElem = match el {
+  ElPlain(x)  -> ElPlain(subst_placeholder_expr(x, repl))
+  ElSpread(x) -> ElSpread(subst_placeholder_expr(x, repl))
+}
+
+fn subst_placeholder_stmt(s: Stmt, repl: Expr) : Stmt = match s {
+  SLet(p, ann, rhs)           -> SLet(p, ann, subst_placeholder_expr(rhs, repl))
+  SAssert(c, m)               -> SAssert(subst_placeholder_expr(c, repl),
+                                          subst_placeholder_opt(m, repl))
+  SExprStmt(x)                -> SExprStmt(subst_placeholder_expr(x, repl))
+  SIndexAssign(b, i, v, l, c) -> SIndexAssign(subst_placeholder_expr(b, repl),
+                                                subst_placeholder_expr(i, repl),
+                                                subst_placeholder_expr(v, repl),
+                                                l, c)
+  SVar(n, ty, rhs, l, c)      -> SVar(n, ty, subst_placeholder_expr(rhs, repl), l, c)
+  SUse(n, l, c)               -> SUse(n, l, c)
+}
+
+# Wrap a single argument expression in a placeholder lambda when
+# it carries a top-level `.`. Returns the argument unchanged when
+# it has no placeholder, or when the top-level node is itself a
+# lambda / handler (scope barriers), preserving the existing
+# parser shape for those cases.
+fn desugar_placeholder_arg(arg: Expr) : Expr {
+  if arg_has_placeholder(arg) {
+    let pl_name = "__pl"
+    let pl_var = mk_expr(EVar(pl_name), arg.line, arg.col)
+    let body = subst_placeholder_expr(arg, pl_var)
+    let pl_param = Param { pname: pl_name, ptype: None,
+                            pline: arg.line, pcol: arg.col }
+    mk_expr(ELambda([pl_param], body), arg.line, arg.col)
+  } else {
+    arg
+  }
+}
+
+fn desugar_placeholder_args(args_: [Expr]) : [Expr] =
+  map(args_, desugar_placeholder_arg)
+
 fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
   # `|>` (apply), `|` (map), and `||` (flat-map) all sit at the lowest
   # binop level, left-associative. The `|` variant separator in
@@ -2399,7 +2632,14 @@ fn parse_postfix_rest(p: Parser, lhs: Expr) : PExpr {
         }
         match lam_r.r {
           None -> err_e(lam_r.p)
-          Some(xs1) -> parse_postfix_rest(lam_r.p, mk_expr(ECall(lhs, xs1), t.line, t.col))
+          Some(xs1) -> {
+            # Issue #385: rewrite `f(. < 3)` to `f((__pl) => __pl < 3)`
+            # so the documented placeholder sugar reaches the typer as
+            # a function value. See `desugar_placeholder_arg` for the
+            # scope rules.
+            let xs2 = desugar_placeholder_args(xs1)
+            parse_postfix_rest(lam_r.p, mk_expr(ECall(lhs, xs2), t.line, t.col))
+          }
         }
       }
     }
@@ -25825,7 +26065,18 @@ fn synth(st: InferState, e: Expr) : Inferred {
     EStr(_, _)     -> inferred_leaf(st, TyString, e)
     EUnit          -> inferred_leaf(st, TyUnit, e)
     EUnder         -> inferred_leaf(st, TyAny, e)
-    EPlaceholder   -> inferred_leaf(st, TyAny, e)
+    # Issue #385: a `.` placeholder that survives parsing in a
+    # non-argument position is a hard error per
+    # `docs/kaikai-minimal.md` §"Placeholder rules". The argument-
+    # position desugar (`desugar_placeholder_arg`) wraps every
+    # call-arg subtree containing a `.` into a unary lambda before
+    # the typer ever sees it; reaching this arm means the user
+    # wrote `.` outside that sugar.
+    EPlaceholder   -> {
+      diag_error(st.file, e.line, e.col,
+        "`.` placeholder used outside lambda-expected position; use a named arrow `(x) => ...`")
+      inferred_leaf(st_bump_err(st), TyAny, e)
+    }
     EVar(nm)       -> match ty_env_lookup(st.env, nm) {
       Some(sc) -> {
         let r = st_instantiate_report(st, sc)
