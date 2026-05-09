@@ -29267,9 +29267,14 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt {
       # path is unchanged (synth + post-hoc unify against `declared`
       # below). Decimal-literal lowering relies on `rr.ty` being the
       # synthesised RHS type, which is preserved in both paths.
+      # issue #382: same routing for `EIf` via `check_if`.
       let rr = match ann {
         Some(te) -> match rhs.kind {
           EMatch(_, _) -> {
+            let exp_resolved = resolve_ty(te)
+            check_expr_against(st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
+          }
+          EIf(_, _, _) -> {
             let exp_resolved = resolve_ty(te)
             check_expr_against(st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
@@ -29676,15 +29681,50 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
   mk_inferred(st_post, ty, root)
 }
 
+# issue #382: bidirectional check variant of `synth_if`, parallel to
+# `check_match` (issue #379). When the if/else appears in a position
+# with a known expected type — annotated function return, annotated
+# `let` RHS — the caller passes that type in as `expected`, and each
+# branch is unified against it directly instead of against the
+# synthesised `then`-branch type. The change restores the
+# implicit-upcast promise of #187 across if/else branches: with the
+# expected union shape in scope when the first branch unifies, the
+# `union_upcast_ok` rule in `unify_heads` accepts a narrower component
+# type without the typer pinning `body_ty` to it.
+# Synthesise mode (`synth_if`) is preserved verbatim for unannotated
+# positions so existing inference is unchanged.
+fn check_if(st: InferState, c: Expr, t_: Expr, eo: Option[Expr],
+            expected: Ty, line: Int, col: Int) : Inferred {
+  let rc = synth(st, c)
+  let s1 = st_unify(rc.st, rc.ty, TyBool, "if condition", line, col)
+  let rt = synth(s1, t_)
+  match eo {
+    None -> {
+      let root = with_ty(mk_expr(EIf(rc.expr, rt.expr, None), line, col), TyUnit)
+      mk_inferred(rt.st, TyUnit, root)
+    }
+    Some(ee) -> {
+      let s_t = st_unify(rt.st, expected, rt.ty, "if/else branches", line, col)
+      let re = synth(s_t, ee)
+      let s2 = st_unify(re.st, expected, re.ty, "if/else branches", line, col)
+      let ty = apply_ty(s2.sub, expected)
+      let root = with_ty(mk_expr(EIf(rc.expr, rt.expr, Some(re.expr)), line, col), ty)
+      mk_inferred(s2, ty, root)
+    }
+  }
+}
+
 # issue #379: route an expression through `check_match` when its
 # AST head is `EMatch`, otherwise fall back to synth. The post-hoc
 # unify in the caller (`infer_decl`, `synth_stmt` for SLet) handles
 # the non-match case; for match the propagation already happened
 # inside `check_match`.
+# issue #382: extends to `EIf` via `check_if`.
 fn check_expr_against(st: InferState, e: Expr, expected: Ty,
                       what: String, line: Int, col: Int) : Inferred {
   match e.kind {
     EMatch(scr, arms) -> check_match(st, scr, arms, expected, e.line, e.col)
+    EIf(c, t_, eo)    -> check_if(st, c, t_, eo, expected, e.line, e.col)
     _ -> synth(st, e)
   }
 }
@@ -29700,12 +29740,22 @@ fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
                           what: String, line: Int, col: Int) : Inferred {
   match body.kind {
     EMatch(scr, arms) -> check_match(st, scr, arms, expected, body.line, body.col)
+    EIf(c, t_, eo)    -> check_if(st, c, t_, eo, expected, body.line, body.col)
     EBlock(stmts, tail) -> match tail {
       Some(te) -> match te.kind {
         EMatch(scr, arms) -> {
           let outer = st
           let is_ = synth_stmts(st, stmts)
           let r = check_match(is_.st, scr, arms, expected, te.line, te.col)
+          let st2 = st_restore_entries(outer, r.st)
+          let ty = apply_ty(st2.sub, r.ty)
+          let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
+          mk_inferred(st2, ty, root)
+        }
+        EIf(c, t_, eo) -> {
+          let outer = st
+          let is_ = synth_stmts(st, stmts)
+          let r = check_if(is_.st, c, t_, eo, expected, te.line, te.col)
           let st2 = st_restore_entries(outer, r.st)
           let ty = apply_ty(st2.sub, r.ty)
           let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
