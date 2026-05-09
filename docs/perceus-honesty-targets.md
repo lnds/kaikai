@@ -134,26 +134,35 @@ audit + stage 0 eager-dup cleanup to push under the < 5 M
 threshold; the named architectural debt (perceus_pass §4b,
 match-scrutinee, kai_field balance) is now closed.
 
-## Tier 2.5 — *Unboxing Phase 2* (in-MVP, ~5–7 days)
+## Tier 2.5 — *Unboxing Phase 2 + Phase 3* (in-MVP, landed 2026-05-09)
 
-**Decision pinned 2026-04-30**: Phase 2 unboxing moves into MVP
-scope. Without it, the user-facing performance gap vs C native is
+**Decision pinned 2026-04-30**: Phase 2 unboxing moved into MVP
+scope. Without it, the user-facing performance gap vs C native was
 ~50–100× (every `Int` is a heap-allocated `KaiValue *`). Phase 2
-brings the gap to ~5–10×, which is in line with what OCaml /
-Haskell / Go ship as their default representation. Phase 3 (the
-full Koka feature set listed below) stays post-MVP.
+brought the gap to ~5–10× on intra-function arithmetic, in line
+with what OCaml / Haskell / Go ship as their default
+representation. **Phase 3 unboxing (issue #383)** then closes the
+remaining call-boundary gap: every fn whose params + return are in
+{Int, Bool, Char, Real} lowers to a raw C signature, and recursive
+sites pass raw scalars without going through the boxed `kai_apply`
+indirection. Compute-only loops are now within ~1× of clang -O2
+(see `docs/benchmarks/compute_2026-05-09.md` for fib(35) and
+Euler #4 numbers). The "scope expanded to all four primitives" hard
+requirement on the day-5/7/10 gates was met as a single shipped
+release rather than a phased subset.
 
 Phase 1 unboxing (small-int + char cache for `[-128, 127]` ints
-and `[0, 127]` chars) already landed (commit `69c6166`); Phase 2
-is the contained chunk that does **not** require the
-multi-threaded scheduler / cross-thread atomics design that
-Phase 3 needs.
+and `[0, 127]` chars) landed earlier (commit `69c6166`); Phase 2 +
+Phase 3 are contained chunks that do **not** require the
+multi-threaded scheduler / cross-thread atomics design that the
+full Koka feature set needs.
 
 | Phase | What it does | Status | Performance vs C |
 |---|---|---|---:|
 | Phase 1 — small-int + char cache | Cache hits for ints in [-128, 127] / chars [0, 127] reuse singletons; no alloc | ✅ landed (`69c6166`) | 50–100× slower (cache hits free, miss boxes) |
-| **Phase 2 — locals + return values unboxed** | `Int` / `Bool` / `Char` live in C `int64_t` / `int` directly inside fn bodies; boxing only at function-call boundaries and storage edges. Escape analysis decides what gets boxed. | ⏳ in-MVP, this lane | **5–10× slower (boxing only at boundaries)** |
-| Phase 3 — full unboxing (Tier 3 below) | Reuse-in-place, drop specialisation, regions, cross-fiber unboxed messages, type-erased layouts | ⏳ post-MVP | 1–2× slower (close to C) |
+| Phase 2 — locals + return values unboxed | `Int` / `Bool` / `Char` / `Real` live in C `int64_t` / `int` / `double` directly inside fn bodies; boxing only at call boundaries and storage edges. | ✅ landed | 5–10× slower (boxing at call boundaries) |
+| **Phase 3 — call boundaries unboxed (#383)** | Top-level fns with all-primitive concrete signatures emit raw C signatures (`int64_t fib(int64_t)` etc.). Boxing collapses to ~zero on compute-only programs. | ✅ landed 2026-05-09 | **~1× C on compute (fib 1.0×, Euler #4 1.05×)** |
+| Phase 4 — full unboxing (Tier 3 below) | Reuse-in-place, drop specialisation, regions, cross-fiber unboxed messages, type-erased layouts | ⏳ post-MVP | matches C across the whole alloc mix |
 
 **Phase 2 scope** (single lane after `fibers-tier-2` closes):
 
