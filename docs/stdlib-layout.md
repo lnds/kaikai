@@ -224,7 +224,7 @@ stdlib/
   os/            effects: Env, Process
     env.kai      (shipped via PR #131 + PR #143)
     args.kai     (shipped via PR #131 + PR #143)
-    process.kai  (planned: #346 — runtime + effect already in via PR #142)
+    process.kai  (shipped — closes #346; 4 public fns: `start`, `wait`, `kill`, `exit`)
   time.kai       effect: Clock (top-level module — shipped; default handler via PR #134)
   random.kai     effect: Random (top-level module — shipped)
   random_secure.kai  effect: SecureRandom (top-level — shipped via PR #144, closes #140)
@@ -343,8 +343,8 @@ declare `/ Stdin`.
 
 - `os.env` — `get`, `set`, `unset`, `entries` *(shipped via PR #131 + PR #143; closes #127 — `entries` was renamed from `all` because the bare `all` collided with `list.all` for any caller importing both)*
 - `os.args` — `argv`, `program_name` *(shipped via PR #131 + PR #143)*
-- `os.process` — `start(cmd, args)`, `wait`, `wait_or_kill`, `pipe_stdout`, `pipe_stdin`, `signal`, `kill` *(planned: #346 — runtime + `Process` effect already shipped via PR #142; only the public Kai wrapper module is missing. `stdlib/os/process.kai` does not exist on disk yet.)*
-- `os.exit` — *(planned: #346)* — top-level helper exposed directly under `os`, physically inside `process.kai`. Takes an exit code. Effect: `/ Process` (exiting is observable). Mechanism for surfacing it at the top level (re-export, package-level body, …) is a module-system design decision pending in stage 2.
+- `os.process` — `start(cmd, args)`, `wait`, `kill`, `exit` *(shipped — closes #346; 4 public fns wrapping the four ops of `Process`. `wait_or_kill`, `pipe_stdout`, `pipe_stdin`, `signal` deferred — pipe redirection requires runtime work and `wait_or_kill` is best landed once the m8.x scheduler delivers Cancel into a fiber-suspended wait.)*
+- `os.exit` — physically `process.exit` *(shipped via #346)*. Takes an exit code. Effect: `/ Process` (exiting is observable). Top-level alias `os.exit` (calling `exit(7)` without the `process.` qualifier) is a module-system design decision pending in stage 2; until then, `process.exit(code)` is the surface.
 
 ### time (`/ Clock`)
 

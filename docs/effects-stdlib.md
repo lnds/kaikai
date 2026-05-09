@@ -821,16 +821,18 @@ effect Process {
 }
 ```
 
-> **v1 status (signal type, as of 2026-05-08).** The runtime
-> `kai_default_process_kill` takes `sig: Int` (raw POSIX signo). The
-> `Signal` type shown above is the m8.x.x target shape — `os.process`
-> would expose a closed `Signal` enum and the typer would refine
-> `Process.kill`'s second argument to it. Today, user code passes an
-> `Int`; passing a kaikai `Signal` value will not type-check against
-> the actual builtin signature in `stage2/compiler.kai
-> :builtin_process_decl`. Track in #346 (the `os.process` Kai
-> wrapper) — it is the natural place to introduce the `Signal` type
-> alongside the public surface.
+> **v1 status (signal type, as of 2026-05-09).** The runtime
+> `kai_default_process_kill` takes `sig: Int` (raw POSIX signo), and
+> the `os.process` Kai wrapper (`stdlib/os/process.kai`, shipped via
+> #346) preserves that shape — `process.kill(c, 15)` is the surface,
+> not `process.kill(c, SigTerm)`. The closed `Sig` type from the
+> `Signal` effect covers only the five subscribable signals
+> (Int/Term/Hup/Usr1/Usr2); SIGKILL and the rest of the POSIX set
+> fall outside it, so widening the wrapper to take a `Sig` would
+> remove user-reachable signals. The richer `Signal` enum sketched
+> above is the m8.x.x target shape; introducing it requires a
+> separate type that covers the full POSIX set without coupling to
+> `Signal.on`'s subscribable subset.
 
 - `start` launches a child process and returns a handle.
   Deliberately not named `spawn` to avoid clash with the `Spawn`
@@ -923,6 +925,16 @@ The common call is `wait_or_kill(child, SIGTERM)`. The handler
 runs only when the wait is interrupted by cancellation; on a
 clean exit, control flows past the `with` clause and the
 `Result` from `Process.wait` is returned untouched.
+
+> **v1 status (2026-05-09).** `wait_or_kill` does NOT ship in
+> `stdlib/os/process.kai`'s v1 surface (#346). The blocker is
+> upstream: `kai_default_process_wait` blocks via plain
+> `waitpid(pid, &status, 0)` (parking the OS thread, not the
+> fiber), so a Cancel raised from another fiber cannot interrupt
+> a wait in flight. The handler shown above would never run on a
+> Cancel that arrives during `Process.wait`. The helper lands
+> alongside the m8.x.x reactor work that turns `Process.wait`
+> into a fiber-suspending op.
 
 ### What's not in v1 (planned extensions)
 
