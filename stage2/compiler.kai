@@ -12043,23 +12043,58 @@ fn emit_named_call_lookup(callee: String, args_e: [Expr], call_args: String, lcs
   } }
 
 fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
-  let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
   match rhs.kind {
     ECall(f, args_e) -> match f.kind {
+      # Phase 3 unboxing — pipe into a UFn callee. The piped LHS
+      # becomes the first arg; both LHS and the trailing args are
+      # emitted raw via `emit_expr_raw`. Without this branch the
+      # default `emit_call_args` produces boxed args and the
+      # `kai_<sym>` call site (which has the raw signature post-
+      # Phase-3) takes `KaiValue *` — a hard C type error caught
+      # by tier1 on `m7d_21_pipe_placeholder_basic`.
       EVar(callee) -> {
-        let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
-        let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-        emit_pipe_named_lookup(callee, list_length(args_e) + 1, args_all, lcs, fns, variants)
+        if list_has(lcs, callee) {
+          let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+          let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
+          let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
+          emit_pipe_named_lookup(callee, list_length(args_e) + 1, args_all, lcs, fns, variants)
+        } else { match efn_resolve(fns, callee) {
+          Some(EFn(_, _, mo, Some(US(_, rt)))) -> {
+            let lhs_raw = emit_expr_raw(src, lhs, lcs, fns, variants, lams, cls)
+            let rest_raw = emit_call_args_raw(src, args_e, lcs, fns, variants, lams, cls)
+            let args_all = if list_length(args_e) == 0 { lhs_raw } else { cat3(lhs_raw, ", ", rest_raw) }
+            let raw_call = cat5("kai_", c_sym(callee, mo), "(", args_all, ")")
+            box_wrap(Some(rt), raw_call)
+          }
+          _ -> {
+            let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+            let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
+            let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
+            emit_pipe_named_lookup(callee, list_length(args_e) + 1, args_all, lcs, fns, variants)
+          }
+        } }
       }
       # m6.2 Phase 3 / v2: piped qualified call `x |> mod.f(args)`.
       # Mint the prefixed symbol directly — same logic as the
-      # non-piped EModCall branch in emit_call_expr.
-      EModCall(mod, fname) -> {
-        let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
-        let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-        cat5("kai_", c_sym(fname, Some(mod)), "(", args_all, ")")
+      # non-piped EModCall branch in emit_call_expr. Phase 3
+      # routes UFn-classified targets through the raw shape too.
+      EModCall(mod, fname) -> match lookup_ufn_sig(fns, fname, Some(mod)) {
+        Some(US(_, rt)) -> {
+          let lhs_raw = emit_expr_raw(src, lhs, lcs, fns, variants, lams, cls)
+          let rest_raw = emit_call_args_raw(src, args_e, lcs, fns, variants, lams, cls)
+          let args_all = if list_length(args_e) == 0 { lhs_raw } else { cat3(lhs_raw, ", ", rest_raw) }
+          let raw_call = cat5("kai_", c_sym(fname, Some(mod)), "(", args_all, ")")
+          box_wrap(Some(rt), raw_call)
+        }
+        None -> {
+          let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+          let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
+          let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
+          cat5("kai_", c_sym(fname, Some(mod)), "(", args_all, ")")
+        }
       }
       _ -> {
+        let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
         let fc = emit_expr(src, f, lcs, fns, variants, lams, cls)
         let rest_args = emit_call_args(src, args_e, lcs, fns, variants, lams, cls)
         let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
@@ -12069,14 +12104,42 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, lcs: [String], fns: [EFn], 
         ])
       }
     }
-    EVar(callee) -> emit_pipe_named_lookup(callee, 1, lhs_c, lcs, fns, variants)
+    EVar(callee) -> {
+      if list_has(lcs, callee) {
+        let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+        emit_pipe_named_lookup(callee, 1, lhs_c, lcs, fns, variants)
+      } else { match efn_resolve(fns, callee) {
+        Some(EFn(_, _, mo, Some(US(_, rt)))) -> {
+          let lhs_raw = emit_expr_raw(src, lhs, lcs, fns, variants, lams, cls)
+          let raw_call = cat5("kai_", c_sym(callee, mo), "(", lhs_raw, ")")
+          box_wrap(Some(rt), raw_call)
+        }
+        _ -> {
+          let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+          emit_pipe_named_lookup(callee, 1, lhs_c, lcs, fns, variants)
+        }
+      } }
+    }
     # m6.2 Phase 3 / v2: piped qualified-call shorthand `x |> mod.f`
     # (no parens) — same direct mint as the parens form.
-    EModCall(mod, fname) -> cat5("kai_", c_sym(fname, Some(mod)), "(", lhs_c, ")")
-    _ -> concat_all([
-      "kai_apply(", emit_expr(src, rhs, lcs, fns, variants, lams, cls),
-      ", 1, (KaiValue *[]){", lhs_c, "})"
-    ])
+    EModCall(mod, fname) -> match lookup_ufn_sig(fns, fname, Some(mod)) {
+      Some(US(_, rt)) -> {
+        let lhs_raw = emit_expr_raw(src, lhs, lcs, fns, variants, lams, cls)
+        let raw_call = cat5("kai_", c_sym(fname, Some(mod)), "(", lhs_raw, ")")
+        box_wrap(Some(rt), raw_call)
+      }
+      None -> {
+        let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+        cat5("kai_", c_sym(fname, Some(mod)), "(", lhs_c, ")")
+      }
+    }
+    _ -> {
+      let lhs_c = emit_expr(src, lhs, lcs, fns, variants, lams, cls)
+      concat_all([
+        "kai_apply(", emit_expr(src, rhs, lcs, fns, variants, lams, cls),
+        ", 1, (KaiValue *[]){", lhs_c, "})"
+      ])
+    }
   }
 }
 
