@@ -219,7 +219,7 @@ stdlib/
   writer.kai     effect: Writer[W] (top-level module: with_writer — shipped)
   io.kai         (NOTE: lives in `stdlib/core/io.kai`, not at top level; effects: Console, Stdin)
   fs/            effect: File
-    file.kai     (shipped via PR #132 — `read_file`, `write_file`, `append`; rest planned via #345)
+    file.kai     (shipped via PR #132 — `read_file`, `write_file`, `append`; `exists`, `delete`, `rename` shipped via #345 + #423)
     dir.kai      (stub — runtime primitives planned via #344)
     path.kai     pure helpers — shipped, currently lives at `stdlib/path.kai` (top-level), not `stdlib/fs/path.kai`
   os/            effects: Env, Process
@@ -377,7 +377,7 @@ declare `/ Stdin`.
 
 ### fs (`/ File`)
 
-- `fs.file` — `read_file`, `write_file`, `append` *(shipped via PR #132)*; `file_exists`, `file_delete`, `file_rename` *(shipped via #345 — minimum viable surface, error-returning)*; `metadata`, `read_bytes`, `write_bytes` *(deferred — follow-up to #345)*
+- `fs.file` — `read_file`, `write_file`, `append` *(shipped via PR #132)*; `exists`, `delete`, `rename` *(shipped via #345 as prelude builtins; module-qualified surface `file.exists` / `file.delete` / `file.rename` shipped via #423)*; `metadata`, `read_bytes`, `write_bytes` *(deferred — follow-up to #345)*
 - `fs.dir` — `list_dir`, `create_dir`, `remove_dir`, `walk` *(planned: #344 — `stdlib/fs/dir.kai` is a doc-only stub; runtime primitives required)*
 - `fs.path` — pure helpers: `is_absolute`, `basename`, `dirname`, `split`, `ext`, `strip_ext`, `join` *(shipped — but the file lives at `stdlib/path.kai`, not `stdlib/fs/path.kai`; the catalog name `fs.path` reflects the planned move, not today's import path. Today: `import path`.)*
 
