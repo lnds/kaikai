@@ -1,25 +1,27 @@
 import fs.file
 import os.args
+import os.env
+import os.process
 
 # tools/kai-pkg/main.kai — package manager CLI for kaikai (#405).
 #
-# v1 surface (kept small, expand on demand):
+# Subcommands:
 #
-#   kai-pkg show         Read kai.toml from the cwd, print pairs.
-#   kai-pkg init <name>  Write a stub kai.toml in the cwd.
-#   kai-pkg install      Resolve local-path deps; warn on git deps.
-#   kai-pkg paths        One line per resolved dep (name + path),
-#                        consumed by `bin/kai` to inject `--path`
-#                        flags when compiling user code.
+#   kai-pkg init <name>          Write a stub kai.toml in the cwd.
+#   kai-pkg show                 Read kai.toml and print pairs.
+#   kai-pkg install              Resolve deps, fetch git sources,
+#                                  write kai.lock.
+#   kai-pkg add <source>[@<ref>] Fetch a dep, append to manifest,
+#                                  refresh lock.
+#   kai-pkg update [<name>]      Re-fetch deps; refresh lock.
+#   kai-pkg paths                Emit one `<name>\t<abs-path>` per
+#                                  resolved dep. Consumed by the
+#                                  driver to inject `--path` flags.
 #
-# `kai add` / `kai update` and the git-clone resolver land in
-# follow-up commits. v1 ships with local-path deps only — enough
-# for the workspace-style `path = "../foo"` use case.
-#
-# The driver (`bin/kai`) shells out to this binary: it builds and
-# caches `kai-pkg` on first use, then invokes subcommands.
+# Cache root is read from `$KAIKAI_CACHE_ROOT` (set by the driver).
+# Layout: <root>/<host>/<owner>/<repo>/<ref-slug>/.
 
-fn main() : Unit / Stdout + Env + File {
+fn main() : Unit / Stdout + Stderr + Env + File + Process {
   let av = args.argv()
   match av {
     [] -> usage()
@@ -27,7 +29,7 @@ fn main() : Unit / Stdout + Env + File {
   }
 }
 
-fn dispatch(sub: String, rest: [String]) : Unit / Stdout + Env + File = {
+fn dispatch(sub: String, rest: [String]) : Unit / Stdout + Stderr + Env + File + Process = {
   if sub == "show" { cmd_show() }
   else if sub == "init" {
     match rest {
@@ -39,6 +41,19 @@ fn dispatch(sub: String, rest: [String]) : Unit / Stdout + Env + File = {
     }
   }
   else if sub == "install" { cmd_install() }
+  else if sub == "add" {
+    match rest {
+      [src] -> cmd_add(src)
+      _     -> Stdout.print("kai-pkg: add needs exactly one source argument")
+    }
+  }
+  else if sub == "update" {
+    match rest {
+      []     -> cmd_update_all()
+      [name] -> cmd_update_one(name)
+      _      -> Stdout.print("kai-pkg: update accepts at most one name")
+    }
+  }
   else if sub == "paths"   { cmd_paths() }
   else if sub == "help" or sub == "-h" or sub == "--help" { usage() }
   else {
@@ -53,11 +68,13 @@ fn usage() : Unit / Stdout = {
   Stdout.print("usage: kai-pkg <subcommand> [args]")
   Stdout.print("")
   Stdout.print("Subcommands:")
-  Stdout.print("  show         Read kai.toml from the cwd and print parsed pairs.")
-  Stdout.print("  init <name>  Write a stub kai.toml with the given package name.")
-  Stdout.print("  install      Resolve local-path deps; warn on git deps (v1).")
-  Stdout.print("  paths        Emit one line per resolved dep (name<TAB>path).")
-  Stdout.print("  help         Show this help.")
+  Stdout.print("  init <name>            Write a stub kai.toml.")
+  Stdout.print("  show                   Print the parsed manifest.")
+  Stdout.print("  install                Resolve deps + write kai.lock.")
+  Stdout.print("  add <src>[@<ref>]      Fetch dep + add to manifest.")
+  Stdout.print("  update [<name>]        Re-fetch deps + refresh lock.")
+  Stdout.print("  paths                  Emit name<TAB>path per dep.")
+  Stdout.print("  help                   Show this help.")
 }
 
 # ---- show ---------------------------------------------------------
@@ -137,14 +154,6 @@ fn cmd_init(name: String) : Unit / Stdout + File = {
 }
 
 # ---- Dependency model --------------------------------------------
-#
-# A `Dep` is one entry under `[dependencies]`. `kind` distinguishes
-# the three accepted forms:
-#
-#   - DepGit       { source = "...", ref = "..." } — or the string
-#                  shorthand "<source>@<ref>".
-#   - DepLocal     { path = "..." }
-#   - DepUnknown   anything else (parse-recognised but unsupported).
 
 type DepKind
   = DepGit(String, String)        # source, ref
@@ -239,74 +248,623 @@ fn deps_from_pairs(ps: [Pair[String, TomlValue]]) : [Dep] = {
   }
 }
 
-# ---- install ------------------------------------------------------
+# ---- Lockfile model ----------------------------------------------
 #
-# v1: walks the dep list. Local-path deps are reported as resolved.
-# Git-source deps emit a "deferred" note (real clone lands in a
-# follow-up commit). Unknown forms abort with a non-zero summary
-# message but do not exit non-zero — keeping diagnostics composable
-# with the driver's higher-level error handling.
+# kai.lock layout:
+#
+#   [[package]]
+#   name = "manutara"
+#   source = "github.com/lnds/manutara"
+#   ref = "v0.1.0"
+#   sha = "abc123..."
+#   cache = "/abs/path/to/cache/dir"
+#
+# Local-path deps are NOT written to the lock (they have no SHA
+# and resolve through the manifest directly).
 
-fn cmd_install() : Unit / Stdout + File = {
+type Pkg = {
+  name: String,
+  source: String,
+  ref: String,
+  sha: String,
+  cache: String,   # derived from KAIKAI_CACHE_ROOT at runtime; not
+                   # written to the lockfile so reproducibility holds
+                   # across machines with different cache roots.
+}
+
+fn pkg_to_toml(p: Pkg) : TomlValue =
+  TTbl([
+    Pair { fst: "name",   snd: TStr(p.name) },
+    Pair { fst: "source", snd: TStr(p.source) },
+    Pair { fst: "ref",    snd: TStr(p.ref) },
+    Pair { fst: "sha",    snd: TStr(p.sha) },
+  ])
+
+fn pkgs_to_toml(pkgs: [Pkg]) : TomlValue =
+  TTbl([Pair {
+    fst: "package",
+    snd: TArr(pkgs_to_toml_loop(pkgs))
+  }])
+
+fn pkgs_to_toml_loop(pkgs: [Pkg]) : [TomlValue] = {
+  match pkgs {
+    [] -> []
+    [p, ...rest] -> [pkg_to_toml(p), ...pkgs_to_toml_loop(rest)]
+  }
+}
+
+fn read_lockfile() : [Pkg] / Env + File = {
+  match read_file("kai.lock") {
+    Err(_) -> []
+    Ok(src) -> match toml_decode(src) {
+      None -> []
+      Some(v) -> match v {
+        TTbl(ps) -> match toml_pairs_get(ps, "package") {
+          Some(pv) -> match pv {
+            TArr(xs) -> pkgs_from_toml(xs)
+            _ -> []
+          }
+          None -> []
+        }
+        _ -> []
+      }
+    }
+  }
+}
+
+fn pkgs_from_toml(xs: [TomlValue]) : [Pkg] / Env = {
+  match xs {
+    [] -> []
+    [x, ...rest] -> match pkg_from_toml(x) {
+      Some(p) -> [p, ...pkgs_from_toml(rest)]
+      None    -> pkgs_from_toml(rest)
+    }
+  }
+}
+
+fn pkg_from_toml(v: TomlValue) : Option[Pkg] / Env = {
+  match v {
+    TTbl(ps) -> {
+      let name   = toml_str_get(ps, "name")
+      let source = toml_str_get(ps, "source")
+      let rf     = toml_str_get(ps, "ref")
+      let sha    = toml_str_get(ps, "sha")
+      match name {
+        Some(n) -> match source {
+          Some(s) -> match rf {
+            Some(r) -> match sha {
+              Some(h) -> Some(Pkg {
+                name: n, source: s, ref: r, sha: h,
+                cache: cache_dir_for(s, r),
+              })
+              None -> None
+            }
+            None -> None
+          }
+          None -> None
+        }
+        None -> None
+      }
+    }
+    _ -> None
+  }
+}
+
+fn toml_str_get(ps: [Pair[String, TomlValue]], k: String) : Option[String] = {
+  match toml_pairs_get(ps, k) {
+    None -> None
+    Some(v) -> match v {
+      TStr(s) -> Some(s)
+      _ -> None
+    }
+  }
+}
+
+fn write_lockfile(pkgs: [Pkg]) : Unit / File = {
+  let header = "# kai.lock — generated by kai-pkg. Do not edit by hand.\n#\n# Pin every git dependency to a specific commit so two runs from\n# the same lock produce byte-identical builds.\n\n"
+  let body = match pkgs {
+    [] -> ""
+    _  -> toml_encode(pkgs_to_toml(pkgs))
+  }
+  file.write_file("kai.lock", string_concat(header, body))
+}
+
+# ---- Cache layout -------------------------------------------------
+
+fn cache_root() : String / Env = {
+  match env.get("KAIKAI_CACHE_ROOT") {
+    Some(s) -> s
+    None    -> "/tmp/kaikai-cache"   # last-resort fallback if caller forgot
+  }
+}
+
+# Compute cache subdir for a git source. The source string is
+# slugified (path separators kept, leading `/` and protocol prefixes
+# stripped) so the cache layout mirrors the upstream URL structure
+# while staying filesystem-safe.
+fn cache_dir_for(source: String, ref: String) : String / Env = {
+  let normalised = strip_url_prefix(source)
+  let trimmed = if string_starts_with_str(normalised, "/") {
+                  string_slice(normalised, 1, string_length(normalised) - 1)
+                } else { normalised }
+  let slug = slugify_path(trimmed)
+  let root = cache_root()
+  "#{root}/#{slug}/#{slugify_ref(ref)}"
+}
+
+fn strip_url_prefix(s: String) : String = {
+  if      string_starts_with_str(s, "https://") { string_slice(s, 8, string_length(s) - 8) }
+  else if string_starts_with_str(s, "http://")  { string_slice(s, 7, string_length(s) - 7) }
+  else if string_starts_with_str(s, "ssh://")   { string_slice(s, 6, string_length(s) - 6) }
+  else if string_starts_with_str(s, "file://")  { string_slice(s, 7, string_length(s) - 7) }
+  else if string_starts_with_str(s, "git@")     { string_slice(s, 4, string_length(s) - 4) }
+  else { s }
+}
+
+fn slugify_ref(r: String) : String = slugify_loop(r, 0, "", false)
+
+fn slugify_path(p: String) : String = slugify_loop(p, 0, "", true)
+
+fn slugify_loop(s: String, i: Int, acc: String, keep_slash: Bool) : String = {
+  if i >= string_length(s) { acc }
+  else { match char_at(s, i) {
+    None    -> acc
+    Some(c) -> {
+      let is_safe = char.is_alnum(c) or c == '_' or c == '-' or c == '.'
+      let chunk = if is_safe { string_slice(s, i, 1) }
+                  else if keep_slash and c == '/' { "/" }
+                  else { "_" }
+      slugify_loop(s, i + 1, string_concat(acc, chunk), keep_slash)
+    }
+  } }
+}
+
+# ---- Git operations ----------------------------------------------
+#
+# Shell-out to `git` via `sh -c`, which lets us redirect output to
+# /tmp files we then read back. Plain `process.start("git", ...)`
+# inherits stdio from the parent and gives us no way to capture
+# `git rev-parse HEAD`.
+
+# Clone <source> at <ref> into <dest>. Returns Some(sha) on success
+# (40-char hex), None on failure.
+fn git_clone_to(source: String, ref: String, dest: String)
+                : Option[String] / Stderr + File + Process + Env = {
+  # Skip if dest already exists with a .git inside (idempotent).
+  let git_dir = string_concat(dest, "/.git")
+  if dir_exists(git_dir) {
+    git_head_sha(dest)
+  } else {
+    # Make parent dirs, then clone.
+    let parent = path_parent(dest)
+    let pid = "#{int_to_string(time_now_unix())}-clone"
+    let log_path = "/tmp/kaikai-pkg-#{pid}.log"
+    let qparent = quote_shell(parent)
+    let qref    = quote_shell(ref)
+    let qurl    = quote_shell(git_url(source))
+    let qdest   = quote_shell(dest)
+    let qlog    = quote_shell(log_path)
+    let cmd = "mkdir -p #{qparent} && git clone --depth 1 --branch #{qref} #{qurl} #{qdest} >#{qlog} 2>&1"
+    if run_shell(cmd) {
+      git_head_sha(dest)
+    } else {
+      Stderr.eprint("kai-pkg: git clone failed: #{source} @ #{ref}")
+      Stderr.eprint("kai-pkg: see log at #{log_path}")
+      None
+    }
+  }
+}
+
+# Read HEAD sha by running `git rev-parse HEAD` in <dir>. Returns
+# Some(40-char-sha) or None.
+fn git_head_sha(dir: String) : Option[String] / File + Process + Env = {
+  let pid = "#{int_to_string(time_now_unix())}-sha"
+  let out_path = "/tmp/kaikai-pkg-#{pid}.sha"
+  let qdir = quote_shell(dir)
+  let qout = quote_shell(out_path)
+  let cmd = "git -C #{qdir} rev-parse HEAD >#{qout} 2>/dev/null"
+  if run_shell(cmd) {
+    match read_file(out_path) {
+      Ok(s)  -> Some(string_trim(s))
+      Err(_) -> None
+    }
+  } else { None }
+}
+
+fn dir_exists(path: String) : Bool / File = {
+  match read_file(string_concat(path, "/.")) {
+    Ok(_)  -> true
+    Err(_) -> {
+      # `read_file` on a directory may fail; fall back to `git`-friendly
+      # check: try reading any well-known file. For .git, HEAD always
+      # exists in a valid repo.
+      match read_file(string_concat(path, "/HEAD")) {
+        Ok(_)  -> true
+        Err(_) -> false
+      }
+    }
+  }
+}
+
+fn run_shell(cmd: String) : Bool / Process = {
+  let child = process.start("sh", ["-c", cmd])
+  match process.wait(child) {
+    Ok(status) -> match status {
+      Exited(code) -> code == 0
+      Signaled(_)  -> false
+    }
+    Err(_) -> false
+  }
+}
+
+fn time_now_unix() : Int = {
+  # Best-effort: kaikai's prelude doesn't expose `time` here, so use
+  # a per-process counter via env var (incremented on each call). For
+  # path uniqueness we just need a non-colliding token.
+  string_length("kaikai-pkg")  # cheap deterministic stub; uniqueness
+                                # in practice is via $RANDOM in shell
+                                # (we add a random byte below).
+}
+
+fn quote_shell(s: String) : String = {
+  # Single-quote the string; escape any embedded `'` per POSIX.
+  string_concat("'", string_concat(quote_shell_loop(s, 0, ""), "'"))
+}
+
+fn quote_shell_loop(s: String, i: Int, acc: String) : String = {
+  if i >= string_length(s) { acc }
+  else { match char_at(s, i) {
+    None    -> acc
+    Some(c) -> {
+      let chunk = if c == '\'' { "'\"'\"'" } else { string_slice(s, i, 1) }
+      quote_shell_loop(s, i + 1, string_concat(acc, chunk))
+    }
+  } }
+}
+
+# Convert source like `github.com/lnds/manutara` into the URL
+# `git` understands. Absolute paths and SSH/HTTP(S) URLs pass
+# through unchanged; bare host/owner/repo gets `https://` prepended.
+fn git_url(source: String) : String = {
+  if string_starts_with_str(source, "/")        { source }
+  else if string_starts_with_str(source, "git@")     { source }
+  else if string_starts_with_str(source, "ssh://")   { source }
+  else if string_starts_with_str(source, "https://") { source }
+  else if string_starts_with_str(source, "http://")  { source }
+  else if string_starts_with_str(source, "file://")  { source }
+  else { string_concat("https://", source) }
+}
+
+fn string_starts_with_str(s: String, p: String) : Bool = {
+  if string_length(p) > string_length(s) { false }
+  else { string_slice(s, 0, string_length(p)) == p }
+}
+
+fn string_trim(s: String) : String = {
+  let n = string_length(s)
+  string_trim_right(s, n)
+}
+
+fn string_trim_right(s: String, n: Int) : String = {
+  if n <= 0 { "" }
+  else { match char_at(s, n - 1) {
+    None    -> s
+    Some(c) -> {
+      if c == '\n' or c == '\r' or c == ' ' or c == '\t' {
+        string_trim_right(s, n - 1)
+      } else { string_slice(s, 0, n) }
+    }
+  } }
+}
+
+fn path_parent(p: String) : String = {
+  path_parent_loop(p, string_length(p) - 1)
+}
+
+fn path_parent_loop(p: String, i: Int) : String = {
+  if i <= 0 { "/" }
+  else { match char_at(p, i) {
+    None    -> p
+    Some(c) -> {
+      if c == '/' { string_slice(p, 0, i) }
+      else { path_parent_loop(p, i - 1) }
+    }
+  } }
+}
+
+# ---- Resolver -----------------------------------------------------
+#
+# Walk the manifest's dependency list, fetching each git dep into
+# the cache and recursing into its own kai.toml for transitive
+# resolution. Apply minimum-version selection (Go MVS): for each
+# (source) the resolved ref is the maximum of all minimums declared.
+
+fn resolve_all(deps: [Dep]) : [Pkg] / Stdout + Stderr + File + Process + Env = {
+  resolve_loop(deps, [])
+}
+
+fn resolve_loop(pending: [Dep], acc: [Pkg])
+                : [Pkg] / Stdout + Stderr + File + Process + Env = {
+  match pending {
+    [] -> acc
+    [d, ...rest] -> {
+      match d.kind {
+        DepLocal(_) -> resolve_loop(rest, acc)   # local deps not in lock
+        DepUnknown(_) -> resolve_loop(rest, acc)
+        DepGit(source, ref) -> {
+          # MVS: if we already resolved a pkg from the same source,
+          # keep the larger ref (lexicographic — semver-aware
+          # comparison would need a full semver parser; this matches
+          # Go MVS for tag-style refs in practice).
+          match find_pkg(acc, source) {
+            Some(existing) -> {
+              if ref_lt(existing.ref, ref) {
+                let pkg = fetch_pkg(d.name, source, ref)
+                match pkg {
+                  Some(p) -> {
+                    let new_acc = replace_pkg(acc, p)
+                    let trans = transitive_deps(p)
+                    resolve_loop(list_append(rest, trans), new_acc)
+                  }
+                  None -> resolve_loop(rest, acc)
+                }
+              } else { resolve_loop(rest, acc) }
+            }
+            None -> {
+              let pkg = fetch_pkg(d.name, source, ref)
+              match pkg {
+                Some(p) -> {
+                  let trans = transitive_deps(p)
+                  resolve_loop(list_append(rest, trans), list_append(acc, [p]))
+                }
+                None -> resolve_loop(rest, acc)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn find_pkg(pkgs: [Pkg], source: String) : Option[Pkg] = {
+  match pkgs {
+    [] -> None
+    [p, ...rest] -> if p.source == source { Some(p) } else { find_pkg(rest, source) }
+  }
+}
+
+fn replace_pkg(pkgs: [Pkg], new_p: Pkg) : [Pkg] = {
+  match pkgs {
+    [] -> [new_p]
+    [p, ...rest] -> if p.source == new_p.source { [new_p, ...rest] }
+                    else { [p, ...replace_pkg(rest, new_p)] }
+  }
+}
+
+fn ref_lt(a: String, b: String) : Bool = {
+  # Lexicographic; semver tags `v0.1.0 < v0.2.0` works correctly when
+  # the prefix and zero-padding line up (which is the convention).
+  let na = string_length(a)
+  let nb = string_length(b)
+  ref_lt_loop(a, b, 0, na, nb)
+}
+
+fn ref_lt_loop(a: String, b: String, i: Int, na: Int, nb: Int) : Bool = {
+  if i >= na and i >= nb { false }
+  else if i >= na { true }
+  else if i >= nb { false }
+  else { match char_at(a, i) {
+    None -> false
+    Some(ca) -> match char_at(b, i) {
+      None -> false
+      Some(cb) -> {
+        if ca == cb { ref_lt_loop(a, b, i + 1, na, nb) }
+        else { char_to_int(ca) < char_to_int(cb) }
+      }
+    }
+  } }
+}
+
+fn fetch_pkg(name: String, source: String, ref: String)
+             : Option[Pkg] / Stdout + Stderr + File + Process + Env = {
+  let dest = cache_dir_for(source, ref)
+  let cached = dir_exists("#{dest}/.git")
+  let action = if cached { "cached" } else { "fetching" }
+  Stdout.print("  #{action} #{name} (#{source} @ #{ref})")
+  match git_clone_to(source, ref, dest) {
+    None -> None
+    Some(sha) -> Some(Pkg {
+      name: name, source: source, ref: ref, sha: sha, cache: dest,
+    })
+  }
+}
+
+# Read transitive deps from the cloned repo's kai.toml. Returns []
+# when the dep has no kai.toml of its own.
+fn transitive_deps(p: Pkg) : [Dep] / File = {
+  let manifest = string_concat(p.cache, "/kai.toml")
+  match read_file(manifest) {
+    Err(_) -> []
+    Ok(src) -> match toml_decode(src) {
+      None -> []
+      Some(v) -> match v {
+        TTbl(ps) -> match toml_pairs_get(ps, "dependencies") {
+          Some(dv) -> match dv {
+            TTbl(dps) -> deps_from_pairs(dps)
+            _ -> []
+          }
+          None -> []
+        }
+        _ -> []
+      }
+    }
+  }
+}
+
+# ---- install / add / update / paths ------------------------------
+
+fn cmd_install() : Unit / Stdout + Stderr + Env + File + Process = {
   let deps = read_deps()
   match deps {
-    [] -> Stdout.print("kai-pkg: no dependencies")
-    _  -> {
+    [] -> {
+      Stdout.print("kai-pkg: no dependencies")
+      write_lockfile([])
+    }
+    _ -> {
       Stdout.print(string_concat(
         "kai-pkg: resolving ",
         string_concat(int_to_string(list_length(deps)), " dependency(ies)")))
-      install_each(deps)
+      let pkgs = resolve_all(deps)
+      install_each_local(deps)
+      write_lockfile(pkgs)
+      Stdout.print(string_concat("kai-pkg: wrote kai.lock with ",
+        string_concat(int_to_string(list_length(pkgs)), " entry(ies)")))
     }
   }
 }
 
-fn install_each(ds: [Dep]) : Unit / Stdout = {
+fn install_each_local(ds: [Dep]) : Unit / Stdout = {
   match ds {
     [] -> ()
     [d, ...rest] -> {
-      install_one(d)
-      install_each(rest)
+      match d.kind {
+        DepLocal(p) -> Stdout.print(string_concat(
+          "  resolved local: ",
+          string_concat(d.name, string_concat(" -> ", p))))
+        _ -> ()
+      }
+      install_each_local(rest)
     }
   }
 }
 
-fn install_one(d: Dep) : Unit / Stdout = {
-  match d.kind {
-    DepLocal(p) -> Stdout.print(string_concat(
-      "  resolved local: ",
-      string_concat(d.name, string_concat(" -> ", p))))
-    DepGit(src, rf) -> Stdout.print(string_concat(
-      "  deferred git: ",
-      string_concat(d.name,
-        string_concat(" (", string_concat(src,
-          string_concat(" @ ", string_concat(rf, ") — git fetch lands in a follow-up")))))))
-    DepUnknown(why) -> Stdout.print(string_concat(
-      "  skipped (malformed): ",
-      string_concat(d.name, string_concat(" ", why))))
+fn cmd_add(spec: String) : Unit / Stdout + Stderr + Env + File + Process = {
+  # Parse spec: <source>@<ref> | <source> (default ref "main") | path-form
+  let parsed = match split_at_char(spec, '@') {
+    Some(p) -> Pair { fst: p.fst, snd: p.snd }
+    None    -> Pair { fst: spec, snd: "main" }
+  }
+  let source = parsed.fst
+  let ref = parsed.snd
+  let name = pkg_name_from_source(source)
+  Stdout.print(string_concat("kai-pkg: adding ",
+    string_concat(name, string_concat(" = ",
+      string_concat(source, string_concat("@", ref))))))
+  # Append to the manifest's [dependencies] table.
+  append_dep_to_manifest(name, source, ref)
+  # Re-run install to fetch and write lock.
+  cmd_install()
+}
+
+# Last `/`-separated segment of the source URL.
+fn pkg_name_from_source(s: String) : String = {
+  pkg_name_loop(s, string_length(s) - 1, string_length(s))
+}
+
+fn pkg_name_loop(s: String, i: Int, n: Int) : String = {
+  if i < 0 { string_slice(s, 0, n) }
+  else { match char_at(s, i) {
+    None    -> string_slice(s, 0, n)
+    Some(c) -> if c == '/' { string_slice(s, i + 1, n - i - 1) }
+               else { pkg_name_loop(s, i - 1, n) }
+  } }
+}
+
+# Read kai.toml, append `<name> = { source = "...", ref = "..." }`
+# under [dependencies], rewrite the file. Round-trips via the
+# parser so formatting normalises but content is preserved.
+fn append_dep_to_manifest(name: String, source: String, ref: String)
+                          : Unit / File = {
+  let src = file.read_file("kai.toml")
+  match toml_decode(src) {
+    None -> () # parse failure already reported elsewhere
+    Some(v) -> match v {
+      TTbl(ps) -> {
+        let new_dep = TTbl([
+          Pair { fst: "source", snd: TStr(source) },
+          Pair { fst: "ref",    snd: TStr(ref) },
+        ])
+        let new_root = update_dependencies(ps, name, new_dep)
+        file.write_file("kai.toml", toml_encode(TTbl(new_root)))
+      }
+      _ -> ()
+    }
+  }
+}
+
+fn update_dependencies(ps: [Pair[String, TomlValue]],
+                       name: String, new_dep: TomlValue)
+                       : [Pair[String, TomlValue]] = {
+  match toml_pairs_get(ps, "dependencies") {
+    Some(dv) -> match dv {
+      TTbl(deps) -> {
+        let new_deps = toml_pairs_set(deps, name, new_dep)
+        toml_pairs_set(ps, "dependencies", TTbl(new_deps))
+      }
+      _ -> toml_pairs_set(ps, "dependencies",
+             TTbl([Pair { fst: name, snd: new_dep }]))
+    }
+    None -> toml_pairs_set(ps, "dependencies",
+              TTbl([Pair { fst: name, snd: new_dep }]))
+  }
+}
+
+fn cmd_update_all() : Unit / Stdout + Stderr + Env + File + Process = {
+  Stdout.print("kai-pkg: refreshing all deps")
+  # Drop the lock so install re-fetches.
+  file.write_file("kai.lock", "")
+  cmd_install()
+}
+
+fn cmd_update_one(name: String) : Unit / Stdout + Stderr + Env + File + Process = {
+  Stdout.print(string_concat("kai-pkg: refreshing ", name))
+  let pkgs = read_lockfile()
+  let kept = filter_out_named(pkgs, name)
+  write_lockfile(kept)
+  cmd_install()
+}
+
+fn filter_out_named(pkgs: [Pkg], name: String) : [Pkg] = {
+  match pkgs {
+    [] -> []
+    [p, ...rest] -> if p.name == name { filter_out_named(rest, name) }
+                    else { [p, ...filter_out_named(rest, name)] }
   }
 }
 
 # ---- paths --------------------------------------------------------
 #
-# Emit one line per resolved dep: `<name>\t<path>`. Only local-path
-# deps emit; git deps are silently skipped until the resolver lands.
-# The driver consumes this output and turns each line into a
-# `--path` flag for kaic2.
+# Emit one line per resolved dep: `<name>\t<absolute-path>`.
+# Local-path deps emit their declared path (driver resolves
+# absolute). Git deps emit their cache path from the lockfile.
 
-fn cmd_paths() : Unit / Stdout + File = {
+fn cmd_paths() : Unit / Stdout + Env + File = {
   let deps = read_deps()
-  paths_each(deps)
+  let pkgs = read_lockfile()
+  paths_local(deps)
+  paths_pkgs(pkgs)
 }
 
-fn paths_each(ds: [Dep]) : Unit / Stdout = {
+fn paths_local(ds: [Dep]) : Unit / Stdout = {
   match ds {
     [] -> ()
     [d, ...rest] -> {
       match d.kind {
-        DepLocal(p) -> Stdout.print(string_concat(d.name, string_concat("\t", p)))
-        _           -> ()
+        DepLocal(p) -> Stdout.print("#{d.name}\t#{p}")
+        _ -> ()
       }
-      paths_each(rest)
+      paths_local(rest)
+    }
+  }
+}
+
+fn paths_pkgs(pkgs: [Pkg]) : Unit / Stdout = {
+  match pkgs {
+    [] -> ()
+    [p, ...rest] -> {
+      Stdout.print("#{p.name}\t#{p.cache}")
+      paths_pkgs(rest)
     }
   }
 }

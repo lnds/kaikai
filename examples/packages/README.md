@@ -1,36 +1,64 @@
 # examples/packages
 
 End-to-end fixtures for the kaikai package manager (issue #405).
-Each subdirectory contains a `kai.toml` and a runnable program.
+Each subdirectory contains a `kai.toml` (or `.template`) and a
+runnable program.
+
+## One-time setup (for git-based fixtures)
+
+```sh
+tests/fixtures/git-fixtures/setup.sh   # builds bare repos
+examples/packages/render-fixtures.sh   # renders kai.toml templates
+```
+
+The bare repos live under `tests/fixtures/git-fixtures/*.bare/`
+and are gitignored — regenerate them whenever the source under
+`tests/fixtures/git-fixtures/{greet,util}/` changes.
 
 ## Fixtures
 
 - **`local_path/`** — `app/kai.toml` declares
-  `greet = { path = "../lib_greet" }`. Running
-  `kai run local_path/app/main.kai` walks up to the manifest,
-  resolves the local-path dep, and injects `--path` for `lib_greet`
-  so kaic2 can find `import greet`. Expected output:
-  `Hello, kaikai!`.
+  `greet = { path = "../lib_greet" }`. Local-path deps need no
+  cache and no lockfile. Expected output: `Hello, kaikai!`.
 
   ```sh
   bin/kai run examples/packages/local_path/app/main.kai
-  # => Hello, kaikai!
+  ```
+
+- **`simple_dep/`** — single git-source dep cloned into the
+  cache, SHA pinned in `kai.lock`. Expected:
+  `Hello from git, simple_dep!`.
+
+  ```sh
+  bin/kai run examples/packages/simple_dep/main.kai
+  ```
+
+- **`transitive/`** — `util` depends on `greet`; the resolver
+  walks the transitive `kai.toml` of each fetched dep and pins
+  both packages. Expected:
+  `Hello from git, transitive! (shouted)`.
+
+  ```sh
+  bin/kai run examples/packages/transitive/main.kai
+  ```
+
+- **`lockfile_reproducibility/`** — `check.sh` runs
+  `kai install` twice in two clean caches and asserts
+  byte-identical `kai.lock` output (same SHAs).
+
+  ```sh
+  examples/packages/lockfile_reproducibility/check.sh
   ```
 
 ## Coverage in tier 1
 
-Driver-level fixtures don't fit `test-llvm-coverage` (which compiles
-fixtures through kaic2 directly without a manifest). Each fixture's
-`.out.expected` golden is the contract; the lane that wires
-fixtures into CI runs `bin/kai run <fixture>` and diffs against the
-golden.
+Driver-level fixtures don't fit `test-llvm-coverage` (which
+compiles fixtures through kaic2 directly without a manifest). The
+`.out.expected` golden in each fixture dir is the contract; the
+lane that wires fixtures into CI runs `bin/kai run <fixture>` and
+diffs against the golden.
 
-## Out of scope (this lane)
+## See also
 
-- Git-based deps (`{ source = "...", ref = "..." }`) — recognised by
-  the parser but `kai install` reports them as deferred. The git
-  resolver lands in a follow-up commit.
-- Lockfile (`kai.lock`) and cache layout. Local-path deps don't
-  need either, so v1 ships without them.
-- Transitive resolution and minimum-version selection. v1 reads
-  only the immediate manifest.
+- `docs/packages.md` — full v1 spec.
+- `tests/fixtures/git-fixtures/setup.sh` — bare repo generator.

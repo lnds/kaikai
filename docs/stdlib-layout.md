@@ -433,7 +433,7 @@ than what a primitive module should expose.
 ### encoding (pure, stage 2)
 
 - `encoding.json` — `encode`, `decode` *(shipped — Real number parsing via #361 adds `JReal(Real)` alongside `JNum(Int)`; surrogate-pair `\uD8xx\uDCxx` decode + UTF-8 emit via #362)*
-- `encoding.toml` — `decode` *(shipped subset for the package manager (#405): top-level scalars, `[name]` and `[[name]]` headers, basic strings, ints/bools, inline tables, comments. Floats / datetimes / dotted keys / multi-line strings deferred until a user-facing TOML need lands.)*
+- `encoding.toml` — `decode`, `encode`, `round_trip` *(shipped subset for the package manager (#405): top-level scalars, `[name]` and `[[name]]` headers, basic strings, ints/bools, inline tables, comments. Encoder emits a canonical form so `kai.lock` round-trips byte-identical. Floats / datetimes / dotted keys / multi-line strings deferred until a user-facing TOML need lands.)*
 - `encoding.utf8` — `validate`, `decode`, `encode`, `chars` *(planned — no `stdlib/encoding/utf8.kai` file)*
 - `encoding.base64` — `encode`, `decode` (standard + URL-safe) *(shipped)*
 - `encoding.hex` — `encode`, `decode` *(shipped)*

@@ -526,3 +526,171 @@ fn toml_parse_inline_value(st: TomlSt) : Option[Pair[TomlSt, TomlValue]] = {
     }
   } }
 }
+
+# ---- Encoder ------------------------------------------------------
+#
+# Round-trips the parser's subset. Layout: scalar top-level keys
+# first, then each `[name]` table, then each `[[name]]` array-of-
+# tables. Inline tables only appear as values inside scalar lines
+# or inside array-of-tables entries.
+#
+# The encoder does NOT preserve original formatting (whitespace,
+# comments). It writes a canonical form: one key per line, single
+# space around `=`, double-quoted strings with `\` `"` `\n` `\r`
+# `\t` escapes.
+
+pub fn toml_encode(v: TomlValue) : String = {
+  match v {
+    TTbl(ps) -> toml_enc_doc(ps)
+    _        -> toml_enc_scalar(v)
+  }
+}
+
+# Encode a top-level table. Walks the pairs in order; scalar pairs
+# go directly, table pairs become `[name]` sections, array-of-table
+# pairs become `[[name]]` sections (one per element).
+fn toml_enc_doc(ps: [Pair[String, TomlValue]]) : String = {
+  toml_enc_doc_loop(ps, "", "")
+}
+
+fn toml_enc_doc_loop(ps: [Pair[String, TomlValue]],
+                     scalars: String, sections: String)
+                     : String = {
+  match ps {
+    [] -> {
+      if scalars == "" { sections }
+      else if sections == "" { scalars }
+      else { string_concat(scalars, string_concat("\n", sections)) }
+    }
+    [p, ...rest] -> {
+      match p.snd {
+        TTbl(_) -> toml_enc_doc_loop(rest, scalars,
+          string_concat(sections, toml_enc_section(p.fst, p.snd)))
+        TArr(xs) -> {
+          if all_tables(xs) {
+            toml_enc_doc_loop(rest, scalars,
+              string_concat(sections, toml_enc_array_of_tables(p.fst, xs)))
+          } else {
+            # Plain array as a scalar line.
+            toml_enc_doc_loop(rest,
+              string_concat(scalars, toml_enc_scalar_line(p.fst, p.snd)),
+              sections)
+          }
+        }
+        _ -> toml_enc_doc_loop(rest,
+          string_concat(scalars, toml_enc_scalar_line(p.fst, p.snd)),
+          sections)
+      }
+    }
+  }
+}
+
+fn all_tables(xs: [TomlValue]) : Bool = {
+  match xs {
+    [] -> true
+    [x, ...rest] -> match x {
+      TTbl(_) -> all_tables(rest)
+      _       -> false
+    }
+  }
+}
+
+fn toml_enc_scalar_line(k: String, v: TomlValue) : String =
+  string_concat(k, string_concat(" = ",
+    string_concat(toml_enc_scalar(v), "\n")))
+
+fn toml_enc_section(name: String, v: TomlValue) : String = {
+  match v {
+    TTbl(ps) -> string_concat("[", string_concat(name,
+      string_concat("]\n", string_concat(toml_enc_section_pairs(ps), "\n"))))
+    _ -> ""
+  }
+}
+
+# Inside a [section], scalars are flat; nested tables become inline
+# tables (the parser only accepts one section level deep).
+fn toml_enc_section_pairs(ps: [Pair[String, TomlValue]]) : String = {
+  match ps {
+    [] -> ""
+    [p, ...rest] -> string_concat(
+      toml_enc_scalar_line(p.fst, p.snd),
+      toml_enc_section_pairs(rest))
+  }
+}
+
+fn toml_enc_array_of_tables(name: String, xs: [TomlValue]) : String = {
+  match xs {
+    [] -> ""
+    [x, ...rest] -> {
+      let head = match x {
+        TTbl(ps) -> string_concat("[[", string_concat(name,
+          string_concat("]]\n", string_concat(toml_enc_section_pairs(ps), "\n"))))
+        _ -> ""
+      }
+      string_concat(head, toml_enc_array_of_tables(name, rest))
+    }
+  }
+}
+
+# Encode a single value as it appears on the right-hand side of
+# `key = ...`. Inline tables and arrays are single-line.
+fn toml_enc_scalar(v: TomlValue) : String = {
+  match v {
+    TStr(s)  -> string_concat("\"", string_concat(toml_enc_str_escape(s), "\""))
+    TBool(b) -> if b { "true" } else { "false" }
+    TInt(n)  -> int_to_string(n)
+    TArr(xs) -> string_concat("[", string_concat(toml_enc_array(xs), "]"))
+    TTbl(ps) -> string_concat("{ ",
+                  string_concat(toml_enc_inline_pairs(ps), " }"))
+  }
+}
+
+fn toml_enc_array(xs: [TomlValue]) : String = {
+  match xs {
+    []  -> ""
+    [x] -> toml_enc_scalar(x)
+    [x, ...rest] -> string_concat(toml_enc_scalar(x),
+                      string_concat(", ", toml_enc_array(rest)))
+  }
+}
+
+fn toml_enc_inline_pairs(ps: [Pair[String, TomlValue]]) : String = {
+  match ps {
+    []  -> ""
+    [p] -> string_concat(p.fst,
+              string_concat(" = ", toml_enc_scalar(p.snd)))
+    [p, ...rest] -> string_concat(p.fst,
+                      string_concat(" = ",
+                        string_concat(toml_enc_scalar(p.snd),
+                          string_concat(", ", toml_enc_inline_pairs(rest)))))
+  }
+}
+
+fn toml_enc_str_escape(s: String) : String = {
+  toml_enc_str_escape_loop(s, 0, "")
+}
+
+fn toml_enc_str_escape_loop(s: String, i: Int, acc: String) : String = {
+  if i >= string_length(s) { acc }
+  else { match char_at(s, i) {
+    None    -> acc
+    Some(c) -> {
+      let esc =
+        if c == '"'      { "\\\"" }
+        else if c == '\\' { "\\\\" }
+        else if c == '\n' { "\\n" }
+        else if c == '\r' { "\\r" }
+        else if c == '\t' { "\\t" }
+        else { string_slice(s, i, 1) }
+      toml_enc_str_escape_loop(s, i + 1, string_concat(acc, esc))
+    }
+  } }
+}
+
+# Round-trip helper: parse → encode for tests + lockfile rewriting.
+pub fn toml_round_trip(src: String) : Option[String] = {
+  match toml_decode(src) {
+    None    -> None
+    Some(v) -> Some(toml_encode(v))
+  }
+}

@@ -1,12 +1,11 @@
 # Package management
 
-> **v1 status (2026-05-09):** the v1 surface in this document
-> ships in incremental commits on issue #405. Local-path deps,
-> manifest parsing, driver auto-resolution, and the
-> `kai init` / `kai install` / `kai show` driver commands are
-> live. **Git-based deps, lockfile (`kai.lock`), cache layout,
-> and minimum-version selection are deferred** — see
-> *Out of scope (this commit)* below for the inventory.
+> **v1 status (2026-05-09):** the v1 surface in this document is
+> live (issue #405). Manifest parsing, lockfile, cache, git-based
+> resolution with transitive deps + minimum-version selection,
+> and the full `kai init` / `add` / `install` / `update` /
+> `show` command surface ship together. Out-of-scope items are
+> listed at the end and pinned to follow-up issues.
 
 kaikai uses a Go-style package manager: a `kai.toml` manifest
 declares dependencies, the driver resolves them on demand, and
@@ -64,15 +63,46 @@ kai-pkg: wrote kai.toml for package 'myapp'
 ### `kai install`
 
 Reads `kai.toml` from the current directory (or the nearest
-ancestor) and resolves dependencies. v1 reports local-path deps
-as resolved and emits a deferred-note for git deps. Idempotent.
+ancestor) and resolves dependencies. Local-path deps are reported
+as resolved; git-source deps are cloned (via
+`git clone --depth 1 --branch <ref>`) into the package cache, the
+HEAD commit is captured, and `kai.lock` is rewritten with each
+package's `(name, source, ref, sha)`. Idempotent: a second run
+with a populated cache prints `cached <name>` instead of
+`fetching`.
 
 ```sh
 $ kai install
 kai-pkg: resolving 2 dependency(ies)
   resolved local: greet -> ../lib_greet
-  deferred git: manutara (github.com/lnds/manutara @ v0.1.0) — git fetch lands in a follow-up
+  fetching manutara (github.com/lnds/manutara @ v0.1.0)
+kai-pkg: wrote kai.lock with 1 entry(ies)
 ```
+
+`kai run` and `kai build` auto-run `kai install` when they
+detect a manifest with git deps but no `kai.lock` (or when a
+pinned cache directory has gone missing). Users do not need to
+run `install` manually before the first `run`.
+
+### `kai add <source>[@<ref>]`
+
+Append a dependency to `kai.toml` and refresh the lockfile in
+one step. Source forms:
+
+```sh
+kai add github.com/lnds/manutara@v0.1
+kai add github.com/lnds/kohau                # ref defaults to "main"
+kai add /abs/path/to/local-bare-repo@v1.0    # local clone for testing
+```
+
+The package name is derived from the last `/`-separated segment
+of the source URL.
+
+### `kai update [<name>]`
+
+Re-fetch dependencies and refresh `kai.lock`. With no argument,
+all deps are refreshed; with one argument, only that package is
+dropped from the lock and re-resolved.
 
 ### `kai show`
 
@@ -81,15 +111,30 @@ debugging the parser; not part of the long-term command surface.
 
 ### `kai run` / `kai build` (auto-resolution)
 
-`kai run` and `kai build` walk up from the entry file looking for
-a `kai.toml`. If found, the driver invokes `kai-pkg paths` to
-emit one line per local-path dependency, then injects `--path
-<abs>` flags for kaic2. No flag is needed on the user's part; the
-manifest is the single source of truth.
+`kai run` and `kai build` walk up from the entry file looking
+for a `kai.toml`. If found, the driver:
+
+1. Reads both manifest and `kai.lock`.
+2. If git deps are declared but the lock is missing or any
+   pinned cache directory has gone missing, runs `kai install`
+   first (transparent auto-install).
+3. Invokes `kai-pkg paths` to emit one `<name>\t<abs-path>` line
+   per local-path dep AND every entry in the lockfile (so
+   transitive git deps are included automatically).
+4. Injects `--path <abs>` flags for kaic2.
+
+No flag is needed on the user's part; the manifest is the single
+source of truth.
 
 ```sh
 $ kai run examples/packages/local_path/app/main.kai
 Hello, kaikai!
+
+$ kai run examples/packages/transitive/main.kai
+  fetching util (... @ v0.1.0)
+  fetching greet (... @ v0.1.0)
+kai-pkg: wrote kai.lock with 2 entry(ies)
+Hello from git, transitive! (shouted)
 ```
 
 ## Architecture
@@ -116,50 +161,97 @@ This split keeps the parser reusable as a stdlib component, gives
 the package manager a real type system to work with (instead of
 shell), and avoids touching kaic2 itself.
 
-## Out of scope (this commit)
-
-The following items are recognised by the design but deferred to
-follow-up commits:
-
-- **Git-based deps**: `{ source = "...", ref = "..." }` and the
-  `"<source>@<ref>"` shorthand. The parser recognises them and
-  `kai install` reports them as deferred; the actual `git clone
-  --depth 1 --branch <ref>` lands once the cache layout is
-  finalised.
-- **`kai.lock`**: deterministic dependency pinning (full git SHA
-  + tarball SHA-256 per package). Required for reproducible
-  builds; not needed for local-path deps.
-- **Cache layout**: `~/.cache/kai/pkg/` with content-addressed
-  directories. Plan: `$KAIKAI_CACHE` →
-  `$XDG_CACHE_HOME/kai/pkg` → `~/.cache/kai/pkg` (Linux) /
-  `~/Library/Caches/kai/pkg` (macOS).
-- **Transitive resolution + minimum-version selection** (Go MVS).
-  v1 reads only the immediate manifest.
-- **`kai add <source>`** and **`kai update [<pkg>]`**. v1 expects
-  manifest edits by hand; once `kai install` covers git fetches,
-  `add` becomes a thin wrapper over manifest mutation + install.
-- **Registry / publish / search**, HTTP-based sources beyond git,
-  workspace mode (multi-package monorepos), build-time scripts.
-  All explicitly out of scope per the lane brief.
-
-## Reference fixture
-
-`examples/packages/local_path/` is the canonical end-to-end
-fixture for this commit. It contains:
+## Cache layout
 
 ```
-examples/packages/local_path/
-  lib_greet/
-    greet.kai          # pub fn greet(name) : String
-  app/
-    kai.toml           # greet = { path = "../lib_greet" }
-    main.kai           # import greet; print(greet.greet("kaikai"))
-    main.out.expected  # "Hello, kaikai!\n"
+$KAIKAI_CACHE / $XDG_CACHE_HOME/kai/pkg /
+~/.cache/kai/pkg (Linux) / ~/Library/Caches/kai/pkg (macOS)
+  └── <slug-of-source>/
+      └── <slug-of-ref>/
+          └── (clone of the repo at that ref)
 ```
 
-`bin/kai run examples/packages/local_path/app/main.kai` prints
-`Hello, kaikai!` — round-trip-verified at every commit on the
-lane.
+Slugification: protocol prefixes (`https://`, `ssh://`,
+`file://`, `git@`) and leading `/` are stripped; remaining
+filesystem-unfriendly characters become `_`. Path separators
+inside the source are kept so the cache mirrors upstream
+structure (`github.com/lnds/manutara/v0.1.0/`).
+
+The `cache` field is **not** written to `kai.lock` — it is
+derived from `KAIKAI_CACHE_ROOT + source + ref` at install time.
+This keeps the lockfile reproducible across machines with
+different cache roots.
+
+## Lockfile format
+
+`kai.lock` is generated TOML with one `[[package]]`
+array-of-tables entry per resolved git dependency. Local-path
+deps are not pinned (they have no SHA).
+
+```toml
+# kai.lock — generated by kai-pkg. Do not edit by hand.
+
+[[package]]
+name = "manutara"
+source = "github.com/lnds/manutara"
+ref = "v0.1.0"
+sha = "abc123def456..."
+```
+
+The lockfile is canonical: parsing then re-encoding via
+`toml_round_trip` produces a byte-identical file (the
+`lockfile_reproducibility` fixture asserts this across two
+clean caches).
+
+## Minimum-version selection
+
+For each unique `source`, the resolver picks the **maximum** of
+all declared `ref` values (Go MVS). This handles diamond deps
+where two transitive deps require different versions of the
+same module: the resolution promotes everyone to the higher
+version. Comparison is lexicographic — for semver tags
+(`v0.1.0` < `v0.2.0` < `v0.10.0` ⚠️) this matches semver order
+when zero-padding is consistent (`v0.10.0` would lose to
+`v0.2.0` lexicographically; bump the minor before the tag is
+double-digit if you care). A full semver parser is a follow-up.
+
+## Reference fixtures
+
+Four fixtures live under `examples/packages/`:
+
+| Fixture | Demonstrates |
+|---|---|
+| `local_path/` | `{ path = "..." }` override; relative path resolved against the manifest dir. |
+| `simple_dep/` | Single git-source dependency cloned to cache, SHA pinned in lock. |
+| `transitive/` | `util` depends on `greet`; both fetched, lockfile contains both, transitive `--path` injection works. |
+| `lockfile_reproducibility/` | Two clean `kai install` runs from the same manifest produce byte-identical `kai.lock`. |
+
+Git-based fixtures depend on bare repos generated by
+`tests/fixtures/git-fixtures/setup.sh`; manifest paths render
+from `*.toml.template` via `examples/packages/render-fixtures.sh`.
+This setup keeps fixtures self-contained and free of external
+network dependencies.
+
+```sh
+# One-time setup:
+tests/fixtures/git-fixtures/setup.sh
+examples/packages/render-fixtures.sh
+
+# Then any fixture works:
+bin/kai run examples/packages/transitive/main.kai
+```
+
+## Out of scope (post-1.0)
+
+- **Registry / publish / search**.
+- **HTTP-based sources** beyond git (raw archives, etc.).
+- **Workspace mode** (multi-package monorepos with shared lock).
+- **Build-time scripts** / generated code.
+- **Pre-`kai install` SHA-256 of the cloned tree** for tamper
+  detection — the git SHA already pins the content, but a
+  post-clone hash would catch local cache corruption.
+- **Semver-aware ref comparison**. Current MVS is lexicographic
+  on the ref string.
 
 ## See also
 

@@ -335,8 +335,12 @@ multi-thread, complete tooling, no honest-target footnotes.
 - Type-erased layouts (Tier 3b) — polymorphic raw layouts so
   generic containers can hold unboxed primitives without
   monomorphising for every primitive type.
-- Package manager — `kai new`, `kai add`. Lockfile, registry
-  abstraction, dependency resolution.
+- Package manager — `kai new` (and registry abstraction).
+  *(`kai add` / `kai install` / `kai update` / lockfile + git
+  dependency resolution shipped 2026-05-09 via #405; see
+  `docs/packages.md`. The remaining work in this row is
+  `kai new` (project scaffolding) and a registry abstraction
+  on top of git.)*
 - FFI binding generator — given a C header, emit kaikai
   `extern "C" fn` declarations and `Ffi`-effected wrappers.
 - Region-brand full `TyBranded` machinery — propagation
@@ -354,7 +358,9 @@ multi-thread, complete tooling, no honest-target footnotes.
 1. Multi-threaded fiber scheduler running production
    workloads; context switch under 200 ns.
 2. `kai new my_app && cd my_app && kai add some_lib && kai
-   build` round-trips end to end.
+   build` round-trips end to end. *(`kai init` / `add` /
+   `install` / `update` / `build` round-trip works as of #405,
+   2026-05-09; only `kai new` (scaffolding) remains.)*
 3. FFI binding generator produces working bindings for at
    least one non-trivial C library (libc subset, sqlite, or
    similar).
