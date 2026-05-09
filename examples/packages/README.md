@@ -69,6 +69,16 @@ and are gitignored — regenerate them whenever the source under
   examples/packages/init_invalid_names/check.sh
   ```
 
+- **`manifest_parse_error/`** — `check.sh` asserts every kai-pkg
+  subcommand bails on a broken `kai.toml` (issue #420): `show`,
+  `install`, `update`, and `add` each exit non-zero and print
+  `kai.toml: parse error` instead of silently treating the
+  manifest as empty.
+
+  ```sh
+  examples/packages/manifest_parse_error/check.sh
+  ```
+
 ## Coverage in tier 1
 
 Driver-level fixtures don't fit `test-llvm-coverage` (which
