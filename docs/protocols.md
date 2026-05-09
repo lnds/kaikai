@@ -1032,16 +1032,21 @@ following the same recipe as `Add` / `Sub` / `Mul` / `Div` (#246):
 | `-`  | `Sub` | `sub` | issue #246 / #180 |
 | `*`  | `Mul` | `mul` | issue #246 / #180 |
 | `/`  | `Div` | `div` | issue #246 / #180 |
-| `%`  | `Rem` | `rem` | Wave Op-1 — Int impl only in v1 (no `fmod` in runtime) |
+| `%`  | `Rem` | `rem` | Wave Op-1 — `Int` and `Real` impls (issue #364 wired the libm `fmod` binding) |
 
-Primitive `Int <op> Int` and `Real <op> Real` arithmetic stays on
-the unify-and-emit fast path — the typer rewrites to the protocol
-method only when both operands resolve to a concrete non-primitive
-type (or when issue #180's heterogeneous routing matches a
-registered impl). `//` (integer division) intentionally does **not**
-overload — modulo is the protocol case for user types (rationals,
-modular integers, residue rings); `//` keeps its Int-only contract.
+Primitive `Int <op> Int` and `Real <op> Real` arithmetic for `+`,
+`-`, `*`, `/` stays on the unify-and-emit fast path — the typer
+rewrites to the protocol method only when both operands resolve to
+a concrete non-primitive type (or when issue #180's heterogeneous
+routing matches a registered impl). `//` (integer division)
+intentionally does **not** overload — modulo is the protocol case
+for user types (rationals, modular integers, residue rings); `//`
+keeps its Int-only contract.
 
-`Real % Real` is currently rejected (no `fmod` shim in stage0
-runtime); add the libc binding plus `impl Rem for Real` together
-when a use case appears.
+`%` is the exception: `Real % Real` always routes through `Rem.rem`
+because stage0's primitive `%` is Int-only. The `Real` impl
+delegates to the `real_rem` libm binding (`fmod`), so `r1 % r2`
+returns the IEEE-754 remainder — `5.5 % 2.0 == 1.5`. NaN propagates
+on a zero divisor (`a % 0.0` is NaN, matching the rest of the libm
+surface from issue #343); inspect with `real_is_nan` at
+boundaries.
