@@ -160,9 +160,10 @@ arguments:
   - **Mandatory annotation on public signatures** (module exports, APIs): effects are part of the contract.
   - Fits LLVM (CPS over segmented stacks) and the LLM-friendly / easy-to-learn principles.
 - **Core tooling**: single `kai` binary with subcommands (Go/Rust/Zig style).
-  - MVP essentials: `kai build`, `kai run`, `kai test`, `kai fmt`, `kai repl`.
+  - MVP essentials: `kai build`, `kai run`, `kai test`, `kai fmt`.
   - Mid-term: `kai lsp` (Language Server Protocol — universal editor support), `kai doc`.
   - Long-term: `kai new`, `kai add` (package manager as separate project).
+  - Post-1.0 (deferred from MVP per #406): `kai repl`.
   - Motivation: LLM-friendly (predictable commands, LSP provides immediate feedback), zero ecosystem fragmentation, trivial install.
 - **FFI / Interop**: crossing to C is expressed as the **`Ffi` effect capability**.
   - Declarations use `extern "C" fn name(args) : T`.
@@ -230,7 +231,7 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 ### Post-MVP
 
 - Stage 2 with direct LLVM backend, full Perceus, effect inference, fibers, scheduler.
-- Tooling: `kai fmt`, `kai repl`, `kai lsp`.
+- Tooling: `kai fmt`, `kai lsp` (`kai repl` deferred post-1.0 per #406).
 - Property testing, benchmarks, snapshots.
 - FFI binding generator.
 - More targets (Linux arm64, macOS x86_64, Windows).
@@ -318,7 +319,7 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 - **Structured concurrency** (`docs/structured-concurrency.md`): nursery-scoped fibers, `Spawn` / `Cancel` as effects, region-branded `Fiber[T]` that cannot escape its scope. Built on top of the effects + handlers machinery; lands in m8.
 - **Actors** (`docs/actors.md`): `Actor[Msg]` effect with typed mailboxes, link/monitor supervision, `Pid[Msg]` as a region-branded handle. Lands in m8 alongside the scheduler.
 - Elm/Rust-level error messages as an explicit design investment (not a "feature" — a quality bar for every diagnostic).
-- `kai fmt`, `kai repl`, `kai lsp`.
+- `kai fmt`, `kai lsp` (`kai repl` post-1.0 per #406).
 - Property testing (`check`), benchmarks (`bench`), snapshots.
 - FFI binding generator.
 - More targets (Linux arm64, macOS x86_64, Windows).
