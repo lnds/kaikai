@@ -73,6 +73,7 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `concurrent/nursery`                    | shipped — `pub fn nursery[T, e]` lives in `stdlib/spawn.kai:95` (top-level, not a `concurrent/` subdir)                        |
 | `math/real` libm bindings               | shipped via PR #359 (closes #343): sqrt, trig, exp/log, pow, atan2 over libm; `fmod` follow-up via #364 enables `Real % Real`  |
 | `encoding/json` Real numbers            | shipped (closes #361): decoder accepts decimals + scientific notation; new `JReal(Real)` variant alongside `JNum(Int)`         |
+| `core/tuple` helpers                    | shipped (closes #348): `tuple.swap`, `tuple.map_fst`, `tuple.map_snd`, `tuple.map_pair`, `tuple.first`/`second`/`third`. `fst`/`snd` projections stay field-access only — adding bare `pub fn fst`/`snd` poisons every existing `record.fst` access whose receiver type isn't yet pinned by inference (see module header) |
 
 What's still open (planned-but-not-shipped):
 
