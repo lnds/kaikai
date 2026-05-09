@@ -314,13 +314,17 @@ indexing sugars (`a[i]`, `a[i] := v`); this module fills the
 gap between the two carriers so consumers don't roll their own
 loops.
 
-- `array.from_list[a](xs: [a], default: a) : Array[a]` — copy a
+Public surface today is **flat-prefix** (`array_*`); the namespaced
+rename to `array.*` waits for the m14 phase-2 migration that already
+covers `list.*`. Listed here as shipped:
+
+- `array_from_list[a](xs: [a], default: a) : Array[a]` — copy a
   linked list into a fresh Array. `default` is the runtime's
   reified-element slot for `array_make`; for non-empty inputs it
   is overwritten on the same pass.
-- `array.to_list[a](a: Array[a]) : [a]` — copy an Array into a
+- `array_to_list[a](a: Array[a]) : [a]` — copy an Array into a
   linked list in index order. Pure read; no `Mutable` demand.
-- `array.copy[a](src: Array[a], default: a) : Array[a]` — element
+- `array_copy[a](src: Array[a], default: a) : Array[a]` — element
   copy. Result is a distinct allocation; mutating either side
   does not affect the other.
 
