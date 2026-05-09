@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.49.0 (2026-05-09)
+
+### Added
+
+- **parser**: multi-clause function bodies (case-led arms) (closes #415)
+
 ## v0.48.0 (2026-05-09)
 
 ### Added
