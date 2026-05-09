@@ -98,6 +98,12 @@ kai add /abs/path/to/local-bare-repo@v1.0    # local clone for testing
 The package name is derived from the last `/`-separated segment
 of the source URL.
 
+`kai add` is atomic with respect to manifest mutation: the source
+is cloned first, and `kai.toml` is only updated if the clone
+succeeds. A failed clone (bad URL, missing ref, network error)
+exits non-zero and leaves `kai.toml` and `kai.lock` untouched, so
+the working tree never drifts into an inconsistent state.
+
 ### `kai update [<name>]`
 
 Re-fetch dependencies and refresh `kai.lock`. With no argument,
