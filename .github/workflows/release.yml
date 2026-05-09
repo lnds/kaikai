@@ -113,3 +113,74 @@ jobs:
               --generate-notes \
               dist/*
           fi
+
+  update-tap:
+    name: Update Homebrew tap formula
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download sha256 from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${{ steps.tag.outputs.version }}"
+          asset="kaikai-v${version}-darwin-arm64.tar.gz.sha256"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$asset" --dir /tmp/release-assets
+          # File format: "<sha256>  <filename>"
+          sha=$(awk '{print $1}' "/tmp/release-assets/$asset")
+          if [ -z "$sha" ] || [ ${#sha} -ne 64 ]; then
+            echo "::error::invalid sha256 in $asset: '$sha'"
+            exit 1
+          fi
+          echo "sha256=$sha" >> "$GITHUB_ENV"
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: lnds/homebrew-kaikai
+          token: ${{ secrets.TAP_PAT }}
+          path: tap
+
+      - name: Patch Formula/kaikai.rb
+        run: |
+          version="${{ steps.tag.outputs.version }}"
+          tag="${{ steps.tag.outputs.tag }}"
+          sha="$sha256"
+          formula="tap/Formula/kaikai.rb"
+          # version "X.Y.Z"
+          sed -i -E "s|^(  version )\"[0-9.]+\"|\1\"${version}\"|" "$formula"
+          # url "https://github.com/lnds/kaikai/releases/download/vX.Y.Z/kaikai-vX.Y.Z-...
+          sed -i -E "s|/releases/download/v[0-9.]+/kaikai-v[0-9.]+-|/releases/download/${tag}/kaikai-${tag}-|g" "$formula"
+          # sha256 "..."
+          sed -i -E "s|sha256 \"[0-9a-f]{64}\"|sha256 \"${sha}\"|" "$formula"
+          echo "--- patched formula ---"
+          grep -E "version |url |sha256 " "$formula"
+
+      - name: Commit and push to tap
+        run: |
+          version="${{ steps.tag.outputs.version }}"
+          cd tap
+          if git diff --quiet; then
+            echo "no changes to formula; skipping commit"
+            exit 0
+          fi
+          git config user.name "kaikai-release-bot"
+          git config user.email "kaikai-release-bot@users.noreply.github.com"
+          git add Formula/kaikai.rb
+          git commit -m "chore(formula): bump to v${version}"
+          git push origin HEAD
