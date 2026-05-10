@@ -237,7 +237,22 @@ test-check: kaic2
 	  echo "test-check FAIL — missing '4/4 checks passed' summary"; \
 	  cat /tmp/kaikai-check-basic.out; exit 1; \
 	fi; \
-	echo "test-check OK — $$matched property blocks passed"
+	./bin/kai check examples/stdlib/check_shrinking.kai > /tmp/kaikai-check-shrinking.out 2>&1; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+	  echo "test-check FAIL — shrinking fixture must exit non-zero (every block fails by design)"; \
+	  cat /tmp/kaikai-check-shrinking.out; exit 1; \
+	fi; \
+	if ! grep -qE '^0/3 checks passed$$' /tmp/kaikai-check-shrinking.out; then \
+	  echo "test-check FAIL — shrinking fixture missing '0/3 checks passed' summary"; \
+	  cat /tmp/kaikai-check-shrinking.out; exit 1; \
+	fi; \
+	shrunk=$$(grep -E ', shrunk to ' /tmp/kaikai-check-shrinking.out | wc -l | tr -d ' '); \
+	if [ "$$shrunk" -lt 2 ]; then \
+	  echo "test-check FAIL — expected >=2 'shrunk to' lines (Int + List), got $$shrunk"; \
+	  cat /tmp/kaikai-check-shrinking.out; exit 1; \
+	fi; \
+	echo "test-check OK — $$matched property blocks passed; shrinking produced $$shrunk minimised counterexamples"
 
 # Tier 2.5 — daily memory-safety gate. Rebuilds the demos/ probe set
 # with `-fsanitize=address,undefined` and runs each binary; fails on

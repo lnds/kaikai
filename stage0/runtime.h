@@ -4135,6 +4135,179 @@ KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_char,   kai_arbitrary_char)
 KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_string, kai_arbitrary_string)
 #undef KAI_DEFINE_ARBITRARY_LIST
 
+/* ---------- shrinkers (issue #438) ---------------------------------
+ * Each kai_shrink_<T>(v) returns a NEW KaiValue* (rc=1) that is one
+ * greedy step closer to the canonical minimum, or NULL when no smaller
+ * candidate exists. Callers own both the input (untouched, still must
+ * be decref'd by the caller as before) and the returned value.
+ *
+ * Strategy is greedy and per-type:
+ *   Int    : halve toward 0 (sign-preserving).
+ *   Bool   : true → false; false → NULL.
+ *   Char   : bisect toward 'a'; if c == 'a' then NULL.
+ *   String : delete first byte; else if non-empty, shrink first non-'a'
+ *            byte toward 'a'; else NULL.
+ *   List   : delete head element; else shrink first element via the
+ *            per-T element shrinker; else NULL.
+ *
+ * Greedy means each step produces ONE candidate; the runner accepts it
+ * only if the predicate still fails. If accepted the runner shrinks
+ * again from the new candidate; if rejected the runner asks for the
+ * NEXT alternative — encoded by re-calling the shrinker on the same
+ * input, which is fine because each shrinker is deterministic and the
+ * runner falls through to a different param after one rejection (the
+ * only branch we care about for v1.x; integrated multi-strategy
+ * backtracking is post-1.0 per #438 out-of-scope). */
+
+static KaiValue *kai_shrink_int(KaiValue *v) {
+    if (!v || v->tag != KAI_INT) return NULL;
+    int64_t x = v->as.i;
+    if (x == 0) return NULL;
+    /* Halve toward zero. Integer division on negatives in C is
+       truncation toward zero (C99 §6.5.5/6), so x/2 already does the
+       right thing for both signs (e.g. -8/2 = -4, -1/2 = 0). */
+    return kai_int(x / 2);
+}
+
+static KaiValue *kai_shrink_bool(KaiValue *v) {
+    if (!v || v->tag != KAI_BOOL) return NULL;
+    if (v->as.b == 0) return NULL;
+    return kai_bool(0);
+}
+
+static KaiValue *kai_shrink_char(KaiValue *v) {
+    if (!v || v->tag != KAI_CHAR) return NULL;
+    uint32_t c = v->as.c;
+    if (c == (uint32_t) 'a') return NULL;
+    /* Bisect toward 'a'. Converges in O(log) steps. */
+    uint32_t a = (uint32_t) 'a';
+    uint32_t next = (c > a) ? (a + (c - a) / 2) : (c + (a - c) / 2);
+    if (next == c) next = a;  /* defensive: ensure progress */
+    return kai_char(next);
+}
+
+static KaiValue *kai_shrink_string(KaiValue *v) {
+    if (!v || v->tag != KAI_STR) return NULL;
+    size_t len = v->as.s.len;
+    if (len > 0) {
+        /* Delete first byte. */
+        return kai_str_from_bytes(v->as.s.bytes + 1, len - 1);
+    }
+    return NULL;
+}
+
+/* List shrinker factory. Two strategies:
+   A) drop head — biggest single reduction, collapses toward nil.
+   B) elem shrink — walks the spine looking for the FIRST element
+      that still has a smaller form via ELEM_SHRINK and rebuilds the
+      list with that one element replaced. Returns NULL if every
+      element is at its own minimum.
+   The walk-and-replace pattern gives strategy B a deterministic
+   linear sweep across the full list, not just the head, so e.g.
+   [0, -30] still has a productive shrink (rebuild to [0, -15]). */
+#define KAI_DEFINE_SHRINK_LIST(NAME, ELEM_SHRINK)                          \
+    static KaiValue *NAME(KaiValue *v) {                                   \
+        if (!v) return NULL;                                               \
+        if (v->tag == KAI_NIL) return NULL;                                \
+        if (v->tag != KAI_CONS) return NULL;                               \
+        KaiValue *tail = v->as.cons.tail;                                  \
+        kai_incref(tail);                                                  \
+        return tail;                                                       \
+    }                                                                      \
+    /* Rebuild prefix (in reverse) onto a new tail. Helper for strategy B. \
+       Each element in `rev_prefix` is a borrowed pointer and is incref'd  \
+       as it lands in the new spine; the new spine takes ownership of the  \
+       passed-in `tail` (no extra incref). */                              \
+    static KaiValue *NAME##_rebuild(KaiValue **rev_prefix, int n,          \
+                                    KaiValue *tail) {                      \
+        KaiValue *acc = tail;                                              \
+        for (int i = 0; i < n; i++) {                                      \
+            KaiValue *h = rev_prefix[i];                                   \
+            kai_incref(h);                                                 \
+            acc = kai_cons(h, acc);                                        \
+        }                                                                  \
+        return acc;                                                        \
+    }                                                                      \
+    static KaiValue *NAME##_head(KaiValue *v) {                            \
+        if (!v || v->tag != KAI_CONS) return NULL;                         \
+        /* First pass: walk to find the first shrinkable element. */       \
+        KaiValue *prefix[64];                                              \
+        int prefix_n = 0;                                                  \
+        KaiValue *cur = v;                                                 \
+        while (cur != NULL && cur->tag == KAI_CONS) {                      \
+            KaiValue *h = cur->as.cons.head;                               \
+            KaiValue *h2 = ELEM_SHRINK(h);                                 \
+            if (h2 != NULL) {                                              \
+                /* Build new list: h2 :: cur->tail (incref'd) prepended    \
+                   by the walked prefix in reverse. */                     \
+                KaiValue *new_tail = cur->as.cons.tail;                    \
+                kai_incref(new_tail);                                      \
+                KaiValue *acc = kai_cons(h2, new_tail);                    \
+                acc = NAME##_rebuild(prefix, prefix_n, acc);               \
+                return acc;                                                \
+            }                                                              \
+            if (prefix_n >= 64) return NULL; /* bound spine walk */         \
+            prefix[prefix_n++] = h;                                        \
+            cur = cur->as.cons.tail;                                       \
+        }                                                                  \
+        return NULL;                                                       \
+    }
+KAI_DEFINE_SHRINK_LIST(kai_shrink_list_int,    kai_shrink_int)
+KAI_DEFINE_SHRINK_LIST(kai_shrink_list_bool,   kai_shrink_bool)
+KAI_DEFINE_SHRINK_LIST(kai_shrink_list_char,   kai_shrink_char)
+KAI_DEFINE_SHRINK_LIST(kai_shrink_list_string, kai_shrink_string)
+#undef KAI_DEFINE_SHRINK_LIST
+
+/* Per-process shrink-iteration cap. KAI_CHECK_SHRINK_ITERS in the env
+   overrides; default 200 per #438. Read once and memoised so we don't
+   pay getenv cost per shrink step. */
+#define KAI_CHECK_SHRINK_ITERS_DEFAULT 200
+static int kai_check_shrink_iters_cached = -1;
+static int kai_check_shrink_iters_limit(void) {
+    if (kai_check_shrink_iters_cached >= 0) return kai_check_shrink_iters_cached;
+    const char *env = getenv("KAI_CHECK_SHRINK_ITERS");
+    int n = KAI_CHECK_SHRINK_ITERS_DEFAULT;
+    if (env && *env) {
+        int parsed = atoi(env);
+        if (parsed >= 0) n = parsed;
+    }
+    kai_check_shrink_iters_cached = n;
+    return n;
+}
+
+/* Counterexample-buffer side channel for shrinking. When a failure
+   triggers shrinking, the runner first snapshots the original cx
+   buffer here so the final report can show "<orig> shrunk to <min>".
+   Bounded by the same KAI_CHECK_CX_BUF cap as the live buffer. */
+static char kai_check_orig_cx_buf[KAI_CHECK_CX_BUF];
+static int  kai_check_has_orig_cx = 0;
+
+static void kai_check_cx_save_orig(void) {
+    size_t n = kai_check_cx_len;
+    if (n >= KAI_CHECK_CX_BUF) n = KAI_CHECK_CX_BUF - 1;
+    memcpy(kai_check_orig_cx_buf, kai_check_cx_buf, n);
+    kai_check_orig_cx_buf[n] = '\0';
+    kai_check_has_orig_cx = 1;
+}
+
+/* Reports a shrunk counterexample. If the shrink loop produced a
+   strictly smaller value, prints both forms; otherwise (no progress)
+   degrades to the v1 single-form output so noise stays low. */
+static void kai_check_fail_shrunk(int iter_at) {
+    if (kai_check_has_orig_cx
+        && strcmp(kai_check_orig_cx_buf, kai_check_cx_buf) != 0) {
+        fprintf(stderr,
+                "  %s: counterexample at iter %d: %s, shrunk to %s\n",
+                kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
+                iter_at, kai_check_orig_cx_buf, kai_check_cx_buf);
+    } else {
+        fprintf(stderr, "  %s: counterexample at iter %d: %s\n",
+                kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
+                iter_at, kai_check_cx_buf);
+    }
+    kai_check_has_orig_cx = 0;
+}
+
 /* Runtime-aware assert: called from every emitted `assert`. Inside an
    active test (kai_test_in_progress) it prints a failure and longjmps
    back to the test harness so the next test can run. Otherwise it
