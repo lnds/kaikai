@@ -236,6 +236,12 @@ polymorphic-impl machinery.
   suggested fix, exhaustiveness counterexamples, scope-aware
   hole reporting. References `docs/typed-holes.md` for the
   JSON contract; m11 elevates the human-text side.
+  - **m11 v1 (#445)**: three high-frequency templates —
+    type mismatch (argument index + callee signature),
+    non-exhaustive match (missing variant + covered list +
+    actionable help), unbound name (Levenshtein did-you-mean
+    on a separate `help:` line). Wrong-arity and
+    missing-effect templates defer to m11.x.
 - `kai lsp` — Language Server Protocol implementation: type
   on hover, completions, go-to-definition, diagnostics push,
   symbol renaming. Reuses the typed-hole + diagnostic JSON
