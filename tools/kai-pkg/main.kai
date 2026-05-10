@@ -19,7 +19,8 @@ import os.process
 #                                  driver to inject `--path` flags.
 #
 # Cache root is read from `$KAIKAI_CACHE_ROOT` (set by the driver).
-# Layout: <root>/<host>/<owner>/<repo>/<ref-slug>/.
+# Layout: <root>/<host>/<owner>/<repo>/<sha>/.  The leaf is the
+# resolved commit SHA so the cache is content-addressed (#421).
 
 fn main() : Unit / Stdout + Stderr + Env + File + Process {
   let av = args.argv()
@@ -307,9 +308,10 @@ type Pkg = {
   source: String,
   ref: String,
   sha: String,
-  cache: String,   # derived from KAIKAI_CACHE_ROOT at runtime; not
-                   # written to the lockfile so reproducibility holds
-                   # across machines with different cache roots.
+  cache: String,   # derived from KAIKAI_CACHE_ROOT + source + sha
+                   # at runtime; not written to the lockfile so
+                   # reproducibility holds across machines with
+                   # different cache roots.
 }
 
 fn pkg_to_toml(p: Pkg) : TomlValue =
@@ -375,7 +377,7 @@ fn pkg_from_toml(v: TomlValue) : Option[Pkg] / Env = {
             Some(r) -> match sha {
               Some(h) -> Some(Pkg {
                 name: n, source: s, ref: r, sha: h,
-                cache: cache_dir_for(s, r),
+                cache: cache_dir_for(s, h),
               })
               None -> None
             }
@@ -421,15 +423,19 @@ fn cache_root() : String / Env = {
 # Compute cache subdir for a git source. The source string is
 # slugified (path separators kept, leading `/` and protocol prefixes
 # stripped) so the cache layout mirrors the upstream URL structure
-# while staying filesystem-safe.
-fn cache_dir_for(source: String, ref: String) : String / Env = {
+# while staying filesystem-safe. The leaf is the resolved commit SHA
+# (issue #421) so the cache is content-addressed: each entry's name
+# matches its contents, branch refs that move upstream do not
+# overwrite older cached SHAs, and lockfile-pinned SHAs always find
+# their own tree on disk regardless of where the branch tip is now.
+fn cache_dir_for(source: String, sha: String) : String / Env = {
   let normalised = strip_url_prefix(source)
   let trimmed = if string_starts_with_str(normalised, "/") {
                   string_slice(normalised, 1, string_length(normalised) - 1)
                 } else { normalised }
   let slug = slugify_path(trimmed)
   let root = cache_root()
-  "#{root}/#{slug}/#{slugify_ref(ref)}"
+  "#{root}/#{slug}/#{slugify_ref(sha)}"
 }
 
 fn strip_url_prefix(s: String) : String = {
@@ -493,6 +499,51 @@ fn git_clone_to(source: String, ref: String, dest: String)
       None
     }
   }
+}
+
+# Resolve <ref> to a commit SHA on <source> without downloading
+# objects. If <ref> already looks like a 40-char hex SHA, return it
+# unchanged. Otherwise run `git ls-remote <url> <ref>` and read the
+# 40-char prefix of the first line.
+fn git_resolve_sha(source: String, ref: String)
+                   : Option[String] / File + Process + Env = {
+  if is_sha_like(ref) { Some(ref) }
+  else {
+    let pid = "#{int_to_string(time_now_unix())}-lsr"
+    let out_path = "/tmp/kaikai-pkg-#{pid}.lsr"
+    let qurl = quote_shell(git_url(source))
+    let qref = quote_shell(ref)
+    let qout = quote_shell(out_path)
+    let cmd = "git ls-remote #{qurl} #{qref} >#{qout} 2>/dev/null"
+    if run_shell(cmd) {
+      match read_file(out_path) {
+        Ok(s)  -> {
+          let trimmed = string_trim(s)
+          if string_length(trimmed) >= 40 {
+            let head = string_slice(trimmed, 0, 40)
+            if is_sha_like(head) { Some(head) } else { None }
+          } else { None }
+        }
+        Err(_) -> None
+      }
+    } else { None }
+  }
+}
+
+fn is_sha_like(s: String) : Bool = {
+  if string_length(s) != 40 { false }
+  else { is_sha_like_loop(s, 0) }
+}
+
+fn is_sha_like_loop(s: String, i: Int) : Bool = {
+  if i >= 40 { true }
+  else { match char_at(s, i) {
+    None    -> false
+    Some(c) -> {
+      let ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+      if ok { is_sha_like_loop(s, i + 1) } else { false }
+    }
+  } }
 }
 
 # Read HEAD sha by running `git rev-parse HEAD` in <dir>. Returns
@@ -708,16 +759,38 @@ fn ref_lt_loop(a: String, b: String, i: Int, na: Int, nb: Int) : Bool = {
 
 fn fetch_pkg(name: String, source: String, ref: String)
              : Option[Pkg] / Stdout + Stderr + File + Process + Env = {
-  let dest = cache_dir_for(source, ref)
-  let cached = dir_exists("#{dest}/.git")
-  let action = if cached { "cached" } else { "fetching" }
-  Stdout.print("  #{action} #{name} (#{source} @ #{ref})")
-  match git_clone_to(source, ref, dest) {
-    None -> None
-    Some(sha) -> Some(Pkg {
-      name: name, source: source, ref: ref, sha: sha, cache: dest,
-    })
+  # Resolve ref -> SHA upfront (issue #421). The cache leaf is the
+  # SHA, so we need it before deciding whether to clone. `git
+  # ls-remote` is one round-trip and tells us the current commit a
+  # branch/tag points at without downloading any objects.
+  match git_resolve_sha(source, ref) {
+    None -> {
+      Stderr.eprint("kai-pkg: cannot resolve #{source} @ #{ref}")
+      None
+    }
+    Some(sha) -> {
+      let dest = cache_dir_for(source, sha)
+      let cached = dir_exists("#{dest}/.git")
+      let action = if cached { "cached" } else { "fetching" }
+      Stdout.print("  #{action} #{name} (#{source} @ #{ref} -> #{sha_short(sha)})")
+      if cached {
+        Some(Pkg {
+          name: name, source: source, ref: ref, sha: sha, cache: dest,
+        })
+      } else {
+        match git_clone_to(source, ref, dest) {
+          None -> None
+          Some(_) -> Some(Pkg {
+            name: name, source: source, ref: ref, sha: sha, cache: dest,
+          })
+        }
+      }
+    }
   }
+}
+
+fn sha_short(sha: String) : String = {
+  if string_length(sha) >= 7 { string_slice(sha, 0, 7) } else { sha }
 }
 
 # Read transitive deps from the cloned repo's kai.toml. Returns []
