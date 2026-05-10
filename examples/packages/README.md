@@ -59,6 +59,16 @@ and are gitignored — regenerate them whenever the source under
   examples/packages/add_failure/check.sh
   ```
 
+- **`init_invalid_names/`** — `check.sh` asserts `kai init`
+  rejects names that fall outside `[a-z][a-z0-9_-]*` (issue
+  #419): names with spaces, slashes, `@`, leading dashes or
+  digits, path traversal, and uppercase letters all exit
+  non-zero without creating `kai.toml`.
+
+  ```sh
+  examples/packages/init_invalid_names/check.sh
+  ```
+
 ## Coverage in tier 1
 
 Driver-level fixtures don't fit `test-llvm-coverage` (which
