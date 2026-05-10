@@ -3845,18 +3845,62 @@ static int kai_test_summary(void) {
 }
 
 /* ---------- bench harness hooks (used by --bench runs) ----------
- * bench v1 (issue #40): mean ns/iter only, N fixed at 1000. The
- * emitted main wrapper calls every _kai_bench_<id> in sequence and
- * returns kai_bench_summary().
+ * bench v1.x (issue #437): per-iteration timings collected into a
+ * sample buffer; on finalize we sort and report median + MAD + mean
+ * + range. The emitted bench wrapper runs KAI_BENCH_WARMUP untimed
+ * iterations first to take JIT/cache effects out of the timed
+ * window, then KAI_BENCH_ITERS timed iterations. Both knobs read
+ * from getenv() at startup so the user can override without
+ * recompiling. KAI_BENCH_ITERS_DEFAULT is the compile-time fallback.
  *
- * Median + MAD-based outlier detection deferred to v1.x; selfhost-
- * bench (the compiler measuring itself) deferred to v1.y. See
- * issue #40 for the split plan.
+ * Selfhost-bench (the compiler measuring itself) deferred to v1.y;
+ * see issue #40 for the split plan.
  */
 
-#define KAI_BENCH_ITERS 1000
+#define KAI_BENCH_ITERS_DEFAULT  1000
+#define KAI_BENCH_WARMUP_DEFAULT 50
 
 static int kai_bench_count_total = 0;
+
+static int kai_bench_iters_cached = -1;
+static int kai_bench_warmup_cached = -1;
+
+static int kai_bench_parse_int_env(const char *name, int fallback) {
+    const char *raw = getenv(name);
+    if (!raw || !*raw) return fallback;
+    long v = 0;
+    const char *p = raw;
+    int sign = 1;
+    if (*p == '-') { sign = -1; p++; }
+    if (!*p) return fallback;
+    while (*p) {
+        if (*p < '0' || *p > '9') return fallback;
+        v = v * 10 + (*p - '0');
+        if (v > 100000000L) return fallback;
+        p++;
+    }
+    v *= sign;
+    if (v < 0) return fallback;
+    return (int)v;
+}
+
+static int kai_bench_iters(void) {
+    if (kai_bench_iters_cached < 0) {
+        int v = kai_bench_parse_int_env("KAI_BENCH_ITERS", KAI_BENCH_ITERS_DEFAULT);
+        if (v < 1) v = 1;
+        kai_bench_iters_cached = v;
+    }
+    return kai_bench_iters_cached;
+}
+
+static int kai_bench_warmup(void) {
+    if (kai_bench_warmup_cached < 0) {
+        int v = kai_bench_parse_int_env("KAI_BENCH_WARMUP", KAI_BENCH_WARMUP_DEFAULT);
+        if (v < 0) v = 0;
+        kai_bench_warmup_cached = v;
+    }
+    return kai_bench_warmup_cached;
+}
 
 static long long kai_bench_now_ns(void) {
     struct timespec ts;
@@ -3864,18 +3908,88 @@ static long long kai_bench_now_ns(void) {
     return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
 }
 
-static void kai_bench_report(const char *desc, long long total_ns, int iters) {
-    /* Mean ns/iter only. desc is the raw source span of the string
-       literal (quotes included) — fprintf passes it through verbatim,
-       which is consistent with how kai_test_pass renders kai_test_current. */
-    long long per = (iters > 0) ? (total_ns / (long long)iters) : 0;
-    fprintf(stderr, "  %s: %d iter / %lld ns/iter\n",
-            desc ? desc : "(unnamed)", iters, per);
+/* Per-bench sample buffer. One bench at a time runs to completion
+   before the next one starts (the emitted main calls them in
+   sequence), so a single shared buffer is enough — we just realloc
+   it lazily to the high-water mark. */
+static long long *kai_bench_samples = NULL;
+static int kai_bench_samples_cap = 0;
+
+static void kai_bench_ensure_capacity(int n) {
+    if (n <= kai_bench_samples_cap) return;
+    long long *r = (long long *)realloc(kai_bench_samples, (size_t)n * sizeof(long long));
+    if (!r) {
+        fprintf(stderr, "kai_bench: out of memory reserving %d samples\n", n);
+        exit(1);
+    }
+    kai_bench_samples = r;
+    kai_bench_samples_cap = n;
+}
+
+static void kai_bench_record(int idx, long long sample_ns) {
+    /* Caller has already ensured capacity. Out-of-range index
+       silently drops — defensive against emitter bugs that miscount
+       iterations. */
+    if (idx < 0 || idx >= kai_bench_samples_cap) return;
+    kai_bench_samples[idx] = sample_ns;
+}
+
+static int kai_bench_ll_cmp(const void *a, const void *b) {
+    long long la = *(const long long *)a;
+    long long lb = *(const long long *)b;
+    if (la < lb) return -1;
+    if (la > lb) return 1;
+    return 0;
+}
+
+static long long kai_bench_median_sorted(const long long *xs, int n) {
+    if (n <= 0) return 0;
+    return xs[n / 2];
+}
+
+static void kai_bench_finalize(const char *desc, int iters) {
+    /* Samples already populated by kai_bench_record(0..iters-1). */
+    if (iters <= 0) {
+        fprintf(stderr, "  %s: 0 iter / median 0 ns / MAD 0 ns / mean 0 ns / range [0, 0]\n",
+                desc ? desc : "(unnamed)");
+        kai_bench_count_total++;
+        return;
+    }
+    long long *xs = kai_bench_samples;
+    long long total = 0;
+    long long mn = xs[0];
+    long long mx = xs[0];
+    for (int i = 0; i < iters; i++) {
+        long long s = xs[i];
+        total += s;
+        if (s < mn) mn = s;
+        if (s > mx) mx = s;
+    }
+    long long mean = total / (long long)iters;
+    qsort(xs, (size_t)iters, sizeof(long long), kai_bench_ll_cmp);
+    long long median = kai_bench_median_sorted(xs, iters);
+    /* MAD: median(|x_i - median|). Reuse the sample buffer for the
+       deviations — we're done with the sorted samples. */
+    for (int i = 0; i < iters; i++) {
+        long long d = xs[i] - median;
+        if (d < 0) d = -d;
+        xs[i] = d;
+    }
+    qsort(xs, (size_t)iters, sizeof(long long), kai_bench_ll_cmp);
+    long long mad = kai_bench_median_sorted(xs, iters);
+    fprintf(stderr,
+            "  %s: %d iter / median %lld ns / MAD %lld ns / mean %lld ns / range [%lld, %lld]\n",
+            desc ? desc : "(unnamed)", iters, median, mad, mean, mn, mx);
     kai_bench_count_total++;
 }
 
 static int kai_bench_summary(void) {
     fprintf(stderr, "\n%d benches\n", kai_bench_count_total);
+    if (kai_bench_samples) {
+        free(kai_bench_samples);
+        kai_bench_samples = NULL;
+        kai_bench_samples_cap = 0;
+    }
     return 0;
 }
 
