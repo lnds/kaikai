@@ -103,6 +103,30 @@ Two further rules:
 
 Without this discipline, doc → reality drift recurs and downstream analysis (Linus / Eric strategic consults, new-contributor onboarding, agent prompts) draws wrong conclusions because the catalog lies. The audit triggered by #367 was launched after a strategic consultation reached a wrong recommendation because Phase 2 was documented as "not landed" while M1+M2+M3 were live in `stdlib/`.
 
+### Primary docs vs. lane bitácora — what's authoritative
+
+When reasoning about *current state* of the language, runtime, or stdlib, the **primary** sources are:
+
+- `docs/design.md`, `docs/effects.md`, `docs/effects-stdlib.md`, `docs/effects-impl.md`, `docs/protocols.md`, `docs/structured-concurrency.md`, `docs/actors.md` — language semantics.
+- `docs/fibers-honesty-targets.md`, `docs/perceus-honesty-targets.md` — what's shipped vs. deferred per honesty tier.
+- `docs/stdlib-layout.md`, `docs/stdlib-roadmap.md` — current inventory.
+- `docs/roadmap.md` — milestone state.
+
+The **secondary / historical** sources are the lane retrospectives and audits:
+
+- `docs/lane-experience-*.md` (~90 files) — per-lane retros: what was attempted, what reworked, what got proposed and didn't ship, what surprised the lane.
+- `docs/lane-audit-*.md`, `docs/*-phase0-audit.md`, `docs/*-followups.md` — point-in-time audits, often pessimistic about features that have since shipped.
+- `docs/lane-experience-*-disclaimer-sweep.md` — the sweeps that aligned other docs to reality.
+
+These are **bitácora**: project diary, retrospective, work log. Use them for **meta-analysis** ("did this feature need rework?", "what was the original scope?", "what did the lane discover?") — **not** as source of truth for current behavior.
+
+Common failure mode an agent should avoid:
+
+- Reading a 4-week-old `lane-experience-X.md` that says "Phase Y not landed" and reporting Phase Y as missing, when the primary docs (catalog + honesty targets) show Phase Y shipped two weeks ago.
+- Citing an audit doc's pessimistic finding ("RC is fictional") as if it described today's runtime, when the closing lane already shipped the fix.
+
+Rule: when a lane retro / audit and a primary doc disagree, the primary doc wins. Lane retros may be stale; primary docs are the lane-close discipline's responsibility to keep current.
+
 ## Commit messages — Conventional Commits
 
 `<type>(<scope>)?: <subject>`. Type drives changelog placement and version bump:

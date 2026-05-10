@@ -15,19 +15,24 @@ claim*.
 Sister doc: `docs/fibers-honesty-targets.md` (same shape, applied to
 the m8.x scheduler).
 
-## Where we are today (2026-04-29 evening — perceus-tier-2 lane)
+## Where we are today (2026-05-09)
 
-Tier 2 architectural debt closed. Three items landed in one lane:
-`pcs_rewrite_estr_span` (closes §4b), match-scrutinee real plug
-(stages 0 + 1 + 2), and `kai_field_borrow` for pat_test
-(record-pattern test paths). `leaked` cut from 25.4 M to
-13.4 M (−47%) on `kaic2` self-compile. Selfhost (stage 1 +
-stage 2 + LLVM) byte-identical, R3 closed-loop fixture
-(`examples/effects/interp_recursive_walk.kai`) still green
-without the workaround. Tier 2 mechanical follow-throughs left:
-remaining `kai_prelude_*` helpers + stage 0 eager-dup retrofit
-cleanup; together those should bring `leaked` under the < 5 M
-threshold.
+Tier 2 architectural debt + Tier 2.5 unboxing both closed.
+Compute parity with C reached on benchmarks (fib(35) 1.00× C,
+Euler 4 1.05× C). Tier 1 #2 ("runtime-efficient") and Tier 1 #3
+("Mandatory TCO") both honest now without footnotes for emitted
+programs.
+
+The perceus-tier-2 lane (2026-04-29) closed three architectural
+items in one go: `pcs_rewrite_estr_span` (§4b), match-scrutinee
+real plug (stages 0 + 1 + 2), and `kai_field_borrow` for pat_test
+(record-pattern test paths). `leaked` cut from 25.4 M to 13.4 M
+(−47%) on `kaic2` self-compile. Phase 3 unboxing (#383) then
+removed the call-boundary boxing on all-primitive concrete
+signatures, taking compute-only loops within ~1× of clang -O2
+(`docs/benchmarks/compute_2026-05-09.md`). Reuse-in-place v1
+landed (#118) + v1.1 (#209) extending to L-per-call on linearly
+unique spines.
 
 R1 atomic flip landed v0.2.0 (2026-04-28):
 
