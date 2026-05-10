@@ -60,6 +60,21 @@ $ kai init myapp
 kai-pkg: wrote kai.toml for package 'myapp'
 ```
 
+The package name must match the grammar
+
+```
+package_name := [a-z][a-z0-9_-]*
+```
+
+i.e. lowercase ASCII alphanumerics plus `_` and `-`, starting
+with a letter. The same shape is used by Cargo, Go modules, and
+Hex.pm and avoids every downstream pitfall: spaces and slashes
+break import resolution, `@` collides with the `kai add foo@v1`
+syntax, leading dashes parse as flags, and `..` enables path
+traversal in the cache layout. `kai init` rejects names that
+fall outside this grammar with a non-zero exit and leaves
+`kai.toml` untouched (issue #419).
+
 ### `kai install`
 
 Reads `kai.toml` from the current directory (or the nearest
