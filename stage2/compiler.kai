@@ -16437,20 +16437,30 @@ fn check_arbitrary_panic(label: String) : String =
     " — supported types are Int, Bool, Char, String, and lists of those\"))"
   ])
 
-fn emit_check_param_inits(params: [Param]) : String {
-  match params {
-    [] -> ""
-    [p, ...rest] -> {
-      let tyc = match p.ptype {
-        Some(t) -> check_arbitrary_for_ty(t)
-        None -> check_arbitrary_panic("<missing>")
-      }
-      concat_all([
-        "        KaiValue *kai_", p.pname, " = ", tyc, ";\n",
-        "        kai_check_record_param(\"", p.pname, "\", kai_", p.pname, ");\n",
-        emit_check_param_inits(rest)
-      ])
+# Picks the runtime shrink-helper names for a parameter type. Returns
+# a list of strategy names. Lists have two strategies (drop-head, then
+# shrink-head); scalars have one. Empty list means no shrink for this
+# type — the runner will skip the param. Issue #438.
+fn check_shrink_for_ty(ty: TypeExpr) : [String] {
+  match ty.tkind {
+    TyName(name, _args) -> {
+      if name == "Int" { ["kai_shrink_int"] }
+      else if name == "Bool" { ["kai_shrink_bool"] }
+      else if name == "Char" { ["kai_shrink_char"] }
+      else if name == "String" { ["kai_shrink_string"] }
+      else { [] }
     }
+    TyList(inner) -> match inner.tkind {
+      TyName(iname, _) -> {
+        if iname == "Int"    { ["kai_shrink_list_int",    "kai_shrink_list_int_head"] }
+        else if iname == "Bool"   { ["kai_shrink_list_bool",   "kai_shrink_list_bool_head"] }
+        else if iname == "Char"   { ["kai_shrink_list_char",   "kai_shrink_list_char_head"] }
+        else if iname == "String" { ["kai_shrink_list_string", "kai_shrink_list_string_head"] }
+        else { [] }
+      }
+      _ -> []
+    }
+    _ -> []
   }
 }
 
@@ -16464,9 +16474,139 @@ fn emit_check_param_drops(params: [Param]) : String {
   }
 }
 
+# After a counterexample is detected, the failing param values are
+# captured in C locals named kai_<name> and we want to keep them alive
+# beyond the per-iter loop's scope. The original loop already drops on
+# every successful iter and breaks BEFORE dropping on failure, so the
+# captured values still hold rc=1 — we just stop treating them as
+# loop-scoped. Issue #438.
+#
+# Re-evaluating the body for shrinking is done by inlining body_c
+# again — this is the cleanest way to keep `EVar(name)` resolving via
+# the same lcs/locals path the typer already produced. Cost is one
+# extra body emission per param-strategy at compile time and zero at
+# steady-state runtime (the inlined re-eval only fires when a check
+# actually fails, so passing checks pay nothing).
+
+# Emits one strategy attempt: try kai_shrink_<helper>(kai_<param>); if
+# it produces a non-NULL candidate AND the body still fails with that
+# candidate swapped in, accept it (decref the previous value, keep the
+# candidate as the new param), set _progressed=1, and break out of the
+# strategy chain. Otherwise restore and decref the candidate.
+fn emit_shrink_attempt(pname: String, helper: String, body_c: String) : String =
+  concat_all([
+    "        if (!_progressed) {\n",
+    "            KaiValue *_cand = ", helper, "(kai_", pname, ");\n",
+    "            if (_cand != NULL) {\n",
+    "                KaiValue *_save = kai_", pname, ";\n",
+    "                kai_", pname, " = _cand;\n",
+    "                KaiValue *_body = ", body_c, ";\n",
+    "                int _ok = kai_op_truthy(_body);\n",
+    "                kai_decref(_body);\n",
+    "                if (!_ok) {\n",
+    "                    kai_decref(_save);\n",
+    "                    _progressed = 1;\n",
+    "                } else {\n",
+    "                    kai_", pname, " = _save;\n",
+    "                    kai_decref(_cand);\n",
+    "                }\n",
+    "            }\n",
+    "        }\n"
+  ])
+
+# All strategies for one param, in order.
+fn emit_shrink_attempts_for_param(pname: String, helpers: [String], body_c: String) : String {
+  match helpers {
+    [] -> ""
+    [h, ...rest] -> concat_all([
+      emit_shrink_attempt(pname, h, body_c),
+      emit_shrink_attempts_for_param(pname, rest, body_c)
+    ])
+  }
+}
+
+# All shrink attempts across every param in the with-clause. The
+# enclosing round flag (_progressed) short-circuits subsequent attempts
+# once any candidate sticks, so we always greedily restart from the
+# first param after each accepted shrink — that matches QuickCheck's
+# greedy strategy and keeps the iter budget focused on the most-
+# productive prefix of params.
+fn emit_shrink_attempts(params: [Param], body_c: String) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let helpers = match p.ptype {
+        Some(t) -> check_shrink_for_ty(t)
+        None -> []
+      }
+      concat_all([
+        emit_shrink_attempts_for_param(p.pname, helpers, body_c),
+        emit_shrink_attempts(rest, body_c)
+      ])
+    }
+  }
+}
+
 fn check_param_names(params: [Param]) : [String] = match params {
   [] -> []
   [p, ...rest] -> [p.pname, ...check_param_names(rest)]
+}
+
+# Re-records every param into the cx buffer (used after shrinking to
+# rebuild the buffer with shrunk values).
+fn emit_check_param_rerecord(params: [Param]) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> concat_all([
+      "    kai_check_record_param(\"", p.pname, "\", kai_", p.pname, ");\n",
+      emit_check_param_rerecord(rest)
+    ])
+  }
+}
+
+# Drops every param at function-tail scope (no leading indent variant
+# of emit_check_param_drops).
+fn emit_check_param_drops_tail(params: [Param]) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> concat_all([
+      "    kai_decref(kai_", p.pname, ");\n",
+      emit_check_param_drops_tail(rest)
+    ])
+  }
+}
+
+# Forward declares each param at function scope so the per-iter loop
+# assigns into them and the post-loop shrink section can reference
+# the surviving values. Initialised to NULL so the no-failure path
+# leaves nothing to drop.
+fn emit_check_param_decls(params: [Param]) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> concat_all([
+      "    KaiValue *kai_", p.pname, " = NULL;\n",
+      emit_check_param_decls(rest)
+    ])
+  }
+}
+
+# Emits the per-iter param init that ASSIGNS (not declares) into the
+# function-scope locals so the post-loop shrink section can see them.
+fn emit_check_param_inits_assign(params: [Param]) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let tyc = match p.ptype {
+        Some(t) -> check_arbitrary_for_ty(t)
+        None -> check_arbitrary_panic("<missing>")
+      }
+      concat_all([
+        "        kai_", p.pname, " = ", tyc, ";\n",
+        "        kai_check_record_param(\"", p.pname, "\", kai_", p.pname, ");\n",
+        emit_check_param_inits_assign(rest)
+      ])
+    }
+  }
 }
 
 fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body: Expr,
@@ -16476,23 +16616,46 @@ fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body:
   # Issue #335: same file-local rotate as emit_test_fn.
   let body_fns = fns_prefer_module(fns, target_origin)
   let body_c = emit_expr(src, body, lcs2, body_fns, variants, lams, cls)
-  let inits = emit_check_param_inits(params)
-  let drops = emit_check_param_drops(params)
+  # Issue #438: hoist param locals to function scope so the post-loop
+  # shrink section can keep mutating them. The per-iter loop now
+  # assigns into them (not redeclares) and only drops on the OK path —
+  # on failure the values survive so the shrinker can use them as the
+  # starting point.
+  let decls = emit_check_param_decls(params)
+  let inits = emit_check_param_inits_assign(params)
+  let iter_drops = emit_check_param_drops(params)
+  let tail_drops = emit_check_param_drops_tail(params)
+  let attempts = emit_shrink_attempts(params, body_c)
+  let rerecord = emit_check_param_rerecord(params)
   concat_all([
     "static void _kai_check_", int_to_string(id), "(void) {\n",
     "    kai_check_begin(", desc_span, ");\n",
     "    int _kai_check_i;\n",
     "    int _kai_check_failed_at = -1;\n",
+    decls,
     "    for (_kai_check_i = 0; _kai_check_i < KAI_CHECK_ITERS; _kai_check_i++) {\n",
     "        kai_check_cx_reset();\n",
     inits,
     "        KaiValue *_body = ", body_c, ";\n",
     "        int _ok = kai_op_truthy(_body);\n",
     "        kai_decref(_body);\n",
-    drops,
     "        if (!_ok) { _kai_check_failed_at = _kai_check_i; break; }\n",
+    iter_drops,
     "    }\n",
-    "    if (_kai_check_failed_at >= 0) { kai_check_fail(_kai_check_failed_at); }\n",
+    "    if (_kai_check_failed_at >= 0) {\n",
+    "        kai_check_cx_save_orig();\n",
+    "        int _kai_shrink_budget = kai_check_shrink_iters_limit();\n",
+    "        int _kai_shrink_i;\n",
+    "        for (_kai_shrink_i = 0; _kai_shrink_i < _kai_shrink_budget; _kai_shrink_i++) {\n",
+    "            int _progressed = 0;\n",
+    attempts,
+    "            if (!_progressed) break;\n",
+    "        }\n",
+    "        kai_check_cx_reset();\n",
+    rerecord,
+    "        kai_check_fail_shrunk(_kai_check_failed_at);\n",
+    tail_drops,
+    "    }\n",
     "    else { kai_check_pass(KAI_CHECK_ITERS); }\n",
     "}\n\n"
   ])
