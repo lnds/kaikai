@@ -159,13 +159,18 @@ tier1: test demos-no-regression test-fmt test-bench test-check
 test-fmt: kaic2
 	@./tests/fmt_fixtures.sh
 
-# bench v1 (issue #40) — smoke for `kai bench`. Builds + runs the
-# `examples/stdlib/bench_basic.kai` fixture and verifies the output
-# format. ns/iter values vary per run so we grep for the pattern
-# rather than diffing against a golden file. Failure modes:
+# bench v1.x (issues #40 + #437) — smoke for `kai bench`. Builds +
+# runs the `examples/stdlib/bench_basic.kai` and
+# `examples/stdlib/bench_median_mad.kai` fixtures and verifies the
+# new median + MAD output format. Numeric values vary per run so we
+# grep for the pattern rather than diffing against a golden file.
+# Also exercises the --iters CLI flag and the KAI_BENCH_WARMUP env
+# var to make sure both paths feed through to the runtime.
+# Failure modes:
 #   - kai bench exits non-zero (compile / runtime error)
-#   - any of the three bench result lines is missing or malformed
-#   - the trailing `3 benches` summary line is missing
+#   - any expected bench result line is missing or malformed
+#   - the trailing `<N> benches` summary line is missing
+#   - --iters override fails to change the iteration count
 test-bench: kaic2
 	@./bin/kai bench examples/stdlib/bench_basic.kai > /tmp/kaikai-bench-basic.out 2>&1; \
 	rc=$$?; \
@@ -173,16 +178,38 @@ test-bench: kaic2
 	  echo "test-bench FAIL — kai bench exited $$rc"; \
 	  cat /tmp/kaikai-bench-basic.out; exit 1; \
 	fi; \
-	matched=$$(grep -E ': 1000 iter / [0-9]+ ns/iter$$' /tmp/kaikai-bench-basic.out | wc -l | tr -d ' '); \
+	matched=$$(grep -E ': 1000 iter / median [0-9]+ ns / MAD [0-9]+ ns / mean [0-9]+ ns / range \[[0-9]+, [0-9]+\]$$' /tmp/kaikai-bench-basic.out | wc -l | tr -d ' '); \
 	if [ "$$matched" != "3" ]; then \
-	  echo "test-bench FAIL — expected 3 bench result lines, got $$matched"; \
+	  echo "test-bench FAIL — expected 3 bench result lines in new format, got $$matched"; \
 	  cat /tmp/kaikai-bench-basic.out; exit 1; \
 	fi; \
 	if ! grep -qE '^3 benches$$' /tmp/kaikai-bench-basic.out; then \
 	  echo "test-bench FAIL — missing '3 benches' summary line"; \
 	  cat /tmp/kaikai-bench-basic.out; exit 1; \
 	fi; \
-	echo "test-bench OK — $$matched benches printed in expected format"
+	./bin/kai bench --iters 200 examples/stdlib/bench_median_mad.kai > /tmp/kaikai-bench-mm.out 2>&1; \
+	rc=$$?; \
+	if [ $$rc -ne 0 ]; then \
+	  echo "test-bench FAIL — kai bench --iters 200 exited $$rc"; \
+	  cat /tmp/kaikai-bench-mm.out; exit 1; \
+	fi; \
+	matched_mm=$$(grep -E ': 200 iter / median [0-9]+ ns / MAD [0-9]+ ns / mean [0-9]+ ns / range \[[0-9]+, [0-9]+\]$$' /tmp/kaikai-bench-mm.out | wc -l | tr -d ' '); \
+	if [ "$$matched_mm" != "2" ]; then \
+	  echo "test-bench FAIL — expected 2 bench result lines @ 200 iter (--iters override), got $$matched_mm"; \
+	  cat /tmp/kaikai-bench-mm.out; exit 1; \
+	fi; \
+	KAI_BENCH_ITERS=128 KAI_BENCH_WARMUP=4 ./bin/kai bench examples/stdlib/bench_median_mad.kai > /tmp/kaikai-bench-env.out 2>&1; \
+	rc=$$?; \
+	if [ $$rc -ne 0 ]; then \
+	  echo "test-bench FAIL — KAI_BENCH_ITERS=128 kai bench exited $$rc"; \
+	  cat /tmp/kaikai-bench-env.out; exit 1; \
+	fi; \
+	matched_env=$$(grep -E ': 128 iter / median [0-9]+ ns / MAD [0-9]+ ns / mean [0-9]+ ns / range \[[0-9]+, [0-9]+\]$$' /tmp/kaikai-bench-env.out | wc -l | tr -d ' '); \
+	if [ "$$matched_env" != "2" ]; then \
+	  echo "test-bench FAIL — expected 2 bench result lines @ 128 iter (env override), got $$matched_env"; \
+	  cat /tmp/kaikai-bench-env.out; exit 1; \
+	fi; \
+	echo "test-bench OK — basic ($$matched), --iters ($$matched_mm), env ($$matched_env) bench formats verified"
 
 # check v1 (issue #44) — smoke for `kai check`. Builds + runs the
 # `examples/stdlib/check_basic.kai` fixture and verifies the output
