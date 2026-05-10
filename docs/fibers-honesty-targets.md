@@ -13,7 +13,11 @@ promises a calendar. The §*Residual m8.x items* section below
 inventories what is left after the R2 lane closed (`0.4.0`) and the
 2026-04-30 Tier 2 retrofit landed.
 
-## Where we are today (2026-04-29)
+## Where we are today (2026-05-09)
+
+Tier 1 + Tier 2 closed. The runtime is BEAM-style cooperative
+single-threaded; everything that surfaced in a 30-minute live demo
+or in the 1.0-honesty target list is shipped and verifiable.
 
 - R2 cooperative scheduler landed v0.4.0 (`ucontext`, READY/RUNNING/
   PARKED/DONE state machine, intrusive ready queue, blocking
@@ -25,85 +29,15 @@ inventories what is left after the R2 lane closed (`0.4.0`) and the
 - `demos/ping_pong/` produces observable round-robin output —
   the cooperative interleave is publicly verifiable, not just a
   type-system claim.
-
-What does **not** work today:
-
-- ~~`let _ = fiber_spawn(…)` (discard the Fiber value without
-  awaiting) deadlocks~~. **FIXED 2026-04-29** (Fibers Tier 1 lane).
-  Scheduler-side fiber RC discipline: the wrapper now carries one
-  ref for the caller and one for the scheduler; the trampoline's
-  DONE/CANCELLED tail drops the scheduler's ref (was R4 in the
-  retired `docs/known-regressions.md`; closure recoverable from
-  `git log` if needed).
-- ~~Stack overflow in a fiber body lands in unmapped memory with
-  no diagnostic.~~ **FIXED 2026-04-29** (Fibers Tier 1 lane).
-  Each spawned fiber's private stack is now `mmap`ed with a
-  `PROT_NONE` guard page at the low end (stacks grow down on
-  x86_64 / arm64); a SIGSEGV/SIGBUS handler running on a
-  sigaltstack prints `kai: fiber stack overflow at <ptr>` before
-  re-raising with the default disposition. Coverage:
-  `examples/effects/m8_fiber_stack_overflow.kai`.
-- ~~`Monitor` is type-surface-only — Phase 5.5+ deferred. Needs
-  `spawn_actor` (Pid handoff primitive) which itself is
-  deferred.~~ **Closed 2026-04-30**
-  (Fibers Tier 2 lane). `spawn_actor` lifts on `fiber_spawn` +
-  `with_mailbox` via two new runtime helpers
-  (`mailbox_alloc_unowned` + `mailbox_assign_owner`) so the
-  spawned fiber owns the mailbox; `Monitor.monitor(pid)`
-  registers an entry on the *target* fiber's `monitor_head`
-  chain and the trampoline's termination tail walks it,
-  pushing the original target_pid into each observer's
-  mailbox. v1 simplification: `MonitorRef` collapses to
-  `Pid[Nothing]` and the `MonitorDown(ref, cause)` payload
-  becomes a bare pid — reason distinction (Normal / Crashed)
-  is reachable today through Link + trap_exit. Coverage:
-  `examples/effects/m8_monitor.kai`.
-- ~~`Fiber[T]` / `Pid[Msg]` region brand is shallow. The shallow
-  walk now symmetrises Fiber and Pid (Tier 2 extension,
-  2026-04-30 — `examples/effects/m8x_6_pid_escapes.kai`), but a
-  `Fiber` / `Pid` embedded inside a *user-defined* sum-type
-  constructor's payload still escapes the shallow check.~~
-  **Sum-payload escape closed 2026-05-02 (issue #71 option (a)).**
-  The walker now consults a `[SumInfo]` registry collected per
-  `infer_program`, substitutes the type's tparams into each
-  variant's payload TypeExpr and recurses. Coverage:
-  `examples/effects/m8x_7_fiber_in_sum.kai`,
-  `m8x_7_pid_in_sum.kai`, `m8x_7_recursive_sum_no_breach.kai`.
-  The remaining gap is option (b) — full `TyBranded(Ty, BrandId)`
-  propagation with sibling-nursery brand-mismatch detection —
-  pinned in `docs/structured-concurrency.md` §*Type system*
-  and gated on the m7b #4 cap-binding form (`nursery { n -> ... }`)
-  not yet landing; see §*Residual m8.x items* item 1 below.
-- ~~LLVM op-dispatch (`llvm_emit_op_dispatch`) does not carry the
-  `in_dispatch_node` flag. The same bug #12 shape exists in the
-  LLVM backend, hidden until someone hits a self-delegating
-  handler under `--emit=llvm`.~~ **Closed 2026-04-30** (Fibers
-  Tier 2 lane). `llvm_emit_op_dispatch` now mirrors the C emit's
-  `_saved_disp = ...; in_dispatch_node = _node_op; <call>;
-  in_dispatch_node = _saved_disp;` envelope via three new
-  runtime helpers (`kaix_evidence_lookup_node`,
-  `kaix_in_dispatch_enter`, `kaix_in_dispatch_leave`). The
-  `m8_12_self_delegating_handler` fixture is now exercised under
-  both backends, with a structural grep on the IR confirming the
-  enter/leave pairing.
-- ~~Trap-exit semantics collapsed to "any termination propagates"
-  in v1. BEAM's `process_flag(trap_exit, true)` distinction
-  (Crashed vs Normal exit) is post-MVP.~~ **FIXED 2026-04-29**
-  (Fibers Tier 2 lane). `Spawn.set_trap_exit(true)` opts the
-  current fiber into trap-exit mode; linked peers' DONE
-  terminations push `"Normal"`, CANCELLED terminations push
-  `"Crashed"` into the fiber's mailbox instead of setting
-  `cancel_requested`. Coverage: `examples/effects/m8_trap_exit.kai`
-  + `stage2/tests/link_runtime_test.c`.
-- ~~Spawn API still uses pre-m7b #2 typing shape — per-op generics
-  were not retrofitted when m7b #2 closed.~~ **Partial 2026-04-30**
-  (Fibers Tier 2 lane). The four Fiber-shaped ops (`spawn`,
-  `await`, `select`, `cancel`) now carry `[T]`, so `Spawn.await(f)`
-  flows back as `T` instead of TyAny. Per-op ROW generics
-  (`spawn[T, e](f: () -> T / e)`) is a separate extension still
-  pending — see §*Residual m8.x items* below; the wrappers in
-  `stdlib/spawn.kai` keep absorbing the thunk's open row via TyAny.
-  Coverage: `examples/effects/m8_spawn_per_op_generics.kai`.
+- Tier 1 quick wins shipped 2026-04-29: fiber-discard deadlock
+  (R4) + stack guard pages.
+- Tier 2 production-honest set shipped 2026-04-29 — 2026-05-02:
+  Monitor + `spawn_actor`, region-brand region walker (Fiber +
+  Pid + sum-type-payload + cap-binding nursery), LLVM
+  op-dispatch parity, trap-exit semantics, per-op generics
+  including ROW generics on spawned thunks (issue #72).
+- §*Residual m8.x items* below now reduces to three minor
+  items, none of which surface as runtime errors today.
 
 ## Tier 1 — *Show HN honest* (~1 day)
 
