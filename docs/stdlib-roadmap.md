@@ -62,7 +62,7 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | Module                                  | Status                                                                                                                         |
 |-----------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
 | `fs/file`                               | shipped via PR #132 (3 public fns: `file_read_file`, `file_write_file`, `file_append`); minimum-viable extras shipped via #345 (`file_exists`, `file_delete`, `file_rename` as prelude builtins riding `File`); module-qualified surface `file.exists` / `file.delete` / `file.rename` shipped via #423 (closes the gap where `import fs.file` did not expose the #345 ops); `metadata`/`read_bytes`/`write_bytes` deferred (need record type / `[Int]` byte-array conversion) |
-| `fs/dir`                                | doc-only stub committed; runtime primitives queued in #344 (no `pub fn` yet)                                                   |
+| `fs/dir`                                | shipped via #344: 4 public fns (`dir.list_dir`, `dir.create_dir`, `dir.remove_dir`, `dir.walk`) over `kai_prelude_dir_*` primitives; rides `File`; v1 walk does not follow symlinks |
 | `os/env`                                | shipped via PR #131 (partial) + PR #143 (close, closes #127); 4 public fns                                                     |
 | `os/args`                               | shipped via PR #131 + PR #143; 2 public fns (`args_argv`, `args_program_name`)                                                 |
 | `os/process` (runtime + effect)         | shipped via PR #142 (closes the runtime side of #126)                                                                          |
@@ -86,7 +86,6 @@ What's still open (planned-but-not-shipped):
 
 | Module                          | Issue   | Notes                                                                                            |
 |---------------------------------|---------|--------------------------------------------------------------------------------------------------|
-| `fs/dir` runtime primitives     | #344    | `kai_prelude_dir_*` C bodies + prelude/typer wiring; `stdlib/fs/dir.kai` is a doc-only stub      |
 | `fs/file` extras (M2)           | #345 follow-up | `metadata` (`FileMetadata` record + `stat(2)`), `read_bytes`/`write_bytes` (`[Int]` byte arrays). M1 (`file_exists`, `file_delete`, `file_rename`) shipped via #345 |
 | `net/udp`, `net/dns`            | (none)  | Tier S3 — no compiler builtin, no runtime handler, no module file                                |
 | `net/http` server-side          | n/a     | belongs **inside** `manutara`, not stdlib (Layout §`net`)                                        |

@@ -480,11 +480,14 @@ them as `append_file` and `write_file_new` when needed.
 Kept as a shortlist for future `File` expansion — shape and
 timing decided when the first real use case pushes them:
 
-- Existence and metadata: `exists(path)`, `stat(path) :
-  Result[Metadata, String]`.
+- Existence and metadata: `exists(path)` *(shipped — #345)*, `stat(path) :
+  Result[Metadata, String]` *(deferred — needs `FileMetadata` record)*.
 - Append / create-only: `append_file`, `write_file_new`.
-- Directories: `list_dir`, `create_dir`, `remove_dir`.
-- Deletion and rename: `delete(path)`, `rename(from, to)`.
+- Directories: `list_dir`, `create_dir`, `remove_dir`, `walk`
+  *(shipped — #344; all four ride `File`; `walk` does not follow
+  symlinks in v1)*.
+- Deletion and rename: `delete(path)` *(shipped — #345)*,
+  `rename(from, to)` *(shipped — #345)*.
 - Binary IO: `read_bytes`, `write_bytes` (today everything is
   UTF-8 `String`).
 - Streaming: chunked read/write without loading the whole file.

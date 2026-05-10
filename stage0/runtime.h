@@ -46,6 +46,7 @@
 #ifndef KAI_RUNTIME_H
 #define KAI_RUNTIME_H
 
+#include <dirent.h>
 #include <math.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -54,6 +55,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -3555,6 +3557,232 @@ static KaiValue *kai_prelude_file_rename(KaiValue *from, KaiValue *to) {
     return r;
 }
 
+/* Issue #344: directory ops on top of the `File` effect. Each consumes
+ * its String args linearly (kai_decref before allocating the result),
+ * mirroring the file_exists/_delete/_rename convention. POSIX only
+ * (macOS + Linux). Return shapes:
+ *
+ *   dir_list_dir(path)    : [String]              — entries (no . / ..)
+ *   dir_create_dir(path)  : Result[String, Unit]  — Err message first
+ *   dir_remove_dir(path)  : Result[String, Unit]
+ *   dir_walk(path)        : [String]              — files (not dirs),
+ *                                                   depth-first; symlinks
+ *                                                   are NOT followed in v1
+ *
+ * dir_list_dir returns the empty list on read errors (matching how
+ * args() can be empty); use dir_create_dir / dir_remove_dir when an
+ * explicit Result is wanted. */
+
+static KaiValue *kai_prelude_dir_list_dir(KaiValue *path) {
+    KaiValue *acc = kai_nil();
+    if (path && path->tag == KAI_STR) {
+        char pbuf[4096];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        DIR *d = opendir(pbuf);
+        if (d) {
+            /* Buffer entries then prepend in reverse so the caller sees
+             * them in readdir order. readdir order is filesystem-defined
+             * but stable for a given mount, which keeps test output
+             * deterministic enough for fixtures. */
+            size_t cap = 16, n = 0;
+            char **names = (char **) malloc(cap * sizeof(char *));
+            if (!names) { closedir(d); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                const char *nm = e->d_name;
+                if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0'))) continue;
+                if (n + 1 > cap) {
+                    cap *= 2;
+                    names = (char **) realloc(names, cap * sizeof(char *));
+                    if (!names) { closedir(d); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                }
+                size_t len = strlen(nm);
+                char *copy = (char *) malloc(len + 1);
+                if (!copy) { closedir(d); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                memcpy(copy, nm, len + 1);
+                names[n++] = copy;
+            }
+            closedir(d);
+            for (size_t i = n; i > 0;) {
+                --i;
+                acc = kai_cons(kai_str(names[i]), acc);
+                free(names[i]);
+            }
+            free(names);
+        }
+    }
+    if (path) kai_decref(path);
+    return acc;
+}
+
+static KaiValue *kai_prelude_dir_create_dir(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("dir_create_dir: path is not a String");
+        r = kai_variant(0, "Err", 1, &msg);
+    } else {
+        char pbuf[4096];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        if (mkdir(pbuf, 0755) == 0) {
+            KaiValue *u = kai_unit();
+            r = kai_variant(0, "Ok", 1, &u);
+        } else {
+            KaiValue *msg = kai_str("dir_create_dir: mkdir failed");
+            r = kai_variant(0, "Err", 1, &msg);
+        }
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+static KaiValue *kai_prelude_dir_remove_dir(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("dir_remove_dir: path is not a String");
+        r = kai_variant(0, "Err", 1, &msg);
+    } else {
+        char pbuf[4096];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        if (rmdir(pbuf) == 0) {
+            KaiValue *u = kai_unit();
+            r = kai_variant(0, "Ok", 1, &u);
+        } else {
+            KaiValue *msg = kai_str("dir_remove_dir: rmdir failed");
+            r = kai_variant(0, "Err", 1, &msg);
+        }
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+/* Iterative depth-first walk. Push subdirectories onto an explicit stack
+ * so a deep tree doesn't blow the C stack. Symlinks are NOT followed
+ * (v1 contract): use lstat + S_ISLNK skip so a symlink loop can't
+ * trap the walker. Only regular files are emitted; directories are
+ * traversed but not reported. */
+static KaiValue *kai_prelude_dir_walk(KaiValue *root) {
+    KaiValue *acc = kai_nil();
+    if (!root || root->tag != KAI_STR) {
+        if (root) kai_decref(root);
+        return acc;
+    }
+
+    size_t cap = 16, top = 0;
+    char **stack = (char **) malloc(cap * sizeof(char *));
+    if (!stack) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+
+    char rbuf[4096];
+    size_t rlen = root->as.s.len < sizeof(rbuf) - 1 ? root->as.s.len : sizeof(rbuf) - 1;
+    memcpy(rbuf, root->as.s.bytes, rlen);
+    rbuf[rlen] = '\0';
+    {
+        char *copy = (char *) malloc(rlen + 1);
+        if (!copy) { free(stack); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        memcpy(copy, rbuf, rlen + 1);
+        stack[top++] = copy;
+    }
+
+    /* Collect files first, then prepend in reverse so the cons list
+     * reads in walk order. */
+    size_t fcap = 32, fn = 0;
+    char **files = (char **) malloc(fcap * sizeof(char *));
+    if (!files) { free(stack[0]); free(stack); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+
+    while (top > 0) {
+        char *dir_path = stack[--top];
+        DIR *d = opendir(dir_path);
+        if (!d) { free(dir_path); continue; }
+        /* Buffer child entries so we can push subdirs in reverse for
+         * deterministic depth-first order. */
+        size_t ccap = 16, cn = 0;
+        char **child_paths = (char **) malloc(ccap * sizeof(char *));
+        if (!child_paths) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        char *child_kinds = (char *) malloc(ccap); /* 'f' / 'd' / 's' (skip) */
+        if (!child_kinds) { free(child_paths); closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            const char *nm = e->d_name;
+            if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0'))) continue;
+            size_t dlen = strlen(dir_path);
+            size_t nlen = strlen(nm);
+            char *full = (char *) malloc(dlen + 1 + nlen + 1);
+            if (!full) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            memcpy(full, dir_path, dlen);
+            int needs_sep = (dlen > 0 && dir_path[dlen - 1] != '/');
+            size_t off = dlen;
+            if (needs_sep) { full[off++] = '/'; }
+            memcpy(full + off, nm, nlen + 1);
+            struct stat st;
+            char kind = 's';
+            if (lstat(full, &st) == 0) {
+                if (S_ISLNK(st.st_mode))      kind = 's'; /* skip symlinks */
+                else if (S_ISDIR(st.st_mode)) kind = 'd';
+                else if (S_ISREG(st.st_mode)) kind = 'f';
+                else                          kind = 's'; /* sockets, fifos, etc. */
+            }
+            if (cn + 1 > ccap) {
+                ccap *= 2;
+                child_paths = (char **) realloc(child_paths, ccap * sizeof(char *));
+                child_kinds = (char *)  realloc(child_kinds, ccap);
+                if (!child_paths || !child_kinds) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            }
+            child_paths[cn] = full;
+            child_kinds[cn] = kind;
+            cn++;
+        }
+        closedir(d);
+        free(dir_path);
+        /* Emit files in encountered order. */
+        for (size_t i = 0; i < cn; ++i) {
+            char k = child_kinds[i];
+            if (k == 'f') {
+                if (fn + 1 > fcap) {
+                    fcap *= 2;
+                    files = (char **) realloc(files, fcap * sizeof(char *));
+                    if (!files) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                }
+                files[fn++] = child_paths[i];
+            }
+        }
+        /* Push subdirs in reverse onto the stack so they pop in natural order. */
+        for (size_t i = cn; i > 0;) {
+            --i;
+            char k = child_kinds[i];
+            if (k == 'd') {
+                if (top + 1 > cap) {
+                    cap *= 2;
+                    stack = (char **) realloc(stack, cap * sizeof(char *));
+                    if (!stack) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                }
+                stack[top++] = child_paths[i];
+            } else if (k != 'f') {
+                /* skipped — free the path string */
+                free(child_paths[i]);
+            }
+        }
+        free(child_paths);
+        free(child_kinds);
+    }
+    free(stack);
+
+    /* Build the cons list in reverse so consumers see files in walk order. */
+    for (size_t i = fn; i > 0;) {
+        --i;
+        acc = kai_cons(kai_str(files[i]), acc);
+        free(files[i]);
+    }
+    free(files);
+
+    kai_decref(root);
+    return acc;
+}
+
 static KaiValue *kai_prelude_read_line(void) {
     size_t cap = 128, n = 0;
     char *buf = (char *) malloc(cap);
@@ -3799,6 +4027,10 @@ static KaiValue *_kai_prelude_write_file_thunk(KaiValue *s, KaiValue **a, int n)
 static KaiValue *_kai_prelude_file_exists_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_exists(a[0]); }
 static KaiValue *_kai_prelude_file_delete_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_delete(a[0]); }
 static KaiValue *_kai_prelude_file_rename_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_rename(a[0], a[1]); }
+static KaiValue *_kai_prelude_dir_list_dir_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_dir_list_dir(a[0]); }
+static KaiValue *_kai_prelude_dir_create_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_dir_create_dir(a[0]); }
+static KaiValue *_kai_prelude_dir_remove_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_dir_remove_dir(a[0]); }
+static KaiValue *_kai_prelude_dir_walk_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_dir_walk(a[0]); }
 static KaiValue *_kai_prelude_read_line_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) a; (void) n; return kai_prelude_read_line(); }
 static KaiValue *_kai_prelude_string_to_int_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_to_int(a[0]); }
 static KaiValue *_kai_prelude_string_to_real_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_to_real(a[0]); }
