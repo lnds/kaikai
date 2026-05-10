@@ -742,6 +742,185 @@ static void kai_leaksite_register_once(void) {
 #define KAI_RC_NOINLINE
 #endif
 
+/* ---------- KAI_PROFILE_RC — per-category wall breakdown (lane #426)
+ *
+ * Independent of KAI_TRACE_RC. Times the four hot RC functions with
+ * `clock_gettime(CLOCK_MONOTONIC)` and prints a per-category summary
+ * at exit. Used to attribute the 16× C wall on the RB-tree benchmark
+ * (docs/benchmarks/rb_tree_2026-05-09.md) to alloc / free / non-free
+ * RC traffic, so the team can scope Phase 4 (variant-field unboxing)
+ * vs drop-specialisation correctly.
+ *
+ * Build with `-DKAI_PROFILE_RC=1` to compile the wrappers in. Output
+ * gates on env var KAI_PROFILE_RC=1 at run time so a single binary
+ * can be timed with and without the report. Vanilla builds compile
+ * to empty hooks and add zero overhead.
+ *
+ * Categories:
+ *   - alloc    — time inside `kai_alloc` (the leaf calloc + bookkeep).
+ *   - free     — time inside `kai_free_value` (the actual free + the
+ *                cascading decrefs on contained children).
+ *   - decref   — time inside `kai_decref` for every call that reaches
+ *                the rc-- path (skips NULL and singleton early exits).
+ *                Includes time spent calling `kai_free_value`; subtract
+ *                the free total to get pure non-free RC traffic.
+ *   - incref   — time inside `kai_incref` for every call that reaches
+ *                the rc++ path (skips NULL and singleton early exits).
+ *
+ * clock_gettime(CLOCK_MONOTONIC) costs ~30 ns per call on macOS — at
+ * ~25 M decrefs the instrumentation inflates the wall by ~1.5 s on
+ * the RB-tree benchmark. Per-category PROPORTIONS remain robust;
+ * absolute milliseconds under -DKAI_PROFILE_RC are not directly
+ * comparable to the un-instrumented wall. The exit report prints the
+ * instrumented wall alongside the categories so the gap is visible.
+ *
+ * Match dispatch is NOT a separate category — pattern test and
+ * field-extract are emitted inline by the codegen (see
+ * `_scr->as.var.variant_tag` reads in compiler-emitted C), so there
+ * is no central function to wrap. It folds into the un-attributed
+ * "other" bucket alongside everything else (calls, arithmetic,
+ * stack management).
+ */
+#ifdef KAI_PROFILE_RC
+#include <time.h>
+
+static int64_t kai_prof_alloc_ns   = 0;
+static int64_t kai_prof_free_ns    = 0;
+static int64_t kai_prof_incref_ns  = 0;
+static int64_t kai_prof_decref_ns  = 0;
+static int64_t kai_prof_alloc_n    = 0;
+static int64_t kai_prof_free_n     = 0;
+static int64_t kai_prof_incref_n   = 0;
+static int64_t kai_prof_decref_n   = 0;
+static int64_t kai_prof_decref_to_zero_n = 0;
+static struct timespec kai_prof_t0;
+static int kai_prof_init_done = 0;
+static int kai_prof_enabled = 0;
+
+/* Exclusive-time stack. The four hot RC functions call each other
+ * (kai_decref → kai_free_value → kai_decref → ...). Naive timing
+ * double-counts nested time. To get exclusive (self-only) time per
+ * category, every active call records its start_ns and accumulates
+ * the gross duration of any child instrumented call into a `child_ns`
+ * slot; on exit, exclusive = (now - start) - child_ns is added to the
+ * category counter, and gross time is bubbled to the parent's slot.
+ *
+ * Stack depth 32 is overkill — the deepest realistic chain is decref
+ * → free_value → decref → free_value → ... bounded by tree depth (~30
+ * for 1M nodes). Static fixed array; saturates on overflow (very
+ * defensively — if it ever fires we silently mis-attribute, no crash). */
+#define KAI_PROF_STACK_CAP 64
+typedef struct {
+    int64_t start_ns;
+    int64_t child_ns;
+} KaiProfFrame;
+static KaiProfFrame kai_prof_stack[KAI_PROF_STACK_CAP];
+static int kai_prof_sp = 0;
+
+static inline int64_t kai_prof_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
+}
+
+static inline int kai_prof_push(void) {
+    if (kai_prof_sp >= KAI_PROF_STACK_CAP) return -1;  /* saturate */
+    int idx = kai_prof_sp++;
+    kai_prof_stack[idx].start_ns = kai_prof_now_ns();
+    kai_prof_stack[idx].child_ns = 0;
+    return idx;
+}
+
+static inline int64_t kai_prof_pop_exclusive(int idx) {
+    if (idx < 0) return 0;
+    int64_t end = kai_prof_now_ns();
+    int64_t gross = end - kai_prof_stack[idx].start_ns;
+    int64_t self  = gross - kai_prof_stack[idx].child_ns;
+    if (self < 0) self = 0;  /* clock noise can produce tiny negatives */
+    kai_prof_sp = idx;  /* unwind any deeper saturated frames defensively */
+    /* Bubble gross time to parent so its exclusive subtraction works. */
+    if (idx > 0) kai_prof_stack[idx - 1].child_ns += gross;
+    return self;
+}
+
+static void kai_prof_report(void) {
+    if (!getenv("KAI_PROFILE_RC")) return;
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    int64_t wall_ns =
+        ((int64_t) t1.tv_sec - (int64_t) kai_prof_t0.tv_sec) * 1000000000LL
+      + ((int64_t) t1.tv_nsec - (int64_t) kai_prof_t0.tv_nsec);
+    int64_t alloc_ns  = kai_prof_alloc_ns;
+    int64_t free_ns   = kai_prof_free_ns;
+    int64_t incref_ns = kai_prof_incref_ns;
+    int64_t decref_ns = kai_prof_decref_ns;
+    /* Categories are exclusive (self-only) — no overlap. */
+    int64_t rc_traffic_ns = incref_ns + decref_ns;
+    int64_t accounted_ns  = alloc_ns + free_ns + rc_traffic_ns;
+    int64_t other_ns      = wall_ns - accounted_ns;
+    fprintf(stderr,
+        "[KAI_PROFILE_RC] wall_ms=%lld alloc_ms=%lld free_ms=%lld "
+        "rc_traffic_ms=%lld other_ms=%lld\n",
+        (long long) (wall_ns / 1000000),
+        (long long) (alloc_ns / 1000000),
+        (long long) (free_ns  / 1000000),
+        (long long) (rc_traffic_ns / 1000000),
+        (long long) (other_ns / 1000000));
+    fprintf(stderr,
+        "[KAI_PROFILE_RC] decref_ms=%lld (self) incref_ms=%lld (self)\n",
+        (long long) (decref_ns / 1000000),
+        (long long) (incref_ns / 1000000));
+    fprintf(stderr,
+        "[KAI_PROFILE_RC] calls alloc=%lld free=%lld incref=%lld "
+        "decref=%lld decref_to_zero=%lld\n",
+        (long long) kai_prof_alloc_n,
+        (long long) kai_prof_free_n,
+        (long long) kai_prof_incref_n,
+        (long long) kai_prof_decref_n,
+        (long long) kai_prof_decref_to_zero_n);
+    if (wall_ns > 0) {
+        fprintf(stderr,
+            "[KAI_PROFILE_RC] share alloc=%.1f%% free=%.1f%% "
+            "rc_traffic=%.1f%% other=%.1f%%\n",
+            100.0 * alloc_ns / wall_ns,
+            100.0 * free_ns / wall_ns,
+            100.0 * rc_traffic_ns / wall_ns,
+            100.0 * other_ns / wall_ns);
+    }
+}
+
+static void kai_prof_init(void) {
+    if (kai_prof_init_done) return;
+    kai_prof_init_done = 1;
+    const char *e = getenv("KAI_PROFILE_RC");
+    kai_prof_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    if (!kai_prof_enabled) return;
+    clock_gettime(CLOCK_MONOTONIC, &kai_prof_t0);
+    atexit(kai_prof_report);
+}
+
+#define KAI_PROF_ENTER()           \
+    int _kai_prof_idx = -1;        \
+    do {                           \
+        if (!kai_prof_init_done) kai_prof_init(); \
+        if (kai_prof_enabled) _kai_prof_idx = kai_prof_push(); \
+    } while (0)
+
+#define KAI_PROF_EXIT(category)                                              \
+    do {                                                                     \
+        if (kai_prof_enabled) {                                              \
+            kai_prof_##category##_ns += kai_prof_pop_exclusive(_kai_prof_idx); \
+            kai_prof_##category##_n++;                                       \
+        }                                                                    \
+    } while (0)
+
+#else /* !KAI_PROFILE_RC */
+
+#define KAI_PROF_ENTER()        ((void) 0)
+#define KAI_PROF_EXIT(category) ((void) 0)
+
+#endif /* KAI_PROFILE_RC */
+
 /* ---------- variant_name histogram (issue #300, lane #297/#298 validation)
  *
  * Independent of KAI_TRACE_RC. Counts variant alloc/free traffic keyed on
@@ -860,6 +1039,7 @@ static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
 #else
 static KaiValue *kai_alloc(KaiTag tag) {
 #endif
+    KAI_PROF_ENTER();
     KaiValue *v = (KaiValue *) calloc(1, sizeof(KaiValue));
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     v->rc = 1;
@@ -880,6 +1060,7 @@ static KaiValue *kai_alloc(KaiTag tag) {
     kai_leaksite_record_alloc(kai_current_scope_fn, (int32_t) tag);
     kai_leaksite_register_once();
 #endif
+    KAI_PROF_EXIT(alloc);
     return v;
 }
 
@@ -918,10 +1099,18 @@ static KaiValue kai_singleton_false = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = 
 static KaiValue kai_singleton_nil   = { .rc = INT32_MAX, .tag = KAI_NIL,  .as = { .b = 0 } };
 
 static KaiValue *kai_incref(KaiValue *v) {
-    if (v && v->rc != INT32_MAX) v->rc++;
+    if (!v || v->rc == INT32_MAX) {
 #ifdef KAI_TRACE_RC
-    if (v) kai_rc_history_log(v, /* op=incref */ 1, v->tag);
+        if (v) kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
+        return v;
+    }
+    KAI_PROF_ENTER();
+    v->rc++;
+#ifdef KAI_TRACE_RC
+    kai_rc_history_log(v, /* op=incref */ 1, v->tag);
+#endif
+    KAI_PROF_EXIT(incref);
     return v;
 }
 static void       kai_decref(KaiValue *v);
@@ -1420,6 +1609,7 @@ static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
 }
 
 static void kai_free_value(KaiValue *v) {
+    KAI_PROF_ENTER();
     switch ((KaiTag) v->tag) {
         case KAI_STR:
             free(v->as.s.bytes);
@@ -1550,15 +1740,23 @@ static void kai_free_value(KaiValue *v) {
     /* trace */
     kai_rc_free_total++;
     kai_rc_live_now--;
+    KAI_PROF_EXIT(free);
 }
 
 static void kai_decref(KaiValue *v) {
     if (!v) return;
     if (v->rc == INT32_MAX) return;   /* m5 #7 — singleton, saturated */
+    KAI_PROF_ENTER();
 #ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
-    if (--v->rc == 0) kai_free_value(v);
+    if (--v->rc == 0) {
+#ifdef KAI_PROFILE_RC
+        kai_prof_decref_to_zero_n++;
+#endif
+        kai_free_value(v);
+    }
+    KAI_PROF_EXIT(decref);
 }
 
 /* m5 #4 — Perceus dup/drop wrappers callable as KaiValue-returning fns.
