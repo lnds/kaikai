@@ -84,6 +84,22 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.50.0 (2026-05-09)
+
+### Added
+
+- **kai-pkg**: validate package name in kai init (closes #419)
+- **stdlib**: export fs.file.{exists,delete,rename} wrappers (closes #423)
+
+### Fixed
+
+- **parser**: terminate arrow-lambda body at pipe operators (closes #422)
+- **kai-pkg**: propagate kai.toml parse errors as non-zero exits (closes #420)
+- **kai-pkg**: cache by SHA instead of ref slug (closes #421)
+- **typer**: propagate declared return type into multi-clause case arms (closes #430)
+- **kai-pkg**: make kai add atomic on git failure (closes #418)
+- **compiler**: dedup imports against prelude modules (closes #425)
+
 ## v0.49.0 (2026-05-09)
 
 ### Added
