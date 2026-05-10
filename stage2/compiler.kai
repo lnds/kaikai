@@ -30908,7 +30908,15 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
 fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
                line: Int, col: Int) : Inferred {
   let rs_ = synth(st, scr)
-  let ra = synth_arms(rs_.st, arms, rs_.ty, expected, line, col)
+  # issue #430: walk arms via `check_arms` so the expected type
+  # propagates into nested EMatch / EIf / EBlock-tailed-by-match
+  # arm bodies — the shape produced by the multi-clause fn-body
+  # desugar (#415) for fns with N>=2 parameters. With `synth_arms`
+  # the nested match was synthesised against a fresh body-ty var,
+  # which re-exposed the asymmetry #379 fixed for the top-level
+  # arm. The 1-arg multi-clause shape is already covered because
+  # `check_body_against_ret` reaches the outer EMatch directly.
+  let ra = check_arms(rs_.st, arms, rs_.ty, expected, line, col)
   let ty = apply_ty(ra.st.sub, expected)
   let scr_final = apply_ty(ra.st.sub, rs_.ty)
   let st_post = check_exhaustive(ra.st, ra.arms, scr_final, line, col)
@@ -30916,6 +30924,41 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
   let arms_codegen  = rewrite_record_alias_arms(arms_narrowed, st_post.recs)
   let root = with_ty(mk_expr(EMatch(rs_.expr, arms_codegen), line, col), ty)
   mk_inferred(st_post, ty, root)
+}
+
+# issue #430: bidirectional walker over match arms. Mirrors
+# `synth_arms` but routes each arm body through
+# `check_body_against_ret`, which dispatches EMatch / EIf /
+# EBlock-tailed-by-match to their check-mode helpers. The trailing
+# unify against `expected` is preserved so non-match leaf bodies
+# behave exactly as in synth_arms (synth + post-hoc unify against
+# `expected`). For the propagating shapes the unify collapses to
+# a no-op since `check_match` / `check_if` already pinned the body
+# type to `expected`.
+fn check_arms(st: InferState, arms: [Arm], scrut_ty: Ty, expected: Ty,
+              line: Int, col: Int) : InferredArms {
+  match arms {
+    [] -> InferredArms { st: st, arms: [] }
+    [a, ...rest] -> match a {
+      Arm(pat, guard, body) -> {
+        let outer = st
+        let s_p = check_pattern(st, pat, scrut_ty)
+        let guard_res = match guard {
+          None -> InferredOptExpr { st: s_p, expr: None }
+          Some(gx) -> {
+            let rg = synth(s_p, gx)
+            let s_g = st_unify(rg.st, rg.ty, TyBool, "match guard", gx.line, gx.col)
+            InferredOptExpr { st: s_g, expr: Some(rg.expr) }
+          }
+        }
+        let rb = check_body_against_ret(guard_res.st, body, expected, "match arm", body.line, body.col)
+        let s_b = st_unify(rb.st, expected, rb.ty, "match arm", body.line, body.col)
+        let s_scoped = st_restore_entries(outer, s_b)
+        let rr = check_arms(s_scoped, rest, scrut_ty, expected, line, col)
+        InferredArms { st: rr.st, arms: [Arm(pat, guard_res.expr, rb.expr), ...rr.arms] }
+      }
+    }
+  }
 }
 
 # issue #382: bidirectional check variant of `synth_if`, parallel to
