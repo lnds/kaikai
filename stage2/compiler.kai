@@ -9936,11 +9936,16 @@ fn chk_expr(e: Env, x: Expr) : Env {
     EVar(name) -> {
       if env_has(e, name) { e }
       else {
-        let hint = match closest_name(name, env_all_names(e)) {
-          Some(sug) -> " (did you mean `#{sug}`?)"
-          None      -> ""
+        # m11 v1 Template 3 — canonical Rust/Elm-style diagnostic.
+        # Error line stays terse; the did-you-mean suggestion moves
+        # to a separate `help:` line and is suppressed when no name
+        # is within Levenshtein distance 3 (closest_name's threshold).
+        diag_error(e.file, x.line, x.col, "cannot find `#{name}` in this scope")
+        match closest_name(name, env_all_names(e)) {
+          Some(sug) -> diag_help("a similar name exists in scope: `#{sug}` (did you mean this?)")
+          None      -> ()
         }
-        chk_error(e, x.line, x.col, "undefined name `#{name}`#{hint}")
+        env_mark_err(e)
       }
     }
     ECall(f, xs) -> {
@@ -27062,6 +27067,106 @@ fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : I
   }
 }
 
+# m11 v1 Template 1 — best-effort callee-name + argument-index
+# augmentation for `type mismatch in function call`. Called after the
+# generic `st_unify` has already emitted its error+notes; pinpoints
+# which argument failed and surfaces the callee's signature.
+#
+# The callee may not be a bare name (it could be a higher-order
+# expression or a method call), so name extraction is optional and
+# we fall back to the generic message when nothing useful can be
+# said.
+fn callee_display_name(callee: Expr) : Option[String] {
+  match callee.kind {
+    EVar(n)        -> Some(n)
+    EModCall(m, n) -> Some(string_concat(string_concat(m, "."), n))
+    EField(_, f)   -> Some(f)
+    _              -> None
+  }
+}
+
+# Walk `callee_ty` and `arg_tys` in lockstep; return the 1-indexed
+# position of the first argument whose type fails to unify against
+# the corresponding parameter, or None if the mismatch is elsewhere
+# (arity differs, or it's a return-type / row mismatch).
+fn first_failing_arg(env: TyEnv, sub: Subst, callee_ty: Ty,
+                       arg_tys: [Ty]) : Option[Int] {
+  match callee_ty {
+    TyFnT(params, _ret, _row) -> {
+      if list_length(params) == list_length(arg_tys) {
+        first_failing_arg_loop(env, sub, params, arg_tys, 1)
+      } else { None }
+    }
+    _ -> None
+  }
+}
+
+fn first_failing_arg_loop(env: TyEnv, sub: Subst, params: [Ty],
+                            args: [Ty], idx: Int) : Option[Int] {
+  match params {
+    [] -> None
+    [p, ...prest] -> match args {
+      [] -> None
+      [a, ...arest] -> {
+        let p1 = apply_ty(sub, p)
+        let a1 = apply_ty(sub, a)
+        match unify_env(env, p1, a1, sub) {
+          Some(_) -> first_failing_arg_loop(env, sub, prest, arest, idx + 1)
+          None    -> if union_upcast_ok(env, p1, a1) {
+            first_failing_arg_loop(env, sub, prest, arest, idx + 1)
+          } else { Some(idx) }
+        }
+      }
+    }
+  }
+}
+
+# Emit Template 1 trailing notes — should be called when the generic
+# unify has already errored. Suppresses if we cannot derive useful
+# context (no callee name AND no resolvable signature).
+fn emit_call_arg_notes(env: TyEnv, sub: Subst, callee: Expr,
+                         callee_ty: Ty, arg_tys: [Ty]) : Unit / Console {
+  let resolved = apply_ty(sub, callee_ty)
+  let name_opt = callee_display_name(callee)
+  match first_failing_arg(env, sub, resolved, arg_tys) {
+    Some(idx) -> {
+      match name_opt {
+        Some(nm) -> diag_note("in argument #{int_to_string(idx)} of `#{nm}`")
+        None     -> diag_note("in argument #{int_to_string(idx)}")
+      }
+      match name_opt {
+        Some(nm) -> match resolved {
+          TyFnT(_, _, _) -> diag_note("`#{nm}` expects: #{ty_to_string(resolved)}")
+          _              -> ()
+        }
+        None -> ()
+      }
+    }
+    None -> match name_opt {
+      Some(nm) -> match resolved {
+        TyFnT(_, _, _) -> diag_note("`#{nm}` expects: #{ty_to_string(resolved)}")
+        _              -> ()
+      }
+      None -> ()
+    }
+  }
+}
+
+# m11 v1 Template 1 — wrapper around `st_unify` for call sites that
+# want richer diagnostics. Delegates to `st_unify` (preserving every
+# existing fixture's substring) and, on failure, appends the
+# argument-position + callee signature notes.
+fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
+                   arg_tys: [Ty], expected_fn_ty: Ty,
+                   line: Int, col: Int) : InferState {
+  let pre_errs = st.errs
+  let st1 = st_unify(st, callee_ty, expected_fn_ty, "function call", line, col)
+  if st1.errs > pre_errs {
+    emit_call_arg_notes(st1.env, st1.sub, callee, callee_ty, arg_tys)
+    st1
+  } else { st1 }
+}
+
 # Issue #199: when either side of a failed unification is a union
 # (or a component of one), augment the generic `expected:` / `found:`
 # notes with structural context — the union's component list and the
@@ -28193,7 +28298,7 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
             let st_fresh = st_set_sub(rv.st, fr.subst)
             let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
             let expected = TyFnT(ra.tys, rv.ty, expected_row)
-            let st2 = st_unify(st_fresh, rc.ty, expected, "function call", line, col)
+            let st2 = st_unify_call(st_fresh, callee, rc.ty, ra.tys, expected, line, col)
             let ty = apply_ty(st2.sub, rv.ty)
             let root = with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), ty)
             mk_inferred(st2, ty, root)
@@ -28250,7 +28355,7 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                 let st_fresh = st_set_sub(rv.st, fr.subst)
                 let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
                 let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
-                let st2 = st_unify(st_fresh, pick.inst_ty, expected, "function call", line, col)
+                let st2 = st_unify_call(st_fresh, callee, pick.inst_ty, all_arg_tys, expected, line, col)
                 let ty = apply_ty(st2.sub, rv.ty)
                 # Issue #235: emit `EModCall(<mod>, nm)` so codegen
                 # mints `kai_<mod>__<nm>` directly.
@@ -28759,9 +28864,10 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
               let st_fresh = st_set_sub(rv.st, fr.subst)
               let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
               let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
-              let st2 = st_unify(st_fresh, inst_ty, expected, "function call", line, col)
+              let synth_callee = mk_expr(pick.callee_kind, line, col)
+              let st2 = st_unify_call(st_fresh, synth_callee, inst_ty, all_arg_tys, expected, line, col)
               let ty = apply_ty(st2.sub, rv.ty)
-              let callee_node = with_ty(mk_expr(pick.callee_kind, line, col), inst_ty)
+              let callee_node = with_ty(synth_callee, inst_ty)
               let root = with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty)
               mk_inferred(st2, ty, root)
             }
@@ -29802,7 +29908,8 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
           # `examples/sugars/map_pipe_type_mismatch.err.expected`)
           # match identically — the surface-level lane should not
           # change unrelated diagnostic strings.
-          let st2 = st_unify(st_fresh, rc.ty, expected, "function call", line, col)
+          let pipe_callee = mk_expr(callee_kind, line, col)
+          let st2 = st_unify_call(st_fresh, pipe_callee, rc.ty, [rl.ty, rf.ty], expected, line, col)
           let ty = apply_ty(st2.sub, rv.ty)
           let root = with_ty(mk_expr(ECall(rc.expr, [rl.expr, rf.expr]), line, col), ty)
           mk_inferred(st2, ty, root)
@@ -31545,6 +31652,53 @@ fn find_missing_variants(needed: [String], arms: [Arm], acc: [String]) : [String
   }
 }
 
+# Inverse of find_missing_variants — used by m11 diagnostics to print
+# the "covered:" note alongside "missing:". Walking the needed list
+# again is cheaper than caching given the small variant counts.
+fn find_covered_variants(needed: [String], arms: [Arm], acc: [String]) : [String] {
+  match needed {
+    [] -> list_reverse(acc)
+    [v, ...rest] -> {
+      if arms_cover_variant(arms, v) {
+        find_covered_variants(rest, arms, [v, ...acc])
+      } else {
+        find_covered_variants(rest, arms, acc)
+      }
+    }
+  }
+}
+
+# m11 v1 Template 2 — common note + help block for non-exhaustive
+# match diagnostics. The header diag_error already carries the type
+# name and missing list (kept verbatim so existing fixtures still
+# match); these notes add per-missing-variant lines, the covered list,
+# and the canonical Rust/Elm-style help.
+fn emit_nonexhaustive_notes(missing: [String], covered: [String]) : Unit / Console {
+  emit_missing_notes(missing)
+  match covered {
+    [] -> ()
+    _  -> diag_note("covered: #{join_with(covered, ", ")}")
+  }
+  emit_nonexhaustive_help(missing)
+}
+
+fn emit_missing_notes(ms: [String]) : Unit / Console {
+  match ms {
+    [] -> ()
+    [m, ...rest] -> {
+      diag_note("missing variant: `#{m}`")
+      emit_missing_notes(rest)
+    }
+  }
+}
+
+fn emit_nonexhaustive_help(missing: [String]) : Unit / Console {
+  match missing {
+    []      -> diag_help("add a wildcard `_ -> ...` arm")
+    [m, ..._] -> diag_help("add an arm `#{m} -> ...` or a wildcard `_ -> ...`")
+  }
+}
+
 fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState {
   if has_catch_all(arms) { st }
   else {
@@ -31589,7 +31743,8 @@ fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int
                 _  -> {
                   diag_error(st.file, line, col,
                     "non-exhaustive match on #{tycon}: missing #{join_with(missing, ", ")}")
-                  diag_help("add an arm for each missing variant, or a wildcard `_` arm")
+                  let covered = find_covered_variants(needed, arms, [])
+                  emit_nonexhaustive_notes(missing, covered)
                   st_bump_err(st)
                 }
               }
@@ -31641,6 +31796,12 @@ fn check_union_component(st: InferState, arms: [Arm], comp: Ty,
               _  -> {
                 diag_error(st.file, line, col,
                   "non-exhaustive match: missing #{join_with(missing, ", ")} (component of #{tycon})")
+                let covered = find_covered_variants(needed, arms, [])
+                emit_missing_notes(missing)
+                match covered {
+                  [] -> ()
+                  _  -> diag_note("covered: #{join_with(covered, ", ")}")
+                }
                 diag_help("add an arm for each missing variant, a `name : #{tycon}` narrowing arm covering the whole component, or a wildcard `_` arm")
                 st_bump_err(st)
               }
@@ -31728,7 +31889,8 @@ fn check_one_union_comp(st: InferState, arms: [Arm], parent: String, comp: Strin
         else {
           diag_error(st.file, line, col,
             "non-exhaustive match on #{parent}: missing #{comp}")
-          diag_help("add an arm for each missing variant, or a wildcard `_` arm")
+          diag_note("missing variant: `#{comp}`")
+          diag_help("add an arm `#{comp} -> ...` or a wildcard `_ -> ...`")
           st_bump_err(st)
         }
       }
@@ -31739,6 +31901,12 @@ fn check_one_union_comp(st: InferState, arms: [Arm], parent: String, comp: Strin
           _  -> {
             diag_error(st.file, line, col,
               "non-exhaustive match: missing #{join_with(missing, ", ")} (component of #{comp})")
+            let covered = find_covered_variants(sub_variants, arms, [])
+            emit_missing_notes(missing)
+            match covered {
+              [] -> ()
+              _  -> diag_note("covered: #{join_with(covered, ", ")}")
+            }
             diag_help("add an arm for each missing variant, a `name : #{comp}` narrowing arm covering the whole component, or a wildcard `_` arm")
             st_bump_err(st)
           }
