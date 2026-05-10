@@ -84,6 +84,18 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.51.0 (2026-05-10)
+
+### Added
+
+- **typer**: m11 v1 diagnostic templates — type mismatch, non-exhaustive, unbound name (closes #445)
+- **check**: shrinking — per-type halving + structural reduction (closes #438)
+- **bench**: median + MAD + configurable iterations + warmup (closes #437)
+
+### Fixed
+
+- **typer**: count variant arms toward exhaustiveness on union match (closes #436)
+
 ## v0.50.0 (2026-05-09)
 
 ### Added
