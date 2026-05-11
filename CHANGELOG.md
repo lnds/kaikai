@@ -84,6 +84,49 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.52.0 (2026-05-11)
+
+### Added
+
+- **driver**: bin/kai build accepts --holes / --holes-json flags
+- **typer**: collectable structured Diagnostics for m11 T1-T5
+- **stdlib**: fs.file.read_bytes / write_bytes return / accept Array[Byte]
+- **compiler**: register file_read_bytes / file_write_bytes signatures with Array[Byte]
+- **runtime**: file_read_bytes / file_write_bytes use Array[Byte] (boundary fix for #488)
+- **typer**: extend def_at to resolve local bindings (issue #484)
+- **compiler**: register file_read_bytes / file_write_bytes (refs #482)
+- **runtime**: file_read_bytes / file_write_bytes primitives (refs #482)
+- **typer**: m11 v1.x diagnostic templates 4 (wrong arity) + 5 (missing effect)
+- **compiler**: extend #derive(BinSerialize) for collections/Char
+- **stdlib**: BinSerialize combinators for List/Option/Char
+- **compiler**: derive_binserialize_impl for records and sums (closes #459)
+- **stdlib**: add BinSerialize protocol for cursor-based binary serialization
+- **stdlib,compiler**: expose u8 prelude names + Byte alias
+- **typer,runtime**: u8 nominal primitive — typer + runtime scaffolding
+- **stdlib**: add option.first_some for N-way pure Option fallback
+- **typer**: library mode — typed AST + span queries (closes #454)
+- **runtime**: prelude_read_bytes for stdin byte-oriented I/O (closes #453)
+- **stdlib**: fs.dir.{list_dir,create_dir,remove_dir,walk} runtime + public surface (closes #344)
+
+### Fixed
+
+- **typer**: distinguish Actor[T1] vs Actor[T2] in effect-row dispatch
+- **typer**: resolve module-qualified record literal types
+- **parser**: accept qualified path before record literal opening brace
+- **stdlib,compiler,runtime**: BinCursor + LLVM byte ops for tier1
+- **runtime**: update int_to_u8 error strings to int_to_byte after rename
+- **stdlib,compiler**: retype BinSerialize for nominal Byte
+- **demos**: rename forth.show to forth.render to avoid Show[List[T]] shadow
+- **demos**: prefer n-tuple sugar over explicit Pair record
+- **demos**: mini_ledger uses official record-spread syntax
+
+### Changed
+
+- **stdlib,compiler**: BinSerialize uses Array[Byte] for O(1) buffer reads
+- **typer,runtime,stdlib**: rename u8 primitive to Byte; add bidirectional list literal check
+- **compiler**: convert if-elseif Char/Int cascades to exhaustive match (audit proposal 2)
+- **compiler**: collapse test/bench/check Bool triple to BuildMode enum (audit proposal 5)
+
 ## v0.51.0 (2026-05-10)
 
 ### Added
