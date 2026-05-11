@@ -60,10 +60,13 @@ Field shapes (stable for v1):
   carries no inferred type (some intermediate nodes synthesised by
   desugar passes).
 - `def.decl_kind` ∈ `DFn`, `DType`, `DConst`, `DEffect`,
-  `DProtocol`, `DAxiom`, `DUnit`. `DConst` does not appear today —
-  consts are lowered to nullary `DFn` before inference; the field
-  reports the post-lowering shape, which is what an LSP consumer
-  actually sees.
+  `DProtocol`, `DAxiom`, `DUnit` (top-level decls) plus `Param`,
+  `PatBind`, `HReturn` for local binding sites introduced by
+  function/lambda parameters, pattern matches, and the named
+  binder of a `handle ... return` clause. `DConst` does not
+  appear today — consts are lowered to nullary `DFn` before
+  inference; the field reports the post-lowering shape, which is
+  what an LSP consumer actually sees.
 
 ## In-process API
 
@@ -84,9 +87,13 @@ byte-offset machinery.
 ## v1 limitations
 
 - `def_at` resolves top-level fn / type / const / effect /
-  protocol / axiom / unit names. Locals (params, `let`-bound names)
-  return `null` today — the walk doesn't track scope. A v2 lane
-  threads the resolver's scope tracker through `find_var_at_*`.
+  protocol / axiom / unit names, plus local bindings inside the
+  same module (`let` binds, function and lambda parameters,
+  pattern binds — `Some(x)`, `[h, ...t]`, `T { f: y }`, `(a, b)`,
+  `as`-aliases, narrow binds, named holes — and closure captures
+  resolving to outer scopes). Variant constructors in expression
+  position (`MkPair(...)` as a builder) and cross-module
+  declarations still return `null`; both are LSP v2 work (#447).
 - The `def` answer's `file` field always reports the queried file's
   path, not the import origin. Cross-module *resolution* works
   (an `import helper_mod` followed by a `triple()` call resolves
