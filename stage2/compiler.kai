@@ -45758,30 +45758,43 @@ fn derive_impls_loop(names: [String], tname: String, body: TypeBody,
                       line: Int, col: Int, acc: [Decl]) : [Decl] {
   match names {
     [] -> list_reverse(acc)
-    [pname, ...rest] -> match derive_impl_for_protocol(pname, tname, body, line, col) {
-      Some(d) -> derive_impls_loop(rest, tname, body, line, col, [d, ...acc])
-      None    -> derive_impls_loop(rest, tname, body, line, col, acc)
+    [pname, ...rest] -> {
+      let ds = derive_impl_for_protocol(pname, tname, body, line, col)
+      derive_impls_loop(rest, tname, body, line, col,
+                        list_append(list_reverse(ds), acc))
     }
   }
 }
 
-# Synthesise an `impl P for T` for one of the supported derive
-# protocols. v1 supports `Show` and `Eq` on records; `Show` on sum
-# types. Other (P, body) combinations return None and surface as
-# "no impl" at typer time.
+# Synthesise zero or more decls for `#derive(P) type T = ...`. v1
+# supports `Show`, `Eq`, `Hash`, `Ord`, and `BinSerialize` on records
+# and sum types. The returned list is empty when the (P, body)
+# combination is unsupported (the resolver / typer surfaces that as
+# "no impl"). Most protocols return a single `DImpl`; `BinSerialize`
+# additionally returns a top-level `<tname>_from_bytes` shim because
+# v1 single-dispatch cannot route a return-type-only call (issue
+# #459 §"Two design routes" + the `Serialize` prologue in
+# `stdlib/protocols.kai`).
 fn derive_impl_for_protocol(pname: String, tname: String, body: TypeBody,
-                             line: Int, col: Int) : Option[Decl] {
+                             line: Int, col: Int) : [Decl] {
   if pname == "Show" {
-    derive_show_impl(tname, body, line, col)
+    option_to_list(derive_show_impl(tname, body, line, col))
   } else if pname == "Eq" {
-    derive_eq_impl(tname, body, line, col)
+    option_to_list(derive_eq_impl(tname, body, line, col))
   } else if pname == "Hash" {
-    derive_hash_impl(tname, body, line, col)
+    option_to_list(derive_hash_impl(tname, body, line, col))
   } else if pname == "Ord" {
-    derive_ord_impl(tname, body, line, col)
+    option_to_list(derive_ord_impl(tname, body, line, col))
+  } else if pname == "BinSerialize" {
+    derive_binserialize_impl(tname, body, line, col)
   } else {
-    None
+    []
   }
+}
+
+fn option_to_list(o: Option[Decl]) : [Decl] = match o {
+  None    -> []
+  Some(d) -> [d]
 }
 
 fn derive_show_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
@@ -46337,6 +46350,583 @@ fn make_derived_impl(pname: String, tname: String, opname: String,
   DImpl(pname, [], mk_ty(TyName(tname, []), line, col), [method], line, col)
 }
 
+# issue #459: `#derive(BinSerialize)` for records and sum types.
+# Synthesises a two-method `impl BinSerialize for T` (`to_bytes`
+# dispatches on Self via the first arg, `from_bytes` cannot — see
+# the wrapper rationale below) plus a top-level `<lower(tname)>_from_bytes`
+# shim that gives the user a non-overloaded entry point. Field /
+# payload decoding routes to `__pimpl_BinSerialize_<TypeHead>_from_bytes`
+# directly because v1 single-dispatch picks the impl from the first
+# argument's type, and `from_bytes(buf, pos)` would always pick the
+# `[Byte]` (`List`) impl — which does not exist and never should
+# (the buffer and the encoded type are both lists).
+fn derive_binserialize_impl(tname: String, body: TypeBody,
+                              line: Int, col: Int) : [Decl] {
+  match body {
+    TBRecord(fields) -> {
+      let to_b = derive_binser_record_to_bytes(fields, line, col)
+      let from_b = derive_binser_record_from_bytes(tname, fields, line, col)
+      let impl_d = make_binser_impl(tname, to_b, from_b, line, col)
+      let shim_d = derive_binser_shim(tname, line, col)
+      [impl_d, shim_d]
+    }
+    TBSum(variants) -> {
+      let to_b = derive_binser_sum_to_bytes(variants, line, col)
+      let from_b = derive_binser_sum_from_bytes(tname, variants, line, col)
+      let impl_d = make_binser_impl(tname, to_b, from_b, line, col)
+      let shim_d = derive_binser_shim(tname, line, col)
+      [impl_d, shim_d]
+    }
+    _ -> []
+  }
+}
+
+# `impl BinSerialize for T { fn to_bytes ... fn from_bytes ... }`
+#
+# Note on `[Byte]` vs `[Int]`: the surface protocol uses `[Byte]`,
+# but the synth runs AFTER `expand_ta_decls` (which rewrites the
+# stdlib protocol's `Byte` to `Int` in every TypeExpr) — so the
+# already-registered `__pimpl_BinSerialize_Int_from_bytes` has an
+# `[Int]` parameter. To match, the synth emits `Int` directly
+# rather than `Byte`. The user-facing wrapper (`<tname>_from_bytes`)
+# does the same. Once Lane 4 introduces a real `u8`, this becomes
+# `TyName("u8", [])` and the alias indirection drops out.
+fn make_binser_impl(tname: String, to_b: Expr, from_b: Expr,
+                     line: Int, col: Int) : Decl {
+  let self_ty = mk_ty(TyName(tname, []), line, col)
+  let byte_list = mk_ty(TyList(mk_ty(TyName("Int", []), line, col)), line, col)
+  let int_ty = mk_ty(TyName("Int", []), line, col)
+  let str_ty = mk_ty(TyName("String", []), line, col)
+  let pair_ty = mk_ty(TyName("Pair", [self_ty, int_ty]), line, col)
+  let res_ty = mk_ty(TyName("Result", [str_ty, pair_ty]), line, col)
+  let to_params = [Param { pname: "self", ptype: Some(self_ty),
+                            pline: line, pcol: col }]
+  let from_params = [Param { pname: "buf", ptype: Some(byte_list),
+                              pline: line, pcol: col },
+                     Param { pname: "pos", ptype: Some(int_ty),
+                              pline: line, pcol: col }]
+  let to_method = DFn(false, "to_bytes", [], to_params, Some(byte_list),
+                      REmpty, to_b, line, col, None)
+  let from_method = DFn(false, "from_bytes", [], from_params, Some(res_ty),
+                        REmpty, from_b, line, col, None)
+  DImpl("BinSerialize", [], self_ty, [to_method, from_method], line, col)
+}
+
+# `fn <lower(tname)>_from_bytes(buf: [Byte], pos: Int) : Result[String, (T, Int)]`
+# wrapping the mangled per-impl name. The shim decouples the user's
+# call site from the dispatcher's first-arg constraint and gives the
+# diagnostic stack a stable function name when the decode fails.
+fn derive_binser_shim(tname: String, line: Int, col: Int) : Decl {
+  let self_ty = mk_ty(TyName(tname, []), line, col)
+  let byte_list = mk_ty(TyList(mk_ty(TyName("Int", []), line, col)), line, col)
+  let int_ty = mk_ty(TyName("Int", []), line, col)
+  let str_ty = mk_ty(TyName("String", []), line, col)
+  let pair_ty = mk_ty(TyName("Pair", [self_ty, int_ty]), line, col)
+  let res_ty = mk_ty(TyName("Result", [str_ty, pair_ty]), line, col)
+  let params = [Param { pname: "buf", ptype: Some(byte_list),
+                         pline: line, pcol: col },
+                Param { pname: "pos", ptype: Some(int_ty),
+                         pline: line, pcol: col }]
+  let mangled = proto_mangled_fn("BinSerialize", tname, "from_bytes")
+  let body = mk_expr(ECall(mk_expr(EVar(mangled), line, col),
+                            [mk_expr(EVar("buf"), line, col),
+                             mk_expr(EVar("pos"), line, col)]),
+                     line, col)
+  DFn(true, concat_all([string_to_lower_ascii(tname), "_from_bytes"]),
+      [], params, Some(res_ty), REmpty, body, line, col, None)
+}
+
+# Lowercase every ASCII byte of `tname` so the shim name
+# (`<lower(tname)>_from_bytes`) is a valid all-lowercase identifier
+# even for types like `Point`, `MyAST`, or `IntMaybe`. We do NOT
+# insert underscores between cased segments — the simple form
+# `intmaybe_from_bytes`, `myast_from_bytes` is unambiguous and
+# avoids tangling with the snake_case convention enforced
+# elsewhere by the resolver. Non-ASCII bytes pass through.
+fn string_to_lower_ascii(s: String) : String =
+  string_to_lower_ascii_loop(s, 0, string_length(s), "")
+
+fn string_to_lower_ascii_loop(s: String, i: Int, n: Int, acc: String) : String = {
+  if i >= n { acc }
+  else { match char_at(s, i) {
+    None    -> acc
+    Some(c) -> {
+      let nc = char_to_int(c)
+      let lc = if nc >= 65 and nc <= 90 { int_to_char(nc + 32) } else { c }
+      string_to_lower_ascii_loop(s, i + 1, n, string_concat(acc, "#{lc}"))
+    }
+  } }
+}
+
+# --- record encoder -------------------------------------------------
+#
+# `to_bytes(self) = list_append(to_bytes(self.f1),
+#                    list_append(to_bytes(self.f2), ...))`
+#
+# Empty record returns `[]`. Each `to_bytes(self.fK)` call rides the
+# protocol dispatcher correctly because the first arg's type IS the
+# field's type (Self is the receiver of the inner call).
+fn derive_binser_record_to_bytes(fields: [FieldDecl], line: Int, col: Int) : Expr {
+  match fields {
+    [] -> mk_expr(EList([]), line, col)
+    [fd, ...rest] -> derive_binser_record_to_bytes_chain(fd, rest, line, col)
+  }
+}
+
+fn derive_binser_record_to_bytes_chain(head: FieldDecl, rest: [FieldDecl],
+                                         line: Int, col: Int) : Expr {
+  match head {
+    FD(name, _) -> {
+      let access = mk_expr(EField(mk_expr(EVar("self"), line, col), name), line, col)
+      let head_call = mk_expr(ECall(mk_expr(EVar("to_bytes"), line, col), [access]),
+                              line, col)
+      match rest {
+        [] -> head_call
+        [next, ...more] -> {
+          let tail = derive_binser_record_to_bytes_chain(next, more, line, col)
+          mk_expr(ECall(mk_expr(EVar("list_append"), line, col),
+                        [head_call, tail]), line, col)
+        }
+      }
+    }
+  }
+}
+
+# --- record decoder -------------------------------------------------
+#
+# Threaded chain of `match __pimpl_BinSerialize_<Tk>_from_bytes(buf, posK) {
+#   Err(m) -> Err(m); Ok(p_K) -> ... }` ending in
+# `Ok((T { f1: p_1.fst, ..., fN: p_N.fst }, posN))`.
+#
+# Empty record short-circuits to `Ok((T {}, pos))` so the empty-fields
+# case still emits a valid impl.
+fn derive_binser_record_from_bytes(tname: String, fields: [FieldDecl],
+                                     line: Int, col: Int) : Expr {
+  let pos0 = mk_expr(EVar("pos"), line, col)
+  match fields {
+    [] -> derive_binser_record_ok_value(tname, [], pos0, line, col)
+    _  -> derive_binser_record_decode_chain(tname, fields, fields, 0, pos0,
+                                              line, col)
+  }
+}
+
+# `remaining` walks left-to-right; `all_fields` is captured so the
+# final `Ok` builder can construct the record literal in declaration
+# order. `pos_e` is the expression naming the current cursor (`pos`
+# initially, then `pK.snd` for the K-th field).
+fn derive_binser_record_decode_chain(tname: String, remaining: [FieldDecl],
+                                       all_fields: [FieldDecl], idx: Int,
+                                       pos_e: Expr, line: Int, col: Int) : Expr {
+  match remaining {
+    [] -> derive_binser_record_ok_value(tname, all_fields, pos_e, line, col)
+    [fd, ...rest] -> match fd {
+      FD(_, ftype) -> {
+        let mangled = proto_mangled_fn("BinSerialize",
+                                        proto_type_name(ftype), "from_bytes")
+        let call = mk_expr(ECall(mk_expr(EVar(mangled), line, col),
+                                  [mk_expr(EVar("buf"), line, col), pos_e]),
+                           line, col)
+        let pvar = concat_all(["p", int_to_string(idx)])
+        let next_pos = mk_expr(EField(mk_expr(EVar(pvar), line, col), "snd"),
+                                line, col)
+        let then_e = derive_binser_record_decode_chain(tname, rest, all_fields,
+                                                        idx + 1, next_pos,
+                                                        line, col)
+        derive_binser_match_result(call, pvar, then_e, line, col)
+      }
+    }
+  }
+}
+
+# Build `Ok((T { f1: p0.fst, ..., fN: pN-1.fst }, pos_e))`.
+fn derive_binser_record_ok_value(tname: String, fields: [FieldDecl],
+                                   pos_e: Expr, line: Int, col: Int) : Expr {
+  let parts = derive_binser_record_field_inits(fields, 0, line, col)
+  let rec_e = mk_expr(ERecordLit(tname, parts), line, col)
+  let pair_e = mk_expr(ERecordLit("Pair",
+                                [FI("fst", rec_e),
+                                 FI("snd", pos_e)]), line, col)
+  mk_expr(ECall(mk_expr(EVar("Ok"), line, col), [pair_e]), line, col)
+}
+
+fn derive_binser_record_field_inits(fields: [FieldDecl], i: Int,
+                                      line: Int, col: Int) : [FieldInit] {
+  match fields {
+    [] -> []
+    [fd, ...rest] -> match fd {
+      FD(name, _) -> {
+        let v = mk_expr(EField(mk_expr(EVar(concat_all(["p", int_to_string(i)])),
+                                        line, col), "fst"),
+                         line, col)
+        [FI(name, v),
+         ...derive_binser_record_field_inits(rest, i + 1, line, col)]
+      }
+    }
+  }
+}
+
+# Wrap an `Err(m) -> Err(m); Ok(pvar) -> then_e` match around a
+# Result-producing decode call.
+fn derive_binser_match_result(call: Expr, pvar: String, then_e: Expr,
+                                line: Int, col: Int) : Expr {
+  let err_pat = mk_pat(PVariant("Err", [mk_pat(PBind("m"), line, col)]),
+                        line, col)
+  let err_arm = Arm(err_pat, None,
+                    mk_expr(ECall(mk_expr(EVar("Err"), line, col),
+                                  [mk_expr(EVar("m"), line, col)]),
+                            line, col))
+  let ok_pat = mk_pat(PVariant("Ok", [mk_pat(PBind(pvar), line, col)]),
+                       line, col)
+  let ok_arm = Arm(ok_pat, None, then_e)
+  mk_expr(EMatch(call, [err_arm, ok_arm]), line, col)
+}
+
+# --- sum encoder ----------------------------------------------------
+#
+# `match self { V0 -> [0]; V1(p0) -> list_append([1], to_bytes(p0));
+#                V2(p0, p1) -> list_append([2], list_append(to_bytes(p0),
+#                              to_bytes(p1))); ... }`
+#
+# Tag is the variant's declaration index encoded as a single byte.
+# Sum types with more than 256 variants are out of v1 scope; they
+# would silently truncate today (open follow-up: switch to a varint
+# tag if real users hit this).
+fn derive_binser_sum_to_bytes(variants: [Variant], line: Int, col: Int) : Expr {
+  match variants {
+    [] -> mk_expr(EList([]), line, col)
+    _  -> {
+      let scrut = mk_expr(EVar("self"), line, col)
+      let arms = derive_binser_sum_to_bytes_arms(variants, 0, line, col)
+      mk_expr(EMatch(scrut, arms), line, col)
+    }
+  }
+}
+
+fn derive_binser_sum_to_bytes_arms(variants: [Variant], idx: Int,
+                                     line: Int, col: Int) : [Arm] {
+  match variants {
+    [] -> []
+    [v, ...rest] ->
+      [derive_binser_sum_to_bytes_arm(v, idx, line, col),
+       ...derive_binser_sum_to_bytes_arms(rest, idx + 1, line, col)]
+  }
+}
+
+fn derive_binser_sum_to_bytes_arm(v: Variant, idx: Int,
+                                    line: Int, col: Int) : Arm {
+  match v {
+    Var(name, vargs) -> {
+      let pat_subs = derive_binser_sum_pat_subs(vargs, "p", 0, line, col)
+      let pat = mk_pat(PVariant(name, pat_subs), line, col)
+      let body = derive_binser_sum_to_bytes_body(vargs, idx, line, col)
+      Arm(pat, None, body)
+    }
+  }
+}
+
+fn derive_binser_sum_pat_subs(vargs: [TypeExpr], prefix: String, i: Int,
+                                line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PBind(concat_all([prefix, int_to_string(i)])), line, col),
+       ...derive_binser_sum_pat_subs(rest, prefix, i + 1, line, col)]
+  }
+}
+
+# `list_append([tag], list_append(to_bytes(p0), list_append(to_bytes(p1), ...)))`
+# Empty payload collapses to just `[tag]`.
+fn derive_binser_sum_to_bytes_body(vargs: [TypeExpr], idx: Int,
+                                     line: Int, col: Int) : Expr {
+  let tag = mk_expr(EList([ElPlain(mk_expr(EInt(idx), line, col))]), line, col)
+  match vargs {
+    [] -> tag
+    _  -> {
+      let payload = derive_binser_sum_to_bytes_payload(vargs, 0, line, col)
+      mk_expr(ECall(mk_expr(EVar("list_append"), line, col), [tag, payload]),
+              line, col)
+    }
+  }
+}
+
+fn derive_binser_sum_to_bytes_payload(vargs: [TypeExpr], i: Int,
+                                        line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> mk_expr(EList([]), line, col)
+    [_, ...rest] -> {
+      let v = mk_expr(EVar(concat_all(["p", int_to_string(i)])), line, col)
+      let head = mk_expr(ECall(mk_expr(EVar("to_bytes"), line, col), [v]),
+                          line, col)
+      match rest {
+        [] -> head
+        _  -> {
+          let tail = derive_binser_sum_to_bytes_payload(rest, i + 1, line, col)
+          mk_expr(ECall(mk_expr(EVar("list_append"), line, col), [head, tail]),
+                  line, col)
+        }
+      }
+    }
+  }
+}
+
+# --- sum decoder ----------------------------------------------------
+#
+# `match bin_byte_at(buf, pos) {
+#   Err(m) -> Err(m)
+#   Ok(__tag) ->
+#     if __tag == 0 { <decode V0 payload> }
+#     else if __tag == 1 { <decode V1 payload> }
+#     ...
+#     else { Err("BinSerialize <tname>: invalid tag") }
+# }`
+#
+# Each per-variant payload chain is identical in shape to the
+# record-field chain: thread `__pimpl_BinSerialize_<Tk>_from_bytes`
+# Result-matches and end with `Ok((Variant(p0.fst, p1.fst, ...), posN))`.
+fn derive_binser_sum_from_bytes(tname: String, variants: [Variant],
+                                  line: Int, col: Int) : Expr {
+  let tag_call = mk_expr(ECall(mk_expr(EVar("bin_byte_at"), line, col),
+                                [mk_expr(EVar("buf"), line, col),
+                                 mk_expr(EVar("pos"), line, col)]),
+                          line, col)
+  let inner_pos = mk_expr(EBinop("+", mk_expr(EVar("pos"), line, col),
+                                       mk_expr(EInt(1), line, col)),
+                           line, col)
+  let chain = derive_binser_sum_tag_chain(tname, variants, 0, inner_pos,
+                                            line, col)
+  derive_binser_match_result(tag_call, "__tag", chain, line, col)
+}
+
+fn derive_binser_sum_tag_chain(tname: String, variants: [Variant], idx: Int,
+                                  start_pos: Expr, line: Int, col: Int) : Expr {
+  match variants {
+    [] -> mk_expr(ECall(mk_expr(EVar("Err"), line, col),
+                         [mk_expr(EStr(concat_all(
+                            ["\"BinSerialize ", tname, ": invalid tag\""]),
+                            false), line, col)]),
+                   line, col)
+    [v, ...rest] -> {
+      let cond = mk_expr(EBinop("==", mk_expr(EVar("__tag"), line, col),
+                                       mk_expr(EInt(idx), line, col)),
+                          line, col)
+      let then_e = derive_binser_sum_payload_decode(tname, v, start_pos,
+                                                      line, col)
+      let else_e = derive_binser_sum_tag_chain(tname, rest, idx + 1,
+                                                  start_pos, line, col)
+      mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
+    }
+  }
+}
+
+# Same shape as record-decode chain, but the final `Ok` builds a
+# constructor call `Variant(p0.fst, p1.fst, ...)` instead of a
+# record literal.
+fn derive_binser_sum_payload_decode(tname: String, v: Variant,
+                                      start_pos: Expr, line: Int, col: Int) : Expr {
+  match v {
+    Var(name, vargs) -> match vargs {
+      [] -> {
+        let ctor = mk_expr(EVar(name), line, col)
+        let pair = mk_expr(ERecordLit("Pair",
+                                    [FI("fst", ctor),
+                                     FI("snd", start_pos)]), line, col)
+        mk_expr(ECall(mk_expr(EVar("Ok"), line, col), [pair]), line, col)
+      }
+      _  -> derive_binser_sum_decode_chain(name, vargs, vargs, 0, start_pos,
+                                             line, col)
+    }
+  }
+}
+
+fn derive_binser_sum_decode_chain(vname: String, remaining: [TypeExpr],
+                                    all_vargs: [TypeExpr], idx: Int,
+                                    pos_e: Expr, line: Int, col: Int) : Expr {
+  match remaining {
+    [] -> {
+      let args = derive_binser_sum_ctor_args(all_vargs, 0, line, col)
+      let ctor = mk_expr(ECall(mk_expr(EVar(vname), line, col), args), line, col)
+      let pair = mk_expr(ERecordLit("Pair",
+                                  [FI("fst", ctor),
+                                   FI("snd", pos_e)]), line, col)
+      mk_expr(ECall(mk_expr(EVar("Ok"), line, col), [pair]), line, col)
+    }
+    [vt, ...rest] -> {
+      let mangled = proto_mangled_fn("BinSerialize",
+                                      proto_type_name(vt), "from_bytes")
+      let call = mk_expr(ECall(mk_expr(EVar(mangled), line, col),
+                                [mk_expr(EVar("buf"), line, col), pos_e]),
+                         line, col)
+      let pvar = concat_all(["p", int_to_string(idx)])
+      let next_pos = mk_expr(EField(mk_expr(EVar(pvar), line, col), "snd"),
+                              line, col)
+      let then_e = derive_binser_sum_decode_chain(vname, rest, all_vargs,
+                                                     idx + 1, next_pos,
+                                                     line, col)
+      derive_binser_match_result(call, pvar, then_e, line, col)
+    }
+  }
+}
+
+fn derive_binser_sum_ctor_args(vargs: [TypeExpr], i: Int,
+                                 line: Int, col: Int) : [Expr] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_expr(EField(mk_expr(EVar(concat_all(["p", int_to_string(i)])),
+                               line, col), "fst"), line, col),
+       ...derive_binser_sum_ctor_args(rest, i + 1, line, col)]
+  }
+}
+
+# Pre-expansion validator for `#derive(BinSerialize)`. Same shape as
+# `validate_derive_ord`: collect every type that has — or will have —
+# a BinSerialize impl, then reject any derive whose fields/payloads
+# reference a type outside that set. The type itself is whitelisted
+# (recursive types are legal). The user gets a typer-time message
+# pointing at the offending field instead of the dispatcher's
+# generic runtime panic.
+fn validate_derive_binserialize(decls: [Decl], file: String) : Int {
+  let providers = collect_binser_providers(decls, [])
+  validate_derive_binser_loop(decls, file, providers, 0)
+}
+
+fn collect_binser_providers(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DImpl(pname, _, target, _, _, _) ->
+        if pname == "BinSerialize" {
+          collect_binser_providers(rest, [proto_type_name(target), ...acc])
+        } else {
+          collect_binser_providers(rest, acc)
+        }
+      DDerive(names, inner, _, _) -> match inner {
+        DType(_, tname, _, _, _, _) ->
+          if list_has(names, "BinSerialize") {
+            collect_binser_providers(rest, [tname, ...acc])
+          } else {
+            collect_binser_providers(rest, acc)
+          }
+        _ -> collect_binser_providers(rest, acc)
+      }
+      _ -> collect_binser_providers(rest, acc)
+    }
+  }
+}
+
+fn validate_derive_binser_loop(decls: [Decl], file: String,
+                                 providers: [String], errs: Int) : Int {
+  match decls {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DDerive(names, inner, _, _) -> match inner {
+        DType(_, tname, _, body, line, col) ->
+          if list_has(names, "BinSerialize") {
+            let errs1 = validate_derive_binser_body(file, tname, body,
+                                                     providers, line, col, errs)
+            validate_derive_binser_loop(rest, file, providers, errs1)
+          } else {
+            validate_derive_binser_loop(rest, file, providers, errs)
+          }
+        _ -> validate_derive_binser_loop(rest, file, providers, errs)
+      }
+      _ -> validate_derive_binser_loop(rest, file, providers, errs)
+    }
+  }
+}
+
+fn validate_derive_binser_body(file: String, tname: String, body: TypeBody,
+                                 providers: [String], line: Int, col: Int,
+                                 errs: Int) : Int {
+  match body {
+    TBRecord(fields) -> validate_derive_binser_fields(file, tname, fields,
+                                                        providers, line, col, errs)
+    TBSum(variants) -> validate_derive_binser_variants(file, tname, variants,
+                                                         providers, line, col, errs)
+    _ -> errs
+  }
+}
+
+fn validate_derive_binser_fields(file: String, tname: String,
+                                   fields: [FieldDecl], providers: [String],
+                                   line: Int, col: Int, errs: Int) : Int {
+  match fields {
+    [] -> errs
+    [fd, ...rest] -> match fd {
+      FD(fname, ftype) -> {
+        let errs1 = validate_derive_binser_one(file, tname, fname, "field",
+                                                 ftype, providers, line, col, errs)
+        validate_derive_binser_fields(file, tname, rest, providers,
+                                        line, col, errs1)
+      }
+    }
+  }
+}
+
+fn validate_derive_binser_variants(file: String, tname: String,
+                                     variants: [Variant], providers: [String],
+                                     line: Int, col: Int, errs: Int) : Int {
+  match variants {
+    [] -> errs
+    [v, ...rest] -> match v {
+      Var(vname, vargs) -> {
+        let errs1 = validate_derive_binser_payload(file, tname, vname, vargs, 0,
+                                                     providers, line, col, errs)
+        validate_derive_binser_variants(file, tname, rest, providers,
+                                          line, col, errs1)
+      }
+    }
+  }
+}
+
+fn validate_derive_binser_payload(file: String, tname: String, vname: String,
+                                    vargs: [TypeExpr], idx: Int,
+                                    providers: [String], line: Int, col: Int,
+                                    errs: Int) : Int {
+  match vargs {
+    [] -> errs
+    [vt, ...rest] -> {
+      let label = concat_all([vname, " payload #", int_to_string(idx)])
+      let errs1 = validate_derive_binser_one(file, tname, label, "variant",
+                                               vt, providers, line, col, errs)
+      validate_derive_binser_payload(file, tname, vname, rest, idx + 1,
+                                       providers, line, col, errs1)
+    }
+  }
+}
+
+fn validate_derive_binser_one(file: String, tname: String, fname: String,
+                                kind: String, ftype: TypeExpr,
+                                providers: [String], line: Int, col: Int,
+                                errs: Int) : Int / Console {
+  let head = proto_type_name(ftype)
+  if head == tname {
+    errs
+  } else if list_has(providers, head) {
+    errs
+  } else if binser_builtin_impl(head) {
+    errs
+  } else {
+    eprint(concat_all([
+      file, ":", int_to_string(line), ":", int_to_string(col),
+      ": error: cannot `#derive(BinSerialize)` for `", tname,
+      "`: no `BinSerialize` impl for ", kind, " `", fname, "` of type `", head,
+      "` (declare `impl BinSerialize for ", head,
+      "` or `#derive(BinSerialize)` on `", head, "`)"]))
+    errs + 1
+  }
+}
+
+# Atomic types with hand-written impls in stdlib/protocols.kai.
+# Mirrors `derive_builtin_impl` for Eq/Hash/Show; kept separate to
+# avoid coupling BinSerialize's whitelist to the protocols that
+# pre-existed it. `Byte` is whitelisted because it is a transparent
+# alias of `Int` and shares the same impl by structural unification —
+# the validator should not reject `field: Byte` even though no `impl
+# BinSerialize for Byte` is declared.
+fn binser_builtin_impl(tname: String) : Bool =
+  list_has(["Int", "Real", "Bool", "String", "Byte"], tname)
+
 # m12.8.z: pre-expansion validation for `#derive(Ord)`. Walks the
 # decl stream once to collect every type that has — or will have
 # after derivation — an `Ord` impl, then rejects any
@@ -46498,7 +47088,8 @@ fn lower_protocols(decls: [Decl], file: String) : LoweredProtocols {
   # isn't surfaced. This pass walks the original decl stream
   # (DDerive nodes still intact) and emits a clear typer-time error
   # naming the offending field/payload.
-  let derive_errs = validate_derive_ord(decls, file)
+  let derive_errs = validate_derive_ord(decls, file) +
+                    validate_derive_binserialize(decls, file)
   # Step 1 — expand `#derive(...)` annotations into synthetic DImpl
   # decls so subsequent steps see all impls uniformly.
   let expanded = expand_derives(decls)
