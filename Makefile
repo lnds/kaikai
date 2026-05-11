@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-fmt test-bench test-check test-library-mode demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-fmt test-bench test-check test-library-mode test-diagnostics-collected demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -148,8 +148,8 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes"
+tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures"
 
 # Tongariki — `kai fmt` fixture suite. Verifies that every fixture
 # in examples/fmt/ formats to its `.expected.kai` and is idempotent,
@@ -292,6 +292,31 @@ test-library-mode: kaic2
 	  || { echo "library-mode def_at_imports DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
 	rm -f "$$out"; \
 	echo "library-mode def_at_imports OK"
+
+# Issue #487 — `--diags-json` regression. Each fixture under
+# examples/library_mode/diags_*.kai compiles a deliberately-broken
+# source; the collected [Diagnostic] is serialised to JSON and diffed
+# against the .diags.expected golden. The fixtures pin the m11 v1 +
+# v1.x template wording (T1, T2, T3, T4, T5) so an unintended
+# refactor that changes the user-facing message fails this gate
+# before LSP-side consumers (#447) drift.
+test-diagnostics-collected: kaic2
+	@set -e; \
+	root=$$(pwd); \
+	cd "$$root"; \
+	for fx in diags_t1_type_mismatch diags_t2_non_exhaustive \
+	          diags_t3_unbound_name diags_t4_wrong_arity \
+	          diags_t5_missing_effect diags_multiple_errors; do \
+	  src="examples/library_mode/$$fx.kai"; \
+	  exp="examples/library_mode/$$fx.diags.expected"; \
+	  out=$$(mktemp); \
+	  "$$root/stage2/kaic2" --diags-json "$$src" > "$$out" 2>/dev/null \
+	    || { echo "diags-collected $$fx FAIL (kaic2 exit)"; rm -f "$$out"; exit 1; }; \
+	  diff -q "$$exp" "$$out" > /dev/null \
+	    || { echo "diags-collected $$fx DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
+	  rm -f "$$out"; \
+	  echo "diags-collected $$fx OK"; \
+	done
 
 # Tier 2.5 — daily memory-safety gate. Rebuilds the demos/ probe set
 # with `-fsanitize=address,undefined` and runs each binary; fails on
