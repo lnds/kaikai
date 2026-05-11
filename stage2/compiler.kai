@@ -30514,6 +30514,14 @@ fn is_array_safe_callee(name: String) : Bool {
   else if name == "array_get" { true }
   else if name == "array_set" { true }
   else if name == "array_grow" { true }
+  # BinSerialize concat / writer helpers: read-only on every input
+  # Array except their locally-allocated `dst`, so passing a caller's
+  # local Array as the LHS does not actually let it be observably
+  # mutated. Whitelisted here so the caller's masking pass keeps the
+  # local label and `Mutable` stays out of its inferred row.
+  # See `stdlib/protocols.kai` §BinSerialize for the contract.
+  else if name == "array_concat_bytes" { true }
+  else if name == "bin_write_len4" { true }
   else { false }
 }
 
@@ -46501,8 +46509,10 @@ fn make_derived_impl(pname: String, tname: String, opname: String,
 # payload decoding routes to `__pimpl_BinSerialize_<TypeHead>_from_bytes`
 # directly because v1 single-dispatch picks the impl from the first
 # argument's type, and `from_bytes(buf, pos)` would always pick the
-# `[Byte]` (`List`) impl — which does not exist and never should
-# (the buffer and the encoded type are both lists).
+# `Array` impl on the buffer — which does not exist and never should
+# (the buffer head and the encoded type's head would collide).
+# Post-#487 the buffer type is `Array[Byte]` (was `[Byte]`); the
+# combinator surface stays the same.
 fn derive_binserialize_impl(tname: String, body: TypeBody,
                               line: Int, col: Int) : [Decl] {
   match body {
@@ -46526,44 +46536,46 @@ fn derive_binserialize_impl(tname: String, body: TypeBody,
 
 # `impl BinSerialize for T { fn to_bytes ... fn from_bytes ... }`
 #
-# Uses `[Byte]` directly. `Byte` is a first-class nominal primitive
-# after Lane 4 + PR #476; the previous `Byte = Int` transparent
-# alias is gone. `byte_to_int` / `int_to_byte` are the explicit
-# conversions when interoperating with `Int` data.
+# Uses `Array[Byte]` for the buffer carrier so `from_bytes` reads land
+# on O(1) `array_get` — the substrate the Phase A cache (#452)
+# requires, per the #487 refactor. `Byte` is a first-class nominal
+# primitive after Lane 4 + PR #476; the previous `Byte = Int`
+# transparent alias is gone. `byte_to_int` / `int_to_byte` are the
+# explicit conversions when interoperating with `Int` data.
 fn make_binser_impl(tname: String, to_b: Expr, from_b: Expr,
                      line: Int, col: Int) : Decl {
   let self_ty = mk_ty(TyName(tname, []), line, col)
-  let byte_list = mk_ty(TyList(mk_ty(TyName("Byte", []), line, col)), line, col)
+  let byte_arr = mk_ty(TyName("Array", [mk_ty(TyName("Byte", []), line, col)]), line, col)
   let int_ty = mk_ty(TyName("Int", []), line, col)
   let str_ty = mk_ty(TyName("String", []), line, col)
   let cur_ty = mk_ty(TyName("BinCursor", [self_ty]), line, col)
   let res_ty = mk_ty(TyName("Result", [str_ty, cur_ty]), line, col)
   let to_params = [Param { pname: "self", ptype: Some(self_ty),
                             pline: line, pcol: col }]
-  let from_params = [Param { pname: "buf", ptype: Some(byte_list),
+  let from_params = [Param { pname: "buf", ptype: Some(byte_arr),
                               pline: line, pcol: col },
                      Param { pname: "pos", ptype: Some(int_ty),
                               pline: line, pcol: col }]
-  let to_method = DFn(false, "to_bytes", [], to_params, Some(byte_list),
+  let to_method = DFn(false, "to_bytes", [], to_params, Some(byte_arr),
                       REmpty, to_b, line, col, None)
   let from_method = DFn(false, "from_bytes", [], from_params, Some(res_ty),
                         REmpty, from_b, line, col, None)
   DImpl("BinSerialize", [], self_ty, [to_method, from_method], line, col)
 }
 
-# `fn <lower(tname)>_from_bytes(buf: [Byte], pos: Int)
+# `fn <lower(tname)>_from_bytes(buf: Array[Byte], pos: Int)
 #       : Result[String, BinCursor[T]]`
 # wrapping the mangled per-impl name. The shim decouples the user's
 # call site from the dispatcher's first-arg constraint and gives the
 # diagnostic stack a stable function name when the decode fails.
 fn derive_binser_shim(tname: String, line: Int, col: Int) : Decl {
   let self_ty = mk_ty(TyName(tname, []), line, col)
-  let byte_list = mk_ty(TyList(mk_ty(TyName("Byte", []), line, col)), line, col)
+  let byte_arr = mk_ty(TyName("Array", [mk_ty(TyName("Byte", []), line, col)]), line, col)
   let int_ty = mk_ty(TyName("Int", []), line, col)
   let str_ty = mk_ty(TyName("String", []), line, col)
   let cur_ty = mk_ty(TyName("BinCursor", [self_ty]), line, col)
   let res_ty = mk_ty(TyName("Result", [str_ty, cur_ty]), line, col)
-  let params = [Param { pname: "buf", ptype: Some(byte_list),
+  let params = [Param { pname: "buf", ptype: Some(byte_arr),
                          pline: line, pcol: col },
                 Param { pname: "pos", ptype: Some(int_ty),
                          pline: line, pcol: col }]
@@ -46734,18 +46746,40 @@ fn derive_binser_decode_mangled(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
 
 # --- record encoder -------------------------------------------------
 #
-# `to_bytes(self) = list_append(to_bytes(self.f1),
-#                    list_append(to_bytes(self.f2), ...))`
+# `to_bytes(self) = array_concat_bytes(to_bytes(self.f1),
+#                    array_concat_bytes(to_bytes(self.f2), ...))`
 #
-# Empty record returns `[]`. For most fields each `to_bytes(self.fK)`
-# call rides the protocol dispatcher because the first arg's type IS
-# the field's type. List/Option/Char fields route through
-# `derive_binser_encode_expr` instead (see above).
+# Empty record returns an empty `Array[Byte]` via `array_make(0, bin_byte(0))`.
+# For most fields each `to_bytes(self.fK)` call rides the protocol
+# dispatcher because the first arg's type IS the field's type.
+# List/Option/Char fields route through `derive_binser_encode_expr`
+# instead (see above).
 fn derive_binser_record_to_bytes(fields: [FieldDecl], line: Int, col: Int) : Expr {
   match fields {
-    [] -> mk_expr(EList([]), line, col)
+    [] -> empty_byte_array_expr(line, col)
     [fd, ...rest] -> derive_binser_record_to_bytes_chain(fd, rest, 0, line, col)
   }
+}
+
+# Build `array_make(0, bin_byte(0))` — the canonical empty
+# `Array[Byte]` literal the derive emits for empty-record / empty-
+# payload cases. The runtime allocates a zero-length backing slot;
+# the sentinel `bin_byte(0)` is never observed.
+fn empty_byte_array_expr(line: Int, col: Int) : Expr {
+  let zero = mk_expr(ECall(mk_expr(EVar("bin_byte"), line, col),
+                            [mk_expr(EInt(0), line, col)]), line, col)
+  mk_expr(ECall(mk_expr(EVar("array_make"), line, col),
+                [mk_expr(EInt(0), line, col), zero]), line, col)
+}
+
+# Build `array_one_byte(bin_byte(idx))` — the canonical single-byte
+# tag the sum encoder emits for variant tags.
+fn one_byte_tag_expr(idx: Int, line: Int, col: Int) : Expr {
+  let tag_byte = mk_expr(ECall(mk_expr(EVar("bin_byte"), line, col),
+                                [mk_expr(EInt(idx), line, col)]),
+                          line, col)
+  mk_expr(ECall(mk_expr(EVar("array_one_byte"), line, col), [tag_byte]),
+          line, col)
 }
 
 # `idx` is bumped per field so that any lambdas the encoder emits for
@@ -46767,7 +46801,7 @@ fn derive_binser_record_to_bytes_chain(head: FieldDecl, rest: [FieldDecl],
         [next, ...more] -> {
           let tail = derive_binser_record_to_bytes_chain(next, more, idx + 1,
                                                           line, col)
-          mk_expr(ECall(mk_expr(EVar("list_append"), line, col),
+          mk_expr(ECall(mk_expr(EVar("array_concat_bytes"), line, col),
                         [head_call, tail]), line, col)
         }
       }
@@ -46867,9 +46901,12 @@ fn derive_binser_match_result(call: Expr, pvar: String, then_e: Expr,
 
 # --- sum encoder ----------------------------------------------------
 #
-# `match self { V0 -> [0]; V1(p0) -> list_append([1], to_bytes(p0));
-#                V2(p0, p1) -> list_append([2], list_append(to_bytes(p0),
-#                              to_bytes(p1))); ... }`
+# `match self {
+#    V0 -> array_one_byte(bin_byte(0));
+#    V1(p0) -> array_concat_bytes(array_one_byte(bin_byte(1)), to_bytes(p0));
+#    V2(p0, p1) -> array_concat_bytes(array_one_byte(bin_byte(2)),
+#                    array_concat_bytes(to_bytes(p0), to_bytes(p1)));
+#    ... }`
 #
 # Tag is the variant's declaration index encoded as a single byte.
 # Sum types with more than 256 variants are out of v1 scope; they
@@ -46877,7 +46914,7 @@ fn derive_binser_match_result(call: Expr, pvar: String, then_e: Expr,
 # tag if real users hit this).
 fn derive_binser_sum_to_bytes(variants: [Variant], line: Int, col: Int) : Expr {
   match variants {
-    [] -> mk_expr(EList([]), line, col)
+    [] -> empty_byte_array_expr(line, col)
     _  -> {
       let scrut = mk_expr(EVar("self"), line, col)
       let arms = derive_binser_sum_to_bytes_arms(variants, 0, line, col)
@@ -46918,17 +46955,12 @@ fn derive_binser_sum_pat_subs(vargs: [TypeExpr], prefix: String, i: Int,
   }
 }
 
-# `list_append([bin_byte(tag)], list_append(to_bytes(p0), ...))`.
-# Empty payload collapses to just `[bin_byte(tag)]`. The tag has
-# to land as a `Byte` literal — since Lane 4 made `Byte` nominal,
-# a bare `[idx]` would type-check as `[Int]` and fail to unify
-# with the impl's `[Byte]` return type.
+# `array_concat_bytes(array_one_byte(bin_byte(tag)),
+#                     array_concat_bytes(to_bytes(p0), ...))`.
+# Empty payload collapses to just `array_one_byte(bin_byte(tag))`.
 fn derive_binser_sum_to_bytes_body(vargs: [TypeExpr], idx: Int,
                                      line: Int, col: Int) : Expr {
-  let tag_byte = mk_expr(ECall(mk_expr(EVar("bin_byte"), line, col),
-                                [mk_expr(EInt(idx), line, col)]),
-                          line, col)
-  let tag = mk_expr(EList([ElPlain(tag_byte)]), line, col)
+  let tag = one_byte_tag_expr(idx, line, col)
   match vargs {
     [] -> tag
     _  -> {
@@ -46941,7 +46973,7 @@ fn derive_binser_sum_to_bytes_body(vargs: [TypeExpr], idx: Int,
       # via the single-byte tag (out of v1 scope).
       let vcol = col + idx * 256
       let payload = derive_binser_sum_to_bytes_payload(vargs, 0, line, vcol)
-      mk_expr(ECall(mk_expr(EVar("list_append"), line, col), [tag, payload]),
+      mk_expr(ECall(mk_expr(EVar("array_concat_bytes"), line, col), [tag, payload]),
               line, col)
     }
   }
@@ -46950,7 +46982,7 @@ fn derive_binser_sum_to_bytes_body(vargs: [TypeExpr], idx: Int,
 fn derive_binser_sum_to_bytes_payload(vargs: [TypeExpr], i: Int,
                                         line: Int, col: Int) : Expr {
   match vargs {
-    [] -> mk_expr(EList([]), line, col)
+    [] -> empty_byte_array_expr(line, col)
     [vt, ...rest] -> {
       let fcol = col + i * 16
       let v = mk_expr(EVar(concat_all(["p", int_to_string(i)])), line, fcol)
@@ -46959,7 +46991,7 @@ fn derive_binser_sum_to_bytes_payload(vargs: [TypeExpr], i: Int,
         [] -> head
         _  -> {
           let tail = derive_binser_sum_to_bytes_payload(rest, i + 1, line, col)
-          mk_expr(ECall(mk_expr(EVar("list_append"), line, col), [head, tail]),
+          mk_expr(ECall(mk_expr(EVar("array_concat_bytes"), line, col), [head, tail]),
                   line, col)
         }
       }

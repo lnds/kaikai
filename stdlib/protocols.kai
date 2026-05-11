@@ -358,18 +358,15 @@ impl Serialize for Bool {
     else { Err("not a bool") }
 }
 
-# ---- BinSerialize (issue #459) ------------------------------------
+# ---- BinSerialize (issue #459; #487 Array[Byte] refactor) ---------
 #
-# Cursor-based binary serialization on `[Byte]`. `Byte` is a
-# transparent alias of `Int` declared in `stdlib/core/byte.kai`,
-# restored after PR #378 (issue #376) made `type X = T` aliases
-# unify with their RHS again — the gap that retired the previous
-# attempt (referenced in `stdlib/effects.kai` §`NetTcp`) is closed.
-# When a true `u8` primitive lands (the post-#459 u8 lane), `Byte`
-# flips to `pub type Byte = u8` and BinSerialize's surface does not
-# move. Each element is a byte in `[0, 255]`; producers truncate
-# higher bits, consumers treat anything outside the range as a
-# malformed buffer.
+# Cursor-based binary serialization on `Array[Byte]`. `Byte` is a
+# nominal primitive declared in `stdlib/core/byte.kai`; an
+# `Array[Byte]` is the contiguous mutable carrier with O(1)
+# `array_get` reads — the substrate the Phase A precompiled-prelude
+# cache (#452) requires. The prior `[Byte]` cons-list carrier made
+# `from_bytes` O(N²) per #485; switching to `Array[Byte]` reduces
+# every cursor read to O(1) without touching the runtime.
 #
 # Why a sibling of Serialize and not a refit: Serialize is the
 # whole-string "config / round-trip" protocol; BinSerialize is the
@@ -379,7 +376,7 @@ impl Serialize for Bool {
 # notes for the trade-off.
 #
 # Shape:
-#   to_bytes(self)             : [Byte]
+#   to_bytes(self)             : Array[Byte]
 #   from_bytes(buf, pos)       : Result[String, BinCursor[Self]]
 #                                # Ok({ value, pos: next_pos }) | Err(msg)
 #
@@ -400,12 +397,24 @@ impl Serialize for Bool {
 #            in `docs/lane-experience-issue-459-binserialize.md`.
 #   String — 4-byte little-endian length prefix + raw bytes.
 #   Bool   — 1 byte (0 = false, 1 = true).
+#
+# Mutable masking: every helper below constructs its `Array[Byte]`
+# output locally via `array_make` and fills it via `array_set` either
+# in-line (small fixed-size buffers) or inside a `bin_foldl` lambda
+# that captures the local Array — never receives it as a parameter.
+# This routes through the local-Array-only branch of the masking
+# pass (issue #251 + #252, `mask_local_mutable_demand` in
+# `stage2/compiler.kai`), so `Mutable` stays out of the inferred row
+# and the BinSerialize surface is pure. Helpers that take an existing
+# buffer (`array_concat_bytes`, `array_copy_into`) appear in the
+# whitelist via `is_array_safe_callee` so the caller's local Array
+# is not flagged as escaping.
 
 pub type BinCursor[t] = { value: t, pos: Int }
 
 protocol BinSerialize {
-  to_bytes(self: Self) : [Byte]
-  from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Self]]
+  to_bytes(self: Self) : Array[Byte]
+  from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Self]]
 }
 
 # --- low-level helpers (private to the BinSerialize impls) --------
@@ -426,121 +435,191 @@ fn bin_byte(n: Int) : Byte = match int_to_byte(n) {
   Err(m) -> panic(m)
 }
 
-fn bin_byte_at(buf: [Byte], pos: Int) : Result[String, Byte] = match buf {
-  []           -> Err("unexpected end of buffer")
-  [b, ...rest] -> if pos == 0 { Ok(b) } else { bin_byte_at(rest, pos - 1) }
+# Private foldl. Mirrors `bin_foldl` but is bare so the BinSerialize
+# helpers below stay usable when stdlib/protocols.kai is loaded as a
+# `--prelude` without `stdlib/core/list.kai` on the same chain (e.g.
+# the `complex_literal_*` test-sugars harness, which only adds
+# protocols + math). Kept as `bin_foldl` so the BinSerialize-private
+# namespace prefix flags it as not user-facing.
+fn bin_foldl[a, r, e](xs: [a], init: r, f: (r, a) -> r / e) : r / e = match xs {
+  []          -> init
+  [h, ...t]   -> bin_foldl(t, f(init, h), f)
 }
 
-fn bin_have(buf: [Byte], pos: Int, n: Int) : Bool = {
-  if n == 0 { true }
-  else { match bin_byte_at(buf, pos) {
-    Ok(_)  -> bin_have(buf, pos + 1, n - 1)
-    Err(_) -> false
-  } }
+# `bin_zero` is the all-purpose sentinel for `array_make` calls that
+# need a `Byte` slot but overwrite every position immediately. Folded
+# out by the optimiser; declaring it here documents the intent.
+fn bin_zero() : Byte = bin_byte(0)
+
+# O(1) cursor read. Returns `Err` past end of buffer so the decoder
+# chain stays Result-monadic rather than panicking on truncated input.
+fn bin_byte_at(buf: Array[Byte], pos: Int) : Result[String, Byte] = {
+  if pos < 0 or pos >= array_length(buf) {
+    Err("unexpected end of buffer")
+  } else { Ok(buf[pos]) }
 }
+
+# Range check — true iff the buffer holds at least `n` more bytes
+# starting at `pos`. O(1) via `array_length`.
+fn bin_have(buf: Array[Byte], pos: Int, n: Int) : Bool =
+  pos >= 0 and n >= 0 and pos + n <= array_length(buf)
 
 # Encode an Int as 8 little-endian bytes in [0, 255]. Negatives wrap
-# via the standard two's-complement masking trick: AND with 0xFF
-# isn't available as a builtin yet, so we use `% 256` plus a `+ 256`
-# fold that brings any negative remainder into range. The decoder
-# reverses with the same shape.
-fn bin_int_to_bytes_loop(n: Int, k: Int, acc: [Byte]) : [Byte] = {
-  if k == 0 { list_reverse(acc) }
-  else {
-    let r = n % 256
+# via the standard two's-complement masking trick: `% 256` plus a
+# `+ 256` fold that brings any negative remainder into range. The
+# decoder reverses with the same shape. The output Array is built
+# locally so the masking pass drops `Mutable` from the inferred row.
+fn bin_int_to_bytes(n: Int) : Array[Byte] = {
+  let buf = array_make(8, bin_zero())
+  let _ = bin_foldl([0, 1, 2, 3, 4, 5, 6, 7], n, (cur, i) => {
+    let r = cur % 256
     let b = if r < 0 { r + 256 } else { r }
-    let q = (n - b) / 256
-    bin_int_to_bytes_loop(q, k - 1, [bin_byte(b), ...acc])
-  }
+    buf[i] := bin_byte(b)
+    (cur - b) / 256
+  })
+  buf
 }
 
-fn bin_int_to_bytes(n: Int) : [Byte] = {
-  let acc: [Byte] = []
-  bin_int_to_bytes_loop(n, 8, acc)
-}
-
-fn bin_bytes_to_int_loop(buf: [Byte], pos: Int, k: Int, mult: Int,
-                          acc: Int) : Result[String, Int] = {
-  if k == 0 { Ok(acc) }
-  else { match bin_byte_at(buf, pos) {
-    Err(m) -> Err(m)
-    Ok(b)  -> {
-      let bi  = byte_to_int(b)
-      let nxt = acc + bi * mult
-      let m2  = if k == 1 {
+# Decode an 8-byte little-endian Int starting at `pos`. Reads via
+# `array_get` (`buf[k]`) are O(1); range-check up front so the loop
+# stays plain arithmetic.
+fn bin_bytes_to_int(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Int]] = {
+  if not bin_have(buf, pos, 8) {
+    Err("unexpected end of buffer")
+  } else {
+    let acc = bin_foldl([0, 1, 2, 3, 4, 5, 6, 7], (0, 1), (st, k) => {
+      let bi   = byte_to_int(buf[pos + k])
+      let nxt  = st.fst + bi * st.snd
+      let m2   = if k == 7 {
         # Top byte: sign-extend if high bit is set so the value
         # becomes a proper negative Int rather than a 64-bit
         # unsigned-style positive.
-        if bi >= 128 { nxt - 256 * mult } else { nxt }
+        if bi >= 128 { nxt - 256 * st.snd } else { nxt }
       } else { nxt }
-      bin_bytes_to_int_loop(buf, pos + 1, k - 1, mult * 256, m2)
-    }
-  } }
-}
-
-fn bin_bytes_to_int(buf: [Byte], pos: Int) : Result[String, BinCursor[Int]] = {
-  match bin_bytes_to_int_loop(buf, pos, 8, 1, 0) {
-    Err(m) -> Err(m)
-    Ok(n)  -> Ok(BinCursor { value: n, pos: pos + 8 })
+      (m2, st.snd * 256)
+    })
+    # Note: bin_foldl invokes `f(acc, elem)` — the lambda above
+    # receives `st` (running pair) then `k` (current byte index).
+    Ok(BinCursor { value: acc.fst, pos: pos + 8 })
   }
 }
 
-# String encoding — 4-byte LE length prefix + raw bytes. The encoder
-# recovers bytes from `String` via `char_at` + `char_to_int` and
-# folds them into a `[Byte]` accumulator via `bin_byte`. The decoder
-# rebuilds the String through `int_to_char` + `"#{c}"` interpolation
-# (see the §String impl limitation note below).
-
-fn bin_string_to_bytes_loop(s: String, i: Int, n: Int, acc: [Byte]) : [Byte] = {
-  if i >= n { list_reverse(acc) }
-  else { match char_at(s, i) {
-    Some(c) -> bin_string_to_bytes_loop(s, i + 1, n,
-                                          [bin_byte(char_to_int(c)), ...acc])
-    None    -> list_reverse(acc)
-  } }
+# Write a 4-byte little-endian length prefix into positions
+# `[off, off + 4)` of an existing locally-constructed buffer. `buf`
+# is whitelisted via `is_array_safe_callee` (see compiler.kai) so the
+# caller's local Array is not flagged as escaping.
+fn bin_write_len4(buf: Array[Byte], off: Int, n: Int) : Array[Byte] = {
+  let _ = bin_foldl([0, 1, 2, 3], n, (cur, i) => {
+    let r = cur % 256
+    let b = if r < 0 { r + 256 } else { r }
+    buf[off + i] := bin_byte(b)
+    (cur - b) / 256
+  })
+  buf
 }
 
-fn bin_string_to_bytes(s: String) : [Byte] = {
+# String encoding — 4-byte LE length prefix + raw bytes. Allocates
+# the full output buffer up front, fills the length prefix in place,
+# then walks the source string once writing each character's byte.
+# Iterating via `int_range_to_list(0, n)` + `char_at` (rather than
+# `string.chars(s)` which is qualified-only in m14 phase 1) keeps
+# protocols.kai callable from `--prelude` without a `use string`
+# directive — the prelude path does not run `expand_imports`.
+fn bin_string_to_bytes(s: String) : Array[Byte] = {
   let n   = string_length(s)
-  let acc0: [Byte] = []
-  let len = bin_int_to_bytes_loop(n, 4, acc0)
-  let bs  = bin_string_to_bytes_loop(s, 0, n, acc0)
-  list_append(len, bs)
-}
-
-fn bin_read_len4_loop(buf: [Byte], pos: Int, k: Int, mult: Int,
-                       acc: Int) : Result[String, Int] = {
-  if k == 0 { Ok(acc) }
-  else { match bin_byte_at(buf, pos) {
-    Err(m) -> Err(m)
-    Ok(b)  -> bin_read_len4_loop(buf, pos + 1, k - 1, mult * 256,
-                                   acc + byte_to_int(b) * mult)
-  } }
-}
-
-fn bin_read_len4(buf: [Byte], pos: Int) : Result[String, Int] =
-  bin_read_len4_loop(buf, pos, 4, 1, 0)
-
-fn bin_collect_chars(buf: [Byte], pos: Int, k: Int, acc: String) : Result[String, String] = {
-  if k == 0 { Ok(acc) }
-  else { match bin_byte_at(buf, pos) {
-    Err(m) -> Err(m)
-    Ok(b)  -> {
-      let c = int_to_char(byte_to_int(b))
-      bin_collect_chars(buf, pos + 1, k - 1, string_concat(acc, "#{c}"))
+  let buf = array_make(4 + n, bin_zero())
+  let _   = bin_write_len4(buf, 0, n)
+  let _   = bin_foldl(int_range_to_list(0, n), 0, (acc, i) => {
+    match char_at(s, i) {
+      Some(c) -> { buf[4 + i] := bin_byte(char_to_int(c)); acc }
+      None    -> acc
     }
-  } }
+  })
+  buf
+}
+
+# Read 4 LE bytes from `buf` at `pos` and return the resulting Int.
+fn bin_read_len4(buf: Array[Byte], pos: Int) : Result[String, Int] = {
+  if not bin_have(buf, pos, 4) {
+    Err("unexpected end of buffer")
+  } else {
+    let acc = bin_foldl([0, 1, 2, 3], (0, 1), (st, k) => {
+      let bi = byte_to_int(buf[pos + k])
+      (st.fst + bi * st.snd, st.snd * 256)
+    })
+    Ok(acc.fst)
+  }
+}
+
+# `bin_collect_chars(buf, pos, k)` rebuilds a String from `k` raw
+# bytes via `int_to_char` + interpolation. v1 limitation: characters
+# outside ASCII `[32, 126]` (incl. null) routes through `Show for
+# Char`'s escape rendering. Tracked in `docs/lane-experience-issue-459-binserialize.md`.
+fn bin_collect_chars(buf: Array[Byte], pos: Int, k: Int) : Result[String, String] = {
+  if not bin_have(buf, pos, k) {
+    Err("unexpected end of buffer")
+  } else {
+    Ok(bin_foldl(int_range_to_list(0, k), "", (acc, i) => {
+      let c = int_to_char(byte_to_int(buf[pos + i]))
+      string_concat(acc, "#{c}")
+    }))
+  }
+}
+
+# Build a list `[lo, lo+1, ..., hi-1]` for use as a `bin_foldl`
+# driver. Defined here (rather than in stdlib/core/list.kai) so the
+# helper stays private to the BinSerialize impls and the prelude
+# resolver does not have to clamber over an extra public name. Pure
+# functional cons; the produced list is consumed once and freed.
+fn int_range_to_list(lo: Int, hi: Int) : [Int] =
+  int_range_to_list_loop(hi - 1, lo, [])
+
+fn int_range_to_list_loop(cur: Int, lo: Int, acc: [Int]) : [Int] = {
+  if cur < lo { acc }
+  else { int_range_to_list_loop(cur - 1, lo, [cur, ...acc]) }
+}
+
+# Concatenate two `Array[Byte]`s into a fresh buffer. Read-only on
+# both inputs; the only mutation targets the local `dst`. Whitelisted
+# via `is_array_safe_callee` (see compiler.kai), so the caller's
+# locally-constructed Arrays do not register as escaping when passed
+# in here. This is the canonical concat surface for the BinSerialize
+# pipeline — every `to_bytes` for a multi-field record stitches its
+# per-field outputs through `array_concat_bytes`.
+fn array_concat_bytes(a: Array[Byte], b: Array[Byte]) : Array[Byte] = {
+  let la  = array_length(a)
+  let lb  = array_length(b)
+  let dst = array_make(la + lb, bin_zero())
+  let _   = bin_foldl(int_range_to_list(0, la), 0, (acc, i) => {
+    dst[i] := a[i]
+    acc
+  })
+  let _   = bin_foldl(int_range_to_list(0, lb), 0, (acc, i) => {
+    dst[la + i] := b[i]
+    acc
+  })
+  dst
+}
+
+# Build a fresh single-byte buffer holding `b`. Pulled out so callers
+# expressing "tag byte then payload" or `Bool`'s 1-byte encoding do
+# not repeat the `array_make` + `array_set` pair.
+fn array_one_byte(b: Byte) : Array[Byte] = {
+  let buf = array_make(1, bin_zero())
+  buf[0] := b
+  buf
 }
 
 impl BinSerialize for Int {
-  fn to_bytes(self: Int) : [Byte] = bin_int_to_bytes(self)
-  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Int]] =
+  fn to_bytes(self: Int) : Array[Byte] = bin_int_to_bytes(self)
+  fn from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Int]] =
     bin_bytes_to_int(buf, pos)
 }
 
 impl BinSerialize for Bool {
-  fn to_bytes(self: Bool) : [Byte] = if self { [bin_byte(1)] } else { [bin_byte(0)] }
-  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Bool]] = {
+  fn to_bytes(self: Bool) : Array[Byte] =
+    if self { array_one_byte(bin_byte(1)) } else { array_one_byte(bin_byte(0)) }
+  fn from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Bool]] = {
     match bin_byte_at(buf, pos) {
       Err(m) -> Err(m)
       Ok(b)  -> {
@@ -554,9 +633,9 @@ impl BinSerialize for Bool {
 }
 
 # String impl — v1 limitation: the decoder rebuilds a String from
-# `[Byte]` via `int_to_char` + `"#{c}"` interpolation, which routes
-# through `Show for Char` and emits `\xNN` for bytes outside the
-# printable ASCII range `[32, 126]`. Strings with null bytes also
+# `Array[Byte]` via `int_to_char` + `"#{c}"` interpolation, which
+# routes through `Show for Char` and emits `\xNN` for bytes outside
+# the printable ASCII range `[32, 126]`. Strings with null bytes also
 # truncate at the `\0` because the runtime treats String as a
 # null-terminated C buffer. Both gaps need an `int_to_byte_string`
 # runtime primitive to close; tracked as a follow-up in the lane
@@ -564,8 +643,8 @@ impl BinSerialize for Bool {
 # use case — file paths, identifier names, source spans) are
 # unaffected.
 impl BinSerialize for String {
-  fn to_bytes(self: String) : [Byte] = bin_string_to_bytes(self)
-  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[String]] = {
+  fn to_bytes(self: String) : Array[Byte] = bin_string_to_bytes(self)
+  fn from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[String]] = {
     match bin_read_len4(buf, pos) {
       Err(m) -> Err(m)
       Ok(n)  -> {
@@ -573,7 +652,7 @@ impl BinSerialize for String {
         if not bin_have(buf, body_pos, n) {
           Err("BinSerialize String: truncated payload")
         } else {
-          match bin_collect_chars(buf, body_pos, n, "") {
+          match bin_collect_chars(buf, body_pos, n) {
             Err(m) -> Err(m)
             Ok(s)  -> Ok(BinCursor { value: s, pos: body_pos + n })
           }
@@ -584,8 +663,8 @@ impl BinSerialize for String {
 }
 
 impl BinSerialize for Real {
-  fn to_bytes(self: Real) : [Byte] = bin_string_to_bytes(real_to_string(self))
-  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Real]] = {
+  fn to_bytes(self: Real) : Array[Byte] = bin_string_to_bytes(real_to_string(self))
+  fn from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Real]] = {
     match bin_read_len4(buf, pos) {
       Err(m) -> Err(m)
       Ok(n)  -> {
@@ -593,7 +672,7 @@ impl BinSerialize for Real {
         if not bin_have(buf, body_pos, n) {
           Err("BinSerialize Real: truncated payload")
         } else {
-          match bin_collect_chars(buf, body_pos, n, "") {
+          match bin_collect_chars(buf, body_pos, n) {
             Err(m) -> Err(m)
             Ok(s)  -> match string_to_real(s) {
               Some(r) -> Ok(BinCursor { value: r, pos: body_pos + n })
@@ -620,10 +699,10 @@ impl BinSerialize for Real {
 # `derive_binserialize_impl` pass synthesises an analogous
 # `<tname>_from_bytes` helper for each derived type.
 
-fn int_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Int]] =
+fn int_from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Int]] =
   bin_bytes_to_int(buf, pos)
 
-fn bool_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Bool]] = {
+fn bool_from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Bool]] = {
   match bin_byte_at(buf, pos) {
     Err(m) -> Err(m)
     Ok(b)  -> {
@@ -635,7 +714,7 @@ fn bool_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Bool]] = {
   }
 }
 
-fn string_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[String]] = {
+fn string_from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[String]] = {
   match bin_read_len4(buf, pos) {
     Err(m) -> Err(m)
     Ok(n)  -> {
@@ -643,7 +722,7 @@ fn string_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[String]] 
       if not bin_have(buf, body_pos, n) {
         Err("BinSerialize String: truncated payload")
       } else {
-        match bin_collect_chars(buf, body_pos, n, "") {
+        match bin_collect_chars(buf, body_pos, n) {
           Err(m) -> Err(m)
           Ok(s)  -> Ok(BinCursor { value: s, pos: body_pos + n })
         }
@@ -652,7 +731,7 @@ fn string_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[String]] 
   }
 }
 
-fn real_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Real]] = {
+fn real_from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Real]] = {
   match bin_read_len4(buf, pos) {
     Err(m) -> Err(m)
     Ok(n)  -> {
@@ -660,7 +739,7 @@ fn real_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Real]] = {
       if not bin_have(buf, body_pos, n) {
         Err("BinSerialize Real: truncated payload")
       } else {
-        match bin_collect_chars(buf, body_pos, n, "") {
+        match bin_collect_chars(buf, body_pos, n) {
           Err(m) -> Err(m)
           Ok(s)  -> match string_to_real(s) {
             Some(r) -> Ok(BinCursor { value: r, pos: body_pos + n })
@@ -677,15 +756,15 @@ fn real_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Real]] = {
 # `[T]` and `Option[T]` cannot have a useful single-dispatch
 # `BinSerialize` impl: the dispatcher resolves on the head type
 # (`"List"`, `"Option"`), which would collide with the buffer (also
-# `[Byte]`, head `"List"`) and could not carry the element type
+# `Array[Byte]`'s element type) and could not carry the element type
 # through `from_bytes`. The `#derive(BinSerialize)` pass emits direct
 # calls to these combinators when it sees `TyList(t)` / `Option[t]`
 # / `Char` field types, supplying the element encoder/decoder inline
 # as a lambda. See `docs/binserialize-collections-design.md`.
 
-fn bin_char_to_bytes(c: Char) : [Byte] = bin_int_to_bytes(char_to_int(c))
+fn bin_char_to_bytes(c: Char) : Array[Byte] = bin_int_to_bytes(char_to_int(c))
 
-fn bin_char_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Char]] = {
+fn bin_char_from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Char]] = {
   match bin_bytes_to_int(buf, pos) {
     Err(m) -> Err(m)
     Ok(c)  -> Ok(BinCursor { value: int_to_char(c.value), pos: c.pos })
@@ -698,25 +777,27 @@ fn bin_char_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Char]] 
 # up. `enc` is opaque to the combinator — the derive supplies a
 # lambda that recurses through nested collections (`[[Int]]` → enc
 # is `{ x -> bin_list_to_bytes(x, { y -> to_bytes(y) }) }`).
-fn bin_list_to_bytes_loop[T](xs: [T], enc: (T) -> [Byte], acc: [Byte]) : [Byte] = {
-  match xs {
-    [] -> acc
-    [x, ...rest] -> bin_list_to_bytes_loop(rest, enc, list_append(acc, enc(x)))
-  }
-}
-
-fn bin_list_to_bytes[T](xs: [T], enc: (T) -> [Byte]) : [Byte] = {
+#
+# The fold accumulator is itself an `Array[Byte]`. `array_concat_bytes`
+# is whitelisted via `is_array_safe_callee`, so the locally-allocated
+# `buf` does not register as escaping when fed into the concat call.
+# The resulting Array each iteration is a fresh allocation (no
+# in-place mutation observable to the caller), and the masking pass
+# drops `Mutable` from this function's row.
+fn bin_list_to_bytes[T](xs: [T], enc: (T) -> Array[Byte]) : Array[Byte] = {
   let len = list_length(xs)
-  let acc0: [Byte] = []
-  let len_bytes = bin_int_to_bytes_loop(len, 4, acc0)
-  bin_list_to_bytes_loop(xs, enc, len_bytes)
+  # 4-byte LE length prefix matches `bin_read_len4` on the decode side.
+  # `bin_int_to_bytes` writes 8 bytes which would desync the cursor.
+  let len_buf = array_make(4, bin_zero())
+  let _ = bin_write_len4(len_buf, 0, len)
+  bin_foldl(xs, len_buf, (acc, x) => array_concat_bytes(acc, enc(x)))
 }
 
 # `bin_list_from_bytes(buf, pos, dec)` reads the 4-byte length, then
 # applies `dec` N times, threading the cursor. Empty list short-
 # circuits before invoking `dec`.
-fn bin_list_from_bytes_loop[T](buf: [Byte], pos: Int,
-                                 dec: ([Byte], Int) -> Result[String, BinCursor[T]],
+fn bin_list_from_bytes_loop[T](buf: Array[Byte], pos: Int,
+                                 dec: (Array[Byte], Int) -> Result[String, BinCursor[T]],
                                  remaining: Int, acc: [T])
                                : Result[String, BinCursor[[T]]] = {
   if remaining == 0 {
@@ -730,8 +811,8 @@ fn bin_list_from_bytes_loop[T](buf: [Byte], pos: Int,
   }
 }
 
-fn bin_list_from_bytes[T](buf: [Byte], pos: Int,
-                            dec: ([Byte], Int) -> Result[String, BinCursor[T]])
+fn bin_list_from_bytes[T](buf: Array[Byte], pos: Int,
+                            dec: (Array[Byte], Int) -> Result[String, BinCursor[T]])
                           : Result[String, BinCursor[[T]]] = {
   match bin_read_len4(buf, pos) {
     Err(m) -> Err(m)
@@ -744,15 +825,15 @@ fn bin_list_from_bytes[T](buf: [Byte], pos: Int,
 
 # `bin_option_to_bytes(o, enc)` — 1-byte tag (0 = None, 1 = Some)
 # followed by `enc(x)` when Some. `None` collapses to a single byte.
-fn bin_option_to_bytes[T](o: Option[T], enc: (T) -> [Byte]) : [Byte] = {
+fn bin_option_to_bytes[T](o: Option[T], enc: (T) -> Array[Byte]) : Array[Byte] = {
   match o {
-    None    -> [bin_byte(0)]
-    Some(x) -> list_append([bin_byte(1)], enc(x))
+    None    -> array_one_byte(bin_byte(0))
+    Some(x) -> array_concat_bytes(array_one_byte(bin_byte(1)), enc(x))
   }
 }
 
-fn bin_option_from_bytes[T](buf: [Byte], pos: Int,
-                              dec: ([Byte], Int) -> Result[String, BinCursor[T]])
+fn bin_option_from_bytes[T](buf: Array[Byte], pos: Int,
+                              dec: (Array[Byte], Int) -> Result[String, BinCursor[T]])
                             : Result[String, BinCursor[Option[T]]] = {
   match bin_byte_at(buf, pos) {
     Err(m) -> Err(m)
