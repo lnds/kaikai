@@ -83,6 +83,15 @@ kai build examples/phase4/euler1.kai -o euler1
 #  sum = 233168
 ```
 
+The default backend emits portable C and links it with `cc`. Pass
+`--backend=llvm` to emit LLVM IR via `kaic2 --emit=llvm` and link it
+with `clang` (must be on `PATH`, or set `CLANG`). The LLVM path is L1
+of the LLVM-direct refactor — opt-in for now, useful when you want to
+sidestep the C compiler on the hot edit/build cycle. The full stdlib
+prelude still hits emitter gaps under the LLVM path; combine
+`--backend=llvm` with `KAI_NO_STDLIB=1` for the subset that's covered
+today.
+
 Run the inline test blocks in a file:
 
 ```sh
