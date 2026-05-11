@@ -205,9 +205,10 @@ issue** as of 2026-05-09; the previous citations of #92 and
 per-call-site dropmask`, closed; #120 is `Perceus: opt-in
 regions for parser/lexer scratch buffers`, open) and have been
 removed. Open a tracking issue for LSP when that lane actually
-starts. **REPL is removed from v1.0** — see #406 and
-`docs/decisions/repl-removal-2026-05-09.md`; it may return as a
-post-1.0 ergonomic, not as a v1 deliverable.
+starts. **REPL is removed permanently** — see #406 and
+`docs/decisions/repl-removal-2026-05-09.md`. Not in v1.0, not in
+v1.x, not on the roadmap. `kai run` + `kai watch` cover the
+ad-hoc evaluation workflow.
 
 **Scope — precondition work (landed early, 2026-05-03 → 2026-05-05)**:
 
