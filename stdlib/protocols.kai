@@ -358,6 +358,320 @@ impl Serialize for Bool {
     else { Err("not a bool") }
 }
 
+# ---- BinSerialize (issue #459) ------------------------------------
+#
+# Cursor-based binary serialization on `[Byte]`. `Byte` is a
+# transparent alias of `Int` declared in `stdlib/core/byte.kai`,
+# restored after PR #378 (issue #376) made `type X = T` aliases
+# unify with their RHS again — the gap that retired the previous
+# attempt (referenced in `stdlib/effects.kai` §`NetTcp`) is closed.
+# When a true `u8` primitive lands (the post-#459 u8 lane), `Byte`
+# flips to `pub type Byte = u8` and BinSerialize's surface does not
+# move. Each element is a byte in `[0, 255]`; producers truncate
+# higher bits, consumers treat anything outside the range as a
+# malformed buffer.
+#
+# Why a sibling of Serialize and not a refit: Serialize is the
+# whole-string "config / round-trip" protocol; BinSerialize is the
+# stream/cursor "feed me a prefix, give me back what's left" protocol
+# the Phase A precompiled-prelude cache (#452) needs. Two protocols
+# with overlapping but non-identical semantics — see #459 design
+# notes for the trade-off.
+#
+# Shape:
+#   to_bytes(self)             : [Byte]
+#   from_bytes(buf, pos)       : Result[String, BinCursor[Self]]
+#                                # Ok({ value, pos: next_pos }) | Err(msg)
+#
+# `BinCursor[t]` is the cursor return shape — a local record so
+# `stdlib/protocols.kai` does not depend on `stdlib/core/tuple.kai`
+# (which declares `Pair[a, b]`, the desugar target of the `(a, b)`
+# tuple sugar). Test harnesses that bundle `protocols.kai` without
+# `core/tuple.kai` (e.g. `complex_literal_basic` in `test-sugars`)
+# would otherwise see `Pair` unresolved at every `from_bytes` call
+# site.
+#
+# Encoding (v1):
+#   Int    — 8-byte little-endian two's complement (assumes Int = i64).
+#   Real   — length-prefixed UTF-8 of `real_to_string` (decimal). Pinned
+#            here as a v1 fallback because no `real_to_bits` runtime
+#            primitive exists yet; finite values round-trip exactly via
+#            kaikai's existing `string_to_real`. Tracked as follow-up
+#            in `docs/lane-experience-issue-459-binserialize.md`.
+#   String — 4-byte little-endian length prefix + raw bytes.
+#   Bool   — 1 byte (0 = false, 1 = true).
+
+pub type BinCursor[t] = { value: t, pos: Int }
+
+protocol BinSerialize {
+  to_bytes(self: Self) : [Byte]
+  from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Self]]
+}
+
+# --- low-level helpers (private to the BinSerialize impls) --------
+#
+# `bin_*` is the namespace prefix; the module exports nothing because
+# stdlib/protocols.kai loads as a flat prelude and we want the helper
+# names out of the bare-name resolver's reach.
+
+# `bin_byte(n)` is the internal Int → Byte coercion. Every call site
+# below masks its input through `% 256` (with negative-wrap fold)
+# before invoking, so the value is always in `[0, 255]` and the
+# `int_to_byte` Result.Err branch is unreachable; we panic on it
+# rather than thread an error type through every helper. After
+# Lane 4 made `Byte` nominal the explicit conversion replaces the
+# old `Byte = Int` transparent-alias shorthand.
+fn bin_byte(n: Int) : Byte = match int_to_byte(n) {
+  Ok(b)  -> b
+  Err(m) -> panic(m)
+}
+
+fn bin_byte_at(buf: [Byte], pos: Int) : Result[String, Byte] = match buf {
+  []           -> Err("unexpected end of buffer")
+  [b, ...rest] -> if pos == 0 { Ok(b) } else { bin_byte_at(rest, pos - 1) }
+}
+
+fn bin_have(buf: [Byte], pos: Int, n: Int) : Bool = {
+  if n == 0 { true }
+  else { match bin_byte_at(buf, pos) {
+    Ok(_)  -> bin_have(buf, pos + 1, n - 1)
+    Err(_) -> false
+  } }
+}
+
+# Encode an Int as 8 little-endian bytes in [0, 255]. Negatives wrap
+# via the standard two's-complement masking trick: AND with 0xFF
+# isn't available as a builtin yet, so we use `% 256` plus a `+ 256`
+# fold that brings any negative remainder into range. The decoder
+# reverses with the same shape.
+fn bin_int_to_bytes_loop(n: Int, k: Int, acc: [Byte]) : [Byte] = {
+  if k == 0 { list_reverse(acc) }
+  else {
+    let r = n % 256
+    let b = if r < 0 { r + 256 } else { r }
+    let q = (n - b) / 256
+    bin_int_to_bytes_loop(q, k - 1, [bin_byte(b), ...acc])
+  }
+}
+
+fn bin_int_to_bytes(n: Int) : [Byte] = {
+  let acc: [Byte] = []
+  bin_int_to_bytes_loop(n, 8, acc)
+}
+
+fn bin_bytes_to_int_loop(buf: [Byte], pos: Int, k: Int, mult: Int,
+                          acc: Int) : Result[String, Int] = {
+  if k == 0 { Ok(acc) }
+  else { match bin_byte_at(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(b)  -> {
+      let bi  = byte_to_int(b)
+      let nxt = acc + bi * mult
+      let m2  = if k == 1 {
+        # Top byte: sign-extend if high bit is set so the value
+        # becomes a proper negative Int rather than a 64-bit
+        # unsigned-style positive.
+        if bi >= 128 { nxt - 256 * mult } else { nxt }
+      } else { nxt }
+      bin_bytes_to_int_loop(buf, pos + 1, k - 1, mult * 256, m2)
+    }
+  } }
+}
+
+fn bin_bytes_to_int(buf: [Byte], pos: Int) : Result[String, BinCursor[Int]] = {
+  match bin_bytes_to_int_loop(buf, pos, 8, 1, 0) {
+    Err(m) -> Err(m)
+    Ok(n)  -> Ok(BinCursor { value: n, pos: pos + 8 })
+  }
+}
+
+# String encoding — 4-byte LE length prefix + raw bytes. The encoder
+# recovers bytes from `String` via `char_at` + `char_to_int` and
+# folds them into a `[Byte]` accumulator via `bin_byte`. The decoder
+# rebuilds the String through `int_to_char` + `"#{c}"` interpolation
+# (see the §String impl limitation note below).
+
+fn bin_string_to_bytes_loop(s: String, i: Int, n: Int, acc: [Byte]) : [Byte] = {
+  if i >= n { list_reverse(acc) }
+  else { match char_at(s, i) {
+    Some(c) -> bin_string_to_bytes_loop(s, i + 1, n,
+                                          [bin_byte(char_to_int(c)), ...acc])
+    None    -> list_reverse(acc)
+  } }
+}
+
+fn bin_string_to_bytes(s: String) : [Byte] = {
+  let n   = string_length(s)
+  let acc0: [Byte] = []
+  let len = bin_int_to_bytes_loop(n, 4, acc0)
+  let bs  = bin_string_to_bytes_loop(s, 0, n, acc0)
+  list_append(len, bs)
+}
+
+fn bin_read_len4_loop(buf: [Byte], pos: Int, k: Int, mult: Int,
+                       acc: Int) : Result[String, Int] = {
+  if k == 0 { Ok(acc) }
+  else { match bin_byte_at(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(b)  -> bin_read_len4_loop(buf, pos + 1, k - 1, mult * 256,
+                                   acc + byte_to_int(b) * mult)
+  } }
+}
+
+fn bin_read_len4(buf: [Byte], pos: Int) : Result[String, Int] =
+  bin_read_len4_loop(buf, pos, 4, 1, 0)
+
+fn bin_collect_chars(buf: [Byte], pos: Int, k: Int, acc: String) : Result[String, String] = {
+  if k == 0 { Ok(acc) }
+  else { match bin_byte_at(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(b)  -> {
+      let c = int_to_char(byte_to_int(b))
+      bin_collect_chars(buf, pos + 1, k - 1, string_concat(acc, "#{c}"))
+    }
+  } }
+}
+
+impl BinSerialize for Int {
+  fn to_bytes(self: Int) : [Byte] = bin_int_to_bytes(self)
+  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Int]] =
+    bin_bytes_to_int(buf, pos)
+}
+
+impl BinSerialize for Bool {
+  fn to_bytes(self: Bool) : [Byte] = if self { [bin_byte(1)] } else { [bin_byte(0)] }
+  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Bool]] = {
+    match bin_byte_at(buf, pos) {
+      Err(m) -> Err(m)
+      Ok(b)  -> {
+        let n = byte_to_int(b)
+        if n == 0 { Ok(BinCursor { value: false, pos: pos + 1 }) }
+        else if n == 1 { Ok(BinCursor { value: true,  pos: pos + 1 }) }
+        else { Err("BinSerialize Bool: byte out of range") }
+      }
+    }
+  }
+}
+
+# String impl — v1 limitation: the decoder rebuilds a String from
+# `[Byte]` via `int_to_char` + `"#{c}"` interpolation, which routes
+# through `Show for Char` and emits `\xNN` for bytes outside the
+# printable ASCII range `[32, 126]`. Strings with null bytes also
+# truncate at the `\0` because the runtime treats String as a
+# null-terminated C buffer. Both gaps need an `int_to_byte_string`
+# runtime primitive to close; tracked as a follow-up in the lane
+# retro for #459. ASCII-only callers (the Phase A cache's primary
+# use case — file paths, identifier names, source spans) are
+# unaffected.
+impl BinSerialize for String {
+  fn to_bytes(self: String) : [Byte] = bin_string_to_bytes(self)
+  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[String]] = {
+    match bin_read_len4(buf, pos) {
+      Err(m) -> Err(m)
+      Ok(n)  -> {
+        let body_pos = pos + 4
+        if not bin_have(buf, body_pos, n) {
+          Err("BinSerialize String: truncated payload")
+        } else {
+          match bin_collect_chars(buf, body_pos, n, "") {
+            Err(m) -> Err(m)
+            Ok(s)  -> Ok(BinCursor { value: s, pos: body_pos + n })
+          }
+        }
+      }
+    }
+  }
+}
+
+impl BinSerialize for Real {
+  fn to_bytes(self: Real) : [Byte] = bin_string_to_bytes(real_to_string(self))
+  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Real]] = {
+    match bin_read_len4(buf, pos) {
+      Err(m) -> Err(m)
+      Ok(n)  -> {
+        let body_pos = pos + 4
+        if not bin_have(buf, body_pos, n) {
+          Err("BinSerialize Real: truncated payload")
+        } else {
+          match bin_collect_chars(buf, body_pos, n, "") {
+            Err(m) -> Err(m)
+            Ok(s)  -> match string_to_real(s) {
+              Some(r) -> Ok(BinCursor { value: r, pos: body_pos + n })
+              None    -> Err("BinSerialize Real: invalid decimal payload")
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Per-type wrappers (issue #459): v1 single-dispatch picks the impl
+# from the first argument's type. For `to_bytes(self)` that is Self,
+# so dispatch is always correct. For `from_bytes(buf, pos)` Self
+# appears only in the return position, so a bare `from_bytes(bs, 0)`
+# dispatches on `[Byte]` (the buffer's type) and finds no impl. The
+# typer has no annotation-driven backstop for this in v1 (same
+# limitation Serialize.from_string and Default.default ride —
+# documented in the §Serialize prologue above).
+#
+# Until annotation-aware lookup lands, these sibling names give
+# users a non-overloaded entry point for each primitive impl. The
+# `derive_binserialize_impl` pass synthesises an analogous
+# `<tname>_from_bytes` helper for each derived type.
+
+fn int_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Int]] =
+  bin_bytes_to_int(buf, pos)
+
+fn bool_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Bool]] = {
+  match bin_byte_at(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(b)  -> {
+      let n = byte_to_int(b)
+      if n == 0 { Ok(BinCursor { value: false, pos: pos + 1 }) }
+      else if n == 1 { Ok(BinCursor { value: true,  pos: pos + 1 }) }
+      else { Err("BinSerialize Bool: byte out of range") }
+    }
+  }
+}
+
+fn string_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[String]] = {
+  match bin_read_len4(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(n)  -> {
+      let body_pos = pos + 4
+      if not bin_have(buf, body_pos, n) {
+        Err("BinSerialize String: truncated payload")
+      } else {
+        match bin_collect_chars(buf, body_pos, n, "") {
+          Err(m) -> Err(m)
+          Ok(s)  -> Ok(BinCursor { value: s, pos: body_pos + n })
+        }
+      }
+    }
+  }
+}
+
+fn real_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Real]] = {
+  match bin_read_len4(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(n)  -> {
+      let body_pos = pos + 4
+      if not bin_have(buf, body_pos, n) {
+        Err("BinSerialize Real: truncated payload")
+      } else {
+        match bin_collect_chars(buf, body_pos, n, "") {
+          Err(m) -> Err(m)
+          Ok(s)  -> match string_to_real(s) {
+            Some(r) -> Ok(BinCursor { value: r, pos: body_pos + n })
+            None    -> Err("BinSerialize Real: invalid decimal payload")
+          }
+        }
+      }
+    }
+  }
+}
+
 # ---- Default (issue #258) -----------------------------------------
 #
 # `default() : Self` has Self only in the return position, so v1
