@@ -327,7 +327,7 @@ polymorphic-impl machinery.
    stdlib re-parsing on every `kai build` invocation. Required
    lanes (prerequisite chain):
 
-   - #453 — runtime `prelude_read_bytes` (LSP precursor, ~2-4 h).
+   - #453 — runtime `prelude_read_bytes` (LSP precursor, ~2-4 h) — **shipped**.
    - #454 — compiler library mode (typed AST retention + span index
      for queries, ~4-7 days, selfhost waiver).
    - #452 — Phase A stdlib precompiled cache (depends on #454,

@@ -471,6 +471,7 @@ static const struct {
     { "read_file",      "kai_prelude_read_file",      1 },
     { "write_file",     "kai_prelude_write_file",     2 },
     { "read_line",      "kai_prelude_read_line",      0 },
+    { "read_bytes",     "kai_prelude_read_bytes",     1 },
     { "string_to_int",  "kai_prelude_string_to_int",  1 },
     { "string_to_real", "kai_prelude_string_to_real", 1 },
     { "char_at",        "kai_prelude_char_at",        2 },
