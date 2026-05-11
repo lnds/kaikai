@@ -1129,8 +1129,14 @@ test-stdlib: $(TARGET) build
 	    || { echo "stdlib FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) -I ../stage0 build/stdlib-$$name.c -o build/stdlib-$$name $(LDLIBS_M) \
 	    || { echo "stdlib FAIL $$name (C compile failed)"; exit 1; }; \
-	  ./build/stdlib-$$name > build/stdlib-$$name.out \
-	    || { echo "stdlib FAIL $$name (run errored)"; cat build/stdlib-$$name.out; exit 1; }; \
+	  in=../examples/stdlib/$$name.in; \
+	  if [ -f $$in ]; then \
+	    ./build/stdlib-$$name < $$in > build/stdlib-$$name.out \
+	      || { echo "stdlib FAIL $$name (run errored)"; cat build/stdlib-$$name.out; exit 1; }; \
+	  else \
+	    ./build/stdlib-$$name > build/stdlib-$$name.out \
+	      || { echo "stdlib FAIL $$name (run errored)"; cat build/stdlib-$$name.out; exit 1; }; \
+	  fi; \
 	  diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out > /dev/null \
 	    && echo "stdlib OK $$name" \
 	    || { echo "stdlib DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out; exit 1; }; \

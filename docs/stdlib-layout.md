@@ -377,7 +377,7 @@ Single top-level module. Per-function effects: `print` / `println` /
 `eprint` / `eprintln` declare `/ Console`; `read_line` / `read_all`
 declare `/ Stdin`.
 
-- `io` — `print`, `println`, `eprint`, `eprintln`, `read_line`, `read_all`
+- `io` — `print`, `println`, `eprint`, `eprintln`, `read_line`, `read_all`, `read_bytes(n)` *(byte-oriented stdin, shipped via #453 as the `read_bytes` prelude builtin + `Stdin.read_bytes` effect op; LSP framing precursor for #447)*
 
 ### fs (`/ File`)
 

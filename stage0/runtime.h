@@ -3802,6 +3802,29 @@ static KaiValue *kai_prelude_read_line(void) {
     return kai_variant(0, "Ok", 1, &s);
 }
 
+/* Issue #453: byte-oriented stdin read. Reads up to `n` raw bytes
+ * from stdin (including '\n') and returns them as a String. On EOF
+ * the returned String is shorter than `n` — possibly empty. Used
+ * by LSP-style framed protocols where the body length is known up
+ * front and may contain newlines. */
+static KaiValue *kai_prelude_read_bytes(KaiValue *n) {
+    int64_t want = 0;
+    if (n && n->tag == KAI_INT && n->as.i > 0) want = n->as.i;
+    if (n) kai_decref(n);
+    if (want <= 0) return kai_str_from_bytes("", 0);
+    char *buf = (char *) malloc((size_t) want);
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    size_t got = 0;
+    while (got < (size_t) want) {
+        size_t r = fread(buf + got, 1, (size_t) want - got, stdin);
+        if (r == 0) break;
+        got += r;
+    }
+    KaiValue *s = kai_str_from_bytes(buf, got);
+    free(buf);
+    return s;
+}
+
 /* ---------- prelude: parsing and string helpers ---------- */
 
 /* m5.x flip Phase 3 closeout (Perceus Tier 2 audit, 2026-04-29):
@@ -4032,6 +4055,7 @@ static KaiValue *_kai_prelude_dir_create_dir_thunk(KaiValue *s, KaiValue **a, in
 static KaiValue *_kai_prelude_dir_remove_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_dir_remove_dir(a[0]); }
 static KaiValue *_kai_prelude_dir_walk_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_dir_walk(a[0]); }
 static KaiValue *_kai_prelude_read_line_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) a; (void) n; return kai_prelude_read_line(); }
+static KaiValue *_kai_prelude_read_bytes_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_read_bytes(a[0]); }
 static KaiValue *_kai_prelude_string_to_int_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_to_int(a[0]); }
 static KaiValue *_kai_prelude_string_to_real_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_to_real(a[0]); }
 static KaiValue *_kai_prelude_char_at_thunk(KaiValue *s, KaiValue **a, int n)        { (void) s; (void) n; return kai_prelude_char_at(a[0], a[1]); }
@@ -4711,6 +4735,15 @@ static KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k) {
     free(buf);
     KaiValue *some = kai_variant(0, "Some", 1, &s);
     return kai_cont_resume(k, some);
+}
+
+/* Issue #453: default Stdin.read_bytes handler. Reuses the flat
+ * prelude helper which returns a String (possibly shorter than `n`
+ * on EOF). No Result wrapper — the LSP framing use case treats a
+ * short read as end-of-stream. */
+static KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_read_bytes(n));
 }
 
 /* m7a #7: default Env handlers. `args()` reuses kai_prelude_args
