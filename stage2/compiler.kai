@@ -46491,32 +46491,175 @@ fn string_to_lower_ascii_loop(s: String, i: Int, n: Int, acc: String) : String =
   } }
 }
 
+# --- field encoders / decoders --------------------------------------
+#
+# For most field types the encode emits `to_bytes(value)` and the
+# decode emits `__pimpl_BinSerialize_<Head>_from_bytes(buf, pos)`.
+# Three families need combinator support because their head type
+# either collides with the buffer (`List`) or lacks a usable single-
+# dispatch impl (`Option`, `Char`) — see
+# `docs/binserialize-collections-design.md`. For those we emit
+# `bin_list_to_bytes(value, { x -> <encode(elem, x)> })` and the
+# analogous decode shape, recursing into the element type so nested
+# `[[Int]]` / `Option[[String]]` produce correctly stacked lambdas.
+
+# `derive_binser_encode_expr` and `derive_binser_decode_call` emit
+# multiple `ELambda` nodes when the field is a nested
+# collection/option. The lambda lifter (`find_lam`,
+# `stage2/compiler.kai:13359`) keys each lambda by its
+# `(line, col)` position, and a duplicate position causes the
+# emitter to reuse the same `_kai_lam_<id>` symbol for distinct
+# lambdas. The derive site has no real source position for these
+# synthesised lambdas, so we bump `col` per-lambda along three axes
+# that must not collide: field index (handled by callers), encoder
+# vs decoder direction (offsets 1 / 5), and nesting depth (each
+# depth bumps by 8). 8 = 4*2 leaves room for both encoder and
+# decoder lambdas at every depth.
+fn derive_binser_encode_expr(value: Expr, ftype: TypeExpr,
+                               line: Int, col: Int) : Expr =
+  derive_binser_encode_expr_at(value, ftype, line, col, 0)
+
+fn derive_binser_encode_expr_at(value: Expr, ftype: TypeExpr,
+                                  line: Int, col: Int, depth: Int) : Expr {
+  match ftype.tkind {
+    TyList(elem) -> {
+      let lcol = col + depth * 8 + 1
+      let xparam = Param { pname: "__bx", ptype: None, pline: line, pcol: lcol }
+      let xvar = mk_expr(EVar("__bx"), line, lcol)
+      let body = derive_binser_encode_expr_at(xvar, elem, line, col, depth + 1)
+      let enc_lam = mk_expr(ELambda([xparam], body), line, lcol)
+      mk_expr(ECall(mk_expr(EVar("bin_list_to_bytes"), line, col),
+                    [value, enc_lam]), line, col)
+    }
+    TyName(tn, targs) ->
+      if tn == "Option" {
+        match targs {
+          [elem] -> {
+            let lcol = col + depth * 8 + 1
+            let xparam = Param { pname: "__bx", ptype: None, pline: line, pcol: lcol }
+            let xvar = mk_expr(EVar("__bx"), line, lcol)
+            let body = derive_binser_encode_expr_at(xvar, elem, line, col,
+                                                     depth + 1)
+            let enc_lam = mk_expr(ELambda([xparam], body), line, lcol)
+            mk_expr(ECall(mk_expr(EVar("bin_option_to_bytes"), line, col),
+                          [value, enc_lam]), line, col)
+          }
+          _ -> derive_binser_encode_mangled(value, ftype, line, col)
+        }
+      } else if tn == "Char" {
+        mk_expr(ECall(mk_expr(EVar("bin_char_to_bytes"), line, col),
+                      [value]), line, col)
+      } else {
+        derive_binser_encode_mangled(value, ftype, line, col)
+      }
+    _ -> derive_binser_encode_mangled(value, ftype, line, col)
+  }
+}
+
+# For non-collection / non-Char fields the derive emits a direct call
+# to the mangled per-type encoder symbol rather than the protocol
+# dispatcher `to_bytes`. Calls inside a lambda body (the closure that
+# `bin_list_to_bytes` / `bin_option_to_bytes` receive) cannot rely on
+# the dispatcher because the monomorpher does not propagate the
+# instantiated type into the lambda body's free-call resolution. The
+# mangled name routes statically to the correct impl regardless.
+# Mirrors the symmetric `derive_binser_decode_mangled` helper used by
+# the decoder chain.
+fn derive_binser_encode_mangled(value: Expr, ftype: TypeExpr,
+                                  line: Int, col: Int) : Expr {
+  let mangled = proto_mangled_fn("BinSerialize",
+                                   proto_type_name(ftype), "to_bytes")
+  mk_expr(ECall(mk_expr(EVar(mangled), line, col), [value]), line, col)
+}
+
+fn derive_binser_decode_call(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
+                               line: Int, col: Int) : Expr =
+  derive_binser_decode_call_at(buf_e, pos_e, ftype, line, col, 0)
+
+fn derive_binser_decode_call_at(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
+                                  line: Int, col: Int, depth: Int) : Expr {
+  match ftype.tkind {
+    TyList(elem) -> {
+      let lcol = col + depth * 8 + 5
+      let bparam = Param { pname: "__bb", ptype: None, pline: line, pcol: lcol }
+      let pparam = Param { pname: "__bp", ptype: None, pline: line, pcol: lcol }
+      let bvar = mk_expr(EVar("__bb"), line, lcol)
+      let pvar = mk_expr(EVar("__bp"), line, lcol)
+      let body = derive_binser_decode_call_at(bvar, pvar, elem, line, col,
+                                                depth + 1)
+      let dec_lam = mk_expr(ELambda([bparam, pparam], body), line, lcol)
+      mk_expr(ECall(mk_expr(EVar("bin_list_from_bytes"), line, col),
+                    [buf_e, pos_e, dec_lam]), line, col)
+    }
+    TyName(tn, targs) ->
+      if tn == "Option" {
+        match targs {
+          [elem] -> {
+            let lcol = col + depth * 8 + 5
+            let bparam = Param { pname: "__bb", ptype: None, pline: line, pcol: lcol }
+            let pparam = Param { pname: "__bp", ptype: None, pline: line, pcol: lcol }
+            let bvar = mk_expr(EVar("__bb"), line, lcol)
+            let pvar = mk_expr(EVar("__bp"), line, lcol)
+            let body = derive_binser_decode_call_at(bvar, pvar, elem, line, col,
+                                                      depth + 1)
+            let dec_lam = mk_expr(ELambda([bparam, pparam], body), line, lcol)
+            mk_expr(ECall(mk_expr(EVar("bin_option_from_bytes"), line, col),
+                          [buf_e, pos_e, dec_lam]), line, col)
+          }
+          _ -> derive_binser_decode_mangled(buf_e, pos_e, ftype, line, col)
+        }
+      } else if tn == "Char" {
+        mk_expr(ECall(mk_expr(EVar("bin_char_from_bytes"), line, col),
+                      [buf_e, pos_e]), line, col)
+      } else {
+        derive_binser_decode_mangled(buf_e, pos_e, ftype, line, col)
+      }
+    _ -> derive_binser_decode_mangled(buf_e, pos_e, ftype, line, col)
+  }
+}
+
+fn derive_binser_decode_mangled(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
+                                  line: Int, col: Int) : Expr {
+  let mangled = proto_mangled_fn("BinSerialize",
+                                   proto_type_name(ftype), "from_bytes")
+  mk_expr(ECall(mk_expr(EVar(mangled), line, col), [buf_e, pos_e]), line, col)
+}
+
 # --- record encoder -------------------------------------------------
 #
 # `to_bytes(self) = list_append(to_bytes(self.f1),
 #                    list_append(to_bytes(self.f2), ...))`
 #
-# Empty record returns `[]`. Each `to_bytes(self.fK)` call rides the
-# protocol dispatcher correctly because the first arg's type IS the
-# field's type (Self is the receiver of the inner call).
+# Empty record returns `[]`. For most fields each `to_bytes(self.fK)`
+# call rides the protocol dispatcher because the first arg's type IS
+# the field's type. List/Option/Char fields route through
+# `derive_binser_encode_expr` instead (see above).
 fn derive_binser_record_to_bytes(fields: [FieldDecl], line: Int, col: Int) : Expr {
   match fields {
     [] -> mk_expr(EList([]), line, col)
-    [fd, ...rest] -> derive_binser_record_to_bytes_chain(fd, rest, line, col)
+    [fd, ...rest] -> derive_binser_record_to_bytes_chain(fd, rest, 0, line, col)
   }
 }
 
+# `idx` is bumped per field so that any lambdas the encoder emits for
+# different fields land at distinct `(line, col)` positions and the
+# lambda lifter (`find_lam`) can tell them apart. Each field gets a
+# 16-column slot; nested encoder/decoder lambdas inside one field
+# bump within that slot via `derive_binser_encode_expr` /
+# `derive_binser_decode_call`.
 fn derive_binser_record_to_bytes_chain(head: FieldDecl, rest: [FieldDecl],
-                                         line: Int, col: Int) : Expr {
+                                         idx: Int, line: Int, col: Int) : Expr {
   match head {
-    FD(name, _) -> {
-      let access = mk_expr(EField(mk_expr(EVar("self"), line, col), name), line, col)
-      let head_call = mk_expr(ECall(mk_expr(EVar("to_bytes"), line, col), [access]),
-                              line, col)
+    FD(name, ftype) -> {
+      let fcol = col + idx * 16
+      let access = mk_expr(EField(mk_expr(EVar("self"), line, fcol), name),
+                            line, fcol)
+      let head_call = derive_binser_encode_expr(access, ftype, line, fcol)
       match rest {
         [] -> head_call
         [next, ...more] -> {
-          let tail = derive_binser_record_to_bytes_chain(next, more, line, col)
+          let tail = derive_binser_record_to_bytes_chain(next, more, idx + 1,
+                                                          line, col)
           mk_expr(ECall(mk_expr(EVar("list_append"), line, col),
                         [head_call, tail]), line, col)
         }
@@ -46554,11 +46697,12 @@ fn derive_binser_record_decode_chain(tname: String, remaining: [FieldDecl],
     [] -> derive_binser_record_ok_value(tname, all_fields, pos_e, line, col)
     [fd, ...rest] -> match fd {
       FD(_, ftype) -> {
-        let mangled = proto_mangled_fn("BinSerialize",
-                                        proto_type_name(ftype), "from_bytes")
-        let call = mk_expr(ECall(mk_expr(EVar(mangled), line, col),
-                                  [mk_expr(EVar("buf"), line, col), pos_e]),
-                           line, col)
+        # Per-field column slot — see `derive_binser_record_to_bytes_chain`
+        # comment. Decoder lambdas land 1 column inside the encoder
+        # slot so encoder/decoder for the same field are also distinct.
+        let fcol = col + idx * 16 + 1
+        let buf_e = mk_expr(EVar("buf"), line, fcol)
+        let call = derive_binser_decode_call(buf_e, pos_e, ftype, line, fcol)
         let pvar = concat_all(["p", int_to_string(idx)])
         let next_pos = mk_expr(EField(mk_expr(EVar(pvar), line, col), "pos"),
                                 line, col)
@@ -46681,7 +46825,15 @@ fn derive_binser_sum_to_bytes_body(vargs: [TypeExpr], idx: Int,
   match vargs {
     [] -> tag
     _  -> {
-      let payload = derive_binser_sum_to_bytes_payload(vargs, 0, line, col)
+      # Per-variant column window so lambdas emitted inside different
+      # variants land at distinct `(line, col)` positions and the
+      # lambda lifter can tell them apart. 256-column window leaves
+      # room for ~16 fields each carrying nested encoder/decoder
+      # lambdas. Sum types with > 256 variants will overflow; that
+      # is the same limit `derive_binser_sum_to_bytes` already imposes
+      # via the single-byte tag (out of v1 scope).
+      let vcol = col + idx * 256
+      let payload = derive_binser_sum_to_bytes_payload(vargs, 0, line, vcol)
       mk_expr(ECall(mk_expr(EVar("list_append"), line, col), [tag, payload]),
               line, col)
     }
@@ -46692,10 +46844,10 @@ fn derive_binser_sum_to_bytes_payload(vargs: [TypeExpr], i: Int,
                                         line: Int, col: Int) : Expr {
   match vargs {
     [] -> mk_expr(EList([]), line, col)
-    [_, ...rest] -> {
-      let v = mk_expr(EVar(concat_all(["p", int_to_string(i)])), line, col)
-      let head = mk_expr(ECall(mk_expr(EVar("to_bytes"), line, col), [v]),
-                          line, col)
+    [vt, ...rest] -> {
+      let fcol = col + i * 16
+      let v = mk_expr(EVar(concat_all(["p", int_to_string(i)])), line, fcol)
+      let head = derive_binser_encode_expr(v, vt, line, fcol)
       match rest {
         [] -> head
         _  -> {
@@ -46755,8 +46907,13 @@ fn derive_binser_sum_tag_chain(tname: String, variants: [Variant], idx: Int,
       let cond = mk_expr(EBinop("==", tag_i,
                                        mk_expr(EInt(idx), line, col)),
                           line, col)
+      # Per-variant decoder window mirrors the encoder offset in
+      # `derive_binser_sum_to_bytes_body`. Add 128 (half the 256-col
+      # window) so encoder and decoder lambdas for the same variant
+      # don't collide either.
+      let vcol = col + idx * 256 + 128
       let then_e = derive_binser_sum_payload_decode(tname, v, start_pos,
-                                                      line, col)
+                                                      line, vcol)
       let else_e = derive_binser_sum_tag_chain(tname, rest, idx + 1,
                                                   start_pos, line, col)
       mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
@@ -46797,11 +46954,9 @@ fn derive_binser_sum_decode_chain(vname: String, remaining: [TypeExpr],
       mk_expr(ECall(mk_expr(EVar("Ok"), line, col), [cur]), line, col)
     }
     [vt, ...rest] -> {
-      let mangled = proto_mangled_fn("BinSerialize",
-                                      proto_type_name(vt), "from_bytes")
-      let call = mk_expr(ECall(mk_expr(EVar(mangled), line, col),
-                                [mk_expr(EVar("buf"), line, col), pos_e]),
-                         line, col)
+      let fcol = col + idx * 16 + 1
+      let buf_e = mk_expr(EVar("buf"), line, fcol)
+      let call = derive_binser_decode_call(buf_e, pos_e, vt, line, fcol)
       let pvar = concat_all(["p", int_to_string(idx)])
       let next_pos = mk_expr(EField(mk_expr(EVar(pvar), line, col), "pos"),
                               line, col)
@@ -46952,6 +47107,12 @@ fn validate_derive_binser_one(file: String, tname: String, fname: String,
     errs
   } else if binser_builtin_impl(head) {
     errs
+  } else if binser_collection_head(head) {
+    # `List` and `Option` route through `bin_list_*` / `bin_option_*`
+    # combinators emitted by the derive. Validate that the element
+    # type still has a usable impl/derive, recursively.
+    validate_derive_binser_collection_elem(file, tname, fname, kind, ftype,
+                                             head, providers, line, col, errs)
   } else {
     eprint(concat_all([
       file, ":", int_to_string(line), ":", int_to_string(col),
@@ -46963,15 +47124,59 @@ fn validate_derive_binser_one(file: String, tname: String, fname: String,
   }
 }
 
+fn binser_collection_head(head: String) : Bool =
+  head == "List" or head == "Option"
+
+# `TyList(elem)` and `Option[elem]` are valid only when `elem` is
+# itself a builtin, a collection (recursive case for `[[Foo]]`), or a
+# provider in scope. Anything else is reported as missing — but the
+# message names the *element* type, not the outer `List`/`Option`,
+# because the user's mental model is "BinSerialize for Foo is what
+# I need to add".
+fn validate_derive_binser_collection_elem(file: String, tname: String,
+                                            fname: String, kind: String,
+                                            ftype: TypeExpr, head: String,
+                                            providers: [String], line: Int,
+                                            col: Int, errs: Int) : Int / Console {
+  let elem_opt = binser_collection_elem(ftype)
+  match elem_opt {
+    None -> {
+      # `Option` without a type arg, or other malformed shape. Report
+      # against the outer head so the user knows the shape is wrong.
+      eprint(concat_all([
+        file, ":", int_to_string(line), ":", int_to_string(col),
+        ": error: cannot `#derive(BinSerialize)` for `", tname,
+        "`: ", kind, " `", fname, "` has shape `", head,
+        "` without an element type"]))
+      errs + 1
+    }
+    Some(elem) -> validate_derive_binser_one(file, tname, fname, kind, elem,
+                                                providers, line, col, errs)
+  }
+}
+
+fn binser_collection_elem(ftype: TypeExpr) : Option[TypeExpr] {
+  match ftype.tkind {
+    TyList(elem) -> Some(elem)
+    TyName(tn, targs) ->
+      if tn == "Option" {
+        match targs {
+          [elem] -> Some(elem)
+          _ -> None
+        }
+      } else { None }
+    _ -> None
+  }
+}
+
 # Atomic types with hand-written impls in stdlib/protocols.kai.
 # Mirrors `derive_builtin_impl` for Eq/Hash/Show; kept separate to
 # avoid coupling BinSerialize's whitelist to the protocols that
-# pre-existed it. `Byte` is whitelisted because it is a transparent
-# alias of `Int` and shares the same impl by structural unification —
-# the validator should not reject `field: Byte` even though no `impl
-# BinSerialize for Byte` is declared.
+# pre-existed it. `Byte` rides the `Int` impl by virtue of Lane 4's
+# nominal-but-byte-castable design. `Char` rides a hand-written
+# `bin_char_*` pair the derive routes to directly.
 fn binser_builtin_impl(tname: String) : Bool =
-  list_has(["Int", "Real", "Bool", "String", "Byte"], tname)
+  list_has(["Int", "Real", "Bool", "String", "Byte", "Char"], tname)
 
 # m12.8.z: pre-expansion validation for `#derive(Ord)`. Walks the
 # decl stream once to collect every type that has — or will have
