@@ -1039,6 +1039,73 @@ type MLeakRecord = MLeakRec(String, Int, Option[LeakLoc])
 fn diag_note(msg: String) : Unit / Console = eprint("  = note: #{msg}")
 fn diag_help(msg: String) : Unit / Console = eprint("  = help: #{msg}")
 
+# Issue #487 — structured diagnostic surface (Approach A, narrow scope).
+# Defines the data types LSP v1 (#447) needs to publish diagnostics
+# via the JSON-RPC `textDocument/publishDiagnostics` notification.
+#
+# Scope discipline: only the m11 v1 + v1.x templates (T1-T5) are wired
+# into the collection path. The remaining ~140 legacy diag_* call-sites
+# keep stderr-only behavior and migrate lane by lane.
+#
+# `Severity` mirrors the LSP severity scale (Error=1, Warning=2,
+# Information=3, Hint=4). Kaikai uses symbolic variants so future tiers
+# (warnings, hints) plug in without renaming.
+type Severity
+  = SevError
+  | SevWarning
+  | SevHint
+  | SevInfo
+
+# `RelatedInfo` captures the `note:` / `help:` follow-ups attached to
+# a primary diagnostic. Each carries its own (file, line, col, message)
+# so LSP can render them at independent ranges if the related site is
+# elsewhere; today the typer pins notes at the parent diagnostic's
+# location, so most RelatedInfo values share the parent (line, col).
+type RelatedInfo = DR(String, Int, Int, String)
+# (file, line, col, message). Variant tag is `DR` (diagnostic-related)
+# because stage 2 uses a single global variant-tag namespace and `RI`
+# was already taken by `type RecInfo = RI(String, [String], [FieldDecl])`
+# at line 26701. LSP serialization sees the field positions, not the
+# tag, so the shorter `DR` name has no impact on the wire format.
+
+# `Diagnostic` is the structured value the LSP consumer reads from
+# `TypedProgram.diags`. Field shape:
+#   severity : Severity
+#   file     : String   (source file path)
+#   line     : Int      (1-indexed; -1 when the diagnostic has no span)
+#   col      : Int      (1-indexed; -1 when no column)
+#   message  : String   (primary `error:` line, no prefix)
+#   related  : [RelatedInfo]  (the `note:` / `help:` lines)
+type Diagnostic = D(Severity, String, Int, Int, String, [RelatedInfo])
+
+fn severity_to_string(s: Severity) : String = match s {
+  SevError   -> "error"
+  SevWarning -> "warning"
+  SevHint    -> "hint"
+  SevInfo    -> "info"
+}
+
+# Build a primary `Diagnostic` value. Used by the T1-T5 emit sites in
+# parallel with their existing `diag_error/note/help` calls — the stderr
+# stream is unchanged; only the in-memory collection is new.
+fn mk_diag(sev: Severity, file: String, line: Int, col: Int,
+            msg: String, related: [RelatedInfo]) : Diagnostic =
+  D(sev, file, line, col, msg, related)
+
+fn ri_note(file: String, line: Int, col: Int, msg: String) : RelatedInfo =
+  DR(file, line, col, string_concat("note: ", msg))
+
+fn ri_help(file: String, line: Int, col: Int, msg: String) : RelatedInfo =
+  DR(file, line, col, string_concat("help: ", msg))
+
+# `[Diagnostic]` accumulator helpers — push, finalize. Diagnostics are
+# stored in reverse insertion order inside the accumulator so a prepend
+# is O(1); the entry point flips them back to source order via
+# `finalize_diags` before exposing through `TypedProgram.diags`.
+fn push_diag(acc: [Diagnostic], d: Diagnostic) : [Diagnostic] = [d, ...acc]
+
+fn finalize_diags(acc: [Diagnostic]) : [Diagnostic] = list_reverse(acc)
+
 # m4c Phase 3 invariant reporter: print one diag per spec leak,
 # return total leak count (0 = clean). Lives near `diag_error` so
 # its row is `Console`-only and the caller's row inference picks it
@@ -9759,16 +9826,21 @@ fn dump_program(decls: [Decl]) : Unit / Console {
 # enters and leaves. Errors accumulate into `had_error`; the driver
 # returns 1 when that flag is set.
 
-type Env = { scopes: [[String]], had_error: Bool, file: String }
+type Env = { scopes: [[String]], had_error: Bool, file: String,
+              # Issue #487: structured diagnostic collection for T3
+              # (`cannot find <name> in this scope`). Mirrors
+              # `InferState.diags` semantics (reverse order, flipped at
+              # the entry point).
+              diags: [Diagnostic] }
 
-fn env_new(file: String) : Env = Env { scopes: [[]], had_error: false, file: file }
+fn env_new(file: String) : Env = Env { scopes: [[]], had_error: false, file: file, diags: [] }
 
 fn env_push(e: Env) : Env =
-  Env { scopes: [[], ...e.scopes], had_error: e.had_error, file: e.file }
+  Env { scopes: [[], ...e.scopes], had_error: e.had_error, file: e.file, diags: e.diags }
 
 fn env_pop(e: Env) : Env {
   match e.scopes {
-    [_, ...rest] -> Env { scopes: rest, had_error: e.had_error, file: e.file }
+    [_, ...rest] -> Env { scopes: rest, had_error: e.had_error, file: e.file, diags: e.diags }
     _ -> e
   }
 }
@@ -9776,7 +9848,7 @@ fn env_pop(e: Env) : Env {
 fn env_add(e: Env, name: String) : Env {
   match e.scopes {
     [top, ...rest] ->
-      Env { scopes: [[name, ...top], ...rest], had_error: e.had_error, file: e.file }
+      Env { scopes: [[name, ...top], ...rest], had_error: e.had_error, file: e.file, diags: e.diags }
     _ -> e
   }
 }
@@ -9807,7 +9879,13 @@ fn concat_scopes(ss: [[String]], acc: [String]) : [String] {
 }
 
 fn env_mark_err(e: Env) : Env =
-  Env { scopes: e.scopes, had_error: true, file: e.file }
+  Env { scopes: e.scopes, had_error: true, file: e.file, diags: e.diags }
+
+# Issue #487: push a Diagnostic onto the Env accumulator. Used by the
+# T3 emit site in parallel with its existing `diag_error` call.
+fn env_push_diag(e: Env, d: Diagnostic) : Env =
+  Env { scopes: e.scopes, had_error: e.had_error, file: e.file,
+        diags: [d, ...e.diags] }
 
 fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env {
   diag_error(e.file, line, col, msg)
@@ -9966,11 +10044,22 @@ fn chk_expr(e: Env, x: Expr) : Env {
         # to a separate `help:` line and is suppressed when no name
         # is within Levenshtein distance 3 (closest_name's threshold).
         diag_error(e.file, x.line, x.col, "cannot find `#{name}` in this scope")
-        match closest_name(name, env_all_names(e)) {
-          Some(sug) -> diag_help("a similar name exists in scope: `#{sug}` (did you mean this?)")
-          None      -> ()
+        let msg = "cannot find `#{name}` in this scope"
+        let sug = closest_name(name, env_all_names(e))
+        match sug {
+          Some(s) -> diag_help("a similar name exists in scope: `#{s}` (did you mean this?)")
+          None    -> ()
         }
-        env_mark_err(e)
+        # Issue #487 — T3 collected diagnostic. Stderr above remains
+        # byte-identical; the structured Diagnostic carries the same
+        # message + optional did-you-mean help.
+        let related = match sug {
+          Some(s) -> [ri_help(e.file, x.line, x.col,
+                              "a similar name exists in scope: `#{s}` (did you mean this?)")]
+          None    -> []
+        }
+        let e1 = env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, related))
+        env_mark_err(e1)
       }
     }
     ECall(f, xs) -> {
@@ -26802,7 +26891,14 @@ type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs
                     # (nonprim, prim) / (nonprim, nonprim cross) pair
                     # has a matching `impl P[A] for T` registered.
                     # Empty when no protocols are loaded.
-                    proto_impls: [ProtoImplReg] }
+                    proto_impls: [ProtoImplReg],
+                    # Issue #487: structured diagnostic collection. T1,
+                    # T2, T4, T5 emit-sites push a `Diagnostic` here in
+                    # parallel with their existing stderr `diag_*` calls.
+                    # Stored in reverse order (most recent first); the
+                    # entry point flips it back to source order when
+                    # exposing via `TypedProgram.diags`.
+                    diags: [Diagnostic] }
 
 type OpEffArity = OEA(String, Int)
 
@@ -26867,7 +26963,7 @@ fn infer_state_new_full_aliases(file: String, env: TyEnv, prelude_len: Int,
                recs: recs, errs: 0, insts: [], holes: [], row: [],
                eff_uses: [], aliases: [], clause_resume: None,
                op_eff_arities: op_eff_arities, ret_ty: None,
-               type_aliases: type_aliases, op_to_eff: op_to_eff, proto_impls: [] }
+               type_aliases: type_aliases, op_to_eff: op_to_eff, proto_impls: [], diags: [] }
 
 fn st_set_proto_impls(st: InferState, pis: [ProtoImplReg]) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
@@ -26875,28 +26971,38 @@ fn st_set_proto_impls(st: InferState, pis: [ProtoImplReg]) : InferState =
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff,
-               proto_impls: pis }
+               proto_impls: pis, diags: st.diags }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
   InferState { file: st.file, env: new_env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: new_sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
 
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
+
+# Issue #487: push a Diagnostic onto the InferState accumulator.
+# Used by the T1, T2, T4, T5 emit sites in parallel with their stderr
+# `diag_error` calls — stderr output is unchanged.
+fn st_push_diag(st: InferState, d: Diagnostic) : InferState =
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: [d, ...st.diags] }
 
 # m7a #4c / m7b #11i: mark that the current body has performed an op
 # of `eff` with the given type-arg instantiation. Labels with the same
@@ -26912,7 +27018,7 @@ fn st_add_label(st: InferState, lab: Label, line: Int, col: Int) : InferState {
                  eff_uses: [EU(lab.eff, line, col), ...st.eff_uses],
                  aliases: st.aliases,
                  clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                 ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+                 ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
   }
 }
 
@@ -27038,7 +27144,7 @@ fn st_set_row(st: InferState, new_row: [Label]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: new_row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
 
 # m7a #4e: push/pop the alias stack as we enter/leave a handle's body.
 # m7b #15: a freshly-pushed alias starts taggable; descending into a
@@ -27052,7 +27158,7 @@ fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
                row: st.row, eff_uses: st.eff_uses,
                aliases: [AB(alias, eff, true), ...st.aliases],
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
 
 fn st_pop_alias(st: InferState) : InferState {
   match st.aliases {
@@ -27062,7 +27168,7 @@ fn st_pop_alias(st: InferState) : InferState {
                    recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                    row: st.row, eff_uses: st.eff_uses, aliases: rest,
                    clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                   ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+                   ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
   }
 }
 
@@ -27072,7 +27178,7 @@ fn st_set_clause_resume(st: InferState, rb: Option[ResumeBind]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: rb, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
 
 # m7e §13: stash/clear/restore the enclosing function's declared
 # return type for `e!` propagation. Set by `infer_decl` before walking
@@ -27083,7 +27189,7 @@ fn st_set_ret_ty(st: InferState, rt: Option[Ty]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: rt, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+               ret_ty: rt, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
 
 fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
   match aliases {
@@ -27120,21 +27226,21 @@ fn st_disable_alias_tag(st: InferState) : InferState =
                row: st.row, eff_uses: st.eff_uses,
                aliases: aliases_disable_tag(st.aliases),
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
 
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
 
 fn st_push_hole(st: InferState, h: HoleSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes],
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
 
 # m7a #8: lookup the recorded first-use line/col of an effect label.
 # Returns (-1, -1) when the effect was never tracked — that should
@@ -27282,6 +27388,35 @@ fn emit_call_arg_notes(env: TyEnv, sub: Subst, callee: Expr,
   }
 }
 
+# Issue #487: structured T1 Diagnostic builder. Mirrors the
+# "type mismatch in function call" header that `st_unify` prints when
+# `unify_list` fails, plus the trailing notes from `emit_call_arg_notes`.
+# Pinned at the call-site (line, col); related infos cite the same span
+# because the typer does not (yet) track per-argument spans.
+fn build_call_type_mismatch_diag(env: TyEnv, sub: Subst, callee: Expr,
+                                   callee_ty: Ty, arg_tys: [Ty],
+                                   file: String, line: Int, col: Int) : Diagnostic {
+  let resolved = apply_ty(sub, callee_ty)
+  let name_opt = callee_display_name(callee)
+  let arg_notes = match first_failing_arg(env, sub, resolved, arg_tys) {
+    Some(idx) -> match name_opt {
+      Some(nm) -> [ri_note(file, line, col, "in argument #{int_to_string(idx)} of `#{nm}`")]
+      None     -> [ri_note(file, line, col, "in argument #{int_to_string(idx)}")]
+    }
+    None -> []
+  }
+  let sig_notes = match name_opt {
+    Some(nm) -> match resolved {
+      TyFnT(_, _, _) -> [ri_note(file, line, col, "`#{nm}` expects: #{ty_to_string(resolved)}")]
+      _              -> []
+    }
+    None -> []
+  }
+  mk_diag(SevError, file, line, col,
+          "type mismatch in function call",
+          list_append(arg_notes, sig_notes))
+}
+
 # m11 v1.x Template 4 — when the callee's resolved type is a fn with
 # a different parameter count than the call site supplied, emit a
 # canonical "wrong number of arguments" diagnostic in place of the
@@ -27340,6 +27475,44 @@ fn emit_wrong_arity(file: String, callee: Expr, callee_ty: Ty,
   }
 }
 
+# Issue #487: structured T4 Diagnostic builder. Mirrors the text emitted
+# by `emit_wrong_arity` exactly so an LSP client can rebuild the same
+# `error: / note: / help:` block from the collected value.
+fn build_wrong_arity_diag(file: String, callee: Expr, callee_ty: Ty,
+                            arg_tys: [Ty], line: Int, col: Int) : Diagnostic {
+  let np = match callee_ty {
+    TyFnT(params, _, _) -> list_length(params)
+    _ -> 0
+  }
+  let na = list_length(arg_tys)
+  let name_opt = callee_display_name(callee)
+  let header = match name_opt {
+    Some(nm) -> "wrong number of arguments to `#{nm}`"
+    None     -> "wrong number of arguments"
+  }
+  let count_note = match name_opt {
+    Some(nm) -> "`#{nm}` expects #{int_to_string(np)} argument(s), got #{int_to_string(na)}"
+    None     -> "expected #{int_to_string(np)} argument(s), got #{int_to_string(na)}"
+  }
+  let sig_notes = match name_opt {
+    Some(nm) -> match callee_ty {
+      TyFnT(_, _, _) -> [ri_note(file, line, col, "`#{nm}` expects: #{ty_to_string(callee_ty)}")]
+      _              -> []
+    }
+    None -> []
+  }
+  let help_msg = if na < np {
+    "add the missing argument(s) or use `_` as a placeholder hole"
+  } else {
+    "remove the extra argument(s) — `#{int_to_string(na - np)}` too many"
+  }
+  let related = list_append(
+    [ri_note(file, line, col, count_note)],
+    list_append(sig_notes, [ri_help(file, line, col, help_msg)])
+  )
+  mk_diag(SevError, file, line, col, header, related)
+}
+
 # m11 v1 Template 1 — wrapper around `st_unify` for call sites that
 # want richer diagnostics. Preflights arity (Template 4) before
 # delegating to `st_unify`; on failure, appends the argument-position
@@ -27357,14 +27530,21 @@ fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
   match arity_mismatch_of(st.sub, callee_ty, arg_tys) {
     Some(_np) -> {
       emit_wrong_arity(st.file, callee, resolved_callee, arg_tys, line, col)
-      st_bump_err(st)
+      # Issue #487 — T4 collected diagnostic.
+      let d = build_wrong_arity_diag(st.file, callee, resolved_callee, arg_tys, line, col)
+      st_bump_err(st_push_diag(st, d))
     }
     None -> {
       let pre_errs = st.errs
       let st1 = st_unify(st, callee_ty, expected_fn_ty, "function call", line, col)
       if st1.errs > pre_errs {
         emit_call_arg_notes(st1.env, st1.sub, callee, callee_ty, arg_tys)
-        st1
+        # Issue #487 — T1 collected diagnostic. The header text mirrors
+        # the generic "type mismatch in function call" line emitted by
+        # `st_unify`; the related notes mirror `emit_call_arg_notes`.
+        let d = build_call_type_mismatch_diag(st1.env, st1.sub, callee, callee_ty,
+                                              arg_tys, st1.file, line, col)
+        st_push_diag(st1, d)
       } else { st1 }
     }
   }
@@ -27614,7 +27794,8 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     ret_ty: outer.ret_ty,
     type_aliases: outer.type_aliases,
     op_to_eff: outer.op_to_eff,
-    proto_impls: outer.proto_impls
+    proto_impls: outer.proto_impls,
+    diags: inner.diags
   }
 
 # ---- parameter typing ----
@@ -30240,7 +30421,7 @@ fn st_drop_label(st: InferState, eff: String) : InferState {
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: row1, eff_uses: uses1, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, diags: st.diags }
 }
 
 fn drop_labels_named(row: [Label], eff: String) : [Label] {
@@ -31989,6 +32170,30 @@ fn emit_nonexhaustive_help(missing: [String]) : Unit / Console {
   }
 }
 
+# Issue #487: structured T2 Diagnostic builder. Mirrors the text emitted
+# by `diag_error` + `emit_nonexhaustive_notes` so the stderr block and
+# the collected Diagnostic carry the same content.
+fn build_nonexhaustive_related(file: String, line: Int, col: Int,
+                                 missing: [String], covered: [String]) : [RelatedInfo] {
+  let miss_notes = map(missing, (m) => ri_note(file, line, col, "missing variant: `#{m}`"))
+  let cov_notes = match covered {
+    [] -> []
+    _  -> [ri_note(file, line, col, "covered: #{join_with(covered, ", ")}")]
+  }
+  let help_msg = match missing {
+    []        -> "add a wildcard `_ -> ...` arm"
+    [m, ..._] -> "add an arm `#{m} -> ...` or a wildcard `_ -> ...`"
+  }
+  let help_ri = [ri_help(file, line, col, help_msg)]
+  list_append(miss_notes, list_append(cov_notes, help_ri))
+}
+
+fn build_nonexhaustive_diag(file: String, line: Int, col: Int,
+                              header: String, missing: [String],
+                              covered: [String]) : Diagnostic =
+  mk_diag(SevError, file, line, col, header,
+          build_nonexhaustive_related(file, line, col, missing, covered))
+
 fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState {
   if has_catch_all(arms) { st }
   else {
@@ -32031,11 +32236,13 @@ fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int
               match missing {
                 [] -> st
                 _  -> {
-                  diag_error(st.file, line, col,
-                    "non-exhaustive match on #{tycon}: missing #{join_with(missing, ", ")}")
+                  let header = "non-exhaustive match on #{tycon}: missing #{join_with(missing, ", ")}"
+                  diag_error(st.file, line, col, header)
                   let covered = find_covered_variants(needed, arms, [])
                   emit_nonexhaustive_notes(missing, covered)
-                  st_bump_err(st)
+                  # Issue #487 — T2 collected diagnostic.
+                  let d = build_nonexhaustive_diag(st.file, line, col, header, missing, covered)
+                  st_bump_err(st_push_diag(st, d))
                 }
               }
             }
@@ -32084,16 +32291,27 @@ fn check_union_component(st: InferState, arms: [Arm], comp: Ty,
             match missing {
               [] -> st
               _  -> {
-                diag_error(st.file, line, col,
-                  "non-exhaustive match: missing #{join_with(missing, ", ")} (component of #{tycon})")
+                let header = "non-exhaustive match: missing #{join_with(missing, ", ")} (component of #{tycon})"
+                diag_error(st.file, line, col, header)
                 let covered = find_covered_variants(needed, arms, [])
                 emit_missing_notes(missing)
                 match covered {
                   [] -> ()
                   _  -> diag_note("covered: #{join_with(covered, ", ")}")
                 }
-                diag_help("add an arm for each missing variant, a `name : #{tycon}` narrowing arm covering the whole component, or a wildcard `_` arm")
-                st_bump_err(st)
+                let help_msg = "add an arm for each missing variant, a `name : #{tycon}` narrowing arm covering the whole component, or a wildcard `_` arm"
+                diag_help(help_msg)
+                # Issue #487 — T2 collected diagnostic (union component path).
+                let miss_notes = map(missing, (m) => ri_note(st.file, line, col, "missing variant: `#{m}`"))
+                let cov_notes = match covered {
+                  [] -> []
+                  _  -> [ri_note(st.file, line, col, "covered: #{join_with(covered, ", ")}")]
+                }
+                let related = list_append(miss_notes,
+                                list_append(cov_notes,
+                                  [ri_help(st.file, line, col, help_msg)]))
+                let d = mk_diag(SevError, st.file, line, col, header, related)
+                st_bump_err(st_push_diag(st, d))
               }
             }
           }
@@ -32177,11 +32395,18 @@ fn check_one_union_comp(st: InferState, arms: [Arm], parent: String, comp: Strin
         # Atomic variant of `parent` — direct coverage required.
         if arms_cover_variant(arms, comp) { st }
         else {
-          diag_error(st.file, line, col,
-            "non-exhaustive match on #{parent}: missing #{comp}")
+          let header = "non-exhaustive match on #{parent}: missing #{comp}"
+          diag_error(st.file, line, col, header)
           diag_note("missing variant: `#{comp}`")
-          diag_help("add an arm `#{comp} -> ...` or a wildcard `_ -> ...`")
-          st_bump_err(st)
+          let help_msg = "add an arm `#{comp} -> ...` or a wildcard `_ -> ...`"
+          diag_help(help_msg)
+          # Issue #487 — T2 collected diagnostic (atomic variant path).
+          let related = [
+            ri_note(st.file, line, col, "missing variant: `#{comp}`"),
+            ri_help(st.file, line, col, help_msg)
+          ]
+          let d = mk_diag(SevError, st.file, line, col, header, related)
+          st_bump_err(st_push_diag(st, d))
         }
       }
       _ -> {
@@ -32189,16 +32414,27 @@ fn check_one_union_comp(st: InferState, arms: [Arm], parent: String, comp: Strin
         match missing {
           [] -> st
           _  -> {
-            diag_error(st.file, line, col,
-              "non-exhaustive match: missing #{join_with(missing, ", ")} (component of #{comp})")
+            let header = "non-exhaustive match: missing #{join_with(missing, ", ")} (component of #{comp})"
+            diag_error(st.file, line, col, header)
             let covered = find_covered_variants(sub_variants, arms, [])
             emit_missing_notes(missing)
             match covered {
               [] -> ()
               _  -> diag_note("covered: #{join_with(covered, ", ")}")
             }
-            diag_help("add an arm for each missing variant, a `name : #{comp}` narrowing arm covering the whole component, or a wildcard `_` arm")
-            st_bump_err(st)
+            let help_msg = "add an arm for each missing variant, a `name : #{comp}` narrowing arm covering the whole component, or a wildcard `_` arm"
+            diag_help(help_msg)
+            # Issue #487 — T2 collected diagnostic (component sub-variant path).
+            let miss_notes = map(missing, (m) => ri_note(st.file, line, col, "missing variant: `#{m}`"))
+            let cov_notes = match covered {
+              [] -> []
+              _  -> [ri_note(st.file, line, col, "covered: #{join_with(covered, ", ")}")]
+            }
+            let related = list_append(miss_notes,
+                            list_append(cov_notes,
+                              [ri_help(st.file, line, col, help_msg)]))
+            let d = mk_diag(SevError, st.file, line, col, header, related)
+            st_bump_err(st_push_diag(st, d))
           }
         }
       }
@@ -32292,9 +32528,14 @@ fn check_list_exhaustive(st: InferState, arms: [Arm], line: Int, col: Int) : Inf
     let missing = if has_empty { "non-empty lists (e.g. `[_, ...rest]`)" }
                   else if has_spread { "the empty list `[]`" }
                   else { "the empty list `[]` and non-empty lists (e.g. `[_, ...rest]`)" }
-    diag_error(st.file, line, col, "non-exhaustive match on list: missing #{missing}")
-    diag_help("cover both `[]` and a spread pattern, or add a wildcard `_` arm")
-    st_bump_err(st)
+    let header = "non-exhaustive match on list: missing #{missing}"
+    diag_error(st.file, line, col, header)
+    let help_msg = "cover both `[]` and a spread pattern, or add a wildcard `_` arm"
+    diag_help(help_msg)
+    # Issue #487 — T2 collected diagnostic (list path).
+    let d = mk_diag(SevError, st.file, line, col, header,
+                    [ri_help(st.file, line, col, help_msg)])
+    st_bump_err(st_push_diag(st, d))
   }
 }
 
@@ -32542,7 +32783,12 @@ fn resolve_holes(hs: [HoleSite], sub: Subst) : [ResolvedHole] {
 # non-DFn). Also carries the error count, the resolved call-site
 # instantiations, and the resolved hole reports.
 type TypedDecl = { decl: Decl, errs: Int, insts: [ResolvedCS],
-                    holes: [ResolvedHole], row_holes: [ResolvedRowHole] }
+                    holes: [ResolvedHole], row_holes: [ResolvedRowHole],
+                    # Issue #487: per-decl collected diagnostics (T1, T2,
+                    # T4, T5). Stored in source order (already reversed
+                    # at the per-decl level, since `infer_all_loop`
+                    # reverses again when assembling `TypedProgram`).
+                    diags: [Diagnostic] }
 
 # Walk to the expression whose type is what the function body
 # "produces". For block bodies that's the tail expression (or the
@@ -32748,10 +32994,11 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
         errs: st2.errs,
         insts: resolved,
         holes: hole_reports,
-        row_holes: row_holes
+        row_holes: row_holes,
+        diags: finalize_diags(st2.diags)
       }
     }
-    _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [], row_holes: [] }
+    _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [], row_holes: [], diags: [] }
   }
 }
 
@@ -33106,15 +33353,31 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
               # surface the enclosing function's actual row and split
               # the help into two actionable lines (declare-the-effect
               # vs handle-locally) instead of the single combined hint.
-              diag_error(st.file, line, col,
-                string_concat("effect not handled: ", lab_str))
-              diag_note("`#{fname}`'s declared row does not include `#{lab_str}`")
-              diag_note("missing effect: `#{lab_str}`")
-              diag_note("enclosing row: #{render_declared_row(declared)}")
-              diag_help("either declare `#{fname} : ... / #{lab_str}`, or wrap this call site in `handle { ... } with #{lab_str} { ... }`")
-              diag_help("add `/ #{lab_str}` to `#{fname}`'s return type")
-              diag_help("or wrap the call in `handle { ... } with #{lab_str} { ... }`")
-              st_bump_err(st)
+              let header = string_concat("effect not handled: ", lab_str)
+              diag_error(st.file, line, col, header)
+              let n1 = "`#{fname}`'s declared row does not include `#{lab_str}`"
+              let n2 = "missing effect: `#{lab_str}`"
+              let n3 = "enclosing row: #{render_declared_row(declared)}"
+              let h1 = "either declare `#{fname} : ... / #{lab_str}`, or wrap this call site in `handle { ... } with #{lab_str} { ... }`"
+              let h2 = "add `/ #{lab_str}` to `#{fname}`'s return type"
+              let h3 = "or wrap the call in `handle { ... } with #{lab_str} { ... }`"
+              diag_note(n1)
+              diag_note(n2)
+              diag_note(n3)
+              diag_help(h1)
+              diag_help(h2)
+              diag_help(h3)
+              # Issue #487 — T5 collected diagnostic.
+              let related = [
+                ri_note(st.file, line, col, n1),
+                ri_note(st.file, line, col, n2),
+                ri_note(st.file, line, col, n3),
+                ri_help(st.file, line, col, h1),
+                ri_help(st.file, line, col, h2),
+                ri_help(st.file, line, col, h3)
+              ]
+              let d = mk_diag(SevError, st.file, line, col, header, related)
+              st_bump_err(st_push_diag(st, d))
             }
           }
         }
@@ -33181,7 +33444,13 @@ fn label_to_string(l: Label) : String {
 
 type TypedProgram = { decls: [Decl], errs: Int, insts: [ResolvedCS],
                       holes: [ResolvedHole], row_holes: [ResolvedRowHole],
-                      prelude_len: Int }
+                      prelude_len: Int,
+                      # Issue #487: structured collected diagnostics for
+                      # m11 templates T1, T2, T4, T5. The T3 unbound-
+                      # name diagnostic lives on `Env` and is folded in
+                      # by `compile_to_module_with_diags` when it runs
+                      # `check_program`.
+                      diags: [Diagnostic] }
 
 fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
                    op_eff_arities: [OpEffArity],
@@ -33189,6 +33458,7 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
                    acc_decls: [Decl], acc_errs: Int, acc_insts: [ResolvedCS],
                    acc_holes: [ResolvedHole],
                    acc_row_holes: [ResolvedRowHole],
+                   acc_diags: [Diagnostic],
                    type_aliases: [AliasResult],
                    op_to_eff: [OpToEff],
                    sums: [SumInfo],
@@ -33198,7 +33468,8 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       decls: list_reverse(acc_decls), errs: acc_errs,
       insts: list_reverse(acc_insts), holes: list_reverse(acc_holes),
       row_holes: list_reverse(acc_row_holes),
-      prelude_len: prelude_len
+      prelude_len: prelude_len,
+      diags: list_reverse(acc_diags)
     }
     [d, ...rest] -> {
       let r = infer_decl(file, env, prelude_len, recs, op_eff_arities,
@@ -33209,6 +33480,7 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
                      llvm_prepend_reverse(r.insts, acc_insts),
                      prepend_reverse_holes(r.holes, acc_holes),
                      prepend_reverse_row_holes(r.row_holes, acc_row_holes),
+                     prepend_reverse_diags(r.diags, acc_diags),
                      type_aliases, op_to_eff, sums, proto_impls)
     }
   }
@@ -33234,6 +33506,16 @@ fn prepend_reverse_holes(xs: [ResolvedHole], acc: [ResolvedHole]) : [ResolvedHol
   match xs {
     [] -> acc
     [x, ...rest] -> prepend_reverse_holes(rest, [x, ...acc])
+  }
+}
+
+# Issue #487: prepend `xs` onto `acc` in reverse order so the final
+# `list_reverse(acc)` at infer_all_loop's terminal restores source
+# order. Matches the pattern used for holes / row_holes / insts above.
+fn prepend_reverse_diags(xs: [Diagnostic], acc: [Diagnostic]) : [Diagnostic] {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> prepend_reverse_diags(rest, [x, ...acc])
   }
 }
 
@@ -33582,7 +33864,7 @@ fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
   # Issue #71: sum-type registry for the region-brand walker.
   let sums = collect_sums(decls_a)
   infer_all_loop(file, built.env, built.prelude_len, recs,
-                 built.op_eff_arities, decls_a, verbose, [], 0, [], [], [],
+                 built.op_eff_arities, decls_a, verbose, [], 0, [], [], [], [],
                  alias_res.aliases, op_to_eff, sums, proto_impls)
 }
 
@@ -47923,7 +48205,8 @@ fn resolve_protocol_calls(typed: TypedProgram, reg: ProtocolReg) : TypedProgram 
     insts: typed.insts,
     holes: typed.holes,
     row_holes: typed.row_holes,
-    prelude_len: typed.prelude_len
+    prelude_len: typed.prelude_len,
+    diags: typed.diags
   }
 }
 
@@ -50328,6 +50611,15 @@ type Mode
   # so fixtures stay self-contained. Output is a single JSON array
   # with one object per probe — schema in docs/library-mode.md.
   | MLibraryMode
+  # Issue #487: dump collected structured diagnostics (m11 T1-T5)
+  # as JSON for LSP-style consumers. Schema:
+  #   [{"severity": String, "file": String, "line": Int, "col": Int,
+  #     "message": String,
+  #     "related": [{"file": String, "line": Int, "col": Int,
+  #                  "message": String}]}, ...]
+  # Stable across runs; source order at the per-decl level, with T3
+  # (unbound-name) diagnostics first.
+  | MDiagsJson
 
 # Build-time wrapper selection passed to the emitters. Collapses the
 # previous test_mode/bench_mode/check_mode Bool triple (audit proposal
@@ -50419,6 +50711,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MFmtCheck))
       } else if a == "--library-mode" {
         parse_cli_loop(more, cli_with_mode(opts, MLibraryMode))
+      } else if a == "--diags-json" {
+        parse_cli_loop(more, cli_with_mode(opts, MDiagsJson))
       } else if a == "--test" {
         parse_cli_loop(more, cli_with_mode(opts, MTest))
       } else if a == "--bench" {
@@ -52494,6 +52788,39 @@ fn compile_to_module(file: String, decls: [Decl]) : TypedModule {
   TypedModule { tm_file: file, tm_decls: r.decls }
 }
 
+# Issue #487: collected structured diagnostics for library / LSP
+# consumers. The pair carries the same TypedModule produced by
+# `compile_to_module` plus a flat `[Diagnostic]` covering the m11
+# templates wired into this lane:
+#   - T1: type mismatch in function call (callee notes)
+#   - T2: non-exhaustive match (sum / list / union component)
+#   - T3: cannot find name in scope (did-you-mean)
+#   - T4: wrong number of arguments
+#   - T5: missing effect on the enclosing row
+#
+# Other diagnostics (m4c invariants, row-label arity, refinement
+# violations, etc.) still print to stderr but are NOT collected here.
+# Each migrates as its own follow-up lane (see lane retro).
+#
+# Order: source order at the per-decl level, with T3 (Env-borne) diags
+# prepended ahead of typer diags. Stable across runs.
+type ModuleWithDiags = { tm: TypedModule, diagnostics: [Diagnostic] }
+
+fn compile_to_module_with_diags(file: String, decls: [Decl]) : ModuleWithDiags / Console {
+  # T3 lives on `Env` during the lexical-scope walk; run that pre-pass
+  # so unbound-name diagnostics surface alongside the typer's T1/T2/T4/T5.
+  let e0 = env_new(file)
+  let e1 = add_all(e0, prelude_names())
+  let e2 = register_decls(e1, decls)
+  let e3 = chk_decls(e2, decls)
+  let t3_diags = finalize_diags(e3.diags)
+  let r = infer_program(file, decls, false)
+  ModuleWithDiags {
+    tm: TypedModule { tm_file: file, tm_decls: r.decls },
+    diagnostics: list_append(t3_diags, r.diags)
+  }
+}
+
 # ---------------- JSON serialization ----------------
 
 fn lib_json_pos(line: Int, col: Int) : String =
@@ -52585,6 +52912,56 @@ fn dump_library_mode(file: String, src: String, decls: [Decl]) : Int / Console {
   print(concat_all([
     "{\"file\": ", json_str(file),
     ", \"probes\": [",
+    join_with(entries, ", "),
+    "]}"
+  ]))
+  0
+}
+
+# Issue #487: serialize a single Diagnostic to the LSP-style JSON shape.
+# Field order matches the schema documented near `type Diagnostic`.
+fn diag_to_json(d: Diagnostic) : String {
+  match d {
+    D(sev, file, line, col, msg, related) -> {
+      let rel_strs = map(related, related_to_json)
+      concat_all([
+        "{\"severity\": ", json_str(severity_to_string(sev)),
+        ", \"file\": ", json_str(file),
+        ", \"line\": ", int_to_string(line),
+        ", \"col\": ", int_to_string(col),
+        ", \"message\": ", json_str(msg),
+        ", \"related\": [", join_with(rel_strs, ", "), "]",
+        "}"
+      ])
+    }
+  }
+}
+
+fn related_to_json(r: RelatedInfo) : String {
+  match r {
+    DR(file, line, col, msg) ->
+      concat_all([
+        "{\"file\": ", json_str(file),
+        ", \"line\": ", int_to_string(line),
+        ", \"col\": ", int_to_string(col),
+        ", \"message\": ", json_str(msg),
+        "}"
+      ])
+  }
+}
+
+# Issue #487: `--diags-json` driver. Runs the same lex → parse →
+# resolve → infer pipeline as `dump_library_mode`, but exposes the
+# m11 T1-T5 collected diagnostics as a JSON array. Returns 0 even when
+# diagnostics fired — the success of the driver is "produced JSON",
+# not "compiled cleanly". Fixtures still assert specific message
+# content against a golden.
+fn dump_diags_json(file: String, decls: [Decl]) : Int / Console {
+  let md = compile_to_module_with_diags(file, decls)
+  let entries = map(md.diagnostics, diag_to_json)
+  print(concat_all([
+    "{\"file\": ", json_str(file),
+    ", \"diagnostics\": [",
     join_with(entries, ", "),
     "]}"
   ]))
@@ -52947,6 +53324,16 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                 # the source so a fixture is self-describing.
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_library_mode(path, src, all_decls) }
+              }
+              MDiagsJson -> {
+                # Issue #487. Run lex → parse → resolve → infer with the
+                # T1-T5 emit sites collecting structured diagnostics in
+                # parallel with their stderr output. Print the collected
+                # list as JSON for LSP-style consumers. Stderr is silenced
+                # so the JSON stream is the sole stdout content; the
+                # broken sources used by fixtures still produce useful
+                # diagnostics.
+                dump_diags_json(path, all_decls)
               }
               _ -> {
                 let chk = check_program(path, all_decls)
