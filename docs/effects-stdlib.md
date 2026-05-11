@@ -316,13 +316,18 @@ effect in scope.
 
 ```kai
 effect Stdin {
-  read_line() : Option[String] / Fail
+  read_line()        : Option[String] / Fail
+  read_bytes(n: Int) : String                  # issue #453
 }
 ```
 
-Single op. `None` means EOF or closed pipe (routine, not an
-error); a real I/O fault escalates through `Fail`. See §*Error
-model* below for the rule.
+Two ops. `read_line()` returns `None` on EOF/closed pipe
+(routine, not an error); a real I/O fault escalates through
+`Fail`. `read_bytes(n)` returns a `String` of at most `n` raw
+bytes (newlines included); on EOF the returned string is shorter
+than `n` — possibly empty. No `Fail` wrapper: the LSP framing
+use case treats a short read as the protocol's own end-of-stream
+signal. See §*Error model* below for the rule.
 
 ### Error model
 
@@ -350,9 +355,11 @@ clause calls `fgets`. Cases:
 
 The caller cannot distinguish "line ended with `\n`" from "line
 ended at EOF without `\n`" — matches Python's `input()`, Rust's
-`BufRead::read_line`, Go's `bufio.Scanner.Text()`. If that
-distinction matters, drop to raw byte IO via a future `Stdin`
-extension.
+`BufRead::read_line`, Go's `bufio.Scanner.Text()`. When that
+distinction matters (e.g. LSP JSON-RPC framing, where the body
+length comes from a header and may contain embedded newlines),
+use `read_bytes(n)`: the runtime calls `fread` and returns
+exactly `n` bytes — or fewer on EOF.
 
 ## `Env`
 
@@ -1769,6 +1776,7 @@ post-effects form.
 | `print(s)`                                    | `Console.print(s)`                         | `Console` |
 | `eprint(s)`                                   | `Console.eprint(s)`                        | `Console` |
 | `read_line()`                                 | `Stdin.read_line()`                        | `Stdin + Fail` (real I/O faults) |
+| `read_bytes(n)` (issue #453)                  | `Stdin.read_bytes(n)`                      | `Stdin` |
 | `read_file(path)`                             | `File.read_file(path)`                     | `File` |
 | `write_file(p, c)`                            | `File.write_file(p, c)`                    | `File` |
 | `args()`                                      | `Env.args()`                               | `Env` |

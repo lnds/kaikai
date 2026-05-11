@@ -86,7 +86,7 @@ static int scope_has(C *c, const char *name, size_t len) {
 
 static const char *PRELUDE[] = {
     /* IO */
-    "print", "eprint", "read_file", "write_file", "read_line", "args",
+    "print", "eprint", "read_file", "write_file", "read_line", "read_bytes", "args",
     "exit", "panic",
     /* conversions */
     "int_to_string", "real_to_string", "string_to_int", "string_to_real",

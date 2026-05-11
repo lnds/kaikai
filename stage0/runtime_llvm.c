@@ -218,6 +218,7 @@ KaiValue *kaix_prelude_dir_create_dir(KaiValue *p)          { return kai_prelude
 KaiValue *kaix_prelude_dir_remove_dir(KaiValue *p)          { return kai_prelude_dir_remove_dir(p); }
 KaiValue *kaix_prelude_dir_walk(KaiValue *p)                { return kai_prelude_dir_walk(p); }
 KaiValue *kaix_prelude_read_line(void)                      { return kai_prelude_read_line(); }
+KaiValue *kaix_prelude_read_bytes(KaiValue *n)              { return kai_prelude_read_bytes(n); }
 KaiValue *kaix_prelude_real_to_string(KaiValue *v)          { return kai_prelude_real_to_string(v); }
 KaiValue *kaix_prelude_int_to_real(KaiValue *v)             { return kai_prelude_int_to_real(v); }
 KaiValue *kaix_prelude_real_to_int(KaiValue *v)             { return kai_prelude_real_to_int(v); }
