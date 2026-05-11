@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-fmt test-bench test-check test-library-mode test-diagnostics-collected demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -17,7 +17,7 @@ bin/kai:
 	@chmod +x bin/kai
 	@echo "kai driver: $$(realpath bin/kai 2>/dev/null || pwd)/bin/kai"
 
-test: test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup
+test: test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record
 
 test-stage0:
 	$(MAKE) -C stage0 test
@@ -105,6 +105,26 @@ test-import-prelude-dedup: kaic2
 	  exp="$$root/examples/imports/$$case.out.expected"; \
 	  out=$$(mktemp); \
 	  "$$kai" run "$$src" > "$$out" \
+	    || { echo "$$case FAIL (kai run)"; rm -f "$$out"; exit 1; }; \
+	  diff -q "$$exp" "$$out" > /dev/null \
+	    || { echo "$$case DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
+	  rm -f "$$out"; \
+	  echo "$$case OK"; \
+	done
+
+# Issue #456 regression — qualified record literal `mod.Type { ... }`
+# parses + resolves end-to-end. Each case lives in its own directory
+# (main + 1..2 sibling modules) so the resolver walks the same
+# multi-file discovery path the issue's reproducer uses.
+test-import-qualified-record: kaic2
+	@set -e; \
+	root=$$(pwd); \
+	kai="$$root/bin/kai"; \
+	for case in qualified_record_basic qualified_record_ambiguous qualified_record_with_spread; do \
+	  src_dir="$$root/examples/imports/$$case"; \
+	  exp="$$src_dir/main.out.expected"; \
+	  out=$$(mktemp); \
+	  "$$kai" run "$$src_dir/main.kai" > "$$out" \
 	    || { echo "$$case FAIL (kai run)"; rm -f "$$out"; exit 1; }; \
 	  diff -q "$$exp" "$$out" > /dev/null \
 	    || { echo "$$case DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
