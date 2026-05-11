@@ -1,6 +1,7 @@
-# Decision: remove `kai repl` from v1.0 surface
+# Decision: remove `kai repl` permanently
 
-**Date:** 2026-05-09
+**Date:** 2026-05-09 (initial: v1.0 removal). Updated 2026-05-11 to
+permanent removal — not v1.0, not v1.x, not on the roadmap.
 **Closes:** #406
 **Status:** accepted
 
@@ -71,8 +72,20 @@ provides the closest "evaluate on every save" approximation.
 
 ## Reversal cost
 
-Re-adding the prototype is ~130 LOC against `bin/kai` and a
-roadmap edit; reversal of this decision is cheap if a v1.x
-post-mortem shows users wanted the recompile-per-eval REPL after
-all. The repo retains the historical implementation in git history
-under PR-of-origin (linked from #406).
+**Reversal is intentionally costly.** The 2026-05-11 update
+escalated this decision from "deferred post-1.0" to permanent
+removal. Reasons:
+
+- The recompile-per-eval prototype was not a foundation; bringing
+  it back at any later milestone would still require the same
+  m17-style incremental compilation work, with no win in between.
+- `kai run` + `kai watch` already cover ad-hoc evaluation. The
+  REPL ergonomics gap is smaller than the maintenance cost.
+- Keeping REPL as "future work" creates a documentation drag
+  (every roadmap revision asks "is REPL in v1.x yet?"); deleting
+  it from the horizon resolves that question once.
+
+The prototype implementation remains accessible in git history
+under PR-of-origin (linked from #406) for anyone who wants to
+fork it as a third-party tool. The core team will not maintain a
+REPL surface in the official `kai` binary.
