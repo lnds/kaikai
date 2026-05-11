@@ -3662,11 +3662,12 @@ static KaiValue *kai_prelude_file_rename(KaiValue *from, KaiValue *to) {
     return r;
 }
 
-/* Issue #482 (follow-up to #345): binary file IO. Mirror
- * read_file / write_file but operate on `[Byte]` cons-lists so
- * callers can round-trip arbitrary bytes including 0x00. Both
- * consume their args linearly (kai_decref before allocating the
- * result), matching the convention used by the text variants. */
+/* Issue #482 (follow-up to #345) + Array[Byte] refactor (prereq for
+ * #452): binary file IO. Operates on `Array[Byte]` so the buffer
+ * lines up with BinSerialize post-#488 (O(1) reads, contiguous
+ * storage). Both primitives consume their args linearly (kai_decref
+ * before allocating the result), matching the convention used by the
+ * text variants. */
 
 static KaiValue *kai_prelude_file_read_bytes(KaiValue *path) {
     KaiValue *r = NULL;
@@ -3697,21 +3698,24 @@ static KaiValue *kai_prelude_file_read_bytes(KaiValue *path) {
                 KaiValue *msg = kai_str("file_read_bytes: rewind failed");
                 r = kai_variant(0, "Err", 1, &msg);
             } else {
-                /* Read into a flat buffer first, then build the
-                 * cons-list right-to-left so the result is in
-                 * natural (file) order without a reverse pass. */
+                /* Read into a flat C buffer, then publish into a
+                 * fresh KAI_ARRAY one KAI_BYTE allocation per slot.
+                 * Allocating the kai_array directly (instead of
+                 * kai_array_make + array_set in a loop) avoids the
+                 * redundant default-incref/decref pair on every
+                 * position. */
                 unsigned char *buf = (unsigned char *) malloc((size_t) n + 1);
                 if (!buf) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); exit(1); }
                 size_t got = fread(buf, 1, (size_t) n, fp);
                 fclose(fp);
-                KaiValue *list = kai_nil();
-                size_t i = got;
-                while (i > 0) {
-                    i--;
-                    list = kai_cons(kai_byte(buf[i]), list);
-                }
+                KaiValue *arr = kai_alloc(KAI_ARRAY);
+                arr->as.arr.len = (int64_t) got;
+                arr->as.arr.cap = got > 0 ? (int64_t) got : 1;
+                arr->as.arr.items = (KaiValue **) malloc((size_t) arr->as.arr.cap * sizeof(KaiValue *));
+                if (!arr->as.arr.items) { free(buf); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                for (size_t i = 0; i < got; ++i) arr->as.arr.items[i] = kai_byte(buf[i]);
                 free(buf);
-                r = kai_variant(0, "Ok", 1, &list);
+                r = kai_variant(0, "Ok", 1, &arr);
             }
         }
     }
@@ -3724,6 +3728,9 @@ static KaiValue *kai_prelude_file_write_bytes(KaiValue *path, KaiValue *bytes) {
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("file_write_bytes: path is not a String");
         r = kai_variant(0, "Err", 1, &msg);
+    } else if (!bytes || bytes->tag != KAI_ARRAY) {
+        KaiValue *msg = kai_str("file_write_bytes: buffer is not an Array");
+        r = kai_variant(0, "Err", 1, &msg);
     } else {
         char pbuf[4096];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
@@ -3734,24 +3741,26 @@ static KaiValue *kai_prelude_file_write_bytes(KaiValue *path, KaiValue *bytes) {
             KaiValue *msg = kai_str("file_write_bytes: cannot open file");
             r = kai_variant(0, "Err", 1, &msg);
         } else {
-            /* Walk the cons-list once writing one byte at a time.
-             * fwrite of 1 byte into a stdio-buffered stream still
-             * batches via the C library's buffer; correct and
-             * acceptable for v1. */
+            /* Pack the kai_array into a contiguous C buffer, then
+             * issue a single fwrite. Cheaper than per-slot fwrite
+             * even with stdio buffering, and lets us fail fast on
+             * a non-Byte slot before any IO. */
+            int64_t n = bytes->as.arr.len;
             int ok = 1;
-            KaiValue *cur = bytes;
-            while (cur && cur->tag == KAI_CONS) {
-                KaiValue *head = cur->as.cons.head;
-                unsigned char b = 0;
-                if (head && head->tag == KAI_BYTE) {
-                    b = head->as.byte_val;
-                } else {
-                    ok = 0;
-                    break;
+            unsigned char *out = NULL;
+            if (n > 0) {
+                out = (unsigned char *) malloc((size_t) n);
+                if (!out) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                for (int64_t i = 0; i < n; ++i) {
+                    KaiValue *e = bytes->as.arr.items[i];
+                    if (!e || e->tag != KAI_BYTE) { ok = 0; break; }
+                    out[i] = e->as.byte_val;
                 }
-                if (fwrite(&b, 1, 1, fp) != 1) { ok = 0; break; }
-                cur = cur->as.cons.tail;
             }
+            if (ok && n > 0) {
+                if (fwrite(out, 1, (size_t) n, fp) != (size_t) n) ok = 0;
+            }
+            if (out) free(out);
             fclose(fp);
             if (!ok) {
                 KaiValue *msg = kai_str("file_write_bytes: write failed");
