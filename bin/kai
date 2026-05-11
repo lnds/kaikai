@@ -120,6 +120,26 @@ fi
 CC="${CC:-cc}"
 CFLAGS="${CFLAGS:--std=c99 -Wno-unused-function -Wno-unused-variable -O2}"
 
+# LLVM backend (L1 of LLVM-direct refactor — issue #DoD6). The driver
+# shells out to an external `clang` to compile the .ll emitted by
+# `kaic2 --emit=llvm`, linking against stage0/runtime_llvm.c. A static
+# libLLVM link is L3 future work; L1 keeps the dependency external and
+# entirely opt-in via `--backend=llvm`.
+CLANG="${CLANG:-clang}"
+CLANGFLAGS="${CLANGFLAGS:--w -O2}"
+
+# Resolve the LLVM-path runtime shim. Dev checkout lives next to the C
+# runtime under stage0/; installed layout would ship it next to
+# runtime.h under share/kaikai/include/. Empty when neither exists —
+# the build path errors out clearly.
+if [ -f "$RUNTIME_INC/runtime_llvm.c" ]; then
+  RUNTIME_LLVM_C="$RUNTIME_INC/runtime_llvm.c"
+elif [ -f "$ROOT/stage0/runtime_llvm.c" ]; then
+  RUNTIME_LLVM_C="$ROOT/stage0/runtime_llvm.c"
+else
+  RUNTIME_LLVM_C=""
+fi
+
 die() {
   echo "kai: error: $*" >&2
   exit 2
@@ -320,6 +340,9 @@ Run 'kai <command> --help' for command-specific options.
 Environment:
   CC               C compiler to invoke (default: cc).
   CFLAGS           Extra flags passed to CC.
+  CLANG            clang binary used by --backend=llvm (default: clang).
+  CLANGFLAGS       Extra flags passed to clang on --backend=llvm
+                   (default: -w -O2).
   KAI_NO_STDLIB    If 1, skip auto-loading the stdlib preludes.
   KAI_STDLIB       Override the stdlib root directory (default: auto-detected
                    from the script's location — share/kaikai/stdlib if installed,
@@ -334,26 +357,35 @@ EOF
 
 usage_build() {
   cat <<EOF
-usage: kai build <file.kai> [-o <out>]
+usage: kai build <file.kai> [-o <out>] [--backend=<c|llvm>]
        kai build --holes <file.kai>
        kai build --holes-json <file.kai>
 
-Compile a kaikai source file to a native binary using kaic2 + cc.
+Compile a kaikai source file to a native binary. The default backend
+emits portable C and links it with cc. The llvm backend emits LLVM IR
+via \`kaic2 --emit=llvm\` and links it with clang against
+stage0/runtime_llvm.c (L1 of the LLVM-direct refactor).
 
 Options:
-  -o <out>       Output binary path (default: basename of input without .kai).
-  --holes        Report every typed hole (\`?\` / \`?name\`) with expected
-                 type, in-scope bindings, and candidate fillers, then
-                 exit. No binary is produced. See docs/typed-holes.md.
-  --holes-json   Same as --holes, but emits the stable JSON schema
-                 documented in docs/typed-holes.md (LLM integration point).
-  -h, --help     Show this help.
+  -o <out>             Output binary path (default: basename of input
+                       without .kai).
+  --backend=<c|llvm>   Codegen backend (default: c).
+                       llvm requires clang in PATH (or set CLANG env var).
+  --holes              Report every typed hole (\`?\` / \`?name\`) with
+                       expected type, in-scope bindings, and candidate
+                       fillers, then exit. No binary is produced. See
+                       docs/typed-holes.md.
+  --holes-json         Same as --holes, but emits the stable JSON
+                       schema documented in docs/typed-holes.md (LLM
+                       integration point).
+  -h, --help           Show this help.
 
 Examples:
-  kai build hello.kai                    # produces ./hello
-  kai build src/app.kai -o build/app     # produces ./build/app
-  kai build --holes draft.kai            # human-readable hole report
-  kai build --holes-json draft.kai       # machine-readable hole report
+  kai build hello.kai                       # produces ./hello (C backend)
+  kai build src/app.kai -o build/app        # produces ./build/app
+  kai build --backend=llvm hello.kai        # produces ./hello via clang
+  kai build --holes draft.kai               # human-readable hole report
+  kai build --holes-json draft.kai          # machine-readable hole report
 
 The compiler auto-loads the stdlib preludes (stdlib/core, protocols,
 effects, etc.). Set KAI_NO_STDLIB=1 to skip them.
@@ -362,18 +394,21 @@ EOF
 
 usage_run() {
   cat <<EOF
-usage: kai run <file.kai> [args...]
+usage: kai run [--backend=<c|llvm>] <file.kai> [args...]
 
 Compile and immediately execute a kaikai program. Any arguments after
 the source file are forwarded to the compiled binary.
 
 Options:
-  -h, --help   Show this help.
+  --backend=<c|llvm>   Codegen backend (default: c).
+                       llvm requires clang in PATH (or set CLANG env var).
+  -h, --help           Show this help.
 
 Examples:
   kai run examples/minimal/hello.kai
   kai run demos/fizzbuzz/fizzbuzz.kai 30
   kai run app.kai --user alice --port 8080
+  kai run --backend=llvm examples/minimal/hello.kai
 
 The temporary binary is removed after the program exits.
 EOF
@@ -571,7 +606,26 @@ stdlib_prelude_flags() {
   return 0
 }
 
+# Detect that `clang` is available before trying to invoke it. Honours
+# the $CLANG override; called only on the LLVM build path.
+ensure_clang() {
+  if command -v "$CLANG" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "kai: error: --backend=llvm requires clang in PATH (or set CLANG env var)" >&2
+  echo "       falling back to C backend not implemented yet" >&2
+  exit 2
+}
+
 compile_to_binary() {
+  # Two leading flags carry the backend across the wrapper boundary.
+  # `--backend <c|llvm>` is consumed here, never forwarded to kaic2.
+  backend="c"
+  while [ "${1:-}" = "--backend" ]; do
+    shift
+    backend="$1"
+    shift
+  done
   src="$1"; tmp="$2"; out="$3"; sub="$4"; shift 4
   [ -f "$src" ] || die_file_not_found "$src" "$sub"
   ensure_built
@@ -604,13 +658,28 @@ compile_to_binary() {
   if [ -n "$manifest_dir" ]; then
     pkg_path_flags="$(manifest_path_flags "$manifest_dir")"
   fi
-  # shellcheck disable=SC2086
-  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $prelude_flags "$@" "$src") > "$tmp/out.c"
-  # shellcheck disable=SC2086
-  # `-lm` (issue #343): math/real libm bindings (sqrt, sin, log, …)
-  # are unresolved on Linux glibc without an explicit link line.
-  # macOS libSystem already exposes them, so the flag is a no-op.
-  $CC $CFLAGS -I "$RUNTIME_INC" "$tmp/out.c" -o "$out" -lm
+  if [ "$backend" = "llvm" ]; then
+    ensure_clang
+    if [ -z "$RUNTIME_LLVM_C" ]; then
+      die "--backend=llvm: cannot locate runtime_llvm.c (looked under $RUNTIME_INC and $ROOT/stage0)"
+    fi
+    # shellcheck disable=SC2086
+    (unset KAI_TRACE_RC; "$KAIC2" --emit=llvm --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $prelude_flags "$@" "$src") > "$tmp/out.ll"
+    # shellcheck disable=SC2086
+    # `-w` matches stage2/Makefile's test-llvm rule: kaic2's emitted
+    # IR triggers benign clang warnings (unused parameter on shim
+    # signatures, type-tag bitcasts) that we silence to keep the
+    # driver output clean. `-lm` parity with the C path (issue #343).
+    $CLANG $CLANGFLAGS -I "$RUNTIME_INC" "$tmp/out.ll" "$RUNTIME_LLVM_C" -o "$out" -lm
+  else
+    # shellcheck disable=SC2086
+    (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $prelude_flags "$@" "$src") > "$tmp/out.c"
+    # shellcheck disable=SC2086
+    # `-lm` (issue #343): math/real libm bindings (sqrt, sin, log, …)
+    # are unresolved on Linux glibc without an explicit link line.
+    # macOS libSystem already exposes them, so the flag is a no-op.
+    $CC $CFLAGS -I "$RUNTIME_INC" "$tmp/out.c" -o "$out" -lm
+  fi
 }
 
 # Run kaic2 in a typed-hole reporting mode (`--holes` or
@@ -634,7 +703,7 @@ report_holes() {
 }
 
 cmd_build() {
-  src=""; out=""; holes_mode=""
+  src=""; out=""; holes_mode=""; backend="c"
   while [ $# -gt 0 ]; do
     case "$1" in
       -o) shift; [ $# -gt 0 ] || die "-o needs an argument"; out="$1"; shift ;;
@@ -645,6 +714,19 @@ cmd_build() {
       --holes-json)
         [ -z "$holes_mode" ] || die "--holes and --holes-json are mutually exclusive"
         holes_mode="--holes-json"; shift ;;
+      --backend=*)
+        backend="${1#--backend=}"; shift
+        case "$backend" in
+          c|llvm) ;;
+          *) die "--backend must be 'c' or 'llvm' (got: $backend)" ;;
+        esac ;;
+      --backend)
+        shift; [ $# -gt 0 ] || die "--backend needs an argument (c|llvm)"
+        backend="$1"; shift
+        case "$backend" in
+          c|llvm) ;;
+          *) die "--backend must be 'c' or 'llvm' (got: $backend)" ;;
+        esac ;;
       -*) die "unknown flag: $1 (see 'kai build --help')" ;;
       *) [ -z "$src" ] || die "only one input file supported"; src="$1"; shift ;;
     esac
@@ -652,6 +734,7 @@ cmd_build() {
   [ -n "$src" ] || die "missing input file (see 'kai build --help')"
   if [ -n "$holes_mode" ]; then
     [ -z "$out" ] || die "$holes_mode does not produce a binary; drop -o <out>"
+    [ "$backend" = "c" ] || die "$holes_mode is independent of --backend; drop the flag"
     report_holes "$src" "$holes_mode"
     return $?
   fi
@@ -660,19 +743,39 @@ cmd_build() {
   fi
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
-  compile_to_binary "$src" "$tmp" "$out" "build"
+  compile_to_binary --backend "$backend" "$src" "$tmp" "$out" "build"
 }
 
 cmd_run() {
+  backend="c"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_run; return 0 ;;
+      --backend=*)
+        backend="${1#--backend=}"; shift
+        case "$backend" in
+          c|llvm) ;;
+          *) die "--backend must be 'c' or 'llvm' (got: $backend)" ;;
+        esac ;;
+      --backend)
+        shift; [ $# -gt 0 ] || die "--backend needs an argument (c|llvm)"
+        backend="$1"; shift
+        case "$backend" in
+          c|llvm) ;;
+          *) die "--backend must be 'c' or 'llvm' (got: $backend)" ;;
+        esac ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
   case "${1:-}" in
-    -h|--help) usage_run; return 0 ;;
     "") die "missing input file (see 'kai run --help')" ;;
   esac
   src="$1"; shift
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
   bin="$tmp/$(basename "$src" .kai)"
-  compile_to_binary "$src" "$tmp" "$bin" "run"
+  compile_to_binary --backend "$backend" "$src" "$tmp" "$bin" "run"
   "$bin" "$@"
 }
 
