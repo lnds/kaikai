@@ -163,7 +163,7 @@ arguments:
   - MVP essentials: `kai build`, `kai run`, `kai test`, `kai fmt`.
   - Mid-term: `kai lsp` (Language Server Protocol — universal editor support), `kai doc`.
   - Long-term: `kai new`, `kai add` (package manager as separate project).
-  - Post-1.0 (deferred from MVP per #406): `kai repl`.
+  - **Out of scope (permanently)**: `kai repl`. Removed from v1.0 per #406 and not planned for v1.x or v2. See `docs/decisions/repl-removal-2026-05-09.md` for the rationale. The `kai run` + `kai watch` workflow replaces the REPL use case.
   - Motivation: LLM-friendly (predictable commands, LSP provides immediate feedback), zero ecosystem fragmentation, trivial install.
 - **FFI / Interop**: crossing to C is expressed as the **`Ffi` effect capability**.
   - Declarations use `extern "C" fn name(args) : T`.
@@ -231,7 +231,7 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 ### Post-MVP
 
 - Stage 2 with direct LLVM backend, full Perceus, effect inference, fibers, scheduler.
-- Tooling: `kai fmt`, `kai lsp` (`kai repl` deferred post-1.0 per #406).
+- Tooling: `kai fmt`, `kai lsp`. (`kai repl` is permanently out of scope per #406 and `docs/decisions/repl-removal-2026-05-09.md`.)
 - Property testing, benchmarks, snapshots.
 - FFI binding generator.
 - More targets (Linux arm64, macOS x86_64, Windows).
@@ -319,7 +319,7 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 - **Structured concurrency** (`docs/structured-concurrency.md`): nursery-scoped fibers, `Spawn` / `Cancel` as effects, region-branded `Fiber[T]` that cannot escape its scope. Built on top of the effects + handlers machinery; lands in m8.
 - **Actors** (`docs/actors.md`): `Actor[Msg]` effect with typed mailboxes, link/monitor supervision, `Pid[Msg]` as a region-branded handle. Lands in m8 alongside the scheduler.
 - Elm/Rust-level error messages as an explicit design investment (not a "feature" — a quality bar for every diagnostic).
-- `kai fmt`, `kai lsp` (`kai repl` post-1.0 per #406).
+- `kai fmt`, `kai lsp`. (`kai repl` removed permanently per #406 / `docs/decisions/repl-removal-2026-05-09.md`.)
 - Property testing (`check`), benchmarks (`bench`), snapshots.
 - FFI binding generator.
 - More targets (Linux arm64, macOS x86_64, Windows).
