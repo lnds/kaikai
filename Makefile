@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-fmt test-bench test-check demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-fmt test-bench test-check test-library-mode demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -148,8 +148,8 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-bench test-check
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke"
+tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes"
 
 # Tongariki — `kai fmt` fixture suite. Verifies that every fixture
 # in examples/fmt/ formats to its `.expected.kai` and is idempotent,
@@ -253,6 +253,38 @@ test-check: kaic2
 	  cat /tmp/kaikai-check-shrinking.out; exit 1; \
 	fi; \
 	echo "test-check OK — $$matched property blocks passed; shrinking produced $$shrunk minimised counterexamples"
+
+# Issue #454 — `--library-mode` regression. Each fixture under
+# examples/library_mode/ embeds `# @probe <kind> L:C` markers; kaic2
+# emits a single JSON object per file with the resolved type / def /
+# enclosing-node answer for each probe. A diff against `.out.expected`
+# pins the JSON byte-for-byte so regressions in the typer (positions
+# drift, ty_to_string format changes, lower passes lose source spans)
+# fail this gate before they reach the LSP / cache lanes downstream.
+test-library-mode: kaic2
+	@set -e; \
+	root=$$(pwd); \
+	cd "$$root"; \
+	for fx in type_at_basic def_at_basic; do \
+	  src="examples/library_mode/$$fx.kai"; \
+	  exp="examples/library_mode/$$fx.out.expected"; \
+	  out=$$(mktemp); \
+	  "$$root/stage2/kaic2" --library-mode "$$src" > "$$out" 2>/dev/null \
+	    || { echo "library-mode $$fx FAIL (kaic2 exit)"; rm -f "$$out"; exit 1; }; \
+	  diff -q "$$exp" "$$out" > /dev/null \
+	    || { echo "library-mode $$fx DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
+	  rm -f "$$out"; \
+	  echo "library-mode $$fx OK"; \
+	done; \
+	src="examples/library_mode/def_at_imports.kai"; \
+	exp="examples/library_mode/def_at_imports.out.expected"; \
+	out=$$(mktemp); \
+	"$$root/stage2/kaic2" --path examples/library_mode --library-mode "$$src" > "$$out" 2>/dev/null \
+	  || { echo "library-mode def_at_imports FAIL (kaic2 exit)"; rm -f "$$out"; exit 1; }; \
+	diff -q "$$exp" "$$out" > /dev/null \
+	  || { echo "library-mode def_at_imports DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
+	rm -f "$$out"; \
+	echo "library-mode def_at_imports OK"
 
 # Tier 2.5 — daily memory-safety gate. Rebuilds the demos/ probe set
 # with `-fsanitize=address,undefined` and runs each binary; fails on

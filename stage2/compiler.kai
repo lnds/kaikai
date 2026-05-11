@@ -49155,6 +49155,13 @@ type Mode
   # and otherwise emits nothing (exit 0).
   | MFmt
   | MFmtCheck
+  # Issue #454: library mode. Run lex → parse → resolve → infer and
+  # answer position-keyed queries against the typed AST instead of
+  # emitting C. Probes are embedded in the source as line comments of
+  # the shape `# @probe <kind> <line>:<col>` (kind ∈ {type, def, enc})
+  # so fixtures stay self-contained. Output is a single JSON array
+  # with one object per probe — schema in docs/library-mode.md.
+  | MLibraryMode
 
 type CliOptions = { mode: Mode, path: Option[String], preludes: [String],
                     strict_holes: Bool, search_paths: [String],
@@ -49238,6 +49245,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MFmt))
       } else if a == "--fmt-check" {
         parse_cli_loop(more, cli_with_mode(opts, MFmtCheck))
+      } else if a == "--library-mode" {
+        parse_cli_loop(more, cli_with_mode(opts, MLibraryMode))
       } else if a == "--test" {
         parse_cli_loop(more, cli_with_mode(opts, MTest))
       } else if a == "--bench" {
@@ -49310,6 +49319,7 @@ fn usage() : Unit / Console {
   eprint("  --emit=llvm        emit LLVM IR (.ll) instead of C; link with stage0/runtime_llvm.c")
   eprint("  --fmt              pretty-print canonical kaikai source to stdout (Tongariki)")
   eprint("  --fmt-check        write formatted source to stdout iff different from input; exit 1")
+  eprint("  --library-mode     run lex/parse/resolve/infer; answer `# @probe <kind> L:C` queries as JSON (issue #454)")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
   eprint("  --include-prelude-tests  also run test blocks defined inside --prelude files (default: drop them; issue #318)")
   eprint("  -h, --help         this help")
@@ -50283,6 +50293,811 @@ fn builtin_spawn_decl() : Decl =
                     ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
+# ============================================================
+# Issue #454 — library mode (typed-AST queries).
+#
+# Today the only consumer of the typed AST is `emit_program`, which
+# burns it down into C and discards it. The LSP lane (#447), the
+# Phase A stdlib cache (#452), and `kai check --json` all need the
+# *opposite* shape: keep the typed AST resident and answer queries
+# of the form "what node sits at file:line:col?".
+#
+# This block adds that surface without touching the AST node types
+# (Expr/Pattern/Stmt/TypeExpr already carry `line`/`col`) and
+# without rewriting any emit site. It plugs into `compile_source`
+# the same way `--dump-typed` does: re-run inference on the post-
+# resolve `all_decls`, then walk the typed AST.
+#
+# Probes are read from `# @probe <kind> <line>:<col>` comments in
+# the source so a fixture is self-contained — no separate stdin
+# protocol, no extra CLI flags. Three kinds:
+#
+#   type — the inferred type of the innermost node enclosing pos
+#   def  — the source location of the declaration that defines the
+#          identifier at pos (top-level fn / type / const today;
+#          locals + cross-module land in a follow-up — see
+#          docs/library-mode.md "v1 limitations")
+#   enc  — the node kind + start position of the innermost node
+#          enclosing pos. Useful for hover-context and as a
+#          debugging aid for the index itself.
+#
+# Output is a single JSON object, schema in docs/library-mode.md.
+
+# A query-friendly wrapper around the typed AST. `compile_to_module`
+# returns one of these; the queries below operate on it. Today we
+# keep only what the queries need (file path + decls + module-table
+# placeholder); Phase A (#452) widens this to a serialisable form.
+type TypedModule = { tm_file: String, tm_decls: [Decl] }
+
+# Result of `enclosing_node` — carries the node kind name (so the
+# JSON consumer can branch without re-implementing the AST), the
+# start position, and (for type queries) the inferred type if any.
+type EncResult = ER(String, Int, Int, Option[Ty])
+
+# A single probe parsed out of the source.
+type LibProbe = LbP(String, Int, Int)   # kind, line, col
+
+# Compare two (line, col) positions: a >= b in document order.
+fn pos_ge(al: Int, ac: Int, bl: Int, bc: Int) : Bool {
+  if al > bl { true }
+  else if al < bl { false }
+  else { ac >= bc }
+}
+
+# Strict <= comparison.
+fn pos_le(al: Int, ac: Int, bl: Int, bc: Int) : Bool {
+  if al < bl { true }
+  else if al > bl { false }
+  else { ac <= bc }
+}
+
+# Tiny non-negative integer parser. Consumes leading digits only;
+# stops at the first non-digit. Returns Some(Int) when at least one
+# digit was consumed, None otherwise. Used by probe-comment parsing.
+fn lib_parse_uint_loop(s: String, i: Int, n: Int, acc: Int, any: Bool) : Option[Int] {
+  if i >= n {
+    if any { Some(acc) } else { None }
+  } else {
+    match char_at(s, i) {
+      None    -> if any { Some(acc) } else { None }
+      Some(c) -> if ch_is_digit(c) {
+                   lib_parse_uint_loop(s, i + 1, n, acc * 10 + (char_to_int(c) - char_to_int('0')), true)
+                 } else if any { Some(acc) } else { None }
+    }
+  }
+}
+
+fn lib_parse_uint(s: String) : Option[Int] =
+  lib_parse_uint_loop(s, 0, string_length(s), 0, false)
+
+# Parse "<line>:<col>" → Some((line, col)).
+type LineColPair = LC(Int, Int)
+
+fn lib_parse_linecol(s: String) : Option[LineColPair] {
+  let n = string_length(s)
+  let colon = lib_find_char(s, 0, n, ':')
+  if colon < 0 { None }
+  else {
+    let l_str = string_slice(s, 0, colon)
+    let c_str = string_slice(s, colon + 1, n - (colon + 1))
+    match lib_parse_uint(l_str) {
+      None    -> None
+      Some(l) -> match lib_parse_uint(c_str) {
+                   None    -> None
+                   Some(c) -> Some(LC(l, c))
+                 }
+    }
+  }
+}
+
+fn lib_find_char(s: String, i: Int, n: Int, want: Char) : Int {
+  if i >= n { 0 - 1 }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == want { i } else { lib_find_char(s, i + 1, n, want) }
+      None    -> 0 - 1
+    }
+  }
+}
+
+# Skip ASCII spaces / tabs starting at i; return the first non-space
+# offset (or n if EOL).
+fn lib_skip_ws(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == ' ' or c == '\t' { lib_skip_ws(s, i + 1, n) } else { i }
+      None    -> i
+    }
+  }
+}
+
+# Scan to the next ASCII whitespace boundary (space, tab, newline, EOL).
+fn lib_scan_token_end(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == ' ' or c == '\t' or c == '\n' or c == '\r' { i }
+                 else { lib_scan_token_end(s, i + 1, n) }
+      None    -> i
+    }
+  }
+}
+
+# Scan to the next newline; return its offset (or n if no newline).
+fn lib_scan_to_eol(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '\n' { i } else { lib_scan_to_eol(s, i + 1, n) }
+      None    -> i
+    }
+  }
+}
+
+# Match a literal substring at offset i. Returns true when the next
+# `|sub|` chars equal `sub`.
+fn lib_match_at(s: String, i: Int, sub: String) : Bool {
+  let m = string_length(sub)
+  let n = string_length(s)
+  if i + m > n { false }
+  else { string_slice(s, i, m) == sub }
+}
+
+# Parse all `# @probe <kind> <line>:<col>` markers out of `src`.
+# A marker may sit anywhere on a comment line; everything after the
+# `<line>:<col>` token on the same line is ignored. Comment syntax
+# follows the lexer (`#` to end of line).
+fn lib_collect_probes(src: String) : [LibProbe] =
+  lib_collect_probes_loop(src, 0, string_length(src), [])
+
+fn lib_collect_probes_loop(src: String, i: Int, n: Int, acc: [LibProbe]) : [LibProbe] {
+  if i >= n { list_reverse(acc) }
+  else {
+    # Find the next '#' (start of a comment).
+    let h = lib_find_char(src, i, n, '#')
+    if h < 0 { list_reverse(acc) }
+    else {
+      let eol = lib_scan_to_eol(src, h, n)
+      # Inspect the comment body.
+      let after_hash = lib_skip_ws(src, h + 1, eol)
+      if lib_match_at(src, after_hash, "@probe") {
+        let after_kw = after_hash + 6
+        let k_start = lib_skip_ws(src, after_kw, eol)
+        let k_end = lib_scan_token_end(src, k_start, eol)
+        if k_end == k_start { lib_collect_probes_loop(src, eol, n, acc) }
+        else {
+          let kind = string_slice(src, k_start, k_end - k_start)
+          let p_start = lib_skip_ws(src, k_end, eol)
+          let p_end = lib_scan_token_end(src, p_start, eol)
+          if p_end == p_start { lib_collect_probes_loop(src, eol, n, acc) }
+          else {
+            let pos_str = string_slice(src, p_start, p_end - p_start)
+            match lib_parse_linecol(pos_str) {
+              None        -> lib_collect_probes_loop(src, eol, n, acc)
+              Some(LC(l, c)) -> lib_collect_probes_loop(src, eol, n, [LbP(kind, l, c), ...acc])
+            }
+          }
+        }
+      } else {
+        lib_collect_probes_loop(src, eol, n, acc)
+      }
+    }
+  }
+}
+
+# ---------------- innermost-enclosing walker ----------------
+#
+# `find_enc_*` walks the typed AST top-down. At each node we compare
+# its start (line, col) against the query position. The returned
+# value is the innermost (last-document-order) node whose start is
+# ≤ pos. We do not need explicit end positions: the AST is built in
+# document order, so the deepest node satisfying `start ≤ pos` is
+# the innermost containing node for any well-formed source position.
+
+fn enc_better(a: Option[EncResult], cl: Int, cc: Int, kind_name: String,
+              ty: Option[Ty], ql: Int, qc: Int) : Option[EncResult] {
+  if not pos_ge(ql, qc, cl, cc) { a }
+  else {
+    match a {
+      None        -> Some(ER(kind_name, cl, cc, ty))
+      Some(ER(_, al, ac, _)) ->
+        if pos_ge(cl, cc, al, ac) { Some(ER(kind_name, cl, cc, ty)) }
+        else { a }
+    }
+  }
+}
+
+fn find_enc_decls(ds: [Decl], ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match ds {
+    []           -> acc
+    [d, ...rest] -> find_enc_decls(rest, ql, qc, find_enc_decl(d, ql, qc, acc))
+  }
+}
+
+fn find_enc_decl(d: Decl, ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match d {
+    DFn(_, _, _, params, _, _, body, line, col, _) -> {
+      let a1 = enc_better(acc, line, col, "DFn", None, ql, qc)
+      let a2 = find_enc_params(params, ql, qc, a1)
+      find_enc_expr(body, ql, qc, a2)
+    }
+    DConst(_, _, _, body, line, col) -> {
+      let a1 = enc_better(acc, line, col, "DConst", None, ql, qc)
+      find_enc_expr(body, ql, qc, a1)
+    }
+    DTest(_, body, line, col) -> {
+      let a1 = enc_better(acc, line, col, "DTest", None, ql, qc)
+      find_enc_expr(body, ql, qc, a1)
+    }
+    DBench(_, body, line, col) -> {
+      let a1 = enc_better(acc, line, col, "DBench", None, ql, qc)
+      find_enc_expr(body, ql, qc, a1)
+    }
+    DCheck(_, params, body, line, col) -> {
+      let a1 = enc_better(acc, line, col, "DCheck", None, ql, qc)
+      let a2 = find_enc_params(params, ql, qc, a1)
+      find_enc_expr(body, ql, qc, a2)
+    }
+    DType(_, _, _, _, line, col) -> enc_better(acc, line, col, "DType", None, ql, qc)
+    DImport(_, line, col)        -> enc_better(acc, line, col, "DImport", None, ql, qc)
+    DEffect(_, _, _, _, line, col) -> enc_better(acc, line, col, "DEffect", None, ql, qc)
+    DProtocol(_, _, _, _, line, col) -> enc_better(acc, line, col, "DProtocol", None, ql, qc)
+    DImpl(_, _, _, decls, line, col) -> {
+      let a1 = enc_better(acc, line, col, "DImpl", None, ql, qc)
+      find_enc_decls(decls, ql, qc, a1)
+    }
+    DDerive(_, inner, line, col) -> {
+      let a1 = enc_better(acc, line, col, "DDerive", None, ql, qc)
+      find_enc_decl(inner, ql, qc, a1)
+    }
+    DAttribPure(inner, line, col) -> {
+      let a1 = enc_better(acc, line, col, "DAttribPure", None, ql, qc)
+      find_enc_decl(inner, ql, qc, a1)
+    }
+    DUnit(_, _, _, line, col) -> enc_better(acc, line, col, "DUnit", None, ql, qc)
+    DUse(_, line, col)        -> enc_better(acc, line, col, "DUse", None, ql, qc)
+    DAxiom(_, _, _, _, _, params, _, _, line, col) -> {
+      let a1 = enc_better(acc, line, col, "DAxiom", None, ql, qc)
+      find_enc_params(params, ql, qc, a1)
+    }
+  }
+}
+
+fn find_enc_params(ps: [Param], ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match ps {
+    []           -> acc
+    [p, ...rest] -> {
+      let a1 = enc_better(acc, p.pline, p.pcol, "Param", None, ql, qc)
+      find_enc_params(rest, ql, qc, a1)
+    }
+  }
+}
+
+fn find_enc_expr(e: Expr, ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  let a0 = enc_better(acc, e.line, e.col, expr_kind_name(e.kind), e.ty, ql, qc)
+  find_enc_expr_kind(e.kind, ql, qc, a0)
+}
+
+fn find_enc_expr_kind(k: ExprKind, ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match k {
+    EInt(_)         -> acc
+    EReal(_)        -> acc
+    EBool(_)        -> acc
+    EChar(_)        -> acc
+    EStr(_, _)      -> acc
+    EUnit           -> acc
+    EVar(_)         -> acc
+    EUnder          -> acc
+    EPlaceholder    -> acc
+    EHole(_)        -> acc
+    ETodo(_)        -> acc
+    EModCall(_, _)  -> acc
+    ECall(f, call_args)  -> {
+      let a1 = find_enc_expr(f, ql, qc, acc)
+      find_enc_exprs(call_args, ql, qc, a1)
+    }
+    EField(e1, _)   -> find_enc_expr(e1, ql, qc, acc)
+    EIndex(e1, e2)  -> find_enc_expr(e2, ql, qc, find_enc_expr(e1, ql, qc, acc))
+    EBinop(_, l, r) -> find_enc_expr(r, ql, qc, find_enc_expr(l, ql, qc, acc))
+    EUnop(_, e1)    -> find_enc_expr(e1, ql, qc, acc)
+    EIf(c, t, eo)   -> {
+      let a1 = find_enc_expr(c, ql, qc, acc)
+      let a2 = find_enc_expr(t, ql, qc, a1)
+      match eo { None -> a2  Some(el) -> find_enc_expr(el, ql, qc, a2) }
+    }
+    EMatch(s, arms) -> {
+      let a1 = find_enc_expr(s, ql, qc, acc)
+      find_enc_arms(arms, ql, qc, a1)
+    }
+    ELambda(params, body) -> {
+      let a1 = find_enc_params(params, ql, qc, acc)
+      find_enc_expr(body, ql, qc, a1)
+    }
+    ERecordLit(_, fis) -> find_enc_field_inits(fis, ql, qc, acc)
+    EList(elems)    -> find_enc_list_elems(elems, ql, qc, acc)
+    ERange(a, b, so) -> {
+      let a1 = find_enc_expr(a, ql, qc, acc)
+      let a2 = find_enc_expr(b, ql, qc, a1)
+      match so { None -> a2  Some(s) -> find_enc_expr(s, ql, qc, a2) }
+    }
+    EBlock(stmts, tail) -> {
+      let a1 = find_enc_stmts(stmts, ql, qc, acc)
+      match tail { None -> a1  Some(t) -> find_enc_expr(t, ql, qc, a1) }
+    }
+    EPipe(l, r)        -> find_enc_expr(r, ql, qc, find_enc_expr(l, ql, qc, acc))
+    EMapPipe(l, r)     -> find_enc_expr(r, ql, qc, find_enc_expr(l, ql, qc, acc))
+    EFlatMapPipe(l, r) -> find_enc_expr(r, ql, qc, find_enc_expr(l, ql, qc, acc))
+    EFilterPipe(l, r)  -> find_enc_expr(r, ql, qc, find_enc_expr(l, ql, qc, acc))
+    EBang(inner)       -> find_enc_expr(inner, ql, qc, acc)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let a1 = find_enc_expr(body, ql, qc, acc)
+      let a2 = match init_opt { None -> a1  Some(i) -> find_enc_expr(i, ql, qc, a1) }
+      let a3 = find_enc_hclauses(clauses, ql, qc, a2)
+      match ret_opt {
+        None              -> a3
+        Some(HR(_, e1, line, col)) -> {
+          let a4 = enc_better(a3, line, col, "HReturn", None, ql, qc)
+          find_enc_expr(e1, ql, qc, a4)
+        }
+      }
+    }
+    ELitUnit(inner, _) -> find_enc_expr(inner, ql, qc, acc)
+    EVariantsOf(_, _)  -> acc
+  }
+}
+
+fn find_enc_exprs(es: [Expr], ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match es {
+    []           -> acc
+    [e, ...rest] -> find_enc_exprs(rest, ql, qc, find_enc_expr(e, ql, qc, acc))
+  }
+}
+
+fn find_enc_arms(arms: [Arm], ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match arms {
+    []           -> acc
+    [a, ...rest] -> match a {
+      Arm(pat, guard, body) -> {
+        let a1 = find_enc_pattern(pat, ql, qc, acc)
+        let a2 = match guard { None -> a1  Some(g) -> find_enc_expr(g, ql, qc, a1) }
+        let a3 = find_enc_expr(body, ql, qc, a2)
+        find_enc_arms(rest, ql, qc, a3)
+      }
+    }
+  }
+}
+
+fn find_enc_pattern(p: Pattern, ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  let a0 = enc_better(acc, p.line, p.col, "Pattern", None, ql, qc)
+  match p.pkind {
+    PWild           -> a0
+    PLit(e)         -> find_enc_expr(e, ql, qc, a0)
+    PBind(_)        -> a0
+    PList(subs, _)  -> find_enc_patterns(subs, ql, qc, a0)
+    PVariant(_, subs) -> find_enc_patterns(subs, ql, qc, a0)
+    PVariantRecord(_, fields) -> find_enc_pfields(fields, ql, qc, a0)
+    PRecord(fields) -> find_enc_pfields(fields, ql, qc, a0)
+    PHole(_)        -> a0
+    PAs(_, inner)   -> find_enc_pattern(inner, ql, qc, a0)
+    PNarrow(_, _)   -> a0
+  }
+}
+
+fn find_enc_patterns(ps: [Pattern], ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match ps {
+    []           -> acc
+    [p, ...rest] -> find_enc_patterns(rest, ql, qc, find_enc_pattern(p, ql, qc, acc))
+  }
+}
+
+fn find_enc_pfields(fs: [PField], ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match fs {
+    []           -> acc
+    [f, ...rest] -> match f {
+      PField(_, sub, _) -> find_enc_pfields(rest, ql, qc, find_enc_pattern(sub, ql, qc, acc))
+    }
+  }
+}
+
+fn find_enc_field_inits(fis: [FieldInit], ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match fis {
+    []           -> acc
+    [f, ...rest] -> match f {
+      FI(_, e1) -> find_enc_field_inits(rest, ql, qc, find_enc_expr(e1, ql, qc, acc))
+    }
+  }
+}
+
+fn find_enc_list_elems(es: [ListElem], ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match es {
+    []           -> acc
+    [e, ...rest] -> match e {
+      ElPlain(e1)  -> find_enc_list_elems(rest, ql, qc, find_enc_expr(e1, ql, qc, acc))
+      ElSpread(e1) -> find_enc_list_elems(rest, ql, qc, find_enc_expr(e1, ql, qc, acc))
+    }
+  }
+}
+
+fn find_enc_stmts(ss: [Stmt], ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match ss {
+    []           -> acc
+    [s, ...rest] -> find_enc_stmts(rest, ql, qc, find_enc_stmt(s, ql, qc, acc))
+  }
+}
+
+fn find_enc_stmt(s: Stmt, ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match s {
+    SLet(pat, _, body)               -> find_enc_expr(body, ql, qc, find_enc_pattern(pat, ql, qc, acc))
+    SAssert(e1, mo)                  -> {
+      let a1 = find_enc_expr(e1, ql, qc, acc)
+      match mo { None -> a1  Some(m) -> find_enc_expr(m, ql, qc, a1) }
+    }
+    SExprStmt(e1)                    -> find_enc_expr(e1, ql, qc, acc)
+    SIndexAssign(arr, idx, v, _, _)  -> find_enc_expr(v, ql, qc,
+                                          find_enc_expr(idx, ql, qc,
+                                            find_enc_expr(arr, ql, qc, acc)))
+    SVar(_, _, init, line, col)      -> {
+      let a1 = enc_better(acc, line, col, "SVar", None, ql, qc)
+      find_enc_expr(init, ql, qc, a1)
+    }
+    SUse(_, line, col)               -> enc_better(acc, line, col, "SUse", None, ql, qc)
+  }
+}
+
+fn find_enc_hclauses(cs: [HClause], ql: Int, qc: Int, acc: Option[EncResult]) : Option[EncResult] {
+  match cs {
+    []           -> acc
+    [c, ...rest] -> match c {
+      HC(_, params, body, line, col) -> {
+        let a1 = enc_better(acc, line, col, "HClause", None, ql, qc)
+        let a2 = find_enc_params(params, ql, qc, a1)
+        let a3 = find_enc_expr(body, ql, qc, a2)
+        find_enc_hclauses(rest, ql, qc, a3)
+      }
+    }
+  }
+}
+
+# Public surface — the three queries from the issue.
+
+fn enclosing_node(tm: TypedModule, line: Int, col: Int) : Option[EncResult] =
+  find_enc_decls(tm.tm_decls, line, col, None)
+
+fn type_at(tm: TypedModule, line: Int, col: Int) : Option[Ty] {
+  match enclosing_node(tm, line, col) {
+    None              -> None
+    Some(ER(_, _, _, ty_opt)) -> ty_opt
+  }
+}
+
+# `def_at` resolves the identifier at `pos` to its declaration site.
+# v1 covers top-level fn / type / const / effect / protocol names —
+# the most common LSP "go-to-definition" target. Locals, params, and
+# imported names land in a follow-up; the JSON consumer sees `null`
+# in those cases. The lookup uses the enclosing-node walk to fish
+# out an EVar at pos, then scans `tm.tm_decls` for a matching name.
+type DefLoc = DL(String, String, Int, Int)   # decl_kind, name, line, col
+
+fn def_at(tm: TypedModule, line: Int, col: Int) : Option[DefLoc] {
+  match find_var_at_decls(tm.tm_decls, line, col, None) {
+    None       -> None
+    Some(name) -> find_decl_def(tm.tm_decls, name)
+  }
+}
+
+# Locate the innermost EVar at the query position, returning its
+# bound name. We walk the same AST as `find_enc_*` but only record
+# nodes that are EVar — anything else is uninteresting for def-at.
+fn find_var_at_decls(ds: [Decl], ql: Int, qc: Int, acc: Option[String]) : Option[String] {
+  match ds {
+    []           -> acc
+    [d, ...rest] -> find_var_at_decls(rest, ql, qc, find_var_at_decl(d, ql, qc, acc))
+  }
+}
+
+fn find_var_at_decl(d: Decl, ql: Int, qc: Int, acc: Option[String]) : Option[String] {
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) -> find_var_at_expr(body, ql, qc, acc)
+    DConst(_, _, _, body, _, _)          -> find_var_at_expr(body, ql, qc, acc)
+    DTest(_, body, _, _)                 -> find_var_at_expr(body, ql, qc, acc)
+    DBench(_, body, _, _)                -> find_var_at_expr(body, ql, qc, acc)
+    DCheck(_, _, body, _, _)             -> find_var_at_expr(body, ql, qc, acc)
+    DImpl(_, _, _, decls, _, _)          -> find_var_at_decls(decls, ql, qc, acc)
+    DDerive(_, inner, _, _)              -> find_var_at_decl(inner, ql, qc, acc)
+    DAttribPure(inner, _, _)             -> find_var_at_decl(inner, ql, qc, acc)
+    _                                    -> acc
+  }
+}
+
+fn var_better(a: Option[String], cl: Int, cc: Int, name: String, ql: Int, qc: Int) : Option[String] {
+  if not pos_ge(ql, qc, cl, cc) { a }
+  else { Some(name) }   # later (deeper / later document order) overrides
+}
+
+fn find_var_at_expr(e: Expr, ql: Int, qc: Int, acc: Option[String]) : Option[String] {
+  let a0 = match e.kind {
+    EVar(name) -> var_better(acc, e.line, e.col, name, ql, qc)
+    _          -> acc
+  }
+  find_var_at_expr_kind(e.kind, ql, qc, a0)
+}
+
+fn find_var_at_expr_kind(k: ExprKind, ql: Int, qc: Int, acc: Option[String]) : Option[String] {
+  match k {
+    EInt(_)        -> acc
+    EReal(_)       -> acc
+    EBool(_)       -> acc
+    EChar(_)       -> acc
+    EStr(_, _)     -> acc
+    EUnit          -> acc
+    EVar(_)        -> acc
+    EUnder         -> acc
+    EPlaceholder   -> acc
+    EHole(_)       -> acc
+    ETodo(_)       -> acc
+    EModCall(_, _) -> acc
+    ECall(f, call_args) -> find_var_at_exprs(call_args, ql, qc, find_var_at_expr(f, ql, qc, acc))
+    EField(e1, _)  -> find_var_at_expr(e1, ql, qc, acc)
+    EIndex(e1, e2) -> find_var_at_expr(e2, ql, qc, find_var_at_expr(e1, ql, qc, acc))
+    EBinop(_, l, r) -> find_var_at_expr(r, ql, qc, find_var_at_expr(l, ql, qc, acc))
+    EUnop(_, e1)   -> find_var_at_expr(e1, ql, qc, acc)
+    EIf(c, t, eo)  -> {
+      let a1 = find_var_at_expr(c, ql, qc, acc)
+      let a2 = find_var_at_expr(t, ql, qc, a1)
+      match eo { None -> a2  Some(el) -> find_var_at_expr(el, ql, qc, a2) }
+    }
+    EMatch(s, arms) -> {
+      let a1 = find_var_at_expr(s, ql, qc, acc)
+      find_var_at_arms(arms, ql, qc, a1)
+    }
+    ELambda(_, body) -> find_var_at_expr(body, ql, qc, acc)
+    ERecordLit(_, fis) -> find_var_at_field_inits(fis, ql, qc, acc)
+    EList(elems)    -> find_var_at_list_elems(elems, ql, qc, acc)
+    ERange(a, b, so) -> {
+      let a1 = find_var_at_expr(a, ql, qc, acc)
+      let a2 = find_var_at_expr(b, ql, qc, a1)
+      match so { None -> a2  Some(s) -> find_var_at_expr(s, ql, qc, a2) }
+    }
+    EBlock(stmts, tail) -> {
+      let a1 = find_var_at_stmts(stmts, ql, qc, acc)
+      match tail { None -> a1  Some(t) -> find_var_at_expr(t, ql, qc, a1) }
+    }
+    EPipe(l, r)        -> find_var_at_expr(r, ql, qc, find_var_at_expr(l, ql, qc, acc))
+    EMapPipe(l, r)     -> find_var_at_expr(r, ql, qc, find_var_at_expr(l, ql, qc, acc))
+    EFlatMapPipe(l, r) -> find_var_at_expr(r, ql, qc, find_var_at_expr(l, ql, qc, acc))
+    EFilterPipe(l, r)  -> find_var_at_expr(r, ql, qc, find_var_at_expr(l, ql, qc, acc))
+    EBang(inner)       -> find_var_at_expr(inner, ql, qc, acc)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let a1 = find_var_at_expr(body, ql, qc, acc)
+      let a2 = match init_opt { None -> a1  Some(i) -> find_var_at_expr(i, ql, qc, a1) }
+      let a3 = find_var_at_hclauses(clauses, ql, qc, a2)
+      match ret_opt {
+        None                       -> a3
+        Some(HR(_, e1, _, _))      -> find_var_at_expr(e1, ql, qc, a3)
+      }
+    }
+    ELitUnit(inner, _) -> find_var_at_expr(inner, ql, qc, acc)
+    EVariantsOf(_, _)  -> acc
+  }
+}
+
+fn find_var_at_exprs(es: [Expr], ql: Int, qc: Int, acc: Option[String]) : Option[String] {
+  match es {
+    []           -> acc
+    [e, ...rest] -> find_var_at_exprs(rest, ql, qc, find_var_at_expr(e, ql, qc, acc))
+  }
+}
+
+fn find_var_at_arms(arms: [Arm], ql: Int, qc: Int, acc: Option[String]) : Option[String] {
+  match arms {
+    []           -> acc
+    [a, ...rest] -> match a {
+      Arm(_, guard, body) -> {
+        let a1 = match guard { None -> acc  Some(g) -> find_var_at_expr(g, ql, qc, acc) }
+        let a2 = find_var_at_expr(body, ql, qc, a1)
+        find_var_at_arms(rest, ql, qc, a2)
+      }
+    }
+  }
+}
+
+fn find_var_at_field_inits(fis: [FieldInit], ql: Int, qc: Int, acc: Option[String]) : Option[String] {
+  match fis {
+    []           -> acc
+    [f, ...rest] -> match f {
+      FI(_, e1) -> find_var_at_field_inits(rest, ql, qc, find_var_at_expr(e1, ql, qc, acc))
+    }
+  }
+}
+
+fn find_var_at_list_elems(es: [ListElem], ql: Int, qc: Int, acc: Option[String]) : Option[String] {
+  match es {
+    []           -> acc
+    [e, ...rest] -> match e {
+      ElPlain(e1)  -> find_var_at_list_elems(rest, ql, qc, find_var_at_expr(e1, ql, qc, acc))
+      ElSpread(e1) -> find_var_at_list_elems(rest, ql, qc, find_var_at_expr(e1, ql, qc, acc))
+    }
+  }
+}
+
+fn find_var_at_stmts(ss: [Stmt], ql: Int, qc: Int, acc: Option[String]) : Option[String] {
+  match ss {
+    []           -> acc
+    [s, ...rest] -> find_var_at_stmts(rest, ql, qc, find_var_at_stmt(s, ql, qc, acc))
+  }
+}
+
+fn find_var_at_stmt(s: Stmt, ql: Int, qc: Int, acc: Option[String]) : Option[String] {
+  match s {
+    SLet(_, _, body)                -> find_var_at_expr(body, ql, qc, acc)
+    SAssert(e1, mo)                 -> {
+      let a1 = find_var_at_expr(e1, ql, qc, acc)
+      match mo { None -> a1  Some(m) -> find_var_at_expr(m, ql, qc, a1) }
+    }
+    SExprStmt(e1)                   -> find_var_at_expr(e1, ql, qc, acc)
+    SIndexAssign(arr, idx, v, _, _) -> find_var_at_expr(v, ql, qc,
+                                          find_var_at_expr(idx, ql, qc,
+                                            find_var_at_expr(arr, ql, qc, acc)))
+    SVar(_, _, init, _, _)          -> find_var_at_expr(init, ql, qc, acc)
+    SUse(_, _, _)                   -> acc
+  }
+}
+
+fn find_var_at_hclauses(cs: [HClause], ql: Int, qc: Int, acc: Option[String]) : Option[String] {
+  match cs {
+    []           -> acc
+    [c, ...rest] -> match c {
+      HC(_, _, body, _, _) -> find_var_at_hclauses(rest, ql, qc, find_var_at_expr(body, ql, qc, acc))
+    }
+  }
+}
+
+# Scan top-level decls for a definition with the given surface name.
+# Returns the first match in declaration order. Cross-module
+# resolution piggybacks on `expand_imports`, which already merged
+# imported decls into the flat list before inference ran (so an
+# imported `pub fn foo` shows up here exactly like a local one).
+fn find_decl_def(ds: [Decl], name: String) : Option[DefLoc] {
+  match ds {
+    []           -> None
+    [d, ...rest] -> match d {
+      DFn(_, n, _, _, _, _, _, line, col, _) ->
+        if n == name { Some(DL("DFn", n, line, col)) } else { find_decl_def(rest, name) }
+      DConst(_, n, _, _, line, col) ->
+        if n == name { Some(DL("DConst", n, line, col)) } else { find_decl_def(rest, name) }
+      DType(_, n, _, _, line, col) ->
+        if n == name { Some(DL("DType", n, line, col)) } else { find_decl_def(rest, name) }
+      DEffect(_, n, _, _, line, col) ->
+        if n == name { Some(DL("DEffect", n, line, col)) } else { find_decl_def(rest, name) }
+      DProtocol(_, n, _, _, line, col) ->
+        if n == name { Some(DL("DProtocol", n, line, col)) } else { find_decl_def(rest, name) }
+      DAxiom(_, _, _, n, _, _, _, _, line, col) ->
+        if n == name { Some(DL("DAxiom", n, line, col)) } else { find_decl_def(rest, name) }
+      DUnit(_, n, _, line, col) ->
+        if n == name { Some(DL("DUnit", n, line, col)) } else { find_decl_def(rest, name) }
+      DDerive(_, inner, _, _) -> match find_decl_def([inner], name) {
+        Some(loc) -> Some(loc)
+        None      -> find_decl_def(rest, name)
+      }
+      DAttribPure(inner, _, _) -> match find_decl_def([inner], name) {
+        Some(loc) -> Some(loc)
+        None      -> find_decl_def(rest, name)
+      }
+      _ -> find_decl_def(rest, name)
+    }
+  }
+}
+
+# Public entry point for in-process consumers (tests + Phase A
+# prototypes). Mirrors `compile_source` up through inference but
+# returns the typed module instead of an exit code. Errors are
+# folded into the returned module's decls just like a normal
+# infer_program run; consumers inspect `tm_decls` for emptiness.
+fn compile_to_module(file: String, decls: [Decl]) : TypedModule {
+  let r = infer_program(file, decls, false)
+  TypedModule { tm_file: file, tm_decls: r.decls }
+}
+
+# ---------------- JSON serialization ----------------
+
+fn lib_json_pos(line: Int, col: Int) : String =
+  concat_all([
+    "\"line\": ", int_to_string(line),
+    ", \"col\": ", int_to_string(col)
+  ])
+
+fn lib_json_enc(opt: Option[EncResult]) : String {
+  match opt {
+    None -> "{\"node_kind\": null}"
+    Some(ER(kn, l, c, _)) ->
+      concat_all([
+        "{\"node_kind\": ", json_str(kn),
+        ", \"node_line\": ", int_to_string(l),
+        ", \"node_col\": ", int_to_string(c),
+        "}"
+      ])
+  }
+}
+
+fn lib_json_type(opt: Option[Ty]) : String {
+  match opt {
+    None    -> "null"
+    Some(t) -> json_str(ty_to_string(t))
+  }
+}
+
+fn lib_json_def(file: String, opt: Option[DefLoc]) : String {
+  match opt {
+    None -> "null"
+    Some(DL(kind, name, line, col)) ->
+      concat_all([
+        "{\"decl_kind\": ", json_str(kind),
+        ", \"name\": ", json_str(name),
+        ", \"file\": ", json_str(file),
+        ", \"line\": ", int_to_string(line),
+        ", \"col\": ", int_to_string(col),
+        "}"
+      ])
+  }
+}
+
+fn lib_run_probe(tm: TypedModule, p: LibProbe) : String {
+  match p {
+    LbP(kind, line, col) -> {
+      let head = concat_all([
+        "{\"kind\": ", json_str(kind),
+        ", ", lib_json_pos(line, col)
+      ])
+      if kind == "type" {
+        let enc = enclosing_node(tm, line, col)
+        let ty = type_at(tm, line, col)
+        concat_all([head,
+          ", \"enclosing\": ", lib_json_enc(enc),
+          ", \"type\": ", lib_json_type(ty),
+          "}"])
+      } else if kind == "enc" {
+        let enc = enclosing_node(tm, line, col)
+        concat_all([head,
+          ", \"enclosing\": ", lib_json_enc(enc),
+          "}"])
+      } else if kind == "def" {
+        let dl = def_at(tm, line, col)
+        let nm = find_var_at_decls(tm.tm_decls, line, col, None)
+        let nm_field = match nm { None -> json_null()  Some(s) -> json_str(s) }
+        concat_all([head,
+          ", \"identifier\": ", nm_field,
+          ", \"def\": ", lib_json_def(tm.tm_file, dl),
+          "}"])
+      } else {
+        # Unknown kind — surface the input so fixture authors can
+        # spot the typo without having to grep the source.
+        concat_all([head,
+          ", \"error\": \"unknown probe kind\"",
+          "}"])
+      }
+    }
+  }
+}
+
+fn lib_run_probes(tm: TypedModule, ps: [LibProbe]) : [String] =
+  map(ps, (p) => lib_run_probe(tm, p))
+
+fn dump_library_mode(file: String, src: String, decls: [Decl]) : Int / Console {
+  let tm = compile_to_module(file, decls)
+  let probes = lib_collect_probes(src)
+  let entries = lib_run_probes(tm, probes)
+  print(concat_all([
+    "{\"file\": ", json_str(file),
+    ", \"probes\": [",
+    join_with(entries, ", "),
+    "]}"
+  ]))
+  0
+}
+
+# ============================================================
+
 fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry]) : Int / Console {
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
@@ -50628,6 +51443,15 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               MEffectHolesJson -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_effect_holes_json(path, all_decls) }
+              }
+              MLibraryMode -> {
+                # Issue #454. Library mode reuses the typer through
+                # `infer_program` (same as the other JSON dumps) and
+                # answers position-keyed queries against the typed
+                # AST. Probes are read from `# @probe` comments in
+                # the source so a fixture is self-describing.
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_library_mode(path, src, all_decls) }
               }
               _ -> {
                 let chk = check_program(path, all_decls)
