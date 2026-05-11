@@ -51910,17 +51910,340 @@ fn type_at(tm: TypedModule, line: Int, col: Int) : Option[Ty] {
 }
 
 # `def_at` resolves the identifier at `pos` to its declaration site.
-# v1 covers top-level fn / type / const / effect / protocol names —
-# the most common LSP "go-to-definition" target. Locals, params, and
-# imported names land in a follow-up; the JSON consumer sees `null`
-# in those cases. The lookup uses the enclosing-node walk to fish
-# out an EVar at pos, then scans `tm.tm_decls` for a matching name.
+# Coverage: top-level fn / type / const / effect / protocol names
+# (decl-table lookup), plus local bindings introduced by `let`,
+# `var`, function/lambda/handler-clause parameters, pattern binds
+# (`Some(x)`, `[h, ...t]`, `T { f: y }`, `(a, b)`, `as`-aliases,
+# narrow binds, named holes), and closure captures (a name used
+# inside a lambda whose binding lives in an outer scope resolves to
+# the outer site).
+#
+# Algorithm:
+#   1. find the innermost EVar(name) at the query position.
+#   2. walk the AST again with a lexical scope stack; the EVar at
+#      the query position takes the innermost scope-stack entry
+#      whose name matches. Shadowing falls out for free because the
+#      stack is LIFO — the most-recently-pushed binding comes first.
+#   3. if step 2 returns a local binding, surface it directly;
+#      otherwise fall back to the top-level decl scan.
 type DefLoc = DL(String, String, Int, Int)   # decl_kind, name, line, col
+type ScopeBind = SB(String, String, Int, Int) # kind ("Local"|"Param"|"PatBind"|"VarMut"|"HReturn"), name, line, col
 
 fn def_at(tm: TypedModule, line: Int, col: Int) : Option[DefLoc] {
   match find_var_at_decls(tm.tm_decls, line, col, None) {
     None       -> None
-    Some(name) -> find_decl_def(tm.tm_decls, name)
+    Some(name) -> match find_local_at_decls(tm.tm_decls, name, line, col, None) {
+      Some(SB(k, n, l, c)) -> Some(DL(k, n, l, c))
+      None                 -> find_decl_def(tm.tm_decls, name)
+    }
+  }
+}
+
+# ---------------- local-binding scope walker ----------------
+#
+# `find_local_at_*` mirrors the structure of `find_var_at_*` but
+# threads a lexical scope stack (innermost binding at the head).
+# When the walker visits an EVar(name) at the query position whose
+# name matches `qname`, it looks up `qname` in the current scope —
+# the first hit (= innermost lexical binding) is recorded. Later
+# matches overwrite earlier ones, so the deepest discovery wins
+# (matters when the same EVar would be visited twice; in practice
+# each leaf is visited once, but the discipline keeps the recursion
+# uniform with `enc_better` / `var_better`).
+
+fn scope_lookup(scope: [ScopeBind], qname: String) : Option[ScopeBind] {
+  match scope {
+    []           -> None
+    [b, ...rest] -> match b {
+      SB(_, n, _, _) -> if n == qname { Some(b) } else { scope_lookup(rest, qname) }
+    }
+  }
+}
+
+# Patterns: walk the pattern, append `(name, line, col)` for each
+# bound identifier. `pat_pos` is the parent pattern's position; we
+# attribute rest-list binders, narrow binds, and `as` aliases to
+# their enclosing pattern's span since those binders are encoded as
+# bare strings without per-binder positions.
+fn pat_binds(p: Pattern, acc: [ScopeBind]) : [ScopeBind] {
+  match p.pkind {
+    PWild              -> acc
+    PLit(_)            -> acc
+    PBind(name)        -> [SB("PatBind", name, p.line, p.col), ...acc]
+    PList(subs, rest)  -> {
+      let a1 = pat_binds_list(subs, acc)
+      match rest {
+        None       -> a1
+        Some(rn)   -> [SB("PatBind", rn, p.line, p.col), ...a1]
+      }
+    }
+    PVariant(_, subs)         -> pat_binds_list(subs, acc)
+    PVariantRecord(_, fields) -> pat_binds_fields(fields, acc)
+    PRecord(fields)           -> pat_binds_fields(fields, acc)
+    PHole(opt_name) -> match opt_name {
+      None       -> acc
+      Some(name) -> [SB("PatBind", name, p.line, p.col), ...acc]
+    }
+    PAs(name, inner) -> pat_binds(inner, [SB("PatBind", name, p.line, p.col), ...acc])
+    PNarrow(name, _) -> [SB("PatBind", name, p.line, p.col), ...acc]
+  }
+}
+
+fn pat_binds_list(ps: [Pattern], acc: [ScopeBind]) : [ScopeBind] {
+  match ps {
+    []           -> acc
+    [p, ...rest] -> pat_binds_list(rest, pat_binds(p, acc))
+  }
+}
+
+fn pat_binds_fields(fs: [PField], acc: [ScopeBind]) : [ScopeBind] {
+  match fs {
+    []           -> acc
+    [f, ...rest] -> match f {
+      PField(_, sub, _) -> pat_binds_fields(rest, pat_binds(sub, acc))
+    }
+  }
+}
+
+# Push every Param onto the scope stack (innermost-first ordering is
+# fine: params share a single scope, so order within them does not
+# affect shadowing semantics).
+fn push_params(ps: [Param], scope: [ScopeBind]) : [ScopeBind] {
+  match ps {
+    []           -> scope
+    [p, ...rest] -> push_params(rest, [SB("Param", p.pname, p.pline, p.pcol), ...scope])
+  }
+}
+
+fn loc_better(a: Option[ScopeBind], b: Option[ScopeBind]) : Option[ScopeBind] {
+  match b { None -> a  Some(_) -> b }
+}
+
+fn find_local_at_decls(ds: [Decl], qname: String, ql: Int, qc: Int,
+                       acc: Option[ScopeBind]) : Option[ScopeBind] {
+  match ds {
+    []           -> acc
+    [d, ...rest] -> find_local_at_decls(rest, qname, ql, qc,
+                       find_local_at_decl(d, qname, ql, qc, acc))
+  }
+}
+
+fn find_local_at_decl(d: Decl, qname: String, ql: Int, qc: Int,
+                      acc: Option[ScopeBind]) : Option[ScopeBind] {
+  match d {
+    DFn(_, _, _, params, _, _, body, _, _, _) -> {
+      let scope = push_params(params, [])
+      find_local_at_expr(body, qname, ql, qc, scope, acc)
+    }
+    DConst(_, _, _, body, _, _) -> find_local_at_expr(body, qname, ql, qc, [], acc)
+    DTest(_, body, _, _)        -> find_local_at_expr(body, qname, ql, qc, [], acc)
+    DBench(_, body, _, _)       -> find_local_at_expr(body, qname, ql, qc, [], acc)
+    DCheck(_, params, body, _, _) -> {
+      let scope = push_params(params, [])
+      find_local_at_expr(body, qname, ql, qc, scope, acc)
+    }
+    DImpl(_, _, _, decls, _, _) -> find_local_at_decls(decls, qname, ql, qc, acc)
+    DDerive(_, inner, _, _)     -> find_local_at_decl(inner, qname, ql, qc, acc)
+    DAttribPure(inner, _, _)    -> find_local_at_decl(inner, qname, ql, qc, acc)
+    _                           -> acc
+  }
+}
+
+fn find_local_at_expr(e: Expr, qname: String, ql: Int, qc: Int,
+                      scope: [ScopeBind], acc: Option[ScopeBind]) : Option[ScopeBind] {
+  let a0 = match e.kind {
+    EVar(name) -> if name == qname and pos_ge(ql, qc, e.line, e.col) {
+                    loc_better(acc, scope_lookup(scope, qname))
+                  } else { acc }
+    _          -> acc
+  }
+  find_local_at_expr_kind(e.kind, qname, ql, qc, scope, a0)
+}
+
+fn find_local_at_expr_kind(k: ExprKind, qname: String, ql: Int, qc: Int,
+                           scope: [ScopeBind], acc: Option[ScopeBind]) : Option[ScopeBind] {
+  match k {
+    EInt(_)        -> acc
+    EReal(_)       -> acc
+    EBool(_)       -> acc
+    EChar(_)       -> acc
+    EStr(_, _)     -> acc
+    EUnit          -> acc
+    EVar(_)        -> acc
+    EUnder         -> acc
+    EPlaceholder   -> acc
+    EHole(_)       -> acc
+    ETodo(_)       -> acc
+    EModCall(_, _) -> acc
+    ECall(f, call_args) -> {
+      let a1 = find_local_at_expr(f, qname, ql, qc, scope, acc)
+      find_local_at_exprs(call_args, qname, ql, qc, scope, a1)
+    }
+    EField(e1, _)  -> find_local_at_expr(e1, qname, ql, qc, scope, acc)
+    EIndex(e1, e2) -> find_local_at_expr(e2, qname, ql, qc, scope,
+                        find_local_at_expr(e1, qname, ql, qc, scope, acc))
+    EBinop(_, l, r) -> find_local_at_expr(r, qname, ql, qc, scope,
+                         find_local_at_expr(l, qname, ql, qc, scope, acc))
+    EUnop(_, e1)   -> find_local_at_expr(e1, qname, ql, qc, scope, acc)
+    EIf(c, t, eo)  -> {
+      let a1 = find_local_at_expr(c, qname, ql, qc, scope, acc)
+      let a2 = find_local_at_expr(t, qname, ql, qc, scope, a1)
+      match eo { None -> a2  Some(el) -> find_local_at_expr(el, qname, ql, qc, scope, a2) }
+    }
+    EMatch(s, arms) -> {
+      let a1 = find_local_at_expr(s, qname, ql, qc, scope, acc)
+      find_local_at_arms(arms, qname, ql, qc, scope, a1)
+    }
+    ELambda(params, body) -> {
+      let inner = push_params(params, scope)
+      find_local_at_expr(body, qname, ql, qc, inner, acc)
+    }
+    ERecordLit(_, fis) -> find_local_at_field_inits(fis, qname, ql, qc, scope, acc)
+    EList(elems)    -> find_local_at_list_elems(elems, qname, ql, qc, scope, acc)
+    ERange(a, b, so) -> {
+      let a1 = find_local_at_expr(a, qname, ql, qc, scope, acc)
+      let a2 = find_local_at_expr(b, qname, ql, qc, scope, a1)
+      match so { None -> a2  Some(s) -> find_local_at_expr(s, qname, ql, qc, scope, a2) }
+    }
+    EBlock(stmts, tail) -> {
+      let r = find_local_at_stmts(stmts, qname, ql, qc, scope, acc)
+      match r { SR(final_scope, hit) ->
+        match tail {
+          None    -> hit
+          Some(t) -> find_local_at_expr(t, qname, ql, qc, final_scope, hit)
+        }
+      }
+    }
+    EPipe(l, r)        -> find_local_at_expr(r, qname, ql, qc, scope,
+                            find_local_at_expr(l, qname, ql, qc, scope, acc))
+    EMapPipe(l, r)     -> find_local_at_expr(r, qname, ql, qc, scope,
+                            find_local_at_expr(l, qname, ql, qc, scope, acc))
+    EFlatMapPipe(l, r) -> find_local_at_expr(r, qname, ql, qc, scope,
+                            find_local_at_expr(l, qname, ql, qc, scope, acc))
+    EFilterPipe(l, r)  -> find_local_at_expr(r, qname, ql, qc, scope,
+                            find_local_at_expr(l, qname, ql, qc, scope, acc))
+    EBang(inner)       -> find_local_at_expr(inner, qname, ql, qc, scope, acc)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let a1 = find_local_at_expr(body, qname, ql, qc, scope, acc)
+      let a2 = match init_opt { None -> a1  Some(i) -> find_local_at_expr(i, qname, ql, qc, scope, a1) }
+      let a3 = find_local_at_hclauses(clauses, qname, ql, qc, scope, a2)
+      match ret_opt {
+        None                            -> a3
+        Some(HR(rname, rbody, rl, rc)) -> {
+          let inner = [SB("HReturn", rname, rl, rc), ...scope]
+          find_local_at_expr(rbody, qname, ql, qc, inner, a3)
+        }
+      }
+    }
+    ELitUnit(inner, _) -> find_local_at_expr(inner, qname, ql, qc, scope, acc)
+    EVariantsOf(_, _)  -> acc
+  }
+}
+
+fn find_local_at_exprs(es: [Expr], qname: String, ql: Int, qc: Int,
+                       scope: [ScopeBind], acc: Option[ScopeBind]) : Option[ScopeBind] {
+  match es {
+    []           -> acc
+    [e, ...rest] -> find_local_at_exprs(rest, qname, ql, qc, scope,
+                       find_local_at_expr(e, qname, ql, qc, scope, acc))
+  }
+}
+
+fn find_local_at_arms(arms: [Arm], qname: String, ql: Int, qc: Int,
+                      scope: [ScopeBind], acc: Option[ScopeBind]) : Option[ScopeBind] {
+  match arms {
+    []           -> acc
+    [a, ...rest] -> match a {
+      Arm(pat, guard, body) -> {
+        let inner = pat_binds(pat, scope)
+        let a1 = match guard { None -> acc  Some(g) -> find_local_at_expr(g, qname, ql, qc, inner, acc) }
+        let a2 = find_local_at_expr(body, qname, ql, qc, inner, a1)
+        find_local_at_arms(rest, qname, ql, qc, scope, a2)
+      }
+    }
+  }
+}
+
+fn find_local_at_field_inits(fis: [FieldInit], qname: String, ql: Int, qc: Int,
+                             scope: [ScopeBind], acc: Option[ScopeBind]) : Option[ScopeBind] {
+  match fis {
+    []           -> acc
+    [f, ...rest] -> match f {
+      FI(_, e1) -> find_local_at_field_inits(rest, qname, ql, qc, scope,
+                      find_local_at_expr(e1, qname, ql, qc, scope, acc))
+    }
+  }
+}
+
+fn find_local_at_list_elems(es: [ListElem], qname: String, ql: Int, qc: Int,
+                            scope: [ScopeBind], acc: Option[ScopeBind]) : Option[ScopeBind] {
+  match es {
+    []           -> acc
+    [e, ...rest] -> match e {
+      ElPlain(e1)  -> find_local_at_list_elems(rest, qname, ql, qc, scope,
+                         find_local_at_expr(e1, qname, ql, qc, scope, acc))
+      ElSpread(e1) -> find_local_at_list_elems(rest, qname, ql, qc, scope,
+                         find_local_at_expr(e1, qname, ql, qc, scope, acc))
+    }
+  }
+}
+
+# Statements thread the scope forward: a `let` or `var` adds bindings
+# visible to the rest of the block (and to the tail expression).
+# `SR` carries `(scope_after, hit)` so the caller (EBlock) can hand
+# the post-statements scope to the tail expression.
+type StmtsResult = SR([ScopeBind], Option[ScopeBind])
+
+fn find_local_at_stmts(ss: [Stmt], qname: String, ql: Int, qc: Int,
+                       scope: [ScopeBind], acc: Option[ScopeBind]) : StmtsResult {
+  match ss {
+    []           -> SR(scope, acc)
+    [s, ...rest] -> match find_local_at_stmt(s, qname, ql, qc, scope, acc) {
+      SR(next_scope, next_acc) -> find_local_at_stmts(rest, qname, ql, qc, next_scope, next_acc)
+    }
+  }
+}
+
+fn find_local_at_stmt(s: Stmt, qname: String, ql: Int, qc: Int,
+                      scope: [ScopeBind], acc: Option[ScopeBind]) : StmtsResult {
+  match s {
+    SLet(pat, _, body) -> {
+      let a1 = find_local_at_expr(body, qname, ql, qc, scope, acc)
+      let next = pat_binds(pat, scope)
+      SR(next, a1)
+    }
+    SAssert(e1, mo) -> {
+      let a1 = find_local_at_expr(e1, qname, ql, qc, scope, acc)
+      let a2 = match mo { None -> a1  Some(m) -> find_local_at_expr(m, qname, ql, qc, scope, a1) }
+      SR(scope, a2)
+    }
+    SExprStmt(e1) -> SR(scope, find_local_at_expr(e1, qname, ql, qc, scope, acc))
+    SIndexAssign(arr, idx, v, _, _) -> {
+      let a1 = find_local_at_expr(arr, qname, ql, qc, scope, acc)
+      let a2 = find_local_at_expr(idx, qname, ql, qc, scope, a1)
+      let a3 = find_local_at_expr(v, qname, ql, qc, scope, a2)
+      SR(scope, a3)
+    }
+    SVar(name, _, init, line, col) -> {
+      let a1 = find_local_at_expr(init, qname, ql, qc, scope, acc)
+      let next = [SB("VarMut", name, line, col), ...scope]
+      SR(next, a1)
+    }
+    SUse(_, _, _) -> SR(scope, acc)
+  }
+}
+
+fn find_local_at_hclauses(cs: [HClause], qname: String, ql: Int, qc: Int,
+                          scope: [ScopeBind], acc: Option[ScopeBind]) : Option[ScopeBind] {
+  match cs {
+    []           -> acc
+    [c, ...rest] -> match c {
+      HC(_, params, body, _, _) -> {
+        let inner = push_params(params, scope)
+        let a1 = find_local_at_expr(body, qname, ql, qc, inner, acc)
+        find_local_at_hclauses(rest, qname, ql, qc, scope, a1)
+      }
+    }
   }
 }
 
