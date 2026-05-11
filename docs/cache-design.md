@@ -12,10 +12,63 @@ choice.
 ## Goal
 
 Move kaikai from "re-parse stdlib + user code on every `kai build`"
-(today: 1.5 s tiny program, of which ~1.3 s is stdlib re-parsing)
-to "deserialise pre-typed modules on every build, re-parse only
-what changed" (target: ≤ 300 ms cold, ≤ 150 ms incremental — DoD
-#6).
+(today: 1.5 s tiny program) to "deserialise pre-typed modules on
+every build, re-parse only what changed" (target: ≤ 300 ms cold,
+≤ 150 ms incremental — DoD #6).
+
+## Empirical breakdown (2026-05-11, M2 Pro, arm64)
+
+Phase-by-phase wall of `bin/kai build empty.kai` after #458, n=5
+runs each, median reported. Re-measured 2026-05-11 because the
+prior "1.3 s is re-parsing" claim in #452 was imprecise. See
+`tools/bench-phases.sh` for the harness.
+
+| Stage | Cumulative wall | Delta | Share |
+|---|---|---|---|
+| `--tokens` (lex preludes) | 0.24 s | 0.24 s | 16% |
+| `--ast` (parse preludes) | 0.34 s | 0.10 s | 7% |
+| `--infer` (typecheck stdlib+main) | 0.77 s | 0.43 s | 29% |
+| default (emit C) | 1.21 s | 0.44 s | 30% |
+| `kai build` total (kaic2 + cc + shell) | 1.47 s | 0.26 s | 18% |
+
+### What the breakdown means
+
+A second control experiment (2026-05-11): `kaic2` over `empty.kai`
+with **no preludes loaded at all** runs in ~3 ms. The full pipeline
+(parse → cascade → typecheck → monomorph → lower_protocols →
+perceus → emit) on a 1-line user file is essentially free. The
+1.19 s of `kaic2` wall today is **100% prelude processing** at every
+pipeline stage, not just lex+parse.
+
+That changes what each cache layer must skip to be effective:
+
+- **A.0 (cache `[Decl]` post-parse)** — skips lex+parse of preludes
+  only. Saves ~0.23 s on the 1.47 s baseline. Wall → ~1.24 s.
+  Mechanism: the 15+ pre-typer passes + the typer + codegen all
+  still run on the merged prelude++user `[Decl]`.
+- **A.1 (cache typed `[Decl]` + per-module env deltas)** — skips
+  the pre-typer cascade and the typer. Saves ~0.66 s. Wall → ~0.82 s.
+  Mechanism: requires a typer-modularisation refactor so the prelude
+  contributes a serialisable env delta (recs, sums, op_eff_arities,
+  type_aliases, op_to_eff, proto_impls, plus the TyEnv slice).
+- **A.2 (cache through perceus + dead-code-emit on prelude)** —
+  skips lower_protocols, perceus, and emit on prelude DFns that the
+  user does not reach. Saves the remaining ~0.41 s. Wall → ~0.30 s.
+  Mechanism: emit walks only the user's reachability closure into
+  the prelude; un-reached prelude DFns are skipped at emit. This
+  reuses the dead-code elimination the compiler already performs
+  (verified: `kaic2` over empty.kai with the full stdlib in scope
+  emits 235 lines of out.c with 39 kai_* symbols, none of them
+  prelude map/filter/fold). Today emit *walks* every prelude DFn
+  even though it skips the unreached ones; A.2 caches the walked-and-
+  decided state.
+
+**Reaching DoD #6 (≤ 300 ms) requires A.0 + A.1 + A.2 cumulatively,
+plus shell + cc fixed overhead (~0.26 s).** Each layer is
+independently shippable; each layer is independently useful. A.0
+is what an in-language `derive(Serialize)`-style approach gets you;
+A.1 needs the typer refactor; A.2 needs A.1 plus an emit pass that
+takes a cache as input.
 
 ## Two layers, one rule
 
@@ -24,8 +77,59 @@ what changed" (target: ≤ 300 ms cold, ≤ 150 ms incremental — DoD
 | **Phase A** | Stdlib preludes (immutable from user POV) | `~/.cache/kaikai/preludes-v<N>/<sha>.kab` | stdlib file changes OR kaikai version bump OR cache format bump |
 | **Phase B** | User-side files (mutable) | `<project>/.kai-cache/<sha>.kab` | source changes OR any transitive import changes OR kaikai version bump OR cache format bump |
 
-Both use the same on-disk format (TypedModule serialised, defined
-by Phase A's lane). Both use the same invalidation primitives.
+Both use the same on-disk format (KAB1, defined below). What
+varies across the three sub-phases is the *payload schema*:
+
+- **A.0 payload** — post-parse `[Decl]` only. Requires no typer
+  refactor. Selfhost risk is low because cached and uncached
+  pipelines diverge only at the parse boundary, after which both
+  paths run the same cascade + typer + codegen.
+- **A.1 payload** — typed `[Decl]` + per-module env delta (recs,
+  sums, op_eff_arities, type_aliases, op_to_eff, proto_impls,
+  TyEnv slice). Requires `build_ty_env` (`stage2/compiler.kai:25273`)
+  and `infer_program` (`stage2/compiler.kai:33278`) to produce
+  these deltas per module rather than over the merged prelude++user
+  list. The `prelude_len: Int` field today is a positional index for
+  diagnostics, not a modularity boundary — the refactor builds the
+  boundary. Est. 2500–4000 LOC, selfhost-byte-identical risk
+  non-trivial. Tracked separately.
+- **A.2 payload** — A.1 plus an emit-time reachability index: the
+  cached prelude knows which DFns are *candidates* for emit; the
+  user's reachability closure picks the subset. Requires emit to
+  consume a cache + reachability seed. Depends on A.1.
+
+### Serialisation primitive
+
+The kaikai stdlib defines `protocol Serialize { to_string,
+from_string }` (`stdlib/protocols.kai:327`) for atomic values
+(Int/Real/String/Bool, all four impls shipped) plus `#derive`
+support for Show/Eq/Hash/Ord but **not yet for Serialize**
+(`stage2/compiler.kai:45590` dispatcher table). Two gaps block any
+A.x lane from using Serialize today:
+
+1. **No derive for Serialize.** Recursive AST types (Decl/Expr/…)
+   would need ~30 hand-written impls today; with a derive_serialize
+   pass analogous to derive_show, that drops to 30 one-line
+   annotations.
+2. **`from_string : String → Result[String, Self]` is whole-string,
+   not cursor-based.** A list of records can't be parsed by calling
+   `from_string` on a prefix and getting `(Self, rest)` back; the
+   protocol consumes the full string or fails. AST serialisation
+   needs a cursor (`from_bytes : ([Byte], Int) → Result[E, (Self, Int)]`
+   or similar).
+
+Both gaps are pre-blockers for the A.0 lane. The cache lane that
+ships A.0 must either:
+
+- Extend `Serialize` to a cursor-aware shape (changes a public
+  stdlib protocol — coordinate with #258 Default consumers); or
+- Add a sibling `protocol BinSerialize` specialised for binary
+  serde with cursor semantics, leaving `Serialize` alone for
+  configuration-style values.
+
+The choice is the A.0 lane's. Either way it is **not a one-line
+change** and should be its own design pass before any cache code
+ships.
 
 ## Cache key
 
@@ -45,7 +149,12 @@ sha256(source_bytes) + kaikai_version_hash + cache_format_version
   AST format is unchanged — the compiler may infer types
   differently.
 - `cache_format_version`: a u32 in the cache file header. Bumped
-  on every change to the TypedModule binary layout.
+  on every change to the serialised-AST binary layout.
+- **Cache schema variant**: encoded in the high byte of
+  `format_version`. `0x00` = A.0 (post-parse `[Decl]`); `0x01` =
+  A.1 (typed `[Decl]` + env deltas). A.0 caches and A.1 caches
+  coexist on disk; the loader rejects the wrong variant for the
+  current compiler load path.
 
 ### Phase B key
 
@@ -75,7 +184,7 @@ struct KaiAstBlob {
     uint32_t kaikai_version;    // matches binary's release tag hash
     uint64_t payload_len;       // bytes after header
     uint64_t checksum;          // sha256 truncated, of payload
-    uint8_t  payload[];         // serialised TypedModule
+    uint8_t  payload[];         // serialised AST (A.0: [Decl]; A.1: typed + env deltas)
 };
 ```
 
@@ -233,20 +342,57 @@ old caches die, users rebuild once. Move on.
 - **No on-disk garbage collection.** Cache directories grow
   unbounded until `kai clean` is run. Acceptable for v1.
 
-## Acceptance for Phase A + Phase B together
+## Acceptance per phase
 
-When both phases land:
+Numbers below are expected walls after each layer ships, on a
+2026-05-11 M2 Pro baseline of 1.47 s for `kai build empty.kai`.
+Tier 0 + Tier 1 + Tier 1-ASAN green and selfhost byte-identical
+are gates for every sub-phase.
 
-- `bin/kai build empty.kai` cold (no cache): ≤ 300 ms wall.
-- `bin/kai build empty.kai` warm (cache hit): ≤ 150 ms wall.
-- Editing `empty.kai` and rebuilding: ≤ 150 ms wall.
-- Editing a stdlib file and rebuilding empty.kai: re-build (≤ 1 s).
-- Editing `stage2/compiler.kai` and self-compiling: same wall as
-  today (~5-7 s), no improvement (self-compile already
-  re-typechecks the whole file).
-- Cache survives across `kai build` invocations.
-- Cache is invalidated correctly per the cases above (5 negative
-  fixtures verify each invalidation path).
+### Phase A.0 — post-parse cache
+
+- Warm wall: ≤ 1.25 s (cache-hit on all 29 preludes).
+- Saves: 0.23 s lex+parse.
+- Cache invalidates on: source sha change, kaikai_version_hash
+  change, header corruption (magic / checksum / version
+  mismatch). Four negative fixtures verify.
+- Atomic write: temp + fsync + rename.
+- **Pre-blocker:** the kaikai-native serialisation primitive
+  (`Serialize` protocol or successor) needs cursor semantics +
+  derive support before the A.0 lane can ship. See "Serialisation
+  primitive" above.
+
+### Phase A.1 — post-typecheck cache
+
+- Warm wall: ≤ 0.85 s.
+- Saves: an additional 0.43 s (typecheck + cascade on prelude).
+- Pre-blocker: typer modularisation (separate issue).
+- Builds on A.0 wire-up; payload schema variant byte changes.
+
+### Phase A.2 — post-perceus + emit-only-user
+
+- Warm wall: ≤ 0.45 s. The remaining ~0.30 s is fixed cc + shell
+  overhead.
+- Saves: the 0.41 s of codegen passes (lower_protocols + perceus +
+  emit walking) on the prelude.
+- Pre-blocker: A.1.
+- Mechanism: emit takes the cached prelude as input + the user's
+  reachability closure as seed; walks only reached prelude DFns.
+
+### DoD #6 (≤ 300 ms)
+
+A.0 + A.1 + A.2 cumulatively reach ~0.45 s wall. Closing the
+remaining gap to 300 ms requires either:
+
+- A compilation daemon (Phase C) that amortises the fixed cc + shell
+  overhead over a long-running process; or
+- Direct LLVM IR emission (skip the cc invocation) — out of scope
+  until post-1.0 per `docs/roadmap.md`.
+
+DoD #6 in its current form (≤ 300 ms cold, ≤ 150 ms incremental)
+is therefore the **endpoint** of the Phase A roadmap, not a
+single-lane gate. The lane that closes the final gap can be Phase C
+or LLVM-direct; either choice belongs in its own design doc.
 
 ## Related
 
