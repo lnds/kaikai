@@ -2465,6 +2465,35 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name-llvm.out > /dev/null \
 	    && echo "effects OK $$name (issue #308: LLVM backend matches)" \
 	    || { echo "effects FAIL $$name (LLVM output mismatch)"; diff $$exp build/s2-$$name-llvm.out; exit 1; }; \
+	done; \
+	for f in ../examples/actors/dual_actor_request_reply.kai \
+	         ../examples/actors/dual_actor_send_only.kai \
+	         ../examples/actors/dual_actor_receive_only.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/actors/$$name.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "actors FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "actors FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "actors FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -u $$exp_out build/s2-$$name.out \
+	    && echo "actors OK $$name (issue #472 Actor[T] dual instantiation)" \
+	    || { echo "actors FAIL $$name (output diff)"; exit 1; }; \
+	done; \
+	for f in ../examples/actors/dual_actor_missing_one.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_err=../examples/actors/$$name.err.expected; \
+	  rc=0; ./$(TARGET) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "actors FAIL $$name (expected error, got success)"; exit 1; \
+	  fi; \
+	  while read -r line; do \
+	    grep -qF "$$line" build/s2-$$name.err \
+	      || { echo "actors FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/s2-$$name.err; exit 1; }; \
+	  done < $$exp_err; \
+	  echo "actors OK $$name (issue #472 missing parametric label still diagnosed)"; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,
