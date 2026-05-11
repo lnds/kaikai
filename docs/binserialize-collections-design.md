@@ -1,5 +1,16 @@
 # BinSerialize for collections — combinator design
 
+> **v1 status (2026-05-11):** the buffer carrier described in this
+> document as `[Byte]` has shipped as `Array[Byte]` (PR #487, follow-up
+> to closed PR #485). Every signature in this doc that mentions
+> `[Byte]` now reads `Array[Byte]` in `stdlib/protocols.kai`. The
+> protocol shape, the derive machinery, and the combinator design
+> below are unchanged — only the buffer type. `bin_byte_at(buf, pos)`
+> is now an O(1) `array_get` rather than a list walk; that closes the
+> O(N²) gap reported in #485. See
+> `docs/lane-experience-binserialize-array-buf.md` for the substrate
+> retro.
+
 A pre-blocker lane for Phase A.0 stdlib cache (#452). PR #471 shipped
 `BinSerialize` with cursor semantics and the `#derive(BinSerialize)`
 machinery for records and sums. The protocol covers `Int`, `Bool`,
