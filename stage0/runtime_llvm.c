@@ -22,6 +22,11 @@
 /* ---------- value constructors ---------- */
 KaiValue *kaix_str(const char *s)              { return kai_str(s); }
 KaiValue *kaix_int(int64_t i)                  { return kai_int(i); }
+/* Lane 4 (#473) Byte literal constructor. Mirrors `kaix_int` but
+ * for the nominal `Byte` (KAI_BYTE) tag — needed when the LLVM
+ * EInt emit targets `[Byte]` literal context (`let bs: [Byte] =
+ * [65]`) and emits `@kaix_byte(i8 65)` instead of `kaix_int`. */
+KaiValue *kaix_byte(uint8_t b)                 { return kai_byte(b); }
 KaiValue *kaix_bool(int b)                     { return kai_bool(b); }
 
 /* ---------- binops ---------- */
@@ -243,6 +248,17 @@ KaiValue *kaix_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) { re
  * to this libm fmod binding. Listed in the LLVM prelude table so the
  * monomorphised __pimpl_Rem_Real_rem body resolves a real symbol. */
 KaiValue *kaix_prelude_real_rem(KaiValue *a, KaiValue *b)                { return kai_prelude_real_rem(a, b); }
+/* Lane 4 (#473) Byte primitive ops. Mirrors the C-side prelude
+ * table; needed at link time when the LLVM emit references
+ * @kaix_prelude_byte_* (e.g. via stdlib/protocols.kai's
+ * BinSerialize impls calling byte_to_int / int_to_byte). */
+KaiValue *kaix_prelude_int_to_byte(KaiValue *v)                          { return kai_prelude_int_to_byte(v); }
+KaiValue *kaix_prelude_byte_to_int(KaiValue *v)                          { return kai_prelude_byte_to_int(v); }
+KaiValue *kaix_prelude_byte_add(KaiValue *a, KaiValue *b)                { return kai_prelude_byte_add(a, b); }
+KaiValue *kaix_prelude_byte_sub(KaiValue *a, KaiValue *b)                { return kai_prelude_byte_sub(a, b); }
+KaiValue *kaix_prelude_byte_eq(KaiValue *a, KaiValue *b)                 { return kai_prelude_byte_eq(a, b); }
+KaiValue *kaix_prelude_byte_lt(KaiValue *a, KaiValue *b)                 { return kai_prelude_byte_lt(a, b); }
+KaiValue *kaix_prelude_byte_to_string(KaiValue *v)                       { return kai_prelude_byte_to_string(v); }
 KaiValue *kaix_prelude_ref_make(KaiValue *init)                          { return kai_prelude_ref_make(init); }
 KaiValue *kaix_prelude_ref_get(KaiValue *r)                              { return kai_prelude_ref_get(r); }
 KaiValue *kaix_prelude_ref_set(KaiValue *r, KaiValue *v)                 { return kai_prelude_ref_set(r, v); }
