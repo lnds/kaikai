@@ -63,7 +63,9 @@ where each element describes one hole. Stable schema:
   {
     "file": "foo.kai",
     "line": 4, "col": 3,
+    "kind": "hole",
     "name": null,
+    "message": null,
     "expected_type": "String",
     "in_scope": [
       {"name": "name", "type": "String"},
@@ -76,6 +78,13 @@ where each element describes one hole. Stable schema:
   }
 ]
 ```
+
+`kind` is `"hole"` for `?` / `?name` and `"todo"` for `todo!("msg")`,
+which share the typed-hole pipeline (see *Implementation notes*).
+`message` carries the `todo!` argument for `"todo"` kinds, `null`
+otherwise. `name` is the `?name` identifier, or `null` for the
+anonymous `?`. The schema is validated in CI by
+`scripts/validate_holes_json.py` against `examples/holes/*.kai`.
 
 The JSON path is the integration point for LLM agents.
 
@@ -131,7 +140,15 @@ deep); the bound keeps compilation fast, keeps candidate lists short
 to tools.
 
 The flags are `--holes` (human-readable report) and `--holes-json`
-(stable JSON schema, same contract as typed holes promises). Unfilled
-holes compile to a runtime panic via the existing `kai_prelude_panic`
-helper; no codegen impact beyond a stub for unfilled positions. The
-JSON schema is validated by `scripts/validate_holes_json.py`.
+(stable JSON schema, same contract as typed holes promises). They are
+exposed at two levels: the underlying `kaic2 --holes` / `kaic2
+--holes-json` (no implicit stdlib preludes — used by
+`make test-holes`), and the driver-level `kai build --holes` /
+`kai build --holes-json` (issue #477, auto-loads the same stdlib
+preludes as a normal `kai build` so the in-scope dump matches what
+the user actually sees at compile time). Both surfaces print the
+report and exit without producing a binary. Unfilled holes that
+reach codegen compile to a runtime panic via the existing
+`kai_prelude_panic` helper; no codegen impact beyond a stub for
+unfilled positions. The JSON schema is validated by
+`scripts/validate_holes_json.py`.
