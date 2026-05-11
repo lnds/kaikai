@@ -672,6 +672,104 @@ fn real_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Real]] = {
   }
 }
 
+# ---- Collection combinators (Phase A.0 pre-blocker) ---------------
+#
+# `[T]` and `Option[T]` cannot have a useful single-dispatch
+# `BinSerialize` impl: the dispatcher resolves on the head type
+# (`"List"`, `"Option"`), which would collide with the buffer (also
+# `[Byte]`, head `"List"`) and could not carry the element type
+# through `from_bytes`. The `#derive(BinSerialize)` pass emits direct
+# calls to these combinators when it sees `TyList(t)` / `Option[t]`
+# / `Char` field types, supplying the element encoder/decoder inline
+# as a lambda. See `docs/binserialize-collections-design.md`.
+
+fn bin_char_to_bytes(c: Char) : [Byte] = bin_int_to_bytes(char_to_int(c))
+
+fn bin_char_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Char]] = {
+  match bin_bytes_to_int(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(c)  -> Ok(BinCursor { value: int_to_char(c.value), pos: c.pos })
+  }
+}
+
+# `bin_list_to_bytes(xs, enc)` writes a 4-byte LE length prefix
+# followed by the concatenation of `enc(x)` for each x in xs. Length
+# encoding matches `String`'s 4-byte prefix so the codec shapes line
+# up. `enc` is opaque to the combinator — the derive supplies a
+# lambda that recurses through nested collections (`[[Int]]` → enc
+# is `{ x -> bin_list_to_bytes(x, { y -> to_bytes(y) }) }`).
+fn bin_list_to_bytes_loop[T](xs: [T], enc: (T) -> [Byte], acc: [Byte]) : [Byte] = {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> bin_list_to_bytes_loop(rest, enc, list_append(acc, enc(x)))
+  }
+}
+
+fn bin_list_to_bytes[T](xs: [T], enc: (T) -> [Byte]) : [Byte] = {
+  let len = list_length(xs)
+  let acc0: [Byte] = []
+  let len_bytes = bin_int_to_bytes_loop(len, 4, acc0)
+  bin_list_to_bytes_loop(xs, enc, len_bytes)
+}
+
+# `bin_list_from_bytes(buf, pos, dec)` reads the 4-byte length, then
+# applies `dec` N times, threading the cursor. Empty list short-
+# circuits before invoking `dec`.
+fn bin_list_from_bytes_loop[T](buf: [Byte], pos: Int,
+                                 dec: ([Byte], Int) -> Result[String, BinCursor[T]],
+                                 remaining: Int, acc: [T])
+                               : Result[String, BinCursor[[T]]] = {
+  if remaining == 0 {
+    Ok(BinCursor { value: list_reverse(acc), pos: pos })
+  } else {
+    match dec(buf, pos) {
+      Err(m) -> Err(m)
+      Ok(c)  -> bin_list_from_bytes_loop(buf, c.pos, dec, remaining - 1,
+                                           [c.value, ...acc])
+    }
+  }
+}
+
+fn bin_list_from_bytes[T](buf: [Byte], pos: Int,
+                            dec: ([Byte], Int) -> Result[String, BinCursor[T]])
+                          : Result[String, BinCursor[[T]]] = {
+  match bin_read_len4(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(n)  -> {
+      let acc0: [T] = []
+      bin_list_from_bytes_loop(buf, pos + 4, dec, n, acc0)
+    }
+  }
+}
+
+# `bin_option_to_bytes(o, enc)` — 1-byte tag (0 = None, 1 = Some)
+# followed by `enc(x)` when Some. `None` collapses to a single byte.
+fn bin_option_to_bytes[T](o: Option[T], enc: (T) -> [Byte]) : [Byte] = {
+  match o {
+    None    -> [bin_byte(0)]
+    Some(x) -> list_append([bin_byte(1)], enc(x))
+  }
+}
+
+fn bin_option_from_bytes[T](buf: [Byte], pos: Int,
+                              dec: ([Byte], Int) -> Result[String, BinCursor[T]])
+                            : Result[String, BinCursor[Option[T]]] = {
+  match bin_byte_at(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(b)  -> {
+      let tag = byte_to_int(b)
+      if tag == 0 { Ok(BinCursor { value: None, pos: pos + 1 }) }
+      else if tag == 1 {
+        match dec(buf, pos + 1) {
+          Err(m) -> Err(m)
+          Ok(c)  -> Ok(BinCursor { value: Some(c.value), pos: c.pos })
+        }
+      }
+      else { Err("BinSerialize Option: tag out of range") }
+    }
+  }
+}
+
 # ---- Default (issue #258) -----------------------------------------
 #
 # `default() : Self` has Self only in the return position, so v1
