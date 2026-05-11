@@ -2708,7 +2708,7 @@ static KaiValue *kai_prelude_real_to_int(KaiValue *v) {
 static KaiValue *kai_prelude_int_to_byte(KaiValue *v) {
     if (!v || v->tag != KAI_INT) {
         if (v) kai_decref(v);
-        KaiValue *err = kai_str("int_to_u8: not an Int");
+        KaiValue *err = kai_str("int_to_byte: not an Int");
         KaiValue **args = (KaiValue **) malloc(sizeof(KaiValue *));
         args[0] = err;
         KaiValue *r = kai_variant(1, "Err", 1, args);
@@ -2719,7 +2719,7 @@ static KaiValue *kai_prelude_int_to_byte(KaiValue *v) {
     kai_decref(v);
     if (n < 0 || n > 255) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "int_to_u8: %lld is out of 0..255", (long long) n);
+        snprintf(buf, sizeof(buf), "int_to_byte: %lld is out of 0..255", (long long) n);
         KaiValue *err = kai_str(buf);
         KaiValue **args = (KaiValue **) malloc(sizeof(KaiValue *));
         args[0] = err;
