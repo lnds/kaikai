@@ -329,7 +329,9 @@ polymorphic-impl machinery.
 
    - #453 — runtime `prelude_read_bytes` (LSP precursor, ~2-4 h) — **shipped**.
    - #454 — compiler library mode (typed AST retention + span index
-     for queries, ~4-7 days, selfhost waiver).
+     for queries, ~4-7 days, selfhost waiver). **Shipped** as the
+     `--library-mode` flag + `compile_to_module` in-process API; see
+     `docs/library-mode.md`.
    - #452 — Phase A stdlib precompiled cache (depends on #454,
      ~1-2 days). Cold target.
    - #455 — Phase B user-file incremental cache (depends on #452,
