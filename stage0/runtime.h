@@ -112,7 +112,8 @@ typedef enum {
     KAI_CLOSURE,
     KAI_ARRAY,
     KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
-    KAI_PID         /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
+    KAI_PID,        /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
+    KAI_U8          /* Lane 4 (#473): unsigned 8-bit integer, nominal */
 } KaiTag;
 
 typedef struct KaiValue KaiValue;
@@ -146,6 +147,7 @@ struct KaiValue {
         int64_t  i;                                 /* KAI_INT */
         double   r;                                 /* KAI_REAL */
         uint32_t c;                                 /* KAI_CHAR */
+        uint8_t  u8;                                /* KAI_U8 — Lane 4 (#473) */
         struct { size_t len; char *bytes; } s;      /* KAI_STR (heap, not NUL-terminated but we always allocate +1 byte for safety) */
         struct { KaiValue *head; KaiValue *tail; } cons;
         struct {
@@ -225,6 +227,7 @@ static const char *kai_rc_tag_name(int t) {
         case KAI_VARIANT: return "variant";
         case KAI_CLOSURE: return "closure";
         case KAI_ARRAY:   return "array";
+        case KAI_U8:      return "u8";
         default:          return "?";
     }
 }
@@ -647,6 +650,7 @@ static const char *kai_leaksite_alloc_fn(int32_t tag) {
         case KAI_NIL:     return "kai_nil";
         case KAI_FIBER:   return "kai_fiber";
         case KAI_PID:     return "kai_pid";
+        case KAI_U8:      return "kai_u8";
         default:          return "kai_alloc";
     }
 }
@@ -1713,6 +1717,11 @@ static void kai_free_value(KaiValue *v) {
              * scope, NOT by the Pid value. Dropping a Pid handle
              * does not free the mailbox. */
             break;
+        case KAI_U8:
+            /* Lane 4 (#473): u8 is a 1-byte scalar embedded directly
+             * in the KaiValue. No heap payload. The base free(v)
+             * below reclaims the whole value. */
+            break;
         default: break;
     }
 #ifdef KAI_TRACE_RC
@@ -1844,6 +1853,15 @@ static KAI_RC_NOINLINE KaiValue *kai_int(int64_t i) {
 static KAI_RC_NOINLINE KaiValue *kai_real(double r) {
     KaiValue *v = kai_alloc(KAI_REAL);
     v->as.r = r;
+    return v;
+}
+
+/* Lane 4 (#473): u8 nominal scalar. No interning cache for v1 — every
+ * `kai_u8(n)` allocates a fresh KaiValue. Cache (analogous to
+ * kai_int_cache for 0..127) is a natural Lane-4b/perf optimisation. */
+static KAI_RC_NOINLINE KaiValue *kai_u8(uint8_t n) {
+    KaiValue *v = kai_alloc(KAI_U8);
+    v->as.u8 = n;
     return v;
 }
 
@@ -2434,6 +2452,7 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
         case KAI_ARRAY:   return 0;      /* arrays are opaque, identity-compared */
         case KAI_FIBER:   return a->as.fib == b->as.fib;  /* identity */
         case KAI_PID:     return a->as.mb  == b->as.mb;   /* identity */
+        case KAI_U8:      return a->as.u8 == b->as.u8;    /* Lane 4 (#473) */
     }
     return 0;
 }
@@ -2510,6 +2529,9 @@ static KaiValue *kai_to_string(KaiValue *v) {
         case KAI_ARRAY:   return kai_str("<array>");
         case KAI_FIBER:   return kai_str("<fiber>");
         case KAI_PID:     return kai_str("<pid>");
+        case KAI_U8:                                       /* Lane 4 (#473) */
+            snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.u8);
+            return kai_str(buf);
     }
     return kai_str("?");
 }
@@ -2676,6 +2698,89 @@ static KaiValue *kai_prelude_real_to_int(KaiValue *v) {
     else out = kai_int((int64_t) r);
     kai_decref(v);
     return out;
+}
+
+/* ---------- Lane 4 (#473): u8 nominal scalar conversions + ops ----- */
+
+/* `int_to_u8(n)` returns `Result[String, u8]` — Err if n is outside
+ * 0..255, Ok otherwise. The Result is encoded as a KAI_VARIANT (Ok /
+ * Err) with one payload. */
+static KaiValue *kai_prelude_int_to_u8(KaiValue *v) {
+    if (!v || v->tag != KAI_INT) {
+        if (v) kai_decref(v);
+        KaiValue *err = kai_str("int_to_u8: not an Int");
+        KaiValue **args = (KaiValue **) malloc(sizeof(KaiValue *));
+        args[0] = err;
+        KaiValue *r = kai_variant(1, "Err", 1, args);
+        free(args);
+        return r;
+    }
+    int64_t n = v->as.i;
+    kai_decref(v);
+    if (n < 0 || n > 255) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "int_to_u8: %lld is out of 0..255", (long long) n);
+        KaiValue *err = kai_str(buf);
+        KaiValue **args = (KaiValue **) malloc(sizeof(KaiValue *));
+        args[0] = err;
+        KaiValue *r = kai_variant(1, "Err", 1, args);
+        free(args);
+        return r;
+    }
+    KaiValue *ok_payload = kai_u8((uint8_t) n);
+    KaiValue **args = (KaiValue **) malloc(sizeof(KaiValue *));
+    args[0] = ok_payload;
+    KaiValue *r = kai_variant(0, "Ok", 1, args);
+    free(args);
+    return r;
+}
+
+static KaiValue *kai_prelude_u8_to_int(KaiValue *v) {
+    if (!v || v->tag != KAI_U8) { if (v) kai_decref(v); return kai_int(0); }
+    int64_t n = (int64_t) v->as.u8;
+    kai_decref(v);
+    return kai_int(n);
+}
+
+/* Wrapping arithmetic per uint8_t C semantics. Overflow is defined. */
+static KaiValue *kai_prelude_u8_add(KaiValue *a, KaiValue *b) {
+    uint8_t av = (a && a->tag == KAI_U8) ? a->as.u8 : 0;
+    uint8_t bv = (b && b->tag == KAI_U8) ? b->as.u8 : 0;
+    if (a) kai_decref(a);
+    if (b) kai_decref(b);
+    return kai_u8((uint8_t) (av + bv));
+}
+
+static KaiValue *kai_prelude_u8_sub(KaiValue *a, KaiValue *b) {
+    uint8_t av = (a && a->tag == KAI_U8) ? a->as.u8 : 0;
+    uint8_t bv = (b && b->tag == KAI_U8) ? b->as.u8 : 0;
+    if (a) kai_decref(a);
+    if (b) kai_decref(b);
+    return kai_u8((uint8_t) (av - bv));
+}
+
+static KaiValue *kai_prelude_u8_eq(KaiValue *a, KaiValue *b) {
+    uint8_t av = (a && a->tag == KAI_U8) ? a->as.u8 : 0;
+    uint8_t bv = (b && b->tag == KAI_U8) ? b->as.u8 : 0;
+    if (a) kai_decref(a);
+    if (b) kai_decref(b);
+    return kai_bool(av == bv);
+}
+
+static KaiValue *kai_prelude_u8_lt(KaiValue *a, KaiValue *b) {
+    uint8_t av = (a && a->tag == KAI_U8) ? a->as.u8 : 0;
+    uint8_t bv = (b && b->tag == KAI_U8) ? b->as.u8 : 0;
+    if (a) kai_decref(a);
+    if (b) kai_decref(b);
+    return kai_bool(av < bv);
+}
+
+static KaiValue *kai_prelude_u8_to_string(KaiValue *v) {
+    if (!v || v->tag != KAI_U8) { if (v) kai_decref(v); return kai_str("0"); }
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.u8);
+    kai_decref(v);
+    return kai_str(buf);
 }
 
 /* ---------- prelude: math/real libm bindings (issue #343) ----------
