@@ -34,7 +34,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-335 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-violations
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-335 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-violations
 
 all: $(TARGET)
 
@@ -1326,6 +1326,54 @@ test-holes: $(TARGET) build
 	  fi; \
 	  echo "holes OK $$name"; \
 	done
+
+# Issue #477: end-to-end check that `kai build --holes` and
+# `kai build --holes-json` (the driver-level surface) wire through to
+# kaic2's typed-hole reporting passes. test-holes above exercises the
+# compiler in isolation (no stdlib auto-load); these fixtures go
+# through the driver with the full stdlib preludes loaded so the
+# scope-resolution path that an LLM agent will actually hit is what
+# we measure.
+#
+# Fixtures live in examples/typed_holes/. Each .kai file declares one
+# or more holes whose expected_type is known up front; the assertions
+# match docs/typed-holes.md §Output formats:
+#   * pretty: `<file>:<line>:<col>: type hole` and `expected: <Ty>`
+#     headers must appear once per hole.
+#   * JSON: validate_holes_json.py confirms the stable schema; in
+#     addition we check the right number of entries.
+test-driver-holes: $(TARGET) build
+	@set -e; \
+	KAI=../bin/kai; \
+	pretty=../examples/typed_holes/hole_pretty.kai; \
+	$$KAI build --holes $$pretty > build/driver-hole-pretty.out; \
+	grep -q "hole_pretty.kai:3:23: type hole ?answer" build/driver-hole-pretty.out \
+	  || { echo "driver-holes FAIL hole_pretty (header missing)"; cat build/driver-hole-pretty.out; exit 1; }; \
+	grep -q "expected: String" build/driver-hole-pretty.out \
+	  || { echo "driver-holes FAIL hole_pretty (expected type missing)"; cat build/driver-hole-pretty.out; exit 1; }; \
+	echo "driver-holes OK hole_pretty (--holes pretty)"; \
+	json=../examples/typed_holes/hole_json.kai; \
+	$$KAI build --holes-json $$json > build/driver-hole-json.out; \
+	python3 ../scripts/validate_holes_json.py build/driver-hole-json.out \
+	  || { echo "driver-holes FAIL hole_json (schema)"; cat build/driver-hole-json.out; exit 1; }; \
+	python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert len(d)==1, d; r=d[0]; assert r['name']=='formula', r; assert r['expected_type']=='Real', r; assert r['line']==1, r" \
+	  build/driver-hole-json.out \
+	  || { echo "driver-holes FAIL hole_json (content)"; cat build/driver-hole-json.out; exit 1; }; \
+	echo "driver-holes OK hole_json (--holes-json single)"; \
+	multi=../examples/typed_holes/hole_multiple.kai; \
+	$$KAI build --holes $$multi > build/driver-hole-multi.out; \
+	for h in "?head" "?tail" "?count"; do \
+	  grep -q "type hole $$h" build/driver-hole-multi.out \
+	    || { echo "driver-holes FAIL hole_multiple (missing $$h)"; cat build/driver-hole-multi.out; exit 1; }; \
+	done; \
+	$$KAI build --holes-json $$multi > build/driver-hole-multi.json; \
+	python3 ../scripts/validate_holes_json.py build/driver-hole-multi.json \
+	  || { echo "driver-holes FAIL hole_multiple (schema)"; cat build/driver-hole-multi.json; exit 1; }; \
+	python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert len(d)==3, d; names=sorted(r['name'] for r in d); assert names==['count','head','tail'], names" \
+	  build/driver-hole-multi.json \
+	  || { echo "driver-holes FAIL hole_multiple (content)"; cat build/driver-hole-multi.json; exit 1; }; \
+	echo "driver-holes OK hole_multiple (--holes + --holes-json multi)"; \
+	echo "driver-holes OK"
 
 # m7a #3 — parser-level smoke tests for `effect` declarations and
 # the `T / Eff + Eff` row syntax. Each .kai file dumps to AST and
@@ -3848,7 +3896,7 @@ test-violations: $(TARGET) build
 	  fi; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-335 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-violations test-unused-bindings
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-335 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-violations test-unused-bindings
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -3857,7 +3905,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-335 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-unused-bindings
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-335 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-unused-bindings
 
 clean:
 	rm -rf build $(TARGET)
