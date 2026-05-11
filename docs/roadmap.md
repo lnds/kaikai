@@ -312,6 +312,33 @@ polymorphic-impl machinery.
    produces a message at the bar set by the m11 acceptance
    fixtures (TBD as part of m11 design).
 
+6. **Compile-time performance — DoD #6 (added 2026-05-11)**:
+   - **Tiny program cold compile** (empty fn, no user imports):
+     ≤ 300 ms wall, ≤ 100 MB RSS. Baseline (today): 1.5 s, 286 MB.
+     Target (Go's bar): 300 ms.
+   - **Incremental recompile** (touch + 0-byte change → rebuild):
+     ≤ 150 ms wall. Today: same 1.5 s (no incremental cache).
+   - **Self-compile** (`make -C stage2 kaic2`): ≤ 5 s wall, ≤ 800 MB
+     RSS. Today: 6.8 s wall, 950 MB RSS.
+
+   Empirical motivation: `docs/benchmarks/cross_lang_2026-05-10.md`
+   measured kaikai at 1.5 s cold (40× slower than `cc -O2`,
+   5× slower than `elixirc`). Decomposition revealed ~1.3 s is
+   stdlib re-parsing on every `kai build` invocation. Required
+   lanes (prerequisite chain):
+
+   - #453 — runtime `prelude_read_bytes` (LSP precursor, ~2-4 h).
+   - #454 — compiler library mode (typed AST retention + span index
+     for queries, ~4-7 days, selfhost waiver).
+   - #452 — Phase A stdlib precompiled cache (depends on #454,
+     ~1-2 days). Cold target.
+   - #455 — Phase B user-file incremental cache (depends on #452,
+     ~1-2 days). Recompile target.
+
+   Phase A + Phase B together close DoD #6. #447 (LSP v1) consumes
+   the same query surface from #454 and becomes a thin layer once
+   the chain lands.
+
 **Estimated cost**: original 4–6 weeks; the precondition chain
 above already absorbed roughly two of those weeks. The six
 remaining items are estimated at **~3–5 weeks** at the agent-pace
