@@ -3662,6 +3662,111 @@ static KaiValue *kai_prelude_file_rename(KaiValue *from, KaiValue *to) {
     return r;
 }
 
+/* Issue #482 (follow-up to #345): binary file IO. Mirror
+ * read_file / write_file but operate on `[Byte]` cons-lists so
+ * callers can round-trip arbitrary bytes including 0x00. Both
+ * consume their args linearly (kai_decref before allocating the
+ * result), matching the convention used by the text variants. */
+
+static KaiValue *kai_prelude_file_read_bytes(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_read_bytes: argument is not a String");
+        r = kai_variant(0, "Err", 1, &msg);
+    } else {
+        char pbuf[4096];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        FILE *fp = fopen(pbuf, "rb");
+        if (!fp) {
+            KaiValue *msg = kai_str("file_read_bytes: cannot open file");
+            r = kai_variant(0, "Err", 1, &msg);
+        } else if (fseek(fp, 0, SEEK_END) != 0) {
+            fclose(fp);
+            KaiValue *msg = kai_str("file_read_bytes: seek failed");
+            r = kai_variant(0, "Err", 1, &msg);
+        } else {
+            long n = ftell(fp);
+            if (n < 0) {
+                fclose(fp);
+                KaiValue *msg = kai_str("file_read_bytes: tell failed");
+                r = kai_variant(0, "Err", 1, &msg);
+            } else if (fseek(fp, 0, SEEK_SET) != 0) {
+                fclose(fp);
+                KaiValue *msg = kai_str("file_read_bytes: rewind failed");
+                r = kai_variant(0, "Err", 1, &msg);
+            } else {
+                /* Read into a flat buffer first, then build the
+                 * cons-list right-to-left so the result is in
+                 * natural (file) order without a reverse pass. */
+                unsigned char *buf = (unsigned char *) malloc((size_t) n + 1);
+                if (!buf) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                size_t got = fread(buf, 1, (size_t) n, fp);
+                fclose(fp);
+                KaiValue *list = kai_nil();
+                size_t i = got;
+                while (i > 0) {
+                    i--;
+                    list = kai_cons(kai_byte(buf[i]), list);
+                }
+                free(buf);
+                r = kai_variant(0, "Ok", 1, &list);
+            }
+        }
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+static KaiValue *kai_prelude_file_write_bytes(KaiValue *path, KaiValue *bytes) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_write_bytes: path is not a String");
+        r = kai_variant(0, "Err", 1, &msg);
+    } else {
+        char pbuf[4096];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        FILE *fp = fopen(pbuf, "wb");
+        if (!fp) {
+            KaiValue *msg = kai_str("file_write_bytes: cannot open file");
+            r = kai_variant(0, "Err", 1, &msg);
+        } else {
+            /* Walk the cons-list once writing one byte at a time.
+             * fwrite of 1 byte into a stdio-buffered stream still
+             * batches via the C library's buffer; correct and
+             * acceptable for v1. */
+            int ok = 1;
+            KaiValue *cur = bytes;
+            while (cur && cur->tag == KAI_CONS) {
+                KaiValue *head = cur->as.cons.head;
+                unsigned char b = 0;
+                if (head && head->tag == KAI_BYTE) {
+                    b = head->as.byte_val;
+                } else {
+                    ok = 0;
+                    break;
+                }
+                if (fwrite(&b, 1, 1, fp) != 1) { ok = 0; break; }
+                cur = cur->as.cons.tail;
+            }
+            fclose(fp);
+            if (!ok) {
+                KaiValue *msg = kai_str("file_write_bytes: write failed");
+                r = kai_variant(0, "Err", 1, &msg);
+            } else {
+                KaiValue *u = kai_unit();
+                r = kai_variant(0, "Ok", 1, &u);
+            }
+        }
+    }
+    if (path)  kai_decref(path);
+    if (bytes) kai_decref(bytes);
+    return r;
+}
+
 /* Issue #344: directory ops on top of the `File` effect. Each consumes
  * its String args linearly (kai_decref before allocating the result),
  * mirroring the file_exists/_delete/_rename convention. POSIX only
@@ -4155,6 +4260,8 @@ static KaiValue *_kai_prelude_write_file_thunk(KaiValue *s, KaiValue **a, int n)
 static KaiValue *_kai_prelude_file_exists_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_exists(a[0]); }
 static KaiValue *_kai_prelude_file_delete_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_delete(a[0]); }
 static KaiValue *_kai_prelude_file_rename_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_rename(a[0], a[1]); }
+static KaiValue *_kai_prelude_file_read_bytes_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_file_read_bytes(a[0]); }
+static KaiValue *_kai_prelude_file_write_bytes_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_file_write_bytes(a[0], a[1]); }
 static KaiValue *_kai_prelude_dir_list_dir_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_dir_list_dir(a[0]); }
 static KaiValue *_kai_prelude_dir_create_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_dir_create_dir(a[0]); }
 static KaiValue *_kai_prelude_dir_remove_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_dir_remove_dir(a[0]); }
