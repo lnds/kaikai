@@ -265,7 +265,14 @@ test-library-mode: kaic2
 	@set -e; \
 	root=$$(pwd); \
 	cd "$$root"; \
-	for fx in type_at_basic def_at_basic; do \
+	for fx in type_at_basic def_at_basic \
+	          def_at_local_basic def_at_local_shadow \
+	          def_at_param_basic def_at_param_shadow \
+	          def_at_pattern_list def_at_pattern_variant \
+	          def_at_pattern_record def_at_pattern_shadow \
+	          def_at_pattern_as def_at_closure_capture \
+	          def_at_nested_let def_at_match_arm \
+	          def_at_lambda_param; do \
 	  src="examples/library_mode/$$fx.kai"; \
 	  exp="examples/library_mode/$$fx.out.expected"; \
 	  out=$$(mktemp); \
