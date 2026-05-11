@@ -241,8 +241,13 @@ polymorphic-impl machinery.
     type mismatch (argument index + callee signature),
     non-exhaustive match (missing variant + covered list +
     actionable help), unbound name (Levenshtein did-you-mean
-    on a separate `help:` line). Wrong-arity and
-    missing-effect templates defer to m11.x.
+    on a separate `help:` line).
+  - **m11 v1.x (#479)**: two remaining templates — wrong
+    arity (declared arity vs. observed count + signature +
+    split add/remove help) and missing effect (m11-shape
+    upgrade of the existing `effect not handled` site with
+    `missing effect:` and `enclosing row:` notes plus
+    split declare/handle help). Closes the m11 v1 series.
 - `kai lsp` — Language Server Protocol implementation: type
   on hover, completions, go-to-definition, diagnostics push,
   symbol renaming. Reuses the typed-hole + diagnostic JSON

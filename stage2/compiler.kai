@@ -27268,20 +27268,94 @@ fn emit_call_arg_notes(env: TyEnv, sub: Subst, callee: Expr,
   }
 }
 
+# m11 v1.x Template 4 — when the callee's resolved type is a fn with
+# a different parameter count than the call site supplied, emit a
+# canonical "wrong number of arguments" diagnostic in place of the
+# generic "type mismatch in function call". The arity check runs as
+# a preflight before `st_unify` so we never produce both diagnostics
+# for the same site.
+#
+# `arg_tys` is the list of inferred argument types at the call site.
+# `callee_ty` is the callee's instantiated function type (typically
+# `TyFnT(params, ret, row)` after `apply_ty`). When the callee is
+# polymorphic and not yet resolved to a `TyFnT`, we fall through to
+# the generic path.
+fn arity_mismatch_of(sub: Subst, callee_ty: Ty, arg_tys: [Ty]) : Option[Int] {
+  match apply_ty(sub, callee_ty) {
+    TyFnT(params, _ret, _row) -> {
+      let np = list_length(params)
+      let na = list_length(arg_tys)
+      if np == na { None } else { Some(np) }
+    }
+    _ -> None
+  }
+}
+
+# Emit Template 4 — wrong number of arguments. The callee's signature
+# (when displayable) goes on a `note: \`fn\` expects: (T1, T2) -> R`
+# line so users see exactly which arity was declared. When the callee
+# is anonymous, the notes omit the name but still surface the param
+# count + signature.
+fn emit_wrong_arity(file: String, callee: Expr, callee_ty: Ty,
+                      arg_tys: [Ty], line: Int, col: Int) : Unit / Console {
+  let np = match callee_ty {
+    TyFnT(params, _, _) -> list_length(params)
+    _ -> 0
+  }
+  let na = list_length(arg_tys)
+  let name_opt = callee_display_name(callee)
+  match name_opt {
+    Some(nm) -> diag_error(file, line, col, "wrong number of arguments to `#{nm}`")
+    None     -> diag_error(file, line, col, "wrong number of arguments")
+  }
+  match name_opt {
+    Some(nm) -> diag_note("`#{nm}` expects #{int_to_string(np)} argument(s), got #{int_to_string(na)}")
+    None     -> diag_note("expected #{int_to_string(np)} argument(s), got #{int_to_string(na)}")
+  }
+  match name_opt {
+    Some(nm) -> match callee_ty {
+      TyFnT(_, _, _) -> diag_note("`#{nm}` expects: #{ty_to_string(callee_ty)}")
+      _              -> ()
+    }
+    None -> ()
+  }
+  if na < np {
+    diag_help("add the missing argument(s) or use `_` as a placeholder hole")
+  } else {
+    diag_help("remove the extra argument(s) — `#{int_to_string(na - np)}` too many")
+  }
+}
+
 # m11 v1 Template 1 — wrapper around `st_unify` for call sites that
-# want richer diagnostics. Delegates to `st_unify` (preserving every
-# existing fixture's substring) and, on failure, appends the
-# argument-position + callee signature notes.
+# want richer diagnostics. Preflights arity (Template 4) before
+# delegating to `st_unify`; on failure, appends the argument-position
+# + callee signature notes (Template 1) and the missing-effect notes
+# (Template 5) when applicable.
 fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
                    arg_tys: [Ty], expected_fn_ty: Ty,
                    line: Int, col: Int) : InferState {
-  let pre_errs = st.errs
-  let st1 = st_unify(st, callee_ty, expected_fn_ty, "function call", line, col)
-  if st1.errs > pre_errs {
-    emit_call_arg_notes(st1.env, st1.sub, callee, callee_ty, arg_tys)
-    st1
-  } else { st1 }
+  # Template 4 preflight: an arity mismatch produces a clearer
+  # diagnostic than the generic "type mismatch in function call"
+  # that `unify_list` would emit. We short-circuit so the caller's
+  # error count still bumps and the rest of the pass keeps
+  # progressing on the synthesised stub.
+  let resolved_callee = apply_ty(st.sub, callee_ty)
+  match arity_mismatch_of(st.sub, callee_ty, arg_tys) {
+    Some(_np) -> {
+      emit_wrong_arity(st.file, callee, resolved_callee, arg_tys, line, col)
+      st_bump_err(st)
+    }
+    None -> {
+      let pre_errs = st.errs
+      let st1 = st_unify(st, callee_ty, expected_fn_ty, "function call", line, col)
+      if st1.errs > pre_errs {
+        emit_call_arg_notes(st1.env, st1.sub, callee, callee_ty, arg_tys)
+        st1
+      } else { st1 }
+    }
+  }
 }
+
 
 # Issue #199: when either side of a failed unification is a union
 # (or a component of one), augment the generic `expected:` / `found:`
@@ -33002,10 +33076,20 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
               let line = if uline >= 0 { uline } else { fline }
               let col  = if ucol  >= 0 { ucol  } else { fcol  }
               let lab_str = label_to_string(apply_label_args(st.sub, lab))
+              # m11 v1.x Template 5 — missing effect. Header keeps the
+              # legacy "effect not handled: <label>" wording so all
+              # prior fixtures still match; the m11-shape notes
+              # surface the enclosing function's actual row and split
+              # the help into two actionable lines (declare-the-effect
+              # vs handle-locally) instead of the single combined hint.
               diag_error(st.file, line, col,
                 string_concat("effect not handled: ", lab_str))
               diag_note("`#{fname}`'s declared row does not include `#{lab_str}`")
+              diag_note("missing effect: `#{lab_str}`")
+              diag_note("enclosing row: #{render_declared_row(declared)}")
               diag_help("either declare `#{fname} : ... / #{lab_str}`, or wrap this call site in `handle { ... } with #{lab_str} { ... }`")
+              diag_help("add `/ #{lab_str}` to `#{fname}`'s return type")
+              diag_help("or wrap the call in `handle { ... } with #{lab_str} { ... }`")
               st_bump_err(st)
             }
           }
@@ -33013,6 +33097,15 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
       }
       check_body_row_label_loop(st1, fname, rest, declared, fline, fcol)
     }
+  }
+}
+
+# m11 v1.x Template 5 — render the declared row labels for the
+# `note: enclosing row` line. Empty declared list → "(empty)".
+fn render_declared_row(declared: [Label]) : String {
+  match declared {
+    [] -> "(empty)"
+    _  -> join_with(map(declared, label_to_string), " + ")
   }
 }
 
