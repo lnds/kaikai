@@ -9827,6 +9827,8 @@ fn prelude_names() : [String] {
     "exit", "panic",
     "int_to_string", "real_to_string", "string_to_int", "string_to_real",
     "int_to_real", "real_to_int",
+    # Lane 4 (#473): u8 nominal primitive surface.
+    "int_to_u8", "u8_to_int", "u8_add", "u8_sub", "u8_eq", "u8_lt", "u8_to_string",
     # libm bindings (issue #343)
     "real_sqrt", "real_cbrt", "real_exp", "real_log", "real_log2", "real_log10",
     "real_sin", "real_cos", "real_tan",
@@ -11646,6 +11648,15 @@ fn prelude_table() : [EPrelude] {
     EP("string_slice",     "kai_prelude_string_slice",     3),
     EP("char_to_int",      "kai_prelude_char_to_int",      1),
     EP("int_to_char",      "kai_prelude_int_to_char",      1),
+    # Lane 4 (#473): u8 nominal primitive. See add_prelude_sigs above
+    # for the type-level surface; C bodies live in stage0/runtime.h.
+    EP("int_to_u8",        "kai_prelude_int_to_u8",        1),
+    EP("u8_to_int",        "kai_prelude_u8_to_int",        1),
+    EP("u8_add",           "kai_prelude_u8_add",           2),
+    EP("u8_sub",           "kai_prelude_u8_sub",           2),
+    EP("u8_eq",            "kai_prelude_u8_eq",            2),
+    EP("u8_lt",            "kai_prelude_u8_lt",            2),
+    EP("u8_to_string",     "kai_prelude_u8_to_string",     1),
     EP("array_make",       "kai_prelude_array_make",       2),
     EP("array_length",     "kai_prelude_array_length",     1),
     EP("array_get",        "kai_prelude_array_get",        2),
@@ -22313,6 +22324,16 @@ type Ty
   | TyString
   | TyChar
   | TyUnit
+  # Lane 4 (#473): unsigned 8-bit integer, nominal — distinct from
+  # TyInt at the type level. Backed by `KaiTag = KAI_U8` at runtime
+  # (uint8_t in KaiValue.as.u8). The user-facing `Byte` alias in
+  # stdlib/core/byte.kai expands to TyU8 via `expand_ta_decls`
+  # pre-typing. Conversions are explicit: `int_to_u8 : Int ->
+  # Result[String, u8]` (range-checks 0..255), `u8_to_int : u8 ->
+  # Int` (lossless widening). Array[u8] uses the contiguous
+  # `KAI_ARRAY_U8` runtime tag (uint8_t* data, 1B/element) rather
+  # than the boxed `KaiValue**` storage of generic Array[T].
+  | TyU8
   | TyListT(Ty)                         # resolved list type
   | TyFnT([Ty], Ty, Row)                # resolved function type (with effect row)
   | TyCon(String, [Ty])                 # user-defined type constructor application
@@ -22374,6 +22395,7 @@ fn resolve_ty(t: TypeExpr) : Ty {
       else if name == "String" { TyString }
       else if name == "Char" { TyChar }
       else if name == "Unit" { TyUnit }
+      else if name == "u8" { TyU8 }
       # m7a #7: `Nothing` is the uninhabited type used by `Fail.fail`
       # (Doc B §`Fail`). The typer can't witness uninhabitedness, so
       # we treat it as TyAny — a call producing Nothing unifies with
@@ -23402,6 +23424,7 @@ fn ty_to_string(t: Ty) : String {
     TyString -> "String"
     TyChar   -> "Char"
     TyUnit   -> "Unit"
+    TyU8     -> "u8"
     TyListT(inner) -> cat3("[", ty_to_string(inner), "]")
     # m7b #11k: render the function type's effect row alongside the
     # arrow when non-empty, with each label printed as `Eff` or
@@ -23486,6 +23509,7 @@ fn mangle_ty(t: Ty) : String {
     TyString -> "String"
     TyChar   -> "Char"
     TyUnit   -> "Unit"
+    TyU8     -> "U8"
     TyListT(inner) -> concat_all(["L_", mangle_ty(inner), "_E"])
     TyFnT(ps, ret, _) -> concat_all([
       "F_", join_with(map(ps, mangle_ty), "_"),
@@ -23976,6 +24000,19 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     # `kai_prelude_real_to_int` in stage0/runtime.h for the guards.
     TyEntry { name: "real_to_int",    scheme: mono(fn_ty([TyReal],   TyInt)) },
 
+    # Lane 4 (#473): u8 nominal primitive. `int_to_u8` range-checks
+    # 0..255 and returns `Result[String, u8]` (Err first per kaikai
+    # convention). `u8_to_int` is lossless widening. Arithmetic
+    # (`u8_add`, `u8_sub`) wraps mod 256 per the C `uint8_t` semantics
+    # — overflow is defined, not UB. Comparison ops mirror Int.
+    TyEntry { name: "int_to_u8",      scheme: mono(fn_ty([TyInt],            TyCon("Result", [TyString, TyU8]))) },
+    TyEntry { name: "u8_to_int",      scheme: mono(fn_ty([TyU8],             TyInt)) },
+    TyEntry { name: "u8_add",         scheme: mono(fn_ty([TyU8, TyU8],       TyU8)) },
+    TyEntry { name: "u8_sub",         scheme: mono(fn_ty([TyU8, TyU8],       TyU8)) },
+    TyEntry { name: "u8_eq",          scheme: mono(fn_ty([TyU8, TyU8],       TyBool)) },
+    TyEntry { name: "u8_lt",          scheme: mono(fn_ty([TyU8, TyU8],       TyBool)) },
+    TyEntry { name: "u8_to_string",   scheme: mono(fn_ty([TyU8],             TyString)) },
+
     # libm bindings (issue #343). IEEE-754 pass-through; inspect with
     # `real_is_nan` / `real_is_inf`. See stage0/runtime.h for the
     # `kai_prelude_real_*` family.
@@ -24239,6 +24276,7 @@ fn canon_uvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyChar   -> t
     TyString -> t
     TyUnit   -> t
+    TyU8     -> t
     TyAny    -> t
     TyVarT(_) -> t
     TyListT(inner) -> TyListT(canon_uvars_ty(inner, m))
@@ -24298,6 +24336,7 @@ fn canon_tvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyChar   -> t
     TyString -> t
     TyUnit   -> t
+    TyU8     -> t
     TyAny    -> t
     TyVarT(n) -> match intpair_lookup(m, n) {
       Some(b) -> TyVarT(b)
@@ -24380,6 +24419,7 @@ fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
           else if name == "String" { TyString }
           else if name == "Char"   { TyChar }
           else if name == "Unit"   { TyUnit }
+          else if name == "u8"     { TyU8 }
           # m7a #7 / m8 #3: Nothing is the bottom type (used by
           # Fail.fail and Spawn's type-erased ops); the typer treats
           # it as TyAny because it can't witness uninhabitedness.
@@ -24871,6 +24911,7 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty 
           else if name == "String" { TyString }
           else if name == "Char"   { TyChar }
           else if name == "Unit"   { TyUnit }
+          else if name == "u8"     { TyU8 }
           else if name == "Nothing" { TyAny }
           else { TyCon(name, map(tas, (a) => resolve_ty_with_binds(a, tpbinds, rbinds))) }
         }
@@ -25884,6 +25925,7 @@ fn apply_ty(s: Subst, t: Ty) : Ty {
     TyString -> t
     TyChar   -> t
     TyUnit   -> t
+    TyU8     -> t
     TyAny    -> t
     TyVarT(n) -> match subst_lookup(s, n) {
       Some(t2) -> apply_ty(s, t2)
@@ -26331,6 +26373,9 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] {
     TyString -> match b { TyString -> Some(s) _ -> None }
     TyChar   -> match b { TyChar   -> Some(s) _ -> None }
     TyUnit   -> match b { TyUnit   -> Some(s) _ -> None }
+    # Lane 4 (#473): u8 is nominal — distinct from Int. Only unifies
+    # with itself. Conversions use `int_to_u8` / `u8_to_int`.
+    TyU8     -> match b { TyU8     -> Some(s) _ -> None }
     # TyAny unifies with anything until typed holes and error reporting
     # land; it's the "I don't know yet" placeholder.
     TyAny    -> Some(s)
@@ -26930,6 +26975,7 @@ fn ty_eq_shape(a: Ty, b: Ty) : Bool {
     TyString -> match bx { TyString -> true _ -> false }
     TyChar   -> match bx { TyChar -> true _ -> false }
     TyUnit   -> match bx { TyUnit -> true _ -> false }
+    TyU8     -> match bx { TyU8 -> true _ -> false }
     TyListT(ai) -> match bx { TyListT(bi) -> ty_eq_shape(ai, bi) _ -> false }
     TyFnT(ap, ar, _) -> match bx {
       TyFnT(bp, br, _) -> ty_list_eq_shape(ap, bp) and ty_eq_shape(ar, br)
@@ -28847,6 +28893,7 @@ fn first_param_head_is_concrete(t: Ty) : Bool = match t {
   TyString     -> true
   TyChar       -> true
   TyUnit       -> true
+  TyU8         -> true
   TyListT(_)   -> true
   TyFnT(_, _, _) -> true
   TyCon(_, _)  -> true
@@ -34287,6 +34334,7 @@ fn ty_eq(a: Ty, b: Ty) : Bool {
     TyChar -> match b { TyChar -> true _ -> false }
     TyString -> match b { TyString -> true _ -> false }
     TyUnit -> match b { TyUnit -> true _ -> false }
+    TyU8 -> match b { TyU8 -> true _ -> false }
     TyAny -> match b { TyAny -> true _ -> false }
     TyVarT(ai) -> match b { TyVarT(bi) -> ai == bi _ -> false }
     TyListT(ai) -> match b { TyListT(bi) -> ty_eq(ai, bi) _ -> false }
@@ -34476,6 +34524,7 @@ fn subst_ty(t: Ty, sm: SubstMap) : Ty {
     TyChar   -> t
     TyString -> t
     TyUnit   -> t
+    TyU8     -> t
     TyAny    -> t
     TyVarT(n) -> match subst_map_lookup_ty(sm, n) {
       Some(t2) -> t2
@@ -47713,6 +47762,7 @@ fn ty_head_name(t: Ty) : Option[String] {
     TyChar         -> Some("Char")
     TyString       -> Some("String")
     TyUnit         -> Some("Unit")
+    TyU8           -> Some("U8")
     TyListT(_)     -> Some("List")
     TyCon(name, _) -> Some(name)
     # m12.5: a dimensioned value dispatches on the underlying base
