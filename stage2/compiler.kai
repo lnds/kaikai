@@ -16726,69 +16726,76 @@ fn has_main_decl(decls: [Decl]) : Bool {
   }
 }
 
-fn emit_main_wrapper(decls: [Decl], test_mode: Bool, bench_mode: Bool, check_mode: Bool) : String {
-  if test_mode {
-    let n = test_count(decls)
-    concat_all([
-      "int main(int argc, char **argv) {\n",
-      "    kai_set_args(argc, argv);\n",
-      test_call_list(n, 0),
-      "    return kai_test_summary();\n",
-      "}\n"
-    ])
-  } else if bench_mode {
-    let n = bench_count(decls)
-    concat_all([
-      "int main(int argc, char **argv) {\n",
-      "    kai_set_args(argc, argv);\n",
-      bench_call_list(n, 0),
-      "    return kai_bench_summary();\n",
-      "}\n"
-    ])
-  } else if check_mode {
-    let n = check_count(decls)
-    concat_all([
-      "int main(int argc, char **argv) {\n",
-      "    kai_set_args(argc, argv);\n",
-      check_call_list(n, 0),
-      "    return kai_check_summary();\n",
-      "}\n"
-    ])
-  } else if has_main_decl(decls) {
-    # m7a #7: install default handlers around `kai_main` only for
-    # the builtin effects that appear in `main`'s row. The push/pop
-    # pair is syntactically balanced (Doc C §*Per-fiber isolation*);
-    # pop runs even if `kai_main` returns. Pops are emitted in
-    # reverse-push order so the evidence stack stays LIFO-balanced.
-    #
-    # Issue #115: the shim block below is emitted at file scope,
-    # before `int main()`. Each shim has the typed signature
-    # matching the EvX struct field and forwards to the runtime
-    # void-self function. Setup assigns shim addresses without a
-    # cast, so UBSan's `-fsanitize=function` (Linux clang's
-    # `-fsanitize=undefined`, absent from Apple clang's default)
-    # sees matching types at every dispatch through `_ev_op->op`.
-    # Issue #308: drop any effect name whose decl is user-supplied
-    # (line/col != 0). The default-handler emit assumes the builtin
-    # EvX layout — emitting it for a user `effect Log { ... }` shape
-    # produces invalid C against the user's struct.
-    let main_row = row_minus_user_effects(main_row_labels(decls), decls)
-    let shims    = default_shims_for(main_row)
-    let setup    = default_setups_for(main_row)
-    let teardown = default_pops_for(main_row)
-    concat_all([
-      shims,
-      "int main(int argc, char **argv) {\n",
-      "    kai_set_args(argc, argv);\n",
-      setup,
-      "    KaiValue *_result = kai_main();\n",
-      teardown,
-      "    kai_decref(_result);\n",
-      "    return 0;\n",
-      "}\n"
-    ])
-  } else {
-    ""
+fn emit_main_wrapper(decls: [Decl], bmode: BuildMode) : String {
+  match bmode {
+    BMTest -> {
+      let n = test_count(decls)
+      concat_all([
+        "int main(int argc, char **argv) {\n",
+        "    kai_set_args(argc, argv);\n",
+        test_call_list(n, 0),
+        "    return kai_test_summary();\n",
+        "}\n"
+      ])
+    }
+    BMBench -> {
+      let n = bench_count(decls)
+      concat_all([
+        "int main(int argc, char **argv) {\n",
+        "    kai_set_args(argc, argv);\n",
+        bench_call_list(n, 0),
+        "    return kai_bench_summary();\n",
+        "}\n"
+      ])
+    }
+    BMCheck -> {
+      let n = check_count(decls)
+      concat_all([
+        "int main(int argc, char **argv) {\n",
+        "    kai_set_args(argc, argv);\n",
+        check_call_list(n, 0),
+        "    return kai_check_summary();\n",
+        "}\n"
+      ])
+    }
+    BMBuild -> {
+      if has_main_decl(decls) {
+        # m7a #7: install default handlers around `kai_main` only for
+        # the builtin effects that appear in `main`'s row. The push/pop
+        # pair is syntactically balanced (Doc C §*Per-fiber isolation*);
+        # pop runs even if `kai_main` returns. Pops are emitted in
+        # reverse-push order so the evidence stack stays LIFO-balanced.
+        #
+        # Issue #115: the shim block below is emitted at file scope,
+        # before `int main()`. Each shim has the typed signature
+        # matching the EvX struct field and forwards to the runtime
+        # void-self function. Setup assigns shim addresses without a
+        # cast, so UBSan's `-fsanitize=function` (Linux clang's
+        # `-fsanitize=undefined`, absent from Apple clang's default)
+        # sees matching types at every dispatch through `_ev_op->op`.
+        # Issue #308: drop any effect name whose decl is user-supplied
+        # (line/col != 0). The default-handler emit assumes the builtin
+        # EvX layout — emitting it for a user `effect Log { ... }` shape
+        # produces invalid C against the user's struct.
+        let main_row = row_minus_user_effects(main_row_labels(decls), decls)
+        let shims    = default_shims_for(main_row)
+        let setup    = default_setups_for(main_row)
+        let teardown = default_pops_for(main_row)
+        concat_all([
+          shims,
+          "int main(int argc, char **argv) {\n",
+          "    kai_set_args(argc, argv);\n",
+          setup,
+          "    KaiValue *_result = kai_main();\n",
+          teardown,
+          "    kai_decref(_result);\n",
+          "    return 0;\n",
+          "}\n"
+        ])
+      } else {
+        ""
+      }
+    }
   }
 }
 
@@ -22213,7 +22220,7 @@ fn interp_part_to_expr(p: IPart, op_names: [String],
   }
 }
 
-fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, bench_mode: Bool, check_mode: Bool, target_origin: Option[String]) : String {
+fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String]) : String {
   # m7a #6c: rewrite `Eff.op(args)` callees from `EField(EVar(Eff), op)`
   # to `EVar("Eff.op")` before code emission. The typer (synth_op_call_with_scheme)
   # produces this form internally, but check_infer is a diagnostic-only
@@ -22258,7 +22265,7 @@ fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool, b
   let tests = emit_all_tests(src, decls, [], fns, variants, lams, cls, target_origin)
   let benches = emit_all_benches(src, decls, [], fns, variants, lams, cls, target_origin)
   let checks = emit_all_checks(src, decls, [], fns, variants, lams, cls, target_origin)
-  let main_wr = emit_main_wrapper(decls, test_mode, bench_mode, check_mode)
+  let main_wr = emit_main_wrapper(decls, bmode)
   concat_all([header, eff_structs, env_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
 }
 
@@ -43558,7 +43565,7 @@ fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffse
 
 fn llvm_build_globals_names(fns: [EFn], vs: [EVar], eff_names: [String], op_quals: [String]) : [String] = build_globals(fns, vs, eff_names, op_quals)
 
-fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], test_mode: Bool, bench_mode: Bool, check_mode: Bool) : String {
+fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], _bmode: BuildMode) : String {
   let alias_resolved = rewrite_alias_decls(raw_decls)
   let decls = alias_resolved
   let fns = register_fn_decls(decls)
@@ -49163,6 +49170,12 @@ type Mode
   # with one object per probe — schema in docs/library-mode.md.
   | MLibraryMode
 
+# Build-time wrapper selection passed to the emitters. Collapses the
+# previous test_mode/bench_mode/check_mode Bool triple (audit proposal
+# 5 in docs/lane-experience-compiler-idioms-audit.md). `BMBuild` is the
+# ordinary `main` path; the other three each emit a distinct wrapper.
+type BuildMode = BMBuild | BMTest | BMBench | BMCheck
+
 type CliOptions = { mode: Mode, path: Option[String], preludes: [String],
                     strict_holes: Bool, search_paths: [String],
                     include_prelude_tests: Bool }
@@ -51536,9 +51549,12 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       # the perceus pass sees post-unbox modes (it
                       # only inserts dup/drop on `MBoxed` nodes).
                       let unboxed_decls = unbox_pass(mono_decls)
-                      let test_mode = match mode { MTest -> true _ -> false }
-                      let bench_mode = match mode { MBench -> true _ -> false }
-                      let check_mode = match mode { MPropCheck -> true _ -> false }
+                      let bmode = match mode {
+                        MTest -> BMTest
+                        MBench -> BMBench
+                        MPropCheck -> BMCheck
+                        _ -> BMBuild
+                      }
                       let use_llvm = match mode { MEmitLlvm -> true _ -> false }
                       # Issue #37 — self-tail-call rewrite. Runs
                       # *before* Perceus on the C path so the
@@ -51587,9 +51603,9 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       else if mono_dispatch_errs != 0 { mono_dispatch_errs }
                       else {
                         let out = if use_llvm {
-                          emit_program_llvm(path, src, perceus_decls, test_mode, bench_mode, check_mode)
+                          emit_program_llvm(path, src, perceus_decls, bmode)
                         } else {
-                          emit_program(path, src, perceus_decls, test_mode, bench_mode, check_mode, Some(target_mod_name))
+                          emit_program(path, src, perceus_decls, bmode, Some(target_mod_name))
                         }
                         print(out)
                         0
