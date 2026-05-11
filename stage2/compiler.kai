@@ -39909,6 +39909,7 @@ fn llvm_header() : String =
     "\n",
     "declare %KaiValue* @kaix_str(i8*)\n",
     "declare %KaiValue* @kaix_int(i64)\n",
+    "declare %KaiValue* @kaix_byte(i8)\n",
     "declare %KaiValue* @kaix_bool(i32)\n",
     "declare i32           @kaix_truthy(%KaiValue*)\n",
     # Issue #87 — Phase 2 unbox boundary readers. Borrowing — they
@@ -40021,6 +40022,17 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_prelude_int_to_char(%KaiValue*)\n",
     # Issue #364: `impl Rem for Real` in stdlib/protocols.kai.
     "declare %KaiValue* @kaix_prelude_real_rem(%KaiValue*, %KaiValue*)\n",
+    # Lane 4 (#473) Byte primitive ops — declarations mirror the
+    # C-side prelude table and the entries added to
+    # `llvm_prelude_table`. Forwarders live in
+    # `stage0/runtime_llvm.c`.
+    "declare %KaiValue* @kaix_prelude_int_to_byte(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_byte_to_int(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_byte_add(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_byte_sub(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_byte_eq(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_byte_lt(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_byte_to_string(%KaiValue*)\n",
     # m7c-b: runtime helpers for the effects ABI. The C backend
     # invokes these via in-line statement-expressions; the LLVM
     # backend declares them as external and emits the same calls.
@@ -40410,7 +40422,21 @@ fn llvm_prelude_table() : [LlvmPrelude] {
     # so the LLVM backend needs a callable symbol even when user
     # code never reaches `Real % Real`. Routes to
     # `@kaix_prelude_real_rem` defined in `stage0/runtime_llvm.c`.
-    LP("real_rem",         2, None)
+    LP("real_rem",         2, None),
+    # Lane 4 (#473) Byte primitive ops. The C backend wires these
+    # via the `prelude_table` at line 11654; the LLVM backend
+    # needs the same names so that any decl referencing them
+    # (e.g. BinSerialize impls in `stdlib/protocols.kai`, which
+    # call `byte_to_int` / `int_to_byte`) emits
+    # `@kaix_prelude_byte_*` rather than falling through to a
+    # missing user-symbol `@kai_byte_*` and failing at link.
+    LP("int_to_byte",      1, None),
+    LP("byte_to_int",      1, None),
+    LP("byte_add",         2, None),
+    LP("byte_sub",         2, None),
+    LP("byte_eq",          2, None),
+    LP("byte_lt",          2, None),
+    LP("byte_to_string",   1, None)
   ]
 }
 
@@ -40849,10 +40875,20 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
 # `llvm_emit_expr` so the mode dispatch happens at every node.
 fn llvm_emit_expr_boxed(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
   match x.kind {
+    # Mirror of the C-side bidirectional fix at `emit_expr_boxed`: when
+    # the typer pinned an Int literal to TyByte (e.g. `let bs: [Byte] =
+    # [65]`), emit a Byte constructor rather than `kaix_int`. The
+    # 0..255 range check has already been validated at type-check time.
     EInt(n) -> {
       let r = llvm_fresh_reg(e)
-      let instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_int(i64 ",
-                              int_to_string(n), ")\n"])
+      let instr = match x.ty {
+        Some(TyByte) ->
+          concat_all(["  ", r.reg, " = call %KaiValue* @kaix_byte(i8 ",
+                      int_to_string(n), ")\n"])
+        _ ->
+          concat_all(["  ", r.reg, " = call %KaiValue* @kaix_int(i64 ",
+                      int_to_string(n), ")\n"])
+      }
       llvm_set_last(llvm_append_body(r.e, instr), r.reg)
     }
     EBool(b) -> {
@@ -46393,8 +46429,8 @@ fn make_binser_impl(tname: String, to_b: Expr, from_b: Expr,
   let byte_list = mk_ty(TyList(mk_ty(TyName("Byte", []), line, col)), line, col)
   let int_ty = mk_ty(TyName("Int", []), line, col)
   let str_ty = mk_ty(TyName("String", []), line, col)
-  let pair_ty = mk_ty(TyName("Pair", [self_ty, int_ty]), line, col)
-  let res_ty = mk_ty(TyName("Result", [str_ty, pair_ty]), line, col)
+  let cur_ty = mk_ty(TyName("BinCursor", [self_ty]), line, col)
+  let res_ty = mk_ty(TyName("Result", [str_ty, cur_ty]), line, col)
   let to_params = [Param { pname: "self", ptype: Some(self_ty),
                             pline: line, pcol: col }]
   let from_params = [Param { pname: "buf", ptype: Some(byte_list),
@@ -46408,7 +46444,8 @@ fn make_binser_impl(tname: String, to_b: Expr, from_b: Expr,
   DImpl("BinSerialize", [], self_ty, [to_method, from_method], line, col)
 }
 
-# `fn <lower(tname)>_from_bytes(buf: [Byte], pos: Int) : Result[String, (T, Int)]`
+# `fn <lower(tname)>_from_bytes(buf: [Byte], pos: Int)
+#       : Result[String, BinCursor[T]]`
 # wrapping the mangled per-impl name. The shim decouples the user's
 # call site from the dispatcher's first-arg constraint and gives the
 # diagnostic stack a stable function name when the decode fails.
@@ -46417,8 +46454,8 @@ fn derive_binser_shim(tname: String, line: Int, col: Int) : Decl {
   let byte_list = mk_ty(TyList(mk_ty(TyName("Byte", []), line, col)), line, col)
   let int_ty = mk_ty(TyName("Int", []), line, col)
   let str_ty = mk_ty(TyName("String", []), line, col)
-  let pair_ty = mk_ty(TyName("Pair", [self_ty, int_ty]), line, col)
-  let res_ty = mk_ty(TyName("Result", [str_ty, pair_ty]), line, col)
+  let cur_ty = mk_ty(TyName("BinCursor", [self_ty]), line, col)
+  let res_ty = mk_ty(TyName("Result", [str_ty, cur_ty]), line, col)
   let params = [Param { pname: "buf", ptype: Some(byte_list),
                          pline: line, pcol: col },
                 Param { pname: "pos", ptype: Some(int_ty),
@@ -46523,7 +46560,7 @@ fn derive_binser_record_decode_chain(tname: String, remaining: [FieldDecl],
                                   [mk_expr(EVar("buf"), line, col), pos_e]),
                            line, col)
         let pvar = concat_all(["p", int_to_string(idx)])
-        let next_pos = mk_expr(EField(mk_expr(EVar(pvar), line, col), "snd"),
+        let next_pos = mk_expr(EField(mk_expr(EVar(pvar), line, col), "pos"),
                                 line, col)
         let then_e = derive_binser_record_decode_chain(tname, rest, all_fields,
                                                         idx + 1, next_pos,
@@ -46534,15 +46571,15 @@ fn derive_binser_record_decode_chain(tname: String, remaining: [FieldDecl],
   }
 }
 
-# Build `Ok((T { f1: p0.fst, ..., fN: pN-1.fst }, pos_e))`.
+# Build `Ok(BinCursor { value: T { f1: p0.value, ... }, pos: pos_e })`.
 fn derive_binser_record_ok_value(tname: String, fields: [FieldDecl],
                                    pos_e: Expr, line: Int, col: Int) : Expr {
   let parts = derive_binser_record_field_inits(fields, 0, line, col)
   let rec_e = mk_expr(ERecordLit(tname, parts), line, col)
-  let pair_e = mk_expr(ERecordLit("Pair",
-                                [FI("fst", rec_e),
-                                 FI("snd", pos_e)]), line, col)
-  mk_expr(ECall(mk_expr(EVar("Ok"), line, col), [pair_e]), line, col)
+  let cur_e = mk_expr(ERecordLit("BinCursor",
+                                [FI("value", rec_e),
+                                 FI("pos", pos_e)]), line, col)
+  mk_expr(ECall(mk_expr(EVar("Ok"), line, col), [cur_e]), line, col)
 }
 
 fn derive_binser_record_field_inits(fields: [FieldDecl], i: Int,
@@ -46552,7 +46589,7 @@ fn derive_binser_record_field_inits(fields: [FieldDecl], i: Int,
     [fd, ...rest] -> match fd {
       FD(name, _) -> {
         let v = mk_expr(EField(mk_expr(EVar(concat_all(["p", int_to_string(i)])),
-                                        line, col), "fst"),
+                                        line, col), "value"),
                          line, col)
         [FI(name, v),
          ...derive_binser_record_field_inits(rest, i + 1, line, col)]
@@ -46728,7 +46765,7 @@ fn derive_binser_sum_tag_chain(tname: String, variants: [Variant], idx: Int,
 }
 
 # Same shape as record-decode chain, but the final `Ok` builds a
-# constructor call `Variant(p0.fst, p1.fst, ...)` instead of a
+# constructor call `Variant(p0.value, p1.value, ...)` instead of a
 # record literal.
 fn derive_binser_sum_payload_decode(tname: String, v: Variant,
                                       start_pos: Expr, line: Int, col: Int) : Expr {
@@ -46736,10 +46773,10 @@ fn derive_binser_sum_payload_decode(tname: String, v: Variant,
     Var(name, vargs) -> match vargs {
       [] -> {
         let ctor = mk_expr(EVar(name), line, col)
-        let pair = mk_expr(ERecordLit("Pair",
-                                    [FI("fst", ctor),
-                                     FI("snd", start_pos)]), line, col)
-        mk_expr(ECall(mk_expr(EVar("Ok"), line, col), [pair]), line, col)
+        let cur = mk_expr(ERecordLit("BinCursor",
+                                    [FI("value", ctor),
+                                     FI("pos", start_pos)]), line, col)
+        mk_expr(ECall(mk_expr(EVar("Ok"), line, col), [cur]), line, col)
       }
       _  -> derive_binser_sum_decode_chain(name, vargs, vargs, 0, start_pos,
                                              line, col)
@@ -46754,10 +46791,10 @@ fn derive_binser_sum_decode_chain(vname: String, remaining: [TypeExpr],
     [] -> {
       let args = derive_binser_sum_ctor_args(all_vargs, 0, line, col)
       let ctor = mk_expr(ECall(mk_expr(EVar(vname), line, col), args), line, col)
-      let pair = mk_expr(ERecordLit("Pair",
-                                  [FI("fst", ctor),
-                                   FI("snd", pos_e)]), line, col)
-      mk_expr(ECall(mk_expr(EVar("Ok"), line, col), [pair]), line, col)
+      let cur = mk_expr(ERecordLit("BinCursor",
+                                  [FI("value", ctor),
+                                   FI("pos", pos_e)]), line, col)
+      mk_expr(ECall(mk_expr(EVar("Ok"), line, col), [cur]), line, col)
     }
     [vt, ...rest] -> {
       let mangled = proto_mangled_fn("BinSerialize",
@@ -46766,7 +46803,7 @@ fn derive_binser_sum_decode_chain(vname: String, remaining: [TypeExpr],
                                 [mk_expr(EVar("buf"), line, col), pos_e]),
                          line, col)
       let pvar = concat_all(["p", int_to_string(idx)])
-      let next_pos = mk_expr(EField(mk_expr(EVar(pvar), line, col), "snd"),
+      let next_pos = mk_expr(EField(mk_expr(EVar(pvar), line, col), "pos"),
                               line, col)
       let then_e = derive_binser_sum_decode_chain(vname, rest, all_vargs,
                                                      idx + 1, next_pos,
@@ -46782,7 +46819,7 @@ fn derive_binser_sum_ctor_args(vargs: [TypeExpr], i: Int,
     [] -> []
     [_, ...rest] ->
       [mk_expr(EField(mk_expr(EVar(concat_all(["p", int_to_string(i)])),
-                               line, col), "fst"), line, col),
+                               line, col), "value"), line, col),
        ...derive_binser_sum_ctor_args(rest, i + 1, line, col)]
   }
 }

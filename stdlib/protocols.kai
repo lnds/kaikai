@@ -380,8 +380,16 @@ impl Serialize for Bool {
 #
 # Shape:
 #   to_bytes(self)             : [Byte]
-#   from_bytes(buf, pos)       : Result[String, (Self, Int)]
-#                                # Ok(value, next_pos) | Err(msg)
+#   from_bytes(buf, pos)       : Result[String, BinCursor[Self]]
+#                                # Ok({ value, pos: next_pos }) | Err(msg)
+#
+# `BinCursor[t]` is the cursor return shape — a local record so
+# `stdlib/protocols.kai` does not depend on `stdlib/core/tuple.kai`
+# (which declares `Pair[a, b]`, the desugar target of the `(a, b)`
+# tuple sugar). Test harnesses that bundle `protocols.kai` without
+# `core/tuple.kai` (e.g. `complex_literal_basic` in `test-sugars`)
+# would otherwise see `Pair` unresolved at every `from_bytes` call
+# site.
 #
 # Encoding (v1):
 #   Int    — 8-byte little-endian two's complement (assumes Int = i64).
@@ -393,9 +401,11 @@ impl Serialize for Bool {
 #   String — 4-byte little-endian length prefix + raw bytes.
 #   Bool   — 1 byte (0 = false, 1 = true).
 
+pub type BinCursor[t] = { value: t, pos: Int }
+
 protocol BinSerialize {
   to_bytes(self: Self) : [Byte]
-  from_bytes(buf: [Byte], pos: Int) : Result[String, (Self, Int)]
+  from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Self]]
 }
 
 # --- low-level helpers (private to the BinSerialize impls) --------
@@ -468,10 +478,10 @@ fn bin_bytes_to_int_loop(buf: [Byte], pos: Int, k: Int, mult: Int,
   } }
 }
 
-fn bin_bytes_to_int(buf: [Byte], pos: Int) : Result[String, (Int, Int)] = {
+fn bin_bytes_to_int(buf: [Byte], pos: Int) : Result[String, BinCursor[Int]] = {
   match bin_bytes_to_int_loop(buf, pos, 8, 1, 0) {
     Err(m) -> Err(m)
-    Ok(n)  -> Ok((n, pos + 8))
+    Ok(n)  -> Ok(BinCursor { value: n, pos: pos + 8 })
   }
 }
 
@@ -524,19 +534,19 @@ fn bin_collect_chars(buf: [Byte], pos: Int, k: Int, acc: String) : Result[String
 
 impl BinSerialize for Int {
   fn to_bytes(self: Int) : [Byte] = bin_int_to_bytes(self)
-  fn from_bytes(buf: [Byte], pos: Int) : Result[String, (Int, Int)] =
+  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Int]] =
     bin_bytes_to_int(buf, pos)
 }
 
 impl BinSerialize for Bool {
   fn to_bytes(self: Bool) : [Byte] = if self { [bin_byte(1)] } else { [bin_byte(0)] }
-  fn from_bytes(buf: [Byte], pos: Int) : Result[String, (Bool, Int)] = {
+  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Bool]] = {
     match bin_byte_at(buf, pos) {
       Err(m) -> Err(m)
       Ok(b)  -> {
         let n = byte_to_int(b)
-        if n == 0 { Ok((false, pos + 1)) }
-        else if n == 1 { Ok((true, pos + 1)) }
+        if n == 0 { Ok(BinCursor { value: false, pos: pos + 1 }) }
+        else if n == 1 { Ok(BinCursor { value: true,  pos: pos + 1 }) }
         else { Err("BinSerialize Bool: byte out of range") }
       }
     }
@@ -555,7 +565,7 @@ impl BinSerialize for Bool {
 # unaffected.
 impl BinSerialize for String {
   fn to_bytes(self: String) : [Byte] = bin_string_to_bytes(self)
-  fn from_bytes(buf: [Byte], pos: Int) : Result[String, (String, Int)] = {
+  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[String]] = {
     match bin_read_len4(buf, pos) {
       Err(m) -> Err(m)
       Ok(n)  -> {
@@ -565,7 +575,7 @@ impl BinSerialize for String {
         } else {
           match bin_collect_chars(buf, body_pos, n, "") {
             Err(m) -> Err(m)
-            Ok(s)  -> Ok((s, body_pos + n))
+            Ok(s)  -> Ok(BinCursor { value: s, pos: body_pos + n })
           }
         }
       }
@@ -575,7 +585,7 @@ impl BinSerialize for String {
 
 impl BinSerialize for Real {
   fn to_bytes(self: Real) : [Byte] = bin_string_to_bytes(real_to_string(self))
-  fn from_bytes(buf: [Byte], pos: Int) : Result[String, (Real, Int)] = {
+  fn from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Real]] = {
     match bin_read_len4(buf, pos) {
       Err(m) -> Err(m)
       Ok(n)  -> {
@@ -586,7 +596,7 @@ impl BinSerialize for Real {
           match bin_collect_chars(buf, body_pos, n, "") {
             Err(m) -> Err(m)
             Ok(s)  -> match string_to_real(s) {
-              Some(r) -> Ok((r, body_pos + n))
+              Some(r) -> Ok(BinCursor { value: r, pos: body_pos + n })
               None    -> Err("BinSerialize Real: invalid decimal payload")
             }
           }
@@ -610,22 +620,22 @@ impl BinSerialize for Real {
 # `derive_binserialize_impl` pass synthesises an analogous
 # `<tname>_from_bytes` helper for each derived type.
 
-fn int_from_bytes(buf: [Byte], pos: Int) : Result[String, (Int, Int)] =
+fn int_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Int]] =
   bin_bytes_to_int(buf, pos)
 
-fn bool_from_bytes(buf: [Byte], pos: Int) : Result[String, (Bool, Int)] = {
+fn bool_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Bool]] = {
   match bin_byte_at(buf, pos) {
     Err(m) -> Err(m)
     Ok(b)  -> {
       let n = byte_to_int(b)
-      if n == 0 { Ok((false, pos + 1)) }
-      else if n == 1 { Ok((true, pos + 1)) }
+      if n == 0 { Ok(BinCursor { value: false, pos: pos + 1 }) }
+      else if n == 1 { Ok(BinCursor { value: true,  pos: pos + 1 }) }
       else { Err("BinSerialize Bool: byte out of range") }
     }
   }
 }
 
-fn string_from_bytes(buf: [Byte], pos: Int) : Result[String, (String, Int)] = {
+fn string_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[String]] = {
   match bin_read_len4(buf, pos) {
     Err(m) -> Err(m)
     Ok(n)  -> {
@@ -635,14 +645,14 @@ fn string_from_bytes(buf: [Byte], pos: Int) : Result[String, (String, Int)] = {
       } else {
         match bin_collect_chars(buf, body_pos, n, "") {
           Err(m) -> Err(m)
-          Ok(s)  -> Ok((s, body_pos + n))
+          Ok(s)  -> Ok(BinCursor { value: s, pos: body_pos + n })
         }
       }
     }
   }
 }
 
-fn real_from_bytes(buf: [Byte], pos: Int) : Result[String, (Real, Int)] = {
+fn real_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Real]] = {
   match bin_read_len4(buf, pos) {
     Err(m) -> Err(m)
     Ok(n)  -> {
@@ -653,7 +663,7 @@ fn real_from_bytes(buf: [Byte], pos: Int) : Result[String, (Real, Int)] = {
         match bin_collect_chars(buf, body_pos, n, "") {
           Err(m) -> Err(m)
           Ok(s)  -> match string_to_real(s) {
-            Some(r) -> Ok((r, body_pos + n))
+            Some(r) -> Ok(BinCursor { value: r, pos: body_pos + n })
             None    -> Err("BinSerialize Real: invalid decimal payload")
           }
         }
