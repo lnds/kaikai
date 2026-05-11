@@ -49,7 +49,7 @@ Three tiers; the higher tier wins on conflict.
 - **Effects**: capability-passing Effekt + inference. Inferred in local bodies; mandatory annotation in public signatures. Three pinned docs: `docs/effects.md` (semantics), `docs/effects-stdlib.md` (catalog + defaults), `docs/effects-impl.md` (CPS + runtime). Sugars in `docs/syntax-sugars.md`.
 - **Concurrency**: fibers and actors live inside the effect system. `spawn/await/select/cancel` are ops of `Spawn` (`docs/structured-concurrency.md`); `send/receive/self` are ops of `Actor[Msg]` (`docs/actors.md`); `Cancel` is a separate cooperative-cancellation effect.
 - **FFI**: crosses to C via the `Ffi` capability. `extern "C" fn name(args) : T`.
-- **Tooling**: single `kai` binary (`build`/`run`/`test`/`fmt`/`repl`/`lsp`/`doc`).
+- **Tooling**: single `kai` binary (`build`/`run`/`test`/`fmt`/`lsp`/`doc`). REPL is permanently out of scope — see `docs/decisions/repl-removal-2026-05-09.md`.
 - **Tests**: builtin syntax (`test "..." { ... }` + `assert`), via `kai test`.
 
 ## Three-stage bootstrap
