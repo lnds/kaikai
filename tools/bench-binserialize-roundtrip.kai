@@ -1,0 +1,69 @@
+# PR #487 bench harness: BinSerialize round-trip on a 500-node
+# ~40 KB payload. Reports total wall time for `iter(buf, N, ...)`
+# decodes so the operator can divide by N to get per-decode cost.
+#
+# Issue #485 reported O(N²) on the prior `[Byte]` cons-list buffer
+# (19 s for 40 KB / 500 nodes / 1 decode). The Array[Byte] refactor
+# (this lane) drops that to single-digit milliseconds per decode.
+#
+# Reproduce:
+#   bin/kai build -o /tmp/bench-binser tools/bench-binserialize-roundtrip.kai
+#   /usr/bin/time -p /tmp/bench-binser >/dev/null
+#
+# Two builds — once with `let p = run_decode(buf)` (single decode)
+# and once with `let p = iter(buf, N, 0)` (N decodes) — subtract to
+# isolate decode-only cost when the build+encode prologue dominates.
+
+#derive(BinSerialize)
+type Node = { id: Int, name: String, payload: [Int] }
+
+fn build_payload(k: Int, acc: [Int]) : [Int] =
+  if k <= 0 { acc }
+  else { build_payload(k - 1, [k, ...acc]) }
+
+fn build_node(i: Int) : Node =
+  Node { id: i,
+         name: string_concat("node-", int_to_string(i)),
+         payload: build_payload(8, []) }
+
+fn build_nodes(n: Int, acc: [Node]) : [Node] =
+  if n <= 0 { acc }
+  else { build_nodes(n - 1, [build_node(n), ...acc]) }
+
+fn nodes_to_bytes(xs: [Node]) : Array[Byte] = {
+  let len = list_length(xs)
+  let len_buf = array_make(4, bin_byte(0))
+  let _ = bin_write_len4(len_buf, 0, len)
+  list.foldl(xs, len_buf, (acc, x) => array_concat_bytes(acc, to_bytes(x)))
+}
+
+fn nodes_from_bytes_loop(buf: Array[Byte], pos: Int, remaining: Int,
+                          acc: [Node]) : Result[String, (Int, [Node])] = {
+  if remaining == 0 { Ok((pos, list_reverse(acc))) }
+  else { match node_from_bytes(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(r)  -> nodes_from_bytes_loop(buf, r.pos, remaining - 1, [r.value, ...acc])
+  } }
+}
+
+fn run_decode(buf: Array[Byte]) : Int = {
+  match bin_read_len4(buf, 0) {
+    Err(_) -> 0
+    Ok(n)  -> match nodes_from_bytes_loop(buf, 4, n, []) {
+      Err(_) -> 0
+      Ok(r)  -> r.fst
+    }
+  }
+}
+
+fn iter(buf: Array[Byte], k: Int, last: Int) : Int =
+  if k == 0 { last } else { iter(buf, k - 1, run_decode(buf)) }
+
+fn main() : Int / Stdout = {
+  let xs = build_nodes(500, [])
+  let buf = nodes_to_bytes(xs)
+  print(string_concat("payload_bytes=", int_to_string(array_length(buf))))
+  let final_pos = iter(buf, 100, 0)
+  print(string_concat("final_pos=", int_to_string(final_pos)))
+  0
+}
