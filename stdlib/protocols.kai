@@ -404,6 +404,18 @@ protocol BinSerialize {
 # stdlib/protocols.kai loads as a flat prelude and we want the helper
 # names out of the bare-name resolver's reach.
 
+# `bin_byte(n)` is the internal Int → Byte coercion. Every call site
+# below masks its input through `% 256` (with negative-wrap fold)
+# before invoking, so the value is always in `[0, 255]` and the
+# `int_to_byte` Result.Err branch is unreachable; we panic on it
+# rather than thread an error type through every helper. After
+# Lane 4 made `Byte` nominal the explicit conversion replaces the
+# old `Byte = Int` transparent-alias shorthand.
+fn bin_byte(n: Int) : Byte = match int_to_byte(n) {
+  Ok(b)  -> b
+  Err(m) -> panic(m)
+}
+
 fn bin_byte_at(buf: [Byte], pos: Int) : Result[String, Byte] = match buf {
   []           -> Err("unexpected end of buffer")
   [b, ...rest] -> if pos == 0 { Ok(b) } else { bin_byte_at(rest, pos - 1) }
@@ -428,11 +440,14 @@ fn bin_int_to_bytes_loop(n: Int, k: Int, acc: [Byte]) : [Byte] = {
     let r = n % 256
     let b = if r < 0 { r + 256 } else { r }
     let q = (n - b) / 256
-    bin_int_to_bytes_loop(q, k - 1, [b, ...acc])
+    bin_int_to_bytes_loop(q, k - 1, [bin_byte(b), ...acc])
   }
 }
 
-fn bin_int_to_bytes(n: Int) : [Byte] = bin_int_to_bytes_loop(n, 8, [])
+fn bin_int_to_bytes(n: Int) : [Byte] = {
+  let acc: [Byte] = []
+  bin_int_to_bytes_loop(n, 8, acc)
+}
 
 fn bin_bytes_to_int_loop(buf: [Byte], pos: Int, k: Int, mult: Int,
                           acc: Int) : Result[String, Int] = {
@@ -440,12 +455,13 @@ fn bin_bytes_to_int_loop(buf: [Byte], pos: Int, k: Int, mult: Int,
   else { match bin_byte_at(buf, pos) {
     Err(m) -> Err(m)
     Ok(b)  -> {
-      let nxt = acc + b * mult
+      let bi  = byte_to_int(b)
+      let nxt = acc + bi * mult
       let m2  = if k == 1 {
         # Top byte: sign-extend if high bit is set so the value
         # becomes a proper negative Int rather than a 64-bit
         # unsigned-style positive.
-        if b >= 128 { nxt - 256 * mult } else { nxt }
+        if bi >= 128 { nxt - 256 * mult } else { nxt }
       } else { nxt }
       bin_bytes_to_int_loop(buf, pos + 1, k - 1, mult * 256, m2)
     }
@@ -459,24 +475,26 @@ fn bin_bytes_to_int(buf: [Byte], pos: Int) : Result[String, (Int, Int)] = {
   }
 }
 
-# String encoding — 4-byte LE length prefix + raw bytes. We recover
-# the bytes from a `String` via `char_at` + `char_to_int`; on the
-# decode side we accumulate the bytes into a list of Chars and pass
-# through `string_concat` of single-char strings, since there is no
-# runtime primitive that builds a String from a `[Int]` directly.
+# String encoding — 4-byte LE length prefix + raw bytes. The encoder
+# recovers bytes from `String` via `char_at` + `char_to_int` and
+# folds them into a `[Byte]` accumulator via `bin_byte`. The decoder
+# rebuilds the String through `int_to_char` + `"#{c}"` interpolation
+# (see the §String impl limitation note below).
 
 fn bin_string_to_bytes_loop(s: String, i: Int, n: Int, acc: [Byte]) : [Byte] = {
   if i >= n { list_reverse(acc) }
   else { match char_at(s, i) {
-    Some(c) -> bin_string_to_bytes_loop(s, i + 1, n, [char_to_int(c), ...acc])
+    Some(c) -> bin_string_to_bytes_loop(s, i + 1, n,
+                                          [bin_byte(char_to_int(c)), ...acc])
     None    -> list_reverse(acc)
   } }
 }
 
 fn bin_string_to_bytes(s: String) : [Byte] = {
   let n   = string_length(s)
-  let len = bin_int_to_bytes_loop(n, 4, [])
-  let bs  = bin_string_to_bytes_loop(s, 0, n, [])
+  let acc0: [Byte] = []
+  let len = bin_int_to_bytes_loop(n, 4, acc0)
+  let bs  = bin_string_to_bytes_loop(s, 0, n, acc0)
   list_append(len, bs)
 }
 
@@ -485,7 +503,8 @@ fn bin_read_len4_loop(buf: [Byte], pos: Int, k: Int, mult: Int,
   if k == 0 { Ok(acc) }
   else { match bin_byte_at(buf, pos) {
     Err(m) -> Err(m)
-    Ok(b)  -> bin_read_len4_loop(buf, pos + 1, k - 1, mult * 256, acc + b * mult)
+    Ok(b)  -> bin_read_len4_loop(buf, pos + 1, k - 1, mult * 256,
+                                   acc + byte_to_int(b) * mult)
   } }
 }
 
@@ -497,7 +516,7 @@ fn bin_collect_chars(buf: [Byte], pos: Int, k: Int, acc: String) : Result[String
   else { match bin_byte_at(buf, pos) {
     Err(m) -> Err(m)
     Ok(b)  -> {
-      let c = int_to_char(b)
+      let c = int_to_char(byte_to_int(b))
       bin_collect_chars(buf, pos + 1, k - 1, string_concat(acc, "#{c}"))
     }
   } }
@@ -510,14 +529,16 @@ impl BinSerialize for Int {
 }
 
 impl BinSerialize for Bool {
-  fn to_bytes(self: Bool) : [Byte] = if self { [1] } else { [0] }
+  fn to_bytes(self: Bool) : [Byte] = if self { [bin_byte(1)] } else { [bin_byte(0)] }
   fn from_bytes(buf: [Byte], pos: Int) : Result[String, (Bool, Int)] = {
     match bin_byte_at(buf, pos) {
       Err(m) -> Err(m)
-      Ok(b)  ->
-        if b == 0 { Ok((false, pos + 1)) }
-        else if b == 1 { Ok((true, pos + 1)) }
+      Ok(b)  -> {
+        let n = byte_to_int(b)
+        if n == 0 { Ok((false, pos + 1)) }
+        else if n == 1 { Ok((true, pos + 1)) }
         else { Err("BinSerialize Bool: byte out of range") }
+      }
     }
   }
 }
@@ -595,10 +616,12 @@ fn int_from_bytes(buf: [Byte], pos: Int) : Result[String, (Int, Int)] =
 fn bool_from_bytes(buf: [Byte], pos: Int) : Result[String, (Bool, Int)] = {
   match bin_byte_at(buf, pos) {
     Err(m) -> Err(m)
-    Ok(b)  ->
-      if b == 0 { Ok((false, pos + 1)) }
-      else if b == 1 { Ok((true, pos + 1)) }
+    Ok(b)  -> {
+      let n = byte_to_int(b)
+      if n == 0 { Ok((false, pos + 1)) }
+      else if n == 1 { Ok((true, pos + 1)) }
       else { Err("BinSerialize Bool: byte out of range") }
+    }
   }
 }
 

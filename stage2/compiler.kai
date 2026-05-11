@@ -46383,18 +46383,14 @@ fn derive_binserialize_impl(tname: String, body: TypeBody,
 
 # `impl BinSerialize for T { fn to_bytes ... fn from_bytes ... }`
 #
-# Note on `[Byte]` vs `[Int]`: the surface protocol uses `[Byte]`,
-# but the synth runs AFTER `expand_ta_decls` (which rewrites the
-# stdlib protocol's `Byte` to `Int` in every TypeExpr) — so the
-# already-registered `__pimpl_BinSerialize_Int_from_bytes` has an
-# `[Int]` parameter. To match, the synth emits `Int` directly
-# rather than `Byte`. The user-facing wrapper (`<tname>_from_bytes`)
-# does the same. Once Lane 4 introduces a real `u8`, this becomes
-# `TyName("u8", [])` and the alias indirection drops out.
+# Uses `[Byte]` directly. `Byte` is a first-class nominal primitive
+# after Lane 4 + PR #476; the previous `Byte = Int` transparent
+# alias is gone. `byte_to_int` / `int_to_byte` are the explicit
+# conversions when interoperating with `Int` data.
 fn make_binser_impl(tname: String, to_b: Expr, from_b: Expr,
                      line: Int, col: Int) : Decl {
   let self_ty = mk_ty(TyName(tname, []), line, col)
-  let byte_list = mk_ty(TyList(mk_ty(TyName("Int", []), line, col)), line, col)
+  let byte_list = mk_ty(TyList(mk_ty(TyName("Byte", []), line, col)), line, col)
   let int_ty = mk_ty(TyName("Int", []), line, col)
   let str_ty = mk_ty(TyName("String", []), line, col)
   let pair_ty = mk_ty(TyName("Pair", [self_ty, int_ty]), line, col)
@@ -46418,7 +46414,7 @@ fn make_binser_impl(tname: String, to_b: Expr, from_b: Expr,
 # diagnostic stack a stable function name when the decode fails.
 fn derive_binser_shim(tname: String, line: Int, col: Int) : Decl {
   let self_ty = mk_ty(TyName(tname, []), line, col)
-  let byte_list = mk_ty(TyList(mk_ty(TyName("Int", []), line, col)), line, col)
+  let byte_list = mk_ty(TyList(mk_ty(TyName("Byte", []), line, col)), line, col)
   let int_ty = mk_ty(TyName("Int", []), line, col)
   let str_ty = mk_ty(TyName("String", []), line, col)
   let pair_ty = mk_ty(TyName("Pair", [self_ty, int_ty]), line, col)
@@ -46634,11 +46630,17 @@ fn derive_binser_sum_pat_subs(vargs: [TypeExpr], prefix: String, i: Int,
   }
 }
 
-# `list_append([tag], list_append(to_bytes(p0), list_append(to_bytes(p1), ...)))`
-# Empty payload collapses to just `[tag]`.
+# `list_append([bin_byte(tag)], list_append(to_bytes(p0), ...))`.
+# Empty payload collapses to just `[bin_byte(tag)]`. The tag has
+# to land as a `Byte` literal — since Lane 4 made `Byte` nominal,
+# a bare `[idx]` would type-check as `[Int]` and fail to unify
+# with the impl's `[Byte]` return type.
 fn derive_binser_sum_to_bytes_body(vargs: [TypeExpr], idx: Int,
                                      line: Int, col: Int) : Expr {
-  let tag = mk_expr(EList([ElPlain(mk_expr(EInt(idx), line, col))]), line, col)
+  let tag_byte = mk_expr(ECall(mk_expr(EVar("bin_byte"), line, col),
+                                [mk_expr(EInt(idx), line, col)]),
+                          line, col)
+  let tag = mk_expr(EList([ElPlain(tag_byte)]), line, col)
   match vargs {
     [] -> tag
     _  -> {
@@ -46706,7 +46708,14 @@ fn derive_binser_sum_tag_chain(tname: String, variants: [Variant], idx: Int,
                             false), line, col)]),
                    line, col)
     [v, ...rest] -> {
-      let cond = mk_expr(EBinop("==", mk_expr(EVar("__tag"), line, col),
+      # `__tag` is a Byte after Lane 4; promote to Int via
+      # `byte_to_int` so the `==` comparison stays Int-Int (we
+      # already enumerate tags as Int indices) without needing a
+      # `byte_eq` rewrite at every variant.
+      let tag_i = mk_expr(ECall(mk_expr(EVar("byte_to_int"), line, col),
+                                  [mk_expr(EVar("__tag"), line, col)]),
+                           line, col)
+      let cond = mk_expr(EBinop("==", tag_i,
                                        mk_expr(EInt(idx), line, col)),
                           line, col)
       let then_e = derive_binser_sum_payload_decode(tname, v, start_pos,
