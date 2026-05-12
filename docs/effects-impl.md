@@ -2076,6 +2076,34 @@ handle lowering, op dispatch, clauses + default handlers). The
 deferred setjmp landing pad lives in the next sub-section as a
 scheduled follow-up.
 
+### C backend invariant: `_discard` must be volatile-qualified (#501)
+
+The handle stmt-expression in the C backend declares `_discard`
+as a local automatic, takes its address, and passes it to
+`kai_evidence_push_with_jmp` so the op-call site can store the
+clause's return value through the slot before `longjmp`-ing back
+to the handle's `setjmp`. Per **C99 §7.13.2.1/3** an automatic
+local that is *changed* between `setjmp` and `longjmp` and is
+not declared `volatile` has indeterminate value after `longjmp`.
+With `-O2` this manifests as the optimiser keeping the original
+NULL in a register across the discard write — the else-branch
+then reads NULL and the surrounding consumer segfaults (issue
+#501). `emit_handle` therefore emits
+
+```c
+KaiValue * volatile _discard = NULL;
+…
+kai_evidence_push_with_jmp(…, (KaiValue **) &_discard);
+```
+
+The cast at the push call strips the qualifier at the runtime
+boundary: the runtime writes through the slot exactly once in
+straight-line code immediately before `longjmp`, so there is no
+race or visibility window to lose by passing a plain
+`KaiValue **` into the helper. The qualifier matters only for
+the local in the `setjmp` function — that is where the
+optimiser's hoisting decision lives.
+
 ### Scheduled follow-up: m7c-e setjmp landing pad
 
 The C backend's m7a #6e flow uses `setjmp(_jmp)` in the handle
