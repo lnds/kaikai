@@ -89,8 +89,9 @@ chmod +x               "$STAGE/libexec/kaikai/kaic2"
 # Stdlib: copy the whole tree preserving structure.
 (cd stdlib && tar -cf - .) | (cd "$STAGE/share/kaikai/stdlib" && tar -xf -)
 
-# Runtime header.
-cp stage0/runtime.h    "$STAGE/share/kaikai/include/runtime.h"
+# Runtime header + LLVM-path runtime shim (L1+ LLVM-direct).
+cp stage0/runtime.h        "$STAGE/share/kaikai/include/runtime.h"
+cp stage0/runtime_llvm.c   "$STAGE/share/kaikai/include/runtime_llvm.c"
 
 # Metadata.
 cp VERSION             "$STAGE/share/kaikai/VERSION"
