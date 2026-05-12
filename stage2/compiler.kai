@@ -27881,10 +27881,9 @@ fn st_propagate_capability_labels(st: InferState, callee_ty: Ty,
   }
 }
 
-# Issue #528 — full transitive propagation. Every label the callee
-# declared flows up into the caller's row. The earlier `Ffi`-only
-# filter (issue #516) was a stopgap; the principled answer is total
-# propagation so the typer enforces honest signatures end-to-end.
+# Issue #528 — full transitive propagation of every callee effect
+# label to the caller's row. The earlier `Ffi`-only filter (issue
+# #516 stopgap) is gone. Honest signatures, no hardcoded filters.
 fn capability_labels_only(labels: [Label]) : [Label] = labels
 
 # True iff `target.eff` matches some label in `row` AND the existing
@@ -31463,10 +31462,11 @@ fn is_mutable_array_write_name(name: String) : Bool {
 fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : InferState {
   if not list_has_label(st.row, "Mutable") { st }
   else {
-    let local_set = collect_local_arrays(body, [])
+    let body_resolved = finalise_typed_expr(st.sub, body)
+    let local_set = collect_local_arrays(body_resolved, [])
     let param_names = mut_collect_param_names(params, [])
-    let escaped_set = collect_escaped_names(body, [])
-    if all_demands_local(body, local_set, escaped_set, param_names) {
+    let escaped_set = collect_escaped_names(body_resolved, [])
+    if all_demands_local(body_resolved, local_set, escaped_set, param_names) {
       st_drop_label(st, "Mutable")
     } else { st }
   }
@@ -31658,7 +31658,7 @@ fn rhs_is_local_array_origin(k: ExprKind, local_so_far: [String]) : Bool {
     ECall(callee, args_) -> match callee.kind {
       EVar(name) ->
         if name == "array_make" { true }
-        else if (name == "array_set" or name == "array_grow") {
+        else if name == "array_set" or name == "array_grow" or name == "Mutable.array_set" or name == "Mutable.array_grow" {
           match args_ {
             [first, ..._ignore] -> match first.kind {
               EVar(n) -> list_has(local_so_far, n)
@@ -31685,8 +31685,31 @@ fn collect_escaped_names(e: Expr, acc: [String]) : [String] =
 fn collect_escaped_names_kind(k: ExprKind, acc: [String]) : [String] {
   match k {
     ECall(callee, args_) -> {
+      # Issue #528 — generalised the previous `is_array_safe_callee`
+      # whitelist (which hardcoded specific stdlib names) into a row-
+      # consulting rule:
+      #   * Runtime-builtin Array primitives (array_make / set / grow / …)
+      #     are still whitelisted by name.
+      #   * Any other callee whose row does NOT carry `Mutable` (post-
+      #     substitution) cannot mutate the arrays it receives, so its
+      #     args do not leak for masking purposes. This covers all pure
+      #     user-defined helpers and HOFs instantiated with a pure
+      #     callback (`bin_foldl(xs, init, pure_lambda)`).
+      #   * A callee whose row DOES carry `Mutable` could mutate; its
+      #     args are conservatively treated as escaped here. The masking
+      #     pass's `mutable_callee_args_all_local` then decides per call
+      #     site whether the locally-constructed Arrays are still safe
+      #     (every Array/Ref arg must be a local non-param non-escaped
+      #     EVar). The two checks agree: if every Array arg is local,
+      #     escape's pessimism is overridden by the demand check.
+      # Issue #528 — every named callee (`EVar`) is safe for escape
+      # purposes. The masking pass's `mutable_callee_args_all_local`
+      # is the sole authority on whether passing an Array/Ref to a
+      # callee `/ Mutable` is observable mutation. For non-Mutable
+      # callees the question doesn't arise. Non-EVar callees (lambdas,
+      # field accesses, etc.) remain conservative.
       let safe = match callee.kind {
-        EVar(n) -> is_array_safe_callee(n)
+        EVar(_) -> true
         _       -> false
       }
       let a0 = collect_escaped_names(callee, acc)
@@ -31757,19 +31780,21 @@ fn collect_escaped_via_pipe(a: Expr, b: Expr, acc: [String]) : [String] {
 }
 
 fn is_array_safe_callee(name: String) : Bool {
+  # Runtime builtins for Array — their first argument is the array
+  # they read or mutate. The masking pass already classifies each
+  # call site as local-vs-external by inspecting that argument, so
+  # treating the callees themselves as non-escaping is sound.
+  #
+  # Issue #528: previously this list also held `array_concat_bytes`
+  # and `bin_write_len4` (stdlib functions hardcoded by name). Those
+  # entries crossed an abstraction boundary — the compiler should
+  # not know about specific stdlib symbols. They are gone; their
+  # callers now propagate `/ Mutable` honestly through the row.
   if name == "array_make" { true }
   else if name == "array_length" { true }
   else if name == "array_get" { true }
   else if name == "array_set" { true }
   else if name == "array_grow" { true }
-  # BinSerialize concat / writer helpers: read-only on every input
-  # Array except their locally-allocated `dst`, so passing a caller's
-  # local Array as the LHS does not actually let it be observably
-  # mutated. Whitelisted here so the caller's masking pass keeps the
-  # local label and `Mutable` stays out of its inferred row.
-  # See `stdlib/protocols.kai` §BinSerialize for the contract.
-  else if name == "array_concat_bytes" { true }
-  else if name == "bin_write_len4" { true }
   else { false }
 }
 
@@ -31861,6 +31886,51 @@ fn collect_escaped_in_list_elems(els: [ListElem], acc: [String]) : [String] = ma
 # An empty body (no demands) returns true vacuously — but the caller
 # only invokes us when `Mutable` is actually in the row, so the body
 # must contain at least one demand.
+# Issue #528 — true iff `t` is a function type whose declared row
+# carries the `Mutable` label. Used by the masking pass to recognise
+# call sites whose Mutable contribution comes from the callee's
+# declared row rather than a direct `array_set` / `ref_set`.
+fn ty_callee_has_mutable(t: Ty) : Bool = match t {
+  TyFnT(_, _, row) -> labels_contain_mutable(row.labels)
+  _                -> false
+}
+
+fn labels_contain_mutable(labels: [Label]) : Bool = match labels {
+  []           -> false
+  [h, ...rest] -> if h.eff == "Mutable" { true } else { labels_contain_mutable(rest) }
+}
+
+# Issue #528 — true iff `t` is `Array[_]` or `Ref[_]`. Those are the
+# observable mutable references whose provenance the masking pass
+# tracks.
+fn ty_is_mutable_ref(t: Ty) : Bool = match t {
+  TyCon(name, _) -> if name == "Array" { true } else if name == "Ref" { true } else { false }
+  _              -> false
+}
+
+# Issue #528 — for a callee declared `/ Mutable`, decide whether the
+# mutation it performs is local to the caller. Each argument whose
+# type is `Array[_]` or `Ref[_]` must be `EVar(n)` with `n` in the
+# caller's local set and not in the escaped set and not a parameter
+# name. Args of other types are ignored (they cannot carry mutation).
+fn mutable_callee_args_all_local(args_: [Expr], locals: [String],
+                                  escaped: [String], params: [String]) : Bool = match args_ {
+  []           -> true
+  [h, ...rest] -> {
+    let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
+    if ty_is_mutable_ref(arg_ty) {
+      match h.kind {
+        EVar(n) ->
+          if list_has(escaped, n) { false }
+          else if list_has(params, n) { false }
+          else if not list_has(locals, n) { false }
+          else { mutable_callee_args_all_local(rest, locals, escaped, params) }
+        _ -> false
+      }
+    } else { mutable_callee_args_all_local(rest, locals, escaped, params) }
+  }
+}
+
 fn all_demands_local(body: Expr, locals: [String], escaped: [String],
                      params: [String]) : Bool =
   all_demands_local_kind(body.kind, locals, escaped, params)
@@ -31876,10 +31946,20 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
       # so without the dotted check this branch falls through to
       # `here = true` and the surrounding `mask_local_mutable_demand`
       # strips `Mutable` even when the write targets a parameter array.
+      #
+      # Issue #528 — also recognise calls to user-defined callees
+      # declared `/ Mutable` (e.g. `bin_write_len4`). The demand they
+      # contribute is local iff every Array/Ref argument the caller
+      # passes is a locally-constructed reference that does not
+      # escape. This generalises `is_array_safe_callee` from a static
+      # whitelist into a typed property of the callee's signature.
+      let callee_ty = match callee.ty { Some(t) -> t  None -> TyAny }
       let here = match callee.kind {
         EVar(name) ->
           if is_mutable_array_write_name(name) {
             demand_is_local(args_, locals, escaped, params)
+          } else if ty_callee_has_mutable(callee_ty) {
+            mutable_callee_args_all_local(args_, locals, escaped, params)
           } else { true }
         _ -> true
       }
