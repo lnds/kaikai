@@ -42063,11 +42063,16 @@ fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : Ll
   ])
   let e6b = llvm_append_body(prev_reg.e, prev_call)
   # 7. GEP to op fn-ptr at field `offset`, load, indirect call.
+  # The effect-struct field uses `%KaiCont*` as the trailing param
+  # type (see llvm_emit_op_fn_ptrs, line 15881). Both the load and
+  # the call must use the matching type or strict LLVM IR verifiers
+  # (Apple clang on macos-14 CI) reject the construction. The
+  # continuation register itself is `i8*` (see `i8* %k` definition
+  # in clause bodies), so cast it explicitly at the callsite.
   let fn_ptr_p_reg = llvm_fresh_reg(e6b)
-  # Build the fn-ptr type: %KaiValue* (%EvEff*, args..., i8*)*
   let arg_ty_list = llvm_op_arg_kaivalue_list(list_length(xs))
   let fn_ptr_ty = concat_all([
-    "%KaiValue* (%Ev", eff_n, "*", arg_ty_list, ", i8*)*"
+    "%KaiValue* (%Ev", eff_n, "*", arg_ty_list, ", %KaiCont*)*"
   ])
   let fn_p_gep = concat_all([
     "  ", fn_ptr_p_reg.reg, " = getelementptr %Ev", eff_n,
@@ -42079,14 +42084,20 @@ fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : Ll
   let fn_load = concat_all([
     "  ", fn_ptr_reg.reg, " = load ", fn_ptr_ty, ", ", fn_ptr_ty, "* ", fn_ptr_p_reg.reg, "\n"
   ])
-  let e8 = llvm_append_body(fn_ptr_reg.e, fn_load)
+  let e7b = llvm_append_body(fn_ptr_reg.e, fn_load)
+  # Cast %k from `i8*` to `%KaiCont*` for the call.
+  let kc_reg = llvm_fresh_reg(e7b)
+  let kc_cast = concat_all([
+    "  ", kc_reg.reg, " = bitcast i8* ", k_reg.reg, " to %KaiCont*\n"
+  ])
+  let e8 = llvm_append_body(kc_reg.e, kc_cast)
   # 8. Indirect call, then restore in_dispatch_node.
   let r_reg = llvm_fresh_reg(e8)
   let arg_regs_str = llvm_format_op_arg_regs(ra.regs)
   let call_instr = concat_all([
     "  ", r_reg.reg, " = call %KaiValue* ", fn_ptr_reg.reg,
     "(%Ev", eff_n, "* ", ev_reg.reg, arg_regs_str,
-    ", i8* ", k_reg.reg, ")\n",
+    ", %KaiCont* ", kc_reg.reg, ")\n",
     "  call void @kaix_in_dispatch_leave(i8* ", prev_reg.reg, ")\n"
   ])
   llvm_set_last(llvm_append_body(r_reg.e, call_instr), r_reg.reg)
@@ -42911,13 +42922,24 @@ fn llvm_emit_handle_clause_assigns(e: LlvmEmit, ev_reg: String, eff_name: String
             let arg_ty_list = llvm_op_arg_kaivalue_list(list_length(op_args))
             let p_reg = llvm_fresh_reg(e)
             let enc_fn = lookup_clause_enc_fn(cls, hline, hcol, op_name)
+            # The clause function is DEFINED with `i8* %k` trailing
+            # (see llvm_emit_clause_body, line 14747), but the effect
+            # struct field type uses `%KaiCont*` (see llvm_emit_op_fn_ptrs,
+            # line 15881). Strict LLVM IR verifiers (e.g. Apple clang on
+            # macos-14 CI runners) reject the implicit conversion; the
+            # default-shim path already uses an explicit `bitcast` for
+            # the same reason. Mirror that pattern: bitcast the clause
+            # fn pointer from the `i8*`-trailing definition type to the
+            # `%KaiCont*`-trailing field type before storing.
             let p_gep = concat_all([
               "  ", p_reg.reg, " = getelementptr %Ev", eff_name,
               ", %Ev", eff_name, "* ", ev_reg, ", i32 0, i32 ",
               int_to_string(offset), "\n",
-              "  store %KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", i8*)* @",
+              "  store %KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", %KaiCont*)* ",
+              "bitcast (%KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", i8*)* @",
               clause_fn_name(enc_fn, hline, hcol, op_name),
-              ", %KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", i8*)** ",
+              " to %KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", %KaiCont*)*)",
+              ", %KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", %KaiCont*)** ",
               p_reg.reg, "\n"
             ])
             let e1 = llvm_append_body(p_reg.e, p_gep)
