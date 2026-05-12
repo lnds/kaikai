@@ -113,22 +113,33 @@ fn main() : Unit / Console = print("hola installed mode")
 HEREDOC
 # Run the staged kai with KAI_NO_STDLIB unset and PATH pointing nowhere
 # else, to make sure the script's own auto-detection logic works.
-# Force C backend: smoke test verifies the staged binary + stdlib layout,
-# not the LLVM path (which has its own tier1 coverage). LLVM default
-# (#506) auto-detects clang in PATH, which makes the smoke test
-# environment-dependent and harder to debug when it fails on CI.
-PATH="$STAGE/bin:/usr/bin:/bin" KAI_BACKEND=c "$STAGE/bin/kai" run "$SMOKE_DIR/hello.kai" \
-  > "$SMOKE_DIR/out" 2>&1 || true
-# Always print the staged kai output so CI logs surface the failure
-# reason instead of dying silently under `set -e`.
-echo "--- staged kai output ---" >&2
-cat "$SMOKE_DIR/out" >&2 || true
-echo "--- end staged kai output ---" >&2
-if grep -q 'hola installed mode' "$SMOKE_DIR/out"; then
-  echo "    OK"
-else
-  echo "build-release.sh: smoke test failed" >&2
-  cat "$SMOKE_DIR/out" >&2
+# We exercise BOTH backends explicitly: C (always available, baseline)
+# and LLVM (the default per #506 when clang is in PATH — what real
+# users will hit on their first run). If LLVM is broken in the staged
+# layout, the release must fail; we will not ship a binary that breaks
+# on its advertised default. The `|| true` lets us always log the
+# staged kai output before deciding pass/fail.
+run_smoke() {
+  backend="$1"
+  out="$SMOKE_DIR/out.$backend"
+  echo "==> smoke test: $backend backend"
+  PATH="$STAGE/bin:/usr/bin:/bin" KAI_BACKEND="$backend" \
+    "$STAGE/bin/kai" run "$SMOKE_DIR/hello.kai" > "$out" 2>&1 || true
+  echo "--- staged kai output ($backend) ---" >&2
+  cat "$out" >&2 || true
+  echo "--- end staged kai output ($backend) ---" >&2
+  if grep -q 'hola installed mode' "$out"; then
+    echo "    $backend backend OK"
+    return 0
+  else
+    echo "build-release.sh: smoke test failed ($backend backend)" >&2
+    return 1
+  fi
+}
+smoke_failed=0
+run_smoke c    || smoke_failed=1
+run_smoke llvm || smoke_failed=1
+if [ "$smoke_failed" -ne 0 ]; then
   exit 2
 fi
 
