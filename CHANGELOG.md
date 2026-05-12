@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.53.1 (2026-05-11)
+
+### Fixed
+
+- **release**: ship kai-pkg binary in release tarball + manifest smoke test (closes #512)
+- **typer**: unwrap DDerive in module export collector (closes #503)
+
 ## v0.53.0 (2026-05-11)
 
 ### Added
