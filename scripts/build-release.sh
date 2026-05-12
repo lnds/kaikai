@@ -79,12 +79,26 @@ echo "==> verifying selfhost byte-identical"
 make -C stage1 selfhost >&2
 make -C stage2 selfhost >&2
 
+# Build kai-pkg (the package-manifest helper). bin/kai dev-mode auto-builds
+# it on first use, but installed mode expects it pre-shipped at
+# libexec/kaikai/kai-pkg — without it, any project with a kai.toml fails
+# with "installation is corrupt" (issue #512). Use the freshly-built kaic2
+# via bin/kai to compile its sources. Force the C backend explicitly:
+# tools/kai-pkg/main.kai uses fs/file.read_bytes which today reaches a
+# runtime symbol (`kai_file_read_bytes`) the LLVM emit path does not
+# declare — tracked as a separate issue. C backend has full runtime
+# coverage; we keep kai-pkg buildable in installed-release mode that way.
+echo "==> building kai-pkg"
+KAI_BACKEND=c ./bin/kai build tools/kai-pkg/main.kai -o tools/kai-pkg/kai-pkg >&2
+
 # Copy artifacts.
 echo "==> assembling installed layout at $STAGE"
 cp bin/kai             "$STAGE/bin/kai"
 chmod +x               "$STAGE/bin/kai"
 cp stage2/kaic2        "$STAGE/libexec/kaikai/kaic2"
 chmod +x               "$STAGE/libexec/kaikai/kaic2"
+cp tools/kai-pkg/kai-pkg "$STAGE/libexec/kaikai/kai-pkg"
+chmod +x               "$STAGE/libexec/kaikai/kai-pkg"
 
 # Stdlib: copy the whole tree preserving structure.
 (cd stdlib && tar -cf - .) | (cd "$STAGE/share/kaikai/stdlib" && tar -xf -)
@@ -139,6 +153,29 @@ run_smoke() {
 smoke_failed=0
 run_smoke c    || smoke_failed=1
 run_smoke llvm || smoke_failed=1
+
+# Smoke test #2 — kai.toml project (issue #512). A release that ships
+# without kai-pkg breaks every multi-file project; the previous smoke
+# test only exercises single-file `kai run` which doesn't touch kai-pkg.
+echo "==> smoke test: kai.toml project (manifest resolution)"
+PROJ_DIR="$SMOKE_DIR/proj"
+mkdir -p "$PROJ_DIR"
+printf 'name = "smoke"\nversion = "0.1.0"\n' > "$PROJ_DIR/kai.toml"
+cat > "$PROJ_DIR/main.kai" <<'HEREDOC'
+fn main() : Unit / Console = print("hola manifest mode")
+HEREDOC
+PATH="$STAGE/bin:/usr/bin:/bin" KAI_BACKEND=c \
+  "$STAGE/bin/kai" run "$PROJ_DIR/main.kai" > "$SMOKE_DIR/out.proj" 2>&1 || true
+echo "--- staged kai output (manifest) ---" >&2
+cat "$SMOKE_DIR/out.proj" >&2 || true
+echo "--- end staged kai output (manifest) ---" >&2
+if grep -q 'hola manifest mode' "$SMOKE_DIR/out.proj"; then
+  echo "    manifest project OK"
+else
+  echo "build-release.sh: smoke test failed (kai.toml project) — issue #512?" >&2
+  smoke_failed=1
+fi
+
 if [ "$smoke_failed" -ne 0 ]; then
   exit 2
 fi
