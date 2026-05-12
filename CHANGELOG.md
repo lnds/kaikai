@@ -84,6 +84,15 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.53.0 (2026-05-11)
+
+### Added
+
+- **driver**: default to LLVM backend when clang is in PATH
+- **emit**: close LLVM emitter gaps for full stdlib support
+- **build**: LLVM static integration prep for L3 in-process linking (L0)
+- **driver**: bin/kai build --backend=llvm flag (L1 of LLVM-direct, refs DoD #6)
+
 ## v0.52.0 (2026-05-11)
 
 ### Added
