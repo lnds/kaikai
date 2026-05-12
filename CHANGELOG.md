@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.54.2 (2026-05-12)
+
+### Fixed
+
+- **typer**: propagate effect demands through qualified op calls (closes #516)
+- **typer**: reject type-name collisions across module boundaries (closes #518)
+
 ## v0.54.1 (2026-05-12)
 
 ### Fixed
