@@ -29033,8 +29033,15 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File {
       let merged = merge_label_lists(prev_row, body_row_minus, rb.st.sub)
       let st_out0 = st_set_row(rb.st, merged)
       let st_out1 = match alias_opt { Some(_) -> st_pop_alias(st_out0) None -> st_out0 }
+      # Issue #517 — verify `with <Eff>` names a known effect. When
+      # `Eff` is unknown the body's labels still flow up via the
+      # filter-and-merge step above (so a downstream "effect not
+      # handled" still fires for what the body actually performs),
+      # but we surface the parse-level mistake directly so the user
+      # does not chase a "unknown op X on effect Y" cascade.
+      let st_out_eff = check_handle_effect_known(st_out1, eff_name, e.line, e.col)
       # m7a #4e: every clause name must be a declared op of `eff_name`.
-      let st_out2 = check_clause_names(st_out1, eff_name, clauses, e.line, e.col)
+      let st_out2 = check_clause_names(st_out_eff, eff_name, clauses, e.line, e.col)
       let stateful = match init_opt { Some(_) -> true None -> false }
       let cs_typed = check_clauses_types(st_out2, eff_name, clauses,
                                           stateful, init_typed_st.state_ty,
@@ -29119,13 +29126,23 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
     [c, ...rest] -> match c {
       HC(op_name, params, body, line, col) -> {
         let outer = st
+        # Issue #517 — clause shape: the clause's positional parameter
+        # count must equal the op's declared arity plus one (the
+        # trailing `resume`). Without this check `print_io(s) -> 0`
+        # (missing resume) or `print_io(a, b, c, resume) -> resume(())`
+        # (too many user params for a single-param op) type-check
+        # silently; the downstream C emitter then produces ill-formed
+        # function pointers. Validation is gated on a known op scheme
+        # so the unknown-op path keeps its dedicated diagnostic in
+        # check_clause_names instead of layering an arity error on top.
+        let st_arity = check_clause_arity(st, eff_name, op_name, params, line, col)
         # m7b #11l: bind the clause params and unify the op's
         # effect-tparam tyvars with the handler's instantiation, so
         # the answer type is concrete (e.g., `Int` for State.get under
         # `with State[Int]`). `st.clause_resume` is then set with the
         # concrete answer/state types so `resume(v)` / `resume(v, ns)`
         # are typechecked precisely.
-        let bind_res = bind_clause_env_typed(st, eff_name, op_name, params,
+        let bind_res = bind_clause_env_typed(st_arity, eff_name, op_name, params,
                                               stateful, state_ty, eff_tyargs)
         let sty = match state_ty { Some(t) -> t None -> TyAny }
         let env_bound = bind_res.st.env
@@ -29275,6 +29292,19 @@ fn bind_params_lenient(st: InferState, params: [Param]) : InferState {
   }
 }
 
+fn check_handle_effect_known(st: InferState, eff: String,
+                              line: Int, col: Int) : InferState {
+  if is_effect_in_env(st.env, eff) { st }
+  else {
+    let header = string_concat("unknown effect in `with`: `",
+      string_concat(eff, "`"))
+    diag_error(st.file, line, col, header)
+    diag_note("`handle { ... } with #{eff} { ... }` references an undeclared effect")
+    diag_help("either `effect #{eff} { ... }` it, or correct the name to a declared effect")
+    st_bump_err(st)
+  }
+}
+
 fn check_clause_names(st: InferState, eff: String, cs: [HClause],
                       line: Int, col: Int) : InferState / Console + File {
 
@@ -29297,6 +29327,49 @@ fn check_clause_names(st: InferState, eff: String, cs: [HClause],
             check_clause_names(st_bump_err(st), eff, rest, line, col)
           }
         }
+      }
+    }
+  }
+}
+
+# Issue #517 — verify a handler clause's positional parameter count
+# matches the op signature plus one for `resume`. Unknown ops fall
+# through (None branch): `check_clause_names` already reports those
+# and stacking an arity error would be confusing. The op scheme's
+# fn arg-tys count is the user-declared arity; the clause body
+# binds the user params positionally and the trailing param as
+# `resume`, so the expected clause-side count is `arg_tys.length + 1`.
+# We read the arg-tys length directly off the scheme's body — no
+# instantiation needed for an arity-only check.
+fn check_clause_arity(st: InferState, eff_name: String, op_name: String,
+                       params: [Param], line: Int, col: Int) : InferState {
+  let key = string_concat(eff_name, string_concat(".", op_name))
+  match ty_env_lookup(st.env, key) {
+    None     -> st
+    Some(sc) -> match sc {
+      Scheme(_, _, _, body) -> match body {
+        TyFnT(arg_tys, _, _) -> {
+          let expected = list_length(arg_tys) + 1
+          let got = list_length(params)
+          if got == expected { st }
+          else {
+            let header = string_concat("handler clause `",
+              string_concat(op_name,
+                string_concat("` has wrong arity for effect `",
+                  string_concat(eff_name, "`"))))
+            diag_error(st.file, line, col, header)
+            let n1 = "`#{eff_name}.#{op_name}` declares #{int_to_string(expected - 1)} parameter(s); the clause must take those plus a trailing `resume`, for a total of #{int_to_string(expected)}"
+            let n2 = "got #{int_to_string(got)} clause parameter(s)"
+            let h1 = "write `#{op_name}(#{int_to_string(expected - 1)} arg(s), resume) -> ...`"
+            let h2 = "the trailing parameter is the resumption continuation; omitting it makes the clause uncallable"
+            diag_note(n1)
+            diag_note(n2)
+            diag_help(h1)
+            diag_help(h2)
+            st_bump_err(st)
+          }
+        }
+        _ -> st
       }
     }
   }
@@ -34396,29 +34469,188 @@ fn check_body_row(st: InferState, fname: String, declared: RowExpr,
       # `examples/negative/silent_contract/ffi_call_no_capability.kai`.
       # Filter Ffi out of the absorbed set so main must declare
       # `/ Ffi` explicitly when it performs FFI calls directly.
+      #
+      # Issue #517 — main's REmpty branch also absorbed user-defined
+      # effects and any builtin without a runtime default handler.
+      # `effect Net { ... }` called from `main` compiled silently and
+      # SIGSEGV'd at runtime (no handler installed). Reject the same
+      # way Ffi is rejected: only labels with an `emit_main_wrapper`
+      # default handler should be absorbed.
       if fname == "main" {
-        check_body_row_label_loop(st, fname, only_non_absorbed_labels(st.row),
+        check_body_row_label_loop(st, fname,
+                                  only_non_absorbed_labels(st, st.row),
                                   [], line, col)
       }
       else { check_body_row_label_loop(st, fname, st.row, [], line, col) }
-    RClosed(lbs) -> check_body_row_label_loop(st, fname, st.row,
-                                                row_labels_of_rls(lbs),
-                                                line, col)
+    RClosed(lbs) -> {
+      # Issue #517 — for `main`, every declared row label must also
+      # have an `emit_main_wrapper` default handler. `main : Int / Net`
+      # for a user-defined `Net` previously accepted, then segfaulted
+      # at runtime because no handler was installed before `kai_main()`.
+      # The body-vs-declared subset check is still the primary check;
+      # this added pass surfaces the unhandled top-level row.
+      let st1 = check_body_row_label_loop(st, fname, st.row,
+                                            row_labels_of_rls(lbs),
+                                            line, col)
+      if fname == "main" {
+        check_main_row_handlable(st1, st.row, line, col)
+      } else { st1 }
+    }
     ROpen(_, _)  -> st
   }
 }
 
-# Issue #516 — labels for which `emit_main_wrapper` does NOT install a
-# default handler. Today this is just `Ffi`; if other capability-only
-# effects with zero ops join the catalog they should be listed here
-# too. Filters `Ffi` so main with an undeclared row still rejects
-# direct FFI calls.
-fn only_non_absorbed_labels(row: [Label]) : [Label] {
+# Issue #516 + #517 — labels for which `emit_main_wrapper` does NOT
+# install a default handler. The runtime default-handler set is the
+# fixed list in `default_shims_for` (Stdout, Stderr, Fail, Stdin,
+# Env, File, Clock, Random, SecureRandom, NetTcp, Signal, Process,
+# Log, Mutable, Cancel, Link, Monitor, Spawn). Anything outside that
+# set — `Ffi` (capability tag, no default handler by design) plus any
+# user-defined effect (no runtime evidence wired up) — must NOT be
+# absorbed by main; reject explicitly so the program does not segfault.
+fn only_non_absorbed_labels(st: InferState, row: [Label]) : [Label] {
   match row {
     [] -> []
     [h, ...rest] ->
-      if h.eff == "Ffi" { [h, ...only_non_absorbed_labels(rest)] }
-      else { only_non_absorbed_labels(rest) }
+      if effect_has_default_handler(st, h.eff) {
+        only_non_absorbed_labels(st, rest)
+      } else {
+        [h, ...only_non_absorbed_labels(st, rest)]
+      }
+  }
+}
+
+# Issue #517 — predicate matching the absorbable-by-main set.
+# Stays in sync with the builtin effects injected by
+# `inject_builtin_effects`: the fixed default-handler list from
+# `default_shims_for` (Stdout..Spawn) plus the parametric stdlib
+# effects (State, Reader, Writer) whose handlers are installed by
+# user-written or desugar-generated `with State[T](init) { ... }`
+# wrappers rather than by `emit_main_wrapper`. `Ffi` is excluded
+# (capability tag with no handler — see issue #516). Anything
+# outside this list is either a user-declared effect or a
+# capability-only label and must NOT be absorbed silently by main.
+#
+# The `st` parameter lets the check confirm that the in-scope
+# `effect <name>` declaration matches the runtime's expected op
+# shape (parallels emit-time `effect_default_compatible`): a user-
+# declared `effect Log { trace }` shadows the canonical `Log` and
+# the runtime's default handler is NOT installed, so the label
+# must NOT be absorbed.
+fn effect_has_default_handler(st: InferState, name: String) : Bool {
+  if is_absorbable_stdlib_eff(name) {
+    if user_shadows_default_eff(st, name) { false }
+    else { true }
+  } else { false }
+}
+
+fn is_absorbable_stdlib_eff(name: String) : Bool {
+  if      name == "Stdout"       { true }
+  else if name == "Stderr"       { true }
+  else if name == "Fail"         { true }
+  else if name == "Stdin"        { true }
+  else if name == "Env"          { true }
+  else if name == "File"         { true }
+  else if name == "Clock"        { true }
+  else if name == "Random"       { true }
+  else if name == "SecureRandom" { true }
+  else if name == "NetTcp"       { true }
+  else if name == "Signal"       { true }
+  else if name == "Process"      { true }
+  else if name == "Log"          { true }
+  else if name == "Mutable"      { true }
+  else if name == "Cancel"       { true }
+  else if name == "Link"         { true }
+  else if name == "Monitor"      { true }
+  else if name == "Spawn"        { true }
+  # Parametric stdlib effects — runtime handlers come from user code
+  # or the `var x = init` desugar's `with State[T](init)` wrapper,
+  # not from `emit_main_wrapper`. Absorbing at main is consistent
+  # with the row-arithmetic gap that lets these labels phantom-leak
+  # past their wrapping handlers (`labels_args_unify` is shallow and
+  # cannot rebind a `?fresh` to `Int` when filtering); rejecting
+  # them would break the `var x = init` sugar surface for any
+  # program where `main` is the closest enclosing scope.
+  else if name == "State"        { true }
+  else if name == "Reader"       { true }
+  else if name == "Writer"       { true }
+  else { false }
+}
+
+# True iff an effect `<name>` is declared in the env (so it carries
+# at least one `<name>.<op>` entry) but its op shape diverges from
+# the canonical builtin op list — i.e., the user redeclared
+# `effect <name>` with a different op set. When the user's decl
+# matches every canonical op the default handler is wired up
+# correctly and we treat the effect as absorbed. When ANY canonical
+# op is missing (because the user redeclared `Log` with only
+# `trace`, say) the runtime would not install the default handler:
+# emit-time `effect_default_compatible` filters the label out of
+# `main_row` so no shim is generated. The typer must keep parity.
+fn user_shadows_default_eff(st: InferState, name: String) : Bool {
+  match canonical_eff_ops(name) {
+    None     -> false
+    Some(ops) ->
+      is_effect_in_env(st.env, name) and
+      not env_has_all_eff_ops(st.env, name, ops)
+  }
+}
+
+fn canonical_eff_ops(name: String) : Option[[String]] {
+  expected_default_op_names(name)
+}
+
+fn env_has_all_eff_ops(env: TyEnv, name: String, ops: [String]) : Bool {
+  match ops {
+    [] -> true
+    [op, ...rest] -> {
+      let key = string_concat(name, string_concat(".", op))
+      match ty_env_lookup(env, key) {
+        Some(_) -> env_has_all_eff_ops(env, name, rest)
+        None    -> false
+      }
+    }
+  }
+}
+
+# Issue #517 — walk `main`'s body row reporting any label whose
+# effect lacks an `emit_main_wrapper` default handler. Catches
+# `main : Int / Net` where `Net` is user-declared: nothing installs
+# a handler, the binary segfaults the first time the op runs.
+# `Ffi` is naturally caught here too.
+fn check_main_row_handlable(st: InferState, body_row: [Label],
+                             line: Int, col: Int) : InferState {
+  match body_row {
+    [] -> st
+    [h, ...rest] -> {
+      # Issue #516 — `Ffi` is the capability-only effect that crosses
+      # to C. There is no `emit_main_wrapper` shim for it (by design;
+      # the C ABI is the handler), but declaring it in main's row is
+      # exactly how a program "earns" the right to call extern fns
+      # directly. Treat it as handlable here so `main : Int / Ffi`
+      # still typechecks; the REmpty path keeps rejecting an
+      # undeclared Ffi label so the silent contract from #516 holds.
+      let st1 = if h.eff == "Ffi" or effect_has_default_handler(st, h.eff) { st }
+      else {
+        let use_eu = lookup_eff_use(st.eff_uses, h.eff)
+        match use_eu {
+          EU(_, uline, ucol) -> {
+            let ln = if uline >= 0 { uline } else { line }
+            let cl = if ucol  >= 0 { ucol  } else { col  }
+            let header = string_concat("`main` declares effect `",
+              string_concat(h.eff,
+                "` but no default handler is installed for it"))
+            diag_error(st.file, ln, cl, header)
+            diag_note("only the canonical stdlib effects (Stdout, Stderr, Fail, Stdin, Env, File, Clock, Random, SecureRandom, NetTcp, Signal, Process, Log, Mutable, Cancel, Link, Monitor, Spawn) receive a default handler from the `main` wrapper")
+            diag_note("`#{h.eff}` is either user-declared or a capability-only effect (e.g. `Ffi`); the runtime would have no evidence for it at the top level")
+            diag_help("wrap the body in `handle { ... } with #{h.eff} { ... }` so the effect is closed before reaching `main`'s scope")
+            diag_help("or remove `/ #{h.eff}` from `main`'s declared row if the call site is dead code")
+            st_bump_err(st)
+          }
+        }
+      }
+      check_main_row_handlable(st1, rest, line, col)
+    }
   }
 }
 
