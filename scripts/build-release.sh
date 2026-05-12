@@ -84,10 +84,12 @@ make -C stage2 selfhost >&2
 # libexec/kaikai/kai-pkg — without it, any project with a kai.toml fails
 # with "installation is corrupt" (issue #512). Use the freshly-built kaic2
 # via bin/kai to compile its sources. Force the C backend explicitly:
-# tools/kai-pkg/main.kai uses fs/file.read_bytes which today reaches a
-# runtime symbol (`kai_file_read_bytes`) the LLVM emit path does not
-# declare — tracked as a separate issue. C backend has full runtime
-# coverage; we keep kai-pkg buildable in installed-release mode that way.
+# kai-pkg currently segfaults at runtime under the LLVM backend on
+# subcommands that read deps (`paths`, `install`, …) — root cause not
+# yet diagnosed, tracked as a follow-up to issue #513 (which only
+# closed the static "undefined `@kai_file_read_bytes`" link failure
+# in the LLVM IR emitter). The C path is the safe shipping backend
+# until the runtime gap is fixed.
 echo "==> building kai-pkg"
 KAI_BACKEND=c ./bin/kai build tools/kai-pkg/main.kai -o tools/kai-pkg/kai-pkg >&2
 
