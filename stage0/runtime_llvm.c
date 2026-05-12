@@ -290,6 +290,11 @@ KaiValue *kaix_prelude_write_file(KaiValue *p, KaiValue *c) { return kai_prelude
 KaiValue *kaix_prelude_file_exists(KaiValue *p)             { return kai_prelude_file_exists(p); }
 KaiValue *kaix_prelude_file_delete(KaiValue *p)             { return kai_prelude_file_delete(p); }
 KaiValue *kaix_prelude_file_rename(KaiValue *f, KaiValue *t){ return kai_prelude_file_rename(f, t); }
+/* Issue #513: Array[Byte] file round-trip. Same shape as the
+ * exists/delete/rename wrappers above — the C-side statics live
+ * in runtime.h; the LLVM emit references the `kaix_` names. */
+KaiValue *kaix_prelude_file_read_bytes(KaiValue *p)              { return kai_prelude_file_read_bytes(p); }
+KaiValue *kaix_prelude_file_write_bytes(KaiValue *p, KaiValue *b){ return kai_prelude_file_write_bytes(p, b); }
 KaiValue *kaix_prelude_dir_list_dir(KaiValue *p)            { return kai_prelude_dir_list_dir(p); }
 KaiValue *kaix_prelude_dir_create_dir(KaiValue *p)          { return kai_prelude_dir_create_dir(p); }
 KaiValue *kaix_prelude_dir_remove_dir(KaiValue *p)          { return kai_prelude_dir_remove_dir(p); }
