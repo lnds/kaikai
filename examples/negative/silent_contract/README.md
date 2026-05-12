@@ -18,7 +18,6 @@ contracts yet, so they cannot gate tier1.
 | --- | --- |
 | `pub_fn_mutable_unannotated.kai`, `pub_fn_transitive_effect.kai`, `mutable_op_no_handler_or_row.kai`, `mutable_through_field.kai`, `mutable_param_write_pure_row.kai`, `ffi_call_no_capability.kai` | [#516](https://github.com/lnds/kaikai/issues/516) — qualified-effect calls do not propagate |
 | `handle_residual_effect.kai`, `handle_partial_with_other_effect.kai`, `handle_clause_missing_resume.kai`, `handle_clause_wrong_arity.kai`, `main_row_user_effect.kai` | [#517](https://github.com/lnds/kaikai/issues/517) — handle block: residual effects + clause shape not validated |
-| `tree_collision_via_import/`, `duplicate_type_decl.kai` | [#518](https://github.com/lnds/kaikai/issues/518) — type-name collision via import + dup decl |
 
 ## Migration recipe
 
