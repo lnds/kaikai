@@ -40365,6 +40365,18 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_neg(%KaiValue*)\n",
     "declare %KaiValue* @kaix_pow_int(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_not(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_and(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_or(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_xor(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_not(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_shl(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_shr(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_ushr(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_count(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_test(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_set(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_clear(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_bit_toggle(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_string_concat(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_to_string(%KaiValue*)\n",
     "declare %KaiValue* @kaix_range(%KaiValue*, %KaiValue*)\n",
@@ -42018,6 +42030,27 @@ fn llvm_format_op_arg_regs(regs: [String]) : String {
   }
 }
 
+# m13 bit-op recognition. Matches the same set of names the typer
+# registers as compiler intrinsics (TyEntry table ~line 24265). Used
+# by `llvm_emit_call` to route to `@kaix_bit_*` wrappers in
+# `runtime_llvm.c` instead of falling through to the default
+# `@kai_<name>` symbol that would be unresolved at link time.
+fn llvm_is_bit_intrinsic(nm: String) : Bool {
+  nm == "bit_and"   or nm == "bit_or"    or nm == "bit_xor"  or
+  nm == "bit_not"   or nm == "bit_shl"   or nm == "bit_shr"  or
+  nm == "bit_ushr"  or nm == "bit_count" or nm == "bit_test" or
+  nm == "bit_set"   or nm == "bit_clear" or nm == "bit_toggle"
+}
+
+fn llvm_emit_bit_intrinsic(e: LlvmEmit, nm: String, xs: [Expr]) : LlvmEmit / Console {
+  let sym = string_concat("@kaix_", nm)
+  let ra = llvm_emit_args(e, xs, [])
+  let r = llvm_fresh_reg(ra.st)
+  let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
+                          llvm_format_args(ra.regs), ")\n"])
+  llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+}
+
 fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
   match callee.kind {
     EVar(nm) -> {
@@ -42072,6 +42105,15 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
           }
           _ -> llvm_set_last(e, "undef")
         }
+      } else if llvm_is_bit_intrinsic(nm) {
+        # m13 bit ops are compiler intrinsics. The C backend inlines
+        # each as a statement-expression that reads `_->as.i`, applies
+        # the operator, boxes via `kai_int`, and decrefs the operands
+        # (emit_call_expr ~line 12151). The LLVM backend cannot use
+        # statement-expressions; route each through the matching
+        # `@kaix_bit_*` wrapper declared above, implemented in
+        # `runtime_llvm.c` with the same refcount discipline.
+        llvm_emit_bit_intrinsic(e, nm, xs)
       } else if nm == "__strip_unit" {
         # m12.8 phase 2: identity at runtime — emit the inner value
         # directly. See the matching C-emit branch for full context.
@@ -43356,9 +43398,56 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
       let e1 = llvm_push_local(e, nm, scr)
       llvm_emit_pattern_test(e1, sub, scr, fail_lbl)
     }
+    # Variant with record-style destructuring (`RxParseError { msg, pos }`).
+    # Check the variant tag first, then bind each named field via
+    # @kaix_field. Mirrors emit_pat_test_variant_record in the C path.
+    PVariantRecord(cname, fields) -> {
+      let name_res = llvm_emit_name_constant(e, cname, "var.")
+      let chk = llvm_fresh_reg(name_res.e)
+      let chk_i = concat_all([
+        "  ", chk.reg, " = call i32 @kaix_is_variant(%KaiValue* ", scr,
+        ", i8* ", name_res.gep, ")\n"
+      ])
+      let e1 = llvm_append_body(chk.e, chk_i)
+      let cond = llvm_fresh_reg(e1)
+      let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk.reg, ", 0\n"])
+      let e2 = llvm_append_body(cond.e, cond_i)
+      let e3 = llvm_emit_cond_br_fail(e2, cond.reg, fail_lbl, "pat.vrec.ok.")
+      llvm_emit_pat_record_fields(e3, fields, scr, fail_lbl)
+    }
+    # Bare record pattern (no variant tag). Just bind fields.
+    PRecord(fields) -> llvm_emit_pat_record_fields(e, fields, scr, fail_lbl)
+    # issue #187 phase 3: PNarrow is normally rewritten to PAs+PVariant
+    # before codegen; this arm is defensive. Bind the name like PBind.
+    PNarrow(nm, _) -> llvm_push_local(e, nm, scr)
     _ -> {
       eprint("llvm: pattern kind not supported at #{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
       e
+    }
+  }
+}
+
+# Bind each PField via @kaix_field(scr, "name"). Sub-patterns recurse
+# through llvm_emit_pattern_test so nested PBind/PVariant/PList work.
+# Mirrors emit_pat_binds_record + emit_pat_test_record_fields in the C
+# path (~line 12835), simplified because llvm_emit_pattern_test handles
+# the test+bind in one pass.
+fn llvm_emit_pat_record_fields(e: LlvmEmit, fields: [PField], scr: String,
+                                fail_lbl: String) : LlvmEmit / Console {
+  match fields {
+    [] -> e
+    [pf, ...rest] -> match pf {
+      PField(name, sub, _) -> {
+        let nameinfo = llvm_emit_name_constant(e, name, "fld.")
+        let r = llvm_fresh_reg(nameinfo.e)
+        let instr = concat_all([
+          "  ", r.reg, " = call %KaiValue* @kaix_field(%KaiValue* ", scr,
+          ", i8* ", nameinfo.gep, ")\n"
+        ])
+        let e1 = llvm_append_body(r.e, instr)
+        let e2 = llvm_emit_pattern_test(e1, sub, r.reg, fail_lbl)
+        llvm_emit_pat_record_fields(e2, rest, scr, fail_lbl)
+      }
     }
   }
 }

@@ -51,6 +51,78 @@ KaiValue *kaix_not(KaiValue *a)                { return kai_op_boolnot(a); }
 /* ---------- control helpers ---------- */
 int kaix_truthy(KaiValue *v)                   { return kai_op_truthy(v); }
 
+/* ---------- m13 bit ops ----------
+ * The C backend (stage2/compiler.kai emit_call_expr ~line 12151)
+ * lowers `bit_and(a, b)` etc. to an inline GNU statement-expression
+ * that reads `_a->as.i & _b->as.i`, boxes via `kai_int`, and decrefs
+ * the operands. The LLVM backend cannot use statement-expressions,
+ * so these mirror wrappers do the same operation in a stable
+ * external symbol callable from IR. Caller hands us owned refs and
+ * must release them exactly once — we do that here, matching the C
+ * path's refcount discipline. */
+KaiValue *kaix_bit_and(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_int(a->as.i & b->as.i);
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+KaiValue *kaix_bit_or(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_int(a->as.i | b->as.i);
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+KaiValue *kaix_bit_xor(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_int(a->as.i ^ b->as.i);
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+KaiValue *kaix_bit_not(KaiValue *a) {
+    KaiValue *r = kai_int(~ a->as.i);
+    kai_decref(a);
+    return r;
+}
+KaiValue *kaix_bit_shl(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_int(a->as.i << b->as.i);
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+KaiValue *kaix_bit_shr(KaiValue *a, KaiValue *b) {
+    /* Arithmetic shift: signed `>>` preserves the sign bit. */
+    KaiValue *r = kai_int(a->as.i >> b->as.i);
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+KaiValue *kaix_bit_ushr(KaiValue *a, KaiValue *b) {
+    /* Logical shift: cast through uint64_t to zero-fill. */
+    KaiValue *r = kai_int((int64_t)(((uint64_t) a->as.i) >> b->as.i));
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+KaiValue *kaix_bit_count(KaiValue *a) {
+    KaiValue *r = kai_int((int64_t) __builtin_popcountll((uint64_t) a->as.i));
+    kai_decref(a);
+    return r;
+}
+KaiValue *kaix_bit_test(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_bool(((a->as.i >> b->as.i) & 1) != 0);
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+KaiValue *kaix_bit_set(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_int(a->as.i | ((int64_t)1 << b->as.i));
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+KaiValue *kaix_bit_clear(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_int(a->as.i & ~((int64_t)1 << b->as.i));
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+KaiValue *kaix_bit_toggle(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_int(a->as.i ^ ((int64_t)1 << b->as.i));
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
 /* ---------- issue #87 — Phase 2 unbox boundary readers ----------
  * Mirror of the C backend's `(boxed)->as.i` / `->as.b` / `->as.r` /
  * `->as.c` field reads used by `emit_expr_raw`'s MBoxed boundary
