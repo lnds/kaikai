@@ -16,8 +16,20 @@ contracts yet, so they cannot gate tier1.
 
 | Fixture(s) | Issue |
 | --- | --- |
-| `pub_fn_mutable_unannotated.kai`, `pub_fn_transitive_effect.kai`, `mutable_op_no_handler_or_row.kai`, `mutable_through_field.kai`, `mutable_param_write_pure_row.kai`, `ffi_call_no_capability.kai` | [#516](https://github.com/lnds/kaikai/issues/516) — qualified-effect calls do not propagate |
+| `pub_fn_transitive_effect.kai` | [#516](https://github.com/lnds/kaikai/issues/516) — general transitive-effect propagation through ordinary fn calls (deferred follow-up; see the lane-experience retro for issue #516) |
 | `handle_residual_effect.kai`, `handle_partial_with_other_effect.kai`, `handle_clause_missing_resume.kai`, `handle_clause_wrong_arity.kai`, `main_row_user_effect.kai` | [#517](https://github.com/lnds/kaikai/issues/517) — handle block: residual effects + clause shape not validated |
+
+`pub_fn_mutable_unannotated.kai`, `mutable_op_no_handler_or_row.kai`,
+`mutable_through_field.kai`, `mutable_param_write_pure_row.kai`,
+and `ffi_call_no_capability.kai` closed under #516 — they live in
+their enforced sub-dirs (`pub_effect/`, `mutable/`, `ffi/`) with
+`.err.expected` goldens. `pub_fn_transitive_effect.kai` stays here:
+closing it requires retrofitting ~109 stage2/compiler.kai helpers
+(`diag_*`, `dump_*`, `check_*`, `synth_*`) that currently absorb
+non-capability effects through an open row tail; the lane brief
+for #516 chose to scope the fix to capability-only labels (`Ffi`),
+the qualified-`Mutable`-op masking gap, and `main`'s REmpty/Ffi
+exception. See `docs/lane-experience-issue-516-effect-row-propagation.md`.
 
 ## Migration recipe
 

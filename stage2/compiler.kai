@@ -27307,6 +27307,44 @@ fn st_add_labels(st: InferState, labels: [Label], line: Int, col: Int) : InferSt
   [h, ...rest] -> st_add_labels(st_add_label(st, h, line, col), rest, line, col)
 }
 
+# Issue #516 — propagate capability-only labels from a callee's
+# declared row into the caller's row. Today this is exactly `Ffi`:
+# it carries zero ops, has no default handler installed by
+# `emit_main_wrapper`, and per `docs/design.md` §Baseline
+# architecture must be declared everywhere it crosses to C. Without
+# this propagation, `main : Unit { let _ = puts("hi") }` (where
+# `puts : Int / Ffi` is an `extern "C" fn`) compiles silently —
+# the silent contract documented in
+# `examples/negative/silent_contract/ffi_call_no_capability.kai`.
+#
+# General transitive propagation (every callee label flows up) is
+# the principled long-term answer, but a single-lane rollout would
+# force annotating ~109 internal stage2/compiler.kai helpers
+# (diag_*, dump_*, check_*, synth_*) whose `/ Console` rows are
+# currently absorbed by the caller's open tail var. That retrofit
+# is tracked separately — see
+# `docs/lane-experience-issue-516-effect-row-propagation.md`.
+fn st_propagate_capability_labels(st: InferState, callee_ty: Ty,
+                                   line: Int, col: Int) : InferState {
+  match callee_ty {
+    TyFnT(_, _, row) -> st_add_labels(st, capability_labels_only(row.labels), line, col)
+    _ -> st
+  }
+}
+
+# Filter a label list down to the capability-only effects whose
+# absence in a caller's row is observable at compile time today.
+# Currently a singleton list (`Ffi`). New zero-op capability
+# effects should join the predicate here.
+fn capability_labels_only(labels: [Label]) : [Label] {
+  match labels {
+    [] -> []
+    [h, ...rest] ->
+      if h.eff == "Ffi" { [h, ...capability_labels_only(rest)] }
+      else { capability_labels_only(rest) }
+  }
+}
+
 # True iff `target.eff` matches some label in `row` AND the existing
 # label's ty_args unify with target.ty_args under the current sub.
 # Used as a syntactic-dedup guard; non-unifying same-name labels do not
@@ -28951,11 +28989,24 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
             # whatever residual labels the callee carries; the caller's
             # effect tracking is handled separately by `st_add_label`
             # for op calls.
+            #
+            # Issue #516 — transitive propagation of ALL callee row
+            # labels is intentionally NOT done here. Doing so closes
+            # the `pub_fn_transitive_effect.kai` silent contract but
+            # ripples through stage2/compiler.kai (109+ helpers would
+            # need explicit rows). Capability-only labels (today: Ffi)
+            # ARE propagated via `st_propagate_capability_labels` so
+            # `extern "C" fn ... / Ffi` calls demand `Ffi` in the
+            # caller's row — closing the `ffi_call_no_capability.kai`
+            # silent contract. The general retrofit is tracked in
+            # the lane retro.
             let fr = subst_fresh_row(rv.st.sub)
             let st_fresh = st_set_sub(rv.st, fr.subst)
             let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
             let expected = TyFnT(ra.tys, rv.ty, expected_row)
-            let st2 = st_unify_call(st_fresh, callee, rc.ty, ra.tys, expected, line, col)
+            let st_unif = st_unify_call(st_fresh, callee, rc.ty, ra.tys, expected, line, col)
+            let st2 = st_propagate_capability_labels(st_unif,
+                        apply_ty(st_unif.sub, rc.ty), line, col)
             let ty = apply_ty(st2.sub, rv.ty)
             let root = with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), ty)
             mk_inferred(st2, ty, root)
@@ -29012,7 +29063,10 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                 let st_fresh = st_set_sub(rv.st, fr.subst)
                 let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
                 let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
-                let st2 = st_unify_call(st_fresh, callee, pick.inst_ty, all_arg_tys, expected, line, col)
+                # Issue #516 — propagate capability-only labels only.
+                let st_unif = st_unify_call(st_fresh, callee, pick.inst_ty, all_arg_tys, expected, line, col)
+                let st2 = st_propagate_capability_labels(st_unif,
+                            apply_ty(st_unif.sub, pick.inst_ty), line, col)
                 let ty = apply_ty(st2.sub, rv.ty)
                 # Issue #235: emit `EModCall(<mod>, nm)` so codegen
                 # mints `kai_<mod>__<nm>` directly.
@@ -29523,7 +29577,10 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
               let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
               let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
               let synth_callee = mk_expr(pick.callee_kind, line, col)
-              let st2 = st_unify_call(st_fresh, synth_callee, inst_ty, all_arg_tys, expected, line, col)
+              # Issue #516 — propagate capability-only labels through UFCS.
+              let st_unif = st_unify_call(st_fresh, synth_callee, inst_ty, all_arg_tys, expected, line, col)
+              let st2 = st_propagate_capability_labels(st_unif,
+                          apply_ty(st_unif.sub, inst_ty), line, col)
               let ty = apply_ty(st2.sub, rv.ty)
               let callee_node = with_ty(synth_callee, inst_ty)
               let root = with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty)
@@ -30667,6 +30724,21 @@ fn prelude_effect_for(name: String) : Option[String] {
 #   If every demand is local, `Mutable` is removed from
 #   `st.row` (and from `st.eff_uses` to keep diagnostics
 #   consistent). Otherwise the row is left untouched.
+# Issue #516 — the bare prelude form (`array_set`/`array_grow`) and
+# the qualified `Mutable.array_set`/`Mutable.array_grow` form both
+# raise the `Mutable` demand. `synth_op_call_with_scheme_keys`
+# rewrites the qualified call site's callee to `EVar(<dispatch key>)`
+# where the key is the dotted form, so the local-Array masking walker
+# must recognise either spelling — otherwise it strips `Mutable` on
+# qualified writes whose target is a parameter array.
+fn is_mutable_array_write_name(name: String) : Bool {
+  if name == "array_set" { true }
+  else if name == "array_grow" { true }
+  else if name == "Mutable.array_set" { true }
+  else if name == "Mutable.array_grow" { true }
+  else { false }
+}
+
 fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : InferState {
   if not list_has_label(st.row, "Mutable") { st }
   else {
@@ -31076,9 +31148,16 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
                            params: [String]) : Bool {
   match k {
     ECall(callee, args_) -> {
+      # Issue #516 — recognise both the bare prelude form and the
+      # qualified `Mutable.array_set` / `Mutable.array_grow` form.
+      # `synth_op_call_with_scheme_keys` rewrites the qualified call
+      # site's callee to `EVar("Mutable.array_set")` (the dispatch key),
+      # so without the dotted check this branch falls through to
+      # `here = true` and the surrounding `mask_local_mutable_demand`
+      # strips `Mutable` even when the write targets a parameter array.
       let here = match callee.kind {
         EVar(name) ->
-          if name == "array_set" or name == "array_grow" {
+          if is_mutable_array_write_name(name) {
             demand_is_local(args_, locals, escaped, params)
           } else { true }
         _ -> true
@@ -33583,12 +33662,40 @@ fn check_body_row(st: InferState, fname: String, declared: RowExpr,
       # `fn main() { ... }` without an explicit row absorbs every
       # builtin effect the body performs. Helpers must still declare
       # their row — Bug 6 enforcement still bites where it matters.
-      if fname == "main" { st }
+      #
+      # Issue #516 — `Ffi` is the one builtin that does NOT get a
+      # default handler from `emit_main_wrapper` (it declares zero
+      # ops and is a capability tag, not a handlable effect; per
+      # docs/design.md §Baseline architecture FFI crosses to C via
+      # the Ffi capability). Absorbing it silently would let
+      # `extern "C" fn puts ... / Ffi` called from `main : Unit`
+      # compile cleanly — exactly the silent contract documented in
+      # `examples/negative/silent_contract/ffi_call_no_capability.kai`.
+      # Filter Ffi out of the absorbed set so main must declare
+      # `/ Ffi` explicitly when it performs FFI calls directly.
+      if fname == "main" {
+        check_body_row_label_loop(st, fname, only_non_absorbed_labels(st.row),
+                                  [], line, col)
+      }
       else { check_body_row_label_loop(st, fname, st.row, [], line, col) }
     RClosed(lbs) -> check_body_row_label_loop(st, fname, st.row,
                                                 row_labels_of_rls(lbs),
                                                 line, col)
     ROpen(_, _)  -> st
+  }
+}
+
+# Issue #516 — labels for which `emit_main_wrapper` does NOT install a
+# default handler. Today this is just `Ffi`; if other capability-only
+# effects with zero ops join the catalog they should be listed here
+# too. Filters `Ffi` so main with an undeclared row still rejects
+# direct FFI calls.
+fn only_non_absorbed_labels(row: [Label]) : [Label] {
+  match row {
+    [] -> []
+    [h, ...rest] ->
+      if h.eff == "Ffi" { [h, ...only_non_absorbed_labels(rest)] }
+      else { only_non_absorbed_labels(rest) }
   }
 }
 
