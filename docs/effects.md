@@ -310,7 +310,10 @@ handle { body } with Effect {
   `resume: one-shot, explicit` below).
 - `return(x)` is an optional clause that runs on `body`'s normal
   return path. If absent, the return value of `handle` is the
-  return value of `body`.
+  return value of `body` — identity is the documented default,
+  not an oversight (`docs/decisions/handler-return-clause-optional-2026-05-12.md`).
+  Handlers that transform the body result (e.g. `State[S]` returning
+  `(x, state)`) must write the clause explicitly.
 - Outside the `with` block, `Effect` is no longer in the row.
 
 `handle { body } with Eff { clauses }` is a **control-flow
