@@ -44763,7 +44763,11 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], rs: 
 # `modules` is the module table — one entry per `import` statement
 # at any level of the import graph. Phase 2.3+ uses the table to
 # rewrite `mod.fn` qualified calls; Phase 2.2 only populates it.
-type ExpandedProgram = EP_Mod([Decl], [ModuleEntry])
+# `n_imports` (issue #510) is the count of imported decls at the
+# head of `decls` so `validate_pub_access` can split the flat
+# stream back into "imported from another module" vs "authored
+# in the root file" without re-walking the import graph.
+type ExpandedProgram = EP_Mod([Decl], [ModuleEntry], Int)
 
 # Given a root file's path and its parsed decls, return the flat
 # decl list with every (transitively-)imported module's decls
@@ -44781,8 +44785,10 @@ fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl],
   let base_dir = dir_of(root_path)
   let rs0 = ResolveState { visited: [root_path, ...prelude_paths], decls: [], modules: [] }
   let rs1 = process_imports(base_dir, root_decls, search_paths, rs0)
-  let all_decls = list_append(rs1.decls, non_import_decls(root_decls))
-  EP_Mod(all_decls, rs1.modules)
+  let imports = rs1.decls
+  let n_imports = list_length(imports)
+  let all_decls = list_append(imports, non_import_decls(root_decls))
+  EP_Mod(all_decls, rs1.modules, n_imports)
 }
 
 # ====================================================================
@@ -45829,6 +45835,703 @@ fn strip_import_holes(decls: [Decl], acc: [Decl]) : [Decl] {
     }
   }
 }
+
+# ====================================================================
+# Issue #510 — `pub` enforcement at module + prelude boundaries
+# ====================================================================
+#
+# Pre-issue-#510, `pub` was parsed and stored on every Decl but only
+# consulted by:
+#   - `collect_pub_exports` (filters qualified-call resolution via
+#     `mod.fn` against the module table; `rqc_decls` rejects qualified
+#     calls to non-`pub` names with "module 'X' does not export 'Y'");
+#   - `import_hole_collect_pub_fns` (typed-hole / auto-import hints —
+#     not a visibility control).
+#
+# Bare-name resolution (the `EVar(name)` path that the typer
+# eventually drives through `ty_env_lookup`) had no visibility check.
+# A user-file `lib_private()` call against a prelude/import that
+# defined `fn lib_private()` (no `pub`) compiled cleanly and linked
+# straight through to `kai_lib__lib_private`, even though every
+# convention in `docs/design.md`, `docs/m14-bootstrap-audit.md`, and
+# 672 `pub` lines in `stdlib/` assumed otherwise.
+#
+# This pass closes the gap. It runs after `rqc_decls` rewrites
+# qualified `EField(EVar(mod), fn)` calls into `EModCall(mod, fn)`
+# but before any other downstream walker, so:
+#   - qualified-call visibility is already gated by `me_has_export`
+#     (the existing `rqc_diag_missing_export` diag fires when the
+#     referenced name is non-`pub`);
+#   - bare-name visibility is the gap this pass closes, by walking
+#     every Decl body with a (locals, home_module) tracker and
+#     rejecting `EVar(nm)` references where `nm` is a non-`pub` decl
+#     authored in a different module than the surrounding body.
+#
+# Strict enforcement (no warning grace period) per the v0.54.0
+# release plan: pre-1.0 kaikai has no external users, so one breaking
+# version with a clear migration path is preferable to two transitional
+# ones. The companion stdlib sweep adds `pub` to every internal helper
+# that user-facing code legitimately needs to reach (e.g. helpers that
+# moved here from the root file when modules were factored out, but
+# never had `pub` added back).
+
+# PubAccessEntry records ALL top-level declarations the bare-name
+# resolver might find under a given name, so the validator can
+# decide whether ANY visible decl with that name satisfies the
+# pub-access rule before flagging a reference as private.
+#
+# A referencing site `EVar(nm)` with surrounding home module `H`
+# accepts the name when at least one entry under that name has
+# either `home == H` (same module — always callable) or `is_pub`
+# (public, visible across modules). Only when NO entry satisfies
+# the rule is the reference reported.
+#
+# Two examples this design handles cleanly:
+#
+#   - `pub fn sum` in `stdlib/core/list.kai` plus a non-`pub`
+#     `fn sum` in `demos/euler1/main.kai` produces two entries
+#     under "sum". Inside list.kai a self-call to `sum` matches
+#     the same-home rule; inside the demo it also matches (root
+#     scope). A reference from a third module would still
+#     resolve through the `pub` entry.
+#   - A variant ctor exported from a `pub type T = A | B` and a
+#     same-named ctor from a non-`pub` user type stay distinct;
+#     the typer / `unions` infrastructure disambiguates by
+#     receiver type. Validation only refuses references where
+#     EVERY candidate entry is private to a foreign module.
+type PubAccessEntry = PAE(String, String, Bool)
+#                          name    home    is_pub
+
+# Build the table of every top-level declaration in the merged
+# decl stream. Each entry records the decl's name, the module
+# it was authored in, and whether it is `pub`. The validator
+# consults the full table per reference so a non-`pub` decl in
+# one module is admissible if another decl with the same name
+# is visible (same-home or `pub`).
+#
+# Skipped: `DImport` (no name), `DTest` / `DBench` / `DCheck`
+# (no surface names that can be referenced).
+#
+# DAttribPure / DDerive wrap an inner Decl whose name + pub-ness
+# drive the decision; we delegate to a recursive sub-walk.
+# DImpl's method DFns are walked too because variant-class
+# protocol methods are looked up by name on the typer side.
+fn collect_priv_decls(decls: [Decl], target_mod: String,
+                       acc: [PubAccessEntry]) : [PubAccessEntry] =
+  collect_priv_decls_loop(decls, target_mod, target_mod, acc)
+
+# DType / DEffect / DProtocol / DUnit / DConst / DAxiom carry no
+# `module_origin` field in v1 of issue #510, so we recover the
+# home module by streaming the flat decl list: every DFn (or
+# DAttribPure(DFn), or DAxiom-already-lowered) carries `mo`, and
+# whatever comes between them shares that module. The decl stream
+# arrives in source order — prelude files first (each emitting a
+# contiguous block) and finally the target file — so the most-
+# recently-seen tagged DFn's `mo` is the right home for an
+# untagged neighbour. When a DFn carries `mo = None` (the parser
+# default for root-file decls AND for non-`pub` root-file decls
+# after `tag_target_decls_module_origin`'s pub-only carve-out), we
+# reset `cur_mod` back to `target_mod` so the next untagged DType
+# in the root file is not mistakenly attributed to the last
+# prelude module we saw.
+fn collect_priv_decls_loop(decls: [Decl], target_mod: String,
+                              cur_mod: String, acc: [PubAccessEntry])
+                              : [PubAccessEntry] = match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
+      let acc1 = priv_one(d, next_mod, acc)
+      collect_priv_decls_loop(rest, target_mod, next_mod, acc1)
+    }
+  }
+
+# When a DFn carries `mo = Some(m)`, switch the running home to
+# `m`. When it carries `mo = None` (root-file decl after the
+# pub-only `tag_target_decls_module_origin`), reset to
+# `target_mod` — the last seen tagged DFn was in a prelude, and
+# the present untagged DFn marks the start of the root file.
+fn decl_home_hint_reset(d: Decl, cur_mod: String, target_mod: String) : String =
+  match d {
+    DFn(_, _, _, _, _, _, _, _, _, mo) -> match mo {
+      Some(m) -> m
+      None    -> target_mod
+    }
+    # DAxiom is the bare-form `extern "C" fn` / `axiom` shape that
+    # `lower_axioms` rewrites to DFn later. It carries no
+    # `module_origin` field, so a root-file DAxiom (e.g. `extern
+    # "C" fn abs(n: Int) : Int / Ffi` inside an examples/effects
+    # fixture) would otherwise inherit the last prelude's home.
+    # Reset to `target_mod` instead — this is symmetric to the
+    # DFn(None) reset above and matches the codegen's
+    # `tag_target_decls_module_origin` carve-out.
+    DAxiom(_, _, _, _, _, _, _, _, _, _) -> target_mod
+    DAttribPure(inner, _, _)        -> decl_home_hint_reset(inner, cur_mod, target_mod)
+    DDerive(_, inner, _, _)         -> decl_home_hint_reset(inner, cur_mod, target_mod)
+    DImpl(_, _, _, sub_decls, _, _) -> impl_home_hint_reset(sub_decls, cur_mod, target_mod)
+    _ -> cur_mod
+  }
+
+fn impl_home_hint_reset(ms: [Decl], cur_mod: String, target_mod: String) : String =
+  match ms {
+    [] -> cur_mod
+    [m, ...rest] -> match m {
+      DFn(_, _, _, _, _, _, _, _, _, mo) -> match mo {
+        Some(mm) -> mm
+        None     -> target_mod
+      }
+      _ -> impl_home_hint_reset(rest, cur_mod, target_mod)
+    }
+  }
+
+# Pick the home-module hint for the next decl based on this decl's
+# `module_origin` field (if any). DFn / DAxiom carry `mo`;
+# DAttribPure / DDerive / DImpl wrap an inner Decl whose `mo` is
+# the real source. Anything else inherits the running cur_mod
+# (which started at target_mod).
+fn decl_home_hint(d: Decl, cur_mod: String) : String = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> home_of(mo, cur_mod)
+  DAxiom(_, _, _, _, _, _, _, _, _, _) -> cur_mod
+  DAttribPure(inner, _, _)             -> decl_home_hint(inner, cur_mod)
+  DDerive(_, inner, _, _)              -> decl_home_hint(inner, cur_mod)
+  DImpl(_, _, _, sub_decls, _, _)      -> impl_home_hint(sub_decls, cur_mod)
+  _ -> cur_mod
+}
+
+# Peek into the first DFn method of a DImpl to pick up the impl's
+# home module. `tag_decl_module_origin`'s DImpl arm propagates
+# `mo` to every method, so any method works; pick the first.
+fn impl_home_hint(ms: [Decl], cur_mod: String) : String = match ms {
+  [] -> cur_mod
+  [m, ...rest] -> match m {
+    DFn(_, _, _, _, _, _, _, _, _, mo) -> home_of(mo, cur_mod)
+    _ -> impl_home_hint(rest, cur_mod)
+  }
+}
+
+fn priv_one(d: Decl, home_mod: String, acc: [PubAccessEntry]) : [PubAccessEntry] =
+  match d {
+    DFn(is_pub, name, _, _, _, _, _, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DAxiom(is_pub, _, name, _, _, _, _, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DConst(is_pub, name, _, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DType(is_pub, name, _, body, _, _) ->
+      pae_with_variants(name, body, home_mod, is_pub, acc)
+    DEffect(is_pub, name, _, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DProtocol(is_pub, name, _, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DUnit(is_pub, name, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DAttribPure(inner, _, _) -> priv_one(inner, home_mod, acc)
+    DDerive(_, inner, _, _)  -> priv_one(inner, home_mod, acc)
+    # Issue #510 — DImpl method bodies. A `impl P for T { fn op(...)
+    # = body }` makes `op` callable cross-module through the protocol
+    # dispatcher; the method itself has no surface `pub` marker.
+    # Register every method as `is_pub = true` so a bare-name `op(x)`
+    # in another module is not flagged as private just because the
+    # `impl`-author did not write `pub` on the method head. The
+    # protocol type declaration (`pub protocol P { ... }`) still
+    # controls whether `P` itself is exported; this rule covers the
+    # impl methods only.
+    DImpl(_, _, _, sub_decls, _, _) ->
+      impl_methods_pub(sub_decls, home_mod, acc)
+    _ -> acc
+  }
+
+fn impl_methods_pub(ms: [Decl], home_mod: String,
+                      acc: [PubAccessEntry]) : [PubAccessEntry] = match ms {
+  [] -> acc
+  [m, ...rest] -> match m {
+    DFn(_, name, _, _, _, _, _, _, _, _) ->
+      impl_methods_pub(rest, home_mod, [PAE(name, home_mod, true), ...acc])
+    _ -> impl_methods_pub(rest, home_mod, acc)
+  }
+}
+
+fn home_of(mo: Option[String], target_mod: String) : String = match mo {
+  Some(m) -> m
+  None    -> target_mod
+}
+
+# A sum type's variant ctors share the type's `pub` status: a
+# `pub type T = A | B` exports both the type name AND every ctor;
+# a non-`pub` `type T = A | B` keeps both private. Record one
+# PubAccessEntry per ctor under the type's home module so the
+# validator can apply the same accept-if-any-visible rule.
+fn pae_with_variants(name: String, body: TypeBody, mod: String,
+                       is_pub: Bool, acc: [PubAccessEntry]) : [PubAccessEntry] =
+  match body {
+    TBSum(vs) -> pae_variants(vs, mod, is_pub,
+                                [PAE(name, mod, is_pub), ...acc])
+    _         -> [PAE(name, mod, is_pub), ...acc]
+  }
+
+fn pae_variants(vs: [Variant], mod: String, is_pub: Bool,
+                  acc: [PubAccessEntry]) : [PubAccessEntry] = match vs {
+  [] -> acc
+  [v, ...rest] -> match v {
+    Var(cname, _) -> pae_variants(rest, mod, is_pub,
+                                    [PAE(cname, mod, is_pub), ...acc])
+  }
+}
+
+# Decision routine — given the full table, the referenced name and
+# the surrounding home module, return:
+#   - `Visible` when at least one entry under `name` is admissible
+#     (same-home, or `pub`),
+#   - `PrivateTo(other_home)` when every entry sits in another
+#     module AND is non-`pub` (the diagnostic prints the first
+#     such home as the offending module),
+#   - `Unknown` when no entry exists for the name (typer reports
+#     "cannot find" separately).
+type PubAccessVerdict
+  = Visible
+  | PrivateTo(String)
+  | Unknown
+
+fn pae_decide(table: [PubAccessEntry], name: String, home: String) : PubAccessVerdict =
+  pae_decide_loop(table, name, home, None)
+
+fn pae_decide_loop(table: [PubAccessEntry], name: String, home: String,
+                     first_private: Option[String]) : PubAccessVerdict =
+  match table {
+    [] -> match first_private {
+      Some(m) -> PrivateTo(m)
+      None    -> Unknown
+    }
+    [e, ...rest] -> match e {
+      PAE(n, h, p) ->
+        if n == name {
+          if h == home or p { Visible }
+          else {
+            let fp = match first_private {
+              Some(_) -> first_private
+              None    -> Some(h)
+            }
+            pae_decide_loop(rest, name, home, fp)
+          }
+        } else {
+          pae_decide_loop(rest, name, home, first_private)
+        }
+    }
+  }
+
+# Walk every Decl body and report each `EVar(nm)` non-local reference
+# whose name belongs to a non-`pub` decl in a different module than
+# the surrounding decl. Returns the number of violations reported.
+#
+# The locals tracker mirrors `rqc_decls` exactly: fn params, lambda
+# params, let/var patterns, match-arm patterns, handle clause params,
+# and `with ... as alias` aliases all extend the visible-name set.
+# A name in scope as a local always wins (Rule B in `rqc_decls`).
+# `take` / `drop` from `stdlib/core/list.kai` are not available
+# while building stage 1 (stage 0 has no prelude); use these
+# decl-list-specific helpers instead. Issue #510 is the only
+# caller, so the names stay private.
+fn pae_take(xs: [Decl], n: Int) : [Decl] = match xs {
+  [] -> []
+  [h, ...t] -> if n <= 0 { [] } else { [h, ...pae_take(t, n - 1)] }
+}
+
+fn pae_drop(xs: [Decl], n: Int) : [Decl] = match xs {
+  [] -> []
+  [h, ...t] -> if n <= 0 { [h, ...t] } else { pae_drop(t, n - 1) }
+}
+
+fn validate_pub_access(prelude_segs: [PreludeSegment],
+                         qualified_prelude: [Decl],
+                         imports_decls: [Decl], root_decls: [Decl],
+                         target_mod: String,
+                         file: String) : Int / Console = {
+  let table = collect_pub_access_table(prelude_segs, imports_decls,
+                                          root_decls, target_mod)
+  let e1 = vpa_decls_loop(qualified_prelude, table, target_mod,
+                             target_mod, file, 0)
+  let e2 = vpa_decls_loop(imports_decls, table, target_mod,
+                             target_mod, file, e1)
+  vpa_decls_loop(root_decls, table, target_mod, target_mod, file, e2)
+}
+
+fn collect_pub_access_table(prelude_segs: [PreludeSegment],
+                              imports_decls: [Decl], root_decls: [Decl],
+                              target_mod: String) : [PubAccessEntry] = {
+  let acc0 = cpa_segs(prelude_segs, [])
+  # For imports, the first tagged DFn in the segment hints the
+  # home for any preceding untagged DType / DEffect / DProtocol /
+  # DUnit (which carry no `module_origin` of their own). Compute
+  # the per-decl home via a tag-anchor lookahead and feed each
+  # entry into `priv_one` directly.
+  let imports_homes = imports_home_anchors(imports_decls, target_mod,
+                                              target_mod, [])
+  let acc1 = cpa_with_homes(imports_decls, imports_homes, acc0)
+  let acc2 = cpa_seg(root_decls, target_mod, target_mod, acc1)
+  list_reverse(acc2)
+}
+
+# For each decl in `ds`, return the home module it should be
+# attributed to. Algorithm: scan left-to-right; when a DFn/DAxiom
+# with `mo=Some(m)` lands, retroactively assign `m` to every
+# preceding decl that was attributed to the running `cur_mod` and
+# update the running home to `m`. The result is a list of homes
+# in source order — one per decl.
+fn imports_home_anchors(ds: [Decl], target_mod: String, cur_mod: String,
+                          acc: [String]) : [String] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> {
+    let hint = decl_home_hint_reset(d, cur_mod, target_mod)
+    # If this decl explicitly carries `Some(m)`, propagate `m`
+    # backward to any prior entries still tagged with the previous
+    # `cur_mod` (so a DType at the head of the import inherits
+    # the first DFn's mod). For decls already tagged we keep
+    # their existing home.
+    let explicit = decl_explicit_home(d)
+    let acc1 = match explicit {
+      Some(m) -> propagate_home_back(acc, cur_mod, m, [])
+      None    -> acc
+    }
+    let mine = match explicit {
+      Some(m) -> m
+      None    -> hint
+    }
+    imports_home_anchors(rest, target_mod, mine, [mine, ...acc1])
+  }
+}
+
+fn decl_explicit_home(d: Decl) : Option[String] = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
+  DAttribPure(inner, _, _)        -> decl_explicit_home(inner)
+  DDerive(_, inner, _, _)         -> decl_explicit_home(inner)
+  DImpl(_, _, _, sub_decls, _, _) -> impl_first_fn_home(sub_decls)
+  _ -> None
+}
+
+fn impl_first_fn_home(ms: [Decl]) : Option[String] = match ms {
+  [] -> None
+  [m, ...rest] -> match m {
+    DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
+    _ -> impl_first_fn_home(rest)
+  }
+}
+
+# Walk `acc` (reversed source order — newest first) and replace
+# every running entry equal to `prev` with `new`, stopping at the
+# first entry that already differs (those belong to a previous
+# anchored module). Returns the list still in reversed order.
+fn propagate_home_back(acc: [String], prev: String, new: String,
+                         done: [String]) : [String] = match acc {
+  [] -> done
+  [h, ...rest] ->
+    if h == prev { propagate_home_back(rest, prev, new, [new, ...done]) }
+    else { append_reverse(done, [h, ...rest]) }
+}
+
+fn append_reverse(a: [String], b: [String]) : [String] = match a {
+  [] -> b
+  [h, ...rest] -> append_reverse(rest, [h, ...b])
+}
+
+# Drive `priv_one` per decl using the pre-computed home list.
+fn cpa_with_homes(ds: [Decl], homes: [String],
+                    acc: [PubAccessEntry]) : [PubAccessEntry] =
+  match ds {
+    [] -> acc
+    [d, ...rest_d] -> match homes {
+      [] -> acc
+      [h, ...rest_h] -> {
+        let acc1 = priv_one(d, h, acc)
+        cpa_with_homes(rest_d, rest_h, acc1)
+      }
+    }
+  }
+
+# Tabulate every prelude segment with its file's mod name as the
+# initial cur_mod. Each PSeg(mod, decls) walks its decls starting
+# from `mod`, so the first DType in the file is attributed to
+# that file's mod even when the previous segment ended with a
+# differently-tagged DFn.
+fn cpa_segs(segs: [PreludeSegment], acc: [PubAccessEntry]) : [PubAccessEntry] =
+  match segs {
+    [] -> acc
+    [s, ...rest] -> match s {
+      PSeg(mod_name, decls) -> {
+        let acc1 = cpa_seg(decls, mod_name, mod_name, acc)
+        cpa_segs(rest, acc1)
+      }
+    }
+  }
+
+fn cpa_seg(decls: [Decl], target_mod: String, cur_mod: String,
+             acc: [PubAccessEntry]) : [PubAccessEntry] = match decls {
+  [] -> acc
+  [d, ...rest] -> {
+    let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
+    let acc1 = priv_one(d, next_mod, acc)
+    cpa_seg(rest, target_mod, next_mod, acc1)
+  }
+}
+
+# Mirrors `collect_priv_decls_loop`'s streaming hint logic so the
+# per-decl `vpa_decl` walker sees the right home module for any
+# DFn whose `mo` field happens to be `None` (root file no-pub
+# decls and a few wrappers).
+
+fn vpa_decls(decls: [Decl], table: [PubAccessEntry], target_mod: String,
+               file: String, errs: Int) : Int / Console =
+  vpa_decls_loop(decls, table, target_mod, target_mod, file, errs)
+
+fn vpa_decls_loop(decls: [Decl], table: [PubAccessEntry],
+                    target_mod: String, cur_mod: String,
+                    file: String, errs: Int) : Int / Console = match decls {
+  [] -> errs
+  [d, ...rest] -> {
+    let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
+    let e1 = errs + vpa_decl(d, table, next_mod, target_mod, file)
+    vpa_decls_loop(rest, table, target_mod, next_mod, file, e1)
+  }
+}
+
+fn vpa_decl(d: Decl, table: [PubAccessEntry], home: String,
+              target_mod: String, file: String) : Int / Console = match d {
+  DFn(_, _, _, params, _, _, body, _, _, _) ->
+    vpa_expr(body, fn_param_names(params), table, home, file, 0)
+  DTest(_, body, _, _) ->
+    vpa_expr(body, [], table, target_mod, file, 0)
+  DBench(_, body, _, _) ->
+    vpa_expr(body, [], table, target_mod, file, 0)
+  DCheck(_, ps, body, _, _) ->
+    vpa_expr(body, fn_param_names(ps), table, target_mod, file, 0)
+  DImpl(_, _, _, sub_decls, _, _) ->
+    vpa_decls_loop(sub_decls, table, target_mod, home, file, 0)
+  DDerive(_, inner, _, _) ->
+    vpa_decl(inner, table, home, target_mod, file)
+  DAttribPure(inner, _, _) ->
+    vpa_decl(inner, table, home, target_mod, file)
+  _ -> 0
+}
+
+fn vpa_expr(e: Expr, locals: [String], table: [PubAccessEntry],
+              home: String, file: String, errs: Int) : Int / Console =
+  vpa_kind(e, locals, table, home, file, errs)
+
+fn vpa_kind(e: Expr, locals: [String], table: [PubAccessEntry],
+              home: String, file: String, errs: Int) : Int / Console =
+  match e.kind {
+    EVar(nm) ->
+      if list_has(locals, nm) { errs }
+      else {
+        match pae_decide(table, nm, home) {
+          Visible      -> errs
+          PrivateTo(m) -> { vpa_diag(file, nm, m, e.line, e.col); errs + 1 }
+          Unknown      -> errs
+        }
+      }
+    ECall(callee, args_) -> {
+      let e1 = vpa_expr(callee, locals, table, home, file, errs)
+      vpa_exprs(args_, locals, table, home, file, e1)
+    }
+    EField(obj, _) -> vpa_expr(obj, locals, table, home, file, errs)
+    EIndex(coll, ix) -> {
+      let e1 = vpa_expr(coll, locals, table, home, file, errs)
+      vpa_expr(ix, locals, table, home, file, e1)
+    }
+    EBinop(_, l, r) -> {
+      let e1 = vpa_expr(l, locals, table, home, file, errs)
+      vpa_expr(r, locals, table, home, file, e1)
+    }
+    EUnop(_, x) -> vpa_expr(x, locals, table, home, file, errs)
+    EIf(c, t_, eo) -> {
+      let e1 = vpa_expr(c, locals, table, home, file, errs)
+      let e2 = vpa_expr(t_, locals, table, home, file, e1)
+      match eo {
+        Some(el) -> vpa_expr(el, locals, table, home, file, e2)
+        None     -> e2
+      }
+    }
+    EMatch(scr, arms) -> {
+      let e1 = vpa_expr(scr, locals, table, home, file, errs)
+      vpa_arms(arms, locals, table, home, file, e1)
+    }
+    ELambda(ps, body) ->
+      vpa_expr(body, list_append(locals, fn_param_names(ps)),
+                 table, home, file, errs)
+    ERecordLit(_, fis) -> vpa_fis(fis, locals, table, home, file, errs)
+    EList(els) -> vpa_elems(els, locals, table, home, file, errs)
+    ERange(lo, hi, stp) -> {
+      let e1 = vpa_expr(lo, locals, table, home, file, errs)
+      let e2 = vpa_expr(hi, locals, table, home, file, e1)
+      match stp {
+        Some(s) -> vpa_expr(s, locals, table, home, file, e2)
+        None    -> e2
+      }
+    }
+    EBlock(stmts, tail) -> {
+      let r = vpa_stmts(stmts, locals, table, home, file, errs)
+      match tail {
+        Some(fe) -> vpa_expr(fe, r.bound, table, home, file, r.errs)
+        None     -> r.errs
+      }
+    }
+    EPipe(lhs, rhs) -> {
+      let e1 = vpa_expr(lhs, locals, table, home, file, errs)
+      vpa_expr(rhs, locals, table, home, file, e1)
+    }
+    EMapPipe(lhs, rhs) -> {
+      let e1 = vpa_expr(lhs, locals, table, home, file, errs)
+      vpa_expr(rhs, locals, table, home, file, e1)
+    }
+    EFlatMapPipe(lhs, rhs) -> {
+      let e1 = vpa_expr(lhs, locals, table, home, file, errs)
+      vpa_expr(rhs, locals, table, home, file, e1)
+    }
+    EFilterPipe(lhs, rhs) -> {
+      let e1 = vpa_expr(lhs, locals, table, home, file, errs)
+      vpa_expr(rhs, locals, table, home, file, e1)
+    }
+    EBang(inner) -> vpa_expr(inner, locals, table, home, file, errs)
+    ELitUnit(inner, _) -> vpa_expr(inner, locals, table, home, file, errs)
+    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
+      let e1 = vpa_expr(body, locals, table, home, file, errs)
+      let e2 = match init_opt {
+        Some(ie) -> vpa_expr(ie, locals, table, home, file, e1)
+        None     -> e1
+      }
+      let inner = match alias_opt { Some(a) -> [a, ...locals] None -> locals }
+      let e3 = vpa_hclauses(clauses, inner, table, home, file, e2)
+      match ret_opt {
+        Some(r) -> vpa_hreturn(r, inner, table, home, file, e3)
+        None    -> e3
+      }
+    }
+    # Leaves and resolved-call shapes — no sub-expressions to walk
+    # for pub access. EModCall already has its `pub` check applied by
+    # `rqc_decls` (qualified calls to non-`pub` names produce
+    # "module X does not export Y" before this pass runs).
+    _ -> errs
+  }
+
+fn vpa_exprs(xs: [Expr], locals: [String], table: [PubAccessEntry],
+               home: String, file: String, errs: Int) : Int / Console =
+  match xs {
+    [] -> errs
+    [x, ...rest] -> vpa_exprs(rest, locals, table, home, file,
+                                vpa_expr(x, locals, table, home, file, errs))
+  }
+
+fn vpa_arms(arms: [Arm], locals: [String], table: [PubAccessEntry],
+              home: String, file: String, errs: Int) : Int / Console =
+  match arms {
+    [] -> errs
+    [a, ...rest] -> match a {
+      Arm(pat, guard, body) -> {
+        let inner = pat_binders(pat, locals)
+        let e1 = match guard {
+          Some(g) -> vpa_expr(g, inner, table, home, file, errs)
+          None    -> errs
+        }
+        let e2 = vpa_expr(body, inner, table, home, file, e1)
+        vpa_arms(rest, locals, table, home, file, e2)
+      }
+    }
+  }
+
+fn vpa_fis(fis: [FieldInit], locals: [String], table: [PubAccessEntry],
+             home: String, file: String, errs: Int) : Int / Console =
+  match fis {
+    [] -> errs
+    [fi, ...rest] -> match fi {
+      FI(_, v) -> vpa_fis(rest, locals, table, home, file,
+                            vpa_expr(v, locals, table, home, file, errs))
+    }
+  }
+
+fn vpa_elems(els: [ListElem], locals: [String], table: [PubAccessEntry],
+               home: String, file: String, errs: Int) : Int / Console =
+  match els {
+    [] -> errs
+    [el, ...rest] -> {
+      let e1 = match el {
+        ElPlain(x)  -> vpa_expr(x, locals, table, home, file, errs)
+        ElSpread(x) -> vpa_expr(x, locals, table, home, file, errs)
+      }
+      vpa_elems(rest, locals, table, home, file, e1)
+    }
+  }
+
+type VpaStmtsAcc = { bound: [String], errs: Int }
+
+fn vpa_stmts(stmts: [Stmt], locals: [String], table: [PubAccessEntry],
+               home: String, file: String, errs: Int) : VpaStmtsAcc / Console =
+  match stmts {
+    [] -> VpaStmtsAcc { bound: locals, errs: errs }
+    [s, ...rest] -> {
+      let r = vpa_stmt(s, locals, table, home, file, errs)
+      vpa_stmts(rest, r.bound, table, home, file, r.errs)
+    }
+  }
+
+fn vpa_stmt(s: Stmt, locals: [String], table: [PubAccessEntry],
+              home: String, file: String, errs: Int) : VpaStmtsAcc / Console =
+  match s {
+    SLet(pat, _, e) -> {
+      let e1 = vpa_expr(e, locals, table, home, file, errs)
+      VpaStmtsAcc { bound: pat_binders(pat, locals), errs: e1 }
+    }
+    SAssert(cond, opt_msg) -> {
+      let e1 = vpa_expr(cond, locals, table, home, file, errs)
+      let e2 = match opt_msg {
+        Some(m) -> vpa_expr(m, locals, table, home, file, e1)
+        None    -> e1
+      }
+      VpaStmtsAcc { bound: locals, errs: e2 }
+    }
+    SExprStmt(e) -> {
+      let e1 = vpa_expr(e, locals, table, home, file, errs)
+      VpaStmtsAcc { bound: locals, errs: e1 }
+    }
+    # `desugar_index_assign` / `desugar_var_decls` rewrite these
+    # before the validator runs; cover them defensively in case the
+    # pass order ever changes. The RHS expressions get walked; the
+    # locals set is unchanged.
+    SIndexAssign(obj, ix, v, _, _) -> {
+      let e1 = vpa_expr(obj, locals, table, home, file, errs)
+      let e2 = vpa_expr(ix, locals, table, home, file, e1)
+      let e3 = vpa_expr(v, locals, table, home, file, e2)
+      VpaStmtsAcc { bound: locals, errs: e3 }
+    }
+    SVar(name, _, init, _, _) -> {
+      let e1 = vpa_expr(init, locals, table, home, file, errs)
+      VpaStmtsAcc { bound: [name, ...locals], errs: e1 }
+    }
+    SUse(_, _, _) -> VpaStmtsAcc { bound: locals, errs: errs }
+  }
+
+fn vpa_hclauses(cs: [HClause], locals: [String], table: [PubAccessEntry],
+                  home: String, file: String, errs: Int) : Int / Console =
+  match cs {
+    [] -> errs
+    [c, ...rest] -> match c {
+      HC(_, params, body, _, _) -> {
+        let inner = list_append(locals, fn_param_names(params))
+        let e1 = vpa_expr(body, inner, table, home, file, errs)
+        vpa_hclauses(rest, locals, table, home, file, e1)
+      }
+    }
+  }
+
+fn vpa_hreturn(r: HReturn, locals: [String], table: [PubAccessEntry],
+                 home: String, file: String, errs: Int) : Int / Console =
+  match r {
+    HR(pname, body, _, _) ->
+      vpa_expr(body, [pname, ...locals], table, home, file, errs)
+  }
+
+fn vpa_diag(file: String, name: String, decl_home: String,
+              line: Int, col: Int) : Unit / Console =
+  diag_error(file, line, col,
+    concat_all(["`", name, "` is private to module `", decl_home,
+                "`; mark the declaration `pub` or call it through a qualified path"]))
 
 # ====================================================================
 # m12.8 — single-dispatch protocols
@@ -51155,6 +51858,25 @@ fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
   # in place here so the produced DFn picks up the same `Some(mod)`
   # stamp the DFn arm above writes.
   DAxiom(_, _, _, _, _, _, _, _, _, _) -> tag_decl_module_origin(lower_axiom_one(d), mod)
+  # Issue #510: lower DConst in place and tag the synthesised DFn so
+  # `pub` enforcement sees a const's home module the same way it
+  # sees a function's. Without this carve-out `lower_consts` (which
+  # runs later in `compile_source`) produces a `DFn(...None)`,
+  # which `validate_pub_access_decls` then treats as "authored in
+  # the root file" — causing every prelude-internal const reference
+  # to look like a cross-module bare-name access. Mirrors the
+  # DAxiom precedent above.
+  DConst(_, _, _, _, _, _) -> tag_decl_module_origin(lower_const_one(d), mod)
+  # Issue #510: DImpl wraps a list of DFn method bodies. Without
+  # tagging the inner methods, `validate_pub_access_decls` would
+  # treat their home module as the root file's basename and flag
+  # every bare-name reference to a non-`pub` helper authored in
+  # the same prelude (e.g. `show_char_ascii_table` inside
+  # `impl Show for Char`). Recurse so each method's `mo` matches
+  # the enclosing prelude.
+  DImpl(name, proto_args, target, sub_decls, l, c) ->
+    DImpl(name, proto_args, target,
+          tag_decls_module_origin(sub_decls, mod), l, c)
   _ -> d
 }
 
@@ -51204,17 +51926,32 @@ fn tag_target_decl(d: Decl, mod: String) : Decl = match d {
   _ -> d
 }
 
-type PreludesLoaded = PLS([Decl], [ModuleEntry])
+# Issue #510 — `segments` retains the per-file `(mod_name, decls)`
+# split so the pub-access validator can treat each prelude as its
+# own home module. Without this, the flat `decls` append loses
+# the boundary between prelude files and a DType / DEffect at the
+# head of one prelude inherits the previous prelude's tagged
+# module via the streaming hint.
+type PreludesLoaded = PLS([Decl], [ModuleEntry], [PreludeSegment])
+type PreludeSegment = PSeg(String, [Decl])
 
 # Load every prelude file in `paths`, concatenating their decls in
 # argument order and accumulating one ModuleEntry per file. Returns
 # None if any single load fails. Empty list yields Some(PLS([], [])).
-fn load_preludes(paths: [String], include_tests: Bool, acc_decls: [Decl], acc_mods: [ModuleEntry]) : Option[PreludesLoaded] = match paths {
-  [] -> Some(PLS(acc_decls, acc_mods))
+fn load_preludes(paths: [String], include_tests: Bool, acc_decls: [Decl],
+                   acc_mods: [ModuleEntry], acc_segs: [PreludeSegment])
+                   : Option[PreludesLoaded] = match paths {
+  [] -> Some(PLS(acc_decls, acc_mods, acc_segs))
   [p, ...rest] -> match load_prelude(p, include_tests) {
     None -> None
     Some(pl) -> match pl {
-      PL(ds, me) -> load_preludes(rest, include_tests, list_append(acc_decls, ds), list_append(acc_mods, [me]))
+      PL(ds, me) -> {
+        let mod_name = match me { ME(m, _, _) -> m }
+        load_preludes(rest, include_tests,
+                       list_append(acc_decls, ds),
+                       list_append(acc_mods, [me]),
+                       list_append(acc_segs, [PSeg(mod_name, ds)]))
+      }
     }
   }
 }
@@ -53227,7 +53964,7 @@ fn dump_diags_json(file: String, decls: [Decl]) : Int / Console {
 
 # ============================================================
 
-fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry]) : Int / Console {
+fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment]) : Int / Console {
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
   match mode {
@@ -53280,7 +54017,8 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # same file twice.
             let prelude_paths = collect_module_origins(prelude_mods, [])
             let expanded = expand_imports(path, search_paths, own_decls_no_holes, prelude_paths)
-            let expanded_decls_raw = match expanded { EP_Mod(ds, _) -> ds }
+            let expanded_decls_raw = match expanded { EP_Mod(ds, _, _) -> ds }
+            let n_imports_raw = match expanded { EP_Mod(_, _, n) -> n }
             # Issue #230: register the target file itself in the module
             # table under its own basename, mirroring what `load_prelude`
             # does for `--prelude` files. Without this, an intrinsic
@@ -53309,7 +54047,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # target's own ME comes last so its bare name shadows any
             # same-named prelude (intentional: the file is "itself").
             let module_table = list_append(
-              list_append(prelude_mods, match expanded { EP_Mod(_, mt) -> mt }),
+              list_append(prelude_mods, match expanded { EP_Mod(_, mt, _) -> mt }),
               [target_me])
             # Issue #216: `--prelude` files used to bypass `rqc_decls`
             # — they were merged in raw, so `list.foo` calls inside a
@@ -53343,6 +54081,41 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             let qualified_prelude = rqc_decls(qt_prelude, module_table, path)
             let qualified_decls = rqc_decls(qt_expanded, module_table, path)
             let merged_raw = list_append(qualified_prelude, qualified_decls)
+            # Issue #510 — `pub` enforcement at module + prelude
+            # boundaries. After `rqc_decls` has rewritten every
+            # `EField(EVar(mod), fn)` into `EModCall(mod, fn)`
+            # (which carries qualified-export gating via
+            # `me_has_export`), the remaining `EVar(nm)` bare-name
+            # references are unqualified lookups. The validator
+            # consumes the prelude / import / root decl streams
+            # as three contiguous segments so the home-module
+            # tracker can reset cleanly at each boundary —
+            # untagged DType / DEffect decls at the head of the
+            # root file would otherwise inherit the last
+            # import-graph module's home.
+            #
+            # Split `qualified_decls` into the imports-via-`import`
+            # head (first n_imports_raw entries — each tagged with
+            # `Some(<imported_mod>)` by `expand_imports`) and the
+            # root-file tail (own decls, untagged-or-target-tagged).
+            let imports_decls = pae_take(qualified_decls, n_imports_raw)
+            let root_only_decls = pae_drop(qualified_decls, n_imports_raw)
+            # `prelude_segs` retains the per-file (mod, decls) split
+            # from `load_preludes`. The validator builds the
+            # `(name, home, is_pub)` table from these segments
+            # (so per-file home boundaries are unambiguous for
+            # DType / DEffect / DProtocol that carry no
+            # `module_origin` of their own) and walks the
+            # post-rqc `qualified_prelude` bodies — those carry the
+            # `EField(mod, fn) -> EModCall(mod, fn)` rewrite. Both
+            # views of the prelude have the same shape because
+            # `rqc_decls` only rewrites Expr trees; the Decl
+            # `module_origin` annotation and the `is_pub` flag
+            # survive.
+            let pub_access_errs = validate_pub_access(
+              prelude_segs, qualified_prelude,
+              imports_decls, root_only_decls,
+              target_mod_name, path)
             # m12.6.x #3 v2: synthesise `__ref_pred_X` fn for every
             # `type X = Base where pred` so match-arm narrowing
             # `p : X` resolves cleanly (parse_optional_arm_refine
@@ -53516,6 +54289,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             else if union_collision_errs > 0 { union_collision_errs }
             else if nursery_brand_errs > 0 { nursery_brand_errs }
             else if qualtype_errs > 0 { qualtype_errs }
+            else if pub_access_errs > 0 { pub_access_errs }
             else {
             match mode {
               MAst -> { dump_program(raw_decls); 0 }
@@ -53765,12 +54539,12 @@ fn run(opts: CliOptions) : Int / Console + File {
         # and concatenate the loaded decls in argument order. Names
         # in later preludes shadow earlier ones (intentional —
         # callers pass `--prelude` in dependency order).
-        let prelude_loaded = load_preludes(opts.preludes, opts.include_prelude_tests, [], [])
+        let prelude_loaded = load_preludes(opts.preludes, opts.include_prelude_tests, [], [], [])
         match prelude_loaded {
           None -> 1
           Some(pls) -> match pls {
-            PLS(pds, pmods) -> match read_file(p) {
-              Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds, pmods)
+            PLS(pds, pmods, psegs) -> match read_file(p) {
+              Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs)
               Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
             }
           }
