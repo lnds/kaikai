@@ -113,8 +113,17 @@ fn main() : Unit / Console = print("hola installed mode")
 HEREDOC
 # Run the staged kai with KAI_NO_STDLIB unset and PATH pointing nowhere
 # else, to make sure the script's own auto-detection logic works.
-PATH="$STAGE/bin:/usr/bin:/bin" "$STAGE/bin/kai" run "$SMOKE_DIR/hello.kai" \
-  > "$SMOKE_DIR/out" 2>&1
+# Force C backend: smoke test verifies the staged binary + stdlib layout,
+# not the LLVM path (which has its own tier1 coverage). LLVM default
+# (#506) auto-detects clang in PATH, which makes the smoke test
+# environment-dependent and harder to debug when it fails on CI.
+PATH="$STAGE/bin:/usr/bin:/bin" KAI_BACKEND=c "$STAGE/bin/kai" run "$SMOKE_DIR/hello.kai" \
+  > "$SMOKE_DIR/out" 2>&1 || true
+# Always print the staged kai output so CI logs surface the failure
+# reason instead of dying silently under `set -e`.
+echo "--- staged kai output ---" >&2
+cat "$SMOKE_DIR/out" >&2 || true
+echo "--- end staged kai output ---" >&2
 if grep -q 'hola installed mode' "$SMOKE_DIR/out"; then
   echo "    OK"
 else
