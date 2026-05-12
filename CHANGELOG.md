@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.54.1 (2026-05-12)
+
+### Fixed
+
+- **emit**: declare fs/file runtime symbols in LLVM IR prologue (closes #513)
+
 ## v0.54.0 (2026-05-12)
 
 ### Added
