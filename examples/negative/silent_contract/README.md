@@ -17,7 +17,6 @@ contracts yet, so they cannot gate tier1.
 | Fixture(s) | Issue |
 | --- | --- |
 | `pub_fn_transitive_effect.kai` | [#516](https://github.com/lnds/kaikai/issues/516) — general transitive-effect propagation through ordinary fn calls (deferred follow-up; see the lane-experience retro for issue #516) |
-| `handle_residual_effect.kai`, `handle_partial_with_other_effect.kai`, `handle_clause_missing_resume.kai`, `handle_clause_wrong_arity.kai`, `main_row_user_effect.kai` | [#517](https://github.com/lnds/kaikai/issues/517) — handle block: residual effects + clause shape not validated |
 
 `pub_fn_mutable_unannotated.kai`, `mutable_op_no_handler_or_row.kai`,
 `mutable_through_field.kai`, `mutable_param_write_pure_row.kai`,
@@ -30,6 +29,12 @@ non-capability effects through an open row tail; the lane brief
 for #516 chose to scope the fix to capability-only labels (`Ffi`),
 the qualified-`Mutable`-op masking gap, and `main`'s REmpty/Ffi
 exception. See `docs/lane-experience-issue-516-effect-row-propagation.md`.
+
+`handle_residual_effect.kai`, `handle_partial_with_other_effect.kai`,
+`handle_clause_missing_resume.kai`, `handle_clause_wrong_arity.kai`,
+and `main_row_user_effect.kai` closed under #517 — they now live in
+`examples/negative/handle_leak/` with `.err.expected` goldens. See
+`docs/lane-experience-issue-517-handle-validation.md`.
 
 ## Migration recipe
 
