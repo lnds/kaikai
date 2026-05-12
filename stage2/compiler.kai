@@ -24855,26 +24855,71 @@ fn find_other_claim(claims: [VariantClaim], vname: String, parent: String) : Opt
 # Public entry: validate every TBSum's variants against earlier
 # claims. Returns the count of D2 errors (0 means clean). Plumbed
 # into `compile_source` next to `pred_errs` and `var_use_errs`.
-fn validate_union_collisions_decls(ds: [Decl], file: String) : Int / Console {
+fn validate_union_collisions_decls(ds: [Decl], file: String,
+                                     module_table: [ModuleEntry]) : Int / Console {
   let top_names = collect_top_type_names(ds)
-  validate_union_collisions_loop(ds, top_names, file, 0, [])
+  # Issue #502: pre-seed the claim table with the builtin variant
+  # constructors registered by `add_builtin_variant_sigs` (Result.Ok,
+  # Result.Err, Option.Some, Option.None). A user `pub type T = Ok(...)`
+  # would otherwise overwrite the bare `Ok` entry in the TyEnv —
+  # because `add_variants_loop` prepends the user scheme — and silently
+  # break every prelude site that constructs `Result.Ok`. Catching the
+  # collision here gives a precise diagnostic at the user's DType
+  # instead of a cascade of unrelated type-mismatch errors pointing at
+  # nonexistent line numbers in the user file.
+  validate_union_collisions_loop(ds, top_names, file, module_table, 0,
+                                   builtin_variant_claims())
+}
+
+# Issue #502: locate the source file that exports `type_name`. Walks
+# the module table built by `expand_imports`; the entry's `origin`
+# field is the absolute path on disk. Falls back to the root file when
+# no module exports the type (top-level user decl in the entry file
+# itself). Returns the resolved path so diagnostics for a colliding
+# DType point at the file that declared it, not at the root file
+# whose line numbers don't match.
+fn resolve_decl_file(type_name: String, root_file: String,
+                       mt: [ModuleEntry]) : String {
+  match mt {
+    [] -> root_file
+    [me, ...rest] -> match me {
+      ME(_, exports, origin) ->
+        if list_has(exports, type_name) { origin }
+        else { resolve_decl_file(type_name, root_file, rest) }
+    }
+  }
+}
+
+# Issue #502: builtin variant constructors that share a top-level
+# namespace with user-declared variants. Mirrors the entries injected
+# by `add_builtin_variant_sigs`. Kept in sync manually — both lists
+# are short and stable.
+fn builtin_variant_claims() : [VariantClaim] {
+  [
+    VC("Some", "Option", 0, 0),
+    VC("None", "Option", 0, 0),
+    VC("Ok",   "Result", 0, 0),
+    VC("Err",  "Result", 0, 0)
+  ]
 }
 
 fn validate_union_collisions_loop(remaining: [Decl], top_names: [String],
-                                    file: String, errs: Int,
+                                    file: String, mt: [ModuleEntry],
+                                    errs: Int,
                                     claims: [VariantClaim]) : Int / Console {
   match remaining {
     [] -> errs
     [d, ...rest] -> match d {
       DType(_, parent, _, body, line, col) -> match body {
         TBSum(vs) -> {
+          let decl_file = resolve_decl_file(parent, file, mt)
           let r = check_variants_for_collision(vs, parent, line, col,
-                                                  top_names, claims, file, errs)
-          validate_union_collisions_loop(rest, top_names, file, r.errs, r.claims)
+                                                  top_names, claims, decl_file, errs)
+          validate_union_collisions_loop(rest, top_names, file, mt, r.errs, r.claims)
         }
-        _ -> validate_union_collisions_loop(rest, top_names, file, errs, claims)
+        _ -> validate_union_collisions_loop(rest, top_names, file, mt, errs, claims)
       }
-      _ -> validate_union_collisions_loop(rest, top_names, file, errs, claims)
+      _ -> validate_union_collisions_loop(rest, top_names, file, mt, errs, claims)
     }
   }
 }
@@ -24883,7 +24928,7 @@ type CollisionResult = { errs: Int, claims: [VariantClaim] }
 
 fn check_variants_for_collision(vs: [Variant], parent: String, line: Int, col: Int,
                                   top_names: [String], claims: [VariantClaim],
-                                  file: String, errs: Int) : CollisionResult / Console {
+                                  decl_file: String, errs: Int) : CollisionResult / Console {
   match vs {
     [] -> CollisionResult { errs: errs, claims: claims }
     [v, ...rest] -> match v {
@@ -24892,26 +24937,52 @@ fn check_variants_for_collision(vs: [Variant], parent: String, line: Int, col: I
           # `vname` is pre-declared as a top-level type. The TBSum
           # references it; no implicit declaration, no D2.
           check_variants_for_collision(rest, parent, line, col,
-                                          top_names, claims, file, errs)
+                                          top_names, claims, decl_file, errs)
         } else {
           match find_other_claim(claims, vname, parent) {
             Some(prev) -> {
-              report_d2_collision(file, vname, parent, line, col, prev)
+              # Issue #502: claims pre-seeded by
+              # `builtin_variant_claims` carry sentinel line/col 0;
+              # render them with a builtin-specific message instead of
+              # the generic "declared by both ..." that points at the
+              # nonexistent file:0:0.
+              match prev {
+                VC(_, prev_parent, 0, 0) ->
+                  report_builtin_collision(decl_file, vname, parent, line, col, prev_parent)
+                _ ->
+                  report_d2_collision(decl_file, vname, parent, line, col, prev)
+              }
               # Continue scanning with the same claim list so a single
               # multi-collision file produces all diagnostics in one run.
               check_variants_for_collision(rest, parent, line, col,
-                                              top_names, claims, file, errs + 1)
+                                              top_names, claims, decl_file, errs + 1)
             }
             None -> {
               let nc = VC(vname, parent, line, col)
               check_variants_for_collision(rest, parent, line, col,
-                                              top_names, [nc, ...claims], file, errs)
+                                              top_names, [nc, ...claims], decl_file, errs)
             }
           }
         }
       }
     }
   }
+}
+
+# Issue #502: collision between a user-declared variant and a builtin
+# constructor of `Result` / `Option`. Distinct from D2 because the
+# earlier claim has no source location — the builtin's "definition"
+# lives inside `add_builtin_variant_sigs`, not in any .kai file. The
+# message names both unions and tells the user to rename.
+fn report_builtin_collision(file: String, vname: String, parent: String,
+                              line: Int, col: Int, builtin_parent: String) : Unit / Console {
+  let msg = concat_all(["constructor '", vname,
+                        "' in 'type ", parent,
+                        " = ...' collides with the built-in constructor '",
+                        vname, "' of '", builtin_parent, "'"])
+  diag_error(file, line, col, msg)
+  diag_help(concat_all(["rename the variant (e.g. '", vname, "Value') so it does not shadow '",
+                         builtin_parent, ".", vname, "'"]))
 }
 
 # Render the D2 diagnostic. The first line names the offending
@@ -53280,7 +53351,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # neither parent pre-declaring the variant as its own
             # `type`). The counter folds into the exit-code aggregator
             # below. See `validate_union_collisions_decls`.
-            let union_collision_errs = validate_union_collisions_decls(merged, path)
+            let union_collision_errs = validate_union_collisions_decls(merged, path, module_table)
             # m7b #1b + m12.8 Phase 4b — closed effect aliases. Resolve
             # every `type Foo = Eff1 + Eff2 + ...` (and `type Foo = Eff`
             # single-name form) into a flat label set and rewrite every
