@@ -25022,6 +25022,176 @@ fn report_d2_collision(file: String, vname: String, parent: String,
   }
 }
 
+# Issue #518 — type-name collisions across module boundaries.
+#
+# Two related contracts. Both rejected up front instead of letting
+# resolution pick one definition non-deterministically and emit
+# downstream errors that name constructors the user never wrote
+# (the symptom that prompted the issue).
+#
+#   (a) A user `type T = ...` whose name `T` is already exported by
+#       a prelude or imported module. Today the typer's variant
+#       lookup walks both definitions and reports `match` arms as
+#       non-exhaustive against the *other* file's constructors.
+#       Companion to #510 (which closed the same shape on the
+#       variant axis via the builtin-claims table) and #502
+#       (constructor-name validator). Type-name path was left
+#       open; this validator closes it for `pub type` exported by
+#       any module in the table — preludes auto-loaded via
+#       `--prelude` and explicit `import` lines alike.
+#
+#   (b) Two `type T = ...` declarations in the SAME root file.
+#       Stage 2 silently accepts; the typer picks one nondeterm-
+#       inistically. Rejecting at the second occurrence keeps the
+#       diagnostic local.
+#
+# Diagnostic always points at the *user's* DType (the second site
+# to claim the name): `path` is the root file, line/col come from
+# the offending DType. The first claimant is named in the message
+# either by its module name (case a) or by its earlier line/col
+# (case b).
+#
+# Approach mirrors `validate_union_collisions_decls`: a small walker
+# over `root_only_decls`, two helper lookups against `module_table`
+# (case a) and an in-flight claim list (case b). No interaction with
+# the typer or pattern-exhaustiveness — that machinery keeps working
+# under the assumption that one type name resolves to one definition,
+# which is exactly what this validator enforces.
+
+type TypeNameClaim = TNC(String, Int, Int)
+
+fn validate_type_name_collisions_decls(root_decls: [Decl], file: String,
+                                          module_table: [ModuleEntry],
+                                          prelude_mods: [ModuleEntry],
+                                          target_mod_name: String) : Int / Console {
+  validate_type_name_collisions_loop(root_decls, file, module_table,
+                                        prelude_mods, target_mod_name, [], 0)
+}
+
+fn validate_type_name_collisions_loop(remaining: [Decl], file: String,
+                                         mt: [ModuleEntry],
+                                         prelude_mods: [ModuleEntry],
+                                         target_mod_name: String,
+                                         claims: [TypeNameClaim],
+                                         errs: Int) : Int / Console {
+  match remaining {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DType(_, name, _, _, line, col) ->
+        validate_one_type_decl(rest, file, mt, prelude_mods, target_mod_name,
+                                  claims, errs, name, line, col)
+      DDerive(_, inner, _, _) -> match inner {
+        DType(_, name, _, _, line, col) ->
+          validate_one_type_decl(rest, file, mt, prelude_mods, target_mod_name,
+                                    claims, errs, name, line, col)
+        _ -> validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
+                                                   target_mod_name, claims, errs)
+      }
+      _ -> validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
+                                                 target_mod_name, claims, errs)
+    }
+  }
+}
+
+fn validate_one_type_decl(rest: [Decl], file: String, mt: [ModuleEntry],
+                             prelude_mods: [ModuleEntry], target_mod_name: String,
+                             claims: [TypeNameClaim], errs: Int,
+                             name: String, line: Int, col: Int) : Int / Console {
+  match find_type_name_claim(claims, name) {
+    Some(prev) -> {
+      report_dup_type_decl(file, name, line, col, prev)
+      validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
+                                            target_mod_name, claims, errs + 1)
+    }
+    None -> match find_exporting_module(mt, name, target_mod_name) {
+      Some(prev_mod) -> {
+        let is_prelude = me_list_has_name(prelude_mods, prev_mod)
+        report_import_type_collision(file, name, line, col, prev_mod, is_prelude)
+        validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
+                                              target_mod_name,
+                                              [TNC(name, line, col), ...claims],
+                                              errs + 1)
+      }
+      None -> validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
+                                                    target_mod_name,
+                                                    [TNC(name, line, col), ...claims],
+                                                    errs)
+    }
+  }
+}
+
+fn me_list_has_name(mes: [ModuleEntry], name: String) : Bool {
+  match mes {
+    [] -> false
+    [me, ...rest] -> match me {
+      ME(mn, _, _) -> if mn == name { true } else { me_list_has_name(rest, name) }
+    }
+  }
+}
+
+fn find_type_name_claim(claims: [TypeNameClaim], name: String) : Option[TypeNameClaim] {
+  match claims {
+    [] -> None
+    [c, ...rest] -> match c {
+      TNC(n, _, _) -> if n == name { Some(c) } else { find_type_name_claim(rest, name) }
+    }
+  }
+}
+
+# Return the module-entry name of the first ME (other than the root
+# file's own ME) whose exports include `name`. The root ME is matched
+# by `target_mod_name`; skipping it prevents the root's own pub type
+# from being reported as a collision against itself.
+fn find_exporting_module(mt: [ModuleEntry], name: String,
+                            target_mod_name: String) : Option[String] {
+  match mt {
+    [] -> None
+    [me, ...rest] -> match me {
+      ME(mn, exports, _) -> {
+        if mn != target_mod_name and list_has(exports, name) { Some(mn) }
+        else { find_exporting_module(rest, name, target_mod_name) }
+      }
+    }
+  }
+}
+
+fn report_import_type_collision(file: String, name: String, line: Int, col: Int,
+                                   prev_mod: String, is_prelude: Bool) : Unit / Console {
+  let origin_phrase = if is_prelude {
+    concat_all(["the prelude module '", prev_mod, "'"])
+  } else {
+    concat_all(["the imported module '", prev_mod, "'"])
+  }
+  let msg = concat_all(["type '", name,
+                        "' is already declared in this scope (exported by ",
+                        origin_phrase, ")"])
+  diag_error(file, line, col, msg)
+  let fix_phrase = if is_prelude {
+    concat_all(["rename the local type (e.g. '", name,
+                  "2') so it does not shadow '", prev_mod, ".", name, "'"])
+  } else {
+    concat_all(["rename the local type (e.g. '", name,
+                  "2') or remove the `import` that brings '",
+                  prev_mod, ".", name, "' into scope"])
+  }
+  diag_help(fix_phrase)
+}
+
+fn report_dup_type_decl(file: String, name: String, line: Int, col: Int,
+                          prev: TypeNameClaim) : Unit / Console {
+  match prev {
+    TNC(_, prev_line, prev_col) -> {
+      let msg = concat_all(["type '", name,
+                            "' is already declared in this module (earlier at ",
+                            file, ":", int_to_string(prev_line), ":",
+                            int_to_string(prev_col), ")"])
+      diag_error(file, line, col, msg)
+      diag_help(concat_all(["remove or rename the second 'type ", name,
+                              " = ...' declaration"]))
+    }
+  }
+}
+
 # m7b #12 — collect all distinct row-variable names appearing in the
 # row positions of a function declaration's signature: the outer
 # return-row plus every nested `TyFn` row inside parameter types and
@@ -54129,6 +54299,19 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               prelude_segs, qualified_prelude,
               imports_decls, root_only_decls,
               target_mod_name, path)
+            # Issue #518: reject user `type T = ...` whose name `T`
+            # is already exported by a prelude or imported module,
+            # and reject two `type T = ...` in the same root file.
+            # Companion to #510 (`pub` enforcement) + #502
+            # (constructor-name validator): both close half of the
+            # implicit-shadowing surface that ended up reporting
+            # exhaustiveness errors against constructors from a
+            # *different* module's `Tree`. Walks only the root file
+            # (`root_only_decls`) — the imports/preludes are
+            # authoritative for the name, so user-side decls are
+            # always the "second claimant" and own the diagnostic.
+            let type_name_coll_errs = validate_type_name_collisions_decls(
+              root_only_decls, path, module_table, prelude_mods, target_mod_name)
             # m12.6.x #3 v2: synthesise `__ref_pred_X` fn for every
             # `type X = Base where pred` so match-arm narrowing
             # `p : X` resolves cleanly (parse_optional_arm_refine
@@ -54303,6 +54486,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             else if nursery_brand_errs > 0 { nursery_brand_errs }
             else if qualtype_errs > 0 { qualtype_errs }
             else if pub_access_errs > 0 { pub_access_errs }
+            else if type_name_coll_errs > 0 { type_name_coll_errs }
             else {
             match mode {
               MAst -> { dump_program(raw_decls); 0 }
