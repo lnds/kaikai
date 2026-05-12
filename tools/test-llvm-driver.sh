@@ -29,7 +29,8 @@ FIXTURES="examples/minimal/hello.kai
 examples/llvm/driver_smoke.kai
 examples/llvm/m3b.kai
 examples/quickstart/02_fizzbuzz.kai
-examples/stdlib/bits_basic.kai"
+examples/stdlib/bits_basic.kai
+examples/stdlib/fs_file_bytes_llvm.kai"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
