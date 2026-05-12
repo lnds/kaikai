@@ -74,6 +74,58 @@ happen** — "make test clean" as prose is not the same as
 The 3-level gate's "Level 2 invariant verifier + audit" and most of
 "Level 3 demo gate" map onto Tier 1.
 
+## Negative-space discipline (issue #511)
+
+Positive tests assert "this valid program compiles and runs". They do
+NOT assert "this invalid program is rejected with the expected
+diagnostic". That blind spot let `pub` go silently unenforced for the
+full life of the language (issue #510): the contract was advertised
+in `docs/design.md` and 672 `pub` lines across `stdlib/` assumed
+otherwise, but no test ever asserted "a non-`pub` decl called across
+modules is rejected", so the gap survived three years.
+
+**Every contract advertised in primary docs must have a negative
+fixture that asserts the rejection.** Without that, the contract is
+not load-bearing — it's an aspiration the compiler may or may not
+have implemented.
+
+Negative fixtures live under `examples/negative/<category>/` and are
+gated by `tools/test-negative.sh`, wired into Tier 1 via the
+`test-negative` target. Three modes are supported:
+
+- **Compile-time**: `<name>.kai` + `<name>.err.expected`. The harness
+  runs `kaic2 <name>.kai`, asserts non-zero exit, and greps stderr
+  for the first line of the golden — same convention as the existing
+  `test-modules-qualified-neg` target. Multi-file fixtures use
+  `<dir>/main.kai` + `<dir>/lib.kai` + `<dir>/main.err.expected`.
+- **Stage 1 rejection**: `<name>.kai` + `<name>.kaic1.err.expected`
+  routes to `stage1/kaic1` instead of `kaic2` (used for stage-2-only
+  features like `protocol`, `impl`, `effect`).
+- **Runtime-time**: `<name>.kai` + `<name>.run.err.expected`. The
+  harness compiles via kaic2 → cc, runs the binary, asserts non-zero
+  exit, and greps stderr for the panic message. Used for contracts
+  that `docs/effects-impl.md` declares runtime-only (one-shot resume
+  is the prototype).
+
+Two optional siblings:
+
+- `<name>.prelude.kai` — implicit `--prelude` invocation.
+- `<name>.flags` — extra CLI args (e.g. `--prelude stdlib/protocols.kai`
+  for derive fixtures, `--path stdlib` for actor fixtures).
+
+When a fixture is authored and the language SILENTLY ACCEPTS the
+prohibited construct, the audit has succeeded — the language has a
+silent contract. The fixture moves to
+`examples/negative/silent_contract/` (excluded from the harness via
+path filter), the lane files a `bug,pre-1.0` issue, and
+`silent_contract/README.md` gets a row linking the fixture to the
+issue. When the issue closes, the closing lane moves the fixture
+back out and adds the `.err.expected` golden.
+
+The #511 audit surfaced 14 silent-contract fixtures clustered into
+3 issues (#516, #517, #518) — see
+`docs/lane-experience-issue-511-negative-tests.md` for the matrix.
+
 ## Tier 2 — `make daily` (end of day / cron)
 
 ~10-20 minutes. Runs once a day on `main` HEAD, not on each PR.

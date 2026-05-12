@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -168,8 +168,8 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures"
+tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures"
 
 # Tongariki — `kai fmt` fixture suite. Verifies that every fixture
 # in examples/fmt/ formats to its `.expected.kai` and is idempotent,
@@ -337,6 +337,16 @@ test-diagnostics-collected: kaic2
 	  rm -f "$$out"; \
 	  echo "diags-collected $$fx OK"; \
 	done
+
+# Negative-space test suite (issue #511). Every fixture under
+# examples/negative/** must be rejected by kaic2 (non-zero exit)
+# AND must surface the expected diagnostic substring stored in the
+# sibling `.err.expected` golden. Existence of this target is the
+# point: positive tests alone proved insufficient (#510 — `pub` was
+# silently unenforced for the full life of the language because no
+# negative test asserted the contract).
+test-negative: kaic2
+	@./tools/test-negative.sh
 
 # Tier 2.5 — daily memory-safety gate. Rebuilds the demos/ probe set
 # with `-fsanitize=address,undefined` and runs each binary; fails on
