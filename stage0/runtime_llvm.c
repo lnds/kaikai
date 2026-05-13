@@ -325,6 +325,40 @@ KaiValue *kaix_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) { re
  * to this libm fmod binding. Listed in the LLVM prelude table so the
  * monomorphised __pimpl_Rem_Real_rem body resolves a real symbol. */
 KaiValue *kaix_prelude_real_rem(KaiValue *a, KaiValue *b)                { return kai_prelude_real_rem(a, b); }
+/* Issue #522: stdlib/math/real libm bindings. Mirrors the C-side
+ * prelude table libm block; needed at link time when the LLVM emit
+ * references @kaix_prelude_real_<libm-op>. */
+KaiValue *kaix_prelude_real_sqrt(KaiValue *x)                            { return kai_prelude_real_sqrt(x); }
+KaiValue *kaix_prelude_real_cbrt(KaiValue *x)                            { return kai_prelude_real_cbrt(x); }
+KaiValue *kaix_prelude_real_exp(KaiValue *x)                             { return kai_prelude_real_exp(x); }
+KaiValue *kaix_prelude_real_log(KaiValue *x)                             { return kai_prelude_real_log(x); }
+KaiValue *kaix_prelude_real_log2(KaiValue *x)                            { return kai_prelude_real_log2(x); }
+KaiValue *kaix_prelude_real_log10(KaiValue *x)                           { return kai_prelude_real_log10(x); }
+KaiValue *kaix_prelude_real_sin(KaiValue *x)                             { return kai_prelude_real_sin(x); }
+KaiValue *kaix_prelude_real_cos(KaiValue *x)                             { return kai_prelude_real_cos(x); }
+KaiValue *kaix_prelude_real_tan(KaiValue *x)                             { return kai_prelude_real_tan(x); }
+KaiValue *kaix_prelude_real_asin(KaiValue *x)                            { return kai_prelude_real_asin(x); }
+KaiValue *kaix_prelude_real_acos(KaiValue *x)                            { return kai_prelude_real_acos(x); }
+KaiValue *kaix_prelude_real_atan(KaiValue *x)                            { return kai_prelude_real_atan(x); }
+KaiValue *kaix_prelude_real_sinh(KaiValue *x)                            { return kai_prelude_real_sinh(x); }
+KaiValue *kaix_prelude_real_cosh(KaiValue *x)                            { return kai_prelude_real_cosh(x); }
+KaiValue *kaix_prelude_real_tanh(KaiValue *x)                            { return kai_prelude_real_tanh(x); }
+KaiValue *kaix_prelude_real_signum(KaiValue *x)                          { return kai_prelude_real_signum(x); }
+KaiValue *kaix_prelude_real_is_nan(KaiValue *x)                          { return kai_prelude_real_is_nan(x); }
+KaiValue *kaix_prelude_real_is_inf(KaiValue *x)                          { return kai_prelude_real_is_inf(x); }
+KaiValue *kaix_prelude_real_pow(KaiValue *a, KaiValue *b)                { return kai_prelude_real_pow(a, b); }
+KaiValue *kaix_prelude_real_atan2(KaiValue *a, KaiValue *b)              { return kai_prelude_real_atan2(a, b); }
+/* Issue #523: m8 mailbox runtime bindings. Mirrors the C-side
+ * prelude table mailbox block; needed at link time when the LLVM
+ * emit references @kaix_prelude_mailbox_* (e.g. via
+ * stdlib/actor.kai's spawn_actor / send / receive surface). */
+KaiValue *kaix_prelude_mailbox_alloc(void)                               { return kai_prelude_mailbox_alloc(); }
+KaiValue *kaix_prelude_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) { return kai_prelude_mailbox_alloc_bounded(cap, overflow); }
+KaiValue *kaix_prelude_mailbox_alloc_unowned(void)                       { return kai_prelude_mailbox_alloc_unowned(); }
+KaiValue *kaix_prelude_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) { return kai_prelude_mailbox_assign_owner(pid, fiber); }
+KaiValue *kaix_prelude_mailbox_send(KaiValue *pid, KaiValue *msg)        { return kai_prelude_mailbox_send(pid, msg); }
+KaiValue *kaix_prelude_mailbox_recv(KaiValue *pid)                       { return kai_prelude_mailbox_recv(pid); }
+KaiValue *kaix_prelude_mailbox_free(KaiValue *pid)                       { return kai_prelude_mailbox_free(pid); }
 /* Lane 4 (#473) Byte primitive ops. Mirrors the C-side prelude
  * table; needed at link time when the LLVM emit references
  * @kaix_prelude_byte_* (e.g. via stdlib/protocols.kai's
