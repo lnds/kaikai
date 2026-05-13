@@ -1522,6 +1522,13 @@ type HClause = HC(String, [Param], Expr, Int, Int)
 # the parameter name bound inside `body`.
 type HReturn = HR(String, Expr, Int, Int)
 
+# Issue #533: user-declared default handler clauses attached to an
+# `effect E { ops; default { clauses } }` declaration. Carries the
+# same `HClause` / `HReturn` shapes that `EHandle` uses so the codegen
+# can later reuse the clause emit machinery. Stored as the new
+# Option[DefaultBlock] field on DEffect.
+type DefaultBlock = DBlk([HClause], Option[HReturn], Int, Int)
+
 type Decl
   # m7b #13: optional type parameters on the function declaration —
   # `pub fn id[T](x: T) : T = x`. Empty list for monomorphic decls.
@@ -1553,7 +1560,11 @@ type Decl
   | DImport(ImportKind, Int, Int)
   # m7b #11: optional type parameters on the effect declaration —
   # `effect Reader[T] { ask() : T }`. Empty list for stateless effects.
-  | DEffect(Bool, String, [String], [EffectOp], Int, Int)
+  # Issue #533: trailing Option[DefaultBlock] carries the parsed
+  # `default { clauses }` body, or None when the effect declares no
+  # default. Stage 1 (parser + AST) only; coverage check and codegen
+  # land in follow-up lanes.
+  | DEffect(Bool, String, [String], [EffectOp], Option[DefaultBlock], Int, Int)
   # m12.8: `protocol P { op_decls }` — single-dispatch ad-hoc
   # polymorphism. Each ProtoOp carries a parameter list using `Self`
   # as the first-position dispatch type. Defaults are not parsed in
@@ -8490,7 +8501,45 @@ fn parse_effect_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
           let ops_r = parse_effect_ops(p3, [])
           match ops_r.r {
             None -> err_d(ops_r.p)
-            Some(ops) -> ok_d(ops_r.p, DEffect(is_pub, name, tparams, ops, t.line, t.col))
+            Some(ops) -> {
+              # Issue #533: when parse_effect_ops stops at `default {`
+              # (sentinel return, no `}` consumed), parse the default
+              # block and then consume the effect-body closing `}`.
+              let after_ops = p_skip_newlines(ops_r.p)
+              let id_t = p_peek(after_ops)
+              let is_default_kw =
+                tk_is(id_t.kind, TkIdent) and tok_source(after_ops.src, id_t) == "default"
+              if is_default_kw {
+                let p_after_default = p_skip_newlines(p_advance(after_ops))
+                if not p_at(p_after_default, TkLbrace) {
+                  err_d(p_error_here(p_after_default, "expected `{` after `default`"))
+                } else {
+                  let p_block_open = p_skip_newlines(p_advance(p_after_default))
+                  let cr = parse_handle_clauses(p_block_open, [], None, [])
+                  match cr.r {
+                    None -> err_d(cr.p)
+                    Some(_) -> {
+                      # parse_handle_clauses already consumed the
+                      # inner `}`. Now consume the outer effect-body
+                      # closing `}`.
+                      let p_after_block = p_skip_newlines(cr.p)
+                      if not p_at(p_after_block, TkRbrace) {
+                        err_d(p_error_here(p_after_block,
+                          "expected `}` to close effect body after `default` block"))
+                      } else {
+                        let p_close = p_advance(p_after_block)
+                        let defblk = DBlk(cr.clauses, cr.return_clause,
+                                          id_t.line, id_t.col)
+                        ok_d(p_close, DEffect(is_pub, name, tparams, ops,
+                                              Some(defblk), t.line, t.col))
+                      }
+                    }
+                  }
+                }
+              } else {
+                ok_d(ops_r.p, DEffect(is_pub, name, tparams, ops, None, t.line, t.col))
+              }
+            }
           }
         }
       }
@@ -8504,6 +8553,11 @@ fn parse_effect_ops(p: Parser, acc: [EffectOp]) : PEffectOps / Console {
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
+    # Note: do NOT advance past the `}` here. The caller drives the
+    # closing-brace consumption so it can first check for an optional
+    # `default { clauses }` block — but issue #533 v1 places `default`
+    # *before* the closing brace of the effect body, so this branch
+    # always closes the effect decl. Keep the existing advance.
     PEffectOps { p: p_advance(p0), r: Some(list_reverse(acc)) }
   } else {
     let id = p_peek(p0)
@@ -8511,6 +8565,15 @@ fn parse_effect_ops(p: Parser, acc: [EffectOp]) : PEffectOps / Console {
       PEffectOps { p: p_error(p0, id, "expected operation name"), r: None }
     } else {
       let opname = tok_source(p0.src, id)
+      # Issue #533: when the ident is `default` and the next token is
+      # `{`, stop accumulating ops. The caller (parse_effect_decl)
+      # consumes the `default { clauses }` block before the effect
+      # body's closing brace. We do NOT advance past `default` here;
+      # the caller re-peeks it.
+      let p_after_id = p_skip_newlines(p_advance(p0))
+      if opname == "default" and p_at(p_after_id, TkLbrace) {
+        PEffectOps { p: p0, r: Some(list_reverse(acc)) }
+      } else {
       let p1 = p_advance(p0)
       # m7b #2: optional `[T1, T2]` op-level tparams before `(args)`.
       # Reuses parse_type_params_loop (m7b #11 / m7a effects). Empty
@@ -8550,6 +8613,7 @@ fn parse_effect_ops(p: Parser, acc: [EffectOp]) : PEffectOps / Console {
         }
           }
         }
+      }
       }
     }
   }
@@ -10020,7 +10084,7 @@ fn dump_decl(d: Decl, depth: Int) : Unit / Console {
         IkHole(name) -> emit_line(depth, "import ?#{name} @#{int_to_string(line)}:#{int_to_string(col)}")
       }
     }
-    DEffect(is_pub, name, tparams, ops, line, col) -> {
+    DEffect(is_pub, name, tparams, ops, _default_block, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       emit_line(depth, "effect #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
       tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
@@ -10651,7 +10715,7 @@ fn chk_decl(e: Env, d: Decl) : Env / Console + File {
       env_pop(e3)
     }
     DImport(_, _, _) -> e
-    DEffect(_, _, _, _, _, _) -> e          # m7a #3c will register effect names
+    DEffect(_, _, _, _, _, _, _) -> e          # m7a #3c will register effect names
     # m12.8: protocol / impl / derive decls are stripped by
     # `lower_protocols` before `check_program` runs, so reaching one
     # here means the pipeline was driven directly into `chk_decl` (e.g.
@@ -10705,7 +10769,7 @@ fn register_one(e: Env, d: Decl) : Env {
     DBench(_, _, _, _) -> e
     DCheck(_, _, _, _, _) -> e
     DImport(ik, _, _) -> register_import(e, ik)
-    DEffect(_, name, _, _, _, _) -> env_add(e, name)
+    DEffect(_, name, _, _, _, _, _) -> env_add(e, name)
     # m12.8: stripped pre-resolve; never reaches register_one in
     # practice. No-op for completeness so the match stays exhaustive.
     DProtocol(_, _, _, _, _, _) -> e
@@ -10791,7 +10855,7 @@ fn collect_effect_arities_loop(decls: [Decl]) : [EffArity] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, name, tparams, _, _, _) ->
+      DEffect(_, name, tparams, _, _, _, _) ->
         [EA(name, list_length(tparams)), ...collect_effect_arities_loop(rest)]
       _ -> collect_effect_arities_loop(rest)
     }
@@ -10856,7 +10920,7 @@ fn collect_effect_names(decls: [Decl]) : [String] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, name, _, _, _, _) -> [name, ...collect_effect_names(rest)]
+      DEffect(_, name, _, _, _, _, _) -> [name, ...collect_effect_names(rest)]
       _ -> collect_effect_names(rest)
     }
   }
@@ -10869,7 +10933,7 @@ fn lookup_effect_op_names(decls: [Decl], name: String) : Option[[String]] {
   match decls {
     [] -> None
     [d, ...rest] -> match d {
-      DEffect(_, dname, _, ops, _, _) ->
+      DEffect(_, dname, _, ops, _, _, _) ->
         if dname == name { Some(effect_op_names(ops)) }
         else { lookup_effect_op_names(rest, name) }
       _ -> lookup_effect_op_names(rest, name)
@@ -14700,7 +14764,7 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect / Console {
       lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
     }
     DImport(_, _, _) -> st
-    DEffect(_, _, _, _, _, _) -> st          # no expressions to walk
+    DEffect(_, _, _, _, _, _, _) -> st          # no expressions to walk
     # m12.8: stripped pre-resolve. No expressions to walk if one
     # somehow survives.
     DProtocol(_, _, _, _, _, _) -> st
@@ -14772,7 +14836,7 @@ fn collect_op_to_eff(decls: [Decl]) : [OpToEff] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, eff_name, _, ops, _, _) ->
+      DEffect(_, eff_name, _, ops, _, _, _) ->
         list_append(ops_to_eff_pairs(eff_name, ops),
                     collect_op_to_eff(rest))
       _ -> collect_op_to_eff(rest)
@@ -14825,7 +14889,7 @@ fn collect_op_qualified_names(decls: [Decl]) : [String] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, name, _, ops, _, _) ->
+      DEffect(_, name, _, ops, _, _, _) ->
         list_append(op_qualified_names_for(name, ops, []),
                     collect_op_qualified_names(rest))
       _ -> collect_op_qualified_names(rest)
@@ -16270,7 +16334,7 @@ fn emit_op_fn_ptr(eff_name: String, op: EffectOp) : String {
 
 fn emit_effect_struct(d: Decl) : String {
   match d {
-    DEffect(_, name, _tparams, ops, _, _) -> {
+    DEffect(_, name, _tparams, ops, _, _, _) -> {
       let fields = concat_all(map(ops, (op) => emit_op_fn_ptr(name, op)))
       concat_all([
         "typedef struct Ev", name, " Ev", name, ";\n",
@@ -16302,7 +16366,7 @@ fn effect_struct_decls(decls: [Decl]) : String =
 # without translation.
 fn llvm_emit_effect_struct(d: Decl) : String {
   match d {
-    DEffect(_, name, _tparams, ops, _, _) -> {
+    DEffect(_, name, _tparams, ops, _, _, _) -> {
       let fields = llvm_emit_op_fn_ptrs(name, ops)
       concat_all([
         "%Ev", name, " = type { i64, i8*, %KaiValue*",
@@ -20997,7 +21061,7 @@ fn use_collect_eff_ops(decls: [Decl]) : [EffOps] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, name, _, ops, _, _) ->
+      DEffect(_, name, _, ops, _, _, _) ->
         [EffOps(name, use_op_names(ops, [])), ...use_collect_eff_ops(rest)]
       _ -> use_collect_eff_ops(rest)
     }
@@ -23893,8 +23957,8 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], fuel: Int) : Decl {
         TBSum(vs) ->
           DType(p, n, tps, TBSum(expand_ta_variants(vs, table, fuel)), l, c)
       }
-    DEffect(p, n, tps, ops, l, c) ->
-      DEffect(p, n, tps, expand_ta_eops(ops, table, fuel), l, c)
+    DEffect(p, n, tps, ops, defblk, l, c) ->
+      DEffect(p, n, tps, expand_ta_eops(ops, table, fuel), defblk, l, c)
     DProtocol(p, n, tps, ops, l, c) ->
       DProtocol(p, n, tps, expand_ta_pops(ops, table, fuel), l, c)
     DImpl(name, proto_args, ty, sub_decls, l, c) ->
@@ -24491,7 +24555,7 @@ fn dump_decl_type(d: Decl) : Unit / Console {
         IkHole(name) -> print("import ?#{name} @#{int_to_string(line)}:#{int_to_string(col)}")
       }
     }
-    DEffect(is_pub, name, _, _, line, col) -> {
+    DEffect(is_pub, name, _, _, _, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       print("#{pub_s}effect #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
@@ -25985,7 +26049,7 @@ fn validate_effect_name_collisions_loop(remaining: [Decl], file: String,
   match remaining {
     [] -> errs
     [d, ...rest] -> match d {
-      DEffect(_, name, _, _, line, col) ->
+      DEffect(_, name, _, _, _, line, col) ->
         validate_one_effect_decl(rest, file, claims, errs, name, line, col)
       _ -> validate_effect_name_collisions_loop(rest, file, claims, errs)
     }
@@ -26563,7 +26627,7 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
           None     -> EnvWithArities { env: env, arities: ar_acc }
         }
         DType(_, _, _, _, _, _) -> EnvWithArities { env: add_variants_of_decl(env, d, top_names), arities: ar_acc }
-        DEffect(_, eff_name, tparams, ops, _, _) -> {
+        DEffect(_, eff_name, tparams, ops, _, _, _) -> {
           let r2 = add_effect_op_sigs(env, eff_name, tparams, ops)
           # m7b #2: merge per-effect arities into the running accumulator.
           EnvWithArities { env: r2.env, arities: append_op_arities(r2.arities, ar_acc) }
@@ -35745,8 +35809,8 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     DBench(desc, body, l, c) -> DBench(desc, expand_aliases_expr(body, aliases), l, c)
     DCheck(desc, ps, body, l, c) -> DCheck(desc, ps, expand_aliases_expr(body, aliases), l, c)
     DImport(_, _, _) -> d
-    DEffect(p, n, tps, ops, l, c) ->
-      DEffect(p, n, tps, map(ops, (op) => expand_aliases_op(op, aliases)), l, c)
+    DEffect(p, n, tps, ops, defblk, l, c) ->
+      DEffect(p, n, tps, map(ops, (op) => expand_aliases_op(op, aliases)), defblk, l, c)
     DUnit(_, _, _, _, _) -> d
     # m12.8: protocols are stripped by `lower_protocols` before
     # `infer_program` runs, so reaching one here means the unit-alias
@@ -46798,7 +46862,7 @@ fn compute_op_offsets_loop(decls: [Decl], acc: [OpOffset]) : [OpOffset] {
     [] -> acc
     [d, ...rest] -> {
       let acc1 = match d {
-        DEffect(_, name, _, ops, _, _) -> compute_op_offsets_for_eff(name, ops, 0, acc)
+        DEffect(_, name, _, ops, _, _, _) -> compute_op_offsets_for_eff(name, ops, 0, acc)
         _ -> acc
       }
       compute_op_offsets_loop(rest, acc1)
@@ -46923,7 +46987,7 @@ fn collect_pub_exports(decls: [Decl], acc: [String]) : [String] {
           TBSum(vs) -> collect_variant_names(vs, [name, ...acc])
           _ -> [name, ...acc]
         }
-        DEffect(true, name, _, _, _, _) -> [name, ...acc]
+        DEffect(true, name, _, _, _, _, _) -> [name, ...acc]
         DProtocol(true, name, _, _, _, _) -> [name, ...acc]
         DAxiom(true, _, name, _, _, _, _, _, _, _) -> [name, ...acc]
         DUnit(true, name, _, _, _) -> [name, ...acc]
@@ -47775,8 +47839,8 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
         qualtype_expr(body, mt, file), l, c, mo)
   DType(p, n, tps, body, l, c) ->
     DType(p, n, tps, qualtype_body(body, mt, file), l, c)
-  DEffect(p, n, tps, ops, l, c) ->
-    DEffect(p, n, tps, qualtype_eops(ops, mt, file), l, c)
+  DEffect(p, n, tps, ops, defblk, l, c) ->
+    DEffect(p, n, tps, qualtype_eops(ops, mt, file), defblk, l, c)
   DProtocol(p, n, tps, ops, l, c) ->
     DProtocol(p, n, tps, qualtype_pops(ops, mt, file), l, c)
   DImpl(name, proto_args, ty, sub_decls, l, c) ->
@@ -47911,7 +47975,7 @@ fn qtchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
     (match ret_opt { None -> 0 Some(te) -> qtchk_te(te, mt) }) +
     qtchk_row(row, mt)
   DType(_, _, _, body, _, _) -> qtchk_body(body, mt)
-  DEffect(_, _, _, ops, _, _) -> qtchk_eops(ops, mt)
+  DEffect(_, _, _, ops, _, _, _) -> qtchk_eops(ops, mt)
   DProtocol(_, _, _, ops, _, _) -> qtchk_pops(ops, mt)
   DImpl(_, proto_args, ty, sub_decls, _, _) ->
     qtchk_te_list(proto_args, mt) +
@@ -48619,7 +48683,7 @@ fn priv_one(d: Decl, home_mod: String, acc: [PubAccessEntry]) : [PubAccessEntry]
       [PAE(name, home_mod, is_pub), ...acc]
     DType(is_pub, name, _, body, _, _) ->
       pae_with_variants(name, body, home_mod, is_pub, acc)
-    DEffect(is_pub, name, _, _, _, _) ->
+    DEffect(is_pub, name, _, _, _, _, _) ->
       [PAE(name, home_mod, is_pub), ...acc]
     DProtocol(is_pub, name, _, _, _, _) ->
       [PAE(name, home_mod, is_pub), ...acc]
@@ -53564,7 +53628,7 @@ fn decl_line(d: Decl) : Int {
     DBench(_, _, line, _) -> line
     DCheck(_, _, _, line, _) -> line
     DImport(_, line, _) -> line
-    DEffect(_, _, _, _, line, _) -> line
+    DEffect(_, _, _, _, _, line, _) -> line
     DProtocol(_, _, _, _, line, _) -> line
     DImpl(_, _, _, _, line, _) -> line
     DDerive(_, _, line, _) -> line
@@ -53606,7 +53670,7 @@ fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
       let s2 = fmt_newline(s1)
       fmt_decl(inner, s2)
     }
-    DEffect(_, _, _, _, line, _) -> fmt_panic_unsupported("effect declarations", line)
+    DEffect(_, _, _, _, _, line, _) -> fmt_panic_unsupported("effect declarations", line)
     DProtocol(_, _, _, _, line, _) -> fmt_panic_unsupported("protocol declarations", line)
     DImpl(_, _, _, _, line, _) -> fmt_panic_unsupported("impl blocks", line)
     DDerive(_, _, line, _) -> fmt_panic_unsupported("#derive annotation", line)
@@ -55258,18 +55322,18 @@ fn builtin_console_decl() : Decl =
 # backward-compat (over-declaration via alias subtyping).
 fn builtin_stdout_decl() : Decl =
   DEffect(false, "Stdout", [],
-    [EOp("print",  [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)], 0, 0)
+    [EOp("print",  [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)], None, 0, 0)
 
 # m12.8 Phase 4b: Stderr owns just `eprint`.
 fn builtin_stderr_decl() : Decl =
   DEffect(false, "Stderr", [],
-    [EOp("eprint", [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)], 0, 0)
+    [EOp("eprint", [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)], None, 0, 0)
 
 fn builtin_fail_decl() : Decl =
   DEffect(false, "Fail", [],
     [
       EOp("fail", [], [param_string_zero("msg")], ty_name_zero("Nothing"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # m12.7.x FFI v1: `Ffi` is the capability tag carried by every
 # `[<extern_c>]` axiom signature. It declares zero ops — the only
@@ -55277,7 +55341,7 @@ fn builtin_fail_decl() : Decl =
 # can mention `/ Ffi` honestly. There is no runtime handler;
 # the FFI codegen path bypasses the effect dispatcher entirely.
 fn builtin_ffi_decl() : Decl =
-  DEffect(false, "Ffi", [], [], 0, 0)
+  DEffect(false, "Ffi", [], [], None, 0, 0)
 
 fn builtin_stdin_decl() : Decl =
   DEffect(false, "Stdin", [],
@@ -55289,7 +55353,7 @@ fn builtin_stdin_decl() : Decl =
      EOp("read_bytes", [],
          [Param { pname: "n", ptype: Some(ty_name_zero("Int")),
                   pline: 0, pcol: 0 }],
-         ty_name_zero("String"), 0, 0)], 0, 0)
+         ty_name_zero("String"), 0, 0)], None, 0, 0)
 
 fn builtin_env_decl() : Decl =
   DEffect(false, "Env", [],
@@ -55311,7 +55375,7 @@ fn builtin_env_decl() : Decl =
                         ty_list_zero(ty_named_zero("Pair",
                           [ty_name_zero("String"), ty_name_zero("String")])),
                         0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 fn builtin_file_decl() : Decl =
   DEffect(false, "File", [],
@@ -55322,7 +55386,7 @@ fn builtin_file_decl() : Decl =
       EOp("write_file", [],
           [param_string_zero("path"), param_string_zero("contents")],
           ty_result_unit_string_zero(), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # Random effect — Doc B §`Random`. v1 ships only `int_range`; the
 # pinned catalog also lists `float()` and `bytes(n)` but those are
@@ -55339,7 +55403,7 @@ fn builtin_random_decl() : Decl =
            Param { pname: "hi", ptype: Some(ty_name_zero("Int")),
                    pline: 0, pcol: 0 }],
           ty_name_zero("Int"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # net-tcp-v1: NetTcp effect — six byte-level TCP ops. Spec:
 # docs/effects-stdlib.md §`NetTcp`. Default handler in stage0/runtime.h
@@ -55394,7 +55458,7 @@ fn builtin_nettcp_decl() : Decl =
       EOp("close", [],
           [param_typed_zero("c", ty_name_zero("Conn"))],
           ty_name_zero("Unit"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # net-tcp-v1: opaque connection handle. Single-field record carrying
 # the OS file descriptor; the runtime's `_kai_net_record_fd` reads
@@ -55429,7 +55493,7 @@ fn builtin_signal_decl() : Decl =
       EOp("off",   [], [param_typed_zero("sig", ty_name_zero("Sig"))],
           ty_name_zero("Unit"), 0, 0),
       EOp("await", [], [], ty_name_zero("Sig"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # Issue #107: Sig sum type — closed catalog of POSIX signals the
 # Signal effect can subscribe to. Variant *names* are the runtime
@@ -55490,7 +55554,7 @@ fn builtin_process_decl() : Decl =
                    pline: 0, pcol: 0 }],
           ty_name_zero("Nothing"),
           0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # Issue #126: opaque Child handle. v1 carries only the OS pid; the
 # field name "pid" is load-bearing — the runtime's
@@ -55524,7 +55588,7 @@ fn builtin_log_decl() : Decl =
       EOp("info",  [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0),
       EOp("warn",  [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0),
       EOp("error", [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # Issue #140: SecureRandom effect — cryptographically-secure RNG,
 # deliberately separate from `Random` so a test handler stubbing
@@ -55558,7 +55622,7 @@ fn builtin_securerandom_decl() : Decl =
           [Param { pname: "n", ptype: Some(ty_name_zero("Int")),
                    pline: 0, pcol: 0 }],
           ty_list_zero(ty_name_zero("Int")), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # m7b #11: stdlib parameterised effects per Doc B §`State[T]` and
 # §`Reader[T] and Writer[W]`. Each one gets its own evidence struct,
@@ -55570,20 +55634,20 @@ fn builtin_state_decl() : Decl =
       EOp("get", [], [], ty_name_zero("T"), 0, 0),
       EOp("set", [], [param_typed_zero("v", ty_name_zero("T"))],
           ty_name_zero("Unit"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 fn builtin_reader_decl() : Decl =
   DEffect(false, "Reader", ["T"],
     [
       EOp("ask", [], [], ty_name_zero("T"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 fn builtin_writer_decl() : Decl =
   DEffect(false, "Writer", ["W"],
     [
       EOp("tell", [], [param_typed_zero("w", ty_name_zero("W"))],
           ty_name_zero("Unit"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # m7b #2b: `Mutable` effect — Doc B §`Mutable`. Per-op generics
 # (#2a) make this declarable: each array op carries its own `[T]`,
@@ -55654,7 +55718,7 @@ fn builtin_mutable_decl() : Decl =
            param_typed_zero("v", ty_name_zero("T"))],
           ty_name_zero("Unit"),
           0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # m8 #7: Actor[Msg] — parameterised effect on the message type. Same
 # m7b #11 machinery as State[T] / Reader[T] / Writer[W]: the effect-
@@ -55679,7 +55743,7 @@ fn builtin_actor_decl() : Decl =
            param_typed_zero("msg", ty_name_zero("Msg"))],
           ty_name_zero("Unit"), 0, 0),
       EOp("receive", [], [], ty_name_zero("Msg"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # m8 #9: Link — bidirectional supervision. `link(peer)` registers a
 # bidirectional crash-propagation between the current actor and
@@ -55696,7 +55760,7 @@ fn builtin_link_decl() : Decl =
     [
       EOp("link", [], [param_typed_zero("peer", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
           ty_name_zero("Unit"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # m8 #9: Monitor — unidirectional supervision. `monitor(target_pid)`
 # registers the current fiber as an observer of `target_pid`'s
@@ -55723,7 +55787,7 @@ fn builtin_monitor_decl() : Decl =
       EOp("demonitor", [],
           [param_typed_zero("ref", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
           ty_name_zero("Unit"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # m8 #4: Cancel — single op `raise() : Nothing`. Doc B §`Cancel`.
 # The default handler exits the program with a banner; user code
@@ -55737,7 +55801,7 @@ fn builtin_cancel_decl() : Decl =
   DEffect(false, "Cancel", [],
     [
       EOp("raise", [], [], ty_name_zero("Nothing"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # m8 #2/#3: Spawn — non-parametric effect. Per Doc B §`Spawn`, the
 # user-facing API is polymorphic (`spawn[T, e]`, `await[T]`, etc.).
@@ -55783,7 +55847,7 @@ fn builtin_spawn_decl() : Decl =
       # `kai_default_spawn_set_trap_exit` in stage0/runtime.h.
       EOp("set_trap_exit", [], [param_typed_zero("on", ty_name_zero("Bool"))],
                     ty_name_zero("Unit"), 0, 0)
-    ], 0, 0)
+    ], None, 0, 0)
 
 # ============================================================
 # Issue #454 — library mode (typed-AST queries).
@@ -56033,7 +56097,7 @@ fn find_enc_decl(d: Decl, ql: Int, qc: Int, acc: Option[EncResult]) : Option[Enc
     }
     DType(_, _, _, _, line, col) -> enc_better(acc, line, col, "DType", None, ql, qc)
     DImport(_, line, col)        -> enc_better(acc, line, col, "DImport", None, ql, qc)
-    DEffect(_, _, _, _, line, col) -> enc_better(acc, line, col, "DEffect", None, ql, qc)
+    DEffect(_, _, _, _, _, line, col) -> enc_better(acc, line, col, "DEffect", None, ql, qc)
     DProtocol(_, _, _, _, line, col) -> enc_better(acc, line, col, "DProtocol", None, ql, qc)
     DImpl(_, _, _, decls, line, col) -> {
       let a1 = enc_better(acc, line, col, "DImpl", None, ql, qc)
@@ -56783,7 +56847,7 @@ fn find_decl_def(ds: [Decl], name: String) : Option[DefLoc] {
         if n == name { Some(DL("DConst", n, line, col)) } else { find_decl_def(rest, name) }
       DType(_, n, _, _, line, col) ->
         if n == name { Some(DL("DType", n, line, col)) } else { find_decl_def(rest, name) }
-      DEffect(_, n, _, _, line, col) ->
+      DEffect(_, n, _, _, _, line, col) ->
         if n == name { Some(DL("DEffect", n, line, col)) } else { find_decl_def(rest, name) }
       DProtocol(_, n, _, _, line, col) ->
         if n == name { Some(DL("DProtocol", n, line, col)) } else { find_decl_def(rest, name) }
