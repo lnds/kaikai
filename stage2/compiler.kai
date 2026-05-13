@@ -75,6 +75,11 @@ type TokKind
   | TkPlusPlus
   | TkEqEq | TkNeq | TkLt | TkGt | TkLe | TkGe
   | TkBang | TkAt
+  # Issue #556: `$<ident>(args)` is the surface form of a compiler
+  # intrinsic call. Reserved sigil; user code cannot define new
+  # intrinsics. Lexer emits a bare `$` as TkDollar; the parser pairs
+  # it with the following identifier to produce `EIntrinsic(name, args)`.
+  | TkDollar
   # m12.5: caret used for integer power inside unit expressions, e.g.
   # `m^2`, `sec^-1`. Reserved exclusively for unit syntax — outside
   # `<...>` annotations it is a parser error.
@@ -125,7 +130,7 @@ fn tk_name(k: TokKind) : String {
     TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
     TkPercent -> "%" TkPlusPlus -> "++"
     TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">"
-    TkLe -> "<=" TkGe -> ">=" TkBang -> "!" TkAt -> "@" TkCaret -> "^"
+    TkLe -> "<=" TkGe -> ">=" TkBang -> "!" TkAt -> "@" TkCaret -> "^" TkDollar -> "$"
     TkHole -> "?" TkHoleName(_) -> "?NAME"
     TkTodoBang -> "todo!"
     TkError(_) -> "ERROR"
@@ -691,6 +696,10 @@ fn lex_punct(l: Lexer) : LexStep {
         '}' -> Step(l1, tok(TkRbrace, sl, sc, start, l1.pos))
         ',' -> Step(l1, tok(TkComma, sl, sc, start, l1.pos))
         '@' -> Step(l1, tok(TkAt, sl, sc, start, l1.pos))
+        # Issue #556: `$` opens a compiler-intrinsic call (`$<ident>(args)`).
+        # The lexer emits the bare sigil; the parser consumes the
+        # following ident and arg list to build `EIntrinsic`.
+        '$' -> Step(l1, tok(TkDollar, sl, sc, start, l1.pos))
         # m12.5: caret token for unit exponents — only meaningful inside
         # `<...>` annotations; the parser rejects it elsewhere.
         '^' -> Step(l1, tok(TkCaret, sl, sc, start, l1.pos))
@@ -1398,6 +1407,13 @@ type ExprKind
   # at runtime — every walker arm exists purely to keep the
   # exhaustive matches valid.
   | EModCall(String, String)
+  # Issue #556: `$<ident>(args)` — a compiler intrinsic call. Reserved
+  # sigil; user code cannot define new intrinsics. The first field is
+  # the intrinsic name (without the `$`), the second is the arg list.
+  # The typer enforces per-intrinsic shape rules (e.g. `$extern_handler`
+  # takes exactly one string-literal arg and is only valid inside a
+  # clause body that lives in a `default { }` block).
+  | EIntrinsic(String, [Expr])
 
 type ListElem = ElPlain(Expr) | ElSpread(Expr)
 
@@ -1856,6 +1872,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkGe         -> match b { TkGe -> true _ -> false }
     TkBang       -> match b { TkBang -> true _ -> false }
     TkAt         -> match b { TkAt -> true _ -> false }
+    TkDollar     -> match b { TkDollar -> true _ -> false }
     TkCaret      -> match b { TkCaret -> true _ -> false }
     TkHole       -> match b { TkHole -> true _ -> false }
     TkHoleName(_) -> match b { TkHoleName(_) -> true _ -> false }
@@ -2244,6 +2261,7 @@ fn arg_has_placeholder(e: Expr) : Bool {
     ETodo(_)            -> false
     EVariantsOf(_, _)   -> false
     EModCall(_, _)      -> false
+    EIntrinsic(_, args_) -> any_arg_has_placeholder(args_)
     # `ELambda` introduces a fresh scope. Per docs, `.` does NOT
     # reach into a nested arrow lambda — that's the multi-arg /
     # nested case the spec rejects.
@@ -2357,6 +2375,8 @@ fn subst_placeholder_kind(k: ExprKind, repl: Expr) : ExprKind {
     ETodo(_)            -> k
     EVariantsOf(_, _)   -> k
     EModCall(_, _)      -> k
+    EIntrinsic(name, args_) ->
+      EIntrinsic(name, map(args_, (a) => subst_placeholder_expr(a, repl)))
     EPlaceholder        -> k    # handled by subst_placeholder_expr
     ELambda(_, _)       -> k    # scope barrier
     EHandle(_, _, _, _, _, _, _) -> k    # scope barrier
@@ -3094,6 +3114,7 @@ fn parse_primary(p: Parser) : PExpr / Console {
     }
     TkHole -> ok_e(p_advance(p), mk_expr(EHole(None), t.line, t.col))
     TkHoleName(nm) -> ok_e(p_advance(p), mk_expr(EHole(Some(nm)), t.line, t.col))
+    TkDollar -> parse_intrinsic(p, t)
     TkTodoBang -> parse_todo_bang(p, t)
     TkRegex -> parse_regex_sigil(p, t)
     TkIdent -> parse_ident_primary(p, t)
@@ -3147,6 +3168,40 @@ fn parse_todo_bang(p: Parser, t: Token) : PExpr / Console {
             ok_e(p_advance(p3), mk_expr(ETodo(msg), t.line, t.col))
           }
         }
+      }
+    }
+  }
+}
+
+# Issue #556: `$<ident>(args)` — a compiler intrinsic call.
+# Caller has already peeked `TkDollar` at `t`; `p` is positioned on
+# the `$` token itself. The parser:
+#   1. consumes the `$`,
+#   2. requires an immediately-following identifier (no whitespace
+#      logic — the lexer already skipped newlines into `t`),
+#   3. requires a `(arg, ...)` arglist,
+#   4. produces `EIntrinsic(name, args)`.
+# Per-intrinsic shape rules (arity, arg kind, context) are enforced
+# later by the typer, not here — the parser's job is to deliver the
+# call shape to the AST.
+fn parse_intrinsic(p: Parser, t: Token) : PExpr / Console {
+
+  let p1 = p_advance(p)
+  let id = p_peek(p1)
+  if not tk_is(id.kind, TkIdent) {
+    err_e(p_error(p1, id, "expected an intrinsic name after `$` (e.g. `$extern_handler(\"sym\")`)"))
+  } else {
+    let name = tok_source(p1.src, id)
+    let p2 = p_advance(p1)
+    if not p_at(p2, TkLparen) {
+      err_e(p_error_here(p2,
+        "expected `(` to start the intrinsic argument list — write `$NAME(args)`"))
+    } else {
+      let p3 = p_advance(p2)
+      let args_r = parse_call_args(p3)
+      match args_r.r {
+        None    -> err_e(args_r.p)
+        Some(args_) -> ok_e(args_r.p, mk_expr(EIntrinsic(name, args_), t.line, t.col))
       }
     }
   }
@@ -7832,6 +7887,7 @@ fn ival_of_expr(e: Expr, env: IntervalEnv) : Interval = match e.kind {
   ETodo(_)   -> ITop
   EVariantsOf(_, _) -> ITop
   EModCall(_, _)    -> ITop
+  EIntrinsic(_, _)  -> ITop
   ECall(_, _)       -> ITop
   EField(_, _)      -> ITop
   EIndex(_, _)      -> ITop
@@ -9766,6 +9822,10 @@ fn dump_expr(e: Expr, depth: Int) : Unit / Console {
     # m6.2: qualified module call. Two strings (module + fn).
     EModCall(m, fname) ->
       emit_line(depth, "modcall #{m}.#{fname} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EIntrinsic(name, args_) -> {
+      emit_line(depth, "intrinsic $#{name} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      args_ |> each((a) => dump_expr(a, depth + 1))
+    }
   }
 }
 
@@ -10538,6 +10598,10 @@ fn chk_expr(e: Env, x: Expr) : Env / Console + File {
     # and binds no names — the resolver fills it in once everything
     # is in scope, so the checker has nothing to verify here.
     EModCall(_, _) -> e
+    # Issue #556: intrinsic args are sub-expressions; the resolver/
+    # typer validates them later (per-intrinsic rules). Here we just
+    # walk through them to surface name-binding issues uniformly.
+    EIntrinsic(_, _) -> e
   }
 }
 
@@ -11622,6 +11686,7 @@ fn walk_bare_callees(e: Expr, acc: [String]) : [String] = match e.kind {
   ETodo(_)            -> acc
   EVariantsOf(_, _)   -> acc
   EModCall(_, _)      -> acc
+  EIntrinsic(_, args_) -> walk_bare_callees_list(args_, acc)
   ECall(callee, args_) -> {
     let acc1 = match callee.kind {
       EVar(name) -> if list_has(acc, name) { acc } else { [name, ...acc] }
@@ -11875,6 +11940,7 @@ fn report_unused_in_expr(file: String, e: Expr) : Unit / Console + File {
     ETodo(_) -> ()
     EVariantsOf(_, _) -> ()
     EModCall(_, _) -> ()
+    EIntrinsic(_, args_) -> report_unused_in_exprs(file, args_)
     ECall(f, xs) -> {
       report_unused_in_expr(file, f)
       report_unused_in_exprs(file, xs)
@@ -14044,6 +14110,7 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
     # binding — module name and function name are both pure strings
     # resolved via the module table.
     EModCall(_, _) -> acc
+    EIntrinsic(_, args_) -> fv_exprs(args_, own, globals, acc)
   }
 }
 
@@ -14448,6 +14515,7 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
     # m6.2 Phase 2.1: qualified module call hosts no lambdas and
     # introduces no clauses — both fields are plain strings.
     EModCall(_, _) -> st
+    EIntrinsic(_, args_) -> collect_exprs(args_, st)
   }
 }
 
@@ -15772,6 +15840,11 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
         cat5("kai_closure(&_kai_", c_sym(fname, Some(mod)), "_thunk, ", int_to_string(ar), ", 0, NULL)")
       None -> cat2("kai_", fname)
     }
+    # Issue #556: intrinsic calls in value position should never reach
+    # emit_expr_boxed — the typer rejects them outside the clause-body
+    # context where Stage 4 codegen recognises them and emits a bridge.
+    # If we get here, that constraint was violated upstream.
+    EIntrinsic(name, _) -> cat3("kai_unit() /* unreachable: intrinsic $", name, " in value position */")
   }
 }
 
@@ -17452,8 +17525,8 @@ fn emit_main_wrapper(decls: [Decl], bmode: BuildMode) : String {
         # EvX layout — emitting it for a user `effect Log { ... }` shape
         # produces invalid C against the user's struct.
         let main_row = row_minus_user_effects(main_row_labels(decls), decls)
-        let shims    = default_shims_for(main_row)
-        let setup    = default_setups_for(main_row)
+        let shims    = default_shims_for(main_row, decls)
+        let setup    = default_setups_for(main_row, decls)
         let teardown = default_pops_for(main_row)
         concat_all([
           shims,
@@ -17518,6 +17591,7 @@ fn collect_call_labels(e: Expr, acc: [Label]) : [Label] = match e.kind {
   ETodo(_)            -> acc
   EVariantsOf(_, _)   -> acc
   EModCall(_, _)      -> acc
+  EIntrinsic(_, args_) -> collect_call_labels_list(args_, acc)
   ECall(callee, args_) -> {
     let acc1 = match callee.ty {
       Some(t) -> match t {
@@ -17690,6 +17764,144 @@ fn main_row_labels(decls: [Decl]) : [String] {
 # `-fsanitize=function`). Setup assigns the shim's address; no
 # cast required at the assignment, no UBSan diagnostic at the
 # dispatch site.
+# Issue #556: derive a default-handler shim from a user-declared
+# `default { }` block whose clause bodies are `$extern_handler("c_sym")`.
+# The shim shape mirrors the hardcoded family above:
+#     static KaiValue *_kai_default_<eff_lc>_<op>_shim(Ev<Eff> *self,
+#         KaiValue *kai_<arg>, ..., KaiCont *k) {
+#         return <c_sym>(self, kai_<arg>, ..., k);
+#     }
+# Returns "" when the effect has no default block, or when the block's
+# clauses do not all bridge to extern_handler (the latter case is a
+# user-declared effect with kaikai-bodied default; Stage C will lower
+# those, but Stage A's codegen scope is the extern_handler bridge only).
+fn default_shims_from_block(eff_name: String, decls: [Decl]) : String =
+  match find_effect_default_block(eff_name, decls) {
+    None         -> ""
+    Some(defblk) -> match defblk {
+      DBlk(clauses, _, _, _) ->
+        concat_all(map(clauses, (c) => default_shim_from_clause(eff_name, c)))
+    }
+  }
+
+fn default_setups_from_block(eff_name: String, decls: [Decl]) : String =
+  match find_effect_default_block(eff_name, decls) {
+    None         -> ""
+    Some(defblk) -> match defblk {
+      DBlk(clauses, _, _, _) -> {
+        let eff_lc = string_to_lower_ascii(eff_name)
+        concat_all([
+          "    static Ev", eff_name, " _kai_default_ev_", eff_lc, ";\n",
+          "    static KaiEvidence _kai_default_node_", eff_lc, ";\n",
+          "    _kai_default_ev_", eff_lc, ".handler_id = kai_fresh_handler_id();\n",
+          concat_all(map(clauses, (c) => default_setup_assign_from_clause(eff_name, c))),
+          "    kai_evidence_push(&_kai_default_node_", eff_lc,
+            ", \"", eff_name, "\", &_kai_default_ev_", eff_lc, ");\n"
+        ])
+      }
+    }
+  }
+
+# Look up the `Option[DefaultBlock]` on `effect <eff_name>`. Returns
+# None when the effect is not declared, or when it declares no default
+# block.
+fn find_effect_default_block(eff_name: String, decls: [Decl]) : Option[DefaultBlock] {
+  match decls {
+    [] -> None
+    [d, ...rest] -> match d {
+      DEffect(_, n, _, _, defblk, _, _) ->
+        if n == eff_name { defblk } else { find_effect_default_block(eff_name, rest) }
+      _ -> find_effect_default_block(eff_name, rest)
+    }
+  }
+}
+
+# Build a single shim declaration from a clause whose body bridges to
+# a C symbol via `$extern_handler("c_sym")`. Returns "" if the body is
+# not an extern_handler intrinsic — Stage A does not emit kaikai-bodied
+# default clauses.
+# NOTE: do NOT name a local binding `c_sym` here — `c_sym` is also a
+# pre-existing fn in compiler.kai (issue #261 FFI C-symbol minter), and
+# the resolver picks the global fn over the let-binding, emitting the
+# expression as a closure reference instead of a string read. Use
+# `csym_name` or similar to dodge the collision.
+fn default_shim_from_clause(eff_name: String, c: HClause) : String =
+  match c {
+    HC(op_name, params, body, _, _) -> {
+      let csym_opt = extern_handler_c_symbol(body)
+      match csym_opt {
+        None        -> ""
+        Some(csym_name) -> {
+          let visible = op_args_only(params)
+          let arg_decls = concat_all(map(visible, (p) => concat_all([", KaiValue *kai_", p.pname])))
+          let arg_pass  = concat_all(map(visible, (p) => concat_all([", kai_", p.pname])))
+          concat_all([
+            "static KaiValue *_kai_default_", string_to_lower_ascii(eff_name),
+              "_", op_name, "_shim(Ev", eff_name, " *self",
+              arg_decls, ", KaiCont *k) {\n",
+            "    return ", csym_name, "(self", arg_pass, ", k);\n",
+            "}\n"
+          ])
+        }
+      }
+    }
+  }
+
+# Build the per-clause field assignment line for the setup block:
+#     _kai_default_ev_<eff_lc>.<op> = &_kai_default_<eff_lc>_<op>_shim;
+# Returns "" when the clause is not an extern_handler bridge.
+fn default_setup_assign_from_clause(eff_name: String, c: HClause) : String =
+  match c {
+    HC(op_name, _, body, _, _) -> match extern_handler_c_symbol(body) {
+      None    -> ""
+      Some(_) -> {
+        let eff_lc = string_to_lower_ascii(eff_name)
+        concat_all([
+          "    _kai_default_ev_", eff_lc, ".", op_name,
+          " = &_kai_default_", eff_lc, "_", op_name, "_shim;\n"
+        ])
+      }
+    }
+  }
+
+# Recognise a `$extern_handler("c_symbol")` body. Returns Some(c_symbol)
+# when the expression is exactly that intrinsic call with a single
+# plain-string-literal arg; None otherwise. The validation that the
+# string is a C identifier lives in `validate_extern_handler_intrinsics`
+# (run before codegen).
+fn extern_handler_c_symbol(body: Expr) : Option[String] =
+  match body.kind {
+    EIntrinsic(name, args_) ->
+      if name == "extern_handler" {
+        match args_ {
+          [a] -> match a.kind {
+            EStr(span, is_triple) ->
+              if is_triple { None }
+              else { Some(strip_string_quotes(span)) }
+            _ -> None
+          }
+          _ -> None
+        }
+      } else { None }
+    _ -> None
+  }
+
+# Strip leading `"` and trailing `"` from a string-literal span and
+# resolve the minimal escape set the C-identifier surface uses: `\"`
+# survives only as a defensive case (no C identifier contains `"`),
+# and no other escape is meaningful here. Returns "" if the span has
+# no outer quotes (defensive against malformed AST).
+fn strip_string_quotes(span: String) : String {
+  let n = string_length(span)
+  if n < 2 { "" }
+  else {
+    let first_q = match char_at(span, 0) { Some(c) -> c == '"' _ -> false }
+    let last_q  = match char_at(span, n - 1) { Some(c) -> c == '"' _ -> false }
+    if first_q and last_q { string_slice(span, 1, n - 2) }
+    else { span }
+  }
+}
+
 fn default_stdout_shims() : String =
   concat_all([
     "static KaiValue *_kai_default_stdout_print_shim(EvStdout *self, KaiValue *kai_s, KaiCont *k) {\n",
@@ -18196,14 +18408,24 @@ fn default_spawn_setup() : String =
 # flags fibers, Cancel handler unwinds); Mutable below Cancel (I/O
 # cluster). Phase 4b: `Console` acts as the alias `Stdout + Stderr`,
 # so a row containing it triggers both setups.
-fn default_setups_for(main_row: [String]) : String = {
+fn default_setups_for(main_row: [String], decls: [Decl]) : String = {
   # Phase 4b note: after alias expansion in `expand_aliases_in_decls`,
   # main's row never contains "Console" — it has been substituted
   # to `Stdout + Stderr + Stdin` already. We gate on the atomic
   # labels only; the older `or list_has(main_row, "Console")` was
   # dead code carried over from the pre-alias scaffolding.
+  #
+  # Issue #556 Stage A: for each builtin effect whose decl carries a
+  # `default { }` block with `$extern_handler` clauses, derive the
+  # setup from the AST instead of the hardcoded table. The first
+  # migrated effect is Stdout; the rest follow in Stage C. Effects
+  # without a default block (or with kaikai-bodied clauses) keep the
+  # hardcoded path.
   concat_all([
-    if list_has(main_row, "Stdout")  { default_stdout_setup() } else { "" },
+    if list_has(main_row, "Stdout")  {
+      let derived = default_setups_from_block("Stdout", decls)
+      if string_length(derived) > 0 { derived } else { default_stdout_setup() }
+    } else { "" },
     if list_has(main_row, "Stderr")  { default_stderr_setup() } else { "" },
     if list_has(main_row, "Fail")    { default_fail_setup() }    else { "" },
     if list_has(main_row, "Stdin")   { default_stdin_setup() }   else { "" },
@@ -18233,9 +18455,12 @@ fn default_setups_for(main_row: [String]) : String = {
 # every effect in `main_row`, and a missing shim shows up as a
 # C compile error before the binary is produced (and well before
 # UBSan would otherwise catch the type mismatch at runtime).
-fn default_shims_for(main_row: [String]) : String = {
+fn default_shims_for(main_row: [String], decls: [Decl]) : String = {
   concat_all([
-    if list_has(main_row, "Stdout")  { default_stdout_shims() } else { "" },
+    if list_has(main_row, "Stdout")  {
+      let derived = default_shims_from_block("Stdout", decls)
+      if string_length(derived) > 0 { derived } else { default_stdout_shims() }
+    } else { "" },
     if list_has(main_row, "Stderr")  { default_stderr_shims() } else { "" },
     if list_has(main_row, "Fail")    { default_fail_shims() }    else { "" },
     if list_has(main_row, "Stdin")   { default_stdin_shims() }   else { "" },
@@ -18542,6 +18767,8 @@ fn map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     # m6.2 Phase 2.1: qualified module call carries no sub-Exprs
     # (both fields are plain Strings), so `f` has nothing to apply.
     EModCall(_, _) -> k
+    # Issue #556: intrinsic args ARE sub-Exprs, so the visitor recurs.
+    EIntrinsic(name, args_) -> EIntrinsic(name, map(args_, f))
     # Composites: apply f to every direct sub-Expr.
     ECall(callee, args_) -> ECall(f(callee), map(args_, f))
     EField(base, name)   -> EField(f(base), name)
@@ -20712,6 +20939,7 @@ fn body_escapes(name: String, e: Expr) : Bool {
     # m6.2 Phase 2.1: qualified module call mentions a module name and
     # a function name as plain strings, never the local `name`.
     EModCall(_, _) -> false
+    EIntrinsic(_, args_) -> args_escape(name, args_)
   }
 }
 
@@ -21257,6 +21485,10 @@ fn use_rewrite_recurse(k: ExprKind, table: [EffOps], opens: [String],
     # m6.2 Phase 2.1: qualified module call has no sub-Exprs to
     # recurse into and binds no names — pass through unchanged.
     EModCall(_, _) -> UseKindAcc { kind: k, acc: acc }
+    EIntrinsic(name, args_) -> {
+      let ra = use_rewrite_exprs(args_, table, opens, bound, file, acc.errs, [])
+      UseKindAcc { kind: EIntrinsic(name, ra.exprs), acc: UseRwAcc { errs: ra.errs } }
+    }
     ECall(callee, args_) -> {
       let rc = use_rewrite_expr(callee, table, opens, bound, file, acc.errs)
       let ra = use_rewrite_exprs(args_, table, opens, bound, file, rc.errs, [])
@@ -22967,6 +23199,8 @@ fn desugar_interp_kind(k: ExprKind, op_names: [String], op_arities: [OpAr],
     ETodo(_)       -> k
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
+    EIntrinsic(name, args_) ->
+      EIntrinsic(name, map(args_, (a) => desugar_interp_expr(a, op_names, op_arities, mt, file)))
     EField(base, name)   -> EField(desugar_interp_expr(base, op_names, op_arities, mt, file), name)
     EIndex(a, b)         -> EIndex(desugar_interp_expr(a, op_names, op_arities, mt, file),
                                     desugar_interp_expr(b, op_names, op_arities, mt, file))
@@ -25866,6 +26100,17 @@ fn validate_one_type_decl(rest: [Decl], file: String, mt: [ModuleEntry],
                              claims: [TypeNameClaim], errs: Int,
                              name: String, line: Int, col: Int) : Int / Console + File {
 
+  if list_has(reserved_builtin_type_names(), name) {
+    diag_error(file, line, col,
+      concat_all(["type '", name,
+                  "' is a reserved builtin type name and cannot be redeclared"]))
+    diag_help(concat_all(["rename the local type (e.g. '", name,
+                          "2'); '", name, "' is reserved by the language"]))
+    validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
+                                          target_mod_name,
+                                          [TNC(name, line, col), ...claims],
+                                          errs + 1)
+  } else {
   match find_type_name_claim(claims, name) {
     Some(prev) -> {
       report_dup_type_decl(file, name, line, col, prev)
@@ -25887,7 +26132,16 @@ fn validate_one_type_decl(rest: [Decl], file: String, mt: [ModuleEntry],
                                                     errs)
     }
   }
+  }
 }
+
+# Issue #556: types that the language reserves for its own use; user
+# code cannot redeclare them via `type X = ...`. `Cont` is the
+# one-shot continuation type that appears in `extern "handler" fn`
+# signatures inside `default { }` blocks; the typer/codegen treat it
+# as an opaque builtin (TyCon("Cont", [t])) and lower it to KaiCont*
+# at emit time.
+fn reserved_builtin_type_names() : [String] = ["Cont"]
 
 fn me_list_has_name(mes: [ModuleEntry], name: String) : Bool {
   match mes {
@@ -29368,6 +29622,17 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File {
     # has them without re-walking the env. Errors yield a TyAny
     # stub so cascade is graceful.
     EVariantsOf(ty_expr, _) -> synth_variants_of(st, ty_expr, e)
+    # Issue #556 (Stage 3 wires this fully): a `$<name>(args)` reaching
+    # `synth` outside its allowed context is an error. The clause-body
+    # path that legitimately admits `$extern_handler` short-circuits
+    # before reaching this arm; any leak to here is user code with a
+    # misplaced intrinsic call.
+    EIntrinsic(nm, _) -> {
+      diag_error(st.file, e.line, e.col,
+        concat_all(["compiler intrinsic `$", nm,
+                    "` is not valid in this position"]))
+      inferred_leaf(st_bump_err(st), TyAny, e)
+    }
     # m6.2 Phase 2.4 / Issue #219: qualified call. rqc rewrites
     # `EField(EVar(mod), fname)` to `EModCall(mod, fname)` after
     # checking `fname` is in `mod`'s exports. Module fns register
@@ -35997,6 +36262,8 @@ fn expand_aliases_exprkind(k: ExprKind, aliases: [UAliasEntry]) : ExprKind {
     # m6.2 Phase 2.1: qualified module call holds plain strings
     # (module + function names). No type alias to expand.
     EModCall(m, fname) -> EModCall(m, fname)
+    EIntrinsic(name, args_) ->
+      EIntrinsic(name, map(args_, (a) => expand_aliases_expr(a, aliases)))
   }
 }
 
@@ -36165,6 +36432,7 @@ fn tag_of_kind(k: ExprKind) : String {
     EVariantsOf(ty, _) -> concat_all(["variants-of ", type_expr_display(ty)])
     # m6.2 Phase 2.1: qualified module call dump label.
     EModCall(m, fname) -> concat_all(["modcall ", m, ".", fname])
+    EIntrinsic(name, _) -> concat_all(["intrinsic $", name])
   }
 }
 
@@ -36723,6 +36991,7 @@ fn count_tyvar_in_kind(k: ExprKind, atv: [Int], auv: [Int]) : Int {
     ETodo(_)       -> 0
     EVariantsOf(_, _) -> 0
     EModCall(_, _) -> 0
+    EIntrinsic(_, args_) -> sum_count_tyvar_args(args_, atv, auv)
     ECall(callee, args_) -> count_tyvar_in_expr(callee, atv, auv, 0) + sum_count_tyvar_args(args_, atv, auv)
     EField(base, _)   -> count_tyvar_in_expr(base, atv, auv, 0)
     EIndex(a, b)      -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
@@ -37490,6 +37759,7 @@ fn discover_new_tuples_kind(k: ExprKind, insts: [ResolvedCS], polys: [PolyFn],
     ETodo(_)       -> acc
     EVariantsOf(_, _) -> acc
     EModCall(_, _) -> acc
+    EIntrinsic(_, args_) -> discover_new_tuples_args(args_, insts, polys, existing, sm, acc)
     ECall(callee, args_) -> {
       let acc1 = discover_new_tuples_expr(callee, insts, polys, existing, sm, acc)
       discover_new_tuples_args(args_, insts, polys, existing, sm, acc1)
@@ -38198,6 +38468,8 @@ fn unbox_kind_aware(k: ExprKind, env: [LocBind], fns: [EFn]) : ExprKind / Consol
     ETodo(_)       -> k
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
+    EIntrinsic(name, args_) ->
+      EIntrinsic(name, map(args_, (a) => unbox_expr_aware(a, env, fns)))
     ECall(callee, args_) -> ECall(unbox_expr_aware(callee, env, fns),
                                    map(args_, (a) => unbox_expr_aware(a, env, fns)))
     EField(base, name)   -> EField(unbox_expr_aware(base, env, fns), name)
@@ -39387,6 +39659,8 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     ETodo(_)       -> k
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
+    EIntrinsic(name, args_) ->
+      EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, in_lam))
     ECall(callee, args_) ->
       ECall(pcs_rewrite_expr(callee, scope, uses, in_lam),
             pcs_rewrite_expr_list(args_, scope, uses, in_lam))
@@ -39735,6 +40009,7 @@ fn pcs_dup_marks_subs(k: ExprKind, acc: [DupMark]) : [DupMark] {
     ETodo(_) -> acc
     EVariantsOf(_, _) -> acc
     EModCall(_, _) -> acc
+    EIntrinsic(_, args_) -> pcs_dup_marks_exprs(args_, acc)
     ECall(callee, args_) -> pcs_dup_marks_exprs(args_, pcs_dup_marks_expr(callee, acc))
     EField(base, _) -> pcs_dup_marks_expr(base, acc)
     EIndex(a, b) -> pcs_dup_marks_expr(b, pcs_dup_marks_expr(a, acc))
@@ -40195,6 +40470,8 @@ fn pcs_arm_drop_kind(k: ExprKind, line: Int, col: Int, fn_name: String,
     ETodo(_)       -> k
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
+    EIntrinsic(name, args_) ->
+      EIntrinsic(name, pcs_arm_drop_expr_list(args_, fn_name, outer_scope, uses))
     ECall(callee, args_) ->
       ECall(pcs_arm_drop_pass(callee, fn_name, outer_scope, uses),
             pcs_arm_drop_expr_list(args_, fn_name, outer_scope, uses))
@@ -44067,6 +44344,7 @@ fn expr_kind_name(k: ExprKind) : String {
     ELitUnit(_, _) -> "ELitUnit"
     EVariantsOf(_, _) -> "EVariantsOf"
     EModCall(_, _) -> "EModCall"
+    EIntrinsic(_, _) -> "EIntrinsic"
   }
 }
 
@@ -47752,6 +48030,8 @@ fn qualtype_expr_kind(k: ExprKind, mt: [ModuleEntry], file: String) : ExprKind /
   EHole(_)       -> k
   ETodo(_)       -> k
   EModCall(_, _) -> k
+  EIntrinsic(name, args_) ->
+    EIntrinsic(name, qualtype_expr_list(args_, mt, file))
   # Composites with sub-Exprs (mirrors `map_expr_kind` but with
   # `qualtype_expr` called directly so the effect row propagates).
   ECall(callee, args_) ->
@@ -48244,6 +48524,8 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKi
   ETodo(_)       -> e.kind
   EVariantsOf(_, _) -> e.kind
   EModCall(_, _) -> e.kind
+  EIntrinsic(name, args_) ->
+    EIntrinsic(name, rqc_expr_list(args_, locals, mt, file))
   ECall(callee, args_) ->
     ECall(rqc_expr(callee, locals, mt, file),
           rqc_expr_list(args_, locals, mt, file))
@@ -54146,6 +54428,9 @@ fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
     EHandle(_, _, _, _, _, _, _) -> fmt_panic_unsupported("effect handlers", e.line)
     EVariantsOf(_, _) -> fmt_panic_unsupported("variants[T]()", e.line)
     EModCall(m, fname) -> fmt_emit(s0, string_concat_all([m, ".", fname, "()"]))
+    EIntrinsic(name, args_) -> fmt_call(
+      Expr { kind: EVar(string_concat("$", name)), line: e.line, col: e.col, ty: None, mode: MUnknown },
+      args_, s0)
   }
 }
 
@@ -55412,9 +55697,30 @@ fn builtin_console_decl() : Decl =
 # Stdout/Stderr split lets a user fn declare exactly the IO surface
 # it touches. `Console` remains as the combined effect for
 # backward-compat (over-declaration via alias subtyping).
+# Issue #556 Stage A: Stdout migrated to declare its default handler
+# in surface kaikai via a `default { }` block. The clause body is
+# `$extern_handler("kai_default_stdout_print")` — the compiler
+# intrinsic that the codegen recognises and emits as a thin bridge to
+# the runtime C symbol with the calling convention pinned in
+# docs/effects-impl.md §*Evidence types*. The hardcoded
+# `default_stdout_shims()` / `default_stdout_setup()` stays as a
+# fallback for now; codegen prefers the AST-derived version when the
+# default block is present, so the emit is byte-identical.
+fn builtin_stdout_default_block() : DefaultBlock = {
+  let print_param = param_string_zero("s")
+  # The clause carries a trailing `resume` parameter for surface
+  # symmetry with kaikai-bodied clauses; the codegen drops it via
+  # `op_args_only` and synthesises the `KaiCont *k` in its place.
+  let resume_param = Param { pname: "resume", ptype: None, pline: 0, pcol: 0 }
+  let c_sym_lit = mk_expr(EStr("\"kai_default_stdout_print\"", false), 0, 0)
+  let body = mk_expr(EIntrinsic("extern_handler", [c_sym_lit]), 0, 0)
+  DBlk([HC("print", [print_param, resume_param], body, 0, 0)], None, 0, 0)
+}
+
 fn builtin_stdout_decl() : Decl =
   DEffect(false, "Stdout", [],
-    [EOp("print",  [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)], None, 0, 0)
+    [EOp("print",  [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)],
+    Some(builtin_stdout_default_block()), 0, 0)
 
 # m12.8 Phase 4b: Stderr owns just `eprint`.
 fn builtin_stderr_decl() : Decl =
@@ -56292,6 +56598,7 @@ fn find_enc_expr_kind(k: ExprKind, ql: Int, qc: Int, acc: Option[EncResult]) : O
     }
     ELitUnit(inner, _) -> find_enc_expr(inner, ql, qc, acc)
     EVariantsOf(_, _)  -> acc
+    EIntrinsic(_, args_) -> find_enc_exprs(args_, ql, qc, acc)
   }
 }
 
@@ -56647,6 +56954,7 @@ fn find_local_at_expr_kind(k: ExprKind, qname: String, ql: Int, qc: Int,
     }
     ELitUnit(inner, _) -> find_local_at_expr(inner, qname, ql, qc, scope, acc)
     EVariantsOf(_, _)  -> acc
+    EIntrinsic(_, args_) -> find_local_at_exprs(args_, qname, ql, qc, scope, acc)
   }
 }
 
@@ -56850,6 +57158,7 @@ fn find_var_at_expr_kind(k: ExprKind, ql: Int, qc: Int, acc: Option[String]) : O
     }
     ELitUnit(inner, _) -> find_var_at_expr(inner, ql, qc, acc)
     EVariantsOf(_, _)  -> acc
+    EIntrinsic(_, args_) -> find_var_at_exprs(args_, ql, qc, acc)
   }
 }
 
