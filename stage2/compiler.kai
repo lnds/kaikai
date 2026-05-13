@@ -25741,6 +25741,82 @@ fn report_dup_type_decl(file: String, name: String, line: Int, col: Int,
   }
 }
 
+# Issue #538 shape 2 — reject two `fn foo` declarations in the same
+# module. The resolver historically prepended decls into the env
+# blindly (see `register_one`), so a second `fn foo` silently
+# shadowed the first. Companion to `validate_type_name_collisions_decls`
+# for `type`; this walker only checks same-module same-name DFn pairs
+# in `root_only_decls`. Cross-module shadowing (`pub fn foo` in one
+# module, `fn foo` private in another) is gated by `pub` + `use` and
+# remains permitted.
+#
+# Diagnostic shape mirrors the type case: anchor at the second site,
+# cite the earlier file:line:col in the message body, and add a help
+# line nudging the user to rename or remove the redeclaration.
+
+type FnNameClaim = FNC(String, Int, Int)
+
+fn validate_fn_name_collisions_decls(root_decls: [Decl],
+                                        file: String) : Int / Console + File {
+
+  validate_fn_name_collisions_loop(root_decls, file, [], 0)
+}
+
+fn validate_fn_name_collisions_loop(remaining: [Decl], file: String,
+                                       claims: [FnNameClaim],
+                                       errs: Int) : Int / Console + File {
+
+  match remaining {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DFn(_, name, _, _, _, _, _, line, col, _) ->
+        validate_one_fn_decl(rest, file, claims, errs, name, line, col)
+      _ -> validate_fn_name_collisions_loop(rest, file, claims, errs)
+    }
+  }
+}
+
+fn validate_one_fn_decl(rest: [Decl], file: String,
+                           claims: [FnNameClaim], errs: Int,
+                           name: String, line: Int, col: Int) : Int / Console + File {
+
+  match find_fn_name_claim(claims, name) {
+    Some(prev) -> {
+      report_dup_fn_decl(file, name, line, col, prev)
+      validate_fn_name_collisions_loop(rest, file, claims, errs + 1)
+    }
+    None ->
+      validate_fn_name_collisions_loop(rest, file,
+                                          [FNC(name, line, col), ...claims],
+                                          errs)
+  }
+}
+
+fn find_fn_name_claim(claims: [FnNameClaim], name: String) : Option[FnNameClaim] {
+  match claims {
+    [] -> None
+    [c, ...rest] -> match c {
+      FNC(n, _, _) -> if n == name { Some(c) } else { find_fn_name_claim(rest, name) }
+    }
+  }
+}
+
+fn report_dup_fn_decl(file: String, name: String, line: Int, col: Int,
+                         prev: FnNameClaim) : Unit / Console + File {
+
+  match prev {
+    FNC(_, prev_line, prev_col) -> {
+      let msg = concat_all(["function '", name,
+                            "' is already declared in this module (earlier at ",
+                            file, ":", int_to_string(prev_line), ":",
+                            int_to_string(prev_col), ")"])
+      diag_error(file, line, col, msg)
+      diag_help(concat_all(["remove or rename the second 'fn ", name,
+                              "(...)' declaration"]))
+    }
+  }
+}
+
 # m7b #12 — collect all distinct row-variable names appearing in the
 # row positions of a function declaration's signature: the outer
 # return-row plus every nested `TyFn` row inside parameter types and
@@ -46148,18 +46224,25 @@ fn lookup_op_offset(table: [OpOffset], key: String) : Option[Int] {
 type ModuleEntry = ME(String, [String], String)
 #                     ^name  ^exports  ^origin
 
-type ResolveState = { visited: [String], decls: [Decl], modules: [ModuleEntry] }
+type ResolveState = { visited: [String], decls: [Decl], modules: [ModuleEntry], errs: Int }
 
 fn rs_has(rs: ResolveState, p: String) : Bool = list_has(rs.visited, p)
 
 fn rs_mark(rs: ResolveState, p: String) : ResolveState =
-  ResolveState { visited: [p, ...rs.visited], decls: rs.decls, modules: rs.modules }
+  ResolveState { visited: [p, ...rs.visited], decls: rs.decls, modules: rs.modules, errs: rs.errs }
 
 fn rs_append_decls(rs: ResolveState, ds: [Decl]) : ResolveState =
-  ResolveState { visited: rs.visited, decls: list_append(rs.decls, ds), modules: rs.modules }
+  ResolveState { visited: rs.visited, decls: list_append(rs.decls, ds), modules: rs.modules, errs: rs.errs }
 
 fn rs_add_module(rs: ResolveState, entry: ModuleEntry) : ResolveState =
-  ResolveState { visited: rs.visited, decls: rs.decls, modules: list_append(rs.modules, [entry]) }
+  ResolveState { visited: rs.visited, decls: rs.decls, modules: list_append(rs.modules, [entry]), errs: rs.errs }
+
+# Issue #538 shape 3: increment the error counter when an import
+# fails to resolve. Callers fold this count into the compile-source
+# exit-code aggregator so a missing module fails the build even when
+# no downstream user references a name from it.
+fn rs_bump_errs(rs: ResolveState) : ResolveState =
+  ResolveState { visited: rs.visited, decls: rs.decls, modules: rs.modules, errs: rs.errs + 1 }
 
 # Extract the public-facing names declared at the top of a module
 # file. Looks at pub fn / pub type / pub effect / pub protocol /
@@ -46325,7 +46408,10 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
         match opt_src {
           None -> {
             eprint("kaic: cannot open module '#{mod_path}' (tried #{abs_path}): no such file")
-            rs1
+            # Issue #538 shape 3: bump the resolver error counter so
+            # the compile-source aggregator returns non-zero even when
+            # nothing downstream uses a name from the missing module.
+            rs_bump_errs(rs1)
           }
           Some(src) -> {
             let tokens = tokenize(src)
@@ -46403,7 +46489,11 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], rs: 
 # head of `decls` so `validate_pub_access` can split the flat
 # stream back into "imported from another module" vs "authored
 # in the root file" without re-walking the import graph.
-type ExpandedProgram = EP_Mod([Decl], [ModuleEntry], Int)
+# `errs` (issue #538 shape 3) is the count of import-resolution
+# failures so `compile_source` can fold it into the exit code
+# even when nothing downstream references a name from the missing
+# module.
+type ExpandedProgram = EP_Mod([Decl], [ModuleEntry], Int, Int)
 
 # Given a root file's path and its parsed decls, return the flat
 # decl list with every (transitively-)imported module's decls
@@ -46421,12 +46511,12 @@ fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl],
 
 
   let base_dir = dir_of(root_path)
-  let rs0 = ResolveState { visited: [root_path, ...prelude_paths], decls: [], modules: [] }
+  let rs0 = ResolveState { visited: [root_path, ...prelude_paths], decls: [], modules: [], errs: 0 }
   let rs1 = process_imports(base_dir, root_decls, search_paths, rs0)
   let imports = rs1.decls
   let n_imports = list_length(imports)
   let all_decls = list_append(imports, non_import_decls(root_decls))
-  EP_Mod(all_decls, rs1.modules, n_imports)
+  EP_Mod(all_decls, rs1.modules, n_imports, rs1.errs)
 }
 
 # ====================================================================
@@ -55919,8 +56009,12 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # same file twice.
             let prelude_paths = collect_module_origins(prelude_mods, [])
             let expanded = expand_imports(path, search_paths, own_decls_no_holes, prelude_paths)
-            let expanded_decls_raw = match expanded { EP_Mod(ds, _, _) -> ds }
-            let n_imports_raw = match expanded { EP_Mod(_, _, n) -> n }
+            let expanded_decls_raw = match expanded { EP_Mod(ds, _, _, _) -> ds }
+            let n_imports_raw = match expanded { EP_Mod(_, _, n, _) -> n }
+            # Issue #538 shape 3: count of import-resolution failures
+            # (e.g. `import nothing_here` whose file is missing on the
+            # search path). Folded into the exit-code aggregator below.
+            let import_resolve_errs = match expanded { EP_Mod(_, _, _, e) -> e }
             # Issue #230: register the target file itself in the module
             # table under its own basename, mirroring what `load_prelude`
             # does for `--prelude` files. Without this, an intrinsic
@@ -55949,7 +56043,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # target's own ME comes last so its bare name shadows any
             # same-named prelude (intentional: the file is "itself").
             let module_table = list_append(
-              list_append(prelude_mods, match expanded { EP_Mod(_, mt, _) -> mt }),
+              list_append(prelude_mods, match expanded { EP_Mod(_, mt, _, _) -> mt }),
               [target_me])
             # Issue #216: `--prelude` files used to bypass `rqc_decls`
             # — they were merged in raw, so `list.foo` calls inside a
@@ -56031,6 +56125,12 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # always the "second claimant" and own the diagnostic.
             let type_name_coll_errs = validate_type_name_collisions_decls(
               root_only_decls, path, module_table, prelude_mods, target_mod_name)
+            # Issue #538 shape 2: reject two `fn foo` decls in the
+            # same root file. Mirrors the type check above. The
+            # resolver's `register_one` prepends blindly so a second
+            # `fn foo` would otherwise silently shadow the first.
+            let fn_name_coll_errs = validate_fn_name_collisions_decls(
+              root_only_decls, path)
             # m12.6.x #3 v2: synthesise `__ref_pred_X` fn for every
             # `type X = Base where pred` so match-arm narrowing
             # `p : X` resolves cleanly (parse_optional_arm_refine
@@ -56196,7 +56296,8 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               all_decls, path, brand_calls, brand_registry)
             let proto_reg = lowered.reg
             let proto_errs = lowered.errs
-            if alias_res.errs > 0 { alias_res.errs }
+            if import_resolve_errs > 0 { import_resolve_errs }
+            else if alias_res.errs > 0 { alias_res.errs }
             else if use_errs > 0 { use_errs }
             else if proto_errs > 0 { proto_errs }
             else if import_hole_errs > 0 { import_hole_errs }
@@ -56206,6 +56307,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             else if qualtype_errs > 0 { qualtype_errs }
             else if pub_access_errs > 0 { pub_access_errs }
             else if type_name_coll_errs > 0 { type_name_coll_errs }
+            else if fn_name_coll_errs > 0 { fn_name_coll_errs }
             else {
             match mode {
               MAst -> { dump_program(raw_decls); 0 }
