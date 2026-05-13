@@ -97,6 +97,18 @@ git filter-repo \
   --path tools/symbolize-rc-trace.sh \
   --path tools/bench-phases.sh \
   --invert-paths \
+  --message-callback '
+import re
+text = message.decode("utf-8", errors="replace")
+# Strip Claude Co-Authored-By trailers (case-insensitive, any Claude variant).
+text = re.sub(r"^Co-Authored-By: .*Claude.*\n?", "", text, flags=re.MULTILINE | re.IGNORECASE)
+# Strip "Generated with Claude Code" footers and similar attribution lines.
+text = re.sub(r"^.*Generated with .*Claude.*\n?", "", text, flags=re.MULTILINE | re.IGNORECASE)
+text = re.sub(r"^🤖.*\n?", "", text, flags=re.MULTILINE)
+# Collapse trailing blank lines that may remain.
+text = re.sub(r"\n{3,}$", "\n\n", text)
+return text.encode("utf-8")
+' \
   --force
 
 # ---------------------------------------------------------------------------
