@@ -184,3 +184,84 @@ jobs:
           git add Formula/kaikai.rb
           git commit -m "chore(formula): bump to v${version}"
           git push origin HEAD
+
+  publish-source:
+    name: Mirror filtered source to kaikailang-org/kaikai
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout work repo (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install git-filter-repo
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y git-filter-repo
+
+      - name: Configure git identity for the mirror commit
+        run: |
+          git config user.name "kaikai-release-bot"
+          git config user.email "kaikai-release-bot@users.noreply.github.com"
+
+      - name: Filter internal-only paths + strip Claude trailers
+        run: |
+          # Mirror the logic of tools/publish.sh in-process. Run in the
+          # checked-out workspace; force-pushes go to kaikailang-org/kaikai.
+          git filter-repo \
+            --path-glob 'docs/lane-experience-*.md' \
+            --path-glob 'docs/lane-audit-*.md' \
+            --path-glob 'docs/*audit*.md' \
+            --path-glob 'docs/*honesty*.md' \
+            --path-glob 'docs/*followup*.md' \
+            --path-glob 'docs/nocturnal-*.md' \
+            --path tools/coverage-baseline.txt \
+            --path tools/symbolize-rc-trace.sh \
+            --path tools/bench-phases.sh \
+            --invert-paths \
+            --message-callback '
+          import re
+          text = message.decode("utf-8", errors="replace")
+          text = re.sub(r"^Co-Authored-By: .*Claude.*\n?", "", text, flags=re.MULTILINE | re.IGNORECASE)
+          text = re.sub(r"^.*Generated with .*Claude.*\n?", "", text, flags=re.MULTILINE | re.IGNORECASE)
+          text = re.sub(r"^🤖.*\n?", "", text, flags=re.MULTILINE)
+          text = re.sub(r"\n{3,}$", "\n\n", text)
+          return text.encode("utf-8")
+          ' \
+            --force
+
+      - name: Replace CLAUDE.md, add CONTRIBUTING.md, sed-clean decisions
+        run: |
+          cp tools/publish/CLAUDE.md.public CLAUDE.md
+          cp tools/publish/CONTRIBUTING.md.public CONTRIBUTING.md
+          sed -i \
+            -e 's|See `docs/lane-experience-kai-repl-watch.md` for the|See an internal lane report for the|' \
+            -e 's|`docs/lane-experience-kai-repl-watch.md` is left intact as the|the internal lane report is preserved as the|' \
+            docs/decisions/repl-removal-2026-05-09.md
+          git add CLAUDE.md CONTRIBUTING.md docs/decisions/repl-removal-2026-05-09.md
+          if ! git diff --cached --quiet; then
+            git commit -m "docs: prepare public mirror (CLAUDE.md trimmed, CONTRIBUTING.md added)"
+          fi
+
+      - name: Push filtered main to public
+        env:
+          PUBLISH_TOKEN: ${{ secrets.TAP_PAT }}
+        run: |
+          git remote add public "https://x-access-token:${PUBLISH_TOKEN}@github.com/kaikailang-org/kaikai.git"
+          git push public main:main --force
+
+      - name: Push filtered tags to public (one-by-one to avoid SSH pack hang)
+        env:
+          PUBLISH_TOKEN: ${{ secrets.TAP_PAT }}
+        run: |
+          # Iterate tags individually; SSH batch tag push has hung on
+          # macOS in the past. HTTPS via PAT works the same on Linux but
+          # we stay defensive.
+          for tag in $(git tag --list 'v*' | sort); do
+            git push public "refs/tags/${tag}:refs/tags/${tag}" --force || {
+              echo "::warning::failed to push tag $tag"
+            }
+          done
