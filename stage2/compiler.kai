@@ -32628,7 +32628,8 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File {
         None -> lower_pair.ty
         Some(te) -> resolve_ty(te)
       }
-      let after = check_pattern(binding_st, pat, binding_ty)
+      let dup_st = check_pattern_no_dup_binds(binding_st, pat)
+      let after = check_pattern(dup_st, pat, binding_ty)
       OneStmt { st: after, stmt: SLet(pat, ann, lower_pair.expr) }
     }
     SAssert(cond, msg) -> {
@@ -32690,6 +32691,76 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File {
 }
 
 # ---- patterns ----
+
+# Issue #534 shape 1: a single pattern that binds the same name
+# twice (e.g. `MkPair(x, x)`) is silently accepted today — the
+# second binding shadows the first within the same arm. Per
+# ML/Haskell-family convention this is a hard error: the user
+# almost certainly intended an equality check (`MkPair(x, y) if
+# x == y -> ...`). We walk the pattern once, gather every PBind
+# / PAs name, and report duplicates before typing the pattern.
+# Wildcards never collide; `_` is not a binding. Pattern holes
+# (`?` / `?name`) bind no value either and so are skipped here.
+fn pattern_collect_binds(pat: Pattern, acc: [String]) : [String] {
+  match pat.pkind {
+    PWild      -> acc
+    PHole(_)   -> acc
+    PLit(_)    -> acc
+    PBind(nm)  -> [nm, ...acc]
+    PNarrow(nm, _) -> [nm, ...acc]
+    PAs(nm, sub) -> pattern_collect_binds(sub, [nm, ...acc])
+    PList(subs, rest_opt) -> {
+      let acc1 = pattern_collect_binds_list(subs, acc)
+      match rest_opt {
+        None      -> acc1
+        Some(rnm) -> [rnm, ...acc1]
+      }
+    }
+    PVariant(_, subs) -> pattern_collect_binds_list(subs, acc)
+    PVariantRecord(_, pfs) -> pattern_collect_binds_pfields(pfs, acc)
+    PRecord(pfs) -> pattern_collect_binds_pfields(pfs, acc)
+  }
+}
+
+fn pattern_collect_binds_list(ps: [Pattern], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> pattern_collect_binds_list(rest, pattern_collect_binds(p, acc))
+  }
+}
+
+fn pattern_collect_binds_pfields(pfs: [PField], acc: [String]) : [String] {
+  match pfs {
+    [] -> acc
+    [pf, ...rest] -> match pf {
+      PField(_, sub, _) -> pattern_collect_binds_pfields(rest, pattern_collect_binds(sub, acc))
+    }
+  }
+}
+
+fn pattern_first_duplicate(names: [String], seen: [String]) : Option[String] {
+  match names {
+    [] -> None
+    [n, ...rest] -> if list_has(seen, n) {
+      Some(n)
+    } else {
+      pattern_first_duplicate(rest, [n, ...seen])
+    }
+  }
+}
+
+fn check_pattern_no_dup_binds(st: InferState, pat: Pattern) : InferState / Console + File {
+  let binds = pattern_collect_binds(pat, [])
+  match pattern_first_duplicate(binds, []) {
+    None -> st
+    Some(nm) -> {
+      diag_error(st.file, pat.line, pat.col, "duplicate binding in pattern: `#{nm}`")
+      diag_note("binding `#{nm}` already used elsewhere in this pattern")
+      diag_help("use a different name, or extract the equality with a guard: `MkPair(x, y) if x == y -> ...`")
+      st_bump_err(st)
+    }
+  }
+}
 
 fn check_pattern(st: InferState, pat: Pattern, expected: Ty) : InferState / Console + File {
 
@@ -32980,10 +33051,225 @@ fn check_pfield_list(st: InferState, pfs: [PField], fields: [FTy], line: Int, co
 
 # ---- match ----
 
+# Issue #534 shapes 2 + 3: redundant arms in a `match`. Two
+# arms whose patterns trivially overlap and that share guard
+# shape (both unguarded) make the second arm dead code. Today
+# the language accepts; the user's intent (compute via the
+# second arm) is silently dropped. We fingerprint each arm's
+# head: variant ctor name, literal value, or catch-all marker.
+# Two arms with the same fingerprint, both unguarded, is a hard
+# error. A catch-all (`_`, bare binding) unguarded arm makes any
+# later arm unreachable; we flag the first such later arm. We
+# stay deliberately syntactic: nothing here recurses into
+# variant payloads (`Some(x)` vs `Some(y)` is shape 2; `Some(x)`
+# vs `Some(Just z)` is NOT). The shape covers the cases #534
+# documents and matches what real ML/HM frontends report.
+type ArmHead
+  = AhCatchAll                          # PWild / PBind / PAs over wild — covers everything
+  | AhVariant(String)                   # PVariant(nm, []) or all-catch-all subpats — totally open shape
+  | AhLitInt(Int)
+  | AhLitBool(Bool)
+  | AhLitChar(Char)
+  | AhLitStr(String)                    # raw source span, includes quotes (EStr shape)
+  | AhUnclassified                      # nested / record / list / hole / narrow — skip
+
+# Returns true when a sub-pattern carries no discriminating
+# information — it matches every value at its type. We use this
+# to decide if a `PVariant(nm, subs)` arm is "totally open"; two
+# such arms with the same ctor name overlap completely and the
+# second is dead code. A variant arm with a literal payload like
+# `Some(true)` is NOT totally open — `Some(true)` and `Some(false)`
+# are legitimately distinct arms.
+fn pat_is_catch_all_subpat(pat: Pattern) : Bool {
+  match pat.pkind {
+    PWild       -> true
+    PBind(_)    -> true
+    PHole(_)    -> true
+    PAs(_, sub) -> pat_is_catch_all_subpat(sub)
+    _           -> false
+  }
+}
+
+fn all_subpats_catch_all(ps: [Pattern]) : Bool {
+  match ps {
+    [] -> true
+    [p, ...rest] -> if pat_is_catch_all_subpat(p) { all_subpats_catch_all(rest) } else { false }
+  }
+}
+
+fn all_pfields_catch_all(pfs: [PField]) : Bool {
+  match pfs {
+    [] -> true
+    [pf, ...rest] -> match pf {
+      PField(_, sub, _) -> if pat_is_catch_all_subpat(sub) { all_pfields_catch_all(rest) } else { false }
+    }
+  }
+}
+
+fn arm_head_of(pat: Pattern) : ArmHead {
+  match pat.pkind {
+    PWild       -> AhCatchAll
+    PBind(_)    -> AhCatchAll
+    PHole(_)    -> AhCatchAll
+    PAs(_, sub) -> arm_head_of(sub)
+    PVariant(nm, subs) -> if all_subpats_catch_all(subs) { AhVariant(nm) } else { AhUnclassified }
+    PVariantRecord(nm, pfs) -> if all_pfields_catch_all(pfs) { AhVariant(nm) } else { AhUnclassified }
+    PLit(lit_expr) -> match lit_expr.kind {
+      EInt(n)     -> AhLitInt(n)
+      EBool(b)    -> AhLitBool(b)
+      EChar(c)    -> AhLitChar(c)
+      EStr(s, _)  -> AhLitStr(s)
+      _           -> AhUnclassified
+    }
+    PList(_, _)    -> AhUnclassified
+    PRecord(_)     -> AhUnclassified
+    PNarrow(_, _)  -> AhUnclassified
+  }
+}
+
+fn arm_head_eq(a: ArmHead, b: ArmHead) : Bool {
+  match a {
+    AhCatchAll -> match b { AhCatchAll -> true _ -> false }
+    AhVariant(na) -> match b {
+      AhVariant(nb) -> na == nb
+      _ -> false
+    }
+    AhLitInt(va) -> match b {
+      AhLitInt(vb) -> va == vb
+      _ -> false
+    }
+    AhLitBool(va) -> match b {
+      AhLitBool(vb) -> va == vb
+      _ -> false
+    }
+    AhLitChar(va) -> match b {
+      AhLitChar(vb) -> va == vb
+      _ -> false
+    }
+    AhLitStr(va) -> match b {
+      AhLitStr(vb) -> va == vb
+      _ -> false
+    }
+    AhUnclassified -> false
+  }
+}
+
+fn arm_head_describe(h: ArmHead) : String {
+  match h {
+    AhCatchAll       -> "catch-all"
+    AhVariant(nm)    -> "variant `#{nm}`"
+    AhLitInt(n)      -> "literal `#{int_to_string(n)}`"
+    AhLitBool(b)     -> if b { "literal `true`" } else { "literal `false`" }
+    AhLitChar(_)     -> "this character literal"
+    AhLitStr(s)      -> "literal #{s}"
+    AhUnclassified   -> "this pattern"
+  }
+}
+
+fn arm_is_unguarded(a: Arm) : Bool {
+  match a {
+    Arm(_, guard, _) -> match guard { None -> true Some(_) -> false }
+  }
+}
+
+fn arm_pat_of(a: Arm) : Pattern {
+  match a {
+    Arm(pat, _, _) -> pat
+  }
+}
+
+# A wildcard fallthrough arm emitted by `build_marm_columns` (the
+# multi-arg-match desugar) inherits the outer EMatch's source span:
+# `mk_pat(PWild, line, col)` where `(line, col)` are the match
+# header. The user-written wildcards always carry their own pattern
+# span, so equality of pat.line/col with the match's line/col is a
+# reliable "synthetic" marker. We skip those arms in redundancy
+# bookkeeping so the desugared chain of two-arm matches never
+# triggers a false positive against itself.
+fn arm_is_synthetic_fallthrough(a: Arm, match_line: Int, match_col: Int) : Bool {
+  match a {
+    Arm(pat, guard, _) -> {
+      let unguarded = match guard { None -> true Some(_) -> false }
+      if not unguarded { false }
+      else if pat.line != match_line { false }
+      else if pat.col != match_col { false }
+      else { match pat.pkind { PWild -> true _ -> false } }
+    }
+  }
+}
+
+# Scan arms in order, accumulating the heads of unguarded arms
+# already seen. Errors fire on the FIRST redundant arm — once
+# diagnostic per offender — so a chain `1 -> 1 -> 1 -> _` reports
+# two errors (the two trailing `1`s), not one report listing
+# every collision. `match_line`/`match_col` pin the outer match
+# header so synthetic fallthrough arms can be filtered.
+fn check_arms_redundancy(st: InferState, arms: [Arm], seen: [ArmHead],
+                          saw_catch_all: Bool,
+                          match_line: Int, match_col: Int) : InferState / Console + File {
+  match arms {
+    [] -> st
+    [a, ...rest] -> {
+      if arm_is_synthetic_fallthrough(a, match_line, match_col) {
+        check_arms_redundancy(st, rest, seen, saw_catch_all, match_line, match_col)
+      } else {
+        let pat = arm_pat_of(a)
+        let head = arm_head_of(pat)
+        let unguarded = arm_is_unguarded(a)
+        if saw_catch_all and unguarded {
+          diag_error(st.file, pat.line, pat.col,
+            "unreachable match arm: previous arm matched every value")
+          diag_note("an earlier unguarded `_` or bare binding already covers this case")
+          diag_help("remove this arm, or move it before the catch-all")
+          let st1 = st_bump_err(st)
+          check_arms_redundancy(st1, rest, seen, saw_catch_all, match_line, match_col)
+        } else if unguarded and arm_head_classified(head) and arm_head_in(seen, head) {
+          diag_error(st.file, pat.line, pat.col,
+            "duplicate match arm: #{arm_head_describe(head)} is already matched above")
+          diag_help("remove this arm, or distinguish it with a guard (`#{arm_head_describe(head)} if cond -> ...`)")
+          let st1 = st_bump_err(st)
+          check_arms_redundancy(st1, rest, seen, saw_catch_all, match_line, match_col)
+        } else {
+          let seen1 = if unguarded and arm_head_classified(head) {
+            [head, ...seen]
+          } else {
+            seen
+          }
+          let saw_ca1 = saw_catch_all or (unguarded and arm_head_is_catch_all(head))
+          check_arms_redundancy(st, rest, seen1, saw_ca1, match_line, match_col)
+        }
+      }
+    }
+  }
+}
+
+fn arm_head_classified(h: ArmHead) : Bool {
+  match h {
+    AhUnclassified -> false
+    AhCatchAll     -> false              # tracked via the saw_catch_all flag
+    _              -> true
+  }
+}
+
+fn arm_head_is_catch_all(h: ArmHead) : Bool {
+  match h {
+    AhCatchAll -> true
+    _          -> false
+  }
+}
+
+fn arm_head_in(seen: [ArmHead], target: ArmHead) : Bool {
+  match seen {
+    [] -> false
+    [h, ...rest] -> if arm_head_eq(h, target) { true } else { arm_head_in(rest, target) }
+  }
+}
+
 fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : Inferred / Console + File {
 
 
-  let rs_ = synth(st, scr)
+  let st0 = check_arms_redundancy(st, arms, [], false, line, col)
+  let rs_ = synth(st0, scr)
   let rv = st_fresh_ty(rs_.st)
   let ra = synth_arms(rv.st, arms, rs_.ty, rv.ty, line, col)
   let ty = apply_ty(ra.st.sub, rv.ty)
@@ -33027,7 +33313,8 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
                line: Int, col: Int) : Inferred / Console + File {
 
 
-  let rs_ = synth(st, scr)
+  let st0 = check_arms_redundancy(st, arms, [], false, line, col)
+  let rs_ = synth(st0, scr)
   # issue #430: walk arms via `check_arms` so the expected type
   # propagates into nested EMatch / EIf / EBlock-tailed-by-match
   # arm bodies — the shape produced by the multi-clause fn-body
@@ -33064,7 +33351,8 @@ fn check_arms(st: InferState, arms: [Arm], scrut_ty: Ty, expected: Ty,
     [a, ...rest] -> match a {
       Arm(pat, guard, body) -> {
         let outer = st
-        let s_p = check_pattern(st, pat, scrut_ty)
+        let st_dup = check_pattern_no_dup_binds(st, pat)
+        let s_p = check_pattern(st_dup, pat, scrut_ty)
         let guard_res = match guard {
           None -> InferredOptExpr { st: s_p, expr: None }
           Some(gx) -> {
@@ -34003,7 +34291,8 @@ fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int,
     [a, ...rest] -> match a {
       Arm(pat, guard, body) -> {
         let outer = st
-        let s_p = check_pattern(st, pat, scrut_ty)
+        let st_dup = check_pattern_no_dup_binds(st, pat)
+        let s_p = check_pattern(st_dup, pat, scrut_ty)
         let guard_res = match guard {
           None -> InferredOptExpr { st: s_p, expr: None }
           Some(gx) -> {
