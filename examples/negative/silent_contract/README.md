@@ -44,7 +44,7 @@ and `main_row_user_effect.kai` closed under #517 — they now live in
 | `impl_missing_required_method.kai`, `impl_method_signature_mismatch.kai`, `impl_method_arity_mismatch.kai` | [#535](https://github.com/lnds/kaikai/issues/535) — protocol impl validation |
 | `extern_missing_ffi_capability.kai`, `extern_array_kaikai_type.kai` | [#536](https://github.com/lnds/kaikai/issues/536) — FFI surface validation |
 | `program_name_no_row.kai` | [#537](https://github.com/lnds/kaikai/issues/537) — prelude effect mapping (partial close: `args` and `exit` now mapped; `program_name` stays here per issue #127, which routes argv[0] through the `kai_g_argv` runtime snapshot — pure read of process-wide constant state, not handler-mediated) |
-| `import_cycle/`, `duplicate_fn_decl.kai` | [#538](https://github.com/lnds/kaikai/issues/538) — module system gaps |
+| `import_cycle/` | [#538](https://github.com/lnds/kaikai/issues/538) — module system gaps (shape 1, import cycles; shapes 2+3 closed) |
 | `spawn_qualified_no_row.kai` | [#531](https://github.com/lnds/kaikai/issues/531) — qualified-call masking (existing family) |
 
 Closed as wontfix: #539 (handler missing `return`). The omission is
