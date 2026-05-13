@@ -27629,6 +27629,7 @@ fn apply_ty(s: Subst, t: Ty) : Ty {
   }
 }
 
+
 # m12.5: collapse `TyDimT(TyDimT(b, u1), u2)` to `TyDimT(b, u1*u2)` and
 # strip a `TyDimT(_, UOne)` down to its base. Both shapes can arise
 # transiently when chasing unit-vars through nested dimensioned types.
@@ -27821,8 +27822,17 @@ type LabelPartition = {
   only_right: [Label]
 }
 
-# Find the first label in `ls` whose eff matches; return the label
-# plus the list with it removed (preserving relative order).
+# Find a label in `ls` whose eff matches `target.eff`; return the
+# label plus the list with it removed (preserving relative order).
+#
+# Issue #532 — when multiple candidates share the eff name (e.g. two
+# parametric `Actor[T]` instantiations on the same row), prefer the
+# candidate whose ty_args are concretely unifiable with `target.ty_args`
+# under `s` over a candidate with TyVar-trivial unifiability. This
+# makes nested `with_mailbox` handlers absorb the right `Actor[T]`
+# instantiation rather than picking by row position. When no concrete
+# match exists, fall back to the first eff-name match (older `s`
+# semantics; preserves behavior for non-parametric labels).
 type FindRemove = { found: Label, remain: [Label] }
 
 fn find_remove_label(eff: String, ls: [Label]) : Option[FindRemove] {
@@ -27842,16 +27852,148 @@ fn find_remove_label_loop(eff: String, ls: [Label], seen: [Label]) : Option[Find
   }
 }
 
+# Issue #532 — best-match label lookup for nested parametric effects.
+#
+# When two `with_mailbox` blocks are nested and the body's row carries
+# both `Actor[Request]` and `Actor[Reply]`, the partition step has to
+# decide which one absorbs into the handler's `Actor[Msg]`. Naïve
+# first-eff-name match (`find_remove_label`) picks by row position,
+# which depends on insertion order — that order varies with how the
+# stdlib loads (`--prelude` vs `--path`) and is not what the user
+# wrote.
+#
+# Preference order (each tier falls through to the next when no match
+# survives):
+#
+#   1. Concrete-args match.  Both sides have concrete ty_args that
+#      `ty_eq_shape` agrees on. Picks the "right" Actor[T] when the
+#      handler's instantiation has already been concretised by an
+#      enclosing context. No effect on the nested-handler bug because
+#      the handler's `Msg` is still a fresh TyVar at this point.
+#
+#   2. Raw-TyVar-args match. The candidate's ty_args list contains an
+#      unsubstituted `TyVarT` after `apply_label_args`. A surviving
+#      TyVar at this stage means the candidate was added by an
+#      `Actor.self()` call inside the body whose `T` is the natural
+#      mate for the handler's `Msg`. Concrete-arg candidates (like the
+#      `Actor[Request]` propagated transitively from `dual_send`) get
+#      deprioritised, leaving them to flow up to the enclosing handler.
+#
+#   3. First eff-name match. The original behaviour — preserves the
+#      semantics for non-parametric labels (`Stdout`, `Console`, …)
+#      where the eff name uniquely identifies the label.
+fn find_remove_label_best(target: Label, ls: [Label], s: Subst) : Option[FindRemove] {
+  match find_remove_label_concrete(target, ls, s, []) {
+    Some(fr) -> Some(fr)
+    None -> match find_remove_label_tyvar_args(target, ls, s, []) {
+      Some(fr) -> Some(fr)
+      None     -> find_remove_label(target.eff, ls)
+    }
+  }
+}
+
+fn find_remove_label_concrete(target: Label, ls: [Label], s: Subst,
+                                seen: [Label]) : Option[FindRemove] {
+  match ls {
+    [] -> None
+    [h, ...rest] -> {
+      if h.eff == target.eff and labels_args_unify_concrete(h.ty_args, target.ty_args, s) {
+        Some(FindRemove { found: h, remain: label_concat(seen, rest) })
+      } else {
+        find_remove_label_concrete(target, rest, s, label_concat(seen, [h]))
+      }
+    }
+  }
+}
+
+# Issue #532 — prefer candidates whose ty_args still contain a raw
+# TyVarT under the current substitution. Such a TyVar is the "fresh-
+# from-`Actor.self()`" mate the handler's instantiation is reaching
+# for. See `find_remove_label_best`'s doc-comment for the ordering
+# rationale.
+fn find_remove_label_tyvar_args(target: Label, ls: [Label], s: Subst,
+                                  seen: [Label]) : Option[FindRemove] {
+  match ls {
+    [] -> None
+    [h, ...rest] -> {
+      if h.eff == target.eff and label_args_have_tyvar(h.ty_args, s) {
+        Some(FindRemove { found: h, remain: label_concat(seen, rest) })
+      } else {
+        find_remove_label_tyvar_args(target, rest, s, label_concat(seen, [h]))
+      }
+    }
+  }
+}
+
+# Issue #532 — check the RAW shape of the ty_args (before applying
+# the substitution). A label literally written as `Actor[TyVarT(n)]`
+# was added by an `Actor.self()` call inside the body — the TyVar
+# may have been bound transitively (e.g. through a downstream call's
+# parameter unification), but the label itself was created with a
+# fresh TyVar that the handler's `Msg` is the natural mate for. A
+# label literally written as `Actor[Request]` came from a callee's
+# declared row (e.g. `dual_send`) and is not a candidate for the
+# enclosing handler's instantiation.
+fn label_args_have_tyvar(args: [Ty], s: Subst) : Bool {
+  match args {
+    [] -> false
+    [h, ...rest] -> match h {
+      TyVarT(_) -> true
+      _         -> label_args_have_tyvar(rest, s)
+    }
+  }
+}
+
+# Strict variant of `labels_args_unify`: requires every position to be
+# CONCRETE-CONCRETE structurally equal under the current substitution.
+# A position where either side is still a TyVar/TyAny is rejected so
+# the best-match preference does not collapse back to "any eff-name
+# match". Empty arg lists count as concrete-match (bare effects like
+# `Stdout` keep their single-candidate semantics).
+fn labels_args_unify_concrete(a: [Ty], b: [Ty], s: Subst) : Bool {
+  match a {
+    [] -> match b { [] -> true _ -> false }
+    [ah, ...arest] -> match b {
+      [] -> false
+      [bh, ...brest] -> {
+        let aa = apply_ty(s, ah)
+        let bb = apply_ty(s, bh)
+        if ty_eq_shape_concrete(aa, bb) { labels_args_unify_concrete(arest, brest, s) }
+        else { false }
+      }
+    }
+  }
+}
+
+# Stricter shape check than `ty_unifiable_shallow`: rejects matches
+# involving TyVar or TyAny on either side. Used only by the best-match
+# label lookup so it never collapses two `Actor[?T]` candidates into a
+# single match.
+fn ty_eq_shape_concrete(a: Ty, b: Ty) : Bool {
+  match a {
+    TyVarT(_) -> false
+    TyAny     -> false
+    _ -> match b {
+      TyVarT(_) -> false
+      TyAny     -> false
+      _ -> ty_eq_shape(a, b)
+    }
+  }
+}
+
 fn partition_labels(a: [Label], b: [Label]) : LabelPartition =
-  partition_walk(a, b, [], [])
+  partition_walk(a, b, [], [], subst_empty())
+
+fn partition_labels_sub(a: [Label], b: [Label], s: Subst) : LabelPartition =
+  partition_walk(a, b, [], [], s)
 
 fn partition_walk(a: [Label], b_remain: [Label],
-                  bp: [LabelPair], ol: [Label]) : LabelPartition {
+                  bp: [LabelPair], ol: [Label], s: Subst) : LabelPartition {
   match a {
     [] -> LabelPartition { both_pairs: bp, only_left: ol, only_right: b_remain }
-    [ah, ...arest] -> match find_remove_label(ah.eff, b_remain) {
-      None -> partition_walk(arest, b_remain, bp, [ah, ...ol])
-      Some(fr) -> partition_walk(arest, fr.remain, [LPair(ah, fr.found), ...bp], ol)
+    [ah, ...arest] -> match find_remove_label_best(ah, b_remain, s) {
+      None -> partition_walk(arest, b_remain, bp, [ah, ...ol], s)
+      Some(fr) -> partition_walk(arest, fr.remain, [LPair(ah, fr.found), ...bp], ol, s)
     }
   }
 }
@@ -27927,13 +28069,68 @@ fn bind_row_tails(at: Option[Int], bt: Option[Int],
 }
 
 # Unify two effect rows. Returns the extended substitution or None.
+#
+# Issue #532 — keep label ty_args literal during partition so
+# `find_remove_label_best` can distinguish TyVar payloads from
+# concrete ones. `apply_row_tail_only` resolves the tail var for
+# proper rigid/flex bookkeeping but leaves the labels' ty_args
+# untouched. `unify_label_pairs` still applies the substitution
+# inside `unify_list`, so soundness is preserved.
 fn unify_row(r1: Row, r2: Row, s: Subst) : Option[Subst] {
-  let a = apply_row(s, r1)
-  let b = apply_row(s, r2)
-  let p = partition_labels(a.labels, b.labels)
+  let a = apply_row_tail_only(s, r1)
+  let b = apply_row_tail_only(s, r2)
+  let p = partition_labels_sub(a.labels, b.labels, s)
   match unify_label_pairs(p.both_pairs, s) {
     None -> None
     Some(s1) -> bind_row_tails(a.tail, b.tail, p.only_left, p.only_right, s1)
+  }
+}
+
+fn apply_row_tail_only(s: Subst, r: Row) : Row {
+  match r.tail {
+    None -> r
+    Some(v) -> match subst_row_lookup(s, v) {
+      None -> r
+      Some(r2) -> {
+        let r2r = apply_row_tail_only(s, r2)
+        Row {
+          labels: label_concat(r.labels, r2r.labels),
+          tail: r2r.tail,
+          display_alias: r.display_alias
+        }
+      }
+    }
+  }
+}
+
+# Issue #532 — variant of `apply_ty` whose only difference from the
+# plain one is that effect-row LABELS are NOT substituted (the row
+# tail still is). Used by `unify_env` so a downstream `unify_row`
+# partition can see raw TyVar payloads. Everywhere else continues to
+# use `apply_ty`.
+fn apply_ty_keep_row_labels(s: Subst, t: Ty) : Ty {
+  match t {
+    TyVarT(n) -> match subst_lookup(s, n) {
+      Some(t2) -> apply_ty_keep_row_labels(s, t2)
+      None     -> t
+    }
+    TyListT(inner) -> TyListT(apply_ty_keep_row_labels(s, inner))
+    TyFnT(params, ret, row) ->
+      TyFnT(apply_ty_keep_row_labels_list(s, params),
+            apply_ty_keep_row_labels(s, ret),
+            apply_row_tail_only(s, row))
+    TyCon(name, atys) -> TyCon(name, apply_ty_keep_row_labels_list(s, atys))
+    TyDimT(base, u) -> dim_collapse(apply_ty_keep_row_labels(s, base), apply_unit(s, u))
+    TyRefineT(base, p) -> TyRefineT(apply_ty_keep_row_labels(s, base), p)
+    TyUnion(parts) -> normalize_union(apply_ty_keep_row_labels_list(s, parts))
+    _ -> t
+  }
+}
+
+fn apply_ty_keep_row_labels_list(s: Subst, ts: [Ty]) : [Ty] {
+  match ts {
+    [] -> []
+    [h, ...rest] -> [apply_ty_keep_row_labels(s, h), ...apply_ty_keep_row_labels_list(s, rest)]
   }
 }
 
@@ -27991,8 +28188,17 @@ fn unify_env(env: TyEnv, t1: Ty, t2: Ty, s: Subst) : Option[Subst] {
   # gets blocked. The predicate stays attached at the declaration
   # site; downstream passes that need to reason about it look it up
   # from the source signature.
-  let a = unwrap_refines(apply_ty(s, t1))
-  let b = unwrap_refines(apply_ty(s, t2))
+  # Issue #532 — `apply_ty_keep_row_labels` preserves the raw TyVar
+  # payloads inside effect-row labels (only the row TAIL is chased)
+  # so the downstream `unify_row` partition can pick by
+  # raw-tyvar-vs-concrete in `find_remove_label_best`. A plain
+  # `apply_ty` would substitute bound TyVars away — every label
+  # whose ty_args reference a TyVar that has been unified to a
+  # concrete type would become structurally identical to a
+  # source-literal concrete label, and the absorption order for two
+  # `Actor[T]` instantiations would collapse back to row position.
+  let a = unwrap_refines(apply_ty_keep_row_labels(s, t1))
+  let b = unwrap_refines(apply_ty_keep_row_labels(s, t2))
   match a {
     TyAny -> Some(s)
     _ -> match b {
@@ -31820,7 +32026,15 @@ fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : 
   # continuation. Mirror the alias-tag boundary at line 14294.
   let st_in3 = st_set_clause_resume(st_in2, None)
   let rb = synth(st_in3, body)
-  let lambda_row_labels = apply_labels(rb.st.sub, rb.st.row)
+  # Issue #532 — keep the row labels in their raw form so a downstream
+  # `unify_row` partition can see TyVar payloads (an `Actor[?T]` mint-
+  # ed by `Actor.self()` inside this body should bias the enclosing
+  # handler's `Msg` toward that `?T`). The previous `apply_labels`
+  # call substituted bound TyVars away and forced the partition into
+  # a row-position lottery; `find_remove_label_best`'s
+  # `find_remove_label_tyvar_args` branch needs the raw shape to
+  # prefer body-local labels over callee-propagated concrete labels.
+  let lambda_row_labels = rb.st.row
   let st_after = st_set_row(rb.st, prev_row)
   let st2 = st_restore_entries(outer, st_after)
   # m12.8.x phase 4 followup: lambdas carry an *open* row with a
