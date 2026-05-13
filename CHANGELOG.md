@@ -84,6 +84,32 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.56.0 (2026-05-13)
+
+### Added
+
+- **emit,examples**: default-handler install for user-declared effects (refs #558)
+- **typer**: default block coverage check (closes #557)
+- **language**: $extern_handler intrinsic + Cont reserved type (closes #556)
+- **parser**: accept default { } block in effect declarations (refs #533)
+
+### Changed
+
+- **typer,emit**: remove parallel default-handler shadow lists (refs #558)
+- **emit**: remove hardcoded default_<eff>_shims/setup family (refs #558)
+- **emit**: unify default_setups_for / default_shims_for on AST path (refs #558)
+- **stdlib**: migrate Fail default to source-level default block (refs #558)
+- **stdlib**: migrate Mutable default to source-level default block (refs #558)
+- **stdlib**: migrate Cancel + Link + Monitor + Spawn defaults to source-level default blocks (refs #558)
+- **stdlib**: migrate Stderr + Stdin defaults to source-level default blocks (refs #558)
+- **stdlib**: migrate Process + Log + Signal defaults to source-level default blocks (refs #558)
+- **stdlib**: migrate Env + File defaults to source-level default blocks (refs #558)
+- **stdlib**: migrate Clock default to source-level default block (refs #558)
+- **stdlib**: migrate NetTcp default to source-level default block (refs #558)
+- **stdlib**: migrate SecureRandom default to source-level default block (refs #558)
+- **stdlib**: migrate Random default to source-level default block (refs #558)
+- **stdlib**: introduce builtin_default_block_for helper (refs #558)
+
 ## v0.55.0 (2026-05-13)
 
 ### Added
