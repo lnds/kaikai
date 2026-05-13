@@ -1366,10 +1366,27 @@ rows containing `Mutable` because the alternative ("every
 program that touches an array must write a handler") is
 pointless.
 
-An explicit `with Mutable { ... }` block in user code exists only
-to *observe* or *intercept* mutation — test harnesses that want
-to log every `array_set`, for instance. Doc C defines the exact
-wire format for such observers.
+An explicit `with Mutable { ... }` block in user code can
+intercept the **qualified** form of mutation only:
+`Mutable.array_set(...)`, `Mutable.array_grow(...)`,
+`Mutable.ref_set(...)`, etc. The handler receives the operation
+arguments and decides whether to forward to the default
+behaviour (call `resume(...)` with the appropriate return value)
+or short-circuit.
+
+> **v1 status (2026-05-13):** bare prelude `array_set` /
+> `array_grow` calls (and the `a[i] := v` desugar that emits
+> them) route directly to the runtime `kai_prelude_array_*`
+> helpers; they DO NOT travel through the handler stack. A user-
+> installed `with Mutable { ... }` therefore observes only the
+> qualified `Mutable.array_*` form. Stdlib-internal `array_*`
+> calls (the desugars in `var x = init`, `a[i] := v`, the
+> `array_*` bridge module) bypass observers entirely. A future
+> lane may rewrite bare-builtin calls through the handler stack
+> when a user handler is present; until then, test harnesses that
+> need to log every mutation must use the qualified form
+> explicitly. Doc C defines the wire format for the handler-
+> routed (qualified) path.
 
 ### Observable-effects discipline (issue #251 + #252)
 
@@ -1977,12 +1994,17 @@ Ffi                                   (always innermost, compiler-synthesised)
    handler (the runtime default). Do we allow user-nested
    `with Mutable { ... }` for observation/mocking, or forbid it
    to keep the handler-stack shape predictable?
-   *Decided:* allow nested observation handlers. The innermost
-   handler wins (Doc A semantics), so a test harness can wrap
-   a body with a `Mutable` interceptor to log every `array_set`.
-   Such a handler sees stdlib-internal `Mutable` calls too;
-   Doc C pins the exact wire format so observers are
-   deterministic.
+   *Decided:* allow nested observation handlers, scoped to the
+   qualified `Mutable.array_*` / `Mutable.ref_*` form only. The
+   innermost handler wins (Doc A semantics) for those qualified
+   calls. Bare prelude `array_set` / `array_grow` and the
+   `a[i] := v` desugar bypass the handler stack and route
+   directly to the runtime — see §`Mutable` *Default handler*
+   v1-status sidebar for the gap. A test harness that needs to
+   intercept every mutation must use the qualified form
+   explicitly (or wait for the future lane that rewrites
+   bare-builtin calls when a user handler is present). Doc C
+   pins the wire format for the handler-routed path.
 
 ## Next steps
 
