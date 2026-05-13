@@ -84,6 +84,22 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.55.0 (2026-05-13)
+
+### Added
+
+- **resolver**: detect import cycles with in_progress stack (closes #538)
+
+### Fixed
+
+- **llvm**: wire stdlib mailbox runtime bindings (closes #523)
+- **llvm**: wire stdlib/math real_* libm bindings (closes #522)
+- **llvm**: qualified EModCall never falls back to prelude shortcut (closes #524)
+- **typer**: protocol ops resolve inside string interpolation (closes #443)
+- **typer**: reject duplicate effect / const / axiom decls (closes #543)
+- **typer**: validate impl methods against protocol declaration (closes #535)
+- **typer**: reject duplicate bindings + duplicate arms in patterns (refs #534)
+
 ## v0.54.3 (2026-05-12)
 
 ### Fixed
