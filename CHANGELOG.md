@@ -84,6 +84,18 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.54.3 (2026-05-12)
+
+### Fixed
+
+- **parser**: validate FFI surface — require /Ffi + C-ABI types (refs #536)
+- **typer,driver**: reject dup fn decls + non-zero exit on missing imports (refs #538)
+- **typer**: map args / exit to their effect labels (refs #537)
+- **typer**: Mutable masking via callee-row consultation; close subtyping silent contract
+- **stage2**: annotate #517 handle-validation helpers with Console+File
+- **typer**: handle block validates residual effects + clause shape (closes #517)
+- **typer,stage2**: retrofit transitive effect-row propagation (refs #528)
+
 ## v0.54.2 (2026-05-12)
 
 ### Fixed
