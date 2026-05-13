@@ -357,6 +357,97 @@ for completeness (could be omitted with the same semantics).
 `Ask` is handled *inside* the `handle` block, so the outer `main`
 does not carry it in its row — only `Io` from the final `print`.
 
+### `default { }` blocks and per-op coverage (issue #533)
+
+An effect declaration can carry an optional `default { }` block
+listing fallback clauses installed by the compiler at the program
+root (`main`). The block sits at the same lexical level as the op
+declarations and uses the same clause shape as `handle ... with`:
+
+```kai
+effect MyLog {
+  info(msg: String) : Unit
+  warn(msg: String) : Unit
+  default {
+    info(msg, resume) -> $extern_handler("kai_default_log_info")
+    warn(msg, resume) -> $extern_handler("kai_default_log_warn")
+  }
+}
+```
+
+`$extern_handler("c_symbol")` is the compiler intrinsic introduced
+in Stage A (#556) that bridges a default clause to a runtime C
+entry. Kaikai-bodied defaults parse and store, but their codegen
+path lands in Stage C of the #533 trilogy.
+
+#### Coverage algorithm
+
+For every directly-performed `Eff.op(...)` inside a function body,
+the typer walks the lexical stack of enclosing handles:
+
+1. **Clause discharge** — the first `handle ... with Eff { clauses }`
+   that lists `op` in its clauses absorbs the obligation.
+2. **Clause-merge from default** *(spec; deferred to Stage C)* — an
+   enclosing `handle ... with Eff` exists but omits `op`, and the
+   effect's `default { }` block declares `op` → the default clause
+   fires inside the handle. **Not yet supported by codegen Stage A**;
+   the typer rejects partial handles whose omitted op would have
+   needed this merge.
+3. **Main absorption** — no enclosing `handle ... with Eff`, the
+   function is `main`, and `Eff`'s `default { }` block (or the
+   legacy hardcoded handler set, for the 16 canonical builtins not
+   yet migrated) declares `op` → the auto-installed default at
+   `main` discharges it.
+4. **Reject** — otherwise the typer emits `effect not handled:
+   Eff.op` with a diagnostic note describing the default-block
+   status (no block, partial block, kaikai-bodied clause, or
+   masked-by-enclosing-handle).
+
+Stage B (#557) lands steps 1, 3, and 4. Step 2 stays a typer
+rejection with a Stage-C-aware diagnostic until the handle emitter
+synthesises missing default clauses inside each `_ev` evidence
+struct.
+
+#### Worked example — partial handle, full default block
+
+```kai
+effect MyLog {
+  info(msg: String) : Unit
+  default {
+    info(msg, resume) -> $extern_handler("kai_default_log_info")
+  }
+}
+
+fn main() : Unit / Stdout {
+  let r = handle {
+    MyLog.info("hello")
+    7
+  } with MyLog {
+    info(msg, resume) -> resume(())
+  }
+  print("result: #{int_to_string(r)}")
+}
+```
+
+Inside `handle ... with MyLog`, the `info` clause discharges
+`MyLog.info` (step 1). The `default { }` block is unused at this
+call site — its presence does not change the type-check outcome.
+The fixture in `examples/effects/default_block_full_user_handle.kai`
+covers this shape.
+
+#### Why partial handles get rejected (Stage B limitation)
+
+Stage A's `emit_clause_assignments` wires `_ev.<op>` only for the
+ops the user wrote in the `handle`. The inner handle's evidence
+node masks any enclosing default — dispatch routes through `_ev`
+even when an outer `_ev` carries the missing op. A partial handle
+plus a `default { }` block thus produces an apparently complete
+type but a NULL function pointer at runtime. The Stage B typer
+treats step 2 of the algorithm as a typer rejection until Stage C
+extends the handle emitter; the diagnostic explicitly references
+Stage C so the user can decide whether to add the clause now or
+wait for the upgrade.
+
 ### `resume`: one-shot, explicit
 
 `resume` is a value of type `(T) -> S / ρ` where:
