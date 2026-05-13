@@ -49159,6 +49159,348 @@ fn validate_impls_loop(ds: [Decl], file: String,
   }
 }
 
+# Issue #535 — impl method validation against protocol declaration.
+#
+# Three failure shapes the dispatch resolver previously accepted silently:
+#   1. missing required method — `impl P for T { fn foo(...) }` when `P`
+#      also declares `bar`. Calls to `bar(t)` get the dispatcher stub and
+#      panic at runtime.
+#   2. signature mismatch — `impl P for T` whose `foo` returns or accepts
+#      a type the protocol does not declare. Calls would type-check on
+#      the wrong shape and corrupt downstream inference.
+#   3. arity mismatch — `impl P for T`'s `foo` has fewer params than
+#      `protocol P` declares. Extra arguments at the call site silently
+#      drop.
+#
+# Implementation strategy:
+#   - Required-method check: per protocol, collect every op name; per
+#     impl, verify each is provided. Reports one error per missing op.
+#   - Arity check: param-count comparison. The protocol's first param
+#     position is `Self` by convention; the impl provides the concrete
+#     type. Counts must match.
+#   - Signature check (conservative, v1): compare param types and return
+#     type by *head-name* via `proto_type_name` after Self substitution.
+#     This collapses `Real<u>` and `Real` to the same head, `[T]` and
+#     `[Int]` to `List`, etc. — matching what the dispatch mangling does
+#     today. Deep structural / refinement comparison is deferred to a
+#     follow-up that wires the typer's unifier into pre-typer
+#     validation. Head-name comparison is enough to flag the bug-class
+#     fixtures (`String` vs `Int`, etc.) without breaking polymorphic
+#     stdlib impls whose tparams are not visible here.
+#
+# Unknown protocol names are silently skipped — `validate_impls_loop`
+# above already reports those.
+
+fn validate_impl_methods(ds: [Decl], file: String,
+                         reg: ProtocolReg) : Int / Console {
+  validate_impl_methods_loop(ds, file, reg, 0)
+}
+
+fn validate_impl_methods_loop(ds: [Decl], file: String,
+                              reg: ProtocolReg, errs: Int) : Int / Console {
+  match ds {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DImpl(pname, proto_args, target, methods, line, col) -> {
+        let tname = proto_type_name(target)
+        let proto_ops = proto_ops_for(reg.ops, pname, [])
+        if proto_ops == [] {
+          validate_impl_methods_loop(rest, file, reg, errs)
+        } else {
+          # Protocol tparams substitute against the impl's bracket
+          # arguments. Legacy `impl P for T` (`proto_args == []`) is
+          # treated as the homogeneous default: every protocol tparam
+          # collapses to the target head. Heterogeneous
+          # `impl P[Real, Int] for T` aligns positionally.
+          let proto_tps = proto_tparams_for(reg.tparams, pname)
+          let arg_heads = match proto_args {
+            [] -> []
+            _  -> map(proto_args, proto_type_name)
+          }
+          let all_op_names = proto_op_names(proto_ops, [])
+          let e1 = check_missing_methods(proto_ops, methods, pname, tname,
+                                         all_op_names,
+                                         file, line, col, errs)
+          let e2 = check_impl_methods(methods, proto_ops, pname, tname,
+                                       proto_tps, arg_heads, file, e1)
+          validate_impl_methods_loop(rest, file, reg, e2)
+        }
+      }
+      DDerive(_, inner, _, _) ->
+        validate_impl_methods_loop([inner, ...rest], file, reg, errs)
+      _ -> validate_impl_methods_loop(rest, file, reg, errs)
+    }
+  }
+}
+
+# All protocol ops for `pname`, returned in declaration order (the
+# registry stores them reversed; we flip back here so error messages
+# follow source order).
+fn proto_ops_for(ops: [ProtoOpReg], pname: String,
+                 acc: [ProtoOpReg]) : [ProtoOpReg] {
+  match ops {
+    [] -> acc
+    [op, ...rest] -> match op {
+      POR(p, _, _, _, _, _) ->
+        if p == pname { proto_ops_for(rest, pname, [op, ...acc]) }
+        else { proto_ops_for(rest, pname, acc) }
+    }
+  }
+}
+
+fn proto_op_names(ops: [ProtoOpReg], acc: [String]) : [String] {
+  match ops {
+    [] -> acc
+    [op, ...rest] -> match op {
+      POR(_, name, _, _, _, _) -> proto_op_names(rest, [name, ...acc])
+    }
+  }
+}
+
+# Look up the protocol's tparam names (the `[a]` in `protocol Add[a]`).
+# Returns `[]` for monomorphic protocols.
+fn proto_tparams_for(tps: [ProtoTPReg], pname: String) : [String] {
+  match tps {
+    [] -> []
+    [t, ...rest] -> match t {
+      PTPR(p, names) ->
+        if p == pname { names } else { proto_tparams_for(rest, pname) }
+    }
+  }
+}
+
+# Shape 1: every protocol op must have a matching method in the impl.
+fn check_missing_methods(proto_ops: [ProtoOpReg], methods: [Decl],
+                         pname: String, tname: String,
+                         all_op_names: [String],
+                         file: String, line: Int, col: Int,
+                         errs: Int) : Int / Console {
+  match proto_ops {
+    [] -> errs
+    [op, ...rest] -> match op {
+      POR(_, opname, _, _, _, _) -> {
+        let errs1 =
+          if impl_has_method(methods, opname) { errs }
+          else {
+            eprint(concat_all([
+              file, ":", int_to_string(line), ":", int_to_string(col),
+              ": error: impl `", pname, " for ", tname,
+              "` is missing required method `", opname, "`"]))
+            eprint(concat_all([
+              "  = note: protocol `", pname,
+              "` declares operations: ", join_with(all_op_names, ", ")]))
+            errs + 1
+          }
+        check_missing_methods(rest, methods, pname, tname, all_op_names,
+                              file, line, col, errs1)
+      }
+    }
+  }
+}
+
+fn impl_has_method(methods: [Decl], opname: String) : Bool {
+  match methods {
+    [] -> false
+    [d, ...rest] -> match d {
+      DFn(_, name, _, _, _, _, _, _, _, _) ->
+        if name == opname { true } else { impl_has_method(rest, opname) }
+      _ -> impl_has_method(rest, opname)
+    }
+  }
+}
+
+# Shapes 2 + 3: walk each impl method; if it matches a protocol op,
+# check arity and head-name compatibility. Methods that match no
+# protocol op are reported as unknown.
+fn check_impl_methods(methods: [Decl], proto_ops: [ProtoOpReg],
+                      pname: String, tname: String,
+                      proto_tps: [String], arg_heads: [String],
+                      file: String, errs: Int) : Int / Console {
+  match methods {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DFn(_, op_name, _, params, ret_opt, _, _, line, col, _) -> {
+        let errs1 = match find_proto_op(proto_ops, op_name) {
+          None -> {
+            eprint(concat_all([
+              file, ":", int_to_string(line), ":", int_to_string(col),
+              ": error: impl `", pname, " for ", tname,
+              "` declares method `", op_name,
+              "` which is not an operation of protocol `", pname, "`"]))
+            errs + 1
+          }
+          Some(op) -> match op {
+            POR(_, _, proto_params, proto_ret, _, _) -> {
+              let pa = list_length(params)
+              let pp = list_length(proto_params)
+              let e_ar =
+                if pa == pp { errs }
+                else {
+                  eprint(concat_all([
+                    file, ":", int_to_string(line), ":", int_to_string(col),
+                    ": error: impl method `", op_name, "` in `",
+                    pname, " for ", tname,
+                    "` has arity ", int_to_string(pa),
+                    " but protocol declares arity ", int_to_string(pp)]))
+                  errs + 1
+                }
+              if pa == pp {
+                check_sig_heads(params, proto_params, ret_opt, proto_ret,
+                                op_name, pname, tname,
+                                proto_tps, arg_heads,
+                                file, line, col, e_ar)
+              } else { e_ar }
+            }
+          }
+        }
+        check_impl_methods(rest, proto_ops, pname, tname, proto_tps, arg_heads,
+                           file, errs1)
+      }
+      _ -> check_impl_methods(rest, proto_ops, pname, tname,
+                              proto_tps, arg_heads, file, errs)
+    }
+  }
+}
+
+fn find_proto_op(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] {
+  match ops {
+    [] -> None
+    [op, ...rest] -> match op {
+      POR(_, name, _, _, _, _) ->
+        if name == target { Some(op) } else { find_proto_op(rest, target) }
+    }
+  }
+}
+
+# Head-name comparison of impl vs protocol signature. `Self` in the
+# protocol substitutes to `tname`; each protocol tparam `Ai`
+# substitutes to `arg_heads[i]` (or `tname` when `arg_heads == []`,
+# the homogeneous default per the lower_impls rule). Unannotated impl
+# params (`ptype == None`) are not checked — the typer infers them; a
+# pre-typer pass has no signal to compare against.
+fn check_sig_heads(impl_params: [Param], proto_params: [Param],
+                   impl_ret_opt: Option[TypeExpr], proto_ret: TypeExpr,
+                   op_name: String, pname: String, tname: String,
+                   proto_tps: [String], arg_heads: [String],
+                   file: String, line: Int, col: Int,
+                   errs: Int) : Int / Console {
+  let e_params = check_sig_param_heads(impl_params, proto_params, tname,
+                                        proto_tps, arg_heads,
+                                        op_name, pname, file, errs)
+  # Return-type check applies only when the impl is homogeneous w.r.t.
+  # the protocol's tparams. Heterogeneous impls (`impl P[Other] for T`
+  # with Other != T) often produce a *promoted* result type that the
+  # protocol's `Self` return cannot express — stdlib's
+  # `impl Add[Complex] for Real { fn add(...) : Complex }` is the
+  # canonical case. Validating the return there requires a protocol-
+  # level `Result` tparam or HKT, both out of scope for v1. The
+  # parameter-position checks above still catch genuine signature
+  # drift (wrong `self`/`rhs` types) — the leak here is only when
+  # the impl rewrites the return shape for a known good reason.
+  if heterogeneous_impl(arg_heads, tname) { e_params }
+  else { match impl_ret_opt {
+    None -> e_params
+    Some(impl_ret) -> {
+      let ih = proto_type_name(impl_ret)
+      let ph = sig_head_subst(proto_ret, tname, proto_tps, arg_heads)
+      if ih == ph { e_params }
+      else {
+        eprint(concat_all([
+          file, ":", int_to_string(line), ":", int_to_string(col),
+          ": error: impl method `", op_name, "` in `",
+          pname, " for ", tname,
+          "` returns `", type_expr_display(impl_ret),
+          "` but protocol declares return type `", ph, "`"]))
+        e_params + 1
+      }
+    }
+  } }
+}
+
+# An impl is heterogeneous iff it carries explicit bracket args and
+# at least one of them differs from the target head. Legacy un-
+# parametrised impls (`arg_heads == []`) are homogeneous by
+# definition. Same-as-target args (`impl Add[Complex] for Complex`)
+# round-trip through the homogeneous default, so they are not
+# heterogeneous either.
+fn heterogeneous_impl(arg_heads: [String], tname: String) : Bool {
+  match arg_heads {
+    [] -> false
+    [h, ...rest] -> if h != tname { true } else { heterogeneous_impl(rest, tname) }
+  }
+}
+
+fn check_sig_param_heads(impl_ps: [Param], proto_ps: [Param], tname: String,
+                         proto_tps: [String], arg_heads: [String],
+                         op_name: String, pname: String,
+                         file: String, errs: Int) : Int / Console {
+  match impl_ps {
+    [] -> errs
+    [ip, ...irest] -> match proto_ps {
+      [] -> errs
+      [pp, ...prest] -> {
+        let errs1 = match ip.ptype {
+          None -> errs
+          Some(it) -> {
+            let ih = proto_type_name(it)
+            let ph = match pp.ptype {
+              None -> ih
+              Some(pt) -> sig_head_subst(pt, tname, proto_tps, arg_heads)
+            }
+            if ih == ph { errs }
+            else {
+              eprint(concat_all([
+                file, ":", int_to_string(ip.pline), ":", int_to_string(ip.pcol),
+                ": error: impl method `", op_name, "` in `",
+                pname, " for ", tname,
+                "`: parameter `", ip.pname,
+                "` has type `", type_expr_display(it),
+                "` but protocol declares `", ph, "`"]))
+              errs + 1
+            }
+          }
+        }
+        check_sig_param_heads(irest, prest, tname, proto_tps, arg_heads,
+                              op_name, pname, file, errs1)
+      }
+    }
+  }
+}
+
+# Substitute `Self` and protocol tparams against the impl target +
+# bracket args, then collapse to the head name. Anything that doesn't
+# bind (free tparam outside the protocol's own list, etc.) falls
+# through to the standard `proto_type_name` collapse — head-name
+# comparison is intentionally permissive about unresolved variables.
+fn sig_head_subst(t: TypeExpr, tname: String,
+                  proto_tps: [String], arg_heads: [String]) : String {
+  match t.tkind {
+    TyName(n, _) ->
+      if n == "Self" { tname }
+      else { match tparam_subst(n, proto_tps, arg_heads, tname) {
+        Some(h) -> h
+        None    -> proto_type_name(t)
+      } }
+    _ -> proto_type_name(t)
+  }
+}
+
+# Position-aligned lookup: `proto_tps[i]` -> `arg_heads[i]`. When
+# `arg_heads == []` (legacy un-parametrised impl), every protocol
+# tparam falls back to the target head — the homogeneous default
+# encoded in `lower_impls`.
+fn tparam_subst(n: String, tps: [String], heads: [String],
+                tname: String) : Option[String] {
+  match tps {
+    [] -> None
+    [t, ...trest] -> match heads {
+      [] -> if t == n { Some(tname) } else { tparam_subst(n, trest, [], tname) }
+      [h, ...hrest] ->
+        if t == n { Some(h) } else { tparam_subst(n, trest, hrest, tname) }
+    }
+  }
+}
+
 # Walk every DImpl and (a) lower its methods into top-level DFns,
 # (b) record (P, T) -> impl_fn_name in the registry. The fn body is
 # the impl's original body verbatim; we only rename the function and
@@ -51104,9 +51446,15 @@ fn lower_protocols(decls: [Decl], file: String) : LoweredProtocols / Console {
   # Step 2 — coherence: orphan + duplicate-impl validation.
   let proto_names = collect_proto_names(expanded, [])
   let local_types = collect_local_type_names(expanded, [])
-  let errs = pre_errs + derive_errs + validate_impls(expanded, file, proto_names, local_types)
+  let coh_errs = validate_impls(expanded, file, proto_names, local_types)
   # Step 3 — collect every protocol op into the registry.
   let reg0 = collect_proto_decls(expanded, proto_reg_empty())
+  # Step 3b — issue #535: validate each impl block against its
+  # protocol's declared operations (missing methods, wrong arity,
+  # head-name signature mismatch). Runs after the registry is built so
+  # impl methods can be cross-referenced against POR entries.
+  let impl_errs = validate_impl_methods(expanded, file, reg0)
+  let errs = pre_errs + derive_errs + coh_errs + impl_errs
   # Step 4 — lower each DImpl method into a top-level DFn (mangled
   # name) and record the (P, T) -> impl_fn entry in the registry.
   let lower_res = lower_impls(expanded, reg0, [])
