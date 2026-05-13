@@ -46864,25 +46864,43 @@ fn lookup_op_offset(table: [OpOffset], key: String) : Option[Int] {
 type ModuleEntry = ME(String, [String], String)
 #                     ^name  ^exports  ^origin
 
-type ResolveState = { visited: [String], decls: [Decl], modules: [ModuleEntry], errs: Int }
+# `in_progress` (issue #538 shape 1) is the stack of module paths
+# currently mid-resolution. It is distinct from `visited`: `visited`
+# means "finished loading, do not reload" (legitimate diamond
+# imports hit this path), `in_progress` means "actively resolving;
+# seeing this path again is an import cycle". Push on entry to
+# `resolve_module`, pop on exit, then mark visited. Order matters —
+# the head of the list is the most recently entered module, so the
+# chain in the diagnostic walks head→tail.
+type ResolveState = { visited: [String], in_progress: [String], decls: [Decl], modules: [ModuleEntry], errs: Int }
 
 fn rs_has(rs: ResolveState, p: String) : Bool = list_has(rs.visited, p)
 
+fn rs_in_progress(rs: ResolveState, p: String) : Bool = list_has(rs.in_progress, p)
+
+fn rs_push_in_progress(rs: ResolveState, p: String) : ResolveState =
+  ResolveState { visited: rs.visited, in_progress: [p, ...rs.in_progress], decls: rs.decls, modules: rs.modules, errs: rs.errs }
+
+fn rs_pop_in_progress(rs: ResolveState) : ResolveState = match rs.in_progress {
+  []           -> rs
+  [_, ...rest] -> ResolveState { visited: rs.visited, in_progress: rest, decls: rs.decls, modules: rs.modules, errs: rs.errs }
+}
+
 fn rs_mark(rs: ResolveState, p: String) : ResolveState =
-  ResolveState { visited: [p, ...rs.visited], decls: rs.decls, modules: rs.modules, errs: rs.errs }
+  ResolveState { visited: [p, ...rs.visited], in_progress: rs.in_progress, decls: rs.decls, modules: rs.modules, errs: rs.errs }
 
 fn rs_append_decls(rs: ResolveState, ds: [Decl]) : ResolveState =
-  ResolveState { visited: rs.visited, decls: list_append(rs.decls, ds), modules: rs.modules, errs: rs.errs }
+  ResolveState { visited: rs.visited, in_progress: rs.in_progress, decls: list_append(rs.decls, ds), modules: rs.modules, errs: rs.errs }
 
 fn rs_add_module(rs: ResolveState, entry: ModuleEntry) : ResolveState =
-  ResolveState { visited: rs.visited, decls: rs.decls, modules: list_append(rs.modules, [entry]), errs: rs.errs }
+  ResolveState { visited: rs.visited, in_progress: rs.in_progress, decls: rs.decls, modules: list_append(rs.modules, [entry]), errs: rs.errs }
 
 # Issue #538 shape 3: increment the error counter when an import
 # fails to resolve. Callers fold this count into the compile-source
 # exit-code aggregator so a missing module fails the build even when
 # no downstream user references a name from it.
 fn rs_bump_errs(rs: ResolveState) : ResolveState =
-  ResolveState { visited: rs.visited, decls: rs.decls, modules: rs.modules, errs: rs.errs + 1 }
+  ResolveState { visited: rs.visited, in_progress: rs.in_progress, decls: rs.decls, modules: rs.modules, errs: rs.errs + 1 }
 
 # Extract the public-facing names declared at the top of a module
 # file. Looks at pub fn / pub type / pub effect / pub protocol /
@@ -47037,32 +47055,71 @@ fn find_module_file(base_dir: String, mod_path: String, search_paths: [String]) 
 # behaviour without registering a module entry — used by paths that
 # load files for other reasons (none in v1, but the parameter
 # leaves the door open).
+# Issue #538 shape 1: format the cycle chain for the diagnostic.
+# `in_progress` is head=deepest, tail=root; the target is the path
+# that the cycle re-entered. The chain we print walks root→deepest
+# (reverse of in_progress) and closes with the target appended once
+# more, so a chain a→b→a reads as `a.kai → b.kai → a.kai`.
+fn format_cycle_chain(in_progress: [String], target: String) : String {
+  let walked = list_reverse(in_progress)
+  let closed = list_append(walked, [target])
+  join_with_arrow(closed, "")
+}
+
+fn join_with_arrow(xs: [String], acc: String) : String {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> {
+      let sep = if acc == "" { "" } else { " -> " }
+      join_with_arrow(rest, concat_all([acc, sep, x]))
+    }
+  }
+}
+
 fn resolve_module(base_dir: String, mod_path: String, import_name: String, search_paths: [String], rs: ResolveState) : ResolveState / Console + File {
 
   let cf = find_module_file(base_dir, mod_path, search_paths)
   match cf {
     CF(abs_path, opt_src) -> {
-      if rs_has(rs, abs_path) { rs }
+      # Issue #538 shape 1: an `abs_path` that is already on the
+      # in_progress stack means resolution looped back to a module
+      # whose load has not yet returned — an import cycle. Emit the
+      # chain (root -> ... -> abs_path) and bump errs so the build
+      # fails. Do NOT push abs_path nor recurse; the cycle is broken
+      # at the re-entry point and the partially-loaded module's
+      # exports remain whatever the outer load had at this moment.
+      if rs_in_progress(rs, abs_path) {
+        eprint("kaic: import cycle detected: #{format_cycle_chain(rs.in_progress, abs_path)}")
+        rs_bump_errs(rs)
+      }
+      # Legitimate diamond import: A imports B and C, both of which
+      # import D. D is visited (already loaded) but not in_progress
+      # — return rs unchanged and let the existing concat dedup the
+      # decls via the visited check on the second visit.
+      else if rs_has(rs, abs_path) { rs }
       else {
-        let rs1 = rs_mark(rs, abs_path)
-        match opt_src {
+        # Push before recursing; pop + mark visited after, on every
+        # branch of the load (missing file, lex error, parse error,
+        # or success), so the stack stays balanced.
+        let rs_in = rs_push_in_progress(rs, abs_path)
+        let rs_done = match opt_src {
           None -> {
             eprint("kaic: cannot open module '#{mod_path}' (tried #{abs_path}): no such file")
             # Issue #538 shape 3: bump the resolver error counter so
             # the compile-source aggregator returns non-zero even when
             # nothing downstream uses a name from the missing module.
-            rs_bump_errs(rs1)
+            rs_bump_errs(rs_in)
           }
           Some(src) -> {
             let tokens = tokenize(src)
             let lex_errs = report_errors(abs_path, src, tokens)
-            if lex_errs != 0 { rs1 }
+            if lex_errs != 0 { rs_in }
             else {
               let parsed = parse_program(abs_path, src, tokens)
               match parsed.decls {
-                None -> rs1
+                None -> rs_in
                 Some(decls) -> {
-                  let rs2 = process_imports(base_dir, decls, search_paths, rs1)
+                  let rs2 = process_imports(base_dir, decls, search_paths, rs_in)
                   let kept = non_import_decls(decls)
                   # m6.2 v2: tag every DFn coming from this module
                   # with `module_origin = Some(import_name)` so the
@@ -47086,6 +47143,7 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
             }
           }
         }
+        rs_mark(rs_pop_in_progress(rs_done), abs_path)
       }
     }
   }
@@ -47151,7 +47209,7 @@ fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl],
 
 
   let base_dir = dir_of(root_path)
-  let rs0 = ResolveState { visited: [root_path, ...prelude_paths], decls: [], modules: [], errs: 0 }
+  let rs0 = ResolveState { visited: [root_path, ...prelude_paths], in_progress: [root_path], decls: [], modules: [], errs: 0 }
   let rs1 = process_imports(base_dir, root_decls, search_paths, rs0)
   let imports = rs1.decls
   let n_imports = list_length(imports)
