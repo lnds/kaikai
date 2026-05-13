@@ -76,6 +76,17 @@ no user handler appears, the runtime installs a stdlib-provided
 handler. Every other effect must be closed by the user before
 `main` returns, or the compiler refuses the build.
 
+Post-#558 (Stage C of the #533 trilogy), the default-handler wiring
+is uniform: every builtin effect and every user-declared effect
+whose `default { }` block bridges its clauses via the Stage A
+`$extern_handler` intrinsic gets auto-installed at main entry. The
+historic hardcoded `default_<eff>_setup` / `default_<eff>_shims`
+emitter tables — one per builtin — are gone; the codegen walks the
+AST. Practical consequence: a user effect can mirror a builtin's
+ergonomics by adding a `default { }` block whose clauses point at a
+runtime C entry (the bridge does not validate the C symbol exists —
+that's the FFI contract).
+
 Sections are self-contained; skim the catalog, then dive where
 you care.
 

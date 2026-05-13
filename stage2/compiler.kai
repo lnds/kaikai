@@ -11014,67 +11014,25 @@ fn effect_op_names(ops: [EffectOp]) : [String] {
   }
 }
 
-# Issue #308: per-effect expected op shape for the runtime's default
-# handler. The `EvX` struct field layout in stage0/runtime.h is
-# co-designed with these op lists; if a user `effect X { ... }`
-# shadows the canonical decl with a different shape, the
-# `_kai_default_ev_x.<op> = ...` wiring would assign through fields
-# that do not exist (or sit at the wrong offset). Returning false
-# from `effect_default_compatible` makes the C and LLVM backends
-# skip wiring for that effect, just as if it were absent from
-# `main_row`.
-fn effect_default_compatible(decls: [Decl], name: String) : Bool = {
-  let expected = expected_default_op_names(name)
-  match expected {
-    None -> true                          # not a default-handler effect
-    Some(exp_ops) -> match lookup_effect_op_names(decls, name) {
-      None -> true                        # no decl in scope; pass-through
-      Some(found_ops) -> eff_op_names_eq(found_ops, exp_ops)
-    }
-  }
-}
-
-# Op-name shape expected by the runtime's default handler for each
-# effect. Order must match the stage0 `EvX` struct field order. Names
-# that have no default handler (or no shadowing risk) return None and
-# pass through unchanged.
-fn expected_default_op_names(name: String) : Option[[String]] {
-  if      name == "Stdout"       { Some(["print"]) }
-  else if name == "Stderr"       { Some(["eprint"]) }
-  else if name == "Fail"         { Some(["fail"]) }
-  else if name == "Stdin"        { Some(["read_line", "read_bytes"]) }
-  else if name == "Env"          { Some(["args", "var", "set_var", "unset_var", "vars"]) }
-  else if name == "File"         { Some(["read_file", "write_file"]) }
-  else if name == "Clock"        { Some(["wall_now", "monotonic_now", "sleep_ns"]) }
-  else if name == "Random"       { Some(["int_range"]) }
-  else if name == "SecureRandom" { Some(["int_range", "bytes"]) }
-  else if name == "NetTcp"       { Some(["connect", "listen", "accept", "send", "recv", "close"]) }
-  else if name == "Signal"       { Some(["on", "off", "await"]) }
-  else if name == "Process"      { Some(["start", "wait", "kill", "exit"]) }
-  else if name == "Log"          { Some(["debug", "info", "warn", "error"]) }
-  else if name == "Mutable"      { Some(["array_make", "array_length", "array_get", "array_set", "array_grow", "ref_make", "ref_get", "ref_set"]) }
-  else if name == "Cancel"       { Some(["raise"]) }
-  else if name == "Link"         { Some(["link"]) }
-  else if name == "Monitor"      { Some(["monitor", "demonitor"]) }
-  else if name == "Spawn"        { Some(["yield", "spawn", "await", "select", "cancel", "set_trap_exit"]) }
-  else { None }
-}
-
-# Issue #308: filter `main_row` to drop effects whose in-scope decl
-# does not match the runtime's expected op shape for that name. The
-# default-handler wiring (setup/shim/pop emit + LLVM mirror) keys on
-# builtin EvX struct layout; emitting it for a user-shadowed effect
-# whose ops differ produces invalid C (e.g.
-# `_kai_default_ev_log.debug = ...` against a user EvLog that only
-# has `.log`).
-fn row_minus_user_effects(main_row: [String], decls: [Decl]) : [String] {
+# Issue #558: keep only the main-row labels whose in-scope decl
+# carries a `default { }` block whose clauses all bridge to
+# `$extern_handler` C symbols. That is the shape the codegen knows
+# how to install — a user-declared effect lacking such a block (or
+# with kaikai-bodied clauses) does not get default-handler wiring at
+# main, and the typer's `check_default_coverage` reports the gap.
+#
+# This replaces the pre-#558 trio (`effect_default_compatible`,
+# `expected_default_op_names`, `row_effects_without_default_handler`) whose names
+# were keyed on the historic hardcoded EvX layouts.
+fn row_effects_without_default_handler(main_row: [String],
+                                        decls: [Decl]) : [String] {
   match main_row {
     [] -> []
     [x, ...rest] ->
-      if effect_default_compatible(decls, x) {
-        [x, ...row_minus_user_effects(rest, decls)]
+      if effect_default_block_all_extern(x, decls) {
+        [x, ...row_effects_without_default_handler(rest, decls)]
       } else {
-        row_minus_user_effects(rest, decls)
+        row_effects_without_default_handler(rest, decls)
       }
   }
 }
@@ -17524,7 +17482,7 @@ fn emit_main_wrapper(decls: [Decl], bmode: BuildMode) : String {
         # (line/col != 0). The default-handler emit assumes the builtin
         # EvX layout — emitting it for a user `effect Log { ... }` shape
         # produces invalid C against the user's struct.
-        let main_row = row_minus_user_effects(main_row_labels(decls), decls)
+        let main_row = row_effects_without_default_handler(main_row_labels(decls), decls)
         let shims    = default_shims_for(main_row, decls)
         let setup    = default_setups_for(main_row, decls)
         let teardown = default_pops_for(main_row)
@@ -18185,9 +18143,10 @@ fn check_op_call_coverage(file: String, decls: [Decl], fname: String,
     let op_name  = dotted_suffix(bare)
     # Skip the row-level absorbed labels (Ffi etc.) — they have no per-op
     # discharge surface. The walker only fires for declared effects that
-    # come through `effect E { ops }` plus the canonical builtin shapes.
-    if not is_effect_declared(eff_name, decls) and
-       not is_absorbable_stdlib_eff(eff_name) { 0 }
+    # come through `effect E { ops }`. Builtins are injected as DEffect
+    # by `inject_builtin_effects` before this check runs, so they all
+    # show up via `is_effect_declared`.
+    if not is_effect_declared(eff_name, decls) { 0 }
     else {
       match find_top_eff_frame(stack, eff_name) {
         Some(frame) -> match frame {
@@ -18215,30 +18174,17 @@ fn check_op_call_coverage(file: String, decls: [Decl], fname: String,
           # No enclosing handle for `eff_name`. The op either fires from
           # main (step 4) or escapes to the caller's row.
           if fname == "main" {
-            # Step 4 is restricted to the canonical builtin set. User-
-            # declared effects with `default { }` would need
-            # `default_setups_for` / `default_shims_for` to walk the
-            # source-level decl tables; Stage A wired only the 17
-            # builtins (with `Stdout` as the only one consulting its
-            # `default { }`). `check_main_row_handlable` already
-            # rejected those at the row level; we duplicate the
-            # message here only when the row was elided.
-            if is_absorbable_stdlib_eff(eff_name) {
-              let default_ops = effect_default_op_names(eff_name, decls)
-              let has_block = effect_has_default_block(eff_name, decls)
-              if list_has_string(default_ops, op_name) { 0 }
-              else if not has_block {
-                # Legacy hardcoded handler covers the op (the 16
-                # builtins not yet migrated).
-                0
-              }
-              else {
-                report_uncovered_op(file, fname, eff_name, op_name, decls,
-                                     line, col, true)
-                1
-              }
+            # Issue #558: every effect (builtin or user) with a
+            # source-level `default { }` block bridging via
+            # `$extern_handler` gets auto-installed at main. The
+            # check is now uniform — no special builtin list.
+            let default_ops = effect_default_op_names(eff_name, decls)
+            if list_has_string(default_ops, op_name) { 0 }
+            else {
+              report_uncovered_op(file, fname, eff_name, op_name, decls,
+                                   line, col, true)
+              1
             }
-            else { 0 }   # `check_main_row_handlable` already complained
           }
           else { 0 }
       }
@@ -18304,15 +18250,8 @@ fn describe_default_status(eff_name: String, op_name: String,
                             decls: [Decl]) : String {
   match find_effect_default_block(eff_name, decls) {
     None ->
-      if is_absorbable_stdlib_eff(eff_name) {
-        # Pre-Stage-C builtin: source-level default not yet migrated.
-        concat_all(["`", eff_name,
-                    "` is a builtin effect; its default handler is installed at `main` but does not cover `",
-                    op_name, "` (Stage A only migrated `Stdout.print`)"])
-      } else {
-        concat_all(["effect `", eff_name,
-                    "` declares no `default { }` block, so no fallback handler exists"])
-      }
+      concat_all(["effect `", eff_name,
+                  "` declares no `default { }` block, so no fallback handler exists"])
     Some(defblk) -> match defblk {
       DBlk(clauses, _, _, _) -> {
         let all_names = handle_clause_op_names(clauses)
@@ -18434,503 +18373,6 @@ fn strip_string_quotes(span: String) : String {
   }
 }
 
-fn default_stdout_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_stdout_print_shim(EvStdout *self, KaiValue *kai_s, KaiCont *k) {\n",
-    "    return kai_default_stdout_print(self, kai_s, k);\n",
-    "}\n"
-  ])
-
-fn default_stdout_setup() : String =
-  concat_all([
-    "    static EvStdout _kai_default_ev_stdout;\n",
-    "    static KaiEvidence _kai_default_node_stdout;\n",
-    "    _kai_default_ev_stdout.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_stdout.print = &_kai_default_stdout_print_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_stdout, \"Stdout\", &_kai_default_ev_stdout);\n"
-  ])
-
-fn default_stderr_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_stderr_eprint_shim(EvStderr *self, KaiValue *kai_s, KaiCont *k) {\n",
-    "    return kai_default_stderr_eprint(self, kai_s, k);\n",
-    "}\n"
-  ])
-
-fn default_stderr_setup() : String =
-  concat_all([
-    "    static EvStderr _kai_default_ev_stderr;\n",
-    "    static KaiEvidence _kai_default_node_stderr;\n",
-    "    _kai_default_ev_stderr.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_stderr.eprint = &_kai_default_stderr_eprint_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_stderr, \"Stderr\", &_kai_default_ev_stderr);\n"
-  ])
-
-fn default_fail_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_fail_fail_shim(EvFail *self, KaiValue *kai_msg, KaiCont *k) {\n",
-    "    return kai_default_fail_fail(self, kai_msg, k);\n",
-    "}\n"
-  ])
-
-fn default_fail_setup() : String =
-  concat_all([
-    "    static EvFail _kai_default_ev_fail;\n",
-    "    static KaiEvidence _kai_default_node_fail;\n",
-    "    _kai_default_ev_fail.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_fail.fail = &_kai_default_fail_fail_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_fail, \"Fail\", &_kai_default_ev_fail);\n"
-  ])
-
-fn default_stdin_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_stdin_read_line_shim(EvStdin *self, KaiCont *k) {\n",
-    "    return kai_default_stdin_read_line(self, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_stdin_read_bytes_shim(EvStdin *self, KaiValue *kai_n, KaiCont *k) {\n",
-    "    return kai_default_stdin_read_bytes(self, kai_n, k);\n",
-    "}\n"
-  ])
-
-fn default_stdin_setup() : String =
-  concat_all([
-    "    static EvStdin _kai_default_ev_stdin;\n",
-    "    static KaiEvidence _kai_default_node_stdin;\n",
-    "    _kai_default_ev_stdin.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_stdin.read_line  = &_kai_default_stdin_read_line_shim;\n",
-    "    _kai_default_ev_stdin.read_bytes = &_kai_default_stdin_read_bytes_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_stdin, \"Stdin\", &_kai_default_ev_stdin);\n"
-  ])
-
-fn default_env_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_env_args_shim(EvEnv *self, KaiCont *k) {\n",
-    "    return kai_default_env_args(self, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_env_var_shim(EvEnv *self, KaiValue *kai_name, KaiCont *k) {\n",
-    "    return kai_default_env_var(self, kai_name, k);\n",
-    "}\n",
-    # Issue #127: write side + full block enumeration. Same EvEnv*
-    # / KaiCont* shape as the existing args/var shims so the typed
-    # dispatch table stays UBSan-clean.
-    "static KaiValue *_kai_default_env_set_var_shim(EvEnv *self, KaiValue *kai_name, KaiValue *kai_value, KaiCont *k) {\n",
-    "    return kai_default_env_set_var(self, kai_name, kai_value, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_env_unset_var_shim(EvEnv *self, KaiValue *kai_name, KaiCont *k) {\n",
-    "    return kai_default_env_unset_var(self, kai_name, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_env_vars_shim(EvEnv *self, KaiCont *k) {\n",
-    "    return kai_default_env_vars(self, k);\n",
-    "}\n"
-  ])
-
-fn default_env_setup() : String =
-  concat_all([
-    "    static EvEnv _kai_default_ev_env;\n",
-    "    static KaiEvidence _kai_default_node_env;\n",
-    "    _kai_default_ev_env.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_env.args      = &_kai_default_env_args_shim;\n",
-    "    _kai_default_ev_env.var       = &_kai_default_env_var_shim;\n",
-    "    _kai_default_ev_env.set_var   = &_kai_default_env_set_var_shim;\n",
-    "    _kai_default_ev_env.unset_var = &_kai_default_env_unset_var_shim;\n",
-    "    _kai_default_ev_env.vars      = &_kai_default_env_vars_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_env, \"Env\", &_kai_default_ev_env);\n"
-  ])
-
-fn default_file_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_file_read_file_shim(EvFile *self, KaiValue *kai_path, KaiCont *k) {\n",
-    "    return kai_default_file_read_file(self, kai_path, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_file_write_file_shim(EvFile *self, KaiValue *kai_path, KaiValue *kai_contents, KaiCont *k) {\n",
-    "    return kai_default_file_write_file(self, kai_path, kai_contents, k);\n",
-    "}\n"
-  ])
-
-fn default_file_setup() : String =
-  concat_all([
-    "    static EvFile _kai_default_ev_file;\n",
-    "    static KaiEvidence _kai_default_node_file;\n",
-    "    _kai_default_ev_file.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_file.read_file  = &_kai_default_file_read_file_shim;\n",
-    "    _kai_default_ev_file.write_file = &_kai_default_file_write_file_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_file, \"File\", &_kai_default_ev_file);\n"
-  ])
-
-# Default Clock handler — three ops bridging to OS clocks via
-# `clock_gettime(CLOCK_REALTIME, ...)` (wall_now), `clock_gettime
-# (CLOCK_MONOTONIC, ...)` (monotonic_now), and `nanosleep` (sleep_ns).
-# Installed when `main`'s row mentions `Clock`. The Clock effect
-# itself is declared in stdlib/time.kai (not as a compiler builtin),
-# so user code reaches this handler by `import time` + writing
-# `time.now()` / `time.monotonic()` / `time.sleep(d)`. See
-# `kai_default_clock_*` in stage0/runtime.h. m8.x follow-up: under
-# the m8 v1 inline-eager scheduler `sleep_ns` blocks the OS thread
-# and is not Cancel-aware; the cooperative scheduler upgrades it.
-fn default_clock_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_clock_wall_now_shim(EvClock *self, KaiCont *k) {\n",
-    "    return kai_default_clock_wall_now(self, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_clock_monotonic_now_shim(EvClock *self, KaiCont *k) {\n",
-    "    return kai_default_clock_monotonic_now(self, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_clock_sleep_ns_shim(EvClock *self, KaiValue *kai_ns, KaiCont *k) {\n",
-    "    return kai_default_clock_sleep_ns(self, kai_ns, k);\n",
-    "}\n"
-  ])
-
-fn default_clock_setup() : String =
-  concat_all([
-    "    static EvClock _kai_default_ev_clock;\n",
-    "    static KaiEvidence _kai_default_node_clock;\n",
-    "    _kai_default_ev_clock.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_clock.wall_now      = &_kai_default_clock_wall_now_shim;\n",
-    "    _kai_default_ev_clock.monotonic_now = &_kai_default_clock_monotonic_now_shim;\n",
-    "    _kai_default_ev_clock.sleep_ns      = &_kai_default_clock_sleep_ns_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_clock, \"Clock\", &_kai_default_ev_clock);\n"
-  ])
-
-# Default Random handler — non-deterministic per-process PCG64
-# seeded from time(NULL) ^ getpid() at first use. See
-# `kai_default_random_int_range` in stage0/runtime.h.
-fn default_random_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_random_int_range_shim(EvRandom *self, KaiValue *kai_lo, KaiValue *kai_hi, KaiCont *k) {\n",
-    "    return kai_default_random_int_range(self, kai_lo, kai_hi, k);\n",
-    "}\n"
-  ])
-
-fn default_random_setup() : String =
-  concat_all([
-    "    static EvRandom _kai_default_ev_random;\n",
-    "    static KaiEvidence _kai_default_node_random;\n",
-    "    _kai_default_ev_random.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_random.int_range = &_kai_default_random_int_range_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_random, \"Random\", &_kai_default_ev_random);\n"
-  ])
-
-# net-tcp-v1: default NetTcp handler — POSIX sockets, blocking. Six
-# ops wired to `kai_default_nettcp_*` in stage0/runtime.h. Installed
-# whenever `main`'s row mentions `NetTcp` (or expands an alias that
-# resolves to it). v1 limitations (IPv4-only, blocking, no listener
-# close) live with the spec memo in stdlib/effects.kai.
-fn default_nettcp_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_nettcp_connect_shim(EvNetTcp *self, KaiValue *kai_host, KaiValue *kai_port, KaiCont *k) {\n",
-    "    return kai_default_nettcp_connect(self, kai_host, kai_port, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_nettcp_listen_shim(EvNetTcp *self, KaiValue *kai_host, KaiValue *kai_port, KaiCont *k) {\n",
-    "    return kai_default_nettcp_listen(self, kai_host, kai_port, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_nettcp_accept_shim(EvNetTcp *self, KaiValue *kai_listener, KaiCont *k) {\n",
-    "    return kai_default_nettcp_accept(self, kai_listener, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_nettcp_send_shim(EvNetTcp *self, KaiValue *kai_conn, KaiValue *kai_bytes, KaiCont *k) {\n",
-    "    return kai_default_nettcp_send(self, kai_conn, kai_bytes, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_nettcp_recv_shim(EvNetTcp *self, KaiValue *kai_conn, KaiValue *kai_max, KaiCont *k) {\n",
-    "    return kai_default_nettcp_recv(self, kai_conn, kai_max, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_nettcp_close_shim(EvNetTcp *self, KaiValue *kai_conn, KaiCont *k) {\n",
-    "    return kai_default_nettcp_close(self, kai_conn, k);\n",
-    "}\n"
-  ])
-
-fn default_nettcp_setup() : String =
-  concat_all([
-    "    static EvNetTcp _kai_default_ev_nettcp;\n",
-    "    static KaiEvidence _kai_default_node_nettcp;\n",
-    "    _kai_default_ev_nettcp.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_nettcp.connect = &_kai_default_nettcp_connect_shim;\n",
-    "    _kai_default_ev_nettcp.listen  = &_kai_default_nettcp_listen_shim;\n",
-    "    _kai_default_ev_nettcp.accept  = &_kai_default_nettcp_accept_shim;\n",
-    "    _kai_default_ev_nettcp.send    = &_kai_default_nettcp_send_shim;\n",
-    "    _kai_default_ev_nettcp.recv    = &_kai_default_nettcp_recv_shim;\n",
-    "    _kai_default_ev_nettcp.close   = &_kai_default_nettcp_close_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_nettcp, \"NetTcp\", &_kai_default_ev_nettcp);\n"
-  ])
-
-# Issue #107: default Signal handler — three ops wired to
-# `kai_default_signal_*` in stage0/runtime.h. Subscribed signals are
-# blocked at the process level via sigprocmask; `await()` synchronously
-# dequeues via sigwait. Installed when `main`'s row mentions `Signal`.
-fn default_signal_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_signal_on_shim(EvSignal *self, KaiValue *kai_sig, KaiCont *k) {\n",
-    "    return kai_default_signal_on(self, kai_sig, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_signal_off_shim(EvSignal *self, KaiValue *kai_sig, KaiCont *k) {\n",
-    "    return kai_default_signal_off(self, kai_sig, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_signal_await_shim(EvSignal *self, KaiCont *k) {\n",
-    "    return kai_default_signal_await(self, k);\n",
-    "}\n"
-  ])
-
-fn default_signal_setup() : String =
-  concat_all([
-    "    static EvSignal _kai_default_ev_signal;\n",
-    "    static KaiEvidence _kai_default_node_signal;\n",
-    "    _kai_default_ev_signal.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_signal.on    = &_kai_default_signal_on_shim;\n",
-    "    _kai_default_ev_signal.off   = &_kai_default_signal_off_shim;\n",
-    "    _kai_default_ev_signal.await = &_kai_default_signal_await_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_signal, \"Signal\", &_kai_default_ev_signal);\n"
-  ])
-
-# Issue #126: default Process handler — four ops wired to
-# `kai_default_process_*` in stage0/runtime.h. fork+execvp for
-# start, waitpid for wait, kill(2) for kill, _exit(2) for exit.
-# Installed when `main`'s row mentions `Process`.
-fn default_process_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_process_start_shim(EvProcess *self, KaiValue *kai_cmd, KaiValue *kai_args, KaiCont *k) {\n",
-    "    return kai_default_process_start(self, kai_cmd, kai_args, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_process_wait_shim(EvProcess *self, KaiValue *kai_c, KaiCont *k) {\n",
-    "    return kai_default_process_wait(self, kai_c, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_process_kill_shim(EvProcess *self, KaiValue *kai_c, KaiValue *kai_sig, KaiCont *k) {\n",
-    "    return kai_default_process_kill(self, kai_c, kai_sig, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_process_exit_shim(EvProcess *self, KaiValue *kai_code, KaiCont *k) {\n",
-    "    return kai_default_process_exit(self, kai_code, k);\n",
-    "}\n"
-  ])
-
-fn default_process_setup() : String =
-  concat_all([
-    "    static EvProcess _kai_default_ev_process;\n",
-    "    static KaiEvidence _kai_default_node_process;\n",
-    "    _kai_default_ev_process.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_process.start = &_kai_default_process_start_shim;\n",
-    "    _kai_default_ev_process.wait  = &_kai_default_process_wait_shim;\n",
-    "    _kai_default_ev_process.kill  = &_kai_default_process_kill_shim;\n",
-    "    _kai_default_ev_process.exit  = &_kai_default_process_exit_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_process, \"Process\", &_kai_default_ev_process);\n"
-  ])
-
-# Issue #141: default Log handler — four leveled ops wired to
-# `kai_default_log_*` in stage0/runtime.h. The C runtime calls
-# `clock_gettime(CLOCK_REALTIME)` directly per write so the Log row
-# does not pull `Clock` into main's row.
-fn default_log_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_log_debug_shim(EvLog *self, KaiValue *kai_msg, KaiCont *k) {\n",
-    "    return kai_default_log_debug(self, kai_msg, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_log_info_shim(EvLog *self, KaiValue *kai_msg, KaiCont *k) {\n",
-    "    return kai_default_log_info(self, kai_msg, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_log_warn_shim(EvLog *self, KaiValue *kai_msg, KaiCont *k) {\n",
-    "    return kai_default_log_warn(self, kai_msg, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_log_error_shim(EvLog *self, KaiValue *kai_msg, KaiCont *k) {\n",
-    "    return kai_default_log_error(self, kai_msg, k);\n",
-    "}\n"
-  ])
-
-fn default_log_setup() : String =
-  concat_all([
-    "    static EvLog _kai_default_ev_log;\n",
-    "    static KaiEvidence _kai_default_node_log;\n",
-    "    _kai_default_ev_log.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_log.debug = &_kai_default_log_debug_shim;\n",
-    "    _kai_default_ev_log.info  = &_kai_default_log_info_shim;\n",
-    "    _kai_default_ev_log.warn  = &_kai_default_log_warn_shim;\n",
-    "    _kai_default_ev_log.error = &_kai_default_log_error_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_log, \"Log\", &_kai_default_ev_log);\n"
-  ])
-
-# Issue #140: default SecureRandom handler — two ops wired to
-# `kai_default_securerandom_*` in stage0/runtime.h. Platform dispatch
-# (Linux getrandom / macOS arc4random_buf) lives in the runtime
-# helpers. Installed when `main`'s row mentions `SecureRandom`.
-fn default_securerandom_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_securerandom_int_range_shim(EvSecureRandom *self, KaiValue *kai_min, KaiValue *kai_max, KaiCont *k) {\n",
-    "    return kai_default_securerandom_int_range(self, kai_min, kai_max, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_securerandom_bytes_shim(EvSecureRandom *self, KaiValue *kai_n, KaiCont *k) {\n",
-    "    return kai_default_securerandom_bytes(self, kai_n, k);\n",
-    "}\n"
-  ])
-
-fn default_securerandom_setup() : String =
-  concat_all([
-    "    static EvSecureRandom _kai_default_ev_securerandom;\n",
-    "    static KaiEvidence _kai_default_node_securerandom;\n",
-    "    _kai_default_ev_securerandom.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_securerandom.int_range = &_kai_default_securerandom_int_range_shim;\n",
-    "    _kai_default_ev_securerandom.bytes = &_kai_default_securerandom_bytes_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_securerandom, \"SecureRandom\", &_kai_default_ev_securerandom);\n"
-  ])
-
-# m7b #2b: default Mutable handler — wraps the prelude `array_*`
-# runtime functions with clauses that resume with the result. Each
-# slot is initialised to the matching `kai_default_mutable_*`
-# trampoline (defined in stage0/runtime.h).
-fn default_mutable_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_mutable_array_make_shim(EvMutable *self, KaiValue *kai_n, KaiValue *kai_init, KaiCont *k) {\n",
-    "    return kai_default_mutable_array_make(self, kai_n, kai_init, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_mutable_array_length_shim(EvMutable *self, KaiValue *kai_arr, KaiCont *k) {\n",
-    "    return kai_default_mutable_array_length(self, kai_arr, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_mutable_array_get_shim(EvMutable *self, KaiValue *kai_arr, KaiValue *kai_i, KaiCont *k) {\n",
-    "    return kai_default_mutable_array_get(self, kai_arr, kai_i, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_mutable_array_set_shim(EvMutable *self, KaiValue *kai_arr, KaiValue *kai_i, KaiValue *kai_v, KaiCont *k) {\n",
-    "    return kai_default_mutable_array_set(self, kai_arr, kai_i, kai_v, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_mutable_array_grow_shim(EvMutable *self, KaiValue *kai_arr, KaiValue *kai_n, KaiValue *kai_init, KaiCont *k) {\n",
-    "    return kai_default_mutable_array_grow(self, kai_arr, kai_n, kai_init, k);\n",
-    "}\n",
-    # issue #257: ref_* trampolines.
-    "static KaiValue *_kai_default_mutable_ref_make_shim(EvMutable *self, KaiValue *kai_init, KaiCont *k) {\n",
-    "    return kai_default_mutable_ref_make(self, kai_init, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_mutable_ref_get_shim(EvMutable *self, KaiValue *kai_r, KaiCont *k) {\n",
-    "    return kai_default_mutable_ref_get(self, kai_r, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_mutable_ref_set_shim(EvMutable *self, KaiValue *kai_r, KaiValue *kai_v, KaiCont *k) {\n",
-    "    return kai_default_mutable_ref_set(self, kai_r, kai_v, k);\n",
-    "}\n"
-  ])
-
-fn default_mutable_setup() : String =
-  concat_all([
-    "    static EvMutable _kai_default_ev_mutable;\n",
-    "    static KaiEvidence _kai_default_node_mutable;\n",
-    "    _kai_default_ev_mutable.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_mutable.array_make   = &_kai_default_mutable_array_make_shim;\n",
-    "    _kai_default_ev_mutable.array_length = &_kai_default_mutable_array_length_shim;\n",
-    "    _kai_default_ev_mutable.array_get    = &_kai_default_mutable_array_get_shim;\n",
-    "    _kai_default_ev_mutable.array_set    = &_kai_default_mutable_array_set_shim;\n",
-    "    _kai_default_ev_mutable.array_grow   = &_kai_default_mutable_array_grow_shim;\n",
-    # issue #257: wire ref_* slots; assignment is by struct field
-    # name, so order here is purely cosmetic.
-    "    _kai_default_ev_mutable.ref_make     = &_kai_default_mutable_ref_make_shim;\n",
-    "    _kai_default_ev_mutable.ref_get      = &_kai_default_mutable_ref_get_shim;\n",
-    "    _kai_default_ev_mutable.ref_set      = &_kai_default_mutable_ref_set_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_mutable, \"Mutable\", &_kai_default_ev_mutable);\n"
-  ])
-
-# m8 #4: emit EvCancel + push it between the I/O group and Spawn
-# (Doc B §*Installation order*). Single op `raise()`. The default
-# resumes by exiting the program; user-installed Cancel handlers
-# can wrap a region to run cleanup before the unwind escapes the
-# wrapping `handle` block.
-fn default_cancel_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_cancel_raise_shim(EvCancel *self, KaiCont *k) {\n",
-    "    return kai_default_cancel_raise(self, k);\n",
-    "}\n"
-  ])
-
-fn default_cancel_setup() : String =
-  concat_all([
-    "    static EvCancel _kai_default_ev_cancel;\n",
-    "    static KaiEvidence _kai_default_node_cancel;\n",
-    "    _kai_default_ev_cancel.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_cancel.raise = &_kai_default_cancel_raise_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_cancel, \"Cancel\", &_kai_default_ev_cancel);\n"
-  ])
-
-# m8 #9 + Phase 5: emit EvLink + push it between Cancel and Spawn.
-# Single op `link(peer)`. The default registers a bidirectional
-# link in both fibers' linked_head chains; trampoline termination
-# walks each chain and sets cancel_requested on every peer. v1's
-# Pid[Nothing]-erased peer parameter is resolved at runtime via
-# peer->as.mb->owner_fiber.
-fn default_link_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_link_link_shim(EvLink *self, KaiValue *kai_peer, KaiCont *k) {\n",
-    "    return kai_default_link_link(self, kai_peer, k);\n",
-    "}\n"
-  ])
-
-fn default_link_setup() : String =
-  concat_all([
-    "    static EvLink _kai_default_ev_link;\n",
-    "    static KaiEvidence _kai_default_node_link;\n",
-    "    _kai_default_ev_link.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_link.link = &_kai_default_link_link_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_link, \"Link\", &_kai_default_ev_link);\n"
-  ])
-
-# Tier 2 (Fibers Tier 2 lane): emit EvMonitor + push it alongside
-# Link. `monitor(target_pid)` registers the current fiber as an
-# observer on target_pid->as.mb->owner_fiber's monitor_head chain;
-# trampoline termination pushes the original target_pid value into
-# every observer's mailbox, *without* setting cancel_requested
-# (monitors are unidirectional / fault-isolated per
-# `docs/actors.md` §*Fault propagation*). `demonitor(ref)` removes
-# the entry. v1 simplification: the MonitorRef returned by `monitor`
-# is the same Pid value the user passed in, so demonitor takes
-# the same Pid.
-fn default_monitor_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_monitor_monitor_shim(EvMonitor *self, KaiValue *kai_target, KaiCont *k) {\n",
-    "    return kai_default_monitor_monitor(self, kai_target, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_monitor_demonitor_shim(EvMonitor *self, KaiValue *kai_ref, KaiCont *k) {\n",
-    "    return kai_default_monitor_demonitor(self, kai_ref, k);\n",
-    "}\n"
-  ])
-
-fn default_monitor_setup() : String =
-  concat_all([
-    "    static EvMonitor _kai_default_ev_monitor;\n",
-    "    static KaiEvidence _kai_default_node_monitor;\n",
-    "    _kai_default_ev_monitor.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_monitor.monitor   = &_kai_default_monitor_monitor_shim;\n",
-    "    _kai_default_ev_monitor.demonitor = &_kai_default_monitor_demonitor_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_monitor, \"Monitor\", &_kai_default_ev_monitor);\n"
-  ])
-
-# m8 #2/#3: emit EvSpawn + push it as the innermost default-handler
-# node (Doc B §*Installation order*: Spawn sits closest to main,
-# Cancel the layer below it, the I/O group below that). Wires all
-# five ops to the inline-eager v1 defaults — see stage0/runtime.h
-# for what each one does at runtime.
-fn default_spawn_shims() : String =
-  concat_all([
-    "static KaiValue *_kai_default_spawn_yield_shim(EvSpawn *self, KaiCont *k) {\n",
-    "    return kai_default_spawn_yield(self, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_spawn_spawn_shim(EvSpawn *self, KaiValue *kai_thunk, KaiCont *k) {\n",
-    "    return kai_default_spawn_spawn(self, kai_thunk, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_spawn_await_shim(EvSpawn *self, KaiValue *kai_fiber, KaiCont *k) {\n",
-    "    return kai_default_spawn_await(self, kai_fiber, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_spawn_select_shim(EvSpawn *self, KaiValue *kai_fibers, KaiCont *k) {\n",
-    "    return kai_default_spawn_select(self, kai_fibers, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_spawn_cancel_shim(EvSpawn *self, KaiValue *kai_fiber, KaiCont *k) {\n",
-    "    return kai_default_spawn_cancel(self, kai_fiber, k);\n",
-    "}\n",
-    "static KaiValue *_kai_default_spawn_set_trap_exit_shim(EvSpawn *self, KaiValue *kai_on, KaiCont *k) {\n",
-    "    return kai_default_spawn_set_trap_exit(self, kai_on, k);\n",
-    "}\n"
-  ])
-
-fn default_spawn_setup() : String =
-  concat_all([
-    "    static EvSpawn _kai_default_ev_spawn;\n",
-    "    static KaiEvidence _kai_default_node_spawn;\n",
-    "    _kai_default_ev_spawn.handler_id = kai_fresh_handler_id();\n",
-    "    _kai_default_ev_spawn.yield  = &_kai_default_spawn_yield_shim;\n",
-    "    _kai_default_ev_spawn.spawn  = &_kai_default_spawn_spawn_shim;\n",
-    "    _kai_default_ev_spawn.await  = &_kai_default_spawn_await_shim;\n",
-    "    _kai_default_ev_spawn.select = &_kai_default_spawn_select_shim;\n",
-    "    _kai_default_ev_spawn.cancel = &_kai_default_spawn_cancel_shim;\n",
-    "    _kai_default_ev_spawn.set_trap_exit = &_kai_default_spawn_set_trap_exit_shim;\n",
-    "    kai_evidence_push(&_kai_default_node_spawn, \"Spawn\", &_kai_default_ev_spawn);\n"
-  ])
 
 # m7a #7 + m7b #2b + m8 #2/#4 + m12.8 Phase 4b: assemble the full
 # setup block for the builtins listed in `main`'s row. Push order
@@ -18941,41 +18383,57 @@ fn default_spawn_setup() : String =
 # cluster). Phase 4b: `Console` acts as the alias `Stdout + Stderr`,
 # so a row containing it triggers both setups.
 fn default_setups_for(main_row: [String], decls: [Decl]) : String = {
-  # Phase 4b note: after alias expansion in `expand_aliases_in_decls`,
-  # main's row never contains "Console" — it has been substituted
-  # to `Stdout + Stderr + Stdin` already. We gate on the atomic
-  # labels only; the older `or list_has(main_row, "Console")` was
-  # dead code carried over from the pre-alias scaffolding.
-  #
-  # Issue #556 Stage A: for each builtin effect whose decl carries a
-  # `default { }` block with `$extern_handler` clauses, derive the
-  # setup from the AST instead of the hardcoded table. The first
-  # migrated effect is Stdout; the rest follow in Stage C. Effects
-  # without a default block (or with kaikai-bodied clauses) keep the
-  # hardcoded path.
-  concat_all([
-    if list_has(main_row, "Stdout")  {
-      let derived = default_setups_from_block("Stdout", decls)
-      if string_length(derived) > 0 { derived } else { default_stdout_setup() }
-    } else { "" },
-    if list_has(main_row, "Stderr")  { default_stderr_setup() } else { "" },
-    if list_has(main_row, "Fail")    { default_fail_setup() }    else { "" },
-    if list_has(main_row, "Stdin")   { default_stdin_setup() }   else { "" },
-    if list_has(main_row, "Env")     { default_env_setup() }     else { "" },
-    if list_has(main_row, "File")    { default_file_setup() }    else { "" },
-    if list_has(main_row, "Clock")   { default_clock_setup() }   else { "" },
-    if list_has(main_row, "Random")  { default_random_setup() }  else { "" },
-    if list_has(main_row, "SecureRandom") { default_securerandom_setup() } else { "" },
-    if list_has(main_row, "NetTcp")  { default_nettcp_setup() }  else { "" },
-    if list_has(main_row, "Signal")  { default_signal_setup() }  else { "" },
-    if list_has(main_row, "Process") { default_process_setup() } else { "" },
-    if list_has(main_row, "Log")     { default_log_setup() }     else { "" },
-    if list_has(main_row, "Mutable") { default_mutable_setup() } else { "" },
-    if list_has(main_row, "Cancel")  { default_cancel_setup() }  else { "" },
-    if list_has(main_row, "Link")    { default_link_setup() }    else { "" },
-    if list_has(main_row, "Monitor") { default_monitor_setup() } else { "" },
-    if list_has(main_row, "Spawn")   { default_spawn_setup() }   else { "" }
-  ])
+  # Issue #558: every builtin (and any user-declared effect) whose
+  # decl carries a `default { }` block bridged via `$extern_handler`
+  # rides the AST-derived `default_setups_from_block`. The hardcoded
+  # `default_<eff>_setup()` family was deleted alongside this
+  # migration — the source-level `default { }` is the only path.
+  # The list below preserves the historic push order for the builtins
+  # so the corresponding pop order in `default_pops_for` stays
+  # consistent; any user-declared effects in `main_row` push after
+  # the builtins in their declaration order.
+  let order = list_append(builtin_default_install_order(),
+                            user_effects_in_row(main_row))
+  emit_default_setups_in_order(order, main_row, decls)
+}
+
+fn emit_default_setups_in_order(order: [String], main_row: [String],
+                                 decls: [Decl]) : String {
+  match order {
+    [] -> ""
+    [eff, ...rest] ->
+      if list_has(main_row, eff) {
+        let derived = default_setups_from_block(eff, decls)
+        concat_all([derived, emit_default_setups_in_order(rest, main_row, decls)])
+      } else {
+        emit_default_setups_in_order(rest, main_row, decls)
+      }
+  }
+}
+
+# Push order for default handlers — mirrors the historic hardcoded
+# arrangement so push/pop stays balanced and selfhost stays
+# byte-identical. Pops in `default_pops_for` walk this list in
+# reverse.
+fn builtin_default_install_order() : [String] =
+  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Clock",
+   "Random", "SecureRandom", "NetTcp", "Signal", "Process", "Log",
+   "Mutable", "Cancel", "Link", "Monitor", "Spawn"]
+
+# Labels in `main_row` that are NOT canonical builtin defaults. They
+# go at the end of the install order, after the builtins, so the pop
+# order can mirror reverse-declaration.
+fn user_effects_in_row(main_row: [String]) : [String] {
+  let builtins = builtin_default_install_order()
+  match main_row {
+    [] -> []
+    [x, ...rest] ->
+      if list_has(builtins, x) {
+        user_effects_in_row(rest)
+      } else {
+        [x, ...user_effects_in_row(rest)]
+      }
+  }
 }
 
 # Issue #115: aggregate the typed shim definitions for every
@@ -18988,53 +18446,55 @@ fn default_setups_for(main_row: [String], decls: [Decl]) : String = {
 # C compile error before the binary is produced (and well before
 # UBSan would otherwise catch the type mismatch at runtime).
 fn default_shims_for(main_row: [String], decls: [Decl]) : String = {
-  concat_all([
-    if list_has(main_row, "Stdout")  {
-      let derived = default_shims_from_block("Stdout", decls)
-      if string_length(derived) > 0 { derived } else { default_stdout_shims() }
-    } else { "" },
-    if list_has(main_row, "Stderr")  { default_stderr_shims() } else { "" },
-    if list_has(main_row, "Fail")    { default_fail_shims() }    else { "" },
-    if list_has(main_row, "Stdin")   { default_stdin_shims() }   else { "" },
-    if list_has(main_row, "Env")     { default_env_shims() }     else { "" },
-    if list_has(main_row, "File")    { default_file_shims() }    else { "" },
-    if list_has(main_row, "Clock")   { default_clock_shims() }   else { "" },
-    if list_has(main_row, "Random")  { default_random_shims() }  else { "" },
-    if list_has(main_row, "SecureRandom") { default_securerandom_shims() } else { "" },
-    if list_has(main_row, "NetTcp")  { default_nettcp_shims() }  else { "" },
-    if list_has(main_row, "Signal")  { default_signal_shims() }  else { "" },
-    if list_has(main_row, "Process") { default_process_shims() } else { "" },
-    if list_has(main_row, "Log")     { default_log_shims() }     else { "" },
-    if list_has(main_row, "Mutable") { default_mutable_shims() } else { "" },
-    if list_has(main_row, "Cancel")  { default_cancel_shims() }  else { "" },
-    if list_has(main_row, "Link")    { default_link_shims() }    else { "" },
-    if list_has(main_row, "Monitor") { default_monitor_shims() } else { "" },
-    if list_has(main_row, "Spawn")   { default_spawn_shims() }   else { "" }
-  ])
+  # Issue #558: every shim is derived from the effect's `default { }`
+  # block; the hardcoded `default_<eff>_shims()` family was deleted
+  # alongside this migration. Iteration order matches
+  # `default_setups_for` (push order) so the shim definitions appear
+  # ahead of the setup block that references them. User-declared
+  # effects with `default { }` blocks emit their shims after the
+  # builtin shims.
+  let order = list_append(builtin_default_install_order(),
+                            user_effects_in_row(main_row))
+  emit_default_shims_in_order(order, main_row, decls)
+}
+
+fn emit_default_shims_in_order(order: [String], main_row: [String],
+                                decls: [Decl]) : String {
+  match order {
+    [] -> ""
+    [eff, ...rest] ->
+      if list_has(main_row, eff) {
+        let derived = default_shims_from_block(eff, decls)
+        concat_all([derived, emit_default_shims_in_order(rest, main_row, decls)])
+      } else {
+        emit_default_shims_in_order(rest, main_row, decls)
+      }
+  }
 }
 
 # Pops in reverse-push order so the evidence stack drains LIFO.
-fn default_pops_for(main_row: [String]) : String =
-  concat_all([
-    if list_has(main_row, "Spawn")   { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Monitor") { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Link")    { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Cancel")  { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Mutable") { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Log")     { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Process") { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Signal")  { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "NetTcp")  { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "SecureRandom") { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Random")  { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Clock")   { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "File")    { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Env")     { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Stdin")   { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Fail")    { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Stderr")  { "    kai_evidence_pop();\n" } else { "" },
-    if list_has(main_row, "Stdout")  { "    kai_evidence_pop();\n" } else { "" }
-  ])
+# Push order: builtins first (in `builtin_default_install_order`),
+# then user-declared effects (in declaration order). Pops therefore
+# walk user-declared effects first (reverse declaration order), then
+# builtins (reverse pinned order).
+fn default_pops_for(main_row: [String]) : String = {
+  let order = list_append(builtin_default_install_order(),
+                            user_effects_in_row(main_row))
+  emit_default_pops_in_order(list_reverse(order), main_row)
+}
+
+fn emit_default_pops_in_order(order_rev: [String], main_row: [String]) : String {
+  match order_rev {
+    [] -> ""
+    [eff, ...rest] ->
+      if list_has(main_row, eff) {
+        concat_all(["    kai_evidence_pop();\n",
+                    emit_default_pops_in_order(rest, main_row)])
+      } else {
+        emit_default_pops_in_order(rest, main_row)
+      }
+  }
+}
 
 # m7b #5b/handle-as: rewrite alias-based callees `EField(EVar(alias),
 # op)` to `EField(EVar(eff_name), op)` so the subsequent
@@ -36223,96 +35683,25 @@ fn only_non_absorbed_labels(st: InferState, row: [Label], decls: [Decl]) : [Labe
 # the runtime's default handler is NOT installed, so the label
 # must NOT be absorbed.
 fn effect_has_default_handler(st: InferState, name: String, decls: [Decl]) : Bool {
-  if is_absorbable_stdlib_eff(name) {
-    if user_shadows_default_eff(st, name) { false }
-    else { true }
-  } else {
-    # Issue #557 — Stage B holds back absorbing user-declared effects
-    # at `main`, even when their declaration carries a `default { }`
-    # block. The reason is purely codegen: `emit_main_wrapper`'s
-    # `default_setups_for` / `default_shims_for` only walk the 17
-    # canonical builtin names. A user effect with `default { }` would
-    # type-check absorbed but never receive a setup block, so the
-    # binary would still segfault on first dispatch. Stage C extends
-    # those walkers to consult arbitrary effect declarations; until
-    # then the row-level rejection stays load-bearing for user-
-    # declared effects.
-    #
-    # The unused param keeps the API ready for Stage C (the walkers
-    # will gate absorption on whether the effect has a default block
-    # whose clauses are all extern-handler-bridgeable).
-    let _ = decls
-    false
-  }
-}
-
-fn is_absorbable_stdlib_eff(name: String) : Bool {
-  if      name == "Stdout"       { true }
-  else if name == "Stderr"       { true }
-  else if name == "Fail"         { true }
-  else if name == "Stdin"        { true }
-  else if name == "Env"          { true }
-  else if name == "File"         { true }
-  else if name == "Clock"        { true }
-  else if name == "Random"       { true }
-  else if name == "SecureRandom" { true }
-  else if name == "NetTcp"       { true }
-  else if name == "Signal"       { true }
-  else if name == "Process"      { true }
-  else if name == "Log"          { true }
-  else if name == "Mutable"      { true }
-  else if name == "Cancel"       { true }
-  else if name == "Link"         { true }
-  else if name == "Monitor"      { true }
-  else if name == "Spawn"        { true }
-  # Parametric stdlib effects — runtime handlers come from user code
-  # or the `var x = init` desugar's `with State[T](init)` wrapper,
-  # not from `emit_main_wrapper`. Absorbing at main is consistent
-  # with the row-arithmetic gap that lets these labels phantom-leak
-  # past their wrapping handlers (`labels_args_unify` is shallow and
-  # cannot rebind a `?fresh` to `Int` when filtering); rejecting
-  # them would break the `var x = init` sugar surface for any
-  # program where `main` is the closest enclosing scope.
-  else if name == "State"        { true }
-  else if name == "Reader"       { true }
-  else if name == "Writer"       { true }
+  # Issue #558: absorption is gated on the source-level `default { }`
+  # block carrying all-`$extern_handler` clauses. Parametric stdlib
+  # effects (State[T], Reader[T], Writer[W]) keep their pre-#558
+  # absorption since they have no runtime default — `var x = init`
+  # depends on it (the row-arithmetic gap discussed in the historic
+  # comment on `is_absorbable_stdlib_eff`).
+  let _ = st
+  if effect_default_block_all_extern(name, decls) { true }
+  else if is_parametric_handlerless_stdlib_eff(name) { true }
   else { false }
 }
 
-# True iff an effect `<name>` is declared in the env (so it carries
-# at least one `<name>.<op>` entry) but its op shape diverges from
-# the canonical builtin op list — i.e., the user redeclared
-# `effect <name>` with a different op set. When the user's decl
-# matches every canonical op the default handler is wired up
-# correctly and we treat the effect as absorbed. When ANY canonical
-# op is missing (because the user redeclared `Log` with only
-# `trace`, say) the runtime would not install the default handler:
-# emit-time `effect_default_compatible` filters the label out of
-# `main_row` so no shim is generated. The typer must keep parity.
-fn user_shadows_default_eff(st: InferState, name: String) : Bool {
-  match canonical_eff_ops(name) {
-    None     -> false
-    Some(ops) ->
-      is_effect_in_env(st.env, name) and
-      not env_has_all_eff_ops(st.env, name, ops)
-  }
-}
-
-fn canonical_eff_ops(name: String) : Option[[String]] {
-  expected_default_op_names(name)
-}
-
-fn env_has_all_eff_ops(env: TyEnv, name: String, ops: [String]) : Bool {
-  match ops {
-    [] -> true
-    [op, ...rest] -> {
-      let key = string_concat(name, string_concat(".", op))
-      match ty_env_lookup(env, key) {
-        Some(_) -> env_has_all_eff_ops(env, name, rest)
-        None    -> false
-      }
-    }
-  }
+# Parametric stdlib effects whose handlers are always user-installed
+# (`var x = init` desugar wraps `with State[T](init) { ... }`). They
+# carry no runtime default but main absorption stays true so the sugar
+# surface keeps compiling — see the long comment on the legacy
+# `is_absorbable_stdlib_eff` for the row-arithmetic rationale.
+fn is_parametric_handlerless_stdlib_eff(name: String) : Bool {
+  name == "State" or name == "Reader" or name == "Writer"
 }
 
 # Issue #517 — walk `main`'s body row reporting any label whose
@@ -47782,8 +47171,8 @@ fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], _bmode: Build
   # Mutable) that appears in main's row. When main has no
   # builtins the functions are no-ops.
   # Issue #308: same shadowing filter as the C backend — see
-  # row_minus_user_effects.
-  let main_row = row_minus_user_effects(main_row_labels(decls), decls)
+  # row_effects_without_default_handler.
+  let main_row = row_effects_without_default_handler(main_row_labels(decls), decls)
   let install = llvm_emit_main_install_defaults(main_row)
   let teardown = llvm_emit_main_teardown_defaults(main_row)
   concat_all([llvm_header(), eff_structs, "\n",
@@ -56264,6 +55653,38 @@ fn builtin_effect_names() : [String] =
 fn builtin_console_decl() : Decl =
   DType(false, "Console", [], TBEffectAlias(["Stdout", "Stderr", "Stdin"]), 0, 0)
 
+# Issue #558 — generic builder: assemble a default { } block for a
+# builtin effect from its declared ops list. Each clause body is
+# `$extern_handler("kai_default_<eff_lc>_<op>")`, the bridge shape
+# Stage A's codegen lowers into a runtime shim. The kaikai-side resume
+# parameter is appended (codegen drops it via `op_args_only` and
+# synthesises the `KaiCont *k` in its place).
+#
+# Naming convention is the same Stage A pinned for Stdout: the C
+# symbol is `kai_default_<lowercased_effect>_<op>`. The runtime
+# already exposes those entries in stage0/runtime.h, so the migration
+# is purely an AST-side rewrite.
+fn builtin_default_block_for(eff_name: String, ops: [EffectOp]) : DefaultBlock = {
+  let eff_lc = string_to_lower_ascii(eff_name)
+  DBlk(builtin_default_clauses_for(eff_lc, ops), None, 0, 0)
+}
+
+fn builtin_default_clauses_for(eff_lc: String, ops: [EffectOp]) : [HClause] {
+  match ops {
+    [] -> []
+    [o, ...rest] -> match o {
+      EOp(op_name, _, params, _, _, _) -> {
+        let resume_param = Param { pname: "resume", ptype: None, pline: 0, pcol: 0 }
+        let csym = concat_all(["\"kai_default_", eff_lc, "_", op_name, "\""])
+        let c_sym_lit = mk_expr(EStr(csym, false), 0, 0)
+        let body = mk_expr(EIntrinsic("extern_handler", [c_sym_lit]), 0, 0)
+        [HC(op_name, list_append(params, [resume_param]), body, 0, 0),
+         ...builtin_default_clauses_for(eff_lc, rest)]
+      }
+    }
+  }
+}
+
 # m12.8 Phase 4b (atomic split): Stdout owns just `print`. The
 # Stdout/Stderr split lets a user fn declare exactly the IO surface
 # it touches. `Console` remains as the combined effect for
@@ -56277,32 +55698,27 @@ fn builtin_console_decl() : Decl =
 # `default_stdout_shims()` / `default_stdout_setup()` stays as a
 # fallback for now; codegen prefers the AST-derived version when the
 # default block is present, so the emit is byte-identical.
-fn builtin_stdout_default_block() : DefaultBlock = {
-  let print_param = param_string_zero("s")
-  # The clause carries a trailing `resume` parameter for surface
-  # symmetry with kaikai-bodied clauses; the codegen drops it via
-  # `op_args_only` and synthesises the `KaiCont *k` in its place.
-  let resume_param = Param { pname: "resume", ptype: None, pline: 0, pcol: 0 }
-  let c_sym_lit = mk_expr(EStr("\"kai_default_stdout_print\"", false), 0, 0)
-  let body = mk_expr(EIntrinsic("extern_handler", [c_sym_lit]), 0, 0)
-  DBlk([HC("print", [print_param, resume_param], body, 0, 0)], None, 0, 0)
-}
+fn builtin_stdout_ops() : [EffectOp] =
+  [EOp("print", [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)]
 
 fn builtin_stdout_decl() : Decl =
-  DEffect(false, "Stdout", [],
-    [EOp("print",  [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)],
-    Some(builtin_stdout_default_block()), 0, 0)
+  DEffect(false, "Stdout", [], builtin_stdout_ops(),
+    Some(builtin_default_block_for("Stdout", builtin_stdout_ops())), 0, 0)
 
 # m12.8 Phase 4b: Stderr owns just `eprint`.
+fn builtin_stderr_ops() : [EffectOp] =
+  [EOp("eprint", [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)]
+
 fn builtin_stderr_decl() : Decl =
-  DEffect(false, "Stderr", [],
-    [EOp("eprint", [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)], None, 0, 0)
+  DEffect(false, "Stderr", [], builtin_stderr_ops(),
+    Some(builtin_default_block_for("Stderr", builtin_stderr_ops())), 0, 0)
+
+fn builtin_fail_ops() : [EffectOp] =
+  [EOp("fail", [], [param_string_zero("msg")], ty_name_zero("Nothing"), 0, 0)]
 
 fn builtin_fail_decl() : Decl =
-  DEffect(false, "Fail", [],
-    [
-      EOp("fail", [], [param_string_zero("msg")], ty_name_zero("Nothing"), 0, 0)
-    ], None, 0, 0)
+  DEffect(false, "Fail", [], builtin_fail_ops(),
+    Some(builtin_default_block_for("Fail", builtin_fail_ops())), 0, 0)
 
 # m12.7.x FFI v1: `Ffi` is the capability tag carried by every
 # `[<extern_c>]` axiom signature. It declares zero ops — the only
@@ -56312,50 +55728,55 @@ fn builtin_fail_decl() : Decl =
 fn builtin_ffi_decl() : Decl =
   DEffect(false, "Ffi", [], [], None, 0, 0)
 
+fn builtin_stdin_ops() : [EffectOp] =
+  [EOp("read_line", [], [], ty_option_string_zero(), 0, 0),
+   # Issue #453: byte-oriented read for protocols that frame
+   # bodies preceded by a length header (LSP JSON-RPC). Returns
+   # a String of at most `n` bytes; on EOF the result is shorter
+   # — possibly empty.
+   EOp("read_bytes", [],
+       [Param { pname: "n", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_name_zero("String"), 0, 0)]
+
 fn builtin_stdin_decl() : Decl =
-  DEffect(false, "Stdin", [],
-    [EOp("read_line", [], [], ty_option_string_zero(), 0, 0),
-     # Issue #453: byte-oriented read for protocols that frame
-     # bodies preceded by a length header (LSP JSON-RPC). Returns
-     # a String of at most `n` bytes; on EOF the result is shorter
-     # — possibly empty.
-     EOp("read_bytes", [],
-         [Param { pname: "n", ptype: Some(ty_name_zero("Int")),
-                  pline: 0, pcol: 0 }],
-         ty_name_zero("String"), 0, 0)], None, 0, 0)
+  DEffect(false, "Stdin", [], builtin_stdin_ops(),
+    Some(builtin_default_block_for("Stdin", builtin_stdin_ops())), 0, 0)
+
+fn builtin_env_ops() : [EffectOp] =
+  [EOp("args",       [], [], ty_list_string_zero(), 0, 0),
+   EOp("var",        [], [param_string_zero("name")], ty_option_string_zero(), 0, 0),
+   # Issue #127: write side + full block enumeration. Writes
+   # stay on `Env` (rejected the alternative of routing through
+   # `Mutable` — see the issue body's "stay on Env" decision).
+   EOp("set_var",    [], [param_string_zero("name"), param_string_zero("value")],
+                     ty_result_string_unit_zero(), 0, 0),
+   EOp("unset_var",  [], [param_string_zero("name")],
+                     ty_result_string_unit_zero(), 0, 0),
+   # `vars()` lists every entry of the process environment block.
+   # Pair fields use `fst`/`snd` to match `core.tuple` (kaikai
+   # has no first-class tuples; `[(String, String)]` in the issue
+   # text materialises as `[Pair[String, String]]`).
+   EOp("vars",       [], [],
+                     ty_list_zero(ty_named_zero("Pair",
+                       [ty_name_zero("String"), ty_name_zero("String")])),
+                     0, 0)]
 
 fn builtin_env_decl() : Decl =
-  DEffect(false, "Env", [],
-    [
-      EOp("args",       [], [], ty_list_string_zero(), 0, 0),
-      EOp("var",        [], [param_string_zero("name")], ty_option_string_zero(), 0, 0),
-      # Issue #127: write side + full block enumeration. Writes
-      # stay on `Env` (rejected the alternative of routing through
-      # `Mutable` — see the issue body's "stay on Env" decision).
-      EOp("set_var",    [], [param_string_zero("name"), param_string_zero("value")],
-                        ty_result_string_unit_zero(), 0, 0),
-      EOp("unset_var",  [], [param_string_zero("name")],
-                        ty_result_string_unit_zero(), 0, 0),
-      # `vars()` lists every entry of the process environment block.
-      # Pair fields use `fst`/`snd` to match `core.tuple` (kaikai
-      # has no first-class tuples; `[(String, String)]` in the issue
-      # text materialises as `[Pair[String, String]]`).
-      EOp("vars",       [], [],
-                        ty_list_zero(ty_named_zero("Pair",
-                          [ty_name_zero("String"), ty_name_zero("String")])),
-                        0, 0)
-    ], None, 0, 0)
+  DEffect(false, "Env", [], builtin_env_ops(),
+    Some(builtin_default_block_for("Env", builtin_env_ops())), 0, 0)
+
+fn builtin_file_ops() : [EffectOp] =
+  [EOp("read_file", [],
+       [param_string_zero("path")],
+       ty_result_string_string_zero(), 0, 0),
+   EOp("write_file", [],
+       [param_string_zero("path"), param_string_zero("contents")],
+       ty_result_unit_string_zero(), 0, 0)]
 
 fn builtin_file_decl() : Decl =
-  DEffect(false, "File", [],
-    [
-      EOp("read_file", [],
-          [param_string_zero("path")],
-          ty_result_string_string_zero(), 0, 0),
-      EOp("write_file", [],
-          [param_string_zero("path"), param_string_zero("contents")],
-          ty_result_unit_string_zero(), 0, 0)
-    ], None, 0, 0)
+  DEffect(false, "File", [], builtin_file_ops(),
+    Some(builtin_default_block_for("File", builtin_file_ops())), 0, 0)
 
 # Random effect — Doc B §`Random`. v1 ships only `int_range`; the
 # pinned catalog also lists `float()` and `bytes(n)` but those are
@@ -56363,16 +55784,17 @@ fn builtin_file_decl() : Decl =
 # int_range; cripto goes through SecureRandom anyway). Default
 # handler seeds PCG64 from time(NULL) ^ getpid() — see
 # `kai_default_random_int_range` in stage0/runtime.h.
+fn builtin_random_ops() : [EffectOp] =
+  [EOp("int_range", [],
+       [Param { pname: "lo", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 },
+        Param { pname: "hi", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_name_zero("Int"), 0, 0)]
+
 fn builtin_random_decl() : Decl =
-  DEffect(false, "Random", [],
-    [
-      EOp("int_range", [],
-          [Param { pname: "lo", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 },
-           Param { pname: "hi", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 }],
-          ty_name_zero("Int"), 0, 0)
-    ], None, 0, 0)
+  DEffect(false, "Random", [], builtin_random_ops(),
+    Some(builtin_default_block_for("Random", builtin_random_ops())), 0, 0)
 
 # net-tcp-v1: NetTcp effect — six byte-level TCP ops. Spec:
 # docs/effects-stdlib.md §`NetTcp`. Default handler in stage0/runtime.h
@@ -56393,41 +55815,42 @@ fn builtin_random_decl() : Decl =
 #      — `Ok` carries the second tparam). The decl flips the order
 #      so `match NetTcp.connect(...) { Ok(c) -> ... Err(msg) -> ... }`
 #      typechecks with `c: Conn` and `msg: String`.
+fn builtin_nettcp_ops() : [EffectOp] =
+  [EOp("connect", [],
+       [param_string_zero("host"),
+        Param { pname: "port", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Conn")]),
+       0, 0),
+   EOp("listen", [],
+       [param_string_zero("host"),
+        Param { pname: "port", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Listener")]),
+       0, 0),
+   EOp("accept", [],
+       [param_typed_zero("l", ty_name_zero("Listener"))],
+       ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Conn")]),
+       0, 0),
+   EOp("send", [],
+       [param_typed_zero("c", ty_name_zero("Conn")),
+        param_typed_zero("data", ty_list_zero(ty_name_zero("Int")))],
+       ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Int")]),
+       0, 0),
+   EOp("recv", [],
+       [param_typed_zero("c", ty_name_zero("Conn")),
+        Param { pname: "max", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_named_zero("Result", [ty_name_zero("String"),
+                                 ty_list_zero(ty_name_zero("Int"))]),
+       0, 0),
+   EOp("close", [],
+       [param_typed_zero("c", ty_name_zero("Conn"))],
+       ty_name_zero("Unit"), 0, 0)]
+
 fn builtin_nettcp_decl() : Decl =
-  DEffect(false, "NetTcp", [],
-    [
-      EOp("connect", [],
-          [param_string_zero("host"),
-           Param { pname: "port", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 }],
-          ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Conn")]),
-          0, 0),
-      EOp("listen", [],
-          [param_string_zero("host"),
-           Param { pname: "port", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 }],
-          ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Listener")]),
-          0, 0),
-      EOp("accept", [],
-          [param_typed_zero("l", ty_name_zero("Listener"))],
-          ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Conn")]),
-          0, 0),
-      EOp("send", [],
-          [param_typed_zero("c", ty_name_zero("Conn")),
-           param_typed_zero("data", ty_list_zero(ty_name_zero("Int")))],
-          ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Int")]),
-          0, 0),
-      EOp("recv", [],
-          [param_typed_zero("c", ty_name_zero("Conn")),
-           Param { pname: "max", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 }],
-          ty_named_zero("Result", [ty_name_zero("String"),
-                                    ty_list_zero(ty_name_zero("Int"))]),
-          0, 0),
-      EOp("close", [],
-          [param_typed_zero("c", ty_name_zero("Conn"))],
-          ty_name_zero("Unit"), 0, 0)
-    ], None, 0, 0)
+  DEffect(false, "NetTcp", [], builtin_nettcp_ops(),
+    Some(builtin_default_block_for("NetTcp", builtin_nettcp_ops())), 0, 0)
 
 # net-tcp-v1: opaque connection handle. Single-field record carrying
 # the OS file descriptor; the runtime's `_kai_net_record_fd` reads
@@ -56454,15 +55877,16 @@ fn builtin_listener_decl() : Decl =
 # `on_cancel(sig)` shape sketched in the issue is deferred until
 # Cancel can run user-installed handlers on runtime-triggered
 # cancellation.
+fn builtin_signal_ops() : [EffectOp] =
+  [EOp("on",    [], [param_typed_zero("sig", ty_name_zero("Sig"))],
+       ty_name_zero("Unit"), 0, 0),
+   EOp("off",   [], [param_typed_zero("sig", ty_name_zero("Sig"))],
+       ty_name_zero("Unit"), 0, 0),
+   EOp("await", [], [], ty_name_zero("Sig"), 0, 0)]
+
 fn builtin_signal_decl() : Decl =
-  DEffect(false, "Signal", [],
-    [
-      EOp("on",    [], [param_typed_zero("sig", ty_name_zero("Sig"))],
-          ty_name_zero("Unit"), 0, 0),
-      EOp("off",   [], [param_typed_zero("sig", ty_name_zero("Sig"))],
-          ty_name_zero("Unit"), 0, 0),
-      EOp("await", [], [], ty_name_zero("Sig"), 0, 0)
-    ], None, 0, 0)
+  DEffect(false, "Signal", [], builtin_signal_ops(),
+    Some(builtin_default_block_for("Signal", builtin_signal_ops())), 0, 0)
 
 # Issue #107: Sig sum type — closed catalog of POSIX signals the
 # Signal effect can subscribe to. Variant *names* are the runtime
@@ -56500,30 +55924,31 @@ fn builtin_sig_decl() : Decl =
 # *Result type-arg order*: `Result[e, a]` with `Ok` carrying the
 # second tparam, so the decl writes `Result[String, Exit]` (Err
 # first) and user code matches `Ok(exit)` / `Err(msg)`.
+fn builtin_process_ops() : [EffectOp] =
+  [EOp("start", [],
+       [param_string_zero("cmd"),
+        param_typed_zero("args", ty_list_string_zero())],
+       ty_name_zero("Child"),
+       0, 0),
+   EOp("wait", [],
+       [param_typed_zero("c", ty_name_zero("Child"))],
+       ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Exit")]),
+       0, 0),
+   EOp("kill", [],
+       [param_typed_zero("c", ty_name_zero("Child")),
+        Param { pname: "sig", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Unit")]),
+       0, 0),
+   EOp("exit", [],
+       [Param { pname: "code", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_name_zero("Nothing"),
+       0, 0)]
+
 fn builtin_process_decl() : Decl =
-  DEffect(false, "Process", [],
-    [
-      EOp("start", [],
-          [param_string_zero("cmd"),
-           param_typed_zero("args", ty_list_string_zero())],
-          ty_name_zero("Child"),
-          0, 0),
-      EOp("wait", [],
-          [param_typed_zero("c", ty_name_zero("Child"))],
-          ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Exit")]),
-          0, 0),
-      EOp("kill", [],
-          [param_typed_zero("c", ty_name_zero("Child")),
-           Param { pname: "sig", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 }],
-          ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Unit")]),
-          0, 0),
-      EOp("exit", [],
-          [Param { pname: "code", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 }],
-          ty_name_zero("Nothing"),
-          0, 0)
-    ], None, 0, 0)
+  DEffect(false, "Process", [], builtin_process_ops(),
+    Some(builtin_default_block_for("Process", builtin_process_ops())), 0, 0)
 
 # Issue #126: opaque Child handle. v1 carries only the OS pid; the
 # field name "pid" is load-bearing — the runtime's
@@ -56550,14 +55975,15 @@ fn builtin_exit_decl() : Decl =
 # `[ISO8601Z] LEVEL message\n` form via `kai_default_log_*` in
 # stage0/runtime.h. Level filtering, structured fields, redaction
 # and rotation are out of scope (ahu.log territory).
+fn builtin_log_ops() : [EffectOp] =
+  [EOp("debug", [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0),
+   EOp("info",  [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0),
+   EOp("warn",  [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0),
+   EOp("error", [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0)]
+
 fn builtin_log_decl() : Decl =
-  DEffect(false, "Log", [],
-    [
-      EOp("debug", [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0),
-      EOp("info",  [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0),
-      EOp("warn",  [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0),
-      EOp("error", [], [param_string_zero("msg")], ty_name_zero("Unit"), 0, 0)
-    ], None, 0, 0)
+  DEffect(false, "Log", [], builtin_log_ops(),
+    Some(builtin_default_block_for("Log", builtin_log_ops())), 0, 0)
 
 # Issue #140: SecureRandom effect — cryptographically-secure RNG,
 # deliberately separate from `Random` so a test handler stubbing
@@ -56578,20 +56004,21 @@ fn builtin_log_decl() : Decl =
 #
 # Default handler: getrandom(2) on Linux, arc4random_buf(3) on
 # macOS/BSD. POSIX-only in v1; Windows BCryptGenRandom is post-MVP.
+fn builtin_securerandom_ops() : [EffectOp] =
+  [EOp("int_range", [],
+       [Param { pname: "min", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 },
+        Param { pname: "max", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_name_zero("Int"), 0, 0),
+   EOp("bytes", [],
+       [Param { pname: "n", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_list_zero(ty_name_zero("Int")), 0, 0)]
+
 fn builtin_securerandom_decl() : Decl =
-  DEffect(false, "SecureRandom", [],
-    [
-      EOp("int_range", [],
-          [Param { pname: "min", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 },
-           Param { pname: "max", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 }],
-          ty_name_zero("Int"), 0, 0),
-      EOp("bytes", [],
-          [Param { pname: "n", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 }],
-          ty_list_zero(ty_name_zero("Int")), 0, 0)
-    ], None, 0, 0)
+  DEffect(false, "SecureRandom", [], builtin_securerandom_ops(),
+    Some(builtin_default_block_for("SecureRandom", builtin_securerandom_ops())), 0, 0)
 
 # m7b #11: stdlib parameterised effects per Doc B §`State[T]` and
 # §`Reader[T] and Writer[W]`. Each one gets its own evidence struct,
@@ -56641,53 +56068,63 @@ fn builtin_writer_decl() : Decl =
 # existing array_* fields stay at struct slots 3..7 and `ref_*` get
 # slots 8..10. Surface order in Doc B (refs first, arrays second)
 # is a documentation concern; the runtime offsets don't follow it.
+fn builtin_mutable_ops() : [EffectOp] =
+  [EOp("array_make", ["T"],
+       [Param { pname: "n", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 },
+        param_typed_zero("init", ty_name_zero("T"))],
+       ty_named_zero("Array", [ty_name_zero("T")]),
+       0, 0),
+   EOp("array_length", ["T"],
+       [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")]))],
+       ty_name_zero("Int"),
+       0, 0),
+   EOp("array_get", ["T"],
+       [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")])),
+        Param { pname: "i", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_name_zero("T"),
+       0, 0),
+   EOp("array_set", ["T"],
+       [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")])),
+        Param { pname: "i", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 },
+        param_typed_zero("v", ty_name_zero("T"))],
+       ty_named_zero("Array", [ty_name_zero("T")]),
+       0, 0),
+   EOp("array_grow", ["T"],
+       [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")])),
+        Param { pname: "n", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 },
+        param_typed_zero("init", ty_name_zero("T"))],
+       ty_named_zero("Array", [ty_name_zero("T")]),
+       0, 0),
+   EOp("ref_make", ["T"],
+       [param_typed_zero("init", ty_name_zero("T"))],
+       ty_named_zero("Ref", [ty_name_zero("T")]),
+       0, 0),
+   EOp("ref_get", ["T"],
+       [param_typed_zero("r", ty_named_zero("Ref", [ty_name_zero("T")]))],
+       ty_name_zero("T"),
+       0, 0),
+   EOp("ref_set", ["T"],
+       [param_typed_zero("r", ty_named_zero("Ref", [ty_name_zero("T")])),
+        param_typed_zero("v", ty_name_zero("T"))],
+       ty_name_zero("Unit"),
+       0, 0)]
+
+# Issue #558: Mutable migrates to a source-level `default { }` block.
+# The bare-builtin bypass (`array_set` / `ref_set` calls outside any
+# `handle ... with Mutable` site short-circuit through
+# `kai_prelude_array_set` etc. without consulting the evidence stack)
+# is preserved — codegen still chooses the direct C path for those
+# call sites. The `default { }` block only governs the dispatched
+# path (`Mutable.array_set(...)` inside a handle frame, or main-level
+# absorption when an explicit `/ Mutable` row reaches main). See
+# `docs/decisions/handler-return-clause-optional-2026-05-12.md`.
 fn builtin_mutable_decl() : Decl =
-  DEffect(false, "Mutable", [],
-    [
-      EOp("array_make", ["T"],
-          [Param { pname: "n", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 },
-           param_typed_zero("init", ty_name_zero("T"))],
-          ty_named_zero("Array", [ty_name_zero("T")]),
-          0, 0),
-      EOp("array_length", ["T"],
-          [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")]))],
-          ty_name_zero("Int"),
-          0, 0),
-      EOp("array_get", ["T"],
-          [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")])),
-           Param { pname: "i", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 }],
-          ty_name_zero("T"),
-          0, 0),
-      EOp("array_set", ["T"],
-          [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")])),
-           Param { pname: "i", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 },
-           param_typed_zero("v", ty_name_zero("T"))],
-          ty_named_zero("Array", [ty_name_zero("T")]),
-          0, 0),
-      EOp("array_grow", ["T"],
-          [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")])),
-           Param { pname: "n", ptype: Some(ty_name_zero("Int")),
-                   pline: 0, pcol: 0 },
-           param_typed_zero("init", ty_name_zero("T"))],
-          ty_named_zero("Array", [ty_name_zero("T")]),
-          0, 0),
-      EOp("ref_make", ["T"],
-          [param_typed_zero("init", ty_name_zero("T"))],
-          ty_named_zero("Ref", [ty_name_zero("T")]),
-          0, 0),
-      EOp("ref_get", ["T"],
-          [param_typed_zero("r", ty_named_zero("Ref", [ty_name_zero("T")]))],
-          ty_name_zero("T"),
-          0, 0),
-      EOp("ref_set", ["T"],
-          [param_typed_zero("r", ty_named_zero("Ref", [ty_name_zero("T")])),
-           param_typed_zero("v", ty_name_zero("T"))],
-          ty_name_zero("Unit"),
-          0, 0)
-    ], None, 0, 0)
+  DEffect(false, "Mutable", [], builtin_mutable_ops(),
+    Some(builtin_default_block_for("Mutable", builtin_mutable_ops())), 0, 0)
 
 # m8 #7: Actor[Msg] — parameterised effect on the message type. Same
 # m7b #11 machinery as State[T] / Reader[T] / Writer[W]: the effect-
@@ -56724,12 +56161,13 @@ fn builtin_actor_decl() : Decl =
 # v1 uses Pid[Nothing] which TyAny-erases the message type, giving
 # the same "any pid" surface without needing existential types in
 # the typer.
+fn builtin_link_ops() : [EffectOp] =
+  [EOp("link", [], [param_typed_zero("peer", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
+       ty_name_zero("Unit"), 0, 0)]
+
 fn builtin_link_decl() : Decl =
-  DEffect(false, "Link", [],
-    [
-      EOp("link", [], [param_typed_zero("peer", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
-          ty_name_zero("Unit"), 0, 0)
-    ], None, 0, 0)
+  DEffect(false, "Link", [], builtin_link_ops(),
+    Some(builtin_default_block_for("Link", builtin_link_ops())), 0, 0)
 
 # m8 #9: Monitor — unidirectional supervision. `monitor(target_pid)`
 # registers the current fiber as an observer of `target_pid`'s
@@ -56747,16 +56185,17 @@ fn builtin_link_decl() : Decl =
 # (which pushes "Normal"/"Crashed" strings into the same mailbox).
 # A richer payload waits on user-defined sum types crossing the
 # runtime/library boundary.
+fn builtin_monitor_ops() : [EffectOp] =
+  [EOp("monitor", [],
+       [param_typed_zero("target", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
+       ty_named_zero("Pid", [ty_name_zero("Nothing")]), 0, 0),
+   EOp("demonitor", [],
+       [param_typed_zero("ref", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
+       ty_name_zero("Unit"), 0, 0)]
+
 fn builtin_monitor_decl() : Decl =
-  DEffect(false, "Monitor", [],
-    [
-      EOp("monitor", [],
-          [param_typed_zero("target", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
-          ty_named_zero("Pid", [ty_name_zero("Nothing")]), 0, 0),
-      EOp("demonitor", [],
-          [param_typed_zero("ref", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
-          ty_name_zero("Unit"), 0, 0)
-    ], None, 0, 0)
+  DEffect(false, "Monitor", [], builtin_monitor_ops(),
+    Some(builtin_default_block_for("Monitor", builtin_monitor_ops())), 0, 0)
 
 # m8 #4: Cancel — single op `raise() : Nothing`. Doc B §`Cancel`.
 # The default handler exits the program with a banner; user code
@@ -56766,11 +56205,12 @@ fn builtin_monitor_decl() : Decl =
 # boundary) lands together with the m8.x ucontext or full-CPS
 # scheduler. Six-field EOp shape (op_tparams = [], no per-op
 # generics).
+fn builtin_cancel_ops() : [EffectOp] =
+  [EOp("raise", [], [], ty_name_zero("Nothing"), 0, 0)]
+
 fn builtin_cancel_decl() : Decl =
-  DEffect(false, "Cancel", [],
-    [
-      EOp("raise", [], [], ty_name_zero("Nothing"), 0, 0)
-    ], None, 0, 0)
+  DEffect(false, "Cancel", [], builtin_cancel_ops(),
+    Some(builtin_default_block_for("Cancel", builtin_cancel_ops())), 0, 0)
 
 # m8 #2/#3: Spawn — non-parametric effect. Per Doc B §`Spawn`, the
 # user-facing API is polymorphic (`spawn[T, e]`, `await[T]`, etc.).
@@ -56787,36 +56227,37 @@ fn builtin_cancel_decl() : Decl =
 #
 # `yield()` and `set_trap_exit(on)` stay monomorphic — neither has
 # a polymorphic shape to expose.
+fn builtin_spawn_ops() : [EffectOp] =
+  [EOp("yield",  [], [], ty_name_zero("Unit"), 0, 0),
+   EOp("spawn",  ["T"],
+       [param_typed_zero("thunk",
+                         mk_ty(TyFn([], ty_name_zero("T"),
+                                     ROpen("e", [])), 0, 0))],
+       ty_named_zero("Fiber", [ty_name_zero("T")]), 0, 0),
+   EOp("await",  ["T"],
+       [param_typed_zero("fiber",
+                         ty_named_zero("Fiber", [ty_name_zero("T")]))],
+       ty_name_zero("T"), 0, 0),
+   EOp("select", ["T"],
+       [param_typed_zero("fibers",
+                         ty_list_zero(ty_named_zero("Fiber", [ty_name_zero("T")])))],
+       ty_name_zero("T"), 0, 0),
+   EOp("cancel", ["T"],
+       [param_typed_zero("fiber",
+                         ty_named_zero("Fiber", [ty_name_zero("T")]))],
+       ty_name_zero("Unit"), 0, 0),
+   # Tier 2 trap-exit: toggle the current fiber's trap_exit flag.
+   # When `on=true`, a linked peer's termination delivers a
+   # "Normal"/"Crashed" string into the current fiber's mailbox
+   # instead of cancelling the fiber. Spec: docs/actors.md
+   # §*Trap-exit semantics*. Default handler:
+   # `kai_default_spawn_set_trap_exit` in stage0/runtime.h.
+   EOp("set_trap_exit", [], [param_typed_zero("on", ty_name_zero("Bool"))],
+                 ty_name_zero("Unit"), 0, 0)]
+
 fn builtin_spawn_decl() : Decl =
-  DEffect(false, "Spawn", [],
-    [
-      EOp("yield",  [], [], ty_name_zero("Unit"), 0, 0),
-      EOp("spawn",  ["T"],
-          [param_typed_zero("thunk",
-                            mk_ty(TyFn([], ty_name_zero("T"),
-                                        ROpen("e", [])), 0, 0))],
-          ty_named_zero("Fiber", [ty_name_zero("T")]), 0, 0),
-      EOp("await",  ["T"],
-          [param_typed_zero("fiber",
-                            ty_named_zero("Fiber", [ty_name_zero("T")]))],
-          ty_name_zero("T"), 0, 0),
-      EOp("select", ["T"],
-          [param_typed_zero("fibers",
-                            ty_list_zero(ty_named_zero("Fiber", [ty_name_zero("T")])))],
-          ty_name_zero("T"), 0, 0),
-      EOp("cancel", ["T"],
-          [param_typed_zero("fiber",
-                            ty_named_zero("Fiber", [ty_name_zero("T")]))],
-          ty_name_zero("Unit"), 0, 0),
-      # Tier 2 trap-exit: toggle the current fiber's trap_exit flag.
-      # When `on=true`, a linked peer's termination delivers a
-      # "Normal"/"Crashed" string into the current fiber's mailbox
-      # instead of cancelling the fiber. Spec: docs/actors.md
-      # §*Trap-exit semantics*. Default handler:
-      # `kai_default_spawn_set_trap_exit` in stage0/runtime.h.
-      EOp("set_trap_exit", [], [param_typed_zero("on", ty_name_zero("Bool"))],
-                    ty_name_zero("Unit"), 0, 0)
-    ], None, 0, 0)
+  DEffect(false, "Spawn", [], builtin_spawn_ops(),
+    Some(builtin_default_block_for("Spawn", builtin_spawn_ops())), 0, 0)
 
 # ============================================================
 # Issue #454 — library mode (typed-AST queries).
