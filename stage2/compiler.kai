@@ -5782,7 +5782,8 @@ fn parse_extern_decl(p: Parser, t: Token) : PDecl / Console {
           if not tk_is(fn_tok.kind, TkFn) {
             err_d(p_error(p3, fn_tok, "expected `fn` after `extern \"C\"` (FFI declarations look like `extern \"C\" fn name(...) : T / Ffi`)"))
           } else {
-            parse_axiom_decl(p_advance(p3), is_pub, true, c_sym_over, t)
+            let decl_r = parse_axiom_decl(p_advance(p3), is_pub, true, c_sym_over, t)
+            validate_extern_c_decl(decl_r, t)
           }
         }
       }
@@ -5827,6 +5828,153 @@ fn parse_optional_extern_c_override(p: Parser) : PStr / Console {
           PStr { p: p_advance(p2), r: Some(sym_clean) }
         }
       }
+    }
+  }
+}
+
+# Issue #536: an `extern "C" fn` declaration MUST advertise `Ffi` in
+# its effect row. The capability discipline pinned in CLAUDE.md
+# baseline architecture says FFI crosses to C *via* the `Ffi`
+# capability; an extern without that label silently bypasses the
+# contract and downstream Tier-1 invariants about effect rows lose
+# their teeth. Returns true iff the row syntactically contains a
+# label named `Ffi` (label args are irrelevant — `Ffi` is nullary).
+fn extern_row_has_ffi(row: RowExpr) : Bool {
+  match row {
+    REmpty         -> false
+    RClosed(lbs)   -> row_label_names_has(lbs, "Ffi")
+    ROpen(_, lbs)  -> row_label_names_has(lbs, "Ffi")
+  }
+}
+
+fn row_label_names_has(labels: [RowLabel], target: String) : Bool {
+  match labels {
+    [] -> false
+    [l, ...rest] -> match l {
+      RL(name, _) -> if name == target { true } else { row_label_names_has(rest, target) }
+    }
+  }
+}
+
+# Issue #536 shape 2: a type appearing in the parameter list or
+# return slot of an `extern "C" fn` MUST be C-ABI compatible. The
+# kaikai layout for `[T]` (singly-linked list), `Option[T]` (tagged
+# sum), records, and user-declared sum types is implementation-
+# defined and unsafe to expose across the C boundary. The allowlist
+# is intentionally small — Int, Real, Bool, String, Unit (return
+# only). Future extensions (Int32, opaque pointer types) get added
+# here explicitly, not via heuristics.
+#
+# `is_return_slot` widens the allowlist to include `Unit` (a `void`
+# return is fine in C; a `void` parameter is not the same shape as
+# kaikai's nullary `Unit` and is excluded).
+fn is_c_abi_safe_type(t: TypeExpr, is_return_slot: Bool) : Bool {
+  match t.tkind {
+    TyName(name, targs) ->
+      if list_length(targs) > 0 { false }
+      else if name == "Int" { true }
+      else if name == "Real" { true }
+      else if name == "Bool" { true }
+      else if name == "String" { true }
+      else if name == "Unit" { is_return_slot }
+      else { false }
+    _ -> false
+  }
+}
+
+# Issue #536: walk an `extern "C" fn` parameter list and return the
+# first param whose type is NOT C-ABI safe, or `None` if every
+# parameter is safe. Untyped parameters (`ptype: None`) cannot occur
+# in an extern signature — `parse_fn_params` rejects missing
+# annotations on axiom-shape decls — but we guard for it anyway.
+fn first_non_c_abi_param(params: [Param]) : Option[Param] {
+  match params {
+    [] -> None
+    [p, ...rest] -> match p.ptype {
+      None -> Some(p)
+      Some(ty) ->
+        if is_c_abi_safe_type(ty, false) { first_non_c_abi_param(rest) }
+        else { Some(p) }
+    }
+  }
+}
+
+# Issue #536: render a TypeExpr surface form for diagnostics. We
+# only need the cases the validator might reject; the fallthrough
+# emits a placeholder that still anchors the diagnostic to the
+# offending site.
+fn type_surface(t: TypeExpr) : String {
+  match t.tkind {
+    TyName(name, targs) ->
+      if list_length(targs) == 0 { name }
+      else { concat_all([name, "[", type_args_surface(targs), "]"]) }
+    TyList(inner) -> concat_all(["[", type_surface(inner), "]"])
+    TyFn(_, _, _) -> "fn(...)"
+    TyDim(base, _) -> concat_all([type_surface(base), "<...>"])
+    TyRefine(base, _) -> concat_all([type_surface(base), " where ..."])
+  }
+}
+
+fn type_args_surface(ts: [TypeExpr]) : String {
+  match ts {
+    [] -> ""
+    [t]  -> type_surface(t)
+    [t, ...rest] -> concat_all([type_surface(t), ", ", type_args_surface(rest)])
+  }
+}
+
+# Issue #536: post-process a successfully parsed `extern "C" fn`
+# declaration. Three independent checks, each surfacing a parse-
+# time diagnostic anchored to the `extern` keyword token:
+#   (a) the effect row must contain `Ffi`;
+#   (b) every parameter type must be C-ABI compatible;
+#   (c) the return type must be C-ABI compatible.
+# A failure in any check converts the PDecl into an error result;
+# on success, the original PDecl flows through unchanged so the
+# rest of the pipeline keeps seeing the uniform DAxiom shape.
+fn validate_extern_c_decl(decl_r: PDecl, t: Token) : PDecl / Console {
+  match decl_r.r {
+    None -> decl_r
+    Some(d) -> match d {
+      DAxiom(_, _, name, _, _, params, ret_ty, row, _, _) -> {
+        if not extern_row_has_ffi(row) {
+          let msg = concat_all([
+            "`extern \"C\" fn ", name,
+            "` must declare `/ Ffi` in its row — FFI declarations always cross the Ffi capability boundary"
+          ])
+          err_d(p_error(decl_r.p, t, msg))
+        } else {
+          match first_non_c_abi_param(params) {
+            Some(p) -> {
+              let ty_s = match p.ptype {
+                Some(ty) -> type_surface(ty)
+                None     -> "<missing>"
+              }
+              let msg = concat_all([
+                "`extern \"C\" fn ", name,
+                "` parameter `", p.pname,
+                "` has type `", ty_s,
+                "` which is not C-ABI compatible — allowed: Int, Real, Bool, String"
+              ])
+              err_d(p_error(decl_r.p, t, msg))
+            }
+            None ->
+              if not is_c_abi_safe_type(ret_ty, true) {
+                let msg = concat_all([
+                  "`extern \"C\" fn ", name,
+                  "` return type `", type_surface(ret_ty),
+                  "` is not C-ABI compatible — allowed: Int, Real, Bool, String, Unit"
+                ])
+                err_d(p_error(decl_r.p, t, msg))
+              } else { decl_r }
+          }
+        }
+      }
+      # parse_axiom_decl always produces a DAxiom on success; any
+      # other shape would be a structural surprise and should fall
+      # through unchanged so the user sees the original parser
+      # error rather than a misleading FFI message.
+      _ -> decl_r
     }
   }
 }
