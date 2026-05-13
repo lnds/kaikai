@@ -302,7 +302,7 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 5. Verification: stage 1 compiled by stage 0 compiles the ported demos.
 
 **Phase 4 — Basic stdlib and MVP tooling**:
-1. Stdlib for stage 1: `List`, `String`, `Option`, `Result`, plus the `Io`-aliased granular effects (`Console`, `Stdin`, `Env`, `File`) under their pre-effects-system shapes.
+1. Stdlib for stage 1: `List`, `String`, `Option`, `Result`, plus the `Io`-aliased granular effects (`Console`, `Stdin`, `Env`, `File`). Today these ship as full effect declarations; the historical "pre-effects-system shape" wording predates the m7a/m7b split that moved them behind the effect system. See `docs/effects-stdlib.md` §`Console` for the v1 monolithic surface and the planned 3-way `Stdout`/`Stderr`/`Stdin` split (#360).
 2. `kai build`, `kai run`, `kai test` working against stage 1.
 3. Demos rewritten under the new design, running.
 

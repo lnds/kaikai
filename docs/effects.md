@@ -384,8 +384,14 @@ For genuinely multi-shot or escaping continuations (backtracking
 search, generators), the programmer writes `resume_multishot(v)`
 — a second builtin that pays the copy cost. `resume_multishot`
 exists so the common case is fast and the uncommon case is
-explicit. v1 of effects ships only one-shot; multi-shot is noted
-for `docs/effects-impl.md`.
+explicit.
+
+> **v1 status (2026-05-13):** v1 of effects ships only
+> one-shot. `resume_multishot` is the target verb but is not
+> yet wired in stage 2. The runtime mechanism for multi-shot
+> (stack-frame copy) is noted in `docs/effects-impl.md` as a
+> separate follow-up; user code that needs multi-shot today
+> has no in-language form.
 
 ### Discarding the continuation
 
@@ -634,13 +640,22 @@ they first need to be acted on.
 
 2. **`return` clause sugar.** If absent, is the return type of
    `handle` the same as `body`?
-   *Tentative:* yes. Is a short form needed for trivial
-   transformers? Probably not — `return(x) -> x` is short.
+   *Decided:* yes — identity is the default. `handle { body }
+   with E { ops }` without a `return` clause has the same type
+   as `body`. See
+   `docs/decisions/handler-return-clause-optional-2026-05-12.md`
+   (closes #539). No short form for trivial transformers —
+   `return(x) -> x` is already short, and the
+   silent-contract concern that prompted the question turned
+   out to be a misread of the spec (line 311-313 already says
+   the clause is optional).
 
 3. **Ordering of `with`-clauses.** Must all ops appear?
-   *Tentative:* yes — exhaustive, analogue of pattern-match
+   *Decided:* yes — exhaustive, analogue of pattern-match
    exhaustiveness. Any omitted op is a compile error ("handler
-   does not cover Eff.op2").
+   does not cover Eff.op2"). Enforced by the handler-validation
+   work that landed under #517; fixtures live in
+   `examples/negative/handle_leak/`.
 
 4. **What does `main` look like?** `fn main() : Unit / Io` with
    the runtime installing the Io handler implicitly, or
@@ -668,8 +683,10 @@ they first need to be acted on.
    re-exported across modules? Is an operation addable after the
    fact (open extension), or does `effect Foo` close its
    signature?
-   *Tentative:* closed signature, matching sum types. Keeps
-   inference predictable.
+   *Decided:* closed signature, matching sum types. Re-export
+   works via the standard module surface (`import` /
+   `pub effect`). Open extension is intentionally out of scope —
+   user-declared default handlers track separately under #533.
 
 ## Next steps
 
