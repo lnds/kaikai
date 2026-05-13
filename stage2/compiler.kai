@@ -11014,67 +11014,25 @@ fn effect_op_names(ops: [EffectOp]) : [String] {
   }
 }
 
-# Issue #308: per-effect expected op shape for the runtime's default
-# handler. The `EvX` struct field layout in stage0/runtime.h is
-# co-designed with these op lists; if a user `effect X { ... }`
-# shadows the canonical decl with a different shape, the
-# `_kai_default_ev_x.<op> = ...` wiring would assign through fields
-# that do not exist (or sit at the wrong offset). Returning false
-# from `effect_default_compatible` makes the C and LLVM backends
-# skip wiring for that effect, just as if it were absent from
-# `main_row`.
-fn effect_default_compatible(decls: [Decl], name: String) : Bool = {
-  let expected = expected_default_op_names(name)
-  match expected {
-    None -> true                          # not a default-handler effect
-    Some(exp_ops) -> match lookup_effect_op_names(decls, name) {
-      None -> true                        # no decl in scope; pass-through
-      Some(found_ops) -> eff_op_names_eq(found_ops, exp_ops)
-    }
-  }
-}
-
-# Op-name shape expected by the runtime's default handler for each
-# effect. Order must match the stage0 `EvX` struct field order. Names
-# that have no default handler (or no shadowing risk) return None and
-# pass through unchanged.
-fn expected_default_op_names(name: String) : Option[[String]] {
-  if      name == "Stdout"       { Some(["print"]) }
-  else if name == "Stderr"       { Some(["eprint"]) }
-  else if name == "Fail"         { Some(["fail"]) }
-  else if name == "Stdin"        { Some(["read_line", "read_bytes"]) }
-  else if name == "Env"          { Some(["args", "var", "set_var", "unset_var", "vars"]) }
-  else if name == "File"         { Some(["read_file", "write_file"]) }
-  else if name == "Clock"        { Some(["wall_now", "monotonic_now", "sleep_ns"]) }
-  else if name == "Random"       { Some(["int_range"]) }
-  else if name == "SecureRandom" { Some(["int_range", "bytes"]) }
-  else if name == "NetTcp"       { Some(["connect", "listen", "accept", "send", "recv", "close"]) }
-  else if name == "Signal"       { Some(["on", "off", "await"]) }
-  else if name == "Process"      { Some(["start", "wait", "kill", "exit"]) }
-  else if name == "Log"          { Some(["debug", "info", "warn", "error"]) }
-  else if name == "Mutable"      { Some(["array_make", "array_length", "array_get", "array_set", "array_grow", "ref_make", "ref_get", "ref_set"]) }
-  else if name == "Cancel"       { Some(["raise"]) }
-  else if name == "Link"         { Some(["link"]) }
-  else if name == "Monitor"      { Some(["monitor", "demonitor"]) }
-  else if name == "Spawn"        { Some(["yield", "spawn", "await", "select", "cancel", "set_trap_exit"]) }
-  else { None }
-}
-
-# Issue #308: filter `main_row` to drop effects whose in-scope decl
-# does not match the runtime's expected op shape for that name. The
-# default-handler wiring (setup/shim/pop emit + LLVM mirror) keys on
-# builtin EvX struct layout; emitting it for a user-shadowed effect
-# whose ops differ produces invalid C (e.g.
-# `_kai_default_ev_log.debug = ...` against a user EvLog that only
-# has `.log`).
-fn row_minus_user_effects(main_row: [String], decls: [Decl]) : [String] {
+# Issue #558: keep only the main-row labels whose in-scope decl
+# carries a `default { }` block whose clauses all bridge to
+# `$extern_handler` C symbols. That is the shape the codegen knows
+# how to install — a user-declared effect lacking such a block (or
+# with kaikai-bodied clauses) does not get default-handler wiring at
+# main, and the typer's `check_default_coverage` reports the gap.
+#
+# This replaces the pre-#558 trio (`effect_default_compatible`,
+# `expected_default_op_names`, `row_effects_without_default_handler`) whose names
+# were keyed on the historic hardcoded EvX layouts.
+fn row_effects_without_default_handler(main_row: [String],
+                                        decls: [Decl]) : [String] {
   match main_row {
     [] -> []
     [x, ...rest] ->
-      if effect_default_compatible(decls, x) {
-        [x, ...row_minus_user_effects(rest, decls)]
+      if effect_default_block_all_extern(x, decls) {
+        [x, ...row_effects_without_default_handler(rest, decls)]
       } else {
-        row_minus_user_effects(rest, decls)
+        row_effects_without_default_handler(rest, decls)
       }
   }
 }
@@ -17524,7 +17482,7 @@ fn emit_main_wrapper(decls: [Decl], bmode: BuildMode) : String {
         # (line/col != 0). The default-handler emit assumes the builtin
         # EvX layout — emitting it for a user `effect Log { ... }` shape
         # produces invalid C against the user's struct.
-        let main_row = row_minus_user_effects(main_row_labels(decls), decls)
+        let main_row = row_effects_without_default_handler(main_row_labels(decls), decls)
         let shims    = default_shims_for(main_row, decls)
         let setup    = default_setups_for(main_row, decls)
         let teardown = default_pops_for(main_row)
@@ -18185,9 +18143,10 @@ fn check_op_call_coverage(file: String, decls: [Decl], fname: String,
     let op_name  = dotted_suffix(bare)
     # Skip the row-level absorbed labels (Ffi etc.) — they have no per-op
     # discharge surface. The walker only fires for declared effects that
-    # come through `effect E { ops }` plus the canonical builtin shapes.
-    if not is_effect_declared(eff_name, decls) and
-       not is_absorbable_stdlib_eff(eff_name) { 0 }
+    # come through `effect E { ops }`. Builtins are injected as DEffect
+    # by `inject_builtin_effects` before this check runs, so they all
+    # show up via `is_effect_declared`.
+    if not is_effect_declared(eff_name, decls) { 0 }
     else {
       match find_top_eff_frame(stack, eff_name) {
         Some(frame) -> match frame {
@@ -18215,30 +18174,17 @@ fn check_op_call_coverage(file: String, decls: [Decl], fname: String,
           # No enclosing handle for `eff_name`. The op either fires from
           # main (step 4) or escapes to the caller's row.
           if fname == "main" {
-            # Step 4 is restricted to the canonical builtin set. User-
-            # declared effects with `default { }` would need
-            # `default_setups_for` / `default_shims_for` to walk the
-            # source-level decl tables; Stage A wired only the 17
-            # builtins (with `Stdout` as the only one consulting its
-            # `default { }`). `check_main_row_handlable` already
-            # rejected those at the row level; we duplicate the
-            # message here only when the row was elided.
-            if is_absorbable_stdlib_eff(eff_name) {
-              let default_ops = effect_default_op_names(eff_name, decls)
-              let has_block = effect_has_default_block(eff_name, decls)
-              if list_has_string(default_ops, op_name) { 0 }
-              else if not has_block {
-                # Legacy hardcoded handler covers the op (the 16
-                # builtins not yet migrated).
-                0
-              }
-              else {
-                report_uncovered_op(file, fname, eff_name, op_name, decls,
-                                     line, col, true)
-                1
-              }
+            # Issue #558: every effect (builtin or user) with a
+            # source-level `default { }` block bridging via
+            # `$extern_handler` gets auto-installed at main. The
+            # check is now uniform — no special builtin list.
+            let default_ops = effect_default_op_names(eff_name, decls)
+            if list_has_string(default_ops, op_name) { 0 }
+            else {
+              report_uncovered_op(file, fname, eff_name, op_name, decls,
+                                   line, col, true)
+              1
             }
-            else { 0 }   # `check_main_row_handlable` already complained
           }
           else { 0 }
       }
@@ -18304,15 +18250,8 @@ fn describe_default_status(eff_name: String, op_name: String,
                             decls: [Decl]) : String {
   match find_effect_default_block(eff_name, decls) {
     None ->
-      if is_absorbable_stdlib_eff(eff_name) {
-        # Pre-Stage-C builtin: source-level default not yet migrated.
-        concat_all(["`", eff_name,
-                    "` is a builtin effect; its default handler is installed at `main` but does not cover `",
-                    op_name, "` (Stage A only migrated `Stdout.print`)"])
-      } else {
-        concat_all(["effect `", eff_name,
-                    "` declares no `default { }` block, so no fallback handler exists"])
-      }
+      concat_all(["effect `", eff_name,
+                  "` declares no `default { }` block, so no fallback handler exists"])
     Some(defblk) -> match defblk {
       DBlk(clauses, _, _, _) -> {
         let all_names = handle_clause_op_names(clauses)
@@ -35721,96 +35660,25 @@ fn only_non_absorbed_labels(st: InferState, row: [Label], decls: [Decl]) : [Labe
 # the runtime's default handler is NOT installed, so the label
 # must NOT be absorbed.
 fn effect_has_default_handler(st: InferState, name: String, decls: [Decl]) : Bool {
-  if is_absorbable_stdlib_eff(name) {
-    if user_shadows_default_eff(st, name) { false }
-    else { true }
-  } else {
-    # Issue #557 — Stage B holds back absorbing user-declared effects
-    # at `main`, even when their declaration carries a `default { }`
-    # block. The reason is purely codegen: `emit_main_wrapper`'s
-    # `default_setups_for` / `default_shims_for` only walk the 17
-    # canonical builtin names. A user effect with `default { }` would
-    # type-check absorbed but never receive a setup block, so the
-    # binary would still segfault on first dispatch. Stage C extends
-    # those walkers to consult arbitrary effect declarations; until
-    # then the row-level rejection stays load-bearing for user-
-    # declared effects.
-    #
-    # The unused param keeps the API ready for Stage C (the walkers
-    # will gate absorption on whether the effect has a default block
-    # whose clauses are all extern-handler-bridgeable).
-    let _ = decls
-    false
-  }
-}
-
-fn is_absorbable_stdlib_eff(name: String) : Bool {
-  if      name == "Stdout"       { true }
-  else if name == "Stderr"       { true }
-  else if name == "Fail"         { true }
-  else if name == "Stdin"        { true }
-  else if name == "Env"          { true }
-  else if name == "File"         { true }
-  else if name == "Clock"        { true }
-  else if name == "Random"       { true }
-  else if name == "SecureRandom" { true }
-  else if name == "NetTcp"       { true }
-  else if name == "Signal"       { true }
-  else if name == "Process"      { true }
-  else if name == "Log"          { true }
-  else if name == "Mutable"      { true }
-  else if name == "Cancel"       { true }
-  else if name == "Link"         { true }
-  else if name == "Monitor"      { true }
-  else if name == "Spawn"        { true }
-  # Parametric stdlib effects — runtime handlers come from user code
-  # or the `var x = init` desugar's `with State[T](init)` wrapper,
-  # not from `emit_main_wrapper`. Absorbing at main is consistent
-  # with the row-arithmetic gap that lets these labels phantom-leak
-  # past their wrapping handlers (`labels_args_unify` is shallow and
-  # cannot rebind a `?fresh` to `Int` when filtering); rejecting
-  # them would break the `var x = init` sugar surface for any
-  # program where `main` is the closest enclosing scope.
-  else if name == "State"        { true }
-  else if name == "Reader"       { true }
-  else if name == "Writer"       { true }
+  # Issue #558: absorption is gated on the source-level `default { }`
+  # block carrying all-`$extern_handler` clauses. Parametric stdlib
+  # effects (State[T], Reader[T], Writer[W]) keep their pre-#558
+  # absorption since they have no runtime default — `var x = init`
+  # depends on it (the row-arithmetic gap discussed in the historic
+  # comment on `is_absorbable_stdlib_eff`).
+  let _ = st
+  if effect_default_block_all_extern(name, decls) { true }
+  else if is_parametric_handlerless_stdlib_eff(name) { true }
   else { false }
 }
 
-# True iff an effect `<name>` is declared in the env (so it carries
-# at least one `<name>.<op>` entry) but its op shape diverges from
-# the canonical builtin op list — i.e., the user redeclared
-# `effect <name>` with a different op set. When the user's decl
-# matches every canonical op the default handler is wired up
-# correctly and we treat the effect as absorbed. When ANY canonical
-# op is missing (because the user redeclared `Log` with only
-# `trace`, say) the runtime would not install the default handler:
-# emit-time `effect_default_compatible` filters the label out of
-# `main_row` so no shim is generated. The typer must keep parity.
-fn user_shadows_default_eff(st: InferState, name: String) : Bool {
-  match canonical_eff_ops(name) {
-    None     -> false
-    Some(ops) ->
-      is_effect_in_env(st.env, name) and
-      not env_has_all_eff_ops(st.env, name, ops)
-  }
-}
-
-fn canonical_eff_ops(name: String) : Option[[String]] {
-  expected_default_op_names(name)
-}
-
-fn env_has_all_eff_ops(env: TyEnv, name: String, ops: [String]) : Bool {
-  match ops {
-    [] -> true
-    [op, ...rest] -> {
-      let key = string_concat(name, string_concat(".", op))
-      match ty_env_lookup(env, key) {
-        Some(_) -> env_has_all_eff_ops(env, name, rest)
-        None    -> false
-      }
-    }
-  }
+# Parametric stdlib effects whose handlers are always user-installed
+# (`var x = init` desugar wraps `with State[T](init) { ... }`). They
+# carry no runtime default but main absorption stays true so the sugar
+# surface keeps compiling — see the long comment on the legacy
+# `is_absorbable_stdlib_eff` for the row-arithmetic rationale.
+fn is_parametric_handlerless_stdlib_eff(name: String) : Bool {
+  name == "State" or name == "Reader" or name == "Writer"
 }
 
 # Issue #517 — walk `main`'s body row reporting any label whose
@@ -47280,8 +47148,8 @@ fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], _bmode: Build
   # Mutable) that appears in main's row. When main has no
   # builtins the functions are no-ops.
   # Issue #308: same shadowing filter as the C backend — see
-  # row_minus_user_effects.
-  let main_row = row_minus_user_effects(main_row_labels(decls), decls)
+  # row_effects_without_default_handler.
+  let main_row = row_effects_without_default_handler(main_row_labels(decls), decls)
   let install = llvm_emit_main_install_defaults(main_row)
   let teardown = llvm_emit_main_teardown_defaults(main_row)
   concat_all([llvm_header(), eff_structs, "\n",
