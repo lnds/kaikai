@@ -17816,6 +17816,538 @@ fn find_effect_default_block(eff_name: String, decls: [Decl]) : Option[DefaultBl
   }
 }
 
+# Issue #557 — Stage B of #533 trilogy. Op-level coverage walker.
+#
+# The typer's row-level checks (`check_body_row`, `check_main_row_handlable`)
+# enforce that every effect label reached from a body is named by an
+# enclosing `handle` or absorbed by `main`. They are blind to which
+# specific op of an effect was performed, so a `handle ... with Log
+# { info }` whose body invokes `Log.warn` compiles cleanly and
+# segfaults at runtime (dispatch hits an unwired evidence slot).
+#
+# This walker closes the gap. For every directly-performed `Eff.op`
+# call inside a `DFn` body it walks the lexical stack of enclosing
+# handles. Discharge order:
+#
+#   1. Enclosing `handle ... with Eff { clauses }` lists `op` in its
+#      clauses  → discharged.
+#   2. Enclosing `handle ... with Eff` exists, `op` not in clauses,
+#      but `Eff`'s `default { }` block declares `op` → discharged
+#      (clause-merge from the spec).
+#   3. No enclosing `handle ... with Eff`, the function is `main`,
+#      and `Eff`'s `default { }` block declares `op` → discharged
+#      (auto-installed at the program root).
+#   4. Otherwise → "effect not handled: Eff.op" with notes naming
+#      the default-block status so the user can decide between
+#      adding a clause to the handle, growing the default block, or
+#      wrapping the call site.
+#
+# Scope: only direct `Eff.op(...)` invocations are checked (the
+# `ECall(EVar("Eff.op"), _)` shape produced by `synth_op_call_with_scheme`).
+# Cross-function reachability is out of scope for Stage B; the row-
+# level check still propagates labels through helper signatures and
+# bites where they bubble up.
+type HandleFrame = HF(String, [String], [String], Int, Int)
+
+fn check_default_coverage(file: String, decls: [Decl]) : Int / Console + File {
+  check_default_coverage_loop(file, decls, decls, 0)
+}
+
+fn check_default_coverage_loop(file: String, all_decls: [Decl], ds: [Decl],
+                                acc: Int) : Int / Console + File {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DFn(_, fname, _, _, _, _, body, _, _, _) -> {
+        let n = walk_coverage_expr(file, all_decls, fname, body, [], 0)
+        check_default_coverage_loop(file, all_decls, rest, acc + n)
+      }
+      _ -> check_default_coverage_loop(file, all_decls, rest, acc)
+    }
+  }
+}
+
+# Names of ops the user wrote in a handle's clause list.
+fn handle_clause_op_names(cs: [HClause]) : [String] = match cs {
+  []           -> []
+  [c, ...rest] -> match c {
+    HC(name, _, _, _, _) -> [name, ...handle_clause_op_names(rest)]
+  }
+}
+
+# Names of ops declared inside an effect's `default { }` block whose
+# clause body is an `$extern_handler("c_sym")` intrinsic — the only
+# shape Stage A codegen knows how to lower into a runtime shim.
+# kaikai-bodied default clauses are recognised by the parser but their
+# emit path is Stage C scope; including them here would let the typer
+# discharge ops that the binary cannot service at runtime.
+# Returns the empty list for "no default block" — the walker treats
+# that case identically to "default block exists but covers no extern
+# handlerable ops".
+fn effect_default_op_names(eff_name: String, decls: [Decl]) : [String] =
+  match find_effect_default_block(eff_name, decls) {
+    None         -> []
+    Some(defblk) -> match defblk {
+      DBlk(clauses, _, _, _) -> extern_handler_op_names(clauses)
+    }
+  }
+
+fn extern_handler_op_names(cs: [HClause]) : [String] = match cs {
+  []           -> []
+  [c, ...rest] -> match c {
+    HC(name, _, body, _, _) -> match extern_handler_c_symbol(body) {
+      None    -> extern_handler_op_names(rest)
+      Some(_) -> [name, ...extern_handler_op_names(rest)]
+    }
+  }
+}
+
+fn effect_has_default_block(eff_name: String, decls: [Decl]) : Bool =
+  match find_effect_default_block(eff_name, decls) {
+    None    -> false
+    Some(_) -> true
+  }
+
+# Issue #557 — strict variant of `effect_has_default_block` used for
+# main absorption: every clause must bridge to an `extern_handler`
+# intrinsic. Stage A's codegen only knows how to lower those — a
+# kaikai-bodied clause has no emitter path yet (Stage C). Treating
+# effects with kaikai-bodied defaults as absorbed would type-check
+# clean and segfault at runtime, so the typer holds back until codegen
+# can match.
+fn effect_default_block_all_extern(eff_name: String, decls: [Decl]) : Bool =
+  match find_effect_default_block(eff_name, decls) {
+    None         -> false
+    Some(defblk) -> match defblk {
+      DBlk(clauses, _, _, _) -> all_clauses_extern_handler(clauses)
+    }
+  }
+
+fn all_clauses_extern_handler(cs: [HClause]) : Bool = match cs {
+  []           -> true
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> match extern_handler_c_symbol(body) {
+      None    -> false
+      Some(_) -> all_clauses_extern_handler(rest)
+    }
+  }
+}
+
+# Search the handle stack for the topmost frame matching `eff_name`.
+# Step 2 (clause-merge) and step 3 (handle-with-default) both require
+# the topmost frame; step 1 fires when that frame's clauses list `op`.
+fn find_top_eff_frame(stack: [HandleFrame], eff_name: String) : Option[HandleFrame] {
+  match stack {
+    []           -> None
+    [f, ...rest] -> match f {
+      HF(n, _, _, _, _) ->
+        if n == eff_name { Some(f) } else { find_top_eff_frame(rest, eff_name) }
+    }
+  }
+}
+
+# Issue #557 — walker over a typed (or pre-typed) Expr. `fname` is the
+# enclosing `DFn` name, used for the main-discharge step (step 4) and
+# for diagnostic context.
+fn walk_coverage_expr(file: String, decls: [Decl], fname: String,
+                       e: Expr, stack: [HandleFrame], acc: Int) : Int / Console + File {
+  match e.kind {
+    EInt(_)           -> acc
+    EReal(_)          -> acc
+    EBool(_)          -> acc
+    EChar(_)          -> acc
+    EStr(_, _)        -> acc
+    EUnit             -> acc
+    EVar(_)           -> acc
+    EUnder            -> acc
+    EPlaceholder      -> acc
+    EHole(_)          -> acc
+    ETodo(_)          -> acc
+    EVariantsOf(_, _) -> acc
+    EModCall(_, _)    -> acc
+    EIntrinsic(_, args_) ->
+      walk_coverage_list(file, decls, fname, args_, stack, acc)
+    ECall(callee, args_) -> {
+      # Detect `Eff.op(...)` shape produced by synth_op_call_with_scheme.
+      # The callee is `EVar("Eff.op")` (possibly with an `@alias` suffix on
+      # the dispatch key — strip that before splitting).
+      let head_errs = match callee.kind {
+        EVar(key) -> check_op_call_coverage(file, decls, fname, key,
+                                              stack, e.line, e.col)
+        _ -> 0
+      }
+      let acc1 = acc + head_errs
+      let acc2 = walk_coverage_expr(file, decls, fname, callee, stack, acc1)
+      walk_coverage_list(file, decls, fname, args_, stack, acc2)
+    }
+    EField(base, _) -> walk_coverage_expr(file, decls, fname, base, stack, acc)
+    EIndex(a, b)    -> {
+      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, fname, b, stack, a1)
+    }
+    EBinop(_, a, b) -> {
+      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, fname, b, stack, a1)
+    }
+    EUnop(_, x)     -> walk_coverage_expr(file, decls, fname, x, stack, acc)
+    EIf(c, t, eo)   -> {
+      let a1 = walk_coverage_expr(file, decls, fname, c, stack, acc)
+      let a2 = walk_coverage_expr(file, decls, fname, t, stack, a1)
+      match eo {
+        Some(b) -> walk_coverage_expr(file, decls, fname, b, stack, a2)
+        None    -> a2
+      }
+    }
+    EMatch(scr, arms) -> {
+      let a1 = walk_coverage_expr(file, decls, fname, scr, stack, acc)
+      walk_coverage_arms(file, decls, fname, arms, stack, a1)
+    }
+    ELambda(_, _) -> acc           # lambda bodies have their own row
+    ERecordLit(_, fs) -> walk_coverage_fields(file, decls, fname, fs, stack, acc)
+    EList(els)        -> walk_coverage_elems(file, decls, fname, els, stack, acc)
+    ERange(a, b, opt) -> {
+      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
+      let a2 = walk_coverage_expr(file, decls, fname, b, stack, a1)
+      match opt {
+        Some(s) -> walk_coverage_expr(file, decls, fname, s, stack, a2)
+        None    -> a2
+      }
+    }
+    EBlock(stmts, tail) -> {
+      let a1 = walk_coverage_stmts(file, decls, fname, stmts, stack, acc)
+      match tail {
+        Some(t) -> walk_coverage_expr(file, decls, fname, t, stack, a1)
+        None    -> a1
+      }
+    }
+    EPipe(a, b)        -> {
+      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, fname, b, stack, a1)
+    }
+    EMapPipe(a, b)     -> {
+      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, fname, b, stack, a1)
+    }
+    EFlatMapPipe(a, b) -> {
+      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, fname, b, stack, a1)
+    }
+    EFilterPipe(a, b)  -> {
+      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, fname, b, stack, a1)
+    }
+    EBang(inner)       -> walk_coverage_expr(file, decls, fname, inner, stack, acc)
+    ELitUnit(inner, _) -> walk_coverage_expr(file, decls, fname, inner, stack, acc)
+    EHandle(body, eff_name, _, init_opt, _, clauses, ret_opt) -> {
+      let frame = HF(eff_name,
+                     handle_clause_op_names(clauses),
+                     effect_default_op_names(eff_name, decls),
+                     e.line, e.col)
+      let a1 = match init_opt {
+        Some(i) -> walk_coverage_expr(file, decls, fname, i, stack, acc)
+        None    -> acc
+      }
+      # Clause bodies execute outside `with eff_name` (the typer enforces
+      # this; clauses are separate functions). Walk them under the outer
+      # stack so a Eff.op clause body that itself calls Eff.op is not
+      # silently treated as discharged by this frame.
+      let a2 = walk_coverage_clauses(file, decls, fname, clauses, stack, a1)
+      let a3 = match ret_opt {
+        Some(r) -> match r {
+          HR(_, b, _, _) -> walk_coverage_expr(file, decls, fname, b, stack, a2)
+        }
+        None -> a2
+      }
+      walk_coverage_expr(file, decls, fname, body, [frame, ...stack], a3)
+    }
+  }
+}
+
+fn walk_coverage_list(file: String, decls: [Decl], fname: String,
+                       es: [Expr], stack: [HandleFrame], acc: Int) : Int / Console + File {
+  match es {
+    []           -> acc
+    [h, ...rest] -> {
+      let a1 = walk_coverage_expr(file, decls, fname, h, stack, acc)
+      walk_coverage_list(file, decls, fname, rest, stack, a1)
+    }
+  }
+}
+
+fn walk_coverage_arms(file: String, decls: [Decl], fname: String,
+                       arms: [Arm], stack: [HandleFrame], acc: Int) : Int / Console + File {
+  match arms {
+    []           -> acc
+    [a, ...rest] -> match a {
+      Arm(_, og, body) -> {
+        let a1 = match og {
+          Some(g) -> walk_coverage_expr(file, decls, fname, g, stack, acc)
+          None    -> acc
+        }
+        let a2 = walk_coverage_expr(file, decls, fname, body, stack, a1)
+        walk_coverage_arms(file, decls, fname, rest, stack, a2)
+      }
+    }
+  }
+}
+
+fn walk_coverage_fields(file: String, decls: [Decl], fname: String,
+                         fs: [FieldInit], stack: [HandleFrame], acc: Int) : Int / Console + File {
+  match fs {
+    []           -> acc
+    [f, ...rest] -> match f {
+      FI(_, e) -> {
+        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
+        walk_coverage_fields(file, decls, fname, rest, stack, a1)
+      }
+    }
+  }
+}
+
+fn walk_coverage_elems(file: String, decls: [Decl], fname: String,
+                        els: [ListElem], stack: [HandleFrame], acc: Int) : Int / Console + File {
+  match els {
+    []            -> acc
+    [el, ...rest] -> match el {
+      ElPlain(e)  -> {
+        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
+        walk_coverage_elems(file, decls, fname, rest, stack, a1)
+      }
+      ElSpread(e) -> {
+        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
+        walk_coverage_elems(file, decls, fname, rest, stack, a1)
+      }
+    }
+  }
+}
+
+fn walk_coverage_stmts(file: String, decls: [Decl], fname: String,
+                        ss: [Stmt], stack: [HandleFrame], acc: Int) : Int / Console + File {
+  match ss {
+    []           -> acc
+    [s, ...rest] -> match s {
+      SLet(_, _, e) -> {
+        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
+        walk_coverage_stmts(file, decls, fname, rest, stack, a1)
+      }
+      SVar(_, _, e, _, _) -> {
+        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
+        walk_coverage_stmts(file, decls, fname, rest, stack, a1)
+      }
+      SAssert(e, og) -> {
+        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
+        let a2 = match og {
+          Some(g) -> walk_coverage_expr(file, decls, fname, g, stack, a1)
+          None    -> a1
+        }
+        walk_coverage_stmts(file, decls, fname, rest, stack, a2)
+      }
+      SExprStmt(e) -> {
+        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
+        walk_coverage_stmts(file, decls, fname, rest, stack, a1)
+      }
+      SIndexAssign(a, b, c, _, _) -> {
+        let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
+        let a2 = walk_coverage_expr(file, decls, fname, b, stack, a1)
+        let a3 = walk_coverage_expr(file, decls, fname, c, stack, a2)
+        walk_coverage_stmts(file, decls, fname, rest, stack, a3)
+      }
+      SUse(_, _, _) -> walk_coverage_stmts(file, decls, fname, rest, stack, acc)
+    }
+  }
+}
+
+fn walk_coverage_clauses(file: String, decls: [Decl], fname: String,
+                          cs: [HClause], stack: [HandleFrame], acc: Int) : Int / Console + File {
+  match cs {
+    []           -> acc
+    [c, ...rest] -> match c {
+      HC(_, _, body, _, _) -> {
+        let a1 = walk_coverage_expr(file, decls, fname, body, stack, acc)
+        walk_coverage_clauses(file, decls, fname, rest, stack, a1)
+      }
+    }
+  }
+}
+
+# Op-call discharge: returns the number of new diagnostics emitted (0
+# or 1). `key` is the callee `EVar` payload — `Eff.op` for a regular
+# op call, possibly `Eff.op@alias` if the alias-tagged dispatch path
+# fired. Returns 0 when the callee is not in `Eff.op` form (regular
+# function call, FFI shim, etc.).
+fn check_op_call_coverage(file: String, decls: [Decl], fname: String,
+                           key: String, stack: [HandleFrame],
+                           line: Int, col: Int) : Int / Console + File {
+  let bare = strip_alias_suffix(key)
+  if not string_contains_dot(bare) { 0 }
+  else {
+    let eff_name = dotted_prefix(bare)
+    let op_name  = dotted_suffix(bare)
+    # Skip the row-level absorbed labels (Ffi etc.) — they have no per-op
+    # discharge surface. The walker only fires for declared effects that
+    # come through `effect E { ops }` plus the canonical builtin shapes.
+    if not is_effect_declared(eff_name, decls) and
+       not is_absorbable_stdlib_eff(eff_name) { 0 }
+    else {
+      match find_top_eff_frame(stack, eff_name) {
+        Some(frame) -> match frame {
+          HF(_, clause_ops, _default_ops, _, _) ->
+            if list_has_string(clause_ops, op_name) { 0 }
+            else {
+              # Spec step 3 ("enclosing handle exists, op not in
+              # clauses, default block covers op → clause-merge from
+              # default fires") is DISABLED in Stage B: codegen Stage
+              # A's `emit_clause_assignments` only wires `_ev.<op>` for
+              # ops the user typed in the handle. The inner handle's
+              # evidence node masks any enclosing default, so the
+              # dispatch hits a NULL function pointer at runtime
+              # regardless of what `default { }` declares. Stage C
+              # extends the handle emitter to consult the effect's
+              # default block and synthesize the missing clauses; at
+              # that point this branch flips to check `_default_ops`
+              # and discharges.
+              report_uncovered_op(file, fname, eff_name, op_name, decls,
+                                   line, col, false)
+              1
+            }
+        }
+        None ->
+          # No enclosing handle for `eff_name`. The op either fires from
+          # main (step 4) or escapes to the caller's row.
+          if fname == "main" {
+            # Step 4 is restricted to the canonical builtin set. User-
+            # declared effects with `default { }` would need
+            # `default_setups_for` / `default_shims_for` to walk the
+            # source-level decl tables; Stage A wired only the 17
+            # builtins (with `Stdout` as the only one consulting its
+            # `default { }`). `check_main_row_handlable` already
+            # rejected those at the row level; we duplicate the
+            # message here only when the row was elided.
+            if is_absorbable_stdlib_eff(eff_name) {
+              let default_ops = effect_default_op_names(eff_name, decls)
+              let has_block = effect_has_default_block(eff_name, decls)
+              if list_has_string(default_ops, op_name) { 0 }
+              else if not has_block {
+                # Legacy hardcoded handler covers the op (the 16
+                # builtins not yet migrated).
+                0
+              }
+              else {
+                report_uncovered_op(file, fname, eff_name, op_name, decls,
+                                     line, col, true)
+                1
+              }
+            }
+            else { 0 }   # `check_main_row_handlable` already complained
+          }
+          else { 0 }
+      }
+    }
+  }
+}
+
+# Some op-call callees carry an `@alias` suffix on the dispatch key
+# (e.g. `Stdout.print@io`). Strip it so the `Eff.op` split is honest.
+fn strip_alias_suffix(key: String) : String =
+  strip_alias_suffix_loop(key, 0, string_length(key))
+
+fn strip_alias_suffix_loop(key: String, i: Int, n: Int) : String {
+  if i >= n { key }
+  else {
+    match char_at(key, i) {
+      Some(c) -> if c == '@' { string_slice(key, 0, i) }
+                 else { strip_alias_suffix_loop(key, i + 1, n) }
+      None    -> key
+    }
+  }
+}
+
+fn is_effect_declared(eff_name: String, decls: [Decl]) : Bool {
+  match decls {
+    [] -> false
+    [d, ...rest] -> match d {
+      DEffect(_, n, _, _, _, _, _) ->
+        if n == eff_name { true } else { is_effect_declared(eff_name, rest) }
+      _ -> is_effect_declared(eff_name, rest)
+    }
+  }
+}
+
+# Emit the structured diagnostic for an unhandled op. The `at_main` flag
+# distinguishes "no handle, fname is main, default block does not cover
+# the op" from "enclosing handle exists, clauses omit the op, default
+# does not fill the gap" — the help lines differ.
+fn report_uncovered_op(file: String, fname: String, eff_name: String,
+                        op_name: String, decls: [Decl],
+                        line: Int, col: Int, at_main: Bool) : Unit / Console + File {
+  let qualified = concat_all([eff_name, ".", op_name])
+  let header = concat_all(["effect not handled: ", qualified])
+  diag_error(file, line, col, header)
+  let default_status = describe_default_status(eff_name, op_name, decls)
+  diag_note(default_status)
+  if at_main {
+    diag_help(concat_all(["wrap the call in `handle { ... } with ",
+                          eff_name, " { ", op_name,
+                          "(args, resume) -> ... }`, or add `",
+                          op_name, "(args, resume) -> ...` to `effect ",
+                          eff_name, "`'s `default { }` block"]))
+  } else {
+    diag_help(concat_all(["add a `", op_name,
+                          "(args, resume) -> ...` clause to the enclosing `handle ... with ",
+                          eff_name, "`, or add `", op_name,
+                          "(args, resume) -> ...` to `effect ", eff_name,
+                          "`'s `default { }` block"]))
+  }
+}
+
+fn describe_default_status(eff_name: String, op_name: String,
+                            decls: [Decl]) : String {
+  match find_effect_default_block(eff_name, decls) {
+    None ->
+      if is_absorbable_stdlib_eff(eff_name) {
+        # Pre-Stage-C builtin: source-level default not yet migrated.
+        concat_all(["`", eff_name,
+                    "` is a builtin effect; its default handler is installed at `main` but does not cover `",
+                    op_name, "` (Stage A only migrated `Stdout.print`)"])
+      } else {
+        concat_all(["effect `", eff_name,
+                    "` declares no `default { }` block, so no fallback handler exists"])
+      }
+    Some(defblk) -> match defblk {
+      DBlk(clauses, _, _, _) -> {
+        let all_names = handle_clause_op_names(clauses)
+        let extern_names = extern_handler_op_names(clauses)
+        if list_has_string(extern_names, op_name) {
+          # The default block does declare the op AND its body is an
+          # `$extern_handler(...)` bridge — codegen Stage A can lower it
+          # at `main` level. The reason discharge failed is that we are
+          # inside a partial `handle ... with E`: Stage A's
+          # `emit_clause_assignments` only wires the user-declared
+          # clauses, so an inner handle's evidence node masks the
+          # main-level default. Stage C lifts the masking by emitting
+          # the default's clauses inside every enclosing handle's `_ev`.
+          concat_all(["effect `", eff_name,
+                      "`'s `default { }` block does declare `", op_name,
+                      "` via `$extern_handler`, but the enclosing `handle ... with ",
+                      eff_name, "` masks the main-level default — Stage C will let the handle inherit unmissed default clauses; until then the partial handle must add `",
+                      op_name, "`"])
+        } else if list_has_string(all_names, op_name) {
+          # The user wrote the clause but its body is a kaikai expression.
+          # Stage A lowers only `$extern_handler(...)` bridges; Stage C
+          # will close this gap.
+          concat_all(["effect `", eff_name,
+                      "`'s `default { }` block declares `", op_name,
+                      "` but its body is not an `$extern_handler(...)` bridge — Stage C will lower kaikai-bodied default clauses; for now the clause must use the intrinsic"])
+        } else {
+          concat_all(["effect `", eff_name,
+                      "`'s `default { }` block does not declare `",
+                      op_name, "`"])
+        }
+      }
+    }
+  }
+}
+
 # Build a single shim declaration from a clause whose body bridges to
 # a C symbol via `$extern_handler("c_sym")`. Returns "" if the body is
 # not an extern_handler intrinsic — Stage A does not emit kaikai-bodied
@@ -35099,6 +35631,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
               type_aliases: [AliasResult], op_to_eff: [OpToEff],
               sums: [SumInfo],
               proto_impls: [ProtoImplReg],
+              all_decls: [Decl],
               d: Decl, verbose: Bool) : TypedDecl / Console + File {
 
 
@@ -35213,7 +35746,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # `mask_local_mutable_demand` and is a no-op when `Mutable`
       # is not in the row to begin with.
       let st1c = mask_local_mutable_demand(st1b, ps, rb.expr)
-      let st2 = check_body_row(st1c, nm, row, line, col)
+      let st2 = check_body_row(st1c, nm, row, line, col, all_decls)
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
       } else { () }
@@ -35593,7 +36126,7 @@ fn subst_tparams_tes(ts: [TypeExpr], mapping: [TParamMapEntry]) : [TypeExpr] {
 # absorbs any extras — every body row is admissible against an
 # open declared row.
 fn check_body_row(st: InferState, fname: String, declared: RowExpr,
-                  line: Int, col: Int) : InferState / Console + File {
+                  line: Int, col: Int, decls: [Decl]) : InferState / Console + File {
 
 
   # m7b #11i + #11k: every body label must match a declared label by
@@ -35625,9 +36158,12 @@ fn check_body_row(st: InferState, fname: String, declared: RowExpr,
       # SIGSEGV'd at runtime (no handler installed). Reject the same
       # way Ffi is rejected: only labels with an `emit_main_wrapper`
       # default handler should be absorbed.
+      # Issue #557 — also absorb user-declared effects that carry a
+      # source-level `default { }` block. Stage A's `default_setups_from_block`
+      # wires shims for them at `main`, so the runtime IS evidence-backed.
       if fname == "main" {
         check_body_row_label_loop(st, fname,
-                                  only_non_absorbed_labels(st, st.row),
+                                  only_non_absorbed_labels(st, st.row, decls),
                                   [], line, col)
       }
       else { check_body_row_label_loop(st, fname, st.row, [], line, col) }
@@ -35642,7 +36178,7 @@ fn check_body_row(st: InferState, fname: String, declared: RowExpr,
                                             row_labels_of_rls(lbs),
                                             line, col)
       if fname == "main" {
-        check_main_row_handlable(st1, st.row, line, col)
+        check_main_row_handlable(st1, st.row, line, col, decls)
       } else { st1 }
     }
     ROpen(_, _)  -> st
@@ -35657,14 +36193,14 @@ fn check_body_row(st: InferState, fname: String, declared: RowExpr,
 # set — `Ffi` (capability tag, no default handler by design) plus any
 # user-defined effect (no runtime evidence wired up) — must NOT be
 # absorbed by main; reject explicitly so the program does not segfault.
-fn only_non_absorbed_labels(st: InferState, row: [Label]) : [Label] {
+fn only_non_absorbed_labels(st: InferState, row: [Label], decls: [Decl]) : [Label] {
   match row {
     [] -> []
     [h, ...rest] ->
-      if effect_has_default_handler(st, h.eff) {
-        only_non_absorbed_labels(st, rest)
+      if effect_has_default_handler(st, h.eff, decls) {
+        only_non_absorbed_labels(st, rest, decls)
       } else {
-        [h, ...only_non_absorbed_labels(st, rest)]
+        [h, ...only_non_absorbed_labels(st, rest, decls)]
       }
   }
 }
@@ -35686,11 +36222,28 @@ fn only_non_absorbed_labels(st: InferState, row: [Label]) : [Label] {
 # declared `effect Log { trace }` shadows the canonical `Log` and
 # the runtime's default handler is NOT installed, so the label
 # must NOT be absorbed.
-fn effect_has_default_handler(st: InferState, name: String) : Bool {
+fn effect_has_default_handler(st: InferState, name: String, decls: [Decl]) : Bool {
   if is_absorbable_stdlib_eff(name) {
     if user_shadows_default_eff(st, name) { false }
     else { true }
-  } else { false }
+  } else {
+    # Issue #557 — Stage B holds back absorbing user-declared effects
+    # at `main`, even when their declaration carries a `default { }`
+    # block. The reason is purely codegen: `emit_main_wrapper`'s
+    # `default_setups_for` / `default_shims_for` only walk the 17
+    # canonical builtin names. A user effect with `default { }` would
+    # type-check absorbed but never receive a setup block, so the
+    # binary would still segfault on first dispatch. Stage C extends
+    # those walkers to consult arbitrary effect declarations; until
+    # then the row-level rejection stays load-bearing for user-
+    # declared effects.
+    #
+    # The unused param keeps the API ready for Stage C (the walkers
+    # will gate absorption on whether the effect has a default block
+    # whose clauses are all extern-handler-bridgeable).
+    let _ = decls
+    false
+  }
 }
 
 fn is_absorbable_stdlib_eff(name: String) : Bool {
@@ -35768,7 +36321,7 @@ fn env_has_all_eff_ops(env: TyEnv, name: String, ops: [String]) : Bool {
 # a handler, the binary segfaults the first time the op runs.
 # `Ffi` is naturally caught here too.
 fn check_main_row_handlable(st: InferState, body_row: [Label],
-                             line: Int, col: Int) : InferState / Console + File {
+                             line: Int, col: Int, decls: [Decl]) : InferState / Console + File {
   match body_row {
     [] -> st
     [h, ...rest] -> {
@@ -35779,7 +36332,7 @@ fn check_main_row_handlable(st: InferState, body_row: [Label],
       # directly. Treat it as handlable here so `main : Int / Ffi`
       # still typechecks; the REmpty path keeps rejecting an
       # undeclared Ffi label so the silent contract from #516 holds.
-      let st1 = if h.eff == "Ffi" or effect_has_default_handler(st, h.eff) { st }
+      let st1 = if h.eff == "Ffi" or effect_has_default_handler(st, h.eff, decls) { st }
       else {
         let use_eu = lookup_eff_use(st.eff_uses, h.eff)
         match use_eu {
@@ -35798,7 +36351,7 @@ fn check_main_row_handlable(st: InferState, body_row: [Label],
           }
         }
       }
-      check_main_row_handlable(st1, rest, line, col)
+      check_main_row_handlable(st1, rest, line, col, decls)
     }
   }
 }
@@ -35951,7 +36504,8 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
                    type_aliases: [AliasResult],
                    op_to_eff: [OpToEff],
                    sums: [SumInfo],
-                   proto_impls: [ProtoImplReg]) : TypedProgram / Console + File {
+                   proto_impls: [ProtoImplReg],
+                   all_decls: [Decl]) : TypedProgram / Console + File {
 
 
   match ds {
@@ -35964,7 +36518,13 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
     }
     [d, ...rest] -> {
       let r = infer_decl(file, env, prelude_len, recs, op_eff_arities,
-                          type_aliases, op_to_eff, sums, proto_impls, d, verbose)
+                          type_aliases, op_to_eff, sums, proto_impls,
+                          # Issue #557 — pass program-level decls so
+                          # check_body_row / check_main_row_handlable can
+                          # consult source-level `default { }` blocks
+                          # when deciding row absorption at `main`.
+                          all_decls,
+                          d, verbose)
       infer_all_loop(file, env, prelude_len, recs, op_eff_arities, rest, verbose,
                      [r.decl, ...acc_decls],
                      acc_errs + r.errs,
@@ -35972,7 +36532,8 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
                      prepend_reverse_holes(r.holes, acc_holes),
                      prepend_reverse_row_holes(r.row_holes, acc_row_holes),
                      prepend_reverse_diags(r.diags, acc_diags),
-                     type_aliases, op_to_eff, sums, proto_impls)
+                     type_aliases, op_to_eff, sums, proto_impls,
+                     all_decls)
     }
   }
 }
@@ -36360,9 +36921,19 @@ fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
   let op_to_eff = collect_op_to_eff(decls_a)
   # Issue #71: sum-type registry for the region-brand walker.
   let sums = collect_sums(decls_a)
-  infer_all_loop(file, built.env, built.prelude_len, recs,
+  let tp = infer_all_loop(file, built.env, built.prelude_len, recs,
                  built.op_eff_arities, decls_a, verbose, [], 0, [], [], [], [],
-                 alias_res.aliases, op_to_eff, sums, proto_impls)
+                 alias_res.aliases, op_to_eff, sums, proto_impls, decls_a)
+  # Issue #557 — Stage B coverage check. Runs after row-level inference
+  # is complete so the typed body carries the resolved `EVar("Eff.op")`
+  # callees the walker keys on. Adds its diagnostics directly to stderr
+  # and folds the count into TypedProgram.errs.
+  let cov_errs = check_default_coverage(file, tp.decls)
+  TypedProgram {
+    decls: tp.decls, errs: tp.errs + cov_errs,
+    insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
+    prelude_len: tp.prelude_len, diags: tp.diags
+  }
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int / Console + File {
