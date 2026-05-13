@@ -1,6 +1,7 @@
 # kaikai roadmap
 
-Pinned 2026-05-02 (post v0.30.0). Names follow the Rapa Nui
+Pinned 2026-05-02 (post v0.30.0). Last refreshed 2026-05-13 (HEAD
+0.54.3, post #543 closure). Names follow the Rapa Nui
 convention already in use across the project (the language
 `kaikai` itself, the framework `ahu`, the web framework
 `manutara`). Each milestone is a real Rapa Nui site; the
@@ -10,8 +11,13 @@ horizon beyond.
 
 ## Status snapshot
 
-- **HEAD**: `0.43.0` (post protocols + ergonomics chain; #285
-  Ref-loop closure capture fix shipped 2026-05-05).
+- **HEAD**: `0.54.3` (post the 2026-05-12 negative-space audit
+  phase 2 closures: #535 protocol impl validation, #543 register-one
+  blind-prepend, #539 handler return clause optional, and #547/#548
+  PRs merged 2026-05-13). The earlier `0.43.0` pin tracked the
+  protocols + ergonomics chain through 2026-05-05; the run from
+  0.44 → 0.54 was the negative-space audit phases 1 + 2 plus the
+  doc reconciliation work that surfaced this lane.
 - **Current target**: **kaikai-Anga Roa** — de-facto since
   ~2026-05-03 with the protocols + ergonomics precondition chain.
   Tongariki MVP closed 2026-05-02 via PR #73 (issue #59 — m8.x
