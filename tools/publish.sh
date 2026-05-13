@@ -140,8 +140,10 @@ git remote add public git@github.com:kaikailang-org/kaikai.git 2>/dev/null || \
   git remote set-url public git@github.com:kaikailang-org/kaikai.git
 
 echo "About to force-push to kaikailang-org/kaikai. This rewrites public history."
-echo "Press Ctrl+C to abort, ENTER to proceed."
-read -r _
+if [ "${PUBLISH_CONFIRM:-}" != "yes" ]; then
+  echo "Press Ctrl+C to abort, ENTER to proceed (or set PUBLISH_CONFIRM=yes to skip)."
+  read -r _ < /dev/tty
+fi
 
 echo "Pushing main..."
 git push public main:main --force
