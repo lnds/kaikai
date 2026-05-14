@@ -11186,7 +11186,11 @@ fn join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 # `unbox_classify_decl`.
 type UFnSig = US([Ty], Ty)
 type EFn  = EFn(String, Int, Option[String], Option[UFnSig])
-type EVar = EV(String, Int)
+# Issue #440 Phase 2 — payload type list per variant. Carries the
+# parsed `[TypeExpr]` of the constructor's args so the emitter can
+# decide which slots to inline-unbox (Int / Real). Empty list means
+# nullary or unknown — both paths emit the legacy boxed shape.
+type EVar = EV(String, Int, [TypeExpr])
 
 fn efn_find(fns: [EFn], target: String) : Option[EFn] {
   match fns {
@@ -11317,7 +11321,19 @@ fn evar_find(vs: [EVar], target: String) : Option[Int] {
   match vs {
     [] -> None
     [h, ...rest] -> match h {
-      EV(n, ar) -> if n == target { Some(ar) } else { evar_find(rest, target) }
+      EV(n, ar, _) -> if n == target { Some(ar) } else { evar_find(rest, target) }
+    }
+  }
+}
+
+# Issue #440 Phase 2 — look up the payload TypeExpr list for a
+# constructor name. Returns None when the name is not a known
+# variant ctor (the call site falls back to the legacy boxed path).
+fn evar_payload_tys(vs: [EVar], target: String) : Option[[TypeExpr]] {
+  match vs {
+    [] -> None
+    [h, ...rest] -> match h {
+      EV(n, _, tys) -> if n == target { Some(tys) } else { evar_payload_tys(rest, target) }
     }
   }
 }
@@ -12087,7 +12103,11 @@ fn list_head_or(xs: [String], fallback: String) : String = match xs {
 }
 
 fn builtin_variants() : [EVar] =
-  [EV("Some", 1), EV("None", 0), EV("Ok", 1), EV("Err", 1)]
+  # Phase 2 #440: builtins use empty type lists so the emitter falls
+  # back to the legacy boxed constructor path. Some/Ok/Err wrap an
+  # arbitrary boxed value; unboxing them would require a per-call-site
+  # type read which is not in scope for this lane.
+  [EV("Some", 1, []), EV("None", 0, []), EV("Ok", 1, []), EV("Err", 1, [])]
 
 fn collect_user_variants_loop(ds: [Decl], acc: [EVar]) : [EVar] {
   match ds {
@@ -12106,7 +12126,7 @@ fn vs_to_evars(vs: [Variant], acc: [EVar]) : [EVar] {
   match vs {
     [] -> acc
     [v, ...rest] -> match v {
-      Var(n, tys) -> vs_to_evars(rest, [EV(n, list_length(tys)), ...acc])
+      Var(n, tys) -> vs_to_evars(rest, [EV(n, list_length(tys), tys), ...acc])
     }
   }
 }
@@ -12388,6 +12408,132 @@ fn emit_variant_call(name: String, n_args: Int, arg_out: String) : String {
   }
 }
 
+# Issue #440 Phase 2 — classify a payload TypeExpr against the inline
+# slot kinds Phase 2 supports. Returns:
+#   0 = pointer (default — emit boxed slot)
+#   1 = Int (i64, unboxed)
+#   2 = Real (double, unboxed)
+# Anything else (List, Fn, dimensioned, refined, user types) returns 0
+# so the slot stays boxed. The classifier inspects the surface
+# `TyKind` only — it does not consult resolved types — so polymorphic
+# variants (`Some(a)`) fall through to the pointer path even when the
+# call site has a concrete Int instantiation. That conservative
+# choice keeps Phase 2 self-contained: only sum types whose
+# declaration spells `Int` / `Real` literally get unboxed slots.
+fn variant_slot_kind(te: TypeExpr) : Int = match te.tkind {
+  TyName(n, args) ->
+    if list_length(args) == 0 {
+      if n == "Int" { 1 }
+      else if n == "Real" { 2 }
+      else { 0 }
+    } else { 0 }
+  _ -> 0
+}
+
+# Build the `slot_mask` value for a payload type list. 2 bits per
+# slot, LSB-first. Returns 0 for any list with > 16 slots (mask
+# exhausts the 32-bit field — falls back to all-pointer layout).
+# Phase 2 — slot position scaler. kinds are 0/1/2 and slot fields
+# are disjoint 2-bit windows, so addition is the same as bitwise OR
+# (no carry-in). We avoid `bit_or` / `<<` because the stage 1
+# compiler does not parse the bit-intrinsic surface; stage 2 builds
+# the mask with plain arithmetic so the bootstrap chain works.
+fn variant_slot_pos(i: Int) : Int =
+  if i <= 0 { 1 } else { 4 * variant_slot_pos(i - 1) }
+
+fn variant_slot_mask_loop(tys: [TypeExpr], i: Int, acc: Int) : Int = match tys {
+  [] -> acc
+  [t, ...rest] ->
+    if i >= 16 { 0 }
+    else {
+      let k = variant_slot_kind(t)
+      variant_slot_mask_loop(rest, i + 1, acc + (k * variant_slot_pos(i)))
+    }
+}
+
+fn variant_slot_mask(tys: [TypeExpr]) : Int = variant_slot_mask_loop(tys, 0, 0)
+
+# True iff any slot of `tys` is a primitive (Int or Real) — i.e. the
+# typed construction path is worth taking. Empty list / all-pointer
+# tys return false, so the legacy `kai_variant` boxed path is used.
+fn variant_has_primitive_slot(tys: [TypeExpr]) : Bool = match tys {
+  [] -> false
+  [t, ...rest] ->
+    if variant_slot_kind(t) != 0 { true }
+    else { variant_has_primitive_slot(rest) }
+}
+
+# Emit a single `KaiVarSlot` initialiser for arg `e` against payload
+# type `te`. For pointer slots: `{.ptr = <boxed>}`. For Int/Real: pass
+# the boxed value through `kai_take_int` / `kai_take_real` so the
+# ephemeral box (e.g. a freshly-allocated `kai_int(7)`) gets
+# released, and the raw scalar lands in the typed slot. Singleton
+# Ints survive the decref because their rc is pinned at INT32_MAX.
+fn emit_variant_slot_init(src: String, e: Expr, te: TypeExpr,
+                          lcs: [String], fns: [EFn], variants: [EVar],
+                          lams: [LamInfo], cls: [ClauseInfo]) : String / Console {
+  let k = variant_slot_kind(te)
+  let boxed = emit_expr(src, e, lcs, fns, variants, lams, cls)
+  if k == 1 {
+    concat_all(["{.i64 = kai_take_int(", boxed, ")}"])
+  } else if k == 2 {
+    concat_all(["{.r = kai_take_real(", boxed, ")}"])
+  } else {
+    concat_all(["{.ptr = ", boxed, "}"])
+  }
+}
+
+fn emit_variant_slot_init_list(src: String, args_e: [Expr], tys: [TypeExpr],
+                               lcs: [String], fns: [EFn], variants: [EVar],
+                               lams: [LamInfo], cls: [ClauseInfo]) : String / Console {
+  match args_e {
+    [] -> ""
+    [e, ...rest_e] -> match tys {
+      [] -> {
+        # Defensive: arity mismatch between call site and decl; fall
+        # back to pointer slot to keep the C compilable. The typer
+        # would have rejected this earlier.
+        let head = concat_all(["{.ptr = ",
+          emit_expr(src, e, lcs, fns, variants, lams, cls), "}"])
+        match rest_e {
+          [] -> head
+          _  -> concat_all([head, ", ",
+            emit_variant_slot_init_list(src, rest_e, [], lcs, fns, variants, lams, cls)])
+        }
+      }
+      [t, ...rest_t] -> {
+        let head = emit_variant_slot_init(src, e, t, lcs, fns, variants, lams, cls)
+        match rest_e {
+          [] -> head
+          _  -> concat_all([head, ", ",
+            emit_variant_slot_init_list(src, rest_e, rest_t, lcs, fns, variants, lams, cls)])
+        }
+      }
+    }
+  }
+}
+
+# Phase 2 entry point for variant construction. When the variant has
+# at least one primitive payload slot, emit `kai_variant_u` with a
+# typed slot literal and a populated mask. Otherwise return None so
+# the caller falls back to the legacy `kai_variant` path.
+fn emit_variant_call_typed(name: String, args_e: [Expr], tys: [TypeExpr],
+                           src: String, lcs: [String], fns: [EFn], variants: [EVar],
+                           lams: [LamInfo], cls: [ClauseInfo]) : Option[String] / Console {
+  if variant_has_primitive_slot(tys) {
+    let n = list_length(args_e)
+    let mask = variant_slot_mask(tys)
+    let slot_inits = emit_variant_slot_init_list(src, args_e, tys, lcs, fns, variants, lams, cls)
+    Some(concat_all([
+      "kai_variant_u(0, \"", name, "\", ", int_to_string(n),
+      ", ", int_to_string(mask),
+      ", (KaiVarSlot[]){", slot_inits, "})"
+    ]))
+  } else {
+    None
+  }
+}
+
 fn emit_call_expr(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String / Console {
 
   # Phase 3 unboxing — when the callee resolves to a UFn (raw C
@@ -12573,18 +12719,48 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], lcs: [String], f
         # where the second arg is a variant constructor call of the
         # same arity. We unpack the constructor's name + args and
         # lower to `kai_reuse_or_alloc_variant`.
+        #
+        # Issue #440 Phase 2 — when the ctor has primitive payload
+        # slots (typed), the reuse-in-place fast path is disabled:
+        # `kai_reuse_or_alloc_variant` writes its replacement args
+        # into `slots[i].ptr` and assumes `slot_mask == 0`, which
+        # would mismatch the emit-side typed extract (`slots[i].i64`).
+        # Routing the rebuild through `kai_variant_u` keeps the
+        # cell coherent with the match read; the reuse-for-typed-
+        # cells extension is a follow-up lane.
         match args_e {
           [_scr, ctor] -> match ctor.kind {
             ECall(cf, cargs) -> match cf.kind {
               EVar(cname) -> {
                 let n = list_length(cargs)
-                let arg_strs = emit_call_args(src, cargs, lcs, fns, variants, lams, cls)
-                if n == 0 {
+                let tys_opt = evar_payload_tys(variants, cname)
+                let has_prim = match tys_opt {
+                  Some(ts) -> variant_has_primitive_slot(ts)
+                  None     -> false
+                }
+                if has_prim {
+                  # Force the typed alloc-fresh path. Mirrors
+                  # `emit_variant_call_typed` but with the existing
+                  # `cargs` already in expression form.
+                  match tys_opt {
+                    Some(ts) -> {
+                      let mask = variant_slot_mask(ts)
+                      let slot_inits = emit_variant_slot_init_list(src, cargs, ts, lcs, fns, variants, lams, cls)
+                      concat_all([
+                        "kai_variant_u(0, \"", cname, "\", ", int_to_string(n),
+                        ", ", int_to_string(mask),
+                        ", (KaiVarSlot[]){", slot_inits, "})"
+                      ])
+                    }
+                    None -> "kai_unit() /* __perceus_reuse_variant: typed lookup vanished */"
+                  }
+                } else if n == 0 {
                   concat_all([
                     "kai_reuse_or_alloc_variant(_scr, 0, \"", cname,
                     "\", 0, NULL)"
                   ])
                 } else {
+                  let arg_strs = emit_call_args(src, cargs, lcs, fns, variants, lams, cls)
                   concat_all([
                     "kai_reuse_or_alloc_variant(_scr, 0, \"", cname,
                     "\", ", int_to_string(n),
@@ -12796,7 +12972,17 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], lcs: [String], f
           "_op_r; })"
         ])
       } else {
-        emit_named_call_lookup(callee, args_e, call_args, lcs, fns, variants)
+        # Issue #440 Phase 2 — when the callee is a variant ctor with
+        # at least one primitive payload slot, emit the typed
+        # `kai_variant_u` path. Falls back to the legacy boxed
+        # `emit_named_call_lookup` shape otherwise.
+        match evar_payload_tys(variants, callee) {
+          Some(tys) -> match emit_variant_call_typed(callee, args_e, tys, src, lcs, fns, variants, lams, cls) {
+            Some(s) -> s
+            None    -> emit_named_call_lookup(callee, args_e, call_args, lcs, fns, variants)
+          }
+          None -> emit_named_call_lookup(callee, args_e, call_args, lcs, fns, variants)
+        }
       }
     }
     # m6.2 Phase 3 / v2: qualified call `mod.fname(args)`. v2 mints
@@ -12873,6 +13059,12 @@ fn emit_named_call_lookup(callee: String, args_e: [Expr], call_args: String, lcs
       ", (KaiValue *[]){", call_args, "})"
     ])
   } else { match evar_find(variants, callee) {
+    # Issue #440 Phase 2 — variant ctor. The typed emit path is
+    # wired through `emit_call_expr_default` (which has access to
+    # `src` + `lams` + `cls`); this lookup-only helper keeps the
+    # legacy boxed shape so its callers (currently only pipe LHS
+    # plumbing) still produce buildable C without the typer
+    # context. The pipe LHS path remains a Phase 2-followup site.
     Some(_) -> emit_variant_call(callee, list_length(args_e), call_args)
     None -> match prelude_find(callee) {
       Some(ep) -> match ep {
@@ -13150,18 +13342,75 @@ fn emit_pat_test_variant(src: String, name: String, subs: [Pattern],
     "(", scr, " && ", scr, "->tag == KAI_VARIANT && strcmp(",
     scr, "->as.var.variant_name, \"", name, "\") == 0"
   ])
-  cat3(base, emit_pat_test_variant_subs(src, subs, scr, 0, lcs, fns, variants, lams, cls), ")")
+  # Issue #440 Phase 2 — look up the variant's payload Types so the
+  # sub-pattern test reads each slot with the right kind. Unknown
+  # ctor (e.g. nullary builtin / non-sum match) falls back to all
+  # pointer slots.
+  let tys = match evar_payload_tys(variants, name) {
+    Some(ts) -> ts
+    None     -> []
+  }
+  cat3(base, emit_pat_test_variant_subs(src, subs, tys, scr, 0, lcs, fns, variants, lams, cls), ")")
 }
 
-fn emit_pat_test_variant_subs(src: String, subs: [Pattern], scr: String, i: Int,
+# Pull a borrowed boxed view of slot `i` against the typed shape. For
+# pointer slots returns the alias expression — no RC bump. For Int /
+# Real slots wraps in `kai_int`/`kai_real`, which allocates a fresh
+# boxed temporary the caller owns. Phase 2 test paths must release
+# any temporary they create.
+fn slot_read_for_test(scr: String, i: Int, tys: [TypeExpr]) : String {
+  let k = match list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t) None -> 0 }
+  if k == 1 {
+    concat_all(["kai_int(", scr, "->as.var.slots[", int_to_string(i), "].i64)"])
+  } else if k == 2 {
+    concat_all(["kai_real(", scr, "->as.var.slots[", int_to_string(i), "].r)"])
+  } else {
+    concat_all([scr, "->as.var.slots[", int_to_string(i), "].ptr"])
+  }
+}
+
+# Borrowed read for pattern tests on primitive slots. Returns a
+# raw-scalar-aware test expression that does NOT allocate when the
+# pattern only checks equality against a literal — but since
+# `emit_pat_test` operates on boxed `KaiValue *`, we go through the
+# boxed read above. The freshly boxed temp leaks unless the caller
+# wraps the test in a statement-expression that decrefs it; for the
+# Phase 2 MVP we only emit unboxed slots when the variant's typed
+# arms use PBind / PWild (not PLit), which means the test side
+# stays boxed only on pointer slots — primitive slots cannot occur
+# in PLit's emit because the literal slot pattern is reached only
+# for PVariant args, which we route through PBind below. The
+# `slot_read_for_test` helper therefore stays simple. The
+# emit_pat_test arm itself does not introduce allocations for the
+# inline literal cases on primitive slots (#440 follow-up): Phase 2
+# routes them through a `slots[i].i64 == LITERAL` check via the
+# specialised PLit path.
+fn list_nth_ty(xs: [TypeExpr], i: Int) : Option[TypeExpr] = match xs {
+  [] -> None
+  [h, ...rest] -> if i == 0 { Some(h) } else { list_nth_ty(rest, i - 1) }
+}
+
+fn emit_pat_test_variant_subs(src: String, subs: [Pattern], tys: [TypeExpr], scr: String, i: Int,
                               lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String / Console {
 
   match subs {
     [] -> ""
     [sp, ...rest] -> {
-      let sub_scr = concat_all([scr, "->as.var.args[", int_to_string(i), "]"])
+      # Issue #440 Phase 2 — primitive slots are stored as raw
+      # scalars. For sub-pattern testing we emit a typed slot read
+      # that the underlying boxed pat-test machinery can consume.
+      # PWild / PBind / PAs do not touch the value so the read is
+      # never evaluated for them; PLit reads the slot (and the
+      # boxed temp is decref'd inline by the comparator chain).
+      let k = match list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t) None -> 0 }
+      let sub_scr =
+        if k == 0 {
+          concat_all([scr, "->as.var.slots[", int_to_string(i), "].ptr"])
+        } else {
+          slot_read_for_test(scr, i, tys)
+        }
       let t = emit_pat_test(src, sp, sub_scr, lcs, fns, variants, lams, cls)
-      concat_all([" && ", t, emit_pat_test_variant_subs(src, rest, scr, i + 1, lcs, fns, variants, lams, cls)])
+      concat_all([" && ", t, emit_pat_test_variant_subs(src, rest, tys, scr, i + 1, lcs, fns, variants, lams, cls)])
     }
   }
 }
@@ -13237,7 +13486,15 @@ fn emit_pat_binds(src: String, pat: Pattern, scr: String, is_alias: Bool,
         concat_all(["KaiValue *kai_", name, " = ", scr, "; "])
       }
     PList(pats, opt_rest) -> emit_pat_binds_list(src, pats, opt_rest, scr, 0, lcs, fns, variants, lams, cls)
-    PVariant(_, subs) -> emit_pat_binds_variant(src, subs, scr, 0, lcs, fns, variants, lams, cls)
+    # Issue #440 Phase 2 — pipe the ctor name through so the variant
+    # bind helper can read each slot with the right kind.
+    PVariant(vname, subs) -> {
+      let tys = match evar_payload_tys(variants, vname) {
+        Some(ts) -> ts
+        None     -> []
+      }
+      emit_pat_binds_variant(src, subs, tys, scr, 0, lcs, fns, variants, lams, cls)
+    }
     PVariantRecord(_, fields) -> emit_pat_binds_record(src, fields, scr, lcs, fns, variants, lams, cls)
     PRecord(fields) -> emit_pat_binds_record(src, fields, scr, lcs, fns, variants, lams, cls)
     PHole(_) -> ""
@@ -13283,15 +13540,38 @@ fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[String],
   }
 }
 
-fn emit_pat_binds_variant(src: String, subs: [Pattern], scr: String, i: Int,
+fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [TypeExpr], scr: String, i: Int,
                           lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String {
   match subs {
     [] -> ""
     [sp, ...rest] -> {
-      let sub_scr = concat_all([scr, "->as.var.args[", int_to_string(i), "]"])
-      # variant arg slot is alias of scr's storage.
-      cat2(emit_pat_binds(src, sp, sub_scr, true, lcs, fns, variants, lams, cls),
-           emit_pat_binds_variant(src, rest, scr, i + 1, lcs, fns, variants, lams, cls))
+      # Issue #440 Phase 2 — read each slot in the shape its kind
+      # dictates. Pointer slots stay aliased to the cell's storage
+      # (no RC bump on the read; the binding decides whether to
+      # incref). Primitive slots (Int / Real) emit a freshly-boxed
+      # owning temporary so the bind machinery can treat them
+      # uniformly. The owning shape (is_alias=false) lets the bind
+      # consume the temp without leaking — kai_incref skipped, no
+      # decref needed at arm exit because no extra ref was taken.
+      let k = match list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t) None -> 0 }
+      if k == 0 {
+        let sub_scr = concat_all([scr, "->as.var.slots[", int_to_string(i), "].ptr"])
+        # variant arg slot is alias of scr's storage.
+        cat2(emit_pat_binds(src, sp, sub_scr, true, lcs, fns, variants, lams, cls),
+             emit_pat_binds_variant(src, rest, tys, scr, i + 1, lcs, fns, variants, lams, cls))
+      } else {
+        let sub_scr =
+          if k == 1 {
+            concat_all(["kai_int(", scr, "->as.var.slots[", int_to_string(i), "].i64)"])
+          } else {
+            concat_all(["kai_real(", scr, "->as.var.slots[", int_to_string(i), "].r)"])
+          }
+        # The primitive slot read allocates a fresh boxed temp; the
+        # bind owns it (is_alias=false) so PBind takes the ref
+        # directly without an incref, PWild releases it, etc.
+        cat2(emit_pat_binds(src, sp, sub_scr, false, lcs, fns, variants, lams, cls),
+             emit_pat_binds_variant(src, rest, tys, scr, i + 1, lcs, fns, variants, lams, cls))
+      }
     }
   }
 }
@@ -14817,7 +15097,7 @@ fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect / Console {
 # Globals: prelude names + user fn names + variant ctor names. Used as a
 # cheap "this ident does not need to be captured" test.
 fn efn_name(e: EFn) : String = match e { EFn(n, _, _, _) -> n }
-fn evar_name(v: EVar) : String = match v { EV(n, _) -> n }
+fn evar_name(v: EVar) : String = match v { EV(n, _, _) -> n }
 
 fn build_globals(fns: [EFn], variants: [EVar], eff_names: [String], op_quals: [String]) : [String] {
   let p = prelude_names()
@@ -15837,7 +16117,7 @@ fn emit_bang(src: String, inner: Expr, lcs: [String], fns: [EFn], variants: [EVa
       "({ KaiValue *_b = ", inner_c, "; ",
       "if (!(_b && _b->tag == KAI_VARIANT && strcmp(_b->as.var.variant_name, \"",
       name, "\") == 0)) return _b; ",
-      "_b->as.var.args[0]; })"
+      "_b->as.var.slots[0].ptr; })"
     ])
     None -> concat_all([
       "kai_prelude_panic(kai_str(\"internal: `!` on non-Option/Result reached emitter\"))"

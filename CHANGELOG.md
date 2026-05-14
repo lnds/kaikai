@@ -84,6 +84,18 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.59.0 (2026-05-14)
+
+### Added
+
+- **perceus**: variant payload unboxing — Int/Real slots inline (refs #440)
+- **runtime**: variant slot abstraction — groundwork for unboxing (refs #440)
+
+### Fixed
+
+- **perceus**: reuse-variant fallback to typed alloc when ctor unboxes (refs #440)
+- **runtime**: mint Exited/Signaled with typed Int slot (refs #440)
+
 ## v0.58.1 (2026-05-14)
 
 ### Fixed
