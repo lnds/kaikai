@@ -55814,6 +55814,13 @@ type Mode
   # prints "OK ..." on success or "FAIL ..." on mismatch. Exit 0 on
   # OK, 1 on FAIL. The mode ignores `path` and any preludes.
   | MCacheRoundtrip
+  # Issue #452 Phase A.0 step 3: emit a .kab cache blob for a single
+  # source file to stdout. Reads `path`, lexes, parses, strips
+  # prelude tests, stamps module_origin, serialises the resulting
+  # `[Decl]` against the source's sha256 (supplied by the caller).
+  # Used by bin/kai's cache MISS path; the driver redirects stdout
+  # to a temp file and atomically renames into the cache dir.
+  | MEmitPreludeCache
 
 # Build-time wrapper selection passed to the emitters. Collapses the
 # previous test_mode/bench_mode/check_mode Bool triple (audit proposal
@@ -55821,39 +55828,70 @@ type Mode
 # ordinary `main` path; the other three each emit a distinct wrapper.
 type BuildMode = BMBuild | BMTest | BMBench | BMCheck
 
+# Issue #452 Phase A.0 step 3: `prelude_caches` is parallel to
+# `preludes`. Each slot is either "" (no cache, force re-parse from
+# source) or a path to a .kab file produced by --emit-prelude-cache.
+# `--prelude <src>` appends "" to keep the arrays aligned;
+# `--prelude-cache <src> <cache>` appends <cache>. Length is always
+# equal to length of `preludes`.
+# `cache_sha` carries the optional sha256 hex (64 chars) used when
+# emitting a cache via --emit-prelude-cache; empty string means write
+# the all-zero placeholder.
 type CliOptions = { mode: Mode, path: Option[String], preludes: [String],
+                    prelude_caches: [String], cache_sha: String,
                     strict_holes: Bool, search_paths: [String],
                     include_prelude_tests: Bool }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
   CliOptions { mode: m, path: opts.path, preludes: opts.preludes,
+               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests }
 
 fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, path: Some(p), preludes: opts.preludes,
+               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests }
 
 fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path,
                preludes: list_append(opts.preludes, [p]),
+               prelude_caches: list_append(opts.prelude_caches, [""]),
+               cache_sha: opts.cache_sha,
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               include_prelude_tests: opts.include_prelude_tests }
+
+fn cli_with_prelude_cache(opts: CliOptions, src: String, cache: String) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path,
+               preludes: list_append(opts.preludes, [src]),
+               prelude_caches: list_append(opts.prelude_caches, [cache]),
+               cache_sha: opts.cache_sha,
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               include_prelude_tests: opts.include_prelude_tests }
+
+fn cli_with_cache_sha(opts: CliOptions, sha: String) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+               prelude_caches: opts.prelude_caches, cache_sha: sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests }
 
 fn cli_with_strict_holes(opts: CliOptions) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: true, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests }
 
 fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes,
                search_paths: list_append(opts.search_paths, [sp]),
                include_prelude_tests: opts.include_prelude_tests }
 
 fn cli_with_include_prelude_tests(opts: CliOptions) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: true }
 
@@ -55909,6 +55947,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MDiagsJson))
       } else if a == "--cache-roundtrip-test" {
         parse_cli_loop(more, cli_with_mode(opts, MCacheRoundtrip))
+      } else if a == "--emit-prelude-cache" {
+        parse_cli_loop(more, cli_with_mode(opts, MEmitPreludeCache))
       } else if a == "--test" {
         parse_cli_loop(more, cli_with_mode(opts, MTest))
       } else if a == "--bench" {
@@ -55937,6 +55977,28 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
             cli_with_mode(opts, MHelp)
           }
         }
+      } else if a == "--prelude-cache" {
+        # Two positional arguments: <source> <cache_file>. The source
+        # is the .kai file (used to derive module_origin and as
+        # fallback when the cache fails); the cache_file is the .kab
+        # blob produced by --emit-prelude-cache.
+        match more {
+          [src, cache, ...rest2] -> parse_cli_loop(rest2, cli_with_prelude_cache(opts, src, cache))
+          _ -> {
+            eprint("kaic2: --prelude-cache requires two arguments: <source.kai> <cache.kab>")
+            cli_with_mode(opts, MHelp)
+          }
+        }
+      } else if a == "--cache-sha" {
+        # 64-char hex sha256 written into the next emitted cache blob.
+        # Optional; defaults to all-zeros placeholder when omitted.
+        match more {
+          [s, ...rest2] -> parse_cli_loop(rest2, cli_with_cache_sha(opts, s))
+          [] -> {
+            eprint("kaic2: --cache-sha requires a 64-char hex argument")
+            cli_with_mode(opts, MHelp)
+          }
+        }
       } else if a == "--path" {
         match more {
           [p, ...rest2] -> parse_cli_loop(rest2, cli_push_search_path(opts, p))
@@ -55955,6 +56017,7 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
 fn parse_cli(argv: [String]) : CliOptions / Console {
 
   parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, preludes: [],
+                                    prelude_caches: [], cache_sha: "",
                                     strict_holes: false, search_paths: [],
                                     include_prelude_tests: false })
 }
@@ -56175,19 +56238,69 @@ type PreludeSegment = PSeg(String, [Decl])
 # Load every prelude file in `paths`, concatenating their decls in
 # argument order and accumulating one ModuleEntry per file. Returns
 # None if any single load fails. Empty list yields Some(PLS([], [])).
-fn load_preludes(paths: [String], include_tests: Bool, acc_decls: [Decl],
+#
+# Issue #452 Phase A.0 step 3: `caches` is parallel to `paths`. Each
+# slot holds a cache .kab file path, or "" to force a full parse.
+# A non-empty cache path is tried first; on header / payload
+# mismatch the loader falls back to re-parsing the source.
+fn load_preludes(paths: [String], caches: [String], include_tests: Bool, acc_decls: [Decl],
                    acc_mods: [ModuleEntry], acc_segs: [PreludeSegment])
                    : Option[PreludesLoaded] / Console + File = match paths {
   [] -> Some(PLS(acc_decls, acc_mods, acc_segs))
-  [p, ...rest] -> match load_prelude(p, include_tests) {
-    None -> None
-    Some(pl) -> match pl {
-      PL(ds, me) -> {
-        let mod_name = match me { ME(m, _, _) -> m }
-        load_preludes(rest, include_tests,
-                       list_append(acc_decls, ds),
-                       list_append(acc_mods, [me]),
-                       list_append(acc_segs, [PSeg(mod_name, ds)]))
+  [p, ...rest] -> match caches {
+    [] -> match load_prelude(p, include_tests) {
+      None -> None
+      Some(pl) -> match pl {
+        PL(ds, me) -> {
+          let mod_name = match me { ME(m, _, _) -> m }
+          load_preludes(rest, [], include_tests,
+                         list_append(acc_decls, ds),
+                         list_append(acc_mods, [me]),
+                         list_append(acc_segs, [PSeg(mod_name, ds)]))
+        }
+      }
+    }
+    [c, ...rest_caches] -> match load_prelude_cached(p, c, include_tests) {
+      None -> None
+      Some(pl) -> match pl {
+        PL(ds, me) -> {
+          let mod_name = match me { ME(m, _, _) -> m }
+          load_preludes(rest, rest_caches, include_tests,
+                         list_append(acc_decls, ds),
+                         list_append(acc_mods, [me]),
+                         list_append(acc_segs, [PSeg(mod_name, ds)]))
+        }
+      }
+    }
+  }
+}
+
+# Issue #452 Phase A.0 step 3: try the cache file `cache_path` first;
+# on any failure (empty path, missing file, header mismatch,
+# truncated payload) fall back to the full parse via `load_prelude`.
+# The cache stores already-tagged decls with prelude tests stripped,
+# so reconstructing the `ModuleEntry` only needs `prelude_module_name`
+# + `collect_pub_exports` over the deserialised decls.
+fn load_prelude_cached(source_path: String, cache_path: String, include_tests: Bool)
+                       : Option[PreludeLoaded] / Console + File = {
+  if cache_path == "" {
+    load_prelude(source_path, include_tests)
+  } else {
+    match read_file(cache_path) {
+      Err(_) -> load_prelude(source_path, include_tests)
+      Ok(blob) -> match cache_deserialize_module(blob) {
+        None -> {
+          eprint("kaic2: cache miss (header/payload mismatch): #{cache_path} — re-parsing #{source_path}")
+          load_prelude(source_path, include_tests)
+        }
+        Some(cds) -> match cds {
+          CDs(decls, _) -> {
+            let mod_name = prelude_module_name(source_path)
+            let kept = if include_tests { decls } else { strip_prelude_tests(decls, []) }
+            let exports = collect_pub_exports(kept, [])
+            Some(PL(kept, ME(mod_name, exports, source_path)))
+          }
+        }
       }
     }
   }
@@ -58927,6 +59040,13 @@ fn run(opts: CliOptions) : Int / Console + File {
         _         -> 1
       }
     }
+    MEmitPreludeCache -> match opts.path {
+      None -> {
+        eprint("kaic2: --emit-prelude-cache requires a source .kai file")
+        2
+      }
+      Some(p) -> emit_prelude_cache_for(p, opts.include_prelude_tests, opts.cache_sha)
+    }
     _ -> match opts.path {
       None -> { usage(); 2 }
       Some(p) -> {
@@ -58936,7 +59056,7 @@ fn run(opts: CliOptions) : Int / Console + File {
         # and concatenate the loaded decls in argument order. Names
         # in later preludes shadow earlier ones (intentional —
         # callers pass `--prelude` in dependency order).
-        let prelude_loaded = load_preludes(opts.preludes, opts.include_prelude_tests, [], [], [])
+        let prelude_loaded = load_preludes(opts.preludes, opts.prelude_caches, opts.include_prelude_tests, [], [], [])
         match prelude_loaded {
           None -> 1
           Some(pls) -> match pls {
@@ -62303,6 +62423,42 @@ fn cache_roundtrip_self_test() : String {
                       int_to_string(string_length(blob1)), " hex chars"])
         } else {
           "FAIL: blob content differs"
+        }
+      }
+    }
+  }
+}
+
+# Issue #452 Phase A.0 step 3: lex+parse a single prelude source,
+# strip its tests, tag every DFn with module_origin, then emit the
+# KAB1 cache blob to stdout. The driver (bin/kai) captures stdout,
+# writes it to a `.tmp` file, fsyncs, and renames atomically into the
+# cache directory. `sha_arg` is the 64-char hex sha256 of the source
+# (caller-supplied); empty string emits the all-zero placeholder.
+fn emit_prelude_cache_for(source_path: String, include_tests: Bool, sha_arg: String) : Int / Console + File {
+  match read_file(source_path) {
+    Err(msg) -> { eprint("kaic2: #{source_path}: #{msg}"); 1 }
+    Ok(src) -> {
+      let tokens = tokenize(src)
+      let errs = report_errors(source_path, src, tokens)
+      if errs != 0 { 1 }
+      else {
+        let parsed = parse_program(source_path, src, tokens)
+        match parsed.decls {
+          None -> 1
+          Some(ds) -> {
+            let mod_name = prelude_module_name(source_path)
+            let kept = if include_tests { ds } else { strip_prelude_tests(ds, []) }
+            let tagged = tag_decls_module_origin(kept, mod_name)
+            let sha = if sha_arg == "" {
+              "0000000000000000000000000000000000000000000000000000000000000000"
+            } else if string_length(sha_arg) != 64 {
+              "0000000000000000000000000000000000000000000000000000000000000000"
+            } else { sha_arg }
+            let blob = cache_serialize_module(tagged, sha)
+            print(blob)
+            0
+          }
         }
       }
     }
