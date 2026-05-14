@@ -36689,27 +36689,80 @@ fn typecheck_module(file: String, mod: ModuleDecls,
   TypecheckedModule { typed: typed, delta: delta }
 }
 
-# Fold `typecheck_module` over a list of per-module decl streams.
-# Scope A v1: collapses the list back into a single segment so the
-# monolithic typer sees the same input it did pre-refactor; the
-# fold dynamics live in this function and become non-trivial in a
-# future sub-step that partitions all_decls by module_origin.
+# Issue #574 — fold `typecheck_module` left-to-right across the
+# per-module decl streams, threading the accumulating
+# `ModuleEnvDelta` as `inherited` for each segment. The fold is
+# trivial when `modules` has a single segment (the path every legacy
+# caller still uses): one iteration, `inherited = empty_delta`,
+# identical to the pre-#574 flatten-and-call shape. Multi-segment
+# callers (the Phase A.1 cache loader, prelude/user split) drive
+# real fold dynamics — see `typecheck_program_loop`.
 fn typecheck_program(file: String, modules: [ModuleDecls],
                       proto_impls: [ProtoImplReg],
                       verbose: Bool) : TypedProgram / Console + File {
 
 
-  let flat = flatten_module_decls(modules, [])
-  let mod_all = ModuleDecls { name: None, decls: flat }
-  let r = typecheck_module(file, mod_all, module_env_delta_empty(),
-                            proto_impls, verbose)
-  r.typed
+  typecheck_program_loop(file, modules, module_env_delta_empty(),
+                          proto_impls, verbose,
+                          [], 0, [], [], [], [], 0)
 }
 
-fn flatten_module_decls(modules: [ModuleDecls], acc: [Decl]) : [Decl] {
+# Tail-recursive fold accumulator. Each iteration typechecks one
+# `ModuleDecls` against the running delta, merges the produced delta
+# into the accumulator, and appends the typed module's pieces to
+# `acc_*`. `prelude_len_acc` keeps the first non-zero `prelude_len`
+# returned by any module — under scope A v1 every call shares the
+# same built-in seed length, so the value is identical regardless of
+# which module reports it. The reverse step at the terminal restores
+# document order on the accumulated lists.
+fn typecheck_program_loop(file: String, modules: [ModuleDecls],
+                            acc_delta: ModuleEnvDelta,
+                            proto_impls: [ProtoImplReg],
+                            verbose: Bool,
+                            acc_decls: [Decl],
+                            acc_errs: Int,
+                            acc_insts: [ResolvedCS],
+                            acc_holes: [ResolvedHole],
+                            acc_row_holes: [ResolvedRowHole],
+                            acc_diags: [Diagnostic],
+                            prelude_len_acc: Int) : TypedProgram / Console + File {
+
   match modules {
+    [] -> TypedProgram {
+      decls: list_reverse(acc_decls), errs: acc_errs,
+      insts: list_reverse(acc_insts), holes: list_reverse(acc_holes),
+      row_holes: list_reverse(acc_row_holes),
+      prelude_len: prelude_len_acc,
+      diags: list_reverse(acc_diags)
+    }
+    [m, ...rest] -> {
+      let r = typecheck_module(file, m, acc_delta, proto_impls, verbose)
+      let next_delta = merge_env_deltas(acc_delta, r.delta)
+      let next_prelude_len = match prelude_len_acc {
+        0 -> r.typed.prelude_len
+        _ -> prelude_len_acc
+      }
+      typecheck_program_loop(file, rest, next_delta, proto_impls, verbose,
+                              prepend_reverse_decls(r.typed.decls, acc_decls),
+                              acc_errs + r.typed.errs,
+                              llvm_prepend_reverse(r.typed.insts, acc_insts),
+                              prepend_reverse_holes(r.typed.holes, acc_holes),
+                              prepend_reverse_row_holes(r.typed.row_holes,
+                                                         acc_row_holes),
+                              prepend_reverse_diags(r.typed.diags, acc_diags),
+                              next_prelude_len)
+    }
+  }
+}
+
+# Issue #574 — prepend `xs` onto `acc` reversed; the final
+# `list_reverse(acc)` at terminal restores source order. Mirrors the
+# pattern used by `prepend_reverse_holes` / `llvm_prepend_reverse`
+# inside `infer_all_loop`.
+fn prepend_reverse_decls(xs: [Decl], acc: [Decl]) : [Decl] {
+  match xs {
     [] -> acc
-    [m, ...rest] -> flatten_module_decls(rest, list_append(acc, m.decls))
+    [x, ...rest] -> prepend_reverse_decls(rest, [x, ...acc])
   }
 }
 
