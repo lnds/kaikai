@@ -16,59 +16,98 @@ Move kaikai from "re-parse stdlib + user code on every `kai build`"
 every build, re-parse only what changed" (target: ≤ 300 ms cold,
 ≤ 150 ms incremental — DoD #6).
 
-## Empirical breakdown (2026-05-11, M2 Pro, arm64)
+## Empirical breakdown (2026-05-13, M2 Pro, arm64)
 
-Phase-by-phase wall of `bin/kai build empty.kai` after #458, n=5
-runs each, median reported. Re-measured 2026-05-11 because the
-prior "1.3 s is re-parsing" claim in #452 was imprecise. See
-`tools/bench-phases.sh` for the harness.
+Phase-by-phase wall of `bin/kai build empty.kai`, n=5 runs each,
+median reported. See `tools/bench-phases.sh` (run with `-r` for RSS).
+Anchor: post-#572 (self-import) + #573 (LLVM lambda lift) + 32
+preludes auto-loaded by `bin/kai`. Re-measured 2026-05-13 because
+the prior 2026-05-11 baseline (1.47 s wall) predates the recent
+prelude growth (decimal, money, fx, uuid, regexp, path, crypto/*)
+and the per-prelude lex+parse work scales linearly with file count.
 
-| Stage | Cumulative wall | Delta | Share |
-|---|---|---|---|
-| `--tokens` (lex preludes) | 0.24 s | 0.24 s | 16% |
-| `--ast` (parse preludes) | 0.34 s | 0.10 s | 7% |
-| `--infer` (typecheck stdlib+main) | 0.77 s | 0.43 s | 29% |
-| default (emit C) | 1.21 s | 0.44 s | 30% |
-| `kai build` total (kaic2 + cc + shell) | 1.47 s | 0.26 s | 18% |
+| Stage | Cumulative wall | Delta | RSS peak | Share |
+|---|---|---|---|---|
+| `--tokens` (lex preludes) | 0.33 s | 0.33 s |  73 MB | 12% |
+| `--ast` (parse preludes) | 0.54 s | 0.21 s | 151 MB |  7% |
+| `--check` (typecheck) | 1.18 s | 0.64 s | 196 MB | 23% |
+| `--infer` (typecheck) | 1.31 s | 0.13 s | 196 MB |  5% |
+| default (emit C) | 2.06 s | 0.75 s | 306 MB | 26% |
+| `kai build` total (kaic2 + cc + shell, median 5 runs) | 2.79 s | 0.73 s | ~478 MB | 26% |
 
 ### What the breakdown means
 
-A second control experiment (2026-05-11): `kaic2` over `empty.kai`
-with **no preludes loaded at all** runs in ~3 ms. The full pipeline
+A second control (2026-05-13): `kaic2` over `empty.kai` with **no
+preludes loaded at all** runs in ~3 ms. The full pipeline
 (parse → cascade → typecheck → monomorph → lower_protocols →
 perceus → emit) on a 1-line user file is essentially free. The
-1.19 s of `kaic2` wall today is **100% prelude processing** at every
+2.06 s of `kaic2` wall today is **100% prelude processing** at every
 pipeline stage, not just lex+parse.
 
-That changes what each cache layer must skip to be effective:
+That changes what each cache layer must skip to be effective. Walls
+below are projected savings on the 2.79 s 2026-05-13 baseline:
 
 - **A.0 (cache `[Decl]` post-parse)** — skips lex+parse of preludes
-  only. Saves ~0.23 s on the 1.47 s baseline. Wall → ~1.24 s.
-  Mechanism: the 15+ pre-typer passes + the typer + codegen all
-  still run on the merged prelude++user `[Decl]`.
+  only. Saves ~0.54 s. Wall → ~2.25 s. Mechanism: the 15+ pre-typer
+  passes + the typer + codegen all still run on the merged
+  prelude++user `[Decl]`.
 - **A.1 (cache typed `[Decl]` + per-module env deltas)** — skips
-  the pre-typer cascade and the typer. Saves ~0.66 s. Wall → ~0.82 s.
-  Mechanism: requires a typer-modularisation refactor so the prelude
-  contributes a serialisable env delta (recs, sums, op_eff_arities,
-  type_aliases, op_to_eff, proto_impls, plus the TyEnv slice).
+  the pre-typer cascade and the typer on the prelude. Saves an
+  additional ~0.77 s (parse+typecheck → from cache). Wall → ~1.48 s.
+  Mechanism: requires the typer-modularisation refactor's
+  **semantic step**, not just its API. See "What #460 did and did
+  not deliver" below.
 - **A.2 (cache through perceus + dead-code-emit on prelude)** —
   skips lower_protocols, perceus, and emit on prelude DFns that the
-  user does not reach. Saves the remaining ~0.41 s. Wall → ~0.30 s.
+  user does not reach. Saves the remaining ~0.75 s. Wall → ~0.73 s.
   Mechanism: emit walks only the user's reachability closure into
   the prelude; un-reached prelude DFns are skipped at emit. This
   reuses the dead-code elimination the compiler already performs
   (verified: `kaic2` over empty.kai with the full stdlib in scope
-  emits 235 lines of out.c with 39 kai_* symbols, none of them
+  emits ~235 lines of out.c with ~39 kai_* symbols, none of them
   prelude map/filter/fold). Today emit *walks* every prelude DFn
   even though it skips the unreached ones; A.2 caches the walked-and-
   decided state.
 
 **Reaching DoD #6 (≤ 300 ms) requires A.0 + A.1 + A.2 cumulatively,
-plus shell + cc fixed overhead (~0.26 s).** Each layer is
-independently shippable; each layer is independently useful. A.0
-is what an in-language `derive(Serialize)`-style approach gets you;
-A.1 needs the typer refactor; A.2 needs A.1 plus an emit pass that
-takes a cache as input.
+plus closing the ~0.73 s shell + cc + remaining shared overhead.**
+The shell+cc tail is its own engineering surface (a compilation
+daemon or direct LLVM emission); no cache layer touches it. Each
+A.x layer is independently shippable and independently useful, but
+none of them on its own reaches DoD #6.
+
+### What #460 did and did not deliver
+
+PR #568 (issue #460, merged 2026-05-14) introduced `ModuleEnvDelta`,
+`typecheck_module(file, mod, inherited, proto_impls, verbose)`, and
+`typecheck_program(file, modules, proto_impls, verbose)` in
+`stage2/compiler.kai`. That landed the **API surface** the A.1
+payload needs.
+
+What it deliberately deferred (marked "sub-step 3d-future" in the
+source comments at `stage2/compiler.kai:36649`):
+
+- `typecheck_program` still flattens `modules` to a single segment
+  via `flatten_module_decls` and runs `typecheck_module` once on
+  the concatenation, so the byte-identical selfhost baseline holds.
+- `typecheck_module` ignores its `inherited: ModuleEnvDelta`
+  parameter. `collect_program_data` rebuilds the env from scratch
+  over the full decl list every call. Composing deltas across
+  modules requires re-threading `build_ty_env`, the alias
+  resolver, `collect_records`, `collect_sums`, `collect_op_to_eff`
+  and the seven pre-typer passes that today run globally.
+
+The A.1 cache lane therefore cannot just "deserialise a delta and
+slot it into `inherited`" — there is no consumer for it yet. The
+sub-step 3d-future is the load-bearing piece, and at the cost
+estimate quoted in #460 (2 500–4 000 LOC, selfhost-byte-identical
+non-trivial), it is a lane of its own scale comparable to #568.
+
+The Phase A.1 cache lane is therefore **two lanes**: one that
+delivers the semantic per-module typecheck (consumes `inherited`),
+and one that serialises + ships the cache itself. They can land
+in either order; the cache lane is safer to ship second because the
+semantic refactor will likely change the delta's shape.
 
 ## Two layers, one rule
 
@@ -345,35 +384,60 @@ old caches die, users rebuild once. Move on.
 ## Acceptance per phase
 
 Numbers below are expected walls after each layer ships, on a
-2026-05-11 M2 Pro baseline of 1.47 s for `kai build empty.kai`.
-Tier 0 + Tier 1 + Tier 1-ASAN green and selfhost byte-identical
-are gates for every sub-phase.
+2026-05-13 M2 Pro baseline of 2.79 s for `kai build empty.kai`
+(32 preludes, post-#572/#573). Tier 0 + Tier 1 + Tier 1-ASAN green
+and selfhost byte-identical are gates for every sub-phase.
 
 ### Phase A.0 — post-parse cache
 
-- Warm wall: ≤ 1.25 s (cache-hit on all 29 preludes).
-- Saves: 0.23 s lex+parse.
+- Warm wall: ≤ 2.25 s (cache-hit on all 32 preludes).
+- Saves: 0.54 s lex+parse.
 - Cache invalidates on: source sha change, kaikai_version_hash
   change, header corruption (magic / checksum / version
   mismatch). Four negative fixtures verify.
 - Atomic write: temp + fsync + rename.
-- **Pre-blocker:** the kaikai-native serialisation primitive
-  (`Serialize` protocol or successor) needs cursor semantics +
-  derive support before the A.0 lane can ship. See "Serialisation
-  primitive" above.
+- **Pre-blocker landed (#471):** the kaikai-native `BinSerialize`
+  protocol with cursor semantics (`from_bytes(buf, pos)`) plus
+  `#derive(BinSerialize)` for records and sums (including
+  `[T]` / `Option[T]` collection payloads). Annotating the AST
+  variants (Decl / Expr / ExprKind / Pattern / PatKind / TypeExpr /
+  TyKind / RowExpr / Stmt / Param / Variant / FieldDecl /
+  TypeBody / ImportKind / HClause / HReturn / UnitExprT plus
+  ~10 record wrappers) remains, plus a serialiser per AST node and
+  a deserialiser that reconstructs the same tree. The handwritten
+  combinator surface is ~1500–2500 LOC depending on whether
+  `#derive(BinSerialize)` covers every variant or some get
+  hand-rolled impls (parametric Result is currently not derived;
+  the dispatcher's whitelist is `binser_collection_head = List or
+  Option`).
 
 ### Phase A.1 — post-typecheck cache
 
-- Warm wall: ≤ 0.85 s.
-- Saves: an additional 0.43 s (typecheck + cascade on prelude).
-- Pre-blocker: typer modularisation (separate issue).
-- Builds on A.0 wire-up; payload schema variant byte changes.
+- Warm wall: ≤ 1.48 s.
+- Saves: an additional ~0.77 s (typecheck + cascade on prelude).
+- **Pre-blockers:**
+  - **#574** — typer per-module semantics (sub-step 3d-future of
+    #460). API landed in #568; `inherited: ModuleEnvDelta` is
+    today an unread parameter. Re-threading `build_ty_env`, the
+    alias resolver, and the record/sum/op-to-eff collectors per
+    module; 2 500–4 000 LOC, selfhost-byte-identical risk
+    non-trivial.
+  - The A.1 payload extends the A.0 payload with the
+    `ModuleEnvDelta` struct (`ty_entries`, `unions`,
+    `op_eff_arities`, `recs`, `sums`, `op_to_eff`,
+    `unit_aliases`). The semantic refactor will likely also
+    introduce alias-resolution / proto-impl-table deltas, which
+    the format needs to carry — payload schema cannot be frozen
+    until the refactor lands.
+- Builds on A.0 wire-up; payload schema variant byte changes
+  (0x00 → 0x01).
 
 ### Phase A.2 — post-perceus + emit-only-user
 
-- Warm wall: ≤ 0.45 s. The remaining ~0.30 s is fixed cc + shell
-  overhead.
-- Saves: the 0.41 s of codegen passes (lower_protocols + perceus +
+- Warm wall: ≤ 0.73 s. The remaining ~0.43 s is shell + cc + the
+  pieces of emit that scale with the user file rather than the
+  prelude.
+- Saves: the ~0.75 s of codegen passes (lower_protocols + perceus +
   emit walking) on the prelude.
 - Pre-blocker: A.1.
 - Mechanism: emit takes the cached prelude as input + the user's
@@ -381,8 +445,8 @@ are gates for every sub-phase.
 
 ### DoD #6 (≤ 300 ms)
 
-A.0 + A.1 + A.2 cumulatively reach ~0.45 s wall. Closing the
-remaining gap to 300 ms requires either:
+A.0 + A.1 + A.2 cumulatively reach ~0.73 s wall on the current
+baseline. Closing the remaining gap to 300 ms requires either:
 
 - A compilation daemon (Phase C) that amortises the fixed cc + shell
   overhead over a long-running process; or
@@ -394,10 +458,30 @@ is therefore the **endpoint** of the Phase A roadmap, not a
 single-lane gate. The lane that closes the final gap can be Phase C
 or LLVM-direct; either choice belongs in its own design doc.
 
+### Variants that look attractive but do not pay off
+
+- **Token cache.** Cacheing `[Token]` post-lex skips the ~0.33 s of
+  lex. But `Token` carries `start: Int, length: Int` into the source
+  buffer; the parser still needs the source bytes in memory and the
+  deserialiser pays a per-token decode + allocation cost
+  proportional to the token count (~35K tokens across 32 preludes).
+  On a clean re-bench (2026-05-13) the cache load was within ~50 ms
+  of the cost it replaced, with no slack to overcome cache-key
+  hashing + file IO. The A.0 boundary (`[Decl]`) is the smallest
+  payload that delivers a net win, because the parse pass is the
+  one that turns `O(source-bytes)` work into `O(decl-count)` work.
+
 ## Related
 
-- #452 — Phase A stdlib cache.
+- #452 — Phase A stdlib cache (epic; A.0 / A.1 / A.2 sub-lanes).
 - #455 — Phase B user-file incremental cache.
+- #459 — `BinSerialize` protocol with cursor + `#derive` (closed
+  by #471; the kaikai-native serde primitive A.0/A.1 consume).
+- #460 — typer modularisation API (closed by #568; API only —
+  semantics deferred to #574).
+- #461 — Phase A.2 — post-perceus cache + emit-only-user.
+- #574 — typer per-module semantics (sub-step 3d-future of #460;
+  A.1 pre-blocker).
 - #454 — Compiler library mode (defines the TypedModule that gets
   serialised).
 - #447 — LSP v1 (consumes #454's query surface; benefits from this
