@@ -121,6 +121,20 @@ typedef struct KaiValue KaiValue;
 /* Dynamic-dispatch signature used for closures and higher-order calls. */
 typedef KaiValue *(*KaiFn)(KaiValue *self, KaiValue **args, int n_args);
 
+/* Issue #440 — variant payload slot. One machine word. Mask bits in
+ * `as.var.slot_mask` discriminate per-slot kind; see the `var`
+ * substructure below for the encoding. Binary-compatible with
+ * `KaiValue *` so legacy pointer-only callers (stage 0/1 emit,
+ * immortal-variant cache hash/match, reuse-in-place memcmp) keep
+ * working unchanged when mask=0. */
+typedef union {
+    KaiValue *ptr;
+    int64_t   i64;
+    double    r;
+    uint32_t  c;
+    int8_t    b;
+} KaiVarSlot;
+
 struct KaiValue {
     int32_t rc;
     int32_t tag;
@@ -159,7 +173,26 @@ struct KaiValue {
             int32_t     variant_tag;                /* index into the sum type */
             const char *variant_name;               /* static string */
             int32_t     n_args;
-            KaiValue  **args;
+            /* Issue #440 — variant slot abstraction. Each slot is one
+             * machine word (8 bytes on 64-bit). When `slot_mask` is 0
+             * (legacy and current default), every slot stores a
+             * `KaiValue *` and the runtime walks them as boxed
+             * children. Phase 2 of #440 will encode primitive
+             * (Int/Bool/Char/Real) payloads inline via 2-bit kinds in
+             * `slot_mask` — bits 2i..2i+1 give the kind of slot i:
+             *   0 = pointer (KaiValue *)
+             *   1 = Int     (int64_t,  read via .i64)
+             *   2 = Bool    (int8_t,   read via .b)
+             *   3 = Real    (double,   read via .r)
+             * Variants with >16 slots fall back to mask=0.
+             * For Phase 1 (this lane) every constructor still emits
+             * mask=0 and slot.ptr is read identically to the old
+             * `args[i]`. KaiVarSlot is binary-compatible with
+             * `KaiValue *` so cache hashing, immortal-variant lookup
+             * and Perceus reuse continue to compare pointer-by-pointer
+             * unchanged. */
+            uint32_t    slot_mask;
+            KaiVarSlot *slots;
         } var;
         struct {
             KaiFn       fn;
@@ -1631,8 +1664,13 @@ static void kai_free_value(KaiValue *v) {
             break;
         case KAI_VARIANT:
             KAI_VAR_NAME_FREE(v->as.var.variant_name);
-            for (int i = 0; i < v->as.var.n_args; ++i) kai_decref(v->as.var.args[i]);
-            free(v->as.var.args);
+            /* Issue #440 — only pointer slots cascade through decref.
+             * In Phase 1 every slot is a pointer (mask=0), so the
+             * walk degenerates to the pre-#440 behaviour. Phase 2 will
+             * branch on `(slot_mask >> (2*i)) & 3` and skip primitive
+             * slots. */
+            for (int i = 0; i < v->as.var.n_args; ++i) kai_decref(v->as.var.slots[i].ptr);
+            free(v->as.var.slots);
             break;
         case KAI_CLOSURE:
             for (int i = 0; i < v->as.clo.n_captures; ++i) kai_decref(v->as.clo.captures[i]);
@@ -2150,7 +2188,8 @@ static KAI_RC_NOINLINE KaiValue *kai_variant(int32_t tag, const char *name, int 
         v->as.var.variant_tag = tag;
         v->as.var.variant_name = name;
         v->as.var.n_args = 0;
-        v->as.var.args = NULL;
+        v->as.var.slot_mask = 0;
+        v->as.var.slots = NULL;
         v->rc = INT32_MAX;
         kai_nullary_install(tag, name, v);
         return v;
@@ -2163,8 +2202,9 @@ static KAI_RC_NOINLINE KaiValue *kai_variant(int32_t tag, const char *name, int 
         v->as.var.variant_tag = tag;
         v->as.var.variant_name = name;
         v->as.var.n_args = n;
-        v->as.var.args = (KaiValue **) malloc(n * sizeof(KaiValue *));
-        for (int i = 0; i < n; ++i) v->as.var.args[i] = args[i];
+        v->as.var.slot_mask = 0;
+        v->as.var.slots = (KaiVarSlot *) malloc(n * sizeof(KaiVarSlot));
+        for (int i = 0; i < n; ++i) v->as.var.slots[i].ptr = args[i];
         v->rc = INT32_MAX;
         kai_immortal_var_install(tag, name, n, args, v);
         return v;
@@ -2174,11 +2214,12 @@ static KAI_RC_NOINLINE KaiValue *kai_variant(int32_t tag, const char *name, int 
     v->as.var.variant_tag = tag;
     v->as.var.variant_name = name;
     v->as.var.n_args = n;
+    v->as.var.slot_mask = 0;
     if (n > 0) {
-        v->as.var.args = (KaiValue **) malloc(n * sizeof(KaiValue *));
-        for (int i = 0; i < n; ++i) v->as.var.args[i] = args[i];
+        v->as.var.slots = (KaiVarSlot *) malloc(n * sizeof(KaiVarSlot));
+        for (int i = 0; i < n; ++i) v->as.var.slots[i].ptr = args[i];
     } else {
-        v->as.var.args = NULL;
+        v->as.var.slots = NULL;
     }
     return v;
 }
@@ -2263,12 +2304,17 @@ static KaiValue *kai_reuse_or_alloc_variant(KaiValue *_scr,
                                             int n, KaiValue **args) {
     if (_scr != NULL && _scr->tag == KAI_VARIANT &&
         _scr->as.var.n_args == n && kai_check_unique(_scr)) {
+        /* Phase 1: reuse only legal on mask==0 (all-pointer) cells.
+         * Phase 2 will widen this once primitive slots can appear in
+         * the source layout; for now the recogniser only fires on
+         * legacy cells. */
         for (int i = 0; i < n; ++i) {
-            kai_decref(_scr->as.var.args[i]);
-            _scr->as.var.args[i] = args[i];
+            kai_decref(_scr->as.var.slots[i].ptr);
+            _scr->as.var.slots[i].ptr = args[i];
         }
         _scr->as.var.variant_tag  = tag;
         _scr->as.var.variant_name = name;
+        _scr->as.var.slot_mask    = 0;
         kai_rc_reuse_total++;
         return kai_incref(_scr);
     }
@@ -2438,8 +2484,11 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
         case KAI_VARIANT:
             if (a->as.var.variant_tag != b->as.var.variant_tag) return 0;
             if (a->as.var.n_args != b->as.var.n_args) return 0;
+            /* Phase 1: mask is always 0 on both sides → compare slots
+             * as pointers exactly as before. Phase 2 will dispatch on
+             * the per-slot kind. */
             for (int i = 0; i < a->as.var.n_args; ++i) {
-                if (!kai_op_eq(a->as.var.args[i], b->as.var.args[i])) return 0;
+                if (!kai_op_eq(a->as.var.slots[i].ptr, b->as.var.slots[i].ptr)) return 0;
             }
             return 1;
         case KAI_RECORD:
@@ -2503,9 +2552,11 @@ static KaiValue *kai_to_string(KaiValue *v) {
             KaiValue *acc = kai_str(v->as.var.variant_name);
             if (v->as.var.n_args > 0) {
                 KaiValue *lp = kai_string_concat(acc, kai_str("(")); kai_decref(acc); acc = lp;
+                /* Phase 1: every slot is a pointer (mask=0) so the
+                 * boxed kai_to_string call works unchanged. */
                 for (int i = 0; i < v->as.var.n_args; ++i) {
                     if (i) { KaiValue *sep = kai_string_concat(acc, kai_str(", ")); kai_decref(acc); acc = sep; }
-                    KaiValue *s = kai_to_string(v->as.var.args[i]);
+                    KaiValue *s = kai_to_string(v->as.var.slots[i].ptr);
                     KaiValue *c = kai_string_concat(acc, s); kai_decref(acc); kai_decref(s); acc = c;
                 }
                 KaiValue *rp = kai_string_concat(acc, kai_str(")")); kai_decref(acc); acc = rp;

@@ -200,7 +200,9 @@ int kaix_is_variant(KaiValue *v, const char *name) {
    the C backend passes variant args as borrowed references, but the
    LLVM path keeps ownership uniform. */
 KaiValue *kaix_variant_arg(KaiValue *v, int i) {
-    return kai_incref(v->as.var.args[i]);
+    /* Issue #440 — variant slot. Phase 1: every slot is a pointer
+     * (mask=0), so `.ptr` is identical to the pre-#440 `args[i]`. */
+    return kai_incref(v->as.var.slots[i].ptr);
 }
 
 /* kai_op_eq returns an int; wrap for direct use from the IR in match
