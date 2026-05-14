@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.56.6 (2026-05-14)
+
+### Changed
+
+- **typer**: collect_program_data seeds working tables from inherited delta (refs #574)
+- **typer**: typecheck_program folds typecheck_module per segment (refs #574)
+
 ## v0.56.5 (2026-05-14)
 
 ### Fixed
