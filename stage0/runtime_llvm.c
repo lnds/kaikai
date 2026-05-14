@@ -582,6 +582,21 @@ KaiValue *kaix_default_cancel_raise(void *self, KaiCont *k) {
     return kai_default_cancel_raise(self, k);
 }
 
+/* Issue #587 — LLVM-visible wrappers around the static Link / Monitor
+ * default handlers in runtime.h. Same gap as #570 (Spawn) and #582
+ * (Cancel): without these the LLVM `kaix_evidence_lookup_handler`
+ * returned NULL for Link/Monitor and any fiber body that called
+ * `Link.link(_)` or `Monitor.monitor(_)` segfaulted on the first op. */
+KaiValue *kaix_default_link_link(void *self, KaiValue *peer, KaiCont *k) {
+    return kai_default_link_link(self, peer, k);
+}
+KaiValue *kaix_default_monitor_monitor(void *self, KaiValue *target, KaiCont *k) {
+    return kai_default_monitor_monitor(self, target, k);
+}
+KaiValue *kaix_default_monitor_demonitor(void *self, KaiValue *ref, KaiCont *k) {
+    return kai_default_monitor_demonitor(self, ref, k);
+}
+
 /* m7c-d — install/teardown default handlers for builtins that
  * appear in main's row. The LLVM emitter generates the body of
  * these two functions per program (filling in the right
