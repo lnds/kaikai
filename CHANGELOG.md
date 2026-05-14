@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.57.0 (2026-05-14)
+
+### Added
+
+- **cache**: KAB1 header + low-level hex byte-buffer helpers (refs #452)
+
+### Fixed
+
+- **cache**: rename CacheReadLine ctor RL → CRL to avoid RowLabel collision (refs #452)
+
 ## v0.56.6 (2026-05-14)
 
 ### Changed
