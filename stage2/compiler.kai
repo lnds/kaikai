@@ -36500,6 +36500,64 @@ fn expand_aliases_hreturn(r: HReturn, aliases: [UAliasEntry]) : HReturn {
   }
 }
 
+# Issue #460 — Per-module typer env deltas.
+#
+# `ModuleEnvDelta` is the diff a single module contributes to the
+# typer env. It is the load-bearing data type for the Phase A.1
+# stdlib cache (#452): the prelude's delta gets serialised; cold
+# starts re-apply it on top of the freshly-built built-in seed.
+#
+# Diff (not full env) so the cache stays independent of the
+# built-in env baked into the compiler. `add_prelude_sigs` +
+# `add_builtin_variant_sigs` re-run every invocation; only the
+# user-visible decls live in the delta.
+#
+# Scope A (this lane): ty_entries, unions, op_eff_arities, recs,
+# sums, op_to_eff, unit_aliases. Effect aliases, transparent
+# aliases, and protocol impls are produced by the pre-typer cascade
+# (cross-module by design) and threaded around the fold as separate
+# args. The record's shape is open so scope B/C can add fields
+# without rewriting downstream consumers.
+type ModuleEnvDelta = {
+  name:           Option[String],
+  ty_entries:     [TyEntry],
+  unions:         [UnionInfo],
+  op_eff_arities: [OpEffArity],
+  recs:           [RecInfo],
+  sums:           [SumInfo],
+  op_to_eff:      [OpToEff],
+  unit_aliases:   [UAliasEntry]
+}
+
+fn module_env_delta_empty() : ModuleEnvDelta = ModuleEnvDelta {
+  name: None, ty_entries: [], unions: [], op_eff_arities: [],
+  recs: [], sums: [], op_to_eff: [], unit_aliases: []
+}
+
+# Compose a child delta onto a parent. Cons-front so the child's
+# bindings shadow the parent's (Rule B: locals shadow imports).
+# Data-only tables (recs, sums, op_eff_arities, etc.) are
+# prepended so downstream lookups see the same precedence as the
+# pre-refactor merged stream.
+fn merge_env_deltas(parent: ModuleEnvDelta, child: ModuleEnvDelta) : ModuleEnvDelta =
+  ModuleEnvDelta {
+    name:           child.name,
+    ty_entries:     list_append(child.ty_entries, parent.ty_entries),
+    unions:         list_append(child.unions, parent.unions),
+    op_eff_arities: list_append(child.op_eff_arities, parent.op_eff_arities),
+    recs:           list_append(child.recs, parent.recs),
+    sums:           list_append(child.sums, parent.sums),
+    op_to_eff:      list_append(child.op_to_eff, parent.op_to_eff),
+    unit_aliases:   list_append(child.unit_aliases, parent.unit_aliases)
+  }
+
+# A single module's view of the decl stream. `name = None` is the
+# synthetic seed; everything else carries its source module name
+# (or the target file's basename for the root). Used by
+# `typecheck_program` to partition `all_decls` into per-module
+# sub-streams.
+type ModuleDecls = { name: Option[String], decls: [Decl] }
+
 fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram / Console + File =
 
 
@@ -36543,6 +36601,63 @@ fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
     decls: tp.decls, errs: tp.errs + cov_errs,
     insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
     prelude_len: tp.prelude_len, diags: tp.diags
+  }
+}
+
+# Issue #460 — public per-module typecheck entry point.
+#
+# Typechecks `mod.decls` against the env carried by `inherited`
+# and returns the typed decls plus the delta this module
+# contributes. The composed result of folding `typecheck_module`
+# over a list of modules is byte-identical to the monolithic
+# `infer_program_with_protos` on the concatenation.
+#
+# Scope A v1: the implementation delegates to the monolithic path
+# (single segment = `mod.decls`). The fold composition lives in
+# `typecheck_program`. Subsequent sub-steps migrate per-module
+# table builders (build_ty_env_module, collect_*_module) without
+# changing this API.
+type TypecheckedModule = { typed: TypedProgram, delta: ModuleEnvDelta }
+
+fn typecheck_module(file: String, mod: ModuleDecls,
+                     inherited: ModuleEnvDelta,
+                     proto_impls: [ProtoImplReg],
+                     verbose: Bool) : TypecheckedModule / Console + File {
+
+
+  let typed = infer_program_with_protos(file, mod.decls, verbose, proto_impls)
+  # Scope A v1: the delta is informational. Sub-step 3b populates
+  # ty_entries/op_eff_arities from a per-module build_ty_env; 3c
+  # populates the data-only tables. Today the seed-only baseline
+  # is enough for the wrapper test.
+  let delta = ModuleEnvDelta {
+    name: mod.name, ty_entries: [], unions: [], op_eff_arities: [],
+    recs: [], sums: [], op_to_eff: [], unit_aliases: []
+  }
+  TypecheckedModule { typed: typed, delta: delta }
+}
+
+# Fold `typecheck_module` over a list of per-module decl streams.
+# Scope A v1: collapses the list back into a single segment so the
+# monolithic typer sees the same input it did pre-refactor.
+# Sub-step 3d threads the inherited delta per-module so each
+# segment is typechecked in isolation.
+fn typecheck_program(file: String, modules: [ModuleDecls],
+                      proto_impls: [ProtoImplReg],
+                      verbose: Bool) : TypedProgram / Console + File {
+
+
+  let flat = flatten_module_decls(modules, [])
+  let mod_all = ModuleDecls { name: None, decls: flat }
+  let r = typecheck_module(file, mod_all, module_env_delta_empty(),
+                            proto_impls, verbose)
+  r.typed
+}
+
+fn flatten_module_decls(modules: [ModuleDecls], acc: [Decl]) : [Decl] {
+  match modules {
+    [] -> acc
+    [m, ...rest] -> flatten_module_decls(rest, list_append(acc, m.decls))
   }
 }
 
