@@ -5939,15 +5939,21 @@ static int _kai_process_record_pid(KaiValue *v) {
 }
 
 /* Mint Exited(code) / Signaled(signo) — variant *names* are the
- * runtime contract with `builtin_exit_decl`. */
+ * runtime contract with `builtin_exit_decl`. Issue #440 Phase 2:
+ * the typer-declared shape is `Exited(Int)` / `Signaled(Int)`, so
+ * stage 2 emits typed-slot match readers (`slots[0].i64`). The
+ * runtime constructors must therefore mint cells with `slot_mask`
+ * = KAI_VAR_SLOT_INT on slot 0 (= 1) and store the raw scalar
+ * directly. The legacy boxed path would mismatch the emitted
+ * match read and silently corrupt every Process.wait dispatch. */
 static KaiValue *_kai_process_make_exit_exited(int code) {
-    KaiValue *n = kai_int((int64_t) code);
-    return kai_variant(0, "Exited", 1, &n);
+    KaiVarSlot s; s.i64 = (int64_t) code;
+    return kai_variant_u(0, "Exited", 1, KAI_VAR_SLOT_INT, &s);
 }
 
 static KaiValue *_kai_process_make_exit_signaled(int signo) {
-    KaiValue *n = kai_int((int64_t) signo);
-    return kai_variant(1, "Signaled", 1, &n);
+    KaiVarSlot s; s.i64 = (int64_t) signo;
+    return kai_variant_u(1, "Signaled", 1, KAI_VAR_SLOT_INT, &s);
 }
 
 static KaiValue *_kai_process_err(KaiCont *k, int saved_errno) {
