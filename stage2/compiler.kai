@@ -43835,6 +43835,11 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_default_spawn_select(i8*, %KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_default_spawn_cancel(i8*, %KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_default_spawn_set_trap_exit(i8*, %KaiValue*, i8*)\n",
+    # Issue #582: Cancel default handler wrapper (see stage0/runtime_llvm.c).
+    # One op (`raise`) with no args; the runtime longjmps to the fiber's
+    # cancel_pad. Without this declaration the install block references
+    # an undefined symbol and clang rejects the IR.
+    "declare %KaiValue* @kaix_default_cancel_raise(i8*, i8*)\n",
     "\n"
   ])
 
@@ -46002,6 +46007,20 @@ fn llvm_default_builtin_decls(main_row: [String]) : String {
         "@_kai_default_securerandom_name = private unnamed_addr constant [13 x i8] c\"SecureRandom\\00\"\n"
       ])
     } else { "" },
+    # Issue #582: Cancel default handler globals — mirror Spawn's
+    # structure. The C backend installs Cancel via the AST-derived
+    # `default_setups_for` path; the LLVM backend was missing it, so
+    # `kaix_evidence_lookup_handler("Cancel")` returned NULL and
+    # `Cancel.raise()` from inside a fiber dereferenced a null evidence
+    # pointer (concretely: the post-raise resume continuation hit the
+    # null op fn slot).
+    if list_has(main_row, "Cancel") {
+      concat_all([
+        "@_kai_default_ev_cancel = internal global %EvCancel zeroinitializer\n",
+        "@_kai_default_node_cancel = internal global [48 x i8] zeroinitializer\n",
+        "@_kai_default_cancel_name = private unnamed_addr constant [7 x i8] c\"Cancel\\00\"\n"
+      ])
+    } else { "" },
     # Issue #570: Spawn default handler globals — mirror the structure
     # used by every other builtin so the runtime evidence lookup sees a
     # populated `EvSpawn`. The C backend installs Spawn unconditionally
@@ -46159,6 +46178,26 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
       "  call void @kaix_evidence_push(i8* %node_log_p, i8* getelementptr inbounds ([4 x i8], [4 x i8]* @_kai_default_log_name, i64 0, i64 0), i8* %ev_log_void)\n"
     ])
   } else { "" }
+  # Issue #582: install the Cancel default handler when `Cancel` is in
+  # main's row. One op (`raise`) at slot 3. The runtime's
+  # `kai_default_cancel_raise` longjmps to the current fiber's
+  # `cancel_pad` if set, otherwise prints a banner and exits 0 (matching
+  # m8 v1 main-fiber behaviour). Cancel is pushed between Mutable and
+  # Spawn per `builtin_default_install_order`, so it is popped between
+  # Spawn (popped first) and Mutable (popped after Cancel).
+  let cancel_ = if list_has(main_row, "Cancel") {
+    concat_all([
+      "  ; install Cancel default handler (issue #582)\n",
+      "  %hid_cancel = call i64 @kaix_fresh_handler_id()\n",
+      "  %ev_cancel_hid_p = getelementptr %EvCancel, %EvCancel* @_kai_default_ev_cancel, i32 0, i32 0\n",
+      "  store i64 %hid_cancel, i64* %ev_cancel_hid_p\n",
+      "  %ev_cancel_raise_p = getelementptr %EvCancel, %EvCancel* @_kai_default_ev_cancel, i32 0, i32 3\n",
+      "  store %KaiValue* (%EvCancel*, %KaiCont*)* bitcast (%KaiValue* (i8*, i8*)* @kaix_default_cancel_raise to %KaiValue* (%EvCancel*, %KaiCont*)*), %KaiValue* (%EvCancel*, %KaiCont*)** %ev_cancel_raise_p\n",
+      "  %node_cancel_p = getelementptr [48 x i8], [48 x i8]* @_kai_default_node_cancel, i32 0, i32 0\n",
+      "  %ev_cancel_void = bitcast %EvCancel* @_kai_default_ev_cancel to i8*\n",
+      "  call void @kaix_evidence_push(i8* %node_cancel_p, i8* getelementptr inbounds ([7 x i8], [7 x i8]* @_kai_default_cancel_name, i64 0, i64 0), i8* %ev_cancel_void)\n"
+    ])
+  } else { "" }
   # Issue #570: install the Spawn default handler when `Spawn` is in
   # main's row. Slot order matches `builtin_spawn_ops()`:
   # 3=yield, 4=spawn, 5=await, 6=select, 7=cancel, 8=set_trap_exit.
@@ -46215,6 +46254,11 @@ fn llvm_emit_main_install_defaults(main_row: [String]) : String {
     nettcp_,
     log_,
     mutable_,
+    # Issue #582: Cancel is installed between Mutable and Spawn per
+    # `builtin_default_install_order` (slot 14 of 18). Popped between
+    # Spawn (popped first) and Mutable (popped after Cancel) in the
+    # teardown order.
+    cancel_,
     # Issue #570: Spawn is last-installed (innermost) per
     # `builtin_default_install_order`, so it is first-popped in teardown.
     spawn_,
@@ -46228,6 +46272,9 @@ fn llvm_emit_main_teardown_defaults(main_row: [String]) : String {
     # Issue #570: Spawn was last-installed in `kai_main_install_defaults`,
     # so it must be first-popped here to keep the evidence stack balanced.
     if list_has(main_row, "Spawn")   { "  call void @kaix_evidence_pop()\n" } else { "" },
+    # Issue #582: Cancel pops after Spawn and before Mutable per the
+    # reverse of `builtin_default_install_order`.
+    if list_has(main_row, "Cancel")  { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Mutable") { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "Log")     { "  call void @kaix_evidence_pop()\n" } else { "" },
     if list_has(main_row, "NetTcp")  { "  call void @kaix_evidence_pop()\n" } else { "" },
