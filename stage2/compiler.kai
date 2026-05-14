@@ -12719,18 +12719,48 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], lcs: [String], f
         # where the second arg is a variant constructor call of the
         # same arity. We unpack the constructor's name + args and
         # lower to `kai_reuse_or_alloc_variant`.
+        #
+        # Issue #440 Phase 2 — when the ctor has primitive payload
+        # slots (typed), the reuse-in-place fast path is disabled:
+        # `kai_reuse_or_alloc_variant` writes its replacement args
+        # into `slots[i].ptr` and assumes `slot_mask == 0`, which
+        # would mismatch the emit-side typed extract (`slots[i].i64`).
+        # Routing the rebuild through `kai_variant_u` keeps the
+        # cell coherent with the match read; the reuse-for-typed-
+        # cells extension is a follow-up lane.
         match args_e {
           [_scr, ctor] -> match ctor.kind {
             ECall(cf, cargs) -> match cf.kind {
               EVar(cname) -> {
                 let n = list_length(cargs)
-                let arg_strs = emit_call_args(src, cargs, lcs, fns, variants, lams, cls)
-                if n == 0 {
+                let tys_opt = evar_payload_tys(variants, cname)
+                let has_prim = match tys_opt {
+                  Some(ts) -> variant_has_primitive_slot(ts)
+                  None     -> false
+                }
+                if has_prim {
+                  # Force the typed alloc-fresh path. Mirrors
+                  # `emit_variant_call_typed` but with the existing
+                  # `cargs` already in expression form.
+                  match tys_opt {
+                    Some(ts) -> {
+                      let mask = variant_slot_mask(ts)
+                      let slot_inits = emit_variant_slot_init_list(src, cargs, ts, lcs, fns, variants, lams, cls)
+                      concat_all([
+                        "kai_variant_u(0, \"", cname, "\", ", int_to_string(n),
+                        ", ", int_to_string(mask),
+                        ", (KaiVarSlot[]){", slot_inits, "})"
+                      ])
+                    }
+                    None -> "kai_unit() /* __perceus_reuse_variant: typed lookup vanished */"
+                  }
+                } else if n == 0 {
                   concat_all([
                     "kai_reuse_or_alloc_variant(_scr, 0, \"", cname,
                     "\", 0, NULL)"
                   ])
                 } else {
+                  let arg_strs = emit_call_args(src, cargs, lcs, fns, variants, lams, cls)
                   concat_all([
                     "kai_reuse_or_alloc_variant(_scr, 0, \"", cname,
                     "\", ", int_to_string(n),
