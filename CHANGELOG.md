@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.56.3 (2026-05-13)
+
+### Fixed
+
+- **kai**: add manifest dir to search paths for intra-package imports (closes #567)
+
 ## v0.56.2 (2026-05-13)
 
 ### Changed
