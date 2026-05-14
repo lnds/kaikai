@@ -36635,42 +36635,20 @@ fn collect_program_data(file: String, decls: [Decl]) : ProgramData / Console + F
   }
 }
 
-# Issue #180: variant accepting a snapshot of the protocol impl table
-# from `lower_protocols`. `synth_binop` consults it to gate dispatch
-# on impl existence (heterogeneous `Real + Complex` etc.).
-fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
-                               proto_impls: [ProtoImplReg]) : TypedProgram / Console + File {
-
-
-  let data = collect_program_data(file, decls)
-  let tp = infer_all_loop(file, data.built.env, data.built.prelude_len, data.recs,
-                 data.built.op_eff_arities, data.decls_a, verbose, [], 0, [], [], [], [],
-                 data.alias_res.aliases, data.op_to_eff, data.sums, proto_impls, data.decls_a)
-  # Issue #557 — Stage B coverage check. Runs after row-level inference
-  # is complete so the typed body carries the resolved `EVar("Eff.op")`
-  # callees the walker keys on. Adds its diagnostics directly to stderr
-  # and folds the count into TypedProgram.errs.
-  let cov_errs = check_default_coverage(file, tp.decls)
-  TypedProgram {
-    decls: tp.decls, errs: tp.errs + cov_errs,
-    insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
-    prelude_len: tp.prelude_len, diags: tp.diags
-  }
-}
-
 # Issue #460 — public per-module typecheck entry point.
 #
 # Typechecks `mod.decls` against the env carried by `inherited`
 # and returns the typed decls plus the delta this module
 # contributes. The composed result of folding `typecheck_module`
 # over a list of modules is byte-identical to the monolithic
-# `infer_program_with_protos` on the concatenation.
+# pre-refactor `infer_program_with_protos` on the concatenation.
 #
-# Scope A v1: the implementation delegates to the monolithic path
-# (single segment = `mod.decls`). The fold composition lives in
-# `typecheck_program`. Subsequent sub-steps migrate per-module
-# table builders (build_ty_env_module, collect_*_module) without
-# changing this API.
+# Scope A v1: a single-module call collects ProgramData over its
+# `decls` and runs `infer_all_loop` once. Multi-module fold lives
+# in `typecheck_program` and flattens to a single segment so the
+# byte-identical baseline holds. Sub-step 3d-future will thread
+# the inherited delta per segment and run `infer_all_loop` per
+# module without changing this API.
 type TypecheckedModule = { typed: TypedProgram, delta: ModuleEnvDelta }
 
 fn typecheck_module(file: String, mod: ModuleDecls,
@@ -36679,23 +36657,43 @@ fn typecheck_module(file: String, mod: ModuleDecls,
                      verbose: Bool) : TypecheckedModule / Console + File {
 
 
-  let typed = infer_program_with_protos(file, mod.decls, verbose, proto_impls)
-  # Scope A v1: the delta is informational. Sub-step 3b populates
-  # ty_entries/op_eff_arities from a per-module build_ty_env; 3c
-  # populates the data-only tables. Today the seed-only baseline
-  # is enough for the wrapper test.
+  let data = collect_program_data(file, mod.decls)
+  let tp = infer_all_loop(file, data.built.env, data.built.prelude_len, data.recs,
+                 data.built.op_eff_arities, data.decls_a, verbose, [], 0, [], [], [], [],
+                 data.alias_res.aliases, data.op_to_eff, data.sums, proto_impls, data.decls_a)
+  # Issue #557 — Stage B coverage check. Runs after row-level inference
+  # is complete so the typed body carries the resolved `EVar("Eff.op")`
+  # callees the walker keys on. Adds its diagnostics directly to stderr
+  # and folds the count into TypedProgram.errs.
+  let cov_errs = check_default_coverage(file, tp.decls)
+  let typed = TypedProgram {
+    decls: tp.decls, errs: tp.errs + cov_errs,
+    insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
+    prelude_len: tp.prelude_len, diags: tp.diags
+  }
+  # Scope A v1: the delta is informational — under scope A v1 the
+  # ProgramData tables produced for this module are the program
+  # tables (single module). When typecheck_program threads the fold
+  # across multiple ModuleDecls (future), each call accumulates the
+  # per-module slice here instead.
   let delta = ModuleEnvDelta {
-    name: mod.name, ty_entries: [], unions: [], op_eff_arities: [],
-    recs: [], sums: [], op_to_eff: [], unit_aliases: []
+    name:           mod.name,
+    ty_entries:     data.built.env.entries,
+    unions:         data.built.env.unions,
+    op_eff_arities: data.built.op_eff_arities,
+    recs:           data.recs,
+    sums:           data.sums,
+    op_to_eff:      data.op_to_eff,
+    unit_aliases:   collect_unit_alias_table(mod.decls)
   }
   TypecheckedModule { typed: typed, delta: delta }
 }
 
 # Fold `typecheck_module` over a list of per-module decl streams.
 # Scope A v1: collapses the list back into a single segment so the
-# monolithic typer sees the same input it did pre-refactor.
-# Sub-step 3d threads the inherited delta per-module so each
-# segment is typechecked in isolation.
+# monolithic typer sees the same input it did pre-refactor; the
+# fold dynamics live in this function and become non-trivial in a
+# future sub-step that partitions all_decls by module_origin.
 fn typecheck_program(file: String, modules: [ModuleDecls],
                       proto_impls: [ProtoImplReg],
                       verbose: Bool) : TypedProgram / Console + File {
@@ -36713,6 +36711,22 @@ fn flatten_module_decls(modules: [ModuleDecls], acc: [Decl]) : [Decl] {
     [] -> acc
     [m, ...rest] -> flatten_module_decls(rest, list_append(acc, m.decls))
   }
+}
+
+# Issue #180: variant accepting a snapshot of the protocol impl table
+# from `lower_protocols`. `synth_binop` consults it to gate dispatch
+# on impl existence (heterogeneous `Real + Complex` etc.).
+#
+# Issue #460: thin wrapper around `typecheck_program` over a
+# single-module input. Every legacy caller of
+# infer_program_with_protos goes through here; the per-module fold
+# entry point is `typecheck_program`.
+fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
+                               proto_impls: [ProtoImplReg]) : TypedProgram / Console + File {
+
+
+  let mods = [ModuleDecls { name: None, decls: decls }]
+  typecheck_program(file, mods, proto_impls, verbose)
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int / Console + File {
