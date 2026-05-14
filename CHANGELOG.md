@@ -84,6 +84,21 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.60.0 (2026-05-14)
+
+### Added
+
+- **cache**: bin/kai cache hit/miss + sha256 + atomic write (refs #452)
+- **cache**: kaic2 --prelude-cache + --emit-prelude-cache (refs #452)
+
+### Fixed
+
+- **cache**: avoid prelude-name shadowing in ECall/TyFn arms (closes #585)
+
+### Changed
+
+- **cache**: Phase A.0 stdlib cache complete — infrastructure-ready, wire-format flip pending (closes #452)
+
 ## v0.59.1 (2026-05-14)
 
 ### Fixed
