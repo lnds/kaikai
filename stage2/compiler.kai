@@ -49391,34 +49391,57 @@ fn collect_pub_access_table(prelude_segs: [PreludeSegment],
   list_reverse(acc2)
 }
 
+# A per-decl home attribution paired with a flag distinguishing
+# anchored entries (the decl itself carried `module_origin =
+# Some(m)`) from derived entries (a non-DFn that inherited its
+# home from the running `cur_mod`). Issue #565: the flag is what
+# stops a later anchor from propagating across an unrelated
+# already-anchored module — see `propagate_home_back`.
+type HomeAnchor = HA(String, Bool)
+#                    home    anchored
+
 # For each decl in `ds`, return the home module it should be
 # attributed to. Algorithm: scan left-to-right; when a DFn/DAxiom
 # with `mo=Some(m)` lands, retroactively assign `m` to every
-# preceding decl that was attributed to the running `cur_mod` and
-# update the running home to `m`. The result is a list of homes
-# in source order — one per decl.
+# preceding derived (non-anchored) decl that was attributed to
+# the running `cur_mod` and update the running home to `m`. The
+# result is a list of homes in source order — one per decl.
+#
+# Issue #565: without the anchored flag, a transitive import chain
+# `consumer -> mid -> leaf` would mis-attribute every decl of `leaf`
+# to `mid`. When `leaf`'s decls land first (process_imports recurses
+# depth-first), they anchor under `leaf`; when `mid`'s first explicit
+# DFn arrives later, `propagate_home_back` walks back replacing every
+# preceding entry that still reads `cur_mod`. Since `cur_mod` stayed
+# at `leaf` after the last `leaf` DFn (the new `mid` non-DFn DTypes
+# inherit `leaf`), the back-propagation overruns `mid`'s own DTypes
+# AND every previously-anchored `leaf` DFn. The flag stops the walk
+# at the first anchored entry, preserving `leaf`'s attributions.
 fn imports_home_anchors(ds: [Decl], target_mod: String, cur_mod: String,
-                          acc: [String]) : [String] = match ds {
+                          acc: [HomeAnchor]) : [HomeAnchor] = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> {
     let hint = decl_home_hint_reset(d, cur_mod, target_mod)
     # If this decl explicitly carries `Some(m)`, propagate `m`
-    # backward to any prior entries still tagged with the previous
-    # `cur_mod` (so a DType at the head of the import inherits
-    # the first DFn's mod). For decls already tagged we keep
-    # their existing home.
+    # backward to any prior derived entries still tagged with the
+    # previous `cur_mod` (so a DType at the head of the import
+    # inherits the first DFn's mod). Anchored entries — those
+    # whose own decl had `module_origin = Some(_)` — are never
+    # overwritten.
     let explicit = decl_explicit_home(d)
     let acc1 = match explicit {
       Some(m) -> propagate_home_back(acc, cur_mod, m, [])
       None    -> acc
     }
     let mine = match explicit {
-      Some(m) -> m
-      None    -> hint
+      Some(m) -> HA(m, true)
+      None    -> HA(hint, false)
     }
-    imports_home_anchors(rest, target_mod, mine, [mine, ...acc1])
+    imports_home_anchors(rest, target_mod, ha_home(mine), [mine, ...acc1])
   }
 }
+
+fn ha_home(h: HomeAnchor) : String = match h { HA(m, _) -> m }
 
 fn decl_explicit_home(d: Decl) : Option[String] = match d {
   DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
@@ -49437,31 +49460,38 @@ fn impl_first_fn_home(ms: [Decl]) : Option[String] = match ms {
 }
 
 # Walk `acc` (reversed source order — newest first) and replace
-# every running entry equal to `prev` with `new`, stopping at the
-# first entry that already differs (those belong to a previous
-# anchored module). Returns the list still in reversed order.
-fn propagate_home_back(acc: [String], prev: String, new: String,
-                         done: [String]) : [String] = match acc {
+# every derived (non-anchored) running entry equal to `prev` with
+# `new`, stopping at the first anchored entry OR the first entry
+# whose home already differs. Anchored entries belong to a module
+# that already locked in its attribution and must never be
+# rewritten. Returns the list still in reversed order. Issue #565.
+fn propagate_home_back(acc: [HomeAnchor], prev: String, new: String,
+                         done: [HomeAnchor]) : [HomeAnchor] = match acc {
   [] -> done
-  [h, ...rest] ->
-    if h == prev { propagate_home_back(rest, prev, new, [new, ...done]) }
-    else { append_reverse(done, [h, ...rest]) }
+  [h, ...rest] -> match h {
+    HA(m, anchored) ->
+      if anchored or m != prev {
+        append_reverse_ha(done, [h, ...rest])
+      } else {
+        propagate_home_back(rest, prev, new, [HA(new, false), ...done])
+      }
+  }
 }
 
-fn append_reverse(a: [String], b: [String]) : [String] = match a {
+fn append_reverse_ha(a: [HomeAnchor], b: [HomeAnchor]) : [HomeAnchor] = match a {
   [] -> b
-  [h, ...rest] -> append_reverse(rest, [h, ...b])
+  [h, ...rest] -> append_reverse_ha(rest, [h, ...b])
 }
 
 # Drive `priv_one` per decl using the pre-computed home list.
-fn cpa_with_homes(ds: [Decl], homes: [String],
+fn cpa_with_homes(ds: [Decl], homes: [HomeAnchor],
                     acc: [PubAccessEntry]) : [PubAccessEntry] =
   match ds {
     [] -> acc
     [d, ...rest_d] -> match homes {
       [] -> acc
       [h, ...rest_h] -> {
-        let acc1 = priv_one(d, h, acc)
+        let acc1 = priv_one(d, ha_home(h), acc)
         cpa_with_homes(rest_d, rest_h, acc1)
       }
     }
