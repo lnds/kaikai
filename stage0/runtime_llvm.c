@@ -570,6 +570,16 @@ KaiValue *kaix_default_spawn_set_trap_exit(void *self, KaiValue *on, KaiCont *k)
     return kai_default_spawn_set_trap_exit(self, on, k);
 }
 
+/* Issue #582 — LLVM-visible wrapper around `kai_default_cancel_raise`.
+ * The LLVM emitter installs this by name from `kai_main_install_defaults`
+ * when `Cancel` appears in main's row. Without it the runtime's
+ * `kaix_evidence_lookup_handler("Cancel")` returned NULL and
+ * `Cancel.raise()` inside a fiber (e.g. one spawned under a mailboxed
+ * parent) dereferenced a null evidence op pointer. */
+KaiValue *kaix_default_cancel_raise(void *self, KaiCont *k) {
+    return kai_default_cancel_raise(self, k);
+}
+
 /* m7c-d — install/teardown default handlers for builtins that
  * appear in main's row. The LLVM emitter generates the body of
  * these two functions per program (filling in the right
