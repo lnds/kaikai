@@ -27033,21 +27033,53 @@ fn param_tys_with_binds(params: [Param], binds: [TPBind]) : [Ty] {
 
 type BuiltEnv = { env: TyEnv, prelude_len: Int, op_eff_arities: [OpEffArity] }
 
-fn build_ty_env(decls: [Decl]) : BuiltEnv {
+# Issue #460 — per-module env composition.
+#
+# `build_ty_env_seed` builds the built-in baseline (`add_prelude_sigs`
+# + `add_builtin_variant_sigs`) that every module inherits.
+# `prelude_len = list_length(seed.entries)` is the boundary the
+# `--holes` user-scope filter consults; it is the length of the
+# *built-in* seed, NOT of any user prelude module.
+#
+# `build_ty_env_module` adds a single module's contributions to an
+# inherited seed: registers every DFn / DType / DEffect against the
+# entries already present, returning the updated env plus this
+# module's op-effect arities. The fold composition is the call
+# `build_ty_env_module(seed, all_decls)`, which is byte-identical
+# to the monolithic builder.
+#
+# `unions` and `top_names` are global properties of the entire
+# decl stream — collected once over the union of all modules and
+# threaded around the per-module fold rather than recomputed per
+# module. They are not part of `ModuleEnvDelta` under scope A.
+fn build_ty_env_seed() : BuiltEnv {
   let e0 = ty_env_empty()
   let e1 = add_prelude_sigs(e0)
-  let e2_pre = add_builtin_variant_sigs(e1)
+  let e2 = add_builtin_variant_sigs(e1)
+  BuiltEnv { env: e2, prelude_len: list_length(e2.entries),
+             op_eff_arities: [] }
+}
+
+fn build_ty_env_module(seed: BuiltEnv, decls: [Decl],
+                        unions: [UnionInfo], top_names: [String]) : BuiltEnv {
+  let env_with_unions = TyEnv {
+    entries: seed.env.entries, fresh: seed.env.fresh, unions: unions
+  }
+  let r = add_decls_loop(env_with_unions, seed.op_eff_arities, decls, top_names)
+  BuiltEnv { env: r.env, prelude_len: seed.prelude_len,
+             op_eff_arities: r.arities }
+}
+
+fn build_ty_env(decls: [Decl]) : BuiltEnv {
+  let seed = build_ty_env_seed()
   # Issue #198: harvest the union summary once and stash it on the
   # env so every downstream typer query (`variants_of_type`,
   # `union_upcast_ok`, the #199 diagnostic) sees the same data.
   let unions = collect_unions(decls)
-  let e2 = TyEnv { entries: e2_pre.entries, fresh: e2_pre.fresh, unions: unions }
   # Issue #197: pre-compute top-level type names so variant
   # registration can skip ctor entries whose name shadows.
   let top_names = collect_top_type_names(decls)
-  let r = add_decls_loop(e2, [], decls, top_names)
-  BuiltEnv { env: r.env, prelude_len: list_length(e2.entries),
-             op_eff_arities: r.arities }
+  build_ty_env_module(seed, decls, unions, top_names)
 }
 
 # ---- env dump (debugging) ----
@@ -36500,18 +36532,84 @@ fn expand_aliases_hreturn(r: HReturn, aliases: [UAliasEntry]) : HReturn {
   }
 }
 
+# Issue #460 — Per-module typer env deltas.
+#
+# `ModuleEnvDelta` is the diff a single module contributes to the
+# typer env. It is the load-bearing data type for the Phase A.1
+# stdlib cache (#452): the prelude's delta gets serialised; cold
+# starts re-apply it on top of the freshly-built built-in seed.
+#
+# Diff (not full env) so the cache stays independent of the
+# built-in env baked into the compiler. `add_prelude_sigs` +
+# `add_builtin_variant_sigs` re-run every invocation; only the
+# user-visible decls live in the delta.
+#
+# Scope A (this lane): ty_entries, unions, op_eff_arities, recs,
+# sums, op_to_eff, unit_aliases. Effect aliases, transparent
+# aliases, and protocol impls are produced by the pre-typer cascade
+# (cross-module by design) and threaded around the fold as separate
+# args. The record's shape is open so scope B/C can add fields
+# without rewriting downstream consumers.
+type ModuleEnvDelta = {
+  name:           Option[String],
+  ty_entries:     [TyEntry],
+  unions:         [UnionInfo],
+  op_eff_arities: [OpEffArity],
+  recs:           [RecInfo],
+  sums:           [SumInfo],
+  op_to_eff:      [OpToEff],
+  unit_aliases:   [UAliasEntry]
+}
+
+fn module_env_delta_empty() : ModuleEnvDelta = ModuleEnvDelta {
+  name: None, ty_entries: [], unions: [], op_eff_arities: [],
+  recs: [], sums: [], op_to_eff: [], unit_aliases: []
+}
+
+# Compose a child delta onto a parent. Cons-front so the child's
+# bindings shadow the parent's (Rule B: locals shadow imports).
+# Data-only tables (recs, sums, op_eff_arities, etc.) are
+# prepended so downstream lookups see the same precedence as the
+# pre-refactor merged stream.
+fn merge_env_deltas(parent: ModuleEnvDelta, child: ModuleEnvDelta) : ModuleEnvDelta =
+  ModuleEnvDelta {
+    name:           child.name,
+    ty_entries:     list_append(child.ty_entries, parent.ty_entries),
+    unions:         list_append(child.unions, parent.unions),
+    op_eff_arities: list_append(child.op_eff_arities, parent.op_eff_arities),
+    recs:           list_append(child.recs, parent.recs),
+    sums:           list_append(child.sums, parent.sums),
+    op_to_eff:      list_append(child.op_to_eff, parent.op_to_eff),
+    unit_aliases:   list_append(child.unit_aliases, parent.unit_aliases)
+  }
+
+# A single module's view of the decl stream. `name = None` is the
+# synthetic seed; everything else carries its source module name
+# (or the target file's basename for the root). Used by
+# `typecheck_program` to partition `all_decls` into per-module
+# sub-streams.
+type ModuleDecls = { name: Option[String], decls: [Decl] }
+
 fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram / Console + File =
 
 
   infer_program_with_protos(file, decls, verbose, [])
 
-# Issue #180: variant accepting a snapshot of the protocol impl table
-# from `lower_protocols`. `synth_binop` consults it to gate dispatch
-# on impl existence (heterogeneous `Real + Complex` etc.).
-fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
-                               proto_impls: [ProtoImplReg]) : TypedProgram / Console + File {
+# Issue #460 — pre-typer data tables collected once over the full
+# decl stream. `infer_program_with_protos` (and the per-module fold
+# composing it) read these tables; under scope A the cascade
+# computes them globally and the fold inherits them without
+# recomputing.
+type ProgramData = {
+  decls_a:    [Decl],            # decls after unit-alias expansion
+  built:      BuiltEnv,
+  recs:       [RecInfo],
+  alias_res:  AliasResolution,
+  op_to_eff:  [OpToEff],
+  sums:       [SumInfo]
+}
 
-
+fn collect_program_data(file: String, decls: [Decl]) : ProgramData / Console + File {
   # m12.5: expand `unit Newton = kg * m / sec^2` aliases at the AST
   # level before any pass that calls resolve_ty. After this pass no
   # USym in any TyDim or ELitUnit refers to an alias name.
@@ -36531,19 +36629,104 @@ fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
   let op_to_eff = collect_op_to_eff(decls_a)
   # Issue #71: sum-type registry for the region-brand walker.
   let sums = collect_sums(decls_a)
-  let tp = infer_all_loop(file, built.env, built.prelude_len, recs,
-                 built.op_eff_arities, decls_a, verbose, [], 0, [], [], [], [],
-                 alias_res.aliases, op_to_eff, sums, proto_impls, decls_a)
+  ProgramData {
+    decls_a: decls_a, built: built, recs: recs,
+    alias_res: alias_res, op_to_eff: op_to_eff, sums: sums
+  }
+}
+
+# Issue #460 — public per-module typecheck entry point.
+#
+# Typechecks `mod.decls` against the env carried by `inherited`
+# and returns the typed decls plus the delta this module
+# contributes. The composed result of folding `typecheck_module`
+# over a list of modules is byte-identical to the monolithic
+# pre-refactor `infer_program_with_protos` on the concatenation.
+#
+# Scope A v1: a single-module call collects ProgramData over its
+# `decls` and runs `infer_all_loop` once. Multi-module fold lives
+# in `typecheck_program` and flattens to a single segment so the
+# byte-identical baseline holds. Sub-step 3d-future will thread
+# the inherited delta per segment and run `infer_all_loop` per
+# module without changing this API.
+type TypecheckedModule = { typed: TypedProgram, delta: ModuleEnvDelta }
+
+fn typecheck_module(file: String, mod: ModuleDecls,
+                     inherited: ModuleEnvDelta,
+                     proto_impls: [ProtoImplReg],
+                     verbose: Bool) : TypecheckedModule / Console + File {
+
+
+  let data = collect_program_data(file, mod.decls)
+  let tp = infer_all_loop(file, data.built.env, data.built.prelude_len, data.recs,
+                 data.built.op_eff_arities, data.decls_a, verbose, [], 0, [], [], [], [],
+                 data.alias_res.aliases, data.op_to_eff, data.sums, proto_impls, data.decls_a)
   # Issue #557 — Stage B coverage check. Runs after row-level inference
   # is complete so the typed body carries the resolved `EVar("Eff.op")`
   # callees the walker keys on. Adds its diagnostics directly to stderr
   # and folds the count into TypedProgram.errs.
   let cov_errs = check_default_coverage(file, tp.decls)
-  TypedProgram {
+  let typed = TypedProgram {
     decls: tp.decls, errs: tp.errs + cov_errs,
     insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
     prelude_len: tp.prelude_len, diags: tp.diags
   }
+  # Scope A v1: the delta is informational — under scope A v1 the
+  # ProgramData tables produced for this module are the program
+  # tables (single module). When typecheck_program threads the fold
+  # across multiple ModuleDecls (future), each call accumulates the
+  # per-module slice here instead.
+  let delta = ModuleEnvDelta {
+    name:           mod.name,
+    ty_entries:     data.built.env.entries,
+    unions:         data.built.env.unions,
+    op_eff_arities: data.built.op_eff_arities,
+    recs:           data.recs,
+    sums:           data.sums,
+    op_to_eff:      data.op_to_eff,
+    unit_aliases:   collect_unit_alias_table(mod.decls)
+  }
+  TypecheckedModule { typed: typed, delta: delta }
+}
+
+# Fold `typecheck_module` over a list of per-module decl streams.
+# Scope A v1: collapses the list back into a single segment so the
+# monolithic typer sees the same input it did pre-refactor; the
+# fold dynamics live in this function and become non-trivial in a
+# future sub-step that partitions all_decls by module_origin.
+fn typecheck_program(file: String, modules: [ModuleDecls],
+                      proto_impls: [ProtoImplReg],
+                      verbose: Bool) : TypedProgram / Console + File {
+
+
+  let flat = flatten_module_decls(modules, [])
+  let mod_all = ModuleDecls { name: None, decls: flat }
+  let r = typecheck_module(file, mod_all, module_env_delta_empty(),
+                            proto_impls, verbose)
+  r.typed
+}
+
+fn flatten_module_decls(modules: [ModuleDecls], acc: [Decl]) : [Decl] {
+  match modules {
+    [] -> acc
+    [m, ...rest] -> flatten_module_decls(rest, list_append(acc, m.decls))
+  }
+}
+
+# Issue #180: variant accepting a snapshot of the protocol impl table
+# from `lower_protocols`. `synth_binop` consults it to gate dispatch
+# on impl existence (heterogeneous `Real + Complex` etc.).
+#
+# Issue #460: thin wrapper around `typecheck_program` over a
+# single-module input. Every legacy caller of
+# infer_program_with_protos goes through here; the per-module fold
+# entry point is `typecheck_program`.
+fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
+                               proto_impls: [ProtoImplReg]) : TypedProgram / Console + File {
+
+
+  let mods = [ModuleDecls { name: None, decls: decls }]
+  typecheck_program(file, mods, proto_impls, verbose)
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int / Console + File {
