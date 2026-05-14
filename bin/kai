@@ -585,45 +585,179 @@ home:           https://kaikai-lang.org
 EOF
 }
 
+# Issue #452 Phase A.0 step 4 — prelude cache directory.
+#   $KAI_PRELUDE_CACHE_DIR overrides everything.
+#   $XDG_CACHE_HOME/kaikai/preludes-v1 if set (Linux convention).
+#   ~/Library/Caches/kaikai/preludes-v1 on macOS.
+#   ~/.cache/kaikai/preludes-v1 elsewhere.
+# The `-v1` suffix is the kaikai-cache format generation. A future
+# kaic2 that bumps `cache_format_version()` should also bump the
+# directory suffix so the two generations coexist on disk.
+prelude_cache_dir() {
+  if [ -n "${KAI_PRELUDE_CACHE_DIR:-}" ]; then
+    printf '%s' "$KAI_PRELUDE_CACHE_DIR"
+    return 0
+  fi
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    printf '%s/kaikai/preludes-v1' "$XDG_CACHE_HOME"
+    return 0
+  fi
+  case "$(uname -s)" in
+    Darwin) printf '%s/Library/Caches/kaikai/preludes-v1' "$HOME" ;;
+    *)      printf '%s/.cache/kaikai/preludes-v1' "$HOME" ;;
+  esac
+}
+
+# Compute the lowercase-hex sha256 of $1. Tries `shasum -a 256`
+# (macOS + BSD + coreutils) then `sha256sum` (GNU). Empty on failure.
+file_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | awk '{ print $1 }'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | awk '{ print $1 }'
+  else
+    printf ''
+  fi
+}
+
+# Locate the cache file for $1 (a source .kai path). Returns the
+# cache path on stdout, or empty if no usable cache exists.
+#
+# Hit/miss rule: the filename is `<sha>.kab`. A non-existent file is
+# a miss. An existing file is treated as a hit; the cache header
+# carries kaikai_version_hash + format_version + magic so a stale
+# binary will reject the blob on load and bin/kai re-emits.
+# Content-addressable filename means a source content change yields
+# a different sha and therefore a fresh cache slot — no mtime check
+# is needed.
+#
+# Phase A.0 is OPT-IN today via KAI_PRELUDE_CACHE=1. The hex on-disk
+# format (chosen for stage 1 portability — no Byte type) is ~25%
+# slower than `--prelude <src>` on the full stdlib because hex
+# decoding allocates more strings than the parser. Future format
+# bumps (cache_format_version != 1) can flip to a binary payload and
+# unlock the design's projected ~0.41s savings; the lane that does
+# the flip flips the default here. Tracked in #452 follow-ups.
+prelude_cache_lookup() {
+  src="$1"
+  [ "${KAI_PRELUDE_CACHE:-0}" = "1" ]    || return 0
+  [ -n "${KAI_NO_PRELUDE_CACHE:-}" ]     && return 0
+  [ -n "${KAI_NO_STDLIB:-}" ]            && return 0
+  sha="$(file_sha256 "$src")"
+  [ -n "$sha" ] || return 0
+  cache_dir="$(prelude_cache_dir)"
+  cache_path="$cache_dir/${sha}.kab"
+  if [ -f "$cache_path" ]; then
+    printf '%s' "$cache_path"
+  fi
+}
+
+# Build the cache file for $1 (source .kai path). Invokes kaic2 with
+# --emit-prelude-cache, captures stdout to <tmp>.kab.tmp, fsyncs (via
+# `sync`'s closest portable hook — `dd` with conv=fsync if available;
+# else trust the rename), then atomically renames into place. Quiet
+# on success; returns the cache path on stdout. Empty on failure
+# (caller falls back to passing the source via --prelude).
+prelude_cache_build() {
+  src="$1"
+  [ "${KAI_PRELUDE_CACHE:-0}" = "1" ]    || return 0
+  [ -n "${KAI_NO_PRELUDE_CACHE:-}" ]     && return 0
+  [ -n "${KAI_NO_STDLIB:-}" ]            && return 0
+  sha="$(file_sha256 "$src")"
+  [ -n "$sha" ] || return 0
+  cache_dir="$(prelude_cache_dir)"
+  mkdir -p "$cache_dir" || return 0
+  cache_path="$cache_dir/${sha}.kab"
+  tmp_path="$cache_dir/.${sha}.kab.$$.tmp"
+  if "$KAIC2" --emit-prelude-cache --cache-sha "$sha" "$src" > "$tmp_path" 2>/dev/null; then
+    # POSIX rename(2) is atomic on the same filesystem; the cache
+    # directory and tmp file live side-by-side so any concurrent
+    # reader sees either the prior cache file or the new one, never
+    # a half-written blob.
+    if mv "$tmp_path" "$cache_path"; then
+      printf '%s' "$cache_path"
+      return 0
+    fi
+  fi
+  rm -f "$tmp_path" 2>/dev/null
+  return 0
+}
+
+# Emit a single `--prelude-cache <src> <cache>` pair when a cache hit
+# is available, falling back to `--prelude <src>` on miss (after
+# trying to BUILD the cache on the fly). Each prelude source is
+# considered independently — a corrupted cache for one file does not
+# touch the others. Silent when KAI_NO_PRELUDE_CACHE is set: the
+# driver emits the same `--prelude <src>` flags as before the cache
+# layer existed.
+prelude_flag_for() {
+  src="$1"
+  [ -f "$src" ] || return 0
+  # Default: the cache layer is opt-in via KAI_PRELUDE_CACHE=1. With
+  # the v1 hex on-disk format the deserialiser is slower than the
+  # parser on the full stdlib; leaving it off-by-default keeps every
+  # warm wall identical to v0.58.1 until the binary-format flip
+  # ships. Setting KAI_NO_PRELUDE_CACHE=1 is the explicit override
+  # for opt-in users who want to skip the cache for a single
+  # invocation (e.g. CI runs that purge `~/.cache/kaikai`).
+  if [ "${KAI_PRELUDE_CACHE:-0}" != "1" ] || [ "${KAI_NO_PRELUDE_CACHE:-}" = "1" ]; then
+    printf -- '--prelude %s ' "$src"
+    return 0
+  fi
+  cache_path="$(prelude_cache_lookup "$src")"
+  if [ -z "$cache_path" ]; then
+    # MISS: try to populate the cache, then emit the corresponding
+    # flag pair. On build failure (kaic2 itself rejects the source,
+    # disk full, etc.) fall back to plain --prelude so the user
+    # still gets a working compile.
+    cache_path="$(prelude_cache_build "$src")"
+  fi
+  if [ -n "$cache_path" ] && [ -f "$cache_path" ]; then
+    printf -- '--prelude-cache %s %s ' "$src" "$cache_path"
+  else
+    printf -- '--prelude %s ' "$src"
+  fi
+}
+
 # $1 = source .kai path; $2 = tmpdir; $3 = output binary path;
 # $4 = subcommand name (for help-pointer in errors); rest = extra kaic2 flags
-# Echo `--prelude <file>` flags for every stdlib file, in the same
-# order compile_to_binary used to embed them inline. Silent when
-# KAI_NO_STDLIB=1. Shared by compile_to_binary and the typed-hole
-# report path (cmd_build --holes / --holes-json) so both surfaces see
-# the same scope.
+# Echo `--prelude <file>` (or `--prelude-cache <file> <cache>`) flags
+# for every stdlib file, in the same order compile_to_binary used to
+# embed them inline. Silent when KAI_NO_STDLIB=1. Shared by
+# compile_to_binary and the typed-hole report path (cmd_build --holes
+# / --holes-json) so both surfaces see the same scope.
 stdlib_prelude_flags() {
   if [ "${KAI_NO_STDLIB:-}" = "1" ]; then return 0; fi
   if [ -d "$STDLIB_CORE_DIR" ]; then
     for core_file in "$STDLIB_CORE_DIR"/*.kai; do
-      [ -f "$core_file" ] && printf -- '--prelude %s ' "$core_file"
+      prelude_flag_for "$core_file"
     done
   fi
-  [ -f "$STDLIB_PROTOCOLS" ] && printf -- '--prelude %s ' "$STDLIB_PROTOCOLS"
-  [ -f "$STDLIB_EFFECTS" ]   && printf -- '--prelude %s ' "$STDLIB_EFFECTS"
-  [ -f "$STDLIB_ARRAY" ]     && printf -- '--prelude %s ' "$STDLIB_ARRAY"
-  [ -f "$STDLIB_RANDOM" ]    && printf -- '--prelude %s ' "$STDLIB_RANDOM"
-  [ -f "$STDLIB_RANDOM_SECURE" ] && printf -- '--prelude %s ' "$STDLIB_RANDOM_SECURE"
-  [ -f "$STDLIB_BASE64" ]    && printf -- '--prelude %s ' "$STDLIB_BASE64"
-  [ -f "$STDLIB_HEX" ]       && printf -- '--prelude %s ' "$STDLIB_HEX"
-  [ -f "$STDLIB_MAP" ]       && printf -- '--prelude %s ' "$STDLIB_MAP"
-  [ -f "$STDLIB_SET" ]       && printf -- '--prelude %s ' "$STDLIB_SET"
-  [ -f "$STDLIB_QUEUE" ]     && printf -- '--prelude %s ' "$STDLIB_QUEUE"
-  [ -f "$STDLIB_STACK" ]     && printf -- '--prelude %s ' "$STDLIB_STACK"
-  [ -f "$STDLIB_MATH_NUMERIC" ] && printf -- '--prelude %s ' "$STDLIB_MATH_NUMERIC"
-  [ -f "$STDLIB_MATH_INT" ]     && printf -- '--prelude %s ' "$STDLIB_MATH_INT"
-  [ -f "$STDLIB_MATH_REAL" ]    && printf -- '--prelude %s ' "$STDLIB_MATH_REAL"
-  [ -f "$STDLIB_MATH_COMPLEX" ] && printf -- '--prelude %s ' "$STDLIB_MATH_COMPLEX"
-  [ -f "$STDLIB_JSON" ]      && printf -- '--prelude %s ' "$STDLIB_JSON"
-  [ -f "$STDLIB_TOML" ]      && printf -- '--prelude %s ' "$STDLIB_TOML"
-  [ -f "$STDLIB_DECIMAL" ]   && printf -- '--prelude %s ' "$STDLIB_DECIMAL"
-  [ -f "$STDLIB_MONEY" ]     && printf -- '--prelude %s ' "$STDLIB_MONEY"
-  [ -f "$STDLIB_FX" ]        && printf -- '--prelude %s ' "$STDLIB_FX"
-  [ -f "$STDLIB_UUID" ]      && printf -- '--prelude %s ' "$STDLIB_UUID"
-  [ -f "$STDLIB_REGEXP" ]    && printf -- '--prelude %s ' "$STDLIB_REGEXP"
-  [ -f "$STDLIB_PATH" ]      && printf -- '--prelude %s ' "$STDLIB_PATH"
-  [ -f "$STDLIB_CRYPTO_HASH" ] && printf -- '--prelude %s ' "$STDLIB_CRYPTO_HASH"
-  [ -f "$STDLIB_CRYPTO_MAC" ]  && printf -- '--prelude %s ' "$STDLIB_CRYPTO_MAC"
+  prelude_flag_for "$STDLIB_PROTOCOLS"
+  prelude_flag_for "$STDLIB_EFFECTS"
+  prelude_flag_for "$STDLIB_ARRAY"
+  prelude_flag_for "$STDLIB_RANDOM"
+  prelude_flag_for "$STDLIB_RANDOM_SECURE"
+  prelude_flag_for "$STDLIB_BASE64"
+  prelude_flag_for "$STDLIB_HEX"
+  prelude_flag_for "$STDLIB_MAP"
+  prelude_flag_for "$STDLIB_SET"
+  prelude_flag_for "$STDLIB_QUEUE"
+  prelude_flag_for "$STDLIB_STACK"
+  prelude_flag_for "$STDLIB_MATH_NUMERIC"
+  prelude_flag_for "$STDLIB_MATH_INT"
+  prelude_flag_for "$STDLIB_MATH_REAL"
+  prelude_flag_for "$STDLIB_MATH_COMPLEX"
+  prelude_flag_for "$STDLIB_JSON"
+  prelude_flag_for "$STDLIB_TOML"
+  prelude_flag_for "$STDLIB_DECIMAL"
+  prelude_flag_for "$STDLIB_MONEY"
+  prelude_flag_for "$STDLIB_FX"
+  prelude_flag_for "$STDLIB_UUID"
+  prelude_flag_for "$STDLIB_REGEXP"
+  prelude_flag_for "$STDLIB_PATH"
+  prelude_flag_for "$STDLIB_CRYPTO_HASH"
+  prelude_flag_for "$STDLIB_CRYPTO_MAC"
   return 0
 }
 
