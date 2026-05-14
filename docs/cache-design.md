@@ -16,24 +16,29 @@ Move kaikai from "re-parse stdlib + user code on every `kai build`"
 every build, re-parse only what changed" (target: ≤ 300 ms cold,
 ≤ 150 ms incremental — DoD #6).
 
-## Empirical breakdown (2026-05-13, M2 Pro, arm64)
+## Empirical breakdown (2026-05-14, M2 Pro, arm64)
 
 Phase-by-phase wall of `bin/kai build empty.kai`, n=5 runs each,
 median reported. See `tools/bench-phases.sh` (run with `-r` for RSS).
-Anchor: post-#572 (self-import) + #573 (LLVM lambda lift) + 32
-preludes auto-loaded by `bin/kai`. Re-measured 2026-05-13 because
-the prior 2026-05-11 baseline (1.47 s wall) predates the recent
-prelude growth (decimal, money, fx, uuid, regexp, path, crypto/*)
-and the per-prelude lex+parse work scales linearly with file count.
+Anchor: post-#578 (typer per-module fold) + 32 preludes auto-loaded
+by `bin/kai`. Re-measured 2026-05-14 to refresh the 2026-05-13 numbers
+after #574 / #578 / #570 / #571 / #572 / #573 landed.
 
 | Stage | Cumulative wall | Delta | RSS peak | Share |
 |---|---|---|---|---|
-| `--tokens` (lex preludes) | 0.33 s | 0.33 s |  73 MB | 12% |
-| `--ast` (parse preludes) | 0.54 s | 0.21 s | 151 MB |  7% |
-| `--check` (typecheck) | 1.18 s | 0.64 s | 196 MB | 23% |
-| `--infer` (typecheck) | 1.31 s | 0.13 s | 196 MB |  5% |
-| default (emit C) | 2.06 s | 0.75 s | 306 MB | 26% |
-| `kai build` total (kaic2 + cc + shell, median 5 runs) | 2.79 s | 0.73 s | ~478 MB | 26% |
+| `--tokens` (lex preludes) | 0.26 s | 0.26 s |  73 MB | 11% |
+| `--ast` (parse preludes) | 0.41 s | 0.15 s | 151 MB |  7% |
+| `--check` (typecheck) | 1.00 s | 0.59 s | 196 MB | 26% |
+| `--infer` (typecheck) | 0.97 s | -0.03 s | 196 MB |  0% |
+| default (emit C) | 1.52 s | 0.55 s | 306 MB | 24% |
+| `kai build` total (kaic2 + cc + shell, median 5 runs) | 2.31 s | 0.79 s | ~448 MB | 34% |
+
+The 2.31 s baseline is ~17% better than the 2.79 s recorded on
+2026-05-13. None of the intervening lanes touched the cache layer —
+the improvement comes from #574/#578 (typer fold simplification),
+#573 (LLVM lambda lift cleanup), and a handful of pre-typer cascade
+simplifications that landed in v0.56.4–0.56.6. The shape of the
+breakdown is unchanged; only absolute numbers shift.
 
 ### What the breakdown means
 
@@ -48,18 +53,19 @@ That changes what each cache layer must skip to be effective. Walls
 below are projected savings on the 2.79 s 2026-05-13 baseline:
 
 - **A.0 (cache `[Decl]` post-parse)** — skips lex+parse of preludes
-  only. Saves ~0.54 s. Wall → ~2.25 s. Mechanism: the 15+ pre-typer
+  only. Saves ~0.41 s. Wall → ~1.90 s. Mechanism: the 15+ pre-typer
   passes + the typer + codegen all still run on the merged
   prelude++user `[Decl]`.
 - **A.1 (cache typed `[Decl]` + per-module env deltas)** — skips
   the pre-typer cascade and the typer on the prelude. Saves an
-  additional ~0.77 s (parse+typecheck → from cache). Wall → ~1.48 s.
+  additional ~0.59 s (parse+typecheck → from cache). Wall → ~1.31 s.
   Mechanism: requires the typer-modularisation refactor's
-  **semantic step**, not just its API. See "What #460 did and did
-  not deliver" below.
+  **semantic step** AND a driver-side multi-segment refactor. See
+  "What #574 unblocked and the lower_protocols boundary it did not"
+  below.
 - **A.2 (cache through perceus + dead-code-emit on prelude)** —
   skips lower_protocols, perceus, and emit on prelude DFns that the
-  user does not reach. Saves the remaining ~0.75 s. Wall → ~0.73 s.
+  user does not reach. Saves the remaining ~0.55 s. Wall → ~0.76 s.
   Mechanism: emit walks only the user's reachability closure into
   the prelude; un-reached prelude DFns are skipped at emit. This
   reuses the dead-code elimination the compiler already performs
@@ -75,6 +81,72 @@ The shell+cc tail is its own engineering surface (a compilation
 daemon or direct LLVM emission); no cache layer touches it. Each
 A.x layer is independently shippable and independently useful, but
 none of them on its own reaches DoD #6.
+
+### What #574 unblocked and the lower_protocols boundary it did not
+
+PR #578 (issue #574, merged 2026-05-14) shipped the **semantic** half
+that #568 deferred. `typecheck_module(file, mod, inherited, …)` now
+actually consumes its `inherited: ModuleEnvDelta` parameter, and
+`typecheck_program` folds left-to-right across `[ModuleDecls]`
+threading the accumulating delta. The typer API is therefore ready
+for a cache loader to call as:
+
+```
+typecheck_program(file, [prelude_segment, user_segment], proto_impls, verbose)
+```
+
+where `prelude_segment` carries decls reconstructed from the cache
+and the typer reuses the prelude delta on `inherited` instead of
+recomputing it. Single-segment callers (every legacy driver call)
+keep the byte-identical baseline because the fold reduces to
+`typecheck_module(file, mod, empty_delta, …)`.
+
+**What is still missing for A.1**: the driver call site itself.
+`compile_source` (`stage2/compiler.kai:58150`) runs the 30+
+pre-typer passes — `qualtype_decls`, `rqc_decls`,
+`lower_pattern_narrow_decls`, `lower_consts`, `lower_axioms`,
+`inject_builtin_effects`, `expand_aliases_in_decls`, `expand_ta_decls`,
+`desugar_pos_records_decls`, `desugar_index_decls`,
+`desugar_var_decls`, `desugar_use_decls`, **`lower_protocols`**,
+`desugar_interp_decls`, `rename_proto_calls_decls`,
+`desugar_const_refs_decls`, `rewrite_nursery_caps_decls` — over
+`merged_raw = list_append(qualified_prelude, qualified_decls)`. The
+boundary between prelude and user decls is positional at line 58271
+and survives the per-element walkers, but `lower_protocols` itself
+ends with (`stage2/compiler.kai:52818`):
+
+```
+let final_decls = list_append(user_renamed,
+                              list_append(impl_renamed, dispatchers))
+```
+
+`impl_renamed` and `dispatchers` are freshly-synthesised decls
+that interleave prelude- and user-side protocol material; the
+positional boundary between prelude- and user-origin decls is
+destroyed here. Any cache loader handing the typer two
+`ModuleDecls` segments needs either:
+
+- a refactor of `lower_protocols` (and the desugar passes that
+  follow it) so each output decl carries a `module_origin` tag
+  the loader can partition on; or
+- a different cache payload boundary — e.g. cache **post-pre-typer-
+  cascade**, after every walker has run, accept that the cache no
+  longer skips parse, and ship A.1 as "skip everything between
+  parse and typer for the prelude". That bumps the saving from
+  0.59 s (A.1's typer-only target) to ~0.76 s (parse + cascade +
+  typer), but moves the cache payload past 15 more passes that all
+  change shape across kaikai versions — every walker addition or
+  removal is a payload bump.
+
+The cleaner path is to tag the synthesised decls. The estimate is
+~300-500 LOC across `lower_protocols`, `desugar_interp_decls`, and
+`rename_proto_calls_decls`. The selfhost byte-identical gate is
+the typer caring about origin tags — today it does not, so origin
+is purely tracking metadata.
+
+Neither path is a one-line driver tweak. The cache lane that ships
+A.1 owns this refactor (or chooses the payload-boundary alternative
+above and pays for it in format-version churn).
 
 ### What #460 did and did not deliver
 
@@ -136,6 +208,11 @@ varies across the three sub-phases is the *payload schema*:
   cached prelude knows which DFns are *candidates* for emit; the
   user's reachability closure picks the subset. Requires emit to
   consume a cache + reachability seed. Depends on A.1.
+
+  Note: A.2's saving is the largest individual chunk (~0.55 s of
+  emit-on-prelude on the 2026-05-14 baseline) and is what brings
+  the wall under ~1 s. A.0 + A.1 alone leave the codegen pass running
+  over the full prelude DFn set.
 
 ### Serialisation primitive
 
@@ -384,14 +461,14 @@ old caches die, users rebuild once. Move on.
 ## Acceptance per phase
 
 Numbers below are expected walls after each layer ships, on a
-2026-05-13 M2 Pro baseline of 2.79 s for `kai build empty.kai`
-(32 preludes, post-#572/#573). Tier 0 + Tier 1 + Tier 1-ASAN green
+2026-05-14 M2 Pro baseline of 2.31 s for `kai build empty.kai`
+(32 preludes, post-#578). Tier 0 + Tier 1 + Tier 1-ASAN green
 and selfhost byte-identical are gates for every sub-phase.
 
 ### Phase A.0 — post-parse cache
 
-- Warm wall: ≤ 2.25 s (cache-hit on all 32 preludes).
-- Saves: 0.54 s lex+parse.
+- Warm wall: ≤ 1.90 s (cache-hit on all 32 preludes).
+- Saves: 0.41 s lex+parse.
 - Cache invalidates on: source sha change, kaikai_version_hash
   change, header corruption (magic / checksum / version
   mismatch). Four negative fixtures verify.
@@ -413,31 +490,41 @@ and selfhost byte-identical are gates for every sub-phase.
 
 ### Phase A.1 — post-typecheck cache
 
-- Warm wall: ≤ 1.48 s.
-- Saves: an additional ~0.77 s (typecheck + cascade on prelude).
+- Warm wall: ≤ 1.31 s.
+- Saves: an additional ~0.59 s (typecheck on prelude). Note:
+  caching post-typer alone does NOT save the ~0.20 s of pre-typer
+  cascade — those passes run before the typer call site, so the
+  cache loader bypasses them only if it hands the typer prelude
+  decls that already went through the cascade. See "What #574
+  unblocked and the lower_protocols boundary it did not" above.
 - **Pre-blockers:**
-  - **#574** — typer per-module semantics (sub-step 3d-future of
-    #460). API landed in #568; `inherited: ModuleEnvDelta` is
-    today an unread parameter. Re-threading `build_ty_env`, the
-    alias resolver, and the record/sum/op-to-eff collectors per
-    module; 2 500–4 000 LOC, selfhost-byte-identical risk
-    non-trivial.
+  - **#574 (closed by #578, 2026-05-14)** — typer per-module
+    semantics. `typecheck_module` now consumes `inherited:
+    ModuleEnvDelta` and `typecheck_program` folds across segments.
+    A multi-segment cache loader can drive the typer today.
+  - **Open — `lower_protocols` boundary destruction.** The driver
+    call site mixes prelude- and user-origin decls after
+    `lower_protocols`'s `[user_renamed, impl_renamed, dispatchers]`
+    concat. A cache loader has no way to recover the per-module
+    boundary from the post-cascade decl stream. Mitigation paths
+    documented in §"What #574 unblocked and the lower_protocols
+    boundary it did not".
   - The A.1 payload extends the A.0 payload with the
     `ModuleEnvDelta` struct (`ty_entries`, `unions`,
     `op_eff_arities`, `recs`, `sums`, `op_to_eff`,
-    `unit_aliases`). The semantic refactor will likely also
-    introduce alias-resolution / proto-impl-table deltas, which
-    the format needs to carry — payload schema cannot be frozen
-    until the refactor lands.
+    `unit_aliases`). The boundary-tagging refactor will likely
+    add a `module_origin` field to every Decl, which the format
+    needs to carry — payload schema cannot be frozen until the
+    refactor lands.
 - Builds on A.0 wire-up; payload schema variant byte changes
   (0x00 → 0x01).
 
 ### Phase A.2 — post-perceus + emit-only-user
 
-- Warm wall: ≤ 0.73 s. The remaining ~0.43 s is shell + cc + the
+- Warm wall: ≤ 0.76 s. The remaining ~0.43 s is shell + cc + the
   pieces of emit that scale with the user file rather than the
   prelude.
-- Saves: the ~0.75 s of codegen passes (lower_protocols + perceus +
+- Saves: the ~0.55 s of codegen passes (lower_protocols + perceus +
   emit walking) on the prelude.
 - Pre-blocker: A.1.
 - Mechanism: emit takes the cached prelude as input + the user's
@@ -445,7 +532,7 @@ and selfhost byte-identical are gates for every sub-phase.
 
 ### DoD #6 (≤ 300 ms)
 
-A.0 + A.1 + A.2 cumulatively reach ~0.73 s wall on the current
+A.0 + A.1 + A.2 cumulatively reach ~0.76 s wall on the current
 baseline. Closing the remaining gap to 300 ms requires either:
 
 - A compilation daemon (Phase C) that amortises the fixed cc + shell

@@ -58808,6 +58808,379 @@ fn run(opts: CliOptions) : Int / Console + File {
   }
 }
 
+# ============================================================
+# Phase A.0 cache (issue #452) — serialise [Decl] post-parse to a
+# textual `.kab` blob that kaic2 can deserialise faster than
+# re-parsing the prelude source. The format is "KAB1" header +
+# hex-encoded payload; hex (2 chars per byte) is portable across
+# the stage1 compiler which does not yet handle the `Byte` type or
+# raw binary string interpolation. Every byte 0..255 maps to two
+# uppercase hex chars [0-9A-F]. Round-trip is `bytes -> hex_str ->
+# bytes`; the on-disk file is plain ASCII hex with newline-separated
+# header lines.
+#
+# Header (4 lines, newline-separated, ASCII):
+#   KAB1
+#   <format_version u32 hex, 8 chars>
+#   <kaikai_version_hash u32 hex, 8 chars>
+#   <source_sha256 hex, 64 chars>
+# Body:
+#   <payload as hex chars, length defined by serialiser>
+#
+# `KAI_CACHE_FORMAT_VERSION` is bumped on every change to the
+# serialiser/deserialiser layout. `KAI_CACHE_KAIKAI_VERSION_HASH`
+# is bumped on every kaikai release (this file is the
+# authoritative source; bin/kai reads `VERSION` separately and
+# hashes it for the cache key).
+
+fn cache_format_version() : Int = 1
+
+fn cache_magic() : String = "KAB1"
+
+# Convert a 0..15 nibble into its hex char. Defined inline so the
+# helper can be called from inside the cache serdes without
+# pulling stdlib dependencies into the compiler.
+fn cache_hex_char(n: Int) : String =
+  if n == 0 { "0" } else if n == 1 { "1" } else if n == 2 { "2" }
+  else if n == 3 { "3" } else if n == 4 { "4" } else if n == 5 { "5" }
+  else if n == 6 { "6" } else if n == 7 { "7" } else if n == 8 { "8" }
+  else if n == 9 { "9" } else if n == 10 { "A" } else if n == 11 { "B" }
+  else if n == 12 { "C" } else if n == 13 { "D" } else if n == 14 { "E" }
+  else { "F" }
+
+# Encode a single byte 0..255 as two hex chars.
+fn cache_byte_to_hex(b: Int) : String {
+  let m = if b < 0 { 0 } else if b > 255 { 255 } else { b }
+  string_concat(cache_hex_char(m / 16), cache_hex_char(m % 16))
+}
+
+# Decode one hex char into 0..15, or -1 on invalid input.
+fn cache_hex_to_nibble(c: Char) : Int {
+  let n = char_to_int(c)
+  if n >= 48 and n <= 57 { n - 48 }          # '0'..'9'
+  else if n >= 65 and n <= 70 { n - 65 + 10 } # 'A'..'F'
+  else if n >= 97 and n <= 102 { n - 97 + 10 } # 'a'..'f' (lenient)
+  else { -1 }
+}
+
+# Decode two hex chars from `buf` at position `pos`. Returns Some
+# byte value on success, None on truncation or invalid char.
+fn cache_hex_byte_at(buf: String, pos: Int) : Option[Int] {
+  if pos + 2 > string_length(buf) { None }
+  else { match char_at(buf, pos) {
+    None -> None
+    Some(c1) -> match char_at(buf, pos + 1) {
+      None -> None
+      Some(c2) -> {
+        let h = cache_hex_to_nibble(c1)
+        let l = cache_hex_to_nibble(c2)
+        if h < 0 or l < 0 { None } else { Some(h * 16 + l) }
+      }
+    }
+  } }
+}
+
+# Encode a 32-bit unsigned int as 8 hex chars (4 bytes LE).
+fn cache_u32_to_hex(n: Int) : String {
+  let b0 = n % 256
+  let r0 = (n - b0) / 256
+  let b1 = r0 % 256
+  let r1 = (r0 - b1) / 256
+  let b2 = r1 % 256
+  let r2 = (r1 - b2) / 256
+  let b3 = r2 % 256
+  concat_all([cache_byte_to_hex(b0), cache_byte_to_hex(b1),
+              cache_byte_to_hex(b2), cache_byte_to_hex(b3)])
+}
+
+# Decode 4 LE bytes at position `pos` into an Int. Returns None on
+# truncation or invalid hex.
+fn cache_hex_to_u32(buf: String, pos: Int) : Option[CacheIntPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(b0) -> match cache_hex_byte_at(buf, pos + 2) {
+      None -> None
+      Some(b1) -> match cache_hex_byte_at(buf, pos + 4) {
+        None -> None
+        Some(b2) -> match cache_hex_byte_at(buf, pos + 6) {
+          None -> None
+          Some(b3) -> Some(CIP(b0 + b1 * 256 + b2 * 65536 + b3 * 16777216,
+                                pos + 8))
+        }
+      }
+    }
+  }
+}
+
+type CacheIntPos = CIP(Int, Int)
+type CacheStrPos = CSP(String, Int)
+type CacheBoolPos = CBP(Bool, Int)
+
+# Encode a signed 64-bit Int as 16 hex chars (8 bytes LE). Uses the
+# same two's-complement masking trick as `bin_int_to_bytes` in
+# stdlib/protocols.kai so negative values round-trip exactly.
+fn cache_int_to_hex(n: Int) : String =
+  cache_int_to_hex_loop(n, 8, "")
+
+fn cache_int_to_hex_loop(cur: Int, remaining: Int, acc: String) : String {
+  if remaining <= 0 { acc }
+  else {
+    let r = cur % 256
+    let b = if r < 0 { r + 256 } else { r }
+    cache_int_to_hex_loop((cur - b) / 256, remaining - 1,
+                             string_concat(acc, cache_byte_to_hex(b)))
+  }
+}
+
+# Decode 8 LE bytes at position `pos` into a signed Int.
+fn cache_hex_to_int(buf: String, pos: Int) : Option[CacheIntPos] =
+  cache_hex_to_int_loop(buf, pos, 0, 1, 0)
+
+fn cache_hex_to_int_loop(buf: String, pos: Int, k: Int,
+                           place: Int, acc: Int) : Option[CacheIntPos] {
+  if k >= 8 { Some(CIP(acc, pos)) }
+  else {
+    match cache_hex_byte_at(buf, pos) {
+      None -> None
+      Some(b) -> {
+        let nxt = acc + b * place
+        let m = if k == 7 {
+          # Top byte: sign-extend if high bit is set.
+          if b >= 128 { nxt - 256 * place } else { nxt }
+        } else { nxt }
+        cache_hex_to_int_loop(buf, pos + 2, k + 1, place * 256, m)
+      }
+    }
+  }
+}
+
+# Encode a Bool as one hex byte (00 / 01).
+fn cache_bool_to_hex(b: Bool) : String =
+  if b { "01" } else { "00" }
+
+fn cache_hex_to_bool(buf: String, pos: Int) : Option[CacheBoolPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(CBP(false, pos + 2))
+    Some(1) -> Some(CBP(true, pos + 2))
+    Some(_) -> None
+  }
+}
+
+# Encode a String as length4 (8 hex chars) + per-byte hex of each
+# source byte. Iteration is by codepoint via `char_at`, which is
+# the only string-reader stage1 supports; the encoded bytes are the
+# low 8 bits of each codepoint. This is sound for ASCII source
+# files (every kaikai source today is ASCII); non-ASCII chars
+# would silently truncate, so the caller must only pass ASCII
+# strings. Source files of preludes are ASCII.
+fn cache_string_to_hex(s: String) : String {
+  let n = string_length(s)
+  string_concat(cache_u32_to_hex(n), cache_string_chars_to_hex(s, 0, n, ""))
+}
+
+fn cache_string_chars_to_hex(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else { match char_at(s, i) {
+    None -> acc
+    Some(c) -> {
+      let b = char_to_int(c) % 256
+      let bb = if b < 0 { b + 256 } else { b }
+      cache_string_chars_to_hex(s, i + 1, n,
+                                  string_concat(acc, cache_byte_to_hex(bb)))
+    }
+  } }
+}
+
+fn cache_hex_to_string(buf: String, pos: Int) : Option[CacheStrPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip {
+      CIP(n, pos2) ->
+        cache_hex_collect_string(buf, pos2, n, "")
+    }
+  }
+}
+
+fn cache_hex_collect_string(buf: String, pos: Int, remaining: Int,
+                              acc: String) : Option[CacheStrPos] {
+  if remaining <= 0 { Some(CSP(acc, pos)) }
+  else {
+    match cache_hex_byte_at(buf, pos) {
+      None -> None
+      Some(b) ->
+        cache_hex_collect_string(buf, pos + 2, remaining - 1,
+                                   string_concat(acc, "#{int_to_char(b)}"))
+    }
+  }
+}
+
+# Encode an Option[String] as 1 tag byte + (if Some) the encoded
+# String.
+fn cache_opt_string_to_hex(o: Option[String]) : String = match o {
+  None -> "00"
+  Some(s) -> string_concat("01", cache_string_to_hex(s))
+}
+
+fn cache_hex_to_opt_string(buf: String, pos: Int) : Option[CacheOptStrPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(COSP(None, pos + 2))
+    Some(1) -> match cache_hex_to_string(buf, pos + 2) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p2) -> Some(COSP(Some(s), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+type CacheOptStrPos = COSP(Option[String], Int)
+
+# Encode an Option[Int] as 1 tag byte + (if Some) 16 hex chars.
+fn cache_opt_int_to_hex(o: Option[Int]) : String = match o {
+  None -> "00"
+  Some(n) -> string_concat("01", cache_int_to_hex(n))
+}
+
+fn cache_hex_to_opt_int(buf: String, pos: Int) : Option[CacheOptIntPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(COIP(None, pos + 2))
+    Some(1) -> match cache_hex_to_int(buf, pos + 2) {
+      None -> None
+      Some(cip) -> match cip { CIP(n, p2) -> Some(COIP(Some(n), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+type CacheOptIntPos = COIP(Option[Int], Int)
+
+# Encode a [String] as length4 + each encoded String.
+fn cache_string_list_to_hex(xs: [String]) : String =
+  string_concat(cache_u32_to_hex(list_length(xs)),
+                  cache_string_list_loop(xs, ""))
+
+fn cache_string_list_loop(xs: [String], acc: String) : String = match xs {
+  [] -> acc
+  [h, ...t] -> cache_string_list_loop(t, string_concat(acc, cache_string_to_hex(h)))
+}
+
+fn cache_hex_to_string_list(buf: String, pos: Int) : Option[CacheStrListPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip {
+      CIP(n, pos2) -> cache_hex_collect_string_list(buf, pos2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_string_list(buf: String, pos: Int, remaining: Int,
+                                    acc: [String]) : Option[CacheStrListPos] {
+  if remaining <= 0 { Some(CSLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp {
+        CSP(s, p2) -> cache_hex_collect_string_list(buf, p2, remaining - 1,
+                                                      [s, ...acc])
+      }
+    }
+  }
+}
+
+type CacheStrListPos = CSLP([String], Int)
+
+# `cache_file_header(source_sha)` produces the 4-line ASCII header
+# (terminated by a trailing newline). The caller appends the
+# hex-encoded payload after this header.
+fn cache_file_header(source_sha: String) : String =
+  concat_all([cache_magic(), "\n",
+              cache_u32_to_hex(cache_format_version()), "\n",
+              cache_u32_to_hex(cache_kaikai_version_hash()), "\n",
+              source_sha, "\n"])
+
+# Bumped on every kaikai release. Currently hard-coded; the build
+# system can override via a future code-gen step.
+fn cache_kaikai_version_hash() : Int = 1
+
+# Parse the cache file header from `buf`. Returns the source SHA
+# the file claims to hash, plus the offset where the payload begins
+# (right after the trailing newline of line 4). Returns `None` if
+# any of magic / version / sha lines are malformed or mismatch the
+# current compiler's expectations.
+fn cache_read_header(buf: String) : Option[CacheHdr] {
+  # Line 1: magic
+  let m1 = cache_read_line(buf, 0)
+  match m1 {
+    None -> None
+    Some(rl1) -> match rl1 {
+      CRL(line, p1) ->
+        if line != cache_magic() { None }
+        else {
+          # Line 2: format version (must match)
+          let m2 = cache_read_line(buf, p1)
+          match m2 {
+            None -> None
+            Some(rl2) -> match rl2 {
+              CRL(line2, p2) -> match cache_hex_to_u32(line2, 0) {
+                None -> None
+                Some(cip) -> match cip { CIP(fv, _) ->
+                  if fv != cache_format_version() { None }
+                  else {
+                    # Line 3: kaikai version hash
+                    let m3 = cache_read_line(buf, p2)
+                    match m3 {
+                      None -> None
+                      Some(rl3) -> match rl3 {
+                        CRL(line3, p3) -> match cache_hex_to_u32(line3, 0) {
+                          None -> None
+                          Some(cip2) -> match cip2 { CIP(kv, _) ->
+                            if kv != cache_kaikai_version_hash() { None }
+                            else {
+                              # Line 4: source sha (64 hex chars)
+                              let m4 = cache_read_line(buf, p3)
+                              match m4 {
+                                None -> None
+                                Some(rl4) -> match rl4 {
+                                  CRL(sha, p4) ->
+                                    if string_length(sha) != 64 { None }
+                                    else { Some(CHdr(sha, p4)) }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+    }
+  }
+}
+
+type CacheReadLine = CRL(String, Int)
+type CacheHdr = CHdr(String, Int)
+
+fn cache_read_line(buf: String, pos: Int) : Option[CacheReadLine] =
+  cache_read_line_loop(buf, pos, pos)
+
+fn cache_read_line_loop(buf: String, start: Int,
+                          cur: Int) : Option[CacheReadLine] {
+  if cur >= string_length(buf) { None }
+  else { match char_at(buf, cur) {
+    None -> None
+    Some(c) ->
+      if char_to_int(c) == 10 {
+        Some(CRL(string_slice(buf, start, cur - start), cur + 1))
+      } else { cache_read_line_loop(buf, start, cur + 1) }
+  } }
+}
+
 fn main() {
   let code = run(parse_cli(args()))
   exit(code)
