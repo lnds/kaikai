@@ -84,6 +84,15 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.56.2 (2026-05-13)
+
+### Changed
+
+- **typer**: make typecheck_module the typer entry point, infer_program_with_protos a thin wrapper (refs #460)
+- **typer**: extract collect_program_data from infer_program_with_protos (refs #460)
+- **typer**: split build_ty_env into seed + per-module (refs #460)
+- **typer**: introduce ModuleEnvDelta and typecheck_module API (refs #460)
+
 ## v0.56.1 (2026-05-13)
 
 ### Fixed
