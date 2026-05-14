@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.56.5 (2026-05-14)
+
+### Fixed
+
+- **emit**: LLVM backend installs Spawn default handler in kai_main (closes #570)
+
 ## v0.56.4 (2026-05-13)
 
 ### Fixed
