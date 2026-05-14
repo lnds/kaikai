@@ -84,6 +84,15 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.56.1 (2026-05-13)
+
+### Fixed
+
+- **typer**: privacy check preserves home attribution across import chains (closes #565)
+- **typer**: refinement type aliases support subtyping to base (closes #449, closes #505)
+- **typer**: Actor[T] row absorption with nested with_mailbox (closes #532)
+- **release**: use TAP_PAT for cross-repo gh API calls
+
 ## v0.56.0 (2026-05-13)
 
 ### Added
