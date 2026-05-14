@@ -46461,8 +46461,15 @@ fn llvm_emit_list_tail(e: LlvmEmit, elems: [ListElem]) : LlvmEmit / Console {
 fn llvm_emit_lambda_ref(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
   match find_lam(e.lams, x.line, x.col) {
     None -> {
-      eprint("llvm: lambda info missing at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
-      llvm_set_last(e, "undef")
+      # Issue #571: a missing LamInfo at codegen used to emit `undef`
+      # plus a stderr warning. The resulting binary referenced an
+      # invalid closure pointer and crashed at runtime (`ldr x1, [x0]`
+      # with x0==NULL) the moment the closure was invoked. The
+      # populating + lookup invariant is now maintained by
+      # `llvm_emit_lambda_bodies` (passes the full table, not the
+      # remaining tail), so reaching this branch indicates a compiler
+      # bug that we surface loudly rather than ship a broken binary.
+      panic("kaic: internal error: llvm lambda info missing at #{int_to_string(x.line)}:#{int_to_string(x.col)} — please file an issue against kaikai")
     }
     Some(l) -> match l {
       LamInfo(id, _, _, params, caps, _) -> {
@@ -47519,13 +47526,25 @@ fn llvm_emit_lambda_capture_loads(e: LlvmEmit, caps: [String], i: Int) : LlvmEmi
   }
 }
 
+# Issue #571: walks `remaining` while passing the FULL `all_lams`
+# table down to each `llvm_emit_lambda_body` call. The earlier shape
+# reused the same parameter for both, so the LamInfo for an inner
+# nested lambda was dropped from the table by the time its enclosing
+# lambda's body was emitted; `find_lam` then failed at the inner
+# `ELambda` use site and the emitter substituted `undef` for the
+# closure pointer (visible as the "lambda info missing" stderr line).
 fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : String / Console {
 
-  match lams {
+  llvm_emit_lambda_bodies_loop(lams, lams, fns, vs, oo, cls, start_id, acc)
+}
+
+fn llvm_emit_lambda_bodies_loop(remaining: [LamInfo], all_lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : String / Console {
+
+  match remaining {
     [] -> acc
     [l, ...rest] -> {
-      let out = llvm_emit_lambda_body(l, fns, vs, lams, oo, cls, start_id)
-      llvm_emit_lambda_bodies(rest, fns, vs, oo, cls, out.next_id, string_concat(acc, out.text))
+      let out = llvm_emit_lambda_body(l, fns, vs, all_lams, oo, cls, start_id)
+      llvm_emit_lambda_bodies_loop(rest, all_lams, fns, vs, oo, cls, out.next_id, string_concat(acc, out.text))
     }
   }
 }
