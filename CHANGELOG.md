@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.58.0 (2026-05-14)
+
+### Added
+
+- **cache**: AST record serdes — Phase A.0 step 2 (refs #452)
+
 ## v0.57.1 (2026-05-14)
 
 ### Fixed
