@@ -167,6 +167,7 @@ full Koka feature set needs.
 | Phase 1 — small-int + char cache | Cache hits for ints in [-128, 127] / chars [0, 127] reuse singletons; no alloc | ✅ landed (`69c6166`) | 50–100× slower (cache hits free, miss boxes) |
 | Phase 2 — locals + return values unboxed | `Int` / `Bool` / `Char` / `Real` live in C `int64_t` / `int` / `double` directly inside fn bodies; boxing only at call boundaries and storage edges. | ✅ landed | 5–10× slower (boxing at call boundaries) |
 | **Phase 3 — call boundaries unboxed (#383)** | Top-level fns with all-primitive concrete signatures emit raw C signatures (`int64_t fib(int64_t)` etc.). Boxing collapses to ~zero on compute-only programs. | ✅ landed 2026-05-09 | **~1× C on compute (fib 1.0×, Euler #4 1.05×)** |
+| Phase 4 Option A — variant field unboxing (#440) | Each user variant whose declaration spells `Int` / `Real` literally gets a typed payload slot encoded in `slot_mask`; the runtime walkers (free, eq, to_string, reuse) branch on per-slot kind; cells with all-pointer payloads stay on the legacy hot path. | 🟡 layout shipped 2026-05-14, gate not met | 12.6× C on RB-tree (down from 15.9× C baseline #439). Target was ≤ 10× C; follow-up lane needed for primitive-slot extract that survives without a fresh `kai_int` alloc. |
 | Phase 4 — full unboxing (Tier 3 below) | Reuse-in-place, drop specialisation, regions, cross-fiber unboxed messages, type-erased layouts | ⏳ post-MVP | matches C across the whole alloc mix |
 
 **Phase 2 scope** (single lane after `fibers-tier-2` closes):
