@@ -135,6 +135,22 @@ typedef union {
     int8_t    b;
 } KaiVarSlot;
 
+/* Issue #440 Phase 2 — slot kind decoder. 2 bits per slot in
+ * `slot_mask`; bit pair at position (2*i) encodes slot i's kind:
+ *   0 = pointer (KaiValue *) — legacy
+ *   1 = Int (int64_t, .i64)
+ *   2 = Real (double, .r)
+ *   3 = reserved
+ * Variants with >16 slots fall back to mask=0 (all pointer) since the
+ * encoding exhausts the 32-bit mask. */
+#define KAI_VAR_SLOT_PTR  0u
+#define KAI_VAR_SLOT_INT  1u
+#define KAI_VAR_SLOT_REAL 2u
+
+static inline uint32_t kai_var_slot_kind(uint32_t mask, int i) {
+    return (mask >> (2 * (uint32_t) i)) & 3u;
+}
+
 struct KaiValue {
     int32_t rc;
     int32_t tag;
@@ -1665,11 +1681,18 @@ static void kai_free_value(KaiValue *v) {
         case KAI_VARIANT:
             KAI_VAR_NAME_FREE(v->as.var.variant_name);
             /* Issue #440 — only pointer slots cascade through decref.
-             * In Phase 1 every slot is a pointer (mask=0), so the
-             * walk degenerates to the pre-#440 behaviour. Phase 2 will
-             * branch on `(slot_mask >> (2*i)) & 3` and skip primitive
-             * slots. */
-            for (int i = 0; i < v->as.var.n_args; ++i) kai_decref(v->as.var.slots[i].ptr);
+             * Phase 2: primitive slots (mask kind != PTR) carry raw
+             * scalars and need no RC. The mask==0 hot path skips the
+             * kind branch entirely. */
+            if (v->as.var.slot_mask == 0) {
+                for (int i = 0; i < v->as.var.n_args; ++i) kai_decref(v->as.var.slots[i].ptr);
+            } else {
+                for (int i = 0; i < v->as.var.n_args; ++i) {
+                    if (kai_var_slot_kind(v->as.var.slot_mask, i) == KAI_VAR_SLOT_PTR) {
+                        kai_decref(v->as.var.slots[i].ptr);
+                    }
+                }
+            }
             free(v->as.var.slots);
             break;
         case KAI_CLOSURE:
@@ -2224,6 +2247,69 @@ static KAI_RC_NOINLINE KaiValue *kai_variant(int32_t tag, const char *name, int 
     return v;
 }
 
+/* Issue #440 Phase 2 — variant constructor with typed payload slots.
+ * Called by stage 2 emitter when at least one payload slot is a
+ * primitive (Int or Real). `slots` is borrowed by the constructor:
+ * each slot value is copied verbatim into the new cell. For pointer
+ * slots the caller transfers ownership exactly like the legacy
+ * `kai_variant` path. Singleton caches (nullary / immortal) are NOT
+ * consulted on this path; Phase 2 only takes the typed-construction
+ * fast path when there is at least one unboxed primitive — those
+ * cells have no boxed-equivalent in the existing cache shape.
+ * Returns an owning ref. */
+static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
+                                               int n, uint32_t mask,
+                                               KaiVarSlot *slots) {
+    KAI_VAR_NAME_ALLOC(name);
+    KAI_VAR_NAME_REAL_ALLOC(name);
+    KaiValue *v = kai_alloc(KAI_VARIANT);
+    v->as.var.variant_tag = tag;
+    v->as.var.variant_name = name;
+    v->as.var.n_args = n;
+    v->as.var.slot_mask = mask;
+    if (n > 0) {
+        v->as.var.slots = (KaiVarSlot *) malloc(n * sizeof(KaiVarSlot));
+        for (int i = 0; i < n; ++i) v->as.var.slots[i] = slots[i];
+    } else {
+        v->as.var.slots = NULL;
+    }
+    return v;
+}
+
+/* Issue #440 Phase 2 — borrow a slot as a boxed `KaiValue *`. Used by
+ * match-arm extraction, by the generic walkers (eq, to_string) and by
+ * any other code path that needs the boxed view. For pointer slots
+ * this returns the boxed child directly (still owned by the cell).
+ * For primitive slots this allocates a fresh boxed temporary that the
+ * caller owns and must release. Hot path: pointer slots are the
+ * majority by far in legacy code; the branch predictor sees one
+ * direction. */
+static inline KaiValue *kai_variant_slot_box(KaiValue *v, int i) {
+    uint32_t k = kai_var_slot_kind(v->as.var.slot_mask, i);
+    if (k == KAI_VAR_SLOT_PTR)  return v->as.var.slots[i].ptr;
+    if (k == KAI_VAR_SLOT_INT)  return kai_int(v->as.var.slots[i].i64);
+    if (k == KAI_VAR_SLOT_REAL) return kai_real(v->as.var.slots[i].r);
+    return v->as.var.slots[i].ptr;
+}
+
+/* Issue #440 Phase 2 — consume a boxed Int / Real, return the raw
+ * scalar and release the boxed temporary. Used by the stage 2
+ * emitter when packing a primitive payload into a typed variant
+ * slot: the call expression yields a boxed `KaiValue *` (already
+ * possibly cached as a singleton), and we want the raw payload to
+ * write into `slot.i64` / `slot.r`. Singleton Ints (rc == INT32_MAX)
+ * survive the decref unchanged. */
+static inline int64_t kai_take_int(KaiValue *v) {
+    int64_t x = v->as.i;
+    kai_decref(v);
+    return x;
+}
+static inline double kai_take_real(KaiValue *v) {
+    double x = v->as.r;
+    kai_decref(v);
+    return x;
+}
+
 /* ---------- Perceus reuse-in-place (issue #118 / Anga Roa wave) ----------
  *
  * Koka-style reuse-in-place: when a constructor consumes a value the
@@ -2303,18 +2389,21 @@ static KaiValue *kai_reuse_or_alloc_variant(KaiValue *_scr,
                                             int32_t tag, const char *name,
                                             int n, KaiValue **args) {
     if (_scr != NULL && _scr->tag == KAI_VARIANT &&
-        _scr->as.var.n_args == n && kai_check_unique(_scr)) {
-        /* Phase 1: reuse only legal on mask==0 (all-pointer) cells.
-         * Phase 2 will widen this once primitive slots can appear in
-         * the source layout; for now the recogniser only fires on
-         * legacy cells. */
+        _scr->as.var.n_args == n && _scr->as.var.slot_mask == 0 &&
+        kai_check_unique(_scr)) {
+        /* Phase 2: reuse fires only on legacy mask==0 cells. A typed
+         * cell (mask != 0) carries unboxed scalars whose slot kinds
+         * would have to be re-derived from the rebuild context — the
+         * recogniser does not yet ship that path. The Perceus
+         * recogniser in stage 2 still only synthesises this call for
+         * boxed-arg constructors, so the precondition matches the
+         * emit side. */
         for (int i = 0; i < n; ++i) {
             kai_decref(_scr->as.var.slots[i].ptr);
             _scr->as.var.slots[i].ptr = args[i];
         }
         _scr->as.var.variant_tag  = tag;
         _scr->as.var.variant_name = name;
-        _scr->as.var.slot_mask    = 0;
         kai_rc_reuse_total++;
         return kai_incref(_scr);
     }
@@ -2484,11 +2573,28 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
         case KAI_VARIANT:
             if (a->as.var.variant_tag != b->as.var.variant_tag) return 0;
             if (a->as.var.n_args != b->as.var.n_args) return 0;
-            /* Phase 1: mask is always 0 on both sides → compare slots
-             * as pointers exactly as before. Phase 2 will dispatch on
-             * the per-slot kind. */
-            for (int i = 0; i < a->as.var.n_args; ++i) {
-                if (!kai_op_eq(a->as.var.slots[i].ptr, b->as.var.slots[i].ptr)) return 0;
+            /* Phase 2: if either cell carries primitive slots, the
+             * masks must agree slot-by-slot (a variant of the same
+             * tag/name must have the same layout). Then compare each
+             * slot by its kind: pointer slots recurse via kai_op_eq,
+             * primitive slots compare raw scalars. The mask==0 hot
+             * path stays on the original pointer-by-pointer walk. */
+            if (a->as.var.slot_mask == 0 && b->as.var.slot_mask == 0) {
+                for (int i = 0; i < a->as.var.n_args; ++i) {
+                    if (!kai_op_eq(a->as.var.slots[i].ptr, b->as.var.slots[i].ptr)) return 0;
+                }
+            } else {
+                if (a->as.var.slot_mask != b->as.var.slot_mask) return 0;
+                for (int i = 0; i < a->as.var.n_args; ++i) {
+                    uint32_t k = kai_var_slot_kind(a->as.var.slot_mask, i);
+                    if (k == KAI_VAR_SLOT_PTR) {
+                        if (!kai_op_eq(a->as.var.slots[i].ptr, b->as.var.slots[i].ptr)) return 0;
+                    } else if (k == KAI_VAR_SLOT_INT) {
+                        if (a->as.var.slots[i].i64 != b->as.var.slots[i].i64) return 0;
+                    } else if (k == KAI_VAR_SLOT_REAL) {
+                        if (a->as.var.slots[i].r != b->as.var.slots[i].r) return 0;
+                    }
+                }
             }
             return 1;
         case KAI_RECORD:
@@ -2552,11 +2658,20 @@ static KaiValue *kai_to_string(KaiValue *v) {
             KaiValue *acc = kai_str(v->as.var.variant_name);
             if (v->as.var.n_args > 0) {
                 KaiValue *lp = kai_string_concat(acc, kai_str("(")); kai_decref(acc); acc = lp;
-                /* Phase 1: every slot is a pointer (mask=0) so the
-                 * boxed kai_to_string call works unchanged. */
+                /* Phase 2: primitive slots are boxed on-the-fly via
+                 * kai_variant_slot_box; for the mask==0 hot path it
+                 * just returns the stored pointer. */
                 for (int i = 0; i < v->as.var.n_args; ++i) {
                     if (i) { KaiValue *sep = kai_string_concat(acc, kai_str(", ")); kai_decref(acc); acc = sep; }
-                    KaiValue *s = kai_to_string(v->as.var.slots[i].ptr);
+                    uint32_t k = kai_var_slot_kind(v->as.var.slot_mask, i);
+                    KaiValue *s;
+                    if (k == KAI_VAR_SLOT_PTR) {
+                        s = kai_to_string(v->as.var.slots[i].ptr);
+                    } else {
+                        KaiValue *tmp = kai_variant_slot_box(v, i);
+                        s = kai_to_string(tmp);
+                        kai_decref(tmp);
+                    }
                     KaiValue *c = kai_string_concat(acc, s); kai_decref(acc); kai_decref(s); acc = c;
                 }
                 KaiValue *rp = kai_string_concat(acc, kai_str(")")); kai_decref(acc); acc = rp;
