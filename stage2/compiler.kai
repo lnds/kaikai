@@ -27070,6 +27070,32 @@ fn build_ty_env_module(seed: BuiltEnv, decls: [Decl],
              op_eff_arities: r.arities }
 }
 
+# Issue #574 — `build_ty_env_module` variant that seeds the working
+# env from a `ModuleEnvDelta` previously contributed by an upstream
+# module (typically the prelude). The seed entries (built-in
+# prelude + built-in variants) precede `inherited.ty_entries`, then
+# `add_decls_loop` registers this module's decls on top. The
+# resulting `BuiltEnv` carries `prelude_len` for the built-in
+# boundary unchanged — `prelude_len` is the built-in seed length, an
+# invariant of the compiler binary, NOT a per-module quantity (see
+# the #460 retrospective on `prelude_len`).
+#
+# When `inherited == module_env_delta_empty()` the result is exactly
+# `build_ty_env_module(seed, decls, unions, top_names)`, so callers
+# that have no upstream delta keep the pre-#574 byte-identical path.
+fn build_ty_env_inherited(seed: BuiltEnv, inherited: ModuleEnvDelta,
+                            decls: [Decl], unions: [UnionInfo],
+                            top_names: [String]) : BuiltEnv {
+  let seeded_entries = list_append(inherited.ty_entries, seed.env.entries)
+  let env_in = TyEnv {
+    entries: seeded_entries, fresh: seed.env.fresh, unions: unions
+  }
+  let ar_in = list_append(inherited.op_eff_arities, seed.op_eff_arities)
+  let r = add_decls_loop(env_in, ar_in, decls, top_names)
+  BuiltEnv { env: r.env, prelude_len: seed.prelude_len,
+             op_eff_arities: r.arities }
+}
+
 fn build_ty_env(decls: [Decl]) : BuiltEnv {
   let seed = build_ty_env_seed()
   # Issue #198: harvest the union summary once and stash it on the
@@ -36609,14 +36635,51 @@ type ProgramData = {
   sums:       [SumInfo]
 }
 
-fn collect_program_data(file: String, decls: [Decl]) : ProgramData / Console + File {
+# Issue #574 — variant that seeds the working tables from an
+# inherited `ModuleEnvDelta` (typically the prelude's). Each table
+# (TyEnv entries, op_eff_arities, recs, sums, op_to_eff, unions,
+# unit_aliases, type aliases) is computed for the current module
+# and composed with the inherited contribution so the typer sees
+# the same view it would over `inherited.decls ++ decls` flattened.
+#
+# Composition rules (cons-front so this module's bindings shadow
+# the inherited ones — Rule B, locals shadow imports):
+#   - `entries` / `op_eff_arities` / `unions`: append this module's
+#     contribution at the FRONT (handled by `build_ty_env_inherited`
+#     for entries / arities; this fn for unions).
+#   - `recs` / `sums` / `op_to_eff` / `unit_aliases`: list_append
+#     `this_module ++ inherited` for the same reason.
+#   - `alias_res`: resolved over `decls` only — alias resolution is
+#     scope-A-global and the caller threads its result separately;
+#     for a per-module fold each segment resolves its own aliases
+#     against the inherited effect-name namespace.
+#
+# When `inherited == module_env_delta_empty()` the function reduces
+# to the original `collect_program_data` shape — byte-identical to
+# the pre-#574 baseline.
+fn collect_program_data_inherited(file: String, decls: [Decl],
+                                    inherited: ModuleEnvDelta)
+                                    : ProgramData / Console + File {
   # m12.5: expand `unit Newton = kg * m / sec^2` aliases at the AST
   # level before any pass that calls resolve_ty. After this pass no
   # USym in any TyDim or ELitUnit refers to an alias name.
-  let aliases = collect_unit_alias_table(decls)
-  let decls_a = expand_unit_aliases_decls(decls, aliases)
-  let built = build_ty_env(decls_a)
-  let recs = collect_records(decls_a)
+  let aliases_here = collect_unit_alias_table(decls)
+  # Issue #574 — when this module references a unit alias declared
+  # by an upstream module, the inherited table participates in
+  # expansion. Cons-front so local aliases shadow inherited ones.
+  let aliases_all = unit_alias_compose(aliases_here, inherited.unit_aliases)
+  let decls_a = expand_unit_aliases_decls(decls, aliases_all)
+  # Issue #574 — seed the typer env from `inherited.ty_entries` on
+  # top of the built-in seed; collect unions across the inherited
+  # set + this module so cross-module variant lookups still resolve.
+  let seed = build_ty_env_seed()
+  let unions_here = collect_unions(decls_a)
+  let unions_all = list_append(unions_here, inherited.unions)
+  let top_names = collect_top_type_names(decls_a)
+  let built = build_ty_env_inherited(seed, inherited, decls_a,
+                                       unions_all, top_names)
+  let recs_here = collect_records(decls_a)
+  let recs_all = list_append(recs_here, inherited.recs)
   # m12.8 Phase 4b: rebuild the type-alias resolution table here so
   # `try_op_call` can resolve `Aliasname.opname` for aliases like
   # `Console = Stdout + Stderr + Stdin` and `Io = Console + Env +
@@ -36626,14 +36689,23 @@ fn collect_program_data(file: String, decls: [Decl]) : ProgramData / Console + F
   let eff_names_for_alias = list_append(builtin_effect_names(),
                                           collect_effect_names(decls_a))
   let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, file)
-  let op_to_eff = collect_op_to_eff(decls_a)
+  let op_to_eff_here = collect_op_to_eff(decls_a)
+  let op_to_eff_all = list_append(op_to_eff_here, inherited.op_to_eff)
   # Issue #71: sum-type registry for the region-brand walker.
-  let sums = collect_sums(decls_a)
+  let sums_here = collect_sums(decls_a)
+  let sums_all = list_append(sums_here, inherited.sums)
   ProgramData {
-    decls_a: decls_a, built: built, recs: recs,
-    alias_res: alias_res, op_to_eff: op_to_eff, sums: sums
+    decls_a: decls_a, built: built, recs: recs_all,
+    alias_res: alias_res, op_to_eff: op_to_eff_all, sums: sums_all
   }
 }
+
+# Issue #574 — cons-front unit-alias composition. Child shadows
+# parent: `unit Newton = kg * m / sec^2` declared locally hides any
+# inherited alias of the same name. Linear in the child + parent
+# count, called once per module fold step.
+fn unit_alias_compose(child: [UAliasEntry], parent: [UAliasEntry])
+                       : [UAliasEntry] = list_append(child, parent)
 
 # Issue #460 — public per-module typecheck entry point.
 #
@@ -36657,7 +36729,7 @@ fn typecheck_module(file: String, mod: ModuleDecls,
                      verbose: Bool) : TypecheckedModule / Console + File {
 
 
-  let data = collect_program_data(file, mod.decls)
+  let data = collect_program_data_inherited(file, mod.decls, inherited)
   let tp = infer_all_loop(file, data.built.env, data.built.prelude_len, data.recs,
                  data.built.op_eff_arities, data.decls_a, verbose, [], 0, [], [], [], [],
                  data.alias_res.aliases, data.op_to_eff, data.sums, proto_impls, data.decls_a)
@@ -36671,45 +36743,129 @@ fn typecheck_module(file: String, mod: ModuleDecls,
     insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
     prelude_len: tp.prelude_len, diags: tp.diags
   }
-  # Scope A v1: the delta is informational — under scope A v1 the
-  # ProgramData tables produced for this module are the program
-  # tables (single module). When typecheck_program threads the fold
-  # across multiple ModuleDecls (future), each call accumulates the
-  # per-module slice here instead.
+  # Issue #574 — the returned delta carries ONLY this module's
+  # contribution (i.e. the slice of working-table state that
+  # `decls_a` added on top of `inherited`). The fold's `acc_delta`
+  # composes these per-module slices via `merge_env_deltas`, so a
+  # downstream cache hit can serialise this slice in isolation and
+  # the next loader hands it back through `inherited` to skip the
+  # work this call did.
+  #
+  # `ty_entries` extracted by length-diff against `inherited`: every
+  # entry past `len(inherited.ty_entries) + len(seed_entries)` was
+  # added by `add_decls_loop` over this module. `add_decls_loop`
+  # cons-prepends, so the new entries occupy the head of the list;
+  # the same shape holds for `op_eff_arities`.
+  let n_inherited = list_length(inherited.ty_entries) +
+                     list_length(build_ty_env_seed().env.entries)
+  let n_total = list_length(data.built.env.entries)
+  let n_new = n_total - n_inherited
+  let new_entries = take_entries(data.built.env.entries, n_new, [])
+  let n_ar_inherited = list_length(inherited.op_eff_arities)
+  let n_ar_total = list_length(data.built.op_eff_arities)
+  let new_arities = take_op_eff_arities(data.built.op_eff_arities,
+                                          n_ar_total - n_ar_inherited, [])
   let delta = ModuleEnvDelta {
     name:           mod.name,
-    ty_entries:     data.built.env.entries,
-    unions:         data.built.env.unions,
-    op_eff_arities: data.built.op_eff_arities,
-    recs:           data.recs,
-    sums:           data.sums,
-    op_to_eff:      data.op_to_eff,
+    ty_entries:     new_entries,
+    unions:         collect_unions(data.decls_a),
+    op_eff_arities: new_arities,
+    recs:           collect_records(data.decls_a),
+    sums:           collect_sums(data.decls_a),
+    op_to_eff:      collect_op_to_eff(data.decls_a),
     unit_aliases:   collect_unit_alias_table(mod.decls)
   }
   TypecheckedModule { typed: typed, delta: delta }
 }
 
-# Fold `typecheck_module` over a list of per-module decl streams.
-# Scope A v1: collapses the list back into a single segment so the
-# monolithic typer sees the same input it did pre-refactor; the
-# fold dynamics live in this function and become non-trivial in a
-# future sub-step that partitions all_decls by module_origin.
+# Issue #574 — take the first `n` op-eff arity records, mirroring
+# `take_entries`. Used by `typecheck_module` to extract the head
+# slice that `add_decls_loop` cons-prepended for this module's
+# contribution. Tail-recursive on `acc` for arity-list sizes that
+# scale with the effect-op count of every loaded module.
+fn take_op_eff_arities(xs: [OpEffArity], n: Int,
+                         acc: [OpEffArity]) : [OpEffArity] {
+  if n <= 0 { list_reverse(acc) }
+  else { match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> take_op_eff_arities(rest, n - 1, [h, ...acc])
+  } }
+}
+
+# Issue #574 — fold `typecheck_module` left-to-right across the
+# per-module decl streams, threading the accumulating
+# `ModuleEnvDelta` as `inherited` for each segment. The fold is
+# trivial when `modules` has a single segment (the path every legacy
+# caller still uses): one iteration, `inherited = empty_delta`,
+# identical to the pre-#574 flatten-and-call shape. Multi-segment
+# callers (the Phase A.1 cache loader, prelude/user split) drive
+# real fold dynamics — see `typecheck_program_loop`.
 fn typecheck_program(file: String, modules: [ModuleDecls],
                       proto_impls: [ProtoImplReg],
                       verbose: Bool) : TypedProgram / Console + File {
 
 
-  let flat = flatten_module_decls(modules, [])
-  let mod_all = ModuleDecls { name: None, decls: flat }
-  let r = typecheck_module(file, mod_all, module_env_delta_empty(),
-                            proto_impls, verbose)
-  r.typed
+  typecheck_program_loop(file, modules, module_env_delta_empty(),
+                          proto_impls, verbose,
+                          [], 0, [], [], [], [], 0)
 }
 
-fn flatten_module_decls(modules: [ModuleDecls], acc: [Decl]) : [Decl] {
+# Tail-recursive fold accumulator. Each iteration typechecks one
+# `ModuleDecls` against the running delta, merges the produced delta
+# into the accumulator, and appends the typed module's pieces to
+# `acc_*`. `prelude_len_acc` keeps the first non-zero `prelude_len`
+# returned by any module — under scope A v1 every call shares the
+# same built-in seed length, so the value is identical regardless of
+# which module reports it. The reverse step at the terminal restores
+# document order on the accumulated lists.
+fn typecheck_program_loop(file: String, modules: [ModuleDecls],
+                            acc_delta: ModuleEnvDelta,
+                            proto_impls: [ProtoImplReg],
+                            verbose: Bool,
+                            acc_decls: [Decl],
+                            acc_errs: Int,
+                            acc_insts: [ResolvedCS],
+                            acc_holes: [ResolvedHole],
+                            acc_row_holes: [ResolvedRowHole],
+                            acc_diags: [Diagnostic],
+                            prelude_len_acc: Int) : TypedProgram / Console + File {
+
   match modules {
+    [] -> TypedProgram {
+      decls: list_reverse(acc_decls), errs: acc_errs,
+      insts: list_reverse(acc_insts), holes: list_reverse(acc_holes),
+      row_holes: list_reverse(acc_row_holes),
+      prelude_len: prelude_len_acc,
+      diags: list_reverse(acc_diags)
+    }
+    [m, ...rest] -> {
+      let r = typecheck_module(file, m, acc_delta, proto_impls, verbose)
+      let next_delta = merge_env_deltas(acc_delta, r.delta)
+      let next_prelude_len = match prelude_len_acc {
+        0 -> r.typed.prelude_len
+        _ -> prelude_len_acc
+      }
+      typecheck_program_loop(file, rest, next_delta, proto_impls, verbose,
+                              prepend_reverse_decls(r.typed.decls, acc_decls),
+                              acc_errs + r.typed.errs,
+                              llvm_prepend_reverse(r.typed.insts, acc_insts),
+                              prepend_reverse_holes(r.typed.holes, acc_holes),
+                              prepend_reverse_row_holes(r.typed.row_holes,
+                                                         acc_row_holes),
+                              prepend_reverse_diags(r.typed.diags, acc_diags),
+                              next_prelude_len)
+    }
+  }
+}
+
+# Issue #574 — prepend `xs` onto `acc` reversed; the final
+# `list_reverse(acc)` at terminal restores source order. Mirrors the
+# pattern used by `prepend_reverse_holes` / `llvm_prepend_reverse`
+# inside `infer_all_loop`.
+fn prepend_reverse_decls(xs: [Decl], acc: [Decl]) : [Decl] {
+  match xs {
     [] -> acc
-    [m, ...rest] -> flatten_module_decls(rest, list_append(acc, m.decls))
+    [x, ...rest] -> prepend_reverse_decls(rest, [x, ...acc])
   }
 }
 
