@@ -545,6 +545,31 @@ KaiValue *kaix_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCont *k)
     return kai_default_securerandom_bytes(self, n_v, k);
 }
 
+/* Issue #570 — LLVM-visible wrappers around the static Spawn default
+ * handlers in runtime.h. The LLVM emitter installs these by name from
+ * `kai_main_install_defaults` when `Spawn` appears in main's row.
+ * Without these the runtime's `kaix_evidence_lookup_handler("Spawn")`
+ * returns NULL and the first op call (typically inside `with_mailbox`
+ * → `spawn_actor`) dereferences a null evidence pointer. */
+KaiValue *kaix_default_spawn_yield(void *self, KaiCont *k) {
+    return kai_default_spawn_yield(self, k);
+}
+KaiValue *kaix_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k) {
+    return kai_default_spawn_spawn(self, thunk, k);
+}
+KaiValue *kaix_default_spawn_await(void *self, KaiValue *fib, KaiCont *k) {
+    return kai_default_spawn_await(self, fib, k);
+}
+KaiValue *kaix_default_spawn_select(void *self, KaiValue *fibs, KaiCont *k) {
+    return kai_default_spawn_select(self, fibs, k);
+}
+KaiValue *kaix_default_spawn_cancel(void *self, KaiValue *fib, KaiCont *k) {
+    return kai_default_spawn_cancel(self, fib, k);
+}
+KaiValue *kaix_default_spawn_set_trap_exit(void *self, KaiValue *on, KaiCont *k) {
+    return kai_default_spawn_set_trap_exit(self, on, k);
+}
+
 /* m7c-d — install/teardown default handlers for builtins that
  * appear in main's row. The LLVM emitter generates the body of
  * these two functions per program (filling in the right
