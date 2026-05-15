@@ -57,9 +57,11 @@ intentionally in `docs/syntax-sugars.md`; this doc carries only their
 # line comment until end-of-line
 ```
 
-There are no block comments. The sequence `#derive` at the start of a
-token is *not* a comment — it produces the dedicated `DERIVE` token
-(see 1.4).
+There are no block comments. `/*` is reserved and lexes to `TkError`
+with a guidance message; `//` is reserved the same way (it is neither a
+comment form nor an operator — `Int / Int` already truncates per #315).
+The sequence `#[` at the start of a token opens an **attribute** (see
+1.4 — `HASHOPEN` token) and is *not* treated as a comment.
 
 ### 1.3 Identifiers
 
@@ -104,7 +106,9 @@ var       where     with
 
 Plus the special tokens:
 
-- `#derive`  — the `DERIVE` token, used as a prefix to a `type` decl.
+- `#[`       — the `HASHOPEN` token, opens an attribute body. Followed
+  by an identifier (`derive`, `unstable`, or any future attribute name),
+  optional `(args)`, and the matching `]`.
 - `todo!`    — the `TODOBANG` token, an explicit termination escape.
 - `?`        — the `HOLE` token (bare typed hole).
 - `?ident`   — the `HOLE_NAME` token (named typed hole).
@@ -327,8 +331,10 @@ variant     ::= IDENT ('(' type_list ')')?
 field_list  ::= field (',' field)* ','?
 field       ::= IDENT ':' type
 type_list   ::= type (',' type)*
-derive_attr ::= '#derive' '(' protocol_list ')'
+derive_attr ::= '#[' 'derive' '(' protocol_list ')' ']'
 protocol_list ::= IDENT (',' IDENT)*
+(* Other attributes follow the same shape: `#[' IDENT ('(' args ')')? ']'`
+   where unknown attributes parse but are dropped from the AST. *)
 ```
 
 #### Effect declaration
@@ -807,10 +813,10 @@ unit Newton = kg * m / sec^2
 Introduces a Measure-kind symbol; has no value-level desugar but
 extends the unit algebra accepted inside `<...>`.
 
-### 4.11 `#derive` (m12.8)
+### 4.11 `#[derive(...)]` (m12.8; bracket form since #608)
 
 ```
-#derive(Show, Eq) type Point = { x: Int, y: Int }
+#[derive(Show, Eq)] type Point = { x: Int, y: Int }
 ```
 
 Expands at the type-decl boundary to synthetic `impl Show for Point`
