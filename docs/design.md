@@ -56,9 +56,39 @@ The design breaks if any of these is compromised.
      lower`, each pass a pure function of its input, with
      `--dump=<pass>` between any two.
 
+4. **Stability without stagnation**
+   - Adopted from Rust's
+     [2014 manifesto](https://blog.rust-lang.org/2014/10/30/Stability/).
+     The contract to the user is that upgrading kaikai does not
+     break their code without a migration path. The contract to
+     the kaikai team is that we can keep iterating fast on
+     internals — runtime, codegen, RC discipline, cache layers,
+     typer refactors — without that protection blocking progress.
+   - The mechanism is **editions**, geographic Rapa Nui names
+     matching the kaikai naming family (Tongariki today, Anga Roa
+     21 May 2026, Orongo after). An edition is a snapshot of the
+     language surface plus the user-facing protocol/stdlib API
+     boundaries. Within one edition, breaking changes are
+     forbidden. Between editions, breaking changes are allowed
+     but require explicit opt-in (the user picks which edition
+     their package compiles against in `kai.toml`).
+   - Pre-1.0 we still ship `feat:` / `fix:` rapidly per
+     Conventional Commits and PATCH/MINOR bumps. The protection
+     lives at the **edition boundary**, not at every minor.
+   - The `EDITION` file at repo root holds the current edition
+     name. `kai --version` surfaces it. `docs/editions.md`
+     documents the edition policy: what stability commitments
+     each edition makes, what changed between editions, how to
+     migrate.
+   - The lesson load-bearing here, in the words of the Rust
+     team: *"we owe it to users not to dread upgrading"*. That
+     phrase is the test for every breaking-change discussion:
+     if a user has to dread the upgrade, the change requires an
+     edition bump.
+
 ### Tier 2 — Aspirational (trade-offs allowed; Tier 1 wins ties)
 
-4. **Structured compiler output**
+5. **Structured compiler output**
    - Every diagnostic and query is emitted as stable JSON alongside
      the human-readable text. Typed holes + `--holes-json` are the
      prototype for this contract; `kai type --json`, `kai effects
@@ -71,7 +101,7 @@ The design breaks if any of these is compromised.
      signals intent. The real rule is *few forms, each with clear
      intent*, not *one form, full stop*.
 
-5. **Approachable core, novel where it pays off**
+6. **Approachable core, novel where it pays off**
    - Day-to-day syntax — declarations, `let`, `if`, `match`, pipes,
      pattern matching, interpolation — deliberately stays close to
      Python / JavaScript / Elixir.
@@ -85,7 +115,7 @@ The design breaks if any of these is compromised.
      sequential kaikai in about a day, and take roughly a week to
      internalise the effect model.
 
-6. **Few visible concepts, layered**
+7. **Few visible concepts, layered**
    - The floor for basic code is about ten concepts: types,
      functions, `let`, `match`, `if`, records, sum types, lists,
      pipes, strings. Algebraic types compose via `|` (union); see
@@ -99,7 +129,7 @@ The design breaks if any of these is compromised.
 
 ### Tier 3 — Strategic bet (depends on future conditions)
 
-7. **LLM authorability**
+8. **LLM authorability**
    - The bet: with typed holes + structured JSON + a stable
      ruleset, LLMs can author kaikai well, even though current
      models know Python and Rust far better than effect-typed
@@ -131,15 +161,18 @@ Retired or explicitly rejected. Do not cite these in design
 arguments:
 
 - *One canonical form per construct* — already violated four times
-  deliberately; see #4. The real standard is *few forms with clear
+  deliberately; see #5. The real standard is *few forms with clear
   intent*.
 - *Never surprise a Python programmer* — effects, nursery, and
-  typed holes will surprise them, by design; see #5.
+  typed holes will surprise them, by design; see #6.
 - *Zero-cost abstractions* — effects, fibers, and Perceus RC have
   small but non-zero costs. The target is *low* cost, not zero.
-- *Backward compatibility across phases* — not promised until
-  post-MVP. Phase-4 code may not compile under stage 2 without
-  adjustment.
+- *Full backward compatibility forever* — within an edition, yes
+  (per #4 stability without stagnation). Across editions, breaking
+  changes are allowed but require explicit opt-in. Pre-1.0 we
+  still ship `feat:` / `fix:` rapidly via Conventional Commits and
+  PATCH/MINOR bumps; the protection lives at the edition boundary,
+  not at every minor version.
 
 ## Decisions
 
