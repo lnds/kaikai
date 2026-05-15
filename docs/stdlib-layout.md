@@ -427,12 +427,14 @@ security-sensitive code paths.
 - `net.udp` — `bind`, `send`, `recv` *(planned, no tracking issue — Tier S3, post-1.0)*
 - `net.dns` — `resolve`, `resolve_all`, `reverse_lookup` *(planned, no tracking issue — Tier S3; today `net.http` falls back to libc `getaddrinfo` via FFI)*
 - `net.url` — pure: `parse`, `format`, `join`, `query_*` *(planned — `http_parse_url` exists inside `net/http.kai` as a private helper but is not exposed as a `net.url` module)*
-- `net.http` — client only: `http_get`, `http_post`, `http_put`, `http_delete`, `http_request` *(shipped, `/ NetTcp + Cancel`)*; headers, body, timeouts available via the request builder. Uses libc `getaddrinfo` for DNS (no `NetDns` effect yet).
+- `net.http` — client surface (stable): `http_get`, `http_post`, `http_put`, `http_delete`, `http_request` *(shipped, `/ NetTcp + Cancel`)*; headers, body, timeouts available via the request builder. Uses libc `getaddrinfo` for DNS (no `NetDns` effect yet). Server-side helpers (`#[unstable]`): `http_parse_request`, `http_serialize_response`, `http_status_reason` (pure), and `http_read_request` (`/ NetTcp`) *(shipped — issue #605)* — minimal primitives for hand-rolled HTTP/1.1 servers. The wire helpers reuse the client-side internals (`http_str_index`, `http_parse_header_lines`, `http_format_headers`, `http_header_lookup`); the convenience read loop is the only NetTcp-touching addition.
 
-Server-side HTTP (`net.http.server`) is deferred — it belongs with the
-web framework product (C1 in the roadmap), not in stdlib, because its
-design surface (router, middleware, graceful shutdown) is much larger
-than what a primitive module should expose.
+A full server framework (`manutara`-side: router, middleware,
+graceful shutdown) is deferred — its design surface is much larger
+than what a primitive module should expose. The `#[unstable]`
+server-side helpers above are the seam manutara will sit on top of;
+they are explicitly carved out of the edition contract until
+manutara's first design pass exercises them.
 
 ### encoding (pure, stage 2)
 

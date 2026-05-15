@@ -829,6 +829,20 @@ pub fn tcp_connect_or_fail(host: String, port: Int) : Conn / NetTcp + Fail {
   modules over the same `NetTcp` (and `NetUdp` for QUIC) — no
   new effect needed.
 
+The `stdlib/net/http.kai` module is the canonical caller of
+`NetTcp` today. Issue #605 added a minimal `#[unstable]` server-side
+seam to the same file (`http_parse_request`,
+`http_serialize_response`, `http_status_reason`,
+`http_read_request`) so the kaikai-book HTTP-server chapter and the
+future manutara web framework can build against real stdlib rather
+than against an aspirational sketch. The server-side helpers are
+pure (parse/serialize) plus a single `NetTcp`-aware convenience
+(`http_read_request`); routing, middleware, and graceful shutdown
+remain a `manutara` concern. The wire helpers are the only
+non-`NetTcp.recv`-shaped surface; everything that reads bytes off a
+`Conn` still goes through the v1 blocking default handler, with
+the same caveats pinned in the v1-status sidebar above.
+
 ## `Process`
 
 ### Declaration
