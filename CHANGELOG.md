@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.61.0 (2026-05-14)
+
+### Added
+
+- **cache**: batch shasum + default KAI_PRELUDE_CACHE=1 (closes #592)
+- **cache**: KAB2 binary on-disk format (refs #592)
+
 ## v0.60.0 (2026-05-14)
 
 ### Added
