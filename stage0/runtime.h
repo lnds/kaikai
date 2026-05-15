@@ -4358,6 +4358,43 @@ static KaiValue *kai_prelude_int_to_char(KaiValue *n) {
     return kai_char(value);
 }
 
+/* Build a 1-byte String holding the low 8 bits of `n`. Unlike
+ * `"#{int_to_char(n)}"` interpolation, which routes through
+ * `kai_to_string(KAI_CHAR)` + `Show for Char` and escape-renders any
+ * byte outside ASCII [32,126] (and truncates NUL via `strlen`), this
+ * builtin constructs the string via `kai_str_from_bytes` so every
+ * value 0..255 round-trips byte-exact. Cache layer (issue #592) uses
+ * it for the KAB2 binary on-disk format. Documented limitation
+ * sidebar in `stdlib/protocols.kai` (BinSerialize String/Real ASCII-
+ * only) closes once Phase A/B serdes routes through this. */
+static KaiValue *kai_prelude_int_to_byte_string(KaiValue *n) {
+    int64_t v = (n && n->tag == KAI_INT) ? n->as.i : 0;
+    if (n) kai_decref(n);
+    unsigned char b = (unsigned char) (v & 0xff);
+    return kai_str_from_bytes((const char *) &b, 1);
+}
+
+/* Read one byte at index `i` of String `s`, returning it as an Int
+ * 0..255. Returns -1 on out-of-bounds or wrong type. Faster than
+ * `match char_at(s, i) { Some(c) -> char_to_int(c); None -> -1 }`
+ * because it avoids the Option allocation + Char alloc + decref
+ * chain (KAI_CHAR is cached for value < 128 but still hits a load
+ * + tag check). The KAB2 cache decoder (#592) calls this ~1M times
+ * per warm load; replacing Option-wrapped char_at cuts decoder wall
+ * from ~0.26s to under 0.04s. */
+static KaiValue *kai_prelude_string_byte_at_int(KaiValue *s, KaiValue *i) {
+    int64_t v = -1;
+    if (s && s->tag == KAI_STR && i && i->tag == KAI_INT) {
+        int64_t idx = i->as.i;
+        if (idx >= 0 && (size_t) idx < s->as.s.len) {
+            v = (int64_t)(unsigned char) s->as.s.bytes[idx];
+        }
+    }
+    if (s) kai_decref(s);
+    if (i) kai_decref(i);
+    return kai_int(v);
+}
+
 static KaiValue *kai_prelude_string_contains(KaiValue *s, KaiValue *sub) {
     int yes = 0;
     if (s && s->tag == KAI_STR && sub && sub->tag == KAI_STR) {
@@ -4451,6 +4488,8 @@ static KaiValue *_kai_prelude_string_contains_thunk(KaiValue *s, KaiValue **a, i
 static KaiValue *_kai_prelude_string_slice_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_string_slice(a[0], a[1], a[2]); }
 static KaiValue *_kai_prelude_char_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_char_to_int(a[0]); }
 static KaiValue *_kai_prelude_int_to_char_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_int_to_char(a[0]); }
+static KaiValue *_kai_prelude_int_to_byte_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_int_to_byte_string(a[0]); }
+static KaiValue *_kai_prelude_string_byte_at_int_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_byte_at_int(a[0], a[1]); }
 static KaiValue *_kai_prelude_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) a; (void) n; return kai_prelude_mailbox_alloc(); }
 static KaiValue *_kai_prelude_mailbox_alloc_bounded_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_mailbox_alloc_bounded(a[0], a[1]); }
 static KaiValue *_kai_prelude_mailbox_send_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_send(a[0], a[1]); }

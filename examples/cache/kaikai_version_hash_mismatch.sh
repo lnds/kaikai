@@ -1,5 +1,5 @@
 #!/bin/sh
-# Phase A.0 cache invalidation fixture #3 — kaikai_version_hash
+# Phase A cache invalidation fixture #3 — kaikai_version_hash
 # mismatch.
 #
 # Plants a cache .kab whose magic + format_version + sha lines are
@@ -19,12 +19,11 @@ SRC="$ROOT/stdlib/core/char.kai"
 SHA="$(shasum -a 256 "$SRC" | awk '{ print $1 }')"
 CACHE_FILE="$CACHE_DIR/${SHA}.kab"
 
-{
-  printf 'KAB1\n'
-  printf '01000000\n'
-  printf '63000000\n'        # kaikai_version_hash = 99 → mismatch
-  printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000"
-} > "$CACHE_FILE"
+# Seed: KAB2 magic + format_version=2 + kaikai_version=99 + sha OK.
+printf 'KAB2' > "$CACHE_FILE"
+printf '\002\000\000\000' >> "$CACHE_FILE"  # format_version 2 LE
+printf '\143\000\000\000' >> "$CACHE_FILE"  # kaikai_version_hash = 99 LE
+printf '0000000000000000000000000000000000000000000000000000000000000000' >> "$CACHE_FILE"
 
 cat > "$CACHE_DIR/empty.kai" <<'EOF'
 fn main() : Unit / Console {

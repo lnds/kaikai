@@ -94,7 +94,8 @@ static const char *PRELUDE[] = {
     /* strings */
     "string_length", "string_concat", "string_concat_all", "string_join",
     "string_split", "string_contains", "char_at",
-    "string_slice", "char_to_int", "int_to_char",
+    "string_slice", "char_to_int", "int_to_char", "int_to_byte_string",
+    "string_byte_at_int",
     /* lists */
     "list_length", "list_append", "list_reverse",
     "map", "filter", "reduce", "each",
