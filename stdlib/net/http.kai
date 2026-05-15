@@ -1,10 +1,17 @@
-# stdlib/net/http.kai — HTTP/1.1 client over the NetTcp effect.
+# stdlib/net/http.kai — HTTP/1.1 over the NetTcp effect (client +
+# minimal server-side helpers).
 #
 # Spec: docs/effects-stdlib.md §`NetTcp` notes that "Higher-level
 # protocols (HTTP, WebSocket, gRPC) live in stdlib modules that
-# *use* the relevant effects". docs/stdlib-layout.md §`net` pins
-# net.http as **client only** — server-side HTTP belongs to the
-# manutara web framework, not stdlib.
+# *use* the relevant effects". The client-side surface
+# (`http_parse_url`, `http_serialize_request`, `http_parse_response`,
+# `http_request`, `http_get/post/put/delete`) is the v1 stable
+# contract. The server-side dual added by issue #605
+# (`http_parse_request`, `http_serialize_response`,
+# `http_status_reason`, `http_read_request`) is marked `#[unstable]`
+# so kaikai-book chapter 17 and the future manutara framework can
+# build against real stdlib while we keep room to iterate before
+# Anga Roa freezes.
 #
 # Module path: `import net.http`. The catalog and naming convention
 # live in docs/stdlib-layout.md §`net`. The flat `http_*` prefix
@@ -93,13 +100,23 @@ pub type HttpHostPort = { host: String, port: Int }
 # of surrounding whitespace per RFC 7230 §3.2.4.
 pub type HttpHeader = { name: String, value: String }
 
-# Outbound request. `method` is the verb (uppercase: "GET" / "POST"
-# / "PUT" / "DELETE"). `url` is the absolute URL the request is
-# directed at; `http_request` parses it to derive the connect target
-# and the request-line path. `headers` is a list of name/value
-# pairs appended after the auto-emitted `Host` and `Content-Length`
-# (in user-provided order). `body` is the raw request body — empty
-# for GET / DELETE, application-defined bytes for POST / PUT.
+# HTTP request. `method` is the verb (uppercase: "GET" / "POST"
+# / "PUT" / "DELETE"). `headers` is a list of name/value pairs
+# appended after the auto-emitted `Host` and `Content-Length` (in
+# user-provided order). `body` is the raw request body — empty for
+# GET / DELETE, application-defined bytes for POST / PUT.
+#
+# `url` carries different semantics on each side of the wire:
+#   - For *outbound* requests built by the caller, `url` is the
+#     absolute URL the request is directed at; `http_request` parses
+#     it to derive the connect target and the request-line path.
+#   - For *incoming* requests parsed by `http_parse_request`
+#     (#[unstable], server side), `url` is just the request-line path
+#     (e.g. "/hello"). The absolute URL never appears on the wire
+#     for ordinary HTTP/1.1, so there is nothing to fill in.
+# Both sides share the same record by design — the alternative
+# (a sibling `HttpReq` type for the server) would be two forms with
+# overlapping intent, forbidden by CLAUDE.md.
 pub type Request  = { method: String, url: String,
                       headers: [HttpHeader], body: String }
 
@@ -442,3 +459,210 @@ pub fn http_put(url: String, body: String) : Response / NetTcp + Cancel =
 
 pub fn http_delete(url: String) : Response / NetTcp + Cancel =
   http_request(Request { method: "DELETE", url: url, headers: [], body: "" })
+
+# ---- server side (#[unstable], issue #605) -----------------------
+#
+# Every export below is the dual of a client-side helper above.
+# All are marked `#[unstable]` (issues #602 + #608): the wire-format helpers
+# are stable, but the convenience surface (`http_read_request`, the
+# status-code map) needs at least one round of book-driven feedback
+# before the edition contract takes them on. Reuses the existing
+# internal helpers (`http_str_index`, `http_parse_header_lines`,
+# `http_format_headers`, `http_trim`, `http_header_lookup`) so the
+# new surface is purely additive.
+
+# Parse a request line — `METHOD SP PATH SP HTTP/1.1`. v1 is strict:
+# any other framing (extra spaces, HTTP/1.0, HTTP/2 prior knowledge)
+# is rejected. Callers wrap the Err in a 400 Bad Request.
+fn http_parse_request_line(line: String) : Result[String, HttpReqLine] = {
+  let parts = string_split(line, " ")
+  match parts {
+    [m, p, proto] ->
+      if proto == "HTTP/1.1" { Ok(HttpReqLine { method: m, path: p }) }
+      else { Err(string_concat_all(["http_parse_request: unsupported protocol '", proto, "' (v1 accepts HTTP/1.1 only)"])) }
+    _ -> Err(string_concat("http_parse_request: malformed request line: ", line))
+  }
+}
+
+# Carrier for request-line parts. Internal — callers receive a
+# `Request` from `http_parse_request`, not this record.
+type HttpReqLine = { method: String, path: String }
+
+# Parse a complete HTTP/1.1 request: request line + headers + body.
+# Mirrors `http_parse_response`. Body length is read from
+# `Content-Length`; absent header means an empty body (POST without
+# Content-Length is malformed per RFC 7230 §3.3.3 for v1 purposes,
+# but we accept the empty-body interpretation rather than reject).
+#
+# `Request.url` is populated from the request-line path; the
+# absolute URL is never reconstructed because the wire does not
+# carry it (the `Host` header is separate).
+#[unstable]
+pub fn http_parse_request(raw: String) : Result[String, Request] = {
+  let sep = "\r\n\r\n"
+  let i   = http_str_index(raw, sep)
+  if i < 0 {
+    Err("http_parse_request: missing header/body separator (\\r\\n\\r\\n)")
+  } else {
+    let head_block = string_slice(raw, 0, i)
+    let body_start = i + string_length(sep)
+    let body_all   = string_slice(raw, body_start, string_length(raw) - body_start)
+    let lines      = string_split(head_block, "\r\n")
+    match lines {
+      [] -> Err("http_parse_request: empty header block")
+      [req_line, ...rest] -> match http_parse_request_line(req_line) {
+        Err(e) -> Err(e)
+        Ok(rl) -> match http_parse_header_lines(rest) {
+          Err(e) -> Err(e)
+          Ok(hs) -> {
+            let body = match http_header_lookup(hs, "Content-Length") {
+              Some(v) -> match string_to_int(http_trim(v)) {
+                Some(n) ->
+                  if n <= 0 { "" }
+                  else if n >= string_length(body_all) { body_all }
+                  else { string_slice(body_all, 0, n) }
+                None -> body_all
+              }
+              None -> body_all
+            }
+            Ok(Request { method: rl.method, url: rl.path, headers: hs, body: body })
+          }
+        }
+      }
+    }
+  }
+}
+
+# Minimal status code → reason phrase map. v1 lists the codes the
+# book demos exercise plus the obvious 4xx/5xx; anything outside
+# the table falls through to "OK" so the wire stays well-formed
+# (the status code itself carries the semantics; the reason phrase
+# is informational per RFC 7230 §3.1.2). A richer table arrives
+# when manutara needs it.
+#[unstable]
+pub fn http_status_reason(code: Int) : String =
+  if      code == 200 { "OK" }
+  else if code == 201 { "Created" }
+  else if code == 202 { "Accepted" }
+  else if code == 204 { "No Content" }
+  else if code == 301 { "Moved Permanently" }
+  else if code == 302 { "Found" }
+  else if code == 304 { "Not Modified" }
+  else if code == 400 { "Bad Request" }
+  else if code == 401 { "Unauthorized" }
+  else if code == 403 { "Forbidden" }
+  else if code == 404 { "Not Found" }
+  else if code == 405 { "Method Not Allowed" }
+  else if code == 409 { "Conflict" }
+  else if code == 500 { "Internal Server Error" }
+  else if code == 502 { "Bad Gateway" }
+  else if code == 503 { "Service Unavailable" }
+  else { "OK" }
+
+# Serialise a `Response` to wire bytes (HTTP/1.1 framing). Emitted
+# block:
+#   HTTP/1.1 <status> <reason>\r\n
+#   Content-Length: <body.len>\r\n
+#   <user header lines>
+#   \r\n
+#   <body>
+# `Content-Length` is auto-emitted; user headers are appended
+# verbatim. Reuses `http_format_headers`. Callers wanting
+# `Connection: close` add it to `resp.headers` themselves.
+#[unstable]
+pub fn http_serialize_response(resp: Response) : String = {
+  let reason = http_status_reason(resp.status)
+  let line1  = string_concat_all(["HTTP/1.1 ", int_to_string(resp.status), " ", reason, "\r\n"])
+  let clen   = string_concat_all(["Content-Length: ", int_to_string(string_length(resp.body)), "\r\n"])
+  let extra  = http_format_headers(resp.headers)
+  string_concat_all([line1, clen, extra, "\r\n", resp.body])
+}
+
+# Read a full HTTP/1.1 request off `conn`, capped at `max_bytes`
+# to prevent unbounded header buffering. Loops `NetTcp.recv` until
+# either (a) the header block separator `\r\n\r\n` has been seen
+# AND enough bytes have followed it to cover `Content-Length`, or
+# (b) the peer closes (`Ok([])` per docs/effects-stdlib.md §`NetTcp`
+# "Error model"), or (c) `max_bytes` would be exceeded — in which
+# case we return Err so the caller can answer 413.
+#
+# The function is intentionally simple: it copies bytes into a
+# growing list, converts to String once the framing is complete,
+# and hands the String to `http_parse_request`. v1 reads in
+# 4 KiB chunks; a future Content-Length-aware short-read can stop
+# earlier without an extra recv.
+#[unstable]
+pub fn http_read_request(conn: Conn, max_bytes: Int) : Result[String, Request] / NetTcp =
+  http_read_request_loop(conn, [], 0, max_bytes)
+
+fn http_read_request_loop(conn: Conn, acc_rev: [Int], have: Int, max_bytes: Int)
+    : Result[String, Request] / NetTcp = {
+  if have > max_bytes {
+    Err(string_concat_all(["http_read_request: exceeded max_bytes=", int_to_string(max_bytes)]))
+  } else { match http_request_ready(acc_rev, have) {
+    Some(req) -> Ok(req)
+    None      -> match NetTcp.recv(conn, 4096) {
+      Err(e) -> Err(string_concat("http_read_request: ", e))
+      Ok(chunk) -> match chunk {
+        [] -> {
+          # Peer closed before a complete request arrived. If the
+          # accumulator already holds something that parses (e.g. a
+          # GET with no Content-Length), surface that; otherwise
+          # report the truncated read.
+          let raw = http_bytes_to_string(list_reverse(acc_rev))
+          match http_parse_request(raw) {
+            Ok(r)  -> Ok(r)
+            Err(_) -> Err("http_read_request: peer closed before request complete")
+          }
+        }
+        _ -> {
+          let next_acc = http_recv_all_prepend(chunk, acc_rev)
+          let next_have = have + list_length(chunk)
+          http_read_request_loop(conn, next_acc, next_have, max_bytes)
+        }
+      }
+    }
+  } }
+}
+
+# Probe the in-flight buffer: if it already holds a complete
+# request (header block separator present AND body has at least
+# `Content-Length` bytes, or no Content-Length and we treat the
+# current accumulator as the full body), return Some(req). Else
+# None — caller does another recv.
+fn http_request_ready(acc_rev: [Int], _have: Int) : Option[Request] = {
+  let raw = http_bytes_to_string(list_reverse(acc_rev))
+  let sep = "\r\n\r\n"
+  let i   = http_str_index(raw, sep)
+  if i < 0 { None }
+  else {
+    let head_block = string_slice(raw, 0, i)
+    let body_start = i + string_length(sep)
+    let body_all   = string_slice(raw, body_start, string_length(raw) - body_start)
+    let lines      = string_split(head_block, "\r\n")
+    match lines {
+      [] -> None
+      [req_line, ...rest] -> match http_parse_request_line(req_line) {
+        Err(_) -> None
+        Ok(rl) -> match http_parse_header_lines(rest) {
+          Err(_) -> None
+          Ok(hs) -> match http_header_lookup(hs, "Content-Length") {
+            None -> Some(Request { method: rl.method, url: rl.path,
+                                   headers: hs, body: body_all })
+            Some(v) -> match string_to_int(http_trim(v)) {
+              None    -> None
+              Some(n) ->
+                if n <= 0 {
+                  Some(Request { method: rl.method, url: rl.path,
+                                 headers: hs, body: "" })
+                } else if string_length(body_all) >= n {
+                  Some(Request { method: rl.method, url: rl.path, headers: hs,
+                                 body: string_slice(body_all, 0, n) })
+                } else { None }
+            }
+          }
+        }
+      }
+    }
+  }
+}

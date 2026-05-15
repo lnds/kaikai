@@ -88,7 +88,7 @@ What's still open (planned-but-not-shipped):
 |---------------------------------|---------|--------------------------------------------------------------------------------------------------|
 | `fs/file` extras (M2)           | #345 follow-up | `metadata` (`FileMetadata` record + `stat(2)`), `read_bytes`/`write_bytes` (`[Int]` byte arrays). M1 (`file_exists`, `file_delete`, `file_rename`) shipped via #345 |
 | `net/udp`, `net/dns`            | (none)  | Tier S3 — no compiler builtin, no runtime handler, no module file                                |
-| `net/http` server-side          | n/a     | belongs **inside** `manutara`, not stdlib (Layout §`net`)                                        |
+| `net/http` server-side primitives | #605  | minimal `#[unstable]` helpers (`http_parse_request`, `http_serialize_response`, `http_status_reason`, `http_read_request`) shipped in `stdlib/net/http.kai`. A full server framework (router, middleware, graceful shutdown) remains a `manutara` concern. |
 
 ## Tier plan
 
