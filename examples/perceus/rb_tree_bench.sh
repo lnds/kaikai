@@ -101,5 +101,5 @@ Ratios:
   kaikai / C    = $(ratio "$KAI_MS" "$C_MS")  time, $(ratio "$KAI_RSS" "$C_RSS") RSS
   kaikai / C++  = $(ratio "$KAI_MS" "$CXX_MS")  time, $(ratio "$KAI_RSS" "$CXX_RSS") RSS
 
-Anga Roa DoD #4 target: kaikai/C ≤ 1.7× (stretch) or 2.0× (relaxed).
+Hanga Roa DoD #4 target: kaikai/C ≤ 1.7× (stretch) or 2.0× (relaxed).
 EOF
