@@ -13,7 +13,7 @@ promises a calendar. The §*Residual m8.x items* section below
 inventories what is left after the R2 lane closed (`0.4.0`) and the
 2026-04-30 Tier 2 retrofit landed.
 
-## Where we are today (2026-05-09)
+## Where we are today (2026-05-15)
 
 Tier 1 + Tier 2 closed. The runtime is BEAM-style cooperative
 single-threaded; everything that surfaced in a 30-minute live demo
@@ -36,6 +36,17 @@ or in the 1.0-honesty target list is shipped and verifiable.
   Pid + sum-type-payload + cap-binding nursery), LLVM
   op-dispatch parity, trap-exit semantics, per-op generics
   including ROW generics on spawned thunks (issue #72).
+- **R1 reactor shipped 2026-05-15 (issue #611)** — `Spawn.sleep`,
+  `File.read_file` / `write_file`, and `Process.wait` park the
+  *fiber*, not the OS thread. Wait primitive is `poll()` on two
+  self-pipes (SIGCHLD + a 4-worker file pool) plus a sorted timer
+  wheel keyed on `CLOCK_MONOTONIC`. 10 concurrent fibers each
+  sleeping 100 ms finish in ~100 ms total (`demos/sleep_concurrent`),
+  3 concurrent `Process.wait`s on a 200 ms child sleep finish in
+  ~200 ms (`demos/process_wait_concurrent`), and 4 file writes
+  share the disk in parallel (`demos/file_concurrent`). TCP
+  sockets (`NetTcp`) and stdin (`read_line`) stay blocking until
+  R2 and R3 ship in Orongo alongside the Cancel redesign.
 - §*Residual m8.x items* below now reduces to three minor
   items, none of which surface as runtime errors today.
 
@@ -69,6 +80,7 @@ can be parallelised across short lanes.
 | ~~**LLVM op-dispatch `in_dispatch_node`**~~ ✅ shipped 2026-04-30 | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend — three runtime helpers (`kaix_evidence_lookup_node` / `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the KaiFiber struct out of the IR |
 | ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
 | ~~**Per-op generics in Spawn API**~~ ✅ shipped 2026-05-02 | ~0.5d | TYPE generics retrofitted 2026-04-30 on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk closed in issue #72 — `Spawn.spawn[T, e](f: () -> T / e)` is the canonical entry point, wrappers in `stdlib/spawn.kai` reduced to one-line aliases |
+| ~~**Reactor — Phase R1 (file + sleep + process)**~~ ✅ shipped 2026-05-15 | ~1d | Issue #611. Sorted timer wheel + SIGCHLD self-pipe + 4-worker file pool, woken via a single `poll()` on the scheduler thread. `Clock.sleep_ns`, `File.read_file` / `write_file`, `Process.wait` no longer freeze the scheduler; sockets (`NetTcp`) and stdin queue for R2 / R3 in Orongo |
 
 After this set, `docs/effects.md`, `docs/structured-concurrency.md`,
 `docs/actors.md`, and `docs/fibers-impl.md` claims are all
