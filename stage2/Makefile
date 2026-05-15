@@ -34,7 +34,7 @@ SRC     := compiler.kai
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-issue-335 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-violations
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-issue-335 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-violations test-attributes
 
 all: $(TARGET)
 
@@ -4054,7 +4054,45 @@ test-violations: $(TARGET) build
 	  fi; \
 	done
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-issue-501 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-issue-335 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-violations test-unused-bindings
+# Issue #608 — `#[...]` attribute syntax. Each fixture in
+# examples/attributes/ has either an `.out.expected` (positive: compile,
+# run, diff) or an `.err.expected` (negative: kaic2 must reject; the
+# expected file's first line must appear in the error output as a
+# substring). Stdlib prelude is loaded so `Show`/`Eq` resolve.
+test-attributes: $(TARGET) build
+	@$(STACK) set -e; \
+	preludes="$(CORE_PRELUDE_FLAGS) --prelude ../stdlib/protocols.kai"; \
+	for f in ../examples/attributes/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/attributes/$$name.out.expected; \
+	  exp_err=../examples/attributes/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    rc=0; ./$(TARGET) --path ../stdlib $$preludes $$f \
+	      > /dev/null 2> build/attr-$$name.err || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "attributes FAIL $$name (expected error, got success)"; exit 1; \
+	    fi; \
+	    needle=$$(head -1 $$exp_err); \
+	    grep -qF "$$needle" build/attr-$$name.err \
+	      && echo "attributes OK $$name (rejection diagnostic matches)" \
+	      || { echo "attributes FAIL $$name (missing diagnostic: $$needle)"; \
+	           cat build/attr-$$name.err; exit 1; }; \
+	  elif [ -f $$exp_out ]; then \
+	    ./$(TARGET) --path ../stdlib $$preludes $$f > build/attr-$$name.c \
+	      || { echo "attributes FAIL $$name (kaic2 errored)"; exit 1; }; \
+	    $(CC) $(CFLAGS) -I ../stage0 build/attr-$$name.c -o build/attr-$$name $(LDLIBS_M) \
+	      || { echo "attributes FAIL $$name (C compile failed)"; exit 1; }; \
+	    ./build/attr-$$name > build/attr-$$name.out \
+	      || { echo "attributes FAIL $$name (run errored)"; cat build/attr-$$name.out; exit 1; }; \
+	    diff -q $$exp_out build/attr-$$name.out > /dev/null \
+	      && echo "attributes OK $$name" \
+	      || { echo "attributes DIFF $$name"; diff $$exp_out build/attr-$$name.out; exit 1; }; \
+	  else \
+	    echo "attributes SKIP $$name (no golden)"; \
+	  fi; \
+	done
+
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-issue-501 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-issue-335 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-violations test-unused-bindings test-attributes
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of

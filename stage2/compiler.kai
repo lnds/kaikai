@@ -42,15 +42,11 @@ type TokKind
   | TkHandle | TkIf | TkImpl | TkImport
   | TkLet | TkMatch | TkNot | TkOr | TkProtocol | TkPub | TkRequires | TkTest | TkTrue | TkType
   | TkUnitKw | TkUse | TkVar | TkWhen | TkWhere | TkWith
-  # m12.8: `#derive(P, ...)` annotation. The lexer recognises `#derive`
-  # specifically (instead of treating it as a comment) so the parser can
-  # consume it as a prefix to a `type` declaration.
-  | TkDerive
-  # Issue #602: `#unstable` annotation. Marks a `pub fn / pub type / pub
-  # const` whose API is not covered by the edition stability contract.
-  # Tokenised the same way as `#derive` — the `#` would otherwise begin
-  # a line comment, so the lexer must single out the keyword.
-  | TkUnstable
+  # Issue #608: `#[...]` annotation form. `#[` is one token (TkHashOpen);
+  # the parser then reads `ident (args)?` and expects a closing `]`.
+  # Replaces the pre-#608 hard-coded `#derive`/`#unstable` reserved-word
+  # scan. The `#` followed by anything other than `[` remains a comment.
+  | TkHashOpen
   # m12.6.x #7: regex literal `/pattern/`, only emitted when the
   # previous non-newline token is the identifier `matches` (the
   # refinement-pure predicate). Outside that narrow context, `/` keeps
@@ -121,8 +117,7 @@ fn tk_name(k: TokKind) : String {
     TkProtocol -> "protocol" TkPub -> "pub" TkRequires -> "requires"
     TkTest -> "test" TkTrue -> "true" TkType -> "type"
     TkUnitKw -> "unit" TkUse -> "use" TkVar -> "var" TkWhen -> "when" TkWhere -> "where" TkWith -> "with"
-    TkDerive -> "#derive"
-    TkUnstable -> "#unstable"
+    TkHashOpen -> "#["
     TkRegex -> "REGEX"
     TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
     TkComplex -> "COMPLEX"
@@ -216,11 +211,13 @@ fn lex_skip_ws(l: Lexer) : Lexer {
     Some(c) -> {
       if ch_is_space(c) { lex_skip_ws(lex_advance(l)) }
       else if c == '#' {
-        # m12.8: `#derive` is a token, not a comment. Leave the `#`
-        # in place so lex_punct can produce TkDerive. Anything else
-        # starting with `#` is still a line comment.
-        # Issue #602: `#unstable` is recognised the same way.
-        if lex_match_word_at(l, 1, "derive") { l }
+        # Issue #608: `#[` opens an attribute (TkHashOpen). `#derive` and
+        # `#unstable` (bare, no brackets) are kept in place too so
+        # `lex_punct` can emit a TkError pointing to the new syntax —
+        # transition aid. Anything else starting with `#` is a line
+        # comment.
+        if lex_peek_at(l, 1) == Some('[') { l }
+        else if lex_match_word_at(l, 1, "derive") { l }
         else if lex_match_word_at(l, 1, "unstable") { l }
         else { lex_skip_ws(lex_skip_comment(lex_advance(l))) }
       }
@@ -744,10 +741,17 @@ fn lex_punct(l: Lexer) : LexStep {
         }
         '/' -> {
           if lex_peek_is(l1, '/') {
-            # Issue #315 — `//` integer division operator is removed.
-            # Post-#246, `Int / Int` already truncates via `Div[Int]`.
+            # Issue #608: `//` is reserved as TkError with guidance.
+            # kaikai uses `#` for comments; `//` is not a comment form
+            # and the `//` integer-division operator was removed in #315.
             let l2 = lex_advance(l1)
-            Step(l2, tok(TkError("`//` operator is removed (issue #315) — use `/` instead (Int / Int truncates)"),
+            Step(l2, tok(TkError("kaikai uses `#` for comments, not `//` (and `//` is not an operator — `Int / Int` already truncates per #315)"),
+                         sl, sc, start, l2.pos))
+          } else if lex_peek_is(l1, '*') {
+            # Issue #608: `/*` reserved as TkError. kaikai does not
+            # support block comments; each comment line begins with `#`.
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkError("block comments are not supported — use `#` on each line (kaikai follows Elixir on this)"),
                          sl, sc, start, l2.pos))
           } else {
             Step(l1, tok(TkSlash, sl, sc, start, l1.pos))
@@ -836,17 +840,24 @@ fn lex_punct(l: Lexer) : LexStep {
           }
         }
         '#' -> {
-          # m12.8: `#derive` is a single token; the `#` here cannot be a
-          # comment because lex_skip_ws only forwards `#` here when it is
-          # immediately followed by `derive` and a non-alphanumeric tail.
-          # Issue #602: `#unstable` is recognised the same way, with the
-          # same non-alphanumeric-tail guarantee from lex_skip_ws.
-          if lex_match_word_at(l1, 0, "derive") {
+          # Issue #608: `#[` opens an attribute. lex_skip_ws only leaves a
+          # `#` for lex_punct when it is followed by `[`, by the legacy
+          # `derive`/`unstable` keywords (for the transition-aid TkError),
+          # or in error positions; all three branches are handled here.
+          if lex_peek_is(l1, '[') {
+            let l_end = lex_advance(l1)
+            Step(l_end, tok(TkHashOpen, sl, sc, start, l_end.pos))
+          } else if lex_match_word_at(l1, 0, "derive") {
             let l_end = lex_advance_n(l1, 6)
-            Step(l_end, tok(TkDerive, sl, sc, start, l_end.pos))
-          } else {
+            Step(l_end, tok(TkError("deprecated annotation syntax (issue #608) — write `#[derive(...)]` instead of `#derive(...)`"),
+                            sl, sc, start, l_end.pos))
+          } else if lex_match_word_at(l1, 0, "unstable") {
             let l_end = lex_advance_n(l1, 8)
-            Step(l_end, tok(TkUnstable, sl, sc, start, l_end.pos))
+            Step(l_end, tok(TkError("deprecated annotation syntax (issue #608) — write `#[unstable]` instead of `#unstable`"),
+                            sl, sc, start, l_end.pos))
+          } else {
+            Step(l1, tok(TkError("unexpected `#` — comments start with `#` followed by space; annotations use `#[...]`"),
+                         sl, sc, start, l1.pos))
           }
         }
         '~' -> {
@@ -1903,8 +1914,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkHoleName(_) -> match b { TkHoleName(_) -> true _ -> false }
     TkTodoBang   -> match b { TkTodoBang -> true _ -> false }
     TkPlusPlus   -> match b { TkPlusPlus -> true _ -> false }
-    TkDerive     -> match b { TkDerive -> true _ -> false }
-    TkUnstable   -> match b { TkUnstable -> true _ -> false }
+    TkHashOpen   -> match b { TkHashOpen -> true _ -> false }
     TkRegex      -> match b { TkRegex -> true _ -> false }
     TkError(_)   -> false
   }
@@ -5726,12 +5736,9 @@ fn parse_decl(p: Parser) : PDecl / Console {
   } else if tk_is(hd.kind, TkImpl) {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on an impl")) }
     else { parse_impl_decl(p_advance(p1), hd) }
-  } else if tk_is(hd.kind, TkDerive) {
-    if is_pub { err_d(p_error(p1, hd, "`pub` must precede the `type` declaration after `#derive`")) }
-    else { parse_derive_decl(p_advance(p1), hd) }
-  } else if tk_is(hd.kind, TkUnstable) {
-    if is_pub { err_d(p_error(p1, hd, "`pub` must come AFTER `#unstable`, not before — write `#unstable pub fn ...`")) }
-    else { parse_unstable_decl(p_advance(p1), hd) }
+  } else if tk_is(hd.kind, TkHashOpen) {
+    if is_pub { err_d(p_error(p1, hd, "`pub` must come AFTER the `#[...]` attribute, not before — write `#[unstable] pub fn ...`")) }
+    else { parse_attribute_decl(p_advance(p1), hd) }
   } else if tk_is(hd.kind, TkTest) {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a test")) }
     else { parse_test_decl(p_advance(p1), hd) }
@@ -8988,37 +8995,112 @@ fn parse_impl_methods(p: Parser, acc: [Decl]) : PImplMethods / Console {
   }
 }
 
-# m12.8: `#derive(P1, P2, ...)` immediately followed by a `type` decl.
-# The annotation list is attached to the wrapped DType so the lower
-# pass can synthesise structural impls.
-fn parse_derive_decl(p: Parser, t: Token) : PDecl / Console {
+# Issue #608: `#[ident (args)?]` attribute, dispatched after the lexer
+# emits `TkHashOpen` and the caller has advanced past it. Reads the
+# identifier inside the brackets, expects the matching `]`, and routes
+# to the appropriate inner-decl parser. Known attributes today: `derive`
+# (with parenthesised protocol list) and `unstable` (flag form). Unknown
+# attributes parse cleanly (forward-compat for future `#[doc(...)]`,
+# `#[deprecated]`, custom user attributes) and are dropped from the AST.
+fn parse_attribute_decl(p: Parser, hash_tok: Token) : PDecl / Console {
+
+  let p0 = p_skip_newlines(p)
+  let id = p_peek(p0)
+  if not tk_is(id.kind, TkIdent) {
+    err_d(p_error(p0, id, "expected attribute name after `#[`"))
+  } else {
+    let name = tok_source(p0.src, id)
+    let p1 = p_advance(p0)
+    if name == "derive" {
+      parse_attr_derive_body(p1, hash_tok)
+    } else if name == "unstable" {
+      parse_attr_unstable_body(p1, hash_tok)
+    } else {
+      parse_attr_unknown_body(p1, name, hash_tok)
+    }
+  }
+}
+
+# `#[derive(P1, P2, ...)] type T = ...`. The ident and TkHashOpen have
+# already been consumed; `p` points at the `(`.
+fn parse_attr_derive_body(p: Parser, hash_tok: Token) : PDecl / Console {
 
   if not p_at(p, TkLparen) {
-    err_d(p_error_here(p, "expected `(` after `#derive`"))
+    err_d(p_error_here(p, "expected `(` after `#[derive`"))
   } else {
     let p1 = p_skip_newlines(p_advance(p))
     let names_r = parse_derive_names(p1, [])
     match names_r.r {
       None -> err_d(names_r.p)
       Some(names) -> {
-        let p2 = p_skip_newlines(names_r.p)
-        let p2_pub_r =
-          if tk_is(p_peek(p2).kind, TkPub) { PTy { p: p_advance(p2), r: Some(mk_ty(TyName("", []), 0, 0)) } }
-          else { PTy { p: p2, r: None } }
-        let inner_pub = match p2_pub_r.r { Some(_) -> true None -> false }
-        let p3 = p2_pub_r.p
-        let hd = p_peek(p3)
-        if not tk_is(hd.kind, TkType) {
-          err_d(p_error(p3, hd, "`#derive` must precede a `type` declaration"))
+        let p_close = p_skip_newlines(names_r.p)
+        if not p_at(p_close, TkRbracket) {
+          err_d(p_error_here(p_close, "expected `]` to close `#[derive(...)]`"))
         } else {
-          let inner = parse_type_decl(p_advance(p3), inner_pub, hd)
-          match inner.r {
-            None -> err_d(inner.p)
-            Some(d) -> ok_d(inner.p, DDerive(names, d, t.line, t.col))
+          let p2 = p_skip_newlines(p_advance(p_close))
+          let p2_pub_r =
+            if tk_is(p_peek(p2).kind, TkPub) { PTy { p: p_advance(p2), r: Some(mk_ty(TyName("", []), 0, 0)) } }
+            else { PTy { p: p2, r: None } }
+          let inner_pub = match p2_pub_r.r { Some(_) -> true None -> false }
+          let p3 = p2_pub_r.p
+          let hd = p_peek(p3)
+          if not tk_is(hd.kind, TkType) {
+            err_d(p_error(p3, hd, "`#[derive(...)]` must precede a `type` declaration"))
+          } else {
+            let inner = parse_type_decl(p_advance(p3), inner_pub, hd)
+            match inner.r {
+              None -> err_d(inner.p)
+              Some(d) -> ok_d(inner.p, DDerive(names, d, hash_tok.line, hash_tok.col))
+            }
           }
         }
       }
     }
+  }
+}
+
+# `#[unstable] pub fn / pub type / pub const / pub effect / pub protocol`.
+# The ident and TkHashOpen have already been consumed; `p` points at the
+# closing `]`.
+fn parse_attr_unstable_body(p: Parser, hash_tok: Token) : PDecl / Console {
+
+  if not p_at(p, TkRbracket) {
+    err_d(p_error_here(p, "expected `]` to close `#[unstable]` (the unstable attribute takes no arguments)"))
+  } else {
+    let p_after = p_advance(p)
+    parse_unstable_decl(p_after, hash_tok)
+  }
+}
+
+# Forward-compat: unknown attributes (`#[doc("...")]`, `#[deprecated]`,
+# `#[cfg(...)]`, custom user attributes). Consume the optional argument
+# list and the closing `]`, then return whatever decl follows untouched.
+# The attribute itself is dropped — only `derive` and `unstable` have
+# downstream semantics in this lane.
+fn parse_attr_unknown_body(p: Parser, name: String, hash_tok: Token) : PDecl / Console {
+
+  let p_args = if p_at(p, TkLparen) {
+    skip_balanced_parens(p_advance(p), 1)
+  } else { p }
+  if not p_at(p_args, TkRbracket) {
+    err_d(p_error_here(p_args, string_concat_all(["expected `]` to close `#[", name, "(...)]`"])))
+  } else {
+    let p2 = p_skip_newlines(p_advance(p_args))
+    parse_decl(p2)
+  }
+}
+
+# Skip tokens until the matching `)` (the caller has already consumed the
+# opening `(` and `depth` starts at 1). Used by unknown-attribute parsing
+# to ignore arbitrary argument shapes. Bails on EOF.
+fn skip_balanced_parens(p: Parser, depth: Int) : Parser {
+  if depth <= 0 { p }
+  else {
+    let t = p_peek(p)
+    if tk_is(t.kind, TkEof) { p }
+    else if tk_is(t.kind, TkLparen) { skip_balanced_parens(p_advance(p), depth + 1) }
+    else if tk_is(t.kind, TkRparen) { skip_balanced_parens(p_advance(p), depth - 1) }
+    else { skip_balanced_parens(p_advance(p), depth) }
   }
 }
 
@@ -9028,7 +9110,7 @@ fn parse_derive_names(p: Parser, acc: [String]) : PDeriveNames / Console {
 
   let id = p_peek(p)
   if not tk_is(id.kind, TkIdent) or not is_upper_ident(p.src, id) {
-    PDeriveNames { p: p_error(p, id, "expected a protocol name in `#derive(...)`"), r: None }
+    PDeriveNames { p: p_error(p, id, "expected a protocol name in `#[derive(...)]`"), r: None }
   } else {
     let name = tok_source(p.src, id)
     let p1 = p_skip_newlines(p_advance(p))
@@ -9037,7 +9119,7 @@ fn parse_derive_names(p: Parser, acc: [String]) : PDeriveNames / Console {
     } else if p_at(p1, TkRparen) {
       PDeriveNames { p: p_advance(p1), r: Some(list_reverse([name, ...acc])) }
     } else {
-      PDeriveNames { p: p_error_here(p1, "expected `,` or `)` in `#derive(...)`"), r: None }
+      PDeriveNames { p: p_error_here(p1, "expected `,` or `)` in `#[derive(...)]`"), r: None }
     }
   }
 }
@@ -9053,7 +9135,7 @@ fn parse_unstable_decl(p: Parser, t: Token) : PDecl / Console {
   let p0 = p_skip_newlines(p)
   let pub_tok = p_peek(p0)
   if not tk_is(pub_tok.kind, TkPub) {
-    err_d(p_error(p0, pub_tok, "`#unstable` must precede a `pub fn`, `pub type`, or `pub const` declaration"))
+    err_d(p_error(p0, pub_tok, "`#[unstable]` must precede a `pub fn`, `pub type`, or `pub const` declaration"))
   } else {
     let p1 = p_skip_newlines(p_advance(p0))
     let hd = p_peek(p1)
@@ -9088,7 +9170,7 @@ fn parse_unstable_decl(p: Parser, t: Token) : PDecl / Console {
         Some(d) -> ok_d(inner.p, DUnstable(d, t.line, t.col))
       }
     } else {
-      err_d(p_error(p1, hd, "`#unstable pub` must be followed by `fn`, `type`, `const`, `effect`, or `protocol`"))
+      err_d(p_error(p1, hd, "`#[unstable] pub` must be followed by `fn`, `type`, `const`, `effect`, or `protocol`"))
     }
   }
 }
@@ -10244,11 +10326,11 @@ fn dump_decl(d: Decl, depth: Int) : Unit / Console {
     }
     DDerive(names, inner, line, col) -> {
       let names_s = join_with(names, ", ")
-      emit_line(depth, "#derive(#{names_s}) @#{int_to_string(line)}:#{int_to_string(col)}")
+      emit_line(depth, "#[derive(#{names_s})] @#{int_to_string(line)}:#{int_to_string(col)}")
       dump_decl(inner, depth + 1)
     }
     DUnstable(inner, line, col) -> {
-      emit_line(depth, "#unstable @#{int_to_string(line)}:#{int_to_string(col)}")
+      emit_line(depth, "#[unstable] @#{int_to_string(line)}:#{int_to_string(col)}")
       dump_decl(inner, depth + 1)
     }
     DUnit(is_pub, name, alias_opt, line, col) -> {
@@ -49632,7 +49714,7 @@ fn unstable_check_expr(e: Expr, mt: [ModuleEntry], pkg: String,
           if me_export_is_unstable(me, fname) {
             diag_warning(file, e.line, e.col,
               concat_all([mod, ".", fname,
-                          " is #unstable — API may change between versions without an edition bump. ",
+                          " is #[unstable] — API may change between versions without an edition bump. ",
                           "Add '", mod, " = true' under [unstable] in kai.toml to acknowledge."]))
           } else { () }
       }
@@ -53423,10 +53505,10 @@ fn validate_derive_binser_one(file: String, tname: String, fname: String,
   } else {
     eprint(concat_all([
       file, ":", int_to_string(line), ":", int_to_string(col),
-      ": error: cannot `#derive(BinSerialize)` for `", tname,
+      ": error: cannot `#[derive(BinSerialize)]` for `", tname,
       "`: no `BinSerialize` impl for ", kind, " `", fname, "` of type `", head,
       "` (declare `impl BinSerialize for ", head,
-      "` or `#derive(BinSerialize)` on `", head, "`)"]))
+      "` or `#[derive(BinSerialize)]` on `", head, "`)"]))
     errs + 1
   }
 }
@@ -53452,7 +53534,7 @@ fn validate_derive_binser_collection_elem(file: String, tname: String,
       # against the outer head so the user knows the shape is wrong.
       eprint(concat_all([
         file, ":", int_to_string(line), ":", int_to_string(col),
-        ": error: cannot `#derive(BinSerialize)` for `", tname,
+        ": error: cannot `#[derive(BinSerialize)]` for `", tname,
         "`: ", kind, " `", fname, "` has shape `", head,
         "` without an element type"]))
       errs + 1
@@ -53628,9 +53710,9 @@ fn validate_derive_ord_one(file: String, tname: String, fname: String,
   } else {
     eprint(concat_all([
       file, ":", int_to_string(line), ":", int_to_string(col),
-      ": error: cannot `#derive(Ord)` for `", tname,
+      ": error: cannot `#[derive(Ord)]` for `", tname,
       "`: no `Ord` impl for ", kind, " `", fname, "` of type `", head,
-      "` (declare `impl Ord for ", head, "` or `#derive(Ord)` on `", head, "`)"]))
+      "` (declare `impl Ord for ", head, "` or `#[derive(Ord)]` on `", head, "`)"]))
     errs + 1
   }
 }
@@ -55575,8 +55657,8 @@ fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
     DEffect(_, _, _, _, _, line, _) -> fmt_panic_unsupported("effect declarations", line)
     DProtocol(_, _, _, _, line, _) -> fmt_panic_unsupported("protocol declarations", line)
     DImpl(_, _, _, _, line, _) -> fmt_panic_unsupported("impl blocks", line)
-    DDerive(_, _, line, _) -> fmt_panic_unsupported("#derive annotation", line)
-    DUnstable(_, line, _) -> fmt_panic_unsupported("#unstable annotation", line)
+    DDerive(_, _, line, _) -> fmt_panic_unsupported("#[derive(...)] annotation", line)
+    DUnstable(_, line, _) -> fmt_panic_unsupported("#[unstable] annotation", line)
     DUnit(_, _, _, line, _) -> fmt_panic_unsupported("unit declarations", line)
     DUse(_, line, _) -> fmt_panic_unsupported("file-level `use`", line)
     DAxiom(_, _, _, _, _, _, _, _, line, _) -> fmt_panic_unsupported("axiom declarations", line)
