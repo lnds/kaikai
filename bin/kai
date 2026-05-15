@@ -620,6 +620,37 @@ file_sha256() {
   fi
 }
 
+# Issue #592: batch sha256 for the stdlib preludes. Per-file
+# `shasum` forks cost ~9ms each; with 32 preludes that compounds to
+# ~270ms — more than the cache itself saves on warm reload.
+# `prelude_sha_batch` runs `shasum -a 256` once over every path and
+# emits `<sha> <path>` lines into KAI_PRELUDE_SHA_FILE (a tmp file
+# the parent sets before invoking stdlib_prelude_flags). Per-file
+# lookups use `awk` against that file in O(n) per query — still
+# cheaper than re-forking shasum.
+prelude_sha_batch() {
+  out_file="$1"; shift
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$@" 2>/dev/null | awk '{ sha=$1; $1=""; sub(/^ /, ""); print sha " " $0 }' > "$out_file"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@" 2>/dev/null | awk '{ sha=$1; $1=""; sub(/^ /, ""); print sha " " $0 }' > "$out_file"
+  else
+    : > "$out_file"
+  fi
+}
+
+# Look up a path's pre-computed sha in $KAI_PRELUDE_SHA_FILE. Falls
+# back to a one-off `file_sha256` if the batch file is absent or the
+# path is not listed.
+file_sha256_cached() {
+  src="$1"
+  if [ -n "${KAI_PRELUDE_SHA_FILE:-}" ] && [ -f "$KAI_PRELUDE_SHA_FILE" ]; then
+    awk -v p="$src" '$2 == p { print $1; exit }' "$KAI_PRELUDE_SHA_FILE"
+    return 0
+  fi
+  file_sha256 "$src"
+}
+
 # Locate the cache file for $1 (a source .kai path). Returns the
 # cache path on stdout, or empty if no usable cache exists.
 #
@@ -631,19 +662,16 @@ file_sha256() {
 # a different sha and therefore a fresh cache slot — no mtime check
 # is needed.
 #
-# Phase A.0 is OPT-IN today via KAI_PRELUDE_CACHE=1. The hex on-disk
-# format (chosen for stage 1 portability — no Byte type) is ~25%
-# slower than `--prelude <src>` on the full stdlib because hex
-# decoding allocates more strings than the parser. Future format
-# bumps (cache_format_version != 1) can flip to a binary payload and
-# unlock the design's projected ~0.41s savings; the lane that does
-# the flip flips the default here. Tracked in #452 follow-ups.
+# Issue #592: the KAB2 binary format closes the KAB1 hex regression.
+# Warm wall is now within noise of cache-OFF (slight net positive),
+# so the cache layer is ON by default. KAI_PRELUDE_CACHE=0 (or
+# KAI_NO_PRELUDE_CACHE=1) restores the pre-cache path.
 prelude_cache_lookup() {
   src="$1"
-  [ "${KAI_PRELUDE_CACHE:-0}" = "1" ]    || return 0
+  [ "${KAI_PRELUDE_CACHE:-1}" = "1" ]    || return 0
   [ -n "${KAI_NO_PRELUDE_CACHE:-}" ]     && return 0
   [ -n "${KAI_NO_STDLIB:-}" ]            && return 0
-  sha="$(file_sha256 "$src")"
+  sha="$(file_sha256_cached "$src")"
   [ -n "$sha" ] || return 0
   cache_dir="$(prelude_cache_dir)"
   cache_path="$cache_dir/${sha}.kab"
@@ -660,10 +688,10 @@ prelude_cache_lookup() {
 # (caller falls back to passing the source via --prelude).
 prelude_cache_build() {
   src="$1"
-  [ "${KAI_PRELUDE_CACHE:-0}" = "1" ]    || return 0
+  [ "${KAI_PRELUDE_CACHE:-1}" = "1" ]    || return 0
   [ -n "${KAI_NO_PRELUDE_CACHE:-}" ]     && return 0
   [ -n "${KAI_NO_STDLIB:-}" ]            && return 0
-  sha="$(file_sha256 "$src")"
+  sha="$(file_sha256_cached "$src")"
   [ -n "$sha" ] || return 0
   cache_dir="$(prelude_cache_dir)"
   mkdir -p "$cache_dir" || return 0
@@ -694,13 +722,11 @@ prelude_flag_for() {
   src="$1"
   [ -f "$src" ] || return 0
   # Default: the cache layer is opt-in via KAI_PRELUDE_CACHE=1. With
-  # the v1 hex on-disk format the deserialiser is slower than the
-  # parser on the full stdlib; leaving it off-by-default keeps every
-  # warm wall identical to v0.58.1 until the binary-format flip
-  # ships. Setting KAI_NO_PRELUDE_CACHE=1 is the explicit override
-  # for opt-in users who want to skip the cache for a single
-  # invocation (e.g. CI runs that purge `~/.cache/kaikai`).
-  if [ "${KAI_PRELUDE_CACHE:-0}" != "1" ] || [ "${KAI_NO_PRELUDE_CACHE:-}" = "1" ]; then
+  # Issue #592: cache layer is ON by default with KAB2. Setting
+  # KAI_PRELUDE_CACHE=0 or KAI_NO_PRELUDE_CACHE=1 restores the
+  # pre-cache code path (useful for CI runs that purge
+  # ~/.cache/kaikai or for benchmark comparison).
+  if [ "${KAI_PRELUDE_CACHE:-1}" != "1" ] || [ "${KAI_NO_PRELUDE_CACHE:-}" = "1" ]; then
     printf -- '--prelude %s ' "$src"
     return 0
   fi
@@ -728,6 +754,36 @@ prelude_flag_for() {
 # / --holes-json) so both surfaces see the same scope.
 stdlib_prelude_flags() {
   if [ "${KAI_NO_STDLIB:-}" = "1" ]; then return 0; fi
+  # Issue #592: when the cache is on, batch sha256 every prelude in a
+  # single `shasum` invocation. 32 individual `file_sha256` forks
+  # cost ~270ms; one batched call costs ~10ms. The KAI_PRELUDE_SHA_FILE
+  # env var travels via the parent's exported scope and is read by
+  # `file_sha256_cached` for every per-prelude lookup that follows.
+  if [ "${KAI_PRELUDE_CACHE:-1}" = "1" ] && [ -z "${KAI_NO_PRELUDE_CACHE:-}" ]; then
+    sha_paths=""
+    if [ -d "$STDLIB_CORE_DIR" ]; then
+      for core_file in "$STDLIB_CORE_DIR"/*.kai; do
+        [ -f "$core_file" ] && sha_paths="$sha_paths $core_file"
+      done
+    fi
+    for f in "$STDLIB_PROTOCOLS" "$STDLIB_EFFECTS" "$STDLIB_ARRAY" \
+             "$STDLIB_RANDOM" "$STDLIB_RANDOM_SECURE" "$STDLIB_BASE64" \
+             "$STDLIB_HEX" "$STDLIB_MAP" "$STDLIB_SET" "$STDLIB_QUEUE" \
+             "$STDLIB_STACK" "$STDLIB_MATH_NUMERIC" "$STDLIB_MATH_INT" \
+             "$STDLIB_MATH_REAL" "$STDLIB_MATH_COMPLEX" "$STDLIB_JSON" \
+             "$STDLIB_TOML" "$STDLIB_DECIMAL" "$STDLIB_MONEY" "$STDLIB_FX" \
+             "$STDLIB_UUID" "$STDLIB_REGEXP" "$STDLIB_PATH" \
+             "$STDLIB_CRYPTO_HASH" "$STDLIB_CRYPTO_MAC"; do
+      [ -f "$f" ] && sha_paths="$sha_paths $f"
+    done
+    if [ -n "$sha_paths" ]; then
+      sha_file="${TMPDIR:-/tmp}/kai-preludes-sha.$$.txt"
+      # shellcheck disable=SC2086
+      prelude_sha_batch "$sha_file" $sha_paths
+      KAI_PRELUDE_SHA_FILE="$sha_file"
+      export KAI_PRELUDE_SHA_FILE
+    fi
+  fi
   if [ -d "$STDLIB_CORE_DIR" ]; then
     for core_file in "$STDLIB_CORE_DIR"/*.kai; do
       prelude_flag_for "$core_file"
@@ -758,6 +814,10 @@ stdlib_prelude_flags() {
   prelude_flag_for "$STDLIB_PATH"
   prelude_flag_for "$STDLIB_CRYPTO_HASH"
   prelude_flag_for "$STDLIB_CRYPTO_MAC"
+  if [ -n "${KAI_PRELUDE_SHA_FILE:-}" ] && [ -f "$KAI_PRELUDE_SHA_FILE" ]; then
+    rm -f "$KAI_PRELUDE_SHA_FILE" 2>/dev/null
+    unset KAI_PRELUDE_SHA_FILE
+  fi
   return 0
 }
 
