@@ -1,9 +1,15 @@
 #!/bin/sh
-# Phase A.0 cache invalidation fixture #1 — magic mismatch.
+# Phase A cache invalidation fixture #1 — magic mismatch.
 #
 # Plants a cache .kab whose 4-byte magic is "KAB0" instead of the
-# current "KAB1". `cache_read_header` rejects the blob, the loader
+# current "KAB2". `cache_read_header` rejects the blob, the loader
 # falls back to `load_prelude`, the compile succeeds.
+#
+# KAB2 header layout (76 bytes, fixed):
+#   magic           4 bytes  "KAB2"
+#   format_version  4 bytes  u32 LE  (current = 2)
+#   kaikai_version  4 bytes  u32 LE  (current = 1)
+#   source_sha     64 bytes  ASCII lowercase hex
 
 set -eu
 
@@ -11,20 +17,17 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CACHE_DIR="$(mktemp -d)"
 trap 'rm -rf "$CACHE_DIR"' EXIT INT TERM
 
-# Use a tiny stdlib file as the "victim" prelude. char.kai is the
-# smallest core prelude and the alphabetical-first one bin/kai loads,
-# so a single corrupted cache entry is enough to exercise the path.
 SRC="$ROOT/stdlib/core/char.kai"
 SHA="$(shasum -a 256 "$SRC" | awk '{ print $1 }')"
 CACHE_FILE="$CACHE_DIR/${SHA}.kab"
 
-# Seed: valid header layout, BUT magic = KAB0 (one digit off).
-{
-  printf 'KAB0\n'
-  printf '01000000\n'        # format_version (matches current)
-  printf '01000000\n'        # kaikai_version_hash (matches current)
-  printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000"
-} > "$CACHE_FILE"
+# Seed: valid header layout but magic = "KAB0" (one byte off).
+# format_version + kaikai_version match the current binary so the
+# rejection is specifically on the magic.
+printf 'KAB0' > "$CACHE_FILE"
+printf '\002\000\000\000' >> "$CACHE_FILE"  # format_version 2 LE
+printf '\001\000\000\000' >> "$CACHE_FILE"  # kaikai_version_hash 1 LE
+printf '0000000000000000000000000000000000000000000000000000000000000000' >> "$CACHE_FILE"
 
 cat > "$CACHE_DIR/empty.kai" <<'EOF'
 fn main() : Unit / Console {
@@ -32,9 +35,6 @@ fn main() : Unit / Console {
 }
 EOF
 
-# Compile with the seeded cache directory. Expect: success + "hi"
-# on stdout. Stderr will contain the cache-miss diagnostic; we don't
-# require its exact wording, only that the build does not fail.
 out="$(KAI_PRELUDE_CACHE=1 KAI_PRELUDE_CACHE_DIR="$CACHE_DIR" \
        "$ROOT/bin/kai" run "$CACHE_DIR/empty.kai" 2>&1 || true)"
 
