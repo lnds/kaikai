@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.62.0 (2026-05-15)
+
+### Added
+
+- **typer**: boundary tagging — synth decls carry module_origin (closes #597)
+
 ## v0.61.0 (2026-05-14)
 
 ### Added
