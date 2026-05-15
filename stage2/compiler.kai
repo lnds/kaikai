@@ -32876,35 +32876,52 @@ fn find_head_owner(env: TyEnv, head: String) : HeadLookup =
 # target. The user can extract the type into a module if they want
 # pipes to dispatch against it.
 fn build_head_owner_map(decls: [Decl], modules: [ModuleEntry],
-                         target_mod: String) : [HeadOwnerEntry] {
-  let pub_type_names = collect_pub_type_names(decls, [])
-  # Filter out the target file's ME from the dispatch search. The
-  # target ME's `exports` list is built over the post-`expand_imports`
-  # decl stream, which transitively includes every imported module's
-  # decls — so a `pub type T` exported by an imported module appears
-  # in BOTH the imported module's ME and the target ME. Without this
-  # filter every imported `pub type` would surface as ambiguously
-  # declared by `(<owning_module>, <target_basename>)`. Filtering by
-  # name preserves the cache's invariant that each entry's `mods`
-  # list contains only modules that genuinely own the `pub type`
-  # declaration. Pipes against `pub type` declared in the root file
-  # are intentionally not dispatchable — the rejection diagnostic
-  # ("no module declaring type `T` is in scope") is the design.
-  let modules_filtered = filter_out_target(modules, target_mod, [])
-  let from_decls = build_head_owner_loop(pub_type_names, modules_filtered, [])
-  # Issue #594: `List` is a built-in head with no `pub type List`
-  # declaration in any user-visible module — the parser stamps `[T]`
-  # syntax directly to `TyListT`, and `core/list.kai` carries the
-  # canonical `pub fn map / flat_map / filter` against it. Register
-  # the `List → list` mapping unconditionally so the cache mirrors
-  # what the pre-#594 hardcoded `head_module_for` returned for the
-  # only entry it knew. The dispatch site falls back to a bare-name
-  # callee (`EVar("map")`) when `list::map` is not registered in the
-  # qualified env — the test-sugars harness exercises this path by
-  # invoking `kaic2` against `[1..6] |? p` without
-  # `--prelude core/list.kai`, relying on the runtime
-  # `kai_prelude_map` / `kai_prelude_filter` stubs.
-  [HOE("List", ["list"]), ...from_decls]
+                         target_mod: String, edition: String) : [HeadOwnerEntry] {
+  # Issue #603: gate the #594 convention-based pipe dispatch on
+  # edition >= anga-roa. Pre-anga-roa (tongariki) packages keep only
+  # the seeded `List → list` mapping, which is what the pre-#594
+  # hardcoded `head_module_for` returned. User `pub type` heads
+  # therefore route through the bare-name fallback in
+  # `synth_pipe_dispatch`, matching the diagnostic the legacy code
+  # path produced ("no module declaring type `T` is in scope" via
+  # HLNone). An empty edition string from a driver that predates
+  # #603 also falls into the tongariki branch.
+  let walk_user_types = edition_at_least(edition, "anga-roa")
+  if walk_user_types {
+    let pub_type_names = collect_pub_type_names(decls, [])
+    # Filter out the target file's ME from the dispatch search. The
+    # target ME's `exports` list is built over the post-`expand_imports`
+    # decl stream, which transitively includes every imported module's
+    # decls — so a `pub type T` exported by an imported module appears
+    # in BOTH the imported module's ME and the target ME. Without this
+    # filter every imported `pub type` would surface as ambiguously
+    # declared by `(<owning_module>, <target_basename>)`. Filtering by
+    # name preserves the cache's invariant that each entry's `mods`
+    # list contains only modules that genuinely own the `pub type`
+    # declaration. Pipes against `pub type` declared in the root file
+    # are intentionally not dispatchable — the rejection diagnostic
+    # ("no module declaring type `T` is in scope") is the design.
+    let modules_filtered = filter_out_target(modules, target_mod, [])
+    let from_decls = build_head_owner_loop(pub_type_names, modules_filtered, [])
+    # Issue #594: `List` is a built-in head with no `pub type List`
+    # declaration in any user-visible module — the parser stamps `[T]`
+    # syntax directly to `TyListT`, and `core/list.kai` carries the
+    # canonical `pub fn map / flat_map / filter` against it. Register
+    # the `List → list` mapping unconditionally so the cache mirrors
+    # what the pre-#594 hardcoded `head_module_for` returned for the
+    # only entry it knew. The dispatch site falls back to a bare-name
+    # callee (`EVar("map")`) when `list::map` is not registered in the
+    # qualified env — the test-sugars harness exercises this path by
+    # invoking `kaic2` against `[1..6] |? p` without
+    # `--prelude core/list.kai`, relying on the runtime
+    # `kai_prelude_map` / `kai_prelude_filter` stubs.
+    [HOE("List", ["list"]), ...from_decls]
+  } else {
+    # Tongariki: only the seeded built-in `List → list` participates.
+    # User-defined `pub type T` is invisible to pipe dispatch and the
+    # rejection diagnostic falls through to the standard HLNone path.
+    [HOE("List", ["list"])]
+  }
 }
 
 fn collect_pub_type_names(ds: [Decl], acc: [String]) : [String] {
@@ -56989,21 +57006,29 @@ type CliOptions = { mode: Mode, path: Option[String], preludes: [String],
                     # qualified-call rewriter so #unstable warnings
                     # skip both self-imports and opted-in deps.
                     package_name: String,
-                    unstable_optins: [String] }
+                    unstable_optins: [String],
+                    # Issue #603: edition name parsed from
+                    # `--edition <name>`. `bin/kai` always provides a
+                    # value (kai.toml field or repo EDITION fallback);
+                    # an empty string means the driver did not supply
+                    # the flag (legacy call site). The typer gates
+                    # feature branches on this (e.g. #594 convention
+                    # pipe dispatch is active only for >= anga-roa).
+                    edition: String }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
   CliOptions { mode: m, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
 
 fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, path: Some(p), preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
 
 fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path,
@@ -57012,7 +57037,7 @@ fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
                cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
 
 fn cli_with_prelude_cache(opts: CliOptions, src: String, cache: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path,
@@ -57021,21 +57046,21 @@ fn cli_with_prelude_cache(opts: CliOptions, src: String, cache: String) : CliOpt
                cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
 
 fn cli_with_cache_sha(opts: CliOptions, sha: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
 
 fn cli_with_strict_holes(opts: CliOptions) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: true, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
 
 fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
@@ -57043,14 +57068,14 @@ fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
                strict_holes: opts.strict_holes,
                search_paths: list_append(opts.search_paths, [sp]),
                include_prelude_tests: opts.include_prelude_tests,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
 
 fn cli_with_include_prelude_tests(opts: CliOptions) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: true,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
 
 # Issue #602: set the consumer-package name parsed from kai.toml. The
 # value flows through to the qualified-call rewriter so self-imports
@@ -57060,7 +57085,44 @@ fn cli_with_package_name(opts: CliOptions, n: String) : CliOptions =
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests,
-               package_name: n, unstable_optins: opts.unstable_optins }
+               package_name: n, unstable_optins: opts.unstable_optins, edition: opts.edition }
+
+# Issue #603: set the consumer-declared edition (parsed from
+# `--edition <name>` which `bin/kai` derives from kai.toml's
+# `edition = "..."` field, falling back to the repo EDITION file).
+# An empty string at compile time means the driver did not pass the
+# flag; the typer treats that as the oldest edition (tongariki) so
+# pre-#603 invocations and old fixture harnesses keep working.
+fn cli_with_edition(opts: CliOptions, n: String) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               include_prelude_tests: opts.include_prelude_tests,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins,
+               edition: n }
+
+# Issue #603: the canonical lowercase set of edition names the
+# compiler accepts. Adding a new edition (Orongo) flips this list
+# AND adds an `edition_rank` row below.
+fn known_editions() : [String] = ["tongariki", "anga-roa"]
+
+fn edition_is_known_loop(es: [String], n: String) : Bool = match es {
+  [] -> false
+  [e, ...rest] -> if e == n { true } else { edition_is_known_loop(rest, n) }
+}
+
+fn edition_is_known(n: String) : Bool = edition_is_known_loop(known_editions(), n)
+
+# Numeric rank for `>=` comparisons. Unknown values default to 0
+# (tongariki) defensively; the CLI rejects unknown values before any
+# rank lookup runs.
+fn edition_rank(n: String) : Int =
+  if n == "anga-roa" { 1 }
+  else if n == "tongariki" { 0 }
+  else { 0 }
+
+fn edition_at_least(have: String, target: String) : Bool =
+  edition_rank(have) >= edition_rank(target)
 
 # Issue #602: register a `[unstable] <pkg> = true` opt-in from
 # kai.toml. Repeated flags accumulate.
@@ -57070,7 +57132,8 @@ fn cli_push_unstable_optin(opts: CliOptions, pkg: String) : CliOptions =
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                include_prelude_tests: opts.include_prelude_tests,
                package_name: opts.package_name,
-               unstable_optins: list_append(opts.unstable_optins, [pkg]) }
+               unstable_optins: list_append(opts.unstable_optins, [pkg]),
+               edition: opts.edition }
 
 fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
   match rest {
@@ -57205,6 +57268,26 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
             cli_with_mode(opts, MHelp)
           }
         }
+      } else if a == "--edition" {
+        # Issue #603: the consumer's edition, derived by `bin/kai`
+        # from kai.toml's `edition = "..."` field (or the repo
+        # EDITION file when no manifest is present). Unknown values
+        # produce an error that names the known set so the user can
+        # correct the manifest.
+        match more {
+          [n, ...rest2] ->
+            if edition_is_known(n) {
+              parse_cli_loop(rest2, cli_with_edition(opts, n))
+            } else {
+              eprint(concat_all(["kaic2: unknown edition `", n,
+                "` in kai.toml — known editions: tongariki, anga-roa"]))
+              cli_with_mode(opts, MHelp)
+            }
+          [] -> {
+            eprint("kaic2: --edition requires an edition-name argument")
+            cli_with_mode(opts, MHelp)
+          }
+        }
       } else {
         parse_cli_loop(more, cli_with_path(opts, a))
       }
@@ -57218,7 +57301,8 @@ fn parse_cli(argv: [String]) : CliOptions / Console {
                                     prelude_caches: [], cache_sha: "",
                                     strict_holes: false, search_paths: [],
                                     include_prelude_tests: false,
-                                    package_name: "", unstable_optins: [] })
+                                    package_name: "", unstable_optins: [],
+                                    edition: "" })
 }
 
 fn usage() : Unit / Console {
@@ -57249,6 +57333,7 @@ fn usage() : Unit / Console {
   eprint("  --include-prelude-tests  also run test blocks defined inside --prelude files (default: drop them; issue #318)")
   eprint("  --package-name <n>   identifier of the consuming package (from kai.toml `name`); silences #unstable on self-imports (#602)")
   eprint("  --unstable-optin <p> mark package <p> as `[unstable] = true` opt-in (repeatable; #602)")
+  eprint("  --edition <name>     declared edition from kai.toml — gates edition-bumped features (#603)")
   eprint("  -h, --help         this help")
   eprint("  -V, --version      print version and exit")
 }
@@ -59674,7 +59759,7 @@ fn dump_diags_json(file: String, decls: [Decl]) : Int / Console + File {
 
 # ============================================================
 
-fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment], package_name: String, unstable_optins: [String]) : Int / Console + File {
+fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment], package_name: String, unstable_optins: [String], edition: String) : Int / Console + File {
 
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
@@ -60169,7 +60254,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   # `map / flat_map / filter` participates in `|`, `||`,
                   # `|?` automatically — no compiler change required when
                   # a downstream package adds a new pipe-eligible type.
-                  let head_owners = build_head_owner_map(all_decls, module_table, target_mod_name)
+                  let head_owners = build_head_owner_map(all_decls, module_table, target_mod_name, edition)
                   let typed_prog0 = infer_program_with_protos_cached(path, all_decls, false, lowered.reg.impls, head_owners)
                   # m12.8: post-inference protocol-call rewrite.
                   # `Expr.ty` is populated for every node now, so each
@@ -60359,7 +60444,7 @@ fn run(opts: CliOptions) : Int / Console + File {
           None -> 1
           Some(pls) -> match pls {
             PLS(pds, pmods, psegs) -> match read_file(p) {
-              Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins)
+              Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition)
               Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
             }
           }
@@ -60695,7 +60780,14 @@ fn cache_file_header(source_sha: String) : String =
 
 # Bumped on every kaikai release. Currently hard-coded; the build
 # system can override via a future code-gen step.
-fn cache_kaikai_version_hash() : Int = 1
+#
+# Issue #603: bumped from 1 to 2 when the edition catalog became
+# load-bearing. The driver also partitions cache files by edition
+# under `~/.cache/kaikai/preludes-v1/<edition>/`, so cross-edition
+# contamination is prevented at the path level; this header bump
+# is defense-in-depth against any leftover blob copied between
+# edition directories.
+fn cache_kaikai_version_hash() : Int = 2
 
 # Parse the cache file header from `buf`. Returns the source SHA
 # the file claims to hash, plus the offset where the payload begins
