@@ -93,14 +93,14 @@ What's still open (planned-but-not-shipped):
 ## Tier plan
 
 Three tiers, ordered by impact on the next two product layers
-(`ahu`, `manutara`) and parallelism with the **Anga Roa**
+(`ahu`, `manutara`) and parallelism with the **Hanga Roa**
 milestone (m11 diagnostics + lsp + repl + reuse-in-place — see
-`docs/roadmap.md` §`Anga Roa`).
+`docs/roadmap.md` §`Hanga Roa`).
 
-### Tier S1 — blocks `ahu` / `manutara`, runs parallel with Anga Roa start
+### Tier S1 — blocks `ahu` / `manutara`, runs parallel with Hanga Roa start
 
 Four modules. Each is an independent code path; they can land in
-parallel with each other and with Anga Roa's compiler-side work.
+parallel with each other and with Hanga Roa's compiler-side work.
 
 1. **`fs/`** — file + directory operations on top of `File`.
    - Surface: `fs.file.read_file`, `fs.file.write_file`,
@@ -166,7 +166,7 @@ parallel with each other and with Anga Roa's compiler-side work.
      `time.now()` and `time.sleep(millis(10))` without
      installing a handler; asserts elapsed monotonic ≥ 10 ms.
 
-### Tier S2 — parallel with Anga Roa middle/end
+### Tier S2 — parallel with Hanga Roa middle/end
 
 Three modules. Independent code paths; not on `ahu`/`manutara`'s
 critical path but needed for production-quality services.
@@ -213,10 +213,10 @@ design surface on its own.
   over a `Spawn`-based worker pool. Distinct from `concurrent.nursery`
   (which is *structured*, not *parallel*).
 
-## Sequencing relative to Anga Roa
+## Sequencing relative to Hanga Roa
 
 ```
-                  Anga Roa milestone
+                  Hanga Roa milestone
                   ┌──────────────────────────────────┐
   ──── 0.37.0 ───►│ m11 │ kai lsp │ repl │ reuse-IP │──► 1.0.0 (Orongo)
                   └──────────────────────────────────┘

@@ -1,7 +1,7 @@
 # examples/unstable
 
 Fixtures exercising the `#unstable` annotation + `[unstable]`
-opt-in workflow (issue #602, first lane of the Anga Roa edition).
+opt-in workflow (issue #602, first lane of the Hanga Roa edition).
 
 ## Workflow
 

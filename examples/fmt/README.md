@@ -13,4 +13,4 @@ pipes, ranges, string interpolation, line comments. Out-of-scope
 constructs (effects, handlers, protocols, impls, units, refinements,
 axioms, generic params, parametric effect rows, `var`) are rejected
 by the formatter with an explicit error — fixtures for them belong
-to future Tongariki / Anga Roa lanes.
+to future Tongariki / Hanga Roa lanes.

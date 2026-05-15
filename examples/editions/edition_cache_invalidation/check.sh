@@ -1,6 +1,6 @@
 #!/bin/sh
 # Issue #603 cache-partition smoke. Compile this fixture under each
-# of {tongariki, anga-roa}, snapshotting the prelude cache root. The
+# of {tongariki, hanga-roa}, snapshotting the prelude cache root. The
 # partition must produce one subdirectory per edition; cache files
 # created in one must NOT appear under the other.
 #
@@ -34,14 +34,14 @@ EOF
 cat > "$manifest" <<'EOF'
 name = "edition_cache_invalidation"
 version = "0.1.0"
-edition = "anga-roa"
+edition = "hanga-roa"
 EOF
-"$KAI" build "$FIXTURE/main.kai" -o "$TMPDIR/m.anga-roa" 2>/dev/null
-[ -d "$TMPDIR/anga-roa" ] || { echo "FAIL: $TMPDIR/anga-roa missing"; exit 1; }
+"$KAI" build "$FIXTURE/main.kai" -o "$TMPDIR/m.hanga-roa" 2>/dev/null
+[ -d "$TMPDIR/hanga-roa" ] || { echo "FAIL: $TMPDIR/hanga-roa missing"; exit 1; }
 
 t_count="$(ls "$TMPDIR/tongariki" 2>/dev/null | wc -l | tr -d ' ')"
-a_count="$(ls "$TMPDIR/anga-roa" 2>/dev/null | wc -l | tr -d ' ')"
+a_count="$(ls "$TMPDIR/hanga-roa" 2>/dev/null | wc -l | tr -d ' ')"
 [ "$t_count" -gt 0 ] || { echo "FAIL: tongariki partition empty"; exit 1; }
-[ "$a_count" -gt 0 ] || { echo "FAIL: anga-roa partition empty"; exit 1; }
+[ "$a_count" -gt 0 ] || { echo "FAIL: hanga-roa partition empty"; exit 1; }
 
-echo "edition-cache-partition OK: tongariki=$t_count entries; anga-roa=$a_count entries"
+echo "edition-cache-partition OK: tongariki=$t_count entries; hanga-roa=$a_count entries"

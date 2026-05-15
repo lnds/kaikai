@@ -15,11 +15,11 @@ geographic Rapa Nui names matching the kaikai naming family.
 
 - The current edition is **Tongariki** (v0.x series leading up to the
   21 May 2026 release).
-- The 21 May 2026 release will tag the **Anga Roa** edition. It is
+- The 21 May 2026 release will tag the **Hanga Roa** edition. It is
   not v1.0.0 — it is whatever v0.x.y the bump cadence reaches on
-  that date, labelled `anga-roa`.
-- The edition after Anga Roa will be named **Orongo**. It will pull
-  in items deferred from Anga Roa (advanced FFI, new numeric
+  that date, labelled `hanga-roa`.
+- The edition after Hanga Roa will be named **Orongo**. It will pull
+  in items deferred from Hanga Roa (advanced FFI, new numeric
   primitives, LLVM direct emit, Phase A.2 cache, compilation
   daemon, etc.).
 
@@ -94,9 +94,9 @@ policy.
 ### `kai.toml` edition field
 
 The doc names an `edition = "tongariki"` field that future
-versions will read. Pre-Anga-Roa compilers parse it but do not
+versions will read. Pre-Hanga-Roa compilers parse it but do not
 yet apply edition-specific behaviour selectively — full
-enforcement is targeted at the Anga Roa release. The field is
+enforcement is targeted at the Hanga Roa release. The field is
 forward-compatible.
 
 ## Alternatives considered
@@ -152,7 +152,7 @@ Rejected because:
 
 - We already have a strong naming culture: Rapa Nui geographic
   names for the language family. Numbering would clash.
-- Numbers are less memorable in conversation. "Anga Roa" reads;
+- Numbers are less memorable in conversation. "Hanga Roa" reads;
   "edition 2026" doesn't.
 - Rapa Nui place names also signal that kaikai is its own
   project, not a Rust clone.
@@ -172,17 +172,17 @@ Rejected because:
 These are not blockers for this decision; they are the
 implementation work this decision unblocks.
 
-1. **Anga Roa edition declaration.** A separate decision-doc on
-   21 May 2026 will record what the Anga Roa edition fixes,
+1. **Hanga Roa edition declaration.** A separate decision-doc on
+   21 May 2026 will record what the Hanga Roa edition fixes,
    what changed since Tongariki, and the migration guidance.
 2. **kai migrate command.** The `editions.md` policy mentions
    `kai migrate --from <old> --to <new>`. Not implemented yet;
-   may not be needed for Tongariki → Anga Roa if changes are
-   small. Required for Anga Roa → Orongo.
+   may not be needed for Tongariki → Hanga Roa if changes are
+   small. Required for Hanga Roa → Orongo.
 3. **Edition-aware kaic2.** The compiler today does not change
    its behaviour based on the `edition` field in `kai.toml`.
    Implementing selective edition behaviour is the lane that
-   makes the contract real. Targeted at the Anga Roa release
+   makes the contract real. Targeted at the Hanga Roa release
    week.
 4. **CHANGELOG annotation.** Releases that cross an edition
    boundary should be visually distinct in CHANGELOG.md. Not
