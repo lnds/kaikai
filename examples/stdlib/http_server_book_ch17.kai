@@ -1,0 +1,103 @@
+# kaikai-book chapter 17 (HTTP server) flow against real stdlib.
+#
+# Issue #605 makes the chapter honest: the parse/serialize helpers
+# below come from `stdlib/net/http.kai` directly, not from a hand-
+# rolled local copy. This fixture mirrors the chapter's notes-server
+# `route` discipline (parse → dispatch by (method, path) → build a
+# Response) without binding a real socket — that lets the fixture
+# stay deterministic in CI and avoids the m8 v1 reactor gap that
+# would otherwise force a parallel server fiber.
+#
+# The TCP wire layer is covered separately by `http_server_basic.kai`.
+
+# A handful of canned requests sized like the ones the chapter
+# walks through: GET /notes, POST /notes (with a JSON body),
+# GET /notes/42, plus an intentional malformed line so the
+# diagnostic surface is exercised.
+
+fn list_notes() : String =
+  "[{\"id\":1,\"title\":\"hello\"},{\"id\":2,\"title\":\"world\"}]"
+
+fn show_note(id: String) : String =
+  string_concat_all(["{\"id\":", id, ",\"title\":\"stub\"}"])
+
+# Tiny router. The chapter explains the discipline as: "match on
+# (method, path) and return a `Response`; everything else is
+# bookkeeping". This fixture pins exactly that — no string parsing
+# beyond method/path comparison, no middleware, no path templates
+# (those land with manutara).
+fn route(req: Request) : Response = {
+  let m = req.method
+  let p = req.url
+  if m == "GET" and p == "/notes" {
+    Response {
+      status: 200,
+      headers: [HttpHeader { name: "Content-Type", value: "application/json" }],
+      body: list_notes()
+    }
+  } else if m == "POST" and p == "/notes" {
+    Response {
+      status: 201,
+      headers: [HttpHeader { name: "Content-Type", value: "application/json" },
+                HttpHeader { name: "Location",     value: "/notes/3" }],
+      body: req.body
+    }
+  } else if m == "GET" and starts_with(p, "/notes/") {
+    let id = string_slice(p, 7, string_length(p) - 7)
+    Response {
+      status: 200,
+      headers: [HttpHeader { name: "Content-Type", value: "application/json" }],
+      body: show_note(id)
+    }
+  } else {
+    Response { status: 404, headers: [], body: "" }
+  }
+}
+
+# Drive one (raw_request → wire_response) cycle through the
+# stdlib helpers exactly the way a manutara `handle_one` callback
+# would, then echo a compact line so the fixture has deterministic
+# output to gold.
+fn handle_one(label: String, raw: String) : Unit / Stdout =
+  match http_parse_request(raw) {
+    Err(e) -> Stdout.print(string_concat_all([label, " parse ERR: ", e]))
+    Ok(req) -> {
+      let resp = route(req)
+      let wire = http_serialize_response(resp)
+      # First wire line is `HTTP/1.1 <code> <reason>\r\n`; show that
+      # plus the body length so we pin both the framing and the
+      # response shape without splatting the full byte stream.
+      let status_line = match string_split(wire, "\r\n") {
+        [first, ..._rest] -> first
+        []                -> wire
+      }
+      Stdout.print(string_concat_all([
+        label, " -> ", status_line,
+        " body_len=", int_to_string(string_length(resp.body))]))
+    }
+  }
+
+fn main() : Unit / Stdout = {
+  Stdout.print("== ch17 routes ==")
+  handle_one("GET /notes",
+    "GET /notes HTTP/1.1\r\nHost: notes.local\r\n\r\n")
+  handle_one("POST /notes",
+    string_concat_all([
+      "POST /notes HTTP/1.1\r\n",
+      "Host: notes.local\r\n",
+      "Content-Type: application/json\r\n",
+      "Content-Length: 18\r\n",
+      "\r\n",
+      "{\"title\":\"new\"}xxx"
+    ]))
+  handle_one("GET /notes/42",
+    "GET /notes/42 HTTP/1.1\r\nHost: notes.local\r\n\r\n")
+  handle_one("DELETE /nope",
+    "DELETE /nope HTTP/1.1\r\nHost: notes.local\r\n\r\n")
+
+  Stdout.print("== ch17 error path ==")
+  handle_one("malformed",
+    "GET /x HTTP/0.9\r\nHost: notes.local\r\n\r\n")
+
+  Stdout.print("done")
+}
