@@ -482,6 +482,20 @@ Runtime-installed around `main` when `main`'s row contains
 the C call's return. No clause ever short-circuits — errors flow
 as data, not as `Fail`.
 
+> **v1 status (R1 reactor, 2026-05-15):** `read_file` and
+> `write_file` park the *fiber* and offload the blocking stdio
+> syscall to a 4-worker thread pool. The scheduler's `poll()`
+> loop wakes on a self-pipe byte written from the worker once
+> the op completes. Pre-R1 the syscalls ran inline on the
+> scheduler thread and blocked every other fiber. Linux's
+> `epoll` does not surface readiness for regular files, so the
+> thread-pool offload is the portable shape — the worker count
+> is fixed at 4 for v1; `io_uring` and dynamic pool sizing are
+> post-MVP. `read_bytes` / `write_bytes` and the
+> `exists`/`delete`/`rename` prelude builtins are *not* yet on
+> the parking path — they still run inline; routing the rest
+> through the pool queues for the file-bytes follow-up lane.
+
 Because the default is installed automatically, `main` does not
 need to write `handle { ... } with File { ... }` itself.
 
@@ -566,6 +580,17 @@ Runtime-installed around `main` when `Clock` is in the row.
   timer wheel, keyed on `monotonic() + d`. The scheduler resumes
   the fiber when the deadline elapses, or earlier if `Cancel` is
   delivered.
+
+  > **v1 status (R1 reactor, 2026-05-15):** `kai_default_clock_sleep_ns`
+  > parks the *fiber* on the reactor's sorted timer wheel keyed on
+  > `CLOCK_MONOTONIC`. The scheduler's `poll()` loop blocks with
+  > the deadline-derived timeout and resumes every fiber whose
+  > deadline has fired in a single drain. Pre-R1 the op blocked
+  > the OS thread inside `nanosleep`. Cancel mid-sleep still does
+  > NOT unwind the op — the wake source is the timer fire, not a
+  > Cancel signal — but the cancel pad fires at the next yield-
+  > point after resume. The cancel-aware mid-sleep redesign is R2
+  > territory in Orongo.
 
 The handler never short-circuits; clock ops always resume.
 
@@ -878,11 +903,16 @@ effect Process {
 - `wait` blocks until the child exits and returns its exit
   status. The fiber suspends via the scheduler's reactor
   (`pidfd_open` on Linux; SIGCHLD-driven on macOS / *BSD).
-  > **v1 status:** `kai_default_process_wait` blocks via
-  > `waitpid(pid, &status, 0)` — it parks the OS thread, not the
-  > fiber. `pidfd_open` (Linux) and SIGCHLD-driven dispatch (macOS /
-  > *BSD) are post-MVP and queued for m8.x.x alongside the NetTcp
-  > reactor work. Same pattern as the `NetTcp` sidebar above.
+  > **v1 status (R1 reactor, 2026-05-15):** `kai_default_process_wait`
+  > parks the *fiber* on the reactor's pid-waiter map. A POSIX
+  > SIGCHLD self-pipe wakes the scheduler, which drains every
+  > terminated child via `waitpid(-1, &status, WNOHANG)` and
+  > resumes the matching fiber with the captured status. Pre-R1
+  > the op blocked the OS thread inside `waitpid(pid, &status, 0)`.
+  > `pidfd_open` is post-MVP — POSIX SIGCHLD covers both macOS
+  > and Linux uniformly today. Cancel mid-wait still does NOT
+  > unwind the op (the child's exit is the only wake source); the
+  > cancel-aware redesign queues for R2 in Orongo.
 - `kill` delivers a signal to the child. The signal set is the
   POSIX-canonical subset (`SIGTERM`, `SIGKILL`, `SIGINT`, …)
   declared by the `os.process` module.
@@ -928,10 +958,12 @@ Runtime-installed around `main` when `Process` is in the row.
   SIGCHLD handler wakes the awaiting fiber. Cancellation
   unwinds out of the wait without reaping the child — see
   `wait_or_kill` below for the canonical cancel-aware pattern.
-  > **v1 status (2026-05-08):** see the v1 sidebar under §`Process`
-  > *Declaration*. The current implementation is plain
-  > `waitpid(pid, &status, 0)`; the `pidfd`/SIGCHLD path is
-  > post-MVP and Cancel does NOT unwind a wait in flight.
+  > **v1 status (R1 reactor, 2026-05-15):** see the v1 sidebar
+  > under §`Process` *Declaration*. SIGCHLD-driven dispatch is
+  > shipped on both macOS and Linux uniformly via a self-pipe
+  > drained by the scheduler's `poll()` loop; the `pidfd_open`
+  > Linux fast path is post-MVP. Cancel mid-wait still does NOT
+  > unwind — the cancel-aware redesign queues for R2 in Orongo.
 - `kill` is `kill(2)`.
 - `exit` is libc `_exit(code)`. No flushing of stdio buffers; the
   caller must `print` everything they want printed before
