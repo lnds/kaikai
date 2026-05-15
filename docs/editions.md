@@ -137,10 +137,19 @@ default edition is anga-roa. This is how `stability without
 stagnation` works in practice: a tongariki package keeps working
 on an anga-roa compiler.
 
-(v0.x compilers: edition selection is **planned for Anga Roa
-release**. Pre-Anga-Roa compilers always behave as the current
-edition; the `edition` field in `kai.toml` is read but its
-enforcement is partial.)
+> **v1 status (2026-05-15):** edition selection is **shipped**
+> (issue #603). `bin/kai` reads `kai.toml`'s `edition` field,
+> validates it against the known set `{tongariki, anga-roa}`, and
+> forwards `--edition <name>` to `kaic2`. The compiler routes the
+> #594 convention-based pipe dispatch on `edition >= anga-roa` and
+> falls back to the legacy seeded `List → list` mapping under
+> tongariki. The prelude cache is partitioned by edition under
+> `~/.cache/kaikai/preludes-v1/<edition>/`, so cross-edition rebuilds
+> are clean. An unknown edition value produces
+> `kaic2: unknown edition \`<x>\` in kai.toml — known editions:
+> tongariki, anga-roa` before any compilation work runs. The
+> `cache_kaikai_version_hash` was bumped from 1 to 2; any `.kab`
+> blob predating #603 is rejected at load.
 
 ## Marking unstable APIs (#unstable)
 
