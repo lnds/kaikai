@@ -46,6 +46,11 @@ type TokKind
   # specifically (instead of treating it as a comment) so the parser can
   # consume it as a prefix to a `type` declaration.
   | TkDerive
+  # Issue #602: `#unstable` annotation. Marks a `pub fn / pub type / pub
+  # const` whose API is not covered by the edition stability contract.
+  # Tokenised the same way as `#derive` — the `#` would otherwise begin
+  # a line comment, so the lexer must single out the keyword.
+  | TkUnstable
   # m12.6.x #7: regex literal `/pattern/`, only emitted when the
   # previous non-newline token is the identifier `matches` (the
   # refinement-pure predicate). Outside that narrow context, `/` keeps
@@ -117,6 +122,7 @@ fn tk_name(k: TokKind) : String {
     TkTest -> "test" TkTrue -> "true" TkType -> "type"
     TkUnitKw -> "unit" TkUse -> "use" TkVar -> "var" TkWhen -> "when" TkWhere -> "where" TkWith -> "with"
     TkDerive -> "#derive"
+    TkUnstable -> "#unstable"
     TkRegex -> "REGEX"
     TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
     TkComplex -> "COMPLEX"
@@ -213,7 +219,9 @@ fn lex_skip_ws(l: Lexer) : Lexer {
         # m12.8: `#derive` is a token, not a comment. Leave the `#`
         # in place so lex_punct can produce TkDerive. Anything else
         # starting with `#` is still a line comment.
+        # Issue #602: `#unstable` is recognised the same way.
         if lex_match_word_at(l, 1, "derive") { l }
+        else if lex_match_word_at(l, 1, "unstable") { l }
         else { lex_skip_ws(lex_skip_comment(lex_advance(l))) }
       }
       else { l }
@@ -831,8 +839,15 @@ fn lex_punct(l: Lexer) : LexStep {
           # m12.8: `#derive` is a single token; the `#` here cannot be a
           # comment because lex_skip_ws only forwards `#` here when it is
           # immediately followed by `derive` and a non-alphanumeric tail.
-          let l_end = lex_advance_n(l1, 6)
-          Step(l_end, tok(TkDerive, sl, sc, start, l_end.pos))
+          # Issue #602: `#unstable` is recognised the same way, with the
+          # same non-alphanumeric-tail guarantee from lex_skip_ws.
+          if lex_match_word_at(l1, 0, "derive") {
+            let l_end = lex_advance_n(l1, 6)
+            Step(l_end, tok(TkDerive, sl, sc, start, l_end.pos))
+          } else {
+            let l_end = lex_advance_n(l1, 8)
+            Step(l_end, tok(TkUnstable, sl, sc, start, l_end.pos))
+          }
         }
         '~' -> {
           # m12.6.x #7: Elixir-style sigils. Currently only `~r/pattern/`
@@ -1605,6 +1620,16 @@ type Decl
   # annotation alongside the wrapped DType so the desugar pass has all
   # the data in one node.
   | DDerive([String], Decl, Int, Int)
+  # Issue #602: `#unstable` wrapper around a `pub fn / pub type / pub
+  # const`. Marks the inner declaration as not covered by the edition
+  # stability contract. The wrapper is preserved through the resolver
+  # and module-export collection so import-site enforcement can flag
+  # consumers that have not opted in via `[unstable]` in their
+  # `kai.toml`. Every downstream walker that recurses into Decl trees
+  # mirrors the existing `DDerive` / `DAttribPure` precedent: unwrap
+  # the inner Decl and walk that. The flag only affects diagnostics —
+  # codegen does not see it.
+  | DUnstable(Decl, Int, Int)
   # m12.6.x #5(a): `[<refinement_pure>]` attribute on a fn signature.
   # Wraps a DFn so the post-parse `extract_pure_names_decls` walker
   # can collect the marked names; the validator pass then admits
@@ -1879,6 +1904,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkTodoBang   -> match b { TkTodoBang -> true _ -> false }
     TkPlusPlus   -> match b { TkPlusPlus -> true _ -> false }
     TkDerive     -> match b { TkDerive -> true _ -> false }
+    TkUnstable   -> match b { TkUnstable -> true _ -> false }
     TkRegex      -> match b { TkRegex -> true _ -> false }
     TkError(_)   -> false
   }
@@ -5703,6 +5729,9 @@ fn parse_decl(p: Parser) : PDecl / Console {
   } else if tk_is(hd.kind, TkDerive) {
     if is_pub { err_d(p_error(p1, hd, "`pub` must precede the `type` declaration after `#derive`")) }
     else { parse_derive_decl(p_advance(p1), hd) }
+  } else if tk_is(hd.kind, TkUnstable) {
+    if is_pub { err_d(p_error(p1, hd, "`pub` must come AFTER `#unstable`, not before — write `#unstable pub fn ...`")) }
+    else { parse_unstable_decl(p_advance(p1), hd) }
   } else if tk_is(hd.kind, TkTest) {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a test")) }
     else { parse_test_decl(p_advance(p1), hd) }
@@ -9013,6 +9042,57 @@ fn parse_derive_names(p: Parser, acc: [String]) : PDeriveNames / Console {
   }
 }
 
+# Issue #602: `#unstable` immediately followed by `pub fn`, `pub type`,
+# or `pub const`. Newlines between the annotation and the `pub` keyword
+# are allowed so authors can place `#unstable` on its own line above
+# the declaration (matching the surface shown in `docs/editions.md`).
+# Wraps the parsed Decl in `DUnstable` so downstream walkers see the
+# inner shape unchanged but the export-collection pass can mark the
+# pub name as unstable for import-site enforcement.
+fn parse_unstable_decl(p: Parser, t: Token) : PDecl / Console {
+  let p0 = p_skip_newlines(p)
+  let pub_tok = p_peek(p0)
+  if not tk_is(pub_tok.kind, TkPub) {
+    err_d(p_error(p0, pub_tok, "`#unstable` must precede a `pub fn`, `pub type`, or `pub const` declaration"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p0))
+    let hd = p_peek(p1)
+    if tk_is(hd.kind, TkFn) {
+      let inner = parse_fn_decl(p_advance(p1), true, hd)
+      match inner.r {
+        None    -> err_d(inner.p)
+        Some(d) -> ok_d(inner.p, DUnstable(d, t.line, t.col))
+      }
+    } else if tk_is(hd.kind, TkType) {
+      let inner = parse_type_decl(p_advance(p1), true, hd)
+      match inner.r {
+        None    -> err_d(inner.p)
+        Some(d) -> ok_d(inner.p, DUnstable(d, t.line, t.col))
+      }
+    } else if tk_is(hd.kind, TkConst) {
+      let inner = parse_const_decl(p_advance(p1), true, hd)
+      match inner.r {
+        None    -> err_d(inner.p)
+        Some(d) -> ok_d(inner.p, DUnstable(d, t.line, t.col))
+      }
+    } else if tk_is(hd.kind, TkEffect) {
+      let inner = parse_effect_decl(p_advance(p1), true, hd)
+      match inner.r {
+        None    -> err_d(inner.p)
+        Some(d) -> ok_d(inner.p, DUnstable(d, t.line, t.col))
+      }
+    } else if tk_is(hd.kind, TkProtocol) {
+      let inner = parse_protocol_decl(p_advance(p1), true, hd)
+      match inner.r {
+        None    -> err_d(inner.p)
+        Some(d) -> ok_d(inner.p, DUnstable(d, t.line, t.col))
+      }
+    } else {
+      err_d(p_error(p1, hd, "`#unstable pub` must be followed by `fn`, `type`, `const`, `effect`, or `protocol`"))
+    }
+  }
+}
+
 fn parse_type_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
 
   let id = p_peek(p)
@@ -10167,6 +10247,10 @@ fn dump_decl(d: Decl, depth: Int) : Unit / Console {
       emit_line(depth, "#derive(#{names_s}) @#{int_to_string(line)}:#{int_to_string(col)}")
       dump_decl(inner, depth + 1)
     }
+    DUnstable(inner, line, col) -> {
+      emit_line(depth, "#unstable @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_decl(inner, depth + 1)
+    }
     DUnit(is_pub, name, alias_opt, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       let body_s = match alias_opt {
@@ -10791,6 +10875,7 @@ fn chk_decl(e: Env, d: Decl) : Env / Console + File {
     DProtocol(_, _, _, _, _, _) -> e
     DImpl(_, _, _, _, _, _) -> e
     DDerive(_, _, _, _) -> e
+    DUnstable(_, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit declarations introduce no value bindings
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before chk runs
     DAxiom(_, _, _, _, _, _, _, _, _, _) -> e     # m12.7: rewritten to DFn by lower_axioms before chk runs
@@ -10840,6 +10925,7 @@ fn register_one(e: Env, d: Decl) : Env {
     DProtocol(_, _, _, _, _, _) -> e
     DImpl(_, _, _, _, _, _) -> e
     DDerive(_, _, _, _) -> e
+    DUnstable(_, _, _) -> e
     DUnit(_, _, _, _, _) -> e               # m12.5: unit names live in their own namespace, validated at type-resolve time
     DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before register_one runs
     DAxiom(_, _, name, _, _, _, _, _, _, _) -> env_add(e, name)  # m12.7: also rewritten to DFn by lower_axioms; case kept for completeness
@@ -15086,6 +15172,7 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect / Console {
     DProtocol(_, _, _, _, _, _) -> st
     DImpl(_, _, _, _, _, _) -> st
     DDerive(_, _, _, _) -> st
+    DUnstable(_, _, _) -> st
     DUnit(_, _, _, _, _) -> st               # m12.5: no expressions in a unit decl
     DUse(_, _, _) -> st                       # m7e §25: stripped by desugar_use_decls; no expressions
     DAxiom(_, _, _, _, _, _, _, _, _, _) -> st     # m12.7: rewritten to DFn by lower_axioms; no expressions on the bare form
@@ -22166,6 +22253,10 @@ fn use_rewrite_decl(d: Decl, table: [EffOps], file_opens: [String],
       let r = use_rewrite_decl(inner, table, file_opens, file, errs)
       UseRwDecl { decl: DDerive(names, r.decl, l, c), errs: r.errs }
     }
+    DUnstable(inner, l, c) -> {
+      let r = use_rewrite_decl(inner, table, file_opens, file, errs)
+      UseRwDecl { decl: DUnstable(r.decl, l, c), errs: r.errs }
+    }
     _ -> UseRwDecl { decl: d, errs: errs }
   }
 }
@@ -22371,6 +22462,10 @@ fn rewrite_nursery_caps_decl(d: Decl, file: String, bw: BrandWalk) : NurseryRwDe
     DDerive(names, inner, l, c) -> {
       let r = rewrite_nursery_caps_decl(inner, file, bw)
       NurseryRwDecl { decl: DDerive(names, r.decl, l, c), bw: r.bw }
+    }
+    DUnstable(inner, l, c) -> {
+      let r = rewrite_nursery_caps_decl(inner, file, bw)
+      NurseryRwDecl { decl: DUnstable(r.decl, l, c), bw: r.bw }
     }
     _ -> NurseryRwDecl { decl: d, bw: bw }
   }
@@ -23058,6 +23153,8 @@ fn check_brand_decl(d: Decl, file: String, calls: [BrandCall],
     DImpl(_, _, _, ms, _, _) ->
       check_brand_decls_loop(ms, file, calls, brs, errs)
     DDerive(_, inner, _, _) ->
+      check_brand_decl(inner, file, calls, brs, errs)
+    DUnstable(inner, _, _) ->
       check_brand_decl(inner, file, calls, brs, errs)
     _ -> errs
   }
@@ -24513,6 +24610,8 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], fuel: Int) : Decl {
             expand_ta_decls_loop(sub_decls, table, fuel), l, c)
     DDerive(ps, inner, l, c) ->
       DDerive(ps, expand_ta_decl(inner, table, fuel), l, c)
+    DUnstable(inner, l, c) ->
+      DUnstable(expand_ta_decl(inner, table, fuel), l, c)
     DAttribPure(inner, l, c) ->
       DAttribPure(expand_ta_decl(inner, table, fuel), l, c)
     DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
@@ -25112,6 +25211,7 @@ fn dump_decl_type(d: Decl) : Unit / Console {
     DImpl(pname, _, _, _, line, col) ->
       print("impl #{pname} @#{int_to_string(line)}:#{int_to_string(col)}")
     DDerive(_, inner, _, _) -> dump_decl_type(inner)
+    DUnstable(inner, _, _) -> dump_decl_type(inner)
     DUnit(is_pub, name, alias_opt, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       let body_s = match alias_opt {
@@ -26193,7 +26293,7 @@ fn resolve_decl_file(type_name: String, root_file: String,
   match mt {
     [] -> root_file
     [me, ...rest] -> match me {
-      ME(_, exports, origin) ->
+      ME(_, exports, origin, _) ->
         if list_has(exports, type_name) { origin }
         else { resolve_decl_file(type_name, root_file, rest) }
     }
@@ -26395,6 +26495,13 @@ fn validate_type_name_collisions_loop(remaining: [Decl], file: String,
         _ -> validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
                                                    target_mod_name, claims, errs)
       }
+      DUnstable(inner, _, _) -> match inner {
+        DType(_, name, _, _, line, col) ->
+          validate_one_type_decl(rest, file, mt, prelude_mods, target_mod_name,
+                                    claims, errs, name, line, col)
+        _ -> validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
+                                                   target_mod_name, claims, errs)
+      }
       _ -> validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
                                                  target_mod_name, claims, errs)
     }
@@ -26453,7 +26560,7 @@ fn me_list_has_name(mes: [ModuleEntry], name: String) : Bool {
   match mes {
     [] -> false
     [me, ...rest] -> match me {
-      ME(mn, _, _) -> if mn == name { true } else { me_list_has_name(rest, name) }
+      ME(mn, _, _, _) -> if mn == name { true } else { me_list_has_name(rest, name) }
     }
   }
 }
@@ -26476,7 +26583,7 @@ fn find_exporting_module(mt: [ModuleEntry], name: String,
   match mt {
     [] -> None
     [me, ...rest] -> match me {
-      ME(mn, exports, _) -> {
+      ME(mn, exports, _, _) -> {
         if mn != target_mod_name and list_has(exports, name) { Some(mn) }
         else { find_exporting_module(rest, name, target_mod_name) }
       }
@@ -36629,6 +36736,7 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     DProtocol(_, _, _, _, _, _) -> d
     DImpl(_, _, _, _, _, _) -> d
     DDerive(_, _, _, _) -> d
+    DUnstable(_, _, _) -> d
     # m7e §25: DUse has no TypeExpr to expand; pass through. The
     # desugar_use_decls pass handles it later.
     DUse(_, _, _) -> d
@@ -39003,6 +39111,7 @@ fn unbox_decl(d: Decl, fns: [EFn]) : Decl / Console {
     DImpl(name, proto_args, ty, sub_decls, l, c) ->
       DImpl(name, proto_args, ty, map(sub_decls, (sd) => unbox_decl(sd, fns)), l, c)
     DDerive(ps, inner, l, c) -> DDerive(ps, unbox_decl(inner, fns), l, c)
+    DUnstable(inner, l, c) -> DUnstable(unbox_decl(inner, fns), l, c)
     _ -> d
   }
 }
@@ -48332,8 +48441,14 @@ fn lookup_op_offset(table: [OpOffset], key: String) : Option[Int] {
 # this list — concat semantics (M6.1) still bring every public decl
 # into the unqualified scope, so the qualified surface mirrors that
 # for now. Phase 2.3 / m6.2.v2 may revisit.
-type ModuleEntry = ME(String, [String], String)
-#                     ^name  ^exports  ^origin
+type ModuleEntry = ME(String, [String], String, [String])
+#                     ^name  ^exports  ^origin ^unstable_exports
+#
+# Issue #602: `unstable_exports` is the subset of `exports` that the
+# module file wrapped in `DUnstable(...)`. The import-rewrite pass
+# checks this list when threading an `EField(EVar(mod), fn)` into an
+# `EModCall(mod, fn)` so it can emit the #602 warning before any
+# code generation runs.
 
 # `in_progress` (issue #538 shape 1) is the stack of module paths
 # currently mid-resolution. It is distinct from `visited`: `visited`
@@ -48405,11 +48520,55 @@ fn collect_pub_exports(decls: [Decl], acc: [String]) : [String] {
         # inner decl with the same accumulator so the wrapped type
         # (and its variants, if a sum) lands in the export list.
         DDerive(_, inner, _, _) -> collect_pub_exports([inner], acc)
+        # Issue #602: `#unstable` wrapper preserves the inner pub
+        # name in the regular export list so import resolution sees
+        # it; the unstable bit is collected separately by
+        # `collect_unstable_exports` below.
+        DUnstable(inner, _, _) -> collect_pub_exports([inner], acc)
         _ -> acc
       }
       collect_pub_exports(rest, acc1)
     }
   }
+}
+
+# Issue #602: collect the names of pub decls wrapped in `DUnstable`.
+# Mirrors `collect_pub_exports` shape so the per-pub-form variant
+# expansion (sum-type ctors, etc.) stays consistent. The result lives
+# alongside `exports` on the `ModuleEntry` and is consulted by the
+# qualified-call rewrite + import-name resolver to decide whether to
+# emit the unstable-consumer warning.
+fn collect_unstable_exports(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let acc1 = match d {
+        DUnstable(inner, _, _) -> collect_pub_names_for_unstable(inner, acc)
+        DDerive(_, inner, _, _) -> collect_unstable_exports([inner], acc)
+        _ -> acc
+      }
+      collect_unstable_exports(rest, acc1)
+    }
+  }
+}
+
+# Extract the pub names introduced by the inner Decl of a DUnstable
+# wrapper. Mirrors the `collect_pub_exports` per-variant logic so a
+# `#unstable pub type T = A | B` marks `T`, `A`, and `B` as unstable.
+fn collect_pub_names_for_unstable(d: Decl, acc: [String]) : [String] = match d {
+  DFn(true, name, _, _, _, _, _, _, _, _) -> [name, ...acc]
+  DType(true, name, _, body, _, _) -> match body {
+    TBSum(vs) -> collect_variant_names(vs, [name, ...acc])
+    _ -> [name, ...acc]
+  }
+  DEffect(true, name, _, _, _, _, _) -> [name, ...acc]
+  DProtocol(true, name, _, _, _, _) -> [name, ...acc]
+  DAxiom(true, _, name, _, _, _, _, _, _, _) -> [name, ...acc]
+  DUnit(true, name, _, _, _) -> [name, ...acc]
+  DConst(true, name, _, _, _, _) -> [name, ...acc]
+  DDerive(_, inner, _, _) -> collect_pub_names_for_unstable(inner, acc)
+  DAttribPure(inner, _, _) -> collect_pub_names_for_unstable(inner, acc)
+  _ -> acc
 }
 
 fn collect_variant_names(vs: [Variant], acc: [String]) : [String] = match vs {
@@ -48607,7 +48766,8 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                   if import_name == "" { rs3 }
                   else {
                     let exports = collect_pub_exports(kept, [])
-                    rs_add_module(rs3, ME(import_name, exports, abs_path))
+                    let unstable_exports = collect_unstable_exports(kept, [])
+                    rs_add_module(rs3, ME(import_name, exports, abs_path, unstable_exports))
                   }
                 }
               }
@@ -48715,13 +48875,20 @@ fn mt_lookup(mt: [ModuleEntry], name: String) : Option[ModuleEntry] {
   match mt {
     [] -> None
     [me, ...rest] -> match me {
-      ME(mn, _, _) -> if mn == name { Some(me) } else { mt_lookup(rest, name) }
+      ME(mn, _, _, _) -> if mn == name { Some(me) } else { mt_lookup(rest, name) }
     }
   }
 }
 
 fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
-  ME(_, exports, _) -> list_has(exports, fn_name)
+  ME(_, exports, _, _) -> list_has(exports, fn_name)
+}
+
+# Issue #602: returns true when `fn_name` is in the module's unstable
+# export list. Callers use this from EField -> EModCall rewriting to
+# decide whether to emit the unstable-consumer warning.
+fn me_export_is_unstable(me: ModuleEntry, fn_name: String) : Bool = match me {
+  ME(_, _, _, unstable) -> list_has(unstable, fn_name)
 }
 
 # Issue #425: collect the absolute origin path of every ModuleEntry
@@ -48731,7 +48898,7 @@ fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
 fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String] = match mes {
   [] -> list_reverse(acc)
   [me, ...rest] -> match me {
-    ME(_, _, origin) -> collect_module_origins(rest, [origin, ...acc])
+    ME(_, _, origin, _) -> collect_module_origins(rest, [origin, ...acc])
   }
 }
 
@@ -48774,7 +48941,7 @@ fn name_starts_upper(name: String) : Bool = match char_at(name, 0) {
 }
 
 fn me_lookup_export(me: ModuleEntry, fname: String) : Option[String] = match me {
-  ME(mod_name, exports, _) ->
+  ME(mod_name, exports, _, _) ->
     if list_has(exports, fname) { Some(fname) }
     else {
       let p = match module_legacy_prefix(mod_name) {
@@ -48889,7 +49056,7 @@ fn qualtype_te(te: TypeExpr, mt: [ModuleEntry], file: String) : TypeExpr / Conso
             if me_has_export(me, ty) {
               TypeExpr { tkind: TyName(ty, targs1), line: te.line, col: te.col }
             } else {
-              let exports = match me { ME(_, exs, _) -> exs }
+              let exports = match me { ME(_, exs, _, _) -> exs }
               let _ = qt_diag_missing_type(mod, ty, exports, file, te.line, te.col)
               TypeExpr { tkind: TyName("__qualtype_bad__", []), line: te.line, col: te.col }
             }
@@ -49019,7 +49186,7 @@ fn qualtype_expr_kind_at(k: ExprKind, mt: [ModuleEntry], file: String, line: Int
             if me_has_export(me, ty) {
               ERecordLit(ty, fs1)
             } else {
-              let exports = match me { ME(_, exs, _) -> exs }
+              let exports = match me { ME(_, exs, _, _) -> exs }
               let _ = qt_diag_missing_type(mod, ty, exports, file, line, col)
               ERecordLit("__qualtype_bad__", fs1)
             }
@@ -49258,6 +49425,8 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
           qualtype_decls(sub_decls, mt, file), l, c)
   DDerive(ps, inner, l, c) ->
     DDerive(ps, qualtype_decl(inner, mt, file), l, c)
+  DUnstable(inner, l, c) ->
+    DUnstable(qualtype_decl(inner, mt, file), l, c)
   DAttribPure(inner, l, c) ->
     DAttribPure(qualtype_decl(inner, mt, file), l, c)
   DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
@@ -49390,6 +49559,7 @@ fn qtchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
     qtchk_te_list(proto_args, mt) +
     qtchk_te(ty, mt) + qtchk_decls(sub_decls, mt)
   DDerive(_, inner, _, _) -> qtchk_decl(inner, mt)
+  DUnstable(inner, _, _) -> qtchk_decl(inner, mt)
   DAttribPure(inner, _, _) -> qtchk_decl(inner, mt)
   DAxiom(_, _, _, _, _, ps, ret, row, _, _) ->
     qtchk_params(ps, mt) + qtchk_te(ret, mt) + qtchk_row(row, mt)
@@ -49408,6 +49578,206 @@ fn rqc_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Console 
   [d, ...rest] -> [rqc_decl(d, mt, file), ...rqc_decls(rest, mt, file)]
 }
 
+# Issue #602: walk every Decl body's EModCall sites and emit a
+# diagnostic for any call to a `#unstable` export from a package
+# the consumer has not opted into. Pure post-pass — runs AFTER
+# `rqc_decls` has lifted `EField(EVar(mod), fn)` into
+# `EModCall(mod, fname)` so we have a uniform shape to scan.
+#
+# Suppression rules:
+#   1. `mod == pkg` — the consumer is touching their own module;
+#      never warn on self-imports.
+#   2. `mod ∈ optins` — the consumer added `mod = true` under
+#      `[unstable]` in their kai.toml.
+#   3. The module is unknown to `mt` (corner case — should not
+#      happen by the time rqc runs, but be defensive). Skip.
+#   4. The fname is not in the module's `unstable_exports` list.
+#      The vast majority of imports.
+#
+# Otherwise emit a warning anchored at the call site, naming the
+# `<mod>.<fname>` pair and the opt-in instruction. The diagnostic
+# is non-fatal; downstream codegen proceeds as usual.
+fn unstable_check_decls(ds: [Decl], mt: [ModuleEntry],
+                          pkg: String, optins: [String], file: String)
+                          : Unit / Console + File = match ds {
+  [] -> ()
+  [d, ...rest] -> {
+    unstable_check_decl(d, mt, pkg, optins, file)
+    unstable_check_decls(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_decl(d: Decl, mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DTest(_, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DBench(_, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DCheck(_, _, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DImpl(_, _, _, subs, _, _) -> unstable_check_decls(subs, mt, pkg, optins, file)
+  DDerive(_, inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
+  DUnstable(inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
+  DAttribPure(inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
+  _ -> ()
+}
+
+fn unstable_check_expr(e: Expr, mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match e.kind {
+  EModCall(mod, fname) -> {
+    if mod == pkg { () }
+    else if list_has(optins, mod) { () }
+    else {
+      match mt_lookup(mt, mod) {
+        None -> ()
+        Some(me) ->
+          if me_export_is_unstable(me, fname) {
+            diag_warning(file, e.line, e.col,
+              concat_all([mod, ".", fname,
+                          " is #unstable — API may change between versions without an edition bump. ",
+                          "Add '", mod, " = true' under [unstable] in kai.toml to acknowledge."]))
+          } else { () }
+      }
+    }
+  }
+  EField(b, _) -> unstable_check_expr(b, mt, pkg, optins, file)
+  EIntrinsic(_, args_) -> unstable_check_exprs(args_, mt, pkg, optins, file)
+  ECall(callee, args_) -> {
+    unstable_check_expr(callee, mt, pkg, optins, file)
+    unstable_check_exprs(args_, mt, pkg, optins, file)
+  }
+  EIndex(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EBinop(_, a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EUnop(_, x) -> unstable_check_expr(x, mt, pkg, optins, file)
+  EIf(c, t_, eo) -> {
+    unstable_check_expr(c, mt, pkg, optins, file)
+    unstable_check_expr(t_, mt, pkg, optins, file)
+    unstable_check_expr_opt(eo, mt, pkg, optins, file)
+  }
+  ERecordLit(_, fs) -> unstable_check_fields_init(fs, mt, pkg, optins, file)
+  EList(els) -> unstable_check_list_elems(els, mt, pkg, optins, file)
+  ERange(a, b, opt_step) -> {
+    unstable_check_expr(a, mt, pkg, optins, file)
+    unstable_check_expr(b, mt, pkg, optins, file)
+    unstable_check_expr_opt(opt_step, mt, pkg, optins, file)
+  }
+  EPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EMapPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EFlatMapPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EFilterPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  ELitUnit(inner, _) -> unstable_check_expr(inner, mt, pkg, optins, file)
+  EBang(inner) -> unstable_check_expr(inner, mt, pkg, optins, file)
+  ELambda(_, body) -> unstable_check_expr(body, mt, pkg, optins, file)
+  EMatch(scrut, arms) -> {
+    unstable_check_expr(scrut, mt, pkg, optins, file)
+    unstable_check_arms(arms, mt, pkg, optins, file)
+  }
+  EHandle(body, _, _, init_opt, _, cs, ret_opt) -> {
+    unstable_check_expr(body, mt, pkg, optins, file)
+    unstable_check_expr_opt(init_opt, mt, pkg, optins, file)
+    unstable_check_hclauses(cs, mt, pkg, optins, file)
+    unstable_check_hreturn_opt(ret_opt, mt, pkg, optins, file)
+  }
+  EBlock(stmts, opt_final) -> {
+    unstable_check_stmts(stmts, mt, pkg, optins, file)
+    unstable_check_expr_opt(opt_final, mt, pkg, optins, file)
+  }
+  _ -> ()
+}
+
+fn unstable_check_exprs(es: [Expr], mt: [ModuleEntry], pkg: String,
+                          optins: [String], file: String) : Unit / Console + File = match es {
+  [] -> ()
+  [x, ...rest] -> {
+    unstable_check_expr(x, mt, pkg, optins, file)
+    unstable_check_exprs(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_expr_opt(opt: Option[Expr], mt: [ModuleEntry], pkg: String,
+                             optins: [String], file: String) : Unit / Console + File = match opt {
+  None -> ()
+  Some(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+}
+
+fn unstable_check_fields_init(fs: [FieldInit], mt: [ModuleEntry], pkg: String,
+                                optins: [String], file: String) : Unit / Console + File = match fs {
+  [] -> ()
+  [f, ...rest] -> match f {
+    FI(_, e) -> {
+      unstable_check_expr(e, mt, pkg, optins, file)
+      unstable_check_fields_init(rest, mt, pkg, optins, file)
+    }
+  }
+}
+
+fn unstable_check_list_elems(els: [ListElem], mt: [ModuleEntry], pkg: String,
+                               optins: [String], file: String) : Unit / Console + File = match els {
+  [] -> ()
+  [el, ...rest] -> {
+    match el {
+      ElPlain(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+      ElSpread(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+    }
+    unstable_check_list_elems(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_arms(arms: [Arm], mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match arms {
+  [] -> ()
+  [a, ...rest] -> match a {
+    Arm(_, guard_opt, body) -> {
+      unstable_check_expr_opt(guard_opt, mt, pkg, optins, file)
+      unstable_check_expr(body, mt, pkg, optins, file)
+      unstable_check_arms(rest, mt, pkg, optins, file)
+    }
+  }
+}
+
+fn unstable_check_hclauses(cs: [HClause], mt: [ModuleEntry], pkg: String,
+                             optins: [String], file: String) : Unit / Console + File = match cs {
+  [] -> ()
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> {
+      unstable_check_expr(body, mt, pkg, optins, file)
+      unstable_check_hclauses(rest, mt, pkg, optins, file)
+    }
+  }
+}
+
+fn unstable_check_hreturn_opt(opt: Option[HReturn], mt: [ModuleEntry], pkg: String,
+                                optins: [String], file: String) : Unit / Console + File = match opt {
+  None -> ()
+  Some(r) -> match r {
+    HR(_, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_stmts(ss: [Stmt], mt: [ModuleEntry], pkg: String,
+                          optins: [String], file: String) : Unit / Console + File = match ss {
+  [] -> ()
+  [s, ...rest] -> {
+    unstable_check_stmt(s, mt, pkg, optins, file)
+    unstable_check_stmts(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_stmt(s: Stmt, mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match s {
+  SLet(_, _, e) -> unstable_check_expr(e, mt, pkg, optins, file)
+  SAssert(e, eo) -> {
+    unstable_check_expr(e, mt, pkg, optins, file)
+    unstable_check_expr_opt(eo, mt, pkg, optins, file)
+  }
+  SExprStmt(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+  SIndexAssign(a, b, c, _, _) -> {
+    unstable_check_expr(a, mt, pkg, optins, file)
+    unstable_check_expr(b, mt, pkg, optins, file)
+    unstable_check_expr(c, mt, pkg, optins, file)
+  }
+  SVar(_, _, e, _, _) -> unstable_check_expr(e, mt, pkg, optins, file)
+  _ -> ()
+}
+
 fn rqc_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + File = match d {
 
   DFn(p, n, tp, params, ret, row, body, l, c, mo) ->
@@ -49423,6 +49793,8 @@ fn rqc_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + File = 
     DImpl(name, proto_args, ty, rqc_decls(sub_decls, mt, file), l, c)
   DDerive(ps, inner, l, c) ->
     DDerive(ps, rqc_decl(inner, mt, file), l, c)
+  DUnstable(inner, l, c) ->
+    DUnstable(rqc_decl(inner, mt, file), l, c)
   # DType / DEffect / DProtocol / DUnit / DAxiom / DUse / DImport
   # carry no Expr bodies that need walking. (DAxiom's body is
   # synthesised by lower_axioms and lives in the resulting DFn,
@@ -49497,7 +49869,7 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKi
                 # (which the typer treats as a record-field
                 # projection on TyAny — produces a generic but
                 # non-fatal cascade).
-                let exports = match me { ME(_, exs, _) -> exs }
+                let exports = match me { ME(_, exs, _, _) -> exs }
                 let _ = rqc_diag_missing_export(name, fname, exports, file, e.line, e.col)
                 EField(rqc_expr(base, locals, mt, file), fname)
               }
@@ -50043,6 +50415,7 @@ fn decl_home_hint_reset(d: Decl, cur_mod: String, target_mod: String) : String =
     DAxiom(_, _, _, _, _, _, _, _, _, _) -> target_mod
     DAttribPure(inner, _, _)        -> decl_home_hint_reset(inner, cur_mod, target_mod)
     DDerive(_, inner, _, _)         -> decl_home_hint_reset(inner, cur_mod, target_mod)
+    DUnstable(inner, _, _)          -> decl_home_hint_reset(inner, cur_mod, target_mod)
     DImpl(_, _, _, sub_decls, _, _) -> impl_home_hint_reset(sub_decls, cur_mod, target_mod)
     _ -> cur_mod
   }
@@ -50069,6 +50442,7 @@ fn decl_home_hint(d: Decl, cur_mod: String) : String = match d {
   DAxiom(_, _, _, _, _, _, _, _, _, _) -> cur_mod
   DAttribPure(inner, _, _)             -> decl_home_hint(inner, cur_mod)
   DDerive(_, inner, _, _)              -> decl_home_hint(inner, cur_mod)
+  DUnstable(inner, _, _)               -> decl_home_hint(inner, cur_mod)
   DImpl(_, _, _, sub_decls, _, _)      -> impl_home_hint(sub_decls, cur_mod)
   _ -> cur_mod
 }
@@ -50102,6 +50476,7 @@ fn priv_one(d: Decl, home_mod: String, acc: [PubAccessEntry]) : [PubAccessEntry]
       [PAE(name, home_mod, is_pub), ...acc]
     DAttribPure(inner, _, _) -> priv_one(inner, home_mod, acc)
     DDerive(_, inner, _, _)  -> priv_one(inner, home_mod, acc)
+    DUnstable(inner, _, _)   -> priv_one(inner, home_mod, acc)
     # Issue #510 — DImpl method bodies. A `impl P for T { fn op(...)
     # = body }` makes `op` callable cross-module through the protocol
     # dispatcher; the method itself has no surface `pub` marker.
@@ -50303,6 +50678,7 @@ fn decl_explicit_home(d: Decl) : Option[String] = match d {
   DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
   DAttribPure(inner, _, _)        -> decl_explicit_home(inner)
   DDerive(_, inner, _, _)         -> decl_explicit_home(inner)
+  DUnstable(inner, _, _)          -> decl_explicit_home(inner)
   DImpl(_, _, _, sub_decls, _, _) -> impl_first_fn_home(sub_decls)
   _ -> None
 }
@@ -50415,6 +50791,8 @@ fn vpa_decl(d: Decl, table: [PubAccessEntry], home: String,
   DImpl(_, _, _, sub_decls, _, _) ->
     vpa_decls_loop(sub_decls, table, target_mod, home, file, 0)
   DDerive(_, inner, _, _) ->
+    vpa_decl(inner, table, home, target_mod, file)
+  DUnstable(inner, _, _) ->
     vpa_decl(inner, table, home, target_mod, file)
   DAttribPure(inner, _, _) ->
     vpa_decl(inner, table, home, target_mod, file)
@@ -50812,6 +51190,8 @@ fn collect_proto_decls(ds: [Decl], reg: ProtocolReg,
         }
         DDerive(_, inner, _, _) ->
           collect_proto_decls([inner, ...rest], reg, target_mod, cur_mod)
+        DUnstable(inner, _, _) ->
+          collect_proto_decls([inner, ...rest], reg, target_mod, cur_mod)
         _ -> collect_proto_decls(rest, reg, target_mod, next_mod)
       }
     }
@@ -50876,6 +51256,7 @@ fn collect_proto_names(ds: [Decl], acc: [String]) : [String] {
     [d, ...rest] -> match d {
       DProtocol(_, name, _, _, _, _) -> collect_proto_names(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
+      DUnstable(inner, _, _) -> collect_proto_names([inner, ...rest], acc)
       _ -> collect_proto_names(rest, acc)
     }
   }
@@ -50887,6 +51268,7 @@ fn collect_local_type_names(ds: [Decl], acc: [String]) : [String] {
     [d, ...rest] -> match d {
       DType(_, name, _, _, _, _) -> collect_local_type_names(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
+      DUnstable(inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
       _ -> collect_local_type_names(rest, acc)
     }
   }
@@ -50959,6 +51341,8 @@ fn validate_impls_loop(ds: [Decl], file: String,
         validate_impls_loop(rest, file, proto_names, local_types, seen1, errs3)
       }
       DDerive(_, inner, _, _) ->
+        validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
+      DUnstable(inner, _, _) ->
         validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
       _ -> validate_impls_loop(rest, file, proto_names, local_types, seen, errs)
     }
@@ -51033,6 +51417,8 @@ fn validate_impl_methods_loop(ds: [Decl], file: String,
         }
       }
       DDerive(_, inner, _, _) ->
+        validate_impl_methods_loop([inner, ...rest], file, reg, errs)
+      DUnstable(inner, _, _) ->
         validate_impl_methods_loop([inner, ...rest], file, reg, errs)
       _ -> validate_impl_methods_loop(rest, file, reg, errs)
     }
@@ -51327,6 +51713,7 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
         lower_impls(rest, r.reg, r.fns)
       }
       DDerive(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
+      DUnstable(inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
       _ -> lower_impls(rest, reg, acc_fns)
     }
   }
@@ -51497,6 +51884,8 @@ fn collect_future_impl_keys(ds: [Decl], acc: [String]) : [String] {
         }
         collect_future_impl_keys(rest, acc1)
       }
+      DUnstable(inner, _, _) ->
+        collect_future_impl_keys([inner, ...rest], acc)
       _ -> collect_future_impl_keys(rest, acc)
     }
   }
@@ -51535,6 +51924,8 @@ fn validate_derives_loop(ds: [Decl], file: String,
                                           line, col, errs)
         validate_derives_loop(rest, file, future_impls, errs1)
       }
+      DUnstable(inner, _, _) ->
+        validate_derives_loop([inner, ...rest], file, future_impls, errs)
       _ -> validate_derives_loop(rest, file, future_impls, errs)
     }
   }
@@ -51633,6 +52024,8 @@ fn expand_derives_loop(ds: [Decl], acc: [Decl]) : [Decl] {
         let derived = derive_impls_for(names, inner)
         expand_derives_loop(rest, list_append([inner, ...list_reverse(derived)], acc))
       }
+      DUnstable(inner, _, _) ->
+        expand_derives_loop([inner, ...rest], acc)
       _ -> expand_derives_loop(rest, [d, ...acc])
     }
   }
@@ -52915,6 +53308,8 @@ fn collect_binser_providers(decls: [Decl], acc: [String]) : [String] {
           }
         _ -> collect_binser_providers(rest, acc)
       }
+      DUnstable(inner, _, _) ->
+        collect_binser_providers([inner, ...rest], acc)
       _ -> collect_binser_providers(rest, acc)
     }
   }
@@ -52937,6 +53332,8 @@ fn validate_derive_binser_loop(decls: [Decl], file: String,
           }
         _ -> validate_derive_binser_loop(rest, file, providers, errs)
       }
+      DUnstable(inner, _, _) ->
+        validate_derive_binser_loop([inner, ...rest], file, providers, errs)
       _ -> validate_derive_binser_loop(rest, file, providers, errs)
     }
   }
@@ -53123,6 +53520,8 @@ fn collect_ord_providers(decls: [Decl], acc: [String]) : [String] {
           }
         _ -> collect_ord_providers(rest, acc)
       }
+      DUnstable(inner, _, _) ->
+        collect_ord_providers([inner, ...rest], acc)
       _ -> collect_ord_providers(rest, acc)
     }
   }
@@ -53145,6 +53544,8 @@ fn validate_derive_ord_loop(decls: [Decl], file: String,
           }
         _ -> validate_derive_ord_loop(rest, file, providers, errs)
       }
+      DUnstable(inner, _, _) ->
+        validate_derive_ord_loop([inner, ...rest], file, providers, errs)
       _ -> validate_derive_ord_loop(rest, file, providers, errs)
     }
   }
@@ -55132,6 +55533,7 @@ fn decl_line(d: Decl) : Int {
     DProtocol(_, _, _, _, line, _) -> line
     DImpl(_, _, _, _, line, _) -> line
     DDerive(_, _, line, _) -> line
+    DUnstable(_, line, _) -> line
     DAttribPure(_, line, _) -> line
     DUnit(_, _, _, line, _) -> line
     DUse(_, line, _) -> line
@@ -55174,6 +55576,7 @@ fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
     DProtocol(_, _, _, _, line, _) -> fmt_panic_unsupported("protocol declarations", line)
     DImpl(_, _, _, _, line, _) -> fmt_panic_unsupported("impl blocks", line)
     DDerive(_, _, line, _) -> fmt_panic_unsupported("#derive annotation", line)
+    DUnstable(_, line, _) -> fmt_panic_unsupported("#unstable annotation", line)
     DUnit(_, _, _, line, _) -> fmt_panic_unsupported("unit declarations", line)
     DUse(_, line, _) -> fmt_panic_unsupported("file-level `use`", line)
     DAxiom(_, _, _, _, _, _, _, _, line, _) -> fmt_panic_unsupported("axiom declarations", line)
@@ -56210,19 +56613,30 @@ type BuildMode = BMBuild | BMTest | BMBench | BMCheck
 type CliOptions = { mode: Mode, path: Option[String], preludes: [String],
                     prelude_caches: [String], cache_sha: String,
                     strict_holes: Bool, search_paths: [String],
-                    include_prelude_tests: Bool }
+                    include_prelude_tests: Bool,
+                    # Issue #602: identity of the consuming package
+                    # (from `name = ...` in the user's kai.toml; empty
+                    # when no manifest is present) and the list of
+                    # packages this consumer has opted into via
+                    # `[unstable] <pkg> = true`. Threaded into the
+                    # qualified-call rewriter so #unstable warnings
+                    # skip both self-imports and opted-in deps.
+                    package_name: String,
+                    unstable_optins: [String] }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
   CliOptions { mode: m, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               include_prelude_tests: opts.include_prelude_tests }
+               include_prelude_tests: opts.include_prelude_tests,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
 
 fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, path: Some(p), preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               include_prelude_tests: opts.include_prelude_tests }
+               include_prelude_tests: opts.include_prelude_tests,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
 
 fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path,
@@ -56230,7 +56644,8 @@ fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
                prelude_caches: list_append(opts.prelude_caches, [""]),
                cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               include_prelude_tests: opts.include_prelude_tests }
+               include_prelude_tests: opts.include_prelude_tests,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
 
 fn cli_with_prelude_cache(opts: CliOptions, src: String, cache: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path,
@@ -56238,32 +56653,57 @@ fn cli_with_prelude_cache(opts: CliOptions, src: String, cache: String) : CliOpt
                prelude_caches: list_append(opts.prelude_caches, [cache]),
                cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               include_prelude_tests: opts.include_prelude_tests }
+               include_prelude_tests: opts.include_prelude_tests,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
 
 fn cli_with_cache_sha(opts: CliOptions, sha: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               include_prelude_tests: opts.include_prelude_tests }
+               include_prelude_tests: opts.include_prelude_tests,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
 
 fn cli_with_strict_holes(opts: CliOptions) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: true, search_paths: opts.search_paths,
-               include_prelude_tests: opts.include_prelude_tests }
+               include_prelude_tests: opts.include_prelude_tests,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
 
 fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes,
                search_paths: list_append(opts.search_paths, [sp]),
-               include_prelude_tests: opts.include_prelude_tests }
+               include_prelude_tests: opts.include_prelude_tests,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
 
 fn cli_with_include_prelude_tests(opts: CliOptions) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               include_prelude_tests: true }
+               include_prelude_tests: true,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins }
+
+# Issue #602: set the consumer-package name parsed from kai.toml. The
+# value flows through to the qualified-call rewriter so self-imports
+# from a package's own modules never emit the unstable warning.
+fn cli_with_package_name(opts: CliOptions, n: String) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               include_prelude_tests: opts.include_prelude_tests,
+               package_name: n, unstable_optins: opts.unstable_optins }
+
+# Issue #602: register a `[unstable] <pkg> = true` opt-in from
+# kai.toml. Repeated flags accumulate.
+fn cli_push_unstable_optin(opts: CliOptions, pkg: String) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               include_prelude_tests: opts.include_prelude_tests,
+               package_name: opts.package_name,
+               unstable_optins: list_append(opts.unstable_optins, [pkg]) }
 
 fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
   match rest {
@@ -56377,6 +56817,27 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
             cli_with_mode(opts, MHelp)
           }
         }
+      } else if a == "--package-name" {
+        # Issue #602: identifier of the package that owns the source
+        # being compiled. Read from `name = "..."` in the consumer's
+        # kai.toml. Used to silence #unstable warnings on self-imports.
+        match more {
+          [n, ...rest2] -> parse_cli_loop(rest2, cli_with_package_name(opts, n))
+          [] -> {
+            eprint("kaic2: --package-name requires a package-name argument")
+            cli_with_mode(opts, MHelp)
+          }
+        }
+      } else if a == "--unstable-optin" {
+        # Issue #602: one entry per `<pkg> = true` line under the
+        # `[unstable]` table in the consumer's kai.toml. Repeated.
+        match more {
+          [pkg, ...rest2] -> parse_cli_loop(rest2, cli_push_unstable_optin(opts, pkg))
+          [] -> {
+            eprint("kaic2: --unstable-optin requires a package-name argument")
+            cli_with_mode(opts, MHelp)
+          }
+        }
       } else {
         parse_cli_loop(more, cli_with_path(opts, a))
       }
@@ -56389,7 +56850,8 @@ fn parse_cli(argv: [String]) : CliOptions / Console {
   parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, preludes: [],
                                     prelude_caches: [], cache_sha: "",
                                     strict_holes: false, search_paths: [],
-                                    include_prelude_tests: false })
+                                    include_prelude_tests: false,
+                                    package_name: "", unstable_optins: [] })
 }
 
 fn usage() : Unit / Console {
@@ -56418,6 +56880,8 @@ fn usage() : Unit / Console {
   eprint("  --library-mode     run lex/parse/resolve/infer; answer `# @probe <kind> L:C` queries as JSON (issue #454)")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
   eprint("  --include-prelude-tests  also run test blocks defined inside --prelude files (default: drop them; issue #318)")
+  eprint("  --package-name <n>   identifier of the consuming package (from kai.toml `name`); silences #unstable on self-imports (#602)")
+  eprint("  --unstable-optin <p> mark package <p> as `[unstable] = true` opt-in (repeatable; #602)")
   eprint("  -h, --help         this help")
   eprint("  -V, --version      print version and exit")
 }
@@ -56471,12 +56935,13 @@ fn load_prelude(path: String, include_tests: Bool) : Option[PreludeLoaded] / Con
             let mod_name = prelude_module_name(path)
             let kept = if include_tests { ds } else { strip_prelude_tests(ds, []) }
             let exports = collect_pub_exports(kept, [])
+            let unstable_exports = collect_unstable_exports(kept, [])
             # m6.2 v2: tag every DFn coming from this prelude file
             # with `module_origin = Some(<basename>)` so the codegen
             # mints `kai_<basename>__<name>` for it. Decls authored
             # in the root file keep `None` (set by the parser).
             let tagged = tag_decls_module_origin(kept, mod_name)
-            Some(PL(tagged, ME(mod_name, exports, path)))
+            Some(PL(tagged, ME(mod_name, exports, path, unstable_exports)))
           }
         }
       }
@@ -56518,6 +56983,7 @@ fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
   # but the lower pass synthesises further DFns from it later, after
   # this point). Tag whatever's inside.
   DDerive(ps, inner, l, c) -> DDerive(ps, tag_decl_module_origin(inner, mod), l, c)
+  DUnstable(inner, l, c) -> DUnstable(tag_decl_module_origin(inner, mod), l, c)
   # Issue #244: a `pub axiom` (with or without `[<extern_c>]`) needs
   # the same module_origin stamp as a regular DFn so the lowered FFI
   # shim's C symbol becomes `kai_<mod>__<name>` — the symbol that
@@ -56609,6 +57075,7 @@ fn decl_partition_home(d: Decl) : Option[String] = match d {
   DFn(_, _, _, _, _, _, _, _, _, mo)   -> mo
   DAttribPure(inner, _, _)             -> decl_partition_home(inner)
   DDerive(_, inner, _, _)              -> decl_partition_home(inner)
+  DUnstable(inner, _, _)               -> decl_partition_home(inner)
   DImpl(_, _, _, sub_decls, _, _)      -> impl_first_fn_home(sub_decls)
   _                                    -> None
 }
@@ -56649,6 +57116,7 @@ fn tag_target_decl(d: Decl, mod: String) : Decl = match d {
     }
   DAttribPure(inner, l, c) -> DAttribPure(tag_target_decl(inner, mod), l, c)
   DDerive(ps, inner, l, c) -> DDerive(ps, tag_target_decl(inner, mod), l, c)
+  DUnstable(inner, l, c) -> DUnstable(tag_target_decl(inner, mod), l, c)
   # Issue #244: same carve-out as tag_target_decl's DFn arm — only
   # `pub` axioms get the module stamp. A non-pub axiom (rare, but
   # legal as an in-file FFI helper) keeps the bare `kai_<name>` symbol
@@ -56685,7 +57153,7 @@ fn load_preludes(paths: [String], caches: [String], include_tests: Bool, acc_dec
       None -> None
       Some(pl) -> match pl {
         PL(ds, me) -> {
-          let mod_name = match me { ME(m, _, _) -> m }
+          let mod_name = match me { ME(m, _, _, _) -> m }
           load_preludes(rest, [], include_tests,
                          list_append(acc_decls, ds),
                          list_append(acc_mods, [me]),
@@ -56697,7 +57165,7 @@ fn load_preludes(paths: [String], caches: [String], include_tests: Bool, acc_dec
       None -> None
       Some(pl) -> match pl {
         PL(ds, me) -> {
-          let mod_name = match me { ME(m, _, _) -> m }
+          let mod_name = match me { ME(m, _, _, _) -> m }
           load_preludes(rest, rest_caches, include_tests,
                          list_append(acc_decls, ds),
                          list_append(acc_mods, [me]),
@@ -56731,7 +57199,8 @@ fn load_prelude_cached(source_path: String, cache_path: String, include_tests: B
             let mod_name = prelude_module_name(source_path)
             let kept = if include_tests { decls } else { strip_prelude_tests(decls, []) }
             let exports = collect_pub_exports(kept, [])
-            Some(PL(kept, ME(mod_name, exports, source_path)))
+            let unstable_exports = collect_unstable_exports(kept, [])
+            Some(PL(kept, ME(mod_name, exports, source_path, unstable_exports)))
           }
         }
       }
@@ -57867,6 +58336,10 @@ fn find_enc_decl(d: Decl, ql: Int, qc: Int, acc: Option[EncResult]) : Option[Enc
       let a1 = enc_better(acc, line, col, "DDerive", None, ql, qc)
       find_enc_decl(inner, ql, qc, a1)
     }
+    DUnstable(inner, line, col) -> {
+      let a1 = enc_better(acc, line, col, "DUnstable", None, ql, qc)
+      find_enc_decl(inner, ql, qc, a1)
+    }
     DAttribPure(inner, line, col) -> {
       let a1 = enc_better(acc, line, col, "DAttribPure", None, ql, qc)
       find_enc_decl(inner, ql, qc, a1)
@@ -58223,6 +58696,7 @@ fn find_local_at_decl(d: Decl, qname: String, ql: Int, qc: Int,
     }
     DImpl(_, _, _, decls, _, _) -> find_local_at_decls(decls, qname, ql, qc, acc)
     DDerive(_, inner, _, _)     -> find_local_at_decl(inner, qname, ql, qc, acc)
+    DUnstable(inner, _, _)      -> find_local_at_decl(inner, qname, ql, qc, acc)
     DAttribPure(inner, _, _)    -> find_local_at_decl(inner, qname, ql, qc, acc)
     _                           -> acc
   }
@@ -58446,6 +58920,7 @@ fn find_var_at_decl(d: Decl, ql: Int, qc: Int, acc: Option[String]) : Option[Str
     DCheck(_, _, body, _, _)             -> find_var_at_expr(body, ql, qc, acc)
     DImpl(_, _, _, decls, _, _)          -> find_var_at_decls(decls, ql, qc, acc)
     DDerive(_, inner, _, _)              -> find_var_at_decl(inner, ql, qc, acc)
+    DUnstable(inner, _, _)               -> find_var_at_decl(inner, ql, qc, acc)
     DAttribPure(inner, _, _)             -> find_var_at_decl(inner, ql, qc, acc)
     _                                    -> acc
   }
@@ -58619,6 +59094,10 @@ fn find_decl_def(ds: [Decl], name: String) : Option[DefLoc] {
       DUnit(_, n, _, line, col) ->
         if n == name { Some(DL("DUnit", n, line, col)) } else { find_decl_def(rest, name) }
       DDerive(_, inner, _, _) -> match find_decl_def([inner], name) {
+        Some(loc) -> Some(loc)
+        None      -> find_decl_def(rest, name)
+      }
+      DUnstable(inner, _, _) -> match find_decl_def([inner], name) {
         Some(loc) -> Some(loc)
         None      -> find_decl_def(rest, name)
       }
@@ -58828,7 +59307,7 @@ fn dump_diags_json(file: String, decls: [Decl]) : Int / Console + File {
 
 # ============================================================
 
-fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment]) : Int / Console + File {
+fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment], package_name: String, unstable_optins: [String]) : Int / Console + File {
 
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
@@ -58905,7 +59384,8 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # bare name only because the qualifier did not resolve.
             let target_mod_name = prelude_module_name(path)
             let target_exports = collect_pub_exports(expanded_decls_raw, [])
-            let target_me = ME(target_mod_name, target_exports, path)
+            let target_unstable = collect_unstable_exports(expanded_decls_raw, [])
+            let target_me = ME(target_mod_name, target_exports, path, target_unstable)
             let expanded_decls = tag_target_decls_module_origin(expanded_decls_raw, target_mod_name)
             # m14 v0: every `--prelude` file is also registered as a
             # module under its basename, so qualified calls into the
@@ -58949,6 +59429,14 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             let qt_expanded = qualtype_decls(expanded_decls_lc, module_table, path)
             let qualified_prelude = rqc_decls(qt_prelude, module_table, path)
             let qualified_decls = rqc_decls(qt_expanded, module_table, path)
+            # Issue #602: emit warnings for consumed `#unstable`
+            # exports the user hasn't opted into. Runs over the user
+            # decls only (preludes are part of the stdlib and the
+            # consumer never owns them, but stdlib has no unstable
+            # decls today; including the prelude here keeps the
+            # behaviour consistent if that ever changes).
+            unstable_check_decls(qualified_decls, module_table,
+                                  package_name, unstable_optins, path)
             let merged_raw = list_append(qualified_prelude, qualified_decls)
             # Issue #510 — `pub` enforcement at module + prelude
             # boundaries. After `rqc_decls` has rewritten every
@@ -59494,7 +59982,7 @@ fn run(opts: CliOptions) : Int / Console + File {
           None -> 1
           Some(pls) -> match pls {
             PLS(pds, pmods, psegs) -> match read_file(p) {
-              Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs)
+              Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins)
               Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
             }
           }
@@ -61997,6 +62485,10 @@ fn cache_decl_to_hex(d: Decl) : String = match d {
     cache_typeexpr_to_hex(ty), cache_expr_to_hex(body),
     cache_int_to_hex(l), cache_int_to_hex(c)
   ])
+  DUnstable(inner, l, c) -> concat_all([
+    cache_byte_to_hex(16), cache_decl_to_hex(inner),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
 }
 
 fn cache_hex_to_decl(buf: String, pos: Int) : Option[CacheDeclPos] {
@@ -62068,6 +62560,8 @@ fn cache_hex_to_decl_body(buf: String, pos: Int,
     cache_hex_to_daxiom(buf, pos)
   } else if tag == 15 {
     cache_hex_to_dconst(buf, pos)
+  } else if tag == 16 {
+    cache_hex_to_dunstable(buf, pos)
   } else { None }
 }
 
@@ -62366,6 +62860,25 @@ fn cache_hex_to_dattribpure(buf: String, pos: Int) : Option[CacheDeclPos] {
             None -> None
             Some(cc) -> match cc { CIP(cn, p3) ->
               Some(CDP(DAttribPure(inner, ln, cn), p3))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dunstable(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_decl(buf, pos) {
+    None -> None
+    Some(cd) -> match cd { CDP(inner, p1) ->
+      match cache_hex_to_int(buf, p1) {
+        None -> None
+        Some(cl) -> match cl { CIP(ln, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(cc) -> match cc { CIP(cn, p3) ->
+              Some(CDP(DUnstable(inner, ln, cn), p3))
             }
           }
         }
