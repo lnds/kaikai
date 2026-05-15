@@ -1,8 +1,8 @@
 #!/bin/sh
-# Phase A.0 cache invalidation fixture #2 — format_version mismatch.
+# Phase A cache invalidation fixture #2 — format_version mismatch.
 #
 # Plants a cache .kab whose magic + sha lines are well-formed but the
-# format_version field is 99 (current compiler expects 1).
+# format_version field is 99 (current compiler expects 2).
 # `cache_read_header` rejects on the format_version comparison;
 # the loader falls back to a full parse.
 
@@ -16,14 +16,12 @@ SRC="$ROOT/stdlib/core/char.kai"
 SHA="$(shasum -a 256 "$SRC" | awk '{ print $1 }')"
 CACHE_FILE="$CACHE_DIR/${SHA}.kab"
 
-# Seed: magic OK, format_version = 99 (0x63), version_hash OK, sha OK.
+# Seed: magic OK (KAB2), format_version = 99, kaikai_version OK, sha OK.
 # Payload empty — the header check rejects before any payload work.
-{
-  printf 'KAB1\n'
-  printf '63000000\n'        # format_version = 99 → mismatch
-  printf '01000000\n'
-  printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000"
-} > "$CACHE_FILE"
+printf 'KAB2' > "$CACHE_FILE"
+printf '\143\000\000\000' >> "$CACHE_FILE"  # format_version = 99 (0x63) LE
+printf '\001\000\000\000' >> "$CACHE_FILE"  # kaikai_version_hash 1 LE
+printf '0000000000000000000000000000000000000000000000000000000000000000' >> "$CACHE_FILE"
 
 cat > "$CACHE_DIR/empty.kai" <<'EOF'
 fn main() : Unit / Console {
