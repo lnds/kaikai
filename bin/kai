@@ -284,6 +284,43 @@ manifest_path_flags() {
   done
 }
 
+# Issue #602: emit `--package-name <name>` if the manifest declares
+# one, and `--unstable-optin <pkg>` for every `<pkg> = true` entry
+# under `[unstable]`. The compiler uses these to suppress the
+# `#unstable` warning for opted-in upstream packages and for the
+# consumer's self-imports. Silent when no manifest exists. Parsing
+# is intentionally simple — awk on raw TOML — because kaikai's
+# manifest format never quotes table or key names. A leading `#`
+# comment after the value is tolerated.
+manifest_unstable_flags() {
+  manifest_dir="$1"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    return 0
+  fi
+  # Consumer package name (top-level `name = "..."` outside any table).
+  awk '
+    /^\[/ { in_root = 0; next }
+    NR == 1 { in_root = 1 }
+    in_root && /^[[:space:]]*name[[:space:]]*=/ {
+      n = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", n)
+      sub(/".*/, "", n)
+      print "--package-name " n
+      exit
+    }
+  ' "$manifest_dir/kai.toml"
+  # `[unstable]` table entries: `<pkg> = true` → `--unstable-optin <pkg>`.
+  awk '
+    /^\[unstable\][[:space:]]*$/ { in_section = 1; next }
+    /^\[/                       { in_section = 0; next }
+    in_section && /^[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*=[[:space:]]*true/ {
+      k = $1
+      sub(/[[:space:]]*=.*/, "", k)
+      print "--unstable-optin " k
+    }
+  ' "$manifest_dir/kai.toml"
+}
+
 # Returns 0 (true) if the manifest needs `kai install` to run
 # before paths are usable. Heuristics:
 #   - manifest mentions `[dependencies]` AND kai.lock is missing.
@@ -911,8 +948,10 @@ compile_to_binary() {
   # zero-cost when no manifest exists (issue #405).
   manifest_dir="$(find_manifest_dir "$src_dir")"
   pkg_path_flags=""
+  unstable_flags=""
   if [ -n "$manifest_dir" ]; then
     pkg_path_flags="$(manifest_path_flags "$manifest_dir")"
+    unstable_flags="$(manifest_unstable_flags "$manifest_dir")"
   fi
   if [ "$backend" = "llvm" ]; then
     ensure_clang
@@ -920,7 +959,7 @@ compile_to_binary() {
       die "--backend=llvm: cannot locate runtime_llvm.c (looked under $RUNTIME_INC and $ROOT/stage0)"
     fi
     # shellcheck disable=SC2086
-    (unset KAI_TRACE_RC; "$KAIC2" --emit=llvm --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $prelude_flags "$@" "$src") > "$tmp/out.ll"
+    (unset KAI_TRACE_RC; "$KAIC2" --emit=llvm --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $prelude_flags "$@" "$src") > "$tmp/out.ll"
     # shellcheck disable=SC2086
     # `-w` matches stage2/Makefile's test-llvm rule: kaic2's emitted
     # IR triggers benign clang warnings (unused parameter on shim
@@ -929,7 +968,7 @@ compile_to_binary() {
     $CLANG $CLANGFLAGS -I "$RUNTIME_INC" "$tmp/out.ll" "$RUNTIME_LLVM_C" -o "$out" -lm
   else
     # shellcheck disable=SC2086
-    (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $prelude_flags "$@" "$src") > "$tmp/out.c"
+    (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $prelude_flags "$@" "$src") > "$tmp/out.c"
     # shellcheck disable=SC2086
     # `-lm` (issue #343): math/real libm bindings (sqrt, sin, log, …)
     # are unresolved on Linux glibc without an explicit link line.
@@ -951,11 +990,13 @@ report_holes() {
   src_dir="$(cd "$(dirname "$src")" && pwd)"
   manifest_dir="$(find_manifest_dir "$src_dir")"
   pkg_path_flags=""
+  unstable_flags=""
   if [ -n "$manifest_dir" ]; then
     pkg_path_flags="$(manifest_path_flags "$manifest_dir")"
+    unstable_flags="$(manifest_unstable_flags "$manifest_dir")"
   fi
   # shellcheck disable=SC2086
-  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $prelude_flags "$flag" "$src")
+  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $prelude_flags "$flag" "$src")
 }
 
 cmd_build() {
