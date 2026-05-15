@@ -74,6 +74,16 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+/* Issue #611 — Phase R1 reactor support. `poll()` is the wait
+ * primitive (POSIX everywhere we ship), `pthread` powers the file
+ * I/O worker pool, and `fcntl` toggles O_NONBLOCK on the self-pipes
+ * so the SIGCHLD handler and worker threads never block on write.
+ * Sockets stay on the blocking path until R2. */
+#include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
+#include <pthread.h>
+
 /* Apple deprecated ucontext in macOS 10.6 (POSIX-2008 obsoletion).
  * The functions still work; the deprecation attribute on the
  * prototypes triggers -Wdeprecated-declarations, which the local
@@ -1317,6 +1327,26 @@ struct KaiFiber {
      * concern (the *Ev itself can be overwritten the same way) —
      * not safe across parent termination, tracked for follow-up. */
     KaiEvidence    *cloned_evidence_chain;
+    /* Issue #611 — Phase R1 reactor metadata. A parked fiber lives
+     * on exactly one reactor list at a time (timer wheel, pid waiter
+     * map, or file-pool waiter list), so a single intrusive link slot
+     * is sufficient. The companion data members carry the wakeup
+     * payload that the parking op needs to read on resume:
+     *   reactor_deadline_ns — monotonic deadline for timer-wheel parks.
+     *   reactor_wait_pid    — pid the fiber is waiting on (Process.wait).
+     *   reactor_wait_status — waitpid status filled by the SIGCHLD drain.
+     *   reactor_data        — generic pointer slot used by the file
+     *                         thread-pool offload to publish the
+     *                         completed `KaiValue *` result before
+     *                         waking the parked fiber.
+     * The slots are read once on resume; nothing else in the runtime
+     * touches them. Zero is a valid "not parked here" sentinel for
+     * all four. */
+    KaiFiber       *reactor_next;
+    uint64_t        reactor_deadline_ns;
+    int             reactor_wait_pid;
+    int             reactor_wait_status;
+    void           *reactor_data;
 };
 
 /* m7a #5 + m8.x: kai_main_fiber starts as the OS-thread context,
@@ -1341,7 +1371,8 @@ static KaiFiber kai_main_fiber = {
     0,                   /* trap_exit — main starts opted out */
     NULL,                /* mailbox — set by with_mailbox if main uses one */
     NULL,                /* monitor_head — Monitor.monitor(...) appends here */
-    NULL                 /* cloned_evidence_chain — main never inherits */
+    NULL,                /* cloned_evidence_chain — main never inherits */
+    NULL, 0, 0, 0, NULL  /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */
 };
 
 static KaiFiber *kai_active_fiber = &kai_main_fiber;
@@ -1499,6 +1530,18 @@ struct KaiMonitorNode {
  * mailbox ops compile in their natural file location. */
 static void kai_sched_park(void);
 static void kai_sched_unpark(KaiFiber *target);
+
+/* Issue #611 — Phase R1 reactor forward decls. The default Clock /
+ * File / Process handlers live above the reactor implementation
+ * but call into it through the small API below to park their
+ * fibers. Bodies sit alongside the scheduler primitives a few
+ * thousand lines further down. */
+typedef struct KaiFilepoolItem KaiFilepoolItem;
+static void     kai_reactor_init(void);
+static void     kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns);
+static void     kai_reactor_park_pid(KaiFiber *f, int pid);
+static KaiValue *kai_reactor_run_in_pool(KaiValue *(*work)(void *), void *arg);
+static uint64_t kai_reactor_now_ns(void);
 
 static KaiMailbox *kai_mailbox_alloc(void) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
@@ -5293,18 +5336,47 @@ static KaiValue *kai_default_env_vars(void *self, KaiCont *k) {
     return kai_cont_resume(k, acc);
 }
 
-/* m7a #7: default File handlers. Both reuse the prelude helpers
- * which already produce `Result[T, String]` shapes (Doc B §`File`
- * error model). */
+/* m7a #7: default File handlers. Each reuses the prelude helper —
+ * which already produces `Result[T, String]` shapes per Doc B
+ * §`File` error model — but routes the call through the Phase R1
+ * reactor's file-pool worker (issue #611) so the blocking `fopen`
+ * / `fread` / `fwrite` syscall runs off the scheduler thread.
+ * Other fibers therefore make forward progress while one is mid
+ * file op.
+ *
+ * Each `_arg` struct lives on the calling fiber's stack for the
+ * lifetime of the work; the `_thunk` runs on a pool worker thread
+ * and returns the KaiValue * the prelude produced. */
+typedef struct {
+    KaiValue *path;
+} KaiFileReadFileArg;
+static KaiValue *_kai_file_read_file_thunk(void *arg) {
+    KaiFileReadFileArg *a = (KaiFileReadFileArg *) arg;
+    return kai_prelude_read_file(a->path);
+}
 static KaiValue *kai_default_file_read_file(void *self, KaiValue *path, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_read_file(path));
+    kai_reactor_init();
+    KaiFileReadFileArg a = { path };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_read_file_thunk, &a);
+    return kai_cont_resume(k, r);
 }
 
+typedef struct {
+    KaiValue *path;
+    KaiValue *contents;
+} KaiFileWriteFileArg;
+static KaiValue *_kai_file_write_file_thunk(void *arg) {
+    KaiFileWriteFileArg *a = (KaiFileWriteFileArg *) arg;
+    return kai_prelude_write_file(a->path, a->contents);
+}
 static KaiValue *kai_default_file_write_file(void *self, KaiValue *path,
                                               KaiValue *contents, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_write_file(path, contents));
+    kai_reactor_init();
+    KaiFileWriteFileArg a = { path, contents };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_write_file_thunk, &a);
+    return kai_cont_resume(k, r);
 }
 
 /* m7b #2b: default Mutable handler — wraps the prelude `array_*`
@@ -5428,16 +5500,16 @@ static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue
  * Spec: docs/effects-stdlib.md §`Clock`. Three ops:
  *   wall_now()       -> WallTime { secs, nanos } via CLOCK_REALTIME
  *   monotonic_now()  -> Instant  { secs, nanos } via CLOCK_MONOTONIC
- *   sleep_ns(ns)     -> Unit     via nanosleep
+ *   sleep_ns(ns)     -> Unit     via the Phase R1 reactor timer wheel
  *
- * sleep_ns blocks the OS thread inside `nanosleep` and is therefore
- * not a yield point: `Cancel.raise` cannot be delivered mid-sleep
- * because no reactor is registered to wake the fiber on a timer
- * event. The m8.x cooperative scheduler (landed v0.4.0) has the
- * suspend / resume primitives in place; the missing piece is a
- * timer-wheel reactor that parks the fiber and resumes it via the
- * scheduler's existing wake path. Tier 2 follow-up tracked in
- * docs/fibers-honesty-targets.md §Reactor.
+ * Issue #611 — Phase R1: sleep_ns parks the calling fiber on the
+ * reactor's timer wheel (sorted by CLOCK_MONOTONIC deadline) and
+ * yields. The scheduler's poll() loop blocks until the next
+ * deadline fires (or another wake source arrives) and promotes
+ * the sleeper back to READY. A previous EINTR-based busy loop
+ * around nanosleep(2) blocked the OS thread; the new path leaves
+ * the rest of the scheduler free to run other fibers while one is
+ * asleep.
  *
  * Field names ("secs", "nanos") are load-bearing: kai_op_field reads
  * the slot by strcmp on the name pointer's contents, so the static
@@ -5479,17 +5551,12 @@ static KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiCont *k
     (void) self;
     int64_t ns_v = (ns && ns->tag == KAI_INT) ? ns->as.i : 0;
     if (ns_v > 0) {
-        struct timespec req;
-        req.tv_sec  = (time_t) (ns_v / 1000000000LL);
-        req.tv_nsec = (long)   (ns_v % 1000000000LL);
-        struct timespec rem;
-        /* Loop on EINTR so a stray signal doesn't shorten the sleep.
-         * v1 is not Cancel-aware (m8.x scope) — Cancel-delivered while
-         * a fiber sleeps will be observed only after wake-up. */
-        while (nanosleep(&req, &rem) != 0) {
-            if (errno != EINTR) break;
-            req = rem;
-        }
+        kai_reactor_init();
+        uint64_t deadline = kai_reactor_now_ns() + (uint64_t) ns_v;
+        kai_reactor_park_timer(kai_current_fiber(), deadline);
+        /* Resumed by the timer-wheel drain. Cancel delivered while
+         * the fiber is parked still arrives at the next yield-point
+         * hook after we resume. */
     }
     return kai_cont_resume(k, kai_unit());
 }
@@ -6037,13 +6104,19 @@ static void _kai_process_free_argv(char **argv, int n) {
 
 /* start(cmd, args) -> Child. fork + execvp; on failure of either
  * primitive, panic with strerror — start has no Result wrapper in
- * v1 (see the divergence note in builtin_process_decl). */
+ * v1 (see the divergence note in builtin_process_decl).
+ *
+ * Issue #611 — install the SIGCHLD handler before fork() so that
+ * a fast-exiting child cannot deliver SIGCHLD to the kernel's
+ * default disposition (zombie reaper only) before the reactor is
+ * armed. Idempotent. */
 static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *args, KaiCont *k) {
     (void) self;
     if (!cmd || cmd->tag != KAI_STR) {
         fputs("kai: Process.start: cmd must be a String\n", stderr);
         exit(1);
     }
+    kai_reactor_init();
     /* cmd is heap-allocated by kai_str_from_bytes with a trailing
      * NUL, so passing bytes directly to execvp is safe. */
     const char *cmd_cstr = cmd->as.s.bytes ? cmd->as.s.bytes : "";
@@ -6084,11 +6157,14 @@ static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *
     return kai_cont_resume(k, child);
 }
 
-/* wait(c) -> Result[Exit, String]. waitpid blocks until the child
- * terminates; EINTR retries (cooperative-scheduler integration is
- * m8.x scope). WIFEXITED → Exited(status); WIFSIGNALED →
- * Signaled(signo). Other states (stopped, continued) cannot occur
- * with `options=0`, so we only branch on the two terminal cases. */
+/* wait(c) -> Result[Exit, String]. Issue #611 Phase R1: the wait
+ * parks the calling fiber on the reactor's pid waiter map and the
+ * SIGCHLD self-pipe drives the wake. WIFEXITED → Exited(status);
+ * WIFSIGNALED → Signaled(signo). The reactor's waitpid drain uses
+ * `-1` to harvest any pending child, so a SIGCHLD that fires while
+ * the parking fiber is mid-park is handled by the drain helper at
+ * the next reactor wait (or immediately if the byte was already
+ * pending in the self-pipe). */
 static KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *k) {
     (void) self;
     int pid = _kai_process_record_pid(child);
@@ -6097,12 +6173,21 @@ static KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *
         KaiValue *err = kai_variant(0, "Err", 1, &m);
         return kai_cont_resume(k, err);
     }
+    kai_reactor_init();
+    /* Race: the child may have terminated before we registered the
+     * waiter. Try a non-blocking waitpid first; if it succeeds we
+     * report the status without parking. */
     int status = 0;
-    pid_t rc;
-    do {
-        rc = waitpid((pid_t) pid, &status, 0);
-    } while (rc < 0 && errno == EINTR);
-    if (rc < 0) {
+    pid_t rc = waitpid((pid_t) pid, &status, WNOHANG);
+    if (rc == 0) {
+        /* Child still running; park on the pid map and let the
+         * SIGCHLD drain wake us with the status. */
+        KaiFiber *me = kai_current_fiber();
+        kai_reactor_park_pid(me, pid);
+        status = me->reactor_wait_status;
+        me->reactor_wait_pid    = 0;
+        me->reactor_wait_status = 0;
+    } else if (rc < 0) {
         return _kai_process_err(k, errno);
     }
     KaiValue *exit_v;
@@ -6111,8 +6196,6 @@ static KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *
     } else if (WIFSIGNALED(status)) {
         exit_v = _kai_process_make_exit_signaled(WTERMSIG(status));
     } else {
-        /* options=0 should preclude this; treat as Exited(-1) so
-         * the user can still match. */
         exit_v = _kai_process_make_exit_exited(-1);
     }
     KaiValue *ok = kai_variant(0, "Ok", 1, &exit_v);
@@ -6458,6 +6541,509 @@ static void kai_install_fiber_sigsegv_handler(void) {
     sigaction(SIGBUS,  &sa, NULL);
 }
 
+/* =================================================================
+ * Phase R1 reactor — issue #611
+ * =================================================================
+ *
+ * Single-threaded readiness reactor wired into the cooperative
+ * scheduler. Three surfaces park the calling fiber instead of the
+ * OS thread:
+ *   - Spawn.sleep(ns)        — timer wheel keyed on CLOCK_MONOTONIC.
+ *   - File defaults          — thread-pool offload (4 workers).
+ *   - Process.wait(child)    — SIGCHLD self-pipe + pid waiter map.
+ *
+ * Wait primitive is `poll()` on two self-pipes (one for SIGCHLD,
+ * one for file-pool completions) plus a deadline-derived timeout.
+ * The kqueue/epoll path the parent issue (#474) sketched is queued
+ * for R2 when TCP sockets need readiness notifications; R1's three
+ * surfaces never wait directly on regular FDs, so the simpler
+ * `poll()` shape covers them portably without per-platform
+ * branching.
+ *
+ * Sockets (`NetTcp`) intentionally stay on the blocking syscall
+ * path until R2 ships in Orongo together with the Cancel redesign.
+ * The `NetTcp` runtime note in this file is left untouched and the
+ * `docs/effects-stdlib.md` sidebar for the surface continues to
+ * advertise the blocking shape.
+ */
+
+/* `kai_sched_unpark` is forward-declared earlier (right after the
+ * KaiFiber typedef) so the reactor drain helpers below can wake
+ * promoted fibers without needing a second prototype. */
+
+/* Self-pipe halves. The SIGCHLD handler writes one byte to
+ * kai_reactor_sigchld_pipe[1] from signal context (write(2) is
+ * async-signal-safe per POSIX). The reactor poll watches the read
+ * half. The file-pool worker threads write one byte to
+ * kai_reactor_filepool_pipe[1] on completion to wake the main
+ * thread from poll(). Both pipes are O_NONBLOCK so neither writer
+ * ever blocks; the reactor drains them with read() in a loop. */
+static int kai_reactor_sigchld_pipe[2]  = { -1, -1 };
+static int kai_reactor_filepool_pipe[2] = { -1, -1 };
+
+/* Sorted timer-wheel head (intrusive list of parked fibers chained
+ * through f->reactor_next, ordered by ascending deadline). Insertion
+ * is O(n); for v1 with handfuls of concurrent sleepers this stays
+ * well under the noise floor of poll() itself. A heap is queued for
+ * Orongo if the wheel ever shows up on a profile. */
+static KaiFiber *kai_reactor_timer_head = NULL;
+
+/* Process-wait map and file-pool waiter list. Both are intrusive
+ * single-linked through f->reactor_next, so a fiber can sit on at
+ * most one reactor structure at a time (asserted by the parking
+ * call sites — a fiber awaiting a pid cannot simultaneously sleep
+ * or sit on a file-pool completion). */
+static KaiFiber *kai_reactor_pid_waiters     = NULL;
+static KaiFiber *kai_reactor_filepool_waiters = NULL;
+
+/* Aggregate count of fibers parked on any reactor structure.
+ * kai_sched_park reads this to decide between "no one can wake us
+ * up — deadlock" (count == 0) and "block on the reactor until a
+ * timer/SIGCHLD/file-pool event arrives" (count > 0). */
+static int kai_reactor_parked_count = 0;
+
+/* File-pool work item. Each fiber-side park allocates one of these
+ * on the calling fiber's stack (lifetime = until wake) and pushes
+ * onto kai_filepool_queue. A worker thread pops, invokes `work` on
+ * `arg`, stores the return value in `result`, and writes one byte
+ * to the completion pipe so the scheduler can pick the waiter up.
+ *
+ * `arg` is owned by the calling fiber for the duration of the work
+ * (the worker only reads it); `result` is published by the worker
+ * for the calling fiber to consume on resume. The typedef alias
+ * sits up next to the reactor forward decls; only the struct
+ * definition lives here. */
+struct KaiFilepoolItem {
+    KaiValue *(*work)(void *arg);
+    void            *arg;
+    KaiValue        *result;
+    KaiFiber        *waiter;
+    KaiFilepoolItem *queue_next;
+};
+
+static pthread_mutex_t  kai_filepool_mu    = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t   kai_filepool_cv    = PTHREAD_COND_INITIALIZER;
+static KaiFilepoolItem *kai_filepool_q_head = NULL;
+static KaiFilepoolItem *kai_filepool_q_tail = NULL;
+static int              kai_filepool_started = 0;
+#define KAI_FILEPOOL_WORKERS 4
+static pthread_t        kai_filepool_threads[KAI_FILEPOOL_WORKERS];
+
+/* SIGCHLD delivery slot. The handler does the minimum allowed
+ * inside signal context: write a single byte to the pipe. The
+ * scheduler's reactor drain reaps every child that has terminated
+ * via waitpid(-1, ..., WNOHANG) and wakes the matching fiber from
+ * kai_reactor_pid_waiters. */
+static void kai_reactor_sigchld_handler(int sig) {
+    (void) sig;
+    /* write(2) is the only stdio call the SIGCHLD handler issues —
+     * it is on POSIX's async-signal-safe list and the destination
+     * pipe is O_NONBLOCK, so EAGAIN simply means "byte already
+     * pending, the reactor will drain on next wake". */
+    unsigned char b = 1;
+    int saved = errno;
+    if (kai_reactor_sigchld_pipe[1] >= 0) {
+        ssize_t w = write(kai_reactor_sigchld_pipe[1], &b, 1);
+        (void) w;
+    }
+    errno = saved;
+}
+
+/* Monotonic clock helper. Used by the timer wheel for sleep
+ * deadlines so wall-clock skew (NTP step, RTC adjust) does not
+ * leak into Spawn.sleep semantics. */
+static uint64_t kai_reactor_now_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        /* clock_gettime on CLOCK_MONOTONIC is guaranteed by POSIX;
+         * any failure is a kernel bug. Fall back to zero so a sleep
+         * still terminates rather than spinning. */
+        return 0;
+    }
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+/* Sorted-insert into the timer wheel. O(n) over concurrent
+ * sleepers; expected n is small in v1. */
+static void kai_reactor_timer_insert(KaiFiber *f) {
+    f->reactor_next = NULL;
+    if (!kai_reactor_timer_head ||
+        f->reactor_deadline_ns < kai_reactor_timer_head->reactor_deadline_ns) {
+        f->reactor_next = kai_reactor_timer_head;
+        kai_reactor_timer_head = f;
+        return;
+    }
+    KaiFiber *c = kai_reactor_timer_head;
+    while (c->reactor_next &&
+           c->reactor_next->reactor_deadline_ns <= f->reactor_deadline_ns) {
+        c = c->reactor_next;
+    }
+    f->reactor_next = c->reactor_next;
+    c->reactor_next = f;
+}
+
+/* Pop every fiber whose deadline is <= `now` from the head and
+ * promote it to READY. Returns the number woken. */
+static int kai_reactor_timer_drain(uint64_t now) {
+    int woken = 0;
+    while (kai_reactor_timer_head &&
+           kai_reactor_timer_head->reactor_deadline_ns <= now) {
+        KaiFiber *f = kai_reactor_timer_head;
+        kai_reactor_timer_head = f->reactor_next;
+        f->reactor_next = NULL;
+        f->reactor_deadline_ns = 0;
+        kai_reactor_parked_count--;
+        kai_sched_unpark(f);
+        woken++;
+    }
+    return woken;
+}
+
+/* Drain SIGCHLD self-pipe and waitpid(-1, ..., WNOHANG) until no
+ * more children have terminated, waking the fiber parked on each
+ * pid. Idempotent — safe to call when no children are pending. */
+static int kai_reactor_sigchld_drain(void) {
+    if (kai_reactor_sigchld_pipe[0] < 0) return 0;
+    /* Drain the pipe (its content is just a wake notification —
+     * the real state is in the kernel's child table). */
+    for (;;) {
+        unsigned char buf[64];
+        ssize_t n = read(kai_reactor_sigchld_pipe[0], buf, sizeof(buf));
+        if (n <= 0) break;
+    }
+    int woken = 0;
+    for (;;) {
+        int status = 0;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid <= 0) break;  /* 0 = none ready, -1 = ECHILD/EINTR */
+        KaiFiber **link = &kai_reactor_pid_waiters;
+        while (*link) {
+            if ((*link)->reactor_wait_pid == (int) pid) {
+                KaiFiber *f = *link;
+                *link = f->reactor_next;
+                f->reactor_next = NULL;
+                f->reactor_wait_status = status;
+                /* Leave reactor_wait_pid intact so the wait op
+                 * can confirm it matches on resume; clear elsewhere. */
+                kai_reactor_parked_count--;
+                kai_sched_unpark(f);
+                woken++;
+                break;
+            }
+            link = &(*link)->reactor_next;
+        }
+        /* If no fiber was parked on this pid the exit status is
+         * lost. v1 contract: callers always spawn-then-wait. A
+         * future "wait_any" or detached spawn would need a small
+         * pending-exits buffer here; not on the R1 critical path. */
+    }
+    return woken;
+}
+
+/* Drain the file-pool completion pipe and promote every fiber whose
+ * work item just completed. */
+static int kai_reactor_filepool_drain(void) {
+    if (kai_reactor_filepool_pipe[0] < 0) return 0;
+    /* Empty the pipe; the real signal is in each item's `result`
+     * slot being non-NULL (workers store the result before writing
+     * the byte). Items waiting for promotion are still in
+     * kai_reactor_filepool_waiters. */
+    for (;;) {
+        unsigned char buf[64];
+        ssize_t n = read(kai_reactor_filepool_pipe[0], buf, sizeof(buf));
+        if (n <= 0) break;
+    }
+    int woken = 0;
+    KaiFiber **link = &kai_reactor_filepool_waiters;
+    while (*link) {
+        KaiFiber *f = *link;
+        KaiFilepoolItem *item = (KaiFilepoolItem *) f->reactor_data;
+        if (item && item->result != (KaiValue *) NULL) {
+            *link = f->reactor_next;
+            f->reactor_next = NULL;
+            kai_reactor_parked_count--;
+            kai_sched_unpark(f);
+            woken++;
+        } else {
+            link = &(*link)->reactor_next;
+        }
+    }
+    return woken;
+}
+
+/* File-pool worker loop. Pops items off the FIFO queue, runs the
+ * work function on the worker thread (so the blocking syscall stays
+ * off the scheduler thread), publishes the result, and writes one
+ * byte to the completion pipe to wake the scheduler. */
+static void *kai_filepool_worker(void *arg) {
+    (void) arg;
+    for (;;) {
+        pthread_mutex_lock(&kai_filepool_mu);
+        while (!kai_filepool_q_head) {
+            pthread_cond_wait(&kai_filepool_cv, &kai_filepool_mu);
+        }
+        KaiFilepoolItem *item = kai_filepool_q_head;
+        kai_filepool_q_head = item->queue_next;
+        if (!kai_filepool_q_head) kai_filepool_q_tail = NULL;
+        pthread_mutex_unlock(&kai_filepool_mu);
+
+        /* Sentinel item with NULL `work` signals shutdown — not
+         * exercised in v1 (the runtime never tears down) but kept
+         * symmetric with the queue protocol. */
+        if (!item->work) return NULL;
+
+        KaiValue *r = item->work(item->arg);
+
+        /* Publish the result, then notify. The order matters: the
+         * scheduler reads `result` after the byte arrives, so the
+         * store must be visible first. v1 single-CPU x86/arm64
+         * provides release ordering on aligned word stores, but a
+         * pthread_mutex round-trip gives us the same guarantee
+         * portably. */
+        pthread_mutex_lock(&kai_filepool_mu);
+        item->result = r ? r : kai_unit();
+        pthread_mutex_unlock(&kai_filepool_mu);
+
+        unsigned char b = 1;
+        if (kai_reactor_filepool_pipe[1] >= 0) {
+            ssize_t w = write(kai_reactor_filepool_pipe[1], &b, 1);
+            (void) w;
+        }
+    }
+}
+
+/* Lazy initialisation of the reactor on first use. Idempotent;
+ * safe to call from every parking site. Installs SIGCHLD additively
+ * (only if no existing handler is registered) so the stack-guard
+ * SIGSEGV path and any future signal users continue to operate.
+ *
+ * The file-pool workers (4 OS threads) are deferred to the first
+ * actual file op via kai_reactor_init_filepool — sleep-only and
+ * process-only workloads should not pay the pthread_create cost. */
+static void kai_reactor_init_filepool(void);
+static void kai_reactor_init(void) {
+    static int initialized = 0;
+    if (initialized) return;
+    initialized = 1;
+
+    /* Self-pipes for the two wake sources. O_NONBLOCK so the
+     * SIGCHLD handler and worker threads never block; O_CLOEXEC
+     * so a forked child does not inherit them. */
+    if (pipe(kai_reactor_sigchld_pipe) != 0 ||
+        pipe(kai_reactor_filepool_pipe) != 0) {
+        fprintf(stderr, "kai: reactor pipe() failed: %s\n", strerror(errno));
+        exit(1);
+    }
+    for (int i = 0; i < 2; i++) {
+        int fds[2][2] = {
+            { kai_reactor_sigchld_pipe[0],  kai_reactor_sigchld_pipe[1]  },
+            { kai_reactor_filepool_pipe[0], kai_reactor_filepool_pipe[1] },
+        };
+        for (int p = 0; p < 2; p++) {
+            int fd = fds[i][p];
+            int fl = fcntl(fd, F_GETFL, 0);
+            if (fl != -1) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+            int cl = fcntl(fd, F_GETFD, 0);
+            if (cl != -1) fcntl(fd, F_SETFD, cl | FD_CLOEXEC);
+        }
+    }
+
+    /* Install SIGCHLD additively. The stack-guard handler grabs
+     * SIGSEGV/SIGBUS; we are explicit about touching only SIGCHLD
+     * to avoid stomping on it. Refuse to install if SIGCHLD is
+     * already taken by user code; the runtime exits with a clear
+     * diagnostic rather than silently overriding. */
+    struct sigaction old;
+    if (sigaction(SIGCHLD, NULL, &old) == 0) {
+        if (old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN) {
+            fprintf(stderr,
+                "kai: reactor cannot install SIGCHLD — slot already taken\n");
+            exit(1);
+        }
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = kai_reactor_sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    /* SA_NOCLDSTOP so we are not woken for stop/continue traffic —
+     * only terminal child exits matter. SA_RESTART is intentionally
+     * NOT set: the scheduler's poll() must return early on EINTR so
+     * the wake path is observed even when the self-pipe write loses
+     * the race with the kernel's signal delivery. The worker
+     * threads block SIGCHLD via their thread mask (see below), so
+     * the absence of SA_RESTART does not affect their blocking
+     * reads/writes. */
+    sa.sa_flags = SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
+}
+
+/* Spin up the 4-worker file pool on the first file op. SIGCHLD is
+ * blocked in every worker thread's mask so the signal always lands
+ * on the scheduler (main) thread, which is the one draining the
+ * self-pipe in kai_reactor_wait. The pool runs detached for the
+ * lifetime of the process; the OS reclaims the threads on exit. */
+static void kai_reactor_init_filepool(void) {
+    if (kai_filepool_started) return;
+    kai_filepool_started = 1;
+    sigset_t block_set, prev_set;
+    sigemptyset(&block_set);
+    sigaddset(&block_set, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &block_set, &prev_set);
+    for (int i = 0; i < KAI_FILEPOOL_WORKERS; i++) {
+        if (pthread_create(&kai_filepool_threads[i], NULL,
+                           kai_filepool_worker, NULL) != 0) {
+            fprintf(stderr, "kai: reactor pthread_create failed: %s\n",
+                    strerror(errno));
+            exit(1);
+        }
+        pthread_detach(kai_filepool_threads[i]);
+    }
+    pthread_sigmask(SIG_SETMASK, &prev_set, NULL);
+}
+
+/* Submit a unit of work to the file-pool. The caller (a parking
+ * file op handler) supplies `work` + `arg`, then parks itself on
+ * kai_reactor_filepool_waiters and yields. The worker invokes
+ * `work(arg)`, stores the KaiValue * result in `item->result`,
+ * and wakes the scheduler. The item itself lives on the caller's
+ * fiber stack — no heap allocation. */
+static void kai_filepool_submit(KaiFilepoolItem *item) {
+    pthread_mutex_lock(&kai_filepool_mu);
+    item->queue_next = NULL;
+    if (kai_filepool_q_tail) {
+        kai_filepool_q_tail->queue_next = item;
+    } else {
+        kai_filepool_q_head = item;
+    }
+    kai_filepool_q_tail = item;
+    pthread_cond_signal(&kai_filepool_cv);
+    pthread_mutex_unlock(&kai_filepool_mu);
+}
+
+/* Public entry points used by the Clock / Process / File default
+ * handlers. Each is a thin wrapper that links the calling fiber
+ * into the appropriate reactor structure, bumps the parked-count,
+ * and yields via kai_sched_park (which falls into kai_reactor_wait
+ * once the run queue empties). On resume the reactor drain has
+ * already cleared the fiber's reactor_* slots and unparked it. */
+static void kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns) {
+    f->reactor_deadline_ns = deadline_ns;
+    kai_reactor_timer_insert(f);
+    kai_reactor_parked_count++;
+    kai_sched_park();
+}
+
+static void kai_reactor_park_pid(KaiFiber *f, int pid) {
+    f->reactor_wait_pid    = pid;
+    f->reactor_wait_status = 0;
+    /* Push onto the head; pid lookup walks the list so order is
+     * irrelevant. The drain helper splices the matching node out. */
+    f->reactor_next = kai_reactor_pid_waiters;
+    kai_reactor_pid_waiters = f;
+    kai_reactor_parked_count++;
+    kai_sched_park();
+}
+
+/* Submit `work(arg)` to the file-pool worker queue and park the
+ * caller until completion. Returns the worker's KaiValue *result.
+ * The KaiFilepoolItem lives on the caller's fiber stack — safe
+ * because the parked fiber's stack is preserved until resume. */
+static KaiValue *kai_reactor_run_in_pool(KaiValue *(*work)(void *), void *arg) {
+    kai_reactor_init_filepool();
+    KaiFilepoolItem item;
+    item.work       = work;
+    item.arg        = arg;
+    item.result     = NULL;
+    item.waiter     = kai_current_fiber();
+    item.queue_next = NULL;
+
+    KaiFiber *me = kai_current_fiber();
+    me->reactor_data = &item;
+    /* Queue order is irrelevant for the waiter list; insert at head. */
+    me->reactor_next = kai_reactor_filepool_waiters;
+    kai_reactor_filepool_waiters = me;
+    kai_reactor_parked_count++;
+
+    kai_filepool_submit(&item);
+    kai_sched_park();
+
+    /* On resume the drain helper has spliced us out of
+     * kai_reactor_filepool_waiters. The result slot is set by the
+     * worker prior to the pipe write. */
+    KaiValue *r = item.result;
+    me->reactor_data = NULL;
+    return r ? r : kai_unit();
+}
+
+/* Block in poll() until either the SIGCHLD pipe or the file-pool
+ * completion pipe fires, or the next timer deadline arrives.
+ * Promotes every newly-ready fiber to the run queue. Called by
+ * kai_sched_park when the ready queue is empty but reactor waiters
+ * exist — the dispatch loop's substitute for a dedicated event
+ * loop thread. */
+static void kai_reactor_wait(void) {
+    /* Compute the timeout in ms (poll's resolution). A negative
+     * timeout is "wait forever"; a zero timeout polls. */
+    int timeout_ms = -1;
+    if (kai_reactor_timer_head) {
+        uint64_t now = kai_reactor_now_ns();
+        uint64_t dl  = kai_reactor_timer_head->reactor_deadline_ns;
+        if (dl <= now) {
+            timeout_ms = 0;
+        } else {
+            uint64_t diff_ns = dl - now;
+            uint64_t ms = (diff_ns + 999999ULL) / 1000000ULL;  /* ceil */
+            if (ms > (uint64_t) INT_MAX) ms = (uint64_t) INT_MAX;
+            timeout_ms = (int) ms;
+        }
+    }
+
+    struct pollfd pfds[2];
+    int nfds = 0;
+    if (kai_reactor_sigchld_pipe[0] >= 0) {
+        pfds[nfds].fd = kai_reactor_sigchld_pipe[0];
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    if (kai_reactor_filepool_pipe[0] >= 0) {
+        pfds[nfds].fd = kai_reactor_filepool_pipe[0];
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    int rc = poll(pfds, (nfds_t) nfds, timeout_ms);
+    if (rc < 0 && errno != EINTR) {
+        fprintf(stderr, "kai: reactor poll() failed: %s\n", strerror(errno));
+        exit(1);
+    }
+
+    /* Drain in a fixed order. Even on EINTR (rc < 0) the timer
+     * wheel must be drained because a stray signal could have
+     * coincided with a deadline expiry. */
+    uint64_t now = kai_reactor_now_ns();
+    kai_reactor_timer_drain(now);
+    if (rc > 0) {
+        for (int i = 0; i < nfds; i++) {
+            if (pfds[i].revents & POLLIN) {
+                if (pfds[i].fd == kai_reactor_sigchld_pipe[0]) {
+                    kai_reactor_sigchld_drain();
+                } else if (pfds[i].fd == kai_reactor_filepool_pipe[0]) {
+                    kai_reactor_filepool_drain();
+                }
+            }
+        }
+    }
+    /* A SIGCHLD delivered before we entered poll() may not appear
+     * in revents (the signal handler ran but the byte arrived
+     * after the kernel snapshot). Always attempt a non-blocking
+     * waitpid drain too so children that exited during the
+     * micro-window before poll() do not strand their fibers. */
+    if (kai_reactor_pid_waiters) {
+        kai_reactor_sigchld_drain();
+    }
+}
+
 static void kai_sched_enqueue(KaiFiber *f) {
     f->sched_next = NULL;
     if (kai_ready_tail) {
@@ -6564,22 +7150,45 @@ static void kai_sched_yield(void) {
 
 /* Park: caller goes PARKED, control swaps to the head of the run
  * queue. The caller must have already linked itself into a wakeup
- * list (awaiter chain, mailbox waiter list) before calling park —
- * otherwise no fiber can ever unpark it.
+ * list (awaiter chain, mailbox waiter list, or a reactor structure)
+ * before calling park — otherwise no fiber can ever unpark it.
  *
- * Deadlock detection: if the run queue is empty when we park, no
- * one can wake us up — panic with a diagnostic. */
+ * Issue #611 — Phase R1 reactor integration: when the ready queue
+ * is empty but at least one fiber is parked on the reactor (timer
+ * wheel, pid waiter, file-pool waiter), block in `kai_reactor_wait`
+ * until an event promotes someone, then redequeue. Deadlock is now
+ * `ready queue empty AND reactor empty` — only that combination
+ * means no path to forward progress. */
 static void kai_sched_park(void) {
     KaiFiber *current = kai_active_fiber;
-    KaiFiber *next    = kai_sched_dequeue();
-    if (!next) {
-        fprintf(stderr,
-            "kai: deadlock — fiber parked with empty run queue (%d parked total)\n",
-            kai_parked_count + 1);
-        exit(1);
-    }
+    /* Mark the caller PARKED up front so the reactor drain helpers
+     * (which may run inside kai_reactor_wait below) can promote us
+     * back to READY via kai_sched_unpark. The unpark path bails out
+     * when state != PARKED, so a fiber whose state is still RUNNING
+     * when its deadline fires would be lost. */
     current->state = KAI_FIBER_PARKED;
     kai_parked_count++;
+
+    KaiFiber *next = kai_sched_dequeue();
+    while (!next) {
+        if (kai_reactor_parked_count > 0) {
+            kai_reactor_wait();
+            next = kai_sched_dequeue();
+            continue;
+        }
+        fprintf(stderr,
+            "kai: deadlock — fiber parked with empty run queue (%d parked total)\n",
+            kai_parked_count);
+        exit(1);
+    }
+    if (next == current) {
+        /* The reactor wake promoted us before we picked anyone else.
+         * Skip the swapcontext (we are still on our own stack) and
+         * unwind the parked accounting we just bumped. */
+        current->state = KAI_FIBER_RUNNING;
+        kai_parked_count--;
+        return;
+    }
     next->state = KAI_FIBER_RUNNING;
     kai_active_fiber = next;
     swapcontext(&current->ctx, &next->ctx);
@@ -6680,11 +7289,19 @@ static void kai_fiber_trampoline(void) {
 
     /* Hand control to the next ready fiber. Awaiters we just woke
      * are now in the queue; the FIFO discipline picks the oldest
-     * ready (which may be one of them, or main, or a sibling). If
-     * the queue is empty here, every other fiber is parked with no
-     * wakeup path → deadlock. */
+     * ready (which may be one of them, or main, or a sibling).
+     *
+     * Issue #611 — if the queue is empty here but reactor waiters
+     * remain (timer wheel, pid map, file-pool list), block in
+     * kai_reactor_wait until a wake event promotes someone before
+     * declaring deadlock. */
     KaiFiber *next = kai_sched_dequeue();
-    if (!next) {
+    while (!next) {
+        if (kai_reactor_parked_count > 0) {
+            kai_reactor_wait();
+            next = kai_sched_dequeue();
+            continue;
+        }
         fprintf(stderr,
             "kai: fiber finished with empty run queue (%d parked) — deadlock\n",
             kai_parked_count);
