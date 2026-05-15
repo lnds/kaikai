@@ -402,13 +402,13 @@ Unions are pure types. They have no effect-row component. No
 interaction with the effect system beyond being usable as the
 return type of an effectful function.
 
-### With `#derive`
+### With `#[derive(...)]`
 
-`#derive(Show)`, `#derive(Eq)`, etc. on a union: the compiler walks
+`#[derive(Show)]`, `#[derive(Eq)]`, etc. on a union: the compiler walks
 the components and verifies each has `impl P` reachable, then
 generates a synthetic impl for the union that pattern-matches.
 
-This is the same field-impl validation that `#derive` already does
+This is the same field-impl validation that `#[derive(...)]` already does
 for record fields and sum-type payloads, applied to union
 components.
 

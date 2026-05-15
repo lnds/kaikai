@@ -148,23 +148,23 @@ The edition contract pins every `pub` declaration in stdlib and in
 any downstream package that ships against an edition. That's the
 guarantee. But sometimes a package author wants to ship a new
 public API alongside a stable one and reserve the right to iterate
-on its signatures without an edition bump. The `#unstable`
+on its signatures without an edition bump. The `#[unstable]`
 annotation is the escape hatch (issue #602).
 
 ### Author side — marking a declaration
 
 ```kai
-#unstable
+#[unstable]
 pub fn from_stdin() : Source[String, Stdin + Spawn] / Spawn = ?from_stdin
 
-#unstable
+#[unstable]
 pub type Source[t, e] = { pid: Pid[Demand] }
 
-#unstable
+#[unstable]
 pub const DEFAULT_BUFFER_BYTES : Int = 4096
 ```
 
-`#unstable` precedes the `pub` keyword and is permitted on `pub fn`,
+`#[unstable]` precedes the `pub` keyword and is permitted on `pub fn`,
 `pub type`, `pub const`, `pub effect`, and `pub protocol`. Marking a
 non-`pub` declaration is rejected at parse time — there's no exposed
 surface to mark unstable.
@@ -184,7 +184,7 @@ ahu = true
 henua = true
 ```
 
-Importing a `#unstable` declaration **without** opt-in produces a
+Importing a `#[unstable]` declaration **without** opt-in produces a
 non-fatal warning at every call site:
 
 ```
@@ -201,7 +201,7 @@ consumed exactly as it would be otherwise — no codegen change.
 
 ### Why this is not "an edition for one decl"
 
-`#unstable` does NOT split the edition. The package still declares
+`#[unstable]` does NOT split the edition. The package still declares
 `edition = "anga-roa"`; only specific decls are excluded from the
 contract. This keeps Anga Roa shippable on 2026-05-21 with
 downstream packages (ahu, kohau, henua, the HTTP server) carrying
@@ -209,7 +209,7 @@ their as-yet-uncommitted public surface marked, while the language
 surface itself stays stable.
 
 When the author commits to an unstable decl, they remove the
-`#unstable` annotation in a `feat:` release. Downstream consumers
+`#[unstable]` annotation in a `feat:` release. Downstream consumers
 notice a missing warning, drop the `[unstable]` entry on their next
 clean-up, and the API is now under the edition contract.
 

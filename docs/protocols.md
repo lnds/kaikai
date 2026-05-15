@@ -2,7 +2,7 @@
 
 ## Status: Landed (m12.8)
 
-Stage 2 supports `protocol`, `impl`, and `#derive(...)` syntax with the
+Stage 2 supports `protocol`, `impl`, and `#[derive(...)]` syntax with the
 five stdlib protocols (`Show`, `Eq`, `Ord`, `Hash`, `Serialize`) defined
 in `stdlib/protocols.kai`. The compiler resolves dispatch at the AST
 level (between inference and monomorphisation), so each statically-typed
@@ -352,16 +352,16 @@ Use cases: accumulator initial values, generic record clearing
 missing), and the post-v1 `Array[T]` zero-fill helper. Auto-derive
 for user records is a separate feature and not part of v1.
 
-## Auto-derivation via `#derive` annotation
+## Auto-derivation via `#[derive(...)]` annotation
 
 For records and sum types whose fields all already have `impl P`, the
 user can derive trivially:
 
 ```kai
-#derive(Show, Eq, Hash, Ord)
+#[derive(Show, Eq, Hash, Ord)]
 type Account = { id: AccountId, balance: Decimal[USD], txs: Int }
 
-#derive(Show, Eq, Hash)
+#[derive(Show, Eq, Hash)]
 type Shape = Circle(Real) | Rect(Real, Real) | Empty_
 ```
 
@@ -376,19 +376,19 @@ The compiler generates the obvious structural impls:
   the derived `Hash`.
 
 The annotation is one of two `#`-prefixed meta-instructions
-currently recognised by the parser. The other is `#unstable`
+currently recognised by the parser. The other is `#[unstable]`
 (issue #602), which marks a `pub` declaration as outside the
 edition stability contract — see `docs/editions.md` for the
 opt-in workflow. Other annotations (`#deprecated`, etc.) live in
 their own whitelist per `proposed-extensions.md §27`.
 
-`#derive` is **opt-in**: if the user does not write the annotation, no
+`#[derive(...)]` is **opt-in**: if the user does not write the annotation, no
 impl is generated. This avoids surprising user-defined `impl Show for
 Account` getting shadowed by an auto-derived one.
 
-For sum types, `#derive(Eq)` and `#derive(Hash)` reject at compile
+For sum types, `#[derive(Eq)]` and `#[derive(Hash)]` reject at compile
 time when any variant carries a field whose head type lacks a
-reachable `impl P` (explicit `impl P for T`, another `#derive(P)`, or
+reachable `impl P` (explicit `impl P for T`, another `#[derive(P)]`, or
 a builtin from stdlib). The diagnostic names the variant and the
 offending field type. Records continue to fall through to the
 dispatcher's runtime panic for missing field impls; promoting that
@@ -404,7 +404,7 @@ to a compile-time error is left for a follow-up.
 | `Ord`  | ✓ | ✓ | lexicographic by declaration order; sums by variant position then payload |
 | `Serialize` | — | — | needs return-type-driven dispatch (post-v1) |
 
-### Order semantics for `#derive(Ord)`
+### Order semantics for `#[derive(Ord)]`
 
 Records compare lexicographically in declaration order: the first
 field whose `cmp` returns non-zero decides the result. Sum types
@@ -413,7 +413,7 @@ compare by **variant declaration position** first (variant 0 < variant
 by position. The synthesised `cmp` for
 
 ```kai
-#derive(Ord)
+#[derive(Ord)]
 type Tier = Bronze | Silver | Gold | Platinum
 ```
 
@@ -422,7 +422,7 @@ and `0` for `cmp(Platinum, Platinum)`. The same rule extends to
 variants with payload: `cmp(Circle(99), Square(0)) == -1` because
 `Circle` is declared before `Square`, regardless of the inner radius.
 
-`#derive(Ord)` is consistent with `#derive(Eq)`: when both are
+`#[derive(Ord)]` is consistent with `#[derive(Eq)]`: when both are
 derived (or `Eq` is hand-written to mirror the same field traversal),
 `cmp(a, b) == 0` ↔ `eq(a, b)`. The compiler does not enforce this
 across hand-written impls; users who derive only one of the two
@@ -430,19 +430,19 @@ should keep them in sync.
 
 ### Field-impl validation
 
-Before lowering a `#derive(Ord)` annotation, the compiler walks each
+Before lowering a `#[derive(Ord)]` annotation, the compiler walks each
 field (or variant payload) and confirms the head type appears either
-in a same-unit `impl Ord for T` or in another `#derive(Ord)`. Missing
+in a same-unit `impl Ord for T` or in another `#[derive(Ord)]`. Missing
 impls are rejected at typer time with a diagnostic naming both the
 offending field and its type, e.g.:
 
 ```
-foo.kai:7:1: error: cannot `#derive(Ord)` for `Tagged`: no `Ord`
+foo.kai:7:1: error: cannot `#[derive(Ord)]` for `Tagged`: no `Ord`
 impl for field `tag` of type `String` (declare `impl Ord for String`
-or `#derive(Ord)` on `String`)
+or `#[derive(Ord)]` on `String`)
 ```
 
-The same kind of validation runs for `#derive(Eq)` and `#derive(Hash)`
+The same kind of validation runs for `#[derive(Eq)]` and `#[derive(Hash)]`
 on sum types (m12.8.x); the gap remaining is records with `Show` /
 `Eq` / `Hash` annotations referencing missing field impls — those still
 fall through to the dispatcher's runtime `panic`. Tightening that
@@ -902,7 +902,7 @@ the path forward.
 | Typer: resolve protocol calls; substitute impl fn at monomorph | ~50 | reuses the existing monomorphization pass |
 | Codegen: emit vtable structs + lookup helpers | ~50 | C backend; LLVM mirror in m7c-style follow-up |
 | Stdlib: declare 5 protocols + impls for primitives | ~80 | Show/Eq/Ord/Hash/Serialize for Int/Real/Bool/Char/String/Unit/list/Option/Result |
-| `#derive` annotation: auto-generate structural impls | ~50 | walks record / sum type definition |
+| `#[derive(...)]` annotation: auto-generate structural impls | ~50 | walks record / sum type definition |
 | Tests + fixtures | ~80 | one fixture per protocol, positive + negative |
 | Doc updates: this file + CLAUDE.md clarification + proposed-extensions §28 | ~30 | + cross-refs |
 | **Total** | **~450 lines** | **~2-3 days at observed velocity** |
@@ -941,7 +941,7 @@ infrastructure plugs into a stable foundation. Lands as its own
 milestone with a fresh worktree.
 
 Cost: 2-3 days. Lower-bound for serious value: stdlib's 5 protocols
-ship with primitive impls, `#derive` works, demos can use `#{...}`
+ship with primitive impls, `#[derive(...)]` works, demos can use `#{...}`
 freely.
 
 ## Single-dispatch parametrized protocols (#180)
@@ -1019,7 +1019,7 @@ diagnostic.
 
 - Polymorphic impl in `a` (`impl[T] From[T] for X`) — issue #174.
 - Multi-method dispatch (`(P, T1, T2, ...) -> fn`) — Tier 1 #3 commit.
-- `#derive` synthesis for parametrised protocols — follow-up.
+- `#[derive(...)]` synthesis for parametrised protocols — follow-up.
 - Bidirectional inference beyond let-binding annotations (function
   return type, explicit type ascriptions on sub-expressions) —
   follow-up.
