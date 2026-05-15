@@ -1053,3 +1053,52 @@ returns the IEEE-754 remainder — `5.5 % 2.0 == 1.5`. NaN propagates
 on a zero divisor (`a % 0.0` is NaN, matching the rest of the libm
 surface from issue #343); inspect with `real_is_nan` at
 boundaries.
+
+### Pipe operators are convention-based, not protocol-based (#594)
+
+`|` (map pipe), `||` (flat-map pipe), and `|?` (filter pipe) do
+**not** dispatch through a protocol. Two of the structural rules
+this document enumerates make the protocol path unworkable for
+them, and a third makes the cost of a custom annotation surface
+strictly worse than convention:
+
+| Rule | Why pipes can't ride a protocol |
+|---|---|
+| **No HKT** (Tier 1 #3, "Fast compilation") | `map`'s shape is `F[A] -> (A -> B) -> F[B]` — the type constructor `F` is bound, not a concrete type. Single-dispatch protocols require a concrete `Self` in first position; they cannot abstract over the head constructor. |
+| **No effect rows in protocol ops** (§"With effects" rule above) | The function arg to `map` carries an effect row, and the row must propagate to `map`'s own row. Protocol op signatures are pinned to closed rows; the protocol ban on effect rows in op signatures rules out the canonical `map` shape. |
+| **Annotation surface vs convention** | A `#[pipe_dispatch]` annotation costs a parser change, a new visible concept for ~5 stdlib + future package decls, and a test surface. Convention is free at the parser, costs ~70 LOC inside the typer, and mirrors how qualified-name resolution already works for `EModCall`-driven calls. |
+
+Instead the typer keeps a per-compile **head-owner cache**:
+`[(head_type_name, [declaring_module])]`, built once from the
+post-`expand_imports` decl stream + module table. Any `pub type T`
+exported by a module whose `pub fn map / flat_map / filter` follow
+the canonical signatures participates in `|`, `||`, `|?`
+automatically — no annotation, no compiler change. ahu's future
+`Source[T, e]`, henua's `EventBus[E]`, manutara stream/sink types
+opt in by declaring `pub type` + the canonical fns.
+
+The canonical signatures (LHS receiver first, function/predicate
+second, return wraps the same head type):
+
+```kaikai
+pub fn map[A, B, e](xs: T[A], f: (A) -> B / e) : T[B] / e
+pub fn flat_map[A, B, e](xs: T[A], f: (A) -> T[B] / e) : T[B] / e
+pub fn filter[A, e](xs: T[A], p: (A) -> Bool / e) : T[A] / e
+```
+
+Diagnostic shape when conventions are violated (anchored at the
+user's pipe call site):
+
+| Cache state | Diagnostic |
+|---|---|
+| `HLNone` (no module declares the head) | `no module declaring type ` `T` ` is in scope` |
+| `HLOk(mod)` but no `mod::op` qualified entry | `module ` `mod` ` declares ` `T` ` but does not export ` `op` |
+| `HLAmbiguous([mod_a, mod_b])` | `ambiguous head type ` `T` ` — ` `mod_a` ` and ` `mod_b` ` all declare it. Use qualified type annotation.` |
+| `mod::op` exists but signature does not unify | standard call-inference signature mismatch (the same diagnostic the explicit `mod.op(xs, f)` form would produce) |
+
+Implementation: `build_head_owner_map` (`stage2/compiler.kai`) +
+`find_head_owner` (linear lookup on the small cache list) +
+`synth_pipe_dispatch` (the rewrite path). The seeded `List → list`
+entry preserves the pre-#594 dispatch surface for `[T] | f` —
+`core/list.kai` ships the canonical fns and the parser-stamped
+`TyListT` flows through the same code path as a user `pub type`.
