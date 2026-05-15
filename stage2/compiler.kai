@@ -20404,25 +20404,38 @@ fn append_char(acc: String, c: Char) : String = cat2(acc, "#{c}")
 # predicates. parse_optional_arm_refine references this name when
 # it sees `match { p : X -> ... }`; the resolver later binds the
 # call to this synthesised fn.
-fn synthesize_refine_pred_fns(decls: [Decl]) : [Decl] =
-  synth_refine_loop(decls, [])
+# Issue #597 boundary tagging: thread `target_mod` so each synthesised
+# `__ref_pred_X` inherits the home module of the originating `DType`.
+# `DType` carries no `module_origin` field of its own, so the home is
+# recovered by streaming through `decl_home_hint_reset` (same algorithm
+# `validate_pub_access` uses for non-DFn decls). A refinement alias
+# declared in `stdlib/foo.kai` now produces `__ref_pred_X` tagged with
+# `mo = Some("foo")` instead of mixing into the root file's untagged
+# decl set; root-file refinements still produce `mo = None`.
+fn synthesize_refine_pred_fns(decls: [Decl], target_mod: String) : [Decl] =
+  synth_refine_loop(decls, target_mod, target_mod, [])
 
-fn synth_refine_loop(decls: [Decl], acc: [Decl]) : [Decl] {
+fn synth_refine_loop(decls: [Decl], target_mod: String, cur_mod: String,
+                       acc: [Decl]) : [Decl] {
   match decls {
     [] -> list_reverse(acc)
     [d, ...rest] -> {
-      let extra = synth_refine_for_decl(d)
+      let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
+      let parent_mo =
+        if next_mod == target_mod { None } else { Some(next_mod) }
+      let extra = synth_refine_for_decl(d, parent_mo)
       let acc1 = list_append(extra, [d, ...acc])
-      synth_refine_loop(rest, acc1)
+      synth_refine_loop(rest, target_mod, next_mod, acc1)
     }
   }
 }
 
-fn synth_refine_for_decl(d: Decl) : [Decl] {
+fn synth_refine_for_decl(d: Decl, parent_mo: Option[String]) : [Decl] {
   match d {
     DType(_, name, _, body, l, c) -> match body {
       TBAlias(t) -> match t.tkind {
-        TyRefine(base, pred) -> [build_refine_pred_fn(name, base, pred, l, c)]
+        TyRefine(base, pred) ->
+          [build_refine_pred_fn(name, base, pred, l, c, parent_mo)]
         _ -> []
       }
       _ -> []
@@ -20432,13 +20445,13 @@ fn synth_refine_for_decl(d: Decl) : [Decl] {
 }
 
 fn build_refine_pred_fn(tyname: String, base: TypeExpr, pred: Expr,
-                          l: Int, c: Int) : Decl {
+                          l: Int, c: Int, mo: Option[String]) : Decl {
   let fn_name = synth_refine_pred_fn_name(tyname)
   let self_param = Param { pname: "self", ptype: Some(base),
                             pline: l, pcol: c }
   let ret_ty = mk_ty(TyName("Bool", []), l, c)
   let dfn = DFn(false, fn_name, [], [self_param], Some(ret_ty),
-                 REmpty, pred, l, c, None)
+                 REmpty, pred, l, c, mo)
   DAttribPure(dfn, l, c)
 }
 
@@ -50693,11 +50706,20 @@ type ProtoImplReg = PIR(String, String, String, String, [String])
 # for each `Ai` parameter at the impl-site. Empty list means
 # legacy un-parametrised `impl P for X` (treated as `Ai = Self`).
 
+# Issue #597 boundary tagging: each protocol's home module recovered
+# by streaming through `decl_home_hint_reset` (DProtocol carries no
+# `module_origin` field today). `generate_dispatchers` looks up the
+# proto's tag here so every synthesised dispatcher inherits the same
+# `mo` the original protocol's prelude file would carry.
+type ProtoOriginReg = PrOR(String, Option[String])
+#                          proto   module_origin
+
 type ProtocolReg = { ops: [ProtoOpReg], impls: [ProtoImplReg],
-                      op_names: [String], tparams: [ProtoTPReg] }
+                      op_names: [String], tparams: [ProtoTPReg],
+                      origins: [ProtoOriginReg] }
 
 fn proto_reg_empty() : ProtocolReg =
-  ProtocolReg { ops: [], impls: [], op_names: [], tparams: [] }
+  ProtocolReg { ops: [], impls: [], op_names: [], tparams: [], origins: [] }
 
 # m12.8: the type-mangling used in the impl-fn name. Walks a
 # TypeExpr, collapsing it down to the head TyName (so `Money[u]`,
@@ -50762,19 +50784,36 @@ fn proto_dispatcher_name(op: String) : String = concat_all(["__proto_", op])
 # Register every DProtocol decl the program declares. The op list
 # becomes the universe of "names that look like ordinary fn calls but
 # really need protocol dispatch".
-fn collect_proto_decls(ds: [Decl], reg: ProtocolReg) : ProtocolReg {
+#
+# Issue #597 boundary tagging: thread `cur_mod` through the walk so
+# each registered DProtocol records its home module. DProtocol carries
+# no `module_origin` field of its own (v1 of #510 only added the field
+# to DFn), so we recover the home by streaming through the same
+# `decl_home_hint_reset` algorithm `validate_pub_access` uses. The
+# result `proto_origins` table feeds `make_dispatcher_fn` so each
+# synthesised dispatcher inherits the originating module's tag.
+fn collect_proto_decls(ds: [Decl], reg: ProtocolReg,
+                        target_mod: String, cur_mod: String) : ProtocolReg {
   match ds {
     [] -> reg
-    [d, ...rest] -> match d {
-      DProtocol(_, name, tparams, ops, _, _) -> {
-        let reg1 = ProtocolReg {
-          ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
-          tparams: [PTPR(name, tparams), ...reg.tparams]
+    [d, ...rest] -> {
+      let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
+      match d {
+        DProtocol(_, name, tparams, ops, _, _) -> {
+          let proto_mo =
+            if next_mod == target_mod { None } else { Some(next_mod) }
+          let reg1 = ProtocolReg {
+            ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
+            tparams: [PTPR(name, tparams), ...reg.tparams],
+            origins: [PrOR(name, proto_mo), ...reg.origins]
+          }
+          collect_proto_decls(rest, register_proto_ops(reg1, name, ops),
+                                target_mod, next_mod)
         }
-        collect_proto_decls(rest, register_proto_ops(reg1, name, ops))
+        DDerive(_, inner, _, _) ->
+          collect_proto_decls([inner, ...rest], reg, target_mod, cur_mod)
+        _ -> collect_proto_decls(rest, reg, target_mod, next_mod)
       }
-      DDerive(_, inner, _, _) -> collect_proto_decls([inner, ...rest], reg)
-      _ -> collect_proto_decls(rest, reg)
     }
   }
 }
@@ -50792,10 +50831,24 @@ fn register_proto_ops(reg: ProtocolReg, proto: String, ops: [ProtoOp]) : Protoco
           ops: [entry, ...reg.ops],
           impls: reg.impls,
           op_names: names1,
-          tparams: reg.tparams
+          tparams: reg.tparams,
+          origins: reg.origins
         }
         register_proto_ops(reg1, proto, rest)
       }
+    }
+  }
+}
+
+# Issue #597: lookup a protocol's home module in the registry. Returns
+# `None` for root-file protocols (so the synthesised dispatcher stays
+# `mo = None`, matching the rest of the root file's untagged decls) or
+# `Some(mod)` for protocols imported from a prelude / module.
+fn proto_origin_lookup(origins: [ProtoOriginReg], proto: String) : Option[String] {
+  match origins {
+    [] -> None
+    [h, ...rest] -> match h {
+      PrOR(p, mo) -> if p == proto { mo } else { proto_origin_lookup(rest, proto) }
     }
   }
 }
@@ -51301,7 +51354,8 @@ fn lower_impl_methods(pname: String, tname: String, arg_names: [String],
           ops: reg.ops,
           impls: [entry, ...reg.impls],
           op_names: reg.op_names,
-          tparams: reg.tparams
+          tparams: reg.tparams,
+          origins: reg.origins
         }
         lower_impl_methods(pname, tname, arg_names, rest, reg1, [new_fn, ...acc_fns])
       }
@@ -51314,19 +51368,29 @@ fn lower_impl_methods(pname: String, tname: String, arg_names: [String],
 # and typer can treat `op(x, ...)` as a regular polymorphic call.
 # The body panics; the post-inference rewrite redirects every reach-
 # able call to the matching `__pimpl_*` function.
+#
+# Issue #597 boundary tagging: each dispatcher inherits the home
+# module of the originating DProtocol via `reg.origins`. Root-file
+# protocols still resolve to `mo = None`, so root-file selfhost
+# stays byte-identical. Prelude protocols (the common case in
+# `stdlib/protocols.kai`) now produce dispatchers tagged with the
+# prelude's basename so a cache loader can partition post-cascade
+# decls back into their original prelude/user segments.
 fn generate_dispatchers(reg: ProtocolReg) : [Decl] =
-  generate_dispatchers_loop(reg.ops, [])
+  generate_dispatchers_loop(reg.ops, reg.origins, [])
 
-fn generate_dispatchers_loop(ops: [ProtoOpReg], acc: [Decl]) : [Decl] {
+fn generate_dispatchers_loop(ops: [ProtoOpReg], origins: [ProtoOriginReg],
+                                acc: [Decl]) : [Decl] {
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
       POR(pname, opname, params, ret, line, col) -> {
         let already = dispatcher_in_acc(acc, opname)
-        if already { generate_dispatchers_loop(rest, acc) }
+        if already { generate_dispatchers_loop(rest, origins, acc) }
         else {
-          let stub = make_dispatcher_fn(pname, opname, params, ret, line, col)
-          generate_dispatchers_loop(rest, [stub, ...acc])
+          let mo = proto_origin_lookup(origins, pname)
+          let stub = make_dispatcher_fn(pname, opname, params, ret, line, col, mo)
+          generate_dispatchers_loop(rest, origins, [stub, ...acc])
         }
       }
     }
@@ -51346,12 +51410,13 @@ fn dispatcher_in_acc(ds: [Decl], target: String) : Bool {
 }
 
 fn make_dispatcher_fn(pname: String, opname: String, params: [Param],
-                       ret: TypeExpr, line: Int, col: Int) : Decl {
+                       ret: TypeExpr, line: Int, col: Int,
+                       mo: Option[String]) : Decl {
   let new_params = map(params, dispatcher_substitute_self_param)
   let new_ret = substitute_self_in_type(ret)
   let body = make_dispatcher_body(pname, opname, new_ret, line, col)
   DFn(true, proto_dispatcher_name(opname), [], new_params, Some(new_ret),
-      REmpty, body, line, col, None)
+      REmpty, body, line, col, mo)
 }
 
 # Synthesises a body that *typechecks* with the declared return type
@@ -53174,7 +53239,8 @@ fn validate_derive_ord_one(file: String, tname: String, fname: String,
 # threaded ProtocolReg the post-inference rewrite consumes.
 type LoweredProtocols = { decls: [Decl], reg: ProtocolReg, errs: Int }
 
-fn lower_protocols(decls: [Decl], file: String) : LoweredProtocols / Console {
+fn lower_protocols(decls: [Decl], file: String,
+                     target_mod: String) : LoweredProtocols / Console {
 
   # Step 0 — m12.8.x: validate `#derive(Eq/Hash)` on sum types: every
   # variant field's head type must already have an impl reachable in
@@ -53201,7 +53267,13 @@ fn lower_protocols(decls: [Decl], file: String) : LoweredProtocols / Console {
   let local_types = collect_local_type_names(expanded, [])
   let coh_errs = validate_impls(expanded, file, proto_names, local_types)
   # Step 3 — collect every protocol op into the registry.
-  let reg0 = collect_proto_decls(expanded, proto_reg_empty())
+  # Issue #597 boundary tagging: thread `target_mod` so each
+  # DProtocol's home module is recorded in `reg.origins`; the
+  # streaming `decl_home_hint_reset` algorithm recovers the home
+  # from the surrounding DFn tags (DProtocol carries no `mo` field
+  # of its own).
+  let reg0 = collect_proto_decls(expanded, proto_reg_empty(),
+                                    target_mod, target_mod)
   # Step 3b — issue #535: validate each impl block against its
   # protocol's declared operations (missing methods, wrong arity,
   # head-name signature mismatch). Runs after the registry is built so
@@ -56478,6 +56550,69 @@ fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
   _ -> d
 }
 
+# Issue #597 boundary tagging: partition a post-cascade `[Decl]` stream
+# back into the (prelude_decls, user_decls) segments a cache loader
+# needs. The post-cascade stream is positionally `[user_renamed,
+# impl_renamed, dispatchers]` (per `lower_protocols`'s final concat at
+# line 53295) with synthesised refinement-predicate fns interleaved
+# inline at their declaring DType's position; the positional boundary
+# between prelude and user decls is destroyed there. This function
+# rebuilds the partition by inspecting each decl's `module_origin`:
+#
+# - Decls whose home is one of `prelude_mods` go to `prelude_decls`.
+# - Decls whose home is `None` (root-file) OR not in `prelude_mods`
+#   (an imported user module) go to `user_decls`.
+#
+# After every synthesis site in the cascade now propagates
+# `module_origin` (issue #597 — `make_dispatcher_fn`,
+# `build_refine_pred_fn`, plus the load-time `tag_decl_module_origin`
+# pre-lowering of DConst / DAxiom), this partition is exhaustive: no
+# post-cascade decl is in an indeterminate state.
+type PartitionedDecls = { prelude_decls: [Decl], user_decls: [Decl] }
+
+fn partition_decls_by_origin(decls: [Decl],
+                                prelude_mods: [String]) : PartitionedDecls = {
+  let acc = partition_decls_loop(decls, prelude_mods, [], [])
+  PartitionedDecls { prelude_decls: list_reverse(acc.prelude_decls),
+                      user_decls: list_reverse(acc.user_decls) }
+}
+
+# Internal accumulator carries the partition in reverse-source order
+# so each `[h, ...acc]` cons is `O(1)`; `partition_decls_by_origin`
+# reverses both lists once at the boundary.
+type PartitionAcc = { prelude_decls: [Decl], user_decls: [Decl] }
+
+fn partition_decls_loop(decls: [Decl], prelude_mods: [String],
+                          p_acc: [Decl], u_acc: [Decl]) : PartitionAcc =
+  match decls {
+    [] -> PartitionAcc { prelude_decls: p_acc, user_decls: u_acc }
+    [d, ...rest] -> {
+      let home = decl_partition_home(d)
+      let is_prelude = match home {
+        Some(m) -> list_has(prelude_mods, m)
+        None    -> false
+      }
+      if is_prelude {
+        partition_decls_loop(rest, prelude_mods, [d, ...p_acc], u_acc)
+      } else {
+        partition_decls_loop(rest, prelude_mods, p_acc, [d, ...u_acc])
+      }
+    }
+  }
+
+# Recover a decl's home module for partitioning. Reads `mo` from the
+# decl variants that carry it (DFn, DAttribPure(DFn), DDerive(DFn),
+# DImpl through its first method); returns None for decls that have
+# no `module_origin` of their own — which, after the issue #597
+# cascade tagging, only happens for root-file decls.
+fn decl_partition_home(d: Decl) : Option[String] = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo)   -> mo
+  DAttribPure(inner, _, _)             -> decl_partition_home(inner)
+  DDerive(_, inner, _, _)              -> decl_partition_home(inner)
+  DImpl(_, _, _, sub_decls, _, _)      -> impl_first_fn_home(sub_decls)
+  _                                    -> None
+}
+
 # Issue #230: tag the target file's PUB DFns with the target's
 # basename — the same way `tag_decls_module_origin` tags every DFn in
 # a prelude, but restricted to the public surface. Three carve-outs:
@@ -58893,7 +59028,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # emits an ECall to this name). Runs before
             # extract_pure_names_decls so the synthesised fns'
             # DAttribPure wrappers are picked up too.
-            let merged_raw_synth0 = synthesize_refine_pred_fns(merged_raw)
+            let merged_raw_synth0 = synthesize_refine_pred_fns(merged_raw, target_mod_name)
             # issue #187 phase 3: rewrite `PNarrow(name, T)` where
             # `T` is a refinement-type alias back into
             # `PBind(name)` + `__ref_pred_T(name)` guard so m12.6.x
@@ -59005,7 +59140,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # top-level fns + a registry the post-inference rewrite
             # consumes. The registry-driven dispatch resolution runs
             # later, after `infer_program` populates `Expr.ty`.
-            let lowered = lower_protocols(post_use_decls, path)
+            let lowered = lower_protocols(post_use_decls, path, target_mod_name)
             # m12.8.x phase 2 (Bug 4): lift `#{x}` interp parts into
             # `string_concat_all([..., show(x), ...])` so the typer +
             # protocol-call rewrite see them. Conditional on `Show`
