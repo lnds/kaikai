@@ -25372,13 +25372,35 @@ type UnionInfo = UI(String, [Ty], Int, Int)
 # `unions` is the typer-side authority for "which types compose this
 # union?" — needed once #197 stops registering shadow components
 # under their nominal name.
-type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo] }
+# Issue #594: per-compile cache `head_owners` records the (head_type
+# → declaring_module) mapping the typer consults when lowering a
+# convention-based pipe (`|`, `||`, `|?`). Each `HeadOwnerEntry` carries
+# the modules that declare a `pub type T` so a second-pass dispatch
+# lookup can answer "module that owns `T`'s `map`/`flat_map`/`filter`"
+# in O(1) per pipe call site without re-scanning the decl stream.
+# When `head_owners` lists more than one module for the same `T` the
+# typer reports an unambiguous diagnostic at the use site instead of
+# silently picking a winner. The list is built once per compile by
+# `build_head_owner_map` and stays empty for typer entry points that
+# do not run inside `compile_source` (test helpers, `dump_typed`, etc.)
+# — those paths have no module table to consult, so the only head a
+# pipe could resolve against is the prelude-loaded `List`, which their
+# fixtures already exercise via the standard prelude path.
+type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
+               head_owners: [HeadOwnerEntry] }
 
-fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [] }
+# Issue #594: head-owner cache entry. `head` is the bare type name
+# (`List`, `MyBox`, ...); `mods` is the list of modules whose
+# `pub type` declarations introduce this name. Single-element `mods`
+# is the dispatchable case; multi-element is ambiguous and the typer
+# diagnostic asks the user to qualify the LHS.
+type HeadOwnerEntry = HOE(String, [String])
+
+fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], head_owners: [] }
 
 fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv =
   TyEnv { entries: [TyEntry { name: name, scheme: sc }, ...env.entries],
-          fresh: env.fresh, unions: env.unions }
+          fresh: env.fresh, unions: env.unions, head_owners: env.head_owners }
 
 # Issue #219: composite key for module-qualified scheme entries.
 # When the same bare `fname` is exported from two prelude modules
@@ -25766,7 +25788,7 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "bit_clear",  scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
     TyEntry { name: "bit_toggle", scheme: mono(fn_ty([TyInt, TyInt], TyInt)) }
   ]
-  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh, unions: env.unions }
+  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh, unions: env.unions, head_owners: env.head_owners }
 }
 
 # ---- built-in variant constructors ----
@@ -25780,7 +25802,7 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "Ok",   scheme: scheme([0, 1], fn_ty([tv(1)], TyCon("Result", [tv(0), tv(1)]))) },
     TyEntry { name: "Err",  scheme: scheme([0, 1], fn_ty([tv(0)], TyCon("Result", [tv(0), tv(1)]))) }
   ]
-  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh, unions: env.unions }
+  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh, unions: env.unions, head_owners: env.head_owners }
 }
 
 # ---- user-defined signatures ----
@@ -27559,7 +27581,8 @@ fn build_ty_env_seed() : BuiltEnv {
 fn build_ty_env_module(seed: BuiltEnv, decls: [Decl],
                         unions: [UnionInfo], top_names: [String]) : BuiltEnv {
   let env_with_unions = TyEnv {
-    entries: seed.env.entries, fresh: seed.env.fresh, unions: unions
+    entries: seed.env.entries, fresh: seed.env.fresh, unions: unions,
+    head_owners: seed.env.head_owners
   }
   let r = add_decls_loop(env_with_unions, seed.op_eff_arities, decls, top_names)
   BuiltEnv { env: r.env, prelude_len: seed.prelude_len,
@@ -27584,7 +27607,8 @@ fn build_ty_env_inherited(seed: BuiltEnv, inherited: ModuleEnvDelta,
                             top_names: [String]) : BuiltEnv {
   let seeded_entries = list_append(inherited.ty_entries, seed.env.entries)
   let env_in = TyEnv {
-    entries: seeded_entries, fresh: seed.env.fresh, unions: unions
+    entries: seeded_entries, fresh: seed.env.fresh, unions: unions,
+    head_owners: seed.env.head_owners
   }
   let ar_in = list_append(inherited.op_eff_arities, seed.op_eff_arities)
   let r = add_decls_loop(env_in, ar_in, decls, top_names)
@@ -28926,7 +28950,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] {
 # id. The env's `fresh` counter advances by one per bound var.
 
 fn fresh_var(env: TyEnv) : TyEnv =
-  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions }
+  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, head_owners: env.head_owners }
 
 fn advance_fresh(env: TyEnv, n: Int) : TyEnv =
   if n <= 0 { env } else { advance_fresh(fresh_var(env), n - 1) }
@@ -28963,7 +28987,7 @@ fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if env.fresh >= need { env.fresh } else { need }
-      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions }
+      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, head_owners: env.head_owners }
       let sub = mk_fresh_subst(vars, start)
       Instantiated { env: env1, ty: apply_ty(sub, body) }
     }
@@ -30150,7 +30174,7 @@ fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes {
 fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
   InferState {
     file: outer.file,
-    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions },
+    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, head_owners: outer.env.head_owners },
     prelude_len: outer.prelude_len,
     sub: inner.sub,
     recs: inner.recs,
@@ -32750,33 +32774,201 @@ fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Infer
   mk_inferred(res.st, res.ty, root)
 }
 
-# issue #201: head-type-to-module map.
+# Issue #594: head-owner cache.
 #
-# The map is one-to-one: each head type name resolves to at most one
-# module that owns its `map` / `flat_map` implementations. v1 ships
-# only the builtin `List → list` entry because `[T]` is the only
-# container type with both `map` and `flat_map` in the standard
-# library today. ahu's future `Stream[T]` participates by adding a
-# second entry (and a `pub fn map` / `pub fn flat_map` in the
-# `ahu/stream.kai` module) — no compiler change required beyond the
-# table extension.
+# `synth_pipe_dispatch` rewrites `xs | f`, `xs || f`, and `xs |? p`
+# into a qualified call against the module that owns the LHS's head
+# type — `List → list.map`, `MyBox → mypkg.mybox.map`, etc.
 #
-# The lookup returns:
-#   * `Some(module_name)` when the head type is dispatch-eligible.
-#   * `None` for `Option` / `Result` (Constraint #1, rejected with a
-#     dedicated diagnostic pointing at `!` and `option.and_then` /
-#     `result.and_then`).
-#   * `None` for any other head name (Constraint #2 — the type opted
-#     out by not exporting `map` / `flat_map` in a registered module).
+# Pre-#594 this was a hardcoded `if head == "List" { Some("list") }`
+# table that knew exactly one entry. That made any downstream package
+# wishing to participate in `|` (ahu.stream.Source[T], henua.EventBus,
+# manutara stream/sink types, …) require a recompile of `kaic2`.
+# Unacceptable for a downstream-package ecosystem.
 #
-# A `None` return at the call site is the typer's signal to issue
-# the right error and stamp `TyAny`. The map is queried twice per
-# pipe call site (once for `head_module_for` and once via the
-# `ty_env_lookup` for the operation), so keeping it tiny matters.
-fn head_module_for(head: String) : Option[String] {
-  if head == "List" { Some("list") }
-  else { None }
+# Why convention beats annotation/protocol here:
+#   * Operator protocols (`+`-style) require the op's signature to fit
+#     `(Self, X) -> Y` shapes a protocol can express. `map`'s shape is
+#     `F[A] -> (A -> B) -> F[B]` — higher-kinded. CLAUDE.md bans HKT in
+#     the typer; protocols cannot express it.
+#   * Effect rows in operator-protocol ops are also banned, but `map`
+#     against an effectful function carries the function's effect row
+#     into its own signature — protocols would have to admit row-poly
+#     ops, which they don't.
+#   * Annotations (`#pipe_dispatch`) cost a parser change and a new
+#     visible concept for ~5 stdlib + future package decls. Convention
+#     is free at the surface, costs ~70 LOC inside the compiler, and
+#     mirrors how qualified-name resolution already works for
+#     `EModCall`-driven calls.
+#
+# The cache shape: `[HOE(head_name, [module_path])]`. A single-element
+# `module_path` list is the dispatchable case; a multi-element list is
+# ambiguous and the typer reports the modules at the use site so the
+# user can pick `mod.T` annotation or rename one of the conflicting
+# `pub type T` declarations.
+#
+# Canonical signatures package authors must follow for their `pub type T`
+# to participate in `|` / `||` / `|?` (the LHS receiver is always the
+# first argument; the function/predicate is second; the return wraps
+# the same head type):
+#
+#   pub fn map[A, B, e](xs: T[A], f: (A) -> B / e) : T[B] / e
+#   pub fn flat_map[A, B, e](xs: T[A], f: (A) -> T[B] / e) : T[B] / e
+#   pub fn filter[A, e](xs: T[A], p: (A) -> Bool / e) : T[A] / e
+#
+# A package that exports `pub type T` but ships `map` with a swapped
+# argument order, missing row var, or extra parameter still surfaces
+# the standard call-inference signature mismatch (issue 594 fixture
+# `pipe_wrong_signature`) — the typer does not need a separate
+# diagnostic for "your map shape is wrong".
+#
+# Construction: linear over `(decls, modules)`, called once per
+# `compile_source` invocation right before `infer_program_with_protos`
+# runs the typer over the same decl stream. Lookup at each pipe call
+# site is `find_head_owner` walking the cache; it is a small linear
+# list (one entry per `pub type` across all modules in scope) and the
+# constant-factor cost dominates over a hash map until the program
+# crosses ~hundreds of pub types — hello-world programs sit at <50.
+
+# Result of `find_head_owner` lookup. Distinguishing the three states
+# at the use site lets the typer print the four #594 error texts
+# verbatim (missing module, missing op, ambiguous, signature mismatch
+# falls through to the standard call-inference path).
+type HeadLookup
+  = HLOk(String)
+  # Two or more modules declare `pub type Head`. The user must
+  # disambiguate via a qualified annotation on the LHS.
+  | HLAmbiguous([String])
+  | HLNone
+
+fn find_head_owner_loop(es: [HeadOwnerEntry], head: String) : HeadLookup {
+  match es {
+    [] -> HLNone
+    [e, ...rest] -> match e {
+      HOE(name, mods) ->
+        if name == head {
+          match mods {
+            [m]      -> HLOk(m)
+            [_, _, ...] -> HLAmbiguous(mods)
+            _        -> HLNone
+          }
+        } else { find_head_owner_loop(rest, head) }
+    }
+  }
 }
+
+fn find_head_owner(env: TyEnv, head: String) : HeadLookup =
+  find_head_owner_loop(env.head_owners, head)
+
+# Build the head-owner cache from a `[Decl]` post-`expand_imports`
+# stream paired with the module table the import resolver collected.
+# For each `pub type T`, find the module(s) that export `T` (i.e. the
+# `ModuleEntry` whose `exports` list contains the type name). Folding
+# the same `T` from two modules produces a multi-element entry so the
+# lookup can report ambiguity at the use site instead of silently
+# picking the first definer.
+#
+# `pub type T` declared in the root file (not associated with any
+# module entry) intentionally does NOT participate in pipe dispatch.
+# Pipes against root-file types fall through to the "no module
+# declaring type" diagnostic — which is the correct behaviour, since
+# the root file has no qualified surface that a pipe rewrite can
+# target. The user can extract the type into a module if they want
+# pipes to dispatch against it.
+fn build_head_owner_map(decls: [Decl], modules: [ModuleEntry],
+                         target_mod: String) : [HeadOwnerEntry] {
+  let pub_type_names = collect_pub_type_names(decls, [])
+  # Filter out the target file's ME from the dispatch search. The
+  # target ME's `exports` list is built over the post-`expand_imports`
+  # decl stream, which transitively includes every imported module's
+  # decls — so a `pub type T` exported by an imported module appears
+  # in BOTH the imported module's ME and the target ME. Without this
+  # filter every imported `pub type` would surface as ambiguously
+  # declared by `(<owning_module>, <target_basename>)`. Filtering by
+  # name preserves the cache's invariant that each entry's `mods`
+  # list contains only modules that genuinely own the `pub type`
+  # declaration. Pipes against `pub type` declared in the root file
+  # are intentionally not dispatchable — the rejection diagnostic
+  # ("no module declaring type `T` is in scope") is the design.
+  let modules_filtered = filter_out_target(modules, target_mod, [])
+  let from_decls = build_head_owner_loop(pub_type_names, modules_filtered, [])
+  # Issue #594: `List` is a built-in head with no `pub type List`
+  # declaration in any user-visible module — the parser stamps `[T]`
+  # syntax directly to `TyListT`, and `core/list.kai` carries the
+  # canonical `pub fn map / flat_map / filter` against it. Register
+  # the `List → list` mapping unconditionally so the cache mirrors
+  # what the pre-#594 hardcoded `head_module_for` returned for the
+  # only entry it knew. The dispatch site falls back to a bare-name
+  # callee (`EVar("map")`) when `list::map` is not registered in the
+  # qualified env — the test-sugars harness exercises this path by
+  # invoking `kaic2` against `[1..6] |? p` without
+  # `--prelude core/list.kai`, relying on the runtime
+  # `kai_prelude_map` / `kai_prelude_filter` stubs.
+  [HOE("List", ["list"]), ...from_decls]
+}
+
+fn collect_pub_type_names(ds: [Decl], acc: [String]) : [String] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> collect_pub_type_names(rest, collect_pub_type_name_one(d, acc))
+  }
+}
+
+fn collect_pub_type_name_one(d: Decl, acc: [String]) : [String] = match d {
+  DType(true, name, _, _, _, _) ->
+    if list_has(acc, name) { acc } else { [name, ...acc] }
+  DDerive(_, inner, _, _) -> collect_pub_type_name_one(inner, acc)
+  DUnstable(inner, _, _) -> collect_pub_type_name_one(inner, acc)
+  _ -> acc
+}
+
+fn build_head_owner_loop(names: [String], modules: [ModuleEntry],
+                          acc: [HeadOwnerEntry]) : [HeadOwnerEntry] {
+  match names {
+    [] -> acc
+    [n, ...rest] -> {
+      let mods = modules_declaring_type(modules, n, [])
+      match mods {
+        [] -> build_head_owner_loop(rest, modules, acc)
+        _  -> build_head_owner_loop(rest, modules, [HOE(n, mods), ...acc])
+      }
+    }
+  }
+}
+
+fn filter_out_target(modules: [ModuleEntry], target: String,
+                      acc: [ModuleEntry]) : [ModuleEntry] {
+  match modules {
+    [] -> list_reverse(acc)
+    [me, ...rest] -> match me {
+      ME(mn, _, _, _) ->
+        if mn == target { filter_out_target(rest, target, acc) }
+        else { filter_out_target(rest, target, [me, ...acc]) }
+    }
+  }
+}
+
+fn modules_declaring_type(modules: [ModuleEntry], head: String,
+                          acc: [String]) : [String] {
+  match modules {
+    [] -> list_reverse(acc)
+    [me, ...rest] -> match me {
+      ME(mn, exports, _, _) ->
+        if list_has(exports, head) {
+          modules_declaring_type(rest, head, [mn, ...acc])
+        } else {
+          modules_declaring_type(rest, head, acc)
+        }
+    }
+  }
+}
+
+# Attach a freshly-built head-owner cache to a `TyEnv`, preserving
+# the rest of the env. Called once per compile from `compile_source`
+# right before the typer runs.
+fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
+  TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions,
+          head_owners: hos }
 
 # issue #201 Constraint #1: explicit, typed rejection for the
 # `Option` / `Result` heads. Returns `Some(diagnostic)` for the
@@ -32798,14 +32990,30 @@ fn pipe_rejection_reason(head: String, op: String) : Option[String] {
   }
 }
 
-# issue #201: shared lowering for `EMapPipe` and `EFlatMapPipe`.
-# Resolves the LHS's head type, dispatches via `head_module_for`,
-# rewrites to `<module>.<op>(lhs, f)`, and runs the standard call
-# inference path (`synth_call` against an `EModCall` callee — same
-# arms the explicit `list.map(xs, f)` qualified-call form uses).
+# issue #201 + #594: shared lowering for `EMapPipe` / `EFlatMapPipe` /
+# `EFilterPipe`. Resolves the LHS's head type, consults the head-owner
+# cache built once per compile from the module table, rewrites to
+# `<module>.<op>(lhs, f)` when the lookup is unambiguous, and runs the
+# standard call inference path (`synth_call` against an `EModCall`
+# callee — same arms the explicit `list.map(xs, f)` qualified-call
+# form uses).
 #
 # Errors stamp `TyAny` and bump `st.errs` so cascade is graceful and
 # downstream passes don't crash on a missing pipe lowering.
+#
+# Issue #594 diagnostic shape — the four error textual forms anchor on
+# the user's pipe-call site and stay verbatim across releases so LSP
+# clients can match them:
+#   * "no module declaring type `T` is in scope" (HLNone after the
+#      cache lookup), and
+#   * "module `mod.path` declares `T` but does not export `op`"
+#     (HLOk(mod) but the qualified `mod::op` entry is missing — the
+#     module ships the type but not the canonical fn), and
+#   * "ambiguous head type `T` — `mod_a` and `mod_b` both declare it.
+#     Use qualified type annotation." (HLAmbiguous), and
+#   * the standard call-inference signature mismatch (when `mod::op`
+#     exists but its declared shape does not unify with the pipe's
+#     expected `(T[A], (A) -> ...) -> T[B]`).
 fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
                         line: Int, col: Int) : Inferred / Console + File {
 
@@ -32827,38 +33035,65 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
         let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
         mk_inferred(st_bump_err(rl.st), TyAny, root)
       }
-      None -> match head_module_for(head) {
-        None -> {
+      None -> match find_head_owner(rl.st.env, head) {
+        HLNone -> {
           diag_error(rl.st.file, line, col,
-            concat_all(["no `", op, "` registered for head type `", head,
-              "`. The head type's module must export `pub fn ", op,
-              "` with the canonical signature for `", op, "`-pipe to dispatch."]))
+            concat_all(["no module declaring type `", head, "` is in scope"]))
           let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
           mk_inferred(st_bump_err(rl.st), TyAny, root)
         }
-        Some(module_name) -> {
-          # Issue #235: emit an `EModCall(module_name, op)` callee
-          # so the resolution is module-direct rather than going
-          # through bare-name lookup (which picks the newest
-          # registered `map`/`flat_map` — option's, list's, or
-          # result's — by load order rather than receiver type).
-          # The qualified-call typer arm (`EModCall` in `synth`)
-          # consults `<module>::<op>` first and falls back to bare
-          # only when no qualified entry exists.
-          #
-          # Guard: only rewrite to `EModCall` when the qualified
-          # entry is actually registered. In test-sugars and other
-          # contexts where the head type's module isn't loaded as a
-          # `--prelude` (e.g. `list.kai` for `[Int] | f`), the
-          # built-in `prelude_table` provides runtime stubs like
-          # `kai_prelude_map`. Falling back to `EVar(op)` lets the
-          # codegen route through `prelude_find` and emit the stub
-          # call, matching the pre-#235 behavior on that lane.
-          let callee_kind = match ty_env_lookup_qualified(rl.st.env, module_name, op) {
+        HLAmbiguous(mods) -> {
+          diag_error(rl.st.file, line, col,
+            concat_all(["ambiguous head type `", head, "` — ",
+              join_modules_for_diag(mods),
+              " all declare it. Use qualified type annotation."]))
+          let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
+          mk_inferred(st_bump_err(rl.st), TyAny, root)
+        }
+        HLOk(module_name) -> {
+          # Issue #594: emit `EModCall(module_name, op)` when the
+          # qualified `<module>::<op>` entry is registered — that is
+          # the dispatch-eligible case (and the diagnostic surface
+          # the issue body anchors against in `pipe_no_map`). When
+          # no qualified entry exists we fall back to a bare-name
+          # callee (`EVar(op)`); this preserves the pre-#594
+          # behaviour for the only seeded head, `List → list`, when
+          # invoked by harnesses that do not load `core/list.kai`
+          # as a prelude (the runtime `kai_prelude_map` /
+          # `kai_prelude_flat_map` / `kai_prelude_filter` stubs
+          # take over). For user-defined heads whose declaring
+          # module IS in scope but ships no canonical op, the
+          # bare-name fallback then triggers the standard
+          # call-inference signature mismatch — distinguishable
+          # from the seeded `List` case because the `from_decls`
+          # branch of `build_head_owner_map` only includes user
+          # heads that are actually module-resident, so reaching
+          # `HLOk` for a user head implies the module IS loaded
+          # and the missing qualified entry IS the user's bug.
+          let qualified = ty_env_lookup_qualified(rl.st.env, module_name, op)
+          let callee_kind = match qualified {
             Some(_) -> EModCall(module_name, op)
             None    -> EVar(op)
           }
-          let rf = synth(rl.st, rhs)
+          # Issue #594: emit the "module declares T but does not
+          # export op" diagnostic only when the head was contributed
+          # by the from_decls walk — i.e. a real user `pub type` —
+          # AND the module ships no qualified op. The seeded
+          # `List → list` case stays silent and routes through the
+          # bare-name fallback so existing test-sugars fixtures (no
+          # `--prelude core/list.kai`) continue to compile.
+          let st_after_diag = match qualified {
+            Some(_) -> rl.st
+            None ->
+              if head == "List" { rl.st }
+              else {
+                diag_error(rl.st.file, line, col,
+                  concat_all(["module `", module_name, "` declares `", head,
+                    "` but does not export `", op, "`"]))
+                st_bump_err(rl.st)
+              }
+          }
+          let rf = synth(st_after_diag, rhs)
           let rc = synth(rf.st, with_ty(mk_expr(callee_kind, line, col), TyAny))
           let rv = st_fresh_ty(rc.st)
           let fr = subst_fresh_row(rv.st.sub)
@@ -32878,6 +33113,20 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
         }
       }
     }
+  }
+}
+
+# Format a list of module names for the ambiguous-head diagnostic.
+# Two modules become "`a` and `b`"; three or more become "`a`, `b`,
+# and `c`". Output is wrapped in backticks per the issue #594
+# diagnostic shape.
+fn join_modules_for_diag(mods: [String]) : String {
+  match mods {
+    []        -> ""
+    [a]       -> concat_all(["`", a, "`"])
+    [a, b]    -> concat_all(["`", a, "` and `", b, "`"])
+    [a, ...rest] ->
+      concat_all(["`", a, "`, ", join_modules_for_diag(rest)])
   }
 }
 
@@ -37223,10 +37472,23 @@ type TypecheckedModule = { typed: TypedProgram, delta: ModuleEnvDelta }
 fn typecheck_module(file: String, mod: ModuleDecls,
                      inherited: ModuleEnvDelta,
                      proto_impls: [ProtoImplReg],
+                     head_owners: [HeadOwnerEntry],
                      verbose: Bool) : TypecheckedModule / Console + File {
 
 
-  let data = collect_program_data_inherited(file, mod.decls, inherited)
+  let data0 = collect_program_data_inherited(file, mod.decls, inherited)
+  # Issue #594: attach the per-compile head-owner cache to the env
+  # the typer walks. The cache is built once per `compile_source`
+  # invocation from the post-`expand_imports` decl stream + module
+  # table; threading it here keeps `synth_pipe_dispatch`'s lookup
+  # `O(1)` per call site.
+  let env_with_owners = ty_env_with_head_owners(data0.built.env, head_owners)
+  let built1 = BuiltEnv { env: env_with_owners,
+                          prelude_len: data0.built.prelude_len,
+                          op_eff_arities: data0.built.op_eff_arities }
+  let data = ProgramData { decls_a: data0.decls_a, built: built1,
+                            recs: data0.recs, alias_res: data0.alias_res,
+                            op_to_eff: data0.op_to_eff, sums: data0.sums }
   let tp = infer_all_loop(file, data.built.env, data.built.prelude_len, data.recs,
                  data.built.op_eff_arities, data.decls_a, verbose, [], 0, [], [], [], [],
                  data.alias_res.aliases, data.op_to_eff, data.sums, proto_impls, data.decls_a)
@@ -37299,11 +37561,23 @@ fn take_op_eff_arities(xs: [OpEffArity], n: Int,
 # real fold dynamics — see `typecheck_program_loop`.
 fn typecheck_program(file: String, modules: [ModuleDecls],
                       proto_impls: [ProtoImplReg],
-                      verbose: Bool) : TypedProgram / Console + File {
+                      verbose: Bool) : TypedProgram / Console + File =
+  typecheck_program_with_head_owners(file, modules, proto_impls, [], verbose)
+
+# Issue #594 — variant accepting the per-compile head-owner cache. The
+# cache is built once by `compile_source` after `expand_imports`
+# completes; legacy callers (test helpers, dump utilities) pass `[]`
+# via `typecheck_program` and any pipe call sites in those test inputs
+# fall back to the "no module declaring type" diagnostic — the right
+# behaviour given those harnesses do not load a module table.
+fn typecheck_program_with_head_owners(file: String, modules: [ModuleDecls],
+                                       proto_impls: [ProtoImplReg],
+                                       head_owners: [HeadOwnerEntry],
+                                       verbose: Bool) : TypedProgram / Console + File {
 
 
   typecheck_program_loop(file, modules, module_env_delta_empty(),
-                          proto_impls, verbose,
+                          proto_impls, head_owners, verbose,
                           [], 0, [], [], [], [], 0)
 }
 
@@ -37318,6 +37592,7 @@ fn typecheck_program(file: String, modules: [ModuleDecls],
 fn typecheck_program_loop(file: String, modules: [ModuleDecls],
                             acc_delta: ModuleEnvDelta,
                             proto_impls: [ProtoImplReg],
+                            head_owners: [HeadOwnerEntry],
                             verbose: Bool,
                             acc_decls: [Decl],
                             acc_errs: Int,
@@ -37336,13 +37611,13 @@ fn typecheck_program_loop(file: String, modules: [ModuleDecls],
       diags: list_reverse(acc_diags)
     }
     [m, ...rest] -> {
-      let r = typecheck_module(file, m, acc_delta, proto_impls, verbose)
+      let r = typecheck_module(file, m, acc_delta, proto_impls, head_owners, verbose)
       let next_delta = merge_env_deltas(acc_delta, r.delta)
       let next_prelude_len = match prelude_len_acc {
         0 -> r.typed.prelude_len
         _ -> prelude_len_acc
       }
-      typecheck_program_loop(file, rest, next_delta, proto_impls, verbose,
+      typecheck_program_loop(file, rest, next_delta, proto_impls, head_owners, verbose,
                               prepend_reverse_decls(r.typed.decls, acc_decls),
                               acc_errs + r.typed.errs,
                               llvm_prepend_reverse(r.typed.insts, acc_insts),
@@ -37375,11 +37650,21 @@ fn prepend_reverse_decls(xs: [Decl], acc: [Decl]) : [Decl] {
 # infer_program_with_protos goes through here; the per-module fold
 # entry point is `typecheck_program`.
 fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
-                               proto_impls: [ProtoImplReg]) : TypedProgram / Console + File {
+                               proto_impls: [ProtoImplReg]) : TypedProgram / Console + File =
+  infer_program_with_protos_cached(file, decls, verbose, proto_impls, [])
+
+# Issue #594 — variant accepting the per-compile head-owner cache. The
+# `compile_source` driver builds the cache from the post-`expand_imports`
+# decl stream + module table once per invocation and passes it here so
+# `synth_pipe_dispatch` can resolve any in-scope `pub type T` against
+# its declaring module without a hardcoded compiler table.
+fn infer_program_with_protos_cached(file: String, decls: [Decl], verbose: Bool,
+                                       proto_impls: [ProtoImplReg],
+                                       head_owners: [HeadOwnerEntry]) : TypedProgram / Console + File {
 
 
   let mods = [ModuleDecls { name: None, decls: decls }]
-  typecheck_program(file, mods, proto_impls, verbose)
+  typecheck_program_with_head_owners(file, mods, proto_impls, head_owners, verbose)
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int / Console + File {
@@ -43444,7 +43729,7 @@ fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: 
       if list_has_string(avoid, te.name) or (not synth_return_structural(te.scheme)) {
         synth_find_arg(rest, want, fresh, avoid, sub)
       } else {
-        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [] }, te.scheme)
+        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [] }, te.scheme)
         match unify(inst.ty, want, sub) {
           Some(sub1) -> Some(ArgMatch { name: te.name, sub: sub1, fresh: inst.env.fresh })
           None       -> synth_find_arg(rest, want, fresh, avoid, sub)
@@ -43473,7 +43758,7 @@ fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
 # Try entry `te` as a direct match or a 1-level application against
 # `expected`. Returns rendered candidate text or None.
 fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) : Option[String] {
-  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [] }, te.scheme)
+  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [] }, te.scheme)
   match unify(inst.ty, expected, subst_empty()) {
     Some(_) -> Some(te.name)
     None    -> match inst.ty {
@@ -59875,7 +60160,17 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk }
                 else {
-                  let typed_prog0 = infer_program_with_protos(path, all_decls, false, lowered.reg.impls)
+                  # Issue #594: build the per-compile head-owner cache
+                  # once from the post-`expand_imports` decl stream + the
+                  # full module table (preludes + transitively imported +
+                  # the target file itself). The typer threads this cache
+                  # into `synth_pipe_dispatch` so any in-scope `pub type`
+                  # whose declaring module exports the canonical
+                  # `map / flat_map / filter` participates in `|`, `||`,
+                  # `|?` automatically — no compiler change required when
+                  # a downstream package adds a new pipe-eligible type.
+                  let head_owners = build_head_owner_map(all_decls, module_table, target_mod_name)
+                  let typed_prog0 = infer_program_with_protos_cached(path, all_decls, false, lowered.reg.impls, head_owners)
                   # m12.8: post-inference protocol-call rewrite.
                   # `Expr.ty` is populated for every node now, so each
                   # `op(x, ...)` call can be redirected to the matching
