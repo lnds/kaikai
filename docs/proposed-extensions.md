@@ -988,7 +988,7 @@ Land as a single lane that bundles:
    only `map` rejected when `||` is used).
 
 The lane is independent of any milestone in flight (m12.6
-refinement waves, Anga Roa Perceus, unions milestone #184). It can
+refinement waves, Hanga Roa Perceus, unions milestone #184). It can
 land any time after m12.8 protocols (already closed). Recommended
 to land **after unions (#184)** so the typer changes from unions
 have stabilized — the head-type-to-module map can reuse the same

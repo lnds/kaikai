@@ -7,7 +7,7 @@ negative case).
 
 | Fixture                       | Edition       | Exercises                                                      |
 |-------------------------------|---------------|----------------------------------------------------------------|
-| `edition_anga_roa_pipe/`      | `anga-roa`    | #594 convention-based pipe dispatch over a user `pub type Box` |
+| `edition_hanga_roa_pipe/`      | `hanga-roa`    | #594 convention-based pipe dispatch over a user `pub type Box` |
 | `edition_tongariki_pipe/`     | `tongariki`   | Legacy seeded `List → list` mapping, no user-type walk         |
 | `edition_unknown_error/`      | `atlantis`    | Unknown-edition diagnostic with the known set named            |
 | `edition_missing_field/`      | (omitted)     | Manifest with no `edition =` → repo `EDITION` fallback         |
@@ -15,5 +15,5 @@ negative case).
 
 The cache-invalidation fixture sets `$KAI_PRELUDE_CACHE_DIR` to a
 temporary directory so the system cache is untouched, and asserts
-that compiling under `tongariki` and `anga-roa` produces disjoint
+that compiling under `tongariki` and `hanga-roa` produces disjoint
 subdirectories.
