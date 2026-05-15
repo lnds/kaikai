@@ -284,6 +284,61 @@ manifest_path_flags() {
   done
 }
 
+# Issue #603: emit `--edition <name>` based on the consumer's
+# kai.toml `edition = "..."` field. Falls back to the repo-level
+# EDITION file (read_edition) when no manifest exists or the field
+# is absent. The compiler validates the value and gates feature
+# branches (e.g. #594 pipe convention dispatch) on edition >=
+# anga-roa. Awk parsing mirrors manifest_unstable_flags — kaikai's
+# TOML never quotes key/table names.
+manifest_edition_flag() {
+  manifest_dir="$1"
+  default_ed="$(read_edition)"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    printf -- '--edition %s' "$default_ed"
+    return 0
+  fi
+  ed="$(awk '
+    /^\[/ { in_root = 0; next }
+    NR == 1 { in_root = 1 }
+    in_root && /^[[:space:]]*edition[[:space:]]*=/ {
+      n = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", n)
+      sub(/".*/, "", n)
+      print n
+      exit
+    }
+  ' "$manifest_dir/kai.toml")"
+  if [ -z "$ed" ]; then ed="$default_ed"; fi
+  printf -- '--edition %s' "$ed"
+}
+
+# Read the edition for cache-partitioning purposes. Same resolution
+# as manifest_edition_flag but emits only the bare value (no flag
+# prefix), and silently falls back to the repo EDITION when the
+# manifest is absent or lacks the field.
+manifest_edition_value() {
+  manifest_dir="$1"
+  default_ed="$(read_edition)"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    printf '%s' "$default_ed"
+    return 0
+  fi
+  ed="$(awk '
+    /^\[/ { in_root = 0; next }
+    NR == 1 { in_root = 1 }
+    in_root && /^[[:space:]]*edition[[:space:]]*=/ {
+      n = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", n)
+      sub(/".*/, "", n)
+      print n
+      exit
+    }
+  ' "$manifest_dir/kai.toml")"
+  if [ -z "$ed" ]; then ed="$default_ed"; fi
+  printf '%s' "$ed"
+}
+
 # Issue #602: emit `--package-name <name>` if the manifest declares
 # one, and `--unstable-optin <pkg>` for every `<pkg> = true` entry
 # under `[unstable]`. The compiler uses these to suppress the
@@ -641,18 +696,27 @@ EOF
 # The `-v1` suffix is the kaikai-cache format generation. A future
 # kaic2 that bumps `cache_format_version()` should also bump the
 # directory suffix so the two generations coexist on disk.
+#
+# Issue #603: partition the cache by edition so a user who flips
+# `edition = "anga-roa"` in kai.toml never hits a tongariki-shaped
+# cache entry (and vice versa). The optional first argument is the
+# edition name; absent, we read the repo EDITION file. Existing
+# pre-#603 cache directories at the un-partitioned root become
+# dormant leftovers — users may rm -rf them; the partitioned tree
+# rebuilds on first use.
 prelude_cache_dir() {
+  ed="${1:-$(read_edition)}"
   if [ -n "${KAI_PRELUDE_CACHE_DIR:-}" ]; then
-    printf '%s' "$KAI_PRELUDE_CACHE_DIR"
+    printf '%s/%s' "$KAI_PRELUDE_CACHE_DIR" "$ed"
     return 0
   fi
   if [ -n "${XDG_CACHE_HOME:-}" ]; then
-    printf '%s/kaikai/preludes-v1' "$XDG_CACHE_HOME"
+    printf '%s/kaikai/preludes-v1/%s' "$XDG_CACHE_HOME" "$ed"
     return 0
   fi
   case "$(uname -s)" in
-    Darwin) printf '%s/Library/Caches/kaikai/preludes-v1' "$HOME" ;;
-    *)      printf '%s/.cache/kaikai/preludes-v1' "$HOME" ;;
+    Darwin) printf '%s/Library/Caches/kaikai/preludes-v1/%s' "$HOME" "$ed" ;;
+    *)      printf '%s/.cache/kaikai/preludes-v1/%s' "$HOME" "$ed" ;;
   esac
 }
 
@@ -716,12 +780,13 @@ file_sha256_cached() {
 # KAI_NO_PRELUDE_CACHE=1) restores the pre-cache path.
 prelude_cache_lookup() {
   src="$1"
+  ed="${2:-$(read_edition)}"
   [ "${KAI_PRELUDE_CACHE:-1}" = "1" ]    || return 0
   [ -n "${KAI_NO_PRELUDE_CACHE:-}" ]     && return 0
   [ -n "${KAI_NO_STDLIB:-}" ]            && return 0
   sha="$(file_sha256_cached "$src")"
   [ -n "$sha" ] || return 0
-  cache_dir="$(prelude_cache_dir)"
+  cache_dir="$(prelude_cache_dir "$ed")"
   cache_path="$cache_dir/${sha}.kab"
   if [ -f "$cache_path" ]; then
     printf '%s' "$cache_path"
@@ -736,12 +801,13 @@ prelude_cache_lookup() {
 # (caller falls back to passing the source via --prelude).
 prelude_cache_build() {
   src="$1"
+  ed="${2:-$(read_edition)}"
   [ "${KAI_PRELUDE_CACHE:-1}" = "1" ]    || return 0
   [ -n "${KAI_NO_PRELUDE_CACHE:-}" ]     && return 0
   [ -n "${KAI_NO_STDLIB:-}" ]            && return 0
   sha="$(file_sha256_cached "$src")"
   [ -n "$sha" ] || return 0
-  cache_dir="$(prelude_cache_dir)"
+  cache_dir="$(prelude_cache_dir "$ed")"
   mkdir -p "$cache_dir" || return 0
   cache_path="$cache_dir/${sha}.kab"
   tmp_path="$cache_dir/.${sha}.kab.$$.tmp"
@@ -768,6 +834,7 @@ prelude_cache_build() {
 # layer existed.
 prelude_flag_for() {
   src="$1"
+  ed="${2:-$(read_edition)}"
   [ -f "$src" ] || return 0
   # Default: the cache layer is opt-in via KAI_PRELUDE_CACHE=1. With
   # Issue #592: cache layer is ON by default with KAB2. Setting
@@ -778,13 +845,13 @@ prelude_flag_for() {
     printf -- '--prelude %s ' "$src"
     return 0
   fi
-  cache_path="$(prelude_cache_lookup "$src")"
+  cache_path="$(prelude_cache_lookup "$src" "$ed")"
   if [ -z "$cache_path" ]; then
     # MISS: try to populate the cache, then emit the corresponding
     # flag pair. On build failure (kaic2 itself rejects the source,
     # disk full, etc.) fall back to plain --prelude so the user
     # still gets a working compile.
-    cache_path="$(prelude_cache_build "$src")"
+    cache_path="$(prelude_cache_build "$src" "$ed")"
   fi
   if [ -n "$cache_path" ] && [ -f "$cache_path" ]; then
     printf -- '--prelude-cache %s %s ' "$src" "$cache_path"
@@ -802,6 +869,9 @@ prelude_flag_for() {
 # / --holes-json) so both surfaces see the same scope.
 stdlib_prelude_flags() {
   if [ "${KAI_NO_STDLIB:-}" = "1" ]; then return 0; fi
+  # Issue #603: cache partition by edition — caller passes the
+  # consumer's resolved edition (from kai.toml or EDITION file).
+  ed_arg="${1:-$(read_edition)}"
   # Issue #592: when the cache is on, batch sha256 every prelude in a
   # single `shasum` invocation. 32 individual `file_sha256` forks
   # cost ~270ms; one batched call costs ~10ms. The KAI_PRELUDE_SHA_FILE
@@ -834,34 +904,34 @@ stdlib_prelude_flags() {
   fi
   if [ -d "$STDLIB_CORE_DIR" ]; then
     for core_file in "$STDLIB_CORE_DIR"/*.kai; do
-      prelude_flag_for "$core_file"
+      prelude_flag_for "$core_file" "$ed_arg"
     done
   fi
-  prelude_flag_for "$STDLIB_PROTOCOLS"
-  prelude_flag_for "$STDLIB_EFFECTS"
-  prelude_flag_for "$STDLIB_ARRAY"
-  prelude_flag_for "$STDLIB_RANDOM"
-  prelude_flag_for "$STDLIB_RANDOM_SECURE"
-  prelude_flag_for "$STDLIB_BASE64"
-  prelude_flag_for "$STDLIB_HEX"
-  prelude_flag_for "$STDLIB_MAP"
-  prelude_flag_for "$STDLIB_SET"
-  prelude_flag_for "$STDLIB_QUEUE"
-  prelude_flag_for "$STDLIB_STACK"
-  prelude_flag_for "$STDLIB_MATH_NUMERIC"
-  prelude_flag_for "$STDLIB_MATH_INT"
-  prelude_flag_for "$STDLIB_MATH_REAL"
-  prelude_flag_for "$STDLIB_MATH_COMPLEX"
-  prelude_flag_for "$STDLIB_JSON"
-  prelude_flag_for "$STDLIB_TOML"
-  prelude_flag_for "$STDLIB_DECIMAL"
-  prelude_flag_for "$STDLIB_MONEY"
-  prelude_flag_for "$STDLIB_FX"
-  prelude_flag_for "$STDLIB_UUID"
-  prelude_flag_for "$STDLIB_REGEXP"
-  prelude_flag_for "$STDLIB_PATH"
-  prelude_flag_for "$STDLIB_CRYPTO_HASH"
-  prelude_flag_for "$STDLIB_CRYPTO_MAC"
+  prelude_flag_for "$STDLIB_PROTOCOLS" "$ed_arg"
+  prelude_flag_for "$STDLIB_EFFECTS" "$ed_arg"
+  prelude_flag_for "$STDLIB_ARRAY" "$ed_arg"
+  prelude_flag_for "$STDLIB_RANDOM" "$ed_arg"
+  prelude_flag_for "$STDLIB_RANDOM_SECURE" "$ed_arg"
+  prelude_flag_for "$STDLIB_BASE64" "$ed_arg"
+  prelude_flag_for "$STDLIB_HEX" "$ed_arg"
+  prelude_flag_for "$STDLIB_MAP" "$ed_arg"
+  prelude_flag_for "$STDLIB_SET" "$ed_arg"
+  prelude_flag_for "$STDLIB_QUEUE" "$ed_arg"
+  prelude_flag_for "$STDLIB_STACK" "$ed_arg"
+  prelude_flag_for "$STDLIB_MATH_NUMERIC" "$ed_arg"
+  prelude_flag_for "$STDLIB_MATH_INT" "$ed_arg"
+  prelude_flag_for "$STDLIB_MATH_REAL" "$ed_arg"
+  prelude_flag_for "$STDLIB_MATH_COMPLEX" "$ed_arg"
+  prelude_flag_for "$STDLIB_JSON" "$ed_arg"
+  prelude_flag_for "$STDLIB_TOML" "$ed_arg"
+  prelude_flag_for "$STDLIB_DECIMAL" "$ed_arg"
+  prelude_flag_for "$STDLIB_MONEY" "$ed_arg"
+  prelude_flag_for "$STDLIB_FX" "$ed_arg"
+  prelude_flag_for "$STDLIB_UUID" "$ed_arg"
+  prelude_flag_for "$STDLIB_REGEXP" "$ed_arg"
+  prelude_flag_for "$STDLIB_PATH" "$ed_arg"
+  prelude_flag_for "$STDLIB_CRYPTO_HASH" "$ed_arg"
+  prelude_flag_for "$STDLIB_CRYPTO_MAC" "$ed_arg"
   if [ -n "${KAI_PRELUDE_SHA_FILE:-}" ] && [ -f "$KAI_PRELUDE_SHA_FILE" ]; then
     rm -f "$KAI_PRELUDE_SHA_FILE" 2>/dev/null
     unset KAI_PRELUDE_SHA_FILE
@@ -922,7 +992,10 @@ compile_to_binary() {
   src="$1"; tmp="$2"; out="$3"; sub="$4"; shift 4
   [ -f "$src" ] || die_file_not_found "$src" "$sub"
   ensure_built
-  prelude_flags="$(stdlib_prelude_flags)"
+  src_dir_for_ed="$(cd "$(dirname "$src")" && pwd)"
+  manifest_dir_pre="$(find_manifest_dir "$src_dir_for_ed")"
+  edition_value="$(manifest_edition_value "$manifest_dir_pre")"
+  prelude_flags="$(stdlib_prelude_flags "$edition_value")"
   # shellcheck disable=SC2086
   # KAI_TRACE_RC unset for the compiler invocation: we want the trace
   # to come from the user's compiled program, not from kaic2 itself.
@@ -949,6 +1022,7 @@ compile_to_binary() {
   manifest_dir="$(find_manifest_dir "$src_dir")"
   pkg_path_flags=""
   unstable_flags=""
+  edition_flag="$(manifest_edition_flag "$manifest_dir")"
   if [ -n "$manifest_dir" ]; then
     pkg_path_flags="$(manifest_path_flags "$manifest_dir")"
     unstable_flags="$(manifest_unstable_flags "$manifest_dir")"
@@ -959,7 +1033,7 @@ compile_to_binary() {
       die "--backend=llvm: cannot locate runtime_llvm.c (looked under $RUNTIME_INC and $ROOT/stage0)"
     fi
     # shellcheck disable=SC2086
-    (unset KAI_TRACE_RC; "$KAIC2" --emit=llvm --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $prelude_flags "$@" "$src") > "$tmp/out.ll"
+    (unset KAI_TRACE_RC; "$KAIC2" --emit=llvm --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $prelude_flags "$@" "$src") > "$tmp/out.ll"
     # shellcheck disable=SC2086
     # `-w` matches stage2/Makefile's test-llvm rule: kaic2's emitted
     # IR triggers benign clang warnings (unused parameter on shim
@@ -968,7 +1042,7 @@ compile_to_binary() {
     $CLANG $CLANGFLAGS -I "$RUNTIME_INC" "$tmp/out.ll" "$RUNTIME_LLVM_C" -o "$out" -lm
   else
     # shellcheck disable=SC2086
-    (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $prelude_flags "$@" "$src") > "$tmp/out.c"
+    (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $prelude_flags "$@" "$src") > "$tmp/out.c"
     # shellcheck disable=SC2086
     # `-lm` (issue #343): math/real libm bindings (sqrt, sin, log, …)
     # are unresolved on Linux glibc without an explicit link line.
@@ -986,9 +1060,11 @@ report_holes() {
   src="$1"; flag="$2"
   [ -f "$src" ] || die_file_not_found "$src" "build"
   ensure_built
-  prelude_flags="$(stdlib_prelude_flags)"
   src_dir="$(cd "$(dirname "$src")" && pwd)"
   manifest_dir="$(find_manifest_dir "$src_dir")"
+  edition_value="$(manifest_edition_value "$manifest_dir")"
+  edition_flag="$(manifest_edition_flag "$manifest_dir")"
+  prelude_flags="$(stdlib_prelude_flags "$edition_value")"
   pkg_path_flags=""
   unstable_flags=""
   if [ -n "$manifest_dir" ]; then
@@ -996,7 +1072,7 @@ report_holes() {
     unstable_flags="$(manifest_unstable_flags "$manifest_dir")"
   fi
   # shellcheck disable=SC2086
-  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $prelude_flags "$flag" "$src")
+  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $prelude_flags "$flag" "$src")
 }
 
 cmd_build() {
