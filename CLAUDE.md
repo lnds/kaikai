@@ -16,16 +16,17 @@ Three tiers; the higher tier wins on conflict.
 1. **Safe at compile time.** Memory-safe by default; `Option[T]` instead of null; effects visible in row types (catalog in `docs/effects-stdlib.md`); explicit runtime escapes (`panic`, `?`, `todo!`, `axiom`, FFI) are audited, not incidental. `Array[T]` writes ride the `Mutable` effect per `docs/effects-stdlib.md` §`Mutable` on the observable-effects discipline (issue #251 + #252): observable mutations require `Mutable`, locally-constructed Arrays mask it.
 2. **Runtime-efficient.** Generics monomorphised; mandatory TCO; primitives unboxed inside fibers; effects compile to one-shot continuations as the zero-cost default.
 3. **Fast compilation.** Single-pass parse, LL(1) with minor bookkeeping; HM extended with effect rows, decidable; **no Haskell-style type-class resolution** (no HKT, no constraint propagation, no functional dependencies, no type families). Single-dispatch protocols Go/Clojure/Elixir-style — `O(1)` impl-table lookup — are permitted (`docs/protocols.md`). Pipeline `lex → parse → resolve → infer → monomorph → perceus → lower`, dumpable between any two passes.
+4. **Stability without stagnation** (Rust-inspired, [2014 manifesto](https://blog.rust-lang.org/2014/10/30/Stability/)). Upgrades between kaikai versions never break user code without a migration path. We iterate fast on internals — runtime, codegen, RC discipline, cache layers, typer refactors — but the surface a user wrote against is preserved across versions within the same **edition**. Breaking changes to the language surface require an **edition bump** (Tongariki → Anga Roa → Orongo, geographic Rapa Nui names), which is a deliberate public commitment, not an incidental side effect of a refactor lane. Editions are tracked in the `EDITION` file at repo root, surfaced in `kai --version`, and documented in `docs/editions.md`. The lesson load-bearing here: **we owe users that they never dread upgrading kaikai**.
 
 ### Tier 2 — Aspirational (Tier 1 wins ties)
 
-4. **Structured compiler output.** Diagnostics + queries come as stable JSON alongside human text. Typed holes + `--holes-json` are the prototype. **Not** "one canonical form per construct" — the language has intentional redundancies (`=` vs `{}` bodies, `|>` vs `|`, multiple lambda forms); the rule is *few forms, each with clear intent*.
-5. **Approachable core, novel where it pays off.** Day-to-day syntax (declarations, `let`, `if`, `match`, pipes, patterns) stays close to Python/JS/Elixir. Advanced surface — effects, handlers, nursery, fibers, holes — is novel on purpose.
-6. **Few visible concepts, layered.** ~10 concepts for basic code; advanced features stack on top.
+5. **Structured compiler output.** Diagnostics + queries come as stable JSON alongside human text. Typed holes + `--holes-json` are the prototype. **Not** "one canonical form per construct" — the language has intentional redundancies (`=` vs `{}` bodies, `|>` vs `|`, multiple lambda forms); the rule is *few forms, each with clear intent*.
+6. **Approachable core, novel where it pays off.** Day-to-day syntax (declarations, `let`, `if`, `match`, pipes, patterns) stays close to Python/JS/Elixir. Advanced surface — effects, handlers, nursery, fibers, holes — is novel on purpose.
+7. **Few visible concepts, layered.** ~10 concepts for basic code; advanced features stack on top.
 
 ### Tier 3 — Strategic bet
 
-7. **LLM authorability.** Bet that typed holes + structured JSON + stable rules let LLMs author kaikai despite weak prior exposure. Acceptance: an LLM with JSON access completes the top 80% of typical functions within one round of compilation.
+8. **LLM authorability.** Bet that typed holes + structured JSON + stable rules let LLMs author kaikai despite weak prior exposure. Acceptance: an LLM with JSON access completes the top 80% of typical functions within one round of compilation.
 
 ### Tie-breakers
 
@@ -37,10 +38,10 @@ Three tiers; the higher tier wins on conflict.
 
 ### Not principles (do not cite)
 
-- *One canonical form per construct* — already violated four times deliberately; see #4.
+- *One canonical form per construct* — already violated four times deliberately; see #5.
 - *Never surprise a Python programmer* — effects surprise them, by design.
 - *Zero-cost abstractions* — effects, fibers, RC have small but non-zero costs.
-- *Backward compatibility* — not promised until post-MVP.
+- *Full backward compatibility forever* — within an edition, yes (per #4 stability). Across editions, breaking changes are allowed but require opt-in. Pre-1.0 we still ship `feat:` / `fix:` rapidly; the protection is at the edition boundary, not at every minor version.
 
 ## Baseline architecture
 
