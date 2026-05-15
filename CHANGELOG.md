@@ -84,6 +84,14 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.65.0 (2026-05-15)
+
+### Added
+
+- **stdlib**: HTTP server-side parse/serialize helpers (closes #605)
+- **typer**: convention-based pipe dispatch via head-owner cache (closes #594)
+- **lexer,parser**: #[...] attribute syntax migration (refs #608)
+
 ## v0.64.0 (2026-05-15)
 
 ### Added
