@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.66.0 (2026-05-15)
+
+### Added
+
+- **runtime**: Phase R1 reactor — file + sleep + process park the fiber (closes #611)
+
 ## v0.65.0 (2026-05-15)
 
 ### Added
