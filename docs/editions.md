@@ -105,9 +105,9 @@ needed and the version increments per Conventional Commits
 
 | Edition  | Active from | Released as     | Notes                                                                        |
 |----------|-------------|-----------------|------------------------------------------------------------------------------|
-| Tongariki | pre-2026-05-15 | v0.x series through 2026-05-20 | The pre-Anga-Roa phase. Rapid iteration on internals; user surface stabilising. |
-| **Anga Roa** | **2026-05-21** | v0.x release | First public-target edition. Includes the cache chain, package-mode workflow, HTTP server, stable pipe dispatch including the convention-based extension for downstream types (`|` against `Stream`, `Repository`, etc.). |
-| Orongo | post-Anga-Roa | TBD | Next edition. Pulls in items that did not make Anga Roa: advanced FFI (struct-by-value), new numeric primitives (BigInt, Rational, Float32, etc.), LLVM direct emit, Phase A.2 cache, compilation daemon. |
+| Tongariki | pre-2026-05-15 | v0.x series through 2026-05-20 | The pre-Hanga-Roa phase. Rapid iteration on internals; user surface stabilising. |
+| **Hanga Roa** | **2026-05-21** | v0.x release | First public-target edition. Includes the cache chain, package-mode workflow, HTTP server, stable pipe dispatch including the convention-based extension for downstream types (`|` against `Stream`, `Repository`, etc.). |
+| Orongo | post-Hanga-Roa | TBD | Next edition. Pulls in items that did not make Hanga Roa: advanced FFI (struct-by-value), new numeric primitives (BigInt, Rational, Float32, etc.), LLVM direct emit, Phase A.2 cache, compilation daemon. |
 
 The current edition name is in the `EDITION` file at repo root.
 This table is updated when an edition transitions; the historical
@@ -120,7 +120,7 @@ A `kai.toml` declares which edition its source compiles against:
 ```toml
 name = "my-app"
 version = "0.1.0"
-edition = "anga-roa"
+edition = "hanga-roa"
 
 [dependencies]
 ```
@@ -133,21 +133,21 @@ silently retarget the package against a newer edition.
 **Multi-edition support:** kaikai's compiler accepts source from
 any edition it knows about. When a package declares `edition =
 "tongariki"`, the compiler applies the tongariki rules even if the
-default edition is anga-roa. This is how `stability without
+default edition is hanga-roa. This is how `stability without
 stagnation` works in practice: a tongariki package keeps working
-on an anga-roa compiler.
+on an hanga-roa compiler.
 
 > **v1 status (2026-05-15):** edition selection is **shipped**
 > (issue #603). `bin/kai` reads `kai.toml`'s `edition` field,
-> validates it against the known set `{tongariki, anga-roa}`, and
+> validates it against the known set `{tongariki, hanga-roa}`, and
 > forwards `--edition <name>` to `kaic2`. The compiler routes the
-> #594 convention-based pipe dispatch on `edition >= anga-roa` and
+> #594 convention-based pipe dispatch on `edition >= hanga-roa` and
 > falls back to the legacy seeded `List → list` mapping under
 > tongariki. The prelude cache is partitioned by edition under
 > `~/.cache/kaikai/preludes-v1/<edition>/`, so cross-edition rebuilds
 > are clean. An unknown edition value produces
 > `kaic2: unknown edition \`<x>\` in kai.toml — known editions:
-> tongariki, anga-roa` before any compilation work runs. The
+> tongariki, hanga-roa` before any compilation work runs. The
 > `cache_kaikai_version_hash` was bumped from 1 to 2; any `.kab`
 > blob predating #603 is rejected at load.
 
@@ -186,7 +186,7 @@ exports they have read and accepted:
 ```toml
 name = "my-app"
 version = "0.1.0"
-edition = "anga-roa"
+edition = "hanga-roa"
 
 [unstable]
 ahu = true
@@ -211,8 +211,8 @@ consumed exactly as it would be otherwise — no codegen change.
 ### Why this is not "an edition for one decl"
 
 `#[unstable]` does NOT split the edition. The package still declares
-`edition = "anga-roa"`; only specific decls are excluded from the
-contract. This keeps Anga Roa shippable on 2026-05-21 with
+`edition = "hanga-roa"`; only specific decls are excluded from the
+contract. This keeps Hanga Roa shippable on 2026-05-21 with
 downstream packages (ahu, kohau, henua, the HTTP server) carrying
 their as-yet-uncommitted public surface marked, while the language
 surface itself stays stable.

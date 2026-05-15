@@ -65,7 +65,7 @@ The design breaks if any of these is compromised.
      internals — runtime, codegen, RC discipline, cache layers,
      typer refactors — without that protection blocking progress.
    - The mechanism is **editions**, geographic Rapa Nui names
-     matching the kaikai naming family (Tongariki today, Anga Roa
+     matching the kaikai naming family (Tongariki today, Hanga Roa
      21 May 2026, Orongo after). An edition is a snapshot of the
      language surface plus the user-facing protocol/stdlib API
      boundaries. Within one edition, breaking changes are

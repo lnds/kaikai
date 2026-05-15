@@ -5,7 +5,7 @@ Pinned 2026-05-02 (post v0.30.0). Last refreshed 2026-05-13 (HEAD
 convention already in use across the project (the language
 `kaikai` itself, the framework `ahu`, the web framework
 `manutara`). Each milestone is a real Rapa Nui site; the
-sequence Tongariki → Anga Roa → Orongo → Anakena tracks the
+sequence Tongariki → Hanga Roa → Orongo → Anakena tracks the
 arc from public face → daily life → ceremonial culmination →
 horizon beyond.
 
@@ -18,11 +18,11 @@ horizon beyond.
   protocols + ergonomics chain through 2026-05-05; the run from
   0.44 → 0.54 was the negative-space audit phases 1 + 2 plus the
   doc reconciliation work that surfaced this lane.
-- **Current target**: **kaikai-Anga Roa** — de-facto since
+- **Current target**: **kaikai-Hanga Roa** — de-facto since
   ~2026-05-03 with the protocols + ergonomics precondition chain.
   Tongariki MVP closed 2026-05-02 via PR #73 (issue #59 — m8.x
-  disclaimer sweep). The chain that opened Anga Roa de facto:
-  - **Anga Roa precondition work (landed early)**: #246 / #245
+  disclaimer sweep). The chain that opened Hanga Roa de facto:
+  - **Hanga Roa precondition work (landed early)**: #246 / #245
     (operator overloading via protocols + Complex stdlib),
     #266 (positional record construction), #257 (Ref[T] in
     Mutable effect), #260 / #261 (extern "C" fn syntax + name
@@ -32,7 +32,7 @@ horizon beyond.
     arithmetic), #174 (polymorphic impl bounded constraints),
     #175 (stdlib polymorphic impls Show/Eq/Ord/Hash for
     [T]/Option/Result), #258 (Default protocol + 6 impls).
-    These are prerequisites for the remaining Anga Roa scope
+    These are prerequisites for the remaining Hanga Roa scope
     (LSP, m11 diagnostics quality, bench v1.x, check
     shrinking, reuse-in-place, `check` v2 Arbitrary).
   - **Distribution**: macOS arm64 tarball + GH Actions release
@@ -44,7 +44,7 @@ horizon beyond.
   - Tier 1 #3 (fast compilation) — defendible
 - **Inner-loop perf**: ~2.0× C reference under -O2 on
   compute-bound code (post Real unboxing in 0.27.0). Target
-  trajectory bifurcates at Anga Roa by workload class
+  trajectory bifurcates at Hanga Roa by workload class
   (see DoD #3 below): compute-bound code → ≤ 1.5–2× C in-MVP;
   structural data traversal → ≤ 5–10× C in-MVP, ≤ 2× post-MVP
   via Phase 3. Orongo: near-C on compute-bound with multi-thread
@@ -96,7 +96,7 @@ sweep plus the residual typer-side items.
   +5.4% regression at `-O0` on `kaic2` self-compile — both
   well below the lane's ≥10% success threshold. Phase 2
   unboxing had already absorbed the addressable overhead.
-  Re-evaluation is paired with the Anga Roa
+  Re-evaluation is paired with the Hanga Roa
   **reuse-in-place** lane, which may shift the alloc mix
   enough to unlock per-tag dispatch on
   KAI_RECORD / KAI_VARIANT. Retro pinned in
@@ -192,9 +192,9 @@ actors (Orongo+).
 **Estimated cost**: Waves 1+2+cierre shipped in ~2 weeks of agent
 work distributed across ~5 lanes. Wave 3 disclaimer sweep is one
 small lane (~1 day); the two residual typer items are independent
-lanes (~3–5d each) that can land in parallel with Anga Roa.
+lanes (~3–5d each) that can land in parallel with Hanga Roa.
 
-### Anga Roa — pre-1.0 — **STARTED ~2026-05-03 (de facto)**
+### Hanga Roa — pre-1.0 — **STARTED ~2026-05-03 (de facto)**
 
 "Hanga Roa" — the village where life happens. Polish the
 developer experience to the level where teams (not just
@@ -278,7 +278,7 @@ polymorphic-impl machinery.
 2. Property test runner reports the minimal counterexample
    (post-shrink) on failure.
 3. **Performance, bifurcated by workload class.** Both gates
-   below are required for Anga Roa to close. The split reflects
+   below are required for Hanga Roa to close. The split reflects
    the architecture: kaikai represents locals unboxed and storage
    edges boxed; a single performance target cannot honestly cover
    both unless they share a representation.
@@ -463,7 +463,7 @@ own sub-lane.
 
 kaikai is the foundation of a layered ecosystem. Each layer
 is its own project, with its own repository, its own
-roadmap, and its own `Tongariki / Anga Roa / Orongo /
+roadmap, and its own `Tongariki / Hanga Roa / Orongo /
 Anakena` series. Names repeat across projects; context
 disambiguates.
 
@@ -510,7 +510,7 @@ asynchronous background-job face. Neither depends on the other.
 Each downstream project does not wait for 1.0.0 of its
 dependency. It waits for that dependency's Tongariki (MVP).
 This unlocks parallelism: once `kaikai-Tongariki` ships,
-`kaikai-Anga Roa` and `ahu-design` can run in parallel.
+`kaikai-Hanga Roa` and `ahu-design` can run in parallel.
 
 ### What this doc is NOT
 
