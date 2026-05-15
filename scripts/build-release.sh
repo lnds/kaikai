@@ -21,6 +21,7 @@
 #     libexec/kaikai/kaic2
 #     share/kaikai/
 #       VERSION
+#       EDITION
 #       stdlib/...
 #       include/runtime.h
 #       demos/baseline.txt
@@ -111,6 +112,7 @@ cp stage0/runtime_llvm.c   "$STAGE/share/kaikai/include/runtime_llvm.c"
 
 # Metadata.
 cp VERSION             "$STAGE/share/kaikai/VERSION"
+cp EDITION             "$STAGE/share/kaikai/EDITION"
 if [ -f demos/baseline.txt ]; then
   cp demos/baseline.txt "$STAGE/share/kaikai/demos/baseline.txt"
 fi
