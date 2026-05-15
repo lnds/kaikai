@@ -502,13 +502,16 @@ and selfhost byte-identical are gates for every sub-phase.
     semantics. `typecheck_module` now consumes `inherited:
     ModuleEnvDelta` and `typecheck_program` folds across segments.
     A multi-segment cache loader can drive the typer today.
-  - **Open — `lower_protocols` boundary destruction.** The driver
-    call site mixes prelude- and user-origin decls after
+  - **#597 (open) — `lower_protocols` boundary destruction.** The
+    driver call site mixes prelude- and user-origin decls after
     `lower_protocols`'s `[user_renamed, impl_renamed, dispatchers]`
     concat. A cache loader has no way to recover the per-module
     boundary from the post-cascade decl stream. Mitigation paths
     documented in §"What #574 unblocked and the lower_protocols
-    boundary it did not".
+    boundary it did not". Empirically confirmed by the #461 lane
+    verification step (2026-05-14) — see
+    `docs/lane-experience-issue-461-phase-a1-a2.md`. The A.1 cache
+    lane is blocked on #597 closing.
   - The A.1 payload extends the A.0 payload with the
     `ModuleEnvDelta` struct (`ty_entries`, `unions`,
     `op_eff_arities`, `recs`, `sums`, `op_to_eff`,
@@ -568,7 +571,9 @@ or LLVM-direct; either choice belongs in its own design doc.
   semantics deferred to #574).
 - #461 — Phase A.2 — post-perceus cache + emit-only-user.
 - #574 — typer per-module semantics (sub-step 3d-future of #460;
-  A.1 pre-blocker).
+  A.1 pre-blocker, closed by #578).
+- #597 — `lower_protocols` + synth desugar boundary tagging (the
+  remaining A.1 pre-blocker after #574 closed).
 - #454 — Compiler library mode (defines the TypedModule that gets
   serialised).
 - #447 — LSP v1 (consumes #454's query surface; benefits from this
