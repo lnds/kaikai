@@ -16,9 +16,9 @@
 # Conventions:
 #   - **Iteration order is by key**, not by insertion order. The
 #     v0 carrier preserved insertion order; that contract changed
-#     when the tree carrier shipped (issue #128). `map_keys`,
-#     `map_values`, and `map_to_pairs` produce keys in ascending
-#     order under the runtime's `<` operator.
+#     when the tree carrier shipped (issue #128). `keys`, `values`,
+#     and `to_pairs` produce keys in ascending order under the
+#     runtime's `<` operator.
 #   - Key equality is structural via `==` (kaikai's deep-equals
 #     runtime helper). Key ordering is the runtime's `<` operator,
 #     which today defines a total order on `Int`, `Real`, `Char`,
@@ -30,22 +30,54 @@
 #     (rotations rebuild only the spine to the inserted/removed
 #     leaf), so the per-op allocation cost stays `O(log n)`.
 #
-# Public surface (flat-prefix until m14 namespaced migration):
+# Public surface (m14 follow-up, issue #613): the qualified-call
+# form is canonical (`map.put(m, k, v)`); flat-prefix aliases
+# (`map_put`, `map_get`, …) are retained for the tongariki edition
+# per `docs/editions.md` stability discipline and are scheduled to
+# drop at the Orongo edition boundary.
 #
-#   pub fn map_empty[k, v]() : Map[k, v]
-#   pub fn map_size[k, v](m: Map[k, v]) : Int
-#   pub fn map_is_empty[k, v](m: Map[k, v]) : Bool
-#   pub fn map_get[k, v](m: Map[k, v], key: k) : Option[v]
-#   pub fn map_contains[k, v](m: Map[k, v], key: k) : Bool
-#   pub fn map_put[k, v](m: Map[k, v], key: k, value: v) : Map[k, v]
-#   pub fn map_remove[k, v](m: Map[k, v], key: k) : Map[k, v]
-#   pub fn map_keys[k, v](m: Map[k, v]) : [k]
-#   pub fn map_values[k, v](m: Map[k, v]) : [v]
-#   pub fn map_to_pairs[k, v](m: Map[k, v]) : [Pair[k, v]]
-#   pub fn map_from_pairs[k, v](ps: [Pair[k, v]]) : Map[k, v]
+# Qualified canonical (16 pub fns):
+#
+#   pub fn empty[k, v]() : Map[k, v]
+#   pub fn size[k, v](m: Map[k, v]) : Int
+#   pub fn is_empty[k, v](m: Map[k, v]) : Bool
+#   pub fn get[k, v](m: Map[k, v], key: k) : Option[v]
+#   pub fn contains[k, v](m: Map[k, v], key: k) : Bool
+#   pub fn put[k, v](m: Map[k, v], key: k, value: v) : Map[k, v]
+#   pub fn remove[k, v](m: Map[k, v], key: k) : Map[k, v]
+#   pub fn keys[k, v](m: Map[k, v]) : [k]
+#   pub fn values[k, v](m: Map[k, v]) : [v]
+#   pub fn to_pairs[k, v](m: Map[k, v]) : [Pair[k, v]]
+#   pub fn from_pairs[k, v](ps: [Pair[k, v]]) : Map[k, v]
+#   pub fn update[k, v](m: Map[k, v], key: k, default: v, f: (v) -> v) : Map[k, v]
+#   pub fn fold[k, v, a, e](m: Map[k, v], init: a, f: (a, Pair[k, v]) -> a / e) : a / e
+#   pub fn merge[k, v](m1: Map[k, v], m2: Map[k, v]) : Map[k, v]  -- m1 keys win
+#   pub fn filter[k, v, e](m: Map[k, v], p: (Pair[k, v]) -> Bool / e) : Map[k, v] / e
+#   pub fn transform_values[k, v, w, e](m: Map[k, v], f: (v) -> w / e) : Map[k, w] / e
+#
+# Pipe convention (issue #594): `Map[k, v]` participates in `|`,
+# `||`, `|?` through the canonical `map`, `flat_map`, `filter`
+# exports — elements are `Pair[k, v]`. `filter` is shared with the
+# round-out surface above.
+#
+#   pub fn map[k, v, w, e](m: Map[k, v], f: (Pair[k, v]) -> Pair[k, w] / e)
+#       : Map[k, w] / e
+#   pub fn flat_map[k, v, k2, v2, e](m: Map[k, v], f: (Pair[k, v]) -> Map[k2, v2] / e)
+#       : Map[k2, v2] / e
+#
+# `transform_values` (values-only) is distinct from `map`
+# (pair-based, pipe-canonical). The name avoids the ugly
+# `map.map_values(m, f)` qualified call.
+#
+# Legacy flat-prefix aliases (tongariki only; dropped at Orongo):
+#
+#   pub fn map_empty, map_size, map_is_empty, map_get, map_contains,
+#   pub fn map_put, map_remove, map_to_pairs, map_keys, map_values,
+#   pub fn map_from_pairs
 #
 # The read-side indexing sugar `m[key]` lowers to `map_get(m, key)`
-# at the typer (see `docs/syntax-sugars.md` §4). The write-side
+# at the typer (see `docs/syntax-sugars.md` §4). The alias keeps
+# that lowering byte-identical post-rename. The write-side
 # `m[key] := v` is **rejected** in v1 with a typed error pointing
 # at `map_put`; the v2 design lands alongside the HAMT carrier.
 
@@ -58,7 +90,7 @@
 # record (none in tree-stage stdlib, but tests have done it before)
 # fail with a clear field error rather than a silent type mismatch.
 
-pub type Tree[k, v]
+type Tree[k, v]
   = TEmpty
   | TNode(k, v, Int, Tree[k, v], Tree[k, v])
 
@@ -202,46 +234,156 @@ fn tree_to_pairs_acc(t: Tree[k, v], acc: [Pair[k, v]]) : [Pair[k, v]] = match t 
     tree_to_pairs_acc(l, [Pair { fst: nk, snd: nv }, ...tree_to_pairs_acc(r, acc)])
 }
 
-# ---- Public surface ---------------------------------------------
+# In-order fold over the tree. `f` sees pairs in ascending key
+# order. The accumulator threads through left subtree, then the
+# current node, then the right subtree. Effect row `e` flows out
+# so callers can fold with side-effecting `f` (e.g. logging).
+fn tree_fold(t: Tree[k, v], acc: a, f: (a, Pair[k, v]) -> a / e) : a / e = match t {
+  TEmpty -> acc
+  TNode(nk, nv, _, l, r) -> {
+    let left_done  = tree_fold(l, acc, f)
+    let with_self  = f(left_done, Pair { fst: nk, snd: nv })
+    tree_fold(r, with_self, f)
+  }
+}
 
-pub fn map_empty() : Map[k, v] = Map { root: TEmpty }
+# ---- Public surface (qualified canonical) -----------------------
 
-pub fn map_size(m: Map[k, v]) : Int = tree_size(m.root)
+pub fn empty() : Map[k, v] = Map { root: TEmpty }
 
-pub fn map_is_empty(m: Map[k, v]) : Bool = match m.root {
+pub fn size(m: Map[k, v]) : Int = tree_size(m.root)
+
+pub fn is_empty(m: Map[k, v]) : Bool = match m.root {
   TEmpty -> true
   _      -> false
 }
 
-pub fn map_get(m: Map[k, v], key: k) : Option[v] =
+pub fn get(m: Map[k, v], key: k) : Option[v] =
   tree_get(m.root, key)
 
-pub fn map_contains(m: Map[k, v], key: k) : Bool = match map_get(m, key) {
+pub fn contains(m: Map[k, v], key: k) : Bool = match get(m, key) {
   Some(_) -> true
   None    -> false
 }
 
-pub fn map_put(m: Map[k, v], key: k, value: v) : Map[k, v] =
+pub fn put(m: Map[k, v], key: k, value: v) : Map[k, v] =
   Map { root: tree_insert(m.root, key, value) }
 
-pub fn map_remove(m: Map[k, v], key: k) : Map[k, v] =
+pub fn remove(m: Map[k, v], key: k) : Map[k, v] =
   Map { root: tree_remove(m.root, key) }
 
-pub fn map_to_pairs(m: Map[k, v]) : [Pair[k, v]] =
+pub fn to_pairs(m: Map[k, v]) : [Pair[k, v]] =
   tree_to_pairs_acc(m.root, [])
 
-pub fn map_keys(m: Map[k, v]) : [k] =
-  list.map(map_to_pairs(m), (p) => p.fst)
+pub fn keys(m: Map[k, v]) : [k] =
+  list.map(to_pairs(m), (p) => p.fst)
 
-pub fn map_values(m: Map[k, v]) : [v] =
-  list.map(map_to_pairs(m), (p) => p.snd)
+pub fn values(m: Map[k, v]) : [v] =
+  list.map(to_pairs(m), (p) => p.snd)
 
-# Fold left, applying `map_put` once per pair so duplicate keys in
+# Fold left, applying `put` once per pair so duplicate keys in
 # the input collapse to the last occurrence (standard semantics).
-fn map_from_pairs_loop(ps: [Pair[k, v]], acc: Map[k, v]) : Map[k, v] = match ps {
+fn from_pairs_loop(ps: [Pair[k, v]], acc: Map[k, v]) : Map[k, v] = match ps {
   []           -> acc
-  [p, ...rest] -> map_from_pairs_loop(rest, map_put(acc, p.fst, p.snd))
+  [p, ...rest] -> from_pairs_loop(rest, put(acc, p.fst, p.snd))
 }
 
-pub fn map_from_pairs(ps: [Pair[k, v]]) : Map[k, v] =
-  map_from_pairs_loop(ps, map_empty())
+pub fn from_pairs(ps: [Pair[k, v]]) : Map[k, v] =
+  from_pairs_loop(ps, empty())
+
+# ---- Round-out (issue #613) -------------------------------------
+
+# `update(m, key, default, f)`: when `key` is present, replaces its
+# value with `f(old)`; when absent, inserts `default`. One tree
+# walk via `get` + `put`; `f` is invoked at most once.
+pub fn update(m: Map[k, v], key: k, default: v, f: (v) -> v) : Map[k, v] =
+  match get(m, key) {
+    Some(old) -> put(m, key, f(old))
+    None      -> put(m, key, default)
+  }
+
+# Left-biased in-order fold over the map. Pairs are visited in
+# ascending key order; `f` is invoked exactly `size(m)` times.
+# Effects in `f` flow out via `e`.
+pub fn fold(m: Map[k, v], init: a, f: (a, Pair[k, v]) -> a / e) : a / e =
+  tree_fold(m.root, init, f)
+
+# Left-biased merge: keys present in `m1` win on conflict. `m2`
+# pairs are folded into `m1` with a `put` that overwrites only
+# when the key is absent in `m1`. O((n1 + n2) log n1) — one
+# `contains` + `put` per pair of `m2`.
+pub fn merge(m1: Map[k, v], m2: Map[k, v]) : Map[k, v] =
+  fold(m2, m1, (acc, p) => if contains(acc, p.fst) { acc } else { put(acc, p.fst, p.snd) })
+
+# Keeps the pairs of `m` for which `p` returns true. Element shape
+# is `Pair[k, v]` (consistent with `fold` and the pipe-convention
+# exports below). `p` is invoked exactly `size(m)` times.
+pub fn filter(m: Map[k, v], p: (Pair[k, v]) -> Bool / e) : Map[k, v] / e =
+  fold(m, empty(), (acc, pr) => if p(pr) { put(acc, pr.fst, pr.snd) } else { acc })
+
+# Transforms each value through `f`, keeping keys unchanged. The
+# result type `Map[k, w]` may differ from the input value type.
+# Named `transform_values` rather than `map_values` because the
+# qualified call site reads `map.transform_values(m, f)` — the
+# 0-arg form `map.values(m) : [v]` already owns the `values`
+# name, and `map.map` is reserved for the pipe-canonical
+# pair-shaped transform below.
+pub fn transform_values(m: Map[k, v], f: (v) -> w / e) : Map[k, w] / e =
+  fold(m, empty(), (acc, p) => put(acc, p.fst, f(p.snd)))
+
+# ---- Pipe convention exports (issue #594) -----------------------
+#
+# `Map[k, v]` participates in `|`, `||`, `|?` post-#594 by
+# exporting `map`, `flat_map`, `filter` with the canonical
+# convention signatures. Elements are `Pair[k, v]` (consistent
+# with Elixir's `Enum.map(map, fn {k, v} -> … end)`). `filter` is
+# shared with the round-out section above; only `map` and
+# `flat_map` are introduced here.
+
+# Pair-shaped element transform: each pair becomes a new pair,
+# possibly with a different value type. Duplicate output keys
+# collapse to the last occurrence by `put` semantics.
+pub fn map(m: Map[k, v], f: (Pair[k, v]) -> Pair[k, w] / e) : Map[k, w] / e =
+  fold(m, empty(), (acc, p) => {
+    let q = f(p)
+    put(acc, q.fst, q.snd)
+  })
+
+# Pair-shaped flat-map: each input pair produces a sub-map; the
+# sub-maps are folded together with `merge` semantics (earlier
+# sub-maps' keys win on conflict, consistent with `merge`).
+pub fn flat_map(m: Map[k, v], f: (Pair[k, v]) -> Map[k2, v2] / e) : Map[k2, v2] / e =
+  fold(m, empty(), (acc, p) => merge(acc, f(p)))
+
+# ---- Legacy flat-prefix aliases (tongariki; drop at Orongo) -----
+#
+# Every alias is a one-liner delegating to the qualified
+# canonical above. The aliases preserve selfhost byte-identicality
+# (the only stage2 call site is the textual `"map_get"` callee
+# name synthesised by the indexing-sugar lowering, which keeps
+# resolving as long as `map_get` remains a pub fn) and every
+# user-side call site in `examples/`, `demos/`, `tests/`,
+# `stdlib/-self`. Scheduled to drop at the Orongo edition
+# boundary per `docs/editions.md` stability discipline.
+
+pub fn map_empty() : Map[k, v] = empty()
+
+pub fn map_size(m: Map[k, v]) : Int = size(m)
+
+pub fn map_is_empty(m: Map[k, v]) : Bool = is_empty(m)
+
+pub fn map_get(m: Map[k, v], key: k) : Option[v] = get(m, key)
+
+pub fn map_contains(m: Map[k, v], key: k) : Bool = contains(m, key)
+
+pub fn map_put(m: Map[k, v], key: k, value: v) : Map[k, v] = put(m, key, value)
+
+pub fn map_remove(m: Map[k, v], key: k) : Map[k, v] = remove(m, key)
+
+pub fn map_to_pairs(m: Map[k, v]) : [Pair[k, v]] = to_pairs(m)
+
+pub fn map_keys(m: Map[k, v]) : [k] = keys(m)
+
+pub fn map_values(m: Map[k, v]) : [v] = values(m)
+
+pub fn map_from_pairs(ps: [Pair[k, v]]) : Map[k, v] = from_pairs(ps)
