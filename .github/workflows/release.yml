@@ -194,79 +194,88 @@ jobs:
     name: Mirror filtered source to kaikailang-org/kaikai
     needs: release
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
-      - name: Checkout work repo (full history + tags)
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout work repo at tag (no persisted creds)
+        # persist-credentials: false is load-bearing. With the default
+        # (true), actions/checkout installs http.extraheader with the
+        # ephemeral GITHUB_TOKEN. That header applies to every push to
+        # github.com — including push to the public mirror — and
+        # overrides the PAT embedded in the remote URL, producing a
+        # 403 "denied to github-actions[bot]" that broke this job for
+        # 8 consecutive releases (v0.63.0 → v0.68.1).
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          fetch-tags: true
+          ref: ${{ steps.tag.outputs.tag }}
+          persist-credentials: false
 
-      - name: Install git-filter-repo
+      - name: Verify VERSION matches tag
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y git-filter-repo
+          ver="$(cat VERSION)"
+          tag="${{ steps.tag.outputs.tag }}"
+          if [ "v$ver" != "$tag" ]; then
+            echo "::error::tag $tag does not match VERSION $ver"
+            exit 1
+          fi
 
-      - name: Configure git identity for the mirror commit
+      - name: Apply public-mirror overlay
         run: |
-          git config user.name "kaikai-release-bot"
-          git config user.email "kaikai-release-bot@users.noreply.github.com"
-
-      - name: Filter internal-only paths + strip Claude trailers
-        run: |
-          # Mirror the logic of tools/publish.sh in-process. Run in the
-          # checked-out workspace; force-pushes go to kaikailang-org/kaikai.
-          git filter-repo \
-            --path-glob 'docs/lane-experience-*.md' \
-            --path-glob 'docs/lane-audit-*.md' \
-            --path-glob 'docs/*audit*.md' \
-            --path-glob 'docs/*honesty*.md' \
-            --path-glob 'docs/*followup*.md' \
-            --path-glob 'docs/nocturnal-*.md' \
-            --path tools/coverage-baseline.txt \
-            --path tools/symbolize-rc-trace.sh \
-            --path tools/bench-phases.sh \
-            --invert-paths \
-            --message-callback '
-          import re
-          text = message.decode("utf-8", errors="replace")
-          text = re.sub(r"^Co-Authored-By: .*Claude.*\n?", "", text, flags=re.MULTILINE | re.IGNORECASE)
-          text = re.sub(r"^.*Generated with .*Claude.*\n?", "", text, flags=re.MULTILINE | re.IGNORECASE)
-          text = re.sub(r"^🤖.*\n?", "", text, flags=re.MULTILINE)
-          text = re.sub(r"\n{3,}$", "\n\n", text)
-          return text.encode("utf-8")
-          ' \
-            --force
-
-      - name: Replace CLAUDE.md, add CONTRIBUTING.md, sed-clean decisions
-        run: |
+          # Replace CLAUDE.md / add CONTRIBUTING.md / scrub the one
+          # internal-lane-report reference in docs/decisions/.
           cp tools/publish/CLAUDE.md.public CLAUDE.md
           cp tools/publish/CONTRIBUTING.md.public CONTRIBUTING.md
           sed -i \
             -e 's|See `docs/lane-experience-kai-repl-watch.md` for the|See an internal lane report for the|' \
             -e 's|`docs/lane-experience-kai-repl-watch.md` is left intact as the|the internal lane report is preserved as the|' \
             docs/decisions/repl-removal-2026-05-09.md
-          git add CLAUDE.md CONTRIBUTING.md docs/decisions/repl-removal-2026-05-09.md
-          if ! git diff --cached --quiet; then
-            git commit -m "docs: prepare public mirror (CLAUDE.md trimmed, CONTRIBUTING.md added)"
-          fi
+          # Strip internal-only paths from the working tree. The mirror
+          # is published as a single orphan commit, so removing the
+          # files from the worktree is enough — no history rewrite,
+          # no `git filter-repo`, no prune-empty hazards.
+          rm -f docs/lane-experience-*.md \
+                docs/lane-audit-*.md \
+                docs/*audit*.md \
+                docs/*honesty*.md \
+                docs/*followup*.md \
+                docs/nocturnal-*.md \
+                tools/coverage-baseline.txt \
+                tools/symbolize-rc-trace.sh \
+                tools/bench-phases.sh
 
-      - name: Push filtered main to public
+      - name: Push orphan snapshot as main + tag
         env:
           PUBLISH_TOKEN: ${{ secrets.TAP_PAT }}
         run: |
+          # The mirror is intentionally history-free: a single orphan
+          # commit per release containing the filtered snapshot at this
+          # tag. Both `main` and `${tag}` point at the same commit,
+          # which makes the VERSION-at-tag check tautological — it can
+          # never drift again. This matches what the integrator did by
+          # hand to recover from the 8-release outage at v0.68.1.
+          # Releases on the public mirror's Releases page (with the
+          # darwin-arm64 tarball) remain the canonical source of
+          # historical artifacts; full development history lives on
+          # lnds/kaikai.
+          git config user.name "kaikai-release-bot"
+          git config user.email "kaikai-release-bot@users.noreply.github.com"
+          tag="${{ steps.tag.outputs.tag }}"
+          git checkout --orphan public-snapshot
+          git add -A
+          git commit -m "release: ${tag}
+
+          Filtered snapshot of lnds/kaikai at ${tag}.
+          See https://github.com/lnds/kaikai for full development history."
           git remote add public "https://x-access-token:${PUBLISH_TOKEN}@github.com/kaikailang-org/kaikai.git"
-          git push public main:main --force
-
-      - name: Push filtered tags to public (one-by-one to avoid SSH pack hang)
-        env:
-          PUBLISH_TOKEN: ${{ secrets.TAP_PAT }}
-        run: |
-          # Iterate tags individually; SSH batch tag push has hung on
-          # macOS in the past. HTTPS via PAT works the same on Linux but
-          # we stay defensive.
-          for tag in $(git tag --list 'v*' | sort); do
-            git push public "refs/tags/${tag}:refs/tags/${tag}" --force || {
-              echo "::warning::failed to push tag $tag"
-            }
-          done
+          git push public HEAD:refs/heads/main --force
+          git tag -f "$tag"
+          git push public "refs/tags/${tag}" --force
