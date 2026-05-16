@@ -43,10 +43,15 @@
 #     `Content-Length`; a missing header means "read until peer
 #     close" (HTTP/1.0 fallback). Chunked decoding lands when a
 #     real-world workload demands it.
-#   - Redirects (3xx). The caller inspects `response.status` and
-#     re-issues the request against `Location` if desired. An
-#     automatic follow surface waits for the cookie / redirect
-#     policy design.
+#   - Redirects (3xx). `http_request` returns the 3xx verbatim;
+#     callers that want automatic follow use `http_follow` /
+#     `http_get_follow` / `http_post_follow` / `http_put_follow` /
+#     `http_delete_follow` (closes #357). The follow surface honours
+#     RFC 9110 §15.4 method-rewrite rules through a `RedirectPolicy`
+#     record with sane defaults; cookie persistence across hops
+#     (Set-Cookie jar, cross-origin Authorization stripping policy,
+#     per-host overrides) remains deferred until the cookie design
+#     lands in a follow-up edition.
 #   - Compression (gzip / deflate / br). The `Accept-Encoding`
 #     header is not set automatically; servers that honour it
 #     would need a decoder this lane does not ship.
@@ -666,3 +671,188 @@ fn http_request_ready(acc_rev: [Int], _have: Int) : Option[Request] = {
     }
   }
 }
+
+# ---- redirect following (issue #357) ------------------------------
+#
+# `http_follow` (and the convenience `http_*_follow` wrappers) sit
+# on top of the existing `http_request`. The single-call surface
+# (`http_request`, `http_get`, `http_post`, …) is unchanged: callers
+# that want explicit control over 3xx handling keep using it. Callers
+# that want browser-like behaviour (auto-follow, RFC 9110 §15.4
+# method-rewrite rules, bounded loop) opt into `http_follow`.
+#
+# Out of scope for this lane (each cited in the issue #357 body):
+#   - Set-Cookie persistence across hops.
+#   - Cross-origin Authorization / Cookie stripping policy. The
+#     v1 follow surface forwards `req.headers` verbatim; callers
+#     who care strip these themselves before calling.
+#   - HSTS preload table.
+#   - Per-host policy overrides.
+#   - Permanent-redirect (301 / 308) caching.
+# These follow once the cookie / credentials policy lands.
+
+# `RedirectPolicy` carries the four knobs the issue body pinned —
+# nothing more. A record (rather than scattered `Bool` parameters
+# on `http_follow`) so callers can build a default once and override
+# only the field they care about; the typer pins the field types
+# from a single constructor literal at every call site.
+#
+# Field semantics:
+#   - `max_redirects`: hard cap on hops before `http_follow` returns
+#     `Err("too many redirects (max <N>)")`. Default 10 — matches
+#     curl, Go's net/http, Python's requests.
+#   - `follow_3xx`: status codes that trigger a follow. Default
+#     [301, 302, 303, 307, 308] — every redirect status RFC 9110
+#     §15.4 lists.
+#   - `rewrite_post_to_get_on_303`: when a POST hits a 303 See Other,
+#     the follow request is a GET with no body (RFC 9110 §15.4.4).
+#     Default true; flip to false only for compatibility with
+#     non-conformant servers.
+#   - `preserve_method_307_308`: when a 307 / 308 is followed, the
+#     method and body are preserved (RFC 9110 §15.4.8 / §15.4.9).
+#     Default true; flip to false only for caller-driven shims.
+pub type RedirectPolicy = {
+  max_redirects: Int,
+  follow_3xx: [Int],
+  rewrite_post_to_get_on_303: Bool,
+  preserve_method_307_308: Bool,
+}
+
+# Sane defaults in one place — every convenience wrapper threads
+# the result through `http_follow`. Callers who want a custom
+# policy build a `RedirectPolicy { … }` literal directly.
+pub fn default_redirect_policy() : RedirectPolicy = RedirectPolicy {
+  max_redirects: 10,
+  follow_3xx: [301, 302, 303, 307, 308],
+  rewrite_post_to_get_on_303: true,
+  preserve_method_307_308: true,
+}
+
+# Local helpers — neither `string_starts_with` nor `list_contains`
+# is in the prelude (see stage1/compiler.kai EP() table); we keep
+# them private here rather than reaching into stdlib.core to avoid
+# the cross-module dependency the stage 2 prelude chain enforces.
+
+fn http_string_starts_with(s: String, prefix: String) : Bool = {
+  let pn = string_length(prefix)
+  let sn = string_length(s)
+  if pn == 0 { true }
+  else if pn > sn { false }
+  else { string_slice(s, 0, pn) == prefix }
+}
+
+fn http_status_in(codes: [Int], status: Int) : Bool = match codes {
+  [] -> false
+  [c, ...rest] -> if c == status { true } else { http_status_in(rest, status) }
+}
+
+# `Location` resolution per RFC 9110 §10.2.2. Three shapes:
+#   - Absolute URL (`http://…`, `https://…`): used verbatim. The
+#     downstream `http_request` will reject `https://` with a clear
+#     Err so callers see why the redirect dead-ends.
+#   - Path-absolute (`/foo`): keep scheme + host + port from the
+#     previous request, swap the path. The `:port` is always
+#     emitted (rather than relying on the scheme default) because
+#     `http_parse_url` round-trips it explicitly.
+#   - Anything else (relative path, protocol-relative `//host/…`):
+#     v1 returns the Location verbatim so the follow attempt fails
+#     with a parse error the caller can surface. A real RFC 3986
+#     §5 base resolver lands when `net.url` is its own module
+#     (docs/stdlib-layout.md §`net` "url.kai planned").
+fn http_resolve_redirect_url(orig_url: String, loc: String) : String = {
+  if http_string_starts_with(loc, "http://") or http_string_starts_with(loc, "https://") {
+    loc
+  } else if http_string_starts_with(loc, "/") {
+    match http_parse_url(orig_url) {
+      Err(_) -> loc
+      Ok(u)  -> string_concat_all([u.scheme, "://", u.host, ":", int_to_string(u.port), loc])
+    }
+  } else {
+    loc
+  }
+}
+
+# Build the follow-up `Request` from the original + the response
+# status + the `Location` value + the policy. Method-rewrite rules
+# are expressed positively: 303 wins over 307/308 wins over 301/302
+# because no real status hits more than one branch, but the order
+# matches RFC 9110 §15.4 reading order for clarity.
+fn http_build_next_request(orig: Request, status: Int, loc: String,
+                           policy: RedirectPolicy) : Request = {
+  let new_method =
+    if status == 303 and policy.rewrite_post_to_get_on_303 and orig.method == "POST" {
+      "GET"
+    } else if (status == 307 or status == 308) and policy.preserve_method_307_308 {
+      orig.method
+    } else if (status == 301 or status == 302) and orig.method == "POST" {
+      "GET"
+    } else {
+      orig.method
+    }
+  let new_body = if new_method == "GET" { "" } else { orig.body }
+  let new_url  = http_resolve_redirect_url(orig.url, loc)
+  Request { method: new_method, url: new_url, headers: orig.headers, body: new_body }
+}
+
+# Inner loop — one hop per recursive call. Tail-recursive so the
+# mandatory TCO (CLAUDE.md Tier 1 #2) keeps the stack flat for the
+# `max_redirects=10` default. The `n_redirects` counter is the hop
+# index of the *current* request; we compare against `max_redirects`
+# *before* issuing so a policy of 0 redirects still allows the
+# initial request through.
+fn http_follow_loop(req: Request, policy: RedirectPolicy, n_redirects: Int)
+    : Result[String, Response] / NetTcp + Cancel = {
+  if n_redirects > policy.max_redirects {
+    Err(string_concat_all([
+      "too many redirects (max ", int_to_string(policy.max_redirects), ")"
+    ]))
+  } else {
+    let resp = http_request(req)
+    if http_status_in(policy.follow_3xx, resp.status) {
+      match http_header_lookup(resp.headers, "Location") {
+        None -> Err(string_concat_all([
+          "redirect missing Location header at status ",
+          int_to_string(resp.status)
+        ]))
+        Some(loc) -> {
+          let next_req = http_build_next_request(req, resp.status, loc, policy)
+          http_follow_loop(next_req, policy, n_redirects + 1)
+        }
+      }
+    } else {
+      Ok(resp)
+    }
+  }
+}
+
+# Public entry point — issue the request and follow 3xx redirects
+# until either a non-3xx status is reached, the `Location` header
+# is missing, or `policy.max_redirects` is exceeded. The bare
+# `http_request` keeps its single-call semantics so existing call
+# sites are unaffected.
+pub fn http_follow(req: Request, policy: RedirectPolicy)
+    : Result[String, Response] / NetTcp + Cancel =
+  http_follow_loop(req, policy, 0)
+
+# Convenience wrappers mirroring `http_get` / `http_post` / `http_put`
+# / `http_delete`. Each builds a `Request` value and threads it
+# through `http_follow` with the default policy. Callers that need
+# custom headers or a non-default policy fall through to `http_follow`
+# directly.
+pub fn http_get_follow(url: String) : Result[String, Response] / NetTcp + Cancel =
+  http_follow(Request { method: "GET", url: url, headers: [], body: "" },
+              default_redirect_policy())
+
+pub fn http_post_follow(url: String, body: String)
+    : Result[String, Response] / NetTcp + Cancel =
+  http_follow(Request { method: "POST", url: url, headers: [], body: body },
+              default_redirect_policy())
+
+pub fn http_put_follow(url: String, body: String)
+    : Result[String, Response] / NetTcp + Cancel =
+  http_follow(Request { method: "PUT", url: url, headers: [], body: body },
+              default_redirect_policy())
+
+pub fn http_delete_follow(url: String) : Result[String, Response] / NetTcp + Cancel =
+  http_follow(Request { method: "DELETE", url: url, headers: [], body: "" },
+              default_redirect_policy())
