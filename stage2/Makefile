@@ -1547,8 +1547,7 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (row match accepted)" \
 	    || { echo "effects FAIL $$name (matching rows rejected)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
-	for f in ../examples/effects/row_mismatch_higher_order.kai \
-	         ../examples/effects/row_pure_to_effectful.kai; do \
+	for f in ../examples/effects/row_mismatch_higher_order.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
 	    { echo "effects FAIL $$name (row mismatch accepted)"; exit 1; } \
@@ -1556,6 +1555,12 @@ test-effects: $(TARGET) build
 	  grep -q "type mismatch in function call" build/s2-$$name.err \
 	    && echo "effects OK $$name (rejected as expected)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/row_pure_to_effectful.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    && echo "effects OK $$name (pure-to-effectful elaboration accepted)" \
+	    || { echo "effects FAIL $$name (pure-to-effectful elaboration rejected)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/op_call_basic.kai; do \
 	  name=$$(basename $$f .kai); \

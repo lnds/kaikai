@@ -139,6 +139,15 @@ need either row-constraint propagation or explicit coercions),
 and the resulting errors are hard to explain. Keep the model
 concrete-per-call: if you want polymorphism, use a row variable.
 
+> **Note — pure named callbacks (issue #645).** A function declared
+> without a `/` row clause is treated as row-polymorphic at the call
+> site: its scheme gains an implicit row variable so callers can pass
+> it where any row is expected. The mechanism is generalisation, not
+> subsumption — the body itself is still verified to be pure, and the
+> asymmetry above is preserved (a `/ Stdout` callee still cannot flow
+> into a slot demanding purity). This removes the `[e] / e`
+> boilerplate from named pure callbacks in higher-order combinators.
+
 ## Syntax
 
 ### Function types with effects
