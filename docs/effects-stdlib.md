@@ -1025,15 +1025,17 @@ runs only when the wait is interrupted by cancellation; on a
 clean exit, control flows past the `with` clause and the
 `Result` from `Process.wait` is returned untouched.
 
-> **v1 status (2026-05-09).** `wait_or_kill` does NOT ship in
-> `stdlib/os/process.kai`'s v1 surface (#346). The blocker is
-> upstream: `kai_default_process_wait` blocks via plain
-> `waitpid(pid, &status, 0)` (parking the OS thread, not the
-> fiber), so a Cancel raised from another fiber cannot interrupt
-> a wait in flight. The handler shown above would never run on a
+> **v1 status (2026-05-16).** `wait_or_kill` still does NOT ship in
+> `stdlib/os/process.kai`'s v1 surface (#346). The R1 reactor
+> (#611, 2026-05-15) flipped `kai_default_process_wait` to park
+> the *fiber* on a SIGCHLD self-pipe instead of blocking the OS
+> thread inside `waitpid(pid, &status, 0)`. However, the wake
+> source is the child's exit — Cancel mid-wait does NOT unwind
+> the op, so the handler shown above would still not run on a
 > Cancel that arrives during `Process.wait`. The helper lands
-> alongside the m8.x.x reactor work that turns `Process.wait`
-> into a fiber-suspending op.
+> alongside the cancel-aware reactor redesign queued for R2 in
+> Orongo (see `docs/fibers-honesty-targets.md` §*Residual m8.x
+> items*).
 
 ### What's not in v1 (planned extensions)
 
@@ -1087,9 +1089,14 @@ yield-point because building a `KaiValue` variant in a signal
 handler is not async-signal-safe; the BEAM-style `on_cancel(sig)`
 shape sketched in issue #107 also requires Cancel to honour
 user-installed handlers on runtime-triggered cancellation, which
-v1 does not (`docs/fibers-honesty-targets.md`). Both points
-disappear once the m8.x scheduler lands; until then, `on/off/
-await` is the shape.
+v1 still does not (`docs/fibers-honesty-targets.md` §*Residual
+m8.x items*). The cooperative scheduler shipped in v0.4.0, and the
+reactor (R1+R2+R3, #611/#620/#630, 2026-05-15→2026-05-16) flipped
+`File`/`Clock`/`Process`/`Stdin`/`NetTcp` to park the fiber — but
+`Signal.await` was deliberately left out of that surface (the
+sigwait→reactor port would need an SA_RESTART-safe self-pipe shape
+and the `on_cancel(sig)` redesign noted above). For now, `on/off/
+await` keeps its v1 shape.
 
 ### Platform
 
@@ -1112,8 +1119,10 @@ backends; they are out of scope for the v1 effect.
 - `await()` blocks the OS thread. Other fibers cannot make
   progress while it is parked. Acceptable when `main` parks on
   `Signal.await()` after spawning workers; reactor-driven
-  non-blocking integration with the Spawn scheduler waits on
-  m8.x.
+  non-blocking integration with the Spawn scheduler is queued for
+  Orongo (the R1/R2/R3 wave that landed in 2026-05-15→2026-05-16
+  covered `File`/`Clock`/`Process`/`Stdin`/`NetTcp` only — see
+  `docs/fibers-honesty-targets.md`).
 - SIGCHLD is not exposed — `Process.wait` already reaps
   children internally.
 - Real-time signals (SIGRTMIN+n) and the `siginfo_t` payload
