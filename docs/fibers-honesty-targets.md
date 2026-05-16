@@ -44,9 +44,23 @@ or in the 1.0-honesty target list is shipped and verifiable.
   sleeping 100 ms finish in ~100 ms total (`demos/sleep_concurrent`),
   3 concurrent `Process.wait`s on a 200 ms child sleep finish in
   ~200 ms (`demos/process_wait_concurrent`), and 4 file writes
-  share the disk in parallel (`demos/file_concurrent`). TCP
-  sockets (`NetTcp`) and stdin (`read_line`) stay blocking until
-  R2 and R3 ship in Orongo alongside the Cancel redesign.
+  share the disk in parallel (`demos/file_concurrent`).
+- **R3 reactor shipped 2026-05-15 (issue #620)** — `Stdin.read_line`
+  and `Stdin.read_bytes` park the *fiber* on a singleton
+  `kai_reactor_stdin_waiter` slot. Fd 0 is set to `O_NONBLOCK`
+  once per process with an `atexit`-restored cleanup; the
+  scheduler's `poll()` set grows a third slot for `STDIN_FILENO`
+  whenever a waiter is registered, and POLLIN / POLLHUP / POLLERR
+  promote the parked fiber. `demos/stdin_concurrent` shows the
+  compute fiber running while the reader is parked on a slow pipe
+  (`(echo a; sleep 0.5; echo b) | demo`); the same demo runs
+  cleanly under the regression harness with stdin closed because
+  the empty-pipe case maps to `None` on the first iteration.
+  Multiple concurrent stdin readers panic with a clear diagnostic
+  (`stdin: multiple fibers reading concurrently is undefined;
+  serialize via an actor`). TCP sockets (`NetTcp`) stay blocking
+  until R2 ships in Orongo alongside the Cancel-mid-syscall
+  redesign.
 - §*Residual m8.x items* below now reduces to three minor
   items, none of which surface as runtime errors today.
 
@@ -80,7 +94,8 @@ can be parallelised across short lanes.
 | ~~**LLVM op-dispatch `in_dispatch_node`**~~ ✅ shipped 2026-04-30 | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend — three runtime helpers (`kaix_evidence_lookup_node` / `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the KaiFiber struct out of the IR |
 | ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
 | ~~**Per-op generics in Spawn API**~~ ✅ shipped 2026-05-02 | ~0.5d | TYPE generics retrofitted 2026-04-30 on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk closed in issue #72 — `Spawn.spawn[T, e](f: () -> T / e)` is the canonical entry point, wrappers in `stdlib/spawn.kai` reduced to one-line aliases |
-| ~~**Reactor — Phase R1 (file + sleep + process)**~~ ✅ shipped 2026-05-15 | ~1d | Issue #611. Sorted timer wheel + SIGCHLD self-pipe + 4-worker file pool, woken via a single `poll()` on the scheduler thread. `Clock.sleep_ns`, `File.read_file` / `write_file`, `Process.wait` no longer freeze the scheduler; sockets (`NetTcp`) and stdin queue for R2 / R3 in Orongo |
+| ~~**Reactor — Phase R1 (file + sleep + process)**~~ ✅ shipped 2026-05-15 | ~1d | Issue #611. Sorted timer wheel + SIGCHLD self-pipe + 4-worker file pool, woken via a single `poll()` on the scheduler thread. `Clock.sleep_ns`, `File.read_file` / `write_file`, `Process.wait` no longer freeze the scheduler; sockets (`NetTcp`) queue for R2 in Orongo |
+| ~~**Reactor — Phase R3 (stdin)**~~ ✅ shipped 2026-05-15 | ~0.1d | Issue #620. Singleton `kai_reactor_stdin_waiter` slot reuses the existing `poll()` set; fd 0 is flipped to `O_NONBLOCK` once per process with an `atexit`-restored cleanup. `Stdin.read_line` and `Stdin.read_bytes` park on EAGAIN; multiple concurrent readers panic. TCP sockets (`NetTcp`) remain on R2 |
 
 After this set, `docs/effects.md`, `docs/structured-concurrency.md`,
 `docs/actors.md`, and `docs/fibers-impl.md` claims are all
