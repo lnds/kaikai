@@ -126,6 +126,84 @@ The #511 audit surfaced 14 silent-contract fixtures clustered into
 3 issues (#516, #517, #518) — see
 `docs/lane-experience-issue-511-negative-tests.md` for the matrix.
 
+## Backend-parity discipline (issue #575)
+
+Positive tests assert "this program compiles and runs on the C
+backend" (or, in a hard-coded handful, on both). They do NOT assert
+that *every* fixture compiles + runs identically on both backends.
+That blind spot let five LLVM-only failures ship to main in two
+weeks (#513, #522, #524, #570, #571), each discovered by a
+downstream consumer (notably ahu) rather than by CI.
+
+The C backend is the spec-by-construction (it is the bootstrap
+path; it must work). The LLVM backend is the production target.
+They must agree on every program kaikai can express. When they
+disagree, that is a backend bug, not a language ambiguity.
+
+`tools/test-backend-parity.sh` walks every entry-point fixture
+under:
+
+- `examples/effects/`, `examples/actors/`, `examples/spawn/`,
+  `examples/perceus/`, `examples/refinements/`, `examples/llvm/`,
+  `examples/packages/`, `examples/minimal/`, `examples/quickstart/`,
+  `examples/stdlib/`, `examples/attributes/`, `examples/unstable/`
+- `demos/`
+
+For each fixture, the harness runs `KAI_BACKEND=c kai build …`,
+`KAI_BACKEND=llvm kai build …`, executes both binaries (with a
+30-second per-binary timeout), and diffs stdout + exit code. Any
+divergence is a failure. `examples/negative/` is intentionally
+excluded — those fixtures must reject at compile time, so
+backend-parity (which assumes both build cleanly) does not apply.
+
+Entry-point detection: kaikai fixtures live in two shapes —
+**flat** (`<dir>/<name>.kai` is a standalone program) and
+**package** (`<dir>/<pkg>/main.kai` is the entry-point; sibling
+files are libraries loaded by main). The harness walks `*.kai`
+directly under each listed dir for the flat shape and `**/main.kai`
+for the package shape. Library files are never compiled standalone
+— they would always C-FAIL at link time (no `kai_main` symbol) and
+that's not a backend-parity concern.
+
+The harness is wired into CI as the `tier1-backend-parity` job,
+which runs on the same `paths` filter as `tier1-asan` (any change
+to `stage*/`, `stdlib/`, `examples/`, `demos/`, `bin/kai`, the
+script itself, or the workflow). Locally it runs as
+`tools/test-backend-parity.sh` from the repo root after `make all`.
+
+**Skip discipline.** Two skip mechanisms, used differently:
+
+- `tools/backend-parity-skips.txt` — one line per fixture:
+  `<relative-path>:<issue-number>:<one-line-reason>`. Every entry
+  must reference an *open* tracking issue. The skip is the
+  bookmark; the issue is the work. When the issue closes, the
+  closing lane removes the line and re-runs the harness to confirm
+  parity.
+- Inline annotation — a fixture whose first line contains
+  `// skip-backend-parity: <reason>` is skipped silently. Reserved
+  for fixtures that are *intentionally* backend-specific by design
+  (e.g. a feature only one backend implements, with no expectation
+  the other ever will).
+
+**What to do when this gate fails.** The failure output names the
+fixture and the divergence (build-failure on one backend, exit-code
+mismatch, or stdout diff). Two valid responses:
+
+1. **Backend bug.** The divergence is unintended — fix the
+   offending backend (usually LLVM, since the C backend is the
+   spec). The fix is in scope for the same PR if small; otherwise
+   file a tracking issue and add the fixture to the skips file in
+   the same PR that introduced it.
+2. **Intentional divergence.** The fixture exercises a
+   backend-specific feature. Add the inline `// skip-backend-parity`
+   annotation with a reason. This is rare — the language is
+   designed for the two backends to be observationally equivalent.
+
+Adding a new fixture to any of the walked dirs implicitly opts it
+into this gate. New fixtures that fail on one backend but not the
+other should not merge until the divergence is resolved or
+explicitly skipped with a tracking issue.
+
 ## Tier 2 — `make daily` (end of day / cron)
 
 ~10-20 minutes. Runs once a day on `main` HEAD, not on each PR.
