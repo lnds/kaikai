@@ -84,6 +84,19 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.67.0 (2026-05-15)
+
+### Added
+
+- **ci**: tier1-backend-parity gate every fixture on C and LLVM
+- **runtime**: Phase R3 reactor — stdin parks the fiber (closes #620)
+- **compiler**: --edition flag + pipe dispatch gate (refs #603)
+- **driver**: kai.toml edition field load-bearing + cache partition (refs #603)
+
+### Fixed
+
+- **stdlib**: println declares Unit / Stdout (was Unit / Console) (closes #623)
+
 ## v0.66.0 (2026-05-15)
 
 ### Added
