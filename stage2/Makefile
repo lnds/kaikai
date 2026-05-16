@@ -388,18 +388,14 @@ test-modules-collision: $(TARGET) build
 	  diff -q $$exp build/mc-$$d-c.out > /dev/null \
 	    || { echo "modules-collision DIFF $$d (C vs golden)"; diff $$exp build/mc-$$d-c.out; exit 1; }; \
 	  echo "modules-collision OK $$d"; \
-	done; \
-	src=../examples/modules/export_ambiguous_constructor.kai; \
-	exp=../examples/modules/export_ambiguous_constructor.err.expected; \
-	rc=0; ./$(TARGET) $$src > /dev/null 2> build/mc-neg.err || rc=$$?; \
-	if [ $$rc -eq 0 ]; then \
-	  echo "modules-collision-neg FAIL (expected error, got success)"; exit 1; \
-	fi; \
-	needle=$$(cat $$exp | head -1); \
-	grep -qF "$$needle" build/mc-neg.err \
-	  || { echo "modules-collision-neg FAIL (substring '$$needle' not in stderr)"; \
-	       cat build/mc-neg.err; exit 1; }; \
-	echo "modules-collision-neg OK"
+	done
+	@# Issue #644: the m12.8.x upfront rejection (PR #507) for
+	@# `pub type Respuesta = Ok(String) | ...` colliding with the
+	@# builtin `Result.Ok` was relaxed by Plan B. The
+	@# `export_ambiguous_constructor.kai` fixture moved from a
+	@# negative gate (was rejected) to a positive runner under
+	@# `test-shadowing` — the new fixture set covers the use-site
+	@# disambiguation that replaced the upfront rejection.
 
 # Issue #503: `#derive(...)` annotation on a `pub type` previously
 # hid the type from the module export table because the export
