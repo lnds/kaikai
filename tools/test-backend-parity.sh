@@ -237,11 +237,11 @@ total=$(wc -l < "$tmp/entry-points" | tr -d ' ')
 
 echo "test-backend-parity: walking $total fixtures with $JOBS workers..."
 
-# xargs spawns N parallel `sh -c 'process_one <fixture>'` calls,
+# xargs spawns N parallel `bash -c 'process_one <fixture>'` calls,
 # each fixture goes to whichever worker is free. Output ordering is
 # non-deterministic but the failure log and counter file capture
 # everything; the final summary is deterministic.
-xargs -P "$JOBS" -n 1 -I{} sh -c 'process_one "$@"' _ {} < "$tmp/entry-points"
+xargs -P "$JOBS" -n 1 -I{} bash -c 'process_one "$@"' _ {} < "$tmp/entry-points"
 
 pass=$(grep -c '^P$' "$results" 2>/dev/null || echo 0)
 fail=$(grep -c '^F$' "$results" 2>/dev/null || echo 0)
