@@ -840,7 +840,21 @@ fires, exactly the same mechanism as `Clock.sleep`. A `Cancel`
 raised mid-call unwinds out of the op with no half-written
 state visible to user code.
 
-> **v1 status (as of 2026-05-08).** The paragraph above describes the **target** runtime. Today: the `NetTcp` default handler **blocks the OS thread**. There is no kqueue/epoll reactor wired; `O_NONBLOCK` is not set on the fd; a `Cancel` raised mid-syscall does NOT unwind the op (the syscall completes first). `NetUdp` and `NetDns` are not even installed — there is no compiler builtin, no runtime handler, and no `stdlib/net/{udp,dns}.kai` module. Reactor integration is queued for the m8.x.x lane (see `docs/fibers-honesty-targets.md` §Reactor and `stage0/runtime.h:61-64`). The honesty memo `project_runtime_debt_2026-04-28` lists this as one of the three structural gaps between docs and runtime.
+> **v1 status (R2 reactor, 2026-05-16).** The four blocking ops on
+> `NetTcp` (`connect`, `accept`, `send`, `recv`) **park the fiber**
+> via the scheduler's reactor (`poll()` over self-pipes plus every
+> live socket fd, on macOS and Linux). The fd is flipped to
+> `O_NONBLOCK` at creation time; on `EAGAIN` the fiber yields and
+> the next `poll()` wake promotes it. `send` loops internally on
+> partial writes so user code never sees a short write. `connect`
+> handles `EINPROGRESS` by parking on write-readiness and then
+> reading `SO_ERROR` to surface the handshake result. `Cancel` stays
+> cooperative (`docs/structured-concurrency.md` §"Non-goals"): a
+> fiber parked in `recv` / `accept` / `connect` is interrupted at
+> the park boundary, not mid-syscall. Issue #630 closes the reactor
+> for Hanga Roa; `NetUdp` and `NetDns` are still not installed —
+> their runtime handlers, compiler builtins, and
+> `stdlib/net/{udp,dns}.kai` modules are post-MVP.
 
 ### Stdlib helper
 
