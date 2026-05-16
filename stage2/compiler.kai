@@ -30702,9 +30702,14 @@ fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred / Co
           # Re-stamp the AST node with the resolved names so codegen
           # has them without re-walking the env. Result type is
           # `[T]` (TyListT of TyCon).
+          # Issue #644 — Plan B: walker may visit both qualified
+          # `<target>::<cname>` and bare `<cname>` entries that both
+          # collapse to the same bare ctor name. Dedup before
+          # emitting so `variants[Suit]()` returns each tag once.
+          let names_dedup = union_merge_unique([], names)
           let result_ty = TyListT(TyCon(name, []))
           let resolved = with_ty(
-            mk_expr(EVariantsOf(ty_expr, names), e.line, e.col),
+            mk_expr(EVariantsOf(ty_expr, names_dedup), e.line, e.col),
             result_ty)
           mk_inferred(st, result_ty, resolved)
         }
@@ -36192,18 +36197,30 @@ fn check_variants_nullary_loop(es: [TyEntry], target: String,
       else { VCHasPayload(err_acc) }
     }
     [e, ...rest] -> {
-      let first_upper = match char_at(e.name, 0) {
+      # Issue #644 — Plan B: qualified entries `<target>::<cname>` are
+      # registered alongside bare entries for variants whose bare
+      # slot would shadow a prelude builtin (Ok/Err/Some/None). The
+      # variants walker must use the BARE name (the variant tag
+      # runtime keys on), and bare AND qualified entries collapse to
+      # the same tag — emit the bare form, and dedup via the caller.
+      # Other qualified entries (e.g. `Eff.op` under a `.` separator)
+      # were already filtered by the `string_contains_dot` check.
+      let visible_name = match ty_env_strip_qualified_prefix(e.name, target) {
+        Some(bare) -> bare
+        None       -> e.name
+      }
+      let first_upper = match char_at(visible_name, 0) {
         Some(c) -> c >= 'A' and c <= 'Z'
         None    -> false
       }
-      if first_upper and not string_contains_dot(e.name) {
+      if first_upper and not string_contains_dot(visible_name) {
         match e.scheme {
           Scheme(_, _, _, ty) -> match ty {
             # Zero-arg variant: scheme is the bare TyCon (e.g. `Hearts`
             # for `type Suit = Hearts | ...`).
             TyCon(nm, _) ->
               if nm == target {
-                check_variants_nullary_loop(rest, target, [e.name, ...ok_acc], err_acc)
+                check_variants_nullary_loop(rest, target, [visible_name, ...ok_acc], err_acc)
               } else {
                 check_variants_nullary_loop(rest, target, ok_acc, err_acc)
               }
@@ -36214,9 +36231,9 @@ fn check_variants_nullary_loop(es: [TyEntry], target: String,
                 if nm == target {
                   let args_empty = match args { [] -> true _ -> false }
                   if args_empty {
-                    check_variants_nullary_loop(rest, target, [e.name, ...ok_acc], err_acc)
+                    check_variants_nullary_loop(rest, target, [visible_name, ...ok_acc], err_acc)
                   } else {
-                    check_variants_nullary_loop(rest, target, ok_acc, [e.name, ...err_acc])
+                    check_variants_nullary_loop(rest, target, ok_acc, [visible_name, ...err_acc])
                   }
                 } else {
                   check_variants_nullary_loop(rest, target, ok_acc, err_acc)
