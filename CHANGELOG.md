@@ -84,6 +84,15 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.68.1 (2026-05-16)
+
+### Fixed
+
+- **ci**: bash shebang for test-backend-parity — dash rejects export -f
+- **stdlib**: os/time fixtures use import; drop from default preludes (closes #617)
+- **stdlib**: http fixtures use import net.http; drop from default preludes (closes #631)
+- **driver**: validate edition in kai.toml early with a typed diagnostic (closes #637)
+
 ## v0.68.0 (2026-05-16)
 
 ### Added
