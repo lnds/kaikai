@@ -20,6 +20,15 @@ plan sections that follow describe the design intent of each lane
 at the time it was queued — read those alongside the inventory
 above to see which acceptance bars have been met.
 
+**Re-verified 2026-05-16** (issue #604 docs honesty audit). The
+inventory below was spot-checked against `stdlib/` and closing
+PR numbers; no new drift caught. New rows added this cycle:
+`collections/map` round-out + qualified migration + pipes (#613),
+`core/string` drop_prefix/drop_suffix (#632), `net/http` automatic
+redirect following (#357). `net/http` server-side `#[unstable]`
+helpers (#605) shipped under the existing "What's still open" row
+and have been moved into the inventory.
+
 ## Why now
 
 Tongariki (m1–m13 + m14 partial) closed at 0.37.0. The language

@@ -15,6 +15,14 @@ inventories what is left after the R2 lane closed (`0.4.0`) and the
 
 ## Where we are today (2026-05-16)
 
+> **Last verified 2026-05-16 (issue #604 docs honesty audit).** The
+> R1+R2+R3 reactor wave landed in this same week (#611, #620, #630,
+> closed 2026-05-15→2026-05-16); the LLVM default-handler trio
+> (Spawn, Cancel, Link/Monitor — #570, #582, #587) closed during
+> the bug-bash week 2026-05-14. The Tier 2 bullets below were
+> spot-checked against runtime symbols, fixtures, and closing PR
+> numbers — all green.
+
 Tier 1 + Tier 2 closed. The runtime is BEAM-style cooperative
 single-threaded; everything that surfaced in a 30-minute live demo
 or in the 1.0-honesty target list is shipped and verifiable.
