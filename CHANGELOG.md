@@ -84,6 +84,23 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.68.0 (2026-05-16)
+
+### Added
+
+- **stdlib**: http_follow + redirect policy for net.http (closes #357)
+- **runtime**: Phase R2 reactor — TCP sockets park the fiber (closes #630)
+- **stdlib**: map round-out + qualified migration + pipe compatibility (closes #613)
+
+### Fixed
+
+- **typer**: alias instantiation with row variable + concrete row (closes #624)
+- **stdlib**: map_pipes package layout + Tree no longer pub (closes #625)
+
+### Changed
+
+- **ci**: parallelise backend-parity sweep with xargs -P
+
 ## v0.67.0 (2026-05-15)
 
 ### Added
