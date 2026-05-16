@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.72.0 (2026-05-16)
+
+### Added
+
+- **driver**: infer entry point from cwd when no file is named
+
 ## v0.71.0 (2026-05-16)
 
 ### BREAKING CHANGE
