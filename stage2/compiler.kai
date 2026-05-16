@@ -27494,7 +27494,24 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
           }
           None     -> EnvWithArities { env: env, arities: ar_acc }
         }
-        DType(_, _, _, _, _, _) -> EnvWithArities { env: add_variants_of_decl(env, d, top_names), arities: ar_acc }
+        # Issue #643: prepend a boundary sentinel
+        # `<tname>::__type_decl_arity_<N>__` BEFORE registering
+        # the variants. Since `ty_env_add` cons-prepends, the
+        # sentinel ends up after this DType's variants in head-
+        # first order: walking newest-first, the typer's
+        # `variants_of_type_loop_arity` accepts variants until
+        # it hits the sentinel (the boundary between this
+        # DType's variants and any earlier declaration's). The
+        # arity filter alone discriminates `Tree[k, v]` (arity
+        # 2) from `Tree` (arity 0); the sentinel closes the
+        # same-arity case (e.g. private `type SplitN = SplitOk
+        # | SplitShort` in `stdlib/crypto/hash.kai` vs. a user
+        # redeclaration of `type SplitN = ...`).
+        DType(_, dt_name, dt_tparams, _, _, _) -> {
+          let env1 = ty_env_add_decl_marker(env, dt_name, list_length(dt_tparams))
+          let env2 = add_variants_of_decl(env1, d, top_names)
+          EnvWithArities { env: env2, arities: ar_acc }
+        }
         DEffect(_, eff_name, tparams, ops, _, _, _) -> {
           let r2 = add_effect_op_sigs(env, eff_name, tparams, ops)
           # m7b #2: merge per-effect arities into the running accumulator.
@@ -35385,10 +35402,60 @@ fn extract_return_tycon(sc: TyScheme) : Option[String] {
   }
 }
 
-fn variants_of_type_loop(es: [TyEntry], target: String, acc: [String]) : [String] {
+fn variants_of_type_loop(es: [TyEntry], target: String, acc: [String]) : [String] =
+  variants_of_type_loop_arity(es, target, -1, acc)
+
+# Issue #643 — arity-aware entry point. Callers that know the
+# scrutinee's `TyCon(name, args)` shape pass `list_length(args)` so
+# the walker picks variants whose return tycon has the SAME arity.
+# This discriminates `Tree` (arity 0, user redeclaration) from
+# `Tree[k, v]` (arity 2, private `stdlib/collections/map.kai`).
+# Callers that don't know the arity pass `variants_of_type_loop`'s
+# legacy entry point and accept the "pin to first variant seen"
+# behaviour.
+fn variants_of_type_loop_with_arity(es: [TyEntry], target: String,
+                                       arity: Int, acc: [String]) : [String] =
+  variants_of_type_loop_arity(es, target, arity, acc)
+
+# Issue #643 — walk newest-first; track the arity (number of type
+# arguments on the return tycon) of the first variant we accept and
+# skip any subsequent variant of the same `target` name whose return
+# tycon has a DIFFERENT arity. The arity discriminates `Tree`
+# (user, arity 0) from `Tree[k, v]` (prelude `stdlib/collections/
+# map.kai`, arity 2) when both register variants under the shared
+# bare-name table. Without this filter, a non-`pub` prelude type's
+# variants leaked into the user-scope match-exhaustiveness check
+# any time the user redeclared the same type name.
+#
+# `pin = -1` is the "not yet seen" sentinel — the first matching
+# variant pins the canonical arity for this walk. A subsequent
+# variant with a different arity belongs to an unrelated (shadowed
+# or unrelated-but-same-name) declaration and is ignored.
+#
+# When the user's redeclaration has the same arity as the prelude
+# type, this filter alone is not sufficient — but that case is
+# already caught by `validate_type_name_collisions_decls` for `pub`
+# preludes, and the `top_names` shadow guard in `add_variants_loop`
+# strips zero-arg ctors that collide with another top-level type.
+# Private same-arity collisions in distinct stdlib modules are
+# rare; we currently leave them for a follow-up if they surface.
+fn variants_of_type_loop_arity(es: [TyEntry], target: String,
+                                  pin: Int, acc: [String]) : [String] {
   match es {
     [] -> list_reverse(acc)
     [e, ...rest] -> {
+      # Issue #643 — sentinel boundary check. The marker name has
+      # the form `<target>::__type_decl_arity_<N>__`. If we have
+      # already pinned an arity and we cross a marker for the same
+      # target whose arity equals our pin, we have left the
+      # newest declaration's variant region and entered an earlier
+      # (shadowed) one — stop.
+      if pin >= 0 and e.name == ty_env_decl_marker_name(target, pin) {
+        # Same-(target, arity) marker reached after we already
+        # collected at least one variant (or pinned). Either way,
+        # the variants we have are the canonical set.
+        list_reverse(acc)
+      } else {
       # Effect ops are registered as `Eff.op` (m7a #4a) — those
       # names also start uppercase but are not sum-type constructors,
       # so the exhaustiveness check would otherwise treat them as
@@ -35398,17 +35465,74 @@ fn variants_of_type_loop(es: [TyEntry], target: String, acc: [String]) : [String
         None    -> false
       }
       if first_upper and not string_contains_dot(e.name) {
-        match extract_return_tycon(e.scheme) {
-          Some(tn) -> if tn == target {
-            variants_of_type_loop(rest, target, [e.name, ...acc])
-          } else {
-            variants_of_type_loop(rest, target, acc)
+        match extract_return_tycon_arity(e.scheme) {
+          Some(ta) -> match ta {
+            TCA(tn, ar) -> if tn == target {
+              if pin < 0 {
+                variants_of_type_loop_arity(rest, target, ar, [e.name, ...acc])
+              } else if ar == pin {
+                variants_of_type_loop_arity(rest, target, pin, [e.name, ...acc])
+              } else {
+                variants_of_type_loop_arity(rest, target, pin, acc)
+              }
+            } else {
+              variants_of_type_loop_arity(rest, target, pin, acc)
+            }
           }
-          None -> variants_of_type_loop(rest, target, acc)
+          None -> variants_of_type_loop_arity(rest, target, pin, acc)
         }
       } else {
-        variants_of_type_loop(rest, target, acc)
+        variants_of_type_loop_arity(rest, target, pin, acc)
       }
+      }
+    }
+  }
+}
+
+# Issue #643 — return tycon paired with the arity of its type-arg
+# list. `TCA(name, arity)` lets `variants_of_type_loop_arity`
+# distinguish `Tree` (arity 0) from `Tree[k, v]` (arity 2).
+type TyConArity = TCA(String, Int)
+
+# Issue #643 — sentinel marker name. Inserted into `env.entries`
+# right after a `DType`'s variants are registered, with format
+# `<tname>::__type_decl_arity_<N>__`. The walker that enumerates
+# a tycon's variants stops at the first matching sentinel after
+# accepting at least one variant, which closes the boundary of an
+# earlier same-name same-arity declaration (e.g. a private prelude
+# `type SplitN = SplitOk | SplitShort` shadowed by a user
+# redeclaration of the same name and arity).
+#
+# The format keeps the sentinel filtered out by the existing
+# uppercase-name walkers (`__` does not start with `A`..`Z`) and
+# by the `::<fname>` qualified-key suffix scan (the sentinel ends
+# with `__type_decl_arity_<N>__`, not `::<user_target>`).
+fn ty_env_decl_marker_name(tname: String, arity: Int) : String =
+  concat_all([tname, "::__type_decl_arity_",
+              int_to_string(arity), "__"])
+
+fn ty_env_add_decl_marker(env: TyEnv, tname: String, arity: Int) : TyEnv = {
+  # The sentinel's scheme is a closed `Scheme([], [], [], TyAny)`
+  # so any accidental read returns `None` from
+  # `extract_return_tycon_arity`. The walker keys on the name
+  # alone and never dereferences the scheme.
+  let dummy = mono(TyAny)
+  ty_env_add(env, ty_env_decl_marker_name(tname, arity), dummy)
+}
+
+fn extract_return_tycon_arity(sc: TyScheme) : Option[TyConArity] {
+  # NOTE: name the slot `tas` (not `args`); `args` shadows the
+  # prelude's CLI-args fn and the codegen wires the call to the
+  # closure instead of the local binding (see CLAUDE.md / global
+  # feedback memo on the `args` shadow).
+  match sc {
+    Scheme(_, _, _, ty) -> match ty {
+      TyFnT(_, ret, _) -> match ret {
+        TyCon(nm, tas) -> Some(TCA(nm, list_length(tas)))
+        _              -> None
+      }
+      TyCon(nm, tas) -> Some(TCA(nm, list_length(tas)))
+      _              -> None
     }
   }
 }
@@ -35424,6 +35548,93 @@ fn variants_of_type(env: TyEnv, tycon: String) : [String] = {
   let from_entries = variants_of_type_loop(env.entries, tycon, [])
   let from_summary = union_components_of(env.unions, tycon)
   union_merge_unique(from_entries, from_summary)
+}
+
+# Issue #643 — arity-aware variant of `variants_of_type`. Callers
+# that have the scrutinee's full `TyCon(name, args)` use this to
+# select variants whose return tycon has the matching arity, so a
+# private prelude `Tree[k, v]` (arity 2) does not leak its variants
+# into the exhaustiveness check of a user-declared `Tree` (arity 0)
+# and vice-versa. Falls back to the bare-name walk when no entry
+# matches the arity (legacy single-arity types stay byte-identical).
+fn variants_of_type_arity(env: TyEnv, tycon: String, arity: Int) : [String] = {
+  let from_entries = variants_of_type_loop_with_arity(env.entries, tycon, arity, [])
+  match from_entries {
+    [] -> {
+      # No arity-matched entries — fall back to the bare-name walk
+      # so records / opaque tycons whose schemes the variant table
+      # does not register still surface their union components.
+      # The fallback consults `env.unions` (the issue #198 / #197
+      # shadow path) and is non-arity-aware; this is acceptable
+      # because the fallback only fires when the variant entries
+      # produced no arity match — i.e. no genuine ambiguity exists.
+      let fallback = variants_of_type_loop(env.entries, tycon, [])
+      union_merge_unique(fallback, union_components_of(env.unions, tycon))
+    }
+    # Arity-matched entries from the variant table are the
+    # canonical view; `env.unions` is non-arity-aware and would
+    # re-introduce the other arity's components if merged in
+    # blindly. Filter the summary against the matched entries'
+    # parent declaration by keeping only summary entries that
+    # also surface (or are already in) the entry-list.
+    _ -> union_merge_with_summary_filtered(from_entries,
+                                              env.unions, tycon, arity, env.entries)
+  }
+}
+
+# Issue #643 — merge `from_entries` (already arity-matched) with the
+# subset of `env.unions` components that *also* belong to the same
+# (name, arity) declaration. A `UnionInfo` does not carry arity
+# directly, so we infer it from any entry whose return tycon
+# matches `(tycon, arity)` — `UnionInfo`'s `parent` field. If a
+# `UnionInfo` for `tycon` exists whose listed components include at
+# least one of the variants we already pulled from entries, we
+# merge in its full component list; otherwise we ignore it (the
+# other-arity union is structurally unrelated).
+fn union_merge_with_summary_filtered(from_entries: [String],
+                                        unions: [UnionInfo], tycon: String,
+                                        arity: Int, es: [TyEntry]) : [String] {
+  match unions {
+    [] -> from_entries
+    [u, ...rest] -> match u {
+      UI(parent, comps, _, _) ->
+        if parent == tycon {
+          let cnames = ty_component_names(comps, [])
+          if any_str_in(cnames, from_entries) {
+            union_merge_unique(from_entries,
+              union_merge_with_summary_filtered_collect(cnames, []))
+          } else {
+            union_merge_with_summary_filtered(from_entries, rest, tycon, arity, es)
+          }
+        } else {
+          union_merge_with_summary_filtered(from_entries, rest, tycon, arity, es)
+        }
+    }
+  }
+}
+
+fn union_merge_with_summary_filtered_collect(xs: [String], acc: [String]) : [String] {
+  match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> union_merge_with_summary_filtered_collect(rest, [h, ...acc])
+  }
+}
+
+fn ty_component_names(ts: [Ty], acc: [String]) : [String] {
+  match ts {
+    [] -> list_reverse(acc)
+    [t, ...rest] -> match t {
+      TyCon(nm, _) -> ty_component_names(rest, [nm, ...acc])
+      _ -> ty_component_names(rest, acc)
+    }
+  }
+}
+
+fn any_str_in(xs: [String], ys: [String]) : Bool {
+  match xs {
+    [] -> false
+    [h, ...rest] -> if list_has(ys, h) { true } else { any_str_in(rest, ys) }
+  }
 }
 
 fn union_merge_unique(a: [String], b: [String]) : [String] {
@@ -35595,12 +35806,17 @@ fn build_nonexhaustive_diag(file: String, line: Int, col: Int,
 
 fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState / Console + File {
 
-
   if has_catch_all(arms) { st }
   else {
     match scr_ty {
-      TyCon(tycon, _) -> {
-        let needed = variants_of_type(st.env, tycon)
+      TyCon(tycon, scr_tas) -> {
+        # Issue #643: thread the scrutinee's tycon arity so private
+        # prelude types of the same bare name but different arity
+        # (e.g. `Tree[k, v]` in `stdlib/collections/map.kai`) do not
+        # leak their variants into the user's exhaustiveness check.
+        # The slot is named `scr_tas` (not `args`) to avoid the
+        # `args`-prelude shadow that bites the stage 0/1 resolver.
+        let needed = variants_of_type_arity(st.env, tycon, list_length(scr_tas))
         match needed {
           [] -> st                     # unknown sum (e.g. Int, lists): skip
           _  -> {
@@ -35685,10 +35901,12 @@ fn check_union_component(st: InferState, arms: [Arm], comp: Ty,
 
 
   match comp {
-    TyCon(tycon, _) -> {
+    TyCon(tycon, comp_tas) -> {
       if arms_cover_narrow(arms, tycon) { st }
       else {
-        let needed = variants_of_type(st.env, tycon)
+        # Issue #643: arity-aware variant lookup; see `check_exhaustive`.
+        # Use `comp_tas` (not `args`) to avoid the prelude-`args` shadow.
+        let needed = variants_of_type_arity(st.env, tycon, list_length(comp_tas))
         match needed {
           [] -> st       # not a sum component (record / primitive); skip
           _  -> {
