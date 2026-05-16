@@ -9,13 +9,39 @@ calibration (~5–10× faster than spec).
 
 This is a **scope decision**, not a roadmap. The pending Perceus
 follow-ups live as GitHub Issues (`perceus` label — issues #77, #78,
-#82); this file says *which followups are required for which honesty
-claim*.
+~~#82~~ (closed 2026-05-02 by #123), #599 (open — `pcs_pass`
+conservative-dup wall regression)); this file says *which followups
+are required for which honesty claim*.
 
 Sister doc: `docs/fibers-honesty-targets.md` (same shape, applied to
 the m8.x scheduler).
 
-## Where we are today (2026-05-09)
+## Where we are today (refreshed 2026-05-16)
+
+> **Refresh note (issue #604).** Numbers in this section through
+> "Wall time has not moved" reflect the 2026-04-29 baseline. Re-
+> measured 2026-05-16 on HEAD (v0.69.0, post-Phase 3 unboxing +
+> #123 + KAB2 #592):
+>
+> - Full selfhost (`make -C stage2 selfhost` from clean
+>   `stage2/build/`, i.e. kaic0 → kaic1 → kaic2 + fixed-point
+>   verification): ~124 s wall. The 2.15 s / 5.74 s figures
+>   in §"Where we are today" referred to a single `kaic2 selfhost`
+>   round, not the full bootstrap.
+> - The `cc` link step that materialises `kaic2` from
+>   `build/stage2.c` is ~2.8 s wall, ~530 MB peak RSS — the kaic2
+>   compile of `compiler.kai` happens *before* this link step and
+>   is what the table below measures.
+> - `tools/bench-phases.sh -r` on `empty.kai` (32 preludes, KAB2
+>   warm): tokens 0.30 s / parse 0.49 s / typecheck 1.41 s, baseline
+>   for `docs/cache-design.md`'s 2.31 s figure.
+>
+> The pre-Phase 3 3.02 GB RSS / 5.74 s wall figures quoted below
+> are the post-flip / pre-unboxing snapshot — the wall regression
+> the original §"Wall time has not moved" lamented was recovered by
+> #383 (Phase 3 unboxing + tcrec) and #123 (#82 leak sweep).
+
+## Where we are today (2026-05-09 — original snapshot)
 
 Tier 2 architectural debt + Tier 2.5 unboxing both closed.
 Compute parity with C reached on benchmarks (fib(35) 1.00× C,
@@ -69,20 +95,31 @@ side audit shipped with `b3b1e2f` extends `7ab3d64`'s single-use
 optimisation past parameters to let-bindings and match-arm binds:
 `stage1.c` `kai_internal_dup` count drops 1181 → 1090 (−7.7%) on
 top of the param-only baseline; selfhost stays byte-identical.
-Wall time has not moved — the dup machinery still fires for the
+~~Wall time has not moved — the dup machinery still fires for the
 multi-use majority; recovering wall regression is paired with the
 kai_field balance work that drops redundant increfs in the
-match-test phase.
+match-test phase.~~ **Updated 2026-05-16:** the +2.7× wall
+regression noted at flip time was recovered by Phase 3 unboxing
+(#383, v0.45.x) plus the #82 leak sweep (#123). Re-measured today
+on v0.69.0: peak RSS during the `kaic2` self-compile link step
+is ~530 MB, vs the 3.02 GB pre-unboxing snapshot in the table
+above. `pcs_pass` conservative-dup is now the residual wall
+source tracked separately by #599 — see the refresh note at the
+top of this section for the current selfhost-pipeline numbers.
 
 ## What does NOT work today
 
-Two named leak sources remain (issue #82 inventory + issue #77
-Full Perceus):
+Originally two named leak sources remained from the issue #82
+inventory + the issue #77 Full Perceus debt. **Issue #82 closed
+2026-05-02 (PR #123)**, sweeping the four leak sources it
+catalogued; the surviving items below are what #82's closing
+audit did not target.
 
 - **`kai_truthy` non-consuming** — intentional. The LLVM
   short-circuit phi returns `lhs` in the early-exit branch, so
   consuming the truthy probe's argument would alias-free a
-  value still referenced downstream. Tracked in issue #82.
+  value still referenced downstream. ~~Tracked in issue #82.~~
+  (#82 closed; the design rationale lives in this section.)
 - **`kai_prelude_*` C helpers leak their params** — 9fe6f6d
   closed 12 of them (print/eprint, int/real string conversion,
   array & list ops). The remaining hand-written prelude
@@ -111,9 +148,11 @@ Closed in the perceus-tier-2 lane (2026-04-29 evening):
 ## Tier 1 — *Show HN honest* (~0 days)
 
 Empty. The R1 flip already did the Show-HN work. A 30-minute live
-demo on unfamiliar code does not reach the leak ceiling — RSS is
-3 GB only on a self-compile of a 25 k-line compiler, not on any
-demo someone would actually try in a tutorial.
+demo on unfamiliar code does not reach the leak ceiling — ~~RSS is
+3 GB only on a self-compile of a 25 k-line compiler~~, not on any
+demo someone would actually try in a tutorial. **Updated 2026-05-16:
+post-Phase 3 unboxing + #123 #82 sweep, the self-compile peak RSS
+is ~530 MB, not 3 GB. The Tier 1 claim only gets stronger.**
 
 The two correctness bugs that *would* embarrass us in a 5-minute
 browse — R2 (m8x_2 SIGSEGV) and R3 (interp panic) — are already
@@ -294,8 +333,12 @@ and shouldn't be designed pre-1.0.
   affect honesty claims. Internal scaffolding work that doesn't
   surface to user code lives in the `perceus`-labelled issues
   (#77–#82).
-- Not an excuse to defer Tier 2. The +2.7× wall regression and
+- ~~Not an excuse to defer Tier 2. The +2.7× wall regression and
   46.9 M residual leaks are the cost of the flip without the
   follow-throughs; paying this debt is what makes the v0.2.0
   trade reverse from "more honest, slower" to "more honest, no
-  slower".
+  slower".~~ **Closed 2026-05-16 audit (issue #604).** Tier 2
+  shipped: the three architectural items + #82 leak sweep (#123,
+  v0.45.x) + Phase 3 unboxing (#383) together reversed the wall
+  regression. Residual debt (`pcs_pass` conservative-dup, #599)
+  is a perf hotspot, not an honesty footnote.
