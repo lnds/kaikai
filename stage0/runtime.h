@@ -1551,6 +1551,19 @@ static uint64_t kai_reactor_now_ns(void);
 static int       kai_reactor_park_stdin(KaiFiber *f);
 static void      kai_reactor_stdin_set_nonblocking(void);
 
+/* Issue #630 — Phase R2 reactor forward decls. The six NetTcp
+ * default handlers live ~1000 lines above the reactor; they call
+ * these helpers to park on read/write readiness of a socket fd.
+ * A fiber sits on at most one socket-direction list at a time
+ * (a single op is either reading or writing, never both), so the
+ * existing `reactor_next` intrusive slot is sufficient. The fd is
+ * stashed in `reactor_wait_pid` (the slot is otherwise unused while
+ * a fiber is parked on a socket — pids and sockets are mutually
+ * exclusive park reasons). */
+static void      kai_reactor_park_socket_read(KaiFiber *f, int fd);
+static void      kai_reactor_park_socket_write(KaiFiber *f, int fd);
+static void      kai_socket_set_nonblock(int fd);
+
 static KaiMailbox *kai_mailbox_alloc(void) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
@@ -5754,7 +5767,17 @@ static int _kai_net_record_fd(KaiValue *v) {
 
 /* connect(host, port) -> Result[Conn, String]. host is a hostname
  * or IPv4 dotted-quad; getaddrinfo handles both. Restricted to
- * AF_INET in v1. */
+ * AF_INET in v1.
+ *
+ * Issue #630 — Phase R2: non-blocking connect. The fd is flipped to
+ * O_NONBLOCK before connect(), which returns either 0 (instant
+ * success — common for loopback) or -1 with errno == EINPROGRESS.
+ * On EINPROGRESS the fiber parks on write-readiness; when the
+ * handshake completes (or fails) the kernel marks the fd writable.
+ * We read SO_ERROR to distinguish success from failure since
+ * connect() itself does not run a second time. EAGAIN/EWOULDBLOCK
+ * is not a documented connect() outcome and is treated identically
+ * to EINPROGRESS for safety. */
 static KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
     (void) self;
     if (!host || host->tag != KAI_STR || !port || port->tag != KAI_INT) {
@@ -5779,13 +5802,39 @@ static KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue
         const char *msg = gai_strerror(gai);
         return _kai_net_err_msg(k, msg ? msg : "getaddrinfo failed");
     }
+    kai_reactor_init();
     int fd = -1;
     int saved_errno = 0;
     for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
         fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd < 0) { saved_errno = errno; continue; }
-        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) {
-            break;
+        kai_socket_set_nonblock(fd);
+        int crc = connect(fd, p->ai_addr, p->ai_addrlen);
+        if (crc == 0) {
+            saved_errno = 0;
+            break;  /* instant success — loopback path */
+        }
+        if (errno == EINPROGRESS || errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* Park until the kernel marks the fd writable. POLLHUP /
+             * POLLERR also wake us — drain treats them as ready and
+             * the SO_ERROR check below surfaces the real reason. */
+            kai_reactor_park_socket_write(kai_current_fiber(), fd);
+            int so_err = 0;
+            socklen_t slen = sizeof(so_err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &slen) < 0) {
+                saved_errno = errno;
+                close(fd);
+                fd = -1;
+                continue;
+            }
+            if (so_err == 0) {
+                saved_errno = 0;
+                break;  /* handshake succeeded */
+            }
+            saved_errno = so_err;
+            close(fd);
+            fd = -1;
+            continue;
         }
         saved_errno = errno;
         close(fd);
@@ -5855,6 +5904,11 @@ static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue 
     if (listen(fd, 128) < 0) {
         int e = errno; close(fd); return _kai_net_err(k, e);
     }
+    /* Issue #630 — Phase R2: the listener fd must be non-blocking so
+     * the parking accept() path below sees EAGAIN/EWOULDBLOCK when
+     * no connection is queued. Without this the accept() syscall
+     * would block the OS thread and starve every other fiber. */
+    kai_socket_set_nonblock(fd);
 
     /* Read back the assigned port (kernel may have picked one when
      * the caller passed 0). */
@@ -5870,29 +5924,58 @@ static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue 
     return kai_cont_resume(k, ok);
 }
 
-/* accept(l) -> Result[Conn, String]. Blocks until a peer connects;
- * v1 has no scheduler suspension, so the fiber is genuinely parked
- * in the syscall. The fixture sequences listen → connect → accept
- * so the connection is queued before accept is called. */
+/* accept(l) -> Result[Conn, String].
+ *
+ * Issue #630 — Phase R2: non-blocking accept. The listener fd was
+ * flipped to O_NONBLOCK in listen(); accept() now returns -1 +
+ * EAGAIN/EWOULDBLOCK when no peer is queued. The fiber parks on
+ * read-readiness of the listener fd and retries on wake. The
+ * connection fd inherits non-blocking on Linux when SOCK_NONBLOCK
+ * is passed to accept4(); for portability (macOS lacks accept4)
+ * we set it explicitly via kai_socket_set_nonblock on the returned
+ * fd so subsequent send/recv on the Conn also park rather than
+ * blocking. */
 static KaiValue *kai_default_nettcp_accept(void *self, KaiValue *l, KaiCont *k) {
     (void) self;
     int lfd = _kai_net_record_fd(l);
     if (lfd < 0) return _kai_net_err_msg(k, "accept: invalid listener");
-    struct sockaddr_in peer;
-    socklen_t plen = sizeof(peer);
-    int cfd = accept(lfd, (struct sockaddr *) &peer, &plen);
-    if (cfd < 0) return _kai_net_err(k, errno);
-    KaiValue *conn = _kai_net_make_conn(cfd);
-    KaiValue *ok   = kai_variant(0, "Ok", 1, &conn);
-    return kai_cont_resume(k, ok);
+    kai_reactor_init();
+    /* Defensive: listener fd should already be non-blocking from
+     * listen(), but a future Listener constructed via FFI would not
+     * be. Idempotent. */
+    kai_socket_set_nonblock(lfd);
+    for (;;) {
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof(peer);
+        int cfd = accept(lfd, (struct sockaddr *) &peer, &plen);
+        if (cfd >= 0) {
+            kai_socket_set_nonblock(cfd);
+            KaiValue *conn = _kai_net_make_conn(cfd);
+            KaiValue *ok   = kai_variant(0, "Ok", 1, &conn);
+            return kai_cont_resume(k, ok);
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            kai_reactor_park_socket_read(kai_current_fiber(), lfd);
+            continue;  /* Resume → retry accept() */
+        }
+        if (errno == EINTR) continue;
+        return _kai_net_err(k, errno);
+    }
 }
 
 /* send(c, data) -> Result[Int, String]. data is a [Byte] = [Int]
  * cons list; each element is taken mod 256. v1 walks the list once
- * to assemble a contiguous buffer, then issues a single send(2);
- * partial sends short-circuit and return the byte count actually
- * written, matching the POSIX contract that callers may have to
- * loop. */
+ * to assemble a contiguous buffer, then writes it.
+ *
+ * Issue #630 — Phase R2: non-blocking send with a partial-writes
+ * loop. The conn fd is already O_NONBLOCK (set by accept or
+ * connect). send() may return fewer bytes than requested when the
+ * kernel buffer is partially full, or -1 with EAGAIN when it is
+ * completely full. The loop parks on write-readiness on EAGAIN and
+ * advances on partial writes. The returned count is the total
+ * bytes written — equal to the input length on success. The
+ * pre-R2 contract that "callers may have to loop" is honoured
+ * internally so user code never sees a short write. */
 static KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data, KaiCont *k) {
     (void) self;
     int fd = _kai_net_record_fd(c);
@@ -5914,12 +5997,46 @@ static KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data
             buf[i++] = (unsigned char) (b & 0xff);
         }
     }
-    ssize_t wrote = (n == 0) ? 0 : send(fd, buf, n, 0);
-    int saved_errno = errno;
-    free(buf);
-    if (wrote < 0) return _kai_net_err(k, saved_errno);
 
-    KaiValue *cnt = kai_int((int64_t) wrote);
+    kai_reactor_init();
+    /* Defensive: send may be called on a Conn that was never funnelled
+     * through the local accept/connect path (e.g. constructed via FFI
+     * in a future user lane). Idempotent on already-nonblock fds. */
+    kai_socket_set_nonblock(fd);
+
+    size_t total = 0;
+    int saved_errno = 0;
+    while (total < n) {
+        /* MSG_NOSIGNAL stops a SIGPIPE from killing the process when
+         * the peer has closed its read side; we surface EPIPE through
+         * the Result-shaped return instead. macOS does not have
+         * MSG_NOSIGNAL but exposes SO_NOSIGPIPE on the socket; we
+         * conservatively pass the flag where it exists and rely on
+         * the default SIGPIPE handler being SIG_IGN-equivalent on
+         * the install side for v1. */
+#ifdef MSG_NOSIGNAL
+        ssize_t w = send(fd, buf + total, n - total, MSG_NOSIGNAL);
+#else
+        ssize_t w = send(fd, buf + total, n - total, 0);
+#endif
+        if (w > 0) {
+            total += (size_t) w;
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            kai_reactor_park_socket_write(kai_current_fiber(), fd);
+            continue;  /* Resume → retry send() */
+        }
+        if (w < 0 && errno == EINTR) continue;
+        saved_errno = errno;
+        break;
+    }
+    free(buf);
+    if (saved_errno != 0 && total == 0) {
+        return _kai_net_err(k, saved_errno);
+    }
+
+    KaiValue *cnt = kai_int((int64_t) total);
     KaiValue *ok  = kai_variant(0, "Ok", 1, &cnt);
     return kai_cont_resume(k, ok);
 }
@@ -5927,7 +6044,15 @@ static KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data
 /* recv(c, max) -> Result[[Byte], String]. max = 0 panics per spec
  * (no useful "read zero bytes"); negative max is treated the same.
  * Peer clean-close (recv == 0) returns Ok([]) so callers can
- * distinguish from "not yet" via the empty list. */
+ * distinguish from "not yet" via the empty list.
+ *
+ * Issue #630 — Phase R2: non-blocking recv. The fd is O_NONBLOCK
+ * (set by accept or connect). recv() returns >0 (bytes available),
+ * 0 (peer clean-close — surfaces as Ok([])), or -1 with EAGAIN
+ * when the kernel buffer is empty. On EAGAIN the fiber parks on
+ * read-readiness and retries. A single recv call returns whatever
+ * the kernel has buffered; callers loop at the user level if they
+ * need an exact byte count (matches POSIX recv semantics). */
 static KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max, KaiCont *k) {
     (void) self;
     int fd = _kai_net_record_fd(c);
@@ -5940,9 +6065,23 @@ static KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max,
     if (cap > (1 << 20)) cap = 1 << 20;  /* 1 MiB ceiling for v1 */
     unsigned char *buf = (unsigned char *) malloc((size_t) cap);
     if (!buf) return _kai_net_err_msg(k, "recv: out of memory");
-    ssize_t got = recv(fd, buf, (size_t) cap, 0);
-    int saved_errno = errno;
-    if (got < 0) {
+
+    kai_reactor_init();
+    /* Defensive idempotent flip — Conn fds from accept/connect are
+     * already non-blocking, but a future FFI-constructed Conn would
+     * not be. */
+    kai_socket_set_nonblock(fd);
+
+    ssize_t got;
+    for (;;) {
+        got = recv(fd, buf, (size_t) cap, 0);
+        if (got >= 0) break;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            kai_reactor_park_socket_read(kai_current_fiber(), fd);
+            continue;  /* Resume → retry recv() */
+        }
+        if (errno == EINTR) continue;
+        int saved_errno = errno;
         free(buf);
         return _kai_net_err(k, saved_errno);
     }
@@ -6725,6 +6864,17 @@ static KaiFiber *kai_reactor_filepool_waiters = NULL;
 static KaiFiber *kai_reactor_stdin_waiter = NULL;
 static int       kai_reactor_stdin_orig_flags = -1;
 
+/* Issue #630 — Phase R2 reactor: per-direction socket waiter lists.
+ * One fiber-per-(fd, direction); the same fd may simultaneously have
+ * a reader and a writer parked (rare in v1 — typical HTTP server
+ * fibers serialise send/recv on a Conn — but it is the correct
+ * semantics for full-duplex sockets and costs nothing to support).
+ * Each list is intrusive through `f->reactor_next`; the fd lives in
+ * `f->reactor_wait_pid` (the slot doubles as "what are we waiting
+ * for"; pid waiters and socket waiters are mutually exclusive). */
+static KaiFiber *kai_reactor_socket_read_waiters  = NULL;
+static KaiFiber *kai_reactor_socket_write_waiters = NULL;
+
 /* Aggregate count of fibers parked on any reactor structure.
  * kai_sched_park reads this to decide between "no one can wake us
  * up — deadlock" (count == 0) and "block on the reactor until a
@@ -7114,6 +7264,48 @@ static int kai_reactor_park_stdin(KaiFiber *f) {
     return 0;
 }
 
+/* Issue #630 — Phase R2: set O_NONBLOCK on a socket fd. Idempotent;
+ * safe to call once per fd creation site. We do NOT save/restore the
+ * original flags (unlike stdin) because the fd was just opened by us
+ * — no caller cares about its pre-flag state. */
+static void kai_socket_set_nonblock(int fd) {
+    if (fd < 0) return;
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return;
+    if (!(fl & O_NONBLOCK)) {
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    }
+}
+
+/* Issue #630 — Phase R2: park `f` waiting for read-readiness on
+ * `fd` (accept on a listener, recv on a connection). Pushes the
+ * fiber onto the socket_read_waiters list, stashes the fd in
+ * reactor_wait_pid (slot is repurposed; pid waiters and socket
+ * waiters are mutually exclusive), bumps the parked-count, and
+ * yields. On resume the drain helper has spliced the fiber out;
+ * the caller retries its non-blocking read(). */
+static void kai_reactor_park_socket_read(KaiFiber *f, int fd) {
+    f->reactor_wait_pid    = fd;
+    f->reactor_wait_status = 0;
+    f->reactor_next = kai_reactor_socket_read_waiters;
+    kai_reactor_socket_read_waiters = f;
+    kai_reactor_parked_count++;
+    kai_sched_park();
+}
+
+/* Issue #630 — Phase R2: park `f` waiting for write-readiness on
+ * `fd` (connect handshake completion, send when the kernel buffer is
+ * full). Symmetric with kai_reactor_park_socket_read on the
+ * socket_write_waiters list. */
+static void kai_reactor_park_socket_write(KaiFiber *f, int fd) {
+    f->reactor_wait_pid    = fd;
+    f->reactor_wait_status = 0;
+    f->reactor_next = kai_reactor_socket_write_waiters;
+    kai_reactor_socket_write_waiters = f;
+    kai_reactor_parked_count++;
+    kai_sched_park();
+}
+
 /* Submit `work(arg)` to the file-pool worker queue and park the
  * caller until completion. Returns the worker's KaiValue *result.
  * The KaiFilepoolItem lives on the caller's fiber stack — safe
@@ -7145,12 +7337,60 @@ static KaiValue *kai_reactor_run_in_pool(KaiValue *(*work)(void *), void *arg) {
     return r ? r : kai_unit();
 }
 
+/* Issue #630 — Phase R2: count the live socket-waiter fds in each
+ * direction. Two fibers parked on the same fd in the same direction
+ * is impossible in v1 (every Conn / Listener belongs to a single
+ * fiber under the per-fiber-arena model). Counting unique fds is
+ * therefore equivalent to counting waiters. */
+static int kai_reactor_count_socket_waiters(KaiFiber *head) {
+    int n = 0;
+    for (KaiFiber *f = head; f; f = f->reactor_next) n++;
+    return n;
+}
+
+/* Issue #630 — Phase R2: drain one socket-direction waiter list.
+ * For every fiber whose fd shows up in `pfds[i].revents` with
+ * POLLIN/POLLOUT/POLLHUP/POLLERR set, splice it out and unpark.
+ * The handler at the park site will retry its non-blocking syscall
+ * and either succeed, EOF, or re-park if the kernel buffer drained
+ * between wake and retry (spurious wake — POSIX permits it). */
+static int kai_reactor_socket_drain(KaiFiber **head_ptr, struct pollfd *pfds,
+                                    int nfds, short ready_mask) {
+    int woken = 0;
+    KaiFiber **link = head_ptr;
+    while (*link) {
+        int fd = (*link)->reactor_wait_pid;
+        /* OR every pfds entry's revents for this fd. The same fd can
+         * appear in the poll set multiple times (full-duplex sockets
+         * with both read and write waiters, or two readers on a
+         * shared listener — accept() distributes connections across
+         * them). Aggregating revents avoids missing a wake when the
+         * ready entry is not the first match. */
+        short revents = 0;
+        for (int i = 0; i < nfds; i++) {
+            if (pfds[i].fd == fd) revents |= pfds[i].revents;
+        }
+        if (revents & (ready_mask | POLLHUP | POLLERR | POLLNVAL)) {
+            KaiFiber *f = *link;
+            *link = f->reactor_next;
+            f->reactor_next = NULL;
+            f->reactor_wait_pid = 0;
+            kai_reactor_parked_count--;
+            kai_sched_unpark(f);
+            woken++;
+        } else {
+            link = &(*link)->reactor_next;
+        }
+    }
+    return woken;
+}
+
 /* Block in poll() until either the SIGCHLD pipe or the file-pool
- * completion pipe fires, or the next timer deadline arrives.
- * Promotes every newly-ready fiber to the run queue. Called by
- * kai_sched_park when the ready queue is empty but reactor waiters
- * exist — the dispatch loop's substitute for a dedicated event
- * loop thread. */
+ * completion pipe fires, a socket fd becomes ready, or the next
+ * timer deadline arrives. Promotes every newly-ready fiber to the
+ * run queue. Called by kai_sched_park when the ready queue is empty
+ * but reactor waiters exist — the dispatch loop's substitute for a
+ * dedicated event loop thread. */
 static void kai_reactor_wait(void) {
     /* Compute the timeout in ms (poll's resolution). A negative
      * timeout is "wait forever"; a zero timeout polls. */
@@ -7168,7 +7408,25 @@ static void kai_reactor_wait(void) {
         }
     }
 
-    struct pollfd pfds[3];
+    /* Size the pfds array: 2 self-pipes + optional stdin + N
+     * socket-read + M socket-write. Use a small stack buffer for the
+     * common case (no sockets) and fall back to a heap alloc when
+     * more than ~16 fds are live. */
+    int nread  = kai_reactor_count_socket_waiters(kai_reactor_socket_read_waiters);
+    int nwrite = kai_reactor_count_socket_waiters(kai_reactor_socket_write_waiters);
+    int max_fds = 2 + 1 + nread + nwrite;
+    struct pollfd  stack_pfds[16];
+    struct pollfd *pfds = stack_pfds;
+    int heap_alloced = 0;
+    if (max_fds > (int) (sizeof(stack_pfds) / sizeof(stack_pfds[0]))) {
+        pfds = (struct pollfd *) malloc((size_t) max_fds * sizeof(*pfds));
+        if (!pfds) {
+            fprintf(stderr, "kai: reactor pfds malloc failed\n");
+            exit(1);
+        }
+        heap_alloced = 1;
+    }
+
     int nfds = 0;
     if (kai_reactor_sigchld_pipe[0] >= 0) {
         pfds[nfds].fd = kai_reactor_sigchld_pipe[0];
@@ -7192,6 +7450,23 @@ static void kai_reactor_wait(void) {
         pfds[nfds].revents = 0;
         nfds++;
     }
+    /* Issue #630 — Phase R2: register every socket waiter's fd. If
+     * the same fd shows up in both directions (a fiber reading on a
+     * fd while another writes to it — rare in v1 but legal), the fd
+     * appears twice in the poll set with disjoint event masks; POSIX
+     * permits this and reports revents per-entry. */
+    for (KaiFiber *f = kai_reactor_socket_read_waiters; f; f = f->reactor_next) {
+        pfds[nfds].fd = f->reactor_wait_pid;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    for (KaiFiber *f = kai_reactor_socket_write_waiters; f; f = f->reactor_next) {
+        pfds[nfds].fd = f->reactor_wait_pid;
+        pfds[nfds].events = POLLOUT;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
     int rc = poll(pfds, (nfds_t) nfds, timeout_ms);
     if (rc < 0 && errno != EINTR) {
         fprintf(stderr, "kai: reactor poll() failed: %s\n", strerror(errno));
@@ -7204,27 +7479,31 @@ static void kai_reactor_wait(void) {
     uint64_t now = kai_reactor_now_ns();
     kai_reactor_timer_drain(now);
     if (rc > 0) {
+        /* Self-pipe and stdin paths first (these compare against the
+         * fixed fds we know up front). */
         for (int i = 0; i < nfds; i++) {
-            if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-                if (pfds[i].fd == kai_reactor_sigchld_pipe[0]) {
-                    kai_reactor_sigchld_drain();
-                } else if (pfds[i].fd == kai_reactor_filepool_pipe[0]) {
-                    kai_reactor_filepool_drain();
-                } else if (pfds[i].fd == STDIN_FILENO) {
-                    /* Issue #620 — readiness event on stdin: promote
-                     * the parked fiber. POLLHUP / POLLERR also count
-                     * as wakeups so a closed pipe (EOF) does not
-                     * strand the waiter forever. The handler's read
-                     * loop will observe EOF / error on retry. */
-                    KaiFiber *f = kai_reactor_stdin_waiter;
-                    if (f) {
-                        kai_reactor_stdin_waiter = NULL;
-                        kai_reactor_parked_count--;
-                        kai_sched_unpark(f);
-                    }
-                }
+            if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            if (pfds[i].fd == kai_reactor_sigchld_pipe[0]) {
+                kai_reactor_sigchld_drain();
+            } else if (pfds[i].fd == kai_reactor_filepool_pipe[0]) {
+                kai_reactor_filepool_drain();
+            } else if (pfds[i].fd == STDIN_FILENO &&
+                       kai_reactor_stdin_waiter != NULL) {
+                /* Issue #620 — readiness event on stdin: promote
+                 * the parked fiber. POLLHUP / POLLERR also count
+                 * as wakeups so a closed pipe (EOF) does not
+                 * strand the waiter forever. */
+                KaiFiber *f = kai_reactor_stdin_waiter;
+                kai_reactor_stdin_waiter = NULL;
+                kai_reactor_parked_count--;
+                kai_sched_unpark(f);
             }
         }
+        /* Socket waiters: separate drain pass because the same fd
+         * may appear in both directions (and the read/write masks
+         * are disjoint). Each drain handles only the matching list. */
+        kai_reactor_socket_drain(&kai_reactor_socket_read_waiters,  pfds, nfds, POLLIN);
+        kai_reactor_socket_drain(&kai_reactor_socket_write_waiters, pfds, nfds, POLLOUT);
     }
     /* A SIGCHLD delivered before we entered poll() may not appear
      * in revents (the signal handler ran but the byte arrived
@@ -7234,6 +7513,8 @@ static void kai_reactor_wait(void) {
     if (kai_reactor_pid_waiters) {
         kai_reactor_sigchld_drain();
     }
+
+    if (heap_alloced) free(pfds);
 }
 
 static void kai_sched_enqueue(KaiFiber *f) {
