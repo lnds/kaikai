@@ -55,19 +55,15 @@ while IFS= read -r -d '' f; do
       Cont) skip=$((skip + 1)); continue ;;
     esac
 
-    # Issue #643 follow-up: same-arity sum-type collisions are
-    # documented as a known limitation. The arity-aware variant
-    # walker discriminates `Tree[k, v]` (arity 2) from `Tree`
-    # (arity 0) but does NOT discriminate two arity-0 sum types
-    # of the same name. The prelude code consuming the private
-    # type still resolves variants against the bare name table
-    # and ends up seeing the user's redeclared variants. The
-    # proper fix (per-module name scopes for non-`pub` types)
-    # is a separate lane; tracked in the lane retro.
-    case "$tname" in
-      SplitN|NB_FragR)
-        skip=$((skip + 1)); continue ;;
-    esac
+    # Issue #647 closed the same-arity sum-type collision gap
+    # by mangling every non-`pub` prelude DType to
+    # `<module>::<name>` (`crypto.hash::SplitN`,
+    # `regexp::NB_FragR`). The skip-list previously needed for
+    # `SplitN` and `NB_FragR` is therefore retired — the audit
+    # now exercises those cases end-to-end. If a future prelude
+    # type ever needs to opt out again, document the reason here
+    # and add an explicit case below; do NOT silently re-add
+    # entries.
 
     # Synthesize a minimal user program that redeclares `tname`
     # as a sum type. Two arms, both nullary, so the typer's
