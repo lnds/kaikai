@@ -272,7 +272,7 @@ land in each module's own spec when implemented.
 
 ### collections (pure, stage 2)
 
-- `collections.map` — ordered map: empty, insert, get, remove, keys, values, merge
+- `collections.map` — AVL-tree-backed ordered map (canonical qualified-call style as of #613): `empty`, `size`, `is_empty`, `get`, `contains`, `put`, `remove`, `keys`, `values`, `to_pairs`, `from_pairs`, `update`, `fold`, `merge`, `filter`, `transform_values` (16 pub fns); `map`, `flat_map`, `filter` exported with `Pair[k, v]` element shape so `Map[k, v]` participates in `|`, `||`, `|?` per #594. Legacy flat-prefix aliases (`map_empty`, `map_size`, `map_is_empty`, `map_get`, `map_contains`, `map_put`, `map_remove`, `map_to_pairs`, `map_keys`, `map_values`, `map_from_pairs` — 11 one-liners) retained for the tongariki edition and scheduled to drop at the Orongo edition boundary.
 - `collections.set` — ordered set: empty, insert, remove, contains, union, intersection
 
 ### math (pure, stage 2)
