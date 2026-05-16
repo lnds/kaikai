@@ -122,7 +122,7 @@ Selfhost is byte-identical post-rename: tier 0 reports
 The aliases are scheduled to drop at the Orongo edition boundary
 per `docs/editions.md` stability discipline. Until then, they are
 **not** marked `#unstable` — they are part of the stable surface
-under tongariki + anga-roa, just labeled "legacy."
+under tongariki + hanga-roa, just labeled "legacy."
 
 ## Fixture decisions
 
@@ -135,8 +135,17 @@ Three fixtures:
 - `examples/stdlib/map_round_out.kai` — new. Exercises the five
   round-out ops with explicit value asserts plus a final
   pair-printout for ordering verification.
-- `examples/stdlib/map_pipes.kai` — new. Exercises the three
-  pipe operators (`|`, `|?`, `||`) against `Map[String, Int]`.
+- `examples/stdlib/map_pipes/` — new package. Exercises the
+  three pipe operators (`|`, `|?`, `||`) against `Map[String, Int]`.
+  Pinned to `edition = "hanga-roa"` in `kai.toml` because the
+  convention-based pipe dispatch from #594 is gated behind
+  `hanga-roa` for non-List heads (per #603). Sits in a
+  sub-directory rather than a flat `.kai` because the
+  `test-stdlib` glob runs every top-level `examples/stdlib/*.kai`
+  under the repo's default `tongariki` edition; smoke-testable
+  manually with `bin/kai run examples/stdlib/map_pipes/main.kai`,
+  matching the precedent set by `examples/editions/*` (also not
+  wired into stage 2 CI per the #603 retro).
 
 A potential extra fixture (`map_aliases.kai`, smoke-testing
 every flat-prefix alias) was considered and skipped: the legacy
@@ -153,6 +162,16 @@ type through the lambda even with `acc: String` annotated.
 The fixture works around this by accumulating into `[String]`
 instead. Tracked here as a follow-up sharpener for the
 type-narrowing pass, not load-bearing for this lane.
+
+## Collateral fix — `Tree[k, v]` no longer leaks to prelude (closes #625)
+
+The lane originally landed `pub type Tree[k, v]` alongside
+`pub type Map[k, v]`. CI surfaced that `Tree` was leaking into
+the global prelude namespace, colliding with any user-defined
+`type Tree` (e.g. the canonical chapter-5 example from the book).
+The fix is a one-liner: drop `pub` from `Tree[k, v]` — the AVL
+carrier is an implementation detail of `Map`, not API. `Map[k, v]`
+stays `pub`. Closes #625 collaterally.
 
 ## Real cost vs estimate
 
