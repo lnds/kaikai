@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -418,11 +418,21 @@ tier1-asan: kaic2
 	@$(MAKE) -C stage2 test-securerandom-asan
 	@echo "tier1-asan OK — issue #140 fixture passes under ASAN+UBSan (SecureRandom default-handler gate)"
 
+# Backend-parity (issue #575): build every entry-point fixture under
+# the documented example dirs + demos with both backends, run, diff
+# stdout + exit code. Path-gated CI (tier1-backend-parity.yml) on every
+# PR touching compiler / stdlib / examples / demos / driver. Local
+# convenience target — paralleled by the CI workflow, not invoked from
+# `tier1` because the cost (~15-30 min) does not belong on every PR
+# locally.
+tier1-backend-parity: kaic2
+	@tools/test-backend-parity.sh
+
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
 # commit) but a diagnostic opens a lane the next morning.
-daily: tier1 stress-fixtures coverage-probe rc-budget tier1-asan
-	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget + tier1-asan"
+daily: tier1 stress-fixtures coverage-probe rc-budget tier1-asan tier1-backend-parity
+	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget + tier1-asan + tier1-backend-parity"
 
 # Stress fixtures: programs that exercise patterns the per-feature
 # suite does not. Some are aspirational (expected to fail until a
