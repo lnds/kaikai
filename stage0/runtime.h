@@ -1543,6 +1543,14 @@ static void     kai_reactor_park_pid(KaiFiber *f, int pid);
 static KaiValue *kai_reactor_run_in_pool(KaiValue *(*work)(void *), void *arg);
 static uint64_t kai_reactor_now_ns(void);
 
+/* Issue #620 — Phase R3 reactor forward decls. The default Stdin
+ * handlers live ~1700 lines above the reactor implementation. They
+ * call into the small park-stdin helper which encapsulates the
+ * single-fiber slot, the parked-count bump, and the kai_sched_park
+ * yield. The nonblock-once helper is also forward-declared. */
+static int       kai_reactor_park_stdin(KaiFiber *f);
+static void      kai_reactor_stdin_set_nonblocking(void);
+
 static KaiMailbox *kai_mailbox_alloc(void) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
@@ -4230,11 +4238,20 @@ static KaiValue *kai_prelude_read_line(void) {
     return kai_variant(0, "Ok", 1, &s);
 }
 
-/* Issue #453: byte-oriented stdin read. Reads up to `n` raw bytes
- * from stdin (including '\n') and returns them as a String. On EOF
- * the returned String is shorter than `n` — possibly empty. Used
- * by LSP-style framed protocols where the body length is known up
- * front and may contain newlines. */
+/* Issue #453 + #620: byte-oriented stdin read. Reads up to `n` raw
+ * bytes from stdin (including '\n') and returns them as a String.
+ * On EOF the returned String is shorter than `n` — possibly empty.
+ * Used by LSP-style framed protocols where the body length is known
+ * up front and may contain newlines.
+ *
+ * R3 unification: this prelude entry and the `Stdin.read_bytes`
+ * default handler both go through `read(STDIN_FILENO, …)` so that a
+ * program mixing the two forms (flat `read_bytes(n)` and qualified
+ * `Stdin.read_bytes(n)`) consumes the input stream byte-for-byte
+ * without libc's stdio buffer in the middle. The flat prelude path
+ * stays blocking (it predates the reactor and is reachable from
+ * stage 0 binaries that have no fibers); the qualified handler
+ * parks the fiber on EAGAIN. */
 static KaiValue *kai_prelude_read_bytes(KaiValue *n) {
     int64_t want = 0;
     if (n && n->tag == KAI_INT && n->as.i > 0) want = n->as.i;
@@ -4244,9 +4261,25 @@ static KaiValue *kai_prelude_read_bytes(KaiValue *n) {
     if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     size_t got = 0;
     while (got < (size_t) want) {
-        size_t r = fread(buf + got, 1, (size_t) want - got, stdin);
-        if (r == 0) break;
-        got += r;
+        ssize_t r = read(STDIN_FILENO, buf + got, (size_t) want - got);
+        if (r > 0) {
+            got += (size_t) r;
+        } else if (r == 0) {
+            break;  /* EOF */
+        } else if (errno == EINTR) {
+            continue;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* fd 0 is O_NONBLOCK because the R3 reactor handler
+             * flipped it earlier in this process. The flat prelude
+             * has no fiber to park; emulate blocking semantics by
+             * polling until the fd is readable, then retry. */
+            struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
+            int prc = poll(&p, 1, -1);
+            if (prc < 0 && errno != EINTR) break;
+            continue;
+        } else {
+            break;  /* I/O error — surface as short read */
+        }
     }
     KaiValue *s = kai_str_from_bytes(buf, got);
     free(buf);
@@ -5180,39 +5213,126 @@ static KaiValue *kai_default_fail_fail(void *self, KaiValue *msg, KaiCont *k) {
     exit(1);
 }
 
-/* m7a #7: default Stdin handler. Doc B §`Stdin` declares
- * `read_line() : Option[String] / Fail`; m7a simplifies to
- * `: Option[String]` (no /Fail propagation yet — fread errors
- * panic the same way Console does). EOF maps to None; any byte
+/* m7a #7 + Issue #620 — Phase R3 reactor: default Stdin handler.
+ * Doc B §`Stdin` declares `read_line() : Option[String] / Fail`;
+ * m7a simplifies to `: Option[String]`. EOF maps to None; any byte
  * read returns Some(line) with the trailing '\n' stripped if
- * present. */
+ * present.
+ *
+ * R3 wiring: fd 0 is flipped to O_NONBLOCK once per process, then
+ * read() loops accumulating bytes. On EAGAIN the fiber parks on
+ * `kai_reactor_stdin_waiter` and the scheduler's poll() loop wakes
+ * it when POLLIN / POLLHUP arrives on STDIN_FILENO. Multiple
+ * concurrent readers are a logic bug (the bytes shred between
+ * fibers); the second reader panics with a clear diagnostic. */
 static KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k) {
     (void) self;
+    kai_reactor_init();
+    kai_reactor_stdin_set_nonblocking();
+
     size_t cap = 128, n = 0;
     char *buf = (char *) malloc(cap);
     if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
-    int ch;
-    while ((ch = fgetc(stdin)) != EOF && ch != '\n') {
+
+    for (;;) {
         if (n + 1 >= cap) { cap *= 2; buf = (char *) realloc(buf, cap); }
-        buf[n++] = (char) ch;
+        ssize_t r = read(STDIN_FILENO, buf + n, 1);
+        if (r > 0) {
+            if (buf[n] == '\n') {
+                /* Strip the trailing newline. */
+                KaiValue *s = kai_str_from_bytes(buf, n);
+                free(buf);
+                KaiValue *some = kai_variant(0, "Some", 1, &s);
+                return kai_cont_resume(k, some);
+            }
+            n++;
+        } else if (r == 0) {
+            /* EOF — peer closed. Partial line returned as Some;
+             * empty buffer becomes None. */
+            if (n == 0) {
+                free(buf);
+                return kai_cont_resume(k, kai_variant(0, "None", 0, NULL));
+            }
+            KaiValue *s = kai_str_from_bytes(buf, n);
+            free(buf);
+            KaiValue *some = kai_variant(0, "Some", 1, &s);
+            return kai_cont_resume(k, some);
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* No bytes available — park the fiber on the reactor
+             * until POLLIN fires on stdin. */
+            if (kai_reactor_park_stdin(kai_current_fiber()) != 0) {
+                fprintf(stderr,
+                    "kai: stdin: multiple fibers reading concurrently "
+                    "is undefined; serialize via an actor\n");
+                exit(1);
+            }
+            /* Resumed: drain helper cleared the waiter slot. Loop
+             * to retry the read. */
+        } else if (errno == EINTR) {
+            /* Signal interrupted the read — retry immediately. */
+            continue;
+        } else {
+            /* Real I/O error. The op's surface type is
+             * `Option[String]`; propagate as None and let the
+             * caller see end-of-stream. Keeps parity with the
+             * pre-R3 fgetc path which silently treated errors as
+             * EOF. */
+            free(buf);
+            return kai_cont_resume(k, kai_variant(0, "None", 0, NULL));
+        }
     }
-    if (ch == EOF && n == 0) {
-        free(buf);
-        return kai_cont_resume(k, kai_variant(0, "None", 0, NULL));
-    }
-    KaiValue *s = kai_str_from_bytes(buf, n);
-    free(buf);
-    KaiValue *some = kai_variant(0, "Some", 1, &s);
-    return kai_cont_resume(k, some);
 }
 
-/* Issue #453: default Stdin.read_bytes handler. Reuses the flat
- * prelude helper which returns a String (possibly shorter than `n`
- * on EOF). No Result wrapper — the LSP framing use case treats a
- * short read as end-of-stream. */
+/* Issue #453 + #620 — Phase R3: default Stdin.read_bytes handler.
+ * Returns a String of at most `n` raw bytes; on EOF the returned
+ * String is shorter than `n` — possibly empty. No Result wrapper —
+ * the LSP framing use case treats a short read as end-of-stream.
+ *
+ * R3 wiring: same shape as read_line — non-blocking read() loop
+ * with reactor parking on EAGAIN. The buffer is sized once up
+ * front so partial reads accumulate without realloc. */
 static KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_read_bytes(n));
+    int64_t want = 0;
+    if (n && n->tag == KAI_INT && n->as.i > 0) want = n->as.i;
+    if (n) kai_decref(n);
+    if (want <= 0) {
+        return kai_cont_resume(k, kai_str_from_bytes("", 0));
+    }
+
+    kai_reactor_init();
+    kai_reactor_stdin_set_nonblocking();
+
+    char *buf = (char *) malloc((size_t) want);
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    size_t got = 0;
+
+    while (got < (size_t) want) {
+        ssize_t r = read(STDIN_FILENO, buf + got, (size_t) want - got);
+        if (r > 0) {
+            got += (size_t) r;
+        } else if (r == 0) {
+            /* EOF — return what we have. */
+            break;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (kai_reactor_park_stdin(kai_current_fiber()) != 0) {
+                fprintf(stderr,
+                    "kai: stdin: multiple fibers reading concurrently "
+                    "is undefined; serialize via an actor\n");
+                exit(1);
+            }
+        } else if (errno == EINTR) {
+            continue;
+        } else {
+            /* Real I/O error — surface as short read (matches
+             * fread's silent behaviour on the pre-R3 path). */
+            break;
+        }
+    }
+
+    KaiValue *s = kai_str_from_bytes(buf, got);
+    free(buf);
+    return kai_cont_resume(k, s);
 }
 
 /* m7a #7: default Env handlers. `args()` reuses kai_prelude_args
@@ -6596,6 +6716,15 @@ static KaiFiber *kai_reactor_timer_head = NULL;
 static KaiFiber *kai_reactor_pid_waiters     = NULL;
 static KaiFiber *kai_reactor_filepool_waiters = NULL;
 
+/* Issue #620 — Phase R3 reactor: stdin slot. Singleton because
+ * STDIN_FILENO is process-shared; multiple fibers reading the same
+ * pipe concurrently is a logic bug (the bytes would shred). The
+ * parking op rejects with a clear panic if a second fiber tries.
+ * Wake source is POLLIN on fd 0, drained alongside the SIGCHLD /
+ * file-pool self-pipes by `kai_reactor_wait`. */
+static KaiFiber *kai_reactor_stdin_waiter = NULL;
+static int       kai_reactor_stdin_orig_flags = -1;
+
 /* Aggregate count of fibers parked on any reactor structure.
  * kai_sched_park reads this to decide between "no one can wake us
  * up — deadlock" (count == 0) and "block on the reactor until a
@@ -6812,6 +6941,33 @@ static void *kai_filepool_worker(void *arg) {
     }
 }
 
+/* Issue #620 — restore stdin's original flags on process exit. The
+ * runtime flips fd 0 to O_NONBLOCK once the first stdin op runs;
+ * leaving the shell's stdin in non-blocking mode after exit is a
+ * subtle, hard-to-diagnose footgun (tools downstream of the kaikai
+ * program would see EAGAIN on every read). atexit guarantees this
+ * runs on normal termination and on `exit()` calls. */
+static void kai_reactor_stdin_restore(void) {
+    if (kai_reactor_stdin_orig_flags >= 0) {
+        fcntl(STDIN_FILENO, F_SETFL, kai_reactor_stdin_orig_flags);
+        kai_reactor_stdin_orig_flags = -1;
+    }
+}
+
+/* Issue #620 — set fd 0 to O_NONBLOCK once per process. Saves the
+ * original flags into kai_reactor_stdin_orig_flags so atexit can
+ * restore them. No-op on subsequent calls. If F_GETFL fails (eg. fd
+ * 0 closed by the parent program), the function is a no-op and the
+ * stdin parking path will surface the failure as a Fail/error. */
+static void kai_reactor_stdin_set_nonblocking(void) {
+    if (kai_reactor_stdin_orig_flags >= 0) return;
+    int fl = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (fl < 0) return;
+    kai_reactor_stdin_orig_flags = fl;
+    fcntl(STDIN_FILENO, F_SETFL, fl | O_NONBLOCK);
+    atexit(kai_reactor_stdin_restore);
+}
+
 /* Lazy initialisation of the reactor on first use. Idempotent;
  * safe to call from every parking site. Installs SIGCHLD additively
  * (only if no existing handler is registered) so the stack-guard
@@ -6944,6 +7100,20 @@ static void kai_reactor_park_pid(KaiFiber *f, int pid) {
     kai_sched_park();
 }
 
+/* Issue #620 — Phase R3: park `f` on the singleton stdin slot.
+ * Returns 0 on success and -1 if another fiber already holds the
+ * slot (the caller should treat that as "concurrent stdin readers
+ * — undefined" and panic). The slot is cleared by `kai_reactor_wait`
+ * when POLLIN / POLLHUP / POLLERR fires on STDIN_FILENO; on resume
+ * the parking site simply retries its read(). */
+static int kai_reactor_park_stdin(KaiFiber *f) {
+    if (kai_reactor_stdin_waiter != NULL) return -1;
+    kai_reactor_stdin_waiter = f;
+    kai_reactor_parked_count++;
+    kai_sched_park();
+    return 0;
+}
+
 /* Submit `work(arg)` to the file-pool worker queue and park the
  * caller until completion. Returns the worker's KaiValue *result.
  * The KaiFilepoolItem lives on the caller's fiber stack — safe
@@ -6998,7 +7168,7 @@ static void kai_reactor_wait(void) {
         }
     }
 
-    struct pollfd pfds[2];
+    struct pollfd pfds[3];
     int nfds = 0;
     if (kai_reactor_sigchld_pipe[0] >= 0) {
         pfds[nfds].fd = kai_reactor_sigchld_pipe[0];
@@ -7008,6 +7178,16 @@ static void kai_reactor_wait(void) {
     }
     if (kai_reactor_filepool_pipe[0] >= 0) {
         pfds[nfds].fd = kai_reactor_filepool_pipe[0];
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    /* Issue #620 — Phase R3: only register stdin in the poll set
+     * while a fiber is parked on it. Otherwise we would wake on
+     * every keystroke even when no one is reading, burn CPU, and
+     * have no waiter to promote. */
+    if (kai_reactor_stdin_waiter != NULL) {
+        pfds[nfds].fd = STDIN_FILENO;
         pfds[nfds].events = POLLIN;
         pfds[nfds].revents = 0;
         nfds++;
@@ -7025,11 +7205,23 @@ static void kai_reactor_wait(void) {
     kai_reactor_timer_drain(now);
     if (rc > 0) {
         for (int i = 0; i < nfds; i++) {
-            if (pfds[i].revents & POLLIN) {
+            if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
                 if (pfds[i].fd == kai_reactor_sigchld_pipe[0]) {
                     kai_reactor_sigchld_drain();
                 } else if (pfds[i].fd == kai_reactor_filepool_pipe[0]) {
                     kai_reactor_filepool_drain();
+                } else if (pfds[i].fd == STDIN_FILENO) {
+                    /* Issue #620 — readiness event on stdin: promote
+                     * the parked fiber. POLLHUP / POLLERR also count
+                     * as wakeups so a closed pipe (EOF) does not
+                     * strand the waiter forever. The handler's read
+                     * loop will observe EOF / error on retry. */
+                    KaiFiber *f = kai_reactor_stdin_waiter;
+                    if (f) {
+                        kai_reactor_stdin_waiter = NULL;
+                        kai_reactor_parked_count--;
+                        kai_sched_unpark(f);
+                    }
                 }
             }
         }

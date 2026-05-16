@@ -372,6 +372,24 @@ length comes from a header and may contain embedded newlines),
 use `read_bytes(n)`: the runtime calls `fread` and returns
 exactly `n` bytes — or fewer on EOF.
 
+> **v1 status (R3 reactor, 2026-05-15):** `read_line` and
+> `read_bytes` park the *fiber* on the reactor's singleton stdin
+> slot. Fd 0 is flipped to `O_NONBLOCK` once per process (with an
+> `atexit`-restored cleanup so the user's shell does not inherit
+> non-blocking stdin), and the handler's `read()` loop parks on
+> `EAGAIN`. The scheduler's `poll()` set grows a third slot for
+> `STDIN_FILENO` whenever a waiter is registered, and POLLIN /
+> POLLHUP / POLLERR all wake the parked fiber. Pre-R3 the handler
+> blocked the OS thread inside `fgetc` / `fread` and every other
+> fiber starved until input arrived. Multiple concurrent stdin
+> readers are a logic bug — a second fiber attempting to park
+> while the slot is held panics with `"stdin: multiple fibers
+> reading concurrently is undefined; serialize via an actor"`;
+> the singleton-fd shape mirrors the discipline already enforced
+> for stdout / stderr. Cancel mid-syscall is NOT delivered: the
+> cancel pad fires at the next yield-point hook after the wake,
+> matching the cooperative-cancellation contract from R1.
+
 ## `Env`
 
 ### Declaration
