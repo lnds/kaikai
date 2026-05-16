@@ -24584,7 +24584,7 @@ fn apply_tp_subst_te(te: TypeExpr, subst: [TPSubst]) : TypeExpr {
     TyFn(ps, ret, row) ->
       TypeExpr { tkind: TyFn(apply_tp_subst_te_list(ps, subst),
                               apply_tp_subst_te(ret, subst),
-                              row),
+                              apply_tp_subst_row(row, subst)),
                   line: te.line, col: te.col }
     TyDim(base, u) ->
       TypeExpr { tkind: TyDim(apply_tp_subst_te(base, subst), u),
@@ -24599,6 +24599,69 @@ fn apply_tp_subst_te_list(tes: [TypeExpr], subst: [TPSubst]) : [TypeExpr] {
   match tes {
     [] -> []
     [t, ...rest] -> [apply_tp_subst_te(t, subst), ...apply_tp_subst_te_list(rest, subst)]
+  }
+}
+
+# Apply a tparam substitution to a RowExpr. When a tparam name appears
+# as the row variable (`ROpen("e", labels)`), replace the tail with the
+# substituted TypeExpr, treating an uppercase `TyName(NN, [])` argument
+# as a single effect label (`labels + [RL(NN, [])]`, closed). Lowercase
+# `TyName(nm, [])` is treated as another row variable name. Any more
+# complex replacement (e.g. `TyName("Foo", [Int])`) leaves the row
+# unchanged — that case is rejected by `resolve_ty_with_binds` later
+# with a normal "unknown row variable" diagnostic instead of a panic.
+#
+# Closes #624 (alias with row variable + concrete row annotation): the
+# alias body `() -> Option[t] / e` instantiated at `Foo[Int, Console]`
+# now rewrites the row to `RClosed([Console])`, where before the
+# substitution skipped the row entirely and downstream resolve produced
+# a row tail of `Some(-1)` that paniced in `subst_row_lookup`.
+fn apply_tp_subst_row(r: RowExpr, subst: [TPSubst]) : RowExpr {
+  match r {
+    REmpty -> REmpty
+    RClosed(labels) -> RClosed(apply_tp_subst_rls(labels, subst))
+    ROpen(rv, labels) -> {
+      let labels1 = apply_tp_subst_rls(labels, subst)
+      match tp_subst_lookup(subst, rv) {
+        None -> ROpen(rv, labels1)
+        Some(rep) -> match rep.tkind {
+          TyName(nm, []) -> {
+            if name_first_is_upper(nm) {
+              RClosed(label_concat_rls(labels1, [RL(nm, [])]))
+            } else {
+              ROpen(nm, labels1)
+            }
+          }
+          _ -> ROpen(rv, labels1)
+        }
+      }
+    }
+  }
+}
+
+fn apply_tp_subst_rls(ls: [RowLabel], subst: [TPSubst]) : [RowLabel] {
+  match ls {
+    [] -> []
+    [rl, ...rest] -> match rl {
+      RL(name, ts) -> [
+        RL(name, apply_tp_subst_te_list(ts, subst)),
+        ...apply_tp_subst_rls(rest, subst)
+      ]
+    }
+  }
+}
+
+fn label_concat_rls(a: [RowLabel], b: [RowLabel]) : [RowLabel] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...label_concat_rls(rest, b)]
+  }
+}
+
+fn name_first_is_upper(s: String) : Bool {
+  match char_at(s, 0) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None -> false
   }
 }
 
@@ -24626,7 +24689,7 @@ fn expand_ta_te(te: TypeExpr, table: [TAEntry], fuel: Int) : TypeExpr {
     TyFn(ps, ret, row) ->
       TypeExpr { tkind: TyFn(expand_ta_te_list(ps, table, fuel),
                               expand_ta_te(ret, table, fuel),
-                              row),
+                              expand_ta_row(row, table, fuel)),
                   line: te.line, col: te.col }
     TyDim(base, u) ->
       TypeExpr { tkind: TyDim(expand_ta_te(base, table, fuel), u),
@@ -24642,6 +24705,30 @@ fn expand_ta_te_list(tes: [TypeExpr], table: [TAEntry], fuel: Int) : [TypeExpr] 
     [] -> []
     [t, ...rest] -> [expand_ta_te(t, table, fuel),
                      ...expand_ta_te_list(rest, table, fuel)]
+  }
+}
+
+# Walk a RowExpr looking for TypeExprs (inside label ty_args) to expand.
+# The row tail is a name — not a TypeExpr — so no alias substitution
+# happens there. Label ty_args (`Reader[Int]`) carry TypeExprs that
+# may mention aliases.
+fn expand_ta_row(r: RowExpr, table: [TAEntry], fuel: Int) : RowExpr {
+  match r {
+    REmpty -> REmpty
+    RClosed(labels) -> RClosed(expand_ta_rls(labels, table, fuel))
+    ROpen(rv, labels) -> ROpen(rv, expand_ta_rls(labels, table, fuel))
+  }
+}
+
+fn expand_ta_rls(ls: [RowLabel], table: [TAEntry], fuel: Int) : [RowLabel] {
+  match ls {
+    [] -> []
+    [rl, ...rest] -> match rl {
+      RL(name, ts) -> [
+        RL(name, expand_ta_te_list(ts, table, fuel)),
+        ...expand_ta_rls(rest, table, fuel)
+      ]
+    }
   }
 }
 
@@ -27740,7 +27827,12 @@ fn subst_extend(s: Subst, v: Int, ty: Ty) : Subst / Mutable {
 # only created during unify_row, never elsewhere.
 
 fn subst_row_lookup(s: Subst, v: Int) : Option[Row] {
-  if v >= array_length(s.row_slots) { None }
+  # Issue #624: tolerate sentinel negative ids that `row_of_expr_with_binds`
+  # emits when a row variable name was not resolved (e.g. an alias body
+  # whose row tparam remained after alias expansion). Treat as unbound
+  # instead of paniccing in `array_get`.
+  if v < 0 { None }
+  else if v >= array_length(s.row_slots) { None }
   else { array_get(s.row_slots, v) }
 }
 
@@ -60033,7 +60125,16 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # narrowing keep working.
             let ta_table = collect_transparent_aliases(raw_decls_post_eff,
                                                         eff_names_for_alias)
-            let raw_decls_pre_pos = expand_ta_decls(raw_decls_post_eff, ta_table)
+            # Issue #624: re-run effect-alias expansion after transparent
+            # type-alias expansion. Transparent aliases parameterised by
+            # a row variable (`type Foo[t, e] = ... / e`) may surface
+            # effect-alias labels (e.g. `Console`) that the first pass
+            # did not see, because the substituted name was carried in
+            # the TPSubst as a TypeExpr argument rather than appearing
+            # syntactically in the decl stream.
+            let raw_decls_pre_pos =
+              expand_aliases_in_decls(expand_ta_decls(raw_decls_post_eff, ta_table),
+                                       alias_res.aliases)
             # issue #266: rewrite `T { v1, v2 }` (parser tags fields
             # with `__pos_<i>__` sentinels) into `T { f1: v1, f2: v2 }`
             # using the record's declared field order. Runs before any
