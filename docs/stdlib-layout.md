@@ -6,8 +6,9 @@ what effects they declare, and where the line runs between stdlib and
 the forthcoming `ahu` layer. It is **not** an API reference — each
 module gets its own spec when implemented.
 
-**Status markers (refreshed 2026-05-08, issue #367).** Operations in
-the per-module catalog below are tagged inline:
+**Status markers (refreshed 2026-05-08, issue #367; re-verified
+2026-05-16 in #604).** Operations in the per-module catalog below
+are tagged inline:
 
 - *(shipped)* — `pub fn` exists in the named `stdlib/<module>.kai`.
 - *(planned: #N)* — tracked in an open GitHub issue; not yet in `stdlib/`.
@@ -232,7 +233,7 @@ stdlib/
   random_secure.kai  effect: SecureRandom (top-level — shipped via PR #144, closes #140)
   log.kai        effect: Log (top-level module — shipped via PR #145, closes #141)
   net/           effects: NetTcp (NetUdp + NetDns NOT shipped; alias `Net = NetTcp + NetUdp + NetDns` is aspirational)
-    tcp.kai      uses NetTcp (shipped — v1: blocking, no reactor; see effects-stdlib.md sidebar)
+    tcp.kai      uses NetTcp (shipped — v1; R2 reactor flipped NetTcp to fiber-parking 2026-05-16 via #630; see effects-stdlib.md sidebar)
     udp.kai      (planned, no tracking issue — Tier S3)
     dns.kai      (planned, no tracking issue — Tier S3)
     url.kai      pure URL parsing (planned — folded into http.kai parser today)

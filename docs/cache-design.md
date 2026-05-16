@@ -465,9 +465,11 @@ Numbers below are expected walls after each layer ships, on a
 (32 preludes, post-#578). Tier 0 + Tier 1 + Tier 1-ASAN green
 and selfhost byte-identical are gates for every sub-phase.
 
-### Phase A.0 — post-parse cache
+### Phase A.0 — post-parse cache — **SHIPPED 2026-05-14 (#452) + KAB2 2026-05-15 (#592)**
 
-- Warm wall: ≤ 1.90 s (cache-hit on all 32 preludes).
+- Warm wall: ≤ 1.90 s (cache-hit on all 32 preludes). **Empirically
+  delivered** by #452 (hex KAB1) and #592 (binary KAB2). Post-KAB2
+  baseline ~2.31 s overall (see §"Empirical breakdown").
 - Saves: 0.41 s lex+parse.
 - Cache invalidates on: source sha change, kaikai_version_hash
   change, header corruption (magic / checksum / version
@@ -502,16 +504,20 @@ and selfhost byte-identical are gates for every sub-phase.
     semantics. `typecheck_module` now consumes `inherited:
     ModuleEnvDelta` and `typecheck_program` folds across segments.
     A multi-segment cache loader can drive the typer today.
-  - **#597 (open) — `lower_protocols` boundary destruction.** The
-    driver call site mixes prelude- and user-origin decls after
-    `lower_protocols`'s `[user_renamed, impl_renamed, dispatchers]`
-    concat. A cache loader has no way to recover the per-module
-    boundary from the post-cascade decl stream. Mitigation paths
-    documented in §"What #574 unblocked and the lower_protocols
-    boundary it did not". Empirically confirmed by the #461 lane
-    verification step (2026-05-14) — see
-    `docs/lane-experience-issue-461-phase-a1-a2.md`. The A.1 cache
-    lane is blocked on #597 closing.
+  - ~~**#597 (open) — `lower_protocols` boundary destruction.**~~
+    **#597 closed 2026-05-15** — `module_origin` propagation through
+    `lower_protocols` + the desugar passes that follow it shipped;
+    synthesised decls now carry the prelude-vs-user tag the cache
+    loader needs. The driver call site that mixed prelude- and
+    user-origin decls after `lower_protocols`'s `[user_renamed,
+    impl_renamed, dispatchers]` concat is no longer the blocker.
+    Mitigation paths documented in §"What #574 unblocked and the
+    lower_protocols boundary it did not" — the boundary-tagging
+    option (a) is what shipped. Lane retros:
+    `docs/lane-experience-issue-461-phase-a1-a2.md` (pre-fix audit),
+    and the #597 closing PR for the tagging refactor. **The A.1
+    cache lane is now blocked only on the typer-side semantic step
+    (sub-step 3d-future of #460), since closed by #578.**
   - The A.1 payload extends the A.0 payload with the
     `ModuleEnvDelta` struct (`ty_entries`, `unions`,
     `op_eff_arities`, `recs`, `sums`, `op_to_eff`,
@@ -564,6 +570,9 @@ or LLVM-direct; either choice belongs in its own design doc.
 ## Related
 
 - #452 — Phase A stdlib cache (epic; A.0 / A.1 / A.2 sub-lanes).
+  **A.0 closed 2026-05-14** (hex KAB1 baseline); KAB2 binary format
+  closed 2026-05-15 via #592. A.1 / A.2 remain open as separate
+  lanes per the sub-phase plan above.
 - #455 — Phase B user-file incremental cache.
 - #459 — `BinSerialize` protocol with cursor + `#derive` (closed
   by #471; the kaikai-native serde primitive A.0/A.1 consume).
@@ -572,8 +581,14 @@ or LLVM-direct; either choice belongs in its own design doc.
 - #461 — Phase A.2 — post-perceus cache + emit-only-user.
 - #574 — typer per-module semantics (sub-step 3d-future of #460;
   A.1 pre-blocker, closed by #578).
-- #597 — `lower_protocols` + synth desugar boundary tagging (the
-  remaining A.1 pre-blocker after #574 closed).
+- ~~#597 — `lower_protocols` + synth desugar boundary tagging (the
+  remaining A.1 pre-blocker after #574 closed).~~ **#597 closed
+  2026-05-15** — `module_origin` propagation through
+  `lower_protocols` and the downstream desugar passes shipped; A.1
+  payload schema can now carry the per-module boundary.
+- #592 — KAB2 binary on-disk cache format (closed 2026-05-15);
+  flipped A.0 from hex KAB1 to packed binary, delivered the
+  projected 0.41 s wall save.
 - #454 — Compiler library mode (defines the TypedModule that gets
   serialised).
 - #447 — LSP v1 (consumes #454's query surface; benefits from this
