@@ -84,6 +84,17 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.69.0 (2026-05-16)
+
+### Added
+
+- **stdlib**: core.string drop_prefix / drop_suffix (closes #632)
+
+### Fixed
+
+- **typer**: private types in prelude no longer leak into user scope (closes #643)
+- **ci**: xargs subshell must be bash, not sh — export -f invisible to dash
+
 ## v0.68.1 (2026-05-16)
 
 ### Fixed
