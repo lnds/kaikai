@@ -13169,8 +13169,18 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], lcs: [String], f
     # do not need to round-trip through emit_named_call_lookup (which
     # would lose the qualified context and pick the wrong entry when
     # two modules export the same bare name).
-    EModCall(mod, fname) ->
-      cat5("kai_", c_sym(fname, Some(mod)), "(", call_args, ")")
+    #
+    # Issue #644 — Plan B: the typer rewrites `Response.Ok(x)` (or a
+    # bare `Ok(x)` disambiguated to `Response.Ok` by annotation) to
+    # `EModCall("Response", "Ok")`. The emitter must lower it as a
+    # variant ctor (`kai_variant(0, "Ok", ...)`), not as a module fn
+    # call, because variant tag matching keys on the bare ctor name
+    # at runtime. Detect by membership in `variants`; fall through to
+    # the module-fn path otherwise.
+    EModCall(mod, fname) -> match evar_find(variants, fname) {
+      Some(_) -> emit_variant_call(fname, list_length(args_e), call_args)
+      None    -> cat5("kai_", c_sym(fname, Some(mod)), "(", call_args, ")")
+    }
     _ -> {
       let fc = emit_expr(src, f, lcs, fns, variants, lams, cls)
       concat_all([
@@ -16252,10 +16262,21 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
     # the prefixed thunk symbol directly from the EModCall payload.
     # `emit_ident_value(fname, ...)` would lose the qualified context
     # and pick the wrong entry in the ambiguous-name case.
-    EModCall(mod, fname) -> match efn_resolve(fns, fname) {
-      Some(EFn(_, ar, _, _)) ->
-        cat5("kai_closure(&_kai_", c_sym(fname, Some(mod)), "_thunk, ", int_to_string(ar), ", 0, NULL)")
-      None -> cat2("kai_", fname)
+    # Issue #644 — Plan B: when the qualified name is actually a
+    # variant ctor, emit the variant value directly (nullary only;
+    # non-nullary as a value is not supported, mirroring the EVar
+    # value-position constraint).
+    EModCall(mod, fname) -> match evar_find(variants, fname) {
+      Some(ar) -> if ar == 0 {
+        emit_variant_call(fname, 0, "")
+      } else {
+        cat3("kai_unit() /* non-nullary ctor as value not supported: ", string_concat(mod, string_concat(".", fname)), " */")
+      }
+      None -> match efn_resolve(fns, fname) {
+        Some(EFn(_, ar, _, _)) ->
+          cat5("kai_closure(&_kai_", c_sym(fname, Some(mod)), "_thunk, ", int_to_string(ar), ", 0, NULL)")
+        None -> cat2("kai_", fname)
+      }
     }
     # Issue #556: intrinsic calls in value position should never reach
     # emit_expr_boxed — the typer rejects them outside the clause-body
@@ -25540,6 +25561,24 @@ fn modules_exporting_loop(es: [TyEntry], fname: String, acc: [String]) : [String
   }
 }
 
+# Issue #644 — Plan B: returns `Some(bare)` when `key` has the form
+# `<target>::<bare>` (i.e. the qualified key whose left side is
+# `target`). Used by `variants_of_type_loop_arity` to surface user
+# variants registered only under the qualified key (because a prelude
+# builtin already occupies the bare slot) as variants of `target`,
+# yielding the bare ctor name pattern arms / exhaustiveness reports
+# expect.
+fn ty_env_strip_qualified_prefix(key: String, target: String) : Option[String] {
+  let prefix = string_concat(target, "::")
+  let pn = string_length(prefix)
+  let kn = string_length(key)
+  if kn <= pn { None }
+  else {
+    let head = string_slice(key, 0, pn)
+    if head == prefix { Some(string_slice(key, pn, kn - pn)) } else { None }
+  }
+}
+
 # Returns Some(<mod>) if `key` is `<mod>::<fname>`, else None. Used
 # only by `ty_env_modules_exporting` for diagnostic suggestions.
 fn ty_entry_split_mod(key: String, fname: String) : Option[String] {
@@ -25881,13 +25920,30 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
 # ---- built-in variant constructors ----
 
 fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
+  # Issue #644 — Plan B: also register the qualified `Option::Some`,
+  # `Option::None`, `Result::Ok`, `Result::Err` keys so that
+  # annotation-driven ctor disambiguation in user code can pin a
+  # prelude variant by qualifier when a user type collides with the
+  # bare ctor name. Prelude code itself does not consult these (it
+  # uses bare names exclusively); the qualified entries exist only
+  # so `ctor_needs_qualification` and `check_expr_against`'s ECall
+  # path can route `Result.Ok(x)` and `Response.Ok(x)` to distinct
+  # schemes without flipping the bare slot's protection.
+  let some_sc = scheme([0],    fn_ty([tv(0)], TyCon("Option", [tv(0)])))
+  let none_sc = scheme([0],    TyCon("Option", [tv(0)]))
+  let ok_sc   = scheme([0, 1], fn_ty([tv(1)], TyCon("Result", [tv(0), tv(1)])))
+  let err_sc  = scheme([0, 1], fn_ty([tv(0)], TyCon("Result", [tv(0), tv(1)])))
   let es = [
-    # Option[a]
-    TyEntry { name: "Some", scheme: scheme([0],    fn_ty([tv(0)], TyCon("Option", [tv(0)]))) },
-    TyEntry { name: "None", scheme: scheme([0],    TyCon("Option", [tv(0)])) },
-    # Result[e, a]: Ok carries `a` (TyVarT(1)), Err carries `e` (TyVarT(0)).
-    TyEntry { name: "Ok",   scheme: scheme([0, 1], fn_ty([tv(1)], TyCon("Result", [tv(0), tv(1)]))) },
-    TyEntry { name: "Err",  scheme: scheme([0, 1], fn_ty([tv(0)], TyCon("Result", [tv(0), tv(1)]))) }
+    # Bare entries — the load-bearing keys that bare prelude code uses.
+    TyEntry { name: "Some", scheme: some_sc },
+    TyEntry { name: "None", scheme: none_sc },
+    TyEntry { name: "Ok",   scheme: ok_sc   },
+    TyEntry { name: "Err",  scheme: err_sc  },
+    # Qualified entries — only the Plan B disambiguation paths read these.
+    TyEntry { name: ty_mod_key("Option", "Some"), scheme: some_sc },
+    TyEntry { name: ty_mod_key("Option", "None"), scheme: none_sc },
+    TyEntry { name: ty_mod_key("Result", "Ok"),   scheme: ok_sc   },
+    TyEntry { name: ty_mod_key("Result", "Err"),  scheme: err_sc  }
   ]
   TyEnv { entries: list_append(es, env.entries), fresh: env.fresh, unions: env.unions, head_owners: env.head_owners }
 }
@@ -26273,9 +26329,44 @@ fn add_variants_loop(env: TyEnv, tname: String, tparams: [String],
           add_variants_loop(env, tname, tparams, rest, top_names)
         } else {
           let sc = scheme_of_variant(tname, tparams, v)
-          add_variants_loop(ty_env_add(env, cname, sc), tname, tparams, rest, top_names)
+          # Issue #644 — Plan B (ctor overloading at use sites): always
+          # register the qualified `<tname>::<cname>` key so disambiguation
+          # at match / annotated construction sites can pick this variant
+          # explicitly. The bare `cname` key is ALSO added unless a prelude
+          # builtin already occupies it (Ok/Err/Some/None) — in that case
+          # the bare slot is left protecting the prelude, and resolution
+          # of `cname` in user code must come through the qualified key
+          # (driven by scrutinee or annotation context) or via the
+          # explicit `<tname>.<cname>` syntax. Same-arity user-vs-user
+          # bare collisions still prepend (legacy behavior); the cross-
+          # module case is what #644 closes.
+          let env_q = ty_env_add(env, ty_mod_key(tname, cname), sc)
+          let env2 = if bare_is_prelude_builtin_variant(env_q, cname) {
+            env_q
+          } else {
+            ty_env_add(env_q, cname, sc)
+          }
+          add_variants_loop(env2, tname, tparams, rest, top_names)
         }
       }
+    }
+  }
+}
+
+# Issue #644 — Plan B: is the bare `cname` slot currently occupied by a
+# prelude builtin variant constructor (Ok/Err/Some/None from
+# `add_builtin_variant_sigs`)? Used by `add_variants_loop` to decide
+# whether registering a user variant under bare `cname` would clobber a
+# prelude entry — in which case we keep the prelude bare entry and rely
+# on qualified-key resolution for the user variant. The check looks at
+# the scheme's return tycon name: only Result / Option builtin schemes
+# are protected.
+fn bare_is_prelude_builtin_variant(env: TyEnv, cname: String) : Bool {
+  match ty_env_lookup(env, cname) {
+    None -> false
+    Some(sc) -> match extract_return_tycon(sc) {
+      Some(t) -> t == "Result" or t == "Option"
+      None -> false
     }
   }
 }
@@ -26549,16 +26640,29 @@ fn check_variants_for_collision(vs: [Variant], parent: String, line: Int, col: I
               # render them with a builtin-specific message instead of
               # the generic "declared by both ..." that points at the
               # nonexistent file:0:0.
+              #
+              # Issue #644 — Plan B (ctor overloading at use sites):
+              # the builtin-collision case is now ALLOWED. A user
+              # `pub type Response = Ok(String) | ...` no longer trips
+              # an upfront rejection; ambiguity surfaces at use sites
+              # only (via scrutinee-driven and annotation-driven
+              # resolution, and a dedicated diagnostic for the
+              # genuinely bare unannotated use). The D2 same-file
+              # user-vs-user collision still fires.
               match prev {
-                VC(_, prev_parent, 0, 0) ->
-                  report_builtin_collision(decl_file, vname, parent, line, col, prev_parent)
-                _ ->
+                VC(_, _, 0, 0) ->
+                  # Builtin collision — registration is safe because
+                  # `add_variants_loop` keeps the prelude bare entry
+                  # and only adds the user variant under its qualified
+                  # key. Continue without bumping err count.
+                  check_variants_for_collision(rest, parent, line, col,
+                                                  top_names, claims, decl_file, errs)
+                _ -> {
                   report_d2_collision(decl_file, vname, parent, line, col, prev)
+                  check_variants_for_collision(rest, parent, line, col,
+                                                  top_names, claims, decl_file, errs + 1)
+                }
               }
-              # Continue scanning with the same claim list so a single
-              # multi-collision file produces all diagnostics in one run.
-              check_variants_for_collision(rest, parent, line, col,
-                                              top_names, claims, decl_file, errs + 1)
             }
             None -> {
               let nc = VC(vname, parent, line, col)
@@ -31356,6 +31460,23 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
 
   match callee.kind {
     EVar(nm) -> {
+      # Issue #644 — Plan B: ctor names (uppercase first letter) are
+      # NOT receiver-typed dispatch targets — narrow-by-first-arg was
+      # designed for module-disambiguated FN candidates (e.g.
+      # `option::map` vs `list::map`). When a user variant `Response.Ok`
+      # shadows the prelude `Result.Ok`, both qualified entries appear
+      # in the candidate list and `pick_by_first_arg` may prefer the
+      # ctor whose first param is concrete (`String`) over the
+      # polymorphic one (`T`), silently re-routing prelude `Ok(x)` to
+      # `Response::Ok`. Skip the narrow path for ctors and let the
+      # default arm pick the bare-lookup scheme — for ctors that is
+      # the prelude builtin, which annotation/scrutinee disambiguation
+      # rewrites to a qualified `EModCall` upstream when needed.
+      let is_ctor = match char_at(nm, 0) {
+        Some(c) -> c >= 'A' and c <= 'Z'
+        None    -> false
+      }
+      if is_ctor { None } else {
       let candidates = ty_env_collect_candidates(st.env, nm)
       let n_cand = list_length(candidates)
       if n_cand < 2 { None }
@@ -31395,6 +31516,7 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
             }
           }
         }
+      }
       }
     }
     _ -> None
@@ -34266,6 +34388,26 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File {
 
   match stmt {
     SLet(pat, ann, rhs) -> {
+      # Issue #644 — Plan B: bare-unannotated ctor ambiguity. Run the
+      # ambiguity diagnostic at SLet sites with NO annotation when the
+      # RHS is a bare ctor reference — that is the canonical
+      # "silently resolves to prelude" shape. With an annotation the
+      # ambiguity is resolved by the annotation context; with a more
+      # complex RHS the ctor is typically embedded in a typed
+      # surrounding context. Limiting the diagnostic to SLet-no-ann
+      # avoids spurious fires from prelude code whose `Ok(...)` is
+      # nested under typed handlers.
+      let amb_st = match ann {
+        None -> match rhs.kind {
+          ECall(c, _) -> match c.kind {
+            EVar(nm) -> report_ctor_ambiguity_if_any(st, nm, c.line, c.col)
+            _ -> st
+          }
+          EVar(nm) -> report_ctor_ambiguity_if_any(st, nm, rhs.line, rhs.col)
+          _ -> st
+        }
+        Some(_) -> st
+      }
       # issue #379: when the let is annotated and the RHS is an
       # `EMatch`, drive the RHS in check-mode so the expected
       # type reaches every arm via `check_match`. The non-match
@@ -34277,21 +34419,33 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File {
         Some(te) -> match rhs.kind {
           EMatch(_, _) -> {
             let exp_resolved = resolve_ty(te)
-            check_expr_against(st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
+            check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
           EIf(_, _, _) -> {
             let exp_resolved = resolve_ty(te)
-            check_expr_against(st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
+            check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
           # Fix B: route EList through bidirectional check so element
           # literals can be retagged to Byte when expected is [Byte].
           EList(_) -> {
             let exp_resolved = resolve_ty(te)
-            check_expr_against(st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
+            check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
-          _ -> synth(st, rhs)
+          # Issue #644 — Plan B: route ECall/EVar with annotation
+          # context through check_expr_against so a bare ctor whose
+          # qualified `<parent>::<cname>` matches the annotation
+          # resolves to the qualified scheme.
+          ECall(_, _) -> {
+            let exp_resolved = resolve_ty(te)
+            check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
+          }
+          EVar(_) -> {
+            let exp_resolved = resolve_ty(te)
+            check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
+          }
+          _ -> synth(amb_st, rhs)
         }
-        None -> synth(st, rhs)
+        None -> synth(amb_st, rhs)
       }
       # issue #162: when the let binding is annotated `Decimal<u>` and
       # the RHS is a UoM-literal `<u>`, lower it to a typed
@@ -34597,7 +34751,21 @@ fn check_list_subpats(st: InferState, ps: [Pattern], elem: Ty) : InferState / Co
 fn check_variant_pattern(st: InferState, cname: String, subpats: [Pattern], expected: Ty, line: Int, col: Int) : InferState / Console + File {
 
 
-  match ty_env_lookup(st.env, cname) {
+  # Issue #644 — Plan B: scrutinee-driven ctor disambiguation. When the
+  # expected type resolves to a `TyCon(parent, _)`, prefer the qualified
+  # `parent::cname` scheme if it exists; this is how a user variant
+  # `Response.Ok` shadows the prelude `Result.Ok` in patterns matching a
+  # `Response` scrutinee. Fall back to bare lookup so prelude variants
+  # and non-shadowing user variants keep working.
+  let applied = apply_ty(st.sub, expected)
+  let sc_opt = match applied {
+    TyCon(parent, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
+      Some(sc) -> Some(sc)
+      None     -> ty_env_lookup(st.env, cname)
+    }
+    _ -> ty_env_lookup(st.env, cname)
+  }
+  match sc_opt {
     None -> {
       let hint = match closest_name(cname, ty_env_uppercase_names(st.env)) {
         Some(sug) -> " (did you mean `#{sug}`?)"
@@ -35073,7 +35241,13 @@ fn check_if(st: InferState, c: Expr, t_: Expr, eo: Option[Expr],
 
   let rc = synth(st, c)
   let s1 = st_unify(rc.st, rc.ty, TyBool, "if condition", line, col)
-  let rt = synth(s1, t_)
+  # Issue #644 — Plan B: thread `expected` into the then-branch ONLY
+  # when it is shaped like a bare ctor expression (`EBlock` whose tail
+  # is a ctor / nullary ctor, ECall(EVar, _), or EVar) so a user
+  # `Response.Ok` shadowing the prelude `Result.Ok` can be picked by
+  # annotation context. Other branch shapes stay on synth to avoid
+  # regressions in non-ctor expression types.
+  let rt = check_branch_for_ctor(s1, t_, expected)
   match eo {
     None -> {
       let root = with_ty(mk_expr(EIf(rc.expr, rt.expr, None), line, col), TyUnit)
@@ -35081,12 +35255,39 @@ fn check_if(st: InferState, c: Expr, t_: Expr, eo: Option[Expr],
     }
     Some(ee) -> {
       let s_t = st_unify(rt.st, expected, rt.ty, "if/else branches", line, col)
-      let re = synth(s_t, ee)
+      let re = check_branch_for_ctor(s_t, ee, expected)
       let s2 = st_unify(re.st, expected, re.ty, "if/else branches", line, col)
       let ty = apply_ty(s2.sub, expected)
       let root = with_ty(mk_expr(EIf(rc.expr, rt.expr, Some(re.expr)), line, col), ty)
       mk_inferred(s2, ty, root)
     }
+  }
+}
+
+# Issue #644 — Plan B helper: route a branch through `check_expr_against`
+# when it is a bare ctor reference (or a block whose tail is), so the
+# annotation context can disambiguate. Other shapes fall through to
+# `synth` to keep existing behaviour.
+fn check_branch_for_ctor(st: InferState, br: Expr, expected: Ty) : Inferred / Console + File {
+
+  match br.kind {
+    ECall(c, _) -> match c.kind {
+      EVar(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+      _ -> synth(st, br)
+    }
+    EVar(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+    EBlock(_, tail) -> match tail {
+      Some(te) -> match te.kind {
+        ECall(c, _) -> match c.kind {
+          EVar(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+          _ -> synth(st, br)
+        }
+        EVar(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+        _ -> synth(st, br)
+      }
+      None -> synth(st, br)
+    }
+    _ -> synth(st, br)
   }
 }
 
@@ -35112,7 +35313,226 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
       TyListT(elem_ty) -> check_list_elems_against(st, els, elem_ty, e.line, e.col)
       _                -> synth(st, e)
     }
+    # Issue #644 — Plan B: annotation-driven ctor disambiguation. When
+    # the expected type is `TyCon(parent, _)` and the callee is a bare
+    # `EVar(cname)` whose qualified `parent::cname` scheme exists,
+    # rewrite the callee to `EModCall(parent, cname)` so the prelude's
+    # bare-name table never wins. Falls through to synth otherwise.
+    ECall(callee, args_) ->
+      ctor_check_or_synth(st, e, callee, args_, expected, line, col)
+    # Issue #644 — Plan B: nullary ctor disambiguation. A bare
+    # `EVar(cname)` (e.g. `NotFound`) in annotation context whose
+    # qualified `parent::cname` exists picks the qualified scheme.
+    EVar(_) -> nullary_ctor_check_or_synth(st, e, expected)
+    # Issue #644 — Plan B: thread expected into block tails so a
+    # `{ ...stmts...; ctor(args) }` body benefits from the same
+    # annotation-driven disambiguation as a bare ctor expression.
+    EBlock(stmts, tail) -> match tail {
+      Some(te) -> {
+        let outer = st
+        let is_ = synth_stmts(st, stmts)
+        let r = check_expr_against(is_.st, te, expected, what, te.line, te.col)
+        let st2 = st_restore_entries(outer, r.st)
+        let ty = apply_ty(st2.sub, r.ty)
+        let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), e.line, e.col), ty)
+        mk_inferred(st2, ty, root)
+      }
+      None -> synth(st, e)
+    }
     _ -> synth(st, e)
+  }
+}
+
+# Issue #644 — Plan B helper: rewrite a bare-ctor call `EVar(cname)(args)`
+# to `EModCall(parent, cname)(args)` whenever a qualified `parent::cname`
+# entry exists. The rewrite is unconditional within annotation context —
+# `parent` IS the expected type, so the qualified scheme is the correct
+# one and the rewrite ALSO bypasses the bare-unannotated ambiguity
+# diagnostic in `synth_call` (which would otherwise fire whenever a
+# user variant shadows `Result.Ok` / `Option.Some`). Falls through to
+# `synth` when no qualified entry exists.
+fn ctor_check_or_synth(st: InferState, e: Expr, callee: Expr, args_: [Expr],
+                          expected: Ty, line: Int, col: Int) : Inferred / Console + File {
+
+  match callee.kind {
+    EVar(cname) -> {
+      let applied = apply_ty(st.sub, expected)
+      match applied {
+        TyCon(parent, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
+          Some(_) -> {
+            let qcallee = mk_expr(EModCall(parent, cname), callee.line, callee.col)
+            let rewritten = mk_expr(ECall(qcallee, args_), line, col)
+            synth(st, rewritten)
+          }
+          None -> synth(st, e)
+        }
+        _ -> synth(st, e)
+      }
+    }
+    _ -> synth(st, e)
+  }
+}
+
+# Issue #644 — Plan B helper: a bare nullary ctor `EVar(cname)` in
+# annotation context whose qualified `parent::cname` exists picks the
+# qualified scheme.
+fn nullary_ctor_check_or_synth(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File {
+
+  match e.kind {
+    EVar(cname) -> {
+      let applied = apply_ty(st.sub, expected)
+      match applied {
+        TyCon(parent, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
+          Some(_) -> {
+            let qe = mk_expr(EModCall(parent, cname), e.line, e.col)
+            synth(st, qe)
+          }
+          None -> synth(st, e)
+        }
+        _ -> synth(st, e)
+      }
+    }
+    _ -> synth(st, e)
+  }
+}
+
+# Issue #644 — Plan B: collect the qualified parents of `cname` —
+# every `<X>::<cname>` key in the env where `X` looks like a sum type
+# (starts uppercase, contains no `::` itself). Used by the bare-
+# unannotated ambiguity diagnostic to list candidates the user must
+# disambiguate among.
+fn ty_env_qualified_parents(env: TyEnv, cname: String) : [String] =
+  ty_env_qualified_parents_loop(env.entries, cname, [])
+
+fn ty_env_qualified_parents_loop(es: [TyEntry], cname: String, acc: [String]) : [String] {
+  match es {
+    [] -> list_reverse(acc)
+    [e, ...rest] -> {
+      let suffix = string_concat("::", cname)
+      let kn = string_length(e.name)
+      let sn = string_length(suffix)
+      if kn <= sn {
+        ty_env_qualified_parents_loop(rest, cname, acc)
+      } else {
+        let tail = string_slice(e.name, kn - sn, sn)
+        if tail == suffix {
+          let parent = string_slice(e.name, 0, kn - sn)
+          # Skip sentinel keys (`<tname>::__type_decl_arity_<N>__`) —
+          # their `cname` is `__type_decl_arity_<N>__`, never a real
+          # ctor name; but defend by checking the parent starts
+          # uppercase (sentinels and real sum types both do, so the
+          # length / suffix shape carries the discriminator). The
+          # uppercase guard also filters effect-op qualified keys
+          # (`Eff.op` was stored under a `.` separator pre-`::`).
+          let parent_upper = match char_at(parent, 0) {
+            Some(c) -> c >= 'A' and c <= 'Z'
+            None    -> false
+          }
+          if parent_upper and not list_has(acc, parent) {
+            ty_env_qualified_parents_loop(rest, cname, [parent, ...acc])
+          } else {
+            ty_env_qualified_parents_loop(rest, cname, acc)
+          }
+        } else {
+          ty_env_qualified_parents_loop(rest, cname, acc)
+        }
+      }
+    }
+  }
+}
+
+# Issue #644 — Plan B: emit a diagnostic when a bare ctor name is
+# genuinely ambiguous (its bare slot is occupied by a prelude builtin
+# Result/Option ctor AND at least one user type registers a qualified
+# `<X>::<cname>` entry whose parent is NOT Result/Option). Returns
+# the input state bumped by one error if the diagnostic fires;
+# otherwise the input state unchanged. Idempotent — the predicate is
+# pure and the diagnostic carries the call site.
+fn report_ctor_ambiguity_if_any(st: InferState, cname: String,
+                                   line: Int, col: Int) : InferState / Console + File {
+
+  match ty_env_lookup(st.env, cname) {
+    None -> st
+    Some(bare_sc) -> match extract_return_tycon(bare_sc) {
+      None -> st
+      Some(bare_parent) ->
+        if bare_parent == "Result" or bare_parent == "Option" {
+          let user_parents = ty_env_qualified_parents_excluding_builtin(st.env, cname)
+          match user_parents {
+            [] -> st
+            _ -> {
+              let candidates_str = format_ctor_candidates(cname,
+                                                            [bare_parent, ...user_parents])
+              diag_error(st.file, line, col,
+                concat_all(["ambiguous constructor '", cname,
+                            "' — matches both the prelude '",
+                            bare_parent, ".", cname,
+                            "' and user-declared variant(s)"]))
+              diag_note(concat_all(["candidates: ", candidates_str]))
+              diag_help(concat_all(["disambiguate with an explicit `<Parent>.", cname,
+                                     "(...)` qualifier or annotate the binding"]))
+              st_bump_err(st)
+            }
+          }
+        } else { st }
+    }
+  }
+}
+
+# Helper: list the qualified parents of `cname` registered in `env`
+# that are NOT the Result/Option prelude. Each parent appears at most
+# once; order mirrors the env's newest-first registration order.
+fn ty_env_qualified_parents_excluding_builtin(env: TyEnv, cname: String) : [String] =
+  filter_builtin_parents(ty_env_qualified_parents(env, cname), [])
+
+fn filter_builtin_parents(parents: [String], acc: [String]) : [String] {
+  match parents {
+    [] -> list_reverse(acc)
+    [p, ...rest] -> if p == "Result" or p == "Option" {
+      filter_builtin_parents(rest, acc)
+    } else {
+      filter_builtin_parents(rest, [p, ...acc])
+    }
+  }
+}
+
+# Helper: render `Result.Ok, Response.Ok` for the ambiguity note.
+fn format_ctor_candidates(cname: String, parents: [String]) : String =
+  format_ctor_candidates_loop(cname, parents, "")
+
+fn format_ctor_candidates_loop(cname: String, parents: [String], acc: String) : String {
+  match parents {
+    [] -> acc
+    [p, ...rest] -> {
+      let one = concat_all([p, ".", cname])
+      let sep = if string_length(acc) == 0 { "" } else { ", " }
+      format_ctor_candidates_loop(cname, rest, concat_all([acc, sep, one]))
+    }
+  }
+}
+
+# Issue #644 — Plan B predicate: is there a genuine ctor ambiguity for
+# `cname` between the bare slot and a qualified `<parent>::<cname>`
+# entry? Returns true only when:
+#   - a qualified `<parent>::<cname>` entry exists, AND
+#   - the bare `cname` entry exists, AND
+#   - the bare entry's return tycon name differs from `parent`.
+# In that case the bare lookup would silently pick the wrong scheme
+# (the prelude builtin or an earlier-declared user variant) and we
+# must rewrite the callee to `EModCall(parent, cname)` so resolution
+# pins the user variant. When no bare entry exists or bare already
+# returns `parent`, the synth path resolves correctly without
+# rewriting.
+fn ctor_needs_qualification(env: TyEnv, cname: String, parent: String) : Bool {
+  match ty_env_lookup_qualified(env, parent, cname) {
+    None -> false
+    Some(_) -> match ty_env_lookup(env, cname) {
+      None -> false
+      Some(bare_sc) -> match extract_return_tycon(bare_sc) {
+        Some(bare_parent) -> bare_parent != parent
+        None -> false
+      }
+    }
   }
 }
 
@@ -35212,10 +35632,40 @@ fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
           let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
           mk_inferred(st2, ty, root)
         }
+        # Issue #644 — Plan B: thread `expected` into the block tail
+        # when the tail is a bare ctor reference (`ECall(EVar, _)` or
+        # `EVar`), so annotation-driven disambiguation can pick a
+        # qualified user variant over the prelude builtin. Other
+        # tail shapes keep synthing the whole body as before to avoid
+        # regressions in non-ctor expression types.
+        ECall(_, _) -> {
+          let outer = st
+          let is_ = synth_stmts(st, stmts)
+          let r = check_expr_against(is_.st, te, expected, what, te.line, te.col)
+          let st2 = st_restore_entries(outer, r.st)
+          let ty = apply_ty(st2.sub, r.ty)
+          let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
+          mk_inferred(st2, ty, root)
+        }
+        EVar(_) -> {
+          let outer = st
+          let is_ = synth_stmts(st, stmts)
+          let r = check_expr_against(is_.st, te, expected, what, te.line, te.col)
+          let st2 = st_restore_entries(outer, r.st)
+          let ty = apply_ty(st2.sub, r.ty)
+          let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
+          mk_inferred(st2, ty, root)
+        }
         _ -> synth(st, body)
       }
       None -> synth(st, body)
     }
+    # Issue #644 — Plan B: bare-expression body benefits from
+    # annotation-driven ctor disambiguation when it is a ctor call
+    # or a nullary ctor reference. Other shapes stay on synth to
+    # avoid regressing existing inference paths.
+    ECall(_, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
+    EVar(_) -> check_expr_against(st, body, expected, what, body.line, body.col)
     _ -> synth(st, body)
   }
 }
@@ -35464,25 +35914,64 @@ fn variants_of_type_loop_arity(es: [TyEntry], target: String,
         Some(c) -> c >= 'A' and c <= 'Z'
         None    -> false
       }
-      if first_upper and not string_contains_dot(e.name) {
-        match extract_return_tycon_arity(e.scheme) {
-          Some(ta) -> match ta {
-            TCA(tn, ar) -> if tn == target {
-              if pin < 0 {
-                variants_of_type_loop_arity(rest, target, ar, [e.name, ...acc])
-              } else if ar == pin {
-                variants_of_type_loop_arity(rest, target, pin, [e.name, ...acc])
-              } else {
-                variants_of_type_loop_arity(rest, target, pin, acc)
-              }
-            } else {
-              variants_of_type_loop_arity(rest, target, pin, acc)
-            }
+      # Issue #644 — Plan B: user variants registered under the
+      # qualified `<target>::<cname>` key (because a prelude builtin
+      # occupied the bare slot) must still surface as variants of
+      # `target`. Strip the `<target>::` prefix and recurse with the
+      # bare name as the candidate variant. Other qualified entries
+      # (`<other>::<cname>`, sentinels, effect ops) remain filtered.
+      let qual_strip = ty_env_strip_qualified_prefix(e.name, target)
+      match qual_strip {
+        Some(bare) -> {
+          # bare must itself be uppercase (sum-ctor convention) and
+          # not contain `.` (effect-op `Eff.op` was registered under a
+          # dotted name pre-`::` keying and must still be excluded).
+          let bare_upper = match char_at(bare, 0) {
+            Some(c) -> c >= 'A' and c <= 'Z'
+            None    -> false
           }
-          None -> variants_of_type_loop_arity(rest, target, pin, acc)
+          if bare_upper and not string_contains_dot(bare) {
+            match extract_return_tycon_arity(e.scheme) {
+              Some(ta) -> match ta {
+                TCA(tn, ar) -> if tn == target {
+                  if pin < 0 {
+                    variants_of_type_loop_arity(rest, target, ar, [bare, ...acc])
+                  } else if ar == pin {
+                    variants_of_type_loop_arity(rest, target, pin, [bare, ...acc])
+                  } else {
+                    variants_of_type_loop_arity(rest, target, pin, acc)
+                  }
+                } else {
+                  variants_of_type_loop_arity(rest, target, pin, acc)
+                }
+              }
+              None -> variants_of_type_loop_arity(rest, target, pin, acc)
+            }
+          } else {
+            variants_of_type_loop_arity(rest, target, pin, acc)
+          }
         }
-      } else {
-        variants_of_type_loop_arity(rest, target, pin, acc)
+        None ->
+          if first_upper and not string_contains_dot(e.name) {
+            match extract_return_tycon_arity(e.scheme) {
+              Some(ta) -> match ta {
+                TCA(tn, ar) -> if tn == target {
+                  if pin < 0 {
+                    variants_of_type_loop_arity(rest, target, ar, [e.name, ...acc])
+                  } else if ar == pin {
+                    variants_of_type_loop_arity(rest, target, pin, [e.name, ...acc])
+                  } else {
+                    variants_of_type_loop_arity(rest, target, pin, acc)
+                  }
+                } else {
+                  variants_of_type_loop_arity(rest, target, pin, acc)
+                }
+              }
+              None -> variants_of_type_loop_arity(rest, target, pin, acc)
+            }
+          } else {
+            variants_of_type_loop_arity(rest, target, pin, acc)
+          }
       }
       }
     }
@@ -35547,7 +36036,13 @@ fn extract_return_tycon_arity(sc: TyScheme) : Option[TyConArity] {
 fn variants_of_type(env: TyEnv, tycon: String) : [String] = {
   let from_entries = variants_of_type_loop(env.entries, tycon, [])
   let from_summary = union_components_of(env.unions, tycon)
-  union_merge_unique(from_entries, from_summary)
+  # Issue #644 — Plan B: the entry walker emits one variant name per
+  # matching entry, and Plan B registers both bare (`Ok`) and qualified
+  # (`Result::Ok`) keys for prelude builtins (and qualified-only for
+  # user variants that collide with bare). Dedup the entry list before
+  # merging so exhaustiveness does not see double-counted variants.
+  let entries_dedup = union_merge_unique([], from_entries)
+  union_merge_unique(entries_dedup, from_summary)
 }
 
 # Issue #643 — arity-aware variant of `variants_of_type`. Callers
@@ -35558,7 +36053,12 @@ fn variants_of_type(env: TyEnv, tycon: String) : [String] = {
 # and vice-versa. Falls back to the bare-name walk when no entry
 # matches the arity (legacy single-arity types stay byte-identical).
 fn variants_of_type_arity(env: TyEnv, tycon: String, arity: Int) : [String] = {
-  let from_entries = variants_of_type_loop_with_arity(env.entries, tycon, arity, [])
+  # Issue #644 — Plan B: dedup the entry walker's output before any
+  # downstream merge. Bare (`Ok`) and qualified (`Result::Ok`) entries
+  # both produce the same bare ctor name; without dedup exhaustiveness
+  # double-counts and reports phantom missing variants.
+  let raw_entries = variants_of_type_loop_with_arity(env.entries, tycon, arity, [])
+  let from_entries = union_merge_unique([], raw_entries)
   match from_entries {
     [] -> {
       # No arity-matched entries — fall back to the bare-name walk
@@ -35568,7 +36068,8 @@ fn variants_of_type_arity(env: TyEnv, tycon: String, arity: Int) : [String] = {
       # shadow path) and is non-arity-aware; this is acceptable
       # because the fallback only fires when the variant entries
       # produced no arity match — i.e. no genuine ambiguity exists.
-      let fallback = variants_of_type_loop(env.entries, tycon, [])
+      let raw_fallback = variants_of_type_loop(env.entries, tycon, [])
+      let fallback = union_merge_unique([], raw_fallback)
       union_merge_unique(fallback, union_components_of(env.unions, tycon))
     }
     # Arity-matched entries from the variant table are the
@@ -45934,7 +46435,22 @@ fn llvm_emit_expr_boxed(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
     # (`let f = mod.fname`). Mint the prefixed thunk symbol so the
     # closure ends up holding `@_kai_<m>__<n>_thunk` regardless of
     # whether other modules also export the same bare name.
-    EModCall(mod, fname) -> llvm_emit_modcall_fn_value(e, mod, fname, x.line, x.col)
+    #
+    # Issue #644 — Plan B: when the qualified name is actually a
+    # variant ctor (`Option.None`, `Response.NotFound`) emit the
+    # variant ctor value directly. Nullary ctors are emitted via
+    # `llvm_emit_variant_ctor(e, fname, [])`; non-nullary ctors
+    # as values are not supported (matches the EVar value-position
+    # behaviour above).
+    EModCall(mod, fname) -> match evar_find(e.vars_, fname) {
+      Some(ar) -> if ar == 0 {
+        llvm_emit_variant_ctor(e, fname, [])
+      } else {
+        eprint("llvm: non-nullary variant ctor as value not supported: #{mod}.#{fname}")
+        llvm_set_last(e, "undef")
+      }
+      None -> llvm_emit_modcall_fn_value(e, mod, fname, x.line, x.col)
+    }
     _ -> {
       eprint("llvm: unsupported expression kind (#{expr_kind_name(x.kind)}) at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
       llvm_set_last(e, "undef")
@@ -46713,27 +47229,37 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
     # semantics put the fn body there. The variant exists so that
     # v2 can switch this branch to mint a prefixed symbol while
     # leaving the unqualified `EVar(fname)` branch alone.
-    EModCall(mod, fname) -> {
-      let ra = llvm_emit_args(e, xs, [])
-      # m6.2 v2: qualified call `mod.fname(args)`. Mint the prefixed
-      # symbol directly from the EModCall payload — the resolver
-      # already verified `fname` is exported by `mod`, so the EFn
-      # entry for it carries `module_origin = Some(mod)`. We could
-      # equivalently route through `efn_resolve`; using `mod`
-      # directly is one indirection less.
-      # issue #524 — qualified callees never fall back to the prelude
-      # shortcut. The qualifier is authoritative: if the user wrote
-      # `mod.fname`, the resolver already proved `mod` exports
-      # `fname`, so we must emit the module's own symbol even when
-      # `fname` collides with a prelude entry (e.g. `file.read_bytes`
-      # vs. prelude `read_bytes`). The C backend never had this bug
-      # because its EModCall arm goes straight through `c_sym`.
-      let sym = string_concat("@kai_", c_sym(fname, Some(mod)))
-      let r = llvm_fresh_reg(ra.st)
-      let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
-                              llvm_format_args(ra.regs), ")\n"])
-      llvm_set_last(llvm_append_body(r.e, instr), r.reg)
-    }
+    EModCall(mod, fname) ->
+      # Issue #644 — Plan B: the typer rewrites `Ok(x)` in `Response`
+      # context to `EModCall("Response", "Ok")`. Variant ctors lower
+      # through `llvm_emit_variant_ctor` (kaix_variant), not as module
+      # fn calls — variant tag dispatch keys on the bare ctor name at
+      # runtime. Detect by membership in the EVar table and short-
+      # circuit before minting `@kai_<mod>__<fname>`.
+      match evar_find(e.vars_, fname) {
+        Some(_) -> llvm_emit_variant_ctor(e, fname, xs)
+        None -> {
+          let ra = llvm_emit_args(e, xs, [])
+          # m6.2 v2: qualified call `mod.fname(args)`. Mint the prefixed
+          # symbol directly from the EModCall payload — the resolver
+          # already verified `fname` is exported by `mod`, so the EFn
+          # entry for it carries `module_origin = Some(mod)`. We could
+          # equivalently route through `efn_resolve`; using `mod`
+          # directly is one indirection less.
+          # issue #524 — qualified callees never fall back to the prelude
+          # shortcut. The qualifier is authoritative: if the user wrote
+          # `mod.fname`, the resolver already proved `mod` exports
+          # `fname`, so we must emit the module's own symbol even when
+          # `fname` collides with a prelude entry (e.g. `file.read_bytes`
+          # vs. prelude `read_bytes`). The C backend never had this bug
+          # because its EModCall arm goes straight through `c_sym`.
+          let sym = string_concat("@kai_", c_sym(fname, Some(mod)))
+          let r = llvm_fresh_reg(ra.st)
+          let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
+                                  llvm_format_args(ra.regs), ")\n"])
+          llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+        }
+      }
     _ -> {
       let ec = llvm_emit_expr(e, callee)
       llvm_emit_apply(ec, ec.last_val, xs)
