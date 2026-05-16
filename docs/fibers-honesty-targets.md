@@ -13,7 +13,7 @@ promises a calendar. The §*Residual m8.x items* section below
 inventories what is left after the R2 lane closed (`0.4.0`) and the
 2026-04-30 Tier 2 retrofit landed.
 
-## Where we are today (2026-05-15)
+## Where we are today (2026-05-16)
 
 Tier 1 + Tier 2 closed. The runtime is BEAM-style cooperative
 single-threaded; everything that surfaced in a 30-minute live demo
@@ -58,9 +58,21 @@ or in the 1.0-honesty target list is shipped and verifiable.
   the empty-pipe case maps to `None` on the first iteration.
   Multiple concurrent stdin readers panic with a clear diagnostic
   (`stdin: multiple fibers reading concurrently is undefined;
-  serialize via an actor`). TCP sockets (`NetTcp`) stay blocking
-  until R2 ships in Orongo alongside the Cancel-mid-syscall
-  redesign.
+  serialize via an actor`).
+- **R2 reactor shipped 2026-05-16 (issue #630)** — `NetTcp.connect`,
+  `NetTcp.accept`, `NetTcp.send`, and `NetTcp.recv` park the *fiber*
+  on socket read/write readiness. Two intrusive waiter lists
+  (`kai_reactor_socket_read_waiters` + `..._write_waiters`) extend
+  the existing `poll()` set with every live socket fd. Each fd is
+  flipped to `O_NONBLOCK` at creation time; `send` loops internally
+  on partial writes; `connect` handles `EINPROGRESS` and checks
+  `SO_ERROR` post-wake. `demos/tcp_concurrent` runs three concurrent
+  client/server handshakes that pre-R2 would have deadlocked under
+  the OS-thread-blocking accept. `Cancel` stays cooperative — a
+  fiber parked in a socket op is interrupted at the park boundary,
+  not mid-syscall (the mid-syscall redesign with `close(fd)` +
+  `pthread_kill` is Orongo territory). The reactor work for Hanga
+  Roa is closed.
 - §*Residual m8.x items* below now reduces to three minor
   items, none of which surface as runtime errors today.
 
@@ -95,7 +107,8 @@ can be parallelised across short lanes.
 | ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
 | ~~**Per-op generics in Spawn API**~~ ✅ shipped 2026-05-02 | ~0.5d | TYPE generics retrofitted 2026-04-30 on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk closed in issue #72 — `Spawn.spawn[T, e](f: () -> T / e)` is the canonical entry point, wrappers in `stdlib/spawn.kai` reduced to one-line aliases |
 | ~~**Reactor — Phase R1 (file + sleep + process)**~~ ✅ shipped 2026-05-15 | ~1d | Issue #611. Sorted timer wheel + SIGCHLD self-pipe + 4-worker file pool, woken via a single `poll()` on the scheduler thread. `Clock.sleep_ns`, `File.read_file` / `write_file`, `Process.wait` no longer freeze the scheduler; sockets (`NetTcp`) queue for R2 in Orongo |
-| ~~**Reactor — Phase R3 (stdin)**~~ ✅ shipped 2026-05-15 | ~0.1d | Issue #620. Singleton `kai_reactor_stdin_waiter` slot reuses the existing `poll()` set; fd 0 is flipped to `O_NONBLOCK` once per process with an `atexit`-restored cleanup. `Stdin.read_line` and `Stdin.read_bytes` park on EAGAIN; multiple concurrent readers panic. TCP sockets (`NetTcp`) remain on R2 |
+| ~~**Reactor — Phase R3 (stdin)**~~ ✅ shipped 2026-05-15 | ~0.1d | Issue #620. Singleton `kai_reactor_stdin_waiter` slot reuses the existing `poll()` set; fd 0 is flipped to `O_NONBLOCK` once per process with an `atexit`-restored cleanup. `Stdin.read_line` and `Stdin.read_bytes` park on EAGAIN; multiple concurrent readers panic. |
+| ~~**Reactor — Phase R2 (TCP sockets)**~~ ✅ shipped 2026-05-16 | ~0.2d | Issue #630. Per-direction socket waiter lists (`socket_read_waiters` + `socket_write_waiters`) join the existing `poll()` set; every socket fd is `O_NONBLOCK` from creation; `connect` handles `EINPROGRESS` + `SO_ERROR`, `send` loops on partial writes, `accept` / `recv` park on read-readiness. `demos/tcp_concurrent` proves three concurrent handshakes interleave. Closes the reactor for Hanga Roa. |
 
 After this set, `docs/effects.md`, `docs/structured-concurrency.md`,
 `docs/actors.md`, and `docs/fibers-impl.md` claims are all
