@@ -168,8 +168,8 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + private-type shadow audit"
+tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-private-record-shadow-audit
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + private-type shadow audit + private-record shadow audit"
 
 # Issue #643 — institutional regression gate for the private-type
 # leak fix. `tools/audit-prelude-private-types.sh` walks every
@@ -181,6 +181,15 @@ tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode
 # audit script's skip-list and are tracked as a follow-up.
 test-private-type-shadow-audit: kaic2
 	@./tools/audit-prelude-private-types.sh
+
+# Issue #648 — record-side companion to the audit above. Walks every
+# non-`pub type X = { ... }` record declaration in `stdlib/` and
+# verifies a minimal user program that redeclares `X` with a
+# distinct field set still compiles. Failure means the typer's
+# record-table walker (`rec_find_with_field`, issue #648) regressed
+# and leaked the prelude's field set into the user's scope.
+test-private-record-shadow-audit: kaic2
+	@./tools/audit-prelude-private-records.sh
 
 # Tongariki — `kai fmt` fixture suite. Verifies that every fixture
 # in examples/fmt/ formats to its `.expected.kai` and is idempotent,
