@@ -85,9 +85,9 @@ needed and the version increments per Conventional Commits
 ## How editions advance
 
 1. **Current edition lives in `EDITION` at repo root.** Plain text,
-   one line, lowercase name. Today: `tongariki`.
-2. **`kai --version` surfaces the edition**: e.g. `kaikai 0.62.0 -
-   tongariki (stage 2, self-hosted)`.
+   one line, lowercase name. Today: `hanga-roa`.
+2. **`kai --version` surfaces the edition**: e.g. `kaikai 0.69.0 -
+   hanga-roa (stage 2, self-hosted)`.
 3. **Edition changes are deliberate**, decided by the integrator
    (the human), not automated by `cz bump`. The decision is
    recorded in `docs/decisions/edition-<name>-<yyyy-mm-dd>.md` per
@@ -105,8 +105,8 @@ needed and the version increments per Conventional Commits
 
 | Edition  | Active from | Released as     | Notes                                                                        |
 |----------|-------------|-----------------|------------------------------------------------------------------------------|
-| Tongariki | pre-2026-05-15 | v0.x series through 2026-05-20 | The pre-Hanga-Roa phase. Rapid iteration on internals; user surface stabilising. |
-| **Hanga Roa** | **2026-05-21** | v0.x release | First public-target edition. Ships: Phase A.0 precompiled stdlib cache (≤300 ms tiny cold compile, #452); package-mode workflow with edition dispatch (#603); HTTP client + server-side helpers + automatic redirect-following (#605, #357); full reactor — NetTcp + file + sleep + process + stdin all park the fiber, never the OS thread (#611, #620, #630); convention-based pipe dispatch (`|` against downstream `Stream`, `Repository`, etc., #594); constructor overloading at use sites — local declarations shadow prelude names (#634); `#unstable` annotation for surface excluded from the edition contract (#602); the `tier1-backend-parity` CI gate enforcing C/LLVM equivalence on every fixture (#575). |
+| Tongariki | pre-2026-05-15 | v0.x series through v0.69.0 | The pre-Hanga-Roa phase. Rapid iteration on internals; user surface stabilising. Closed when `EDITION` flipped to `hanga-roa` on 2026-05-16. |
+| **Hanga Roa** | **2026-05-16 (default)** | v0.69.0+ | First public-target edition. Ships: Phase A.0 precompiled stdlib cache (≤300 ms tiny cold compile, #452); package-mode workflow with edition dispatch (#603); HTTP client + server-side helpers + automatic redirect-following (#605, #357); full reactor — NetTcp + file + sleep + process + stdin all park the fiber, never the OS thread (#611, #620, #630); convention-based pipe dispatch (`|` against downstream `Stream`, `Repository`, etc., #594); constructor overloading at use sites — local declarations shadow prelude names (#644); pure named functions auto-generalize over effect rows (#645); private prelude types no longer leak into user scope (#643, #647, #648); `#unstable` annotation for surface excluded from the edition contract (#602); the `tier1-backend-parity` CI gate enforcing C/LLVM equivalence on every fixture (#575). |
 | Orongo | post-Hanga-Roa | TBD | Next edition. Pulls in items deferred from Hanga Roa: Phase A.1 / A.2 / B / L5 cache layers (#461, #455, #499); advanced FFI (struct-by-value); new numeric primitives (BigInt, Rational, Float32, Int32, UInt32, UInt64, #514); LLVM direct emit (no clang shell-out, #497, #498); compilation daemon; timeout-bounded `Actor.receive` (RFC #638); `kai migrate` automated edition migration; NetDns + NetUdp installation (#352); full m14 qualified-call migration for the 21 remaining flat-prefix modules (#614). |
 
 The current edition name is in the `EDITION` file at repo root.
