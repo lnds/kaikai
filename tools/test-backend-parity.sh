@@ -1,5 +1,9 @@
-#!/bin/sh
+#!/bin/bash
 # tier1-backend-parity (issue #575).
+#
+# bash (not sh): the xargs worker fan-out uses `export -f` to make
+# the worker function visible to forked subshells. dash (Ubuntu's
+# /bin/sh) rejects `export -f` as illegal; bash supports it.
 #
 # Build every entry-point fixture with both backends (C and LLVM),
 # run the resulting binaries, and assert that stdout + exit code
