@@ -19905,6 +19905,11 @@ fn dpr_record_lit(name: String, fis: [FieldInit], line: Int, col: Int, recs: [Re
   if not is_pos {
     DPRFields { fields: fis, errs: errs }
   } else {
+    # Positional record-lit: every field is a `__pos_<i>__` marker
+    # at this point, so probing by field name does not disambiguate
+    # same-(name, arity) collisions. Fall back to the bare-name
+    # lookup; the field-set tie-breaker activates downstream in
+    # `synth_record_lit` after positional → named rewriting.
     match rec_find(recs, name) {
       None -> {
         diag_error(file, line, col,
@@ -19977,7 +19982,20 @@ fn dpr_record_spread(
     [] -> DPRSpread { expr: mk_expr(ERecordLit(name, fis), line, col), errs: errs }
     [head, ...overrides] -> match head {
       FI(_marker, src) -> {
-        match rec_find(recs, name) {
+        # Issue #648 — probe by the first override's field name to
+        # disambiguate same-(name, arity) record collisions. Falls
+        # back to bare lookup when no overrides accompany the spread
+        # (rare).
+        let probe = match overrides {
+          [] -> ""
+          [ov, ..._] -> match ov { FI(fnm, _) -> fnm }
+        }
+        let lookup = if probe == "" {
+          rec_find(recs, name)
+        } else {
+          rec_find_with_field(recs, name, -1, probe)
+        }
+        match lookup {
           None -> {
             diag_error(file, line, col,
               concat_all(["unknown record type `", name,
@@ -29884,20 +29902,141 @@ fn advance_unit_fresh(st: InferState, n: Int) : InferState {
 
 type RecInfo = RI(String, [String], [FieldDecl])
 
-fn rec_find_loop(rs: [RecInfo], target: String) : Option[RecInfo] {
+# Issue #648 — arity-aware record lookup. Two layers, mirroring the
+# variant-side `variants_of_type_loop_arity` (issue #643):
+#
+# 1. **Arity match**. Caller passes `arity = list_length(args)` from
+#    its `TyCon(name, args)` scrutinee; we prefer a `RI` whose
+#    `tparams` length matches. Discriminates `Tree[k, v]` (arity 2)
+#    from `Tree` (arity 0).
+#
+# 2. **Field-set tie-break** for same-(name, arity) collisions. The
+#    record-side analog of the variant-side same-arity limitation:
+#    `stdlib/regexp.kai` declares `type Thread = { state_id, captures }`
+#    (private) and a user re-declares `type Thread = { id, name }`.
+#    Both have arity 0. The prelude code (which the typer must also
+#    re-check) accesses `t.state_id`; the user code accesses `t.name`.
+#    Resolving by arity alone hands one or the other the wrong field
+#    set. `rec_find_with_field` (used by field-access call sites)
+#    prefers a `RI` that actually declares the requested field —
+#    that suffices to keep BOTH the user's `t.name` and the prelude's
+#    `t.state_id` resolving to their respective declarations.
+#
+# `arity = -1` is the "caller does not know the arity" sentinel —
+# all matches by bare name are accepted and the first one wins, which
+# reproduces the legacy `rec_find` semantics over the newest-first
+# list.
+fn rec_find_arity_loop(rs: [RecInfo], target: String, arity: Int,
+                          fallback: Option[RecInfo]) : Option[RecInfo] {
   match rs {
-    [] -> None
+    [] -> fallback
     [r, ...rest] -> match r {
-      RI(nm, _, _) -> if nm == target { Some(r) } else { rec_find_loop(rest, target) }
+      RI(nm, tps, _) ->
+        if nm == target {
+          if arity < 0 {
+            Some(r)
+          } else if list_length(tps) == arity {
+            Some(r)
+          } else {
+            let fb = match fallback {
+              Some(_) -> fallback
+              None    -> Some(r)
+            }
+            rec_find_arity_loop(rest, target, arity, fb)
+          }
+        } else {
+          rec_find_arity_loop(rest, target, arity, fallback)
+        }
     }
   }
 }
 
+fn rec_find_arity(rs: [RecInfo], target: String, arity: Int) : Option[RecInfo] =
+  rec_find_arity_loop(rs, target, arity, None)
+
+fn rec_find_loop(rs: [RecInfo], target: String) : Option[RecInfo] =
+  rec_find_arity_loop(rs, target, -1, None)
+
 fn rec_find(rs: [RecInfo], target: String) : Option[RecInfo] = rec_find_loop(rs, target)
 
+# Issue #648 — field-aware record lookup. When the caller knows the
+# field being accessed (or the field-set being constructed), prefer
+# an arity-matched `RI` that declares the requested field. This is
+# the record-side same-arity tie-breaker that the variant-side fix
+# left unresolved (`SplitN` / `NB_FragR` skip-list in issue #643).
+# A user `type Thread = { id, name }` and a private prelude `type
+# Thread = { state_id, captures }` collide on name + arity 0; the
+# walker hands the user's record back when the access site reads
+# `name`, and the prelude's when the access site reads `state_id`.
+fn rec_find_with_field(rs: [RecInfo], target: String, arity: Int,
+                          field: String) : Option[RecInfo] =
+  rec_find_with_field_loop(rs, target, arity, field, None, None)
+
+fn rec_find_with_field_loop(rs: [RecInfo], target: String, arity: Int,
+                                field: String, by_field: Option[RecInfo],
+                                by_arity: Option[RecInfo]) : Option[RecInfo] {
+  match rs {
+    [] -> match by_field {
+      Some(_) -> by_field
+      None    -> by_arity
+    }
+    [r, ...rest] -> match r {
+      RI(nm, tps, fs) ->
+        if nm == target {
+          let arity_ok = arity < 0 or list_length(tps) == arity
+          if arity_ok {
+            if field_decl_list_has(fs, field) {
+              # First arity-matched record that declares `field`
+              # wins outright — no further walking needed.
+              Some(r)
+            } else {
+              let ba = match by_arity {
+                Some(_) -> by_arity
+                None    -> Some(r)
+              }
+              rec_find_with_field_loop(rest, target, arity, field, by_field, ba)
+            }
+          } else {
+            rec_find_with_field_loop(rest, target, arity, field, by_field, by_arity)
+          }
+        } else {
+          rec_find_with_field_loop(rest, target, arity, field, by_field, by_arity)
+        }
+    }
+  }
+}
+
+fn field_decl_list_has(fs: [FieldDecl], target: String) : Bool {
+  match fs {
+    [] -> false
+    [f, ...rest] -> match f {
+      FD(nm, _) -> if nm == target { true } else { field_decl_list_has(rest, target) }
+    }
+  }
+}
+
+fn field_init_list_has(fs: [FieldInit], target: String) : Bool {
+  match fs {
+    [] -> false
+    [f, ...rest] -> match f {
+      FI(nm, _) -> if nm == target { true } else { field_init_list_has(rest, target) }
+    }
+  }
+}
+
+# Issue #648 — keep the accumulator newest-first (no `list_reverse`)
+# so a user record declared later in the decl stream shadows an
+# earlier same-name prelude record under `rec_find` (legacy bare-name
+# lookup). The newest-first ordering is harmless for the field-aware
+# walker — `rec_find_with_field` picks by declared-field set rather
+# than position — and is correct for the arity-aware walker, which
+# is unaffected by ordering when at most one record matches the
+# arity. Pre-#648 the list was `list_reverse`d back to declaration
+# order (oldest-first), which made bare `rec_find` return the
+# prelude's record over a same-name user redeclaration.
 fn collect_records_loop(ds: [Decl], acc: [RecInfo]) : [RecInfo] {
   match ds {
-    [] -> list_reverse(acc)
+    [] -> acc
     [d, ...rest] -> match d {
       DType(_, nm, tps, body, _, _) -> match body {
         TBRecord(fs) -> collect_records_loop(rest, [RI(nm, tps, fs), ...acc])
@@ -32342,7 +32481,7 @@ fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
 # attempting UFCS lookup.
 fn record_has_field(st: InferState, obj_ty: Ty, ident: String) : Bool {
   match obj_ty {
-    TyCon(cname, _) -> match rec_find(st.recs, cname) {
+    TyCon(cname, cargs) -> match rec_find_with_field(st.recs, cname, list_length(cargs), ident) {
       None -> false
       Some(ri) -> {
         let inst = rec_instantiate(st, ri)
@@ -32841,7 +32980,7 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
   let r = synth(st, obj)
   let applied = apply_ty(r.st.sub, r.ty)
   match applied {
-    TyCon(cname, _) -> match rec_find(r.st.recs, cname) {
+    TyCon(cname, cargs) -> match rec_find_with_field(r.st.recs, cname, list_length(cargs), fnm) {
       None -> field_non_record_or_partial_app(r.st, r.expr, fnm, line, col)
       Some(ri) -> {
         let inst = rec_instantiate(r.st, ri)
@@ -34753,7 +34892,27 @@ fn all_demands_local_in_list_elems(els: [ListElem], locals: [String],
 fn synth_record_lit(st: InferState, nm: String, fis: [FieldInit], line: Int, col: Int) : Inferred / Console + File {
 
 
-  match rec_find(st.recs, nm) {
+  # Issue #648 — disambiguate same-(name, arity) record collisions by
+  # field name. `synth_record_lit` is called with the construction's
+  # `[FieldInit]`; use the first init's name to pick the `RI` whose
+  # declared field set includes that name. Two arity-0 `Thread`
+  # records (private prelude + user redeclaration) are distinguished
+  # this way: the user's `Thread { id, name }` literal probes for
+  # `id` and matches the user's `RI`; the prelude's `Thread {
+  # state_id, captures }` literal probes for `state_id` and matches
+  # the prelude's `RI`. Falls back to bare arity-aware lookup when
+  # no fields are present (zero-field constructions are rare and
+  # arity alone suffices).
+  let probe_field = match fis {
+    [] -> ""
+    [fi, ..._] -> match fi { FI(fnm, _) -> fnm }
+  }
+  let lookup = if probe_field == "" {
+    rec_find(st.recs, nm)
+  } else {
+    rec_find_with_field(st.recs, nm, -1, probe_field)
+  }
+  match lookup {
     None -> {
       let r = synth_field_inits(st, fis, [], line, col)
       let ty = TyCon(nm, [])
@@ -35407,10 +35566,21 @@ fn variant_arity_check(st: InferState, ps: [Pattern], tys: [Ty],
   }
 }
 
+fn pfield_list_probe(pfs: [PField]) : String = match pfs {
+  [] -> ""
+  [pf, ..._] -> match pf { PField(nm, _, _) -> nm }
+}
+
 fn check_variant_record_pattern(st: InferState, cname: String, pfs: [PField], expected: Ty, line: Int, col: Int) : InferState / Console + File {
 
 
-  match rec_find(st.recs, cname) {
+  let probe = pfield_list_probe(pfs)
+  let lookup = if probe == "" {
+    rec_find(st.recs, cname)
+  } else {
+    rec_find_with_field(st.recs, cname, -1, probe)
+  }
+  match lookup {
     None -> check_unknown_pfields(st, pfs)
     Some(ri) -> {
       let inst = rec_instantiate(st, ri)
@@ -35426,12 +35596,21 @@ fn check_record_pattern(st: InferState, pfs: [PField], expected: Ty, line: Int, 
 
   let applied = apply_ty(st.sub, expected)
   match applied {
-    TyCon(nm, _) -> match rec_find(st.recs, nm) {
-      None -> check_unknown_pfields(st, pfs)
-      Some(ri) -> {
-        let inst = rec_instantiate(st, ri)
-        let s1 = st_unify(inst.st, expected, inst.result_ty, "record pattern", line, col)
-        check_pfield_list(s1, pfs, inst.fields, line, col)
+    TyCon(nm, nargs) -> {
+      let probe = pfield_list_probe(pfs)
+      let arity = list_length(nargs)
+      let lookup = if probe == "" {
+        rec_find_arity(st.recs, nm, arity)
+      } else {
+        rec_find_with_field(st.recs, nm, arity, probe)
+      }
+      match lookup {
+        None -> check_unknown_pfields(st, pfs)
+        Some(ri) -> {
+          let inst = rec_instantiate(st, ri)
+          let s1 = st_unify(inst.st, expected, inst.result_ty, "record pattern", line, col)
+          check_pfield_list(s1, pfs, inst.fields, line, col)
+        }
       }
     }
     _ -> check_unknown_pfields(st, pfs)

@@ -215,6 +215,16 @@ revisiting as a Tier 0 sanity probe.
    today (no stdlib `State` collision); the audit script's skip
    list covers the records with actual collisions.
 
+   **Closed by issue #648** (lane retro
+   `docs/lane-experience-issue-648-record-side-private-leak.md`)
+   — `rec_find_with_field` adds a field-set tie-breaker that
+   discriminates same-(name, arity) record collisions without
+   the prelude-side regression the variant-side sentinel left
+   open. The fixture
+   `examples/shadowing/user_thread_does_not_collide_with_private_regexp_thread.kai`
+   exercises the closed case; `tools/audit-prelude-private-records.sh`
+   institutionalises the gate.
+
 3. **The audit script is one-shot.** It compiles each redeclared-
    type test in sequence (no parallelism, ~1.5s per stdlib type
    on macOS). For the ~12 non-`pub type` declarations in
