@@ -25318,8 +25318,18 @@ fn mangle_unit_ident_loop(s: String, i: Int, n: Int, acc: [String]) : String {
 # strings. Empty row → empty string. Open row tail → trailing
 # `+ ?eN`. Each label uses `label_to_string` so type args render.
 fn row_to_string_suffix(r: Row) : String {
+  # Issue #645: a row with no labels is treated as "pure" in display
+  # form, whether its tail is None (truly closed empty) or Some(_)
+  # (a free row var with no demand on it — the phantom that
+  # `fn_scheme_of_decl` inserts for REmpty signatures, or any fresh
+  # row var introduced by instantiation and never constrained). The
+  # tail variable is internal bookkeeping; showing `?eN` to users
+  # mis-suggests they need to annotate the function. Diagnostics for
+  # actual row mismatches still print the `expected` and `found`
+  # rows in full (those rows carry labels by the time the mismatch
+  # is reported).
   let body =
-    if labels_empty(r.labels) and (match r.tail { None -> true Some(_) -> false }) {
+    if labels_empty(r.labels) {
       ""
     } else {
       let lbs = join_with(map(r.labels, label_to_string), " + ")
@@ -27339,7 +27349,7 @@ fn row_labels_of_rls_with_binds(ls: [RowLabel], tpbinds: [TPBind], rbinds: [RVBi
 
 fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
   match d {
-    DFn(_, _, tparams, params, opt_ret, rexpr, _, _, _, _) -> {
+    DFn(_, fname, tparams, params, opt_ret, rexpr, _, _, _, _) -> {
       # m7b #12: collect row-variable names per decl, allocate small
       # bound ids (0, 1, ...) in order of appearance, build the body
       # type with those ids in tail positions. The scheme generalises
@@ -27365,13 +27375,49 @@ fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
         Some(rty) -> resolve_ty_with_binds(rty, tpbinds, rbinds)
         None      -> TyUnit
       }
-      let body = TyFnT(pts, ret, row_of_expr_with_binds(rexpr, tpbinds, rbinds))
+      # Issue #645 — elaboration for pure named callbacks. When a fn
+      # decl omits the row clause (`fn foo(...) : T` without `/`), the
+      # scheme gains a fresh phantom row variable in the outermost
+      # TyFnT tail. Effect: each call site instantiates the row to a
+      # fresh free variable instead of empty-closed, so passing a pure
+      # named callback to a slot expecting `(args) -> ret / e` no
+      # longer pins `e := ε`. `check_body_row` (line ~36939) still
+      # enforces empty-closed for the *body*, so soundness is
+      # preserved: pure → effectful lifts, effectful → pure stays
+      # rejected. The asymmetry holds because RClosed/ROpen signatures
+      # carry their declared row verbatim — only REmpty triggers
+      # elaboration. Excludes `main` (which absorbs builtin effects
+      # under its REmpty branch in check_body_row).
+      let phantom_id = list_length(rbinds)
+      let row = if elaborate_phantom_row(rexpr, fname) {
+        Row { labels: [], tail: Some(phantom_id), display_alias: None }
+      } else {
+        row_of_expr_with_binds(rexpr, tpbinds, rbinds)
+      }
+      let body = TyFnT(pts, ret, row)
       # m12.5: split tparam IDs by kind so unit-vars live in their own
       # pool and get fresh-instantiated by st_instantiate_report.
       let split = tparam_id_split(effective_tparams)
-      Some(scheme_uvars(split.tvars, rvbind_ids(rbinds), split.uvars, body))
+      let rvars = if elaborate_phantom_row(rexpr, fname) {
+        list_append(rvbind_ids(rbinds), [phantom_id])
+      } else {
+        rvbind_ids(rbinds)
+      }
+      Some(scheme_uvars(split.tvars, rvars, split.uvars, body))
     }
     _ -> None
+  }
+}
+
+# Issue #645 — predicate gating the elaboration of a phantom row
+# variable on a fn signature lacking a `/` row clause. `main` is
+# excluded because `check_body_row`'s REmpty branch absorbs builtin
+# effects there; adding a phantom row var would interfere with that
+# special-case.
+fn elaborate_phantom_row(rexpr: RowExpr, fname: String) : Bool {
+  match rexpr {
+    REmpty -> fname != "main"
+    _      -> false
   }
 }
 
@@ -36470,7 +36516,13 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # `synth_binop` can decide whether a (prim, nonprim) /
       # (nonprim, nonprim cross) pair routes to a registered impl.
       let st_init = st_set_proto_impls(st_init0, proto_impls)
-      let st0 = advance_row_fresh(st_init, list_length(rbinds))
+      # Issue #645 — reserve one extra row-var id for the phantom row
+      # variable inserted by `fn_scheme_of_decl` into REmpty signatures.
+      # Without this advance, the inferencer's first fresh row var
+      # would alias `phantom_id = len(rbinds)`, which the scheme
+      # already quantifies over.
+      let phantom_extra = if elaborate_phantom_row(row, nm) { 1 } else { 0 }
+      let st0 = advance_row_fresh(st_init, list_length(rbinds) + phantom_extra)
       # m7b #13 follow-up (surfaced by m8 #3's typed Spawn wrappers):
       # mk_tpbinds allocates ids 0..n-1 for the fn-level tparams, but
       # infer_state_new starts env.fresh at 0 too. Without bumping the
