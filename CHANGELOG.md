@@ -84,6 +84,20 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.70.0 (2026-05-16)
+
+### Added
+
+- **edition**: flip default edition tongariki → hanga-roa
+- **typer**: pure named functions auto-generalize over effect rows (closes #645)
+
+### Fixed
+
+- **typer**: arity- and field-aware record lookup (Path 1, closes #648)
+- **typer**: same-arity private types use module-mangled names (closes #647)
+- **typer**: constructor overloading at use sites (Plan B, closes #644)
+- **ci**: release.yml publish-source produces self-consistent mirror
+
 ## v0.69.0 (2026-05-16)
 
 ### Added
