@@ -134,19 +134,34 @@ is_skipped() {
 
 collect_entry_points
 
-pass=0
-fail=0
-skip=0
-total=0
-failures="$tmp/failures.log"
-: > "$failures"
+# Jobs: number of parallel workers. Defaults to the host's logical CPU count;
+# override via BACKEND_PARITY_JOBS. macOS uses sysctl, Linux uses nproc.
+if [ -n "${BACKEND_PARITY_JOBS:-}" ]; then
+  JOBS="$BACKEND_PARITY_JOBS"
+elif command -v nproc >/dev/null 2>&1; then
+  JOBS="$(nproc)"
+elif command -v sysctl >/dev/null 2>&1; then
+  JOBS="$(sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
+else
+  JOBS=4
+fi
 
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  total=$((total + 1))
+failures="$tmp/failures.log"
+results="$tmp/results"   # one line per fixture: P|F|S
+: > "$failures"
+: > "$results"
+
+# Worker — invoked once per fixture via `xargs -P $JOBS -n 1`.
+# Side-effects: appends one of "P", "F", "S" to $results; appends a
+# multi-line failure block to $failures on F. Read-only otherwise.
+# Single-line appends to the counter file are atomic on POSIX up to
+# PIPE_BUF (>= 512 bytes); the 1-char results and the diff-bounded
+# failure blocks both fit.
+process_one() {
+  f="$1"
   if is_skipped "$f"; then
-    skip=$((skip + 1))
-    continue
+    printf 'S\n' >> "$results"
+    return 0
   fi
 
   slug=$(echo "$f" | tr '/' '_' | tr '.' '_')
@@ -155,29 +170,26 @@ while IFS= read -r f; do
   c_blog="$tmp/${slug}.c.build.log"
   l_blog="$tmp/${slug}.llvm.build.log"
 
-  # Build with C backend.
   if ! KAI_BACKEND=c "$KAI" build "$f" -o "$c_bin" >"$c_blog" 2>&1; then
     {
       echo "FAIL $f — C build failed:"
       tail -10 "$c_blog" | sed 's/^/    /'
       echo
     } >> "$failures"
-    fail=$((fail + 1))
-    continue
+    printf 'F\n' >> "$results"
+    return 0
   fi
 
-  # Build with LLVM backend.
   if ! KAI_BACKEND=llvm "$KAI" build "$f" -o "$l_bin" >"$l_blog" 2>&1; then
     {
       echo "FAIL $f — LLVM build failed:"
       tail -10 "$l_blog" | sed 's/^/    /'
       echo
     } >> "$failures"
-    fail=$((fail + 1))
-    continue
+    printf 'F\n' >> "$results"
+    return 0
   fi
 
-  # Run both, capture combined stdout+stderr and exit code.
   c_out_file="$tmp/${slug}.c.out"
   l_out_file="$tmp/${slug}.llvm.out"
   c_rc=0
@@ -194,8 +206,8 @@ while IFS= read -r f; do
       head -5 "$l_out_file" | sed 's/^/    /'
       echo
     } >> "$failures"
-    fail=$((fail + 1))
-    continue
+    printf 'F\n' >> "$results"
+    return 0
   fi
 
   if ! diff -q "$c_out_file" "$l_out_file" >/dev/null 2>&1; then
@@ -204,12 +216,32 @@ while IFS= read -r f; do
       diff -u "$c_out_file" "$l_out_file" | head -20 | sed 's/^/    /'
       echo
     } >> "$failures"
-    fail=$((fail + 1))
-    continue
+    printf 'F\n' >> "$results"
+    return 0
   fi
 
-  pass=$((pass + 1))
-done < "$tmp/entry-points"
+  printf 'P\n' >> "$results"
+}
+
+# Export the worker + the helpers and state it touches so xargs can
+# reach them from each forked subshell.
+export KAI tmp failures results SKIPS_FILE RUN_TIMEOUT TIMEOUT_CMD
+export -f process_one is_skipped run_with_timeout
+
+# Total fixtures (pre-skip).
+total=$(wc -l < "$tmp/entry-points" | tr -d ' ')
+
+echo "test-backend-parity: walking $total fixtures with $JOBS workers..."
+
+# xargs spawns N parallel `sh -c 'process_one <fixture>'` calls,
+# each fixture goes to whichever worker is free. Output ordering is
+# non-deterministic but the failure log and counter file capture
+# everything; the final summary is deterministic.
+xargs -P "$JOBS" -n 1 -I{} sh -c 'process_one "$@"' _ {} < "$tmp/entry-points"
+
+pass=$(grep -c '^P$' "$results" 2>/dev/null || echo 0)
+fail=$(grep -c '^F$' "$results" 2>/dev/null || echo 0)
+skip=$(grep -c '^S$' "$results" 2>/dev/null || echo 0)
 
 echo ""
 echo "test-backend-parity: pass=$pass fail=$fail skip=$skip total=$total"
