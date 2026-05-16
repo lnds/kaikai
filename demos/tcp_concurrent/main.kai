@@ -1,0 +1,96 @@
+# demos/tcp_concurrent — issue #630 Phase R2 reactor proof for
+# non-blocking TCP sockets. Three client fibers each open a
+# connection, send a small payload, and read the server's reply,
+# while three server fibers concurrently accept those connections
+# and echo a single byte back. All six socket-shaped operations
+# (`connect`, `accept`, `recv`, `send`, plus the surrounding
+# `listen` / `close`) park the fiber via the reactor's poll set
+# instead of blocking the OS thread.
+#
+# Pre-R2 a single `accept()` would have frozen the OS thread; the
+# three client fibers spawned earlier never get a chance to issue
+# their `connect()` calls and the whole nursery deadlocks. With the
+# R2 wiring `accept` parks on read-readiness, the scheduler dispatches
+# a client fiber, the client's `connect` parks on write-readiness,
+# the kernel completes both halves of the handshake, and both fibers
+# resume.
+#
+# The fixture is a correctness gate, not a wall-time gate. The
+# golden output is a fixed sequence:
+#
+#   listen ok
+#   accepted 3
+#   ok
+#
+# "accepted 3" prints after every server fiber has completed its
+# handshake — its presence is the proof that three concurrent
+# accept/recv/send round-trips made progress without a deadlock.
+# Pre-R2 the program would never reach "accepted 3" because the
+# first accept would have blocked the OS thread, starving the
+# clients that needed to drive the handshake forward.
+
+import spawn
+import net.tcp
+
+# Payload helpers — ASCII codepoints keep the golden output free of
+# encoding helpers. Each client sends "P" (80) and expects "K" (75).
+fn req_bytes() : [Int] = [80]
+fn rep_bytes() : [Int] = [75]
+
+# Server-side: accept a connection, recv the request byte, send the
+# reply byte, close the connection. Returns 1 on success / 0 on any
+# error so the caller can sum across fibers.
+fn serve_one(l: Listener) : Int / NetTcp = {
+  match NetTcp.accept(l) {
+    Err(_)  -> 0
+    Ok(srv) ->
+      match NetTcp.recv(srv, 16) {
+        Err(_) -> { NetTcp.close(srv); 0 }
+        Ok(_) ->
+          match NetTcp.send(srv, rep_bytes()) {
+            Err(_)   -> { NetTcp.close(srv); 0 }
+            Ok(_)    -> { NetTcp.close(srv); 1 }
+          }
+      }
+  }
+}
+
+# Client-side: connect, send the request byte, recv one reply byte,
+# close. Returns 1 on success / 0 on any error.
+fn client_one(port: Int) : Int / NetTcp = {
+  match NetTcp.connect("127.0.0.1", port) {
+    Err(_)  -> 0
+    Ok(c)   ->
+      match NetTcp.send(c, req_bytes()) {
+        Err(_) -> { NetTcp.close(c); 0 }
+        Ok(_)  ->
+          match NetTcp.recv(c, 16) {
+            Err(_) -> { NetTcp.close(c); 0 }
+            Ok(_)  -> { NetTcp.close(c); 1 }
+          }
+      }
+  }
+}
+
+fn main() : Int / NetTcp + Spawn + Stdout = {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(e) -> { Stdout.print(string_concat("listen FAIL: ", e)); 1 }
+    Ok(l)  -> {
+      Stdout.print("listen ok")
+      let port = local_port(l)
+      let accepted = nursery { n ->
+        let s1 = n.spawn(() => serve_one(l))
+        let s2 = n.spawn(() => serve_one(l))
+        let s3 = n.spawn(() => serve_one(l))
+        let c1 = n.spawn(() => client_one(port))
+        let c2 = n.spawn(() => client_one(port))
+        let c3 = n.spawn(() => client_one(port))
+        let r1 = n.await(s1) + n.await(s2) + n.await(s3)
+        let r2 = n.await(c1) + n.await(c2) + n.await(c3)
+        if r1 == 3 and r2 == 3 { 3 } else { 0 }
+      }
+      Stdout.print(string_concat("accepted ", int_to_string(accepted)))
+      if accepted == 3 { Stdout.print("ok"); 0 } else { Stdout.print("fail"); 1 }
+    }
+  }
+}
