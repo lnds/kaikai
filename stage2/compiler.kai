@@ -1102,7 +1102,7 @@ type Severity
 type RelatedInfo = DR(String, Int, Int, String)
 # (file, line, col, message). Variant tag is `DR` (diagnostic-related)
 # because stage 2 uses a single global variant-tag namespace and `RI`
-# was already taken by `type RecInfo = RI(String, [String], [FieldDecl])`
+# was already taken by `type RecInfo = RI(String, [String], [FieldDecl], Option[String])`
 # at line 26701. LSP serialization sees the field positions, not the
 # tag, so the shorter `DR` name has no impact on the wire format.
 
@@ -1588,7 +1588,16 @@ type Decl
   # without a linker collision and lets a root-file `fn sum`
   # silently shadow `pub fn sum` exported by a prelude.
   = DFn(Bool, String, [String], [Param], Option[TypeExpr], RowExpr, Expr, Int, Int, Option[String])
-  | DType(Bool, String, [String], TypeBody, Int, Int)
+  # Hanga Roa: trailing `Option[String]` is the *module origin*,
+  # mirroring `DFn`. None for decls authored in the root file; the
+  # surface name of the owning module for decls coming through
+  # `expand_imports` / the core auto-load. The typer's type-name
+  # resolution uses this to disambiguate same-name records / sums /
+  # unions per-module — a user `type Pair = ...` in the root file
+  # shadows `core.tuple.Pair` only inside the root, while
+  # `core/tuple.kai`'s own internal uses of `Pair` keep resolving
+  # to their home module's definition.
+  | DType(Bool, String, [String], TypeBody, Int, Int, Option[String])
   | DTest(String, Expr, Int, Int)
   # bench v1 (issue #40): mirrors DTest but the runner times the body.
   # Fields: description (raw quoted span), body, line, col.
@@ -9462,7 +9471,7 @@ fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], t: 
           let rt = parse_type(p)
           match rt.r {
             None -> err_d(rt.p)
-            Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col))
+            Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col, None))
           }
         }
       }
@@ -9470,7 +9479,7 @@ fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], t: 
       let rt = parse_type(p)
       match rt.r {
         None -> err_d(rt.p)
-        Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col))
+        Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col, None))
       }
     }
   }
@@ -9523,7 +9532,7 @@ fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tp
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
-    ok_d(p_advance(p0), DType(is_pub, name, tparams, TBRecord(list_reverse(acc)), t.line, t.col))
+    ok_d(p_advance(p0), DType(is_pub, name, tparams, TBRecord(list_reverse(acc)), t.line, t.col, None))
   } else {
     let ft = p_peek(p0)
     if not tk_is(ft.kind, TkIdent) {
@@ -9543,7 +9552,7 @@ fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tp
             if p_at(p2, TkComma) {
               parse_record_body(p_skip_newlines(p_advance(p2)), [fd, ...acc], is_pub, name, tparams, t)
             } else if p_at(p2, TkRbrace) {
-              ok_d(p_advance(p2), DType(is_pub, name, tparams, TBRecord(list_reverse([fd, ...acc])), t.line, t.col))
+              ok_d(p_advance(p2), DType(is_pub, name, tparams, TBRecord(list_reverse([fd, ...acc])), t.line, t.col, None))
             } else {
               err_d(p_error_here(p2, "expected `,` or `}` in record type"))
             }
@@ -9571,7 +9580,7 @@ fn parse_effect_alias_body(p: Parser, acc: [String], is_pub: Bool, name: String,
     if p_at(p1, TkPlus) {
       parse_effect_alias_body(p_advance(p1), acc1, is_pub, name, tparams, t)
     } else {
-      ok_d(p1, DType(is_pub, name, tparams, TBEffectAlias(list_reverse(acc1)), t.line, t.col))
+      ok_d(p1, DType(is_pub, name, tparams, TBEffectAlias(list_reverse(acc1)), t.line, t.col, None))
     }
   }
 }
@@ -9599,7 +9608,7 @@ fn parse_sum_body(p: Parser, acc: [Variant], is_pub: Bool, name: String, tparams
         if p_at(p2, TkPipe) {
           parse_sum_body(p_skip_newlines(p_advance(p2)), [vnode, ...acc], is_pub, name, tparams, t)
         } else {
-          ok_d(p2, DType(is_pub, name, tparams, TBSum(list_reverse([vnode, ...acc])), t.line, t.col))
+          ok_d(p2, DType(is_pub, name, tparams, TBSum(list_reverse([vnode, ...acc])), t.line, t.col, None))
         }
       }
     }
@@ -10276,7 +10285,7 @@ fn dump_decl(d: Decl, depth: Int) : Unit / Console {
       dump_type(ty, depth + 1)
       dump_expr(body, depth + 1)
     }
-    DType(is_pub, name, tparams, body, line, col) -> {
+    DType(is_pub, name, tparams, body, line, col, _) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       emit_line(depth, "type #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
       tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
@@ -10928,7 +10937,7 @@ fn chk_decl(e: Env, d: Decl) : Env / Console + File {
       let e3 = chk_expr(e2, body)
       env_pop(e3)
     }
-    DType(_, _, _, _, _, _) -> e
+    DType(_, _, _, _, _, _, _) -> e
     DTest(_, body, _, _) -> {
       let e1 = env_push(e)
       let e2 = chk_expr(e1, body)
@@ -10990,7 +10999,7 @@ fn register_decls(e: Env, ds: [Decl]) : Env {
 fn register_one(e: Env, d: Decl) : Env {
   match d {
     DFn(_, name, _, _, _, _, _, _, _, _) -> env_add(e, name)
-    DType(_, name, _, body, _, _) -> {
+    DType(_, name, _, body, _, _, _) -> {
       let e1 = env_add(e, name)
       match body {
         TBSum(variants) -> register_variants_env(e1, variants)
@@ -11215,7 +11224,7 @@ fn collect_type_names(decls: [Decl]) : [String] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DType(_, name, _, _, _, _) -> [name, ...collect_type_names(rest)]
+      DType(_, name, _, _, _, _, _) -> [name, ...collect_type_names(rest)]
       _ -> collect_type_names(rest)
     }
   }
@@ -12462,7 +12471,7 @@ fn collect_user_variants_loop(ds: [Decl], acc: [EVar]) : [EVar] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DType(_, _, _, body, _, _) -> match body {
+      DType(_, _, _, body, _, _, _) -> match body {
         TBSum(vs) -> collect_user_variants_loop(rest, vs_to_evars(vs, acc))
         _ -> collect_user_variants_loop(rest, acc)
       }
@@ -15417,7 +15426,7 @@ fn collect_decl(d: Decl, st: LamCollect) : LamCollect / Console {
       let st2 = collect_expr(body, st1)
       lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
     }
-    DType(_, _, _, _, _, _) -> st
+    DType(_, _, _, _, _, _, _) -> st
     DTest(_, body, line, col) -> {
       let outer = st.cur_enc_fn
       let outer_locals = st.local_scope
@@ -20102,7 +20111,7 @@ fn dpr_record_lit(name: String, fis: [FieldInit], line: Int, col: Int, recs: [Re
         DPRFields { fields: fis, errs: errs + 1 }
       }
       Some(ri) -> match ri {
-        RI(_, _, fds) -> {
+        RI(_, _, fds, _) -> {
           let n_pos = list_length(fis)
           let n_decl = list_length(fds)
           if n_pos != n_decl {
@@ -20186,7 +20195,7 @@ fn dpr_record_spread(
             DPRSpread { expr: mk_expr(ERecordLit(name, fis), line, col), errs: errs + 1 }
           }
           Some(ri) -> match ri {
-            RI(_, tparams, fds) -> {
+            RI(_, tparams, fds, _) -> {
               # Diagnose duplicate overrides (same field listed twice).
               let dup_errs = check_spread_dup_overrides(overrides, [], file, line, col, 0)
               # Diagnose overrides naming a field not declared on `T`.
@@ -20510,9 +20519,9 @@ fn desugar_const_refs_decl(d: Decl, const_names: [String]) : Decl {
       let body_names = list_minus_names(const_names, fn_param_names(params))
       DCheck(desc, params, desugar_const_refs_expr(body, body_names), l, c)
     }
-    DType(p, n, tps, body, l, c) -> DType(p, n, tps,
+    DType(p, n, tps, body, l, c, _) -> DType(p, n, tps,
                                             desugar_const_refs_typebody(body, const_names),
-                                            l, c)
+                                            l, c, None)
     DAttribPure(inner, l, c) -> DAttribPure(desugar_const_refs_decl(inner, const_names), l, c)
     _ -> d
   }
@@ -20836,7 +20845,7 @@ fn synth_refine_loop(decls: [Decl], target_mod: String, cur_mod: String,
 
 fn synth_refine_for_decl(d: Decl, parent_mo: Option[String]) : [Decl] {
   match d {
-    DType(_, name, _, body, l, c) -> match body {
+    DType(_, name, _, body, l, c, _) -> match body {
       TBAlias(t) -> match t.tkind {
         TyRefine(base, pred) ->
           [build_refine_pred_fn(name, base, pred, l, c, parent_mo)]
@@ -20874,7 +20883,7 @@ fn collect_refine_alias_loop(decls: [Decl], acc: [String]) : [String] {
   match decls {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DType(_, name, _, body, _, _) -> match body {
+      DType(_, name, _, body, _, _, _) -> match body {
         TBAlias(t) -> match t.tkind {
           TyRefine(_, _) -> collect_refine_alias_loop(rest, [name, ...acc])
           _ -> collect_refine_alias_loop(rest, acc)
@@ -24371,7 +24380,7 @@ fn collect_alias_cands(decls: [Decl]) : [AliasCand] {
     [] -> []
     [d, ...rest] -> {
       let here = match d {
-        DType(_, name, _, body, line, col) -> match body {
+        DType(_, name, _, body, line, col, _) -> match body {
           TBEffectAlias(labels) -> [AC(name, labels, true, line, col)]
           TBAlias(ty) -> match ty.tkind {
             TyName(n, targs) ->
@@ -24741,7 +24750,7 @@ fn collect_transparent_aliases_loop(decls: [Decl], eff_names: [String],
 
 fn transparent_alias_of_decl(d: Decl, eff_names: [String]) : Option[TAEntry] {
   match d {
-    DType(_, name, tparams, body, _, _) -> match body {
+    DType(_, name, tparams, body, _, _, _) -> match body {
       TBAlias(t) -> match t.tkind {
         # Single-name body that resolves to an effect: skip. Effect
         # aliasing is the legacy semantics of TBAlias single-name
@@ -24990,7 +24999,7 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], fuel: Int) : Decl {
           match ret_opt { None -> None Some(te) -> Some(expand_ta_te(te, table, fuel)) },
           row,
           expand_ta_expr(body, table, fuel), l, c, mo)
-    DType(p, n, tps, body, l, c) ->
+    DType(p, n, tps, body, l, c, _) ->
       # Skip rewriting the alias's own DType body: keeping the original
       # decl preserves the alias name in `--ast` output and lets later
       # passes that consult it (refinement synth, dump) see the surface
@@ -25000,9 +25009,9 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], fuel: Int) : Decl {
         TBAlias(_) -> d
         TBEffectAlias(_) -> d
         TBRecord(fs) ->
-          DType(p, n, tps, TBRecord(expand_ta_fields(fs, table, fuel)), l, c)
+          DType(p, n, tps, TBRecord(expand_ta_fields(fs, table, fuel)), l, c, None)
         TBSum(vs) ->
-          DType(p, n, tps, TBSum(expand_ta_variants(vs, table, fuel)), l, c)
+          DType(p, n, tps, TBSum(expand_ta_variants(vs, table, fuel)), l, c, None)
       }
     DEffect(p, n, tps, ops, defblk, l, c) ->
       DEffect(p, n, tps, expand_ta_eops(ops, table, fuel), defblk, l, c)
@@ -25320,7 +25329,7 @@ fn collect_private_segment_types(decls: [Decl], mod_name: String,
 fn private_type_entry_of(d: Decl, home_mod: String,
                             acc: [PrivTyEntry]) : [PrivTyEntry] {
   match d {
-    DType(is_pub, name, _, body, _, _) ->
+    DType(is_pub, name, _, body, _, _, _) ->
       if is_pub { acc }
       else { match body {
         # Only sum types are mangled today. Records ride the
@@ -25410,13 +25419,13 @@ fn mangle_one_segment(decls: [Decl], entries: [PrivTyEntry],
 
 fn mangle_one_decl(d: Decl, entries: [PrivTyEntry], home_mod: String) : Decl {
   match d {
-    DType(is_pub, name, tps, body, l, c) -> {
+    DType(is_pub, name, tps, body, l, c, _) -> {
       let name1 = match priv_ty_lookup(entries, home_mod, name) {
         Some(m) -> m
         None    -> name
       }
       DType(is_pub, name1, tps,
-            mangle_typebody(body, entries, home_mod), l, c)
+            mangle_typebody(body, entries, home_mod), l, c, None)
     }
     DFn(p, n, tps, ps, ret_opt, row, body, l, c, mo) ->
       DFn(p, n, tps, mangle_params(ps, entries, home_mod),
@@ -26096,7 +26105,7 @@ fn dump_decl_type(d: Decl) : Unit / Console {
         None -> ()
       }
     }
-    DType(is_pub, name, tparams, _, line, col) -> {
+    DType(is_pub, name, tparams, _, line, col, _) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       let tps = match tparams {
         [] -> ""
@@ -26891,10 +26900,10 @@ fn canon_resolved_css(css: [ResolvedCS], tv_map: [IntPair],
   match css {
     [] -> []
     [cs, ...rest] -> match cs {
-      RCS(nm, line, col, tys, units) ->
+      RCS(nm, line, col, tys, units, mo) ->
         [RCS(nm, line, col,
              map(tys, (t) => canon_uvars_ty(canon_tvars_ty(t, tv_map), uv_map)),
-             map(units, (u) => canon_uvars_unit(u, uv_map))),
+             map(units, (u) => canon_uvars_unit(u, uv_map)), mo),
          ...canon_resolved_css(rest, tv_map, uv_map)]
     }
   }
@@ -27023,7 +27032,7 @@ fn scheme_of_variant(type_name: String, tparams: [String], v: Variant) : TySchem
 
 fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String]) : TyEnv {
   match d {
-    DType(_, tname, tparams, body, _, _) -> match body {
+    DType(_, tname, tparams, body, _, _, _) -> match body {
       TBSum(vs) -> add_variants_loop(env, tname, tparams, vs, top_names)
       _ -> env
     }
@@ -27131,7 +27140,7 @@ fn collect_unions_loop(ds: [Decl], acc: [UnionInfo]) : [UnionInfo] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DType(_, name, _, body, line, col) -> match body {
+      DType(_, name, _, body, line, col, _) -> match body {
         TBSum(vs) -> {
           let comps = variants_to_component_tys(vs)
           collect_unions_loop(rest, [UI(name, comps, line, col), ...acc])
@@ -27251,7 +27260,7 @@ fn collect_top_type_names_loop(ds: [Decl], acc: [String]) : [String] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DType(_, name, _, _, _, _) -> collect_top_type_names_loop(rest, [name, ...acc])
+      DType(_, name, _, _, _, _, _) -> collect_top_type_names_loop(rest, [name, ...acc])
       _ -> collect_top_type_names_loop(rest, acc)
     }
   }
@@ -27332,7 +27341,7 @@ fn validate_union_collisions_loop(remaining: [Decl], top_names: [String],
   match remaining {
     [] -> errs
     [d, ...rest] -> match d {
-      DType(_, parent, _, body, line, col) -> match body {
+      DType(_, parent, _, body, line, col, _) -> match body {
         TBSum(vs) -> {
           let decl_file = resolve_decl_file(parent, file, mt)
           let r = check_variants_for_collision(vs, parent, line, col,
@@ -27509,18 +27518,18 @@ fn validate_type_name_collisions_loop(remaining: [Decl], file: String,
   match remaining {
     [] -> errs
     [d, ...rest] -> match d {
-      DType(_, name, _, _, line, col) ->
+      DType(_, name, _, _, line, col, _) ->
         validate_one_type_decl(rest, file, mt, prelude_mods, target_mod_name,
                                   claims, errs, name, line, col)
       DDerive(_, inner, _, _) -> match inner {
-        DType(_, name, _, _, line, col) ->
+        DType(_, name, _, _, line, col, _) ->
           validate_one_type_decl(rest, file, mt, prelude_mods, target_mod_name,
                                     claims, errs, name, line, col)
         _ -> validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
                                                    target_mod_name, claims, errs)
       }
       DUnstable(inner, _, _) -> match inner {
-        DType(_, name, _, _, line, col) ->
+        DType(_, name, _, _, line, col, _) ->
           validate_one_type_decl(rest, file, mt, prelude_mods, target_mod_name,
                                     claims, errs, name, line, col)
         _ -> validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
@@ -27554,20 +27563,25 @@ fn validate_one_type_decl(rest: [Decl], file: String, mt: [ModuleEntry],
       validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
                                             target_mod_name, claims, errs + 1)
     }
-    None -> match find_exporting_module(mt, name, target_mod_name) {
-      Some(prev_mod) -> {
-        let is_prelude = me_list_has_name(prelude_mods, prev_mod)
-        report_import_type_collision(file, name, line, col, prev_mod, is_prelude)
-        validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
-                                              target_mod_name,
-                                              [TNC(name, line, col), ...claims],
-                                              errs + 1)
-      }
-      None -> validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
-                                                    target_mod_name,
-                                                    [TNC(name, line, col), ...claims],
-                                                    errs)
-    }
+    # Hanga Roa: cross-module type-name "collision" with a core /
+    # prelude / imported module is NOT an error — it is shadowing,
+    # which every serious language with scoped identifiers permits.
+    # A user `type Pair = { fst: Int, snd: Int }` in their root file
+    # is welcome to coexist with `core.tuple.Pair[a, b]`: inside the
+    # user's archivo the local definition wins; the imported one
+    # stays reachable via qualified access (`tuple.Pair`). The cb4bd6b
+    # invariant ("one type name resolves to one definition") was an
+    # over-strict shortcut that traded language ergonomics for a
+    # simpler variant-table lookup — the correct fix lives in the
+    # typer's dispatch (key variants by (module, name) and resolve
+    # contextually by the scrutinee's type) and is tracked as a
+    # separate bug. Local duplicates inside the same file (the case
+    # `Some(prev)` above) remain an error — that ambiguity has no
+    # disambiguator.
+    None -> validate_type_name_collisions_loop(rest, file, mt, prelude_mods,
+                                                  target_mod_name,
+                                                  [TNC(name, line, col), ...claims],
+                                                  errs)
   }
   }
 }
@@ -28376,7 +28390,7 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # same-arity case (e.g. private `type SplitN = SplitOk
         # | SplitShort` in `stdlib/crypto/hash.kai` vs. a user
         # redeclaration of `type SplitN = ...`).
-        DType(_, dt_name, dt_tparams, _, _, _) -> {
+        DType(_, dt_name, dt_tparams, _, _, _, _) -> {
           let env1 = ty_env_add_decl_marker(env, dt_name, list_length(dt_tparams))
           let env2 = add_variants_of_decl(env1, d, top_names)
           EnvWithArities { env: env2, arities: ar_acc }
@@ -30083,8 +30097,14 @@ fn advance_unit_fresh(st: InferState, n: Int) : InferState {
 #
 # Collected once per program. Lookup is linear in the number of record
 # declarations, which is tiny in practice.
-
-type RecInfo = RI(String, [String], [FieldDecl])
+#
+# Hanga Roa: the trailing `Option[String]` is the module_origin
+# inherited from the `DType` declaration. None means the type was
+# authored in the root file; Some(m) means it came from module `m`
+# (core, an imported module, or the user's auto-loaded set). The
+# typer's `rec_find` consults this to disambiguate same-name records
+# per-module — see `rec_find_in_scope`.
+type RecInfo = RI(String, [String], [FieldDecl], Option[String])
 
 # Issue #648 — arity-aware record lookup. Two layers, mirroring the
 # variant-side `variants_of_type_loop_arity` (issue #643):
@@ -30115,7 +30135,7 @@ fn rec_find_arity_loop(rs: [RecInfo], target: String, arity: Int,
   match rs {
     [] -> fallback
     [r, ...rest] -> match r {
-      RI(nm, tps, _) ->
+      RI(nm, tps, _, _) ->
         if nm == target {
           if arity < 0 {
             Some(r)
@@ -30137,6 +30157,52 @@ fn rec_find_arity_loop(rs: [RecInfo], target: String, arity: Int,
 
 fn rec_find_arity(rs: [RecInfo], target: String, arity: Int) : Option[RecInfo] =
   rec_find_arity_loop(rs, target, arity, None)
+
+# Hanga Roa: reorder a `[RecInfo]` so the records visible to a decl
+# from module `home_mod` resolve correctly under `rec_find`. Three
+# buckets, visited in this order:
+#
+#   1. home: records whose module_origin matches `home_mod` — the
+#      enclosing decl's own home wins for self-references.
+#   2. other_mods: records authored in any OTHER non-root module.
+#      Within a non-root home (e.g. typing `core/list.kai`), these
+#      cross-module records (e.g. `tuple.Pair`) outrank a same-name
+#      user redeclaration. Pre-Hanga-Roa the user's redecl could
+#      contaminate prelude-internal lookups.
+#   3. root: records whose module_origin is None (the user's root
+#      file). For a non-root home these go last so they cannot shadow
+#      the same-name prelude record under `rec_find`. For
+#      `home_mod = None` (the root) every record is in this bucket
+#      and the original newest-first order is preserved so the
+#      user's redecl wins over the same-name prelude record — the
+#      shadowing semantics user code expects.
+fn rerank_recs_for(rs: [RecInfo], home_mod: Option[String]) : [RecInfo] =
+  match home_mod {
+    None    -> rs  # root file: newest-first list already prefers user redecls
+    Some(_) -> rerank_recs_loop(rs, home_mod, [], [], [])
+  }
+
+fn rerank_recs_loop(rs: [RecInfo], hm: Option[String],
+                       home: [RecInfo], other_mods: [RecInfo],
+                       root: [RecInfo]) : [RecInfo] =
+  match rs {
+    [] -> list_append(list_reverse(home),
+            list_append(list_reverse(other_mods), list_reverse(root)))
+    [r, ...rs2] -> match r {
+      RI(_, _, _, mo) ->
+        if option_str_eq(mo, hm) {
+          rerank_recs_loop(rs2, hm, [r, ...home], other_mods, root)
+        } else { match mo {
+          None    -> rerank_recs_loop(rs2, hm, home, other_mods, [r, ...root])
+          Some(_) -> rerank_recs_loop(rs2, hm, home, [r, ...other_mods], root)
+        } }
+    }
+  }
+
+fn option_str_eq(a: Option[String], b: Option[String]) : Bool = match a {
+  None    -> match b { None -> true Some(_) -> false }
+  Some(x) -> match b { None -> false Some(y) -> x == y }
+}
 
 fn rec_find_loop(rs: [RecInfo], target: String) : Option[RecInfo] =
   rec_find_arity_loop(rs, target, -1, None)
@@ -30165,7 +30231,7 @@ fn rec_find_with_field_loop(rs: [RecInfo], target: String, arity: Int,
       None    -> by_arity
     }
     [r, ...rest] -> match r {
-      RI(nm, tps, fs) ->
+      RI(nm, tps, fs, _) ->
         if nm == target {
           let arity_ok = arity < 0 or list_length(tps) == arity
           if arity_ok {
@@ -30222,8 +30288,8 @@ fn collect_records_loop(ds: [Decl], acc: [RecInfo]) : [RecInfo] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DType(_, nm, tps, body, _, _) -> match body {
-        TBRecord(fs) -> collect_records_loop(rest, [RI(nm, tps, fs), ...acc])
+      DType(_, nm, tps, body, _, _, mo) -> match body {
+        TBRecord(fs) -> collect_records_loop(rest, [RI(nm, tps, fs, mo), ...acc])
         _ -> collect_records_loop(rest, acc)
       }
       _ -> collect_records_loop(rest, acc)
@@ -30240,25 +30306,50 @@ fn collect_records(ds: [Decl]) : [RecInfo] = collect_records_loop(ds, [])
 # `TyName("Boxed", [])`. SumInfo records (type name, tparams,
 # variants) per `DType ... TBSum`, threaded through `infer_program`
 # the same way `RecInfo` is.
-type SumInfo = SI(String, [String], [Variant])
+type SumInfo = SI(String, [String], [Variant], Option[String])
+              # name, tparams, variants, module_origin (None = root file)
 
 fn sum_find_loop(ss: [SumInfo], target: String) : Option[SumInfo] {
   match ss {
     [] -> None
     [s, ...rest] -> match s {
-      SI(nm, _, _) -> if nm == target { Some(s) } else { sum_find_loop(rest, target) }
+      SI(nm, _, _, _) -> if nm == target { Some(s) } else { sum_find_loop(rest, target) }
     }
   }
 }
 
 fn sum_find(ss: [SumInfo], target: String) : Option[SumInfo] = sum_find_loop(ss, target)
 
+# Hanga Roa: SumInfo analog of `rerank_recs_for` (3-bucket scheme).
+fn rerank_sums_for(ss: [SumInfo], home_mod: Option[String]) : [SumInfo] =
+  match home_mod {
+    None    -> ss
+    Some(_) -> rerank_sums_loop(ss, home_mod, [], [], [])
+  }
+
+fn rerank_sums_loop(ss: [SumInfo], hm: Option[String],
+                       home: [SumInfo], other_mods: [SumInfo],
+                       root: [SumInfo]) : [SumInfo] =
+  match ss {
+    [] -> list_append(list_reverse(home),
+            list_append(list_reverse(other_mods), list_reverse(root)))
+    [s, ...ss2] -> match s {
+      SI(_, _, _, mo) ->
+        if option_str_eq(mo, hm) {
+          rerank_sums_loop(ss2, hm, [s, ...home], other_mods, root)
+        } else { match mo {
+          None    -> rerank_sums_loop(ss2, hm, home, other_mods, [s, ...root])
+          Some(_) -> rerank_sums_loop(ss2, hm, home, [s, ...other_mods], root)
+        } }
+    }
+  }
+
 fn collect_sums_loop(ds: [Decl], acc: [SumInfo]) : [SumInfo] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DType(_, nm, tps, body, _, _) -> match body {
-        TBSum(vs) -> collect_sums_loop(rest, [SI(nm, tps, vs), ...acc])
+      DType(_, nm, tps, body, _, _, mo) -> match body {
+        TBSum(vs) -> collect_sums_loop(rest, [SI(nm, tps, vs, mo), ...acc])
         _ -> collect_sums_loop(rest, acc)
       }
       _ -> collect_sums_loop(rest, acc)
@@ -30278,7 +30369,13 @@ fn collect_sums(ds: [Decl]) : [SumInfo] = collect_sums_loop(ds, [])
 # `Show for Real<u>` cannot be specialised per concrete unit, since
 # the scheme has zero type-vars and the parametric body's
 # `unit_name(x)` reads the impl-level uvar baked into `Expr.ty`.
-type CallSite = CS(String, Int, Int, [Int], [Int])  # name, line, col, fresh ty ids, fresh unit ids
+# `mo` is the module_origin of the enclosing DFn (None = root file,
+# Some(mod) = imported or auto-loaded module). Hanga Roa: with core
+# auto-loaded into every program, downstream consumers of CallSite
+# (notably `--dump-mono` and the test runner) need to distinguish
+# call-sites authored in the user's root file from those that come
+# through core or other modules.
+type CallSite = CS(String, Int, Int, [Int], [Int], Option[String])  # name, line, col, fresh ty ids, fresh unit ids, module_origin
 
 # A typed hole site: the kind discriminator (m7d §1 splits `?` /
 # `?name` from `todo!(msg)`), source position, the fresh TyVarT id
@@ -31392,7 +31489,7 @@ fn fresh_tv_range(start: Int, n: Int) : [Ty] = fresh_tv_range_loop(start, n, 0, 
 
 fn rec_instantiate(st: InferState, ri: RecInfo) : RecInst {
   match ri {
-    RI(nm, tps, fs) -> {
+    RI(nm, tps, fs, _) -> {
       let start = st.env.fresh
       let n = list_length(tps)
       let env2 = advance_fresh(st.env, n)
@@ -31468,7 +31565,7 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File {
         let st2 = if r.fresh == [] and r.unit_fresh == [] {
           r.st
         } else {
-          st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh, r.unit_fresh))
+          st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh, r.unit_fresh, None))
         }
         inferred_leaf(st2, r.ty, e)
       }
@@ -31537,7 +31634,7 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File {
           let st2 = if r.fresh == [] and r.unit_fresh == [] {
             r.st
           } else {
-            st_push_inst(r.st, CS(fname, e.line, e.col, r.fresh, r.unit_fresh))
+            st_push_inst(r.st, CS(fname, e.line, e.col, r.fresh, r.unit_fresh, None))
           }
           inferred_leaf(st2, r.ty, e)
         }
@@ -32383,7 +32480,7 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                 let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
                   pick.st
                 } else {
-                  st_push_inst(pick.st, CS(nm, line, col, pick.fresh, pick.unit_fresh))
+                  st_push_inst(pick.st, CS(nm, line, col, pick.fresh, pick.unit_fresh, None))
                 }
                 let ra_rest = synth_many(st_inst, rest_args)
                 let all_arg_tys = [first_ty, ...ra_rest.tys]
@@ -32898,7 +32995,7 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
       let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
         inst_st
       } else {
-        st_push_inst(inst_st, CS(ident, line, col, pick.fresh, pick.unit_fresh))
+        st_push_inst(inst_st, CS(ident, line, col, pick.fresh, pick.unit_fresh, None))
       }
       match inst_ty {
         TyFnT(params, _, _) -> match params {
@@ -33856,7 +33953,7 @@ fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Infer
                 let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
                   pick.st
                 } else {
-                  st_push_inst(pick.st, CS(nm, f.line, f.col, pick.fresh, pick.unit_fresh))
+                  st_push_inst(pick.st, CS(nm, f.line, f.col, pick.fresh, pick.unit_fresh, None))
                 }
                 let callee_node = with_ty(mk_expr(EModCall(pick.mod, nm), f.line, f.col), pick.inst_ty)
                 mk_inferred(st_inst, pick.inst_ty, callee_node)
@@ -34055,7 +34152,7 @@ fn collect_pub_type_names(ds: [Decl], acc: [String]) : [String] {
 }
 
 fn collect_pub_type_name_one(d: Decl, acc: [String]) : [String] = match d {
-  DType(true, name, _, _, _, _) ->
+  DType(true, name, _, _, _, _, _) ->
     if list_has(acc, name) { acc } else { [name, ...acc] }
   DDerive(_, inner, _, _) -> collect_pub_type_name_one(inner, acc)
   DUnstable(inner, _, _) -> collect_pub_type_name_one(inner, acc)
@@ -37654,7 +37751,9 @@ fn print_inferred_fn(nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col:
 # (m4c Phase 3) — used to differentiate impl `Show for Real<u>`
 # specialisations that share an empty type tuple but bind `u` to
 # distinct concrete units (USD vs EUR vs `m^2` ...).
-type ResolvedCS = RCS(String, Int, Int, [Ty], [UnitExprT])  # name, line, col, concrete tys, concrete units
+# `mo` propagates from the originating CallSite — see CallSite's
+# Hanga Roa note for why downstream consumers need it.
+type ResolvedCS = RCS(String, Int, Int, [Ty], [UnitExprT], Option[String])  # name, line, col, concrete tys, concrete units, module_origin
 
 fn resolve_callsite_tys(ids: [Int], sub: Subst) : [Ty] {
   match ids {
@@ -37670,13 +37769,18 @@ fn resolve_callsite_units(ids: [Int], sub: Subst) : [UnitExprT] {
   }
 }
 
-fn resolve_callsites(css: [CallSite], sub: Subst) : [ResolvedCS] {
+fn resolve_callsites(css: [CallSite], sub: Subst, mo: Option[String]) : [ResolvedCS] {
   match css {
     [] -> []
     [cs, ...rest] -> match cs {
-      CS(nm, line, col, ids, uids) ->
+      # The mo parameter overrides the mo carried on the CS itself.
+      # `infer_decl` walks all CS produced inside one DFn body, so
+      # tagging them with the enclosing DFn's `module_origin` is
+      # correct and avoids threading home_mod through every
+      # InferState constructor (28 of them).
+      CS(nm, line, col, ids, uids, _) ->
         [RCS(nm, line, col, resolve_callsite_tys(ids, sub),
-             resolve_callsite_units(uids, sub)), ...resolve_callsites(rest, sub)]
+             resolve_callsite_units(uids, sub), mo), ...resolve_callsites(rest, sub, mo)]
     }
   }
 }
@@ -37908,7 +38012,16 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       let implicit = collect_implicit_tparams_in_decl(d, tparams)
       let effective_tparams = list_append(tparams, implicit)
       let tpbinds = mk_tpbinds(effective_tparams)
-      let st_init0 = infer_state_new_full_aliases(file, env, prelude_len, recs,
+      # Hanga Roa: reorder `recs` so the records authored in this
+      # decl's home module visit first under `rec_find`. Without
+      # this, a `core/tuple.kai` body that constructs `Pair { ... }`
+      # would resolve to a user-redeclared `Pair` from the root
+      # file (which sits newest-first in the unranked list) and the
+      # types would mismatch downstream. None means root file —
+      # rerank_recs_for is a no-op there since the user's records
+      # are already newest-first by construction.
+      let local_recs = rerank_recs_for(recs, mo)
+      let st_init0 = infer_state_new_full_aliases(file, env, prelude_len, local_recs,
                                                     op_eff_arities, type_aliases, op_to_eff)
       # Issue #180: install the protocol impl table snapshot so
       # `synth_binop` can decide whether a (prim, nonprim) /
@@ -37999,7 +38112,8 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # the type-annotation line. Internal stdlib helpers
       # (spawn.spawn, etc.) are exempt by file-path because they are
       # the legitimate constructors of Fiber[T] values.
-      let st1b = check_no_fiber_escape(st1, file, nm, opt_ret, sums, line, col)
+      let local_sums = rerank_sums_for(sums, mo)
+      let st1b = check_no_fiber_escape(st1, file, nm, opt_ret, local_sums, line, col)
       # issue #251 + #252 — Mutable masking. Drop `Mutable` from the
       # inferred row when every `array_set` / `array_grow` demand
       # the body raised targets a locally-constructed Array that
@@ -38011,7 +38125,12 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
       } else { () }
-      let resolved0 = resolve_callsites(list_reverse(st2.insts), st2.sub)
+      # Hanga Roa: tag every call-site instance with the enclosing
+      # DFn's module_origin so downstream consumers (`--dump-mono`,
+      # the m4c monomorphiser, the test runner) can distinguish
+      # instances authored in the user's root file from those that
+      # come through core or other modules.
+      let resolved0 = resolve_callsites(list_reverse(st2.insts), st2.sub, mo)
       let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub)
       # m12.8.x phase 2 (Bug 2): apply the final substitution to every
       # `Expr.ty` annotation in the body so the post-inference protocol-
@@ -38256,7 +38375,7 @@ fn ty_expr_find_handle(hname: String, t: TypeExpr,
               match sum_find(sums, name) {
                 None -> None
                 Some(si) -> match si {
-                  SI(sname, tps, vs) -> {
+                  SI(sname, tps, vs, _) -> {
                     let mapping = build_tparam_mapping(tps, tas)
                     variants_find_handle(hname, vs, mapping, sums,
                                           [sname, ...visited], sname)
@@ -38833,8 +38952,8 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
           row,
           expand_aliases_expr(body, aliases),
           l, c, mo)
-    DType(p, n, tps, body, l, c) ->
-      DType(p, n, tps, expand_aliases_typebody(body, aliases), l, c)
+    DType(p, n, tps, body, l, c, _) ->
+      DType(p, n, tps, expand_aliases_typebody(body, aliases), l, c, None)
     DTest(desc, body, l, c) -> DTest(desc, expand_aliases_expr(body, aliases), l, c)
     DBench(desc, body, l, c) -> DBench(desc, expand_aliases_expr(body, aliases), l, c)
     DCheck(desc, ps, body, l, c) -> DCheck(desc, ps, expand_aliases_expr(body, aliases), l, c)
@@ -39659,9 +39778,18 @@ fn dump_typed_stmt(s: Stmt, depth: Int) : Unit / Console {
 
 fn dump_typed_decl(d: Decl) : Unit / Console {
   match d {
-    DFn(_, nm, _, _, _, _, body, line, col, _) -> {
-      print("fn #{nm} @#{int_to_string(line)}:#{int_to_string(col)}")
-      dump_typed_expr(body, 1)
+    # Hanga Roa: with core auto-loaded, `all_decls` carries both the
+    # root file and the entire core set. Only dump decls authored in
+    # the root file (module_origin = None); core / imported modules
+    # have `Some(mod)`. This keeps the --dump-typed output focused on
+    # what the user actually wrote — the same scope the legacy
+    # behaviour gave before core became implicit.
+    DFn(_, nm, _, _, _, _, body, line, col, mo) -> match mo {
+      None -> {
+        print("fn #{nm} @#{int_to_string(line)}:#{int_to_string(col)}")
+        dump_typed_expr(body, 1)
+      }
+      Some(_) -> ()
     }
     _ -> ()
   }
@@ -39694,9 +39822,24 @@ fn dump_typed_loop(ds: [Decl]) : Unit / Console {
 
 fn dump_mono_line(cs: ResolvedCS) : Unit / Console {
   match cs {
-    RCS(nm, line, col, tys, _) -> {
+    RCS(nm, line, col, tys, _, _) -> {
       let tys_str = join_with(ty_string_list(tys), ", ")
       print("#{nm}@#{int_to_string(line)}:#{int_to_string(col)}  [#{tys_str}]")
+    }
+  }
+}
+
+# Drop every instance whose enclosing decl was authored outside the
+# root file (i.e. came in through core or an imported module). Used
+# by --dump-mono / --dump-mono-out so the diagnostic surface only
+# reflects what the user's program contributes, mirroring the legacy
+# behaviour before core became implicit.
+fn root_only_insts(insts: [ResolvedCS]) : [ResolvedCS] = match insts {
+  [] -> []
+  [cs, ...rest] -> match cs {
+    RCS(_, _, _, _, _, mo) -> match mo {
+      None    -> [cs, ...root_only_insts(rest)]
+      Some(_) -> root_only_insts(rest)
     }
   }
 }
@@ -39705,7 +39848,7 @@ fn dump_mono(file: String, decls: [Decl]) : Int / Console + File {
 
 
   let r = infer_program(file, decls, false)
-  r.insts |> each(dump_mono_line)
+  root_only_insts(r.insts) |> each(dump_mono_line)
   r.errs
 }
 
@@ -39719,7 +39862,7 @@ fn dump_mono(file: String, decls: [Decl]) : Int / Console + File {
 
 fn dump_mono_out_line(cs: ResolvedCS) : Unit / Console {
   match cs {
-    RCS(nm, line, col, tys, units) -> {
+    RCS(nm, line, col, tys, units, _) -> {
       let tys_str = join_with(ty_string_list(tys), ", ")
       let mname = mangle_name(nm, tys, units)
       print("#{nm}@#{int_to_string(line)}:#{int_to_string(col)}  [#{tys_str}]  ->  #{mname}")
@@ -39731,7 +39874,7 @@ fn dump_mono_out(file: String, decls: [Decl]) : Int / Console + File {
 
 
   let r = infer_program(file, decls, false)
-  r.insts |> each(dump_mono_out_line)
+  root_only_insts(r.insts) |> each(dump_mono_out_line)
   r.errs
 }
 
@@ -40234,7 +40377,7 @@ fn synthesize_inst_for_decl(d: Decl, args_: [Expr], line: Int, col: Int) : Optio
                               SubstBindings { tvars: [], uvars: [] })
             let tys = collect_subst_tys(split.tvars, bindings.tvars)
             let units = collect_subst_units(split.uvars, bindings.uvars)
-            Some(RCS(name, line, col, tys, units))
+            Some(RCS(name, line, col, tys, units, None))
           }
           _ -> None
         }
@@ -40451,7 +40594,7 @@ fn collect_distinct_tuples(insts: [ResolvedCS], polys: [PolyFn],
   match insts {
     [] -> list_reverse(acc)
     [cs, ...rest] -> match cs {
-      RCS(name, _, _, tys, units) -> {
+      RCS(name, _, _, tys, units, _) -> {
         let is_poly = match lookup_poly_fn(polys, name) {
           Some(_) -> true None -> false
         }
@@ -41058,7 +41201,7 @@ fn resolve_call_inst(insts: [ResolvedCS], polys: [PolyFn], name: String,
     None -> match lookup_poly_fn(polys, name) {
       Some(d) -> match synthesize_inst_for_decl(d, args_, callee.line, callee.col) {
         Some(rcs) -> match rcs {
-          RCS(_, _, _, tys0, units0) -> {
+          RCS(_, _, _, tys0, units0, _) -> {
             let tys = map(tys0, (t) => subst_ty(t, sm))
             let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
             Some(MIPair(tys, units))
@@ -41155,7 +41298,7 @@ fn find_mono_inst(insts: [ResolvedCS], name: String,
   match insts {
     [] -> None
     [r, ...rest] -> match r {
-      RCS(rn, rl, rc, tys, units) ->
+      RCS(rn, rl, rc, tys, units, _) ->
         if rn == name and rl == line and rc == col {
           Some(MIPair(tys, units))
         } else {
@@ -50680,7 +50823,7 @@ fn collect_pub_exports(decls: [Decl], acc: [String]) : [String] {
         # type name AND every variant constructor — `mod.A` /
         # `mod.B` qualified expressions / patterns rely on the ctor
         # names being looked up in the module table.
-        DType(true, name, _, body, _, _) -> match body {
+        DType(true, name, _, body, _, _, _) -> match body {
           TBSum(vs) -> collect_variant_names(vs, [name, ...acc])
           _ -> [name, ...acc]
         }
@@ -50732,7 +50875,7 @@ fn collect_unstable_exports(decls: [Decl], acc: [String]) : [String] {
 # `#unstable pub type T = A | B` marks `T`, `A`, and `B` as unstable.
 fn collect_pub_names_for_unstable(d: Decl, acc: [String]) : [String] = match d {
   DFn(true, name, _, _, _, _, _, _, _, _) -> [name, ...acc]
-  DType(true, name, _, body, _, _) -> match body {
+  DType(true, name, _, body, _, _, _) -> match body {
     TBSum(vs) -> collect_variant_names(vs, [name, ...acc])
     _ -> [name, ...acc]
   }
@@ -51557,8 +51700,8 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
         match ret_opt { None -> None Some(te) -> Some(qualtype_te(te, mt, file)) },
         qualtype_row(row, mt, file),
         qualtype_expr(body, mt, file), l, c, mo)
-  DType(p, n, tps, body, l, c) ->
-    DType(p, n, tps, qualtype_body(body, mt, file), l, c)
+  DType(p, n, tps, body, l, c, _) ->
+    DType(p, n, tps, qualtype_body(body, mt, file), l, c, None)
   DEffect(p, n, tps, ops, defblk, l, c) ->
     DEffect(p, n, tps, qualtype_eops(ops, mt, file), defblk, l, c)
   DProtocol(p, n, tps, ops, l, c) ->
@@ -51696,7 +51839,7 @@ fn qtchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
     qtchk_params(ps, mt) +
     (match ret_opt { None -> 0 Some(te) -> qtchk_te(te, mt) }) +
     qtchk_row(row, mt)
-  DType(_, _, _, body, _, _) -> qtchk_body(body, mt)
+  DType(_, _, _, body, _, _, _) -> qtchk_body(body, mt)
   DEffect(_, _, _, ops, _, _, _) -> qtchk_eops(ops, mt)
   DProtocol(_, _, _, ops, _, _) -> qtchk_pops(ops, mt)
   DImpl(_, proto_args, ty, sub_decls, _, _) ->
@@ -52610,7 +52753,7 @@ fn priv_one(d: Decl, home_mod: String, acc: [PubAccessEntry]) : [PubAccessEntry]
       [PAE(name, home_mod, is_pub), ...acc]
     DConst(is_pub, name, _, _, _, _) ->
       [PAE(name, home_mod, is_pub), ...acc]
-    DType(is_pub, name, _, body, _, _) ->
+    DType(is_pub, name, _, body, _, _, _) ->
       pae_with_variants(name, body, home_mod, is_pub, acc)
     DEffect(is_pub, name, _, _, _, _, _) ->
       [PAE(name, home_mod, is_pub), ...acc]
@@ -53410,7 +53553,7 @@ fn collect_local_type_names(ds: [Decl], acc: [String]) : [String] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DType(_, name, _, _, _, _) -> collect_local_type_names(rest, [name, ...acc])
+      DType(_, name, _, _, _, _, _) -> collect_local_type_names(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
       _ -> collect_local_type_names(rest, acc)
@@ -54023,7 +54166,7 @@ fn collect_future_impl_keys(ds: [Decl], acc: [String]) : [String] {
           [concat_all([pname, "/", proto_type_name(target)]), ...acc])
       DDerive(names, inner, _, _) -> {
         let acc1 = match inner {
-          DType(_, tname, _, _, _, _) -> add_future_impl_keys(names, tname, acc)
+          DType(_, tname, _, _, _, _, _) -> add_future_impl_keys(names, tname, acc)
           _ -> acc
         }
         collect_future_impl_keys(rest, acc1)
@@ -54080,7 +54223,7 @@ fn validate_derive_decl(names: [String], inner: Decl, file: String,
                          errs: Int) : Int / Console {
 
   match inner {
-    DType(_, tname, _, body, _, _) -> match body {
+    DType(_, tname, _, body, _, _, _) -> match body {
       TBSum(variants) -> validate_derive_sum_protos(names, tname, variants,
                                                      file, future_impls,
                                                      dline, dcol, errs)
@@ -54201,7 +54344,7 @@ fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
 # by the typer / resolver after lowering.
 fn derive_impls_for(names: [String], dt: Decl) : [Decl] {
   match dt {
-    DType(_, tname, _, body, line, col) ->
+    DType(_, tname, _, body, line, col, _) ->
       derive_impls_loop(names, tname, body, line, col, [])
     _ -> []
   }
@@ -55444,7 +55587,7 @@ fn collect_binser_providers(decls: [Decl], acc: [String]) : [String] {
           collect_binser_providers(rest, acc)
         }
       DDerive(names, inner, _, _) -> match inner {
-        DType(_, tname, _, _, _, _) ->
+        DType(_, tname, _, _, _, _, _) ->
           if list_has(names, "BinSerialize") {
             collect_binser_providers(rest, [tname, ...acc])
           } else {
@@ -55466,7 +55609,7 @@ fn validate_derive_binser_loop(decls: [Decl], file: String,
     [] -> errs
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
-        DType(_, tname, _, body, line, col) ->
+        DType(_, tname, _, body, line, col, _) ->
           if list_has(names, "BinSerialize") {
             let errs1 = validate_derive_binser_body(file, tname, body,
                                                      providers, line, col, errs)
@@ -55656,7 +55799,7 @@ fn collect_ord_providers(decls: [Decl], acc: [String]) : [String] {
           collect_ord_providers(rest, acc)
         }
       DDerive(names, inner, _, _) -> match inner {
-        DType(_, tname, _, _, _, _) ->
+        DType(_, tname, _, _, _, _, _) ->
           if list_has(names, "Ord") {
             collect_ord_providers(rest, [tname, ...acc])
           } else {
@@ -55678,7 +55821,7 @@ fn validate_derive_ord_loop(decls: [Decl], file: String,
     [] -> errs
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
-        DType(_, tname, _, body, line, col) ->
+        DType(_, tname, _, body, line, col, _) ->
           if list_has(names, "Ord") {
             let errs1 = validate_derive_ord_body(file, tname, body, providers,
                                                   line, col, errs)
@@ -57668,7 +57811,7 @@ fn decls_trailing_limit(d: Decl, rest: [Decl]) : Int {
 fn decl_line(d: Decl) : Int {
   match d {
     DFn(_, _, _, _, _, _, _, line, _, _) -> line
-    DType(_, _, _, _, line, _) -> line
+    DType(_, _, _, _, line, _, _) -> line
     DTest(_, _, line, _) -> line
     DBench(_, _, line, _) -> line
     DCheck(_, _, _, line, _) -> line
@@ -57701,7 +57844,7 @@ fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
         fmt_fn(is_pub, name, tparams, params, ret, row, body, s)
       }
     }
-    DType(is_pub, name, tparams, body, line, _) -> {
+    DType(is_pub, name, tparams, body, line, _, _) -> {
       if not list_is_empty(tparams) {
         fmt_panic_unsupported("generic types", line)
       } else {
@@ -59214,6 +59357,14 @@ fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
   DImpl(name, proto_args, target, sub_decls, l, c) ->
     DImpl(name, proto_args, target,
           tag_decls_module_origin(sub_decls, mod), l, c)
+  # Hanga Roa: tag `DType` with its module_origin too. Without this,
+  # the typer cannot tell whether a `type Pair = ...` came from
+  # `core/tuple.kai` or the user's root file, and same-name records
+  # collapse into a single (last-loaded-wins) entry — breaking
+  # shadowing in either direction. The typer's record / sum / union
+  # tables read `module_origin` to disambiguate.
+  DType(p, n, tps, body, l, c, _) ->
+    DType(p, n, tps, body, l, c, Some(mod))
   _ -> d
 }
 
@@ -59325,6 +59476,20 @@ fn tag_target_decl(d: Decl, mod: String) : Decl = match d {
   # `kai_<mod>__<name>` form.
   DAxiom(p, _, _, _, _, _, _, _, _, _) ->
     if p { tag_decl_module_origin(d, mod) } else { d }
+  # Hanga Roa: the root file's own DTypes need a module_origin too so
+  # the typer's per-module record / sum / union resolution treats
+  # root-file definitions as belonging to a named scope (the file's
+  # basename), not the unscoped "global". Without this, a user
+  # `type Pair = ...` ends up with `module_origin = None` and the
+  # disambiguation falls back to "newest wins" — exactly the legacy
+  # bug. We tag every root-file DType (pub or not), since `pub`
+  # gates cross-module export, not whether the type has an identity
+  # of its own.
+  DType(p, n, tps, body, l, c, mo) ->
+    match mo {
+      Some(_) -> d
+      None    -> DType(p, n, tps, body, l, c, Some(mod))
+    }
   _ -> d
 }
 
@@ -59717,7 +59882,7 @@ fn builtin_effect_names() : [String] =
 # explicitly, or rely on the bare `print` / `eprint` / `read_line`
 # sugar prelude that routes to the right atomic effect automatically.
 fn builtin_console_decl() : Decl =
-  DType(false, "Console", [], TBEffectAlias(["Stdout", "Stderr", "Stdin"]), 0, 0)
+  DType(false, "Console", [], TBEffectAlias(["Stdout", "Stderr", "Stdin"]), 0, 0, None)
 
 # Issue #558 — generic builder: assemble a default { } block for a
 # builtin effect from its declared ops list. Each clause body is
@@ -59924,7 +60089,7 @@ fn builtin_nettcp_decl() : Decl =
 # "fd" in lockstep with stage0/runtime.h's `_kai_net_make_conn`.
 fn builtin_conn_decl() : Decl =
   DType(false, "Conn", [],
-    TBRecord([FD("fd", ty_name_zero("Int"))]), 0, 0)
+    TBRecord([FD("fd", ty_name_zero("Int"))]), 0, 0, None)
 
 # net-tcp-v1: opaque listener handle. Two slots — `fd` for the
 # socket descriptor (same contract as Conn), `port` for the
@@ -59935,7 +60100,7 @@ fn builtin_conn_decl() : Decl =
 fn builtin_listener_decl() : Decl =
   DType(false, "Listener", [],
     TBRecord([FD("fd",   ty_name_zero("Int")),
-              FD("port", ty_name_zero("Int"))]), 0, 0)
+              FD("port", ty_name_zero("Int"))]), 0, 0, None)
 
 # Issue #107: Signal effect — POSIX SIGINT/SIGTERM/SIGHUP/SIGUSR1/
 # SIGUSR2 trap for graceful shutdown. Spec: docs/effects-stdlib.md
@@ -59965,7 +60130,7 @@ fn builtin_sig_decl() : Decl =
            Var("SigTerm", []),
            Var("SigHup",  []),
            Var("SigUsr1", []),
-           Var("SigUsr2", [])]), 0, 0)
+           Var("SigUsr2", [])]), 0, 0, None)
 
 # Issue #126: Process effect — POSIX subprocess primitives. Spec:
 # docs/effects-stdlib.md §`Process`. Four ops in v1 (start / wait /
@@ -60024,7 +60189,7 @@ fn builtin_process_decl() : Decl =
 # issue #126 §*Lane scope DO NOT*).
 fn builtin_child_decl() : Decl =
   DType(false, "Child", [],
-    TBRecord([FD("pid", ty_name_zero("Int"))]), 0, 0)
+    TBRecord([FD("pid", ty_name_zero("Int"))]), 0, 0, None)
 
 # Issue #126: Exit sum type — closed two-variant catalog matching
 # POSIX wait-status decoding. The runtime's
@@ -60034,7 +60199,7 @@ fn builtin_child_decl() : Decl =
 fn builtin_exit_decl() : Decl =
   DType(false, "Exit", [],
     TBSum([Var("Exited",   [ty_name_zero("Int")]),
-           Var("Signaled", [ty_name_zero("Int")])]), 0, 0)
+           Var("Signaled", [ty_name_zero("Int")])]), 0, 0, None)
 
 # Issue #141: Log effect — Tier S2 #7 of `docs/stdlib-roadmap.md`.
 # Four leveled ops; the runtime default handler writes to stderr in
@@ -60571,7 +60736,7 @@ fn find_enc_decl(d: Decl, ql: Int, qc: Int, acc: Option[EncResult]) : Option[Enc
       let a2 = find_enc_params(params, ql, qc, a1)
       find_enc_expr(body, ql, qc, a2)
     }
-    DType(_, _, _, _, line, col) -> enc_better(acc, line, col, "DType", None, ql, qc)
+    DType(_, _, _, _, line, col, _) -> enc_better(acc, line, col, "DType", None, ql, qc)
     DImport(_, line, col)        -> enc_better(acc, line, col, "DImport", None, ql, qc)
     DEffect(_, _, _, _, _, line, col) -> enc_better(acc, line, col, "DEffect", None, ql, qc)
     DProtocol(_, _, _, _, line, col) -> enc_better(acc, line, col, "DProtocol", None, ql, qc)
@@ -61330,7 +61495,7 @@ fn find_decl_def(ds: [Decl], name: String) : Option[DefLoc] {
         if n == name { Some(DL("DFn", n, line, col)) } else { find_decl_def(rest, name) }
       DConst(_, n, _, _, line, col) ->
         if n == name { Some(DL("DConst", n, line, col)) } else { find_decl_def(rest, name) }
-      DType(_, n, _, _, line, col) ->
+      DType(_, n, _, _, line, col, _) ->
         if n == name { Some(DL("DType", n, line, col)) } else { find_decl_def(rest, name) }
       DEffect(_, n, _, _, _, line, col) ->
         if n == name { Some(DL("DEffect", n, line, col)) } else { find_decl_def(rest, name) }
@@ -64714,7 +64879,7 @@ fn cache_decl_to_hex(d: Decl) : String = match d {
     cache_int_to_hex(l), cache_int_to_hex(c),
     cache_opt_string_to_hex(omo)
   ])
-  DType(is_pub, name, tps, body, l, c) -> concat_all([
+  DType(is_pub, name, tps, body, l, c, _) -> concat_all([
     cache_byte_to_hex(2), cache_bool_to_hex(is_pub), cache_string_to_hex(name),
     cache_string_list_to_hex(tps), cache_tb_to_hex(body),
     cache_int_to_hex(l), cache_int_to_hex(c)
@@ -64936,7 +65101,7 @@ fn cache_hex_to_dtype(buf: String, pos: Int) : Option[CacheDeclPos] {
                       match cache_hex_to_int(buf, p5) {
                         None -> None
                         Some(cc) -> match cc { CIP(cn, p6) ->
-                          Some(CDP(DType(is_pub, name, tps, body, ln, cn), p6))
+                          Some(CDP(DType(is_pub, name, tps, body, ln, cn, _), p6))
                         }
                       }
                     }
@@ -65557,11 +65722,11 @@ fn cache_roundtrip_self_test() : String {
   let decls = [
     DType(true, "Color", [],
           TBSum([Var("Red", []), Var("Green", []), Var("Blue", [])]),
-          1, 1),
+          1, 1, None),
     DType(true, "Pair", ["T"],
           TBRecord([FD("fst", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 }),
                     FD("snd", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 })]),
-          2, 1),
+          2, 1, None),
     DFn(true, "answer", [], [], Some(int_ty), row, body, 3, 1, None),
     DConst(true, "PI",
             TypeExpr { tkind: TyName("Real", []), line: 4, col: 1 },
