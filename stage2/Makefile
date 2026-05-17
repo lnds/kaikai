@@ -117,9 +117,14 @@ test-dump-mono: $(TARGET) build
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) --dump-mono $$f > build/s2-$$name.mono 2> build/s2-$$name.mono.err; \
-	  if grep -Eq '\?t[0-9]+' build/s2-$$name.mono; then \
+	  : '#645 introduced phantom row vars on pure named fns, so call-sites'; \
+	  : 'into row-poly callbacks (filter, map, each, ...) legitimately'; \
+	  : 'leave the trailing row slot as `?tN` until m4c specialises.'; \
+	  : 'Reject only when a `?tN` appears as a TYPE var (any slot but'; \
+	  : 'the last of the type-arg list), not as the trailing row var.'; \
+	  if grep -Eq '\?t[0-9]+, ' build/s2-$$name.mono; then \
 	    echo "dump-mono FAIL $$name (unresolved type vars)"; \
-	    grep -E '\?t[0-9]+' build/s2-$$name.mono | head; \
+	    grep -E '\?t[0-9]+, ' build/s2-$$name.mono | head; \
 	    exit 1; \
 	  else \
 	    echo "dump-mono OK $$name"; \
@@ -2621,7 +2626,7 @@ test-sugars: $(TARGET) build
 	  exp_out=../examples/sugars/$$name.out.expected; \
 	  exp_err=../examples/sugars/$$name.err.expected; \
 	  case "$$name" in \
-	    complex_literal_*) extra_flags="--path ../stdlib --prelude ../stdlib/protocols.kai --prelude ../stdlib/math/numeric.kai --prelude ../stdlib/math/real.kai --prelude ../stdlib/math/complex.kai" ;; \
+	    complex_literal_*) extra_flags="--path ../stdlib" ;; \
 	    *) extra_flags="" ;; \
 	  esac; \
 	  if [ -f $$exp_err ]; then \
