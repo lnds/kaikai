@@ -19,15 +19,15 @@ KAIC2     := ../stage2/kaic2
 # is retired with the m12.8 scope-aware rename pass — local
 # parameters whose name matches a registered op are no longer
 # rewritten to the dispatcher.
-CORE_PRELUDES := $(patsubst %,--prelude %,$(sort $(wildcard ../stdlib/core/*.kai)))
-PRELUDES  := $(CORE_PRELUDES) \
-             --prelude ../stdlib/protocols.kai \
-             --prelude ../stdlib/effects.kai \
-             --prelude ../stdlib/random.kai
+# Hanga Roa: core (core/*, protocols, effects, array) is loaded
+# automatically by the compiler. Demos that need random must
+# declare `import random` themselves.
+CORE_PRELUDES :=
+PRELUDES  :=
 STDLIB    := ../stdlib
 RT_INC    := -I ../stage0
 CC        := cc
-CFLAGS    := -std=c99 -O2 -Wno-unused-function -Wno-unused-variable
+CFLAGS    := -std=c99 -O2 -Wno-unused-function -Wno-unused-variable -DKAI_STDLIB_PATH=\"$(abspath ../stdlib)\"
 # issue #343 — math/real libm bindings live in stage0/runtime.h.
 # Linux glibc requires explicit `-lm` after the .c inputs; macOS
 # libSystem already exposes those symbols.

@@ -35,26 +35,11 @@ printf 'fn main() : Unit { () }\n' > "$SRC"
 
 [ -x "$KAIC2" ] || { echo "kaic2 not built; run: make -C stage2 kaic2" >&2; exit 1; }
 
-# Build the same prelude_flags shape that bin/kai uses
-# (`stdlib_prelude_flags` in bin/kai). Anchor: bin/kai $(grep -n
-# STDLIB_PROTOCOLS bin/kai). Add new lines here when a prelude is
-# added to the driver.
-STDLIB_CORE_DIR="$STDLIB_ROOT/core"
+# Hanga Roa: core (core/*, protocols, effects, array) is loaded
+# automatically by the compiler via the compile-time KAI_STDLIB_PATH
+# constant. No --prelude flag is needed; opt-in modules require
+# `import` in user code.
 prelude_flags=""
-for core_file in "$STDLIB_CORE_DIR"/*.kai; do
-  [ -f "$core_file" ] && prelude_flags="$prelude_flags --prelude $core_file"
-done
-for f in protocols.kai effects.kai array.kai random.kai random_secure.kai \
-         encoding/base64.kai encoding/hex.kai \
-         collections/map.kai collections/set.kai collections/queue.kai collections/stack.kai \
-         math/numeric.kai math/int.kai math/real.kai math/complex.kai \
-         encoding/json.kai encoding/toml.kai \
-         decimal.kai money.kai fx.kai \
-         uuid.kai regexp.kai path.kai \
-         crypto/hash.kai crypto/mac.kai; do
-  full="$STDLIB_ROOT/$f"
-  [ -f "$full" ] && prelude_flags="$prelude_flags --prelude $full"
-done
 
 # /usr/bin/time -p reports `real <sec>` on stderr. On macOS the same
 # binary also accepts `-l` to print maximum-resident-set-size on a

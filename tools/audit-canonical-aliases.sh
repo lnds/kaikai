@@ -45,7 +45,7 @@ modules=(
   "stdlib/spawn.kai:fiber:spawn"
   "stdlib/log.kai:log:log"
   "stdlib/net/http.kai:http:http"
-  "stdlib/protocols.kai:bin:protocols"
+  "stdlib/bin.kai:bin:bin"
 )
 
 total_both=0

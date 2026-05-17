@@ -168,8 +168,8 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-private-record-shadow-audit test-flat-prefix-aliases test-canonical-aliases-progress
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + private-type shadow audit + private-record shadow audit + flat-prefix alias audit + canonical aliases progress report"
+tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + private-type shadow audit + private-record shadow audit + canonical-only alias audit"
 
 # Issue #643 — institutional regression gate for the private-type
 # leak fix. `tools/audit-prelude-private-types.sh` walks every
@@ -191,29 +191,13 @@ test-private-type-shadow-audit: kaic2
 test-private-record-shadow-audit: kaic2
 	@./tools/audit-prelude-private-records.sh
 
-# Issue #614 — institutional regression gate for the m14 follow-up
-# qualified-call migration. `tools/audit-flat-prefix-aliases.sh`
-# walks every m14 follow-up module and verifies the legacy
-# flat-prefix exports (`<module>_<op>` or the per-module prefix
-# like `q_*` / `stk_*` / `rx_*` / `dec_*`) still ship as `pub fn`.
-# A refactor that drops one of the alias prefixes mid-flight is
-# caught here before the user-facing surface regresses.
-test-flat-prefix-aliases:
-	@./tools/audit-flat-prefix-aliases.sh
-
-# Option E canonical-name progress audit (the m14 follow-up gate
-# that #614 should have shipped but did not). `audit-flat-prefix-aliases.sh`
-# above checks that the legacy `<prefix>_<op>` exports survive a
-# refactor; this audit verifies the converse — that the canonical
-# `<op>` form ALSO exists, which is the actual Option E shape.
-#
-# Today: BOTH=17, LEGACY-only=152, CANONICAL-only=31. The audit
-# exits non-zero when LEGACY-only > 0; piped through `|| true` so
-# the report runs as an informational gate without breaking tier1
-# while the migration is in progress. When LEGACY-only reaches 0,
-# the typer's `module_legacy_prefix` fallback can be retired.
-test-canonical-aliases-progress:
-	@./tools/audit-canonical-aliases.sh | tail -6 || true
+# Option E canonical-name audit (m14 follow-up, closed 2026-05-17).
+# Walks every m14 follow-up module and confirms the canonical
+# `<module>.<op>` surface exists with no surviving `<prefix>_<op>`
+# legacy aliases. The qualified-call resolver's legacy-prefix
+# fallback was retired together with this gate flip.
+test-canonical-aliases:
+	@./tools/audit-canonical-aliases.sh | tail -6
 
 # Tongariki — `kai fmt` fixture suite. Verifies that every fixture
 # in examples/fmt/ formats to its `.expected.kai` and is idempotent,

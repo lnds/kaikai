@@ -10521,7 +10521,7 @@ fn prelude_names() : [String] {
     # Issue #344: fs/dir operations.
     "dir_list_dir", "dir_create_dir", "dir_remove_dir", "dir_walk",
     "read_line", "read_bytes", "args",
-    "program_name",
+    "program_name", "stdlib_path",
     "exit", "panic",
     "int_to_string", "real_to_string", "string_to_int", "string_to_real",
     "int_to_real", "real_to_int",
@@ -12546,6 +12546,9 @@ fn prelude_table() : [EPrelude] {
     # this as `program_name()` so the dotted-call surface stays
     # uniform with the rest of `os.args`.
     EP("program_name",     "kai_prelude_program_name",     0),
+    # Hanga Roa: compile-time hard-coded path to `stdlib/`. Used by
+    # the core loader to find core/*.kai without --prelude flags.
+    EP("stdlib_path",      "kai_prelude_stdlib_path",      0),
     EP("read_file",        "kai_prelude_read_file",        1),
     EP("write_file",       "kai_prelude_write_file",       2),
     # Issue #345: fs/file expansion (exists/delete/rename).
@@ -26443,6 +26446,7 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     # Issue #127: argv[0] as a flat prelude. Total — empty string
     # when the runtime hasn't seen `kai_set_args` yet.
     TyEntry { name: "program_name",   scheme: mono(fn_ty([], TyString)) },
+    TyEntry { name: "stdlib_path",    scheme: mono(fn_ty([], TyString)) },
     TyEntry { name: "read_file",      scheme: mono(fn_ty([TyString], TyCon("Result", [TyString, TyString]))) },
     TyEntry { name: "write_file",     scheme: mono(fn_ty([TyString, TyString], TyCon("Result", [TyUnit, TyString]))) },
     # Issue #345: fs/file expansion. `file_exists` returns Bool;
@@ -46226,6 +46230,7 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_field(%KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_prelude_args()\n",
     "declare %KaiValue* @kaix_prelude_program_name()\n",
+    "declare %KaiValue* @kaix_prelude_stdlib_path()\n",
     "declare %KaiValue* @kaix_prelude_exit(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_panic_fn(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_panic(%KaiValue*)\n",
@@ -46686,6 +46691,7 @@ fn llvm_prelude_table() : [LlvmPrelude] {
     LP("list_reverse",     1, None),
     LP("args",             0, None),
     LP("program_name",     0, None),
+    LP("stdlib_path",      0, None),
     LP("exit",             1, None),
     LP("panic",            1, None),
     LP("read_file",        1, None),
@@ -58963,26 +58969,15 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MHelp))
       } else if a == "-V" or a == "--version" {
         parse_cli_loop(more, cli_with_mode(opts, MVersion))
-      } else if a == "--prelude" {
-        match more {
-          [p, ...rest2] -> parse_cli_loop(rest2, cli_with_prelude(opts, p))
-          [] -> {
-            eprint("kaic1: --prelude requires a file argument")
-            cli_with_mode(opts, MHelp)
-          }
-        }
-      } else if a == "--prelude-cache" {
-        # Two positional arguments: <source> <cache_file>. The source
-        # is the .kai file (used to derive module_origin and as
-        # fallback when the cache fails); the cache_file is the .kab
-        # blob produced by --emit-prelude-cache.
-        match more {
-          [src, cache, ...rest2] -> parse_cli_loop(rest2, cli_with_prelude_cache(opts, src, cache))
-          _ -> {
-            eprint("kaic2: --prelude-cache requires two arguments: <source.kai> <cache.kab>")
-            cli_with_mode(opts, MHelp)
-          }
-        }
+      } else if a == "--prelude" or a == "--prelude-cache" {
+        # Hanga Roa: --prelude and --prelude-cache were retired when
+        # core became hard-coded. The compiler now loads core/*,
+        # protocols, effects and array from the compile-time
+        # KAI_STDLIB_PATH on every run. The flags are accepted as a
+        # legacy alias only to surface a clear error during the
+        # migration window; reject on sight.
+        eprint(concat_all(["kaic2: ", a, " is retired in Hanga Roa — the core module set is loaded automatically; remove the flag"]))
+        cli_with_mode(opts, MHelp)
       } else if a == "--cache-sha" {
         # 64-char hex sha256 written into the next emitted cache blob.
         # Optional; defaults to all-zeros placeholder when omitted.
@@ -59350,6 +59345,52 @@ type PreludeSegment = PSeg(String, [Decl])
 # slot holds a cache .kab file path, or "" to force a full parse.
 # A non-empty cache path is tried first; on header / payload
 # mismatch the loader falls back to re-parsing the source.
+# Hanga Roa core module set. Hard-coded in the compiler:
+# `stdlib_path()` returns the absolute path baked at compile time
+# via -DKAI_STDLIB_PATH. Every kaikai program receives this set
+# automatically — no flags, no driver assistance, no escape hatch
+# beyond rebuilding the compiler with a different KAI_STDLIB_PATH.
+fn core_module_files() : [String] = [
+  "core/char.kai",
+  "core/io.kai",
+  "core/list.kai",
+  "core/option.kai",
+  "core/result.kai",
+  "core/string.kai",
+  "core/tuple.kai",
+  # math/numeric and math/complex live in stdlib/math/ (their
+  # natural taxonomy) but are auto-loaded so that the Numeric
+  # protocol's universals (`abs`, `sign`, `pow_int`, `clamp`)
+  # and the imaginary literal (`2.5i`) work in every program
+  # without an explicit `import math.*`.
+  "math/numeric.kai",
+  "math/complex.kai",
+  "protocols.kai",
+  "effects.kai",
+  "array.kai"
+]
+
+# Build the full absolute path list for the core module set,
+# anchored at the compile-time `stdlib_path()`.
+fn core_module_paths() : [String] = {
+  let root = stdlib_path()
+  core_module_paths_loop(core_module_files(), root, [])
+}
+
+fn core_module_paths_loop(rels: [String], root: String, acc: [String]) : [String] = match rels {
+  [] -> list_reverse(acc)
+  [r, ...rest] -> core_module_paths_loop(rest, root,
+                    [string_concat(root, string_concat("/", r)), ...acc])
+}
+
+# Load the core module set. Replaces the legacy `--prelude`-driven
+# `load_preludes` call: every program gets `core/*` + protocols +
+# effects + array, no negotiation. Mirrors load_preludes' return
+# shape so downstream callers (`PLS`, segments, module entries)
+# do not change.
+fn load_core(include_tests: Bool) : Option[PreludesLoaded] / Console + File =
+  load_preludes(core_module_paths(), [], include_tests, [], [], [])
+
 fn load_preludes(paths: [String], caches: [String], include_tests: Bool, acc_decls: [Decl],
                    acc_mods: [ModuleEntry], acc_segs: [PreludeSegment])
                    : Option[PreludesLoaded] / Console + File = match paths {
@@ -62216,13 +62257,12 @@ fn run(opts: CliOptions) : Int / Console + File {
     _ -> match opts.path {
       None -> { usage(); 2 }
       Some(p) -> {
-        # Bug multi-prelude (m12.8 v1): the previous implementation
-        # held a single Option[String] and silently dropped all but
-        # the last `--prelude` flag. Fixed: accumulate every prelude
-        # and concatenate the loaded decls in argument order. Names
-        # in later preludes shadow earlier ones (intentional —
-        # callers pass `--prelude` in dependency order).
-        let prelude_loaded = load_preludes(opts.preludes, opts.prelude_caches, opts.include_prelude_tests, [], [], [])
+        # Hanga Roa: the core module set (core/* + protocols + effects
+        # + array) is loaded automatically from the compile-time
+        # `stdlib_path()`. No `--prelude` flag, no driver assistance:
+        # every program receives core. To swap which stdlib feeds the
+        # compiler, rebuild with a different KAI_STDLIB_PATH macro.
+        let prelude_loaded = load_core(opts.include_prelude_tests)
         match prelude_loaded {
           None -> 1
           Some(pls) -> match pls {
