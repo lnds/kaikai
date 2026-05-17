@@ -241,6 +241,29 @@ find_manifest_dir() {
   done
 }
 
+# Read the package name from `name = "..."` in kai.toml. Empty on
+# missing manifest, missing field, or unreadable file. Used by
+# `kai build` to pick a sensible default output binary name when
+# the user did not pass -o (Go-style: the package name, not the
+# entry-point filename).
+manifest_package_name() {
+  manifest_dir="$1"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    return 0
+  fi
+  awk '
+    /^[[:space:]]*\[/ { in_root = 0 }
+    /^[[:space:]]*\[package\]/ { in_root = 1; next }
+    NR == 1 || in_root || /^[^[]/ {
+      if (in_root || NR <= 30) {
+        if ($0 ~ /^[[:space:]]*name[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/) {
+          gsub(/^[^"]*"/, "", $0); gsub(/".*$/, "", $0); print; exit
+        }
+      }
+    }
+  ' "$manifest_dir/kai.toml"
+}
+
 # Emit `--path <abs>` flags for the manifest's own root plus each
 # dep in $1/kai.toml. Resolves relative local-path deps against $1;
 # git deps come from the lockfile's cache field. Silent if no
@@ -471,8 +494,8 @@ Environment:
   CLANGFLAGS       Extra flags passed to clang on --backend=llvm
                    (default: -w -O2).
   KAI_BACKEND      Default backend (c|llvm) when --backend is not
-                   passed. Overridden by --backend; falls back to
-                   auto-detect (clang in PATH -> llvm, else c).
+                   passed. Overridden by --backend; defaults to `c`
+                   (the LLVM backend is opt-in until Orongo).
   KAI_NO_STDLIB    If 1, skip auto-loading the stdlib preludes.
   KAI_STDLIB       Override the stdlib root directory (default: auto-detected
                    from the script's location — share/kaikai/stdlib if installed,
@@ -491,20 +514,21 @@ usage: kai build <file.kai> [-o <out>] [--backend=<c|llvm>]
        kai build --holes <file.kai>
        kai build --holes-json <file.kai>
 
-Compile a kaikai source file to a native binary. By default kai picks
-the LLVM backend when clang is in PATH (faster, fewer external deps);
-otherwise it falls back to the portable C backend linked with cc. Set
-KAI_BACKEND=c|llvm to override the default without writing --backend
-on every invocation. The llvm backend emits LLVM IR via
-\`kaic2 --emit=llvm\` and links it with clang against
-stage0/runtime_llvm.c (L1 of the LLVM-direct refactor).
+Compile a kaikai source file to a native binary. The default backend
+is \`c\` (portable C linked with cc) — supported across every Hanga
+Roa fixture. The LLVM backend is opt-in via \`--backend=llvm\` or
+\`KAI_BACKEND=llvm\`: it is faster and has fewer external deps when it
+works, but has known M3b gaps that fail on tuple-pattern let-bindings
+and several closure shapes. Those gaps close in Orongo. The llvm
+backend emits LLVM IR via \`kaic2 --emit=llvm\` and links it with clang
+against stage0/runtime_llvm.c (L1 of the LLVM-direct refactor).
 
 Options:
   -o <out>             Output binary path (default: basename of input
                        without .kai).
-  --backend=<c|llvm>   Codegen backend (default: auto-detect — llvm
-                       if clang is in PATH, else c). KAI_BACKEND env
-                       var overrides auto-detect; this flag overrides
+  --backend=<c|llvm>   Codegen backend (default: c — the LLVM backend
+                       is opt-in until Orongo). KAI_BACKEND env var
+                       overrides the default; this flag overrides
                        both.
   --holes              Report every typed hole (\`?\` / \`?name\`) with
                        expected type, in-scope bindings, and candidate
@@ -534,12 +558,12 @@ usage: kai run [--backend=<c|llvm>] <file.kai> [args...]
 Compile and immediately execute a kaikai program. Any arguments after
 the source file are forwarded to the compiled binary. Backend selection
 follows the same rule as \`kai build\`: --backend > KAI_BACKEND >
-auto-detect (llvm if clang is in PATH, else c).
+default (\`c\` — the LLVM backend is opt-in until Orongo).
 
 Options:
-  --backend=<c|llvm>   Codegen backend (default: auto-detect — llvm
-                       if clang is in PATH, else c). KAI_BACKEND env
-                       var overrides auto-detect; this flag overrides
+  --backend=<c|llvm>   Codegen backend (default: c — the LLVM backend
+                       is opt-in until Orongo). KAI_BACKEND env var
+                       overrides the default; this flag overrides
                        both.
   -h, --help           Show this help.
 
@@ -968,14 +992,14 @@ stdlib_prelude_flags() {
 # Resolve the active backend. Precedence (highest first):
 #   1. Caller-supplied value (the --backend CLI flag, already parsed).
 #   2. $KAI_BACKEND environment variable (c|llvm).
-#   3. Auto-detect: clang in PATH -> llvm, else c.
+#   3. Hard-coded default: `c`.
 #
-# Stages 0/1 are bootstrapped with the system cc and never see this
-# logic; only stage 2's user-facing driver path is affected. L2 of the
-# LLVM-direct refactor closed the emitter gaps (bit_* intrinsics, the
-# PVariantRecord/PRecord/PNarrow pattern shapes) so the default flip
-# is safe for stdlib-using programs; the C path remains a working
-# fallback if clang is absent or the user sets --backend=c explicitly.
+# The LLVM backend used to be auto-selected when clang was in PATH,
+# but the M3b gaps (tuple-pattern let-bindings, several closure
+# shapes) fail on idiomatic stdlib-using programs. Until Orongo
+# closes those gaps, the Hanga Roa edition ships with `c` as the
+# sole default — users who want LLVM opt in explicitly. Stages 0/1
+# are bootstrapped with the system cc and never see this logic.
 resolve_backend() {
   cli_choice="$1"
   if [ -n "$cli_choice" ]; then
@@ -988,11 +1012,13 @@ resolve_backend() {
       *) die "KAI_BACKEND must be 'c' or 'llvm' (got: $KAI_BACKEND)" ;;
     esac
   fi
-  if command -v "$CLANG" >/dev/null 2>&1; then
-    printf 'llvm'
-  else
-    printf 'c'
-  fi
+  # Default backend for the Hanga Roa edition is `c`. The LLVM
+  # backend has known M3b gaps (tuple-pattern let-bindings, several
+  # closure shapes) that fail on idiomatic stdlib-using programs;
+  # the C backend is the supported path until those gaps close in
+  # Orongo. Users with LLVM-shaped fixtures opt in explicitly via
+  # `--backend=llvm` or `KAI_BACKEND=llvm`.
+  printf 'c'
 }
 
 # Detect that `clang` is available before trying to invoke it. Honours
@@ -1077,6 +1103,51 @@ compile_to_binary() {
   fi
 }
 
+# If the user did not name an input file, try to infer one from the
+# current directory:
+#
+#   1. If `./main.kai` exists, use it. This mirrors `go run .` —
+#      the convention for package layouts is a single `main.kai`
+#      entry-point next to `kai.toml`.
+#   2. Otherwise, if the cwd has exactly one `.kai` file at the top
+#      level, use it. Useful for tiny single-file scripts.
+#
+# Both branches print the inferred path to stderr so the user sees
+# what got picked. Returns the path on stdout when found; empty
+# string when no inference is possible (caller falls back to the
+# old "missing input file" diagnostic).
+infer_entry_point() {
+  if [ -f "./main.kai" ]; then
+    # Manifest-aware diagnostic: when there's a kai.toml the user
+    # is in a package directory and the message should reflect
+    # that, not just the file name.
+    src_dir_abs="$(pwd)"
+    manifest_dir_inf="$(find_manifest_dir "$src_dir_abs")"
+    pkg_name_inf="$(manifest_package_name "$manifest_dir_inf")"
+    if [ -n "$pkg_name_inf" ]; then
+      echo "kai: building package '$pkg_name_inf' (entry point: ./main.kai)" >&2
+    else
+      echo "kai: using ./main.kai as entry point" >&2
+    fi
+    printf './main.kai'
+    return 0
+  fi
+  # Count .kai files at depth 1.
+  candidate=""
+  count=0
+  for f in ./*.kai; do
+    [ -f "$f" ] || continue
+    candidate="$f"
+    count=$((count + 1))
+  done
+  if [ "$count" = "1" ]; then
+    echo "kai: using $candidate as entry point (only .kai file in cwd)" >&2
+    printf '%s' "$candidate"
+    return 0
+  fi
+  printf ''
+}
+
 # Run kaic2 in a typed-hole reporting mode (`--holes` or
 # `--holes-json`). The compiler's report is the entire output of
 # this invocation — no binary is produced. Uses the same prelude
@@ -1130,6 +1201,7 @@ cmd_build() {
       *) [ -z "$src" ] || die "only one input file supported"; src="$1"; shift ;;
     esac
   done
+  if [ -z "$src" ]; then src="$(infer_entry_point)"; fi
   [ -n "$src" ] || die "missing input file (see 'kai build --help')"
   backend="$(resolve_backend "$backend_cli")"
   if [ -n "$holes_mode" ]; then
@@ -1140,7 +1212,18 @@ cmd_build() {
     return $?
   fi
   if [ -z "$out" ]; then
-    out="$(basename "$src" .kai)"
+    # Default output name: prefer the package name from kai.toml
+    # over the entry-point's basename, so a package laid out as
+    # `notes/{kai.toml,main.kai,...}` builds to `./notes` not
+    # `./main`. Mirrors `go build` which uses the module name.
+    src_dir_abs="$(cd "$(dirname "$src")" && pwd)"
+    manifest_dir_for_out="$(find_manifest_dir "$src_dir_abs")"
+    pkg_name="$(manifest_package_name "$manifest_dir_for_out")"
+    if [ -n "$pkg_name" ]; then
+      out="$pkg_name"
+    else
+      out="$(basename "$src" .kai)"
+    fi
   fi
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -1170,9 +1253,10 @@ cmd_run() {
     esac
   done
   case "${1:-}" in
-    "") die "missing input file (see 'kai run --help')" ;;
+    "") src="$(infer_entry_point)"
+        [ -n "$src" ] || die "missing input file (see 'kai run --help')" ;;
+    *)  src="$1"; shift ;;
   esac
-  src="$1"; shift
   backend="$(resolve_backend "$backend_cli")"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -1196,9 +1280,10 @@ cmd_test() {
     esac
   done
   case "${1:-}" in
-    "") die "missing input file (see 'kai test --help')" ;;
+    "") src="$(infer_entry_point)"
+        [ -n "$src" ] || die "missing input file (see 'kai test --help')" ;;
+    *)  src="$1"; shift ;;
   esac
-  src="$1"; shift
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
   bin="$tmp/$(basename "$src" .kai)-t"
@@ -1222,7 +1307,9 @@ cmd_bench() {
     esac
   done
   case "${1:-}" in
-    "") die "missing input file (see 'kai bench --help')" ;;
+    "") src="$(infer_entry_point)"
+        [ -n "$src" ] || die "missing input file (see 'kai bench --help')" ;;
+    *)  src="$1"; shift ;;
   esac
   if [ -n "$iters_override" ]; then
     case "$iters_override" in
@@ -1230,7 +1317,6 @@ cmd_bench() {
     esac
     [ "$iters_override" -gt 0 ] || die "--iters value must be a positive integer (got: $iters_override)"
   fi
-  src="$1"; shift
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
   bin="$tmp/$(basename "$src" .kai)-b"
@@ -1245,9 +1331,10 @@ cmd_bench() {
 cmd_check() {
   case "${1:-}" in
     -h|--help) usage_check; return 0 ;;
-    "") die "missing input file (see 'kai check --help')" ;;
+    "") src="$(infer_entry_point)"
+        [ -n "$src" ] || die "missing input file (see 'kai check --help')" ;;
+    *)  src="$1"; shift ;;
   esac
-  src="$1"; shift
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
   bin="$tmp/$(basename "$src" .kai)-c"
@@ -1292,6 +1379,7 @@ cmd_fmt() {
     return $?
   fi
 
+  if [ -z "$src" ]; then src="$(infer_entry_point)"; fi
   [ -n "$src" ] || die "missing input file (see 'kai fmt --help')"
   [ -f "$src" ] || die_file_not_found "$src" "fmt"
 
@@ -1346,9 +1434,10 @@ watch_run_once() {
 cmd_watch() {
   case "${1:-}" in
     -h|--help) usage_watch; return 0 ;;
-    "") die "missing input file (see 'kai watch --help')" ;;
+    "") src="$(infer_entry_point)"
+        [ -n "$src" ] || die "missing input file (see 'kai watch --help')" ;;
+    *)  src="$1"; shift ;;
   esac
-  src="$1"; shift
   [ -f "$src" ] || die_file_not_found "$src" "watch"
   abs_src="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
   tmp="$(mktemp -d)"
