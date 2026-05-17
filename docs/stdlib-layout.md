@@ -124,6 +124,53 @@ the explicit module qualifier instead of doing a flat
 in a mechanical follow-up. The `opt_or` survivor is independent
 — it is blocked by parser-level keyword reservation, not by #219.
 
+### Migration status (m14 follow-up, #614)
+
+The 21 modules outside `stdlib/core/*` listed in issue #614 keep
+their flat-prefix definitions and surface the canonical qualified
+form (`<module>.<op>`) through the qualified-call resolver's
+prefix fallback (`me_lookup_export` in `stage2/compiler.kai`).
+Closed by the m14 follow-up lane (`docs/lane-experience-issue-614-m14-followup.md`).
+
+| Module                          | Legacy prefix | Canonical surface                              | Notes                                                          |
+| ------------------------------- | ------------- | ---------------------------------------------- | -------------------------------------------------------------- |
+| `stdlib/fs/file.kai`            | `file`        | `file.read`, `file.write`, `file.append`, ...  | 3 ops gained bare aliases (`read`/`write`/`append`); 5 already bare |
+| `stdlib/spawn.kai`              | `fiber`       | `spawn.spawn`, `spawn.await`, ...              | 6 ops gained bare aliases (`spawn`, `await`, `select`, `cancel`, `yield`, `set_trap_exit`); `nursery` already bare |
+| `stdlib/log.kai`                | `log`         | `log.debug`, `log.info`, `log.warn`, `log.error` | 4 ops gained bare aliases                                       |
+| `stdlib/math/int.kai`           | `int`         | `int.min`, `int.max`, `int.gcd`, ...           | All defs stay flat (`gcd`/`fib`/`factorial` widely shadowed by fixtures + demos) |
+| `stdlib/math/real.kai`          | `real`        | `real.min`, `real.floor`, `real.ceil`, ...     | 4 ops gained bare aliases (`trunc`/`floor`/`ceil`/`round_half_even`); `round` stays flat (fixture shadow) |
+| `stdlib/decimal.kai`            | `dec`         | `decimal.zero`, `decimal.add`, `decimal.eq`, ... | 2 ops gained bare aliases (`from_int`/`from_parts`); rest collide with complex.kai or protocol methods |
+| `stdlib/money.kai`              | `money`       | `money.make`, `money.zero`, `money.add`, ...   | All defs stay flat (collide with decimal/complex/protocol methods) |
+| `stdlib/fx.kai`                 | `fx`          | `fx.pair`, `fx.rate_make`, `fx.convert`, ...   | All defs stay flat (`pair`/`lookup`/`convert` shadowed by fixtures) |
+| `stdlib/array.kai`              | `array`       | `array.from_list`, `array.to_list`, `array.copy` | All defs stay flat (`from_list`/`to_list` collide with collections) |
+| `stdlib/collections/set.kai`    | `set`         | `set.empty`, `set.insert`, `set.union`, ...    | All defs stay flat (clash with map / queue / stack / list)     |
+| `stdlib/collections/queue.kai`  | `q`           | `queue.push`, `queue.pop`, `queue.peek`, ...   | All defs stay flat (clash with stack)                          |
+| `stdlib/collections/stack.kai`  | `stk`         | `stack.push`, `stack.pop`, `stack.peek`, ...   | All defs stay flat (clash with queue)                          |
+| `stdlib/path.kai`               | `path`        | `path.basename`, `path.dirname`, `path.join`, ... | All defs stay flat (`join`/`split` clash with `string.join`/`split`) |
+| `stdlib/encoding/base64.kai`    | `base64`      | `base64.encode`, `base64.decode`, ...          | All defs stay flat (`encode` clashes with hex.encode)          |
+| `stdlib/encoding/hex.kai`       | `hex`         | `hex.encode`, `hex.decode`, ...                | All defs stay flat (`decode` shadowed by demos)                |
+| `stdlib/encoding/toml.kai`      | `toml`        | `toml.decode`, `toml.encode`, ...              | All defs stay flat                                             |
+| `stdlib/uuid.kai`               | `uuid`        | `uuid.v4`, `uuid.format`, `uuid.is_valid`, ... | All defs stay flat (`parse` shadowed by demos)                 |
+| `stdlib/regexp.kai`             | `regex` + `rx` (alt) | `regexp.compile`, `regexp.find_all`, `regexp.parse_pattern` | Resolver carries TWO legacy prefixes via `module_legacy_prefix_alt`; `regexp.match` unreachable (`match` is a keyword) |
+| `stdlib/random_secure.kai`      | `random_secure` | `random_secure.int`, `random_secure.bytes`   | All defs stay flat                                              |
+| `stdlib/net/http.kai`           | `http`        | `http.parse_url`, `http.get`, `http.post`, ... | All defs stay flat (`get`/`put`/`delete` clash with map/env/file) |
+| `stdlib/protocols.kai`          | `bin`         | `bin_*` helpers — NOT a module surface today   | A dedicated `stdlib/bin.kai` split is tracked as follow-up     |
+
+**Departure from issue #614's stated Option E ("each flat-prefix
+pub fn duplicated to a bare canonical + alias"):** kaikai does not
+overload `pub fn` by signature at the top level. Adding bare
+canonical defs collides with sibling modules (`min(Int, Int)` vs
+`min(xs: [Int])`, `from_list(xs, def): Array` vs `from_list(xs):
+Set`, `push(q): Queue` vs `push(s): Stack`) and shadows user-defined
+fns in fixtures and demos (`fn round`, `fn fib`, `fn factorial`,
+`fn gcd`, `fn pair`, `fn lookup`, `fn convert`, `fn decode`,
+`fn parse`). The compiler's `emit_ident_value` shadow path
+(documented in `docs/lane-experience-m14-v1.md` §Finding 2) trips
+the codegen when a user-defined local shares a name with a global
+pub fn. Where the bare canonical is safe (no shadow, no top-level
+clash), the lane added both forms; otherwise the qualified-call
+resolver's prefix fallback alone supplies the canonical surface.
+
 The 5 `list_*` survivors documented in the m14 Phase 1 retro
 (`docs/lane-experience-issue-203-phase1-list.md`) were retired
 in #227 once PR #218 closed the prelude-scope (#216) and

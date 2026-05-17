@@ -168,8 +168,8 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-private-record-shadow-audit
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + private-type shadow audit + private-record shadow audit"
+tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-private-record-shadow-audit test-flat-prefix-aliases
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + private-type shadow audit + private-record shadow audit + flat-prefix alias audit"
 
 # Issue #643 — institutional regression gate for the private-type
 # leak fix. `tools/audit-prelude-private-types.sh` walks every
@@ -190,6 +190,16 @@ test-private-type-shadow-audit: kaic2
 # and leaked the prelude's field set into the user's scope.
 test-private-record-shadow-audit: kaic2
 	@./tools/audit-prelude-private-records.sh
+
+# Issue #614 — institutional regression gate for the m14 follow-up
+# qualified-call migration. `tools/audit-flat-prefix-aliases.sh`
+# walks every m14 follow-up module and verifies the legacy
+# flat-prefix exports (`<module>_<op>` or the per-module prefix
+# like `q_*` / `stk_*` / `rx_*` / `dec_*`) still ship as `pub fn`.
+# A refactor that drops one of the alias prefixes mid-flight is
+# caught here before the user-facing surface regresses.
+test-flat-prefix-aliases:
+	@./tools/audit-flat-prefix-aliases.sh
 
 # Tongariki — `kai fmt` fixture suite. Verifies that every fixture
 # in examples/fmt/ formats to its `.expected.kai` and is idempotent,
