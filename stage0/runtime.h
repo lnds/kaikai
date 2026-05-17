@@ -3656,6 +3656,19 @@ static KaiValue *kai_prelude_program_name(void) {
     return kai_str(kai_g_argv[0]);
 }
 
+/* Hanga Roa core loader: the path where `core/` lives on this
+ * system, hard-coded at compile time via -DKAI_STDLIB_PATH=... in
+ * stage1/stage2 Makefiles. Defaults to "stdlib" (relative to the
+ * caller's cwd) when the macro is unset, which keeps in-tree
+ * unit harnesses happy without the macro. Surface to kaikai code
+ * via the `kai_stdlib_path` builtin. */
+#ifndef KAI_STDLIB_PATH
+#define KAI_STDLIB_PATH "stdlib"
+#endif
+static KaiValue *kai_prelude_stdlib_path(void) {
+    return kai_str(KAI_STDLIB_PATH);
+}
+
 /* ---------- prelude: mailbox runtime (m8 #7) ---------- */
 
 /* User code reaches the mailbox runtime through these prelude
@@ -4556,6 +4569,7 @@ static KaiValue *_kai_prelude_reduce_thunk(KaiValue *s, KaiValue **a, int n)    
 static KaiValue *_kai_prelude_each_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_prelude_each(a[0], a[1]); }
 static KaiValue *_kai_prelude_args_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) a; (void) n; return kai_prelude_args(); }
 static KaiValue *_kai_prelude_program_name_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_prelude_program_name(); }
+static KaiValue *_kai_prelude_stdlib_path_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) a; (void) n; return kai_prelude_stdlib_path(); }
 static KaiValue *_kai_prelude_read_file_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_read_file(a[0]); }
 static KaiValue *_kai_prelude_write_file_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_write_file(a[0], a[1]); }
 static KaiValue *_kai_prelude_file_exists_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_exists(a[0]); }

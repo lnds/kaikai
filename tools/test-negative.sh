@@ -69,11 +69,11 @@ run_one() {
   errfile="$tmp/$(echo "$rel" | tr '/' '_').err"
   rc=0
   # shellcheck disable=SC2086 — extra_flags is intentionally word-split.
-  if [ -n "$prelude" ]; then
-    "$compiler" $extra_flags --prelude "$prelude" "$src" > /dev/null 2> "$errfile" || rc=$?
-  else
-    "$compiler" $extra_flags "$src" > /dev/null 2> "$errfile" || rc=$?
-  fi
+  # Hanga Roa: core is loaded automatically by the compiler. The
+  # legacy `--prelude` flag was retired; callers wanting an
+  # additional prelude (which the runner used to support per-fixture)
+  # now have to add an `import` to the fixture source instead.
+  "$compiler" $extra_flags "$src" > /dev/null 2> "$errfile" || rc=$?
 
   if [ "$rc" -eq 0 ]; then
     echo "FAIL $rel — exit 0 (silent contract; expected non-zero)"

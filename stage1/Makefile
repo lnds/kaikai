@@ -5,6 +5,12 @@ CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g -O0
 # libSystem already exposes those symbols. Trailed at the end of
 # every $(CC) compile-and-link line that consumes runtime.h.
 LDLIBS_M := -lm
+# Hanga Roa: compile-time absolute path to `stdlib/` so the core
+# loader can find core/*.kai, protocols.kai, effects.kai, array.kai
+# without any --prelude flag at runtime. The path is resolved from
+# this Makefile's location (../stdlib relative to stage1/).
+STDLIB_ABS := $(abspath ../stdlib)
+CPPFLAGS_CORE := -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 STAGE0  := ../stage0/kaic0
 TARGET  := kaic1
 SRC     := compiler.kai
@@ -23,7 +29,7 @@ build/stage1.c: $(SRC) $(STAGE0) | build
 	$(STAGE0) $(SRC) > $@
 
 $(TARGET): build/stage1.c
-	$(CC) $(CFLAGS) -I ../stage0 $< -o $@ $(LDLIBS_M)
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 $< -o $@ $(LDLIBS_M)
 
 # Compare stage 1's --tokens output against stage 0's (normalized to
 # ignore whitespace differences, since stage 0 uses fixed-width columns).
