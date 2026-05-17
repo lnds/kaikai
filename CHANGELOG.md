@@ -84,6 +84,31 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.72.1 (2026-05-16)
+
+### Added
+
+- **driver**: kai build uses kai.toml package name as the default output
+
+## v0.72.0 (2026-05-16)
+
+### Added
+
+- **driver**: infer entry point from cwd when no file is named
+
+## v0.71.0 (2026-05-16)
+
+### BREAKING CHANGE
+
+- programs that relied on the implicit LLVM default
+now build with the C backend unless they pass --backend=llvm or set
+KAI_BACKEND=llvm. The runtime behaviour is identical; only the
+codegen path changes.
+
+### Added
+
+- **driver**: default backend is c, llvm is opt-in until Orongo
+
 ## v0.70.0 (2026-05-16)
 
 ### Added
