@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.72.1 (2026-05-16)
+
+### Added
+
+- **driver**: kai build uses kai.toml package name as the default output
+
 ## v0.72.0 (2026-05-16)
 
 ### Added
