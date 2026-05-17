@@ -11067,7 +11067,8 @@ fn check_program(file: String, decls: [Decl]) : Int / Console + File {
   let arities = collect_effect_arities(decls)
   let row_errs = check_row_labels(decls, file, eff_names, arities)
   let strict_errs = check_call_site_refinements(file, decls)
-  if e3.had_error or row_errs > 0 or strict_errs > 0 { 1 } else { 0 }
+  let tyvar_errs = check_unbound_tyvars(decls, file)
+  if e3.had_error or row_errs > 0 or strict_errs > 0 or tyvar_errs > 0 { 1 } else { 0 }
 }
 
 # m7b #11j — arity table built from every DEffect in the program.
@@ -11299,6 +11300,185 @@ fn check_row_labels_loop(labels: [RowLabel], file: String, line: Int, col: Int,
           }
         here + check_row_labels_loop(rest, file, line, col, eff_names, arities)
       }
+    }
+  }
+}
+
+# ====================================================================
+# Issue #534 shape 4 — unbound type variable in signature.
+# ====================================================================
+#
+# `fn_scheme_of_decl` already auto-collects lowercase TyName names as
+# implicit tparams (R1 fix, 2026-04-26), so `fn f(x: a) : a = x` works
+# without `[a]`. But that promotion is undisciplined: it also accepts
+# `fn coerce(x: a) : b = x`, where `b` appears only in the return type
+# and has no value-level binding site. Under HM that tyvar is
+# ambiguous — the caller cannot constrain it, the body cannot witness
+# it, and the value silently masquerades as whatever the call site
+# expects. ML/Haskell-family compilers reject this as "unbound type
+# variable".
+#
+# This check enforces the rule on every `DFn`:
+#
+#   For every lowercase tyvar name appearing in the return type or in
+#   the row labels of a fn signature, the name must also appear in
+#   the explicit `[…]` tparam list OR in at least one parameter type.
+#
+# Tyvars that *only* appear in params remain implicit and legal (the
+# implicit-tparam promotion still handles them). Tyvars declared in
+# `[…]` are always legal — the user opted in deliberately. The diag
+# nudges users toward the explicit form when the shape is genuinely
+# polymorphic but currently mis-declared.
+fn is_lc_tyvar_name(name: String) : Bool {
+  if string_length(name) == 0 { false }
+  else { match char_at(name, 0) {
+    Some(c) -> c >= 'a' and c <= 'z'
+    None -> false
+  } }
+}
+
+fn lc_add(names: [String], name: String) : [String] {
+  if list_has(names, name) { names } else { list_append(names, [name]) }
+}
+
+fn collect_tyvars_in_typeexpr(t: TypeExpr, acc: [String]) : [String] {
+  match t.tkind {
+    TyName(name, tas) -> {
+      let acc1 = collect_tyvars_in_typeexprs(tas, acc)
+      if is_lc_tyvar_name(name) { lc_add(acc1, name) } else { acc1 }
+    }
+    TyList(inner) -> collect_tyvars_in_typeexpr(inner, acc)
+    TyFn(ps, ret, rexpr) -> {
+      let acc1 = collect_tyvars_in_typeexprs(ps, acc)
+      let acc2 = collect_tyvars_in_typeexpr(ret, acc1)
+      collect_tyvars_in_row(rexpr, acc2)
+    }
+    TyDim(base, _) -> collect_tyvars_in_typeexpr(base, acc)
+    TyRefine(base, _) -> collect_tyvars_in_typeexpr(base, acc)
+  }
+}
+
+fn collect_tyvars_in_typeexprs(ts: [TypeExpr], acc: [String]) : [String] {
+  match ts {
+    [] -> acc
+    [t, ...rest] -> collect_tyvars_in_typeexprs(rest, collect_tyvars_in_typeexpr(t, acc))
+  }
+}
+
+fn collect_tyvars_in_params(ps: [Param], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> {
+      let acc1 = match p.ptype {
+        Some(te) -> collect_tyvars_in_typeexpr(te, acc)
+        None     -> acc
+      }
+      collect_tyvars_in_params(rest, acc1)
+    }
+  }
+}
+
+fn collect_tyvars_in_row_labels(labels: [RowLabel], acc: [String]) : [String] {
+  match labels {
+    [] -> acc
+    [l, ...rest] -> match l {
+      RL(_, tas) -> collect_tyvars_in_row_labels(rest, collect_tyvars_in_typeexprs(tas, acc))
+    }
+  }
+}
+
+fn collect_tyvars_in_row(re: RowExpr, acc: [String]) : [String] {
+  match re {
+    REmpty -> acc
+    RClosed(labels) -> collect_tyvars_in_row_labels(labels, acc)
+    ROpen(_, labels) -> collect_tyvars_in_row_labels(labels, acc)
+  }
+}
+
+fn check_unbound_tyvars(decls: [Decl], file: String) : Int / Console + File {
+  match decls {
+    [] -> 0
+    [d, ...rest] -> check_decl_unbound_tyvars(d, file) + check_unbound_tyvars(rest, file)
+  }
+}
+
+fn is_compiler_synth_name(n: String) : Bool {
+  if string_length(n) < 2 { false }
+  else { match char_at(n, 0) {
+    Some(c1) -> if c1 == '_' { match char_at(n, 1) {
+      Some(c2) -> c2 == '_'
+      None -> false
+    } } else { false }
+    None -> false
+  } }
+}
+
+fn check_decl_unbound_tyvars(d: Decl, file: String) : Int / Console + File {
+  match d {
+    DFn(_, fname, declared, params, opt_ret, rexpr, _, line, col, _) -> {
+      # Synthetic compiler-generated fns (`__proto_*`, `__deriv_*`,
+      # etc.) come from desugar and may legitimately have tyvars in
+      # return-only position by construction (protocol `Self` lives
+      # only on the right of `:`). Skip them; their soundness is the
+      # desugar pass's responsibility.
+      if is_compiler_synth_name(fname) { 0 } else {
+        let in_params = collect_tyvars_in_params(params, [])
+        # Constructor-style fns with no value-level params (e.g.
+        # `pub fn empty() : Map[k, v] = ...`) are caller-elects:
+        # tyvars in the return are unambiguous because the caller
+        # picks them at the use site. Only fns that already bind
+        # *some* tyvar via a param can suffer the silent-shadow
+        # shape from issue #534.
+        if list_length(in_params) == 0 { 0 } else {
+          let in_ret = match opt_ret {
+            Some(rty) -> collect_tyvars_in_typeexpr(rty, [])
+            None      -> []
+          }
+          let in_row = collect_tyvars_in_row(rexpr, [])
+          let ret_errs = report_unbound_tyvars_in_set(in_ret, declared, in_params, fname, file, line, col, 0)
+          let row_errs = report_unbound_tyvars_in_set(in_row, declared, in_params, fname, file, line, col, 0)
+          ret_errs + row_errs
+        }
+      }
+    }
+    DAxiom(_, _, fname, _, declared, params, ret, rexpr, line, col) -> {
+      if is_compiler_synth_name(fname) { 0 } else {
+        let in_params = collect_tyvars_in_params(params, [])
+        if list_length(in_params) == 0 { 0 } else {
+          let in_ret = collect_tyvars_in_typeexpr(ret, [])
+          let in_row = collect_tyvars_in_row(rexpr, [])
+          let ret_errs = report_unbound_tyvars_in_set(in_ret, declared, in_params, fname, file, line, col, 0)
+          let row_errs = report_unbound_tyvars_in_set(in_row, declared, in_params, fname, file, line, col, 0)
+          ret_errs + row_errs
+        }
+      }
+    }
+    _ -> 0
+  }
+}
+
+fn report_unbound_tyvars_in_set(found: [String], declared: [String], in_params: [String],
+                                 fname: String, file: String, line: Int, col: Int,
+                                 acc: Int) : Int / Console + File {
+  match found {
+    [] -> acc
+    [n, ...rest] -> {
+      let bound = list_has(declared, n) or list_has(in_params, n)
+      let here = if bound { 0 } else {
+        let _ = diag_error(file, line, col,
+          string_concat_all(["unbound type variable: `", n, "`"]))
+        let _ = diag_note(string_concat_all([
+          "type variable `", n,
+          "` appears in the return type or effect row of `fn ",
+          fname, "` but not in any parameter"
+        ]))
+        let _ = diag_help(string_concat_all([
+          "introduce it as an explicit tparam (e.g. `fn ",
+          fname, "[", n, "](...) : ...`)"
+        ]))
+        1
+      }
+      report_unbound_tyvars_in_set(rest, declared, in_params, fname, file, line, col, acc + here)
     }
   }
 }
