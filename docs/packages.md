@@ -170,6 +170,107 @@ kai-pkg: wrote kai.lock with 2 entry(ies)
 Hello from git, transitive! (shouted)
 ```
 
+## Package-aware build (issue #658)
+
+`kai build`, `kai run`, `kai test`, `kai bench`, `kai check`,
+`kai fmt`, and `kai watch` accept a **package spec** in place of a
+single `.kai` file. The spec is one of:
+
+| Spec                | Meaning                                                     |
+| ------------------- | ----------------------------------------------------------- |
+| (omitted)           | The cwd package. Reads `kai.toml`, uses `entry` (default    |
+|                     | `main.kai`), and writes the binary to the package name.     |
+| `.`                 | Same as omitting — the dot is an explicit, scriptable form. |
+| `./<sub>`           | A sub-package. `<sub>` must carry its own `kai.toml`; the   |
+|                     | binary lands inside `<sub>/` so the surrounding tree stays  |
+|                     | undisturbed.                                                |
+| `./...` (test only) | Walk the cwd subtree and run `kai test` for every directory |
+|                     | with a `kai.toml`. Exit code is the OR of every sub-run.    |
+| `<file>.kai`        | Legacy file mode — unchanged from earlier versions, so      |
+|                     | every prior invocation keeps working byte-for-byte.         |
+
+The shape mirrors `go build`, `go run .`, and `go test ./...`. The
+distinction between package and file is made explicit by the
+leading `./` (or absent argument); a bare token without an
+extension is rejected with a clear diagnostic.
+
+### `entry` field
+
+The manifest may override the conventional `main.kai`:
+
+```toml
+name = "notes"
+version = "0.1.0"
+entry = "src/main.kai"
+```
+
+If the manifest declares an entry that does not exist, the driver
+errors out before invoking the compiler:
+
+```
+kai: error: kai.toml declares entry = 'src/main.kai' but
+src/main.kai does not exist
+```
+
+Layouts that keep sources under `src/`, `app/`, etc. configure
+the entry once and forget about it.
+
+### Sub-packages
+
+A sub-directory becomes a sub-package by carrying its own
+`kai.toml`. `kai build ./sub` resolves `./sub/kai.toml`, picks its
+entry (default `main.kai`), and writes the binary into `./sub/`.
+The parent package is unaffected — both can ship independent
+binaries from the same checkout. A directory without `kai.toml` is
+rejected:
+
+```
+$ kai build ./not_a_package
+kai: error: ./not_a_package has no kai.toml — sub-packages must
+declare their own manifest
+```
+
+### Module-qualified imports
+
+When a package is named `notes` in `kai.toml`, a file inside the
+package can write either form:
+
+```kai
+import store          # bare — resolves against the manifest dir
+import notes.store    # qualified — resolves against the parent dir
+                      # via the existing dotted-path rule (a.b -> a/b.kai)
+```
+
+The driver makes the manifest's parent directory a search path so
+the qualified form lands on `<parent>/notes/store.kai` (= the
+manifest dir's `store.kai`) on the first try. No changes to
+`kaic2` were needed — the existing `module_to_path` already
+translates dots to slashes. Both forms continue to work; the
+qualified form is recommended when a package wants to be explicit
+about the package boundary it is crossing.
+
+### Transitive test discovery
+
+`kai test ./...` walks the cwd subtree and runs `kai test` once
+per `kai.toml`. Packages are visited in `find`'s default order
+(lexicographic per level); aggregate exit code is the OR of every
+sub-run, so CI fails the moment any package's tests do. Packages
+without an entry file are skipped silently with a `SKIP <pkg>`
+line on stderr; the run continues.
+
+### Fixtures
+
+The reference fixtures for the package-aware shape live under
+`examples/packages/`:
+
+- `build_hello/` — `kai build` with no arguments.
+- `build_entry_override/` — `entry = "src/main.kai"`.
+- `build_sub_package/` — `kai build ./sub` against a sibling
+  manifest.
+- `build_module_qualified/` — `import <pkgname>.<module>` shape.
+
+Each fixture has its own `README.md` with the reproducer.
+
 ## Architecture
 
 The package manager is split across three components:

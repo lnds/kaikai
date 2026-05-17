@@ -264,6 +264,37 @@ manifest_package_name() {
   ' "$manifest_dir/kai.toml"
 }
 
+# Issue #658: read the `entry = "..."` field from kai.toml as an
+# explicit override of the conventional `main.kai` entry point.
+# Empty manifest dir, missing manifest, or missing field all fall
+# back to `main.kai`. Mirrors Cargo's `[[bin]] path =` shape: when
+# a package wants to keep sources under `src/` (e.g. `src/main.kai`)
+# the manifest declares it and the driver respects it from every
+# entry-aware subcommand.
+manifest_entry_field() {
+  manifest_dir="$1"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    printf 'main.kai'
+    return 0
+  fi
+  entry="$(awk '
+    /^[[:space:]]*\[/ { in_root = 0 }
+    /^[[:space:]]*\[package\]/ { in_root = 1; next }
+    NR == 1 || in_root || /^[^[]/ {
+      if (in_root || NR <= 30) {
+        if ($0 ~ /^[[:space:]]*entry[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/) {
+          gsub(/^[^"]*"/, "", $0); gsub(/".*$/, "", $0); print; exit
+        }
+      }
+    }
+  ' "$manifest_dir/kai.toml")"
+  if [ -z "$entry" ]; then
+    printf 'main.kai'
+  else
+    printf '%s' "$entry"
+  fi
+}
+
 # Emit `--path <abs>` flags for the manifest's own root plus each
 # dep in $1/kai.toml. Resolves relative local-path deps against $1;
 # git deps come from the lockfile's cache field. Silent if no
@@ -284,6 +315,17 @@ manifest_path_flags() {
     return 0
   fi
   printf -- '--path %s ' "$manifest_dir"
+  # Issue #658: also expose the manifest's parent directory so that
+  # `import <pkgname>.<module>` resolves under it. kaic2's
+  # `module_to_path` already turns dotted paths into directory
+  # paths (`a.b -> a/b.kai`); we just need the parent visible as a
+  # search root for the package's own short name. Bare `import
+  # <module>` keeps working because the manifest dir itself is
+  # still the first search path.
+  parent_dir="$(dirname "$manifest_dir")"
+  if [ -n "$parent_dir" ] && [ "$parent_dir" != "$manifest_dir" ] && [ -d "$parent_dir" ]; then
+    printf -- '--path %s ' "$parent_dir"
+  fi
   ensure_kaipkg
   cache_root="$(resolve_cache_root)"
   mkdir -p "$cache_root"
@@ -469,14 +511,16 @@ usage() {
 usage: kai <command> [args...]
 
 Commands:
-  build <file.kai> [-o <out>]   Compile a kaikai file to a native binary.
-  run   <file.kai> [args...]    Build and execute; forwards remaining args.
-  test  <file.kai>              Compile with --test and run the test binary.
-  bench [--iters N] <file.kai>  Compile with --bench and run the bench binary.
-  check <file.kai>              Compile with --prop-check and run property
+  build [<spec>] [-o <out>]     Compile a kaikai package or file. With no
+                                <spec> the cwd package's entry point is used.
+  run   [<spec>] [args...]      Build and execute; forwards remaining args.
+  test  [<spec>|./...]          Compile with --test and run. './...' walks
+                                every kai.toml under cwd.
+  bench [--iters N] [<spec>]    Compile with --bench and run.
+  check [<spec>]                Compile with --prop-check and run property
                                 blocks (issue #44).
-  fmt   <file.kai> [--check]    Pretty-print kaikai source canonically.
-  watch <file.kai>              Recompile + run on every save (live demo).
+  fmt   [<spec>] [--check]      Pretty-print kaikai source canonically.
+  watch [<spec>]                Recompile + run on every save (live demo).
   init  <name>                  Create a kai.toml manifest in the cwd.
   add   <source>[@<ref>]        Fetch a dep and append it to kai.toml.
   install                       Resolve dependencies (git fetch + lock).
@@ -484,6 +528,10 @@ Commands:
   show                          Print the parsed kai.toml.
   help                          Show this help.
   --version                     Print version and demo baseline.
+
+A <spec> is one of: a path to a .kai file (legacy file mode), '.' or
+omitted (the current directory's package, read from kai.toml), or
+'./<sub>' where <sub> is a directory carrying its own kai.toml.
 
 Run 'kai <command> --help' for command-specific options.
 
@@ -510,18 +558,28 @@ EOF
 
 usage_build() {
   cat <<EOF
-usage: kai build <file.kai> [-o <out>] [--backend=<c|llvm>]
-       kai build --holes <file.kai>
-       kai build --holes-json <file.kai>
+usage: kai build [<spec>] [-o <out>] [--backend=<c|llvm>]
+       kai build --holes [<spec>]
+       kai build --holes-json [<spec>]
 
-Compile a kaikai source file to a native binary. The default backend
-is \`c\` (portable C linked with cc) — supported across every Hanga
-Roa fixture. The LLVM backend is opt-in via \`--backend=llvm\` or
-\`KAI_BACKEND=llvm\`: it is faster and has fewer external deps when it
-works, but has known M3b gaps that fail on tuple-pattern let-bindings
-and several closure shapes. Those gaps close in Orongo. The llvm
-backend emits LLVM IR via \`kaic2 --emit=llvm\` and links it with clang
-against stage0/runtime_llvm.c (L1 of the LLVM-direct refactor).
+Compile a kaikai package or file to a native binary. <spec> is one
+of:
+  <file>.kai       legacy file mode (unchanged from earlier versions).
+  '.' or omitted   the package rooted at the cwd; kai.toml supplies
+                   the package name (used as the binary name) and
+                   optional 'entry = "..."' override of the default
+                   main.kai entry point.
+  './<sub>'        a sub-package — <sub> must carry its own kai.toml;
+                   the binary lands inside that sub-directory.
+
+The default backend is \`c\` (portable C linked with cc) — supported
+across every Hanga Roa fixture. The LLVM backend is opt-in via
+\`--backend=llvm\` or \`KAI_BACKEND=llvm\`: it is faster and has fewer
+external deps when it works, but has known M3b gaps that fail on
+tuple-pattern let-bindings and several closure shapes. Those gaps
+close in Orongo. The llvm backend emits LLVM IR via \`kaic2
+--emit=llvm\` and links it with clang against stage0/runtime_llvm.c
+(L1 of the LLVM-direct refactor).
 
 Options:
   -o <out>             Output binary path (default: basename of input
@@ -540,6 +598,9 @@ Options:
   -h, --help           Show this help.
 
 Examples:
+  kai build                                 # cwd package (reads kai.toml)
+  kai build .                               # equivalent explicit form
+  kai build ./sub                           # sibling sub-package
   kai build hello.kai                       # produces ./hello (C backend)
   kai build src/app.kai -o build/app        # produces ./build/app
   kai build --backend=llvm hello.kai        # produces ./hello via clang
@@ -553,12 +614,14 @@ EOF
 
 usage_run() {
   cat <<EOF
-usage: kai run [--backend=<c|llvm>] <file.kai> [args...]
+usage: kai run [--backend=<c|llvm>] [<spec>] [args...]
 
-Compile and immediately execute a kaikai program. Any arguments after
-the source file are forwarded to the compiled binary. Backend selection
-follows the same rule as \`kai build\`: --backend > KAI_BACKEND >
-default (\`c\` — the LLVM backend is opt-in until Orongo).
+Compile and immediately execute a kaikai program. <spec> follows the
+same rules as \`kai build\` (a .kai file, '.', '<sub>', or omitted for
+the cwd package). Any arguments after the spec are forwarded to the
+compiled binary. Backend selection follows the same rule as
+\`kai build\`: --backend > KAI_BACKEND > default (\`c\` — the LLVM
+backend is opt-in until Orongo).
 
 Options:
   --backend=<c|llvm>   Codegen backend (default: c — the LLVM backend
@@ -568,6 +631,9 @@ Options:
   -h, --help           Show this help.
 
 Examples:
+  kai run                                   # cwd package
+  kai run .                                 # equivalent explicit form
+  kai run ./sub                             # sub-package binary
   kai run examples/minimal/hello.kai
   kai run demos/fizzbuzz/fizzbuzz.kai 30
   kai run app.kai --user alice --port 8080
@@ -579,11 +645,17 @@ EOF
 
 usage_test() {
   cat <<EOF
-usage: kai test [options] <file.kai>
+usage: kai test [options] [<spec>|./...]
 
 Compile a kaikai source with --test enabled and run the test binary.
+<spec> follows the same rules as \`kai build\` (a .kai file, '.', a
+'./<sub>' sub-package, or omitted for the cwd package). The special
+spec './...' walks the cwd subtree and runs \`kai test\` for every
+directory that carries its own kai.toml — exit code is the OR of
+every sub-run, so CI fails the moment any package's tests do.
+
 The compiler emits a main that runs every 'test "..." { ... }' block
-defined in <file.kai> and reports the result.
+defined in the entry point and reports the result.
 
 Tests defined inside the auto-loaded stdlib preludes are dropped at
 load time (issue #318) so the count reflects only the user's tests.
@@ -594,6 +666,8 @@ Options:
                             stdlib preludes (legacy behaviour).
 
 Examples:
+  kai test                                   # cwd package
+  kai test ./...                             # every package under cwd
   kai test stage2/tests/test_lex.kai
   kai test demos/poker/poker.kai
   kai test --include-prelude-tests demos/poker/poker.kai
@@ -1116,23 +1190,88 @@ compile_to_binary() {
 # what got picked. Returns the path on stdout when found; empty
 # string when no inference is possible (caller falls back to the
 # old "missing input file" diagnostic).
-infer_entry_point() {
+# Issue #658: resolve a package spec — `.`, `./sub`, a relative
+# `*.kai` file path, or empty (meaning the cwd) — into a concrete
+# entry-point file path. Sub-package mode (`./sub`) requires the
+# target directory to carry its own kai.toml; plain subdirectories
+# of the current package are not separately buildable. `./...`
+# (transitive test discovery) is handled by a dedicated walker in
+# cmd_test, not here. File-path arguments (`foo.kai`) pass through
+# unchanged so existing invocations keep working.
+#
+# Manifest-aware entry resolution: when the resolved directory has
+# a kai.toml, the entry point is `manifest_entry_field` (default
+# `main.kai`). The function dies with a clear diagnostic when an
+# explicit `entry = "..."` points at a file that does not exist.
+#
+# Emits nothing (returning success) when the spec is empty AND no
+# manifest exists AND the legacy single-`.kai`-file heuristic does
+# not fire — callers detect this with `[ -n "$src" ]` and surface
+# their own usage error.
+resolve_package_spec() {
+  spec="${1:-}"
+  case "$spec" in
+    ""|".")
+      target_dir="$(pwd)"
+      manifest_dir_inf="$(find_manifest_dir "$target_dir")"
+      if [ -n "$manifest_dir_inf" ] && [ "$manifest_dir_inf" = "$target_dir" ]; then
+        entry_rel="$(manifest_entry_field "$manifest_dir_inf")"
+        entry_path="$manifest_dir_inf/$entry_rel"
+        if [ ! -f "$entry_path" ]; then
+          die "kai.toml declares entry = '$entry_rel' but $entry_path does not exist"
+        fi
+        pkg_name_inf="$(manifest_package_name "$manifest_dir_inf")"
+        if [ -n "$pkg_name_inf" ]; then
+          echo "kai: building package '$pkg_name_inf' (entry point: $entry_rel)" >&2
+        else
+          echo "kai: using $entry_rel as entry point" >&2
+        fi
+        printf '%s' "$entry_path"
+        return 0
+      fi
+      infer_entry_point_legacy
+      return $?
+      ;;
+    ./*)
+      sub_path="${spec#./}"
+      sub_path="${sub_path%/}"
+      [ -d "$sub_path" ] || die "$spec is not a directory"
+      if [ ! -f "$sub_path/kai.toml" ]; then
+        die "$spec has no kai.toml — sub-packages must declare their own manifest"
+      fi
+      entry_rel="$(manifest_entry_field "$sub_path")"
+      entry_path="$sub_path/$entry_rel"
+      if [ ! -f "$entry_path" ]; then
+        die "$sub_path/kai.toml declares entry = '$entry_rel' but $entry_path does not exist"
+      fi
+      pkg_name_inf="$(manifest_package_name "$sub_path")"
+      if [ -n "$pkg_name_inf" ]; then
+        echo "kai: building package '$pkg_name_inf' (entry point: $entry_path)" >&2
+      else
+        echo "kai: using $entry_path as entry point" >&2
+      fi
+      printf '%s' "$entry_path"
+      ;;
+    *.kai)
+      printf '%s' "$spec"
+      ;;
+    *)
+      die "expected a .kai file, '.', or './<sub-package>' (got: $spec)"
+      ;;
+  esac
+}
+
+# Legacy entry-point heuristic preserved for cwds without a
+# kai.toml. Picks ./main.kai if it exists, otherwise the lone .kai
+# file at depth 1. Emits nothing when neither rule matches; the
+# caller surfaces its own usage error so the message stays subcommand
+# specific (`see 'kai build --help'`).
+infer_entry_point_legacy() {
   if [ -f "./main.kai" ]; then
-    # Manifest-aware diagnostic: when there's a kai.toml the user
-    # is in a package directory and the message should reflect
-    # that, not just the file name.
-    src_dir_abs="$(pwd)"
-    manifest_dir_inf="$(find_manifest_dir "$src_dir_abs")"
-    pkg_name_inf="$(manifest_package_name "$manifest_dir_inf")"
-    if [ -n "$pkg_name_inf" ]; then
-      echo "kai: building package '$pkg_name_inf' (entry point: ./main.kai)" >&2
-    else
-      echo "kai: using ./main.kai as entry point" >&2
-    fi
+    echo "kai: using ./main.kai as entry point" >&2
     printf './main.kai'
     return 0
   fi
-  # Count .kai files at depth 1.
   candidate=""
   count=0
   for f in ./*.kai; do
@@ -1146,6 +1285,13 @@ infer_entry_point() {
     return 0
   fi
   printf ''
+}
+
+# Backwards-compatible alias retained for any caller that still
+# reaches for the old name. New code paths funnel through
+# resolve_package_spec.
+infer_entry_point() {
+  resolve_package_spec ""
 }
 
 # Run kaic2 in a typed-hole reporting mode (`--holes` or
@@ -1198,10 +1344,10 @@ cmd_build() {
           *) die "--backend must be 'c' or 'llvm' (got: $backend_cli)" ;;
         esac ;;
       -*) die "unknown flag: $1 (see 'kai build --help')" ;;
-      *) [ -z "$src" ] || die "only one input file supported"; src="$1"; shift ;;
+      *) [ -z "$src" ] || die "only one input supported"; src="$1"; shift ;;
     esac
   done
-  if [ -z "$src" ]; then src="$(infer_entry_point)"; fi
+  src="$(resolve_package_spec "$src")"
   [ -n "$src" ] || die "missing input file (see 'kai build --help')"
   backend="$(resolve_backend "$backend_cli")"
   if [ -n "$holes_mode" ]; then
@@ -1216,13 +1362,24 @@ cmd_build() {
     # over the entry-point's basename, so a package laid out as
     # `notes/{kai.toml,main.kai,...}` builds to `./notes` not
     # `./main`. Mirrors `go build` which uses the module name.
+    # Issue #658: when the src lives under a sub-package (its
+    # manifest dir differs from cwd), the binary goes into that
+    # sub-package dir rather than the cwd. This both matches
+    # `go build ./sub` placement and avoids the path collision
+    # where `./sub` is already a directory.
     src_dir_abs="$(cd "$(dirname "$src")" && pwd)"
     manifest_dir_for_out="$(find_manifest_dir "$src_dir_abs")"
     pkg_name="$(manifest_package_name "$manifest_dir_for_out")"
     if [ -n "$pkg_name" ]; then
-      out="$pkg_name"
+      bin_name="$pkg_name"
     else
-      out="$(basename "$src" .kai)"
+      bin_name="$(basename "$src" .kai)"
+    fi
+    cwd_abs="$(pwd)"
+    if [ -n "$manifest_dir_for_out" ] && [ "$manifest_dir_for_out" != "$cwd_abs" ]; then
+      out="$manifest_dir_for_out/$bin_name"
+    else
+      out="$bin_name"
     fi
   fi
   tmp="$(mktemp -d)"
@@ -1253,7 +1410,10 @@ cmd_run() {
     esac
   done
   case "${1:-}" in
-    "") src="$(infer_entry_point)"
+    "") src="$(resolve_package_spec "")"
+        [ -n "$src" ] || die "missing input file (see 'kai run --help')" ;;
+    .|./*)
+        src="$(resolve_package_spec "$1")"; shift
         [ -n "$src" ] || die "missing input file (see 'kai run --help')" ;;
     *)  src="$1"; shift ;;
   esac
@@ -1263,6 +1423,73 @@ cmd_run() {
   bin="$tmp/$(basename "$src" .kai)"
   compile_to_binary --backend "$backend" "$src" "$tmp" "$bin" "run"
   "$bin" "$@"
+}
+
+# Issue #658: `kai test ./...` walks the cwd subtree and runs
+# `kai test` for every directory that carries its own kai.toml.
+# Aggregate status is the OR of every sub-run's exit code, so CI
+# fails the moment any package's tests do. Packages are visited in
+# `find`'s default order (lexicographic per level), keeping output
+# stable across runs. Directories without a kai.toml are skipped
+# silently — they are not separately buildable.
+run_tests_recursively() {
+  extra_flags="$1"
+  cwd_abs="$(pwd)"
+  # `find -print` rather than `-print0` keeps the loop portable
+  # across BSD/GNU `find`; package directory names cannot contain
+  # newlines in practice (kai-pkg rejects them at init time).
+  manifests="$(find . -name kai.toml -type f 2>/dev/null | sort)"
+  if [ -z "$manifests" ]; then
+    echo "kai: no kai.toml found under $cwd_abs" >&2
+    return 1
+  fi
+  # The body loop runs in a subshell under POSIX sh (piped from
+  # printf), so counter state must materialise on disk to survive
+  # the loop boundary. Two tiny tally files do the job without
+  # pulling in a temp dir lifecycle.
+  fail_marker="$(mktemp -t kai-test-rec-fail.XXXXXX)"
+  count_marker="$(mktemp -t kai-test-rec-count.XXXXXX)"
+  trap 'rm -f "$fail_marker" "$count_marker"' RETURN 2>/dev/null || true
+  : > "$fail_marker"
+  printf '0' > "$count_marker"
+  printf '%s\n' "$manifests" | while IFS= read -r manifest; do
+    pkg_dir="$(dirname "$manifest")"
+    pkg_name_inf="$(manifest_package_name "$pkg_dir")"
+    if [ -n "$pkg_name_inf" ]; then
+      label="$pkg_name_inf ($pkg_dir)"
+    else
+      label="$pkg_dir"
+    fi
+    entry_rel="$(manifest_entry_field "$pkg_dir")"
+    entry_path="$pkg_dir/$entry_rel"
+    if [ ! -f "$entry_path" ]; then
+      printf '== kai test SKIP %s (no %s)\n' "$label" "$entry_rel" >&2
+      continue
+    fi
+    printf '== kai test %s\n' "$label" >&2
+    # shellcheck disable=SC2086
+    if ( cd "$pkg_dir" && "$SCRIPT" test $extra_flags ); then
+      :
+    else
+      printf 'fail' > "$fail_marker"
+      printf '== FAIL %s\n' "$label" >&2
+    fi
+    cur="$(cat "$count_marker")"
+    printf '%d' "$((cur + 1))" > "$count_marker"
+  done
+  count="$(cat "$count_marker" 2>/dev/null || echo 0)"
+  failed=""
+  [ -s "$fail_marker" ] && failed=1
+  rm -f "$fail_marker" "$count_marker"
+  if [ "$count" = 0 ]; then
+    echo "kai: no buildable packages found under $cwd_abs" >&2
+    return 1
+  fi
+  if [ -n "$failed" ]; then
+    return 1
+  fi
+  printf 'kai: all package tests passed (%d package(s))\n' "$count" >&2
+  return 0
 }
 
 cmd_test() {
@@ -1280,7 +1507,13 @@ cmd_test() {
     esac
   done
   case "${1:-}" in
-    "") src="$(infer_entry_point)"
+    "./..."|"...") shift
+        run_tests_recursively "$extra_flags"
+        return $? ;;
+    "") src="$(resolve_package_spec "")"
+        [ -n "$src" ] || die "missing input file (see 'kai test --help')" ;;
+    .|./*)
+        src="$(resolve_package_spec "$1")"; shift
         [ -n "$src" ] || die "missing input file (see 'kai test --help')" ;;
     *)  src="$1"; shift ;;
   esac
@@ -1307,7 +1540,10 @@ cmd_bench() {
     esac
   done
   case "${1:-}" in
-    "") src="$(infer_entry_point)"
+    "") src="$(resolve_package_spec "")"
+        [ -n "$src" ] || die "missing input file (see 'kai bench --help')" ;;
+    .|./*)
+        src="$(resolve_package_spec "$1")"; shift
         [ -n "$src" ] || die "missing input file (see 'kai bench --help')" ;;
     *)  src="$1"; shift ;;
   esac
@@ -1331,7 +1567,10 @@ cmd_bench() {
 cmd_check() {
   case "${1:-}" in
     -h|--help) usage_check; return 0 ;;
-    "") src="$(infer_entry_point)"
+    "") src="$(resolve_package_spec "")"
+        [ -n "$src" ] || die "missing input file (see 'kai check --help')" ;;
+    .|./*)
+        src="$(resolve_package_spec "$1")"; shift
         [ -n "$src" ] || die "missing input file (see 'kai check --help')" ;;
     *)  src="$1"; shift ;;
   esac
@@ -1379,7 +1618,13 @@ cmd_fmt() {
     return $?
   fi
 
-  if [ -z "$src" ]; then src="$(infer_entry_point)"; fi
+  if [ -z "$src" ]; then
+    src="$(resolve_package_spec "")"
+  else
+    case "$src" in
+      .|./*) src="$(resolve_package_spec "$src")" ;;
+    esac
+  fi
   [ -n "$src" ] || die "missing input file (see 'kai fmt --help')"
   [ -f "$src" ] || die_file_not_found "$src" "fmt"
 
@@ -1434,7 +1679,10 @@ watch_run_once() {
 cmd_watch() {
   case "${1:-}" in
     -h|--help) usage_watch; return 0 ;;
-    "") src="$(infer_entry_point)"
+    "") src="$(resolve_package_spec "")"
+        [ -n "$src" ] || die "missing input file (see 'kai watch --help')" ;;
+    .|./*)
+        src="$(resolve_package_spec "$1")"; shift
         [ -n "$src" ] || die "missing input file (see 'kai watch --help')" ;;
     *)  src="$1"; shift ;;
   esac

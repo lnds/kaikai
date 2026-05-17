@@ -121,6 +121,7 @@ A `kai.toml` declares which edition its source compiles against:
 name = "my-app"
 version = "0.1.0"
 edition = "hanga-roa"
+entry = "src/main.kai"   # optional — defaults to main.kai
 
 [dependencies]
 ```
@@ -129,6 +130,15 @@ If omitted, the package uses the default edition of the kaikai
 installation. Recommendation: set it explicitly once the package
 ships a stable release, so that future kaikai upgrades do not
 silently retarget the package against a newer edition.
+
+The `entry` field (issue #658) overrides the conventional
+`main.kai` entry point used by `kai build` / `kai run` / `kai test`
+when run from inside the package directory. Mirrors Cargo's
+`[[bin]] path =`. If the manifest declares an `entry` that does
+not exist on disk, the driver fails with
+`kai.toml declares entry = '<path>' but <path> does not exist`
+before invoking the compiler. See `docs/packages.md` for the full
+package-aware build shape.
 
 **Multi-edition support:** kaikai's compiler accepts source from
 any edition it knows about. When a package declares `edition =
