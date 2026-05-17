@@ -241,6 +241,29 @@ find_manifest_dir() {
   done
 }
 
+# Read the package name from `name = "..."` in kai.toml. Empty on
+# missing manifest, missing field, or unreadable file. Used by
+# `kai build` to pick a sensible default output binary name when
+# the user did not pass -o (Go-style: the package name, not the
+# entry-point filename).
+manifest_package_name() {
+  manifest_dir="$1"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    return 0
+  fi
+  awk '
+    /^[[:space:]]*\[/ { in_root = 0 }
+    /^[[:space:]]*\[package\]/ { in_root = 1; next }
+    NR == 1 || in_root || /^[^[]/ {
+      if (in_root || NR <= 30) {
+        if ($0 ~ /^[[:space:]]*name[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/) {
+          gsub(/^[^"]*"/, "", $0); gsub(/".*$/, "", $0); print; exit
+        }
+      }
+    }
+  ' "$manifest_dir/kai.toml"
+}
+
 # Emit `--path <abs>` flags for the manifest's own root plus each
 # dep in $1/kai.toml. Resolves relative local-path deps against $1;
 # git deps come from the lockfile's cache field. Silent if no
@@ -1095,7 +1118,17 @@ compile_to_binary() {
 # old "missing input file" diagnostic).
 infer_entry_point() {
   if [ -f "./main.kai" ]; then
-    echo "kai: using ./main.kai (no input file specified)" >&2
+    # Manifest-aware diagnostic: when there's a kai.toml the user
+    # is in a package directory and the message should reflect
+    # that, not just the file name.
+    src_dir_abs="$(pwd)"
+    manifest_dir_inf="$(find_manifest_dir "$src_dir_abs")"
+    pkg_name_inf="$(manifest_package_name "$manifest_dir_inf")"
+    if [ -n "$pkg_name_inf" ]; then
+      echo "kai: building package '$pkg_name_inf' (entry point: ./main.kai)" >&2
+    else
+      echo "kai: using ./main.kai as entry point" >&2
+    fi
     printf './main.kai'
     return 0
   fi
@@ -1108,7 +1141,7 @@ infer_entry_point() {
     count=$((count + 1))
   done
   if [ "$count" = "1" ]; then
-    echo "kai: using $candidate (only .kai in cwd)" >&2
+    echo "kai: using $candidate as entry point (only .kai file in cwd)" >&2
     printf '%s' "$candidate"
     return 0
   fi
@@ -1179,7 +1212,18 @@ cmd_build() {
     return $?
   fi
   if [ -z "$out" ]; then
-    out="$(basename "$src" .kai)"
+    # Default output name: prefer the package name from kai.toml
+    # over the entry-point's basename, so a package laid out as
+    # `notes/{kai.toml,main.kai,...}` builds to `./notes` not
+    # `./main`. Mirrors `go build` which uses the module name.
+    src_dir_abs="$(cd "$(dirname "$src")" && pwd)"
+    manifest_dir_for_out="$(find_manifest_dir "$src_dir_abs")"
+    pkg_name="$(manifest_package_name "$manifest_dir_for_out")"
+    if [ -n "$pkg_name" ]; then
+      out="$pkg_name"
+    else
+      out="$(basename "$src" .kai)"
+    fi
   fi
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
