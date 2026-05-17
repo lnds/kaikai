@@ -168,8 +168,8 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-private-record-shadow-audit test-flat-prefix-aliases
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + private-type shadow audit + private-record shadow audit + flat-prefix alias audit"
+tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-private-record-shadow-audit test-flat-prefix-aliases test-canonical-aliases-progress
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + private-type shadow audit + private-record shadow audit + flat-prefix alias audit + canonical aliases progress report"
 
 # Issue #643 — institutional regression gate for the private-type
 # leak fix. `tools/audit-prelude-private-types.sh` walks every
@@ -200,6 +200,20 @@ test-private-record-shadow-audit: kaic2
 # caught here before the user-facing surface regresses.
 test-flat-prefix-aliases:
 	@./tools/audit-flat-prefix-aliases.sh
+
+# Option E canonical-name progress audit (the m14 follow-up gate
+# that #614 should have shipped but did not). `audit-flat-prefix-aliases.sh`
+# above checks that the legacy `<prefix>_<op>` exports survive a
+# refactor; this audit verifies the converse — that the canonical
+# `<op>` form ALSO exists, which is the actual Option E shape.
+#
+# Today: BOTH=17, LEGACY-only=152, CANONICAL-only=31. The audit
+# exits non-zero when LEGACY-only > 0; piped through `|| true` so
+# the report runs as an informational gate without breaking tier1
+# while the migration is in progress. When LEGACY-only reaches 0,
+# the typer's `module_legacy_prefix` fallback can be retired.
+test-canonical-aliases-progress:
+	@./tools/audit-canonical-aliases.sh | tail -6 || true
 
 # Tongariki — `kai fmt` fixture suite. Verifies that every fixture
 # in examples/fmt/ formats to its `.expected.kai` and is idempotent,
