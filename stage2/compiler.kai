@@ -27975,6 +27975,41 @@ fn report_dup_axiom_decl(file: String, name: String, line: Int, col: Int,
   }
 }
 
+# Run every same-module duplicate-decl validator over a single module's
+# decls. Stdlib modules (core auto-load + `import`-resolved files) bypass
+# `validate_*_collisions_decls` because those walkers only see the
+# root file's `root_only_decls`. The consequence (json_hex_digit case):
+# a duplicate `fn foo` inside a stdlib module silently overwrites the
+# first definition, the second wins at name resolution, and the codegen
+# emits two C-level definitions of `kai_<mod>__foo` that cc rejects at
+# link time — far from the kaikai source where the duplicate lives.
+#
+# This wrapper closes the gap. `load_prelude` (core auto-load) and
+# `resolve_module` (import) call it on every freshly-parsed module's
+# decls before tagging or appending to the global stream. Each
+# validator counts its own diagnostic emissions; the caller sums the
+# total and aborts the load when non-zero so downstream passes never
+# see the broken module.
+#
+# Pre-conditions:
+#   - decls are the just-parsed AST of one source file, NOT the global
+#     concat. Cross-module shadowing is NOT a concern here — by design,
+#     a stdlib `type Pair` and a user `type Pair` coexist (Hanga Roa
+#     decision; see `validate_one_type_decl` comments). This walker
+#     only catches same-file same-name pairs.
+#   - `validate_type_name_collisions_decls` accepts empty module_table
+#     / prelude_mods / target_mod_name to suppress its cross-module
+#     branch, leaving only the local-local check.
+fn validate_module_same_module_collisions(decls: [Decl], file: String)
+    : Int / Console + File {
+  let e_fn     = validate_fn_name_collisions_decls(decls, file)
+  let e_type   = validate_type_name_collisions_decls(decls, file, [], [], "")
+  let e_effect = validate_effect_name_collisions_decls(decls, file)
+  let e_const  = validate_const_name_collisions_decls(decls, file)
+  let e_axiom  = validate_axiom_name_collisions_decls(decls, file)
+  e_fn + e_type + e_effect + e_const + e_axiom
+}
+
 # m7b #12 — collect all distinct row-variable names appearing in the
 # row positions of a function declaration's signature: the outer
 # return-row plus every nested `TyFn` row inside parameter types and
@@ -51881,6 +51916,9 @@ fn rs_add_module(rs: ResolveState, entry: ModuleEntry) : ResolveState =
 fn rs_bump_errs(rs: ResolveState) : ResolveState =
   ResolveState { visited: rs.visited, in_progress: rs.in_progress, decls: rs.decls, modules: rs.modules, errs: rs.errs + 1 }
 
+fn rs_bump_errs_by(rs: ResolveState, n: Int) : ResolveState =
+  ResolveState { visited: rs.visited, in_progress: rs.in_progress, decls: rs.decls, modules: rs.modules, errs: rs.errs + n }
+
 # Extract the public-facing names declared at the top of a module
 # file. Looks at pub fn / pub type / pub effect / pub protocol /
 # pub axiom / pub use? Currently: pub fn, pub type, pub effect,
@@ -52144,6 +52182,15 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                 Some(decls) -> {
                   let rs2 = process_imports(base_dir, decls, search_paths, rs_in)
                   let kept = non_import_decls(decls)
+                  # Validate same-module name collisions before the
+                  # imported module's decls join the global stream.
+                  # Mirrors the check in `load_prelude` for core
+                  # auto-load — without it, an `import` of a module
+                  # with a duplicate `fn foo` silently keeps the
+                  # second definition and the codegen emits two C
+                  # symbols for the same kaikai name.
+                  let mod_errs = validate_module_same_module_collisions(kept, abs_path)
+                  let rs2b = if mod_errs > 0 { rs_bump_errs_by(rs2, mod_errs) } else { rs2 }
                   # m6.2 v2: tag every DFn coming from this module
                   # with `module_origin = Some(import_name)` so the
                   # codegen mints `kai_<import_name>__<name>`. Done
@@ -52155,7 +52202,7 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                   # M6.1 fallback diag fires later.
                   let tagged = if import_name == "" { kept }
                                else { tag_decls_module_origin(kept, import_name) }
-                  let rs3 = rs_append_decls(rs2, tagged)
+                  let rs3 = rs_append_decls(rs2b, tagged)
                   if import_name == "" { rs3 }
                   else {
                     let exports = collect_pub_exports(kept, [])
@@ -60661,14 +60708,24 @@ fn load_prelude(path: String, include_tests: Bool) : Option[PreludeLoaded] / Con
           Some(ds) -> {
             let mod_name = prelude_module_name(path)
             let kept = if include_tests { ds } else { strip_prelude_tests(ds, []) }
-            let exports = collect_pub_exports(kept, [])
-            let unstable_exports = collect_unstable_exports(kept, [])
-            # m6.2 v2: tag every DFn coming from this prelude file
-            # with `module_origin = Some(<basename>)` so the codegen
-            # mints `kai_<basename>__<name>` for it. Decls authored
-            # in the root file keep `None` (set by the parser).
-            let tagged = tag_decls_module_origin(kept, mod_name)
-            Some(PL(tagged, ME(mod_name, exports, path, unstable_exports)))
+            # Validate same-module name collisions before the module's
+            # decls join the global stream. Without this, a duplicate
+            # `fn foo` inside a stdlib module silently overwrites the
+            # first and surfaces as a cc-time "redefinition of …" deep
+            # in generated code (see `validate_module_same_module_collisions`
+            # for the json_hex_digit case study).
+            let mod_errs = validate_module_same_module_collisions(kept, path)
+            if mod_errs > 0 { None }
+            else {
+              let exports = collect_pub_exports(kept, [])
+              let unstable_exports = collect_unstable_exports(kept, [])
+              # m6.2 v2: tag every DFn coming from this prelude file
+              # with `module_origin = Some(<basename>)` so the codegen
+              # mints `kai_<basename>__<name>` for it. Decls authored
+              # in the root file keep `None` (set by the parser).
+              let tagged = tag_decls_module_origin(kept, mod_name)
+              Some(PL(tagged, ME(mod_name, exports, path, unstable_exports)))
+            }
           }
         }
       }
