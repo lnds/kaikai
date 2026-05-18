@@ -54123,16 +54123,43 @@ fn vpa_decls_loop(decls: [Decl], table: [PubAccessEntry],
 fn vpa_decl(d: Decl, table: [PubAccessEntry], home: String,
               target_mod: String, file: String) : Int / Console + File = match d {
 
-  DFn(_, _, _, params, _, _, body, _, _, _) ->
-    vpa_expr(body, fn_param_names(params), table, home, file, 0)
+  DFn(_, _, _, params, ret, row, body, line, col, _) -> {
+    let es = vpa_sig_params(params, table, home, file, 0)
+    let er = match ret {
+      Some(te) -> es + vpa_sig_te(te, table, home, file)
+      None -> es
+    }
+    let ew = er + vpa_sig_row(row, table, home, file, line, col)
+    ew + vpa_expr(body, fn_param_names(params), table, home, file, 0)
+  }
+  DAxiom(_, _, _, _, _, params, ret, row, line, col) -> {
+    let es = vpa_sig_params(params, table, home, file, 0)
+    let er = es + vpa_sig_te(ret, table, home, file)
+    er + vpa_sig_row(row, table, home, file, line, col)
+  }
+  DConst(_, _, te, body, _, _) -> {
+    let es = vpa_sig_te(te, table, home, file)
+    es + vpa_expr(body, [], table, home, file, 0)
+  }
+  DType(_, _, _, body, line, col, _) ->
+    vpa_sig_typebody(body, table, home, file, line, col)
+  DEffect(_, _, _, ops, _, _, _) ->
+    vpa_sig_eops(ops, table, home, file, 0)
+  DProtocol(_, _, _, ops, _, _) ->
+    vpa_sig_pops(ops, table, home, file, 0)
   DTest(_, body, _, _) ->
     vpa_expr(body, [], table, target_mod, file, 0)
   DBench(_, body, _, _) ->
     vpa_expr(body, [], table, target_mod, file, 0)
-  DCheck(_, ps, body, _, _) ->
-    vpa_expr(body, fn_param_names(ps), table, target_mod, file, 0)
-  DImpl(_, _, _, sub_decls, _, _) ->
-    vpa_decls_loop(sub_decls, table, target_mod, home, file, 0)
+  DCheck(_, ps, body, _, _) -> {
+    let es = vpa_sig_params(ps, table, target_mod, file, 0)
+    es + vpa_expr(body, fn_param_names(ps), table, target_mod, file, 0)
+  }
+  DImpl(_, targs, target_te, sub_decls, _, _) -> {
+    let et = vpa_sig_te(target_te, table, home, file)
+    let ea = et + vpa_sig_te_list(targs, table, home, file, 0)
+    ea + vpa_decls_loop(sub_decls, table, target_mod, home, file, 0)
+  }
   DDerive(_, inner, _, _) ->
     vpa_decl(inner, table, home, target_mod, file)
   DUnstable(inner, _, _) ->
@@ -54141,6 +54168,163 @@ fn vpa_decl(d: Decl, table: [PubAccessEntry], home: String,
     vpa_decl(inner, table, home, target_mod, file)
   _ -> 0
 }
+
+# Signature walkers. Each `TyName(n, _)` or `RL(n, _)` or `USym(n)`
+# reachable from a decl signature is checked through `pae_decide`,
+# mirroring how `vpa_kind` checks `EVar(nm)` references in bodies.
+# This closes the privacy leak class where a `pub fn` in one module
+# names a non-`pub` type (or effect / unit / protocol) of another
+# module — a reference the body-only walker missed because the leak
+# lives in the signature, not in any expression.
+fn vpa_sig_params(ps: [Param], table: [PubAccessEntry], home: String,
+                     file: String, acc: Int) : Int / Console + File = match ps {
+  [] -> acc
+  [p, ...rest] -> {
+    let e1 = match p.ptype {
+      Some(te) -> acc + vpa_sig_te(te, table, home, file)
+      None -> acc
+    }
+    vpa_sig_params(rest, table, home, file, e1)
+  }
+}
+
+fn vpa_sig_te(te: TypeExpr, table: [PubAccessEntry], home: String,
+                 file: String) : Int / Console + File = match te.tkind {
+  TyName(n, targs) -> {
+    let en = vpa_sig_check_name(n, table, home, file, te.line, te.col)
+    let el = vpa_sig_te_list(targs, table, home, file, 0)
+    en + el
+  }
+  TyList(inner) -> vpa_sig_te(inner, table, home, file)
+  TyFn(ps, ret, row) -> {
+    let ep = vpa_sig_te_list(ps, table, home, file, 0)
+    let er = vpa_sig_te(ret, table, home, file)
+    let ew = vpa_sig_row(row, table, home, file, te.line, te.col)
+    ep + er + ew
+  }
+  TyDim(base, u) -> {
+    let eb = vpa_sig_te(base, table, home, file)
+    let eu = vpa_sig_uexpr(u, table, home, file, te.line, te.col)
+    eb + eu
+  }
+  TyRefine(base, _) -> vpa_sig_te(base, table, home, file)
+}
+
+fn vpa_sig_te_list(ts: [TypeExpr], table: [PubAccessEntry], home: String,
+                      file: String, acc: Int) : Int / Console + File = match ts {
+  [] -> acc
+  [t, ...rest] -> {
+    let e1 = acc + vpa_sig_te(t, table, home, file)
+    vpa_sig_te_list(rest, table, home, file, e1)
+  }
+}
+
+fn vpa_sig_row(row: RowExpr, table: [PubAccessEntry], home: String,
+                  file: String, line: Int, col: Int) : Int / Console + File = match row {
+  REmpty -> 0
+  RClosed(labels) -> vpa_sig_row_labels(labels, table, home, file, line, col, 0)
+  ROpen(_, labels) -> vpa_sig_row_labels(labels, table, home, file, line, col, 0)
+}
+
+fn vpa_sig_row_labels(ls: [RowLabel], table: [PubAccessEntry], home: String,
+                         file: String, line: Int, col: Int,
+                         acc: Int) : Int / Console + File = match ls {
+  [] -> acc
+  [l, ...rest] -> match l {
+    RL(name, targs) -> {
+      let en = vpa_sig_check_name(name, table, home, file, line, col)
+      let el = vpa_sig_te_list(targs, table, home, file, 0)
+      vpa_sig_row_labels(rest, table, home, file, line, col, acc + en + el)
+    }
+  }
+}
+
+fn vpa_sig_typebody(b: TypeBody, table: [PubAccessEntry], home: String,
+                       file: String, line: Int, col: Int) : Int / Console + File = match b {
+  TBAlias(te) -> vpa_sig_te(te, table, home, file)
+  TBRecord(fs) -> vpa_sig_fdecls(fs, table, home, file, 0)
+  TBSum(vs) -> vpa_sig_variants(vs, table, home, file, 0)
+  TBEffectAlias(labels) -> vpa_sig_alias_labels(labels, table, home, file, line, col, 0)
+}
+
+fn vpa_sig_fdecls(fs: [FieldDecl], table: [PubAccessEntry], home: String,
+                     file: String, acc: Int) : Int / Console + File = match fs {
+  [] -> acc
+  [f, ...rest] -> match f {
+    FD(_, te) -> vpa_sig_fdecls(rest, table, home, file, acc + vpa_sig_te(te, table, home, file))
+  }
+}
+
+fn vpa_sig_variants(vs: [Variant], table: [PubAccessEntry], home: String,
+                       file: String, acc: Int) : Int / Console + File = match vs {
+  [] -> acc
+  [v, ...rest] -> match v {
+    Var(_, tes) -> vpa_sig_variants(rest, table, home, file,
+                                       acc + vpa_sig_te_list(tes, table, home, file, 0))
+  }
+}
+
+fn vpa_sig_alias_labels(ls: [String], table: [PubAccessEntry], home: String,
+                           file: String, line: Int, col: Int,
+                           acc: Int) : Int / Console + File = match ls {
+  [] -> acc
+  [n, ...rest] -> vpa_sig_alias_labels(rest, table, home, file, line, col,
+                                          acc + vpa_sig_check_name(n, table, home, file, line, col))
+}
+
+fn vpa_sig_eops(ops: [EffectOp], table: [PubAccessEntry], home: String,
+                   file: String, acc: Int) : Int / Console + File = match ops {
+  [] -> acc
+  [op, ...rest] -> match op {
+    EOp(_, _, ps, ret, _, _) -> {
+      let ep = vpa_sig_params(ps, table, home, file, 0)
+      let er = vpa_sig_te(ret, table, home, file)
+      vpa_sig_eops(rest, table, home, file, acc + ep + er)
+    }
+  }
+}
+
+fn vpa_sig_pops(ops: [ProtoOp], table: [PubAccessEntry], home: String,
+                   file: String, acc: Int) : Int / Console + File = match ops {
+  [] -> acc
+  [op, ...rest] -> match op {
+    POp(_, _, ps, ret, _, _) -> {
+      let ep = vpa_sig_params(ps, table, home, file, 0)
+      let er = vpa_sig_te(ret, table, home, file)
+      vpa_sig_pops(rest, table, home, file, acc + ep + er)
+    }
+  }
+}
+
+fn vpa_sig_uexpr(u: UnitExprT, table: [PubAccessEntry], home: String,
+                    file: String, line: Int, col: Int) : Int / Console + File = match u {
+  UOne -> 0
+  UVar(_) -> 0
+  USym(s) -> vpa_sig_check_name(s, table, home, file, line, col)
+  UMul(a, b) -> {
+    let ea = vpa_sig_uexpr(a, table, home, file, line, col)
+    let eb = vpa_sig_uexpr(b, table, home, file, line, col)
+    ea + eb
+  }
+  UInv(a) -> vpa_sig_uexpr(a, table, home, file, line, col)
+  UPow(a, _) -> vpa_sig_uexpr(a, table, home, file, line, col)
+}
+
+fn vpa_sig_check_name(n: String, table: [PubAccessEntry], home: String,
+                         file: String, line: Int,
+                         col: Int) : Int / Console + File =
+  match pae_decide(table, n, home) {
+    Visible -> 0
+    Unknown -> 0
+    PrivateTo(other_home) -> {
+      diag_error(file, line, col,
+        concat_all(["cannot reference non-pub `", n, "` from module `",
+                    other_home, "` in this signature (declared private to `",
+                    other_home, "`); mark it as `pub` in module `", other_home,
+                    "` to expose it"]))
+      1
+    }
+  }
 
 fn vpa_expr(e: Expr, locals: [String], table: [PubAccessEntry],
               home: String, file: String, errs: Int) : Int / Console + File =
