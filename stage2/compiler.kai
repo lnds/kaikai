@@ -39349,6 +39349,379 @@ fn validate_unit_expr(u: UnitExprT, declared: [String], file: String,
 # editing the per-fixture declaration list.
 fn is_builtin_unit_symbol(_s: String) : Bool = false
 
+# ----------------------------------------------------------------------
+# Pub-signature privacy pass (Hanga Roa import-filter lane, step 1).
+#
+# Walks every `pub` declaration in the merged decl stream and reports
+# an error whenever its signature mentions a NON-`pub` symbol declared
+# in the same module. Examples of the leak this catches:
+#
+#   # lib.kai
+#   type Secret = Hidden(Int)             # not pub
+#   pub fn unwrap(s: Secret) : Int = ...  # leaks `Secret` to importers
+#
+# Why this lives here, not in the post-typer cross-module walker: the
+# next step of the same lane filters non-`pub` decls out of the import
+# stream entirely, so by the time a consumer sees `lib`'s exports the
+# private types are physically absent. A consumer that references
+# `Secret` would simply fail to resolve the name — but that diagnostic
+# would fire in the consumer, not in `lib`. This pass moves the error
+# to the right place: the module whose signature is the leak.
+#
+# Scope of "private name of the same module":
+#   - DType names whose `is_pub == false`.
+#   - DEffect names whose `is_pub == false` (referenced as row labels).
+#   - DProtocol names whose `is_pub == false`.
+#   - DConst names are not type-level and cannot appear in signatures;
+#     skipped.
+#   - DUnit cross-module privacy is handled by validate_unit_refs after
+#     the import filter lands. Intra-module unit hygiene already runs
+#     in validate_unit_refs_decls.
+#
+# Walked positions for each pub decl:
+#   - DFn / DAxiom: params, return type, row labels.
+#   - DConst: declared type.
+#   - DType (TBAlias / TBRecord / TBSum): every embedded TypeExpr.
+#     TBEffectAlias labels reference effect names — those check too.
+#   - DEffect: every op's params and return.
+#   - DProtocol: every op's params and return.
+#   - DImpl: target type + all sub_decls walked as pub-equivalent (an
+#     impl pub exposes its methods).
+#
+# Implementation: bucket decls by home module via the same anchor
+# walker validate_pub_access uses. For each bucket compute the set of
+# private type / effect / protocol names. Walk every pub decl in that
+# bucket and report references into the private set.
+
+# Per-decl private-name table. `home` is the module the entry was
+# declared in; `name` is the surface identifier; `kind` is "type",
+# "effect", "protocol", or "unit" so the diagnostic can use the
+# right word. The same table answers two questions:
+#   - given a TyName at the current home, is its name a private of
+#     that home? (covered by priv_lookup)
+#   - given a USym at the current home, is its symbol a private of
+#     that home? (covered by priv_unit_lookup)
+type PubLeakPriv = PLPriv(String, String, String)
+#                         home    name    kind
+
+fn collect_pub_leak_privates(decls: [Decl], homes: [HomeAnchor],
+                                acc: [PubLeakPriv]) : [PubLeakPriv] = match decls {
+  [] -> acc
+  [d, ...rest_d] -> match homes {
+    [] -> acc
+    [h, ...rest_h] -> {
+      let acc1 = pub_leak_priv_one(d, ha_home(h), acc)
+      collect_pub_leak_privates(rest_d, rest_h, acc1)
+    }
+  }
+}
+
+fn pub_leak_priv_one(d: Decl, home: String,
+                        acc: [PubLeakPriv]) : [PubLeakPriv] = match d {
+  DType(p, name, _, _, _, _, _) ->
+    if p { acc } else { [PLPriv(home, name, "type"), ...acc] }
+  DEffect(p, name, _, _, _, _, _) ->
+    if p { acc } else { [PLPriv(home, name, "effect"), ...acc] }
+  DProtocol(p, name, _, _, _, _) ->
+    if p { acc } else { [PLPriv(home, name, "protocol"), ...acc] }
+  DUnit(p, name, _, _, _) ->
+    if p { acc } else { [PLPriv(home, name, "unit"), ...acc] }
+  DAttribPure(inner, _, _) -> pub_leak_priv_one(inner, home, acc)
+  DDerive(_, inner, _, _) -> pub_leak_priv_one(inner, home, acc)
+  DUnstable(inner, _, _) -> pub_leak_priv_one(inner, home, acc)
+  _ -> acc
+}
+
+fn priv_lookup(table: [PubLeakPriv], home: String,
+                  name: String) : Option[String] = match table {
+  [] -> None
+  [e, ...rest] -> match e {
+    PLPriv(h, n, k) ->
+      if h == home and n == name { Some(k) }
+      else { priv_lookup(rest, home, name) }
+  }
+}
+
+# Top-level driver. Walks the merged decl stream; for each `pub` decl
+# (or `pub`-equivalent member of a `pub`/non-`pub` impl), recurse into
+# its signature pieces and emit a diagnostic for every reference into
+# the private name table for the decl's home module.
+fn validate_module_pub_signatures(decls: [Decl], file: String) : Int / Console + File = {
+  let target_mod = prelude_module_name(file)
+  let homes = imports_home_anchors(decls, target_mod, target_mod, [])
+  let priv_table = collect_pub_leak_privates(decls, homes, [])
+  vmps_walk(decls, homes, priv_table, file, 0)
+}
+
+fn vmps_walk(decls: [Decl], homes: [HomeAnchor],
+               priv_table: [PubLeakPriv], file: String,
+               errs: Int) : Int / Console + File = match decls {
+  [] -> errs
+  [d, ...rest_d] -> match homes {
+    [] -> errs
+    [h, ...rest_h] -> {
+      let e1 = errs + vmps_decl(d, ha_home(h), priv_table, file)
+      vmps_walk(rest_d, rest_h, priv_table, file, e1)
+    }
+  }
+}
+
+fn vmps_decl(d: Decl, home: String, priv_table: [PubLeakPriv],
+               file: String) : Int / Console + File = match d {
+  DFn(is_pub, name, _, ps, ret, row, _, line, col, _) ->
+    if is_pub {
+      vmps_fn_sig(name, "fn", ps, ret, row, home, priv_table, file, line, col)
+    } else { 0 }
+  DAxiom(is_pub, _, name, _, _, ps, ret, row, line, col) ->
+    if is_pub {
+      vmps_fn_sig(name, "axiom", ps, Some(ret), row, home, priv_table, file, line, col)
+    } else { 0 }
+  DConst(is_pub, name, te, _, line, col) ->
+    if is_pub {
+      vmps_te(te, name, "const", home, priv_table, file, line, col)
+    } else { 0 }
+  DType(is_pub, name, _, body, line, col, _) ->
+    if is_pub {
+      vmps_typebody(body, name, home, priv_table, file, line, col)
+    } else { 0 }
+  DEffect(is_pub, name, _, ops, _, line, col) ->
+    if is_pub {
+      vmps_eops(ops, name, home, priv_table, file, line, col, 0)
+    } else { 0 }
+  DProtocol(is_pub, name, _, ops, line, col) ->
+    if is_pub {
+      vmps_pops(ops, name, home, priv_table, file, line, col, 0)
+    } else { 0 }
+  DImpl(_, _, target_te, sub_decls, line, col) -> {
+    # Impl methods are reachable through `T.method(...)` whenever the
+    # protocol op resolves to this impl. Treat every sub_decl as
+    # pub-equivalent for the purposes of this validator.
+    let e0 = vmps_te(target_te, "impl target", "impl", home,
+                       priv_table, file, line, col)
+    e0 + vmps_impl_methods(sub_decls, home, priv_table, file, 0)
+  }
+  DAttribPure(inner, _, _) -> vmps_decl(inner, home, priv_table, file)
+  DDerive(_, inner, _, _) -> vmps_decl(inner, home, priv_table, file)
+  DUnstable(inner, _, _) -> vmps_decl(inner, home, priv_table, file)
+  _ -> 0
+}
+
+fn vmps_impl_methods(ds: [Decl], home: String, priv_table: [PubLeakPriv],
+                        file: String, acc: Int) : Int / Console + File = match ds {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DFn(_, name, _, ps, ret, row, _, line, col, _) -> {
+      let e1 = acc + vmps_fn_sig(name, "fn", ps, ret, row, home, priv_table,
+                                    file, line, col)
+      vmps_impl_methods(rest, home, priv_table, file, e1)
+    }
+    DAttribPure(inner, _, _) -> vmps_impl_methods([inner, ...rest], home, priv_table, file, acc)
+    DDerive(_, inner, _, _) -> vmps_impl_methods([inner, ...rest], home, priv_table, file, acc)
+    DUnstable(inner, _, _) -> vmps_impl_methods([inner, ...rest], home, priv_table, file, acc)
+    _ -> vmps_impl_methods(rest, home, priv_table, file, acc)
+  }
+}
+
+fn vmps_fn_sig(decl_name: String, decl_kind: String, ps: [Param],
+                 ret: Option[TypeExpr], row: RowExpr, home: String,
+                 priv_table: [PubLeakPriv], file: String,
+                 line: Int, col: Int) : Int / Console + File = {
+  let e0 = vmps_params(ps, decl_name, decl_kind, home, priv_table, file, 0)
+  let e1 = match ret {
+    Some(te) -> e0 + vmps_te(te, decl_name, decl_kind, home,
+                                priv_table, file, line, col)
+    None -> e0
+  }
+  e1 + vmps_row(row, decl_name, decl_kind, home, priv_table, file, line, col)
+}
+
+fn vmps_params(ps: [Param], decl_name: String, decl_kind: String,
+                  home: String, priv_table: [PubLeakPriv], file: String,
+                  acc: Int) : Int / Console + File = match ps {
+  [] -> acc
+  [p, ...rest] -> {
+    let e1 = match p.ptype {
+      Some(te) -> acc + vmps_te(te, decl_name, decl_kind, home,
+                                   priv_table, file, te.line, te.col)
+      None -> acc
+    }
+    vmps_params(rest, decl_name, decl_kind, home, priv_table, file, e1)
+  }
+}
+
+fn vmps_typebody(b: TypeBody, decl_name: String, home: String,
+                    priv_table: [PubLeakPriv], file: String,
+                    line: Int, col: Int) : Int / Console + File = match b {
+  TBAlias(te) -> vmps_te(te, decl_name, "type", home, priv_table, file, te.line, te.col)
+  TBRecord(fs) -> vmps_fdecls(fs, decl_name, home, priv_table, file, 0)
+  TBSum(vs) -> vmps_variants(vs, decl_name, home, priv_table, file, 0)
+  TBEffectAlias(labels) ->
+    vmps_effect_alias_labels(labels, decl_name, home, priv_table, file, line, col, 0)
+}
+
+fn vmps_fdecls(fs: [FieldDecl], decl_name: String, home: String,
+                  priv_table: [PubLeakPriv], file: String,
+                  acc: Int) : Int / Console + File = match fs {
+  [] -> acc
+  [f, ...rest] -> match f {
+    FD(_, te) -> {
+      let e1 = acc + vmps_te(te, decl_name, "type", home, priv_table,
+                                file, te.line, te.col)
+      vmps_fdecls(rest, decl_name, home, priv_table, file, e1)
+    }
+  }
+}
+
+fn vmps_variants(vs: [Variant], decl_name: String, home: String,
+                    priv_table: [PubLeakPriv], file: String,
+                    acc: Int) : Int / Console + File = match vs {
+  [] -> acc
+  [v, ...rest] -> match v {
+    Var(_, payload_tes) -> {
+      let e1 = acc + vmps_te_list(payload_tes, decl_name, "type", home,
+                                     priv_table, file, 0)
+      vmps_variants(rest, decl_name, home, priv_table, file, e1)
+    }
+  }
+}
+
+fn vmps_effect_alias_labels(labels: [String], decl_name: String,
+                               home: String, priv_table: [PubLeakPriv],
+                               file: String, line: Int, col: Int,
+                               acc: Int) : Int / Console + File = match labels {
+  [] -> acc
+  [l, ...rest] -> {
+    let e1 = acc + vmps_check_name(l, decl_name, "type", home, priv_table,
+                                      file, line, col)
+    vmps_effect_alias_labels(rest, decl_name, home, priv_table, file,
+                                line, col, e1)
+  }
+}
+
+fn vmps_eops(ops: [EffectOp], decl_name: String, home: String,
+                priv_table: [PubLeakPriv], file: String,
+                line: Int, col: Int, acc: Int) : Int / Console + File = match ops {
+  [] -> acc
+  [op, ...rest] -> match op {
+    EOp(_, _, ps, ret, ol, oc) -> {
+      let ep = vmps_params(ps, decl_name, "effect", home, priv_table, file, 0)
+      let er = vmps_te(ret, decl_name, "effect", home, priv_table, file, ol, oc)
+      vmps_eops(rest, decl_name, home, priv_table, file, line, col, acc + ep + er)
+    }
+  }
+}
+
+fn vmps_pops(ops: [ProtoOp], decl_name: String, home: String,
+                priv_table: [PubLeakPriv], file: String,
+                line: Int, col: Int, acc: Int) : Int / Console + File = match ops {
+  [] -> acc
+  [op, ...rest] -> match op {
+    POp(_, _, ps, ret, ol, oc) -> {
+      let pp = vmps_params(ps, decl_name, "protocol", home, priv_table, file, 0)
+      let pr = vmps_te(ret, decl_name, "protocol", home, priv_table, file, ol, oc)
+      vmps_pops(rest, decl_name, home, priv_table, file, line, col, acc + pp + pr)
+    }
+  }
+}
+
+fn vmps_row(row: RowExpr, decl_name: String, decl_kind: String,
+              home: String, priv_table: [PubLeakPriv], file: String,
+              line: Int, col: Int) : Int / Console + File = match row {
+  REmpty -> 0
+  RClosed(labels) -> vmps_row_labels(labels, decl_name, decl_kind, home,
+                                        priv_table, file, line, col, 0)
+  ROpen(_, labels) -> vmps_row_labels(labels, decl_name, decl_kind, home,
+                                         priv_table, file, line, col, 0)
+}
+
+fn vmps_row_labels(ls: [RowLabel], decl_name: String, decl_kind: String,
+                      home: String, priv_table: [PubLeakPriv], file: String,
+                      line: Int, col: Int,
+                      acc: Int) : Int / Console + File = match ls {
+  [] -> acc
+  [l, ...rest] -> match l {
+    RL(name, targs) -> {
+      let cn = vmps_check_name(name, decl_name, decl_kind, home,
+                                  priv_table, file, line, col)
+      let cl = vmps_te_list(targs, decl_name, decl_kind, home,
+                               priv_table, file, 0)
+      vmps_row_labels(rest, decl_name, decl_kind, home, priv_table, file,
+                         line, col, acc + cn + cl)
+    }
+  }
+}
+
+fn vmps_te(te: TypeExpr, decl_name: String, decl_kind: String,
+              home: String, priv_table: [PubLeakPriv], file: String,
+              line: Int, col: Int) : Int / Console + File = match te.tkind {
+  TyName(n, targs) -> {
+    let cn = vmps_check_name(n, decl_name, decl_kind, home, priv_table, file,
+                                te.line, te.col)
+    let cl = vmps_te_list(targs, decl_name, decl_kind, home, priv_table, file, 0)
+    cn + cl
+  }
+  TyList(inner) -> vmps_te(inner, decl_name, decl_kind, home, priv_table, file,
+                              te.line, te.col)
+  TyFn(ps, ret, row) -> {
+    let cp = vmps_te_list(ps, decl_name, decl_kind, home, priv_table, file, 0)
+    let cr = vmps_te(ret, decl_name, decl_kind, home, priv_table, file, te.line, te.col)
+    let cw = vmps_row(row, decl_name, decl_kind, home, priv_table, file, te.line, te.col)
+    cp + cr + cw
+  }
+  TyDim(base, u) -> {
+    let cb = vmps_te(base, decl_name, decl_kind, home, priv_table, file,
+                        te.line, te.col)
+    let cu = vmps_uexpr(u, decl_name, decl_kind, home, priv_table, file,
+                          te.line, te.col)
+    cb + cu
+  }
+  TyRefine(base, _) -> vmps_te(base, decl_name, decl_kind, home, priv_table, file,
+                                  te.line, te.col)
+}
+
+fn vmps_uexpr(u: UnitExprT, decl_name: String, decl_kind: String,
+                 home: String, priv_table: [PubLeakPriv], file: String,
+                 line: Int, col: Int) : Int / Console + File = match u {
+  UOne -> 0
+  UVar(_) -> 0
+  USym(s) -> vmps_check_name(s, decl_name, decl_kind, home, priv_table,
+                                file, line, col)
+  UMul(a, b) -> {
+    let ca = vmps_uexpr(a, decl_name, decl_kind, home, priv_table, file, line, col)
+    let cb = vmps_uexpr(b, decl_name, decl_kind, home, priv_table, file, line, col)
+    ca + cb
+  }
+  UInv(a) -> vmps_uexpr(a, decl_name, decl_kind, home, priv_table, file, line, col)
+  UPow(a, _) -> vmps_uexpr(a, decl_name, decl_kind, home, priv_table, file, line, col)
+}
+
+fn vmps_te_list(ts: [TypeExpr], decl_name: String, decl_kind: String,
+                   home: String, priv_table: [PubLeakPriv], file: String,
+                   acc: Int) : Int / Console + File = match ts {
+  [] -> acc
+  [t, ...rest] -> {
+    let e1 = acc + vmps_te(t, decl_name, decl_kind, home, priv_table,
+                              file, t.line, t.col)
+    vmps_te_list(rest, decl_name, decl_kind, home, priv_table, file, e1)
+  }
+}
+
+fn vmps_check_name(n: String, decl_name: String, decl_kind: String,
+                      home: String, priv_table: [PubLeakPriv],
+                      file: String, line: Int,
+                      col: Int) : Int / Console + File =
+  match priv_lookup(priv_table, home, n) {
+    None -> 0
+    Some(kind_word) -> {
+      diag_error(file, line, col,
+        concat_all(["pub ", decl_kind, " `", decl_name,
+                    "` exposes non-pub ", kind_word, " `", n,
+                    "` from module `", home,
+                    "`; mark `", n, "` as `pub` or remove it from the signature"]))
+      1
+    }
+  }
+
 fn unit_alias_lookup(aliases: [UAliasEntry], name: String) : Option[UnitExprT] {
   match aliases {
     [] -> None
@@ -62723,6 +63096,12 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # fly by the validator.
             let unit_decl_names = collect_declared_unit_names(merged)
             let unit_ref_errs = validate_unit_refs_decls(merged, unit_decl_names, path)
+            # Hanga Roa import-filter lane step 1: every `pub` decl
+            # must not expose a non-`pub` type / effect / protocol
+            # from its own module in the signature. Catches the leak
+            # at the module that authored it, not at every consumer
+            # that downstream might fail to resolve the missing name.
+            let pub_sig_errs = validate_module_pub_signatures(merged, path)
             # issue #187 phase 2: D2 collision check on `type T = A | B`
             # declarations. Walks every TBSum and reports any variant
             # name claimed implicitly by two different parents (with
@@ -62889,6 +63268,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             else if import_hole_errs > 0 { import_hole_errs }
             else if pred_errs > 0 { pred_errs }
             else if unit_ref_errs > 0 { unit_ref_errs }
+            else if pub_sig_errs > 0 { pub_sig_errs }
             else if union_collision_errs > 0 { union_collision_errs }
             else if nursery_brand_errs > 0 { nursery_brand_errs }
             else if qualtype_errs > 0 { qualtype_errs }
