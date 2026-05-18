@@ -3096,7 +3096,7 @@ selfhost: $(TARGET) build
 selfhost-llvm: $(TARGET) build
 	@$(STACK) set -e; \
 	./$(TARGET) --emit=llvm $(SRC) > build/kaic2-s1.ll; \
-	clang -w -I ../stage0 build/kaic2-s1.ll ../stage0/runtime_llvm.c -o build/kaic2-llvm-s1 $(LDLIBS_M) ; \
+	clang -w $(CPPFLAGS_CORE) -I ../stage0 build/kaic2-s1.ll ../stage0/runtime_llvm.c -o build/kaic2-llvm-s1 $(LDLIBS_M) ; \
 	./build/kaic2-llvm-s1 --emit=llvm $(SRC) > build/kaic2-s2.ll; \
 	diff -q build/kaic2-s1.ll build/kaic2-s2.ll > /dev/null \
 	  && echo "llvm self-hosting fixed point: OK" \
