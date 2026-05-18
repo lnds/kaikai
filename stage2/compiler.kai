@@ -40632,7 +40632,8 @@ fn sum_count_tyvar_clauses(cs: [HClause], atv: [Int], auv: [Int]) : Int {
 
 type MonoOutput = MonoOut([Decl], [MLeakRecord])
 
-fn monomorphise(tp: TypedProgram, reg: ProtocolReg) : MonoOutput {
+fn monomorphise(tp: TypedProgram, reg: ProtocolReg,
+                  local_arities: [OpAr]) : MonoOutput {
   let polys = collect_poly_fns(tp.decls)
   # `resolve_protocol_calls` renames `__proto_<op>(arg)` call sites
   # to `__pimpl_<P>_<T>_<op>(arg)` AFTER `infer_program` has populated
@@ -40656,7 +40657,7 @@ fn monomorphise(tp: TypedProgram, reg: ProtocolReg) : MonoOutput {
   # which now mangles to `g__mono__Int`); those new tuples enter
   # the worklist and produce additional specs. Each spec also
   # accumulates a per-spec leak record (m4c Phase 3 invariant).
-  let r = generate_specs_iter(polys, initial_tuples, tp.insts, [], initial_tuples, [], reg)
+  let r = generate_specs_iter(polys, initial_tuples, tp.insts, [], initial_tuples, [], reg, local_arities)
   match r {
     GenSpecsOut(specs, _, leaks) -> MonoOut(list_append(rewritten, specs), leaks)
   }
@@ -41141,7 +41142,8 @@ fn subst_decl(d: Decl, sm: SubstMap) : Decl {
 type SpecEmitOut = SEO(Decl, [MonoTuple], [MLeakRecord])
 
 fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
-              all_tuples: [MonoTuple], reg: ProtocolReg) : SpecEmitOut {
+              all_tuples: [MonoTuple], reg: ProtocolReg,
+              local_arities: [OpAr]) : SpecEmitOut {
   match mt { MT(_, tys, units) -> {
     let sm = build_subst_map(d, tys, units)
     let spec0 = specialise_decl(d, tys, units)
@@ -41154,7 +41156,10 @@ fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
     # polymorphic impls that recurse on the type parameter (e.g.
     # `impl[T: Show] Show for [T]` calling `show(x: T)` per element)
     # leave the renamed dispatcher in place and panic at runtime.
-    let spec1 = resolve_protocol_calls_decl(spec1a, reg)
+    # Hanga Roa shadow guard: same `local_arities` the top-level
+    # `resolve_protocol_calls` consults, so a spec body that mentions
+    # a shadowed bare name keeps the user fn (not the impl).
+    let spec1 = resolve_protocol_calls_decl(spec1a, reg, local_arities)
     # Discover transitive tuples introduced by body subst: for each
     # ECall(EVar(name)) inside the spec body, look up the original
     # CS, apply sm, and collect concrete poly tuples not yet known.
@@ -41532,20 +41537,21 @@ fn generate_specs_iter(polys: [PolyFn], worklist: [MonoTuple],
                         insts: [ResolvedCS], specs_acc: [Decl],
                         all_tuples: [MonoTuple],
                         leaks_acc: [MLeakRecord],
-                        reg: ProtocolReg) : GenSpecsResult {
+                        reg: ProtocolReg,
+                        local_arities: [OpAr]) : GenSpecsResult {
   match worklist {
     [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples, list_reverse(leaks_acc))
     [t, ...rest] -> match lookup_poly_fn(polys, mt_name(t)) {
-      None -> generate_specs_iter(polys, rest, insts, specs_acc, all_tuples, leaks_acc, reg)
+      None -> generate_specs_iter(polys, rest, insts, specs_acc, all_tuples, leaks_acc, reg, local_arities)
       Some(d) -> {
-        let r = emit_spec(d, t, insts, polys, all_tuples, reg)
+        let r = emit_spec(d, t, insts, polys, all_tuples, reg, local_arities)
         match r {
           SEO(spec, new_ts, new_leaks) -> {
             let next_worklist = list_append(rest, new_ts)
             let next_all = list_append(all_tuples, new_ts)
             let next_leaks = prepend_leaks(new_leaks, leaks_acc)
             generate_specs_iter(polys, next_worklist, insts,
-                                 [spec, ...specs_acc], next_all, next_leaks, reg)
+                                 [spec, ...specs_acc], next_all, next_leaks, reg, local_arities)
           }
         }
       }
@@ -56387,6 +56393,23 @@ fn op_ar_match(arities: [OpAr], target: String, n: Int) : Bool {
   }
 }
 
+# Hanga Roa shadow guard for the post-typer protocol-call rewrite.
+# Returns `true` when the rewrite must back off because the callee
+# is a bare-name call whose `(name, arity)` matches a top-level fn.
+# Prefixed dispatchers (`__proto_<op>`) bypass the guard — they were
+# synthesised specifically to land on the impl-table dispatch (by
+# `lower_protocols`'s rename pass for non-shadowed call sites, and
+# by `desugar_interp_decls` to stringify `#{...}` interpolations).
+fn proto_call_is_shadowed(callee_name: String, arity: Int,
+                            local_arities: [OpAr]) : Bool {
+  let pfx = "__proto_"
+  let n_pfx = string_length(pfx)
+  let is_prefixed = string_length(callee_name) > n_pfx and
+                    string_slice(callee_name, 0, n_pfx) == pfx
+  if is_prefixed { false }
+  else { op_ar_match(local_arities, callee_name, arity) }
+}
+
 # Resolver-arity / local-shadow (lane: resolver-local-shadow): collect
 # every top-level `DFn` in the compilation unit as `(name, arity)`. A
 # protocol op whose `(name, arity)` matches one of these is considered
@@ -56703,9 +56726,10 @@ fn rename_proto_calls_kind(k: ExprKind, op_arities: [OpAr], bound: [String]) : E
 # fallback so partial programs (typed holes, generic helpers without
 # concrete dispatch info) still build.
 
-fn resolve_protocol_calls(typed: TypedProgram, reg: ProtocolReg) : TypedProgram {
+fn resolve_protocol_calls(typed: TypedProgram, reg: ProtocolReg,
+                            local_arities: [OpAr]) : TypedProgram {
   TypedProgram {
-    decls: map(typed.decls, (d) => resolve_protocol_calls_decl(d, reg)),
+    decls: map(typed.decls, (d) => resolve_protocol_calls_decl(d, reg, local_arities)),
     errs: typed.errs,
     insts: typed.insts,
     holes: typed.holes,
@@ -56715,25 +56739,30 @@ fn resolve_protocol_calls(typed: TypedProgram, reg: ProtocolReg) : TypedProgram 
   }
 }
 
-fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg) : Decl {
+fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg,
+                                 local_arities: [OpAr]) : Decl {
   match d {
     DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
-      DFn(pub_, n, tps, ps, ret, row, resolve_protocol_calls_expr(body, reg), l, c, mo)
+      DFn(pub_, n, tps, ps, ret, row,
+          resolve_protocol_calls_expr(body, reg, local_arities), l, c, mo)
     DTest(desc, body, l, c) ->
-      DTest(desc, resolve_protocol_calls_expr(body, reg), l, c)
+      DTest(desc, resolve_protocol_calls_expr(body, reg, local_arities), l, c)
     DBench(desc, body, l, c) ->
-      DBench(desc, resolve_protocol_calls_expr(body, reg), l, c)
+      DBench(desc, resolve_protocol_calls_expr(body, reg, local_arities), l, c)
     DCheck(desc, ps, body, l, c) ->
-      DCheck(desc, ps, resolve_protocol_calls_expr(body, reg), l, c)
+      DCheck(desc, ps, resolve_protocol_calls_expr(body, reg, local_arities), l, c)
     _ -> d
   }
 }
 
-fn resolve_protocol_calls_expr(e: Expr, reg: ProtocolReg) : Expr =
-  Expr { kind: resolve_protocol_calls_kind(e.kind, reg, e.ty, e.line, e.col),
+fn resolve_protocol_calls_expr(e: Expr, reg: ProtocolReg,
+                                 local_arities: [OpAr]) : Expr =
+  Expr { kind: resolve_protocol_calls_kind(e.kind, reg, local_arities,
+                                              e.ty, e.line, e.col),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
+                                local_arities: [OpAr],
                                 ret_ty: Option[Ty],
                                 line: Int, col: Int) : ExprKind {
   match k {
@@ -56743,20 +56772,20 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
     # other kinds recurse purely structurally — there is no scope
     # bookkeeping at this stage.
     ECall(callee, args_) -> {
-      let new_args = map(args_, (a) => resolve_protocol_calls_expr(a, reg))
-      let new_callee = resolve_protocol_calls_expr(callee, reg)
+      let new_args = map(args_, (a) => resolve_protocol_calls_expr(a, reg, local_arities))
+      let new_callee = resolve_protocol_calls_expr(callee, reg, local_arities)
       # Issue #180: pass the call's inferred return type so dispatchers
       # whose only Self informant is the return position (e.g.
       # `from(x) : Self` against a `let x : T = from(...)` annotation)
       # can resolve `Self` from that pin.
       let rewritten = try_rewrite_proto_call_with_ret(new_callee, new_args,
-                                                       reg, ret_ty)
+                                                       reg, local_arities, ret_ty)
       match rewritten {
         Some(rk) -> rk
         None     -> ECall(new_callee, new_args)
       }
     }
-    _ -> map_expr_kind(k, (sub) => resolve_protocol_calls_expr(sub, reg))
+    _ -> map_expr_kind(k, (sub) => resolve_protocol_calls_expr(sub, reg, local_arities))
   }
 }
 
@@ -57397,8 +57426,9 @@ fn validate_inv_clauses(cs: [HClause], file: String, bound: [String],
 # arg-driven dispatch when ret_ty is None or Self is informed by args.
 fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
                                      reg: ProtocolReg,
+                                     local_arities: [OpAr],
                                      ret_ty: Option[Ty]) : Option[ExprKind] {
-  match try_rewrite_proto_call(callee, args_, reg) {
+  match try_rewrite_proto_call(callee, args_, reg, local_arities) {
     Some(rk) -> Some(rk)
     None -> {
       # Last-ditch: try the return type as Self.
@@ -57410,6 +57440,15 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
             EVar(name) -> {
               let opname = strip_proto_dispatcher_prefix(name)
               if not list_has(reg.op_names, opname) { None }
+              # Hanga Roa shadow guard: a bare call to a name that
+              # also names a top-level fn of matching arity must
+              # resolve to that fn, not to the protocol impl.
+              # Prefixed callees (`__proto_<op>`) bypass this check
+              # — they were synthesised specifically to land on the
+              # impl-table dispatch.
+              else if proto_call_is_shadowed(name, list_length(args_), local_arities) {
+                None
+              }
               else {
                 let pname = match proto_op_lookup(reg, opname) {
                   Some(po) -> match po { POR(pn, _, _, _, _, _) -> pn }
@@ -57444,11 +57483,17 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
 }
 
 fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
-                            reg: ProtocolReg) : Option[ExprKind] {
+                            reg: ProtocolReg,
+                            local_arities: [OpAr]) : Option[ExprKind] {
   match callee.kind {
     EVar(name) -> {
       let opname = strip_proto_dispatcher_prefix(name)
       if not list_has(reg.op_names, opname) { None }
+      # Hanga Roa shadow guard: see `proto_call_is_shadowed`.
+      # Prefixed dispatchers (`__proto_<op>`) bypass the guard.
+      else if proto_call_is_shadowed(name, list_length(args_), local_arities) {
+        None
+      }
       else {
         # Issue #180: with heterogeneous P[A] dispatch, the receiver
         # is no longer always args[0]. We need to consider every
@@ -62574,7 +62619,17 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   # `__pimpl_<P>_<T>_<op>` direct call. Sites with
                   # unknown types fall through and execute the
                   # dispatcher fn's panic at runtime.
-                  let typed_prog = resolve_protocol_calls(typed_prog0, proto_reg)
+                  # Hanga Roa shadow guard: collect the (name, arity)
+                  # of every top-level DFn so `try_rewrite_proto_call`
+                  # skips bare calls whose name matches a local fn.
+                  # Without this, a user-side `fn show(o: Option[Int])`
+                  # gets silently overridden by
+                  # `__pimpl_Show_Option_show` at the impl-table
+                  # rewrite, breaking the local-wins shadow rule the
+                  # pre-typer `filter_shadowed_ops` already established.
+                  let post_local_arities = collect_local_fn_arities(typed_prog0.decls)
+                  let typed_prog = resolve_protocol_calls(typed_prog0, proto_reg,
+                                                            post_local_arities)
                   # m12.8.x phase 2 (Bug 5): walk the post-rewrite
                   # AST and report any `__proto_<op>` call whose
                   # receiver type is concrete but has no matching
@@ -62617,7 +62672,8 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       # full plan. Phase 3 adds body type / unit
                       # substitution per spec, which retires the
                       # `try_rewrite_show_dim_real` workaround.
-                      let mono_out = monomorphise(typed_prog, proto_reg)
+                      let mono_out = monomorphise(typed_prog, proto_reg,
+                                                     post_local_arities)
                       let mono_decls = match mono_out { MonoOut(ds, _) -> ds }
                       # m4c Phase 3 invariant: per-spec leak records
                       # carry only TyVarT/UVar ids in the spec's
