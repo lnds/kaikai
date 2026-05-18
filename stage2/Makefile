@@ -454,43 +454,50 @@ test-modules-transitive-privacy: $(TARGET) build
 	  || { echo "modules-transitive-privacy DIFF $$d (C vs golden)"; diff $$exp build/mtp-$$d-c.out; exit 1; }; \
 	echo "modules-transitive-privacy OK $$d"
 
-# Hanga Roa import-filter lane — cross-module unit privacy.
+# Hanga Roa import-filter lane — cross-module privacy validation
+# of decl signatures. Each sub-fixture lives in its own directory
+# under `examples/modules/` with `lib.kai` + `main.kai`. Positive
+# fixtures supply a `main.out.expected` golden; negative fixtures
+# supply a `main.err.expected` whose every non-empty line must
+# appear (grep) in the compiler's stderr.
 #
-#   uom_pub_import     — positive: `pub unit K` in lib is visible
-#                        from main. Compiles + runs to "ok\n".
-#   uom_private_unit   — negative: non-`pub` `unit Secret` in lib
-#                        must be rejected when main references it.
-#                        Stderr must contain a substring matching
-#                        `main.err.expected`.
+#   uom_pub_import           positive: pub unit visible
+#   uom_private_unit         negative: priv unit rejected at use
+#   priv_type_used_in_main   negative: priv type rejected at use
+#   priv_effect_used_in_main negative: priv effect rejected at use
+MUOMP_POS_DIRS := uom_pub_import pub_type_used_in_main
+MUOMP_NEG_DIRS := uom_private_unit priv_type_used_in_main priv_effect_used_in_main
 test-modules-uom-privacy: $(TARGET) build
 	@set -e; \
-	d=uom_pub_import; \
-	src=../examples/modules/$$d/main.kai; \
-	exp=../examples/modules/$$d/main.out.expected; \
-	./$(TARGET) --path ../examples/modules/$$d $$src > build/muomp-$$d.c \
-	  || { echo "modules-uom-privacy FAIL $$d (kaic2)"; exit 1; }; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/muomp-$$d.c -o build/muomp-$$d-c $(LDLIBS_M) \
-	  || { echo "modules-uom-privacy FAIL $$d (cc)"; exit 1; }; \
-	./build/muomp-$$d-c > build/muomp-$$d-c.out \
-	  || { echo "modules-uom-privacy FAIL $$d (run C)"; exit 1; }; \
-	diff -q $$exp build/muomp-$$d-c.out > /dev/null \
-	  || { echo "modules-uom-privacy DIFF $$d"; diff $$exp build/muomp-$$d-c.out; exit 1; }; \
-	echo "modules-uom-privacy OK $$d"
+	for d in $(MUOMP_POS_DIRS); do \
+	  src=../examples/modules/$$d/main.kai; \
+	  exp=../examples/modules/$$d/main.out.expected; \
+	  ./$(TARGET) --path ../examples/modules/$$d $$src > build/muomp-$$d.c \
+	    || { echo "modules-uom-privacy FAIL $$d (kaic2)"; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/muomp-$$d.c -o build/muomp-$$d-c $(LDLIBS_M) \
+	    || { echo "modules-uom-privacy FAIL $$d (cc)"; exit 1; }; \
+	  ./build/muomp-$$d-c > build/muomp-$$d-c.out \
+	    || { echo "modules-uom-privacy FAIL $$d (run C)"; exit 1; }; \
+	  diff -q $$exp build/muomp-$$d-c.out > /dev/null \
+	    || { echo "modules-uom-privacy DIFF $$d"; diff $$exp build/muomp-$$d-c.out; exit 1; }; \
+	  echo "modules-uom-privacy OK $$d"; \
+	done
 	@set -e; \
-	d=uom_private_unit; \
-	src=../examples/modules/$$d/main.kai; \
-	exp=../examples/modules/$$d/main.err.expected; \
-	rc=0; ./$(TARGET) --path ../examples/modules/$$d $$src > /dev/null 2> build/muomp-$$d.err || rc=$$?; \
-	if [ $$rc -eq 0 ]; then \
-	  echo "modules-uom-privacy FAIL $$d (expected error, got success)"; exit 1; \
-	fi; \
-	while read -r line; do \
-	  [ -z "$$line" ] && continue; \
-	  grep -q "$$line" build/muomp-$$d.err \
-	    || { echo "modules-uom-privacy FAIL $$d (missing diagnostic: $$line)"; \
-	         cat build/muomp-$$d.err; exit 1; }; \
-	done < $$exp; \
-	echo "modules-uom-privacy OK $$d (rejected as expected)"
+	for d in $(MUOMP_NEG_DIRS); do \
+	  src=../examples/modules/$$d/main.kai; \
+	  exp=../examples/modules/$$d/main.err.expected; \
+	  rc=0; ./$(TARGET) --path ../examples/modules/$$d $$src > /dev/null 2> build/muomp-$$d.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "modules-uom-privacy FAIL $$d (expected error, got success)"; exit 1; \
+	  fi; \
+	  while read -r line; do \
+	    [ -z "$$line" ] && continue; \
+	    grep -q "$$line" build/muomp-$$d.err \
+	      || { echo "modules-uom-privacy FAIL $$d (missing diagnostic: $$line)"; \
+	           cat build/muomp-$$d.err; exit 1; }; \
+	  done < $$exp; \
+	  echo "modules-uom-privacy OK $$d (rejected as expected)"; \
+	done
 
 # M6.2 search-path smoke test: `examples/modules-path/main.kai`
 # imports `shared.helpers`, which lives under
