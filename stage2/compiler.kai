@@ -20519,9 +20519,9 @@ fn desugar_const_refs_decl(d: Decl, const_names: [String]) : Decl {
       let body_names = list_minus_names(const_names, fn_param_names(params))
       DCheck(desc, params, desugar_const_refs_expr(body, body_names), l, c)
     }
-    DType(p, n, tps, body, l, c, _) -> DType(p, n, tps,
+    DType(p, n, tps, body, l, c, mo) -> DType(p, n, tps,
                                             desugar_const_refs_typebody(body, const_names),
-                                            l, c, None)
+                                            l, c, mo)
     DAttribPure(inner, l, c) -> DAttribPure(desugar_const_refs_decl(inner, const_names), l, c)
     _ -> d
   }
@@ -25008,7 +25008,7 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], fuel: Int) : Decl {
           match ret_opt { None -> None Some(te) -> Some(expand_ta_te(te, table, fuel)) },
           row,
           expand_ta_expr(body, table, fuel), l, c, mo)
-    DType(p, n, tps, body, l, c, _) ->
+    DType(p, n, tps, body, l, c, mo) ->
       # Skip rewriting the alias's own DType body: keeping the original
       # decl preserves the alias name in `--ast` output and lets later
       # passes that consult it (refinement synth, dump) see the surface
@@ -25018,9 +25018,9 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], fuel: Int) : Decl {
         TBAlias(_) -> d
         TBEffectAlias(_) -> d
         TBRecord(fs) ->
-          DType(p, n, tps, TBRecord(expand_ta_fields(fs, table, fuel)), l, c, None)
+          DType(p, n, tps, TBRecord(expand_ta_fields(fs, table, fuel)), l, c, mo)
         TBSum(vs) ->
-          DType(p, n, tps, TBSum(expand_ta_variants(vs, table, fuel)), l, c, None)
+          DType(p, n, tps, TBSum(expand_ta_variants(vs, table, fuel)), l, c, mo)
       }
     DEffect(p, n, tps, ops, defblk, l, c) ->
       DEffect(p, n, tps, expand_ta_eops(ops, table, fuel), defblk, l, c)
@@ -29880,7 +29880,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] {
     # — language-level builtins / root-file types — also coincide.
     TyCon(am, an, aa) -> match b {
       TyCon(bm, bn, ba) -> {
-        if option_str_eq(am, bm) and an == bn { unify_list(env, aa, ba, s) }
+        if module_slot_compat(am, bm) and an == bn { unify_list(env, aa, ba, s) }
         # issue #187 phase 4 (D3): implicit upcast inside structural
         # unification. When the two TyCons disagree, accept the
         # mismatch if `b` is a component of the union `a` per the env
@@ -30184,49 +30184,79 @@ fn rec_find_arity(rs: [RecInfo], target: String, arity: Int) : Option[RecInfo] =
   rec_find_arity_loop(rs, target, arity, None)
 
 # Hanga Roa: reorder a `[RecInfo]` so the records visible to a decl
-# from module `home_mod` resolve correctly under `rec_find`. Three
-# buckets, visited in this order:
+# from module `home_mod` resolve correctly under `rec_find`.
 #
-#   1. home: records whose module_origin matches `home_mod` — the
-#      enclosing decl's own home wins for self-references.
-#   2. other_mods: records authored in any OTHER non-root module.
-#      Within a non-root home (e.g. typing `core/list.kai`), these
-#      cross-module records (e.g. `tuple.Pair`) outrank a same-name
-#      user redeclaration. Pre-Hanga-Roa the user's redecl could
-#      contaminate prelude-internal lookups.
-#   3. root: records whose module_origin is None (the user's root
-#      file). For a non-root home these go last so they cannot shadow
-#      the same-name prelude record under `rec_find`. For
-#      `home_mod = None` (the root) every record is in this bucket
-#      and the original newest-first order is preserved so the
-#      user's redecl wins over the same-name prelude record — the
-#      shadowing semantics user code expects.
-fn rerank_recs_for(rs: [RecInfo], home_mod: Option[String]) : [RecInfo] =
-  match home_mod {
-    None    -> rs  # root file: newest-first list already prefers user redecls
-    Some(_) -> rerank_recs_loop(rs, home_mod, [], [], [])
+# Semantics: library code from module M sees its own records first,
+# then records from OTHER library modules, but NEVER records from
+# the consumer's root file. Root code sees everything in its
+# natural newest-first order (its own redecls win for the root's
+# own scope). `root_mod` is the basename of the root file, used
+# to identify and drop root-tagged records when home != root.
+fn rerank_recs_for(rs: [RecInfo], home_mod: Option[String], root_mod: String) : [RecInfo] = {
+  let is_root_home = match home_mod {
+    None     -> true
+    Some(hm) -> hm == root_mod
   }
+  if is_root_home {
+    rs
+  } else {
+    rerank_recs_loop(rs, home_mod, root_mod, [], [], [])
+  }
+}
 
-fn rerank_recs_loop(rs: [RecInfo], hm: Option[String],
+fn rerank_recs_loop(rs: [RecInfo], hm: Option[String], root_mod: String,
                        home: [RecInfo], other_mods: [RecInfo],
                        root: [RecInfo]) : [RecInfo] =
   match rs {
     [] -> list_append(list_reverse(home),
             list_append(list_reverse(other_mods), list_reverse(root)))
     [r, ...rs2] -> match r {
-      RI(_, _, _, mo) ->
-        if option_str_eq(mo, hm) {
-          rerank_recs_loop(rs2, hm, [r, ...home], other_mods, root)
+      RI(_, _, _, mo) -> {
+        let is_root_rec = match mo {
+          None     -> false
+          Some(rm) -> rm == root_mod
+        }
+        if is_root_rec {
+          # Drop: library code never sees consumer-root records.
+          rerank_recs_loop(rs2, hm, root_mod, home, other_mods, root)
+        } else if option_str_eq(mo, hm) {
+          rerank_recs_loop(rs2, hm, root_mod, [r, ...home], other_mods, root)
         } else { match mo {
-          None    -> rerank_recs_loop(rs2, hm, home, other_mods, [r, ...root])
-          Some(_) -> rerank_recs_loop(rs2, hm, home, [r, ...other_mods], root)
+          None    -> rerank_recs_loop(rs2, hm, root_mod, home, other_mods, [r, ...root])
+          Some(_) -> rerank_recs_loop(rs2, hm, root_mod, home, [r, ...other_mods], root)
         } }
+      }
     }
   }
 
 fn option_str_eq(a: Option[String], b: Option[String]) : Bool = match a {
   None    -> match b { None -> true Some(_) -> false }
   Some(x) -> match b { None -> false Some(y) -> x == y }
+}
+
+# Hanga Roa: module-slot compatibility for TyCon unification.
+# Two TyCons unify when their module slots are equal OR at least
+# one slot is `None`. `None` is the placeholder produced by
+# `resolve_ty_with_binds` when it walks a signature TypeExpr
+# without access to the recs/sums tables; the modular typecheck
+# partition (`partition_decls_by_home`) already prevents a user
+# `type Pair = ...` and `tuple.Pair[a, b]` from sharing the same
+# bucket's typer state, so a `None` slot in a signature is no
+# longer destructive — it cannot accidentally pair-up a user-side
+# `Pair` against the stdlib's `Pair`.
+#
+# Returning to strict slot equality fails inside `tuple.kai`'s own
+# bodies: `pub fn swap(p: Pair[a, b])` resolves `p`'s type via
+# `resolve_ty_with_binds` to `TyCon(None, "Pair", [a, b])`, but
+# the `Pair { ... }` literal in the body goes through
+# `rec_instantiate` which stamps `Some("tuple")`. The permissive
+# rule lets those unify; the partition keeps it safe.
+fn module_slot_compat(am: Option[String], bm: Option[String]) : Bool = match am {
+  None    -> true
+  Some(_) -> match bm {
+    None    -> true
+    Some(_) -> option_str_eq(am, bm)
+  }
 }
 
 fn rec_find_loop(rs: [RecInfo], target: String) : Option[RecInfo] =
@@ -30345,27 +30375,41 @@ fn sum_find_loop(ss: [SumInfo], target: String) : Option[SumInfo] {
 
 fn sum_find(ss: [SumInfo], target: String) : Option[SumInfo] = sum_find_loop(ss, target)
 
-# Hanga Roa: SumInfo analog of `rerank_recs_for` (3-bucket scheme).
-fn rerank_sums_for(ss: [SumInfo], home_mod: Option[String]) : [SumInfo] =
-  match home_mod {
-    None    -> ss
-    Some(_) -> rerank_sums_loop(ss, home_mod, [], [], [])
+# SumInfo analog of `rerank_recs_for`. Same semantics: library
+# code never sees the consumer's root sums.
+fn rerank_sums_for(ss: [SumInfo], home_mod: Option[String], root_mod: String) : [SumInfo] = {
+  let is_root_home = match home_mod {
+    None     -> true
+    Some(hm) -> hm == root_mod
   }
+  if is_root_home {
+    ss
+  } else {
+    rerank_sums_loop(ss, home_mod, root_mod, [], [], [])
+  }
+}
 
-fn rerank_sums_loop(ss: [SumInfo], hm: Option[String],
+fn rerank_sums_loop(ss: [SumInfo], hm: Option[String], root_mod: String,
                        home: [SumInfo], other_mods: [SumInfo],
                        root: [SumInfo]) : [SumInfo] =
   match ss {
     [] -> list_append(list_reverse(home),
             list_append(list_reverse(other_mods), list_reverse(root)))
     [s, ...ss2] -> match s {
-      SI(_, _, _, mo) ->
-        if option_str_eq(mo, hm) {
-          rerank_sums_loop(ss2, hm, [s, ...home], other_mods, root)
+      SI(_, _, _, mo) -> {
+        let is_root_sum = match mo {
+          None     -> false
+          Some(rm) -> rm == root_mod
+        }
+        if is_root_sum {
+          rerank_sums_loop(ss2, hm, root_mod, home, other_mods, root)
+        } else if option_str_eq(mo, hm) {
+          rerank_sums_loop(ss2, hm, root_mod, [s, ...home], other_mods, root)
         } else { match mo {
-          None    -> rerank_sums_loop(ss2, hm, home, other_mods, [s, ...root])
-          Some(_) -> rerank_sums_loop(ss2, hm, home, [s, ...other_mods], root)
+          None    -> rerank_sums_loop(ss2, hm, root_mod, home, other_mods, [s, ...root])
+          Some(_) -> rerank_sums_loop(ss2, hm, root_mod, home, [s, ...other_mods], root)
         } }
+      }
     }
   }
 
@@ -30721,7 +30765,7 @@ fn ty_eq_shape(a: Ty, b: Ty) : Bool {
     }
     # Hanga Roa: shape equality respects module_origin too.
     TyCon(am, an, atas) -> match bx {
-      TyCon(bm, bn, btas) -> option_str_eq(am, bm) and an == bn and ty_list_eq_shape(atas, btas)
+      TyCon(bm, bn, btas) -> module_slot_compat(am, bm) and an == bn and ty_list_eq_shape(atas, btas)
       _ -> false
     }
     # issue #187 phase 1: shape-equality on unions is point-wise on
@@ -38046,16 +38090,15 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       let implicit = collect_implicit_tparams_in_decl(d, tparams)
       let effective_tparams = list_append(tparams, implicit)
       let tpbinds = mk_tpbinds(effective_tparams)
-      # Hanga Roa: reorder `recs` so the records authored in this
-      # decl's home module visit first under `rec_find`. Without
-      # this, a `core/tuple.kai` body that constructs `Pair { ... }`
-      # would resolve to a user-redeclared `Pair` from the root
-      # file (which sits newest-first in the unranked list) and the
-      # types would mismatch downstream. None means root file —
-      # rerank_recs_for is a no-op there since the user's records
-      # are already newest-first by construction.
-      let local_recs = rerank_recs_for(recs, mo)
-      let st_init0 = infer_state_new_full_aliases(file, env, prelude_len, local_recs,
+      # Hanga Roa modular typecheck: the per-module fold in
+      # `typecheck_program_loop` already feeds this decl's typer
+      # only the records / sums its bucket inherits from
+      # upstream modules. The legacy `rerank_recs_for` /
+      # `rerank_sums_for` parches (which dropped consumer-root
+      # records when typing prelude bodies) are no longer load-
+      # bearing: a prelude module's recs simply never see the
+      # target's recs in the same `RecInfo[]`.
+      let st_init0 = infer_state_new_full_aliases(file, env, prelude_len, recs,
                                                     op_eff_arities, type_aliases, op_to_eff)
       # Issue #180: install the protocol impl table snapshot so
       # `synth_binop` can decide whether a (prim, nonprim) /
@@ -38146,8 +38189,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # the type-annotation line. Internal stdlib helpers
       # (spawn.spawn, etc.) are exempt by file-path because they are
       # the legitimate constructors of Fiber[T] values.
-      let local_sums = rerank_sums_for(sums, mo)
-      let st1b = check_no_fiber_escape(st1, file, nm, opt_ret, local_sums, line, col)
+      let st1b = check_no_fiber_escape(st1, file, nm, opt_ret, sums, line, col)
       # issue #251 + #252 — Mutable masking. Drop `Mutable` from the
       # inferred row when every `array_set` / `array_grow` demand
       # the body raised targets a locally-constructed Array that
@@ -38986,8 +39028,8 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
           row,
           expand_aliases_expr(body, aliases),
           l, c, mo)
-    DType(p, n, tps, body, l, c, _) ->
-      DType(p, n, tps, expand_aliases_typebody(body, aliases), l, c, None)
+    DType(p, n, tps, body, l, c, mo) ->
+      DType(p, n, tps, expand_aliases_typebody(body, aliases), l, c, mo)
     DTest(desc, body, l, c) -> DTest(desc, expand_aliases_expr(body, aliases), l, c)
     DBench(desc, body, l, c) -> DBench(desc, expand_aliases_expr(body, aliases), l, c)
     DCheck(desc, ps, body, l, c) -> DCheck(desc, ps, expand_aliases_expr(body, aliases), l, c)
@@ -39338,7 +39380,8 @@ type ProgramData = {
 # to the original `collect_program_data` shape — byte-identical to
 # the pre-#574 baseline.
 fn collect_program_data_inherited(file: String, decls: [Decl],
-                                    inherited: ModuleEnvDelta)
+                                    inherited: ModuleEnvDelta,
+                                    all_program_decls: [Decl])
                                     : ProgramData / Console + File {
   # m12.5: expand `unit Newton = kg * m / sec^2` aliases at the AST
   # level before any pass that calls resolve_ty. After this pass no
@@ -39365,9 +39408,20 @@ fn collect_program_data_inherited(file: String, decls: [Decl],
   # `Console = Stdout + Stderr + Stdin` and `Io = Console + Env +
   # File`. The work duplicates `compile_source`'s alias resolution
   # but avoids threading 10+ call sites with two extra parameters.
-  let alias_cands = collect_alias_cands(decls_a)
+  #
+  # Hanga Roa modular typecheck: collect alias candidates over the
+  # FULL program decl stream so an alias declared in one bucket
+  # (e.g. the built-in `Console` alias) is still resolvable from
+  # any other bucket's bodies. Without this, a target file that
+  # writes `Console.print(s)` looks up `Console` only in its own
+  # bucket's decls and falls back to the legacy 2-arg shape (op
+  # call passing the effect-value as the first arg).
+  let alias_src_decls = if list_length(all_program_decls) > 0 {
+    all_program_decls
+  } else { decls_a }
+  let alias_cands = collect_alias_cands(alias_src_decls)
   let eff_names_for_alias = list_append(builtin_effect_names(),
-                                          collect_effect_names(decls_a))
+                                          collect_effect_names(alias_src_decls))
   let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, file)
   let op_to_eff_here = collect_op_to_eff(decls_a)
   let op_to_eff_all = list_append(op_to_eff_here, inherited.op_to_eff)
@@ -39405,12 +39459,14 @@ type TypecheckedModule = { typed: TypedProgram, delta: ModuleEnvDelta }
 
 fn typecheck_module(file: String, mod: ModuleDecls,
                      inherited: ModuleEnvDelta,
+                     all_program_decls: [Decl],
                      proto_impls: [ProtoImplReg],
                      head_owners: [HeadOwnerEntry],
                      verbose: Bool) : TypecheckedModule / Console + File {
 
 
-  let data0 = collect_program_data_inherited(file, mod.decls, inherited)
+  let data0 = collect_program_data_inherited(file, mod.decls, inherited,
+                                                all_program_decls)
   # Issue #594: attach the per-compile head-owner cache to the env
   # the typer walks. The cache is built once per `compile_source`
   # invocation from the post-`expand_imports` decl stream + module
@@ -39423,9 +39479,18 @@ fn typecheck_module(file: String, mod: ModuleDecls,
   let data = ProgramData { decls_a: data0.decls_a, built: built1,
                             recs: data0.recs, alias_res: data0.alias_res,
                             op_to_eff: data0.op_to_eff, sums: data0.sums }
+  # Hanga Roa modular typecheck: `infer_all_loop` keeps a per-decl
+  # `all_decls` pointer so `check_main_row_handlable` /
+  # `check_body_row` can look up `DEffect default { ... }` blocks
+  # from any module. Pass the full program's decl list (not just
+  # this module's) so cross-module effect-default lookups stay
+  # honest after the partition.
+  let all_decls_for_typer = if list_length(all_program_decls) > 0 {
+    all_program_decls
+  } else { data.decls_a }
   let tp = infer_all_loop(file, data.built.env, data.built.prelude_len, data.recs,
                  data.built.op_eff_arities, data.decls_a, verbose, [], 0, [], [], [], [],
-                 data.alias_res.aliases, data.op_to_eff, data.sums, proto_impls, data.decls_a)
+                 data.alias_res.aliases, data.op_to_eff, data.sums, proto_impls, all_decls_for_typer)
   # Issue #557 — Stage B coverage check. Runs after row-level inference
   # is complete so the typed body carries the resolved `EVar("Eff.op")`
   # callees the walker keys on. Adds its diagnostics directly to stderr
@@ -39510,9 +39575,20 @@ fn typecheck_program_with_head_owners(file: String, modules: [ModuleDecls],
                                        verbose: Bool) : TypedProgram / Console + File {
 
 
+  # Flatten every bucket's decls in the order they appear in
+  # `modules` so the per-module typechecker can still cross-reference
+  # `DEffect default { ... }` blocks (and other program-wide
+  # decl-shaped data) without seeing the partition boundary.
+  let all_program_decls = flatten_module_decls(modules, [])
   typecheck_program_loop(file, modules, module_env_delta_empty(),
+                          all_program_decls,
                           proto_impls, head_owners, verbose,
                           [], 0, [], [], [], [], 0)
+}
+
+fn flatten_module_decls(mods: [ModuleDecls], acc: [Decl]) : [Decl] = match mods {
+  [] -> acc
+  [m, ...rest] -> flatten_module_decls(rest, list_append(acc, m.decls))
 }
 
 # Tail-recursive fold accumulator. Each iteration typechecks one
@@ -39525,6 +39601,7 @@ fn typecheck_program_with_head_owners(file: String, modules: [ModuleDecls],
 # document order on the accumulated lists.
 fn typecheck_program_loop(file: String, modules: [ModuleDecls],
                             acc_delta: ModuleEnvDelta,
+                            all_program_decls: [Decl],
                             proto_impls: [ProtoImplReg],
                             head_owners: [HeadOwnerEntry],
                             verbose: Bool,
@@ -39545,13 +39622,15 @@ fn typecheck_program_loop(file: String, modules: [ModuleDecls],
       diags: list_reverse(acc_diags)
     }
     [m, ...rest] -> {
-      let r = typecheck_module(file, m, acc_delta, proto_impls, head_owners, verbose)
+      let r = typecheck_module(file, m, acc_delta, all_program_decls,
+                                  proto_impls, head_owners, verbose)
       let next_delta = merge_env_deltas(acc_delta, r.delta)
       let next_prelude_len = match prelude_len_acc {
         0 -> r.typed.prelude_len
         _ -> prelude_len_acc
       }
-      typecheck_program_loop(file, rest, next_delta, proto_impls, head_owners, verbose,
+      typecheck_program_loop(file, rest, next_delta, all_program_decls,
+                              proto_impls, head_owners, verbose,
                               prepend_reverse_decls(r.typed.decls, acc_decls),
                               acc_errs + r.typed.errs,
                               llvm_prepend_reverse(r.typed.insts, acc_insts),
@@ -39572,6 +39651,183 @@ fn prepend_reverse_decls(xs: [Decl], acc: [Decl]) : [Decl] {
   match xs {
     [] -> acc
     [x, ...rest] -> prepend_reverse_decls(rest, [x, ...acc])
+  }
+}
+
+# Hanga Roa modular typecheck: partition a post-cascade flat decl
+# stream into per-module sub-streams. Each decl is attributed to
+# its declaring module based on its OWN `module_origin` field (or
+# the target's basename when the field is `None`); the result is a
+# list of `ModuleDecls` in first-appearance order so the typer
+# fold processes preludes in the order the loader saw them, and
+# the target file last.
+#
+# This deliberately does NOT reuse `imports_home_anchors` — that
+# walker propagates the running home backward to fix up untagged
+# DTypes at module boundaries, which is correct for the pub-access
+# table but wrong here. We need a static, decl-local rule so a
+# post-cascade decl interleaved (e.g. a target-file fn sitting
+# between a prelude's last DFn and its later-emitted protocol
+# impl methods) lands in its own bucket instead of being absorbed
+# by the surrounding prelude's home.
+#
+# The partition is structural — once it runs, the typer can no
+# longer see a prelude module's records leaking into the target
+# (or vice versa). The legacy `rerank_recs_for` patch is no longer
+# load-bearing once every call site goes through this partition.
+fn partition_decls_by_home(decls: [Decl], target_mod: String) : [ModuleDecls] = {
+  partition_by_homes_loop(decls, target_mod, [])
+}
+
+# Walk decls left-to-right, bucketing each decl under its home
+# module. Buckets are accumulated in first-appearance order;
+# within a bucket decls keep source order.
+#
+# Two-phase walk:
+#   Phase 1 (`seen_anchor=false`): builtin / synthetic decls
+#     (`inject_builtin_effects` emits DEffect / DType for the
+#     canonical Stdout/Stderr/... before any user decl). They are
+#     untagged but conceptually language-level, not target-level.
+#     We collect them into the `__builtin__` bucket so the target
+#     does not absorb them.
+#   Phase 2 (`seen_anchor=true`): every untagged decl is target-
+#     authored (the cascade preserves source order, so once any
+#     anchored decl appears we are past the synthetic prelude).
+#
+# The phase flip happens at the first decl carrying an explicit
+# `module_origin` of its own.
+fn partition_by_homes_loop(decls: [Decl], target_mod: String,
+                              acc: [ModuleDecls]) : [ModuleDecls] =
+  partition_by_homes_walk(decls, target_mod, "__builtin__", acc)
+
+# Walk decls left-to-right, threading the running `current_anchor`
+# module (= the home of the most recently seen DFn / DType /
+# DAttribPure that carried an explicit `module_origin`). Decls
+# whose own kind cannot carry a `module_origin` (DEffect, DUnit,
+# DUse) attribute to the `current_anchor` — they live in the same
+# physical .kai file as the surrounding tagged DFns. The starting
+# anchor is `__builtin__`, so any untagged decl emitted before
+# the first real module's first tagged DFn (the synthetic
+# `inject_builtin_effects` block) lands in `__builtin__`.
+fn partition_by_homes_walk(decls: [Decl], target_mod: String,
+                              current_anchor: String,
+                              acc: [ModuleDecls]) : [ModuleDecls] = match decls {
+  [] -> acc
+  [d, ...rest_d] -> {
+    let explicit = decl_explicit_module_origin(d)
+    let next_anchor = match explicit {
+      Some(m) -> m
+      None    -> current_anchor
+    }
+    let home = decide_partition_home(d, target_mod, next_anchor)
+    let acc1 = bucket_append(acc, home, d, [])
+    partition_by_homes_walk(rest_d, target_mod, next_anchor, acc1)
+  }
+}
+
+# Per-decl bucketing rule, given the running anchor module:
+#   - DFn with an explicit `mo`: that module (anchor).
+#   - DFn with `mo = None`: `target_mod` (target-authored fns).
+#   - DType with `mo = Some(m)`: that module.
+#   - DType with `mo = None`: `anchor` (untagged DType belongs
+#     to the same physical file as the surrounding tagged DFns).
+#   - DEffect / DUnit / DUse / DAxiom: `anchor` for the same
+#     "same-file" reason.
+#   - DTest / DBench / DCheck: `target_mod` (these never live
+#     inside a prelude file).
+#   - Wrappers (DAttribPure, DDerive, DUnstable, DImpl): recurse
+#     into the inner decl.
+fn decide_partition_home(d: Decl, target_mod: String,
+                            anchor: String) : String = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> match mo {
+    Some(m) -> m
+    None    -> target_mod
+  }
+  DType(_, _, _, _, _, _, mo) -> match mo {
+    Some(m) -> m
+    None    -> anchor
+  }
+  DEffect(_, _, _, _, _, _, _)       -> anchor
+  DUnit(_, _, _, _, _)                -> anchor
+  DUse(_, _, _)                        -> anchor
+  DAxiom(_, _, _, _, _, _, _, _, _, _) -> anchor
+  DTest(_, _, _, _)                    -> target_mod
+  DBench(_, _, _, _)                   -> target_mod
+  DCheck(_, _, _, _, _)                -> target_mod
+  DAttribPure(inner, _, _)             -> decide_partition_home(inner, target_mod, anchor)
+  DDerive(_, inner, _, _)              -> decide_partition_home(inner, target_mod, anchor)
+  DUnstable(inner, _, _)               -> decide_partition_home(inner, target_mod, anchor)
+  DImpl(_, _, _, sub, _, _)            -> match sub {
+    [] -> anchor
+    [m, ..._] -> decide_partition_home(m, target_mod, anchor)
+  }
+  _ -> anchor
+}
+
+# Like `decl_explicit_home` but specialised for the partition
+# walker: returns `Some(m)` when this decl declares its OWN home,
+# `None` when it inherits from the running anchor. DType counts
+# as explicit because the `tag_*` passes write its `mo`; DEffect /
+# DUnit do not (they carry no `module_origin` field).
+fn decl_explicit_module_origin(d: Decl) : Option[String] = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
+  DType(_, _, _, _, _, _, mo)        -> mo
+  DAttribPure(inner, _, _)        -> decl_explicit_module_origin(inner)
+  DDerive(_, inner, _, _)         -> decl_explicit_module_origin(inner)
+  DUnstable(inner, _, _)          -> decl_explicit_module_origin(inner)
+  DImpl(_, _, _, sub, _, _)       -> match sub {
+    [] -> None
+    [m, ..._] -> decl_explicit_module_origin(m)
+  }
+  _ -> None
+}
+
+fn opt_str_is_some(o: Option[String]) : Bool = match o {
+  None -> false
+  Some(_) -> true
+}
+
+# Decide a decl's home module from its own `module_origin` field,
+# falling back to `target_mod` when the field is absent. The
+# DAttribPure / DDerive / DUnstable wrappers delegate to the inner
+# decl; DImpl peeks at its first method (the post-`lower_protocols`
+# stream never contains DImpl, but we cover it defensively).
+fn partition_home_for(d: Decl, target_mod: String) : String = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> home_or_target(mo, target_mod)
+  DType(_, _, _, _, _, _, mo)        -> home_or_target(mo, target_mod)
+  DAttribPure(inner, _, _)        -> partition_home_for(inner, target_mod)
+  DDerive(_, inner, _, _)         -> partition_home_for(inner, target_mod)
+  DUnstable(inner, _, _)          -> partition_home_for(inner, target_mod)
+  DImpl(_, _, _, sub, _, _)       -> match sub {
+    [] -> target_mod
+    [m, ..._] -> partition_home_for(m, target_mod)
+  }
+  _ -> target_mod
+}
+
+fn home_or_target(mo: Option[String], target_mod: String) : String = match mo {
+  Some(m) -> m
+  None    -> target_mod
+}
+
+# Append `d` to the bucket whose `name = Some(home)`. Creates the
+# bucket at the END of `acc` (preserves first-appearance order)
+# when no bucket for `home` exists yet. `done` accumulates the
+# already-walked head of `acc` so the in-progress buckets stay in
+# order without reversing twice.
+fn bucket_append(acc: [ModuleDecls], home: String, d: Decl,
+                    done: [ModuleDecls]) : [ModuleDecls] = match acc {
+  [] -> list_append(list_reverse(done),
+          [ModuleDecls { name: Some(home), decls: [d] }])
+  [m, ...rest] -> {
+    let mname = match m.name { None -> "" Some(s) -> s }
+    if mname == home {
+      let updated = ModuleDecls { name: m.name,
+                                    decls: list_append(m.decls, [d]) }
+      list_append(list_reverse(done), [updated, ...rest])
+    } else {
+      bucket_append(rest, home, d, [m, ...done])
+    }
   }
 }
 
@@ -39597,7 +39853,23 @@ fn infer_program_with_protos_cached(file: String, decls: [Decl], verbose: Bool,
                                        head_owners: [HeadOwnerEntry]) : TypedProgram / Console + File {
 
 
-  let mods = [ModuleDecls { name: None, decls: decls }]
+  # Hanga Roa modular typecheck: partition the post-cascade decl
+  # stream by home module so each prelude is typed against the
+  # inherited delta of the modules loaded before it, and the target
+  # file is typed last. Without this partition, every module sees
+  # every other module's records (and sums), so a user `type Pair =
+  # ...` in the target file leaks into the typecheck of `core/list.kai`
+  # and clobbers `tuple.Pair[a, b]`. The fold is byte-identical to
+  # the pre-refactor flatten-and-call path when there is only one
+  # bucket — which is the case for legacy callers passing a target-
+  # only decl stream.
+  let target_mod = prelude_module_name(file)
+  let mods0 = partition_decls_by_home(decls, target_mod)
+  let mods = match mods0 {
+    []           -> [ModuleDecls { name: None, decls: decls }]
+    [_]          -> [ModuleDecls { name: None, decls: decls }]
+    _            -> mods0
+  }
   typecheck_program_with_head_owners(file, mods, proto_impls, head_owners, verbose)
 }
 
@@ -40601,7 +40873,7 @@ fn ty_eq(a: Ty, b: Ty) : Bool {
     # this check, `tuple.Pair` and a user-defined `Pair` would
     # collapse to one mangled symbol.
     TyCon(am, an, atas) -> match b {
-      TyCon(bm, bn, btas) -> option_str_eq(am, bm) and an == bn and ty_list_eq(atas, btas)
+      TyCon(bm, bn, btas) -> module_slot_compat(am, bm) and an == bn and ty_list_eq(atas, btas)
       _ -> false
     }
     TyDimT(ab, _) -> match b { TyDimT(bb, _) -> ty_eq(ab, bb) _ -> false }
@@ -51738,8 +52010,8 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
         match ret_opt { None -> None Some(te) -> Some(qualtype_te(te, mt, file)) },
         qualtype_row(row, mt, file),
         qualtype_expr(body, mt, file), l, c, mo)
-  DType(p, n, tps, body, l, c, _) ->
-    DType(p, n, tps, qualtype_body(body, mt, file), l, c, None)
+  DType(p, n, tps, body, l, c, mo) ->
+    DType(p, n, tps, qualtype_body(body, mt, file), l, c, mo)
   DEffect(p, n, tps, ops, defblk, l, c) ->
     DEffect(p, n, tps, qualtype_eops(ops, mt, file), defblk, l, c)
   DProtocol(p, n, tps, ops, l, c) ->
@@ -59554,22 +59826,35 @@ type PreludeSegment = PSeg(String, [Decl])
 # automatically — no flags, no driver assistance, no escape hatch
 # beyond rebuilding the compiler with a different KAI_STDLIB_PATH.
 fn core_module_files() : [String] = [
+  # Hanga Roa modular typecheck: order matters. Each module is typed
+  # against the inherited deltas of every preceding module — a type
+  # or fn declared in module M only becomes visible to typecheckers
+  # of modules that load AFTER M. Topologically ordered by their
+  # cross-module references:
+  #   char       — leaf (Char is builtin, no kaikai-side deps)
+  #   io         — uses String (builtin)
+  #   tuple      — declares Pair/Triple/Quad (load BEFORE list)
+  #   option     — Option is builtin; defines helpers over it
+  #   result     — Result is builtin; defines helpers over it
+  #   list       — uses Pair (tuple), Option (option), Result (result)
+  #   string     — uses Option (option) for to_int / find / etc.
+  #   numeric    — leaf (over Int/Real builtins)
+  #   complex    — declares Complex; uses Real
+  #   effects    — currently empty (placeholder for runtime helpers)
+  #   protocols  — defines Show/Eq/Ord/Hash impls — depends on every
+  #                core module's types
+  #   array      — uses Array builtin + list helpers
   "core/char.kai",
   "core/io.kai",
-  "core/list.kai",
+  "core/tuple.kai",
   "core/option.kai",
   "core/result.kai",
+  "core/list.kai",
   "core/string.kai",
-  "core/tuple.kai",
-  # math/numeric and math/complex live in stdlib/math/ (their
-  # natural taxonomy) but are auto-loaded so that the Numeric
-  # protocol's universals (`abs`, `sign`, `pow_int`, `clamp`)
-  # and the imaginary literal (`2.5i`) work in every program
-  # without an explicit `import math.*`.
   "math/numeric.kai",
   "math/complex.kai",
-  "protocols.kai",
   "effects.kai",
+  "protocols.kai",
   "array.kai"
 ]
 
