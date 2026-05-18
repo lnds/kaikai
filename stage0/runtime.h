@@ -3669,6 +3669,27 @@ static KaiValue *kai_prelude_stdlib_path(void) {
     return kai_str(KAI_STDLIB_PATH);
 }
 
+/* Canonicalise a filesystem path via realpath(3). Returns the input
+ * unchanged when the path does not yet exist (caller's "first_try"
+ * candidate path before stat), so the dedup logic at the load site
+ * stays correct: only paths that resolve to real files get folded
+ * to their canonical form. Backed by POSIX realpath; falls back to
+ * the input string when realpath fails (errno != 0). */
+static KaiValue *kai_prelude_abspath(KaiValue *path) {
+    if (!path || path->tag != KAI_STR) {
+        return path;
+    }
+    char pbuf[4096];
+    size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+    memcpy(pbuf, path->as.s.bytes, plen);
+    pbuf[plen] = '\0';
+    char resolved[4096];
+    if (realpath(pbuf, resolved) == NULL) {
+        return path;
+    }
+    return kai_str(resolved);
+}
+
 /* ---------- prelude: mailbox runtime (m8 #7) ---------- */
 
 /* User code reaches the mailbox runtime through these prelude
@@ -4570,6 +4591,7 @@ static KaiValue *_kai_prelude_each_thunk(KaiValue *s, KaiValue **a, int n)      
 static KaiValue *_kai_prelude_args_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) a; (void) n; return kai_prelude_args(); }
 static KaiValue *_kai_prelude_program_name_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_prelude_program_name(); }
 static KaiValue *_kai_prelude_stdlib_path_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) a; (void) n; return kai_prelude_stdlib_path(); }
+static KaiValue *_kai_prelude_abspath_thunk(KaiValue *s, KaiValue **a, int n)        { (void) s; (void) n; return kai_prelude_abspath(a[0]); }
 static KaiValue *_kai_prelude_read_file_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_read_file(a[0]); }
 static KaiValue *_kai_prelude_write_file_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_write_file(a[0], a[1]); }
 static KaiValue *_kai_prelude_file_exists_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_exists(a[0]); }
