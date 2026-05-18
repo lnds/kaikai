@@ -10542,7 +10542,7 @@ fn prelude_names() : [String] {
     # Issue #344: fs/dir operations.
     "dir_list_dir", "dir_create_dir", "dir_remove_dir", "dir_walk",
     "read_line", "read_bytes", "args",
-    "program_name", "stdlib_path",
+    "program_name", "stdlib_path", "abspath",
     "exit", "panic",
     "int_to_string", "real_to_string", "string_to_int", "string_to_real",
     "int_to_real", "real_to_int",
@@ -12570,6 +12570,11 @@ fn prelude_table() : [EPrelude] {
     # Hanga Roa: compile-time hard-coded path to `stdlib/`. Used by
     # the core loader to find core/*.kai without --prelude flags.
     EP("stdlib_path",      "kai_prelude_stdlib_path",      0),
+    # Canonicalise a filesystem path via realpath(3). Used by the
+    # import resolver to dedup module loads when --prelude paths
+    # are absolute (core auto-load) but user --path arguments are
+    # relative — without this the same file loads twice.
+    EP("abspath",          "kai_prelude_abspath",          1),
     EP("read_file",        "kai_prelude_read_file",        1),
     EP("write_file",       "kai_prelude_write_file",       2),
     # Issue #345: fs/file expansion (exists/delete/rename).
@@ -26484,6 +26489,7 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     # when the runtime hasn't seen `kai_set_args` yet.
     TyEntry { name: "program_name",   scheme: mono(fn_ty([], TyString)) },
     TyEntry { name: "stdlib_path",    scheme: mono(fn_ty([], TyString)) },
+    TyEntry { name: "abspath",        scheme: mono(fn_ty([TyString], TyString)) },
     TyEntry { name: "read_file",      scheme: mono(fn_ty([TyString], TyCon(None, "Result", [TyString, TyString]))) },
     TyEntry { name: "write_file",     scheme: mono(fn_ty([TyString, TyString], TyCon(None, "Result", [TyUnit, TyString]))) },
     # Issue #345: fs/file expansion. `file_exists` returns Bool;
@@ -47484,6 +47490,7 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_prelude_args()\n",
     "declare %KaiValue* @kaix_prelude_program_name()\n",
     "declare %KaiValue* @kaix_prelude_stdlib_path()\n",
+    "declare %KaiValue* @kaix_prelude_abspath(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_exit(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_panic_fn(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_panic(%KaiValue*)\n",
@@ -47945,6 +47952,7 @@ fn llvm_prelude_table() : [LlvmPrelude] {
     LP("args",             0, None),
     LP("program_name",     0, None),
     LP("stdlib_path",      0, None),
+    LP("abspath",          1, None),
     LP("exit",             1, None),
     LP("panic",            1, None),
     LP("read_file",        1, None),
@@ -52141,7 +52149,18 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
 
   let cf = find_module_file(base_dir, mod_path, search_paths)
   match cf {
-    CF(abs_path, opt_src) -> {
+    CF(raw_path, opt_src) -> {
+      # Canonicalise the resolver's candidate path so the `visited`
+      # dedup matches paths the core auto-load registered through
+      # `KAI_STDLIB_PATH` (always absolute) when the user passes
+      # `--path stdlib` (relative). Without abspath, a trampoline
+      # `import math.complex` resolves to `stdlib/math/complex.kai`
+      # (relative) and misses the already-loaded absolute path in
+      # visited — re-loading the same file and emitting duplicate
+      # impls. `abspath` returns the input unchanged when realpath
+      # fails (e.g. file does not exist), so the missing-file branch
+      # below still fires with a useful candidate path.
+      let abs_path = abspath(raw_path)
       # Issue #538 shape 1: an `abs_path` that is already on the
       # in_progress stack means resolution looped back to a module
       # whose load has not yet returned — an import cycle. Emit the
@@ -52280,12 +52299,27 @@ fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl],
 
 
   let base_dir = dir_of(root_path)
-  let rs0 = ResolveState { visited: [root_path, ...prelude_paths], in_progress: [root_path], decls: [], modules: [], errs: 0 }
+  # Canonicalise root + prelude paths so the resolver's `visited`
+  # dedup compares against the same shape `resolve_module` will
+  # produce for each import candidate (`abspath` of the raw path
+  # `find_module_file` returns). Without this, a core auto-loaded
+  # `/Users/.../stdlib/math/complex.kai` (absolute) and a user
+  # `import math.complex` resolving via `--path stdlib` to
+  # `stdlib/math/complex.kai` (relative) are treated as different
+  # files and the module gets loaded twice.
+  let canon_root = abspath(root_path)
+  let canon_preludes = canon_paths(prelude_paths)
+  let rs0 = ResolveState { visited: [canon_root, ...canon_preludes], in_progress: [canon_root], decls: [], modules: [], errs: 0 }
   let rs1 = process_imports(base_dir, root_decls, search_paths, rs0)
   let imports = rs1.decls
   let n_imports = list_length(imports)
   let all_decls = list_append(imports, non_import_decls(root_decls))
   EP_Mod(all_decls, rs1.modules, n_imports, rs1.errs)
+}
+
+fn canon_paths(ps: [String]) : [String] = match ps {
+  []           -> []
+  [p, ...rest] -> [abspath(p), ...canon_paths(rest)]
 }
 
 # ====================================================================

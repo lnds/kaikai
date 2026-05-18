@@ -286,6 +286,7 @@ KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_op_fie
 KaiValue *kaix_prelude_args(void)                           { return kai_prelude_args(); }
 KaiValue *kaix_prelude_program_name(void)                   { return kai_prelude_program_name(); }
 KaiValue *kaix_prelude_stdlib_path(void)                    { return kai_prelude_stdlib_path(); }
+KaiValue *kaix_prelude_abspath(KaiValue *p)                 { return kai_prelude_abspath(p); }
 KaiValue *kaix_prelude_exit(KaiValue *v)                    { return kai_prelude_exit(v); }
 /* kaix_prelude_panic is defined above near kaix_match_panic. */
 KaiValue *kaix_prelude_read_file(KaiValue *p)               { return kai_prelude_read_file(p); }
