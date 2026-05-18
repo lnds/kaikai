@@ -117,7 +117,7 @@ exactly the same way as `panic` and unfilled `?`.
 Predicates are **decidable**. The constraints that keep them so:
 
 1. **Pure**: no effects, no user-defined function calls except
-   prelude predicates explicitly marked `[<refinement-pure>]`
+   prelude predicates explicitly marked `[<refinement_pure>]`
    (e.g. `is_finite`, `is_nan`, regex constants).
 2. **Linear in the AST**: interval propagation over comparisons,
    constant-folding over `&&` / `||` / `!`.
@@ -265,7 +265,7 @@ Allowed:
 - Boolean operators: `&&`, `||`, `!`.
 - Constants and `self` / arguments / `result`.
 - Field access on records (`acc.balance`).
-- Prelude predicates marked `[<refinement-pure>]`: `is_finite`,
+- Prelude predicates marked `[<refinement_pure>]`: `is_finite`,
   `is_nan`, `length` (on lists/strings), `is_some`, `is_none`,
   string `matches ~r/regex/` (regex literals lex as the
   Elixir-style sigil `~r/.../`; full-match semantics).
@@ -550,15 +550,15 @@ matching its predicate without re-checking.
 
 ### Stdlib changes
 
-A small set of `[<refinement-pure>]` prelude predicates:
+A small set of `[<refinement_pure>]` prelude predicates:
 
 ```kai
-fn is_finite(x: Real) : Bool [<refinement-pure>]
-fn is_nan(x: Real) : Bool    [<refinement-pure>]
-fn length[T](xs: [T]) : Int  [<refinement-pure>]
-fn is_some[T](o: Option<T>) : Bool [<refinement-pure>]
-fn is_none[T](o: Option<T>) : Bool [<refinement-pure>]
-fn matches(s: String, r: Regex) : Bool [<refinement-pure>]
+fn is_finite(x: Real) : Bool [<refinement_pure>]
+fn is_nan(x: Real) : Bool    [<refinement_pure>]
+fn length[T](xs: [T]) : Int  [<refinement_pure>]
+fn is_some[T](o: Option<T>) : Bool [<refinement_pure>]
+fn is_none[T](o: Option<T>) : Bool [<refinement_pure>]
+fn matches(s: String, r: Regex) : Bool [<refinement_pure>]
 ```
 
 The set is closed in v1: extending it later is additive.
@@ -720,7 +720,7 @@ What is **not** done yet (deferred from the original plan):
   through refined arguments, (b) implicit upcast `Int where >= 0`
   ⊑ `Int`, (c) match-arm narrowing `p : RefinedT`, and (d)
   composition with UoM at the semantic level.
-- **`[<refinement-pure>]` stdlib annotations.** The attribute is
+- **`[<refinement_pure>]` stdlib annotations.** The attribute is
   spec'd but not parsed yet because there is no enforcement pass
   to rule against impure calls in predicates.
 - **Compile-time errors for trivially-false predicates.** The
@@ -742,7 +742,7 @@ the semantic Ty side.
 **Follow-up lanes** for items deferred from m12.6 v1 are tracked
 as GitHub issues with the `refinements` label: issue #83
 (static interval propagation — alpha / operator / call-site
-substitution), issue #84 (`[<refinement-pure>]` inline placement),
+substitution), issue #84 (`[<refinement_pure>]` inline placement),
 issue #85 (regex literals), issue #86 (predicate-aware
 diagnostics). The original load-bearing item (`TyRefineT` on the
 semantic side) landed 2026-04-27.

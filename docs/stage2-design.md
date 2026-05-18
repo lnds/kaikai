@@ -723,7 +723,7 @@ Rationale:
    - **#3 Match-arm narrowing** (`p : RefinedT`) — landed.
    - **#4 UoM composition** (`Decimal<USD> where >= 0`) —
      landed.
-   - **#5 `[<refinement-pure>]` stdlib annotations** —
+   - **#5 `[<refinement_pure>]` stdlib annotations** —
      enforcement + attribute parser landed; inline placement
      (lexer disambiguation) pending in issue #84.
    - **#6 Compile-time errors** for trivially-false
