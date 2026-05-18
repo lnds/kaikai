@@ -54126,41 +54126,51 @@ fn vpa_decls_loop(decls: [Decl], table: [PubAccessEntry],
 fn vpa_decl(d: Decl, table: [PubAccessEntry], home: String,
               target_mod: String, file: String) : Int / Console + File = match d {
 
-  DFn(_, _, _, params, ret, row, body, line, col, _) -> {
-    let es = vpa_sig_params(params, table, home, file, 0)
+  DFn(_, _, tparams, params, ret, row, body, line, col, _) -> {
+    let es = vpa_sig_params(params, table, home, file, tparams, 0)
     let er = match ret {
-      Some(te) -> es + vpa_sig_te(te, table, home, file)
+      Some(te) -> es + vpa_sig_te(te, table, home, file, tparams)
       None -> es
     }
-    let ew = er + vpa_sig_row(row, table, home, file, line, col)
+    let ew = er + vpa_sig_row(row, table, home, file, tparams, line, col)
     ew + vpa_expr(body, fn_param_names(params), table, home, file, 0)
   }
-  DAxiom(_, _, _, _, _, params, ret, row, line, col) -> {
-    let es = vpa_sig_params(params, table, home, file, 0)
-    let er = es + vpa_sig_te(ret, table, home, file)
-    er + vpa_sig_row(row, table, home, file, line, col)
+  DAxiom(_, _, _, _, tparams, params, ret, row, line, col) -> {
+    let es = vpa_sig_params(params, table, home, file, tparams, 0)
+    let er = es + vpa_sig_te(ret, table, home, file, tparams)
+    er + vpa_sig_row(row, table, home, file, tparams, line, col)
   }
   DConst(_, _, te, body, _, _) -> {
-    let es = vpa_sig_te(te, table, home, file)
+    let es = vpa_sig_te(te, table, home, file, [])
     es + vpa_expr(body, [], table, home, file, 0)
   }
-  DType(_, _, _, body, line, col, _) ->
-    vpa_sig_typebody(body, table, home, file, line, col)
-  DEffect(_, _, _, ops, _, _, _) ->
-    vpa_sig_eops(ops, table, home, file, 0)
-  DProtocol(_, _, _, ops, _, _) ->
-    vpa_sig_pops(ops, table, home, file, 0)
+  DType(_, _, tparams, body, line, col, _) ->
+    vpa_sig_typebody(body, table, home, file, tparams, line, col)
+  DEffect(_, _, tparams, ops, _, _, _) ->
+    vpa_sig_eops(ops, table, home, file, tparams, 0)
+  DProtocol(_, _, tparams, ops, _, _) ->
+    # Protocol ops carry `Self` as the implicit type parameter the
+    # body can refer to; protocols can also declare additional
+    # tparams (`protocol Add[a] { add(self: Self, rhs: a) }`).
+    # Both stack into the per-op tparam list.
+    vpa_sig_pops(ops, table, home, file, ["Self", ...tparams], 0)
   DTest(_, body, _, _) ->
     vpa_expr(body, [], table, target_mod, file, 0)
   DBench(_, body, _, _) ->
     vpa_expr(body, [], table, target_mod, file, 0)
   DCheck(_, ps, body, _, _) -> {
-    let es = vpa_sig_params(ps, table, target_mod, file, 0)
+    let es = vpa_sig_params(ps, table, target_mod, file, [], 0)
     es + vpa_expr(body, fn_param_names(ps), table, target_mod, file, 0)
   }
   DImpl(_, targs, target_te, sub_decls, _, _) -> {
-    let et = vpa_sig_te(target_te, table, home, file)
-    let ea = et + vpa_sig_te_list(targs, table, home, file, 0)
+    # `impl[E: Show, T: Show] Show for Result[E, T] { ... }` —
+    # the impl header's tparam list is prepended to every method's
+    # DFn `tparams` field by `prepend_impl_tparams_to_methods` at
+    # parse time. To check the impl header (target type + proto
+    # args) we recover those tparams from the first method.
+    let impl_tparams = impl_tparams_of(sub_decls)
+    let et = vpa_sig_te(target_te, table, home, file, impl_tparams)
+    let ea = et + vpa_sig_te_list(targs, table, home, file, impl_tparams, 0)
     ea + vpa_decls_loop(sub_decls, table, target_mod, home, file, 0)
   }
   DDerive(_, inner, _, _) ->
@@ -54180,152 +54190,195 @@ fn vpa_decl(d: Decl, table: [PubAccessEntry], home: String,
 # module — a reference the body-only walker missed because the leak
 # lives in the signature, not in any expression.
 fn vpa_sig_params(ps: [Param], table: [PubAccessEntry], home: String,
-                     file: String, acc: Int) : Int / Console + File = match ps {
+                     file: String, tparams: [String],
+                     acc: Int) : Int / Console + File = match ps {
   [] -> acc
   [p, ...rest] -> {
     let e1 = match p.ptype {
-      Some(te) -> acc + vpa_sig_te(te, table, home, file)
+      Some(te) -> acc + vpa_sig_te(te, table, home, file, tparams)
       None -> acc
     }
-    vpa_sig_params(rest, table, home, file, e1)
+    vpa_sig_params(rest, table, home, file, tparams, e1)
   }
 }
 
 fn vpa_sig_te(te: TypeExpr, table: [PubAccessEntry], home: String,
-                 file: String) : Int / Console + File = match te.tkind {
+                 file: String, tparams: [String]) : Int / Console + File = match te.tkind {
   TyName(n, targs) -> {
-    let en = vpa_sig_check_name(n, table, home, file, te.line, te.col)
-    let el = vpa_sig_te_list(targs, table, home, file, 0)
+    let en = vpa_sig_check_name(n, table, home, tparams, file, te.line, te.col)
+    let el = vpa_sig_te_list(targs, table, home, file, tparams, 0)
     en + el
   }
-  TyList(inner) -> vpa_sig_te(inner, table, home, file)
+  TyList(inner) -> vpa_sig_te(inner, table, home, file, tparams)
   TyFn(ps, ret, row) -> {
-    let ep = vpa_sig_te_list(ps, table, home, file, 0)
-    let er = vpa_sig_te(ret, table, home, file)
-    let ew = vpa_sig_row(row, table, home, file, te.line, te.col)
+    let ep = vpa_sig_te_list(ps, table, home, file, tparams, 0)
+    let er = vpa_sig_te(ret, table, home, file, tparams)
+    let ew = vpa_sig_row(row, table, home, file, tparams, te.line, te.col)
     ep + er + ew
   }
   TyDim(base, u) -> {
-    let eb = vpa_sig_te(base, table, home, file)
-    let eu = vpa_sig_uexpr(u, table, home, file, te.line, te.col)
+    let eb = vpa_sig_te(base, table, home, file, tparams)
+    let eu = vpa_sig_uexpr(u, table, home, file, tparams, te.line, te.col)
     eb + eu
   }
-  TyRefine(base, _) -> vpa_sig_te(base, table, home, file)
+  TyRefine(base, _) -> vpa_sig_te(base, table, home, file, tparams)
 }
 
 fn vpa_sig_te_list(ts: [TypeExpr], table: [PubAccessEntry], home: String,
-                      file: String, acc: Int) : Int / Console + File = match ts {
+                      file: String, tparams: [String],
+                      acc: Int) : Int / Console + File = match ts {
   [] -> acc
   [t, ...rest] -> {
-    let e1 = acc + vpa_sig_te(t, table, home, file)
-    vpa_sig_te_list(rest, table, home, file, e1)
+    let e1 = acc + vpa_sig_te(t, table, home, file, tparams)
+    vpa_sig_te_list(rest, table, home, file, tparams, e1)
   }
 }
 
 fn vpa_sig_row(row: RowExpr, table: [PubAccessEntry], home: String,
-                  file: String, line: Int, col: Int) : Int / Console + File = match row {
+                  file: String, tparams: [String],
+                  line: Int, col: Int) : Int / Console + File = match row {
   REmpty -> 0
-  RClosed(labels) -> vpa_sig_row_labels(labels, table, home, file, line, col, 0)
-  ROpen(_, labels) -> vpa_sig_row_labels(labels, table, home, file, line, col, 0)
+  RClosed(labels) -> vpa_sig_row_labels(labels, table, home, file, tparams, line, col, 0)
+  ROpen(_, labels) -> vpa_sig_row_labels(labels, table, home, file, tparams, line, col, 0)
 }
 
 fn vpa_sig_row_labels(ls: [RowLabel], table: [PubAccessEntry], home: String,
-                         file: String, line: Int, col: Int,
+                         file: String, tparams: [String],
+                         line: Int, col: Int,
                          acc: Int) : Int / Console + File = match ls {
   [] -> acc
   [l, ...rest] -> match l {
     RL(name, targs) -> {
-      let en = vpa_sig_check_name(name, table, home, file, line, col)
-      let el = vpa_sig_te_list(targs, table, home, file, 0)
-      vpa_sig_row_labels(rest, table, home, file, line, col, acc + en + el)
+      let en = vpa_sig_check_name(name, table, home, tparams, file, line, col)
+      let el = vpa_sig_te_list(targs, table, home, file, tparams, 0)
+      vpa_sig_row_labels(rest, table, home, file, tparams, line, col, acc + en + el)
     }
   }
 }
 
 fn vpa_sig_typebody(b: TypeBody, table: [PubAccessEntry], home: String,
-                       file: String, line: Int, col: Int) : Int / Console + File = match b {
-  TBAlias(te) -> vpa_sig_te(te, table, home, file)
-  TBRecord(fs) -> vpa_sig_fdecls(fs, table, home, file, 0)
-  TBSum(vs) -> vpa_sig_variants(vs, table, home, file, 0)
-  TBEffectAlias(labels) -> vpa_sig_alias_labels(labels, table, home, file, line, col, 0)
+                       file: String, tparams: [String],
+                       line: Int, col: Int) : Int / Console + File = match b {
+  TBAlias(te) -> vpa_sig_te(te, table, home, file, tparams)
+  TBRecord(fs) -> vpa_sig_fdecls(fs, table, home, file, tparams, 0)
+  TBSum(vs) -> vpa_sig_variants(vs, table, home, file, tparams, 0)
+  TBEffectAlias(labels) -> vpa_sig_alias_labels(labels, table, home, tparams, file, line, col, 0)
 }
 
 fn vpa_sig_fdecls(fs: [FieldDecl], table: [PubAccessEntry], home: String,
-                     file: String, acc: Int) : Int / Console + File = match fs {
+                     file: String, tparams: [String],
+                     acc: Int) : Int / Console + File = match fs {
   [] -> acc
   [f, ...rest] -> match f {
-    FD(_, te) -> vpa_sig_fdecls(rest, table, home, file, acc + vpa_sig_te(te, table, home, file))
+    FD(_, te) -> vpa_sig_fdecls(rest, table, home, file, tparams,
+                                   acc + vpa_sig_te(te, table, home, file, tparams))
   }
 }
 
 fn vpa_sig_variants(vs: [Variant], table: [PubAccessEntry], home: String,
-                       file: String, acc: Int) : Int / Console + File = match vs {
+                       file: String, tparams: [String],
+                       acc: Int) : Int / Console + File = match vs {
   [] -> acc
   [v, ...rest] -> match v {
-    Var(_, tes) -> vpa_sig_variants(rest, table, home, file,
-                                       acc + vpa_sig_te_list(tes, table, home, file, 0))
+    Var(_, tes) -> vpa_sig_variants(rest, table, home, file, tparams,
+                                       acc + vpa_sig_te_list(tes, table, home, file, tparams, 0))
   }
 }
 
 fn vpa_sig_alias_labels(ls: [String], table: [PubAccessEntry], home: String,
-                           file: String, line: Int, col: Int,
+                           tparams: [String], file: String,
+                           line: Int, col: Int,
                            acc: Int) : Int / Console + File = match ls {
   [] -> acc
-  [n, ...rest] -> vpa_sig_alias_labels(rest, table, home, file, line, col,
-                                          acc + vpa_sig_check_name(n, table, home, file, line, col))
+  [n, ...rest] -> vpa_sig_alias_labels(rest, table, home, tparams, file, line, col,
+                                          acc + vpa_sig_check_name(n, table, home, tparams, file, line, col))
 }
 
 fn vpa_sig_eops(ops: [EffectOp], table: [PubAccessEntry], home: String,
-                   file: String, acc: Int) : Int / Console + File = match ops {
+                   file: String, tparams: [String],
+                   acc: Int) : Int / Console + File = match ops {
   [] -> acc
   [op, ...rest] -> match op {
-    EOp(_, _, ps, ret, _, _) -> {
-      let ep = vpa_sig_params(ps, table, home, file, 0)
-      let er = vpa_sig_te(ret, table, home, file)
-      vpa_sig_eops(rest, table, home, file, acc + ep + er)
+    EOp(_, op_tparams, ps, ret, _, _) -> {
+      # Per-op tparams stack on top of the enclosing decl tparams.
+      let local = list_append(op_tparams, tparams)
+      let ep = vpa_sig_params(ps, table, home, file, local, 0)
+      let er = vpa_sig_te(ret, table, home, file, local)
+      vpa_sig_eops(rest, table, home, file, tparams, acc + ep + er)
     }
   }
 }
 
 fn vpa_sig_pops(ops: [ProtoOp], table: [PubAccessEntry], home: String,
-                   file: String, acc: Int) : Int / Console + File = match ops {
+                   file: String, tparams: [String],
+                   acc: Int) : Int / Console + File = match ops {
   [] -> acc
   [op, ...rest] -> match op {
-    POp(_, _, ps, ret, _, _) -> {
-      let ep = vpa_sig_params(ps, table, home, file, 0)
-      let er = vpa_sig_te(ret, table, home, file)
-      vpa_sig_pops(rest, table, home, file, acc + ep + er)
+    POp(_, op_tparams, ps, ret, _, _) -> {
+      let local = list_append(op_tparams, tparams)
+      let ep = vpa_sig_params(ps, table, home, file, local, 0)
+      let er = vpa_sig_te(ret, table, home, file, local)
+      vpa_sig_pops(rest, table, home, file, tparams, acc + ep + er)
     }
   }
 }
 
 fn vpa_sig_uexpr(u: UnitExprT, table: [PubAccessEntry], home: String,
-                    file: String, line: Int, col: Int) : Int / Console + File = match u {
+                    file: String, tparams: [String],
+                    line: Int, col: Int) : Int / Console + File = match u {
   UOne -> 0
   UVar(_) -> 0
-  USym(s) -> vpa_sig_check_name(s, table, home, file, line, col)
+  USym(s) -> vpa_sig_check_name(s, table, home, tparams, file, line, col)
   UMul(a, b) -> {
-    let ea = vpa_sig_uexpr(a, table, home, file, line, col)
-    let eb = vpa_sig_uexpr(b, table, home, file, line, col)
+    let ea = vpa_sig_uexpr(a, table, home, file, tparams, line, col)
+    let eb = vpa_sig_uexpr(b, table, home, file, tparams, line, col)
     ea + eb
   }
-  UInv(a) -> vpa_sig_uexpr(a, table, home, file, line, col)
-  UPow(a, _) -> vpa_sig_uexpr(a, table, home, file, line, col)
+  UInv(a) -> vpa_sig_uexpr(a, table, home, file, tparams, line, col)
+  UPow(a, _) -> vpa_sig_uexpr(a, table, home, file, tparams, line, col)
+}
+
+# Recover the impl-header tparams from the first DFn method. The
+# parser injects the impl's `[E: Show, T: Show]` list into every
+# method's tparam string list (see `prepend_impl_tparams_to_methods`),
+# and since all methods share the same impl header they all carry
+# the same prefix. Returns an empty list when sub_decls is empty
+# or its first method has no tparams. Bound suffixes (`T#b:Show`)
+# are already stripped by `prepend_impl_tparams_to_methods`, so
+# the names here are clean idents.
+fn impl_tparams_of(sub_decls: [Decl]) : [String] = match sub_decls {
+  [] -> []
+  [d, ...rest] -> match d {
+    DFn(_, _, tps, _, _, _, _, _, _, _) -> tps
+    DAttribPure(inner, _, _) -> impl_tparams_of([inner, ...rest])
+    DDerive(_, inner, _, _) -> impl_tparams_of([inner, ...rest])
+    DUnstable(inner, _, _) -> impl_tparams_of([inner, ...rest])
+    _ -> impl_tparams_of(rest)
+  }
 }
 
 fn vpa_sig_check_name(n: String, table: [PubAccessEntry], home: String,
-                         file: String, line: Int,
+                         tparams: [String], file: String, line: Int,
                          col: Int) : Int / Console + File =
-  match pae_decide(table, n, home) {
-    Visible -> 0
-    Unknown -> 0
-    PrivateTo(other_home) -> {
-      diag_error(file, line, col,
-        concat_all(["cannot reference non-pub `", n, "` from module `",
-                    other_home, "` in this signature (declared private to `",
-                    other_home, "`); mark it as `pub` in module `", other_home,
-                    "` to expose it"]))
-      1
+  # Tparams are bound at the declaration site (e.g. `impl[E : Show]
+  # Show for Result[E, T]` — `E` is a type variable, not a reference
+  # to whatever module also happens to have an entity called `E`).
+  # Skipping them avoids spurious "non-pub E from module X" errors
+  # when the privacy table happens to contain a same-named variant
+  # constructor or type from an unrelated module.
+  if list_has(tparams, n) { 0 }
+  else {
+    match pae_decide(table, n, home) {
+      Visible -> 0
+      Unknown -> 0
+      PrivateTo(other_home) -> {
+        diag_error(file, line, col,
+          concat_all(["cannot reference non-pub `", n, "` from module `",
+                      other_home, "` in this signature (declared private to `",
+                      other_home, "`); mark it as `pub` in module `", other_home,
+                      "` to expose it"]))
+        1
+      }
     }
   }
 
