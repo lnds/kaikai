@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -168,8 +168,8 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + private-type shadow audit + private-record shadow audit + canonical-only alias audit"
+tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + private-type shadow audit + private-record shadow audit + canonical-only alias audit"
 
 # Issue #643 — institutional regression gate for the private-type
 # leak fix. `tools/audit-prelude-private-types.sh` walks every
@@ -375,6 +375,51 @@ test-diagnostics-collected: kaic2
 # negative test asserted the contract).
 test-negative: kaic2
 	@./tools/test-negative.sh
+
+# Validate every stdlib module compiles cleanly when loaded.
+# stdlib is normally pulled into user programs via core auto-load or
+# `import`, both of which route the file through `expand_imports`.
+# The same-module name-collision validators (`validate_fn_name_collisions_decls`
+# et al.) now run inside `load_prelude` and `resolve_module` (per-
+# module, before the decls join the global stream), so a duplicate
+# `fn foo` (or `type T`, `effect E`, `const N`, `axiom A`) inside a
+# stdlib file is caught at load time — wherever the module is loaded
+# from.
+#
+# This target exercises that gate. For every `stdlib/**/*.kai` we
+# build a one-line trampoline `import <mod>` `fn main() = 0` and
+# compile it; the act of importing forces kaic2 to parse and
+# validate the module. Any failure (validator rejection, parse
+# error, type error) is reported per-module and the target exits
+# non-zero. Belongs in tier1 so stdlib drift cannot land via PR
+# without surfacing.
+test-stdlib-modules: kaic2
+	@set +e; \
+	pass=0; fail=0; total=0; \
+	tmpdir=$$(mktemp -d); \
+	for f in $$(find stdlib -name '*.kai' | sort); do \
+	  total=$$((total + 1)); \
+	  rel=$${f#stdlib/}; \
+	  mod=$${rel%.kai}; \
+	  mod_dotted=$$(echo "$$mod" | tr '/' '.'); \
+	  probe="$$tmpdir/probe.kai"; \
+	  printf 'import %s\n\nfn main() : Int = 0\n' "$$mod_dotted" > "$$probe"; \
+	  err=$$(mktemp); \
+	  ./stage2/kaic2 --path stdlib "$$probe" > /dev/null 2> "$$err"; \
+	  rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    pass=$$((pass + 1)); \
+	  else \
+	    fail=$$((fail + 1)); \
+	    echo "stdlib-module FAIL $$f"; \
+	    head -4 "$$err" | sed 's/^/  /'; \
+	  fi; \
+	  rm -f "$$err"; \
+	done; \
+	rm -rf "$$tmpdir"; \
+	echo ""; \
+	echo "test-stdlib-modules: $$pass / $$total passed, $$fail failed"; \
+	[ "$$fail" -eq 0 ] || exit 1
 
 # Tier 2.5 — daily memory-safety gate. Rebuilds the demos/ probe set
 # with `-fsanitize=address,undefined` and runs each binary; fails on
