@@ -55948,38 +55948,64 @@ fn derive_hash_sum_chain(acc: Expr, vargs: [TypeExpr], i: Int,
   }
 }
 
-# m12.8.z: `#derive(Ord)` synthesises a lexicographic `cmp` for records
-# (compare field-by-field in declaration order, return on the first
-# non-zero result) and a position-then-payload `cmp` for sum types
-# (variants ordered by their position in the declaration; for the
-# same variant, payloads compared lexicographically). Either form
-# delegates to `cmp` on the field / payload type, so the typer
-# rejects the derive transitively if any sub-component lacks an
+# m12.8.z: `#derive(Ord)` synthesises three methods to satisfy the
+# stdlib `protocol Ord { cmp, min, max }`:
+#
+#   - `cmp(a, b) : Int` — the load-bearing comparator. Records are
+#     lexicographic (compare each field in declaration order, return
+#     the first non-zero); sum types are variants-by-position with a
+#     payload-lexicographic tie-breaker inside the same variant.
+#   - `min(a, b) : Self` — `if cmp(a, b) <= 0 { a } else { b }`,
+#     derived from the synthesised `cmp` above.
+#   - `max(a, b) : Self` — `if cmp(a, b) >= 0 { a } else { b }`.
+#
+# `cmp` delegates to each field/payload's own `cmp`, so the typer
+# transitively rejects the derive if any sub-component lacks an
 # `Ord` impl — naming the missing call site in the diagnostic.
+# `min` and `max` only call the just-synthesised `cmp`, so they
+# carry no extra requirement on sub-types.
 fn derive_ord_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
   match body {
-    TBRecord(fields) -> {
-      let body_expr = derive_ord_record_body(fields, line, col)
-      Some(make_derived_impl("Ord", tname, "cmp",
-        [Param { pname: "a", ptype: Some(mk_ty(TyName(tname, []), line, col)),
-                 pline: line, pcol: col },
-         Param { pname: "b", ptype: Some(mk_ty(TyName(tname, []), line, col)),
-                 pline: line, pcol: col }],
-        mk_ty(TyName("Int", []), line, col),
-        body_expr, line, col))
-    }
-    TBSum(variants) -> {
-      let body_expr = derive_ord_sum_body(variants, line, col)
-      Some(make_derived_impl("Ord", tname, "cmp",
-        [Param { pname: "a", ptype: Some(mk_ty(TyName(tname, []), line, col)),
-                 pline: line, pcol: col },
-         Param { pname: "b", ptype: Some(mk_ty(TyName(tname, []), line, col)),
-                 pline: line, pcol: col }],
-        mk_ty(TyName("Int", []), line, col),
-        body_expr, line, col))
-    }
+    TBRecord(fields) ->
+      Some(derive_ord_make_impl(tname, derive_ord_record_body(fields, line, col), line, col))
+    TBSum(variants) ->
+      Some(derive_ord_make_impl(tname, derive_ord_sum_body(variants, line, col), line, col))
     _ -> None
   }
+}
+
+# Build the three-method `impl Ord for T` given a ready-to-use `cmp`
+# body expression. Factored out so the record / sum arms above share
+# the impl assembly, and so `min` / `max` are produced in one place.
+fn derive_ord_make_impl(tname: String, cmp_body: Expr, line: Int, col: Int) : Decl {
+  let self_ty = mk_ty(TyName(tname, []), line, col)
+  let int_ty = mk_ty(TyName("Int", []), line, col)
+  let params2 = [
+    Param { pname: "a", ptype: Some(self_ty), pline: line, pcol: col },
+    Param { pname: "b", ptype: Some(self_ty), pline: line, pcol: col }
+  ]
+  let cmp_method = DFn(false, "cmp", [], params2, Some(int_ty), REmpty,
+                          cmp_body, line, col, None)
+  # Body of min: `if cmp(a, b) <= 0 { a } else { b }`.
+  # Body of max: `if cmp(a, b) >= 0 { a } else { b }`.
+  let a_var = mk_expr(EVar("a"), line, col)
+  let b_var = mk_expr(EVar("b"), line, col)
+  let zero = mk_expr(EInt(0), line, col)
+  let cmp_call_min = mk_expr(ECall(mk_expr(EVar("cmp"), line, col),
+                                       [a_var, b_var]), line, col)
+  let cmp_call_max = mk_expr(ECall(mk_expr(EVar("cmp"), line, col),
+                                       [a_var, b_var]), line, col)
+  let min_body = mk_expr(EIf(
+    mk_expr(EBinop("<=", cmp_call_min, zero), line, col),
+    a_var, Some(b_var)), line, col)
+  let max_body = mk_expr(EIf(
+    mk_expr(EBinop(">=", cmp_call_max, zero), line, col),
+    a_var, Some(b_var)), line, col)
+  let min_method = DFn(false, "min", [], params2, Some(self_ty), REmpty,
+                          min_body, line, col, None)
+  let max_method = DFn(false, "max", [], params2, Some(self_ty), REmpty,
+                          max_body, line, col, None)
+  DImpl("Ord", [], self_ty, [cmp_method, min_method, max_method], line, col)
 }
 
 fn derive_ord_record_body(fields: [FieldDecl], line: Int, col: Int) : Expr {
