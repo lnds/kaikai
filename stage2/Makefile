@@ -570,8 +570,7 @@ test-writer: $(TARGET) build
 # the same shape produces a deterministic stdout diff under tier1.
 test-foreign-prelude: $(TARGET) build
 	@set -e; \
-	./$(TARGET) --prelude ../examples/effects/foreign_prelude_lib.kai \
-	            ../examples/effects/foreign_prelude.kai > build/foreign_prelude.c; \
+	./$(TARGET) ../examples/effects/foreign_prelude.kai > build/foreign_prelude.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/foreign_prelude.c -o build/foreign_prelude-c $(LDLIBS_M) ; \
 	./build/foreign_prelude-c > build/foreign_prelude.out; \
 	diff -q ../examples/effects/foreign_prelude.out.expected build/foreign_prelude.out > /dev/null \
@@ -735,7 +734,6 @@ test-ffi-extern-c-asan: $(TARGET) build
 test-prelude-qualified-call: $(TARGET) build
 	@set -e; \
 	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
-	            --prelude ../examples/stdlib/qualified_call_in_prelude_lib.kai \
 	            ../examples/stdlib/qualified_call_in_prelude.kai \
 	            > build/qualified_call_in_prelude.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/qualified_call_in_prelude.c -o build/qualified_call_in_prelude $(LDLIBS_M) ; \
@@ -755,7 +753,6 @@ test-prelude-qualified-call: $(TARGET) build
 test-issue-219-modcall: $(TARGET) build
 	@set -e; \
 	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
-	            --prelude ../examples/stdlib/issue_219_typer_modcall_lib.kai \
 	            ../examples/stdlib/issue_219_typer_modcall.kai \
 	            > build/issue_219_typer_modcall.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/issue_219_typer_modcall.c -o build/issue_219_typer_modcall $(LDLIBS_M) ; \
