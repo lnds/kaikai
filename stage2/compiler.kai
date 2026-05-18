@@ -38982,6 +38982,373 @@ fn collect_unit_alias_table_loop(decls: [Decl], acc: [UAliasEntry]) : [UAliasEnt
   }
 }
 
+# m12.5 unit hygiene: walk the decl stream collecting every name
+# introduced by a `unit <Name>` declaration (atomic or aliased). The
+# typer's unit machinery uses this set to flag references to
+# undeclared symbols at use sites — `Real<USD>` only makes sense
+# after `unit USD` has been seen.
+fn collect_declared_unit_names(decls: [Decl]) : [String] =
+  collect_declared_unit_names_loop(decls, [])
+
+fn collect_declared_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DUnit(_, name, _, _, _) -> collect_declared_unit_names_loop(rest, [name, ...acc])
+      DAttribPure(inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
+      DDerive(_, inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
+      DUnstable(inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
+      _ -> collect_declared_unit_names_loop(rest, acc)
+    }
+  }
+}
+
+# m12.5 unit hygiene cross-module: only `pub unit X` decls cross
+# module boundaries. A consumer can reference `Real<X>` when `X`
+# is either declared locally (any visibility) or exported from
+# another module via `pub unit`. Internal `unit X` decls stay
+# module-private.
+fn collect_pub_unit_names(decls: [Decl]) : [String] =
+  collect_pub_unit_names_loop(decls, [])
+
+fn collect_pub_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DUnit(true, name, _, _, _) -> collect_pub_unit_names_loop(rest, [name, ...acc])
+      DAttribPure(inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
+      DDerive(_, inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
+      DUnstable(inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
+      _ -> collect_pub_unit_names_loop(rest, acc)
+    }
+  }
+}
+
+# m12.5 unit hygiene: walk every `UnitExprT` reachable from the decl
+# stream and report an error for each `USym(name)` whose `name` is
+# neither a built-in dimension symbol nor declared by a `unit` decl
+# present in the merged stream. Returns the number of diagnostics
+# emitted; the driver folds it into the exit-code aggregator.
+#
+# Scoping rules:
+#   - Any `unit X` declaration anywhere in the merged stream is
+#     visible to every decl in the stream. Cross-module privacy of
+#     unit symbols is enforced at the import boundary: `expand_imports`
+#     filters non-`pub` decls out before they reach a consumer, so a
+#     private `unit X` of module M never appears in the merged stream
+#     a different module sees. No bucket / home / visibility table is
+#     needed here.
+#   - Unit-kind tparams (`impl[u: Measure] ...`) extend the visible
+#     set for the duration of a single decl; that scoping is handled
+#     in `validate_unit_refs_decl` itself.
+fn validate_unit_refs_decls(decls: [Decl], declared: [String],
+                              file: String) : Int / Console + File =
+  validate_unit_refs_decls_loop(decls, declared, file, 0)
+
+fn validate_unit_refs_decls_loop(decls: [Decl], declared: [String],
+                                    file: String, errs: Int) : Int / Console + File {
+  match decls {
+    [] -> errs
+    [d, ...rest] -> {
+      let e1 = errs + validate_unit_refs_decl(d, declared, file)
+      validate_unit_refs_decls_loop(rest, declared, file, e1)
+    }
+  }
+}
+
+fn validate_unit_refs_decl(d: Decl, declared: [String], file: String) : Int / Console + File = match d {
+  DFn(_, _, tparams, ps, ret, _, body, _, _, _) -> {
+    # Extend `declared` with this fn's unit-kind tparams (parametric
+    # impls like `impl[u: Measure] Show for Real<u>` introduce `u` as
+    # a unit symbol valid only inside this body).
+    let local_declared = list_append(collect_unit_tparam_names(tparams), declared)
+    let e0 = validate_unit_refs_params(ps, local_declared, file, 0)
+    let e1 = match ret {
+      Some(te) -> e0 + validate_unit_refs_te(te, local_declared, file)
+      None -> e0
+    }
+    e1 + validate_unit_refs_expr(body, local_declared, file)
+  }
+  DType(_, _, _, body, _, _, _) -> validate_unit_refs_typebody(body, declared, file)
+  DTest(_, body, _, _) -> validate_unit_refs_expr(body, declared, file)
+  DBench(_, body, _, _) -> validate_unit_refs_expr(body, declared, file)
+  DCheck(_, ps, body, _, _) ->
+    validate_unit_refs_params(ps, declared, file, 0) +
+    validate_unit_refs_expr(body, declared, file)
+  DEffect(_, _, _, ops, _, _, _) -> validate_unit_refs_eops(ops, declared, file, 0)
+  DImpl(_, _, _, sub_decls, _, _) ->
+    validate_unit_refs_decls_loop(sub_decls, declared, file, 0)
+  DAttribPure(inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
+  DDerive(_, inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
+  DUnstable(inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
+  _ -> 0
+}
+
+# Strip the `#Unit` suffix from every unit-kind tparam name and
+# return the surface names (the lexically valid identifiers the
+# user wrote in `impl[u: Measure] ...`).
+fn collect_unit_tparam_names(tparams: [String]) : [String] =
+  collect_unit_tparam_names_loop(tparams, [])
+
+fn collect_unit_tparam_names_loop(tparams: [String], acc: [String]) : [String] {
+  match tparams {
+    [] -> acc
+    [n, ...rest] ->
+      if tp_kind_is_unit(n) {
+        collect_unit_tparam_names_loop(rest, [tp_strip_kind(n), ...acc])
+      } else {
+        collect_unit_tparam_names_loop(rest, acc)
+      }
+  }
+}
+
+fn validate_unit_refs_params(ps: [Param], declared: [String], file: String,
+                                acc: Int) : Int / Console + File = match ps {
+  [] -> acc
+  [p, ...rest] -> {
+    let e1 = match p.ptype {
+      Some(te) -> acc + validate_unit_refs_te(te, declared, file)
+      None -> acc
+    }
+    validate_unit_refs_params(rest, declared, file, e1)
+  }
+}
+
+fn validate_unit_refs_eops(ops: [EffectOp], declared: [String], file: String,
+                              acc: Int) : Int / Console + File = match ops {
+  [] -> acc
+  [op, ...rest] -> match op {
+    EOp(_, _, ps, ret, _, _) -> {
+      let e1 = acc + validate_unit_refs_params(ps, declared, file, 0) +
+                validate_unit_refs_te(ret, declared, file)
+      validate_unit_refs_eops(rest, declared, file, e1)
+    }
+  }
+}
+
+fn validate_unit_refs_typebody(b: TypeBody, declared: [String], file: String) : Int / Console + File = match b {
+  TBAlias(te) -> validate_unit_refs_te(te, declared, file)
+  TBRecord(fs) -> validate_unit_refs_fdecls(fs, declared, file, 0)
+  TBSum(vs) -> validate_unit_refs_variants(vs, declared, file, 0)
+  TBEffectAlias(_) -> 0
+}
+
+fn validate_unit_refs_fdecls(fs: [FieldDecl], declared: [String], file: String,
+                                acc: Int) : Int / Console + File = match fs {
+  [] -> acc
+  [f, ...rest] -> match f {
+    FD(_, te) -> {
+      let e1 = acc + validate_unit_refs_te(te, declared, file)
+      validate_unit_refs_fdecls(rest, declared, file, e1)
+    }
+  }
+}
+
+fn validate_unit_refs_variants(vs: [Variant], declared: [String], file: String,
+                                  acc: Int) : Int / Console + File = match vs {
+  [] -> acc
+  [v, ...rest] -> match v {
+    Var(_, payload_tes) -> {
+      let e1 = acc + validate_unit_refs_te_list(payload_tes, declared, file, 0)
+      validate_unit_refs_variants(rest, declared, file, e1)
+    }
+  }
+}
+
+fn validate_unit_refs_te(te: TypeExpr, declared: [String], file: String) : Int / Console + File = match te.tkind {
+  TyName(_, targs) -> validate_unit_refs_te_list(targs, declared, file, 0)
+  TyList(inner) -> validate_unit_refs_te(inner, declared, file)
+  TyFn(ps, ret, _) -> validate_unit_refs_te_list(ps, declared, file, 0) +
+                       validate_unit_refs_te(ret, declared, file)
+  TyDim(base, u) -> validate_unit_refs_te(base, declared, file) +
+                     validate_unit_expr(u, declared, file, te.line, te.col)
+  TyRefine(base, _) -> validate_unit_refs_te(base, declared, file)
+}
+
+fn validate_unit_refs_te_list(ts: [TypeExpr], declared: [String], file: String,
+                                 acc: Int) : Int / Console + File = match ts {
+  [] -> acc
+  [t, ...rest] -> {
+    let e1 = acc + validate_unit_refs_te(t, declared, file)
+    validate_unit_refs_te_list(rest, declared, file, e1)
+  }
+}
+
+fn validate_unit_refs_expr(e: Expr, declared: [String], file: String) : Int / Console + File =
+  validate_unit_refs_kind(e.kind, declared, file, e.line, e.col)
+
+fn validate_unit_refs_kind(k: ExprKind, declared: [String], file: String,
+                              line: Int, col: Int) : Int / Console + File = match k {
+  EInt(_)        -> 0
+  EReal(_)       -> 0
+  EBool(_)       -> 0
+  EChar(_)       -> 0
+  EStr(_, _)     -> 0
+  EUnit          -> 0
+  EVar(_)        -> 0
+  EUnder         -> 0
+  EPlaceholder   -> 0
+  EHole(_)       -> 0
+  ETodo(_)       -> 0
+  EVariantsOf(_, _) -> 0
+  EModCall(_, _) -> 0
+  EIntrinsic(_, args_) -> validate_unit_refs_expr_list(args_, declared, file, 0)
+  ECall(callee, args_) -> validate_unit_refs_expr(callee, declared, file) +
+                           validate_unit_refs_expr_list(args_, declared, file, 0)
+  EField(base, _) -> validate_unit_refs_expr(base, declared, file)
+  EIndex(a, b) -> validate_unit_refs_expr(a, declared, file) +
+                  validate_unit_refs_expr(b, declared, file)
+  EBinop(_, a, b) -> validate_unit_refs_expr(a, declared, file) +
+                     validate_unit_refs_expr(b, declared, file)
+  EUnop(_, x) -> validate_unit_refs_expr(x, declared, file)
+  EIf(c, t_, eo) -> validate_unit_refs_expr(c, declared, file) +
+                     validate_unit_refs_expr(t_, declared, file) +
+                     validate_unit_refs_opt_expr(eo, declared, file)
+  EMatch(scr, arms) -> validate_unit_refs_expr(scr, declared, file) +
+                        validate_unit_refs_arms(arms, declared, file, 0)
+  ELambda(_, b) -> validate_unit_refs_expr(b, declared, file)
+  ERecordLit(_, fs) -> validate_unit_refs_fields(fs, declared, file, 0)
+  EList(els) -> validate_unit_refs_elems(els, declared, file, 0)
+  ERange(a, b, opt_step) -> validate_unit_refs_expr(a, declared, file) +
+                             validate_unit_refs_expr(b, declared, file) +
+                             validate_unit_refs_opt_expr(opt_step, declared, file)
+  EBlock(stmts, tail) -> validate_unit_refs_stmts(stmts, declared, file, 0) +
+                          validate_unit_refs_opt_expr(tail, declared, file)
+  EPipe(a, b)        -> validate_unit_refs_expr(a, declared, file) +
+                         validate_unit_refs_expr(b, declared, file)
+  EMapPipe(a, b)     -> validate_unit_refs_expr(a, declared, file) +
+                         validate_unit_refs_expr(b, declared, file)
+  EFlatMapPipe(a, b) -> validate_unit_refs_expr(a, declared, file) +
+                         validate_unit_refs_expr(b, declared, file)
+  EFilterPipe(a, b)  -> validate_unit_refs_expr(a, declared, file) +
+                         validate_unit_refs_expr(b, declared, file)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) ->
+    validate_unit_refs_expr(body, declared, file) +
+    validate_unit_refs_opt_expr(init_opt, declared, file) +
+    validate_unit_refs_clauses(clauses, declared, file, 0) +
+    validate_unit_refs_opt_return(ret_opt, declared, file)
+  ELitUnit(inner, u) -> validate_unit_refs_expr(inner, declared, file) +
+                         validate_unit_expr(u, declared, file, line, col)
+  EBang(inner) -> validate_unit_refs_expr(inner, declared, file)
+}
+
+fn validate_unit_refs_expr_list(es: [Expr], declared: [String], file: String,
+                                   acc: Int) : Int / Console + File = match es {
+  [] -> acc
+  [e, ...rest] -> {
+    let e1 = acc + validate_unit_refs_expr(e, declared, file)
+    validate_unit_refs_expr_list(rest, declared, file, e1)
+  }
+}
+
+fn validate_unit_refs_opt_expr(opt: Option[Expr], declared: [String],
+                                  file: String) : Int / Console + File = match opt {
+  None -> 0
+  Some(e) -> validate_unit_refs_expr(e, declared, file)
+}
+
+fn validate_unit_refs_arms(arms: [Arm], declared: [String], file: String,
+                              acc: Int) : Int / Console + File = match arms {
+  [] -> acc
+  [a, ...rest] -> match a {
+    Arm(_, g, b) -> {
+      let e1 = acc + validate_unit_refs_opt_expr(g, declared, file) +
+                validate_unit_refs_expr(b, declared, file)
+      validate_unit_refs_arms(rest, declared, file, e1)
+    }
+  }
+}
+
+fn validate_unit_refs_fields(fs: [FieldInit], declared: [String], file: String,
+                                acc: Int) : Int / Console + File = match fs {
+  [] -> acc
+  [f, ...rest] -> match f {
+    FI(_, v) -> {
+      let e1 = acc + validate_unit_refs_expr(v, declared, file)
+      validate_unit_refs_fields(rest, declared, file, e1)
+    }
+  }
+}
+
+fn validate_unit_refs_elems(els: [ListElem], declared: [String], file: String,
+                               acc: Int) : Int / Console + File = match els {
+  [] -> acc
+  [el, ...rest] -> {
+    let e1 = match el {
+      ElPlain(x)  -> acc + validate_unit_refs_expr(x, declared, file)
+      ElSpread(x) -> acc + validate_unit_refs_expr(x, declared, file)
+    }
+    validate_unit_refs_elems(rest, declared, file, e1)
+  }
+}
+
+fn validate_unit_refs_stmts(stmts: [Stmt], declared: [String], file: String,
+                               acc: Int) : Int / Console + File = match stmts {
+  [] -> acc
+  [s, ...rest] -> {
+    let e1 = match s {
+      SLet(_, _, rhs)             -> acc + validate_unit_refs_expr(rhs, declared, file)
+      SAssert(c, m) -> match m {
+        Some(me) -> acc + validate_unit_refs_expr(c, declared, file) +
+                          validate_unit_refs_expr(me, declared, file)
+        None     -> acc + validate_unit_refs_expr(c, declared, file)
+      }
+      SExprStmt(x)                -> acc + validate_unit_refs_expr(x, declared, file)
+      SIndexAssign(b, i, v, _, _) -> acc + validate_unit_refs_expr(b, declared, file) +
+                                            validate_unit_refs_expr(i, declared, file) +
+                                            validate_unit_refs_expr(v, declared, file)
+      SVar(_, _, rhs, _, _)       -> acc + validate_unit_refs_expr(rhs, declared, file)
+      SUse(_, _, _)               -> acc
+    }
+    validate_unit_refs_stmts(rest, declared, file, e1)
+  }
+}
+
+fn validate_unit_refs_clauses(cs: [HClause], declared: [String], file: String,
+                                 acc: Int) : Int / Console + File = match cs {
+  [] -> acc
+  [c, ...rest] -> match c {
+    HC(_, _, b, _, _) -> {
+      let e1 = acc + validate_unit_refs_expr(b, declared, file)
+      validate_unit_refs_clauses(rest, declared, file, e1)
+    }
+  }
+}
+
+fn validate_unit_refs_opt_return(opt: Option[HReturn], declared: [String],
+                                    file: String) : Int / Console + File = match opt {
+  None -> 0
+  Some(r) -> match r { HR(_, b, _, _) -> validate_unit_refs_expr(b, declared, file) }
+}
+
+# Walk a UnitExprT and emit one error per undeclared USym. Linear in
+# the tree size; cycles cannot occur because UnitExprT is finite.
+fn validate_unit_expr(u: UnitExprT, declared: [String], file: String,
+                         line: Int, col: Int) : Int / Console + File = match u {
+  UOne -> 0
+  UVar(_) -> 0
+  USym(s) ->
+    if list_has_string(declared, s) { 0 }
+    else if is_builtin_unit_symbol(s) { 0 }
+    else {
+      diag_error(file, line, col,
+        concat_all(["unknown unit `", s, "`; declare it with `unit ", s,
+                    "` (atomic) or `unit ", s, " = <expr>` (alias) before use"]))
+      1
+    }
+  UMul(a, b) -> validate_unit_expr(a, declared, file, line, col) +
+                validate_unit_expr(b, declared, file, line, col)
+  UInv(a) -> validate_unit_expr(a, declared, file, line, col)
+  UPow(a, _) -> validate_unit_expr(a, declared, file, line, col)
+}
+
+# Reserved unit symbols the compiler treats as built-in (currently
+# none — `Real<1>` parses as UOne, not USym("1")). This hook keeps
+# the validator forward-compatible with future built-in dimensions
+# (e.g. SI base units shipped as part of the language) without
+# editing the per-fixture declaration list.
+fn is_builtin_unit_symbol(_s: String) : Bool = false
+
 fn unit_alias_lookup(aliases: [UAliasEntry], name: String) : Option[UnitExprT] {
   match aliases {
     [] -> None
@@ -62348,6 +62715,14 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # exit code further below.
             let pred_errs = validate_contract_predicates_decls(
               merged, user_pure_names, path)
+            # m12.5 unit hygiene: every `USym(name)` reachable from a
+            # `Real<u>` / `Int<u>` / `Decimal<u>` annotation or a
+            # literal `N<u>` must refer to a name introduced by a
+            # `unit <name>` declaration. Unit-kind tparams (`impl[u:
+            # Measure] ...`) are scoped per-decl and added on the
+            # fly by the validator.
+            let unit_decl_names = collect_declared_unit_names(merged)
+            let unit_ref_errs = validate_unit_refs_decls(merged, unit_decl_names, path)
             # issue #187 phase 2: D2 collision check on `type T = A | B`
             # declarations. Walks every TBSum and reports any variant
             # name claimed implicitly by two different parents (with
@@ -62513,6 +62888,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             else if proto_errs > 0 { proto_errs }
             else if import_hole_errs > 0 { import_hole_errs }
             else if pred_errs > 0 { pred_errs }
+            else if unit_ref_errs > 0 { unit_ref_errs }
             else if union_collision_errs > 0 { union_collision_errs }
             else if nursery_brand_errs > 0 { nursery_brand_errs }
             else if qualtype_errs > 0 { qualtype_errs }
