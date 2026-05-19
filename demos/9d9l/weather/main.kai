@@ -1,24 +1,22 @@
 # 9d9l #2 — Weather (https://github.com/lnds/9d9l/tree/master/desafio2)
 #
-# The original 9d9l challenge fetches weather for several cities
-# from OpenWeatherMap, optionally in parallel with `-p`, and
-# prints them sorted by current temperature (high to low).
+# Fetches current weather for several cities from wttr.in (a
+# free, no-API-key wrapper around the WeatherUnderground feed —
+# https://github.com/chubin/wttr.in), parses the JSON response,
+# sorts the results by current temperature high-to-low, and
+# prints them in the line shape the upstream README asks for:
 #
-# kaikai port: the live HTTP path is exercised by the
-# `examples/stdlib/http_*` fixtures already; here we keep the demo
-# hermetic by parsing fixed JSON payloads via stdlib/encoding/json.
-# The pitch the demo carries — typed JSON drilling + functional
-# sort by a derived key — runs end-to-end without network access.
+#   <City>  max: <tmax>  min: <tmin>  actual: <tactual>  <condition>
 #
-# What the upstream challenge asks for (per the README):
-#
-#   <Ciudad>   max: <tmax>  min: <tmin>  actual: <tactual>  <Condición>
-#   ...
-#   Tiempo ocupado en descargar información : hh:mm:ss.ms
-#
-# We drop the timing line — Clock.monotonic is post-m8 work — and
-# focus on the JSON drilling + descending-temperature sort.
+# Upstream takes the cities on the command line, reads an API key
+# from the environment, and offers a `-p` parallel mode. This port
+# bakes in the city list (so the demo is hermetic when run under
+# `make -C demos verify`) but the network call is real — the
+# Hanga Roa reactor (R2 NetTcp, #630, 2026-05-16) parks the fiber
+# during the socket read instead of blocking the OS thread, so
+# every fetch yields cleanly.
 
+import net.http
 import encoding.json
 
 type Report = {
@@ -29,25 +27,21 @@ type Report = {
   desc:     String,
 }
 
-# A minimal in-memory database of weather JSON payloads, shaped
-# after the slices of an OpenWeatherMap response the upstream
-# demo reads (main.temp, main.temp_max, main.temp_min,
-# weather[0].description). The hermetic input lets the demo
-# exercise the parse-and-sort pipeline without an API key.
-fn payload(city: String) : String = match city {
-  "Berlin"   -> "{\"main\":{\"temp\":18.0,\"temp_max\":22.0,\"temp_min\":12.0},\"weather\":[{\"description\":\"clear sky\"}]}"
-  "Santiago" -> "{\"main\":{\"temp\":24.5,\"temp_max\":28.0,\"temp_min\":15.0},\"weather\":[{\"description\":\"few clouds\"}]}"
-  "Boston"   -> "{\"main\":{\"temp\":10.2,\"temp_max\":15.0,\"temp_min\":5.0},\"weather\":[{\"description\":\"overcast\"}]}"
-  "Madrid"   -> "{\"main\":{\"temp\":26.0,\"temp_max\":30.5,\"temp_min\":18.0},\"weather\":[{\"description\":\"sunny\"}]}"
-  _          -> "{\"main\":{\"temp\":0.0,\"temp_max\":0.0,\"temp_min\":0.0},\"weather\":[{\"description\":\"unknown\"}]}"
-}
-
 # ---- JSON drilling helpers ----------------------------------------
 #
-# stdlib/encoding/json.kai exposes a single algebraic `JsonValue`.
-# The demo only needs three projections (object lookup by key, array
-# index, primitive extraction); the rest of the parsed tree is
-# discarded.
+# wttr.in's `?format=j1` response shape:
+#
+#   { "current_condition": [ { "temp_C": "27",
+#                              "weatherDesc": [ { "value": "Sunny" } ] } ],
+#     "weather":           [ { "mintempC": "13", "maxtempC": "26" } ] }
+#
+# Every numeric field is wire-encoded as a String, so we run
+# `string.to_int` on the JStr payload after the JSON drill.
+
+fn pairs_get(pairs: [Pair[String, JsonValue]], k: String) : Option[JsonValue] = match pairs {
+  []           -> None
+  [p, ...rest] -> if p.fst == k { Some(p.snd) } else { pairs_get(rest, k) }
+}
 
 fn obj_get(v: JsonValue, k: String) : JsonValue = match v {
   JObj(pairs) -> match pairs_get(pairs, k) {
@@ -57,9 +51,9 @@ fn obj_get(v: JsonValue, k: String) : JsonValue = match v {
   _           -> JNull
 }
 
-fn pairs_get(pairs: [Pair[String, JsonValue]], k: String) : Option[JsonValue] = match pairs {
-  []           -> None
-  [p, ...rest] -> if p.fst == k { Some(p.snd) } else { pairs_get(rest, k) }
+fn nth_or(xs: [JsonValue], i: Int, fallback: JsonValue) : JsonValue = match xs {
+  []           -> fallback
+  [x, ...rest] -> if i == 0 { x } else { nth_or(rest, i - 1, fallback) }
 }
 
 fn arr_get(v: JsonValue, i: Int) : JsonValue = match v {
@@ -67,38 +61,123 @@ fn arr_get(v: JsonValue, i: Int) : JsonValue = match v {
   _           -> JNull
 }
 
-fn nth_or(xs: [JsonValue], i: Int, fallback: JsonValue) : JsonValue = match xs {
-  []           -> fallback
-  [x, ...rest] -> if i == 0 { x } else { nth_or(rest, i - 1, fallback) }
-}
-
-fn as_real(v: JsonValue) : Real = match v {
-  JReal(r) -> r
-  JNum(n)  -> int_to_real(n)
-  _        -> 0.0
-}
-
 fn as_string(v: JsonValue) : String = match v {
   JStr(s) -> s
   _       -> ""
 }
 
-# ---- Per-city pipeline --------------------------------------------
+# wttr.in encodes temperatures as integer-valued strings ("27",
+# "-3"). Parse them via `string.to_int`; if the string is unexpected
+# (e.g. wttr.in returns a banner) we fall back to 0.
+fn as_temp(v: JsonValue) : Real = match v {
+  JStr(s) -> match string.to_int(s) {
+    Some(n) -> int_to_real(n)
+    None    -> 0.0
+  }
+  JNum(n) -> int_to_real(n)
+  JReal(r) -> r
+  _        -> 0.0
+}
 
-fn parse_report(city: String) : Report = {
-  let v    = match json_decode(payload(city)) {
+# ---- HTTP chunked-transfer-encoding decode ------------------------
+#
+# wttr.in serves the JSON body chunked, but stdlib/net/http.kai's
+# `parse_response` deliberately leaves chunked framing in `body`
+# (see the doc comment on `parse_response`). This walks the body,
+# parses each `<hex-length>\r\n<bytes>\r\n` frame, and concatenates
+# the payloads. A `0\r\n` length terminates the stream.
+
+fn hex_digit_value(c: Char) : Option[Int] = {
+  if char.is_digit(c) { Some(char_to_int(c) - char_to_int('0')) }
+  else if c >= 'a' and c <= 'f' { Some(char_to_int(c) - char_to_int('a') + 10) }
+  else if c >= 'A' and c <= 'F' { Some(char_to_int(c) - char_to_int('A') + 10) }
+  else { None }
+}
+
+fn parse_hex_loop(s: String, i: Int, n: Int, acc: Int) : Option[Int] = {
+  if i >= n { Some(acc) }
+  else { match char_at(s, i) {
+    None    -> Some(acc)
+    Some(c) -> match hex_digit_value(c) {
+      None     -> Some(acc)
+      Some(v)  -> parse_hex_loop(s, i + 1, n, acc * 16 + v)
+    }
+  } }
+}
+
+fn parse_hex(s: String) : Option[Int] =
+  parse_hex_loop(s, 0, string.length(s), 0)
+
+# Returns Index of "\r\n" in `s` starting at `from`, or -1 if not found.
+fn find_crlf(s: String, from: Int) : Int = {
+  let n = string.length(s)
+  if from + 1 >= n { -1 }
+  else { find_crlf_loop(s, from, n) }
+}
+
+fn find_crlf_loop(s: String, i: Int, n: Int) : Int = {
+  if i + 1 >= n { -1 }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '\r' {
+        match char_at(s, i + 1) {
+          Some(c2) -> if c2 == '\n' { i } else { find_crlf_loop(s, i + 1, n) }
+          None     -> -1
+        }
+      } else { find_crlf_loop(s, i + 1, n) }
+      None    -> -1
+    }
+  }
+}
+
+fn dechunk_loop(body: String, pos: Int, acc: String) : String = {
+  let crlf = find_crlf(body, pos)
+  if crlf < 0 { acc }
+  else {
+    let len_str = string.slice(body, pos, crlf - pos)
+    match parse_hex(len_str) {
+      None    -> acc
+      Some(0) -> acc
+      Some(n) -> {
+        let data_start = crlf + 2
+        let chunk = string.slice(body, data_start, n)
+        # Skip the trailing "\r\n" after the chunk data.
+        dechunk_loop(body, data_start + n + 2, string_concat(acc, chunk))
+      }
+    }
+  }
+}
+
+fn dechunk(body: String) : String = dechunk_loop(body, 0, "")
+
+# ---- Per-city fetch + parse ---------------------------------------
+
+fn fetch_report(city: String) : Report / NetTcp + Cancel = {
+  let url = string_concat_all(["http://wttr.in/", city, "?format=j1"])
+  let resp = http.get(url)
+  # wttr.in responds Transfer-Encoding: chunked; stdlib's
+  # `parse_response` leaves the framing in `body`, so peel it off
+  # before handing to the JSON parser.
+  let body = dechunk(resp.body)
+  let parsed = match json_decode(body) {
     Some(j) -> j
     None    -> JNull
   }
-  let main = obj_get(v, "main")
-  let w0   = arr_get(obj_get(v, "weather"), 0)
+  let current = arr_get(obj_get(parsed, "current_condition"), 0)
+  let today   = arr_get(obj_get(parsed, "weather"), 0)
+  let w0      = arr_get(obj_get(current, "weatherDesc"), 0)
   Report {
     city:     city,
-    temp:     as_real(obj_get(main, "temp")),
-    temp_max: as_real(obj_get(main, "temp_max")),
-    temp_min: as_real(obj_get(main, "temp_min")),
-    desc:     as_string(obj_get(w0, "description")),
+    temp:     as_temp(obj_get(current, "temp_C")),
+    temp_max: as_temp(obj_get(today,   "maxtempC")),
+    temp_min: as_temp(obj_get(today,   "mintempC")),
+    desc:     as_string(obj_get(w0,    "value")),
   }
+}
+
+fn fetch_each(cs: [String]) : [Report] / NetTcp + Cancel = match cs {
+  []           -> []
+  [c, ...rest] -> [fetch_report(c), ...fetch_each(rest)]
 }
 
 # Descending sort by `.temp`: list.sort_by takes a (Report, Report)
@@ -109,12 +188,7 @@ fn cmp_by_temp_desc(a: Report, b: Report) : Int =
   else if a.temp < b.temp { 1 }
   else { 0 }
 
-fn map_reports(cs: [String]) : [Report] = match cs {
-  []           -> []
-  [c, ...rest] -> [parse_report(c), ...map_reports(rest)]
-}
-
-# ---- Output ---------------------------------------------------------
+# ---- Output -------------------------------------------------------
 
 fn render(r: Report) : String =
   string_concat_all([
@@ -132,9 +206,9 @@ fn print_reports(rs: [Report]) : Unit / Stdout = match rs {
   }
 }
 
-fn main() : Int / Stdout = {
+fn main() : Int / NetTcp + Cancel + Stdout = {
   let cities = ["Berlin", "Santiago", "Boston", "Madrid"]
-  let reports = map_reports(cities)
+  let reports = fetch_each(cities)
   let sorted  = list.sort_by(reports, cmp_by_temp_desc)
   print_reports(sorted)
   0
