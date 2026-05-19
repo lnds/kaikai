@@ -1,29 +1,24 @@
-# 9d9l #4 — Huffman compression with real bit-packing
+# 9d9l #4 — Huffman (https://github.com/lnds/9d9l/tree/master/desafio4)
 #
-# Compress / decompress files using Huffman coding. Builds the tree
-# from character frequencies, encodes via the resulting code table,
-# packs the bit stream into bytes (8 bits per byte, MSB first), and
-# decompresses by walking the tree per bit.
+# Compress a literal text via Huffman coding and verify the
+# round-trip. The challenge's restriction is to build the
+# priority queue and the binary tree by hand rather than reach
+# for stdlib containers; kaikai's stdlib doesn't ship a min-heap
+# anyway, so the priority queue is a sorted list with insert
+# walks (`tree_pq_insert`), and the tree is a sum type.
 #
-# Acts as a probe for **m13 bit ops** (proposed-extensions.md §16):
-# `bit.shl`, `bit.shr`, `bit.and`, `bit.or` are compiler intrinsics
-# in `stdlib/core/bit.kai` that lower directly to the backend's bit
-# op. The demo flips from FAIL to PASS the moment m13 lands.
-#
-# Pending features:
-#   - `use Effect`            — m7e §25
-#   - `File.read_bytes` etc.  — File effect catalog (post-m14)
-#   - `++`                    — m7d §23
-#   - bit ops (bit.shl/bit.shr/bit.and/bit.or) — m13 (§16)
+# Scope: in-memory round-trip. The upstream CLI persists the
+# Huffman table alongside the bit stream, which means defining a
+# binary file format — a separate concern from the algorithm.
+# This demo proves correctness end-to-end by re-encoding and
+# decoding the same payload in the same process.
 
-use Console
-use Env
-use File
+import os.args
 
-import bit
-
-# A Huffman tree is either a leaf (char + frequency) or an internal
-# node (combined frequency + two subtrees).
+# A Huffman tree is either a leaf (frequency + character) or an
+# internal node (combined frequency + left + right). The
+# children carry the bit labels: walking left appends a 0, right
+# appends a 1.
 type Tree
   = Leaf(Int, Char)
   | Node(Int, Tree, Tree)
@@ -33,126 +28,221 @@ fn freq(t: Tree) : Int = match t {
   Node(f, _, _) -> f
 }
 
-# --- Frequency table as an association list of (Char, Int) ---
+# ---- Frequency table as an association list of (char, count) -----
+#
+# `kaikai` doesn't have anonymous tuples; using a tiny record
+# instead keeps the call sites readable (`entry.ch`, `entry.n`).
+type FreqEntry = { ch: Char, n: Int }
 
-fn bump(table: [(Char, Int)], c: Char) : [(Char, Int)] = match table {
-  []                           -> [(c, 1)]
-  [(k, n), ...rest] if k == c  -> [(k, n + 1), ...rest]
-  [pair, ...rest]              -> [pair, ...bump(rest, c)]
-}
-
-fn count(chars: [Char], acc: [(Char, Int)]) : [(Char, Int)] = match chars {
-  []           -> acc
-  [c, ...rest] -> count(rest, bump(acc, c))
-}
-
-# --- Priority queue as a sorted list (min-first) ---
-
-fn pq_insert(t: Tree, q: [Tree]) : [Tree] = match q {
-  []                                 -> [t]
-  [h, ...rest] if freq(t) <= freq(h) -> [t, h, ...rest]
-  [h, ...rest]                       -> [h, ...pq_insert(t, rest)]
-}
-
-fn build(q: [Tree]) : Tree / Fail = match q {
-  []              -> Fail.fail("empty queue")
-  [t]             -> t
-  [a, b, ...rest] -> build(pq_insert(Node(freq(a) + freq(b), a, b), rest))
-}
-
-fn from_text(text: String) : Tree / Fail = {
-  let table = count(string.chars(text), [])
-  let leaves = table | (p) => Leaf(p.1, p.0)
-  let queue = reduce(leaves, [], (q, t) => pq_insert(t, q))
-  build(queue)
-}
-
-# --- Code lookup: bits as [Int] of 0/1, not String ---
-
-fn lookup(t: Tree, target: Char, code: [Int]) : Option[[Int]] = match t {
-  Leaf(_, c) if c == target -> Some(code)
-  Leaf(_, _)                -> None
-  Node(_, l, r)             -> match lookup(l, target, code ++ [0]) {
-    Some(s) -> Some(s)
-    None    -> lookup(r, target, code ++ [1])
+fn freq_bump(table: [FreqEntry], c: Char) : [FreqEntry] = match table {
+  []           -> [FreqEntry { ch: c, n: 1 }]
+  [e, ...rest] -> if e.ch == c {
+    [FreqEntry { ...e, n: e.n + 1 }, ...rest]
+  } else {
+    [e, ...freq_bump(rest, c)]
   }
 }
 
-fn encode_bits(t: Tree, text: String) : [Int] / Fail = {
-  string.chars(text)
-    | (c) => match lookup(t, c, []) {
-      Some(code) -> code
-      None       -> Fail.fail("char not in tree")
-    }
-    |> list.flatten
+fn freq_count(chars: [Char], acc: [FreqEntry]) : [FreqEntry] = match chars {
+  []           -> acc
+  [c, ...rest] -> freq_count(rest, freq_bump(acc, c))
 }
 
-# --- Bit packing using m13 bit ops ---
+# ---- Priority queue as a sorted list (lowest freq first) ---------
 
+fn tree_pq_insert(t: Tree, q: [Tree]) : [Tree] = match q {
+  []                                 -> [t]
+  [h, ...rest] -> if freq(t) <= freq(h) {
+    [t, h, ...rest]
+  } else {
+    [h, ...tree_pq_insert(t, rest)]
+  }
+}
+
+# Build the Huffman tree by repeatedly combining the two smallest
+# trees in the priority queue until only one remains.
+fn tree_build(q: [Tree]) : Option[Tree] = match q {
+  []              -> None
+  [t]             -> Some(t)
+  [a, b, ...rest] -> tree_build(tree_pq_insert(Node(freq(a) + freq(b), a, b), rest))
+}
+
+# Build the queue: one Leaf per frequency entry, then sort by
+# inserting into an empty queue.
+fn seed_queue(entries: [FreqEntry], acc: [Tree]) : [Tree] = match entries {
+  []           -> acc
+  [e, ...rest] -> seed_queue(rest, tree_pq_insert(Leaf(e.n, e.ch), acc))
+}
+
+fn tree_from_text(text: String) : Option[Tree] =
+  tree_build(seed_queue(freq_count(string.chars(text), []), []))
+
+# ---- Code table: each Char maps to a [Int] of 0/1 bits -----------
+#
+# Walk the tree in-order, accumulating the bit path. Build a flat
+# association list keyed by character — the encode loop reads it
+# per source character.
+
+type CodeEntry = { ch: Char, bits: [Int] }
+
+fn collect_codes(t: Tree, path: [Int], acc: [CodeEntry]) : [CodeEntry] = match t {
+  Leaf(_, c)    -> [CodeEntry { ch: c, bits: path }, ...acc]
+  Node(_, l, r) -> {
+    let with_left = collect_codes(l, list_append(path, [0]), acc)
+    collect_codes(r, list_append(path, [1]), with_left)
+  }
+}
+
+fn code_lookup(codes: [CodeEntry], target: Char) : Option[[Int]] = match codes {
+  []           -> None
+  [e, ...rest] -> if e.ch == target { Some(e.bits) } else { code_lookup(rest, target) }
+}
+
+fn encode_chars(codes: [CodeEntry], chars: [Char]) : Option[[Int]] = match chars {
+  []           -> Some([])
+  [c, ...rest] -> match code_lookup(codes, c) {
+    None       -> None
+    Some(code) -> match encode_chars(codes, rest) {
+      None      -> None
+      Some(more) -> Some(list_append(code, more))
+    }
+  }
+}
+
+# ---- Bit packing -------------------------------------------------
+#
 # Pack a sequence of 0/1 into bytes, MSB first. The final byte may
-# carry padding zeros on the right; the bit count is reported
-# separately so a real implementation can drop them on decode.
+# carry padding zeros on the right; the caller reports the bit
+# count separately so the decoder can drop the padding.
+
 fn pack_loop(bits: [Int], acc: Int, n: Int, out: [Int]) : [Int] = match bits {
-  []           -> if n == 0 { out } else { out ++ [bit.shl(acc, 8 - n)] }
+  []           -> if n == 0 { out } else { list_append(out, [bit.shl(acc, 8 - n)]) }
   [b, ...rest] -> {
     let acc2 = bit.or(bit.shl(acc, 1), b)
-    if n + 1 == 8 { pack_loop(rest, 0, 0, out ++ [bit.and(acc2, 0xFF)]) }
-    else          { pack_loop(rest, acc2, n + 1, out) }
+    if n + 1 == 8 {
+      pack_loop(rest, 0, 0, list_append(out, [bit.and(acc2, 0xFF)]))
+    } else {
+      pack_loop(rest, acc2, n + 1, out)
+    }
   }
 }
 
 fn pack_bits(bits: [Int]) : [Int] = pack_loop(bits, 0, 0, [])
 
-# Unpack a byte stream back into a 0/1 sequence. `total_bits` from
-# the header is used to drop padding from the final byte.
-fn unpack_byte(byte: Int, n: Int, acc: [Int]) : [Int] =
-  if n == 0 { acc }
-  else      { unpack_byte(byte, n - 1, [bit.and(bit.shr(byte, n - 1), 1), ...acc]) }
+# Unpack a byte stream back into a 0/1 sequence. `total_bits`
+# trims the padding on the last byte.
+
+fn unpack_byte_bits(byte: Int, take: Int, out_pos: Int, acc: [Int]) : [Int] =
+  if out_pos >= take { acc }
+  else {
+    let bit = bit.and(bit.shr(byte, 7 - out_pos), 1)
+    unpack_byte_bits(byte, take, out_pos + 1, list_append(acc, [bit]))
+  }
 
 fn unpack_loop(bytes: [Int], remaining: Int, acc: [Int]) : [Int] = match bytes {
   []           -> acc
   [b, ...rest] -> {
     let take = if remaining < 8 { remaining } else { 8 }
-    unpack_loop(rest, remaining - take, acc ++ list.reverse(unpack_byte(b, take, [])))
+    unpack_loop(rest, remaining - take, list_append(acc, unpack_byte_bits(b, take, 0, [])))
   }
 }
 
-fn unpack_bits(bytes: [Int], total_bits: Int) : [Int] =
-  unpack_loop(bytes, total_bits, [])
+fn unpack_bits(bytes: [Int], total: Int) : [Int] = unpack_loop(bytes, total, [])
 
-# --- Decode: walk the tree per bit ---
+# ---- Decode: walk the tree per bit -------------------------------
 
-fn decode_step(root: Tree, cur: Tree, bits: [Int], acc: String) : String / Fail = match cur, bits {
-  Leaf(_, c), []              -> acc ++ char_to_string(c)
-  Leaf(_, c), more            -> decode_step(root, root, more, acc ++ char_to_string(c))
-  Node(_, l, _), [b, ...rest] if b == 0 -> decode_step(root, l, rest, acc)
-  Node(_, _, r), [b, ...rest] if b == 1 -> decode_step(root, r, rest, acc)
-  _, _                        -> Fail.fail("malformed bitstream")
-}
-
-fn decode(t: Tree, bits: [Int]) : String / Fail =
-  decode_step(t, t, bits, "")
-
-# --- CLI driver ---
-
-fn compress(input: String, output: String) : Unit / Console + File + Fail = {
-  let text = File.read(input)!
-  let tree = from_text(text)
-  let bits = encode_bits(tree, text)
-  let bytes = pack_bits(bits)
-  # NOTE: A real implementation also serialises `tree` and the bit
-  # count alongside `bytes` so decompression can reconstruct the
-  # input exactly (no off-by-one on padding).
-  File.write_bytes(output, bytes)!
-  println("compressed: " ++ int_to_string(list.length(bits)) ++ " bits → "
-    ++ int_to_string(list.length(bytes)) ++ " bytes")
-}
-
-fn main() = match Env.args() {
-  ["-c", input, output] -> handle { compress(input, output) } with Fail {
-    fail(msg, _) -> Console.eprint("error: " ++ msg)
-    return(_)    -> ()
+fn decode_step(root: Tree, cur: Tree, bits: [Int], acc: String) : Option[String] = match cur {
+  Leaf(_, c) -> match bits {
+    []           -> Some(string_concat(acc, char_to_string(c)))
+    _            -> decode_step(root, root, bits, string_concat(acc, char_to_string(c)))
   }
-  ["-d", _, _] -> println("decode requires the serialised tree + bit count from compression — out of scope for this demo")
-  _            -> println("usage: huffman [-c|-d] <input> <output>")
+  Node(_, l, r) -> match bits {
+    []           -> None    # bit stream ended inside an internal node
+    [b, ...rest] -> if b == 0 { decode_step(root, l, rest, acc) }
+                    else      { decode_step(root, r, rest, acc) }
+  }
+}
+
+fn decode(t: Tree, bits: [Int]) : Option[String] = decode_step(t, t, bits, "")
+
+# A 1-char helper because stdlib's `char_to_string` is missing —
+# slice a 1-char window out of a 1-char string would be circular,
+# so we build it via concat over an intermediate string literal.
+# This works for any ASCII or single-byte UTF-8 character.
+fn char_to_string(c: Char) : String = {
+  let buf = string.repeat(" ", 1)
+  # Indirect: emit the char via its integer value through the
+  # prelude. Falls back to the literal " " when the input is not
+  # representable as a single byte (multi-byte UTF-8); the demo
+  # uses an ASCII corpus so this branch never fires.
+  match char_at(buf, 0) {
+    Some(_) -> {
+      let n = char_to_int(c)
+      if n < 128 { string.slice(builtin_ascii(), n, 1) }
+      else { " " }
+    }
+    None    -> " "
+  }
+}
+
+# Pre-built ASCII table: every byte 0..127. The demo only walks
+# printable bytes so the non-printable rows are placeholders; the
+# decode tests below assert printable Char round-tripping.
+fn builtin_ascii() : String =
+  "                                 !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ "
+
+# ---- Driver ------------------------------------------------------
+
+fn render_bits(bits: [Int]) : String = match bits {
+  []           -> ""
+  [b, ...rest] -> string_concat(int_to_string(b), render_bits(rest))
+}
+
+fn render_bytes(bs: [Int]) : String = match bs {
+  []           -> ""
+  [b]          -> int_to_string(b)
+  [b, ...rest] -> string_concat(int_to_string(b), string_concat(" ", render_bytes(rest)))
+}
+
+fn demo_for(text: String) : Unit / Stdout = match tree_from_text(text) {
+  None       -> Stdout.print("empty input — nothing to compress")
+  Some(tree) -> {
+    let codes = collect_codes(tree, [], [])
+    match encode_chars(codes, string.chars(text)) {
+      None       -> Stdout.print("char missing from tree — should be unreachable")
+      Some(bits) -> {
+        let bytes  = pack_bits(bits)
+        let unpacked = unpack_bits(bytes, list.length(bits))
+        let decoded = decode(tree, unpacked)
+        Stdout.print(string_concat("input:    ", text))
+        Stdout.print(string_concat("bits:     ", int_to_string(list.length(bits))))
+        Stdout.print(string_concat("bytes:    ", int_to_string(list.length(bytes))))
+        Stdout.print(string_concat("packed:   ", render_bytes(bytes)))
+        match decoded {
+          Some(out) -> if out == text { Stdout.print("decode:   ok (round-trip match)") }
+                       else           { Stdout.print(string_concat("decode:   MISMATCH ", out)) }
+          None      -> Stdout.print("decode:   FAILED")
+        }
+      }
+    }
+  }
+}
+
+fn main() : Int / Env + Stdout = {
+  let argv = args.argv()
+  let texts = match argv {
+    []  -> ["abracadabra", "this is an example of huffman encoding"]
+    _   -> argv
+  }
+  run(texts)
+  0
+}
+
+fn run(texts: [String]) : Unit / Stdout = match texts {
+  []           -> ()
+  [t, ...rest] -> {
+    demo_for(t)
+    Stdout.print("")
+    run(rest)
+  }
 }
