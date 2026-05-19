@@ -16,7 +16,7 @@
 # script's own location, so the script works from any working
 # directory.
 #
-# Auto-loaded preludes — the Hanga Roa "core" module. Anything else
+# Auto-loaded core modules — the Hanga Roa "core" set. Anything else
 # under stdlib/ requires explicit `import` from user code.
 #
 #   stdlib/core/*.kai      sorted alphabetically (char before string
@@ -33,8 +33,6 @@
 # collections/*, encoding/*, crypto/*, random*, fx, uuid, path) is
 # opt-in via `import <name>` — see docs/stdlib-layout.md §*Core vs.
 # opt-in*.
-#
-# KAI_NO_STDLIB=1 skips all auto-loaded preludes.
 
 set -eu
 
@@ -97,17 +95,6 @@ RUNTIME_INC="${KAI_INCLUDE:-$RUNTIME_INC}"
 # back to the macro only when the env is unset, so this export is
 # what makes installed kaikai self-consistent.
 export KAIKAI_STDLIB_PATH="$STDLIB_ROOT"
-
-STDLIB_CORE_DIR="$STDLIB_ROOT/core"
-STDLIB_PROTOCOLS="$STDLIB_ROOT/protocols.kai"
-STDLIB_EFFECTS="$STDLIB_ROOT/effects.kai"
-STDLIB_ARRAY="$STDLIB_ROOT/array.kai"
-
-# Modules loaded as the implicit `core` prelude. Everything else
-# under `stdlib/` is opt-in via explicit `import` — see
-# `docs/stdlib-layout.md` §*Core vs. opt-in*. Adding a new file
-# here means every kaikai program sees its `pub` exports in the
-# global scope without an `import`; tread carefully.
 
 # Package manager helper (issue #405). The driver shells out to a
 # kaikai-compiled CLI for kai.toml read/write, dependency
@@ -549,7 +536,6 @@ Environment:
   KAI_BACKEND      Default backend (c|llvm) when --backend is not
                    passed. Overridden by --backend; defaults to `c`
                    (the LLVM backend is opt-in until Orongo).
-  KAI_NO_STDLIB    If 1, skip auto-loading the stdlib preludes.
   KAI_STDLIB       Override the stdlib root directory (default: auto-detected
                    from the script's location — share/kaikai/stdlib if installed,
                    stdlib/ if running from a dev checkout).
@@ -612,8 +598,9 @@ Examples:
   kai build --holes draft.kai               # human-readable hole report
   kai build --holes-json draft.kai          # machine-readable hole report
 
-The compiler auto-loads the stdlib preludes (stdlib/core, protocols,
-effects, etc.). Set KAI_NO_STDLIB=1 to skip them.
+The compiler auto-loads the core stdlib modules (stdlib/core, protocols,
+effects, array). Everything else under stdlib/ requires an explicit
+`import`.
 EOF
 }
 
@@ -662,13 +649,13 @@ every sub-run, so CI fails the moment any package's tests do.
 The compiler emits a main that runs every 'test "..." { ... }' block
 defined in the entry point and reports the result.
 
-Tests defined inside the auto-loaded stdlib preludes are dropped at
-load time (issue #318) so the count reflects only the user's tests.
+Tests defined inside the auto-loaded core stdlib modules are dropped
+at load time (issue #318) so the count reflects only the user's tests.
 
 Options:
   -h, --help                Show this help.
   --include-prelude-tests   Also run test blocks defined inside the
-                            stdlib preludes (legacy behaviour).
+                            auto-loaded core stdlib modules (legacy).
 
 Examples:
   kai test                                   # cwd package
@@ -817,189 +804,6 @@ home:           https://kaikai-lang.org
 EOF
 }
 
-# Issue #452 Phase A.0 step 4 — prelude cache directory.
-#   $KAI_PRELUDE_CACHE_DIR overrides everything.
-#   $XDG_CACHE_HOME/kaikai/preludes-v1 if set (Linux convention).
-#   ~/Library/Caches/kaikai/preludes-v1 on macOS.
-#   ~/.cache/kaikai/preludes-v1 elsewhere.
-# The `-v1` suffix is the kaikai-cache format generation. A future
-# kaic2 that bumps `cache_format_version()` should also bump the
-# directory suffix so the two generations coexist on disk.
-#
-# Issue #603: partition the cache by edition so a user who flips
-# `edition = "hanga-roa"` in kai.toml never hits a tongariki-shaped
-# cache entry (and vice versa). The optional first argument is the
-# edition name; absent, we read the repo EDITION file. Existing
-# pre-#603 cache directories at the un-partitioned root become
-# dormant leftovers — users may rm -rf them; the partitioned tree
-# rebuilds on first use.
-prelude_cache_dir() {
-  ed="${1:-$(read_edition)}"
-  if [ -n "${KAI_PRELUDE_CACHE_DIR:-}" ]; then
-    printf '%s/%s' "$KAI_PRELUDE_CACHE_DIR" "$ed"
-    return 0
-  fi
-  if [ -n "${XDG_CACHE_HOME:-}" ]; then
-    printf '%s/kaikai/preludes-v1/%s' "$XDG_CACHE_HOME" "$ed"
-    return 0
-  fi
-  case "$(uname -s)" in
-    Darwin) printf '%s/Library/Caches/kaikai/preludes-v1/%s' "$HOME" "$ed" ;;
-    *)      printf '%s/.cache/kaikai/preludes-v1/%s' "$HOME" "$ed" ;;
-  esac
-}
-
-# Compute the lowercase-hex sha256 of $1. Tries `shasum -a 256`
-# (macOS + BSD + coreutils) then `sha256sum` (GNU). Empty on failure.
-file_sha256() {
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" 2>/dev/null | awk '{ print $1 }'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" 2>/dev/null | awk '{ print $1 }'
-  else
-    printf ''
-  fi
-}
-
-# Issue #592: batch sha256 for the stdlib preludes. Per-file
-# `shasum` forks cost ~9ms each; with 32 preludes that compounds to
-# ~270ms — more than the cache itself saves on warm reload.
-# `prelude_sha_batch` runs `shasum -a 256` once over every path and
-# emits `<sha> <path>` lines into KAI_PRELUDE_SHA_FILE (a tmp file
-# the parent sets before invoking stdlib_prelude_flags). Per-file
-# lookups use `awk` against that file in O(n) per query — still
-# cheaper than re-forking shasum.
-prelude_sha_batch() {
-  out_file="$1"; shift
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$@" 2>/dev/null | awk '{ sha=$1; $1=""; sub(/^ /, ""); print sha " " $0 }' > "$out_file"
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$@" 2>/dev/null | awk '{ sha=$1; $1=""; sub(/^ /, ""); print sha " " $0 }' > "$out_file"
-  else
-    : > "$out_file"
-  fi
-}
-
-# Look up a path's pre-computed sha in $KAI_PRELUDE_SHA_FILE. Falls
-# back to a one-off `file_sha256` if the batch file is absent or the
-# path is not listed.
-file_sha256_cached() {
-  src="$1"
-  if [ -n "${KAI_PRELUDE_SHA_FILE:-}" ] && [ -f "$KAI_PRELUDE_SHA_FILE" ]; then
-    awk -v p="$src" '$2 == p { print $1; exit }' "$KAI_PRELUDE_SHA_FILE"
-    return 0
-  fi
-  file_sha256 "$src"
-}
-
-# Locate the cache file for $1 (a source .kai path). Returns the
-# cache path on stdout, or empty if no usable cache exists.
-#
-# Hit/miss rule: the filename is `<sha>.kab`. A non-existent file is
-# a miss. An existing file is treated as a hit; the cache header
-# carries kaikai_version_hash + format_version + magic so a stale
-# binary will reject the blob on load and bin/kai re-emits.
-# Content-addressable filename means a source content change yields
-# a different sha and therefore a fresh cache slot — no mtime check
-# is needed.
-#
-# Issue #592: the KAB2 binary format closes the KAB1 hex regression.
-# Warm wall is now within noise of cache-OFF (slight net positive),
-# so the cache layer is ON by default. KAI_PRELUDE_CACHE=0 (or
-# KAI_NO_PRELUDE_CACHE=1) restores the pre-cache path.
-prelude_cache_lookup() {
-  src="$1"
-  ed="${2:-$(read_edition)}"
-  [ "${KAI_PRELUDE_CACHE:-1}" = "1" ]    || return 0
-  [ -n "${KAI_NO_PRELUDE_CACHE:-}" ]     && return 0
-  [ -n "${KAI_NO_STDLIB:-}" ]            && return 0
-  sha="$(file_sha256_cached "$src")"
-  [ -n "$sha" ] || return 0
-  cache_dir="$(prelude_cache_dir "$ed")"
-  cache_path="$cache_dir/${sha}.kab"
-  if [ -f "$cache_path" ]; then
-    printf '%s' "$cache_path"
-  fi
-}
-
-# Build the cache file for $1 (source .kai path). Invokes kaic2 with
-# --emit-prelude-cache, captures stdout to <tmp>.kab.tmp, fsyncs (via
-# `sync`'s closest portable hook — `dd` with conv=fsync if available;
-# else trust the rename), then atomically renames into place. Quiet
-# on success; returns the cache path on stdout. Empty on failure
-# (caller falls back to passing the source via --prelude).
-prelude_cache_build() {
-  src="$1"
-  ed="${2:-$(read_edition)}"
-  [ "${KAI_PRELUDE_CACHE:-1}" = "1" ]    || return 0
-  [ -n "${KAI_NO_PRELUDE_CACHE:-}" ]     && return 0
-  [ -n "${KAI_NO_STDLIB:-}" ]            && return 0
-  sha="$(file_sha256_cached "$src")"
-  [ -n "$sha" ] || return 0
-  cache_dir="$(prelude_cache_dir "$ed")"
-  mkdir -p "$cache_dir" || return 0
-  cache_path="$cache_dir/${sha}.kab"
-  tmp_path="$cache_dir/.${sha}.kab.$$.tmp"
-  if "$KAIC2" --emit-prelude-cache --cache-sha "$sha" "$src" > "$tmp_path" 2>/dev/null; then
-    # POSIX rename(2) is atomic on the same filesystem; the cache
-    # directory and tmp file live side-by-side so any concurrent
-    # reader sees either the prior cache file or the new one, never
-    # a half-written blob.
-    if mv "$tmp_path" "$cache_path"; then
-      printf '%s' "$cache_path"
-      return 0
-    fi
-  fi
-  rm -f "$tmp_path" 2>/dev/null
-  return 0
-}
-
-# Emit a single `--prelude-cache <src> <cache>` pair when a cache hit
-# is available, falling back to `--prelude <src>` on miss (after
-# trying to BUILD the cache on the fly). Each prelude source is
-# considered independently — a corrupted cache for one file does not
-# touch the others. Silent when KAI_NO_PRELUDE_CACHE is set: the
-# driver emits the same `--prelude <src>` flags as before the cache
-# layer existed.
-prelude_flag_for() {
-  src="$1"
-  ed="${2:-$(read_edition)}"
-  [ -f "$src" ] || return 0
-  # Default: the cache layer is opt-in via KAI_PRELUDE_CACHE=1. With
-  # Issue #592: cache layer is ON by default with KAB2. Setting
-  # KAI_PRELUDE_CACHE=0 or KAI_NO_PRELUDE_CACHE=1 restores the
-  # pre-cache code path (useful for CI runs that purge
-  # ~/.cache/kaikai or for benchmark comparison).
-  if [ "${KAI_PRELUDE_CACHE:-1}" != "1" ] || [ "${KAI_NO_PRELUDE_CACHE:-}" = "1" ]; then
-    printf -- '--prelude %s ' "$src"
-    return 0
-  fi
-  cache_path="$(prelude_cache_lookup "$src" "$ed")"
-  if [ -z "$cache_path" ]; then
-    # MISS: try to populate the cache, then emit the corresponding
-    # flag pair. On build failure (kaic2 itself rejects the source,
-    # disk full, etc.) fall back to plain --prelude so the user
-    # still gets a working compile.
-    cache_path="$(prelude_cache_build "$src" "$ed")"
-  fi
-  if [ -n "$cache_path" ] && [ -f "$cache_path" ]; then
-    printf -- '--prelude-cache %s %s ' "$src" "$cache_path"
-  else
-    printf -- '--prelude %s ' "$src"
-  fi
-}
-
-# Hanga Roa: the core module set is hard-coded into the compiler
-# via -DKAI_STDLIB_PATH and loaded automatically on every run.
-# This shim prints nothing and exists only so the legacy call sites
-# (`prelude_flags="$(stdlib_prelude_flags …)"`) keep working until
-# they are all rewritten. KAI_NO_STDLIB is honoured by the compiler
-# itself (TODO: surface the env var as a CLI override in a follow-up
-# lane); the previous prelude cache layer has been retired.
-stdlib_prelude_flags() {
-  return 0
-}
-
 # Resolve the active backend. Precedence (highest first):
 #   1. Caller-supplied value (the --backend CLI flag, already parsed).
 #   2. $KAI_BACKEND environment variable (c|llvm).
@@ -1055,10 +859,6 @@ compile_to_binary() {
   src="$1"; tmp="$2"; out="$3"; sub="$4"; shift 4
   [ -f "$src" ] || die_file_not_found "$src" "$sub"
   ensure_built
-  src_dir_for_ed="$(cd "$(dirname "$src")" && pwd)"
-  manifest_dir_pre="$(find_manifest_dir "$src_dir_for_ed")"
-  edition_value="$(manifest_edition_value "$manifest_dir_pre")"
-  prelude_flags="$(stdlib_prelude_flags "$edition_value")"
   # shellcheck disable=SC2086
   # KAI_TRACE_RC unset for the compiler invocation: we want the trace
   # to come from the user's compiled program, not from kaic2 itself.
@@ -1096,7 +896,7 @@ compile_to_binary() {
       die "--backend=llvm: cannot locate runtime_llvm.c (looked under $RUNTIME_INC and $ROOT/stage0)"
     fi
     # shellcheck disable=SC2086
-    (unset KAI_TRACE_RC; "$KAIC2" --emit=llvm --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $prelude_flags "$@" "$src") > "$tmp/out.ll"
+    (unset KAI_TRACE_RC; "$KAIC2" --emit=llvm --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$src") > "$tmp/out.ll"
     # shellcheck disable=SC2086
     # `-w` matches stage2/Makefile's test-llvm rule: kaic2's emitted
     # IR triggers benign clang warnings (unused parameter on shim
@@ -1105,7 +905,7 @@ compile_to_binary() {
     $CLANG $CLANGFLAGS -I "$RUNTIME_INC" "$tmp/out.ll" "$RUNTIME_LLVM_C" -o "$out" -lm
   else
     # shellcheck disable=SC2086
-    (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $prelude_flags "$@" "$src") > "$tmp/out.c"
+    (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$src") > "$tmp/out.c"
     # shellcheck disable=SC2086
     # `-lm` (issue #343): math/real libm bindings (sqrt, sin, log, …)
     # are unresolved on Linux glibc without an explicit link line.
@@ -1233,18 +1033,16 @@ infer_entry_point() {
 
 # Run kaic2 in a typed-hole reporting mode (`--holes` or
 # `--holes-json`). The compiler's report is the entire output of
-# this invocation — no binary is produced. Uses the same prelude
-# wiring and `--path` flags as a normal build so the hole's in-scope
-# entries match what the user actually sees at compile time.
+# this invocation — no binary is produced. Uses the same `--path`
+# flags as a normal build so the hole's in-scope entries match what
+# the user actually sees at compile time.
 report_holes() {
   src="$1"; flag="$2"
   [ -f "$src" ] || die_file_not_found "$src" "build"
   ensure_built
   src_dir="$(cd "$(dirname "$src")" && pwd)"
   manifest_dir="$(find_manifest_dir "$src_dir")"
-  edition_value="$(manifest_edition_value "$manifest_dir")"
   edition_flag="$(manifest_edition_flag "$manifest_dir")"
-  prelude_flags="$(stdlib_prelude_flags "$edition_value")"
   pkg_path_flags=""
   unstable_flags=""
   if [ -n "$manifest_dir" ]; then
@@ -1252,7 +1050,7 @@ report_holes() {
     unstable_flags="$(manifest_unstable_flags "$manifest_dir")"
   fi
   # shellcheck disable=SC2086
-  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $prelude_flags "$flag" "$src")
+  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$flag" "$src")
 }
 
 cmd_build() {
@@ -1529,9 +1327,8 @@ cmd_check() {
 #   kai fmt --stdin            -> read stdin, write formatted to stdout.
 #
 # The formatter is implemented as a `kaic2 --fmt` (or `--fmt-check`)
-# subcommand. The driver does NOT pass `--prelude` flags here — fmt
-# runs at the source-text level and never resolves names; the prelude
-# would only slow the parse and the unsupported-check.
+# subcommand. fmt runs at the source-text level and never resolves
+# names, so the core-stdlib auto-load is irrelevant here.
 cmd_fmt() {
   src=""; mode_check=""; stdin_mode=""
   while [ $# -gt 0 ]; do
