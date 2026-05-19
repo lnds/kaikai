@@ -157,11 +157,23 @@ fn json_match_lit(s: String, i: Int, lit: String) : Option[Int] = {
   else { None }
 }
 
+# A pending container frame on the iterative parser's explicit
+# stack. ArrFrame accumulates an array's items; ObjFrame
+# accumulates an object's key/value pairs plus the (optional)
+# key whose value is currently being parsed.
+type JFrame
+  = ArrFrame([JsonValue])
+  | ObjFrame([Pair[String, JsonValue]], Option[String])
+
 # Top-level: skip leading whitespace, parse a value, demand only
-# whitespace until end-of-input.
+# whitespace until end-of-input. The iterative driver keeps an
+# explicit stack of pending container frames so deeply-nested
+# JSON does not blow the fiber stack — recursion is bounded to
+# the leaf parsers (string / number / null / bool), each of
+# which produces a value in a fixed number of frames.
 pub fn json_decode(s: String) : Option[JsonValue] = {
   let i0 = json_skip_ws(s, 0)
-  match json_parse_value(s, i0) {
+  match json_parse_iter(s, i0, []) {
     None    -> None
     Some(r) -> {
       let i_end = json_skip_ws(s, r.i)
@@ -170,7 +182,9 @@ pub fn json_decode(s: String) : Option[JsonValue] = {
   }
 }
 
-# Dispatch on the first non-whitespace char.
+# Dispatch on the first non-whitespace char, returning either a
+# completed leaf or — for `{` / `[` — the new container frame
+# the caller pushes onto the stack.
 fn json_parse_value(s: String, i: Int) : Option[JParse] = {
   let j = json_skip_ws(s, i)
   if j >= string_length(s) { None }
@@ -186,6 +200,134 @@ fn json_parse_value(s: String, i: Int) : Option[JParse] = {
       else { None }
     }
   } }
+}
+
+# ---- Iterative driver ---------------------------------------------
+#
+# Walks the input with an explicit stack of pending container
+# frames. The whole loop lives in a single self-tail-recursive
+# function (`json_loop`) so kaikai's mandatory TCO collapses every
+# iteration onto the same stack frame — mutual tail recursion
+# across two functions is explicitly out of scope per
+# docs/perceus-honesty-targets.md §TCO, which would otherwise
+# overflow the 64 KiB default fiber stack on a ~40 KB payload.
+#
+# `mode` encodes what the loop is looking for next:
+#   ModeValue   — parse a value (leaf or container open)
+#   ModeAfterValue(v) — value `v` just completed; feed to the top
+#                       frame, handle the separator, continue
+#   ModeObjKey  — read a key + `:` and push an ObjFrame frame
+
+type JMode
+  = ModeValue
+  | ModeAfterValue(JsonValue)
+  | ModeObjKey
+
+fn json_parse_iter(s: String, i: Int, stack: [JFrame]) : Option[JParse] =
+  json_loop(s, i, stack, ModeValue)
+
+fn json_loop(s: String, i: Int, stack: [JFrame], mode: JMode) : Option[JParse] = match mode {
+  # ---- ModeValue: parse a single value at position i -------------
+  ModeValue -> {
+    let j = json_skip_ws(s, i)
+    if j >= string_length(s) { None }
+    else { match char_at(s, j) {
+      None    -> None
+      Some(c) -> {
+        if c == '{' {
+          let k = json_skip_ws(s, j + 1)
+          match char_at(s, k) {
+            Some('}') -> json_loop(s, k + 1, stack, ModeAfterValue(JObj([])))
+            _         -> json_loop(s, k, [ObjFrame([], None), ...stack], ModeObjKey)
+          }
+        }
+        else if c == '[' {
+          let k = json_skip_ws(s, j + 1)
+          match char_at(s, k) {
+            Some(']') -> json_loop(s, k + 1, stack, ModeAfterValue(JArr([])))
+            _         -> json_loop(s, k, [ArrFrame([]), ...stack], ModeValue)
+          }
+        }
+        else if c == '"' { match json_parse_string(s, j) {
+          None    -> None
+          Some(r) -> json_loop(s, r.i, stack, ModeAfterValue(r.v))
+        } }
+        else if c == 't' or c == 'f' { match json_parse_bool(s, j) {
+          None    -> None
+          Some(r) -> json_loop(s, r.i, stack, ModeAfterValue(r.v))
+        } }
+        else if c == 'n' { match json_parse_null(s, j) {
+          None    -> None
+          Some(r) -> json_loop(s, r.i, stack, ModeAfterValue(r.v))
+        } }
+        else if c == '-' or char.is_digit(c) { match json_parse_number(s, j) {
+          None    -> None
+          Some(r) -> json_loop(s, r.i, stack, ModeAfterValue(r.v))
+        } }
+        else { None }
+      }
+    } }
+  }
+
+  # ---- ModeAfterValue(v): feed v into the top frame -------------
+  ModeAfterValue(v) -> match stack {
+    []             -> Some(JParse { v: v, i: i })
+    [top, ...rest] -> match top {
+      # Build head-first; the runtime's list_append walks the
+      # existing prefix recursively, so cons + reverse-on-close
+      # keeps both space and time linear in the result length.
+      ArrFrame(acc) -> {
+        let acc1 = [v, ...acc]
+        let j = json_skip_ws(s, i)
+        match char_at(s, j) {
+          Some(',') -> json_loop(s, json_skip_ws(s, j + 1), [ArrFrame(acc1), ...rest], ModeValue)
+          Some(']') -> json_loop(s, j + 1, rest, ModeAfterValue(JArr(list_reverse(acc1))))
+          _         -> None
+        }
+      }
+      ObjFrame(acc, pending_key) -> match pending_key {
+        None     -> None    # invariant: a value lands only after a key was set
+        Some(k)  -> {
+          let acc1 = [Pair { fst: k, snd: v }, ...acc]
+          let j = json_skip_ws(s, i)
+          match char_at(s, j) {
+            Some(',') -> json_loop(s, json_skip_ws(s, j + 1),
+                                     [ObjFrame(acc1, None), ...rest], ModeObjKey)
+            Some('}') -> json_loop(s, j + 1, rest, ModeAfterValue(JObj(list_reverse(acc1))))
+            _         -> None
+          }
+        }
+      }
+    }
+  }
+
+  # ---- ModeObjKey: read `"key":` and switch to ModeValue --------
+  ModeObjKey -> {
+    let j = json_skip_ws(s, i)
+    match char_at(s, j) {
+      Some('"') -> match json_parse_string(s, j) {
+        None    -> None
+        Some(rk) -> match rk.v {
+          JStr(k) -> {
+            let j2 = json_skip_ws(s, rk.i)
+            match char_at(s, j2) {
+              # Bind the key onto the top ObjFrame and continue
+              # looking for the value position.
+              Some(':') -> match stack {
+                [ObjFrame(acc, _), ...rest] ->
+                  json_loop(s, json_skip_ws(s, j2 + 1),
+                             [ObjFrame(acc, Some(k)), ...rest], ModeValue)
+                _ -> None
+              }
+              _ -> None
+            }
+          }
+          _ -> None
+        }
+      }
+      _ -> None
+    }
+  }
 }
 
 fn json_parse_null(s: String, i: Int) : Option[JParse] = match json_match_lit(s, i, "null") {
