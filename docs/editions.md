@@ -153,13 +153,9 @@ on an hanga-roa compiler.
 > forwards `--edition <name>` to `kaic2`. The compiler routes the
 > #594 convention-based pipe dispatch on `edition >= hanga-roa` and
 > falls back to the legacy seeded `List → list` mapping under
-> tongariki. The prelude cache is partitioned by edition under
-> `~/.cache/kaikai/preludes-v1/<edition>/`, so cross-edition rebuilds
-> are clean. An unknown edition value produces
+> tongariki. An unknown edition value produces
 > `kaic2: unknown edition \`<x>\` in kai.toml — known editions:
-> tongariki, hanga-roa` before any compilation work runs. The
-> `cache_kaikai_version_hash` was bumped from 1 to 2; any `.kab`
-> blob predating #603 is rejected at load.
+> tongariki, hanga-roa` before any compilation work runs.
 
 ## Marking unstable APIs (#unstable)
 

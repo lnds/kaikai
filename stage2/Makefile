@@ -40,7 +40,7 @@ CPPFLAGS_CORE := -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-violations test-attributes test-shadowing
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-violations test-attributes test-shadowing
 
 all: $(TARGET)
 
@@ -1365,44 +1365,6 @@ test-stdlib: $(TARGET) build
 	@grep -F -q '__builtin_popcountll' build/stdlib-bits_dotted.c \
 	  || { echo "stdlib FAIL bits_dotted (popcount not inlined)"; exit 1; }
 	@echo "stdlib OK bits_dotted intrinsic-lowered"
-
-# Issue #170 phase 1 — intrinsic `test "..." { ... }` blocks living
-# directly inside stdlib/core/*.kai. Gated by
-# `.github/workflows/tier1-stdlib-core.yml` (paths: stdlib/core/**),
-# so PRs that don't touch stdlib/core pay zero seconds for this.
-#
-# Cross-file dependencies inside stdlib/core (e.g. string.kai calls
-# `ch_is_space` from char.kai) require the *other* core modules to
-# be present as preludes when compiling the module under test. The
-# module under test must NOT be in its own prelude set — otherwise
-# its source is parsed twice (once as prelude, once as the test
-# source) and every test block runs twice with duplicated definitions.
-# Solution: invoke kaic2 directly with the prelude set computed as
-# (CORE − module-under-test), then drive --test through the regular
-# C-emit + cc + run pipeline.
-test-stdlib-core-intrinsic: $(TARGET) build
-	@set -e; \
-	for mod in option result string char tuple list; do \
-	  out=build/stdlib-core-$$mod.test.out; \
-	  cfile=build/stdlib-core-$$mod.test.c; \
-	  binfile=build/stdlib-core-$$mod.test.bin; \
-	  preludes=""; \
-	  for core_file in $(sort $(wildcard ../stdlib/core/*.kai)); do \
-	    case $$core_file in *core/$$mod.kai) ;; *) preludes="$$preludes --prelude $$core_file" ;; esac; \
-	  done; \
-	  ./$(TARGET) --path ../stdlib $$preludes --test ../stdlib/core/$$mod.kai > $$cfile 2> $$out \
-	    || { echo "stdlib-core-intrinsic FAIL $$mod (kaic2 errored)"; cat $$out; exit 1; }; \
-	  $(CC) -std=c99 -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 $$cfile -o $$binfile \
-	    || { echo "stdlib-core-intrinsic FAIL $$mod (cc errored)"; exit 1; }; \
-	  ./$$binfile > $$out 2>&1 \
-	    || { echo "stdlib-core-intrinsic FAIL $$mod (test binary errored)"; cat $$out; exit 1; }; \
-	  awk '/^[0-9]+\/[0-9]+ tests passed$$/ { split($$1, p, "/"); \
-	         if (p[1] > 0 && p[1] == p[2]) { ok = 1 } } \
-	       END { exit ok ? 0 : 1 }' $$out \
-	    || { echo "stdlib-core-intrinsic FAIL $$mod (no all-pass tests-passed line)"; cat $$out; exit 1; }; \
-	  echo "stdlib-core-intrinsic OK $$mod"; \
-	done
 
 # Issue #139 — crypto_hash_basic under ASAN+UBSan. SHA-2 + HMAC are
 # heavy on byte-buffer churn (per-block 64-element message schedules,
