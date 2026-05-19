@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.73.1 (2026-05-19)
+
+### Fixed
+
+- **runtime**: KAIKAI_STDLIB_PATH env override unblocks installed kaikai
+
 ## v0.73.0 (2026-05-19)
 
 ### BREAKING CHANGE
