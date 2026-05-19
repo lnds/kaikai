@@ -18560,6 +18560,379 @@ fn check_default_coverage_loop(file: String, all_decls: [Decl], ds: [Decl],
   }
 }
 
+# Field-privacy walker (priv-fields lane). For every `EField(obj, fname)`
+# and every `ERecordLit { fname: val, ... }` in this module's typed
+# bodies, when `obj.ty` is `TyCon(Some(decl_mod), rec_name, _)` and
+# `decl_mod` is some other module, look up the field in `all_decls`
+# and reject the read/write when the field is `priv`. Records declared
+# in the same module pass freely (their internal fns are the
+# expected consumers).
+#
+# Runs post-typing so `Expr.ty` is the resolved record type, not a
+# free type variable. Mirrors `check_default_coverage`'s pre-conditions
+# (post-typing, has `tp.decls` for iteration, has `all_decls_for_typer`
+# for lookup of the declaring module's record shape).
+fn check_field_privacy(file: String, home: Option[String],
+                        mod_decls: [Decl], all_decls: [Decl])
+                        : Int / Console + File {
+  check_field_privacy_loop(file, home, all_decls, mod_decls, 0)
+}
+
+fn check_field_privacy_loop(file: String, home: Option[String],
+                              all_decls: [Decl], ds: [Decl],
+                              acc: Int) : Int / Console + File {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DFn(_, _, _, _, _, _, body, _, _, _) -> {
+        let n = walk_field_priv_expr(file, home, all_decls, body, 0)
+        check_field_privacy_loop(file, home, all_decls, rest, acc + n)
+      }
+      _ -> check_field_privacy_loop(file, home, all_decls, rest, acc)
+    }
+  }
+}
+
+# Look up a `(FieldDecl, declaring_module)` pair by record name across
+# `all_decls`. Returns the FieldDecl paired with the DType's own
+# module_origin so callers can compare against the access-site home —
+# the TyCon's `module_origin` is not always populated for user types
+# at this point, so the DType is the authoritative source.
+#
+# When two DTypes carry the same record name across modules (shadowing),
+# the first match wins — by Hanga Roa convention the root file's type
+# shadows imports, but at this point in the pipeline `all_decls` order
+# reflects that already (root file's decls come last after import
+# expansion's reverse-flatten, so the first match here is typically
+# the deepest dependency). Same-name collisions across modules are
+# rare enough that the caller will accept the first hit's verdict.
+fn lookup_record_field(all_decls: [Decl], rec_name: String, fname: String)
+                         : Option[FieldDeclWithHome] = match all_decls {
+  []           -> None
+  [d, ...rest] -> match d {
+    DType(_, tn, _, TBRecord(fields), _, _, decl_mo) ->
+      if tn == rec_name {
+        match find_field_in_decls(fields, fname) {
+          Some(fd) -> Some(FDH(fd, decl_mo))
+          None     -> lookup_record_field(rest, rec_name, fname)
+        }
+      } else {
+        lookup_record_field(rest, rec_name, fname)
+      }
+    _ -> lookup_record_field(rest, rec_name, fname)
+  }
+}
+
+type FieldDeclWithHome = FDH(FieldDecl, Option[String])
+
+fn find_field_in_decls(fields: [FieldDecl], target: String) : Option[FieldDecl] =
+  match fields {
+    []           -> None
+    [f, ...rest] -> match f {
+      FD(_, n, _) -> if n == target { Some(f) } else { find_field_in_decls(rest, target) }
+    }
+  }
+
+# Returns the (module, record_name) pair of the record type carried
+# by `obj.ty`. Records whose carrier is anything other than a
+# record-shaped TyCon (free variable, primitive, list, fn) cannot
+# be classified at this point — return None and skip the check.
+fn record_carrier_of(ty: Option[Ty]) : Option[Pair[Option[String], String]] =
+  match ty {
+    None     -> None
+    Some(t)  -> record_carrier_t(t)
+  }
+
+fn record_carrier_t(t: Ty) : Option[Pair[Option[String], String]] = match t {
+  TyCon(mo, name, _) -> Some(Pair { fst: mo, snd: name })
+  TyRefineT(inner, _) -> record_carrier_t(inner)
+  TyDimT(inner, _)    -> record_carrier_t(inner)
+  _ -> None
+}
+
+fn walk_field_priv_expr(file: String, home: Option[String],
+                          all_decls: [Decl], e: Expr,
+                          acc: Int) : Int / Console + File {
+  let head_errs = match e.kind {
+    # Cross-module read of a `priv` field. The record's declared
+    # home is in `obj.ty`'s TyCon module_origin; the access site's
+    # home is the walker-level `home` parameter (None = root file).
+    EField(obj, fname) -> match record_carrier_of(obj.ty) {
+      None         -> 0
+      Some(carrier) -> {
+        let rec_name = carrier.snd
+        match lookup_record_field(all_decls, rec_name, fname) {
+          None -> 0
+          Some(fdh) -> match fdh { FDH(fd, decl_mo) ->
+            if mo_eq(decl_mo, home) { 0 }
+            else { match fd {
+              FD(true, _, _)  -> 0
+              FD(false, _, _) -> {
+                let owner = match decl_mo {
+                  Some(m) -> m
+                  None    -> "<root>"
+                }
+                diag_error(file, e.line, e.col,
+                  concat_all(["field `", fname,
+                              "` of `", rec_name,
+                              "` is private to module `", owner, "`"]))
+                diag_help(concat_all(["the field is declared `priv` in module `",
+                                      owner, "`; only fns inside that module can read it"]))
+                1
+              }
+            } }
+          }
+        }
+      }
+    }
+    # Cross-module construction touching a `priv` field. RecordLit
+    # carries the carrier in its ty (set by `synth_record_lit`).
+    # Any field init mentioning a priv field of another module is
+    # an error — the constructor escapes the encapsulation boundary.
+    ERecordLit(_, fis) -> match record_carrier_of(e.ty) {
+      None         -> 0
+      Some(carrier) -> {
+        let rec_name = carrier.snd
+        walk_priv_field_inits(file, home, all_decls, rec_name,
+                                fis, e.line, e.col, 0)
+      }
+    }
+    _ -> 0
+  }
+  acc + head_errs + walk_field_priv_children(file, home, all_decls, e.kind, 0)
+}
+
+fn walk_priv_field_inits(file: String, home: Option[String],
+                           all_decls: [Decl], rec_name: String,
+                           fis: [FieldInit], line: Int, col: Int,
+                           acc: Int) : Int / Console + File {
+  match fis {
+    []           -> acc
+    [fi, ...rest] -> match fi {
+      FI(fname, _) -> {
+        let n = match lookup_record_field(all_decls, rec_name, fname) {
+          None -> 0
+          Some(fdh) -> match fdh { FDH(fd, decl_mo) ->
+            if mo_eq(decl_mo, home) { 0 }
+            else { match fd {
+              FD(true, _, _)  -> 0
+              FD(false, _, _) -> {
+                let owner = match decl_mo {
+                  Some(m) -> m
+                  None    -> "<root>"
+                }
+                diag_error(file, line, col,
+                  concat_all(["cannot construct `", rec_name,
+                              "` from outside module `", owner,
+                              "`: field `", fname, "` is private"]))
+                diag_help(concat_all(["the field is declared `priv` in module `",
+                                      owner, "`; ask that module for a constructor fn"]))
+                1
+              }
+            } }
+          }
+        }
+        walk_priv_field_inits(file, home, all_decls, rec_name, rest,
+                               line, col, acc + n)
+      }
+    }
+  }
+}
+
+fn walk_field_priv_children(file: String, home: Option[String],
+                              all_decls: [Decl], k: ExprKind,
+                              acc: Int) : Int / Console + File = match k {
+  EInt(_)           -> acc
+  EReal(_)          -> acc
+  EBool(_)          -> acc
+  EChar(_)          -> acc
+  EStr(_, _)        -> acc
+  EUnit             -> acc
+  EVar(_)           -> acc
+  EUnder            -> acc
+  EPlaceholder      -> acc
+  EHole(_)          -> acc
+  ETodo(_)          -> acc
+  EVariantsOf(_, _) -> acc
+  EModCall(_, _)    -> acc
+  EIntrinsic(_, args_) -> walk_field_priv_list(file, home, all_decls, args_, acc)
+  ECall(callee, args_) -> {
+    let a1 = walk_field_priv_expr(file, home, all_decls, callee, acc)
+    walk_field_priv_list(file, home, all_decls, args_, a1)
+  }
+  EField(base, _)   -> walk_field_priv_expr(file, home, all_decls, base, acc)
+  EIndex(a, b)      -> {
+    let a1 = walk_field_priv_expr(file, home, all_decls, a, acc)
+    walk_field_priv_expr(file, home, all_decls, b, a1)
+  }
+  EBinop(_, a, b)   -> {
+    let a1 = walk_field_priv_expr(file, home, all_decls, a, acc)
+    walk_field_priv_expr(file, home, all_decls, b, a1)
+  }
+  EUnop(_, x)       -> walk_field_priv_expr(file, home, all_decls, x, acc)
+  EIf(c, t, eo)     -> {
+    let a1 = walk_field_priv_expr(file, home, all_decls, c, acc)
+    let a2 = walk_field_priv_expr(file, home, all_decls, t, a1)
+    match eo {
+      Some(b) -> walk_field_priv_expr(file, home, all_decls, b, a2)
+      None    -> a2
+    }
+  }
+  EMatch(scr, arms) -> {
+    let a1 = walk_field_priv_expr(file, home, all_decls, scr, acc)
+    walk_field_priv_arms(file, home, all_decls, arms, a1)
+  }
+  ELambda(_, _) -> acc
+  ERecordLit(_, fs) -> walk_field_priv_field_inits(file, home, all_decls, fs, acc)
+  EList(els) -> walk_field_priv_elems(file, home, all_decls, els, acc)
+  ERange(a, b, opt) -> {
+    let a1 = walk_field_priv_expr(file, home, all_decls, a, acc)
+    let a2 = walk_field_priv_expr(file, home, all_decls, b, a1)
+    match opt {
+      Some(s) -> walk_field_priv_expr(file, home, all_decls, s, a2)
+      None    -> a2
+    }
+  }
+  EBlock(stmts, tail) -> {
+    let a1 = walk_field_priv_stmts(file, home, all_decls, stmts, acc)
+    match tail {
+      Some(t) -> walk_field_priv_expr(file, home, all_decls, t, a1)
+      None    -> a1
+    }
+  }
+  EPipe(a, b)        -> {
+    let a1 = walk_field_priv_expr(file, home, all_decls, a, acc)
+    walk_field_priv_expr(file, home, all_decls, b, a1)
+  }
+  EMapPipe(a, b)     -> {
+    let a1 = walk_field_priv_expr(file, home, all_decls, a, acc)
+    walk_field_priv_expr(file, home, all_decls, b, a1)
+  }
+  EFlatMapPipe(a, b) -> {
+    let a1 = walk_field_priv_expr(file, home, all_decls, a, acc)
+    walk_field_priv_expr(file, home, all_decls, b, a1)
+  }
+  EFilterPipe(a, b)  -> {
+    let a1 = walk_field_priv_expr(file, home, all_decls, a, acc)
+    walk_field_priv_expr(file, home, all_decls, b, a1)
+  }
+  EBang(inner)       -> walk_field_priv_expr(file, home, all_decls, inner, acc)
+  ELitUnit(inner, _) -> walk_field_priv_expr(file, home, all_decls, inner, acc)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    let a0 = match init_opt {
+      Some(i) -> walk_field_priv_expr(file, home, all_decls, i, acc)
+      None    -> acc
+    }
+    let a1 = walk_field_priv_clauses(file, home, all_decls, clauses, a0)
+    let a2 = match ret_opt {
+      Some(r) -> match r { HR(_, b, _, _) -> walk_field_priv_expr(file, home, all_decls, b, a1) }
+      None    -> a1
+    }
+    walk_field_priv_expr(file, home, all_decls, body, a2)
+  }
+}
+
+fn walk_field_priv_list(file: String, home: Option[String],
+                          all_decls: [Decl], es: [Expr],
+                          acc: Int) : Int / Console + File = match es {
+  [] -> acc
+  [h, ...rest] -> {
+    let a1 = walk_field_priv_expr(file, home, all_decls, h, acc)
+    walk_field_priv_list(file, home, all_decls, rest, a1)
+  }
+}
+
+fn walk_field_priv_arms(file: String, home: Option[String],
+                         all_decls: [Decl], arms: [Arm],
+                         acc: Int) : Int / Console + File = match arms {
+  [] -> acc
+  [a, ...rest] -> match a {
+    Arm(_, og, body) -> {
+      let a1 = match og {
+        Some(g) -> walk_field_priv_expr(file, home, all_decls, g, acc)
+        None    -> acc
+      }
+      let a2 = walk_field_priv_expr(file, home, all_decls, body, a1)
+      walk_field_priv_arms(file, home, all_decls, rest, a2)
+    }
+  }
+}
+
+fn walk_field_priv_field_inits(file: String, home: Option[String],
+                                 all_decls: [Decl], fis: [FieldInit],
+                                 acc: Int) : Int / Console + File = match fis {
+  [] -> acc
+  [fi, ...rest] -> match fi {
+    FI(_, e) -> {
+      let a1 = walk_field_priv_expr(file, home, all_decls, e, acc)
+      walk_field_priv_field_inits(file, home, all_decls, rest, a1)
+    }
+  }
+}
+
+fn walk_field_priv_elems(file: String, home: Option[String],
+                          all_decls: [Decl], els: [ListElem],
+                          acc: Int) : Int / Console + File = match els {
+  [] -> acc
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> {
+      let a1 = walk_field_priv_expr(file, home, all_decls, e, acc)
+      walk_field_priv_elems(file, home, all_decls, rest, a1)
+    }
+    ElSpread(e) -> {
+      let a1 = walk_field_priv_expr(file, home, all_decls, e, acc)
+      walk_field_priv_elems(file, home, all_decls, rest, a1)
+    }
+  }
+}
+
+fn walk_field_priv_stmts(file: String, home: Option[String],
+                          all_decls: [Decl], ss: [Stmt],
+                          acc: Int) : Int / Console + File = match ss {
+  [] -> acc
+  [s, ...rest] -> match s {
+    SLet(_, _, e) -> {
+      let a1 = walk_field_priv_expr(file, home, all_decls, e, acc)
+      walk_field_priv_stmts(file, home, all_decls, rest, a1)
+    }
+    SVar(_, _, e, _, _) -> {
+      let a1 = walk_field_priv_expr(file, home, all_decls, e, acc)
+      walk_field_priv_stmts(file, home, all_decls, rest, a1)
+    }
+    SAssert(e, og) -> {
+      let a1 = walk_field_priv_expr(file, home, all_decls, e, acc)
+      let a2 = match og {
+        Some(g) -> walk_field_priv_expr(file, home, all_decls, g, a1)
+        None    -> a1
+      }
+      walk_field_priv_stmts(file, home, all_decls, rest, a2)
+    }
+    SExprStmt(e) -> {
+      let a1 = walk_field_priv_expr(file, home, all_decls, e, acc)
+      walk_field_priv_stmts(file, home, all_decls, rest, a1)
+    }
+    SIndexAssign(a, b, c, _, _) -> {
+      let a1 = walk_field_priv_expr(file, home, all_decls, a, acc)
+      let a2 = walk_field_priv_expr(file, home, all_decls, b, a1)
+      let a3 = walk_field_priv_expr(file, home, all_decls, c, a2)
+      walk_field_priv_stmts(file, home, all_decls, rest, a3)
+    }
+    SUse(_, _, _) -> walk_field_priv_stmts(file, home, all_decls, rest, acc)
+  }
+}
+
+fn walk_field_priv_clauses(file: String, home: Option[String],
+                             all_decls: [Decl], cs: [HClause],
+                             acc: Int) : Int / Console + File = match cs {
+  [] -> acc
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> {
+      let a1 = walk_field_priv_expr(file, home, all_decls, body, acc)
+      walk_field_priv_clauses(file, home, all_decls, rest, a1)
+    }
+  }
+}
+
 # Names of ops the user wrote in a handle's clause list.
 fn handle_clause_op_names(cs: [HClause]) : [String] = match cs {
   []           -> []
@@ -40318,8 +40691,15 @@ fn typecheck_module(file: String, mod: ModuleDecls,
   # for any user effect declared in the same file but partitioned away
   # from its `fn main()`, silencing the per-op coverage walker.
   let cov_errs = check_default_coverage(file, tp.decls, all_decls_for_typer)
+  # priv-fields lane: reject cross-module reads / constructions that
+  # touch a `priv` record field. The record's declaring module lives
+  # in the field's TyCon module_origin; this walker compares against
+  # `mod.name` (the current module's home — None for the root file,
+  # Some(m) for an imported module). Runs post-typing so `obj.ty` is
+  # the resolved record type, not a free variable.
+  let priv_errs = check_field_privacy(file, mod.name, tp.decls, all_decls_for_typer)
   let typed = TypedProgram {
-    decls: tp.decls, errs: tp.errs + cov_errs,
+    decls: tp.decls, errs: tp.errs + cov_errs + priv_errs,
     insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
     prelude_len: tp.prelude_len, diags: tp.diags
   }
