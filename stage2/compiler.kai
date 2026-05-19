@@ -40,7 +40,7 @@ type TokKind
   # keywords (alphabetical)
   | TkAnd | TkAs | TkAssert | TkAxiom | TkBench | TkCase | TkCheck | TkConst | TkEffect | TkElse | TkEnsures | TkExtern | TkFalse | TkFn | TkFor
   | TkHandle | TkIf | TkImpl | TkImport
-  | TkLet | TkMatch | TkNot | TkOr | TkProtocol | TkPub | TkRequires | TkTest | TkTrue | TkType
+  | TkLet | TkMatch | TkNot | TkOr | TkPriv | TkProtocol | TkPub | TkRequires | TkTest | TkTrue | TkType
   | TkUnitKw | TkUse | TkVar | TkWhen | TkWhere | TkWith
   # Issue #608: `#[...]` annotation form. `#[` is one token (TkHashOpen);
   # the parser then reads `ident (args)?` and expects a closing `]`.
@@ -114,7 +114,7 @@ fn tk_name(k: TokKind) : String {
     TkFalse -> "false" TkFn -> "fn" TkFor -> "for" TkHandle -> "handle"
     TkIf -> "if" TkImpl -> "impl" TkImport -> "import"
     TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
-    TkProtocol -> "protocol" TkPub -> "pub" TkRequires -> "requires"
+    TkPriv -> "priv" TkProtocol -> "protocol" TkPub -> "pub" TkRequires -> "requires"
     TkTest -> "test" TkTrue -> "true" TkType -> "type"
     TkUnitKw -> "unit" TkUse -> "use" TkVar -> "var" TkWhen -> "when" TkWhere -> "where" TkWith -> "with"
     TkHashOpen -> "#["
@@ -289,6 +289,7 @@ fn keyword_kind(text: String) : TokKind {
   else if text == "match" { TkMatch }
   else if text == "not" { TkNot }
   else if text == "or" { TkOr }
+  else if text == "priv" { TkPriv }
   else if text == "protocol" { TkProtocol }
   else if text == "pub" { TkPub }
   else if text == "requires" { TkRequires }  # m12.6.b
@@ -1731,7 +1732,20 @@ type EffectOp = EOp(String, [String], [Param], TypeExpr, Int, Int)
 # resolve time. Single-effect aliases (`type Foo = Console`) parse as
 # TBAlias(TyName(name, [])) and are recognised at resolve time.
 type TypeBody = TBAlias(TypeExpr) | TBRecord([FieldDecl]) | TBSum([Variant]) | TBEffectAlias([String])
-type FieldDecl = FD(String, TypeExpr)
+# Record field declaration.
+#
+# `is_pub`: by default record fields are private to the module that
+# declares the type (mirroring the module-level `pub` discipline).
+# Marking a field `pub` exposes both read access (`r.field` from
+# outside the module) and construction-time naming (the field name
+# may appear in a `Foo { field: v }` literal written outside the
+# module). Pattern matching on the field is permitted only inside
+# the declaring module unless `pub`.
+#
+# Coherence: marking a field `pub` inside a non-`pub` record type
+# has no effect (the type itself is invisible outside the module);
+# the parser/validator reports it as a coherence error.
+type FieldDecl = FD(Bool, String, TypeExpr)
 type Variant = Var(String, [TypeExpr])
 
 type ImportKind
@@ -1865,6 +1879,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkMatch      -> match b { TkMatch -> true _ -> false }
     TkNot        -> match b { TkNot -> true _ -> false }
     TkOr         -> match b { TkOr -> true _ -> false }
+    TkPriv       -> match b { TkPriv -> true _ -> false }
     TkProtocol   -> match b { TkProtocol -> true _ -> false }
     TkPub        -> match b { TkPub -> true _ -> false }
     TkRequires   -> match b { TkRequires -> true _ -> false }
@@ -9546,12 +9561,22 @@ fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tp
   if p_at(p0, TkRbrace) {
     ok_d(p_advance(p0), DType(is_pub, name, tparams, TBRecord(list_reverse(acc)), t.line, t.col, None))
   } else {
-    let ft = p_peek(p0)
+    # Optional `priv` qualifier marks the field private to the
+    # declaring module. Default visibility for record fields is
+    # public (record fields are the value's representation, not
+    # its API — the module is the unit of encapsulation in kaikai;
+    # the record is the unit of representation). Marking `priv`
+    # is the opt-out used when a field carries an invariant the
+    # module wants to enforce — e.g. `Map.root: Tree` where `Tree`
+    # is private to the `map` module.
+    let field_is_pub = not tk_is(p_peek(p0).kind, TkPriv)
+    let p_after_priv = if field_is_pub { p0 } else { p_advance(p0) }
+    let ft = p_peek(p_after_priv)
     if not tk_is(ft.kind, TkIdent) {
-      err_d(p_error(p0, ft, "expected field name in record type"))
+      err_d(p_error(p_after_priv, ft, "expected field name in record type"))
     } else {
-      let fname = tok_source(p0.src, ft)
-      let p1 = p_advance(p0)
+      let fname = tok_source(p_after_priv.src, ft)
+      let p1 = p_advance(p_after_priv)
       if not p_at(p1, TkColon) {
         err_d(p_error_here(p1, "expected `:` after field name"))
       } else {
@@ -9559,7 +9584,7 @@ fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tp
         match rt.r {
           None -> err_d(rt.p)
           Some(ty) -> {
-            let fd = FD(fname, ty)
+            let fd = FD(field_is_pub, fname, ty)
             let p2 = p_skip_newlines(rt.p)
             if p_at(p2, TkComma) {
               parse_record_body(p_skip_newlines(p_advance(p2)), [fd, ...acc], is_pub, name, tparams, t)
@@ -10429,8 +10454,9 @@ fn dump_type_body(tb: TypeBody, depth: Int) : Unit / Console {
 fn dump_field_decl(fd: FieldDecl, depth: Int) : Unit / Console {
 
   match fd {
-    FD(name, ty) -> {
-      emit_line(depth, "field_decl #{name}")
+    FD(is_pub, name, ty) -> {
+      let vis = if is_pub { "pub" } else { "priv" }
+      emit_line(depth, "field_decl #{vis} #{name}")
       dump_type(ty, depth + 1)
     }
   }
@@ -20159,7 +20185,7 @@ fn rename_pos_fields(fis: [FieldInit], fds: [FieldDecl]) : [FieldInit] {
       [] -> [fi, ...frest]
       [fd, ...drest] -> match fi {
         FI(_, val) -> match fd {
-          FD(real_name, _) -> [FI(real_name, val), ...rename_pos_fields(frest, drest)]
+          FD(_, real_name, _) -> [FI(real_name, val), ...rename_pos_fields(frest, drest)]
         }
       }
     }
@@ -20277,7 +20303,7 @@ fn expand_spread_fields(
   match fds {
     [] -> []
     [fd, ...rest] -> match fd {
-      FD(fname, _) -> {
+      FD(_, fname, _) -> {
         let val = match find_override(overrides, fname) {
           Some(ov) -> ov
           None -> mk_expr(EField(var_ref, fname), line, col)
@@ -20356,7 +20382,7 @@ fn field_decl_has(fds: [FieldDecl], name: String) : Bool {
   match fds {
     [] -> false
     [h, ...rest] -> match h {
-      FD(n, _) -> if n == name { true } else { field_decl_has(rest, name) }
+      FD(_, n, _) -> if n == name { true } else { field_decl_has(rest, name) }
     }
   }
 }
@@ -20584,7 +20610,7 @@ fn desugar_const_refs_typebody(b: TypeBody, const_names: [String]) : TypeBody {
 
 fn desugar_const_refs_field(fd: FieldDecl, const_names: [String]) : FieldDecl {
   match fd {
-    FD(name, ty) -> FD(name, desugar_const_refs_typeexpr(ty, const_names))
+    FD(is_pub, name, ty) -> FD(is_pub, name, desugar_const_refs_typeexpr(ty, const_names))
   }
 }
 
@@ -25100,7 +25126,7 @@ fn expand_ta_fields(fs: [FieldDecl], table: [TAEntry], fuel: Int) : [FieldDecl] 
   match fs {
     [] -> []
     [f, ...rest] -> match f {
-      FD(name, te) -> [FD(name, expand_ta_te(te, table, fuel)),
+      FD(is_pub, name, te) -> [FD(is_pub, name, expand_ta_te(te, table, fuel)),
                        ...expand_ta_fields(rest, table, fuel)]
     }
   }
@@ -25587,7 +25613,7 @@ fn mangle_fields(fs: [FieldDecl], entries: [PrivTyEntry],
   match fs {
     [] -> []
     [f, ...rest] -> match f {
-      FD(name, te) -> [FD(name, mangle_te(te, entries, home_mod)),
+      FD(is_pub, name, te) -> [FD(is_pub, name, mangle_te(te, entries, home_mod)),
                         ...mangle_fields(rest, entries, home_mod)]
     }
   }
@@ -30375,7 +30401,7 @@ fn field_decl_list_has(fs: [FieldDecl], target: String) : Bool {
   match fs {
     [] -> false
     [f, ...rest] -> match f {
-      FD(nm, _) -> if nm == target { true } else { field_decl_list_has(rest, target) }
+      FD(_, nm, _) -> if nm == target { true } else { field_decl_list_has(rest, target) }
     }
   }
 }
@@ -31608,7 +31634,7 @@ fn rec_field_tys(fs: [FieldDecl], binds: [TPBind]) : [FTy] {
   match fs {
     [] -> []
     [f, ...rest] -> match f {
-      FD(nm, te) -> [FT(nm, resolve_ty_with_tparams(te, binds)), ...rec_field_tys(rest, binds)]
+      FD(_, nm, te) -> [FT(nm, resolve_ty_with_tparams(te, binds)), ...rec_field_tys(rest, binds)]
     }
   }
 }
@@ -39197,7 +39223,7 @@ fn validate_unit_refs_fdecls(fs: [FieldDecl], declared: [String], file: String,
                                 acc: Int) : Int / Console + File = match fs {
   [] -> acc
   [f, ...rest] -> match f {
-    FD(_, te) -> {
+    FD(_, _, te) -> {
       let e1 = acc + validate_unit_refs_te(te, declared, file)
       validate_unit_refs_fdecls(rest, declared, file, e1)
     }
@@ -39609,11 +39635,15 @@ fn vmps_fdecls(fs: [FieldDecl], decl_name: String, home: String,
                   acc: Int) : Int / Console + File = match fs {
   [] -> acc
   [f, ...rest] -> match f {
-    FD(_, te) -> {
+    # `priv` field — invisible outside the module, so its type cannot
+    # leak. The companion check in `vpa_sig_fdecls` applies the same
+    # rule on the pub-access side.
+    FD(true, _, te) -> {
       let e1 = acc + vmps_te(te, decl_name, "type", home, priv_table,
                                 file, te.line, te.col)
       vmps_fdecls(rest, decl_name, home, priv_table, file, e1)
     }
+    FD(false, _, _) -> vmps_fdecls(rest, decl_name, home, priv_table, file, acc)
   }
 }
 
@@ -39876,7 +39906,7 @@ fn expand_aliases_fdecls(fs: [FieldDecl], aliases: [UAliasEntry]) : [FieldDecl] 
   match fs {
     [] -> []
     [h, ...rest] -> match h {
-      FD(n, t) -> [FD(n, expand_aliases_typeexpr(t, aliases)),
+      FD(is_pub, n, t) -> [FD(is_pub, n, expand_aliases_typeexpr(t, aliases)),
                    ...expand_aliases_fdecls(rest, aliases)]
     }
   }
@@ -52584,7 +52614,7 @@ fn qualtype_fields(fs: [FieldDecl], mt: [ModuleEntry], file: String) : [FieldDec
 
   [] -> []
   [f, ...rest] -> match f {
-    FD(name, te) -> [FD(name, qualtype_te(te, mt, file)), ...qualtype_fields(rest, mt, file)]
+    FD(is_pub, name, te) -> [FD(is_pub, name, qualtype_te(te, mt, file)), ...qualtype_fields(rest, mt, file)]
   }
 }
 
@@ -52972,7 +53002,7 @@ fn qtchk_variants(vs: [Variant], mt: [ModuleEntry]) : Int = match vs {
 fn qtchk_fields(fs: [FieldDecl], mt: [ModuleEntry]) : Int = match fs {
   [] -> 0
   [f, ...rest] -> match f {
-    FD(_, te) -> qtchk_te(te, mt) + qtchk_fields(rest, mt)
+    FD(_, _, te) -> qtchk_te(te, mt) + qtchk_fields(rest, mt)
   }
 }
 
@@ -54261,8 +54291,15 @@ fn vpa_decl(d: Decl, table: [PubAccessEntry], home: String,
     let es = vpa_sig_te(te, table, home, file, [])
     es + vpa_expr(body, [], table, home, file, 0)
   }
-  DType(_, _, tparams, body, line, col, _) ->
-    vpa_sig_typebody(body, table, home, file, tparams, line, col)
+  # Pub-access checks the signature of a `type` declaration only when
+  # it is itself `pub` — the leak only matters when the type's shape
+  # is exposed to consumer modules. A non-pub `type T = body` can
+  # freely reference other non-pub types of the same module (e.g.
+  # `Tree[k, v]` self-referencing inside its TNode variant); those
+  # names never reach a consumer because `T` itself is invisible.
+  DType(is_pub, _, tparams, body, line, col, _) ->
+    if is_pub { vpa_sig_typebody(body, table, home, file, tparams, line, col) }
+    else      { 0 }
   DEffect(_, _, tparams, ops, _, _, _) ->
     vpa_sig_eops(ops, table, home, file, tparams, 0)
   DProtocol(_, _, tparams, ops, _, _) ->
@@ -54387,8 +54424,14 @@ fn vpa_sig_fdecls(fs: [FieldDecl], table: [PubAccessEntry], home: String,
                      acc: Int) : Int / Console + File = match fs {
   [] -> acc
   [f, ...rest] -> match f {
-    FD(_, te) -> vpa_sig_fdecls(rest, table, home, file, tparams,
+    # `priv` fields are invisible outside the declaring module, so
+    # their type never escapes — skip the pub-access check. Public
+    # fields (default) still must reference types accessible to the
+    # consumer module; otherwise the consumer sees a value of an
+    # opaque type with no operations.
+    FD(true, _, te) -> vpa_sig_fdecls(rest, table, home, file, tparams,
                                    acc + vpa_sig_te(te, table, home, file, tparams))
+    FD(false, _, _) -> vpa_sig_fdecls(rest, table, home, file, tparams, acc)
   }
 }
 
@@ -55846,7 +55889,7 @@ fn derive_show_field_parts(fields: [FieldDecl], line: Int, col: Int, first: Bool
   match fields {
     [] -> []
     [fd, ...rest] -> match fd {
-      FD(name, _) -> {
+      FD(_, name, _) -> {
         let prefix_s = if first { concat_all(["\"", name, ": \""]) }
                        else { concat_all(["\", ", name, ": \""]) }
         let prefix = mk_expr(EStr(prefix_s, false), line, col)
@@ -55947,7 +55990,7 @@ fn derive_eq_record_body(fields: [FieldDecl], line: Int, col: Int) : Expr {
 
 fn derive_eq_record_chain(head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
   match head {
-    FD(name, _) -> {
+    FD(_, name, _) -> {
       let l_access = mk_expr(EField(mk_expr(EVar("a"), line, col), name), line, col)
       let r_access = mk_expr(EField(mk_expr(EVar("b"), line, col), name), line, col)
       let call = mk_expr(ECall(mk_expr(EVar("eq"), line, col), [l_access, r_access]),
@@ -56060,7 +56103,7 @@ fn derive_hash_record_body(fields: [FieldDecl], line: Int, col: Int) : Expr {
 
 fn derive_hash_record_chain(head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
   match head {
-    FD(name, _) -> {
+    FD(_, name, _) -> {
       let access = mk_expr(EField(mk_expr(EVar("x"), line, col), name), line, col)
       let call = mk_expr(ECall(mk_expr(EVar("hash"), line, col), [access]), line, col)
       match rest {
@@ -56200,7 +56243,7 @@ fn derive_ord_record_body(fields: [FieldDecl], line: Int, col: Int) : Expr {
 fn derive_ord_record_chain(head: FieldDecl, rest: [FieldDecl], idx: Int,
                             line: Int, col: Int) : Expr {
   match head {
-    FD(name, _) -> {
+    FD(_, name, _) -> {
       let l_access = mk_expr(EField(mk_expr(EVar("a"), line, col), name), line, col)
       let r_access = mk_expr(EField(mk_expr(EVar("b"), line, col), name), line, col)
       let cmp_call = mk_expr(ECall(mk_expr(EVar("cmp"), line, col),
@@ -56675,7 +56718,7 @@ fn one_byte_tag_expr(idx: Int, line: Int, col: Int) : Expr {
 fn derive_binser_record_to_bytes_chain(head: FieldDecl, rest: [FieldDecl],
                                          idx: Int, line: Int, col: Int) : Expr {
   match head {
-    FD(name, ftype) -> {
+    FD(_, name, ftype) -> {
       let fcol = col + idx * 16
       let access = mk_expr(EField(mk_expr(EVar("self"), line, fcol), name),
                             line, fcol)
@@ -56721,7 +56764,7 @@ fn derive_binser_record_decode_chain(tname: String, remaining: [FieldDecl],
   match remaining {
     [] -> derive_binser_record_ok_value(tname, all_fields, pos_e, line, col)
     [fd, ...rest] -> match fd {
-      FD(_, ftype) -> {
+      FD(_, _, ftype) -> {
         # Per-field column slot — see `derive_binser_record_to_bytes_chain`
         # comment. Decoder lambdas land 1 column inside the encoder
         # slot so encoder/decoder for the same field are also distinct.
@@ -56756,7 +56799,7 @@ fn derive_binser_record_field_inits(fields: [FieldDecl], i: Int,
   match fields {
     [] -> []
     [fd, ...rest] -> match fd {
-      FD(name, _) -> {
+      FD(_, name, _) -> {
         let v = mk_expr(EField(mk_expr(EVar(concat_all(["p", int_to_string(i)])),
                                         line, col), "value"),
                          line, col)
@@ -57085,7 +57128,7 @@ fn validate_derive_binser_fields(file: String, tname: String,
   match fields {
     [] -> errs
     [fd, ...rest] -> match fd {
-      FD(fname, ftype) -> {
+      FD(_, fname, ftype) -> {
         let errs1 = validate_derive_binser_one(file, tname, fname, "field",
                                                  ftype, providers, line, col, errs)
         validate_derive_binser_fields(file, tname, rest, providers,
@@ -57300,7 +57343,7 @@ fn validate_derive_ord_fields(file: String, tname: String,
   match fields {
     [] -> errs
     [fd, ...rest] -> match fd {
-      FD(fname, ftype) -> {
+      FD(_, fname, ftype) -> {
         let errs1 = validate_derive_ord_one(file, tname, fname, "field",
                                               ftype, providers, line, col, errs)
         validate_derive_ord_fields(file, tname, rest, providers, line, col, errs1)
@@ -59536,8 +59579,12 @@ fn fmt_field_decls(fs: [FieldDecl], s: FmtSt) : FmtSt {
 
 fn fmt_field_decl(fd: FieldDecl, s: FmtSt) : FmtSt {
   match fd {
-    FD(name, t) -> {
-      let s1 = fmt_emit(s, name)
+    FD(is_pub, name, t) -> {
+      # Round-trip `priv` qualifier when present so `kai fmt` does
+      # not silently flip a field's visibility. Public is the default
+      # — no `pub` prefix is emitted, matching the surface syntax.
+      let s_v = if is_pub { s } else { fmt_emit(s, "priv ") }
+      let s1 = fmt_emit(s_v, name)
       let s2 = fmt_emit(s1, ": ")
       fmt_type(t, s2)
     }
@@ -61590,7 +61637,7 @@ fn builtin_nettcp_decl() : Decl =
 # "fd" in lockstep with stage0/runtime.h's `_kai_net_make_conn`.
 fn builtin_conn_decl() : Decl =
   DType(false, "Conn", [],
-    TBRecord([FD("fd", ty_name_zero("Int"))]), 0, 0, None)
+    TBRecord([FD(true, "fd", ty_name_zero("Int"))]), 0, 0, None)
 
 # net-tcp-v1: opaque listener handle. Two slots — `fd` for the
 # socket descriptor (same contract as Conn), `port` for the
@@ -61600,8 +61647,8 @@ fn builtin_conn_decl() : Decl =
 # kernel picked.
 fn builtin_listener_decl() : Decl =
   DType(false, "Listener", [],
-    TBRecord([FD("fd",   ty_name_zero("Int")),
-              FD("port", ty_name_zero("Int"))]), 0, 0, None)
+    TBRecord([FD(true, "fd",   ty_name_zero("Int")),
+              FD(true, "port", ty_name_zero("Int"))]), 0, 0, None)
 
 # Issue #107: Signal effect — POSIX SIGINT/SIGTERM/SIGHUP/SIGUSR1/
 # SIGUSR2 trap for graceful shutdown. Spec: docs/effects-stdlib.md
@@ -61690,7 +61737,7 @@ fn builtin_process_decl() : Decl =
 # issue #126 §*Lane scope DO NOT*).
 fn builtin_child_decl() : Decl =
   DType(false, "Child", [],
-    TBRecord([FD("pid", ty_name_zero("Int"))]), 0, 0, None)
+    TBRecord([FD(true, "pid", ty_name_zero("Int"))]), 0, 0, None)
 
 # Issue #126: Exit sum type — closed two-variant catalog matching
 # POSIX wait-status decoding. The runtime's
@@ -66053,16 +66100,23 @@ fn cache_hex_to_opt_db(buf: String, pos: Int) : Option[CacheOptDBPos] {
 # ---- FieldDecl / Variant / TypeBody ---------------------------------------
 
 fn cache_fd_to_hex(fd: FieldDecl) : String = match fd {
-  FD(n, t) -> concat_all([cache_string_to_hex(n), cache_typeexpr_to_hex(t)])
+  FD(is_pub, n, t) -> concat_all([cache_bool_to_hex(is_pub),
+                                   cache_string_to_hex(n),
+                                   cache_typeexpr_to_hex(t)])
 }
 
 fn cache_hex_to_fd(buf: String, pos: Int) : Option[CacheFDPos] {
-  match cache_hex_to_string(buf, pos) {
+  match cache_hex_to_bool(buf, pos) {
     None -> None
-    Some(csp) -> match csp { CSP(n, p1) ->
-      match cache_hex_to_typeexpr(buf, p1) {
+    Some(cbp) -> match cbp { CBP(is_pub, p0) ->
+      match cache_hex_to_string(buf, p0) {
         None -> None
-        Some(ct) -> match ct { CTyP(t, p2) -> Some(CFDP(FD(n, t), p2)) }
+        Some(csp) -> match csp { CSP(n, p1) ->
+          match cache_hex_to_typeexpr(buf, p1) {
+            None -> None
+            Some(ct) -> match ct { CTyP(t, p2) -> Some(CFDP(FD(is_pub, n, t), p2)) }
+          }
+        }
       }
     }
   }
@@ -67252,8 +67306,8 @@ fn cache_roundtrip_self_test() : String {
           TBSum([Var("Red", []), Var("Green", []), Var("Blue", [])]),
           1, 1, None),
     DType(true, "Pair", ["T"],
-          TBRecord([FD("fst", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 }),
-                    FD("snd", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 })]),
+          TBRecord([FD(true, "fst", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 }),
+                    FD(true, "snd", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 })]),
           2, 1, None),
     DFn(true, "answer", [], [], Some(int_ty), row, body, 3, 1, None),
     DConst(true, "PI",
