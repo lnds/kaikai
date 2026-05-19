@@ -40,7 +40,7 @@ CPPFLAGS_CORE := -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-violations test-attributes test-shadowing
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-core-intrinsic test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-demos-core test-aspirational test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-violations test-attributes test-shadowing
 
 all: $(TARGET)
 
@@ -1230,6 +1230,63 @@ test-unused-bindings: $(TARGET) build
 # path, random*) must declare `import` themselves.
 CORE_PRELUDE_FLAGS :=
 EXTRA_PRELUDE_FLAGS :=
+
+# Cartography variant of `test-stdlib`: same fixture set, same
+# compilation+run pipeline, but does NOT abort on the first failure.
+# Use to count and classify red fixtures across the whole suite when
+# diagnosing tier1 drift. The gate variant (`test-stdlib`) stays
+# exit-non-zero-on-first-fail so CI remains a hard merge gate.
+test-stdlib-survey: $(TARGET) build
+	@pass=0; fail=0; \
+	for f in ../examples/stdlib/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  case "$$name" in bench_*|check_*|*_lib|qualified_call_in_prelude|issue_219_typer_modcall|issue_318_kai_test_prelude_scope) continue ;; esac; \
+	  exp_err=../examples/stdlib/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    rc=0; ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f \
+	      > /dev/null 2> build/stdlib-$$name.err || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "stdlib FAIL $$name (expected error, got success)"; fail=$$((fail+1)); continue; \
+	    fi; \
+	    miss=0; \
+	    while read -r line; do \
+	      grep -qF "$$line" build/stdlib-$$name.err || miss=1; \
+	    done < $$exp_err; \
+	    if [ $$miss -eq 1 ]; then \
+	      echo "stdlib FAIL $$name (missing diagnostic)"; fail=$$((fail+1)); \
+	    else \
+	      echo "stdlib OK $$name (rejected as expected)"; pass=$$((pass+1)); \
+	    fi; \
+	    continue; \
+	  fi; \
+	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f > build/stdlib-$$name.c 2> build/stdlib-$$name.kaic2err; \
+	  rc=$$?; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo "stdlib FAIL $$name (kaic2 errored)"; fail=$$((fail+1)); continue; \
+	  fi; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/stdlib-$$name.c -o build/stdlib-$$name $(LDLIBS_M) 2> build/stdlib-$$name.ccerr; \
+	  rc=$$?; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo "stdlib FAIL $$name (C compile failed)"; fail=$$((fail+1)); continue; \
+	  fi; \
+	  in=../examples/stdlib/$$name.in; \
+	  if [ -f $$in ]; then \
+	    ./build/stdlib-$$name < $$in > build/stdlib-$$name.out 2>&1; \
+	  else \
+	    ./build/stdlib-$$name > build/stdlib-$$name.out 2>&1; \
+	  fi; \
+	  rc=$$?; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo "stdlib FAIL $$name (run errored)"; fail=$$((fail+1)); continue; \
+	  fi; \
+	  if diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out > /dev/null 2>&1; then \
+	    echo "stdlib OK $$name"; pass=$$((pass+1)); \
+	  else \
+	    echo "stdlib DIFF $$name"; fail=$$((fail+1)); \
+	  fi; \
+	done; \
+	echo ""; \
+	echo "test-stdlib-survey: $$pass pass, $$fail fail"
 
 test-stdlib: $(TARGET) build
 	@set -e; \
