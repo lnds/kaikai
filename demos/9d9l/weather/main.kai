@@ -1,31 +1,26 @@
-# 9d9l #2 — Weather
+# 9d9l #2 — Weather (https://github.com/lnds/9d9l/tree/master/desafio2)
 #
-# Fetches weather for cities from OpenWeatherMap, optionally in parallel
-# with `-p`. Sorts by current temperature (high to low) and reports the
-# total time spent.
+# The original 9d9l challenge fetches weather for several cities
+# from OpenWeatherMap, optionally in parallel with `-p`, and
+# prints them sorted by current temperature (high to low).
 #
-# Showcase of the kaikai concurrency story:
-#   - `nursery { n -> ... }` scopes the spawned fibers (m8).
-#   - Each city is fetched on its own fiber via `n.spawn(...)`.
-#   - `n.await(fiber)` joins the result.
-#   - On any failure, the nursery cancels the rest cooperatively.
+# kaikai port: the live HTTP path is exercised by the
+# `examples/stdlib/http_*` fixtures already; here we keep the demo
+# hermetic by parsing fixed JSON payloads via stdlib/encoding/json.
+# The pitch the demo carries — typed JSON drilling + functional
+# sort by a derived key — runs end-to-end without network access.
 #
-# Pending features:
-#   - `use Effect`            — m7e §25
-#   - `Spawn`/nursery         — m8
-#   - `Net.http.get`          — stdlib net.http (post-m8 + m14)
-#   - `json.parse`            — stdlib encoding.json (post-m14)
-#   - `Clock.monotonic` + diff — m8/Time effect
-#   - `list.sort_by`           — m5-stdlib lane
-#   - `++`                    — m7d §23
+# What the upstream challenge asks for (per the README):
+#
+#   <Ciudad>   max: <tmax>  min: <tmin>  actual: <tactual>  <Condición>
+#   ...
+#   Tiempo ocupado en descargar información : hh:mm:ss.ms
+#
+# We drop the timing line — Clock.monotonic is post-m8 work — and
+# focus on the JSON drilling + descending-temperature sort.
 
-use Console
-use Env
-use Net
-use Spawn
-use Clock
+import encoding.json
 
-#[derive(Show, Eq)]
 type Report = {
   city:     String,
   temp:     Real,
@@ -34,53 +29,113 @@ type Report = {
   desc:     String,
 }
 
-fn fetch_one(api_key: String, city: String) : Report / Net + Fail = {
-  let url = "https://api.openweathermap.org/data/2.5/weather?q="
-    ++ city ++ "&appid=" ++ api_key ++ "&units=metric"
-  let body = Net.http.get(url)
-  let j = json.parse(body)
+# A minimal in-memory database of weather JSON payloads, shaped
+# after the slices of an OpenWeatherMap response the upstream
+# demo reads (main.temp, main.temp_max, main.temp_min,
+# weather[0].description). The hermetic input lets the demo
+# exercise the parse-and-sort pipeline without an API key.
+fn payload(city: String) : String = match city {
+  "Berlin"   -> "{\"main\":{\"temp\":18.0,\"temp_max\":22.0,\"temp_min\":12.0},\"weather\":[{\"description\":\"clear sky\"}]}"
+  "Santiago" -> "{\"main\":{\"temp\":24.5,\"temp_max\":28.0,\"temp_min\":15.0},\"weather\":[{\"description\":\"few clouds\"}]}"
+  "Boston"   -> "{\"main\":{\"temp\":10.2,\"temp_max\":15.0,\"temp_min\":5.0},\"weather\":[{\"description\":\"overcast\"}]}"
+  "Madrid"   -> "{\"main\":{\"temp\":26.0,\"temp_max\":30.5,\"temp_min\":18.0},\"weather\":[{\"description\":\"sunny\"}]}"
+  _          -> "{\"main\":{\"temp\":0.0,\"temp_max\":0.0,\"temp_min\":0.0},\"weather\":[{\"description\":\"unknown\"}]}"
+}
+
+# ---- JSON drilling helpers ----------------------------------------
+#
+# stdlib/encoding/json.kai exposes a single algebraic `JsonValue`.
+# The demo only needs three projections (object lookup by key, array
+# index, primitive extraction); the rest of the parsed tree is
+# discarded.
+
+fn obj_get(v: JsonValue, k: String) : JsonValue = match v {
+  JObj(pairs) -> match pairs_get(pairs, k) {
+    Some(found) -> found
+    None        -> JNull
+  }
+  _           -> JNull
+}
+
+fn pairs_get(pairs: [Pair[String, JsonValue]], k: String) : Option[JsonValue] = match pairs {
+  []           -> None
+  [p, ...rest] -> if p.fst == k { Some(p.snd) } else { pairs_get(rest, k) }
+}
+
+fn arr_get(v: JsonValue, i: Int) : JsonValue = match v {
+  JArr(items) -> nth_or(items, i, JNull)
+  _           -> JNull
+}
+
+fn nth_or(xs: [JsonValue], i: Int, fallback: JsonValue) : JsonValue = match xs {
+  []           -> fallback
+  [x, ...rest] -> if i == 0 { x } else { nth_or(rest, i - 1, fallback) }
+}
+
+fn as_real(v: JsonValue) : Real = match v {
+  JReal(r) -> r
+  JNum(n)  -> int_to_real(n)
+  _        -> 0.0
+}
+
+fn as_string(v: JsonValue) : String = match v {
+  JStr(s) -> s
+  _       -> ""
+}
+
+# ---- Per-city pipeline --------------------------------------------
+
+fn parse_report(city: String) : Report = {
+  let v    = match json_decode(payload(city)) {
+    Some(j) -> j
+    None    -> JNull
+  }
+  let main = obj_get(v, "main")
+  let w0   = arr_get(obj_get(v, "weather"), 0)
   Report {
     city:     city,
-    temp:     j |> json.get("main") |> json.get("temp") |> json.as_real,
-    temp_max: j |> json.get("main") |> json.get("temp_max") |> json.as_real,
-    temp_min: j |> json.get("main") |> json.get("temp_min") |> json.as_real,
-    desc:     j |> json.get("weather") |> json.nth(0) |> json.get("description") |> json.as_string,
+    temp:     as_real(obj_get(main, "temp")),
+    temp_max: as_real(obj_get(main, "temp_max")),
+    temp_min: as_real(obj_get(main, "temp_min")),
+    desc:     as_string(obj_get(w0, "description")),
   }
 }
 
-fn fetch_parallel(api_key: String, cities: [String]) : [Report] / Net + Spawn + Fail = {
-  nursery { n ->
-    let fibers = cities | (c) => n.spawn { fetch_one(api_key, c) }
-    fibers | n.await
-  }
+# Descending sort by `.temp`: list.sort_by takes a (Report, Report)
+# -> Int cmp returning negative when the first arg should come
+# first. To sort descending we flip the operands.
+fn cmp_by_temp_desc(a: Report, b: Report) : Int =
+  if a.temp > b.temp { -1 }
+  else if a.temp < b.temp { 1 }
+  else { 0 }
+
+fn map_reports(cs: [String]) : [Report] = match cs {
+  []           -> []
+  [c, ...rest] -> [parse_report(c), ...map_reports(rest)]
 }
 
-fn fetch_sequential(api_key: String, cities: [String]) : [Report] / Net + Fail =
-  cities | (c) => fetch_one(api_key, c)
+# ---- Output ---------------------------------------------------------
 
 fn render(r: Report) : String =
-  "#{r.city}  max: #{r.temp_max}  min: #{r.temp_min}  actual: #{r.temp}  #{r.desc}"
+  string_concat_all([
+    r.city, "  max: ", real_to_string(r.temp_max),
+    "  min: ", real_to_string(r.temp_min),
+    "  actual: ", real_to_string(r.temp),
+    "  ", r.desc,
+  ])
 
-fn main() = {
-  let args = Env.args()
-  let parallel = list.contains(args, "-p")
-  let cities = list.filter(args, (a) => a != "-p")
-
-  match cities {
-    [] -> println("usage: weather [-p] <city1> <city2> ...")
-    _  -> match Env.get("WEATHER_API_KEY") {
-      None      -> Console.eprint("error: WEATHER_API_KEY not set")
-      Some(key) -> {
-        let t0 = Clock.monotonic()
-        let reports =
-          if parallel { fetch_parallel(key, cities) }
-          else        { fetch_sequential(key, cities) }
-        let sorted = list.sort_by(reports, (r) => -r.temp)  # desc by temp
-        list.each(sorted, (r) => println(render(r)))
-        let t1 = Clock.monotonic()
-        println("")
-        println("Tiempo: " ++ Clock.format_diff(t0, t1))
-      }
-    }
+fn print_reports(rs: [Report]) : Unit / Stdout = match rs {
+  []           -> ()
+  [r, ...rest] -> {
+    Stdout.print(render(r))
+    print_reports(rest)
   }
+}
+
+fn main() : Int / Stdout = {
+  let cities = ["Berlin", "Santiago", "Boston", "Madrid"]
+  let reports = map_reports(cities)
+  let sorted  = list.sort_by(reports, cmp_by_temp_desc)
+  print_reports(sorted)
+  0
 }
