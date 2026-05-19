@@ -1,94 +1,113 @@
-# 9d9l #3 — Vectores
+# 9d9l #3 — Vectores (https://github.com/lnds/9d9l/tree/master/desafio3)
 #
-# Reads a file of fixed-width records, consolidates 6 period vectors of
-# 23 elements each into a single deduplicated, sorted vector of at most
-# 23 elements. Marks the result S/N/D depending on overflow/empty/short.
+# Per-line record layout:
+#   header:  9 digits
+#   detail:  6 vectors × 23 periods × 6 digits/period = 828 chars
+# Per-line output:
+#   header:  9 digits (copied)
+#   mark:    1 char (S, N, or D)
+#   vector:  138 chars = 23 periods × 6 digits, space-padded on the right
 #
-# Record layout (per line):
-#   header: 9 digits
-#   detail: 6 vectors × 23 periods × 6 digits/period = 828 chars
-# Output:
-#   header: 9 digits (copied)
-#   mark:   1 char (S, N, or D)
-#   vector: at most 23 periods × 6 digits = 138 chars (padded with spaces)
+# Rules (from the upstream README):
+#   1. Consolidate the 6 vectors into at most 23 periods.
+#   2. Drop the zero periods (`000000`); deduplicate the rest.
+#   3. Sort descending.
+#   4. If n > 23 → mark `S`, body is all spaces.
+#      If n == 0 → mark `N`, body is all spaces.
+#      Otherwise → mark `D`, body is the n periods followed by
+#                  (23 − n) × 6 spaces.
 #
-# Pending features:
-#   - `use Effect`            — m7e §25
-#   - `File.read_lines` etc.  — File effect catalog (post-m14)
-#   - `Clock.monotonic`       — Time effect (post-m8)
-#   - `list.sort` desc + `list.uniq` — stdlib lite (m5-stdlib lane)
-#   - `++`                    — m7d §23
+# Input is read from `tests/input.txt` next to this demo so the
+# fixture is hermetic — no Env.args() yet, kaikai's File effect
+# carries the path through.
 
-use Console
-use Env
-use File
-use Clock
+import fs.file
 
-let header_len  : Int = 9
-let period_len  : Int = 6
-let vec_size    : Int = 23
-let n_vectors   : Int = 6
-let detail_len  : Int = period_len * vec_size * n_vectors   # 828
+const header_len  : Int = 9
+const period_len  : Int = 6
+const vec_size    : Int = 23
+const n_vectors   : Int = 6
+const detail_len  : Int = period_len * vec_size * n_vectors   # 828
 
-fn parse_period(s: String) : Option[Int] =
-  if string.length(s) != period_len { None } else { string.parse_int(s) }
+# Parse one 6-char period. Returns Some(n) for any valid integer
+# (including 0 — the caller filters zeros separately). Returns
+# None for a non-digit lexeme (treated as zero by the consolidator).
+fn parse_period(s: String) : Option[Int] = string.to_int(s)
 
-fn slice_periods(detail: String, offset: Int, n: Int, acc: [Int]) : [Int] =
-  if n == 0 { acc }
+# Walk the detail string in 6-char windows, collect non-zero parsed
+# values into `acc`. The accumulator is built tail-first by cons —
+# the caller dedups + sorts, so the build order does not matter.
+fn slice_periods(detail: String, offset: Int, remaining: Int, acc: [Int]) : [Int] =
+  if remaining == 0 { acc }
   else {
     let p = string.slice(detail, offset, period_len)
     match parse_period(p) {
-      None        -> slice_periods(detail, offset + period_len, n - 1, acc)
-      Some(0)     -> slice_periods(detail, offset + period_len, n - 1, acc)
-      Some(v)     -> slice_periods(detail, offset + period_len, n - 1, [v, ...acc])
+      None    -> slice_periods(detail, offset + period_len, remaining - 1, acc)
+      Some(0) -> slice_periods(detail, offset + period_len, remaining - 1, acc)
+      Some(v) -> slice_periods(detail, offset + period_len, remaining - 1, [v, ...acc])
     }
   }
 
+# Cmp for descending int sort: `sort_by` takes (a, b) -> Int with
+# the usual "negative = a first" convention, so to sort descending
+# we return (b - a).
+fn cmp_desc(a: Int, b: Int) : Int = b - a
+
 fn consolidate(detail: String) : [Int] = {
   let raw = slice_periods(detail, 0, vec_size * n_vectors, [])
-  raw |> list.uniq |> list.sort |> list.reverse
+  list.sort_by(list.uniq(raw), cmp_desc)
 }
 
-fn pad_periods(periods: [Int], padding: Int) : String = {
-  let body = periods | int_to_string |> string.join("")
-  body ++ string.repeat(" ", padding * period_len)
+# Render a 6-digit period (zero-padded). The data files coming from
+# the benchmark already store every period as 6 digits, so this is
+# what makes the output round-trip cleanly through `wc -c`.
+fn pad6(n: Int) : String = {
+  let s = int_to_string(n)
+  string.repeat("0", period_len - string.length(s)) ++ s
+}
+
+fn render_periods(periods: [Int]) : String = match periods {
+  []           -> ""
+  [p, ...rest] -> pad6(p) ++ render_periods(rest)
+}
+
+# Body for the D case: the n rendered periods plus (23 − n) blank
+# 6-char slots so every line ends at `header_len + 1 + 138`.
+fn render_body(periods: [Int], n: Int) : String = {
+  let head    = render_periods(periods)
+  let padding = string.repeat(" ", (vec_size - n) * period_len)
+  head ++ padding
 }
 
 fn process_line(line: String) : String =
   if string.length(line) < header_len + detail_len { "" }
   else {
-    let header = string.slice(line, 0, header_len)
-    let detail = string.slice(line, header_len, detail_len)
+    let header  = string.slice(line, 0, header_len)
+    let detail  = string.slice(line, header_len, detail_len)
     let periods = consolidate(detail)
-    let n = list.length(periods)
+    let n       = list.length(periods)
     if n > vec_size {
       header ++ "S" ++ string.repeat(" ", vec_size * period_len)
     } else if n == 0 {
       header ++ "N" ++ string.repeat(" ", vec_size * period_len)
     } else {
-      header ++ "D" ++ pad_periods(periods, vec_size - n)
+      header ++ "D" ++ render_body(periods, n)
     }
   }
 
-fn format_elapsed(secs: Real) : String = {
-  let m = (secs / 60.0) |> real.floor |> real_to_int
-  let s = secs - real_of_int(m * 60)
-  int_to_string(m) ++ "m " ++ real_to_string(s) ++ "s"
-}
-
-fn process(input: String, output: String) : Unit / Console + File + Clock + Fail = {
-  let t0 = Clock.monotonic()
-  let lines = File.read_lines(input)!
-  let processed = lines | process_line
-  File.write_lines(output, processed)!
-  let t1 = Clock.monotonic()
-  println("Tiempo: " ++ format_elapsed(Clock.diff_secs(t0, t1)))
-}
-
-fn main() = match Env.args() {
-  [input, output] -> handle { process(input, output) } with Fail {
-    fail(msg, _) -> Console.eprint("error: " ++ msg)
-    return(_)    -> ()
+fn process_lines(lines: [String]) : [String] = match lines {
+  []              -> []
+  [l, ...rest]    -> {
+    let r = process_line(l)
+    if string.length(r) == 0 { process_lines(rest) }
+    else { [r, ...process_lines(rest)] }
   }
-  _ -> println("usage: ordenar_vector <input> <output>")
+}
+
+fn main() : Int / File + Stdout = {
+  let text  = file.read("demos/9d9l/vectores/tests/input.txt")
+  let lines = string.split(text, "\n")
+  let out   = process_lines(lines)
+  Stdout.print(string.join(out, "\n"))
+  0
 }
