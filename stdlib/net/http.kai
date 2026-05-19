@@ -393,10 +393,23 @@ pub fn parse_response(raw: String) : Result[String, Response] = {
         Ok(code) -> match http_parse_header_lines(rest) {
           Err(e) -> Err(e)
           Ok(hs) -> {
-            # When Content-Length pins the length, slice exactly that
-            # many bytes — anything past that is the *next* response on
-            # a keep-alive stream (which v1 doesn't multiplex anyway).
-            let body = match header_lookup(hs, "Content-Length") {
+            # Body framing precedence (RFC 9112 §6):
+            #   1. Transfer-Encoding: chunked  → walk the
+            #      `<hex-len>\r\n<bytes>\r\n` frames and
+            #      concatenate the payloads.
+            #   2. Content-Length: N           → slice the first
+            #      N bytes (anything past is the next response on a
+            #      keep-alive stream, which v1 does not multiplex).
+            #   3. Otherwise                   → body is everything
+            #      after the blank line; the recv loop already
+            #      drained until peer close.
+            let te = match header_lookup(hs, "Transfer-Encoding") {
+              Some(v) -> http_trim(v)
+              None    -> ""
+            }
+            let body = if te == "chunked" {
+              dechunk_body(body_all)
+            } else { match header_lookup(hs, "Content-Length") {
               Some(v) -> match string_to_int(http_trim(v)) {
                 Some(n) ->
                   if n <= 0 { "" }
@@ -405,13 +418,87 @@ pub fn parse_response(raw: String) : Result[String, Response] = {
                 None -> body_all
               }
               None -> body_all
-            }
+            } }
             Ok(Response { status: code, headers: hs, body: body })
           }
         }
       }
     }
   }
+}
+
+# ---- chunked transfer encoding ------------------------------------
+#
+# RFC 9112 §7.1. A chunked body is a sequence of `<hex-length>\r\n
+# <data>\r\n` frames followed by a `0\r\n\r\n` terminator. Servers
+# that don't know the response size in advance (CGI gateways,
+# wttr.in, …) emit this shape; `parse_response` peels it off so
+# every caller sees a single contiguous String regardless of
+# whether the server framed by length or by chunks.
+#
+# Exposed `pub` so callers building their own connection plumbing
+# (NetTcp directly, bypassing `http.request`) can reuse the
+# dechunker against bytes they've assembled themselves.
+pub fn dechunk_body(s: String) : String = http_dechunk_loop(s, 0, "")
+
+fn http_dechunk_loop(s: String, pos: Int, acc: String) : String = {
+  let crlf = http_find_crlf(s, pos)
+  if crlf < 0 { acc }
+  else {
+    let len_str = string_slice(s, pos, crlf - pos)
+    match http_parse_hex(len_str) {
+      None    -> acc
+      Some(0) -> acc
+      Some(n) -> {
+        let data_start = crlf + 2
+        let chunk = string_slice(s, data_start, n)
+        # Skip the trailing "\r\n" after the chunk data.
+        http_dechunk_loop(s, data_start + n + 2, string_concat(acc, chunk))
+      }
+    }
+  }
+}
+
+fn http_find_crlf(s: String, from: Int) : Int = {
+  let n = string_length(s)
+  if from + 1 >= n { -1 }
+  else { http_find_crlf_loop(s, from, n) }
+}
+
+fn http_find_crlf_loop(s: String, i: Int, n: Int) : Int = {
+  if i + 1 >= n { -1 }
+  else {
+    match char_at(s, i) {
+      None    -> -1
+      Some(c) -> if c == '\r' {
+        match char_at(s, i + 1) {
+          Some(c2) -> if c2 == '\n' { i } else { http_find_crlf_loop(s, i + 1, n) }
+          None     -> -1
+        }
+      } else { http_find_crlf_loop(s, i + 1, n) }
+    }
+  }
+}
+
+fn http_hex_digit_value(c: Char) : Option[Int] = {
+  if char.is_digit(c) { Some(char_to_int(c) - char_to_int('0')) }
+  else if c >= 'a' and c <= 'f' { Some(char_to_int(c) - char_to_int('a') + 10) }
+  else if c >= 'A' and c <= 'F' { Some(char_to_int(c) - char_to_int('A') + 10) }
+  else { None }
+}
+
+fn http_parse_hex(s: String) : Option[Int] =
+  http_parse_hex_loop(s, 0, string_length(s), 0)
+
+fn http_parse_hex_loop(s: String, i: Int, n: Int, acc: Int) : Option[Int] = {
+  if i >= n { Some(acc) }
+  else { match char_at(s, i) {
+    None    -> Some(acc)
+    Some(c) -> match http_hex_digit_value(c) {
+      None    -> Some(acc)
+      Some(v) -> http_parse_hex_loop(s, i + 1, n, acc * 16 + v)
+    }
+  } }
 }
 
 # ---- network surface ---------------------------------------------
