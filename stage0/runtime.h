@@ -3665,7 +3665,20 @@ static KaiValue *kai_prelude_program_name(void) {
 #ifndef KAI_STDLIB_PATH
 #define KAI_STDLIB_PATH "stdlib"
 #endif
+/* The compile-time `KAI_STDLIB_PATH` macro is set by stage{1,2}/Makefile
+ * to `$(abspath ../stdlib)` — an absolute path to the checkout's stdlib
+ * directory. After install (brew, tarball, etc.) that path no longer
+ * exists, so the env-var override `KAIKAI_STDLIB_PATH` takes precedence
+ * when set. `bin/kai` exports this var pointing at the installed
+ * `share/kaikai/stdlib` so users get a working compiler without
+ * rebuilding from source. Direct `kaic2` invocations from a source
+ * checkout leave the env unset and fall back to the macro.
+ */
 static KaiValue *kai_prelude_stdlib_path(void) {
+    const char *env = getenv("KAIKAI_STDLIB_PATH");
+    if (env && *env) {
+        return kai_str(env);
+    }
     return kai_str(KAI_STDLIB_PATH);
 }
 
