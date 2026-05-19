@@ -84,6 +84,60 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.73.0 (2026-05-19)
+
+### BREAKING CHANGE
+
+- any record field a downstream module reads must be
+explicitly public (default today). Existing code unaffected because
+priv is opt-in; no existing fields change visibility unless the user
+adds `priv` to them.
+
+### Added
+
+- **typer**: post-typing walker enforces priv field privacy + 3 negative fixtures
+- **typer**: priv keyword for record fields, default public
+- **typer**: per-module duplicate-decl validation at load time
+- **typer**: refinement predicates accept EModCall for pure-set ops
+- **typer**: #derive(Ord) synthesises cmp + min + max
+- **typer**: extend validate_pub_access to walk decl signatures
+- **typer**: validate_module_pub_signatures — intra-module pub leak gate
+- **typer**: validate_unit_refs hygiene pass — intra-module declared scope
+- **compiler**: retire --prelude, hard-code the core module set
+- **driver**: package-aware build with .  ./...  and kai.toml entry field (closes #658)
+- **stdlib**: qualified-call migration — batch B4 (encoding + uuid + regexp + protocols + secure_random + net/http + money doc)
+- **stdlib**: qualified-call migration — batch B3 (array + collections + path)
+- **stdlib**: qualified-call migration — batch B2 (math + numeric)
+- **stdlib**: qualified-call migration — batch B1 (file, spawn, log)
+
+### Fixed
+
+- **tools**: migrate kai-pkg to canonical toml + file API post-Hanga Roa
+- **unbox**: resolve UFn classification by (name, module) not name alone
+- **resolver**: canonicalise paths via realpath so core + import dedup
+- **stdlib**: close 4 same-module dup/missing-import bugs surfaced by validator
+- **diag**: --dump-intervals filters to target-file decls only
+- **typer**: coverage walker reads effects from whole program, not module partition
+- **typer**: vpa signature walker honours tparam scope to dodge variant clashes
+- **stdlib**: drop stray .kai.tmp files left by helper script
+- **stdlib**: restore fixture imports after --prelude retirement (partial)
+- **typer**: post-typer dispatch honours local shadow over protocol op
+- **typer**: reject unbound type variables in fn signatures (closes #534)
+
+### Changed
+
+- **typer**: modular per-module typecheck with home-bucket partition
+- **typer**: TyCon carries module_origin, unification is strict
+- **typer**: module_origin on DType, RecInfo, SumInfo; rerank by home_mod
+- **compiler**: remove module_legacy_prefix dead code
+- **stdlib,compiler**: kill the legacy-prefix fallback (MAGIC GONE)
+- **stdlib**: canonical-only net/http surface (20 ops)
+- **stdlib**: canonical-only int + real-remaining + array + spawn
+- **stdlib**: canonical-only surface for fx + decimal + money
+- **stdlib,compiler**: canonical-only regexp surface + private hex helper renames
+- **stdlib**: canonical-only surface for set/queue/base64/hex
+- **stdlib**: canonical-only surface for 9 m14-followup modules
+
 ## v0.72.1 (2026-05-16)
 
 ### Added
