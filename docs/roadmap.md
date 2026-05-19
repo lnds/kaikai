@@ -1,14 +1,25 @@
 # kaikai roadmap
 
-Pinned 2026-05-02 (post v0.30.0). Last refreshed 2026-05-16 (HEAD
-0.69.0, post #604 docs honesty audit; previous refresh 2026-05-13
-at HEAD 0.54.3). Names follow the Rapa Nui
-convention already in use across the project (the language
-`kaikai` itself, the framework `ahu`, the web framework
-`manutara`). Each milestone is a real Rapa Nui site; the
-sequence Tongariki → Hanga Roa → Orongo → Anakena tracks the
-arc from public face → daily life → ceremonial culmination →
+Pinned 2026-05-02 (post v0.30.0). Last refreshed 2026-05-19 (HEAD
+0.73.0, post the priv-fields lane + Hanga Roa modular typecheck
+work). Names follow the Rapa Nui convention already in use across
+the project (the language `kaikai` itself, the framework `ahu`,
+the web framework `manutara`). Each milestone is a real Rapa Nui
+site; the sequence Tongariki → Hanga Roa → Orongo → Anakena tracks
+the arc from public face → daily life → ceremonial culmination →
 horizon beyond.
+
+**Version-to-edition map** (kept explicit so there is no ambiguity
+when discussing 1.0 readiness):
+
+- **Tongariki** — pre-1.0 MVP edition, closed 2026-05-02.
+- **Hanga Roa** — current pre-1.0 edition. HEAD `0.73.0` sits inside
+  it. Spans the `0.30.0` → `<1.0` arc.
+- **Orongo** — **1.0.0** ships under this edition name. The edition
+  boundary is the public stability commitment: surface code written
+  against Orongo is preserved across patch / minor bumps within the
+  edition.
+- **Anakena** — post-1.0 horizon.
 
 ## Status snapshot
 
