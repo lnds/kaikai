@@ -26,6 +26,7 @@
 import net.http
 import encoding.json
 import os.args
+import spawn
 
 type Report = {
   city:     String,
@@ -92,6 +93,31 @@ fn fetch_each(cs: [String]) : [Report] / NetTcp + Cancel = match cs {
   [c, ...rest] -> [fetch_report(c), ...fetch_each(rest)]
 }
 
+# Parallel variant: one fiber per city, joined by the nursery. The
+# Hanga Roa R2 reactor parks each fiber on its socket `recv`, so
+# wall-time drops from sum(per-city latency) to max(per-city
+# latency). Spawn / await stay inline inside the nursery block
+# because the cap `n` is brand-scoped — every `n.spawn(...)` /
+# `n.await(...)` carries the brand of THIS nursery, and the
+# brand-mismatch checker rejects calls that leak the cap into a
+# helper fn (docs/structured-concurrency.md §*Type system*).
+#
+# A 16 MiB fiber stack is the working size for this demo:
+#   KAI_FIBER_STACK_SIZE=16777216 ./weather -p
+# The default 64 KiB overflows while parsing wttr.in's ~40 KB JSON
+# (json_decode is recursive). For a parser-cost-sensitive lane the
+# right fix is an iterative JSON parser in stdlib — out of scope
+# here; the env-var override is the documented escape hatch.
+fn fetch_parallel(cs: [String]) : [Report] / Spawn + NetTcp + Cancel =
+  nursery { n ->
+    # Phase 1 — open one fiber per city.
+    let fibers = list.map(cs, (c) => n.spawn(() => fetch_report(c)))
+    # Phase 2 — await each fiber in declaration order. The nursery
+    # guarantees every spawned fiber completes (or is cancelled
+    # cooperatively) before the block returns.
+    list.map(fibers, (f) => n.await(f))
+  }
+
 # Descending sort by `.temp`: list.sort_by takes (a, b) -> Int with
 # the usual negative-means-a-first convention, so to sort descending
 # we flip the operands.
@@ -116,12 +142,16 @@ fn print_reports(rs: [Report]) : Unit / Stdout = match rs {
   }
 }
 
-fn main() : Int / NetTcp + Cancel + Env + Stdout = {
-  let cities = match args.argv() {
-    []   -> ["Berlin", "Santiago", "Boston", "Madrid"]
-    cli  -> cli
+fn main() : Int / NetTcp + Spawn + Cancel + Env + Stdout = {
+  let argv = args.argv()
+  let parallel = list.contains(argv, "-p")
+  let cities0 = list.filter(argv, (a) => a != "-p")
+  let cities = match cities0 {
+    [] -> ["Berlin", "Santiago", "Boston", "Madrid"]
+    _  -> cities0
   }
-  let reports = fetch_each(cities)
+  let reports = if parallel { fetch_parallel(cities) }
+                else        { fetch_each(cities) }
   let sorted  = list.sort_by(reports, cmp_by_temp_desc)
   print_reports(sorted)
   0
