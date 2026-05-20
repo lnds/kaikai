@@ -94,6 +94,13 @@ make -C stage2 selfhost >&2
 echo "==> building kai-pkg"
 KAI_BACKEND=c ./bin/kai build tools/kai-pkg/main.kai -o tools/kai-pkg/kai-pkg >&2
 
+# Build kai-lsp (the Language Server, issue #447). Same rationale as
+# kai-pkg: installed mode looks for libexec/kaikai/kai-lsp, dev mode
+# auto-builds. Force the C backend for the same reason — LLVM path
+# is opt-in until the runtime gap closes.
+echo "==> building kai-lsp"
+KAI_BACKEND=c ./bin/kai build tools/kai-lsp/main.kai -o tools/kai-lsp/kai-lsp >&2
+
 # Copy artifacts.
 echo "==> assembling installed layout at $STAGE"
 cp bin/kai             "$STAGE/bin/kai"
@@ -102,6 +109,8 @@ cp stage2/kaic2        "$STAGE/libexec/kaikai/kaic2"
 chmod +x               "$STAGE/libexec/kaikai/kaic2"
 cp tools/kai-pkg/kai-pkg "$STAGE/libexec/kaikai/kai-pkg"
 chmod +x               "$STAGE/libexec/kaikai/kai-pkg"
+cp tools/kai-lsp/kai-lsp "$STAGE/libexec/kaikai/kai-lsp"
+chmod +x               "$STAGE/libexec/kaikai/kai-lsp"
 
 # Stdlib: copy the whole tree preserving structure.
 (cd stdlib && tar -cf - .) | (cd "$STAGE/share/kaikai/stdlib" && tar -xf -)
