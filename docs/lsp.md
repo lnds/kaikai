@@ -1,8 +1,8 @@
 # Language Server (`kai lsp`)
 
-> v1 status (2026-05-19): hover ships. Goto-definition, diagnostics
-> push, completion, and signature help are deferred to v1.1; see
-> issue #447 for the full roadmap.
+> v2 status (2026-05-20): hover, goto-definition, publishDiagnostics,
+> and documentSymbol all ship. Completion + signature help are
+> still pending; see issue #447 for the full roadmap.
 
 `kai lsp` is the kaikai Language Server. It speaks LSP JSON-RPC
 over stdio and is the integration point for every editor — VS
@@ -13,9 +13,9 @@ etc.
 $ kai lsp        # block on stdio; reads JSON-RPC frames
 ```
 
-## What v1 does
+## What v2 does
 
-| LSP method                        | v1 support |
+| LSP method                        | v2 support |
 | --------------------------------- | ---------- |
 | `initialize` / `initialized`      | ✅          |
 | `shutdown` / `exit`               | ✅          |
@@ -23,15 +23,29 @@ $ kai lsp        # block on stdio; reads JSON-RPC frames
 | `textDocument/didChange` (Full)   | ✅          |
 | `textDocument/didClose`           | ✅          |
 | `textDocument/hover`              | ✅          |
-| `textDocument/definition`         | planned    |
-| `textDocument/publishDiagnostics` | planned    |
+| `textDocument/definition`         | ✅          |
+| `textDocument/publishDiagnostics` | ✅ (partial) |
+| `textDocument/documentSymbol`     | ✅          |
 | `textDocument/completion`         | future     |
 | `textDocument/signatureHelp`      | future     |
 
-Hover returns the inferred kaikai type for the AST node under the
-cursor, formatted as a markdown fenced block. The lookup is exact
-— the same `type_at` query the compiler exposes through
-`kaic2 --library-mode` (issue #454).
+* **Hover** returns the inferred kaikai type for the AST node under
+  the cursor, formatted as a markdown fenced block. Driven by the
+  `type_at` query in `--library-mode` (issue #454).
+* **Goto-definition** points at the source line of the resolved
+  identifier. User-authored decls always win over preloaded
+  prelude / stdlib decls — `find_decl_def` prefers
+  `module_origin = None` matches.
+* **publishDiagnostics** fires on `didOpen` and `didChange`. Driven
+  by `--diags-json`; only the T1–T5 diagnostics migrated to the
+  structured collector are visible (~11 of 239 emit sites — the
+  rest still print to stderr). An empty array publishes on a clean
+  buffer so previous markers clear.
+* **documentSymbol** walks the parser-level decls and emits the
+  outline panel content. `DFn` (incl. lowered `const`),
+  `DEffect`, `DProtocol`, `DUnit`, `DTest`, `DBench` are
+  surfaced. `DType` is dropped by the elaborator and does not
+  appear in v2 — pending follow-up.
 
 ## Architecture
 

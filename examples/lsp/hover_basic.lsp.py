@@ -50,6 +50,9 @@ send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
       "params": {"textDocument": {"uri": "file:///tmp/hover_basic.kai",
                                     "languageId": "kaikai", "version": 1, "text": src}}})
+# Consume the publishDiagnostics notification triggered by didOpen.
+diag_notif = recv()
+assert diag_notif.get("method") == "textDocument/publishDiagnostics", diag_notif
 
 # Hover at line 0, col 31 — the `x` in `x + y`. Expect Int.
 send({"jsonrpc": "2.0", "id": 2, "method": "textDocument/hover",
