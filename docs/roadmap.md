@@ -1,8 +1,11 @@
 # kaikai roadmap
 
-Pinned 2026-05-02 (post v0.30.0). Last refreshed 2026-05-19 (HEAD
-0.73.0, post the priv-fields lane + Hanga Roa modular typecheck
-work). Names follow the Rapa Nui convention already in use across
+Pinned 2026-05-02 (post v0.30.0). Last refreshed 2026-05-20 (HEAD
+0.79.0, post the LSP v1 → v2 → v3 wave that closed #447 — hover,
+goto-def, publishDiagnostics, documentSymbol, completion,
+signatureHelp, plus hole warning diagnostics — and exposed the
+`--diags-json` / `--effects-json` / `--library-mode` flags on
+`kai build`). Names follow the Rapa Nui convention already in use across
 the project (the language `kaikai` itself, the framework `ahu`,
 the web framework `manutara`). Each milestone is a real Rapa Nui
 site; the sequence Tongariki → Hanga Roa → Orongo → Anakena tracks
@@ -13,7 +16,7 @@ horizon beyond.
 when discussing 1.0 readiness):
 
 - **Tongariki** — pre-1.0 MVP edition, closed 2026-05-02.
-- **Hanga Roa** — current pre-1.0 edition. HEAD `0.73.0` sits inside
+- **Hanga Roa** — current pre-1.0 edition. HEAD `0.79.0` sits inside
   it. Spans the `0.30.0` → `<1.0` arc.
 - **Orongo** — **1.0.0** ships under this edition name. The edition
   boundary is the public stability commitment: surface code written
@@ -23,12 +26,18 @@ when discussing 1.0 readiness):
 
 ## Status snapshot
 
-- **HEAD**: `0.69.0` (post the 2026-05-15→2026-05-16 reactor wave
-  closing #611 (R1 file/sleep/process), #620 (R3 stdin), #630 (R2
-  TCP), the cache chain closing #452 (Phase A.0) + #592 (KAB2) +
-  #597 (lower_protocols boundary tagging), the Hanga Roa-precondition
-  fixes #643/#644/#645, and the mirror pipeline fix #649). The
-  earlier `0.54.3` pin tracked the negative-space audit phase 2;
+- **HEAD**: `0.79.0` (post the LSP v1 → v2 → v3 wave 2026-05-09 →
+  2026-05-20 closing #447 — hover, goto-def, publishDiagnostics,
+  documentSymbol, completion, signatureHelp, plus hole warning
+  diagnostics — and the `kai build` JSON-flag surface
+  (`--diags-json`, `--effects-json`, `--library-mode`,
+  `--effect-holes-json`)). The earlier `0.69.0` pin tracked the
+  2026-05-15→2026-05-16 reactor wave closing #611 (R1
+  file/sleep/process), #620 (R3 stdin), #630 (R2 TCP), the cache
+  chain closing #452 (Phase A.0) + #592 (KAB2) + #597
+  (lower_protocols boundary tagging), the Hanga Roa-precondition
+  fixes #643/#644/#645, and the mirror pipeline fix #649. The
+  prior `0.54.3` pin tracked the negative-space audit phase 2;
   the run from 0.55 → 0.69 was the bug-bash week (LLVM default
   handlers #570/#582/#587, edition dispatch #603) plus the reactor
   wave plus the cache chain that landed in 2026-05-14→2026-05-16.
@@ -219,13 +228,15 @@ precondition chain (see *Status snapshot*); the remaining scope
 below tracks against issues #86 (m12.6 diagnostics quality —
 title was "m11 diagnostics" pre-rename), #210 (variant + record
 reuse-in-place — closed 2026-05-06), and #264 (canonical
-grammar.md, closed 2026-05-06). LSP **does not have a tracking
-issue** as of 2026-05-09; the previous citations of #92 and
+grammar.md, closed 2026-05-06). LSP is tracked under #447; v1
+(hover) shipped v0.75.0, v2 (goto-def + publishDiagnostics +
+documentSymbol) shipped v0.76.0, v3 (completion + signatureHelp +
+hole warning diagnostics) shipped v0.77.0 → v0.79.0
+(2026-05-09 → 2026-05-20). The previous citations of #92 and
 #120 were ghost references (#92 is `R6 — TCO precise
 per-call-site dropmask`, closed; #120 is `Perceus: opt-in
 regions for parser/lexer scratch buffers`, open) and have been
-removed. Open a tracking issue for LSP when that lane actually
-starts. **REPL is removed permanently** — see #406 and
+removed. **REPL is removed permanently** — see #406 and
 `docs/decisions/repl-removal-2026-05-09.md`. Not in v1.0, not in
 v1.x, not on the roadmap. `kai run` + `kai watch` cover the
 ad-hoc evaluation workflow.
@@ -268,10 +279,15 @@ polymorphic-impl machinery.
     upgrade of the existing `effect not handled` site with
     `missing effect:` and `enclosing row:` notes plus
     split declare/handle help). Closes the m11 v1 series.
-- `kai lsp` — Language Server Protocol implementation: type
-  on hover, completions, go-to-definition, diagnostics push,
-  symbol renaming. Reuses the typed-hole + diagnostic JSON
-  surface.
+- ~~`kai lsp`~~ ✅ **shipped v0.75.0 → v0.79.0
+  (2026-05-09 → 2026-05-20, issue #447)** — Language Server
+  Protocol implementation: hover, goto-definition,
+  publishDiagnostics (compile errors + hole warnings),
+  documentSymbol, completion, signatureHelp. Reuses the
+  typed-hole + diagnostic JSON surface; consumes
+  `--library-mode` from issue #454. Symbol rename and
+  cross-file resolution slip to a v4 lane post-Hanga Roa.
+  See `docs/lsp.md` for the v3 capability matrix.
 - `bench` v1.x — median + MAD outlier detection,
   configurable iteration count.
 - `check` v1.x — shrinking. Per-type halving for `Int`,

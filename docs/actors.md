@@ -101,7 +101,7 @@ actor instance. Equality is intentional: supervision,
 monitoring, and message routing need it.
 
 ## Spawning actors
-<!-- coverage: skip --> spawn_actor primitive deferred to Fibers Tier 2 (Monitor lane); m8x_4_recv_blocking covers the Pid handoff path indirectly
+<!-- coverage: skip --> spawn_actor + Monitor shipped in Fibers Tier 2 (2026-04-30, v0.5.0+); coverage via m8x_4_recv_blocking + m8_monitor.kai + m8_trap_exit.kai + demos/ping_pong/
 
 An actor is spawned through `Spawn` just like any other fiber,
 with an `Actor[Msg]` handler wrapped around the body so
@@ -701,11 +701,18 @@ worker so a crash is observable via `MonitorDown`.
 
 ## Next steps
 
-- **Stdlib module `stdlib/actor.kai`**: canonical
-  implementations of `spawn_actor`, `spawn_actor_default`, and
-  `with_mailbox` ship in m8 alongside the scheduler. An
-  OTP-style supervisor DSL (`one_for_one`, `rest_for_one`,
-  `one_for_all`) slips to m9+ — design surface is large and
+The v1 surface specified above is **shipped** as of 2026-04-30
+(R2 scheduler v0.4.0 + Monitor / spawn_actor / trap-exit Tier 2
+retrofit at v0.5.0). `stdlib/actor.kai` exposes `spawn_actor`,
+`spawn_actor_default`, and `with_mailbox` against the m8.x
+runtime; `examples/effects/m8_monitor.kai`, `m8_trap_exit.kai`,
+`m8x_4_recv_blocking.kai`, and `demos/ping_pong/` exercise the
+full mailbox + supervision surface.
+
+Open work after v1:
+
+- **OTP-style supervisor DSL** (`one_for_one`, `rest_for_one`,
+  `one_for_all`). Slipped to m9+ — design surface is large and
   the right shape needs usage data from the first few stdlib
   actors, not pre-emptive specification.
 - **`docs/distributed-actors.md`** — phase 5+. Node addressing,
@@ -714,8 +721,5 @@ worker so a crash is observable via `MonitorDown`.
 - **Doc C updates for mailbox layout**: runtime representation
   of mailboxes, lock-free vs per-actor-mutex, how `DropOldest`
   interacts with Perceus RC on messages in flight.
-
-Implementation milestone is **m8** or later — actors depend on
-fibers (`Spawn`) and cancellation (`Cancel`), both of which land
-in m7's scheduler. Once the scheduler is in place, `Actor[Msg]`
-and supervision primitives are comparatively small additions.
+- **Timeout-bounded `Actor.receive`** — RFC #638, deferred to
+  the Orongo edition. v1 receive blocks indefinitely.

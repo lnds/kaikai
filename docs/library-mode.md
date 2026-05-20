@@ -15,16 +15,21 @@ library mode is purely additive.
 A probe is a `# @probe <kind> <line>:<col>` comment somewhere in the
 source. Probes are scanned by the comment lexer (everything after
 `#` to end-of-line), so they sit anywhere a line comment is legal.
-Three kinds are recognised today:
+Six kinds are recognised today (the original three plus the three
+the LSP wave added):
 
-| Kind   | Question answered                                          |
-|--------|------------------------------------------------------------|
-| `type` | What is the inferred type of the innermost node at L:C?    |
-| `def`  | Where is the identifier at L:C declared?                   |
-| `enc`  | What is the innermost node enclosing L:C? (kind + start)   |
+| Kind       | Question answered                                                              |
+|------------|--------------------------------------------------------------------------------|
+| `type`     | What is the inferred type of the innermost node at L:C?                        |
+| `def`      | Where is the identifier at L:C declared?                                       |
+| `enc`      | What is the innermost node enclosing L:C? (kind + start)                       |
+| `complete` | Which top-level names (user fns + stdlib + prelude) are in scope at L:C?       |
+| `sig`      | What is the callee type of the innermost enclosing call at L:C? (signature help) |
+| `symbols`  | What top-level decls does this file declare? (documentSymbol outline)          |
 
 Lines and columns are 1-indexed, matching every other diagnostic in
-the compiler.
+the compiler. `complete`, `sig`, and `symbols` shipped alongside
+the LSP v3 wave (issue #447, v0.75.0 → v0.79.0).
 
 ## Output
 

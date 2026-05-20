@@ -182,10 +182,15 @@ that lands with its message text, not a TODO.
 
 - `kai fmt`: canonical formatter. Single style, no options. LLM-
   friendly deterministic output.
-- `kai repl`: deferred to post-1.0 per #406 (was: online session
-  with module reload and `?`-hole completion).
-- `kai lsp`: LSP server talking diagnostics + hover + completion +
-  go-to-definition. `--holes-json` doubles as completion source.
+- `kai repl`: **removed permanently** per #406 and
+  `docs/decisions/repl-removal-2026-05-09.md`. Not in v1.0, not
+  on the roadmap. `kai run` + `kai watch` cover the ad-hoc
+  evaluation workflow.
+- `kai lsp`: LSP server. v1 → v3 shipped 2026-05-09 → 2026-05-20
+  (issue #447). Hover, goto-definition, publishDiagnostics
+  (compile errors + hole warnings), documentSymbol, completion,
+  signatureHelp. `--holes-json` + `--diags-json` feed
+  publishDiagnostics; see `docs/lsp.md` for the capability matrix.
 - `kai doc`: extract `pub` signatures and doc comments; emit HTML.
 - `kai bench`: alongside `kai test`; reuses the test syntax but
   measures time.
@@ -590,9 +595,12 @@ in.
     §17, §20).
 15. **m15 — `kai fmt`** using the stage 2 parser. Canonical,
     no options (gofmt-style discipline).
-16. **m16 — `kai lsp`** using the stage 2 pipeline.
-17. **m17 — `kai repl`** *(deferred to post-1.0 per #406)* using
-    the stage 2 pipeline + holes.
+16. **m16 — `kai lsp`** using the stage 2 pipeline. **Shipped
+    2026-05-09 → 2026-05-20 (issue #447, v0.75.0 → v0.79.0)**:
+    hover, goto-def, publishDiagnostics, documentSymbol,
+    completion, signatureHelp, hole warnings. See `docs/lsp.md`.
+17. ~~**m17 — `kai repl`**~~ *(removed permanently per #406 and
+    `docs/decisions/repl-removal-2026-05-09.md`)*. Slot retired.
 
 ## Recommended ordering — the direct path
 

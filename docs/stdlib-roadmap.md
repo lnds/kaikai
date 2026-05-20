@@ -107,8 +107,9 @@ What's still open (planned-but-not-shipped):
 
 Three tiers, ordered by impact on the next two product layers
 (`ahu`, `manutara`) and parallelism with the **Hanga Roa**
-milestone (m11 diagnostics + lsp + repl + reuse-in-place — see
-`docs/roadmap.md` §`Hanga Roa`).
+milestone (m11 diagnostics + lsp + reuse-in-place — see
+`docs/roadmap.md` §`Hanga Roa`; REPL removed permanently per
+#406 and `docs/decisions/repl-removal-2026-05-09.md`).
 
 ### Tier S1 — blocks `ahu` / `manutara`, runs parallel with Hanga Roa start
 
@@ -231,7 +232,7 @@ design surface on its own.
 ```
                   Hanga Roa milestone
                   ┌──────────────────────────────────┐
-  ──── 0.37.0 ───►│ m11 │ kai lsp │ repl │ reuse-IP │──► 1.0.0 (Orongo)
+  ──── 0.37.0 ───►│ m11 │ kai lsp ✓ │ reuse-IP ✓   │──► 1.0.0 (Orongo)
                   └──────────────────────────────────┘
                           │              │
         Tier S1 ──────────┘              │
@@ -244,6 +245,11 @@ design surface on its own.
         Tier S3 ───────────────────────────────────► (post-1.0)
         (net/udp, net/dns, http2/3, crypto/aead, sql, parallel)
 ```
+
+`kai lsp` ✓ shipped v0.75.0 → v0.79.0 (issue #447). REPL is not
+on the diagram: removed permanently per #406. `reuse-in-place` ✓
+shipped (issue #210 closed 2026-05-06; #118 + #209 extended to
+linearly-unique spines).
 
 S1 starts immediately (parallel lanes spawned 2026-05-02). S2
 opens once S1 is in CI. S3 stays gated behind Orongo — no agent

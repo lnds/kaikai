@@ -437,7 +437,7 @@ declare `/ Stdin`.
 
 - `os.env` — `get`, `set`, `unset`, `entries` *(shipped via PR #131 + PR #143; closes #127 — `entries` was renamed from `all` because the bare `all` collided with `list.all` for any caller importing both)*
 - `os.args` — `argv`, `program_name` *(shipped via PR #131 + PR #143)*
-- `os.process` — `start(cmd, args)`, `wait`, `kill`, `exit` *(shipped — closes #346; 4 public fns wrapping the four ops of `Process`. `wait_or_kill`, `pipe_stdout`, `pipe_stdin`, `signal` deferred — pipe redirection requires runtime work and `wait_or_kill` is best landed once the m8.x scheduler delivers Cancel into a fiber-suspended wait.)*
+- `os.process` — `start(cmd, args)`, `wait`, `kill`, `exit` *(shipped — closes #346; 4 public fns wrapping the four ops of `Process`. `wait_or_kill`, `pipe_stdout`, `pipe_stdin`, `signal` still deferred — pipe redirection requires runtime work; `wait_or_kill` is now unblocked (R1 reactor shipped 2026-05-15, #611, parks the fiber on `Process.wait` via SIGCHLD self-pipe) and waits on the cancel-aware wrapper, see `docs/effects-stdlib.md` §`Process` v1-status sidebar.)*
 - `os.exit` — physically `process.exit` *(shipped via #346)*. Takes an exit code. Effect: `/ Process` (exiting is observable). Top-level alias `os.exit` (calling `exit(7)` without the `process.` qualifier) is a module-system design decision pending in stage 2; until then, `process.exit(code)` is the surface.
 
 ### time (`/ Clock`)
@@ -471,7 +471,7 @@ security-sensitive code paths.
 
 > **v1 caveat (2026-05-08).** The `Net = NetTcp + NetUdp + NetDns` alias is forward-looking. Only `NetTcp` exists as a builtin and a runtime handler today; `NetUdp` and `NetDns` have no compiler builtin, no runtime, no module file. See `docs/effects-stdlib.md` §`NetTcp` v1-status sidebar for the reactor status.
 
-- `net.tcp` — `connect`, `listen`, `accept`, read/write *(shipped — PR #68; v1 default handler blocks the OS thread, no kqueue/epoll reactor — see effects-stdlib.md sidebar)*
+- `net.tcp` — `connect`, `listen`, `accept`, read/write *(shipped — PR #68; R2 reactor flipped the default handler to fiber-parking via `poll()` 2026-05-16, issue #630 — every blocking op parks the fiber, never the OS thread)*
 - `net.udp` — `bind`, `send`, `recv` *(planned, no tracking issue — Tier S3, post-1.0)*
 - `net.dns` — `resolve`, `resolve_all`, `reverse_lookup` *(planned, no tracking issue — Tier S3; today `net.http` falls back to libc `getaddrinfo` via FFI)*
 - `net.url` — pure: `parse`, `format`, `join`, `query_*` *(planned — `http_parse_url` exists inside `net/http.kai` as a private helper but is not exposed as a `net.url` module)*
