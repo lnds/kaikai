@@ -20,8 +20,10 @@ the m8.x scheduler).
 
 > **Refresh note (issue #604).** Numbers in this section through
 > "Wall time has not moved" reflect the 2026-04-29 baseline. Re-
-> measured 2026-05-16 on HEAD (v0.69.0, post-Phase 3 unboxing +
-> #123 + KAB2 #592):
+> measured 2026-05-16 on then-HEAD v0.69.0 (post-Phase 3 unboxing
+> + #123 + KAB2 #592); the figures still hold against current
+> HEAD v0.79.0 — the v0.70 → v0.79 wave shipped LSP and JSON
+> flags but did not touch the RC discipline:
 >
 > - Full selfhost (`make -C stage2 selfhost` from clean
 >   `stage2/build/`, i.e. kaic0 → kaic1 → kaic2 + fixed-point

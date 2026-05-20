@@ -193,9 +193,9 @@ arguments:
   - **Mandatory annotation on public signatures** (module exports, APIs): effects are part of the contract.
   - Fits LLVM (CPS over segmented stacks) and the LLM-friendly / easy-to-learn principles.
 - **Core tooling**: single `kai` binary with subcommands (Go/Rust/Zig style).
-  - MVP essentials: `kai build`, `kai run`, `kai test`, `kai fmt`.
-  - Mid-term: `kai lsp` (Language Server Protocol — universal editor support), `kai doc`.
-  - Long-term: `kai new`, `kai add` (package manager as separate project).
+  - MVP essentials: `kai build`, `kai run`, `kai test`, `kai fmt`, `kai bench`, `kai check`.
+  - **Shipped (Hanga Roa)**: `kai lsp` (Language Server Protocol — universal editor support; v1 → v3 via issue #447, v0.75.0 → v0.79.0), `kai init` / `kai add` / `kai install` / `kai update` / `kai show` (package manager v1, issue #405).
+  - Long-term: `kai new` (project scaffolding), `kai doc`, registry abstraction.
   - **Out of scope (permanently)**: `kai repl`. Removed from v1.0 per #406 and not planned for v1.x or v2. See `docs/decisions/repl-removal-2026-05-09.md` for the rationale. The `kai run` + `kai watch` workflow replaces the REPL use case.
   - Motivation: LLM-friendly (predictable commands, LSP provides immediate feedback), zero ecosystem fragmentation, trivial install.
 - **FFI / Interop**: crossing to C is expressed as the **`Ffi` effect capability**.
@@ -342,7 +342,9 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 
 `Map[K, V]` and full effects-aware stdlib (`Mutable`, `State[T]`, `Reader[T]`, `Writer[W]`, `Fail`, `Cancel`, `Spawn`, `Ffi`) land in stage 2 — m7a (mechanics) and m7b (sugars). The actor surface (`Actor[Msg]`, `Pid[Msg]`, mailbox policies, link/monitor) lands in m8 alongside the fiber scheduler. See the post-MVP list below for the deliverables.
 
-**Post-MVP** (out of immediate scope):
+**Post-MVP** (out of immediate scope at the time this section
+was first pinned; many items below have since shipped — see
+`docs/roadmap.md` for the current snapshot):
 - Stage 2 with LLVM backend directly, full Perceus, effect inference, fibers, BEAM-style scheduler.
 - **Effects system** — three pinned design docs:
   - `docs/effects.md` (Doc A): rows, unification, syntax, `handle` / `resume`, inference. The mental model.
@@ -353,7 +355,7 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 - **Structured concurrency** (`docs/structured-concurrency.md`): nursery-scoped fibers, `Spawn` / `Cancel` as effects, region-branded `Fiber[T]` that cannot escape its scope. Built on top of the effects + handlers machinery; lands in m8.
 - **Actors** (`docs/actors.md`): `Actor[Msg]` effect with typed mailboxes, link/monitor supervision, `Pid[Msg]` as a region-branded handle. Lands in m8 alongside the scheduler.
 - Elm/Rust-level error messages as an explicit design investment (not a "feature" — a quality bar for every diagnostic).
-- `kai fmt`, `kai lsp`. (`kai repl` removed permanently per #406 / `docs/decisions/repl-removal-2026-05-09.md`.)
+- `kai fmt` (shipped v0.24.0), `kai lsp` (shipped v0.75.0 → v0.79.0, issue #447). `kai repl` removed permanently per #406 / `docs/decisions/repl-removal-2026-05-09.md`.
 - Property testing (`check`), benchmarks (`bench`), snapshots.
 - FFI binding generator.
 - More targets (Linux arm64, macOS x86_64, Windows).

@@ -102,7 +102,7 @@ supported path.
 
 ```sh
 kai --version
-# kaikai 0.52.0 (stage 2, self-hosted)
+# kaikai 0.79.0 - hanga-roa (stage 2, self-hosted)
 
 kai run examples/minimal/hello.kai
 # Hello, kaikai

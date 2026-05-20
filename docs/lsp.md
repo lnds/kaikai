@@ -140,25 +140,43 @@ lspconfig.kaikai.setup({})
 (add-to-list 'eglot-server-programs '(kaikai-mode . ("kai" "lsp")))
 ```
 
-## Known v1 limitations
+## Known v3 limitations
 
-* **Goto-definition is not implemented.** The `def_at` query exists
-  in the compiler (probe `# @probe def L:C`) but the LSP handler
-  is not wired yet. Tracking under #447.
-* **No `publishDiagnostics`.** Errors are not surfaced to the
-  editor. Pending the migration of compiler diagnostics from
-  `stderr` to the structured `--diags-json` path (#487).
+The v1 limitations around goto-def and publishDiagnostics are
+closed (see the status sidebar above). The limitations that
+remain:
+
 * **ASCII-only positions.** LSP uses UTF-16 code units for line
   characters; kaikai uses byte offsets. Files with non-ASCII
   content will misalign for multi-byte characters. Tracked in
   #447 step 4.
 * **No cross-file resolution.** A hover on an imported symbol
   resolves only if its definition is part of the open document.
+  Goto-definition follows user-authored decls in the current file
+  (prefers `module_origin = None` matches) but cross-module
+  resolution is LSP v4 work.
 * **No incremental sync.** Every `didChange` ships the full text.
   Acceptable for files under a few hundred KB.
-* **One probe per hover.** No caching between hovers; each request
-  re-types the file. Acceptable while compile time stays under
-  20 ms for sub-1 kLOC files.
+* **One probe per request.** No caching between hovers /
+  completions / signature lookups; each request re-types the
+  file. Acceptable while compile time stays under 20 ms for
+  sub-1 kLOC files; #452 Phase B (user-file incremental cache)
+  is the long-term answer.
+* **Completion is top-level only.** User fns + stdlib + prelude
+  builtins (~445 items by default). Locals, params, and field
+  completion after `.` are not yet wired — `.` is announced as a
+  trigger but the server returns the same top-level set.
+* **`activeParameter` is static in signature help.** Hardcoded to
+  index 0; the dynamic tracking that highlights the current
+  argument is not yet implemented.
+* **`DType` decls are not in the outline.** The elaborator drops
+  them before `documentSymbol` walks the decl list. Pending
+  follow-up on the parser-vs-elaborator split.
+* **Diagnostic coverage is partial.** Only the T1–T5 *error*
+  diagnostics migrated to the structured collector are visible
+  (~11 of 239 emit sites); the rest still print to stderr.
+* **No references, rename, workspace symbols, or inlay hints.**
+  All deferred to LSP v4.
 
 ## Environment variables
 
@@ -189,6 +207,10 @@ release.
 
 ## Roadmap
 
-Goto-def → publishDiagnostics → multi-file project mode → semantic
-tokens → completion → signature help. Tracked in #447; each step
-is a separate PR-sized lane.
+v1 (hover) → v2 (goto-def + publishDiagnostics + documentSymbol,
+shipped 2026-05-09) → v3 (completion + signatureHelp + hole
+warning diagnostics, shipped 2026-05-11 → 2026-05-20). Next
+candidates for v4: cross-file resolution, locals/params in
+completion scope, field completion after `.`, references,
+rename, workspace symbols, inlay hints. Each step is a separate
+PR-sized lane; tracked in #447.
