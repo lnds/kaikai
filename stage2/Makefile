@@ -2526,6 +2526,25 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (Signal.on/off/await: SIGINT trap → clean exit 0)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
+	for f in ../examples/effects/m8x_signal_await_parks.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  $(CC) $(CFLAGS) ../tests/sigharness.c -o build/s2-$$name.harness $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (harness compile failed)"; exit 1; }; \
+	  ./build/s2-$$name.harness ./build/s2-$$name > build/s2-$$name.out 2>&1; \
+	  rc=$$?; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo "effects FAIL $$name (harness rc=$$rc — expected 0; R4 reactor parking proof)"; \
+	    cat build/s2-$$name.out; exit 1; \
+	  fi; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (R4: Signal.await() parks fiber; compute fiber interleaves)" \
+	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
 	for f in ../examples/effects/process_basic.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \

@@ -1072,31 +1072,44 @@ effect Signal {
   be delivered with the default disposition as soon as `off`
   returns; for SIGINT/SIGTERM that means the program dies. Call
   `await` to drain the queue first when this matters.
-- `await()` blocks the current OS thread until any subscribed
+- `await()` parks the calling fiber until any subscribed
   signal arrives, then returns the corresponding `Sig` variant.
-  An empty subscription set is treated as `{SigInt}` so a
-  programmer who forgot `on()` still wakes on Ctrl-C.
+  Other fibers in the same nursery (or anywhere in the program)
+  keep making progress while this fiber is parked. An empty
+  subscription set is treated as `{SigInt}` so a programmer who
+  forgot `on()` still wakes on Ctrl-C.
 
 ### Default handler
 
 Runtime-installed around `main` when `Signal` is in the row.
-Implementation: `sigprocmask(SIG_BLOCK, ...)` for `on`, the
-matching unblock for `off`, and `sigwait(2)` for `await`.
+Implementation: an async-signal-safe `sa_handler` writes the
+`signo` to a reactor self-pipe; the scheduler's `poll()` loop
+reads the byte and promotes the parked waiter on its next round.
 
-`sigwait` is synchronous and runs on the calling thread. The
-implementation chose it over an async `sa_handler` + drain-on-
-yield-point because building a `KaiValue` variant in a signal
-handler is not async-signal-safe; the BEAM-style `on_cancel(sig)`
-shape sketched in issue #107 also requires Cancel to honour
-user-installed handlers on runtime-triggered cancellation, which
-v1 still does not (`docs/fibers-honesty-targets.md` §*Residual
-m8.x items*). The cooperative scheduler shipped in v0.4.0, and the
-reactor (R1+R2+R3, #611/#620/#630, 2026-05-15→2026-05-16) flipped
-`File`/`Clock`/`Process`/`Stdin`/`NetTcp` to park the fiber — but
-`Signal.await` was deliberately left out of that surface (the
-sigwait→reactor port would need an SA_RESTART-safe self-pipe shape
-and the `on_cancel(sig)` redesign noted above). For now, `on/off/
-await` keeps its v1 shape.
+> **v1 status (R4 reactor, 2026-05-20).** `Signal.await()` now
+> parks the *fiber* on the reactor's signal self-pipe instead of
+> the calling OS thread (issue #671). Pre-R4 the handler called
+> `sigwait(2)` synchronously, which froze every other fiber until
+> the kernel delivered the signal. The R4 path mirrors the R1
+> SIGCHLD shape: the `sa_handler` writes one byte (= signo) to
+> `kai_reactor_signal_pipe[1]` (which is async-signal-safe per
+> POSIX), and `kai_reactor_signal_drain` promotes the singleton
+> waiter from `poll()` on its next iteration. Building a
+> `KaiValue` variant inside the handler is still not
+> async-signal-safe — the variant is constructed on the waiter
+> path after resume, exactly the same way R3 stdin's `Some(line)`
+> wrapper runs after the fiber wakes. The single-waiter contract
+> matches R3: a second concurrent `Signal.await()` panics with a
+> clear diagnostic. Coverage:
+> `examples/effects/m8x_signal_await_parks.kai` (compute fiber
+> interleaves with the await) and `demos/signal_concurrent`
+> (Spawn.cancel reaches the parked fiber).
+
+The BEAM-style `on_cancel(sig)` shape from issue #107 (signal
+arrival fires `Cancel.raise()` in the calling fiber) still waits
+on the unrelated lane that lets `Cancel` honour user-installed
+handlers on runtime-triggered cancellation
+(`docs/fibers-honesty-targets.md` §*Residual m8.x items*).
 
 ### Platform
 
@@ -1116,13 +1129,16 @@ backends; they are out of scope for the v1 effect.
 
 ### Limitations (v1)
 
-- `await()` blocks the OS thread. Other fibers cannot make
-  progress while it is parked. Acceptable when `main` parks on
-  `Signal.await()` after spawning workers; reactor-driven
-  non-blocking integration with the Spawn scheduler is queued for
-  Orongo (the R1/R2/R3 wave that landed in 2026-05-15→2026-05-16
-  covered `File`/`Clock`/`Process`/`Stdin`/`NetTcp` only — see
-  `docs/fibers-honesty-targets.md`).
+- ~~`await()` blocks the OS thread.~~ Closed by R4 (#671,
+  2026-05-20): the await now parks the fiber on the reactor's
+  signal self-pipe; concurrent fibers progress while it sits
+  there.
+- Only one fiber may sit in `Signal.await()` at a time. The
+  reactor's signal slot is a singleton (the self-pipe byte
+  carries no waiter identity, so two parked fibers would race
+  over who picks it up). A second concurrent `Signal.await()`
+  panics with a clear diagnostic, same shape as R3 stdin.
+  Serialise via an actor or supervisor.
 - SIGCHLD is not exposed — `Process.wait` already reaps
   children internally.
 - Real-time signals (SIGRTMIN+n) and the `siginfo_t` payload

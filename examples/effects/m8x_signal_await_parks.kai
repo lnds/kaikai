@@ -1,0 +1,59 @@
+# Issue #671 — Phase R4 reactor proof: Signal.await() parks the
+# fiber, not the OS thread.
+#
+# Two fibers concurrent through a nursery: one in a Signal.await()
+# loop, one in a compute step loop. Pre-R4, Signal.await()'s
+# sigwait() body froze the entire OS thread — the compute fiber's
+# yields never ran. Post-R4 the await parks on the reactor's signal
+# self-pipe and yields cleanly; the compute fiber runs concurrently
+# until the parent harness delivers SIGTERM.
+#
+# The fixture is harness-driven (tests/sigharness.c): a parent
+# process spawns this binary, waits for the "ready" marker, then
+# sends SIGTERM. The child prints its compute steps + the
+# "got SigTerm" line and exits 0. The golden pins the relative
+# ordering — compute steps interleave with await parking, not
+# starve behind it.
+
+import spawn
+
+fn name_of(s: Sig) : String = match s {
+  SigInt  -> "SigInt"
+  SigTerm -> "SigTerm"
+  SigHup  -> "SigHup"
+  SigUsr1 -> "SigUsr1"
+  SigUsr2 -> "SigUsr2"
+}
+
+# Three yield points. Each one is a chance for the scheduler to
+# resume the signal-awaiting fiber if a signal has arrived. The
+# golden expects all three "compute step" lines BEFORE
+# "got SigTerm" — the harness waits ~50 ms after "ready" before
+# sending the signal, plenty of time for the three steps to run.
+fn compute_loop() : Unit / Spawn + Stdout = {
+  Stdout.print("compute step 1")
+  Spawn.yield()
+  Stdout.print("compute step 2")
+  Spawn.yield()
+  Stdout.print("compute step 3")
+  Spawn.yield()
+}
+
+fn await_loop() : Unit / Signal + Stdout = {
+  Stdout.print("ready")
+  Signal.on(SigTerm)
+  let s = Signal.await()
+  Stdout.print(string_concat("got ", name_of(s)))
+  Signal.off(SigTerm)
+}
+
+fn main() : Int / Spawn + Signal + Stdout = {
+  nursery { n ->
+    let f1 = n.spawn(await_loop)
+    let f2 = n.spawn(compute_loop)
+    n.await(f1)
+    n.await(f2)
+  }
+  Stdout.print("ok")
+  0
+}

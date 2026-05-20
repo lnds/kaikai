@@ -1564,6 +1564,20 @@ static void      kai_reactor_park_socket_read(KaiFiber *f, int fd);
 static void      kai_reactor_park_socket_write(KaiFiber *f, int fd);
 static void      kai_socket_set_nonblock(int fd);
 
+/* Issue #671 — Phase R4: park `f` on the singleton signal waiter
+ * slot and yield. Returns 0 on success, -1 if a second fiber is
+ * already parked (concurrent `Signal.await()` is undefined — v1
+ * panics at the call site with a clear diagnostic, mirroring the
+ * R3 stdin-multiplex contract). The signo arrives on resume via
+ * `f->reactor_wait_status`. */
+static int       kai_reactor_park_signal(KaiFiber *f);
+
+/* Issue #671 — Phase R4: async-signal-safe handler installed for
+ * every subscribed signal. Forward-declared because it is used by
+ * `kai_default_signal_on` (~line 6300) but its body lives down in
+ * the reactor block (~line 7030, alongside kai_reactor_sigchld_handler). */
+static void      kai_reactor_signal_handler(int sig);
+
 static KaiMailbox *kai_mailbox_alloc(void) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
@@ -6253,54 +6267,120 @@ static void _kai_signal_init_subscribed(void) {
     }
 }
 
+/* Issue #671 — Phase R4: install an async-signal-safe sa_handler
+ * for `signo` that writes the signo byte into the reactor's self-
+ * pipe. Replaces v1's sigprocmask-only block, which relied on
+ * sigwait() inside `signal_await` to dequeue. Under R4 the kernel
+ * delivers the signal asynchronously to our handler (write(2) is
+ * async-signal-safe), and the scheduler's poll() loop reads the
+ * byte and wakes the parked fiber. */
+static void _kai_signal_install_handler(int signo) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = kai_reactor_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    /* SA_RESTART so a signal arriving during a syscall in another
+     * thread does not abort that syscall — only the scheduler
+     * thread's poll() needs to wake, and poll() returns -1/EINTR
+     * cleanly on its own. The reactor already runs without
+     * SA_RESTART on SIGCHLD because the wake byte is its own
+     * notification; here SA_RESTART is fine because the wake byte
+     * IS the signal payload. */
+    sa.sa_flags = SA_RESTART;
+    sigaction(signo, &sa, NULL);
+}
+
+static void _kai_signal_uninstall_handler(int signo) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(signo, &sa, NULL);
+}
+
 static KaiValue *kai_default_signal_on(void *self, KaiValue *sig_v, KaiCont *k) {
     (void) self;
     _kai_signal_init_subscribed();
     int signo = _kai_signal_from_variant(sig_v);
     if (signo > 0) {
         sigaddset(&kai_signal_subscribed, signo);
+        /* Make sure the signal is NOT blocked at the process level —
+         * R4 wants the handler to fire, not for the kernel to queue
+         * the signal until sigwait() pulls it. Idempotent. */
         sigset_t one;
         sigemptyset(&one);
         sigaddset(&one, signo);
-        sigprocmask(SIG_BLOCK, &one, NULL);
+        sigprocmask(SIG_UNBLOCK, &one, NULL);
+        _kai_signal_install_handler(signo);
+        /* Ensure the reactor self-pipe exists before any handler can
+         * fire — kai_reactor_init is idempotent so paying the call
+         * here costs nothing if the reactor is already up. */
+        kai_reactor_init();
     }
     return kai_cont_resume(k, kai_unit());
 }
 
-/* off(sig): a pending instance that arrived while blocked is delivered
- * with the default disposition as soon as sigprocmask unblocks —
- * typically killing the program on SIGINT/SIGTERM. Documented in
- * docs/effects-stdlib.md §Signal as a sharp edge. */
+/* off(sig): restore the default disposition. A signal that arrives
+ * after `off` but before the SIG_DFL takes effect is best-effort —
+ * sigaction is atomic w.r.t. the calling thread but not w.r.t.
+ * concurrent signal delivery, the kernel may have already queued
+ * one byte to the self-pipe that the next `signal_await` (if any)
+ * will consume. Documented as a sharp edge in
+ * docs/effects-stdlib.md §Signal. */
 static KaiValue *kai_default_signal_off(void *self, KaiValue *sig_v, KaiCont *k) {
     (void) self;
     _kai_signal_init_subscribed();
     int signo = _kai_signal_from_variant(sig_v);
     if (signo > 0) {
         sigdelset(&kai_signal_subscribed, signo);
-        sigset_t one;
-        sigemptyset(&one);
-        sigaddset(&one, signo);
-        sigprocmask(SIG_UNBLOCK, &one, NULL);
+        _kai_signal_uninstall_handler(signo);
     }
     return kai_cont_resume(k, kai_unit());
 }
 
 /* await(): empty subscribed set adds SIGINT defensively so Ctrl-C
- * still wakes the caller. EINTR / unknown signo: retry. */
+ * still wakes the caller. R4 path: park on the singleton signal
+ * waiter slot, yield to the scheduler, and resume when the reactor
+ * drains the self-pipe. The signo arrives in reactor_wait_status. */
 static KaiValue *kai_default_signal_await(void *self, KaiCont *k) {
     (void) self;
     _kai_signal_init_subscribed();
-    sigset_t wait_set = kai_signal_subscribed;
+    /* Defensive SIGINT subscription if nothing has been on()'d —
+     * mirrors the v1 behaviour so existing code that does
+     * `Signal.await()` directly without `Signal.on(SigInt)` still
+     * traps Ctrl-C. */
     int any = 0;
     for (const KaiSignalEntry *e = kai_signal_entries; e->name; ++e) {
-        if (sigismember(&wait_set, e->signo)) { any = 1; break; }
+        if (sigismember(&kai_signal_subscribed, e->signo)) { any = 1; break; }
     }
-    if (!any) sigaddset(&wait_set, SIGINT);
+    if (!any) {
+        sigaddset(&kai_signal_subscribed, SIGINT);
+        sigset_t one;
+        sigemptyset(&one);
+        sigaddset(&one, SIGINT);
+        sigprocmask(SIG_UNBLOCK, &one, NULL);
+        _kai_signal_install_handler(SIGINT);
+        kai_reactor_init();
+    }
     for (;;) {
-        int sig = 0;
-        int rc  = sigwait(&wait_set, &sig);
-        if (rc == 0 && sig > 0) {
-            KaiValue *v = _kai_signal_to_variant(sig);
+        KaiFiber *me = kai_current_fiber();
+        if (kai_reactor_park_signal(me) != 0) {
+            /* v1 contract: only one fiber may sit in Signal.await()
+             * at a time. The byte in the self-pipe carries no
+             * identity, so two concurrent waiters would race over
+             * who picks it up. Mirrors the R3 stdin-multiplex
+             * panic. */
+            kai_prelude_panic(kai_str(
+                "signal_await: a fiber is already awaiting a signal — "
+                "concurrent Signal.await() is undefined; "
+                "serialize via an actor or supervisor"));
+        }
+        /* Drain set f->reactor_wait_status before unparking. A
+         * spurious wake (signo == 0) loops back and re-parks. */
+        int signo = me->reactor_wait_status;
+        me->reactor_wait_status = 0;
+        if (signo > 0) {
+            KaiValue *v = _kai_signal_to_variant(signo);
             if (v) return kai_cont_resume(k, v);
         }
     }
@@ -6911,6 +6991,16 @@ static void kai_install_fiber_sigsegv_handler(void) {
 static int kai_reactor_sigchld_pipe[2]  = { -1, -1 };
 static int kai_reactor_filepool_pipe[2] = { -1, -1 };
 
+/* Issue #671 — Phase R4 reactor: Signal effect self-pipe. The
+ * sa_handler installed by `signal_on` writes the signo to
+ * kai_reactor_signal_pipe[1] from signal context (one byte per
+ * delivery; write(2) is async-signal-safe per POSIX). The reactor
+ * poll watches the read half and drains it on wake, mapping signo
+ * → variant and waking the parked waiter. Replaces the v1
+ * sigwait body of `kai_default_signal_await` which blocked the
+ * entire OS thread. */
+static int kai_reactor_signal_pipe[2]   = { -1, -1 };
+
 /* Sorted timer-wheel head (intrusive list of parked fibers chained
  * through f->reactor_next, ordered by ascending deadline). Insertion
  * is O(n); for v1 with handfuls of concurrent sleepers this stays
@@ -6945,6 +7035,18 @@ static int       kai_reactor_stdin_orig_flags = -1;
  * for"; pid waiters and socket waiters are mutually exclusive). */
 static KaiFiber *kai_reactor_socket_read_waiters  = NULL;
 static KaiFiber *kai_reactor_socket_write_waiters = NULL;
+
+/* Issue #671 — Phase R4 reactor: Signal waiter slot. Singleton
+ * because only one fiber can sit on `Signal.await()` at a time —
+ * the signo arrives in the self-pipe regardless of which fiber
+ * is waiting, so multiple waiters would race over the byte. A
+ * second concurrent `signal_await` panics with a clear message
+ * (mirrors the stdin-multiplex panic from R3). Wake source is
+ * POLLIN on `kai_reactor_signal_pipe[0]`, drained alongside the
+ * SIGCHLD / file-pool / stdin pipes by `kai_reactor_wait`. The
+ * delivered signo is parked in `f->reactor_data` (a void * slot)
+ * so the await handler can rebuild the variant on resume. */
+static KaiFiber *kai_reactor_signal_waiter = NULL;
 
 /* Aggregate count of fibers parked on any reactor structure.
  * kai_sched_park reads this to decide between "no one can wake us
@@ -6994,6 +7096,22 @@ static void kai_reactor_sigchld_handler(int sig) {
     int saved = errno;
     if (kai_reactor_sigchld_pipe[1] >= 0) {
         ssize_t w = write(kai_reactor_sigchld_pipe[1], &b, 1);
+        (void) w;
+    }
+    errno = saved;
+}
+
+/* Issue #671 — Phase R4: Signal-effect handler. Writes the signo
+ * to the signal self-pipe so the reactor can promote the parked
+ * `Signal.await()` fiber on the next poll wake. The signo fits in
+ * the bottom byte (kai_signal_entries only ever contains values
+ * ≤ SIGUSR2 == 31 on every POSIX system we target). write(2) and
+ * the cast to unsigned char are async-signal-safe. */
+static void kai_reactor_signal_handler(int sig) {
+    int saved = errno;
+    if (kai_reactor_signal_pipe[1] >= 0 && sig > 0 && sig <= 255) {
+        unsigned char b = (unsigned char) sig;
+        ssize_t w = write(kai_reactor_signal_pipe[1], &b, 1);
         (void) w;
     }
     errno = saved;
@@ -7121,6 +7239,40 @@ static int kai_reactor_filepool_drain(void) {
     return woken;
 }
 
+/* Issue #671 — Phase R4: drain the Signal self-pipe and promote
+ * the parked `Signal.await()` waiter (if any). The first byte
+ * pulled is the delivered signo; subsequent bytes mean another
+ * signal arrived while the first one was still queued — those
+ * are discarded under v1's "single waiter, single fire" contract.
+ * If no fiber is parked at drain time the signo is also discarded;
+ * `signal_await` documents the race (a signal that arrived before
+ * the first await call is lost). The matching `kai_reactor_signal_*`
+ * design comment in stage0/runtime.h covers the trade-off. */
+static int kai_reactor_signal_drain(void) {
+    if (kai_reactor_signal_pipe[0] < 0) return 0;
+    int signo = 0;
+    unsigned char buf[64];
+    for (;;) {
+        ssize_t n = read(kai_reactor_signal_pipe[0], buf, sizeof(buf));
+        if (n <= 0) break;
+        /* Keep the most recent signo from this batch; v1 collapses
+         * concurrent deliveries to one wake. */
+        if (n > 0) signo = (int) buf[n - 1];
+    }
+    if (signo == 0)                 return 0;
+    if (!kai_reactor_signal_waiter) return 0;
+    KaiFiber *f = kai_reactor_signal_waiter;
+    kai_reactor_signal_waiter = NULL;
+    /* Stash the signo in reactor_wait_status so the await handler
+     * can recover it on resume. Re-use of the slot is safe: the
+     * fiber is parked on a singleton waiter, never simultaneously
+     * on a pid / socket waiter. */
+    f->reactor_wait_status = signo;
+    kai_reactor_parked_count--;
+    kai_sched_unpark(f);
+    return 1;
+}
+
 /* File-pool worker loop. Pops items off the FIFO queue, runs the
  * work function on the worker thread (so the blocking syscall stays
  * off the scheduler thread), publishes the result, and writes one
@@ -7203,18 +7355,20 @@ static void kai_reactor_init(void) {
     if (initialized) return;
     initialized = 1;
 
-    /* Self-pipes for the two wake sources. O_NONBLOCK so the
-     * SIGCHLD handler and worker threads never block; O_CLOEXEC
-     * so a forked child does not inherit them. */
-    if (pipe(kai_reactor_sigchld_pipe) != 0 ||
-        pipe(kai_reactor_filepool_pipe) != 0) {
+    /* Self-pipes for the three wake sources (SIGCHLD, file-pool,
+     * Signal R4). O_NONBLOCK so handlers and worker threads never
+     * block; O_CLOEXEC so a forked child does not inherit them. */
+    if (pipe(kai_reactor_sigchld_pipe)  != 0 ||
+        pipe(kai_reactor_filepool_pipe) != 0 ||
+        pipe(kai_reactor_signal_pipe)   != 0) {
         fprintf(stderr, "kai: reactor pipe() failed: %s\n", strerror(errno));
         exit(1);
     }
-    for (int i = 0; i < 2; i++) {
-        int fds[2][2] = {
+    for (int i = 0; i < 3; i++) {
+        int fds[3][2] = {
             { kai_reactor_sigchld_pipe[0],  kai_reactor_sigchld_pipe[1]  },
             { kai_reactor_filepool_pipe[0], kai_reactor_filepool_pipe[1] },
+            { kai_reactor_signal_pipe[0],   kai_reactor_signal_pipe[1]   },
         };
         for (int p = 0; p < 2; p++) {
             int fd = fds[i][p];
@@ -7330,6 +7484,21 @@ static void kai_reactor_park_pid(KaiFiber *f, int pid) {
 static int kai_reactor_park_stdin(KaiFiber *f) {
     if (kai_reactor_stdin_waiter != NULL) return -1;
     kai_reactor_stdin_waiter = f;
+    kai_reactor_parked_count++;
+    kai_sched_park();
+    return 0;
+}
+
+/* Issue #671 — Phase R4: park `f` on the singleton Signal waiter
+ * slot. Returns 0 on success, -1 if another fiber is already
+ * parked (the caller panics with a clear diagnostic, same shape
+ * as the R3 stdin contract). On resume the delivered signo lives
+ * in `f->reactor_wait_status`; the await handler maps it back to
+ * the matching variant. */
+static int kai_reactor_park_signal(KaiFiber *f) {
+    if (kai_reactor_signal_waiter != NULL) return -1;
+    f->reactor_wait_status = 0;
+    kai_reactor_signal_waiter = f;
     kai_reactor_parked_count++;
     kai_sched_park();
     return 0;
@@ -7485,7 +7654,11 @@ static void kai_reactor_wait(void) {
      * more than ~16 fds are live. */
     int nread  = kai_reactor_count_socket_waiters(kai_reactor_socket_read_waiters);
     int nwrite = kai_reactor_count_socket_waiters(kai_reactor_socket_write_waiters);
-    int max_fds = 2 + 1 + nread + nwrite;
+    /* 3 self-pipes (sigchld + filepool + signal) + optional stdin
+     * (R3) + optional signal-waiter pipe (R4 — same fd as the
+     * self-pipe, but kept in the count for clarity). socket waiters
+     * grow the set per (fd, direction). */
+    int max_fds = 3 + 1 + nread + nwrite;
     struct pollfd  stack_pfds[16];
     struct pollfd *pfds = stack_pfds;
     int heap_alloced = 0;
@@ -7507,6 +7680,18 @@ static void kai_reactor_wait(void) {
     }
     if (kai_reactor_filepool_pipe[0] >= 0) {
         pfds[nfds].fd = kai_reactor_filepool_pipe[0];
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    /* Issue #671 — Phase R4: signal self-pipe stays in the poll
+     * set for the lifetime of the process. A signal that arrives
+     * with no parked waiter is dropped by the drain — that races
+     * the v1 sigwait body exactly the same way (an unblocked signal
+     * arriving before sigwait() was lost too); the new path adds
+     * no new strand-against-handler hazard. */
+    if (kai_reactor_signal_pipe[0] >= 0) {
+        pfds[nfds].fd = kai_reactor_signal_pipe[0];
         pfds[nfds].events = POLLIN;
         pfds[nfds].revents = 0;
         nfds++;
@@ -7558,6 +7743,8 @@ static void kai_reactor_wait(void) {
                 kai_reactor_sigchld_drain();
             } else if (pfds[i].fd == kai_reactor_filepool_pipe[0]) {
                 kai_reactor_filepool_drain();
+            } else if (pfds[i].fd == kai_reactor_signal_pipe[0]) {
+                kai_reactor_signal_drain();
             } else if (pfds[i].fd == STDIN_FILENO &&
                        kai_reactor_stdin_waiter != NULL) {
                 /* Issue #620 — readiness event on stdin: promote
