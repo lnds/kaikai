@@ -660,23 +660,189 @@ fn handle_did_change(state: ServerState, kaic2: String, msg: String)
   }
 }
 
-# Run --diags-json against the current text and build a
-# textDocument/publishDiagnostics notification body. Empty
+# Run --diags-json AND --holes-json against the current text and
+# build a textDocument/publishDiagnostics notification body. Empty
 # diagnostics arrays clear previously-published markers — required
 # semantics per the LSP spec, and how editors un-highlight a line
 # once the user fixes the error.
+#
+# Holes get severity=Warning (2) because they don't prevent
+# compilation today (the binary panics at runtime if reached). The
+# diagnostic message carries the inferred type so the user sees
+# *what* to fill in without leaving the editor.
 fn publish_diagnostics_notification(kaic2: String, uri: String, text: String)
   : String / File + Process = {
   let diags_json = run_diags_json(kaic2, text)
-  let diags = decode_diagnostics(diags_json)
+  let diags_arr = decode_diagnostics(diags_json)
+  let holes_json = run_holes_json(kaic2, text)
+  let holes_arr = decode_hole_diagnostics(holes_json)
+  let combined = combine_diag_arrays(diags_arr, holes_arr)
   let params = json_obj([
     ("uri", json_str(uri)),
-    ("diagnostics", diags)
+    ("diagnostics", combined)
   ])
   json_obj([
     ("jsonrpc", json_str("2.0")),
     ("method", json_str("textDocument/publishDiagnostics")),
     ("params", params)
+  ])
+}
+
+# Concatenate two JSON array strings of the shape "[...]". Skipping
+# the parse round-trip keeps this O(n) and lets us reuse the
+# already-encoded entries from both producers.
+fn combine_diag_arrays(a: String, b: String) : String = {
+  let an = string_length(a)
+  let bn = string_length(b)
+  # Both inputs are guaranteed to be "[" + body + "]" by their
+  # producers. Slice off the brackets and rejoin.
+  let a_body = if an < 2 { "" } else { string_slice(a, 1, an - 2) }
+  let b_body = if bn < 2 { "" } else { string_slice(b, 1, bn - 2) }
+  let sep =
+    if string_length(a_body) > 0 and string_length(b_body) > 0 { "," }
+    else { "" }
+  string_concat("[", string_concat(a_body, string_concat(sep, string_concat(b_body, "]"))))
+}
+
+# Spawn `kaic2 --holes-json <tmp>` and parse the result into an
+# LSP-compatible warning-Diagnostic array. Each hole becomes one
+# entry with severity=2 (Warning) and a message of the form
+#   unfilled hole [?name] : <expected_type>
+# carrying the same info the runtime panic now reports (kaikai
+# v0.77.1), so the editor surface matches the compile-time and
+# runtime experience.
+fn run_holes_json(kaic2: String, text: String) : String / File + Process = {
+  let tmp = tempfile_path("holes-src")
+  let out = tempfile_path("holes-out")
+  match File.write_file(tmp, text) {
+    Err(_) -> "[]"
+    Ok(_)  -> {
+      let cmd = string_concat(shell_escape(kaic2),
+        string_concat(" --holes-json ",
+          string_concat(shell_escape(tmp),
+            string_concat(" > ",
+              string_concat(shell_escape(out), " 2>/dev/null")))))
+      let child = process.start("/bin/sh", ["-c", cmd])
+      match process.wait(child) {
+        Err(_) -> "[]"
+        Ok(_)  -> {
+          match File.read_file(out) {
+            Err(_) -> "[]"
+            Ok(blob) -> blob
+          }
+        }
+      }
+    }
+  }
+}
+
+# The holes-json payload is a top-level JSON array of objects.
+# Each object has at least:
+#   {"line": N, "col": N, "name": "..." | null, "expected_type": "..."}
+# (`in_scope` and `message` exist too but are not used here — the
+# scope would balloon the diagnostic message past usable size; the
+# user can run `kai build --holes-json` to inspect it in full.)
+fn decode_hole_diagnostics(blob: String) : String =
+  string_concat("[", string_concat(decode_holes_loop(blob, 0, ""), "]"))
+
+fn decode_holes_loop(blob: String, start: Int, acc: String) : String {
+  let i = match find_hole_entry(blob, start) {
+    Some(p) -> p
+    None    -> 0 - 1
+  }
+  if i < 0 {
+    acc
+  } else {
+    let close = find_matching_brace(blob, i + 1, string_length(blob))
+    if close < 0 {
+      acc
+    } else {
+      let entry = string_slice(blob, i, (close + 1) - i)
+      let one = decode_one_hole(entry)
+      let sep = if string_length(acc) == 0 { "" } else { "," }
+      decode_holes_loop(blob, close + 1, string_concat(acc, string_concat(sep, one)))
+    }
+  }
+}
+
+# Each hole object starts with `{"file":` per the kaic2 emitter.
+fn find_hole_entry(blob: String, start: Int) : Option[Int] {
+  let a = string_index_of_from(blob, "{\"file\": \"", start)
+  let b = string_index_of_from(blob, "{\"file\":\"", start)
+  match (a >= 0, b >= 0) {
+    (true, true)  -> if a < b { Some(a) } else { Some(b) }
+    (true, false) -> Some(a)
+    (false, true) -> Some(b)
+    _ -> None
+  }
+}
+
+fn extract_hole_name(entry: String) : Option[String] = {
+  # Find the literal `"name":` marker that introduces the hole's
+  # own name field (the *first* one in the entry; `in_scope`
+  # objects appear later).
+  let marker = "\"name\":"
+  let i = string_index_of(entry, marker)
+  if i < 0 {
+    None
+  } else {
+    let n = string_length(entry)
+    let after = i + string_length(marker)
+    let p = skip_ws(entry, after, n)
+    if p >= n { None }
+    else {
+      let c = string_byte_at_int(entry, p)
+      if c == 110 { None }     # 'n' → null
+      else if c == 34 {        # '"' → string
+        # Reuse the standard string extractor starting at p+1.
+        extract_string_at(entry, p + 1, n, "")
+      } else { None }
+    }
+  }
+}
+
+fn decode_one_hole(entry: String) : String = {
+  let line1 = match extract_int_field(entry, "\"line\":") { Some(n) -> n  None -> 1 }
+  let col1  = match extract_int_field(entry, "\"col\":")  { Some(n) -> n  None -> 1 }
+  # Holes can be anonymous (`name: null`) or named (`name: "foo"`).
+  # We have to look at what follows the literal `"name":` marker — if
+  # the next non-whitespace byte is `n` (start of `null`), the hole
+  # is anonymous. Otherwise it's a quoted string. Without this guard
+  # the loose `extract_first_string_field("\"name\": \"")` walks
+  # past `name: null` and matches the next `"name"` it finds — which
+  # for hole entries is the first `in_scope` element's name. The
+  # symptom is anonymous holes mis-labelled with a stray binding name.
+  let name_opt = extract_hole_name(entry)
+  let ty =
+    match extract_first_string_field(entry, "\"expected_type\": \"") {
+      Some(t) -> t
+      None    -> match extract_first_string_field(entry, "\"expected_type\":\"") {
+        Some(t) -> t
+        None    -> "?"
+      }
+    }
+  let label = match name_opt {
+    None    -> "?"
+    Some(n) -> string_concat("?", n)
+  }
+  let msg = string_concat("unfilled hole ",
+    string_concat(label, string_concat(": expected ", ty)))
+  let l0 = line1 - 1
+  let c0 = col1 - 1
+  # Underline the hole's single `?` glyph plus the optional name.
+  let span = match name_opt {
+    None    -> 1
+    Some(n) -> 1 + string_length(n)
+  }
+  let range = json_obj([
+    ("start", json_obj([("line", json_num(l0)), ("character", json_num(c0))])),
+    ("end",   json_obj([("line", json_num(l0)), ("character", json_num(c0 + span))]))
+  ])
+  json_obj([
+    ("range", range),
+    ("severity", json_num(2)),  # Warning
+    ("source", json_str("kaikai")),
+    ("message", json_str(msg))
   ])
 }
 

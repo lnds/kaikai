@@ -37,7 +37,12 @@ $ kai lsp        # block on stdio; reads JSON-RPC frames
   prelude / stdlib decls — `find_decl_def` prefers
   `module_origin = None` matches.
 * **publishDiagnostics** fires on `didOpen` and `didChange`. Driven
-  by `--diags-json`; only the T1–T5 diagnostics migrated to the
+  by `--diags-json` for compile errors and by `--holes-json` for
+  unfilled typed holes. Each hole becomes one Warning-severity
+  diagnostic carrying the inferred type — e.g.
+  `unfilled hole ?conversion: expected Real<F>` — so editors can
+  underline the `?` and agents can read the expected type without
+  shelling out. Only the T1–T5 *error* diagnostics migrated to the
   structured collector are visible (~11 of 239 emit sites — the
   rest still print to stderr). An empty array publishes on a clean
   buffer so previous markers clear.
