@@ -1,0 +1,55 @@
+# demos/signal_concurrent — issue #671 Phase R4 reactor proof.
+#
+# Two fibers in a nursery:
+#   • signal_loop parks on Signal.await() — pre-R4 this would
+#     freeze the entire OS thread inside sigwait().
+#   • compute_loop yields a fixed number of compute steps then
+#     cancels the signal_loop via Spawn.cancel.
+#
+# With the R4 reactor, Signal.await() parks the *fiber* on the
+# reactor's signal self-pipe and yields cleanly; the compute fiber
+# runs three steps concurrently and then issues Spawn.cancel,
+# which the scheduler delivers at the signal-await's park boundary.
+# Pre-R4 the whole nursery froze inside sigwait() and the compute
+# steps never ran (the demo would deadlock or hang at the harness
+# timeout).
+#
+# The fixture is self-terminating — no external signal needed —
+# because `make demos verify` runs the binary stand-alone with no
+# harness, just diffs stdout. The cancel path is the proof that
+# Spawn.cancel reaches a fiber parked in Signal.await().
+
+import spawn
+
+fn signal_loop() : Unit / Signal + Cancel + Stdout = {
+  Stdout.print("signal: parked on Signal.await")
+  Signal.on(SigUsr1)
+  # Without R4, the next line freezes the OS thread until the OS
+  # delivers a signal. With R4, the fiber parks and the compute
+  # fiber gets the CPU. The cancel arrives at this park boundary.
+  let _ = Signal.await()
+  Stdout.print("signal: awoke (unexpected — should be cancelled)")
+}
+
+fn compute_loop(target: Fiber[Unit]) : Unit / Spawn + Stdout + Cancel = {
+  Stdout.print("compute: step 1")
+  Spawn.yield()
+  Stdout.print("compute: step 2")
+  Spawn.yield()
+  Stdout.print("compute: step 3")
+  Spawn.yield()
+  Stdout.print("compute: cancelling signal fiber")
+  Spawn.cancel(target)
+}
+
+fn main() : Int / Spawn + Signal + Cancel + Stdout = {
+  nursery { n ->
+    let sig = n.spawn(signal_loop)
+    let cmp = n.spawn(() => compute_loop(sig))
+    n.await(cmp)
+    # n.await(sig) is implicit on nursery exit; the cancel above
+    # makes sig unwind without raising the unhandled effect.
+  }
+  Stdout.print("ok")
+  0
+}

@@ -15,13 +15,16 @@ inventories what is left after the R2 lane closed (`0.4.0`) and the
 
 ## Where we are today (2026-05-16)
 
-> **Last verified 2026-05-16 (issue #604 docs honesty audit).** The
-> R1+R2+R3 reactor wave landed in this same week (#611, #620, #630,
-> closed 2026-05-15→2026-05-16); the LLVM default-handler trio
-> (Spawn, Cancel, Link/Monitor — #570, #582, #587) closed during
-> the bug-bash week 2026-05-14. The Tier 2 bullets below were
-> spot-checked against runtime symbols, fixtures, and closing PR
-> numbers — all green.
+> **Last verified 2026-05-20.** The R1+R2+R3 reactor wave landed
+> 2026-05-15→2026-05-16 (#611, #620, #630); the LLVM
+> default-handler trio (Spawn, Cancel, Link/Monitor — #570, #582,
+> #587) closed during the bug-bash week 2026-05-14. **R4 reactor
+> (signal trap fiber-aware) shipped 2026-05-20 (issue #671)** —
+> `Signal.await()` now parks the fiber on the reactor's signal
+> self-pipe via an async-signal-safe `sa_handler`; concurrent
+> fibers progress while it sits there. The Tier 2 bullets below
+> were spot-checked against runtime symbols, fixtures, and closing
+> PR numbers — all green.
 
 Tier 1 + Tier 2 closed. The runtime is BEAM-style cooperative
 single-threaded; everything that surfaced in a 30-minute live demo
@@ -79,8 +82,22 @@ or in the 1.0-honesty target list is shipped and verifiable.
   the OS-thread-blocking accept. `Cancel` stays cooperative — a
   fiber parked in a socket op is interrupted at the park boundary,
   not mid-syscall (the mid-syscall redesign with `close(fd)` +
-  `pthread_kill` is Orongo territory). The reactor work for Hanga
-  Roa is closed.
+  `pthread_kill` is Orongo territory).
+- **R4 reactor shipped 2026-05-20 (issue #671)** — `Signal.await()`
+  parks the *fiber* on a singleton `kai_reactor_signal_waiter`
+  slot. The implementation replaces the v1 sigwait body with an
+  async-signal-safe `sa_handler` that writes `signo` to a self-pipe
+  (`kai_reactor_signal_pipe`), drained by the existing `poll()` set
+  on the next loop iteration. The signo is parked in the waiter's
+  `reactor_wait_status` and the await handler builds the matching
+  `Sig` variant on resume (variant construction is not
+  async-safe). Two concurrent `Signal.await()` calls panic with a
+  clear diagnostic, mirroring the R3 stdin contract. Coverage:
+  `examples/effects/m8x_signal_await_parks.kai` (compute fiber
+  interleaves with await) and `demos/signal_concurrent`
+  (Spawn.cancel reaches the parked fiber). This unblocks
+  `lnds/ahu`'s `run_app(root)` spawn+multiplex+cancel pattern and
+  the todo-demo (#606) graceful-shutdown story.
 - §*Residual m8.x items* below now reduces to three minor
   items, none of which surface as runtime errors today.
 
@@ -116,7 +133,8 @@ can be parallelised across short lanes.
 | ~~**Per-op generics in Spawn API**~~ ✅ shipped 2026-05-02 | ~0.5d | TYPE generics retrofitted 2026-04-30 on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk closed in issue #72 — `Spawn.spawn[T, e](f: () -> T / e)` is the canonical entry point, wrappers in `stdlib/spawn.kai` reduced to one-line aliases |
 | ~~**Reactor — Phase R1 (file + sleep + process)**~~ ✅ shipped 2026-05-15 | ~1d | Issue #611. Sorted timer wheel + SIGCHLD self-pipe + 4-worker file pool, woken via a single `poll()` on the scheduler thread. `Clock.sleep_ns`, `File.read_file` / `write_file`, `Process.wait` no longer freeze the scheduler; sockets (`NetTcp`) queue for R2 in Orongo |
 | ~~**Reactor — Phase R3 (stdin)**~~ ✅ shipped 2026-05-15 | ~0.1d | Issue #620. Singleton `kai_reactor_stdin_waiter` slot reuses the existing `poll()` set; fd 0 is flipped to `O_NONBLOCK` once per process with an `atexit`-restored cleanup. `Stdin.read_line` and `Stdin.read_bytes` park on EAGAIN; multiple concurrent readers panic. |
-| ~~**Reactor — Phase R2 (TCP sockets)**~~ ✅ shipped 2026-05-16 | ~0.2d | Issue #630. Per-direction socket waiter lists (`socket_read_waiters` + `socket_write_waiters`) join the existing `poll()` set; every socket fd is `O_NONBLOCK` from creation; `connect` handles `EINPROGRESS` + `SO_ERROR`, `send` loops on partial writes, `accept` / `recv` park on read-readiness. `demos/tcp_concurrent` proves three concurrent handshakes interleave. Closes the reactor for Hanga Roa. |
+| ~~**Reactor — Phase R2 (TCP sockets)**~~ ✅ shipped 2026-05-16 | ~0.2d | Issue #630. Per-direction socket waiter lists (`socket_read_waiters` + `socket_write_waiters`) join the existing `poll()` set; every socket fd is `O_NONBLOCK` from creation; `connect` handles `EINPROGRESS` + `SO_ERROR`, `send` loops on partial writes, `accept` / `recv` park on read-readiness. `demos/tcp_concurrent` proves three concurrent handshakes interleave. |
+| ~~**Reactor — Phase R4 (Signal trap)**~~ ✅ shipped 2026-05-20 | ~0.3d | Issue #671. Singleton `kai_reactor_signal_waiter` + `kai_reactor_signal_pipe` self-pipe in the existing `poll()` set; an async-signal-safe `sa_handler` writes one signo byte, the drain helper maps it to the `Sig` variant on the waiter path (variant alloc is not async-safe in the handler). Closes `lnds/ahu` `run_app` blocker and the todo-demo graceful shutdown story (#606). Closes the reactor for Hanga Roa. |
 
 After this set, `docs/effects.md`, `docs/structured-concurrency.md`,
 `docs/actors.md`, and `docs/fibers-impl.md` claims are all
