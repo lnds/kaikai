@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.77.1 (2026-05-20)
+
+### Fixed
+
+- **holes**: include location + inferred type in unfilled-hole panic
+
 ## v0.77.0 (2026-05-20)
 
 ### Added
