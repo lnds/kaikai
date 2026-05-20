@@ -84,6 +84,17 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.80.0 (2026-05-20)
+
+### Added
+
+- **runtime**: R4 reactor — Signal.await() parks the fiber (closes #671)
+- **ci**: package-mode harness — close the package-consumer blind spot (closes #569)
+
+### Fixed
+
+- **release**: strip .github/workflows from public mirror overlay
+
 ## v0.79.0 (2026-05-20)
 
 ### Added
