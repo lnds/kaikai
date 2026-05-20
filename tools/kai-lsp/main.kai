@@ -379,19 +379,44 @@ fn resolve_kaic2() : String / Env = {
 # treats as best-effort partial typing). Errors in process plumbing
 # also fold to None so the LSP never crashes the client.
 fn probe_type(kaic2: String, text: String, line: Int, col: Int)
+  : Option[String] / File + Process =
+  match probe_run(kaic2, text, "type", line, col) {
+    None -> None
+    Some(blob) -> extract_first_type(blob)
+  }
+
+# Goto-definition probe. Returns (file, line, col) of the
+# identifier's defining decl, or None when the cursor is not on a
+# resolved name. Cross-file definitions resolve only when both
+# files were typed in the same compile; in v1 the LSP types just
+# the current file, so cross-file goto-def is best-effort.
+fn probe_def(kaic2: String, text: String, line: Int, col: Int)
+  : Option[(String, Int, Int)] / File + Process =
+  match probe_run(kaic2, text, "def", line, col) {
+    None -> None
+    Some(blob) -> extract_def_loc(blob)
+  }
+
+# Shared runner for both probes. Writes `text` plus a single
+# `# @probe <kind> L:C` line to a tempfile, spawns
+# `kaic2 --library-mode`, captures stdout via shell redirect, and
+# returns the raw JSON. All probe-specific decoding lives in the
+# callers.
+fn probe_run(kaic2: String, text: String, kind: String, line: Int, col: Int)
   : Option[String] / File + Process = {
-  let tag = string_concat(int_to_string(line), string_concat("_", int_to_string(col)))
+  let tag = string_concat(kind,
+    string_concat("-",
+      string_concat(int_to_string(line), string_concat("_", int_to_string(col)))))
   let tmp = tempfile_path(string_concat("src-", tag))
   let out = tempfile_path(string_concat("out-", tag))
-  let probe = string_concat("\n# @probe type ",
-    string_concat(int_to_string(line),
-      string_concat(":", string_concat(int_to_string(col), "\n"))))
+  let probe = string_concat("\n# @probe ",
+    string_concat(kind,
+      string_concat(" ",
+        string_concat(int_to_string(line),
+          string_concat(":", string_concat(int_to_string(col), "\n"))))))
   match File.write_file(tmp, string_concat(text, probe)) {
     Err(_) -> None
     Ok(_)  -> {
-      # `sh -c "<kaic2> --library-mode <tmp> > <out> 2>/dev/null"`.
-      # Shell handles redirection because process.start has no
-      # built-in stdout capture in v1 (#447 follow-up).
       let cmd = string_concat(shell_escape(kaic2),
         string_concat(" --library-mode ",
           string_concat(shell_escape(tmp),
@@ -403,11 +428,65 @@ fn probe_type(kaic2: String, text: String, line: Int, col: Int)
         Ok(_)  -> {
           match File.read_file(out) {
             Err(_) -> None
-            Ok(blob) -> extract_first_type(blob)
+            Ok(blob) -> Some(blob)
           }
         }
       }
     }
+  }
+}
+
+# Decode the `def` probe response: extract {file, line, col} from
+# the first `"def": { ... }` object in the payload. None when the
+# probe returned no definition (cursor not on a resolved name).
+fn extract_def_loc(blob: String) : Option[(String, Int, Int)] {
+  let m = "\"def\": {"
+  let i = string_index_of(blob, m)
+  if i < 0 {
+    None
+  } else {
+    let start = i + string_length(m)
+    let n = string_length(blob)
+    # Constrain the search to the substring between `{` and the
+    # matching `}` so we don't accidentally grab fields from a
+    # sibling object further down the JSON.
+    let close = find_matching_brace(blob, start, n)
+    if close < 0 {
+      None
+    } else {
+      let sub = string_slice(blob, start, close - start)
+      let file_opt =
+        match extract_first_string_field(sub, "\"file\":\"") {
+          Some(f) -> Some(f)
+          None    -> extract_first_string_field(sub, "\"file\": \"")
+        }
+      let line_opt = extract_int_field(sub, "\"line\":")
+      let col_opt = extract_int_field(sub, "\"col\":")
+      match (file_opt, line_opt, col_opt) {
+        (Some(f), Some(l), Some(c)) -> Some((f, l, c))
+        _ -> None
+      }
+    }
+  }
+}
+
+# Brace-matcher for the `def` payload. Starts after the opening
+# `{` (caller passes `i` past the brace) and walks until a balanced
+# `}` is found. Returns the index OF the closing brace, or -1 if
+# the JSON is truncated. v1 ignores strings — kaic2's library-mode
+# output never embeds `{` inside string values, so naive counting
+# is safe.
+fn find_matching_brace(s: String, i: Int, n: Int) : Int =
+  brace_loop(s, i, n, 1)
+
+fn brace_loop(s: String, i: Int, n: Int, depth: Int) : Int {
+  if i >= n { 0 - 1 }
+  else if depth == 0 { i }
+  else {
+    let c = string_byte_at_int(s, i)
+    if c == 123 { brace_loop(s, i + 1, n, depth + 1) }      # {
+    else if c == 125 { brace_loop(s, i + 1, n, depth - 1) }  # }
+    else { brace_loop(s, i + 1, n, depth) }
   }
 }
 
@@ -477,13 +556,19 @@ fn dispatch(state: ServerState, kaic2: String, msg: String)
         # Caller handles the actual exit on shutdown_seen.
         (state, None)
       } else if method == "textDocument/didOpen" {
-        (handle_did_open(state, msg), None)
+        handle_did_open(state, kaic2, msg)
       } else if method == "textDocument/didChange" {
-        (handle_did_change(state, msg), None)
+        handle_did_change(state, kaic2, msg)
       } else if method == "textDocument/didClose" {
         (handle_did_close(state, msg), None)
       } else if method == "textDocument/hover" {
         let body = handle_hover(state, kaic2, msg, id_opt)
+        (state, Some(body))
+      } else if method == "textDocument/definition" {
+        let body = handle_definition(state, kaic2, msg, id_opt)
+        (state, Some(body))
+      } else if method == "textDocument/documentSymbol" {
+        let body = handle_document_symbol(state, kaic2, msg, id_opt)
         (state, Some(body))
       } else {
         # Unknown method — return empty result for requests, ignore
@@ -500,11 +585,13 @@ fn dispatch(state: ServerState, kaic2: String, msg: String)
 fn reply_initialize(id: Option[Int]) : String = {
   let caps = json_obj([
     ("textDocumentSync", json_num(1)),     # 1 = Full sync
-    ("hoverProvider", json_bool(true))
+    ("hoverProvider", json_bool(true)),
+    ("definitionProvider", json_bool(true)),
+    ("documentSymbolProvider", json_bool(true))
   ])
   let info = json_obj([
     ("name", json_str("kai-lsp")),
-    ("version", json_str("0.1.0"))
+    ("version", json_str("0.2.0"))
   ])
   let result = json_obj([
     ("capabilities", caps),
@@ -528,27 +615,162 @@ fn envelope_result(id: Option[Int], result: String) : String = {
   ])
 }
 
-fn handle_did_open(state: ServerState, msg: String) : ServerState = {
+fn handle_did_open(state: ServerState, kaic2: String, msg: String)
+  : (ServerState, Option[String]) / File + Process = {
   match parse_uri_and_text(msg) {
-    None -> state
-    Some((uri, text)) -> ss_with_docs(state, store_put(ss_docs(state), uri, text))
+    None -> (state, None)
+    Some((uri, text)) -> {
+      let new_state = ss_with_docs(state, store_put(ss_docs(state), uri, text))
+      let notif = publish_diagnostics_notification(kaic2, uri, text)
+      (new_state, Some(notif))
+    }
   }
 }
 
-fn handle_did_change(state: ServerState, msg: String) : ServerState = {
-  # textDocument/didChange (Full sync): params.contentChanges[0].text
-  # contains the new full text. We extract the first occurrence of
-  # `"text":"..."` AFTER the version field. For Full sync this is
-  # always the single change entry.
+fn handle_did_change(state: ServerState, kaic2: String, msg: String)
+  : (ServerState, Option[String]) / File + Process = {
   match extract_uri(msg) {
-    None -> state
+    None -> (state, None)
     Some(uri) -> {
       match extract_change_text(msg) {
-        None -> state
-        Some(text) -> ss_with_docs(state, store_put(ss_docs(state), uri, text))
+        None -> (state, None)
+        Some(text) -> {
+          let new_state = ss_with_docs(state, store_put(ss_docs(state), uri, text))
+          let notif = publish_diagnostics_notification(kaic2, uri, text)
+          (new_state, Some(notif))
+        }
       }
     }
   }
+}
+
+# Run --diags-json against the current text and build a
+# textDocument/publishDiagnostics notification body. Empty
+# diagnostics arrays clear previously-published markers — required
+# semantics per the LSP spec, and how editors un-highlight a line
+# once the user fixes the error.
+fn publish_diagnostics_notification(kaic2: String, uri: String, text: String)
+  : String / File + Process = {
+  let diags_json = run_diags_json(kaic2, text)
+  let diags = decode_diagnostics(diags_json)
+  let params = json_obj([
+    ("uri", json_str(uri)),
+    ("diagnostics", diags)
+  ])
+  json_obj([
+    ("jsonrpc", json_str("2.0")),
+    ("method", json_str("textDocument/publishDiagnostics")),
+    ("params", params)
+  ])
+}
+
+# Spawn `kaic2 --diags-json <tmp>` and return the JSON blob (or
+# "{}" when the spawn / read fails — empty diagnostics is the safe
+# fallback for the LSP).
+fn run_diags_json(kaic2: String, text: String) : String / File + Process = {
+  let tmp = tempfile_path("diags-src")
+  let out = tempfile_path("diags-out")
+  match File.write_file(tmp, text) {
+    Err(_) -> "{}"
+    Ok(_)  -> {
+      let cmd = string_concat(shell_escape(kaic2),
+        string_concat(" --diags-json ",
+          string_concat(shell_escape(tmp),
+            string_concat(" > ",
+              string_concat(shell_escape(out), " 2>/dev/null")))))
+      let child = process.start("/bin/sh", ["-c", cmd])
+      match process.wait(child) {
+        Err(_) -> "{}"
+        Ok(_)  -> {
+          match File.read_file(out) {
+            Err(_) -> "{}"
+            Ok(blob) -> blob
+          }
+        }
+      }
+    }
+  }
+}
+
+# Walk the diagnostics array and re-emit each entry as an LSP
+# Diagnostic. The library-mode payload looks like:
+#   {"diagnostics": [{"severity": "error", "file": ..., "line": N,
+#                     "col": N, "message": "...", "related": [...]}]}
+# LSP wants:
+#   {range:{start:{line,character},end:{line,character}}, severity, message}
+# Severity 1 = Error, 2 = Warning, 3 = Information, 4 = Hint.
+fn decode_diagnostics(blob: String) : String =
+  string_concat("[", string_concat(decode_diagnostics_loop(blob, 0, ""), "]"))
+
+fn decode_diagnostics_loop(blob: String, start: Int, acc: String) : String {
+  let i = match find_diag_entry(blob, start) {
+    Some(p) -> p
+    None    -> 0 - 1
+  }
+  if i < 0 {
+    acc
+  } else {
+    let close = find_matching_brace(blob, i + 1, string_length(blob))
+    if close < 0 {
+      acc
+    } else {
+      let entry = string_slice(blob, i, (close + 1) - i)
+      let one = decode_one_diagnostic(entry)
+      let sep = if string_length(acc) == 0 { "" } else { "," }
+      decode_diagnostics_loop(blob, close + 1, string_concat(acc, string_concat(sep, one)))
+    }
+  }
+}
+
+# Decode a single diagnostic JSON fragment (already isolated to a
+# `{ ... }` substring containing the diagnostic). Returns the LSP
+# Diagnostic shape as an encoded JSON object.
+fn decode_one_diagnostic(entry: String) : String = {
+  let sev_str =
+    match extract_first_string_field(entry, "\"severity\": \"") {
+      Some(s) -> s
+      None    -> match extract_first_string_field(entry, "\"severity\":\"") {
+        Some(s) -> s
+        None    -> "error"
+      }
+    }
+  let line1 = match extract_int_field(entry, "\"line\":") { Some(n) -> n  None -> 1 }
+  let col1  = match extract_int_field(entry, "\"col\":")  { Some(n) -> n  None -> 1 }
+  let msg =
+    match extract_first_string_field(entry, "\"message\": \"") {
+      Some(m) -> m
+      None    -> match extract_first_string_field(entry, "\"message\":\"") {
+        Some(m) -> m
+        None    -> ""
+      }
+    }
+  let l0 = line1 - 1
+  let c0 = col1 - 1
+  let range = json_obj([
+    ("start", json_obj([("line", json_num(l0)), ("character", json_num(c0))])),
+    ("end",   json_obj([("line", json_num(l0)), ("character", json_num(c0 + 1))]))
+  ])
+  let sev_code =
+    if sev_str == "error" { 1 }
+    else if sev_str == "warning" { 2 }
+    else if sev_str == "info" { 3 }
+    else { 4 }
+  json_obj([
+    ("range", range),
+    ("severity", json_num(sev_code)),
+    ("source", json_str("kaikai")),
+    ("message", json_str(msg))
+  ])
+}
+
+# Search for `needle` starting at `start`. Returns -1 when not
+# found. Avoids re-slicing the haystack on each call.
+fn string_index_of_from(haystack: String, needle: String, start: Int) : Int {
+  let hn = string_length(haystack)
+  let nn = string_length(needle)
+  if nn == 0 { start }
+  else if start + nn > hn { 0 - 1 }
+  else { string_index_of_loop(haystack, needle, start, hn - nn + 1, nn) }
 }
 
 fn handle_did_close(state: ServerState, msg: String) : ServerState = {
@@ -580,6 +802,202 @@ fn handle_hover(state: ServerState, kaic2: String, msg: String, id: Option[Int])
       }
     }
   }
+}
+
+fn handle_definition(state: ServerState, kaic2: String, msg: String, id: Option[Int])
+  : String / File + Process = {
+  match extract_uri(msg) {
+    None -> reply_null(id)
+    Some(uri) -> {
+      match store_get(ss_docs(state), uri) {
+        None -> reply_null(id)
+        Some(text) -> {
+          let line0 = extract_int_for_key(msg, "\"line\":")
+          let col0 = extract_int_for_key(msg, "\"character\":")
+          match (line0, col0) {
+            (Some(l), Some(c)) -> {
+              let res = probe_def(kaic2, text, l + 1, c + 1)
+              definition_reply(id, uri, res)
+            }
+            _ -> reply_null(id)
+          }
+        }
+      }
+    }
+  }
+}
+
+# Build a Location response. The LSP shape is either a single
+# Location or Location[]. v1 returns a single-element array — most
+# clients accept both and the array form simplifies the future
+# disambiguation case (e.g. ambiguous protocol impls).
+fn definition_reply(id: Option[Int], uri: String,
+                    loc: Option[(String, Int, Int)]) : String {
+  match loc {
+    None -> reply_null(id)
+    Some((file, line, col)) -> {
+      # kaic2 returns 1-indexed line/col; LSP uses 0-indexed.
+      let l0 = line - 1
+      let c0 = col - 1
+      # Map the definition's file. If the probe reported the same
+      # tempfile we generated for the probe, swap it back for the
+      # caller's URI so the editor opens the user's buffer, not
+      # /tmp/kai-lsp-src-*.
+      let mapped_uri =
+        if string_starts_with(file, "/tmp/kai-lsp-src-") { uri }
+        else { string_concat("file://", file) }
+      let range = json_obj([
+        ("start", json_obj([("line", json_num(l0)), ("character", json_num(c0))])),
+        ("end",   json_obj([("line", json_num(l0)), ("character", json_num(c0))]))
+      ])
+      let location = json_obj([
+        ("uri", json_str(mapped_uri)),
+        ("range", range)
+      ])
+      # LSP allows `Location | Location[] | null`. We return the
+      # array form so future multi-target results don't require a
+      # protocol break.
+      let arr = string_concat("[", string_concat(location, "]"))
+      envelope_result(id, arr)
+    }
+  }
+}
+
+fn string_starts_with(s: String, prefix: String) : Bool {
+  let sn = string_length(s)
+  let pn = string_length(prefix)
+  if pn > sn { false }
+  else { string_match_at(s, 0, prefix, 0, pn) }
+}
+
+fn handle_document_symbol(state: ServerState, kaic2: String, msg: String, id: Option[Int])
+  : String / File + Process = {
+  match extract_uri(msg) {
+    None -> reply_null(id)
+    Some(uri) -> {
+      match store_get(ss_docs(state), uri) {
+        None -> reply_null(id)
+        Some(text) -> {
+          # Symbols probe ignores line/col — pin them to 1:1.
+          match probe_run(kaic2, text, "symbols", 1, 1) {
+            None -> reply_null(id)
+            Some(blob) -> {
+              let syms = decode_document_symbols(blob)
+              envelope_result(id, syms)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Decode the `symbols` probe payload into an LSP DocumentSymbol[]
+# response. The library-mode shape is:
+#   "symbols": [{"kind": "Function", "name": "...", "line": N, "col": N}, ...]
+# LSP wants:
+#   [{name, kind:int, range:{start,end}, selectionRange:{start,end}}]
+fn decode_document_symbols(blob: String) : String = {
+  # Skip past the probe wrapper `"symbols": [` and only decode the
+  # entries inside that array, so we don't accidentally match the
+  # outer `{"kind": "symbols", ...}` probe entry as a document
+  # symbol of its own.
+  let m = "\"symbols\": ["
+  let s0 = string_index_of(blob, m)
+  let start = if s0 < 0 { 0 } else { s0 + string_length(m) }
+  string_concat("[", string_concat(decode_symbols_loop(blob, start, ""), "]"))
+}
+
+fn decode_symbols_loop(blob: String, start: Int, acc: String) : String {
+  # Accept both compact (`{"kind":`) and pretty (`{"kind": `) JSON.
+  let i = match find_symbol_entry(blob, start) {
+    Some(p) -> p
+    None    -> 0 - 1
+  }
+  if i < 0 {
+    acc
+  } else {
+    let close = find_matching_brace(blob, i + 1, string_length(blob))
+    if close < 0 {
+      acc
+    } else {
+      let entry = string_slice(blob, i, (close + 1) - i)
+      let one = decode_one_symbol(entry)
+      let sep = if string_length(acc) == 0 { "" } else { "," }
+      decode_symbols_loop(blob, close + 1, string_concat(acc, string_concat(sep, one)))
+    }
+  }
+}
+
+fn find_symbol_entry(blob: String, start: Int) : Option[Int] {
+  let a = string_index_of_from(blob, "{\"kind\": \"", start)
+  let b = string_index_of_from(blob, "{\"kind\":\"", start)
+  match (a >= 0, b >= 0) {
+    (true, true)  -> if a < b { Some(a) } else { Some(b) }
+    (true, false) -> Some(a)
+    (false, true) -> Some(b)
+    _ -> None
+  }
+}
+
+fn find_diag_entry(blob: String, start: Int) : Option[Int] {
+  let a = string_index_of_from(blob, "{\"severity\": \"", start)
+  let b = string_index_of_from(blob, "{\"severity\":\"", start)
+  match (a >= 0, b >= 0) {
+    (true, true)  -> if a < b { Some(a) } else { Some(b) }
+    (true, false) -> Some(a)
+    (false, true) -> Some(b)
+    _ -> None
+  }
+}
+
+fn decode_one_symbol(entry: String) : String = {
+  let kind_str =
+    match extract_first_string_field(entry, "\"kind\": \"") {
+      Some(k) -> k
+      None    -> match extract_first_string_field(entry, "\"kind\":\"") {
+        Some(k) -> k
+        None    -> "Function"
+      }
+    }
+  let name =
+    match extract_first_string_field(entry, "\"name\": \"") {
+      Some(n) -> n
+      None    -> match extract_first_string_field(entry, "\"name\":\"") {
+        Some(n) -> n
+        None    -> "<anon>"
+      }
+    }
+  let line1 = match extract_int_field(entry, "\"line\":") { Some(n) -> n  None -> 1 }
+  let col1  = match extract_int_field(entry, "\"col\":")  { Some(n) -> n  None -> 1 }
+  let l0 = line1 - 1
+  let c0 = col1 - 1
+  let kind_code = symbol_kind_code(kind_str)
+  let range = json_obj([
+    ("start", json_obj([("line", json_num(l0)), ("character", json_num(c0))])),
+    ("end",   json_obj([("line", json_num(l0)),
+                         ("character", json_num(c0 + string_length(name)))]))
+  ])
+  json_obj([
+    ("name", json_str(name)),
+    ("kind", json_num(kind_code)),
+    ("range", range),
+    ("selectionRange", range)
+  ])
+}
+
+# Map LSP SymbolKind strings (kaic2 surface) to LSP wire integers.
+# Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#symbolKind
+fn symbol_kind_code(k: String) : Int {
+  if k == "Function"  { 12 }
+  else if k == "Method"    { 6 }
+  else if k == "Class"     { 5 }
+  else if k == "Interface" { 11 }
+  else if k == "Constant"  { 14 }
+  else if k == "Variable"  { 13 }
+  else if k == "Enum"      { 10 }
+  else if k == "Struct"    { 23 }
+  else { 12 }  # default to Function
 }
 
 fn hover_reply(id: Option[Int], type_opt: Option[String]) : String {
