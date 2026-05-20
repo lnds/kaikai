@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages test-binserialize-budget demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -518,8 +518,8 @@ tier1-backend-parity: kaic2
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
 # commit) but a diagnostic opens a lane the next morning.
-daily: tier1 stress-fixtures coverage-probe rc-budget tier1-asan tier1-backend-parity
-	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget + tier1-asan + tier1-backend-parity"
+daily: tier1 stress-fixtures coverage-probe rc-budget test-binserialize-budget tier1-asan tier1-backend-parity
+	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget + BinSerialize budget + tier1-asan + tier1-backend-parity"
 
 # Stress fixtures: programs that exercise patterns the per-feature
 # suite does not. Some are aspirational (expected to fail until a
@@ -561,6 +561,30 @@ rc-budget: kaic2
 	  exit 1; \
 	fi; \
 	echo "rc-budget OK — leaked $$leaked <= threshold $$threshold"
+
+# BinSerialize perf gate (issue #489). Wall-time ceiling over 100
+# decodes of a 500-node / ~40 KB payload. Tier 2 (not Tier 1)
+# because perf telemetry belongs at daily cadence, not per-PR.
+# Ceiling lives in tools/binserialize-budget.txt; ratchet down as
+# future lanes improve. Guards against silent re-introduction of
+# O(N) shape on the decode path that the round-trip correctness
+# tests would not catch (issue #485 was 19 s; PR #487 dropped that
+# to ~7 ms/decode; the budget defends that work for the cache lanes
+# (#452 Phase A.0 onwards) that build on top of this substrate).
+test-binserialize-budget: kaic2
+	@bin/kai build tools/bench-binserialize-roundtrip.kai -o /tmp/bench-binserialize >/dev/null 2>&1 \
+	  || { echo "binserialize-budget FAIL — build error"; exit 1; }
+	@ceiling=$$(grep -v '^#' tools/binserialize-budget.txt | head -1); \
+	wall_s=$$(/usr/bin/time -p /tmp/bench-binserialize > /dev/null 2>/tmp/binserialize.t \
+	  && awk '/^real/{print $$2}' /tmp/binserialize.t); \
+	wall_ms=$$(awk -v s="$$wall_s" 'BEGIN{printf "%d", s * 1000}'); \
+	per_decode=$$(awk -v ms="$$wall_ms" 'BEGIN{printf "%.2f", ms / 100.0}'); \
+	if [ "$$wall_ms" -gt "$$ceiling" ]; then \
+	  echo "binserialize-budget FAIL — 100 decodes took $${wall_ms} ms (per decode $${per_decode} ms) > ceiling $${ceiling} ms"; \
+	  echo "  expected: PR #487 baseline was ~7 ms/decode; ratchet up only with a documented justification"; \
+	  exit 1; \
+	fi; \
+	echo "binserialize-budget OK — 100 decodes in $${wall_ms} ms ($${per_decode} ms/decode <= $$((ceiling / 100)) ms ceiling)"
 
 # ---- L0 LLVM static prep (issue: LLVM-direct DoD #6 follow-up) ------
 #
