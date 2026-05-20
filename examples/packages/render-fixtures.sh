@@ -29,5 +29,6 @@ render() {
 render simple_dep
 render transitive
 render lockfile_reproducibility
+render auto_install
 
 echo "render-fixtures.sh: OK"

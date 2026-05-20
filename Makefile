@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -168,8 +168,8 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + private-type shadow audit + private-record shadow audit + canonical-only alias audit"
+tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + package-mode harness (issue #569) + private-type shadow audit + private-record shadow audit + canonical-only alias audit"
 
 # Issue #643 — institutional regression gate for the private-type
 # leak fix. `tools/audit-prelude-private-types.sh` walks every
@@ -420,6 +420,20 @@ test-stdlib-modules: kaic2
 	echo ""; \
 	echo "test-stdlib-modules: $$pass / $$total passed, $$fail failed"; \
 	[ "$$fail" -eq 0 ] || exit 1
+
+# Package-mode harness (issue #569). The compiler's self-host
+# never exercises kaikai-as-a-package — stdlib lives flat under
+# `stdlib/`, not behind manifests. Without this harness the entire
+# package-manager surface (manifest discovery, kai-pkg paths,
+# transitive imports, cross-package effects, auto-install) stays
+# a CI blind spot, surfacing regressions only when downstream
+# consumers (ahu, henua, kohau) try to integrate — which is how
+# #565 and #567 shipped to main. The harness lives in tools/ and
+# delegates the 9-category matrix from the issue plus the
+# pre-existing driver-level checks (lockfile_reproducibility,
+# add_failure, init_invalid_names, manifest_parse_error).
+test-packages: kaic2
+	@tools/test-packages.sh
 
 # Tier 2.5 — daily memory-safety gate. Rebuilds the demos/ probe set
 # with `-fsanitize=address,undefined` and runs each binary; fails on
