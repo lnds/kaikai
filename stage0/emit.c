@@ -428,6 +428,7 @@ static const struct {
 } PRELUDE[] = {
     { "print",          "kai_prelude_print",          1 },
     { "eprint",         "kai_prelude_eprint",         1 },
+    { "write_stdout",   "kai_prelude_write_stdout",   1 },
     { "panic",          "kai_prelude_panic",          1 },
     { "exit",           "kai_prelude_exit",           1 },
     { "int_to_string",  "kai_prelude_int_to_string",  1 },

@@ -2873,6 +2873,27 @@ static KaiValue *kai_prelude_eprint(KaiValue *arg) {
     return kai_unit();
 }
 
+/*
+ * Issue #447 (LSP framing): write a String to stdout verbatim with
+ * no trailing newline, then flush. LSP JSON-RPC framing requires the
+ * body to be exactly `Content-Length` bytes; `print` would inject an
+ * extra '\n' that breaks strict clients. Non-String args fall through
+ * `kai_to_string` for safety.
+ */
+static KaiValue *kai_prelude_write_stdout(KaiValue *arg) {
+    if (!arg) { fflush(stdout); return kai_unit(); }
+    if (arg->tag == KAI_STR) {
+        fwrite(arg->as.s.bytes, 1, arg->as.s.len, stdout);
+    } else {
+        KaiValue *s = kai_to_string(arg);
+        fwrite(s->as.s.bytes, 1, s->as.s.len, stdout);
+        kai_decref(s);
+    }
+    fflush(stdout);
+    kai_decref(arg);
+    return kai_unit();
+}
+
 static KaiValue *kai_prelude_panic(KaiValue *msg) {
     fprintf(stderr, "panic: ");
     if (msg && msg->tag == KAI_STR) {
@@ -4554,6 +4575,7 @@ static KaiValue *kai_prelude_string_contains(KaiValue *s, KaiValue *sub) {
 
 static KaiValue *_kai_prelude_print_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_prelude_print(a[0]); }
 static KaiValue *_kai_prelude_eprint_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_eprint(a[0]); }
+static KaiValue *_kai_prelude_write_stdout_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_write_stdout(a[0]); }
 static KaiValue *_kai_prelude_panic_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_prelude_panic(a[0]); }
 static KaiValue *_kai_prelude_exit_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_prelude_exit(a[0]); }
 static KaiValue *_kai_prelude_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_int_to_string(a[0]); }
