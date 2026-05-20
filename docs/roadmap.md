@@ -261,25 +261,26 @@ diagnostic surface stabilised, LSP needs the protocol resolver,
 and `check` v2 (`Arbitrary`) needs `protocol P[A]` plus the
 polymorphic-impl machinery.
 
-**Scope — remaining**:
+**Scope — closure status (refreshed 2026-05-20, HEAD v0.79.0)**:
 
-- m11 diagnostics quality pass — Elm/Rust-grade error
-  messages: "expected `Int`, found `String` at line N" with
-  suggested fix, exhaustiveness counterexamples, scope-aware
-  hole reporting. References `docs/typed-holes.md` for the
-  JSON contract; m11 elevates the human-text side.
-  - **m11 v1 (#445)**: three high-frequency templates —
-    type mismatch (argument index + callee signature),
-    non-exhaustive match (missing variant + covered list +
-    actionable help), unbound name (Levenshtein did-you-mean
-    on a separate `help:` line).
-  - **m11 v1.x (#479)**: two remaining templates — wrong
-    arity (declared arity vs. observed count + signature +
-    split add/remove help) and missing effect (m11-shape
-    upgrade of the existing `effect not handled` site with
-    `missing effect:` and `enclosing row:` notes plus
-    split declare/handle help). Closes the m11 v1 series.
-- ~~`kai lsp`~~ ✅ **shipped v0.75.0 → v0.79.0
+The original Hanga Roa scope was six items: m11 diagnostics, LSP,
+bench v1.x, check shrinking, reuse-in-place, plus the compile-time
+perf chain pinned in DoD #6. Five of those six items have shipped;
+only Phase B of the cache chain (#455) remains load-bearing for
+Hanga Roa closure.
+
+- ~~**m11 diagnostics quality pass**~~ ✅ **shipped 2026-05-03 → 2026-05-15**.
+  Elm/Rust-grade error messages with stable JSON alongside the
+  human-readable text. Three sub-lanes closed:
+  - m11 v1 (#445, `e239d15`): type mismatch + non-exhaustive +
+    unbound name templates.
+  - m11 v1.x (#479, `3273f87`): wrong arity + missing effect
+    templates. Closes the m11 v1 series.
+  - Collectable structured diagnostics (#487, PR #491,
+    `5ffe26c`): T1-T5 emit through the structured collector,
+    consumed by `kai build --diags-json` and by the LSP's
+    `textDocument/publishDiagnostics`.
+- ~~**`kai lsp`**~~ ✅ **shipped v0.75.0 → v0.79.0
   (2026-05-09 → 2026-05-20, issue #447)** — Language Server
   Protocol implementation: hover, goto-definition,
   publishDiagnostics (compile errors + hole warnings),
@@ -288,37 +289,48 @@ polymorphic-impl machinery.
   `--library-mode` from issue #454. Symbol rename and
   cross-file resolution slip to a v4 lane post-Hanga Roa.
   See `docs/lsp.md` for the v3 capability matrix.
-- `bench` v1.x — median + MAD outlier detection,
-  configurable iteration count.
-- `check` v1.x — shrinking. Per-type halving for `Int`,
-  delete-element + per-element for `[T]`, structural for
-  records / sums.
-- Reuse-in-place (Perceus Tier 3a) — constructors reuse
-  consumed cells when alias analysis can prove the old value
-  is dead at the construction site. Big win on linked-list
-  rewrites (`map`, `filter`, `fold`-into-list). Closes the
-  compute-bound side of DoD #3 (gate 3a) and contributes to
-  gate 3b on structural-data traversal.
-  *(Optimization thread for this milestone.)*
+- ~~**`bench` v1.x**~~ ✅ **shipped** (#437, `53a1cbd`):
+  median + MAD outlier detection + configurable iterations +
+  warmup. `kai bench` consumes the new surface.
+- ~~**`check` v1.x — shrinking**~~ ✅ **shipped** (#438,
+  `07424e6`): per-type halving for `Int`, delete-element +
+  per-element for `[T]`, structural reduction for records /
+  sums. Property test failures now report the minimal
+  counterexample.
+- ~~**Reuse-in-place (Perceus Tier 3a)**~~ ✅ **shipped** across
+  three lanes:
+  - #118 (`0c97cb8`): known-unique constructors reuse consumed
+    cells.
+  - #209 (`9baff4e`): resolved `pcs_rewrite_expr` dup
+    interaction so reuse-in-place actually fires.
+  - #210 (`e8cf955`): typer-aware shape predicate enables
+    variant + record reuse-in-place (PR #289).
+- **Compile-time perf chain (DoD #6)** — see §DoD #6 below.
+  Phase A.0 + A.1 + A.2 + KAB2 binary format all shipped; only
+  Phase B (user-file incremental cache, #455) remains. Phase B
+  is the **single load-bearing pre-1.0 item** still open for
+  Hanga Roa closure.
 
-**Definition of Done**:
+**Definition of Done** (closure status refreshed 2026-05-20):
 
-1. Editor with `kai lsp` running shows type on hover, completes
-   record fields, surfaces diagnostics inline.
-2. Property test runner reports the minimal counterexample
-   (post-shrink) on failure.
-3. **Performance, bifurcated by workload class.** Both gates
-   below are required for Hanga Roa to close. The split reflects
-   the architecture: kaikai represents locals unboxed and storage
-   edges boxed; a single performance target cannot honestly cover
-   both unless they share a representation.
+1. ✅ **MET.** Editor with `kai lsp` running shows type on
+   hover, surfaces diagnostics inline, lists outline symbols,
+   triggers completion (top-level), and shows signature help.
+   `kai lsp` v3 shipped v0.75.0 → v0.79.0 (#447); see
+   `docs/lsp.md`. Record-field completion is a deferred v4
+   item (not load-bearing for Hanga Roa close).
+2. ✅ **MET.** Property test runner reports minimal
+   counterexample post-shrink (#438, `07424e6`).
+3. **Performance, bifurcated by workload class.** The split
+   reflects the architecture: kaikai represents locals unboxed
+   and storage edges boxed; a single performance target cannot
+   honestly cover both unless they share a representation.
 
-   3a. **Compute-bound code** (locals + return values, in scope
-       of Phase 2 unboxing): ≤ 1.5–2× C reference under -O2.
-       Acceptance benchmarks: fizzbuzz
-       (`examples/quickstart/02_fizzbuzz.kai`), euler problems,
-       sieve. Phase 2 already landed (M1+M2+M3); gate is
-       achievable in-MVP.
+   3a. ✅ **MET.** Compute-bound code ≤ 1.5–2× C reference
+       under -O2 — actual: **fib(35) = 1.0× C, Euler #4 =
+       1.05× C** post Phase 3 unboxing (#383), see
+       `docs/benchmarks/compute_2026-05-09.md`. Both numbers
+       smash the gate.
 
    3b. **Structural data traversal** (records, variants,
        recursive tree algorithms with mutation-as-rebuild):
@@ -350,18 +362,21 @@ polymorphic-impl machinery.
    `docs/benchmarks/` but is **not featured** in v0.45.0 launch
    surface (kaikai-book, brew landing). Closing #371 details:
    https://github.com/lnds/kaikai/issues/371#issuecomment-4411080979.
-5. Diagnostic quality: a representative ill-typed program
-   produces a message at the bar set by the m11 acceptance
-   fixtures (TBD as part of m11 design).
+5. ✅ **MET.** Diagnostic quality at the m11 bar — type
+   mismatch (#445), non-exhaustive match (#445), unbound name
+   with Levenshtein did-you-mean (#445), wrong arity (#479),
+   missing effect (#479). Both human-readable text and stable
+   JSON (`kai build --diags-json`, via #487).
 
 6. **Compile-time performance — DoD #6 (added 2026-05-11)**:
    - **Tiny program cold compile** (empty fn, no user imports):
-     ≤ 300 ms wall, ≤ 100 MB RSS. Baseline (today): 1.5 s, 286 MB.
-     Target (Go's bar): 300 ms.
+     ≤ 300 ms wall, ≤ 100 MB RSS. Phase A.0 + KAB2 landed
+     2026-05-14 → 2026-05-16 (#452 + #592); re-measure pending
+     post-Phase B.
    - **Incremental recompile** (touch + 0-byte change → rebuild):
-     ≤ 150 ms wall. Today: same 1.5 s (no incremental cache).
+     ≤ 150 ms wall. **Pending Phase B (#455).**
    - **Self-compile** (`make -C stage2 kaic2`): ≤ 5 s wall, ≤ 800 MB
-     RSS. Today: 6.8 s wall, 950 MB RSS.
+     RSS. Original baseline 6.8 s / 950 MB; re-measure pending.
 
    Empirical motivation: `docs/benchmarks/cross_lang_2026-05-10.md`
    measured kaikai at 1.5 s cold (40× slower than `cc -O2`,
@@ -369,25 +384,42 @@ polymorphic-impl machinery.
    stdlib re-parsing on every `kai build` invocation. Required
    lanes (prerequisite chain):
 
-   - #453 — runtime `prelude_read_bytes` (LSP precursor, ~2-4 h) — **shipped**.
-   - #454 — compiler library mode (typed AST retention + span index
-     for queries, ~4-7 days, selfhost waiver). **Shipped** as the
+   - ✅ #453 — runtime `prelude_read_bytes` (LSP precursor) — **shipped**.
+   - ✅ #454 — compiler library mode (typed AST retention + span index
+     for queries, selfhost waiver). **Shipped** as the
      `--library-mode` flag + `compile_to_module` in-process API; see
      `docs/library-mode.md`.
-   - #452 — Phase A stdlib precompiled cache (depends on #454,
-     ~1-2 days). Cold target.
-   - #455 — Phase B user-file incremental cache (depends on #452,
-     ~1-2 days). Recompile target.
+   - ✅ #452 — Phase A.0 stdlib precompiled cache. **Shipped**
+     (`e6f02f9`, `688e666`, `676f4d1`).
+   - ✅ #592 — KAB2 binary on-disk format. **Shipped**
+     (`8b33888`, `3954c21`). Default cache flipped to
+     `KAI_PRELUDE_CACHE=1`.
+   - ✅ #461 — Phase A.1 / A.2 verification (post-perceus cache
+     + emit-only-user). A.1 verified; A.2 still tracked (open).
+   - **#455 — Phase B user-file incremental cache (still
+     OPEN).** Mtime + hash skipping for user modules; the
+     single load-bearing item left to close DoD #6.
 
-   Phase A + Phase B together close DoD #6. #447 (LSP v1) consumes
-   the same query surface from #454 and becomes a thin layer once
-   the chain lands.
+   Phase A is complete; Phase B is the remaining work. #447 (LSP)
+   already consumes the same query surface from #454 and is a
+   thin layer over it today (shipped).
 
-**Estimated cost**: original 4–6 weeks; the precondition chain
-above already absorbed roughly two of those weeks. The six
-remaining items are estimated at **~3–5 weeks** at the agent-pace
-observed since 2026-05-03 — m11 + lsp are still the heaviest
-items; reuse-in-place is the optimization sub-lane.
+**Estimated cost**: original 4–6 weeks. The precondition chain
+absorbed ~2 weeks. The six scope items closed in roughly two
+weeks of agent work (m11 v1+v1.x+collectable, LSP v1→v3, bench
+v1.x, check shrinking, reuse-in-place). Remaining work to close
+Hanga Roa:
+
+- **#455 Phase B incremental cache** (~1-2 days estimated; the
+  single load-bearing item).
+- **DoD #3b** RB-tree perf is **explicitly v1.0-trajectory**,
+  not Hanga Roa (decided 2026-05-09; see the §DoD #3b note).
+  Tracked via #383 (shipped, Int unboxing), #384 (open,
+  variant-reuse borrowed-binds), #593 (open, primitive-slot
+  extract raw).
+
+At current pace, Hanga Roa closes when #455 lands; the perf-side
+items #384 / #593 carry forward to Orongo without blocking.
 
 ### Orongo — 1.0.0
 
