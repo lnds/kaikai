@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.79.0 (2026-05-20)
+
+### Added
+
+- **lsp**: surface unfilled holes as warning diagnostics
+
 ## v0.78.0 (2026-05-20)
 
 ### Added
