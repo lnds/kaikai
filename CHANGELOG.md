@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.78.0 (2026-05-20)
+
+### Added
+
+- **driver**: expose --diags-json / --effects-json / --library-mode via kai build
+
 ## v0.77.1 (2026-05-20)
 
 ### Fixed
