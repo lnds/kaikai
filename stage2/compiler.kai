@@ -63641,6 +63641,28 @@ fn lib_run_probe(tm: TypedModule, raw_decls: [Decl], p: LibProbe) : String {
           ", \"identifier\": ", nm_field,
           ", \"def\": ", lib_json_def(tm.tm_file, dl),
           "}"])
+      } else if kind == "complete" {
+        # LSP completion (issue #447). Enumerate every callable name
+        # in scope at the cursor: top-level decls in the root file
+        # plus prelude / stdlib decls (origin != None). Local
+        # bindings are out of scope for v1 — covering 90% of editor
+        # autocomplete cases.
+        #
+        # Each entry: {name, kind, signature}. The shim layer adds
+        # LSP CompletionItem fields (kind code, sortText, ...).
+        let comps = lib_collect_completions(tm.tm_decls)
+        concat_all([head,
+          ", \"completions\": [", join_with(comps, ", "), "]",
+          "}"])
+      } else if kind == "sig" {
+        # LSP signatureHelp (issue #447). Walk to the innermost ECall
+        # whose argument list contains the cursor; emit the callee's
+        # type so the editor can render the parameter hints. Falls
+        # back to `null` when the cursor isn't inside any call.
+        let sig = lib_signature_at(tm, line, col)
+        concat_all([head,
+          ", \"signature\": ", sig,
+          "}"])
       } else if kind == "symbols" {
         # LSP documentSymbol support (issue #447 step 3). Lists every
         # top-level decl authored in the root file (module_origin =
@@ -63732,6 +63754,241 @@ fn lib_symbol_json(kind: String, name: String, line: Int, col: Int) : String =
     ", \"col\": ", int_to_string(col),
     "}"
   ])
+
+# ----- completion -----
+#
+# Enumerate every top-level decl visible from the cursor: user decls
+# (origin = None) followed by prelude / stdlib decls (origin != None).
+# Each entry carries the decl kind so the LSP shim can map it to the
+# right LSP CompletionItemKind, plus a render-friendly "detail" string
+# the editor shows next to the candidate.
+fn lib_collect_completions(ds: [Decl]) : [String] = {
+  let user_and_stdlib = list_reverse(lib_collect_completions_loop(ds, []))
+  let prelude = lib_collect_prelude_completions()
+  list_append(user_and_stdlib, prelude)
+}
+
+# Builtins injected by `add_prelude_sigs` do NOT live as DFn in the
+# typed-module decl list — they're TyEntry rows added directly to the
+# initial type env. We synthesise CompletionItem-shaped JSON for them
+# from the same env shape, so editors see `print`, `int_to_string`,
+# `read_line`, etc. alongside the user-authored and stdlib decls.
+fn lib_collect_prelude_completions() : [String] = {
+  let env = add_prelude_sigs(ty_env_empty())
+  prelude_entries_to_completions(env.entries, [])
+}
+
+fn prelude_entries_to_completions(entries: [TyEntry], acc: [String]) : [String] {
+  match entries {
+    []           -> list_reverse(acc)
+    [e, ...rest] -> {
+      let ty_str = match e.scheme {
+        Scheme(_, _, _, t) -> ty_to_string(t)
+      }
+      let item = lib_completion_json("Function", e.name, ty_str)
+      prelude_entries_to_completions(rest, [item, ...acc])
+    }
+  }
+}
+
+fn lib_collect_completions_loop(ds: [Decl], acc: [String]) : [String] {
+  match ds {
+    []           -> acc
+    [d, ...rest] -> match lib_decl_to_completion(d) {
+      None    -> lib_collect_completions_loop(rest, acc)
+      Some(s) -> lib_collect_completions_loop(rest, [s, ...acc])
+    }
+  }
+}
+
+fn lib_decl_to_completion(d: Decl) : Option[String] {
+  match d {
+    DFn(_, n, _, params, ret, _, _, _, _, _) ->
+      Some(lib_completion_json("Function", n, fn_detail(params, ret)))
+    DConst(_, n, ty, _, _, _) ->
+      Some(lib_completion_json("Constant", n, te_to_string(ty)))
+    DType(_, n, _, _, _, _, _) ->
+      Some(lib_completion_json("Class", n, ""))
+    DEffect(_, n, _, _, _, _, _) ->
+      Some(lib_completion_json("Interface", n, ""))
+    DProtocol(_, n, _, _, _, _) ->
+      Some(lib_completion_json("Interface", n, ""))
+    DUnit(_, n, _, _, _) ->
+      Some(lib_completion_json("Variable", n, ""))
+    DAxiom(_, _, _, n, _, params, ret, _, _, _) ->
+      Some(lib_completion_json("Function", n, fn_detail(params, Some(ret))))
+    DDerive(_, inner, _, _)  -> lib_decl_to_completion(inner)
+    DUnstable(inner, _, _)   -> lib_decl_to_completion(inner)
+    DAttribPure(inner, _, _) -> lib_decl_to_completion(inner)
+    _ -> None
+  }
+}
+
+fn fn_detail(params: [Param], ret: Option[TypeExpr]) : String = {
+  let ps = string_join(map(params, param_detail), ", ")
+  let rs = match ret {
+    None    -> ""
+    Some(t) -> string_concat(" -> ", te_to_string(t))
+  }
+  concat_all(["(", ps, ")", rs])
+}
+
+fn param_detail(p: Param) : String =
+  match p.ptype {
+    None    -> p.pname
+    Some(t) -> concat_all([p.pname, ": ", te_to_string(t)])
+  }
+
+# Render a TypeExpr to a short user-facing string. Best-effort hint
+# for completion `detail` and signature `name` fields — not a faithful
+# pretty-print. TypeExpr is the parser-level shape (TyKind variants
+# in `type TyKind`).
+fn te_to_string(t: TypeExpr) : String =
+  match t.tkind {
+    TyName(n, args) -> {
+      if list_length(args) == 0 { n }
+      else {
+        let inner = string_join(map(args, te_to_string), ", ")
+        concat_all([n, "[", inner, "]"])
+      }
+    }
+    TyList(inner) -> concat_all(["[", te_to_string(inner), "]"])
+    TyFn(ps, ret, _) -> {
+      let inner = string_join(map(ps, te_to_string), ", ")
+      concat_all(["(", inner, ") -> ", te_to_string(ret)])
+    }
+    TyDim(base, _) -> te_to_string(base)
+    TyRefine(base, _) -> te_to_string(base)
+  }
+
+fn lib_completion_json(kind: String, name: String, detail: String) : String =
+  concat_all([
+    "{\"kind\": ", json_str(kind),
+    ", \"name\": ", json_str(name),
+    ", \"detail\": ", json_str(detail),
+    "}"
+  ])
+
+# ----- signature help -----
+#
+# Walk the typed module looking for the innermost ECall whose argument
+# list spans the cursor position. Emit the callee's inferred type so
+# the shim can render the parameter hints. Returns the JSON literal
+# "null" when no enclosing call is found.
+fn lib_signature_at(tm: TypedModule, line: Int, col: Int) : String =
+  match find_enc_call(tm.tm_decls, line, col, None) {
+    None -> "null"
+    Some(EC(callee_name, callee_ty)) ->
+      concat_all([
+        "{\"name\": ", json_str(callee_name),
+        ", \"type\": ", lib_json_type(callee_ty),
+        "}"
+      ])
+  }
+
+type EncCall = EC(String, Option[Ty])
+
+fn find_enc_call(ds: [Decl], ql: Int, qc: Int, acc: Option[EncCall]) : Option[EncCall] {
+  match ds {
+    []           -> acc
+    [d, ...rest] -> find_enc_call(rest, ql, qc, find_enc_call_decl(d, ql, qc, acc))
+  }
+}
+
+fn find_enc_call_decl(d: Decl, ql: Int, qc: Int, acc: Option[EncCall]) : Option[EncCall] {
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) -> find_enc_call_expr(body, ql, qc, acc)
+    DConst(_, _, _, body, _, _)          -> find_enc_call_expr(body, ql, qc, acc)
+    DTest(_, body, _, _)                 -> find_enc_call_expr(body, ql, qc, acc)
+    DBench(_, body, _, _)                -> find_enc_call_expr(body, ql, qc, acc)
+    DCheck(_, _, body, _, _)             -> find_enc_call_expr(body, ql, qc, acc)
+    DImpl(_, _, _, inner, _, _)          -> find_enc_call(inner, ql, qc, acc)
+    DDerive(_, inner, _, _)              -> find_enc_call_decl(inner, ql, qc, acc)
+    DUnstable(inner, _, _)               -> find_enc_call_decl(inner, ql, qc, acc)
+    DAttribPure(inner, _, _)             -> find_enc_call_decl(inner, ql, qc, acc)
+    _                                     -> acc
+  }
+}
+
+fn find_enc_call_expr(e: Expr, ql: Int, qc: Int, acc: Option[EncCall]) : Option[EncCall] {
+  let a0 = match e.kind {
+    ECall(callee, _) ->
+      if pos_ge(ql, qc, e.line, e.col) {
+        # The cursor is inside (or past) the start of this call. We
+        # record the *callee*'s inferred type — that is the function
+        # type the editor renders as the signature. The call expr's
+        # own `ty` is the *return* type, which isn't what we want.
+        let name = call_name_of(callee)
+        Some(EC(name, callee.ty))
+      } else { acc }
+    _ -> acc
+  }
+  find_enc_call_expr_kind(e.kind, ql, qc, a0)
+}
+
+fn call_name_of(callee: Expr) : String =
+  match callee.kind {
+    EVar(n) -> n
+    EField(_, n) -> n
+    _ -> "<call>"
+  }
+
+fn find_enc_call_expr_kind(k: ExprKind, ql: Int, qc: Int, acc: Option[EncCall]) : Option[EncCall] {
+  match k {
+    ECall(f, call_args) -> {
+      let a1 = find_enc_call_expr(f, ql, qc, acc)
+      find_enc_call_exprs(call_args, ql, qc, a1)
+    }
+    EField(e1, _)   -> find_enc_call_expr(e1, ql, qc, acc)
+    EIndex(e1, e2)  -> find_enc_call_expr(e2, ql, qc, find_enc_call_expr(e1, ql, qc, acc))
+    EBinop(_, l, r) -> find_enc_call_expr(r, ql, qc, find_enc_call_expr(l, ql, qc, acc))
+    EUnop(_, e1)    -> find_enc_call_expr(e1, ql, qc, acc)
+    EIf(c, t, eo)   -> {
+      let a1 = find_enc_call_expr(c, ql, qc, acc)
+      let a2 = find_enc_call_expr(t, ql, qc, a1)
+      match eo { None -> a2  Some(el) -> find_enc_call_expr(el, ql, qc, a2) }
+    }
+    EMatch(s, arms)       -> find_enc_call_arms(arms, ql, qc, find_enc_call_expr(s, ql, qc, acc))
+    ELambda(_, body)      -> find_enc_call_expr(body, ql, qc, acc)
+    EBlock(stmts, last)   -> {
+      let a1 = find_enc_call_stmts(stmts, ql, qc, acc)
+      match last { None -> a1  Some(e1) -> find_enc_call_expr(e1, ql, qc, a1) }
+    }
+    EPipe(l, r)           -> find_enc_call_expr(r, ql, qc, find_enc_call_expr(l, ql, qc, acc))
+    _ -> acc
+  }
+}
+
+fn find_enc_call_exprs(es: [Expr], ql: Int, qc: Int, acc: Option[EncCall]) : Option[EncCall] {
+  match es {
+    []           -> acc
+    [e, ...rest] -> find_enc_call_exprs(rest, ql, qc, find_enc_call_expr(e, ql, qc, acc))
+  }
+}
+
+fn find_enc_call_arms(arms: [Arm], ql: Int, qc: Int, acc: Option[EncCall]) : Option[EncCall] {
+  match arms {
+    []           -> acc
+    [a, ...rest] -> match a {
+      Arm(_, _, body) -> find_enc_call_arms(rest, ql, qc, find_enc_call_expr(body, ql, qc, acc))
+    }
+  }
+}
+
+fn find_enc_call_stmts(ss: [Stmt], ql: Int, qc: Int, acc: Option[EncCall]) : Option[EncCall] {
+  match ss {
+    []           -> acc
+    [s, ...rest] -> find_enc_call_stmts(rest, ql, qc, find_enc_call_stmt(s, ql, qc, acc))
+  }
+}
+
+fn find_enc_call_stmt(s: Stmt, ql: Int, qc: Int, acc: Option[EncCall]) : Option[EncCall] =
+  match s {
+    SLet(_, _, e)         -> find_enc_call_expr(e, ql, qc, acc)
+    SExprStmt(e)          -> find_enc_call_expr(e, ql, qc, acc)
+    SVar(_, _, e, _, _)   -> find_enc_call_expr(e, ql, qc, acc)
+    _                      -> acc
+  }
 
 fn dump_library_mode(file: String, src: String, decls: [Decl]) : Int / Console + File {
 

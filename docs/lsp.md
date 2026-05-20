@@ -1,8 +1,8 @@
 # Language Server (`kai lsp`)
 
-> v2 status (2026-05-20): hover, goto-definition, publishDiagnostics,
-> and documentSymbol all ship. Completion + signature help are
-> still pending; see issue #447 for the full roadmap.
+> v3 status (2026-05-20): hover, goto-definition, publishDiagnostics,
+> documentSymbol, **completion**, and **signatureHelp** all ship.
+> See issue #447 for the roadmap.
 
 `kai lsp` is the kaikai Language Server. It speaks LSP JSON-RPC
 over stdio and is the integration point for every editor — VS
@@ -13,9 +13,9 @@ etc.
 $ kai lsp        # block on stdio; reads JSON-RPC frames
 ```
 
-## What v2 does
+## What v3 does
 
-| LSP method                        | v2 support |
+| LSP method                        | v3 support |
 | --------------------------------- | ---------- |
 | `initialize` / `initialized`      | ✅          |
 | `shutdown` / `exit`               | ✅          |
@@ -26,8 +26,8 @@ $ kai lsp        # block on stdio; reads JSON-RPC frames
 | `textDocument/definition`         | ✅          |
 | `textDocument/publishDiagnostics` | ✅ (partial) |
 | `textDocument/documentSymbol`     | ✅          |
-| `textDocument/completion`         | future     |
-| `textDocument/signatureHelp`      | future     |
+| `textDocument/completion`         | ✅          |
+| `textDocument/signatureHelp`      | ✅          |
 
 * **Hover** returns the inferred kaikai type for the AST node under
   the cursor, formatted as a markdown fenced block. Driven by the

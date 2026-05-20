@@ -570,6 +570,12 @@ fn dispatch(state: ServerState, kaic2: String, msg: String)
       } else if method == "textDocument/documentSymbol" {
         let body = handle_document_symbol(state, kaic2, msg, id_opt)
         (state, Some(body))
+      } else if method == "textDocument/completion" {
+        let body = handle_completion(state, kaic2, msg, id_opt)
+        (state, Some(body))
+      } else if method == "textDocument/signatureHelp" {
+        let body = handle_signature_help(state, kaic2, msg, id_opt)
+        (state, Some(body))
       } else {
         # Unknown method — return empty result for requests, ignore
         # notifications.
@@ -583,15 +589,25 @@ fn dispatch(state: ServerState, kaic2: String, msg: String)
 }
 
 fn reply_initialize(id: Option[Int]) : String = {
+  let completion_options = json_obj([
+    ("triggerCharacters", "[\".\"]"),
+    ("resolveProvider", json_bool(false))
+  ])
+  let sighelp_options = json_obj([
+    ("triggerCharacters", "[\"(\", \",\"]"),
+    ("retriggerCharacters", "[\",\"]")
+  ])
   let caps = json_obj([
     ("textDocumentSync", json_num(1)),     # 1 = Full sync
     ("hoverProvider", json_bool(true)),
     ("definitionProvider", json_bool(true)),
-    ("documentSymbolProvider", json_bool(true))
+    ("documentSymbolProvider", json_bool(true)),
+    ("completionProvider", completion_options),
+    ("signatureHelpProvider", sighelp_options)
   ])
   let info = json_obj([
     ("name", json_str("kai-lsp")),
-    ("version", json_str("0.2.0"))
+    ("version", json_str("0.3.0"))
   ])
   let result = json_obj([
     ("capabilities", caps),
@@ -998,6 +1014,216 @@ fn symbol_kind_code(k: String) : Int {
   else if k == "Enum"      { 10 }
   else if k == "Struct"    { 23 }
   else { 12 }  # default to Function
+}
+
+# ----- completion -----
+#
+# textDocument/completion handler. Sends a `# @probe complete L:C`
+# to kaic2, parses the resulting candidates, and returns them as
+# CompletionItem[]. We do NOT filter by prefix server-side: the
+# editor's fuzzy matcher handles that.
+fn handle_completion(state: ServerState, kaic2: String, msg: String, id: Option[Int])
+  : String / File + Process = {
+  match extract_uri(msg) {
+    None -> reply_null(id)
+    Some(uri) -> {
+      match store_get(ss_docs(state), uri) {
+        None -> reply_null(id)
+        Some(text) -> {
+          let line0 = extract_int_for_key(msg, "\"line\":")
+          let col0 = extract_int_for_key(msg, "\"character\":")
+          match (line0, col0) {
+            (Some(l), Some(c)) -> {
+              match probe_run(kaic2, text, "complete", l + 1, c + 1) {
+                None -> reply_null(id)
+                Some(blob) -> {
+                  let items = decode_completions(blob)
+                  envelope_result(id, items)
+                }
+              }
+            }
+            _ -> reply_null(id)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn decode_completions(blob: String) : String = {
+  let m = "\"completions\": ["
+  let s0 = string_index_of(blob, m)
+  let start = if s0 < 0 { 0 } else { s0 + string_length(m) }
+  string_concat("[", string_concat(decode_completions_loop(blob, start, ""), "]"))
+}
+
+fn decode_completions_loop(blob: String, start: Int, acc: String) : String {
+  let i = match find_completion_entry(blob, start) {
+    Some(p) -> p
+    None    -> 0 - 1
+  }
+  if i < 0 { acc }
+  else {
+    let close = find_matching_brace(blob, i + 1, string_length(blob))
+    if close < 0 { acc }
+    else {
+      let entry = string_slice(blob, i, (close + 1) - i)
+      let one = decode_one_completion(entry)
+      let sep = if string_length(acc) == 0 { "" } else { "," }
+      decode_completions_loop(blob, close + 1, string_concat(acc, string_concat(sep, one)))
+    }
+  }
+}
+
+fn find_completion_entry(blob: String, start: Int) : Option[Int] {
+  let a = string_index_of_from(blob, "{\"kind\": \"", start)
+  let b = string_index_of_from(blob, "{\"kind\":\"", start)
+  match (a >= 0, b >= 0) {
+    (true, true)  -> if a < b { Some(a) } else { Some(b) }
+    (true, false) -> Some(a)
+    (false, true) -> Some(b)
+    _ -> None
+  }
+}
+
+fn decode_one_completion(entry: String) : String = {
+  let kind_str =
+    match extract_first_string_field(entry, "\"kind\": \"") {
+      Some(k) -> k
+      None    -> match extract_first_string_field(entry, "\"kind\":\"") {
+        Some(k) -> k
+        None    -> "Function"
+      }
+    }
+  let name =
+    match extract_first_string_field(entry, "\"name\": \"") {
+      Some(n) -> n
+      None    -> match extract_first_string_field(entry, "\"name\":\"") {
+        Some(n) -> n
+        None    -> ""
+      }
+    }
+  let detail =
+    match extract_first_string_field(entry, "\"detail\": \"") {
+      Some(d) -> d
+      None    -> match extract_first_string_field(entry, "\"detail\":\"") {
+        Some(d) -> d
+        None    -> ""
+      }
+    }
+  let kind_code = completion_kind_code(kind_str)
+  json_obj([
+    ("label", json_str(name)),
+    ("kind", json_num(kind_code)),
+    ("detail", json_str(detail)),
+    ("insertText", json_str(name))
+  ])
+}
+
+# Map our kind strings to LSP CompletionItemKind wire integers.
+# Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#completionItemKind
+fn completion_kind_code(k: String) : Int {
+  if k == "Function"      { 3 }
+  else if k == "Method"   { 2 }
+  else if k == "Class"    { 7 }
+  else if k == "Interface" { 8 }
+  else if k == "Constant" { 21 }
+  else if k == "Variable" { 6 }
+  else if k == "Keyword"  { 14 }
+  else if k == "Module"   { 9 }
+  else if k == "Enum"     { 13 }
+  else if k == "Struct"   { 22 }
+  else { 3 }   # default Function
+}
+
+# ----- signatureHelp -----
+#
+# textDocument/signatureHelp handler. Sends a `# @probe sig L:C`
+# and reads back the callee's name + inferred type. Returns
+# SignatureHelp with a single signature.
+fn handle_signature_help(state: ServerState, kaic2: String, msg: String, id: Option[Int])
+  : String / File + Process = {
+  match extract_uri(msg) {
+    None -> reply_null(id)
+    Some(uri) -> {
+      match store_get(ss_docs(state), uri) {
+        None -> reply_null(id)
+        Some(text) -> {
+          let line0 = extract_int_for_key(msg, "\"line\":")
+          let col0 = extract_int_for_key(msg, "\"character\":")
+          match (line0, col0) {
+            (Some(l), Some(c)) -> {
+              match probe_run(kaic2, text, "sig", l + 1, c + 1) {
+                None -> reply_null(id)
+                Some(blob) -> {
+                  let body = decode_signature_help(blob)
+                  envelope_result(id, body)
+                }
+              }
+            }
+            _ -> reply_null(id)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn decode_signature_help(blob: String) : String = {
+  let m = "\"signature\": "
+  let i = string_index_of(blob, m)
+  if i < 0 {
+    json_null()
+  } else {
+    let after = i + string_length(m)
+    let n = string_length(blob)
+    # Either `null` or an object `{...}`. Peek the first non-space.
+    let p = skip_ws(blob, after, n)
+    if p >= n { json_null() }
+    else {
+      let c = string_byte_at_int(blob, p)
+      if c == 110 { json_null() }   # 'n' of null
+      else {
+        # Object: extract name + type fields and wrap as SignatureHelp.
+        let close = find_matching_brace(blob, p + 1, n)
+        if close < 0 { json_null() }
+        else {
+          let entry = string_slice(blob, p, (close + 1) - p)
+          let name =
+            match extract_first_string_field(entry, "\"name\": \"") {
+              Some(n) -> n
+              None    -> ""
+            }
+          let ty =
+            match extract_first_string_field(entry, "\"type\": \"") {
+              Some(t) -> t
+              None    -> ""
+            }
+          let label = if string_length(ty) == 0 { name }
+                      else { string_concat(name, string_concat(" : ", ty)) }
+          let signature = json_obj([
+            ("label", json_str(label)),
+            ("documentation", json_str(""))
+          ])
+          let arr = string_concat("[", string_concat(signature, "]"))
+          json_obj([
+            ("signatures", arr),
+            ("activeSignature", json_num(0)),
+            ("activeParameter", json_num(0))
+          ])
+        }
+      }
+    }
+  }
+}
+
+fn skip_ws(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    let c = string_byte_at_int(s, i)
+    if c == 32 or c == 9 or c == 10 or c == 13 { skip_ws(s, i + 1, n) }
+    else { i }
+  }
 }
 
 fn hover_reply(id: Option[Int], type_opt: Option[String]) : String {
