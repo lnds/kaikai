@@ -148,6 +148,7 @@ KaiValue *kaix_internal_drop(KaiValue *v)      { return kai_internal_drop(v); }
 /* ---------- prelude subset used by M3b ---------- */
 KaiValue *kaix_prelude_print(KaiValue *v)          { return kai_prelude_print(v); }
 KaiValue *kaix_prelude_eprint(KaiValue *v)         { return kai_prelude_eprint(v); }
+KaiValue *kaix_prelude_write_stdout(KaiValue *v)   { return kai_prelude_write_stdout(v); }
 KaiValue *kaix_prelude_int_to_string(KaiValue *v)  { return kai_prelude_int_to_string(v); }
 
 /* ---------- M3c: strings, ranges, higher-order prelude ---------- */
@@ -183,6 +184,7 @@ KaiValue *kaix_apply(KaiValue *clo, int32_t n, KaiValue **args) {
    calls. One per prelude entry we may reference as a value. */
 KaiValue *kaix_print_thunk(KaiValue *s, KaiValue **a, int n)            { (void)s; (void)n; return kai_prelude_print(a[0]); }
 KaiValue *kaix_eprint_thunk(KaiValue *s, KaiValue **a, int n)           { (void)s; (void)n; return kai_prelude_eprint(a[0]); }
+KaiValue *kaix_write_stdout_thunk(KaiValue *s, KaiValue **a, int n)     { (void)s; (void)n; return kai_prelude_write_stdout(a[0]); }
 KaiValue *kaix_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)    { (void)s; (void)n; return kai_prelude_int_to_string(a[0]); }
 
 /* ---------- M3d: variants + match ---------- */
