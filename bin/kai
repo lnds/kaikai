@@ -579,6 +579,10 @@ usage_build() {
 usage: kai build [<spec>] [-o <out>] [--backend=<c|llvm>]
        kai build --holes [<spec>]
        kai build --holes-json [<spec>]
+       kai build --diags-json [<spec>]
+       kai build --effects-json [<spec>]
+       kai build --effect-holes-json [<spec>]
+       kai build --library-mode [<spec>]
 
 Compile a kaikai package or file to a native binary. <spec> is one
 of:
@@ -613,6 +617,23 @@ Options:
   --holes-json         Same as --holes, but emits the stable JSON
                        schema documented in docs/typed-holes.md (LLM
                        integration point).
+  --diags-json         Emit collected structured diagnostics (errors +
+                       notes) as a JSON object matching the LSP
+                       Diagnostic shape. Only the m11 templates T1-T5
+                       are migrated; older sites still print to stderr.
+                       Used by \`kai lsp\` to drive
+                       textDocument/publishDiagnostics.
+  --effects-json       Emit per-function effect-row info as JSON:
+                       declared row, inferred row, handlers in scope.
+                       Used by tooling that wants effect coverage.
+  --effect-holes-json  Emit row-variable hole resolutions (\`/ ?\` or
+                       \`/ ?e\` in a row tail) as JSON, listing the
+                       effects the typer inferred for each hole.
+  --library-mode       Run lex / parse / resolve / infer and answer
+                       \`# @probe <kind> L:C\` comments embedded in the
+                       source. Probe kinds: type, def, enc, complete,
+                       sig, symbols. Used by \`kai lsp\` to back hover /
+                       goto-def / completion / signature help.
   -h, --help           Show this help.
 
 Examples:
@@ -624,6 +645,8 @@ Examples:
   kai build --backend=llvm hello.kai        # produces ./hello via clang
   kai build --holes draft.kai               # human-readable hole report
   kai build --holes-json draft.kai          # machine-readable hole report
+  kai build --diags-json draft.kai          # structured diagnostics (JSON)
+  kai build --library-mode draft.kai        # answer @probe queries (JSON)
 
 The compiler auto-loads the core stdlib modules (stdlib/core, protocols,
 effects, array). Everything else under stdlib/ requires an explicit
@@ -1058,12 +1081,14 @@ infer_entry_point() {
   resolve_package_spec ""
 }
 
-# Run kaic2 in a typed-hole reporting mode (`--holes` or
-# `--holes-json`). The compiler's report is the entire output of
-# this invocation — no binary is produced. Uses the same `--path`
-# flags as a normal build so the hole's in-scope entries match what
-# the user actually sees at compile time.
-report_holes() {
+# Run kaic2 in a non-binary-producing reporting mode (`--holes`,
+# `--holes-json`, `--diags-json`, `--effects-json`,
+# `--effect-holes-json`, `--library-mode`). The compiler's report
+# is the entire output of this invocation — no binary is produced.
+# Uses the same `--path` flags as a normal build so the report's
+# in-scope entries match what the user actually sees at compile
+# time.
+run_report_mode() {
   src="$1"; flag="$2"
   [ -f "$src" ] || die_file_not_found "$src" "build"
   ensure_built
@@ -1080,18 +1105,38 @@ report_holes() {
   (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$flag" "$src")
 }
 
+# Back-compat alias — older internal call sites referenced this name.
+report_holes() { run_report_mode "$@"; }
+
 cmd_build() {
-  src=""; out=""; holes_mode=""; backend_cli=""
+  src=""; out=""; report_mode=""; backend_cli=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -o) shift; [ $# -gt 0 ] || die "-o needs an argument"; out="$1"; shift ;;
       -h|--help) usage_build; return 0 ;;
+      # Reporting modes — mutually exclusive, no binary produced.
+      # All of these run the compiler through lex / parse / resolve /
+      # infer and emit a JSON or text report, then exit. They are
+      # intended for tooling (LSP, agents, linters) that needs the
+      # typed-AST view without paying for codegen.
       --holes)
-        [ -z "$holes_mode" ] || die "--holes and --holes-json are mutually exclusive"
-        holes_mode="--holes"; shift ;;
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--holes"; shift ;;
       --holes-json)
-        [ -z "$holes_mode" ] || die "--holes and --holes-json are mutually exclusive"
-        holes_mode="--holes-json"; shift ;;
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--holes-json"; shift ;;
+      --diags-json)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--diags-json"; shift ;;
+      --effects-json)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--effects-json"; shift ;;
+      --effect-holes-json)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--effect-holes-json"; shift ;;
+      --library-mode)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--library-mode"; shift ;;
       --backend=*)
         backend_cli="${1#--backend=}"; shift
         case "$backend_cli" in
@@ -1112,11 +1157,11 @@ cmd_build() {
   src="$(resolve_package_spec "$src")"
   [ -n "$src" ] || die "missing input file (see 'kai build --help')"
   backend="$(resolve_backend "$backend_cli")"
-  if [ -n "$holes_mode" ]; then
-    [ -z "$out" ] || die "$holes_mode does not produce a binary; drop -o <out>"
-    # --holes runs the typer only — backend selection is irrelevant.
-    [ -z "$backend_cli" ] || die "$holes_mode is independent of --backend; drop the flag"
-    report_holes "$src" "$holes_mode"
+  if [ -n "$report_mode" ]; then
+    [ -z "$out" ] || die "$report_mode does not produce a binary; drop -o <out>"
+    # Report modes run the typer only — backend selection is irrelevant.
+    [ -z "$backend_cli" ] || die "$report_mode is independent of --backend; drop the flag"
+    run_report_mode "$src" "$report_mode"
     return $?
   fi
   if [ -z "$out" ]; then
