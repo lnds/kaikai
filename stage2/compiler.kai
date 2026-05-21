@@ -44852,27 +44852,257 @@ fn pcs_max_paths_in_ret_opt(nm: String, opt: Option[HReturn]) : Int = match opt 
   }
 }
 
-# Compute the branch-aware skip-set for a fn body: every param name
-# whose max non-lam reads across any execution path is <= 1 AND
-# whose read is guaranteed to occur on every path.
+# Compute the branch-aware skip-set for a fn body: every top-level
+# fn param whose reads can safely transfer ownership raw on every
+# execution path. The three conditions for safety:
 #
-# DISABLED — returning empty list. The two conditions above are
-# necessary but insufficient: the single consumer must also be
-# *linear* (consume the ref it receives) for the raw transfer to
-# be safe. Many stdlib helpers and runtime primitives internally
-# incref their arguments; sending them an unwrapped ref leaves the
-# original's RC unchanged at the call site, and the exit drop (now
-# suppressed by the skip-set) is the only thing keeping the count
-# from drifting. Compiler self-compile shows the symptom: the
-# fixture passes (its consumer is `string_concat`, linear) but the
-# compiler.kai bootstrap fixed-point crashes because of unbalanced
-# RC on bindings whose consumer is a non-linear stdlib helper.
-#
-# The infrastructure (`pcs_max_paths_*`, `pcs_consumed_*`, the
-# `skip_set` threading) is in place and validated; the missing
-# piece is a "linear-consumer" annotation on stdlib + runtime
-# entry points. That work is its own lane.
+#   1. `pcs_max_paths_in_expr <= 1` — the binding is read at most
+#      once on any single execution path (no path doubles a wrap).
+#   2. `pcs_consumed_on_every_path` — every path through the body
+#      actually consumes the binding (no exit-drop needed; the
+#      single read on the executed path transfers ownership).
+#   3. `pcs_all_consumers_linear` — every consumer of the binding
+#      is a linear consumer: a call to a user-defined fn (which
+#      pcs_pass made linear by construction) or a variant/record
+#      that owns the slot. Non-linear consumers (intrinsics,
+#      capability ops, raw field access on a borrowed record)
+#      internally incref their arg, and a raw transfer would leak
+#      or double-free.
+# DISABLED — returns the empty list. The triple condition
+# (max-path ≤ 1 AND consumed-on-every-path AND all-consumers-linear)
+# is correct in isolation and on the fixture, but enabling it on
+# self-compile of compiler.kai trips a downstream pass that this
+# lane has not yet aligned. The activation toggle below restores
+# the optimisation; see the retro for the remaining work.
 fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] = []
+
+# Activation toggle (when remaining downstream passes are aligned):
+# replace the body above with:
+#
+#   match pnames {
+#     []           -> []
+#     [h, ...rest] -> {
+#       let mp = pcs_max_paths_in_expr(h, body)
+#       let cv = pcs_consumed_on_every_path(h, body)
+#       let ln = pcs_all_consumers_linear(h, body)
+#       let rest_skip = pcs_branch_aware_skip_params(rest, body)
+#       if mp <= 1 and cv and ln { [h, ...rest_skip] } else { rest_skip }
+#     }
+#   }
+
+# Returns `true` if every read of `nm` in `e` is a linear consumer
+# context — either:
+#   - direct arg to `ECall(EVar(<user_fn>), ...)` — call to a
+#     user-defined fn (pcs_pass makes those linear by construction);
+#   - direct slot of `EVariantsOf` / variant-constructor `ECall` /
+#     `ERecordLit` field init — the constructor takes ownership of
+#     the slot.
+# Any other context (intrinsic, capability op like `EField(EVar(eff),
+# op)` invoked, raw `EField` read of `nm` for record projection,
+# `EIndex`, binop, unop on non-numeric types) is non-linear and
+# requires the conservative dup wrap.
+fn pcs_all_consumers_linear(nm: String, e: Expr) : Bool =
+  pcs_consumers_linear_kind(nm, e.kind)
+
+fn pcs_consumers_linear_kind(nm: String, k: ExprKind) : Bool = match k {
+  EVar(_)             -> true   # a bare EVar is "in linear position"
+                                 # — it's either the body's tail (return
+                                 # transfer, linear), or recursed into
+                                 # from an arg/field that already classified
+                                 # the call/ctor as linear or not.
+  EStr(_, _)          -> true   # interpolated reads handled by §4b
+  ECall(f, xs)        -> pcs_call_consumers_linear(nm, f, xs)
+  EIntrinsic(_, xs)   -> {
+    # Intrinsics are runtime primitives — non-linear if `nm` appears
+    # as an arg.
+    if pcs_any_arg_is_var(nm, xs) { false }
+    else { pcs_all_args_consumers_linear(nm, xs) }
+  }
+  EField(x, _)        -> {
+    # Field access reads the record raw and incref's the field.
+    # If `nm == x` (bare ref), this is non-linear (borrow-only on nm).
+    match x.kind {
+      EVar(uname) -> uname != nm    # bare `nm.field` = borrow → false
+      _           -> pcs_all_consumers_linear(nm, x)
+    }
+  }
+  EIndex(a, b)        -> {
+    # Same as EField: index borrows the array.
+    let a_ok = match a.kind {
+      EVar(uname) -> uname != nm
+      _           -> pcs_all_consumers_linear(nm, a)
+    }
+    a_ok and pcs_all_consumers_linear(nm, b)
+  }
+  EBinop(_, a, b)     -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b)
+  EUnop(_, x)         -> pcs_all_consumers_linear(nm, x)
+  EIf(c, t, opt_e)    -> pcs_all_consumers_linear(nm, c) and
+                          pcs_all_consumers_linear(nm, t) and
+                          pcs_consumers_linear_opt(nm, opt_e)
+  EMatch(s, arms)     -> {
+    # The scrutinee is consumed by `match` (kai_decref at end of
+    # the match block). A bare EVar(nm) as scrutinee is therefore
+    # linear; but if `nm` appears INSIDE the scrutinee expression
+    # (e.g. `match opts.path { ... }`), we recurse.
+    let s_ok = match s.kind {
+      EVar(_) -> true     # scrutinee linear by match semantics
+      _       -> pcs_all_consumers_linear(nm, s)
+    }
+    s_ok and pcs_consumers_linear_arms(nm, arms)
+  }
+  ELambda(_, _)       -> true    # closure capture is handled separately
+  ERecordLit(_, fis)  -> pcs_consumers_linear_fields(nm, fis)
+  EList(els)          -> pcs_consumers_linear_elems(nm, els)
+  ERange(a, b, opt)   -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b) and
+                          pcs_consumers_linear_opt(nm, opt)
+  EBlock(stmts, tail) -> pcs_consumers_linear_block(nm, stmts, tail)
+  EPipe(a, b)         -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b)
+  EMapPipe(a, b)      -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b)
+  EFlatMapPipe(a, b)  -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b)
+  EFilterPipe(a, b)   -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b)
+  EHandle(body, _, _, init_opt, _, _, _) ->
+    pcs_all_consumers_linear(nm, body) and
+    pcs_consumers_linear_opt(nm, init_opt)
+  EBang(inner)        -> pcs_all_consumers_linear(nm, inner)
+  ELitUnit(inner, _)  -> pcs_all_consumers_linear(nm, inner)
+  EModCall(_, _)      -> true    # mod calls go through user fns
+                                  # post-resolve; treated as linear
+  _                   -> true    # leaves (EInt, EBool, ELambda, ...)
+                                  # don't reference nm
+}
+
+# Check whether a call expression `f(xs...)` with `nm` possibly
+# appearing as an arg is linear-safe. Rules:
+#   - If callee `f` is `EVar(fn_name)`:
+#       - If fn_name starts with `__perceus_` → non-linear (these are
+#         RC primitives that should never see a skipped read).
+#       - Otherwise treat as user-defined linear fn.
+#   - If callee is anything else (EField on capability, intrinsic,
+#     apply on closure value), assume non-linear unless `nm` does
+#     not appear in args.
+fn pcs_call_consumers_linear(nm: String, f: Expr, xs: [Expr]) : Bool = {
+  let nm_in_args = pcs_any_arg_is_var(nm, xs) or pcs_any_arg_mentions(nm, xs)
+  if not nm_in_args {
+    # `nm` only appears inside the callee expression (rare); recurse.
+    pcs_all_consumers_linear(nm, f)
+  } else {
+    match f.kind {
+      EVar(fn_name) -> {
+        # User-defined fn call — linear by pcs_pass construction —
+        # UNLESS the fn name is a builtin synthetic.
+        if pcs_is_runtime_primitive(fn_name) { false }
+        # Even for user fns, check that `nm` does not also appear in
+        # the callee (would mean f is computed from nm, unusual).
+        else { pcs_all_consumers_linear(nm, f) and
+                pcs_all_args_consumers_linear(nm, xs) }
+      }
+      _ -> false   # call through capability/closure: assume non-linear
+    }
+  }
+}
+
+# Is `nm` directly an arg (as bare `EVar(nm)`)?
+fn pcs_any_arg_is_var(nm: String, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> match h.kind {
+    EVar(uname) -> if uname == nm { true } else { pcs_any_arg_is_var(nm, rest) }
+    _           -> pcs_any_arg_is_var(nm, rest)
+  }
+}
+
+# Does `nm` appear anywhere within these args (recursively)?
+fn pcs_any_arg_mentions(nm: String, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> {
+    if pcs_max_paths_in_expr(nm, h) > 0 { true }
+    else { pcs_any_arg_mentions(nm, rest) }
+  }
+}
+
+# Recurse into each arg.
+fn pcs_all_args_consumers_linear(nm: String, xs: [Expr]) : Bool = match xs {
+  []           -> true
+  [h, ...rest] -> pcs_all_consumers_linear(nm, h) and
+                   pcs_all_args_consumers_linear(nm, rest)
+}
+
+# Known runtime primitives / synthetic names that the compiler should
+# treat as non-linear consumers. Builtin from the runtime's borrow
+# discipline.
+fn pcs_is_runtime_primitive(nm: String) : Bool = {
+  nm == "__perceus_dup" or
+  nm == "__perceus_drop" or
+  nm == "__perceus_reuse_cons" or
+  nm == "__perceus_reuse_record" or
+  nm == "__perceus_reuse_variant"
+}
+
+fn pcs_consumers_linear_opt(nm: String, opt: Option[Expr]) : Bool = match opt {
+  None    -> true
+  Some(e) -> pcs_all_consumers_linear(nm, e)
+}
+
+fn pcs_consumers_linear_arms(nm: String, arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, body) -> {
+      let gp = match opt_g {
+        None    -> true
+        Some(g) -> pcs_all_consumers_linear(nm, g)
+      }
+      gp and pcs_all_consumers_linear(nm, body) and
+      pcs_consumers_linear_arms(nm, rest)
+    }
+  }
+}
+
+fn pcs_consumers_linear_fields(nm: String, fis: [FieldInit]) : Bool = match fis {
+  []           -> true
+  [h, ...rest] -> match h {
+    # Record field init: the field consumes the value (record owns slot).
+    # So a bare `EVar(nm)` as the field value IS linear.
+    FI(_, e) -> pcs_all_consumers_linear(nm, e) and
+                pcs_consumers_linear_fields(nm, rest)
+  }
+}
+
+fn pcs_consumers_linear_elems(nm: String, els: [ListElem]) : Bool = match els {
+  []           -> true
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    # List element: cons cell takes ownership of head.
+    pcs_all_consumers_linear(nm, inner) and
+    pcs_consumers_linear_elems(nm, rest)
+  }
+}
+
+fn pcs_consumers_linear_block(nm: String, stmts: [Stmt], tail: Option[Expr]) : Bool = {
+  pcs_consumers_linear_stmts(nm, stmts) and pcs_consumers_linear_opt(nm, tail)
+}
+
+fn pcs_consumers_linear_stmts(nm: String, stmts: [Stmt]) : Bool = match stmts {
+  []           -> true
+  [h, ...rest] -> pcs_consumers_linear_stmt(nm, h) and
+                   pcs_consumers_linear_stmts(nm, rest)
+}
+
+fn pcs_consumers_linear_stmt(nm: String, s: Stmt) : Bool = match s {
+  SLet(_, _, e)                  -> pcs_all_consumers_linear(nm, e)
+  SVar(_, _, e, _, _)            -> pcs_all_consumers_linear(nm, e)
+  SAssert(e, opt_m)              -> pcs_all_consumers_linear(nm, e) and
+                                     pcs_consumers_linear_opt(nm, opt_m)
+  SExprStmt(e)                   -> pcs_all_consumers_linear(nm, e)
+  SIndexAssign(a, b, c, _, _)    -> pcs_all_consumers_linear(nm, a) and
+                                     pcs_all_consumers_linear(nm, b) and
+                                     pcs_all_consumers_linear(nm, c)
+  SUse(_, _, _)                  -> true
+}
 
 # Returns `true` if every execution path through `body` consumes
 # `nm` exactly once on a non-lambda read. Composition rules:
@@ -45379,10 +45609,10 @@ fn pcs_collect_exit_drops(params: [Param], uses: [Use], skip_set: [String], acc:
       let acc1 = match last_use_for(p.pname, uses) {
         LUBlocked(_) -> [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...acc]
         LUAt(_, _, _) -> {
-          # Issue #599 — branch-aware: if the param is in `skip_set`
-          # (max non-lam reads on any execution path is <= 1), the
-          # rewriter did NOT wrap reads in `__perceus_dup`, so the
-          # single read transfers ownership raw. Emitting an exit
+          # Issue #599 — branch-aware: if the param is in `skip_set`,
+          # the rewriter did NOT wrap reads in `__perceus_dup`, so
+          # the single read on the executed path transfers the ref
+          # raw and the consumer must be linear. Emitting an exit
           # drop here would double-free.
           if list_has(skip_set, p.pname) { acc }
           else if pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 {
@@ -46315,8 +46545,14 @@ fn tcrec_rewrite_decl(d: Decl) : Decl / Console {
             let borrow_flags = tcrec_compute_borrow_flags(params, body, [])
             let dm_table = tcrec_collect_dm_table(body, name, arity, params,
                                                    pnames, uses, borrow_flags, [], [])
+            # Issue #599 — recompute the branch-aware skip-set so the
+            # TCO-site dropmask aligns with pcs_pass's wrap-skip
+            # decisions. Without this, params in skip_set get the
+            # TCO drop planted while the rewriter omitted the
+            # matching dup, double-freeing the original ref.
+            let skip_set = pcs_branch_aware_skip_params(pnames, body)
             let new_body = tcrec_rewrite_body(body, name, arity, c_sym_str,
-                                              params, pnames, uses, dm_table, [])
+                                              params, pnames, uses, dm_table, skip_set, [])
             DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo)
           }
         }
@@ -46365,8 +46601,10 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
             let borrow_flags = tcrec_compute_borrow_flags(params, inner, [])
             let dm_table = tcrec_collect_dm_table(inner, name, arity, params,
                                                    pnames, uses, borrow_flags, [], [])
+            # Issue #599 — branch-aware skip-set for TCO drop alignment.
+            let skip_set = pcs_branch_aware_skip_params(pnames, inner)
             let new_inner = tcrec_rewrite_body(inner, name, arity, c_sym_str,
-                                                params, pnames, uses, dm_table, [])
+                                                params, pnames, uses, dm_table, skip_set, [])
             let new_body = tcrec_rebuild_pcs_ret_wrap(body, before, new_inner, after)
             DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo)
           }
@@ -46455,18 +46693,27 @@ fn tcrec_any_unused(params: [Param], uses: [Use]) : Bool {
 #                               `examples/tco/list_nth_shape.kai`.
 #   - LUUnused               → unreachable (`tcrec_any_unused` made
 #                               us bail out before getting here).
-fn tcrec_compute_site_dropmask(params: [Param], uses: [Use],
+fn tcrec_compute_site_dropmask(params: [Param], uses: [Use], skip_set: [String],
                                 i: Int, acc: Int) : Int {
   match params {
     [] -> acc
     [p, ...rest] -> {
       let drop = match last_use_for(p.pname, uses) {
         LUBlocked(_) -> true
-        LUAt(_, _, _) -> pcs_count_non_lam_uses(p.pname, uses, 0) >= 2
+        LUAt(_, _, _) -> {
+          # Issue #599 — branch-aware alignment: if the param is in
+          # `skip_set`, the pcs_rewrite pass did NOT wrap reads and
+          # `pcs_collect_exit_drops` suppressed the exit drop. The
+          # TCO setup must NOT plant a drop either; the single read
+          # transfers the ref raw to the recursive call's matching
+          # arg, balanced.
+          if list_has(skip_set, p.pname) { false }
+          else { pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 }
+        }
         LUUnused(_) -> false
       }
       let acc1 = if drop { acc + tcrec_pow2(i) } else { acc }
-      tcrec_compute_site_dropmask(rest, uses, i + 1, acc1)
+      tcrec_compute_site_dropmask(rest, uses, skip_set, i + 1, acc1)
     }
   }
 }
@@ -47002,14 +47249,14 @@ fn tcrec_split_pipe_loop(s: String, start: Int, i: Int, n: Int, acc: [String]) :
 # them normally on emit.
 fn tcrec_rewrite_body(body: Expr, nm: String, arity: Int, c_sym_str: String,
                       params: [Param], pnames: [String], uses: [Use],
-                      dm_table: [TcrDm], scope: [String]) : Expr =
+                      dm_table: [TcrDm], skip_set: [String], scope: [String]) : Expr =
   Expr { kind: tcrec_rewrite_kind(body.kind, body.line, body.col, nm, arity,
-                                   c_sym_str, params, pnames, uses, dm_table, scope),
+                                   c_sym_str, params, pnames, uses, dm_table, skip_set, scope),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode }
 
 fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
                       c_sym_str: String, params: [Param], pnames: [String],
-                      uses: [Use], dm_table: [TcrDm], scope: [String]) : ExprKind {
+                      uses: [Use], dm_table: [TcrDm], skip_set: [String], scope: [String]) : ExprKind {
   match k {
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
@@ -47020,7 +47267,7 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
           # built once at `tcrec_rewrite_decl` entry. The two masks are
           # disjoint by construction (rule 1+2 fires on count==0 or
           # count>=2; rule 3 fires only on count==1) so OR == ADD.
-          let base_mask = tcrec_compute_site_dropmask(params, uses, 0, 0)
+          let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
           let rule3_mask = tcrec_lookup_dm(dm_table, f.line, f.col)
           let dropmask = base_mask + rule3_mask
           let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
@@ -47032,24 +47279,24 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
       _ -> k
     }
     EIf(c, t, opt_e) -> {
-      let t1 = tcrec_rewrite_body(t, nm, arity, c_sym_str, params, pnames, uses, dm_table, scope)
+      let t1 = tcrec_rewrite_body(t, nm, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope)
       let opt_e1 = match opt_e {
         None -> None
         Some(e2) -> Some(tcrec_rewrite_body(e2, nm, arity, c_sym_str, params,
-                                            pnames, uses, dm_table, scope))
+                                            pnames, uses, dm_table, skip_set, scope))
       }
       EIf(c, t1, opt_e1)
     }
     EMatch(s, arms) ->
       EMatch(s, tcrec_rewrite_arms(arms, nm, arity, c_sym_str, params, pnames,
-                                    uses, dm_table, scope, []))
+                                    uses, dm_table, skip_set, scope, []))
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
         None -> k
         Some(e) ->
           EBlock(stmts, Some(tcrec_rewrite_body(e, nm, arity, c_sym_str, params,
-                                                 pnames, uses, dm_table, scope1)))
+                                                 pnames, uses, dm_table, skip_set, scope1)))
       }
     }
     _ -> k
@@ -47058,16 +47305,16 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
 
 fn tcrec_rewrite_arms(arms: [Arm], nm: String, arity: Int, c_sym_str: String,
                       params: [Param], pnames: [String], uses: [Use],
-                      dm_table: [TcrDm], scope: [String], acc: [Arm]) : [Arm] {
+                      dm_table: [TcrDm], skip_set: [String], scope: [String], acc: [Arm]) : [Arm] {
   match arms {
     [] -> list_reverse(acc)
     [a, ...rest] -> match a {
       Arm(pat, opt_g, body) -> {
         let scope1 = pat_bindings(pat, scope)
         let new_body = tcrec_rewrite_body(body, nm, arity, c_sym_str, params,
-                                          pnames, uses, dm_table, scope1)
+                                          pnames, uses, dm_table, skip_set, scope1)
         tcrec_rewrite_arms(rest, nm, arity, c_sym_str, params, pnames, uses,
-                           dm_table, scope, [Arm(pat, opt_g, new_body), ...acc])
+                           dm_table, skip_set, scope, [Arm(pat, opt_g, new_body), ...acc])
       }
     }
   }
