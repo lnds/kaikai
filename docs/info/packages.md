@@ -46,7 +46,9 @@ VISIBILITY
 
   Private items cannot be imported by other packages. Public items in
   internal packages do NOT leak to consumers if the public package
-  re-exports them through a public surface (pub-leak validator, #565).
+  re-exports them through a public surface; the typer's pub-leak
+  validator rejects code that would leak a private type or effect
+  through a `pub` signature.
 
 STDLIB IS AUTO-LOADED
   The Hanga Roa "core" set is loaded automatically — no import
@@ -72,7 +74,7 @@ SPEC ARG TO kai BUILD/RUN
 
   kai build .                        # cwd's package
   kai build ./sub                    # sub-package
-  kai build foo.kai                  # legacy file mode
+  kai build foo.kai                  # single-file mode
   kai build                          # same as `kai build .`
 
 NOT IN KAIKAI
