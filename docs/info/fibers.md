@@ -1,80 +1,89 @@
-FIBERS(7)                       kaikai                       FIBERS(7)
+# fibers
 
-NAME
-  fibers — structured concurrency via nursery, spawn, await, cancel
+Structured concurrency via nursery, spawn, await, cancel — BEAM-style
+fibers coordinated by the `Spawn` effect.
 
-SYNOPSIS
-  nursery { n -> ... n.spawn(thunk) ... n.await(fiber) ... }
-  Spawn.spawn(thunk)                                # inside Spawn handler
-  Spawn.await(fiber)
-  Spawn.cancel(fiber)
-  Spawn.select([fiber1, fiber2])                    # first to finish wins
+## Description
 
-DESCRIPTION
-  kaikai concurrency is BEAM-style fibers (private heap, cheap, ~64 KiB
-  default stack) coordinated by structured-concurrency primitives. The
-  `Spawn` effect provides spawn/await/select/cancel as ops; `nursery`
-  is the stdlib helper that installs Spawn for a scope and joins all
-  children at exit.
+kaikai concurrency is fibers (private heap, cheap, ~64 KiB default
+stack) coordinated by structured-concurrency primitives. The `Spawn`
+effect provides spawn/await/select/cancel as ops; `nursery` is the
+stdlib helper that installs Spawn for a scope and joins all children
+at exit.
 
-  Fibers are not OS threads. The runtime parks them on I/O via the
-  reactor (R1 file/sleep/process, R2 TCP, R3 stdin, R4 signal) — no
-  blocking call freezes the OS thread.
+Fibers are not OS threads. The runtime parks them on I/O via the
+reactor (R1 file/sleep/process, R2 TCP, R3 stdin, R4 signal) — no
+blocking call freezes the OS thread.
 
-  Cancellation is COOPERATIVE: `Spawn.cancel(f)` marks the target;
-  the scheduler injects `Cancel.raise()` into the target at its next
-  yield point (next I/O op or other scheduling boundary). The body
-  may `handle { ... } with Cancel { raise(_) -> ... }` to run cleanup.
-  There is no preemption.
+Cancellation is COOPERATIVE: `Spawn.cancel(f)` marks the target;
+the scheduler injects `Cancel.raise()` into the target at its next
+yield point. There is no preemption.
 
-NURSERY
+## Nursery
 
-  fn fetch_all(urls: [String]) : [String] / Spawn + NetTcp + Stdout = {
-    nursery { n ->
-      let fibers = urls | (url => n.spawn(() => fetch_one(url)))
-      fibers | (f => n.await(f))
-    }
+```kaikai
+import spawn
+
+fn fetch_one(url: String) : String / Stdout = {
+  Stdout.print("fetching #{url}")
+  url
+}
+
+fn fetch_all(urls: [String]) : [String] / Spawn + Stdout = {
+  nursery { n ->
+    let fibers = urls | (url => n.spawn(() => fetch_one(url)))
+    fibers | (f => n.await(f))
   }
+}
 
-  - On normal exit, the nursery awaits every spawned child.
-  - If any child throws, the nursery cancels the rest and re-raises.
-  - The nursery scope is the structured boundary; fibers cannot escape.
+fn main() : Int / Spawn + Stdout = {
+  let results = fetch_all(["a", "b", "c"])
+  Stdout.print("got #{int_to_string(results.length())}")
+  0
+}
+```
 
-ACTORS
-  For message-passing, see `kai info actors`. Actors are built on top
-  of fibers + a private mailbox.
+- On normal exit, the nursery awaits every spawned child.
+- If any child throws, the nursery cancels the rest and re-raises.
+- The nursery scope is the structured boundary; fibers cannot escape.
 
-CANCELLATION
-  `Cancel` is a separate effect, orthogonal to `Spawn`. Its single op
-  is `raise() : Nothing`. The scheduler injects `Cancel.raise()` into
-  a fiber whose `Spawn.cancel(f)` was called, at the next yield point.
-  Handle it to run cleanup. The clause receives `resume` (a callable)
-  by convention; since `raise` returns `Nothing` the handler typically
-  ignores `resume` and short-circuits:
+## Actors
 
-    fn worker() : Unit / Cancel + Stdout = {
-      handle {
-        long_running_loop()
-      } with Cancel {
-        raise(resume) -> Stdout.print("worker cleaning up")
-      }
-    }
+For message-passing, see `kai info actors`. Actors are built on top
+of fibers + a private mailbox.
 
-  See `docs/structured-concurrency.md` for the full semantics.
+## Cancellation
 
-SELECT
+`Cancel` is a separate effect, orthogonal to `Spawn`. Its single op
+is `raise() : Nothing`. The scheduler injects `Cancel.raise()` into
+a fiber whose `Spawn.cancel(f)` was called, at the next yield point.
+Handle it to run cleanup. The clause receives `resume` by convention;
+since `raise` returns `Nothing` the handler typically ignores `resume`
+and short-circuits.
 
-  let winner = Spawn.select([fiber_a, fiber_b])
-  # winner is the first fiber that completed; the others are not auto-cancelled.
+```kaikai
+fn worker() : Int / Cancel + Stdout = {
+  handle {
+    Stdout.print("working")
+    42
+  } with Cancel {
+    raise(resume) -> { Stdout.print("cleaning up"); 0 }
+  }
+}
 
-NOT IN KAIKAI
-  - `async` / `await` keywords. Concurrency is an effect, not syntax.
-  - Goroutines / unstructured spawn. Every spawn lives in a nursery.
-  - Channels as a primitive. Use Actors or nursery + shared State[T].
-  - OS-thread parking under blocking syscalls. Reactor parks fibers.
-  - Multi-shot resume (which would mean a fiber's continuation
-    runs twice). One-shot only.
+fn main() : Int / Cancel + Stdout = worker()
+```
 
-SEE ALSO
-  kai info effects, kai info actors, kai info main
-  docs/structured-concurrency.md, docs/fibers-honesty-targets.md
+## NOT IN KAIKAI
+
+- `async` / `await` keywords. Concurrency is an effect, not syntax.
+- Goroutines / unstructured spawn. Every spawn lives in a nursery.
+- Channels as a primitive. Use Actors or nursery + shared State[T].
+- OS-thread parking under blocking syscalls. Reactor parks fibers.
+- Multi-shot resume (which would mean a fiber's continuation
+  runs twice). One-shot only.
+
+## See also
+
+`kai info effects`, `kai info actors`,
+`docs/structured-concurrency.md`, `docs/fibers-honesty-targets.md`

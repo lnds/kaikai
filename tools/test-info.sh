@@ -48,7 +48,7 @@ count=0
 for topic in $listed; do
   page="$("$KAI" info "$topic" 2>&1)" || fail "'kai info $topic' exited non-zero"
   [ -n "$page" ] || fail "'kai info $topic' produced empty output"
-  echo "$page" | grep -q "^NAME$" || fail "'kai info $topic' missing NAME section"
+  echo "$page" | grep -q "^# " || fail "'kai info $topic' missing H1 title"
 
   if [ "$need_json_validator" = 1 ]; then
     "$KAI" info "$topic" --json 2>&1 | python3 -c "
@@ -60,8 +60,10 @@ except Exception as e:
     sys.exit(1)
 if d.get('topic') != '$topic':
     sys.stderr.write('topic mismatch: %r\n' % d.get('topic')); sys.exit(1)
-if 'NAME' not in d.get('sections', {}):
-    sys.stderr.write('missing NAME section\n'); sys.exit(1)
+if not d.get('title'):
+    sys.stderr.write('missing title\n'); sys.exit(1)
+if not d.get('sections'):
+    sys.stderr.write('no sections\n'); sys.exit(1)
 " || fail "'kai info $topic --json' invalid"
   fi
 

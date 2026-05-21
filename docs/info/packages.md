@@ -1,89 +1,107 @@
-PACKAGES(7)                     kaikai                     PACKAGES(7)
+# packages
 
-NAME
-  packages — kai.toml, imports, visibility
+`kai.toml`, imports, visibility.
 
-SYNOPSIS
-  kai init <name>                   # create a kai.toml in cwd
-  kai add <source>[@<ref>]          # add a dep
-  kai install                       # resolve + lock
-  kai update [<name>]               # refresh deps
-  kai show                          # dump parsed manifest
+## Description
 
-DESCRIPTION
-  A kaikai package is a directory with a `kai.toml` manifest. The
-  package name in the manifest is what other packages import.
+A kaikai package is a directory with a `kai.toml` manifest. The
+package name in the manifest is what other packages import.
 
-  Files inside a package are merged at build time. Each file declares
-  what it imports from other packages and what it exports.
+Files inside a package are merged at build time. Each file declares
+what it imports from other packages and what it exports.
 
-MANIFEST
+## Driver commands
 
-  # kai.toml
-  [package]
-  name = "mathlib"
-  version = "0.1.0"
-  entry = "main.kai"                # optional; defaults to main.kai
+```text
+kai init <name>                   # create a kai.toml in cwd
+kai add <source>[@<ref>]          # add a dep
+kai install                       # resolve + lock
+kai update [<name>]               # refresh deps
+kai show                          # dump parsed manifest
+```
 
-  [dependencies]
-  jsonlib = { git = "https://github.com/x/jsonlib", tag = "v1.2.0" }
-  utilslib = { path = "../utilslib" }
+## Manifest
 
-IMPORTS
+```text
+[package]
+name = "mathlib"
+version = "0.1.0"
+entry = "main.kai"                # optional; defaults to main.kai
 
-  import mathlib                    # whole package
-  import mathlib.vec                # specific module
-  import mathlib as m               # rename
-  import mathlib.{add, mul}         # selective: only `add` and `mul`
+[dependencies]
+jsonlib = { git = "https://github.com/x/jsonlib", tag = "v1.2.0" }
+utilslib = { path = "../utilslib" }
+```
 
-  Imports are RESOLVED through `kai.toml` — the name on the right of
-  `import` must appear as a dep (or be a stdlib name).
+## Imports
 
-VISIBILITY
+```text
+import mathlib                    # whole package
+import mathlib.vec                # specific module
+import mathlib as m               # rename
+import mathlib.{add, mul}         # selective: only `add` and `mul`
+```
 
-  pub fn add(a: Int, b: Int) : Int = a + b      # exported
-  fn helper() : Int = 42                         # private to file
+Imports are RESOLVED through `kai.toml` — the name on the right of
+`import` must appear as a dep (or be a stdlib name).
 
-  Private items cannot be imported by other packages. Public items in
-  internal packages do NOT leak to consumers if the public package
-  re-exports them through a public surface; the typer's pub-leak
-  validator rejects code that would leak a private type or effect
-  through a `pub` signature.
+## Visibility
 
-STDLIB IS AUTO-LOADED
-  The Hanga Roa "core" set is loaded automatically — no import
-  needed for: Stdin/Stdout/Stderr, File, Env, Console, Option, Result,
-  List ops, Array, String, Char, Int/Real basics, protocols, complex.
-  Everything else (decimal, money, math/int, regexp, collections/*,
-  encoding/*, crypto/*, random, fx, uuid, path) is opt-in via
-  `import <name>`.
+```kaikai
+pub fn add(a: Int, b: Int) : Int = a + b      # exported
+fn helper() : Int = 42                         # private to file
 
-  Full split: `docs/stdlib-layout.md` §Core vs opt-in.
+fn main() : Int = add(helper(), 1)
+```
 
-PACKAGE LAYOUT
-  Convention:
+Private items cannot be imported by other packages. Public items in
+internal packages do NOT leak to consumers if the public package
+re-exports them through a public surface; the typer's pub-leak
+validator rejects code that would leak a private type or effect
+through a `pub` signature.
 
-    mypackage/
-      kai.toml
-      main.kai                       # entry point
-      lib.kai                        # other modules
-      examples/                      # example programs (own kai.toml)
-      tests/                         # tests (own kai.toml)
+## Stdlib is auto-loaded
 
-SPEC ARG TO kai BUILD/RUN
+The Hanga Roa "core" set is loaded automatically — no import
+needed for: Stdin/Stdout/Stderr, File, Env, Console, Option, Result,
+List ops, Array, String, Char, Int/Real basics, protocols, complex.
+Everything else (decimal, money, math/int, regexp, collections/*,
+encoding/*, crypto/*, random, fx, uuid, path) is opt-in via
+`import <name>`.
 
-  kai build .                        # cwd's package
-  kai build ./sub                    # sub-package
-  kai build foo.kai                  # single-file mode
-  kai build                          # same as `kai build .`
+Full split: `docs/stdlib-layout.md` §Core vs opt-in.
 
-NOT IN KAIKAI
-  - Cargo-style `[features]`. No feature flags.
-  - npm-style version ranges (`^1.2`). Pin exactly.
-  - Build scripts (`build.rs`). No code runs at build time outside
-    the compiler.
-  - C-style header includes. Each file's import is explicit.
-  - Re-exports inside the same package — files merge automatically.
+## Package layout
 
-SEE ALSO
-  kai info syntax, docs/library-mode.md, docs/stdlib-layout.md
+Convention:
+
+```text
+mypackage/
+  kai.toml
+  main.kai                       # entry point
+  lib.kai                        # other modules
+  examples/                      # example programs (own kai.toml)
+  tests/                         # tests (own kai.toml)
+```
+
+## Spec arg to kai build / run
+
+```text
+kai build .                        # cwd's package
+kai build ./sub                    # sub-package
+kai build foo.kai                  # single-file mode
+kai build                          # same as `kai build .`
+```
+
+## NOT IN KAIKAI
+
+- Cargo-style `[features]`. No feature flags.
+- npm-style version ranges (`^1.2`). Pin exactly.
+- Build scripts (`build.rs`). No code runs at build time outside
+  the compiler.
+- C-style header includes. Each file's import is explicit.
+- Re-exports inside the same package — files merge automatically.
+
+## See also
+
+`kai info syntax`, `docs/library-mode.md`, `docs/stdlib-layout.md`

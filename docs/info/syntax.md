@@ -1,161 +1,455 @@
-SYNTAX(7)                       kaikai                       SYNTAX(7)
+# syntax
 
-NAME
-  syntax — one-page reference of the forms kaikai actually has
+One-page reference of the forms kaikai actually has. Every form on
+this page is real. Forms NOT on this page do not exist in kaikai —
+see the [NOT IN KAIKAI](#not-in-kaikai) section at the bottom.
 
-SYNOPSIS
-  See FORMS below. Every form on this page is real. Forms NOT on this
-  page do not exist in kaikai. See `NOT IN KAIKAI` at the bottom.
+## Description
 
-DESCRIPTION
-  kaikai is statically typed with HM extended by effect rows. Day-to-day
-  syntax stays close to Python/Elixir/JS; advanced surface (effects,
-  handlers, fibers, holes) is novel by design.
+kaikai is statically typed with HM extended by effect rows. Day-to-day
+syntax stays close to Python/Elixir/JS; advanced surface (effects,
+handlers, fibers, holes) is novel by design.
 
-  Comments start with `#`. Files have no module header — the path is
-  the package name (see `kai info packages`).
+Comments start with `#`. Files have no module header — the path is
+the package name (see `kai info packages`).
 
-FORMS
+## Declarations
 
-  Declarations
-    fn name(p1: T1, p2: T2) : R = expr               # short body
-    fn name(p1: T1, p2: T2) : R { stmts; expr }      # block body
-    fn name(p1: T1, p2: T2) : R / Eff1 + Eff2 = ...  # effect annotation
-    pub fn name(...) : R = ...                       # exported
-    type Color = Red | Green | Blue                  # sum type
-    type Point = { x: Int, y: Int }                  # record type
-    effect Logger { log(s: String) : Unit }          # effect decl
-    unit C                                           # unit of measure
-    extern "C" fn name(p: T) : R                     # FFI
+```kaikai
+type Color = Red | Green | Blue                # sum type
+type Point = { x: Int, y: Int }                # record type
 
-  Bindings
-    let x = expr                                     # immutable binding
-    let x: T = expr                                  # with annotation
-    var x = expr                                     # local mutable cell
-                                                     # (sugar for State[T]).
-                                                     # Read with @x;
-                                                     # write with `x := ...`.
-                                                     # Bare `x` is rejected.
+effect Logger {                                # effect declaration
+  log(s: String) : Unit
+}
 
-  Functions and lambdas
-    (x) => body                                      # lambda expression
-    (a, b) => body                                   # multi-arg lambda
-    .                                                # placeholder lambda
-    { x -> body }                                    # block lambda (in
-                                                     # trailing position)
-    f(a, b) { x -> body }                            # trailing lambda
-    f { body }                                       # paren-free single
-                                                     # trailing lambda
+unit m                                         # unit of measure
+unit s
 
-  Control flow
-    if cond { then_block } else { else_block }
-    if cond { then_block }                            # else is optional
-    match expr {
-      Pat1            -> arm1
-      Pat2 if guard   -> arm2
-      _               -> arm3
+fn add(a: Int, b: Int) : Int = a + b           # short body
+fn double(n: Int) : Int { n * 2 }              # block body
+fn greet(name: String) : Unit / Logger {       # with effect row
+  Logger.log("hi #{name}")
+}
+pub fn area(w: Int, h: Int) : Int = w * h      # exported
+
+extern "C" fn cos(x: Real) : Real / Ffi        # FFI — Ffi in row REQUIRED
+
+fn main() : Int = 0
+```
+
+## Bindings
+
+```kaikai
+fn main() : Int / Stdout = {
+  let x = 42                                   # immutable
+  let y: Int = 100                             # with annotation
+
+  var counter = 0                              # local mutable cell
+                                               # (State[Int] handler)
+  counter := @counter + 1                      # write needs `:=`
+  let result = @counter                        # read needs `@`
+  Stdout.print("x=#{int_to_string(x)} y=#{int_to_string(y)} c=#{int_to_string(result)}")
+  0
+}
+```
+
+## Lambdas
+
+```kaikai
+fn run_with(f: (Int) -> Int, x: Int) : Int = f(x)
+
+fn main() : Int = {
+  let f1 = (x) => x + 1                        # unary arrow
+  let f2 = (a, b) => a * b                     # multi-arg arrow
+  let r1 = run_with(. + 10, 5)                 # placeholder `.`
+                                               # only in arg position
+  let r2 = f1(1) + f2(2, 3) + r1
+  r2
+}
+```
+
+## Trailing lambdas
+
+```kaikai
+fn each_of[a, e](xs: [a], f: (a) -> Unit / e) : Unit / e = match xs {
+  []         -> ()
+  [h, ...t]  -> { f(h); each_of(t, f) }
+}
+
+fn main() : Unit / Stdout = {
+  each_of([1, 2, 3]) { x ->                    # block lambda
+    Stdout.print("got #{int_to_string(x)}")
+  }
+}
+```
+
+## Control flow
+
+```kaikai
+import loop
+
+fn classify(n: Int) : String = {
+  if n == 0 {
+    "zero"
+  } else {
+    match n {
+      k if k > 0  -> "pos"
+      _           -> "neg"
     }
-    while { cond } { body }                          # stdlib helper
-    until { cond } { body }                          # stdlib helper
-                                                     # (NO `for x in xs`;
-                                                     # use `xs | (x => ...)`
-                                                     # or `xs |> each(f)`)
+  }
+}
 
-  Pipes
-    x |> f(args)                                     # apply: f(x, args)
-    xs | f                                           # map (head-type dispatch)
-    xs || f                                          # flat-map (head-type)
-    xs |? p                                          # filter (head-type)
+fn count_to(n: Int) : Int / Stdout = {
+  var i = 0
+  while { @i < n } {
+    Stdout.print("#{int_to_string(@i)}")
+    i := @i + 1
+  }
+  @i
+}
 
-  Effects
-    handle { body } with Eff {
-      op(args, resume) -> expr
-      return(x)        -> expr                       # optional
-    }
-    handle { body } with Eff as name { ... }         # rebind capability
-    Eff.op(args)                                     # call op via capability
+fn main() : Int / Stdout = {
+  Stdout.print(classify(0))
+  Stdout.print(classify(5))
+  let _ = count_to(3)
+  0
+}
+```
 
-  Effect rows in types
-    : T / Eff1 + Eff2                                # row of two effects
-    : T                                              # pure (empty row)
+`while` and `until` live in the `loop` stdlib package — `import loop`
+at the top of the file makes them available.
 
-  Literals and operators
-    42  0xFF  0b1010  3.14  3.14e-2                  # numbers
-    'a'  '\n'  'A'                                   # chars
-    "hello"  "x = #{expr}"                           # strings + interp
-    [1, 2, 3]   [head, ...tail]                      # lists
-    [1..10]     [1..10..2]                           # ranges (incl. step)
-    Point { x: 1, y: 2 }                             # record literal —
-                                                     # type prefix REQUIRED
-    Point { x, y }                                   # record punning in
-                                                     # construction
-    { x: 1, y: y }                                   # record PATTERN
-                                                     # (no prefix needed
-                                                     #  in match arms)
-    { x, y }                                         # pattern punning
-    Some(42)    None                                 # variants
-    (a, b)      (a, b, c)      (a, b, c, d)          # n-tuples (sugar for
-                                                     # Pair/Triple/Quad records;
-                                                     # access via .fst/.snd/.trd/.frt)
-    a[i]        a[i] := v                            # array index / set
-    @cap        cap := v                             # capability read/write
-    expr!                                            # Option/Result propagation
-                                                     # (early-return None/Err)
-    + - * / %   == != < <= > >=   and or not         # operators
-    ++                                               # list/string concat
+There is no `for x in xs` loop. Iterate with the map-pipe (`xs | (x =>
+...)`) or `xs |> each(f)` from the prelude.
 
-  Pipe placeholder
-    x |> f(a, _, b)                                  # `_` puts x at the given
-                                                     # position; without `_`,
-                                                     # x lands first.
+## Pipes
 
-  Match patterns (see `kai info match` for the full list)
-    name @ pattern                                   # as-pattern: bind whole
-                                                     # to `name`, also destructure
+Four pipes, each with one intent. See `kai info pipes` for the full
+treatment.
 
-  Units of measure
-    Real<m>     Real<m/s>     Real<m^2>              # in types
-    9.81<m/s^2>                                      # in literals
+```kaikai
+fn double(x: Int) : Int = x * 2
+fn gt1(x: Int) : Bool = x > 1
+fn single(x: Int) : [Int] = [x, x]
+fn sub(a: Int, b: Int) : Int = a - b
 
-  Holes (typed)
-    ?           ?name                                # ask the type-checker
+fn main() : Unit / Stdout = {
+  let a = 5 |> double                          # |> apply
+  let b = [1, 2, 3] | double                   # | map (head-type)
+  let c = [1, 2] || single                     # || flat-map
+  let d = [1, 2, 3] |? gt1                     # |? filter
+  let e = 5 |> sub(7, _)                       # _ placeholder
+  Stdout.print("a=#{int_to_string(a)} b len=#{int_to_string(b.length())} c len=#{int_to_string(c.length())} d len=#{int_to_string(d.length())} e=#{int_to_string(e)}")
+}
+```
 
-  UFCS (method-style dispatch)
-    receiver.fn(args)                                # ≡ fn(receiver, args),
-                                                     # dispatched by receiver
-                                                     # type. Chains left-assoc:
-                                                     # r.f(x).g(y) parses as
-                                                     # (r.f(x)).g(y).
+## Effects
 
-NOT IN KAIKAI
-  These look plausible but DO NOT EXIST. Do not write them:
+```kaikai
+effect Greeter {
+  greet(s: String) : Unit
+}
 
-    \x -> body                  # Haskell lambda. Use (x) => body.
-    fn x -> body                # ML lambda. Use (x) => body.
-    (+ 1)   (* 2)               # operator sections (Haskell). Don't.
-    [x*2 for x in xs]           # Python comprehension. Use `xs | (x => x*2)`.
-    do { ... }                  # Haskell do-notation. Use block body.
-    where x = ...               # Haskell `where`. Use `let` inside block.
-    class Foo where ...         # type classes / HKT. kaikai has neither.
-                                # Single-dispatch protocols only (see
-                                # `kai info protocols`).
-    type Foo<T> = ...           # angle generics. kaikai uses [T]: Foo[T].
-                                # Angle brackets are reserved for units of
-                                # measure (`Real<m>`).
-    null  undefined  nil        # there is no null. Use Option[T].
-    throw  try/catch  raise     # exceptions. Use Fail effect or Result[e, a]
-                                # (and `expr!` for propagation).
-    async / await keywords      # concurrency is via fibers + Spawn effect.
-                                # See `kai info fibers`.
-    interface I { ... }         # no interfaces. See `protocol` instead.
-    impl Trait for T { ... }    # close — kaikai writes `impl Proto for T`.
-    return expr                 # no `return` statement. Last expression
-                                # is the value. (Early-return is via `expr!`
-                                # for Option/Result, match, or structure.)
-    self.x  this.x              # no implicit self/this. Method receivers
-                                # are explicit parameters in `impl` blocks.
+fn say(name: String) : Unit / Greeter = Greeter.greet(name)
 
-SEE ALSO
-  kai info effects, kai info fibers, kai info match, kai info pipes,
-  kai info protocols, kai info units, kai info packages,
-  kai info testing, kai info holes
+fn main() : Int / Stdout = {
+  let result = handle {
+    say("world")
+    42
+  } with Greeter {
+    greet(s, resume) -> { Stdout.print("hello #{s}"); resume(()) }
+    return(x)        -> x
+  }
+  result
+}
+```
+
+In a function type, the row appears after `/`: `: T / E1 + E2`.
+Empty row means pure.
+
+## Literals and operators
+
+```kaikai
+fn main() : Unit / Stdout = {
+  let n = 42 + 0xFF + 0b1010                   # numbers
+  let r = 3.14 + 2.5e-2                        # reals
+  let c = 'A'                                  # chars
+  let s = "hello, #{int_to_string(n)}"         # interpolation
+  let xs = [1, 2, 3]                           # list
+  let r1 = [1..10]                             # range
+  let r2 = [1..10..2]                          # range w/ step
+  let opt = Some(42)                           # variant
+  let combined = [1, 2] ++ [3, 4]              # ++ concat (right-assoc)
+  Stdout.print("n=#{int_to_string(n)} s=#{s} xs len=#{int_to_string(xs.length())} r1 len=#{int_to_string(r1.length())} r2 len=#{int_to_string(r2.length())} combined len=#{int_to_string(combined.length())}")
+  match opt {
+    Some(v) -> Stdout.print("v=#{int_to_string(v)}")
+    None    -> Stdout.print("none")
+  }
+}
+```
+
+List destructuring (`[head, ...tail]`) goes in pattern position, not
+on the RHS of `let`. See the [Patterns section](#patterns-highlights-see-kai-info-match).
+
+Operators by precedence (looser at the bottom):
+
+```text
+postfix       f(args)  a.b  a[i]  expr!  trailing-lambda
+power         a ^ b                                  (right-assoc)
+unary         -x  not x  @cap
+multiplicative *  /  %
+additive      +  -
+concat        ++                                     (right-assoc)
+comparison    ==  !=  <  >  <=  >=                   (non-associative)
+logical and   and                                    (short-circuit)
+logical or    or                                     (short-circuit)
+pipes         |>  |  ||  |?                          (left-assoc)
+```
+
+`a < b < c` is a syntax error (non-associative). Use `a < b and b < c`.
+Boolean operators are the keywords `and`, `or`, `not` — not `&&`,
+`||`, `!`. (`||` is the flat-map pipe; `!` is postfix Option/Result
+propagation.)
+
+## Records
+
+```kaikai
+type Point = { x: Int, y: Int }
+
+fn make_point(x: Int, y: Int) : Point = Point { x, y }       # punning
+
+fn area_at_origin(p: Point) : Int = match p {
+  { x: 0, y: 0 } -> 0                                        # match values
+  { x, y }       -> x * y                                    # pattern punning
+}
+
+fn main() : Int / Stdout = {
+  let p = Point { x: 3, y: 4 }                               # type prefix REQUIRED
+                                                             # in expression position
+  Stdout.print("p.x=#{int_to_string(p.x)}")
+  area_at_origin(p)
+}
+```
+
+## N-tuples
+
+`(a, b)`, `(a, b, c)`, `(a, b, c, d)` desugar to `Pair`, `Triple`,
+`Quad` records. Field access via `.fst`, `.snd`, `.trd`, `.frt`.
+
+```kaikai
+fn make_pair() : (Int, Int) = (10, 20)
+fn make_triple() : (Int, Int, Int) = (1, 2, 3)
+
+fn main() : Unit / Stdout = {
+  let pr = make_pair()
+  let tr = make_triple()
+  Stdout.print("pair=#{int_to_string(pr.fst)},#{int_to_string(pr.snd)}")
+  Stdout.print("triple=#{int_to_string(tr.fst)},#{int_to_string(tr.snd)},#{int_to_string(tr.trd)}")
+}
+```
+
+`(e)` is grouping; never a 1-tuple. `()` is the unit value.
+
+## Patterns (highlights — see `kai info match`)
+
+```kaikai
+fn first(xs: [Int]) : Option[Int] = match xs {
+  []             -> None                        # empty list
+  [x, ..._]      -> Some(x)                     # head + ignored rest
+}
+
+fn list_info(xs: [Int]) : String = match xs {
+  whole @ [_, ..._] -> "non-empty len=#{int_to_string(whole.length())}"
+                                                # `whole` binds the
+                                                # entire scrutinee
+  []                -> "empty"
+}
+
+fn main() : Unit / Stdout = {
+  match first([1, 2, 3]) {
+    Some(n) -> Stdout.print("first=#{int_to_string(n)}")
+    None    -> Stdout.print("empty")
+  }
+  Stdout.print(list_info([1, 2]))
+}
+```
+
+## Postfix `!` — Option/Result propagation
+
+```kaikai
+fn lookup_a() : Option[Int] = Some(3)
+fn lookup_b() : Option[Int] = Some(4)
+
+fn add_them() : Option[Int] = {
+  let a = lookup_a()!                          # unwrap or early-return None
+  let b = lookup_b()!
+  Some(a + b)
+}
+
+fn main() : Unit / Stdout = match add_them() {
+  Some(n) -> Stdout.print("sum=#{int_to_string(n)}")
+  None    -> Stdout.print("none")
+}
+```
+
+The dispatch (Option vs Result) is by the type the typer assigns to
+the expression; the enclosing function's return type must match.
+
+## UFCS
+
+`receiver.fn(args)` desugars to `fn(receiver, args)`, dispatched by
+receiver type. Chains left-associative.
+
+```kaikai
+fn main() : Unit / Stdout = {
+  let r : Result[Int, Int] = Ok(5)
+  let b = r.map((x) => x + 1).map_err((e) => e * 10).is_ok()
+  let xs = [1, 2, 3]
+  let n = xs.length()
+  let label = if b { "yes" } else { "no" }
+  Stdout.print("ok=#{label} n=#{int_to_string(n)}")
+}
+```
+
+## Units of measure
+
+```kaikai
+unit m
+unit s
+
+fn area(w: Real<m>, h: Real<m>) : Real<m^2> = w * h
+fn area_of[u: Measure](w: Real<u>, h: Real<u>) : Real<u^2> = w * h
+
+fn main() : Unit / Stdout = {
+  let g = 9.81<m/s^2>                          # literal with unit
+  let t = 2.0<s>
+  let v = g * t                                # inferred Real<m/s>
+  let a1 = area(3.0<m>, 4.0<m>)
+  let a2 = area_of(3.0<s>, 4.0<s>)
+  Stdout.print("ok")
+}
+```
+
+`^` appears only inside `<...>` for units; `2^10` does not work as
+power in expressions (use `int_pow(2, 10)`).
+
+## Capability sugar
+
+Capability read / write — `@cap` and `cap := v`:
+
+```kaikai
+fn main() : Int / Stdout = {
+  var tally = 0
+  tally := @tally + 1                          # cap := v writes
+  tally := @tally + 1                          # @cap reads
+  let v = @tally
+  Stdout.print("tally=#{int_to_string(v)}")
+  v
+}
+```
+
+`@cap` does not currently flatten through string interpolation
+(`"#{@cap}"`); bind to a `let` first.
+
+Array indexing — `a[i]` reads, `a[i] := v` writes:
+
+```kaikai
+fn main() : Unit / Stdout = {
+  let arr = array_make(3, 0)                   # local array
+  arr[0] := 42                                 # array index write
+  let n = arr[0]                               # array index read
+  Stdout.print("arr[0]=#{int_to_string(n)}")
+}
+```
+
+## Typed holes
+
+```kaikai
+fn maybe(s: String) : Int = {
+  let n = ?                                    # anonymous hole
+  let m = ?fallback                            # named hole
+  n + m
+}
+
+fn main() : Int = 0
+```
+
+The checker reports each hole with expected type and bindings in
+scope under `kai build --holes file.kai`. JSON via `--holes-json`.
+
+## NOT IN KAIKAI
+
+These look plausible but DO NOT EXIST. Do not write them.
+
+```kaikai-neg
+fn main() : Int = (\x -> x + 1)(5)            # Haskell lambda
+```
+
+```kaikai-neg
+fn main() : Int = (fn x -> x + 1)(5)          # ML lambda
+```
+
+```kaikai-neg
+fn main() : [Int] = [1, 2, 3] | (+ 1)         # operator section
+```
+
+```kaikai-neg
+fn main() : [Int] = [x * 2 for x in [1, 2, 3]]  # Python list comp
+```
+
+```kaikai-neg
+fn main() : Int = do { let x = 1; let y = 2; x + y }  # Haskell do
+```
+
+```kaikai-neg
+fn main() : Int = x + y where { let x = 1; let y = 2 }  # Haskell where
+```
+
+```kaikai-neg
+type Foo<T> = T                                # angle generics
+                                               # (use [T] / Foo[T])
+```
+
+```kaikai-neg
+fn pick() : Int = null                         # no null
+```
+
+```kaikai-neg
+fn risky() : Int = throw "boom"                # no throw
+```
+
+```kaikai-neg
+fn main() : Int = {
+  for x in [1, 2, 3] { print(x) }              # no for-in
+  0
+}
+```
+
+```kaikai-neg
+fn main() : Int = {
+  return 42                                    # no return statement
+}
+```
+
+Use instead:
+
+- `\x -> body` / `fn x -> body` → `(x) => body`
+- `(+ 1)` → `(x => x + 1)`
+- `[x*2 for x in xs]` → `xs | (x => x * 2)`
+- `do { ... }` → block body
+- `where x = ...` → `let` inside block
+- angle generics `Foo<T>` → bracket generics `Foo[T]` (angles are reserved for `Real<m>`)
+- `null` / `undefined` / `nil` → `Option[T]`
+- `throw` / `try-catch` → `Fail` effect or `Result[e, a]` (with `expr!`)
+- `async` / `await` → `Spawn` effect (see `kai info fibers`)
+- `interface I { ... }` → `protocol P { ... }`
+- `for x in xs { ... }` → `xs | (x => ...)` or `xs |> each(f)`
+- `return expr` → the last expression of a block IS the value
+- `self.x` / `this.x` → no implicit receiver; methods take explicit params
+
+## See also
+
+`kai info effects`, `kai info fibers`, `kai info match`,
+`kai info pipes`, `kai info protocols`, `kai info units`,
+`kai info packages`, `kai info testing`, `kai info holes`
