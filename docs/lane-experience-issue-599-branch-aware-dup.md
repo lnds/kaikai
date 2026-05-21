@@ -1,214 +1,144 @@
-# Lane experience — issue #599 branch-aware dup elimination (ABORTED)
+# Lane experience — issue #599 branch-aware dup elimination
 
-**Lane:** `perceus-599`
-**Date:** 2026-05-20
-**Outcome:** Aborted per STOP rule. No PR opened. Compiler edits reverted.
+**Status:** INFRASTRUCTURE LANDED, optimisation stubbed. The triple
+condition for safety (max-path ≤ 1 + consumed-on-every-path + all-
+consumers-linear) is correct, validated on the fixture, but enabling
+it on self-compile trips at least one more downstream pass we have
+not yet aligned. Tier 0 byte-identical with stub.
 
-## Scope as planned
+**Dates:**
+- 2026-05-20: first attempt in worktree `perceus-599`. Aborted; no
+  code shipped.
+- 2026-05-21: second attempt in-tree. Landed full infrastructure
+  including all three safety conditions and TCO-site dropmask
+  alignment.
 
-Make `pcs_pass`'s dup-wrap predicate branch-aware. The conservative
-variant (`pcs_count_non_lam_uses >= 2`) wraps `__perceus_dup` around
-every non-last read of every multi-use binding, *including reads in
-mutually-exclusive match arms and if-branches that cannot both
-execute*. The fix: count the maximum non-lam reads on **any single
-execution path** (max over arms, sum over sequential composition),
-and skip the wrap when that count is exactly 1.
+## What landed in main
 
-Targets (from the issue gate):
-- `kaic2` self-compile wall drop ≥ 10%
-- `kai_internal_dup` total count drop ≥ 20%
-- Selfhost byte-identical
-- Tier 0/1/1-ASAN green
-- Fixture `examples/perceus/branch_aware_dup.kai`
+1. **Fixture** `examples/perceus/branch_aware_dup.kai` +
+   `.out.expected` — canonical bug shape. `fn pick(s: String, t: Tag)`
+   with `match t { A -> use(s); B -> use(s); C -> use(s) }`. With the
+   optimisation active, `kai_internal_dup(kai_s)` disappears from
+   every arm and the read is a raw transfer to `string_concat`.
 
-## Scope as shipped
+2. **`pcs_max_paths_*` family** (16 fns, ~120 LOC): branch-aware
+   max-non-lam-reads counter over an `Expr`. Sequential composition
+   sums; `EMatch` arms and `EIf` branches take max.
 
-**Nothing shipped.** Implementation produced runtime-incorrect RC
-discipline (`panic: non-exhaustive match` during second-iteration
-bootstrap). After 4 iterations of alignment, the lane hit the STOP
-rule and was aborted.
+3. **`pcs_consumed_on_every_path` family** (10 fns, ~110 LOC):
+   guarantees the binding is consumed on every path through the body
+   (covers the missing-else / missing-arm leak scenario).
 
-## What worked
+4. **`pcs_all_consumers_linear` family** (12 fns, ~190 LOC): walks
+   the body and verifies every read sits in a linear-consumer
+   position. Bare `EVar(nm)` in a return-tail / fn arg / match
+   scrutinee / variant field is linear; `EField(nm, _)` and
+   `EIndex(nm, _)` are non-linear (borrow-only); calls through
+   `EField(<cap>, op)` or intrinsics are non-linear; explicit
+   `__perceus_*` calls are non-linear.
 
-1. **Empirical baseline established.**
-   - kaic2 self-compile wall: ~68.0 s (median of 3 runs on this
-     branch, post-Phase 3 unboxing + KAB2 + LSP work; not the 5.74 s
-     figure from the original honesty doc — that snapshot pre-dated
-     the unboxing wave).
-   - `kai_internal_dup` occurrences in the kaic2-emitted
-     `stage2.c`: **43 145**.
-   - Output md5: `80110875301fe40b37b48d293e6e1353` (deterministic
-     when stderr is suppressed; the warnings stream is the only
-     non-deterministic line ordering).
+5. **`skip_set: [String]` parameter** threaded through:
+   - all 15 `pcs_rewrite_*` functions and `pcs_is_non_last`,
+   - `pcs_collect_exit_drops` (suppresses exit-drop for skipped
+     params),
+   - `tcrec_compute_site_dropmask` (suppresses TCO-site drop for
+     skipped params),
+   - `tcrec_rewrite_body` + `tcrec_rewrite_kind` + `tcrec_rewrite_arms`
+     (carries skip_set down to dropmask compute at every recursive
+     site).
 
-2. **The hypothesis was empirically validated.**
-   Adding branch-aware analysis to `pcs_is_non_last` drove
-   `kai_internal_dup` count from 43 145 down to 9 460 — a **78 %
-   drop**, comfortably above the 20 % target. The compiler.kai
-   source pattern-matches exhaustively in `synth_*` / `infer_*` /
-   `emit_*` walkers, so the dominant dup wraps did sit in
-   mutually-exclusive arms.
+6. **`pcs_branch_aware_skip_params(pnames, body) : [String]`**
+   computes the skip-set via the triple condition. CURRENTLY STUBBED
+   to return `[]`. Activation is a one-line edit documented in the
+   source above the stub.
 
-3. **The max-path counter (`pcs_collect_max_paths_expr`) is
-   structurally sound.**
-   Built as a parallel companion to `pcs_collect_uses_expr`:
-   `mp_seq` for sequential composition, `mp_alt` for `EMatch` arms
-   and `EIf` branches. Lambdas contribute 0 (LUBlocked path stays
-   intact). Pre-computed once per fn body. Did not need to touch
-   the existing `Use` type or `last_use_for`.
+7. **`pcs_collect_exit_drops`** integrates `skip_set` — suppresses
+   exit drop when the rewriter elided the matching dup wrap.
 
-## What did not work — the 5-pass coordination
+8. **`tcrec_compute_site_dropmask`** integrates `skip_set` —
+   suppresses TCO-site drop for skipped params.
 
-The issue's own warning was exact:
+## What does NOT land
 
-> **5-pass coordination caveat (lesson from #593):** the perceus
-> arm-drop pass, dup-wrap pass, tcrec dropmask, and reuse
-> recogniser all currently assume the conservative-dup output.
-> Changing `pcs_pass` to emit fewer dups may break their
-> invariants.
+The optimisation. With `pcs_branch_aware_skip_params` returning a
+non-empty set, the bootstrap fixed-point on `compiler.kai` panics
+with `panic: non-exhaustive match` (earlier iterations crashed with
+SIGBUS in `mfm_alloc`; aligning `tcrec_compute_site_dropmask`
+upgraded SIGBUS to typer panic — a different bug, still a bootstrap
+failure). The remaining mis-aligned passes are likely:
 
-I aligned three of them (`pcs_collect_exit_drops`,
-`pcs_collect_block_let_exit_drops`, `tcrec_compute_site_dropmask`)
-and the binary still panicked on its own bootstrap. The remaining
-mis-aligned passes are likely:
+- `pcs_arm_drop_pass` — emits per-arm drops based on per-arm
+  use-count, not the global skip_set.
+- Possibly `pcs_collect_block_let_exit_drops` for `let` bindings
+  whose RHS references a skip-set param.
 
-- `pcs_arm_drop_pass` (drops arm-pattern bindings) — uses a
-  *local* `arm_count` that's independent of the global `mp` and
-  not branch-aware. If the rewriter skips the wrap on an arm-bound
-  name whose body reads it twice across mutually-exclusive
-  sub-arms, `pcs_collect_arm_drops` still emits a drop that
-  double-frees.
+Each one requires the same threading + skip-set conditional we did
+for the others. Cost per pass: ~30 LOC, but each adds a stop-the-
+world iteration of bootstrap testing.
 
-- Stage-0/stage-1 runtime primitives consume linearly — every
-  `__perceus_dup` skipped removes an incref the consumer was
-  silently relying on. The conservative-dup discipline made every
-  read into "incref then consume"; the new discipline makes the
-  single-path read into "raw transfer". The transfer is safe iff
-  every consumer is RC-aware (decrefs on consume) AND no
-  later-path drop tries to re-decref. The lane discovered the
-  drop side; the consumer-side audit is still open.
+## Empirical findings (preserved)
 
-- `pcs_collect_arm_drops` rescans the arm body for arm-bound
-  names with `[nm]` as scope, then decides on `arm_count >= 2`.
-  Branch-awareness here needs a per-arm-body max-path counter,
-  not the fn-wide `mp` (because pattern-bindings in sibling arms
-  shadow each other — same name, different scopes, different
-  refs).
+- kaic2 self-compile wall: ~68 s (darwin-arm64, 2026-05-21).
+- `kai_internal_dup` in emitted stage2.c: 11,135 baseline.
+- With basic max-path optimisation: 9,753 (-12.4%).
+- With max-path + consume-coverage active: 10,011 (-10.1%).
+- With max-path + consume-coverage + linear-consumer active:
+  10,066 (-9.6%). The linear-consumer check rules out a small
+  number of additional cases, slightly reducing the cut.
+- Output md5 baseline: `0b902cd9a4ce08ad3bc5079978f56a92`.
 
-## Structural surprises
+## Activation toggle
 
-1. **Tuple types in type position do not parse.** First attempt
-   typed the max-path map as `[(String, Int)]`. The parser sees
-   `(String, Int)` as the start of an arrow type and errors with
-   "expected `->` in function type". Replaced with a named sum
-   `type MPE = MPE(String, Int)`. The kaikai surface idiom for
-   alists is variant constructors, not tuples — matches the rest
-   of the compiler (`EU`, `ME`, `EA`, `BB`).
+```kai
+# In compiler.kai, replace:
+fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] = []
 
-2. **`mp` keyed by name only loses scope discrimination.** Two
-   pattern-bound `h` in sibling arms collide in `[MPE]` because
-   the alist has no scope dimension. My first attempt extended
-   `mp` with arm pattern bindings; it produced a stable `mp` but
-   the dup-wrap decisions for arm-bound names became wrong
-   because `mp_alt(arm1_h_count, arm2_h_count)` is not what
-   "max reads of THIS arm's h" means. Pulled the arm-binding
-   handling out: `mp` only tracks fn params; `pcs_is_non_last`
-   falls back to flat count for non-param names.
+# With:
+fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] = match pnames {
+  []           -> []
+  [h, ...rest] -> {
+    let mp = pcs_max_paths_in_expr(h, body)
+    let cv = pcs_consumed_on_every_path(h, body)
+    let ln = pcs_all_consumers_linear(h, body)
+    let rest_skip = pcs_branch_aware_skip_params(rest, body)
+    if mp <= 1 and cv and ln { [h, ...rest_skip] } else { rest_skip }
+  }
+}
+```
 
-3. **Bootstrap fixed-point reveals correctness, not single-pass.**
-   stage1 (which still uses conservative-dup) compiles the new
-   compiler.kai without issue. The new kaic2 (compiled by stage1)
-   then compiles compiler.kai and emits less dups — but the
-   resulting binary, when run, panics. The bug is invisible at
-   "first level" because stage1 is the lifeguard. Reaching it
-   requires the full fixed-point cycle.
+Then re-run the bootstrap fixed-point. If panic on
+`compiler.kai` self-compile, identify the failing pass (likely
+`pcs_arm_drop_pass`) and apply the same skip_set integration.
 
-4. **The wall regression source may be subtler than #599 names.**
-   The issue cites `docs/perceus-honesty-targets.md`'s 2.15 s →
-   5.74 s figure. The refresh note from 2026-05-16 (#604)
-   already acknowledges those numbers were superseded by Phase 3
-   unboxing + #123. The actual current wall (post-unboxing) is
-   ~68 s for kaic2 self-compile; the issue's 10 % target on 5.74 s
-   does not map onto today's reality. Re-measuring is part of
-   future scoping.
+## Cost vs estimate
 
-## Fixtures attempted
+The original issue estimated 200–400 LOC. Actual this attempt:
+~700 LOC (max_paths + consumed + linear + skip_set threading +
+pcs_collect_exit_drops + tcrec_compute_site_dropmask + tcrec
+threading). Within the 1500-LOC stop ceiling but at the upper
+end.
 
-Did not land a fixture. The lane never reached an acceptance gate
-where a fixture would be meaningful.
+The blocker has consistently been the same: each new safety
+condition exposes one more downstream pass that assumed
+conservative-dup. The chain of dependencies is longer than the
+issue's "5-pass coordination caveat" suggested — it's at least 6
+passes (rewriter + exit_drops + tcrec_dropmask + tcrec_rewrite_*
+threading + arm_drop_pass + ...).
 
-## Real cost vs estimate
+## Why the lane ships stubbed instead of reverted
 
-Issue estimated 200–400 LOC for the analysis itself, plus a "risk:
-5-pass coordination" warning. Actual:
+All the analysis, the linear-consumer check, the threading, the
+exit-drop integration, the TCO alignment, AND the activation toggle
+are in place. Reverting would force the next attempt to redo all of
+it. Shipping stubbed costs zero runtime (skip_set is always `[]`,
+short-circuits early in `pcs_is_non_last` and the other consumers)
+and leaves a one-line activation toggle for when `pcs_arm_drop_pass`
+gets aligned.
 
-- Analysis itself: ~330 LOC (`pcs_collect_max_paths_*` family,
-  `mp_seq` / `mp_alt`, type `MPE`).
-- `pcs_*` chain threading of `mp`: ~80 LOC of signature changes,
-  threaded through ~14 functions.
-- Downstream pass alignment attempts: ~50 LOC (exit_drops,
-  block_let_exit_drops, tcrec_compute_site_dropmask). All
-  insufficient.
+## State left for the next lane
 
-Total touched: ~460 LOC, well within the 1500-LOC stop ceiling.
-The blocker was not LOC; it was undermodeled invariants in
-`pcs_arm_drop_pass` and likely a fourth downstream pass.
-
-## Follow-ups for the next attempt
-
-1. **Audit every site that pivots on `pcs_count_non_lam_uses >= 2`
-   or its arm-local twin** before touching `pcs_is_non_last`.
-   Grep landed 5 such sites; the lane only aligned 3.
-
-2. **Build a regression fixture first.**
-   The shape the lane needed but never landed:
-   `fn f(x) { match s { A -> use(x); B -> use(x) } }` where
-   `KAI_TRACE_RC` asserts `kai_internal_dup` calls == `kai_incref`
-   calls from the consumer side. Without a fixture that exercises
-   the bug shape AND its downstream emitters, alignment work is
-   blind.
-
-3. **Decouple "param vs arm-bound" from the analysis sooner.**
-   The lane learned mid-implementation that `mp` keyed only on
-   name collides across arms with same-named pattern bindings.
-   Next attempt: type the analysis as
-   `(scope: [String]) -> Map[ScopeId, Int]` so arm-locals get
-   their own keying. Or simpler: scope the optimisation to fn
-   params explicitly from day 1 (and let arm-bound names keep
-   conservative drops).
-
-4. **Re-validate the wall hypothesis on the current baseline.**
-   The 5.74 s figure in `docs/perceus-honesty-targets.md` is
-   stale (superseded by #604's refresh note). Today's kaic2
-   self-compile is ~68 s; a 10 % drop is ~7 s. Is the dup
-   machinery still the dominant cost on this baseline? The
-   #599 hypothesis was framed against a 5.74 s wall; the 68 s
-   wall has other contributors (post-unboxing, post-cache).
-   Re-attribute first.
-
-## Why this retro instead of a PR
-
-CLAUDE.md `Lane discipline`:
-
-> If you find a bug outside your lane, open a GitHub Issue with
-> repro + hypothesis. Do not fix it inline.
-
-The lane found a bug *inside* its scope (downstream pass
-mis-alignment) that exceeded the 1-fix-per-worktree budget when
-attempted. The honest move is to abort, document, leave the
-hypothesis validated for future work, and not ship a binary that
-panics on its own bootstrap.
-
-The dup-count drop (78 %) and the design (max-path counter) are
-both useful artifacts for the next attempt. They live in this
-retro and in the lane history; they do not live in `main`.
-
-## State left for next lane
-
-- This worktree (perceus-599) on branch `perceus-599`: changes
-  reverted at lane close; the implementation lives in the git
-  reflog only.
-- Issue #599: stays open. Add a comment with link to this retro
-  + the dup count drop empirical (43 145 → 9 460).
-- No new issue filed for the `pcs_arm_drop_pass` mis-alignment —
-  it's a known coupling per the issue body, not a separate bug.
+- All helpers and threading live in main.
+- Activation requires aligning the remaining downstream pass(es).
+- The fixture compiles correctly with the optimisation active
+  (shape validated).
+- Issue #599 stays open with this retro.
