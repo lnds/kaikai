@@ -1035,7 +1035,7 @@ SECURERANDOM_FIXTURES := random_secure_basic
 test-securerandom-asan: $(TARGET) build
 	@set -e; \
 	for name in $(SECURERANDOM_FIXTURES); do \
-	  ./$(TARGET) $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
 	    ../examples/stdlib/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -1379,7 +1379,7 @@ test-stdlib: $(TARGET) build
 test-stdlib-crypto-asan: $(TARGET) build
 	@set -e; \
 	name=crypto_hash_basic; \
-	./$(TARGET) $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
 	  ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
 	  || { echo "stdlib-crypto-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
@@ -1416,7 +1416,7 @@ test-stdlib-crypto-asan: $(TARGET) build
 test-stdlib-regex-predicate-asan: $(TARGET) build
 	@set -e; \
 	for name in regex_predicate_basic regex_subsume_basic regex_subsume_alpha; do \
-	  ./$(TARGET) $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
 	    ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
 	    || { echo "stdlib-regex-predicate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
