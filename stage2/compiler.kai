@@ -44865,30 +44865,19 @@ fn pcs_max_paths_in_ret_opt(nm: String, opt: Option[HReturn]) : Int = match opt 
 #      is a linear consumer: a call to a user-defined fn (which
 #      pcs_pass made linear by construction) or a variant/record
 #      that owns the slot. Non-linear consumers (intrinsics,
-#      capability ops, raw field access on a borrowed record)
-#      internally incref their arg, and a raw transfer would leak
-#      or double-free.
-# DISABLED — returns the empty list. The triple condition
-# (max-path ≤ 1 AND consumed-on-every-path AND all-consumers-linear)
-# is correct in isolation and on the fixture, but enabling it on
-# self-compile of compiler.kai trips a downstream pass that this
-# lane has not yet aligned. The activation toggle below restores
-# the optimisation; see the retro for the remaining work.
-fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] = []
-
-# Activation toggle (when remaining downstream passes are aligned):
-# replace the body above with:
-#
-#   match pnames {
-#     []           -> []
-#     [h, ...rest] -> {
-#       let mp = pcs_max_paths_in_expr(h, body)
-#       let cv = pcs_consumed_on_every_path(h, body)
-#       let ln = pcs_all_consumers_linear(h, body)
-#       let rest_skip = pcs_branch_aware_skip_params(rest, body)
-#       if mp <= 1 and cv and ln { [h, ...rest_skip] } else { rest_skip }
-#     }
-#   }
+#      capability ops, raw field access on a borrowed record,
+#      list-spread tails `[..., ...nm]`) internally incref their
+#      arg, and a raw transfer would leak or double-free.
+fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] = match pnames {
+  []           -> []
+  [h, ...rest] -> {
+    let mp = pcs_max_paths_in_expr(h, body)
+    let cv = pcs_consumed_on_every_path(h, body)
+    let ln = pcs_all_consumers_linear(h, body)
+    let rest_skip = pcs_branch_aware_skip_params(rest, body)
+    if mp <= 1 and cv and ln { [h, ...rest_skip] } else { rest_skip }
+  }
+}
 
 # Returns `true` if every read of `nm` in `e` is a linear consumer
 # context — either:
@@ -45075,10 +45064,19 @@ fn pcs_consumers_linear_fields(nm: String, fis: [FieldInit]) : Bool = match fis 
 fn pcs_consumers_linear_elems(nm: String, els: [ListElem]) : Bool = match els {
   []           -> true
   [h, ...rest] -> {
-    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
-    # List element: cons cell takes ownership of head.
-    pcs_all_consumers_linear(nm, inner) and
-    pcs_consumers_linear_elems(nm, rest)
+    let h_ok = match h {
+      ElPlain(e)  -> pcs_all_consumers_linear(nm, e)
+      ElSpread(e) -> match e.kind {
+        # `[x, ...nm]` lowers to `kai_cons(x, kai_incref(nm))`
+        # (see `emit_list_tail` in the emitter): the spread tail is
+        # increfed, not transferred. A bare `EVar(nm)` spread is
+        # therefore a non-linear consumer of `nm` — the conservative
+        # dup wrap MUST stay.
+        EVar(uname) -> uname != nm
+        _           -> pcs_all_consumers_linear(nm, e)
+      }
+    }
+    h_ok and pcs_consumers_linear_elems(nm, rest)
   }
 }
 
