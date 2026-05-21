@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.81.0 (2026-05-21)
+
+### Added
+
+- **cli**: kai info — man/info-style language reference
+- **ci**: BinSerialize Tier 2 perf gate (closes #489)
+
 ## v0.80.0 (2026-05-20)
 
 ### Added
