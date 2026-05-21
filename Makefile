@@ -174,8 +174,12 @@ tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
 # dispatcher, JSON-escape regressions in the awk converter.
-test-info:
+# Also runs the fenced-code-block compile audit so every example in
+# `docs/info/*.md` is guaranteed to type-check against the current
+# stage 2 compiler.
+test-info: kaic2
 	@tools/test-info.sh
+	@tools/test-info-blocks.sh
 
 # Issue #643 — institutional regression gate for the private-type
 # leak fix. `tools/audit-prelude-private-types.sh` walks every
