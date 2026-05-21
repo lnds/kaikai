@@ -34,16 +34,31 @@ EXAMPLES
   [1, 2, 3] |? (x => x > 1)                # → [2, 3]
   [[1,2],[3]] || (xs => xs)                # → [1, 2, 3]
 
-  # `|>` with a stdlib fn:
+  # `|>` with a stdlib fn (single-arg, no parens needed):
   "hello" |> string_length                 # → 5
   42 |> int_to_string                      # → "42"
 
-  # Composing pipes:
-  [1..10] |? is_prime | int_to_string |> list.intersperse(", ")
+  # `|>` with extra args (LHS lands first by default):
+  3 |> max(7)                              # → max(3, 7) → 7
+
+  # `|>` with explicit placeholder `_` to land elsewhere:
+  3 |> max(7, _)                           # → max(7, 3) → 7
+
+  # `|>` into an effectful fn:
+  "boom" |> Stdout.print                    # row picks up `Stdout`
+
+  # Composing pipes (left-assoc):
+  [1..10] |? is_prime | (n => n * 2) |> sum
 
 PRECEDENCE
-  Pipes are LEFT-ASSOCIATIVE. They bind looser than arithmetic and
-  comparisons. When in doubt, parenthesise.
+  Pipes are at the bottom of the precedence table (level 10, looser
+  than `and` / `or`, which are looser than comparisons, which are
+  looser than arithmetic). All pipes associate LEFT. So
+  `a + b |> f` parses as `f(a + b)`, and `xs | g | h` parses as
+  `(xs | g) | h`. When in doubt, parenthesise.
+
+  Comparisons are NON-ASSOCIATIVE: `a < b < c` is a syntax error
+  (use `a < b and b < c`).
 
 NOT IN KAIKAI
   - `|>` from F# meaning the same thing — close but in F# it is
@@ -52,6 +67,13 @@ NOT IN KAIKAI
   - Reverse pipe `<|`. Not in kaikai.
   - Function composition operator. Use a lambda.
   - Operator sections `(+ 1)` to feed into pipes. Use `(x => x + 1)`.
+  - `||` as boolean OR (C/JS/Java). In kaikai `||` is the flat-map
+    pipe. Boolean OR is the keyword `or`. Boolean AND is `and`
+    (not `&&`). NOT is the keyword `not` (not `!`).
+  - `|>` chained without parens around a non-call RHS:
+    `x |> y |> z` works because each step is a separate pipe;
+    but `x |> (y |> z)` is parenthesised application, evaluated
+    right-first.
 
 SEE ALSO
   kai info syntax, kai info protocols, docs/protocols.md
