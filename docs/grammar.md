@@ -57,11 +57,11 @@ intentionally in `docs/syntax-sugars.md`; this doc carries only their
 # line comment until end-of-line
 ```
 
-There are no block comments. `/*` is reserved and lexes to `TkError`
-with a guidance message; `//` is reserved the same way (it is neither a
-comment form nor an operator — `Int / Int` already truncates per #315).
-The sequence `#[` at the start of a token opens an **attribute** (see
-1.4 — `HASHOPEN` token) and is *not* treated as a comment.
+There are no block comments. `/*` and `//` lex to `TkError` with a
+guidance message; neither is a comment form nor an operator. Integer
+`/` on `Int` operands truncates. The sequence `#[` at the start of a
+token opens an **attribute** (see 1.4 — `HASHOPEN` token) and is *not*
+treated as a comment.
 
 ### 1.3 Identifiers
 
@@ -77,13 +77,13 @@ Naming conventions enforced by `kai fmt` and the resolver:
   identifier.
 - `_name` (leading underscore on an identifier) — convention for
   *intentionally unused* local bindings. The typer warns on any
-  unused `let` or pattern binding (issue #381) and silences the
-  warning when the name starts with `_`. Function parameters never
-  warn regardless of name (interface compliance, protocol dispatch,
-  contract with caller).
+  unused `let` or pattern binding and silences the warning when the
+  name starts with `_`. Function parameters never warn regardless of
+  name (interface compliance, protocol dispatch, contract with
+  caller).
 - `__name` (double underscore prefix) — reserved for compiler-
-  internal synthetics produced by desugars (`__cv_*` from m12.6
-  const-pattern desugar, `__pcs_ret` from Perceus, etc.). User code
+  internal synthetics produced by desugars (`__cv_*` from const-
+  pattern desugar, `__pcs_ret` from Perceus, etc.). User code
   should avoid this prefix; it is also silenced by the unused-
   binding check.
 - `kai_*` is reserved for the runtime / FFI shim layer.
@@ -96,12 +96,13 @@ Reserved words (recognised by the lexer as keyword tokens, never as
 identifiers):
 
 ```
-and       as        assert    axiom     bench     check
-const     effect    else      ensures   extern    false
-fn        for       handle    if        impl      import
-let       match     not       or        protocol  pub
-requires  test      true      type      unit      use
-var       where     with
+and       as        assert    axiom     bench     case
+check     const     effect    else      ensures   extern
+false     fn        for       handle    if        impl
+import    let       match     not       or        priv
+protocol  pub       requires  test      todo      true
+type      unit      use       var       when      where
+with
 ```
 
 Plus the special tokens:
@@ -110,11 +111,23 @@ Plus the special tokens:
   by an identifier (`derive`, `unstable`, or any future attribute name),
   optional `(args)`, and the matching `]`.
 - `todo!`    — the `TODOBANG` token, an explicit termination escape.
+  Lexer recognises `todo` immediately followed by `!` as one token;
+  bare `todo` is the reserved keyword (no other use today).
 - `?`        — the `HOLE` token (bare typed hole).
 - `?ident`   — the `HOLE_NAME` token (named typed hole).
+- `$ident`   — the parser pairs a bare `DOLLAR` token with the
+  following identifier to recognise compiler intrinsics
+  (`$extern_handler("c_symbol")`, etc.). Not a user-extensible form.
+
+`_` is its own token (`UNDERSCORE`), used as wildcard pattern,
+lambda placeholder, and pipe-placeholder argument.
 
 `Self` is reserved inside protocol bodies but not lexed as a keyword
 elsewhere.
+
+`case`, `priv`, and `when` are reserved for the parser's case-led
+multi-clause bodies and refinement-related forms; they are NOT user-
+extensible identifier names. Do not bind them as locals.
 
 ### 1.5 Punctuation and operators
 
@@ -136,8 +149,9 @@ elsewhere.
 | `PIPE`                     | `|`     |
 | `PIPE_APPLY`               | `|>`    |
 | `BAR_BAR`                  | `||`    |
+| `PIPE_QUESTION`            | `|?`    |
 | `PLUS`, `MINUS`, `STAR`    | `+` `-` `*` |
-| `SLASH`, `SLASH_SLASH`     | `/` `//` |
+| `SLASH`                    | `/`     |
 | `PERCENT`                  | `%`     |
 | `PLUS_PLUS`                | `++`    |
 | `EQ_EQ`, `NEQ`             | `==` `!=` |
@@ -145,9 +159,15 @@ elsewhere.
 | `BANG`                     | `!`     |
 | `AT`                       | `@`     |
 | `CARET`                    | `^`     |
+| `UNDERSCORE`               | `_`     |
+| `DOLLAR`                   | `$` (compiler intrinsics only — see §1.4) |
+| `HASHOPEN`                 | `#[` (attribute body) |
+| `COMPLEX`                  | imaginary literal token (`3i`, `2.5i`) |
+| `REGEX`                    | regex sigil token (`~r/.../flags?`) |
 
 The match between these names and `compiler.kai`'s `Tk*` enum is
-1:1; differences in casing are presentation only.
+1:1; differences in casing are presentation only. Integer division is
+`/` on `Int` operands; the typer distinguishes by operand type.
 
 ### 1.6 Literals
 
@@ -270,7 +290,7 @@ module_path ::= IDENT ('.' IDENT)*
 import_tail ::= 'as' IDENT
               | '.' '{' ident_list '}'
 ident_list  ::= IDENT (',' IDENT)*
-use_decl    ::= 'use' module_path                    (* m7e §25 *)
+use_decl    ::= 'use' module_path                    (* `use` reserved *)
 ```
 
 There is no `module` declaration; a file's module name comes from its
@@ -354,8 +374,8 @@ protocol_decl ::= 'protocol' IDENT type_params? '{' protocol_op+ '}'
 protocol_op   ::= 'fn'? IDENT '(' params? ')' return_spec ('=' expr)?
 ```
 
-`Self` is implicit. `protocol P[A]` (issue #180) introduces a single
-type parameter `A` for parametrised single-dispatch protocols.
+`Self` is implicit. `protocol P[A]` introduces a single type
+parameter `A` for parametrised single-dispatch protocols.
 
 #### Implementation declaration
 
@@ -367,9 +387,9 @@ impl_type_param  ::= IDENT (':' type_bound ('+' type_bound)*)?
 impl_member ::= 'fn'? IDENT '(' params? ')' return_spec? fn_body
 ```
 
-Bounded impl-site type parameters (`impl[T : Show + Eq] Show for [T]`,
-issue #174) are the only place protocol bounds appear in the syntax;
-ordinary `fn` declarations do not carry bounds.
+Bounded impl-site type parameters (`impl[T : Show + Eq] Show for [T]`)
+are the only place protocol bounds appear in the syntax; ordinary
+`fn` declarations do not carry bounds.
 
 #### `extern "C"` / `axiom`
 
@@ -380,8 +400,8 @@ extern_decl ::= 'extern' STRING_LIT 'fn' IDENT
 axiom_decl  ::= 'axiom' IDENT type_params? '(' params? ')' return_spec
 ```
 
-`extern "C" fn` (issues #260, #261) routes through `axiom_decl_inner`
-so the rest of the pipeline keeps a single shape.
+`extern "C" fn` routes through `axiom_decl_inner` so the rest of
+the pipeline keeps a single shape.
 
 #### Constants and units
 
@@ -472,33 +492,40 @@ directly (see §3 for the table). Each `parse_<level>` function in
 ```
 expr        ::= pipe_expr
 pipe_expr   ::= or_expr (pipe_op or_expr)*
-pipe_op     ::= '|>' | '|' | '||'
+pipe_op     ::= '|>' | '|' | '||' | '|?'
 or_expr     ::= and_expr ('or' and_expr)*
 and_expr   ::= cmp_expr ('and' cmp_expr)*
 cmp_expr    ::= concat_expr (cmp_op concat_expr)?     (* non-associative *)
 cmp_op      ::= '==' | '!=' | '<' | '>' | '<=' | '>='
 concat_expr ::= add_expr ('++' add_expr)*              (* right-associative *)
 add_expr    ::= mul_expr (('+' | '-') mul_expr)*
-mul_expr    ::= unary_expr (('*' | '/' | '//' | '%') unary_expr)*
+mul_expr    ::= unary_expr (('*' | '/' | '%') unary_expr)*
 unary_expr  ::= ('-' | 'not' | '@') unary_expr
               | pow_expr
 pow_expr    ::= postfix_expr ('^' postfix_expr)?       (* right-associative *)
 postfix_expr ::= primary postfix*
-postfix     ::= '.' IDENT                              (* field / method *)
+postfix     ::= '.' IDENT                              (* field / method / UFCS *)
               | '(' arg_list? ')' trailing_lambda?
                                   trailing_lambda?     (* call *)
               | '[' expr ']'                           (* index *)
-              | '?'                                    (* postfix Option/Result *)
-              | '!'                                    (* postfix unwrap *)
+              | '!'                                    (* postfix
+                                                        Option/Result early
+                                                        propagation *)
               | trailing_lambda                        (* paren-less call *)
               | trailing_lambda trailing_lambda
 arg_list    ::= arg (',' arg)*
 arg         ::= expr
-              | '_'                                    (* placeholder *)
+              | '_'                                    (* pipe placeholder
+                                                        — only inside the
+                                                        RHS call of `|>` *)
 trailing_lambda ::= '{' (lambda_params '->')? block_body '}'
 lambda_params ::= IDENT (',' IDENT)*
 block_body  ::= (stmt stmt_sep)* expr?
 ```
+
+`?` and `?ident` are primary (typed-hole) expressions only — there
+is no postfix `?`. See §1.4 *special tokens*. Integer `/` on `Int`
+operands truncates.
 
 #### Primary expressions
 
@@ -545,18 +572,18 @@ starts a block expression.
 ```
 record_lit  ::= IDENT ('{' field_init_list? '}')
 field_init_list ::= spread_inits | named_inits | pun_inits | positional_inits
-spread_inits ::= '...' expr (',' named_init)* ','?     (* issue #326 *)
+spread_inits ::= '...' expr (',' named_init)* ','?     (* spread *)
 named_inits ::= named_init (',' named_init)* ','?
 named_init  ::= IDENT ':' expr
 pun_inits   ::= IDENT (',' IDENT)* ','?
-positional_inits ::= expr (',' expr)*                  (* issue #266 *)
+positional_inits ::= expr (',' expr)*                  (* positional *)
 ```
 
 The parser inspects the first element after `T {`:
 
-- `'...'`            — record-spread sugar (issue #326). Only named
-                       overrides may follow; pun and positional are
-                       rejected. A pre-typer pass expands
+- `'...'`            — record-spread sugar. Only named overrides
+                       may follow; pun and positional are rejected.
+                       A pre-typer pass expands
                        `T { ...src, x: 10 }` into
                        `{ let s = src; T { f1: s.f1, ..., x: 10, ... } }`,
                        filling unnamed declared fields from `src`. The
@@ -648,14 +675,13 @@ list_spread ::= '...'                                  (* tail discarded — pre
 ```
 
 The bare `...` is the preferred spelling for "match any list with this
-prefix, tail unused"; `..._` and `...IDENT` remain accepted for the
-"uniform-with-`_`" reading and for binding the tail respectively
-(issue #328).
+prefix, tail unused"; `..._` and `...IDENT` are also accepted, for the
+"uniform-with-`_`" reading and for binding the tail respectively.
 
 ### 2.8 Refinements
 
-`m12.6.x` introduces `where` clauses and `requires` / `ensures`
-annotations. They attach to function declarations and to `match` arms.
+`where` clauses and `requires` / `ensures` annotations attach to
+function declarations and to `match` arms.
 
 ```
 fn_decl     ::= ... fn_body refine_block?
@@ -676,16 +702,16 @@ resolves against the level above it.
 
 | Level | Operators                                     | Associativity        | Parser fn          |
 |------:|-----------------------------------------------|----------------------|--------------------|
-|     1 | call `f(args)`, field `.`, index `[i]`, postfix `?` / `!`, trailing-lambda | Postfix              | `parse_postfix`    |
+|     1 | call `f(args)`, field `.`, index `[i]`, postfix `!`, trailing-lambda | Postfix              | `parse_postfix`    |
 |     2 | `^` (power)                                   | Right                | `parse_pow`        |
 |     3 | unary `-`, `not`, `@`                         | Prefix               | `parse_unary`      |
-|     4 | `*`, `/`, `//`, `%`                           | Left                 | `parse_mul`        |
+|     4 | `*`, `/`, `%`                                 | Left                 | `parse_mul`        |
 |     5 | `+`, `-` (binary)                             | Left                 | `parse_add`        |
 |     6 | `++` (concat)                                 | Right                | `parse_concat`     |
 |     7 | `==`, `!=`, `<`, `>`, `<=`, `>=`              | **Non-associative**  | `parse_cmp`        |
 |     8 | `and`                                         | Left (short-circuit) | `parse_and`        |
 |     9 | `or`                                          | Left (short-circuit) | `parse_or`         |
-|    10 | `\|>`, `\|`, `\|\|`                            | Left                 | `parse_pipe`       |
+|    10 | `\|>`, `\|`, `\|\|`, `\|?`                     | Left                 | `parse_pipe`       |
 
 Notes:
 
@@ -700,6 +726,10 @@ Notes:
   `CARET` is rejected by the lexer's parse stage.
 - `:=` is a **statement** form, not an operator. It does not appear
   in the precedence table.
+- Postfix `!` propagates `Option`/`Result` early-return; binds
+  tighter than calls so `lookup_a()!` evaluates the call first then
+  unwraps. `?` is primary (typed-hole), not postfix.
+- Integer `/` on `Int` operands truncates.
 
 ## §4 — Sugars and their desugars
 
@@ -708,7 +738,7 @@ shape. The authoritative spec for intent and editorial rules is
 `docs/syntax-sugars.md`; this section only summarises the grammar
 delta and the desugar target.
 
-### 4.1 N-tuples (issue #154)
+### 4.1 N-tuples
 
 ```
 (a, b)              ≡  Pair { fst: a, snd: b }
@@ -724,7 +754,7 @@ let (a, b) = pair   ≡  let Pair { fst: a, snd: b } = pair  (* pattern *)
 
 Cap arity 2..4. `(e)` is grouping, never a 1-tuple. `()` is unit.
 
-### 4.2 Trailing lambdas (issue #244)
+### 4.2 Trailing lambdas
 
 ```
 f(args) { body }       ≡  f(args, () => body)
@@ -735,7 +765,7 @@ f { body }             ≡  f(() => body)             (* paren-less *)
 Same-line attachment only: a `NEWLINE` between the call and `{`
 terminates the call; the `{` then starts a block expression.
 
-### 4.3 Double trailing lambdas (issue #248)
+### 4.3 Double trailing lambdas
 
 ```
 f(a) { body1 } { body2 }  ≡  f(a, () => body1, () => body2)
@@ -749,11 +779,22 @@ preceding `}` continuation).
 ```
 xs |> f                ≡  f(xs)                     (* apply *)
 xs |> f(extra)         ≡  f(xs, extra)
-xs | f                 ≡  map(xs, f)                (* map *)
-xs || f                ≡  flat_map(xs, f)           (* flat-map *)
+xs |> f(a, _, b)       ≡  { let __p = xs in f(a, __p, b) }   (* placeholder *)
+xs | f                 ≡  <head>.map(xs, f)         (* map *)
+xs || f                ≡  <head>.flat_map(xs, f)    (* flat-map *)
+xs |? p                ≡  <head>.filter(xs, p)      (* filter *)
 ```
 
-### 4.5 Lambda block as expression (issue #244)
+The `|`, `||`, and `|?` pipes dispatch by head-type-of-LHS;
+participating types export `pub fn map / flat_map / filter` with the
+canonical signatures. `|>` is plain application — no dispatch.
+
+The pipe placeholder `_` is recognised only inside the RHS argument
+list of `|>`. Multiple `_` in the same call are rejected (would
+duplicate side effects of the LHS). With no `_`, the LHS lands as
+the first argument.
+
+### 4.5 Lambda block as expression
 
 ```
 let g = { x -> x * 2 }       ≡  let g = (x) => x * 2
@@ -763,7 +804,7 @@ let h = { -> 42 }            ≡  let h = () => 42
 Disambiguated from a plain block by peeking past `{` for a parameter
 list followed by `->`.
 
-### 4.6 UFCS (issue #205)
+### 4.6 UFCS
 
 ```
 r.f(args)               ≡  f(r, args)               (* when f is a free fn *)
@@ -773,16 +814,16 @@ Resolved by the head-module-of-`r` rule: if `r` has type `T` declared
 in module `M`, `r.f(args)` rewrites to `M.f(r, args)` when `M.f`
 exists.
 
-### 4.7 Record punning (issue #266 family)
+### 4.7 Record punning
 
 ```
 T { x, y }              ≡  T { x: x, y: y }         (* identifier punning *)
-T { v1, v2 }            ≡  T { f1: v1, f2: v2 }     (* positional, #266 *)
+T { v1, v2 }            ≡  T { f1: v1, f2: v2 }     (* positional *)
 ```
 
 Selected by first-element peek (see §2.6 *Record literals*).
 
-### 4.8 Complex literal (issue #267 phase 1)
+### 4.8 Complex literal
 
 ```
 3i                      ≡  complex.mk(0.0, 3.0)
@@ -791,7 +832,7 @@ Selected by first-element peek (see §2.6 *Record literals*).
 
 Lexer-only: `<digits>i` with no whitespace is one `COMPLEX_LIT` token.
 
-### 4.9 Capability read / write (issue #275)
+### 4.9 Capability read / write
 
 ```
 @cap                    ≡  Cap.get()
@@ -804,7 +845,7 @@ var x = init            ≡  handle { ... } with State[T](init) { ... }
 The `@` prefix and `:=` are exclusively for capability reads/writes;
 `Ref[T]` uses ordinary `r.get()` / `r.set(v)`.
 
-### 4.10 `unit` keyword (m12.5)
+### 4.10 `unit` keyword
 
 ```
 unit Newton = kg * m / sec^2
@@ -813,7 +854,7 @@ unit Newton = kg * m / sec^2
 Introduces a Measure-kind symbol; has no value-level desugar but
 extends the unit algebra accepted inside `<...>`.
 
-### 4.11 `#[derive(...)]` (m12.8; bracket form since #608)
+### 4.11 `#[derive(...)]`
 
 ```
 #[derive(Show, Eq)] type Point = { x: Int, y: Int }
@@ -822,6 +863,105 @@ extends the unit algebra accepted inside `<...>`.
 Expands at the type-decl boundary to synthetic `impl Show for Point`
 and `impl Eq for Point` with the per-protocol auto-derivation rule
 described in `docs/protocols.md` §*Auto-derivation*.
+
+### 4.12 Postfix `!` — Option/Result early-return
+
+```
+expr!                  ≡  match expr {
+                            Some(__v) -> __v          (* Option *)
+                            None      -> return None
+                          }
+
+expr!                  ≡  match expr {
+                            Ok(__v)   -> __v          (* Result *)
+                            Err(__e)  -> return Err(__e)
+                          }
+```
+
+The dispatch (Option vs Result) is by the type the typer assigns to
+`expr`. Used in any expression position; the enclosing function's
+return type must be `Option[U]` or `Result[E, U]` accordingly.
+
+### 4.13 As-pattern — `name @ pattern`
+
+```
+match xs {
+  whole @ [head, ...rest] -> ...                    (* `whole` is `xs` *)
+}
+```
+
+Binds the whole scrutinee to `name` while still destructuring via
+`pattern`. Grammar already covered in §2.7 (the pattern production).
+
+### 4.14 Record spread — `T { ...src, x: v }`
+
+```
+T { ...src }            ≡  { let s = src; T { f1: s.f1, ..., fn: s.fn } }
+T { ...src, x: 10 }     ≡  { let s = src; T { f1: s.f1, x: 10, ..., fn: s.fn } }
+```
+
+The spread MUST be the first element of the literal. Only named
+overrides may follow; positional and pun fields cannot mix with
+spread. A second `...` is rejected. The expansion fills unnamed
+declared fields from `src` and applies the named overrides. Grammar
+spec lives in §2.6 *Record literals*.
+
+### 4.15 Positional record construction — `T { v1, v2 }`
+
+```
+T { v1, v2 }            ≡  T { f1: v1, f2: v2 }
+```
+
+The parser sees a leading expression after `T {` that is not an
+`IDENT ':'` and not bare `IDENT` (which would be pun) and switches
+to positional mode. A pre-typer pass rewrites sentinels into the
+declared field names by order. Mixed positional-and-named is rejected
+at parse time.
+
+### 4.16 Case-led multi-clause function body
+
+```
+fn classify(n: Int) : String {
+  case 0            -> "zero"
+  case n when n < 0 -> "neg"
+  case _            -> "pos"
+}
+                                                     (* desugars to: *)
+fn classify(n: Int) : String = match n {
+  0           -> "zero"
+  n if n < 0  -> "neg"
+  _           -> "pos"
+}
+```
+
+`case <pattern> (when <guard>)? -> <body>` arms in lieu of an explicit
+`match` block. The single-arg form (one parameter) matches the
+parameter directly; multi-arg form matches a tuple of parameters per
+arm. Note: `when` is the guard keyword here, not `if` — guards in
+`case`-led bodies use `when` while guards in plain `match` arms use
+`if`. Grammar productions live in `parse_case_arms` /
+`parse_case_multi_arms`.
+
+### 4.17 Regex sigil — `~r/pattern/flags?`
+
+```
+~r/foo/
+~r/foo/i
+```
+
+Lexed as a single `REGEX` token (see §1.6 *Regex sigil*). The parser
+treats it as a `literal` primary. Outside the `~r/.../` form, `/`
+keeps its arithmetic meaning.
+
+### 4.18 Hex and binary integer literals
+
+```
+0xFF                   ≡  255
+0b1010                 ≡  10
+```
+
+Underscore separators are not accepted inside the hex / binary
+branches (only inside `DEC_LIT`). See §1.6 *Integer*.
 
 ## §5 — Ambiguity resolution
 

@@ -41,8 +41,8 @@ PROPERTY CHECKS
     assert reverse_twice_is_identity(xs)
   }
 
-  Shrinking is built in (#438). On failure, the runner reports the
-  minimal counterexample.
+  Shrinking is built in. On failure, the runner reports the minimal
+  counterexample.
 
 BENCHMARKS
 
