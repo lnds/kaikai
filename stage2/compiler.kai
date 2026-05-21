@@ -16499,7 +16499,7 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
       # so the user (or an LLM driving the codebase) sees *what*
       # they have to fill in, not just "?":
       #
-      #   unfilled hole ?name at line 12 col 34, expected (Int) -> String
+      #   unfilled hole: ?name at line 12 col 34, expected (Int) -> String
       #
       # When the hole is anonymous, we omit the `?<name>` segment.
       # When the typer never pinned a type (rare), we omit the type
@@ -16513,7 +16513,7 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
         Some(t) -> cat2(", expected ", ty_to_string(t))
       }
       let loc = concat_all([" at line ", int_to_string(x.line), " col ", int_to_string(x.col)])
-      let msg = concat_all(["unfilled hole ", label, loc, ty_seg])
+      let msg = concat_all(["unfilled hole: ", label, loc, ty_seg])
       concat_all(["kai_prelude_panic(kai_str(\"", msg, "\"))"])
     }
     ETodo(msg) -> {
@@ -43854,7 +43854,12 @@ fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
       else {
         let pnames = map(params, (p) => p.pname)
         let uses = pcs_collect_uses_expr(body, pnames, false, [])
-        let new_body = pcs_rewrite_expr(body, pnames, uses, false)
+        # Issue #599 — branch-aware skip-set: every top-level fn param
+        # whose max non-lam reads on any single execution path is <= 1.
+        # Such a param is safe to read raw: the single read on the
+        # path that executes transfers ownership; no dup wrap needed.
+        let skip_set = pcs_branch_aware_skip_params(pnames, body)
+        let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set)
         # Issue #350 — emit `__perceus_drop` for multi-use pattern
         # bindings introduced by match arms (mirror of the SLet
         # exit-drop pass from #342). Runs BEFORE reuse recognition so
@@ -43862,7 +43867,7 @@ fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
         # part of the canonicalised arm body.
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
-        let body_with_drops = pcs_prepend_unused_drops(reused_body, params, uses)
+        let body_with_drops = pcs_prepend_unused_drops(reused_body, params, uses, skip_set)
         DFn(is_pub, name, tparams, params, opt_ret, row, body_with_drops, ln, cl, mo)
       }
     }
@@ -43874,13 +43879,13 @@ fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
     # bindings.
     DTest(desc, body, ln, cl) -> {
       let uses = pcs_collect_uses_expr(body, [], false, [])
-      let new_body = pcs_rewrite_expr(body, [], uses, false)
+      let new_body = pcs_rewrite_expr(body, [], uses, false, [])
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DTest(desc, reused_body, ln, cl)
     }
     DBench(desc, body, ln, cl) -> {
       let uses = pcs_collect_uses_expr(body, [], false, [])
-      let new_body = pcs_rewrite_expr(body, [], uses, false)
+      let new_body = pcs_rewrite_expr(body, [], uses, false, [])
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DBench(desc, reused_body, ln, cl)
     }
@@ -43892,7 +43897,8 @@ fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
     DCheck(desc, ps, body, ln, cl) -> {
       let pnames = map(ps, (p) => p.pname)
       let uses = pcs_collect_uses_expr(body, pnames, false, [])
-      let new_body = pcs_rewrite_expr(body, pnames, uses, false)
+      let skip_set = pcs_branch_aware_skip_params(pnames, body)
+      let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set)
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DCheck(desc, ps, reused_body, ln, cl)
     }
@@ -44354,18 +44360,18 @@ fn pcs_collect_uses_interp_parts(parts: [IPart], scope: [String], in_lam: Bool,
 
 # ---- pcs_rewrite: wrap non-last in-scope EVar reads in __perceus_dup ----
 
-fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool) : Expr / Console =
+fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : Expr / Console =
 
-  Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam),
+  Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam, skip_set),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
-                    uses: [Use], in_lam: Bool) : ExprKind / Console {
+                    uses: [Use], in_lam: Bool, skip_set: [String]) : ExprKind / Console {
 
   match k {
     # The actual rewrite: wrap a non-last `EVar` use in `__perceus_dup`.
     EVar(nm) -> {
-      if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam) {
+      if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam, skip_set) {
         ECall(
           Expr { kind: EVar("__perceus_dup"), line: line, col: col,
                  ty: None, mode: MUnknown },
@@ -44380,7 +44386,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     # the parsed Expr, then surgically rewrite the source by replacing
     # the wrapped ident tokens with `__perceus_dup(NAME)`. Result rounds
     # back through the parser at emit time as a normal ECall(__perceus_dup).
-    EStr(span, is_triple) -> EStr(pcs_rewrite_estr_span(span, is_triple, scope, uses, in_lam), is_triple)
+    EStr(span, is_triple) -> EStr(pcs_rewrite_estr_span(span, is_triple, scope, uses, in_lam, skip_set), is_triple)
     # Scope-aware kinds: ELambda extends scope with params and flips
     # in_lam; EBlock threads scope through SLet/SVar bindings; EMatch
     # delegates to pcs_rewrite_arms which adds pattern bindings to the
@@ -44388,13 +44394,13 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     # state/log/op-param scope.
     ELambda(ps, body) -> {
       let pn = map(ps, (p) => p.pname)
-      ELambda(ps, pcs_rewrite_expr(body, list_append(scope, pn), uses, true))
+      ELambda(ps, pcs_rewrite_expr(body, list_append(scope, pn), uses, true, skip_set))
     }
     EBlock(stmts, opt_tail) -> {
-      let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [])
+      let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [], skip_set)
       let new_tail = match opt_tail {
         None -> None
-        Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam))
+        Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam, skip_set))
       }
       # Issue #297 (partial) — block-scope exit drops for SLet PBind
       # bindings that took a `__perceus_dup` per non-last read above.
@@ -44420,21 +44426,21 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
                                                          opt_tail, [])
       EBlock(pcs_append_drops(r.stmts, exit_drops), new_tail)
     }
-    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam),
-                              pcs_rewrite_arms(arms, scope, uses, in_lam))
+    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set),
+                              pcs_rewrite_arms(arms, scope, uses, in_lam, skip_set))
     EHandle(body, eff, eff_tas, init_opt, alias, clauses, ret_opt) -> {
-      let body1 = pcs_rewrite_expr(body, scope, uses, in_lam)
+      let body1 = pcs_rewrite_expr(body, scope, uses, in_lam, skip_set)
       let init1 = match init_opt {
         None -> None
-        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam))
+        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam, skip_set))
       }
-      let cls1 = pcs_rewrite_clauses(clauses, scope, uses, in_lam)
+      let cls1 = pcs_rewrite_clauses(clauses, scope, uses, in_lam, skip_set)
       let ret1 = match ret_opt {
         None -> None
         Some(hr) -> match hr {
           HR(pname, body2, hl, hc) ->
             Some(HR(pname,
-                    pcs_rewrite_expr(body2, [pname, ...scope], uses, in_lam),
+                    pcs_rewrite_expr(body2, [pname, ...scope], uses, in_lam, skip_set),
                     hl, hc))
         }
       }
@@ -44456,70 +44462,70 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
     EIntrinsic(name, args_) ->
-      EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, in_lam))
+      EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set))
     ECall(callee, args_) ->
-      ECall(pcs_rewrite_expr(callee, scope, uses, in_lam),
-            pcs_rewrite_expr_list(args_, scope, uses, in_lam))
-    EField(base, nm)     -> EField(pcs_rewrite_expr(base, scope, uses, in_lam), nm)
-    EIndex(a, b)         -> EIndex(pcs_rewrite_expr(a, scope, uses, in_lam),
-                                    pcs_rewrite_expr(b, scope, uses, in_lam))
-    EBinop(op, a, b)     -> EBinop(op, pcs_rewrite_expr(a, scope, uses, in_lam),
-                                        pcs_rewrite_expr(b, scope, uses, in_lam))
-    EUnop(op, x)         -> EUnop(op, pcs_rewrite_expr(x, scope, uses, in_lam))
-    EIf(c, t_, eo)       -> EIf(pcs_rewrite_expr(c, scope, uses, in_lam),
-                                  pcs_rewrite_expr(t_, scope, uses, in_lam),
-                                  pcs_rewrite_expr_opt(eo, scope, uses, in_lam))
-    ERecordLit(name, fs) -> ERecordLit(name, pcs_rewrite_fields_init(fs, scope, uses, in_lam))
-    EList(els)           -> EList(pcs_rewrite_list_elems(els, scope, uses, in_lam))
-    ERange(a, b, opt_step) -> ERange(pcs_rewrite_expr(a, scope, uses, in_lam),
-                                       pcs_rewrite_expr(b, scope, uses, in_lam),
-                                       pcs_rewrite_expr_opt(opt_step, scope, uses, in_lam))
-    EPipe(a, b)          -> EPipe(pcs_rewrite_expr(a, scope, uses, in_lam),
-                                    pcs_rewrite_expr(b, scope, uses, in_lam))
-    EMapPipe(a, b)       -> EMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam),
-                                       pcs_rewrite_expr(b, scope, uses, in_lam))
-    EFlatMapPipe(a, b)   -> EFlatMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam),
-                                            pcs_rewrite_expr(b, scope, uses, in_lam))
-    EFilterPipe(a, b)    -> EFilterPipe(pcs_rewrite_expr(a, scope, uses, in_lam),
-                                           pcs_rewrite_expr(b, scope, uses, in_lam))
-    ELitUnit(inner, u)   -> ELitUnit(pcs_rewrite_expr(inner, scope, uses, in_lam), u)
-    EBang(inner)         -> EBang(pcs_rewrite_expr(inner, scope, uses, in_lam))
+      ECall(pcs_rewrite_expr(callee, scope, uses, in_lam, skip_set),
+            pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set))
+    EField(base, nm)     -> EField(pcs_rewrite_expr(base, scope, uses, in_lam, skip_set), nm)
+    EIndex(a, b)         -> EIndex(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
+                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
+    EBinop(op, a, b)     -> EBinop(op, pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
+                                        pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
+    EUnop(op, x)         -> EUnop(op, pcs_rewrite_expr(x, scope, uses, in_lam, skip_set))
+    EIf(c, t_, eo)       -> EIf(pcs_rewrite_expr(c, scope, uses, in_lam, skip_set),
+                                  pcs_rewrite_expr(t_, scope, uses, in_lam, skip_set),
+                                  pcs_rewrite_expr_opt(eo, scope, uses, in_lam, skip_set))
+    ERecordLit(name, fs) -> ERecordLit(name, pcs_rewrite_fields_init(fs, scope, uses, in_lam, skip_set))
+    EList(els)           -> EList(pcs_rewrite_list_elems(els, scope, uses, in_lam, skip_set))
+    ERange(a, b, opt_step) -> ERange(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
+                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set),
+                                       pcs_rewrite_expr_opt(opt_step, scope, uses, in_lam, skip_set))
+    EPipe(a, b)          -> EPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
+                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
+    EMapPipe(a, b)       -> EMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
+                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
+                                            pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
+    EFilterPipe(a, b)    -> EFilterPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
+                                           pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
+    ELitUnit(inner, u)   -> ELitUnit(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set), u)
+    EBang(inner)         -> EBang(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set))
   }
 }
 
-fn pcs_rewrite_expr_opt(opt: Option[Expr], scope: [String], uses: [Use], in_lam: Bool) : Option[Expr] / Console = match opt {
+fn pcs_rewrite_expr_opt(opt: Option[Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : Option[Expr] / Console = match opt {
   None    -> None
-  Some(x) -> Some(pcs_rewrite_expr(x, scope, uses, in_lam))
+  Some(x) -> Some(pcs_rewrite_expr(x, scope, uses, in_lam, skip_set))
 }
 
-fn pcs_rewrite_expr_list(es: [Expr], scope: [String], uses: [Use], in_lam: Bool) : [Expr] / Console = match es {
+fn pcs_rewrite_expr_list(es: [Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : [Expr] / Console = match es {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, in_lam),
-                   ...pcs_rewrite_expr_list(rest, scope, uses, in_lam)]
+  [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, in_lam, skip_set),
+                   ...pcs_rewrite_expr_list(rest, scope, uses, in_lam, skip_set)]
 }
 
-fn pcs_rewrite_fields_init(fs: [FieldInit], scope: [String], uses: [Use], in_lam: Bool) : [FieldInit] / Console = match fs {
+fn pcs_rewrite_fields_init(fs: [FieldInit], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : [FieldInit] / Console = match fs {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_field_init(h, scope, uses, in_lam),
-                   ...pcs_rewrite_fields_init(rest, scope, uses, in_lam)]
+  [h, ...rest] -> [pcs_rewrite_field_init(h, scope, uses, in_lam, skip_set),
+                   ...pcs_rewrite_fields_init(rest, scope, uses, in_lam, skip_set)]
 }
 
-fn pcs_rewrite_field_init(fi: FieldInit, scope: [String], uses: [Use], in_lam: Bool) : FieldInit / Console = match fi {
-  FI(name, e) -> FI(name, pcs_rewrite_expr(e, scope, uses, in_lam))
+fn pcs_rewrite_field_init(fi: FieldInit, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : FieldInit / Console = match fi {
+  FI(name, e) -> FI(name, pcs_rewrite_expr(e, scope, uses, in_lam, skip_set))
 }
 
-fn pcs_rewrite_list_elems(els: [ListElem], scope: [String], uses: [Use], in_lam: Bool) : [ListElem] / Console = match els {
+fn pcs_rewrite_list_elems(els: [ListElem], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : [ListElem] / Console = match els {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_list_elem(h, scope, uses, in_lam),
-                   ...pcs_rewrite_list_elems(rest, scope, uses, in_lam)]
+  [h, ...rest] -> [pcs_rewrite_list_elem(h, scope, uses, in_lam, skip_set),
+                   ...pcs_rewrite_list_elems(rest, scope, uses, in_lam, skip_set)]
 }
 
-fn pcs_rewrite_list_elem(el: ListElem, scope: [String], uses: [Use], in_lam: Bool) : ListElem / Console = match el {
-  ElPlain(e)  -> ElPlain(pcs_rewrite_expr(e, scope, uses, in_lam))
-  ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam))
+fn pcs_rewrite_list_elem(el: ListElem, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : ListElem / Console = match el {
+  ElPlain(e)  -> ElPlain(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set))
+  ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set))
 }
 
-fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool) : [Arm] / Console {
+fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : [Arm] / Console {
 
   match arms {
     [] -> []
@@ -44528,10 +44534,10 @@ fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool) : [
         let scope1 = pat_bindings(pat, scope)
         let g1 = match opt_g {
           None -> None
-          Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam))
+          Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam, skip_set))
         }
-        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam)
-        [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam)]
+        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set)
+        [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam, skip_set)]
       }
     }
   }
@@ -44540,24 +44546,24 @@ fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool) : [
 type PcsRwBlock = { stmts: [Stmt], scope: [String] }
 
 fn pcs_rewrite_block(stmts: [Stmt], scope: [String], uses: [Use], in_lam: Bool,
-                     acc: [Stmt]) : PcsRwBlock / Console {
+                     acc: [Stmt], skip_set: [String]) : PcsRwBlock / Console {
 
   match stmts {
     [] -> PcsRwBlock { stmts: list_reverse(acc), scope: scope }
     [s, ...rest] -> {
-      let r = pcs_rewrite_stmt(s, scope, uses, in_lam)
-      pcs_rewrite_block(rest, r.scope, uses, in_lam, [r.stmt, ...acc])
+      let r = pcs_rewrite_stmt(s, scope, uses, in_lam, skip_set)
+      pcs_rewrite_block(rest, r.scope, uses, in_lam, [r.stmt, ...acc], skip_set)
     }
   }
 }
 
 type PcsRwStmt = { stmt: Stmt, scope: [String] }
 
-fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool) : PcsRwStmt / Console {
+fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : PcsRwStmt / Console {
 
   match s {
     SLet(pat, ty_opt, rhs) -> {
-      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam)
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set)
       # See `pcs_collect_uses_in_block` SLet — raw locals stay
       # outside the Perceus scope so EVar reads of them are not
       # rewritten into `__perceus_dup` calls (which expect boxed
@@ -44566,25 +44572,25 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool) : PcsRw
                   scope: pat_bindings_skip_raw(pat, rhs, scope) }
     }
     SVar(name, ty_opt, rhs, ln, cl) -> {
-      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam)
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set)
       PcsRwStmt { stmt: SVar(name, ty_opt, rhs1, ln, cl), scope: [name, ...scope] }
     }
     SAssert(c, opt_m) -> {
-      let c1 = pcs_rewrite_expr(c, scope, uses, in_lam)
+      let c1 = pcs_rewrite_expr(c, scope, uses, in_lam, skip_set)
       let m1 = match opt_m {
         None -> None
-        Some(m) -> Some(pcs_rewrite_expr(m, scope, uses, in_lam))
+        Some(m) -> Some(pcs_rewrite_expr(m, scope, uses, in_lam, skip_set))
       }
       PcsRwStmt { stmt: SAssert(c1, m1), scope: scope }
     }
     SExprStmt(e) -> {
-      let e1 = pcs_rewrite_expr(e, scope, uses, in_lam)
+      let e1 = pcs_rewrite_expr(e, scope, uses, in_lam, skip_set)
       PcsRwStmt { stmt: SExprStmt(e1), scope: scope }
     }
     SIndexAssign(b, i, v, ln, cl) -> {
-      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam)
-      let i1 = pcs_rewrite_expr(i, scope, uses, in_lam)
-      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam)
+      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam, skip_set)
+      let i1 = pcs_rewrite_expr(i, scope, uses, in_lam, skip_set)
+      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam, skip_set)
       PcsRwStmt { stmt: SIndexAssign(b1, i1, v1, ln, cl), scope: scope }
     }
     # m7e §25: SUse has no expression and binds nothing.
@@ -44593,7 +44599,7 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool) : PcsRw
 }
 
 fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
-                        in_lam: Bool) : [HClause] / Console {
+                        in_lam: Bool, skip_set: [String]) : [HClause] / Console {
 
   match cs {
     [] -> []
@@ -44601,8 +44607,8 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
       HC(op, params, body, ln, cl) -> {
         let pn = pcs_filter_non_resume(map(params, (p) => p.pname), [])
         let scope1 = list_append(scope, ["state", "log", ...pn])
-        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam)
-        [HC(op, params, body1, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam)]
+        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set)
+        [HC(op, params, body1, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam, skip_set)]
       }
     }
   }
@@ -44652,12 +44658,22 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
 # (issues #77–#82). Closed R10 and R11 (issue #61).
 
 fn pcs_is_non_last(nm: String, line: Int, col: Int, uses: [Use],
-                   in_lam_here: Bool) : Bool {
+                   in_lam_here: Bool, skip_set: [String]) : Bool {
   if nm == "state" or nm == "log" { true }
   else if in_lam_here { true }
   else {
     match last_use_for(nm, uses) {
-      LUAt(_, _, _) -> pcs_count_non_lam_uses(nm, uses, 0) >= 2
+      LUAt(_, _, _) -> {
+        # Issue #599 — branch-aware dup elimination. If the binding
+        # appears in `skip_set` (built once from the body via
+        # `pcs_max_paths_*`, populated only for top-level fn params
+        # whose max non-lam reads across any execution path is <= 1),
+        # skip the dup wrap entirely: the single read on the executed
+        # path can transfer ownership raw. Otherwise fall back to the
+        # conservative "≥ 2 non-lam uses" check.
+        if list_has(skip_set, nm) { false }
+        else { pcs_count_non_lam_uses(nm, uses, 0) >= 2 }
+      }
       LUBlocked(_) -> true
       LUUnused(_) -> false
     }
@@ -44684,6 +44700,534 @@ fn pcs_count_non_lam_uses(nm: String, uses: [Use], acc: Int) : Int {
   }
 }
 
+# Issue #599 — branch-aware max-path count for a single name in a
+# function body. Returns the maximum number of non-lambda reads of
+# `nm` on ANY linear execution path through the body, taking the max
+# over `EMatch` arms and `EIf` branches (mutually-exclusive sites)
+# and the sum over sequential composition (`EBlock`, `ECall` args,
+# `EBinop`, …).
+#
+# When the result is <= 1 the binding is read at most once on every
+# path, so the conservative-dup wrap can be skipped: the last (and
+# only) read on the executed path can transfer ownership raw.
+#
+# Lambdas contribute 0 because closure captures are RC'd separately
+# via `kai_closure`'s incref; this matches the in_lam-skip convention
+# of `pcs_count_non_lam_uses` and keeps the rule sound for
+# LUBlocked bindings.
+#
+# This function is read-only and pure (no Console effect needed) so
+# it can be called from any rewrite site without threading a new
+# parameter through every `pcs_rewrite_*` helper. It is invoked
+# lazily from `pcs_is_non_last` only for top-level fn params; per-fn
+# bodies are small enough that the O(body-size) walk per param is
+# cheap compared with the rest of the perceus pass.
+fn pcs_max_paths_in_expr(nm: String, e: Expr) : Int =
+  pcs_max_paths_in_kind(nm, e.kind)
+
+fn pcs_max_paths_in_kind(nm: String, k: ExprKind) : Int = match k {
+  EVar(uname)         -> if uname == nm { 1 } else { 0 }
+  EStr(_, _)          -> 0   # interpolated reads handled by §4b path;
+                              # branch-aware analysis applies to non-
+                              # interpolation reads only.
+  ECall(f, xs)        -> pcs_max_paths_in_expr(nm, f) + pcs_max_paths_seq(nm, xs)
+  EIntrinsic(_, xs)   -> pcs_max_paths_seq(nm, xs)
+  EField(x, _)        -> pcs_max_paths_in_expr(nm, x)
+  EIndex(a, b)        -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
+  EBinop(_, a, b)     -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
+  EUnop(_, x)         -> pcs_max_paths_in_expr(nm, x)
+  EIf(c, t, opt_e)    -> pcs_max_paths_in_expr(nm, c) +
+                          pcs_max_paths_alt2(nm, t, opt_e)
+  EMatch(s, arms)     -> pcs_max_paths_in_expr(nm, s) +
+                          pcs_max_paths_in_arms(nm, arms, 0)
+  ELambda(_, _)       -> 0
+  ERecordLit(_, fis)  -> pcs_max_paths_in_field_inits(nm, fis)
+  EList(els)          -> pcs_max_paths_in_list_elems(nm, els)
+  ERange(a, b, opt)   -> pcs_max_paths_in_expr(nm, a) +
+                          pcs_max_paths_in_expr(nm, b) +
+                          pcs_max_paths_opt(nm, opt)
+  EBlock(stmts, tail) -> pcs_max_paths_in_block(nm, stmts, tail)
+  EPipe(a, b)         -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
+  EMapPipe(a, b)      -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
+  EFlatMapPipe(a, b)  -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
+  EFilterPipe(a, b)   -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    # Handler clauses are alternatives — only one clause fires per op
+    # invocation — but a single body can fire multiple ops, so the
+    # body-vs-clauses relationship is sum, not alt. Conservative
+    # fallback: treat as sum.
+    let bp = pcs_max_paths_in_expr(nm, body)
+    let ip = pcs_max_paths_opt(nm, init_opt)
+    let cp = pcs_max_paths_in_clauses(nm, clauses)
+    let rp = pcs_max_paths_in_ret_opt(nm, ret_opt)
+    bp + ip + cp + rp
+  }
+  EBang(inner)        -> pcs_max_paths_in_expr(nm, inner)
+  ELitUnit(inner, _)  -> pcs_max_paths_in_expr(nm, inner)
+  _                   -> 0
+}
+
+fn pcs_max_paths_seq(nm: String, es: [Expr]) : Int = match es {
+  []           -> 0
+  [h, ...rest] -> pcs_max_paths_in_expr(nm, h) + pcs_max_paths_seq(nm, rest)
+}
+
+fn pcs_max_paths_alt2(nm: String, t: Expr, opt_e: Option[Expr]) : Int = {
+  let tp = pcs_max_paths_in_expr(nm, t)
+  let ep = match opt_e {
+    None    -> 0
+    Some(e) -> pcs_max_paths_in_expr(nm, e)
+  }
+  if tp > ep { tp } else { ep }
+}
+
+fn pcs_max_paths_in_arms(nm: String, arms: [Arm], best: Int) : Int = match arms {
+  [] -> best
+  [a, ...rest] -> match a {
+    Arm(pat, opt_g, body) -> {
+      let gp = match opt_g {
+        None    -> 0
+        Some(g) -> pcs_max_paths_in_expr(nm, g)
+      }
+      let bp = pcs_max_paths_in_expr(nm, body)
+      let armp = gp + bp
+      let nb = if armp > best { armp } else { best }
+      pcs_max_paths_in_arms(nm, rest, nb)
+    }
+  }
+}
+
+fn pcs_max_paths_in_field_inits(nm: String, fis: [FieldInit]) : Int = match fis {
+  []           -> 0
+  [h, ...rest] -> match h {
+    FI(_, e) -> pcs_max_paths_in_expr(nm, e) + pcs_max_paths_in_field_inits(nm, rest)
+  }
+}
+
+fn pcs_max_paths_in_list_elems(nm: String, els: [ListElem]) : Int = match els {
+  []           -> 0
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    pcs_max_paths_in_expr(nm, inner) + pcs_max_paths_in_list_elems(nm, rest)
+  }
+}
+
+fn pcs_max_paths_opt(nm: String, opt: Option[Expr]) : Int = match opt {
+  None    -> 0
+  Some(e) -> pcs_max_paths_in_expr(nm, e)
+}
+
+fn pcs_max_paths_in_block(nm: String, stmts: [Stmt], tail: Option[Expr]) : Int =
+  pcs_max_paths_in_stmts(nm, stmts) + pcs_max_paths_opt(nm, tail)
+
+fn pcs_max_paths_in_stmts(nm: String, stmts: [Stmt]) : Int = match stmts {
+  []           -> 0
+  [h, ...rest] -> pcs_max_paths_in_stmt(nm, h) + pcs_max_paths_in_stmts(nm, rest)
+}
+
+fn pcs_max_paths_in_stmt(nm: String, s: Stmt) : Int = match s {
+  SLet(_, _, e)                  -> pcs_max_paths_in_expr(nm, e)
+  SVar(_, _, e, _, _)            -> pcs_max_paths_in_expr(nm, e)
+  SAssert(e, opt_m)              -> pcs_max_paths_in_expr(nm, e) +
+                                     pcs_max_paths_opt(nm, opt_m)
+  SExprStmt(e)                   -> pcs_max_paths_in_expr(nm, e)
+  SIndexAssign(a, b, c, _, _)    -> pcs_max_paths_in_expr(nm, a) +
+                                     pcs_max_paths_in_expr(nm, b) +
+                                     pcs_max_paths_in_expr(nm, c)
+  SUse(_, _, _)                  -> 0
+}
+
+fn pcs_max_paths_in_clauses(nm: String, cs: [HClause]) : Int = match cs {
+  []           -> 0
+  [h, ...rest] -> match h {
+    HC(_, _, body, _, _) ->
+      pcs_max_paths_in_expr(nm, body) + pcs_max_paths_in_clauses(nm, rest)
+  }
+}
+
+fn pcs_max_paths_in_ret_opt(nm: String, opt: Option[HReturn]) : Int = match opt {
+  None    -> 0
+  Some(hr) -> match hr {
+    HR(_, body, _, _) -> pcs_max_paths_in_expr(nm, body)
+  }
+}
+
+# Compute the branch-aware skip-set for a fn body: every top-level
+# fn param whose reads can safely transfer ownership raw on every
+# execution path. The three conditions for safety:
+#
+#   1. `pcs_max_paths_in_expr <= 1` — the binding is read at most
+#      once on any single execution path (no path doubles a wrap).
+#   2. `pcs_consumed_on_every_path` — every path through the body
+#      actually consumes the binding (no exit-drop needed; the
+#      single read on the executed path transfers ownership).
+#   3. `pcs_all_consumers_linear` — every consumer of the binding
+#      is a linear consumer: a call to a user-defined fn (which
+#      pcs_pass made linear by construction) or a variant/record
+#      that owns the slot. Non-linear consumers (intrinsics,
+#      capability ops, raw field access on a borrowed record)
+#      internally incref their arg, and a raw transfer would leak
+#      or double-free.
+# DISABLED — returns the empty list. The triple condition
+# (max-path ≤ 1 AND consumed-on-every-path AND all-consumers-linear)
+# is correct in isolation and on the fixture, but enabling it on
+# self-compile of compiler.kai trips a downstream pass that this
+# lane has not yet aligned. The activation toggle below restores
+# the optimisation; see the retro for the remaining work.
+fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] = []
+
+# Activation toggle (when remaining downstream passes are aligned):
+# replace the body above with:
+#
+#   match pnames {
+#     []           -> []
+#     [h, ...rest] -> {
+#       let mp = pcs_max_paths_in_expr(h, body)
+#       let cv = pcs_consumed_on_every_path(h, body)
+#       let ln = pcs_all_consumers_linear(h, body)
+#       let rest_skip = pcs_branch_aware_skip_params(rest, body)
+#       if mp <= 1 and cv and ln { [h, ...rest_skip] } else { rest_skip }
+#     }
+#   }
+
+# Returns `true` if every read of `nm` in `e` is a linear consumer
+# context — either:
+#   - direct arg to `ECall(EVar(<user_fn>), ...)` — call to a
+#     user-defined fn (pcs_pass makes those linear by construction);
+#   - direct slot of `EVariantsOf` / variant-constructor `ECall` /
+#     `ERecordLit` field init — the constructor takes ownership of
+#     the slot.
+# Any other context (intrinsic, capability op like `EField(EVar(eff),
+# op)` invoked, raw `EField` read of `nm` for record projection,
+# `EIndex`, binop, unop on non-numeric types) is non-linear and
+# requires the conservative dup wrap.
+fn pcs_all_consumers_linear(nm: String, e: Expr) : Bool =
+  pcs_consumers_linear_kind(nm, e.kind)
+
+fn pcs_consumers_linear_kind(nm: String, k: ExprKind) : Bool = match k {
+  EVar(_)             -> true   # a bare EVar is "in linear position"
+                                 # — it's either the body's tail (return
+                                 # transfer, linear), or recursed into
+                                 # from an arg/field that already classified
+                                 # the call/ctor as linear or not.
+  EStr(_, _)          -> true   # interpolated reads handled by §4b
+  ECall(f, xs)        -> pcs_call_consumers_linear(nm, f, xs)
+  EIntrinsic(_, xs)   -> {
+    # Intrinsics are runtime primitives — non-linear if `nm` appears
+    # as an arg.
+    if pcs_any_arg_is_var(nm, xs) { false }
+    else { pcs_all_args_consumers_linear(nm, xs) }
+  }
+  EField(x, _)        -> {
+    # Field access reads the record raw and incref's the field.
+    # If `nm == x` (bare ref), this is non-linear (borrow-only on nm).
+    match x.kind {
+      EVar(uname) -> uname != nm    # bare `nm.field` = borrow → false
+      _           -> pcs_all_consumers_linear(nm, x)
+    }
+  }
+  EIndex(a, b)        -> {
+    # Same as EField: index borrows the array.
+    let a_ok = match a.kind {
+      EVar(uname) -> uname != nm
+      _           -> pcs_all_consumers_linear(nm, a)
+    }
+    a_ok and pcs_all_consumers_linear(nm, b)
+  }
+  EBinop(_, a, b)     -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b)
+  EUnop(_, x)         -> pcs_all_consumers_linear(nm, x)
+  EIf(c, t, opt_e)    -> pcs_all_consumers_linear(nm, c) and
+                          pcs_all_consumers_linear(nm, t) and
+                          pcs_consumers_linear_opt(nm, opt_e)
+  EMatch(s, arms)     -> {
+    # The scrutinee is consumed by `match` (kai_decref at end of
+    # the match block). A bare EVar(nm) as scrutinee is therefore
+    # linear; but if `nm` appears INSIDE the scrutinee expression
+    # (e.g. `match opts.path { ... }`), we recurse.
+    let s_ok = match s.kind {
+      EVar(_) -> true     # scrutinee linear by match semantics
+      _       -> pcs_all_consumers_linear(nm, s)
+    }
+    s_ok and pcs_consumers_linear_arms(nm, arms)
+  }
+  ELambda(_, _)       -> true    # closure capture is handled separately
+  ERecordLit(_, fis)  -> pcs_consumers_linear_fields(nm, fis)
+  EList(els)          -> pcs_consumers_linear_elems(nm, els)
+  ERange(a, b, opt)   -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b) and
+                          pcs_consumers_linear_opt(nm, opt)
+  EBlock(stmts, tail) -> pcs_consumers_linear_block(nm, stmts, tail)
+  EPipe(a, b)         -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b)
+  EMapPipe(a, b)      -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b)
+  EFlatMapPipe(a, b)  -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b)
+  EFilterPipe(a, b)   -> pcs_all_consumers_linear(nm, a) and
+                          pcs_all_consumers_linear(nm, b)
+  EHandle(body, _, _, init_opt, _, _, _) ->
+    pcs_all_consumers_linear(nm, body) and
+    pcs_consumers_linear_opt(nm, init_opt)
+  EBang(inner)        -> pcs_all_consumers_linear(nm, inner)
+  ELitUnit(inner, _)  -> pcs_all_consumers_linear(nm, inner)
+  EModCall(_, _)      -> true    # mod calls go through user fns
+                                  # post-resolve; treated as linear
+  _                   -> true    # leaves (EInt, EBool, ELambda, ...)
+                                  # don't reference nm
+}
+
+# Check whether a call expression `f(xs...)` with `nm` possibly
+# appearing as an arg is linear-safe. Rules:
+#   - If callee `f` is `EVar(fn_name)`:
+#       - If fn_name starts with `__perceus_` → non-linear (these are
+#         RC primitives that should never see a skipped read).
+#       - Otherwise treat as user-defined linear fn.
+#   - If callee is anything else (EField on capability, intrinsic,
+#     apply on closure value), assume non-linear unless `nm` does
+#     not appear in args.
+fn pcs_call_consumers_linear(nm: String, f: Expr, xs: [Expr]) : Bool = {
+  let nm_in_args = pcs_any_arg_is_var(nm, xs) or pcs_any_arg_mentions(nm, xs)
+  if not nm_in_args {
+    # `nm` only appears inside the callee expression (rare); recurse.
+    pcs_all_consumers_linear(nm, f)
+  } else {
+    match f.kind {
+      EVar(fn_name) -> {
+        # User-defined fn call — linear by pcs_pass construction —
+        # UNLESS the fn name is a builtin synthetic.
+        if pcs_is_runtime_primitive(fn_name) { false }
+        # Even for user fns, check that `nm` does not also appear in
+        # the callee (would mean f is computed from nm, unusual).
+        else { pcs_all_consumers_linear(nm, f) and
+                pcs_all_args_consumers_linear(nm, xs) }
+      }
+      _ -> false   # call through capability/closure: assume non-linear
+    }
+  }
+}
+
+# Is `nm` directly an arg (as bare `EVar(nm)`)?
+fn pcs_any_arg_is_var(nm: String, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> match h.kind {
+    EVar(uname) -> if uname == nm { true } else { pcs_any_arg_is_var(nm, rest) }
+    _           -> pcs_any_arg_is_var(nm, rest)
+  }
+}
+
+# Does `nm` appear anywhere within these args (recursively)?
+fn pcs_any_arg_mentions(nm: String, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> {
+    if pcs_max_paths_in_expr(nm, h) > 0 { true }
+    else { pcs_any_arg_mentions(nm, rest) }
+  }
+}
+
+# Recurse into each arg.
+fn pcs_all_args_consumers_linear(nm: String, xs: [Expr]) : Bool = match xs {
+  []           -> true
+  [h, ...rest] -> pcs_all_consumers_linear(nm, h) and
+                   pcs_all_args_consumers_linear(nm, rest)
+}
+
+# Known runtime primitives / synthetic names that the compiler should
+# treat as non-linear consumers. Builtin from the runtime's borrow
+# discipline.
+fn pcs_is_runtime_primitive(nm: String) : Bool = {
+  nm == "__perceus_dup" or
+  nm == "__perceus_drop" or
+  nm == "__perceus_reuse_cons" or
+  nm == "__perceus_reuse_record" or
+  nm == "__perceus_reuse_variant"
+}
+
+fn pcs_consumers_linear_opt(nm: String, opt: Option[Expr]) : Bool = match opt {
+  None    -> true
+  Some(e) -> pcs_all_consumers_linear(nm, e)
+}
+
+fn pcs_consumers_linear_arms(nm: String, arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, body) -> {
+      let gp = match opt_g {
+        None    -> true
+        Some(g) -> pcs_all_consumers_linear(nm, g)
+      }
+      gp and pcs_all_consumers_linear(nm, body) and
+      pcs_consumers_linear_arms(nm, rest)
+    }
+  }
+}
+
+fn pcs_consumers_linear_fields(nm: String, fis: [FieldInit]) : Bool = match fis {
+  []           -> true
+  [h, ...rest] -> match h {
+    # Record field init: the field consumes the value (record owns slot).
+    # So a bare `EVar(nm)` as the field value IS linear.
+    FI(_, e) -> pcs_all_consumers_linear(nm, e) and
+                pcs_consumers_linear_fields(nm, rest)
+  }
+}
+
+fn pcs_consumers_linear_elems(nm: String, els: [ListElem]) : Bool = match els {
+  []           -> true
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    # List element: cons cell takes ownership of head.
+    pcs_all_consumers_linear(nm, inner) and
+    pcs_consumers_linear_elems(nm, rest)
+  }
+}
+
+fn pcs_consumers_linear_block(nm: String, stmts: [Stmt], tail: Option[Expr]) : Bool = {
+  pcs_consumers_linear_stmts(nm, stmts) and pcs_consumers_linear_opt(nm, tail)
+}
+
+fn pcs_consumers_linear_stmts(nm: String, stmts: [Stmt]) : Bool = match stmts {
+  []           -> true
+  [h, ...rest] -> pcs_consumers_linear_stmt(nm, h) and
+                   pcs_consumers_linear_stmts(nm, rest)
+}
+
+fn pcs_consumers_linear_stmt(nm: String, s: Stmt) : Bool = match s {
+  SLet(_, _, e)                  -> pcs_all_consumers_linear(nm, e)
+  SVar(_, _, e, _, _)            -> pcs_all_consumers_linear(nm, e)
+  SAssert(e, opt_m)              -> pcs_all_consumers_linear(nm, e) and
+                                     pcs_consumers_linear_opt(nm, opt_m)
+  SExprStmt(e)                   -> pcs_all_consumers_linear(nm, e)
+  SIndexAssign(a, b, c, _, _)    -> pcs_all_consumers_linear(nm, a) and
+                                     pcs_all_consumers_linear(nm, b) and
+                                     pcs_all_consumers_linear(nm, c)
+  SUse(_, _, _)                  -> true
+}
+
+# Returns `true` if every execution path through `body` consumes
+# `nm` exactly once on a non-lambda read. Composition rules:
+#   - leaf EVar(nm) → true
+#   - sequential composition (Block/Call/Binop/...) → any sub-position
+#     consumes
+#   - EIf with both branches → both branches must consume
+#   - EIf without else → cannot prove consume (the missing-else path
+#     leaves the binding alive)
+#   - EMatch → every arm body must consume (the scrutinee path is
+#     a sequence: scrutinee evaluated, then arm body)
+#   - ELambda → false (closure capture is RC'd separately)
+#   - leaves (EInt, EBool, ...) → false
+fn pcs_consumed_on_every_path(nm: String, e: Expr) : Bool =
+  pcs_consumed_kind(nm, e.kind)
+
+fn pcs_consumed_kind(nm: String, k: ExprKind) : Bool = match k {
+  EVar(uname)         -> uname == nm
+  EStr(_, _)          -> false  # interpolated reads go through §4b path
+  ECall(f, xs)        -> pcs_consumed_on_every_path(nm, f) or
+                          pcs_consumed_any(nm, xs)
+  EIntrinsic(_, xs)   -> pcs_consumed_any(nm, xs)
+  EField(x, _)        -> pcs_consumed_on_every_path(nm, x)
+  EIndex(a, b)        -> pcs_consumed_on_every_path(nm, a) or
+                          pcs_consumed_on_every_path(nm, b)
+  EBinop(_, a, b)     -> pcs_consumed_on_every_path(nm, a) or
+                          pcs_consumed_on_every_path(nm, b)
+  EUnop(_, x)         -> pcs_consumed_on_every_path(nm, x)
+  EIf(c, t, opt_e)    -> {
+    # consumed if cond consumes, OR both branches consume.
+    if pcs_consumed_on_every_path(nm, c) { true }
+    else {
+      match opt_e {
+        None    -> false   # missing-else path leaves the binding alive
+        Some(e2) -> pcs_consumed_on_every_path(nm, t) and
+                    pcs_consumed_on_every_path(nm, e2)
+      }
+    }
+  }
+  EMatch(s, arms)     -> {
+    if pcs_consumed_on_every_path(nm, s) { true }
+    else { pcs_consumed_all_arms(nm, arms) }
+  }
+  ELambda(_, _)       -> false
+  ERecordLit(_, fis)  -> pcs_consumed_any_field(nm, fis)
+  EList(els)          -> pcs_consumed_any_elem(nm, els)
+  ERange(a, b, opt)   -> pcs_consumed_on_every_path(nm, a) or
+                          pcs_consumed_on_every_path(nm, b) or
+                          pcs_consumed_opt(nm, opt)
+  EBlock(stmts, tail) -> pcs_consumed_in_block(nm, stmts, tail)
+  EPipe(a, b)         -> pcs_consumed_on_every_path(nm, a) or
+                          pcs_consumed_on_every_path(nm, b)
+  EMapPipe(a, b)      -> pcs_consumed_on_every_path(nm, a) or
+                          pcs_consumed_on_every_path(nm, b)
+  EFlatMapPipe(a, b)  -> pcs_consumed_on_every_path(nm, a) or
+                          pcs_consumed_on_every_path(nm, b)
+  EFilterPipe(a, b)   -> pcs_consumed_on_every_path(nm, a) or
+                          pcs_consumed_on_every_path(nm, b)
+  EHandle(body, _, _, init_opt, _, _, _) -> {
+    # Conservative: only count the body and init expression. Handler
+    # clause bodies execute on op invocation; we can't prove they
+    # always fire.
+    pcs_consumed_on_every_path(nm, body) or pcs_consumed_opt(nm, init_opt)
+  }
+  EBang(inner)        -> pcs_consumed_on_every_path(nm, inner)
+  ELitUnit(inner, _)  -> pcs_consumed_on_every_path(nm, inner)
+  _                   -> false
+}
+
+fn pcs_consumed_any(nm: String, es: [Expr]) : Bool = match es {
+  []           -> false
+  [h, ...rest] -> pcs_consumed_on_every_path(nm, h) or pcs_consumed_any(nm, rest)
+}
+
+fn pcs_consumed_all_arms(nm: String, arms: [Arm]) : Bool = match arms {
+  []           -> true   # no arms = no paths = vacuously consumed
+                          # (but EMatch with zero arms is invalid anyway)
+  [a, ...rest] -> match a {
+    Arm(_, _, body) ->
+      pcs_consumed_on_every_path(nm, body) and pcs_consumed_all_arms(nm, rest)
+  }
+}
+
+fn pcs_consumed_any_field(nm: String, fis: [FieldInit]) : Bool = match fis {
+  []           -> false
+  [h, ...rest] -> match h {
+    FI(_, e) -> pcs_consumed_on_every_path(nm, e) or pcs_consumed_any_field(nm, rest)
+  }
+}
+
+fn pcs_consumed_any_elem(nm: String, els: [ListElem]) : Bool = match els {
+  []           -> false
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    pcs_consumed_on_every_path(nm, inner) or pcs_consumed_any_elem(nm, rest)
+  }
+}
+
+fn pcs_consumed_opt(nm: String, opt: Option[Expr]) : Bool = match opt {
+  None    -> false
+  Some(e) -> pcs_consumed_on_every_path(nm, e)
+}
+
+fn pcs_consumed_in_block(nm: String, stmts: [Stmt], tail: Option[Expr]) : Bool = {
+  if pcs_consumed_in_stmts(nm, stmts) { true }
+  else { pcs_consumed_opt(nm, tail) }
+}
+
+fn pcs_consumed_in_stmts(nm: String, stmts: [Stmt]) : Bool = match stmts {
+  []           -> false
+  [h, ...rest] -> pcs_consumed_in_stmt(nm, h) or pcs_consumed_in_stmts(nm, rest)
+}
+
+fn pcs_consumed_in_stmt(nm: String, s: Stmt) : Bool = match s {
+  SLet(_, _, e)                  -> pcs_consumed_on_every_path(nm, e)
+  SVar(_, _, e, _, _)            -> pcs_consumed_on_every_path(nm, e)
+  SAssert(e, opt_m)              -> pcs_consumed_on_every_path(nm, e) or
+                                     pcs_consumed_opt(nm, opt_m)
+  SExprStmt(e)                   -> pcs_consumed_on_every_path(nm, e)
+  SIndexAssign(a, b, c, _, _)    -> pcs_consumed_on_every_path(nm, a) or
+                                     pcs_consumed_on_every_path(nm, b) or
+                                     pcs_consumed_on_every_path(nm, c)
+  SUse(_, _, _)                  -> false
+}
+
 # ---- m5.x §4b: rewrite EVar reads inside EStr interpolation bodies ----
 #
 # `pcs_rewrite_kind` cannot reach EVar reads buried inside `#{...}`
@@ -44705,7 +45249,7 @@ fn pcs_count_non_lam_uses(nm: String, uses: [Use], acc: Int) : Int {
 type DupMark = DM(Int, Int)   # line, col of an EVar that needs wrapping
 
 fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
-                          uses: [Use], in_lam: Bool) : String / Console {
+                          uses: [Use], in_lam: Bool, skip_set: [String]) : String / Console {
 
   let n = string_length(span)
   let body_start = if is_triple { 3 } else { 1 }
@@ -44714,7 +45258,7 @@ fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
   else {
     let parts = iscan_collect(span, body_end,
                   IScan { parts: [], lit_start: body_start, i: body_start })
-    let new_parts = pcs_rewrite_iparts(parts, scope, uses, in_lam, [])
+    let new_parts = pcs_rewrite_iparts(parts, scope, uses, in_lam, [], skip_set)
     let body = pcs_concat_iparts(new_parts, "")
     let prefix = if is_triple { "\"\"\"" } else { "\"" }
     concat_all([prefix, body, prefix])
@@ -44722,16 +45266,16 @@ fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
 }
 
 fn pcs_rewrite_iparts(parts: [IPart], scope: [String], uses: [Use],
-                       in_lam: Bool, acc: [IPart]) : [IPart] / Console {
+                       in_lam: Bool, acc: [IPart], skip_set: [String]) : [IPart] / Console {
 
   match parts {
     [] -> list_reverse(acc)
     [p, ...rest] -> {
       let p1 = match p {
         IpLit(_, _) -> p
-        IpExp(esrc) -> IpExp(pcs_rewrite_interp_src(esrc, scope, uses, in_lam))
+        IpExp(esrc) -> IpExp(pcs_rewrite_interp_src(esrc, scope, uses, in_lam, skip_set))
       }
-      pcs_rewrite_iparts(rest, scope, uses, in_lam, [p1, ...acc])
+      pcs_rewrite_iparts(rest, scope, uses, in_lam, [p1, ...acc], skip_set)
     }
   }
 }
@@ -44750,7 +45294,7 @@ fn pcs_concat_iparts(parts: [IPart], acc: String) : String {
 }
 
 fn pcs_rewrite_interp_src(esrc: String, scope: [String], uses: [Use],
-                           in_lam: Bool) : String / Console {
+                           in_lam: Bool, skip_set: [String]) : String / Console {
 
   let toks = tokenize(esrc)
   let prs = parser_new("<interp>", esrc, toks)
@@ -44758,7 +45302,7 @@ fn pcs_rewrite_interp_src(esrc: String, scope: [String], uses: [Use],
   match r.r {
     None -> esrc
     Some(parsed) -> {
-      let rewritten = pcs_rewrite_expr(parsed, scope, uses, in_lam)
+      let rewritten = pcs_rewrite_expr(parsed, scope, uses, in_lam, skip_set)
       let marks = pcs_dup_marks_expr(rewritten, [])
       match marks {
         [] -> esrc
@@ -45014,9 +45558,9 @@ fn pcs_render_with_marks(esrc: String, toks: [Token], marks: [DupMark],
 # incref-on-extract / Step A here is the prerequisite for this pass)
 # is recoverable from `git log` on the m5.x runtime flip commits
 # (atomic A+B+C+D, 2026-04-28).
-fn pcs_prepend_unused_drops(body: Expr, params: [Param], uses: [Use]) : Expr {
+fn pcs_prepend_unused_drops(body: Expr, params: [Param], uses: [Use], skip_set: [String]) : Expr {
   let entry = pcs_collect_entry_drops(params, uses, [])
-  let exit_ = pcs_collect_exit_drops(params, uses, [])
+  let exit_ = pcs_collect_exit_drops(params, uses, skip_set, [])
   match entry {
     [] -> match exit_ {
       [] -> body
@@ -45058,19 +45602,26 @@ fn pcs_collect_entry_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
   }
 }
 
-fn pcs_collect_exit_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
+fn pcs_collect_exit_drops(params: [Param], uses: [Use], skip_set: [String], acc: [Stmt]) : [Stmt] {
   match params {
     [] -> list_reverse(acc)
     [p, ...rest] -> {
       let acc1 = match last_use_for(p.pname, uses) {
         LUBlocked(_) -> [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...acc]
-        LUAt(_, _, _) ->
-          if pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 {
+        LUAt(_, _, _) -> {
+          # Issue #599 — branch-aware: if the param is in `skip_set`,
+          # the rewriter did NOT wrap reads in `__perceus_dup`, so
+          # the single read on the executed path transfers the ref
+          # raw and the consumer must be linear. Emitting an exit
+          # drop here would double-free.
+          if list_has(skip_set, p.pname) { acc }
+          else if pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 {
             [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...acc]
           } else { acc }
+        }
         _ -> acc
       }
-      pcs_collect_exit_drops(rest, uses, acc1)
+      pcs_collect_exit_drops(rest, uses, skip_set, acc1)
     }
   }
 }
@@ -45994,8 +46545,14 @@ fn tcrec_rewrite_decl(d: Decl) : Decl / Console {
             let borrow_flags = tcrec_compute_borrow_flags(params, body, [])
             let dm_table = tcrec_collect_dm_table(body, name, arity, params,
                                                    pnames, uses, borrow_flags, [], [])
+            # Issue #599 — recompute the branch-aware skip-set so the
+            # TCO-site dropmask aligns with pcs_pass's wrap-skip
+            # decisions. Without this, params in skip_set get the
+            # TCO drop planted while the rewriter omitted the
+            # matching dup, double-freeing the original ref.
+            let skip_set = pcs_branch_aware_skip_params(pnames, body)
             let new_body = tcrec_rewrite_body(body, name, arity, c_sym_str,
-                                              params, pnames, uses, dm_table, [])
+                                              params, pnames, uses, dm_table, skip_set, [])
             DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo)
           }
         }
@@ -46044,8 +46601,10 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
             let borrow_flags = tcrec_compute_borrow_flags(params, inner, [])
             let dm_table = tcrec_collect_dm_table(inner, name, arity, params,
                                                    pnames, uses, borrow_flags, [], [])
+            # Issue #599 — branch-aware skip-set for TCO drop alignment.
+            let skip_set = pcs_branch_aware_skip_params(pnames, inner)
             let new_inner = tcrec_rewrite_body(inner, name, arity, c_sym_str,
-                                                params, pnames, uses, dm_table, [])
+                                                params, pnames, uses, dm_table, skip_set, [])
             let new_body = tcrec_rebuild_pcs_ret_wrap(body, before, new_inner, after)
             DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo)
           }
@@ -46134,18 +46693,27 @@ fn tcrec_any_unused(params: [Param], uses: [Use]) : Bool {
 #                               `examples/tco/list_nth_shape.kai`.
 #   - LUUnused               → unreachable (`tcrec_any_unused` made
 #                               us bail out before getting here).
-fn tcrec_compute_site_dropmask(params: [Param], uses: [Use],
+fn tcrec_compute_site_dropmask(params: [Param], uses: [Use], skip_set: [String],
                                 i: Int, acc: Int) : Int {
   match params {
     [] -> acc
     [p, ...rest] -> {
       let drop = match last_use_for(p.pname, uses) {
         LUBlocked(_) -> true
-        LUAt(_, _, _) -> pcs_count_non_lam_uses(p.pname, uses, 0) >= 2
+        LUAt(_, _, _) -> {
+          # Issue #599 — branch-aware alignment: if the param is in
+          # `skip_set`, the pcs_rewrite pass did NOT wrap reads and
+          # `pcs_collect_exit_drops` suppressed the exit drop. The
+          # TCO setup must NOT plant a drop either; the single read
+          # transfers the ref raw to the recursive call's matching
+          # arg, balanced.
+          if list_has(skip_set, p.pname) { false }
+          else { pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 }
+        }
         LUUnused(_) -> false
       }
       let acc1 = if drop { acc + tcrec_pow2(i) } else { acc }
-      tcrec_compute_site_dropmask(rest, uses, i + 1, acc1)
+      tcrec_compute_site_dropmask(rest, uses, skip_set, i + 1, acc1)
     }
   }
 }
@@ -46681,14 +47249,14 @@ fn tcrec_split_pipe_loop(s: String, start: Int, i: Int, n: Int, acc: [String]) :
 # them normally on emit.
 fn tcrec_rewrite_body(body: Expr, nm: String, arity: Int, c_sym_str: String,
                       params: [Param], pnames: [String], uses: [Use],
-                      dm_table: [TcrDm], scope: [String]) : Expr =
+                      dm_table: [TcrDm], skip_set: [String], scope: [String]) : Expr =
   Expr { kind: tcrec_rewrite_kind(body.kind, body.line, body.col, nm, arity,
-                                   c_sym_str, params, pnames, uses, dm_table, scope),
+                                   c_sym_str, params, pnames, uses, dm_table, skip_set, scope),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode }
 
 fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
                       c_sym_str: String, params: [Param], pnames: [String],
-                      uses: [Use], dm_table: [TcrDm], scope: [String]) : ExprKind {
+                      uses: [Use], dm_table: [TcrDm], skip_set: [String], scope: [String]) : ExprKind {
   match k {
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
@@ -46699,7 +47267,7 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
           # built once at `tcrec_rewrite_decl` entry. The two masks are
           # disjoint by construction (rule 1+2 fires on count==0 or
           # count>=2; rule 3 fires only on count==1) so OR == ADD.
-          let base_mask = tcrec_compute_site_dropmask(params, uses, 0, 0)
+          let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
           let rule3_mask = tcrec_lookup_dm(dm_table, f.line, f.col)
           let dropmask = base_mask + rule3_mask
           let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
@@ -46711,24 +47279,24 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
       _ -> k
     }
     EIf(c, t, opt_e) -> {
-      let t1 = tcrec_rewrite_body(t, nm, arity, c_sym_str, params, pnames, uses, dm_table, scope)
+      let t1 = tcrec_rewrite_body(t, nm, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope)
       let opt_e1 = match opt_e {
         None -> None
         Some(e2) -> Some(tcrec_rewrite_body(e2, nm, arity, c_sym_str, params,
-                                            pnames, uses, dm_table, scope))
+                                            pnames, uses, dm_table, skip_set, scope))
       }
       EIf(c, t1, opt_e1)
     }
     EMatch(s, arms) ->
       EMatch(s, tcrec_rewrite_arms(arms, nm, arity, c_sym_str, params, pnames,
-                                    uses, dm_table, scope, []))
+                                    uses, dm_table, skip_set, scope, []))
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
         None -> k
         Some(e) ->
           EBlock(stmts, Some(tcrec_rewrite_body(e, nm, arity, c_sym_str, params,
-                                                 pnames, uses, dm_table, scope1)))
+                                                 pnames, uses, dm_table, skip_set, scope1)))
       }
     }
     _ -> k
@@ -46737,16 +47305,16 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
 
 fn tcrec_rewrite_arms(arms: [Arm], nm: String, arity: Int, c_sym_str: String,
                       params: [Param], pnames: [String], uses: [Use],
-                      dm_table: [TcrDm], scope: [String], acc: [Arm]) : [Arm] {
+                      dm_table: [TcrDm], skip_set: [String], scope: [String], acc: [Arm]) : [Arm] {
   match arms {
     [] -> list_reverse(acc)
     [a, ...rest] -> match a {
       Arm(pat, opt_g, body) -> {
         let scope1 = pat_bindings(pat, scope)
         let new_body = tcrec_rewrite_body(body, nm, arity, c_sym_str, params,
-                                          pnames, uses, dm_table, scope1)
+                                          pnames, uses, dm_table, skip_set, scope1)
         tcrec_rewrite_arms(rest, nm, arity, c_sym_str, params, pnames, uses,
-                           dm_table, scope, [Arm(pat, opt_g, new_body), ...acc])
+                           dm_table, skip_set, scope, [Arm(pat, opt_g, new_body), ...acc])
       }
     }
   }
@@ -49082,7 +49650,7 @@ fn llvm_emit_expr_boxed(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
         Some(t) -> cat2(", expected ", ty_to_string(t))
       }
       let loc = concat_all([" at line ", int_to_string(x.line), " col ", int_to_string(x.col)])
-      let msg = concat_all(["unfilled hole ", label, loc, ty_seg])
+      let msg = concat_all(["unfilled hole: ", label, loc, ty_seg])
       let name_res = llvm_emit_name_constant(e, msg, "hole.msg.")
       let sreg = llvm_fresh_reg(name_res.e)
       let s_instr = concat_all([
