@@ -39,13 +39,17 @@ EXAMPLES
   42 |> int_to_string                      # → "42"
 
   # `|>` with extra args (LHS lands first by default):
-  3 |> max(7)                              # → max(3, 7) → 7
+  3 |> sub(7)                              # → sub(3, 7) → -4
 
   # `|>` with explicit placeholder `_` to land elsewhere:
-  3 |> max(7, _)                           # → max(7, 3) → 7
+  3 |> sub(7, _)                           # → sub(7, 3) → 4
 
-  # `|>` into an effectful fn:
-  "boom" |> Stdout.print                    # row picks up `Stdout`
+  # (where: `fn sub(a: Int, b: Int) : Int = a - b`)
+
+  # `|>` into an effect op needs an explicit lambda — capability
+  # ops (`Stdout.print`, etc.) are NOT first-class values you can
+  # bare-reference:
+  "hi" |> (s => Stdout.print(s))           # row picks up `Stdout`
 
   # Composing pipes (left-assoc):
   [1..10] |? is_prime | (n => n * 2) |> sum

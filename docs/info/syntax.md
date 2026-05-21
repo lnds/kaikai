@@ -57,7 +57,6 @@ FORMS
     }
     while { cond } { body }                          # stdlib helper
     until { cond } { body }                          # stdlib helper
-    if_then_else(p) { a } { b }                      # stdlib helper
                                                      # (NO `for x in xs`;
                                                      # use `xs | (x => ...)`
                                                      # or `xs |> each(f)`)
@@ -86,9 +85,14 @@ FORMS
     "hello"  "x = #{expr}"                           # strings + interp
     [1, 2, 3]   [head, ...tail]                      # lists
     [1..10]     [1..10..2]                           # ranges (incl. step)
-    {x: 1, y: 2}                                     # records
-    {x, y}                                           # record punning
-                                                     # (≡ {x: x, y: y})
+    Point { x: 1, y: 2 }                             # record literal —
+                                                     # type prefix REQUIRED
+    Point { x, y }                                   # record punning in
+                                                     # construction
+    { x: 1, y: y }                                   # record PATTERN
+                                                     # (no prefix needed
+                                                     #  in match arms)
+    { x, y }                                         # pattern punning
     Some(42)    None                                 # variants
     (a, b)      (a, b, c)      (a, b, c, d)          # n-tuples (sugar for
                                                      # Pair/Triple/Quad records;

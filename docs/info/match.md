@@ -37,9 +37,11 @@ PATTERNS
     [head, ...tail]                                 # head + rest
     [a, b, ...rest]                                 # two + rest
 
-  Records
-    {x: 1, y: y}                                    # match x, bind y
-    {x, y}                                          # shorthand: bind x, y
+  Records (patterns only — no type prefix needed in match)
+    { x: 1, y: y }                                  # match x == 1, bind y
+    { x, y }                                        # punning: bind both
+    # NB: a record LITERAL in expression position needs the type:
+    #   `Point { x: 3, y: 4 }`
 
   Guards
     n if n > 0          -> "pos"

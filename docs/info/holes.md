@@ -24,23 +24,35 @@ DESCRIPTION
 
 EXAMPLE
 
-  fn parse_url(s: String) : Url / Fail = {
-    let scheme = ?
-    let host = ?host
-    { scheme: scheme, host: host, port: 0 }
+  fn maybe_parse(s: String) : Int = {
+    let n = ?
+    n
   }
 
-  $ kai build --holes parse_url.kai
-    parse_url.kai:2  hole: expected String
-      in scope:  s: String
-    parse_url.kai:3  hole 'host': expected String
-      in scope:  s: String, scheme: String
+  fn other() : String = {
+    let host = ?host
+    host
+  }
+
+  $ kai build --holes file.kai
+    file.kai:2:11: type hole ?
+      expected: Int
+      in scope:
+        s : String
+        main : () -> Int
+        ...stdlib functions in scope...
 
 JSON OUTPUT
-  `--holes-json` emits a stable JSON document (one record per hole)
-  designed for LLM consumption — that is the Tier 3 #8 strategic bet.
-  Field names: `file`, `line`, `col`, `name`, `expected_type`,
-  `scope`, `effects`.
+  `--holes-json` emits a JSON array, one record per hole, designed
+  for LLM consumption. Record fields:
+
+    file            string         source file path
+    line, col       int            position
+    kind            string         "hole" (vs other holes kinds)
+    name            string|null    null for `?`, name for `?ident`
+    message         string|null    extra context if any
+    expected_type   string         the type the hole must have
+    in_scope        array          [{name, type}, ...] of all bindings
 
   See `docs/lsp.md` for the LSP hover format that wraps the same
   data.

@@ -8,7 +8,6 @@ SYNOPSIS
   if cond { then_block } else { else_block }
   while { cond } { body }
   until { cond } { body }
-  if_then_else(cond) { then_block } { else_block }
 
   # iteration over a list/range:
   xs | (x => body_expr)                       # map-pipe + lambda
@@ -16,9 +15,9 @@ SYNOPSIS
   xs |> each(f)                               # prelude alias of foreach
 
 DESCRIPTION
-  `if` and `match` are language built-ins. `while`, `until`, and
-  `if_then_else` are STDLIB FUNCTIONS that take trailing lambdas
-  (the double-trailing-lambda sugar). They are not keywords.
+  `if` and `match` are language built-ins. `while` and `until` are
+  STDLIB FUNCTIONS that take trailing lambdas (the double-trailing-
+  lambda sugar). They are not keywords.
 
   Because they are functions, they obey the effect row of their body:
   a `while { ... } { body that uses Stdout }` itself has `Stdout` in
@@ -50,8 +49,8 @@ EXAMPLES
   # iterating a range for side effects:
   [1..10] |> each((i) => Stdout.print("#{i}"))
 
-  # if_then_else as expression — both branches must type:
-  let label = if_then_else(n > 0) { "pos" } { "non-pos" }
+  # `if` is an expression — both branches must type:
+  let label = if n > 0 { "pos" } else { "non-pos" }
 
   # tail recursion is the idiomatic loop for non-trivial state:
   fn sum_loop(xs: [Int], acc: Int) : Int = match xs {
