@@ -168,8 +168,14 @@ tier0: selfhost demos-no-regression
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + package-mode harness (issue #569) + private-type shadow audit + private-record shadow audit + canonical-only alias audit"
+tier1: test demos-no-regression test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + package-mode harness (issue #569) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + kai info smoke"
+
+# `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
+# JSON validation). Guards against deleted .md, broken cmd_info
+# dispatcher, JSON-escape regressions in the awk converter.
+test-info:
+	@tools/test-info.sh
 
 # Issue #643 — institutional regression gate for the private-type
 # leak fix. `tools/audit-prelude-private-types.sh` walks every

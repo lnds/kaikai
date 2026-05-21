@@ -7,6 +7,12 @@ A functional language with static typing, LLVM native compilation, algebraic eff
 - Commit messages, PR titles/bodies, and all documentation are **English only** — no Spanish loanwords, even when the briefing is in Spanish.
 - Conversation with the user (Spanish) is not documentation and does not appear in the repo.
 
+## kaikai syntax — `kai info` is authoritative
+
+Before claiming a kaikai surface form exists in conversation, code suggestions, or examples, run `kai info <topic>`. `kai info` with no args lists the topics; `kai info syntax` is the one-page cheat sheet of every form kaikai actually has, including an explicit **NOT IN KAIKAI** section listing the false-friends that look plausible but do not exist (operator sections, `\x -> body`, list comprehensions, `do { }`, type classes, `throw/catch`, `return` statements, etc.). LLM agents in particular extrapolate from Haskell/Python/JS when uncertain — `kai info` is the cheap, always-correct way to check before writing. `kai info <topic> --json` returns the same content as structured JSON for programmatic consumption.
+
+The reference pages live at `docs/info/*.md` and travel with the binary (dev checkout reads from there; installed tarball ships `share/kaikai/info/`).
+
 ## Cross-cutting principles
 
 Three tiers; the higher tier wins on conflict.

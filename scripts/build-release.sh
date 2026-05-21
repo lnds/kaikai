@@ -25,6 +25,7 @@
 #       stdlib/...
 #       include/runtime.h
 #       demos/baseline.txt
+#       info/...                   # `kai info` reference pages
 #     README.md
 #     LICENSE
 
@@ -67,7 +68,8 @@ mkdir -p "$STAGE/bin" \
          "$STAGE/libexec/kaikai" \
          "$STAGE/share/kaikai/stdlib" \
          "$STAGE/share/kaikai/include" \
-         "$STAGE/share/kaikai/demos"
+         "$STAGE/share/kaikai/demos" \
+         "$STAGE/share/kaikai/info"
 
 # Bootstrap chain. kaic0 (C) → kaic1 (kaikai-from-C) → kaic2 (self-hosted).
 echo "==> bootstrapping kaic0 → kaic1 → kaic2"
@@ -124,6 +126,15 @@ cp VERSION             "$STAGE/share/kaikai/VERSION"
 cp EDITION             "$STAGE/share/kaikai/EDITION"
 if [ -f demos/baseline.txt ]; then
   cp demos/baseline.txt "$STAGE/share/kaikai/demos/baseline.txt"
+fi
+
+# `kai info` reference pages. Source lives at docs/info/*.md; the
+# installed layout puts them under share/kaikai/info/ where bin/kai
+# looks for them (see `cmd_info` in bin/kai). Distributing through the
+# tarball means brew tap users get them automatically — the formula
+# only bumps version+url+sha and never touches contents.
+if [ -d docs/info ]; then
+  (cd docs/info && tar -cf - .) | (cd "$STAGE/share/kaikai/info" && tar -xf -)
 fi
 
 # User-visible docs.
