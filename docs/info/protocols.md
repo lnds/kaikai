@@ -54,7 +54,7 @@ EXAMPLE
 DERIVE
   Some protocols can be derived:
 
-    #derive(Show, Eq)
+    #[derive(Show, Eq)]
     type Point = { x: Int, y: Int }
 
   Derivable: Show, Eq, Ord, Hash, BinSerialize (partial — see

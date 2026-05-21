@@ -48,13 +48,15 @@ CANCELLATION
   `Cancel` is a separate effect, orthogonal to `Spawn`. Its single op
   is `raise() : Nothing`. The scheduler injects `Cancel.raise()` into
   a fiber whose `Spawn.cancel(f)` was called, at the next yield point.
-  Handle it to run cleanup:
+  Handle it to run cleanup. The clause receives `resume` (a callable)
+  by convention; since `raise` returns `Nothing` the handler typically
+  ignores `resume` and short-circuits:
 
     fn worker() : Unit / Cancel + Stdout = {
       handle {
         long_running_loop()
       } with Cancel {
-        raise(_) -> Stdout.print("worker cleaning up")
+        raise(resume) -> Stdout.print("worker cleaning up")
       }
     }
 
