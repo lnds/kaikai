@@ -1,19 +1,23 @@
 # Lane experience — issue #599 branch-aware dup elimination
 
-**Status:** INFRASTRUCTURE LANDED, optimisation stubbed. The triple
-condition for safety (max-path ≤ 1 + consumed-on-every-path + all-
-consumers-linear) is correct, validated on the fixture, but enabling
-it on self-compile trips at least one more downstream pass we have
-not yet aligned. Tier 0 byte-identical with stub.
+**Status:** LANDED 2026-05-21. Optimisation is active; self-host
+fixed point byte-identical; tier 0 + tier 1 (excluding pre-existing
+`test-holes` breakage) green; -7.9% kai_internal_dup on self-compile.
 
 **Dates:**
 - 2026-05-20: first attempt in worktree `perceus-599`. Aborted; no
   code shipped.
-- 2026-05-21: second attempt in-tree. Landed full infrastructure
+- 2026-05-21 AM: second attempt in-tree. Landed full infrastructure
   including all three safety conditions and TCO-site dropmask
-  alignment.
+  alignment, but stubbed because activation broke the self-compile
+  fixed point.
+- 2026-05-21 PM: third attempt (this one). Identified the actual
+  root cause as a soundness bug in `pcs_consumers_linear_elems`
+  (list-spread tail `[..., ...nm]` was treated as linear but the
+  emitter applies `kai_incref` to it). One-line fix to the linearity
+  predicate; activation toggle restored; bootstrap converges; closing.
 
-## What landed in main
+## What landed
 
 1. **Fixture** `examples/perceus/branch_aware_dup.kai` +
    `.out.expected` — canonical bug shape. `fn pick(s: String, t: Tag)`
@@ -31,11 +35,12 @@ not yet aligned. Tier 0 byte-identical with stub.
 
 4. **`pcs_all_consumers_linear` family** (12 fns, ~190 LOC): walks
    the body and verifies every read sits in a linear-consumer
-   position. Bare `EVar(nm)` in a return-tail / fn arg / match
-   scrutinee / variant field is linear; `EField(nm, _)` and
-   `EIndex(nm, _)` are non-linear (borrow-only); calls through
-   `EField(<cap>, op)` or intrinsics are non-linear; explicit
-   `__perceus_*` calls are non-linear.
+   position. Soundness fix this session: `ElSpread(EVar(nm))` in a
+   list literal must be treated as **non-linear** because
+   `emit_list_tail` lowers it to `kai_incref(nm)` — an incref-borrow,
+   not a transfer. Without this fix, multi-iteration self-compile
+   crashes (corruption visible as `panic: non-exhaustive match` or
+   `field access on non-record`).
 
 5. **`skip_set: [String]` parameter** threaded through:
    - all 15 `pcs_rewrite_*` functions and `pcs_is_non_last`,
@@ -48,9 +53,8 @@ not yet aligned. Tier 0 byte-identical with stub.
      site).
 
 6. **`pcs_branch_aware_skip_params(pnames, body) : [String]`**
-   computes the skip-set via the triple condition. CURRENTLY STUBBED
-   to return `[]`. Activation is a one-line edit documented in the
-   source above the stub.
+   computes the skip-set via the triple condition. ACTIVE — no
+   stub.
 
 7. **`pcs_collect_exit_drops`** integrates `skip_set` — suppresses
    exit drop when the rewriter elided the matching dup wrap.
@@ -58,42 +62,118 @@ not yet aligned. Tier 0 byte-identical with stub.
 8. **`tcrec_compute_site_dropmask`** integrates `skip_set` —
    suppresses TCO-site drop for skipped params.
 
-## What does NOT land
+## What broke (and what the diagnosis taught us)
 
-The optimisation. With `pcs_branch_aware_skip_params` returning a
-non-empty set, the bootstrap fixed-point on `compiler.kai` panics
-with `panic: non-exhaustive match` (earlier iterations crashed with
-SIGBUS in `mfm_alloc`; aligning `tcrec_compute_site_dropmask`
-upgraded SIGBUS to typer panic — a different bug, still a bootstrap
-failure). The remaining mis-aligned passes are likely:
+The previous attempt (PR-stub) believed the blocker was downstream
+*coordination*: one more Perceus pass had to also consult `skip_set`,
+recursively, until all six passes agreed. Linus reviewed and pointed
+to `pcs_arm_drop_pass` as the likely next culprit because it
+re-scans arm bodies locally instead of consulting the global
+use-counter.
 
-- `pcs_arm_drop_pass` — emits per-arm drops based on per-arm
-  use-count, not the global skip_set.
-- Possibly `pcs_collect_block_let_exit_drops` for `let` bindings
-  whose RHS references a skip-set param.
+This session inverted that diagnosis. Reproducing the bootstrap
+failure under lldb revealed the panic is in **`kai_inv_param_names`**
+inside the typer invariant walker — a function that reads `p.pname`
+from a `[Param]`. The crash signature was a `KAI_VARIANT` (`TyVarT`)
+where a `KAI_RECORD` (Param) was expected: classic use-after-free
+followed by memory reuse. That is **memory corruption produced by
+the rewriter eliding a dup wrap that the emitter could not honour as
+a raw transfer**, not a pass that needed to learn about `skip_set`.
 
-Each one requires the same threading + skip-set conditional we did
-for the others. Cost per pass: ~30 LOC, but each adds a stop-the-
-world iteration of bootstrap testing.
+Bisecting which fn first received a non-empty skip-set under
+`inv_param_names`'s flavour pinned the second param (`acc: [String]`).
+`acc` appears once in each `match` arm:
 
-## Empirical findings (preserved)
+- `NIL  -> acc`             (consumed)
+- `CONS -> ... [p.pname, ...acc] ...` (spread)
+
+`pcs_consumers_linear_elems` walked the list element body and
+delegated to `pcs_all_consumers_linear(EVar("acc"))` → `EVar(_) ->
+true` → **linear**. But the emitter (`emit_list_tail` for the trailing
+spread) lowers `...acc` to `kai_incref(kai_acc)`, an incref-borrow,
+not a transfer. Eliding the conservative dup wrap therefore left the
+acc reference owned in two places (the new cons cell + the next
+iteration's `kai_acc`), and the iteration that reassigned `kai_acc`
+without dropping the previous owner accumulated a leaked ref. Over
+thousands of iterations the heap state diverged enough that an
+unrelated allocation reused a freed cell visible to
+`inv_param_names`, producing the cross-type crash.
+
+The fix is one match arm in `pcs_consumers_linear_elems`: a bare
+`ElSpread(EVar(nm))` returns `false` for the linearity check on `nm`.
+Any other spread (computed expression) recurses normally.
+
+**Lesson**: when a pass-coordination story doesn't reduce to "yes,
+one more table-lookup site," the real bug is usually a soundness gap
+in a predicate the optimisation depends on. The earlier hypothesis
+was reaching for ceremony (a `RcPlan` refactor to centralise five
+duplicated predicates) when the right move was to read the emitter
+and audit which expression shapes the rewriter's `__perceus_dup`
+insertion is actually paired with.
+
+## Empirical findings
 
 - kaic2 self-compile wall: ~68 s (darwin-arm64, 2026-05-21).
-- `kai_internal_dup` in emitted stage2.c: 11,135 baseline.
-- With basic max-path optimisation: 9,753 (-12.4%).
-- With max-path + consume-coverage active: 10,011 (-10.1%).
-- With max-path + consume-coverage + linear-consumer active:
-  10,066 (-9.6%). The linear-consumer check rules out a small
-  number of additional cases, slightly reducing the cut.
-- Output md5 baseline: `0b902cd9a4ce08ad3bc5079978f56a92`.
+- `kai_internal_dup` in emitted compiler.c:
+  - Baseline (skip-set always `[]`): 11,254.
+  - Active triple condition + soundness fix: **10,364 (-7.9%)**.
+- Output of `kaic2 compiler.kai`:
+  - Pre-activation md5: `6310d458ca3622a3647f13fda01b9c6d`.
+  - Post-activation md5: `5e71c7c8930ed617f123200d417c7b05`.
+  - **Self-host fixed point byte-identical** under the post md5.
+- Fixture `examples/perceus/branch_aware_dup.kai` compiles + runs +
+  matches `.out.expected`.
 
-## Activation toggle
+## Cost vs estimate
+
+The original issue estimated 200–400 LOC. Actual landed total over
+all three attempts: ~700 LOC (the same as the AM attempt, plus a
+~12-line predicate fix). Within the 1500-LOC stop ceiling.
+
+The work that closed the lane was a one-line diagnosis under lldb +
+a single Edit to `pcs_consumers_linear_elems`. The cost was almost
+entirely in routing past the wrong hypothesis from the previous
+attempt's retro.
+
+## Things this lane changed about how we look at Perceus bugs
+
+1. **The emitter is the ground truth for what counts as "linear."**
+   The rewriter inserts `__perceus_dup` calls; everything not
+   wrapped is a raw transfer ASSUMING the emitter doesn't add an
+   `kai_incref` of its own. A linearity-predicate audit needs to
+   pair every `pcs_*_consumers_linear_*` site against the
+   corresponding `emit_*` lowering and verify they agree.
+
+2. **Multi-iteration self-compile failures look like memory
+   corruption, not like rule violations.** When the bootstrap fixed
+   point breaks but small fixtures pass, the leak/double-decref is
+   accumulating across iterations — the visible crash is a downstream
+   read on reused memory. lldb + stack trace at `kai_prelude_panic` /
+   `kai_op_field` is the fastest way to localise.
+
+3. **A coordination story should be falsified before it is followed
+   to its conclusion.** "One more pass needs to consult the table"
+   is the kind of story that can absorb infinite work without
+   discovering the actual bug. Three attempts on #599 spent compute
+   on this story; the third attempt only escaped by running the
+   crashing binary under a debugger and reading what the trap said.
+
+## Follow-ups
+
+- The pre-existing `test-holes` failure (Makefile expects `unfilled
+  hole:` but compiler emits `unfilled hole ?` — no colon) is
+  orthogonal to this lane but is a tier-1 break on `main`. Open
+  separate issue if not already filed.
+- Audit other `pcs_*_consumers_linear_*` cases against `emit_*` for
+  similar mismatches. Suspects: `EHandle` body emission (handler
+  prologue may incref the body's free vars), nested closures.
+
+## Final activation toggle (for historical reference)
+
+The toggle the previous retro documented as "replace stub body with"
+is now the actual body of `pcs_branch_aware_skip_params`:
 
 ```kai
-# In compiler.kai, replace:
-fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] = []
-
-# With:
 fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] = match pnames {
   []           -> []
   [h, ...rest] -> {
@@ -106,39 +186,5 @@ fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] = match
 }
 ```
 
-Then re-run the bootstrap fixed-point. If panic on
-`compiler.kai` self-compile, identify the failing pass (likely
-`pcs_arm_drop_pass`) and apply the same skip_set integration.
-
-## Cost vs estimate
-
-The original issue estimated 200–400 LOC. Actual this attempt:
-~700 LOC (max_paths + consumed + linear + skip_set threading +
-pcs_collect_exit_drops + tcrec_compute_site_dropmask + tcrec
-threading). Within the 1500-LOC stop ceiling but at the upper
-end.
-
-The blocker has consistently been the same: each new safety
-condition exposes one more downstream pass that assumed
-conservative-dup. The chain of dependencies is longer than the
-issue's "5-pass coordination caveat" suggested — it's at least 6
-passes (rewriter + exit_drops + tcrec_dropmask + tcrec_rewrite_*
-threading + arm_drop_pass + ...).
-
-## Why the lane ships stubbed instead of reverted
-
-All the analysis, the linear-consumer check, the threading, the
-exit-drop integration, the TCO alignment, AND the activation toggle
-are in place. Reverting would force the next attempt to redo all of
-it. Shipping stubbed costs zero runtime (skip_set is always `[]`,
-short-circuits early in `pcs_is_non_last` and the other consumers)
-and leaves a one-line activation toggle for when `pcs_arm_drop_pass`
-gets aligned.
-
-## State left for the next lane
-
-- All helpers and threading live in main.
-- Activation requires aligning the remaining downstream pass(es).
-- The fixture compiles correctly with the optimisation active
-  (shape validated).
-- Issue #599 stays open with this retro.
+Coupled with the one-arm fix in `pcs_consumers_linear_elems` that
+treats `ElSpread(EVar(nm))` as non-linear for `nm`.
