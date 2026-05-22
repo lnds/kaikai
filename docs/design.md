@@ -209,7 +209,7 @@ arguments:
   - **Stage 0** (in C, ~5–10K lines, no dependencies): compiles an austere subset **kaikai-minimal** → **portable C**. Any machine with `cc` can build kaikai from scratch.
   - **Stage 1** (in kaikai-minimal, compiled by stage 0): compiles full kaikai (effects + inference + Perceus) → emits C or textual LLVM IR.
   - **Stage 2** (in full kaikai, compiled by stage 1): definitive compiler with direct LLVM, optimizations, Perceus, fiber scheduler. Self-hosted.
-  - **Verification**: stage 2 compiled by stage 1 must produce the same binary as stage 2 compiled by itself (fixed-point bootstrap).
+  - **Verification**: stage 2 compiled by itself must be deterministic — running `kaic2b` twice on `stage2/compiler.kai` produces byte-identical C output (`kaic2b.c == kaic2c.c`). Stage 1's output (`kaic2a.c`) is **not** required to match stage 2's; the two compilers are structurally distinct (stage 1 has no typer) and may legitimately emit different code from the same source. The functional contract — that `kaic2a` produces a `kaic2b` that passes tier1 — is enforced by tier1, not by structural equivalence. See `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md` for the rationale.
   - **Final format**: single static binary with embedded runtime.
   - **MVP targets**: Linux x86_64, macOS arm64. Linux arm64, macOS x86_64, Windows post-MVP.
 - **Tests as first-class**: **builtin** syntax, recognized by the compiler.

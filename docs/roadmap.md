@@ -72,8 +72,11 @@ when discussing 1.0 readiness):
   structural data traversal → ≤ 5–10× C in-MVP, ≤ 2× post-MVP
   via Phase 3. Orongo: near-C on compute-bound with multi-thread
   + Tier 3b unboxed messages.
-- **Selfhost**: byte-identical at fixed point under both C and LLVM
-  backends.
+- **Selfhost**: per-compiler determinism under both C and LLVM
+  backends — `kaic2b` and `kaic2c` (stage 2 compiled by itself, twice)
+  produce byte-identical output. Stage 1's output is not required to
+  match (see
+  `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`).
 
 ## Milestones — kaikai language
 

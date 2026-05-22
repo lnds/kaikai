@@ -203,7 +203,7 @@ Two layers, both run from the repo root:
 
    — stage 1 compiled by stage 0 must compile the same examples stage 0 does, and their outputs must match byte-for-byte.
 
-3. **Fixed-point check**: once self-hosting, `kaic1 stage1/compiler.kai` must produce a C source that, when compiled, yields a binary byte-identical to `kaic1` itself.
+3. **Determinism check (stage 1)**: `kaic1 stage1/compiler.kai` run twice on the same source must produce byte-identical C output. This catches non-determinism in stage 1 (hashmap iteration order, leaked pointer addresses, timestamps) without requiring stage 1 and stage 2 to agree on emission shape. See `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md` — the stage 1 ↔ stage 2 byte-identical fixed point that previously appeared here is intentionally dropped because stage 1 (no typer) and stage 2 (full typer + effects + Perceus) are structurally distinct compilers and cannot agree on type-driven emission decisions like match tag-compare or niche-filling.
 
 ## Milestones within phase 3
 

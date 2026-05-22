@@ -463,7 +463,10 @@ old caches die, users rebuild once. Move on.
 Numbers below are expected walls after each layer ships, on a
 2026-05-14 M2 Pro baseline of 2.31 s for `kai build empty.kai`
 (32 preludes, post-#578). Tier 0 + Tier 1 + Tier 1-ASAN green
-and selfhost byte-identical are gates for every sub-phase.
+and selfhost per-compiler determinism (`kaic2b.c == kaic2c.c`;
+stage 1's output is not required to match — see
+`docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`)
+are gates for every sub-phase.
 
 ### Phase A.0 — post-parse cache — **SHIPPED 2026-05-14 (#452) + KAB2 2026-05-15 (#592)**
 

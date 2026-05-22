@@ -23,9 +23,12 @@ all claimed `make test clean`:
 
 The pattern: **the gate the commit message named was not the gate that
 ran**, or the fixture for the case did not exist. `make selfhost` was
-honest (byte-identical fixed point); `make test` was honest in name
-but partial in practice; `make demos-no-regression` was honest about
-its baseline but the baseline did not include the regressions.
+honest in its day (then a byte-identical fixed point across stage 1
+↔ stage 2; today narrowed to per-compiler determinism — see
+`docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`);
+`make test` was honest in name but partial in practice;
+`make demos-no-regression` was honest about its baseline but the
+baseline did not include the regressions.
 
 The fix is not "run more tests per commit" — that murders velocity
 when 510 commits land in 10 days. The fix is to **name three tiers
@@ -37,13 +40,16 @@ PR description to declare which tier ran**.
 ~30-60 seconds. Runs inside each worktree, before any commit.
 
 ```
-make selfhost              # byte-identical fixed point (C + LLVM)
+make selfhost              # per-compiler determinism (C + LLVM)
 make demos-no-regression   # baseline N
 ```
 
 If Tier 0 fails, the commit does not happen. This is what keeps `main`
 unbroken across parallel lanes — every commit lands on a green
-self-host fixed point with the demo baseline holding.
+self-host with the demo baseline holding. `make selfhost` checks that
+`kaic2b` and `kaic2c` (stage 2 compiled by itself, twice) are
+byte-identical; stage 1's output (`kaic2a.c`) is not required to match
+stage 2's (see `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`).
 
 **Disciplina**: agents never push commits that fail Tier 0. The
 3-level gate's "Level 1 mechanical" maps onto Tier 0.
