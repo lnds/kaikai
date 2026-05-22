@@ -104,17 +104,28 @@ test-blocks: $(TARGET) build
 	    || { echo "tests DIFF $$name"; diff build/$$name-t-s0.err build/$$name-t.err; exit 1; }; \
 	done
 
-# Self-hosting: build kaic1b (stage 1 compiled by stage 1), verify it
-# compiles the same examples to the same outputs, and reach a fixed
-# point where running kaic1b on its own source is byte-identical.
+# Self-hosting: stage 1 per-compiler determinism.
+#
+# Build kaic1b (stage 1 compiled by stage 1), have it compile its own
+# source again to produce kaic1c.c, and require kaic1b.c == kaic1c.c.
+# This catches non-determinism inside stage 1 (hashmap iteration,
+# pointer addresses, timestamps) — the same canary `make -C stage2
+# selfhost` provides for stage 2. See
+# docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md.
+#
+# The trailing per-example diff (kaic1 vs kaic1b emitting the same
+# minimal-language samples) is an additional check that stage 1's
+# emitter is consistent across its own bootstrap. This compares
+# kaic1 against kaic1b — same compiler, two builds — not stage 1
+# against stage 2.
 selfhost: $(TARGET) build
 	@set -e; \
 	./$(TARGET) compiler.kai > build/kaic1b.c; \
 	$(CC) $(CFLAGS) -I ../stage0 build/kaic1b.c -o build/kaic1b $(LDLIBS_M); \
 	./build/kaic1b compiler.kai > build/kaic1c.c; \
 	diff -q build/kaic1b.c build/kaic1c.c > /dev/null \
-	  && echo "self-hosting fixed point: OK" \
-	  || { echo "self-hosting fixed point: DIFF"; exit 1; }; \
+	  && echo "stage1 selfhost determinism: OK (kaic1b.c == kaic1c.c)" \
+	  || { echo "stage1 selfhost determinism: DIFF (kaic1b.c != kaic1c.c)"; exit 1; }; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./build/kaic1b $$f    > build/$$name-b.c; \

@@ -148,7 +148,11 @@ demos-verify: kaic2
 demos-no-regression: kaic2
 	$(MAKE) -C demos no-regression
 
-# Self-hosting fixed point for both compilers.
+# Self-hosting: per-compiler determinism for stage 1 and stage 2.
+# Each stage compiles its own source twice; output must match
+# byte-for-byte. Stage 1 and stage 2 are NOT required to agree on
+# emission shape — see
+# docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md.
 selfhost:
 	$(MAKE) -C stage1 selfhost
 	$(MAKE) -C stage2 selfhost
@@ -163,7 +167,7 @@ clean:
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
 tier0: selfhost demos-no-regression
-	@echo "tier0 OK — selfhost byte-identical, demos baseline holds"
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds"
 
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
