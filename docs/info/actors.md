@@ -51,7 +51,9 @@ handler over the current fiber (see `stdlib/actor.kai`).
 
 ## NOT IN KAIKAI
 
-- Erlang link/unlink semantics. Use Monitor + a supervisor pattern.
+- Erlang `unlink`. The `Link` effect exists with a `Link.link(peer)`
+  op, but bidirectional crash propagation is m8.x scope and there is
+  no `unlink` op. For supervision today, use Monitor + handler.
 - Process registry / named actors as primitive. Use a stdlib
   helper that wraps `Actor[Msg]` handles.
 - Distributed actors. Single-node only.

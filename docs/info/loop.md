@@ -65,6 +65,8 @@ package — `import loop` at the top of the file.
 ```kaikai
 import loop
 
+fn maybe_done() : Bool = false                 # placeholder predicate
+
 fn main() : Unit / Stdout = {
   repeat(3) {                                  # `body` runs n times
     Stdout.print("hi")
@@ -72,9 +74,12 @@ fn main() : Unit / Stdout = {
 
   # `forever` returns `Nothing`: the type system knows there is no
   # normal-completion path. The only exits are `Cancel` (cooperative
-  # cancellation) or an effect that unwinds (e.g. `Fail.fail`).
-  forever {
-    handle_one_message()
+  # cancellation) or an effect that unwinds (e.g. `Fail.fail`). In a
+  # real program the body would `Cancel.cancel()` or call a Fail op.
+  if maybe_done() {
+    forever {
+      Stdout.print("tick")
+    }
   }
 }
 ```
@@ -104,7 +109,8 @@ fn main() : Unit / Stdout = {
 }
 ```
 
-…or with the stdlib `each` helper (which returns `Unit`):
+…or with the prelude `each` helper (auto-loaded, returns `Unit`;
+`foreach` is the spelled-out stdlib equivalent in `core/list`):
 
 ```kaikai
 fn main() : Unit / Stdout = {

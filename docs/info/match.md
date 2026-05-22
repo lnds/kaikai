@@ -21,7 +21,7 @@ match expr {
 ```text
 _                                         # wildcard
 x                                         # bind
-x: Int                                    # bind with type assert
+x: Int                                    # bind + union-variant narrow
 
 42  3.14  "hello"  'c'  true  false       # literals
 
@@ -95,9 +95,31 @@ The checker reports a specific witness pattern, not a generic error.
 Use `_` only when you genuinely want a catch-all; do not use it to
 silence the checker.
 
+## `case`-led fn body
+
+A function whose body is `{ case <pat> (when <guard>)? -> <body> ...
+}` desugars into a `match` against the function's parameter(s). The
+guard keyword inside `case` arms is `when`, not `if`. Multi-arg form
+matches a tuple of up to 4 parameters per arm.
+
+```kaikai
+fn classify(n: Int) : String {
+  case 0            -> "zero"
+  case n when n < 0 -> "neg"
+  case _            -> "pos"
+}
+
+fn main() : Unit / Stdout = Stdout.print(classify(-3))
+```
+
+Useful when the function exists to dispatch on its parameters and an
+explicit `= match { ... }` would just add a wrapper.
+
 ## NOT IN KAIKAI
 
-- `case x of` (Haskell/Erlang). Use `match expr { ... }`.
+- `case x of pat -> ...` (Haskell/Erlang). The `case` keyword exists
+  in kaikai but only in a *clause-block fn body* (`fn f(x) { case 0
+  -> ...; case _ -> ... }`); it is not a standalone expression.
 - `switch / case` (C/JS). Use `match`.
 - Or-patterns `A | B -> ...` as a single arm. Write two arms.
 - View patterns. Use a guard.

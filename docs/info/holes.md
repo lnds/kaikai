@@ -59,8 +59,18 @@ See `docs/lsp.md` for the LSP hover format that wraps the same data.
 
 ## Where holes are legal
 
-Anywhere an expression is legal. Patterns and types do not (yet)
-accept holes.
+Three positions today:
+
+- **Expressions** — `?` or `?name`. The compiler reports the inferred
+  type and any in-scope bindings of that type.
+- **Effect-row tails** — `fn f(x: Int) : Int / ?e = x` parses; the
+  `--effect-holes-json` flag reports the inferred row variable.
+- **Patterns** — `?` and `?name` are accepted in match-arm patterns
+  (they match anything, like `_`). Pattern holes do not produce a
+  typed-hole report today; the position is reserved for richer
+  reporting in a follow-up.
+
+Type-expression holes (`fn f(x: ?) : ? = x`) are not implemented.
 
 ## NOT IN KAIKAI
 

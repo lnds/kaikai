@@ -59,14 +59,14 @@ over units, not types.
 - Adding two values requires matching units: `1.0<m> + 1.0<s>` is
   a type error. Multiplying multiplies units: `1.0<m> * 1.0<s> :
   Real<m*s>`.
-- Units cannot constrain integer types — `Int<m>` does not exist.
-  Only `Real`.
+- Unit annotations apply only to numeric heads: `Real<m>`, `Int<m>`,
+  and `Decimal<m>` parse and typecheck. `String<m>` or `Bool<m>`
+  are parse errors.
 
 ## NOT IN KAIKAI
 
 - Unit conversions as language built-ins. Write a conversion fn:
   `fn ft_to_m(x: Real<ft>) : Real<m> = x * 0.3048<m/ft>`.
-- Dimensional analysis on `Int`. Use `Real`.
 - F#-style unit suffixes without angle brackets — `9.81<...>` is
   required; `9.81m_s_2` is not a thing.
 
