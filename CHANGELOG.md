@@ -84,6 +84,24 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.82.0 (2026-05-21)
+
+### Added
+
+- **test**: auto-discover tests/ directory in package mode
+- **fmt**: fill all unsupported arms — kai fmt covers full kaikai surface
+
+### Fixed
+
+- **emit**: restore `unfilled hole:` colon in runtime panic message
+- **make**: add --path ../stdlib to three ASAN targets
+
+### Changed
+
+- **perceus**: activate branch-aware dup elimination (#599)
+- **perceus**: add linear-consumer check and TCO alignment for #599
+- **perceus**: land branch-aware dup infrastructure (stubbed)
+
 ## v0.81.0 (2026-05-21)
 
 ### Added
