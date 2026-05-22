@@ -80,8 +80,14 @@ mypackage/
   kai.toml
   main.kai                       # entry point
   lib.kai                        # other modules
-  examples/                      # example programs (own kai.toml)
-  tests/                         # tests (own kai.toml)
+  examples/                      # example programs (own kai.toml
+                                 #   per example, or sibling files
+                                 #   that import the parent package)
+  tests/                         # test files — `kai test .` auto-runs
+                                 #   each `*.kai` here; imports
+                                 #   resolve to the parent's modules
+                                 #   via sibling resolution (no
+                                 #   manifest needed inside tests/)
 ```
 
 ## Spec arg to kai build / run
