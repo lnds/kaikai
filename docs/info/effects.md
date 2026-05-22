@@ -70,6 +70,53 @@ fn main() : Int / Stdout = {
 - Calling `resume(v)` continues the body with `v`.
 - Outside the `with { ... }`, `Greeter` is no longer in the row.
 
+## Default handlers
+
+An effect declaration can carry an optional `default { }` block with
+fallback clauses the compiler auto-installs at `main` when the
+program performs `Eff.op(...)` without an enclosing
+`handle ... with Eff`. The block sits next to the op declarations
+and uses the same clause shape as `handle`:
+
+```kaikai
+effect MyConsole {
+  shout(msg: String) : Unit
+  default {
+    shout(msg, resume) -> $extern_handler("kai_default_stdout_print")
+  }
+}
+
+fn main() : Unit / MyConsole = {
+  MyConsole.shout("hello from a user effect default\n")
+}
+```
+
+`$extern_handler("c_symbol")` is the compiler intrinsic that bridges
+a default clause to a runtime C entry — the only form codegen
+currently accepts inside `default { }`. Kaikai-bodied default
+clauses parse and store but their codegen path is deferred (Stage C
+of issue #533).
+
+Coverage rules (typer):
+
+1. **Inside a `handle ... with Eff { clauses }`** — the listed
+   clauses discharge the op; the `default { }` block is unused at
+   that call site.
+2. **At `main`, no enclosing `handle`** — the `default { }` block's
+   clause fires; the auto-installed handler runs `$extern_handler`.
+3. **Partial handle + missing op in default** — typer rejects with
+   `effect not handled: Eff.op`. Merging defaults *into* a partial
+   handle is Stage C work; today, list the op explicitly in the
+   `handle` or let it fall through to the default at `main`.
+
+For builtin effects, the 16 canonical handlers (Stdout, Stderr,
+Stdin, File, Env, Console, Clock, Random, …) ship default
+installation paths in the runtime — `Log` is one of them and its
+default writes to stderr in ISO-8601 form without a literal
+`default { }` block in `stdlib/log.kai`. The full catalog lives in
+`docs/effects-stdlib.md`; the runtime implementation rationale and
+the Stage A/B/C trilogy live in `docs/effects.md`.
+
 ## Rebinding the capability name
 
 When two handlers of the same effect nest, use `as`. Inside that body

@@ -51,8 +51,11 @@ over units, not types.
 
 ## Caveats
 
-- `^` ONLY appears inside `<...>` (units). `2^10` does not lex as
-  power in expressions; use `int_pow(2, 10)`.
+- `^` in unit expressions (`Real<m^2>`, `<m/s^2>`) denotes a unit-level
+  power and the exponent is a literal integer. The same `^` also works
+  as an expression-level power operator (`x ^ n` with `n: Int`) — see
+  `kai info syntax`. The unit rule and the expression rule line up:
+  `r : Real<m>` and `r ^ 3 : Real<m^3>` only when `3` is a literal.
 - Adding two values requires matching units: `1.0<m> + 1.0<s>` is
   a type error. Multiplying multiplies units: `1.0<m> * 1.0<s> :
   Real<m*s>`.
