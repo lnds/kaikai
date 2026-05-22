@@ -70,6 +70,34 @@ reports median and MAD.
 `kai test ./...` walks every `kai.toml` under cwd and runs each
 package's tests.
 
+## The `tests/` directory
+
+When a package (a directory with `kai.toml`) carries a sibling
+`tests/` directory, `kai test .` compiles and runs every `*.kai`
+file under `tests/` in addition to the entry point. Each test file
+becomes its own test binary; imports inside the file resolve to
+the parent package's modules via sibling resolution — no extra
+`kai.toml` inside `tests/`.
+
+```text
+mypkg/
+  kai.toml             # name = "mypkg"
+  main.kai
+  mathlib/adder.kai    # pub fn add, pub fn double
+  tests/
+    test_adder.kai     # `import mypkg.mathlib.adder`
+```
+
+```sh
+kai test .             # runs main.kai's blocks + tests/*.kai
+```
+
+Files inside `tests/` follow the same rules as a top-level test
+file: at least one `test "..." { ... }` block plus an
+`fn main() : Int = 0` placeholder (the `--test` driver replaces
+`main` with the test runner). Non-`*.kai` files (fixtures, golden
+files) under `tests/` are ignored by the runner.
+
 ## Exit codes
 
 ```text
