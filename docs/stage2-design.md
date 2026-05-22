@@ -270,16 +270,22 @@ cc /tmp/s1.c -I stage0 -o kaic1                # existing
 # stage 2 comes online
 ./kaic1 stage2/compiler.kai > /tmp/s2.c        # first cross-compile
 cc /tmp/s2.c -I stage0 -o kaic2
-./kaic2 stage2/compiler.kai > /tmp/s2b.c       # self-compile
-diff /tmp/s2.c /tmp/s2b.c                      # optional: fixed-point sanity
+./kaic2 stage2/compiler.kai > /tmp/s2b.c       # self-compile (kaic2b)
+./kaic2b stage2/compiler.kai > /tmp/s2c.c      # second self-compile (kaic2c)
+diff /tmp/s2b.c /tmp/s2c.c                     # determinism check
+# note: /tmp/s2.c (written by stage 1) is NOT required to match s2b.c
 
 # then kaic2 becomes the compiler for everything
 ./kaic2 demos/my_actor_system.kai -o actor-sys
 ./actor-sys
 ```
 
-Once stage 2 is compiled with itself and produces a fixed point,
-stage 1 is frozen. Any language-level change lands only in stage 2.
+Once stage 2 self-compiles deterministically (`kaic2b` produces the
+same C as `kaic2c` on the same source), stage 1 is frozen. Stage 1 is
+allowed to emit structurally different code from stage 2 — stage 1
+has no typer and cannot replicate stage 2's type-driven emission
+decisions. See `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`.
+Any language-level change lands only in stage 2.
 
 ## Milestones within stage 2
 
@@ -470,8 +476,11 @@ in.
     `scripts/validate_holes_json.py`.
 11. **m11 — Diagnostics quality pass**: every error message
     reviewed, rewritten, and tested against an Elm/Rust bar.
-12. **m12 — Self-hosting checkpoint**: `kaic2
-    stage2/compiler.kai` produces a byte-identical output.
+12. **m12 — Self-hosting checkpoint**: `kaic2b` and `kaic2c`
+    (stage 2 compiled by itself, twice) produce byte-identical
+    output on `stage2/compiler.kai`. Stage 1's output (`kaic2a.c`)
+    is no longer required to match — see
+    `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`.
     Stage 1 retired from the dev loop.
 12.5. **m12.5 — Units of Measure**: F#-style first-class units
     on numeric primitives (`Real<USD>`, `Int<Seconds>`,
@@ -662,9 +671,11 @@ Rationale:
    §9 decision against a parser combinator suite. Verdict and
    stress-test follow-ups (Pair[a, b], multi-arg match sugar,
    record destructuring + punning) pinned in §9.
-5. **m12 (self-hosting checkpoint)** — `kaic2 stage2/compiler.kai`
-   produces a byte-identical output. Stage 1 retires from the
-   dev loop. This is the natural moment to evaluate stage 2's
+5. **m12 (self-hosting checkpoint)** — `kaic2b` and `kaic2c`
+   (stage 2 compiled by itself, twice) produce byte-identical
+   output on `stage2/compiler.kai` (per-compiler determinism).
+   Stage 1's output is allowed to differ. Stage 1 retires from
+   the dev loop. This is the natural moment to evaluate stage 2's
    performance, because once stage 1 is gone, stage 2's speed
    is the development speed.
 6. **m12.5 (units of measure)** — F#-style first-class units on
