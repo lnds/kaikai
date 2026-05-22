@@ -331,8 +331,18 @@ fn main() : Unit / Stdout = {
 }
 ```
 
-`^` appears only inside `<...>` for units; `2^10` does not work as
-power in expressions (use `int_pow(2, 10)`).
+`^` is the power operator. The exponent MUST be `Int` (literal or
+non-literal); the base may be `Int`, `Real`, or `Real<u>`. The result
+keeps the base type, with the unit lifted to `u^n` when the base is
+dimensioned (in that case `n` must be an `Int` literal — there are no
+dependent units). For `Int` base, negative exponents truncate to `0`;
+for `Real` base, negative exponents compute `1.0 / base^|e|`. There
+is no `Real ^ Real` operator; for non-integer exponents use a stdlib
+helper (e.g. `Numeric.pow_int` for the `Int`-exponent case in
+`stdlib/math/numeric.kai`).
+
+Inside `<...>` (unit expressions) `^` also denotes power, but the
+exponent there is a unit-level integer literal — see `kai info units`.
 
 ## Capability sugar
 

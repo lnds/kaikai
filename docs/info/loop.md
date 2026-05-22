@@ -57,8 +57,40 @@ fn main() : Int / Stdout = {
 }
 ```
 
-`while` and `until` live in the `loop` stdlib package — `import loop`
-at the top of the file.
+`while`, `until`, `repeat`, and `forever` live in the `loop` stdlib
+package — `import loop` at the top of the file.
+
+## `repeat` and `forever`
+
+```kaikai
+import loop
+
+fn main() : Unit / Stdout = {
+  repeat(3) {                                  # `body` runs n times
+    Stdout.print("hi")
+  }
+
+  # `forever` returns `Nothing`: the type system knows there is no
+  # normal-completion path. The only exits are `Cancel` (cooperative
+  # cancellation) or an effect that unwinds (e.g. `Fail.fail`).
+  forever {
+    handle_one_message()
+  }
+}
+```
+
+Signatures (all four are row-polymorphic over a single effect `e`):
+
+```text
+while  : (() -> Bool / e, () -> Unit / e) -> Unit    / e
+until  : (() -> Bool / e, () -> Unit / e) -> Unit    / e
+repeat : (Int,            () -> Unit / e) -> Unit    / e
+forever:                  (() -> Unit / e) -> Nothing / e
+```
+
+`repeat(n, body)` with `n <= 0` is a no-op. `forever`'s body must
+end the program by raising or by being cancelled — there is no
+graceful return.
 
 ## Pipe-for-each
 
