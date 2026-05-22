@@ -189,8 +189,10 @@ fn main() : Unit / Stdout = {
 }
 ```
 
-List destructuring (`[head, ...tail]`) goes in pattern position, not
-on the RHS of `let`. See the [Patterns section](#patterns-highlights-see-kai-info-match).
+List destructuring (`[head, ...tail]`) only parses where a pattern
+is expected — `match` arms, `let` LHS (`let [h, ...t] = xs`), fn
+parameters. It is not an RHS expression form. See the
+[Patterns section](#patterns-highlights-see-kai-info-match).
 
 Operators by precedence (looser at the bottom):
 

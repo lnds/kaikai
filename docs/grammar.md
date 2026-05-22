@@ -119,15 +119,21 @@ Plus the special tokens:
   following identifier to recognise compiler intrinsics
   (`$extern_handler("c_symbol")`, etc.). Not a user-extensible form.
 
-`_` is its own token (`UNDERSCORE`), used as wildcard pattern,
-lambda placeholder, and pipe-placeholder argument.
+`_` is its own token (`UNDERSCORE`), used as a wildcard pattern and
+as the pipe-RHS placeholder inside `xs |> f(a, _, b)` (§4.4).
+
+`.` is the lambda placeholder in argument position (`f(. + 10)`)
+and the head of the method-ref placeholder (`xs | .length`); see
+§2.6 *Postfix and lambda* for details.
 
 `Self` is reserved inside protocol bodies but not lexed as a keyword
 elsewhere.
 
-`case`, `priv`, and `when` are reserved for the parser's case-led
-multi-clause bodies and refinement-related forms; they are NOT user-
-extensible identifier names. Do not bind them as locals.
+`case` and `when` are reserved for the parser's case-led multi-clause
+function bodies (§4.16). `priv` is the per-field visibility qualifier
+inside record type bodies (§2.2 *Type declaration* — `priv name: T`
+marks a field as not exported from its declaring module). None of the
+three may be bound as a local identifier.
 
 ### 1.5 Punctuation and operators
 
@@ -257,7 +263,7 @@ unit_atom   ::= IDENT
               | IDENT '^' '-' INT_LIT
               | INT_LIT                  (* '1' for dimensionless *)
               | '(' unit_expr ')'
-unit_op     ::= '*' | '/' | <space>      (* implicit product *)
+unit_op     ::= '*' | '/'                (* explicit only *)
 ```
 
 Inside `<...>`, `^` is the only place the caret token is legal as an
@@ -284,22 +290,44 @@ The lexer recognises the identifier `todo` immediately followed by
 ### 2.1 Program and modules
 
 ```
-program     ::= import* decl*
-import      ::= 'import' module_path import_tail?
+program     ::= decl*
+decl        ::= visibility? decl_inner
+              | import_decl                          (* `pub` rejected here *)
+import_decl ::= 'import' module_path import_tail?
+              | 'import' '?' IDENT                   (* dependency hole *)
 module_path ::= IDENT ('.' IDENT)*
 import_tail ::= 'as' IDENT
               | '.' '{' ident_list '}'
 ident_list  ::= IDENT (',' IDENT)*
-use_decl    ::= 'use' module_path                    (* `use` reserved *)
+use_decl    ::= 'use' IDENT                          (* effect-name only *)
 ```
 
-There is no `module` declaration; a file's module name comes from its
-path relative to the project root.
+There is no `module` declaration; a file's module name comes from
+its path relative to the project root. Imports may be interleaved
+with other top-level decls — the parser dispatches `import` from
+the same decl-loop as everything else. By convention they sit at
+the top of the file, but the grammar imposes no order.
+
+The `import ?name` form (m7f §7) is a typed-hole at module-load
+position: the parser accepts it; the resolver reports a diagnostic
+listing the closest module exports for `name`. Useful for "let me
+type the symbol and discover which module it lives in".
+
+The file-scope `use Effect` form (covered by §2.2 *Top-level
+declarations*) opens an effect's ops for bare-name resolution.
+Inside a block, the same syntax appears as `use_stmt` (§2.5).
 
 ### 2.2 Top-level declarations
 
 ```
-decl        ::= visibility? decl_inner
+decl        ::= attr_prefix* visibility? decl_inner
+              | import_decl
+attr_prefix ::= '#[' attr_body ']'
+              | '[<' 'refinement_pure' '>]'           (* legacy bracket form *)
+attr_body   ::= 'derive' '(' protocol_list ')'        (* §4.11 *)
+              | 'unstable'                            (* issue #602 — Tier 1 #4 *)
+              | IDENT ('(' arg_list? ')')?            (* future attrs parse,
+                                                        AST drops unknown *)
 visibility  ::= 'pub'
 decl_inner  ::= fn_decl
               | type_decl
@@ -316,6 +344,13 @@ decl_inner  ::= fn_decl
               | check_decl
 ```
 
+Attribute prefixes attach to the next `decl_inner`. The two
+load-bearing attributes are `#[derive(P, ...)]` on a type decl
+(§4.11) and `#[unstable]` on a `pub fn` / `pub type` / `pub const`
+(issue #602 — opts a public name out of the edition-stability
+contract).  Unknown attributes parse and are dropped — third-party
+tools may attach their own.
+
 #### Function declaration
 
 ```
@@ -324,8 +359,9 @@ fn_body     ::= '=' expr
               | block
 type_params ::= '[' type_param (',' type_param)* ']'
 type_param  ::= IDENT (':' kind_or_bound)?
-kind_or_bound ::= 'Measure'
-              | type_bound ('+' type_bound)*
+kind_or_bound ::= 'Type'                               (* default — no-op *)
+              | 'Measure'                              (* unit-of-measure kind *)
+              | type_bound ('+' type_bound)*           (* impl-site only *)
 type_bound  ::= IDENT                                  (* protocol name *)
 params      ::= param (',' param)*
 param       ::= IDENT ':' type
@@ -349,7 +385,7 @@ type_body   ::= type                                   (* alias *)
               | variant ('|' variant)*                 (* sum *)
 variant     ::= IDENT ('(' type_list ')')?
 field_list  ::= field (',' field)* ','?
-field       ::= IDENT ':' type
+field       ::= 'priv'? IDENT ':' type                 (* priv = module-private *)
 type_list   ::= type (',' type)*
 derive_attr ::= '#[' 'derive' '(' protocol_list ')' ']'
 protocol_list ::= IDENT (',' IDENT)*
@@ -357,25 +393,39 @@ protocol_list ::= IDENT (',' IDENT)*
    where unknown attributes parse but are dropped from the AST. *)
 ```
 
+The `priv` qualifier on a field hides it from cross-module access:
+the field is readable / writable inside the type's declaring module
+only. Consumers of `pub type T` still see the type but cannot project
+its private fields.
+
 #### Effect declaration
 
 ```
-effect_decl ::= 'effect' IDENT type_params? '{' effect_op* '}'
-effect_op   ::= IDENT '(' params? ')' return_spec
+effect_decl ::= 'effect' IDENT type_params? '{' effect_op* default_block? '}'
+effect_op   ::= IDENT type_params? '(' params? ')' return_spec
+default_block ::= 'default' '{' (handle_clause | return_clause)* '}'
 ```
 
 Operations are declared without `fn`, without a body; "paying the
-effect" is implicit at the call site.
+effect" is implicit at the call site. Each op may carry its own
+type parameters (`next[T]() : Option[T]`) in addition to the
+effect-level ones. Issue #533: an optional `default { … }` block at
+the tail of the body supplies handler clauses that run when no user
+handler is in scope — the clause shapes (`op(params, resume) -> body`
+and `return(name) -> body`) match the `handle_expr` (§2.6) clauses.
 
 #### Protocol declaration
 
 ```
 protocol_decl ::= 'protocol' IDENT type_params? '{' protocol_op+ '}'
-protocol_op   ::= 'fn'? IDENT '(' params? ')' return_spec ('=' expr)?
+protocol_op   ::= IDENT type_params? '(' params? ')' return_spec
 ```
 
 `Self` is implicit. `protocol P[A]` introduces a single type
-parameter `A` for parametrised single-dispatch protocols.
+parameter `A` for parametrised single-dispatch protocols. Op
+declarations OMIT the `fn` keyword (parser rejects `fn name(...)`
+inside `protocol { ... }`) and have no body — default-impl bodies
+are not parsed today.
 
 #### Implementation declaration
 
@@ -383,25 +433,36 @@ parameter `A` for parametrised single-dispatch protocols.
 impl_decl   ::= 'impl' impl_type_params? IDENT type_args? 'for' type
                 '{' impl_member* '}'
 impl_type_params ::= '[' impl_type_param (',' impl_type_param)* ']'
-impl_type_param  ::= IDENT (':' type_bound ('+' type_bound)*)?
-impl_member ::= 'fn'? IDENT '(' params? ')' return_spec? fn_body
+impl_type_param  ::= IDENT (':' kind_or_bound)?
+impl_member ::= fn_decl
 ```
 
 Bounded impl-site type parameters (`impl[T : Show + Eq] Show for [T]`)
-are the only place protocol bounds appear in the syntax; ordinary
-`fn` declarations do not carry bounds.
+are the only place protocol bounds appear in the syntax. Ordinary
+`fn` / `type` declarations call `parse_optional_kind_annotation`
+which accepts only `: Type` or `: Measure` — the bound branch is
+gated behind the impl-site parser. `impl_member` is parsed via the
+full `fn_decl` production, so the leading `fn` keyword is REQUIRED
+on every method (the body uses the same `=` / `{ }` choice as a
+top-level function).
 
 #### `extern "C"` / `axiom`
 
 ```
-extern_decl ::= 'extern' STRING_LIT 'fn' IDENT
-                ('=' STRING_LIT)?                      (* C name override *)
+extern_decl ::= 'extern' '"C"' c_sym_override? 'pub'? 'fn' IDENT
                 '(' params? ')' return_spec
+c_sym_override ::= '(' STRING_LIT ')'                  (* issue #261 *)
 axiom_decl  ::= 'axiom' IDENT type_params? '(' params? ')' return_spec
 ```
 
-`extern "C" fn` routes through `axiom_decl_inner` so the rest of
-the pipeline keeps a single shape.
+The ABI literal must be exactly `"C"`; other ABIs are a parse error.
+The C-symbol override (`extern "C"("strlen") fn c_strlen ...`,
+issue #261) sits IMMEDIATELY after the ABI literal with no
+intervening newline. The optional `pub` modifier appears between the
+override and `fn`. `extern "C" fn` desugars into the same `DAxiom`
+node `axiom` produces, with `extern_c = true`; post-parse validation
+enforces the `/ Ffi` row and the C-ABI-compatible parameter / return
+allowlist (issue #536).
 
 #### Constants and units
 
@@ -425,7 +486,7 @@ property_params ::= '(' params ')'
 ### 2.3 Types
 
 ```
-type        ::= type_atom effect_suffix?
+type        ::= type_atom uom_annot? refinement? effect_suffix?
 type_atom   ::= primitive_type
               | IDENT type_args?                       (* user type / ctor *)
               | module_path '.' IDENT type_args?       (* qualified ctor *)
@@ -433,11 +494,21 @@ type_atom   ::= primitive_type
               | '(' type_list? ')' '->' type effect_suffix?  (* fn type *)
               | '(' type ')'                           (* grouping *)
               | '(' type ',' type (',' type)* ')'      (* n-tuple, arity 2..4 *)
-              | type '<' unit_expr '>'                 (* UoM type *)
+uom_annot   ::= '<' unit_expr '>'                      (* numeric only *)
+refinement  ::= 'where' expr                           (* §2.8 *)
 type_args   ::= '[' type (',' type)* ']'
 primitive_type ::= 'Int' | 'Real' | 'Bool' | 'String' | 'Char'
                  | 'Unit' | 'Nothing'
 ```
+
+The unit-of-measure annotation `<unit_expr>` is accepted ONLY when
+the head type is `Real`, `Int`, or `Decimal` (the three numeric
+primitives that participate in unit unification). `Foo<m>` for a
+user-defined `Foo` is a parse error.
+
+The trailing `where expr` clause (m12.6 refinement, §2.8) attaches
+to any type atom and produces a `TyRefine` node. The predicate is
+parsed in the refinement-pure expression sub-grammar.
 
 ### 2.4 Effect rows
 
@@ -471,6 +542,7 @@ stmt        ::= let_stmt
               | var_stmt
               | assign_stmt
               | assert_stmt
+              | use_stmt
               | expr
 let_stmt    ::= 'let' pattern (':' type)? '=' expr
 var_stmt    ::= 'var' IDENT (':' type)? '=' expr
@@ -478,10 +550,14 @@ assign_stmt ::= IDENT ':=' expr                        (* capability set *)
               | index_lhs '[' expr ']' ':=' expr        (* indexed write *)
 index_lhs   ::= IDENT ('.' IDENT)*
 assert_stmt ::= 'assert' expr (',' expr)?
+use_stmt    ::= 'use' IDENT                            (* m7e §25 — open eff in block *)
 ```
 
 A block evaluates to the value of its trailing expression; if the
-last form is a statement, the block's type is `Unit`.
+last form is a statement, the block's type is `Unit`. The
+block-scope `use Effect` form opens the effect's ops for bare-name
+resolution in the remainder of the enclosing block — mirror of the
+file-scope `use_decl` (§2.1) but scoped to one block.
 
 ### 2.6 Expressions
 
@@ -502,9 +578,10 @@ add_expr    ::= mul_expr (('+' | '-') mul_expr)*
 mul_expr    ::= unary_expr (('*' | '/' | '%') unary_expr)*
 unary_expr  ::= ('-' | 'not' | '@') unary_expr
               | pow_expr
-pow_expr    ::= postfix_expr ('^' postfix_expr)?       (* right-associative *)
+pow_expr    ::= postfix_expr ('^' unary_expr)?         (* right-assoc, allows
+                                                        '-' in the exponent *)
 postfix_expr ::= primary postfix*
-postfix     ::= '.' IDENT                              (* field / method / UFCS *)
+postfix     ::= '.' field_name                         (* field / method / UFCS *)
               | '(' arg_list? ')' trailing_lambda?
                                   trailing_lambda?     (* call *)
               | '[' expr ']'                           (* index *)
@@ -513,13 +590,28 @@ postfix     ::= '.' IDENT                              (* field / method / UFCS 
                                                         propagation *)
               | trailing_lambda                        (* paren-less call *)
               | trailing_lambda trailing_lambda
+field_name  ::= IDENT
+              | 'var' | 'and' | 'or' | 'not'
+              | 'test' | 'bench' | 'check'             (* keyword-as-field
+                                                        — keeps `bit.and`,
+                                                        `Env.var`, etc.
+                                                        parseable *)
 arg_list    ::= arg (',' arg)*
 arg         ::= expr
               | '_'                                    (* pipe placeholder
                                                         — only inside the
                                                         RHS call of `|>` *)
+              | '.'                                    (* lambda placeholder
+                                                        — see Lambda forms *)
+              | '.' field_name                         (* method-ref sugar:
+                                                        `f(.length)` ≡
+                                                        `f((x) => x.length)` *)
 trailing_lambda ::= '{' (lambda_params '->')? block_body '}'
-lambda_params ::= IDENT (',' IDENT)*
+lambda_params ::= lambda_param (',' lambda_param)*
+lambda_param ::= IDENT (':' type)?                     (* annotation parses
+                                                        but is discarded —
+                                                        body is monomorphised
+                                                        by call-site inference *)
 block_body  ::= (stmt stmt_sep)* expr?
 ```
 
@@ -527,12 +619,20 @@ block_body  ::= (stmt stmt_sep)* expr?
 is no postfix `?`. See §1.4 *special tokens*. Integer `/` on `Int`
 operands truncates.
 
+A handful of keywords (`var`, `and`, `or`, `not`, `test`, `bench`,
+`check`) lex as keyword tokens but parse as identifiers when they
+appear *immediately after* `.` in a postfix chain — without this the
+prelude / stdlib could not export functions named after them
+(`bit.and`, `Env.var`, `bench.run`, …).
+
 #### Primary expressions
 
 ```
 primary     ::= literal
               | IDENT                                  (* var / ctor *)
-              | '_'                                    (* lambda placeholder *)
+              | '.'                                    (* lambda placeholder
+                                                        — only inside an
+                                                        arg list, see below *)
               | qualified_call
               | record_lit
               | list_lit
@@ -544,28 +644,62 @@ primary     ::= literal
               | match_expr
               | handle_expr
               | hole_expr
-              | 'todo!' ( '(' STRING_LIT ')' )?
+              | intrinsic_call
+              | variants_of
+              | ensure_primary
+              | 'todo!' '(' STRING_LIT ')'             (* arg REQUIRED *)
               | '@' IDENT                              (* capability read *)
 literal     ::= INT_LIT | REAL_LIT | COMPLEX_LIT
               | BOOL_LIT | CHAR_LIT | STRING_LIT
               | UOM_LIT  | REGEX_LIT
-qualified_call ::= module_path '.' IDENT
+qualified_call ::= module_path '.' IDENT               (* possibly a CALL too *)
 hole_expr   ::= HOLE_LIT | HOLE_NAME_LIT
+intrinsic_call ::= '$' IDENT '(' arg_list? ')'         (* compiler-only *)
+variants_of ::= 'variants' '[' type ']' '(' ')'        (* enumerate ctors of T *)
+ensure_primary ::= 'ensure' '(' expr ')' 'where' expr  (* refinement narrow *)
 ```
+
+`todo!` requires a parenthesised string-literal message: bare
+`todo!` is a parse error. The string must be a `STRING_LIT` — no
+interpolation or triple-quoted forms.
+
+`$IDENT(args)` is the compiler intrinsic call form — reserved for
+internals like `$extern_handler("c_symbol")`. Pinned 2026-05-13 to
+keep the `$`-prefixed namespace from leaking to user code.
+
+`variants[T]()` enumerates every constructor of the union type `T`
+at compile time; the result is a list of the constructor values.
+
+`ensure(expr) where pred` narrows `expr` against a refinement
+predicate; the syntactic form is distinguished from a normal
+`ensure(...)` call by the trailing `where`.
 
 #### Lambda forms
 
 ```
-lambda_expr ::= IDENT '=>' expr                        (* unary arrow *)
-              | '(' params? ')' '=>' expr              (* multi-arg arrow *)
+lambda_expr ::= IDENT '=>' or_expr                     (* unary arrow *)
+              | '(' params? ')' '=>' or_expr           (* multi-arg arrow *)
               | '{' lambda_params? '->' block_body '}'  (* lambda block *)
 ```
+
+Lambda BODIES are parsed via `parse_or`, not the full expression
+production (issue #422). This is deliberate so a top-level pipe on
+the call site binds outside the lambda: `xs | (x => x + 1) |> f`
+parses as `(xs | (x => x + 1)) |> f`, not `xs | ((x => x + 1) |> f)`.
 
 The lambda-block form `{ x -> ... }` is also produced by the
 trailing-lambda postfix on a call. As a standalone primary, it is
 disambiguated from a plain `block` by peeking past the `{`: an
 identifier-list followed by `->` opens a lambda block; anything else
 starts a block expression.
+
+Inside an argument list a bare `.` is the **lambda placeholder**:
+`f(. + 10, 5)` desugars to `f((__p) => __p + 10, 5)`. The form
+`.IDENT` is the **method-ref placeholder**: `xs | .length` desugars
+to `xs | ((__p) => __p.length)`. The placeholder is recognised only
+as a CALL argument — anywhere else, `.` after a non-postfix-eligible
+token is a parse error. (The `_` placeholder is a separate, narrower
+form documented under §4.4 — pipe-RHS only.)
 
 #### Record literals
 
@@ -626,25 +760,49 @@ expression / zero-arg lambda head.
 
 ```
 if_expr     ::= 'if' expr block ('else' if_expr | 'else' block)?
-match_expr  ::= 'match' expr (',' expr)* '{' match_arm+ '}'
+match_expr  ::= 'match' expr (',' expr){0,3} '{' match_arm+ '}'
 match_arm   ::= pattern_n ('if' expr)? '->' (expr | block)
-pattern_n   ::= pattern (',' pattern)*                 (* matches each scrutinee *)
+              | pattern_n ('if' expr)? '->' expr ';'?  (* one-line arm *)
+pattern_n   ::= pattern (',' pattern){0,3}             (* arity cap 4 *)
 ```
 
-Multi-scrutinee match `match a, b { p1, p2 -> ... }` projects multiple
-expressions onto a tuple of patterns per arm.
+Multi-scrutinee match `match a, b { p1, p2 -> ... }` projects
+multiple expressions onto a tuple of patterns per arm. The arity is
+capped at 4 (parser rejects `match a, b, c, d, e`).
 
 #### `handle` (effect handler)
 
 ```
-handle_expr ::= 'handle' block 'with' IDENT ('as' IDENT)? '{'
-                  (effect_clause | return_clause)*
-                '}'
+handle_expr ::= 'handle' block 'with' IDENT type_args? handle_init?
+                  handle_alias? '{' handle_member* '}'
+type_args   ::= '[' type (',' type)* ']'
+handle_init ::= '(' expr ')'                           (* m7b #11 init value *)
+handle_alias ::= 'as' IDENT
+handle_member ::= effect_clause
+              | return_clause
+              | var_stmt                               (* lifts to wrapping
+                                                        State[T] handler
+                                                        (issue #148 / m7b
+                                                        #5b extension) *)
+              | let_stmt                               (* lifts as above *)
 effect_clause ::= IDENT '(' clause_params ')' '->' (expr | block)
 return_clause ::= 'return' '(' IDENT ')' '->' (expr | block)
 clause_params ::= (IDENT (',' IDENT)*)? ',' 'resume'   (* resume always last *)
               | 'resume'
+              | (* empty — handler op takes no args *)
 ```
+
+`with EffName[T1, T2](init) as alias` exercises every option: type
+arguments for parametric effects (`Reader[Int]`), an initial value
+for stateful handlers (`State[Int](0)`), and a rebinding alias when
+two handlers of the same effect nest. All three slots are
+independently optional.
+
+`var` and `let` declarations at the top of the clause block lift
+into wrapping `State[T]` handlers via `desugar_var_block` (m7b #5b
+extension, issue #148). The lifted handlers wrap the original body
+before the user-supplied clauses run, giving the inner block access
+to a State capability that survives the outer effect's handler.
 
 `handle` is a control-flow construct (in the family of `if`/`match`),
 not a function call. Trailing-lambda sugar does not apply to it.
@@ -654,18 +812,22 @@ not a function call. Trailing-lambda sugar does not apply to it.
 ```
 pattern     ::= '_'                                    (* wildcard *)
               | literal_pattern
+              | hole_pattern
               | IDENT
               | IDENT '@' pattern                      (* @-bind *)
+              | IDENT ':' type                         (* type narrow *)
               | qualified_ctor type_args?
                   ('(' pattern_list ')')?              (* ctor pattern *)
               | qualified_ctor '{' field_pat_list '}'  (* record/variant pattern *)
+              | '{' field_pat_list '}'                 (* anonymous record *)
               | '[' (pattern (',' pattern)* (',' list_spread)?)? ']'
               | '(' pattern (',' pattern){1,3} ')'     (* n-tuple pattern *)
-              | INT_LIT '..' INT_LIT                   (* range pattern *)
 qualified_ctor ::= IDENT
                  | module_path '.' IDENT
-literal_pattern ::= INT_LIT | REAL_LIT | BOOL_LIT
+literal_pattern ::= INT_LIT | '-' INT_LIT              (* negative literal *)
+                  | REAL_LIT | BOOL_LIT
                   | CHAR_LIT | STRING_LIT
+hole_pattern   ::= HOLE_LIT | HOLE_NAME_LIT            (* `?` or `?name` *)
 pattern_list ::= pattern (',' pattern)*
 field_pat_list ::= field_pat (',' field_pat)* ','?
 field_pat   ::= IDENT (':' pattern)?                   (* punning if no ':' *)
@@ -678,22 +840,61 @@ The bare `...` is the preferred spelling for "match any list with this
 prefix, tail unused"; `..._` and `...IDENT` are also accepted, for the
 "uniform-with-`_`" reading and for binding the tail respectively.
 
-### 2.8 Refinements
+### 2.8 Refinements (m12.6)
 
-`where` clauses and `requires` / `ensures` annotations attach to
-function declarations and to `match` arms.
+Three syntactic surfaces share the refinement-pure predicate
+sub-grammar; each attaches in a different position.
+
+**Type-position refinement** — `Base where pred` (§2.3) produces a
+`TyRefine` node. The predicate is an expression referring to the
+implicit binder `self`.
 
 ```
-fn_decl     ::= ... fn_body refine_block?
-match_arm   ::= ... refine_block?
-refine_block ::= 'where' '{' refine_clause* '}'
-refine_clause ::= 'requires' expr
-              | 'ensures' expr
-              | IDENT ':' type 'where' expr           (* per-binding refine *)
+(in type position)
+type        ::= ... | type_atom 'where' expr
 ```
 
-Refinement expressions are ordinary expressions restricted to the
-refinement-pure predicate set (see `docs/refinements.md`).
+Example: `type Positive = Int where self > 0`.
+
+**Function contracts** — `requires` / `ensures` clauses sit between
+the function signature and its body. Each clause takes a single
+expression (not a `'{' … '}'` block); multiple clauses stack.
+
+```
+fn_decl     ::= 'fn' IDENT type_params? '(' params? ')' return_spec?
+                  contract_clause* fn_body
+contract_clause ::= 'requires' expr
+              | 'ensures'  expr
+```
+
+Example:
+
+```kaikai
+fn safe_div(a: Int, b: Int) : Int
+  requires b != 0
+  ensures result != 0 or a == 0
+  = a / b
+```
+
+The implicit binder inside `ensures` is `result` (the returned
+value). Inside `requires` only the function's parameters are in
+scope.
+
+**Arm-position narrow** — a `match` arm pattern of the shape
+`name : Type` (optionally followed by a type-position `where`)
+narrows the scrutinee to `Type` and binds it as `name`.
+
+```
+match_arm   ::= pattern_n ('if' expr)? '->' (expr | block)
+pattern_n   ::= pattern (',' pattern){0,3}            (* per-arm patterns *)
+```
+
+The narrow `name : Type` is one of the patterns produced by §2.7,
+not a separate refinement form on the arm.
+
+Predicates everywhere are restricted to the refinement-pure subset
+documented in `docs/refinements.md`. There is NO `where { … }` block
+form on fn decls or match arms.
 
 ## §3 — Operator precedence and associativity
 
@@ -939,8 +1140,9 @@ fn classify(n: Int) : String = match n {
 parameter directly; multi-arg form matches a tuple of parameters per
 arm. Note: `when` is the guard keyword here, not `if` — guards in
 `case`-led bodies use `when` while guards in plain `match` arms use
-`if`. Grammar productions live in `parse_case_arms` /
-`parse_case_multi_arms`.
+`if`. The multi-arg form is capped at 4 parameters (matching the
+`match`-multi cap in §2.6). Grammar productions live in
+`parse_case_arms` / `parse_case_multi_arms`.
 
 ### 4.17 Regex sigil — `~r/pattern/flags?`
 
@@ -1007,14 +1209,15 @@ between them in the order:
 The parser produces the syntactic form `ECall(EField(EVar("a"), "b"), args)`
 unconditionally; resolution rewrites later.
 
-### 5.4 `a < b > c` — comparison vs generic instantiation vs UoM
+### 5.4 `a < b > c` — comparison vs UoM annotation
 
-Three readings disambiguated by **position**:
+Two readings disambiguated by **position**:
 
-- In **type position** after an identifier: `IDENT '<' ...` opens
-  type arguments (`Map<K, V>` does not occur in kaikai — generics use
-  `[]` — but `Real<m>` is a UoM literal/type because `Real` is a
-  primitive type and `m` is a unit identifier).
+- In **type position** the `<unit_expr>` UoM annotation is parsed
+  only after the head identifier `Real`, `Int`, or `Decimal`. Any
+  other head identifier followed by `<` is a parse error in type
+  position (generics use `[]`, never `<>`). `Real<m>` is a UoM type;
+  `Foo<m>` is rejected.
 - In **expression position** after a numeric literal: `INT_LIT '<' ...`
   opens a UoM literal, recognised by the lexer/parser pair
   (`100<USD>`).
@@ -1042,6 +1245,12 @@ let f = SomeFn
 ```
 
 from accidentally parsing `SomeFn { ... }`.
+
+A bare `{` in expression position (no leading IDENT) opens either a
+plain block expression or a lambda block — disambiguated by §5.2. An
+anonymous record literal `{ x: 1, y: 2 }` is a primary in PATTERN
+position only (§2.7); in expression position it is parsed as a
+block, and a record must carry a constructor name.
 
 ### 5.6 `:=` and indexed write
 

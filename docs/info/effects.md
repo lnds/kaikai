@@ -109,18 +109,21 @@ Coverage rules (typer):
    handle is Stage C work; today, list the op explicitly in the
    `handle` or let it fall through to the default at `main`.
 
-For builtin effects, the 16 canonical handlers (Stdout, Stderr,
-Stdin, File, Env, Console, Clock, Random, …) ship default
-installation paths in the runtime — `Log` is one of them and its
-default writes to stderr in ISO-8601 form without a literal
+For builtin effects, the 18 canonical handlers (Stdout, Stderr,
+Stdin, Env, File, Clock, Random, SecureRandom, NetTcp, Signal,
+Process, Log, Mutable, Cancel, Link, Monitor, Spawn, Fail) ship
+default installation paths in the runtime — `Log` is one of them
+and its default writes to stderr in ISO-8601 form without a literal
 `default { }` block in `stdlib/log.kai`. The full catalog lives in
 `docs/effects-stdlib.md`; the runtime implementation rationale and
 the Stage A/B/C trilogy live in `docs/effects.md`.
 
 ## Rebinding the capability name
 
-When two handlers of the same effect nest, use `as`. Inside that body
-the original effect name is NOT in scope; only the rebinding is.
+When two handlers of the same effect nest, use `as`. The rebinding
+introduces a local capability under the chosen name; the original
+effect name remains usable inside the handle body. Convention is to
+prefer the local binding for clarity.
 
 ```kaikai
 effect Logger {
@@ -141,12 +144,15 @@ fn main() : Int / Stdout = {
 ## Stdlib effects
 
 Stdin, Stdout, Stderr, File, Env, Console, Clock, Random,
-SecureRandom, NetTcp, NetUdp, NetDns, Process, Spawn, Cancel,
-Actor[Msg], Signal, Mutable, State, Reader, Writer, Fail, Ffi.
+SecureRandom, NetTcp, Process, Spawn, Cancel, Actor[Msg],
+Signal, Mutable, State, Reader, Writer, Fail, Log, Link,
+Monitor, Ffi.
 
 Full catalog: `docs/effects-stdlib.md`. The main effect at the
 program entry installs Stdin/Stdout/Stderr/Env/File automatically
-when inferred.
+when inferred. NetUdp / NetDns are reserved as part of the planned
+`Net` aggregate but are not shipped in v1 — `NetTcp` is the only
+network effect available today.
 
 ## NOT IN KAIKAI
 

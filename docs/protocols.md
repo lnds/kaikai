@@ -1080,7 +1080,7 @@ opt in by declaring `pub type` + the canonical fns.
 The canonical signatures (LHS receiver first, function/predicate
 second, return wraps the same head type):
 
-```kaikai
+```text
 pub fn map[A, B, e](xs: T[A], f: (A) -> B / e) : T[B] / e
 pub fn flat_map[A, B, e](xs: T[A], f: (A) -> T[B] / e) : T[B] / e
 pub fn filter[A, e](xs: T[A], p: (A) -> Bool / e) : T[A] / e
