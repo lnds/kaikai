@@ -2999,8 +2999,23 @@ test-protocols: $(TARGET) build
 	  fi; \
 	done
 
-# Self-hosting: kaic2 compiles its own source, and the round-trip reaches
-# a fixed point.
+# Self-hosting: per-compiler determinism.
+#
+# We compile stage2/compiler.kai with `kaic2` (which was built by
+# stage1 a few targets up), then compile the same source again with
+# the freshly built `kaic2b`, and require `kaic2b.c == kaic2c.c`.
+#
+# What this protects: the mature compiler is deterministic — given
+# the same input, it produces the same C output. Catches hashmap
+# iteration order leaks, timestamps in metadata, pointer addresses
+# used as identifiers, race conditions in emission.
+#
+# What this does NOT require: that the C produced by stage1 (which
+# has no typer) match the C produced by stage2 (which has full HM +
+# effects + Perceus). Stage1 and stage2 are structurally distinct
+# compilers and may legitimately diverge on type-driven decisions
+# like match tag-compare, niche-filling, devirtualisation. See
+# docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md.
 # m7a #5: smoke test for the handler-stack runtime primitives.
 # Builds a small C program against runtime.h and runs it. m7a #6
 # will provide the end-to-end coverage from compiled kaikai code.
@@ -3093,22 +3108,24 @@ selfhost: $(TARGET) build
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 build/kaic2b.c -o build/kaic2b $(LDLIBS_M) ; \
 	./build/kaic2b $(SRC) > build/kaic2c.c; \
 	diff -q build/kaic2b.c build/kaic2c.c > /dev/null \
-	  && echo "self-hosting fixed point: OK" \
-	  || { echo "self-hosting fixed point: DIFF"; exit 1; }
+	  && echo "selfhost determinism: OK (kaic2b.c == kaic2c.c)" \
+	  || { echo "selfhost determinism: DIFF (kaic2b.c != kaic2c.c)"; exit 1; }
 
-# LLVM self-hosting: same idea but via the LLVM backend.
+# LLVM self-hosting: per-compiler determinism via the LLVM backend.
 # kaic2 (C) emits its own source as .ll, which is compiled to a
-# binary. That binary then re-emits the same .ll. We require a
-# byte-identical fixed point — the LLVM emitter must be a pure
-# function of the typed AST.
+# binary. That binary then re-emits the same .ll. We require the two
+# .ll outputs to match byte-for-byte — the LLVM emitter must be a
+# pure function of the typed AST. As with `selfhost` above, stage1's
+# output is not compared. See
+# docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md.
 selfhost-llvm: $(TARGET) build
 	@$(STACK) set -e; \
 	./$(TARGET) --emit=llvm $(SRC) > build/kaic2-s1.ll; \
 	clang -w $(CPPFLAGS_CORE) -I ../stage0 build/kaic2-s1.ll ../stage0/runtime_llvm.c -o build/kaic2-llvm-s1 $(LDLIBS_M) ; \
 	./build/kaic2-llvm-s1 --emit=llvm $(SRC) > build/kaic2-s2.ll; \
 	diff -q build/kaic2-s1.ll build/kaic2-s2.ll > /dev/null \
-	  && echo "llvm self-hosting fixed point: OK" \
-	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
+	  && echo "llvm selfhost determinism: OK (s1.ll == s2.ll)" \
+	  || { echo "llvm selfhost determinism: DIFF (s1.ll != s2.ll)"; exit 1; }
 
 # m12.8 Phase 3 — Core demos. Each demo lives in its own
 # `examples/<name>/<name>.kai` directory, ships an `<name>.out.expected`
