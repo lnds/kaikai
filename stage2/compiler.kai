@@ -60353,20 +60353,10 @@ fn decl_line(d: Decl) : Int {
 fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
   match d {
     DImport(ik, _, _) -> fmt_import(ik, s)
-    DFn(is_pub, name, tparams, params, ret, row, body, line, _, _) -> {
-      if not list_is_empty(tparams) {
-        fmt_panic_unsupported("generic functions", line)
-      } else {
-        fmt_fn(is_pub, name, tparams, params, ret, row, body, s)
-      }
-    }
-    DType(is_pub, name, tparams, body, line, _, _) -> {
-      if not list_is_empty(tparams) {
-        fmt_panic_unsupported("generic types", line)
-      } else {
-        fmt_type_decl(is_pub, name, tparams, body, s)
-      }
-    }
+    DFn(is_pub, name, tparams, params, ret, row, body, _, _, _) ->
+      fmt_fn(is_pub, name, tparams, params, ret, row, body, s)
+    DType(is_pub, name, tparams, body, _, _, _) ->
+      fmt_type_decl(is_pub, name, tparams, body, s)
     DTest(label, body, _, _) -> fmt_test(label, body, s)
     DBench(label, body, _, _) -> fmt_bench(label, body, s)
     DCheck(label, ps, body, _, _) -> fmt_check(label, ps, body, s)
@@ -60375,14 +60365,49 @@ fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
       let s2 = fmt_newline(s1)
       fmt_decl(inner, s2)
     }
-    DEffect(_, _, _, _, _, line, _) -> fmt_panic_unsupported("effect declarations", line)
-    DProtocol(_, _, _, _, line, _) -> fmt_panic_unsupported("protocol declarations", line)
-    DImpl(_, _, _, _, line, _) -> fmt_panic_unsupported("impl blocks", line)
-    DDerive(_, _, line, _) -> fmt_panic_unsupported("#[derive(...)] annotation", line)
-    DUnstable(_, line, _) -> fmt_panic_unsupported("#[unstable] annotation", line)
-    DUnit(_, _, _, line, _) -> fmt_panic_unsupported("unit declarations", line)
-    DUse(_, line, _) -> fmt_panic_unsupported("file-level `use`", line)
-    DAxiom(_, _, _, _, _, _, _, _, line, _) -> fmt_panic_unsupported("axiom declarations", line)
+    DEffect(is_pub, name, tparams, ops, default_opt, _, _) ->
+      fmt_effect_decl(is_pub, name, tparams, ops, default_opt, s)
+    DProtocol(is_pub, name, tparams, ops, _, _) ->
+      fmt_protocol_decl(is_pub, name, tparams, ops, s)
+    DImpl(pname, proto_args, target_ty, methods, _, _) ->
+      fmt_impl_decl(pname, proto_args, target_ty, methods, s)
+    # `#[derive(P, ...)] <inner_type_decl>` — emit the annotation on
+    # its own line, then the wrapped decl. Issue #608: the short
+    # `#derive(...)` form was deprecated; only `#[derive(...)]` is
+    # accepted by the parser.
+    DDerive(names, inner, _, _) -> {
+      let s1 = fmt_emit(s, string_concat_all(["#[derive(", string_join(names, ", "), ")]"]))
+      let s2 = fmt_newline(s1)
+      fmt_decl(inner, s2)
+    }
+    # `#[unstable]` attribute wrapping a `pub fn / pub type / pub const`.
+    DUnstable(inner, _, _) -> {
+      let s1 = fmt_emit(s, "#[unstable]")
+      let s2 = fmt_newline(s1)
+      fmt_decl(inner, s2)
+    }
+    # `[pub] unit NAME [= unit_expr]` — m12.5.
+    DUnit(is_pub, name, alias_opt, _, _) -> {
+      let s1 = if is_pub { fmt_emit(s, "pub ") } else { s }
+      let s2 = fmt_emit(s1, "unit ")
+      let s3 = fmt_emit(s2, name)
+      match alias_opt {
+        None      -> s3
+        Some(u)   -> {
+          let a = fmt_emit(s3, " = ")
+          fmt_emit(a, fmt_unit_expr_str(u))
+        }
+      }
+    }
+    # `use Effect` at file scope — m7e §25.
+    DUse(eff_name, _, _) ->
+      fmt_emit(s, string_concat("use ", eff_name))
+    # `[pub] axiom name[tparams](params) : T / row` (m12.7) or
+    # `extern "C" [pub] fn name[...](...) : T / Ffi` when extern_c.
+    # When c_sym_over is non-empty, the override sits between the
+    # ABI string and `pub` / `fn` per issue #261.
+    DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, _, _) ->
+      fmt_axiom_decl(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, s)
     # Issue #269: dedicated fmt arm matching the parser surface.
     # Round-trips `[pub] const NAME : T = body`. The body is emitted
     # via `fmt_expr` (the same printer used by `let pat = expr`
@@ -60403,6 +60428,263 @@ fn fmt_const_decl(is_pub: Bool, name: String, ty: TypeExpr, body: Expr, s: FmtSt
   fmt_newline(s7)
 }
 
+# Emit a UnitExprT in surface form the parser accepts. This is
+# stricter than `unit_expr_display` (which uses bare juxtaposition
+# `kg m` for products); the parser only recognises `*` and `/`
+# between unit terms (see `parse_unit_expr_rest` near line 6258).
+# Used by `fmt` for `unit` declarations and `<...>` literal/type
+# annotations so the formatter's output re-parses cleanly.
+fn fmt_unit_expr_str(u: UnitExprT) : String = match u {
+  UOne -> "1"
+  USym(s) -> s
+  UMul(a, b) -> match b {
+    UInv(bi) -> match a {
+      UOne -> concat_all(["1/", fmt_unit_expr_str(bi)])
+      _    -> concat_all([fmt_unit_expr_str(a), "/", fmt_unit_expr_str(bi)])
+    }
+    UOne -> fmt_unit_expr_str(a)
+    _ -> match a {
+      UOne          -> fmt_unit_expr_str(b)
+      UInv(ai)      -> concat_all([fmt_unit_expr_str(b), "/", fmt_unit_expr_str(ai)])
+      _             -> concat_all([fmt_unit_expr_str(a), "*", fmt_unit_expr_str(b)])
+    }
+  }
+  UInv(a) -> concat_all(["1/", fmt_unit_expr_str(a)])
+  UPow(a, n) -> concat_all([fmt_unit_expr_str(a), "^", int_to_string(n)])
+  UVar(n) -> cat2("?u", int_to_string(n))
+}
+
+# m12.7: `[pub] axiom name[tparams](params) : T / row` or
+# `extern "C" [name_override] [pub] fn name[tparams](params) : T / row`
+# when extern_c is true (issues #260 / #261).
+fn fmt_axiom_decl(is_pub: Bool, extern_c: Bool, name: String, c_sym_over: String, tparams: [String], params: [Param], ret_ty: TypeExpr, row: RowExpr, s: FmtSt) : FmtSt {
+  let s_pre = if extern_c {
+    let a = fmt_emit(s, "extern \"C\" ")
+    if string_length(c_sym_over) > 0 {
+      fmt_emit(a, string_concat_all(["\"", c_sym_over, "\" "]))
+    } else { a }
+  } else { s }
+  let s_pub = if is_pub { fmt_emit(s_pre, "pub ") } else { s_pre }
+  let s_kw  = fmt_emit(s_pub, if extern_c { "fn " } else { "axiom " })
+  let s_n   = fmt_emit(s_kw, name)
+  let s_tp  = fmt_tparams(tparams, s_n)
+  let s_op  = fmt_emit(s_tp, "(")
+  let s_ps  = fmt_params(params, s_op)
+  let s_cp  = fmt_emit(s_ps, ") : ")
+  let s_rt  = fmt_type(ret_ty, s_cp)
+  fmt_row(row, s_rt)
+}
+
+# m7b #11: `[pub] effect Name[tparams] { op_decls... [default { ... }] }`.
+fn fmt_effect_decl(is_pub: Bool, name: String, tparams: [String], ops: [EffectOp], default_opt: Option[DefaultBlock], s: FmtSt) : FmtSt {
+  let s0 = if is_pub { fmt_emit(s, "pub ") } else { s }
+  let s1 = fmt_emit(s0, "effect ")
+  let s2 = fmt_emit(s1, name)
+  let s3 = fmt_tparams(tparams, s2)
+  let s4 = fmt_emit(s3, " {")
+  let s5 = fmt_newline(s4)
+  let s6 = fmt_indent_in(s5)
+  let s7 = fmt_effect_ops(ops, s6)
+  let s8 = match default_opt {
+    None     -> s7
+    Some(db) -> fmt_default_block(db, s7)
+  }
+  let s9 = fmt_indent_out(s8)
+  fmt_emit(s9, "}")
+}
+
+fn fmt_effect_ops(ops: [EffectOp], s: FmtSt) : FmtSt = match ops {
+  [] -> s
+  [o, ...rest] -> {
+    let s1 = fmt_effect_op(o, s)
+    let s2 = fmt_newline(s1)
+    fmt_effect_ops(rest, s2)
+  }
+}
+
+fn fmt_effect_op(o: EffectOp, s: FmtSt) : FmtSt = match o {
+  EOp(op_name, tparams, params, ret_ty, _, _) -> {
+    let s1 = fmt_emit(s, op_name)
+    let s2 = fmt_tparams(tparams, s1)
+    let s3 = fmt_emit(s2, "(")
+    let s4 = fmt_params(params, s3)
+    let s5 = fmt_emit(s4, ") : ")
+    fmt_type(ret_ty, s5)
+  }
+}
+
+# Issue #533: `default { hclauses... [return(x) -> body] }` body of an
+# effect declaration. Shares the clause-printing helpers with `EHandle`
+# (`fmt_hclauses` / `fmt_hreturn`, defined further below in this file).
+fn fmt_default_block(db: DefaultBlock, s: FmtSt) : FmtSt = match db {
+  DBlk(clauses, ret_opt, _, _) -> {
+    let s1 = fmt_emit(s, "default {")
+    let s2 = fmt_newline(s1)
+    let s3 = fmt_indent_in(s2)
+    let s4 = fmt_hclauses(clauses, s3)
+    let s5 = match ret_opt {
+      None    -> s4
+      Some(r) -> fmt_hreturn(r, s4)
+    }
+    let s6 = fmt_indent_out(s5)
+    let s7 = fmt_emit(s6, "}")
+    fmt_newline(s7)
+  }
+}
+
+# m12.8: `[pub] protocol Name[tparams] { op_signatures... }`.
+# v1: bodyless op signatures only — parser rejects defaults.
+fn fmt_protocol_decl(is_pub: Bool, name: String, tparams: [String], ops: [ProtoOp], s: FmtSt) : FmtSt {
+  let s0 = if is_pub { fmt_emit(s, "pub ") } else { s }
+  let s1 = fmt_emit(s0, "protocol ")
+  let s2 = fmt_emit(s1, name)
+  let s3 = fmt_tparams(tparams, s2)
+  let s4 = fmt_emit(s3, " {")
+  let s5 = fmt_newline(s4)
+  let s6 = fmt_indent_in(s5)
+  let s7 = fmt_proto_ops(ops, s6)
+  let s8 = fmt_indent_out(s7)
+  fmt_emit(s8, "}")
+}
+
+fn fmt_proto_ops(ops: [ProtoOp], s: FmtSt) : FmtSt = match ops {
+  [] -> s
+  [o, ...rest] -> {
+    let s1 = fmt_proto_op(o, s)
+    let s2 = fmt_newline(s1)
+    fmt_proto_ops(rest, s2)
+  }
+}
+
+# Protocol op signatures OMIT the `fn` keyword (per `kai info protocols`).
+# `impl` bodies use the full `fn name(...) : R = body` form, which goes
+# through `fmt_decl` -> `fmt_fn` and brings the `fn` back.
+fn fmt_proto_op(o: ProtoOp, s: FmtSt) : FmtSt = match o {
+  POp(op_name, tparams, params, ret_ty, _, _) -> {
+    let s1 = fmt_emit(s, op_name)
+    let s2 = fmt_tparams(tparams, s1)
+    let s3 = fmt_emit(s2, "(")
+    let s4 = fmt_params(params, s3)
+    let s5 = fmt_emit(s4, ") : ")
+    fmt_type(ret_ty, s5)
+  }
+}
+
+# m12.8: `impl Pname[proto_args] for Target { method_decls... }`.
+# When `proto_args` is empty, the surface form drops the `[...]`.
+# Issue #180.
+fn fmt_impl_decl(pname: String, proto_args: [TypeExpr], target_ty: TypeExpr, methods: [Decl], s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, "impl ")
+  let s2 = fmt_emit(s1, pname)
+  let s3 = if list_is_empty(proto_args) { s2 }
+    else {
+      let a = fmt_emit(s2, "[")
+      let b = fmt_type_args(proto_args, a)
+      fmt_emit(b, "]")
+    }
+  let s4 = fmt_emit(s3, " for ")
+  let s5 = fmt_type(target_ty, s4)
+  let s6 = fmt_emit(s5, " {")
+  let s7 = fmt_newline(s6)
+  let s8 = fmt_indent_in(s7)
+  let s9 = fmt_impl_methods(methods, s8)
+  let s10 = fmt_indent_out(s9)
+  fmt_emit(s10, "}")
+}
+
+fn fmt_impl_methods(methods: [Decl], s: FmtSt) : FmtSt = match methods {
+  []           -> s
+  [m, ...rest] -> {
+    let s1 = fmt_decl(m, s)
+    let s2 = fmt_newline(s1)
+    fmt_impl_methods(rest, s2)
+  }
+}
+
+# m7b #11: `handle { body } with Eff[tyargs](init) as alias { clauses }`.
+# Each of `[tyargs]`, `(init)`, `as alias` is optional; the parser
+# accepts them in that order. Renders block-style with the body and
+# clause list each on their own indented lines.
+fn fmt_handle(body: Expr, eff_name: String, eff_tyargs: [TypeExpr], init_opt: Option[Expr], alias_opt: Option[String], clauses: [HClause], ret_opt: Option[HReturn], s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, "handle {")
+  let s2 = fmt_newline(s1)
+  let s3 = fmt_indent_in(s2)
+  # Inline the body's contents when it is a block; otherwise emit as
+  # a single expression. Without this, `handle { body }` round-trips
+  # to `handle { { body } }` because `fmt_expr` on an EBlock opens
+  # its own braces.
+  let s4 = match body.kind {
+    EBlock(stmts, tail) -> fmt_block_inner(stmts, tail, s3)
+    _                   -> fmt_expr(body, s3)
+  }
+  let s5 = if s4.at_line_start { s4 } else { fmt_newline(s4) }
+  let s6 = fmt_indent_out(s5)
+  let s7 = fmt_emit(s6, "} with ")
+  let s8 = fmt_emit(s7, eff_name)
+  let s9 = if list_is_empty(eff_tyargs) { s8 }
+    else {
+      let a = fmt_emit(s8, "[")
+      let b = fmt_type_args(eff_tyargs, a)
+      fmt_emit(b, "]")
+    }
+  let s10 = match init_opt {
+    None     -> s9
+    Some(ie) -> {
+      let a = fmt_emit(s9, "(")
+      let b = fmt_expr(ie, a)
+      fmt_emit(b, ")")
+    }
+  }
+  let s11 = match alias_opt {
+    None       -> s10
+    Some(name) -> fmt_emit(s10, string_concat(" as ", name))
+  }
+  let s12 = fmt_emit(s11, " {")
+  let s13 = fmt_newline(s12)
+  let s14 = fmt_indent_in(s13)
+  let s15 = fmt_hclauses(clauses, s14)
+  let s16 = match ret_opt {
+    None    -> s15
+    Some(r) -> fmt_hreturn(r, s15)
+  }
+  let s17 = fmt_indent_out(s16)
+  fmt_emit(s17, "}")
+}
+
+fn fmt_hclauses(cs: [HClause], s: FmtSt) : FmtSt = match cs {
+  []           -> s
+  [c, ...rest] -> {
+    let s1 = fmt_hclause(c, s)
+    let s2 = fmt_newline(s1)
+    fmt_hclauses(rest, s2)
+  }
+}
+
+# `op_name(params) -> body` — the trailing param is conventionally
+# the `resume` continuation. Body uses block form when it is itself
+# an EBlock so the result stays readable.
+fn fmt_hclause(c: HClause, s: FmtSt) : FmtSt = match c {
+  HC(op_name, params, body, _, _) -> {
+    let s1 = fmt_emit(s, op_name)
+    let s2 = fmt_emit(s1, "(")
+    let s3 = fmt_params(params, s2)
+    let s4 = fmt_emit(s3, ") -> ")
+    fmt_expr(body, s4)
+  }
+}
+
+# `return(pname) -> body` — optional clause at the end of a handler
+# (or default { }) block. Same body-rendering convention as fmt_hclause.
+fn fmt_hreturn(r: HReturn, s: FmtSt) : FmtSt = match r {
+  HR(pname, body, _, _) -> {
+    let s1 = fmt_emit(s, "return(")
+    let s2 = fmt_emit(s1, pname)
+    let s3 = fmt_emit(s2, ") -> ")
+    let s4 = fmt_expr(body, s3)
+    fmt_newline(s4)
+  }
+}
+
 fn fmt_panic_unsupported(what: String, line: Int) : a = panic(string_concat_all(["kai fmt: ", what, " not yet supported (line ", int_to_string(line), ")"]))
 
 # ---- imports --------------------------------------------------------
@@ -60418,6 +60700,32 @@ fn fmt_import(ik: ImportKind, s: FmtSt) : FmtSt {
 
 # ---- fn decls -------------------------------------------------------
 
+# Decode a single tparam string back to surface syntax.
+# Encoding (see `tp_make_with_bounds` near line 9354):
+#   "T"           -> "T"
+#   "T#Unit"      -> "T: Measure"
+#   "T#b:Show"    -> "T: Show"
+#   "T#b:Show,Eq" -> "T: Show + Eq"
+fn fmt_tparam_decode(stored: String) : String {
+  let name = tp_strip_kind(tp_strip_bounds(stored))
+  let suffix = if tp_kind_is_unit(stored) {
+    ": Measure"
+  } else if tp_has_bounds(stored) {
+    string_concat_all([": ", string_join(tp_bounds_of(stored), " + ")])
+  } else {
+    ""
+  }
+  string_concat(name, suffix)
+}
+
+fn fmt_tparams(tparams: [String], s: FmtSt) : FmtSt {
+  if list_is_empty(tparams) { s }
+  else {
+    let decoded = map(tparams, (t) => fmt_tparam_decode(t))
+    fmt_emit(s, string_concat_all(["[", string_join(decoded, ", "), "]"]))
+  }
+}
+
 fn fmt_fn(is_pub: Bool, name: String, tparams: [String], params: [Param], ret: Option[TypeExpr], row: RowExpr, body: Expr, s: FmtSt) : FmtSt {
   let s1 = if is_pub {
     fmt_emit(s, "pub ")
@@ -60426,11 +60734,7 @@ fn fmt_fn(is_pub: Bool, name: String, tparams: [String], params: [Param], ret: O
   }
   let s2 = fmt_emit(s1, "fn ")
   let s3 = fmt_emit(s2, name)
-  let s4 = if list_is_empty(tparams) {
-    s3
-  } else {
-    fmt_emit(s3, string_concat_all(["[", string_join(tparams, ", "), "]"]))
-  }
+  let s4 = fmt_tparams(tparams, s3)
   let s5 = fmt_emit(s4, "(")
   let s6 = fmt_params(params, s5)
   let s7 = fmt_emit(s6, ")")
@@ -60479,7 +60783,19 @@ fn fmt_row(row: RowExpr, s: FmtSt) : FmtSt {
         fmt_row_labels(labels, s1)
       }
     }
-    ROpen(_, _) -> fmt_panic_unsupported("open / parametric effect rows", 0)
+    # m7b #12: open row `T / Io + e` or `T / e`. Tail variable is
+    # `tail` (a lowercase ident). Emit `Io + e` (labels first, tail
+    # last) or just `e` when labels is empty.
+    ROpen(tail, labels) -> {
+      let s1 = fmt_emit(s, " / ")
+      if list_is_empty(labels) {
+        fmt_emit(s1, tail)
+      } else {
+        let s2 = fmt_row_labels(labels, s1)
+        let s3 = fmt_emit(s2, " + ")
+        fmt_emit(s3, tail)
+      }
+    }
   }
 }
 
@@ -60498,10 +60814,12 @@ fn fmt_row_labels(ls: [RowLabel], s: FmtSt) : FmtSt {
 fn fmt_row_label(rl: RowLabel, s: FmtSt) : FmtSt {
   match rl {
     RL(name, ty_args) -> {
-      if list_is_empty(ty_args) {
-        fmt_emit(s, name)
-      } else {
-        fmt_panic_unsupported("parametric effect labels", 0)
+      let s1 = fmt_emit(s, name)
+      if list_is_empty(ty_args) { s1 }
+      else {
+        let a = fmt_emit(s1, "[")
+        let b = fmt_type_args(ty_args, a)
+        fmt_emit(b, "]")
       }
     }
   }
@@ -60537,11 +60855,7 @@ fn fmt_type_decl(is_pub: Bool, name: String, tparams: [String], body: TypeBody, 
   }
   let s2 = fmt_emit(s1, "type ")
   let s3 = fmt_emit(s2, name)
-  let s4 = if list_is_empty(tparams) {
-    s3
-  } else {
-    fmt_emit(s3, string_concat_all(["[", string_join(tparams, ", "), "]"]))
-  }
+  let s4 = fmt_tparams(tparams, s3)
   match body {
     TBAlias(t) -> {
       let a = fmt_emit(s4, " = ")
@@ -60684,8 +60998,20 @@ fn fmt_type(t: TypeExpr, s: FmtSt) : FmtSt {
       let s4 = fmt_type(ret, s3)
       fmt_row(row, s4)
     }
-    TyDim(_, _) -> fmt_panic_unsupported("unit-of-measure types", t.line)
-    TyRefine(_, _) -> fmt_panic_unsupported("refinement types", t.line)
+    # m12.5: `Real<m>`, `Int<kg*m/sec^2>` — dimensioned numerics.
+    TyDim(base, u) -> {
+      let s1 = fmt_type(base, s)
+      let s2 = fmt_emit(s1, "<")
+      let s3 = fmt_emit(s2, fmt_unit_expr_str(u))
+      fmt_emit(s3, ">")
+    }
+    # m12.6: `Base where <pred>` — refinement. The predicate prints
+    # through the normal expression formatter.
+    TyRefine(base, pred) -> {
+      let s1 = fmt_type(base, s)
+      let s2 = fmt_emit(s1, " where ")
+      fmt_expr(pred, s2)
+    }
   }
 }
 
@@ -60760,9 +61086,28 @@ fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
     EMapPipe(l, r) -> fmt_map_pipe(l, r, s0)
     EFlatMapPipe(l, r) -> fmt_flat_map_pipe(l, r, s0)
     EFilterPipe(l, r) -> fmt_filter_pipe(l, r, s0)
-    ELitUnit(_, _) -> fmt_panic_unsupported("unit-of-measure literals", e.line)
-    EHandle(_, _, _, _, _, _, _) -> fmt_panic_unsupported("effect handlers", e.line)
-    EVariantsOf(_, _) -> fmt_panic_unsupported("variants[T]()", e.line)
+    # m12.5: `100<USD>`, `2.5<m>` — numeric literal with unit annotation.
+    ELitUnit(inner, u) -> {
+      let s1 = fmt_expr_atom(inner, s0)
+      let s2 = fmt_emit(s1, "<")
+      let s3 = fmt_emit(s2, fmt_unit_expr_str(u))
+      fmt_emit(s3, ">")
+    }
+    # m7b #11: `handle { body } with Eff[tyargs](init) as alias { clauses }`.
+    # Any of `[tyargs]`, `(init)`, `as alias` is optional. Closes with
+    # the clause block whose contents are `op(args) -> body` lines
+    # plus an optional `return(x) -> body`.
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      fmt_handle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt, s0)
+    # `variants[T]()` — m12.8 utility expanding to a list of every
+    # constructor of the union T. The second slot is a stage-internal
+    # name list filled by the resolver; surface form re-renders only
+    # the type argument.
+    EVariantsOf(ty, _) -> {
+      let s1 = fmt_emit(s0, "variants[")
+      let s2 = fmt_type(ty, s1)
+      fmt_emit(s2, "]()")
+    }
     EModCall(m, fname) -> fmt_emit(s0, string_concat_all([m, ".", fname, "()"]))
     EIntrinsic(name, args_) -> fmt_call(
       Expr { kind: EVar(string_concat("$", name)), line: e.line, col: e.col, ty: None, mode: MUnknown },
@@ -61147,9 +61492,31 @@ fn fmt_stmt(st: Stmt, s: FmtSt) : FmtSt {
       fmt_expr(e, s1)
     }
     SExprStmt(e) -> fmt_expr(e, s)
-    SIndexAssign(_, _, _, l, _) -> fmt_panic_unsupported("`a[i] := v`", l)
-    SVar(_, _, _, l, _) -> fmt_panic_unsupported("`var` bindings", l)
-    SUse(_, l, _) -> fmt_panic_unsupported("block-level `use`", l)
+    # m7b #6: `a[i] := v` — indexed write. Surface form mirrors the
+    # parser exactly (Stmt definition near line 1460).
+    SIndexAssign(base, idx, val, _, _) -> {
+      let s1 = fmt_expr(base, s)
+      let s2 = fmt_emit(s1, "[")
+      let s3 = fmt_expr(idx, s2)
+      let s4 = fmt_emit(s3, "] := ")
+      fmt_expr(val, s4)
+    }
+    # m7b #5: local mutable cell `var name [: T] = init`.
+    SVar(name, ty_opt, rhs, _, _) -> {
+      let s1 = fmt_emit(s, "var ")
+      let s2 = fmt_emit(s1, name)
+      let s3 = match ty_opt {
+        None -> s2
+        Some(t) -> {
+          let a = fmt_emit(s2, ": ")
+          fmt_type(t, a)
+        }
+      }
+      let s4 = fmt_emit(s3, " = ")
+      fmt_expr(rhs, s4)
+    }
+    # m7e §25: `use Effect` at block scope.
+    SUse(eff_name, _, _) -> fmt_emit(s, string_concat("use ", eff_name))
   }
 }
 

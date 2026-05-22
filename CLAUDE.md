@@ -11,6 +11,12 @@ A functional language with static typing, LLVM native compilation, algebraic eff
 
 Before claiming a kaikai surface form exists in conversation, code suggestions, or examples, run `kai info <topic>`. `kai info` with no args lists the topics; `kai info syntax` is the one-page cheat sheet of every form kaikai actually has, including an explicit **NOT IN KAIKAI** section listing the false-friends that look plausible but do not exist (operator sections, `\x -> body`, list comprehensions, `do { }`, type classes, `throw/catch`, `return` statements, etc.). LLM agents in particular extrapolate from Haskell/Python/JS when uncertain — `kai info` is the cheap, always-correct way to check before writing. `kai info <topic> --json` returns the same content as structured JSON for programmatic consumption.
 
+Use `kai info` as your first source of truth, ahead of any prior memory or guess:
+
+- **Before writing a `.kai` snippet** to demonstrate something — check `kai info syntax` and the relevant per-topic page (`kai info effects`, `kai info match`, `kai info protocols`, `kai info units`, `kai info pipes`, etc.). The check costs one shell call; a wrong snippet costs a parser-error round-trip plus credibility.
+- **Before adding a new arm** to a kaikai-AST consumer (a typer pass, a codegen path, a formatter helper) — check the corresponding `kai info` topic to confirm the surface syntax you are reproducing, AND read the AST type definition near the top of `stage2/compiler.kai` for the slot order. Past slip: implementing `DDerive` printer with `#derive(P)` because that was the legacy syntax (issue #608 removed it); the only accepted spelling is `#[derive(P)]`, and `kai info syntax` says so on a single line.
+- **When the user uses a kaikai keyword you have not seen recently** (e.g. `where`, `default {}`, `axiom`, `extern "C"`, `unit`, `Measure`, `variants[T]()`) — re-read the relevant topic instead of relying on stale memory. Topics drift toward correctness faster than agent memory does.
+
 The reference pages live at `docs/info/*.md` and travel with the binary (dev checkout reads from there; installed tarball ships `share/kaikai/info/`).
 
 ## Cross-cutting principles
