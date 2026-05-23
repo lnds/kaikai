@@ -1,0 +1,65 @@
+# Issue #680 fixture — polymorphic recursive fold with a closure-typed
+# parameter, exact shape of `henua.aggregate.fold_events`.
+#
+# Pre-fix symptom (kaikai 0.82.0): lists of length >= 4 crashed at
+# runtime with "kai: field access on non-record" (inline-defined) or
+# bus error (cross-module). Lists of length 1, 2, 3 ran fine.
+#
+# Root cause: `pcs_branch_aware_skip_params` and
+# `tcrec_compute_site_dropmask` disagreed on which params qualified
+# for the post-#599 skip-set. The disagreement only manifested when
+# the body's recursive call passed a closure-typed parameter (`step` /
+# `f`) and ran through the post-perceus body — there, `pcs_pass`
+# wrapped the closure callee in `__perceus_dup(...)`, and
+# `pcs_call_consumers_linear` then refused to consider the call site
+# as linear (its callee was an ECall instead of a bare EVar). The
+# resulting misalignment skipped the defensive `dup(initial)` while
+# still planting the goto-block `drop(initial)`, double-decrefing the
+# original ref on the third iteration of the TCO loop.
+#
+# Fix: `pcs_call_consumers_linear` strips an outer `__perceus_dup(x)`
+# wrap before classifying the callee, so the post-perceus body
+# matches the pre-perceus shape for the linearity analysis.
+#
+# This fixture covers the canonical bug shape: a polymorphic
+# recursive function whose tail-call passes a function-typed param
+# through to itself, exercised at depths 1, 2, 3, 4, 8, 16, and 64
+# so the TCO loop reaches the deep recursion that exposed the leak.
+
+type S = { v: Int }
+type Ev = Plus | Minus | Reset
+
+fn step(s: S, e: Ev) : S = match e {
+  Plus  -> S { v: s.v + 1 }
+  Minus -> S { v: s.v - 1 }
+  Reset -> S { v: 0 }
+}
+
+fn fold_events[s, ev, e](
+  initial: s, events: [ev], f: (s, ev) -> s / e
+) : s / e = match events {
+  []             -> initial
+  [ev1]          -> f(initial, ev1)
+  [ev1, ...rest] -> fold_events(f(initial, ev1), rest, f)
+}
+
+# Build an N-element list of `Plus` events so `fold` should return
+# the input length unchanged.
+fn make_pluses(n: Int, acc: [Ev]) : [Ev] =
+  if n <= 0 { acc } else { make_pluses(n - 1, [Plus, ...acc]) }
+
+fn run(n: Int) : Int = {
+  let s0 = S { v: 0 }
+  let s1 = fold_events(s0, make_pluses(n, []), step)
+  s1.v
+}
+
+fn main() : Unit / Console = {
+  print(int_to_string(run(1)))
+  print(int_to_string(run(2)))
+  print(int_to_string(run(3)))
+  print(int_to_string(run(4)))
+  print(int_to_string(run(8)))
+  print(int_to_string(run(16)))
+  print(int_to_string(run(64)))
+}
