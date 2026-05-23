@@ -18483,24 +18483,29 @@ fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar]) : String {
   ])
 }
 
-# Row for one `__pimpl_*` entry: the C symbol name, the proto name and
-# the kaikai type name (head). Heterogeneous-mangled impls
-# (`__pimpl_<P>_<T>_<op>__a_<args>`) collapse to the same `(P, T)`
-# dispatch key — the typer's compile-time rewrite already routes the
-# right arg-shape; the runtime only needs the head match.
-type PimplRow = PR(String, String, String)
-#                  c_sym    proto   type_name
+# Row for one `__pimpl_*` entry: the C symbol name, the proto name,
+# the kaikai type name (head), and the impl fn's arity. Heterogeneous-
+# mangled impls (`__pimpl_<P>_<T>_<op>__a_<args>`) collapse to the same
+# `(P, T)` dispatch key — the typer's compile-time rewrite already
+# routes the right arg-shape; the runtime only needs the head match.
+# The arity is needed by the LLVM emit to synthesise the bitcast
+# target type (`%KaiValue* (%KaiValue*, ...)*`) with the right number
+# of params — without it every impl would be bitcast to arity 1 and
+# clang rejects the mismatch (issue surfaced in release v0.83.x build).
+type PimplRow = PR(String, String, String, Int)
+#                  c_sym    proto   type_name arity
 
 fn collect_pimpl_rows(ds: [Decl], acc: [PimplRow]) : [PimplRow] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DFn(_, name, _, _, _, _, _, _, _, mo) -> {
+      DFn(_, name, _, params, _, _, _, _, _, mo) -> {
         if string_starts_with_q(name, "__pimpl_") {
           match parse_pimpl_name(name) {
             Some(pr) -> {
               let csym = c_sym(name, mo)
-              collect_pimpl_rows(rest, [pr_with_csym(pr, csym), ...acc])
+              let arity = list_length(params)
+              collect_pimpl_rows(rest, [pr_with_csym(pr, csym, arity), ...acc])
             }
             None -> collect_pimpl_rows(rest, acc)
           }
@@ -18513,8 +18518,8 @@ fn collect_pimpl_rows(ds: [Decl], acc: [PimplRow]) : [PimplRow] {
   }
 }
 
-fn pr_with_csym(pr: PimplRow, csym: String) : PimplRow {
-  match pr { PR(_, p, t) -> PR(csym, p, t) }
+fn pr_with_csym(pr: PimplRow, csym: String, arity: Int) : PimplRow {
+  match pr { PR(_, p, t, _) -> PR(csym, p, t, arity) }
 }
 
 # Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>`
@@ -18543,7 +18548,7 @@ fn parse_pimpl_name(name: String) : Option[PimplRow] {
           if last <= 0 { None }
           else {
             let tname = string_slice(rest1, 0, last)
-            Some(PR("", p, tname))
+            Some(PR("", p, tname, 0))
           }
         }
       }
@@ -18639,7 +18644,7 @@ fn emit_impl_table_array(rows: [PimplRow]) : String =
 fn emit_impl_table_array_loop(rows: [PimplRow], acc: String) : String {
   match rows {
     [] -> acc
-    [PR(csym, p, t), ...rest] -> {
+    [PR(csym, p, t, _), ...rest] -> {
       let line = concat_all(["\n    { .proto_id = ", stdlib_proto_id_c(p),
                               ", .head_tag = ", stdlib_head_tag_c(t),
                               ", .fn = (void *) &kai_", csym, " },"])
@@ -18722,7 +18727,7 @@ fn emit_pimpl_forwards(rows: [PimplRow], _seen: [String]) : String =
 fn emit_pimpl_forwards_loop(rows: [PimplRow], seen: [String]) : String {
   match rows {
     [] -> ""
-    [PR(csym, _, _), ...rest] ->
+    [PR(csym, _, _, _), ...rest] ->
       if list_has(seen, csym) {
         emit_pimpl_forwards_loop(rest, seen)
       } else {
@@ -53798,7 +53803,7 @@ fn llvm_emit_proto_init(decls: [Decl], variants: [EVar]) : String {
 fn llvm_emit_impl_register_calls(rows: [PimplRow], i: Int, acc: String) : String {
   match rows {
     [] -> acc
-    [PR(csym, p, t), ...rest] -> {
+    [PR(csym, p, t, arity), ...rest] -> {
       let head_int = stdlib_head_tag_int(t)
       let proto_int = llvm_stdlib_proto_id(p)
       if head_int < 0 {
@@ -53807,7 +53812,16 @@ fn llvm_emit_impl_register_calls(rows: [PimplRow], i: Int, acc: String) : String
         # the bitcast if the impl ever runs. Safer to omit here.
         llvm_emit_impl_register_calls(rest, i + 1, acc)
       } else {
-        let fn_ptr = concat_all(["bitcast (%KaiValue* (%KaiValue*)* @kai_", csym, " to i8*)"])
+        # The bitcast target type must match the impl fn's actual
+        # signature (`%KaiValue* (%KaiValue*, ...)*` with N params).
+        # Hardcoding arity 1 here was a v0.83.x release-build regression:
+        # heterogeneous operator-overload impls like
+        # `__pimpl_Add_Real_add__a_Complex` are arity 2 and clang's
+        # LLVM verifier rejects the type mismatch at link time. The
+        # arity is threaded from `collect_pimpl_rows` which reads
+        # `length(params)` on the original DFn.
+        let fn_ty = llvm_proto_fn_ty(arity)
+        let fn_ptr = concat_all(["bitcast (", fn_ty, " @kai_", csym, " to i8*)"])
         let line = concat_all([
           "  call void @kaix_register_one_impl(i32 ", proto_int,
           ", i32 ", int_to_string(head_int),
@@ -53839,7 +53853,7 @@ fn llvm_emit_variant_register_calls(v2h: [Int], i: Int, acc: String) : String {
 fn llvm_emit_pimpl_extern_declares(rows: [PimplRow], seen: [String], acc: String) : String {
   match rows {
     [] -> acc
-    [PR(csym, _, t), ...rest] -> {
+    [PR(csym, _, t, _), ...rest] -> {
       let head_int = stdlib_head_tag_int(t)
       if head_int < 0 or list_has(seen, csym) {
         llvm_emit_pimpl_extern_declares(rest, seen, acc)
