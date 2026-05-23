@@ -18432,13 +18432,305 @@ fn has_main_decl(decls: [Decl]) : Bool {
   }
 }
 
-fn emit_main_wrapper(decls: [Decl], bmode: BuildMode) : String {
+# Option C runtime infrastructure — emit the impl-table + variant->head
+# tables and a registration call before user main.
+#
+# Walks every DFn whose name starts with `__pimpl_` and synthesises a
+# `KaiImplEntry { .proto_id = …, .head_tag = …, .fn = &kai_<sym> }`
+# row. The protocol name and target type name are parsed back out of
+# the mangled symbol (`__pimpl_<P>_<T>_<op>` and the heterogeneous
+# variant `__pimpl_<P>_<T>_<op>__a_<args>`). User protocols / user types
+# emit an `-1` slot that the runtime hashmap ignores; v1 supports the
+# stdlib heads/protos pinned in `docs/variant-tags.md`.
+#
+# `kai_variant_to_head` is rebuilt the same way: every entry in
+# `variants` (the global EVar table) gets its head tag derived from
+# the constructor->sum mapping in the user's declarations.
+fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar]) : String {
+  let impl_rows = collect_pimpl_rows(decls, [])
+  let v2h       = collect_variant_to_head(variants, decls)
+  let n_impl    = list_length(impl_rows)
+  let n_v2h     = list_length(v2h)
+  let impl_arr  = emit_impl_table_array(impl_rows)
+  let v2h_arr   = emit_variant_to_head_array(v2h)
+  let fwds      = emit_pimpl_forwards(impl_rows, [])
+  concat_all([
+    fwds,
+    "static const int32_t _kai_variant_to_head_tbl[] = {",
+    v2h_arr,
+    "};\n",
+    "static const KaiImplEntry _kai_impl_table_entries[] = {",
+    impl_arr,
+    "};\n",
+    "static void _kai_register_proto_tables(void) {\n",
+    "    kai_register_variant_heads(_kai_variant_to_head_tbl, ",
+    int_to_string(n_v2h), ");\n",
+    "    kai_register_impls(_kai_impl_table_entries, ",
+    int_to_string(n_impl), ");\n",
+    "}\n\n"
+  ])
+}
+
+# Row for one `__pimpl_*` entry: the C symbol name, the proto name and
+# the kaikai type name (head). Heterogeneous-mangled impls
+# (`__pimpl_<P>_<T>_<op>__a_<args>`) collapse to the same `(P, T)`
+# dispatch key — the typer's compile-time rewrite already routes the
+# right arg-shape; the runtime only needs the head match.
+type PimplRow = PR(String, String, String)
+#                  c_sym    proto   type_name
+
+fn collect_pimpl_rows(ds: [Decl], acc: [PimplRow]) : [PimplRow] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DFn(_, name, _, _, _, _, _, _, _, mo) -> {
+        if string_starts_with_q(name, "__pimpl_") {
+          match parse_pimpl_name(name) {
+            Some(pr) -> {
+              let csym = c_sym(name, mo)
+              collect_pimpl_rows(rest, [pr_with_csym(pr, csym), ...acc])
+            }
+            None -> collect_pimpl_rows(rest, acc)
+          }
+        } else {
+          collect_pimpl_rows(rest, acc)
+        }
+      }
+      _ -> collect_pimpl_rows(rest, acc)
+    }
+  }
+}
+
+fn pr_with_csym(pr: PimplRow, csym: String) : PimplRow {
+  match pr { PR(_, p, t) -> PR(csym, p, t) }
+}
+
+# Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>`
+# back into (proto, type_name). The proto is the stdlib name (Show,
+# Eq, ...) for v1; user protos return None to skip.
+fn parse_pimpl_name(name: String) : Option[PimplRow] {
+  # name = "__pimpl_" ++ <rest>; cut prefix.
+  let prefix_len = 8
+  let n = string_length(name)
+  if n <= prefix_len { None }
+  else {
+    let rest = string_slice(name, prefix_len, n - prefix_len)
+    # split off the trailing "__a_..." suffix if present.
+    let base = pimpl_strip_arg_suffix(rest)
+    # `base` is now `<P>_<T>_<op>`. Take P as the longest known
+    # stdlib protocol prefix; everything between `<P>_` and the final
+    # `_<op>` is the type name.
+    match pimpl_split_proto(base) {
+      None -> None
+      Some(p_rest) -> match p_rest {
+        PR2(p, rest1) -> {
+          # rest1 = "<T>_<op>". Strip the trailing `_<op>` by finding
+          # the last underscore.
+          let m = string_length(rest1)
+          let last = find_last_underscore_proto(rest1, m - 1)
+          if last <= 0 { None }
+          else {
+            let tname = string_slice(rest1, 0, last)
+            Some(PR("", p, tname))
+          }
+        }
+      }
+    }
+  }
+}
+
+type PR2 = PR2(String, String)
+
+# Strip a `__a_…` suffix off a `__pimpl_*` symbol's payload string.
+fn pimpl_strip_arg_suffix(s: String) : String {
+  let marker = "__a_"
+  let idx = find_substring(s, marker, 0)
+  let n = string_length(s)
+  if idx >= n { s }
+  else { string_slice(s, 0, idx) }
+}
+
+# Detect which stdlib protocol prefix `s` starts with. Returns the
+# protocol name and the remainder after the trailing `_`. None if
+# unknown.
+fn pimpl_split_proto(s: String) : Option[PR2] {
+  let try_one = (p: String) => {
+    let plen = string_length(p)
+    let n = string_length(s)
+    if n > plen and substring_eq(s, 0, p) {
+      let after = char_at_or_zero(s, plen)
+      if after == '_' {
+        Some(PR2(p, string_slice(s, plen + 1, n - plen - 1)))
+      } else { None }
+    } else { None }
+  }
+  let tries = ["BinSerialize", "Serialize", "Default", "Show", "Hash",
+                "Ord", "Eq", "Add", "Sub", "Mul", "Div", "Rem"]
+  pimpl_first_match(tries, try_one)
+}
+
+fn pimpl_first_match(opts: [String], f: (String) -> Option[PR2]) : Option[PR2] {
+  match opts {
+    [] -> None
+    [o, ...rest] -> match f(o) {
+      Some(r) -> Some(r)
+      None    -> pimpl_first_match(rest, f)
+    }
+  }
+}
+
+fn find_last_underscore_proto(s: String, from: Int) : Int {
+  if from < 0 { -1 }
+  else {
+    match char_at(s, from) {
+      Some('_') -> from
+      _         -> find_last_underscore_proto(s, from - 1)
+    }
+  }
+}
+
+# Substring-equality. Returns true if `s[i..i+|t|] == t`. Bounds-safe.
+fn substring_eq(s: String, i: Int, t: String) : Bool {
+  let tn = string_length(t)
+  let sn = string_length(s)
+  if i + tn > sn { false }
+  else { substring_eq_loop(s, i, t, 0, tn) }
+}
+
+fn substring_eq_loop(s: String, i: Int, t: String, k: Int, tn: Int) : Bool {
+  if k >= tn { true }
+  else {
+    match char_at(s, i + k) {
+      Some(c1) -> match char_at(t, k) {
+        Some(c2) -> if c1 == c2 { substring_eq_loop(s, i, t, k + 1, tn) } else { false }
+        None     -> false
+      }
+      None -> false
+    }
+  }
+}
+
+# Find `needle` in `hay` starting at `from`. Returns length(hay) if
+# not found.
+fn find_substring(hay: String, needle: String, from: Int) : Int {
+  let hn = string_length(hay)
+  if from >= hn { hn }
+  else if substring_eq(hay, from, needle) { from }
+  else { find_substring(hay, needle, from + 1) }
+}
+
+# C array body for the impl table. Each row maps the parsed proto/type
+# back to the integer constants pinned in runtime.h.
+fn emit_impl_table_array(rows: [PimplRow]) : String =
+  emit_impl_table_array_loop(rows, "")
+
+fn emit_impl_table_array_loop(rows: [PimplRow], acc: String) : String {
+  match rows {
+    [] -> acc
+    [PR(csym, p, t), ...rest] -> {
+      let line = concat_all(["\n    { .proto_id = ", stdlib_proto_id_c(p),
+                              ", .head_tag = ", stdlib_head_tag_c(t),
+                              ", .fn = (void *) &kai_", csym, " },"])
+      emit_impl_table_array_loop(rest, concat_all([acc, line]))
+    }
+  }
+}
+
+# Map a kaikai type-name (mangled form like `Int`, `String`, `Option`,
+# `Result`, or a user type) to the runtime head-tag C constant.
+fn stdlib_head_tag_c(tname: String) : String {
+  if tname == "Int"          { "KAI_HEAD_INT" }
+  else if tname == "Real"    { "KAI_HEAD_REAL" }
+  else if tname == "Bool"    { "KAI_HEAD_BOOL" }
+  else if tname == "Char"    { "KAI_HEAD_CHAR" }
+  else if tname == "String"  { "KAI_HEAD_STRING" }
+  else if tname == "Unit"    { "KAI_HEAD_UNIT" }
+  else if tname == "Byte"    { "KAI_HEAD_BYTE" }
+  else if tname == "List"    { "KAI_HEAD_LIST" }
+  else if tname == "Array"   { "KAI_HEAD_ARRAY" }
+  else if tname == "Option"  { "KAI_HEAD_OPTION" }
+  else if tname == "Result"  { "KAI_HEAD_RESULT" }
+  else if tname == "Signal"  { "KAI_HEAD_SIGNAL" }
+  else if tname == "ProcessExit" { "KAI_HEAD_PROCESS_EXIT" }
+  else { concat_all(["-1 /* user/unknown type: ", tname, " */"]) }
+}
+
+# `kai_variant_to_head[]` — one int32_t per variant tag, mapping each
+# constructor to its sum-type head. Indexed by `variant_tag`.
+fn collect_variant_to_head(variants: [EVar], decls: [Decl]) : [Int] =
+  collect_v2h_loop(variants, decls, [])
+
+fn collect_v2h_loop(vs: [EVar], decls: [Decl], acc: [Int]) : [Int] {
+  match vs {
+    [] -> list_reverse(acc)
+    [EV(name, _, _, _), ...rest] -> {
+      let head = variant_head_tag_for(name, decls)
+      collect_v2h_loop(rest, decls, [head, ...acc])
+    }
+  }
+}
+
+# For a constructor `name`, find the sum type it belongs to and look
+# up that sum's head tag. Builtins use the reserved ids; user sums
+# would need a registry — out of scope for v1 (the dispatcher's
+# runtime panic catches the miss).
+fn variant_head_tag_for(name: String, decls: [Decl]) : Int {
+  if name == "Some" { 16 }
+  else if name == "None" { 16 }
+  else if name == "Ok" { 17 }
+  else if name == "Err" { 17 }
+  else if name == "SigInt" { 18 }
+  else if name == "SigTerm" { 18 }
+  else if name == "SigHup" { 18 }
+  else if name == "SigUsr1" { 18 }
+  else if name == "SigUsr2" { 18 }
+  else if name == "Exited" { 19 }
+  else if name == "Signaled" { 19 }
+  else { 0 }   # user variant: anonymous head, dispatcher will miss
+}
+
+fn emit_variant_to_head_array(xs: [Int]) : String =
+  emit_v2h_loop(xs, "")
+
+fn emit_v2h_loop(xs: [Int], acc: String) : String {
+  match xs {
+    [] -> acc
+    [v, ...rest] -> emit_v2h_loop(rest, concat_all([acc, " ", int_to_string(v), ","]))
+  }
+}
+
+# Forward declarations for every `__pimpl_*` whose address we take in
+# the impl table. These names are static fns in the same translation
+# unit; the regular fwd block already declares them, but the impl
+# table is emitted before user main and must be sure the names are
+# in scope. Re-emitting the forwards is cheap and idempotent.
+fn emit_pimpl_forwards(rows: [PimplRow], _seen: [String]) : String =
+  emit_pimpl_forwards_loop(rows, [])
+
+fn emit_pimpl_forwards_loop(rows: [PimplRow], seen: [String]) : String {
+  match rows {
+    [] -> ""
+    [PR(csym, _, _), ...rest] ->
+      if list_has(seen, csym) {
+        emit_pimpl_forwards_loop(rest, seen)
+      } else {
+        concat_all(["/* impl-table address-of for &kai_", csym, " */\n",
+                     emit_pimpl_forwards_loop(rest, [csym, ...seen])])
+      }
+  }
+}
+
+fn emit_main_wrapper(decls: [Decl], bmode: BuildMode, variants: [EVar]) : String {
+  let proto_tables = emit_proto_runtime_tables(decls, variants)
+  let proto_init   = "    _kai_register_proto_tables();\n"
   match bmode {
     BMTest -> {
       let n = test_count(decls)
       concat_all([
+        proto_tables,
         "int main(int argc, char **argv) {\n",
         "    kai_set_args(argc, argv);\n",
+        proto_init,
         test_call_list(n, 0),
         "    return kai_test_summary();\n",
         "}\n"
@@ -18447,8 +18739,10 @@ fn emit_main_wrapper(decls: [Decl], bmode: BuildMode) : String {
     BMBench -> {
       let n = bench_count(decls)
       concat_all([
+        proto_tables,
         "int main(int argc, char **argv) {\n",
         "    kai_set_args(argc, argv);\n",
+        proto_init,
         bench_call_list(n, 0),
         "    return kai_bench_summary();\n",
         "}\n"
@@ -18457,8 +18751,10 @@ fn emit_main_wrapper(decls: [Decl], bmode: BuildMode) : String {
     BMCheck -> {
       let n = check_count(decls)
       concat_all([
+        proto_tables,
         "int main(int argc, char **argv) {\n",
         "    kai_set_args(argc, argv);\n",
+        proto_init,
         check_call_list(n, 0),
         "    return kai_check_summary();\n",
         "}\n"
@@ -18489,8 +18785,10 @@ fn emit_main_wrapper(decls: [Decl], bmode: BuildMode) : String {
         let teardown = default_pops_for(main_row)
         concat_all([
           shims,
+          proto_tables,
           "int main(int argc, char **argv) {\n",
           "    kai_set_args(argc, argv);\n",
+          proto_init,
           setup,
           "    KaiValue *_result = kai_main();\n",
           teardown,
@@ -24896,7 +25194,7 @@ fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, 
   let tests = emit_all_tests(src, decls, [], fns, variants, lams, cls, target_origin)
   let benches = emit_all_benches(src, decls, [], fns, variants, lams, cls, target_origin)
   let checks = emit_all_checks(src, decls, [], fns, variants, lams, cls, target_origin)
-  let main_wr = emit_main_wrapper(decls, bmode)
+  let main_wr = emit_main_wrapper(decls, bmode, variants)
   concat_all([header, eff_structs, env_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
 }
 
@@ -52864,6 +53162,9 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
         let c_sym_target = ffi_extern_symbol_of(body, nm)
         let shim = llvm_emit_ffi_shim(sym, c_sym_target, ps, ret_ty_opt, start_id)
         LlvmDeclOut { text: concat_all([shim.text, thunk]), next_id: shim.next_id }
+      } else if body_is_proto_dispatch(body) {
+        let shim = llvm_emit_proto_dispatch_shim(sym, proto_dispatch_parts(body), ps, start_id)
+        LlvmDeclOut { text: concat_all([shim.text, thunk]), next_id: shim.next_id }
       } else {
       let locals0 = llvm_init_locals_from_params(ps)
       # Same-module preference: rotate `fns` so DFns from this DFn's
@@ -52980,6 +53281,127 @@ fn llvm_ffi_ret_ty(k: FfiRetKind) : String {
     FfiRetString -> "i8*"
     FfiRetUnknown(_) -> "void"
   }
+}
+
+# Option C — LLVM IR side of the runtime-dispatch shim. Mirrors
+# `emit_proto_dispatch_shim_c`. The shim:
+#   1. derives head_tag(self) via @kaix_head_tag,
+#   2. looks up the impl via @kaix_lookup_impl(proto_id, head_tag),
+#   3. on miss, calls @kaix_panic_no_impl and unreachable,
+#   4. on hit, bitcasts the i8* result to a typed function pointer
+#      and tail-calls it with the original kaikai args.
+#
+# Arity-0 ops (e.g. `Default.default()`) have no value to read the
+# head tag from. The shim still emits but uses KAI_HEAD_ANON (= 0)
+# as the dispatch tag, which the impl-table never matches against
+# stdlib heads — those ops must be statically resolved via the
+# typer's return-position annotation pin.
+fn llvm_emit_proto_dispatch_shim(sym: String, parts: ProtoDispatchParts,
+                                  params: [Param], start_id: Int) : LlvmDeclOut {
+  match parts {
+    PDP(pname, opname) -> {
+      let proto_id_val = llvm_stdlib_proto_id(pname)
+      let arity = list_length(params)
+      let fn_ty = llvm_proto_fn_ty(arity)
+      let self_pname = match params {
+        [p, ..._] -> p.pname
+        []        -> "self"
+      }
+      let head_setup = match params {
+        [] -> concat_all(["  %_kai_head = add i32 0, 0  ; arity-0 op\n"])
+        [_, ..._] -> concat_all([
+          "  %_kai_head = call i32 @kaix_head_tag(%KaiValue* %p_", self_pname, ")\n"
+        ])
+      }
+      let arg_csv = llvm_proto_dispatch_arg_list(params, 0)
+      # Emit literal C strings for the panic message helper at module
+      # scope. We use the .str constant pattern other emits already use.
+      let pname_str_id  = int_to_string(start_id)
+      let opname_str_id = int_to_string(start_id + 1)
+      let pname_len  = string_length(pname) + 1
+      let opname_len = string_length(opname) + 1
+      let strings = concat_all([
+        "@.proto_pname_", pname_str_id, " = private unnamed_addr constant [",
+          int_to_string(pname_len), " x i8] c\"", pname, "\\00\"\n",
+        "@.proto_opname_", opname_str_id, " = private unnamed_addr constant [",
+          int_to_string(opname_len), " x i8] c\"", opname, "\\00\"\n"
+      ])
+      let body = concat_all([
+        "entry:\n",
+        head_setup,
+        "  %_kai_fn_p = call i8* @kaix_lookup_impl(i32 ", proto_id_val,
+          ", i32 %_kai_head)\n",
+        "  %_kai_is_null = icmp eq i8* %_kai_fn_p, null\n",
+        "  br i1 %_kai_is_null, label %miss, label %hit\n",
+        "miss:\n",
+        "  %_kai_pname = getelementptr [", int_to_string(pname_len), " x i8], [",
+          int_to_string(pname_len), " x i8]* @.proto_pname_", pname_str_id,
+          ", i32 0, i32 0\n",
+        "  %_kai_opname = getelementptr [", int_to_string(opname_len), " x i8], [",
+          int_to_string(opname_len), " x i8]* @.proto_opname_", opname_str_id,
+          ", i32 0, i32 0\n",
+        "  call void @kaix_panic_no_impl(i8* %_kai_pname, i8* %_kai_opname, i32 %_kai_head)\n",
+        "  unreachable\n",
+        "hit:\n",
+        "  %_kai_fn = bitcast i8* %_kai_fn_p to ", fn_ty, "\n",
+        "  %_kai_ret = call %KaiValue* %_kai_fn(", arg_csv, ")\n",
+        "  ret %KaiValue* %_kai_ret\n"
+      ])
+      let text = concat_all([
+        strings, "\n",
+        "define %KaiValue* ", sym, "(", llvm_param_list(params), ") {\n",
+        body,
+        "}\n"
+      ])
+      LlvmDeclOut { text: text, next_id: start_id + 2 }
+    }
+  }
+}
+
+# Build the LLVM function-pointer type for a dispatcher of N params.
+# All params and the return are %KaiValue*.
+fn llvm_proto_fn_ty(arity: Int) : String {
+  let args = llvm_proto_fn_arg_tys(arity, 0)
+  concat_all(["%KaiValue* (", args, ")*"])
+}
+
+fn llvm_proto_fn_arg_tys(arity: Int, i: Int) : String {
+  if i >= arity { "" }
+  else if i == 0 { concat_all(["%KaiValue*", llvm_proto_fn_arg_tys(arity, i + 1)]) }
+  else { concat_all([", %KaiValue*", llvm_proto_fn_arg_tys(arity, i + 1)]) }
+}
+
+# Emit the kaikai params as an LLVM call arg list. LLVM names params
+# as `%p_<name>` (see `llvm_param_list_loop`).
+fn llvm_proto_dispatch_arg_list(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let head = if i == 0 { concat_all(["%KaiValue* %p_", p.pname]) }
+                 else { concat_all([", %KaiValue* %p_", p.pname]) }
+      concat_all([head, llvm_proto_dispatch_arg_list(rest, i + 1)])
+    }
+  }
+}
+
+# Map a stdlib protocol name to its integer ID for LLVM IR. Mirrors
+# `stdlib_proto_id_c` but emits a bare integer for the LLVM call
+# argument. Unknown protocols emit `-1`, which the runtime hashmap
+# never finds.
+fn llvm_stdlib_proto_id(pname: String) : String {
+  if pname == "Show"         { "0" }
+  else if pname == "Eq"      { "1" }
+  else if pname == "Ord"     { "2" }
+  else if pname == "Hash"    { "3" }
+  else if pname == "Serialize"     { "4" }
+  else if pname == "BinSerialize"  { "5" }
+  else if pname == "Default" { "6" }
+  else if pname == "Add"     { "7" }
+  else if pname == "Sub"     { "8" }
+  else if pname == "Mul"     { "9" }
+  else if pname == "Div"     { "10" }
+  else if pname == "Rem"     { "11" }
+  else { "-1" }
 }
 
 fn llvm_ffi_param_ty(p: Param) : String {
@@ -53219,9 +53641,120 @@ fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], _bmode: Build
   let main_row = row_effects_without_default_handler(main_row_labels(decls), decls)
   let install = llvm_emit_main_install_defaults(main_row)
   let teardown = llvm_emit_main_teardown_defaults(main_row)
+  let proto_init = llvm_emit_proto_init(decls, vs)
   concat_all([llvm_header(), eff_structs, "\n",
               decls_out.text, lam_bodies, clauses_out.text,
-              install, teardown])
+              install, teardown, proto_init])
+}
+
+# Option C — emit the LLVM IR body of `_kai_proto_init_llvm`. Called
+# once by runtime_llvm.c's `int main` before `kai_main_install_defaults`.
+# Each impl-table entry becomes one `call void @kaix_register_one_impl
+# (i32 proto_id, i32 head_tag, i8* fn_ptr)`; each variant becomes one
+# `call void @kaix_register_one_variant_head(i32 variant_tag, i32 head_tag)`.
+fn llvm_emit_proto_init(decls: [Decl], variants: [EVar]) : String {
+  let impl_rows = collect_pimpl_rows(decls, [])
+  let v2h       = collect_variant_to_head(variants, decls)
+  let impl_calls   = llvm_emit_impl_register_calls(impl_rows, 0, "")
+  let variant_calls = llvm_emit_variant_register_calls(v2h, 0, "")
+  let fn_declares  = llvm_emit_pimpl_extern_declares(impl_rows, [], "")
+  concat_all([
+    "\ndeclare void @kaix_register_one_impl(i32, i32, i8*)\n",
+    "declare void @kaix_register_one_variant_head(i32, i32)\n",
+    "declare i32 @kaix_head_tag(%KaiValue*)\n",
+    "declare i8* @kaix_lookup_impl(i32, i32)\n",
+    "declare void @kaix_panic_no_impl(i8*, i8*, i32)\n",
+    fn_declares,
+    "\ndefine void @_kai_proto_init_llvm() {\n",
+    "entry:\n",
+    variant_calls,
+    impl_calls,
+    "  ret void\n",
+    "}\n"
+  ])
+}
+
+# For each pimpl row, emit one register call. Skips entries whose
+# head_tag is -1 (user/unknown types) since the runtime hashmap would
+# never match them anyway.
+fn llvm_emit_impl_register_calls(rows: [PimplRow], i: Int, acc: String) : String {
+  match rows {
+    [] -> acc
+    [PR(csym, p, t), ...rest] -> {
+      let head_int = stdlib_head_tag_int(t)
+      let proto_int = llvm_stdlib_proto_id(p)
+      if head_int < 0 {
+        # Skip user-types; the C backend keeps them in the table (with
+        # -1) as a documentation footprint, but LLVM IR errors out on
+        # the bitcast if the impl ever runs. Safer to omit here.
+        llvm_emit_impl_register_calls(rest, i + 1, acc)
+      } else {
+        let fn_ptr = concat_all(["bitcast (%KaiValue* (%KaiValue*)* @kai_", csym, " to i8*)"])
+        let line = concat_all([
+          "  call void @kaix_register_one_impl(i32 ", proto_int,
+          ", i32 ", int_to_string(head_int),
+          ", i8* ", fn_ptr, ")\n"
+        ])
+        llvm_emit_impl_register_calls(rest, i + 1, concat_all([acc, line]))
+      }
+    }
+  }
+}
+
+# Emit one `@kaix_register_one_variant_head` call per variant tag.
+fn llvm_emit_variant_register_calls(v2h: [Int], i: Int, acc: String) : String {
+  match v2h {
+    [] -> acc
+    [head, ...rest] -> {
+      let line = concat_all([
+        "  call void @kaix_register_one_variant_head(i32 ",
+        int_to_string(i), ", i32 ", int_to_string(head), ")\n"
+      ])
+      llvm_emit_variant_register_calls(rest, i + 1, concat_all([acc, line]))
+    }
+  }
+}
+
+# Emit forward `declare`s for each `__pimpl_*` we bitcast above.
+# These names are already defined in the same module so the declare
+# acts only as a no-op type assertion.
+fn llvm_emit_pimpl_extern_declares(rows: [PimplRow], seen: [String], acc: String) : String {
+  match rows {
+    [] -> acc
+    [PR(csym, _, t), ...rest] -> {
+      let head_int = stdlib_head_tag_int(t)
+      if head_int < 0 or list_has(seen, csym) {
+        llvm_emit_pimpl_extern_declares(rest, seen, acc)
+      } else {
+        # Always declare with 1-arg shape since pimpl arities vary
+        # and the actual call type comes through the bitcast. The
+        # declare is omitted — LLVM resolves @kai_<csym> from the
+        # same module's `define %KaiValue* @kai_<csym>(...)`. We
+        # leave a comment for readers.
+        llvm_emit_pimpl_extern_declares(rest, [csym, ...seen],
+                                          concat_all([acc, "; pimpl ref ", csym, "\n"]))
+      }
+    }
+  }
+}
+
+# Integer version of `stdlib_head_tag_c` for direct LLVM emission.
+# Returns -1 for unknown/user types.
+fn stdlib_head_tag_int(tname: String) : Int {
+  if tname == "Int"          { 3 }
+  else if tname == "Real"    { 4 }
+  else if tname == "Bool"    { 2 }
+  else if tname == "Char"    { 5 }
+  else if tname == "String"  { 6 }
+  else if tname == "Unit"    { 1 }
+  else if tname == "Byte"    { 9 }
+  else if tname == "List"    { 7 }
+  else if tname == "Array"   { 8 }
+  else if tname == "Option"  { 16 }
+  else if tname == "Result"  { 17 }
+  else if tname == "Signal"  { 18 }
+  else if tname == "ProcessExit" { 19 }
+  else { -1 }
 }
 
 # m7c-c: per-decl walker that flattens every effect's ops into a
