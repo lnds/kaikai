@@ -17613,30 +17613,42 @@ fn emit_proto_dispatch_shim_c(sig: String, parts: ProtoDispatchParts,
     PDP(pname, opname) -> {
       let proto_id_c = stdlib_proto_id_c(pname)
       let arity = list_length(params)
-      let cast = proto_dispatch_cast(arity)
-      let arg_list = proto_dispatch_arg_list(params, 0)
       let miss_msg = concat_all(["no impl of ", pname, ".", opname,
-                                  " for runtime head"])
-      let head_expr = match params {
-        # Arity-0 ops (e.g. `Default.default() : Self`) have no value
-        # informant for runtime dispatch — Self is pinned by the
-        # caller's annotation and monomorphised at compile time. If
-        # one reaches the dispatcher at runtime, that is a compiler
-        # bug (the validator should have rejected the call site).
-        []         -> "KAI_HEAD_ANON /* arity-0 op — should be statically resolved */"
-        [p, ..._]  -> concat_all(["kai_head_tag(kai_", p.pname, ")"])
+                                  " for runtime head (arity 0 op: caller must annotate Self)"])
+      if arity == 0 {
+        # Arity-0 ops (`Default.default() : Self`) cannot be runtime-
+        # dispatched: there is no value to derive the head tag from,
+        # and Self is meant to be pinned by the caller's annotation
+        # so the monomorphiser resolves the impl statically. Reaching
+        # this body means the validator missed an unresolved call —
+        # panic with the diagnostic and never call back into the
+        # impl-table.
+        concat_all([
+          sig, " {\n",
+          "    fprintf(stderr, \"panic: ", miss_msg, "\\n\");\n",
+          "    exit(1);\n",
+          "}\n\n"
+        ])
+      } else {
+        let cast = proto_dispatch_cast(arity)
+        let arg_list = proto_dispatch_arg_list(params, 0)
+        let head_param = match params {
+          [p, ..._] -> p.pname
+          []        -> "self"
+        }
+        concat_all([
+          sig, " {\n",
+          "    int32_t _kai_head = kai_head_tag(kai_", head_param, ");\n",
+          "    void *_kai_fn_p = kai_lookup_impl(", proto_id_c, ", _kai_head);\n",
+          "    if (_kai_fn_p == NULL) {\n",
+          "        fprintf(stderr, \"panic: no impl of ", pname, ".", opname,
+                  " for runtime head %d\\n\", (int) _kai_head);\n",
+          "        exit(1);\n",
+          "    }\n",
+          "    return ", cast, "_kai_fn_p)(", arg_list, ");\n",
+          "}\n\n"
+        ])
       }
-      concat_all([
-        sig, " {\n",
-        "    int32_t _kai_head = ", head_expr, ";\n",
-        "    void *_kai_fn_p = kai_lookup_impl(", proto_id_c, ", _kai_head);\n",
-        "    if (_kai_fn_p == NULL) {\n",
-        "        fprintf(stderr, \"panic: ", miss_msg, " %d\\n\", (int) _kai_head);\n",
-        "        exit(1);\n",
-        "    }\n",
-        "    return ", cast, "_kai_fn_p)(", arg_list, ");\n",
-        "}\n\n"
-      ])
     }
   }
 }
@@ -33353,8 +33365,20 @@ fn synth_hole(st: InferState, nm_opt: Option[String], e: Expr) : Inferred {
 # occurrence is independent (no name-based sharing — `todo!` carries
 # a free-form message, not an identifier), so we always allocate a
 # fresh TyVarT.
-fn synth_todo(st: InferState, msg: String, e: Expr) : Inferred =
-  register_fresh_hole(st, HKTodo(msg), e)
+fn synth_todo(st: InferState, msg: String, e: Expr) : Inferred {
+  # Protocol-dispatcher markers reach `synth_todo` because they are
+  # ETodos. They are NOT user-authored holes; the dispatcher fn typechecks
+  # exactly like a regular polymorphic fn but emits a runtime shim at
+  # codegen. Skip the hole register so `--holes-json` does not list the
+  # marker as a user hole.
+  if string_starts_with_q(msg, proto_dispatch_tag_prefix()) {
+    let fresh_id = st.env.fresh
+    let st1 = st_set_env(st, fresh_var(st.env))
+    inferred_leaf(st1, TyVarT(fresh_id), e)
+  } else {
+    register_fresh_hole(st, HKTodo(msg), e)
+  }
+}
 
 # m7e §13 — `expr!` typer.
 # - Operand must be `Option[T]` or `Result[E, T]` (after substitution).
