@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.83.2 (2026-05-23)
+
+### Fixed
+
+- **runtime**: line-buffer stdout (#678) + cancel reaches reactor-parked fiber (#679)
+
 ## v0.83.1 (2026-05-23)
 
 ### Fixed
