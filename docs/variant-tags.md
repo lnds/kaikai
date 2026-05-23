@@ -115,3 +115,154 @@ side) continues to use strcmp until a follow-up lane flips it to
 `variant_tag == N`. Splitting the lanes lets us land the producer fix
 under the existing strcmp regime (no semantic change yet) and then
 flip consumers on a separate change with its own perf measurement.
+
+## Head-type tags — protocol dispatch key
+
+`variant_tag` identifies a *constructor* (`Some`, `None`, `Ok`, …). Single-
+dispatch protocols (`docs/protocols.md`) need a *head type* identifier
+(`Option`, `Result`, `Foo`, `Int`, …) so the runtime impl-table lookup
+`(proto_id, head_type_tag) → fn_ptr` collapses sibling constructors of the
+same sum type to one entry. This section pins the head-type tag
+convention used by the runtime impl-table.
+
+### Primitive head tags (reserved 0..15)
+
+| Tag | Head           | KaiTag mapping          |
+| --- | -------------- | ----------------------- |
+| 0   | (anonymous)    | structural / opaque     |
+| 1   | `Unit`         | `KAI_UNIT`              |
+| 2   | `Bool`         | `KAI_BOOL`              |
+| 3   | `Int`          | `KAI_INT`               |
+| 4   | `Real`         | `KAI_REAL`              |
+| 5   | `Char`         | `KAI_CHAR`              |
+| 6   | `String`       | `KAI_STR`               |
+| 7   | `List`         | `KAI_NIL` ∪ `KAI_CONS`  |
+| 8   | `Array`        | `KAI_ARRAY`             |
+| 9   | `Byte`         | `KAI_BYTE`              |
+| 10  | `Closure`      | `KAI_CLOSURE`           |
+| 11  | `Fiber`        | `KAI_FIBER`             |
+| 12  | `Pid`          | `KAI_PID`               |
+| 13  | `Bytes`        | reserved                |
+| 14  | reserved       |                         |
+| 15  | reserved       |                         |
+
+`HEAD_LIST` covers both `KAI_NIL` and `KAI_CONS` — single-dispatch on
+`List` does not distinguish the empty from the cons case (the body
+pattern-matches on the value as usual).
+
+`head_type_tag = 0` is reserved for anonymous / structural records.
+`impl P for { ... }` is not allowed in v1; the post-mono validator
+rejects any impl whose target is anonymous.
+
+### Stdlib nominal heads (reserved 16..19)
+
+The stdlib sum types are pinned alongside the primitives so the runtime
+and all three stages agree byte-for-byte:
+
+| Tag | Head          | Constructors          |
+| --- | ------------- | --------------------- |
+| 16  | `Option`      | `Some`, `None`        |
+| 17  | `Result`      | `Ok`, `Err`           |
+| 18  | `Signal`      | `SigInt`…`SigUsr2`    |
+| 19  | `ProcessExit` | `Exited`, `Signaled`  |
+
+`KAI_USER_HEAD_TAG_BASE = 20`. User-declared sum types and records
+receive head tags from 20 upward, assigned in declaration order during
+resolve. Like `variant_tag`, user head tags are stable within a single
+compilation but not across compilations (declaration-order
+dependent).
+
+### Runtime derivation — `kai_head_tag(KaiValue *v)`
+
+The runtime helper maps any value to its head tag:
+
+- **Immediates / boxed primitives** — switch on `v->tag` (the existing
+  `KaiTag`) to the constant from the table above.
+- **Variants** (`KAI_VARIANT`) — `kai_variant_to_head[v->as.var.variant_tag]`.
+  One indirection into a static array emitted by the compiler. Zero
+  memory cost in the variant payload itself.
+- **Records** (`KAI_RECORD`) — read the new `int32_t head_type_tag`
+  field on `as.rec`. Initialised by `kai_record(…)` from the value
+  passed at construction.
+- **Lists** — `KAI_NIL` and `KAI_CONS` both map to `HEAD_LIST = 7`.
+
+`kai_head_tag` is `static inline` in `runtime.h`; the cost is one
+load + small switch, predictable on hot paths.
+
+### Compile-time tables emitted by the compiler
+
+For each compilation unit, the codegen emits:
+
+```c
+/* head tag of each variant constructor, indexed by variant_tag */
+static const int32_t kai_variant_to_head[] = {
+  [0]  = 16,  /* Some -> Option   */
+  [1]  = 16,  /* None -> Option   */
+  [2]  = 17,  /* Ok   -> Result   */
+  [3]  = 17,  /* Err  -> Result   */
+  ...
+};
+
+/* impl table entries collected during codegen */
+static const KaiImplEntry kai_impl_table_entries[] = {
+  { .proto_id = 0, .head_tag = 3,  .fn = &__pimpl_Show_Int_show },
+  { .proto_id = 0, .head_tag = 16, .fn = &__pimpl_Show_Option_show },
+  ...
+};
+```
+
+`kai_runtime_init` walks `kai_impl_table_entries` and populates the
+open-addressing hashmap before user `main` runs.
+
+### Invariants
+
+1. **One head tag per nominal type** within a compilation. Two
+   distinct `type Foo = …` declarations never share a head tag.
+2. **`kai_variant_to_head[t]` is defined for every `t` in the
+   variants table.** Missing entries are a codegen bug.
+3. **Primitive head tags are stable across kaikai versions within an
+   edition.** Same discipline as variant tags (see §Invariants
+   above). User-assigned tags ≥16 are *not* stable across recompilation
+   (declaration order shifts them); the impl-table is rebuilt per
+   compilation, so this is fine.
+4. **`KAI_USER_HEAD_TAG_BASE = 20`.** If a new primitive or stdlib
+   head is added (e.g. `Map` becomes a runtime primitive), bump this
+   constant and document it here.
+
+### Protocol IDs
+
+`(proto_id, head_type_tag)` is the dispatch key. The stdlib protocols
+pin the first 12 IDs in declaration order in `stdlib/protocols.kai`:
+
+| ID  | Protocol       |
+| --- | -------------- |
+| 0   | `Show`         |
+| 1   | `Eq`           |
+| 2   | `Ord`          |
+| 3   | `Hash`         |
+| 4   | `Serialize`    |
+| 5   | `BinSerialize` |
+| 6   | `Default`      |
+| 7   | `Add`          |
+| 8   | `Sub`          |
+| 9   | `Mul`          |
+| 10  | `Div`          |
+| 11  | `Rem`          |
+
+`KAI_USER_PROTO_ID_BASE = 12`. User-declared protocols receive IDs
+from 12 upward in declaration order. Like head tags, user proto IDs
+are stable within a compilation but not across compilations.
+
+### Where the convention is encoded
+
+- **`stage0/runtime.h`** — `kai_head_tag` inline helper; `struct rec`
+  carries `int32_t head_type_tag`; `KaiImplEntry` and impl-table
+  hashmap.
+- **`stage0/emit.c`**, **`stage1/compiler.kai`**, **`stage2/compiler.kai`**
+  — each maintains its own head-tag table, threaded through resolve in
+  declaration order from `KAI_USER_HEAD_TAG_BASE`. Codegen emits both
+  the `kai_variant_to_head[]` array and the impl-table entries at the
+  end of the translation unit.
+
+Cross-stage table duplication is accepted as deferred consolidation, on
+the same precedent as `variant_tag` (see audit decision 2026-05-22).

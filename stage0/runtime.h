@@ -126,6 +126,155 @@ typedef enum {
     KAI_BYTE          /* Lane 4 (#473): unsigned 8-bit integer, nominal */
 } KaiTag;
 
+/* Head-type tags — single-dispatch protocol dispatch key.
+ * See docs/variant-tags.md "Head-type tags — protocol dispatch key".
+ *
+ * Tags 0..15 are reserved for primitives + structural; stdlib sums
+ * pin 16..19; user-declared nominal types start at 20. */
+#define KAI_HEAD_ANON         0
+#define KAI_HEAD_UNIT         1
+#define KAI_HEAD_BOOL         2
+#define KAI_HEAD_INT          3
+#define KAI_HEAD_REAL         4
+#define KAI_HEAD_CHAR         5
+#define KAI_HEAD_STRING       6
+#define KAI_HEAD_LIST         7
+#define KAI_HEAD_ARRAY        8
+#define KAI_HEAD_BYTE         9
+#define KAI_HEAD_CLOSURE     10
+#define KAI_HEAD_FIBER       11
+#define KAI_HEAD_PID         12
+#define KAI_HEAD_BYTES       13
+#define KAI_HEAD_OPTION      16
+#define KAI_HEAD_RESULT      17
+#define KAI_HEAD_SIGNAL      18
+#define KAI_HEAD_PROCESS_EXIT 19
+#define KAI_USER_HEAD_TAG_BASE 20
+
+/* Protocol IDs — first 12 reserved for stdlib protocols in
+ * stdlib/protocols.kai declaration order. User protocols start at 12.
+ * See docs/variant-tags.md "Protocol IDs". */
+#define KAI_PROTO_SHOW          0
+#define KAI_PROTO_EQ            1
+#define KAI_PROTO_ORD           2
+#define KAI_PROTO_HASH          3
+#define KAI_PROTO_SERIALIZE     4
+#define KAI_PROTO_BIN_SERIALIZE 5
+#define KAI_PROTO_DEFAULT       6
+#define KAI_PROTO_ADD           7
+#define KAI_PROTO_SUB           8
+#define KAI_PROTO_MUL           9
+#define KAI_PROTO_DIV          10
+#define KAI_PROTO_REM          11
+#define KAI_USER_PROTO_ID_BASE 12
+
+/* Variant-tag -> head-type-tag map. Set once at startup by codegen-
+ * emitted main via kai_register_variant_heads(table, len). Until set,
+ * the bootstrap table covers the 11 reserved builtin variants
+ * (Some/None -> Option, Ok/Err -> Result, Sig* -> Signal,
+ * Exited/Signaled -> ProcessExit). */
+static const int32_t kai_variant_to_head_bootstrap[11] = {
+    /* 0  */ KAI_HEAD_OPTION,        /* Some  */
+    /* 1  */ KAI_HEAD_OPTION,        /* None  */
+    /* 2  */ KAI_HEAD_RESULT,        /* Ok    */
+    /* 3  */ KAI_HEAD_RESULT,        /* Err   */
+    /* 4  */ KAI_HEAD_SIGNAL,        /* SigInt  */
+    /* 5  */ KAI_HEAD_SIGNAL,        /* SigTerm */
+    /* 6  */ KAI_HEAD_SIGNAL,        /* SigHup  */
+    /* 7  */ KAI_HEAD_SIGNAL,        /* SigUsr1 */
+    /* 8  */ KAI_HEAD_SIGNAL,        /* SigUsr2 */
+    /* 9  */ KAI_HEAD_PROCESS_EXIT,  /* Exited   */
+    /* 10 */ KAI_HEAD_PROCESS_EXIT,  /* Signaled */
+};
+
+static const int32_t *kai_variant_to_head     = kai_variant_to_head_bootstrap;
+static int32_t        kai_variant_to_head_len = 11;
+
+static inline void kai_register_variant_heads(const int32_t *tbl, int32_t len) {
+    kai_variant_to_head     = tbl;
+    kai_variant_to_head_len = len;
+}
+
+/* Impl-table entry — emitted by codegen as a static const array, then
+ * loaded into the runtime hashmap at startup by kai_register_impls. */
+typedef struct {
+    int32_t proto_id;
+    int32_t head_tag;
+    void   *fn;
+} KaiImplEntry;
+
+/* Open-addressing hashmap, linear probing. Capacity is a power of 2.
+ * Empty slot marked by fn == NULL (no impl ever has NULL function). */
+typedef struct {
+    int32_t proto_id;
+    int32_t head_tag;
+    void   *fn;
+} KaiImplSlot;
+
+static KaiImplSlot *kai_impl_table  = NULL;
+static int32_t      kai_impl_cap    = 0;
+static int32_t      kai_impl_count  = 0;
+
+static inline uint32_t kai_impl_hash(int32_t proto_id, int32_t head_tag) {
+    /* FNV-1a-ish mix; keys are small ints so any cheap mix is fine. */
+    uint32_t h = (uint32_t) proto_id * 2654435761u;
+    h ^= (uint32_t) head_tag * 40503u;
+    h ^= h >> 13;
+    return h;
+}
+
+/* Lookup. Returns NULL when no impl is registered for (proto_id, head_tag).
+ * The dispatcher panics on NULL with a meaningful message. */
+static inline void *kai_lookup_impl(int32_t proto_id, int32_t head_tag) {
+    if (kai_impl_cap == 0) return NULL;
+    uint32_t mask = (uint32_t) (kai_impl_cap - 1);
+    uint32_t i    = kai_impl_hash(proto_id, head_tag) & mask;
+    while (kai_impl_table[i].fn != NULL) {
+        if (kai_impl_table[i].proto_id == proto_id &&
+            kai_impl_table[i].head_tag == head_tag) {
+            return kai_impl_table[i].fn;
+        }
+        i = (i + 1u) & mask;
+    }
+    return NULL;
+}
+
+static inline void kai_impl_insert(int32_t proto_id, int32_t head_tag, void *fn) {
+    uint32_t mask = (uint32_t) (kai_impl_cap - 1);
+    uint32_t i    = kai_impl_hash(proto_id, head_tag) & mask;
+    while (kai_impl_table[i].fn != NULL) {
+        /* Duplicate registration of the same (proto_id, head_tag) is
+         * a codegen bug — overwrite silently rather than crash, but
+         * keep the same fn pointer in practice. */
+        if (kai_impl_table[i].proto_id == proto_id &&
+            kai_impl_table[i].head_tag == head_tag) {
+            kai_impl_table[i].fn = fn;
+            return;
+        }
+        i = (i + 1u) & mask;
+    }
+    kai_impl_table[i].proto_id = proto_id;
+    kai_impl_table[i].head_tag = head_tag;
+    kai_impl_table[i].fn       = fn;
+    kai_impl_count++;
+}
+
+/* Called once at program start by codegen-emitted main (before user
+ * code runs). Sizes capacity at 2x for ~50% max load factor.
+ * Idempotent: calling twice replaces the table (last writer wins),
+ * which is correct for the single-compilation single-link model. */
+static void kai_register_impls(const KaiImplEntry *entries, int32_t n) {
+    int32_t cap = 16;
+    while (cap < n * 2) cap *= 2;
+    if (kai_impl_table != NULL) free(kai_impl_table);
+    kai_impl_table  = (KaiImplSlot *) calloc((size_t) cap, sizeof(KaiImplSlot));
+    kai_impl_cap    = cap;
+    kai_impl_count  = 0;
+    for (int32_t k = 0; k < n; ++k) {
+        kai_impl_insert(entries[k].proto_id, entries[k].head_tag, entries[k].fn);
+    }
+}
+
 typedef struct KaiValue KaiValue;
 
 /* Dynamic-dispatch signature used for closures and higher-order calls. */
@@ -194,6 +343,7 @@ struct KaiValue {
             int          n_fields;
             KaiValue   **fields;
             const char **names;                     /* static strings, not freed */
+            int32_t      head_type_tag;             /* docs/variant-tags.md "Head-type tags" */
         } rec;
         struct {
             int32_t     variant_tag;                /* index into the sum type */
@@ -251,6 +401,38 @@ struct KaiValue {
         struct KaiMailbox *mb;
     } as;
 };
+
+/* ---------- head-type tag derivation ---------- */
+
+/* kai_head_tag — single-dispatch protocol dispatch key for any value.
+ * See docs/variant-tags.md "Head-type tags". O(1), cache-warm hot path. */
+static inline int32_t kai_head_tag(KaiValue *v) {
+    if (v == NULL) return KAI_HEAD_ANON;
+    switch ((KaiTag) v->tag) {
+        case KAI_UNIT:    return KAI_HEAD_UNIT;
+        case KAI_BOOL:    return KAI_HEAD_BOOL;
+        case KAI_INT:     return KAI_HEAD_INT;
+        case KAI_REAL:    return KAI_HEAD_REAL;
+        case KAI_CHAR:    return KAI_HEAD_CHAR;
+        case KAI_STR:     return KAI_HEAD_STRING;
+        case KAI_NIL:     return KAI_HEAD_LIST;
+        case KAI_CONS:    return KAI_HEAD_LIST;
+        case KAI_RECORD:  return v->as.rec.head_type_tag;
+        case KAI_VARIANT: {
+            int32_t vt = v->as.var.variant_tag;
+            if (vt >= 0 && vt < kai_variant_to_head_len) {
+                return kai_variant_to_head[vt];
+            }
+            return KAI_HEAD_ANON;
+        }
+        case KAI_CLOSURE: return KAI_HEAD_CLOSURE;
+        case KAI_ARRAY:   return KAI_HEAD_ARRAY;
+        case KAI_FIBER:   return KAI_HEAD_FIBER;
+        case KAI_PID:     return KAI_HEAD_PID;
+        case KAI_BYTE:    return KAI_HEAD_BYTE;
+    }
+    return KAI_HEAD_ANON;
+}
 
 /* ---------- allocation and refcounting ---------- */
 
@@ -2112,10 +2294,20 @@ static KAI_RC_NOINLINE KaiValue *kai_record(int n, KaiValue **fields, const char
     v->as.rec.n_fields = n;
     v->as.rec.fields = (KaiValue **) malloc(n * sizeof(KaiValue *));
     v->as.rec.names  = (const char **) malloc(n * sizeof(const char *));
+    v->as.rec.head_type_tag = 0;  /* anonymous; kai_record_h sets it nominally */
     for (int i = 0; i < n; ++i) {
         v->as.rec.fields[i] = fields[i];
         v->as.rec.names[i]  = names[i];
     }
+    return v;
+}
+
+/* Nominal-record constructor — same as kai_record but stamps the
+ * head-type tag for protocol dispatch. See docs/variant-tags.md
+ * "Head-type tags". */
+static KAI_RC_NOINLINE KaiValue *kai_record_h(int n, KaiValue **fields, const char **names, int32_t head_tag) {
+    KaiValue *v = kai_record(n, fields, names);
+    v->as.rec.head_type_tag = head_tag;
     return v;
 }
 
@@ -2462,6 +2654,17 @@ static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr,
         return kai_incref(_scr);
     }
     return kai_record(n, fields, names);
+}
+
+/* Same as kai_reuse_or_alloc_record but stamps head_type_tag — used by
+ * codegen when the record's nominal head is known at compile time. */
+static KaiValue *kai_reuse_or_alloc_record_h(KaiValue *_scr,
+                                             int n, KaiValue **fields,
+                                             const char **names,
+                                             int32_t head_tag) {
+    KaiValue *v = kai_reuse_or_alloc_record(_scr, n, fields, names);
+    v->as.rec.head_type_tag = head_tag;
+    return v;
 }
 
 static KaiValue *kai_reuse_or_alloc_variant(KaiValue *_scr,
