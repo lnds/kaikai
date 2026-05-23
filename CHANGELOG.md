@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.83.3 (2026-05-23)
+
+### Fixed
+
+- **emit**: LLVM impl-table bitcast carries the impl's actual arity
+
 ## v0.83.2 (2026-05-23)
 
 ### Fixed
