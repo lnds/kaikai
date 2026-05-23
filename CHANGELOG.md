@@ -84,6 +84,26 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.83.0 (2026-05-23)
+
+### Added
+
+- **emit**: impl-table registration + LLVM dispatch shim for protocols
+- **emit**: C-backend runtime dispatch shim for protocol dispatcher
+- **runtime**: add impl-table hashmap + head-type tags for protocol dispatch
+- **emit**: emit atom-style global variant tags across all stages
+
+### Fixed
+
+- **emit**: skip dispatcher-marker ETodos from hole register + lane retro
+- **runtime**: align hardcoded variant tags with the atom-style convention
+
+### Changed
+
+- **emit**: flip LLVM match dispatch to variant_tag == N
+- **runtime**: drop kai_variant, keep kai_variant_u as the only ctor
+- **emit**: flip match dispatch from strcmp to variant_tag == N
+
 ## v0.82.0 (2026-05-21)
 
 ### Added
