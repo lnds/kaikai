@@ -606,7 +606,7 @@ static void emit_ident_value(E *e, const char *name, size_t len) {
     {
         int vtag = 0;
         if (find_variant(e, name, len, &arity, &vtag)) {
-            fprintf(e->out, "kai_variant(%d, \"%.*s\", 0, NULL)", vtag, (int) len, name);
+            fprintf(e->out, "kai_variant_u(%d, \"%.*s\", 0, 0, NULL)", vtag, (int) len, name);
             return;
         }
     }
@@ -878,20 +878,25 @@ static void emit_args_with_prepend(E *e, Node *call, Node *prepended) {
 
 static void emit_variant_construction(E *e, const char *name, size_t name_len,
                                        Node *call_or_null) {
-    /* Emits kai_variant(<tag>, "<Name>", n_args, <args array>) where
-     * <tag> comes from the global variants table — builtins land in
-     * 0..10 and user variants in 11.. (see docs/variant-tags.md). */
+    /* Emits kai_variant_u(<tag>, "<Name>", n_args, 0, <slot array>)
+     * where <tag> comes from the global variants table (builtins
+     * 0..10, users 11.., see docs/variant-tags.md) and <slot array>
+     * is a KaiVarSlot[] with each slot's .ptr filled. Stage 0 only
+     * emits boxed args, so the mask is always 0; the typed payload
+     * path (Phase 2 #440) lives in stage 2's emitter. */
     size_t n_args = call_or_null ? (call_or_null->n_children - 1) : 0;
     int vtag = 0;
     find_variant(e, name, name_len, NULL, &vtag);
-    fprintf(e->out, "kai_variant(%d, \"%.*s\", %d, ", vtag, (int) name_len, name, (int) n_args);
+    fprintf(e->out, "kai_variant_u(%d, \"%.*s\", %d, 0, ", vtag, (int) name_len, name, (int) n_args);
     if (n_args == 0) {
         fputs("NULL)", e->out);
     } else {
-        fputs("(KaiValue *[]){", e->out);
+        fputs("(KaiVarSlot[]){", e->out);
         for (size_t i = 1; i < call_or_null->n_children; ++i) {
             if (i > 1) fputs(", ", e->out);
+            fputs("{.ptr = ", e->out);
             emit_expr(e, call_or_null->children[i]);
+            fputc('}', e->out);
         }
         fputs("})", e->out);
     }
@@ -949,14 +954,18 @@ static void emit_pipe(E *e, Node *n) {
             int arity = 0;
             int vtag = 0;
             if (find_variant(e, callee->name, callee->name_len, &arity, &vtag)) {
-                /* Variant constructor with piped first arg. */
-                fprintf(e->out, "kai_variant(%d, \"%.*s\", %d, (KaiValue *[]){",
+                /* Variant constructor with piped first arg. Stage 0
+                 * only emits boxed args, mask is always 0. */
+                fprintf(e->out, "kai_variant_u(%d, \"%.*s\", %d, 0, (KaiVarSlot[]){",
                         vtag, (int) callee->name_len, callee->name,
                         (int) rhs->n_children);
+                fputs("{.ptr = ", e->out);
                 emit_expr(e, lhs);
+                fputc('}', e->out);
                 for (size_t i = 1; i < rhs->n_children; ++i) {
-                    fputs(", ", e->out);
+                    fputs(", {.ptr = ", e->out);
                     emit_expr(e, rhs->children[i]);
+                    fputc('}', e->out);
                 }
                 fputs("})", e->out);
                 return;
