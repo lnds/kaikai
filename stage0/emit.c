@@ -27,7 +27,16 @@
 
 /* ---------- tables ---------- */
 
-typedef struct { const char *name; size_t len; int arity; } SymEntry;
+/* Atom-style global variant tag base — first user-variant tag.
+ * Tags 0..10 are reserved for builtin constructors per the convention
+ * pinned in docs/variant-tags.md. Stage 0 only knows about the four
+ * builtins it can emit (Some, None, Ok, Err); the Signal and ProcessExit
+ * constructors are runtime-only and never built by stage-0-emitted code,
+ * so they do not appear in the table here but they still consume tags
+ * 4 through 10 in the global numbering. */
+#define KAI_USER_VARIANT_TAG_BASE 11
+
+typedef struct { const char *name; size_t len; int arity; int tag; } SymEntry;
 
 typedef struct {
     const char *name;       /* capture name (borrowed from source) */
@@ -506,7 +515,7 @@ static int find_prelude(const char *name, size_t len, int *out_arity, const char
 /* ---------- user fns + variants tables ---------- */
 
 static void reg_entry(SymEntry **arr, size_t *n, size_t *cap,
-                      const char *name, size_t len, int arity) {
+                      const char *name, size_t len, int arity, int tag) {
     if (*n == *cap) {
         *cap = *cap ? *cap * 2 : 16;
         *arr = (SymEntry *) realloc(*arr, *cap * sizeof(SymEntry));
@@ -514,14 +523,17 @@ static void reg_entry(SymEntry **arr, size_t *n, size_t *cap,
     (*arr)[*n].name = name;
     (*arr)[*n].len  = len;
     (*arr)[*n].arity = arity;
+    (*arr)[*n].tag = tag;
     (*n)++;
 }
 
 static int find_entry(SymEntry *arr, size_t n,
-                      const char *name, size_t len, int *out_arity) {
+                      const char *name, size_t len,
+                      int *out_arity, int *out_tag) {
     for (size_t i = 0; i < n; ++i) {
         if (arr[i].len == len && memcmp(arr[i].name, name, len) == 0) {
             if (out_arity) *out_arity = arr[i].arity;
+            if (out_tag)   *out_tag   = arr[i].tag;
             return 1;
         }
     }
@@ -529,10 +541,11 @@ static int find_entry(SymEntry *arr, size_t n,
 }
 
 static int find_user_fn(E *e, const char *name, size_t len, int *out_arity) {
-    return find_entry(e->fns, e->n_fns, name, len, out_arity);
+    return find_entry(e->fns, e->n_fns, name, len, out_arity, NULL);
 }
-static int find_variant(E *e, const char *name, size_t len, int *out_arity) {
-    return find_entry(e->variants, e->n_variants, name, len, out_arity);
+static int find_variant(E *e, const char *name, size_t len,
+                        int *out_arity, int *out_tag) {
+    return find_entry(e->variants, e->n_variants, name, len, out_arity, out_tag);
 }
 
 /* ---------- identifier emission modes ---------- */
@@ -590,9 +603,12 @@ static void emit_ident_value(E *e, const char *name, size_t len) {
         fprintf(e->out, "kai_internal_dup(kai_%.*s)", (int) len, name);
         return;
     }
-    if (find_variant(e, name, len, &arity)) {
-        fprintf(e->out, "kai_variant(0, \"%.*s\", 0, NULL)", (int) len, name);
-        return;
+    {
+        int vtag = 0;
+        if (find_variant(e, name, len, &arity, &vtag)) {
+            fprintf(e->out, "kai_variant(%d, \"%.*s\", 0, NULL)", vtag, (int) len, name);
+            return;
+        }
     }
     if (find_prelude(name, len, &arity, &mapped)) {
         fprintf(e->out, "kai_closure(&_%s_thunk, %d, 0, NULL)", mapped, arity);
@@ -613,7 +629,7 @@ static int is_global_name(E *e, const char *name, size_t len) {
     const char *c;
     return find_prelude(name, len, &a, &c) ||
            find_user_fn(e, name, len, &a) ||
-           find_variant(e, name, len, &a);
+           find_variant(e, name, len, &a, NULL);
 }
 
 static int is_lambda_param(Node *lam, const char *name, size_t len) {
@@ -862,9 +878,13 @@ static void emit_args_with_prepend(E *e, Node *call, Node *prepended) {
 
 static void emit_variant_construction(E *e, const char *name, size_t name_len,
                                        Node *call_or_null) {
-    /* Emits kai_variant(0, "<Name>", n_args, <args array>). */
+    /* Emits kai_variant(<tag>, "<Name>", n_args, <args array>) where
+     * <tag> comes from the global variants table — builtins land in
+     * 0..10 and user variants in 11.. (see docs/variant-tags.md). */
     size_t n_args = call_or_null ? (call_or_null->n_children - 1) : 0;
-    fprintf(e->out, "kai_variant(0, \"%.*s\", %d, ", (int) name_len, name, (int) n_args);
+    int vtag = 0;
+    find_variant(e, name, name_len, NULL, &vtag);
+    fprintf(e->out, "kai_variant(%d, \"%.*s\", %d, ", vtag, (int) name_len, name, (int) n_args);
     if (n_args == 0) {
         fputs("NULL)", e->out);
     } else {
@@ -885,7 +905,7 @@ static void emit_call(E *e, Node *n) {
     Node *callee = n->children[0];
     if (callee && callee->kind == N_IDENT) {
         int arity = 0;
-        if (find_variant(e, callee->name, callee->name_len, &arity)) {
+        if (find_variant(e, callee->name, callee->name_len, &arity, NULL)) {
             emit_variant_construction(e, callee->name, callee->name_len, n);
             return;
         }
@@ -927,10 +947,11 @@ static void emit_pipe(E *e, Node *n) {
         Node *callee = rhs->children[0];
         if (callee && callee->kind == N_IDENT) {
             int arity = 0;
-            if (find_variant(e, callee->name, callee->name_len, &arity)) {
+            int vtag = 0;
+            if (find_variant(e, callee->name, callee->name_len, &arity, &vtag)) {
                 /* Variant constructor with piped first arg. */
-                fprintf(e->out, "kai_variant(0, \"%.*s\", %d, (KaiValue *[]){",
-                        (int) callee->name_len, callee->name,
+                fprintf(e->out, "kai_variant(%d, \"%.*s\", %d, (KaiValue *[]){",
+                        vtag, (int) callee->name_len, callee->name,
                         (int) rhs->n_children);
                 emit_expr(e, lhs);
                 for (size_t i = 1; i < rhs->n_children; ++i) {
@@ -1909,22 +1930,30 @@ static void register_top_level_fns(E *e, Node *prog) {
                 Node *p = d->children[j];
                 if (p && p->kind == N_PARAM) arity++;
             }
-            reg_entry(&e->fns, &e->n_fns, &e->cap_fns, d->name, d->name_len, arity);
+            reg_entry(&e->fns, &e->n_fns, &e->cap_fns, d->name, d->name_len, arity, 0);
         }
     }
 }
 
 static void register_builtin_variants(E *e) {
-    static const struct { const char *n; int a; } B[] = {
-        { "Some", 1 }, { "None", 0 }, { "Ok", 1 }, { "Err", 1 }
+    /* Tag assignment from docs/variant-tags.md. Stage 0 only emits
+     * code that constructs these four builtins; the remaining
+     * reserved tags (4..10 for Signal* / Exited / Signaled) are
+     * runtime-only and never reached from stage-0-emitted .c. */
+    static const struct { const char *n; int a; int t; } B[] = {
+        { "Some", 1, 0 },
+        { "None", 0, 1 },
+        { "Ok",   1, 2 },
+        { "Err",   1, 3 },
     };
     for (size_t i = 0; i < sizeof(B) / sizeof(B[0]); ++i) {
         reg_entry(&e->variants, &e->n_variants, &e->cap_variants,
-                  B[i].n, strlen(B[i].n), B[i].a);
+                  B[i].n, strlen(B[i].n), B[i].a, B[i].t);
     }
 }
 
 static void register_user_variants(E *e, Node *prog) {
+    int next_tag = KAI_USER_VARIANT_TAG_BASE;
     for (size_t i = 0; i < prog->n_children; ++i) {
         Node *d = prog->children[i];
         if (!d || d->kind != N_TYPE_DECL) continue;
@@ -1935,7 +1964,8 @@ static void register_user_variants(E *e, Node *prog) {
             Node *v = body->children[j];
             if (v && v->kind == N_VARIANT) {
                 reg_entry(&e->variants, &e->n_variants, &e->cap_variants,
-                          v->name, v->name_len, (int) v->n_children);
+                          v->name, v->name_len, (int) v->n_children, next_tag);
+                next_tag++;
             }
         }
     }
