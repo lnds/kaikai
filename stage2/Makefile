@@ -25,6 +25,32 @@ KAIC1   := ../stage1/kaic1
 TARGET  := kaic2
 SRC     := compiler.kai
 
+# Issue #677 Phase 1 — modularisation infrastructure.
+#
+# `BUNDLE_SRCS` is the explicit list of source modules that
+# `build/bundle.kai` concatenates for kaic1 to consume. The list is
+# explicit (no wildcards) so the cat order is deterministic — a wildcard
+# would silently break the build the day someone adds a module whose
+# alphabetical name lands before its dependencies.
+#
+# kaic1 parses `import` declarations (stage1/compiler.kai:2447
+# `parse_import_decl`) and produces `DImport` AST nodes, then ignores
+# them downstream — so inter-module imports inside the bundle compile
+# clean without strip. kaic2 (the downstream stage) resolves the same
+# imports via its `expand_imports` pipeline once the split lands.
+#
+# Phase 1a state: a single src/all.kai = compiler.kai. The bundle is
+# byte-identical to compiler.kai once awk-newline normalisation runs.
+# Phase 1b onward will split src/all.kai into per-section modules; the
+# only Makefile change per increment is appending the new module to
+# BUNDLE_SRCS in dependency order.
+#
+# Eventually (Phase 2/3 of #677) the source-of-truth flips: src/*.kai
+# becomes the authoritative input and compiler.kai becomes the
+# generated artifact. Until then, src/all.kai is the staging ground
+# and compiler.kai stays as the authoritative source.
+BUNDLE_SRCS := src/all.kai
+
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
 # effects.kai, array.kai without any --prelude flag at runtime.
@@ -50,8 +76,25 @@ $(KAIC1):
 build:
 	@mkdir -p build
 
-build/stage2.c: $(SRC) $(KAIC1) | build
-	$(STACK) $(KAIC1) $(SRC) > $@
+# Issue #677 Phase 1 — concat the per-module sources into a single
+# bundle that kaic1 consumes as one translation unit. `awk 1` ensures
+# every file ends with a newline before its successor starts, so a
+# missing final newline in module A cannot fuse a token across the
+# A→B boundary.
+#
+# No header preamble. Adding any line at the top would shift every
+# downstream line number and would cascade into kaikai's gensym names
+# (which encode `<line>_<col>`), producing a byte-shift in the
+# emitted C between the direct `kaic1 compiler.kai` path and the new
+# `kaic1 build/bundle.kai` path. Selfhost determinism still holds
+# (kaic2b.c == kaic2c.c) but the cross-path equivalence is worth
+# preserving so anyone comparing artifacts pre/post-modularisation
+# sees zero diff.
+build/bundle.kai: $(BUNDLE_SRCS) | build
+	@awk 1 $(BUNDLE_SRCS) > $@
+
+build/stage2.c: build/bundle.kai $(KAIC1) | build
+	$(STACK) $(KAIC1) build/bundle.kai > $@
 
 $(TARGET): build/stage2.c
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M)
