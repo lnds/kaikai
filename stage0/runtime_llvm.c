@@ -653,12 +653,76 @@ KaiValue *kaix_default_monitor_demonitor(void *self, KaiValue *ref, KaiCont *k) 
 extern void kai_main_install_defaults(void);
 extern void kai_main_teardown_defaults(void);
 
+/* Option C — protocol dispatch tables. The LLVM emitter generates the
+ * body of `_kai_proto_init_llvm` per program: it calls
+ * `kaix_register_one_impl` once per impl and
+ * `kaix_register_one_variant_head` once per variant. When the program
+ * declares no protocols the IR still defines the function as a
+ * no-op. */
+extern void _kai_proto_init_llvm(void);
+
+/* Variant-tag -> head-tag registration shim. The LLVM IR calls this
+ * once per variant entry; we accumulate in a heap array and rebind
+ * the runtime pointer + length each time. */
+static int32_t *_kaix_v2h_heap     = NULL;
+static int32_t  _kaix_v2h_capacity = 0;
+
+void kaix_register_one_variant_head(int32_t variant_tag, int32_t head_tag) {
+    if (variant_tag >= _kaix_v2h_capacity) {
+        int32_t newcap = _kaix_v2h_capacity == 0 ? 32 : _kaix_v2h_capacity * 2;
+        while (variant_tag >= newcap) newcap *= 2;
+        _kaix_v2h_heap = (int32_t *) realloc(_kaix_v2h_heap, (size_t) newcap * sizeof(int32_t));
+        for (int32_t i = _kaix_v2h_capacity; i < newcap; ++i) _kaix_v2h_heap[i] = 0;
+        _kaix_v2h_capacity = newcap;
+    }
+    _kaix_v2h_heap[variant_tag] = head_tag;
+    kai_register_variant_heads(_kaix_v2h_heap, _kaix_v2h_capacity);
+}
+
+/* Impl-table registration shim. The LLVM IR calls this once per impl
+ * with the resolved function pointer. Builds an in-place hashmap by
+ * accumulating + reinserting on each call. Cheap because each
+ * register call is O(1) amortised. */
+static KaiImplEntry *_kaix_impls_heap     = NULL;
+static int32_t       _kaix_impls_capacity = 0;
+static int32_t       _kaix_impls_count    = 0;
+
+void kaix_register_one_impl(int32_t proto_id, int32_t head_tag, void *fn) {
+    if (_kaix_impls_count >= _kaix_impls_capacity) {
+        int32_t newcap = _kaix_impls_capacity == 0 ? 32 : _kaix_impls_capacity * 2;
+        _kaix_impls_heap = (KaiImplEntry *) realloc(_kaix_impls_heap, (size_t) newcap * sizeof(KaiImplEntry));
+        _kaix_impls_capacity = newcap;
+    }
+    _kaix_impls_heap[_kaix_impls_count].proto_id = proto_id;
+    _kaix_impls_heap[_kaix_impls_count].head_tag = head_tag;
+    _kaix_impls_heap[_kaix_impls_count].fn       = fn;
+    _kaix_impls_count++;
+    kai_register_impls(_kaix_impls_heap, _kaix_impls_count);
+}
+
+/* Runtime helpers exposed to LLVM IR via @kaix_* — used by the
+ * runtime dispatch shim emitted for every `__proto_<op>` dispatcher. */
+int32_t kaix_head_tag(KaiValue *v) {
+    return kai_head_tag(v);
+}
+
+void *kaix_lookup_impl(int32_t proto_id, int32_t head_tag) {
+    return kai_lookup_impl(proto_id, head_tag);
+}
+
+void kaix_panic_no_impl(const char *proto, const char *op, int32_t head) {
+    fprintf(stderr, "panic: no impl of %s.%s for runtime head %d\n",
+            proto, op, (int) head);
+    exit(1);
+}
+
 /* Entry point: the LLVM output defines kai_main. Match what the C
    backend's emit_main_wrapper does. */
 extern KaiValue *kai_main(void);
 
 int main(int argc, char **argv) {
     kai_set_args(argc, argv);
+    _kai_proto_init_llvm();
     kai_main_install_defaults();
     KaiValue *result = kai_main();
     kai_main_teardown_defaults();
