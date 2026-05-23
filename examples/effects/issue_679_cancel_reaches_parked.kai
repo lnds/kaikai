@@ -1,0 +1,48 @@
+# Issue #679 fixture — Spawn.cancel(target) reaches a fiber parked
+# on the reactor.
+#
+# Pre-fix: `kai_default_spawn_cancel` only set `cancel_requested`
+# on the target; it did NOT detach the target from its reactor
+# waiter list. A fiber parked in `time.sleep` (timer waiter),
+# `NetTcp.accept` (socket read waiter), `Stdin.read_line` (stdin
+# waiter), `Signal.await` (signal waiter), etc. stayed parked
+# until the underlying event arrived (next deadline, next
+# connection, next signal). The cancel flag was observed only at
+# the next op-call boundary — which the parked fiber never
+# reached. Symptom: graceful shutdown patterns (cancel a
+# server-loop fiber from a SIGINT-driven sibling) silently hung.
+#
+# Fix: `kai_default_spawn_cancel` now detaches the target from
+# whichever reactor list it sits on and unparks it.
+# `kai_sched_park` runs `kai_check_cancel_yield_point` on resume,
+# so the longjmp to `cancel_pad` fires before the syscall retry
+# loop at the park site does another EAGAIN round.
+# `kai_default_spawn_await` accepts state CANCELLED (not just
+# DONE) so the awaiter side of the nursery does not panic.
+#
+# This fixture uses `time.sleep` instead of `NetTcp.accept` so it
+# does not depend on the network stack. The bug shape is the same:
+# a fiber parked on the reactor with no external event ever
+# arriving in a reasonable time.
+
+import time
+import spawn
+
+fn sleeper() : Unit / Clock + Cancel =
+  time.sleep(time.seconds(60))   # would block for a minute without cancel
+
+fn canceller(target: Fiber[Unit]) : Unit / Clock + Spawn + Cancel = {
+  time.sleep(time.millis(100))
+  Spawn.cancel(target)
+}
+
+fn main() : Int / Spawn + Clock + Cancel + Stdout = {
+  Stdout.print("nursery start")
+  nursery { n ->
+    let server = n.spawn(sleeper)
+    let _      = n.spawn(() => canceller(server))
+    n.await(server)
+  }
+  Stdout.print("nursery end")
+  0
+}
