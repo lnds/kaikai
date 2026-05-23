@@ -3231,7 +3231,15 @@ fn join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 # lists of sum-variant pairs.
 
 type EFn  = EFn(String, Int)
-type EVar = EV(String, Int)
+# EVar carries name, arity, and the atom-style global variant tag.
+# Tags 0..10 are reserved for builtins per docs/variant-tags.md; user
+# variants start at 11 (KAI_USER_VARIANT_TAG_BASE in stage 0) and
+# increment in declaration order. The tag is emitted into every
+# kai_variant / kai_variant_u call; the matcher still goes through
+# strcmp on the variant name today, so an out-of-convention tag
+# degrades the runtime nullary/immortal cache hit-rate but does not
+# affect correctness.
+type EVar = EV(String, Int, Int)
 
 fn efn_find(fns: [EFn], target: String) : Option[Int] {
   match fns {
@@ -3246,7 +3254,16 @@ fn evar_find(vs: [EVar], target: String) : Option[Int] {
   match vs {
     [] -> None
     [h, ...rest] -> match h {
-      EV(n, ar) -> if n == target { Some(ar) } else { evar_find(rest, target) }
+      EV(n, ar, _) -> if n == target { Some(ar) } else { evar_find(rest, target) }
+    }
+  }
+}
+
+fn evar_find_tag(vs: [EVar], target: String) : Int {
+  match vs {
+    [] -> 0
+    [h, ...rest] -> match h {
+      EV(n, _, t) -> if n == target { t } else { evar_find_tag(rest, target) }
     }
   }
 }
@@ -3268,33 +3285,48 @@ fn register_fn_decls(decls: [Decl]) : [EFn] {
   }
 }
 
+# Builtin tags per docs/variant-tags.md. Sig*/Exited/Signaled live at
+# tags 4..10 in the global numbering; stage 1 does not have AST-level
+# constructors for them (they are built by the C runtime directly via
+# stage0/runtime.h), so they do not appear in this list — but the
+# reserved slots stay claimed and user-variant assignment skips them.
 fn builtin_variants() : [EVar] =
-  [EV("Some", 1), EV("None", 0), EV("Ok", 1), EV("Err", 1)]
+  [EV("Some", 1, 0), EV("None", 0, 1), EV("Ok", 1, 2), EV("Err", 1, 3)]
 
-fn collect_user_variants_loop(ds: [Decl], acc: [EVar]) : [EVar] {
+# First tag handed out to a user-declared variant. Mirrors the
+# KAI_USER_VARIANT_TAG_BASE constant in stage0/emit.c.
+fn user_variant_tag_base() : Int = 11
+
+fn collect_user_variants_loop(ds: [Decl], next_tag: Int, acc: [EVar]) : [EVar] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
       DType(_, _, _, body, _, _) -> match body {
-        TBSum(vs) -> collect_user_variants_loop(rest, vs_to_evars(vs, acc))
-        _ -> collect_user_variants_loop(rest, acc)
+        TBSum(vs) -> {
+          let n_new = list_length(vs)
+          collect_user_variants_loop(rest, next_tag + n_new, vs_to_evars(vs, next_tag, acc))
+        }
+        _ -> collect_user_variants_loop(rest, next_tag, acc)
       }
-      _ -> collect_user_variants_loop(rest, acc)
+      _ -> collect_user_variants_loop(rest, next_tag, acc)
     }
   }
 }
 
-fn vs_to_evars(vs: [Variant], acc: [EVar]) : [EVar] {
+# Acc accumulates with prepend (head-cons), so to preserve the
+# declaration-order tag assignment we still pre-pend each EV but feed
+# it the correct tag value `next_tag + i` for its index in `vs`.
+fn vs_to_evars(vs: [Variant], next_tag: Int, acc: [EVar]) : [EVar] {
   match vs {
     [] -> acc
     [v, ...rest] -> match v {
-      Var(n, tys) -> vs_to_evars(rest, [EV(n, list_length(tys)), ...acc])
+      Var(n, tys) -> vs_to_evars(rest, next_tag + 1, [EV(n, list_length(tys), next_tag), ...acc])
     }
   }
 }
 
 fn register_variants(decls: [Decl]) : [EVar] =
-  collect_user_variants_loop(decls, builtin_variants())
+  collect_user_variants_loop(decls, user_variant_tag_base(), builtin_variants())
 
 # ---- prelude mapping for emission ----
 #
@@ -3408,7 +3440,10 @@ fn emit_ident_callee(name: String) : String {
 fn emit_ident_value(name: String, fns: [EFn], variants: [EVar], locals: [String]) : String {
   if list_has(locals, name) { cat2("kai_", name) }
   else { match evar_find(variants, name) {
-    Some(_) -> cat3("kai_variant(0, \"", name, "\", 0, NULL)")
+    Some(_) -> concat_all([
+      "kai_variant(", int_to_string(evar_find_tag(variants, name)),
+      ", \"", name, "\", 0, NULL)"
+    ])
     None -> match prelude_find(name) {
       Some(ep) -> match ep {
         EP(_, cname, ar) ->
@@ -3456,12 +3491,13 @@ fn unop_cname(op: String) : Option[String] {
 fn emit_call_args(src: String, args_e: [Expr], fns: [EFn], variants: [EVar], lams: [LamInfo], locals: [String]) : String =
   join_with(map(args_e, (a) => emit_expr(src, a, fns, variants, lams, locals)), ", ")
 
-fn emit_variant_call(name: String, n_args: Int, arg_out: String) : String {
+fn emit_variant_call(name: String, n_args: Int, arg_out: String, variants: [EVar]) : String {
+  let tag_str = int_to_string(evar_find_tag(variants, name))
   if n_args == 0 {
-    cat3("kai_variant(0, \"", name, "\", 0, NULL)")
+    concat_all(["kai_variant(", tag_str, ", \"", name, "\", 0, NULL)"])
   } else {
     concat_all([
-      "kai_variant(0, \"", name, "\", ", int_to_string(n_args),
+      "kai_variant(", tag_str, ", \"", name, "\", ", int_to_string(n_args),
       ", (KaiValue *[]){", arg_out, "})"
     ])
   }
@@ -3481,7 +3517,7 @@ fn emit_named_call_lookup(callee: String, args_e: [Expr], call_args: String, fns
       ", (KaiValue *[]){", call_args, "})"
     ])
   } else { match evar_find(variants, callee) {
-    Some(_) -> emit_variant_call(callee, list_length(args_e), call_args)
+    Some(_) -> emit_variant_call(callee, list_length(args_e), call_args, variants)
     None -> match prelude_find(callee) {
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
@@ -3509,7 +3545,7 @@ fn emit_pipe_named_lookup(callee: String, arity: Int, args_all: String, fns: [EF
       ", (KaiValue *[]){", args_all, "})"
     ])
   } else { match evar_find(variants, callee) {
-    Some(_) -> emit_variant_call(callee, arity, args_all)
+    Some(_) -> emit_variant_call(callee, arity, args_all, variants)
     None -> match prelude_find(callee) {
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
@@ -4425,7 +4461,7 @@ fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect {
 # Globals: prelude names + user fn names + variant ctor names. Used as a
 # cheap "this ident does not need to be captured" test.
 fn efn_name(e: EFn) : String = match e { EFn(n, _) -> n }
-fn evar_name(v: EVar) : String = match v { EV(n, _) -> n }
+fn evar_name(v: EVar) : String = match v { EV(n, _, _) -> n }
 
 fn build_globals(fns: [EFn], variants: [EVar]) : [String] {
   let p = prelude_names()

@@ -11586,7 +11586,18 @@ type EFn  = EFn(String, Int, Option[String], Option[UFnSig])
 # parsed `[TypeExpr]` of the constructor's args so the emitter can
 # decide which slots to inline-unbox (Int / Real). Empty list means
 # nullary or unknown — both paths emit the legacy boxed shape.
-type EVar = EV(String, Int, [TypeExpr])
+#
+# Atom-style global variant tag (issue #688, docs/variant-tags.md):
+# the last slot carries the variant_tag emitted into every
+# kai_variant / kai_variant_u call. Tags 0..10 are reserved for
+# builtins per the convention; user variants start at
+# `user_variant_tag_base() == 11` and increment in declaration order.
+# Today the matcher still routes through strcmp on the variant name,
+# so an out-of-convention tag degrades the runtime nullary/immortal
+# cache hit-rate but does not affect correctness; a follow-up lane
+# flips consumers to `variant_tag == N` once stage 0 / 1 / 2 and the
+# runtime agree on the table.
+type EVar = EV(String, Int, [TypeExpr], Int)
 
 fn efn_find(fns: [EFn], target: String) : Option[EFn] {
   match fns {
@@ -11717,7 +11728,7 @@ fn evar_find(vs: [EVar], target: String) : Option[Int] {
   match vs {
     [] -> None
     [h, ...rest] -> match h {
-      EV(n, ar, _) -> if n == target { Some(ar) } else { evar_find(rest, target) }
+      EV(n, ar, _, _) -> if n == target { Some(ar) } else { evar_find(rest, target) }
     }
   }
 }
@@ -11729,7 +11740,24 @@ fn evar_payload_tys(vs: [EVar], target: String) : Option[[TypeExpr]] {
   match vs {
     [] -> None
     [h, ...rest] -> match h {
-      EV(n, _, tys) -> if n == target { Some(tys) } else { evar_payload_tys(rest, target) }
+      EV(n, _, tys, _) -> if n == target { Some(tys) } else { evar_payload_tys(rest, target) }
+    }
+  }
+}
+
+# Atom-style global variant tag lookup. Returns the reserved-range
+# tag for builtins (0..10 per docs/variant-tags.md) or the user-range
+# tag (>= 11) assigned in declaration order. Falls back to 0 for
+# unknown names (call sites guard with evar_find first; the fallback
+# only matters for synthetic emit paths that legitimately stringify
+# a non-variant identifier into a kai_variant call shape — none
+# survives in the current sources but the safe default avoids
+# crashing the emitter if one regresses in).
+fn evar_find_tag(vs: [EVar], target: String) : Int {
+  match vs {
+    [] -> 0
+    [h, ...rest] -> match h {
+      EV(n, _, _, t) -> if n == target { t } else { evar_find_tag(rest, target) }
     }
   }
 }
@@ -12503,32 +12531,47 @@ fn builtin_variants() : [EVar] =
   # back to the legacy boxed constructor path. Some/Ok/Err wrap an
   # arbitrary boxed value; unboxing them would require a per-call-site
   # type read which is not in scope for this lane.
-  [EV("Some", 1, []), EV("None", 0, []), EV("Ok", 1, []), EV("Err", 1, [])]
+  #
+  # Tag assignment per docs/variant-tags.md. Stage 2, like stage 1,
+  # only registers the four constructors it can directly emit; tags
+  # 4..10 are reserved for Sig*/Exited/Signaled which the C runtime
+  # constructs directly and never reach this table.
+  [EV("Some", 1, [], 0), EV("None", 0, [], 1), EV("Ok", 1, [], 2), EV("Err", 1, [], 3)]
 
-fn collect_user_variants_loop(ds: [Decl], acc: [EVar]) : [EVar] {
+# First tag assigned to a user-declared variant. Mirrors
+# KAI_USER_VARIANT_TAG_BASE in stage0/emit.c and
+# user_variant_tag_base() in stage1/compiler.kai.
+fn user_variant_tag_base() : Int = 11
+
+fn collect_user_variants_loop(ds: [Decl], next_tag: Int, acc: [EVar]) : [EVar] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
       DType(_, _, _, body, _, _, _) -> match body {
-        TBSum(vs) -> collect_user_variants_loop(rest, vs_to_evars(vs, acc))
-        _ -> collect_user_variants_loop(rest, acc)
+        TBSum(vs) -> {
+          let n_new = list_length(vs)
+          collect_user_variants_loop(rest, next_tag + n_new, vs_to_evars(vs, next_tag, acc))
+        }
+        _ -> collect_user_variants_loop(rest, next_tag, acc)
       }
-      _ -> collect_user_variants_loop(rest, acc)
+      _ -> collect_user_variants_loop(rest, next_tag, acc)
     }
   }
 }
 
-fn vs_to_evars(vs: [Variant], acc: [EVar]) : [EVar] {
+# Acc accumulates with head-cons; we still pre-pend each EV but feed
+# it the correct tag value `next_tag + i` for its index in `vs`.
+fn vs_to_evars(vs: [Variant], next_tag: Int, acc: [EVar]) : [EVar] {
   match vs {
     [] -> acc
     [v, ...rest] -> match v {
-      Var(n, tys) -> vs_to_evars(rest, [EV(n, list_length(tys), tys), ...acc])
+      Var(n, tys) -> vs_to_evars(rest, next_tag + 1, [EV(n, list_length(tys), tys, next_tag), ...acc])
     }
   }
 }
 
 fn register_variants(decls: [Decl]) : [EVar] =
-  collect_user_variants_loop(decls, builtin_variants())
+  collect_user_variants_loop(decls, user_variant_tag_base(), builtin_variants())
 
 # ---- prelude mapping for emission ----
 #
@@ -12703,7 +12746,10 @@ fn emit_ident_callee(name: String) : String {
 fn emit_ident_value(name: String, lcs: [String], fns: [EFn], variants: [EVar]) : String {
   if list_has(lcs, name) { cat2("kai_", name) }
   else { match evar_find(variants, name) {
-    Some(_) -> cat3("kai_variant(0, \"", name, "\", 0, NULL)")
+    Some(_) -> concat_all([
+      "kai_variant(", int_to_string(evar_find_tag(variants, name)),
+      ", \"", name, "\", 0, NULL)"
+    ])
     None -> match prelude_find(name) {
       Some(ep) -> match ep {
         EP(_, cname, ar) ->
@@ -12811,12 +12857,13 @@ fn emit_op_arg_pass_list(args_e: [Expr], i: Int) : String {
   }
 }
 
-fn emit_variant_call(name: String, n_args: Int, arg_out: String) : String {
+fn emit_variant_call(name: String, n_args: Int, arg_out: String, variants: [EVar]) : String {
+  let tag_str = int_to_string(evar_find_tag(variants, name))
   if n_args == 0 {
-    cat3("kai_variant(0, \"", name, "\", 0, NULL)")
+    concat_all(["kai_variant(", tag_str, ", \"", name, "\", 0, NULL)"])
   } else {
     concat_all([
-      "kai_variant(0, \"", name, "\", ", int_to_string(n_args),
+      "kai_variant(", tag_str, ", \"", name, "\", ", int_to_string(n_args),
       ", (KaiValue *[]){", arg_out, "})"
     ])
   }
@@ -12938,8 +12985,9 @@ fn emit_variant_call_typed(name: String, args_e: [Expr], tys: [TypeExpr],
     let n = list_length(args_e)
     let mask = variant_slot_mask(tys)
     let slot_inits = emit_variant_slot_init_list(src, args_e, tys, lcs, fns, variants, lams, cls)
+    let tag_str = int_to_string(evar_find_tag(variants, name))
     Some(concat_all([
-      "kai_variant_u(0, \"", name, "\", ", int_to_string(n),
+      "kai_variant_u(", tag_str, ", \"", name, "\", ", int_to_string(n),
       ", ", int_to_string(mask),
       ", (KaiVarSlot[]){", slot_inits, "})"
     ]))
@@ -13160,8 +13208,9 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], lcs: [String], f
                     Some(ts) -> {
                       let mask = variant_slot_mask(ts)
                       let slot_inits = emit_variant_slot_init_list(src, cargs, ts, lcs, fns, variants, lams, cls)
+                      let tag_str = int_to_string(evar_find_tag(variants, cname))
                       concat_all([
-                        "kai_variant_u(0, \"", cname, "\", ", int_to_string(n),
+                        "kai_variant_u(", tag_str, ", \"", cname, "\", ", int_to_string(n),
                         ", ", int_to_string(mask),
                         ", (KaiVarSlot[]){", slot_inits, "})"
                       ])
@@ -13424,9 +13473,9 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], lcs: [String], f
       Some(_) -> match evar_payload_tys(variants, fname) {
         Some(tys) -> match emit_variant_call_typed(fname, args_e, tys, src, lcs, fns, variants, lams, cls) {
           Some(s) -> s
-          None    -> emit_variant_call(fname, list_length(args_e), call_args)
+          None    -> emit_variant_call(fname, list_length(args_e), call_args, variants)
         }
-        None -> emit_variant_call(fname, list_length(args_e), call_args)
+        None -> emit_variant_call(fname, list_length(args_e), call_args, variants)
       }
       None    -> cat5("kai_", c_sym(fname, Some(mod)), "(", call_args, ")")
     }
@@ -13469,7 +13518,7 @@ fn emit_pipe_named_lookup(callee: String, arity: Int, args_all: String, lcs: [St
       ", (KaiValue *[]){", args_all, "})"
     ])
   } else { match evar_find(variants, callee) {
-    Some(_) -> emit_variant_call(callee, arity, args_all)
+    Some(_) -> emit_variant_call(callee, arity, args_all, variants)
     None -> match prelude_find(callee) {
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
@@ -13502,7 +13551,7 @@ fn emit_named_call_lookup(callee: String, args_e: [Expr], call_args: String, lcs
     # legacy boxed shape so its callers (currently only pipe LHS
     # plumbing) still produce buildable C without the typer
     # context. The pipe LHS path remains a Phase 2-followup site.
-    Some(_) -> emit_variant_call(callee, list_length(args_e), call_args)
+    Some(_) -> emit_variant_call(callee, list_length(args_e), call_args, variants)
     None -> match prelude_find(callee) {
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
@@ -15547,7 +15596,7 @@ fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect / Console {
 # Globals: prelude names + user fn names + variant ctor names. Used as a
 # cheap "this ident does not need to be captured" test.
 fn efn_name(e: EFn) : String = match e { EFn(n, _, _, _) -> n }
-fn evar_name(v: EVar) : String = match v { EV(n, _, _) -> n }
+fn evar_name(v: EVar) : String = match v { EV(n, _, _, _) -> n }
 
 fn build_globals(fns: [EFn], variants: [EVar], eff_names: [String], op_quals: [String]) : [String] {
   let p = prelude_names()
@@ -16534,7 +16583,7 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
     # them as a kai_cons spine of nullary constructors. Each variant
     # was validated as nullary at typing time, so emit_variant_call
     # with arity 0 / empty arg array is correct.
-    EVariantsOf(_, names) -> emit_variants_of_list(names)
+    EVariantsOf(_, names) -> emit_variants_of_list(names, variants)
     # m6.2 Phase 3 / v2: qualified call as an expression value
     # (callee of an ECall is handled in emit_call_expr; this branch
     # covers `let f = list.map`-style first-class references). Mint
@@ -16547,7 +16596,7 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
     # value-position constraint).
     EModCall(mod, fname) -> match evar_find(variants, fname) {
       Some(ar) -> if ar == 0 {
-        emit_variant_call(fname, 0, "")
+        emit_variant_call(fname, 0, "", variants)
       } else {
         cat3("kai_unit() /* non-nullary ctor as value not supported: ", string_concat(mod, string_concat(".", fname)), " */")
       }
@@ -16569,12 +16618,13 @@ fn emit_expr_boxed(src: String, x: Expr, lcs: [String], fns: [EFn], variants: [E
 # constructors. Mirrors emit_list_tail's cons-spine shape; uses the
 # same kai_variant signature emit_ident_value uses for a bare
 # nullary constructor reference.
-fn emit_variants_of_list(names: [String]) : String {
+fn emit_variants_of_list(names: [String], variants: [EVar]) : String {
   match names {
     [] -> "kai_nil()"
     [n, ...rest] -> concat_all([
-      "kai_cons(kai_variant(0, \"", n, "\", 0, NULL), ",
-      emit_variants_of_list(rest), ")"
+      "kai_cons(kai_variant(", int_to_string(evar_find_tag(variants, n)),
+      ", \"", n, "\", 0, NULL), ",
+      emit_variants_of_list(rest, variants), ")"
     ])
   }
 }
