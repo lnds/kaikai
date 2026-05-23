@@ -3444,8 +3444,8 @@ fn emit_ident_value(name: String, fns: [EFn], variants: [EVar], locals: [String]
   if list_has(locals, name) { cat2("kai_", name) }
   else { match evar_find(variants, name) {
     Some(_) -> concat_all([
-      "kai_variant(", int_to_string(evar_find_tag(variants, name)),
-      ", \"", name, "\", 0, NULL)"
+      "kai_variant_u(", int_to_string(evar_find_tag(variants, name)),
+      ", \"", name, "\", 0, 0, NULL)"
     ])
     None -> match prelude_find(name) {
       Some(ep) -> match ep {
@@ -3494,14 +3494,28 @@ fn unop_cname(op: String) : Option[String] {
 fn emit_call_args(src: String, args_e: [Expr], fns: [EFn], variants: [EVar], lams: [LamInfo], locals: [String]) : String =
   join_with(map(args_e, (a) => emit_expr(src, a, fns, variants, lams, locals)), ", ")
 
-fn emit_variant_call(name: String, n_args: Int, arg_out: String, variants: [EVar]) : String {
+# Build the `{.ptr = X0}, {.ptr = X1}, ...` slot-list string from a
+# list of arg expressions. Stage 1 only emits boxed-args variants
+# (no Phase 2 typed payload), so every slot is a pointer.
+fn emit_call_args_slots(src: String, args_e: [Expr], fns: [EFn], variants: [EVar], lams: [LamInfo], locals: [String]) : String =
+  join_with(map(args_e, (a) => string_concat("{.ptr = ", string_concat(emit_expr(src, a, fns, variants, lams, locals), "}"))), ", ")
+
+# Wrap an already-rendered argument expression `arg_str` as a single
+# slot literal. Used by pipe lowering where the LHS expression is
+# rendered separately before the rest of the args.
+fn arg_str_as_slot(arg_str: String) : String =
+  string_concat("{.ptr = ", string_concat(arg_str, "}"))
+
+# Emit a variant constructor call from a pre-rendered slot list.
+# `slot_out` must already be the `{.ptr=X0}, {.ptr=X1}, ...` form.
+fn emit_variant_call(name: String, n_args: Int, slot_out: String, variants: [EVar]) : String {
   let tag_str = int_to_string(evar_find_tag(variants, name))
   if n_args == 0 {
-    concat_all(["kai_variant(", tag_str, ", \"", name, "\", 0, NULL)"])
+    concat_all(["kai_variant_u(", tag_str, ", \"", name, "\", 0, 0, NULL)"])
   } else {
     concat_all([
-      "kai_variant(", tag_str, ", \"", name, "\", ", int_to_string(n_args),
-      ", (KaiValue *[]){", arg_out, "})"
+      "kai_variant_u(", tag_str, ", \"", name, "\", ", int_to_string(n_args),
+      ", 0, (KaiVarSlot[]){", slot_out, "})"
     ])
   }
 }
@@ -3513,14 +3527,16 @@ fn emit_variant_call(name: String, n_args: Int, arg_out: String, variants: [EVar
 # it as a local read, so emit `kai_apply(kai_drop, ...)` over the
 # local C variable rather than letting prelude_find / efn_find pick
 # the global. Mirrors stage2's emit_named_call_lookup (m14 v1.x).
-fn emit_named_call_lookup(callee: String, args_e: [Expr], call_args: String, fns: [EFn], variants: [EVar], locals: [String]) : String =
+fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args: String, fns: [EFn], variants: [EVar], lams: [LamInfo], locals: [String]) : String =
   if list_has(locals, callee) {
     concat_all([
       "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e)),
       ", (KaiValue *[]){", call_args, "})"
     ])
   } else { match evar_find(variants, callee) {
-    Some(_) -> emit_variant_call(callee, list_length(args_e), call_args, variants)
+    Some(_) -> emit_variant_call(callee, list_length(args_e),
+                                 emit_call_args_slots(src, args_e, fns, variants, lams, locals),
+                                 variants)
     None -> match prelude_find(callee) {
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
@@ -3541,14 +3557,19 @@ fn emit_named_call_lookup(callee: String, args_e: [Expr], call_args: String, fns
 # `locals` makes a local closure shadow a same-named top-level fn —
 # user wrote `let take = ...; xs |> take(1)` and the local must win.
 # Mirrors stage2's emit_pipe_named_lookup (m14 v1.x).
-fn emit_pipe_named_lookup(callee: String, arity: Int, args_all: String, fns: [EFn], variants: [EVar], locals: [String]) : String =
+fn emit_pipe_named_lookup(src: String, callee: String, arity: Int, lhs_c: String, args_e: [Expr], args_all: String, fns: [EFn], variants: [EVar], lams: [LamInfo], locals: [String]) : String =
   if list_has(locals, callee) {
     concat_all([
       "kai_apply(kai_", callee, ", ", int_to_string(arity),
       ", (KaiValue *[]){", args_all, "})"
     ])
   } else { match evar_find(variants, callee) {
-    Some(_) -> emit_variant_call(callee, arity, args_all, variants)
+    Some(_) -> {
+      let rest_slots = emit_call_args_slots(src, args_e, fns, variants, lams, locals)
+      let lhs_slot = arg_str_as_slot(lhs_c)
+      let slots_all = if list_length(args_e) == 0 { lhs_slot } else { cat3(lhs_slot, ", ", rest_slots) }
+      emit_variant_call(callee, arity, slots_all, variants)
+    }
     None -> match prelude_find(callee) {
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
@@ -3597,7 +3618,7 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
           _   -> "kai_unit() /* __perceus_drop: arity mismatch */"
         }
       } else {
-        emit_named_call_lookup(callee, args_e, call_args, fns, variants, locals)
+        emit_named_call_lookup(src, callee, args_e, call_args, fns, variants, lams, locals)
       }
     }
     _ -> {
@@ -3617,7 +3638,7 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar
       EVar(callee) -> {
         let rest_args = emit_call_args(src, args_e, fns, variants, lams, locals)
         let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-        emit_pipe_named_lookup(callee, list_length(args_e) + 1, args_all, fns, variants, locals)
+        emit_pipe_named_lookup(src, callee, list_length(args_e) + 1, lhs_c, args_e, args_all, fns, variants, lams, locals)
       }
       _ -> {
         let fc = emit_expr(src, f, fns, variants, lams, locals)
@@ -3629,7 +3650,7 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar
         ])
       }
     }
-    EVar(callee) -> emit_pipe_named_lookup(callee, 1, lhs_c, fns, variants, locals)
+    EVar(callee) -> emit_pipe_named_lookup(src, callee, 1, lhs_c, [], lhs_c, fns, variants, lams, locals)
     _ -> concat_all([
       "kai_apply(", emit_expr(src, rhs, fns, variants, lams, locals),
       ", 1, (KaiValue *[]){", lhs_c, "})"

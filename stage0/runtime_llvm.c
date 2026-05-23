@@ -189,7 +189,22 @@ KaiValue *kaix_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)    { (void)
 
 /* ---------- M3d: variants + match ---------- */
 KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args) {
-    return kai_variant(tag, name, n, args);
+    /* LLVM backend still passes args as KaiValue **; bridge to the
+     * slot-mask shape by stamping each as a pointer slot. mask==0
+     * means "all slots boxed", which is what the legacy boxed path
+     * always emitted. */
+    if (n <= 0) return kai_variant_u(tag, name, 0, 0, NULL);
+    KaiVarSlot stack_slots[16];
+    KaiVarSlot *slots = stack_slots;
+    KaiVarSlot *heap = NULL;
+    if (n > (int)(sizeof(stack_slots) / sizeof(stack_slots[0]))) {
+        heap = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+        slots = heap;
+    }
+    for (int i = 0; i < n; i++) slots[i].ptr = args[i];
+    KaiValue *r = kai_variant_u(tag, name, n, 0, slots);
+    if (heap) free(heap);
+    return r;
 }
 
 /* 1 iff `v` is a KAI_VARIANT whose tag name matches `name`. Used as
@@ -257,7 +272,21 @@ KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n,
 }
 KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag,
                                       const char *name, int n, KaiValue **args) {
-  return kai_reuse_or_alloc_variant(scr, tag, name, n, args);
+  /* Same bridge as kaix_variant: LLVM's emit path still hands us
+   * KaiValue ** for boxed args. Stamp into the slot-mask shape with
+   * mask==0 and forward to the unified entry point. */
+  if (n <= 0) return kai_reuse_or_alloc_variant(scr, tag, name, 0, 0, NULL);
+  KaiVarSlot stack_slots[16];
+  KaiVarSlot *slots = stack_slots;
+  KaiVarSlot *heap = NULL;
+  if (n > (int)(sizeof(stack_slots) / sizeof(stack_slots[0]))) {
+    heap = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+    slots = heap;
+  }
+  for (int i = 0; i < n; i++) slots[i].ptr = args[i];
+  KaiValue *r = kai_reuse_or_alloc_variant(scr, tag, name, n, 0, slots);
+  if (heap) free(heap);
+  return r;
 }
 
 /* Used by lambda thunks to read their captured values from the
