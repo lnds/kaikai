@@ -43050,6 +43050,23 @@ fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
     let new_tuples = discover_new_tuples_decl(spec1, insts, polys, all_tuples, sm)
     let updated_tuples = list_append(all_tuples, new_tuples)
     let spec2 = rewrite_callsites_decl_sm(spec1, insts, updated_tuples, polys, sm)
+    # Issue #680: self-recursive calls inside a spec body must retarget
+    # to the spec's own mangled name. Without this step the spec body
+    # keeps `ECall(EVar(orig_name), ...)` pointing at the polymorphic
+    # original — and that means TCO never fires on the spec (the goto
+    # loop lives in the poly), causing every recursion to bounce
+    # main → spec(1 iter) → poly(TCO loop). Post-#599 the RC
+    # convention across that boundary mismatches and a `step(s, ev)`
+    # closure call double-decrefs `s` on the third iteration.
+    # The walker is sound here because, after `subst_decl`, every
+    # `EVar(orig_name)` in the spec body refers to the spec being
+    # emitted — the formals are monomorphic and there is no other
+    # instance the original name could mean. Function-as-value
+    # uses (bare `EVar(orig_name)` outside an `ECall`) are left
+    # alone, preserving the polymorphic dispatch surface.
+    let orig_name = match d { DFn(_, n, _, _, _, _, _, _, _, _) -> n  _ -> "" }
+    let mangled = mangle_name(orig_name, tys, units)
+    let spec3 = retarget_self_calls_decl(spec2, orig_name, mangled)
     # m4c Phase 3 invariant: count any TyVarT/UVar in the spec body
     # whose id is in `sm`'s domain (i.e., should have been replaced
     # by `subst_decl`). Out-of-domain ids belong to unrelated free
@@ -43057,7 +43074,7 @@ fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
     # location go into the diag report at compile_source level.
     let atv = subst_map_tvar_ids(sm)
     let auv = subst_map_uvar_ids(sm)
-    let leaks = match spec2 {
+    let leaks = match spec3 {
       DFn(_, sname, _, _, _, _, sbody, _, _, _) ->
         match first_spec_leak(sbody, atv, auv) {
           Some(loc) -> [MLeakRec(sname, count_spec_leaks(sbody, atv, auv), Some(loc))]
@@ -43065,8 +43082,55 @@ fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
         }
       _ -> []
     }
-    SEO(spec2, new_tuples, leaks)
+    SEO(spec3, new_tuples, leaks)
   } }
+}
+
+# Issue #680: retarget self-recursive `ECall(EVar(orig_name), args)`
+# inside a spec body to the spec's mangled name. Leaves bare
+# `EVar(orig_name)` (function-as-value) untouched — the polymorphic
+# dispatch surface stays for partial application / higher-order use.
+fn retarget_self_calls_decl(d: Decl, orig_name: String, mangled: String) : Decl {
+  if orig_name == mangled { d }
+  else if string_length(orig_name) == 0 { d }
+  else {
+    match d {
+      DFn(p, n, tp, ps, rt, row, body, ln, cl, mo) ->
+        DFn(p, n, tp, ps, rt, row,
+            retarget_self_calls_expr(body, orig_name, mangled),
+            ln, cl, mo)
+      _ -> d
+    }
+  }
+}
+
+fn retarget_self_calls_expr(e: Expr, orig_name: String, mangled: String) : Expr =
+  Expr { kind: retarget_self_calls_kind(e.kind, orig_name, mangled),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn retarget_self_calls_kind(k: ExprKind, orig_name: String, mangled: String) : ExprKind {
+  match k {
+    ECall(callee, args_) -> match callee.kind {
+      # The single rewrite the walker performs: `f(args)` where f is
+      # the bare original name becomes `mangled(args)`. Args still
+      # recurse so nested self-calls inside arg expressions also get
+      # retargeted.
+      EVar(name) ->
+        if name == orig_name {
+          let new_callee = Expr { kind: EVar(mangled),
+                                   line: callee.line, col: callee.col,
+                                   ty: callee.ty, mode: callee.mode }
+          let new_args = map(args_, (a) => retarget_self_calls_expr(a, orig_name, mangled))
+          ECall(new_callee, new_args)
+        } else {
+          ECall(callee,
+                map(args_, (a) => retarget_self_calls_expr(a, orig_name, mangled)))
+        }
+      _ -> ECall(retarget_self_calls_expr(callee, orig_name, mangled),
+                  map(args_, (a) => retarget_self_calls_expr(a, orig_name, mangled)))
+    }
+    _ -> map_expr_kind(k, (sub) => retarget_self_calls_expr(sub, orig_name, mangled))
+  }
 }
 
 # Walk a decl's body collecting concrete poly tuples introduced by
@@ -45626,19 +45690,49 @@ fn pcs_call_consumers_linear(nm: String, f: Expr, xs: [Expr]) : Bool = {
     # `nm` only appears inside the callee expression (rare); recurse.
     pcs_all_consumers_linear(nm, f)
   } else {
-    match f.kind {
+    # Issue #680: when this predicate runs on a post-perceus body, the
+    # callee may be wrapped in `__perceus_dup(...)` (e.g.
+    # `step(initial, ev1)` becomes `(__perceus_dup(step))(initial,
+    # ev1)`). Look through the dup wrap so the linearity analysis
+    # matches the pre-perceus body. Without this, the same param
+    # qualifies for skip_set when `pcs_pass` analyses the body but
+    # NOT when `tcrec_rewrite_decl` re-analyses the post-perceus
+    # `inner` — and the resulting misalignment plants a goto-block
+    # drop without the matching `pcs_pass` dup, double-decrefing the
+    # original ref.
+    let effective_f = pcs_strip_dup_wrap(f)
+    match effective_f.kind {
       EVar(fn_name) -> {
         # User-defined fn call — linear by pcs_pass construction —
         # UNLESS the fn name is a builtin synthetic.
         if pcs_is_runtime_primitive(fn_name) { false }
         # Even for user fns, check that `nm` does not also appear in
         # the callee (would mean f is computed from nm, unusual).
-        else { pcs_all_consumers_linear(nm, f) and
+        else { pcs_all_consumers_linear(nm, effective_f) and
                 pcs_all_args_consumers_linear(nm, xs) }
       }
       _ -> false   # call through capability/closure: assume non-linear
     }
   }
+}
+
+# Issue #680: strip an outer `__perceus_dup(x)` wrap to expose the
+# underlying expression. Used by the linearity analysis so a post-
+# perceus body whose call callee is `__perceus_dup(EVar(name))` is
+# treated the same as the pre-perceus `EVar(name)` callee. Returns
+# the original expression unchanged when no wrap is present.
+fn pcs_strip_dup_wrap(e: Expr) : Expr = match e.kind {
+  ECall(callee, args_) -> match callee.kind {
+    EVar(nm) ->
+      if nm == "__perceus_dup" {
+        match args_ {
+          [inner] -> inner
+          _       -> e
+        }
+      } else { e }
+    _ -> e
+  }
+  _ -> e
 }
 
 # Is `nm` directly an arg (as bare `EVar(nm)`)?
