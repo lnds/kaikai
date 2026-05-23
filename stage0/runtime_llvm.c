@@ -207,10 +207,23 @@ KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args
     return r;
 }
 
-/* 1 iff `v` is a KAI_VARIANT whose tag name matches `name`. Used as
-   the discriminator in match arms. */
+/* 1 iff `v` is a KAI_VARIANT whose tag name matches `name`. Legacy
+   match discriminator — kept as a fallback for emit paths that do
+   not resolve a constructor name to a tag at compile time (synthetic
+   AST nodes that slip past `evar_find_tag_opt`). The fast path is
+   `kaix_is_variant_tag` below. */
 int kaix_is_variant(KaiValue *v, const char *name) {
     return v && v->tag == KAI_VARIANT && strcmp(v->as.var.variant_name, name) == 0;
+}
+
+/* 1 iff `v` is a KAI_VARIANT whose variant_tag equals `tag`. The
+   primary match discriminator under issue #688 — the LLVM backend
+   emits this when the constructor name resolves through the
+   atom-style global table in docs/variant-tags.md. Constant-folds to
+   a single i32 compare under -O2, eliminating the strcmp call that
+   the legacy `kaix_is_variant` path retains for fallback. */
+int kaix_is_variant_tag(KaiValue *v, int32_t tag) {
+    return v && v->tag == KAI_VARIANT && v->as.var.variant_tag == tag;
 }
 
 /* Read the i-th argument of a variant. incref so the caller owns it;

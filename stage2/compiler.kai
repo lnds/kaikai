@@ -48646,6 +48646,7 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_int_to_string_thunk(%KaiValue*, %KaiValue**, i32)\n",
     "declare %KaiValue* @kaix_variant(i32, i8*, i32, %KaiValue**)\n",
     "declare i32           @kaix_is_variant(%KaiValue*, i8*)\n",
+    "declare i32           @kaix_is_variant_tag(%KaiValue*, i32)\n",
     "declare %KaiValue* @kaix_variant_arg(%KaiValue*, i32)\n",
     "declare %KaiValue* @kaix_eq_raw(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_match_panic(%KaiValue*)\n",
@@ -50162,12 +50163,16 @@ fn llvm_emit_reuse_record(e: LlvmEmit, scr_e: Expr, fis: [FieldInit]) : LlvmEmit
 
 # issue #210 — LLVM lowering for the variant reuse-in-place magic call.
 # Same shape as `llvm_emit_variant_ctor` but routes through
-# `kaix_reuse_or_alloc_variant(scr, 0, name, n, args)`.
+# `kaix_reuse_or_alloc_variant(scr, tag, name, n, args)`. The tag
+# comes from the atom-style global table (issue #688) so the reused
+# cell carries the right discriminator for the matcher to find.
 fn llvm_emit_reuse_variant(e: LlvmEmit, scr_e: Expr,
                             cname: String, xs: [Expr]) : LlvmEmit / Console {
 
   let n = list_length(xs)
   let r_scr = llvm_emit_expr(e, scr_e)
+  let tag = evar_find_tag(r_scr.vars_, cname)
+  let tag_str = int_to_string(tag)
   let name_label_id = llvm_fresh_label(r_scr, "var.")
   let name_label = name_label_id.reg
   let name_body = cname
@@ -50179,7 +50184,7 @@ fn llvm_emit_reuse_variant(e: LlvmEmit, scr_e: Expr,
       "  ", r.reg,
       " = call %KaiValue* @kaix_reuse_or_alloc_variant(%KaiValue* ",
       r_scr.last_val,
-      ", i32 0, i8* ", llvm_gep_str(name_label, name_len),
+      ", i32 ", tag_str, ", i8* ", llvm_gep_str(name_label, name_len),
       ", i32 0, %KaiValue** null)\n"
     ])
     llvm_set_last(llvm_append_body(r.e, instr), r.reg)
@@ -50196,7 +50201,7 @@ fn llvm_emit_reuse_variant(e: LlvmEmit, scr_e: Expr,
       "  ", r.reg,
       " = call %KaiValue* @kaix_reuse_or_alloc_variant(%KaiValue* ",
       r_scr.last_val,
-      ", i32 0, i8* ", llvm_gep_str(name_label, name_len),
+      ", i32 ", tag_str, ", i8* ", llvm_gep_str(name_label, name_len),
       ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"
     ])
     llvm_set_last(llvm_append_body(r.e, call_instr), r.reg)
@@ -50707,11 +50712,18 @@ fn llvm_emit_apply(e: LlvmEmit, clo_reg: String, xs: [Expr]) : LlvmEmit / Consol
 }
 
 # Construct a KAI_VARIANT via `kaix_variant(tag, name, n, args)`. The
-# args array is an `alloca` + sequential stores; the tag field is
-# always 0 — stage 0's runtime discriminates by name.
+# args array is an `alloca` + sequential stores. The tag comes from
+# the atom-style global table (docs/variant-tags.md) so producer and
+# matcher agree under issue #688's `kaix_is_variant_tag` discriminator.
+# Unknown names fall back to tag 0; matchers cover that path via
+# strcmp-fallback, so no semantic regression — but the runtime's
+# nullary/immortal cache misses on every alloc, which is the same
+# degradation the C backend had pre-cdaf9dc.
 fn llvm_emit_variant_ctor(e: LlvmEmit, cname: String, xs: [Expr]) : LlvmEmit / Console {
 
   let n = list_length(xs)
+  let tag = evar_find_tag(e.vars_, cname)
+  let tag_str = int_to_string(tag)
   # Global string constant for the ctor name.
   let name_label_id = llvm_fresh_label(e, "var.")
   let name_label = name_label_id.reg
@@ -50721,7 +50733,7 @@ fn llvm_emit_variant_ctor(e: LlvmEmit, cname: String, xs: [Expr]) : LlvmEmit / C
   if n == 0 {
     let r = llvm_fresh_reg(e1)
     let instr = concat_all([
-      "  ", r.reg, " = call %KaiValue* @kaix_variant(i32 0, i8* ",
+      "  ", r.reg, " = call %KaiValue* @kaix_variant(i32 ", tag_str, ", i8* ",
       llvm_gep_str(name_label, name_len), ", i32 0, %KaiValue** null)\n"
     ])
     llvm_set_last(llvm_append_body(r.e, instr), r.reg)
@@ -50738,7 +50750,7 @@ fn llvm_emit_variant_ctor(e: LlvmEmit, cname: String, xs: [Expr]) : LlvmEmit / C
     let e3 = llvm_emit_variant_stores(e2, buf.reg, ra.regs, 0)
     let r = llvm_fresh_reg(e3)
     let call_instr = concat_all([
-      "  ", r.reg, " = call %KaiValue* @kaix_variant(i32 0, i8* ",
+      "  ", r.reg, " = call %KaiValue* @kaix_variant(i32 ", tag_str, ", i8* ",
       llvm_gep_str(name_label, name_len),
       ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"
     ])
@@ -52008,15 +52020,33 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
       llvm_emit_truthy_br(e1, eq.reg, fail_lbl, "pat.lit.ok.")
     }
     PVariant(cname, subpats) -> {
-      let name_res = llvm_emit_name_constant(e, cname, "var.")
-      let chk = llvm_fresh_reg(name_res.e)
-      let chk_i = concat_all([
-        "  ", chk.reg, " = call i32 @kaix_is_variant(%KaiValue* ", scr,
-        ", i8* ", name_res.gep, ")\n"
-      ])
-      let e1 = llvm_append_body(chk.e, chk_i)
-      let cond = llvm_fresh_reg(e1)
-      let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk.reg, ", 0\n"])
+      # Issue #688 — LLVM backend tag-compare. When the constructor
+      # name resolves in the atom-style global table, emit a
+      # `kaix_is_variant_tag(scr, <tag>)` call so the discriminator
+      # constant-folds to a single i32 compare. Otherwise (synthetic
+      # AST that escaped resolver registration) fall back to the
+      # legacy strcmp-based `kaix_is_variant`.
+      let chk_res = match evar_find_tag_opt(e.vars_, cname) {
+        Some(t) -> {
+          let chk = llvm_fresh_reg(e)
+          let chk_i = concat_all([
+            "  ", chk.reg, " = call i32 @kaix_is_variant_tag(%KaiValue* ", scr,
+            ", i32 ", int_to_string(t), ")\n"
+          ])
+          LlvmReg { e: llvm_append_body(chk.e, chk_i), reg: chk.reg }
+        }
+        None -> {
+          let name_res = llvm_emit_name_constant(e, cname, "var.")
+          let chk = llvm_fresh_reg(name_res.e)
+          let chk_i = concat_all([
+            "  ", chk.reg, " = call i32 @kaix_is_variant(%KaiValue* ", scr,
+            ", i8* ", name_res.gep, ")\n"
+          ])
+          LlvmReg { e: llvm_append_body(chk.e, chk_i), reg: chk.reg }
+        }
+      }
+      let cond = llvm_fresh_reg(chk_res.e)
+      let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk_res.reg, ", 0\n"])
       let e2 = llvm_append_body(cond.e, cond_i)
       let e3 = llvm_emit_cond_br_fail(e2, cond.reg, fail_lbl, "pat.var.ok.")
       llvm_emit_pat_subpats(e3, subpats, scr, fail_lbl, 0)
@@ -52033,15 +52063,29 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
     # Check the variant tag first, then bind each named field via
     # @kaix_field. Mirrors emit_pat_test_variant_record in the C path.
     PVariantRecord(cname, fields) -> {
-      let name_res = llvm_emit_name_constant(e, cname, "var.")
-      let chk = llvm_fresh_reg(name_res.e)
-      let chk_i = concat_all([
-        "  ", chk.reg, " = call i32 @kaix_is_variant(%KaiValue* ", scr,
-        ", i8* ", name_res.gep, ")\n"
-      ])
-      let e1 = llvm_append_body(chk.e, chk_i)
-      let cond = llvm_fresh_reg(e1)
-      let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk.reg, ", 0\n"])
+      # Issue #688 — same tag-compare / strcmp-fallback shape as
+      # PVariant above. See the comment there for the rationale.
+      let chk_res = match evar_find_tag_opt(e.vars_, cname) {
+        Some(t) -> {
+          let chk = llvm_fresh_reg(e)
+          let chk_i = concat_all([
+            "  ", chk.reg, " = call i32 @kaix_is_variant_tag(%KaiValue* ", scr,
+            ", i32 ", int_to_string(t), ")\n"
+          ])
+          LlvmReg { e: llvm_append_body(chk.e, chk_i), reg: chk.reg }
+        }
+        None -> {
+          let name_res = llvm_emit_name_constant(e, cname, "var.")
+          let chk = llvm_fresh_reg(name_res.e)
+          let chk_i = concat_all([
+            "  ", chk.reg, " = call i32 @kaix_is_variant(%KaiValue* ", scr,
+            ", i8* ", name_res.gep, ")\n"
+          ])
+          LlvmReg { e: llvm_append_body(chk.e, chk_i), reg: chk.reg }
+        }
+      }
+      let cond = llvm_fresh_reg(chk_res.e)
+      let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk_res.reg, ", 0\n"])
       let e2 = llvm_append_body(cond.e, cond_i)
       let e3 = llvm_emit_cond_br_fail(e2, cond.reg, fail_lbl, "pat.vrec.ok.")
       llvm_emit_pat_record_fields(e3, fields, scr, fail_lbl)
@@ -52522,15 +52566,31 @@ fn llvm_emit_bang(e: LlvmEmit, inner: Expr) : LlvmEmit / Console {
     Some(name) -> {
       let ei = llvm_emit_expr(e, inner)
       let inner_reg = ei.last_val
-      let nm_res = llvm_emit_name_constant(ei, name, "bang.var.")
-      let chk = llvm_fresh_reg(nm_res.e)
-      let chk_i = concat_all([
-        "  ", chk.reg, " = call i32 @kaix_is_variant(%KaiValue* ", inner_reg,
-        ", i8* ", nm_res.gep, ")\n"
-      ])
-      let e1 = llvm_append_body(chk.e, chk_i)
-      let cond = llvm_fresh_reg(e1)
-      let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk.reg, ", 0\n"])
+      # Issue #688 — same tag-compare / strcmp-fallback shape as the
+      # PVariant test path. `name` is always Some / Ok (the two `!`
+      # discriminators) so the table lookup never misses in
+      # well-typed code; the fallback is defensive.
+      let chk_res = match evar_find_tag_opt(ei.vars_, name) {
+        Some(t) -> {
+          let chk = llvm_fresh_reg(ei)
+          let chk_i = concat_all([
+            "  ", chk.reg, " = call i32 @kaix_is_variant_tag(%KaiValue* ", inner_reg,
+            ", i32 ", int_to_string(t), ")\n"
+          ])
+          LlvmReg { e: llvm_append_body(chk.e, chk_i), reg: chk.reg }
+        }
+        None -> {
+          let nm_res = llvm_emit_name_constant(ei, name, "bang.var.")
+          let chk = llvm_fresh_reg(nm_res.e)
+          let chk_i = concat_all([
+            "  ", chk.reg, " = call i32 @kaix_is_variant(%KaiValue* ", inner_reg,
+            ", i8* ", nm_res.gep, ")\n"
+          ])
+          LlvmReg { e: llvm_append_body(chk.e, chk_i), reg: chk.reg }
+        }
+      }
+      let cond = llvm_fresh_reg(chk_res.e)
+      let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk_res.reg, ", 0\n"])
       let e2 = llvm_append_body(cond.e, cond_i)
       let unwrap_lbl = llvm_fresh_label(e2, "bang.unwrap.")
       let fail_lbl   = llvm_fresh_label(unwrap_lbl.e, "bang.fail.")
