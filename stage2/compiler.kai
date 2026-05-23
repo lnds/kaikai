@@ -17469,6 +17469,11 @@ fn emit_fn_body(src: String, d: Decl, lcs: [String], fns: [EFn], variants: [EVar
         # Issue #261: the C-side symbol is either the override
         # baked into the body's tag or the kaikai identifier.
         emit_ffi_shim_body(sig, ffi_extern_symbol_of(body, name), params, ret_ty_opt)
+      } else if body_is_proto_dispatch(body) {
+        # Option C: runtime dispatch shim. Look up the matching
+        # `__pimpl_*` in the impl-table and tail-call it. See
+        # `make_dispatcher_body` and docs/protocols.md §Codegen sketch.
+        emit_proto_dispatch_shim_c(sig, proto_dispatch_parts(body), params, ret_ty_opt)
       } else {
         # Seed the local-name scope with the fn's parameters so an
         # `EVar(pname)` reference inside the body emits the local C
@@ -17584,6 +17589,105 @@ fn emit_ffi_shim_body(sig: String, name: String, params: [Param],
     ])
   }
   concat_all([sig, " {\n", body, "}\n\n"])
+}
+
+# Option C: runtime-dispatch shim body for `__proto_<op>`. Looks up
+# the matching `__pimpl_*` in the impl-table by `(proto_id,
+# head_tag(self))` and tail-calls it.
+#
+# The shim signature must match the dispatcher's kaikai signature
+# byte-for-byte — `sig` already encodes that. The first parameter is
+# always `Self`-shaped (the receiver carries the dispatch tag); we
+# read its head tag and look up.
+#
+# If the lookup misses (no impl registered for the receiver's runtime
+# head), panic with a useful message. The validator pass
+# (`validate_resolved_protocols`) catches the static cases at compile
+# time; reaching the panic at runtime means either (a) a user wrote a
+# polymorphic helper without the required `T : P` bound and the bound
+# was not enforced at instantiation, or (b) impl-table corruption.
+fn emit_proto_dispatch_shim_c(sig: String, parts: ProtoDispatchParts,
+                                params: [Param],
+                                ret_ty_opt: Option[TypeExpr]) : String {
+  match parts {
+    PDP(pname, opname) -> {
+      let proto_id_c = stdlib_proto_id_c(pname)
+      let arity = list_length(params)
+      let cast = proto_dispatch_cast(arity)
+      let arg_list = proto_dispatch_arg_list(params, 0)
+      let miss_msg = concat_all(["no impl of ", pname, ".", opname,
+                                  " for runtime head"])
+      let head_expr = match params {
+        # Arity-0 ops (e.g. `Default.default() : Self`) have no value
+        # informant for runtime dispatch — Self is pinned by the
+        # caller's annotation and monomorphised at compile time. If
+        # one reaches the dispatcher at runtime, that is a compiler
+        # bug (the validator should have rejected the call site).
+        []         -> "KAI_HEAD_ANON /* arity-0 op — should be statically resolved */"
+        [p, ..._]  -> concat_all(["kai_head_tag(kai_", p.pname, ")"])
+      }
+      concat_all([
+        sig, " {\n",
+        "    int32_t _kai_head = ", head_expr, ";\n",
+        "    void *_kai_fn_p = kai_lookup_impl(", proto_id_c, ", _kai_head);\n",
+        "    if (_kai_fn_p == NULL) {\n",
+        "        fprintf(stderr, \"panic: ", miss_msg, " %d\\n\", (int) _kai_head);\n",
+        "        exit(1);\n",
+        "    }\n",
+        "    return ", cast, "_kai_fn_p)(", arg_list, ");\n",
+        "}\n\n"
+      ])
+    }
+  }
+}
+
+# Map a stdlib protocol name to its KAI_PROTO_* C constant.
+# Returns `-1` (cast to int32_t below in the emitted call) and emits
+# an #error comment for unknown protocols so the C compile fails
+# loudly. v1 supports the 12 stdlib protocols pinned in
+# docs/variant-tags.md.
+fn stdlib_proto_id_c(pname: String) : String {
+  if pname == "Show"         { "KAI_PROTO_SHOW" }
+  else if pname == "Eq"      { "KAI_PROTO_EQ" }
+  else if pname == "Ord"     { "KAI_PROTO_ORD" }
+  else if pname == "Hash"    { "KAI_PROTO_HASH" }
+  else if pname == "Serialize"     { "KAI_PROTO_SERIALIZE" }
+  else if pname == "BinSerialize"  { "KAI_PROTO_BIN_SERIALIZE" }
+  else if pname == "Default" { "KAI_PROTO_DEFAULT" }
+  else if pname == "Add"     { "KAI_PROTO_ADD" }
+  else if pname == "Sub"     { "KAI_PROTO_SUB" }
+  else if pname == "Mul"     { "KAI_PROTO_MUL" }
+  else if pname == "Div"     { "KAI_PROTO_DIV" }
+  else if pname == "Rem"     { "KAI_PROTO_REM" }
+  else { concat_all(["-1 /* unknown protocol ", pname,
+                      " — user protocols not supported in v1 */"]) }
+}
+
+# Build the C cast prefix for indirect call of a dispatcher of N
+# params. All params and the return are `KaiValue *`. The caller emits
+# the closing `)` after the cast and the arg list:
+# `return ((KaiValue *(*)(KaiValue *)) _kai_fn_p)(kai_a);`
+fn proto_dispatch_cast(arity: Int) : String {
+  let args = proto_dispatch_kaivalueptr_list(arity, 0)
+  concat_all(["((KaiValue *(*)(", args, ")) "])
+}
+
+fn proto_dispatch_kaivalueptr_list(arity: Int, i: Int) : String {
+  if i >= arity { "" }
+  else if i == 0 { concat_all(["KaiValue *", proto_dispatch_kaivalueptr_list(arity, i + 1)]) }
+  else { concat_all([", KaiValue *", proto_dispatch_kaivalueptr_list(arity, i + 1)]) }
+}
+
+# Emit the kaikai params as a C call-arg list `kai_p0, kai_p1, ...`.
+fn proto_dispatch_arg_list(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let head = if i == 0 { concat_all(["kai_", p.pname]) }
+                 else { concat_all([", kai_", p.pname]) }
+      concat_all([head, proto_dispatch_arg_list(rest, i + 1)])
+    }
+  }
 }
 
 # m12.7.x FFI v1: enumeration of the supported return kinds plus an
@@ -21053,6 +21157,72 @@ fn ffi_extern_symbol_of(body: Expr, default_name: String) : String {
                      string_length(msg) - string_length(ffi_extern_tag_prefix()))
       } else { default_name }
     _ -> default_name
+  }
+}
+
+# Protocol-dispatch runtime shim (opción C).
+#
+# A dispatcher fn (`__proto_<op>`) whose body is the tag
+# `__kai_proto_dispatch__:<P>:<op>` signals codegen to emit a custom
+# C/LLVM body that looks up the impl in the runtime hashmap by
+# `(proto_id, head_tag)` and tail-calls it. The dispatcher fn shape
+# (params, return type) is unchanged so the typer / monomorphiser see
+# a regular polymorphic call.
+fn proto_dispatch_tag() : String = "__kai_proto_dispatch__"
+fn proto_dispatch_tag_prefix() : String = "__kai_proto_dispatch__:"
+
+fn body_is_proto_dispatch(body: Expr) : Bool {
+  proto_dispatch_marker_in(body)
+}
+
+# The dispatcher's body starts as a bare `ETodo(marker)`, but Perceus'
+# exit-drop wrap can re-shape it into `EBlock([_drop kai_x...], Some(ETodo))`
+# before codegen sees it. Walk through the EBlock / EIf / EMatch shells
+# the lowering may wrap around the marker and look for the ETodo with
+# our prefix on the tail position.
+fn proto_dispatch_marker_in(e: Expr) : Bool {
+  match e.kind {
+    ETodo(msg)             -> string_starts_with_q(msg, proto_dispatch_tag_prefix())
+    EBlock(_, Some(tail))  -> proto_dispatch_marker_in(tail)
+    _                      -> false
+  }
+}
+
+type ProtoDispatchParts = PDP(String, String)
+
+# Build the dispatcher body marker: `__kai_proto_dispatch__:<P>:<op>`.
+fn mk_proto_dispatch_body(pname: String, opname: String, line: Int, col: Int) : Expr =
+  mk_expr(ETodo(concat_all([proto_dispatch_tag_prefix(), pname, ":", opname])), line, col)
+
+# Parse the marker back into (P, op). Caller must have established
+# `body_is_proto_dispatch` first. Walks through Perceus' exit-drop
+# wrap (EBlock-with-tail) to reach the underlying ETodo marker.
+fn proto_dispatch_parts(body: Expr) : ProtoDispatchParts {
+  match body.kind {
+    ETodo(msg) -> {
+      let payload = string_slice(msg, string_length(proto_dispatch_tag_prefix()),
+                                  string_length(msg) - string_length(proto_dispatch_tag_prefix()))
+      let idx = find_colon(payload, 0)
+      let pname = string_slice(payload, 0, idx)
+      let opname = string_slice(payload, idx + 1, string_length(payload) - (idx + 1))
+      PDP(pname, opname)
+    }
+    EBlock(_, Some(tail)) -> proto_dispatch_parts(tail)
+    _                     -> PDP("?", "?")
+  }
+}
+
+# Find the first ':' starting at `from`. Returns string length if not
+# found. The dispatcher marker always contains exactly one ':' so this
+# helper is sufficient (no escaping concerns).
+fn find_colon(s: String, from: Int) : Int {
+  let n = string_length(s)
+  if from >= n { n }
+  else {
+    match char_at(s, from) {
+      Some(c) -> if c == ':' { from } else { find_colon(s, from + 1) }
+      None    -> n
+    }
   }
 }
 
@@ -56757,19 +56927,20 @@ fn make_dispatcher_fn(pname: String, opname: String, params: [Param],
       REmpty, body, line, col, mo)
 }
 
-# Synthesises a body that *typechecks* with the declared return type
-# without invoking any prelude function (so the dispatcher does not
-# pull `panic` into its row). The post-inference rewrite replaces
-# every reachable call to this dispatcher; only protocols with no
-# matching impl reach this body, in which case execution panics via
-# the placeholder value the typer accepts but the runtime treats as
-# unsound use.
+# Synthesises an `ETodo` body tagged `__kai_proto_dispatch__:<P>:<op>`.
+# The typer keeps treating the dispatcher as a regular polymorphic fn
+# (ETodo is the same magic shape `body_is_ffi_extern` uses for FFI
+# shims, see `proto_dispatch_tag` above). When the C / LLVM emit
+# encounters this body, it generates a runtime-dispatch shim that
+# looks up the matching `__pimpl_*` in the impl-table by
+# `(proto_id, head_tag(self))` and tail-calls it — option C from
+# `docs/protocols.md`. Post-inference rewrite still redirects every
+# monomorphic call site directly to `__pimpl_<P>_<T>_<op>`, so the
+# runtime lookup only runs when the type stays polymorphic past mono
+# (e.g. inside the body of `impl[T : Show] Show for [T]`).
 fn make_dispatcher_body(pname: String, opname: String, ret: TypeExpr,
-                          line: Int, col: Int) : Expr {
-  let label = concat_all(["__protocol_dispatch_", pname, "_", opname])
-  let arg = mk_expr(EStr(concat_all(["\"", label, "\""]), false), line, col)
-  mk_expr(ECall(mk_expr(EVar("panic"), line, col), [arg]), line, col)
-}
+                          line: Int, col: Int) : Expr =
+  mk_proto_dispatch_body(pname, opname, line, col)
 
 fn dispatcher_substitute_self_param(p: Param) : Param {
   match p.ptype {
