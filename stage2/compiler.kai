@@ -11762,6 +11762,22 @@ fn evar_find_tag(vs: [EVar], target: String) : Int {
   }
 }
 
+# Match-side variant. Returns Some(tag) when target is in the
+# variants table, None otherwise. Consumers (emit_pat_test_variant*,
+# emit_bang) use this to decide between the fast tag-compare path
+# (`variant_tag == N`) and the legacy strcmp fallback. Under the
+# atom-style global convention every well-typed PVariant pattern
+# resolves to a known name; the None branch protects synthetic AST
+# paths where a constructor name slipped through without registration.
+fn evar_find_tag_opt(vs: [EVar], target: String) : Option[Int] {
+  match vs {
+    [] -> None
+    [h, ...rest] -> match h {
+      EV(n, _, _, t) -> if n == target { Some(t) } else { evar_find_tag_opt(rest, target) }
+    }
+  }
+}
+
 fn fn_of_decl(d: Decl) : Option[EFn] {
   match d {
     DFn(_, name, tparams, params, opt_ret, row, body, _, _, mo) ->
@@ -12532,42 +12548,80 @@ fn builtin_variants() : [EVar] =
   # arbitrary boxed value; unboxing them would require a per-call-site
   # type read which is not in scope for this lane.
   #
-  # Tag assignment per docs/variant-tags.md. Stage 2, like stage 1,
-  # only registers the four constructors it can directly emit; tags
-  # 4..10 are reserved for Sig*/Exited/Signaled which the C runtime
-  # constructs directly and never reach this table.
-  [EV("Some", 1, [], 0), EV("None", 0, [], 1), EV("Ok", 1, [], 2), EV("Err", 1, [], 3)]
+  # Tag assignment per docs/variant-tags.md. Builtins 0..10 are
+  # reserved; user code that matches against Sig*/Exited/Signaled
+  # (e.g. `match s { SigInt -> ... }`) needs these in the table so
+  # `evar_find_tag` resolves to the reserved value and not to a
+  # user-range tag. The runtime constructs these via stage0/runtime.h
+  # using the same convention, so producer and matcher agree.
+  [EV("Some", 1, [], 0), EV("None", 0, [], 1),
+   EV("Ok", 1, [], 2), EV("Err", 1, [], 3),
+   EV("SigInt", 0, [], 4), EV("SigTerm", 0, [], 5), EV("SigHup", 0, [], 6),
+   EV("SigUsr1", 0, [], 7), EV("SigUsr2", 0, [], 8),
+   # Exited/Signaled carry an unboxed Int slot — the runtime constructs
+   # them via kai_variant_u with KAI_VAR_SLOT_INT, so the matcher must
+   # read slots[0].i64 not slots[0].ptr. Registering the payload type
+   # here drives emit_pat_test_variant through the typed (Phase 2 #440)
+   # slot-read path.
+   EV("Exited", 1, [ty_name_zero("Int")], 9),
+   EV("Signaled", 1, [ty_name_zero("Int")], 10)]
 
 # First tag assigned to a user-declared variant. Mirrors
 # KAI_USER_VARIANT_TAG_BASE in stage0/emit.c and
 # user_variant_tag_base() in stage1/compiler.kai.
 fn user_variant_tag_base() : Int = 11
 
-fn collect_user_variants_loop(ds: [Decl], next_tag: Int, acc: [EVar]) : [EVar] {
+# Walk the declarations and accumulate the variants table; returns
+# the new table plus the consumed counter so subsequent decls keep
+# the assignment monotonic. Sum-typed DTypes whose constructors are
+# already in `acc` are skipped (typical case: the Sig/ProcessExit
+# DTypes the prelude-inject pass synthesises so the typer sees them
+# — they overlap with the reserved builtins).
+fn collect_user_variants_loop(ds: [Decl], next_tag: Int, acc: [EVar]) : [EVar] = match collect_user_variants_count(ds, next_tag, acc) {
+  CUV(t) -> t
+}
+
+type CUVResult = CUV([EVar])
+
+fn collect_user_variants_count(ds: [Decl], next_tag: Int, acc: [EVar]) : CUVResult {
   match ds {
-    [] -> acc
+    [] -> CUV(acc)
     [d, ...rest] -> match d {
       DType(_, _, _, body, _, _, _) -> match body {
-        TBSum(vs) -> {
-          let n_new = list_length(vs)
-          collect_user_variants_loop(rest, next_tag + n_new, vs_to_evars(vs, next_tag, acc))
+        TBSum(vs) -> match vs_to_evars_count(vs, next_tag, acc) {
+          CUVStep(nt, acc1) -> collect_user_variants_count(rest, nt, acc1)
         }
-        _ -> collect_user_variants_loop(rest, next_tag, acc)
+        _ -> collect_user_variants_count(rest, next_tag, acc)
       }
-      _ -> collect_user_variants_loop(rest, next_tag, acc)
+      _ -> collect_user_variants_count(rest, next_tag, acc)
     }
   }
 }
 
+type CUVStep = CUVStep(Int, [EVar])
+
 # Acc accumulates with head-cons; we still pre-pend each EV but feed
-# it the correct tag value `next_tag + i` for its index in `vs`.
-fn vs_to_evars(vs: [Variant], next_tag: Int, acc: [EVar]) : [EVar] {
+# it the correct tag value `next_tag + i` for its index in `vs`,
+# skipping names that already resolve in acc (builtins re-emitted as
+# synthetic DTypes by the prelude-inject pass).
+fn vs_to_evars_count(vs: [Variant], next_tag: Int, acc: [EVar]) : CUVStep {
   match vs {
-    [] -> acc
+    [] -> CUVStep(next_tag, acc)
     [v, ...rest] -> match v {
-      Var(n, tys) -> vs_to_evars(rest, next_tag + 1, [EV(n, list_length(tys), tys, next_tag), ...acc])
+      Var(n, tys) -> match evar_find_tag_opt(acc, n) {
+        Some(_) -> vs_to_evars_count(rest, next_tag, acc)
+        None    -> vs_to_evars_count(rest, next_tag + 1, [EV(n, list_length(tys), tys, next_tag), ...acc])
+      }
     }
   }
+}
+
+# Legacy entry kept for callers that still construct an [EVar]
+# from `[Variant]` with no acc threading; emits the same shape but
+# does not preserve builtin tags. Internal callers go through
+# vs_to_evars_count to keep the convention.
+fn vs_to_evars(vs: [Variant], next_tag: Int, acc: [EVar]) : [EVar] = match vs_to_evars_count(vs, next_tag, acc) {
+  CUVStep(_, a) -> a
 }
 
 fn register_variants(decls: [Decl]) : [EVar] =
@@ -13218,14 +13272,16 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], lcs: [String], f
                     None -> "kai_unit() /* __perceus_reuse_variant: typed lookup vanished */"
                   }
                 } else if n == 0 {
+                  let tag_str = int_to_string(evar_find_tag(variants, cname))
                   concat_all([
-                    "kai_reuse_or_alloc_variant(_scr, 0, \"", cname,
+                    "kai_reuse_or_alloc_variant(_scr, ", tag_str, ", \"", cname,
                     "\", 0, NULL)"
                   ])
                 } else {
                   let arg_strs = emit_call_args(src, cargs, lcs, fns, variants, lams, cls)
+                  let tag_str = int_to_string(evar_find_tag(variants, cname))
                   concat_all([
-                    "kai_reuse_or_alloc_variant(_scr, 0, \"", cname,
+                    "kai_reuse_or_alloc_variant(_scr, ", tag_str, ", \"", cname,
                     "\", ", int_to_string(n),
                     ", (KaiValue *[]){", arg_strs, "})"
                   ])
@@ -13821,13 +13877,29 @@ fn list_nth(xs: [Pattern], i: Int) : Pattern {
   }
 }
 
+# Issue #688 — emit the variant-name dispatch as either
+# `scr->as.var.variant_tag == N` (when the constructor is registered
+# under the atom-style global convention, docs/variant-tags.md) or
+# `strcmp(scr->as.var.variant_name, "Name") == 0` (synthetic fallback).
+# Used by emit_pat_test_variant, emit_pat_test_variant_record, and
+# emit_bang to keep the three sites in sync.
+fn emit_variant_tag_test(scr: String, name: String, variants: [EVar]) : String {
+  match evar_find_tag_opt(variants, name) {
+    Some(t) -> concat_all([
+      scr, "->tag == KAI_VARIANT && ",
+      scr, "->as.var.variant_tag == ", int_to_string(t)
+    ])
+    None -> concat_all([
+      scr, "->tag == KAI_VARIANT && strcmp(",
+      scr, "->as.var.variant_name, \"", name, "\") == 0"
+    ])
+  }
+}
+
 fn emit_pat_test_variant(src: String, name: String, subs: [Pattern],
                          scr: String, lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String / Console {
 
-  let base = concat_all([
-    "(", scr, " && ", scr, "->tag == KAI_VARIANT && strcmp(",
-    scr, "->as.var.variant_name, \"", name, "\") == 0"
-  ])
+  let base = concat_all(["(", scr, " && ", emit_variant_tag_test(scr, name, variants)])
   # Issue #440 Phase 2 — look up the variant's payload Types so the
   # sub-pattern test reads each slot with the right kind. Unknown
   # ctor (e.g. nullary builtin / non-sum match) falls back to all
@@ -13930,13 +14002,11 @@ fn emit_pat_test_record_fields(src: String, fields: [PField], scr: String,
 fn emit_pat_test_variant_record(src: String, name: String, fields: [PField], scr: String,
                                  lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String / Console {
 
-  # Variant with record destructuring: first check variant tag, then
-  # record fields are accessed via kai_op_field on the scrutinee itself
+  # Variant with record destructuring: first check the variant tag,
+  # then read record fields via kai_op_field on the scrutinee itself
   # because the emit side stores records directly in variants.
-  let base = concat_all([
-    "(", scr, " && ", scr, "->tag == KAI_VARIANT && strcmp(",
-    scr, "->as.var.variant_name, \"", name, "\") == 0"
-  ])
+  # Issue #688 — atom-style global tag dispatch via emit_variant_tag_test.
+  let base = concat_all(["(", scr, " && ", emit_variant_tag_test(scr, name, variants)])
   cat3(base, emit_pat_test_record_fields(src, fields, scr, lcs, fns, variants, lams, cls), ")")
 }
 
@@ -16644,8 +16714,7 @@ fn emit_bang(src: String, inner: Expr, lcs: [String], fns: [EFn], variants: [EVa
   match success {
     Some(name) -> concat_all([
       "({ KaiValue *_b = ", inner_c, "; ",
-      "if (!(_b && _b->tag == KAI_VARIANT && strcmp(_b->as.var.variant_name, \"",
-      name, "\") == 0)) return _b; ",
+      "if (!(_b && ", emit_variant_tag_test("_b", name, variants), ")) return _b; ",
       "_b->as.var.slots[0].ptr; })"
     ])
     None -> concat_all([

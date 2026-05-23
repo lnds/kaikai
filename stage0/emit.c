@@ -1936,15 +1936,23 @@ static void register_top_level_fns(E *e, Node *prog) {
 }
 
 static void register_builtin_variants(E *e) {
-    /* Tag assignment from docs/variant-tags.md. Stage 0 only emits
-     * code that constructs these four builtins; the remaining
-     * reserved tags (4..10 for Signal* / Exited / Signaled) are
-     * runtime-only and never reached from stage-0-emitted .c. */
+    /* Tag assignment from docs/variant-tags.md. Some/None/Ok/Err are
+     * the four constructors stage-0-emitted code directly builds;
+     * SigInt..Signaled live in tags 4..10 because user code may
+     * pattern-match against them and the matcher must look up the
+     * reserved tag (the runtime stamps the same literal). */
     static const struct { const char *n; int a; int t; } B[] = {
-        { "Some", 1, 0 },
-        { "None", 0, 1 },
-        { "Ok",   1, 2 },
-        { "Err",   1, 3 },
+        { "Some",     1, 0 },
+        { "None",     0, 1 },
+        { "Ok",       1, 2 },
+        { "Err",      1, 3 },
+        { "SigInt",   0, 4 },
+        { "SigTerm",  0, 5 },
+        { "SigHup",   0, 6 },
+        { "SigUsr1",  0, 7 },
+        { "SigUsr2",  0, 8 },
+        { "Exited",   1, 9 },
+        { "Signaled", 1, 10 },
     };
     for (size_t i = 0; i < sizeof(B) / sizeof(B[0]); ++i) {
         reg_entry(&e->variants, &e->n_variants, &e->cap_variants,
