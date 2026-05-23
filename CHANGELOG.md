@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.83.1 (2026-05-23)
+
+### Fixed
+
+- **perceus**: align skip-set across perceus boundary + retarget mono self-calls (#680)
+
 ## v0.83.0 (2026-05-23)
 
 ### Added
