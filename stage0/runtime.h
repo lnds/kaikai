@@ -2976,7 +2976,7 @@ static KaiValue *kai_prelude_int_to_byte(KaiValue *v) {
         KaiValue *err = kai_str("int_to_byte: not an Int");
         KaiValue **args = (KaiValue **) malloc(sizeof(KaiValue *));
         args[0] = err;
-        KaiValue *r = kai_variant(1, "Err", 1, args);
+        KaiValue *r = kai_variant(3, "Err", 1, args);
         free(args);
         return r;
     }
@@ -2988,14 +2988,14 @@ static KaiValue *kai_prelude_int_to_byte(KaiValue *v) {
         KaiValue *err = kai_str(buf);
         KaiValue **args = (KaiValue **) malloc(sizeof(KaiValue *));
         args[0] = err;
-        KaiValue *r = kai_variant(1, "Err", 1, args);
+        KaiValue *r = kai_variant(3, "Err", 1, args);
         free(args);
         return r;
     }
     KaiValue *ok_payload = kai_byte((uint8_t) n);
     KaiValue **args = (KaiValue **) malloc(sizeof(KaiValue *));
     args[0] = ok_payload;
-    KaiValue *r = kai_variant(0, "Ok", 1, args);
+    KaiValue *r = kai_variant(2, "Ok", 1, args);
     free(args);
     return r;
 }
@@ -3832,7 +3832,7 @@ static KAI_RC_NOINLINE KaiValue *kai_prelude_read_file(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("read_file: argument is not a String");
-        r = kai_variant(0, "Err", 1, &msg);
+        r = kai_variant(3, "Err", 1, &msg);
     } else {
         char pbuf[4096];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
@@ -3841,21 +3841,21 @@ static KAI_RC_NOINLINE KaiValue *kai_prelude_read_file(KaiValue *path) {
         FILE *fp = fopen(pbuf, "rb");
         if (!fp) {
             KaiValue *msg = kai_str("read_file: cannot open file");
-            r = kai_variant(0, "Err", 1, &msg);
+            r = kai_variant(3, "Err", 1, &msg);
         } else if (fseek(fp, 0, SEEK_END) != 0) {
             fclose(fp);
             KaiValue *msg = kai_str("read_file: seek failed");
-            r = kai_variant(0, "Err", 1, &msg);
+            r = kai_variant(3, "Err", 1, &msg);
         } else {
             long n = ftell(fp);
             if (n < 0) {
                 fclose(fp);
                 KaiValue *msg = kai_str("read_file: tell failed");
-                r = kai_variant(0, "Err", 1, &msg);
+                r = kai_variant(3, "Err", 1, &msg);
             } else if (fseek(fp, 0, SEEK_SET) != 0) {
                 fclose(fp);
                 KaiValue *msg = kai_str("read_file: rewind failed");
-                r = kai_variant(0, "Err", 1, &msg);
+                r = kai_variant(3, "Err", 1, &msg);
             } else {
                 KaiValue *v = kai_alloc(KAI_STR);
                 v->as.s.len = (size_t) n;
@@ -3865,7 +3865,7 @@ static KAI_RC_NOINLINE KaiValue *kai_prelude_read_file(KaiValue *path) {
                 fclose(fp);
                 v->as.s.bytes[got] = '\0';
                 v->as.s.len = got;
-                r = kai_variant(0, "Ok", 1, &v);
+                r = kai_variant(2, "Ok", 1, &v);
             }
         }
     }
@@ -3877,10 +3877,10 @@ static KaiValue *kai_prelude_write_file(KaiValue *path, KaiValue *content) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("write_file: path is not a String");
-        r = kai_variant(0, "Err", 1, &msg);
+        r = kai_variant(3, "Err", 1, &msg);
     } else if (!content || content->tag != KAI_STR) {
         KaiValue *msg = kai_str("write_file: content is not a String");
-        r = kai_variant(0, "Err", 1, &msg);
+        r = kai_variant(3, "Err", 1, &msg);
     } else {
         char pbuf[4096];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
@@ -3889,16 +3889,16 @@ static KaiValue *kai_prelude_write_file(KaiValue *path, KaiValue *content) {
         FILE *fp = fopen(pbuf, "wb");
         if (!fp) {
             KaiValue *msg = kai_str("write_file: cannot open file");
-            r = kai_variant(0, "Err", 1, &msg);
+            r = kai_variant(3, "Err", 1, &msg);
         } else {
             size_t wrote = fwrite(content->as.s.bytes, 1, content->as.s.len, fp);
             fclose(fp);
             if (wrote != content->as.s.len) {
                 KaiValue *msg = kai_str("write_file: short write");
-                r = kai_variant(0, "Err", 1, &msg);
+                r = kai_variant(3, "Err", 1, &msg);
             } else {
                 KaiValue *u = kai_unit();
-                r = kai_variant(0, "Ok", 1, &u);
+                r = kai_variant(2, "Ok", 1, &u);
             }
         }
     }
@@ -3928,7 +3928,7 @@ static KaiValue *kai_prelude_file_delete(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("file_delete: path is not a String");
-        r = kai_variant(0, "Err", 1, &msg);
+        r = kai_variant(3, "Err", 1, &msg);
     } else {
         char pbuf[4096];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
@@ -3936,10 +3936,10 @@ static KaiValue *kai_prelude_file_delete(KaiValue *path) {
         pbuf[plen] = '\0';
         if (unlink(pbuf) == 0) {
             KaiValue *u = kai_unit();
-            r = kai_variant(0, "Ok", 1, &u);
+            r = kai_variant(2, "Ok", 1, &u);
         } else {
             KaiValue *msg = kai_str("file_delete: unlink failed");
-            r = kai_variant(0, "Err", 1, &msg);
+            r = kai_variant(3, "Err", 1, &msg);
         }
     }
     if (path) kai_decref(path);
@@ -3950,10 +3950,10 @@ static KaiValue *kai_prelude_file_rename(KaiValue *from, KaiValue *to) {
     KaiValue *r = NULL;
     if (!from || from->tag != KAI_STR) {
         KaiValue *msg = kai_str("file_rename: from is not a String");
-        r = kai_variant(0, "Err", 1, &msg);
+        r = kai_variant(3, "Err", 1, &msg);
     } else if (!to || to->tag != KAI_STR) {
         KaiValue *msg = kai_str("file_rename: to is not a String");
-        r = kai_variant(0, "Err", 1, &msg);
+        r = kai_variant(3, "Err", 1, &msg);
     } else {
         char fbuf[4096];
         char tbuf[4096];
@@ -3963,10 +3963,10 @@ static KaiValue *kai_prelude_file_rename(KaiValue *from, KaiValue *to) {
         memcpy(tbuf, to->as.s.bytes,   tlen); tbuf[tlen] = '\0';
         if (rename(fbuf, tbuf) == 0) {
             KaiValue *u = kai_unit();
-            r = kai_variant(0, "Ok", 1, &u);
+            r = kai_variant(2, "Ok", 1, &u);
         } else {
             KaiValue *msg = kai_str("file_rename: rename failed");
-            r = kai_variant(0, "Err", 1, &msg);
+            r = kai_variant(3, "Err", 1, &msg);
         }
     }
     if (from) kai_decref(from);
@@ -3985,7 +3985,7 @@ static KaiValue *kai_prelude_file_read_bytes(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("file_read_bytes: argument is not a String");
-        r = kai_variant(0, "Err", 1, &msg);
+        r = kai_variant(3, "Err", 1, &msg);
     } else {
         char pbuf[4096];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
@@ -3994,21 +3994,21 @@ static KaiValue *kai_prelude_file_read_bytes(KaiValue *path) {
         FILE *fp = fopen(pbuf, "rb");
         if (!fp) {
             KaiValue *msg = kai_str("file_read_bytes: cannot open file");
-            r = kai_variant(0, "Err", 1, &msg);
+            r = kai_variant(3, "Err", 1, &msg);
         } else if (fseek(fp, 0, SEEK_END) != 0) {
             fclose(fp);
             KaiValue *msg = kai_str("file_read_bytes: seek failed");
-            r = kai_variant(0, "Err", 1, &msg);
+            r = kai_variant(3, "Err", 1, &msg);
         } else {
             long n = ftell(fp);
             if (n < 0) {
                 fclose(fp);
                 KaiValue *msg = kai_str("file_read_bytes: tell failed");
-                r = kai_variant(0, "Err", 1, &msg);
+                r = kai_variant(3, "Err", 1, &msg);
             } else if (fseek(fp, 0, SEEK_SET) != 0) {
                 fclose(fp);
                 KaiValue *msg = kai_str("file_read_bytes: rewind failed");
-                r = kai_variant(0, "Err", 1, &msg);
+                r = kai_variant(3, "Err", 1, &msg);
             } else {
                 /* Read into a flat C buffer, then publish into a
                  * fresh KAI_ARRAY one KAI_BYTE allocation per slot.
@@ -4027,7 +4027,7 @@ static KaiValue *kai_prelude_file_read_bytes(KaiValue *path) {
                 if (!arr->as.arr.items) { free(buf); fprintf(stderr, "kai: out of memory\n"); exit(1); }
                 for (size_t i = 0; i < got; ++i) arr->as.arr.items[i] = kai_byte(buf[i]);
                 free(buf);
-                r = kai_variant(0, "Ok", 1, &arr);
+                r = kai_variant(2, "Ok", 1, &arr);
             }
         }
     }
@@ -4039,10 +4039,10 @@ static KaiValue *kai_prelude_file_write_bytes(KaiValue *path, KaiValue *bytes) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("file_write_bytes: path is not a String");
-        r = kai_variant(0, "Err", 1, &msg);
+        r = kai_variant(3, "Err", 1, &msg);
     } else if (!bytes || bytes->tag != KAI_ARRAY) {
         KaiValue *msg = kai_str("file_write_bytes: buffer is not an Array");
-        r = kai_variant(0, "Err", 1, &msg);
+        r = kai_variant(3, "Err", 1, &msg);
     } else {
         char pbuf[4096];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
@@ -4051,7 +4051,7 @@ static KaiValue *kai_prelude_file_write_bytes(KaiValue *path, KaiValue *bytes) {
         FILE *fp = fopen(pbuf, "wb");
         if (!fp) {
             KaiValue *msg = kai_str("file_write_bytes: cannot open file");
-            r = kai_variant(0, "Err", 1, &msg);
+            r = kai_variant(3, "Err", 1, &msg);
         } else {
             /* Pack the kai_array into a contiguous C buffer, then
              * issue a single fwrite. Cheaper than per-slot fwrite
@@ -4076,10 +4076,10 @@ static KaiValue *kai_prelude_file_write_bytes(KaiValue *path, KaiValue *bytes) {
             fclose(fp);
             if (!ok) {
                 KaiValue *msg = kai_str("file_write_bytes: write failed");
-                r = kai_variant(0, "Err", 1, &msg);
+                r = kai_variant(3, "Err", 1, &msg);
             } else {
                 KaiValue *u = kai_unit();
-                r = kai_variant(0, "Ok", 1, &u);
+                r = kai_variant(2, "Ok", 1, &u);
             }
         }
     }
@@ -4152,7 +4152,7 @@ static KaiValue *kai_prelude_dir_create_dir(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("dir_create_dir: path is not a String");
-        r = kai_variant(0, "Err", 1, &msg);
+        r = kai_variant(3, "Err", 1, &msg);
     } else {
         char pbuf[4096];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
@@ -4160,10 +4160,10 @@ static KaiValue *kai_prelude_dir_create_dir(KaiValue *path) {
         pbuf[plen] = '\0';
         if (mkdir(pbuf, 0755) == 0) {
             KaiValue *u = kai_unit();
-            r = kai_variant(0, "Ok", 1, &u);
+            r = kai_variant(2, "Ok", 1, &u);
         } else {
             KaiValue *msg = kai_str("dir_create_dir: mkdir failed");
-            r = kai_variant(0, "Err", 1, &msg);
+            r = kai_variant(3, "Err", 1, &msg);
         }
     }
     if (path) kai_decref(path);
@@ -4174,7 +4174,7 @@ static KaiValue *kai_prelude_dir_remove_dir(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("dir_remove_dir: path is not a String");
-        r = kai_variant(0, "Err", 1, &msg);
+        r = kai_variant(3, "Err", 1, &msg);
     } else {
         char pbuf[4096];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
@@ -4182,10 +4182,10 @@ static KaiValue *kai_prelude_dir_remove_dir(KaiValue *path) {
         pbuf[plen] = '\0';
         if (rmdir(pbuf) == 0) {
             KaiValue *u = kai_unit();
-            r = kai_variant(0, "Ok", 1, &u);
+            r = kai_variant(2, "Ok", 1, &u);
         } else {
             KaiValue *msg = kai_str("dir_remove_dir: rmdir failed");
-            r = kai_variant(0, "Err", 1, &msg);
+            r = kai_variant(3, "Err", 1, &msg);
         }
     }
     if (path) kai_decref(path);
@@ -4326,11 +4326,11 @@ static KaiValue *kai_prelude_read_line(void) {
     if (ch == EOF && n == 0) {
         free(buf);
         KaiValue *msg = kai_str("read_line: end of input");
-        return kai_variant(0, "Err", 1, &msg);
+        return kai_variant(3, "Err", 1, &msg);
     }
     KaiValue *s = kai_str_from_bytes(buf, n);
     free(buf);
-    return kai_variant(0, "Ok", 1, &s);
+    return kai_variant(2, "Ok", 1, &s);
 }
 
 /* Issue #453 + #620: byte-oriented stdin read. Reads up to `n` raw
@@ -4405,7 +4405,7 @@ static KaiValue *kai_prelude_string_to_int(KaiValue *s) {
         KaiValue *iv = kai_int(value);
         return kai_variant(0, "Some", 1, &iv);
     }
-    return kai_variant(0, "None", 0, NULL);
+    return kai_variant(1, "None", 0, NULL);
 }
 
 static KaiValue *kai_prelude_string_to_real(KaiValue *s) {
@@ -4427,7 +4427,7 @@ static KaiValue *kai_prelude_string_to_real(KaiValue *s) {
         KaiValue *rv = kai_real(value);
         return kai_variant(0, "Some", 1, &rv);
     }
-    return kai_variant(0, "None", 0, NULL);
+    return kai_variant(1, "None", 0, NULL);
 }
 
 static KaiValue *kai_prelude_char_at(KaiValue *s, KaiValue *i) {
@@ -4449,7 +4449,7 @@ static KaiValue *kai_prelude_char_at(KaiValue *s, KaiValue *i) {
         KaiValue *cv = kai_char(value);
         return kai_variant(0, "Some", 1, &cv);
     }
-    return kai_variant(0, "None", 0, NULL);
+    return kai_variant(1, "None", 0, NULL);
 }
 
 static KaiValue *kai_prelude_string_split(KaiValue *s, KaiValue *sep) {
@@ -5349,7 +5349,7 @@ static KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k) {
              * empty buffer becomes None. */
             if (n == 0) {
                 free(buf);
-                return kai_cont_resume(k, kai_variant(0, "None", 0, NULL));
+                return kai_cont_resume(k, kai_variant(1, "None", 0, NULL));
             }
             KaiValue *s = kai_str_from_bytes(buf, n);
             free(buf);
@@ -5376,7 +5376,7 @@ static KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k) {
              * pre-R3 fgetc path which silently treated errors as
              * EOF. */
             free(buf);
-            return kai_cont_resume(k, kai_variant(0, "None", 0, NULL));
+            return kai_cont_resume(k, kai_variant(1, "None", 0, NULL));
         }
     }
 }
@@ -5444,14 +5444,14 @@ static KaiValue *kai_default_env_args(void *self, KaiCont *k) {
 static KaiValue *kai_default_env_var(void *self, KaiValue *name, KaiCont *k) {
     (void) self;
     if (!name || name->tag != KAI_STR) {
-        return kai_cont_resume(k, kai_variant(0, "None", 0, NULL));
+        return kai_cont_resume(k, kai_variant(1, "None", 0, NULL));
     }
     char nbuf[1024];
     size_t nlen = name->as.s.len < sizeof(nbuf) - 1 ? name->as.s.len : sizeof(nbuf) - 1;
     memcpy(nbuf, name->as.s.bytes, nlen);
     nbuf[nlen] = '\0';
     const char *got = getenv(nbuf);
-    if (!got) return kai_cont_resume(k, kai_variant(0, "None", 0, NULL));
+    if (!got) return kai_cont_resume(k, kai_variant(1, "None", 0, NULL));
     KaiValue *s = kai_str(got);
     KaiValue *some = kai_variant(0, "Some", 1, &s);
     return kai_cont_resume(k, some);
@@ -5472,7 +5472,7 @@ static KaiValue *kai_default_env_set_var(void *self, KaiValue *name,
     (void) self;
     if (!name || name->tag != KAI_STR || !value || value->tag != KAI_STR) {
         KaiValue *m = kai_str("set_var: name and value must be Strings");
-        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        KaiValue *err = kai_variant(3, "Err", 1, &m);
         return kai_cont_resume(k, err);
     }
     char nbuf[1024];
@@ -5485,7 +5485,7 @@ static KaiValue *kai_default_env_set_var(void *self, KaiValue *name,
     char *vbuf = (char *) malloc(value->as.s.len + 1);
     if (!vbuf) {
         KaiValue *m = kai_str("set_var: out of memory");
-        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        KaiValue *err = kai_variant(3, "Err", 1, &m);
         return kai_cont_resume(k, err);
     }
     if (value->as.s.len > 0) memcpy(vbuf, value->as.s.bytes, value->as.s.len);
@@ -5497,11 +5497,11 @@ static KaiValue *kai_default_env_set_var(void *self, KaiValue *name,
         const char *msg = strerror(saved_errno);
         if (!msg) msg = "set_var failed";
         KaiValue *m = kai_str(msg);
-        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        KaiValue *err = kai_variant(3, "Err", 1, &m);
         return kai_cont_resume(k, err);
     }
     KaiValue *u = kai_unit();
-    KaiValue *ok = kai_variant(0, "Ok", 1, &u);
+    KaiValue *ok = kai_variant(2, "Ok", 1, &u);
     return kai_cont_resume(k, ok);
 }
 
@@ -5509,7 +5509,7 @@ static KaiValue *kai_default_env_unset_var(void *self, KaiValue *name, KaiCont *
     (void) self;
     if (!name || name->tag != KAI_STR) {
         KaiValue *m = kai_str("unset_var: name must be a String");
-        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        KaiValue *err = kai_variant(3, "Err", 1, &m);
         return kai_cont_resume(k, err);
     }
     char nbuf[1024];
@@ -5520,11 +5520,11 @@ static KaiValue *kai_default_env_unset_var(void *self, KaiValue *name, KaiCont *
         const char *msg = strerror(errno);
         if (!msg) msg = "unset_var failed";
         KaiValue *m = kai_str(msg);
-        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        KaiValue *err = kai_variant(3, "Err", 1, &m);
         return kai_cont_resume(k, err);
     }
     KaiValue *u = kai_unit();
-    KaiValue *ok = kai_variant(0, "Ok", 1, &u);
+    KaiValue *ok = kai_variant(2, "Ok", 1, &u);
     return kai_cont_resume(k, ok);
 }
 
@@ -5805,13 +5805,13 @@ static KaiValue *_kai_net_err(KaiCont *k, int saved_errno) {
     const char *msg = strerror(saved_errno);
     if (!msg) msg = "unknown error";
     KaiValue *m = kai_str(msg);
-    KaiValue *err = kai_variant(0, "Err", 1, &m);
+    KaiValue *err = kai_variant(3, "Err", 1, &m);
     return kai_cont_resume(k, err);
 }
 
 static KaiValue *_kai_net_err_msg(KaiCont *k, const char *msg) {
     KaiValue *m = kai_str(msg);
-    KaiValue *err = kai_variant(0, "Err", 1, &m);
+    KaiValue *err = kai_variant(3, "Err", 1, &m);
     return kai_cont_resume(k, err);
 }
 
@@ -5930,7 +5930,7 @@ static KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue
         return _kai_net_err(k, saved_errno ? saved_errno : ECONNREFUSED);
     }
     KaiValue *conn = _kai_net_make_conn(fd);
-    KaiValue *ok   = kai_variant(0, "Ok", 1, &conn);
+    KaiValue *ok   = kai_variant(2, "Ok", 1, &conn);
     return kai_cont_resume(k, ok);
 }
 
@@ -6005,7 +6005,7 @@ static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue 
     }
 
     KaiValue *l  = _kai_net_make_listener(fd, actual_port);
-    KaiValue *ok = kai_variant(0, "Ok", 1, &l);
+    KaiValue *ok = kai_variant(2, "Ok", 1, &l);
     return kai_cont_resume(k, ok);
 }
 
@@ -6036,7 +6036,7 @@ static KaiValue *kai_default_nettcp_accept(void *self, KaiValue *l, KaiCont *k) 
         if (cfd >= 0) {
             kai_socket_set_nonblock(cfd);
             KaiValue *conn = _kai_net_make_conn(cfd);
-            KaiValue *ok   = kai_variant(0, "Ok", 1, &conn);
+            KaiValue *ok   = kai_variant(2, "Ok", 1, &conn);
             return kai_cont_resume(k, ok);
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -6122,7 +6122,7 @@ static KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data
     }
 
     KaiValue *cnt = kai_int((int64_t) total);
-    KaiValue *ok  = kai_variant(0, "Ok", 1, &cnt);
+    KaiValue *ok  = kai_variant(2, "Ok", 1, &cnt);
     return kai_cont_resume(k, ok);
 }
 
@@ -6173,7 +6173,7 @@ static KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max,
     KaiValue *acc = kai_nil();
     for (ssize_t i = got; i > 0;) { --i; acc = kai_cons(kai_int((int64_t) buf[i]), acc); }
     free(buf);
-    KaiValue *ok = kai_variant(0, "Ok", 1, &acc);
+    KaiValue *ok = kai_variant(2, "Ok", 1, &acc);
     return kai_cont_resume(k, ok);
 }
 
@@ -6227,15 +6227,16 @@ static KaiValue *kai_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
 typedef struct {
     int         signo;
     const char *name;
+    int32_t     tag;       /* atom-style variant tag, docs/variant-tags.md */
 } KaiSignalEntry;
 
 static const KaiSignalEntry kai_signal_entries[] = {
-    { SIGINT,  "SigInt"  },
-    { SIGTERM, "SigTerm" },
-    { SIGHUP,  "SigHup"  },
-    { SIGUSR1, "SigUsr1" },
-    { SIGUSR2, "SigUsr2" },
-    { 0,       NULL      }
+    { SIGINT,  "SigInt",  4 },
+    { SIGTERM, "SigTerm", 5 },
+    { SIGHUP,  "SigHup",  6 },
+    { SIGUSR1, "SigUsr1", 7 },
+    { SIGUSR2, "SigUsr2", 8 },
+    { 0,       NULL,      0 }
 };
 
 static int _kai_signal_from_variant(KaiValue *sig_v) {
@@ -6251,7 +6252,7 @@ static int _kai_signal_from_variant(KaiValue *sig_v) {
 static KaiValue *_kai_signal_to_variant(int signo) {
     for (const KaiSignalEntry *e = kai_signal_entries; e->name; ++e) {
         if (e->signo == signo) {
-            return kai_variant(0, e->name, 0, NULL);
+            return kai_variant(e->tag, e->name, 0, NULL);
         }
     }
     return NULL;
@@ -6464,19 +6465,19 @@ static int _kai_process_record_pid(KaiValue *v) {
  * match read and silently corrupt every Process.wait dispatch. */
 static KaiValue *_kai_process_make_exit_exited(int code) {
     KaiVarSlot s; s.i64 = (int64_t) code;
-    return kai_variant_u(0, "Exited", 1, KAI_VAR_SLOT_INT, &s);
+    return kai_variant_u(9, "Exited", 1, KAI_VAR_SLOT_INT, &s);
 }
 
 static KaiValue *_kai_process_make_exit_signaled(int signo) {
     KaiVarSlot s; s.i64 = (int64_t) signo;
-    return kai_variant_u(1, "Signaled", 1, KAI_VAR_SLOT_INT, &s);
+    return kai_variant_u(10, "Signaled", 1, KAI_VAR_SLOT_INT, &s);
 }
 
 static KaiValue *_kai_process_err(KaiCont *k, int saved_errno) {
     const char *msg = strerror(saved_errno);
     if (!msg) msg = "unknown error";
     KaiValue *m = kai_str(msg);
-    KaiValue *err = kai_variant(0, "Err", 1, &m);
+    KaiValue *err = kai_variant(3, "Err", 1, &m);
     return kai_cont_resume(k, err);
 }
 
@@ -6580,7 +6581,7 @@ static KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *
     int pid = _kai_process_record_pid(child);
     if (pid <= 0) {
         KaiValue *m = kai_str("wait: invalid Child");
-        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        KaiValue *err = kai_variant(3, "Err", 1, &m);
         return kai_cont_resume(k, err);
     }
     kai_reactor_init();
@@ -6608,7 +6609,7 @@ static KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *
     } else {
         exit_v = _kai_process_make_exit_exited(-1);
     }
-    KaiValue *ok = kai_variant(0, "Ok", 1, &exit_v);
+    KaiValue *ok = kai_variant(2, "Ok", 1, &exit_v);
     return kai_cont_resume(k, ok);
 }
 
@@ -6620,7 +6621,7 @@ static KaiValue *kai_default_process_kill(void *self, KaiValue *child, KaiValue 
     int pid = _kai_process_record_pid(child);
     if (pid <= 0) {
         KaiValue *m = kai_str("kill: invalid Child");
-        KaiValue *err = kai_variant(0, "Err", 1, &m);
+        KaiValue *err = kai_variant(3, "Err", 1, &m);
         return kai_cont_resume(k, err);
     }
     int signo = (sig && sig->tag == KAI_INT) ? (int) sig->as.i : 0;
@@ -6628,7 +6629,7 @@ static KaiValue *kai_default_process_kill(void *self, KaiValue *child, KaiValue 
         return _kai_process_err(k, errno);
     }
     KaiValue *u  = kai_unit();
-    KaiValue *ok = kai_variant(0, "Ok", 1, &u);
+    KaiValue *ok = kai_variant(2, "Ok", 1, &u);
     return kai_cont_resume(k, ok);
 }
 
