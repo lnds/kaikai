@@ -49,7 +49,7 @@ SRC     := compiler.kai
 # becomes the authoritative input and compiler.kai becomes the
 # generated artifact. Until then, src/all.kai is the staging ground
 # and compiler.kai stays as the authoritative source.
-BUNDLE_SRCS := src/all.kai
+BUNDLE_SRCS := src/chars.kai src/all.kai
 
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
