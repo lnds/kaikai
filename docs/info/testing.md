@@ -11,7 +11,8 @@ produces a test runner binary.
 
 `assert` takes a boolean expression; on false it records a failure
 with the expression's source text and line. There is no special
-matcher DSL — `assert x == 42` is enough.
+matcher DSL — `assert x == 42` is enough. `assert` belongs inside
+`test` and `bench` bodies; `check` bodies are different (see below).
 
 ## Driver commands
 
@@ -41,11 +42,19 @@ fn main() : Int = 0
 fn double(n: Int) : Int = n * 2
 
 check "double of double is times 4" with n: Int {
-  assert double(double(n)) == n * 4
+  double(double(n)) == n * 4
 }
 
 fn main() : Int = 0
 ```
+
+A `check` body is a **Bool expression**, not a statement block:
+the runner generates inputs for the `with`-clause params, evaluates
+the body, and treats `true` as the property holding for that
+sample. Do not use `assert` inside `check` — `assert` is a statement
+with no value, so the body has nothing to witness and the runner
+records a counterexample on every iteration. Express the property
+directly: `n + 1 == 1 + n`, `not p(x) or q(x)`, etc.
 
 Shrinking is built in. On failure, the runner reports the minimal
 counterexample.
