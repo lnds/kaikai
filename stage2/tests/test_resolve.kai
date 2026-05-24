@@ -1,0 +1,192 @@
+# compiler/resolve.kai unit tests — per-module tests for the
+# post-parse name resolver extracted under issue #677 Phase 1i.
+#
+# Coverage splits two ways:
+#
+#   - Pure helpers exercised directly through the public surface:
+#     env_new / add_all (scope construction, read back via the pub
+#     `Env` record's `scopes` / `had_error` fields), last_segment
+#     (import-path tail), and prelude_names (membership of the
+#     canonical built-in list).
+#   - End-to-end paths driven through the real parser: tokenize ->
+#     parse_program -> register_decls / chk_decls / collect_effect_names
+#     / check_program, so the resolver is exercised on genuine AST
+#     rather than hand-built Decl nodes.
+#
+# The internal walkers (chk_expr / bind_pat / the arity table / the
+# tyvar collectors) are not `pub`, so they are covered transitively
+# via check_program rather than called directly — and exhaustively
+# during every selfhost.
+#
+# Runner: `kai test stage2/.`. Tier 1 wiring deferred until
+# #452 / #677 Phase 2 lowers the per-test-file cost.
+
+import compiler.lex
+import compiler.ast
+import compiler.parse
+import compiler.resolve
+
+# ---- helpers ----
+
+fn scopes_contains(scopes: [[String]], target: String) : Bool {
+  match scopes {
+    [] -> false
+    [top, ...rest] -> if list_has(top, target) { true } else { scopes_contains(rest, target) }
+  }
+}
+
+fn parse_src(src: String) : [Decl] / Console {
+  match resolve_parse(src) {
+    Some(ds) -> ds
+    None     -> []
+  }
+}
+
+fn resolve_parse(src: String) : Option[[Decl]] / Console {
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  r.decls
+}
+
+# ---- env construction ----
+
+test "env_new starts with one empty scope and no error" {
+  let e = resolve.env_new("f.kai")
+  assert not e.had_error
+  match e.scopes {
+    [top] -> { assert list_length(top) == 0 }
+    _ -> { assert false }
+  }
+}
+
+test "add_all binds every name into the top scope" {
+  let e0 = resolve.env_new("f.kai")
+  let e1 = resolve.add_all(e0, ["alpha", "beta", "gamma"])
+  assert scopes_contains(e1.scopes, "alpha")
+  assert scopes_contains(e1.scopes, "beta")
+  assert scopes_contains(e1.scopes, "gamma")
+  assert not scopes_contains(e1.scopes, "delta")
+}
+
+test "add_all of an empty list leaves the env unchanged" {
+  let e0 = resolve.env_new("f.kai")
+  let e1 = resolve.add_all(e0, [])
+  match e1.scopes {
+    [top] -> { assert list_length(top) == 0 }
+    _ -> { assert false }
+  }
+}
+
+# ---- prelude seeding ----
+
+test "prelude_names includes the core IO and list built-ins" {
+  let p = resolve.prelude_names()
+  assert list_has(p, "print")
+  assert list_has(p, "panic")
+  assert list_has(p, "map")
+  assert list_has(p, "filter")
+  assert list_has(p, "reduce")
+}
+
+test "prelude_names includes the Option / Result constructors" {
+  let p = resolve.prelude_names()
+  assert list_has(p, "Some")
+  assert list_has(p, "None")
+  assert list_has(p, "Ok")
+  assert list_has(p, "Err")
+}
+
+test "prelude_names excludes a name that is not a built-in" {
+  let p = resolve.prelude_names()
+  assert not list_has(p, "definitely_not_a_prelude_name")
+}
+
+# ---- import-path tail ----
+
+test "last_segment returns the final dotted component" {
+  assert resolve.last_segment("a.b.c") == "c"
+  assert resolve.last_segment("compiler.resolve") == "resolve"
+}
+
+test "last_segment of a single segment is the whole string" {
+  assert resolve.last_segment("solo") == "solo"
+}
+
+# ---- pre-registration through the real parser ----
+
+test "register_decls binds every top-level fn name" {
+  let decls = parse_src("fn alpha() : Int = 1\nfn beta() : Int = 2\nfn main() : Int = 0\n")
+  let e0 = resolve.env_new("<test>")
+  let e1 = resolve.register_decls(e0, decls)
+  assert scopes_contains(e1.scopes, "alpha")
+  assert scopes_contains(e1.scopes, "beta")
+  assert scopes_contains(e1.scopes, "main")
+}
+
+test "register_decls binds sum-type variant constructors" {
+  let decls = parse_src("type Color = Red | Green | Blue\nfn main() : Int = 0\n")
+  let e0 = resolve.env_new("<test>")
+  let e1 = resolve.register_decls(e0, decls)
+  assert scopes_contains(e1.scopes, "Color")
+  assert scopes_contains(e1.scopes, "Red")
+  assert scopes_contains(e1.scopes, "Green")
+  assert scopes_contains(e1.scopes, "Blue")
+}
+
+test "collect_effect_names returns declared effect names only" {
+  let decls = parse_src("effect Beep {\n  boop() : Unit\n}\nfn main() : Int = 0\n")
+  let names = resolve.collect_effect_names(decls)
+  assert list_has(names, "Beep")
+  assert not list_has(names, "main")
+}
+
+test "collect_effect_names is empty when no effect is declared" {
+  let decls = parse_src("fn main() : Int = 0\n")
+  let names = resolve.collect_effect_names(decls)
+  assert list_length(names) == 0
+}
+
+# ---- check_program end to end ----
+
+test "check_program accepts a well-formed program" {
+  let decls = parse_src("fn id(x: Int) : Int = x\nfn main() : Int = id(0)\n")
+  assert resolve.check_program("<test>", decls) == 0
+}
+
+test "check_program rejects an unbound name" {
+  let decls = parse_src("fn main() : Int = nope_undefined\n")
+  assert resolve.check_program("<test>", decls) == 1
+}
+
+test "check_program accepts a let-bound local" {
+  let decls = parse_src("fn main() : Int = {\n  let x = 7\n  x\n}\n")
+  assert resolve.check_program("<test>", decls) == 0
+}
+
+# ---- property checks (Bool body, no assert) ----
+
+check "last_segment of an undotted name is the name itself" with s: String {
+  # a name with no `.` is its own last segment
+  let has_dot = string_contains(s, ".")
+  has_dot or resolve.last_segment(s) == s
+}
+
+check "add_all then membership holds for the added name" with s: String {
+  let e = resolve.add_all(resolve.env_new("<test>"), [s])
+  scopes_contains(e.scopes, s)
+}
+
+check "register_decls is idempotent on the bound-name set" with n: Int {
+  # registering the same decls twice keeps each name present
+  let decls = parse_src("fn solo() : Int = #{mod_nonneg(n, 100)}\nfn main() : Int = 0\n")
+  let e0 = resolve.env_new("<test>")
+  let once = resolve.register_decls(e0, decls)
+  let twice = resolve.register_decls(once, decls)
+  scopes_contains(twice.scopes, "solo") and scopes_contains(twice.scopes, "main")
+}
+
+fn mod_nonneg(n: Int, m: Int) : Int {
+  let r = n - (n / m) * m
+  if r < 0 { r + m } else { r }
+}
+
+fn main() : Int = 0
