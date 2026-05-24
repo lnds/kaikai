@@ -80,6 +80,23 @@ fn worker() : Int / Cancel + Stdout = {
 fn main() : Int / Cancel + Stdout = worker()
 ```
 
+The same handler fires whether the cancel was raised synchronously
+inside the body (a direct `Cancel.raise()`) or arrived from a sibling
+fiber's `Spawn.cancel(self_fiber)`. Both paths walk the target
+fiber's evidence stack for the innermost `with Cancel { ... }` in
+scope and dispatch through it; only when no user handler is in
+scope does the runtime unwind the fiber to its trampoline directly.
+This makes "wrap the body in `handle { ... } with Cancel { raise(_)
+-> cleanup }`" the canonical pattern for graceful shutdown — a
+SIGINT-driven supervisor that calls `Spawn.cancel(server)` runs the
+server's cleanup before the fiber terminates.
+
+The exception is a fiber that is `Link.link`'d to a peer with
+`Spawn.set_trap_exit(true)`: in that case the runtime bypasses the
+fiber's own Cancel handlers so the supervisor observes the child's
+termination through its mailbox (see `kai info actors` §*Trap-exit
+semantics*).
+
 ## NOT IN KAIKAI
 
 - `async` / `await` keywords. Concurrency is an effect, not syntax.
