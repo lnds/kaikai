@@ -563,6 +563,18 @@ fn err_el(p: Parser) : PEL = PEL { p: p, r: None }
 
 fn parse_expr(p: Parser) : PExpr / Console = parse_pipe(p)
 
+# Parse a single expression from raw source — the shape every
+# string-interpolation `#{...}` body takes. Tokenises, parses, and
+# returns just the AST, hiding the PExpr workspace type from the
+# emitter / typer / codegen callers (issue #677 phase 1h H0). This
+# is the only parse entry point besides parse_program that downstream
+# phases reach for; when parse.kai extracts it travels as `pub`.
+pub fn parse_interp_expr(src: String) : Option[Expr] / Console {
+  let toks = tokenize(src)
+  let prs = parser_new("<interp>", src, toks)
+  parse_expr(prs).r
+}
+
 fn parse_pipe(p: Parser) : PExpr / Console {
 
   let r = parse_or(p)
@@ -2225,42 +2237,10 @@ fn parse_record_pos_loop(p: Parser, acc: [FieldInit], i: Int, type_name: String,
   }
 }
 
-# Sentinel field-name builder. Resolved by `desugar_pos_records_decls`
-# back to the record's declared field name in declaration order. Any
-# leak into a downstream pass is a bug — the sentinel is never a
-# legal record-field identifier (real ones cannot start with `__`).
-fn pos_field_marker(i: Int) : String =
-  string_concat("__pos_", string_concat(int_to_string(i), "__"))
-
-# issue #326 — sentinel field name used by the parser when the
-# first item in a record literal is `...src`. `dpr_record_lit`
-# detects this marker, captures the source expression, and expands
-# it against the record's declared fields before any later pass
-# sees the literal. As with `__pos_<i>__`, real field names
-# cannot start with `__`, so the sentinel is unambiguous.
-fn spread_field_marker() : String = "__spread__"
-
-fn is_spread_field_marker(s: String) : Bool = s == "__spread__"
-
-fn is_pos_field_marker(s: String) : Bool {
-  let n = string_length(s)
-  if n < 8 { false }
-  else {
-    match char_at(s, 0) { Some(c0) -> if c0 != '_' { false } else {
-      match char_at(s, 1) { Some(c1) -> if c1 != '_' { false } else {
-        match char_at(s, 2) { Some(c2) -> if c2 != 'p' { false } else {
-          match char_at(s, 3) { Some(c3) -> if c3 != 'o' { false } else {
-            match char_at(s, 4) { Some(c4) -> if c4 != 's' { false } else {
-              match char_at(s, 5) { Some(c5) -> c5 == '_'
-                None -> false
-              }
-              } None -> false }
-            } None -> false }
-          } None -> false }
-        } None -> false }
-      } None -> false }
-  }
-}
+# pos_field_marker / spread_field_marker / is_pos_field_marker /
+# is_spread_field_marker moved to compiler/ast.kai (issue #677 phase
+# 1h H0): they are an AST-shape convention shared with codegen, not
+# parser-internal.
 
 fn parse_record_fields_loop(p: Parser, acc: [FieldInit], type_name: String, tname: Token) : PExpr / Console {
 
@@ -12643,10 +12623,7 @@ fn emit_interp_part(src: String, p: IPart, lcs: [String], fns: [EFn], variants: 
   match p {
     IpLit(_, raw) -> cat3("kai_str(", raw, ")")
     IpExp(expr_src) -> {
-      let toks = tokenize(expr_src)
-      let prs = parser_new("<interp>", expr_src, toks)
-      let r = parse_expr(prs)
-      match r.r {
+      match parse_interp_expr(expr_src) {
         Some(e) -> cat3("kai_to_string(", emit_expr(src,e, lcs, fns, variants, lams, cls), ")")
         None -> "kai_str(\"\")"
       }
@@ -13120,10 +13097,7 @@ fn fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [Strin
     [p, ...rest] -> match p {
       IpLit(_, _) -> fv_interp_parts(rest, own, globals, acc)
       IpExp(esrc) -> {
-        let toks = tokenize(esrc)
-        let prs = parser_new("<interp>", esrc, toks)
-        let r = parse_expr(prs)
-        let acc1 = match r.r {
+        let acc1 = match parse_interp_expr(esrc) {
           Some(e) -> fv_expr(e, own, globals, acc)
           None -> acc
         }
@@ -13551,10 +13525,7 @@ fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect / Console {
     [p, ...rest] -> match p {
       IpLit(_, _) -> collect_interp_parts(rest, st)
       IpExp(esrc) -> {
-        let toks = tokenize(esrc)
-        let prs = parser_new("<interp>", esrc, toks)
-        let r = parse_expr(prs)
-        let st1 = match r.r { Some(e) -> collect_expr(e, st) None -> st }
+        let st1 = match parse_interp_expr(esrc) { Some(e) -> collect_expr(e, st) None -> st }
         collect_interp_parts(rest, st1)
       }
     }
@@ -23102,10 +23073,7 @@ fn interp_part_to_expr(p: IPart, op_names: [String], op_arities: [OpAr],
   match p {
     IpLit(_, raw_quoted) -> mk_expr(EStr(raw_quoted, false), line, col)
     IpExp(expr_src) -> {
-      let toks = tokenize(expr_src)
-      let prs = parser_new("<interp>", expr_src, toks)
-      let r = parse_expr(prs)
-      let inner = match r.r {
+      let inner = match parse_interp_expr(expr_src) {
         # Issue #217: run the qualified-call resolver on the
         # freshly-parsed sub-expression before recursing into the
         # interp desugar. Without this step `list.sum(xs)` and other
@@ -42957,10 +42925,7 @@ fn pcs_collect_uses_interp_parts(parts: [IPart], scope: [String], in_lam: Bool,
     [p, ...rest] -> match p {
       IpLit(_, _) -> pcs_collect_uses_interp_parts(rest, scope, in_lam, acc)
       IpExp(esrc) -> {
-        let toks = tokenize(esrc)
-        let prs = parser_new("<interp>", esrc, toks)
-        let r = parse_expr(prs)
-        let acc1 = match r.r {
+        let acc1 = match parse_interp_expr(esrc) {
           Some(e) -> pcs_collect_uses_expr(e, scope, in_lam, acc)
           None -> acc
         }
@@ -44973,10 +44938,7 @@ fn scan_uses_interp_parts(parts: [IPart], in_lam: Bool) : [Use] / Console {
     [p, ...rest] -> match p {
       IpLit(_, _) -> scan_uses_interp_parts(rest, in_lam)
       IpExp(esrc) -> {
-        let toks = tokenize(esrc)
-        let prs = parser_new("<interp>", esrc, toks)
-        let r = parse_expr(prs)
-        let head = match r.r {
+        let head = match parse_interp_expr(esrc) {
           Some(e) -> scan_uses_expr(e, in_lam)
           None -> []
         }
@@ -48471,10 +48433,7 @@ fn llvm_emit_interp_part(e: LlvmEmit, p: IPart) : LlvmEmit / Console {
   match p {
     IpLit(body, _) -> llvm_emit_plain_str_body(e, body)
     IpExp(expr_src) -> {
-      let toks = tokenize(expr_src)
-      let prs = parser_new("<interp>", expr_src, toks)
-      let res = parse_expr(prs)
-      match res.r {
+      match parse_interp_expr(expr_src) {
         Some(ex) -> {
           let ee = llvm_emit_expr(e, ex)
           let r = llvm_fresh_reg(ee)
