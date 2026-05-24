@@ -1,0 +1,211 @@
+# compiler/refinements.kai unit tests — per-module tests for the
+# refinement-discharge engine extracted under issue #677 Phase 1h
+# (sub-lane H1).
+#
+# Coverage focuses on the pure, AST-only public surface that can be
+# exercised without the parser or typer:
+#
+# - synth_refine_pred_fn_name — pure string mint.
+# - refinement_pure_names — the closed pure-call allow-list.
+# - find_impure_call — walks an Expr for a call outside the allow-list.
+# - try_eval_int — compile-time integer partial evaluator.
+# - try_eval_pred — compile-time boolean predicate evaluator.
+#
+# The regex-subsumption, interval, and call-site-substitution paths
+# (regex_pred_subsumed, check_pred_with_interval, analyze_calls, …)
+# need richer AST fixtures or full Decl streams; they are exercised
+# implicitly during every selfhost and by the call-elision fixtures
+# in examples/. Re-testing them here would duplicate the parser
+# harness.
+#
+# Runner: `../bin/kai test tests/test_refinements.kai` from stage2/,
+# or `kai test stage2/.`. Tier 1 wiring deferred until #452 / #677
+# Phase 2 lowers the per-test-file cost.
+
+import compiler.ast
+import compiler.refinements
+
+# ---- helpers: build small Expr fixtures via ast.mk_expr ----
+
+fn lit(n: Int) : Expr = ast.mk_expr(ast.EInt(n), 0, 0)
+fn boollit(b: Bool) : Expr = ast.mk_expr(ast.EBool(b), 0, 0)
+fn binop(op: String, a: Expr, b: Expr) : Expr = ast.mk_expr(ast.EBinop(op, a, b), 0, 0)
+fn unop(op: String, x: Expr) : Expr = ast.mk_expr(ast.EUnop(op, x), 0, 0)
+fn varexpr(name: String) : Expr = ast.mk_expr(ast.EVar(name), 0, 0)
+
+# local membership helper (kept here to avoid importing util just for tests)
+fn names_has(xs: [String], target: String) : Bool {
+  match xs {
+    [] -> false
+    [x, ...rest] -> if x == target { true } else { names_has(rest, target) }
+  }
+}
+
+# ---- synth_refine_pred_fn_name ----
+
+test "synth_refine_pred_fn_name prefixes the type name" {
+  assert refinements.synth_refine_pred_fn_name("Pos") == "__ref_pred_Pos"
+}
+
+test "synth_refine_pred_fn_name on empty name yields the bare prefix" {
+  assert refinements.synth_refine_pred_fn_name("") == "__ref_pred_"
+}
+
+# ---- refinement_pure_names ----
+
+test "refinement_pure_names includes is_some" {
+  assert names_has(refinements.refinement_pure_names(), "is_some")
+}
+
+test "refinement_pure_names includes matches" {
+  assert names_has(refinements.refinement_pure_names(), "matches")
+}
+
+test "refinement_pure_names excludes an arbitrary impure name" {
+  assert not names_has(refinements.refinement_pure_names(), "println")
+}
+
+# ---- find_impure_call ----
+
+test "find_impure_call returns None for a literal" {
+  match refinements.find_impure_call(lit(1), refinements.refinement_pure_names()) {
+    None -> { assert true }
+    Some(_) -> { assert false }
+  }
+}
+
+test "find_impure_call returns None for a pure arithmetic expression" {
+  let e = binop("+", lit(1), lit(2))
+  match refinements.find_impure_call(e, refinements.refinement_pure_names()) {
+    None -> { assert true }
+    Some(_) -> { assert false }
+  }
+}
+
+test "find_impure_call flags a call to a name outside the allow-list" {
+  let call = ast.mk_expr(ast.ECall(varexpr("side_effect"), []), 0, 0)
+  match refinements.find_impure_call(call, refinements.refinement_pure_names()) {
+    Some(n) -> { assert n == "side_effect" }
+    None -> { assert false }
+  }
+}
+
+# ---- try_eval_int ----
+
+test "try_eval_int evaluates a bare literal" {
+  match refinements.try_eval_int(lit(42)) {
+    Some(v) -> { assert v == 42 }
+    None -> { assert false }
+  }
+}
+
+test "try_eval_int folds addition" {
+  match refinements.try_eval_int(binop("+", lit(2), lit(3))) {
+    Some(v) -> { assert v == 5 }
+    None -> { assert false }
+  }
+}
+
+test "try_eval_int folds nested arithmetic" {
+  let e = binop("*", binop("+", lit(2), lit(3)), lit(4))
+  match refinements.try_eval_int(e) {
+    Some(v) -> { assert v == 20 }
+    None -> { assert false }
+  }
+}
+
+test "try_eval_int handles unary negation" {
+  match refinements.try_eval_int(unop("-", lit(7))) {
+    Some(v) -> { assert v == 0 - 7 }
+    None -> { assert false }
+  }
+}
+
+test "try_eval_int gives up on a variable" {
+  match refinements.try_eval_int(varexpr("x")) {
+    None -> { assert true }
+    Some(_) -> { assert false }
+  }
+}
+
+# ---- try_eval_pred ----
+
+test "try_eval_pred evaluates a bare bool" {
+  match refinements.try_eval_pred(boollit(true)) {
+    Some(b) -> { assert b }
+    None -> { assert false }
+  }
+}
+
+test "try_eval_pred folds a true comparison" {
+  match refinements.try_eval_pred(binop("<", lit(1), lit(2))) {
+    Some(b) -> { assert b }
+    None -> { assert false }
+  }
+}
+
+test "try_eval_pred folds a false comparison" {
+  match refinements.try_eval_pred(binop(">", lit(1), lit(2))) {
+    Some(b) -> { assert not b }
+    None -> { assert false }
+  }
+}
+
+test "try_eval_pred short-circuits and with a false left" {
+  let e = binop("and", boollit(false), varexpr("unknown"))
+  match refinements.try_eval_pred(e) {
+    Some(b) -> { assert not b }
+    None -> { assert false }
+  }
+}
+
+test "try_eval_pred short-circuits or with a true left" {
+  let e = binop("or", boollit(true), varexpr("unknown"))
+  match refinements.try_eval_pred(e) {
+    Some(b) -> { assert b }
+    None -> { assert false }
+  }
+}
+
+test "try_eval_pred negates with not" {
+  match refinements.try_eval_pred(unop("not", boollit(false))) {
+    Some(b) -> { assert b }
+    None -> { assert false }
+  }
+}
+
+test "try_eval_pred gives up on an unresolved variable predicate" {
+  match refinements.try_eval_pred(binop("<", varexpr("x"), lit(5))) {
+    None -> { assert true }
+    Some(_) -> { assert false }
+  }
+}
+
+# ---- property checks ----
+
+check "try_eval_int round-trips any integer literal" with n: Int {
+  match refinements.try_eval_int(lit(n)) {
+    Some(v) -> v == n
+    None -> false
+  }
+}
+
+check "try_eval_int addition agrees with native +" with n: Int {
+  match refinements.try_eval_int(binop("+", lit(n), lit(3))) {
+    Some(v) -> v == n + 3
+    None -> false
+  }
+}
+
+check "try_eval_pred equality agrees with native ==" with n: Int {
+  match refinements.try_eval_pred(binop("==", lit(n), lit(n))) {
+    Some(b) -> b
+    None -> false
+  }
+}
+
+check "synth_refine_pred_fn_name is injective on distinct suffixes" with n: Int {
+  let a = refinements.synth_refine_pred_fn_name("T#{n}")
+  let b = refinements.synth_refine_pred_fn_name("T#{n + 1}")
+  not (a == b)
+}

@@ -1,0 +1,203 @@
+# compiler/parse.kai unit tests — per-module tests for the parser
+# extracted under issue #677 Phase 1h (sub-lane H2, the last of the
+# parse-extraction sequence).
+#
+# Coverage focuses on the two public entry points that can be driven
+# from a string without the rest of the pipeline:
+#
+# - parse_interp_expr — parse a single expression (the `#{...}`
+#   interpolation-body entry); exercises the precedence-climbing
+#   expression grammar and literal decoders.
+# - parse_program — parse a whole source into a [Decl]; exercises the
+#   declaration grammar and the program driver.
+#
+# The grammar is large; these tests assert the AST *shape* for the
+# common forms rather than re-deriving every production (the selfhost
+# round-trip and the examples/ fixtures cover the long tail). Pattern,
+# type-expression, effect-row, and sugar-desugar paths are exercised
+# implicitly by parse_program over representative sources.
+#
+# Runner: `../bin/kai test tests/test_parse.kai` from stage2/, or
+# `kai test stage2/.`.
+
+import compiler.ast
+import compiler.parse
+
+# ---- parse_interp_expr: literals ----
+
+test "parse_interp_expr parses an integer literal" {
+  match parse.parse_interp_expr("42") {
+    Some(e) -> match e.kind {
+      ast.EInt(n) -> { assert n == 42 }
+      _ -> { assert false }
+    }
+    None -> { assert false }
+  }
+}
+
+test "parse_interp_expr parses a variable reference" {
+  match parse.parse_interp_expr("foo") {
+    Some(e) -> match e.kind {
+      ast.EVar(name) -> { assert name == "foo" }
+      _ -> { assert false }
+    }
+    None -> { assert false }
+  }
+}
+
+test "parse_interp_expr parses a bool literal" {
+  match parse.parse_interp_expr("true") {
+    Some(e) -> match e.kind {
+      ast.EBool(b) -> { assert b }
+      _ -> { assert false }
+    }
+    None -> { assert false }
+  }
+}
+
+# ---- parse_interp_expr: operators + precedence ----
+
+test "parse_interp_expr parses addition as EBinop" {
+  match parse.parse_interp_expr("1 + 2") {
+    Some(e) -> match e.kind {
+      ast.EBinop(op, _, _) -> { assert op == "+" }
+      _ -> { assert false }
+    }
+    None -> { assert false }
+  }
+}
+
+test "parse_interp_expr respects multiplication-over-addition precedence" {
+  # 1 + 2 * 3 must parse as 1 + (2 * 3): top node is `+`, right child is `*`.
+  match parse.parse_interp_expr("1 + 2 * 3") {
+    Some(e) -> match e.kind {
+      ast.EBinop(op, _, rhs) -> {
+        assert op == "+"
+        match rhs.kind {
+          ast.EBinop(rop, _, _) -> { assert rop == "*" }
+          _ -> { assert false }
+        }
+      }
+      _ -> { assert false }
+    }
+    None -> { assert false }
+  }
+}
+
+test "parse_interp_expr parses a parenthesised expression flattening the grouping" {
+  # (1 + 2) * 3: top node is `*`, left child is `+`.
+  match parse.parse_interp_expr("(1 + 2) * 3") {
+    Some(e) -> match e.kind {
+      ast.EBinop(op, lhs, _) -> {
+        assert op == "*"
+        match lhs.kind {
+          ast.EBinop(lop, _, _) -> { assert lop == "+" }
+          _ -> { assert false }
+        }
+      }
+      _ -> { assert false }
+    }
+    None -> { assert false }
+  }
+}
+
+test "parse_interp_expr parses a function call" {
+  match parse.parse_interp_expr("f(1, 2)") {
+    Some(e) -> match e.kind {
+      ast.ECall(callee, args) -> {
+        match callee.kind {
+          ast.EVar(name) -> { assert name == "f" }
+          _ -> { assert false }
+        }
+        assert list_length(args) == 2
+      }
+      _ -> { assert false }
+    }
+    None -> { assert false }
+  }
+}
+
+test "parse_interp_expr parses unary negation" {
+  match parse.parse_interp_expr("-x") {
+    Some(e) -> match e.kind {
+      ast.EUnop(op, _) -> { assert op == "-" }
+      _ -> { assert false }
+    }
+    None -> { assert false }
+  }
+}
+
+# ---- parse_program: declaration counting ----
+
+test "parse_program parses a single function declaration" {
+  let r = parse.parse_program("<test>", "fn answer() : Int = 42", tokenize("fn answer() : Int = 42"))
+  match r.decls {
+    Some(ds) -> { assert list_length(ds) == 1 }
+    None -> { assert false }
+  }
+}
+
+test "parse_program parses multiple declarations" {
+  let src = "fn a() : Int = 1\nfn b() : Int = 2\nfn c() : Int = 3"
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    Some(ds) -> { assert list_length(ds) == 3 }
+    None -> { assert false }
+  }
+}
+
+test "parse_program parses a type declaration" {
+  let src = "type Color = Red | Green | Blue"
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    Some(ds) -> { assert list_length(ds) == 1 }
+    None -> { assert false }
+  }
+}
+
+test "parse_program surfaces a parse error as None decls" {
+  # `fn` with no name is a syntax error; the driver returns decls: None.
+  let src = "fn = 1"
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    None -> { assert true }
+    Some(_) -> { assert false }
+  }
+}
+
+# ---- property checks ----
+
+check "parse_interp_expr round-trips any non-negative integer literal" with n: Int {
+  let src = "#{n}"
+  match parse.parse_interp_expr(src) {
+    Some(e) -> match e.kind {
+      ast.EInt(v) -> v == n
+      # negative n lexes as unary minus over a literal, not an EInt
+      ast.EUnop(op, _) -> op == "-" and n < 0
+      _ -> false
+    }
+    None -> false
+  }
+}
+
+check "parse_program decl count matches the number of fn lines" with n: Int {
+  # build a source of (1 + (n mod 5)) trivial fns and count them back
+  let k = 1 + mod_nonneg(n, 5)
+  let src = repeat_fns(k, 0, "")
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    Some(ds) -> list_length(ds) == k
+    None -> false
+  }
+}
+
+# helpers for the property check
+fn mod_nonneg(n: Int, m: Int) : Int {
+  let r = n - (n / m) * m
+  if r < 0 { r + m } else { r }
+}
+
+fn repeat_fns(k: Int, i: Int, acc: String) : String {
+  if i >= k { acc }
+  else { repeat_fns(k, i + 1, "#{acc}fn f#{i}() : Int = #{i}\n") }
+}
