@@ -1,0 +1,179 @@
+# compiler/fmt.kai unit tests — per-module tests for the `kai fmt`
+# canonical pretty-printer extracted under issue #677 Phase 1j.
+#
+# The public surface is tiny: `collect_comments` (recovers the line
+# comments the lexer discards) and `fmt_program` (AST -> canonical
+# source). Both are exercised end-to-end through the real lexer +
+# parser, since the formatter only makes sense on genuine AST:
+#
+#   tokenize -> parse_program -> fmt_program  (and collect_comments
+#   off the same token stream).
+#
+# Two assertion shapes:
+#   - Round-trip: a source that is already canonical formats back to
+#     itself (the strongest single check for a formatter).
+#   - Idempotence: formatting twice equals formatting once — the
+#     property a formatter must satisfy even on non-canonical input.
+#
+# The internal walkers (the per-node fmt_* helpers, the FmtSt writer,
+# the comment-drain machinery) are not `pub`; they are covered
+# transitively through fmt_program here and exhaustively during
+# every selfhost.
+#
+# Runner: `kai test stage2/.`. Tier 1 wiring deferred until
+# #452 / #677 Phase 2 lowers the per-test-file cost.
+
+import compiler.lex
+import compiler.ast
+import compiler.parse
+import compiler.fmt
+
+# ---- helpers ----
+
+# Parse `src` and pretty-print it. Returns "" on a parse failure so a
+# test that expected success fails loudly on the equality check.
+fn fmt_src(src: String) : String / Console {
+  let toks = tokenize(src)
+  let r = parse.parse_program("<test>", src, toks)
+  match r.decls {
+    Some(ds) -> fmt.fmt_program(ds, fmt.collect_comments(src, toks))
+    None     -> ""
+  }
+}
+
+# Count the comments collect_comments recovers from `src`.
+fn comment_count(src: String) : Int / Console {
+  let toks = tokenize(src)
+  list_length(fmt.collect_comments(src, toks))
+}
+
+# Whether any recovered comment in `src` carries the trailing flag.
+fn has_trailing_comment(src: String) : Bool / Console {
+  let toks = tokenize(src)
+  any_trailing(fmt.collect_comments(src, toks))
+}
+
+fn any_trailing(cs: [fmt.Cmt]) : Bool {
+  match cs {
+    [] -> false
+    [fmt.Cmt(_, _, _, is_tr), ...rest] -> if is_tr { true } else { any_trailing(rest) }
+  }
+}
+
+# Local non-negative modulo — the test files own this helper rather
+# than reaching for a prelude that may not bind it. Mirrors the copy
+# in test_resolve.kai / test_parse.kai.
+fn mod_nonneg(n: Int, m: Int) : Int {
+  let r = n - (n / m) * m
+  if r < 0 { r + m } else { r }
+}
+
+# Append `count` distinct `fn fN() : Int = 0` decls onto `acc`. Used
+# to vary the number of decls following a comment in a property check.
+fn repeat_decl(count: Int, acc: String) : String {
+  if count <= 0 {
+    acc
+  } else {
+    repeat_decl(count - 1, "#{acc}fn f#{count}() : Int = 0\n")
+  }
+}
+
+# ---- round-trip: canonical source formats back to itself ----
+
+test "round-trips a simple fn with a block body" {
+  let src = "fn double(x: Int) : Int {\n  x * 2\n}"
+  assert fmt_src(src) == src
+}
+
+test "round-trips a short-form fn body" {
+  let src = "fn id(x: Int) : Int = x"
+  assert fmt_src(src) == src
+}
+
+test "round-trips a record type decl" {
+  let src = "type Point = { x: Int, y: Int }"
+  assert fmt_src(src) == src
+}
+
+test "round-trips a sum type decl" {
+  let src = "type Shape\n  = Circle(Int)\n  | Square(Int)"
+  assert fmt_src(src) == src
+}
+
+test "round-trips an import decl" {
+  let src = "import compiler.ast"
+  assert fmt_src(src) == src
+}
+
+test "round-trips a match expression" {
+  let src = "fn f(o: Option[Int]) : Int {\n  match o {\n    Some(n) -> n\n    None -> 0\n  }\n}"
+  assert fmt_src(src) == src
+}
+
+test "round-trips a let-binding inside a block" {
+  let src = "fn g(x: Int) : Int {\n  let y = x + 1\n  y * y\n}"
+  assert fmt_src(src) == src
+}
+
+test "round-trips an if/else expression" {
+  # `if` brace-bodies always render multi-line — this is the canonical
+  # shape the formatter emits, so it must round-trip to itself.
+  let src = "fn h(b: Bool) : Int = if b {\n  1\n} else {\n  2\n}"
+  assert fmt_src(src) == src
+}
+
+test "round-trips a pipe chain" {
+  let src = "fn p(xs: [Int]) : Int = xs |> sum()"
+  assert fmt_src(src) == src
+}
+
+test "round-trips a test decl" {
+  let src = "test \"two is two\" {\n  assert 2 == 2\n}"
+  assert fmt_src(src) == src
+}
+
+# ---- comment recovery ----
+
+test "collect_comments recovers a leading comment" {
+  assert comment_count("# a note\nfn f() : Int = 1") == 1
+}
+
+test "collect_comments recovers multiple comments" {
+  assert comment_count("# one\n# two\nfn f() : Int = 1\n# three") == 3
+}
+
+test "collect_comments classifies a trailing comment" {
+  # code precedes the `#` on the same source line -> trailing.
+  assert has_trailing_comment("fn f() : Int = 1  # trailing")
+}
+
+test "collect_comments does not flag a leading comment as trailing" {
+  assert not has_trailing_comment("# leading\nfn f() : Int = 1")
+}
+
+test "a program with no comments yields an empty comment list" {
+  assert comment_count("fn f() : Int = 1") == 0
+}
+
+# ---- property checks ----
+
+# Idempotence: formatting an already-formatted program is a no-op.
+check "fmt_program is idempotent on a fn body" with n: Int {
+  let src = "fn k() : Int = #{mod_nonneg(n, 1000)}"
+  let once = fmt_src(src)
+  fmt_src(once) == once
+}
+
+# A fresh-line comment over an n-line program is recovered intact and
+# never classified trailing, regardless of how many decls follow it.
+check "a leading comment over n decls stays a single non-trailing comment" with n: Int {
+  let decls = repeat_decl(mod_nonneg(n, 8) + 1, "")
+  let src = "# note\n#{decls}"
+  comment_count(src) == 1 and not has_trailing_comment(src)
+}
+
+# Round-tripping a canonical short-form fn is stable across re-format.
+check "short-form fn round-trips for any non-negative literal" with n: Int {
+  let src = "fn lit() : Int = #{mod_nonneg(n, 100)}"
+  fmt_src(src) == src
+}
