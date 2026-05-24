@@ -1,0 +1,54 @@
+# Issue #682 fixture — `Spawn.cancel(target)` from a sibling fiber
+# now runs the user-installed `with Cancel { raise(_) -> ... }`
+# handler in the target before the fiber terminates.
+#
+# Pre-fix: `kai_check_cancel_yield_point` longjmped straight to the
+# trampoline's `cancel_pad`, marking the target CANCELLED without
+# visiting any user Cancel handler installed inside its body. The
+# synchronous path (a direct `Cancel.raise()` call) DID dispatch
+# through the user clause, so the two paths produced different
+# observable behaviour for what `kai info fibers` describes as the
+# same "inject Cancel at the next yield point" contract.
+#
+# Fix: the yield-point hook walks the evidence stack first. If a
+# user Cancel handler (one with a live `handle_jmp`) is in scope,
+# the hook dispatches through it exactly as a synchronous op call
+# site would (clause invoke + discard + longjmp to the handle's
+# landing pad). If no user handler is in scope, it falls back to
+# the cancel_pad as before.
+#
+# Expected output (the `worker: cancelled cleanly` line was the
+# missing one):
+#
+#   worker: parking
+#   canceller: cancelling
+#   worker: cancelled cleanly
+#   main: done
+
+import spawn
+import time
+
+fn worker() : Unit / Cancel + Stdout + Clock =
+  handle {
+    Stdout.print("worker: parking")
+    time.sleep(time.seconds(10))
+    Stdout.print("worker: woke (should not see this)")
+  } with Cancel {
+    raise(resume) -> Stdout.print("worker: cancelled cleanly")
+  }
+
+fn canceller(target: Fiber[Unit]) : Unit / Clock + Spawn + Cancel + Stdout = {
+  time.sleep(time.millis(300))
+  Stdout.print("canceller: cancelling")
+  Spawn.cancel(target)
+}
+
+fn main() : Int / Spawn + Cancel + Stdout + Clock = {
+  nursery { n ->
+    let w = n.spawn(worker)
+    let _ = n.spawn(() => canceller(w))
+    n.await(w)
+  }
+  Stdout.print("main: done")
+  0
+}
