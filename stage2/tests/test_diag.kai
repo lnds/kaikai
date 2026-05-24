@@ -1,0 +1,160 @@
+# compiler/diag.kai unit tests — per-module tests for the
+# diagnostics module extracted under issue #677 Phase 1d.
+#
+# Coverage focuses on the pure pieces of diag.kai that can be
+# tested without capturing stderr:
+#
+#   - spaces (string allocation)
+#   - nth_line (line lookup)
+#   - severity_to_string (label conversion)
+#   - mk_diag / ri_note / ri_help (constructor shape)
+#   - push_diag / finalize_diags (accumulator discipline)
+#   - levenshtein / closest_name (distance + suggestion)
+#   - abs_int (integer helper used cross-module)
+#
+# Skipped on purpose (effect-heavy or requires stderr capture):
+#
+#   - emit_src_snippet / emit_source_caret(_from_src) — Console
+#   - diag_error / diag_note / diag_help — Console + File
+#   - diag_error_from_src — Console
+#
+# Runner: `kai test stage2/.`. The package compile dominates
+# wall-clock time; tier1 wiring is deferred until #452 (cache
+# layer) drops the per-test-file cost.
+
+import compiler.diag
+
+test "spaces returns the requested width" {
+  assert string_length(diag.spaces(0)) == 0
+  assert string_length(diag.spaces(1)) == 1
+  assert string_length(diag.spaces(7)) == 7
+  assert string_length(diag.spaces(128)) == 128
+}
+
+test "spaces handles widths beyond the 128-char pool" {
+  assert string_length(diag.spaces(129)) == 129
+  assert string_length(diag.spaces(200)) == 200
+  assert string_length(diag.spaces(256)) == 256
+}
+
+test "spaces is content-correct (all ASCII 0x20)" {
+  let s = diag.spaces(5)
+  assert s == "     "
+}
+
+test "nth_line returns None for n <= 0 or beyond src" {
+  assert diag.nth_line("a\nb\nc", 0) == None
+  assert diag.nth_line("a\nb\nc", -1) == None
+  assert diag.nth_line("a\nb\nc", 4) == None
+  assert diag.nth_line("", 1) == Some("")
+}
+
+test "nth_line returns the requested 1-indexed line" {
+  assert diag.nth_line("first\nsecond\nthird", 1) == Some("first")
+  assert diag.nth_line("first\nsecond\nthird", 2) == Some("second")
+  assert diag.nth_line("first\nsecond\nthird", 3) == Some("third")
+}
+
+test "nth_line strips the trailing newline" {
+  match diag.nth_line("hello\nworld\n", 1) {
+    Some(s) -> { assert s == "hello" }
+    None -> { assert false }
+  }
+  match diag.nth_line("hello\nworld\n", 2) {
+    Some(s) -> { assert s == "world" }
+    None -> { assert false }
+  }
+}
+
+test "severity_to_string covers every Severity variant" {
+  assert diag.severity_to_string(diag.SevError) == "error"
+  assert diag.severity_to_string(diag.SevWarning) == "warning"
+  assert diag.severity_to_string(diag.SevHint) == "hint"
+  assert diag.severity_to_string(diag.SevInfo) == "info"
+}
+
+test "ri_note and ri_help prefix the message" {
+  match diag.ri_note("f.kai", 1, 1, "see also") {
+    diag.DR(_, _, _, m) -> { assert m == "note: see also" }
+  }
+  match diag.ri_help("f.kai", 1, 1, "try X") {
+    diag.DR(_, _, _, m) -> { assert m == "help: try X" }
+  }
+}
+
+test "mk_diag preserves all six fields" {
+  let related = [diag.ri_note("f.kai", 5, 10, "explained")]
+  let d = diag.mk_diag(diag.SevError, "f.kai", 5, 10, "oops", related)
+  match d {
+    diag.D(sev, file, line, col, msg, rel) -> {
+      assert diag.severity_to_string(sev) == "error"
+      assert file == "f.kai"
+      assert line == 5
+      assert col == 10
+      assert msg == "oops"
+      match rel {
+        [r, ..._] -> match r {
+          diag.DR(_, _, _, rm) -> { assert rm == "note: explained" }
+        }
+        [] -> { assert false }
+      }
+    }
+  }
+}
+
+test "push_diag prepends; finalize_diags reverses to source order" {
+  let d1 = diag.mk_diag(diag.SevError,   "f.kai", 1, 1, "one",   [])
+  let d2 = diag.mk_diag(diag.SevWarning, "f.kai", 2, 1, "two",   [])
+  let d3 = diag.mk_diag(diag.SevHint,    "f.kai", 3, 1, "three", [])
+  let acc = diag.push_diag(diag.push_diag(diag.push_diag([], d1), d2), d3)
+  let final = diag.finalize_diags(acc)
+  match final {
+    [a, b, c] -> {
+      match a { diag.D(_, _, _, _, m, _) -> { assert m == "one" } }
+      match b { diag.D(_, _, _, _, m, _) -> { assert m == "two" } }
+      match c { diag.D(_, _, _, _, m, _) -> { assert m == "three" } }
+    }
+    _ -> { assert false }
+  }
+}
+
+test "levenshtein satisfies the classic identity and substitution cases" {
+  assert diag.levenshtein("", "") == 0
+  assert diag.levenshtein("kaikai", "kaikai") == 0
+  assert diag.levenshtein("", "abc") == 3
+  assert diag.levenshtein("abc", "") == 3
+}
+
+test "levenshtein counts single insertions, deletions, substitutions" {
+  assert diag.levenshtein("cat", "cats") == 1
+  assert diag.levenshtein("cats", "cat") == 1
+  assert diag.levenshtein("cat", "bat") == 1
+}
+
+test "levenshtein on the textbook kitten/sitting case is 3" {
+  assert diag.levenshtein("kitten", "sitting") == 3
+}
+
+test "closest_name picks the nearest candidate within bound" {
+  let cands = ["map", "filter", "fold", "reduce", "concat"]
+  match diag.closest_name("filtr", cands) {
+    Some(s) -> { assert s == "filter" }
+    None -> { assert false }
+  }
+}
+
+test "closest_name returns None when nothing is within bound" {
+  let cands = ["alpha", "bravo", "charlie"]
+  assert diag.closest_name("zzzzzzzz", cands) == None
+}
+
+test "closest_name on an empty candidate list returns None" {
+  assert diag.closest_name("foo", []) == None
+}
+
+test "abs_int folds negatives to positives and preserves non-negatives" {
+  assert diag.abs_int(0) == 0
+  assert diag.abs_int(7) == 7
+  assert diag.abs_int(0 - 7) == 7
+  assert diag.abs_int(0 - 1) == 1
+}

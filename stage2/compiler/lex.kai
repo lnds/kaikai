@@ -1,0 +1,942 @@
+# compiler/lex.kai — Lexer for the kaikai compiler.
+#
+# Owns the TokKind / Token / Lexer / LexStep / StrResult types and
+# every lex_* / tokenize helper that walks a source string and
+# produces a [Token] stream. Third per-module extraction after
+# compiler/chars.kai and compiler/diag.kai under issue #677
+# Phase 1e.
+#
+# What stays in main.kai
+#
+#   - Token dump helpers (tok_text, tok_line_str, tok_col_str,
+#     dump_token, dump_tokens) — they consume Token but compose
+#     with the --tokens driver flag and naturally live near the
+#     driver until that extracts.
+#   - Error-scanning helpers (report_one_error, report_errors_loop,
+#     report_errors) — they bridge a [Token] stream and diag_error,
+#     i.e. they're glue between two modules rather than belonging
+#     to either.
+#
+# Cross-module dependencies
+#
+#   - compiler.chars — ch_is_digit / ch_is_lower / ch_is_upper /
+#     ch_is_alpha / ch_is_alnum / ch_is_space / ch_is_hex_digit.
+#   - stdlib core — char_at, string_slice, string_length,
+#     concat_all, list_reverse, int_to_string.
+#
+# No diag dependency. The lexer reports errors by emitting
+# TkError(msg) tokens; rendering them to stderr is the job of
+# the (main.kai-resident) error-scanning helpers.
+#
+# Public surface
+#
+# Marked pub on first extraction: every top-level type and every
+# fn whose name does not begin with `lex_` (i.e. the public
+# entry points the parser and driver call). lex_* helpers stay
+# pub too because tokenize is the only caller-facing entry but
+# the per-token-kind body fns are referenced from the dispatch
+# loop and the tests that probe lexer edge cases. The first
+# extraction marked everything pub; a later audit may un-pub
+# the helpers that turn out to be lexer-internal.
+
+import compiler.chars
+
+# ====================================================================
+# token kinds + tokens
+# ====================================================================
+
+pub type TokKind
+  = TkEof
+  | TkNewline
+  # keywords (alphabetical)
+  | TkAnd | TkAs | TkAssert | TkAxiom | TkBench | TkCase | TkCheck | TkConst | TkEffect | TkElse | TkEnsures | TkExtern | TkFalse | TkFn | TkFor
+  | TkHandle | TkIf | TkImpl | TkImport
+  | TkLet | TkMatch | TkNot | TkOr | TkPriv | TkProtocol | TkPub | TkRequires | TkTest | TkTrue | TkType
+  | TkUnitKw | TkUse | TkVar | TkWhen | TkWhere | TkWith
+  # Issue #608: `#[...]` annotation form. `#[` is one token (TkHashOpen);
+  # the parser then reads `ident (args)?` and expects a closing `]`.
+  # Replaces the pre-#608 hard-coded `#derive`/`#unstable` reserved-word
+  # scan. The `#` followed by anything other than `[` remains a comment.
+  | TkHashOpen
+  # m12.6.x #7: regex literal `/pattern/`, only emitted when the
+  # previous non-newline token is the identifier `matches` (the
+  # refinement-pure predicate). Outside that narrow context, `/` keeps
+  # its arithmetic meaning as TkSlash. The token's source span covers
+  # both delimiters so the parser can carve out the inner pattern with
+  # `tok_source` + `string_slice`.
+  | TkRegex
+  # literals
+  | TkInt | TkReal | TkChar | TkString
+  # m12.x: numeric literal followed *immediately* (no whitespace) by
+  # `i` lexes as TkComplex. The token span includes the trailing `i`;
+  # the parser strips it before decoding the imaginary value as Real
+  # and desugars to `complex.mk(0.0, im)`. Phase 1 of #267; full
+  # `Real + Complex` heterogeneous arithmetic awaits #180.
+  | TkComplex
+  # identifiers
+  | TkIdent | TkUnderscore
+  # punctuation
+  | TkLparen | TkRparen | TkLbracket | TkRbracket | TkLbrace | TkRbrace
+  | TkComma | TkColon | TkColonEq | TkSemi | TkDot | TkDotDot | TkEllipsis
+  # operators
+  | TkEq | TkArrow | TkFatArrow | TkPipe | TkPipeApply | TkBarBar | TkPipeQuestion
+  | TkPlus | TkMinus | TkStar | TkSlash | TkPercent
+  # m7d §23: `++` is the string / list concatenation operator.
+  # Right-associative, lower precedence than `+`/`-`/`*`/`/`,
+  # higher than comparison.
+  | TkPlusPlus
+  | TkEqEq | TkNeq | TkLt | TkGt | TkLe | TkGe
+  | TkBang | TkAt
+  # Issue #556: `$<ident>(args)` is the surface form of a compiler
+  # intrinsic call. Reserved sigil; user code cannot define new
+  # intrinsics. Lexer emits a bare `$` as TkDollar; the parser pairs
+  # it with the following identifier to produce `EIntrinsic(name, args)`.
+  | TkDollar
+  # m12.5: caret used for integer power inside unit expressions, e.g.
+  # `m^2`, `sec^-1`. Reserved exclusively for unit syntax — outside
+  # `<...>` annotations it is a parser error.
+  | TkCaret
+  # typed holes (M10): TkHole is a bare `?`; TkHoleName carries the
+  # identifier for `?foo`. The lexer recognises `?ident` as one token
+  # so the parser does not have to re-synthesise the form.
+  | TkHole | TkHoleName(String)
+  # m7d §1: `todo!` is a single token. The lexer recognises the
+  # `todo` identifier followed immediately by `!` as `TkTodoBang`,
+  # so the parser sees one symbol at the call site.
+  | TkTodoBang
+  # error token carries a human-readable message
+  | TkError(String)
+
+pub type Token = { kind: TokKind, line: Int, col: Int, start: Int, length: Int }
+
+# Convenience constructor — fewer characters at call sites.
+pub fn tok(kind: TokKind, line: Int, col: Int, start: Int, end: Int) : Token {
+  Token { kind: kind, line: line, col: col, start: start, length: end - start }
+}
+
+# Mnemonic for token kinds (for --tokens dump). Keep in sync with TokKind.
+pub fn tk_name(k: TokKind) : String {
+  match k {
+    TkEof -> "EOF"
+    TkNewline -> "NEWLINE"
+    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkAxiom -> "axiom" TkBench -> "bench" TkCase -> "case" TkCheck -> "check" TkConst -> "const" TkEffect -> "effect" TkElse -> "else"
+    TkEnsures -> "ensures"
+    TkExtern -> "extern"
+    TkFalse -> "false" TkFn -> "fn" TkFor -> "for" TkHandle -> "handle"
+    TkIf -> "if" TkImpl -> "impl" TkImport -> "import"
+    TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
+    TkPriv -> "priv" TkProtocol -> "protocol" TkPub -> "pub" TkRequires -> "requires"
+    TkTest -> "test" TkTrue -> "true" TkType -> "type"
+    TkUnitKw -> "unit" TkUse -> "use" TkVar -> "var" TkWhen -> "when" TkWhere -> "where" TkWith -> "with"
+    TkHashOpen -> "#["
+    TkRegex -> "REGEX"
+    TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
+    TkComplex -> "COMPLEX"
+    TkIdent -> "IDENT" TkUnderscore -> "_"
+    TkLparen -> "(" TkRparen -> ")" TkLbracket -> "[" TkRbracket -> "]"
+    TkLbrace -> "{" TkRbrace -> "}"
+    TkComma -> "," TkColon -> ":" TkColonEq -> ":=" TkSemi -> ";"
+    TkDot -> "." TkDotDot -> ".." TkEllipsis -> "..."
+    TkEq -> "=" TkArrow -> "->" TkFatArrow -> "=>"
+    TkPipe -> "|" TkPipeApply -> "|>" TkBarBar -> "||" TkPipeQuestion -> "|?"
+    TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
+    TkPercent -> "%" TkPlusPlus -> "++"
+    TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">"
+    TkLe -> "<=" TkGe -> ">=" TkBang -> "!" TkAt -> "@" TkCaret -> "^" TkDollar -> "$"
+    TkHole -> "?" TkHoleName(_) -> "?NAME"
+    TkTodoBang -> "todo!"
+    TkError(_) -> "ERROR"
+  }
+}
+
+# ====================================================================
+# lexer state + helpers
+# ====================================================================
+
+pub type Lexer = { src: String, pos: Int, line: Int, col: Int }
+
+pub fn lex_new(src: String) : Lexer = Lexer { src: src, pos: 0, line: 1, col: 1 }
+
+pub fn lex_at_end(l: Lexer) : Bool = l.pos >= string_length(l.src)
+
+pub fn lex_peek_at(l: Lexer, off: Int) : Option[Char] =
+  char_at(l.src, l.pos + off)
+
+pub fn lex_peek(l: Lexer) : Option[Char] = lex_peek_at(l, 0)
+
+pub fn lex_advance(l: Lexer) : Lexer {
+  match char_at(l.src, l.pos) {
+    None -> l
+    Some(c) -> {
+      if c == '\n' {
+        Lexer { src: l.src, pos: l.pos + 1, line: l.line + 1, col: 1 }
+      } else {
+        Lexer { src: l.src, pos: l.pos + 1, line: l.line, col: l.col + 1 }
+      }
+    }
+  }
+}
+
+# Pair of lexer state + emitted token. Used everywhere the scanner
+# returns both a new position and a produced token.
+pub type LexStep = Step(Lexer, Token)
+
+# Returns true if the next char matches `want` (and does not consume it).
+pub fn lex_peek_is(l: Lexer, want: Char) : Bool {
+  match lex_peek(l) {
+    None -> false
+    Some(c) -> c == want
+  }
+}
+
+pub fn lex_peek2_is(l: Lexer, want: Char) : Bool {
+  match lex_peek_at(l, 1) {
+    None -> false
+    Some(c) -> c == want
+  }
+}
+
+pub fn lex_peek3_is(l: Lexer, want: Char) : Bool {
+  match lex_peek_at(l, 2) {
+    None -> false
+    Some(c) -> c == want
+  }
+}
+
+# ====================================================================
+# whitespace and comments
+# ====================================================================
+
+pub fn lex_skip_comment(l: Lexer) : Lexer {
+  # `#` already consumed. Stop at newline or EOF; the newline itself is a
+  # token and stays for the main loop to emit.
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> if c == '\n' { l } else { lex_skip_comment(lex_advance(l)) }
+  }
+}
+
+pub fn lex_skip_ws(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if ch_is_space(c) { lex_skip_ws(lex_advance(l)) }
+      else if c == '#' {
+        # Issue #608: `#[` opens an attribute (TkHashOpen). `#derive` and
+        # `#unstable` (bare, no brackets) are kept in place too so
+        # `lex_punct` can emit a TkError pointing to the new syntax —
+        # transition aid. Anything else starting with `#` is a line
+        # comment.
+        if lex_peek_at(l, 1) == Some('[') { l }
+        else if lex_match_word_at(l, 1, "derive") { l }
+        else if lex_match_word_at(l, 1, "unstable") { l }
+        else { lex_skip_ws(lex_skip_comment(lex_advance(l))) }
+      }
+      else { l }
+    }
+  }
+}
+
+# m12.8: return true when `s` starts at offset `off` AND the character
+# right after is not alphanumeric (so `#derive` matches `#derive(` but
+# not `#deriveable`).
+pub fn lex_match_word_at(l: Lexer, off: Int, s: String) : Bool {
+  if not lex_match_str_at(l, off, s, 0) { false }
+  else {
+    let after = l.pos + off + string_length(s)
+    match char_at(l.src, after) {
+      None -> true
+      Some(c) -> not ch_is_alnum(c)
+    }
+  }
+}
+
+pub fn lex_match_str_at(l: Lexer, off: Int, s: String, i: Int) : Bool {
+  let n = string_length(s)
+  if i >= n { true }
+  else {
+    match char_at(s, i) {
+      None -> true
+      Some(want) -> match char_at(l.src, l.pos + off + i) {
+        None -> false
+        Some(have) -> if have == want { lex_match_str_at(l, off, s, i + 1) } else { false }
+      }
+    }
+  }
+}
+
+# ====================================================================
+# identifiers and keywords
+# ====================================================================
+
+pub fn lex_scan_ident_rest(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> if ch_is_alnum(c) { lex_scan_ident_rest(lex_advance(l)) } else { l }
+  }
+}
+
+pub fn keyword_kind(text: String) : TokKind {
+  if text == "and" { TkAnd }
+  else if text == "as" { TkAs }
+  else if text == "assert" { TkAssert }
+  else if text == "axiom" { TkAxiom }   # m12.7
+  else if text == "bench" { TkBench }   # bench v1 (issue #40)
+  else if text == "case" { TkCase }     # issue #415: multi-clause fn body
+  else if text == "check" { TkCheck }   # check v1 (issue #44)
+  else if text == "const" { TkConst }   # §29 / m12.6.x #const
+  else if text == "effect" { TkEffect }
+  else if text == "else" { TkElse }
+  else if text == "ensures" { TkEnsures }   # m12.6.b
+  else if text == "extern" { TkExtern }     # issue #260: FFI extern "C" fn
+  else if text == "false" { TkFalse }
+  else if text == "fn" { TkFn }
+  else if text == "for" { TkFor }
+  else if text == "handle" { TkHandle }
+  else if text == "if" { TkIf }
+  else if text == "impl" { TkImpl }
+  else if text == "import" { TkImport }
+  else if text == "let" { TkLet }
+  else if text == "match" { TkMatch }
+  else if text == "not" { TkNot }
+  else if text == "or" { TkOr }
+  else if text == "priv" { TkPriv }
+  else if text == "protocol" { TkProtocol }
+  else if text == "pub" { TkPub }
+  else if text == "requires" { TkRequires }  # m12.6.b
+  else if text == "test" { TkTest }
+  else if text == "true" { TkTrue }
+  else if text == "type" { TkType }
+  else if text == "unit" { TkUnitKw }   # m12.5
+  else if text == "use" { TkUse }       # m7e §25
+  else if text == "var" { TkVar }
+  else if text == "when" { TkWhen }     # issue #415: multi-clause guard
+  else if text == "where" { TkWhere }   # m12.6
+  else if text == "with" { TkWith }
+  else { TkIdent }
+}
+
+pub fn lex_ident(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  let l2 = lex_scan_ident_rest(l)
+  let text = string_slice(l.src, start, l2.pos - start)
+  # m7d §1: `todo!` lexes as a single token. We recognise the
+  # identifier `todo` immediately followed by `!` (no whitespace)
+  # so the parser sees `TkTodoBang` instead of `TkIdent` + `TkBang`.
+  # The bang stays available as a postfix operator elsewhere (m7e §13).
+  if text == "todo" and lex_peek_is(l2, '!') {
+    let l3 = lex_advance(l2)
+    Step(l3, tok(TkTodoBang, sl, sc, start, l3.pos))
+  } else {
+    let kind =
+      if string_length(text) == 1 and text == "_" {
+        TkUnderscore
+      } else {
+        keyword_kind(text)
+      }
+    Step(l2, tok(kind, sl, sc, start, l2.pos))
+  }
+}
+
+# ====================================================================
+# numbers
+# ====================================================================
+
+pub fn lex_scan_digits(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if ch_is_digit(c) or c == '_' { lex_scan_digits(lex_advance(l)) }
+      else { l }
+    }
+  }
+}
+
+pub fn lex_scan_hex_digits(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if ch_is_hex_digit(c) { lex_scan_hex_digits(lex_advance(l)) }
+      else { l }
+    }
+  }
+}
+
+pub fn lex_scan_bin_digits(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if c == '0' or c == '1' { lex_scan_bin_digits(lex_advance(l)) }
+      else { l }
+    }
+  }
+}
+
+# Recognise `0x[0-9a-fA-F]+` and `0b[01]+` as TkInt.
+# Caller has confirmed `lex_peek(l) == Some('0')` and the next char
+# is one of x/X/b/B. Emits TkError if no digits follow the prefix.
+pub fn lex_hex_or_bin_int(l: Lexer, is_hex: Bool, sl: Int, sc: Int, start: Int) : LexStep {
+  # Skip the `0` and the base marker.
+  let l_after_prefix = lex_advance(lex_advance(l))
+  let l_end = if is_hex { lex_scan_hex_digits(l_after_prefix) }
+              else { lex_scan_bin_digits(l_after_prefix) }
+  if l_end.pos == l_after_prefix.pos {
+    let msg = if is_hex { "malformed number: expected hex digits after 0x" }
+              else { "malformed number: expected binary digits after 0b" }
+    Step(l_end, tok(TkError(msg), sl, sc, start, l_end.pos))
+  } else {
+    Step(l_end, tok(TkInt, sl, sc, start, l_end.pos))
+  }
+}
+
+pub fn lex_number(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  # Hex (`0x`/`0X`) and binary (`0b`/`0B`) literals branch off here so
+  # they share TkInt with decimal and skip the float/exponent path below.
+  let is_zero_prefix =
+    match lex_peek(l) { Some(c) -> c == '0' _ -> false }
+  if is_zero_prefix {
+    match lex_peek_at(l, 1) {
+      Some(n) -> {
+        if n == 'x' or n == 'X' { lex_hex_or_bin_int(l, true, sl, sc, start) }
+        else if n == 'b' or n == 'B' { lex_hex_or_bin_int(l, false, sl, sc, start) }
+        else { lex_number_decimal(l, sl, sc, start) }
+      }
+      None -> lex_number_decimal(l, sl, sc, start)
+    }
+  } else {
+    lex_number_decimal(l, sl, sc, start)
+  }
+}
+
+pub fn lex_number_decimal(l: Lexer, sl: Int, sc: Int, start: Int) : LexStep {
+  let l1 = lex_scan_digits(l)
+  # Fractional part: only when `.` is followed by a digit. `x..y` (range)
+  # and `x.field` (access) must be left alone.
+  let after_frac_kind =
+    if lex_peek_is(l1, '.') {
+      match lex_peek_at(l1, 1) {
+        Some(d) -> if ch_is_digit(d) { Some(true) } else { Some(false) }
+        None -> Some(false)
+      }
+    } else {
+      Some(false)
+    }
+  let l2 =
+    match after_frac_kind {
+      Some(true) -> lex_scan_digits(lex_advance(lex_advance(l1)))
+      _ -> l1
+    }
+  let is_real1 = match after_frac_kind { Some(true) -> true _ -> false }
+  # Exponent part: `e` or `E`, optional sign, digits.
+  let has_exp =
+    match lex_peek(l2) {
+      Some(c) -> c == 'e' or c == 'E'
+      None -> false
+    }
+  if has_exp {
+    let l3 = lex_advance(l2)
+    let l4 =
+      match lex_peek(l3) {
+        Some(c) -> if c == '+' or c == '-' { lex_advance(l3) } else { l3 }
+        None -> l3
+      }
+    match lex_peek(l4) {
+      Some(d) -> {
+        if ch_is_digit(d) {
+          let l5 = lex_scan_digits(l4)
+          lex_maybe_complex_suffix(l5, sl, sc, start, TkReal)
+        } else {
+          Step(l4, tok(TkError("malformed number: expected digits after exponent"),
+                       sl, sc, start, l4.pos))
+        }
+      }
+      None -> {
+        Step(l4, tok(TkError("malformed number: expected digits after exponent"),
+                     sl, sc, start, l4.pos))
+      }
+    }
+  } else {
+    let kind = if is_real1 { TkReal } else { TkInt }
+    lex_maybe_complex_suffix(l2, sl, sc, start, kind)
+  }
+}
+
+# Phase 1 of #267 — after a complete numeric scan, peek for an
+# *immediately adjacent* `i` and, if present, consume it and emit
+# TkComplex. The token span covers the digits + `i` suffix; the
+# parser strips the trailing `i` before decoding the imaginary value
+# as Real. Whitespace before `i` already terminates the numeric scan,
+# so `3 + i` and `for i in ...` continue to lex `i` as TkIdent.
+pub fn lex_maybe_complex_suffix(l: Lexer, sl: Int, sc: Int, start: Int, fallback: TokKind) : LexStep {
+  if lex_peek_is(l, 'i') {
+    let l_after = lex_advance(l)
+    Step(l_after, tok(TkComplex, sl, sc, start, l_after.pos))
+  } else {
+    Step(l, tok(fallback, sl, sc, start, l.pos))
+  }
+}
+
+# ====================================================================
+# strings
+# ====================================================================
+
+# Walk a string literal consuming chars until the closing `"` (or `"""`).
+# Handles backslash escapes and `#{...}` interpolation (nested braces).
+# Return the lexer positioned past the closing quote, plus the kind of
+# token to emit (TkString or TkError(msg)).
+
+pub type StrResult = StrOk(Lexer) | StrErr(Lexer, String)
+
+# Skip past a nested {...} block inside interpolation, counting braces.
+pub fn lex_skip_interp(l: Lexer, depth: Int) : StrResult {
+  if depth == 0 { StrOk(l) }
+  else {
+    match lex_peek(l) {
+      None -> StrErr(l, "unterminated interpolation in string")
+      Some(c) -> {
+        match c {
+          '{' -> lex_skip_interp(lex_advance(l), depth + 1)
+          '}' -> lex_skip_interp(lex_advance(l), depth - 1)
+          '"' -> {
+            # Skip a nested string literal inside the interpolation.
+            match lex_skip_inner_string(lex_advance(l)) {
+              StrOk(l2) -> lex_skip_interp(l2, depth)
+              StrErr(l2, msg) -> StrErr(l2, msg)
+            }
+          }
+          _ -> lex_skip_interp(lex_advance(l), depth)
+        }
+      }
+    }
+  }
+}
+
+pub fn lex_skip_inner_string(l: Lexer) : StrResult {
+  match lex_peek(l) {
+    None -> StrErr(l, "unterminated string inside interpolation")
+    Some(c) -> {
+      match c {
+        '"' -> StrOk(lex_advance(l))
+        '\\' -> {
+          let l1 = lex_advance(l)
+          match lex_peek(l1) {
+            None -> StrErr(l1, "unterminated string inside interpolation")
+            Some(_) -> lex_skip_inner_string(lex_advance(l1))
+          }
+        }
+        _ -> lex_skip_inner_string(lex_advance(l))
+      }
+    }
+  }
+}
+
+pub fn lex_string_body(l: Lexer, triple: Bool) : StrResult {
+  match lex_peek(l) {
+    None -> StrErr(l, "unterminated string")
+    Some(c) -> {
+      if c == '\\' {
+        let l1 = lex_advance(l)
+        match lex_peek(l1) {
+          None -> StrErr(l1, "unterminated string")
+          Some(_) -> lex_string_body(lex_advance(l1), triple)
+        }
+      } else if c == '#' and lex_peek2_is(l, '{') {
+        let l1 = lex_advance(lex_advance(l))
+        match lex_skip_interp(l1, 1) {
+          StrOk(l2) -> lex_string_body(l2, triple)
+          StrErr(l2, msg) -> StrErr(l2, msg)
+        }
+      } else if triple {
+        if c == '"' and lex_peek2_is(l, '"') and lex_peek3_is(l, '"') {
+          StrOk(lex_advance(lex_advance(lex_advance(l))))
+        } else {
+          lex_string_body(lex_advance(l), triple)
+        }
+      } else {
+        if c == '\n' {
+          StrErr(l, "unterminated string (newline in single-line string)")
+        } else if c == '"' {
+          StrOk(lex_advance(l))
+        } else {
+          lex_string_body(lex_advance(l), triple)
+        }
+      }
+    }
+  }
+}
+
+pub fn lex_string(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  let l1 = lex_advance(l)                  # consume opening "
+  let triple = lex_peek_is(l1, '"') and lex_peek2_is(l1, '"')
+  let l2 = if triple { lex_advance(lex_advance(l1)) } else { l1 }
+  match lex_string_body(l2, triple) {
+    StrOk(l3) -> Step(l3, tok(TkString, sl, sc, start, l3.pos))
+    StrErr(l3, msg) -> Step(l3, tok(TkError(msg), sl, sc, start, l3.pos))
+  }
+}
+
+# ====================================================================
+# regex literals (m12.6.x #7)
+# ====================================================================
+#
+# Elixir-style sigil: `~r/pattern/` lexes as a single `TkRegex` token
+# whose source span covers the full sigil including delimiters. The
+# `~` route in `lex_punct` handles the prefix; this helper takes
+# over once the cursor is positioned at the opening `/`. Because
+# the prefix is unambiguous, `/` keeps its arithmetic meaning
+# everywhere else — no contextual lookback in the lexer, no parser
+# backtracking.
+#
+# Pattern body rules: any byte except an unescaped `/` or unescaped
+# newline; `\` escapes the next byte; inside `[...]` a `/` is a
+# literal class element, not a terminator (mirrors JS / Pony / Perl
+# regex literal lexing).
+
+pub fn lex_regex(l: Lexer, sl: Int, sc: Int, start: Int) : LexStep {
+  let l1 = lex_advance(l)                  # consume opening /
+  match lex_regex_body(l1, false) {
+    StrOk(l2) -> Step(l2, tok(TkRegex, sl, sc, start, l2.pos))
+    StrErr(l2, msg) -> Step(l2, tok(TkError(msg), sl, sc, start, l2.pos))
+  }
+}
+
+# `in_class` is true when the cursor is inside a `[...]` character
+# class, where `/` and `]` swap their meaning relative to the outer
+# state.
+pub fn lex_regex_body(l: Lexer, in_class: Bool) : StrResult {
+  match lex_peek(l) {
+    None -> StrErr(l, "unterminated regex literal")
+    Some(c) -> {
+      if c == '\\' {
+        let l1 = lex_advance(l)
+        match lex_peek(l1) {
+          None -> StrErr(l1, "unterminated regex literal")
+          Some(_) -> lex_regex_body(lex_advance(l1), in_class)
+        }
+      } else if c == '\n' {
+        StrErr(l, "unterminated regex literal (newline before closing `/`)")
+      } else if in_class {
+        if c == ']' { lex_regex_body(lex_advance(l), false) }
+        else { lex_regex_body(lex_advance(l), true) }
+      } else {
+        if c == '/' { StrOk(lex_advance(l)) }
+        else if c == '[' { lex_regex_body(lex_advance(l), true) }
+        else { lex_regex_body(lex_advance(l), false) }
+      }
+    }
+  }
+}
+
+# ====================================================================
+# char literals
+# ====================================================================
+
+pub fn lex_char_skip_u_escape(l: Lexer) : Lexer {
+  # We're past `\u`; consume `{HHHH}`.
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if c == '}' { lex_advance(l) }
+      else { lex_char_skip_u_escape(lex_advance(l)) }
+    }
+  }
+}
+
+pub fn lex_char(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  let l1 = lex_advance(l)                 # consume opening '
+  match lex_peek(l1) {
+    None -> Step(l1, tok(TkError("unterminated char literal"),
+                         sl, sc, start, l1.pos))
+    Some(c) -> {
+      let l2 =
+        if c == '\\' {
+          let la = lex_advance(l1)
+          match lex_peek(la) {
+            None -> la
+            Some(e) -> {
+              if e == 'u' and lex_peek2_is(la, '{') {
+                lex_char_skip_u_escape(lex_advance(lex_advance(la)))
+              } else {
+                lex_advance(la)
+              }
+            }
+          }
+        } else {
+          # One byte of a UTF-8 codepoint. For the stage-0-compatible
+          # subset we treat multi-byte characters structurally: consume
+          # one byte and trust the closing quote to appear.
+          lex_advance(l1)
+        }
+      if lex_peek_is(l2, '\'') {
+        Step(lex_advance(l2), tok(TkChar, sl, sc, start, l2.pos + 1))
+      } else {
+        Step(l2, tok(TkError("unterminated char literal"),
+                     sl, sc, start, l2.pos))
+      }
+    }
+  }
+}
+
+# ====================================================================
+# punctuation and operators
+# ====================================================================
+
+pub fn lex_punct(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  match lex_peek(l) {
+    None -> Step(l, tok(TkEof, sl, sc, start, start))
+    Some(c) -> {
+      let l1 = lex_advance(l)
+      match c {
+        '(' -> Step(l1, tok(TkLparen, sl, sc, start, l1.pos))
+        ')' -> Step(l1, tok(TkRparen, sl, sc, start, l1.pos))
+        '[' -> Step(l1, tok(TkLbracket, sl, sc, start, l1.pos))
+        ']' -> Step(l1, tok(TkRbracket, sl, sc, start, l1.pos))
+        '{' -> Step(l1, tok(TkLbrace, sl, sc, start, l1.pos))
+        '}' -> Step(l1, tok(TkRbrace, sl, sc, start, l1.pos))
+        ',' -> Step(l1, tok(TkComma, sl, sc, start, l1.pos))
+        '@' -> Step(l1, tok(TkAt, sl, sc, start, l1.pos))
+        # Issue #556: `$` opens a compiler-intrinsic call (`$<ident>(args)`).
+        # The lexer emits the bare sigil; the parser consumes the
+        # following ident and arg list to build `EIntrinsic`.
+        '$' -> Step(l1, tok(TkDollar, sl, sc, start, l1.pos))
+        # m12.5: caret token for unit exponents — only meaningful inside
+        # `<...>` annotations; the parser rejects it elsewhere.
+        '^' -> Step(l1, tok(TkCaret, sl, sc, start, l1.pos))
+        ':' -> {
+          if lex_peek_is(l1, '=') {
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkColonEq, sl, sc, start, l2.pos))
+          } else {
+            Step(l1, tok(TkColon, sl, sc, start, l1.pos))
+          }
+        }
+        ';' -> Step(l1, tok(TkSemi, sl, sc, start, l1.pos))
+        '+' -> {
+          # m7d §23: `++` is the concatenation operator. The lexer
+          # fuses two adjacent `+` characters into a single token; a
+          # space breaks it (so `1 + +2` is still allowed if anyone
+          # writes it).
+          if lex_peek_is(l1, '+') {
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkPlusPlus, sl, sc, start, l2.pos))
+          } else {
+            Step(l1, tok(TkPlus, sl, sc, start, l1.pos))
+          }
+        }
+        '*' -> Step(l1, tok(TkStar, sl, sc, start, l1.pos))
+        '%' -> Step(l1, tok(TkPercent, sl, sc, start, l1.pos))
+        '-' -> {
+          if lex_peek_is(l1, '>') {
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkArrow, sl, sc, start, l2.pos))
+          } else {
+            Step(l1, tok(TkMinus, sl, sc, start, l1.pos))
+          }
+        }
+        '/' -> {
+          if lex_peek_is(l1, '/') {
+            # Issue #608: `//` is reserved as TkError with guidance.
+            # kaikai uses `#` for comments; `//` is not a comment form
+            # and the `//` integer-division operator was removed in #315.
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkError("kaikai uses `#` for comments, not `//` (and `//` is not an operator — `Int / Int` already truncates per #315)"),
+                         sl, sc, start, l2.pos))
+          } else if lex_peek_is(l1, '*') {
+            # Issue #608: `/*` reserved as TkError. kaikai does not
+            # support block comments; each comment line begins with `#`.
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkError("block comments are not supported — use `#` on each line (kaikai follows Elixir on this)"),
+                         sl, sc, start, l2.pos))
+          } else {
+            Step(l1, tok(TkSlash, sl, sc, start, l1.pos))
+          }
+        }
+        '=' -> {
+          if lex_peek_is(l1, '=') {
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkEqEq, sl, sc, start, l2.pos))
+          } else if lex_peek_is(l1, '>') {
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkFatArrow, sl, sc, start, l2.pos))
+          } else {
+            Step(l1, tok(TkEq, sl, sc, start, l1.pos))
+          }
+        }
+        '<' -> {
+          if lex_peek_is(l1, '=') {
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkLe, sl, sc, start, l2.pos))
+          } else {
+            Step(l1, tok(TkLt, sl, sc, start, l1.pos))
+          }
+        }
+        '>' -> {
+          if lex_peek_is(l1, '=') {
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkGe, sl, sc, start, l2.pos))
+          } else {
+            Step(l1, tok(TkGt, sl, sc, start, l1.pos))
+          }
+        }
+        '!' -> {
+          if lex_peek_is(l1, '=') {
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkNeq, sl, sc, start, l2.pos))
+          } else {
+            Step(l1, tok(TkBang, sl, sc, start, l1.pos))
+          }
+        }
+        '?' -> {
+          # `?ident` is one TkHoleName token; `?` alone is TkHole.
+          # Peek at the next char: if it's alpha (or `_`), read an
+          # identifier.
+          match lex_peek(l1) {
+            Some(nc) -> {
+              if ch_is_alpha(nc) {
+                let l_end = lex_scan_ident_rest(lex_advance(l1))
+                let name = string_slice(l.src, start + 1, l_end.pos - (start + 1))
+                Step(l_end, tok(TkHoleName(name), sl, sc, start, l_end.pos))
+              } else {
+                Step(l1, tok(TkHole, sl, sc, start, l1.pos))
+              }
+            }
+            None -> Step(l1, tok(TkHole, sl, sc, start, l1.pos))
+          }
+        }
+        '|' -> {
+          if lex_peek_is(l1, '>') {
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkPipeApply, sl, sc, start, l2.pos))
+          } else if lex_peek_is(l1, '|') {
+            # issue #201: `||` (no whitespace between bars) is the
+            # flat-map pipe. Single token so the parser sees one symbol
+            # at the operator slot, mirroring how `|>` is one token.
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkBarBar, sl, sc, start, l2.pos))
+          } else if lex_peek_is(l1, '?') {
+            # issue #412: `|?` (no whitespace between bar and question)
+            # is the filter pipe. Single token, mirroring `|>` and `||`.
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkPipeQuestion, sl, sc, start, l2.pos))
+          } else {
+            Step(l1, tok(TkPipe, sl, sc, start, l1.pos))
+          }
+        }
+        '.' -> {
+          if lex_peek_is(l1, '.') and lex_peek2_is(l1, '.') {
+            let l2 = lex_advance(lex_advance(l1))
+            Step(l2, tok(TkEllipsis, sl, sc, start, l2.pos))
+          } else if lex_peek_is(l1, '.') {
+            let l2 = lex_advance(l1)
+            Step(l2, tok(TkDotDot, sl, sc, start, l2.pos))
+          } else {
+            Step(l1, tok(TkDot, sl, sc, start, l1.pos))
+          }
+        }
+        '#' -> {
+          # Issue #608: `#[` opens an attribute. lex_skip_ws only leaves a
+          # `#` for lex_punct when it is followed by `[`, by the legacy
+          # `derive`/`unstable` keywords (for the transition-aid TkError),
+          # or in error positions; all three branches are handled here.
+          if lex_peek_is(l1, '[') {
+            let l_end = lex_advance(l1)
+            Step(l_end, tok(TkHashOpen, sl, sc, start, l_end.pos))
+          } else if lex_match_word_at(l1, 0, "derive") {
+            let l_end = lex_advance_n(l1, 6)
+            Step(l_end, tok(TkError("deprecated annotation syntax (issue #608) — write `#[derive(...)]` instead of `#derive(...)`"),
+                            sl, sc, start, l_end.pos))
+          } else if lex_match_word_at(l1, 0, "unstable") {
+            let l_end = lex_advance_n(l1, 8)
+            Step(l_end, tok(TkError("deprecated annotation syntax (issue #608) — write `#[unstable]` instead of `#unstable`"),
+                            sl, sc, start, l_end.pos))
+          } else {
+            Step(l1, tok(TkError("unexpected `#` — comments start with `#` followed by space; annotations use `#[...]`"),
+                         sl, sc, start, l1.pos))
+          }
+        }
+        '~' -> {
+          # m12.6.x #7: Elixir-style sigils. Currently only `~r/pattern/`
+          # is recognised — opens a regex literal that lexes as a single
+          # `TkRegex` token spanning `~r/.../`. The sigil family is
+          # designed for future growth (`~s`, `~w`, etc.) but those
+          # require their own runtime carriers and are out of scope
+          # for this lane. Anything other than `~r` followed by a
+          # delimiter falls through as an error so tildes don't silently
+          # turn into a junk-drawer prefix.
+          if lex_peek_is(l1, 'r') and lex_peek_at(l1, 1) == Some('/') {
+            let l_r = lex_advance(l1)            # consume `r`
+            lex_regex(l_r, sl, sc, start)
+          } else {
+            let msg = string_concat("unexpected character '~' (only `~r/.../` regex sigil is supported)", "")
+            Step(l1, tok(TkError(msg), sl, sc, start, l1.pos))
+          }
+        }
+        _ -> {
+          let msg = string_concat("unexpected character '", string_concat("#{c}", "'"))
+          Step(l1, tok(TkError(msg), sl, sc, start, l1.pos))
+        }
+      }
+    }
+  }
+}
+
+pub fn lex_advance_n(l: Lexer, n: Int) : Lexer {
+  if n <= 0 { l } else { lex_advance_n(lex_advance(l), n - 1) }
+}
+
+# ====================================================================
+# dispatch: one token
+# ====================================================================
+
+pub fn lex_next(l: Lexer) : LexStep {
+  let l0 = lex_skip_ws(l)
+  let sl = l0.line
+  let sc = l0.col
+  match lex_peek(l0) {
+    None -> Step(l0, tok(TkEof, sl, sc, l0.pos, l0.pos))
+    Some(c) -> {
+      if c == '\n' {
+        let l1 = lex_advance(l0)
+        Step(l1, tok(TkNewline, sl, sc, l0.pos, l1.pos))
+      }
+      else if ch_is_alpha(c) { lex_ident(l0) }
+      else if ch_is_digit(c) { lex_number(l0) }
+      else if c == '"' { lex_string(l0) }
+      else if c == '\'' { lex_char(l0) }
+      else { lex_punct(l0) }
+    }
+  }
+}
+
+# Build the full token list. Accumulate in reverse for O(1) prepend, then
+# list_reverse once at the end.
+pub fn lex_loop(l: Lexer, acc: [Token]) : [Token] {
+  match lex_next(l) {
+    Step(l1, t) -> {
+      let acc1 = [t, ...acc]
+      match t.kind {
+        TkEof -> list_reverse(acc1)
+        _ -> lex_loop(l1, acc1)
+      }
+    }
+  }
+}
+
+pub fn tokenize(src: String) : [Token] {
+  lex_loop(lex_new(src), [])
+}
+
