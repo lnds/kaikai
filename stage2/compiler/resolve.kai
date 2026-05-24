@@ -1,0 +1,1095 @@
+# compiler/resolve.kai — post-parse name resolution + lightweight
+# signature checks. The kaikai answer to stage 0's `check.c`.
+#
+# Extracted from main.kai under issue #677 Phase 1i — the first of
+# the "easy three" follow-ups (resolve / fmt / driver) after the
+# parser extraction (Phase 1h, PR #684). This section lived at the
+# top of the residual main.kai (immediately after the parser), so
+# pulling it out shifts every line below it; fmt + driver lanes run
+# after this merges.
+#
+# What this module owns
+#
+# - The resolver scope environment (the immutable `Env` record:
+#   a stack of `[[String]]` scopes plus an error flag, the source
+#   file name, and a `[Diagnostic]` accumulator for the structured
+#   T3 `cannot find <name>` diagnostics from issue #487).
+# - Env algebra: env_new / env_push / env_pop / env_add / env_has /
+#   env_all_names / env_mark_err / env_push_diag, plus the scope
+#   primitives scopes_has / concat_scopes and the chk_error emit
+#   helper.
+# - Prelude seeding (`prelude_names`) — the canonical list of
+#   built-in value names pre-bound in every program's outermost
+#   scope, kept in sync with stage 0's PRELUDE.
+# - The pattern-binding walker (bind_pat + bind_pats_loop /
+#   bind_pfields_loop / bind_pfield) that adds a pattern's bound
+#   names into the current scope.
+# - The expression / statement / declaration scope walkers
+#   (chk_expr / chk_stmt / chk_decl and their list/arm/clause
+#   helpers) that push and pop a scope per block, match arm, lambda,
+#   handler clause, and function body, reporting `cannot find` for
+#   any unbound EVar.
+# - Top-level pre-registration (register_decls / register_one /
+#   register_variants_env / register_import + last_segment) so
+#   forward references between top-level decls resolve.
+# - The program entry point `check_program`, which seeds the
+#   prelude, pre-registers all decls, walks them, and folds in the
+#   row-label name/arity check, the call-site refinement check
+#   (from compiler.refinements), and the unbound-tyvar check.
+# - The effect-arity table (EffArity + collect_effect_arities and
+#   the builtin-arity backfill) and the row-label name + arity
+#   check (m7b #11j) — every `T / Eff + ...` label must name a
+#   declared or catalog effect with the right tparam count.
+# - The unbound-type-variable check (issue #534 shape 4): a
+#   lowercase tyvar in a fn's return type or effect row must also
+#   appear in `[…]` or a parameter type.
+#
+# Cross-section boundary (issue #677 Phase 1i analysis)
+#
+# Two functions co-located in the original section did NOT move,
+# because they are default-handler-wiring / effect-injection logic
+# that merely sat next to the resolver:
+#
+# - `row_effects_without_default_handler` calls
+#   `effect_default_block_all_extern` (defined in main.kai's
+#   default-handler section) and is itself called only from
+#   main.kai. Moving it would create a resolve↔main import cycle.
+# - `collect_type_names` is used only by `inject_builtin_effects`
+#   in main.kai and is not referenced by the resolver; it stays
+#   with its sole caller.
+#
+# Public surface
+#
+# Only the decls main.kai actually calls are `pub`: the entry point
+# `check_program`, the driver-seeding helpers `env_new` / `add_all`
+# / `prelude_names` / `register_decls` / `chk_decls`, the import
+# path helper `last_segment` (used by the module resolver), and
+# `collect_effect_names` (used by the effect-injection and typer
+# paths). `Env` / `Diagnostic` flow through pub signatures so `Env`
+# is pub too. Everything else (the walkers, the arity table, the
+# tyvar helpers) is private to this file.
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.refinements
+
+# ====================================================================
+# checker: name resolution
+# ====================================================================
+#
+# Mirrors stage 0's `check.c`. No type inference, no exhaustiveness —
+# just "every identifier is bound somewhere in scope." Top-level names
+# (fns, type constructors, imported names) are pre-registered so
+# forward references work. Each scope introduced by a block, match
+# arm, lambda, or function body is pushed and popped as the walker
+# enters and leaves. Errors accumulate into `had_error`; the driver
+# returns 1 when that flag is set.
+
+#[doc("Resolver scope environment: a stack of name scopes, an error flag, the source file, and the T3 diagnostic accumulator.")]
+pub type Env = { scopes: [[String]], had_error: Bool, file: String,
+              # Issue #487: structured diagnostic collection for T3
+              # (`cannot find <name> in this scope`). Mirrors
+              # `InferState.diags` semantics (reverse order, flipped at
+              # the entry point).
+              diags: [Diagnostic] }
+
+#[doc("Fresh resolver env for `file` with a single empty scope and no errors.")]
+pub fn env_new(file: String) : Env = Env { scopes: [[]], had_error: false, file: file, diags: [] }
+
+fn env_push(e: Env) : Env =
+  Env { scopes: [[], ...e.scopes], had_error: e.had_error, file: e.file, diags: e.diags }
+
+fn env_pop(e: Env) : Env {
+  match e.scopes {
+    [_, ...rest] -> Env { scopes: rest, had_error: e.had_error, file: e.file, diags: e.diags }
+    _ -> e
+  }
+}
+
+fn env_add(e: Env, name: String) : Env {
+  match e.scopes {
+    [top, ...rest] ->
+      Env { scopes: [[name, ...top], ...rest], had_error: e.had_error, file: e.file, diags: e.diags }
+    _ -> e
+  }
+}
+
+# list_has moved to compiler/util.kai (issue #677 phase 1h H1a).
+
+fn scopes_has(scopes: [[String]], target: String) : Bool {
+  match scopes {
+    [] -> false
+    [top, ...rest] -> if list_has(top, target) { true } else { scopes_has(rest, target) }
+  }
+}
+
+fn env_has(e: Env, name: String) : Bool = scopes_has(e.scopes, name)
+
+fn env_all_names(e: Env) : [String] = concat_scopes(e.scopes, [])
+
+fn concat_scopes(ss: [[String]], acc: [String]) : [String] {
+  match ss {
+    [] -> acc
+    [scope, ...rest] -> concat_scopes(rest, list_append(acc, scope))
+  }
+}
+
+fn env_mark_err(e: Env) : Env =
+  Env { scopes: e.scopes, had_error: true, file: e.file, diags: e.diags }
+
+# Issue #487: push a Diagnostic onto the Env accumulator. Used by the
+# T3 emit site in parallel with its existing `diag_error` call.
+fn env_push_diag(e: Env, d: Diagnostic) : Env =
+  Env { scopes: e.scopes, had_error: e.had_error, file: e.file,
+        diags: [d, ...e.diags] }
+
+fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env / Console + File {
+
+
+  diag_error(e.file, line, col, msg)
+  env_mark_err(e)
+}
+
+# ---- prelude seeding (kept in sync with stage 0's PRELUDE) ----
+
+#[doc("Canonical list of built-in value names pre-bound in every program's outermost scope.")]
+pub fn prelude_names() : [String] {
+  [
+    "print", "eprint", "write_stdout", "read_file", "write_file",
+    "file_exists", "file_delete", "file_rename",
+    # Issue #482: binary file IO.
+    "file_read_bytes", "file_write_bytes",
+    # Issue #344: fs/dir operations.
+    "dir_list_dir", "dir_create_dir", "dir_remove_dir", "dir_walk",
+    "read_line", "read_bytes", "args",
+    "program_name", "stdlib_path", "abspath",
+    "exit", "panic",
+    "int_to_string", "real_to_string", "string_to_int", "string_to_real",
+    "int_to_real", "real_to_int",
+    # Lane 4 (#473): Byte nominal primitive surface.
+    "int_to_byte", "byte_to_int", "byte_add", "byte_sub", "byte_eq", "byte_lt", "byte_to_string",
+    # libm bindings (issue #343)
+    "real_sqrt", "real_cbrt", "real_exp", "real_log", "real_log2", "real_log10",
+    "real_sin", "real_cos", "real_tan",
+    "real_asin", "real_acos", "real_atan",
+    "real_sinh", "real_cosh", "real_tanh",
+    "real_signum", "real_is_nan", "real_is_inf",
+    "real_pow", "real_atan2", "real_rem",
+    "string_length", "string_concat", "string_concat_all", "string_join",
+    "string_split", "string_contains", "char_at",
+    "string_slice", "char_to_int", "int_to_char", "int_to_byte_string",
+    "string_byte_at_int",
+    "list_length", "list_append", "list_reverse",
+    "map", "filter", "reduce", "each",
+    "array_make", "array_length", "array_get", "array_set", "array_grow",
+    # m13: bit operations on Int. Compiler intrinsics — each call lowers
+    # to the corresponding C operator (`<<`, `>>`, `&`, `|`, `^`, `~`)
+    # in `emit_call_value`, mirroring the `unit_name` / `__strip_unit`
+    # pattern. Listed here so the closure-capture analyser does not
+    # promote them to free vars when used inside a lambda body.
+    "bit_and", "bit_or", "bit_xor", "bit_not",
+    "bit_shl", "bit_shr", "bit_ushr",
+    "bit_count", "bit_test",
+    "bit_set", "bit_clear", "bit_toggle",
+    # m8 #7: mailbox runtime exposed as prelude functions; user-facing
+    # API lives in stdlib/actor.kai's `with_mailbox` helper.
+    # m8 #8: bounded variant takes (cap: Int, overflow_code: Int).
+    "mailbox_alloc", "mailbox_alloc_bounded",
+    "mailbox_send", "mailbox_recv", "mailbox_free",
+    # Tier 2 spawn_actor primitives — alloc-without-owner-stamp +
+    # owner reassignment so a parent fiber can hand a mailbox to
+    # the spawned fiber and have it observably owned by the child.
+    "mailbox_alloc_unowned", "mailbox_assign_owner",
+    "Some", "None", "Ok", "Err",
+    # m5 #4 — Perceus dup/drop magic names. The pass synthesises
+    # ECall(EVar("__perceus_dup"), [...]) and ECall(EVar("__perceus_drop"),
+    # [...]) AFTER inference; the emitter handles them via special cases
+    # in emit_call_expr. They're listed here so the closure-capture
+    # analyser does not treat them as free vars to capture inside lambda
+    # bodies (which would emit invalid C: `kai___perceus_dup` is undeclared).
+    "__perceus_dup", "__perceus_drop",
+    # issue #118 — Perceus reuse-in-place magic names. The recogniser
+    # `pcs_recognise_reuse_*` synthesises calls to these from
+    # constructor-after-deconsume patterns. The emitter lowers them to
+    # `kai_reuse_or_alloc_<shape>` runtime helpers that branch on the
+    # consumed cell's RC: in-place rewrite when unique, fall back to a
+    # fresh allocation when shared.
+    "__perceus_reuse_cons",
+    "__perceus_reuse_record",
+    "__perceus_reuse_variant",
+    # Bug 8 (docs/m12.8-followup.md): `unitless` removed from the
+    # user-visible prelude. It was implemented as an emit-time
+    # identity special case (no kai_prelude_unitless runtime fn),
+    # which made first-class use (`x |> unitless`, `let f = unitless`)
+    # crash at C compile. The emit special cases below were repurposed
+    # for `__strip_unit`, the typer-internal erasure intrinsic that
+    # the parametric `impl Show for Real[u: Measure]` body uses to feed
+    # `Real<u>` into `real_to_string : Real -> String`.
+    # m12.8.x phase 2 (Gap 1): compile-time unit reflection;
+    # emitter lowers to a constant String literal.
+    "unit_name",
+    # m12.8 phase 2: typer-internal erasure of the unit annotation on a
+    # dimensioned Real. NOT for user code — the `__` prefix marks it as
+    # a compiler-generated name. Used by the parametric Show impl in
+    # stdlib/protocols.kai to revive the dead `unitless` emit identity.
+    "__strip_unit"
+  ]
+}
+
+#[doc("Add every name in `names` to the current (top) scope of `e`.")]
+pub fn add_all(e: Env, names: [String]) : Env =
+  reduce(names, e, (acc, n) => env_add(acc, n))
+
+# ---- pattern bindings: walk a pattern and add its bound names ----
+
+fn bind_pat(e: Env, pat: Pattern) : Env {
+  match pat.pkind {
+    PWild -> e
+    PLit(_) -> e
+    PBind(name) -> env_add(e, name)
+    PList(pats, opt_rest) -> {
+      let e1 = bind_pats_loop(e, pats)
+      match opt_rest {
+        Some(rname) -> env_add(e1, rname)
+        None -> e1
+      }
+    }
+    PVariant(_, subs) -> bind_pats_loop(e, subs)
+    PVariantRecord(_, fields) -> bind_pfields_loop(e, fields)
+    PRecord(fields) -> bind_pfields_loop(e, fields)
+    PHole(_) -> e
+    PAs(name, sub) -> bind_pat(env_add(e, name), sub)
+    PNarrow(name, _) -> env_add(e, name)
+  }
+}
+
+fn bind_pats_loop(e: Env, ps: [Pattern]) : Env {
+  match ps {
+    [] -> e
+    [p, ...rest] -> bind_pats_loop(bind_pat(e, p), rest)
+  }
+}
+
+fn bind_pfields_loop(e: Env, fs: [PField]) : Env {
+  match fs {
+    [] -> e
+    [pf, ...rest] -> bind_pfields_loop(bind_pfield(e, pf), rest)
+  }
+}
+
+fn bind_pfield(e: Env, pf: PField) : Env {
+  match pf {
+    # Shorthand `{ x }` binds `x` directly; the parser already builds the
+    # equivalent of `{ x: x }` so bind_pat handles both cases uniformly.
+    PField(_, sub, _) -> bind_pat(e, sub)
+  }
+}
+
+# ---- expression walker ----
+
+fn chk_expr(e: Env, x: Expr) : Env / Console + File {
+
+
+  match x.kind {
+    EInt(_)    -> e
+    EReal(_)   -> e
+    EBool(_)   -> e
+    EChar(_)   -> e
+    EStr(_, _) -> e
+    EUnit      -> e
+    EUnder     -> e
+    EPlaceholder -> e
+    EVar(name) -> {
+      if env_has(e, name) { e }
+      else {
+        # m11 v1 Template 3 — canonical Rust/Elm-style diagnostic.
+        # Error line stays terse; the did-you-mean suggestion moves
+        # to a separate `help:` line and is suppressed when no name
+        # is within Levenshtein distance 3 (closest_name's threshold).
+        diag_error(e.file, x.line, x.col, "cannot find `#{name}` in this scope")
+        let msg = "cannot find `#{name}` in this scope"
+        let sug = closest_name(name, env_all_names(e))
+        match sug {
+          Some(s) -> diag_help("a similar name exists in scope: `#{s}` (did you mean this?)")
+          None    -> ()
+        }
+        # Issue #487 — T3 collected diagnostic. Stderr above remains
+        # byte-identical; the structured Diagnostic carries the same
+        # message + optional did-you-mean help.
+        let related = match sug {
+          Some(s) -> [ri_help(e.file, x.line, x.col,
+                              "a similar name exists in scope: `#{s}` (did you mean this?)")]
+          None    -> []
+        }
+        let e1 = env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, related))
+        env_mark_err(e1)
+      }
+    }
+    ECall(f, xs) -> {
+      let e1 = chk_expr(e, f)
+      chk_exprs(e1, xs)
+    }
+    EField(base, _) -> chk_expr(e, base)
+    EIndex(base, idx) -> chk_expr(chk_expr(e, base), idx)
+    EBinop(_, a, b) -> chk_expr(chk_expr(e, a), b)
+    EUnop(_, inner) -> chk_expr(e, inner)
+    EIf(c, a, opt_b) -> {
+      let e1 = chk_expr(chk_expr(e, c), a)
+      match opt_b {
+        Some(b) -> chk_expr(e1, b)
+        None -> e1
+      }
+    }
+    EMatch(scrut, arms) -> {
+      let e1 = chk_expr(e, scrut)
+      chk_arms(e1, arms)
+    }
+    ELambda(params, body) -> {
+      let e1 = env_push(e)
+      let e2 = add_params(e1, params)
+      let e3 = chk_expr(e2, body)
+      env_pop(e3)
+    }
+    ERecordLit(_, fields) -> chk_field_inits(e, fields)
+    EList(elems) -> chk_list_elems(e, elems)
+    ERange(a, b, opt_step) -> {
+      let e1 = chk_expr(chk_expr(e, a), b)
+      match opt_step { Some(s) -> chk_expr(e1, s) None -> e1 }
+    }
+    EBlock(stmts, opt_final) -> {
+      let e1 = env_push(e)
+      let e2 = chk_stmts(e1, stmts)
+      let e3 = match opt_final { Some(f) -> chk_expr(e2, f) None -> e2 }
+      env_pop(e3)
+    }
+    EPipe(a, b) -> chk_expr(chk_expr(e, a), b)
+    EMapPipe(a, b) -> chk_expr(chk_expr(e, a), b)
+    EFlatMapPipe(a, b) -> chk_expr(chk_expr(e, a), b)
+    EFilterPipe(a, b) -> chk_expr(chk_expr(e, a), b)
+    EHole(_) -> e          # holes bind no names; checker lets them pass silently
+    ETodo(_) -> e          # m7d §1: same posture as a hole
+    EBang(inner) -> chk_expr(e, inner)   # m7e §13: scope-walk the operand
+    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
+      # m7a #4e: `Eff as log` makes `log` a binding that names
+      # the capability inside the body. We push a scope so the
+      # name disappears once the body is done.
+      # m7b #11: the init expression (`with State[T](init)`) lives
+      # in the outer scope — its free vars are the surrounding env.
+      let stateful = match init_opt { Some(_) -> true None -> false }
+      let after_init = match init_opt {
+        Some(ie) -> chk_expr(e, ie)
+        None     -> e
+      }
+      let body_env = match alias_opt {
+        Some(alias) -> env_add(env_push(after_init), alias)
+        None        -> after_init
+      }
+      let e1 = chk_expr(body_env, body)
+      let restored = match alias_opt {
+        Some(_) -> env_pop(e1)
+        None    -> e1
+      }
+      let e2 = chk_handler_clauses(restored, clauses, stateful)
+      match ret_opt {
+        Some(r) -> chk_handler_return(e2, r, stateful)
+        None    -> e2
+      }
+    }
+    # m12.5: literal carrying a unit annotation. Recurse into the inner
+    # numeric literal; the unit symbols themselves are validated at
+    # type-resolution time, not here.
+    ELitUnit(inner, _) -> chk_expr(e, inner)
+    # m7e §11: `variants[T]()` carries no value-level sub-expressions.
+    # The TypeExpr is validated by the resolver (sum + nullary-only)
+    # in a later pass, not here.
+    EVariantsOf(_, _) -> e
+    # m6.2 Phase 2.1: qualified module call carries no sub-expressions
+    # and binds no names — the resolver fills it in once everything
+    # is in scope, so the checker has nothing to verify here.
+    EModCall(_, _) -> e
+    # Issue #556: intrinsic args are sub-expressions; the resolver/
+    # typer validates them later (per-intrinsic rules). Here we just
+    # walk through them to surface name-binding issues uniformly.
+    EIntrinsic(_, _) -> e
+  }
+}
+
+fn chk_handler_clauses(e: Env, cs: [HClause], stateful: Bool) : Env / Console + File {
+
+
+  match cs {
+    [] -> e
+    [c, ...rest] -> match c {
+      HC(_, params, body, _, _) -> {
+        let e1 = env_push(e)
+        # m7b #11: parameterised handlers (`with State[T](init)`)
+        # expose the current handler-state inside every clause as
+        # `state` (and the alias `log` for accumulator-shaped handlers
+        # like `Writer[W]`). They are aliases of the same slot — the
+        # codegen layer resolves both to `self->state`.
+        let e1s = if stateful { env_add(env_add(e1, "state"), "log") } else { e1 }
+        let e2 = add_params(e1s, params)
+        let e3 = chk_expr(e2, body)
+        chk_handler_clauses(env_pop(e3), rest, stateful)
+      }
+    }
+  }
+}
+
+fn chk_handler_return(e: Env, r: HReturn, stateful: Bool) : Env / Console + File {
+
+
+  match r {
+    HR(name, body, _, _) -> {
+      let e1 = env_push(e)
+      let e2 = env_add(e1, name)
+      let e2s = if stateful { env_add(env_add(e2, "state"), "log") } else { e2 }
+      let e3 = chk_expr(e2s, body)
+      env_pop(e3)
+    }
+  }
+}
+
+fn chk_exprs(e: Env, xs: [Expr]) : Env / Console + File {
+
+
+  match xs {
+    [] -> e
+    [h, ...rest] -> chk_exprs(chk_expr(e, h), rest)
+  }
+}
+
+fn chk_field_inits(e: Env, fs: [FieldInit]) : Env / Console + File {
+
+
+  match fs {
+    [] -> e
+    [f, ...rest] -> match f {
+      FI(_, val) -> chk_field_inits(chk_expr(e, val), rest)
+    }
+  }
+}
+
+fn chk_list_elems(e: Env, es: [ListElem]) : Env / Console + File {
+
+
+  match es {
+    [] -> e
+    [el, ...rest] -> match el {
+      ElPlain(x)  -> chk_list_elems(chk_expr(e, x), rest)
+      ElSpread(x) -> chk_list_elems(chk_expr(e, x), rest)
+    }
+  }
+}
+
+fn chk_arms(e: Env, arms: [Arm]) : Env / Console + File {
+
+
+  match arms {
+    [] -> e
+    [a, ...rest] -> chk_arms(chk_arm(e, a), rest)
+  }
+}
+
+fn chk_arm(e: Env, a: Arm) : Env / Console + File {
+
+
+  match a {
+    Arm(pat, guard, body) -> {
+      let e1 = env_push(e)
+      let e2 = bind_pat(e1, pat)
+      let e3 = match guard { Some(g) -> chk_expr(e2, g) None -> e2 }
+      let e4 = chk_expr(e3, body)
+      env_pop(e4)
+    }
+  }
+}
+
+fn chk_stmts(e: Env, ss: [Stmt]) : Env / Console + File {
+
+
+  match ss {
+    [] -> e
+    [s, ...rest] -> chk_stmts(chk_stmt(e, s), rest)
+  }
+}
+
+fn chk_stmt(e: Env, s: Stmt) : Env / Console + File {
+
+
+  match s {
+    SLet(pat, _, rhs) -> {
+      let e1 = chk_expr(e, rhs)
+      bind_pat(e1, pat)
+    }
+    SAssert(cond, opt_msg) -> {
+      let e1 = chk_expr(e, cond)
+      match opt_msg { Some(m) -> chk_expr(e1, m) None -> e1 }
+    }
+    SExprStmt(x) -> chk_expr(e, x)
+    # m7b #6: index-assign sugar — desugared away before this pass runs,
+    # but kept arm here so the match stays exhaustive if name resolution
+    # is invoked on the raw AST (e.g. from a future debug dump).
+    SIndexAssign(base, idx, val, _, _) -> {
+      let e1 = chk_expr(e, base)
+      let e2 = chk_expr(e1, idx)
+      chk_expr(e2, val)
+    }
+    # m7b #5b: `var name = init` is desugared away pre-resolve by
+    # `desugar_var_decls`. This arm is dead code in normal compilation;
+    # if a future debug mode skips the desugar, treat the binding like
+    # `let` so the match stays exhaustive and follow-on resolution
+    # still produces useful diagnostics.
+    SVar(name, _, rhs, _line, _col) -> {
+      let e1 = chk_expr(e, rhs)
+      env_add(e1, name)
+    }
+    # m7e §25: `use Effect` stmt is stripped by desugar_use_decls
+    # before chk runs. Arm kept so the match is exhaustive in case
+    # of a future debug-only path that skips the desugar.
+    SUse(_, _, _) -> e
+  }
+}
+
+fn add_params(e: Env, ps: [Param]) : Env {
+  match ps {
+    [] -> e
+    [p, ...rest] -> add_params(env_add(e, p.pname), rest)
+  }
+}
+
+# ---- declaration walkers ----
+
+fn chk_decl(e: Env, d: Decl) : Env / Console + File {
+
+
+  match d {
+    DFn(_, _, _, params, _, _, body, _, _, _) -> {
+      let e1 = env_push(e)
+      let e2 = add_params(e1, params)
+      let e3 = chk_expr(e2, body)
+      env_pop(e3)
+    }
+    DType(_, _, _, _, _, _, _) -> e
+    DTest(_, body, _, _) -> {
+      let e1 = env_push(e)
+      let e2 = chk_expr(e1, body)
+      env_pop(e2)
+    }
+    DBench(_, body, _, _) -> {
+      let e1 = env_push(e)
+      let e2 = chk_expr(e1, body)
+      env_pop(e2)
+    }
+    DCheck(_, params, body, _, _) -> {
+      let e1 = env_push(e)
+      let e2 = add_params(e1, params)
+      let e3 = chk_expr(e2, body)
+      env_pop(e3)
+    }
+    DImport(_, _, _) -> e
+    DEffect(_, _, _, _, _, _, _) -> e          # m7a #3c will register effect names
+    # m12.8: protocol / impl / derive decls are stripped by
+    # `lower_protocols` before `check_program` runs, so reaching one
+    # here means the pipeline was driven directly into `chk_decl` (e.g.
+    # via `--check` on a file that bypassed lowering, or a future
+    # caller that forgot to lower first). Treat as a no-op rather than
+    # a fatal error so the selfhost path continues to validate the
+    # post-lowering decl stream.
+    DProtocol(_, _, _, _, _, _) -> e
+    DImpl(_, _, _, _, _, _) -> e
+    DDerive(_, _, _, _) -> e
+    DUnstable(_, _, _) -> e
+    DUnit(_, _, _, _, _) -> e               # m12.5: unit declarations introduce no value bindings
+    DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before chk runs
+    DAxiom(_, _, _, _, _, _, _, _, _, _) -> e     # m12.7: rewritten to DFn by lower_axioms before chk runs
+    DAttribPure(inner, _, _) -> chk_decl(e, inner)  # m12.6.x #5(a)
+    DConst(_, name, _, body, _, _) -> {           # issue #269
+      let e1 = env_add(e, name)
+      chk_expr(e1, body)
+    }
+  }
+}
+
+#[doc("Walk a decl list with the resolver, threading the scope env left to right.")]
+pub fn chk_decls(e: Env, ds: [Decl]) : Env / Console + File {
+
+
+  match ds {
+    [] -> e
+    [d, ...rest] -> chk_decls(chk_decl(e, d), rest)
+  }
+}
+
+# ---- top-level pre-registration ----
+
+#[doc("Pre-register every top-level decl's name into the env so forward references resolve.")]
+pub fn register_decls(e: Env, ds: [Decl]) : Env {
+  match ds {
+    [] -> e
+    [d, ...rest] -> register_decls(register_one(e, d), rest)
+  }
+}
+
+fn register_one(e: Env, d: Decl) : Env {
+  match d {
+    DFn(_, name, _, _, _, _, _, _, _, _) -> env_add(e, name)
+    DType(_, name, _, body, _, _, _) -> {
+      let e1 = env_add(e, name)
+      match body {
+        TBSum(variants) -> register_variants_env(e1, variants)
+        _ -> e1
+      }
+    }
+    DTest(_, _, _, _) -> e
+    DBench(_, _, _, _) -> e
+    DCheck(_, _, _, _, _) -> e
+    DImport(ik, _, _) -> register_import(e, ik)
+    DEffect(_, name, _, _, _, _, _) -> env_add(e, name)
+    # m12.8: stripped pre-resolve; never reaches register_one in
+    # practice. No-op for completeness so the match stays exhaustive.
+    DProtocol(_, _, _, _, _, _) -> e
+    DImpl(_, _, _, _, _, _) -> e
+    DDerive(_, _, _, _) -> e
+    DUnstable(_, _, _) -> e
+    DUnit(_, _, _, _, _) -> e               # m12.5: unit names live in their own namespace, validated at type-resolve time
+    DUse(_, _, _) -> e                       # m7e §25: stripped by desugar_use_decls before register_one runs
+    DAxiom(_, _, name, _, _, _, _, _, _, _) -> env_add(e, name)  # m12.7: also rewritten to DFn by lower_axioms; case kept for completeness
+    DAttribPure(inner, _, _) -> register_one(e, inner)  # m12.6.x #5(a)
+    DConst(_, name, _, _, _, _) -> env_add(e, name)  # issue #269
+  }
+}
+
+fn register_variants_env(e: Env, vs: [Variant]) : Env {
+  match vs {
+    [] -> e
+    [v, ...rest] -> match v {
+      Var(name, _) -> register_variants_env(env_add(e, name), rest)
+    }
+  }
+}
+
+# For imports we add just the surface name: the last segment of the
+# dotted path, the alias, or each selected name. Stage 0 does the
+# same; deeper module resolution is a stage 2 concern.
+#[doc("Last dotted segment of an import path (`a.b.c` -> `c`).")]
+pub fn last_segment(path: String) : String {
+  last_segment_loop(path, string_length(path) - 1, string_length(path))
+}
+
+fn last_segment_loop(s: String, i: Int, end: Int) : String {
+  if i < 0 { string_slice(s, 0, end) }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '.' { string_slice(s, i + 1, end - i - 1) }
+                 else { last_segment_loop(s, i - 1, end) }
+      None -> string_slice(s, 0, end)
+    }
+  }
+}
+
+fn register_import(e: Env, ik: ImportKind) : Env {
+  match ik {
+    IkPath(path) -> env_add(e, last_segment(path))
+    IkAlias(_, alias) -> env_add(e, alias)
+    IkSelective(_, names) -> add_all(e, names)
+    # m7f §7: import holes don't bind anything in the value
+    # namespace — they are diagnostic-only. Skip for env-binding
+    # purposes; the symbol-index pass handles the diagnostic.
+    IkHole(_) -> e
+  }
+}
+
+# ---- entry point ----
+
+#[doc("Resolve a program: seed prelude, pre-register decls, walk them, then fold in row-label, refinement, and unbound-tyvar checks. Returns 1 if any check failed.")]
+pub fn check_program(file: String, decls: [Decl]) : Int / Console + File {
+
+  let e0 = env_new(file)
+  let e1 = add_all(e0, prelude_names())
+  let e2 = register_decls(e1, decls)
+  let e3 = chk_decls(e2, decls)
+  let eff_names = collect_effect_names(decls)
+  let arities = collect_effect_arities(decls)
+  let row_errs = check_row_labels(decls, file, eff_names, arities)
+  let strict_errs = check_call_site_refinements(file, decls)
+  let tyvar_errs = check_unbound_tyvars(decls, file)
+  if e3.had_error or row_errs > 0 or strict_errs > 0 or tyvar_errs > 0 { 1 } else { 0 }
+}
+
+# m7b #11j — arity table built from every DEffect in the program.
+# `inject_builtin_effects` runs before `check_program`, so the
+# parametric stdlib effects (State, Reader, Writer) and any used
+# default-handler effects are already in `decls`. Any builtin not
+# yet injected (the user's main doesn't reference it) is filled in
+# from `builtin_effect_arities()` so a helper can still use the
+# effect with the right tparam count.
+type EffArity = EA(String, Int)
+
+fn collect_effect_arities(decls: [Decl]) : [EffArity] {
+  let from_decls = collect_effect_arities_loop(decls)
+  list_append(from_decls, builtin_effect_arities_filtered(from_decls))
+}
+
+fn collect_effect_arities_loop(decls: [Decl]) : [EffArity] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, name, tparams, _, _, _, _) ->
+        [EA(name, list_length(tparams)), ...collect_effect_arities_loop(rest)]
+      _ -> collect_effect_arities_loop(rest)
+    }
+  }
+}
+
+# Names known to `builtin_effect_names()` that the program did not
+# declare or inject. Tparam counts are the canonical Doc B values
+# (Console/Fail/Stdin/Env/File: 0; State/Reader/Writer: 1).
+fn builtin_effect_arities_filtered(known: [EffArity]) : [EffArity] {
+  let all = [
+    EA("Console", 0), EA("Fail", 0), EA("Stdin", 0),
+    EA("Env", 0), EA("File", 0),
+    EA("State", 1), EA("Reader", 1), EA("Writer", 1),
+    EA("Mutable", 0),
+    # m12.7.x FFI v1: `Ffi` is the capability tag carried by every
+    # `[<extern_c>]` axiom row. The runtime has no handler for it —
+    # the codegen lowers extern_c calls to direct C symbols, which
+    # never trap into the effect dispatcher — so the row label
+    # exists only to keep public signatures honest.
+    EA("Ffi", 0)
+  ]
+  filter_unknown_arities(all, known)
+}
+
+fn filter_unknown_arities(all: [EffArity], known: [EffArity]) : [EffArity] {
+  match all {
+    [] -> []
+    [a, ...rest] -> match a {
+      EA(n, _) ->
+        if has_arity(known, n) { filter_unknown_arities(rest, known) }
+        else { [a, ...filter_unknown_arities(rest, known)] }
+    }
+  }
+}
+
+fn has_arity(arities: [EffArity], target: String) : Bool {
+  match arities {
+    [] -> false
+    [a, ...rest] -> match a {
+      EA(n, _) -> if n == target { true } else { has_arity(rest, target) }
+    }
+  }
+}
+
+fn lookup_arity(arities: [EffArity], target: String) : Option[Int] {
+  match arities {
+    [] -> None
+    [a, ...rest] -> match a {
+      EA(n, k) -> if n == target { Some(k) } else { lookup_arity(rest, target) }
+    }
+  }
+}
+
+# ---- m7a #3c: name resolution for effect labels in rows ----
+# Every label that appears in a `T / Eff + ...` suffix must refer to
+# a declared effect. Anything else is a compile error. m7a #3 does
+# not yet build evidence types or check the body's row against the
+# declared row — those are #3d and #8.
+
+#[doc("All declared effect names in the program (every DEffect's name).")]
+pub fn collect_effect_names(decls: [Decl]) : [String] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, name, _, _, _, _, _) -> [name, ...collect_effect_names(rest)]
+      _ -> collect_effect_names(rest)
+    }
+  }
+}
+
+# Issue #308: look up the in-scope decl for an effect by name and
+# return its op-name list. None if no DEffect with that name is
+# present.
+fn lookup_effect_op_names(decls: [Decl], name: String) : Option[[String]] {
+  match decls {
+    [] -> None
+    [d, ...rest] -> match d {
+      DEffect(_, dname, _, ops, _, _, _) ->
+        if dname == name { Some(effect_op_names(ops)) }
+        else { lookup_effect_op_names(rest, name) }
+      _ -> lookup_effect_op_names(rest, name)
+    }
+  }
+}
+
+fn effect_op_names(ops: [EffectOp]) : [String] {
+  match ops {
+    [] -> []
+    [o, ...rest] -> match o {
+      EOp(n, _, _, _, _, _) -> [n, ...effect_op_names(rest)]
+    }
+  }
+}
+
+fn check_row_labels(decls: [Decl], file: String, eff_names: [String],
+                     arities: [EffArity]) : Int / Console + File {
+
+
+  match decls {
+    [] -> 0
+    [d, ...rest] ->
+      check_decl_row_labels(d, file, eff_names, arities) +
+      check_row_labels(rest, file, eff_names, arities)
+  }
+}
+
+fn check_decl_row_labels(d: Decl, file: String, eff_names: [String],
+                          arities: [EffArity]) : Int / Console + File {
+
+
+  match d {
+    DFn(_, _, _, _, _, rexpr, _, line, col, _) ->
+      check_row_expr(rexpr, file, line, col, eff_names, arities)
+    _ -> 0
+  }
+}
+
+fn check_row_expr(re: RowExpr, file: String, line: Int, col: Int,
+                   eff_names: [String], arities: [EffArity]) : Int / Console + File {
+
+
+  match re {
+    REmpty -> 0
+    RClosed(labels) -> check_row_labels_loop(labels, file, line, col, eff_names, arities)
+    # m7b #12: row variables in tail position carry the same labels;
+    # apply the same name + arity check.
+    ROpen(_, labels) -> check_row_labels_loop(labels, file, line, col, eff_names, arities)
+  }
+}
+
+# m7b #11j — per-label name + arity check. Unknown effect → "unknown
+# effect: X". Arity mismatch → "effect 'X' expects N type
+# argument(s), got M".
+fn check_row_labels_loop(labels: [RowLabel], file: String, line: Int, col: Int,
+                          eff_names: [String], arities: [EffArity]) : Int / Console + File {
+
+
+  match labels {
+    [] -> 0
+    [l, ...rest] -> match l {
+      RL(name, ts) -> {
+        let got = list_length(ts)
+        let here =
+          if not list_has(eff_names, name) {
+            let _ = diag_error(file, line, col,
+              string_concat("unknown effect: ", name))
+            let _ = diag_note("only declared `effect Foo { ... }` names and the catalog (Console, Fail, Stdin, Env, File, State, Reader, Writer, Mutable, Ffi) are valid in a row")
+            let _ = diag_help("declare `effect #{name} { ... }` first, or fix the spelling")
+            1
+          } else {
+            match lookup_arity(arities, name) {
+              None -> 0     # declared without arity — should not happen given collect_effect_arities covers all
+              Some(want) ->
+                if want == got { 0 }
+                else {
+                  let _ = diag_error(file, line, col,
+                    concat_all(["effect '", name, "' expects ",
+                                int_to_string(want),
+                                " type argument(s), got ",
+                                int_to_string(got)]))
+                  let _ = diag_note("the parametric label must match the effect's `[...]` declaration")
+                  let _ = diag_help(
+                    if got > want {
+                      concat_all(["drop ", int_to_string(got - want), " type argument(s) from `", name, "[...]`"])
+                    } else {
+                      concat_all(["add ", int_to_string(want - got), " more type argument(s) to `", name, "[...]`"])
+                    })
+                  1
+                }
+            }
+          }
+        here + check_row_labels_loop(rest, file, line, col, eff_names, arities)
+      }
+    }
+  }
+}
+
+# ====================================================================
+# Issue #534 shape 4 — unbound type variable in signature.
+# ====================================================================
+#
+# `fn_scheme_of_decl` already auto-collects lowercase TyName names as
+# implicit tparams (R1 fix, 2026-04-26), so `fn f(x: a) : a = x` works
+# without `[a]`. But that promotion is undisciplined: it also accepts
+# `fn coerce(x: a) : b = x`, where `b` appears only in the return type
+# and has no value-level binding site. Under HM that tyvar is
+# ambiguous — the caller cannot constrain it, the body cannot witness
+# it, and the value silently masquerades as whatever the call site
+# expects. ML/Haskell-family compilers reject this as "unbound type
+# variable".
+#
+# This check enforces the rule on every `DFn`:
+#
+#   For every lowercase tyvar name appearing in the return type or in
+#   the row labels of a fn signature, the name must also appear in
+#   the explicit `[…]` tparam list OR in at least one parameter type.
+#
+# Tyvars that *only* appear in params remain implicit and legal (the
+# implicit-tparam promotion still handles them). Tyvars declared in
+# `[…]` are always legal — the user opted in deliberately. The diag
+# nudges users toward the explicit form when the shape is genuinely
+# polymorphic but currently mis-declared.
+fn is_lc_tyvar_name(name: String) : Bool {
+  if string_length(name) == 0 { false }
+  else { match char_at(name, 0) {
+    Some(c) -> c >= 'a' and c <= 'z'
+    None -> false
+  } }
+}
+
+fn lc_add(names: [String], name: String) : [String] {
+  if list_has(names, name) { names } else { list_append(names, [name]) }
+}
+
+fn collect_tyvars_in_typeexpr(t: TypeExpr, acc: [String]) : [String] {
+  match t.tkind {
+    TyName(name, tas) -> {
+      let acc1 = collect_tyvars_in_typeexprs(tas, acc)
+      if is_lc_tyvar_name(name) { lc_add(acc1, name) } else { acc1 }
+    }
+    TyList(inner) -> collect_tyvars_in_typeexpr(inner, acc)
+    TyFn(ps, ret, rexpr) -> {
+      let acc1 = collect_tyvars_in_typeexprs(ps, acc)
+      let acc2 = collect_tyvars_in_typeexpr(ret, acc1)
+      collect_tyvars_in_row(rexpr, acc2)
+    }
+    TyDim(base, _) -> collect_tyvars_in_typeexpr(base, acc)
+    TyRefine(base, _) -> collect_tyvars_in_typeexpr(base, acc)
+  }
+}
+
+fn collect_tyvars_in_typeexprs(ts: [TypeExpr], acc: [String]) : [String] {
+  match ts {
+    [] -> acc
+    [t, ...rest] -> collect_tyvars_in_typeexprs(rest, collect_tyvars_in_typeexpr(t, acc))
+  }
+}
+
+fn collect_tyvars_in_params(ps: [Param], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> {
+      let acc1 = match p.ptype {
+        Some(te) -> collect_tyvars_in_typeexpr(te, acc)
+        None     -> acc
+      }
+      collect_tyvars_in_params(rest, acc1)
+    }
+  }
+}
+
+fn collect_tyvars_in_row_labels(labels: [RowLabel], acc: [String]) : [String] {
+  match labels {
+    [] -> acc
+    [l, ...rest] -> match l {
+      RL(_, tas) -> collect_tyvars_in_row_labels(rest, collect_tyvars_in_typeexprs(tas, acc))
+    }
+  }
+}
+
+fn collect_tyvars_in_row(re: RowExpr, acc: [String]) : [String] {
+  match re {
+    REmpty -> acc
+    RClosed(labels) -> collect_tyvars_in_row_labels(labels, acc)
+    ROpen(_, labels) -> collect_tyvars_in_row_labels(labels, acc)
+  }
+}
+
+fn check_unbound_tyvars(decls: [Decl], file: String) : Int / Console + File {
+  match decls {
+    [] -> 0
+    [d, ...rest] -> check_decl_unbound_tyvars(d, file) + check_unbound_tyvars(rest, file)
+  }
+}
+
+fn is_compiler_synth_name(n: String) : Bool {
+  if string_length(n) < 2 { false }
+  else { match char_at(n, 0) {
+    Some(c1) -> if c1 == '_' { match char_at(n, 1) {
+      Some(c2) -> c2 == '_'
+      None -> false
+    } } else { false }
+    None -> false
+  } }
+}
+
+fn check_decl_unbound_tyvars(d: Decl, file: String) : Int / Console + File {
+  match d {
+    DFn(_, fname, declared, params, opt_ret, rexpr, _, line, col, _) -> {
+      # Synthetic compiler-generated fns (`__proto_*`, `__deriv_*`,
+      # etc.) come from desugar and may legitimately have tyvars in
+      # return-only position by construction (protocol `Self` lives
+      # only on the right of `:`). Skip them; their soundness is the
+      # desugar pass's responsibility.
+      if is_compiler_synth_name(fname) { 0 } else {
+        let in_params = collect_tyvars_in_params(params, [])
+        # Constructor-style fns with no value-level params (e.g.
+        # `pub fn empty() : Map[k, v] = ...`) are caller-elects:
+        # tyvars in the return are unambiguous because the caller
+        # picks them at the use site. Only fns that already bind
+        # *some* tyvar via a param can suffer the silent-shadow
+        # shape from issue #534.
+        if list_length(in_params) == 0 { 0 } else {
+          let in_ret = match opt_ret {
+            Some(rty) -> collect_tyvars_in_typeexpr(rty, [])
+            None      -> []
+          }
+          let in_row = collect_tyvars_in_row(rexpr, [])
+          let ret_errs = report_unbound_tyvars_in_set(in_ret, declared, in_params, fname, file, line, col, 0)
+          let row_errs = report_unbound_tyvars_in_set(in_row, declared, in_params, fname, file, line, col, 0)
+          ret_errs + row_errs
+        }
+      }
+    }
+    DAxiom(_, _, fname, _, declared, params, ret, rexpr, line, col) -> {
+      if is_compiler_synth_name(fname) { 0 } else {
+        let in_params = collect_tyvars_in_params(params, [])
+        if list_length(in_params) == 0 { 0 } else {
+          let in_ret = collect_tyvars_in_typeexpr(ret, [])
+          let in_row = collect_tyvars_in_row(rexpr, [])
+          let ret_errs = report_unbound_tyvars_in_set(in_ret, declared, in_params, fname, file, line, col, 0)
+          let row_errs = report_unbound_tyvars_in_set(in_row, declared, in_params, fname, file, line, col, 0)
+          ret_errs + row_errs
+        }
+      }
+    }
+    _ -> 0
+  }
+}
+
+fn report_unbound_tyvars_in_set(found: [String], declared: [String], in_params: [String],
+                                 fname: String, file: String, line: Int, col: Int,
+                                 acc: Int) : Int / Console + File {
+  match found {
+    [] -> acc
+    [n, ...rest] -> {
+      let bound = list_has(declared, n) or list_has(in_params, n)
+      let here = if bound { 0 } else {
+        let _ = diag_error(file, line, col,
+          string_concat_all(["unbound type variable: `", n, "`"]))
+        let _ = diag_note(string_concat_all([
+          "type variable `", n,
+          "` appears in the return type or effect row of `fn ",
+          fname, "` but not in any parameter"
+        ]))
+        let _ = diag_help(string_concat_all([
+          "introduce it as an explicit tparam (e.g. `fn ",
+          fname, "[", n, "](...) : ...`)"
+        ]))
+        1
+      }
+      report_unbound_tyvars_in_set(rest, declared, in_params, fname, file, line, col, acc + here)
+    }
+  }
+}
