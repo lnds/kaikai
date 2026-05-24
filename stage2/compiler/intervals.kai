@@ -1,0 +1,416 @@
+# compiler/intervals.kai — Integer interval lattice + post-typing
+# interval propagation (m12.6.x #2).
+#
+# Extracted from main.kai under issue #677 Phase 1g. The lattice
+# computes bounded `[lo, hi]` ranges for `Int`-typed expressions
+# so the refinement-discharge path can prove predicates statically
+# in a future unifier reshape. The propagation pass walks
+# post-typing decls, threading IntervalEnv through Stmt /
+# Expr / Pattern shapes that already carry their AST types from
+# compiler/ast.kai.
+#
+# Public surface
+#
+# Marked pub on extraction: the lattice ops (ival_*), the env
+# helpers (ie_*), the AST-walking entry points (ival_of_expr,
+# ival_of_decl, ival_of_block, …), and the seed helpers used
+# by the call-site analysis pass (still in main.kai today).
+# Internal helpers (ival_of_match_loop, ival_thread_stmts, etc.)
+# would be candidates for private in a follow-up pass.
+#
+# Cross-module dependencies
+#
+# - compiler.ast — Expr / ExprKind / Stmt / Pattern / Decl /
+#   Arm / Param / Ty / TyInt / EVar / EInt / EBlock / EIf /
+#   EMatch / EBinop / EUnop / ECall + every variant tag the
+#   lattice pattern-matches on.
+# - stdlib core — int_to_string, string_concat_all.
+#
+# No diag / lex dependency. The interval pass is a pure
+# walk-and-compute: any diagnostics it triggers happen at
+# call-site rendering time in main.kai.
+#
+# Single-line `#[doc(...)]` only — kaic1 still consumes the
+# concatenated bundle and does not accept triple-quoted
+# strings inside attributes (#677 Phase 2 will retire that
+# constraint once separate compilation lands).
+
+import compiler.ast
+
+# ====================================================================
+# m12.6.x #2 (sub-step 1) — Integer interval lattice
+# ====================================================================
+#
+# Foundation for the post-typing interval-propagation pass. Computes
+# bounded `[lo, hi]` ranges for `Int`-typed expressions so a future
+# unifier reshape can decide refinement predicates statically. This
+# step adds only the lattice; no compiler integration yet (the pass
+# that consumes these intervals lands in the next sub-step). Keeping
+# the lattice self-contained makes it independently testable and
+# avoids touching the typer / Perceus path while those lanes are in
+# flight.
+#
+# Interval values:
+#   - `IBot`: empty / unreachable / contradiction. Bottom of the
+#             lattice.
+#   - `Ival(lo, hi)`: inclusive `[lo, hi]` range, `lo <= hi`. Singletons
+#                     (literals) use `lo == hi`.
+#   - `ITop`: unbounded; "any Int". Top of the lattice. Saturating
+#             arithmetic that overflows the conservative bounds we
+#             use elsewhere returns ITop instead of fabricating a
+#             made-up range.
+#
+# Operations are deliberately conservative — overestimating the
+# range never makes the analysis unsound (it just leaves more
+# refinements to runtime), while underestimating would let us
+# reject valid programs at compile time. When in doubt: ITop.
+
+pub type Interval = ITop | IBot | Ival(Int, Int)
+
+# Locally-scoped Int helpers. stdlib/math/int.kai exports the same
+# names but the compiler does not load it as a prelude — these are
+# self-contained inline so the lattice is bootstrap-safe.
+pub fn ival_int_min(a: Int, b: Int) : Int = if a < b { a } else { b }
+pub fn ival_int_max(a: Int, b: Int) : Int = if a > b { a } else { b }
+
+pub fn ival_top() : Interval = ITop
+
+pub fn ival_bot() : Interval = IBot
+
+pub fn ival_const(n: Int) : Interval = Ival(n, n)
+
+# Smart constructor: if `lo > hi` the range is empty — return IBot.
+# Used by intersect and by the comparison-narrow paths once they
+# land.
+pub fn ival_range(lo: Int, hi: Int) : Interval =
+  if lo > hi { IBot } else { Ival(lo, hi) }
+
+pub fn ival_show(iv: Interval) : String = match iv {
+  ITop -> "T"
+  IBot -> "_|_"
+  Ival(lo, hi) ->
+    if lo == hi { string_concat_all(["{", int_to_string(lo), "}"]) }
+    else { string_concat_all(["[", int_to_string(lo), ", ", int_to_string(hi), "]"]) }
+}
+
+# Lattice join (least upper bound). Used by EIf to merge branches
+# and by EMatch to merge arm results — the inferred interval after
+# the join covers either branch.
+pub fn ival_join(a: Interval, b: Interval) : Interval = match a {
+  IBot -> b
+  ITop -> ITop
+  Ival(alo, ahi) -> match b {
+    IBot -> a
+    ITop -> ITop
+    Ival(blo, bhi) -> Ival(ival_int_min(alo, blo), ival_int_max(ahi, bhi))
+  }
+}
+
+# Lattice meet (greatest lower bound). Used by control-flow
+# narrowing (e.g. inside an `if x > 0 { ... }` branch the body sees
+# `x.interval ⊓ [1, +∞]`). The next sub-step adds the narrowing
+# walker; this helper is the primitive it consumes.
+pub fn ival_intersect(a: Interval, b: Interval) : Interval = match a {
+  IBot -> IBot
+  ITop -> b
+  Ival(alo, ahi) -> match b {
+    IBot -> IBot
+    ITop -> a
+    Ival(blo, bhi) -> ival_range(ival_int_max(alo, blo), ival_int_min(ahi, bhi))
+  }
+}
+
+# Saturating arithmetic. We do not track Int overflow precisely;
+# any operation that COULD overflow returns ITop. This trades
+# precision for safety: code that genuinely depends on overflow
+# semantics will fall back to runtime asserts, which is the worst
+# case anyway.
+pub fn ival_add(a: Interval, b: Interval) : Interval = match a {
+  IBot -> IBot
+  ITop -> match b { IBot -> IBot _ -> ITop }
+  Ival(alo, ahi) -> match b {
+    IBot -> IBot
+    ITop -> ITop
+    Ival(blo, bhi) -> Ival(alo + blo, ahi + bhi)
+  }
+}
+
+pub fn ival_sub(a: Interval, b: Interval) : Interval = match a {
+  IBot -> IBot
+  ITop -> match b { IBot -> IBot _ -> ITop }
+  Ival(alo, ahi) -> match b {
+    IBot -> IBot
+    ITop -> ITop
+    Ival(blo, bhi) -> Ival(alo - bhi, ahi - blo)
+  }
+}
+
+# Multiplication: cross-product of bounds, take min/max. Catches
+# the [-1, 1] * [-1, 1] = [-1, 1] case correctly (vs the naive
+# alo*blo..ahi*bhi which would give [-1, 1] too, but only by luck).
+pub fn ival_mul(a: Interval, b: Interval) : Interval = match a {
+  IBot -> IBot
+  ITop -> match b { IBot -> IBot _ -> ITop }
+  Ival(alo, ahi) -> match b {
+    IBot -> IBot
+    ITop -> ITop
+    Ival(blo, bhi) -> {
+      let p1 = alo * blo
+      let p2 = alo * bhi
+      let p3 = ahi * blo
+      let p4 = ahi * bhi
+      let m1 = ival_int_min(p1, p2)
+      let m2 = ival_int_min(p3, p4)
+      let lo = ival_int_min(m1, m2)
+      let h1 = ival_int_max(p1, p2)
+      let h2 = ival_int_max(p3, p4)
+      let hi = ival_int_max(h1, h2)
+      Ival(lo, hi)
+    }
+  }
+}
+
+# Provability helpers: each comparison returns
+#   Some(true)  — provably true given the intervals,
+#   Some(false) — provably false,
+#   None        — undecidable, defer to runtime.
+# Mirrors the three-valued logic that the unifier reshape will
+# consume in the next sub-step.
+
+pub fn ival_lt(a: Interval, b: Interval) : Option[Bool] = match a {
+  IBot -> Some(true)        # vacuously true on an empty domain
+  ITop -> match b { IBot -> Some(true) ITop -> None Ival(_, _) -> None }
+  Ival(alo, ahi) -> match b {
+    IBot -> Some(true)
+    ITop -> None
+    Ival(blo, bhi) ->
+      if ahi < blo { Some(true) }
+      else if alo >= bhi { Some(false) }
+      else { None }
+  }
+}
+
+pub fn ival_le(a: Interval, b: Interval) : Option[Bool] = match a {
+  IBot -> Some(true)
+  ITop -> match b { IBot -> Some(true) ITop -> None Ival(_, _) -> None }
+  Ival(alo, ahi) -> match b {
+    IBot -> Some(true)
+    ITop -> None
+    Ival(blo, bhi) ->
+      if ahi <= blo { Some(true) }
+      else if alo > bhi { Some(false) }
+      else { None }
+  }
+}
+
+pub fn ival_gt(a: Interval, b: Interval) : Option[Bool] = ival_lt(b, a)
+
+pub fn ival_ge(a: Interval, b: Interval) : Option[Bool] = ival_le(b, a)
+
+pub fn ival_eq(a: Interval, b: Interval) : Option[Bool] = match a {
+  IBot -> Some(true)
+  ITop -> match b { IBot -> Some(true) ITop -> None Ival(_, _) -> None }
+  Ival(alo, ahi) -> match b {
+    IBot -> Some(true)
+    ITop -> None
+    Ival(blo, bhi) ->
+      if alo == ahi and blo == bhi and alo == blo { Some(true) }
+      else if ahi < blo or alo > bhi { Some(false) }
+      else { None }
+  }
+}
+
+pub fn ival_ne(a: Interval, b: Interval) : Option[Bool] = match ival_eq(a, b) {
+  Some(b1) -> Some(not b1)
+  None     -> None
+}
+
+# ====================================================================
+# m12.6.x #2 (sub-step 2) — Post-typing interval propagation
+# ====================================================================
+#
+# Walks a typed Expr and infers an Interval for every node. Bindings
+# learned at SLet propagate through the rest of the block; EIf and
+# EMatch join branches; EBinop on Int dispatches to the lattice ops;
+# every other shape collapses to ITop (we are not in the business of
+# inferring `Real` ranges, `String` properties, etc. — only Int).
+#
+# This step adds the WALKER ONLY. The unifier still ignores
+# refinements; the assert path still emits runtime checks. The next
+# sub-step adds a `--dump-intervals` flag so fixtures can pin the
+# walker's output before the unifier reshape consumes it.
+#
+# Intentionally not threaded through the typer's InferState — the
+# walker runs after typing finalises, reading types off
+# `Expr.ty` to decide whether a node is Int-shaped at all.
+
+# Per-name interval table. Keyed by binding name; missing names
+# default to ITop. Uses a flat assoc-list because the typical
+# function body has a handful of bindings — a hashmap would be
+# overkill.
+pub type IntervalEnv = IE([IntervalBinding])
+
+pub type IntervalBinding = IB(String, Interval)
+
+pub fn ie_empty() : IntervalEnv = IE([])
+
+pub fn ie_lookup(env: IntervalEnv, name: String) : Interval = match env {
+  IE(bs) -> ie_lookup_loop(bs, name)
+}
+
+pub fn ie_lookup_loop(bs: [IntervalBinding], name: String) : Interval = match bs {
+  [] -> ITop
+  [b, ...rest] -> match b {
+    IB(nm, iv) -> if nm == name { iv } else { ie_lookup_loop(rest, name) }
+  }
+}
+
+pub fn ie_extend(env: IntervalEnv, name: String, iv: Interval) : IntervalEnv = match env {
+  IE(bs) -> IE([IB(name, iv), ...bs])
+}
+
+# Walk an Expr, returning its interval. The caller passes in the
+# current `env`; bindings introduced by sub-Exprs (via SLet inside
+# blocks) do NOT escape — their scope ends with the block.
+pub fn ival_of_expr(e: Expr, env: IntervalEnv) : Interval = match e.kind {
+  EInt(n)    -> Ival(n, n)
+  EBool(_)   -> ITop
+  EReal(_)   -> ITop
+  EChar(_)   -> ITop
+  EStr(_, _) -> ITop
+  EUnit      -> ITop
+  EVar(nm)   -> ie_lookup(env, nm)
+  EUnder     -> ITop
+  EPlaceholder -> ITop
+  EHole(_)   -> ITop
+  ETodo(_)   -> ITop
+  EVariantsOf(_, _) -> ITop
+  EModCall(_, _)    -> ITop
+  EIntrinsic(_, _)  -> ITop
+  ECall(_, _)       -> ITop
+  EField(_, _)      -> ITop
+  EIndex(_, _)      -> ITop
+  EBinop(op, a, b)  -> ival_of_binop(op, a, b, env)
+  EUnop(op, x)      -> ival_of_unop(op, x, env)
+  EIf(c, t, eo)     -> ival_of_if(c, t, eo, env)
+  EMatch(scr, arms) -> ival_of_match(scr, arms, env)
+  ELambda(_, _)     -> ITop
+  ERecordLit(_, _)  -> ITop
+  EList(_)          -> ITop
+  ERange(_, _, _)   -> ITop
+  EBlock(stmts, tail) -> ival_of_block(stmts, tail, env)
+  EPipe(_, _)       -> ITop
+  EMapPipe(_, _)     -> ITop
+  EFlatMapPipe(_, _) -> ITop
+  EFilterPipe(_, _)  -> ITop
+  EBang(_)          -> ITop
+  EHandle(_, _, _, _, _, _, _) -> ITop
+  ELitUnit(_, _)    -> ITop
+}
+
+pub fn ival_of_binop(op: String, a: Expr, b: Expr, env: IntervalEnv) : Interval = {
+  let ia = ival_of_expr(a, env)
+  let ib = ival_of_expr(b, env)
+  if op == "+" { ival_add(ia, ib) }
+  else if op == "-" { ival_sub(ia, ib) }
+  else if op == "*" { ival_mul(ia, ib) }
+  else { ITop }
+}
+
+# Unary minus narrows: -[lo, hi] = [-hi, -lo]. `not` is Bool, so it
+# falls through. Anything else (e.g. parser-only ops) — ITop.
+pub fn ival_of_unop(op: String, x: Expr, env: IntervalEnv) : Interval = {
+  if op == "-" {
+    match ival_of_expr(x, env) {
+      IBot -> IBot
+      ITop -> ITop
+      Ival(lo, hi) -> Ival(0 - hi, 0 - lo)
+    }
+  } else { ITop }
+}
+
+# Conditional: when `eo == None` the if-without-else returns Unit on
+# the false branch, so the result is the join of the then-branch
+# interval and ITop (= ITop). When eo is present, join both arms.
+pub fn ival_of_if(c: Expr, t: Expr, eo: Option[Expr], env: IntervalEnv) : Interval = {
+  let it = ival_of_expr(t, env)
+  match eo {
+    None -> ITop
+    Some(e) -> ival_join(it, ival_of_expr(e, env))
+  }
+}
+
+# match: join over all arm bodies. Pattern bindings are not
+# narrowed in v1 — every arm body sees the same env. Adding pattern-
+# narrowing (e.g. `Some(x) -> ...` reveals `x` is non-None) is a
+# follow-up sub-step alongside the unifier reshape.
+pub fn ival_of_match(scr: Expr, arms: [Arm], env: IntervalEnv) : Interval = {
+  let _ = scr  # walked for side-effects when the pass becomes intervalize
+  ival_of_match_loop(arms, env, IBot)
+}
+
+pub fn ival_of_match_loop(arms: [Arm], env: IntervalEnv, acc: Interval) : Interval = match arms {
+  [] -> if match_is_total(acc) { acc } else { acc }
+  [a, ...rest] -> match a {
+    Arm(_, _, body) -> ival_of_match_loop(rest, env, ival_join(acc, ival_of_expr(body, env)))
+  }
+}
+
+# Placeholder for "every variant of the scrutinee is covered" so we
+# can drop the IBot fallback. Without this we would over-approximate
+# to ITop on any match (the IBot starts polluting the join). Total
+# match analysis lives in the typer for exhaustiveness; for v1 we
+# trust the typer's exhaustiveness check has already run.
+pub fn match_is_total(_acc: Interval) : Bool = true
+
+pub fn ival_of_block(stmts: [Stmt], tail: Option[Expr], env: IntervalEnv) : Interval = {
+  let env1 = ival_thread_stmts(stmts, env)
+  match tail {
+    None    -> ITop
+    Some(e) -> ival_of_expr(e, env1)
+  }
+}
+
+# Thread the env through SLet bindings. Each SLet of `pat = e`
+# extends the env when `pat` is a single name (PBind) — destructuring
+# patterns are out of scope for v1; they bind to ITop. SAssert /
+# SExprStmt / SUse / SVar / SIndexAssign do not introduce Int
+# bindings worth tracking here (SVar's State desugar fires before
+# the typer; if it ever survives, treat as ITop binding).
+pub fn ival_thread_stmts(stmts: [Stmt], env: IntervalEnv) : IntervalEnv = match stmts {
+  [] -> env
+  [s, ...rest] -> match s {
+    SLet(pat, _, e) -> {
+      let iv = ival_of_expr(e, env)
+      let env1 = ival_bind_pat(pat, iv, env)
+      ival_thread_stmts(rest, env1)
+    }
+    _ -> ival_thread_stmts(rest, env)
+  }
+}
+
+# Bind a pattern to an interval. Only the simple PBind(name) case
+# adds a useful entry; everything else falls through.
+pub fn ival_bind_pat(pat: Pattern, iv: Interval, env: IntervalEnv) : IntervalEnv = match pat.pkind {
+  PBind(nm) -> ie_extend(env, nm, iv)
+  _ -> env
+}
+
+# Convenience entry: walk an entire DFn body, returning the
+# inferred interval for the whole expression. Used by the dump
+# flag and by the (future) unifier reshape that needs to consult
+# intervals at the body's tail expression.
+pub fn ival_of_decl(d: Decl) : Interval = match d {
+  DFn(_, _, _, params, _, _, body, _, _, _) ->
+    ival_of_expr(body, ival_seed_params(params, ie_empty()))
+  _ -> ITop
+}
+
+# Seed the env with each parameter mapped to ITop (no narrowing
+# from refinement types yet — the unifier reshape will refine
+# this when refined params land).
+pub fn ival_seed_params(params: [Param], env: IntervalEnv) : IntervalEnv = match params {
+  [] -> env
+  [p, ...rest] -> ival_seed_params(rest, ie_extend(env, p.pname, ITop))
+}
+
