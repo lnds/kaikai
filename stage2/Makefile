@@ -46,7 +46,7 @@ SRC     := main.kai
 # dependencies. kaic1 parses `import` lines (stage1/compiler.kai
 # `parse_import_decl`) and ignores them downstream, so the bundle
 # compiles clean without stripping the import statements.
-BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/intervals.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/desugar.kai compiler/infer.kai compiler/fnreg.kai compiler/unbox.kai compiler/perceus.kai compiler/protos.kai main.kai
+BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/intervals.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/desugar.kai compiler/infer.kai compiler/fnreg.kai compiler/unbox.kai compiler/perceus.kai compiler/protos.kai compiler/emit_llvm.kai main.kai
 
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
