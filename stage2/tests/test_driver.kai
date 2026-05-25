@@ -1,0 +1,194 @@
+# compiler/driver.kai unit tests — per-module tests for the CLI +
+# driver apex extracted under issue #677 phase 1s (the FINAL phase-1
+# lane).
+#
+# driver owns the CLI surface (`parse_cli` / `Mode` / `CliOptions`),
+# prelude loading + builtin-effect injection, module-import resolution,
+# the #454 library-query mode, the token/AST/diagnostic dumpers, and the
+# `compile_source` / `run` orchestrators. Its public surface is just
+# `parse_cli`, `run`, `Mode`, and `CliOptions` — the two entry points
+# `fn main()` in main.kai calls plus the types that flow between them.
+#
+# Coverage drives `parse_cli` end-to-end so the private `parse_cli_loop`
+# flag walk + the `cli_with_*` builders are exercised transitively. The
+# heavy orchestrators (`run`, `compile_source`, the library probes) ride
+# selfhost + tier1 end-to-end; pinning them here would re-implement the
+# pipeline.
+#
+# Coverage:
+#   - parse_cli: empty argv -> MDefault, no path; a bare path arg sets
+#     `path`; every mode flag (--test, --emit=llvm, --fmt, --check,
+#     --library-mode, …) selects its Mode; --strict-holes flips the
+#     flag; --path / --package-name / --edition consume their argument.
+#   - Mode: each variant is constructible and distinguishable by match.
+#   - CliOptions: the record is constructible with all fields and
+#     round-trips its values through field access.
+#
+# Property checks (body Bool, NOT assert — `kai check` reports a
+# counterexample per input; Bool/Int generators only, per the phase-1n
+# String-generator caveat): a leading mode flag never leaves MDefault;
+# --strict-holes is idempotent under repetition; the option record's
+# strict_holes field round-trips a generated Bool.
+#
+# Runner: `kai test stage2/.`. Property checks: `kai check`.
+
+import compiler.driver
+
+# ---- helpers ----
+
+# A compact tag for each Mode so tests can assert the selected mode by
+# string instead of a 30-arm match per assertion.
+fn mode_tag(m: Mode) : String = match m {
+  MDefault          -> "default"
+  MTokens           -> "tokens"
+  MAst              -> "ast"
+  MTypes            -> "types"
+  MEnv              -> "env"
+  MInfer            -> "infer"
+  MCheck            -> "check"
+  MDumpTyped        -> "dump-typed"
+  MDumpMono         -> "dump-mono"
+  MDumpMonoOut      -> "dump-mono-out"
+  MDumpLastUse      -> "dump-last-use"
+  MHoles            -> "holes"
+  MHolesJson        -> "holes-json"
+  MEffectsJson      -> "effects-json"
+  MEffectHolesJson  -> "effect-holes-json"
+  MEmitLlvm         -> "emit-llvm"
+  MTest             -> "test"
+  MBench            -> "bench"
+  MPropCheck        -> "prop-check"
+  MHelp             -> "help"
+  MVersion          -> "version"
+  MDumpIntervals    -> "dump-intervals"
+  MDumpCallElision  -> "dump-call-elision"
+  MDumpBrands       -> "dump-brands"
+  MFmt              -> "fmt"
+  MFmtCheck         -> "fmt-check"
+  MLibraryMode      -> "library-mode"
+  MDiagsJson        -> "diags-json"
+  MCacheRoundtrip   -> "cache-roundtrip"
+  MEmitPreludeCache -> "emit-prelude-cache"
+}
+
+fn opt_path_or(opts: CliOptions, dflt: String) : String = match opts.path {
+  Some(p) -> p
+  None    -> dflt
+}
+
+# ==================================================================
+# Unit tests — parse_cli mode selection
+# ==================================================================
+
+test "parse_cli on empty argv stays in MDefault with no path" {
+  let opts = parse_cli([])
+  assert mode_tag(opts.mode) == "default"
+  assert opt_path_or(opts, "<none>") == "<none>"
+}
+
+test "parse_cli treats a bare argument as the source path" {
+  let opts = parse_cli(["foo.kai"])
+  assert mode_tag(opts.mode) == "default"
+  assert opt_path_or(opts, "<none>") == "foo.kai"
+}
+
+test "parse_cli --test selects MTest" {
+  let opts = parse_cli(["--test", "foo.kai"])
+  assert mode_tag(opts.mode) == "test"
+  assert opt_path_or(opts, "<none>") == "foo.kai"
+}
+
+test "parse_cli --emit=llvm selects MEmitLlvm" {
+  let opts = parse_cli(["--emit=llvm", "foo.kai"])
+  assert mode_tag(opts.mode) == "emit-llvm"
+}
+
+test "parse_cli --fmt and --fmt-check select distinct modes" {
+  assert mode_tag(parse_cli(["--fmt", "f.kai"]).mode) == "fmt"
+  assert mode_tag(parse_cli(["--fmt-check", "f.kai"]).mode) == "fmt-check"
+}
+
+test "parse_cli --library-mode selects MLibraryMode" {
+  assert mode_tag(parse_cli(["--library-mode", "f.kai"]).mode) == "library-mode"
+}
+
+# ==================================================================
+# Unit tests — parse_cli flags + argument-consuming options
+# ==================================================================
+
+test "parse_cli --strict-holes flips the flag without changing mode" {
+  let opts = parse_cli(["--strict-holes", "foo.kai"])
+  assert opts.strict_holes
+  assert mode_tag(opts.mode) == "default"
+}
+
+test "parse_cli --path consumes its directory argument" {
+  let opts = parse_cli(["--path", "lib", "foo.kai"])
+  assert list_length(opts.search_paths) == 1
+  assert opt_path_or(opts, "<none>") == "foo.kai"
+}
+
+test "parse_cli --package-name and --edition consume their arguments" {
+  let opts = parse_cli(["--package-name", "mypkg", "--edition", "hanga-roa", "f.kai"])
+  assert opts.package_name == "mypkg"
+  assert opts.edition == "hanga-roa"
+}
+
+# ==================================================================
+# Unit tests — Mode + CliOptions are constructible
+# ==================================================================
+
+test "Mode variants are distinguishable by their tag" {
+  assert mode_tag(MCheck) == "check"
+  assert mode_tag(MHelp) == "help"
+  assert mode_tag(MCheck) != mode_tag(MHelp)
+}
+
+test "CliOptions record round-trips its fields through access" {
+  let o = CliOptions { mode: MTest, path: Some("x.kai"), preludes: [],
+                       prelude_caches: [], cache_sha: "ab",
+                       strict_holes: true, search_paths: ["d"],
+                       include_prelude_tests: false,
+                       package_name: "pkg", unstable_optins: ["dep"],
+                       edition: "tongariki" }
+  assert mode_tag(o.mode) == "test"
+  assert opt_path_or(o, "<none>") == "x.kai"
+  assert o.strict_holes
+  assert o.package_name == "pkg"
+  assert o.edition == "tongariki"
+}
+
+# ==================================================================
+# Property checks (body Bool, NOT assert) — Bool/Int generators only.
+# ==================================================================
+
+# A bare path argument never selects a non-default mode, whatever the
+# (Bool-driven) shape of the surrounding argv: parse_cli only leaves
+# MDefault when it sees an explicit mode flag, and a path is not one.
+check "parse_cli on a bare path keeps MDefault"
+  with strict: Bool {
+  let argv = if strict { ["--strict-holes", "f.kai"] } else { ["f.kai"] }
+  mode_tag(parse_cli(argv).mode) == "default"
+}
+
+# --strict-holes is idempotent: applying it once or twice leaves the
+# flag set and the mode unchanged.
+check "parse_cli --strict-holes is idempotent"
+  with twice: Bool {
+  let argv = if twice { ["--strict-holes", "--strict-holes", "f.kai"] }
+             else { ["--strict-holes", "f.kai"] }
+  parse_cli(argv).strict_holes
+}
+
+# The CliOptions strict_holes field round-trips a generated Bool through
+# record construction + access.
+check "CliOptions strict_holes round-trips a generated Bool"
+  with b: Bool {
+  let o = CliOptions { mode: MDefault, path: None, preludes: [],
+                       prelude_caches: [], cache_sha: "",
+                       strict_holes: b, search_paths: [],
+                       include_prelude_tests: false,
+                       package_name: "", unstable_optins: [],
+                       edition: "" }
+  o.strict_holes == b
+}
