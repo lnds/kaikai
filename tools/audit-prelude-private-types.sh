@@ -16,6 +16,14 @@
 #
 # Wired into `stage2/Makefile` as `test-private-type-shadow-audit`,
 # part of the tier-1 chain.
+#
+# Parallelism (lane tier1-perf): candidate discovery (grep over
+# stdlib) is cheap and stays serial; the per-candidate `kai build`
+# invocations are independent (each writes to per-candidate temp
+# files keyed by the type name) so they fan out over `xargs -P$JOBS`.
+# A worker mode (`__probe <tmpdir> <tname> <srcfile>`) builds one
+# candidate and prints `PASS`/`SKIP`/`FAIL ...`; the summary is
+# recomputed from the collected lines. KAI_TEST_JOBS=1 → serial.
 
 set -euo pipefail
 
@@ -28,48 +36,22 @@ if [ ! -x "$KAI" ]; then
   exit 2
 fi
 
-tmp=$(mktemp -d)
-trap "rm -rf $tmp" EXIT INT TERM
+# probe_one: synthesize + compile the sum-type redeclaration for one
+# private type name. Prints exactly one of PASS / SKIP / FAIL ....
+probe_one() {
+  tmp="$1"
+  tname="$2"
+  f="$3"
 
-fail=0
-pass=0
-skip=0
+  # Skip reserved builtin type names — the typer rejects user
+  # redeclarations of these on a different code path
+  # (`reserved_builtin_type_names`) and the test would legitimately
+  # fail.
+  case "$tname" in
+    Cont) echo "SKIP"; return ;;
+  esac
 
-# Iterate every `.kai` file under stdlib/. The regex picks
-# `^type <Name>` lines (private declarations); `^pub type` is
-# intentionally NOT matched (those are caught by
-# `validate_type_name_collisions_decls` already and surface a
-# collision diagnostic at the user's redeclaration).
-while IFS= read -r -d '' f; do
-  while IFS= read -r line; do
-    tname="$(echo "$line" | sed -E 's/^type[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/')"
-    if [ -z "$tname" ] || ! [[ "$tname" =~ ^[A-Z] ]]; then
-      continue
-    fi
-
-    # Skip reserved builtin type names — the typer rejects user
-    # redeclarations of these on a different code path
-    # (`reserved_builtin_type_names`) and the test would
-    # legitimately fail.
-    case "$tname" in
-      Cont) skip=$((skip + 1)); continue ;;
-    esac
-
-    # Issue #647 closed the same-arity sum-type collision gap
-    # by mangling every non-`pub` prelude DType to
-    # `<module>::<name>` (`crypto.hash::SplitN`,
-    # `regexp::NB_FragR`). The skip-list previously needed for
-    # `SplitN` and `NB_FragR` is therefore retired — the audit
-    # now exercises those cases end-to-end. If a future prelude
-    # type ever needs to opt out again, document the reason here
-    # and add an explicit case below; do NOT silently re-add
-    # entries.
-
-    # Synthesize a minimal user program that redeclares `tname`
-    # as a sum type. Two arms, both nullary, so the typer's
-    # variant-arity discriminator gets a clean 0-vs-prelude-arity
-    # case to resolve.
-    cat > "$tmp/test_${tname}.kai" <<EOF
+  cat > "$tmp/test_${tname}.kai" <<EOF
 type ${tname}
   = LocalA${tname}
   | LocalB${tname}
@@ -84,17 +66,61 @@ fn main() : Unit / Stdout = {
 }
 EOF
 
-    if "$KAI" build "$tmp/test_${tname}.kai" -o "$tmp/test_${tname}.bin" \
-        > "$tmp/test_${tname}.log" 2>&1; then
-      pass=$((pass + 1))
-    else
-      echo "FAIL: redeclaring private '${tname}' (from ${f}) is rejected" >&2
-      sed 's/^/  /' "$tmp/test_${tname}.log" >&2
-      fail=$((fail + 1))
+  if "$KAI" build "$tmp/test_${tname}.kai" -o "$tmp/test_${tname}.bin" \
+      > "$tmp/test_${tname}.log" 2>&1; then
+    echo "PASS"
+  else
+    echo "FAIL: redeclaring private '${tname}' (from ${f}) is rejected"
+    sed 's/^/  /' "$tmp/test_${tname}.log"
+  fi
+}
+
+# ---- worker mode -----------------------------------------------------
+if [ "${1:-}" = "__probe" ]; then
+  probe_one "$2" "$3" "$4"
+  exit 0
+fi
+
+# ---- orchestrator ----------------------------------------------------
+tmp=$(mktemp -d)
+trap "rm -rf $tmp" EXIT INT TERM
+
+JOBS="${KAI_TEST_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}"
+self="$ROOT/tools/audit-prelude-private-types.sh"
+
+# Phase 1 (serial): discover candidates. Each candidate is a
+# `<tname>\t<srcfile>` line. Pick `^type <Name>` lines (private decls);
+# `^pub type` is intentionally NOT matched.
+worklist="$tmp/worklist"
+: > "$worklist"
+while IFS= read -r -d '' f; do
+  while IFS= read -r line; do
+    tname="$(echo "$line" | sed -E 's/^type[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/')"
+    if [ -z "$tname" ] || ! [[ "$tname" =~ ^[A-Z] ]]; then
+      continue
     fi
-  done < <(grep -aE '^type [A-Z]' "$f" | grep -v '^pub ')
+    printf '%s\t%s\n' "$tname" "$f" >> "$worklist"
+  done < <(grep -aE '^type [A-Z]' "$f" | grep -v '^pub ' || true)
 done < <(find stdlib -name '*.kai' -print0)
 
-echo "audit-prelude-private-types: pass=$pass fail=$fail skip=$skip"
+results="$tmp/results"
+# Phase 2 (parallel): build each candidate.
+if [ -s "$worklist" ]; then
+  while IFS="$(printf '\t')" read -r tname f; do
+    printf '%s\0%s\0' "$tname" "$f"
+  done < "$worklist" \
+    | xargs -0 -P "$JOBS" -n2 "$self" __probe "$tmp" \
+    > "$results"
+else
+  : > "$results"
+fi
 
+# Surface FAIL diagnostics on stderr (preserves old behaviour).
+grep -E '^FAIL|^  ' "$results" >&2 || true
+
+pass=$(grep -c '^PASS$' "$results" 2>/dev/null || true)
+skip=$(grep -c '^SKIP$' "$results" 2>/dev/null || true)
+fail=$(grep -c '^FAIL' "$results" 2>/dev/null || true)
+
+echo "audit-prelude-private-types: pass=$pass fail=$fail skip=$skip"
 [ "$fail" -eq 0 ]

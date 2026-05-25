@@ -33,6 +33,16 @@
 #   FAIL <fixture>  — language accepts (silent contract; needs follow-up).
 #   MISS <fixture>  — language rejects but with a different diagnostic.
 # The script exits non-zero if any fixture FAILs or MISSes.
+#
+# Parallelism (lane tier1-perf): the per-fixture kaic2 invocations are
+# independent — each writes only to its own temp errfile keyed by the
+# fixture's relative path. The orchestrator therefore fans the goldens
+# out over `xargs -P$JOBS`, re-invoking this script in a worker mode
+# (`__worker <exp>`) that processes exactly one golden and prints its
+# single PASS/FAIL/MISS line. The summary is recomputed from the
+# collected lines, so the exit-code contract is byte-identical to the
+# old serial loop. JOBS defaults to the core count and is overridable
+# via KAI_TEST_JOBS; KAI_TEST_JOBS=1 restores fully serial behaviour.
 
 set -eu
 
@@ -47,45 +57,61 @@ if [ ! -x "$KAIC2" ]; then
   exit 1
 fi
 
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT INT TERM
-
-pass=0
-fail=0
-miss=0
-total=0
-
+# run_one: classify a single fixture and print one PASS/FAIL/MISS line.
+# Self-contained — reads only its arguments + $ROOT/$KAIC1/$KAIC2 and a
+# private $tmp. Safe to run concurrently with other run_one calls
+# because every output path it touches is keyed by the fixture's
+# relative path.
 run_one() {
-  src="$1"
-  exp="$2"
-  compiler="$3"        # kaic2 or kaic1
-  prelude="$4"          # path or empty
-  extra_flags="$5"      # raw flag string or empty
-  multi_line="$6"       # "1" → match every non-empty line; otherwise first line
+  exp="$1"
+  tmp="$2"
 
-  total=$((total + 1))
+  base=$(basename "$exp")
+  dir=$(dirname "$exp")
+
+  # ---- compile-time goldens (.err.expected / .diag.expected) ----
+  case "$base" in
+    *.run.err.expected)
+      run_one_runtime "$exp" "$tmp"
+      return ;;
+  esac
+
+  multi_line=0
+  case "$base" in
+    main.err.expected)
+      stem="main"; src="$dir/main.kai"; compiler="$KAIC2" ;;
+    *.kaic1.err.expected)
+      stem="${base%.kaic1.err.expected}"; src="$dir/$stem.kai"; compiler="$KAIC1" ;;
+    *.diag.expected)
+      stem="${base%.diag.expected}"; src="$dir/$stem.kai"; compiler="$KAIC2"; multi_line=1 ;;
+    *.err.expected)
+      stem="${base%.err.expected}"; src="$dir/$stem.kai"; compiler="$KAIC2" ;;
+    *)
+      return ;;
+  esac
+
+  if [ ! -f "$src" ]; then
+    echo "MISS $exp — source file not found ($src)"
+    return
+  fi
+
+  extra_flags=""
+  if [ -f "$dir/$stem.flags" ]; then
+    extra_flags=$(cat "$dir/$stem.flags")
+  fi
+
   rel="${src#$ROOT/}"
-
   errfile="$tmp/$(echo "$rel" | tr '/' '_').err"
   rc=0
   # shellcheck disable=SC2086 — extra_flags is intentionally word-split.
-  # Hanga Roa: core is loaded automatically by the compiler. The
-  # legacy `--prelude` flag was retired; callers wanting an
-  # additional prelude (which the runner used to support per-fixture)
-  # now have to add an `import` to the fixture source instead.
   "$compiler" $extra_flags "$src" > /dev/null 2> "$errfile" || rc=$?
 
   if [ "$rc" -eq 0 ]; then
     echo "FAIL $rel — exit 0 (silent contract; expected non-zero)"
-    fail=$((fail + 1))
     return
   fi
 
   if [ "$multi_line" = "1" ]; then
-    # Every non-empty, non-comment line in the golden must appear
-    # somewhere in stderr (substring match, fixed-string). Order
-    # is not enforced — kaikai diagnostics can re-order notes
-    # when multiple errors fire.
     missing=""
     while IFS= read -r line; do
       case "$line" in
@@ -97,10 +123,8 @@ run_one() {
     done < "$exp"
     if [ -z "$missing" ]; then
       echo "PASS $rel"
-      pass=$((pass + 1))
     else
       printf 'MISS %s — diagnostic body mismatch%b\n' "$rel" "$missing"
-      miss=$((miss + 1))
     fi
     return
   fi
@@ -108,93 +132,24 @@ run_one() {
   needle=$(head -1 "$exp")
   if [ -z "$needle" ]; then
     echo "MISS $rel — .err.expected first line is empty"
-    miss=$((miss + 1))
     return
   fi
 
   if grep -qF "$needle" "$errfile"; then
     echo "PASS $rel"
-    pass=$((pass + 1))
   else
     echo "MISS $rel — diagnostic mismatch"
     echo "  want: $needle"
     echo "  got : $(head -1 "$errfile")"
-    miss=$((miss + 1))
   fi
 }
 
-# Find all .err.expected / .diag.expected goldens and pair them with
-# their .kai sources.
-# Multi-file: <dir>/main.err.expected pairs with <dir>/main.kai.
-# Single-file: <name>.err.expected pairs with <name>.kai.
-# Stage 1 routing: <name>.kaic1.err.expected pairs with <name>.kai using kaic1.
-# Multi-line shape: <name>.diag.expected — every non-empty,
-# non-`#`-prefixed line in the golden must appear (as a fixed
-# substring) somewhere in stderr. Used to assert diagnostic body
-# quality (anchor, caret, notes, help) per #520 category 7.
+# run_one_runtime: typer-accepts-but-runtime-rejects fixtures. Compile
+# via kaic2 → C → cc, run, expect non-zero exit + golden substring.
+run_one_runtime() {
+  exp="$1"
+  tmp="$2"
 
-# Skip the `silent_contract/` subtree — those fixtures DOCUMENT a
-# gap the language has not yet closed, and live alongside a follow-up
-# issue link in a sibling `.silent_contract.md` note. Once the gap
-# closes, the fixture moves out of `silent_contract/` and the
-# `.err.expected` golden lands in this run.
-find "$ROOT/examples/negative" \( -name '*.err.expected' -o -name '*.diag.expected' \) -not -name '*.run.err.expected' -not -path '*/silent_contract/*' 2>/dev/null | sort | while read -r exp; do
-  base=$(basename "$exp")
-  dir=$(dirname "$exp")
-  multi_line=0
-
-  case "$base" in
-    main.err.expected)
-      src="$dir/main.kai"
-      stem="main"
-      compiler="$KAIC2"
-      ;;
-    *.kaic1.err.expected)
-      stem="${base%.kaic1.err.expected}"
-      src="$dir/$stem.kai"
-      compiler="$KAIC1"
-      ;;
-    *.diag.expected)
-      stem="${base%.diag.expected}"
-      src="$dir/$stem.kai"
-      compiler="$KAIC2"
-      multi_line=1
-      ;;
-    *.err.expected)
-      stem="${base%.err.expected}"
-      src="$dir/$stem.kai"
-      compiler="$KAIC2"
-      ;;
-  esac
-
-  if [ ! -f "$src" ]; then
-    echo "MISS $exp — source file not found ($src)"
-    continue
-  fi
-
-  # Optional sibling overrides.
-  prelude=""
-  if [ -f "$dir/$stem.prelude.kai" ]; then
-    prelude="$dir/$stem.prelude.kai"
-  fi
-
-  extra_flags=""
-  if [ -f "$dir/$stem.flags" ]; then
-    extra_flags=$(cat "$dir/$stem.flags")
-  fi
-
-  run_one "$src" "$exp" "$compiler" "$prelude" "$extra_flags" "$multi_line"
-done > "$tmp/results"
-cat "$tmp/results"
-
-# Runtime-time negative tests: fixtures that the typer accepts by
-# design (e.g. resume-twice is a runtime panic, not a static error
-# per docs/effects-impl.md). Pair each `<name>.kai` with
-# `<name>.run.err.expected` — we compile via kaic2 → C → cc, run
-# the resulting binary, expect non-zero exit, and grep stderr for
-# the golden substring.
-
-find "$ROOT/examples/negative" -name '*.run.err.expected' -not -path '*/silent_contract/*' 2>/dev/null | sort | while read -r exp; do
   base=$(basename "$exp")
   dir=$(dirname "$exp")
   stem="${base%.run.err.expected}"
@@ -202,29 +157,30 @@ find "$ROOT/examples/negative" -name '*.run.err.expected' -not -path '*/silent_c
 
   if [ ! -f "$src" ]; then
     echo "MISS $exp — source file not found ($src)"
-    continue
+    return
   fi
 
   rel="${src#$ROOT/}"
-  cfile="$tmp/$(echo "$rel" | tr '/' '_').c"
-  bin="$tmp/$(echo "$rel" | tr '/' '_').bin"
-  errfile="$tmp/$(echo "$rel" | tr '/' '_').runerr"
+  key="$(echo "$rel" | tr '/' '_')"
+  cfile="$tmp/$key.c"
+  bin="$tmp/$key.bin"
+  errfile="$tmp/$key.runerr"
 
   if ! "$KAIC2" "$src" > "$cfile" 2> "$errfile.compile"; then
     echo "FAIL $rel — kaic2 rejected at compile (this is a runtime-negative fixture)"
-    continue
+    return
   fi
   if ! cc -std=c99 -Wall -Wno-incompatible-function-pointer-types -I "$ROOT/stage0" "$cfile" -o "$bin" -lm 2> "$errfile.cc"; then
     echo "FAIL $rel — cc rejected the generated C (likely silent type-level contract)"
-    cat "$errfile.cc" | head -3
-    continue
+    head -3 "$errfile.cc"
+    return
   fi
 
   rc=0
   "$bin" > /dev/null 2> "$errfile" || rc=$?
   if [ "$rc" -eq 0 ]; then
     echo "FAIL $rel — binary exit 0 (expected runtime panic)"
-    continue
+    return
   fi
 
   needle=$(head -1 "$exp")
@@ -235,17 +191,44 @@ find "$ROOT/examples/negative" -name '*.run.err.expected' -not -path '*/silent_c
     echo "  want: $needle"
     echo "  got : $(head -1 "$errfile")"
   fi
-done >> "$tmp/results.runtime"
+}
 
-if [ -f "$tmp/results.runtime" ]; then
-  cat "$tmp/results.runtime"
-  cat "$tmp/results.runtime" >> "$tmp/results"
+# ---- worker mode -----------------------------------------------------
+# `$0 __worker <tmpdir> <exp>` processes exactly one golden. Invoked by
+# xargs from the orchestrator below; never called by a human.
+if [ "${1:-}" = "__worker" ]; then
+  run_one "$3" "$2"
+  exit 0
 fi
 
-# subshell breaks our counters; recompute from results file.
-pass=$(grep -c '^PASS ' "$tmp/results" 2>/dev/null || true)
-fail=$(grep -c '^FAIL ' "$tmp/results" 2>/dev/null || true)
-miss=$(grep -c '^MISS ' "$tmp/results" 2>/dev/null || true)
+# ---- orchestrator ----------------------------------------------------
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
+# Job count: core-count by default, KAI_TEST_JOBS overrides (=1 → serial).
+JOBS="${KAI_TEST_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}"
+
+self="$ROOT/tools/test-negative.sh"
+results="$tmp/results"
+
+# Skip the `silent_contract/` subtree — those fixtures DOCUMENT a gap
+# the language has not yet closed. Find every compile-time + runtime
+# golden, fan out over xargs -P. Each worker prints its own lines; the
+# null-delimited find + xargs -0 keeps paths with spaces intact.
+find "$ROOT/examples/negative" \
+  \( -name '*.err.expected' -o -name '*.diag.expected' -o -name '*.run.err.expected' \) \
+  -not -path '*/silent_contract/*' -print0 2>/dev/null \
+  | sort -z \
+  | xargs -0 -P "$JOBS" -n1 "$self" __worker "$tmp" \
+  > "$results"
+
+cat "$results"
+
+# Counters recomputed from the results file — identical contract to the
+# old serial loop (subshell/parallel counter loss is a non-issue).
+pass=$(grep -c '^PASS ' "$results" 2>/dev/null || true)
+fail=$(grep -c '^FAIL ' "$results" 2>/dev/null || true)
+miss=$(grep -c '^MISS ' "$results" 2>/dev/null || true)
 total=$((pass + fail + miss))
 
 echo
