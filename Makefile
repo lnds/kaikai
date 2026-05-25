@@ -411,32 +411,7 @@ test-negative: kaic2
 # non-zero. Belongs in tier1 so stdlib drift cannot land via PR
 # without surfacing.
 test-stdlib-modules: kaic2
-	@set +e; \
-	pass=0; fail=0; total=0; \
-	tmpdir=$$(mktemp -d); \
-	for f in $$(find stdlib -name '*.kai' | sort); do \
-	  total=$$((total + 1)); \
-	  rel=$${f#stdlib/}; \
-	  mod=$${rel%.kai}; \
-	  mod_dotted=$$(echo "$$mod" | tr '/' '.'); \
-	  probe="$$tmpdir/probe.kai"; \
-	  printf 'import %s\n\nfn main() : Int = 0\n' "$$mod_dotted" > "$$probe"; \
-	  err=$$(mktemp); \
-	  ./stage2/kaic2 --path stdlib "$$probe" > /dev/null 2> "$$err"; \
-	  rc=$$?; \
-	  if [ $$rc -eq 0 ]; then \
-	    pass=$$((pass + 1)); \
-	  else \
-	    fail=$$((fail + 1)); \
-	    echo "stdlib-module FAIL $$f"; \
-	    head -4 "$$err" | sed 's/^/  /'; \
-	  fi; \
-	  rm -f "$$err"; \
-	done; \
-	rm -rf "$$tmpdir"; \
-	echo ""; \
-	echo "test-stdlib-modules: $$pass / $$total passed, $$fail failed"; \
-	[ "$$fail" -eq 0 ] || exit 1
+	@./tools/test-stdlib-modules.sh
 
 # Package-mode harness (issue #569). The compiler's self-host
 # never exercises kaikai-as-a-package — stdlib lives flat under
