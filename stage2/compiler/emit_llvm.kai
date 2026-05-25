@@ -31,104 +31,9 @@ import compiler.refinements
 import compiler.infer
 import compiler.fnreg
 import compiler.unbox
+import compiler.emit_shared
 
 # ---- mirrored helper types (Lvm*-renamed; main keeps originals) ----
-
-type LvmEVar = LvmEV(String, Int, [TypeExpr], Int)
-
-type LvmCUVResult = LvmCUV([LvmEVar])
-
-type LvmCUVStep = LvmCUVStep(Int, [LvmEVar])
-
-# Acc accumulates with head-cons; we still pre-pend each LvmEV but feed
-# it the correct tag value `next_tag + i` for its index in `vs`,
-# skipping names that already resolve in acc (builtins re-emitted as
-# synthetic DTypes by the prelude-inject pass).
-
-type LvmLamInfo = LvmLamInfo(Int, Int, Int, [Param], [String], Expr)
-
-# m7a #6c: each handler op clause becomes a top-level C function.
-# The id pair (handle_line, handle_col) plus op_name uniquely names
-# the clause (HCs do not nest within the same handle, and two
-# handles cannot share both line and column). `params` is the
-# clause's surface param list — the last one is the conventional
-# `resume` binding (Doc A §*resume: one-shot, explicit*); m7a #6c
-# treats `resume(v)` as direct-style identity and does not need to
-# distinguish args from resume in the C signature beyond skipping
-# the trailing slot.
-# m7b #11: a clause is `stateful` (the trailing Bool) when its
-# enclosing `handle` carries a state initializer (`with State[T](init)`
-# / `with Writer[W]([])`). The codegen layer prepends a `kai_state` /
-# `kai_log` alias of `self->state` to the clause body and emits the
-# 2-arg `resume(v, ns)` form as a state write before resume.
-# m4c #4 (2026-04-29): trailing `String` is the **enclosing fn name** —
-# the post-monomorph C symbol for the fn / lambda / test that contains
-# this `EHandle`. Pre-m4c #4 clause symbols were keyed on (line, col,
-# op) only and collided across monomorphisation copies; the enc_fn
-# prefix lets two specialisations of one polymorphic body produce
-# distinct C symbols (`_kai_<enc>__clause_<l>_<c>_<op>`). The collect
-# pass populates this from `LvmLamCollect.cur_enc_fn`; emit and install
-# paths read it back so both ends mint the same name.
-# R9 (issue #60, 2026-05-02): trailing `[String]` is the per-clause
-# closure-capture set — surface names that are free in the clause body
-# given (clause params + `state` + `log`) as the local scope. The list
-# travels through the EvE's `env` slot per `docs/effects-impl.md`
-# §"Op clause as ordinary function": at install time the handle
-# allocates a per-(line,col) env struct on its frame and populates one
-# field per captured name; the clause prologue rebinds each `kai_<name>`
-# alias from `((env*) self->env)->kai_<name>`. Without this channel,
-# any clause body that names an enclosing-fn parameter triggered the
-# `use of undeclared identifier 'kai_<param>'` C error tracked as R9.
-
-type LvmClauseInfo = LvmCI(Int, Int, String, String, [Param], Expr, Bool, String, [String])
-
-type LvmFvScoped = { own: [String], acc: [String] }
-
-type LvmLamCollect = { next_id: Int, lams: [LvmLamInfo], clauses: [LvmClauseInfo],
-                    globals: [String], cur_enc_fn: String,
-                    # issue #285: enclosing-fn parameter and let/var binding
-                    # names visible at the current walk position. Shadows
-                    # `globals` when computing a nested lambda's caps so a
-                    # captured `Ref[T]` parameter named after a stdlib fn
-                    # (e.g. `count`, colliding with `list.count`) is added
-                    # to the closure's capture array instead of being
-                    # silently re-resolved to the global function value.
-                    local_scope: [String] }
-
-type LvmFfiRetKind
-  = LvmFfiRetUnit
-  | LvmFfiRetInt
-  | LvmFfiRetReal
-  | LvmFfiRetBool
-  | LvmFfiRetString
-  | LvmFfiRetUnknown(String)
-
-type LvmPimplRow = LvmPR(String, String, String, Int)
-#                  lvm_c_sym    proto   type_name arity
-
-type LvmPR2 = LvmPR2(String, String)
-
-# Strip a `__a_…` suffix off a `__pimpl_*` symbol's payload string.
-
-type LvmAliasMap = LvmAM([AliasBinding], Bool)   # bindings, may_tag
-
-type LvmStmtsRewrite = { stmts: [Stmt], m: LvmAliasMap }
-
-type LvmProtoDispatchParts = LvmPDP(String, String)
-
-# Build the dispatcher body marker: `__kai_proto_dispatch__:<P>:<op>`.
-
-# Issue #452 Phase A.0 step 3: `prelude_caches` is parallel to
-# `preludes`. Each slot is either "" (no cache, force re-parse from
-# source) or a path to a .kab file produced by --emit-prelude-cache.
-# `--prelude <src>` appends "" to keep the arrays aligned;
-# `--prelude-cache <src> <cache>` appends <cache>. Length is always
-# equal to length of `preludes`.
-# `cache_sha` carries the optional sha256 hex (64 chars) used when
-# emitting a cache via --emit-prelude-cache; empty string means write
-# the all-zero placeholder.
-
-# ---- mirrored emit_c / driver / typer-adjacent helpers (lvm_*) ----
 
 fn lvm_unit_expr_display(u: UnitExprT) : String {
   match u {
@@ -172,7 +77,7 @@ fn lvm_row_effects_without_default_handler(main_row: [String],
   match main_row {
     [] -> []
     [x, ...rest] ->
-      if lvm_effect_default_block_all_extern(x, decls) {
+      if effect_default_block_all_extern(x, decls) {
         [x, ...lvm_row_effects_without_default_handler(rest, decls)]
       } else {
         lvm_row_effects_without_default_handler(rest, decls)
@@ -185,2219 +90,14 @@ fn lvm_row_effects_without_default_handler(main_row: [String],
 # any user-supplied decl with the same name. Mirrors
 # `collect_effect_names` for DType.
 
-fn lvm_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
-
-# ---- tables: user function arities, variant arities ----
-#
-# Stage 0 emit keeps parallel tables of user-defined function names and
-# variant constructors; the ident dispatcher looks into both before
-# falling back to a local. Stage 1 does the same; both tables are
-# lists of sum-variant pairs.
-
-fn lvm_fns_prefer_module(fns: [EFn], mo: Option[String]) : [EFn] = match mo {
-  None    -> fns
-  Some(m) -> list_append(lvm_fns_filter_same_module(fns, m, []),
-                          lvm_fns_filter_other_module(fns, m, []))
-}
-
-fn lvm_fns_filter_same_module(fns: [EFn], m: String, acc: [EFn]) : [EFn] {
-  match fns {
-    [] -> list_reverse(acc)
-    [h, ...rest] -> match h {
-      EFn(_, _, Some(em), _) ->
-        if em == m { lvm_fns_filter_same_module(rest, m, [h, ...acc]) }
-        else       { lvm_fns_filter_same_module(rest, m, acc) }
-      _ -> lvm_fns_filter_same_module(rest, m, acc)
-    }
-  }
-}
-
-fn lvm_fns_filter_other_module(fns: [EFn], m: String, acc: [EFn]) : [EFn] {
-  match fns {
-    [] -> list_reverse(acc)
-    [h, ...rest] -> match h {
-      EFn(_, _, Some(em), _) ->
-        if em == m { lvm_fns_filter_other_module(rest, m, acc) }
-        else       { lvm_fns_filter_other_module(rest, m, [h, ...acc]) }
-      _ -> lvm_fns_filter_other_module(rest, m, [h, ...acc])
-    }
-  }
-}
-
-fn lvm_c_sym(name: String, mo: Option[String]) : String = match mo {
-  None    -> name
-  Some(m) -> string_concat(m, string_concat("__", name))
-}
-
-# m6.2 v2: mint the C-symbol suffix for a callee resolved via the
-# EFn table. Falls back to the bare name when the lookup misses (e.g.
-# the callee is a closure variable held in a local that gets routed
-# through `kai_apply` instead).
-
-fn lvm_c_sym_of_callee(fns: [EFn], callee: String) : String = match efn_resolve(fns, callee) {
-  Some(EFn(_, _, mo, _)) -> lvm_c_sym(callee, mo)
-  None                   -> callee
-}
-
-fn lvm_evar_find(vs: [LvmEVar], target: String) : Option[Int] {
-  match vs {
-    [] -> None
-    [h, ...rest] -> match h {
-      LvmEV(n, ar, _, _) -> if n == target { Some(ar) } else { lvm_evar_find(rest, target) }
-    }
-  }
-}
-
-# Issue #440 Phase 2 — look up the payload TypeExpr list for a
-# constructor name. Returns None when the name is not a known
-# variant ctor (the call site falls back to the legacy boxed path).
-
-fn lvm_evar_find_tag(vs: [LvmEVar], target: String) : Int {
-  match vs {
-    [] -> 0
-    [h, ...rest] -> match h {
-      LvmEV(n, _, _, t) -> if n == target { t } else { lvm_evar_find_tag(rest, target) }
-    }
-  }
-}
-
-# Match-side variant. Returns Some(tag) when target is in the
-# variants table, None otherwise. Consumers (emit_pat_test_variant*,
-# emit_bang) use this to decide between the fast tag-compare path
-# (`variant_tag == N`) and the legacy strcmp fallback. Under the
-# atom-style global convention every well-typed PVariant pattern
-# resolves to a known name; the None branch protects synthetic AST
-# paths where a constructor name slipped through without registration.
-
-fn lvm_evar_find_tag_opt(vs: [LvmEVar], target: String) : Option[Int] {
-  match vs {
-    [] -> None
-    [h, ...rest] -> match h {
-      LvmEV(n, _, _, t) -> if n == target { Some(t) } else { lvm_evar_find_tag_opt(rest, target) }
-    }
-  }
-}
-
-fn lvm_builtin_variants() : [LvmEVar] =
-  # Phase 2 #440: builtins use empty type lists so the emitter falls
-  # back to the legacy boxed constructor path. Some/Ok/Err wrap an
-  # arbitrary boxed value; unboxing them would require a per-call-site
-  # type read which is not in scope for this lane.
-  #
-  # Tag assignment per docs/variant-tags.md. Builtins 0..10 are
-  # reserved; user code that matches against Sig*/Exited/Signaled
-  # (e.g. `match s { SigInt -> ... }`) needs these in the table so
-  # `lvm_evar_find_tag` resolves to the reserved value and not to a
-  # user-range tag. The runtime constructs these via stage0/runtime.h
-  # using the same convention, so producer and matcher agree.
-  [LvmEV("Some", 1, [], 0), LvmEV("None", 0, [], 1),
-   LvmEV("Ok", 1, [], 2), LvmEV("Err", 1, [], 3),
-   LvmEV("SigInt", 0, [], 4), LvmEV("SigTerm", 0, [], 5), LvmEV("SigHup", 0, [], 6),
-   LvmEV("SigUsr1", 0, [], 7), LvmEV("SigUsr2", 0, [], 8),
-   # Exited/Signaled carry an unboxed Int slot — the runtime constructs
-   # them via kai_variant_u with KAI_VAR_SLOT_INT, so the matcher must
-   # read slots[0].i64 not slots[0].ptr. Registering the payload type
-   # here drives emit_pat_test_variant through the typed (Phase 2 #440)
-   # slot-read path.
-   LvmEV("Exited", 1, [lvm_ty_name_zero("Int")], 9),
-   LvmEV("Signaled", 1, [lvm_ty_name_zero("Int")], 10)]
-
-# First tag assigned to a user-declared variant. Mirrors
-# KAI_USER_VARIANT_TAG_BASE in stage0/emit.c and
-# lvm_user_variant_tag_base() in stage1/compiler.kai.
-
-fn lvm_user_variant_tag_base() : Int = 11
-
-# Walk the declarations and accumulate the variants table; returns
-# the new table plus the consumed counter so subsequent decls keep
-# the assignment monotonic. Sum-typed DTypes whose constructors are
-# already in `acc` are skipped (typical case: the Sig/ProcessExit
-# DTypes the prelude-inject pass synthesises so the typer sees them
-# — they overlap with the reserved builtins).
-
-fn lvm_collect_user_variants_loop(ds: [Decl], next_tag: Int, acc: [LvmEVar]) : [LvmEVar] = match lvm_collect_user_variants_count(ds, next_tag, acc) {
-  LvmCUV(t) -> t
-}
-
-fn lvm_collect_user_variants_count(ds: [Decl], next_tag: Int, acc: [LvmEVar]) : LvmCUVResult {
-  match ds {
-    [] -> LvmCUV(acc)
-    [d, ...rest] -> match d {
-      DType(_, _, _, body, _, _, _) -> match body {
-        TBSum(vs) -> match lvm_vs_to_evars_count(vs, next_tag, acc) {
-          LvmCUVStep(nt, acc1) -> lvm_collect_user_variants_count(rest, nt, acc1)
-        }
-        _ -> lvm_collect_user_variants_count(rest, next_tag, acc)
-      }
-      _ -> lvm_collect_user_variants_count(rest, next_tag, acc)
-    }
-  }
-}
-
-fn lvm_vs_to_evars_count(vs: [Variant], next_tag: Int, acc: [LvmEVar]) : LvmCUVStep {
-  match vs {
-    [] -> LvmCUVStep(next_tag, acc)
-    [v, ...rest] -> match v {
-      Var(n, tys) -> match lvm_evar_find_tag_opt(acc, n) {
-        Some(_) -> lvm_vs_to_evars_count(rest, next_tag, acc)
-        None    -> lvm_vs_to_evars_count(rest, next_tag + 1, [LvmEV(n, list_length(tys), tys, next_tag), ...acc])
-      }
-    }
-  }
-}
-
-# Legacy entry kept for callers that still construct an [LvmEVar]
-# from `[Variant]` with no acc threading; emits the same shape but
-# does not preserve builtin tags. Internal callers go through
-# lvm_vs_to_evars_count to keep the convention.
-
-fn lvm_register_variants(decls: [Decl]) : [LvmEVar] =
-  lvm_collect_user_variants_loop(decls, lvm_user_variant_tag_base(), lvm_builtin_variants())
-
-# ---- prelude mapping for emission ----
-#
-# For user-facing builtins, we map to their runtime C symbol and arity.
-# Stage 1 mirrors stage 0's table 1:1.
-
-fn lvm_arms_all_literal_or_wild(arms: [Arm]) : Bool {
-  match arms {
-    [] -> false   # need at least one arm to dispatch on
-    _  -> lvm_arms_all_literal_or_wild_loop(arms)
-  }
-}
-
-fn lvm_arms_all_literal_or_wild_loop(arms: [Arm]) : Bool {
-  match arms {
-    [] -> true
-    [Arm(p, g, _), ...rest] -> match g {
-      Some(_) -> false
-      None    -> if lvm_pat_is_unboxable_lit_or_wild(p) {
-        lvm_arms_all_literal_or_wild_loop(rest)
-      } else { false }
-    }
-  }
-}
-
-# Issue #91 — fast-path eligibility check for `PBind(name)`
-# catch-all arms. When the body of a PBind catch-all reads
-# `name` from inside a `#{...}` interp slot OR from inside a
-# captured ELambda body, the read site bypasses the unbox
-# pass's alias map and resolves to `kai_<name>` — but the
-# fast path only binds `kair_<name>`. Disqualify the whole
-# match in that case so it routes through the boxed path
-# (which always binds `kai_<name>`). Mirrors the R8 / lambda-
-# capture guards in `unbox_stmt` SLet.
-
-fn lvm_arms_pbind_safe_for_fast_path(arms: [Arm]) : Bool / Console {
-
-  match arms {
-    [] -> true
-    [Arm(p, _, b), ...rest] -> {
-      let ok = match p.pkind {
-        PBind(nm) ->
-          not expr_has_interp_use(b, nm) and
-          not uses_have_in_lam(scan_uses_expr(b, false), nm)
-        _ -> true
-      }
-      if ok { lvm_arms_pbind_safe_for_fast_path(rest) } else { false }
-    }
-  }
-}
-
-fn lvm_pat_is_unboxable_lit_or_wild(p: Pattern) : Bool {
-  match p.pkind {
-    PWild     -> true
-    # Issue #91 — PBind catch-all is now in the fast path. The
-    # unbox pass marks the body's LvmEVar reads of the bound name as
-    # MUnboxed (see `unbox_arm_with_scr`); the C / LLVM emit
-    # binds `kair_<name>` in the default block before the body.
-    PBind(_)  -> true
-    PLit(lit) -> match lit.kind {
-      EInt(_)  -> true
-      EBool(_) -> true
-      EChar(_) -> true
-      _ -> false
-    }
-    _ -> false
-  }
-}
-
-# Emit the raw C scalar that goes inside `switch (...)` for a
-# literal pattern. `EInt` → `<n>LL`, `EBool` → `0`/`1`,
-# `EChar` → numeric codepoint.
-
-fn lvm_find_lam(lams: [LvmLamInfo], line: Int, col: Int) : Option[LvmLamInfo] {
-  match lams {
-    [] -> None
-    [l, ...rest] -> match l {
-      LvmLamInfo(_, ln, cl, _, _, _) ->
-        if ln == line and cl == col { Some(l) }
-        else { lvm_find_lam(rest, line, col) }
-    }
-  }
-}
-
-# Free variables of an expression, given the lambda's own params and the
-# program's globals. We skip descent into nested ELambdas (each gets its
-# own capture set), and re-parse string interpolations so identifiers
-# hidden inside #{...} get captured too.
-
-fn lvm_fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] / Console {
-
-  match x.kind {
-    EInt(_)  -> acc
-    EReal(_) -> acc
-    EBool(_) -> acc
-    EChar(_) -> acc
-    EStr(span, is_triple) -> lvm_fv_interp(span, is_triple, own, globals, acc)
-    EUnit -> acc
-    EVar(name) -> {
-      # m7b #15 closure-capture: a tagged op call like
-      # `Eff.op@<alias>` rewrites to `EVar("Eff.op@alias")`. The
-      # name is *not* a real identifier — emit_call_expr splits the
-      # `@` and dispatches via `kai_alias_<alias>_id`. For closure
-      # capture purposes we record the alias under the sentinel
-      # name `__alias_id__<alias>`; the lambda emit decodes it back
-      # to `KaiHandlerId kai_alias_<alias>_id` in the body prologue.
-      let at_pos = string_index_of_at(name)
-      if at_pos >= 0 {
-        let alias = string_slice(name, at_pos + 1, string_length(name))
-        let cap_name = string_concat("__alias_id__", alias)
-        if list_has(own, alias) { acc }
-        else if list_has(acc, cap_name) { acc }
-        else { [cap_name, ...acc] }
-      }
-      # Issue #669: `__pcs_scr` / `__pcs_ret` / `__pcs_arm_ret` are
-      # synthetic identifiers inserted by Perceus passes that
-      # materialise as match-scoped C locals (`_scr`, etc.) at emit
-      # time, not as kaikai-level bindings. When a Perceus pass leaves
-      # one of these inside a lambda body, lvm_fv_expr would treat it as
-      # a free variable and ask the lambda to capture it — but no
-      # outer binding exists to capture, producing C output that
-      # references an undeclared identifier. They are never genuine
-      # free vars; suppress them here.
-      else if name == "__pcs_scr"     { acc }
-      else if name == "__pcs_ret"     { acc }
-      else if name == "__pcs_arm_ret" { acc }
-      else if list_has(own, name) { acc }
-      else if list_has(globals, name) { acc }
-      else if list_has(acc, name) { acc }
-      else { [name, ...acc] }
-    }
-    EUnder -> acc
-    EPlaceholder -> acc
-    ECall(f, xs) -> lvm_fv_exprs(xs, own, globals, lvm_fv_expr(f, own, globals, acc))
-    EField(base, _) -> lvm_fv_expr(base, own, globals, acc)
-    EIndex(a, b) -> lvm_fv_expr(b, own, globals, lvm_fv_expr(a, own, globals, acc))
-    EBinop(_, a, b) -> lvm_fv_expr(b, own, globals, lvm_fv_expr(a, own, globals, acc))
-    EUnop(_, inner) -> lvm_fv_expr(inner, own, globals, acc)
-    EIf(c, a, opt_b) -> {
-      let acc1 = lvm_fv_expr(a, own, globals, lvm_fv_expr(c, own, globals, acc))
-      match opt_b { Some(b) -> lvm_fv_expr(b, own, globals, acc1) None -> acc1 }
-    }
-    EMatch(scr, arms) -> lvm_fv_arms(arms, own, globals, lvm_fv_expr(scr, own, globals, acc))
-    ELambda(ps, body) -> {
-      # m7b #15 closure-capture: a nested lambda computes its own
-      # capture list independently, but every free var that
-      # nested body references AND that is not bound by the
-      # nested params still has to be visible at the *outer*
-      # lambda's body — that body is where the nested
-      # `kai_closure(...)` literal evaluates its capture array.
-      # Pre-fix, an outer lambda whose body contained
-      # `while(() => @i < dim, () => ...)` failed to pick up
-      # `kai_dim` / `kai_alias_i_id` as outer captures, so the
-      # generated C referenced undeclared identifiers when
-      # building the inner closure.
-      let nested_own = list_append(own, lvm_params_to_names(ps))
-      lvm_fv_expr(body, nested_own, globals, acc)
-    }
-    ETodo(_) -> acc
-    EBang(inner) -> lvm_fv_expr(inner, own, globals, acc)
-    ERecordLit(_, fields) -> lvm_fv_field_inits(fields, own, globals, acc)
-    EList(elems) -> lvm_fv_list_elems(elems, own, globals, acc)
-    ERange(a, b, opt_step) -> {
-      let acc1 = lvm_fv_expr(b, own, globals, lvm_fv_expr(a, own, globals, acc))
-      match opt_step { Some(s) -> lvm_fv_expr(s, own, globals, acc1) None -> acc1 }
-    }
-    EBlock(stmts, opt_final) -> {
-      # m7b #18: track the scope as it grows through SLet / SVar so
-      # the optional trailing expression sees the same bindings the
-      # earlier statements introduced.
-      let r = lvm_fv_stmts_scoped(stmts, own, globals, acc)
-      match opt_final { Some(f) -> lvm_fv_expr(f, r.own, globals, r.acc) None -> r.acc }
-    }
-    EPipe(a, b) -> lvm_fv_expr(b, own, globals, lvm_fv_expr(a, own, globals, acc))
-    EMapPipe(a, b) -> lvm_fv_expr(b, own, globals, lvm_fv_expr(a, own, globals, acc))
-    EFlatMapPipe(a, b) -> lvm_fv_expr(b, own, globals, lvm_fv_expr(a, own, globals, acc))
-    EFilterPipe(a, b) -> lvm_fv_expr(b, own, globals, lvm_fv_expr(a, own, globals, acc))
-    EHole(_) -> acc
-    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
-      # m7b #11: free vars in the handler-state init expression
-      # contribute to the surrounding scope.
-      let acc0 = match init_opt {
-        Some(ie) -> lvm_fv_expr(ie, own, globals, acc)
-        None     -> acc
-      }
-      # m12.8.x phase 4 followup: when `with Eff(init) as name { body }`
-      # binds an alias, treat that name as in-scope for the body —
-      # references to it dispatch via the runtime evidence stack at
-      # call time, not via a captured C local. Pre-fix the m7b #5b
-      # desugar (`var top = 0` → `with State[Int](0) as top { ... }`)
-      # caused inner lambdas to capture `top` as if it were a value;
-      # the C emit then read `kai_top` against an undeclared
-      # identifier. The alias is only in scope inside the body — not
-      # in `init` (runs before the handler is installed) and not in
-      # the clauses (which see `state` / `log` magic instead).
-      let own_body = match alias_opt {
-        Some(a) -> [a, ...own]
-        None    -> own
-      }
-      let acc1 = lvm_fv_expr(body, own_body, globals, acc0)
-      let acc2 = lvm_fv_hclauses(clauses, own, globals, acc1)
-      match ret_opt { Some(r) -> lvm_fv_hreturn(r, own, globals, acc2) None -> acc2 }
-    }
-    # m12.5: literal-with-unit captures whatever the inner literal does
-    # (always nothing in practice, since the inner is EInt/EReal).
-    ELitUnit(inner, _) -> lvm_fv_expr(inner, own, globals, acc)
-    # m7e §11: `variants[T]()` has no value-level sub-expressions, so
-    # it captures nothing.
-    EVariantsOf(_, _) -> acc
-    # m6.2 Phase 2.1: qualified module call references no local
-    # binding — module name and function name are both pure strings
-    # resolved via the module table.
-    EModCall(_, _) -> acc
-    EIntrinsic(_, args_) -> lvm_fv_exprs(args_, own, globals, acc)
-  }
-}
-
-fn lvm_fv_hclauses(cs: [HClause], own: [String], globals: [String], acc: [String]) : [String] / Console {
-
-  match cs {
-    [] -> acc
-    [c, ...rest] -> match c {
-      HC(_, params, body, _, _) -> {
-        # m7b #18: stateful handler clauses see two magic bindings —
-        # `state` and `log` — that the codegen aliases to the
-        # evidence struct's slot. Always include them in `own` so the
-        # free-var collector does not promote them to lambda captures
-        # when the whole `with State[T]` sits inside a closure body
-        # (e.g. desugared `var` inside a lambda).
-        let own_magic = ["state", "log", ...own]
-        let own1 = lvm_list_concat_strings(map(params, (pm) => pm.pname), own_magic)
-        let acc1 = lvm_fv_expr(body, own1, globals, acc)
-        lvm_fv_hclauses(rest, own, globals, acc1)
-      }
-    }
-  }
-}
-
-fn lvm_fv_hreturn(r: HReturn, own: [String], globals: [String], acc: [String]) : [String] / Console {
-
-  match r {
-    # m7b #18: same `state` / `log` magic bindings as in
-    # `lvm_fv_hclauses` apply here (Doc C §m7b #11l: stateful return
-    # clauses see the handler-state alias too).
-    HR(name, body, _, _) -> lvm_fv_expr(body, [name, "state", "log", ...own], globals, acc)
-  }
-}
-
-fn lvm_list_concat_strings(a: [String], b: [String]) : [String] {
-  match a {
-    [] -> b
-    [h, ...rest] -> [h, ...lvm_list_concat_strings(rest, b)]
-  }
-}
-
-fn lvm_fv_exprs(xs: [Expr], own: [String], globals: [String], acc: [String]) : [String] / Console {
-
-  match xs {
-    [] -> acc
-    [h, ...rest] -> lvm_fv_exprs(rest, own, globals, lvm_fv_expr(h, own, globals, acc))
-  }
-}
-
-fn lvm_fv_arms(arms: [Arm], own: [String], globals: [String], acc: [String]) : [String] / Console {
-
-  match arms {
-    [] -> acc
-    [a, ...rest] -> match a {
-      Arm(pat, opt_g, body) -> {
-        # m7b #18: extend `own` with the pattern's bound names so the
-        # guard and body don't treat them as free vars when the arm
-        # sits inside a lambda body.
-        let own1 = lvm_pat_bindings(pat, own)
-        let acc1 = match opt_g { Some(g) -> lvm_fv_expr(g, own1, globals, acc) None -> acc }
-        lvm_fv_arms(rest, own, globals, lvm_fv_expr(body, own1, globals, acc1))
-      }
-    }
-  }
-}
-
-# m7b #18: collect every name a pattern would bind into the accumulator,
-# mirroring `bind_pat` (resolver) but operating on a [String] instead of
-# an Env. Used by `lvm_fv_arms` and `fv_stmts` to keep `let` / pattern-bound
-# names out of a lambda's free-var capture set.
-
-fn lvm_pat_bindings(pat: Pattern, acc: [String]) : [String] {
-  match pat.pkind {
-    PWild -> acc
-    PLit(_) -> acc
-    PBind(name) -> [name, ...acc]
-    PList(pats, opt_rest) -> {
-      let acc1 = lvm_pat_bindings_loop(pats, acc)
-      match opt_rest {
-        Some(rname) -> [rname, ...acc1]
-        None -> acc1
-      }
-    }
-    PVariant(_, subs) -> lvm_pat_bindings_loop(subs, acc)
-    PVariantRecord(_, fields) -> lvm_pfield_bindings_loop(fields, acc)
-    PRecord(fields) -> lvm_pfield_bindings_loop(fields, acc)
-    PHole(_) -> acc
-    PAs(name, sub) -> lvm_pat_bindings(sub, [name, ...acc])
-    PNarrow(name, _) -> [name, ...acc]
-  }
-}
-
-# Like `lvm_pat_bindings`, but if the pattern is a single `PBind` and
-# the let's RHS is `MUnboxed`, the binding is a raw C scalar and
-# must NOT enter the Perceus tracking scope. All other shapes —
-# destructured lets, wildcards, literals — defer to the standard
-# `lvm_pat_bindings` walker. See `docs/unboxing-phase2-design.md` §3
-# (boundary tactic) for the coordination contract.
-
-fn lvm_pat_bindings_loop(ps: [Pattern], acc: [String]) : [String] {
-  match ps {
-    [] -> acc
-    [p, ...rest] -> lvm_pat_bindings_loop(rest, lvm_pat_bindings(p, acc))
-  }
-}
-
-fn lvm_pfield_bindings_loop(fs: [PField], acc: [String]) : [String] {
-  match fs {
-    [] -> acc
-    [f, ...rest] -> match f {
-      PField(_, sub, _) -> lvm_pfield_bindings_loop(rest, lvm_pat_bindings(sub, acc))
-    }
-  }
-}
-
-fn lvm_fv_field_inits(fs: [FieldInit], own: [String], globals: [String], acc: [String]) : [String] / Console {
-
-  match fs {
-    [] -> acc
-    [f, ...rest] -> match f {
-      FI(_, val) -> lvm_fv_field_inits(rest, own, globals, lvm_fv_expr(val, own, globals, acc))
-    }
-  }
-}
-
-fn lvm_fv_list_elems(es: [ListElem], own: [String], globals: [String], acc: [String]) : [String] / Console {
-
-  match es {
-    [] -> acc
-    [el, ...rest] -> match el {
-      ElPlain(x) -> lvm_fv_list_elems(rest, own, globals, lvm_fv_expr(x, own, globals, acc))
-      ElSpread(x) -> lvm_fv_list_elems(rest, own, globals, lvm_fv_expr(x, own, globals, acc))
-    }
-  }
-}
-
-fn lvm_fv_stmts_scoped(ss: [Stmt], own: [String], globals: [String], acc: [String]) : LvmFvScoped / Console {
-
-  match ss {
-    [] -> LvmFvScoped { own: own, acc: acc }
-    [s, ...rest] -> match s {
-      SLet(pat, _, rhs) -> {
-        let acc1 = lvm_fv_expr(rhs, own, globals, acc)
-        let own1 = lvm_pat_bindings(pat, own)
-        lvm_fv_stmts_scoped(rest, own1, globals, acc1)
-      }
-      SVar(name, _, rhs, _, _) -> {
-        let acc1 = lvm_fv_expr(rhs, own, globals, acc)
-        lvm_fv_stmts_scoped(rest, [name, ...own], globals, acc1)
-      }
-      _ -> lvm_fv_stmts_scoped(rest, own, globals, lvm_fv_stmt(s, own, globals, acc))
-    }
-  }
-}
-
-fn lvm_fv_stmt(s: Stmt, own: [String], globals: [String], acc: [String]) : [String] / Console {
-
-  match s {
-    SLet(_, _, rhs) -> lvm_fv_expr(rhs, own, globals, acc)
-    SAssert(c, opt_m) -> {
-      let acc1 = lvm_fv_expr(c, own, globals, acc)
-      match opt_m { Some(m) -> lvm_fv_expr(m, own, globals, acc1) None -> acc1 }
-    }
-    SExprStmt(x) -> lvm_fv_expr(x, own, globals, acc)
-    SIndexAssign(b, i, v, _, _) -> {
-      let acc1 = lvm_fv_expr(b, own, globals, acc)
-      let acc2 = lvm_fv_expr(i, own, globals, acc1)
-      lvm_fv_expr(v, own, globals, acc2)
-    }
-    # m7b #5: `var name = init` — desugared away pre-resolve. The free
-    # variables of the init expression contribute; the bound name is a
-    # local introduction (handled by the surrounding scope).
-    SVar(_, _, rhs, _, _) -> lvm_fv_expr(rhs, own, globals, acc)
-    # m7e §25: stripped by desugar_use_decls before fv runs.
-    SUse(_, _, _) -> acc
-  }
-}
-
-fn lvm_fv_interp(span: String, is_triple: Bool, own: [String], globals: [String], acc: [String]) : [String] / Console {
-
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
-  lvm_fv_interp_parts(parts, own, globals, acc)
-}
-
-fn lvm_fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [String]) : [String] / Console {
-
-  match parts {
-    [] -> acc
-    [p, ...rest] -> match p {
-      IpLit(_, _) -> lvm_fv_interp_parts(rest, own, globals, acc)
-      IpExp(esrc) -> {
-        let acc1 = match parse_interp_expr(esrc) {
-          Some(e) -> lvm_fv_expr(e, own, globals, acc)
-          None -> acc
-        }
-        lvm_fv_interp_parts(rest, own, globals, acc1)
-      }
-    }
-  }
-}
-
-# ---- lambda collection pass ----
-
-# m4c #4: `cur_enc_fn` carries the post-monomorph C symbol of the
-# fn / lambda / test the walker is currently inside. Updated at scope
-# boundaries (DFn / DTest entry, ELambda recursion); read by the
-# EHandle case to stamp each `LvmClauseInfo` so install/emit paths can
-# mint matching prefixed clause symbols.
-
-fn lvm_lc_new(globals: [String]) : LvmLamCollect =
-  LvmLamCollect { next_id: 0, lams: [], clauses: [], globals: globals,
-                cur_enc_fn: "", local_scope: [] }
-
-# issue #285: state-passing scope helpers. Snapshot at entry of a
-# scope-introducing form (DFn body, EBlock, ELambda body); restore
-# on exit. Kept tiny so the walker stays a one-line state-tweak per
-# scope frame.
-
-fn lvm_lc_set_locals(st: LvmLamCollect, locals: [String]) : LvmLamCollect =
-  LvmLamCollect { next_id: st.next_id, lams: st.lams,
-                clauses: st.clauses, globals: st.globals,
-                cur_enc_fn: st.cur_enc_fn, local_scope: locals }
-
-fn lvm_lc_extend_locals(st: LvmLamCollect, names: [String]) : LvmLamCollect =
-  lvm_lc_set_locals(st, list_append(st.local_scope, names))
-
-# issue #285: filter names out of `globals` so `lvm_fv_expr` records them
-# as captures. O(|globals| × |locals|) is acceptable: |locals| stays
-# tiny (a handful per fn), and lambda lifting runs once per emit.
-
-fn lvm_list_minus(xs: [String], ys: [String]) : [String] = lvm_list_minus_loop(xs, ys, [])
-
-fn lvm_list_minus_loop(xs: [String], ys: [String], acc: [String]) : [String] {
-  match xs {
-    [] -> list_reverse(acc)
-    [h, ...rest] ->
-      if list_has(ys, h) { lvm_list_minus_loop(rest, ys, acc) }
-      else               { lvm_list_minus_loop(rest, ys, [h, ...acc]) }
-  }
-}
-
-fn lvm_params_to_names(ps: [Param]) : [String] =
-  map(ps, (pm) => pm.pname)
-
-fn lvm_collect_expr(x: Expr, st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match x.kind {
-    EInt(_)  -> st
-    EReal(_) -> st
-    EBool(_) -> st
-    EChar(_) -> st
-    EStr(span, is_triple) -> lvm_collect_interp(span, is_triple, st)
-    EUnit -> st
-    EVar(_) -> st
-    EUnder -> st
-    EPlaceholder -> st
-    ECall(f, xs) -> lvm_collect_exprs(xs, lvm_collect_expr(f, st))
-    EField(base, _) -> lvm_collect_expr(base, st)
-    EIndex(a, b) -> lvm_collect_expr(b, lvm_collect_expr(a, st))
-    EBinop(_, a, b) -> lvm_collect_expr(b, lvm_collect_expr(a, st))
-    EUnop(_, inner) -> lvm_collect_expr(inner, st)
-    EIf(c, a, opt_b) -> {
-      let s1 = lvm_collect_expr(a, lvm_collect_expr(c, st))
-      match opt_b { Some(b) -> lvm_collect_expr(b, s1) None -> s1 }
-    }
-    EMatch(scr, arms) -> lvm_collect_arms(arms, lvm_collect_expr(scr, st))
-    ELambda(params, body) -> {
-      let id = st.next_id
-      let own = lvm_params_to_names(params)
-      # issue #285: an enclosing fn parameter or let/var binding whose
-      # name happens to match a stdlib fn (e.g. a `count: Ref[Int]`
-      # parameter while `list.count` is in scope) must be captured by
-      # the lambda, not silently re-resolved to the global. Filter the
-      # globals fed to `lvm_fv_expr` so any name shadowed by the current
-      # `local_scope` is treated as a free variable and added to caps.
-      let effective_globals = lvm_list_minus(st.globals, st.local_scope)
-      let caps = lvm_fv_expr(body, own, effective_globals, [])
-      let info = LvmLamInfo(id, x.line, x.col, params, caps, body)
-      # m4c #4: the lambda body is its own enclosing scope for clause
-      # symbols (lifted to `_kai_lam_<id>` at emit). Push the new
-      # enc_fn for the body walk; restore the outer enc_fn on the way
-      # out so a sibling expression keeps stamping against its own
-      # enclosing fn.
-      let outer_enc_fn = st.cur_enc_fn
-      let outer_locals = st.local_scope
-      let lam_enc_fn = concat_all(["_kai_lam_", int_to_string(id)])
-      # Inside the lambda body, the lambda's own params shadow outer
-      # globals too — extend `local_scope` so a nested lambda nested
-      # again inside this body sees the shadowing chain.
-      let st1 = LvmLamCollect { next_id: id + 1, lams: [info, ...st.lams],
-                              clauses: st.clauses, globals: st.globals,
-                              cur_enc_fn: lam_enc_fn,
-                              local_scope: list_append(outer_locals, own) }
-      let st2 = lvm_collect_expr(body, st1)
-      LvmLamCollect { next_id: st2.next_id, lams: st2.lams,
-                    clauses: st2.clauses, globals: st2.globals,
-                    cur_enc_fn: outer_enc_fn,
-                    local_scope: outer_locals }
-    }
-    ERecordLit(_, fields) -> lvm_collect_field_inits(fields, st)
-    EList(elems) -> lvm_collect_list_elems(elems, st)
-    ERange(a, b, opt_step) -> {
-      let s1 = lvm_collect_expr(b, lvm_collect_expr(a, st))
-      match opt_step { Some(s) -> lvm_collect_expr(s, s1) None -> s1 }
-    }
-    EBlock(stmts, opt_final) -> {
-      # issue #285: SLet / SVar inside the block extend `local_scope`;
-      # restore the outer scope on exit so siblings (and the lambda
-      # lifter's caller) don't see the block's bindings as still in
-      # scope.
-      let outer_locals = st.local_scope
-      let s1 = lvm_collect_stmts(stmts, st)
-      let s2 = match opt_final { Some(f) -> lvm_collect_expr(f, s1) None -> s1 }
-      lvm_lc_set_locals(s2, outer_locals)
-    }
-    EPipe(a, b) -> lvm_collect_expr(b, lvm_collect_expr(a, st))
-    EMapPipe(a, b) -> lvm_collect_expr(b, lvm_collect_expr(a, st))
-    EFlatMapPipe(a, b) -> lvm_collect_expr(b, lvm_collect_expr(a, st))
-    EFilterPipe(a, b) -> lvm_collect_expr(b, lvm_collect_expr(a, st))
-    EHole(_) -> st
-    ETodo(_) -> st
-    EBang(inner) -> lvm_collect_expr(inner, st)
-    EHandle(body, eff_name, _, init_opt, alias_opt, clauses, ret_opt) -> {
-      let stateful = match init_opt { Some(_) -> true None -> false }
-      let s_init = match init_opt { Some(ie) -> lvm_collect_expr(ie, st) None -> st }
-      # m4c #4: stamp each clause with the current enclosing fn name
-      # set by lvm_collect_decl (DFn / DTest) or the surrounding ELambda.
-      # emit-time install code reads back the same string so install
-      # and clause-body symbols agree.
-      let s0 = lvm_lc_record_clauses(clauses, eff_name, stateful, x.line, x.col, s_init.cur_enc_fn, s_init)
-      # m12.8.x phase 4 followup: when `with Eff(init) as name { body }`
-      # binds an alias, mark `name` as an in-scope global for the body
-      # walk so any inner lambda's free-var analysis treats references
-      # to it as alias dispatches (resolved via the runtime evidence
-      # stack), not as values that need capture in the closure
-      # environment. Pre-fix the m7b #5b desugar (`var top = 0` →
-      # `with State[Int](0) as top { ... }`) caused inner lambdas
-      # passed to row-polymorphic helpers like `while` to capture
-      # `top` as if it were a value, and the C emit then read
-      # `kai_top` against an undeclared identifier. Surfaced via
-      # `demos/spiral`. The alias is only in scope inside the body —
-      # not in `init` (runs before the handler is installed) and not
-      # in the clauses (which see `state` / `log` magic instead).
-      let outer_globals = s0.globals
-      let s_body_in = match alias_opt {
-        Some(a) -> LvmLamCollect {
-          next_id: s0.next_id, lams: s0.lams,
-          clauses: s0.clauses, globals: [a, ...outer_globals],
-          cur_enc_fn: s0.cur_enc_fn, local_scope: s0.local_scope
-        }
-        None -> s0
-      }
-      let s1_ext = lvm_collect_expr(body, s_body_in)
-      let s1 = LvmLamCollect {
-        next_id: s1_ext.next_id, lams: s1_ext.lams,
-        clauses: s1_ext.clauses, globals: outer_globals,
-        cur_enc_fn: s1_ext.cur_enc_fn, local_scope: s1_ext.local_scope
-      }
-      let s2 = lvm_collect_hclauses(clauses, s1)
-      match ret_opt { Some(r) -> lvm_collect_hreturn(r, s2) None -> s2 }
-    }
-    # m12.5: literal-with-unit — the inner literal contributes nothing,
-    # but recurse so future non-literal carriers stay covered.
-    ELitUnit(inner, _) -> lvm_collect_expr(inner, st)
-    # m7e §11: `variants[T]()` produces no lambdas / no clauses to
-    # collect. The TypeExpr is not a lambda host.
-    EVariantsOf(_, _) -> st
-    # m6.2 Phase 2.1: qualified module call hosts no lambdas and
-    # introduces no clauses — both fields are plain strings.
-    EModCall(_, _) -> st
-    EIntrinsic(_, args_) -> lvm_collect_exprs(args_, st)
-  }
-}
-
-# m7a #6c: append one LvmClauseInfo per HClause of this handle. The
-# (line, col) of the EHandle node is reused as the clause's stable
-# id; the op_name disambiguates among clauses of the same handle.
-# m4c #4: the trailing `enc_fn` argument is the post-monomorph C
-# symbol of the fn / lambda / test that physically contains this
-# `EHandle`. It feeds LvmCI's 8th field so emit_clause_body and the
-# install path mint matching prefixed symbols
-# (`_kai_<enc>__clause_<l>_<c>_<op>`).
-
-fn lvm_lc_record_clauses(cs: [HClause], eff: String, stateful: Bool,
-                     hline: Int, hcol: Int, enc_fn: String,
-                     st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match cs {
-    [] -> st
-    [c, ...rest] -> match c {
-      HC(op_name, params, body, _, _) -> {
-        # R9: compute the clause's free-variable set, treating its own
-        # params plus the magic `state` / `log` aliases as bound. The
-        # resulting names are the captures the env channel must thread
-        # in from the surrounding handle frame. Mirrors `lvm_fv_hclauses`.
-        let own_for_fv = lvm_list_concat_strings(map(params, (pm) => pm.pname), ["state", "log"])
-        # issue #285: filter globals shadowed by enclosing-fn / outer
-        # let-var bindings, so a clause body capturing e.g. `count`
-        # (parameter shadowing `list.count`) is added to env captures.
-        let effective_globals = lvm_list_minus(st.globals, st.local_scope)
-        let raw_caps = lvm_fv_expr(body, own_for_fv, effective_globals, [])
-        let caps = lvm_filter_clause_captures(raw_caps)
-        let info = LvmCI(hline, hcol, eff, op_name, params, body, stateful, enc_fn, caps)
-        let st1 = LvmLamCollect {
-          next_id: st.next_id, lams: st.lams,
-          clauses: [info, ...st.clauses], globals: st.globals,
-          cur_enc_fn: st.cur_enc_fn, local_scope: st.local_scope
-        }
-        lvm_lc_record_clauses(rest, eff, stateful, hline, hcol, enc_fn, st1)
-      }
-    }
-  }
-}
-
-# R9: drop the `__alias_id__<a>` sentinels produced by `lvm_fv_expr` for
-# tagged op calls (`Eff.op@<a>`). Lambda capture rebinds them via
-# `kai_alias_<a>_id` reads in the lambda prologue; the clause env
-# channel does not yet carry handler-id captures (a follow-up — for
-# now an alias-id needed inside a clause body must be threaded
-# through the parametric handler's `state` slot, the existing
-# workaround). Plain value captures are everything else and travel
-# through `self->env` per `docs/effects-impl.md` §"Op clause as
-# ordinary function".
-
-fn lvm_filter_clause_captures(caps: [String]) : [String] {
-  match caps {
-    [] -> []
-    [c, ...rest] -> {
-      let prefix = "__alias_id__"
-      if string_starts_with_q(c, prefix) {
-        lvm_filter_clause_captures(rest)
-      } else {
-        [c, ...lvm_filter_clause_captures(rest)]
-      }
-    }
-  }
-}
-
-# R9: union the per-clause capture sets of every clause that belongs
-# to a single handle (matched by hline/hcol). The handle allocates
-# one env struct shared across all its clauses, so every clause's
-# capture has to find a slot in the same struct.
-
-fn lvm_collect_hclauses(cs: [HClause], st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match cs {
-    [] -> st
-    [c, ...rest] -> match c {
-      HC(_, _, body, _, _) -> lvm_collect_hclauses(rest, lvm_collect_expr(body, st))
-    }
-  }
-}
-
-fn lvm_collect_hreturn(r: HReturn, st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match r {
-    HR(_, body, _, _) -> lvm_collect_expr(body, st)
-  }
-}
-
-fn lvm_collect_exprs(xs: [Expr], st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match xs {
-    [] -> st
-    [h, ...rest] -> lvm_collect_exprs(rest, lvm_collect_expr(h, st))
-  }
-}
-
-fn lvm_collect_arms(arms: [Arm], st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match arms {
-    [] -> st
-    [a, ...rest] -> match a {
-      Arm(_, opt_g, body) -> {
-        let s1 = match opt_g { Some(g) -> lvm_collect_expr(g, st) None -> st }
-        lvm_collect_arms(rest, lvm_collect_expr(body, s1))
-      }
-    }
-  }
-}
-
-fn lvm_collect_field_inits(fs: [FieldInit], st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match fs {
-    [] -> st
-    [f, ...rest] -> match f {
-      FI(_, val) -> lvm_collect_field_inits(rest, lvm_collect_expr(val, st))
-    }
-  }
-}
-
-fn lvm_collect_list_elems(es: [ListElem], st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match es {
-    [] -> st
-    [el, ...rest] -> match el {
-      ElPlain(x) -> lvm_collect_list_elems(rest, lvm_collect_expr(x, st))
-      ElSpread(x) -> lvm_collect_list_elems(rest, lvm_collect_expr(x, st))
-    }
-  }
-}
-
-fn lvm_collect_stmts(ss: [Stmt], st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match ss {
-    [] -> st
-    [s, ...rest] -> lvm_collect_stmts(rest, lvm_collect_stmt(s, st))
-  }
-}
-
-fn lvm_collect_stmt(s: Stmt, st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match s {
-    SLet(pat, _, rhs) -> {
-      # issue #285: walk RHS in the *outer* scope, then extend
-      # `local_scope` with the pattern's bound names so subsequent
-      # stmts and a trailing tail expression treat them as captures.
-      let s1 = lvm_collect_expr(rhs, st)
-      lvm_lc_set_locals(s1, lvm_pat_bindings(pat, s1.local_scope))
-    }
-    SAssert(c, opt_m) -> {
-      let s1 = lvm_collect_expr(c, st)
-      match opt_m { Some(m) -> lvm_collect_expr(m, s1) None -> s1 }
-    }
-    SExprStmt(x) -> lvm_collect_expr(x, st)
-    SIndexAssign(b, i, v, _, _) -> {
-      let s1 = lvm_collect_expr(b, st)
-      let s2 = lvm_collect_expr(i, s1)
-      lvm_collect_expr(v, s2)
-    }
-    # m7b #5: `var name = init` — desugared into `EHandle` upstream of
-    # this walker (`desugar_var_block`), so an `SVar` reaching here is
-    # rare; nonetheless mirror SLet so a lone surviving `var` still
-    # shadows globals correctly (issue #285).
-    SVar(name, _, rhs, _, _) -> {
-      let s1 = lvm_collect_expr(rhs, st)
-      lvm_lc_extend_locals(s1, [name])
-    }
-    # m7e §25: stripped by desugar_use_decls before lambda lift runs.
-    SUse(_, _, _) -> st
-  }
-}
-
-fn lvm_collect_interp(span: String, is_triple: Bool, st: LvmLamCollect) : LvmLamCollect / Console {
-
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
-  lvm_collect_interp_parts(parts, st)
-}
-
-fn lvm_collect_interp_parts(parts: [IPart], st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match parts {
-    [] -> st
-    [p, ...rest] -> match p {
-      IpLit(_, _) -> lvm_collect_interp_parts(rest, st)
-      IpExp(esrc) -> {
-        let st1 = match parse_interp_expr(esrc) { Some(e) -> lvm_collect_expr(e, st) None -> st }
-        lvm_collect_interp_parts(rest, st1)
-      }
-    }
-  }
-}
-
-# m4c #4: enter / leave helpers for the cur_enc_fn field. Functional
-# state-passing — the walker swaps the enclosing fn name on the way
-# in and restores the parent's name on the way out so siblings stamp
-# their own clauses against the right scope.
-
-fn lvm_enter_enc_fn(st: LvmLamCollect, name: String) : LvmLamCollect =
-  LvmLamCollect { next_id: st.next_id, lams: st.lams,
-                clauses: st.clauses, globals: st.globals,
-                cur_enc_fn: name, local_scope: st.local_scope }
-
-fn lvm_restore_enc_fn(st: LvmLamCollect, name: String) : LvmLamCollect =
-  LvmLamCollect { next_id: st.next_id, lams: st.lams,
-                clauses: st.clauses, globals: st.globals,
-                cur_enc_fn: name, local_scope: st.local_scope }
-
-fn lvm_collect_decl(d: Decl, st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match d {
-    DFn(_, name, _, ps, _, _, body, _, _, mo) -> {
-      let outer = st.cur_enc_fn
-      let outer_locals = st.local_scope
-      # issue #285: seed `local_scope` with the fn's parameter names so
-      # any nested ELambda's free-variable analysis treats a parameter
-      # whose name collides with a stdlib fn (e.g. `count` shadowing
-      # `list.count`) as a captured local instead of a global.
-      let st1 = lvm_enter_enc_fn(lvm_lc_set_locals(st, lvm_params_to_names(ps)),
-                              lvm_c_sym(name, mo))
-      let st2 = lvm_collect_expr(body, st1)
-      lvm_lc_set_locals(lvm_restore_enc_fn(st2, outer), outer_locals)
-    }
-    DType(_, _, _, _, _, _, _) -> st
-    DTest(_, body, line, col) -> {
-      let outer = st.cur_enc_fn
-      let outer_locals = st.local_scope
-      # m4c #4: the synthesised name has to match the prefix
-      # `emit_test_fn` will use so install code emitted inside a test
-      # body's `EHandle` and the corresponding clause's top-level C
-      # function agree on a single C symbol.
-      let test_enc = concat_all([
-        "__test__", int_to_string(line), "_", int_to_string(col)
-      ])
-      let st1 = lvm_enter_enc_fn(lvm_lc_set_locals(st, []), test_enc)
-      let st2 = lvm_collect_expr(body, st1)
-      lvm_lc_set_locals(lvm_restore_enc_fn(st2, outer), outer_locals)
-    }
-    DBench(_, body, line, col) -> {
-      let outer = st.cur_enc_fn
-      let outer_locals = st.local_scope
-      let bench_enc = concat_all([
-        "__bench__", int_to_string(line), "_", int_to_string(col)
-      ])
-      let st1 = lvm_enter_enc_fn(lvm_lc_set_locals(st, []), bench_enc)
-      let st2 = lvm_collect_expr(body, st1)
-      lvm_lc_set_locals(lvm_restore_enc_fn(st2, outer), outer_locals)
-    }
-    DCheck(_, ps, body, line, col) -> {
-      let outer = st.cur_enc_fn
-      let outer_locals = st.local_scope
-      let check_enc = concat_all([
-        "__check__", int_to_string(line), "_", int_to_string(col)
-      ])
-      let st1 = lvm_enter_enc_fn(lvm_lc_set_locals(st, lvm_params_to_names(ps)),
-                              check_enc)
-      let st2 = lvm_collect_expr(body, st1)
-      lvm_lc_set_locals(lvm_restore_enc_fn(st2, outer), outer_locals)
-    }
-    DImport(_, _, _) -> st
-    DEffect(_, _, _, _, _, _, _) -> st          # no expressions to walk
-    # m12.8: stripped pre-resolve. No expressions to walk if one
-    # somehow survives.
-    DProtocol(_, _, _, _, _, _) -> st
-    DImpl(_, _, _, _, _, _) -> st
-    DDerive(_, _, _, _) -> st
-    DUnstable(_, _, _) -> st
-    DUnit(_, _, _, _, _) -> st               # m12.5: no expressions in a unit decl
-    DUse(_, _, _) -> st                       # m7e §25: stripped by desugar_use_decls; no expressions
-    DAxiom(_, _, _, _, _, _, _, _, _, _) -> st     # m12.7: rewritten to DFn by lower_axioms; no expressions on the bare form
-    DAttribPure(inner, _, _) -> lvm_collect_decl(inner, st)  # m12.6.x #5(a)
-    DConst(_, _, _, body, _, _) -> {              # issue #269: literal-only body, but walk for safety
-      lvm_collect_expr(body, st)
-    }
-  }
-}
-
-fn lvm_collect_decls(ds: [Decl], st: LvmLamCollect) : LvmLamCollect / Console {
-
-  match ds {
-    [] -> st
-    [d, ...rest] -> lvm_collect_decls(rest, lvm_collect_decl(d, st))
-  }
-}
-
-# Globals: prelude names + user fn names + variant ctor names. Used as a
-# cheap "this ident does not need to be captured" test.
-
-fn lvm_efn_name(e: EFn) : String = match e { EFn(n, _, _, _) -> n }
-
-fn lvm_evar_name(v: LvmEVar) : String = match v { LvmEV(n, _, _, _) -> n }
-
-fn lvm_build_globals(fns: [EFn], variants: [LvmEVar], eff_names: [String], op_quals: [String]) : [String] {
-  let p = prelude_names()
-  let f = map(fns, lvm_efn_name)
-  let v = map(variants, lvm_evar_name)
-  # Effect names (e.g. `Console`) and qualified op references
-  # (`Stdout.print`) are not runtime values; they are
-  # name-resolved at op-call sites via the evidence stack.
-  # `desugar_op_calls_callee` rewrites `EField(EVar(Eff), op)` into
-  # `EVar("Eff.op")` (a single qualified ident), so without
-  # including the qualified form in globals, `lvm_fv_expr` would treat
-  # `Stdout.print` as a free variable inside a lambda body and the
-  # lambda lifter would capture it, emitting invalid C
-  # (`kai_Stdout.print` is not a valid C identifier).
-  list_append(p,
-    list_append(f,
-      list_append(v,
-        list_append(eff_names, op_quals))))
-}
-
-# For every `effect Eff { op_a(...) : T  op_b(...) : U }` decl,
-# yield the qualified ident strings `"Eff.op_a"`, `"Eff.op_b"`.
-# These match what `desugar_op_calls_callee` produces when it
-# rewrites `Eff.op(args)` callees into `EVar("Eff.op")`.
-
-fn lvm_op_qualified_names_for(eff_name: String, ops: [EffectOp], acc: [String]) : [String] {
-  match ops {
-    [] -> acc
-    [o, ...rest] -> match o {
-      EOp(op_name, _, _, _, _, _) ->
-        lvm_op_qualified_names_for(eff_name, rest,
-          [string_concat(eff_name, string_concat(".", op_name)), ...acc])
-    }
-  }
-}
-
-# m12.8 Phase 4b: (op_name, eff_name) pairs collected from every
-# DEffect in the program. Used to resolve alias-qualified op calls
-# (`Console.print` → `Stdout.print`, `Io.read_line` → `Stdin.read_line`).
-
-fn lvm_collect_op_qualified_names(decls: [Decl]) : [String] {
-  match decls {
-    [] -> []
-    [d, ...rest] -> match d {
-      DEffect(_, name, _, ops, _, _, _) ->
-        list_append(lvm_op_qualified_names_for(name, ops, []),
-                    lvm_collect_op_qualified_names(rest))
-      _ -> lvm_collect_op_qualified_names(rest)
-    }
-  }
-}
-
-# ---- lambda helper emission ----
-
-fn lvm_op_args_only(params: [Param]) : [Param] {
-  match params {
-    [] -> []
-    [_] -> []                       # the lone trailing `resume`
-    [p, ...rest] -> [p, ...lvm_op_args_only(rest)]
-  }
-}
-
-# m4c #4: clause C-symbol minting takes the enclosing fn name as a
-# prefix. Pre-fix the name was `_kai_clause_<l>_<c>_<op>` keyed only
-# on source position; duplicating a polymorphic body that contains
-# `EHandle` produced colliding C symbols and the linker rejected the
-# binary, which is why `monomorphise` shipped as identity. The
-# prefixed form `_kai_<enc>__clause_<l>_<c>_<op>` lets two
-# specialisations of the same source fn (`foo__mono__Int` vs
-# `foo__mono__String`) emit distinct symbols. The same prefix is
-# minted both at the install site (`emit_clause_assignments`) and at
-# the clause-body emit site, fed from `LvmClauseInfo.enc_fn`.
-
-fn lvm_clause_fn_name(enc_fn: String, line: Int, col: Int, op: String) : String =
-  concat_all([
-    "_kai_", enc_fn, "__clause_",
-    int_to_string(line), "_", int_to_string(col), "_", op
-  ])
-
-fn lvm_bang_success_variant(opt_ty: Option[Ty]) : Option[String] {
-  match opt_ty {
-    None -> None
-    Some(t) -> match t {
-      TyCon(_, name, _) ->
-        if name == "Option" { Some("Some") }
-        else if name == "Result" { Some("Ok") }
-        else { None }
-      _ -> None
-    }
-  }
-}
-
-# m7a #6b/#6c: lower `handle { body } with Eff [as alias] { clauses }`
-# to its prologue/body/epilogue. m7a #6b shipped the EvE alloca,
-# the handler-id stamp, the kai_evidence_push/pop pair, and the
-# optional return clause; m7a #6c populates each op fn-ptr with the
-# top-level clause function emitted by emit_clause_body, so that op
-# calls inside the body dispatch through the EvE.
-# m7b #11: when `init_opt` is `Some(ie)`, write the init value into
-# `_ev.state` after the handler-id and op-fn-ptr assignments. The
-# clause body emitter exposes that slot inside clauses as `state` /
-# `log` aliases of `self->state`.
-
-fn lvm_lookup_clause_enc_fn(cs: [LvmClauseInfo], hline: Int, hcol: Int, op_name: String) : String {
-  match cs {
-    [] -> ""
-    [c, ...rest] -> match c {
-      LvmCI(line, col, _, op, _, _, _, enc_fn, _) ->
-        if line == hline and col == hcol and op == op_name { enc_fn }
-        else { lvm_lookup_clause_enc_fn(rest, hline, hcol, op_name) }
-    }
-  }
-}
-
-# Issue #403: cheap structural test for `ECall(EVar("__perceus_drop"), _)`.
-# `__perceus_drop` lowers to `kai_internal_drop`, which decrefs and returns
-# the unit singleton — the SExprStmt fast path skips the redundant trailing
-# `kai_decref` when this fires.
-
-fn lvm_block_unused_lets(stmts: [Stmt], opt_final: Option[Expr]) : [String] / Console =
-
-  lvm_block_unused_lets_loop(stmts, opt_final, [])
-
-fn lvm_block_unused_lets_loop(stmts: [Stmt], opt_final: Option[Expr],
-                          acc: [String]) : [String] / Console {
-
-  match stmts {
-    [] -> list_reverse(acc)
-    [s, ...rest] -> {
-      let acc1 = match s {
-        SLet(pat, _, rhs) -> match pat.pkind {
-          PBind(nm) -> {
-            if lvm_is_fresh_alloc(rhs) and not lvm_name_read_in_block(rest, opt_final, nm) {
-              [nm, ...acc]
-            } else { acc }
-          }
-          _ -> acc
-        }
-        _ -> acc
-      }
-      lvm_block_unused_lets_loop(rest, opt_final, acc1)
-    }
-  }
-}
-
-fn lvm_name_read_in_block(stmts: [Stmt], opt_final: Option[Expr], nm: String) : Bool / Console {
-
-  let stmt_uses = scan_uses_in_stmts(stmts, false)
-  let final_uses = match opt_final {
-    None -> []
-    Some(e) -> scan_uses_expr(e, false)
-  }
-  lvm_any_use_of(list_append(stmt_uses, final_uses), nm)
-}
-
-fn lvm_any_use_of(uses: [Use], nm: String) : Bool {
-  match uses {
-    [] -> false
-    [h, ...rest] -> match h {
-      U(uname, _, _, _) ->
-        if uname == nm { true } else { lvm_any_use_of(rest, nm) }
-    }
-  }
-}
-
-# Conservative "fresh allocation" predicate. Returns true when the
-# RHS is known to materialise a value with rc=1 and no aliasing.
-# False for `LvmEVar` (alias of an existing binding), `EField` /
-# `EIndex` (extracted ref into a parent), and the composite control
-# forms (`EIf`, `EMatch`, `EBlock`, `EHandle`, `EPipe`) whose result
-# can be a sub-expression aliased into the surrounding scope.
-
-fn lvm_is_fresh_alloc(e: Expr) : Bool {
-  match e.kind {
-    EInt(_)         -> true
-    EReal(_)        -> true
-    EBool(_)        -> true
-    EChar(_)        -> true
-    EStr(_, _)      -> true
-    EUnit           -> true
-    ECall(_, _)     -> true
-    EList(_)        -> true
-    ERecordLit(_, _) -> true
-    ERange(_, _, _) -> true
-    ELambda(_, _)   -> true
-    EBinop(_, _, _) -> true
-    EUnop(_, _)     -> true
-    _               -> false
-  }
-}
-
-fn lvm_ffi_ret_kind_of(opt: Option[TypeExpr]) : LvmFfiRetKind {
-  match opt {
-    None -> LvmFfiRetUnit
-    Some(t) -> lvm_ffi_kind_of_ty(t)
-  }
-}
-
-fn lvm_ffi_kind_of_ty(t: TypeExpr) : LvmFfiRetKind {
-  match t.tkind {
-    TyName(n, _) ->
-      if n == "Int" { LvmFfiRetInt }
-      else if n == "Real" { LvmFfiRetReal }
-      else if n == "Bool" { LvmFfiRetBool }
-      else if n == "String" { LvmFfiRetString }
-      else if n == "Unit" { LvmFfiRetUnit }
-      else { LvmFfiRetUnknown(n) }
-    _ -> LvmFfiRetUnknown("non-named type")
-  }
-}
-
-fn lvm_collect_pimpl_rows(ds: [Decl], acc: [LvmPimplRow]) : [LvmPimplRow] {
-  match ds {
-    [] -> list_reverse(acc)
-    [d, ...rest] -> match d {
-      DFn(_, name, _, params, _, _, _, _, _, mo) -> {
-        if string_starts_with_q(name, "__pimpl_") {
-          match lvm_parse_pimpl_name(name) {
-            Some(pr) -> {
-              let csym = lvm_c_sym(name, mo)
-              let arity = list_length(params)
-              lvm_collect_pimpl_rows(rest, [lvm_pr_with_csym(pr, csym, arity), ...acc])
-            }
-            None -> lvm_collect_pimpl_rows(rest, acc)
-          }
-        } else {
-          lvm_collect_pimpl_rows(rest, acc)
-        }
-      }
-      _ -> lvm_collect_pimpl_rows(rest, acc)
-    }
-  }
-}
-
-fn lvm_pr_with_csym(pr: LvmPimplRow, csym: String, arity: Int) : LvmPimplRow {
-  match pr { LvmPR(_, p, t, _) -> LvmPR(csym, p, t, arity) }
-}
-
-# Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>`
-# back into (proto, type_name). The proto is the stdlib name (Show,
-# Eq, ...) for v1; user protos return None to skip.
-
-fn lvm_parse_pimpl_name(name: String) : Option[LvmPimplRow] {
-  # name = "__pimpl_" ++ <rest>; cut prefix.
-  let prefix_len = 8
-  let n = string_length(name)
-  if n <= prefix_len { None }
-  else {
-    let rest = string_slice(name, prefix_len, n - prefix_len)
-    # split off the trailing "__a_..." suffix if present.
-    let base = lvm_pimpl_strip_arg_suffix(rest)
-    # `base` is now `<P>_<T>_<op>`. Take P as the longest known
-    # stdlib protocol prefix; everything between `<P>_` and the final
-    # `_<op>` is the type name.
-    match lvm_pimpl_split_proto(base) {
-      None -> None
-      Some(p_rest) -> match p_rest {
-        LvmPR2(p, rest1) -> {
-          # rest1 = "<T>_<op>". Strip the trailing `_<op>` by finding
-          # the last underscore.
-          let m = string_length(rest1)
-          let last = lvm_find_last_underscore_proto(rest1, m - 1)
-          if last <= 0 { None }
-          else {
-            let tname = string_slice(rest1, 0, last)
-            Some(LvmPR("", p, tname, 0))
-          }
-        }
-      }
-    }
-  }
-}
-
-fn lvm_pimpl_strip_arg_suffix(s: String) : String {
-  let marker = "__a_"
-  let idx = lvm_find_substring(s, marker, 0)
-  let n = string_length(s)
-  if idx >= n { s }
-  else { string_slice(s, 0, idx) }
-}
-
-# Detect which stdlib protocol prefix `s` starts with. Returns the
-# protocol name and the remainder after the trailing `_`. None if
-# unknown.
-
-fn lvm_pimpl_split_proto(s: String) : Option[LvmPR2] {
-  let try_one = (p: String) => {
-    let plen = string_length(p)
-    let n = string_length(s)
-    if n > plen and lvm_substring_eq(s, 0, p) {
-      let after = char_at_or_zero(s, plen)
-      if after == '_' {
-        Some(LvmPR2(p, string_slice(s, plen + 1, n - plen - 1)))
-      } else { None }
-    } else { None }
-  }
-  let tries = ["BinSerialize", "Serialize", "Default", "Show", "Hash",
-                "Ord", "Eq", "Add", "Sub", "Mul", "Div", "Rem"]
-  lvm_pimpl_first_match(tries, try_one)
-}
-
-fn lvm_pimpl_first_match(opts: [String], f: (String) -> Option[LvmPR2]) : Option[LvmPR2] {
-  match opts {
-    [] -> None
-    [o, ...rest] -> match f(o) {
-      Some(r) -> Some(r)
-      None    -> lvm_pimpl_first_match(rest, f)
-    }
-  }
-}
-
-fn lvm_find_last_underscore_proto(s: String, from: Int) : Int {
-  if from < 0 { -1 }
-  else {
-    match char_at(s, from) {
-      Some('_') -> from
-      _         -> lvm_find_last_underscore_proto(s, from - 1)
-    }
-  }
-}
-
-# Substring-equality. Returns true if `s[i..i+|t|] == t`. Bounds-safe.
-
-fn lvm_substring_eq(s: String, i: Int, t: String) : Bool {
-  let tn = string_length(t)
-  let sn = string_length(s)
-  if i + tn > sn { false }
-  else { lvm_substring_eq_loop(s, i, t, 0, tn) }
-}
-
-fn lvm_substring_eq_loop(s: String, i: Int, t: String, k: Int, tn: Int) : Bool {
-  if k >= tn { true }
-  else {
-    match char_at(s, i + k) {
-      Some(c1) -> match char_at(t, k) {
-        Some(c2) -> if c1 == c2 { lvm_substring_eq_loop(s, i, t, k + 1, tn) } else { false }
-        None     -> false
-      }
-      None -> false
-    }
-  }
-}
-
-# Find `needle` in `hay` starting at `from`. Returns length(hay) if
-# not found.
-
-#[doc("Index of the first occurrence of needle in hay at or after `from`, or `string_length(hay)` if absent. Pub for unit testing.")]
-pub fn lvm_find_substring(hay: String, needle: String, from: Int) : Int {
-  let hn = string_length(hay)
-  if from >= hn { hn }
-  else if lvm_substring_eq(hay, from, needle) { from }
-  else { lvm_find_substring(hay, needle, from + 1) }
-}
-
-# C array body for the impl table. Each row maps the parsed proto/type
-# back to the integer constants pinned in runtime.h.
-
-fn lvm_collect_variant_to_head(variants: [LvmEVar], decls: [Decl]) : [Int] =
-  lvm_collect_v2h_loop(variants, decls, [])
-
-fn lvm_collect_v2h_loop(vs: [LvmEVar], decls: [Decl], acc: [Int]) : [Int] {
-  match vs {
-    [] -> list_reverse(acc)
-    [LvmEV(name, _, _, _), ...rest] -> {
-      let head = lvm_variant_head_tag_for(name, decls)
-      lvm_collect_v2h_loop(rest, decls, [head, ...acc])
-    }
-  }
-}
-
-# For a constructor `name`, find the sum type it belongs to and look
-# up that sum's head tag. Builtins use the reserved ids; user sums
-# would need a registry — out of scope for v1 (the dispatcher's
-# runtime panic catches the miss).
-
-fn lvm_variant_head_tag_for(name: String, decls: [Decl]) : Int {
-  if name == "Some" { 16 }
-  else if name == "None" { 16 }
-  else if name == "Ok" { 17 }
-  else if name == "Err" { 17 }
-  else if name == "SigInt" { 18 }
-  else if name == "SigTerm" { 18 }
-  else if name == "SigHup" { 18 }
-  else if name == "SigUsr1" { 18 }
-  else if name == "SigUsr2" { 18 }
-  else if name == "Exited" { 19 }
-  else if name == "Signaled" { 19 }
-  else { 0 }   # user variant: anonymous head, dispatcher will miss
-}
-
-fn lvm_main_row_labels(decls: [Decl]) : [String] {
-  match decls {
-    [] -> []
-    [d, ...rest] -> match d {
-      DFn(_, n, _, _, _, row, _, _, _, _) ->
-        if n == "main" {
-          match row {
-            REmpty       -> []
-            RClosed(lbs) -> lvm_row_label_names(lbs)
-            ROpen(_, lbs) -> lvm_row_label_names(lbs)
-          }
-        } else { lvm_main_row_labels(rest) }
-      _ -> lvm_main_row_labels(rest)
-    }
-  }
-}
-
-# m12.8 Phase 4b: atomic Stdout / Stderr default setups. The
-# combined `Console` is an alias `type Console = Stdout + Stderr`,
-# so a `main` declaring `/ Console` installs BOTH the Stdout and
-# Stderr default handlers via the alias-expansion path in
-# `default_setups_for`.
-#
-# Issue #115: the runtime `kai_default_*` handlers in stage0/runtime.h
-# take `void *self` because the runtime header cannot know the
-# emitted `EvStdout` / `EvStderr` / ... types. Casting their
-# addresses to typed function pointers (`(KaiValue *(*)(EvStdout *,
-# ...))`) is a representation-equivalent cast in C, but UBSan's
-# `-fsanitize=function` (active in clang's `-fsanitize=undefined`
-# on Linux; absent from Apple clang's default `undefined` set)
-# checks at every indirect call that the *function definition's*
-# type tag equals the function pointer's static type. The cast
-# does not change the function definition's type tag, so every
-# dispatch through `_ev_op->print(...)` etc. trips the check on
-# Linux while passing on macOS.
-#
-# Fix: emit a thin typed shim per default-op at file scope
-# (`_kai_default_<eff>_<op>_shim`). The shim has the typed
-# signature matching the struct field, forwards to the runtime
-# void-self function via a regular call (not subject to
-# `-fsanitize=function`). Setup assigns the shim's address; no
-# cast required at the assignment, no UBSan diagnostic at the
-# dispatch site.
-# Issue #556: derive a default-handler shim from a user-declared
-# `default { }` block whose clause bodies are `$extern_handler("c_sym")`.
-# The shim shape mirrors the hardcoded family above:
-#     static KaiValue *_kai_default_<eff_lc>_<op>_shim(Ev<Eff> *self,
-#         KaiValue *kai_<arg>, ..., KaiCont *k) {
-#         return <lvm_c_sym>(self, kai_<arg>, ..., k);
-#     }
-# Returns "" when the effect has no default block, or when the block's
-# clauses do not all bridge to extern_handler (the latter case is a
-# user-declared effect with kaikai-bodied default; Stage C will lower
-# those, but Stage A's codegen scope is the extern_handler bridge only).
-
-fn lvm_find_effect_default_block(eff_name: String, decls: [Decl]) : Option[DefaultBlock] {
-  match decls {
-    [] -> None
-    [d, ...rest] -> match d {
-      DEffect(_, n, _, _, defblk, _, _) ->
-        if n == eff_name { defblk } else { lvm_find_effect_default_block(eff_name, rest) }
-      _ -> lvm_find_effect_default_block(eff_name, rest)
-    }
-  }
-}
-
-# Issue #557 — Stage B of #533 trilogy. Op-level coverage walker.
-#
-# The typer's row-level checks (`check_body_row`, `check_main_row_handlable`)
-# enforce that every effect label reached from a body is named by an
-# enclosing `handle` or absorbed by `main`. They are blind to which
-# specific op of an effect was performed, so a `handle ... with Log
-# { info }` whose body invokes `Log.warn` compiles cleanly and
-# segfaults at runtime (dispatch hits an unwired evidence slot).
-#
-# This walker closes the gap. For every directly-performed `Eff.op`
-# call inside a `DFn` body it walks the lexical stack of enclosing
-# handles. Discharge order:
-#
-#   1. Enclosing `handle ... with Eff { clauses }` lists `op` in its
-#      clauses  → discharged.
-#   2. Enclosing `handle ... with Eff` exists, `op` not in clauses,
-#      but `Eff`'s `default { }` block declares `op` → discharged
-#      (clause-merge from the spec).
-#   3. No enclosing `handle ... with Eff`, the function is `main`,
-#      and `Eff`'s `default { }` block declares `op` → discharged
-#      (auto-installed at the program root).
-#   4. Otherwise → "effect not handled: Eff.op" with notes naming
-#      the default-block status so the user can decide between
-#      adding a clause to the handle, growing the default block, or
-#      wrapping the call site.
-#
-# Scope: only direct `Eff.op(...)` invocations are checked (the
-# `ECall(EVar("Eff.op"), _)` shape produced by `synth_op_call_with_scheme`).
-# Cross-function reachability is out of scope for Stage B; the row-
-# level check still propagates labels through helper signatures and
-# bites where they bubble up.
-
-fn lvm_effect_default_block_all_extern(eff_name: String, decls: [Decl]) : Bool =
-  match lvm_find_effect_default_block(eff_name, decls) {
-    None         -> false
-    Some(defblk) -> match defblk {
-      DBlk(clauses, _, _, _) -> lvm_all_clauses_extern_handler(clauses)
-    }
-  }
-
-fn lvm_all_clauses_extern_handler(cs: [HClause]) : Bool = match cs {
-  []           -> true
-  [c, ...rest] -> match c {
-    HC(_, _, body, _, _) -> match lvm_extern_handler_c_symbol(body) {
-      None    -> false
-      Some(_) -> lvm_all_clauses_extern_handler(rest)
-    }
-  }
-}
-
-# Search the handle stack for the topmost frame matching `eff_name`.
-# Step 2 (clause-merge) and step 3 (handle-with-default) both require
-# the topmost frame; step 1 fires when that frame's clauses list `op`.
-
-fn lvm_extern_handler_c_symbol(body: Expr) : Option[String] =
-  match body.kind {
-    EIntrinsic(name, args_) ->
-      if name == "extern_handler" {
-        match args_ {
-          [a] -> match a.kind {
-            EStr(span, is_triple) ->
-              if is_triple { None }
-              else { Some(lvm_strip_string_quotes(span)) }
-            _ -> None
-          }
-          _ -> None
-        }
-      } else { None }
-    _ -> None
-  }
-
-# Strip leading `"` and trailing `"` from a string-literal span and
-# resolve the minimal escape set the C-identifier surface uses: `\"`
-# survives only as a defensive case (no C identifier contains `"`),
-# and no other escape is meaningful here. Returns "" if the span has
-# no outer quotes (defensive against malformed AST).
-
-fn lvm_strip_string_quotes(span: String) : String {
-  let n = string_length(span)
-  if n < 2 { "" }
-  else {
-    let first_q = match char_at(span, 0) { Some(c) -> c == '"' _ -> false }
-    let last_q  = match char_at(span, n - 1) { Some(c) -> c == '"' _ -> false }
-    if first_q and last_q { string_slice(span, 1, n - 2) }
-    else { span }
-  }
-}
-
-
-# m7a #7 + m7b #2b + m8 #2/#4 + m12.8 Phase 4b: assemble the full
-# setup block for the builtins listed in `main`'s row. Push order
-# Stdout → Stderr → Fail → Stdin → Env → File → Mutable → Cancel →
-# Spawn matches Doc B §*Installation order*: Spawn innermost (last
-# pushed, first looked up); Cancel the layer below it (root nursery
-# flags fibers, Cancel handler unwinds); Mutable below Cancel (I/O
-# cluster). Phase 4b: `Console` acts as the alias `Stdout + Stderr`,
-# so a row containing it triggers both setups.
-
-fn lvm_alias_map_empty() : LvmAliasMap = LvmAM([], true)
-
-fn lvm_alias_map_push(m: LvmAliasMap, name: String, eff: String) : LvmAliasMap {
-  # m7b #15: the rewrite-pass LvmAliasMap stores the per-binding
-  # taggability Bool inside AB so the inferencer's snapshots stay
-  # symmetric, but the rewrite pass actually consults
-  # `lvm_alias_map_may_tag(m)` (a per-map flag) to decide tagging.
-  # Pass `true` here unconditionally — the per-map flag is what
-  # gates EField tagging in `lvm_rewrite_alias_kind`.
-  match m { LvmAM(xs, t) -> LvmAM([AB(name, eff, true), ...xs], t) }
-}
-
-fn lvm_alias_map_lookup(m: LvmAliasMap, name: String) : Option[String] {
-  match m { LvmAM(xs, _) -> lookup_alias(xs, name) }
-}
-
-# m7b #15 (compiler integration, scope-limited): once we descend
-# into a closure (lambda body), the handle prologue's
-# `kai_alias_<a>_id` C local is no longer in scope. Mark the
-# alias map so the EField rewrite stops tagging op names with
-# `@<alias>` and falls back to the legacy name-keyed lookup.
-# The bindings themselves stay live so the substitution
-# `cap.op` → `Eff.op` keeps working inside the closure.
-
-fn lvm_alias_map_disable_tag(m: LvmAliasMap) : LvmAliasMap {
-  match m { LvmAM(xs, _) -> LvmAM(xs, false) }
-}
-
-fn lvm_alias_map_may_tag(m: LvmAliasMap) : Bool {
-  match m { LvmAM(_, t) -> t }
-}
-
-# m7b #17: drop every binding for `name` from the alias map. Used
-# when entering a scope (let / var / lambda param / match pattern)
-# whose binder shadows an outer `with Eff as name`. Removes from
-# the head down so the most recent re-bind no longer matches.
-
-fn lvm_alias_map_remove(m: LvmAliasMap, name: String) : LvmAliasMap {
-  match m { LvmAM(xs, t) -> LvmAM(lvm_alias_remove_loop(xs, name, []), t) }
-}
-
-fn lvm_alias_remove_loop(xs: [AliasBinding], name: String, acc: [AliasBinding]) : [AliasBinding] {
-  match xs {
-    [] -> list_reverse(acc)
-    [h, ...rest] -> match h {
-      AB(n, _, _) ->
-        if n == name { lvm_alias_remove_loop(rest, name, acc) }
-        else        { lvm_alias_remove_loop(rest, name, [h, ...acc]) }
-    }
-  }
-}
-
-# m7b #17: drop every binding whose name is in `names`. Convenience
-# for shadowing by lambda params and match-arm patterns where the
-# whole pattern's bound-name set lands in scope at once.
-
-fn lvm_alias_map_remove_all(m: LvmAliasMap, names: [String]) : LvmAliasMap {
-  match names {
-    [] -> m
-    [h, ...rest] -> lvm_alias_map_remove_all(lvm_alias_map_remove(m, h), rest)
-  }
-}
-
-fn lvm_rewrite_alias_decls(ds: [Decl]) : [Decl] = map(ds, lvm_rewrite_alias_decl)
-
-fn lvm_rewrite_alias_decl(d: Decl) : Decl {
-  match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
-      DFn(pub_, n, tps, ps, ret, row, lvm_rewrite_alias_expr(body, lvm_alias_map_empty()), l, c, mo)
-    DTest(desc, body, l, c) ->
-      DTest(desc, lvm_rewrite_alias_expr(body, lvm_alias_map_empty()), l, c)
-    DBench(desc, body, l, c) ->
-      DBench(desc, lvm_rewrite_alias_expr(body, lvm_alias_map_empty()), l, c)
-    DCheck(desc, params, body, l, c) ->
-      DCheck(desc, params, lvm_rewrite_alias_expr(body, lvm_alias_map_empty()), l, c)
-    _ -> d
-  }
-}
-
-fn lvm_rewrite_alias_expr(e: Expr, m: LvmAliasMap) : Expr =
-  Expr { kind: lvm_rewrite_alias_kind(e.kind, m, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
-
-fn lvm_rewrite_alias_opt(opt: Option[Expr], m: LvmAliasMap) : Option[Expr] {
-  match opt {
-    Some(e) -> Some(lvm_rewrite_alias_expr(e, m))
-    None    -> None
-  }
-}
-
-# m7b #17: walk a statement list with shadow-aware alias map.
-# Each SLet / SVar binds its name(s) for the rest of the block, so
-# subsequent statements (and the trailing expression handled in
-# the EBlock arm) see a map with those names removed. Without this
-# the walker would rewrite an inner `let x = ...; x.op()` against
-# an outer `with Eff as x` even though the inner `x` shadows.
-
-fn lvm_rewrite_alias_stmts_scoped(ss: [Stmt], m: LvmAliasMap, acc: [Stmt]) : LvmStmtsRewrite {
-  match ss {
-    [] -> LvmStmtsRewrite { stmts: list_reverse(acc), m: m }
-    [s, ...rest] -> match s {
-      SLet(pat, ann, rhs) -> {
-        let s1 = SLet(pat, ann, lvm_rewrite_alias_expr(rhs, m))
-        let m1 = lvm_alias_map_remove_all(m, lvm_pat_bindings(pat, []))
-        lvm_rewrite_alias_stmts_scoped(rest, m1, [s1, ...acc])
-      }
-      SVar(n, ty, rhs, l, c) -> {
-        let s1 = SVar(n, ty, lvm_rewrite_alias_expr(rhs, m), l, c)
-        let m1 = lvm_alias_map_remove(m, n)
-        lvm_rewrite_alias_stmts_scoped(rest, m1, [s1, ...acc])
-      }
-      _ -> lvm_rewrite_alias_stmts_scoped(rest, m, [lvm_rewrite_alias_stmt(s, m), ...acc])
-    }
-  }
-}
-
-fn lvm_rewrite_alias_stmt(s: Stmt, m: LvmAliasMap) : Stmt {
-  match s {
-    SLet(pat, ann, rhs) -> SLet(pat, ann, lvm_rewrite_alias_expr(rhs, m))
-    SAssert(c, msg) -> SAssert(lvm_rewrite_alias_expr(c, m), lvm_rewrite_alias_opt(msg, m))
-    SExprStmt(x) -> SExprStmt(lvm_rewrite_alias_expr(x, m))
-    SIndexAssign(b, i, v, l, c) ->
-      SIndexAssign(lvm_rewrite_alias_expr(b, m), lvm_rewrite_alias_expr(i, m),
-                   lvm_rewrite_alias_expr(v, m), l, c)
-    SVar(n, ty, rhs, l, c) -> SVar(n, ty, lvm_rewrite_alias_expr(rhs, m), l, c)
-    # m7e §25: SUse has no expr to rewrite. Pass through.
-    SUse(n, l, c) -> SUse(n, l, c)
-  }
-}
-
-fn lvm_rewrite_alias_arms(arms: [Arm], m: LvmAliasMap) : [Arm] =
-  map(arms, (a) => lvm_rewrite_alias_arm(a, m))
-
-# m7b #17: pattern bindings shadow outer aliases inside the arm's
-# guard and body — same idea as the SLet shadow in stmts.
-
-fn lvm_rewrite_alias_arm(a: Arm, m: LvmAliasMap) : Arm {
-  match a {
-    Arm(p, g, b) -> {
-      let m1 = lvm_alias_map_remove_all(m, lvm_pat_bindings(p, []))
-      Arm(p, lvm_rewrite_alias_opt(g, m1), lvm_rewrite_alias_expr(b, m1))
-    }
-  }
-}
-
-fn lvm_rewrite_alias_clauses(cs: [HClause], m: LvmAliasMap) : [HClause] =
-  map(cs, (c) => lvm_rewrite_alias_clause(c, m))
-
-fn lvm_rewrite_alias_clause(c: HClause, m: LvmAliasMap) : HClause {
-  match c {
-    HC(n, ps, b, l, co) -> {
-      # m7b #17: clause params (op args + the trailing `resume`)
-      # shadow outer aliases inside the clause body.
-      let names = map(ps, (pm) => pm.pname)
-      let m1 = lvm_alias_map_remove_all(m, names)
-      # Issue #148 (Option A): a clause body compiles to a separate
-      # C function, so any `kai_alias_<a>_id` declared in an outer
-      # `EHandle` prologue is out of scope here — same situation as
-      # a lambda body. Disable tag emission so cross-handler reads
-      # of an outer-bound capability fall back to the legacy
-      # name-keyed lookup. The bindings stay live so the
-      # `cap.op` → `Eff.op` substitution keeps working.
-      let m2 = lvm_alias_map_disable_tag(m1)
-      HC(n, ps, lvm_rewrite_alias_expr(b, m2), l, co)
-    }
-  }
-}
-
-fn lvm_rewrite_alias_opt_return(opt: Option[HReturn], m: LvmAliasMap) : Option[HReturn] {
-  match opt {
-    Some(r) -> Some(lvm_rewrite_alias_return(r, m))
-    None    -> None
-  }
-}
-
-fn lvm_rewrite_alias_return(r: HReturn, m: LvmAliasMap) : HReturn {
-  match r {
-    # m7b #17: the return clause's `p` binding shadows outer
-    # aliases inside its body (Doc C §m7b #11l: `state` / `log`
-    # magic bindings are introduced by the codegen, not the
-    # rewrite pass — only `p` is user-visible here).
-    HR(p, b, l, c) -> {
-      let m1 = lvm_alias_map_remove(m, p)
-      # Issue #148 (Option A): the return clause also compiles to a
-      # separate C function, so disable tag emission for the same
-      # cross-handler reason as `lvm_rewrite_alias_clause`.
-      let m2 = lvm_alias_map_disable_tag(m1)
-      HR(p, lvm_rewrite_alias_expr(b, m2), l, c)
-    }
-  }
-}
-
-# ---------------------------------------------------------------------------
-# Shared structural map over ExprKind.
-#
-# Background (Full prerequisite 0.1, see `docs/stage2-design.md`):
-# every AST-walking pass used to hand-roll its own structural recursion
-# with a `_ -> k` catch-all over ExprKind. The wildcard audit in
-# `7bd5a68` showed the same pattern duplicated 10x. Adding a new
-# ExprKind variant (m7e variants[T](), refinement carriers, future
-# actor primitives) silently re-introduces the same `_ -> k` debt
-# at every site.
-#
-# `lvm_map_expr_kind` is the single point of structural recursion. Each
-# walker handles only the kinds it actually transforms (or that
-# require scope-aware bookkeeping); everything else falls through to
-# `lvm_map_expr_kind`, which recurses into sub-Exprs explicitly. Adding
-# a new ExprKind now breaks the compiler at one match site instead
-# of degrading ten walkers.
-#
-# Convention: `f` is a closure that captures the walker's context
-# and threads it through `<walker>_expr`. The closure is responsible
-# for further recursion (i.e., `lvm_map_expr_kind` is one-level: it
-# applies `f` to direct children, not to grandchildren).
-#
-# Sub-helpers (`lvm_map_stmt_exprs`, `lvm_map_arm_exprs`, etc.) replicate
-# the structure for the auxiliary AST nodes that contain Exprs.
-# A pass that needs scope-aware traversal (pattern shadowing in
-# arms, binding shadowing in stmt blocks) handles those nodes
-# explicitly in its own walker and never reaches the helpers below.
-# ---------------------------------------------------------------------------
-
-fn lvm_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
-  match k {
-    # Leaves: no sub-Expr to recurse into.
-    EInt(_)        -> k
-    EReal(_)       -> k
-    EBool(_)       -> k
-    EChar(_)       -> k
-    EStr(_, _)     -> k
-    EUnit          -> k
-    EVar(_)        -> k
-    EUnder         -> k
-    EPlaceholder   -> k
-    EHole(_)       -> k
-    ETodo(_)       -> k
-    # `EVariantsOf(TypeExpr, [String])` carries no sub-Expr (only a
-    # TypeExpr and a resolved-names list, neither of which the
-    # visitor traverses). Same shape as EHole/ETodo for the
-    # purposes of the structural recursion.
-    EVariantsOf(_, _) -> k
-    # m6.2 Phase 2.1: qualified module call carries no sub-Exprs
-    # (both fields are plain Strings), so `f` has nothing to apply.
-    EModCall(_, _) -> k
-    # Issue #556: intrinsic args ARE sub-Exprs, so the visitor recurs.
-    EIntrinsic(name, args_) -> EIntrinsic(name, map(args_, f))
-    # Composites: apply f to every direct sub-Expr.
-    ECall(callee, args_) -> ECall(f(callee), map(args_, f))
-    EField(base, name)   -> EField(f(base), name)
-    EIndex(a, b)         -> EIndex(f(a), f(b))
-    EBinop(op, a, b)     -> EBinop(op, f(a), f(b))
-    EUnop(op, x)         -> EUnop(op, f(x))
-    EIf(c, t_, eo)       -> EIf(f(c), f(t_), lvm_map_opt_expr(eo, f))
-    EMatch(scr, arms)    -> EMatch(f(scr), map(arms, (a) => lvm_map_arm_exprs(a, f)))
-    ELambda(ps, b)       -> ELambda(ps, f(b))
-    ERecordLit(name, fs) -> ERecordLit(name, map(fs, (fi) => lvm_map_field_exprs(fi, f)))
-    EList(els)           -> EList(map(els, (el) => lvm_map_elem_exprs(el, f)))
-    ERange(a, b, opt_step) -> ERange(f(a), f(b), lvm_map_opt_expr(opt_step, f))
-    EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => lvm_map_stmt_exprs(s, f)),
-                                    lvm_map_opt_expr(tail, f))
-    EPipe(a, b)          -> EPipe(f(a), f(b))
-    EMapPipe(a, b)       -> EMapPipe(f(a), f(b))
-    EFlatMapPipe(a, b)   -> EFlatMapPipe(f(a), f(b))
-    EFilterPipe(a, b)    -> EFilterPipe(f(a), f(b))
-    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(f(body), eff_name, eff_tyargs,
-              lvm_map_opt_expr(init_opt, f), alias_opt,
-              map(clauses, (c) => lvm_map_clause_exprs(c, f)),
-              lvm_map_opt_return_exprs(ret_opt, f))
-    ELitUnit(inner, u)   -> ELitUnit(f(inner), u)
-    EBang(inner)         -> EBang(f(inner))
-  }
-}
-
-fn lvm_map_opt_expr(opt: Option[Expr], f: (Expr) -> Expr) : Option[Expr] {
-  match opt {
-    Some(e) -> Some(f(e))
-    None    -> None
-  }
-}
-
-fn lvm_map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
-  match s {
-    SLet(p, ann, rhs)           -> SLet(p, ann, f(rhs))
-    SAssert(c, m)               -> SAssert(f(c), lvm_map_opt_expr(m, f))
-    SExprStmt(x)                -> SExprStmt(f(x))
-    SIndexAssign(b, i, v, l, c) -> SIndexAssign(f(b), f(i), f(v), l, c)
-    SVar(n, ty, rhs, l, c)      -> SVar(n, ty, f(rhs), l, c)
-    # m7e §25: SUse has no sub-expression — pass through unchanged.
-    SUse(n, l, c)               -> SUse(n, l, c)
-  }
-}
-
-fn lvm_map_arm_exprs(a: Arm, f: (Expr) -> Expr) : Arm {
-  match a {
-    Arm(p, g, b) -> Arm(p, lvm_map_opt_expr(g, f), f(b))
-  }
-}
-
-fn lvm_map_field_exprs(fi: FieldInit, f: (Expr) -> Expr) : FieldInit {
-  match fi {
-    FI(n, v) -> FI(n, f(v))
-  }
-}
-
-fn lvm_map_elem_exprs(el: ListElem, f: (Expr) -> Expr) : ListElem {
-  match el {
-    ElPlain(x)  -> ElPlain(f(x))
-    ElSpread(x) -> ElSpread(f(x))
-  }
-}
-
-fn lvm_map_clause_exprs(c: HClause, f: (Expr) -> Expr) : HClause {
-  match c {
-    HC(n, ps, b, l, co) -> HC(n, ps, f(b), l, co)
-  }
-}
-
-fn lvm_map_opt_return_exprs(opt: Option[HReturn], f: (Expr) -> Expr) : Option[HReturn] {
-  match opt {
-    Some(r) -> Some(lvm_map_return_exprs(r, f))
-    None    -> None
-  }
-}
-
-fn lvm_map_return_exprs(r: HReturn, f: (Expr) -> Expr) : HReturn {
-  match r {
-    HR(p, b, l, c) -> HR(p, f(b), l, c)
-  }
-}
-
-fn lvm_rewrite_alias_kind(k: ExprKind, m: LvmAliasMap, line: Int, col: Int) : ExprKind {
-  match k {
-    EField(base, fname) -> match base.kind {
-      EVar(name) -> match lvm_alias_map_lookup(m, name) {
-        Some(eff_name) -> {
-          # m7b #4: the `@cap` desugar always emits `cap.get`; for
-          # a Reader-bound capability the actual op is `ask`.
-          # Translate the field name here so a downstream
-          # `cap.get()` call becomes `Reader.ask()`.
-          let real_fname =
-            if eff_name == "Reader" and fname == "get" { "ask" } else { fname }
-          # m7b #15 (compiler integration, scope-limited): tag the
-          # field name with `@<alias>` so the codegen can dispatch
-          # via the handle's local `kai_alias_<a>_id` instead of a
-          # name-keyed lookup. This fixes the innermost-wins bug
-          # for the case where the op-call site is reachable from
-          # the handle prologue's lexical scope (no intervening
-          # closure). Inside a closure (`lvm_alias_map_may_tag = false`)
-          # the handle's local is out of scope, so we do not tag —
-          # the legacy name-keyed lookup runs and the closure-
-          # capture path keeps working. See m7b #15 sub-followup.
-          let tagged_fname =
-            if lvm_alias_map_may_tag(m) {
-              string_concat(real_fname, string_concat("@", name))
-            } else {
-              real_fname
-            }
-          EField(mk_expr(EVar(eff_name), base.line, base.col), tagged_fname)
-        }
-        None -> EField(lvm_rewrite_alias_expr(base, m), fname)
-      }
-      _ -> EField(lvm_rewrite_alias_expr(base, m), fname)
-    }
-    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
-      let body_m = match alias_opt {
-        Some(a) -> lvm_alias_map_push(m, a, eff_name)
-        None    -> m
-      }
-      EHandle(lvm_rewrite_alias_expr(body, body_m), eff_name, eff_tyargs,
-              lvm_map_opt_expr(init_opt, (e) => lvm_rewrite_alias_expr(e, m)),
-              alias_opt,
-              lvm_rewrite_alias_clauses(clauses, m),
-              lvm_rewrite_alias_opt_return(ret_opt, m))
-    }
-    EBlock(stmts, tail) -> {
-      # m7b #17: track shadowing through the block. The trailing
-      # expression sees the alias map after every SLet / SVar in
-      # the block has had its name removed.
-      let r = lvm_rewrite_alias_stmts_scoped(stmts, m, [])
-      EBlock(r.stmts, lvm_map_opt_expr(tail, (e) => lvm_rewrite_alias_expr(e, r.m)))
-    }
-    ELambda(ps, b) -> {
-      # m7b #17: lambda params shadow outer aliases inside the body.
-      # The cross-lambda tagging (`@<alias>`) stays enabled now that
-      # the closure carries the enclosing handle's
-      # `kai_alias_<a>_id` as a capture (see lvm_fv_expr's tagged-op
-      # detection and the closure prologue in emit_lambda_body).
-      let names = map(ps, (pm) => pm.pname)
-      let m1 = lvm_alias_map_remove_all(m, names)
-      ELambda(ps, lvm_rewrite_alias_expr(b, m1))
-    }
-    EMatch(scr, arms) -> EMatch(lvm_rewrite_alias_expr(scr, m),
-                                 lvm_rewrite_alias_arms(arms, m))
-    # All remaining kinds (ECall, EIf, EBinop, EUnop, EPipe, EIndex,
-    # ERecordLit, EList, ERange, ELitUnit, EBang) recurse purely
-    # structurally with no scope or alias bookkeeping. The leaves
-    # (EInt, EReal, ..., LvmEVar, EHole, ETodo) return unchanged. The
-    # shared visitor handles both — adding a new ExprKind variant
-    # breaks the compiler at `lvm_map_expr_kind`'s match instead of
-    # silently leaking through this walker.
-    _ -> lvm_map_expr_kind(k, (sub) => lvm_rewrite_alias_expr(sub, m))
-  }
-}
-
-# m7a #6c: pre-emit op-call desugar. Walk the AST and rewrite every
-# `EField(EVar(eff), op)` callee, where `eff` is a declared effect,
-# into `EVar("eff.op")`. emit_call_expr then dispatches it through
-# kai_evidence_lookup. All other expression shapes are traversed
-# verbatim — only call sites are touched.
-
-fn lvm_ffi_extern_symbol_of(body: Expr, default_name: String) : String {
-  match body.kind {
-    ETodo(msg) ->
-      if string_starts_with_q(msg, ffi_extern_tag_prefix()) {
-        string_slice(msg, string_length(ffi_extern_tag_prefix()),
-                     string_length(msg) - string_length(ffi_extern_tag_prefix()))
-      } else { default_name }
-    _ -> default_name
-  }
-}
-
-# Protocol-dispatch runtime shim (opción C).
-#
-# A dispatcher fn (`__proto_<op>`) whose body is the tag
-# `__kai_proto_dispatch__:<P>:<op>` signals codegen to emit a custom
-# C/LLVM body that looks up the impl in the runtime hashmap by
-# `(proto_id, head_tag)` and tail-calls it. The dispatcher fn shape
-# (params, return type) is unchanged so the typer / monomorphiser see
-# a regular polymorphic call.
-
-fn lvm_proto_dispatch_tag_prefix() : String = "__kai_proto_dispatch__:"
-
-fn lvm_body_is_proto_dispatch(body: Expr) : Bool {
-  lvm_proto_dispatch_marker_in(body)
-}
-
-# The dispatcher's body starts as a bare `ETodo(marker)`, but Perceus'
-# exit-drop wrap can re-shape it into `EBlock([_drop kai_x...], Some(ETodo))`
-# before codegen sees it. Walk through the EBlock / EIf / EMatch shells
-# the lowering may wrap around the marker and look for the ETodo with
-# our prefix on the tail position.
-
-fn lvm_proto_dispatch_marker_in(e: Expr) : Bool {
-  match e.kind {
-    ETodo(msg)             -> string_starts_with_q(msg, lvm_proto_dispatch_tag_prefix())
-    EBlock(_, Some(tail))  -> lvm_proto_dispatch_marker_in(tail)
-    _                      -> false
-  }
-}
-
-fn lvm_proto_dispatch_parts(body: Expr) : LvmProtoDispatchParts {
-  match body.kind {
-    ETodo(msg) -> {
-      let payload = string_slice(msg, string_length(lvm_proto_dispatch_tag_prefix()),
-                                  string_length(msg) - string_length(lvm_proto_dispatch_tag_prefix()))
-      let idx = lvm_find_colon(payload, 0)
-      let pname = string_slice(payload, 0, idx)
-      let opname = string_slice(payload, idx + 1, string_length(payload) - (idx + 1))
-      LvmPDP(pname, opname)
-    }
-    EBlock(_, Some(tail)) -> lvm_proto_dispatch_parts(tail)
-    _                     -> LvmPDP("?", "?")
-  }
-}
-
-# Find the first ':' starting at `from`. Returns string length if not
-# found. The dispatcher marker always contains exactly one ':' so this
-# helper is sufficient (no escaping concerns).
-
-fn lvm_find_colon(s: String, from: Int) : Int {
-  let n = string_length(s)
-  if from >= n { n }
-  else {
-    match char_at(s, from) {
-      Some(c) -> if c == ':' { from } else { lvm_find_colon(s, from + 1) }
-      None    -> n
-    }
-  }
-}
-
-fn lvm_ty_string_list(ts: [Ty]) : [String] = map(ts, lvm_ty_to_string)
-
-fn lvm_ty_to_string(t: Ty) : String {
-  match t {
-    TyInt    -> "Int"
-    TyReal   -> "Real"
-    TyBool   -> "Bool"
-    TyString -> "String"
-    TyChar   -> "Char"
-    TyUnit   -> "Unit"
-    TyByte     -> "Byte"
-    TyListT(inner) -> cat3("[", lvm_ty_to_string(inner), "]")
-    # m7b #11k: render the function type's effect row alongside the
-    # arrow when non-empty, with each label printed as `Eff` or
-    # `Eff[T1, T2]` so parametric-effect mismatches (Reader[Int] vs
-    # Reader[String]) are visible in `expected/found` notes.
-    TyFnT(ps, ret, row) -> concat_all([
-      "(", lvm_join_with(lvm_ty_string_list(ps), ", "), ") -> ",
-      lvm_ty_to_string(ret),
-      lvm_row_to_string_suffix(row)
-    ])
-    TyCon(_, cname, tas) -> {
-      match tas {
-        [] -> cname
-        _ -> concat_all([cname, "[", lvm_join_with(lvm_ty_string_list(tas), ", "), "]"])
-      }
-    }
-    TyVarT(n) -> cat2("?t", int_to_string(n))
-    TyAny -> "?"
-    # m12.5: render dimensioned base types as `Real<u>` / `Int<u>`.
-    # The unit goes through unit_canon so the printed form matches
-    # what the unifier compares against — same shape on every side.
-    TyDimT(base, u) -> concat_all([lvm_ty_to_string(base), "<", lvm_unit_canon_display(u), ">"])
-    # m12.6.x #1: render `T where ...` for diagnostics. The predicate
-    # is left as `<pred>` to keep the line short; full predicate text
-    # lands with the diagnostics-quality pass (m12.6.x #8).
-    TyRefineT(base, _) -> concat_all([lvm_ty_to_string(base), " where <pred>"])
-    # issue #187 phase 1: render unions inline as `A | B | C` to match
-    # surface syntax. Components are already in canonical order when
-    # the walker receives them via `normalize_union`.
-    TyUnion(parts) -> lvm_join_with(map(parts, lvm_ty_to_string), " | ")
-  }
-}
-
-# m12.5: render a UnitExprT in canonical form for diagnostics. Sorts
-# symbols alphabetically and groups powers, so `kg * m` and `m * kg`
-# render identically.
-
-fn lvm_unit_canon_display(u: UnitExprT) : String = lvm_unit_expr_display(unit_canon(u))
-
-# m12.8.x phase 2 (Gap 1, partial): extract the canonical unit symbol
-# of a dimensioned type for the `unit_name` compile-time intrinsic.
-# Bare types and unresolved unit-vars yield the empty string so the
-# emitter never produces an LLVM/C error from a missing dimension.
-
-fn lvm_unit_name_of_ty(ot: Option[Ty]) : String {
-  match ot {
-    Some(t) -> match t {
-      TyDimT(_, u) -> match unit_canon(u) {
-        UVar(_) -> ""
-        UOne    -> ""
-        cu      -> lvm_unit_expr_display(cu)
-      }
-      _ -> ""
-    }
-    None -> ""
-  }
-}
-
-# m4c #2 — name-mangling helpers for monomorphisation.
-#
-# `mangle_name(name, [Ty]) : String` produces a deterministic,
-# C-identifier-safe name for a polymorphic decl instantiated at a
-# concrete type tuple. The empty tuple maps back to `name` (no
-# instantiation, e.g. fully monomorphic decls). For non-empty tuples
-# the form is `name__mono__T1[__T2...]`, with each `Tn` rendered by
-# `mangle_ty` using bracketed sentinels (`L_..._E` for lists,
-# `_O_..._C` for type-constructor argument lists, `F_..._R_..._E`
-# for function arrows). The sentinels make the encoding unambiguous:
-# `Foo[Bar]` and a hypothetical user fn named `Foo_Bar` cannot
-# collide. Effects are erased — two instantiations that differ only
-# in the row of an inner `TyFnT` mangle the same, by design (Perceus
-# operates on values, not on rows).
-#
-# The mangler errors implicitly on `TyVarT` / `TyAny`: a resolved
-# call-site tuple should not contain unresolved variables. If one
-# slips through the renderer emits `TVAR` / `Any` and the resulting
-# duplicate is caught by the m4c #3 collision check.
-
-fn lvm_row_to_string_suffix(r: Row) : String {
-  # Issue #645: a row with no labels is treated as "pure" in display
-  # form, whether its tail is None (truly closed empty) or Some(_)
-  # (a free row var with no demand on it — the phantom that
-  # `fn_scheme_of_decl` inserts for REmpty signatures, or any fresh
-  # row var introduced by instantiation and never constrained). The
-  # tail variable is internal bookkeeping; showing `?eN` to users
-  # mis-suggests they need to annotate the function. Diagnostics for
-  # actual row mismatches still print the `expected` and `found`
-  # rows in full (those rows carry labels by the time the mismatch
-  # is reported).
-  let body =
-    if labels_empty(r.labels) {
-      ""
-    } else {
-      let lbs = lvm_join_with(map(r.labels, label_to_string), " + ")
-      let tail_s = match r.tail {
-        None -> ""
-        Some(v) -> {
-          let pre = if string_length(lbs) > 0 { " + " } else { "" }
-          concat_all([pre, "?e", int_to_string(v)])
-        }
-      }
-      concat_all([" / ", lbs, tail_s])
-    }
-  body
-}
-
-# Dump the declared signature (or shape) of every top-level decl. Used
-# by `--types`; does not attempt to infer bodies, just surfaces what
-# the user wrote.
-
 fn lvm_ty_name_zero(name: String) : TypeExpr =
   TypeExpr { tkind: TyName(name, []), line: 0, col: 0 }
 
 # ---- LLVM clause / effect-struct emitters (were resident in the
 # emit_c region; logically the backend) ----
 
-fn llvm_emit_clause_body(c: LvmClauseInfo, fns: [EFn], vs: [LvmEVar], lams: [LvmLamInfo],
-                          oo: [OpOffset], cls: [LvmClauseInfo],
+fn llvm_emit_clause_body(c: ClauseInfo, fns: [EFn], vs: [EVar], lams: [LamInfo],
+                          oo: [OpOffset], cls: [ClauseInfo],
                           start_id: Int) : LlvmDeclOut / Console {
 
   match c {
@@ -2408,9 +108,9 @@ fn llvm_emit_clause_body(c: LvmClauseInfo, fns: [EFn], vs: [LvmEVar], lams: [Lvm
     # under `selfhost-llvm` the same way it failed under the C
     # backend pre-fix. Mirror is a follow-up; see CHANGELOG entry
     # for R9 for the C-first staging note.
-    LvmCI(line, col, eff, op_name, params, body, stateful, enc_fn, _) -> {
-      let sym = lvm_clause_fn_name(enc_fn, line, col, op_name)
-      let op_args = lvm_op_args_only(params)
+    CI(line, col, eff, op_name, params, body, stateful, enc_fn, _) -> {
+      let sym = clause_fn_name(enc_fn, line, col, op_name)
+      let op_args = op_args_only(params)
       let arg_sig = llvm_clause_arg_sig(op_args)
       let locals0 = llvm_clause_locals(op_args)
       let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
@@ -2466,9 +166,9 @@ fn llvm_clause_locals(ps: [Param]) : [LlvmLocal] {
   }
 }
 
-fn llvm_emit_clause_bodies(cs: [LvmClauseInfo], fns: [EFn], vs: [LvmEVar],
-                            lams: [LvmLamInfo], oo: [OpOffset],
-                            cls_all: [LvmClauseInfo],
+fn llvm_emit_clause_bodies(cs: [ClauseInfo], fns: [EFn], vs: [EVar],
+                            lams: [LamInfo], oo: [OpOffset],
+                            cls_all: [ClauseInfo],
                             start_id: Int, acc: String) : LlvmDeclOut / Console {
 
   match cs {
@@ -2542,7 +242,7 @@ fn llvm_effect_struct_decls(decls: [Decl]) : String =
 #   - Int / Bool literals                           (kaix_int / kaix_bool)
 #   - Fn params bound to named SSA registers        (%p_<name>)
 #   - Local let bindings                            (stored in a lookup)
-#   - LvmEVar reads that resolve to a local            (no closures yet)
+#   - EVar reads that resolve to a local            (no closures yet)
 #   - ECall to user-defined fns                     (@kai_<name>)
 #   - ECall to the M3b prelude subset               (@kaix_prelude_<name>)
 #   - EBinop arithmetic/comparison/logic            (via kaix_* helpers)
@@ -2858,7 +558,7 @@ fn llvm_id_bump(g: LlvmIdGen) : LlvmIdGen = LlvmIdGen { next: g.next + 1 }
 
 # ---- local scope ----
 # Issue #87 — Phase 2 unbox LLVM mirror. Raw locals carry the LLVM
-# IR scalar type alongside the SSA register so a later LvmEVar read
+# IR scalar type alongside the SSA register so a later EVar read
 # can either re-box (boxed-context use) or copy verbatim (raw-context
 # use). The boxed lookup (`llvm_local_find`) skips raw entries so a
 # raw binding does not silently resolve to the wrong register name.
@@ -2904,20 +604,20 @@ type LlvmEmit = {
   cur_label: String,
   locals: [LlvmLocal],
   fns: [EFn],
-  vars_: [LvmEVar],
-  lams: [LvmLamInfo],
+  vars_: [EVar],
+  lams: [LamInfo],
   # m7c-c — per-`Eff.op` field offset inside the matching `%EvX`
   # struct. Populated once in `emit_program_llvm` from the
   # declared (and injected-builtin) effects; consulted by the
   # op-call dispatch in `llvm_emit_call` to GEP the right
   # function pointer.
   op_offsets: [OpOffset],
-  # m4c #4 — recorded clauses from `lvm_collect_decls`, threaded so the
+  # m4c #4 — recorded clauses from `collect_decls`, threaded so the
   # LLVM install path (`llvm_emit_handle_clause_assigns`) can look up
   # the enclosing fn name stamped on each clause and mint the same C
   # symbol the body emit produces. Populated once at the top of
   # `emit_program_llvm`; pure read-only afterwards.
-  cls: [LvmClauseInfo]
+  cls: [ClauseInfo]
 }
 
 type OpOffset = OO(String, Int)
@@ -3102,7 +802,7 @@ fn llvm_gep_str(label: String, n: Int) : String =
 # M3c's prelude subset. Each entry is (kaikai name, arity, supports
 # being passed as a value). When the name appears as a *callee* in an
 # ECall we emit a direct `@kaix_prelude_<nm>` call. When the name
-# appears as an *LvmEVar value* (i.e. passed to map/each as a function),
+# appears as an *EVar value* (i.e. passed to map/each as a function),
 # we build a closure via `@kaix_closure` with the matching thunk
 # symbol; only entries with a checked-in thunk shim can be passed as
 # values.
@@ -3452,7 +1152,7 @@ fn llvm_raw_cmp_op(op: String, op_ty: Option[Ty]) : String {
 #
 # Mirrors `emit_expr_raw` from the C backend. When `x.mode` is
 # `MUnboxed` the kind is one of the natively-raw forms (literal,
-# raw LvmEVar, raw arith). When `x.mode` is `MBoxed` we fall back to
+# raw EVar, raw arith). When `x.mode` is `MBoxed` we fall back to
 # emitting boxed and unwrapping via `kaix_to_*` — the same boundary
 # tactic from `docs/unboxing-phase2-design.md` §3.
 fn llvm_emit_expr_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
@@ -3725,7 +1425,7 @@ fn llvm_emit_expr_boxed(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
     ERecordLit(nm, fis) -> llvm_emit_record_lit(e, nm, fis)
     EVar(nm) -> match llvm_local_find(e.locals, nm) {
       Some(reg) -> llvm_set_last(e, reg)
-      None -> match lvm_evar_find(e.vars_, nm) {
+      None -> match evar_find(e.vars_, nm) {
         Some(ar) -> if ar == 0 {
           llvm_emit_variant_ctor(e, nm, [])
         } else {
@@ -3789,7 +1489,7 @@ fn llvm_emit_expr_boxed(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
       let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
       let ty_seg = match x.ty {
         None    -> ""
-        Some(t) -> cat2(", expected ", lvm_ty_to_string(t))
+        Some(t) -> cat2(", expected ", ty_to_string(t))
       }
       let loc = concat_all([" at line ", int_to_string(x.line), " col ", int_to_string(x.col)])
       let msg = concat_all(["unfilled hole: ", label, loc, ty_seg])
@@ -3839,9 +1539,9 @@ fn llvm_emit_expr_boxed(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
     # variant ctor (`Option.None`, `Response.NotFound`) emit the
     # variant ctor value directly. Nullary ctors are emitted via
     # `llvm_emit_variant_ctor(e, fname, [])`; non-nullary ctors
-    # as values are not supported (matches the LvmEVar value-position
+    # as values are not supported (matches the EVar value-position
     # behaviour above).
-    EModCall(mod, fname) -> match lvm_evar_find(e.vars_, fname) {
+    EModCall(mod, fname) -> match evar_find(e.vars_, fname) {
       Some(ar) -> if ar == 0 {
         llvm_emit_variant_ctor(e, fname, [])
       } else {
@@ -4159,7 +1859,7 @@ fn llvm_emit_reuse_variant(e: LlvmEmit, scr_e: Expr,
 
   let n = list_length(xs)
   let r_scr = llvm_emit_expr(e, scr_e)
-  let tag = lvm_evar_find_tag(r_scr.vars_, cname)
+  let tag = evar_find_tag(r_scr.vars_, cname)
   let tag_str = int_to_string(tag)
   let name_label_id = llvm_fresh_label(r_scr, "var.")
   let name_label = name_label_id.reg
@@ -4262,7 +1962,7 @@ fn llvm_emit_fn_value(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit /
     }
     None -> match efn_resolve(e.fns, nm) {
       Some(EFn(_, arity, mo, _)) -> {
-        let thunk = concat_all(["@_kai_", lvm_c_sym(nm, mo), "_thunk"])
+        let thunk = concat_all(["@_kai_", c_sym(nm, mo), "_thunk"])
         llvm_build_closure(e, thunk, arity)
       }
       None -> llvm_closure_error(e, nm, line, col)
@@ -4293,7 +1993,7 @@ fn llvm_closure_error(e: LlvmEmit, nm: String, line: Int, col: Int) : LlvmEmit /
 fn llvm_emit_modcall_fn_value(e: LlvmEmit, mod: String, fname: String, line: Int, col: Int) : LlvmEmit / Console {
   match efn_resolve(e.fns, fname) {
     Some(EFn(_, arity, _, _)) -> {
-      let thunk = concat_all(["@_kai_", lvm_c_sym(fname, Some(mod)), "_thunk"])
+      let thunk = concat_all(["@_kai_", c_sym(fname, Some(mod)), "_thunk"])
       llvm_build_closure(e, thunk, arity)
     }
     None -> llvm_closure_error(e, fname, line, col)
@@ -4391,7 +2091,7 @@ fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : Ll
   # The effect-struct field uses `%KaiCont*` as the trailing param
   # type (see llvm_emit_op_fn_ptrs, line 15881). Both the load and
   # the call must use the matching type or strict LLVM IR verifiers
-  # (Apple clang on macos-14 LvmCI) reject the construction. The
+  # (Apple clang on macos-14 CI) reject the construction. The
   # continuation register itself is `i8*` (see `i8* %k` definition
   # in clause bodies), so cast it explicitly at the callsite.
   let fn_ptr_p_reg = llvm_fresh_reg(e6b)
@@ -4542,7 +2242,7 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
         # whose contents are the canonical unit symbol of the
         # arg's type (empty when the unit is unresolved or absent).
         match xs {
-          [a] -> llvm_emit_plain_str_body(e, lvm_unit_name_of_ty(a.ty))
+          [a] -> llvm_emit_plain_str_body(e, unit_name_of_ty(a.ty))
           _   -> llvm_set_last(e, "undef")
         }
       } else if nm == "resume" {
@@ -4602,7 +2302,7 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
         match lookup_op_offset(e.op_offsets, lookup_key) {
           Some(offset) -> llvm_emit_op_dispatch(e, lookup_key, offset, xs)
           None ->
-            match lvm_evar_find(e.vars_, nm) {
+            match evar_find(e.vars_, nm) {
               Some(_) -> llvm_emit_variant_ctor(e, nm, xs)
               None -> match llvm_local_find_loop(e.locals, nm) {
                 Some(reg) -> llvm_emit_apply(e, reg, xs)
@@ -4613,7 +2313,7 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
                   # (`@kai_<m>__<n>` for module-owned decls, plain
                   # `@kai_<n>` for root-file decls).
                   let sym = if llvm_is_prelude_fn(nm) { llvm_prelude_symbol(nm) }
-                            else { string_concat("@kai_", lvm_c_sym_of_callee(e.fns, nm)) }
+                            else { string_concat("@kai_", c_sym_of_callee(e.fns, nm)) }
                   let r = llvm_fresh_reg(ra.st)
                   let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
                                           llvm_format_args(ra.regs), ")\n"])
@@ -4635,9 +2335,9 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
       # context to `EModCall("Response", "Ok")`. Variant ctors lower
       # through `llvm_emit_variant_ctor` (kaix_variant), not as module
       # fn calls — variant tag dispatch keys on the bare ctor name at
-      # runtime. Detect by membership in the LvmEVar table and short-
+      # runtime. Detect by membership in the EVar table and short-
       # circuit before minting `@kai_<mod>__<fname>`.
-      match lvm_evar_find(e.vars_, fname) {
+      match evar_find(e.vars_, fname) {
         Some(_) -> llvm_emit_variant_ctor(e, fname, xs)
         None -> {
           let ra = llvm_emit_args(e, xs, [])
@@ -4653,8 +2353,8 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
           # `fname`, so we must emit the module's own symbol even when
           # `fname` collides with a prelude entry (e.g. `file.read_bytes`
           # vs. prelude `read_bytes`). The C backend never had this bug
-          # because its EModCall arm goes straight through `lvm_c_sym`.
-          let sym = string_concat("@kai_", lvm_c_sym(fname, Some(mod)))
+          # because its EModCall arm goes straight through `c_sym`.
+          let sym = string_concat("@kai_", c_sym(fname, Some(mod)))
           let r = llvm_fresh_reg(ra.st)
           let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
                                   llvm_format_args(ra.regs), ")\n"])
@@ -4710,7 +2410,7 @@ fn llvm_emit_apply(e: LlvmEmit, clo_reg: String, xs: [Expr]) : LlvmEmit / Consol
 fn llvm_emit_variant_ctor(e: LlvmEmit, cname: String, xs: [Expr]) : LlvmEmit / Console {
 
   let n = list_length(xs)
-  let tag = lvm_evar_find_tag(e.vars_, cname)
+  let tag = evar_find_tag(e.vars_, cname)
   let tag_str = int_to_string(tag)
   # Global string constant for the ctor name.
   let name_label_id = llvm_fresh_label(e, "var.")
@@ -4985,7 +2685,7 @@ type LlvmArm = { e: LlvmEmit, reg: String, from_label: String }
 # (op dispatch) and m7c-d (clauses + setjmp) land.
 # m7c-d — for each handler clause, GEP into the matching `%EvX`
 # field and store a function pointer to the clause's emitted
-# top-level LLVM function (named via `lvm_clause_fn_name`).
+# top-level LLVM function (named via `clause_fn_name`).
 # m7c-d — generate the LLVM IR body of `kai_main_install_defaults`
 # and `kai_main_teardown_defaults`. Each builtin in main's row
 # contributes a `kai_evidence_push(...)` (install) and a matching
@@ -5422,13 +3122,13 @@ fn llvm_emit_main_teardown_defaults(main_row: [String]) : String {
 }
 
 # m4c #4: install code in the LLVM backend mirrors the C path. Same
-# clause symbol minting via `lvm_clause_fn_name(enc_fn, ...)` keyed on the
-# matching `LvmClauseInfo`. The `cls` table comes in via a parameter
+# clause symbol minting via `clause_fn_name(enc_fn, ...)` keyed on the
+# matching `ClauseInfo`. The `cls` table comes in via a parameter
 # threaded from `emit_program_llvm` → `llvm_emit_decls_loop` → ... →
 # `llvm_emit_handle` so install lookup matches the body's emission.
 fn llvm_emit_handle_clause_assigns(e: LlvmEmit, ev_reg: String, eff_name: String,
                                     hline: Int, hcol: Int,
-                                    cs: [HClause], cls: [LvmClauseInfo]) : LlvmEmit {
+                                    cs: [HClause], cls: [ClauseInfo]) : LlvmEmit {
   match cs {
     [] -> e
     [c, ...rest] -> match c {
@@ -5437,15 +3137,15 @@ fn llvm_emit_handle_clause_assigns(e: LlvmEmit, ev_reg: String, eff_name: String
         match lookup_op_offset(e.op_offsets, key) {
           None -> llvm_emit_handle_clause_assigns(e, ev_reg, eff_name, hline, hcol, rest, cls)
           Some(offset) -> {
-            let op_args = lvm_op_args_only(params)
+            let op_args = op_args_only(params)
             let arg_ty_list = llvm_op_arg_kaivalue_list(list_length(op_args))
             let p_reg = llvm_fresh_reg(e)
-            let enc_fn = lvm_lookup_clause_enc_fn(cls, hline, hcol, op_name)
+            let enc_fn = lookup_clause_enc_fn(cls, hline, hcol, op_name)
             # The clause function is DEFINED with `i8* %k` trailing
             # (see llvm_emit_clause_body, line 14747), but the effect
             # struct field type uses `%KaiCont*` (see llvm_emit_op_fn_ptrs,
             # line 15881). Strict LLVM IR verifiers (e.g. Apple clang on
-            # macos-14 LvmCI runners) reject the implicit conversion; the
+            # macos-14 CI runners) reject the implicit conversion; the
             # default-shim path already uses an explicit `bitcast` for
             # the same reason. Mirror that pattern: bitcast the clause
             # fn pointer from the `i8*`-trailing definition type to the
@@ -5456,7 +3156,7 @@ fn llvm_emit_handle_clause_assigns(e: LlvmEmit, ev_reg: String, eff_name: String
               int_to_string(offset), "\n",
               "  store %KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", %KaiCont*)* ",
               "bitcast (%KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", i8*)* @",
-              lvm_clause_fn_name(enc_fn, hline, hcol, op_name),
+              clause_fn_name(enc_fn, hline, hcol, op_name),
               " to %KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", %KaiCont*)*)",
               ", %KaiValue* (%Ev", eff_name, "*", arg_ty_list, ", %KaiCont*)** ",
               p_reg.reg, "\n"
@@ -5597,9 +3297,9 @@ fn llvm_emit_block(e: LlvmEmit, stmts: [Stmt], tail: Option[Expr]) : LlvmEmit / 
   let outer_locals = e.locals
   # m5 #3 LLVM mirror — drops for unused let-bindings whose RHS is a
   # fresh allocation. Same per-block drop set the C-emitter computes
-  # in emit_expr's EBlock arm; reuses lvm_block_unused_lets unchanged so
+  # in emit_expr's EBlock arm; reuses block_unused_lets unchanged so
   # both backends agree on which bindings are droppable.
-  let drops = lvm_block_unused_lets(stmts, tail)
+  let drops = block_unused_lets(stmts, tail)
   let after = llvm_emit_stmts_with_drops(e, stmts, drops)
   let tailed = match tail {
     Some(te) -> llvm_emit_expr(after, te)
@@ -5624,7 +3324,7 @@ fn llvm_emit_stmts(e: LlvmEmit, stmts: [Stmt]) : LlvmEmit / Console {
 }
 
 # m5 #3 LLVM mirror — variant of llvm_emit_stmts that consults the
-# per-block drop set computed by lvm_block_unused_lets. SLet routes
+# per-block drop set computed by block_unused_lets. SLet routes
 # through llvm_emit_stmt_with_drops; other stmt forms delegate to
 # the original llvm_emit_stmt path.
 fn llvm_emit_stmts_with_drops(e: LlvmEmit, stmts: [Stmt], drops: [String]) : LlvmEmit / Console {
@@ -5846,13 +3546,13 @@ fn llvm_emit_list_tail(e: LlvmEmit, elems: [ListElem]) : LlvmEmit / Console {
 
 # ---- lambda expressions ----
 #
-# At the ELambda site we look up the LvmLamInfo by (line, col) and emit
+# At the ELambda site we look up the LamInfo by (line, col) and emit
 # a call to `kaix_closure` with the thunk's address, arity, and the
 # captured values currently in scope.
 fn llvm_emit_lambda_ref(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
-  match lvm_find_lam(e.lams, x.line, x.col) {
+  match find_lam(e.lams, x.line, x.col) {
     None -> {
-      # Issue #571: a missing LvmLamInfo at codegen used to emit `undef`
+      # Issue #571: a missing LamInfo at codegen used to emit `undef`
       # plus a stderr warning. The resulting binary referenced an
       # invalid closure pointer and crashed at runtime (`ldr x1, [x0]`
       # with x0==NULL) the moment the closure was invoked. The
@@ -5863,7 +3563,7 @@ fn llvm_emit_lambda_ref(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
       panic("kaic: internal error: llvm lambda info missing at #{int_to_string(x.line)}:#{int_to_string(x.col)} — please file an issue against kaikai")
     }
     Some(l) -> match l {
-      LvmLamInfo(id, _, _, params, caps, _) -> {
+      LamInfo(id, _, _, params, caps, _) -> {
         let arity = list_length(params)
         let n_caps = list_length(caps)
         let thunk_sym = concat_all(["@_kai_lam_", int_to_string(id)])
@@ -5901,7 +3601,7 @@ fn llvm_emit_lambda_ref(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
 
 # Fill the captures buffer with the current register binding for each
 # captured name. If a capture isn't in scope (shouldn't happen after
-# `lvm_fv_expr`), store a null to keep the IR well-formed.
+# `fv_expr`), store a null to keep the IR well-formed.
 fn llvm_emit_capture_stores(e: LlvmEmit, buf_reg: String, caps: [String], i: Int) : LlvmEmit {
   match caps {
     [] -> e
@@ -6014,7 +3714,7 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
       # constant-folds to a single i32 compare. Otherwise (synthetic
       # AST that escaped resolver registration) fall back to the
       # legacy strcmp-based `kaix_is_variant`.
-      let chk_res = match lvm_evar_find_tag_opt(e.vars_, cname) {
+      let chk_res = match evar_find_tag_opt(e.vars_, cname) {
         Some(t) -> {
           let chk = llvm_fresh_reg(e)
           let chk_i = concat_all([
@@ -6053,7 +3753,7 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
     PVariantRecord(cname, fields) -> {
       # Issue #688 — same tag-compare / strcmp-fallback shape as
       # PVariant above. See the comment there for the rationale.
-      let chk_res = match lvm_evar_find_tag_opt(e.vars_, cname) {
+      let chk_res = match evar_find_tag_opt(e.vars_, cname) {
         Some(t) -> {
           let chk = llvm_fresh_reg(e)
           let chk_i = concat_all([
@@ -6270,14 +3970,14 @@ fn llvm_emit_match(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : L
   # `switch` requires an integer operand; a Real scrutinee re-boxes
   # at the boundary and routes through the generic match path.
   # Issue #91 closed 2026-05-02: PBind catch-all is now in the
-  # fast path. `lvm_arms_all_literal_or_wild` accepts `PBind(name)`
-  # and `lvm_arms_pbind_safe_for_fast_path` filters bodies whose
+  # fast path. `arms_all_literal_or_wild` accepts `PBind(name)`
+  # and `arms_pbind_safe_for_fast_path` filters bodies whose
   # `name` reads cross an interp / lambda boundary. The default
-  # block pushes `LRaw(name, raw_reg, scr_ty)` so LvmEVar reads of
+  # block pushes `LRaw(name, raw_reg, scr_ty)` so EVar reads of
   # `name` inside the body resolve via `llvm_raw_local_find`.
   match scr.mode {
     MUnboxed -> {
-      if ty_is_integral_raw(scr.ty) and lvm_arms_all_literal_or_wild(arms) and lvm_arms_pbind_safe_for_fast_path(arms) {
+      if ty_is_integral_raw(scr.ty) and arms_all_literal_or_wild(arms) and arms_pbind_safe_for_fast_path(arms) {
         llvm_emit_match_switch(e, scr, arms, line, col)
       } else {
         llvm_emit_match_default(e, scr, arms, line, col)
@@ -6531,7 +4231,7 @@ fn llvm_emit_switch_case_bodies(e: LlvmEmit, cases: [SwCase], end_lbl: String,
 # fn — never for a closure body.
 fn llvm_emit_bang(e: LlvmEmit, inner: Expr) : LlvmEmit / Console {
 
-  let success = lvm_bang_success_variant(inner.ty)
+  let success = bang_success_variant(inner.ty)
   match success {
     None -> {
       # Should be unreachable — synth_bang rejects non-Option/Result
@@ -6558,7 +4258,7 @@ fn llvm_emit_bang(e: LlvmEmit, inner: Expr) : LlvmEmit / Console {
       # PVariant test path. `name` is always Some / Ok (the two `!`
       # discriminators) so the table lookup never misses in
       # well-typed code; the fallback is defensive.
-      let chk_res = match lvm_evar_find_tag_opt(ei.vars_, name) {
+      let chk_res = match evar_find_tag_opt(ei.vars_, name) {
         Some(t) -> {
           let chk = llvm_fresh_reg(ei)
           let chk_i = concat_all([
@@ -6614,9 +4314,9 @@ fn llvm_emit_bang(e: LlvmEmit, inner: Expr) : LlvmEmit / Console {
 # Emit an `_kai_<name>_thunk` that unpacks args from a `KaiValue**`
 # and forwards them to the user-defined `kai_<name>`. One per user
 # fn so its address can be taken when the fn is passed as a value.
-# m6.2 v2: `nm` here is already the lvm_c_sym suffix (`<name>` for
+# m6.2 v2: `nm` here is already the c_sym suffix (`<name>` for
 # root-file decls, `<m>__<name>` for module-owned decls); the
-# caller in llvm_emit_fn does the lvm_c_sym build before passing in.
+# caller in llvm_emit_fn does the c_sym build before passing in.
 fn llvm_emit_thunk(nm: String, arity: Int) : String {
   let thunk_sym = concat_all(["@_kai_", nm, "_thunk"])
   let target_sym = concat_all(["@kai_", nm])
@@ -6660,11 +4360,11 @@ fn llvm_thunk_call_args(i: Int, arity: Int, acc: String) : String {
 # through all decls.
 type LlvmDeclOut = { text: String, next_id: Int }
 
-fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [LvmEVar], lams: [LvmLamInfo], oo: [OpOffset], cls: [LvmClauseInfo], start_id: Int) : LlvmDeclOut / Console {
+fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], start_id: Int) : LlvmDeclOut / Console {
 
   match d {
     DFn(_, nm, _, ps, ret_ty_opt, _, body, _, _, mo) -> {
-      let csuffix = lvm_c_sym(nm, mo)
+      let csuffix = c_sym(nm, mo)
       let sym = if nm == "main" { "@kai_main" } else { string_concat("@kai_", csuffix) }
       let arity = list_length(ps)
       let thunk = llvm_emit_thunk(csuffix, arity)
@@ -6679,11 +4379,11 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [LvmEVar], lams: [LvmLamInfo], oo: [OpO
         # identifier. The kaikai-side wrapper symbol (`sym`) stays
         # the kaikai name — only the call target inside the shim
         # changes.
-        let c_sym_target = lvm_ffi_extern_symbol_of(body, nm)
+        let c_sym_target = ffi_extern_symbol_of(body, nm)
         let shim = llvm_emit_ffi_shim(sym, c_sym_target, ps, ret_ty_opt, start_id)
         LlvmDeclOut { text: concat_all([shim.text, thunk]), next_id: shim.next_id }
-      } else if lvm_body_is_proto_dispatch(body) {
-        let shim = llvm_emit_proto_dispatch_shim(sym, lvm_proto_dispatch_parts(body), ps, start_id)
+      } else if body_is_proto_dispatch(body) {
+        let shim = llvm_emit_proto_dispatch_shim(sym, proto_dispatch_parts(body), ps, start_id)
         LlvmDeclOut { text: concat_all([shim.text, thunk]), next_id: shim.next_id }
       } else {
       let locals0 = llvm_init_locals_from_params(ps)
@@ -6691,7 +4391,7 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [LvmEVar], lams: [LvmLamInfo], oo: [OpO
       # module come first. `efn_resolve`'s ambiguous fallback returns
       # the first match so a recursive call resolves to the local
       # module entry. Mirror of the C backend's emit_fn_body.
-      let body_fns = lvm_fns_prefer_module(fns, mo)
+      let body_fns = fns_prefer_module(fns, mo)
       let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
                           globals: "", body: "",
                           last_val: "", cur_label: "entry",
@@ -6733,7 +4433,7 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [LvmEVar], lams: [LvmLamInfo], oo: [OpO
 fn llvm_emit_ffi_shim(sym: String, name: String, params: [Param],
                        ret_ty_opt: Option[TypeExpr],
                        start_id: Int) : LlvmDeclOut {
-  let ret_kind = lvm_ffi_ret_kind_of(ret_ty_opt)
+  let ret_kind = ffi_ret_kind_of(ret_ty_opt)
   let extern_decl = concat_all([
     "declare ", llvm_ffi_ret_ty(ret_kind), " @", name,
     "(", llvm_ffi_param_list(params), ")\n"
@@ -6750,32 +4450,32 @@ fn llvm_emit_ffi_shim(sym: String, name: String, params: [Param],
   # reference.
   let arg_decrefs = llvm_ffi_param_decrefs(params, 0)
   let call_body = match ret_kind {
-    LvmFfiRetUnit -> concat_all([
+    FfiRetUnit -> concat_all([
       "  call void @", name, "(", arg_csv, ")\n",
       arg_decrefs,
       "  %_kai_ffi_ret = call %KaiValue* @kaix_unit()\n"
     ])
-    LvmFfiRetInt -> concat_all([
+    FfiRetInt -> concat_all([
       "  %_kai_ffi_raw = call i64 @", name, "(", arg_csv, ")\n",
       arg_decrefs,
       "  %_kai_ffi_ret = call %KaiValue* @kaix_int(i64 %_kai_ffi_raw)\n"
     ])
-    LvmFfiRetReal -> concat_all([
+    FfiRetReal -> concat_all([
       "  %_kai_ffi_raw = call double @", name, "(", arg_csv, ")\n",
       arg_decrefs,
       "  %_kai_ffi_ret = call %KaiValue* @kaix_real(double %_kai_ffi_raw)\n"
     ])
-    LvmFfiRetBool -> concat_all([
+    FfiRetBool -> concat_all([
       "  %_kai_ffi_raw = call i32 @", name, "(", arg_csv, ")\n",
       arg_decrefs,
       "  %_kai_ffi_ret = call %KaiValue* @kaix_bool(i32 %_kai_ffi_raw)\n"
     ])
-    LvmFfiRetString -> concat_all([
+    FfiRetString -> concat_all([
       "  %_kai_ffi_raw = call i8* @", name, "(", arg_csv, ")\n",
       arg_decrefs,
       "  %_kai_ffi_ret = call %KaiValue* @kaix_str(i8* %_kai_ffi_raw)\n"
     ])
-    LvmFfiRetUnknown(t) -> concat_all([
+    FfiRetUnknown(t) -> concat_all([
       "  ; FFI: unsupported return type `", t, "`\n",
       "  %_kai_ffi_ret = call %KaiValue* @kaix_unit()\n"
     ])
@@ -6792,14 +4492,14 @@ fn llvm_emit_ffi_shim(sym: String, name: String, params: [Param],
   LlvmDeclOut { text: text, next_id: unbox.next_id }
 }
 
-fn llvm_ffi_ret_ty(k: LvmFfiRetKind) : String {
+fn llvm_ffi_ret_ty(k: FfiRetKind) : String {
   match k {
-    LvmFfiRetUnit -> "void"
-    LvmFfiRetInt -> "i64"
-    LvmFfiRetReal -> "double"
-    LvmFfiRetBool -> "i32"
-    LvmFfiRetString -> "i8*"
-    LvmFfiRetUnknown(_) -> "void"
+    FfiRetUnit -> "void"
+    FfiRetInt -> "i64"
+    FfiRetReal -> "double"
+    FfiRetBool -> "i32"
+    FfiRetString -> "i8*"
+    FfiRetUnknown(_) -> "void"
   }
 }
 
@@ -6816,10 +4516,10 @@ fn llvm_ffi_ret_ty(k: LvmFfiRetKind) : String {
 # as the dispatch tag, which the impl-table never matches against
 # stdlib heads — those ops must be statically resolved via the
 # typer's return-position annotation pin.
-fn llvm_emit_proto_dispatch_shim(sym: String, parts: LvmProtoDispatchParts,
+fn llvm_emit_proto_dispatch_shim(sym: String, parts: ProtoDispatchParts,
                                   params: [Param], start_id: Int) : LlvmDeclOut {
   match parts {
-    LvmPDP(pname, opname) -> {
+    PDP(pname, opname) -> {
       let proto_id_val = llvm_stdlib_proto_id(pname)
       let arity = list_length(params)
       let fn_ty = llvm_proto_fn_ty(arity)
@@ -6927,19 +4627,19 @@ fn llvm_stdlib_proto_id(pname: String) : String {
 fn llvm_ffi_param_ty(p: Param) : String {
   match p.ptype {
     None -> "i8*"
-    Some(t) -> match lvm_ffi_kind_of_ty(t) {
-      LvmFfiRetInt -> "i64"
-      LvmFfiRetReal -> "double"
-      LvmFfiRetBool -> "i32"
-      LvmFfiRetString -> "i8*"
-      LvmFfiRetUnit -> "i8*"
-      LvmFfiRetUnknown(_) -> "i8*"
+    Some(t) -> match ffi_kind_of_ty(t) {
+      FfiRetInt -> "i64"
+      FfiRetReal -> "double"
+      FfiRetBool -> "i32"
+      FfiRetString -> "i8*"
+      FfiRetUnit -> "i8*"
+      FfiRetUnknown(_) -> "i8*"
     }
   }
 }
 
 fn llvm_ffi_param_list(params: [Param]) : String =
-  lvm_join_with(map(params, llvm_ffi_param_ty), ", ")
+  join_with(map(params, llvm_ffi_param_ty), ", ")
 
 fn llvm_ffi_arg_list(params: [Param], i: Int) : String {
   match params {
@@ -6971,26 +4671,26 @@ fn llvm_ffi_unbox_params(params: [Param], i: Int, next_id: Int) : FfiUnboxOut {
       let arg_name = concat_all(["%_kai_ffi_arg", int_to_string(i)])
       let kv = concat_all(["%p_", p.pname])
       let kind = match p.ptype {
-        None -> LvmFfiRetUnknown("missing")
-        Some(t) -> lvm_ffi_kind_of_ty(t)
+        None -> FfiRetUnknown("missing")
+        Some(t) -> ffi_kind_of_ty(t)
       }
       let stmt = match kind {
-        LvmFfiRetInt -> concat_all([
+        FfiRetInt -> concat_all([
           "  ", arg_name, " = call i64 @kaix_to_int(%KaiValue* ", kv, ")\n"
         ])
-        LvmFfiRetReal -> concat_all([
+        FfiRetReal -> concat_all([
           "  ", arg_name, " = call double @kaix_to_real(%KaiValue* ", kv, ")\n"
         ])
-        LvmFfiRetBool -> concat_all([
+        FfiRetBool -> concat_all([
           "  ", arg_name, " = call i32 @kaix_to_bool(%KaiValue* ", kv, ")\n"
         ])
-        LvmFfiRetString -> concat_all([
+        FfiRetString -> concat_all([
           "  ", arg_name, " = call i8* @kaix_to_str_data(%KaiValue* ", kv, ")\n"
         ])
-        LvmFfiRetUnit -> concat_all([
+        FfiRetUnit -> concat_all([
           "  ; FFI Unit param elided at index ", int_to_string(i), "\n"
         ])
-        LvmFfiRetUnknown(t) -> concat_all([
+        FfiRetUnknown(t) -> concat_all([
           "  ; FFI unsupported param type: ", t, "\n"
         ])
       }
@@ -7010,7 +4710,7 @@ fn llvm_ffi_param_decrefs(params: [Param], i: Int) : String {
   }
 }
 
-fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [LvmEVar], lams: [LvmLamInfo], oo: [OpOffset], cls: [LvmClauseInfo], start_id: Int, acc: String) : LlvmDeclOut / Console {
+fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : LlvmDeclOut / Console {
 
   match ds {
     [] -> LlvmDeclOut { text: acc, next_id: start_id }
@@ -7026,10 +4726,10 @@ fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [LvmEVar], lams: [LvmLamInfo
 # has thunk signature `(self, args, n)` — args[i] reads the i-th
 # param, `kaix_capture(self, i)` reads the i-th captured local. The
 # body is then emitted under an env that pushes both as named regs.
-fn llvm_emit_lambda_body(l: LvmLamInfo, fns: [EFn], vs: [LvmEVar], lams: [LvmLamInfo], oo: [OpOffset], cls: [LvmClauseInfo], start_id: Int) : LlvmDeclOut / Console {
+fn llvm_emit_lambda_body(l: LamInfo, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], start_id: Int) : LlvmDeclOut / Console {
 
   match l {
-    LvmLamInfo(id, _, _, params, caps, body) -> {
+    LamInfo(id, _, _, params, caps, body) -> {
       let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
                           globals: "", body: "",
                           last_val: "", cur_label: "entry",
@@ -7091,17 +4791,17 @@ fn llvm_emit_lambda_capture_loads(e: LlvmEmit, caps: [String], i: Int) : LlvmEmi
 
 # Issue #571: walks `remaining` while passing the FULL `all_lams`
 # table down to each `llvm_emit_lambda_body` call. The earlier shape
-# reused the same parameter for both, so the LvmLamInfo for an inner
+# reused the same parameter for both, so the LamInfo for an inner
 # nested lambda was dropped from the table by the time its enclosing
-# lambda's body was emitted; `lvm_find_lam` then failed at the inner
+# lambda's body was emitted; `find_lam` then failed at the inner
 # `ELambda` use site and the emitter substituted `undef` for the
 # closure pointer (visible as the "lambda info missing" stderr line).
-fn llvm_emit_lambda_bodies(lams: [LvmLamInfo], fns: [EFn], vs: [LvmEVar], oo: [OpOffset], cls: [LvmClauseInfo], start_id: Int, acc: String) : String / Console {
+fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : String / Console {
 
   llvm_emit_lambda_bodies_loop(lams, lams, fns, vs, oo, cls, start_id, acc)
 }
 
-fn llvm_emit_lambda_bodies_loop(remaining: [LvmLamInfo], all_lams: [LvmLamInfo], fns: [EFn], vs: [LvmEVar], oo: [OpOffset], cls: [LvmClauseInfo], start_id: Int, acc: String) : String / Console {
+fn llvm_emit_lambda_bodies_loop(remaining: [LamInfo], all_lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : String / Console {
 
   match remaining {
     [] -> acc
@@ -7112,20 +4812,20 @@ fn llvm_emit_lambda_bodies_loop(remaining: [LvmLamInfo], all_lams: [LvmLamInfo],
   }
 }
 
-fn llvm_build_globals_names(fns: [EFn], vs: [LvmEVar], eff_names: [String], op_quals: [String]) : [String] = lvm_build_globals(fns, vs, eff_names, op_quals)
+fn llvm_build_globals_names(fns: [EFn], vs: [EVar], eff_names: [String], op_quals: [String]) : [String] = build_globals(fns, vs, eff_names, op_quals)
 
 #[doc("Entry point: lower a parsed+resolved [Decl] program to textual LLVM IR linking against stage0/runtime_llvm.c. The driver calls this when KAI_BACKEND=llvm; the default selfhost path stays on the C emitter.")]
 pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String / Console {
 
-  let alias_resolved = lvm_rewrite_alias_decls(raw_decls)
+  let alias_resolved = rewrite_alias_decls(raw_decls)
   let decls = alias_resolved
   let fns = register_fn_decls(decls)
-  let vs = lvm_register_variants(decls)
+  let vs = register_variants(decls)
   let eff_names = collect_effect_names(decls)
-  let op_quals = lvm_collect_op_qualified_names(decls)
+  let op_quals = collect_op_qualified_names(decls)
   let globals = llvm_build_globals_names(fns, vs, eff_names, op_quals)
-  let st0 = lvm_lc_new(globals)
-  let lc = lvm_collect_decls(decls, st0)
+  let st0 = lc_new(globals)
+  let lc = collect_decls(decls, st0)
   let lams = lc.lams
   # m7c-a: emit `%EvX` struct declarations for every effect in
   # the program (user-declared + the builtins inject_builtin_effects
@@ -7139,7 +4839,7 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String 
   # First three fields are handler_id / env / state, so op N is at
   # field 3 + N (in declaration order).
   let oo = compute_op_offsets(decls)
-  # m4c #4: thread `clauses_info` (the side table built by lvm_collect_decls)
+  # m4c #4: thread `clauses_info` (the side table built by collect_decls)
   # through every emit step so install code in `llvm_emit_handle` can
   # mint the same prefixed clause symbols that the bodies emit.
   let cls = lc.clauses
@@ -7159,7 +4859,7 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String 
   # builtins the functions are no-ops.
   # Issue #308: same shadowing filter as the C backend — see
   # lvm_row_effects_without_default_handler.
-  let main_row = lvm_row_effects_without_default_handler(lvm_main_row_labels(decls), decls)
+  let main_row = lvm_row_effects_without_default_handler(main_row_labels(decls), decls)
   let install = llvm_emit_main_install_defaults(main_row)
   let teardown = llvm_emit_main_teardown_defaults(main_row)
   let proto_init = llvm_emit_proto_init(decls, vs)
@@ -7173,9 +4873,9 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String 
 # Each impl-table entry becomes one `call void @kaix_register_one_impl
 # (i32 proto_id, i32 head_tag, i8* fn_ptr)`; each variant becomes one
 # `call void @kaix_register_one_variant_head(i32 variant_tag, i32 head_tag)`.
-fn llvm_emit_proto_init(decls: [Decl], variants: [LvmEVar]) : String {
-  let impl_rows = lvm_collect_pimpl_rows(decls, [])
-  let v2h       = lvm_collect_variant_to_head(variants, decls)
+fn llvm_emit_proto_init(decls: [Decl], variants: [EVar]) : String {
+  let impl_rows = collect_pimpl_rows(decls, [])
+  let v2h       = collect_variant_to_head(variants, decls)
   let impl_calls   = llvm_emit_impl_register_calls(impl_rows, 0, "")
   let variant_calls = llvm_emit_variant_register_calls(v2h, 0, "")
   let fn_declares  = llvm_emit_pimpl_extern_declares(impl_rows, [], "")
@@ -7198,10 +4898,10 @@ fn llvm_emit_proto_init(decls: [Decl], variants: [LvmEVar]) : String {
 # For each pimpl row, emit one register call. Skips entries whose
 # head_tag is -1 (user/unknown types) since the runtime hashmap would
 # never match them anyway.
-fn llvm_emit_impl_register_calls(rows: [LvmPimplRow], i: Int, acc: String) : String {
+fn llvm_emit_impl_register_calls(rows: [PimplRow], i: Int, acc: String) : String {
   match rows {
     [] -> acc
-    [LvmPR(csym, p, t, arity), ...rest] -> {
+    [PR(csym, p, t, arity), ...rest] -> {
       let head_int = stdlib_head_tag_int(t)
       let proto_int = llvm_stdlib_proto_id(p)
       if head_int < 0 {
@@ -7216,7 +4916,7 @@ fn llvm_emit_impl_register_calls(rows: [LvmPimplRow], i: Int, acc: String) : Str
         # heterogeneous operator-overload impls like
         # `__pimpl_Add_Real_add__a_Complex` are arity 2 and clang's
         # LLVM verifier rejects the type mismatch at link time. The
-        # arity is threaded from `lvm_collect_pimpl_rows` which reads
+        # arity is threaded from `collect_pimpl_rows` which reads
         # `length(params)` on the original DFn.
         let fn_ty = llvm_proto_fn_ty(arity)
         let fn_ptr = concat_all(["bitcast (", fn_ty, " @kai_", csym, " to i8*)"])
@@ -7248,10 +4948,10 @@ fn llvm_emit_variant_register_calls(v2h: [Int], i: Int, acc: String) : String {
 # Emit forward `declare`s for each `__pimpl_*` we bitcast above.
 # These names are already defined in the same module so the declare
 # acts only as a no-op type assertion.
-fn llvm_emit_pimpl_extern_declares(rows: [LvmPimplRow], seen: [String], acc: String) : String {
+fn llvm_emit_pimpl_extern_declares(rows: [PimplRow], seen: [String], acc: String) : String {
   match rows {
     [] -> acc
-    [LvmPR(csym, _, t, _), ...rest] -> {
+    [PR(csym, _, t, _), ...rest] -> {
       let head_int = stdlib_head_tag_int(t)
       if head_int < 0 or list_has(seen, csym) {
         llvm_emit_pimpl_extern_declares(rest, seen, acc)
