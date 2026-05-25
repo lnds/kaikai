@@ -1,0 +1,138 @@
+# compiler/emit_c.kai unit tests — per-module tests for the C backend
+# (+ TCO pre-pass) extracted under issue #677 Phase 1r.
+#
+# emit_c owns `emit_program` (the C emitter that produces the bootstrap
+# C), `tcrec_rewrite_decls` (the tail-call rewrite pre-pass), the
+# `--dump-*` queries, the pre-emit alias/index/interp passes, the
+# ambiguous-EFn reporter, and the `BuildMode` wrapper-selection type.
+# Coverage drives `emit_program` end-to-end through the real parser so
+# the private emit walk (forward decls, thunks, expression lowering, the
+# `int main` scaffolding) is exercised transitively — the same surface
+# every selfhost rides.
+#
+# Coverage:
+#   - emit_program: emits non-empty C for a trivial fn, and the output
+#     contains the runtime.h include the C backend always prepends.
+#   - tcrec_rewrite_decls: identity-shaped on a non-recursive program
+#     (decl count preserved); a self-recursive tail fn still round-trips
+#     its decl count (the rewrite never adds or drops top-level decls).
+#   - BuildMode: each wrapper-selection variant is constructible and
+#     distinguishable by match. (The cmt_ downward-glue mirrors are
+#     private to emit_c; their coverage rides emit_program transitively.)
+#
+# Property checks (body Bool, NOT assert — `kai check` reports a
+# counterexample per input; Int generators per the phase-1n String-
+# generator caveat): tcrec_rewrite_decls preserves the decl count of an
+# all-constant program, and emit_program always emits a non-empty string
+# for a single-constant module.
+#
+# Runner: `kai test stage2/.`. Property checks: `kai check`.
+
+import compiler.lex
+import compiler.ast
+import compiler.parse
+import compiler.emit_shared
+import compiler.emit_c
+
+# ---- helpers ----
+
+fn parse_decls(src: String) : [Decl] / Console {
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    Some(ds) -> ds
+    None     -> []
+  }
+}
+
+# find_substring returns string_length(hay) when the needle is absent,
+# so "present" means the index lands strictly before the end.
+fn string_has(hay: String, needle: String) : Bool =
+  find_substring(hay, needle, 0) < string_length(hay)
+
+# A single-constant module whose decl count is predictable.
+fn const_src(n: Int) : String =
+  concat_all(["fn answer() : Int = ", int_to_string(n), "\n"])
+
+fn is_bm_test(b: BuildMode) : Bool = match b {
+  BMTest -> true
+  _      -> false
+}
+
+# ==================================================================
+# Unit tests — emit_program end-to-end
+# ==================================================================
+
+test "emit_program emits non-empty C for a trivial fn" {
+  let src = "fn answer() : Int = 42\n"
+  let out = emit_program("<test>", src, parse_decls(src), BMBuild, None)
+  assert string_length(out) > 0
+}
+
+test "emit_program output includes the runtime.h include" {
+  let src = "fn answer() : Int = 42\n"
+  let out = emit_program("<test>", src, parse_decls(src), BMBuild, None)
+  assert string_has(out, "runtime.h")
+}
+
+test "emit_program emits an int main scaffold" {
+  let src = "fn main() : Int = 0\n"
+  let out = emit_program("<test>", src, parse_decls(src), BMBuild, None)
+  assert string_has(out, "main")
+}
+
+# ==================================================================
+# Unit tests — tcrec_rewrite_decls preserves the decl stream
+# ==================================================================
+
+test "tcrec_rewrite_decls preserves a non-recursive decl count" {
+  let ds = parse_decls("fn a() : Int = 1\nfn b() : Int = 2\n")
+  assert list_length(tcrec_rewrite_decls(ds)) == list_length(ds)
+}
+
+test "tcrec_rewrite_decls preserves a self-recursive decl count" {
+  let ds = parse_decls("fn loop(n: Int) : Int = if n == 0 { 0 } else { loop(n - 1) }\n")
+  assert list_length(tcrec_rewrite_decls(ds)) == list_length(ds)
+}
+
+# ==================================================================
+# Unit tests — BuildMode is constructible + distinguishable
+# ==================================================================
+
+test "BuildMode BMTest is distinguishable from BMBuild" {
+  assert is_bm_test(BMTest)
+  assert is_bm_test(BMBuild) == false
+}
+
+fn bm_label(b: BuildMode) : String = match b {
+  BMBuild -> "build"
+  BMTest  -> "test"
+  BMBench -> "bench"
+  BMCheck -> "check"
+}
+
+test "BuildMode variants all match their own arm" {
+  assert bm_label(BMBench) == "bench"
+  assert bm_label(BMCheck) == "check"
+}
+
+# (The cmt_ downward-glue mirrors are private to emit_c; their coverage
+# rides emit_program transitively in the end-to-end tests above.)
+
+# ==================================================================
+# Property checks (body Bool, NOT assert) — Int generators only.
+# ==================================================================
+
+# tcrec_rewrite_decls never adds or drops top-level decls; for a single
+# constant fn the count stays 1 regardless of the constant value.
+check "tcrec_rewrite_decls keeps a one-decl module at one decl"
+  with n: Int {
+  list_length(tcrec_rewrite_decls(parse_decls(const_src(n)))) == 1
+}
+
+# emit_program always produces a non-empty C string for a single
+# constant module, whatever the constant value.
+check "emit_program is non-empty for any single-constant module"
+  with n: Int {
+  let src = const_src(n)
+  string_length(emit_program("<test>", src, parse_decls(src), BMBuild, None)) > 0
+}
