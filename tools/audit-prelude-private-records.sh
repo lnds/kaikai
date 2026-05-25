@@ -17,6 +17,9 @@
 #
 # Wired into top-level `Makefile` as `test-private-record-shadow-audit`,
 # part of the tier-1 chain.
+#
+# Parallelism (lane tier1-perf): see audit-prelude-private-types.sh —
+# same discover-then-fan-out structure. KAI_TEST_JOBS=1 → serial.
 
 set -euo pipefail
 
@@ -29,39 +32,18 @@ if [ ! -x "$KAI" ]; then
   exit 2
 fi
 
-tmp=$(mktemp -d)
-trap "rm -rf $tmp" EXIT INT TERM
+# probe_one: synthesize + compile the record redeclaration for one
+# private type name. Prints exactly one of PASS / SKIP / FAIL ....
+probe_one() {
+  tmp="$1"
+  tname="$2"
+  f="$3"
 
-fail=0
-pass=0
-skip=0
+  case "$tname" in
+    Cont) echo "SKIP"; return ;;
+  esac
 
-# Iterate every `.kai` file under stdlib/. The grep picks
-# `^type <Name>` lines followed by `{` (record body); `^pub type`
-# is intentionally NOT matched (those are caught earlier by
-# `validate_type_name_collisions_decls`).
-while IFS= read -r -d '' f; do
-  while IFS= read -r line; do
-    tname="$(echo "$line" | sed -E 's/^type[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/')"
-    if [ -z "$tname" ] || ! [[ "$tname" =~ ^[A-Z] ]]; then
-      continue
-    fi
-
-    # Skip reserved builtin type names — the typer rejects user
-    # redeclarations of these on a different code path.
-    case "$tname" in
-      Cont) skip=$((skip + 1)); continue ;;
-    esac
-
-    # Synthesize a minimal user program that redeclares `tname` as
-    # a record with two distinct fields the prelude's declaration
-    # does not use (`user_field_a_<tname>`, `user_field_b_<tname>`).
-    # The field-set tie-breaker (`rec_find_with_field`, issue #648)
-    # is the load-bearing mechanism: the user's `t.user_field_a_*`
-    # access must resolve to the user's record, and the prelude's
-    # own accesses to its private fields must keep resolving to
-    # the prelude's record. If either side flips, the audit fails.
-    cat > "$tmp/test_${tname}.kai" <<EOF
+  cat > "$tmp/test_${tname}.kai" <<EOF
 type ${tname} = { user_field_a_${tname}: Int, user_field_b_${tname}: String }
 
 fn make_${tname}(a: Int, b: String) : ${tname} =
@@ -80,17 +62,58 @@ fn main() : Unit / Stdout = {
 }
 EOF
 
-    if "$KAI" build "$tmp/test_${tname}.kai" -o "$tmp/test_${tname}.bin" \
-        > "$tmp/test_${tname}.log" 2>&1; then
-      pass=$((pass + 1))
-    else
-      echo "FAIL: redeclaring private record '${tname}' (from ${f}) is rejected" >&2
-      sed 's/^/  /' "$tmp/test_${tname}.log" >&2
-      fail=$((fail + 1))
+  if "$KAI" build "$tmp/test_${tname}.kai" -o "$tmp/test_${tname}.bin" \
+      > "$tmp/test_${tname}.log" 2>&1; then
+    echo "PASS"
+  else
+    echo "FAIL: redeclaring private record '${tname}' (from ${f}) is rejected"
+    sed 's/^/  /' "$tmp/test_${tname}.log"
+  fi
+}
+
+# ---- worker mode -----------------------------------------------------
+if [ "${1:-}" = "__probe" ]; then
+  probe_one "$2" "$3" "$4"
+  exit 0
+fi
+
+# ---- orchestrator ----------------------------------------------------
+tmp=$(mktemp -d)
+trap "rm -rf $tmp" EXIT INT TERM
+
+JOBS="${KAI_TEST_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}"
+self="$ROOT/tools/audit-prelude-private-records.sh"
+
+# Phase 1 (serial): discover candidates — `^type <Name> = {` lines
+# (private record decls); `^pub type` intentionally NOT matched.
+worklist="$tmp/worklist"
+: > "$worklist"
+while IFS= read -r -d '' f; do
+  while IFS= read -r line; do
+    tname="$(echo "$line" | sed -E 's/^type[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/')"
+    if [ -z "$tname" ] || ! [[ "$tname" =~ ^[A-Z] ]]; then
+      continue
     fi
-  done < <(grep -aE '^type [A-Z][A-Za-z0-9_]* = \{' "$f" | grep -v '^pub ')
+    printf '%s\t%s\n' "$tname" "$f" >> "$worklist"
+  done < <(grep -aE '^type [A-Z][A-Za-z0-9_]* = \{' "$f" | grep -v '^pub ' || true)
 done < <(find stdlib -name '*.kai' -print0)
 
-echo "audit-prelude-private-records: pass=$pass fail=$fail skip=$skip"
+results="$tmp/results"
+if [ -s "$worklist" ]; then
+  while IFS="$(printf '\t')" read -r tname f; do
+    printf '%s\0%s\0' "$tname" "$f"
+  done < "$worklist" \
+    | xargs -0 -P "$JOBS" -n2 "$self" __probe "$tmp" \
+    > "$results"
+else
+  : > "$results"
+fi
 
+grep -E '^FAIL|^  ' "$results" >&2 || true
+
+pass=$(grep -c '^PASS$' "$results" 2>/dev/null || true)
+skip=$(grep -c '^SKIP$' "$results" 2>/dev/null || true)
+fail=$(grep -c '^FAIL' "$results" 2>/dev/null || true)
+
+echo "audit-prelude-private-records: pass=$pass fail=$fail skip=$skip"
 [ "$fail" -eq 0 ]
