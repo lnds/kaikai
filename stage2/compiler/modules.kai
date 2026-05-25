@@ -1,0 +1,2684 @@
+# compiler/modules.kai — kaikai module system: qualified-call/type
+# rewriters, import-hole symbol-index resolver, and pub enforcement.
+#
+# Extracted from main.kai under issue #677 Phase 1l — the first of the
+# "vertical pipeline" extractions, after the 11 leaf modules (util /
+# chars / diag / lex / ast / intervals / refinements / parse / resolve /
+# fmt / cache). The cross-section analysis is in
+# docs/lane-modules-cross-section-analysis.md and the retro in
+# docs/lane-experience-issue-677-phase1l.md.
+#
+# The cut, in one sentence
+#
+# The *import-load orchestrator* (`expand_imports` / `process_imports` /
+# `resolve_module` + the `ResolveState` it threads) STAYS in main.kai
+# because it calls UPWARD into the typer (`validate_module_same_module_
+# collisions`), the lowering layer (`tag_decls_module_origin` ->
+# `lower_axiom_one` / `lower_const_one`) and lexer reporting
+# (`report_errors`) — those are pipeline-orchestration concerns, the
+# "driver disguised". Everything the orchestrator *computes over* —
+# file resolution, the module table type, the qualified rewriters, the
+# import-hole index, pub enforcement — sits BELOW the driver and moves
+# here. main.kai keeps a downward-only import: it calls into this
+# module, this module never calls back.
+#
+# What this module owns
+#
+# - File resolution: `find_module_file` / `module_to_path` /
+#   `dots_to_slashes` / `try_candidate*` / `CandidateFile` / `dir_of` /
+#   `last_slash` — pure path mechanics + on-disk lookup (File effect),
+#   no upward calls. The orchestrator in main.kai calls
+#   `find_module_file`; the import-hole pass calls it too.
+# - `ModuleEntry` (the per-import module-table entry, constructor `ME`)
+#   and its accessors (`me_has_export` / `me_lookup_export` /
+#   `mt_lookup` / `me_export_is_unstable` / `name_starts_upper`). This
+#   type is consumed widely by the typer and emitter in main.kai (the
+#   module table is threaded through inference and codegen), so it is
+#   `pub` here and resolves through `import compiler.modules`. It is a
+#   candidate to promote into compiler.ast in a future lane (it is more
+#   "shared AST-adjacent type" than "module-system internal"); kept here
+#   for now to keep this lane's blast radius to a single new file.
+# - Qualified-call rewrite (m6.2 Phase 2.3): EField(EVar(mod), name) ->
+#   EModCall(mod, name, ...) once the module table proves `mod` is an
+#   imported module — `rqc_decls` / `rqc_expr` and the `rqc_*` walkers.
+# - Qualified-type rewrite (issue #232): `mod.Type` heads in signatures
+#   rewritten + validated against the module table — `qualtype_decls` /
+#   `qtchk_decls` and the `qualtype_*` / `qtchk_*` walkers.
+# - `#[unstable]` export checking — `unstable_check_decls` + walkers.
+# - Import-hole symbol-index resolver (m7f §7): `import ?name` is a
+#   diagnostic-only form that suggests stdlib/explicit modules exporting
+#   a wanted symbol — `report_import_holes` / `strip_import_holes`.
+# - Pub enforcement (issue #510): cross-module bare-name access to a
+#   non-`pub` declaration is an error — `validate_pub_access`, the
+#   `vpa_*` signature/expr walkers, the `pae_*` access-table decision
+#   helpers, and the `HomeAnchor` / home-hint machinery that tracks
+#   which surface module each decl was authored in.
+#
+# Two AST-generic helpers ride along because the rewriters use them but
+# they are NOT module-system concepts: `pat_binders` (pattern binder
+# names) and `fn_param_names` (parameter names). The typer/desugar in
+# main.kai also call them, so they are `pub`. Future lane should
+# promote both to compiler.ast or compiler.util.
+#
+# Public surface (24 symbols + the `ME` / `CF` constructors exported
+# with `ModuleEntry` / `CandidateFile`): the file-resolution +
+# module-table types the orchestrator (in main.kai) needs downward
+# (`ModuleEntry`, `CandidateFile`, `dir_of`, `find_module_file`,
+# `last_slash`), the pass entry points the driver invokes
+# (`qualtype_decls`, `qtchk_decls`, `rqc_decls`, `unstable_check_decls`,
+# `report_import_holes`, `strip_import_holes`, `validate_pub_access`),
+# the home/access helpers the typer + emitter consume
+# (`collect_module_origins`, `decl_home_hint_reset`, `HomeAnchor`,
+# `ha_home`, `impl_first_fn_home`, `imports_home_anchors`, `pae_take`,
+# `pae_drop`, `PreludeSegment`), and the AST-generic helpers
+# (`pat_binders`, `fn_param_names`, `rqc_expr`).
+#
+# `PreludeSegment` (issue #510) moved here from the driver layer: it is
+# the per-prelude-file `(mod_name, decls)` split that `validate_pub_
+# access` consumes; the driver constructs `PSeg` values and threads
+# them downward. `join_with` / `diag_warning` are mirrored locally as
+# `mods_join_with` / `mods_diag_warning` (see below) rather than
+# imported upward from main.
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.lex
+import compiler.parse
+
+# ====================================================================
+# Local mirrors of two trivial main.kai helpers (downward-glue rule)
+# ====================================================================
+#
+# The rewriters + pub-enforcement passes below call two one-liner
+# helpers that live in main.kai. Rather than `pub`-export them from
+# main and have this module import upward (which would invert the
+# dependency arrow — modules sits BELOW main, not beside it), we mirror
+# them locally. Both depend only on already-imported symbols
+# (`emit_source_caret` from compiler.diag, `string_join` / `eprint` /
+# `int_to_string` from the prelude), so the mirror is exact and carries
+# no further coupling. main.kai keeps its own copies for its own use.
+
+# Mirror of main.kai's `diag_warning`: emit a warning with a source
+# caret. Used by the qualified-type rewriter to flag deprecated /
+# unstable references without failing the build. Prefixed `mods_` so
+# the flat bundle does not mint a duplicate `kai_diag_warning` C symbol
+# against main.kai's own copy (`join_with` / `diag_warning` are ubiqu
+# helpers main keeps for its emitter + typer).
+fn mods_diag_warning(file: String, line: Int, col: Int, msg: String) : Unit / Console + File {
+  eprint("warning: #{msg}")
+  eprint("  --> #{file}:#{int_to_string(line)}:#{int_to_string(col)}")
+  emit_source_caret(file, line, col)
+}
+
+# Mirror of main.kai's `join_with`: comma/arrow-style joins for
+# "available exports" diagnostic lists. Prefixed `mods_` for the same
+# duplicate-symbol reason as `mods_diag_warning`.
+fn mods_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
+
+# module resolution (M6.1 — simple concat semantics)
+# ====================================================================
+#
+# First cut of the import system. `import a.b.c` maps to loading
+# `<dir-of-current-file>/a/b/c.kai` and concatenating its decls into
+# the program. No namespacing, no aliases, no selective imports (the
+# parser accepts them but this pass treats them as plain imports).
+# Topological order via post-order DFS: an import's decls land in
+# the flat list *before* the decls of the file that imported it, so
+# the rest of the pipeline (name resolution, HM, emit) sees a single
+# linear decl stream.
+#
+# Cycles are handled by a visited-set: re-imports are skipped, not
+# reported. A → B → A still works — the second visit to A is a
+# no-op.
+
+# m6.2: ModuleEntry records the surface name a user wrote on an
+# `import` line, the public names that file exports, and the
+# absolute path the file was loaded from. The resolver collects one
+# per import in expand_imports; later passes (Phase 2.3 onward) use
+# the table to disambiguate `mod.fn` qualified calls from
+# record-field projections.
+#
+# `name` is the surface form: the last segment of `IkPath("a.b.c")`
+# (=> `c`), the alias from `IkAlias`, or the last segment of
+# `IkSelective`. `exports` is the list of pub fn / pub type / pub
+# effect / pub protocol names declared in the imported file's
+# top-level (non-import) decls. Selective imports do NOT pre-filter
+# this list — concat semantics (M6.1) still bring every public decl
+# into the unqualified scope, so the qualified surface mirrors that
+# for now. Phase 2.3 / m6.2.v2 may revisit.
+pub type ModuleEntry = ME(String, [String], String, [String])
+
+# `last_segment` already exists (line 6253) and is used by
+# register_import. We reuse it here unchanged.
+
+# Directory portion of a path. "a/b/c.kai" -> "a/b". If no slash,
+# returns "." (current dir).
+pub fn dir_of(path: String) : String {
+  let i = last_slash(path, string_length(path) - 1)
+  if i < 0 { "." }
+  else { string_slice(path, 0, i) }
+}
+
+pub fn last_slash(s: String, i: Int) : Int {
+  if i < 0 { -1 }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '/' { i } else { last_slash(s, i - 1) }
+      None -> -1
+    }
+  }
+}
+
+# Map a dotted module path to a filesystem path relative to base_dir.
+# "a.b.c" + "stage2" -> "stage2/a/b/c.kai".
+fn module_to_path(base_dir: String, mod: String) : String {
+  let rel = string_concat(dots_to_slashes(mod), ".kai")
+  if base_dir == "." { rel }
+  else { concat_all([base_dir, "/", rel]) }
+}
+
+fn dots_to_slashes(s: String) : String = dots_to_slashes_loop(s, 0, string_length(s), "")
+
+fn dots_to_slashes_loop(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      Some(c) -> {
+        let piece = if c == '.' { "/" } else { "#{c}" }
+        dots_to_slashes_loop(s, i + 1, n, string_concat(acc, piece))
+      }
+      None -> acc
+    }
+  }
+}
+
+# Dotted module paths (`math.arith`) are resolved in order:
+#   1. relative to the root file's directory (`base_dir`), then
+#   2. each directory given via `--path`, in the order passed.
+# The first candidate that exists wins. If none do, the caller
+# reports the original `base_dir` path so the error message points
+# to the most obvious location.
+pub type CandidateFile = CF(String, Option[String])
+#                      path    source (if read succeeded)
+
+fn try_candidate(abs_path: String) : Option[String] / File {
+  match read_file(abs_path) {
+    Err(_)  -> None
+    Ok(src) -> Some(src)
+  }
+}
+
+fn try_candidates_loop(mod_path: String, dirs: [String], first_tried: String) : CandidateFile / File {
+
+  match dirs {
+    [] -> CF(first_tried, None)
+    [d, ...rest] -> {
+      let p = module_to_path(d, mod_path)
+      match try_candidate(p) {
+        Some(src) -> CF(p, Some(src))
+        None      -> try_candidates_loop(mod_path, rest, first_tried)
+      }
+    }
+  }
+}
+
+pub fn find_module_file(base_dir: String, mod_path: String, search_paths: [String]) : CandidateFile / File {
+
+  let first_try = module_to_path(base_dir, mod_path)
+  match try_candidate(first_try) {
+    Some(src) -> CF(first_try, Some(src))
+    None      -> try_candidates_loop(mod_path, search_paths, first_try)
+  }
+}
+
+# m6.2: `import_name` is the surface binding the importing file
+# uses to refer to this module — last segment of `IkPath` /
+# `IkSelective`, or the alias from `IkAlias`. The resolver records
+# a ModuleEntry under this name once the file has been parsed
+# successfully (skipped when the file is missing or has lex/parse
+# errors — the M6.1 fallback diagnostic still fires).
+#
+# When `import_name` is `""`, the caller is asking for plain M6.1
+# behaviour without registering a module entry — used by paths that
+# load files for other reasons (none in v1, but the parameter
+# leaves the door open).
+# Issue #538 shape 1: format the cycle chain for the diagnostic.
+# `in_progress` is head=deepest, tail=root; the target is the path
+# that the cycle re-entered. The chain we print walks root→deepest
+# (reverse of in_progress) and closes with the target appended once
+# more, so a chain a→b→a reads as `a.kai → b.kai → a.kai`.
+fn format_cycle_chain(in_progress: [String], target: String) : String {
+  let walked = list_reverse(in_progress)
+  let closed = list_append(walked, [target])
+  join_with_arrow(closed, "")
+}
+
+fn join_with_arrow(xs: [String], acc: String) : String {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> {
+      let sep = if acc == "" { "" } else { " -> " }
+      join_with_arrow(rest, concat_all([acc, sep, x]))
+    }
+  }
+}
+
+# ====================================================================
+# m6.2 Phase 2.3 — qualified call rewrite (EField → EModCall)
+# ====================================================================
+#
+# After expand_imports populates the module table, this pass walks
+# every Decl body and rewrites every `EField(EVar(mod), fn)` into
+# `EModCall(mod, fn)` when **rule B** holds:
+#
+#   1. `mod` is not bound as a local in the surrounding lexical
+#      scope (rule B — locals shadow imports).
+#   2. `mod` matches an entry in the module table.
+#   3. `fn` is in that module's exports list.
+#
+# When any of those fail, the EField stays as-is and the typer
+# treats it as a record-field projection (today's behaviour).
+#
+# Lexical scoping tracker: a flat `[String]` of names currently in
+# scope. Updated as the walker enters fn params, lambda params,
+# `let` patterns, `match` arm patterns, handle clause params, and
+# `with State[T](init) as alias` aliases. This is the same shape
+# stage 1 added in 2c5de6b for the codegen shadow bug — the
+# tracker reads identically here, just for a different decision.
+
+fn mt_lookup(mt: [ModuleEntry], name: String) : Option[ModuleEntry] {
+  match mt {
+    [] -> None
+    [me, ...rest] -> match me {
+      ME(mn, _, _, _) -> if mn == name { Some(me) } else { mt_lookup(rest, name) }
+    }
+  }
+}
+
+fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
+  ME(_, exports, _, _) -> list_has(exports, fn_name)
+}
+
+# Issue #602: returns true when `fn_name` is in the module's unstable
+# export list. Callers use this from EField -> EModCall rewriting to
+# decide whether to emit the unstable-consumer warning.
+fn me_export_is_unstable(me: ModuleEntry, fn_name: String) : Bool = match me {
+  ME(_, _, _, unstable) -> list_has(unstable, fn_name)
+}
+
+# Issue #425: collect the absolute origin path of every ModuleEntry
+# in `mes`. Used to pre-seed the import resolver's `visited` set with
+# the paths of every `--prelude` file so a user `import` of the same
+# module is a no-op instead of a duplicate-symbol link error.
+pub fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String] = match mes {
+  [] -> list_reverse(acc)
+  [me, ...rest] -> match me {
+    ME(_, _, origin, _) -> collect_module_origins(rest, [origin, ...acc])
+  }
+}
+
+
+# m14 v1: resolve a qualified-call field name to the real exported
+# name in the module. Tries the verbatim `fname` first; if that is
+# not exported, falls back to `<module>_<fname>` (or the per-module
+# legacy prefix) so a caller can write `list.take(xs, n)` against
+# today's flat-prefix definitions (`pub fn list_take`) without
+# renaming the stdlib. The legacy definitions retire when the
+# per-module surface migration completes in a follow-up lane
+# (see `docs/stage2-design.md` §m14). Returns the export name to
+# thread through `EModCall`, which is what codegen uses to mint
+# the C symbol (`kai_<actual>`).
+fn name_starts_upper(name: String) : Bool = match char_at(name, 0) {
+  Some(c) -> c >= 'A' and c <= 'Z'
+  None    -> false
+}
+
+fn me_lookup_export(me: ModuleEntry, fname: String) : Option[String] = match me {
+  ME(_, exports, _, _) ->
+    if list_has(exports, fname) { Some(fname) } else { None }
+}
+
+# Collect the bindings introduced by a pattern. Used by SLet,
+# match-arm patterns, and variant-record / record patterns.
+pub fn pat_binders(pat: Pattern, acc: [String]) : [String] = match pat.pkind {
+  PWild           -> acc
+  PLit(_)         -> acc
+  PBind(name)     -> [name, ...acc]
+  PList(subs, opt_rest) -> {
+    let acc1 = pat_binders_list(subs, acc)
+    match opt_rest { Some(n) -> [n, ...acc1] None -> acc1 }
+  }
+  PVariant(_, subs)        -> pat_binders_list(subs, acc)
+  PVariantRecord(_, fs)    -> pat_binders_pfields(fs, acc)
+  PRecord(fs)              -> pat_binders_pfields(fs, acc)
+  PHole(_)                 -> acc
+  PAs(name, inner)         -> pat_binders(inner, [name, ...acc])
+  PNarrow(name, _)         -> [name, ...acc]
+}
+
+fn pat_binders_list(ps: [Pattern], acc: [String]) : [String] = match ps {
+  [] -> acc
+  [p, ...rest] -> pat_binders_list(rest, pat_binders(p, acc))
+}
+
+fn pat_binders_pfields(fs: [PField], acc: [String]) : [String] = match fs {
+  [] -> acc
+  [f, ...rest] -> match f {
+    PField(_, sub, _) -> pat_binders_pfields(rest, pat_binders(sub, acc))
+  }
+}
+
+pub fn fn_param_names(params: [Param]) : [String] = match params {
+  [] -> []
+  [p, ...rest] -> [p.pname, ...fn_param_names(rest)]
+}
+
+# ====================================================================
+# Issue #232 — qualified type rewriter
+# ====================================================================
+#
+# The parser turns `mod.Type[args?]` in type position into a single
+# `TyName("mod.Type", args)` with the qualifier folded into the name
+# string. This pass walks every TypeExpr reachable from a Decl,
+# detects the dotted form, validates that `mod` is in the module
+# table and exports `Type`, and rewrites the node back to the bare
+# `TyName("Type", args)`. After rewrite, every downstream walker
+# (resolve_ty, mangle, codegen) sees the same shape produced by an
+# unqualified annotation, so the qualified surface is purely a
+# parse-time disambiguator.
+#
+# Validation diagnostics: an unknown `mod` reports
+# `unknown module qualifier`; a known `mod` that does not export
+# `Type` reports `module 'mod' does not export 'Type'` and lists the
+# available exports.
+
+fn first_dot_index(s: String, i: Int, n: Int) : Int {
+  if i >= n { -1 }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '.' { i } else { first_dot_index(s, i + 1, n) }
+      None -> -1
+    }
+  }
+}
+
+type QtSplit = QSplit(String, String)
+
+fn split_dotted_qualifier(name: String) : Option[QtSplit] {
+  let n = string_length(name)
+  let i = first_dot_index(name, 0, n)
+  if i < 0 { None }
+  else { Some(QSplit(string_slice(name, 0, i), string_slice(name, i + 1, n - i - 1))) }
+}
+
+fn qt_diag_unknown_mod(mod: String, ty: String, file: String, line: Int, col: Int) : Unit / Console + File =
+
+  diag_error(file, line, col,
+    concat_all(["unknown module qualifier '", mod, "' in qualified type '",
+                mod, ".", ty, "'"]))
+
+fn qt_diag_missing_type(mod: String, ty: String, exports: [String], file: String, line: Int, col: Int) : Unit / Console + File =
+
+  diag_error(file, line, col,
+    concat_all(["module '", mod, "' does not export type '", ty,
+                "'; available exports: ", mods_join_with(exports, ", ")]))
+
+fn qualtype_te(te: TypeExpr, mt: [ModuleEntry], file: String) : TypeExpr / Console + File = match te.tkind {
+
+  TyName(name, targs) -> {
+    let targs1 = qualtype_te_list(targs, mt, file)
+    match split_dotted_qualifier(name) {
+      None -> TypeExpr { tkind: TyName(name, targs1), line: te.line, col: te.col }
+      Some(parts) -> match parts {
+        QSplit(mod, ty) -> match mt_lookup(mt, mod) {
+          None -> {
+            let _ = qt_diag_unknown_mod(mod, ty, file, te.line, te.col)
+            # Sentinel name forces the typer cascade to fail.
+            TypeExpr { tkind: TyName("__qualtype_bad__", []), line: te.line, col: te.col }
+          }
+          Some(me) ->
+            if me_has_export(me, ty) {
+              TypeExpr { tkind: TyName(ty, targs1), line: te.line, col: te.col }
+            } else {
+              let exports = match me { ME(_, exs, _, _) -> exs }
+              let _ = qt_diag_missing_type(mod, ty, exports, file, te.line, te.col)
+              TypeExpr { tkind: TyName("__qualtype_bad__", []), line: te.line, col: te.col }
+            }
+        }
+      }
+    }
+  }
+  TyList(inner) ->
+    TypeExpr { tkind: TyList(qualtype_te(inner, mt, file)), line: te.line, col: te.col }
+  TyFn(ps, ret, row) ->
+    TypeExpr { tkind: TyFn(qualtype_te_list(ps, mt, file),
+                            qualtype_te(ret, mt, file),
+                            qualtype_row(row, mt, file)),
+                line: te.line, col: te.col }
+  TyDim(base, u) ->
+    TypeExpr { tkind: TyDim(qualtype_te(base, mt, file), u), line: te.line, col: te.col }
+  TyRefine(base, pred) ->
+    TypeExpr { tkind: TyRefine(qualtype_te(base, mt, file), qualtype_expr(pred, mt, file)),
+                line: te.line, col: te.col }
+}
+
+fn qualtype_te_list(tes: [TypeExpr], mt: [ModuleEntry], file: String) : [TypeExpr] / Console + File = match tes {
+
+  [] -> []
+  [t, ...rest] -> [qualtype_te(t, mt, file), ...qualtype_te_list(rest, mt, file)]
+}
+
+fn qualtype_row(re: RowExpr, mt: [ModuleEntry], file: String) : RowExpr / Console + File = match re {
+
+  REmpty -> REmpty
+  RClosed(labels) -> RClosed(qualtype_rls(labels, mt, file))
+  ROpen(rv, labels) -> ROpen(rv, qualtype_rls(labels, mt, file))
+}
+
+fn qualtype_rls(ls: [RowLabel], mt: [ModuleEntry], file: String) : [RowLabel] / Console + File = match ls {
+
+  [] -> []
+  [rl, ...rest] -> match rl {
+    RL(name, ts) -> [RL(name, qualtype_te_list(ts, mt, file)), ...qualtype_rls(rest, mt, file)]
+  }
+}
+
+fn qualtype_param(pm: Param, mt: [ModuleEntry], file: String) : Param / Console + File =
+
+  Param { pname: pm.pname,
+          ptype: match pm.ptype {
+            None -> None
+            Some(te) -> Some(qualtype_te(te, mt, file))
+          },
+          pline: pm.pline, pcol: pm.pcol }
+
+fn qualtype_params(ps: [Param], mt: [ModuleEntry], file: String) : [Param] / Console + File = match ps {
+
+  [] -> []
+  [p, ...rest] -> [qualtype_param(p, mt, file), ...qualtype_params(rest, mt, file)]
+}
+
+fn qualtype_variants(vs: [Variant], mt: [ModuleEntry], file: String) : [Variant] / Console + File = match vs {
+
+  [] -> []
+  [v, ...rest] -> match v {
+    Var(cname, vargs) -> [Var(cname, qualtype_te_list(vargs, mt, file)),
+                           ...qualtype_variants(rest, mt, file)]
+  }
+}
+
+fn qualtype_fields(fs: [FieldDecl], mt: [ModuleEntry], file: String) : [FieldDecl] / Console + File = match fs {
+
+  [] -> []
+  [f, ...rest] -> match f {
+    FD(is_pub, name, te) -> [FD(is_pub, name, qualtype_te(te, mt, file)), ...qualtype_fields(rest, mt, file)]
+  }
+}
+
+fn qualtype_body(tb: TypeBody, mt: [ModuleEntry], file: String) : TypeBody / Console + File = match tb {
+
+  TBAlias(te) -> TBAlias(qualtype_te(te, mt, file))
+  TBRecord(fs) -> TBRecord(qualtype_fields(fs, mt, file))
+  TBSum(vs) -> TBSum(qualtype_variants(vs, mt, file))
+  TBEffectAlias(ls) -> TBEffectAlias(ls)
+}
+
+fn qualtype_eops(ops: [EffectOp], mt: [ModuleEntry], file: String) : [EffectOp] / Console + File = match ops {
+
+  [] -> []
+  [op, ...rest] -> match op {
+    EOp(name, tps, ps, ret, l, c) ->
+      [EOp(name, tps, qualtype_params(ps, mt, file), qualtype_te(ret, mt, file), l, c),
+       ...qualtype_eops(rest, mt, file)]
+  }
+}
+
+fn qualtype_pops(ops: [ProtoOp], mt: [ModuleEntry], file: String) : [ProtoOp] / Console + File = match ops {
+
+  [] -> []
+  [op, ...rest] -> match op {
+    POp(name, tps, ps, ret, l, c) ->
+      [POp(name, tps, qualtype_params(ps, mt, file), qualtype_te(ret, mt, file), l, c),
+       ...qualtype_pops(rest, mt, file)]
+  }
+}
+
+# Walk the (rare) TypeExprs that live inside expression bodies:
+# `let x : T = e` annotations and `p : T` match-arm narrows.
+fn qualtype_expr(e: Expr, mt: [ModuleEntry], file: String) : Expr / Console + File =
+
+  Expr { kind: qualtype_expr_kind_at(e.kind, mt, file, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+# Issue #456: qualtype rewrite at the kind level needs source position
+# for module-export diagnostics on `ERecordLit("mod.Type", _)`. Routes
+# through here so the wrapping `Expr` can supply line/col; all other
+# arms forward to `qualtype_expr_kind` unchanged.
+fn qualtype_expr_kind_at(k: ExprKind, mt: [ModuleEntry], file: String, line: Int, col: Int) : ExprKind / Console + File = match k {
+
+  ERecordLit(name, fs) -> {
+    let fs1 = qualtype_fields_init(fs, mt, file)
+    match split_dotted_qualifier(name) {
+      None -> ERecordLit(name, fs1)
+      Some(parts) -> match parts {
+        QSplit(mod, ty) -> match mt_lookup(mt, mod) {
+          None -> {
+            let _ = qt_diag_unknown_mod(mod, ty, file, line, col)
+            ERecordLit("__qualtype_bad__", fs1)
+          }
+          Some(me) ->
+            if me_has_export(me, ty) {
+              ERecordLit(ty, fs1)
+            } else {
+              let exports = match me { ME(_, exs, _, _) -> exs }
+              let _ = qt_diag_missing_type(mod, ty, exports, file, line, col)
+              ERecordLit("__qualtype_bad__", fs1)
+            }
+        }
+      }
+    }
+  }
+  _ -> qualtype_expr_kind(k, mt, file)
+}
+
+fn qualtype_expr_kind(k: ExprKind, mt: [ModuleEntry], file: String) : ExprKind / Console + File = match k {
+
+  EBlock(stmts, opt_final) ->
+    EBlock(qualtype_stmts(stmts, mt, file),
+           match opt_final {
+             None -> None
+             Some(fe) -> Some(qualtype_expr(fe, mt, file))
+           })
+  EMatch(scrut, arms) ->
+    EMatch(qualtype_expr(scrut, mt, file), qualtype_arms(arms, mt, file))
+  EVariantsOf(te, _) ->
+    EVariantsOf(qualtype_te(te, mt, file), [])
+  ELambda(ps, body) ->
+    ELambda(qualtype_params(ps, mt, file), qualtype_expr(body, mt, file))
+  EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) ->
+    EHandle(qualtype_expr(body, mt, file), eff,
+             qualtype_ty_list_opt(ty_args, mt, file),
+             match init_opt { None -> None Some(ie) -> Some(qualtype_expr(ie, mt, file)) },
+             alias_opt,
+             qualtype_hclauses(clauses, mt, file),
+             match ret_opt {
+               None -> None
+               Some(r) -> Some(qualtype_hreturn(r, mt, file))
+             })
+  # Leaves
+  EInt(_)        -> k
+  EReal(_)       -> k
+  EBool(_)       -> k
+  EChar(_)       -> k
+  EStr(_, _)     -> k
+  EUnit          -> k
+  EVar(_)        -> k
+  EUnder         -> k
+  EPlaceholder   -> k
+  EHole(_)       -> k
+  ETodo(_)       -> k
+  EModCall(_, _) -> k
+  EIntrinsic(name, args_) ->
+    EIntrinsic(name, qualtype_expr_list(args_, mt, file))
+  # Composites with sub-Exprs (mirrors `map_expr_kind` but with
+  # `qualtype_expr` called directly so the effect row propagates).
+  ECall(callee, args_) ->
+    ECall(qualtype_expr(callee, mt, file),
+          qualtype_expr_list(args_, mt, file))
+  EField(base, name)   -> EField(qualtype_expr(base, mt, file), name)
+  EIndex(a, b)         -> EIndex(qualtype_expr(a, mt, file),
+                                  qualtype_expr(b, mt, file))
+  EBinop(op, a, b)     -> EBinop(op, qualtype_expr(a, mt, file),
+                                      qualtype_expr(b, mt, file))
+  EUnop(op, x)         -> EUnop(op, qualtype_expr(x, mt, file))
+  EIf(c, t_, eo)       -> EIf(qualtype_expr(c, mt, file),
+                                qualtype_expr(t_, mt, file),
+                                qualtype_expr_opt(eo, mt, file))
+  ERecordLit(name, fs) -> ERecordLit(name, qualtype_fields_init(fs, mt, file))
+  EList(els)           -> EList(qualtype_list_elems(els, mt, file))
+  ERange(a, b, opt_step) -> ERange(qualtype_expr(a, mt, file),
+                                     qualtype_expr(b, mt, file),
+                                     qualtype_expr_opt(opt_step, mt, file))
+  EPipe(a, b)          -> EPipe(qualtype_expr(a, mt, file),
+                                  qualtype_expr(b, mt, file))
+  EMapPipe(a, b)       -> EMapPipe(qualtype_expr(a, mt, file),
+                                     qualtype_expr(b, mt, file))
+  EFlatMapPipe(a, b)   -> EFlatMapPipe(qualtype_expr(a, mt, file),
+                                          qualtype_expr(b, mt, file))
+  EFilterPipe(a, b)    -> EFilterPipe(qualtype_expr(a, mt, file),
+                                         qualtype_expr(b, mt, file))
+  ELitUnit(inner, u)   -> ELitUnit(qualtype_expr(inner, mt, file), u)
+  EBang(inner)         -> EBang(qualtype_expr(inner, mt, file))
+}
+
+# Helpers used by the inlined `_ -> map_expr_kind` expansion above.
+# Issue #528: `map_expr_kind` cannot accept an effectful callback
+# without row polymorphism in function-param types (which stage 1 does
+# not parse), so each effectful traversal walks `ExprKind` directly
+# with these specialised helpers.
+fn qualtype_expr_opt(opt: Option[Expr], mt: [ModuleEntry], file: String) : Option[Expr] / Console + File = match opt {
+  None    -> None
+  Some(e) -> Some(qualtype_expr(e, mt, file))
+}
+
+fn qualtype_expr_list(es: [Expr], mt: [ModuleEntry], file: String) : [Expr] / Console + File = match es {
+  []           -> []
+  [h, ...rest] -> [qualtype_expr(h, mt, file), ...qualtype_expr_list(rest, mt, file)]
+}
+
+fn qualtype_list_elems(els: [ListElem], mt: [ModuleEntry], file: String) : [ListElem] / Console + File = match els {
+  []           -> []
+  [h, ...rest] -> [qualtype_list_elem(h, mt, file), ...qualtype_list_elems(rest, mt, file)]
+}
+
+fn qualtype_list_elem(el: ListElem, mt: [ModuleEntry], file: String) : ListElem / Console + File = match el {
+  ElPlain(e)  -> ElPlain(qualtype_expr(e, mt, file))
+  ElSpread(e) -> ElSpread(qualtype_expr(e, mt, file))
+}
+
+fn qualtype_fields_init(fs: [FieldInit], mt: [ModuleEntry], file: String) : [FieldInit] / Console + File = match fs {
+
+  [] -> []
+  [fi, ...rest] -> match fi {
+    FI(n, v) -> [FI(n, qualtype_expr(v, mt, file)), ...qualtype_fields_init(rest, mt, file)]
+  }
+}
+
+fn qualtype_ty_list_opt(ts: [TypeExpr], mt: [ModuleEntry], file: String) : [TypeExpr] / Console + File =
+
+  qualtype_te_list(ts, mt, file)
+
+fn qualtype_arms(arms: [Arm], mt: [ModuleEntry], file: String) : [Arm] / Console + File = match arms {
+
+  [] -> []
+  [a, ...rest] -> [qualtype_arm(a, mt, file), ...qualtype_arms(rest, mt, file)]
+}
+
+fn qualtype_arm(a: Arm, mt: [ModuleEntry], file: String) : Arm / Console + File = match a {
+
+  Arm(pat, opt_guard, body) ->
+    Arm(qualtype_pat(pat, mt, file),
+        match opt_guard {
+          None -> None
+          Some(g) -> Some(qualtype_expr(g, mt, file))
+        },
+        qualtype_expr(body, mt, file))
+}
+
+fn qualtype_pat(pat: Pattern, mt: [ModuleEntry], file: String) : Pattern / Console + File = match pat.pkind {
+
+  PNarrow(name, te) ->
+    Pattern { pkind: PNarrow(name, qualtype_te(te, mt, file)), line: pat.line, col: pat.col }
+  PVariant(name, subs) ->
+    Pattern { pkind: PVariant(name, qualtype_pat_list(subs, mt, file)),
+               line: pat.line, col: pat.col }
+  PVariantRecord(name, fs) ->
+    Pattern { pkind: PVariantRecord(name, qualtype_pfields(fs, mt, file)),
+               line: pat.line, col: pat.col }
+  PRecord(fs) ->
+    Pattern { pkind: PRecord(qualtype_pfields(fs, mt, file)),
+               line: pat.line, col: pat.col }
+  PList(subs, rest) ->
+    Pattern { pkind: PList(qualtype_pat_list(subs, mt, file), rest),
+               line: pat.line, col: pat.col }
+  PAs(name, inner) ->
+    Pattern { pkind: PAs(name, qualtype_pat(inner, mt, file)),
+               line: pat.line, col: pat.col }
+  _ -> pat
+}
+
+fn qualtype_pat_list(ps: [Pattern], mt: [ModuleEntry], file: String) : [Pattern] / Console + File = match ps {
+
+  [] -> []
+  [p, ...rest] -> [qualtype_pat(p, mt, file), ...qualtype_pat_list(rest, mt, file)]
+}
+
+fn qualtype_pfields(fs: [PField], mt: [ModuleEntry], file: String) : [PField] / Console + File = match fs {
+
+  [] -> []
+  [f, ...rest] -> match f {
+    PField(name, sub, sh) -> [PField(name, qualtype_pat(sub, mt, file), sh),
+                               ...qualtype_pfields(rest, mt, file)]
+  }
+}
+
+fn qualtype_stmts(ss: [Stmt], mt: [ModuleEntry], file: String) : [Stmt] / Console + File = match ss {
+
+  [] -> []
+  [s, ...rest] -> [qualtype_stmt(s, mt, file), ...qualtype_stmts(rest, mt, file)]
+}
+
+fn qualtype_stmt(s: Stmt, mt: [ModuleEntry], file: String) : Stmt / Console + File = match s {
+
+  SLet(pat, ty_opt, e) ->
+    SLet(qualtype_pat(pat, mt, file),
+         match ty_opt {
+           None -> None
+           Some(te) -> Some(qualtype_te(te, mt, file))
+         },
+         qualtype_expr(e, mt, file))
+  SVar(name, ty_opt, init, l, c) ->
+    SVar(name,
+         match ty_opt {
+           None -> None
+           Some(te) -> Some(qualtype_te(te, mt, file))
+         },
+         qualtype_expr(init, mt, file), l, c)
+  SAssert(e, om) ->
+    SAssert(qualtype_expr(e, mt, file),
+            match om { None -> None Some(m) -> Some(qualtype_expr(m, mt, file)) })
+  SExprStmt(e) -> SExprStmt(qualtype_expr(e, mt, file))
+  SIndexAssign(t, ix, v, l, c) ->
+    SIndexAssign(qualtype_expr(t, mt, file),
+                  qualtype_expr(ix, mt, file),
+                  qualtype_expr(v, mt, file), l, c)
+  SUse(eff, l, c) -> SUse(eff, l, c)
+}
+
+fn qualtype_hclauses(cs: [HClause], mt: [ModuleEntry], file: String) : [HClause] / Console + File = match cs {
+
+  [] -> []
+  [c, ...rest] -> match c {
+    HC(name, ps, body, l, col) ->
+      [HC(name, qualtype_params(ps, mt, file), qualtype_expr(body, mt, file), l, col),
+       ...qualtype_hclauses(rest, mt, file)]
+  }
+}
+
+fn qualtype_hreturn(r: HReturn, mt: [ModuleEntry], file: String) : HReturn / Console + File = match r {
+
+  HR(name, body, l, c) -> HR(name, qualtype_expr(body, mt, file), l, c)
+}
+
+fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + File = match d {
+
+  DFn(p, n, tps, ps, ret_opt, row, body, l, c, mo) ->
+    DFn(p, n, tps, qualtype_params(ps, mt, file),
+        match ret_opt { None -> None Some(te) -> Some(qualtype_te(te, mt, file)) },
+        qualtype_row(row, mt, file),
+        qualtype_expr(body, mt, file), l, c, mo)
+  DType(p, n, tps, body, l, c, mo) ->
+    DType(p, n, tps, qualtype_body(body, mt, file), l, c, mo)
+  DEffect(p, n, tps, ops, defblk, l, c) ->
+    DEffect(p, n, tps, qualtype_eops(ops, mt, file), defblk, l, c)
+  DProtocol(p, n, tps, ops, l, c) ->
+    DProtocol(p, n, tps, qualtype_pops(ops, mt, file), l, c)
+  DImpl(name, proto_args, ty, sub_decls, l, c) ->
+    DImpl(name, map(proto_args, (te) => qualtype_te(te, mt, file)),
+          qualtype_te(ty, mt, file),
+          qualtype_decls(sub_decls, mt, file), l, c)
+  DDerive(ps, inner, l, c) ->
+    DDerive(ps, qualtype_decl(inner, mt, file), l, c)
+  DUnstable(inner, l, c) ->
+    DUnstable(qualtype_decl(inner, mt, file), l, c)
+  DAttribPure(inner, l, c) ->
+    DAttribPure(qualtype_decl(inner, mt, file), l, c)
+  DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
+    DAxiom(p, sm, n, cso, tps, qualtype_params(ps, mt, file),
+            qualtype_te(ret, mt, file), qualtype_row(row, mt, file), l, c)
+  # Issue #269: rewrite the declared type's qualifiers and the body
+  # expression. `lower_consts` runs before this in the driver, but
+  # the arm exists for completeness so any pre-lowering caller (e.g.
+  # `--ast` of a future entry point) does not blow up. Mirrors what
+  # the DFn arm above does for the body + return type.
+  DConst(p, n, ty, body, l, c) ->
+    DConst(p, n, qualtype_te(ty, mt, file),
+            qualtype_expr(body, mt, file), l, c)
+  DTest(n, body, l, c) -> DTest(n, qualtype_expr(body, mt, file), l, c)
+  DBench(n, body, l, c) -> DBench(n, qualtype_expr(body, mt, file), l, c)
+  DCheck(n, ps, body, l, c) ->
+    DCheck(n, qualtype_params(ps, mt, file), qualtype_expr(body, mt, file), l, c)
+  DImport(ik, l, c) -> DImport(ik, l, c)
+  DUnit(p, n, opt, l, c) -> DUnit(p, n, opt, l, c)
+  DUse(eff, l, c) -> DUse(eff, l, c)
+}
+
+pub fn qualtype_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Console + File = match decls {
+
+  [] -> []
+  [d, ...rest] -> [qualtype_decl(d, mt, file), ...qualtype_decls(rest, mt, file)]
+}
+
+# Issue #232 validation pass: counts how many qualified type heads
+# fail validation against the module table. Errors were already
+# emitted as part of the rewrite pass (qualtype_te); this counter
+# pass mirrors the same traversal so the caller can fold the count
+# into the program's exit status.
+fn qtchk_te(te: TypeExpr, mt: [ModuleEntry]) : Int = match te.tkind {
+  TyName(name, targs) -> {
+    let inner = qtchk_te_list(targs, mt)
+    match split_dotted_qualifier(name) {
+      None -> inner
+      Some(parts) -> match parts {
+        QSplit(mod, ty) -> match mt_lookup(mt, mod) {
+          None -> inner + 1
+          Some(me) -> if me_has_export(me, ty) { inner } else { inner + 1 }
+        }
+      }
+    }
+  }
+  TyList(inner) -> qtchk_te(inner, mt)
+  TyFn(ps, ret, row) -> qtchk_te_list(ps, mt) + qtchk_te(ret, mt) + qtchk_row(row, mt)
+  TyDim(base, _) -> qtchk_te(base, mt)
+  TyRefine(base, _) -> qtchk_te(base, mt)
+}
+
+fn qtchk_te_list(tes: [TypeExpr], mt: [ModuleEntry]) : Int = match tes {
+  [] -> 0
+  [t, ...rest] -> qtchk_te(t, mt) + qtchk_te_list(rest, mt)
+}
+
+fn qtchk_row(re: RowExpr, mt: [ModuleEntry]) : Int = match re {
+  REmpty -> 0
+  RClosed(ls) -> qtchk_rls(ls, mt)
+  ROpen(_, ls) -> qtchk_rls(ls, mt)
+}
+
+fn qtchk_rls(ls: [RowLabel], mt: [ModuleEntry]) : Int = match ls {
+  [] -> 0
+  [rl, ...rest] -> match rl {
+    RL(_, ts) -> qtchk_te_list(ts, mt) + qtchk_rls(rest, mt)
+  }
+}
+
+fn qtchk_params(ps: [Param], mt: [ModuleEntry]) : Int = match ps {
+  [] -> 0
+  [p, ...rest] -> {
+    let here = match p.ptype { None -> 0 Some(te) -> qtchk_te(te, mt) }
+    here + qtchk_params(rest, mt)
+  }
+}
+
+fn qtchk_variants(vs: [Variant], mt: [ModuleEntry]) : Int = match vs {
+  [] -> 0
+  [v, ...rest] -> match v {
+    Var(_, vargs) -> qtchk_te_list(vargs, mt) + qtchk_variants(rest, mt)
+  }
+}
+
+fn qtchk_fields(fs: [FieldDecl], mt: [ModuleEntry]) : Int = match fs {
+  [] -> 0
+  [f, ...rest] -> match f {
+    FD(_, _, te) -> qtchk_te(te, mt) + qtchk_fields(rest, mt)
+  }
+}
+
+fn qtchk_body(tb: TypeBody, mt: [ModuleEntry]) : Int = match tb {
+  TBAlias(te) -> qtchk_te(te, mt)
+  TBRecord(fs) -> qtchk_fields(fs, mt)
+  TBSum(vs) -> qtchk_variants(vs, mt)
+  TBEffectAlias(_) -> 0
+}
+
+fn qtchk_eops(ops: [EffectOp], mt: [ModuleEntry]) : Int = match ops {
+  [] -> 0
+  [op, ...rest] -> match op {
+    EOp(_, _, ps, ret, _, _) -> qtchk_params(ps, mt) + qtchk_te(ret, mt) + qtchk_eops(rest, mt)
+  }
+}
+
+fn qtchk_pops(ops: [ProtoOp], mt: [ModuleEntry]) : Int = match ops {
+  [] -> 0
+  [op, ...rest] -> match op {
+    POp(_, _, ps, ret, _, _) -> qtchk_params(ps, mt) + qtchk_te(ret, mt) + qtchk_pops(rest, mt)
+  }
+}
+
+# Decl-only counter: walks every TypeExpr that appears at decl
+# boundaries (fn params/return/row, type-body fields/variants/aliases,
+# effect/protocol op signatures, impl target, axiom signatures).
+# Body expressions are not walked — the rewrite pass already replaces
+# bad qualifiers with the bare-name fallback so cascade-typer noise
+# stays bounded; the counter only needs to detect ONE bad use to
+# fail the build.
+fn qtchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
+  DFn(_, _, _, ps, ret_opt, row, _, _, _, _) ->
+    qtchk_params(ps, mt) +
+    (match ret_opt { None -> 0 Some(te) -> qtchk_te(te, mt) }) +
+    qtchk_row(row, mt)
+  DType(_, _, _, body, _, _, _) -> qtchk_body(body, mt)
+  DEffect(_, _, _, ops, _, _, _) -> qtchk_eops(ops, mt)
+  DProtocol(_, _, _, ops, _, _) -> qtchk_pops(ops, mt)
+  DImpl(_, proto_args, ty, sub_decls, _, _) ->
+    qtchk_te_list(proto_args, mt) +
+    qtchk_te(ty, mt) + qtchk_decls(sub_decls, mt)
+  DDerive(_, inner, _, _) -> qtchk_decl(inner, mt)
+  DUnstable(inner, _, _) -> qtchk_decl(inner, mt)
+  DAttribPure(inner, _, _) -> qtchk_decl(inner, mt)
+  DAxiom(_, _, _, _, _, ps, ret, row, _, _) ->
+    qtchk_params(ps, mt) + qtchk_te(ret, mt) + qtchk_row(row, mt)
+  DCheck(_, ps, _, _, _) -> qtchk_params(ps, mt)
+  _ -> 0
+}
+
+pub fn qtchk_decls(ds: [Decl], mt: [ModuleEntry]) : Int = match ds {
+  [] -> 0
+  [d, ...rest] -> qtchk_decl(d, mt) + qtchk_decls(rest, mt)
+}
+
+pub fn rqc_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Console + File = match decls {
+
+  [] -> []
+  [d, ...rest] -> [rqc_decl(d, mt, file), ...rqc_decls(rest, mt, file)]
+}
+
+# Issue #602: walk every Decl body's EModCall sites and emit a
+# diagnostic for any call to a `#unstable` export from a package
+# the consumer has not opted into. Pure post-pass — runs AFTER
+# `rqc_decls` has lifted `EField(EVar(mod), fn)` into
+# `EModCall(mod, fname)` so we have a uniform shape to scan.
+#
+# Suppression rules:
+#   1. `mod == pkg` — the consumer is touching their own module;
+#      never warn on self-imports.
+#   2. `mod ∈ optins` — the consumer added `mod = true` under
+#      `[unstable]` in their kai.toml.
+#   3. The module is unknown to `mt` (corner case — should not
+#      happen by the time rqc runs, but be defensive). Skip.
+#   4. The fname is not in the module's `unstable_exports` list.
+#      The vast majority of imports.
+#
+# Otherwise emit a warning anchored at the call site, naming the
+# `<mod>.<fname>` pair and the opt-in instruction. The diagnostic
+# is non-fatal; downstream codegen proceeds as usual.
+pub fn unstable_check_decls(ds: [Decl], mt: [ModuleEntry],
+                          pkg: String, optins: [String], file: String)
+                          : Unit / Console + File = match ds {
+  [] -> ()
+  [d, ...rest] -> {
+    unstable_check_decl(d, mt, pkg, optins, file)
+    unstable_check_decls(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_decl(d: Decl, mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DTest(_, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DBench(_, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DCheck(_, _, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DImpl(_, _, _, subs, _, _) -> unstable_check_decls(subs, mt, pkg, optins, file)
+  DDerive(_, inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
+  DUnstable(inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
+  DAttribPure(inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
+  _ -> ()
+}
+
+fn unstable_check_expr(e: Expr, mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match e.kind {
+  EModCall(mod, fname) -> {
+    if mod == pkg { () }
+    else if list_has(optins, mod) { () }
+    else {
+      match mt_lookup(mt, mod) {
+        None -> ()
+        Some(me) ->
+          if me_export_is_unstable(me, fname) {
+            mods_diag_warning(file, e.line, e.col,
+              concat_all([mod, ".", fname,
+                          " is #[unstable] — API may change between versions without an edition bump. ",
+                          "Add '", mod, " = true' under [unstable] in kai.toml to acknowledge."]))
+          } else { () }
+      }
+    }
+  }
+  EField(b, _) -> unstable_check_expr(b, mt, pkg, optins, file)
+  EIntrinsic(_, args_) -> unstable_check_exprs(args_, mt, pkg, optins, file)
+  ECall(callee, args_) -> {
+    unstable_check_expr(callee, mt, pkg, optins, file)
+    unstable_check_exprs(args_, mt, pkg, optins, file)
+  }
+  EIndex(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EBinop(_, a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EUnop(_, x) -> unstable_check_expr(x, mt, pkg, optins, file)
+  EIf(c, t_, eo) -> {
+    unstable_check_expr(c, mt, pkg, optins, file)
+    unstable_check_expr(t_, mt, pkg, optins, file)
+    unstable_check_expr_opt(eo, mt, pkg, optins, file)
+  }
+  ERecordLit(_, fs) -> unstable_check_fields_init(fs, mt, pkg, optins, file)
+  EList(els) -> unstable_check_list_elems(els, mt, pkg, optins, file)
+  ERange(a, b, opt_step) -> {
+    unstable_check_expr(a, mt, pkg, optins, file)
+    unstable_check_expr(b, mt, pkg, optins, file)
+    unstable_check_expr_opt(opt_step, mt, pkg, optins, file)
+  }
+  EPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EMapPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EFlatMapPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EFilterPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  ELitUnit(inner, _) -> unstable_check_expr(inner, mt, pkg, optins, file)
+  EBang(inner) -> unstable_check_expr(inner, mt, pkg, optins, file)
+  ELambda(_, body) -> unstable_check_expr(body, mt, pkg, optins, file)
+  EMatch(scrut, arms) -> {
+    unstable_check_expr(scrut, mt, pkg, optins, file)
+    unstable_check_arms(arms, mt, pkg, optins, file)
+  }
+  EHandle(body, _, _, init_opt, _, cs, ret_opt) -> {
+    unstable_check_expr(body, mt, pkg, optins, file)
+    unstable_check_expr_opt(init_opt, mt, pkg, optins, file)
+    unstable_check_hclauses(cs, mt, pkg, optins, file)
+    unstable_check_hreturn_opt(ret_opt, mt, pkg, optins, file)
+  }
+  EBlock(stmts, opt_final) -> {
+    unstable_check_stmts(stmts, mt, pkg, optins, file)
+    unstable_check_expr_opt(opt_final, mt, pkg, optins, file)
+  }
+  _ -> ()
+}
+
+fn unstable_check_exprs(es: [Expr], mt: [ModuleEntry], pkg: String,
+                          optins: [String], file: String) : Unit / Console + File = match es {
+  [] -> ()
+  [x, ...rest] -> {
+    unstable_check_expr(x, mt, pkg, optins, file)
+    unstable_check_exprs(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_expr_opt(opt: Option[Expr], mt: [ModuleEntry], pkg: String,
+                             optins: [String], file: String) : Unit / Console + File = match opt {
+  None -> ()
+  Some(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+}
+
+fn unstable_check_fields_init(fs: [FieldInit], mt: [ModuleEntry], pkg: String,
+                                optins: [String], file: String) : Unit / Console + File = match fs {
+  [] -> ()
+  [f, ...rest] -> match f {
+    FI(_, e) -> {
+      unstable_check_expr(e, mt, pkg, optins, file)
+      unstable_check_fields_init(rest, mt, pkg, optins, file)
+    }
+  }
+}
+
+fn unstable_check_list_elems(els: [ListElem], mt: [ModuleEntry], pkg: String,
+                               optins: [String], file: String) : Unit / Console + File = match els {
+  [] -> ()
+  [el, ...rest] -> {
+    match el {
+      ElPlain(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+      ElSpread(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+    }
+    unstable_check_list_elems(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_arms(arms: [Arm], mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match arms {
+  [] -> ()
+  [a, ...rest] -> match a {
+    Arm(_, guard_opt, body) -> {
+      unstable_check_expr_opt(guard_opt, mt, pkg, optins, file)
+      unstable_check_expr(body, mt, pkg, optins, file)
+      unstable_check_arms(rest, mt, pkg, optins, file)
+    }
+  }
+}
+
+fn unstable_check_hclauses(cs: [HClause], mt: [ModuleEntry], pkg: String,
+                             optins: [String], file: String) : Unit / Console + File = match cs {
+  [] -> ()
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> {
+      unstable_check_expr(body, mt, pkg, optins, file)
+      unstable_check_hclauses(rest, mt, pkg, optins, file)
+    }
+  }
+}
+
+fn unstable_check_hreturn_opt(opt: Option[HReturn], mt: [ModuleEntry], pkg: String,
+                                optins: [String], file: String) : Unit / Console + File = match opt {
+  None -> ()
+  Some(r) -> match r {
+    HR(_, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_stmts(ss: [Stmt], mt: [ModuleEntry], pkg: String,
+                          optins: [String], file: String) : Unit / Console + File = match ss {
+  [] -> ()
+  [s, ...rest] -> {
+    unstable_check_stmt(s, mt, pkg, optins, file)
+    unstable_check_stmts(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_stmt(s: Stmt, mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match s {
+  SLet(_, _, e) -> unstable_check_expr(e, mt, pkg, optins, file)
+  SAssert(e, eo) -> {
+    unstable_check_expr(e, mt, pkg, optins, file)
+    unstable_check_expr_opt(eo, mt, pkg, optins, file)
+  }
+  SExprStmt(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+  SIndexAssign(a, b, c, _, _) -> {
+    unstable_check_expr(a, mt, pkg, optins, file)
+    unstable_check_expr(b, mt, pkg, optins, file)
+    unstable_check_expr(c, mt, pkg, optins, file)
+  }
+  SVar(_, _, e, _, _) -> unstable_check_expr(e, mt, pkg, optins, file)
+  _ -> ()
+}
+
+fn rqc_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + File = match d {
+
+  DFn(p, n, tp, params, ret, row, body, l, c, mo) ->
+    DFn(p, n, tp, params, ret, row,
+        rqc_expr(body, fn_param_names(params), mt, file), l, c, mo)
+  DTest(n, body, l, c) ->
+    DTest(n, rqc_expr(body, [], mt, file), l, c)
+  DBench(n, body, l, c) ->
+    DBench(n, rqc_expr(body, [], mt, file), l, c)
+  DCheck(n, ps, body, l, c) ->
+    DCheck(n, ps, rqc_expr(body, fn_param_names(ps), mt, file), l, c)
+  DImpl(name, proto_args, ty, sub_decls, l, c) ->
+    DImpl(name, proto_args, ty, rqc_decls(sub_decls, mt, file), l, c)
+  DDerive(ps, inner, l, c) ->
+    DDerive(ps, rqc_decl(inner, mt, file), l, c)
+  DUnstable(inner, l, c) ->
+    DUnstable(rqc_decl(inner, mt, file), l, c)
+  # DType / DEffect / DProtocol / DUnit / DAxiom / DUse / DImport
+  # carry no Expr bodies that need walking. (DAxiom's body is
+  # synthesised by lower_axioms and lives in the resulting DFn,
+  # which we already cover above.)
+  _ -> d
+}
+
+pub fn rqc_expr(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : Expr / Console + File =
+
+  Expr { kind: rqc_kind(e, locals, mt, file), line: e.line, col: e.col,
+         ty: e.ty, mode: e.mode }
+
+# m6.2 diagnostics: emit a specific message when the user wrote
+# `mod.fname` against a known imported module that does not export
+# `fname`. The list of available exports is included so the fix is
+# obvious. Returns the original EField shape so the typer's own
+# error path still fires (catches the unbound `mod` value as a
+# secondary effect, which is mostly redundant but harmless — the
+# rqc-emitted diag arrives first).
+fn rqc_diag_missing_export(mod: String, fname: String, exports: [String], file: String, line: Int, col: Int) : Unit / Console + File =
+
+  diag_error(file, line, col,
+    concat_all(["module '", mod, "' does not export '", fname,
+                "'; available exports: ",
+                mods_join_with(exports, ", ")]))
+
+fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKind / Console + File = match e.kind {
+
+  # The rewrite rule itself: only `EField(EVar(mod), fn)` is a
+  # candidate. Every other shape just recurses with the same scope.
+  EField(base, fname) -> match base.kind {
+    EVar(name) ->
+      if list_has(locals, name) {
+        # Rule B: local in scope. Treat as record projection.
+        EField(rqc_expr(base, locals, mt, file), fname)
+      } else if name == "bit" {
+        # m13: dotted bit.* surface. The bit operations are compiler
+        # intrinsics — `bit_and`, `bit_or`, `bit_xor`, `bit_not`,
+        # `bit_shl`, `bit_shr`, `bit_ushr`, `bit_count`, `bit_test`,
+        # `bit_set`, `bit_clear`, `bit_toggle` — registered in the
+        # typer's intrinsic table (`add_prelude_sigs`) and lowered
+        # inline by `emit_call_expr`'s else-if chain. There is no
+        # `kai_bit_*` runtime helper and no `bit` source file with
+        # bodies, so the m14 ModuleEntry path (which mints
+        # `kai_<mod>__<name>`) cannot apply. Rewrite `bit.X` to the
+        # flat-prefix `EVar("bit_X")` so the existing intrinsic path
+        # handles it without a codegen patch. If `bit_X` is not a
+        # known name the typer reports it as an unbound identifier,
+        # which is the right diagnostic for a typo like `bit.adn`.
+        EVar(string_concat("bit_", fname))
+      } else {
+        match mt_lookup(mt, name) {
+          Some(me) ->
+            # m14 v1: prefix-fallback — `list.take` resolves to the
+            # actual export `list_take` when the bare form is not
+            # exported. EModCall carries the real name for codegen.
+            #
+            # Issue #234: when `fname` starts with an uppercase
+            # letter and the module exports it, treat the qualifier
+            # as a variant-constructor disambiguator. Variant ctors
+            # are auto-declared globally (#187), so `mod.Ctor`
+            # collapses back to a bare `EVar(Ctor)` after the
+            # qualifier validates. The same rewrite applies to
+            # qualified ctor pattern shape parsed below.
+            if name_starts_upper(fname) and me_has_export(me, fname) {
+              EVar(fname)
+            } else { match me_lookup_export(me, fname) {
+              Some(actual) -> EModCall(name, actual)
+              None -> {
+                # m6.2 diagnostics: imported module, missing export.
+                # Emit specific error before falling back to EField
+                # (which the typer treats as a record-field
+                # projection on TyAny — produces a generic but
+                # non-fatal cascade).
+                let exports = match me { ME(_, exs, _, _) -> exs }
+                let _ = rqc_diag_missing_export(name, fname, exports, file, e.line, e.col)
+                EField(rqc_expr(base, locals, mt, file), fname)
+              }
+            } }
+          None -> EField(rqc_expr(base, locals, mt, file), fname)
+        }
+      }
+    _ -> EField(rqc_expr(base, locals, mt, file), fname)
+  }
+  # Scope-introducing shapes: lambda, match arms, handle, block.
+  ELambda(params, body) ->
+    ELambda(params,
+            rqc_expr(body, list_append(locals, fn_param_names(params)), mt, file))
+  EMatch(scrut, arms) ->
+    EMatch(rqc_expr(scrut, locals, mt, file),
+           rqc_arms(arms, locals, mt, file))
+  EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) -> {
+    let body1 = rqc_expr(body, locals, mt, file)
+    let init_opt1 = match init_opt {
+      Some(ie) -> Some(rqc_expr(ie, locals, mt, file))
+      None -> None
+    }
+    # The handle alias (`as name`) and `with State[T](init) as
+    # name` introduce a binding visible only inside the clauses
+    # and the return clause, not the body. The body sees the
+    # original locals.
+    let inner = match alias_opt { Some(a) -> [a, ...locals] None -> locals }
+    let clauses1 = rqc_hclauses(clauses, inner, mt, file)
+    let ret_opt1 = match ret_opt {
+      Some(r) -> Some(rqc_hreturn(r, inner, mt, file))
+      None -> None
+    }
+    EHandle(body1, eff, ty_args, init_opt1, alias_opt, clauses1, ret_opt1)
+  }
+  EBlock(stmts, opt_final) -> {
+    # Scope grows monotonically through the block. Each SLet /
+    # SVar / SUse contributes new bindings to `inner`.
+    let res = rqc_block_stmts(stmts, locals, mt, file, [])
+    let inner = res.bound
+    let final1 = match opt_final {
+      Some(fe) -> Some(rqc_expr(fe, inner, mt, file))
+      None -> None
+    }
+    EBlock(res.stmts, final1)
+  }
+  # Everything else: inlined from `map_expr_kind` to allow the
+  # effect row to propagate (issue #528). Stage 1 cannot parse row
+  # polymorphism in function-param types, so the HOF cannot accept
+  # an effectful callback. The structural recursion is replicated
+  # here with direct calls to `rqc_expr` and friends.
+  EInt(_)        -> e.kind
+  EReal(_)       -> e.kind
+  EBool(_)       -> e.kind
+  EChar(_)       -> e.kind
+  EStr(_, _)     -> e.kind
+  EUnit          -> e.kind
+  EVar(_)        -> e.kind
+  EUnder         -> e.kind
+  EPlaceholder   -> e.kind
+  EHole(_)       -> e.kind
+  ETodo(_)       -> e.kind
+  EVariantsOf(_, _) -> e.kind
+  EModCall(_, _) -> e.kind
+  EIntrinsic(name, args_) ->
+    EIntrinsic(name, rqc_expr_list(args_, locals, mt, file))
+  ECall(callee, args_) ->
+    ECall(rqc_expr(callee, locals, mt, file),
+          rqc_expr_list(args_, locals, mt, file))
+  EIndex(a, b)         -> EIndex(rqc_expr(a, locals, mt, file),
+                                  rqc_expr(b, locals, mt, file))
+  EBinop(op, a, b)     -> EBinop(op, rqc_expr(a, locals, mt, file),
+                                      rqc_expr(b, locals, mt, file))
+  EUnop(op, x)         -> EUnop(op, rqc_expr(x, locals, mt, file))
+  EIf(c, t_, eo)       -> EIf(rqc_expr(c, locals, mt, file),
+                                rqc_expr(t_, locals, mt, file),
+                                rqc_expr_opt(eo, locals, mt, file))
+  ERecordLit(name, fs) -> ERecordLit(name, rqc_fields_init(fs, locals, mt, file))
+  EList(els)           -> EList(rqc_list_elems(els, locals, mt, file))
+  ERange(a, b, opt_step) -> ERange(rqc_expr(a, locals, mt, file),
+                                     rqc_expr(b, locals, mt, file),
+                                     rqc_expr_opt(opt_step, locals, mt, file))
+  EPipe(a, b)          -> EPipe(rqc_expr(a, locals, mt, file),
+                                  rqc_expr(b, locals, mt, file))
+  EMapPipe(a, b)       -> EMapPipe(rqc_expr(a, locals, mt, file),
+                                     rqc_expr(b, locals, mt, file))
+  EFlatMapPipe(a, b)   -> EFlatMapPipe(rqc_expr(a, locals, mt, file),
+                                          rqc_expr(b, locals, mt, file))
+  EFilterPipe(a, b)    -> EFilterPipe(rqc_expr(a, locals, mt, file),
+                                         rqc_expr(b, locals, mt, file))
+  ELitUnit(inner, u)   -> ELitUnit(rqc_expr(inner, locals, mt, file), u)
+  EBang(inner)         -> EBang(rqc_expr(inner, locals, mt, file))
+}
+
+fn rqc_expr_opt(opt: Option[Expr], locals: [String], mt: [ModuleEntry], file: String) : Option[Expr] / Console + File = match opt {
+  None    -> None
+  Some(x) -> Some(rqc_expr(x, locals, mt, file))
+}
+
+fn rqc_expr_list(es: [Expr], locals: [String], mt: [ModuleEntry], file: String) : [Expr] / Console + File = match es {
+  []           -> []
+  [h, ...rest] -> [rqc_expr(h, locals, mt, file), ...rqc_expr_list(rest, locals, mt, file)]
+}
+
+fn rqc_fields_init(fs: [FieldInit], locals: [String], mt: [ModuleEntry], file: String) : [FieldInit] / Console + File = match fs {
+  []           -> []
+  [h, ...rest] -> [rqc_field_init(h, locals, mt, file), ...rqc_fields_init(rest, locals, mt, file)]
+}
+
+fn rqc_field_init(fi: FieldInit, locals: [String], mt: [ModuleEntry], file: String) : FieldInit / Console + File = match fi {
+  FI(name, e) -> FI(name, rqc_expr(e, locals, mt, file))
+}
+
+fn rqc_list_elems(els: [ListElem], locals: [String], mt: [ModuleEntry], file: String) : [ListElem] / Console + File = match els {
+  []           -> []
+  [h, ...rest] -> [rqc_list_elem(h, locals, mt, file), ...rqc_list_elems(rest, locals, mt, file)]
+}
+
+fn rqc_list_elem(el: ListElem, locals: [String], mt: [ModuleEntry], file: String) : ListElem / Console + File = match el {
+  ElPlain(e)  -> ElPlain(rqc_expr(e, locals, mt, file))
+  ElSpread(e) -> ElSpread(rqc_expr(e, locals, mt, file))
+}
+
+fn rqc_arms(arms: [Arm], locals: [String], mt: [ModuleEntry], file: String) : [Arm] / Console + File = match arms {
+
+  [] -> []
+  [a, ...rest] -> [rqc_arm(a, locals, mt, file), ...rqc_arms(rest, locals, mt, file)]
+}
+
+fn rqc_arm(a: Arm, locals: [String], mt: [ModuleEntry], file: String) : Arm / Console + File = match a {
+
+  Arm(pat, opt_guard, body) -> {
+    let inner = pat_binders(pat, locals)
+    let guard1 = match opt_guard {
+      Some(g) -> Some(rqc_expr(g, inner, mt, file))
+      None -> None
+    }
+    Arm(pat, guard1, rqc_expr(body, inner, mt, file))
+  }
+}
+
+fn rqc_hclauses(cs: [HClause], locals: [String], mt: [ModuleEntry], file: String) : [HClause] / Console + File =
+
+  match cs {
+    [] -> []
+    [c, ...rest] -> [rqc_hclause(c, locals, mt, file), ...rqc_hclauses(rest, locals, mt, file)]
+  }
+
+fn rqc_hclause(c: HClause, locals: [String], mt: [ModuleEntry], file: String) : HClause / Console + File = match c {
+
+  HC(name, params, body, l, col) -> {
+    let inner = list_append(locals, fn_param_names(params))
+    HC(name, params, rqc_expr(body, inner, mt, file), l, col)
+  }
+}
+
+fn rqc_hreturn(r: HReturn, locals: [String], mt: [ModuleEntry], file: String) : HReturn / Console + File = match r {
+
+  HR(pname, body, l, c) ->
+    HR(pname, rqc_expr(body, [pname, ...locals], mt, file), l, c)
+}
+
+# Stmt-walker: threads the scope through a block's statement list.
+# `bound` accumulates the local names introduced so far; the final
+# expression after the last SExprStmt sees the full bound set.
+type RqcStmtsAcc = { stmts: [Stmt], bound: [String] }
+
+fn rqc_block_stmts(stmts: [Stmt], locals: [String], mt: [ModuleEntry], file: String, acc_stmts: [Stmt]) : RqcStmtsAcc / Console + File =
+
+  match stmts {
+    [] -> RqcStmtsAcc { stmts: list_reverse(acc_stmts), bound: locals }
+    [s, ...rest] -> {
+      let r = rqc_stmt(s, locals, mt, file)
+      rqc_block_stmts(rest, r.bound, mt, file, [r.s, ...acc_stmts])
+    }
+  }
+
+type RqcStmtR = { s: Stmt, bound: [String] }
+
+fn rqc_stmt(s: Stmt, locals: [String], mt: [ModuleEntry], file: String) : RqcStmtR / Console + File = match s {
+
+  SLet(pat, ty_opt, e) -> {
+    # The RHS evaluates under the *outer* scope; bindings from `pat`
+    # only become visible to subsequent stmts.
+    let e1 = rqc_expr(e, locals, mt, file)
+    let inner = pat_binders(pat, locals)
+    RqcStmtR { s: SLet(pat, ty_opt, e1), bound: inner }
+  }
+  SAssert(e, opt_msg) -> {
+    let e1 = rqc_expr(e, locals, mt, file)
+    let m1 = match opt_msg {
+      Some(m) -> Some(rqc_expr(m, locals, mt, file))
+      None -> None
+    }
+    RqcStmtR { s: SAssert(e1, m1), bound: locals }
+  }
+  SExprStmt(e) ->
+    RqcStmtR { s: SExprStmt(rqc_expr(e, locals, mt, file)), bound: locals }
+  SIndexAssign(target, ix, v, l, c) -> {
+    let t1 = rqc_expr(target, locals, mt, file)
+    let i1 = rqc_expr(ix, locals, mt, file)
+    let v1 = rqc_expr(v, locals, mt, file)
+    RqcStmtR { s: SIndexAssign(t1, i1, v1, l, c), bound: locals }
+  }
+  SVar(name, ty_opt, init, l, c) -> {
+    # SVar should not survive the desugar pass that runs before
+    # rqc, but we handle it defensively just in case rqc lands
+    # earlier in the pipeline some day.
+    let init1 = rqc_expr(init, locals, mt, file)
+    RqcStmtR { s: SVar(name, ty_opt, init1, l, c), bound: [name, ...locals] }
+  }
+  # SUse introduces no value bindings; leaves locals untouched.
+  SUse(eff, l, c) ->
+    RqcStmtR { s: SUse(eff, l, c), bound: locals }
+}
+
+# ====================================================================
+# m7f §7 — `import ?name` symbol-index resolver
+# ====================================================================
+#
+# When the user writes `import ?some_symbol`, the resolver scans a
+# small list of well-known stdlib modules and any module already
+# imported via a regular `import` for a `pub fn some_symbol`. The
+# diagnostic lists every match so the user can replace the hole with
+# an explicit module path.
+#
+# v1 scope:
+#  - The known-stdlib list is hardcoded — kaikai stage2 has no
+#    listdir effect, so an automatic walk over arbitrary search-paths
+#    is not feasible without one. The hardcoded list covers every
+#    module that lives in `stdlib/` today.
+#  - The match is the literal pub fn name (no fuzzy matching, no
+#    type-direction). A v2 lane can add Levenshtein suggestions
+#    when nothing matches exactly.
+#  - The IkHole node is treated as inert by every downstream pass
+#    (it loads no module, binds no name in the env, emits no code).
+#    The diagnostic is the entire user-visible effect.
+
+fn import_hole_known_stdlib() : [String] = [
+  "core", "actor", "effects", "loop", "protocols", "reader",
+  "spawn", "writer"
+]
+
+# Try to load a module's source from the search paths and return the
+# list of `pub fn name` identifiers it exports. Returns an empty
+# list if the module cannot be opened — the caller treats that as
+# "no candidate from this path".
+fn import_hole_pub_fns(base_dir: String, mod_path: String,
+                         search_paths: [String]) : [String] / File + Console {
+
+  let cf = find_module_file(base_dir, mod_path, search_paths)
+  match cf {
+    CF(_, opt_src) -> match opt_src {
+      None      -> []
+      Some(src) -> {
+        let toks = tokenize(src)
+        let parsed = parse_program(mod_path, src, toks)
+        match parsed.decls {
+          None -> []
+          Some(decls) -> import_hole_collect_pub_fns(decls, [])
+        }
+      }
+    }
+  }
+}
+
+fn import_hole_collect_pub_fns(ds: [Decl], acc: [String]) : [String] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DFn(is_pub, name, _, _, _, _, _, _, _, _) ->
+        if is_pub { import_hole_collect_pub_fns(rest, [name, ...acc]) }
+        else     { import_hole_collect_pub_fns(rest, acc) }
+      _ -> import_hole_collect_pub_fns(rest, acc)
+    }
+  }
+}
+
+# A single "module exports name" hit.
+type ImportHoleHit = IHH(String, String)
+
+fn import_hole_search_modules(target: String, base_dir: String,
+                                 mods: [String], search_paths: [String],
+                                 acc: [ImportHoleHit]) : [ImportHoleHit] / File + Console {
+
+  match mods {
+    [] -> list_reverse(acc)
+    [m, ...rest] -> {
+      let pubs = import_hole_pub_fns(base_dir, m, search_paths)
+      if list_has(pubs, target) {
+        import_hole_search_modules(target, base_dir, rest, search_paths,
+                                      [IHH(m, target), ...acc])
+      } else {
+        import_hole_search_modules(target, base_dir, rest, search_paths, acc)
+      }
+    }
+  }
+}
+
+# Also walk the modules the user already imported in this file
+# (regular DImport with IkPath / IkAlias / IkSelective).
+fn import_hole_explicit_paths(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DImport(ik, _, _) -> match ik {
+        IkPath(p)         -> import_hole_explicit_paths(rest, [p, ...acc])
+        IkAlias(p, _)     -> import_hole_explicit_paths(rest, [p, ...acc])
+        IkSelective(p, _) -> import_hole_explicit_paths(rest, [p, ...acc])
+        IkHole(_)         -> import_hole_explicit_paths(rest, acc)
+      }
+      _ -> import_hole_explicit_paths(rest, acc)
+    }
+  }
+}
+
+# Top-level: report every IkHole in `decls`. Returns the number of
+# unresolved holes (zero matches → 1; everything else → 0). The
+# caller aborts compilation if any holes failed to resolve so the
+# downstream typer/codegen sees no IkHole noise.
+pub fn report_import_holes(file: String, decls: [Decl], base_dir: String,
+                          search_paths: [String]) : Int / Console + File {
+  let explicit = import_hole_explicit_paths(decls, [])
+  # Combine stdlib + user-explicit module paths, deduped by name.
+  let all_mods = import_hole_dedup_paths(
+    list_append(import_hole_known_stdlib(), explicit), [])
+  report_import_holes_loop(file, decls, base_dir, all_mods, search_paths, 0)
+}
+
+fn import_hole_dedup_paths(xs: [String], acc: [String]) : [String] {
+  match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] ->
+      if list_has(acc, h) { import_hole_dedup_paths(rest, acc) }
+      else { import_hole_dedup_paths(rest, [h, ...acc]) }
+  }
+}
+
+fn report_import_holes_loop(file: String, decls: [Decl], base_dir: String,
+                              mods: [String], search_paths: [String],
+                              errs: Int) : Int / Console + File {
+  match decls {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DImport(ik, line, col) -> match ik {
+        IkHole(name) -> {
+          let hits = import_hole_search_modules(name, base_dir, mods,
+                                                   search_paths, [])
+          let new_errs = report_import_hole(file, name, line, col, hits)
+          report_import_holes_loop(file, rest, base_dir, mods, search_paths,
+                                      errs + new_errs)
+        }
+        _ -> report_import_holes_loop(file, rest, base_dir, mods, search_paths, errs)
+      }
+      _ -> report_import_holes_loop(file, rest, base_dir, mods, search_paths, errs)
+    }
+  }
+}
+
+fn report_import_hole(file: String, name: String, line: Int, col: Int,
+                        hits: [ImportHoleHit]) : Int / Console + File {
+
+  match hits {
+    [] -> {
+      diag_error(file, line, col,
+        "import hole: no module exports `#{name}`")
+      diag_help("the symbol-index v1 only scans well-known stdlib modules and modules already imported by name in this file")
+      diag_note("add an `import some.module` for the file that exports `#{name}`, then replace the hole if you still want the report")
+      1
+    }
+    [h] -> match h {
+      IHH(mod_path, _) -> {
+        diag_error(file, line, col,
+          "import hole: `#{name}` is exported by `#{mod_path}`")
+        diag_help("replace `?#{name}` with `#{mod_path}` (the import then loads the module and exposes `#{name}`)")
+        1
+      }
+    }
+    _ -> {
+      diag_error(file, line, col,
+        "import hole: `#{name}` is exported by multiple modules")
+      report_import_hole_candidates(hits)
+      diag_help("replace `?#{name}` with one of the explicit module paths above")
+      1
+    }
+  }
+}
+
+fn report_import_hole_candidates(hits: [ImportHoleHit]) : Unit / Console {
+  match hits {
+    [] -> ()
+    [h, ...rest] -> match h {
+      IHH(mod_path, _) -> {
+        diag_note("candidate: `#{mod_path}`")
+        report_import_hole_candidates(rest)
+      }
+    }
+  }
+}
+
+# Strip every DUse and IkHole DImport from the decl stream after
+# the diagnostic pass runs. Downstream passes never see them.
+pub fn strip_import_holes(decls: [Decl], acc: [Decl]) : [Decl] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DImport(ik, _, _) -> match ik {
+        IkHole(_) -> strip_import_holes(rest, acc)
+        _         -> strip_import_holes(rest, [d, ...acc])
+      }
+      _ -> strip_import_holes(rest, [d, ...acc])
+    }
+  }
+}
+
+# ====================================================================
+# Issue #510 — `pub` enforcement at module + prelude boundaries
+# ====================================================================
+#
+# Pre-issue-#510, `pub` was parsed and stored on every Decl but only
+# consulted by:
+#   - `collect_pub_exports` (filters qualified-call resolution via
+#     `mod.fn` against the module table; `rqc_decls` rejects qualified
+#     calls to non-`pub` names with "module 'X' does not export 'Y'");
+#   - `import_hole_collect_pub_fns` (typed-hole / auto-import hints —
+#     not a visibility control).
+#
+# Bare-name resolution (the `EVar(name)` path that the typer
+# eventually drives through `ty_env_lookup`) had no visibility check.
+# A user-file `lib_private()` call against a prelude/import that
+# defined `fn lib_private()` (no `pub`) compiled cleanly and linked
+# straight through to `kai_lib__lib_private`, even though every
+# convention in `docs/design.md`, `docs/m14-bootstrap-audit.md`, and
+# 672 `pub` lines in `stdlib/` assumed otherwise.
+#
+# This pass closes the gap. It runs after `rqc_decls` rewrites
+# qualified `EField(EVar(mod), fn)` calls into `EModCall(mod, fn)`
+# but before any other downstream walker, so:
+#   - qualified-call visibility is already gated by `me_has_export`
+#     (the existing `rqc_diag_missing_export` diag fires when the
+#     referenced name is non-`pub`);
+#   - bare-name visibility is the gap this pass closes, by walking
+#     every Decl body with a (locals, home_module) tracker and
+#     rejecting `EVar(nm)` references where `nm` is a non-`pub` decl
+#     authored in a different module than the surrounding body.
+#
+# Strict enforcement (no warning grace period) per the v0.54.0
+# release plan: pre-1.0 kaikai has no external users, so one breaking
+# version with a clear migration path is preferable to two transitional
+# ones. The companion stdlib sweep adds `pub` to every internal helper
+# that user-facing code legitimately needs to reach (e.g. helpers that
+# moved here from the root file when modules were factored out, but
+# never had `pub` added back).
+
+# PubAccessEntry records ALL top-level declarations the bare-name
+# resolver might find under a given name, so the validator can
+# decide whether ANY visible decl with that name satisfies the
+# pub-access rule before flagging a reference as private.
+#
+# A referencing site `EVar(nm)` with surrounding home module `H`
+# accepts the name when at least one entry under that name has
+# either `home == H` (same module — always callable) or `is_pub`
+# (public, visible across modules). Only when NO entry satisfies
+# the rule is the reference reported.
+#
+# Two examples this design handles cleanly:
+#
+#   - `pub fn sum` in `stdlib/core/list.kai` plus a non-`pub`
+#     `fn sum` in `demos/euler1/main.kai` produces two entries
+#     under "sum". Inside list.kai a self-call to `sum` matches
+#     the same-home rule; inside the demo it also matches (root
+#     scope). A reference from a third module would still
+#     resolve through the `pub` entry.
+#   - A variant ctor exported from a `pub type T = A | B` and a
+#     same-named ctor from a non-`pub` user type stay distinct;
+#     the typer / `unions` infrastructure disambiguates by
+#     receiver type. Validation only refuses references where
+#     EVERY candidate entry is private to a foreign module.
+# Issue #510: the per-prelude-file `(mod_name, decls)` split. The
+# driver's prelude loader (`load_core` in main.kai) builds one `PSeg`
+# per prelude file so the pub-access validator can treat each prelude
+# as its own home module — without it the flat decl append loses the
+# boundary between prelude files and a DType/DEffect at the head of one
+# prelude inherits the previous prelude's tagged module. `pub` because
+# the driver constructs `PSeg` values and threads them into
+# `validate_pub_access` / `collect_pub_access_table`.
+pub type PreludeSegment = PSeg(String, [Decl])
+
+type PubAccessEntry = PAE(String, String, Bool)
+#                          name    home    is_pub
+
+# Build the table of every top-level declaration in the merged
+# decl stream. Each entry records the decl's name, the module
+# it was authored in, and whether it is `pub`. The validator
+# consults the full table per reference so a non-`pub` decl in
+# one module is admissible if another decl with the same name
+# is visible (same-home or `pub`).
+#
+# Skipped: `DImport` (no name), `DTest` / `DBench` / `DCheck`
+# (no surface names that can be referenced).
+#
+# DAttribPure / DDerive wrap an inner Decl whose name + pub-ness
+# drive the decision; we delegate to a recursive sub-walk.
+# DImpl's method DFns are walked too because variant-class
+# protocol methods are looked up by name on the typer side.
+fn collect_priv_decls(decls: [Decl], target_mod: String,
+                       acc: [PubAccessEntry]) : [PubAccessEntry] =
+  collect_priv_decls_loop(decls, target_mod, target_mod, acc)
+
+# DType / DEffect / DProtocol / DUnit / DConst / DAxiom carry no
+# `module_origin` field in v1 of issue #510, so we recover the
+# home module by streaming the flat decl list: every DFn (or
+# DAttribPure(DFn), or DAxiom-already-lowered) carries `mo`, and
+# whatever comes between them shares that module. The decl stream
+# arrives in source order — prelude files first (each emitting a
+# contiguous block) and finally the target file — so the most-
+# recently-seen tagged DFn's `mo` is the right home for an
+# untagged neighbour. When a DFn carries `mo = None` (the parser
+# default for root-file decls AND for non-`pub` root-file decls
+# after `tag_target_decls_module_origin`'s pub-only carve-out), we
+# reset `cur_mod` back to `target_mod` so the next untagged DType
+# in the root file is not mistakenly attributed to the last
+# prelude module we saw.
+fn collect_priv_decls_loop(decls: [Decl], target_mod: String,
+                              cur_mod: String, acc: [PubAccessEntry])
+                              : [PubAccessEntry] = match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
+      let acc1 = priv_one(d, next_mod, acc)
+      collect_priv_decls_loop(rest, target_mod, next_mod, acc1)
+    }
+  }
+
+# When a DFn carries `mo = Some(m)`, switch the running home to
+# `m`. When it carries `mo = None` (root-file decl after the
+# pub-only `tag_target_decls_module_origin`), reset to
+# `target_mod` — the last seen tagged DFn was in a prelude, and
+# the present untagged DFn marks the start of the root file.
+pub fn decl_home_hint_reset(d: Decl, cur_mod: String, target_mod: String) : String =
+  match d {
+    DFn(_, _, _, _, _, _, _, _, _, mo) -> match mo {
+      Some(m) -> m
+      None    -> target_mod
+    }
+    # DAxiom is the bare-form `extern "C" fn` / `axiom` shape that
+    # `lower_axioms` rewrites to DFn later. It carries no
+    # `module_origin` field, so a root-file DAxiom (e.g. `extern
+    # "C" fn abs(n: Int) : Int / Ffi` inside an examples/effects
+    # fixture) would otherwise inherit the last prelude's home.
+    # Reset to `target_mod` instead — this is symmetric to the
+    # DFn(None) reset above and matches the codegen's
+    # `tag_target_decls_module_origin` carve-out.
+    DAxiom(_, _, _, _, _, _, _, _, _, _) -> target_mod
+    DAttribPure(inner, _, _)        -> decl_home_hint_reset(inner, cur_mod, target_mod)
+    DDerive(_, inner, _, _)         -> decl_home_hint_reset(inner, cur_mod, target_mod)
+    DUnstable(inner, _, _)          -> decl_home_hint_reset(inner, cur_mod, target_mod)
+    DImpl(_, _, _, sub_decls, _, _) -> impl_home_hint_reset(sub_decls, cur_mod, target_mod)
+    _ -> cur_mod
+  }
+
+fn impl_home_hint_reset(ms: [Decl], cur_mod: String, target_mod: String) : String =
+  match ms {
+    [] -> cur_mod
+    [m, ...rest] -> match m {
+      DFn(_, _, _, _, _, _, _, _, _, mo) -> match mo {
+        Some(mm) -> mm
+        None     -> target_mod
+      }
+      _ -> impl_home_hint_reset(rest, cur_mod, target_mod)
+    }
+  }
+
+# Pick the home-module hint for the next decl based on this decl's
+# `module_origin` field (if any). DFn / DAxiom carry `mo`;
+# DAttribPure / DDerive / DImpl wrap an inner Decl whose `mo` is
+# the real source. Anything else inherits the running cur_mod
+# (which started at target_mod).
+fn decl_home_hint(d: Decl, cur_mod: String) : String = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> home_of(mo, cur_mod)
+  DAxiom(_, _, _, _, _, _, _, _, _, _) -> cur_mod
+  DAttribPure(inner, _, _)             -> decl_home_hint(inner, cur_mod)
+  DDerive(_, inner, _, _)              -> decl_home_hint(inner, cur_mod)
+  DUnstable(inner, _, _)               -> decl_home_hint(inner, cur_mod)
+  DImpl(_, _, _, sub_decls, _, _)      -> impl_home_hint(sub_decls, cur_mod)
+  _ -> cur_mod
+}
+
+# Peek into the first DFn method of a DImpl to pick up the impl's
+# home module. `tag_decl_module_origin`'s DImpl arm propagates
+# `mo` to every method, so any method works; pick the first.
+fn impl_home_hint(ms: [Decl], cur_mod: String) : String = match ms {
+  [] -> cur_mod
+  [m, ...rest] -> match m {
+    DFn(_, _, _, _, _, _, _, _, _, mo) -> home_of(mo, cur_mod)
+    _ -> impl_home_hint(rest, cur_mod)
+  }
+}
+
+fn priv_one(d: Decl, home_mod: String, acc: [PubAccessEntry]) : [PubAccessEntry] =
+  match d {
+    DFn(is_pub, name, _, _, _, _, _, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DAxiom(is_pub, _, name, _, _, _, _, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DConst(is_pub, name, _, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DType(is_pub, name, _, body, _, _, _) ->
+      pae_with_variants(name, body, home_mod, is_pub, acc)
+    DEffect(is_pub, name, _, _, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DProtocol(is_pub, name, _, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DUnit(is_pub, name, _, _, _) ->
+      [PAE(name, home_mod, is_pub), ...acc]
+    DAttribPure(inner, _, _) -> priv_one(inner, home_mod, acc)
+    DDerive(_, inner, _, _)  -> priv_one(inner, home_mod, acc)
+    DUnstable(inner, _, _)   -> priv_one(inner, home_mod, acc)
+    # Issue #510 — DImpl method bodies. A `impl P for T { fn op(...)
+    # = body }` makes `op` callable cross-module through the protocol
+    # dispatcher; the method itself has no surface `pub` marker.
+    # Register every method as `is_pub = true` so a bare-name `op(x)`
+    # in another module is not flagged as private just because the
+    # `impl`-author did not write `pub` on the method head. The
+    # protocol type declaration (`pub protocol P { ... }`) still
+    # controls whether `P` itself is exported; this rule covers the
+    # impl methods only.
+    DImpl(_, _, _, sub_decls, _, _) ->
+      impl_methods_pub(sub_decls, home_mod, acc)
+    _ -> acc
+  }
+
+fn impl_methods_pub(ms: [Decl], home_mod: String,
+                      acc: [PubAccessEntry]) : [PubAccessEntry] = match ms {
+  [] -> acc
+  [m, ...rest] -> match m {
+    DFn(_, name, _, _, _, _, _, _, _, _) ->
+      impl_methods_pub(rest, home_mod, [PAE(name, home_mod, true), ...acc])
+    _ -> impl_methods_pub(rest, home_mod, acc)
+  }
+}
+
+fn home_of(mo: Option[String], target_mod: String) : String = match mo {
+  Some(m) -> m
+  None    -> target_mod
+}
+
+# A sum type's variant ctors share the type's `pub` status: a
+# `pub type T = A | B` exports both the type name AND every ctor;
+# a non-`pub` `type T = A | B` keeps both private. Record one
+# PubAccessEntry per ctor under the type's home module so the
+# validator can apply the same accept-if-any-visible rule.
+fn pae_with_variants(name: String, body: TypeBody, mod: String,
+                       is_pub: Bool, acc: [PubAccessEntry]) : [PubAccessEntry] =
+  match body {
+    TBSum(vs) -> pae_variants(vs, mod, is_pub,
+                                [PAE(name, mod, is_pub), ...acc])
+    _         -> [PAE(name, mod, is_pub), ...acc]
+  }
+
+fn pae_variants(vs: [Variant], mod: String, is_pub: Bool,
+                  acc: [PubAccessEntry]) : [PubAccessEntry] = match vs {
+  [] -> acc
+  [v, ...rest] -> match v {
+    Var(cname, _) -> pae_variants(rest, mod, is_pub,
+                                    [PAE(cname, mod, is_pub), ...acc])
+  }
+}
+
+# Decision routine — given the full table, the referenced name and
+# the surrounding home module, return:
+#   - `Visible` when at least one entry under `name` is admissible
+#     (same-home, or `pub`),
+#   - `PrivateTo(other_home)` when every entry sits in another
+#     module AND is non-`pub` (the diagnostic prints the first
+#     such home as the offending module),
+#   - `Unknown` when no entry exists for the name (typer reports
+#     "cannot find" separately).
+type PubAccessVerdict
+  = Visible
+  | PrivateTo(String)
+  | Unknown
+
+fn pae_decide(table: [PubAccessEntry], name: String, home: String) : PubAccessVerdict =
+  pae_decide_loop(table, name, home, None)
+
+fn pae_decide_loop(table: [PubAccessEntry], name: String, home: String,
+                     first_private: Option[String]) : PubAccessVerdict =
+  match table {
+    [] -> match first_private {
+      Some(m) -> PrivateTo(m)
+      None    -> Unknown
+    }
+    [e, ...rest] -> match e {
+      PAE(n, h, p) ->
+        if n == name {
+          if h == home or p { Visible }
+          else {
+            let fp = match first_private {
+              Some(_) -> first_private
+              None    -> Some(h)
+            }
+            pae_decide_loop(rest, name, home, fp)
+          }
+        } else {
+          pae_decide_loop(rest, name, home, first_private)
+        }
+    }
+  }
+
+# Walk every Decl body and report each `EVar(nm)` non-local reference
+# whose name belongs to a non-`pub` decl in a different module than
+# the surrounding decl. Returns the number of violations reported.
+#
+# The locals tracker mirrors `rqc_decls` exactly: fn params, lambda
+# params, let/var patterns, match-arm patterns, handle clause params,
+# and `with ... as alias` aliases all extend the visible-name set.
+# A name in scope as a local always wins (Rule B in `rqc_decls`).
+# `take` / `drop` from `stdlib/core/list.kai` are not available
+# while building stage 1 (stage 0 has no prelude); use these
+# decl-list-specific helpers instead. Issue #510 is the only
+# caller, so the names stay private.
+pub fn pae_take(xs: [Decl], n: Int) : [Decl] = match xs {
+  [] -> []
+  [h, ...t] -> if n <= 0 { [] } else { [h, ...pae_take(t, n - 1)] }
+}
+
+pub fn pae_drop(xs: [Decl], n: Int) : [Decl] = match xs {
+  [] -> []
+  [h, ...t] -> if n <= 0 { [h, ...t] } else { pae_drop(t, n - 1) }
+}
+
+pub fn validate_pub_access(prelude_segs: [PreludeSegment],
+                         qualified_prelude: [Decl],
+                         imports_decls: [Decl], root_decls: [Decl],
+                         target_mod: String,
+                         file: String) : Int / Console + File {
+
+  let table = collect_pub_access_table(prelude_segs, imports_decls,
+                                          root_decls, target_mod)
+  let e1 = vpa_decls_loop(qualified_prelude, table, target_mod,
+                             target_mod, file, 0)
+  let e2 = vpa_decls_loop(imports_decls, table, target_mod,
+                             target_mod, file, e1)
+  vpa_decls_loop(root_decls, table, target_mod, target_mod, file, e2)
+}
+
+fn collect_pub_access_table(prelude_segs: [PreludeSegment],
+                              imports_decls: [Decl], root_decls: [Decl],
+                              target_mod: String) : [PubAccessEntry] = {
+  let acc0 = cpa_segs(prelude_segs, [])
+  # For imports, the first tagged DFn in the segment hints the
+  # home for any preceding untagged DType / DEffect / DProtocol /
+  # DUnit (which carry no `module_origin` of their own). Compute
+  # the per-decl home via a tag-anchor lookahead and feed each
+  # entry into `priv_one` directly.
+  let imports_homes = imports_home_anchors(imports_decls, target_mod,
+                                              target_mod, [])
+  let acc1 = cpa_with_homes(imports_decls, imports_homes, acc0)
+  let acc2 = cpa_seg(root_decls, target_mod, target_mod, acc1)
+  list_reverse(acc2)
+}
+
+# A per-decl home attribution paired with a flag distinguishing
+# anchored entries (the decl itself carried `module_origin =
+# Some(m)`) from derived entries (a non-DFn that inherited its
+# home from the running `cur_mod`). Issue #565: the flag is what
+# stops a later anchor from propagating across an unrelated
+# already-anchored module — see `propagate_home_back`.
+pub type HomeAnchor = HA(String, Bool)
+#                    home    anchored
+
+# For each decl in `ds`, return the home module it should be
+# attributed to. Algorithm: scan left-to-right; when a DFn/DAxiom
+# with `mo=Some(m)` lands, retroactively assign `m` to every
+# preceding derived (non-anchored) decl that was attributed to
+# the running `cur_mod` and update the running home to `m`. The
+# result is a list of homes in source order — one per decl.
+#
+# Issue #565: without the anchored flag, a transitive import chain
+# `consumer -> mid -> leaf` would mis-attribute every decl of `leaf`
+# to `mid`. When `leaf`'s decls land first (process_imports recurses
+# depth-first), they anchor under `leaf`; when `mid`'s first explicit
+# DFn arrives later, `propagate_home_back` walks back replacing every
+# preceding entry that still reads `cur_mod`. Since `cur_mod` stayed
+# at `leaf` after the last `leaf` DFn (the new `mid` non-DFn DTypes
+# inherit `leaf`), the back-propagation overruns `mid`'s own DTypes
+# AND every previously-anchored `leaf` DFn. The flag stops the walk
+# at the first anchored entry, preserving `leaf`'s attributions.
+pub fn imports_home_anchors(ds: [Decl], target_mod: String, cur_mod: String,
+                          acc: [HomeAnchor]) : [HomeAnchor] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> {
+    let hint = decl_home_hint_reset(d, cur_mod, target_mod)
+    # If this decl explicitly carries `Some(m)`, propagate `m`
+    # backward to any prior derived entries still tagged with the
+    # previous `cur_mod` (so a DType at the head of the import
+    # inherits the first DFn's mod). Anchored entries — those
+    # whose own decl had `module_origin = Some(_)` — are never
+    # overwritten.
+    let explicit = decl_explicit_home(d)
+    let acc1 = match explicit {
+      Some(m) -> propagate_home_back(acc, cur_mod, m, [])
+      None    -> acc
+    }
+    let mine = match explicit {
+      Some(m) -> HA(m, true)
+      None    -> HA(hint, false)
+    }
+    imports_home_anchors(rest, target_mod, ha_home(mine), [mine, ...acc1])
+  }
+}
+
+pub fn ha_home(h: HomeAnchor) : String = match h { HA(m, _) -> m }
+
+fn decl_explicit_home(d: Decl) : Option[String] = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
+  # Hanga Roa: root-file DTypes also carry `module_origin = Some(_)`
+  # after `tag_target_decl`, so use them as home anchors too — a
+  # leading DType in the root file does not have a DFn ahead of it
+  # to seed the propagate_home_back walk, and the home should not
+  # leak in from the last imported prelude segment.
+  DType(_, _, _, _, _, _, mo) -> mo
+  DAttribPure(inner, _, _)        -> decl_explicit_home(inner)
+  DDerive(_, inner, _, _)         -> decl_explicit_home(inner)
+  DUnstable(inner, _, _)          -> decl_explicit_home(inner)
+  DImpl(_, _, _, sub_decls, _, _) -> impl_first_fn_home(sub_decls)
+  _ -> None
+}
+
+pub fn impl_first_fn_home(ms: [Decl]) : Option[String] = match ms {
+  [] -> None
+  [m, ...rest] -> match m {
+    DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
+    _ -> impl_first_fn_home(rest)
+  }
+}
+
+# Walk `acc` (reversed source order — newest first) and replace
+# every derived (non-anchored) running entry equal to `prev` with
+# `new`, stopping at the first anchored entry OR the first entry
+# whose home already differs. Anchored entries belong to a module
+# that already locked in its attribution and must never be
+# rewritten. Returns the list still in reversed order. Issue #565.
+fn propagate_home_back(acc: [HomeAnchor], prev: String, new: String,
+                         done: [HomeAnchor]) : [HomeAnchor] = match acc {
+  [] -> done
+  [h, ...rest] -> match h {
+    HA(m, anchored) ->
+      if anchored or m != prev {
+        append_reverse_ha(done, [h, ...rest])
+      } else {
+        propagate_home_back(rest, prev, new, [HA(new, false), ...done])
+      }
+  }
+}
+
+fn append_reverse_ha(a: [HomeAnchor], b: [HomeAnchor]) : [HomeAnchor] = match a {
+  [] -> b
+  [h, ...rest] -> append_reverse_ha(rest, [h, ...b])
+}
+
+# Drive `priv_one` per decl using the pre-computed home list.
+fn cpa_with_homes(ds: [Decl], homes: [HomeAnchor],
+                    acc: [PubAccessEntry]) : [PubAccessEntry] =
+  match ds {
+    [] -> acc
+    [d, ...rest_d] -> match homes {
+      [] -> acc
+      [h, ...rest_h] -> {
+        let acc1 = priv_one(d, ha_home(h), acc)
+        cpa_with_homes(rest_d, rest_h, acc1)
+      }
+    }
+  }
+
+# Tabulate every prelude segment with its file's mod name as the
+# initial cur_mod. Each PSeg(mod, decls) walks its decls starting
+# from `mod`, so the first DType in the file is attributed to
+# that file's mod even when the previous segment ended with a
+# differently-tagged DFn.
+fn cpa_segs(segs: [PreludeSegment], acc: [PubAccessEntry]) : [PubAccessEntry] =
+  match segs {
+    [] -> acc
+    [s, ...rest] -> match s {
+      PSeg(mod_name, decls) -> {
+        let acc1 = cpa_seg(decls, mod_name, mod_name, acc)
+        cpa_segs(rest, acc1)
+      }
+    }
+  }
+
+fn cpa_seg(decls: [Decl], target_mod: String, cur_mod: String,
+             acc: [PubAccessEntry]) : [PubAccessEntry] = match decls {
+  [] -> acc
+  [d, ...rest] -> {
+    let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
+    let acc1 = priv_one(d, next_mod, acc)
+    cpa_seg(rest, target_mod, next_mod, acc1)
+  }
+}
+
+# Mirrors `collect_priv_decls_loop`'s streaming hint logic so the
+# per-decl `vpa_decl` walker sees the right home module for any
+# DFn whose `mo` field happens to be `None` (root file no-pub
+# decls and a few wrappers).
+
+fn vpa_decls(decls: [Decl], table: [PubAccessEntry], target_mod: String,
+               file: String, errs: Int) : Int / Console + File =
+
+  vpa_decls_loop(decls, table, target_mod, target_mod, file, errs)
+
+fn vpa_decls_loop(decls: [Decl], table: [PubAccessEntry],
+                    target_mod: String, cur_mod: String,
+                    file: String, errs: Int) : Int / Console + File = match decls {
+
+  [] -> errs
+  [d, ...rest] -> {
+    let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
+    let e1 = errs + vpa_decl(d, table, next_mod, target_mod, file)
+    vpa_decls_loop(rest, table, target_mod, next_mod, file, e1)
+  }
+}
+
+fn vpa_decl(d: Decl, table: [PubAccessEntry], home: String,
+              target_mod: String, file: String) : Int / Console + File = match d {
+
+  DFn(_, _, tparams, params, ret, row, body, line, col, _) -> {
+    let es = vpa_sig_params(params, table, home, file, tparams, 0)
+    let er = match ret {
+      Some(te) -> es + vpa_sig_te(te, table, home, file, tparams)
+      None -> es
+    }
+    let ew = er + vpa_sig_row(row, table, home, file, tparams, line, col)
+    ew + vpa_expr(body, fn_param_names(params), table, home, file, 0)
+  }
+  DAxiom(_, _, _, _, tparams, params, ret, row, line, col) -> {
+    let es = vpa_sig_params(params, table, home, file, tparams, 0)
+    let er = es + vpa_sig_te(ret, table, home, file, tparams)
+    er + vpa_sig_row(row, table, home, file, tparams, line, col)
+  }
+  DConst(_, _, te, body, _, _) -> {
+    let es = vpa_sig_te(te, table, home, file, [])
+    es + vpa_expr(body, [], table, home, file, 0)
+  }
+  # Pub-access checks the signature of a `type` declaration only when
+  # it is itself `pub` — the leak only matters when the type's shape
+  # is exposed to consumer modules. A non-pub `type T = body` can
+  # freely reference other non-pub types of the same module (e.g.
+  # `Tree[k, v]` self-referencing inside its TNode variant); those
+  # names never reach a consumer because `T` itself is invisible.
+  DType(is_pub, _, tparams, body, line, col, _) ->
+    if is_pub { vpa_sig_typebody(body, table, home, file, tparams, line, col) }
+    else      { 0 }
+  DEffect(_, _, tparams, ops, _, _, _) ->
+    vpa_sig_eops(ops, table, home, file, tparams, 0)
+  DProtocol(_, _, tparams, ops, _, _) ->
+    # Protocol ops carry `Self` as the implicit type parameter the
+    # body can refer to; protocols can also declare additional
+    # tparams (`protocol Add[a] { add(self: Self, rhs: a) }`).
+    # Both stack into the per-op tparam list.
+    vpa_sig_pops(ops, table, home, file, ["Self", ...tparams], 0)
+  DTest(_, body, _, _) ->
+    vpa_expr(body, [], table, target_mod, file, 0)
+  DBench(_, body, _, _) ->
+    vpa_expr(body, [], table, target_mod, file, 0)
+  DCheck(_, ps, body, _, _) -> {
+    let es = vpa_sig_params(ps, table, target_mod, file, [], 0)
+    es + vpa_expr(body, fn_param_names(ps), table, target_mod, file, 0)
+  }
+  DImpl(_, targs, target_te, sub_decls, _, _) -> {
+    # `impl[E: Show, T: Show] Show for Result[E, T] { ... }` —
+    # the impl header's tparam list is prepended to every method's
+    # DFn `tparams` field by `prepend_impl_tparams_to_methods` at
+    # parse time. To check the impl header (target type + proto
+    # args) we recover those tparams from the first method.
+    let impl_tparams = impl_tparams_of(sub_decls)
+    let et = vpa_sig_te(target_te, table, home, file, impl_tparams)
+    let ea = et + vpa_sig_te_list(targs, table, home, file, impl_tparams, 0)
+    ea + vpa_decls_loop(sub_decls, table, target_mod, home, file, 0)
+  }
+  DDerive(_, inner, _, _) ->
+    vpa_decl(inner, table, home, target_mod, file)
+  DUnstable(inner, _, _) ->
+    vpa_decl(inner, table, home, target_mod, file)
+  DAttribPure(inner, _, _) ->
+    vpa_decl(inner, table, home, target_mod, file)
+  _ -> 0
+}
+
+# Signature walkers. Each `TyName(n, _)` or `RL(n, _)` or `USym(n)`
+# reachable from a decl signature is checked through `pae_decide`,
+# mirroring how `vpa_kind` checks `EVar(nm)` references in bodies.
+# This closes the privacy leak class where a `pub fn` in one module
+# names a non-`pub` type (or effect / unit / protocol) of another
+# module — a reference the body-only walker missed because the leak
+# lives in the signature, not in any expression.
+fn vpa_sig_params(ps: [Param], table: [PubAccessEntry], home: String,
+                     file: String, tparams: [String],
+                     acc: Int) : Int / Console + File = match ps {
+  [] -> acc
+  [p, ...rest] -> {
+    let e1 = match p.ptype {
+      Some(te) -> acc + vpa_sig_te(te, table, home, file, tparams)
+      None -> acc
+    }
+    vpa_sig_params(rest, table, home, file, tparams, e1)
+  }
+}
+
+fn vpa_sig_te(te: TypeExpr, table: [PubAccessEntry], home: String,
+                 file: String, tparams: [String]) : Int / Console + File = match te.tkind {
+  TyName(n, targs) -> {
+    let en = vpa_sig_check_name(n, table, home, tparams, file, te.line, te.col)
+    let el = vpa_sig_te_list(targs, table, home, file, tparams, 0)
+    en + el
+  }
+  TyList(inner) -> vpa_sig_te(inner, table, home, file, tparams)
+  TyFn(ps, ret, row) -> {
+    let ep = vpa_sig_te_list(ps, table, home, file, tparams, 0)
+    let er = vpa_sig_te(ret, table, home, file, tparams)
+    let ew = vpa_sig_row(row, table, home, file, tparams, te.line, te.col)
+    ep + er + ew
+  }
+  TyDim(base, u) -> {
+    let eb = vpa_sig_te(base, table, home, file, tparams)
+    let eu = vpa_sig_uexpr(u, table, home, file, tparams, te.line, te.col)
+    eb + eu
+  }
+  TyRefine(base, _) -> vpa_sig_te(base, table, home, file, tparams)
+}
+
+fn vpa_sig_te_list(ts: [TypeExpr], table: [PubAccessEntry], home: String,
+                      file: String, tparams: [String],
+                      acc: Int) : Int / Console + File = match ts {
+  [] -> acc
+  [t, ...rest] -> {
+    let e1 = acc + vpa_sig_te(t, table, home, file, tparams)
+    vpa_sig_te_list(rest, table, home, file, tparams, e1)
+  }
+}
+
+fn vpa_sig_row(row: RowExpr, table: [PubAccessEntry], home: String,
+                  file: String, tparams: [String],
+                  line: Int, col: Int) : Int / Console + File = match row {
+  REmpty -> 0
+  RClosed(labels) -> vpa_sig_row_labels(labels, table, home, file, tparams, line, col, 0)
+  ROpen(_, labels) -> vpa_sig_row_labels(labels, table, home, file, tparams, line, col, 0)
+}
+
+fn vpa_sig_row_labels(ls: [RowLabel], table: [PubAccessEntry], home: String,
+                         file: String, tparams: [String],
+                         line: Int, col: Int,
+                         acc: Int) : Int / Console + File = match ls {
+  [] -> acc
+  [l, ...rest] -> match l {
+    RL(name, targs) -> {
+      let en = vpa_sig_check_name(name, table, home, tparams, file, line, col)
+      let el = vpa_sig_te_list(targs, table, home, file, tparams, 0)
+      vpa_sig_row_labels(rest, table, home, file, tparams, line, col, acc + en + el)
+    }
+  }
+}
+
+fn vpa_sig_typebody(b: TypeBody, table: [PubAccessEntry], home: String,
+                       file: String, tparams: [String],
+                       line: Int, col: Int) : Int / Console + File = match b {
+  TBAlias(te) -> vpa_sig_te(te, table, home, file, tparams)
+  TBRecord(fs) -> vpa_sig_fdecls(fs, table, home, file, tparams, 0)
+  TBSum(vs) -> vpa_sig_variants(vs, table, home, file, tparams, 0)
+  TBEffectAlias(labels) -> vpa_sig_alias_labels(labels, table, home, tparams, file, line, col, 0)
+}
+
+fn vpa_sig_fdecls(fs: [FieldDecl], table: [PubAccessEntry], home: String,
+                     file: String, tparams: [String],
+                     acc: Int) : Int / Console + File = match fs {
+  [] -> acc
+  [f, ...rest] -> match f {
+    # `priv` fields are invisible outside the declaring module, so
+    # their type never escapes — skip the pub-access check. Public
+    # fields (default) still must reference types accessible to the
+    # consumer module; otherwise the consumer sees a value of an
+    # opaque type with no operations.
+    FD(true, _, te) -> vpa_sig_fdecls(rest, table, home, file, tparams,
+                                   acc + vpa_sig_te(te, table, home, file, tparams))
+    FD(false, _, _) -> vpa_sig_fdecls(rest, table, home, file, tparams, acc)
+  }
+}
+
+fn vpa_sig_variants(vs: [Variant], table: [PubAccessEntry], home: String,
+                       file: String, tparams: [String],
+                       acc: Int) : Int / Console + File = match vs {
+  [] -> acc
+  [v, ...rest] -> match v {
+    Var(_, tes) -> vpa_sig_variants(rest, table, home, file, tparams,
+                                       acc + vpa_sig_te_list(tes, table, home, file, tparams, 0))
+  }
+}
+
+fn vpa_sig_alias_labels(ls: [String], table: [PubAccessEntry], home: String,
+                           tparams: [String], file: String,
+                           line: Int, col: Int,
+                           acc: Int) : Int / Console + File = match ls {
+  [] -> acc
+  [n, ...rest] -> vpa_sig_alias_labels(rest, table, home, tparams, file, line, col,
+                                          acc + vpa_sig_check_name(n, table, home, tparams, file, line, col))
+}
+
+fn vpa_sig_eops(ops: [EffectOp], table: [PubAccessEntry], home: String,
+                   file: String, tparams: [String],
+                   acc: Int) : Int / Console + File = match ops {
+  [] -> acc
+  [op, ...rest] -> match op {
+    EOp(_, op_tparams, ps, ret, _, _) -> {
+      # Per-op tparams stack on top of the enclosing decl tparams.
+      let local = list_append(op_tparams, tparams)
+      let ep = vpa_sig_params(ps, table, home, file, local, 0)
+      let er = vpa_sig_te(ret, table, home, file, local)
+      vpa_sig_eops(rest, table, home, file, tparams, acc + ep + er)
+    }
+  }
+}
+
+fn vpa_sig_pops(ops: [ProtoOp], table: [PubAccessEntry], home: String,
+                   file: String, tparams: [String],
+                   acc: Int) : Int / Console + File = match ops {
+  [] -> acc
+  [op, ...rest] -> match op {
+    POp(_, op_tparams, ps, ret, _, _) -> {
+      let local = list_append(op_tparams, tparams)
+      let ep = vpa_sig_params(ps, table, home, file, local, 0)
+      let er = vpa_sig_te(ret, table, home, file, local)
+      vpa_sig_pops(rest, table, home, file, tparams, acc + ep + er)
+    }
+  }
+}
+
+fn vpa_sig_uexpr(u: UnitExprT, table: [PubAccessEntry], home: String,
+                    file: String, tparams: [String],
+                    line: Int, col: Int) : Int / Console + File = match u {
+  UOne -> 0
+  UVar(_) -> 0
+  USym(s) -> vpa_sig_check_name(s, table, home, tparams, file, line, col)
+  UMul(a, b) -> {
+    let ea = vpa_sig_uexpr(a, table, home, file, tparams, line, col)
+    let eb = vpa_sig_uexpr(b, table, home, file, tparams, line, col)
+    ea + eb
+  }
+  UInv(a) -> vpa_sig_uexpr(a, table, home, file, tparams, line, col)
+  UPow(a, _) -> vpa_sig_uexpr(a, table, home, file, tparams, line, col)
+}
+
+# Recover the impl-header tparams from the first DFn method. The
+# parser injects the impl's `[E: Show, T: Show]` list into every
+# method's tparam string list (see `prepend_impl_tparams_to_methods`),
+# and since all methods share the same impl header they all carry
+# the same prefix. Returns an empty list when sub_decls is empty
+# or its first method has no tparams. Bound suffixes (`T#b:Show`)
+# are already stripped by `prepend_impl_tparams_to_methods`, so
+# the names here are clean idents.
+fn impl_tparams_of(sub_decls: [Decl]) : [String] = match sub_decls {
+  [] -> []
+  [d, ...rest] -> match d {
+    DFn(_, _, tps, _, _, _, _, _, _, _) -> tps
+    DAttribPure(inner, _, _) -> impl_tparams_of([inner, ...rest])
+    DDerive(_, inner, _, _) -> impl_tparams_of([inner, ...rest])
+    DUnstable(inner, _, _) -> impl_tparams_of([inner, ...rest])
+    _ -> impl_tparams_of(rest)
+  }
+}
+
+fn vpa_sig_check_name(n: String, table: [PubAccessEntry], home: String,
+                         tparams: [String], file: String, line: Int,
+                         col: Int) : Int / Console + File =
+  # Tparams are bound at the declaration site (e.g. `impl[E : Show]
+  # Show for Result[E, T]` — `E` is a type variable, not a reference
+  # to whatever module also happens to have an entity called `E`).
+  # Skipping them avoids spurious "non-pub E from module X" errors
+  # when the privacy table happens to contain a same-named variant
+  # constructor or type from an unrelated module.
+  if list_has(tparams, n) { 0 }
+  else {
+    match pae_decide(table, n, home) {
+      Visible -> 0
+      Unknown -> 0
+      PrivateTo(other_home) -> {
+        diag_error(file, line, col,
+          concat_all(["cannot reference non-pub `", n, "` from module `",
+                      other_home, "` in this signature (declared private to `",
+                      other_home, "`); mark it as `pub` in module `", other_home,
+                      "` to expose it"]))
+        1
+      }
+    }
+  }
+
+fn vpa_expr(e: Expr, locals: [String], table: [PubAccessEntry],
+              home: String, file: String, errs: Int) : Int / Console + File =
+
+  vpa_kind(e, locals, table, home, file, errs)
+
+fn vpa_kind(e: Expr, locals: [String], table: [PubAccessEntry],
+              home: String, file: String, errs: Int) : Int / Console + File =
+
+  match e.kind {
+    EVar(nm) ->
+      if list_has(locals, nm) { errs }
+      else {
+        match pae_decide(table, nm, home) {
+          Visible      -> errs
+          PrivateTo(m) -> { vpa_diag(file, nm, m, e.line, e.col); errs + 1 }
+          Unknown      -> errs
+        }
+      }
+    ECall(callee, args_) -> {
+      let e1 = vpa_expr(callee, locals, table, home, file, errs)
+      vpa_exprs(args_, locals, table, home, file, e1)
+    }
+    EField(obj, _) -> vpa_expr(obj, locals, table, home, file, errs)
+    EIndex(coll, ix) -> {
+      let e1 = vpa_expr(coll, locals, table, home, file, errs)
+      vpa_expr(ix, locals, table, home, file, e1)
+    }
+    EBinop(_, l, r) -> {
+      let e1 = vpa_expr(l, locals, table, home, file, errs)
+      vpa_expr(r, locals, table, home, file, e1)
+    }
+    EUnop(_, x) -> vpa_expr(x, locals, table, home, file, errs)
+    EIf(c, t_, eo) -> {
+      let e1 = vpa_expr(c, locals, table, home, file, errs)
+      let e2 = vpa_expr(t_, locals, table, home, file, e1)
+      match eo {
+        Some(el) -> vpa_expr(el, locals, table, home, file, e2)
+        None     -> e2
+      }
+    }
+    EMatch(scr, arms) -> {
+      let e1 = vpa_expr(scr, locals, table, home, file, errs)
+      vpa_arms(arms, locals, table, home, file, e1)
+    }
+    ELambda(ps, body) ->
+      vpa_expr(body, list_append(locals, fn_param_names(ps)),
+                 table, home, file, errs)
+    ERecordLit(_, fis) -> vpa_fis(fis, locals, table, home, file, errs)
+    EList(els) -> vpa_elems(els, locals, table, home, file, errs)
+    ERange(lo, hi, stp) -> {
+      let e1 = vpa_expr(lo, locals, table, home, file, errs)
+      let e2 = vpa_expr(hi, locals, table, home, file, e1)
+      match stp {
+        Some(s) -> vpa_expr(s, locals, table, home, file, e2)
+        None    -> e2
+      }
+    }
+    EBlock(stmts, tail) -> {
+      let r = vpa_stmts(stmts, locals, table, home, file, errs)
+      match tail {
+        Some(fe) -> vpa_expr(fe, r.bound, table, home, file, r.errs)
+        None     -> r.errs
+      }
+    }
+    EPipe(lhs, rhs) -> {
+      let e1 = vpa_expr(lhs, locals, table, home, file, errs)
+      vpa_expr(rhs, locals, table, home, file, e1)
+    }
+    EMapPipe(lhs, rhs) -> {
+      let e1 = vpa_expr(lhs, locals, table, home, file, errs)
+      vpa_expr(rhs, locals, table, home, file, e1)
+    }
+    EFlatMapPipe(lhs, rhs) -> {
+      let e1 = vpa_expr(lhs, locals, table, home, file, errs)
+      vpa_expr(rhs, locals, table, home, file, e1)
+    }
+    EFilterPipe(lhs, rhs) -> {
+      let e1 = vpa_expr(lhs, locals, table, home, file, errs)
+      vpa_expr(rhs, locals, table, home, file, e1)
+    }
+    EBang(inner) -> vpa_expr(inner, locals, table, home, file, errs)
+    ELitUnit(inner, _) -> vpa_expr(inner, locals, table, home, file, errs)
+    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
+      let e1 = vpa_expr(body, locals, table, home, file, errs)
+      let e2 = match init_opt {
+        Some(ie) -> vpa_expr(ie, locals, table, home, file, e1)
+        None     -> e1
+      }
+      let inner = match alias_opt { Some(a) -> [a, ...locals] None -> locals }
+      let e3 = vpa_hclauses(clauses, inner, table, home, file, e2)
+      match ret_opt {
+        Some(r) -> vpa_hreturn(r, inner, table, home, file, e3)
+        None    -> e3
+      }
+    }
+    # Leaves and resolved-call shapes — no sub-expressions to walk
+    # for pub access. EModCall already has its `pub` check applied by
+    # `rqc_decls` (qualified calls to non-`pub` names produce
+    # "module X does not export Y" before this pass runs).
+    _ -> errs
+  }
+
+fn vpa_exprs(xs: [Expr], locals: [String], table: [PubAccessEntry],
+               home: String, file: String, errs: Int) : Int / Console + File =
+
+  match xs {
+    [] -> errs
+    [x, ...rest] -> vpa_exprs(rest, locals, table, home, file,
+                                vpa_expr(x, locals, table, home, file, errs))
+  }
+
+fn vpa_arms(arms: [Arm], locals: [String], table: [PubAccessEntry],
+              home: String, file: String, errs: Int) : Int / Console + File =
+
+  match arms {
+    [] -> errs
+    [a, ...rest] -> match a {
+      Arm(pat, guard, body) -> {
+        let inner = pat_binders(pat, locals)
+        let e1 = match guard {
+          Some(g) -> vpa_expr(g, inner, table, home, file, errs)
+          None    -> errs
+        }
+        let e2 = vpa_expr(body, inner, table, home, file, e1)
+        vpa_arms(rest, locals, table, home, file, e2)
+      }
+    }
+  }
+
+fn vpa_fis(fis: [FieldInit], locals: [String], table: [PubAccessEntry],
+             home: String, file: String, errs: Int) : Int / Console + File =
+
+  match fis {
+    [] -> errs
+    [fi, ...rest] -> match fi {
+      FI(_, v) -> vpa_fis(rest, locals, table, home, file,
+                            vpa_expr(v, locals, table, home, file, errs))
+    }
+  }
+
+fn vpa_elems(els: [ListElem], locals: [String], table: [PubAccessEntry],
+               home: String, file: String, errs: Int) : Int / Console + File =
+
+  match els {
+    [] -> errs
+    [el, ...rest] -> {
+      let e1 = match el {
+        ElPlain(x)  -> vpa_expr(x, locals, table, home, file, errs)
+        ElSpread(x) -> vpa_expr(x, locals, table, home, file, errs)
+      }
+      vpa_elems(rest, locals, table, home, file, e1)
+    }
+  }
+
+type VpaStmtsAcc = { bound: [String], errs: Int }
+
+fn vpa_stmts(stmts: [Stmt], locals: [String], table: [PubAccessEntry],
+               home: String, file: String, errs: Int) : VpaStmtsAcc / Console + File =
+
+  match stmts {
+    [] -> VpaStmtsAcc { bound: locals, errs: errs }
+    [s, ...rest] -> {
+      let r = vpa_stmt(s, locals, table, home, file, errs)
+      vpa_stmts(rest, r.bound, table, home, file, r.errs)
+    }
+  }
+
+fn vpa_stmt(s: Stmt, locals: [String], table: [PubAccessEntry],
+              home: String, file: String, errs: Int) : VpaStmtsAcc / Console + File =
+
+  match s {
+    SLet(pat, _, e) -> {
+      let e1 = vpa_expr(e, locals, table, home, file, errs)
+      VpaStmtsAcc { bound: pat_binders(pat, locals), errs: e1 }
+    }
+    SAssert(cond, opt_msg) -> {
+      let e1 = vpa_expr(cond, locals, table, home, file, errs)
+      let e2 = match opt_msg {
+        Some(m) -> vpa_expr(m, locals, table, home, file, e1)
+        None    -> e1
+      }
+      VpaStmtsAcc { bound: locals, errs: e2 }
+    }
+    SExprStmt(e) -> {
+      let e1 = vpa_expr(e, locals, table, home, file, errs)
+      VpaStmtsAcc { bound: locals, errs: e1 }
+    }
+    # `desugar_index_assign` / `desugar_var_decls` rewrite these
+    # before the validator runs; cover them defensively in case the
+    # pass order ever changes. The RHS expressions get walked; the
+    # locals set is unchanged.
+    SIndexAssign(obj, ix, v, _, _) -> {
+      let e1 = vpa_expr(obj, locals, table, home, file, errs)
+      let e2 = vpa_expr(ix, locals, table, home, file, e1)
+      let e3 = vpa_expr(v, locals, table, home, file, e2)
+      VpaStmtsAcc { bound: locals, errs: e3 }
+    }
+    SVar(name, _, init, _, _) -> {
+      let e1 = vpa_expr(init, locals, table, home, file, errs)
+      VpaStmtsAcc { bound: [name, ...locals], errs: e1 }
+    }
+    SUse(_, _, _) -> VpaStmtsAcc { bound: locals, errs: errs }
+  }
+
+fn vpa_hclauses(cs: [HClause], locals: [String], table: [PubAccessEntry],
+                  home: String, file: String, errs: Int) : Int / Console + File =
+
+  match cs {
+    [] -> errs
+    [c, ...rest] -> match c {
+      HC(_, params, body, _, _) -> {
+        let inner = list_append(locals, fn_param_names(params))
+        let e1 = vpa_expr(body, inner, table, home, file, errs)
+        vpa_hclauses(rest, locals, table, home, file, e1)
+      }
+    }
+  }
+
+fn vpa_hreturn(r: HReturn, locals: [String], table: [PubAccessEntry],
+                 home: String, file: String, errs: Int) : Int / Console + File =
+
+  match r {
+    HR(pname, body, _, _) ->
+      vpa_expr(body, [pname, ...locals], table, home, file, errs)
+  }
+
+fn vpa_diag(file: String, name: String, decl_home: String,
+              line: Int, col: Int) : Unit / Console + File =
+
+  diag_error(file, line, col,
+    concat_all(["`", name, "` is private to module `", decl_home,
+                "`; mark the declaration `pub` or call it through a qualified path"]))
