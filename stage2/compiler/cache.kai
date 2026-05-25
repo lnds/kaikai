@@ -1,0 +1,3375 @@
+# compiler/cache.kai — KAB2 prelude cache codec + AST serde.
+#
+# Extracted from main.kai under issue #677 Phase 1k (re-scope). The
+# original Phase 1k brief targeted compiler/driver.kai, but the
+# cross-section analysis in docs/lane-driver-cross-section-analysis.md
+# (PR #687) found the driver is the pipeline apex and cannot extract
+# before the stages beneath it. That analysis identified the cache
+# codec as the one clean cut inside the cli+driver block: it sits
+# *beside* the pipeline (a pure AST<->bytes function with no upward
+# calls into the typer/emitter/desugars), so it cuts cleanly today.
+#
+# What this module owns
+#
+# The KAB2 binary cache format and the full AST serialiser/deserialiser
+# behind it. `cache_serialize_module` walks a `[Decl]` and emits a
+# packed binary blob (header + payload); `cache_deserialize_module`
+# parses a blob back into `[Decl]` via the `CacheDeserialized` result.
+# The codec covers every Expr / Decl / Ty / Pattern / Stmt node the
+# compiler builds, so any change to the AST variant set in
+# compiler/ast.kai must be mirrored here or the cache silently misses.
+#
+# Wire format (KAB2, raw packed binary — NOT hex despite the legacy
+# `_to_hex` / `hex_to_` helper names kept from the KAB1 era):
+#   Header (76 bytes, fixed):
+#     magic           4 bytes  "KAB2"
+#     format_version  4 bytes  u32 LE
+#     kaikai_version  4 bytes  u32 LE
+#     source_sha256  64 bytes  ASCII lowercase hex of source content
+#   Body: payload as packed binary; per-type encodings documented inline.
+#
+# Public surface (4 symbols):
+#   - cache_serialize_module     — [Decl] + sha -> blob String
+#   - cache_deserialize_module   — blob -> Option[CacheDeserialized]
+#   - CacheDeserialized          — deserialise result (decls + echoed sha)
+#   - cache_roundtrip_self_test  — in-memory serialise/deserialise smoke test
+#
+# The four prelude-glue bridges (`load_prelude_cached`,
+# `emit_prelude_cache_for`, and the `run` dispatch arms) stay in
+# main.kai and call the public entry points above — they mix serde
+# with prelude helpers (prelude_module_name / strip_prelude_tests /
+# tag_decls_module_origin) that live up in the driver layer.
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+
+# ============================================================
+# Phase A cache (issue #592) — serialise [Decl] post-parse to a
+# binary `.kab` blob that kaic2 deserialises faster than re-parsing
+# the prelude source. KAB2 replaces the earlier KAB1 hex ASCII
+# format (issue #452) which doubled wire bytes and paid more in
+# string allocation than it saved in lex+parse. The codec uses raw
+# packed binary throughout, with the `int_to_byte_string` runtime
+# primitive (added for this lane) to construct exact 1-byte
+# Strings from Int byte values; `"#{int_to_char(b)}"` interpolation
+# would route through `Show for Char` and either escape-render or
+# truncate at NUL.
+#
+# Header (76 bytes, fixed, no newlines):
+#   magic           4 bytes  "KAB2"
+#   format_version  4 bytes  u32 LE — bump on any payload schema change
+#   kaikai_version  4 bytes  u32 LE — bump on kaikai release
+#   source_sha256  64 bytes  ASCII lowercase hex of source content
+#
+# Body:
+#   <payload as packed binary; per-type encodings documented inline>
+#
+# Function names are unchanged from KAB1 (cache_*_to_hex /
+# cache_hex_to_*) to keep the diff small — every helper is now a
+# binary encoder/decoder despite the legacy hex-suffix names. A
+# future rename pass can clean this up.
+
+fn cache_format_version() : Int = 2
+
+fn cache_magic() : String = "KAB2"
+
+# Build a 1-byte String holding the low 8 bits of `b`. The runtime
+# primitive `int_to_byte_string` was added for the KAB2 codec
+# specifically so this path bypasses `Show for Char`'s `\xNN` escape
+# rendering (which would silently corrupt any byte outside ASCII
+# [32,126], including NUL).
+fn cache_byte_to_hex(b: Int) : String {
+  let m = if b < 0 { 0 } else if b > 255 { 255 } else { b }
+  int_to_byte_string(m)
+}
+
+# Read one byte at position `pos` in `buf`. Returns Some byte value
+# on success, None on truncation. Uses `string_byte_at_int` (runtime
+# primitive added for #592) which returns -1 on OOB; this avoids the
+# Option[Char] + Char allocations that `char_at` pays per byte. The
+# warm-load decoder calls this ~10^6 times per build; the bypass
+# cuts cache deserialize wall by ~80%.
+fn cache_hex_byte_at(buf: String, pos: Int) : Option[Int] {
+  let b = string_byte_at_int(buf, pos)
+  if b < 0 { None } else { Some(b) }
+}
+
+# Encode a 32-bit unsigned int as 4 raw bytes LE.
+fn cache_u32_to_hex(n: Int) : String {
+  let b0 = n % 256
+  let r0 = (n - b0) / 256
+  let b1 = r0 % 256
+  let r1 = (r0 - b1) / 256
+  let b2 = r1 % 256
+  let r2 = (r1 - b2) / 256
+  let b3 = r2 % 256
+  concat_all([cache_byte_to_hex(b0), cache_byte_to_hex(b1),
+              cache_byte_to_hex(b2), cache_byte_to_hex(b3)])
+}
+
+# Decode 4 LE bytes at position `pos` into an Int. Option-free hot
+# path using the `string_byte_at_int` primitive — see commentary on
+# `cache_hex_to_int` above.
+fn cache_hex_to_u32(buf: String, pos: Int) : Option[CacheIntPos] {
+  let b0 = string_byte_at_int(buf, pos)
+  if b0 < 0 { None }
+  else {
+    let b1 = string_byte_at_int(buf, pos + 1)
+    if b1 < 0 { None }
+    else {
+      let b2 = string_byte_at_int(buf, pos + 2)
+      if b2 < 0 { None }
+      else {
+        let b3 = string_byte_at_int(buf, pos + 3)
+        if b3 < 0 { None }
+        else { Some(CIP(b0 + b1 * 256 + b2 * 65536 + b3 * 16777216, pos + 4)) }
+      }
+    }
+  }
+}
+
+type CacheIntPos = CIP(Int, Int)
+type CacheStrPos = CSP(String, Int)
+type CacheBoolPos = CBP(Bool, Int)
+
+# Encode a signed 64-bit Int as 8 raw bytes LE. Uses the same
+# two's-complement masking trick as `bin_int_to_bytes` in
+# stdlib/protocols.kai so negative values round-trip exactly.
+fn cache_int_to_hex(n: Int) : String =
+  concat_all(list_reverse(cache_int_to_hex_loop(n, 8, [])))
+
+fn cache_int_to_hex_loop(cur: Int, remaining: Int, acc: [String]) : [String] {
+  if remaining <= 0 { acc }
+  else {
+    let r = cur % 256
+    let b = if r < 0 { r + 256 } else { r }
+    cache_int_to_hex_loop((cur - b) / 256, remaining - 1,
+                            [cache_byte_to_hex(b), ...acc])
+  }
+}
+
+# Decode 8 LE bytes at position `pos` into a signed Int. Unrolled
+# and Option-free on the hot path: each byte read goes through
+# `string_byte_at_int` which returns Int directly (-1 on OOB),
+# avoiding per-byte Option allocations. ~30% of cache_load wall
+# went into this function pre-unroll.
+fn cache_hex_to_int(buf: String, pos: Int) : Option[CacheIntPos] {
+  let b0 = string_byte_at_int(buf, pos)
+  if b0 < 0 { None }
+  else {
+    let b1 = string_byte_at_int(buf, pos + 1)
+    if b1 < 0 { None }
+    else {
+      let b2 = string_byte_at_int(buf, pos + 2)
+      if b2 < 0 { None }
+      else {
+        let b3 = string_byte_at_int(buf, pos + 3)
+        if b3 < 0 { None }
+        else {
+          let b4 = string_byte_at_int(buf, pos + 4)
+          if b4 < 0 { None }
+          else {
+            let b5 = string_byte_at_int(buf, pos + 5)
+            if b5 < 0 { None }
+            else {
+              let b6 = string_byte_at_int(buf, pos + 6)
+              if b6 < 0 { None }
+              else {
+                let b7 = string_byte_at_int(buf, pos + 7)
+                if b7 < 0 { None }
+                else {
+                  let lo = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+                  let hi_base = b4 + b5 * 256 + b6 * 65536
+                  let hi_top = if b7 >= 128 { b7 - 256 } else { b7 }
+                  let hi = hi_base + hi_top * 16777216
+                  Some(CIP(lo + hi * 4294967296, pos + 8))
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Encode a Bool as one raw byte (0x00 / 0x01).
+fn cache_bool_to_hex(b: Bool) : String =
+  if b { cache_byte_to_hex(1) } else { cache_byte_to_hex(0) }
+
+fn cache_hex_to_bool(buf: String, pos: Int) : Option[CacheBoolPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(CBP(false, pos + 1))
+    Some(1) -> Some(CBP(true, pos + 1))
+    Some(_) -> None
+  }
+}
+
+# Encode a String as u32 LE length + raw bytes. The source bytes
+# are appended verbatim — `string_concat` is memcpy-based on the
+# runtime and preserves every byte 0..255 including NUL.
+fn cache_string_to_hex(s: String) : String {
+  let n = string_length(s)
+  concat_all([cache_u32_to_hex(n), s])
+}
+
+# Decode a length4-prefixed raw String payload. `string_slice` is
+# byte-wise on the runtime so the decoded String round-trips byte-
+# exact even for non-ASCII content.
+fn cache_hex_to_string(buf: String, pos: Int) : Option[CacheStrPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip {
+      CIP(n, pos2) ->
+        if pos2 + n > string_length(buf) { None }
+        else { Some(CSP(string_slice(buf, pos2, n), pos2 + n)) }
+    }
+  }
+}
+
+
+# Encode an Option[String] as 1 tag byte + (if Some) the encoded
+# String.
+fn cache_opt_string_to_hex(o: Option[String]) : String = match o {
+  None -> cache_byte_to_hex(0)
+  Some(s) -> string_concat(cache_byte_to_hex(1), cache_string_to_hex(s))
+}
+
+fn cache_hex_to_opt_string(buf: String, pos: Int) : Option[CacheOptStrPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(COSP(None, pos + 1))
+    Some(1) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p2) -> Some(COSP(Some(s), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+type CacheOptStrPos = COSP(Option[String], Int)
+
+# Encode an Option[Int] as 1 tag byte + (if Some) 8 raw bytes.
+fn cache_opt_int_to_hex(o: Option[Int]) : String = match o {
+  None -> cache_byte_to_hex(0)
+  Some(n) -> string_concat(cache_byte_to_hex(1), cache_int_to_hex(n))
+}
+
+fn cache_hex_to_opt_int(buf: String, pos: Int) : Option[CacheOptIntPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(COIP(None, pos + 1))
+    Some(1) -> match cache_hex_to_int(buf, pos + 1) {
+      None -> None
+      Some(cip) -> match cip { CIP(n, p2) -> Some(COIP(Some(n), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+type CacheOptIntPos = COIP(Option[Int], Int)
+
+# Encode a [String] as length4 + each encoded String.
+fn cache_string_list_to_hex(xs: [String]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_string_list_loop(xs, [])))])
+
+fn cache_string_list_loop(xs: [String], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_string_list_loop(t, [cache_string_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_string_list(buf: String, pos: Int) : Option[CacheStrListPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip {
+      CIP(n, pos2) -> cache_hex_collect_string_list(buf, pos2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_string_list(buf: String, pos: Int, remaining: Int,
+                                    acc: [String]) : Option[CacheStrListPos] {
+  if remaining <= 0 { Some(CSLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp {
+        CSP(s, p2) -> cache_hex_collect_string_list(buf, p2, remaining - 1,
+                                                      [s, ...acc])
+      }
+    }
+  }
+}
+
+type CacheStrListPos = CSLP([String], Int)
+
+# Char codec: 4 bytes LE for the codepoint Int. Stage 1 chars are
+# codepoints, not UTF-8 byte sequences, so the wire encoding matches
+# `char_to_int` directly.
+fn cache_char_to_hex(c: Char) : String =
+  cache_u32_to_hex(char_to_int(c))
+
+type CacheCharPos = CCP(Char, Int)
+
+fn cache_hex_to_char(buf: String, pos: Int) : Option[CacheCharPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) -> Some(CCP(int_to_char(n), p2)) }
+  }
+}
+
+# Real codec: store as `length4 + ASCII decimal payload` produced by
+# `real_to_string`. The compiler-internal Real surface is what
+# decode_real already uses (real_to_string round-trip), so re-using
+# the runtime's stringification keeps Real cache values byte-stable
+# across builds.
+fn cache_real_to_hex(r: Real) : String =
+  cache_string_to_hex(real_to_string(r))
+
+type CacheRealPos = CRP(Real, Int)
+
+fn cache_hex_to_real(buf: String, pos: Int) : Option[CacheRealPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(s, p2) ->
+      match string_to_real(s) {
+        None -> None
+        Some(r) -> Some(CRP(r, p2))
+      }
+    }
+  }
+}
+
+# Generic [T] codec primitives. Stage 1 has first-class fn values but
+# the cache layer avoids them so the wire encoding stays inspectable:
+# every list-of-T serialiser below opens with the length, then walks
+# the list and concats the per-element chunks. The acc-then-reverse
+# shape keeps the inner loop O(1) per element; the final concat_all
+# is O(n) over the chunk list.
+#
+# Each cache_list_<T>_to_hex_chunks below returns the reversed chunk
+# accumulator. The top-level cache_list_<T>_to_hex wraps it with the
+# length prefix and the reverse+concat finaliser.
+
+# `cache_hex_to_u32` returns a CacheIntPos; conventionally the cache
+# layer treats CIP's first slot as "the decoded length" and the
+# second slot as "the cursor after the length". This is reused below.
+
+# `cache_file_header(source_sha)` produces the 76-byte fixed-size
+# header. KAB2 layout: 4-byte magic + 4-byte format_version LE +
+# 4-byte kaikai_version_hash LE + 64-byte ASCII source sha. The
+# caller appends the binary payload after this header.
+fn cache_file_header(source_sha: String) : String =
+  concat_all([cache_magic(),
+              cache_u32_to_hex(cache_format_version()),
+              cache_u32_to_hex(cache_kaikai_version_hash()),
+              source_sha])
+
+# Bumped on every kaikai release. Currently hard-coded; the build
+# system can override via a future code-gen step.
+#
+# Issue #603: bumped from 1 to 2 when the edition catalog became
+# load-bearing. The driver also partitions cache files by edition
+# under `~/.cache/kaikai/preludes-v1/<edition>/`, so cross-edition
+# contamination is prevented at the path level; this header bump
+# is defense-in-depth against any leftover blob copied between
+# edition directories.
+fn cache_kaikai_version_hash() : Int = 2
+
+# Parse the cache file header from `buf`. Returns the source SHA
+# the file claims to hash, plus the offset where the payload begins
+# (76). Returns `None` if any of magic / format version / kaikai
+# version / sha length are malformed or mismatch the current
+# compiler's expectations.
+fn cache_read_header(buf: String) : Option[CacheHdr] {
+  if string_length(buf) < 76 { None }
+  else {
+    let magic = string_slice(buf, 0, 4)
+    if magic != cache_magic() { None }
+    else { match cache_hex_to_u32(buf, 4) {
+      None -> None
+      Some(cip) -> match cip { CIP(fv, _) ->
+        if fv != cache_format_version() { None }
+        else { match cache_hex_to_u32(buf, 8) {
+          None -> None
+          Some(cip2) -> match cip2 { CIP(kv, _) ->
+            if kv != cache_kaikai_version_hash() { None }
+            else {
+              let sha = string_slice(buf, 12, 64)
+              if string_length(sha) != 64 { None }
+              else { Some(CHdr(sha, 76)) }
+            }
+          }
+        } }
+      }
+    } }
+  }
+}
+
+type CacheHdr = CHdr(String, Int)
+
+# ========================================================================
+# AST serde — Phase A.0 step 2 (refs #452)
+# ========================================================================
+#
+# Wire format conventions for every AST type below:
+#   - Sum types open with a 1-byte tag (2 hex chars). Tag values are
+#     local to each type (0x01.., never 0x00 so a stray zero byte is
+#     visibly wrong). Decoders reject unknown tags with `None`.
+#   - Records emit fields in source declaration order.
+#   - Lists emit `cache_u32_to_hex(length) + each element`.
+#   - Spans are (line: Int, col: Int) inline. The source file path is
+#     out-of-band — the module loader supplies it from the cache key,
+#     not from per-node payload, which keeps every Expr/Pattern/TypeExpr
+#     ~16 bytes lighter than carrying file inline.
+#
+# Every encoder returns a `String` (the hex payload chunk) and pushes
+# nothing onto the global state. Every decoder returns
+# `Option[Cache<T>Pos]` where the second slot is the cursor advanced
+# past the consumed bytes. The pos-types are defined alongside the
+# decoders so the wire format stays grep-able from one place.
+
+# ---- Pos accumulator types -------------------------------------------------
+
+type CacheTyPos     = CTyP(TypeExpr, Int)
+type CacheRowPos    = CRowP(RowExpr, Int)
+type CacheRLPos     = CRLP(RowLabel, Int)
+type CacheUnitPos   = CUP(UnitExprT, Int)
+type CacheOptTyPos  = COTyP(Option[TypeExpr], Int)
+type CacheTyListPos = CTyLP([TypeExpr], Int)
+type CacheRLListPos = CRLLP([RowLabel], Int)
+type CacheExprPos   = CEP(Expr, Int)
+type CachePatPos    = CPaP(Pattern, Int)
+type CacheStmtPos   = CSMP(Stmt, Int)
+type CacheArmPos    = CArmP(Arm, Int)
+type CacheLEPos     = CLEP(ListElem, Int)
+type CacheFIPos     = CFIP(FieldInit, Int)
+type CachePFPos     = CPFP(PField, Int)
+type CacheParamPos  = CPmP(Param, Int)
+type CacheHCPos     = CHCP(HClause, Int)
+type CacheHRPos     = CHRP(HReturn, Int)
+type CacheDBPos     = CDBP(DefaultBlock, Int)
+type CacheOptExpPos = COExpP(Option[Expr], Int)
+type CacheOptStrPos2 = COSP2(Option[String], Int) # unused alias placeholder
+type CacheOptDBPos  = CODBP(Option[DefaultBlock], Int)
+type CacheOptHRPos  = COHRP(Option[HReturn], Int)
+type CacheExprLPos  = CExpLP([Expr], Int)
+type CacheStmtLPos  = CSMLP([Stmt], Int)
+type CachePatLPos   = CPaLP([Pattern], Int)
+type CacheArmLPos   = CArmLP([Arm], Int)
+type CacheLELPos    = CLELP([ListElem], Int)
+type CacheFILPos    = CFILP([FieldInit], Int)
+type CachePFLPos    = CPFLP([PField], Int)
+type CacheParamLPos = CPmLP([Param], Int)
+type CacheHCLPos    = CHCLP([HClause], Int)
+type CacheDeclPos   = CDP(Decl, Int)
+type CacheDeclLPos  = CDLP([Decl], Int)
+type CacheFDPos     = CFDP(FieldDecl, Int)
+type CacheVarPos    = CVarP(Variant, Int)
+type CacheFDLPos    = CFDLP([FieldDecl], Int)
+type CacheVarLPos   = CVarLP([Variant], Int)
+type CacheTBPos     = CTBP(TypeBody, Int)
+type CacheIKPos     = CIKP(ImportKind, Int)
+type CachePOPos     = CPOP(ProtoOp, Int)
+type CacheEOPos     = CEOP(EffectOp, Int)
+type CachePOLPos    = CPOLP([ProtoOp], Int)
+type CacheEOLPos    = CEOLP([EffectOp], Int)
+type CacheSevPos    = CSevP(Severity, Int)
+type CacheDiagPos   = CDgP(Diagnostic, Int)
+type CacheRIPos     = CRIP(RelatedInfo, Int)
+type CacheRILPos    = CRILP([RelatedInfo], Int)
+type CacheDiagLPos  = CDgLP([Diagnostic], Int)
+type CacheVMPos     = CVMP(ValueMode, Int)
+type CacheKindPos   = CKnP(Kind, Int)
+type CacheStrListPos2 = CSLP2([String], Int) # unused alias placeholder
+
+# ---- UnitExprT ------------------------------------------------------------
+
+fn cache_unit_to_hex(u: UnitExprT) : String = match u {
+  UOne          -> cache_byte_to_hex(1)
+  USym(s)       -> concat_all([cache_byte_to_hex(2), cache_string_to_hex(s)])
+  UMul(a, b)    -> concat_all([cache_byte_to_hex(3), cache_unit_to_hex(a), cache_unit_to_hex(b)])
+  UInv(a)       -> concat_all([cache_byte_to_hex(4), cache_unit_to_hex(a)])
+  UPow(a, n)    -> concat_all([cache_byte_to_hex(5), cache_unit_to_hex(a), cache_int_to_hex(n)])
+  UVar(n)       -> concat_all([cache_byte_to_hex(6), cache_int_to_hex(n)])
+}
+
+fn cache_hex_to_unit(buf: String, pos: Int) : Option[CacheUnitPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(1) -> Some(CUP(UOne, pos + 1))
+    Some(2) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p2) -> Some(CUP(USym(s), p2)) }
+    }
+    Some(3) -> match cache_hex_to_unit(buf, pos + 1) {
+      None -> None
+      Some(cu1) -> match cu1 { CUP(a, p2) -> match cache_hex_to_unit(buf, p2) {
+        None -> None
+        Some(cu2) -> match cu2 { CUP(b, p3) -> Some(CUP(UMul(a, b), p3)) }
+      } }
+    }
+    Some(4) -> match cache_hex_to_unit(buf, pos + 1) {
+      None -> None
+      Some(cu1) -> match cu1 { CUP(a, p2) -> Some(CUP(UInv(a), p2)) }
+    }
+    Some(5) -> match cache_hex_to_unit(buf, pos + 1) {
+      None -> None
+      Some(cu1) -> match cu1 { CUP(a, p2) -> match cache_hex_to_int(buf, p2) {
+        None -> None
+        Some(cip) -> match cip { CIP(n, p3) -> Some(CUP(UPow(a, n), p3)) }
+      } }
+    }
+    Some(6) -> match cache_hex_to_int(buf, pos + 1) {
+      None -> None
+      Some(cip) -> match cip { CIP(n, p2) -> Some(CUP(UVar(n), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+# ---- TypeExpr / TyKind ----------------------------------------------------
+#
+# `TyRefine(TypeExpr, Expr)` closes the TypeExpr <-> Expr loop; the
+# Expr serde lives below and is forward-referenced by name.
+
+fn cache_typeexpr_to_hex(t: TypeExpr) : String =
+  concat_all([cache_int_to_hex(t.line),
+              cache_int_to_hex(t.col),
+              cache_tykind_to_hex(t.tkind)])
+
+fn cache_tykind_to_hex(k: TyKind) : String = match k {
+  TyName(s, ts)   -> concat_all([cache_byte_to_hex(1), cache_string_to_hex(s),
+                                  cache_typeexpr_list_to_hex(ts)])
+  TyList(t)       -> concat_all([cache_byte_to_hex(2), cache_typeexpr_to_hex(t)])
+  TyFn(as_, ret, row) -> concat_all([cache_byte_to_hex(3), cache_typeexpr_list_to_hex(as_),
+                                       cache_typeexpr_to_hex(ret),
+                                       cache_row_to_hex(row)])
+  TyDim(t, u)     -> concat_all([cache_byte_to_hex(4), cache_typeexpr_to_hex(t),
+                                  cache_unit_to_hex(u)])
+  TyRefine(t, e)  -> concat_all([cache_byte_to_hex(5), cache_typeexpr_to_hex(t),
+                                  cache_expr_to_hex(e)])
+}
+
+fn cache_hex_to_typeexpr(buf: String, pos: Int) : Option[CacheTyPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c1) -> match c1 {
+      CIP(line, p1) -> match cache_hex_to_int(buf, p1) {
+        None -> None
+        Some(c2) -> match c2 {
+          CIP(col, p2) -> cache_hex_to_typeexpr_at(buf, p2, line, col)
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_typeexpr_at(buf: String, pos: Int, line: Int,
+                               col: Int) : Option[CacheTyPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(1) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p3) ->
+        match cache_hex_to_typeexpr_list(buf, p3) {
+          None -> None
+          Some(ctl) -> match ctl { CTyLP(ts, p4) ->
+            Some(CTyP(TypeExpr { tkind: TyName(s, ts), line: line, col: col }, p4))
+          }
+        }
+      }
+    }
+    Some(2) -> match cache_hex_to_typeexpr(buf, pos + 1) {
+      None -> None
+      Some(ct) -> match ct { CTyP(inner, p3) ->
+        Some(CTyP(TypeExpr { tkind: TyList(inner), line: line, col: col }, p3))
+      }
+    }
+    Some(3) -> cache_hex_to_typeexpr_fn(buf, pos + 1, line, col)
+    Some(4) -> cache_hex_to_typeexpr_dim(buf, pos + 1, line, col)
+    Some(5) -> cache_hex_to_typeexpr_refine(buf, pos + 1, line, col)
+    Some(_) -> None
+  }
+}
+
+fn cache_hex_to_typeexpr_fn(buf: String, pos: Int, line: Int,
+                               col: Int) : Option[CacheTyPos] {
+  match cache_hex_to_typeexpr_list(buf, pos) {
+    None -> None
+    Some(ctl) -> match ctl { CTyLP(as_, p3) ->
+      match cache_hex_to_typeexpr(buf, p3) {
+        None -> None
+        Some(ct) -> match ct { CTyP(ret, p4) ->
+          match cache_hex_to_row(buf, p4) {
+            None -> None
+            Some(cr) -> match cr { CRowP(row, p5) ->
+              Some(CTyP(TypeExpr { tkind: TyFn(as_, ret, row), line: line, col: col }, p5))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_typeexpr_dim(buf: String, pos: Int, line: Int,
+                                col: Int) : Option[CacheTyPos] {
+  match cache_hex_to_typeexpr(buf, pos) {
+    None -> None
+    Some(ct) -> match ct { CTyP(inner, p3) ->
+      match cache_hex_to_unit(buf, p3) {
+        None -> None
+        Some(cu) -> match cu { CUP(u, p4) ->
+          Some(CTyP(TypeExpr { tkind: TyDim(inner, u), line: line, col: col }, p4))
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_typeexpr_refine(buf: String, pos: Int, line: Int,
+                                   col: Int) : Option[CacheTyPos] {
+  match cache_hex_to_typeexpr(buf, pos) {
+    None -> None
+    Some(ct) -> match ct { CTyP(inner, p3) ->
+      match cache_hex_to_expr(buf, p3) {
+        None -> None
+        Some(ce) -> match ce { CEP(e, p4) ->
+          Some(CTyP(TypeExpr { tkind: TyRefine(inner, e), line: line, col: col }, p4))
+        }
+      }
+    }
+  }
+}
+
+# `Option[TypeExpr]` — 1 tag byte, then the encoded TypeExpr.
+fn cache_opt_typeexpr_to_hex(o: Option[TypeExpr]) : String = match o {
+  None    -> cache_byte_to_hex(0)
+  Some(t) -> concat_all([cache_byte_to_hex(1), cache_typeexpr_to_hex(t)])
+}
+
+fn cache_hex_to_opt_typeexpr(buf: String, pos: Int) : Option[CacheOptTyPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(COTyP(None, pos + 1))
+    Some(1) -> match cache_hex_to_typeexpr(buf, pos + 1) {
+      None -> None
+      Some(ct) -> match ct { CTyP(t, p2) -> Some(COTyP(Some(t), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+# `[TypeExpr]` — length + per-element.
+fn cache_typeexpr_list_to_hex(xs: [TypeExpr]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_typeexpr_list_loop(xs, [])))])
+
+fn cache_typeexpr_list_loop(xs: [TypeExpr], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_typeexpr_list_loop(t, [cache_typeexpr_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_typeexpr_list(buf: String, pos: Int) : Option[CacheTyListPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_typeexpr_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_typeexpr_list(buf: String, pos: Int, remaining: Int,
+                                      acc: [TypeExpr]) : Option[CacheTyListPos] {
+  if remaining <= 0 { Some(CTyLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_typeexpr(buf, pos) {
+      None -> None
+      Some(ct) -> match ct { CTyP(t, p2) ->
+        cache_hex_collect_typeexpr_list(buf, p2, remaining - 1, [t, ...acc])
+      }
+    }
+  }
+}
+
+# ---- RowExpr / RowLabel ----------------------------------------------------
+
+fn cache_row_to_hex(r: RowExpr) : String = match r {
+  REmpty           -> cache_byte_to_hex(1)
+  RClosed(ls)      -> concat_all([cache_byte_to_hex(2), cache_rowlabel_list_to_hex(ls)])
+  ROpen(v, ls)     -> concat_all([cache_byte_to_hex(3), cache_string_to_hex(v),
+                                   cache_rowlabel_list_to_hex(ls)])
+}
+
+fn cache_hex_to_row(buf: String, pos: Int) : Option[CacheRowPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(1) -> Some(CRowP(REmpty, pos + 1))
+    Some(2) -> match cache_hex_to_rowlabel_list(buf, pos + 1) {
+      None -> None
+      Some(crll) -> match crll { CRLLP(ls, p2) -> Some(CRowP(RClosed(ls), p2)) }
+    }
+    Some(3) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(csp) -> match csp { CSP(v, p2) ->
+        match cache_hex_to_rowlabel_list(buf, p2) {
+          None -> None
+          Some(crll) -> match crll { CRLLP(ls, p3) ->
+            Some(CRowP(ROpen(v, ls), p3))
+          }
+        }
+      }
+    }
+    Some(_) -> None
+  }
+}
+
+fn cache_rowlabel_to_hex(rl: RowLabel) : String = match rl {
+  RL(s, ts) -> concat_all([cache_string_to_hex(s),
+                            cache_typeexpr_list_to_hex(ts)])
+}
+
+fn cache_hex_to_rowlabel(buf: String, pos: Int) : Option[CacheRLPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(s, p2) ->
+      match cache_hex_to_typeexpr_list(buf, p2) {
+        None -> None
+        Some(ctl) -> match ctl { CTyLP(ts, p3) -> Some(CRLP(RL(s, ts), p3)) }
+      }
+    }
+  }
+}
+
+fn cache_rowlabel_list_to_hex(xs: [RowLabel]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_rowlabel_list_loop(xs, [])))])
+
+fn cache_rowlabel_list_loop(xs: [RowLabel], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_rowlabel_list_loop(t, [cache_rowlabel_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_rowlabel_list(buf: String, pos: Int) : Option[CacheRLListPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_rowlabel_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_rowlabel_list(buf: String, pos: Int, remaining: Int,
+                                      acc: [RowLabel]) : Option[CacheRLListPos] {
+  if remaining <= 0 { Some(CRLLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_rowlabel(buf, pos) {
+      None -> None
+      Some(crl) -> match crl { CRLP(rl, p2) ->
+        cache_hex_collect_rowlabel_list(buf, p2, remaining - 1, [rl, ...acc])
+      }
+    }
+  }
+}
+
+# ---- Param ------------------------------------------------------------------
+
+fn cache_param_to_hex(p: Param) : String =
+  concat_all([cache_string_to_hex(p.pname),
+              cache_opt_typeexpr_to_hex(p.ptype),
+              cache_int_to_hex(p.pline),
+              cache_int_to_hex(p.pcol)])
+
+fn cache_hex_to_param(buf: String, pos: Int) : Option[CacheParamPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(pname, p1) ->
+      match cache_hex_to_opt_typeexpr(buf, p1) {
+        None -> None
+        Some(coty) -> match coty { COTyP(ptype, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(c1) -> match c1 { CIP(pline, p3) ->
+              match cache_hex_to_int(buf, p3) {
+                None -> None
+                Some(c2) -> match c2 { CIP(pcol, p4) ->
+                  Some(CPmP(Param { pname: pname, ptype: ptype,
+                                    pline: pline, pcol: pcol }, p4))
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_param_list_to_hex(xs: [Param]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_param_list_loop(xs, [])))])
+
+fn cache_param_list_loop(xs: [Param], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_param_list_loop(t, [cache_param_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_param_list(buf: String, pos: Int) : Option[CacheParamLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_param_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_param_list(buf: String, pos: Int, remaining: Int,
+                                  acc: [Param]) : Option[CacheParamLPos] {
+  if remaining <= 0 { Some(CPmLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_param(buf, pos) {
+      None -> None
+      Some(cp) -> match cp { CPmP(p, p2) ->
+        cache_hex_collect_param_list(buf, p2, remaining - 1, [p, ...acc])
+      }
+    }
+  }
+}
+
+# ---- ValueMode (3-state enum) ----------------------------------------------
+
+fn cache_valuemode_to_hex(v: ValueMode) : String = match v {
+  MUnknown -> cache_byte_to_hex(1)
+  MBoxed   -> cache_byte_to_hex(2)
+  MUnboxed -> cache_byte_to_hex(3)
+}
+
+fn cache_hex_to_valuemode(buf: String, pos: Int) : Option[CacheVMPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(1) -> Some(CVMP(MUnknown, pos + 1))
+    Some(2) -> Some(CVMP(MBoxed, pos + 1))
+    Some(3) -> Some(CVMP(MUnboxed, pos + 1))
+    Some(_) -> None
+  }
+}
+
+# ---- Expr / ExprKind -------------------------------------------------------
+#
+# The `ty: Option[Ty]` field is NOT serialised — Ty is a typer-only
+# value not present in post-parse AST. Cache step 2 targets post-parse
+# only; the loader rebuilds Expr nodes with `ty = None`. This is
+# byte-identical to what the parser produces, which is what the
+# typer expects. Mode is preserved (parser always produces MUnknown
+# today, but it is a public surface field so we round-trip it).
+
+fn cache_expr_to_hex(e: Expr) : String =
+  concat_all([cache_int_to_hex(e.line),
+              cache_int_to_hex(e.col),
+              cache_valuemode_to_hex(e.mode),
+              cache_exprkind_to_hex(e.kind)])
+
+fn cache_hex_to_expr(buf: String, pos: Int) : Option[CacheExprPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c1) -> match c1 { CIP(line, p1) ->
+      match cache_hex_to_int(buf, p1) {
+        None -> None
+        Some(c2) -> match c2 { CIP(col, p2) ->
+          match cache_hex_to_valuemode(buf, p2) {
+            None -> None
+            Some(cvm) -> match cvm { CVMP(mode, p3) ->
+              match cache_hex_to_exprkind(buf, p3) {
+                None -> None
+                Some(cek) -> match cek { CEP(inner, p4) ->
+                  # We reuse CacheExprPos to carry just the ExprKind path through
+                  # `cache_hex_to_exprkind` by wrapping the kind in a placeholder
+                  # Expr. Decompose via field access and rebuild with the real
+                  # span + mode.
+                  Some(CEP(Expr { kind: inner.kind, line: line, col: col,
+                             ty: None, mode: mode }, p4))
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# `cache_hex_to_exprkind` returns CacheExprPos with a stub-wrapped
+# Expr (line/col/mode are placeholders; the caller fills them).
+fn cache_exprkind_to_hex(k: ExprKind) : String = match k {
+  EInt(n)            -> concat_all([cache_byte_to_hex(1), cache_int_to_hex(n)])
+  EReal(r)           -> concat_all([cache_byte_to_hex(2), cache_real_to_hex(r)])
+  EBool(b)           -> concat_all([cache_byte_to_hex(3), cache_bool_to_hex(b)])
+  EChar(c)           -> concat_all([cache_byte_to_hex(4), cache_char_to_hex(c)])
+  EStr(s, t)         -> concat_all([cache_byte_to_hex(5), cache_string_to_hex(s),
+                                     cache_bool_to_hex(t)])
+  EUnit              -> cache_byte_to_hex(6)
+  EVar(s)            -> concat_all([cache_byte_to_hex(7), cache_string_to_hex(s)])
+  EUnder             -> cache_byte_to_hex(8)
+  EPlaceholder       -> cache_byte_to_hex(9)
+  ECall(f, as_)      -> concat_all([cache_byte_to_hex(10), cache_expr_to_hex(f),
+                                     cache_expr_list_to_hex(as_)])
+  EField(e, s)       -> concat_all([cache_byte_to_hex(11), cache_expr_to_hex(e),
+                                     cache_string_to_hex(s)])
+  EIndex(a, i)       -> concat_all([cache_byte_to_hex(12), cache_expr_to_hex(a),
+                                     cache_expr_to_hex(i)])
+  EBinop(op, a, b)   -> concat_all([cache_byte_to_hex(13), cache_string_to_hex(op),
+                                     cache_expr_to_hex(a), cache_expr_to_hex(b)])
+  EUnop(op, a)       -> concat_all([cache_byte_to_hex(14), cache_string_to_hex(op),
+                                     cache_expr_to_hex(a)])
+  EIf(c, t, eo)      -> concat_all([cache_byte_to_hex(15), cache_expr_to_hex(c),
+                                     cache_expr_to_hex(t),
+                                     cache_opt_expr_to_hex(eo)])
+  EMatch(s, arms)    -> concat_all([cache_byte_to_hex(16), cache_expr_to_hex(s),
+                                     cache_arm_list_to_hex(arms)])
+  ELambda(ps, body)  -> concat_all([cache_byte_to_hex(17), cache_param_list_to_hex(ps),
+                                     cache_expr_to_hex(body)])
+  ERecordLit(n, fs)  -> concat_all([cache_byte_to_hex(18), cache_string_to_hex(n),
+                                     cache_fi_list_to_hex(fs)])
+  EList(es)          -> concat_all([cache_byte_to_hex(19), cache_le_list_to_hex(es)])
+  ERange(a, b, c)    -> concat_all([cache_byte_to_hex(20), cache_expr_to_hex(a),
+                                     cache_expr_to_hex(b),
+                                     cache_opt_expr_to_hex(c)])
+  EBlock(ss, eo)     -> concat_all([cache_byte_to_hex(21), cache_stmt_list_to_hex(ss),
+                                     cache_opt_expr_to_hex(eo)])
+  EPipe(a, b)        -> concat_all([cache_byte_to_hex(22), cache_expr_to_hex(a),
+                                     cache_expr_to_hex(b)])
+  EMapPipe(a, b)     -> concat_all([cache_byte_to_hex(23), cache_expr_to_hex(a),
+                                     cache_expr_to_hex(b)])
+  EFlatMapPipe(a, b) -> concat_all([cache_byte_to_hex(24), cache_expr_to_hex(a),
+                                     cache_expr_to_hex(b)])
+  EFilterPipe(a, b)  -> concat_all([cache_byte_to_hex(25), cache_expr_to_hex(a),
+                                     cache_expr_to_hex(b)])
+  EHole(on)          -> concat_all([cache_byte_to_hex(26), cache_opt_string_to_hex(on)])
+  ETodo(s)           -> concat_all([cache_byte_to_hex(27), cache_string_to_hex(s)])
+  EBang(e)           -> concat_all([cache_byte_to_hex(28), cache_expr_to_hex(e)])
+  EHandle(body, eff, targs, init, alias, cls, ret) -> concat_all([
+    cache_byte_to_hex(29), cache_expr_to_hex(body), cache_string_to_hex(eff),
+    cache_typeexpr_list_to_hex(targs),
+    cache_opt_expr_to_hex(init),
+    cache_opt_string_to_hex(alias),
+    cache_hc_list_to_hex(cls),
+    cache_opt_hr_to_hex(ret)
+  ])
+  ELitUnit(inner, u) -> concat_all([cache_byte_to_hex(30), cache_expr_to_hex(inner),
+                                     cache_unit_to_hex(u)])
+  EVariantsOf(t, ns) -> concat_all([cache_byte_to_hex(31), cache_typeexpr_to_hex(t),
+                                     cache_string_list_to_hex(ns)])
+  EModCall(m, f)     -> concat_all([cache_byte_to_hex(32), cache_string_to_hex(m),
+                                     cache_string_to_hex(f)])
+  EIntrinsic(n, as_) -> concat_all([cache_byte_to_hex(33), cache_string_to_hex(n),
+                                     cache_expr_list_to_hex(as_)])
+}
+
+# Decode an ExprKind. Returns `Some(CEP(stubExpr, pos))` where
+# stubExpr carries the kind in `kind` plus placeholder header fields
+# that the caller (cache_hex_to_expr) overrides.
+fn cache_hex_to_exprkind(buf: String, pos: Int) : Option[CacheExprPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(b) -> cache_hex_to_exprkind_body(buf, pos + 1, b)
+  }
+}
+
+fn mk_stub_expr(k: ExprKind, p: Int) : CacheExprPos =
+  CEP(Expr { kind: k, line: 0, col: 0, ty: None, mode: MUnknown }, p)
+
+fn cache_hex_to_exprkind_body(buf: String, pos: Int,
+                                tag: Int) : Option[CacheExprPos] {
+  if tag == 1 {
+    match cache_hex_to_int(buf, pos) {
+      None -> None
+      Some(cip) -> match cip { CIP(n, p2) -> Some(mk_stub_expr(EInt(n), p2)) }
+    }
+  } else if tag == 2 {
+    match cache_hex_to_real(buf, pos) {
+      None -> None
+      Some(crp) -> match crp { CRP(r, p2) -> Some(mk_stub_expr(EReal(r), p2)) }
+    }
+  } else if tag == 3 {
+    match cache_hex_to_bool(buf, pos) {
+      None -> None
+      Some(cbp) -> match cbp { CBP(b, p2) -> Some(mk_stub_expr(EBool(b), p2)) }
+    }
+  } else if tag == 4 {
+    match cache_hex_to_char(buf, pos) {
+      None -> None
+      Some(ccp) -> match ccp { CCP(c, p2) -> Some(mk_stub_expr(EChar(c), p2)) }
+    }
+  } else if tag == 5 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p2) ->
+        match cache_hex_to_bool(buf, p2) {
+          None -> None
+          Some(cbp) -> match cbp { CBP(t, p3) ->
+            Some(mk_stub_expr(EStr(s, t), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 6 {
+    Some(mk_stub_expr(EUnit, pos))
+  } else if tag == 7 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p2) -> Some(mk_stub_expr(EVar(s), p2)) }
+    }
+  } else if tag == 8 {
+    Some(mk_stub_expr(EUnder, pos))
+  } else if tag == 9 {
+    Some(mk_stub_expr(EPlaceholder, pos))
+  } else if tag == 10 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(f, p2) ->
+        match cache_hex_to_expr_list(buf, p2) {
+          None -> None
+          Some(cel) -> match cel { CExpLP(as_, p3) ->
+            Some(mk_stub_expr(ECall(f, as_), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 11 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(e, p2) ->
+        match cache_hex_to_string(buf, p2) {
+          None -> None
+          Some(csp) -> match csp { CSP(s, p3) ->
+            Some(mk_stub_expr(EField(e, s), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 12 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(a, p2) ->
+        match cache_hex_to_expr(buf, p2) {
+          None -> None
+          Some(ce2) -> match ce2 { CEP(i, p3) ->
+            Some(mk_stub_expr(EIndex(a, i), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 13 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(op, p2) ->
+        match cache_hex_to_expr(buf, p2) {
+          None -> None
+          Some(ce1) -> match ce1 { CEP(a, p3) ->
+            match cache_hex_to_expr(buf, p3) {
+              None -> None
+              Some(ce2) -> match ce2 { CEP(b, p4) ->
+                Some(mk_stub_expr(EBinop(op, a, b), p4))
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if tag == 14 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(op, p2) ->
+        match cache_hex_to_expr(buf, p2) {
+          None -> None
+          Some(ce1) -> match ce1 { CEP(a, p3) ->
+            Some(mk_stub_expr(EUnop(op, a), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 15 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(c, p2) ->
+        match cache_hex_to_expr(buf, p2) {
+          None -> None
+          Some(ce2) -> match ce2 { CEP(t, p3) ->
+            match cache_hex_to_opt_expr(buf, p3) {
+              None -> None
+              Some(coep) -> match coep { COExpP(eo, p4) ->
+                Some(mk_stub_expr(EIf(c, t, eo), p4))
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if tag == 16 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(s, p2) ->
+        match cache_hex_to_arm_list(buf, p2) {
+          None -> None
+          Some(cal) -> match cal { CArmLP(arms, p3) ->
+            Some(mk_stub_expr(EMatch(s, arms), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 17 {
+    match cache_hex_to_param_list(buf, pos) {
+      None -> None
+      Some(cpl) -> match cpl { CPmLP(ps, p2) ->
+        match cache_hex_to_expr(buf, p2) {
+          None -> None
+          Some(ce1) -> match ce1 { CEP(body, p3) ->
+            Some(mk_stub_expr(ELambda(ps, body), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 18 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(n, p2) ->
+        match cache_hex_to_fi_list(buf, p2) {
+          None -> None
+          Some(cfl) -> match cfl { CFILP(fs, p3) ->
+            Some(mk_stub_expr(ERecordLit(n, fs), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 19 {
+    match cache_hex_to_le_list(buf, pos) {
+      None -> None
+      Some(clel) -> match clel { CLELP(es, p2) ->
+        Some(mk_stub_expr(EList(es), p2))
+      }
+    }
+  } else if tag == 20 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(a, p2) ->
+        match cache_hex_to_expr(buf, p2) {
+          None -> None
+          Some(ce2) -> match ce2 { CEP(b, p3) ->
+            match cache_hex_to_opt_expr(buf, p3) {
+              None -> None
+              Some(coep) -> match coep { COExpP(c, p4) ->
+                Some(mk_stub_expr(ERange(a, b, c), p4))
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if tag == 21 {
+    match cache_hex_to_stmt_list(buf, pos) {
+      None -> None
+      Some(csl) -> match csl { CSMLP(ss, p2) ->
+        match cache_hex_to_opt_expr(buf, p2) {
+          None -> None
+          Some(coep) -> match coep { COExpP(eo, p3) ->
+            Some(mk_stub_expr(EBlock(ss, eo), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 22 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(a, p2) ->
+        match cache_hex_to_expr(buf, p2) {
+          None -> None
+          Some(ce2) -> match ce2 { CEP(b, p3) ->
+            Some(mk_stub_expr(EPipe(a, b), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 23 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(a, p2) ->
+        match cache_hex_to_expr(buf, p2) {
+          None -> None
+          Some(ce2) -> match ce2 { CEP(b, p3) ->
+            Some(mk_stub_expr(EMapPipe(a, b), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 24 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(a, p2) ->
+        match cache_hex_to_expr(buf, p2) {
+          None -> None
+          Some(ce2) -> match ce2 { CEP(b, p3) ->
+            Some(mk_stub_expr(EFlatMapPipe(a, b), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 25 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(a, p2) ->
+        match cache_hex_to_expr(buf, p2) {
+          None -> None
+          Some(ce2) -> match ce2 { CEP(b, p3) ->
+            Some(mk_stub_expr(EFilterPipe(a, b), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 26 {
+    match cache_hex_to_opt_string(buf, pos) {
+      None -> None
+      Some(cosp) -> match cosp { COSP(on, p2) ->
+        Some(mk_stub_expr(EHole(on), p2))
+      }
+    }
+  } else if tag == 27 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p2) ->
+        Some(mk_stub_expr(ETodo(s), p2))
+      }
+    }
+  } else if tag == 28 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(e, p2) ->
+        Some(mk_stub_expr(EBang(e), p2))
+      }
+    }
+  } else if tag == 29 {
+    cache_hex_to_handle_body(buf, pos)
+  } else if tag == 30 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(inner, p2) ->
+        match cache_hex_to_unit(buf, p2) {
+          None -> None
+          Some(cu) -> match cu { CUP(u, p3) ->
+            Some(mk_stub_expr(ELitUnit(inner, u), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 31 {
+    match cache_hex_to_typeexpr(buf, pos) {
+      None -> None
+      Some(ct) -> match ct { CTyP(t, p2) ->
+        match cache_hex_to_string_list(buf, p2) {
+          None -> None
+          Some(csl) -> match csl { CSLP(ns, p3) ->
+            Some(mk_stub_expr(EVariantsOf(t, ns), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 32 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp1) -> match csp1 { CSP(m, p2) ->
+        match cache_hex_to_string(buf, p2) {
+          None -> None
+          Some(csp2) -> match csp2 { CSP(f, p3) ->
+            Some(mk_stub_expr(EModCall(m, f), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 33 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(n, p2) ->
+        match cache_hex_to_expr_list(buf, p2) {
+          None -> None
+          Some(cel) -> match cel { CExpLP(as_, p3) ->
+            Some(mk_stub_expr(EIntrinsic(n, as_), p3))
+          }
+        }
+      }
+    }
+  } else { None }
+}
+
+# `EHandle` has 7 fields — split to keep the if-chain readable.
+fn cache_hex_to_handle_body(buf: String, pos: Int) : Option[CacheExprPos] {
+  match cache_hex_to_expr(buf, pos) {
+    None -> None
+    Some(ce1) -> match ce1 { CEP(body, p1) ->
+      match cache_hex_to_string(buf, p1) {
+        None -> None
+        Some(csp) -> match csp { CSP(eff, p2) ->
+          match cache_hex_to_typeexpr_list(buf, p2) {
+            None -> None
+            Some(ctl) -> match ctl { CTyLP(targs, p3) ->
+              match cache_hex_to_opt_expr(buf, p3) {
+                None -> None
+                Some(coe) -> match coe { COExpP(init, p4) ->
+                  match cache_hex_to_opt_string(buf, p4) {
+                    None -> None
+                    Some(cos) -> match cos { COSP(alias, p5) ->
+                      match cache_hex_to_hc_list(buf, p5) {
+                        None -> None
+                        Some(chcl) -> match chcl { CHCLP(cls, p6) ->
+                          match cache_hex_to_opt_hr(buf, p6) {
+                            None -> None
+                            Some(cohr) -> match cohr { COHRP(ret, p7) ->
+                              Some(mk_stub_expr(EHandle(body, eff, targs, init,
+                                                         alias, cls, ret), p7))
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# `Option[Expr]` codec.
+fn cache_opt_expr_to_hex(o: Option[Expr]) : String = match o {
+  None -> cache_byte_to_hex(0)
+  Some(e) -> concat_all([cache_byte_to_hex(1), cache_expr_to_hex(e)])
+}
+
+fn cache_hex_to_opt_expr(buf: String, pos: Int) : Option[CacheOptExpPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(COExpP(None, pos + 1))
+    Some(1) -> match cache_hex_to_expr(buf, pos + 1) {
+      None -> None
+      Some(ce) -> match ce { CEP(e, p2) -> Some(COExpP(Some(e), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+# `[Expr]` codec.
+fn cache_expr_list_to_hex(xs: [Expr]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_expr_list_loop(xs, [])))])
+
+fn cache_expr_list_loop(xs: [Expr], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_expr_list_loop(t, [cache_expr_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_expr_list(buf: String, pos: Int) : Option[CacheExprLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_expr_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_expr_list(buf: String, pos: Int, remaining: Int,
+                                 acc: [Expr]) : Option[CacheExprLPos] {
+  if remaining <= 0 { Some(CExpLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce) -> match ce { CEP(e, p2) ->
+        cache_hex_collect_expr_list(buf, p2, remaining - 1, [e, ...acc])
+      }
+    }
+  }
+}
+
+# ---- ListElem --------------------------------------------------------------
+
+fn cache_le_to_hex(le: ListElem) : String = match le {
+  ElPlain(e)  -> concat_all([cache_byte_to_hex(1), cache_expr_to_hex(e)])
+  ElSpread(e) -> concat_all([cache_byte_to_hex(2), cache_expr_to_hex(e)])
+}
+
+fn cache_hex_to_le(buf: String, pos: Int) : Option[CacheLEPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(1) -> match cache_hex_to_expr(buf, pos + 1) {
+      None -> None
+      Some(ce) -> match ce { CEP(e, p2) -> Some(CLEP(ElPlain(e), p2)) }
+    }
+    Some(2) -> match cache_hex_to_expr(buf, pos + 1) {
+      None -> None
+      Some(ce) -> match ce { CEP(e, p2) -> Some(CLEP(ElSpread(e), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+fn cache_le_list_to_hex(xs: [ListElem]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_le_list_loop(xs, [])))])
+
+fn cache_le_list_loop(xs: [ListElem], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_le_list_loop(t, [cache_le_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_le_list(buf: String, pos: Int) : Option[CacheLELPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_le_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_le_list(buf: String, pos: Int, remaining: Int,
+                               acc: [ListElem]) : Option[CacheLELPos] {
+  if remaining <= 0 { Some(CLELP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_le(buf, pos) {
+      None -> None
+      Some(cle) -> match cle { CLEP(le, p2) ->
+        cache_hex_collect_le_list(buf, p2, remaining - 1, [le, ...acc])
+      }
+    }
+  }
+}
+
+# ---- Arm -------------------------------------------------------------------
+
+fn cache_arm_to_hex(a: Arm) : String = match a {
+  Arm(p, g, body) -> concat_all([cache_pat_to_hex(p),
+                                   cache_opt_expr_to_hex(g),
+                                   cache_expr_to_hex(body)])
+}
+
+fn cache_hex_to_arm(buf: String, pos: Int) : Option[CacheArmPos] {
+  match cache_hex_to_pat(buf, pos) {
+    None -> None
+    Some(cp) -> match cp { CPaP(p, p1) ->
+      match cache_hex_to_opt_expr(buf, p1) {
+        None -> None
+        Some(coe) -> match coe { COExpP(g, p2) ->
+          match cache_hex_to_expr(buf, p2) {
+            None -> None
+            Some(ce) -> match ce { CEP(body, p3) ->
+              Some(CArmP(Arm(p, g, body), p3))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_arm_list_to_hex(xs: [Arm]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_arm_list_loop(xs, [])))])
+
+fn cache_arm_list_loop(xs: [Arm], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_arm_list_loop(t, [cache_arm_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_arm_list(buf: String, pos: Int) : Option[CacheArmLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_arm_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_arm_list(buf: String, pos: Int, remaining: Int,
+                                acc: [Arm]) : Option[CacheArmLPos] {
+  if remaining <= 0 { Some(CArmLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_arm(buf, pos) {
+      None -> None
+      Some(ca) -> match ca { CArmP(a, p2) ->
+        cache_hex_collect_arm_list(buf, p2, remaining - 1, [a, ...acc])
+      }
+    }
+  }
+}
+
+# ---- FieldInit -------------------------------------------------------------
+
+fn cache_fi_to_hex(fi: FieldInit) : String = match fi {
+  FI(n, e) -> concat_all([cache_string_to_hex(n), cache_expr_to_hex(e)])
+}
+
+fn cache_hex_to_fi(buf: String, pos: Int) : Option[CacheFIPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(n, p1) ->
+      match cache_hex_to_expr(buf, p1) {
+        None -> None
+        Some(ce) -> match ce { CEP(e, p2) -> Some(CFIP(FI(n, e), p2)) }
+      }
+    }
+  }
+}
+
+fn cache_fi_list_to_hex(xs: [FieldInit]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_fi_list_loop(xs, [])))])
+
+fn cache_fi_list_loop(xs: [FieldInit], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_fi_list_loop(t, [cache_fi_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_fi_list(buf: String, pos: Int) : Option[CacheFILPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_fi_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_fi_list(buf: String, pos: Int, remaining: Int,
+                                acc: [FieldInit]) : Option[CacheFILPos] {
+  if remaining <= 0 { Some(CFILP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_fi(buf, pos) {
+      None -> None
+      Some(cf) -> match cf { CFIP(fi, p2) ->
+        cache_hex_collect_fi_list(buf, p2, remaining - 1, [fi, ...acc])
+      }
+    }
+  }
+}
+
+# ---- Pattern / PatKind / PField -------------------------------------------
+
+fn cache_pat_to_hex(p: Pattern) : String =
+  concat_all([cache_int_to_hex(p.line),
+              cache_int_to_hex(p.col),
+              cache_patkind_to_hex(p.pkind)])
+
+fn cache_patkind_to_hex(k: PatKind) : String = match k {
+  PWild                  -> cache_byte_to_hex(1)
+  PLit(e)                -> concat_all([cache_byte_to_hex(2), cache_expr_to_hex(e)])
+  PBind(s)               -> concat_all([cache_byte_to_hex(3), cache_string_to_hex(s)])
+  PList(ps, on)          -> concat_all([cache_byte_to_hex(4), cache_pat_list_to_hex(ps),
+                                         cache_opt_string_to_hex(on)])
+  PVariant(s, ps)        -> concat_all([cache_byte_to_hex(5), cache_string_to_hex(s),
+                                         cache_pat_list_to_hex(ps)])
+  PVariantRecord(s, pfs) -> concat_all([cache_byte_to_hex(6), cache_string_to_hex(s),
+                                         cache_pf_list_to_hex(pfs)])
+  PRecord(pfs)           -> concat_all([cache_byte_to_hex(7), cache_pf_list_to_hex(pfs)])
+  PHole(on)              -> concat_all([cache_byte_to_hex(8), cache_opt_string_to_hex(on)])
+  PAs(s, p)              -> concat_all([cache_byte_to_hex(9), cache_string_to_hex(s),
+                                         cache_pat_to_hex(p)])
+  PNarrow(s, t)          -> concat_all([cache_byte_to_hex(10), cache_string_to_hex(s),
+                                         cache_typeexpr_to_hex(t)])
+}
+
+fn cache_hex_to_pat(buf: String, pos: Int) : Option[CachePatPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c1) -> match c1 { CIP(line, p1) ->
+      match cache_hex_to_int(buf, p1) {
+        None -> None
+        Some(c2) -> match c2 { CIP(col, p2) ->
+          match cache_hex_to_patkind(buf, p2) {
+            None -> None
+            Some(cpk) -> match cpk { CPaP(stub, p3) ->
+              Some(CPaP(Pattern { pkind: stub.pkind, line: line, col: col }, p3))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn mk_stub_pat(k: PatKind, p: Int) : CachePatPos =
+  CPaP(Pattern { pkind: k, line: 0, col: 0 }, p)
+
+fn cache_hex_to_patkind(buf: String, pos: Int) : Option[CachePatPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(b) -> cache_hex_to_patkind_body(buf, pos + 1, b)
+  }
+}
+
+fn cache_hex_to_patkind_body(buf: String, pos: Int,
+                               tag: Int) : Option[CachePatPos] {
+  if tag == 1 {
+    Some(mk_stub_pat(PWild, pos))
+  } else if tag == 2 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce) -> match ce { CEP(e, p2) -> Some(mk_stub_pat(PLit(e), p2)) }
+    }
+  } else if tag == 3 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p2) -> Some(mk_stub_pat(PBind(s), p2)) }
+    }
+  } else if tag == 4 {
+    match cache_hex_to_pat_list(buf, pos) {
+      None -> None
+      Some(cpl) -> match cpl { CPaLP(ps, p2) ->
+        match cache_hex_to_opt_string(buf, p2) {
+          None -> None
+          Some(cos) -> match cos { COSP(on, p3) ->
+            Some(mk_stub_pat(PList(ps, on), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 5 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p2) ->
+        match cache_hex_to_pat_list(buf, p2) {
+          None -> None
+          Some(cpl) -> match cpl { CPaLP(ps, p3) ->
+            Some(mk_stub_pat(PVariant(s, ps), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 6 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p2) ->
+        match cache_hex_to_pf_list(buf, p2) {
+          None -> None
+          Some(cpfl) -> match cpfl { CPFLP(pfs, p3) ->
+            Some(mk_stub_pat(PVariantRecord(s, pfs), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 7 {
+    match cache_hex_to_pf_list(buf, pos) {
+      None -> None
+      Some(cpfl) -> match cpfl { CPFLP(pfs, p2) ->
+        Some(mk_stub_pat(PRecord(pfs), p2))
+      }
+    }
+  } else if tag == 8 {
+    match cache_hex_to_opt_string(buf, pos) {
+      None -> None
+      Some(cos) -> match cos { COSP(on, p2) ->
+        Some(mk_stub_pat(PHole(on), p2))
+      }
+    }
+  } else if tag == 9 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p2) ->
+        match cache_hex_to_pat(buf, p2) {
+          None -> None
+          Some(cpi) -> match cpi { CPaP(p, p3) ->
+            Some(mk_stub_pat(PAs(s, p), p3))
+          }
+        }
+      }
+    }
+  } else if tag == 10 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(s, p2) ->
+        match cache_hex_to_typeexpr(buf, p2) {
+          None -> None
+          Some(ct) -> match ct { CTyP(t, p3) ->
+            Some(mk_stub_pat(PNarrow(s, t), p3))
+          }
+        }
+      }
+    }
+  } else { None }
+}
+
+fn cache_pat_list_to_hex(xs: [Pattern]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_pat_list_loop(xs, [])))])
+
+fn cache_pat_list_loop(xs: [Pattern], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_pat_list_loop(t, [cache_pat_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_pat_list(buf: String, pos: Int) : Option[CachePatLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_pat_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_pat_list(buf: String, pos: Int, remaining: Int,
+                                acc: [Pattern]) : Option[CachePatLPos] {
+  if remaining <= 0 { Some(CPaLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_pat(buf, pos) {
+      None -> None
+      Some(cp) -> match cp { CPaP(p, p2) ->
+        cache_hex_collect_pat_list(buf, p2, remaining - 1, [p, ...acc])
+      }
+    }
+  }
+}
+
+fn cache_pf_to_hex(pf: PField) : String = match pf {
+  PField(n, p, sh) -> concat_all([cache_string_to_hex(n),
+                                    cache_pat_to_hex(p),
+                                    cache_bool_to_hex(sh)])
+}
+
+fn cache_hex_to_pf(buf: String, pos: Int) : Option[CachePFPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(n, p1) ->
+      match cache_hex_to_pat(buf, p1) {
+        None -> None
+        Some(cp) -> match cp { CPaP(p, p2) ->
+          match cache_hex_to_bool(buf, p2) {
+            None -> None
+            Some(cbp) -> match cbp { CBP(sh, p3) ->
+              Some(CPFP(PField(n, p, sh), p3))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_pf_list_to_hex(xs: [PField]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_pf_list_loop(xs, [])))])
+
+fn cache_pf_list_loop(xs: [PField], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_pf_list_loop(t, [cache_pf_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_pf_list(buf: String, pos: Int) : Option[CachePFLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_pf_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_pf_list(buf: String, pos: Int, remaining: Int,
+                               acc: [PField]) : Option[CachePFLPos] {
+  if remaining <= 0 { Some(CPFLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_pf(buf, pos) {
+      None -> None
+      Some(cpf) -> match cpf { CPFP(pf, p2) ->
+        cache_hex_collect_pf_list(buf, p2, remaining - 1, [pf, ...acc])
+      }
+    }
+  }
+}
+
+# ---- Stmt ------------------------------------------------------------------
+
+fn cache_stmt_to_hex(s: Stmt) : String = match s {
+  SLet(p, ot, e)         -> concat_all([cache_byte_to_hex(1), cache_pat_to_hex(p),
+                                          cache_opt_typeexpr_to_hex(ot),
+                                          cache_expr_to_hex(e)])
+  SAssert(c, om)         -> concat_all([cache_byte_to_hex(2), cache_expr_to_hex(c),
+                                          cache_opt_expr_to_hex(om)])
+  SExprStmt(e)           -> concat_all([cache_byte_to_hex(3), cache_expr_to_hex(e)])
+  SIndexAssign(a, i, v, l, c) -> concat_all([cache_byte_to_hex(4), cache_expr_to_hex(a),
+                                          cache_expr_to_hex(i),
+                                          cache_expr_to_hex(v),
+                                          cache_int_to_hex(l),
+                                          cache_int_to_hex(c)])
+  SVar(n, ot, init, l, c) -> concat_all([cache_byte_to_hex(5), cache_string_to_hex(n),
+                                          cache_opt_typeexpr_to_hex(ot),
+                                          cache_expr_to_hex(init),
+                                          cache_int_to_hex(l),
+                                          cache_int_to_hex(c)])
+  SUse(n, l, c)          -> concat_all([cache_byte_to_hex(6), cache_string_to_hex(n),
+                                          cache_int_to_hex(l),
+                                          cache_int_to_hex(c)])
+}
+
+fn cache_hex_to_stmt(buf: String, pos: Int) : Option[CacheStmtPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(b) -> cache_hex_to_stmt_body(buf, pos + 1, b)
+  }
+}
+
+fn cache_hex_to_stmt_body(buf: String, pos: Int,
+                            tag: Int) : Option[CacheStmtPos] {
+  if tag == 1 {
+    match cache_hex_to_pat(buf, pos) {
+      None -> None
+      Some(cp) -> match cp { CPaP(p, p1) ->
+        match cache_hex_to_opt_typeexpr(buf, p1) {
+          None -> None
+          Some(cot) -> match cot { COTyP(ot, p2) ->
+            match cache_hex_to_expr(buf, p2) {
+              None -> None
+              Some(ce) -> match ce { CEP(e, p3) ->
+                Some(CSMP(SLet(p, ot, e), p3))
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if tag == 2 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce) -> match ce { CEP(c, p1) ->
+        match cache_hex_to_opt_expr(buf, p1) {
+          None -> None
+          Some(coe) -> match coe { COExpP(om, p2) ->
+            Some(CSMP(SAssert(c, om), p2))
+          }
+        }
+      }
+    }
+  } else if tag == 3 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce) -> match ce { CEP(e, p1) -> Some(CSMP(SExprStmt(e), p1)) }
+    }
+  } else if tag == 4 {
+    match cache_hex_to_expr(buf, pos) {
+      None -> None
+      Some(ce1) -> match ce1 { CEP(a, p1) ->
+        match cache_hex_to_expr(buf, p1) {
+          None -> None
+          Some(ce2) -> match ce2 { CEP(i, p2) ->
+            match cache_hex_to_expr(buf, p2) {
+              None -> None
+              Some(ce3) -> match ce3 { CEP(v, p3) ->
+                match cache_hex_to_int(buf, p3) {
+                  None -> None
+                  Some(cl) -> match cl { CIP(ln, p4) ->
+                    match cache_hex_to_int(buf, p4) {
+                      None -> None
+                      Some(cc) -> match cc { CIP(cn, p5) ->
+                        Some(CSMP(SIndexAssign(a, i, v, ln, cn), p5))
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if tag == 5 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(n, p1) ->
+        match cache_hex_to_opt_typeexpr(buf, p1) {
+          None -> None
+          Some(cot) -> match cot { COTyP(ot, p2) ->
+            match cache_hex_to_expr(buf, p2) {
+              None -> None
+              Some(ce) -> match ce { CEP(init, p3) ->
+                match cache_hex_to_int(buf, p3) {
+                  None -> None
+                  Some(cl) -> match cl { CIP(ln, p4) ->
+                    match cache_hex_to_int(buf, p4) {
+                      None -> None
+                      Some(cc) -> match cc { CIP(cn, p5) ->
+                        Some(CSMP(SVar(n, ot, init, ln, cn), p5))
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if tag == 6 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(n, p1) ->
+        match cache_hex_to_int(buf, p1) {
+          None -> None
+          Some(cl) -> match cl { CIP(ln, p2) ->
+            match cache_hex_to_int(buf, p2) {
+              None -> None
+              Some(cc) -> match cc { CIP(cn, p3) ->
+                Some(CSMP(SUse(n, ln, cn), p3))
+              }
+            }
+          }
+        }
+      }
+    }
+  } else { None }
+}
+
+fn cache_stmt_list_to_hex(xs: [Stmt]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_stmt_list_loop(xs, [])))])
+
+fn cache_stmt_list_loop(xs: [Stmt], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_stmt_list_loop(t, [cache_stmt_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_stmt_list(buf: String, pos: Int) : Option[CacheStmtLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_stmt_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_stmt_list(buf: String, pos: Int, remaining: Int,
+                                 acc: [Stmt]) : Option[CacheStmtLPos] {
+  if remaining <= 0 { Some(CSMLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_stmt(buf, pos) {
+      None -> None
+      Some(cs) -> match cs { CSMP(s, p2) ->
+        cache_hex_collect_stmt_list(buf, p2, remaining - 1, [s, ...acc])
+      }
+    }
+  }
+}
+
+# ---- HClause / HReturn / DefaultBlock -------------------------------------
+
+fn cache_hc_to_hex(hc: HClause) : String = match hc {
+  HC(name, ps, body, l, c) -> concat_all([cache_string_to_hex(name),
+                                            cache_param_list_to_hex(ps),
+                                            cache_expr_to_hex(body),
+                                            cache_int_to_hex(l),
+                                            cache_int_to_hex(c)])
+}
+
+fn cache_hex_to_hc(buf: String, pos: Int) : Option[CacheHCPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(name, p1) ->
+      match cache_hex_to_param_list(buf, p1) {
+        None -> None
+        Some(cpl) -> match cpl { CPmLP(ps, p2) ->
+          match cache_hex_to_expr(buf, p2) {
+            None -> None
+            Some(ce) -> match ce { CEP(body, p3) ->
+              match cache_hex_to_int(buf, p3) {
+                None -> None
+                Some(cl) -> match cl { CIP(ln, p4) ->
+                  match cache_hex_to_int(buf, p4) {
+                    None -> None
+                    Some(cc) -> match cc { CIP(cn, p5) ->
+                      Some(CHCP(HC(name, ps, body, ln, cn), p5))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hc_list_to_hex(xs: [HClause]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_hc_list_loop(xs, [])))])
+
+fn cache_hc_list_loop(xs: [HClause], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_hc_list_loop(t, [cache_hc_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_hc_list(buf: String, pos: Int) : Option[CacheHCLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_hc_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_hc_list(buf: String, pos: Int, remaining: Int,
+                                acc: [HClause]) : Option[CacheHCLPos] {
+  if remaining <= 0 { Some(CHCLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_hc(buf, pos) {
+      None -> None
+      Some(chc) -> match chc { CHCP(hc, p2) ->
+        cache_hex_collect_hc_list(buf, p2, remaining - 1, [hc, ...acc])
+      }
+    }
+  }
+}
+
+fn cache_hr_to_hex(hr: HReturn) : String = match hr {
+  HR(name, body, l, c) -> concat_all([cache_string_to_hex(name),
+                                        cache_expr_to_hex(body),
+                                        cache_int_to_hex(l),
+                                        cache_int_to_hex(c)])
+}
+
+fn cache_hex_to_hr(buf: String, pos: Int) : Option[CacheHRPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(name, p1) ->
+      match cache_hex_to_expr(buf, p1) {
+        None -> None
+        Some(ce) -> match ce { CEP(body, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(cl) -> match cl { CIP(ln, p3) ->
+              match cache_hex_to_int(buf, p3) {
+                None -> None
+                Some(cc) -> match cc { CIP(cn, p4) ->
+                  Some(CHRP(HR(name, body, ln, cn), p4))
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_opt_hr_to_hex(o: Option[HReturn]) : String = match o {
+  None     -> cache_byte_to_hex(0)
+  Some(hr) -> concat_all([cache_byte_to_hex(1), cache_hr_to_hex(hr)])
+}
+
+fn cache_hex_to_opt_hr(buf: String, pos: Int) : Option[CacheOptHRPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(COHRP(None, pos + 1))
+    Some(1) -> match cache_hex_to_hr(buf, pos + 1) {
+      None -> None
+      Some(chr) -> match chr { CHRP(hr, p2) -> Some(COHRP(Some(hr), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+fn cache_db_to_hex(d: DefaultBlock) : String = match d {
+  DBlk(cls, ret, l, c) -> concat_all([cache_hc_list_to_hex(cls),
+                                        cache_opt_hr_to_hex(ret),
+                                        cache_int_to_hex(l),
+                                        cache_int_to_hex(c)])
+}
+
+fn cache_hex_to_db(buf: String, pos: Int) : Option[CacheDBPos] {
+  match cache_hex_to_hc_list(buf, pos) {
+    None -> None
+    Some(chcl) -> match chcl { CHCLP(cls, p1) ->
+      match cache_hex_to_opt_hr(buf, p1) {
+        None -> None
+        Some(cohr) -> match cohr { COHRP(ret, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(cl) -> match cl { CIP(ln, p3) ->
+              match cache_hex_to_int(buf, p3) {
+                None -> None
+                Some(cc) -> match cc { CIP(cn, p4) ->
+                  Some(CDBP(DBlk(cls, ret, ln, cn), p4))
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_opt_db_to_hex(o: Option[DefaultBlock]) : String = match o {
+  None    -> cache_byte_to_hex(0)
+  Some(d) -> concat_all([cache_byte_to_hex(1), cache_db_to_hex(d)])
+}
+
+fn cache_hex_to_opt_db(buf: String, pos: Int) : Option[CacheOptDBPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(CODBP(None, pos + 1))
+    Some(1) -> match cache_hex_to_db(buf, pos + 1) {
+      None -> None
+      Some(cdb) -> match cdb { CDBP(d, p2) -> Some(CODBP(Some(d), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+# ---- FieldDecl / Variant / TypeBody ---------------------------------------
+
+fn cache_fd_to_hex(fd: FieldDecl) : String = match fd {
+  FD(is_pub, n, t) -> concat_all([cache_bool_to_hex(is_pub),
+                                   cache_string_to_hex(n),
+                                   cache_typeexpr_to_hex(t)])
+}
+
+fn cache_hex_to_fd(buf: String, pos: Int) : Option[CacheFDPos] {
+  match cache_hex_to_bool(buf, pos) {
+    None -> None
+    Some(cbp) -> match cbp { CBP(is_pub, p0) ->
+      match cache_hex_to_string(buf, p0) {
+        None -> None
+        Some(csp) -> match csp { CSP(n, p1) ->
+          match cache_hex_to_typeexpr(buf, p1) {
+            None -> None
+            Some(ct) -> match ct { CTyP(t, p2) -> Some(CFDP(FD(is_pub, n, t), p2)) }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_fd_list_to_hex(xs: [FieldDecl]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_fd_list_loop(xs, [])))])
+
+fn cache_fd_list_loop(xs: [FieldDecl], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_fd_list_loop(t, [cache_fd_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_fd_list(buf: String, pos: Int) : Option[CacheFDLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_fd_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_fd_list(buf: String, pos: Int, remaining: Int,
+                                acc: [FieldDecl]) : Option[CacheFDLPos] {
+  if remaining <= 0 { Some(CFDLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_fd(buf, pos) {
+      None -> None
+      Some(cfd) -> match cfd { CFDP(fd, p2) ->
+        cache_hex_collect_fd_list(buf, p2, remaining - 1, [fd, ...acc])
+      }
+    }
+  }
+}
+
+fn cache_var_to_hex(v: Variant) : String = match v {
+  Var(n, ts) -> concat_all([cache_string_to_hex(n),
+                              cache_typeexpr_list_to_hex(ts)])
+}
+
+fn cache_hex_to_var(buf: String, pos: Int) : Option[CacheVarPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(n, p1) ->
+      match cache_hex_to_typeexpr_list(buf, p1) {
+        None -> None
+        Some(ctl) -> match ctl { CTyLP(ts, p2) -> Some(CVarP(Var(n, ts), p2)) }
+      }
+    }
+  }
+}
+
+fn cache_var_list_to_hex(xs: [Variant]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_var_list_loop(xs, [])))])
+
+fn cache_var_list_loop(xs: [Variant], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_var_list_loop(t, [cache_var_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_var_list(buf: String, pos: Int) : Option[CacheVarLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_var_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_var_list(buf: String, pos: Int, remaining: Int,
+                                acc: [Variant]) : Option[CacheVarLPos] {
+  if remaining <= 0 { Some(CVarLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_var(buf, pos) {
+      None -> None
+      Some(cv) -> match cv { CVarP(v, p2) ->
+        cache_hex_collect_var_list(buf, p2, remaining - 1, [v, ...acc])
+      }
+    }
+  }
+}
+
+fn cache_tb_to_hex(tb: TypeBody) : String = match tb {
+  TBAlias(t)       -> concat_all([cache_byte_to_hex(1), cache_typeexpr_to_hex(t)])
+  TBRecord(fds)    -> concat_all([cache_byte_to_hex(2), cache_fd_list_to_hex(fds)])
+  TBSum(vs)        -> concat_all([cache_byte_to_hex(3), cache_var_list_to_hex(vs)])
+  TBEffectAlias(ls) -> concat_all([cache_byte_to_hex(4), cache_string_list_to_hex(ls)])
+}
+
+fn cache_hex_to_tb(buf: String, pos: Int) : Option[CacheTBPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(1) -> match cache_hex_to_typeexpr(buf, pos + 1) {
+      None -> None
+      Some(ct) -> match ct { CTyP(t, p2) -> Some(CTBP(TBAlias(t), p2)) }
+    }
+    Some(2) -> match cache_hex_to_fd_list(buf, pos + 1) {
+      None -> None
+      Some(cfdl) -> match cfdl { CFDLP(fds, p2) -> Some(CTBP(TBRecord(fds), p2)) }
+    }
+    Some(3) -> match cache_hex_to_var_list(buf, pos + 1) {
+      None -> None
+      Some(cvl) -> match cvl { CVarLP(vs, p2) -> Some(CTBP(TBSum(vs), p2)) }
+    }
+    Some(4) -> match cache_hex_to_string_list(buf, pos + 1) {
+      None -> None
+      Some(csl) -> match csl { CSLP(ls, p2) -> Some(CTBP(TBEffectAlias(ls), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+# ---- ImportKind -----------------------------------------------------------
+
+fn cache_ik_to_hex(ik: ImportKind) : String = match ik {
+  IkPath(p)            -> concat_all([cache_byte_to_hex(1), cache_string_to_hex(p)])
+  IkAlias(p, a)        -> concat_all([cache_byte_to_hex(2), cache_string_to_hex(p),
+                                       cache_string_to_hex(a)])
+  IkSelective(p, names) -> concat_all([cache_byte_to_hex(3), cache_string_to_hex(p),
+                                       cache_string_list_to_hex(names)])
+  IkHole(name)         -> concat_all([cache_byte_to_hex(4), cache_string_to_hex(name)])
+}
+
+fn cache_hex_to_ik(buf: String, pos: Int) : Option[CacheIKPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(1) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(csp) -> match csp { CSP(p, p2) -> Some(CIKP(IkPath(p), p2)) }
+    }
+    Some(2) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(c1) -> match c1 { CSP(p, p2) ->
+        match cache_hex_to_string(buf, p2) {
+          None -> None
+          Some(c2) -> match c2 { CSP(a, p3) -> Some(CIKP(IkAlias(p, a), p3)) }
+        }
+      }
+    }
+    Some(3) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(c1) -> match c1 { CSP(p, p2) ->
+        match cache_hex_to_string_list(buf, p2) {
+          None -> None
+          Some(csl) -> match csl { CSLP(names, p3) ->
+            Some(CIKP(IkSelective(p, names), p3))
+          }
+        }
+      }
+    }
+    Some(4) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(csp) -> match csp { CSP(name, p2) -> Some(CIKP(IkHole(name), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+# ---- ProtoOp / EffectOp ---------------------------------------------------
+
+fn cache_po_to_hex(p: ProtoOp) : String = match p {
+  POp(n, tps, prms, rt, l, c) -> concat_all([cache_string_to_hex(n),
+                                                cache_string_list_to_hex(tps),
+                                                cache_param_list_to_hex(prms),
+                                                cache_typeexpr_to_hex(rt),
+                                                cache_int_to_hex(l),
+                                                cache_int_to_hex(c)])
+}
+
+fn cache_hex_to_po(buf: String, pos: Int) : Option[CachePOPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(n, p1) ->
+      match cache_hex_to_string_list(buf, p1) {
+        None -> None
+        Some(csl) -> match csl { CSLP(tps, p2) ->
+          match cache_hex_to_param_list(buf, p2) {
+            None -> None
+            Some(cpl) -> match cpl { CPmLP(prms, p3) ->
+              match cache_hex_to_typeexpr(buf, p3) {
+                None -> None
+                Some(ct) -> match ct { CTyP(rt, p4) ->
+                  match cache_hex_to_int(buf, p4) {
+                    None -> None
+                    Some(cl) -> match cl { CIP(ln, p5) ->
+                      match cache_hex_to_int(buf, p5) {
+                        None -> None
+                        Some(cc) -> match cc { CIP(cn, p6) ->
+                          Some(CPOP(POp(n, tps, prms, rt, ln, cn), p6))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_po_list_to_hex(xs: [ProtoOp]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_po_list_loop(xs, [])))])
+
+fn cache_po_list_loop(xs: [ProtoOp], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_po_list_loop(t, [cache_po_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_po_list(buf: String, pos: Int) : Option[CachePOLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_po_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_po_list(buf: String, pos: Int, remaining: Int,
+                                acc: [ProtoOp]) : Option[CachePOLPos] {
+  if remaining <= 0 { Some(CPOLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_po(buf, pos) {
+      None -> None
+      Some(cpo) -> match cpo { CPOP(p, p2) ->
+        cache_hex_collect_po_list(buf, p2, remaining - 1, [p, ...acc])
+      }
+    }
+  }
+}
+
+fn cache_eo_to_hex(e: EffectOp) : String = match e {
+  EOp(n, tps, prms, rt, l, c) -> concat_all([cache_string_to_hex(n),
+                                                cache_string_list_to_hex(tps),
+                                                cache_param_list_to_hex(prms),
+                                                cache_typeexpr_to_hex(rt),
+                                                cache_int_to_hex(l),
+                                                cache_int_to_hex(c)])
+}
+
+fn cache_hex_to_eo(buf: String, pos: Int) : Option[CacheEOPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(n, p1) ->
+      match cache_hex_to_string_list(buf, p1) {
+        None -> None
+        Some(csl) -> match csl { CSLP(tps, p2) ->
+          match cache_hex_to_param_list(buf, p2) {
+            None -> None
+            Some(cpl) -> match cpl { CPmLP(prms, p3) ->
+              match cache_hex_to_typeexpr(buf, p3) {
+                None -> None
+                Some(ct) -> match ct { CTyP(rt, p4) ->
+                  match cache_hex_to_int(buf, p4) {
+                    None -> None
+                    Some(cl) -> match cl { CIP(ln, p5) ->
+                      match cache_hex_to_int(buf, p5) {
+                        None -> None
+                        Some(cc) -> match cc { CIP(cn, p6) ->
+                          Some(CEOP(EOp(n, tps, prms, rt, ln, cn), p6))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_eo_list_to_hex(xs: [EffectOp]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_eo_list_loop(xs, [])))])
+
+fn cache_eo_list_loop(xs: [EffectOp], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_eo_list_loop(t, [cache_eo_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_eo_list(buf: String, pos: Int) : Option[CacheEOLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_eo_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_eo_list(buf: String, pos: Int, remaining: Int,
+                                acc: [EffectOp]) : Option[CacheEOLPos] {
+  if remaining <= 0 { Some(CEOLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_eo(buf, pos) {
+      None -> None
+      Some(ceo) -> match ceo { CEOP(e, p2) ->
+        cache_hex_collect_eo_list(buf, p2, remaining - 1, [e, ...acc])
+      }
+    }
+  }
+}
+
+# ---- Optional Unit (for DUnit alias) --------------------------------------
+
+fn cache_opt_unit_to_hex(o: Option[UnitExprT]) : String = match o {
+  None    -> cache_byte_to_hex(0)
+  Some(u) -> concat_all([cache_byte_to_hex(1), cache_unit_to_hex(u)])
+}
+
+type CacheOptUnitPos = COUP(Option[UnitExprT], Int)
+
+fn cache_hex_to_opt_unit(buf: String, pos: Int) : Option[CacheOptUnitPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(COUP(None, pos + 1))
+    Some(1) -> match cache_hex_to_unit(buf, pos + 1) {
+      None -> None
+      Some(cu) -> match cu { CUP(u, p2) -> Some(COUP(Some(u), p2)) }
+    }
+    Some(_) -> None
+  }
+}
+
+# ---- Decl ------------------------------------------------------------------
+
+fn cache_decl_to_hex(d: Decl) : String = match d {
+  DFn(is_pub, name, tps, prms, ort, row, body, l, c, omo) -> concat_all([
+    cache_byte_to_hex(1), cache_bool_to_hex(is_pub), cache_string_to_hex(name),
+    cache_string_list_to_hex(tps),
+    cache_param_list_to_hex(prms),
+    cache_opt_typeexpr_to_hex(ort),
+    cache_row_to_hex(row),
+    cache_expr_to_hex(body),
+    cache_int_to_hex(l), cache_int_to_hex(c),
+    cache_opt_string_to_hex(omo)
+  ])
+  DType(is_pub, name, tps, body, l, c, _) -> concat_all([
+    cache_byte_to_hex(2), cache_bool_to_hex(is_pub), cache_string_to_hex(name),
+    cache_string_list_to_hex(tps), cache_tb_to_hex(body),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DTest(desc, body, l, c) -> concat_all([
+    cache_byte_to_hex(3), cache_string_to_hex(desc), cache_expr_to_hex(body),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DBench(desc, body, l, c) -> concat_all([
+    cache_byte_to_hex(4), cache_string_to_hex(desc), cache_expr_to_hex(body),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DCheck(desc, params, body, l, c) -> concat_all([
+    cache_byte_to_hex(5), cache_string_to_hex(desc), cache_param_list_to_hex(params),
+    cache_expr_to_hex(body), cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DImport(kind, l, c) -> concat_all([
+    cache_byte_to_hex(6), cache_ik_to_hex(kind), cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DEffect(is_pub, name, tps, ops, odb, l, c) -> concat_all([
+    cache_byte_to_hex(7), cache_bool_to_hex(is_pub), cache_string_to_hex(name),
+    cache_string_list_to_hex(tps), cache_eo_list_to_hex(ops),
+    cache_opt_db_to_hex(odb),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DProtocol(is_pub, name, tps, ops, l, c) -> concat_all([
+    cache_byte_to_hex(8), cache_bool_to_hex(is_pub), cache_string_to_hex(name),
+    cache_string_list_to_hex(tps), cache_po_list_to_hex(ops),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DImpl(pname, targs, target, body, l, c) -> concat_all([
+    cache_byte_to_hex(9), cache_string_to_hex(pname), cache_typeexpr_list_to_hex(targs),
+    cache_typeexpr_to_hex(target), cache_decl_list_to_hex(body),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DDerive(names, inner, l, c) -> concat_all([
+    cache_byte_to_hex(10), cache_string_list_to_hex(names), cache_decl_to_hex(inner),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DAttribPure(inner, l, c) -> concat_all([
+    cache_byte_to_hex(11), cache_decl_to_hex(inner), cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DUnit(is_pub, name, alias, l, c) -> concat_all([
+    cache_byte_to_hex(12), cache_bool_to_hex(is_pub), cache_string_to_hex(name),
+    cache_opt_unit_to_hex(alias),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DUse(name, l, c) -> concat_all([
+    cache_byte_to_hex(13), cache_string_to_hex(name), cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DAxiom(extc, ec_flag, name, csym, tps, prms, rt, row, l, c) -> concat_all([
+    cache_byte_to_hex(14), cache_bool_to_hex(extc), cache_bool_to_hex(ec_flag),
+    cache_string_to_hex(name), cache_string_to_hex(csym),
+    cache_string_list_to_hex(tps), cache_param_list_to_hex(prms),
+    cache_typeexpr_to_hex(rt), cache_row_to_hex(row),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DConst(is_pub, name, ty, body, l, c) -> concat_all([
+    cache_byte_to_hex(15), cache_bool_to_hex(is_pub), cache_string_to_hex(name),
+    cache_typeexpr_to_hex(ty), cache_expr_to_hex(body),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DUnstable(inner, l, c) -> concat_all([
+    cache_byte_to_hex(16), cache_decl_to_hex(inner),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+}
+
+fn cache_hex_to_decl(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(b) -> cache_hex_to_decl_body(buf, pos + 1, b)
+  }
+}
+
+fn cache_hex_to_decl_body(buf: String, pos: Int,
+                            tag: Int) : Option[CacheDeclPos] {
+  if tag == 1 {
+    cache_hex_to_dfn(buf, pos)
+  } else if tag == 2 {
+    cache_hex_to_dtype(buf, pos)
+  } else if tag == 3 {
+    cache_hex_to_dtest_like(buf, pos, 3)
+  } else if tag == 4 {
+    cache_hex_to_dtest_like(buf, pos, 4)
+  } else if tag == 5 {
+    cache_hex_to_dcheck(buf, pos)
+  } else if tag == 6 {
+    match cache_hex_to_ik(buf, pos) {
+      None -> None
+      Some(cik) -> match cik { CIKP(k, p1) ->
+        match cache_hex_to_int(buf, p1) {
+          None -> None
+          Some(cl) -> match cl { CIP(ln, p2) ->
+            match cache_hex_to_int(buf, p2) {
+              None -> None
+              Some(cc) -> match cc { CIP(cn, p3) ->
+                Some(CDP(DImport(k, ln, cn), p3))
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if tag == 7 {
+    cache_hex_to_deffect(buf, pos)
+  } else if tag == 8 {
+    cache_hex_to_dprotocol(buf, pos)
+  } else if tag == 9 {
+    cache_hex_to_dimpl(buf, pos)
+  } else if tag == 10 {
+    cache_hex_to_dderive(buf, pos)
+  } else if tag == 11 {
+    cache_hex_to_dattribpure(buf, pos)
+  } else if tag == 12 {
+    cache_hex_to_dunit(buf, pos)
+  } else if tag == 13 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(n, p1) ->
+        match cache_hex_to_int(buf, p1) {
+          None -> None
+          Some(cl) -> match cl { CIP(ln, p2) ->
+            match cache_hex_to_int(buf, p2) {
+              None -> None
+              Some(cc) -> match cc { CIP(cn, p3) ->
+                Some(CDP(DUse(n, ln, cn), p3))
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if tag == 14 {
+    cache_hex_to_daxiom(buf, pos)
+  } else if tag == 15 {
+    cache_hex_to_dconst(buf, pos)
+  } else if tag == 16 {
+    cache_hex_to_dunstable(buf, pos)
+  } else { None }
+}
+
+fn cache_hex_to_dfn(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_bool(buf, pos) {
+    None -> None
+    Some(cbp) -> match cbp { CBP(is_pub, p1) ->
+      match cache_hex_to_string(buf, p1) {
+        None -> None
+        Some(csp) -> match csp { CSP(name, p2) ->
+          match cache_hex_to_string_list(buf, p2) {
+            None -> None
+            Some(csl) -> match csl { CSLP(tps, p3) ->
+              match cache_hex_to_param_list(buf, p3) {
+                None -> None
+                Some(cpl) -> match cpl { CPmLP(prms, p4) ->
+                  cache_hex_to_dfn_tail(buf, p4, is_pub, name, tps, prms)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dfn_tail(buf: String, pos: Int, is_pub: Bool, name: String,
+                            tps: [String], prms: [Param]) : Option[CacheDeclPos] {
+  match cache_hex_to_opt_typeexpr(buf, pos) {
+    None -> None
+    Some(cot) -> match cot { COTyP(ort, p1) ->
+      match cache_hex_to_row(buf, p1) {
+        None -> None
+        Some(crw) -> match crw { CRowP(row, p2) ->
+          match cache_hex_to_expr(buf, p2) {
+            None -> None
+            Some(ce) -> match ce { CEP(body, p3) ->
+              match cache_hex_to_int(buf, p3) {
+                None -> None
+                Some(cl) -> match cl { CIP(ln, p4) ->
+                  match cache_hex_to_int(buf, p4) {
+                    None -> None
+                    Some(cc) -> match cc { CIP(cn, p5) ->
+                      match cache_hex_to_opt_string(buf, p5) {
+                        None -> None
+                        Some(cos) -> match cos { COSP(omo, p6) ->
+                          Some(CDP(DFn(is_pub, name, tps, prms, ort, row,
+                                       body, ln, cn, omo), p6))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dtype(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_bool(buf, pos) {
+    None -> None
+    Some(cbp) -> match cbp { CBP(is_pub, p1) ->
+      match cache_hex_to_string(buf, p1) {
+        None -> None
+        Some(csp) -> match csp { CSP(name, p2) ->
+          match cache_hex_to_string_list(buf, p2) {
+            None -> None
+            Some(csl) -> match csl { CSLP(tps, p3) ->
+              match cache_hex_to_tb(buf, p3) {
+                None -> None
+                Some(ctb) -> match ctb { CTBP(body, p4) ->
+                  match cache_hex_to_int(buf, p4) {
+                    None -> None
+                    Some(cl) -> match cl { CIP(ln, p5) ->
+                      match cache_hex_to_int(buf, p5) {
+                        None -> None
+                        Some(cc) -> match cc { CIP(cn, p6) ->
+                          Some(CDP(DType(is_pub, name, tps, body, ln, cn, None), p6))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# DTest / DBench share the same shape (desc, body, l, c).
+fn cache_hex_to_dtest_like(buf: String, pos: Int,
+                              which: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(desc, p1) ->
+      match cache_hex_to_expr(buf, p1) {
+        None -> None
+        Some(ce) -> match ce { CEP(body, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(cl) -> match cl { CIP(ln, p3) ->
+              match cache_hex_to_int(buf, p3) {
+                None -> None
+                Some(cc) -> match cc { CIP(cn, p4) ->
+                  if which == 3 {
+                    Some(CDP(DTest(desc, body, ln, cn), p4))
+                  } else {
+                    Some(CDP(DBench(desc, body, ln, cn), p4))
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dcheck(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(desc, p1) ->
+      match cache_hex_to_param_list(buf, p1) {
+        None -> None
+        Some(cpl) -> match cpl { CPmLP(params, p2) ->
+          match cache_hex_to_expr(buf, p2) {
+            None -> None
+            Some(ce) -> match ce { CEP(body, p3) ->
+              match cache_hex_to_int(buf, p3) {
+                None -> None
+                Some(cl) -> match cl { CIP(ln, p4) ->
+                  match cache_hex_to_int(buf, p4) {
+                    None -> None
+                    Some(cc) -> match cc { CIP(cn, p5) ->
+                      Some(CDP(DCheck(desc, params, body, ln, cn), p5))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_deffect(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_bool(buf, pos) {
+    None -> None
+    Some(cbp) -> match cbp { CBP(is_pub, p1) ->
+      match cache_hex_to_string(buf, p1) {
+        None -> None
+        Some(csp) -> match csp { CSP(name, p2) ->
+          match cache_hex_to_string_list(buf, p2) {
+            None -> None
+            Some(csl) -> match csl { CSLP(tps, p3) ->
+              match cache_hex_to_eo_list(buf, p3) {
+                None -> None
+                Some(ceol) -> match ceol { CEOLP(ops, p4) ->
+                  match cache_hex_to_opt_db(buf, p4) {
+                    None -> None
+                    Some(codb) -> match codb { CODBP(odb, p5) ->
+                      match cache_hex_to_int(buf, p5) {
+                        None -> None
+                        Some(cl) -> match cl { CIP(ln, p6) ->
+                          match cache_hex_to_int(buf, p6) {
+                            None -> None
+                            Some(cc) -> match cc { CIP(cn, p7) ->
+                              Some(CDP(DEffect(is_pub, name, tps, ops, odb, ln, cn), p7))
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dprotocol(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_bool(buf, pos) {
+    None -> None
+    Some(cbp) -> match cbp { CBP(is_pub, p1) ->
+      match cache_hex_to_string(buf, p1) {
+        None -> None
+        Some(csp) -> match csp { CSP(name, p2) ->
+          match cache_hex_to_string_list(buf, p2) {
+            None -> None
+            Some(csl) -> match csl { CSLP(tps, p3) ->
+              match cache_hex_to_po_list(buf, p3) {
+                None -> None
+                Some(cpol) -> match cpol { CPOLP(ops, p4) ->
+                  match cache_hex_to_int(buf, p4) {
+                    None -> None
+                    Some(cl) -> match cl { CIP(ln, p5) ->
+                      match cache_hex_to_int(buf, p5) {
+                        None -> None
+                        Some(cc) -> match cc { CIP(cn, p6) ->
+                          Some(CDP(DProtocol(is_pub, name, tps, ops, ln, cn), p6))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dimpl(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(pname, p1) ->
+      match cache_hex_to_typeexpr_list(buf, p1) {
+        None -> None
+        Some(ctl) -> match ctl { CTyLP(targs, p2) ->
+          match cache_hex_to_typeexpr(buf, p2) {
+            None -> None
+            Some(ct) -> match ct { CTyP(target, p3) ->
+              match cache_hex_to_decl_list(buf, p3) {
+                None -> None
+                Some(cdl) -> match cdl { CDLP(body, p4) ->
+                  match cache_hex_to_int(buf, p4) {
+                    None -> None
+                    Some(cl) -> match cl { CIP(ln, p5) ->
+                      match cache_hex_to_int(buf, p5) {
+                        None -> None
+                        Some(cc) -> match cc { CIP(cn, p6) ->
+                          Some(CDP(DImpl(pname, targs, target, body, ln, cn), p6))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dderive(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_string_list(buf, pos) {
+    None -> None
+    Some(csl) -> match csl { CSLP(names, p1) ->
+      match cache_hex_to_decl(buf, p1) {
+        None -> None
+        Some(cd) -> match cd { CDP(inner, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(cl) -> match cl { CIP(ln, p3) ->
+              match cache_hex_to_int(buf, p3) {
+                None -> None
+                Some(cc) -> match cc { CIP(cn, p4) ->
+                  Some(CDP(DDerive(names, inner, ln, cn), p4))
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dattribpure(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_decl(buf, pos) {
+    None -> None
+    Some(cd) -> match cd { CDP(inner, p1) ->
+      match cache_hex_to_int(buf, p1) {
+        None -> None
+        Some(cl) -> match cl { CIP(ln, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(cc) -> match cc { CIP(cn, p3) ->
+              Some(CDP(DAttribPure(inner, ln, cn), p3))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dunstable(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_decl(buf, pos) {
+    None -> None
+    Some(cd) -> match cd { CDP(inner, p1) ->
+      match cache_hex_to_int(buf, p1) {
+        None -> None
+        Some(cl) -> match cl { CIP(ln, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(cc) -> match cc { CIP(cn, p3) ->
+              Some(CDP(DUnstable(inner, ln, cn), p3))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dunit(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_bool(buf, pos) {
+    None -> None
+    Some(cbp) -> match cbp { CBP(is_pub, p1) ->
+      match cache_hex_to_string(buf, p1) {
+        None -> None
+        Some(csp) -> match csp { CSP(name, p2) ->
+          match cache_hex_to_opt_unit(buf, p2) {
+            None -> None
+            Some(cou) -> match cou { COUP(alias, p3) ->
+              match cache_hex_to_int(buf, p3) {
+                None -> None
+                Some(cl) -> match cl { CIP(ln, p4) ->
+                  match cache_hex_to_int(buf, p4) {
+                    None -> None
+                    Some(cc) -> match cc { CIP(cn, p5) ->
+                      Some(CDP(DUnit(is_pub, name, alias, ln, cn), p5))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_daxiom(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_bool(buf, pos) {
+    None -> None
+    Some(cbp1) -> match cbp1 { CBP(extc, p1) ->
+      match cache_hex_to_bool(buf, p1) {
+        None -> None
+        Some(cbp2) -> match cbp2 { CBP(ec_flag, p2) ->
+          match cache_hex_to_string(buf, p2) {
+            None -> None
+            Some(csp1) -> match csp1 { CSP(name, p3) ->
+              match cache_hex_to_string(buf, p3) {
+                None -> None
+                Some(csp2) -> match csp2 { CSP(csym, p4) ->
+                  cache_hex_to_daxiom_tail(buf, p4, extc, ec_flag, name, csym)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_daxiom_tail(buf: String, pos: Int, extc: Bool, ec_flag: Bool,
+                              name: String, csym: String) : Option[CacheDeclPos] {
+  match cache_hex_to_string_list(buf, pos) {
+    None -> None
+    Some(csl) -> match csl { CSLP(tps, p1) ->
+      match cache_hex_to_param_list(buf, p1) {
+        None -> None
+        Some(cpl) -> match cpl { CPmLP(prms, p2) ->
+          match cache_hex_to_typeexpr(buf, p2) {
+            None -> None
+            Some(ct) -> match ct { CTyP(rt, p3) ->
+              match cache_hex_to_row(buf, p3) {
+                None -> None
+                Some(crw) -> match crw { CRowP(row, p4) ->
+                  match cache_hex_to_int(buf, p4) {
+                    None -> None
+                    Some(cl) -> match cl { CIP(ln, p5) ->
+                      match cache_hex_to_int(buf, p5) {
+                        None -> None
+                        Some(cc) -> match cc { CIP(cn, p6) ->
+                          Some(CDP(DAxiom(extc, ec_flag, name, csym, tps,
+                                          prms, rt, row, ln, cn), p6))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dconst(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_bool(buf, pos) {
+    None -> None
+    Some(cbp) -> match cbp { CBP(is_pub, p1) ->
+      match cache_hex_to_string(buf, p1) {
+        None -> None
+        Some(csp) -> match csp { CSP(name, p2) ->
+          match cache_hex_to_typeexpr(buf, p2) {
+            None -> None
+            Some(ct) -> match ct { CTyP(ty, p3) ->
+              match cache_hex_to_expr(buf, p3) {
+                None -> None
+                Some(ce) -> match ce { CEP(body, p4) ->
+                  match cache_hex_to_int(buf, p4) {
+                    None -> None
+                    Some(cl) -> match cl { CIP(ln, p5) ->
+                      match cache_hex_to_int(buf, p5) {
+                        None -> None
+                        Some(cc) -> match cc { CIP(cn, p6) ->
+                          Some(CDP(DConst(is_pub, name, ty, body, ln, cn), p6))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_decl_list_to_hex(xs: [Decl]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_decl_list_loop(xs, [])))])
+
+fn cache_decl_list_loop(xs: [Decl], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_decl_list_loop(t, [cache_decl_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_decl_list(buf: String, pos: Int) : Option[CacheDeclLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_decl_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_decl_list(buf: String, pos: Int, remaining: Int,
+                                  acc: [Decl]) : Option[CacheDeclLPos] {
+  if remaining <= 0 { Some(CDLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_decl(buf, pos) {
+      None -> None
+      Some(cd) -> match cd { CDP(d, p2) ->
+        cache_hex_collect_decl_list(buf, p2, remaining - 1, [d, ...acc])
+      }
+    }
+  }
+}
+
+# ---- Severity / RelatedInfo / Diagnostic ---------------------------------
+
+fn cache_sev_to_hex(s: Severity) : String = match s {
+  SevError   -> cache_byte_to_hex(1)
+  SevWarning -> cache_byte_to_hex(2)
+  SevHint    -> cache_byte_to_hex(3)
+  SevInfo    -> cache_byte_to_hex(4)
+}
+
+fn cache_hex_to_sev(buf: String, pos: Int) : Option[CacheSevPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(1) -> Some(CSevP(SevError, pos + 1))
+    Some(2) -> Some(CSevP(SevWarning, pos + 1))
+    Some(3) -> Some(CSevP(SevHint, pos + 1))
+    Some(4) -> Some(CSevP(SevInfo, pos + 1))
+    Some(_) -> None
+  }
+}
+
+fn cache_ri_to_hex(r: RelatedInfo) : String = match r {
+  DR(file, line, col, msg) -> concat_all([cache_string_to_hex(file),
+                                            cache_int_to_hex(line),
+                                            cache_int_to_hex(col),
+                                            cache_string_to_hex(msg)])
+}
+
+fn cache_hex_to_ri(buf: String, pos: Int) : Option[CacheRIPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp1) -> match csp1 { CSP(file, p1) ->
+      match cache_hex_to_int(buf, p1) {
+        None -> None
+        Some(cl) -> match cl { CIP(line, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(cc) -> match cc { CIP(col, p3) ->
+              match cache_hex_to_string(buf, p3) {
+                None -> None
+                Some(csp2) -> match csp2 { CSP(msg, p4) ->
+                  Some(CRIP(DR(file, line, col, msg), p4))
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_ri_list_to_hex(xs: [RelatedInfo]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_ri_list_loop(xs, [])))])
+
+fn cache_ri_list_loop(xs: [RelatedInfo], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_ri_list_loop(t, [cache_ri_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_ri_list(buf: String, pos: Int) : Option[CacheRILPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_ri_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_ri_list(buf: String, pos: Int, remaining: Int,
+                               acc: [RelatedInfo]) : Option[CacheRILPos] {
+  if remaining <= 0 { Some(CRILP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_ri(buf, pos) {
+      None -> None
+      Some(cri) -> match cri { CRIP(ri, p2) ->
+        cache_hex_collect_ri_list(buf, p2, remaining - 1, [ri, ...acc])
+      }
+    }
+  }
+}
+
+fn cache_diag_to_hex(d: Diagnostic) : String = match d {
+  D(sev, file, line, col, msg, rel) -> concat_all([cache_sev_to_hex(sev),
+                                                       cache_string_to_hex(file),
+                                                       cache_int_to_hex(line),
+                                                       cache_int_to_hex(col),
+                                                       cache_string_to_hex(msg),
+                                                       cache_ri_list_to_hex(rel)])
+}
+
+fn cache_hex_to_diag(buf: String, pos: Int) : Option[CacheDiagPos] {
+  match cache_hex_to_sev(buf, pos) {
+    None -> None
+    Some(cs) -> match cs { CSevP(sev, p1) ->
+      match cache_hex_to_string(buf, p1) {
+        None -> None
+        Some(csp1) -> match csp1 { CSP(file, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(cl) -> match cl { CIP(line, p3) ->
+              match cache_hex_to_int(buf, p3) {
+                None -> None
+                Some(cc) -> match cc { CIP(col, p4) ->
+                  match cache_hex_to_string(buf, p4) {
+                    None -> None
+                    Some(csp2) -> match csp2 { CSP(msg, p5) ->
+                      match cache_hex_to_ri_list(buf, p5) {
+                        None -> None
+                        Some(cril) -> match cril { CRILP(rel, p6) ->
+                          Some(CDgP(D(sev, file, line, col, msg, rel), p6))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_diag_list_to_hex(xs: [Diagnostic]) : String =
+  concat_all([cache_u32_to_hex(list_length(xs)),
+              concat_all(list_reverse(cache_diag_list_loop(xs, [])))])
+
+fn cache_diag_list_loop(xs: [Diagnostic], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [h, ...t] -> cache_diag_list_loop(t, [cache_diag_to_hex(h), ...acc])
+}
+
+fn cache_hex_to_diag_list(buf: String, pos: Int) : Option[CacheDiagLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_diag_list(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_diag_list(buf: String, pos: Int, remaining: Int,
+                                 acc: [Diagnostic]) : Option[CacheDiagLPos] {
+  if remaining <= 0 { Some(CDgLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_diag(buf, pos) {
+      None -> None
+      Some(cd) -> match cd { CDgP(d, p2) ->
+        cache_hex_collect_diag_list(buf, p2, remaining - 1, [d, ...acc])
+      }
+    }
+  }
+}
+
+# ---- Entry points -----------------------------------------------------------
+#
+# cache_serialize_module wraps the KAB1 header + the serialised
+# `[Decl]` payload. The `source_sha` slot is supplied by the caller
+# (bin/kai shells out to shasum); for the step-2 round-trip test we
+# pass a fixed 64-char dummy sha so the header is well-formed.
+#
+# cache_deserialize_module returns `None` on any header / payload
+# mismatch — the caller treats `None` as cache miss + re-parse.
+
+#[doc("Result of cache_deserialize_module: the decoded [Decl] payload plus the source sha256 echoed from the blob header.")]
+pub type CacheDeserialized = CDs([Decl], String) # decls + source_sha echoed
+
+#[doc("Serialise a [Decl] module plus its source sha256 into a KAB2 cache blob String.")]
+pub fn cache_serialize_module(decls: [Decl], source_sha: String) : String =
+  concat_all([cache_file_header(source_sha),
+              cache_decl_list_to_hex(decls)])
+
+#[doc("Deserialise a KAB2 cache blob back into decls + sha; None on any header/payload mismatch (cache miss).")]
+pub fn cache_deserialize_module(buf: String) : Option[CacheDeserialized] {
+  match cache_read_header(buf) {
+    None -> None
+    Some(chdr) -> match chdr { CHdr(sha, payload_pos) ->
+      match cache_hex_to_decl_list(buf, payload_pos) {
+        None -> None
+        Some(cdl) -> match cdl { CDLP(decls, _) -> Some(CDs(decls, sha)) }
+      }
+    }
+  }
+}
+
+# Round-trip smoke test entrypoint. Builds a synthetic [Decl] in
+# memory, serialises it, deserialises it, re-serialises, and reports
+# whether the two hex blobs match. Returns "OK" on match or a short
+# diagnostic on mismatch. The test fixture lives in
+# examples/cache/roundtrip_step2.kai and shells out to `kaic2 -e`
+# for stage1-safe invocation.
+#[doc("In-memory codec smoke test: serialise a synthetic [Decl], round-trip it, re-serialise, and report OK or a short diagnostic.")]
+pub fn cache_roundtrip_self_test() : String {
+  let dummy_sha = "0000000000000000000000000000000000000000000000000000000000000000"
+  let int_ty = TypeExpr { tkind: TyName("Int", []), line: 1, col: 1 }
+  let body = Expr { kind: EInt(42), line: 1, col: 5,
+               ty: None, mode: MUnknown }
+  let row = REmpty
+  # ECall body: callg() = g(7)
+  let probe_arg = Expr { kind: EInt(7), line: 5, col: 20, ty: None, mode: MUnknown }
+  let probe_args : [Expr] = [probe_arg]
+  let g_var = Expr { kind: EVar("g"), line: 5, col: 19, ty: None, mode: MUnknown }
+  let call_body = Expr { kind: ECall(g_var, probe_args), line: 5, col: 18,
+                          ty: None, mode: MUnknown }
+  # Nested ECall body: nested() = f(g(7))
+  let inner_arg = Expr { kind: EInt(7), line: 6, col: 23, ty: None, mode: MUnknown }
+  let inner_args : [Expr] = [inner_arg]
+  let inner_g_var = Expr { kind: EVar("g"), line: 6, col: 21, ty: None, mode: MUnknown }
+  let f_var = Expr { kind: EVar("f"), line: 6, col: 19, ty: None, mode: MUnknown }
+  let inner_call = Expr { kind: ECall(inner_g_var, inner_args), line: 6, col: 21,
+                          ty: None, mode: MUnknown }
+  let outer_args : [Expr] = [inner_call]
+  let nested_body = Expr { kind: ECall(f_var, outer_args), line: 6, col: 18,
+                            ty: None, mode: MUnknown }
+  # EIntrinsic body: intr() = $foo(7)
+  let intr_arg = Expr { kind: EInt(7), line: 7, col: 23, ty: None, mode: MUnknown }
+  let intr_args : [Expr] = [intr_arg]
+  let intr_body = Expr { kind: EIntrinsic("foo", intr_args), line: 7, col: 18,
+                          ty: None, mode: MUnknown }
+  # TyFn return type — exercises the TyFn(args, ret, row) arm.
+  let tyfn_arg = TypeExpr { tkind: TyName("Int", []), line: 8, col: 14 }
+  let tyfn_ret = TypeExpr { tkind: TyName("Int", []), line: 8, col: 20 }
+  let tyfn = TypeExpr { tkind: TyFn([tyfn_arg], tyfn_ret, REmpty), line: 8, col: 12 }
+  let decls = [
+    DType(true, "Color", [],
+          TBSum([Var("Red", []), Var("Green", []), Var("Blue", [])]),
+          1, 1, None),
+    DType(true, "Pair", ["T"],
+          TBRecord([FD(true, "fst", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 }),
+                    FD(true, "snd", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 })]),
+          2, 1, None),
+    DFn(true, "answer", [], [], Some(int_ty), row, body, 3, 1, None),
+    DConst(true, "PI",
+            TypeExpr { tkind: TyName("Real", []), line: 4, col: 1 },
+            Expr { kind: EReal(3.14159), line: 4, col: 15,
+              ty: None, mode: MUnknown },
+            4, 1),
+    DFn(true, "callg", [], [], Some(int_ty), row, call_body, 5, 1, None),
+    DFn(true, "nested", [], [], Some(int_ty), row, nested_body, 6, 1, None),
+    DFn(true, "intr", [], [], Some(int_ty), row, intr_body, 7, 1, None),
+    DFn(true, "tyfn_probe", [], [], Some(tyfn), row, body, 8, 1, None)
+  ]
+  let blob1 = cache_serialize_module(decls, dummy_sha)
+  match cache_deserialize_module(blob1) {
+    None -> "FAIL: deserialize returned None"
+    Some(cds) -> match cds { CDs(restored, sha2) ->
+      if sha2 != dummy_sha { "FAIL: sha mismatch" }
+      else {
+        let blob2 = cache_serialize_module(restored, dummy_sha)
+        if string_length(blob1) != string_length(blob2) {
+          concat_all(["FAIL: blob length differs: ",
+                      int_to_string(string_length(blob1)), " vs ",
+                      int_to_string(string_length(blob2))])
+        } else if blob1 == blob2 {
+          concat_all(["OK ", int_to_string(list_length(restored)),
+                      " decls round-trip; blob=",
+                      int_to_string(string_length(blob1)), " bytes"])
+        } else {
+          "FAIL: blob content differs"
+        }
+      }
+    }
+  }
+}
