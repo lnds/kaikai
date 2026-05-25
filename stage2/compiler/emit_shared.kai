@@ -1,0 +1,2851 @@
+# compiler/emit_shared.kai — backend-shared lowering layer.
+#
+# Extracted from main.kai under issue #677 Phase 1r, ahead of the C
+# emitter (compiler.emit_c). This module owns the stateless plumbing the
+# C backend (`emit_program`) and the LLVM backend (`emit_program_llvm`)
+# both consume: the layer that turns a resolved + monomorphised AST into
+# the per-backend symbol tables, free-variable analyses, alias rewrites,
+# FFI marshalling classifications, and protocol-dispatch decoders. Neither
+# backend reads the typer's working state here — only the `.ty` already
+# embedded in `Expr` nodes — so this is codegen-common, not typer code.
+#
+# Why it exists: the LLVM-backend lane (#699, phase 1q) duplicated 137 of
+# these helpers as `lvm_*` mirrors rather than block on a future sink. The
+# divergence debt was real (a codegen fix had to be applied twice or the
+# two backends drift). This lane reconciles it: the 133 genuinely-shared
+# helpers + their 13 helper types move here once, both backends import
+# them, and the `lvm_*` copies are deleted from emit_llvm.kai. (Four
+# `lvm_*` mirrors whose originals live outside the emit_c range — in the
+# driver/head — stay in emit_llvm.kai until the driver lane.)
+#
+# What this module owns
+#
+#   - Symbol minting: `c_sym` / `c_sym_of_callee`, the `evar_*` variant-
+#     table lookups, `build_globals` / `register_variants` / `builtin_variants`.
+#   - FFI marshalling: the `ffi_*` family + `FfiRetKind`.
+#   - Free-variable analysis: the `fv_*` family + `FvScoped`.
+#   - Alias rewriting: `rewrite_alias_*` / `alias_map_*` + `AliasMap` /
+#     `StmtsRewrite`.
+#   - Protocol-dispatch decoding: `proto_dispatch_*` / `pimpl_*` +
+#     `ProtoDispatchParts` / `PimplRow` / `PR2`.
+#   - The AST collector/functor glue both backends walk (`collect_*`,
+#     `map_*_exprs`, `map_expr_kind`, `pat_bindings`).
+#   - The lifted-clause/lambda descriptors `EVar` / `ClauseInfo` /
+#     `LamInfo` / `LamCollect` and the user-variant scan `CUVResult` /
+#     `CUVStep`.
+#
+# `EVar` (ctor `EV`) is the emit-side variant-table entry — distinct from
+# the AST `ExprKind` constructor `EVar(String)`. It keeps its original
+# name here (it is the original, not a mirror); consumers disambiguate by
+# constructor (`EV(...)` vs `EVar(...)`).
+#
+# Public surface: 133 fns + 13 types, all `pub` — every one is called by
+# at least one of the two backends. That breadth is inherent: this module
+# *is* the shared backend API. `join_with` did NOT come here — it is a
+# generic string helper and moved to compiler.util instead.
+#
+# Bundle order: ... unbox, perceus, protos, monomorph, **emit_shared**,
+# emit_llvm, emit_c, main. Imports compiler.ast (AST nodes + `mk_expr`),
+# compiler.util (string/list/char helpers incl. the relocated `join_with`),
+# compiler.fnreg (`EFn` + `efn_resolve` / the `scan_uses_*` / `iscan_*`
+# use-scan family), compiler.infer (`AliasBinding` / `IScan` / `IPart` /
+# `Use` + `unit_canon` / `label_to_string` / `lookup_alias`), compiler.parse
+# (`parse_interp_expr`), compiler.resolve (`prelude_names`), and
+# compiler.unbox (`expr_has_interp_use` / `uses_have_in_lam`).
+
+import compiler.ast
+import compiler.util
+import compiler.fnreg
+import compiler.infer
+import compiler.parse
+import compiler.resolve
+import compiler.unbox
+
+# ====================================================================
+
+#[doc("Emit-side variant table entry: constructor name, arity, payload type list, head tag.")]
+pub type EVar = EV(String, Int, [TypeExpr], Int)
+
+#[doc("EFn-table filter/selector: prefer module.")]
+pub fn fns_prefer_module(fns: [EFn], mo: Option[String]) : [EFn] = match mo {
+  None    -> fns
+  Some(m) -> list_append(fns_filter_same_module(fns, m, []),
+                          fns_filter_other_module(fns, m, []))
+}
+
+#[doc("EFn-table filter/selector: filter same module.")]
+pub fn fns_filter_same_module(fns: [EFn], m: String, acc: [EFn]) : [EFn] {
+  match fns {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      EFn(_, _, Some(em), _) ->
+        if em == m { fns_filter_same_module(rest, m, [h, ...acc]) }
+        else       { fns_filter_same_module(rest, m, acc) }
+      _ -> fns_filter_same_module(rest, m, acc)
+    }
+  }
+}
+
+#[doc("EFn-table filter/selector: filter other module.")]
+pub fn fns_filter_other_module(fns: [EFn], m: String, acc: [EFn]) : [EFn] {
+  match fns {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      EFn(_, _, Some(em), _) ->
+        if em == m { fns_filter_other_module(rest, m, acc) }
+        else       { fns_filter_other_module(rest, m, [h, ...acc]) }
+      _ -> fns_filter_other_module(rest, m, [h, ...acc])
+    }
+  }
+}
+
+# m6.2 v2: produce the C-symbol suffix (everything after the `kai_`
+# prefix) for a named function. None → just the bare name; Some(m) →
+# the module-prefixed `<m>__<name>`. Used to mint the symbol at decl
+# emission, in call sites, and in closure-thunk forward decls so all
+# three stay in sync.
+#[doc("produce the C-symbol suffix (everything after the `kai_` prefix) for a named function. None → just the bare name; Some(m) → the module-prefixed `<m>__<name>`. Used to mint the…")]
+pub fn c_sym(name: String, mo: Option[String]) : String = match mo {
+  None    -> name
+  Some(m) -> string_concat(m, string_concat("__", name))
+}
+
+# m6.2 v2: mint the C-symbol suffix for a callee resolved via the
+# EFn table. Falls back to the bare name when the lookup misses (e.g.
+# the callee is a closure variable held in a local that gets routed
+# through `kai_apply` instead).
+
+# m6.2 v2: mint the C-symbol suffix for a callee resolved via the
+# EFn table. Falls back to the bare name when the lookup misses (e.g.
+# the callee is a closure variable held in a local that gets routed
+# through `kai_apply` instead).
+#[doc("mint the C-symbol suffix for a callee resolved via the EFn table. Falls back to the bare name when the lookup misses (e.g. the callee is a closure variable held in a local that…")]
+pub fn c_sym_of_callee(fns: [EFn], callee: String) : String = match efn_resolve(fns, callee) {
+  Some(EFn(_, _, mo, _)) -> c_sym(callee, mo)
+  None                   -> callee
+}
+
+#[doc("Variant-table lookup helper: find.")]
+pub fn evar_find(vs: [EVar], target: String) : Option[Int] {
+  match vs {
+    [] -> None
+    [h, ...rest] -> match h {
+      EV(n, ar, _, _) -> if n == target { Some(ar) } else { evar_find(rest, target) }
+    }
+  }
+}
+
+# Issue #440 Phase 2 — look up the payload TypeExpr list for a
+# constructor name. Returns None when the name is not a known
+# variant ctor (the call site falls back to the legacy boxed path).
+
+# Atom-style global variant tag lookup. Returns the reserved-range
+# tag for builtins (0..10 per docs/variant-tags.md) or the user-range
+# tag (>= 11) assigned in declaration order. Falls back to 0 for
+# unknown names (call sites guard with evar_find first; the fallback
+# only matters for synthetic emit paths that legitimately stringify
+# a non-variant identifier into a kai_variant call shape — none
+# survives in the current sources but the safe default avoids
+# crashing the emitter if one regresses in).
+#[doc("Atom-style global variant tag lookup. Returns the reserved-range tag for builtins (0..10 per docs/variant-tags.md) or the user-range tag (>= 11) assigned in declaration order.…")]
+pub fn evar_find_tag(vs: [EVar], target: String) : Int {
+  match vs {
+    [] -> 0
+    [h, ...rest] -> match h {
+      EV(n, _, _, t) -> if n == target { t } else { evar_find_tag(rest, target) }
+    }
+  }
+}
+
+# Match-side variant. Returns Some(tag) when target is in the
+# variants table, None otherwise. Consumers (emit_pat_test_variant*,
+# emit_bang) use this to decide between the fast tag-compare path
+# (`variant_tag == N`) and the legacy strcmp fallback. Under the
+# atom-style global convention every well-typed PVariant pattern
+# resolves to a known name; the None branch protects synthetic AST
+# paths where a constructor name slipped through without registration.
+
+# Match-side variant. Returns Some(tag) when target is in the
+# variants table, None otherwise. Consumers (emit_pat_test_variant*,
+# emit_bang) use this to decide between the fast tag-compare path
+# (`variant_tag == N`) and the legacy strcmp fallback. Under the
+# atom-style global convention every well-typed PVariant pattern
+# resolves to a known name; the None branch protects synthetic AST
+# paths where a constructor name slipped through without registration.
+#[doc("Match-side variant. Returns Some(tag) when target is in the variants table, None otherwise. Consumers (emit_pat_test_variant*, emit_bang) use this to decide between the fast…")]
+pub fn evar_find_tag_opt(vs: [EVar], target: String) : Option[Int] {
+  match vs {
+    [] -> None
+    [h, ...rest] -> match h {
+      EV(n, _, _, t) -> if n == target { Some(t) } else { evar_find_tag_opt(rest, target) }
+    }
+  }
+}
+
+#[doc("The fixed table of built-in variant constructors (Option/Result/etc.) every emit run seeds.")]
+pub fn builtin_variants() : [EVar] =
+  # Phase 2 #440: builtins use empty type lists so the emitter falls
+  # back to the legacy boxed constructor path. Some/Ok/Err wrap an
+  # arbitrary boxed value; unboxing them would require a per-call-site
+  # type read which is not in scope for this lane.
+  #
+  # Tag assignment per docs/variant-tags.md. Builtins 0..10 are
+  # reserved; user code that matches against Sig*/Exited/Signaled
+  # (e.g. `match s { SigInt -> ... }`) needs these in the table so
+  # `evar_find_tag` resolves to the reserved value and not to a
+  # user-range tag. The runtime constructs these via stage0/runtime.h
+  # using the same convention, so producer and matcher agree.
+  [EV("Some", 1, [], 0), EV("None", 0, [], 1),
+   EV("Ok", 1, [], 2), EV("Err", 1, [], 3),
+   EV("SigInt", 0, [], 4), EV("SigTerm", 0, [], 5), EV("SigHup", 0, [], 6),
+   EV("SigUsr1", 0, [], 7), EV("SigUsr2", 0, [], 8),
+   # Exited/Signaled carry an unboxed Int slot — the runtime constructs
+   # them via kai_variant_u with KAI_VAR_SLOT_INT, so the matcher must
+   # read slots[0].i64 not slots[0].ptr. Registering the payload type
+   # here drives emit_pat_test_variant through the typed (Phase 2 #440)
+   # slot-read path.
+   EV("Exited", 1, [es_ty_name_zero("Int")], 9),
+   EV("Signaled", 1, [es_ty_name_zero("Int")], 10)]
+
+# First tag assigned to a user-declared variant. Mirrors
+# KAI_USER_VARIANT_TAG_BASE in stage0/emit.c and
+# user_variant_tag_base() in stage1/compiler.kai.
+
+# First tag assigned to a user-declared variant. Mirrors
+# KAI_USER_VARIANT_TAG_BASE in stage0/emit.c and
+# user_variant_tag_base() in stage1/compiler.kai.
+#[doc("First tag assigned to a user-declared variant. Mirrors KAI_USER_VARIANT_TAG_BASE in stage0/emit.c and user_variant_tag_base() in stage1/compiler.kai.")]
+pub fn user_variant_tag_base() : Int = 11
+
+# Walk the declarations and accumulate the variants table; returns
+# the new table plus the consumed counter so subsequent decls keep
+# the assignment monotonic. Sum-typed DTypes whose constructors are
+# already in `acc` are skipped (typical case: the Sig/ProcessExit
+# DTypes the prelude-inject pass synthesises so the typer sees them
+# — they overlap with the reserved builtins).
+
+# Walk the declarations and accumulate the variants table; returns
+# the new table plus the consumed counter so subsequent decls keep
+# the assignment monotonic. Sum-typed DTypes whose constructors are
+# already in `acc` are skipped (typical case: the Sig/ProcessExit
+# DTypes the prelude-inject pass synthesises so the typer sees them
+# — they overlap with the reserved builtins).
+#[doc("Walk the declarations and accumulate the variants table; returns the new table plus the consumed counter so subsequent decls keep the assignment monotonic. Sum-typed DTypes…")]
+pub fn collect_user_variants_loop(ds: [Decl], next_tag: Int, acc: [EVar]) : [EVar] = match collect_user_variants_count(ds, next_tag, acc) {
+  CUV(t) -> t
+}
+
+#[doc("Collected user-variant scan result (the EVar table entries found).")]
+pub type CUVResult = CUV([EVar])
+
+#[doc("AST collector walking user variants count.")]
+pub fn collect_user_variants_count(ds: [Decl], next_tag: Int, acc: [EVar]) : CUVResult {
+  match ds {
+    [] -> CUV(acc)
+    [d, ...rest] -> match d {
+      DType(_, _, _, body, _, _, _) -> match body {
+        TBSum(vs) -> match vs_to_evars_count(vs, next_tag, acc) {
+          CUVStep(nt, acc1) -> collect_user_variants_count(rest, nt, acc1)
+        }
+        _ -> collect_user_variants_count(rest, next_tag, acc)
+      }
+      _ -> collect_user_variants_count(rest, next_tag, acc)
+    }
+  }
+}
+
+#[doc("One step of the user-variant collection fold (next tag + accumulated entries).")]
+pub type CUVStep = CUVStep(Int, [EVar])
+
+# Acc accumulates with head-cons; we still pre-pend each EV but feed
+# it the correct tag value `next_tag + i` for its index in `vs`,
+# skipping names that already resolve in acc (builtins re-emitted as
+# synthetic DTypes by the prelude-inject pass).
+
+# Acc accumulates with head-cons; we still pre-pend each EV but feed
+# it the correct tag value `next_tag + i` for its index in `vs`,
+# skipping names that already resolve in acc (builtins re-emitted as
+# synthetic DTypes by the prelude-inject pass).
+#[doc("Acc accumulates with head-cons; we still pre-pend each EV but feed it the correct tag value `next_tag + i` for its index in `vs`, skipping names that already resolve in acc…")]
+pub fn vs_to_evars_count(vs: [Variant], next_tag: Int, acc: [EVar]) : CUVStep {
+  match vs {
+    [] -> CUVStep(next_tag, acc)
+    [v, ...rest] -> match v {
+      Var(n, tys) -> match evar_find_tag_opt(acc, n) {
+        Some(_) -> vs_to_evars_count(rest, next_tag, acc)
+        None    -> vs_to_evars_count(rest, next_tag + 1, [EV(n, list_length(tys), tys, next_tag), ...acc])
+      }
+    }
+  }
+}
+
+# Legacy entry kept for callers that still construct an [EVar]
+# from `[Variant]` with no acc threading; emits the same shape but
+# does not preserve builtin tags. Internal callers go through
+# vs_to_evars_count to keep the convention.
+
+#[doc("Register a declaration's variant constructors into the EVar table with head tags.")]
+pub fn register_variants(decls: [Decl]) : [EVar] =
+  collect_user_variants_loop(decls, user_variant_tag_base(), builtin_variants())
+
+# ---- prelude mapping for emission ----
+#
+# For user-facing builtins, we map to their runtime C symbol and arity.
+# Stage 1 mirrors stage 0's table 1:1.
+
+# M5 fast-path predicate. True iff every arm in `arms` is a
+# literal pattern (Int / Bool / Char) or a wildcard (PWild /
+# PBind), and no arm carries a guard. Strings are intentionally
+# excluded — the C `switch` only works on integral types.
+#[doc("M5 fast-path predicate. True iff every arm in `arms` is a literal pattern (Int / Bool / Char) or a wildcard (PWild / PBind), and no arm carries a guard. Strings are…")]
+pub fn arms_all_literal_or_wild(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false   # need at least one arm to dispatch on
+    _  -> arms_all_literal_or_wild_loop(arms)
+  }
+}
+
+#[doc("Tail loop: true while every remaining match arm is a literal or wildcard pattern.")]
+pub fn arms_all_literal_or_wild_loop(arms: [Arm]) : Bool {
+  match arms {
+    [] -> true
+    [Arm(p, g, _), ...rest] -> match g {
+      Some(_) -> false
+      None    -> if pat_is_unboxable_lit_or_wild(p) {
+        arms_all_literal_or_wild_loop(rest)
+      } else { false }
+    }
+  }
+}
+
+# Issue #91 — fast-path eligibility check for `PBind(name)`
+# catch-all arms. When the body of a PBind catch-all reads
+# `name` from inside a `#{...}` interp slot OR from inside a
+# captured ELambda body, the read site bypasses the unbox
+# pass's alias map and resolves to `kai_<name>` — but the
+# fast path only binds `kair_<name>`. Disqualify the whole
+# match in that case so it routes through the boxed path
+# (which always binds `kai_<name>`). Mirrors the R8 / lambda-
+# capture guards in `unbox_stmt` SLet.
+
+# Issue #91 — fast-path eligibility check for `PBind(name)`
+# catch-all arms. When the body of a PBind catch-all reads
+# `name` from inside a `#{...}` interp slot OR from inside a
+# captured ELambda body, the read site bypasses the unbox
+# pass's alias map and resolves to `kai_<name>` — but the
+# fast path only binds `kair_<name>`. Disqualify the whole
+# match in that case so it routes through the boxed path
+# (which always binds `kai_<name>`). Mirrors the R8 / lambda-
+# capture guards in `unbox_stmt` SLet.
+#[doc("fast-path eligibility check for `PBind(name)` catch-all arms. When the body of a PBind catch-all reads `name` from inside a `#{...}` interp slot OR from inside a captured…")]
+pub fn arms_pbind_safe_for_fast_path(arms: [Arm]) : Bool / Console {
+
+  match arms {
+    [] -> true
+    [Arm(p, _, b), ...rest] -> {
+      let ok = match p.pkind {
+        PBind(nm) ->
+          not expr_has_interp_use(b, nm) and
+          not uses_have_in_lam(scan_uses_expr(b, false), nm)
+        _ -> true
+      }
+      if ok { arms_pbind_safe_for_fast_path(rest) } else { false }
+    }
+  }
+}
+
+#[doc("True if a pattern is an unboxable literal or wildcard (drives the fast match path).")]
+pub fn pat_is_unboxable_lit_or_wild(p: Pattern) : Bool {
+  match p.pkind {
+    PWild     -> true
+    # Issue #91 — PBind catch-all is now in the fast path. The
+    # unbox pass marks the body's EVar reads of the bound name as
+    # MUnboxed (see `unbox_arm_with_scr`); the C / LLVM emit
+    # binds `kair_<name>` in the default block before the body.
+    PBind(_)  -> true
+    PLit(lit) -> match lit.kind {
+      EInt(_)  -> true
+      EBool(_) -> true
+      EChar(_) -> true
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
+# Emit the raw C scalar that goes inside `switch (...)` for a
+# literal pattern. `EInt` → `<n>LL`, `EBool` → `0`/`1`,
+# `EChar` → numeric codepoint.
+
+#[doc("Lifted lambda descriptor (id, arity, captured names, body) for closure emission.")]
+pub type LamInfo = LamInfo(Int, Int, Int, [Param], [String], Expr)
+
+# m7a #6c: each handler op clause becomes a top-level C function.
+# The id pair (handle_line, handle_col) plus op_name uniquely names
+# the clause (HCs do not nest within the same handle, and two
+# handles cannot share both line and column). `params` is the
+# clause's surface param list — the last one is the conventional
+# `resume` binding (Doc A §*resume: one-shot, explicit*); m7a #6c
+# treats `resume(v)` as direct-style identity and does not need to
+# distinguish args from resume in the C signature beyond skipping
+# the trailing slot.
+# m7b #11: a clause is `stateful` (the trailing Bool) when its
+# enclosing `handle` carries a state initializer (`with State[T](init)`
+# / `with Writer[W]([])`). The codegen layer prepends a `kai_state` /
+# `kai_log` alias of `self->state` to the clause body and emits the
+# 2-arg `resume(v, ns)` form as a state write before resume.
+# m4c #4 (2026-04-29): trailing `String` is the **enclosing fn name** —
+# the post-monomorph C symbol for the fn / lambda / test that contains
+# this `EHandle`. Pre-m4c #4 clause symbols were keyed on (line, col,
+# op) only and collided across monomorphisation copies; the enc_fn
+# prefix lets two specialisations of one polymorphic body produce
+# distinct C symbols (`_kai_<enc>__clause_<l>_<c>_<op>`). The collect
+# pass populates this from `LamCollect.cur_enc_fn`; emit and install
+# paths read it back so both ends mint the same name.
+# R9 (issue #60, 2026-05-02): trailing `[String]` is the per-clause
+# closure-capture set — surface names that are free in the clause body
+# given (clause params + `state` + `log`) as the local scope. The list
+# travels through the EvE's `env` slot per `docs/effects-impl.md`
+# §"Op clause as ordinary function": at install time the handle
+# allocates a per-(line,col) env struct on its frame and populates one
+# field per captured name; the clause prologue rebinds each `kai_<name>`
+# alias from `((env*) self->env)->kai_<name>`. Without this channel,
+# any clause body that names an enclosing-fn parameter triggered the
+# `use of undeclared identifier 'kai_<param>'` C error tracked as R9.
+
+# m7a #6c: each handler op clause becomes a top-level C function.
+# The id pair (handle_line, handle_col) plus op_name uniquely names
+# the clause (HCs do not nest within the same handle, and two
+# handles cannot share both line and column). `params` is the
+# clause's surface param list — the last one is the conventional
+# `resume` binding (Doc A §*resume: one-shot, explicit*); m7a #6c
+# treats `resume(v)` as direct-style identity and does not need to
+# distinguish args from resume in the C signature beyond skipping
+# the trailing slot.
+# m7b #11: a clause is `stateful` (the trailing Bool) when its
+# enclosing `handle` carries a state initializer (`with State[T](init)`
+# / `with Writer[W]([])`). The codegen layer prepends a `kai_state` /
+# `kai_log` alias of `self->state` to the clause body and emits the
+# 2-arg `resume(v, ns)` form as a state write before resume.
+# m4c #4 (2026-04-29): trailing `String` is the **enclosing fn name** —
+# the post-monomorph C symbol for the fn / lambda / test that contains
+# this `EHandle`. Pre-m4c #4 clause symbols were keyed on (line, col,
+# op) only and collided across monomorphisation copies; the enc_fn
+# prefix lets two specialisations of one polymorphic body produce
+# distinct C symbols (`_kai_<enc>__clause_<l>_<c>_<op>`). The collect
+# pass populates this from `LamCollect.cur_enc_fn`; emit and install
+# paths read it back so both ends mint the same name.
+# R9 (issue #60, 2026-05-02): trailing `[String]` is the per-clause
+# closure-capture set — surface names that are free in the clause body
+# given (clause params + `state` + `log`) as the local scope. The list
+# travels through the EvE's `env` slot per `docs/effects-impl.md`
+# §"Op clause as ordinary function": at install time the handle
+# allocates a per-(line,col) env struct on its frame and populates one
+# field per captured name; the clause prologue rebinds each `kai_<name>`
+# alias from `((env*) self->env)->kai_<name>`. Without this channel,
+# any clause body that names an enclosing-fn parameter triggered the
+# `use of undeclared identifier 'kai_<param>'` C error tracked as R9.
+#[doc("a #6c: each handler op clause becomes a top-level C function. The id pair (handle_line, handle_col) plus op_name uniquely names the clause (HCs do not nest within the same…")]
+pub type ClauseInfo = CI(Int, Int, String, String, [Param], Expr, Bool, String, [String])
+
+#[doc("Look up a lifted lambda by id in the LamInfo table.")]
+pub fn find_lam(lams: [LamInfo], line: Int, col: Int) : Option[LamInfo] {
+  match lams {
+    [] -> None
+    [l, ...rest] -> match l {
+      LamInfo(_, ln, cl, _, _, _) ->
+        if ln == line and cl == col { Some(l) }
+        else { find_lam(rest, line, col) }
+    }
+  }
+}
+
+# Free variables of an expression, given the lambda's own params and the
+# program's globals. We skip descent into nested ELambdas (each gets its
+# own capture set), and re-parse string interpolations so identifiers
+# hidden inside #{...} get captured too.
+
+# Free variables of an expression, given the lambda's own params and the
+# program's globals. We skip descent into nested ELambdas (each gets its
+# own capture set), and re-parse string interpolations so identifiers
+# hidden inside #{...} get captured too.
+#[doc("Free variables of an expression, given the lambda's own params and the program's globals. We skip descent into nested ELambdas (each gets its own capture set), and re-parse…")]
+pub fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] / Console {
+
+  match x.kind {
+    EInt(_)  -> acc
+    EReal(_) -> acc
+    EBool(_) -> acc
+    EChar(_) -> acc
+    EStr(span, is_triple) -> fv_interp(span, is_triple, own, globals, acc)
+    EUnit -> acc
+    EVar(name) -> {
+      # m7b #15 closure-capture: a tagged op call like
+      # `Eff.op@<alias>` rewrites to `EVar("Eff.op@alias")`. The
+      # name is *not* a real identifier — emit_call_expr splits the
+      # `@` and dispatches via `kai_alias_<alias>_id`. For closure
+      # capture purposes we record the alias under the sentinel
+      # name `__alias_id__<alias>`; the lambda emit decodes it back
+      # to `KaiHandlerId kai_alias_<alias>_id` in the body prologue.
+      let at_pos = string_index_of_at(name)
+      if at_pos >= 0 {
+        let alias = string_slice(name, at_pos + 1, string_length(name))
+        let cap_name = string_concat("__alias_id__", alias)
+        if list_has(own, alias) { acc }
+        else if list_has(acc, cap_name) { acc }
+        else { [cap_name, ...acc] }
+      }
+      # Issue #669: `__pcs_scr` / `__pcs_ret` / `__pcs_arm_ret` are
+      # synthetic identifiers inserted by Perceus passes that
+      # materialise as match-scoped C locals (`_scr`, etc.) at emit
+      # time, not as kaikai-level bindings. When a Perceus pass leaves
+      # one of these inside a lambda body, fv_expr would treat it as
+      # a free variable and ask the lambda to capture it — but no
+      # outer binding exists to capture, producing C output that
+      # references an undeclared identifier. They are never genuine
+      # free vars; suppress them here.
+      else if name == "__pcs_scr"     { acc }
+      else if name == "__pcs_ret"     { acc }
+      else if name == "__pcs_arm_ret" { acc }
+      else if list_has(own, name) { acc }
+      else if list_has(globals, name) { acc }
+      else if list_has(acc, name) { acc }
+      else { [name, ...acc] }
+    }
+    EUnder -> acc
+    EPlaceholder -> acc
+    ECall(f, xs) -> fv_exprs(xs, own, globals, fv_expr(f, own, globals, acc))
+    EField(base, _) -> fv_expr(base, own, globals, acc)
+    EIndex(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EBinop(_, a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EUnop(_, inner) -> fv_expr(inner, own, globals, acc)
+    EIf(c, a, opt_b) -> {
+      let acc1 = fv_expr(a, own, globals, fv_expr(c, own, globals, acc))
+      match opt_b { Some(b) -> fv_expr(b, own, globals, acc1) None -> acc1 }
+    }
+    EMatch(scr, arms) -> fv_arms(arms, own, globals, fv_expr(scr, own, globals, acc))
+    ELambda(ps, body) -> {
+      # m7b #15 closure-capture: a nested lambda computes its own
+      # capture list independently, but every free var that
+      # nested body references AND that is not bound by the
+      # nested params still has to be visible at the *outer*
+      # lambda's body — that body is where the nested
+      # `kai_closure(...)` literal evaluates its capture array.
+      # Pre-fix, an outer lambda whose body contained
+      # `while(() => @i < dim, () => ...)` failed to pick up
+      # `kai_dim` / `kai_alias_i_id` as outer captures, so the
+      # generated C referenced undeclared identifiers when
+      # building the inner closure.
+      let nested_own = list_append(own, params_to_names(ps))
+      fv_expr(body, nested_own, globals, acc)
+    }
+    ETodo(_) -> acc
+    EBang(inner) -> fv_expr(inner, own, globals, acc)
+    ERecordLit(_, fields) -> fv_field_inits(fields, own, globals, acc)
+    EList(elems) -> fv_list_elems(elems, own, globals, acc)
+    ERange(a, b, opt_step) -> {
+      let acc1 = fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+      match opt_step { Some(s) -> fv_expr(s, own, globals, acc1) None -> acc1 }
+    }
+    EBlock(stmts, opt_final) -> {
+      # m7b #18: track the scope as it grows through SLet / SVar so
+      # the optional trailing expression sees the same bindings the
+      # earlier statements introduced.
+      let r = fv_stmts_scoped(stmts, own, globals, acc)
+      match opt_final { Some(f) -> fv_expr(f, r.own, globals, r.acc) None -> r.acc }
+    }
+    EPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EMapPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EFlatMapPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EFilterPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EHole(_) -> acc
+    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
+      # m7b #11: free vars in the handler-state init expression
+      # contribute to the surrounding scope.
+      let acc0 = match init_opt {
+        Some(ie) -> fv_expr(ie, own, globals, acc)
+        None     -> acc
+      }
+      # m12.8.x phase 4 followup: when `with Eff(init) as name { body }`
+      # binds an alias, treat that name as in-scope for the body —
+      # references to it dispatch via the runtime evidence stack at
+      # call time, not via a captured C local. Pre-fix the m7b #5b
+      # desugar (`var top = 0` → `with State[Int](0) as top { ... }`)
+      # caused inner lambdas to capture `top` as if it were a value;
+      # the C emit then read `kai_top` against an undeclared
+      # identifier. The alias is only in scope inside the body — not
+      # in `init` (runs before the handler is installed) and not in
+      # the clauses (which see `state` / `log` magic instead).
+      let own_body = match alias_opt {
+        Some(a) -> [a, ...own]
+        None    -> own
+      }
+      let acc1 = fv_expr(body, own_body, globals, acc0)
+      let acc2 = fv_hclauses(clauses, own, globals, acc1)
+      match ret_opt { Some(r) -> fv_hreturn(r, own, globals, acc2) None -> acc2 }
+    }
+    # m12.5: literal-with-unit captures whatever the inner literal does
+    # (always nothing in practice, since the inner is EInt/EReal).
+    ELitUnit(inner, _) -> fv_expr(inner, own, globals, acc)
+    # m7e §11: `variants[T]()` has no value-level sub-expressions, so
+    # it captures nothing.
+    EVariantsOf(_, _) -> acc
+    # m6.2 Phase 2.1: qualified module call references no local
+    # binding — module name and function name are both pure strings
+    # resolved via the module table.
+    EModCall(_, _) -> acc
+    EIntrinsic(_, args_) -> fv_exprs(args_, own, globals, acc)
+  }
+}
+
+#[doc("Free-variable collector over hclauses.")]
+pub fn fv_hclauses(cs: [HClause], own: [String], globals: [String], acc: [String]) : [String] / Console {
+
+  match cs {
+    [] -> acc
+    [c, ...rest] -> match c {
+      HC(_, params, body, _, _) -> {
+        # m7b #18: stateful handler clauses see two magic bindings —
+        # `state` and `log` — that the codegen aliases to the
+        # evidence struct's slot. Always include them in `own` so the
+        # free-var collector does not promote them to lambda captures
+        # when the whole `with State[T]` sits inside a closure body
+        # (e.g. desugared `var` inside a lambda).
+        let own_magic = ["state", "log", ...own]
+        let own1 = list_concat_strings(map(params, (pm) => pm.pname), own_magic)
+        let acc1 = fv_expr(body, own1, globals, acc)
+        fv_hclauses(rest, own, globals, acc1)
+      }
+    }
+  }
+}
+
+#[doc("Free-variable collector over hreturn.")]
+pub fn fv_hreturn(r: HReturn, own: [String], globals: [String], acc: [String]) : [String] / Console {
+
+  match r {
+    # m7b #18: same `state` / `log` magic bindings as in
+    # `fv_hclauses` apply here (Doc C §m7b #11l: stateful return
+    # clauses see the handler-state alias too).
+    HR(name, body, _, _) -> fv_expr(body, [name, "state", "log", ...own], globals, acc)
+  }
+}
+
+#[doc("Concatenate a list of strings end to end.")]
+pub fn list_concat_strings(a: [String], b: [String]) : [String] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...list_concat_strings(rest, b)]
+  }
+}
+
+#[doc("Free-variable collector over exprs.")]
+pub fn fv_exprs(xs: [Expr], own: [String], globals: [String], acc: [String]) : [String] / Console {
+
+  match xs {
+    [] -> acc
+    [h, ...rest] -> fv_exprs(rest, own, globals, fv_expr(h, own, globals, acc))
+  }
+}
+
+#[doc("Free-variable collector over arms.")]
+pub fn fv_arms(arms: [Arm], own: [String], globals: [String], acc: [String]) : [String] / Console {
+
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a {
+      Arm(pat, opt_g, body) -> {
+        # m7b #18: extend `own` with the pattern's bound names so the
+        # guard and body don't treat them as free vars when the arm
+        # sits inside a lambda body.
+        let own1 = pat_bindings(pat, own)
+        let acc1 = match opt_g { Some(g) -> fv_expr(g, own1, globals, acc) None -> acc }
+        fv_arms(rest, own, globals, fv_expr(body, own1, globals, acc1))
+      }
+    }
+  }
+}
+
+# m7b #18: collect every name a pattern would bind into the accumulator,
+# mirroring `bind_pat` (resolver) but operating on a [String] instead of
+# an Env. Used by `fv_arms` and `fv_stmts` to keep `let` / pattern-bound
+# names out of a lambda's free-var capture set.
+
+# m7b #18: collect every name a pattern would bind into the accumulator,
+# mirroring `bind_pat` (resolver) but operating on a [String] instead of
+# an Env. Used by `fv_arms` and `fv_stmts` to keep `let` / pattern-bound
+# names out of a lambda's free-var capture set.
+#[doc("b #18: collect every name a pattern would bind into the accumulator, mirroring `bind_pat` (resolver) but operating on a [String] instead of an Env. Used by `fv_arms` and…")]
+pub fn pat_bindings(pat: Pattern, acc: [String]) : [String] {
+  match pat.pkind {
+    PWild -> acc
+    PLit(_) -> acc
+    PBind(name) -> [name, ...acc]
+    PList(pats, opt_rest) -> {
+      let acc1 = pat_bindings_loop(pats, acc)
+      match opt_rest {
+        Some(rname) -> [rname, ...acc1]
+        None -> acc1
+      }
+    }
+    PVariant(_, subs) -> pat_bindings_loop(subs, acc)
+    PVariantRecord(_, fields) -> pfield_bindings_loop(fields, acc)
+    PRecord(fields) -> pfield_bindings_loop(fields, acc)
+    PHole(_) -> acc
+    PAs(name, sub) -> pat_bindings(sub, [name, ...acc])
+    PNarrow(name, _) -> [name, ...acc]
+  }
+}
+
+# Like `pat_bindings`, but if the pattern is a single `PBind` and
+# the let's RHS is `MUnboxed`, the binding is a raw C scalar and
+# must NOT enter the Perceus tracking scope. All other shapes —
+# destructured lets, wildcards, literals — defer to the standard
+# `pat_bindings` walker. See `docs/unboxing-phase2-design.md` §3
+# (boundary tactic) for the coordination contract.
+
+#[doc("Tail accumulator for pat_bindings: collect the names a pattern binds.")]
+pub fn pat_bindings_loop(ps: [Pattern], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> pat_bindings_loop(rest, pat_bindings(p, acc))
+  }
+}
+
+#[doc("Tail accumulator collecting the names bound by record-pattern fields.")]
+pub fn pfield_bindings_loop(fs: [PField], acc: [String]) : [String] {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      PField(_, sub, _) -> pfield_bindings_loop(rest, pat_bindings(sub, acc))
+    }
+  }
+}
+
+#[doc("Free-variable collector over field inits.")]
+pub fn fv_field_inits(fs: [FieldInit], own: [String], globals: [String], acc: [String]) : [String] / Console {
+
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      FI(_, val) -> fv_field_inits(rest, own, globals, fv_expr(val, own, globals, acc))
+    }
+  }
+}
+
+#[doc("Free-variable collector over list elems.")]
+pub fn fv_list_elems(es: [ListElem], own: [String], globals: [String], acc: [String]) : [String] / Console {
+
+  match es {
+    [] -> acc
+    [el, ...rest] -> match el {
+      ElPlain(x) -> fv_list_elems(rest, own, globals, fv_expr(x, own, globals, acc))
+      ElSpread(x) -> fv_list_elems(rest, own, globals, fv_expr(x, own, globals, acc))
+    }
+  }
+}
+
+# m7b #18: scoped variant of `fv_stmts` that also returns the scope as
+# extended by every SLet / SVar in the list. Used by `EBlock` so the
+# optional trailing expression sees the bindings introduced earlier in
+# the block.
+#[doc("b #18: scoped variant of `fv_stmts` that also returns the scope as extended by every SLet / SVar in the list. Used by `EBlock` so the optional trailing expression sees the…")]
+pub type FvScoped = { own: [String], acc: [String] }
+
+#[doc("Free-variable collector over stmts scoped.")]
+pub fn fv_stmts_scoped(ss: [Stmt], own: [String], globals: [String], acc: [String]) : FvScoped / Console {
+
+  match ss {
+    [] -> FvScoped { own: own, acc: acc }
+    [s, ...rest] -> match s {
+      SLet(pat, _, rhs) -> {
+        let acc1 = fv_expr(rhs, own, globals, acc)
+        let own1 = pat_bindings(pat, own)
+        fv_stmts_scoped(rest, own1, globals, acc1)
+      }
+      SVar(name, _, rhs, _, _) -> {
+        let acc1 = fv_expr(rhs, own, globals, acc)
+        fv_stmts_scoped(rest, [name, ...own], globals, acc1)
+      }
+      _ -> fv_stmts_scoped(rest, own, globals, fv_stmt(s, own, globals, acc))
+    }
+  }
+}
+
+#[doc("Free-variable collector over stmt.")]
+pub fn fv_stmt(s: Stmt, own: [String], globals: [String], acc: [String]) : [String] / Console {
+
+  match s {
+    SLet(_, _, rhs) -> fv_expr(rhs, own, globals, acc)
+    SAssert(c, opt_m) -> {
+      let acc1 = fv_expr(c, own, globals, acc)
+      match opt_m { Some(m) -> fv_expr(m, own, globals, acc1) None -> acc1 }
+    }
+    SExprStmt(x) -> fv_expr(x, own, globals, acc)
+    SIndexAssign(b, i, v, _, _) -> {
+      let acc1 = fv_expr(b, own, globals, acc)
+      let acc2 = fv_expr(i, own, globals, acc1)
+      fv_expr(v, own, globals, acc2)
+    }
+    # m7b #5: `var name = init` — desugared away pre-resolve. The free
+    # variables of the init expression contribute; the bound name is a
+    # local introduction (handled by the surrounding scope).
+    SVar(_, _, rhs, _, _) -> fv_expr(rhs, own, globals, acc)
+    # m7e §25: stripped by desugar_use_decls before fv runs.
+    SUse(_, _, _) -> acc
+  }
+}
+
+#[doc("Free-variable collector over interp.")]
+pub fn fv_interp(span: String, is_triple: Bool, own: [String], globals: [String], acc: [String]) : [String] / Console {
+
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
+  fv_interp_parts(parts, own, globals, acc)
+}
+
+#[doc("Free-variable collector over interp parts.")]
+pub fn fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [String]) : [String] / Console {
+
+  match parts {
+    [] -> acc
+    [p, ...rest] -> match p {
+      IpLit(_, _) -> fv_interp_parts(rest, own, globals, acc)
+      IpExp(esrc) -> {
+        let acc1 = match parse_interp_expr(esrc) {
+          Some(e) -> fv_expr(e, own, globals, acc)
+          None -> acc
+        }
+        fv_interp_parts(rest, own, globals, acc1)
+      }
+    }
+  }
+}
+
+# ---- lambda collection pass ----
+
+# m4c #4: `cur_enc_fn` carries the post-monomorph C symbol of the
+# fn / lambda / test the walker is currently inside. Updated at scope
+# boundaries (DFn / DTest entry, ELambda recursion); read by the
+# EHandle case to stamp each `ClauseInfo` so install/emit paths can
+# mint matching prefixed clause symbols.
+
+# m4c #4: `cur_enc_fn` carries the post-monomorph C symbol of the
+# fn / lambda / test the walker is currently inside. Updated at scope
+# boundaries (DFn / DTest entry, ELambda recursion); read by the
+# EHandle case to stamp each `ClauseInfo` so install/emit paths can
+# mint matching prefixed clause symbols.
+#[doc("c #4: `cur_enc_fn` carries the post-monomorph C symbol of the fn / lambda / test the walker is currently inside. Updated at scope boundaries (DFn / DTest entry, ELambda…")]
+pub type LamCollect = { next_id: Int, lams: [LamInfo], clauses: [ClauseInfo],
+                    globals: [String], cur_enc_fn: String,
+                    # issue #285: enclosing-fn parameter and let/var binding
+                    # names visible at the current walk position. Shadows
+                    # `globals` when computing a nested lambda's caps so a
+                    # captured `Ref[T]` parameter named after a stdlib fn
+                    # (e.g. `count`, colliding with `list.count`) is added
+                    # to the closure's capture array instead of being
+                    # silently re-resolved to the global function value.
+                    local_scope: [String] }
+
+#[doc("Lambda-collect state helper: new.")]
+pub fn lc_new(globals: [String]) : LamCollect =
+  LamCollect { next_id: 0, lams: [], clauses: [], globals: globals,
+                cur_enc_fn: "", local_scope: [] }
+
+# issue #285: state-passing scope helpers. Snapshot at entry of a
+# scope-introducing form (DFn body, EBlock, ELambda body); restore
+# on exit. Kept tiny so the walker stays a one-line state-tweak per
+# scope frame.
+
+# issue #285: state-passing scope helpers. Snapshot at entry of a
+# scope-introducing form (DFn body, EBlock, ELambda body); restore
+# on exit. Kept tiny so the walker stays a one-line state-tweak per
+# scope frame.
+#[doc("issue #285: state-passing scope helpers. Snapshot at entry of a scope-introducing form (DFn body, EBlock, ELambda body); restore on exit. Kept tiny so the walker stays a…")]
+pub fn lc_set_locals(st: LamCollect, locals: [String]) : LamCollect =
+  LamCollect { next_id: st.next_id, lams: st.lams,
+                clauses: st.clauses, globals: st.globals,
+                cur_enc_fn: st.cur_enc_fn, local_scope: locals }
+
+#[doc("Lambda-collect state helper: extend locals.")]
+pub fn lc_extend_locals(st: LamCollect, names: [String]) : LamCollect =
+  lc_set_locals(st, list_append(st.local_scope, names))
+
+# issue #285: filter names out of `globals` so `fv_expr` records them
+# as captures. O(|globals| × |locals|) is acceptable: |locals| stays
+# tiny (a handful per fn), and lambda lifting runs once per emit.
+
+# issue #285: filter names out of `globals` so `fv_expr` records them
+# as captures. O(|globals| × |locals|) is acceptable: |locals| stays
+# tiny (a handful per fn), and lambda lifting runs once per emit.
+#[doc("issue #285: filter names out of `globals` so `fv_expr` records them as captures. O(|globals| × |locals|) is acceptable: |locals| stays tiny (a handful per fn), and lambda…")]
+pub fn list_minus(xs: [String], ys: [String]) : [String] = list_minus_loop(xs, ys, [])
+
+#[doc("Tail accumulator for list_minus: elements of the first list absent from the second.")]
+pub fn list_minus_loop(xs: [String], ys: [String], acc: [String]) : [String] {
+  match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] ->
+      if list_has(ys, h) { list_minus_loop(rest, ys, acc) }
+      else               { list_minus_loop(rest, ys, [h, ...acc]) }
+  }
+}
+
+#[doc("Project a parameter list down to its bare name list.")]
+pub fn params_to_names(ps: [Param]) : [String] =
+  map(ps, (pm) => pm.pname)
+
+#[doc("AST collector walking expr.")]
+pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
+
+  match x.kind {
+    EInt(_)  -> st
+    EReal(_) -> st
+    EBool(_) -> st
+    EChar(_) -> st
+    EStr(span, is_triple) -> collect_interp(span, is_triple, st)
+    EUnit -> st
+    EVar(_) -> st
+    EUnder -> st
+    EPlaceholder -> st
+    ECall(f, xs) -> collect_exprs(xs, collect_expr(f, st))
+    EField(base, _) -> collect_expr(base, st)
+    EIndex(a, b) -> collect_expr(b, collect_expr(a, st))
+    EBinop(_, a, b) -> collect_expr(b, collect_expr(a, st))
+    EUnop(_, inner) -> collect_expr(inner, st)
+    EIf(c, a, opt_b) -> {
+      let s1 = collect_expr(a, collect_expr(c, st))
+      match opt_b { Some(b) -> collect_expr(b, s1) None -> s1 }
+    }
+    EMatch(scr, arms) -> collect_arms(arms, collect_expr(scr, st))
+    ELambda(params, body) -> {
+      let id = st.next_id
+      let own = params_to_names(params)
+      # issue #285: an enclosing fn parameter or let/var binding whose
+      # name happens to match a stdlib fn (e.g. a `count: Ref[Int]`
+      # parameter while `list.count` is in scope) must be captured by
+      # the lambda, not silently re-resolved to the global. Filter the
+      # globals fed to `fv_expr` so any name shadowed by the current
+      # `local_scope` is treated as a free variable and added to caps.
+      let effective_globals = list_minus(st.globals, st.local_scope)
+      let caps = fv_expr(body, own, effective_globals, [])
+      let info = LamInfo(id, x.line, x.col, params, caps, body)
+      # m4c #4: the lambda body is its own enclosing scope for clause
+      # symbols (lifted to `_kai_lam_<id>` at emit). Push the new
+      # enc_fn for the body walk; restore the outer enc_fn on the way
+      # out so a sibling expression keeps stamping against its own
+      # enclosing fn.
+      let outer_enc_fn = st.cur_enc_fn
+      let outer_locals = st.local_scope
+      let lam_enc_fn = concat_all(["_kai_lam_", int_to_string(id)])
+      # Inside the lambda body, the lambda's own params shadow outer
+      # globals too — extend `local_scope` so a nested lambda nested
+      # again inside this body sees the shadowing chain.
+      let st1 = LamCollect { next_id: id + 1, lams: [info, ...st.lams],
+                              clauses: st.clauses, globals: st.globals,
+                              cur_enc_fn: lam_enc_fn,
+                              local_scope: list_append(outer_locals, own) }
+      let st2 = collect_expr(body, st1)
+      LamCollect { next_id: st2.next_id, lams: st2.lams,
+                    clauses: st2.clauses, globals: st2.globals,
+                    cur_enc_fn: outer_enc_fn,
+                    local_scope: outer_locals }
+    }
+    ERecordLit(_, fields) -> collect_field_inits(fields, st)
+    EList(elems) -> collect_list_elems(elems, st)
+    ERange(a, b, opt_step) -> {
+      let s1 = collect_expr(b, collect_expr(a, st))
+      match opt_step { Some(s) -> collect_expr(s, s1) None -> s1 }
+    }
+    EBlock(stmts, opt_final) -> {
+      # issue #285: SLet / SVar inside the block extend `local_scope`;
+      # restore the outer scope on exit so siblings (and the lambda
+      # lifter's caller) don't see the block's bindings as still in
+      # scope.
+      let outer_locals = st.local_scope
+      let s1 = collect_stmts(stmts, st)
+      let s2 = match opt_final { Some(f) -> collect_expr(f, s1) None -> s1 }
+      lc_set_locals(s2, outer_locals)
+    }
+    EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
+    EMapPipe(a, b) -> collect_expr(b, collect_expr(a, st))
+    EFlatMapPipe(a, b) -> collect_expr(b, collect_expr(a, st))
+    EFilterPipe(a, b) -> collect_expr(b, collect_expr(a, st))
+    EHole(_) -> st
+    ETodo(_) -> st
+    EBang(inner) -> collect_expr(inner, st)
+    EHandle(body, eff_name, _, init_opt, alias_opt, clauses, ret_opt) -> {
+      let stateful = match init_opt { Some(_) -> true None -> false }
+      let s_init = match init_opt { Some(ie) -> collect_expr(ie, st) None -> st }
+      # m4c #4: stamp each clause with the current enclosing fn name
+      # set by collect_decl (DFn / DTest) or the surrounding ELambda.
+      # emit-time install code reads back the same string so install
+      # and clause-body symbols agree.
+      let s0 = lc_record_clauses(clauses, eff_name, stateful, x.line, x.col, s_init.cur_enc_fn, s_init)
+      # m12.8.x phase 4 followup: when `with Eff(init) as name { body }`
+      # binds an alias, mark `name` as an in-scope global for the body
+      # walk so any inner lambda's free-var analysis treats references
+      # to it as alias dispatches (resolved via the runtime evidence
+      # stack), not as values that need capture in the closure
+      # environment. Pre-fix the m7b #5b desugar (`var top = 0` →
+      # `with State[Int](0) as top { ... }`) caused inner lambdas
+      # passed to row-polymorphic helpers like `while` to capture
+      # `top` as if it were a value, and the C emit then read
+      # `kai_top` against an undeclared identifier. Surfaced via
+      # `demos/spiral`. The alias is only in scope inside the body —
+      # not in `init` (runs before the handler is installed) and not
+      # in the clauses (which see `state` / `log` magic instead).
+      let outer_globals = s0.globals
+      let s_body_in = match alias_opt {
+        Some(a) -> LamCollect {
+          next_id: s0.next_id, lams: s0.lams,
+          clauses: s0.clauses, globals: [a, ...outer_globals],
+          cur_enc_fn: s0.cur_enc_fn, local_scope: s0.local_scope
+        }
+        None -> s0
+      }
+      let s1_ext = collect_expr(body, s_body_in)
+      let s1 = LamCollect {
+        next_id: s1_ext.next_id, lams: s1_ext.lams,
+        clauses: s1_ext.clauses, globals: outer_globals,
+        cur_enc_fn: s1_ext.cur_enc_fn, local_scope: s1_ext.local_scope
+      }
+      let s2 = collect_hclauses(clauses, s1)
+      match ret_opt { Some(r) -> collect_hreturn(r, s2) None -> s2 }
+    }
+    # m12.5: literal-with-unit — the inner literal contributes nothing,
+    # but recurse so future non-literal carriers stay covered.
+    ELitUnit(inner, _) -> collect_expr(inner, st)
+    # m7e §11: `variants[T]()` produces no lambdas / no clauses to
+    # collect. The TypeExpr is not a lambda host.
+    EVariantsOf(_, _) -> st
+    # m6.2 Phase 2.1: qualified module call hosts no lambdas and
+    # introduces no clauses — both fields are plain strings.
+    EModCall(_, _) -> st
+    EIntrinsic(_, args_) -> collect_exprs(args_, st)
+  }
+}
+
+# m7a #6c: append one ClauseInfo per HClause of this handle. The
+# (line, col) of the EHandle node is reused as the clause's stable
+# id; the op_name disambiguates among clauses of the same handle.
+# m4c #4: the trailing `enc_fn` argument is the post-monomorph C
+# symbol of the fn / lambda / test that physically contains this
+# `EHandle`. It feeds CI's 8th field so emit_clause_body and the
+# install path mint matching prefixed symbols
+# (`_kai_<enc>__clause_<l>_<c>_<op>`).
+
+# m7a #6c: append one ClauseInfo per HClause of this handle. The
+# (line, col) of the EHandle node is reused as the clause's stable
+# id; the op_name disambiguates among clauses of the same handle.
+# m4c #4: the trailing `enc_fn` argument is the post-monomorph C
+# symbol of the fn / lambda / test that physically contains this
+# `EHandle`. It feeds CI's 8th field so emit_clause_body and the
+# install path mint matching prefixed symbols
+# (`_kai_<enc>__clause_<l>_<c>_<op>`).
+#[doc("a #6c: append one ClauseInfo per HClause of this handle. The (line, col) of the EHandle node is reused as the clause's stable id; the op_name disambiguates among clauses of the…")]
+pub fn lc_record_clauses(cs: [HClause], eff: String, stateful: Bool,
+                     hline: Int, hcol: Int, enc_fn: String,
+                     st: LamCollect) : LamCollect / Console {
+
+  match cs {
+    [] -> st
+    [c, ...rest] -> match c {
+      HC(op_name, params, body, _, _) -> {
+        # R9: compute the clause's free-variable set, treating its own
+        # params plus the magic `state` / `log` aliases as bound. The
+        # resulting names are the captures the env channel must thread
+        # in from the surrounding handle frame. Mirrors `fv_hclauses`.
+        let own_for_fv = list_concat_strings(map(params, (pm) => pm.pname), ["state", "log"])
+        # issue #285: filter globals shadowed by enclosing-fn / outer
+        # let-var bindings, so a clause body capturing e.g. `count`
+        # (parameter shadowing `list.count`) is added to env captures.
+        let effective_globals = list_minus(st.globals, st.local_scope)
+        let raw_caps = fv_expr(body, own_for_fv, effective_globals, [])
+        let caps = filter_clause_captures(raw_caps)
+        let info = CI(hline, hcol, eff, op_name, params, body, stateful, enc_fn, caps)
+        let st1 = LamCollect {
+          next_id: st.next_id, lams: st.lams,
+          clauses: [info, ...st.clauses], globals: st.globals,
+          cur_enc_fn: st.cur_enc_fn, local_scope: st.local_scope
+        }
+        lc_record_clauses(rest, eff, stateful, hline, hcol, enc_fn, st1)
+      }
+    }
+  }
+}
+
+# R9: drop the `__alias_id__<a>` sentinels produced by `fv_expr` for
+# tagged op calls (`Eff.op@<a>`). Lambda capture rebinds them via
+# `kai_alias_<a>_id` reads in the lambda prologue; the clause env
+# channel does not yet carry handler-id captures (a follow-up — for
+# now an alias-id needed inside a clause body must be threaded
+# through the parametric handler's `state` slot, the existing
+# workaround). Plain value captures are everything else and travel
+# through `self->env` per `docs/effects-impl.md` §"Op clause as
+# ordinary function".
+
+# R9: drop the `__alias_id__<a>` sentinels produced by `fv_expr` for
+# tagged op calls (`Eff.op@<a>`). Lambda capture rebinds them via
+# `kai_alias_<a>_id` reads in the lambda prologue; the clause env
+# channel does not yet carry handler-id captures (a follow-up — for
+# now an alias-id needed inside a clause body must be threaded
+# through the parametric handler's `state` slot, the existing
+# workaround). Plain value captures are everything else and travel
+# through `self->env` per `docs/effects-impl.md` §"Op clause as
+# ordinary function".
+#[doc("R9: drop the `__alias_id__<a>` sentinels produced by `fv_expr` for tagged op calls (`Eff.op@<a>`). Lambda capture rebinds them via `kai_alias_<a>_id` reads in the lambda…")]
+pub fn filter_clause_captures(caps: [String]) : [String] {
+  match caps {
+    [] -> []
+    [c, ...rest] -> {
+      let prefix = "__alias_id__"
+      if string_starts_with_q(c, prefix) {
+        filter_clause_captures(rest)
+      } else {
+        [c, ...filter_clause_captures(rest)]
+      }
+    }
+  }
+}
+
+# R9: union the per-clause capture sets of every clause that belongs
+# to a single handle (matched by hline/hcol). The handle allocates
+# one env struct shared across all its clauses, so every clause's
+# capture has to find a slot in the same struct.
+
+#[doc("AST collector walking hclauses.")]
+pub fn collect_hclauses(cs: [HClause], st: LamCollect) : LamCollect / Console {
+
+  match cs {
+    [] -> st
+    [c, ...rest] -> match c {
+      HC(_, _, body, _, _) -> collect_hclauses(rest, collect_expr(body, st))
+    }
+  }
+}
+
+#[doc("AST collector walking hreturn.")]
+pub fn collect_hreturn(r: HReturn, st: LamCollect) : LamCollect / Console {
+
+  match r {
+    HR(_, body, _, _) -> collect_expr(body, st)
+  }
+}
+
+#[doc("AST collector walking exprs.")]
+pub fn collect_exprs(xs: [Expr], st: LamCollect) : LamCollect / Console {
+
+  match xs {
+    [] -> st
+    [h, ...rest] -> collect_exprs(rest, collect_expr(h, st))
+  }
+}
+
+#[doc("AST collector walking arms.")]
+pub fn collect_arms(arms: [Arm], st: LamCollect) : LamCollect / Console {
+
+  match arms {
+    [] -> st
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, body) -> {
+        let s1 = match opt_g { Some(g) -> collect_expr(g, st) None -> st }
+        collect_arms(rest, collect_expr(body, s1))
+      }
+    }
+  }
+}
+
+#[doc("AST collector walking field inits.")]
+pub fn collect_field_inits(fs: [FieldInit], st: LamCollect) : LamCollect / Console {
+
+  match fs {
+    [] -> st
+    [f, ...rest] -> match f {
+      FI(_, val) -> collect_field_inits(rest, collect_expr(val, st))
+    }
+  }
+}
+
+#[doc("AST collector walking list elems.")]
+pub fn collect_list_elems(es: [ListElem], st: LamCollect) : LamCollect / Console {
+
+  match es {
+    [] -> st
+    [el, ...rest] -> match el {
+      ElPlain(x) -> collect_list_elems(rest, collect_expr(x, st))
+      ElSpread(x) -> collect_list_elems(rest, collect_expr(x, st))
+    }
+  }
+}
+
+#[doc("AST collector walking stmts.")]
+pub fn collect_stmts(ss: [Stmt], st: LamCollect) : LamCollect / Console {
+
+  match ss {
+    [] -> st
+    [s, ...rest] -> collect_stmts(rest, collect_stmt(s, st))
+  }
+}
+
+#[doc("AST collector walking stmt.")]
+pub fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect / Console {
+
+  match s {
+    SLet(pat, _, rhs) -> {
+      # issue #285: walk RHS in the *outer* scope, then extend
+      # `local_scope` with the pattern's bound names so subsequent
+      # stmts and a trailing tail expression treat them as captures.
+      let s1 = collect_expr(rhs, st)
+      lc_set_locals(s1, pat_bindings(pat, s1.local_scope))
+    }
+    SAssert(c, opt_m) -> {
+      let s1 = collect_expr(c, st)
+      match opt_m { Some(m) -> collect_expr(m, s1) None -> s1 }
+    }
+    SExprStmt(x) -> collect_expr(x, st)
+    SIndexAssign(b, i, v, _, _) -> {
+      let s1 = collect_expr(b, st)
+      let s2 = collect_expr(i, s1)
+      collect_expr(v, s2)
+    }
+    # m7b #5: `var name = init` — desugared into `EHandle` upstream of
+    # this walker (`desugar_var_block`), so an `SVar` reaching here is
+    # rare; nonetheless mirror SLet so a lone surviving `var` still
+    # shadows globals correctly (issue #285).
+    SVar(name, _, rhs, _, _) -> {
+      let s1 = collect_expr(rhs, st)
+      lc_extend_locals(s1, [name])
+    }
+    # m7e §25: stripped by desugar_use_decls before lambda lift runs.
+    SUse(_, _, _) -> st
+  }
+}
+
+#[doc("AST collector walking interp.")]
+pub fn collect_interp(span: String, is_triple: Bool, st: LamCollect) : LamCollect / Console {
+
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
+  collect_interp_parts(parts, st)
+}
+
+#[doc("AST collector walking interp parts.")]
+pub fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect / Console {
+
+  match parts {
+    [] -> st
+    [p, ...rest] -> match p {
+      IpLit(_, _) -> collect_interp_parts(rest, st)
+      IpExp(esrc) -> {
+        let st1 = match parse_interp_expr(esrc) { Some(e) -> collect_expr(e, st) None -> st }
+        collect_interp_parts(rest, st1)
+      }
+    }
+  }
+}
+
+# m4c #4: enter / leave helpers for the cur_enc_fn field. Functional
+# state-passing — the walker swaps the enclosing fn name on the way
+# in and restores the parent's name on the way out so siblings stamp
+# their own clauses against the right scope.
+
+# m4c #4: enter / leave helpers for the cur_enc_fn field. Functional
+# state-passing — the walker swaps the enclosing fn name on the way
+# in and restores the parent's name on the way out so siblings stamp
+# their own clauses against the right scope.
+#[doc("c #4: enter / leave helpers for the cur_enc_fn field. Functional state-passing — the walker swaps the enclosing fn name on the way in and restores the parent's name on the way…")]
+pub fn enter_enc_fn(st: LamCollect, name: String) : LamCollect =
+  LamCollect { next_id: st.next_id, lams: st.lams,
+                clauses: st.clauses, globals: st.globals,
+                cur_enc_fn: name, local_scope: st.local_scope }
+
+#[doc("Restore the enclosing-function name in clause-lookup state after a nested walk.")]
+pub fn restore_enc_fn(st: LamCollect, name: String) : LamCollect =
+  LamCollect { next_id: st.next_id, lams: st.lams,
+                clauses: st.clauses, globals: st.globals,
+                cur_enc_fn: name, local_scope: st.local_scope }
+
+#[doc("AST collector walking decl.")]
+pub fn collect_decl(d: Decl, st: LamCollect) : LamCollect / Console {
+
+  match d {
+    DFn(_, name, _, ps, _, _, body, _, _, mo) -> {
+      let outer = st.cur_enc_fn
+      let outer_locals = st.local_scope
+      # issue #285: seed `local_scope` with the fn's parameter names so
+      # any nested ELambda's free-variable analysis treats a parameter
+      # whose name collides with a stdlib fn (e.g. `count` shadowing
+      # `list.count`) as a captured local instead of a global.
+      let st1 = enter_enc_fn(lc_set_locals(st, params_to_names(ps)),
+                              c_sym(name, mo))
+      let st2 = collect_expr(body, st1)
+      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
+    }
+    DType(_, _, _, _, _, _, _) -> st
+    DTest(_, body, line, col) -> {
+      let outer = st.cur_enc_fn
+      let outer_locals = st.local_scope
+      # m4c #4: the synthesised name has to match the prefix
+      # `emit_test_fn` will use so install code emitted inside a test
+      # body's `EHandle` and the corresponding clause's top-level C
+      # function agree on a single C symbol.
+      let test_enc = concat_all([
+        "__test__", int_to_string(line), "_", int_to_string(col)
+      ])
+      let st1 = enter_enc_fn(lc_set_locals(st, []), test_enc)
+      let st2 = collect_expr(body, st1)
+      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
+    }
+    DBench(_, body, line, col) -> {
+      let outer = st.cur_enc_fn
+      let outer_locals = st.local_scope
+      let bench_enc = concat_all([
+        "__bench__", int_to_string(line), "_", int_to_string(col)
+      ])
+      let st1 = enter_enc_fn(lc_set_locals(st, []), bench_enc)
+      let st2 = collect_expr(body, st1)
+      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
+    }
+    DCheck(_, ps, body, line, col) -> {
+      let outer = st.cur_enc_fn
+      let outer_locals = st.local_scope
+      let check_enc = concat_all([
+        "__check__", int_to_string(line), "_", int_to_string(col)
+      ])
+      let st1 = enter_enc_fn(lc_set_locals(st, params_to_names(ps)),
+                              check_enc)
+      let st2 = collect_expr(body, st1)
+      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
+    }
+    DImport(_, _, _) -> st
+    DEffect(_, _, _, _, _, _, _) -> st          # no expressions to walk
+    # m12.8: stripped pre-resolve. No expressions to walk if one
+    # somehow survives.
+    DProtocol(_, _, _, _, _, _) -> st
+    DImpl(_, _, _, _, _, _) -> st
+    DDerive(_, _, _, _) -> st
+    DUnstable(_, _, _) -> st
+    DUnit(_, _, _, _, _) -> st               # m12.5: no expressions in a unit decl
+    DUse(_, _, _) -> st                       # m7e §25: stripped by desugar_use_decls; no expressions
+    DAxiom(_, _, _, _, _, _, _, _, _, _) -> st     # m12.7: rewritten to DFn by lower_axioms; no expressions on the bare form
+    DAttribPure(inner, _, _) -> collect_decl(inner, st)  # m12.6.x #5(a)
+    DConst(_, _, _, body, _, _) -> {              # issue #269: literal-only body, but walk for safety
+      collect_expr(body, st)
+    }
+  }
+}
+
+#[doc("AST collector walking decls.")]
+pub fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect / Console {
+
+  match ds {
+    [] -> st
+    [d, ...rest] -> collect_decls(rest, collect_decl(d, st))
+  }
+}
+
+# Globals: prelude names + user fn names + variant ctor names. Used as a
+# cheap "this ident does not need to be captured" test.
+
+# Globals: prelude names + user fn names + variant ctor names. Used as a
+# cheap "this ident does not need to be captured" test.
+#[doc("Globals: prelude names + user fn names + variant ctor names. Used as a cheap 'this ident does not need to be captured' test.")]
+pub fn efn_name(e: EFn) : String = match e { EFn(n, _, _, _) -> n }
+
+#[doc("Variant-table lookup helper: name.")]
+pub fn evar_name(v: EVar) : String = match v { EV(n, _, _, _) -> n }
+
+#[doc("Build the emit-time global tables (EFn registry, variant table) from the decl list.")]
+pub fn build_globals(fns: [EFn], variants: [EVar], eff_names: [String], op_quals: [String]) : [String] {
+  let p = prelude_names()
+  let f = map(fns, efn_name)
+  let v = map(variants, evar_name)
+  # Effect names (e.g. `Console`) and qualified op references
+  # (`Stdout.print`) are not runtime values; they are
+  # name-resolved at op-call sites via the evidence stack.
+  # `desugar_op_calls_callee` rewrites `EField(EVar(Eff), op)` into
+  # `EVar("Eff.op")` (a single qualified ident), so without
+  # including the qualified form in globals, `fv_expr` would treat
+  # `Stdout.print` as a free variable inside a lambda body and the
+  # lambda lifter would capture it, emitting invalid C
+  # (`kai_Stdout.print` is not a valid C identifier).
+  list_append(p,
+    list_append(f,
+      list_append(v,
+        list_append(eff_names, op_quals))))
+}
+
+# For every `effect Eff { op_a(...) : T  op_b(...) : U }` decl,
+# yield the qualified ident strings `"Eff.op_a"`, `"Eff.op_b"`.
+# These match what `desugar_op_calls_callee` produces when it
+# rewrites `Eff.op(args)` callees into `EVar("Eff.op")`.
+
+# For every `effect Eff { op_a(...) : T  op_b(...) : U }` decl,
+# yield the qualified ident strings `"Eff.op_a"`, `"Eff.op_b"`.
+# These match what `desugar_op_calls_callee` produces when it
+# rewrites `Eff.op(args)` callees into `EVar("Eff.op")`.
+#[doc("For every `effect Eff { op_a(...) : T op_b(...) : U }` decl, yield the qualified ident strings `'Eff.op_a'`, `'Eff.op_b'`. These match what `desugar_op_calls_callee` produces…")]
+pub fn op_qualified_names_for(eff_name: String, ops: [EffectOp], acc: [String]) : [String] {
+  match ops {
+    [] -> acc
+    [o, ...rest] -> match o {
+      EOp(op_name, _, _, _, _, _) ->
+        op_qualified_names_for(eff_name, rest,
+          [string_concat(eff_name, string_concat(".", op_name)), ...acc])
+    }
+  }
+}
+
+# m12.8 Phase 4b: (op_name, eff_name) pairs collected from every
+# DEffect in the program. Used to resolve alias-qualified op calls
+# (`Console.print` → `Stdout.print`, `Io.read_line` → `Stdin.read_line`).
+
+#[doc("AST collector walking op qualified names.")]
+pub fn collect_op_qualified_names(decls: [Decl]) : [String] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, name, _, ops, _, _, _) ->
+        list_append(op_qualified_names_for(name, ops, []),
+                    collect_op_qualified_names(rest))
+      _ -> collect_op_qualified_names(rest)
+    }
+  }
+}
+
+# ---- lambda helper emission ----
+
+#[doc("Keep only the operand arguments of a call, dropping any threaded evidence args.")]
+pub fn op_args_only(params: [Param]) : [Param] {
+  match params {
+    [] -> []
+    [_] -> []                       # the lone trailing `resume`
+    [p, ...rest] -> [p, ...op_args_only(rest)]
+  }
+}
+
+# m4c #4: clause C-symbol minting takes the enclosing fn name as a
+# prefix. Pre-fix the name was `_kai_clause_<l>_<c>_<op>` keyed only
+# on source position; duplicating a polymorphic body that contains
+# `EHandle` produced colliding C symbols and the linker rejected the
+# binary, which is why `monomorphise` shipped as identity. The
+# prefixed form `_kai_<enc>__clause_<l>_<c>_<op>` lets two
+# specialisations of the same source fn (`foo__mono__Int` vs
+# `foo__mono__String`) emit distinct symbols. The same prefix is
+# minted both at the install site (`emit_clause_assignments`) and at
+# the clause-body emit site, fed from `ClauseInfo.enc_fn`.
+
+# m4c #4: clause C-symbol minting takes the enclosing fn name as a
+# prefix. Pre-fix the name was `_kai_clause_<l>_<c>_<op>` keyed only
+# on source position; duplicating a polymorphic body that contains
+# `EHandle` produced colliding C symbols and the linker rejected the
+# binary, which is why `monomorphise` shipped as identity. The
+# prefixed form `_kai_<enc>__clause_<l>_<c>_<op>` lets two
+# specialisations of the same source fn (`foo__mono__Int` vs
+# `foo__mono__String`) emit distinct symbols. The same prefix is
+# minted both at the install site (`emit_clause_assignments`) and at
+# the clause-body emit site, fed from `ClauseInfo.enc_fn`.
+#[doc("c #4: clause C-symbol minting takes the enclosing fn name as a prefix. Pre-fix the name was `_kai_clause_<l>_<c>_<op>` keyed only on source position; duplicating a polymorphic…")]
+pub fn clause_fn_name(enc_fn: String, line: Int, col: Int, op: String) : String =
+  concat_all([
+    "_kai_", enc_fn, "__clause_",
+    int_to_string(line), "_", int_to_string(col), "_", op
+  ])
+
+#[doc("The success-side variant constructor a postfix-! expression unwraps.")]
+pub fn bang_success_variant(opt_ty: Option[Ty]) : Option[String] {
+  match opt_ty {
+    None -> None
+    Some(t) -> match t {
+      TyCon(_, name, _) ->
+        if name == "Option" { Some("Some") }
+        else if name == "Result" { Some("Ok") }
+        else { None }
+      _ -> None
+    }
+  }
+}
+
+# m7a #6b/#6c: lower `handle { body } with Eff [as alias] { clauses }`
+# to its prologue/body/epilogue. m7a #6b shipped the EvE alloca,
+# the handler-id stamp, the kai_evidence_push/pop pair, and the
+# optional return clause; m7a #6c populates each op fn-ptr with the
+# top-level clause function emitted by emit_clause_body, so that op
+# calls inside the body dispatch through the EvE.
+# m7b #11: when `init_opt` is `Some(ie)`, write the init value into
+# `_ev.state` after the handler-id and op-fn-ptr assignments. The
+# clause body emitter exposes that slot inside clauses as `state` /
+# `log` aliases of `self->state`.
+
+# m4c #4: locate the enclosing fn name stamped on a clause at collect
+# time. Keyed on the install triple (line, col, op_name). Defensive
+# fallback to "" when nothing matches — collect should always record
+# a CI per HClause, but if a clause sneaks through pre-collect rewrites
+# the fallback emits the unprefixed legacy name (which is what the
+# corresponding clause-body would also emit, so the link still works).
+#[doc("c #4: locate the enclosing fn name stamped on a clause at collect time. Keyed on the install triple (line, col, op_name). Defensive fallback to '' when nothing matches —…")]
+pub fn lookup_clause_enc_fn(cs: [ClauseInfo], hline: Int, hcol: Int, op_name: String) : String {
+  match cs {
+    [] -> ""
+    [c, ...rest] -> match c {
+      CI(line, col, _, op, _, _, _, enc_fn, _) ->
+        if line == hline and col == hcol and op == op_name { enc_fn }
+        else { lookup_clause_enc_fn(rest, hline, hcol, op_name) }
+    }
+  }
+}
+
+# Issue #403: cheap structural test for `ECall(EVar("__perceus_drop"), _)`.
+# `__perceus_drop` lowers to `kai_internal_drop`, which decrefs and returns
+# the unit singleton — the SExprStmt fast path skips the redundant trailing
+# `kai_decref` when this fires.
+
+# A let-binding is "droppable" when:
+#   1. The pattern is a single `PBind(name)` (no destructuring).
+#   2. The RHS is a fresh allocation (rc=1, no aliasing — see
+#      `is_fresh_alloc` for the conservative subset).
+#   3. The bound name is never read in the rest of the block: later
+#      stmts AND the trailing optional final expression.
+# Returns the list of droppable names in the block. The walker
+# from m5 #2 (`scan_uses_in_stmts` / `scan_uses_expr`) is reused
+# unchanged.
+#[doc("A let-binding is 'droppable' when: 1. The pattern is a single `PBind(name)` (no destructuring). 2. The RHS is a fresh allocation (rc=1, no aliasing — see `is_fresh_alloc` for…")]
+pub fn block_unused_lets(stmts: [Stmt], opt_final: Option[Expr]) : [String] / Console =
+
+  block_unused_lets_loop(stmts, opt_final, [])
+
+#[doc("Tail loop finding let-bindings in a block whose name is never read.")]
+pub fn block_unused_lets_loop(stmts: [Stmt], opt_final: Option[Expr],
+                          acc: [String]) : [String] / Console {
+
+  match stmts {
+    [] -> list_reverse(acc)
+    [s, ...rest] -> {
+      let acc1 = match s {
+        SLet(pat, _, rhs) -> match pat.pkind {
+          PBind(nm) -> {
+            if is_fresh_alloc(rhs) and not name_read_in_block(rest, opt_final, nm) {
+              [nm, ...acc]
+            } else { acc }
+          }
+          _ -> acc
+        }
+        _ -> acc
+      }
+      block_unused_lets_loop(rest, opt_final, acc1)
+    }
+  }
+}
+
+#[doc("True if a given name is read anywhere inside a statement block.")]
+pub fn name_read_in_block(stmts: [Stmt], opt_final: Option[Expr], nm: String) : Bool / Console {
+
+  let stmt_uses = scan_uses_in_stmts(stmts, false)
+  let final_uses = match opt_final {
+    None -> []
+    Some(e) -> scan_uses_expr(e, false)
+  }
+  any_use_of(list_append(stmt_uses, final_uses), nm)
+}
+
+#[doc("True if a name is used anywhere in an expression.")]
+pub fn any_use_of(uses: [Use], nm: String) : Bool {
+  match uses {
+    [] -> false
+    [h, ...rest] -> match h {
+      U(uname, _, _, _) ->
+        if uname == nm { true } else { any_use_of(rest, nm) }
+    }
+  }
+}
+
+# Conservative "fresh allocation" predicate. Returns true when the
+# RHS is known to materialise a value with rc=1 and no aliasing.
+# False for `EVar` (alias of an existing binding), `EField` /
+# `EIndex` (extracted ref into a parent), and the composite control
+# forms (`EIf`, `EMatch`, `EBlock`, `EHandle`, `EPipe`) whose result
+# can be a sub-expression aliased into the surrounding scope.
+
+# Conservative "fresh allocation" predicate. Returns true when the
+# RHS is known to materialise a value with rc=1 and no aliasing.
+# False for `EVar` (alias of an existing binding), `EField` /
+# `EIndex` (extracted ref into a parent), and the composite control
+# forms (`EIf`, `EMatch`, `EBlock`, `EHandle`, `EPipe`) whose result
+# can be a sub-expression aliased into the surrounding scope.
+#[doc("Conservative 'fresh allocation' predicate. Returns true when the RHS is known to materialise a value with rc=1 and no aliasing. False for `EVar` (alias of an existing binding),…")]
+pub fn is_fresh_alloc(e: Expr) : Bool {
+  match e.kind {
+    EInt(_)         -> true
+    EReal(_)        -> true
+    EBool(_)        -> true
+    EChar(_)        -> true
+    EStr(_, _)      -> true
+    EUnit           -> true
+    ECall(_, _)     -> true
+    EList(_)        -> true
+    ERecordLit(_, _) -> true
+    ERange(_, _, _) -> true
+    ELambda(_, _)   -> true
+    EBinop(_, _, _) -> true
+    EUnop(_, _)     -> true
+    _               -> false
+  }
+}
+
+# m12.7.x FFI v1: enumeration of the supported return kinds plus an
+# escape hatch (`FfiRetUnknown`) carrying the offending type name so
+# the emitted `#error` can name it back to the user.
+#[doc("x FFI v1: enumeration of the supported return kinds plus an escape hatch (`FfiRetUnknown`) carrying the offending type name so the emitted `#error` can name it back to the user.")]
+pub type FfiRetKind
+  = FfiRetUnit
+  | FfiRetInt
+  | FfiRetReal
+  | FfiRetBool
+  | FfiRetString
+  | FfiRetUnknown(String)
+
+#[doc("FFI marshalling helper: ret kind of.")]
+pub fn ffi_ret_kind_of(opt: Option[TypeExpr]) : FfiRetKind {
+  match opt {
+    None -> FfiRetUnit
+    Some(t) -> ffi_kind_of_ty(t)
+  }
+}
+
+#[doc("FFI marshalling helper: kind of ty.")]
+pub fn ffi_kind_of_ty(t: TypeExpr) : FfiRetKind {
+  match t.tkind {
+    TyName(n, _) ->
+      if n == "Int" { FfiRetInt }
+      else if n == "Real" { FfiRetReal }
+      else if n == "Bool" { FfiRetBool }
+      else if n == "String" { FfiRetString }
+      else if n == "Unit" { FfiRetUnit }
+      else { FfiRetUnknown(n) }
+    _ -> FfiRetUnknown("non-named type")
+  }
+}
+
+# Row for one `__pimpl_*` entry: the C symbol name, the proto name,
+# the kaikai type name (head), and the impl fn's arity. Heterogeneous-
+# mangled impls (`__pimpl_<P>_<T>_<op>__a_<args>`) collapse to the same
+# `(P, T)` dispatch key — the typer's compile-time rewrite already
+# routes the right arg-shape; the runtime only needs the head match.
+# The arity is needed by the LLVM emit to synthesise the bitcast
+# target type (`%KaiValue* (%KaiValue*, ...)*`) with the right number
+# of params — without it every impl would be bitcast to arity 1 and
+# clang rejects the mismatch (issue surfaced in release v0.83.x build).
+#[doc("Row for one `__pimpl_*` entry: the C symbol name, the proto name, the kaikai type name (head), and the impl fn's arity. Heterogeneous- mangled impls…")]
+pub type PimplRow = PR(String, String, String, Int)
+#                  c_sym    proto   type_name arity
+
+#[doc("AST collector walking pimpl rows.")]
+pub fn collect_pimpl_rows(ds: [Decl], acc: [PimplRow]) : [PimplRow] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DFn(_, name, _, params, _, _, _, _, _, mo) -> {
+        if string_starts_with_q(name, "__pimpl_") {
+          match parse_pimpl_name(name) {
+            Some(pr) -> {
+              let csym = c_sym(name, mo)
+              let arity = list_length(params)
+              collect_pimpl_rows(rest, [pr_with_csym(pr, csym, arity), ...acc])
+            }
+            None -> collect_pimpl_rows(rest, acc)
+          }
+        } else {
+          collect_pimpl_rows(rest, acc)
+        }
+      }
+      _ -> collect_pimpl_rows(rest, acc)
+    }
+  }
+}
+
+#[doc("Attach the minted C symbol to a decoded protocol-impl row.")]
+pub fn pr_with_csym(pr: PimplRow, csym: String, arity: Int) : PimplRow {
+  match pr { PR(_, p, t, _) -> PR(csym, p, t, arity) }
+}
+
+# Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>`
+# back into (proto, type_name). The proto is the stdlib name (Show,
+# Eq, ...) for v1; user protos return None to skip.
+
+# Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>`
+# back into (proto, type_name). The proto is the stdlib name (Show,
+# Eq, ...) for v1; user protos return None to skip.
+#[doc("Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>` back into (proto, type_name). The proto is the stdlib name (Show, Eq, ...) for v1; user protos return None to skip.")]
+pub fn parse_pimpl_name(name: String) : Option[PimplRow] {
+  # name = "__pimpl_" ++ <rest>; cut prefix.
+  let prefix_len = 8
+  let n = string_length(name)
+  if n <= prefix_len { None }
+  else {
+    let rest = string_slice(name, prefix_len, n - prefix_len)
+    # split off the trailing "__a_..." suffix if present.
+    let base = pimpl_strip_arg_suffix(rest)
+    # `base` is now `<P>_<T>_<op>`. Take P as the longest known
+    # stdlib protocol prefix; everything between `<P>_` and the final
+    # `_<op>` is the type name.
+    match pimpl_split_proto(base) {
+      None -> None
+      Some(p_rest) -> match p_rest {
+        PR2(p, rest1) -> {
+          # rest1 = "<T>_<op>". Strip the trailing `_<op>` by finding
+          # the last underscore.
+          let m = string_length(rest1)
+          let last = find_last_underscore_proto(rest1, m - 1)
+          if last <= 0 { None }
+          else {
+            let tname = string_slice(rest1, 0, last)
+            Some(PR("", p, tname, 0))
+          }
+        }
+      }
+    }
+  }
+}
+
+#[doc("Two-field protocol-impl name split (proto, rest).")]
+pub type PR2 = PR2(String, String)
+
+# Strip a `__a_…` suffix off a `__pimpl_*` symbol's payload string.
+
+# Strip a `__a_…` suffix off a `__pimpl_*` symbol's payload string.
+#[doc("Strip a `__a_…` suffix off a `__pimpl_*` symbol's payload string.")]
+pub fn pimpl_strip_arg_suffix(s: String) : String {
+  let marker = "__a_"
+  let idx = find_substring(s, marker, 0)
+  let n = string_length(s)
+  if idx >= n { s }
+  else { string_slice(s, 0, idx) }
+}
+
+# Detect which stdlib protocol prefix `s` starts with. Returns the
+# protocol name and the remainder after the trailing `_`. None if
+# unknown.
+
+# Detect which stdlib protocol prefix `s` starts with. Returns the
+# protocol name and the remainder after the trailing `_`. None if
+# unknown.
+#[doc("Detect which stdlib protocol prefix `s` starts with. Returns the protocol name and the remainder after the trailing `_`. None if unknown.")]
+pub fn pimpl_split_proto(s: String) : Option[PR2] {
+  let try_one = (p: String) => {
+    let plen = string_length(p)
+    let n = string_length(s)
+    if n > plen and substring_eq(s, 0, p) {
+      let after = char_at_or_zero(s, plen)
+      if after == '_' {
+        Some(PR2(p, string_slice(s, plen + 1, n - plen - 1)))
+      } else { None }
+    } else { None }
+  }
+  let tries = ["BinSerialize", "Serialize", "Default", "Show", "Hash",
+                "Ord", "Eq", "Add", "Sub", "Mul", "Div", "Rem"]
+  pimpl_first_match(tries, try_one)
+}
+
+#[doc("Protocol-impl name decoder: first match.")]
+pub fn pimpl_first_match(opts: [String], f: (String) -> Option[PR2]) : Option[PR2] {
+  match opts {
+    [] -> None
+    [o, ...rest] -> match f(o) {
+      Some(r) -> Some(r)
+      None    -> pimpl_first_match(rest, f)
+    }
+  }
+}
+
+#[doc("Find the last underscore boundary in a protocol-impl name for splitting.")]
+pub fn find_last_underscore_proto(s: String, from: Int) : Int {
+  if from < 0 { -1 }
+  else {
+    match char_at(s, from) {
+      Some('_') -> from
+      _         -> find_last_underscore_proto(s, from - 1)
+    }
+  }
+}
+
+# Substring-equality. Returns true if `s[i..i+|t|] == t`. Bounds-safe.
+
+# Substring-equality. Returns true if `s[i..i+|t|] == t`. Bounds-safe.
+#[doc("Substring-equality. Returns true if `s[i..i+|t|] == t`. Bounds-safe.")]
+pub fn substring_eq(s: String, i: Int, t: String) : Bool {
+  let tn = string_length(t)
+  let sn = string_length(s)
+  if i + tn > sn { false }
+  else { substring_eq_loop(s, i, t, 0, tn) }
+}
+
+#[doc("Tail loop comparing a substring against a needle character by character.")]
+pub fn substring_eq_loop(s: String, i: Int, t: String, k: Int, tn: Int) : Bool {
+  if k >= tn { true }
+  else {
+    match char_at(s, i + k) {
+      Some(c1) -> match char_at(t, k) {
+        Some(c2) -> if c1 == c2 { substring_eq_loop(s, i, t, k + 1, tn) } else { false }
+        None     -> false
+      }
+      None -> false
+    }
+  }
+}
+
+# Find `needle` in `hay` starting at `from`. Returns length(hay) if
+# not found.
+
+# Find `needle` in `hay` starting at `from`. Returns length(hay) if
+# not found.
+#[doc("Find `needle` in `hay` starting at `from`. Returns length(hay) if not found.")]
+pub fn find_substring(hay: String, needle: String, from: Int) : Int {
+  let hn = string_length(hay)
+  if from >= hn { hn }
+  else if substring_eq(hay, from, needle) { from }
+  else { find_substring(hay, needle, from + 1) }
+}
+
+# C array body for the impl table. Each row maps the parsed proto/type
+# back to the integer constants pinned in runtime.h.
+
+# `kai_variant_to_head[]` — one int32_t per variant tag, mapping each
+# constructor to its sum-type head. Indexed by `variant_tag`.
+#[doc("`kai_variant_to_head[]` — one int32_t per variant tag, mapping each constructor to its sum-type head. Indexed by `variant_tag`.")]
+pub fn collect_variant_to_head(variants: [EVar], decls: [Decl]) : [Int] =
+  collect_v2h_loop(variants, decls, [])
+
+#[doc("AST collector walking v2h loop.")]
+pub fn collect_v2h_loop(vs: [EVar], decls: [Decl], acc: [Int]) : [Int] {
+  match vs {
+    [] -> list_reverse(acc)
+    [EV(name, _, _, _), ...rest] -> {
+      let head = variant_head_tag_for(name, decls)
+      collect_v2h_loop(rest, decls, [head, ...acc])
+    }
+  }
+}
+
+# For a constructor `name`, find the sum type it belongs to and look
+# up that sum's head tag. Builtins use the reserved ids; user sums
+# would need a registry — out of scope for v1 (the dispatcher's
+# runtime panic catches the miss).
+
+# For a constructor `name`, find the sum type it belongs to and look
+# up that sum's head tag. Builtins use the reserved ids; user sums
+# would need a registry — out of scope for v1 (the dispatcher's
+# runtime panic catches the miss).
+#[doc("For a constructor `name`, find the sum type it belongs to and look up that sum's head tag. Builtins use the reserved ids; user sums would need a registry — out of scope for v1…")]
+pub fn variant_head_tag_for(name: String, decls: [Decl]) : Int {
+  if name == "Some" { 16 }
+  else if name == "None" { 16 }
+  else if name == "Ok" { 17 }
+  else if name == "Err" { 17 }
+  else if name == "SigInt" { 18 }
+  else if name == "SigTerm" { 18 }
+  else if name == "SigHup" { 18 }
+  else if name == "SigUsr1" { 18 }
+  else if name == "SigUsr2" { 18 }
+  else if name == "Exited" { 19 }
+  else if name == "Signaled" { 19 }
+  else { 0 }   # user variant: anonymous head, dispatcher will miss
+}
+
+# m7e §24: build a RowExpr from the body-performed labels collected
+# by the inferencer. Used only for `main` without an explicit row;
+# the typer writes this back into the DFn so the default-handler
+# wrapper sees the inferred row at emit time. ty_args are dropped —
+# every builtin effect with a default handler is non-parametric, and
+# parametric effects (State[T], Reader[T]) have no default handler
+# anyway, so the wrapper would not install anything for them. The
+# Bug 6 row-vs-body subset check still skips `main` in
+# `check_body_row`; this rewrite only changes what the wrapper sees.
+#[doc("e §24: build a RowExpr from the body-performed labels collected by the inferencer. Used only for `main` without an explicit row; the typer writes this back into the DFn so the…")]
+pub fn main_row_labels(decls: [Decl]) : [String] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DFn(_, n, _, _, _, row, _, _, _, _) ->
+        if n == "main" {
+          match row {
+            REmpty       -> []
+            RClosed(lbs) -> es_row_label_names(lbs)
+            ROpen(_, lbs) -> es_row_label_names(lbs)
+          }
+        } else { main_row_labels(rest) }
+      _ -> main_row_labels(rest)
+    }
+  }
+}
+
+# m12.8 Phase 4b: atomic Stdout / Stderr default setups. The
+# combined `Console` is an alias `type Console = Stdout + Stderr`,
+# so a `main` declaring `/ Console` installs BOTH the Stdout and
+# Stderr default handlers via the alias-expansion path in
+# `default_setups_for`.
+#
+# Issue #115: the runtime `kai_default_*` handlers in stage0/runtime.h
+# take `void *self` because the runtime header cannot know the
+# emitted `EvStdout` / `EvStderr` / ... types. Casting their
+# addresses to typed function pointers (`(KaiValue *(*)(EvStdout *,
+# ...))`) is a representation-equivalent cast in C, but UBSan's
+# `-fsanitize=function` (active in clang's `-fsanitize=undefined`
+# on Linux; absent from Apple clang's default `undefined` set)
+# checks at every indirect call that the *function definition's*
+# type tag equals the function pointer's static type. The cast
+# does not change the function definition's type tag, so every
+# dispatch through `_ev_op->print(...)` etc. trips the check on
+# Linux while passing on macOS.
+#
+# Fix: emit a thin typed shim per default-op at file scope
+# (`_kai_default_<eff>_<op>_shim`). The shim has the typed
+# signature matching the struct field, forwards to the runtime
+# void-self function via a regular call (not subject to
+# `-fsanitize=function`). Setup assigns the shim's address; no
+# cast required at the assignment, no UBSan diagnostic at the
+# dispatch site.
+# Issue #556: derive a default-handler shim from a user-declared
+# `default { }` block whose clause bodies are `$extern_handler("c_sym")`.
+# The shim shape mirrors the hardcoded family above:
+#     static KaiValue *_kai_default_<eff_lc>_<op>_shim(Ev<Eff> *self,
+#         KaiValue *kai_<arg>, ..., KaiCont *k) {
+#         return <c_sym>(self, kai_<arg>, ..., k);
+#     }
+# Returns "" when the effect has no default block, or when the block's
+# clauses do not all bridge to extern_handler (the latter case is a
+# user-declared effect with kaikai-bodied default; Stage C will lower
+# those, but Stage A's codegen scope is the extern_handler bridge only).
+
+# Look up the `Option[DefaultBlock]` on `effect <eff_name>`. Returns
+# None when the effect is not declared, or when it declares no default
+# block.
+#[doc("Look up the `Option[DefaultBlock]` on `effect <eff_name>`. Returns None when the effect is not declared, or when it declares no default block.")]
+pub fn find_effect_default_block(eff_name: String, decls: [Decl]) : Option[DefaultBlock] {
+  match decls {
+    [] -> None
+    [d, ...rest] -> match d {
+      DEffect(_, n, _, _, defblk, _, _) ->
+        if n == eff_name { defblk } else { find_effect_default_block(eff_name, rest) }
+      _ -> find_effect_default_block(eff_name, rest)
+    }
+  }
+}
+
+# Issue #557 — Stage B of #533 trilogy. Op-level coverage walker.
+#
+# The typer's row-level checks (`check_body_row`, `check_main_row_handlable`)
+# enforce that every effect label reached from a body is named by an
+# enclosing `handle` or absorbed by `main`. They are blind to which
+# specific op of an effect was performed, so a `handle ... with Log
+# { info }` whose body invokes `Log.warn` compiles cleanly and
+# segfaults at runtime (dispatch hits an unwired evidence slot).
+#
+# This walker closes the gap. For every directly-performed `Eff.op`
+# call inside a `DFn` body it walks the lexical stack of enclosing
+# handles. Discharge order:
+#
+#   1. Enclosing `handle ... with Eff { clauses }` lists `op` in its
+#      clauses  → discharged.
+#   2. Enclosing `handle ... with Eff` exists, `op` not in clauses,
+#      but `Eff`'s `default { }` block declares `op` → discharged
+#      (clause-merge from the spec).
+#   3. No enclosing `handle ... with Eff`, the function is `main`,
+#      and `Eff`'s `default { }` block declares `op` → discharged
+#      (auto-installed at the program root).
+#   4. Otherwise → "effect not handled: Eff.op" with notes naming
+#      the default-block status so the user can decide between
+#      adding a clause to the handle, growing the default block, or
+#      wrapping the call site.
+#
+# Scope: only direct `Eff.op(...)` invocations are checked (the
+# `ECall(EVar("Eff.op"), _)` shape produced by `synth_op_call_with_scheme`).
+# Cross-function reachability is out of scope for Stage B; the row-
+# level check still propagates labels through helper signatures and
+# bites where they bubble up.
+
+# Issue #557 — strict variant of `effect_has_default_block` used for
+# main absorption: every clause must bridge to an `extern_handler`
+# intrinsic. Stage A's codegen only knows how to lower those — a
+# kaikai-bodied clause has no emitter path yet (Stage C). Treating
+# effects with kaikai-bodied defaults as absorbed would type-check
+# clean and segfault at runtime, so the typer holds back until codegen
+# can match.
+#[doc("strict variant of `effect_has_default_block` used for main absorption: every clause must bridge to an `extern_handler` intrinsic. Stage A's codegen only knows how to lower…")]
+pub fn effect_default_block_all_extern(eff_name: String, decls: [Decl]) : Bool =
+  match find_effect_default_block(eff_name, decls) {
+    None         -> false
+    Some(defblk) -> match defblk {
+      DBlk(clauses, _, _, _) -> all_clauses_extern_handler(clauses)
+    }
+  }
+
+#[doc("True if every handler clause of an effect resolves to an extern (FFI) handler.")]
+pub fn all_clauses_extern_handler(cs: [HClause]) : Bool = match cs {
+  []           -> true
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> match extern_handler_c_symbol(body) {
+      None    -> false
+      Some(_) -> all_clauses_extern_handler(rest)
+    }
+  }
+}
+
+# Search the handle stack for the topmost frame matching `eff_name`.
+# Step 2 (clause-merge) and step 3 (handle-with-default) both require
+# the topmost frame; step 1 fires when that frame's clauses list `op`.
+
+# Recognise a `$extern_handler("c_symbol")` body. Returns Some(c_symbol)
+# when the expression is exactly that intrinsic call with a single
+# plain-string-literal arg; None otherwise. The validation that the
+# string is a C identifier lives in `validate_extern_handler_intrinsics`
+# (run before codegen).
+#[doc("Recognise a `$extern_handler('c_symbol')` body. Returns Some(c_symbol) when the expression is exactly that intrinsic call with a single plain-string-literal arg; None…")]
+pub fn extern_handler_c_symbol(body: Expr) : Option[String] =
+  match body.kind {
+    EIntrinsic(name, args_) ->
+      if name == "extern_handler" {
+        match args_ {
+          [a] -> match a.kind {
+            EStr(span, is_triple) ->
+              if is_triple { None }
+              else { Some(strip_string_quotes(span)) }
+            _ -> None
+          }
+          _ -> None
+        }
+      } else { None }
+    _ -> None
+  }
+
+# Strip leading `"` and trailing `"` from a string-literal span and
+# resolve the minimal escape set the C-identifier surface uses: `\"`
+# survives only as a defensive case (no C identifier contains `"`),
+# and no other escape is meaningful here. Returns "" if the span has
+# no outer quotes (defensive against malformed AST).
+
+# Strip leading `"` and trailing `"` from a string-literal span and
+# resolve the minimal escape set the C-identifier surface uses: `\"`
+# survives only as a defensive case (no C identifier contains `"`),
+# and no other escape is meaningful here. Returns "" if the span has
+# no outer quotes (defensive against malformed AST).
+#[doc("Strip leading `'` and trailing `'` from a string-literal span and resolve the minimal escape set the C-identifier surface uses: `\'` survives only as a defensive case (no C…")]
+pub fn strip_string_quotes(span: String) : String {
+  let n = string_length(span)
+  if n < 2 { "" }
+  else {
+    let first_q = match char_at(span, 0) { Some(c) -> c == '"' _ -> false }
+    let last_q  = match char_at(span, n - 1) { Some(c) -> c == '"' _ -> false }
+    if first_q and last_q { string_slice(span, 1, n - 2) }
+    else { span }
+  }
+}
+
+
+# m7a #7 + m7b #2b + m8 #2/#4 + m12.8 Phase 4b: assemble the full
+# setup block for the builtins listed in `main`'s row. Push order
+# Stdout → Stderr → Fail → Stdin → Env → File → Mutable → Cancel →
+# Spawn matches Doc B §*Installation order*: Spawn innermost (last
+# pushed, first looked up); Cancel the layer below it (root nursery
+# flags fibers, Cancel handler unwinds); Mutable below Cancel (I/O
+# cluster). Phase 4b: `Console` acts as the alias `Stdout + Stderr`,
+# so a row containing it triggers both setups.
+
+# m7b #5b/handle-as: rewrite alias-based callees `EField(EVar(alias),
+# op)` to `EField(EVar(eff_name), op)` so the subsequent
+# desugar_op_calls pass can fold them into `EVar("eff_name.op")`. The
+# inferencer's synth_op_call_with_scheme already does this rewrite on
+# the typed AST (via the alias table built from `with Eff as alias`),
+# but check_infer is a diagnostic-only pass — its rewrite does not
+# propagate into all_decls. This walker closes the gap. It is also
+# what makes the m7b #5b `var x = init` desugar end-to-end: the
+# desugar emits `with State[T](init) as x { ... x.get() ... }`, and
+# this pass converts the body's `x.get()` calls to `State.get()` so
+# desugar_op_calls + emit_call_expr can take it from there.
+#
+# Scope tracking: the alias map is pushed on entering an `EHandle`
+# body when `alias_opt = Some(name)` and dropped on the way out. The
+# init expression and the clause bodies are walked under the *outer*
+# alias map (matching the inferencer's `st_push_alias` placement at
+# synth_handle:9183-9186). Shadowing by an inner `let alias = ...` is
+# not tracked — the resolver's binding rules already make that
+# pattern resolve to the let, but for now this rewrite naively rewrites
+# any `alias.op` it finds inside the body. Pinned in Doc C §m7b #5
+# *Pre-resolve sugars*.
+#[doc("b #5b/handle-as: rewrite alias-based callees `EField(EVar(alias), op)` to `EField(EVar(eff_name), op)` so the subsequent desugar_op_calls pass can fold them into…")]
+pub type AliasMap = AM([AliasBinding], Bool)   # bindings, may_tag
+
+#[doc("Alias-map operation: empty.")]
+pub fn alias_map_empty() : AliasMap = AM([], true)
+
+#[doc("Alias-map operation: push.")]
+pub fn alias_map_push(m: AliasMap, name: String, eff: String) : AliasMap {
+  # m7b #15: the rewrite-pass AliasMap stores the per-binding
+  # taggability Bool inside AB so the inferencer's snapshots stay
+  # symmetric, but the rewrite pass actually consults
+  # `alias_map_may_tag(m)` (a per-map flag) to decide tagging.
+  # Pass `true` here unconditionally — the per-map flag is what
+  # gates EField tagging in `rewrite_alias_kind`.
+  match m { AM(xs, t) -> AM([AB(name, eff, true), ...xs], t) }
+}
+
+#[doc("Alias-map operation: lookup.")]
+pub fn alias_map_lookup(m: AliasMap, name: String) : Option[String] {
+  match m { AM(xs, _) -> lookup_alias(xs, name) }
+}
+
+# m7b #15 (compiler integration, scope-limited): once we descend
+# into a closure (lambda body), the handle prologue's
+# `kai_alias_<a>_id` C local is no longer in scope. Mark the
+# alias map so the EField rewrite stops tagging op names with
+# `@<alias>` and falls back to the legacy name-keyed lookup.
+# The bindings themselves stay live so the substitution
+# `cap.op` → `Eff.op` keeps working inside the closure.
+
+# m7b #15 (compiler integration, scope-limited): once we descend
+# into a closure (lambda body), the handle prologue's
+# `kai_alias_<a>_id` C local is no longer in scope. Mark the
+# alias map so the EField rewrite stops tagging op names with
+# `@<alias>` and falls back to the legacy name-keyed lookup.
+# The bindings themselves stay live so the substitution
+# `cap.op` → `Eff.op` keeps working inside the closure.
+#[doc("b #15 (compiler integration, scope-limited): once we descend into a closure (lambda body), the handle prologue's `kai_alias_<a>_id` C local is no longer in scope. Mark the…")]
+pub fn alias_map_disable_tag(m: AliasMap) : AliasMap {
+  match m { AM(xs, _) -> AM(xs, false) }
+}
+
+#[doc("Alias-map operation: may tag.")]
+pub fn alias_map_may_tag(m: AliasMap) : Bool {
+  match m { AM(_, t) -> t }
+}
+
+# m7b #17: drop every binding for `name` from the alias map. Used
+# when entering a scope (let / var / lambda param / match pattern)
+# whose binder shadows an outer `with Eff as name`. Removes from
+# the head down so the most recent re-bind no longer matches.
+
+# m7b #17: drop every binding for `name` from the alias map. Used
+# when entering a scope (let / var / lambda param / match pattern)
+# whose binder shadows an outer `with Eff as name`. Removes from
+# the head down so the most recent re-bind no longer matches.
+#[doc("b #17: drop every binding for `name` from the alias map. Used when entering a scope (let / var / lambda param / match pattern) whose binder shadows an outer `with Eff as name`.…")]
+pub fn alias_map_remove(m: AliasMap, name: String) : AliasMap {
+  match m { AM(xs, t) -> AM(alias_remove_loop(xs, name, []), t) }
+}
+
+#[doc("Tail loop removing an alias binding from the alias map.")]
+pub fn alias_remove_loop(xs: [AliasBinding], name: String, acc: [AliasBinding]) : [AliasBinding] {
+  match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      AB(n, _, _) ->
+        if n == name { alias_remove_loop(rest, name, acc) }
+        else        { alias_remove_loop(rest, name, [h, ...acc]) }
+    }
+  }
+}
+
+# m7b #17: drop every binding whose name is in `names`. Convenience
+# for shadowing by lambda params and match-arm patterns where the
+# whole pattern's bound-name set lands in scope at once.
+
+# m7b #17: drop every binding whose name is in `names`. Convenience
+# for shadowing by lambda params and match-arm patterns where the
+# whole pattern's bound-name set lands in scope at once.
+#[doc("b #17: drop every binding whose name is in `names`. Convenience for shadowing by lambda params and match-arm patterns where the whole pattern's bound-name set lands in scope at…")]
+pub fn alias_map_remove_all(m: AliasMap, names: [String]) : AliasMap {
+  match names {
+    [] -> m
+    [h, ...rest] -> alias_map_remove_all(alias_map_remove(m, h), rest)
+  }
+}
+
+#[doc("Let-alias rewriter over decls.")]
+pub fn rewrite_alias_decls(ds: [Decl]) : [Decl] = map(ds, rewrite_alias_decl)
+
+#[doc("Let-alias rewriter over decl.")]
+pub fn rewrite_alias_decl(d: Decl) : Decl {
+  match d {
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, n, tps, ps, ret, row, rewrite_alias_expr(body, alias_map_empty()), l, c, mo)
+    DTest(desc, body, l, c) ->
+      DTest(desc, rewrite_alias_expr(body, alias_map_empty()), l, c)
+    DBench(desc, body, l, c) ->
+      DBench(desc, rewrite_alias_expr(body, alias_map_empty()), l, c)
+    DCheck(desc, params, body, l, c) ->
+      DCheck(desc, params, rewrite_alias_expr(body, alias_map_empty()), l, c)
+    _ -> d
+  }
+}
+
+#[doc("Let-alias rewriter over expr.")]
+pub fn rewrite_alias_expr(e: Expr, m: AliasMap) : Expr =
+  Expr { kind: rewrite_alias_kind(e.kind, m, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+#[doc("Let-alias rewriter over opt.")]
+pub fn rewrite_alias_opt(opt: Option[Expr], m: AliasMap) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(rewrite_alias_expr(e, m))
+    None    -> None
+  }
+}
+
+# m7b #17: walk a statement list with shadow-aware alias map.
+# Each SLet / SVar binds its name(s) for the rest of the block, so
+# subsequent statements (and the trailing expression handled in
+# the EBlock arm) see a map with those names removed. Without this
+# the walker would rewrite an inner `let x = ...; x.op()` against
+# an outer `with Eff as x` even though the inner `x` shadows.
+
+# m7b #17: walk a statement list with shadow-aware alias map.
+# Each SLet / SVar binds its name(s) for the rest of the block, so
+# subsequent statements (and the trailing expression handled in
+# the EBlock arm) see a map with those names removed. Without this
+# the walker would rewrite an inner `let x = ...; x.op()` against
+# an outer `with Eff as x` even though the inner `x` shadows.
+#[doc("b #17: walk a statement list with shadow-aware alias map. Each SLet / SVar binds its name(s) for the rest of the block, so subsequent statements (and the trailing expression…")]
+pub type StmtsRewrite = { stmts: [Stmt], m: AliasMap }
+
+#[doc("Let-alias rewriter over stmts scoped.")]
+pub fn rewrite_alias_stmts_scoped(ss: [Stmt], m: AliasMap, acc: [Stmt]) : StmtsRewrite {
+  match ss {
+    [] -> StmtsRewrite { stmts: list_reverse(acc), m: m }
+    [s, ...rest] -> match s {
+      SLet(pat, ann, rhs) -> {
+        let s1 = SLet(pat, ann, rewrite_alias_expr(rhs, m))
+        let m1 = alias_map_remove_all(m, pat_bindings(pat, []))
+        rewrite_alias_stmts_scoped(rest, m1, [s1, ...acc])
+      }
+      SVar(n, ty, rhs, l, c) -> {
+        let s1 = SVar(n, ty, rewrite_alias_expr(rhs, m), l, c)
+        let m1 = alias_map_remove(m, n)
+        rewrite_alias_stmts_scoped(rest, m1, [s1, ...acc])
+      }
+      _ -> rewrite_alias_stmts_scoped(rest, m, [rewrite_alias_stmt(s, m), ...acc])
+    }
+  }
+}
+
+#[doc("Let-alias rewriter over stmt.")]
+pub fn rewrite_alias_stmt(s: Stmt, m: AliasMap) : Stmt {
+  match s {
+    SLet(pat, ann, rhs) -> SLet(pat, ann, rewrite_alias_expr(rhs, m))
+    SAssert(c, msg) -> SAssert(rewrite_alias_expr(c, m), rewrite_alias_opt(msg, m))
+    SExprStmt(x) -> SExprStmt(rewrite_alias_expr(x, m))
+    SIndexAssign(b, i, v, l, c) ->
+      SIndexAssign(rewrite_alias_expr(b, m), rewrite_alias_expr(i, m),
+                   rewrite_alias_expr(v, m), l, c)
+    SVar(n, ty, rhs, l, c) -> SVar(n, ty, rewrite_alias_expr(rhs, m), l, c)
+    # m7e §25: SUse has no expr to rewrite. Pass through.
+    SUse(n, l, c) -> SUse(n, l, c)
+  }
+}
+
+#[doc("Let-alias rewriter over arms.")]
+pub fn rewrite_alias_arms(arms: [Arm], m: AliasMap) : [Arm] =
+  map(arms, (a) => rewrite_alias_arm(a, m))
+
+# m7b #17: pattern bindings shadow outer aliases inside the arm's
+# guard and body — same idea as the SLet shadow in stmts.
+
+# m7b #17: pattern bindings shadow outer aliases inside the arm's
+# guard and body — same idea as the SLet shadow in stmts.
+#[doc("b #17: pattern bindings shadow outer aliases inside the arm's guard and body — same idea as the SLet shadow in stmts.")]
+pub fn rewrite_alias_arm(a: Arm, m: AliasMap) : Arm {
+  match a {
+    Arm(p, g, b) -> {
+      let m1 = alias_map_remove_all(m, pat_bindings(p, []))
+      Arm(p, rewrite_alias_opt(g, m1), rewrite_alias_expr(b, m1))
+    }
+  }
+}
+
+#[doc("Let-alias rewriter over clauses.")]
+pub fn rewrite_alias_clauses(cs: [HClause], m: AliasMap) : [HClause] =
+  map(cs, (c) => rewrite_alias_clause(c, m))
+
+#[doc("Let-alias rewriter over clause.")]
+pub fn rewrite_alias_clause(c: HClause, m: AliasMap) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> {
+      # m7b #17: clause params (op args + the trailing `resume`)
+      # shadow outer aliases inside the clause body.
+      let names = map(ps, (pm) => pm.pname)
+      let m1 = alias_map_remove_all(m, names)
+      # Issue #148 (Option A): a clause body compiles to a separate
+      # C function, so any `kai_alias_<a>_id` declared in an outer
+      # `EHandle` prologue is out of scope here — same situation as
+      # a lambda body. Disable tag emission so cross-handler reads
+      # of an outer-bound capability fall back to the legacy
+      # name-keyed lookup. The bindings stay live so the
+      # `cap.op` → `Eff.op` substitution keeps working.
+      let m2 = alias_map_disable_tag(m1)
+      HC(n, ps, rewrite_alias_expr(b, m2), l, co)
+    }
+  }
+}
+
+#[doc("Let-alias rewriter over opt return.")]
+pub fn rewrite_alias_opt_return(opt: Option[HReturn], m: AliasMap) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(rewrite_alias_return(r, m))
+    None    -> None
+  }
+}
+
+#[doc("Let-alias rewriter over return.")]
+pub fn rewrite_alias_return(r: HReturn, m: AliasMap) : HReturn {
+  match r {
+    # m7b #17: the return clause's `p` binding shadows outer
+    # aliases inside its body (Doc C §m7b #11l: `state` / `log`
+    # magic bindings are introduced by the codegen, not the
+    # rewrite pass — only `p` is user-visible here).
+    HR(p, b, l, c) -> {
+      let m1 = alias_map_remove(m, p)
+      # Issue #148 (Option A): the return clause also compiles to a
+      # separate C function, so disable tag emission for the same
+      # cross-handler reason as `rewrite_alias_clause`.
+      let m2 = alias_map_disable_tag(m1)
+      HR(p, rewrite_alias_expr(b, m2), l, c)
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Shared structural map over ExprKind.
+#
+# Background (Full prerequisite 0.1, see `docs/stage2-design.md`):
+# every AST-walking pass used to hand-roll its own structural recursion
+# with a `_ -> k` catch-all over ExprKind. The wildcard audit in
+# `7bd5a68` showed the same pattern duplicated 10x. Adding a new
+# ExprKind variant (m7e variants[T](), refinement carriers, future
+# actor primitives) silently re-introduces the same `_ -> k` debt
+# at every site.
+#
+# `map_expr_kind` is the single point of structural recursion. Each
+# walker handles only the kinds it actually transforms (or that
+# require scope-aware bookkeeping); everything else falls through to
+# `map_expr_kind`, which recurses into sub-Exprs explicitly. Adding
+# a new ExprKind now breaks the compiler at one match site instead
+# of degrading ten walkers.
+#
+# Convention: `f` is a closure that captures the walker's context
+# and threads it through `<walker>_expr`. The closure is responsible
+# for further recursion (i.e., `map_expr_kind` is one-level: it
+# applies `f` to direct children, not to grandchildren).
+#
+# Sub-helpers (`map_stmt_exprs`, `map_arm_exprs`, etc.) replicate
+# the structure for the auxiliary AST nodes that contain Exprs.
+# A pass that needs scope-aware traversal (pattern shadowing in
+# arms, binding shadowing in stmt blocks) handles those nodes
+# explicitly in its own walker and never reaches the helpers below.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Shared structural map over ExprKind.
+#
+# Background (Full prerequisite 0.1, see `docs/stage2-design.md`):
+# every AST-walking pass used to hand-roll its own structural recursion
+# with a `_ -> k` catch-all over ExprKind. The wildcard audit in
+# `7bd5a68` showed the same pattern duplicated 10x. Adding a new
+# ExprKind variant (m7e variants[T](), refinement carriers, future
+# actor primitives) silently re-introduces the same `_ -> k` debt
+# at every site.
+#
+# `map_expr_kind` is the single point of structural recursion. Each
+# walker handles only the kinds it actually transforms (or that
+# require scope-aware bookkeeping); everything else falls through to
+# `map_expr_kind`, which recurses into sub-Exprs explicitly. Adding
+# a new ExprKind now breaks the compiler at one match site instead
+# of degrading ten walkers.
+#
+# Convention: `f` is a closure that captures the walker's context
+# and threads it through `<walker>_expr`. The closure is responsible
+# for further recursion (i.e., `map_expr_kind` is one-level: it
+# applies `f` to direct children, not to grandchildren).
+#
+# Sub-helpers (`map_stmt_exprs`, `map_arm_exprs`, etc.) replicate
+# the structure for the auxiliary AST nodes that contain Exprs.
+# A pass that needs scope-aware traversal (pattern shadowing in
+# arms, binding shadowing in stmt blocks) handles those nodes
+# explicitly in its own walker and never reaches the helpers below.
+# ---------------------------------------------------------------------------
+#[doc("--------------------------------------------------------------------------- Shared structural map over ExprKind. Background (Full prerequisite 0.1, see…")]
+pub fn map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
+  match k {
+    # Leaves: no sub-Expr to recurse into.
+    EInt(_)        -> k
+    EReal(_)       -> k
+    EBool(_)       -> k
+    EChar(_)       -> k
+    EStr(_, _)     -> k
+    EUnit          -> k
+    EVar(_)        -> k
+    EUnder         -> k
+    EPlaceholder   -> k
+    EHole(_)       -> k
+    ETodo(_)       -> k
+    # `EVariantsOf(TypeExpr, [String])` carries no sub-Expr (only a
+    # TypeExpr and a resolved-names list, neither of which the
+    # visitor traverses). Same shape as EHole/ETodo for the
+    # purposes of the structural recursion.
+    EVariantsOf(_, _) -> k
+    # m6.2 Phase 2.1: qualified module call carries no sub-Exprs
+    # (both fields are plain Strings), so `f` has nothing to apply.
+    EModCall(_, _) -> k
+    # Issue #556: intrinsic args ARE sub-Exprs, so the visitor recurs.
+    EIntrinsic(name, args_) -> EIntrinsic(name, map(args_, f))
+    # Composites: apply f to every direct sub-Expr.
+    ECall(callee, args_) -> ECall(f(callee), map(args_, f))
+    EField(base, name)   -> EField(f(base), name)
+    EIndex(a, b)         -> EIndex(f(a), f(b))
+    EBinop(op, a, b)     -> EBinop(op, f(a), f(b))
+    EUnop(op, x)         -> EUnop(op, f(x))
+    EIf(c, t_, eo)       -> EIf(f(c), f(t_), map_opt_expr(eo, f))
+    EMatch(scr, arms)    -> EMatch(f(scr), map(arms, (a) => map_arm_exprs(a, f)))
+    ELambda(ps, b)       -> ELambda(ps, f(b))
+    ERecordLit(name, fs) -> ERecordLit(name, map(fs, (fi) => map_field_exprs(fi, f)))
+    EList(els)           -> EList(map(els, (el) => map_elem_exprs(el, f)))
+    ERange(a, b, opt_step) -> ERange(f(a), f(b), map_opt_expr(opt_step, f))
+    EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => map_stmt_exprs(s, f)),
+                                    map_opt_expr(tail, f))
+    EPipe(a, b)          -> EPipe(f(a), f(b))
+    EMapPipe(a, b)       -> EMapPipe(f(a), f(b))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(f(a), f(b))
+    EFilterPipe(a, b)    -> EFilterPipe(f(a), f(b))
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(f(body), eff_name, eff_tyargs,
+              map_opt_expr(init_opt, f), alias_opt,
+              map(clauses, (c) => map_clause_exprs(c, f)),
+              map_opt_return_exprs(ret_opt, f))
+    ELitUnit(inner, u)   -> ELitUnit(f(inner), u)
+    EBang(inner)         -> EBang(f(inner))
+  }
+}
+
+#[doc("AST-functor map over opt expr.")]
+pub fn map_opt_expr(opt: Option[Expr], f: (Expr) -> Expr) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(f(e))
+    None    -> None
+  }
+}
+
+#[doc("AST-functor map over stmt exprs.")]
+pub fn map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
+  match s {
+    SLet(p, ann, rhs)           -> SLet(p, ann, f(rhs))
+    SAssert(c, m)               -> SAssert(f(c), map_opt_expr(m, f))
+    SExprStmt(x)                -> SExprStmt(f(x))
+    SIndexAssign(b, i, v, l, c) -> SIndexAssign(f(b), f(i), f(v), l, c)
+    SVar(n, ty, rhs, l, c)      -> SVar(n, ty, f(rhs), l, c)
+    # m7e §25: SUse has no sub-expression — pass through unchanged.
+    SUse(n, l, c)               -> SUse(n, l, c)
+  }
+}
+
+#[doc("AST-functor map over arm exprs.")]
+pub fn map_arm_exprs(a: Arm, f: (Expr) -> Expr) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, map_opt_expr(g, f), f(b))
+  }
+}
+
+#[doc("AST-functor map over field exprs.")]
+pub fn map_field_exprs(fi: FieldInit, f: (Expr) -> Expr) : FieldInit {
+  match fi {
+    FI(n, v) -> FI(n, f(v))
+  }
+}
+
+#[doc("AST-functor map over elem exprs.")]
+pub fn map_elem_exprs(el: ListElem, f: (Expr) -> Expr) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(f(x))
+    ElSpread(x) -> ElSpread(f(x))
+  }
+}
+
+#[doc("AST-functor map over clause exprs.")]
+pub fn map_clause_exprs(c: HClause, f: (Expr) -> Expr) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, f(b), l, co)
+  }
+}
+
+#[doc("AST-functor map over opt return exprs.")]
+pub fn map_opt_return_exprs(opt: Option[HReturn], f: (Expr) -> Expr) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(map_return_exprs(r, f))
+    None    -> None
+  }
+}
+
+#[doc("AST-functor map over return exprs.")]
+pub fn map_return_exprs(r: HReturn, f: (Expr) -> Expr) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, f(b), l, c)
+  }
+}
+
+#[doc("Let-alias rewriter over kind.")]
+pub fn rewrite_alias_kind(k: ExprKind, m: AliasMap, line: Int, col: Int) : ExprKind {
+  match k {
+    EField(base, fname) -> match base.kind {
+      EVar(name) -> match alias_map_lookup(m, name) {
+        Some(eff_name) -> {
+          # m7b #4: the `@cap` desugar always emits `cap.get`; for
+          # a Reader-bound capability the actual op is `ask`.
+          # Translate the field name here so a downstream
+          # `cap.get()` call becomes `Reader.ask()`.
+          let real_fname =
+            if eff_name == "Reader" and fname == "get" { "ask" } else { fname }
+          # m7b #15 (compiler integration, scope-limited): tag the
+          # field name with `@<alias>` so the codegen can dispatch
+          # via the handle's local `kai_alias_<a>_id` instead of a
+          # name-keyed lookup. This fixes the innermost-wins bug
+          # for the case where the op-call site is reachable from
+          # the handle prologue's lexical scope (no intervening
+          # closure). Inside a closure (`alias_map_may_tag = false`)
+          # the handle's local is out of scope, so we do not tag —
+          # the legacy name-keyed lookup runs and the closure-
+          # capture path keeps working. See m7b #15 sub-followup.
+          let tagged_fname =
+            if alias_map_may_tag(m) {
+              string_concat(real_fname, string_concat("@", name))
+            } else {
+              real_fname
+            }
+          EField(mk_expr(EVar(eff_name), base.line, base.col), tagged_fname)
+        }
+        None -> EField(rewrite_alias_expr(base, m), fname)
+      }
+      _ -> EField(rewrite_alias_expr(base, m), fname)
+    }
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+      let body_m = match alias_opt {
+        Some(a) -> alias_map_push(m, a, eff_name)
+        None    -> m
+      }
+      EHandle(rewrite_alias_expr(body, body_m), eff_name, eff_tyargs,
+              map_opt_expr(init_opt, (e) => rewrite_alias_expr(e, m)),
+              alias_opt,
+              rewrite_alias_clauses(clauses, m),
+              rewrite_alias_opt_return(ret_opt, m))
+    }
+    EBlock(stmts, tail) -> {
+      # m7b #17: track shadowing through the block. The trailing
+      # expression sees the alias map after every SLet / SVar in
+      # the block has had its name removed.
+      let r = rewrite_alias_stmts_scoped(stmts, m, [])
+      EBlock(r.stmts, map_opt_expr(tail, (e) => rewrite_alias_expr(e, r.m)))
+    }
+    ELambda(ps, b) -> {
+      # m7b #17: lambda params shadow outer aliases inside the body.
+      # The cross-lambda tagging (`@<alias>`) stays enabled now that
+      # the closure carries the enclosing handle's
+      # `kai_alias_<a>_id` as a capture (see fv_expr's tagged-op
+      # detection and the closure prologue in emit_lambda_body).
+      let names = map(ps, (pm) => pm.pname)
+      let m1 = alias_map_remove_all(m, names)
+      ELambda(ps, rewrite_alias_expr(b, m1))
+    }
+    EMatch(scr, arms) -> EMatch(rewrite_alias_expr(scr, m),
+                                 rewrite_alias_arms(arms, m))
+    # All remaining kinds (ECall, EIf, EBinop, EUnop, EPipe, EIndex,
+    # ERecordLit, EList, ERange, ELitUnit, EBang) recurse purely
+    # structurally with no scope or alias bookkeeping. The leaves
+    # (EInt, EReal, ..., EVar, EHole, ETodo) return unchanged. The
+    # shared visitor handles both — adding a new ExprKind variant
+    # breaks the compiler at `map_expr_kind`'s match instead of
+    # silently leaking through this walker.
+    _ -> map_expr_kind(k, (sub) => rewrite_alias_expr(sub, m))
+  }
+}
+
+# m7a #6c: pre-emit op-call desugar. Walk the AST and rewrite every
+# `EField(EVar(eff), op)` callee, where `eff` is a declared effect,
+# into `EVar("eff.op")`. emit_call_expr then dispatches it through
+# kai_evidence_lookup. All other expression shapes are traversed
+# verbatim — only call sites are touched.
+
+#[doc("FFI marshalling helper: extern symbol of.")]
+pub fn ffi_extern_symbol_of(body: Expr, default_name: String) : String {
+  match body.kind {
+    ETodo(msg) ->
+      if string_starts_with_q(msg, ffi_extern_tag_prefix()) {
+        string_slice(msg, string_length(ffi_extern_tag_prefix()),
+                     string_length(msg) - string_length(ffi_extern_tag_prefix()))
+      } else { default_name }
+    _ -> default_name
+  }
+}
+
+# Protocol-dispatch runtime shim (opción C).
+#
+# A dispatcher fn (`__proto_<op>`) whose body is the tag
+# `__kai_proto_dispatch__:<P>:<op>` signals codegen to emit a custom
+# C/LLVM body that looks up the impl in the runtime hashmap by
+# `(proto_id, head_tag)` and tail-calls it. The dispatcher fn shape
+# (params, return type) is unchanged so the typer / monomorphiser see
+# a regular polymorphic call.
+
+#[doc("Protocol-dispatch marker decoder: tag prefix.")]
+pub fn proto_dispatch_tag_prefix() : String = "__kai_proto_dispatch__:"
+
+#[doc("True if a function body is a single protocol-dispatch marker call.")]
+pub fn body_is_proto_dispatch(body: Expr) : Bool {
+  proto_dispatch_marker_in(body)
+}
+
+# The dispatcher's body starts as a bare `ETodo(marker)`, but Perceus'
+# exit-drop wrap can re-shape it into `EBlock([_drop kai_x...], Some(ETodo))`
+# before codegen sees it. Walk through the EBlock / EIf / EMatch shells
+# the lowering may wrap around the marker and look for the ETodo with
+# our prefix on the tail position.
+
+# The dispatcher's body starts as a bare `ETodo(marker)`, but Perceus'
+# exit-drop wrap can re-shape it into `EBlock([_drop kai_x...], Some(ETodo))`
+# before codegen sees it. Walk through the EBlock / EIf / EMatch shells
+# the lowering may wrap around the marker and look for the ETodo with
+# our prefix on the tail position.
+#[doc("The dispatcher's body starts as a bare `ETodo(marker)`, but Perceus' exit-drop wrap can re-shape it into `EBlock([_drop kai_x...], Some(ETodo))` before codegen sees it. Walk…")]
+pub fn proto_dispatch_marker_in(e: Expr) : Bool {
+  match e.kind {
+    ETodo(msg)             -> string_starts_with_q(msg, proto_dispatch_tag_prefix())
+    EBlock(_, Some(tail))  -> proto_dispatch_marker_in(tail)
+    _                      -> false
+  }
+}
+
+#[doc("Decoded protocol-dispatch marker parts (proto name, qualifier).")]
+pub type ProtoDispatchParts = PDP(String, String)
+
+# Build the dispatcher body marker: `__kai_proto_dispatch__:<P>:<op>`.
+
+# Parse the marker back into (P, op). Caller must have established
+# `body_is_proto_dispatch` first. Walks through Perceus' exit-drop
+# wrap (EBlock-with-tail) to reach the underlying ETodo marker.
+#[doc("Parse the marker back into (P, op). Caller must have established `body_is_proto_dispatch` first. Walks through Perceus' exit-drop wrap (EBlock-with-tail) to reach the…")]
+pub fn proto_dispatch_parts(body: Expr) : ProtoDispatchParts {
+  match body.kind {
+    ETodo(msg) -> {
+      let payload = string_slice(msg, string_length(proto_dispatch_tag_prefix()),
+                                  string_length(msg) - string_length(proto_dispatch_tag_prefix()))
+      let idx = find_colon(payload, 0)
+      let pname = string_slice(payload, 0, idx)
+      let opname = string_slice(payload, idx + 1, string_length(payload) - (idx + 1))
+      PDP(pname, opname)
+    }
+    EBlock(_, Some(tail)) -> proto_dispatch_parts(tail)
+    _                     -> PDP("?", "?")
+  }
+}
+
+# Find the first ':' starting at `from`. Returns string length if not
+# found. The dispatcher marker always contains exactly one ':' so this
+# helper is sufficient (no escaping concerns).
+
+# Find the first ':' starting at `from`. Returns string length if not
+# found. The dispatcher marker always contains exactly one ':' so this
+# helper is sufficient (no escaping concerns).
+#[doc("Find the first ':' starting at `from`. Returns string length if not found. The dispatcher marker always contains exactly one ':' so this helper is sufficient (no escaping…")]
+pub fn find_colon(s: String, from: Int) : Int {
+  let n = string_length(s)
+  if from >= n { n }
+  else {
+    match char_at(s, from) {
+      Some(c) -> if c == ':' { from } else { find_colon(s, from + 1) }
+      None    -> n
+    }
+  }
+}
+
+# Render a Ty back as kaikai surface syntax. Inverse of resolve_ty
+# modulo unknown-constructor handling.
+#[doc("Render a Ty back as kaikai surface syntax. Inverse of resolve_ty modulo unknown-constructor handling.")]
+pub fn ty_string_list(ts: [Ty]) : [String] = map(ts, ty_to_string)
+
+#[doc("Render a Ty to its display string (shared by the emitters and the dump queries).")]
+pub fn ty_to_string(t: Ty) : String {
+  match t {
+    TyInt    -> "Int"
+    TyReal   -> "Real"
+    TyBool   -> "Bool"
+    TyString -> "String"
+    TyChar   -> "Char"
+    TyUnit   -> "Unit"
+    TyByte     -> "Byte"
+    TyListT(inner) -> cat3("[", ty_to_string(inner), "]")
+    # m7b #11k: render the function type's effect row alongside the
+    # arrow when non-empty, with each label printed as `Eff` or
+    # `Eff[T1, T2]` so parametric-effect mismatches (Reader[Int] vs
+    # Reader[String]) are visible in `expected/found` notes.
+    TyFnT(ps, ret, row) -> concat_all([
+      "(", join_with(ty_string_list(ps), ", "), ") -> ",
+      ty_to_string(ret),
+      row_to_string_suffix(row)
+    ])
+    TyCon(_, cname, tas) -> {
+      match tas {
+        [] -> cname
+        _ -> concat_all([cname, "[", join_with(ty_string_list(tas), ", "), "]"])
+      }
+    }
+    TyVarT(n) -> cat2("?t", int_to_string(n))
+    TyAny -> "?"
+    # m12.5: render dimensioned base types as `Real<u>` / `Int<u>`.
+    # The unit goes through unit_canon so the printed form matches
+    # what the unifier compares against — same shape on every side.
+    TyDimT(base, u) -> concat_all([ty_to_string(base), "<", unit_canon_display(u), ">"])
+    # m12.6.x #1: render `T where ...` for diagnostics. The predicate
+    # is left as `<pred>` to keep the line short; full predicate text
+    # lands with the diagnostics-quality pass (m12.6.x #8).
+    TyRefineT(base, _) -> concat_all([ty_to_string(base), " where <pred>"])
+    # issue #187 phase 1: render unions inline as `A | B | C` to match
+    # surface syntax. Components are already in canonical order when
+    # the walker receives them via `normalize_union`.
+    TyUnion(parts) -> join_with(map(parts, ty_to_string), " | ")
+  }
+}
+
+# m12.5: render a UnitExprT in canonical form for diagnostics. Sorts
+# symbols alphabetically and groups powers, so `kg * m` and `m * kg`
+# render identically.
+
+# m12.5: render a UnitExprT in canonical form for diagnostics. Sorts
+# symbols alphabetically and groups powers, so `kg * m` and `m * kg`
+# render identically.
+#[doc("render a UnitExprT in canonical form for diagnostics. Sorts symbols alphabetically and groups powers, so `kg * m` and `m * kg` render identically.")]
+pub fn unit_canon_display(u: UnitExprT) : String = es_unit_expr_display(unit_canon(u))
+
+# m12.8.x phase 2 (Gap 1, partial): extract the canonical unit symbol
+# of a dimensioned type for the `unit_name` compile-time intrinsic.
+# Bare types and unresolved unit-vars yield the empty string so the
+# emitter never produces an LLVM/C error from a missing dimension.
+
+# m12.8.x phase 2 (Gap 1, partial): extract the canonical unit symbol
+# of a dimensioned type for the `unit_name` compile-time intrinsic.
+# Bare types and unresolved unit-vars yield the empty string so the
+# emitter never produces an LLVM/C error from a missing dimension.
+#[doc("x phase 2 (Gap 1, partial): extract the canonical unit symbol of a dimensioned type for the `unit_name` compile-time intrinsic. Bare types and unresolved unit-vars yield the…")]
+pub fn unit_name_of_ty(ot: Option[Ty]) : String {
+  match ot {
+    Some(t) -> match t {
+      TyDimT(_, u) -> match unit_canon(u) {
+        UVar(_) -> ""
+        UOne    -> ""
+        cu      -> es_unit_expr_display(cu)
+      }
+      _ -> ""
+    }
+    None -> ""
+  }
+}
+
+# m4c #2 — name-mangling helpers for monomorphisation.
+#
+# `mangle_name(name, [Ty]) : String` produces a deterministic,
+# C-identifier-safe name for a polymorphic decl instantiated at a
+# concrete type tuple. The empty tuple maps back to `name` (no
+# instantiation, e.g. fully monomorphic decls). For non-empty tuples
+# the form is `name__mono__T1[__T2...]`, with each `Tn` rendered by
+# `mangle_ty` using bracketed sentinels (`L_..._E` for lists,
+# `_O_..._C` for type-constructor argument lists, `F_..._R_..._E`
+# for function arrows). The sentinels make the encoding unambiguous:
+# `Foo[Bar]` and a hypothetical user fn named `Foo_Bar` cannot
+# collide. Effects are erased — two instantiations that differ only
+# in the row of an inner `TyFnT` mangle the same, by design (Perceus
+# operates on values, not on rows).
+#
+# The mangler errors implicitly on `TyVarT` / `TyAny`: a resolved
+# call-site tuple should not contain unresolved variables. If one
+# slips through the renderer emits `TVAR` / `Any` and the resulting
+# duplicate is caught by the m4c #3 collision check.
+
+# Render a Row as the ` / Eff1 + Eff2` suffix used in fn-type
+# strings. Empty row → empty string. Open row tail → trailing
+# `+ ?eN`. Each label uses `label_to_string` so type args render.
+#[doc("Render a Row as the ` / Eff1 + Eff2` suffix used in fn-type strings. Empty row → empty string. Open row tail → trailing `+ ?eN`. Each label uses `label_to_string` so type args…")]
+pub fn row_to_string_suffix(r: Row) : String {
+  # Issue #645: a row with no labels is treated as "pure" in display
+  # form, whether its tail is None (truly closed empty) or Some(_)
+  # (a free row var with no demand on it — the phantom that
+  # `fn_scheme_of_decl` inserts for REmpty signatures, or any fresh
+  # row var introduced by instantiation and never constrained). The
+  # tail variable is internal bookkeeping; showing `?eN` to users
+  # mis-suggests they need to annotate the function. Diagnostics for
+  # actual row mismatches still print the `expected` and `found`
+  # rows in full (those rows carry labels by the time the mismatch
+  # is reported).
+  let body =
+    if labels_empty(r.labels) {
+      ""
+    } else {
+      let lbs = join_with(map(r.labels, label_to_string), " + ")
+      let tail_s = match r.tail {
+        None -> ""
+        Some(v) -> {
+          let pre = if string_length(lbs) > 0 { " + " } else { "" }
+          concat_all([pre, "?e", int_to_string(v)])
+        }
+      }
+      concat_all([" / ", lbs, tail_s])
+    }
+  body
+}
+
+# Dump the declared signature (or shape) of every top-level decl. Used
+# by `--types`; does not attempt to infer bodies, just surfaces what
+# the user wrote.
+
+# ====================================================================
+# downward glue mirrors (es_ prefix) — originals in main head/driver
+
+#[doc("Construct a zero-position TyName TypeExpr (downward glue mirror, phase 1r).")]
+fn es_ty_name_zero(name: String) : TypeExpr =
+  TypeExpr { tkind: TyName(name, []), line: 0, col: 0 }
+
+#[doc("Project a row's labels to their bare effect names (downward glue mirror, phase 1r).")]
+fn es_row_label_names(labels: [RowLabel]) : [String] {
+  match labels {
+    [] -> []
+    [l, ...rest] -> match l {
+      RL(name, _) -> [name, ...es_row_label_names(rest)]
+    }
+  }
+}
+
+#[doc("Render a UnitExprT as user-readable text (downward glue mirror, phase 1r).")]
+fn es_unit_expr_display(u: UnitExprT) : String {
+  match u {
+    UOne -> "1"
+    USym(s) -> s
+    UMul(a, b) -> match b {
+      UInv(b_inner) -> match a {
+        UOne -> concat_all(["1/", es_unit_expr_display(b_inner)])
+        _    -> concat_all([es_unit_expr_display(a), "/", es_unit_expr_display(b_inner)])
+      }
+      UOne -> es_unit_expr_display(a)
+      _ -> match a {
+        UOne -> es_unit_expr_display(b)
+        UInv(a_inner) -> concat_all([es_unit_expr_display(b), "/", es_unit_expr_display(a_inner)])
+        _ -> concat_all([es_unit_expr_display(a), " ", es_unit_expr_display(b)])
+      }
+    }
+    UInv(a) -> concat_all(["1/", es_unit_expr_display(a)])
+    UPow(a, n) -> concat_all([es_unit_expr_display(a), "^", int_to_string(n)])
+    UVar(n) -> cat2("?u", int_to_string(n))
+  }
+}
+
+# Extract just the eff names from a row's labels — useful for the
+# many string-based passes in the resolver that don't need the type
+# args. Parametric effects are projected to their bare name (so
+# `Reader[Int]` and `Reader[String]` both yield `Reader`); callers
+# that need to distinguish instantiations work on the full label list.
