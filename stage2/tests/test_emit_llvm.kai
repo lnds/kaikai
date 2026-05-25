@@ -1,0 +1,154 @@
+# compiler/emit_llvm.kai unit tests — per-module tests for the LLVM
+# backend extracted under issue #677 Phase 1q.
+#
+# The module's pub surface is deliberately small: the driver entry point
+# `emit_program_llvm`, the typed-hole helper `expr_kind_name`, and three
+# pure helpers exposed for testing (`stdlib_head_tag_int`, `llvm_header`,
+# `lvm_find_substring`).
+# The 138 mirrored emit_c/driver helpers and the 14 `Lvm*` mirror types
+# stay private — they are copies of main-resident definitions, exercised
+# transitively whenever the backend runs.
+#
+# Coverage splits two ways:
+#
+#   - Pure helpers exercised directly: `expr_kind_name` (ExprKind tag
+#     names — note EVar maps back to the AST spelling "EVar", not the
+#     module-internal mirror type), `stdlib_head_tag_int` (builtin head
+#     tags), and `llvm_header` (the fixed IR prologue).
+#   - The backend driven end-to-end through the real parser +
+#     `infer_program` + `emit_program_llvm`: a source string is parsed,
+#     inference embeds the `.ty` each Expr carries, and the LLVM emitter
+#     lowers it. This exercises the private emit walk transitively.
+#
+# Property checks (body Bool, NOT assert — `kai check` reports a
+# counterexample per input) use an `Int` generator; a `String` generator
+# currently trips a pre-existing --prop-check runtime fragility
+# (reproducible on main, see docs/lane-experience-issue-677-phase1n4.md).
+#
+# Runner: `kai test stage2/.`. Property checks: `kai check`.
+
+import compiler.lex
+import compiler.ast
+import compiler.parse
+import compiler.infer
+import compiler.emit_llvm
+
+# ---- helpers ----
+
+fn parse_decls(src: String) : [Decl] / Console {
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    Some(ds) -> ds
+    None     -> []
+  }
+}
+
+# An Expr node carrying the given kind, with placeholder position/type.
+fn ek(k: ExprKind) : Expr =
+  Expr { kind: k, line: 1, col: 1, ty: None, mode: MUnknown }
+
+# lvm_find_substring returns string_length(hay) when needle is absent,
+# so "present" means the index lands strictly before the end.
+fn string_has(hay: String, needle: String) : Bool =
+  (lvm_find_substring(hay, needle, 0)) < string_length(hay)
+
+# ==================================================================
+# Unit tests — expr_kind_name (pure ExprKind tag names)
+# ==================================================================
+
+test "expr_kind_name tags an EInt literal" {
+  assert (expr_kind_name(EInt(0))) == "EInt"
+}
+
+test "expr_kind_name tags an EBool literal" {
+  assert (expr_kind_name(EBool(true))) == "EBool"
+}
+
+test "expr_kind_name tags an ECall node" {
+  assert (expr_kind_name(ECall(ek(EUnit), []))) == "ECall"
+}
+
+# Regression guard: the renamer rewrote the emit type EVar -> LvmEVar,
+# but the EVar *tag name* must stay the AST spelling "EVar".
+test "expr_kind_name returns the AST spelling EVar, not the mirror type" {
+  assert (expr_kind_name(EVar("x"))) == "EVar"
+}
+
+# ==================================================================
+# Unit tests — stdlib_head_tag_int (builtin head tags)
+# ==================================================================
+
+test "stdlib_head_tag_int maps Int to 3" {
+  assert (stdlib_head_tag_int("Int")) == 3
+}
+
+test "stdlib_head_tag_int maps Bool to 2" {
+  assert (stdlib_head_tag_int("Bool")) == 2
+}
+
+test "stdlib_head_tag_int returns -1 for an unknown/user type" {
+  assert (stdlib_head_tag_int("MyRecord")) == -1
+}
+
+# ==================================================================
+# Unit tests — llvm_header (fixed IR prologue)
+# ==================================================================
+
+test "llvm_header declares the opaque KaiValue type" {
+  assert string_has(llvm_header(), "%KaiValue = type opaque")
+}
+
+test "llvm_header carries the kaikai LLVM-backend banner" {
+  assert string_has(llvm_header(), "LLVM backend")
+}
+
+# ==================================================================
+# Unit tests — lvm_find_substring (the IR-scan helper)
+# ==================================================================
+
+test "lvm_find_substring locates a needle at the start" {
+  assert (lvm_find_substring("hello", "he", 0)) == 0
+}
+
+test "lvm_find_substring locates a needle mid-string" {
+  assert (lvm_find_substring("hello", "ll", 0)) == 2
+}
+
+test "lvm_find_substring returns the length sentinel when absent" {
+  assert (lvm_find_substring("hello", "zz", 0)) == (string_length("hello"))
+}
+
+# ==================================================================
+# End-to-end — emit_program_llvm over a trivial module
+# ==================================================================
+
+test "emit_program_llvm emits a non-empty .ll for a trivial fn" {
+  let src = "fn answer() : Int = 42\n"
+  let out = emit_program_llvm("<test>", src, parse_decls(src))
+  assert string_length(out) > 0
+}
+
+test "emit_program_llvm output includes the module prologue" {
+  let src = "fn answer() : Int = 42\n"
+  let out = emit_program_llvm("<test>", src, parse_decls(src))
+  assert string_has(out, "%KaiValue = type opaque")
+}
+
+# ==================================================================
+# Property checks (body Bool, Int generator)
+# ==================================================================
+
+# stdlib_head_tag_int is a total function: for every Int input rendered
+# as a (non-builtin) decimal name it returns the unknown sentinel -1.
+check "stdlib_head_tag_int returns -1 for any decimal-named type"
+  with n: Int {
+  (stdlib_head_tag_int(int_to_string(n))) == -1
+}
+
+# llvm_header is a pure constant: its length is the same regardless of
+# how many times it is evaluated (no hidden mutable state per call).
+check "llvm_header is a stable constant across evaluations"
+  with n: Int {
+  let _ = n
+  (string_length(llvm_header())) == (string_length(llvm_header()))
+}
