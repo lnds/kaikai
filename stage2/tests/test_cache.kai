@@ -1,0 +1,183 @@
+# compiler/cache.kai unit tests — per-module tests for the KAB2
+# prelude cache codec + AST serde extracted under issue #677 Phase 1k.
+#
+# The public surface is four symbols:
+#   - cache_serialize_module    : [Decl] + sha -> blob String
+#   - cache_deserialize_module  : blob -> Option[CacheDeserialized]
+#   - CacheDeserialized         : decoded decls + echoed sha
+#   - cache_roundtrip_self_test : in-memory smoke test
+#
+# The codec is a pure AST<->bytes function, so the strongest single
+# check is *structural round-trip*: serialise a [Decl], deserialise it,
+# re-serialise the restored decls, and assert the two blobs are
+# byte-identical. A codec bug on any covered node (a dropped slot, a
+# misordered field, a truncated list) breaks blob equality. This is the
+# same technique cache_roundtrip_self_test uses internally; here we
+# drive it per ExprKind / Decl shape so a regression names the node.
+#
+# The internal `cache_*_to_hex` / `cache_hex_to_*` walkers and the
+# Cache*Pos position types are not `pub`; they are covered transitively
+# through the two public entry points here and exhaustively during
+# every selfhost (the prelude cache rides this codec).
+#
+# Runner: `kai test stage2/.` for the `test` blocks;
+# `kai check stage2/tests/test_cache.kai` for the `check` blocks.
+
+import compiler.ast
+import compiler.cache
+
+# ---- helpers ----
+
+# A fixed well-formed 64-char dummy sha so the KAB2 header validates.
+fn dummy_sha() : String =
+  "0000000000000000000000000000000000000000000000000000000000000000"
+
+# Wrap an ExprKind in a minimal Expr at line 1.
+fn mk_expr(k: ExprKind) : Expr =
+  Expr { kind: k, line: 1, col: 1, ty: None, mode: MUnknown }
+
+# A `fn name() : Int = <body>` decl carrying the given body expression.
+fn mk_fn(name: String, body: Expr) : Decl =
+  DFn(true, name, [], [],
+      Some(TypeExpr { tkind: TyName("Int", []), line: 1, col: 1 }),
+      REmpty, body, 1, 1, None)
+
+# Serialise a [Decl] to its KAB2 blob under the dummy sha.
+fn blob_of(decls: [Decl]) : String =
+  cache.cache_serialize_module(decls, dummy_sha())
+
+# Round-trip a [Decl] through serialise -> deserialise -> re-serialise
+# and report whether the two blobs are byte-identical. False also
+# covers a deserialise miss (None), since that yields a "" blob that
+# cannot match the non-empty original.
+fn roundtrips(decls: [Decl]) : Bool =
+  match cache.cache_deserialize_module(blob_of(decls)) {
+    None -> false
+    Some(cds) -> match cds {
+      CDs(restored, _) -> blob_of(restored) == blob_of(decls)
+    }
+  }
+
+# The sha echoed back from a round-trip, or "" on a deserialise miss.
+fn echoed_sha(decls: [Decl]) : String =
+  match cache.cache_deserialize_module(blob_of(decls)) {
+    None -> ""
+    Some(cds) -> match cds { CDs(_, sha) -> sha }
+  }
+
+# Number of decls a round-trip restores (0 on a deserialise miss).
+fn restored_count(decls: [Decl]) : Int =
+  match cache.cache_deserialize_module(blob_of(decls)) {
+    None -> 0
+    Some(cds) -> match cds { CDs(restored, _) -> list_length(restored) }
+  }
+
+# Local non-negative modulo — test files own this helper rather than
+# reaching for a prelude binding. Mirrors test_fmt.kai / test_parse.kai.
+fn mod_nonneg(n: Int, m: Int) : Int {
+  let r = n - (n / m) * m
+  if r < 0 { r + m } else { r }
+}
+
+# ---- unit: round-trip per ExprKind body ----
+
+test "round-trips an EInt body" {
+  assert roundtrips([mk_fn("answer", mk_expr(EInt(42)))])
+}
+
+test "round-trips an EReal body" {
+  assert roundtrips([mk_fn("pi", mk_expr(EReal(3.14159)))])
+}
+
+test "round-trips an EBool body" {
+  assert roundtrips([mk_fn("flag", mk_expr(EBool(true)))])
+}
+
+test "round-trips an EChar body" {
+  assert roundtrips([mk_fn("ch", mk_expr(EChar('z')))])
+}
+
+test "round-trips an EStr body" {
+  assert roundtrips([mk_fn("greet", mk_expr(EStr("\"hi\"", false)))])
+}
+
+test "round-trips an EVar body" {
+  assert roundtrips([mk_fn("alias", mk_expr(EVar("x")))])
+}
+
+test "round-trips an ECall body" {
+  let g = mk_expr(EVar("g"))
+  let arg = mk_expr(EInt(7))
+  assert roundtrips([mk_fn("callg", mk_expr(ECall(g, [arg])))])
+}
+
+test "round-trips an EBinop body" {
+  let lhs = mk_expr(EInt(1))
+  let rhs = mk_expr(EInt(2))
+  assert roundtrips([mk_fn("sum", mk_expr(EBinop("+", lhs, rhs)))])
+}
+
+# ---- unit: round-trip per Decl shape ----
+
+test "round-trips a record DType" {
+  let fields = [FD(true, "x", TypeExpr { tkind: TyName("Int", []), line: 1, col: 1 }),
+                FD(true, "y", TypeExpr { tkind: TyName("Int", []), line: 1, col: 1 })]
+  assert roundtrips([DType(true, "Point", [], TBRecord(fields), 1, 1, None)])
+}
+
+test "round-trips a sum DType" {
+  let variants = [Var("Red", []), Var("Green", []), Var("Blue", [])]
+  assert roundtrips([DType(true, "Color", [], TBSum(variants), 1, 1, None)])
+}
+
+test "round-trips a DImport" {
+  assert roundtrips([DImport(IkPath("compiler.ast"), 1, 1)])
+}
+
+test "round-trips an empty module" {
+  assert roundtrips([])
+}
+
+test "round-trips a multi-decl module" {
+  let f1 = mk_fn("a", mk_expr(EInt(1)))
+  let f2 = mk_fn("b", mk_expr(EBool(false)))
+  let t = DType(true, "Unit2", [], TBSum([Var("U", [])]), 1, 1, None)
+  assert roundtrips([f1, f2, t])
+}
+
+# ---- unit: header / structural invariants ----
+
+test "deserialise echoes the source sha" {
+  assert echoed_sha([mk_fn("answer", mk_expr(EInt(42)))]) == dummy_sha()
+}
+
+test "deserialise restores the decl count" {
+  let f1 = mk_fn("a", mk_expr(EInt(1)))
+  let f2 = mk_fn("b", mk_expr(EInt(2)))
+  assert restored_count([f1, f2]) == 2
+}
+
+test "the in-memory self test reports OK" {
+  let r = cache.cache_roundtrip_self_test()
+  assert char_at(r, 0) == Some('O')
+}
+
+# ---- property: serialise then deserialise is identity ----
+
+# An EInt body round-trips for any literal value (modulo a bound so the
+# generator stays in a sane range).
+check "EInt body round-trips for any literal" with n: Int {
+  roundtrips([mk_fn("k", mk_expr(EInt(mod_nonneg(n, 1000000))))])
+}
+
+# An EBool body round-trips regardless of which boolean it carries.
+check "EBool body round-trips for either boolean" with b: Bool {
+  roundtrips([mk_fn("k", mk_expr(EBool(b)))])
+}
+
+# An EVar body round-trips and the deserialised module preserves the
+# decl count for a name built from the input.
+check "EVar body round-trips and preserves decl count" with n: Int {
+  let name = "v#{mod_nonneg(n, 1000)}"
+  roundtrips([mk_fn("f", mk_expr(EVar(name)))]) and restored_count([mk_fn("f", mk_expr(EVar(name)))]) == 1
+}
