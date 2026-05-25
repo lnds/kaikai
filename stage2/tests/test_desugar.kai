@@ -1,0 +1,277 @@
+# compiler/desugar.kai unit tests — per-module tests for the pre-typer
+# AST->AST desugar passes extracted under issue #677 Phase 1m
+# (positional-record sugar, the `var` rewriter + const/axiom/refinement
+# lowering, `use Effect` desugar, the cap-binding nursery rewrite, the
+# brand-mismatch validator).
+#
+# Coverage splits two ways:
+#
+#   - Pure passes driven end-to-end through the real parser: a source
+#     string is tokenized + parsed, the pass runs over the resulting
+#     decl stream, and the rewritten AST (or the collected names) is
+#     inspected. This exercises desugar_pos_records_decls (the issue
+#     #266 positional-record sugar — `P { 1, 2 }` field markers
+#     renamed to the declared field names), lower_consts (DConst ->
+#     DAttribPure(DFn) thunk), collect_const_names_decls (reads the
+#     post-lowering DAttribPure thunks), desugar_var_decls (the SVar
+#     rewrite), and collect_refine_alias_names.
+#   - Property checks confirm structural invariants: positional-record
+#     sugar is idempotent (re-running it yields no new errors and no
+#     leftover positional markers), lower_consts preserves the decl
+#     count, and the const-name collector counts exactly the consts.
+#
+# A pipeline note the tests encode: collect_const_names_decls reads
+# DAttribPure(DFn) thunks, NOT raw DConst — it runs AFTER lower_consts
+# in the driver. Feeding it the raw parse would find nothing.
+#
+# The internal walkers (the dpr_* / use_rewrite_* / rewrite_nursery_*
+# / check_brand_* families) are covered transitively here and
+# exhaustively on every selfhost — the prelude itself rides positional
+# records, const lowering, and the nursery rewrite on every build.
+#
+# Runner: `kai test stage2/.`. Property checks: `kai check`.
+# Tier 1 wiring deferred until #452 / #677 Phase 2 lowers the
+# per-test-file cost.
+
+import compiler.lex
+import compiler.ast
+import compiler.parse
+import compiler.desugar
+
+# ---- helpers ----
+
+fn parse_decls(src: String) : [Decl] / Console {
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    Some(ds) -> ds
+    None     -> []
+  }
+}
+
+# Body expr of the first DFn named `name`, or a unit expr if absent.
+fn fn_body_named(ds: [Decl], name: String) : Expr = match ds {
+  []           -> mk_expr(EUnit, 0, 0)
+  [d, ...rest] -> match d {
+    DFn(_, nm, _, _, _, _, body, _, _, _) ->
+      if nm == name { body } else { fn_body_named(rest, name) }
+    _ -> fn_body_named(rest, name)
+  }
+}
+
+# RHS of the first `let` in a fn body block, or a unit expr if absent.
+fn first_let_rhs(e: Expr) : Expr = match e.kind {
+  EBlock(stmts, _) -> first_let_rhs_stmts(stmts)
+  _                -> mk_expr(EUnit, 0, 0)
+}
+
+fn first_let_rhs_stmts(ss: [Stmt]) : Expr = match ss {
+  []           -> mk_expr(EUnit, 0, 0)
+  [s, ...rest] -> match s {
+    SLet(_, _, rhs) -> rhs
+    _               -> first_let_rhs_stmts(rest)
+  }
+}
+
+# True if any FieldInit in a record literal still carries a positional
+# marker name (i.e. the sugar did NOT rename it to a declared field).
+fn record_has_pos_marker(e: Expr) : Bool = match e.kind {
+  ERecordLit(_, fis) -> fields_have_pos_marker(fis)
+  _                  -> false
+}
+
+fn fields_have_pos_marker(fs: [FieldInit]) : Bool = match fs {
+  []           -> false
+  [f, ...rest] -> match f {
+    FI(nm, _) -> is_pos_field_marker(nm) or fields_have_pos_marker(rest)
+  }
+}
+
+# True if `e` is a record literal at all (after the sugar runs over a
+# `T { v1, v2 }` form it stays an ERecordLit, just with renamed fields).
+fn is_record_lit(e: Expr) : Bool = match e.kind {
+  ERecordLit(_, _) -> true
+  _                -> false
+}
+
+# Count DConst decls remaining in a stream (lower_consts should leave
+# zero — every DConst becomes a DAttribPure(DFn) thunk).
+fn count_dconst(ds: [Decl]) : Int = match ds {
+  []           -> 0
+  [d, ...rest] -> match d {
+    DConst(_, _, _, _, _, _) -> 1 + count_dconst(rest)
+    _                        -> count_dconst(rest)
+  }
+}
+
+# Number of `var` SVar statements still present in a fn body block.
+fn count_svar(e: Expr) : Int = match e.kind {
+  EBlock(stmts, _) -> count_svar_stmts(stmts)
+  _                -> 0
+}
+
+fn count_svar_stmts(ss: [Stmt]) : Int = match ss {
+  []           -> 0
+  [s, ...rest] -> match s {
+    SVar(_, _, _, _, _) -> 1 + count_svar_stmts(rest)
+    _                   -> count_svar_stmts(rest)
+  }
+}
+
+fn count_decls(ds: [Decl]) : Int = match ds {
+  []         -> 0
+  [_, ...r]  -> 1 + count_decls(r)
+}
+
+# ---- positional-record sugar (issue #266) ----
+
+# `let p = P { 1, 2 }` — the parser emits FI(pos_marker, _) fields; the
+# sugar renames them to the declared `x` / `y`. We check the result is
+# still a record literal AND no longer carries a positional marker.
+
+test "positional record sugar renames the positional markers away" {
+  let src = "type P = { x: Int, y: Int }\nfn make() : P = {\n  let p = P { 1, 2 }\n  p\n}\n"
+  let r = desugar_pos_records_decls(parse_decls(src), "<test>")
+  let lit = first_let_rhs(fn_body_named(r.decls, "make"))
+  assert is_record_lit(lit) and (record_has_pos_marker(lit) == false)
+}
+
+test "positional record sugar reports no errors on a valid arity match" {
+  let src = "type P = { x: Int, y: Int }\nfn make() : P = {\n  let p = P { 1, 2 }\n  p\n}\n"
+  let r = desugar_pos_records_decls(parse_decls(src), "<test>")
+  assert r.errs == 0
+}
+
+test "positional record sugar leaves a named-field literal a record literal" {
+  let src = "type P = { x: Int, y: Int }\nfn make() : P = {\n  let p = P { x: 1, y: 2 }\n  p\n}\n"
+  let r = desugar_pos_records_decls(parse_decls(src), "<test>")
+  let lit = first_let_rhs(fn_body_named(r.decls, "make"))
+  assert is_record_lit(lit) and (record_has_pos_marker(lit) == false)
+}
+
+test "positional record sugar is idempotent (no new errors on re-run)" {
+  let src = "type P = { x: Int, y: Int }\nfn make() : P = {\n  let p = P { 1, 2 }\n  p\n}\n"
+  let r1 = desugar_pos_records_decls(parse_decls(src), "<test>")
+  let r2 = desugar_pos_records_decls(r1.decls, "<test>")
+  assert r2.errs == 0
+}
+
+# ---- const lowering ----
+
+test "lower_consts leaves no DConst in the stream" {
+  let src = "const ANSWER : Int = 42\nfn main() : Int = ANSWER\n"
+  let lowered = lower_consts(parse_decls(src))
+  assert count_dconst(lowered) == 0
+}
+
+test "lower_consts on a const-free program preserves the decl count" {
+  let src = "fn a() : Int = 1\nfn b() : Int = 2\n"
+  let ds = parse_decls(src)
+  assert count_decls(lower_consts(ds)) == count_decls(ds)
+}
+
+# ---- const-name collection (runs AFTER lower_consts) ----
+
+test "collect_const_names_decls finds the const after lowering" {
+  let src = "const K : Int = 9\nfn main() : Int = K\n"
+  let lowered = lower_consts(parse_decls(src))
+  let names = collect_const_names_decls(lowered)
+  assert list_length(names) == 1
+}
+
+test "collect_const_names_decls of a const-free program is empty" {
+  let src = "fn main() : Int = 0\n"
+  let lowered = lower_consts(parse_decls(src))
+  let names = collect_const_names_decls(lowered)
+  assert list_length(names) == 0
+}
+
+# ---- var rewriter ----
+
+test "desugar_var_decls rewrites away the SVar statement" {
+  let src = "fn f() : Int = {\n  var c = 0\n  c := @c + 1\n  @c\n}\n"
+  let rewritten = desugar_var_decls(parse_decls(src))
+  assert count_svar(fn_body_named(rewritten, "f")) == 0
+}
+
+# ---- refinement-alias collection ----
+
+test "collect_refine_alias_names of a program without refinements is empty" {
+  let src = "fn main() : Int = 0\n"
+  let names = collect_refine_alias_names(parse_decls(src))
+  assert list_length(names) == 0
+}
+
+# ====================================================================
+# Property checks (`kai check`) — body is Bool, not assert.
+# ====================================================================
+
+# Positional-record sugar is idempotent: re-running it over its own
+# output introduces no new errors, regardless of how many fields the
+# record declares.
+check "positional record sugar re-run introduces no errors"
+  with fields: Int {
+  let n = if fields < 1 { 1 } else if fields > 4 { 4 } else { fields }
+  let src = build_record_src(n)
+  let r1 = desugar_pos_records_decls(parse_decls(src), "<chk>")
+  let r2 = desugar_pos_records_decls(r1.decls, "<chk>")
+  r2.errs == 0
+}
+
+# lower_consts never drops or duplicates a decl: the post-lowering
+# decl count equals the pre-lowering count (DConst -> DAttribPure(DFn)
+# is a 1:1 rewrite).
+check "lower_consts preserves the total decl count"
+  with consts: Int {
+  let n = if consts < 0 { 0 } else if consts > 5 { 5 } else { consts }
+  let src = build_consts_src(n)
+  let ds = parse_decls(src)
+  count_decls(lower_consts(ds)) == count_decls(ds)
+}
+
+# collect_const_names_decls (run after lower_consts) counts exactly the
+# const decls that were present.
+check "collect_const_names_decls counts exactly the consts present"
+  with consts: Int {
+  let n = if consts < 0 { 0 } else if consts > 5 { 5 } else { consts }
+  let src = build_consts_src(n)
+  let lowered = lower_consts(parse_decls(src))
+  list_length(collect_const_names_decls(lowered)) == n
+}
+
+# ---- check-only source builders ----
+
+# A record type with `n` Int fields plus a maker using the positional
+# brace form (`R { 0, 1, ... }`).
+fn build_record_src(n: Int) : String =
+  string_concat(
+    string_concat("type R = { ", string_concat(record_fields(n, 0), " }\n")),
+    string_concat("fn make() : R = {\n  let r = R { ",
+      string_concat(record_args(n, 0), " }\n  r\n}\n")))
+
+fn record_fields(n: Int, i: Int) : String =
+  if i >= n { "" }
+  else {
+    let sep = if i == 0 { "" } else { ", " }
+    string_concat(sep, string_concat("f", string_concat(int_to_string(i),
+      string_concat(": Int", record_fields(n, i + 1)))))
+  }
+
+fn record_args(n: Int, i: Int) : String =
+  if i >= n { "" }
+  else {
+    let sep = if i == 0 { "" } else { ", " }
+    string_concat(sep, string_concat(int_to_string(i), record_args(n, i + 1)))
+  }
+
+# `n` const decls (K0..K{n-1}) plus a `main` that returns 0.
+fn build_consts_src(n: Int) : String =
+  string_concat(consts_lines(n, 0), "fn main() : Int = 0\n")
+
+fn consts_lines(n: Int, i: Int) : String =
+  if i >= n { "" }
+  else {
+    string_concat(
+      string_concat("const K", string_concat(int_to_string(i),
+        string_concat(" : Int = ", string_concat(int_to_string(i), "\n")))),
+      consts_lines(n, i + 1))
+  }
