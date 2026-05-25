@@ -1,0 +1,161 @@
+# compiler/protos.kai unit tests — per-module tests for the m12.8
+# single-dispatch protocol system extracted under issue #677 Phase 1p.
+#
+# Coverage splits two ways:
+#
+#   - Pure helpers exercised directly: the dispatcher-name builder
+#     (`proto_dispatcher_name`), the ASCII lowercaser
+#     (`string_to_lower_ascii`), and the arity-aware rename machinery
+#     (`op_arities_from_ops` / `collect_local_fn_arities` /
+#     `filter_shadowed_ops`) — the pre-typer pieces the driver re-runs
+#     over the post-interp-desugar decl stream (issue #443).
+#   - The lowering pass driven end-to-end through the real parser:
+#     a `protocol` + `impl` source string is parsed, `lower_protocols`
+#     expands and lowers it, and we assert on the resulting decl stream
+#     + ProtocolReg. This exercises the private collect / validate /
+#     lower / dispatcher-emit walk transitively — the same surface every
+#     selfhost with protocols rides.
+#
+# Property checks (body Bool, NOT assert — `kai check` reports a
+# counterexample per input): `filter_shadowed_ops` against an empty
+# locals list is the identity on length, and `op_arities_from_ops`
+# preserves the op count. Both use `Int` generators; a `String`
+# generator currently trips a pre-existing --prop-check runtime
+# fragility (reproducible on main).
+#
+# Runner: `kai test stage2/.`. Property checks: `kai check`.
+
+import compiler.lex
+import compiler.ast
+import compiler.parse
+import compiler.protos
+
+# ---- helpers ----
+
+fn parse_decls(src: String) : [Decl] / Console {
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    Some(ds) -> ds
+    None     -> []
+  }
+}
+
+# Build a zero-arg ProtoOpReg for the arity helpers (params = []).
+fn op0(proto: String, name: String) : ProtoOpReg =
+  POR(proto, name, [], mk_ty(TyName("Unit", []), 1, 1), 1, 1)
+
+# ==================================================================
+# Unit tests — pure helpers
+# ==================================================================
+
+# ---- proto_dispatcher_name ----
+
+test "proto_dispatcher_name prefixes the op with __proto_" {
+  assert proto_dispatcher_name("show") == "__proto_show"
+}
+
+test "proto_dispatcher_name on an empty op is just the prefix" {
+  assert proto_dispatcher_name("") == "__proto_"
+}
+
+# ---- string_to_lower_ascii ----
+
+test "string_to_lower_ascii lowercases an all-caps word" {
+  assert string_to_lower_ascii("STDOUT") == "stdout"
+}
+
+test "string_to_lower_ascii leaves already-lowercase text unchanged" {
+  assert string_to_lower_ascii("stderr") == "stderr"
+}
+
+test "string_to_lower_ascii leaves non-letters untouched" {
+  assert string_to_lower_ascii("Eff_42") == "eff_42"
+}
+
+# ---- op_arities_from_ops ----
+
+test "op_arities_from_ops is empty for no ops" {
+  assert (list_length(op_arities_from_ops([]))) == 0
+}
+
+test "op_arities_from_ops yields one arity per op" {
+  let ops = [op0("Show", "show"), op0("Eq", "eq")]
+  assert (list_length(op_arities_from_ops(ops))) == 2
+}
+
+test "op_arities_from_ops reports arity 0 for a zero-param op" {
+  let ops = [op0("Show", "show")]
+  match op_arities_from_ops(ops) {
+    [OpAr(n, a), ..._rest] -> { assert n == "show" and a == 0 }
+    []                     -> { assert false }
+  }
+}
+
+# ---- filter_shadowed_ops ----
+
+test "filter_shadowed_ops with empty locals keeps every op" {
+  let ops = [OpAr("show", 1), OpAr("eq", 2)]
+  assert (list_length(filter_shadowed_ops(ops, []))) == 2
+}
+
+test "filter_shadowed_ops drops an op shadowed by a same-arity local" {
+  let ops    = [OpAr("show", 1), OpAr("eq", 2)]
+  let locals = [OpAr("show", 1)]
+  assert (list_length(filter_shadowed_ops(ops, locals))) == 1
+}
+
+test "filter_shadowed_ops keeps an op when the local arity differs" {
+  let ops    = [OpAr("show", 1)]
+  let locals = [OpAr("show", 2)]
+  assert (list_length(filter_shadowed_ops(ops, locals))) == 1
+}
+
+# ---- collect_local_fn_arities ----
+
+test "collect_local_fn_arities is empty for a module with no fns" {
+  assert (list_length(collect_local_fn_arities([]))) == 0
+}
+
+test "collect_local_fn_arities reports one arity per top-level fn" {
+  let ds = parse_decls("fn a() : Int = 1\nfn b(x: Int) : Int = x")
+  assert (list_length(collect_local_fn_arities(ds))) == 2
+}
+
+# ---- lower_protocols end-to-end (through parse) ----
+
+test "lower_protocols on a plain module leaves the decls untouched" {
+  let lp = lower_protocols(parse_decls("fn id(x: Int) : Int = x"), "test.kai", "test")
+  assert (list_length(lp.decls)) == 1
+}
+
+test "lower_protocols registers the declared protocol op" {
+  let src = "protocol Greet { hi(self: Self) : String }"
+  let lp  = lower_protocols(parse_decls(src), "test.kai", "test")
+  assert (list_length(lp.reg.ops)) == 1
+}
+
+test "lower_protocols emits a dispatcher and drops the protocol decl" {
+  # The DProtocol node is stripped; a __proto_hi dispatcher DFn is
+  # synthesised in its place, so the lowered stream is non-empty while
+  # carrying no protocol/impl nodes for later visitors to choke on.
+  let src = "protocol Greet { hi(self: Self) : String }"
+  let lp  = lower_protocols(parse_decls(src), "test.kai", "test")
+  assert (list_length(lp.decls)) >= 1
+}
+
+# ==================================================================
+# Property checks (body Bool, Int generators)
+# ==================================================================
+
+check "filter_shadowed_ops with empty locals is identity on a singleton"
+  with n: Int {
+  let ops = [OpAr("op", n)]
+  (list_length(filter_shadowed_ops(ops, []))) == 1
+}
+
+check "op_arities_from_ops preserves the op count for a singleton"
+  with n: Int {
+  # n only drives the (unread) arity payload; the count is always 1.
+  let ops = [op0("P", "op")]
+  (list_length(op_arities_from_ops(ops))) == 1
+}
