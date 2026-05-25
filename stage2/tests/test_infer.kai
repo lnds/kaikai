@@ -1,0 +1,143 @@
+# compiler/infer.kai unit tests — per-module tests for the HM typer +
+# bidirectional inference + diagnostic dumps extracted under issue #677
+# Phase 1n1 (the largest single vertical-pipeline extraction).
+#
+# Coverage splits two ways:
+#
+#   - Pure helpers exercised directly: the unit-of-measure canonicaliser
+#     (`unit_canon`), the union normaliser (`normalize_union`), the
+#     effect-label emptiness check (`labels_empty`), the dotted-name
+#     splitters (`dotted_prefix` / `dotted_suffix` / `string_contains_dot`),
+#     the int-membership helper (`list_has_int`), the JSON string escaper
+#     (`json_str`), and the empty typing environment (`ty_env_empty`).
+#   - The HM engine driven end-to-end through the real parser +
+#     `infer_program`: a source string is tokenized + parsed, inference
+#     runs over the decl stream, and the resulting TypedProgram is
+#     inspected for error count and hole count. This exercises the
+#     private engine (`synth` / `unify` / `apply_ty` / `instantiate` /
+#     `ty_to_string`) transitively — the same surface the prelude rides
+#     on every selfhost.
+#
+# Property checks (body Bool, NOT assert — `kai check` reports a
+# counterexample per input): `unit_canon` is idempotent, and
+# `normalize_union` is order-insensitive on a two-element union.
+#
+# Runner: `kai test stage2/.`. Property checks: `kai check`.
+
+import compiler.lex
+import compiler.ast
+import compiler.parse
+import compiler.infer
+
+# ---- helpers ----
+
+fn parse_decls(src: String) : [Decl] / Console {
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    Some(ds) -> ds
+    None     -> []
+  }
+}
+
+fn infer_errs(src: String) : Int / Console + File {
+  let tp = infer_program("test.kai", parse_decls(src), false)
+  tp.errs
+}
+
+fn infer_holes(src: String) : Int / Console + File {
+  let tp = infer_program("test.kai", parse_decls(src), false)
+  list_length(tp.holes)
+}
+
+# A small canonical unit: USD.
+fn usd() : UnitExprT = USym("USD")
+
+# ==================================================================
+# Unit tests
+# ==================================================================
+
+test "ty_env_empty has no entries and zero fresh counter" {
+  let e = ty_env_empty()
+  assert list_length(e.entries) == 0
+  assert e.fresh == 0
+}
+
+test "unit_canon folds u * u^-1 to the dimensionless unit" {
+  let c = unit_canon(UMul(usd(), UInv(usd())))
+  assert c == UOne
+}
+
+test "unit_canon leaves a single atomic unit alone" {
+  assert (unit_canon(usd())) == USym("USD")
+}
+
+test "unit_canon collapses u * u to u^2" {
+  assert (unit_canon(UMul(usd(), usd()))) == UPow(USym("USD"), 2)
+}
+
+test "normalize_union of a single type returns that type" {
+  assert (normalize_union([TyInt])) == TyInt
+}
+
+test "labels_empty is true on the empty label list" {
+  assert labels_empty([])
+}
+
+test "labels_empty is false when a label is present" {
+  let l = Label { eff: "Console", ty_args: [] }
+  assert (labels_empty([l])) == false
+}
+
+test "string_contains_dot detects a qualifier dot" {
+  assert string_contains_dot("List.map")
+  assert (string_contains_dot("map")) == false
+}
+
+test "dotted_prefix returns the module qualifier" {
+  assert (dotted_prefix("List.map")) == "List"
+}
+
+test "dotted_suffix returns the bare name" {
+  assert (dotted_suffix("List.map")) == "map"
+}
+
+test "list_has_int finds a present element and rejects an absent one" {
+  assert list_has_int([1, 2, 3], 2)
+  assert (list_has_int([1, 2, 3], 9)) == false
+}
+
+test "json_str wraps a plain string in quotes" {
+  assert (json_str("ok")) == "\"ok\""
+}
+
+# ---- HM engine end-to-end (through the real parser + infer_program) ----
+
+test "infer_program typechecks a well-typed identity fn with zero errors" {
+  assert (infer_errs("fn id(x: Int) : Int = x")) == 0
+}
+
+test "infer_program reports an error on an int/bool mismatch" {
+  assert (infer_errs("fn bad() : Int = true")) > 0
+}
+
+test "infer_program counts a typed hole" {
+  assert (infer_holes("fn f(x: Int) : Int = ?hole")) == 1
+}
+
+# ==================================================================
+# Property checks (body Bool — `kai check` reports a counterexample)
+# ==================================================================
+
+check "unit_canon is idempotent on a product of atomic units"
+  with sym: String {
+  let u = UMul(USym(sym), USym(sym))
+  let once = unit_canon(u)
+  (unit_canon(once)) == once
+}
+
+check "normalize_union is order-insensitive on a two-type union"
+  with a: Int, b: Int {
+  let ta = TyCon(None, int_to_string(a), [])
+  let tb = TyCon(None, int_to_string(b), [])
+  (normalize_union([ta, tb])) == (normalize_union([tb, ta]))
+}
