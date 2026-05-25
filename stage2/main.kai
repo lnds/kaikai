@@ -34,6 +34,7 @@ import compiler.cache
 import compiler.modules
 import compiler.desugar
 import compiler.infer
+import compiler.fnreg
 
 # ====================================================================
 # token dump (for --tokens)
@@ -792,42 +793,6 @@ fn join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 # falling back to a local. Stage 1 does the same; both tables are
 # lists of sum-variant pairs.
 
-# m6.2 v2: EFn now carries the decl's module of origin. None for
-# decls authored in the root file; Some(m) for decls imported from
-# module `m` (or pulled in via --prelude, see expand_imports +
-# load_prelude). Codegen reads the field to mint `kai_<m>__<name>`
-# vs `kai_<name>`, and to disambiguate two-modules-export-same-name
-# at bare-name call sites.
-#
-# Phase 3 unboxing (issue #383): the fourth slot is the unboxed-
-# signature classification. `None` means the classical
-# `static KaiValue *kai_<name>(KaiValue *...)` calling convention.
-# `Some(US([Ty], Ty))` means the fn was classified by `unbox_classify`
-# as taking + returning raw C scalars (`int64_t` / `double` /
-# `int` / `uint32_t`); the emitter mints a raw signature, EVar reads
-# of the fn's parameters resolve to `kair_<name>`, and call sites
-# emit raw arguments via `emit_expr_raw`. The classifier requires
-# every param ty + return ty to be in {Int, Bool, Char, Real}
-# (concretely; not parametric T), no FFI shim, no protocol-impl
-# child, no effect row, no closure parameters. See
-# `unbox_classify_decl`.
-type UFnSig = US([Ty], Ty)
-type EFn  = EFn(String, Int, Option[String], Option[UFnSig])
-# Issue #440 Phase 2 — payload type list per variant. Carries the
-# parsed `[TypeExpr]` of the constructor's args so the emitter can
-# decide which slots to inline-unbox (Int / Real). Empty list means
-# nullary or unknown — both paths emit the legacy boxed shape.
-#
-# Atom-style global variant tag (issue #688, docs/variant-tags.md):
-# the last slot carries the variant_tag emitted into every
-# kai_variant / kai_variant_u call. Tags 0..10 are reserved for
-# builtins per the convention; user variants start at
-# `user_variant_tag_base() == 11` and increment in declaration order.
-# Today the matcher still routes through strcmp on the variant name,
-# so an out-of-convention tag degrades the runtime nullary/immortal
-# cache hit-rate but does not affect correctness; a follow-up lane
-# flips consumers to `variant_tag == N` once stage 0 / 1 / 2 and the
-# runtime agree on the table.
 type EVar = EV(String, Int, [TypeExpr], Int)
 
 fn efn_find(fns: [EFn], target: String) : Option[EFn] {
@@ -839,45 +804,6 @@ fn efn_find(fns: [EFn], target: String) : Option[EFn] {
   }
 }
 
-# m6.2 v2: bare-name lookup with the disambiguation rule. Returns:
-#   - the unique entry, when there is exactly one;
-#   - the root-file entry (module_origin = None) when present, even
-#     if other modules also export the same name (locals-shadow rule
-#     applied at top-level scope);
-#   - None when zero matches OR when there are multiple module-origin
-#     matches and no root-file entry (ambiguity — the codegen
-#     emit_named_call_lookup falls back to a closure thunk lookup
-#     against `kai_<name>` plain, which lets the linker fail with a
-#     clear undefined-symbol error in the rare unhandled case; the
-#     proper diagnostic ("ambiguous reference to ...") fires from
-#     check_efn_ambiguity at decl-registration time).
-fn efn_resolve(fns: [EFn], target: String) : Option[EFn] {
-  let candidates = efn_collect_matching(fns, target, [])
-  match candidates {
-    []     -> None
-    [one]  -> Some(one)
-    [first, ..._rest] -> match efn_pick_root(candidates) {
-                Some(r) -> Some(r)
-                # Same-module preference: when several modules export
-                # the same name AND no root-file shadow exists, fall
-                # back to the FIRST match. Callers that emit a DFn
-                # body (`emit_fn_body`, `llvm_emit_fn_body`) reorder
-                # the `fns` table with `fns_prefer_module(fns, mo)`
-                # before recursing so the same-module entry wins
-                # over imported modules. This is what unblocks
-                # `stdlib/loop.repeat` recursing on its own name when
-                # `stdlib/core/list.repeat` is also in scope.
-                None    -> Some(first)
-              }
-  }
-}
-
-# m6.2 v2 + same-module preference: project the EFn table so entries
-# whose `module_origin` equals `mo` come first. Stable on the rest.
-# Called from emit_fn_body / llvm_emit_fn_body before the body walk
-# so `efn_resolve`'s "first-match" fallback resolves to the local
-# module. With `mo == None` (root file) the table is returned
-# unchanged — root-file fns already win via `efn_pick_root`.
 fn fns_prefer_module(fns: [EFn], mo: Option[String]) : [EFn] = match mo {
   None    -> fns
   Some(m) -> list_append(fns_filter_same_module(fns, m, []),
@@ -908,29 +834,6 @@ fn fns_filter_other_module(fns: [EFn], m: String, acc: [EFn]) : [EFn] {
   }
 }
 
-fn efn_collect_matching(fns: [EFn], target: String, acc: [EFn]) : [EFn] {
-  match fns {
-    [] -> list_reverse(acc)
-    [h, ...rest] -> match h {
-      EFn(n, _, _, _) ->
-        if n == target { efn_collect_matching(rest, target, [h, ...acc]) }
-        else           { efn_collect_matching(rest, target, acc) }
-    }
-  }
-}
-
-fn efn_pick_root(cands: [EFn]) : Option[EFn] {
-  match cands {
-    [] -> None
-    [h, ...rest] -> match h {
-      EFn(_, _, None, _) -> Some(h)
-      _ -> efn_pick_root(rest)
-    }
-  }
-}
-
-# m6.2 v2: arity helper that wraps the new resolver. Codegen call
-# sites that previously consumed `Option[Int]` keep working unchanged.
 fn efn_find_arity(fns: [EFn], target: String) : Option[Int] = match efn_resolve(fns, target) {
   Some(EFn(_, ar, _, _)) -> Some(ar)
   None                   -> None
@@ -1009,202 +912,6 @@ fn evar_find_tag_opt(vs: [EVar], target: String) : Option[Int] {
   }
 }
 
-fn fn_of_decl(d: Decl) : Option[EFn] {
-  match d {
-    DFn(_, name, tparams, params, opt_ret, row, body, _, _, mo) ->
-      Some(EFn(name, list_length(params), mo, classify_unbox_sig(name, mo, tparams, params, opt_ret, row, body)))
-    _ -> None
-  }
-}
-
-# Phase 3 unboxing (issue #383): classify a top-level DFn as
-# unboxed-signature candidate. Returns `Some(US(param_tys, ret_ty))`
-# when every param + return is in {Int, Bool, Char, Real} concretely
-# (post-Dim / Refinement strip), with no parametric type variables,
-# no declared effect row, and no FFI-shim body. Otherwise returns
-# None — the callee keeps the classical `KaiValue *` calling
-# convention.
-#
-# Excluded:
-#   - Generic functions (`tparams != []`): the parametric T cannot
-#     be unboxed without monomorphisation tweaks (post-1.0).
-#   - FFI shims: `body_is_ffi_extern(body)` already produces the
-#     unbox/box dance internally; the shim signature is fixed.
-#   - Functions with non-empty effect row (e.g. `Console`, `Mutable`,
-#     `State[T]`): op call sites + handler clauses pass `KaiValue *`,
-#     and the kaic1-emitted closure thunk shape relies on boxed
-#     args. v1 keeps these boxed; the call-site cost there is
-#     amortised by the handler-dispatch path itself.
-#   - Functions with closure-typed or non-primitive params /
-#     returns: not in the classify set; stays boxed.
-fn classify_unbox_sig(name: String, mo: Option[String], tparams: [String], params: [Param],
-                      opt_ret: Option[TypeExpr], row: RowExpr, body: Expr) : Option[UFnSig] {
-  # Top-level `main` keeps its boxed signature: the runtime
-  # entry-point shim `int main(argc, argv)` calls `kai_main()` and
-  # casts the result to `KaiValue *` for the closing decref. A
-  # raw-Int main would clash with that ABI.
-  if name == "main" and (match mo { None -> true _ -> false }) { None }
-  else if list_length(tparams) > 0 { None }
-  else if body_is_ffi_extern(body) { None }
-  else if not row_is_empty(row_of_expr(row)) { None }
-  else if body_is_effectful(body) { None }
-  else if not all_params_unboxable(params) { None }
-  else {
-    match opt_ret {
-      None -> None
-      Some(rty) -> {
-        let ret_t = resolve_ty(rty)
-        if ty_is_unboxable_t(ret_t) {
-          Some(US(map(params, param_ty), ret_t))
-        } else { None }
-      }
-    }
-  }
-}
-
-# Phase 3 unboxing — recognise body shapes that pull in handler
-# evidence even when the user did not declare an effect row. v1
-# is conservative: any `EHandle`, `var` desugar (SVar), or
-# `Eff.op(...)` call (EModCall to a known effect, or EVar to a
-# qualified op name) disqualifies the fn. This catches the
-# `fn run(b: Bool) : Int { var inner = 100; ... }` shape where
-# the row is empty syntactically but the body installs a
-# `State[Int]` handler at run time.
-fn body_is_effectful(e: Expr) : Bool = body_kind_is_effectful(e.kind)
-
-fn body_kind_is_effectful(k: ExprKind) : Bool {
-  match k {
-    EHandle(_, _, _, _, _, _, _) -> true
-    EBang(_) -> true
-    EVar(nm) -> string_contains_dot(nm) or is_mutable_intrinsic_name(nm)
-    ECall(callee, args_) -> {
-      if body_is_effectful(callee) { true }
-      else { any_arg_effectful(args_) }
-    }
-    EBinop(_, a, b) -> body_is_effectful(a) or body_is_effectful(b)
-    EUnop(_, x) -> body_is_effectful(x)
-    EIf(c, t_, eo) -> body_is_effectful(c) or body_is_effectful(t_) or body_opt_is_effectful(eo)
-    EMatch(scr, arms) -> body_is_effectful(scr) or any_arm_effectful(arms)
-    EBlock(stmts, tail) -> any_stmt_effectful(stmts) or body_opt_is_effectful(tail)
-    ELambda(_, _) -> false
-    EField(b, _) -> body_is_effectful(b)
-    EIndex(a, b) -> body_is_effectful(a) or body_is_effectful(b)
-    ERecordLit(_, fs) -> any_field_effectful(fs)
-    EList(els) -> any_elem_effectful(els)
-    ERange(a, b, opt_step) -> body_is_effectful(a) or body_is_effectful(b) or body_opt_is_effectful(opt_step)
-    EPipe(a, b) -> body_is_effectful(a) or body_is_effectful(b)
-    EMapPipe(a, b) -> body_is_effectful(a) or body_is_effectful(b)
-    EFlatMapPipe(a, b) -> body_is_effectful(a) or body_is_effectful(b)
-    EFilterPipe(a, b) -> body_is_effectful(a) or body_is_effectful(b)
-    ELitUnit(inner, _) -> body_is_effectful(inner)
-    EModCall(_, _) -> true
-    _ -> false
-  }
-}
-
-fn body_opt_is_effectful(opt: Option[Expr]) : Bool {
-  match opt {
-    Some(e) -> body_is_effectful(e)
-    None    -> false
-  }
-}
-
-fn any_arg_effectful(es: [Expr]) : Bool {
-  match es {
-    [] -> false
-    [h, ...rest] -> if body_is_effectful(h) { true } else { any_arg_effectful(rest) }
-  }
-}
-
-fn any_arm_effectful(arms: [Arm]) : Bool {
-  match arms {
-    [] -> false
-    [Arm(_, g, b), ...rest] -> {
-      if body_opt_is_effectful(g) { true }
-      else if body_is_effectful(b) { true }
-      else { any_arm_effectful(rest) }
-    }
-  }
-}
-
-fn any_field_effectful(fs: [FieldInit]) : Bool {
-  match fs {
-    [] -> false
-    [FI(_, v), ...rest] -> if body_is_effectful(v) { true } else { any_field_effectful(rest) }
-  }
-}
-
-fn any_elem_effectful(els: [ListElem]) : Bool {
-  match els {
-    [] -> false
-    [ElPlain(x), ...rest] -> if body_is_effectful(x) { true } else { any_elem_effectful(rest) }
-    [ElSpread(x), ...rest] -> if body_is_effectful(x) { true } else { any_elem_effectful(rest) }
-  }
-}
-
-fn any_stmt_effectful(ss: [Stmt]) : Bool {
-  match ss {
-    [] -> false
-    [s, ...rest] -> if stmt_is_effectful(s) { true } else { any_stmt_effectful(rest) }
-  }
-}
-
-fn stmt_is_effectful(s: Stmt) : Bool {
-  match s {
-    SLet(_, _, rhs) -> body_is_effectful(rhs)
-    # `var x = init` desugars into a `State[T]` handler at codegen.
-    # That handler installs evidence at run time even when the
-    # declared row is empty, so any SVar disqualifies the enclosing
-    # fn from raw-signature classification.
-    SVar(_, _, _, _, _) -> true
-    SAssert(cond, m) -> body_is_effectful(cond) or body_opt_is_effectful(m)
-    SExprStmt(x) -> body_is_effectful(x)
-    SIndexAssign(b, i, v, _, _) -> body_is_effectful(b) or body_is_effectful(i) or body_is_effectful(v)
-    SUse(_, _, _) -> false
-  }
-}
-
-# Phase 3 unboxing — `array_*` and `ref_*` are post-desugar
-# remnants of `var x = init` (m7b #5b). The desugar lowers `var`
-# into a let-bound slot (`let x__slot = array_make(1, init)`)
-# whose subsequent `x.get()`/`x.set()` reads become
-# `array_get(slot, 0)` / `array_set(slot, 0, v)`. Detecting any
-# of these names in the body of an otherwise-empty-row fn guards
-# against a UFn classification that would mishandle the slot's
-# RC + handler installation.
-fn is_mutable_intrinsic_name(nm: String) : Bool =
-  nm == "array_make" or nm == "array_get" or nm == "array_set" or
-  nm == "array_length" or nm == "array_grow" or
-  nm == "ref_make" or nm == "ref_get" or nm == "ref_set"
-
-fn row_is_empty(r: Row) : Bool =
-  list_length(r.labels) == 0 and (match r.tail { None -> true _ -> false })
-
-fn all_params_unboxable(ps: [Param]) : Bool {
-  match ps {
-    [] -> true
-    [p, ...rest] -> {
-      let pt = param_ty(p)
-      if ty_is_unboxable_t(pt) { all_params_unboxable(rest) }
-      else { false }
-    }
-  }
-}
-
-fn register_fn_decls(decls: [Decl]) : [EFn] {
-  match decls {
-    [] -> []
-    [d, ...rest] -> match fn_of_decl(d) {
-      Some(fs) -> [fs, ...register_fn_decls(rest)]
-      None -> register_fn_decls(rest)
-    }
-  }
-}
-
-# m6.2 v2: a pair of an ambiguous bare-name and the surface names of
-# the modules that export it. Constructed by `find_ambig_efns` and
-# consumed by `report_ambig_efns` (compile-time warning) and
-# `is_ambig_name` (codegen-time short-circuit).
 type AmbigEntry = AmbE(String, [String])
 
 # m6.2 v2: return one AmbigEntry per name N that is exported by two
@@ -3806,72 +3513,6 @@ fn interp_is_triple(span: String) : Bool {
       }
       None -> false
     }
-  }
-}
-
-# Walk the inner body of a string span between (start, end), accumulating
-# parts. At `#{`, open a new IpExp until the balanced `}`; otherwise
-# grow the current literal span.
-fn raw_lit_for_c(piece: String) : String =
-  cat3("\"", escape_str_body_for_c(piece), "\"")
-
-# `st.parts` accumulates in REVERSE here for O(1) prepend; the public
-# iscan_collect entry point reverses once at the end.
-fn iscan_collect_rev(span: String, end: Int, st: IScan) : [IPart] {
-  if st.i >= end { finish_iscan_rev(span, end, st) }
-  else {
-    match char_at(span, st.i) {
-      None -> finish_iscan_rev(span, end, st)
-      Some(c) -> {
-        let nxt = match char_at(span, st.i + 1) { Some(c2) -> c2 None -> ' ' }
-        if c == '#' and nxt == '{' and st.i + 1 < end {
-          let with_lit =
-            if st.i > st.lit_start {
-              let piece = string_slice(span, st.lit_start, st.i - st.lit_start)
-              [IpLit(piece, raw_lit_for_c(piece)), ...st.parts]
-            } else { st.parts }
-          let expr_start = st.i + 2
-          let expr_end = iscan_expr_end(span, expr_start, end, 1)
-          let expr_src = string_slice(span, expr_start, expr_end - expr_start)
-          let new_parts = [IpExp(expr_src), ...with_lit]
-          let next_i = if expr_end < end { expr_end + 1 } else { expr_end }
-          iscan_collect_rev(span, end, IScan { parts: new_parts, lit_start: next_i, i: next_i })
-        } else {
-          iscan_collect_rev(span, end, IScan { parts: st.parts, lit_start: st.lit_start, i: st.i + 1 })
-        }
-      }
-    }
-  }
-}
-
-fn iscan_collect(span: String, end: Int, st: IScan) : [IPart] =
-  list_reverse(iscan_collect_rev(span, end, st))
-
-fn iscan_expr_end(span: String, i: Int, end: Int, depth: Int) : Int {
-  if depth == 0 or i >= end { i }
-  else {
-    match char_at(span, i) {
-      None -> i
-      Some(c) -> {
-        match c {
-          '{' -> iscan_expr_end(span, i + 1, end, depth + 1)
-          '}' -> {
-            if depth == 1 { i }
-            else { iscan_expr_end(span, i + 1, end, depth - 1) }
-          }
-          _ -> iscan_expr_end(span, i + 1, end, depth)
-        }
-      }
-    }
-  }
-}
-
-fn finish_iscan_rev(span: String, end: Int, st: IScan) : [IPart] {
-  if st.lit_start < end {
-    let piece = string_slice(span, st.lit_start, end - st.lit_start)
-    [IpLit(piece, raw_lit_for_c(piece)), ...st.parts]
-  } else {
-    st.parts
   }
 }
 
@@ -6550,23 +6191,6 @@ fn emit_fn_signature_unboxed(name: String, params: [Param], sig: UFnSig) : Strin
     ])
   }
 
-# Decide whether a DFn declared `name`/`mo` was classified as a
-# UFn in the EFn registry. Returns the UFnSig payload so callers
-# can dispatch on raw vs boxed signature in one match. Iterates
-# all matching entries (two modules can export the same bare name
-# under v2 — e.g. `box_a.wrap` and `box_b.wrap`) and picks the one
-# whose module-of-origin matches `mo` exactly.
-fn lookup_ufn_sig(fns: [EFn], name: String, mo: Option[String]) : Option[UFnSig] {
-  match fns {
-    [] -> None
-    [h, ...rest] -> match h {
-      EFn(n, _, m2, sig) ->
-        if n == name and mo_eq(mo, m2) { sig }
-        else { lookup_ufn_sig(rest, name, mo) }
-    }
-  }
-}
-
 fn is_ufn_decl(fns: [EFn], name: String, mo: Option[String]) : Bool {
   match lookup_ufn_sig(fns, name, mo) {
     Some(_) -> true
@@ -6585,16 +6209,6 @@ fn lookup_ufn_by_csym(fns: [EFn], csym: String) : Option[UFnSig] {
         if c_sym(n, mo) == csym { Some(us) }
         else { lookup_ufn_by_csym(rest, csym) }
       _ -> lookup_ufn_by_csym(rest, csym)
-    }
-  }
-}
-
-fn mo_eq(a: Option[String], b: Option[String]) : Bool {
-  match a {
-    None -> match b { None -> true _ -> false }
-    Some(x) -> match b {
-      Some(y) -> x == y
-      None    -> false
     }
   }
 }
@@ -8905,30 +8519,6 @@ fn desugar_index_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
   }
 }
 
-# ====================================================================
-# m12.7.x FFI v1: the magic `ETodo` payload that flags a DFn body
-# as the FFI shim form. `emit_fn_body` (C and LLVM) match on this
-# string before falling through to the default ETodo lowering.
-#
-# Issue #261: when the FFI declaration carries a name override
-# (`extern "C"("real_symbol") fn ...`), the lowering writes
-# `__kai_ffi__:real_symbol` into the tag so the emitters can carve
-# the override back out without a second AST field.
-fn ffi_extern_tag() : String = "__kai_ffi__"
-fn ffi_extern_tag_prefix() : String = "__kai_ffi__:"
-
-fn body_is_ffi_extern(body: Expr) : Bool {
-  match body.kind {
-    ETodo(msg) -> msg == ffi_extern_tag() or string_starts_with_q(msg, ffi_extern_tag_prefix())
-    _ -> false
-  }
-}
-
-# Issue #261: extract the C-side symbol from an FFI shim body's
-# tag. Returns the override (`__kai_ffi__:strlen` → `strlen`) if
-# present, otherwise `default_name` (the kaikai identifier acts as
-# the C symbol when no override was given). Caller must have
-# already established the body is an FFI shim via `body_is_ffi_extern`.
 fn ffi_extern_symbol_of(body: Expr, default_name: String) : String {
   match body.kind {
     ETodo(msg) ->
@@ -9005,48 +8595,6 @@ fn find_colon(s: String, from: Int) : Int {
     }
   }
 }
-
-# §29 const desugar: collect every zero-arg DAttribPure(DFn) name
-# (every const declaration produces this shape; user fns marked
-# `[<refinement_pure>]` with arguments are skipped). Returns the
-# list of names that should be rewritten from `EVar(name)` to
-# `ECall(EVar(name), [])` in subsequent passes.
-fn string_starts_with_q(s: String, prefix: String) : Bool =
-  starts_with_loop(s, prefix, 0)
-
-fn starts_with_loop(s: String, prefix: String, i: Int) : Bool {
-  let pn = string_length(prefix)
-  if i >= pn { true }
-  else { match char_at(s, i) {
-    None -> false
-    Some(sc) -> match char_at(prefix, i) {
-      None -> true
-      Some(pc) -> if sc == pc { starts_with_loop(s, prefix, i + 1) } else { false }
-    }
-  } }
-}
-
-
-# ====================================================================
-# m12.8.x phase 2 (Bug 4): lift `"...#{x}..."` interpolation parts
-# into the pre-inference AST so the typer + protocol-call rewrite see
-# them. Without this the interp body is parsed at emit time and
-# routed through the universal `kai_to_string` runtime, which
-# bypasses any user-defined `impl Show for T`.
-# ====================================================================
-#
-# Run only when the program declares `protocol Show` (the
-# `op_names` list contains "show"); otherwise leave EStr nodes alone
-# so files that just use `#{int_to_string(x)}` and never load the
-# stdlib protocols continue to work via the legacy emit-time path.
-#
-# Lowering shape: a string `"prefix #{e1} mid #{e2} suffix"` becomes
-#
-#   string_concat_all(["prefix ", show(e1), " mid ", show(e2), " suffix"])
-#
-# Each interp body `e_i` is parsed using `parse_expr` (same parser
-# the emitter used to call lazily) and then recursively desugared so
-# nested interpolations also lift.
 
 fn desugar_interp_decls(ds: [Decl], op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : [Decl] / Console + File {
 
@@ -9356,108 +8904,6 @@ fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, 
 # in M2b+.
 
 
-fn row_empty() : Row = Row {
-  labels:        [],
-  tail:          None,
-  display_alias: None
-}
-
-fn resolve_ty_list(ts: [TypeExpr]) : [Ty] = map(ts, resolve_ty)
-
-fn resolve_ty(t: TypeExpr) : Ty {
-  match t.tkind {
-    TyName(name, targs) -> {
-      if name == "Int" { TyInt }
-      else if name == "Real" { TyReal }
-      else if name == "Bool" { TyBool }
-      else if name == "String" { TyString }
-      else if name == "Char" { TyChar }
-      else if name == "Unit" { TyUnit }
-      else if name == "Byte" { TyByte }
-      # m7a #7: `Nothing` is the uninhabited type used by `Fail.fail`
-      # (Doc B §`Fail`). The typer can't witness uninhabitedness, so
-      # we treat it as TyAny — a call producing Nothing unifies with
-      # any expected type, which is sound only because the default
-      # handler aborts before any consumer of that "value" runs.
-      else if name == "Nothing" { TyAny }
-      else { TyCon(None, name, resolve_ty_list(targs)) }
-    }
-    TyList(inner) -> TyListT(resolve_ty(inner))
-    TyFn(fps, fret, rexpr) -> TyFnT(resolve_ty_list(fps), resolve_ty(fret), row_of_expr(rexpr))
-    # m12.5: dimensioned base type. The unit goes through unit_canon
-    # (with empty alias and tparam contexts here) so two textually
-    # different but algebraically equal forms compare equal under unify.
-    TyDim(base, u) -> TyDimT(resolve_ty(base), unit_canon(u))
-    # m12.6.x #1: preserve the refinement on the semantic side.
-    # `TyRefineT(b, p)` ⊑ `b` in the unifier (upcast); narrowing
-    # requires explicit `ensure(...)` or a match-arm `: RefinedT`.
-    TyRefine(base, p) -> TyRefineT(resolve_ty(base), p)
-  }
-}
-
-# Convert a parsed RowExpr into its semantic Row. m7a #3c validates
-# that each label refers to a declared effect; this routine focuses
-# on the type-arg projection. Type args declared in row position are
-# resolved against the *current* declaration's tparam list when one
-# is supplied (`row_of_expr_with_tparams`); calls without tparam
-# context (display, alias rewriting) drop the args to keep behaviour
-# additive while m7b #11's row-arg propagation lands in stages.
-#
-# m7b #12: ROpen carries a row-variable name in tail position. This
-# helper has no per-decl row-var binding context, so it returns a
-# Row with a *placeholder* tail id (-1). Callers that need a proper
-# row-var binding (fn_scheme_of_decl, infer_decl) use
-# `row_of_expr_with_rbinds` instead and pass a context built by
-# `mk_rvbinds`. Diagnostics-only paths are fine with the placeholder.
-fn row_of_expr(re: RowExpr) : Row {
-  row_of_expr_with_rbinds(re, [])
-}
-
-
-fn rvbind_lookup(binds: [RVBind], name: String) : Option[Int] {
-  match binds {
-    [] -> None
-    [b, ...rest] -> match b {
-      RVB(n, i) -> if n == name { Some(i) } else { rvbind_lookup(rest, name) }
-    }
-  }
-}
-
-fn row_of_expr_with_rbinds(re: RowExpr, rbinds: [RVBind]) : Row {
-  match re {
-    REmpty -> row_empty()
-    RClosed(labels) -> Row {
-      labels: row_labels_of_rls(labels),
-      tail: None,
-      display_alias: None
-    }
-    ROpen(rv, labels) -> Row {
-      labels: row_labels_of_rls(labels),
-      tail: match rvbind_lookup(rbinds, rv) {
-        Some(id) -> Some(id)
-        None     -> Some(-1)
-      },
-      display_alias: None
-    }
-  }
-}
-
-fn row_labels_of_rls(ls: [RowLabel]) : [Label] {
-  match ls {
-    [] -> []
-    [rl, ...rest] -> match rl {
-      RL(name, ts) -> [
-        Label { eff: name, ty_args: resolve_ty_list(ts) },
-        ...row_labels_of_rls(rest)
-      ]
-    }
-  }
-}
-
-# m7b #11: resolve a row label list under a tparam binding. Used at
-# decl boundaries where the `Reader[T]` type arg refers to one of the
-# function's own tparams. Falls back to the unparameterised
-# `row_labels_of_rls` for callers that lack a binding context.
 fn row_labels_of_rls_with_tparams(ls: [RowLabel], binds: [TPBind]) : [Label] {
   match ls {
     [] -> []
@@ -10956,15 +10402,6 @@ fn subtract_strings(xs: [String], ys: [String]) : [String] {
   }
 }
 
-fn param_ty(pm: Param) : Ty {
-  match pm.ptype {
-    Some(te) -> resolve_ty(te)
-    None -> TyAny
-  }
-}
-
-# Extract the declared signature of a top-level decl, or None if the
-# decl has no signature shape (DType, DImport).
 fn sig_of_decl(d: Decl) : Option[Ty] {
   match d {
     DFn(_, _, _, params, opt_ret, rexpr, _, _, _, _) -> {
@@ -13180,22 +12617,6 @@ fn ty_is_unboxable(opt_t: Option[Ty]) : Bool {
   }
 }
 
-fn ty_is_unboxable_t(t: Ty) : Bool {
-  match t {
-    TyInt  -> true
-    TyReal -> true
-    TyBool -> true
-    TyChar -> true
-    TyDimT(inner, _)    -> ty_is_unboxable_t(inner)
-    TyRefineT(inner, _) -> ty_is_unboxable_t(inner)
-    _ -> false
-  }
-}
-
-# True iff `t` is one of the integral unboxable types — `Int`,
-# `Bool`, `Char`. `Real` is a `double`, which has no `%` operator
-# and cannot be a C `switch` operand. Used to gate operations that
-# only apply to integral raw scalars.
 fn ty_is_integral_raw(opt_t: Option[Ty]) : Bool {
   match opt_t {
     Some(t) -> ty_is_integral_raw_t(t)
@@ -16178,202 +15599,6 @@ fn pcs_name_in_body_tail(nm: String, body: Expr) : Bool / Console {
 # m5 #3 will consume the same `last_use_for` result to drive drop
 # emission.
 
-fn scan_uses_expr(e: Expr, in_lam: Bool) : [Use] / Console =
-
-  scan_uses_kind(e.kind, e.line, e.col, in_lam)
-
-fn scan_uses_kind(k: ExprKind, line: Int, col: Int, in_lam: Bool) : [Use] / Console {
-
-  match k {
-    EVar(nm) -> [U(nm, line, col, in_lam)]
-    # Interpolated strings hide EVar refs inside `#{...}` segments —
-    # the lexer keeps the raw source span and emit re-parses at code
-    # gen. Mirror `fv_interp` (5700-5725) so a binding read only via
-    # interpolation never gets mis-classified as `LUUnused`.
-    EStr(span, is_triple) -> scan_uses_in_interp(span, is_triple, in_lam)
-    ECall(f, xs) -> list_append(scan_uses_expr(f, in_lam),
-                                scan_uses_in_exprs(xs, in_lam))
-    EField(x, _) -> scan_uses_expr(x, in_lam)
-    EIndex(x, i) -> list_append(scan_uses_expr(x, in_lam),
-                                scan_uses_expr(i, in_lam))
-    EBinop(_, l, r) -> list_append(scan_uses_expr(l, in_lam),
-                                   scan_uses_expr(r, in_lam))
-    EUnop(_, x) -> scan_uses_expr(x, in_lam)
-    EIf(c, t, opt_e) -> {
-      let p1 = list_append(scan_uses_expr(c, in_lam), scan_uses_expr(t, in_lam))
-      match opt_e {
-        None -> p1
-        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
-      }
-    }
-    EMatch(s, arms) -> list_append(scan_uses_expr(s, in_lam),
-                                    scan_uses_in_arms(arms, in_lam))
-    ELambda(_, body) -> scan_uses_expr(body, true)
-    ERecordLit(_, fis) -> scan_uses_in_field_inits(fis, in_lam)
-    EList(elems) -> scan_uses_in_list_elems(elems, in_lam)
-    ERange(lo, hi, opt_by) -> {
-      let p1 = list_append(scan_uses_expr(lo, in_lam), scan_uses_expr(hi, in_lam))
-      match opt_by {
-        None -> p1
-        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
-      }
-    }
-    EBlock(stmts, opt_tail) -> {
-      let p1 = scan_uses_in_stmts(stmts, in_lam)
-      match opt_tail {
-        None -> p1
-        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
-      }
-    }
-    EPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
-                                scan_uses_expr(r, in_lam))
-    EMapPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
-                                   scan_uses_expr(r, in_lam))
-    EFlatMapPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
-                                       scan_uses_expr(r, in_lam))
-    EFilterPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
-                                      scan_uses_expr(r, in_lam))
-    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-      let p1 = scan_uses_expr(body, in_lam)
-      let p2 = match init_opt {
-        None -> p1
-        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
-      }
-      let p3 = list_append(p2, scan_uses_in_clauses(clauses, in_lam))
-      match ret_opt {
-        None -> p3
-        Some(hr) -> match hr {
-          HR(_, body2, _, _) -> list_append(p3, scan_uses_expr(body2, in_lam))
-        }
-      }
-    }
-    _ -> []
-  }
-}
-
-fn scan_uses_in_exprs(es: [Expr], in_lam: Bool) : [Use] / Console {
-
-  match es {
-    [] -> []
-    [h, ...rest] -> list_append(scan_uses_expr(h, in_lam),
-                                scan_uses_in_exprs(rest, in_lam))
-  }
-}
-
-fn scan_uses_in_arms(arms: [Arm], in_lam: Bool) : [Use] / Console {
-
-  match arms {
-    [] -> []
-    [h, ...rest] -> match h {
-      Arm(_, guard_opt, body) -> {
-        let p1 = match guard_opt {
-          None -> []
-          Some(g) -> scan_uses_expr(g, in_lam)
-        }
-        let p2 = list_append(p1, scan_uses_expr(body, in_lam))
-        list_append(p2, scan_uses_in_arms(rest, in_lam))
-      }
-    }
-  }
-}
-
-fn scan_uses_in_field_inits(fis: [FieldInit], in_lam: Bool) : [Use] / Console {
-
-  match fis {
-    [] -> []
-    [h, ...rest] -> match h {
-      FI(_, e) -> list_append(scan_uses_expr(e, in_lam),
-                              scan_uses_in_field_inits(rest, in_lam))
-    }
-  }
-}
-
-fn scan_uses_in_list_elems(es: [ListElem], in_lam: Bool) : [Use] / Console {
-
-  match es {
-    [] -> []
-    [h, ...rest] -> {
-      let inner = match h {
-        ElPlain(e) -> e
-        ElSpread(e) -> e
-      }
-      list_append(scan_uses_expr(inner, in_lam),
-                  scan_uses_in_list_elems(rest, in_lam))
-    }
-  }
-}
-
-fn scan_uses_in_stmts(stmts: [Stmt], in_lam: Bool) : [Use] / Console {
-
-  match stmts {
-    [] -> []
-    [h, ...rest] -> {
-      let p1 = match h {
-        SLet(_, _, rhs) -> scan_uses_expr(rhs, in_lam)
-        SAssert(c, opt_msg) -> {
-          let q = scan_uses_expr(c, in_lam)
-          match opt_msg {
-            None -> q
-            Some(e2) -> list_append(q, scan_uses_expr(e2, in_lam))
-          }
-        }
-        SExprStmt(e) -> scan_uses_expr(e, in_lam)
-        SIndexAssign(arr, idx, val, _, _) -> {
-          let q1 = list_append(scan_uses_expr(arr, in_lam),
-                               scan_uses_expr(idx, in_lam))
-          list_append(q1, scan_uses_expr(val, in_lam))
-        }
-        SVar(_, _, init, _, _) -> scan_uses_expr(init, in_lam)
-        # m7e §25: SUse has no expression — no uses to scan.
-        SUse(_, _, _) -> []
-      }
-      list_append(p1, scan_uses_in_stmts(rest, in_lam))
-    }
-  }
-}
-
-fn scan_uses_in_clauses(cs: [HClause], in_lam: Bool) : [Use] / Console {
-
-  match cs {
-    [] -> []
-    [h, ...rest] -> match h {
-      HC(_, _, body, _, _) -> list_append(scan_uses_expr(body, in_lam),
-                                          scan_uses_in_clauses(rest, in_lam))
-    }
-  }
-}
-
-# Re-parse an `EStr` span to surface `#{expr}` interpolations and
-# scan each parsed sub-expression for EVar refs. Mirrors `fv_interp`.
-fn scan_uses_in_interp(span: String, is_triple: Bool, in_lam: Bool) : [Use] / Console {
-
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  let parts = iscan_collect(span, body_end,
-                            IScan { parts: [], lit_start: body_start, i: body_start })
-  scan_uses_interp_parts(parts, in_lam)
-}
-
-fn scan_uses_interp_parts(parts: [IPart], in_lam: Bool) : [Use] / Console {
-
-  match parts {
-    [] -> []
-    [p, ...rest] -> match p {
-      IpLit(_, _) -> scan_uses_interp_parts(rest, in_lam)
-      IpExp(esrc) -> {
-        let head = match parse_interp_expr(esrc) {
-          Some(e) -> scan_uses_expr(e, in_lam)
-          None -> []
-        }
-        list_append(head, scan_uses_interp_parts(rest, in_lam))
-      }
-    }
-  }
-}
-
-# Find the last-use record for `nm` among `uses`. A single in-lambda
-# reference forces `LUBlocked`; otherwise the max (line, col) wins.
 fn last_use_for(nm: String, uses: [Use]) : LU =
   last_use_for_loop(nm, uses, false, -1, -1)
 
