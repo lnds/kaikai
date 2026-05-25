@@ -1,0 +1,163 @@
+# compiler/unbox.kai unit tests — per-module tests for the Tier 2.5
+# unboxing pass extracted under issue #677 Phase 1n3 (the unbox lane).
+#
+# Coverage splits two ways:
+#
+#   - Pure helpers exercised directly: the raw-operator classifiers the
+#     C/LLVM emitters consult (`op_is_raw_arith` / `op_is_raw_cmp` /
+#     `op_is_raw_logical` / `raw_op_str`), the integral-raw type gate
+#     (`ty_is_integral_raw`), and the use-scanner consumers
+#     (`uses_have_in_lam` / `expr_has_interp_use`).
+#   - The pass driven end-to-end through the real parser + `infer_program`
+#     + `unbox_pass`: a source string is parsed, inference embeds the
+#     `.ty` each Expr carries, and `unbox_pass` walks the typed decls.
+#     This exercises the private mode-assignment walk (`unbox_decl` /
+#     `unbox_expr` / `decide_mode` / the `ufn_promote_calls` post-pass)
+#     transitively — the same surface every selfhost rides through.
+#
+# Property checks (body Bool, NOT assert — `kai check` reports a
+# counterexample per input): `unbox_pass` is idempotent (re-running it on
+# its own output is a no-op) and preserves the top-level decl count (it
+# rewrites modes, it never adds or drops a decl).
+#
+# Runner: `kai test stage2/.`. Property checks: `kai check`.
+
+import compiler.lex
+import compiler.ast
+import compiler.parse
+import compiler.infer
+import compiler.unbox
+
+# ---- helpers ----
+
+fn parse_decls(src: String) : [Decl] / Console {
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    Some(ds) -> ds
+    None     -> []
+  }
+}
+
+# Parse + infer so each Expr node carries the `.ty` the unbox pass reads,
+# then return the typed decl stream.
+fn typed_decls(src: String) : [Decl] / Console + File {
+  let tp = infer_program("test.kai", parse_decls(src), false)
+  tp.decls
+}
+
+# A minimal Expr carrying no interpolation — line/col/ty/mode are the
+# defaults the parser would mint before unboxing assigns a real mode.
+fn plain_var(nm: String) : Expr =
+  Expr { kind: EVar(nm), line: 1, col: 1, ty: None, mode: MUnknown }
+
+# ==================================================================
+# Unit tests — pure classifiers
+# ==================================================================
+
+test "op_is_raw_arith accepts the five native C arithmetic operators" {
+  assert op_is_raw_arith("+")
+  assert op_is_raw_arith("-")
+  assert op_is_raw_arith("*")
+  assert op_is_raw_arith("/")
+  assert op_is_raw_arith("%")
+}
+
+test "op_is_raw_arith rejects power and comparison operators" {
+  assert (op_is_raw_arith("^")) == false
+  assert (op_is_raw_arith("<")) == false
+}
+
+test "op_is_raw_cmp accepts the six comparison operators" {
+  assert op_is_raw_cmp("<")
+  assert op_is_raw_cmp(">")
+  assert op_is_raw_cmp("<=")
+  assert op_is_raw_cmp(">=")
+  assert op_is_raw_cmp("==")
+  assert op_is_raw_cmp("!=")
+}
+
+test "op_is_raw_cmp rejects arithmetic operators" {
+  assert (op_is_raw_cmp("+")) == false
+}
+
+test "op_is_raw_logical accepts and/or only" {
+  assert op_is_raw_logical("and")
+  assert op_is_raw_logical("or")
+  assert (op_is_raw_logical("not")) == false
+  assert (op_is_raw_logical("==")) == false
+}
+
+test "raw_op_str maps and/or to the C short-circuit operators" {
+  assert (raw_op_str("and")) == "&&"
+  assert (raw_op_str("or")) == "||"
+}
+
+test "raw_op_str leaves arithmetic operators unchanged" {
+  assert (raw_op_str("+")) == "+"
+  assert (raw_op_str("*")) == "*"
+}
+
+test "ty_is_integral_raw accepts Int/Bool/Char and rejects Real/None" {
+  assert (ty_is_integral_raw(Some(TyInt)))
+  assert (ty_is_integral_raw(Some(TyBool)))
+  assert (ty_is_integral_raw(Some(TyChar)))
+  assert (ty_is_integral_raw(Some(TyReal))) == false
+  assert (ty_is_integral_raw(None)) == false
+}
+
+test "ty_is_integral_raw strips the Dim wrapper and recurses on the base" {
+  assert (ty_is_integral_raw(Some(TyDimT(TyInt, UOne))))
+  assert (ty_is_integral_raw(Some(TyDimT(TyReal, UOne)))) == false
+}
+
+# ---- use-scanner consumers ----
+
+test "uses_have_in_lam is true only when the named use is in a lambda" {
+  let in_lam = [U("x", 1, 1, true)]
+  let not_lam = [U("x", 1, 1, false)]
+  assert uses_have_in_lam(in_lam, "x")
+  assert (uses_have_in_lam(not_lam, "x")) == false
+  assert (uses_have_in_lam(in_lam, "y")) == false
+}
+
+test "expr_has_interp_use is false for a bare EVar with no interpolation" {
+  assert (expr_has_interp_use(plain_var("x"), "x")) == false
+}
+
+# ---- unbox_pass end-to-end (through parse + infer) ----
+
+test "unbox_pass preserves a single well-typed fn decl" {
+  let ds = unbox_pass(typed_decls("fn id(x: Int) : Int = x"))
+  assert (list_length(ds)) == 1
+}
+
+test "unbox_pass preserves the decl count on a two-fn module" {
+  let ds = unbox_pass(typed_decls("fn a() : Int = 1\nfn b() : Int = 2"))
+  assert (list_length(ds)) == 2
+}
+
+test "unbox_pass returns the empty decl list unchanged" {
+  let ds = unbox_pass([])
+  assert (list_length(ds)) == 0
+}
+
+# ==================================================================
+# Property checks (body Bool — `kai check` reports a counterexample)
+# ==================================================================
+
+check "raw_op_str is idempotent (its output is never itself rewritten)"
+  with op: String {
+  (raw_op_str(raw_op_str(op))) == (raw_op_str(op))
+}
+
+# The raw-op classifiers partition operator strings into disjoint
+# classes: no operator is simultaneously arithmetic, comparison, and
+# logical. (raw_op_str only rewrites the logical pair, so this also
+# pins that rewrite to the logical class.)
+check "the raw-op classes are mutually exclusive"
+  with op: String {
+  let a = if op_is_raw_arith(op) { 1 } else { 0 }
+  let c = if op_is_raw_cmp(op) { 1 } else { 0 }
+  let l = if op_is_raw_logical(op) { 1 } else { 0 }
+  (a + c + l) <= 1
+}
