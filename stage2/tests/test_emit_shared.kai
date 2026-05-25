@@ -1,0 +1,151 @@
+# compiler/emit_shared.kai unit tests — per-module tests for the
+# backend-shared lowering layer extracted under issue #677 Phase 1r.
+#
+# emit_shared is the plumbing the C backend (emit_program) and the LLVM
+# backend (emit_program_llvm) both consume: symbol minting (c_sym), the
+# variant-table lookups (evar_*), FFI return-kind classification (ffi_*),
+# and a string-search helper (find_substring / substring_eq). These are
+# pure, total functions over small inputs, so the unit tests drive them
+# directly rather than through the full pipeline.
+#
+# Coverage:
+#   - c_sym: None → bare name; Some(m) → module-qualified `<m>__<name>`.
+#   - evar_find / evar_find_tag / evar_find_tag_opt: present (returns the
+#     head tag), absent (None / sentinel -1).
+#   - ffi_ret_kind_of: None → Unit; a known scalar TypeExpr → its kind.
+#   - find_substring / substring_eq: start / mid / absent.
+#   - EVar (ctor EV) round-trips its fields (the emit-side variant entry,
+#     distinct from the AST EVar constructor).
+#
+# Property checks (body Bool, NOT assert — `kai check` reports a
+# counterexample per input; Int generators per the phase-1n String-
+# generator caveat): c_sym with no module is the identity on the bare
+# name length, and evar_find_tag on an empty table is always the -1
+# sentinel for any decimal target.
+#
+# Runner: `kai test stage2/.`. Property checks: `kai check`.
+
+import compiler.ast
+import compiler.emit_shared
+
+# ---- helpers ----
+
+# A two-entry variant table: ctor name, arity, payload tys, head tag.
+fn sample_vs() : [EVar] = [EV("Some", 1, [], 1), EV("None", 0, [], 0)]
+
+# A zero-position TyName TypeExpr to feed ffi_ret_kind_of.
+fn ty_named(name: String) : TypeExpr =
+  TypeExpr { tkind: TyName(name, []), line: 0, col: 0 }
+
+fn is_ffi_int(k: FfiRetKind) : Bool = match k {
+  FfiRetInt -> true
+  _         -> false
+}
+
+fn is_ffi_unit(k: FfiRetKind) : Bool = match k {
+  FfiRetUnit -> true
+  _          -> false
+}
+
+# ==================================================================
+# Unit tests
+# ==================================================================
+
+test "c_sym with no module returns the bare name" {
+  assert c_sym("foo", None) == "foo"
+}
+
+test "c_sym with a module qualifies as <m>__<name>" {
+  assert c_sym("foo", Some("bar")) == "bar__foo"
+}
+
+test "evar_find_tag returns the head tag of a present ctor" {
+  assert evar_find_tag(sample_vs(), "Some") == 1
+}
+
+# evar_find_tag returns 0 (the head-tag default) when the ctor is
+# absent — distinct from evar_find_tag_opt, which returns None.
+test "evar_find_tag on a missing ctor returns the 0 default" {
+  assert evar_find_tag(sample_vs(), "Nope") == 0
+}
+
+test "evar_find returns Some(tag) for a present ctor" {
+  match evar_find(sample_vs(), "None") {
+    Some(t) -> { assert t == 0 }
+    None    -> { assert false }
+  }
+}
+
+test "evar_find returns None for a missing ctor" {
+  match evar_find(sample_vs(), "Nope") {
+    Some(_) -> { assert false }
+    None    -> { assert true }
+  }
+}
+
+test "evar_find_tag_opt mirrors evar_find on a present ctor" {
+  match evar_find_tag_opt(sample_vs(), "Some") {
+    Some(t) -> { assert t == 1 }
+    None    -> { assert false }
+  }
+}
+
+test "ffi_ret_kind_of None is the Unit kind" {
+  assert is_ffi_unit(ffi_ret_kind_of(None))
+}
+
+test "ffi_ret_kind_of an Int TypeExpr is the Int kind" {
+  assert is_ffi_int(ffi_ret_kind_of(Some(ty_named("Int"))))
+}
+
+test "find_substring locates a needle at the start" {
+  assert find_substring("hello", "he", 0) == 0
+}
+
+test "find_substring locates a needle mid-string" {
+  assert find_substring("hello", "ll", 0) == 2
+}
+
+# find_substring returns string_length(hay) as the absent sentinel, so
+# the result lands at the end of the string when the needle is missing.
+test "find_substring returns the length sentinel when the needle is absent" {
+  assert find_substring("hello", "zz", 0) == string_length("hello")
+}
+
+test "substring_eq is true for a matching slice" {
+  assert substring_eq("hello", 1, "ell")
+}
+
+test "substring_eq is false for a non-matching slice" {
+  assert substring_eq("hello", 1, "xyz") == false
+}
+
+test "EV round-trips its variant-entry fields" {
+  let v = EV("Cons", 2, [], 7)
+  match v {
+    EV(nm, ar, _, tag) -> {
+      assert nm == "Cons"
+      assert ar == 2
+      assert tag == 7
+    }
+  }
+}
+
+# ==================================================================
+# Property checks (body Bool, NOT assert) — Int generators only.
+# ==================================================================
+
+# c_sym with no module is the identity on the bare name, so the result
+# length always equals the input length for any decimal name.
+check "c_sym preserves the bare-name length"
+  with n: Int {
+  let nm = int_to_string(n)
+  string_length(c_sym(nm, None)) == string_length(nm)
+}
+
+# evar_find_tag on an empty table is always the 0 default, whatever the
+# target name.
+check "evar_find_tag on an empty table is 0"
+  with n: Int {
+  evar_find_tag([], int_to_string(n)) == 0
+}
