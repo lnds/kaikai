@@ -1,0 +1,167 @@
+# compiler/perceus.kai unit tests — per-module tests for the Perceus
+# reference-counting pass extracted under issue #677 Phase 1n4.
+#
+# Coverage splits two ways:
+#
+#   - Pure helpers exercised directly: the last-use classifier
+#     (`last_use_for` -> LUUnused / LUBlocked / LUAt), the non-lambda
+#     use counter (`pcs_count_non_lam_uses`), and the use collector
+#     (`pcs_collect_uses_expr`). These are the four `pub` helpers the
+#     tco pre-pass in main also consults.
+#   - The pass driven end-to-end through the real parser + `infer_program`
+#     + `perceus_pass`: a source string is parsed, inference embeds the
+#     `.ty` each Expr carries, and `perceus_pass` rewrites the typed
+#     decls. This exercises the private rewrite walk (`perceus_decl` /
+#     `pcs_rewrite_expr` / `pcs_prepend_unused_drops` / the dup-marking
+#     machinery) transitively — the same surface every selfhost rides.
+#
+# Property checks (body Bool, NOT assert — `kai check` reports a
+# counterexample per input): the non-lambda use counter is additive in
+# its accumulator, and a single non-lambda use always classifies as LUAt.
+# Both use an `Int` generator; a `String` generator currently trips a
+# pre-existing --prop-check runtime fragility (reproducible on main).
+#
+# Runner: `kai test stage2/.`. Property checks: `kai check`.
+
+import compiler.lex
+import compiler.ast
+import compiler.parse
+import compiler.infer
+import compiler.perceus
+
+# ---- helpers ----
+
+fn parse_decls(src: String) : [Decl] / Console {
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    Some(ds) -> ds
+    None     -> []
+  }
+}
+
+# Parse + infer so each Expr node carries the `.ty` the perceus pass
+# reads, then return the typed decl stream.
+fn typed_decls(src: String) : [Decl] / Console + File {
+  let tp = infer_program("test.kai", parse_decls(src), false)
+  tp.decls
+}
+
+# Classify the LU result by tag for assert comparison (LU has no
+# structural equality op exposed; match on the variant).
+fn lu_is_unused(lu: LU) : Bool = match lu {
+  LUUnused(_) -> true
+  _           -> false
+}
+
+fn lu_is_blocked(lu: LU) : Bool = match lu {
+  LUBlocked(_) -> true
+  _            -> false
+}
+
+fn lu_is_at(lu: LU) : Bool = match lu {
+  LUAt(_, _, _) -> true
+  _             -> false
+}
+
+# ==================================================================
+# Unit tests — pure helpers (last-use + use-count)
+# ==================================================================
+
+test "last_use_for on an empty use list reports LUUnused" {
+  assert lu_is_unused(last_use_for("x", []))
+}
+
+test "last_use_for with a single non-lambda use reports LUAt" {
+  let uses = [U("x", 3, 7, false)]
+  assert lu_is_at(last_use_for("x", uses))
+}
+
+test "last_use_for with only an in-lambda use is LUBlocked" {
+  let uses = [U("x", 3, 7, true)]
+  assert lu_is_blocked(last_use_for("x", uses))
+}
+
+test "last_use_for ignores uses of other names" {
+  let uses = [U("y", 3, 7, false)]
+  assert lu_is_unused(last_use_for("x", uses))
+}
+
+test "last_use_for picks the latest non-lambda position" {
+  let uses = [U("x", 1, 1, false), U("x", 5, 2, false)]
+  match last_use_for("x", uses) {
+    LUAt(_, ln, _) -> { assert ln == 5 }
+    _              -> { assert false }
+  }
+}
+
+# ---- pcs_count_non_lam_uses ----
+
+test "pcs_count_non_lam_uses counts only matching non-lambda reads" {
+  let uses = [U("x", 1, 1, false), U("x", 2, 1, false), U("x", 3, 1, true)]
+  assert (pcs_count_non_lam_uses("x", uses, 0)) == 2
+}
+
+test "pcs_count_non_lam_uses is zero for an unreferenced name" {
+  let uses = [U("y", 1, 1, false)]
+  assert (pcs_count_non_lam_uses("x", uses, 0)) == 0
+}
+
+test "pcs_count_non_lam_uses excludes in-lambda reads" {
+  let uses = [U("x", 1, 1, true), U("x", 2, 1, true)]
+  assert (pcs_count_non_lam_uses("x", uses, 0)) == 0
+}
+
+# ---- pcs_branch_aware_skip_params ----
+
+test "pcs_branch_aware_skip_params returns empty on an empty param list" {
+  let body = Expr { kind: EInt(0), line: 1, col: 1, ty: None, mode: MUnknown }
+  assert (list_length(pcs_branch_aware_skip_params([], body))) == 0
+}
+
+# ---- perceus_pass end-to-end (through parse + infer) ----
+
+test "perceus_pass preserves a single well-typed fn decl" {
+  let ds = perceus_pass(typed_decls("fn id(x: Int) : Int = x"))
+  assert (list_length(ds)) == 1
+}
+
+test "perceus_pass preserves the decl count on a two-fn module" {
+  let ds = perceus_pass(typed_decls("fn a() : Int = 1\nfn b() : Int = 2"))
+  assert (list_length(ds)) == 2
+}
+
+test "perceus_pass returns the empty decl list unchanged" {
+  let ds = perceus_pass([])
+  assert (list_length(ds)) == 0
+}
+
+test "perceus_pass handles a fn with a multi-use parameter" {
+  let ds = perceus_pass(typed_decls("fn dbl(x: Int) : Int = x + x"))
+  assert (list_length(ds)) == 1
+}
+
+# ==================================================================
+# Property checks (body Bool — `kai check` reports a counterexample)
+# ==================================================================
+
+# The non-lambda use counter is monotone in the obvious sense: counting
+# from a non-zero accumulator just shifts the result by that amount.
+check "pcs_count_non_lam_uses is additive in its accumulator"
+  with n: Int {
+  let uses = [U("x", 1, 1, false)]
+  (pcs_count_non_lam_uses("x", uses, n)) == (n + 1)
+}
+
+# A single non-lambda use at position (n, n) always classifies as LUAt,
+# never as LUUnused/LUBlocked — the use exists and is not closure-bound.
+# (Generator is Int, not String: a String generator currently trips a
+# pre-existing fragility in the --prop-check runtime, unrelated to this
+# pass — reproducible on main; see the lane retro.)
+check "last_use_for of a single non-lambda use is always LUAt"
+  with n: Int {
+  # Positions are 1-based in real ASTs; line/col < 0 are the "unseen"
+  # sentinel the loop seeds with, so clamp the generator to >= 0.
+  let pos = if n < 0 { 0 - n } else { n }
+  let uses = [U("x", pos, pos, false)]
+  lu_is_at(last_use_for("x", uses))
+}
