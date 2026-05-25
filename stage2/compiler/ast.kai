@@ -629,3 +629,156 @@ pub fn is_pos_field_marker(s: String) : Bool {
       } None -> false }
   }
 }
+
+
+# ====================================================================
+# Record table (issue #648) — moved from main.kai under issue #677
+# phase 1m (desugar extraction). RecInfo is a shared AST-adjacent
+# type: the positional-record desugar (compiler.desugar) consumes
+# [RecInfo] in its pass signatures, and the typer threads the same
+# table through inference. ast.kai is the only home both import
+# without a lateral arrow. The typer-only rerank / module-slot
+# helpers (rerank_recs_*, option_str_eq, module_slot_compat) and the
+# arity-only rec_find_arity wrapper stay in main.kai.
+# ====================================================================
+
+#[doc("Record-table entry: type name, type params, field decls, module origin. Built by collect_records, consumed by the positional-record desugar (compiler.desugar) and the typer; an AST-adjacent shared type.")]
+pub type RecInfo = RI(String, [String], [FieldDecl], Option[String])
+
+# Issue #648 — arity-aware record lookup. Two layers, mirroring the
+# variant-side `variants_of_type_loop_arity` (issue #643):
+#
+# 1. **Arity match**. Caller passes `arity = list_length(args)` from
+#    its `TyCon(_, name, args)` scrutinee; we prefer a `RI` whose
+#    `tparams` length matches. Discriminates `Tree[k, v]` (arity 2)
+#    from `Tree` (arity 0).
+#
+# 2. **Field-set tie-break** for same-(name, arity) collisions. The
+#    record-side analog of the variant-side same-arity limitation:
+#    `stdlib/regexp.kai` declares `type Thread = { state_id, captures }`
+#    (private) and a user re-declares `type Thread = { id, name }`.
+#    Both have arity 0. The prelude code (which the typer must also
+#    re-check) accesses `t.state_id`; the user code accesses `t.name`.
+#    Resolving by arity alone hands one or the other the wrong field
+#    set. `rec_find_with_field` (used by field-access call sites)
+#    prefers a `RI` that actually declares the requested field —
+#    that suffices to keep BOTH the user's `t.name` and the prelude's
+#    `t.state_id` resolving to their respective declarations.
+#
+# `arity = -1` is the "caller does not know the arity" sentinel —
+# all matches by bare name are accepted and the first one wins, which
+# reproduces the legacy `rec_find` semantics over the newest-first
+# list.
+
+pub fn rec_find_arity_loop(rs: [RecInfo], target: String, arity: Int,
+                          fallback: Option[RecInfo]) : Option[RecInfo] {
+  match rs {
+    [] -> fallback
+    [r, ...rest] -> match r {
+      RI(nm, tps, _, _) ->
+        if nm == target {
+          if arity < 0 {
+            Some(r)
+          } else if list_length(tps) == arity {
+            Some(r)
+          } else {
+            let fb = match fallback {
+              Some(_) -> fallback
+              None    -> Some(r)
+            }
+            rec_find_arity_loop(rest, target, arity, fb)
+          }
+        } else {
+          rec_find_arity_loop(rest, target, arity, fallback)
+        }
+    }
+  }
+}
+
+pub fn rec_find_loop(rs: [RecInfo], target: String) : Option[RecInfo] =
+  rec_find_arity_loop(rs, target, -1, None)
+
+#[doc("Bare-name record lookup (no arity discrimination); newest-first so a later same-name record shadows an earlier one.")]
+pub fn rec_find(rs: [RecInfo], target: String) : Option[RecInfo] = rec_find_loop(rs, target)
+
+# Issue #648 — field-aware record lookup. When the caller knows the
+# field being accessed (or the field-set being constructed), prefer
+# an arity-matched `RI` that declares the requested field. This is
+# the record-side same-arity tie-breaker that the variant-side fix
+# left unresolved (`SplitN` / `NB_FragR` skip-list in issue #643).
+# A user `type Thread = { id, name }` and a private prelude `type
+# Thread = { state_id, captures }` collide on name + arity 0; the
+# walker hands the user's record back when the access site reads
+# `name`, and the prelude's when the access site reads `state_id`.
+
+#[doc("Field-aware record lookup: among same-(name, arity) records, prefer the one declaring the requested field. Issue #648.")]
+pub fn rec_find_with_field(rs: [RecInfo], target: String, arity: Int,
+                          field: String) : Option[RecInfo] =
+  rec_find_with_field_loop(rs, target, arity, field, None, None)
+
+pub fn rec_find_with_field_loop(rs: [RecInfo], target: String, arity: Int,
+                                field: String, by_field: Option[RecInfo],
+                                by_arity: Option[RecInfo]) : Option[RecInfo] {
+  match rs {
+    [] -> match by_field {
+      Some(_) -> by_field
+      None    -> by_arity
+    }
+    [r, ...rest] -> match r {
+      RI(nm, tps, fs, _) ->
+        if nm == target {
+          let arity_ok = arity < 0 or list_length(tps) == arity
+          if arity_ok {
+            if field_decl_list_has(fs, field) {
+              # First arity-matched record that declares `field`
+              # wins outright — no further walking needed.
+              Some(r)
+            } else {
+              let ba = match by_arity {
+                Some(_) -> by_arity
+                None    -> Some(r)
+              }
+              rec_find_with_field_loop(rest, target, arity, field, by_field, ba)
+            }
+          } else {
+            rec_find_with_field_loop(rest, target, arity, field, by_field, by_arity)
+          }
+        } else {
+          rec_find_with_field_loop(rest, target, arity, field, by_field, by_arity)
+        }
+    }
+  }
+}
+
+pub fn field_decl_list_has(fs: [FieldDecl], target: String) : Bool {
+  match fs {
+    [] -> false
+    [f, ...rest] -> match f {
+      FD(_, nm, _) -> if nm == target { true } else { field_decl_list_has(rest, target) }
+    }
+  }
+}
+
+#[doc("Project a decl stream into the record table ([RecInfo]), newest-first.")]
+pub fn collect_records(ds: [Decl]) : [RecInfo] = collect_records_loop(ds, [])
+
+# Sum-type registry for the region-brand walker (issue #71). The
+# shallow `ty_expr_contains_fiber/pid` walker only sees TypeExprs;
+# a `type Boxed = Wrap(Fiber[Int])` would otherwise hide the Fiber
+# inside the variant's payload, since the surface TypeExpr is just
+# `TyName("Boxed", [])`. SumInfo records (type name, tparams,
+# variants) per `DType ... TBSum`, threaded through `infer_program`
+# the same way `RecInfo` is.
+
+pub fn collect_records_loop(ds: [Decl], acc: [RecInfo]) : [RecInfo] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DType(_, nm, tps, body, _, _, mo) -> match body {
+        TBRecord(fs) -> collect_records_loop(rest, [RI(nm, tps, fs, mo), ...acc])
+        _ -> collect_records_loop(rest, acc)
+      }
+      _ -> collect_records_loop(rest, acc)
+    }
+  }
+}
