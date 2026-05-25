@@ -84,6 +84,51 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.84.0 (2026-05-25)
+
+### Added
+
+- **infer**: extract HM typer + bidirectional inference + dumps into compiler/infer.kai (issue #677 phase 1n1)
+- **refinements**: extend predicate-aware violation messages to EReal / EStr / EChar (#86)
+- **stage2**: flip to package layout — kai.toml + main.kai + compiler/ (issue #677 phase 1c)
+- **stage2**: bundle infrastructure for issue #677 phase 1
+
+### Fixed
+
+- **runtime**: dispatch user Cancel handler on sibling-initiated cancel (#682)
+
+### Changed
+
+- **stage2**: extract cli + driver into compiler/driver.kai, reduce main.kai to fn main() (issue #677 phase 1s)
+- **emit**: extract C emitter + TCO into compiler/emit_c.kai (issue #677 phase 1r)
+- **emit**: rewire emit_llvm.kai onto compiler.emit_shared, delete lvm_* mirrors (issue #677 phase 1r)
+- **emit**: sink backend-shared lowering layer into compiler/emit_shared.kai (issue #677 phase 1r)
+- **monomorph**: extract m4c monomorphisation pass into compiler/monomorph.kai (issue #677 phase 1n2)
+- **emit**: extract LLVM backend into compiler/emit_llvm.kai (issue #677 phase 1q)
+- **protocols**: extract m12.8 protocol system into compiler/protos.kai (issue #677 phase 1p)
+- **perceus**: extract Perceus RC pass into compiler/perceus.kai (issue #677 phase 1n4)
+- **unbox**: extract unboxing pass into compiler/unbox.kai (issue #677 phase 1n3)
+- **unbox**: pre-sink fn registry + use scanner into compiler/fnreg.kai (issue #677 phase 1n3)
+- **ast**: sink ProtoImplReg + 4 sibling types into compiler/ast.kai (issue #677 phase 1n0)
+- **stage2**: extract AST desugar passes into compiler/desugar.kai
+- **stage2**: extract module system into compiler/modules.kai
+- **stage2**: extract cache codec + AST serde into compiler/cache.kai
+- **stage2**: extract kai fmt into compiler/fmt.kai + module tests (issue #677 phase 1j)
+- **make**: run the five costly stage2 dump targets under -j5
+- **ci**: parallelise tier1 fixture-loop test scripts via xargs -P
+- **stage2**: extract name resolution into compiler/resolve.kai + module tests (issue #677 phase 1i)
+- **stage2**: extract the parser into compiler/parse.kai + module tests (issue #677 phase 1h H2)
+- **stage2**: extract refinement-discharge engine into compiler/refinements.kai + module tests (issue #677 phase 1h H1)
+- **stage2**: extract low-level util helpers into compiler/util.kai + module tests (issue #677 phase 1h H1a)
+- **stage2**: parse extraction pre-flight + H0 surface cleanup (issue #677 phase 1h)
+- **stage2**: un-pub audit on compiler/{chars,diag,lex,ast,intervals}.kai (issue #677 follow-up)
+- **stage2**: extract integer interval lattice into compiler/intervals.kai (issue #677 phase 1g)
+- **stage2**: extract AST data model + semantic Ty/Row into compiler/ast.kai (issue #677 phase 1f)
+- **stage2**: extract lexer into compiler/lex.kai + module tests (issue #677 phase 1e)
+- **stage2**: extract diagnostics into compiler/diag.kai (issue #677 phase 1d)
+- **stage2**: finish chars extraction and retire orphan compiler.kai
+- **stage2**: extract char primitives into src/chars.kai (issue #677 phase 1b)
+
 ## v0.83.3 (2026-05-23)
 
 ### Fixed
