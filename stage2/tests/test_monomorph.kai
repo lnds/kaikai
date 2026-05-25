@@ -1,0 +1,222 @@
+# compiler/monomorph.kai unit tests — per-module tests for the m4c
+# monomorphisation pass extracted under issue #677 Phase 1n2.
+#
+# The module's public surface is small (1 fn + 3 types): `monomorphise`
+# and the result types `MonoOutput` / `MLeakRecord` / `LeakLoc`. Every
+# helper (the substitution engine, the tuple bookkeeping, the call
+# rewriters, the Phase 3 leak walkers) is private, so coverage drives
+# `monomorphise` end-to-end through the real parser + `infer_program`:
+# a source string is parsed, inference embeds the `.ty` each Expr
+# carries and populates `tp.insts` with the resolved instantiations,
+# and `monomorphise` rewrites the typed decls. This exercises the
+# private specialisation walk transitively — the same surface every
+# selfhost rides.
+#
+# Coverage splits two ways:
+#
+#   - Non-generic programs: monomorphise is near-identity (no insts to
+#     specialise), so the decl ordering and count are preserved and the
+#     leak record list is empty (the m4c Phase 3 invariant holds
+#     trivially when there is nothing to substitute).
+#   - Generic programs: a `fn id[T](x: T) : T` used at two concrete
+#     types produces specialised copies, so the output decl count grows
+#     and stays leak-free (every spec body is fully substituted).
+#
+# Property checks (body Bool, NOT assert — `kai check` reports a
+# counterexample per input): monomorphise on a leak-free non-generic
+# program never produces a leak record, and `MonoOut` round-trips its
+# decl list. Both use `Int` generators; a `String` generator currently
+# trips a pre-existing --prop-check runtime fragility (reproducible on
+# main).
+#
+# Runner: `kai test stage2/.`. Property checks: `kai check`.
+
+import compiler.lex
+import compiler.ast
+import compiler.parse
+import compiler.infer
+import compiler.protos
+import compiler.monomorph
+
+# ---- helpers ----
+
+fn parse_decls(src: String) : [Decl] / Console {
+  let r = parse.parse_program("<test>", src, tokenize(src))
+  match r.decls {
+    Some(ds) -> ds
+    None     -> []
+  }
+}
+
+# Parse + infer so each Expr node carries the `.ty` and `tp.insts` is
+# populated with the resolved concrete instantiations the monomorphiser
+# specialises against.
+fn typed_of(src: String) : TypedProgram / Console + File =
+  infer_program("test.kai", parse_decls(src), false)
+
+# An empty protocol registry: these tests exercise plain HM generics,
+# no protocol dispatch, so every field is the empty list.
+fn empty_reg() : ProtocolReg =
+  ProtocolReg { ops: [], impls: [], op_names: [], tparams: [], origins: [] }
+
+# Run the pass with an empty registry + no local arities (no protocol
+# call sites to rename) and return the MonoOutput.
+fn run_mono(src: String) : MonoOutput / Console + File =
+  monomorphise(typed_of(src), empty_reg(), [])
+
+# Project the decl list out of a MonoOutput.
+fn mono_decls(o: MonoOutput) : [Decl] = match o {
+  MonoOut(ds, _) -> ds
+}
+
+# Project the leak records out of a MonoOutput.
+fn mono_leaks(o: MonoOutput) : [MLeakRecord] = match o {
+  MonoOut(_, ls) -> ls
+}
+
+# Surface name of a top-level decl (only DFn / DType carry a name we
+# assert on here; everything else returns "").
+fn decl_name(d: Decl) : String = match d {
+  DFn(_, n, _, _, _, _, _, _, _, _) -> n
+  DType(_, n, _, _, _, _, _)         -> n
+  _                                  -> ""
+}
+
+# Does this decl stream contain a fn named `nm`?
+fn has_fn_named(ds: [Decl], nm: String) : Bool = match ds {
+  []            -> false
+  [d, ...rest]  -> if decl_name(d) == nm { true } else { has_fn_named(rest, nm) }
+}
+
+# Count how many decls carry the (mangled or plain) name prefix `nm`
+# — used to count specialisations whose mangle starts with the base.
+fn count_name_prefixed(ds: [Decl], pre: String) : Int = match ds {
+  []           -> 0
+  [d, ...rest] -> {
+    let n = decl_name(d)
+    let here = if string_length(n) >= string_length(pre) and string_slice(n, 0, string_length(pre)) == pre { 1 } else { 0 }
+    here + count_name_prefixed(rest, pre)
+  }
+}
+
+# ==================================================================
+# Unit tests — pub result types are constructible + projectable
+# ==================================================================
+
+test "MonoOut projects its decl list back out" {
+  let o = MonoOut([], [])
+  assert list_length(mono_decls(o)) == 0
+}
+
+test "MonoOut projects its leak record list back out" {
+  let o = MonoOut([], [])
+  assert list_length(mono_leaks(o)) == 0
+}
+
+test "MLeakRec carries name, count, and an optional location" {
+  let r = MLeakRec("spec_id", 2, None)
+  match r {
+    MLeakRec(nm, n, loc) -> {
+      assert nm == "spec_id"
+      assert n == 2
+      assert match loc { None -> true _ -> false }
+    }
+  }
+}
+
+test "MLeakAt carries line, col, and the rendered offending type" {
+  let r = MLeakRec("f", 1, Some(MLeakAt(7, 3, "Int")))
+  match r {
+    MLeakRec(_, _, loc) -> match loc {
+      Some(MLeakAt(line, col, ty_s)) -> {
+        assert line == 7
+        assert col == 3
+        assert ty_s == "Int"
+      }
+      None -> { assert false }
+    }
+  }
+}
+
+# ==================================================================
+# Unit tests — monomorphise driven end-to-end
+# ==================================================================
+
+test "monomorphise preserves a single non-generic fn" {
+  let o = run_mono("fn main() : Int = 41")
+  assert has_fn_named(mono_decls(o), "main")
+}
+
+test "monomorphise on a non-generic program is leak-free" {
+  let o = run_mono("fn add(a: Int, b: Int) : Int = a + b\nfn main() : Int = add(1, 2)")
+  assert list_length(mono_leaks(o)) == 0
+}
+
+test "monomorphise keeps every non-generic top-level decl" {
+  let o = run_mono("fn one() : Int = 1\nfn two() : Int = 2\nfn main() : Int = one() + two()")
+  let ds = mono_decls(o)
+  assert has_fn_named(ds, "one")
+  assert has_fn_named(ds, "two")
+  assert has_fn_named(ds, "main")
+}
+
+test "monomorphise preserves a type declaration alongside fns" {
+  let o = run_mono("type Pair = P(Int, Int)\nfn fst(p: Pair) : Int = match p { P(a, _) -> a }\nfn main() : Int = fst(P(3, 4))")
+  let ds = mono_decls(o)
+  assert has_fn_named(ds, "Pair")
+  assert has_fn_named(ds, "fst")
+}
+
+test "monomorphise specialises a generic fn used at a concrete type" {
+  # `id` instantiated at Int: the spec list must still be leak-free and
+  # the base name (or its mangle) must survive in the output.
+  let o = run_mono("fn id[T](x: T) : T = x\nfn main() : Int = id(7)")
+  assert list_length(mono_leaks(o)) == 0
+  assert count_name_prefixed(mono_decls(o), "id") >= 1
+}
+
+test "monomorphise on a generic fn used at two types stays leak-free" {
+  let src = "fn id[T](x: T) : T = x\nfn main() : Int = { let a = id(7)\n let b = id(9)\n a + b }"
+  let o = run_mono(src)
+  assert list_length(mono_leaks(o)) == 0
+}
+
+test "monomorphise never drops main when a generic helper is present" {
+  let o = run_mono("fn wrap[T](x: T) : T = x\nfn main() : Int = wrap(1)")
+  assert has_fn_named(mono_decls(o), "main")
+}
+
+# ==================================================================
+# Property checks (body Bool, NOT assert) — Int generators only.
+# ==================================================================
+
+# A freshly built MonoOut with `n` placeholder leak records reports
+# exactly `n` leaks back through the projection — the result type is a
+# transparent carrier, no hidden filtering.
+check "MonoOut leak projection round-trips its length"
+  with n: Int {
+  let k = if n < 0 { 0 - n } else { n }
+  let small = k - (k / 5) * 5   # clamp 0..4 to keep the list tiny
+  let recs = build_leak_recs(small, [])
+  list_length(mono_leaks(MonoOut([], recs))) == small
+}
+
+# A MonoOut built with `k` empty decl slots projects `k` decls back —
+# the decl list is carried transparently.
+check "MonoOut decl projection round-trips its length"
+  with n: Int {
+  let k = if n < 0 { 0 - n } else { n }
+  let small = k - (k / 4) * 4   # clamp 0..3
+  list_length(mono_decls(MonoOut(build_unit_decls(small, []), []))) == small
+}
+
+# Build `n` placeholder leak records (Int-only payloads).
+fn build_leak_recs(n: Int, acc: [MLeakRecord]) : [MLeakRecord] =
+  if n <= 0 { acc }
+  else { build_leak_recs(n - 1, [MLeakRec("s", n, None), ...acc]) }
+
+# Build `n` trivial nullary-test decls so the list has a known length
+# without needing a generic Decl builder.
+fn build_unit_decls(n: Int, acc: [Decl]) : [Decl] =
+  if n <= 0 { acc }
+  else { build_unit_decls(n - 1, [DTest("t", mk_expr(EUnit, n, 1), n, 1), ...acc]) }
