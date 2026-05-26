@@ -2228,14 +2228,16 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
       # Issue #706: self-tail-call sentinel planted by
       # `tcrec_rewrite_decls` (run for both backends since #706). Lower
       # to a param-slot store + `br %tcrec.loop`. The sentinel carries
-      # `__kai_tcrec|<c_sym>|<dropmask>|<p0>|...`; the c_sym is unused
-      # here (the loop label is the fixed `%tcrec.loop`), only the
-      # dropmask + pnames drive the rebind.
+      # `__kai_tcrec|<c_sym>|<dropmask>|<p0>|...`. The c_sym is *not* the
+      # loop label (that is the fixed `%tcrec.loop`) but it IS needed to
+      # look the callee up in the UFn registry (issue #709): a UFn rebinds
+      # all params via borrow-reads, so the LLVM back-edge must drop every
+      # boxed slot value, not just the C-dropmask'd ones.
       if es_tcrec_is_sentinel(nm) {
         match es_tcrec_split_pipe(nm) {
-          [_, _, dropmask_str, ...pnames] -> {
+          [_, c_sym_str, dropmask_str, ...pnames] -> {
             let dropmask = es_tcrec_parse_decimal(dropmask_str)
-            llvm_emit_tcrec_goto(e, dropmask, pnames, xs)
+            llvm_emit_tcrec_goto(e, c_sym_str, dropmask, pnames, xs)
           }
           _ -> {
             eprint("llvm: malformed tcrec sentinel: #{nm}")
@@ -5327,18 +5329,50 @@ fn llvm_emit_tcrec_reloads(e: LlvmEmit, ps: [Param]) : LlvmEmit {
   }
 }
 
-# Lower a sentinel ECall: evaluate args into temps, drop the dropmask'd
-# params, store the temps back into the param slots, and branch to
+# Lower a sentinel ECall: evaluate args into temps, drop the outgoing
+# slot values, store the temps back into the param slots, and branch to
 # `%tcrec.loop`. A fresh dead block is opened afterwards so the
 # emitter's trailing `br`/`ret`/phi lands in a well-formed (if
 # unreachable) block; `last_val` is `undef`.
-fn llvm_emit_tcrec_goto(e: LlvmEmit, dropmask: Int, pnames: [String],
-                        xs: [Expr]) : LlvmEmit / Console {
+#
+# Issue #709 — which params to drop differs from the C dropmask. In C, a
+# function whose params are all unboxable scalars is a *UFn*: its params
+# are raw `int64_t`/`double` with no refcount, and `tcrec_emit_goto`
+# emits ZERO drops for them (`Some(US(...))` branch, emit_c.kai:9770).
+# The shared dropmask was computed on the Perceus boxed model and is
+# simply discarded by C for a UFn. The LLVM backend has no raw-scalar
+# param path — every param is boxed `%KaiValue*` — and the body reads
+# each param via borrow-readers (`kaix_to_int`, etc.) that do NOT consume
+# it. So at the back-edge every slot value is still live; overwriting the
+# slot without dropping orphans it. Applying the C dropmask here drops
+# only *some* params (e.g. `n` but not `acc` in `loop(n-1, acc+1)`),
+# leaking one boxed Int per iteration per un-dropped param.
+#
+# The fix is UFn-local and reconciles to a SINGLE drop site:
+#   - UFn callee → drop EVERY param slot value (the borrow-read body
+#     never consumed any of them; the dropmask is irrelevant, exactly as
+#     C discards it). This subsumes the dropmask drops — no double-free,
+#     since each `%p_<name>` is dropped exactly once.
+#   - non-UFn callee → keep the C dropmask verbatim. Those bodies use the
+#     classical boxed dup/drop discipline the dropmask was computed for;
+#     a param consumed in the args (e.g. `kaix_add(%p_acc, ...)`) is
+#     already dead and must NOT be dropped again.
+fn llvm_emit_tcrec_goto(e: LlvmEmit, c_sym: String, dropmask: Int,
+                        pnames: [String], xs: [Expr]) : LlvmEmit / Console {
   # 1. evaluate every new arg into a temp register (in order).
   let ra = llvm_emit_args(e, xs, [])
-  # 2. drop the params marked in the dropmask, reading the *current*
-  #    loaded `%p_<name>` value (mirrors C `kai_internal_drop(kai_<p>)`).
-  let e_drops = llvm_emit_tcrec_drops(ra.st, pnames, dropmask, 0)
+  # 2. drop the outgoing slot values, reading the *current* loaded
+  #    `%p_<name>` value. A UFn drops all params (borrow-read body, every
+  #    slot live); a non-UFn follows the C dropmask.
+  let is_ufn = match llvm_lookup_ufn_by_csym(ra.st.fns, c_sym) {
+    Some(_) -> true
+    None    -> false
+  }
+  let e_drops = if is_ufn {
+    llvm_emit_tcrec_drops_all(ra.st, pnames)
+  } else {
+    llvm_emit_tcrec_drops(ra.st, pnames, dropmask, 0)
+  }
   # 3. store each temp into its param slot (declaration order).
   let e_stores = llvm_emit_tcrec_stores(e_drops, pnames, ra.regs, 0)
   # 4. branch back to the loop header.
@@ -5363,6 +5397,43 @@ fn llvm_emit_tcrec_drops(e: LlvmEmit, pnames: [String], dropmask: Int, i: Int) :
         ]))
       } else { e }
       llvm_emit_tcrec_drops(e1, rest, dropmask, i + 1)
+    }
+  }
+}
+
+# Issue #709 — UFn back-edge: drop the outgoing slot value of *every*
+# param. A UFn body reads its (boxed-in-LLVM) params via non-consuming
+# borrow-readers, so each `%p_<name>` reloaded at the loop head is still
+# live at the store; dropping it once balances the slot's reference. This
+# subsumes — does not stack on top of — the C dropmask drops.
+fn llvm_emit_tcrec_drops_all(e: LlvmEmit, pnames: [String]) : LlvmEmit / Console {
+  match pnames {
+    [] -> e
+    [p, ...rest] -> {
+      let reg = string_concat("%p_", p)
+      let d = llvm_fresh_reg(e)
+      let e1 = llvm_append_body(d.e, concat_all([
+        "  ", d.reg, " = call %KaiValue* @kaix_internal_drop(%KaiValue* ", reg, ")\n"
+      ]))
+      llvm_emit_tcrec_drops_all(e1, rest)
+    }
+  }
+}
+
+# Issue #709 — local mirror of emit_c.kai's `lookup_ufn_by_csym`. Finds
+# the EFn registry entry whose emitted C symbol matches `csym` and is
+# classified as a UFn (`Some(UFnSig)`). Mirrored rather than imported to
+# keep emit_llvm's dependency surface unchanged (downward glue only); it
+# uses only `c_sym` (emit_shared) and the EFn/UFnSig types (fnreg), both
+# already imported.
+fn llvm_lookup_ufn_by_csym(fns: [EFn], csym: String) : Option[UFnSig] {
+  match fns {
+    [] -> None
+    [h, ...rest] -> match h {
+      EFn(n, _, mo, Some(us)) ->
+        if c_sym(n, mo) == csym { Some(us) }
+        else { llvm_lookup_ufn_by_csym(rest, csym) }
+      _ -> llvm_lookup_ufn_by_csym(rest, csym)
     }
   }
 }
