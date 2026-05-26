@@ -2225,10 +2225,28 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
 
   match callee.kind {
     EVar(nm) -> {
+      # Issue #706: self-tail-call sentinel planted by
+      # `tcrec_rewrite_decls` (run for both backends since #706). Lower
+      # to a param-slot store + `br %tcrec.loop`. The sentinel carries
+      # `__kai_tcrec|<c_sym>|<dropmask>|<p0>|...`; the c_sym is unused
+      # here (the loop label is the fixed `%tcrec.loop`), only the
+      # dropmask + pnames drive the rebind.
+      if es_tcrec_is_sentinel(nm) {
+        match es_tcrec_split_pipe(nm) {
+          [_, _, dropmask_str, ...pnames] -> {
+            let dropmask = es_tcrec_parse_decimal(dropmask_str)
+            llvm_emit_tcrec_goto(e, dropmask, pnames, xs)
+          }
+          _ -> {
+            eprint("llvm: malformed tcrec sentinel: #{nm}")
+            llvm_set_last(e, "undef")
+          }
+        }
+      }
       # m5 #4 — same dup/drop magic-name handling as the C emit
       # (`emit_call_expr` 4920-4937). Lower to direct `kaix_internal_*`
       # calls. Both names take exactly one arg.
-      if nm == "__perceus_dup" or nm == "__perceus_drop" {
+      else if nm == "__perceus_dup" or nm == "__perceus_drop" {
         let sym = if nm == "__perceus_dup" { "@kaix_internal_dup" } else { "@kaix_internal_drop" }
         let ra = llvm_emit_args(e, xs, [])
         let r = llvm_fresh_reg(ra.st)
@@ -3524,6 +3542,23 @@ fn llvm_param_list_loop(ps: [Param], acc: String) : String {
 
 fn llvm_param_list(ps: [Param]) : String = llvm_param_list_loop(ps, "")
 
+# Issue #706: TCO param list. Names the incoming arguments
+# `%parg_<name>` instead of `%p_<name>` — `%p_<name>` is taken by the
+# per-iteration reload at the loop head (`llvm_emit_tcrec_loop_header`),
+# which is the register the body actually reads.
+fn llvm_param_list_tcrec_loop(ps: [Param], acc: String) : String {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> {
+      let sep = if string_length(acc) == 0 { "" } else { ", " }
+      let piece = concat_all([sep, "%KaiValue* %parg_", p.pname])
+      llvm_param_list_tcrec_loop(rest, string_concat(acc, piece))
+    }
+  }
+}
+
+fn llvm_param_list_tcrec(ps: [Param]) : String = llvm_param_list_tcrec_loop(ps, "")
+
 fn llvm_init_locals_from_params(ps: [Param]) : [LlvmLocal] {
   match ps {
     [] -> []
@@ -4443,26 +4478,48 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
         LlvmDeclOut { text: concat_all([shim.text, thunk]), next_id: shim.next_id }
       } else {
       let locals0 = llvm_init_locals_from_params(ps)
+      # Issue #706: when the body carries a self-tail-call sentinel
+      # (planted by `tcrec_rewrite_decls`, run for both backends),
+      # convert the recursion into a loop. The params can't be SSA
+      # arguments (the back-edge must reassign them), so we alloca a
+      # slot per param in `entry:`, branch to `%tcrec.loop`, and reload
+      # each param as `%p_<name>` at the loop head. The body reads
+      # `%p_<name>` unchanged; the sentinel lowering stores new values
+      # into the slots and branches back. See `llvm_emit_tcrec_goto`.
+      let has_sentinel = llvm_body_has_sentinel(body)
       # Same-module preference: rotate `fns` so DFns from this DFn's
       # module come first. `efn_resolve`'s ambiguous fallback returns
       # the first match so a recursive call resolves to the local
       # module entry. Mirror of the C backend's emit_fn_body.
       let body_fns = fns_prefer_module(fns, mo)
+      # The body's first basic block: `entry` without TCO, `tcrec.loop`
+      # with it (so phi nodes whose incoming value is produced in the
+      # first body block reference the right predecessor).
+      let first_label = if has_sentinel { "tcrec.loop" } else { "entry" }
       let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
                           globals: "", body: "",
-                          last_val: "", cur_label: "entry",
+                          last_val: "", cur_label: first_label,
                           locals: locals0, fns: body_fns, vars_: vs, lams: lams,
                           op_offsets: oo, cls: cls }
-      let e1 = llvm_emit_expr(e0, body)
+      # Prologue (TCO only): alloca + store the incoming args, branch
+      # into the loop header, reload params. Emitted into the body so it
+      # precedes the real body's IR; `cur_label` is already
+      # `tcrec.loop` so the body's first instructions land there.
+      let e_pro = if has_sentinel {
+        let e_slots = llvm_emit_tcrec_slots(e0, ps)
+        llvm_emit_tcrec_loop_header(e_slots, ps)
+      } else { e0 }
+      let e1 = llvm_emit_expr(e_pro, body)
       # m6.2 v2: mint the prefixed symbol when the decl is owned by
       # an imported module. `main` is special-cased — it is always
       # `@kai_main` (the runtime calls it directly), so a hypothetical
       # `pub fn main` defined in a prelude file (none exist today)
       # would still emit unprefixed.
+      let param_list = if has_sentinel { llvm_param_list_tcrec(ps) } else { llvm_param_list(ps) }
       let text = concat_all([
         e1.globals,
         "\n",
-        "define %KaiValue* ", sym, "(", llvm_param_list(ps), ") {\n",
+        "define %KaiValue* ", sym, "(", param_list, ") {\n",
         # The emitter initialises `cur_label` to "entry" (llvm_emit_new
         # / e0 above), so a phi whose incoming value was produced in the
         # function's first basic block references `%entry`. LLVM's
@@ -4473,6 +4530,8 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
         # #622) — EIf always phi-joins freshly opened blocks. Emit the
         # `entry:` header so the label the emitter already tracks is a
         # real block. Mirrors the FFI/proto shims, which label `entry:`.
+        # With TCO, `entry:` holds the alloca prologue and the loop body
+        # opens its own `tcrec.loop:` header inside `e1.body`.
         "entry:\n",
         e1.body,
         "  ret %KaiValue* ", e1.last_val, "\n",
@@ -5102,3 +5161,226 @@ fn lookup_op_offset(table: [OpOffset], key: String) : Option[Int] {
     }
   }
 }
+
+# ====================================================================
+#                       TCO — LLVM sentinel lowering (issue #706)
+# ====================================================================
+#
+# The driver runs `tcrec_rewrite_decls` (emit_c.kai) for BOTH backends
+# now. It plants a `__kai_tcrec|<c_sym>|<dropmask>|<p0>|...` sentinel on
+# every self-tail-call site (always in tail position). The C emitter
+# turns it into a param-rebind + `goto`; the LLVM emitter turns it into
+# a param-slot store + `br %tcrec.loop`.
+#
+# SSA param-rebind mechanism (alloca, not phi): an LLVM `%p_<name>`
+# function argument is an immutable SSA value, so the back-edge cannot
+# reassign it. When a fn body carries a sentinel, `llvm_emit_fn`:
+#
+#   1. renames the incoming arguments to `%parg_<name>`,
+#   2. allocas one `%pslot_<name>` per param in `entry:`, stores the
+#      incoming arg into it, and `br`s to `%tcrec.loop`,
+#   3. opens `%tcrec.loop` and reloads each param as `%p_<name>` — the
+#      exact register the body already reads (locals still map name →
+#      `%p_<name>`), so the body emits unchanged.
+#
+# The sentinel lowering (`llvm_emit_tcrec_goto`) then:
+#   - evaluates each new arg into a temp,
+#   - drops the params whose dropmask bit is set (on the *current*
+#     `%p_<name>` loaded value — the same value the C `tcrec_emit_goto`
+#     drops via `kai_internal_drop(kai_<p>)`),
+#   - stores the temps back into `%pslot_<name>`,
+#   - `br`s to `%tcrec.loop`, then opens a fresh dead block so the
+#     surrounding emitter (which always appends a `br`/`ret`/phi after a
+#     tail expression) stays well-formed. The dead block is unreachable;
+#     LLVM's CFG simplification drops it.
+#
+# The LLVM backend has no UFn (raw-scalar) param path — every param is
+# boxed `%KaiValue*` — so only the boxed branch of the C `tcrec_emit_goto`
+# has an analogue here.
+
+# True when `body` contains a tcrec sentinel anywhere. Must mirror
+# `tcrec_body_has_sentinel`/`tcrec_scan_kind` (emit_c.kai): a tail-only
+# walk is NOT enough, because Perceus wraps the body in
+# `EBlock([entry, SLet(__pcs_ret, <body>), exit_drops], Some(__pcs_ret))`
+# and tcrec rewrites the *SLet RHS* (a statement, not the block tail).
+# We descend block statements (SLet RHS) and every sub-expression.
+fn llvm_body_has_sentinel(body: Expr) : Bool = llvm_sentinel_scan_kind(body.kind)
+
+fn llvm_sentinel_scan_kind(k: ExprKind) : Bool {
+  match k {
+    ECall(f, xs) -> match f.kind {
+      EVar(callee) ->
+        if es_tcrec_is_sentinel(callee) { true } else { llvm_sentinel_scan_exprs(xs) }
+      _ -> if llvm_body_has_sentinel(f) { true } else { llvm_sentinel_scan_exprs(xs) }
+    }
+    EIf(c, t, opt_e) ->
+      if llvm_body_has_sentinel(c) { true }
+      else if llvm_body_has_sentinel(t) { true }
+      else { match opt_e {
+        None -> false
+        Some(e2) -> llvm_body_has_sentinel(e2)
+      } }
+    EMatch(s, arms) ->
+      if llvm_body_has_sentinel(s) { true } else { llvm_sentinel_scan_arms(arms) }
+    EBlock(stmts, opt_tail) ->
+      if llvm_sentinel_scan_stmts(stmts) { true }
+      else { match opt_tail {
+        None -> false
+        Some(e) -> llvm_body_has_sentinel(e)
+      } }
+    EBinop(_, l, r) ->
+      if llvm_body_has_sentinel(l) { true } else { llvm_body_has_sentinel(r) }
+    EUnop(_, x) -> llvm_body_has_sentinel(x)
+    EField(x, _) -> llvm_body_has_sentinel(x)
+    EIndex(x, i) ->
+      if llvm_body_has_sentinel(x) { true } else { llvm_body_has_sentinel(i) }
+    EPipe(l, r) ->
+      if llvm_body_has_sentinel(l) { true } else { llvm_body_has_sentinel(r) }
+    EMapPipe(l, r) ->
+      if llvm_body_has_sentinel(l) { true } else { llvm_body_has_sentinel(r) }
+    EFlatMapPipe(l, r) ->
+      if llvm_body_has_sentinel(l) { true } else { llvm_body_has_sentinel(r) }
+    EFilterPipe(l, r) ->
+      if llvm_body_has_sentinel(l) { true } else { llvm_body_has_sentinel(r) }
+    _ -> false
+  }
+}
+
+fn llvm_sentinel_scan_exprs(es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] ->
+      if llvm_body_has_sentinel(h) { true } else { llvm_sentinel_scan_exprs(rest) }
+  }
+}
+
+fn llvm_sentinel_scan_arms(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, _, b) ->
+        if llvm_body_has_sentinel(b) { true } else { llvm_sentinel_scan_arms(rest) }
+    }
+  }
+}
+
+fn llvm_sentinel_scan_stmts(stmts: [Stmt]) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, rhs)              -> llvm_body_has_sentinel(rhs)
+        SAssert(c, _)                -> llvm_body_has_sentinel(c)
+        SExprStmt(ex)                -> llvm_body_has_sentinel(ex)
+        SVar(_, _, rhs, _, _)        -> llvm_body_has_sentinel(rhs)
+        SIndexAssign(t, ix, v, _, _) ->
+          if llvm_body_has_sentinel(t) { true }
+          else if llvm_body_has_sentinel(ix) { true }
+          else { llvm_body_has_sentinel(v) }
+        SUse(_, _, _)                -> false
+      }
+      if here { true } else { llvm_sentinel_scan_stmts(rest) }
+    }
+  }
+}
+
+# Emit the per-param alloca slots in the entry block, store the
+# incoming `%parg_<name>` arguments, and branch into `%tcrec.loop`.
+fn llvm_emit_tcrec_slots(e: LlvmEmit, ps: [Param]) : LlvmEmit {
+  match ps {
+    [] -> llvm_append_body(e, "  br label %tcrec.loop\n")
+    [p, ...rest] -> {
+      let slot = string_concat("%pslot_", p.pname)
+      let arg  = string_concat("%parg_", p.pname)
+      let e1 = llvm_append_body(e, concat_all([
+        "  ", slot, " = alloca %KaiValue*\n",
+        "  store %KaiValue* ", arg, ", %KaiValue** ", slot, "\n"
+      ]))
+      llvm_emit_tcrec_slots(e1, rest)
+    }
+  }
+}
+
+# Open `%tcrec.loop` and reload each param into its `%p_<name>`
+# register so the body — which reads params via `%p_<name>` — sees the
+# current loop value. Emits a fresh temp for each load, then renames it
+# to `%p_<name>` via a copy is not possible in SSA; instead we name the
+# load result `%p_<name>` directly (a load is a fresh definition, so
+# this is the single dominating definition of `%p_<name>` for the whole
+# loop body).
+fn llvm_emit_tcrec_loop_header(e: LlvmEmit, ps: [Param]) : LlvmEmit {
+  let e0 = llvm_open_block(e, "tcrec.loop")
+  llvm_emit_tcrec_reloads(e0, ps)
+}
+
+fn llvm_emit_tcrec_reloads(e: LlvmEmit, ps: [Param]) : LlvmEmit {
+  match ps {
+    [] -> e
+    [p, ...rest] -> {
+      let slot = string_concat("%pslot_", p.pname)
+      let reg  = string_concat("%p_", p.pname)
+      let e1 = llvm_append_body(e, concat_all([
+        "  ", reg, " = load %KaiValue*, %KaiValue** ", slot, "\n"
+      ]))
+      llvm_emit_tcrec_reloads(e1, rest)
+    }
+  }
+}
+
+# Lower a sentinel ECall: evaluate args into temps, drop the dropmask'd
+# params, store the temps back into the param slots, and branch to
+# `%tcrec.loop`. A fresh dead block is opened afterwards so the
+# emitter's trailing `br`/`ret`/phi lands in a well-formed (if
+# unreachable) block; `last_val` is `undef`.
+fn llvm_emit_tcrec_goto(e: LlvmEmit, dropmask: Int, pnames: [String],
+                        xs: [Expr]) : LlvmEmit / Console {
+  # 1. evaluate every new arg into a temp register (in order).
+  let ra = llvm_emit_args(e, xs, [])
+  # 2. drop the params marked in the dropmask, reading the *current*
+  #    loaded `%p_<name>` value (mirrors C `kai_internal_drop(kai_<p>)`).
+  let e_drops = llvm_emit_tcrec_drops(ra.st, pnames, dropmask, 0)
+  # 3. store each temp into its param slot (declaration order).
+  let e_stores = llvm_emit_tcrec_stores(e_drops, pnames, ra.regs, 0)
+  # 4. branch back to the loop header.
+  let e_br = llvm_append_body(e_stores, "  br label %tcrec.loop\n")
+  # 5. open a fresh dead block; the surrounding tail handling appends a
+  #    terminator here that will never execute.
+  let dead = llvm_fresh_label(e_br, "tcrec.dead.")
+  let e_dead = llvm_open_block(dead.e, dead.reg)
+  llvm_set_last(e_dead, "undef")
+}
+
+fn llvm_emit_tcrec_drops(e: LlvmEmit, pnames: [String], dropmask: Int, i: Int) : LlvmEmit / Console {
+  match pnames {
+    [] -> e
+    [p, ...rest] -> {
+      let bit = llvm_tcrec_pow2(i)
+      let e1 = if (dropmask / bit) % 2 == 1 {
+        let reg = string_concat("%p_", p)
+        let d = llvm_fresh_reg(e)
+        llvm_append_body(d.e, concat_all([
+          "  ", d.reg, " = call %KaiValue* @kaix_internal_drop(%KaiValue* ", reg, ")\n"
+        ]))
+      } else { e }
+      llvm_emit_tcrec_drops(e1, rest, dropmask, i + 1)
+    }
+  }
+}
+
+fn llvm_emit_tcrec_stores(e: LlvmEmit, pnames: [String], regs: [String], i: Int) : LlvmEmit {
+  match pnames {
+    [] -> e
+    [p, ...rest] -> match regs {
+      [] -> e
+      [r, ...rrest] -> {
+        let slot = string_concat("%pslot_", p)
+        let e1 = llvm_append_body(e, concat_all([
+          "  store %KaiValue* ", r, ", %KaiValue** ", slot, "\n"
+        ]))
+        llvm_emit_tcrec_stores(e1, rest, rrest, i + 1)
+      }
+    }
+  }
+}
+
+fn llvm_tcrec_pow2(n: Int) : Int = if n <= 0 { 1 } else { 2 * llvm_tcrec_pow2(n - 1) }
