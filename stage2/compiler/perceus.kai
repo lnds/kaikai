@@ -384,11 +384,32 @@ fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
       # would double-free.
       if body_is_ffi_extern(body) { d }
       # Phase 3 unboxing — UFn params are raw C scalars (`int64_t`
-      # etc.) with no reference count. dup/drop emission against
-      # `kai_<pname>` would refer to a non-existent boxed alias.
-      # Skip Perceus for unboxed-signature decls; the body has no
-      # RC obligations on its own params.
-      else if prc_is_ufn_decl(fns, name, mo) { d }
+      # etc.) with no reference count, so they carry NO dup/drop
+      # obligation: they must stay out of the Perceus scope (a dup
+      # against `kai_<pname>` would name a non-existent boxed alias)
+      # and never receive an unused-param drop.
+      #
+      # Issue #703 — but the *body* of a UFn can still bind boxed
+      # locals (`let v = A([..])`), and the match emitter consumes
+      # (`kai_decref(_scr)`) its scrutinee on every match exit. A
+      # boxed local read by ≥ 2 matches therefore needs the same
+      # dup-at-non-last-read + exit-drop discipline as any other
+      # block-local. The previous code skipped Perceus for the
+      # *entire* UFn body, so the second `match v` dispatched on a
+      # freed chunk → "non-exhaustive match" (C honored the missing
+      # dup; LLVM happened not to). The fix runs the body rewrite
+      # with an EMPTY param scope (mirroring DTest below): in-body
+      # SLet bindings enter the scope during the walk and get their
+      # dups + exit drops, while the raw params stay untouched and
+      # `pcs_prepend_unused_drops` is skipped (no boxed params to
+      # reclaim).
+      else if prc_is_ufn_decl(fns, name, mo) {
+        let uses = pcs_collect_uses_expr(body, [], false, [])
+        let new_body = pcs_rewrite_expr(body, [], uses, false, [])
+        let arm_dropped = pcs_arm_drop_pass(new_body, name, [], uses)
+        let reused_body = pcs_recognise_reuse_expr(arm_dropped)
+        DFn(is_pub, name, tparams, params, opt_ret, row, reused_body, ln, cl, mo)
+      }
       else {
         let pnames = map(params, (p) => p.pname)
         let uses = pcs_collect_uses_expr(body, pnames, false, [])
