@@ -484,6 +484,8 @@ tier1-asan: kaic2
 	@echo "tier1-asan OK — issue #298 fixture passes under ASAN+UBSan (closure capture lifecycle gate)"
 	@$(MAKE) -C stage2 test-perceus-issue350-asan
 	@echo "tier1-asan OK — issue #350 fixtures pass under ASAN+UBSan (arm-binding multi-use drop gate)"
+	@$(MAKE) -C stage2 test-perceus-issue703-asan
+	@echo "tier1-asan OK — issue #703 fixture passes under ASAN+UBSan (UFn-body let-bound variant double-match gate)"
 	@$(MAKE) -C stage2 test-match-pbind-catchall-asan
 	@echo "tier1-asan OK — issue #91 fixture passes under ASAN+UBSan (PBind catch-all fast-path raw-local gate)"
 	@$(MAKE) -C stage2 test-http-client-asan
