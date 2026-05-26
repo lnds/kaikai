@@ -713,13 +713,69 @@ fn llvm_encode_body_loop(src: String, i: Int, n: Int, acc: String, bytes: Int) :
           match char_at(src, i + 1) {
             None -> EncodedBody { text: acc, n_bytes: bytes }
             Some(c2) -> {
-              let piece = llvm_byte_literal(decode_kai_escape(c2))
-              llvm_encode_body_loop(src, i + 2, n, string_concat(acc, piece), bytes + 1)
+              # `\xNN` is two hex digits forming one byte (0..255). The
+              # front-end accepts it in string literals and the C backend
+              # emits the span verbatim for the C compiler to decode; here
+              # we must decode it ourselves and advance the cursor by 4
+              # (`\`, `x`, hi, lo) rather than the 2 a single-char escape
+              # uses. Without this the `\x` is read as the escape `\x`
+              # (= byte for `x`) leaving the two hex digits as literal
+              # bytes — the cluster-A root cause (issue #618).
+              if c2 == 'x' {
+                match llvm_decode_hex_byte(src, i + 2, n) {
+                  Some(b) -> {
+                    let piece = llvm_byte_literal(b)
+                    llvm_encode_body_loop(src, i + 4, n, string_concat(acc, piece), bytes + 1)
+                  }
+                  None -> {
+                    # Malformed `\x` (fewer than two hex digits): fall back
+                    # to the single-char escape so we never silently drop
+                    # bytes. The front-end rejects this shape, so reaching
+                    # here means a degenerate literal.
+                    let piece = llvm_byte_literal(decode_kai_escape(c2))
+                    llvm_encode_body_loop(src, i + 2, n, string_concat(acc, piece), bytes + 1)
+                  }
+                }
+              } else {
+                let piece = llvm_byte_literal(decode_kai_escape(c2))
+                llvm_encode_body_loop(src, i + 2, n, string_concat(acc, piece), bytes + 1)
+              }
             }
           }
         } else {
           let piece = llvm_byte_literal(char_to_int(c))
           llvm_encode_body_loop(src, i + 1, n, string_concat(acc, piece), bytes + 1)
+        }
+      }
+    }
+  }
+}
+
+# Decode the two hex digits of a `\xNN` escape into a byte 0..255.
+# `i` points at the first hex digit (the char after `x`). Returns None
+# if there are not two valid hex digits available — the caller treats
+# that as a degenerate literal. Mirrors the lexer's `ch_is_hex_digit`
+# acceptance for `\x` and `parse.kai`'s `decode_hex_loop` digit values.
+fn llvm_hex_digit_value(c: Char) : Option[Int] {
+  if c >= '0' and c <= '9' { Some(char_to_int(c) - char_to_int('0')) }
+  else if c >= 'a' and c <= 'f' { Some(char_to_int(c) - char_to_int('a') + 10) }
+  else if c >= 'A' and c <= 'F' { Some(char_to_int(c) - char_to_int('A') + 10) }
+  else { None }
+}
+
+fn llvm_decode_hex_byte(src: String, i: Int, n: Int) : Option[Int] {
+  if i + 1 >= n { None }
+  else {
+    match char_at(src, i) {
+      None -> None
+      Some(hi) -> match char_at(src, i + 1) {
+        None -> None
+        Some(lo) -> match llvm_hex_digit_value(hi) {
+          None -> None
+          Some(hv) -> match llvm_hex_digit_value(lo) {
+            None -> None
+            Some(lv) -> Some(hv * 16 + lv)
+          }
         }
       }
     }
