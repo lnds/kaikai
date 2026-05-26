@@ -33,10 +33,21 @@ under LLVM. Path: `kai_to_string(KAI_CHAR)` → `Show for Char`.
   (#618), `r9_clause_capture` (char `P` lost → prints `[[` not `[P`).
 - The static literal `EChar('A')` at `emit_llvm.kai:1184` emits
   `int_to_string(char_to_int(c))` which is **correct** for raw unboxed
-  Char; the bug is the dynamic runtime render, not the literal.
-- asu's note: likely **two sub-bugs** under one roof (ASCII single-byte
-  vs UTF-8 multi-byte). One lane, expect two patches. C oracle:
-  diff `kai_to_string(KAI_CHAR)` in `runtime.h` vs `runtime_llvm.c`.
+  Char; not the literal.
+- **ROOT CAUSE (refined 2026-05-26, supersedes the runtime hypothesis):**
+  it is NOT the dynamic runtime render — `kaix_to_string` forwards to the
+  shared `kai_to_string`, identical on both backends. The bug is the
+  **emitter dropping `\xNN` hex escapes in string literals.**
+  `llvm_encode_body_loop` calls `decode_kai_escape`, which has no `\x`
+  case, so `"\x41"` emits bytes `x`,`4`,`1` instead of `A`. The C
+  backend emits the literal verbatim and the C compiler decodes `\x41`.
+  One-line repro: `"\x41\x42"` → C `AB` (len 2), LLVM `x41x42` (len 6).
+  The JSON garbling is downstream: `json_byte_table()` in
+  `stdlib/encoding/json.kai` is a `"\x01..\xff"` literal that
+  `json_utf8_encode` slices — mis-encoded under LLVM corrupts every
+  decoded codepoint. asu's "two sub-bugs" guess was wrong: **one cause,
+  one patch** (add `\xNN` decoding to the emitter, advancing the loop
+  cursor by 4 not 2).
 
 ### Cluster B — default-handler null deref in kai_main (NARROWED to 4)
 
