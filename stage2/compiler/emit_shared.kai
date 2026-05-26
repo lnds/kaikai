@@ -2849,3 +2849,63 @@ fn es_unit_expr_display(u: UnitExprT) : String {
 # args. Parametric effects are projected to their bare name (so
 # `Reader[Int]` and `Reader[String]` both yield `Reader`); callers
 # that need to distinguish instantiations work on the full label list.
+
+# ---- TCO self-tail-call sentinel (issue #37 / #706) ----------------
+#
+# `tcrec_rewrite_decls` (emit_c.kai) plants a sentinel on every
+# self-tail-call site: it rewrites the callee `EVar` to
+# `__kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...`. Both backends consume
+# the same string:
+#
+#   - the C emitter lowers it to a param-rebind + `goto _kai_<sym>_entry`
+#     (`tcrec_emit_goto`, emit_c.kai),
+#   - the LLVM emitter lowers it to a param-slot store + `br %tcrec.loop`
+#     (`llvm_emit_tcrec_goto`, emit_llvm.kai).
+#
+# The recognition + parsing helpers live here so the sentinel's wire
+# format has a single owner across both backends. The *analysis* that
+# computes the dropmask and decides which sites are tail-self-calls
+# stays in emit_c.kai; the driver runs it for both backends (issue
+# #706 dropped the `if use_llvm` skip).
+
+#[doc("True when an EVar callee carries a `__kai_tcrec|...` self-tail-call sentinel planted by tcrec_rewrite_decls. Shared by both backends.")]
+pub fn es_tcrec_is_sentinel(callee: String) : Bool =
+  string_starts_with_q(callee, "__kai_tcrec|")
+
+#[doc("Split a `|`-delimited sentinel string into its fields: [marker, c_sym, dropmask, p0, p1, ...]. Shared by both backends.")]
+pub fn es_tcrec_split_pipe(s: String) : [String] =
+  es_tcrec_split_pipe_loop(s, 0, 0, string_length(s), [])
+
+fn es_tcrec_split_pipe_loop(s: String, start: Int, i: Int, n: Int, acc: [String]) : [String] {
+  if i >= n {
+    list_reverse([string_slice(s, start, n - start), ...acc])
+  } else {
+    match char_at(s, i) {
+      None -> list_reverse([string_slice(s, start, n - start), ...acc])
+      Some(c) ->
+        if c == '|' {
+          es_tcrec_split_pipe_loop(s, i + 1, i + 1, n,
+            [string_slice(s, start, i - start), ...acc])
+        } else {
+          es_tcrec_split_pipe_loop(s, start, i + 1, n, acc)
+        }
+    }
+  }
+}
+
+#[doc("Parse a decimal-digit prefix of `s` into an Int (the dropmask field of a sentinel). Stops at the first non-digit. Shared by both backends.")]
+pub fn es_tcrec_parse_decimal(s: String) : Int =
+  es_tcrec_parse_decimal_loop(s, 0, string_length(s), 0)
+
+fn es_tcrec_parse_decimal_loop(s: String, i: Int, n: Int, acc: Int) : Int {
+  if i >= n { acc }
+  else { match char_at(s, i) {
+    None -> acc
+    Some(c) -> {
+      let d = char_to_int(c) - char_to_int('0')
+      if d >= 0 and d <= 9 {
+        es_tcrec_parse_decimal_loop(s, i + 1, n, acc * 10 + d)
+      } else { acc }
+    }
+  } }
+}
