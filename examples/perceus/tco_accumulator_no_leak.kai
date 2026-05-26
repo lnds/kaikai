@@ -1,0 +1,37 @@
+# Issue #709 — LLVM TCO accumulator must not leak per iteration.
+#
+# `loop/2` is a self-tail-recursive function with an arithmetic
+# accumulator. After TCO landed in the LLVM backend (#706, PR #708) it
+# ran in constant *stack* space, but the back-edge overwrote the `acc`
+# param slot without dropping the outgoing boxed Int — leaking one box
+# per iteration (linear memory growth: ~5M Ints over 5M iters).
+#
+# Root cause: the shared tcrec dropmask is computed on the C model,
+# where `loop/2` is a UFn (raw `int64_t` params, no refcount) and C
+# emits ZERO drops. The LLVM backend has no raw-scalar param path —
+# every param is boxed — and reads them via non-consuming borrow-readers
+# (`kaix_to_int`), so every slot value is live at the back-edge. The fix
+# (`llvm_emit_tcrec_goto`, emit_llvm.kai) drops every param slot for a
+# UFn callee, subsuming the dropmask.
+#
+# The fixture is run two ways:
+#   - golden stdout (this `.out.expected`): correctness on both backends.
+#   - `test-tco-llvm-709` (stage2/Makefile): asserts `KAI_TRACE_RC`
+#     `leaked` is the SAME small constant at N=1000 and N=100000, i.e.
+#     independent of iteration count. ASAN cannot catch this (a leak is
+#     not a UAF, and macOS runs `detect_leaks=0`); the trace check is the
+#     real gate, mirroring the #706 lane's blind spot.
+#
+# `acc + n` cross-multiplies the iteration index into the accumulator so
+# the result is sensitive to TCO actually running every step (not just
+# returning early), and the running `acc` quickly leaves the small-int
+# cache so a leaked box is a genuine heap allocation, not an interned
+# singleton.
+
+fn loop(n: Int, acc: Int) : Int =
+  if n == 0 { acc } else { loop(n - 1, acc + n) }
+
+fn main() : Int / Console = {
+  print(int_to_string(loop(1000, 0)))
+  0
+}
