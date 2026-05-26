@@ -4407,6 +4407,17 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
         e1.globals,
         "\n",
         "define %KaiValue* ", sym, "(", llvm_param_list(ps), ") {\n",
+        # The emitter initialises `cur_label` to "entry" (llvm_emit_new
+        # / e0 above), so a phi whose incoming value was produced in the
+        # function's first basic block references `%entry`. LLVM's
+        # implicit first block is unnamed unless explicitly labelled, so
+        # that reference is invalid IR ("use of undefined value
+        # '%entry'"). This surfaces only when the first match arm's body
+        # ends in the entry block (e.g. Perceus reuse lowering, issue
+        # #622) — EIf always phi-joins freshly opened blocks. Emit the
+        # `entry:` header so the label the emitter already tracks is a
+        # real block. Mirrors the FFI/proto shims, which label `entry:`.
+        "entry:\n",
         e1.body,
         "  ret %KaiValue* ", e1.last_val, "\n",
         "}\n",
@@ -4796,15 +4807,20 @@ fn llvm_emit_lambda_capture_loads(e: LlvmEmit, caps: [String], i: Int) : LlvmEmi
 # lambda's body was emitted; `find_lam` then failed at the inner
 # `ELambda` use site and the emitter substituted `undef` for the
 # closure pointer (visible as the "lambda info missing" stderr line).
-fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : String / Console {
+fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : LlvmDeclOut / Console {
 
   llvm_emit_lambda_bodies_loop(lams, lams, fns, vs, oo, cls, start_id, acc)
 }
 
-fn llvm_emit_lambda_bodies_loop(remaining: [LamInfo], all_lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : String / Console {
+# Returns LlvmDeclOut (not just the text) so the id counter survives
+# the lambda phase: clause bodies must start where lambdas left off,
+# otherwise both phases mint globals from the same `decls_out.next_id`
+# base and collide (e.g. two `@eff.disp.name.N` for distinct effects,
+# issue #622 — clang rejects the redefinition).
+fn llvm_emit_lambda_bodies_loop(remaining: [LamInfo], all_lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : LlvmDeclOut / Console {
 
   match remaining {
-    [] -> acc
+    [] -> LlvmDeclOut { text: acc, next_id: start_id }
     [l, ...rest] -> {
       let out = llvm_emit_lambda_body(l, fns, vs, all_lams, oo, cls, start_id)
       llvm_emit_lambda_bodies_loop(rest, all_lams, fns, vs, oo, cls, out.next_id, string_concat(acc, out.text))
@@ -4851,7 +4867,7 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String 
   let clauses_info = lc.clauses
   let clauses_out = llvm_emit_clause_bodies(clauses_info, fns, vs, lams, oo,
                                               clauses_info,
-                                              decls_out.next_id, "")
+                                              lam_bodies.next_id, "")
   # m7c-d: emit the install/teardown wrappers the LLVM runtime's
   # `int main` calls. They push/pop default-handler evidence
   # nodes for any builtin (Console / Fail / Stdin / Env / File /
@@ -4864,7 +4880,7 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String 
   let teardown = llvm_emit_main_teardown_defaults(main_row)
   let proto_init = llvm_emit_proto_init(decls, vs)
   concat_all([llvm_header(), eff_structs, "\n",
-              decls_out.text, lam_bodies, clauses_out.text,
+              decls_out.text, lam_bodies.text, clauses_out.text,
               install, teardown, proto_init])
 }
 
