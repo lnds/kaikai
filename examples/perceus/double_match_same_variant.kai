@@ -1,0 +1,45 @@
+# Issue #703 — two consecutive `match v` on the same let-bound variant
+# made the C backend panic `non-exhaustive match` (a Perceus
+# use-after-drop), while LLVM accidentally produced the right answer.
+#
+# Root cause: `f` has an unboxed (UFn) signature `(Int) : Int`, so
+# `perceus_decl` skipped Perceus for the WHOLE body — including its
+# boxed local `let v = A([..])`. The match emitter consumes its
+# scrutinee with `kai_decref(_scr)` on every match exit, assuming the
+# binding arrived pre-wrapped in `__perceus_dup` for non-last reads.
+# With Perceus skipped, neither read was dup-wrapped: the first
+# `match v` freed `v` (rc 1 -> 0), the second dispatched on the freed
+# tag -> "non-exhaustive match". C honored the missing dup; LLVM did
+# not, so it was right by accident.
+#
+# Fix (perceus.kai): a UFn body still runs the dup/exit-drop walk with
+# an EMPTY param scope — params stay raw, but boxed locals get their
+# dups + exit drop. Post-fix the variant is freed exactly once
+# (strict RC report: variant frees == variant allocs).
+#
+# A non-immortal payload is required: the `[seed, seed+1, seed+2]`
+# cons list keeps `v` outside the #304 immortal cache so the rc
+# lifecycle is observable. Both `match v` reads sit in `let _`
+# (non-tail) so the block-exit drop is not skipped for TCO — the
+# tail-position variant is the #297 partial-scope leak, out of
+# scope here.
+
+type V = A([Int]) | B(Int)
+
+fn f(seed: Int) : Int = {
+  let v = A([seed, seed + 1, seed + 2])
+  let _ = match v {
+    A(xs) -> 1
+    B(n) -> n
+  }
+  let _ = match v {
+    A(xs) -> 2
+    B(n) -> n
+  }
+  0
+}
+
+fn main() : Int / Console = {
+  print(int_to_string(f(7)))
+  0
+}
