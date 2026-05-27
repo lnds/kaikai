@@ -650,6 +650,19 @@ pub fn llvm_header() : String =
     "declare i64 @kaix_fresh_handler_id()\n",
     "declare void @kaix_evidence_push(i8*, i8*, i8*)\n",
     "declare void @kaix_evidence_pop()\n",
+    # Continuation-discard unwind (parity lane, refs #622). The handle
+    # pad `alloca`s a runtime-sized `jmp_buf` (`@kai_jmpbuf_size` avoids
+    # baking sizeof(jmp_buf) into IR as a platform-specific N), installs
+    # via `_with_jmp` so the node carries the pad + discard slot, and
+    # `setjmp` runs in the handle frame (it must — a longjmp into a
+    # returned frame is UB). `@setjmp` is `returns_twice`; the op site
+    # tests `kaix_op_discarded` and, on a discard, calls
+    # `kaix_handle_discard_unwind` (store discard + pop + longjmp).
+    "declare i64 @kai_jmpbuf_size()\n",
+    "declare void @kaix_evidence_push_with_jmp(i8*, i8*, i8*, i8*, i8*)\n",
+    "declare i32 @setjmp(i8*) returns_twice\n",
+    "declare i32 @kaix_op_discarded(i8*, i8*)\n",
+    "declare void @kaix_handle_discard_unwind(i8*, %KaiValue*)\n",
     # m7c-c — op-call dispatch helpers. `lookup_handler` returns
     # the `*Ev<Eff>` blob (cast to i8*); `cont_init_identity`
     # initialises the on-stack KaiCont alloca.
@@ -2452,7 +2465,38 @@ fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr], alia
     ", %KaiCont* ", kc_reg.reg, ")\n",
     "  call void @kaix_in_dispatch_leave(i8* ", prev_reg.reg, ")\n"
   ])
-  llvm_set_last(llvm_append_body(r_reg.e, call_instr), r_reg.reg)
+  let e9 = llvm_append_body(r_reg.e, call_instr)
+  # 9. Continuation-discard check (parity lane, refs #622). Mirror of
+  # the C op-site branch (emit_c.kai ~1684): if the clause never called
+  # `resume` (cont status stays UNRESUMED) AND an enclosing handle pad
+  # is live (`node->handle_jmp != NULL`), store the clause's return into
+  # the pad's discard slot, pop the evidence node, and longjmp to the
+  # handle's `setjmp` landing — abandoning the body's tail. The default
+  # handlers always resume, so `kaix_op_discarded` returns 0 for them
+  # and this is straight-line fall-through. `kaix_handle_discard_unwind`
+  # does not return (it longjmps), so the unwind block ends `unreachable`.
+  let disc_reg = llvm_fresh_reg(e9)
+  let disc_call = concat_all([
+    "  ", disc_reg.reg, " = call i32 @kaix_op_discarded(i8* ",
+    node_reg.reg, ", i8* ", k_reg.reg, ")\n"
+  ])
+  let e10 = llvm_append_body(disc_reg.e, disc_call)
+  let dcmp_reg = llvm_fresh_reg(e10)
+  let unwind_lbl = llvm_fresh_label(dcmp_reg.e, "op.discard.")
+  let cont_lbl = llvm_fresh_label(unwind_lbl.e, "op.cont.")
+  let e11 = llvm_append_body(cont_lbl.e, concat_all([
+    "  ", dcmp_reg.reg, " = icmp ne i32 ", disc_reg.reg, ", 0\n",
+    "  br i1 ", dcmp_reg.reg, ", label %", unwind_lbl.reg,
+    ", label %", cont_lbl.reg, "\n"
+  ]))
+  let e_unwind = llvm_open_block(e11, unwind_lbl.reg)
+  let e_unwind1 = llvm_append_body(e_unwind, concat_all([
+    "  call void @kaix_handle_discard_unwind(i8* ", node_reg.reg,
+    ", %KaiValue* ", r_reg.reg, ")\n",
+    "  unreachable\n"
+  ]))
+  let e_cont = llvm_open_block(e_unwind1, cont_lbl.reg)
+  llvm_set_last(e_cont, r_reg.reg)
 }
 
 # Build the type signature suffix `, %KaiValue*, %KaiValue*, …`
@@ -3591,13 +3635,79 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
     "  ", ev_void_reg.reg, " = bitcast %Ev", eff_name, "* ", ev_reg.reg, " to i8*\n"
   ])
   let e7 = llvm_append_body(ev_void_reg.e, ev_cast)
-  # push
-  let push_call = concat_all([
-    "  call void @kaix_evidence_push(i8* ", node_ptr_reg.reg,
-    ", i8* ", name_res.gep,
-    ", i8* ", ev_void_reg.reg, ")\n"
+  # Continuation-discard landing pad (parity lane, refs #622). The C
+  # backend wraps the body in `if (setjmp(_jmp)==0){ push_with_jmp;
+  # body; pop; } else { _body_result=_discard; }` (emit_c.kai ~4025);
+  # the op site longjmps here when a clause discards `resume`. We
+  # mirror that. Three allocas live across the second setjmp return, so
+  # they MUST be memory (not SSA) — the LLVM equivalent of C's
+  # `volatile _discard`:
+  #   - `_jmp`: a runtime-sized `jmp_buf` (size from `@kai_jmpbuf_size`,
+  #     align 16 covers macOS arm64 + glibc; N never baked into IR).
+  #   - `_discard`: where the op site stores the discarded clause value.
+  #   - `_body_result`: the handle's body value, written by both arms so
+  #     the join can `load` it without a phi across the setjmp boundary.
+  let jmpsz_reg = llvm_fresh_reg(e7)
+  let jmpsz_call = concat_all([
+    "  ", jmpsz_reg.reg, " = call i64 @kai_jmpbuf_size()\n"
   ])
-  let e8 = llvm_append_body(e7, push_call)
+  let e7a = llvm_append_body(jmpsz_reg.e, jmpsz_call)
+  let jmp_reg = llvm_fresh_reg(e7a)
+  let jmp_alloca = concat_all([
+    "  ", jmp_reg.reg, " = alloca i8, i64 ", jmpsz_reg.reg, ", align 16\n"
+  ])
+  let e7b = llvm_append_body(jmp_reg.e, jmp_alloca)
+  let disc_reg = llvm_fresh_reg(e7b)
+  # `volatile` is the LLVM equivalent of C's `volatile _discard` (issue
+  # #501): the discard + body-result slots are written across the
+  # `setjmp`/`longjmp` boundary, so under `-O2` a non-volatile load in
+  # the join would read the register-promoted stale NULL instead of the
+  # value the runtime stored through the escaped pointer. Volatile
+  # forces every access to memory, exactly as C99 §7.13.2.1 requires.
+  let disc_alloca = concat_all([
+    "  ", disc_reg.reg, " = alloca %KaiValue*, align 8\n",
+    "  store volatile %KaiValue* null, %KaiValue** ", disc_reg.reg, "\n"
+  ])
+  let e7c = llvm_append_body(disc_reg.e, disc_alloca)
+  let bres_reg = llvm_fresh_reg(e7c)
+  let bres_alloca = concat_all([
+    "  ", bres_reg.reg, " = alloca %KaiValue*, align 8\n"
+  ])
+  let e7d = llvm_append_body(bres_reg.e, bres_alloca)
+  # `_discard` cast to i8* for the `_with_jmp` install slot.
+  let disc_i8_reg = llvm_fresh_reg(e7d)
+  let disc_i8_cast = concat_all([
+    "  ", disc_i8_reg.reg, " = bitcast %KaiValue** ", disc_reg.reg, " to i8*\n"
+  ])
+  let e7e = llvm_append_body(disc_i8_reg.e, disc_i8_cast)
+  # setjmp(_jmp). `@setjmp` is `returns_twice`; the first return is 0
+  # (normal entry → body), the second is 1 (longjmp from the op site →
+  # landing). Branch accordingly.
+  let body_lbl = llvm_fresh_label(e7e, "handle.body.")
+  let land_lbl = llvm_fresh_label(body_lbl.e, "handle.land.")
+  let after_lbl = llvm_fresh_label(land_lbl.e, "handle.after.")
+  let sj_reg = llvm_fresh_reg(after_lbl.e)
+  let sj_call = concat_all([
+    "  ", sj_reg.reg, " = call i32 @setjmp(i8* ", jmp_reg.reg, ")\n"
+  ])
+  let e_sj = llvm_append_body(sj_reg.e, sj_call)
+  let sj_cmp_reg = llvm_fresh_reg(e_sj)
+  let sj_br = concat_all([
+    "  ", sj_cmp_reg.reg, " = icmp eq i32 ", sj_reg.reg, ", 0\n",
+    "  br i1 ", sj_cmp_reg.reg, ", label %", body_lbl.reg,
+    ", label %", land_lbl.reg, "\n"
+  ])
+  let e8 = llvm_append_body(sj_cmp_reg.e, sj_br)
+  # --- body arm (setjmp == 0): push_with_jmp, run body, pop, store ---
+  let e_body0 = llvm_open_block(e8, body_lbl.reg)
+  let push_call = concat_all([
+    "  call void @kaix_evidence_push_with_jmp(i8* ", node_ptr_reg.reg,
+    ", i8* ", name_res.gep,
+    ", i8* ", ev_void_reg.reg,
+    ", i8* ", jmp_reg.reg,
+    ", i8* ", disc_i8_reg.reg, ")\n"
+  ])
+  let e_body1 = llvm_append_body(e_body0, push_call)
   # m7c-c (LLVM per-instance dispatch) — when the handle declared an
   # `as`-bound capability, stash the freshly-minted `handler_id` under
   # the sentinel local `__alias_id__<a>`. The op-call dispatch
@@ -3616,25 +3726,46 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
   # be stored into a `%KaiValue**` slot and the IR would not verify.
   let e8a = match alias_opt {
     Some(a) -> {
-      let box_reg = llvm_fresh_reg(e8)
+      let box_reg = llvm_fresh_reg(e_body1)
       let box_call = concat_all([
         "  ", box_reg.reg, " = call %KaiValue* @kaix_int(i64 ", hid_reg.reg, ")\n"
       ])
       let e_boxed = llvm_append_body(box_reg.e, box_call)
       llvm_push_local(e_boxed, string_concat("__alias_id__", a), box_reg.reg)
     }
-    None -> e8
+    None -> e_body1
   }
   # evaluate body
   let body_e = llvm_emit_expr(e8a, body)
   let body_val = body_e.last_val
-  # pop
-  let e9 = llvm_append_body(body_e, "  call void @kaix_evidence_pop()\n")
+  # pop, store body value into the result slot, jump to join.
+  let e_body_end = llvm_append_body(body_e, concat_all([
+    "  call void @kaix_evidence_pop()\n",
+    "  store volatile %KaiValue* ", body_val, ", %KaiValue** ", bres_reg.reg, "\n",
+    "  br label %", after_lbl.reg, "\n"
+  ]))
+  # --- landing arm (setjmp == 1, after longjmp): use the discarded
+  # value as the body result. The op site already popped the evidence
+  # node and stored the clause's return into `_discard`. ---
+  let e_land0 = llvm_open_block(e_body_end, land_lbl.reg)
+  let disc_load_reg = llvm_fresh_reg(e_land0)
+  let e_land1 = llvm_append_body(disc_load_reg.e, concat_all([
+    "  ", disc_load_reg.reg, " = load volatile %KaiValue*, %KaiValue** ", disc_reg.reg, "\n",
+    "  store volatile %KaiValue* ", disc_load_reg.reg, ", %KaiValue** ", bres_reg.reg, "\n",
+    "  br label %", after_lbl.reg, "\n"
+  ]))
+  # --- join: load the body result both arms wrote ---
+  let e_after = llvm_open_block(e_land1, after_lbl.reg)
+  let bres_load_reg = llvm_fresh_reg(e_after)
+  let e9 = llvm_append_body(bres_load_reg.e, concat_all([
+    "  ", bres_load_reg.reg, " = load volatile %KaiValue*, %KaiValue** ", bres_reg.reg, "\n"
+  ]))
+  let body_val2 = bres_load_reg.reg
   # return clause: bind body result to its pname and emit
   match ret_opt {
     Some(r) -> match r {
       HR(pname, rexpr, _, _) -> {
-        let bound = llvm_push_local(e9, pname, body_val)
+        let bound = llvm_push_local(e9, pname, body_val2)
         # m7b #11: stateful return clauses also see `state` / `log`
         let bound2 = match init_opt {
           Some(_) -> {
@@ -3656,7 +3787,7 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
         llvm_emit_expr(bound2, rexpr)
       }
     }
-    None -> llvm_set_last(e9, body_val)
+    None -> llvm_set_last(e9, body_val2)
   }
 }
 
