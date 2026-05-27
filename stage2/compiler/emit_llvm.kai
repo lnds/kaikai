@@ -467,6 +467,12 @@ pub fn llvm_header() : String =
     # `node_handler` extracts `node->handler` without exposing
     # the KaiEvidence struct layout in IR.
     "declare i8* @kaix_evidence_lookup_node(i8*)\n",
+    # m7c-c (LLVM per-instance dispatch) — resolve an aliased op to
+    # the handler instance with the captured `handler_id` rather than
+    # the innermost handler by effect name. Closes the multi-`var`
+    # State divergence (refs #622): without it, nested State cells all
+    # collapsed to the top-of-stack node.
+    "declare i8* @kaix_evidence_lookup_node_by_id(i64)\n",
     "declare i8* @kaix_evidence_node_handler(i8*)\n",
     # m8 bug #12 LLVM mirror — per-fiber in_dispatch_node guard.
     # `enter(node)` saves the current fiber's `in_dispatch_node`,
@@ -2079,18 +2085,45 @@ fn llvm_emit_modcall_fn_value(e: LlvmEmit, mod: String, fname: String, line: Int
 #   %op = load <fn-type>, <fn-type>* %op_p
 #   %r = call %KaiValue* %op(%EvEff* %ev, args..., i8* %k)
 #   call void @kaix_in_dispatch_leave(i8* %prev)
-fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr]) : LlvmEmit / Console {
+fn llvm_emit_op_dispatch(e: LlvmEmit, key: String, offset: Int, xs: [Expr], alias_opt: Option[String]) : LlvmEmit / Console {
 
   let eff_n = dotted_prefix(key)
-  let name_res = llvm_emit_name_constant(e, eff_n, "eff.disp.name.")
   # 1. Lookup the evidence node (carries the handler pointer + the
-  # `in_dispatch` slot we need to flag).
-  let node_reg = llvm_fresh_reg(name_res.e)
-  let node_call = concat_all([
-    "  ", node_reg.reg, " = call i8* @kaix_evidence_lookup_node(i8* ",
-    name_res.gep, ")\n"
-  ])
-  let e0a = llvm_append_body(node_reg.e, node_call)
+  # `in_dispatch` slot we need to flag). m7c-c: when the op was
+  # tagged with `@<alias>` and the enclosing handle stashed its
+  # `handler_id` under `__alias_id__<alias>`, resolve to *that*
+  # instance by id (parity with the C path). Otherwise fall back to
+  # the innermost-handler-by-effect-name lookup.
+  let alias_id_reg = match alias_opt {
+    Some(a) -> llvm_local_find(e.locals, string_concat("__alias_id__", a))
+    None    -> None
+  }
+  # Reserve the node register up front so the rest of the dispatch
+  # body can reference it uniformly regardless of which lookup we
+  # emit. Both branches `store`/`call` into the same SSA name.
+  let node_reg = llvm_fresh_reg(e)
+  let e0a = match alias_id_reg {
+    Some(idreg) -> {
+      # The sentinel is a boxed `%KaiValue*` (see llvm_emit_handle):
+      # unbox it back to the i64 `handler_id` the lookup expects.
+      let unbox_reg = llvm_fresh_reg(node_reg.e)
+      let unbox_call = concat_all([
+        "  ", unbox_reg.reg, " = call i64 @kaix_to_int(%KaiValue* ", idreg, ")\n"
+      ])
+      let e_unboxed = llvm_append_body(unbox_reg.e, unbox_call)
+      llvm_append_body(e_unboxed, concat_all([
+        "  ", node_reg.reg, " = call i8* @kaix_evidence_lookup_node_by_id(i64 ",
+        unbox_reg.reg, ")\n"
+      ]))
+    }
+    None -> {
+      let name_res = llvm_emit_name_constant(node_reg.e, eff_n, "eff.disp.name.")
+      llvm_append_body(name_res.e, concat_all([
+        "  ", node_reg.reg, " = call i8* @kaix_evidence_lookup_node(i8* ",
+        name_res.gep, ")\n"
+      ]))
+    }
+  }
   let h_reg = llvm_fresh_reg(e0a)
   let h_call = concat_all([
     "  ", h_reg.reg, " = call i8* @kaix_evidence_node_handler(i8* ",
@@ -2369,15 +2402,17 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
         # with KaiCont alloca). Otherwise fall through to the
         # standard fn-call path so dotted module paths and
         # non-effect names keep working.
-        # m7b #15 (compiler integration): the alias rewrite tags
-        # op names with `@<alias>`; the LLVM dispatcher does not
-        # use the tag yet (the C dispatcher does — see
-        # emit_call_expr), so strip it from the lookup key here.
-        # Per-instance dispatch on the LLVM side stays a
-        # follow-up.
+        # m7b #15 / m7c-c (compiler integration): the alias rewrite
+        # tags op names with `@<alias>`. Strip the tag for the
+        # op-offset lookup key, but keep the alias itself — the LLVM
+        # dispatcher now resolves an aliased op to that handler
+        # instance by id (parity with the C `emit_call_expr` path),
+        # not the innermost handler by effect name.
         let lookup_key = string_strip_alias_tag(nm)
+        let at_pos     = string_index_of_at(nm)
+        let alias_opt  = if at_pos >= 0 { Some(string_slice(nm, at_pos + 1, string_length(nm))) } else { None }
         match lookup_op_offset(e.op_offsets, lookup_key) {
-          Some(offset) -> llvm_emit_op_dispatch(e, lookup_key, offset, xs)
+          Some(offset) -> llvm_emit_op_dispatch(e, lookup_key, offset, xs, alias_opt)
           None ->
             match evar_find(e.vars_, nm) {
               Some(_) -> llvm_emit_variant_ctor(e, nm, xs)
@@ -3210,7 +3245,6 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
                     clauses: [HClause], ret_opt: Option[HReturn],
                     hline: Int, hcol: Int) : LlvmEmit / Console {
 
-  let _ = alias_opt    # m7c-c will use this for per-instance dispatch
   # alloca the `%EvX` struct; zero-init field by field.
   let ev_reg = llvm_fresh_reg(e)
   let ev_alloca = concat_all([
@@ -3292,8 +3326,35 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
     ", i8* ", ev_void_reg.reg, ")\n"
   ])
   let e8 = llvm_append_body(e7, push_call)
+  # m7c-c (LLVM per-instance dispatch) — when the handle declared an
+  # `as`-bound capability, stash the freshly-minted `handler_id` under
+  # the sentinel local `__alias_id__<a>`. The op-call dispatch
+  # (`llvm_emit_op_dispatch`) recovers it for an aliased op so `@name`
+  # reads resolve to *this* instance's evidence node instead of the
+  # innermost State handler by name. Mirrors the C emit's
+  # `KaiHandlerId kai_alias_<a>_id = _ev.handler_id;` local; innermost-
+  # alias-wins falls out of the locals stack being newest-first,
+  # matching shadowing of identically-named cells.
+  #
+  # The id (`hid_reg`, an i64) is boxed via `@kaix_int` so the sentinel
+  # is a uniform `%KaiValue*` — a `var`-cell handle whose body is a
+  # closure (e.g. a `while` lambda) captures the sentinel through the
+  # standard `%KaiValue*` capture array; the dispatch unboxes it back
+  # to i64 with `@kaix_to_int`. Without the box, a captured i64 would
+  # be stored into a `%KaiValue**` slot and the IR would not verify.
+  let e8a = match alias_opt {
+    Some(a) -> {
+      let box_reg = llvm_fresh_reg(e8)
+      let box_call = concat_all([
+        "  ", box_reg.reg, " = call %KaiValue* @kaix_int(i64 ", hid_reg.reg, ")\n"
+      ])
+      let e_boxed = llvm_append_body(box_reg.e, box_call)
+      llvm_push_local(e_boxed, string_concat("__alias_id__", a), box_reg.reg)
+    }
+    None -> e8
+  }
   # evaluate body
-  let body_e = llvm_emit_expr(e8, body)
+  let body_e = llvm_emit_expr(e8a, body)
   let body_val = body_e.last_val
   # pop
   let e9 = llvm_append_body(body_e, "  call void @kaix_evidence_pop()\n")
