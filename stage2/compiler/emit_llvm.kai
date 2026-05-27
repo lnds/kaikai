@@ -96,19 +96,205 @@ fn lvm_ty_name_zero(name: String) : TypeExpr =
 # ---- LLVM clause / effect-struct emitters (were resident in the
 # emit_c region; logically the backend) ----
 
+# R9 (LLVM parity, #622): clause-capture env plumbing, mirrored from
+# the C backend's `handle_*`/`emit_*_env_*` family (emit_c.kai). The
+# C emitter threads enclosing-fn captures through `EvE.env`: the
+# install site allocates a per-handle env struct, populates one field
+# per captured surface name, and stores its pointer in the EvX `env`
+# slot (struct field 1, the `i8*`); the clause prologue casts
+# `self->env` back to the struct type and rebinds each `kai_<name>`.
+# These mirrors keep the C emitter's originals untouched (per the
+# 138-helper mirror discipline in this file's header) while giving the
+# LLVM lowering the same capture set, the same stable field order, and
+# the same struct symbol so install and read agree.
+
+# Mirror of `merge_string_set` — stable-order union; field order must
+# match between the install (`llvm_emit_handle`) and read
+# (`llvm_emit_clause_body`) sides.
+fn lvm_merge_string_set(a: [String], b: [String]) : [String] {
+  match a {
+    [] -> b
+    [h, ...rest] ->
+      if list_has(b, h) { lvm_merge_string_set(rest, b) }
+      else { [h, ...lvm_merge_string_set(rest, b)] }
+  }
+}
+
+# Mirror of `handle_captures_at` — union of every clause's capture set
+# for the handle pinned at (hline, hcol).
+fn lvm_handle_captures_at(cls: [ClauseInfo], hline: Int, hcol: Int) : [String] {
+  match cls {
+    [] -> []
+    [c, ...rest] -> match c {
+      CI(line, col, _, _, _, _, _, _, caps) ->
+        if line == hline and col == hcol {
+          lvm_merge_string_set(caps, lvm_handle_captures_at(rest, hline, hcol))
+        } else {
+          lvm_handle_captures_at(rest, hline, hcol)
+        }
+    }
+  }
+}
+
+# Mirror of `handle_enc_fn_at` — the enc_fn stamped on any clause of
+# this handle (all clauses of one handle share it).
+fn lvm_handle_enc_fn_at(cls: [ClauseInfo], hline: Int, hcol: Int) : String {
+  match cls {
+    [] -> ""
+    [c, ...rest] -> match c {
+      CI(line, col, _, _, _, _, _, enc_fn, _) ->
+        if line == hline and col == hcol { enc_fn }
+        else { lvm_handle_enc_fn_at(rest, hline, hcol) }
+    }
+  }
+}
+
+# Mirror of `handle_env_struct_name` — the stable LLVM struct symbol
+# for a handle's env. Built from the same (enc_fn, line, col) triple
+# the C backend uses, prefixed with `%` for an LLVM named type.
+fn lvm_handle_env_struct_name(enc_fn: String, line: Int, col: Int) : String =
+  concat_all([
+    "%_kai_", enc_fn, "__env_",
+    int_to_string(line), "_", int_to_string(col)
+  ])
+
+# Mirror of `list_filter_in` — keep only names in scope at the install
+# site, so the env-field assigns never read a missing local.
+fn lvm_list_filter_in(names: [String], lcs: [String]) : [String] {
+  match names {
+    [] -> []
+    [h, ...rest] ->
+      if list_has(lcs, h) { [h, ...lvm_list_filter_in(rest, lcs)] }
+      else { lvm_list_filter_in(rest, lcs) }
+  }
+}
+
+# ---- env-struct named-type definitions (one per handle) ----
+#
+# Mirror of `emit_handle_env_typedefs`. Each handle that captures gets
+# one LLVM named type `%_kai_<enc>__env_<l>_<c> = type { %KaiValue*, … }`
+# with one element per captured name, in `lvm_handle_captures_at`
+# order. Emitted at module top alongside the `%EvX` structs so both the
+# install GEPs and the clause-prologue casts resolve. "First (l,c) seen
+# wins" — later clauses of the same handle skip re-emission.
+fn lvm_handle_env_typedefs(cs: [ClauseInfo]) : String =
+  lvm_handle_env_typedefs_loop(cs, [])
+
+fn lvm_handle_env_typedefs_loop(cs: [ClauseInfo], seen: [String]) : String {
+  match cs {
+    [] -> ""
+    [c, ...rest] -> match c {
+      CI(line, col, _, _, _, _, _, enc_fn, _) -> {
+        let key = lvm_handle_env_struct_name(enc_fn, line, col)
+        if list_has(seen, key) {
+          lvm_handle_env_typedefs_loop(rest, seen)
+        } else {
+          let caps = lvm_handle_captures_at(cs, line, col)
+          let decl = match caps {
+            [] -> ""
+            _ -> concat_all([
+              key, " = type { ",
+              join_with(map(caps, (_c) => "%KaiValue*"), ", "),
+              " }\n"
+            ])
+          }
+          concat_all([decl, lvm_handle_env_typedefs_loop(rest, [key, ...seen])])
+        }
+      }
+    }
+  }
+}
+
+# ---- clause-prologue env rebind (read side) ----
+#
+# Mirror of `emit_clause_env_prologue` + `emit_clause_env_reads`. Casts
+# `self->env` (EvX field 1, an `i8*`) to the per-handle env-struct
+# pointer, then for each capture GEPs the matching field, loads the
+# `%KaiValue*`, dups it (each clause body is Perceus-analysed in
+# isolation and may consume its captured locals — the env holds a
+# borrow scoped to the handle), and binds it under the surface name so
+# `EVar(name)` reads resolve to a local instead of falling through to
+# the fn-value path (which would emit `undef`). Returns the threaded
+# emitter; empty (no caps) leaves the emitter untouched.
+fn lvm_emit_clause_env_prologue(e: LlvmEmit, eff: String, env_ty: String,
+                                 caps: [String]) : LlvmEmit {
+  match caps {
+    [] -> e
+    _ -> {
+      # %envp = getelementptr %EvX, %EvX* %self, i32 0, i32 1 (the env i8*)
+      let envp_reg = llvm_fresh_reg(e)
+      let envp_gep = concat_all([
+        "  ", envp_reg.reg, " = getelementptr %Ev", eff,
+        ", %Ev", eff, "* %self, i32 0, i32 1\n"
+      ])
+      let e1 = llvm_append_body(envp_reg.e, envp_gep)
+      let envraw_reg = llvm_fresh_reg(e1)
+      let envraw_load = concat_all([
+        "  ", envraw_reg.reg, " = load i8*, i8** ", envp_reg.reg, "\n"
+      ])
+      let e2 = llvm_append_body(envraw_reg.e, envraw_load)
+      let envty_reg = llvm_fresh_reg(e2)
+      let envty_cast = concat_all([
+        "  ", envty_reg.reg, " = bitcast i8* ", envraw_reg.reg,
+        " to ", env_ty, "*\n"
+      ])
+      let e3 = llvm_append_body(envty_reg.e, envty_cast)
+      lvm_emit_clause_env_reads(e3, env_ty, envty_reg.reg, caps, 0)
+    }
+  }
+}
+
+fn lvm_emit_clause_env_reads(e: LlvmEmit, env_ty: String, env_reg: String,
+                              caps: [String], i: Int) : LlvmEmit {
+  match caps {
+    [] -> e
+    [c, ...rest] -> {
+      let fp_reg = llvm_fresh_reg(e)
+      let fp_gep = concat_all([
+        "  ", fp_reg.reg, " = getelementptr ", env_ty, ", ", env_ty, "* ",
+        env_reg, ", i32 0, i32 ", int_to_string(i), "\n"
+      ])
+      let e1 = llvm_append_body(fp_reg.e, fp_gep)
+      let raw_reg = llvm_fresh_reg(e1)
+      let raw_load = concat_all([
+        "  ", raw_reg.reg, " = load %KaiValue*, %KaiValue** ", fp_reg.reg, "\n"
+      ])
+      let e2 = llvm_append_body(raw_reg.e, raw_load)
+      let dup_reg = llvm_fresh_reg(e2)
+      let dup_call = concat_all([
+        "  ", dup_reg.reg, " = call %KaiValue* @kaix_internal_dup(%KaiValue* ",
+        raw_reg.reg, ")\n"
+      ])
+      let e3 = llvm_append_body(dup_reg.e, dup_call)
+      let bound = lvm_clause_cap_bind(e3, c, dup_reg.reg)
+      lvm_emit_clause_env_reads(bound, env_ty, env_reg, rest, i + 1)
+    }
+  }
+}
+
+# Bind one rebound capture as a local. A handler-id sentinel
+# (`__alias_id__<a>`) is kept boxed and re-bound under the same
+# sentinel name; `llvm_emit_op_dispatch` unboxes it via `kaix_to_int`
+# when an aliased op resolves by id. A plain capture binds directly
+# under its surface name so `EVar(name)` reads resolve to this local.
+fn lvm_clause_cap_bind(e: LlvmEmit, c: String, reg: String) : LlvmEmit {
+  llvm_push_local(e, c, reg)
+}
+
 fn llvm_emit_clause_body(c: ClauseInfo, fns: [EFn], vs: [EVar], lams: [LamInfo],
                           oo: [OpOffset], cls: [ClauseInfo],
                           start_id: Int) : LlvmDeclOut / Console {
 
   match c {
-    # R9: the trailing `[String]` captures field is plumbed through
-    # the C backend (`emit_clause_body`) but not yet wired into the
-    # LLVM backend. The LLVM clause body still ignores it, so a
-    # clause that names an enclosing-fn binding will fail to lower
-    # under `selfhost-llvm` the same way it failed under the C
-    # backend pre-fix. Mirror is a follow-up; see CHANGELOG entry
-    # for R9 for the C-first staging note.
-    CI(line, col, eff, op_name, params, body, stateful, enc_fn, _) -> {
+    # R9 (#622): the trailing `[String]` captures field is now wired
+    # into the LLVM backend, mirroring the C `emit_clause_body`. The
+    # clause prologue casts `self->env` back to the per-handle env
+    # struct and rebinds each capture under its surface name; the
+    # install site (`llvm_emit_handle`) populates that struct. Before
+    # this, a clause naming an enclosing-fn binding hit the fn-value
+    # fallback in `llvm_emit_fn_value` and emitted `undef` (corrupting
+    # the captured String/Char and reporting "cannot build closure").
+    CI(line, col, eff, op_name, params, body, stateful, enc_fn, caps) -> {
       let sym = clause_fn_name(enc_fn, line, col, op_name)
       let op_args = op_args_only(params)
       let arg_sig = llvm_clause_arg_sig(op_args)
@@ -118,10 +304,18 @@ fn llvm_emit_clause_body(c: ClauseInfo, fns: [EFn], vs: [EVar], lams: [LamInfo],
                           last_val: "", cur_label: "entry",
                           locals: locals0, fns: fns, vars_: vs, lams: lams,
                           op_offsets: oo, cls: cls }
+      # R9 env prologue: rebind each capture from `self->env` so the
+      # body's `EVar(name)` reads resolve to a local. The env-struct
+      # named type is keyed by the same (enc_fn, line, col) triple the
+      # install site used; the capture order is the cross-clause union
+      # `lvm_handle_captures_at` returns (same field order as install).
+      let env_caps = lvm_handle_captures_at(cls, line, col)
+      let env_ty = lvm_handle_env_struct_name(enc_fn, line, col)
+      let e_env = lvm_emit_clause_env_prologue(e0, eff, env_ty, env_caps)
       # Stateful prologue: read self->state into a fresh value and
       # bind it under both `state` and `log` so the body resolves.
       let e_pro = if stateful {
-        let st_p_reg = llvm_fresh_reg(e0)
+        let st_p_reg = llvm_fresh_reg(e_env)
         let st_p_gep = concat_all([
           "  ", st_p_reg.reg, " = getelementptr %Ev", eff,
           ", %Ev", eff, "* %self, i32 0, i32 2\n"
@@ -134,7 +328,7 @@ fn llvm_emit_clause_body(c: ClauseInfo, fns: [EFn], vs: [EVar], lams: [LamInfo],
         let e_p2 = llvm_append_body(st_v_reg.e, st_load)
         let bound_state = llvm_push_local(e_p2, "state", st_v_reg.reg)
         llvm_push_local(bound_state, "log", st_v_reg.reg)
-      } else { e0 }
+      } else { e_env }
       let e1 = llvm_emit_expr(e_pro, body)
       let text = concat_all([
         e1.globals,
@@ -529,6 +723,49 @@ fn llvm_local_find_loop(ls: [LlvmLocal], target: String) : Option[String] {
 }
 
 fn llvm_local_find(ls: [LlvmLocal], target: String) : Option[String] = llvm_local_find_loop(ls, target)
+
+# Surface names of every local in scope (boxed or raw). Used by the R9
+# install side to filter a handle's capture union down to names that
+# are actually bound here, mirroring the C `list_filter_in` against
+# `lcs`.
+fn llvm_local_names(ls: [LlvmLocal]) : [String] {
+  match ls {
+    [] -> []
+    [l, ...rest] -> match l {
+      LL(nm, _)      -> [nm, ...llvm_local_names(rest)]
+      LRaw(nm, _, _) -> [nm, ...llvm_local_names(rest)]
+    }
+  }
+}
+
+# R9 install side: store each captured local into its env-struct field.
+# Boxed locals (`LL`) store their `%KaiValue*` register directly; raw
+# locals (`LRaw`) are box-wrapped first so the field is uniformly
+# `%KaiValue*` (matching the clause prologue's load type). Field index
+# tracks `lvm_handle_captures_at` order, identical on both sides.
+fn lvm_emit_handle_env_field_assigns(e: LlvmEmit, env_ty: String, env_reg: String,
+                                      caps: [String], i: Int) : LlvmEmit {
+  match caps {
+    [] -> e
+    [c, ...rest] -> {
+      let fp_reg = llvm_fresh_reg(e)
+      let fp_gep = concat_all([
+        "  ", fp_reg.reg, " = getelementptr ", env_ty, ", ", env_ty, "* ",
+        env_reg, ", i32 0, i32 ", int_to_string(i), "\n"
+      ])
+      let e1 = llvm_append_body(fp_reg.e, fp_gep)
+      let val_reg = match llvm_local_find(e1.locals, c) {
+        Some(r) -> r
+        None    -> "null"
+      }
+      let store = concat_all([
+        "  store %KaiValue* ", val_reg, ", %KaiValue** ", fp_reg.reg, "\n"
+      ])
+      let e2 = llvm_append_body(e1, store)
+      lvm_emit_handle_env_field_assigns(e2, env_ty, env_reg, rest, i + 1)
+    }
+  }
+}
 
 fn llvm_raw_local_find_loop(ls: [LlvmLocal], target: String) : Option[LlvmLocal] {
   match ls {
@@ -3264,14 +3501,49 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
     "  store i64 ", hid_reg.reg, ", i64* ", hid_gep_reg.reg, "\n"
   ])
   let e3 = llvm_append_body(hid_gep_reg.e, hid_gep)
-  # env <- null
+  # env <- per-handle capture struct (R9, #622) or null. Mirror of the
+  # C install side (`emit_handle_env_alloc` + `emit_handle_env_ev_assign`):
+  # gather every name a clause of this handle captures, filtered to the
+  # ones actually in scope here, alloca a `%_kai_<enc>__env_<l>_<c>`,
+  # store each captured local into its field (same `lvm_handle_captures_at`
+  # order the clause prologue reads), then stash the struct pointer in
+  # EvX field 1. With no captures the slot stays null and clause
+  # prologues never read it.
+  let env_caps = lvm_list_filter_in(
+    lvm_handle_captures_at(e.cls, hline, hcol),
+    llvm_local_names(e.locals))
+  let env_enc_fn = lvm_handle_enc_fn_at(e.cls, hline, hcol)
+  let env_ty = lvm_handle_env_struct_name(env_enc_fn, hline, hcol)
   let env_gep_reg = llvm_fresh_reg(e3)
   let env_gep = concat_all([
     "  ", env_gep_reg.reg, " = getelementptr %Ev", eff_name,
-    ", %Ev", eff_name, "* ", ev_reg.reg, ", i32 0, i32 1\n",
-    "  store i8* null, i8** ", env_gep_reg.reg, "\n"
+    ", %Ev", eff_name, "* ", ev_reg.reg, ", i32 0, i32 1\n"
   ])
-  let e4 = llvm_append_body(env_gep_reg.e, env_gep)
+  let e3a = llvm_append_body(env_gep_reg.e, env_gep)
+  let e4 = match env_caps {
+    [] -> llvm_append_body(e3a, concat_all([
+      "  store i8* null, i8** ", env_gep_reg.reg, "\n"
+    ]))
+    _ -> {
+      # alloca the env struct, fill fields, cast to i8*, store.
+      let envbuf_reg = llvm_fresh_reg(e3a)
+      let envbuf_alloca = concat_all([
+        "  ", envbuf_reg.reg, " = alloca ", env_ty, ", align 8\n"
+      ])
+      let e_alloc = llvm_append_body(envbuf_reg.e, envbuf_alloca)
+      let e_filled = lvm_emit_handle_env_field_assigns(
+        e_alloc, env_ty, envbuf_reg.reg, env_caps, 0)
+      let envcast_reg = llvm_fresh_reg(e_filled)
+      let envcast = concat_all([
+        "  ", envcast_reg.reg, " = bitcast ", env_ty, "* ", envbuf_reg.reg,
+        " to i8*\n"
+      ])
+      let e_cast = llvm_append_body(envcast_reg.e, envcast)
+      llvm_append_body(e_cast, concat_all([
+        "  store i8* ", envcast_reg.reg, ", i8** ", env_gep_reg.reg, "\n"
+      ]))
+    }
+  }
   # state <- init_opt or null
   let state_init = match init_opt {
     Some(ie) -> {
@@ -4986,6 +5258,12 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String 
   # m7c-b/c handle and op-call lowerings; emitting them here keeps
   # the LLVM IR self-contained without forward declarations.
   let eff_structs = llvm_effect_struct_decls(decls)
+  # R9 (#622): per-handle capture-env named types, one per handle that
+  # captures an enclosing binding. Emitted alongside the `%EvX` structs
+  # so both the install-site alloca/GEP (`llvm_emit_handle`) and the
+  # clause-prologue cast (`llvm_emit_clause_body`) resolve to the same
+  # struct shape and field order.
+  let env_typedefs = lvm_handle_env_typedefs(lc.clauses)
   # m7c-c: compute (Eff.op → field index) for every declared
   # effect; the dispatcher in `llvm_emit_call` consults this to
   # GEP the right function pointer in the matching `%EvX` struct.
@@ -5024,7 +5302,8 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String 
   let teardown = llvm_emit_main_teardown_defaults(main_row, decls)
   let default_op_declares = lvm_default_op_declares(main_row, decls)
   let proto_init = llvm_emit_proto_init(decls, vs)
-  concat_all([llvm_header(), default_op_declares, eff_structs, "\n",
+  concat_all([llvm_header(), default_op_declares, eff_structs,
+              env_typedefs, "\n",
               decls_out.text, lam_bodies.text, clauses_out.text,
               install, teardown, proto_init])
 }
