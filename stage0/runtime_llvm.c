@@ -230,8 +230,29 @@ int kaix_is_variant_tag(KaiValue *v, int32_t tag) {
    the C backend passes variant args as borrowed references, but the
    LLVM path keeps ownership uniform. */
 KaiValue *kaix_variant_arg(KaiValue *v, int i) {
-    /* Issue #440 — variant slot. Phase 1: every slot is a pointer
-     * (mask=0), so `.ptr` is identical to the pre-#440 `args[i]`. */
+    /* Issue #126 / #622 (Cluster F) — variant slot must honor the
+     * `slot_mask`. The LLVM emitter always *builds* variants with
+     * mask==0 (all boxed pointers, see `kaix_variant` above), so for
+     * everything the codegen mints `.ptr` is correct. But the C
+     * *runtime* mints some variants with typed slots — notably
+     * `Exited(Int)` / `Signaled(Int)` from the Process default handler
+     * (runtime.h §`_kai_process_make_exit_exited`), which store the
+     * raw scalar in `slots[i].i64` with KAI_VAR_SLOT_INT. Reading
+     * those via `.ptr` reinterprets the raw int as a pointer and feeds
+     * garbage into the match arm. `kai_variant_slot_box` is exactly
+     * the boxed-view accessor the C backend uses (`slot_read_for_test`
+     * in emit_c.kai); route through it so both backends agree on any
+     * runtime-minted typed-slot variant.
+     *
+     * Ownership: `kai_variant_slot_box` returns a borrowed pointer for
+     * pointer slots and a freshly-allocated boxed temporary (rc==1)
+     * for typed slots. The LLVM path keeps ownership uniform (caller
+     * owns the returned cell), so incref only the borrowed pointer-slot
+     * case; the typed-slot temporary already arrives owned. */
+    uint32_t k = kai_var_slot_kind(v->as.var.slot_mask, i);
+    if (k == KAI_VAR_SLOT_INT || k == KAI_VAR_SLOT_REAL) {
+        return kai_variant_slot_box(v, i);
+    }
     return kai_incref(v->as.var.slots[i].ptr);
 }
 
