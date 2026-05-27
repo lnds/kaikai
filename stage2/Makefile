@@ -3555,6 +3555,11 @@ test-tco-perceus-wrap: $(TARGET) build
 # header + a back-edge `br label %tcrec.loop`), that clang accepts the
 # IR, and that both backends run the 5M loop to the same `5000000`
 # golden. Requires clang; skipped gracefully when absent.
+#
+# Since #718, `loop` is a UFn with a scalar signature — `define i64
+# @kai_loop(i64 ...)`, not boxed `%KaiValue*` — so the loop body lowers
+# through the raw TCO back-edge (`alloca i64` slots, `store i64`, zero
+# drops). The IR-shape grep matches the `i64` signature accordingly.
 test-tco-llvm-706: $(TARGET) build
 	@command -v clang >/dev/null 2>&1 || { echo "tco-llvm-706 SKIP (clang not in PATH)"; exit 0; }
 	@set -e; \
@@ -3562,7 +3567,7 @@ test-tco-llvm-706: $(TARGET) build
 	exp=../examples/perceus/tco_self_recursion_constant_space.out.expected; \
 	./$(TARGET) --emit=llvm $$src > build/tco-706.ll \
 	  || { echo "tco-llvm-706 FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	awk '/^define %KaiValue\* @kai_loop\(/,/^}/' build/tco-706.ll > build/tco-706.loop; \
+	awk '/^define i64 @kai_loop\(/,/^}/' build/tco-706.ll > build/tco-706.loop; \
 	grep -F -q 'tcrec.loop:' build/tco-706.loop \
 	  || { echo "tco-llvm-706 FAIL (no tcrec.loop header in @kai_loop IR — sentinel not lowered)"; cat build/tco-706.loop; exit 1; }; \
 	grep -F -q 'br label %tcrec.loop' build/tco-706.loop \
@@ -4114,24 +4119,23 @@ test-env-mutate-asan: $(TARGET) build
 	    || { echo "env-mutate-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }; \
 	done
 
-# Issue #87 — Phase 2 unbox LLVM mirror. Compiles unbox_bench.kai
-# through `--emit=llvm`, asserts the inner `pure_chain` body
-# lowers to raw `i64` arithmetic (no `kaix_int` / `kaix_add` /
-# `kaix_mul` calls inside the `pure_chain` body), and that the
-# emitted IR links cleanly through clang + the LLVM runtime
-# shim. Mirrors the C-side `test-unbox-phase2` greps. Fails
-# pre-fix (LLVM IR still emits `kaix_*` boxed calls inside the
-# loop), passes post-fix (raw `add i64` / `mul i64` / `srem i64`).
+# Issue #87 / #718 — Phase 2 unbox LLVM mirror. Compiles unbox_bench.kai
+# through `--emit=llvm`, asserts the `pure_chain` body lowers to raw
+# `i64` arithmetic (no `kaix_int` / `kaix_add` / `kaix_mul` calls inside
+# the body), and that the emitted IR links cleanly through clang + the
+# LLVM runtime shim. Mirrors the C-side `test-unbox-phase2` greps.
 #
-# Build-only — the bench's outer driver `bench_loop(1_000_000, 0)`
-# requires self-tail-call optimization to run in O(1) C-stack,
-# which the C backend has (`_kai_bench_loop_entry:` + `goto` —
-# issue #89, PR #121) but the LLVM backend does not yet (a
-# separate follow-up). Running the LLVM binary would stack-overflow
-# at ~50 k frames; that is independent of the unbox mirror this
-# fixture documents, so we only check the IR shape and the link.
-# When LLVM TCO lands, swap the link-only check below for a run
-# + cross-check against the C-backend output.
+# Since #718, `pure_chain` is a UFn with a SCALAR signature — `define
+# i64 @kai_pure_chain(i64 %kair_seed)`, not the old boxed `%KaiValue*`
+# form — so the body extraction matches the `i64` signature.
+#
+# Run + cross-check (upgraded from link-only since #708 LLVM TCO +
+# #718 scalar signatures landed): the bench's outer driver
+# `bench_loop(1_000_000, 0)` is self-tail-recursive and now runs in
+# O(1) C-stack on the LLVM backend (TCO #708), and the scalar UFn
+# signature (#718) keeps `pure_chain`'s own frame tiny — so the LLVM
+# binary runs to completion and must produce byte-identical output to
+# the C backend.
 test-unbox-llvm-bench: $(TARGET) build
 	@set -e; \
 	./$(TARGET) --emit=llvm ../examples/perceus/unbox_bench.kai > build/unbox-bench.ll \
@@ -4140,24 +4144,37 @@ test-unbox-llvm-bench: $(TARGET) build
 	  || { echo "unbox-llvm-bench FAIL (clang errored — IR ill-formed?)"; exit 1; }
 	@# Acceptance grep — `pure_chain` body must contain raw IR
 	@# arithmetic and must NOT contain boxed `kaix_*` arithmetic
-	@# calls. We extract the body between `define ... @kai_pure_chain`
-	@# and the next `define` so the asserts are local to the loop.
-	@awk '/^define %KaiValue\* @kai_pure_chain\(/,/^}/' build/unbox-bench.ll > build/unbox-bench.purechain
+	@# calls. We extract the body between `define i64 @kai_pure_chain`
+	@# (scalar signature since #718) and the closing `}`.
+	@awk '/^define i64 @kai_pure_chain\(/,/^}/' build/unbox-bench.ll > build/unbox-bench.purechain
 	@grep -E '= (add|mul|sub|srem) i64' build/unbox-bench.purechain > /dev/null \
 	  || { echo "unbox-llvm-bench FAIL (no raw i64 arith inside pure_chain)"; \
 	       cat build/unbox-bench.purechain; exit 1; }
 	@if grep -E 'call %KaiValue\* @kaix_(add|sub|mul|mod)\(' build/unbox-bench.purechain; then \
 	  echo "unbox-llvm-bench FAIL (boxed kaix_add/sub/mul/mod survived inside pure_chain)"; exit 1; \
 	fi
-	@# At most one `kaix_int(` call survives — the boundary box
-	@# of the final raw scalar before `ret`. More than one means
-	@# the chain didn't fully collapse.
+	@# At most one `kaix_int(` call survives — the boundary box of the
+	@# block tail before the scalar `ret i64` (the multi-stmt block body
+	@# round-trips through the boxed boundary; the loop arithmetic itself
+	@# is fully raw). More than one means the chain didn't collapse.
 	@n=$$(grep -c 'call %KaiValue\* @kaix_int(' build/unbox-bench.purechain); \
 	  if [ "$$n" -gt 1 ]; then \
 	    echo "unbox-llvm-bench FAIL (more than one kaix_int boundary box inside pure_chain: $$n)"; \
 	    cat build/unbox-bench.purechain; exit 1; \
 	  fi
-	@echo "unbox-llvm-bench OK (pure_chain inner loop lowers to raw i64; one boundary kaix_int; IR links cleanly)"
+	@# Run + cross-check: the LLVM binary must run to completion (TCO
+	@# #708 keeps the driver O(1)-stack; #718 keeps pure_chain's frame
+	@# tiny) and match the C backend byte-for-byte.
+	@./build/unbox-bench-llvm > build/unbox-bench-llvm.out \
+	  || { echo "unbox-llvm-bench FAIL (LLVM binary errored at runtime)"; exit 1; }
+	@./$(TARGET) ../examples/perceus/unbox_bench.kai > build/unbox-bench-c.c \
+	  && cc -std=c99 -w -I ../stage0 build/unbox-bench-c.c -o build/unbox-bench-c $(LDLIBS_M) \
+	  && ./build/unbox-bench-c > build/unbox-bench-c.out \
+	  || { echo "unbox-llvm-bench FAIL (C backend build/run errored)"; exit 1; }
+	@diff -q build/unbox-bench-c.out build/unbox-bench-llvm.out > /dev/null \
+	  || { echo "unbox-llvm-bench FAIL (C vs LLVM output diverged):"; \
+	       diff build/unbox-bench-c.out build/unbox-bench-llvm.out; exit 1; }
+	@echo "unbox-llvm-bench OK (pure_chain raw i64; C == LLVM output; IR links + runs cleanly)"
 
 # issue #187 phase 2 — fixtures for unified-algebraic-types resolver.
 # Each .kai under `examples/unions/` either compiles + runs to a known
