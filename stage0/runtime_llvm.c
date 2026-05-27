@@ -498,6 +498,64 @@ KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v) {
     return kai_cont_resume(k, v);
 }
 
+/* ---------- continuation-discard unwind (parity lane, refs #622) ----------
+ *
+ * The C backend's `handle` lowering (emit_c.kai ~4025) wraps the body
+ * in `if (setjmp(_jmp)==0) { push_with_jmp(...); body; pop; } else {
+ * body_result = _discard; }`, and the op-call site (emit_c.kai ~1684)
+ * longjmps to that pad when a clause discards `resume` (status stays
+ * UNRESUMED). The runtime carries `handle_jmp` + `discard_slot` on the
+ * `KaiEvidence` node (runtime.h ~8796) and exposes
+ * `kai_evidence_push_with_jmp`.
+ *
+ * The LLVM backend emits the `setjmp` in the handle frame directly (it
+ * MUST run there — a `longjmp` into a returned frame is UB), but the
+ * subtle bits — the `jmp_buf` size, the status/handle_jmp read, and the
+ * store+pop+longjmp triple — live here so the emitted IR stays
+ * straight-line and the one place that knows `sizeof(jmp_buf)` is the C
+ * side, never an N hardcoded in IR. */
+
+/* Size + alignment of the platform `jmp_buf`, fetched by the emitter so
+ * the handle pad `alloca`s `i8, i64 %size, align 16` without baking a
+ * platform-specific N into the IR. macOS arm64's `jmp_buf` is large
+ * (sigjmp-capable); glibc's smaller — both fit a generous, 16-aligned
+ * runtime-sized buffer. */
+int64_t kai_jmpbuf_size(void) { return (int64_t) sizeof(jmp_buf); }
+
+/* Mirror of `kai_evidence_push_with_jmp` (runtime.h) for the LLVM
+ * install path: stamps the node's `handle_jmp` + `discard_slot` so the
+ * op site can find the landing pad on a discard. `jmp` is the `i8*`
+ * cast of the handle's `alloca`'d `jmp_buf`; `discard_slot` is the
+ * `i8*` cast of the handle's `%KaiValue*` discard alloca. */
+void kaix_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
+                                 void *handler, void *jmp, void *discard_slot) {
+    kai_evidence_push_with_jmp(node, eff_label, handler,
+                               (jmp_buf *) jmp, (KaiValue **) discard_slot);
+}
+
+/* Op-site discard test, mirroring the C branch condition
+ * `_k.status == KAI_CONT_UNRESUMED && _node_op->handle_jmp != NULL`.
+ * Returns 1 when the clause discarded `resume` AND a handle pad is in
+ * scope to unwind to. `node_v` is the looked-up `KaiEvidence*`; `k_v`
+ * is the `KaiCont*` the dispatch passed to the clause. */
+int kaix_op_discarded(void *node_v, void *k_v) {
+    KaiEvidence *node = (KaiEvidence *) node_v;
+    KaiCont *k = (KaiCont *) k_v;
+    if (node == NULL || k == NULL) { return 0; }
+    return (k->status == KAI_CONT_UNRESUMED && node->handle_jmp != NULL) ? 1 : 0;
+}
+
+/* Op-site discard unwind, mirroring the C triple
+ * `*discard_slot = op_r; kai_evidence_pop(); longjmp(*handle_jmp, 1);`.
+ * Only called when `kaix_op_discarded` returned 1, so `handle_jmp` and
+ * `discard_slot` are both live. Does not return. */
+void kaix_handle_discard_unwind(void *node_v, KaiValue *op_r) {
+    KaiEvidence *node = (KaiEvidence *) node_v;
+    *node->discard_slot = op_r;
+    kai_evidence_pop();
+    longjmp(*node->handle_jmp, 1);
+}
+
 /* m7c-d — clause-body helper for the 2-arg `resume(v, ns)` form.
  * Every Ev<Eff> struct begins with `KaiHandlerId` (8 bytes) +
  * `void *env` (8 bytes), so `state` lives at byte offset 16. */
