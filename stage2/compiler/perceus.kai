@@ -405,7 +405,7 @@ fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
       # reclaim).
       else if prc_is_ufn_decl(fns, name, mo) {
         let uses = pcs_collect_uses_expr(body, [], false, [])
-        let new_body = pcs_rewrite_expr(body, [], uses, false, [])
+        let new_body = pcs_rewrite_expr(body, [], uses, false, [], [])
         let arm_dropped = pcs_arm_drop_pass(new_body, name, [], uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
         DFn(is_pub, name, tparams, params, opt_ret, row, reused_body, ln, cl, mo)
@@ -418,7 +418,7 @@ fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
         # Such a param is safe to read raw: the single read on the
         # path that executes transfers ownership; no dup wrap needed.
         let skip_set = pcs_branch_aware_skip_params(pnames, body)
-        let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set)
+        let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, [])
         # Issue #350 — emit `__perceus_drop` for multi-use pattern
         # bindings introduced by match arms (mirror of the SLet
         # exit-drop pass from #342). Runs BEFORE reuse recognition so
@@ -438,13 +438,13 @@ fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
     # bindings.
     DTest(desc, body, ln, cl) -> {
       let uses = pcs_collect_uses_expr(body, [], false, [])
-      let new_body = pcs_rewrite_expr(body, [], uses, false, [])
+      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [])
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DTest(desc, reused_body, ln, cl)
     }
     DBench(desc, body, ln, cl) -> {
       let uses = pcs_collect_uses_expr(body, [], false, [])
-      let new_body = pcs_rewrite_expr(body, [], uses, false, [])
+      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [])
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DBench(desc, reused_body, ln, cl)
     }
@@ -453,11 +453,23 @@ fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
     # discipline accounts for them. The emitter wraps each iter in a
     # function that defines the param locals and drops them at iter
     # boundary.
+    #
+    # Issue #697: unlike a fn param, a check-param is NOT owned by the
+    # body — the generated check loop owns it. The loop drops it in
+    # iter_drops/tail_drops, and the shrinker re-evaluates the same
+    # body against the SAME param value across iterations. So the body
+    # must BORROW its params: every read dups, last-use included, and
+    # the body never consumes/drops them. Passing `pnames` as the
+    # `force_set` makes `pcs_is_non_last` always-dup them — the same
+    # treatment `state`/`log` get, and for the same alias-not-owned
+    # reason. Without it, a single-use param (`string_length(s)`)
+    # transfers raw to a decref-aware consumer that frees it, then the
+    # loop's own drop double-frees (heap-use-after-free → SIGTRAP).
     DCheck(desc, ps, body, ln, cl) -> {
       let pnames = map(ps, (p) => p.pname)
       let uses = pcs_collect_uses_expr(body, pnames, false, [])
       let skip_set = pcs_branch_aware_skip_params(pnames, body)
-      let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set)
+      let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, pnames)
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DCheck(desc, ps, reused_body, ln, cl)
     }
@@ -917,18 +929,18 @@ fn pcs_collect_uses_interp_parts(parts: [IPart], scope: [String], in_lam: Bool,
 
 # ---- pcs_rewrite: wrap non-last in-scope EVar reads in __perceus_dup ----
 
-fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : Expr / Console =
+fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : Expr / Console =
 
-  Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam, skip_set),
+  Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam, skip_set, force_set),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
-                    uses: [Use], in_lam: Bool, skip_set: [String]) : ExprKind / Console {
+                    uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : ExprKind / Console {
 
   match k {
     # The actual rewrite: wrap a non-last `EVar` use in `__perceus_dup`.
     EVar(nm) -> {
-      if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam, skip_set) {
+      if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam, skip_set, force_set) {
         ECall(
           Expr { kind: EVar("__perceus_dup"), line: line, col: col,
                  ty: None, mode: MUnknown },
@@ -943,7 +955,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     # the parsed Expr, then surgically rewrite the source by replacing
     # the wrapped ident tokens with `__perceus_dup(NAME)`. Result rounds
     # back through the parser at emit time as a normal ECall(__perceus_dup).
-    EStr(span, is_triple) -> EStr(pcs_rewrite_estr_span(span, is_triple, scope, uses, in_lam, skip_set), is_triple)
+    EStr(span, is_triple) -> EStr(pcs_rewrite_estr_span(span, is_triple, scope, uses, in_lam, skip_set, force_set), is_triple)
     # Scope-aware kinds: ELambda extends scope with params and flips
     # in_lam; EBlock threads scope through SLet/SVar bindings; EMatch
     # delegates to pcs_rewrite_arms which adds pattern bindings to the
@@ -951,13 +963,13 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     # state/log/op-param scope.
     ELambda(ps, body) -> {
       let pn = map(ps, (p) => p.pname)
-      ELambda(ps, pcs_rewrite_expr(body, list_append(scope, pn), uses, true, skip_set))
+      ELambda(ps, pcs_rewrite_expr(body, list_append(scope, pn), uses, true, skip_set, force_set))
     }
     EBlock(stmts, opt_tail) -> {
-      let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [], skip_set)
+      let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [], skip_set, force_set)
       let new_tail = match opt_tail {
         None -> None
-        Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam, skip_set))
+        Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam, skip_set, force_set))
       }
       # Issue #297 (partial) — block-scope exit drops for SLet PBind
       # bindings that took a `__perceus_dup` per non-last read above.
@@ -983,21 +995,21 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
                                                          opt_tail, [])
       EBlock(pcs_append_drops(r.stmts, exit_drops), new_tail)
     }
-    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set),
-                              pcs_rewrite_arms(arms, scope, uses, in_lam, skip_set))
+    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set, force_set),
+                              pcs_rewrite_arms(arms, scope, uses, in_lam, skip_set, force_set))
     EHandle(body, eff, eff_tas, init_opt, alias, clauses, ret_opt) -> {
-      let body1 = pcs_rewrite_expr(body, scope, uses, in_lam, skip_set)
+      let body1 = pcs_rewrite_expr(body, scope, uses, in_lam, skip_set, force_set)
       let init1 = match init_opt {
         None -> None
-        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam, skip_set))
+        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam, skip_set, force_set))
       }
-      let cls1 = pcs_rewrite_clauses(clauses, scope, uses, in_lam, skip_set)
+      let cls1 = pcs_rewrite_clauses(clauses, scope, uses, in_lam, skip_set, force_set)
       let ret1 = match ret_opt {
         None -> None
         Some(hr) -> match hr {
           HR(pname, body2, hl, hc) ->
             Some(HR(pname,
-                    pcs_rewrite_expr(body2, [pname, ...scope], uses, in_lam, skip_set),
+                    pcs_rewrite_expr(body2, [pname, ...scope], uses, in_lam, skip_set, force_set),
                     hl, hc))
         }
       }
@@ -1019,70 +1031,70 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
     EIntrinsic(name, args_) ->
-      EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set))
+      EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set))
     ECall(callee, args_) ->
-      ECall(pcs_rewrite_expr(callee, scope, uses, in_lam, skip_set),
-            pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set))
-    EField(base, nm)     -> EField(pcs_rewrite_expr(base, scope, uses, in_lam, skip_set), nm)
-    EIndex(a, b)         -> EIndex(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
-                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
-    EBinop(op, a, b)     -> EBinop(op, pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
-                                        pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
-    EUnop(op, x)         -> EUnop(op, pcs_rewrite_expr(x, scope, uses, in_lam, skip_set))
-    EIf(c, t_, eo)       -> EIf(pcs_rewrite_expr(c, scope, uses, in_lam, skip_set),
-                                  pcs_rewrite_expr(t_, scope, uses, in_lam, skip_set),
-                                  pcs_rewrite_expr_opt(eo, scope, uses, in_lam, skip_set))
-    ERecordLit(name, fs) -> ERecordLit(name, pcs_rewrite_fields_init(fs, scope, uses, in_lam, skip_set))
-    EList(els)           -> EList(pcs_rewrite_list_elems(els, scope, uses, in_lam, skip_set))
-    ERange(a, b, opt_step) -> ERange(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
-                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set),
-                                       pcs_rewrite_expr_opt(opt_step, scope, uses, in_lam, skip_set))
-    EPipe(a, b)          -> EPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
-                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
-    EMapPipe(a, b)       -> EMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
-                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
-    EFlatMapPipe(a, b)   -> EFlatMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
-                                            pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
-    EFilterPipe(a, b)    -> EFilterPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set),
-                                           pcs_rewrite_expr(b, scope, uses, in_lam, skip_set))
-    ELitUnit(inner, u)   -> ELitUnit(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set), u)
-    EBang(inner)         -> EBang(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set))
+      ECall(pcs_rewrite_expr(callee, scope, uses, in_lam, skip_set, force_set),
+            pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set))
+    EField(base, nm)     -> EField(pcs_rewrite_expr(base, scope, uses, in_lam, skip_set, force_set), nm)
+    EIndex(a, b)         -> EIndex(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
+                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
+    EBinop(op, a, b)     -> EBinop(op, pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
+                                        pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
+    EUnop(op, x)         -> EUnop(op, pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set))
+    EIf(c, t_, eo)       -> EIf(pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set),
+                                  pcs_rewrite_expr(t_, scope, uses, in_lam, skip_set, force_set),
+                                  pcs_rewrite_expr_opt(eo, scope, uses, in_lam, skip_set, force_set))
+    ERecordLit(name, fs) -> ERecordLit(name, pcs_rewrite_fields_init(fs, scope, uses, in_lam, skip_set, force_set))
+    EList(els)           -> EList(pcs_rewrite_list_elems(els, scope, uses, in_lam, skip_set, force_set))
+    ERange(a, b, opt_step) -> ERange(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
+                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set),
+                                       pcs_rewrite_expr_opt(opt_step, scope, uses, in_lam, skip_set, force_set))
+    EPipe(a, b)          -> EPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
+                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
+    EMapPipe(a, b)       -> EMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
+                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
+                                            pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
+    EFilterPipe(a, b)    -> EFilterPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
+                                           pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
+    ELitUnit(inner, u)   -> ELitUnit(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set), u)
+    EBang(inner)         -> EBang(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set))
   }
 }
 
-fn pcs_rewrite_expr_opt(opt: Option[Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : Option[Expr] / Console = match opt {
+fn pcs_rewrite_expr_opt(opt: Option[Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : Option[Expr] / Console = match opt {
   None    -> None
-  Some(x) -> Some(pcs_rewrite_expr(x, scope, uses, in_lam, skip_set))
+  Some(x) -> Some(pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set))
 }
 
-fn pcs_rewrite_expr_list(es: [Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : [Expr] / Console = match es {
+fn pcs_rewrite_expr_list(es: [Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : [Expr] / Console = match es {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, in_lam, skip_set),
-                   ...pcs_rewrite_expr_list(rest, scope, uses, in_lam, skip_set)]
+  [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, in_lam, skip_set, force_set),
+                   ...pcs_rewrite_expr_list(rest, scope, uses, in_lam, skip_set, force_set)]
 }
 
-fn pcs_rewrite_fields_init(fs: [FieldInit], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : [FieldInit] / Console = match fs {
+fn pcs_rewrite_fields_init(fs: [FieldInit], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : [FieldInit] / Console = match fs {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_field_init(h, scope, uses, in_lam, skip_set),
-                   ...pcs_rewrite_fields_init(rest, scope, uses, in_lam, skip_set)]
+  [h, ...rest] -> [pcs_rewrite_field_init(h, scope, uses, in_lam, skip_set, force_set),
+                   ...pcs_rewrite_fields_init(rest, scope, uses, in_lam, skip_set, force_set)]
 }
 
-fn pcs_rewrite_field_init(fi: FieldInit, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : FieldInit / Console = match fi {
-  FI(name, e) -> FI(name, pcs_rewrite_expr(e, scope, uses, in_lam, skip_set))
+fn pcs_rewrite_field_init(fi: FieldInit, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : FieldInit / Console = match fi {
+  FI(name, e) -> FI(name, pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set))
 }
 
-fn pcs_rewrite_list_elems(els: [ListElem], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : [ListElem] / Console = match els {
+fn pcs_rewrite_list_elems(els: [ListElem], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : [ListElem] / Console = match els {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_list_elem(h, scope, uses, in_lam, skip_set),
-                   ...pcs_rewrite_list_elems(rest, scope, uses, in_lam, skip_set)]
+  [h, ...rest] -> [pcs_rewrite_list_elem(h, scope, uses, in_lam, skip_set, force_set),
+                   ...pcs_rewrite_list_elems(rest, scope, uses, in_lam, skip_set, force_set)]
 }
 
-fn pcs_rewrite_list_elem(el: ListElem, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : ListElem / Console = match el {
-  ElPlain(e)  -> ElPlain(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set))
-  ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set))
+fn pcs_rewrite_list_elem(el: ListElem, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : ListElem / Console = match el {
+  ElPlain(e)  -> ElPlain(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set))
+  ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set))
 }
 
-fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : [Arm] / Console {
+fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : [Arm] / Console {
 
   match arms {
     [] -> []
@@ -1091,10 +1103,10 @@ fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, ski
         let scope1 = prc_pat_bindings(pat, scope)
         let g1 = match opt_g {
           None -> None
-          Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam, skip_set))
+          Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam, skip_set, force_set))
         }
-        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set)
-        [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam, skip_set)]
+        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set, force_set)
+        [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam, skip_set, force_set)]
       }
     }
   }
@@ -1103,24 +1115,24 @@ fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, ski
 type PcsRwBlock = { stmts: [Stmt], scope: [String] }
 
 fn pcs_rewrite_block(stmts: [Stmt], scope: [String], uses: [Use], in_lam: Bool,
-                     acc: [Stmt], skip_set: [String]) : PcsRwBlock / Console {
+                     acc: [Stmt], skip_set: [String], force_set: [String]) : PcsRwBlock / Console {
 
   match stmts {
     [] -> PcsRwBlock { stmts: list_reverse(acc), scope: scope }
     [s, ...rest] -> {
-      let r = pcs_rewrite_stmt(s, scope, uses, in_lam, skip_set)
-      pcs_rewrite_block(rest, r.scope, uses, in_lam, [r.stmt, ...acc], skip_set)
+      let r = pcs_rewrite_stmt(s, scope, uses, in_lam, skip_set, force_set)
+      pcs_rewrite_block(rest, r.scope, uses, in_lam, [r.stmt, ...acc], skip_set, force_set)
     }
   }
 }
 
 type PcsRwStmt = { stmt: Stmt, scope: [String] }
 
-fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String]) : PcsRwStmt / Console {
+fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : PcsRwStmt / Console {
 
   match s {
     SLet(pat, ty_opt, rhs) -> {
-      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set)
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set)
       # See `pcs_collect_uses_in_block` SLet — raw locals stay
       # outside the Perceus scope so EVar reads of them are not
       # rewritten into `__perceus_dup` calls (which expect boxed
@@ -1129,25 +1141,25 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_se
                   scope: prc_pat_bindings_skip_raw(pat, rhs, scope) }
     }
     SVar(name, ty_opt, rhs, ln, cl) -> {
-      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set)
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set)
       PcsRwStmt { stmt: SVar(name, ty_opt, rhs1, ln, cl), scope: [name, ...scope] }
     }
     SAssert(c, opt_m) -> {
-      let c1 = pcs_rewrite_expr(c, scope, uses, in_lam, skip_set)
+      let c1 = pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set)
       let m1 = match opt_m {
         None -> None
-        Some(m) -> Some(pcs_rewrite_expr(m, scope, uses, in_lam, skip_set))
+        Some(m) -> Some(pcs_rewrite_expr(m, scope, uses, in_lam, skip_set, force_set))
       }
       PcsRwStmt { stmt: SAssert(c1, m1), scope: scope }
     }
     SExprStmt(e) -> {
-      let e1 = pcs_rewrite_expr(e, scope, uses, in_lam, skip_set)
+      let e1 = pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set)
       PcsRwStmt { stmt: SExprStmt(e1), scope: scope }
     }
     SIndexAssign(b, i, v, ln, cl) -> {
-      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam, skip_set)
-      let i1 = pcs_rewrite_expr(i, scope, uses, in_lam, skip_set)
-      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam, skip_set)
+      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set)
+      let i1 = pcs_rewrite_expr(i, scope, uses, in_lam, skip_set, force_set)
+      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam, skip_set, force_set)
       PcsRwStmt { stmt: SIndexAssign(b1, i1, v1, ln, cl), scope: scope }
     }
     # m7e §25: SUse has no expression and binds nothing.
@@ -1156,7 +1168,7 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_se
 }
 
 fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
-                        in_lam: Bool, skip_set: [String]) : [HClause] / Console {
+                        in_lam: Bool, skip_set: [String], force_set: [String]) : [HClause] / Console {
 
   match cs {
     [] -> []
@@ -1164,8 +1176,8 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
       HC(op, params, body, ln, cl) -> {
         let pn = pcs_filter_non_resume(map(params, (p) => p.pname), [])
         let scope1 = list_append(scope, ["state", "log", ...pn])
-        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set)
-        [HC(op, params, body1, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam, skip_set)]
+        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set, force_set)
+        [HC(op, params, body1, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam, skip_set, force_set)]
       }
     }
   }
@@ -1215,8 +1227,18 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
 # (issues #77–#82). Closed R10 and R11 (issue #61).
 
 fn pcs_is_non_last(nm: String, line: Int, col: Int, uses: [Use],
-                   in_lam_here: Bool, skip_set: [String]) : Bool {
-  if nm == "state" or nm == "log" { true }
+                   in_lam_here: Bool, skip_set: [String], force_set: [String]) : Bool {
+  # Issue #697 — `force_set` carries the names that must dup on EVERY
+  # read, last-use included, because the body does not own them: it
+  # borrows them. The sole populator is the `DCheck` branch, whose
+  # `with`-clause params are owned by the generated check loop (it
+  # drops them in iter_drops/tail_drops) and re-read by the shrinker
+  # across iterations. Treating a check-param as last-use → raw
+  # transfer hands the loop's only ref to a decref-aware consumer
+  # (`kai_prelude_string_length`, `kai_op_ne_v`, …), which frees it;
+  # the loop's own drop then double-frees. Same alias-not-owned shape
+  # as `state`/`log` below — forced to always-dup for the same reason.
+  if nm == "state" or nm == "log" or list_has(force_set, nm) { true }
   else if in_lam_here { true }
   else {
     match last_use_for(nm, uses) {
@@ -1836,7 +1858,7 @@ fn pcs_consumed_in_stmt(nm: String, s: Stmt) : Bool = match s {
 type DupMark = DM(Int, Int)   # line, col of an EVar that needs wrapping
 
 fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
-                          uses: [Use], in_lam: Bool, skip_set: [String]) : String / Console {
+                          uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : String / Console {
 
   let n = string_length(span)
   let body_start = if is_triple { 3 } else { 1 }
@@ -1845,7 +1867,7 @@ fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
   else {
     let parts = iscan_collect(span, body_end,
                   IScan { parts: [], lit_start: body_start, i: body_start })
-    let new_parts = pcs_rewrite_iparts(parts, scope, uses, in_lam, [], skip_set)
+    let new_parts = pcs_rewrite_iparts(parts, scope, uses, in_lam, [], skip_set, force_set)
     let body = pcs_concat_iparts(new_parts, "")
     let prefix = if is_triple { "\"\"\"" } else { "\"" }
     concat_all([prefix, body, prefix])
@@ -1853,16 +1875,16 @@ fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
 }
 
 fn pcs_rewrite_iparts(parts: [IPart], scope: [String], uses: [Use],
-                       in_lam: Bool, acc: [IPart], skip_set: [String]) : [IPart] / Console {
+                       in_lam: Bool, acc: [IPart], skip_set: [String], force_set: [String]) : [IPart] / Console {
 
   match parts {
     [] -> list_reverse(acc)
     [p, ...rest] -> {
       let p1 = match p {
         IpLit(_, _) -> p
-        IpExp(esrc) -> IpExp(pcs_rewrite_interp_src(esrc, scope, uses, in_lam, skip_set))
+        IpExp(esrc) -> IpExp(pcs_rewrite_interp_src(esrc, scope, uses, in_lam, skip_set, force_set))
       }
-      pcs_rewrite_iparts(rest, scope, uses, in_lam, [p1, ...acc], skip_set)
+      pcs_rewrite_iparts(rest, scope, uses, in_lam, [p1, ...acc], skip_set, force_set)
     }
   }
 }
@@ -1881,7 +1903,7 @@ fn pcs_concat_iparts(parts: [IPart], acc: String) : String {
 }
 
 fn pcs_rewrite_interp_src(esrc: String, scope: [String], uses: [Use],
-                           in_lam: Bool, skip_set: [String]) : String / Console {
+                           in_lam: Bool, skip_set: [String], force_set: [String]) : String / Console {
 
   # Tokenise once for pcs_render_with_marks (it needs the token
   # stream to map AST positions back to source spans); parse_interp_expr
@@ -1892,7 +1914,7 @@ fn pcs_rewrite_interp_src(esrc: String, scope: [String], uses: [Use],
   match parse_interp_expr(esrc) {
     None -> esrc
     Some(parsed) -> {
-      let rewritten = pcs_rewrite_expr(parsed, scope, uses, in_lam, skip_set)
+      let rewritten = pcs_rewrite_expr(parsed, scope, uses, in_lam, skip_set, force_set)
       let marks = pcs_dup_marks_expr(rewritten, [])
       match marks {
         [] -> esrc
