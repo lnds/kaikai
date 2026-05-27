@@ -294,12 +294,12 @@ test-check: kaic2
 	  cat /tmp/kaikai-check-basic.out; exit 1; \
 	fi; \
 	matched=$$(grep -E ': 100 iter, OK$$' /tmp/kaikai-check-basic.out | wc -l | tr -d ' '); \
-	if [ "$$matched" != "4" ]; then \
-	  echo "test-check FAIL — expected 4 OK lines, got $$matched"; \
+	if [ "$$matched" != "5" ]; then \
+	  echo "test-check FAIL — expected 5 OK lines, got $$matched"; \
 	  cat /tmp/kaikai-check-basic.out; exit 1; \
 	fi; \
-	if ! grep -qE '^4/4 checks passed$$' /tmp/kaikai-check-basic.out; then \
-	  echo "test-check FAIL — missing '4/4 checks passed' summary"; \
+	if ! grep -qE '^5/5 checks passed$$' /tmp/kaikai-check-basic.out; then \
+	  echo "test-check FAIL — missing '5/5 checks passed' summary"; \
 	  cat /tmp/kaikai-check-basic.out; exit 1; \
 	fi; \
 	./bin/kai check examples/stdlib/check_shrinking.kai > /tmp/kaikai-check-shrinking.out 2>&1; \
