@@ -458,6 +458,19 @@ void *kaix_evidence_lookup_node(const char *eff_label) {
     return (void *) kai_evidence_lookup_node(eff_label);
 }
 
+/* m7c-c (LLVM per-instance dispatch) — mirror of the C emit's
+ * `kai_evidence_lookup_node_by_id`. An aliased `with State[T](init)
+ * as name` handler captures its `handler_id` at install time; a
+ * `@name` read (`name.get()`) must resolve to *that* instance's
+ * node, not the innermost State node by name. Without this the LLVM
+ * backend collapsed every nested `var` cell to the top-of-stack
+ * State handler, so e.g. `@top` read the value of the last-pushed
+ * cell. The C backend has always resolved aliased ops by id; this
+ * brings the LLVM mirror to parity. (refs #622) */
+void *kaix_evidence_lookup_node_by_id(KaiHandlerId id) {
+    return (void *) kai_evidence_lookup_node_by_id(id);
+}
+
 void *kaix_evidence_node_handler(void *node_v) {
     KaiEvidence *node = (KaiEvidence *) node_v;
     if (node == NULL) { return NULL; }
