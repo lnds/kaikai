@@ -645,6 +645,67 @@ KaiValue *kaix_default_monitor_demonitor(void *self, KaiValue *ref, KaiCont *k) 
     return kai_default_monitor_demonitor(self, ref, k);
 }
 
+/* Parity lane B (#622) — LLVM-visible wrappers around the static
+ * File / Stdin / Process / Env / Signal default handlers in runtime.h.
+ * The LLVM install path used to drive off a hardcoded effect-name
+ * table that omitted these effects entirely; the user-effect default
+ * path (issue #558) was also absent. The install is AST-driven now
+ * (emit_llvm.kai), so any effect with an all-`$extern_handler` default
+ * block — these builtins included — installs its handler at main entry
+ * and references the `kaix_*` forwarder below. Without the forwarder
+ * the IR's `@kaix_default_*` symbol is undefined and clang rejects it
+ * (the #570/#582/#587 failure mode). File/Stdin/Process were the four
+ * segfaulting fixtures; Env/Signal share the same gap and are wired
+ * here for completeness so the AST walk never re-opens it. */
+KaiValue *kaix_default_file_read_file(void *self, KaiValue *path, KaiCont *k) {
+    return kai_default_file_read_file(self, path, k);
+}
+KaiValue *kaix_default_file_write_file(void *self, KaiValue *path, KaiValue *contents, KaiCont *k) {
+    return kai_default_file_write_file(self, path, contents, k);
+}
+KaiValue *kaix_default_stdin_read_line(void *self, KaiCont *k) {
+    return kai_default_stdin_read_line(self, k);
+}
+KaiValue *kaix_default_stdin_read_bytes(void *self, KaiValue *n, KaiCont *k) {
+    return kai_default_stdin_read_bytes(self, n, k);
+}
+KaiValue *kaix_default_process_start(void *self, KaiValue *cmd, KaiValue *args, KaiCont *k) {
+    return kai_default_process_start(self, cmd, args, k);
+}
+KaiValue *kaix_default_process_wait(void *self, KaiValue *child, KaiCont *k) {
+    return kai_default_process_wait(self, child, k);
+}
+KaiValue *kaix_default_process_kill(void *self, KaiValue *child, KaiValue *sig, KaiCont *k) {
+    return kai_default_process_kill(self, child, sig, k);
+}
+KaiValue *kaix_default_process_exit(void *self, KaiValue *code, KaiCont *k) {
+    return kai_default_process_exit(self, code, k);
+}
+KaiValue *kaix_default_env_args(void *self, KaiCont *k) {
+    return kai_default_env_args(self, k);
+}
+KaiValue *kaix_default_env_var(void *self, KaiValue *name, KaiCont *k) {
+    return kai_default_env_var(self, name, k);
+}
+KaiValue *kaix_default_env_set_var(void *self, KaiValue *name, KaiValue *value, KaiCont *k) {
+    return kai_default_env_set_var(self, name, value, k);
+}
+KaiValue *kaix_default_env_unset_var(void *self, KaiValue *name, KaiCont *k) {
+    return kai_default_env_unset_var(self, name, k);
+}
+KaiValue *kaix_default_env_vars(void *self, KaiCont *k) {
+    return kai_default_env_vars(self, k);
+}
+KaiValue *kaix_default_signal_on(void *self, KaiValue *sig_v, KaiCont *k) {
+    return kai_default_signal_on(self, sig_v, k);
+}
+KaiValue *kaix_default_signal_off(void *self, KaiValue *sig_v, KaiCont *k) {
+    return kai_default_signal_off(self, sig_v, k);
+}
+KaiValue *kaix_default_signal_await(void *self, KaiCont *k) {
+    return kai_default_signal_await(self, k);
+}
+
 /* m7c-d — install/teardown default handlers for builtins that
  * appear in main's row. The LLVM emitter generates the body of
  * these two functions per program (filling in the right
