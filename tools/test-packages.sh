@@ -24,6 +24,13 @@
 # rendered via examples/packages/render-fixtures.sh once at the
 # start. Bare repos under tests/fixtures/git-fixtures/ must exist
 # (setup.sh regenerates them).
+#
+# C<->LLVM PARITY (design decision, 2026-05-27): this harness owns
+# package-mode backend parity. tools/test-backend-parity.sh is
+# file-mode only and cannot resolve a package's manifest deps, so the
+# `run_parity` pass below builds + runs each positive fixture under
+# BOTH backends and compares stdout. The two harnesses split on the
+# package/file axis: file-mode parity there, package-mode parity here.
 
 set -eu
 
@@ -102,6 +109,36 @@ run_negative() {
   fi
 }
 
+# Parity: build + run the package with BOTH backends (C, LLVM) and
+# assert their stdout matches. This is the ONLY place package fixtures
+# get C<->LLVM parity coverage — the file-mode parity harness
+# (tools/test-backend-parity.sh) cannot resolve a package's manifest
+# deps, so package parity lives here, where the git-fixture setup +
+# package-mode build already exist (decided 2026-05-27). `kai run .`
+# honors KAI_BACKEND, verified on local_path + auto_install.
+# Args: <fixture-name> <run-dir-rel-to-PKG_DIR>
+run_parity() {
+  name="$1"; dir="$2"
+  abs_dir="$PKG_DIR/$dir"
+  [ -d "$abs_dir" ] || { skip "$name" "no dir $dir"; return; }
+  # Compare program STDOUT only. stderr carries the package-manager
+  # preamble ("kai-pkg: resolving …", lockfile writes) and git-fixture
+  # setup noise (awk warnings), which differs run-to-run (cache warm vs
+  # cold) and is not program output. Drop stderr; filter any `kai:` /
+  # `kai-pkg:` driver lines that reach stdout.
+  c_out="$(cd "$abs_dir" && KAI_BACKEND=c   "$KAI" run . 2>/dev/null | grep -vE '^kai(-pkg)?:' || true)"
+  l_out="$(cd "$abs_dir" && KAI_BACKEND=llvm "$KAI" run . 2>/dev/null | grep -vE '^kai(-pkg)?:' || true)"
+  if [ "$c_out" = "$l_out" ]; then
+    ok "$name"
+  else
+    err "$name"
+    echo "    --- C backend ---" >&2
+    echo "$c_out" | sed 's/^/    /' >&2
+    echo "    --- LLVM backend ---" >&2
+    echo "$l_out" | sed 's/^/    /' >&2
+  fi
+}
+
 # Driver-level: hand off to a fixture-owned check.sh.
 run_check_script() {
   name="$1"; rel="$2"
@@ -154,6 +191,23 @@ run_check_script "lockfile_repro"     "lockfile_reproducibility/check.sh"
 run_check_script "add_failure"        "add_failure/check.sh"
 run_check_script "init_invalid_names" "init_invalid_names/check.sh"
 run_check_script "manifest_parse"     "manifest_parse_error/check.sh"
+
+# --- C<->LLVM parity for package builds ---
+# Each positive fixture above is also built + run under BOTH backends
+# and their stdout compared. This is the package-mode counterpart to
+# tools/test-backend-parity.sh (which is file-mode only and cannot
+# resolve manifest deps). Covers the git-dep path (auto_install,
+# local_path) end to end under LLVM, which had no parity coverage.
+printf '%s\n' "-- package parity (C vs LLVM) --"
+run_parity  "parity-self_import"        "self_import/examples/demo"
+run_parity  "parity-transitive_privacy" "transitive_privacy/consumer"
+run_parity  "parity-local_path"         "local_path/app"
+run_parity  "parity-sibling_pkg_entry"  "sibling_examples_tests"
+run_parity  "parity-sibling_examples"   "sibling_examples_tests/examples/demo"
+run_parity  "parity-cross_pkg_effects"  "cross_package_effects/consumer"
+run_parity  "parity-same_name_shadow"   "same_name_shadowing"
+run_parity  "parity-stdlib_across_deps" "stdlib_across_deps/consumer"
+run_parity  "parity-auto_install"       "auto_install"
 
 printf '== summary: %d ok, %d fail, %d skip ==\n' "$PASS" "$FAIL" "$SKIP"
 if [ "$FAIL" -gt 0 ]; then

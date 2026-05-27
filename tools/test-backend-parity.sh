@@ -9,6 +9,16 @@
 # run the resulting binaries, and assert that stdout + exit code
 # match. Diverge => fail.
 #
+# SCOPE (design decision, 2026-05-27): this harness is FILE-MODE ONLY.
+# It builds each fixture as a standalone file (`kai build <file>`),
+# which does NOT read a kai.toml or resolve manifest dependencies. A
+# fixture that needs package-mode (deps, git sources) cannot build
+# here and is NOT a parity bug — its C<->LLVM parity is covered by
+# tools/test-packages.sh's `run_parity` (which builds in package mode
+# with `kai run .` under both backends, where the git-fixture setup
+# lives). The two harnesses split on the package/file axis on purpose;
+# do not add package-mode logic here.
+#
 # This generalizes tools/test-llvm-driver.sh — that script gates
 # the *driver* wiring (--backend flag, KAI_BACKEND env, clang
 # detection, precedence) on a hard-coded fixture list. This script
