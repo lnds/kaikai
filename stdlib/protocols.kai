@@ -292,8 +292,25 @@ impl Hash for Int {
   fn hash(x: Int) : Int = x
 }
 
+# `string_hash` is a runtime builtin: a tight C FNV-1a loop over the
+# String's bytes returning the full 64-bit digest (issue #373). It is
+# NOT a kaikai byte-by-byte loop, which would box an Int per character
+# — unacceptable for the hot path a HashMap (#374) exercises. The
+# digest can wrap to a NEGATIVE Int (two's-complement overflow); that
+# is correct and intended. HashMap MUST normalise to a bucket via
+# `((h % n) + n) % n` (or `h & (n-1)` for power-of-two n) — absorbing
+# the sign is HashMap's contract, not Hash's. See #374.
 impl Hash for String {
-  fn hash(x: String) : Int = string_length(x)
+  fn hash(x: String) : Int = string_hash(x)
+}
+
+# `real_bits` is a runtime builtin: it reinterprets the double's
+# IEEE-754 bit pattern as an Int (issue #373). A bit-cast, not an
+# `int_of_real` truncation — truncation would collapse the fraction
+# (1.5 and 1.9 would collide). Like the String digest, the result may
+# wrap negative; HashMap normalises (see the String note above).
+impl Hash for Real {
+  fn hash(x: Real) : Int = real_bits(x)
 }
 
 impl Hash for Bool {
@@ -307,10 +324,14 @@ impl Hash for Char {
 # Polymorphic Hash for parametric containers (issue #175). The list
 # fold is FNV-style: an `acc * 31 + hash(x)` polynomial mix that
 # matches the JVM convention and gives reasonable distribution for
-# mixed-arity primitive children. Option / Result use small per-
-# variant offsets (`None` => 0, `Some(x)` => 1 + hash(x); `Ok` =>
-# 2 + hash(t), `Err` => 3 + hash(e)) so distinct variants with
-# equal-hashing payloads don't collide.
+# mixed-arity primitive children. Option / Result mix the variant tag
+# MULTIPLICATIVELY against a large prime (`tag * 1099511628211`) before
+# adding the payload hash, so distinct variants with equal-hashing
+# payloads stay far apart: with the old additive offsets `Ok(1)` (=> 3)
+# collided with `Err(0)` (=> 3). The prime is the FNV-1a multiplier,
+# reused for the derive-Hash sum-type fold (see compiler/protos.kai).
+# Like every Hash backend here the result may wrap negative; HashMap
+# (#374) normalises to a bucket — see the String impl note above.
 
 fn list_hash_loop[T](xs: [T], acc: Int) : Int = match xs {
   []           -> acc
@@ -324,14 +345,14 @@ impl[T : Hash] Hash for [T] {
 impl[T : Hash] Hash for Option[T] {
   fn hash(o: Option[T]) : Int = match o {
     None    -> 0
-    Some(x) -> 1 + hash(x)
+    Some(x) -> 1 * 1099511628211 + hash(x)
   }
 }
 
 impl[E : Hash, T : Hash] Hash for Result[E, T] {
   fn hash(r: Result[E, T]) : Int = match r {
-    Ok(t)  -> 2 + hash(t)
-    Err(e) -> 3 + hash(e)
+    Ok(t)  -> 2 * 1099511628211 + hash(t)
+    Err(e) -> 3 * 1099511628211 + hash(e)
   }
 }
 
