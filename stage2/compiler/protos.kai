@@ -400,6 +400,30 @@ fn proto_op_lookup_loop(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] 
   }
 }
 
+# Issue #546: two protocols may declare an op with the same name
+# (`protocol Speak { sound(x: Self) }` + `protocol Move { sound(x: Self) }`).
+# kaikai resolves protocol ops by bare name, so the call site `sound(x)`
+# carries no protocol — only the receiver's type disambiguates. The
+# single-result `proto_op_lookup` above fixes the protocol to whichever
+# was declared first, which makes the static rewrite search impls in the
+# wrong protocol and leave a misdispatched residual. `proto_ops_lookup_all`
+# returns EVERY POR matching the name (registry order) so the rewrite can
+# try each candidate protocol and pick the one with an impl for the
+# receiver type.
+fn proto_ops_lookup_all(reg: ProtocolReg, name: String) : [ProtoOpReg] =
+  proto_ops_lookup_all_loop(reg.ops, name)
+
+fn proto_ops_lookup_all_loop(ops: [ProtoOpReg], target: String) : [ProtoOpReg] {
+  match ops {
+    [] -> []
+    [op, ...rest] -> match op {
+      POR(_, name, _, _, _, _) ->
+        if name == target { [op, ...proto_ops_lookup_all_loop(rest, target)] }
+        else { proto_ops_lookup_all_loop(rest, target) }
+    }
+  }
+}
+
 # Collect every protocol the program declares. Used by the
 # orphan-rule validation: an `impl P for T` is allowed only if `P` is
 # declared in the same compilation unit (here: in `decls`) or `T` is.
@@ -4040,27 +4064,15 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
                 None
               }
               else {
-                let pname = match proto_op_lookup(reg, opname) {
-                  Some(po) -> match po { POR(pn, _, _, _, _, _) -> pn }
-                  None -> ""
-                }
-                if pname == "" { None }
-                else {
-                  let arg_names_opt = args_head_names(args_)
-                  match arg_names_opt {
-                    None -> None
-                    Some(arg_names) -> {
-                      match find_impl_with_args(reg.impls, pname, opname,
-                                                  self_name, arg_names) {
-                        None -> None
-                        Some(impl_fn) -> {
-                          let new_callee = mk_expr(EVar(impl_fn),
-                                                    callee.line, callee.col)
-                          Some(ECall(new_callee, args_))
-                        }
-                      }
-                    }
-                  }
+                # Issue #546: a return-typed op (`from(x) : Self`) may
+                # also be declared by more than one protocol. Try each
+                # candidate against the return-derived Self type.
+                match args_head_names(args_) {
+                  None -> None
+                  Some(arg_names) ->
+                    try_rewrite_ret_candidates(proto_ops_lookup_all(reg, opname),
+                                               callee, args_, reg, opname,
+                                               self_name, arg_names)
                 }
               }
             }
@@ -4068,6 +4080,31 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
           }
         }
       }
+    }
+  }
+}
+
+# Issue #546: the return-typed-Self counterpart of
+# `try_rewrite_proto_candidates`. Walks every protocol declaring
+# `opname` and returns the first whose impl table matches the
+# return-derived `self_name` + the other args. `None` when no
+# candidate matches, preserving the prior behaviour.
+fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
+                               args_: [Expr], reg: ProtocolReg,
+                               opname: String, self_name: String,
+                               arg_names: [String]) : Option[ExprKind] {
+  match cands {
+    [] -> None
+    [po, ...rest] -> match po {
+      POR(pname, _, _, _, _, _) ->
+        match find_impl_with_args(reg.impls, pname, opname, self_name, arg_names) {
+          Some(impl_fn) -> {
+            let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
+            Some(ECall(new_callee, args_))
+          }
+          None -> try_rewrite_ret_candidates(rest, callee, args_, reg,
+                                             opname, self_name, arg_names)
+        }
     }
   }
 }
@@ -4089,31 +4126,49 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
         # is no longer always args[0]. We need to consider every
         # argument as a candidate Self and find the impl whose
         # arg-name list matches the OTHER arguments.
-        let pop = proto_op_lookup(reg, opname)
-        match pop {
-          None -> None
-          Some(po) -> match po {
-            POR(pname, _, params, ret, _, _) -> {
-              # When Self appears only in the op's return position
-              # (e.g. `from(x: a) : Self`), the args carry no Self
-              # information — defer to the caller-provided ret_ty
-              # (handled by the `_with_ret` wrapper above).
-              if proto_op_self_only_in_return(params, ret) { None }
-              else {
-                match find_proto_impl_for_args(reg, pname, opname, args_) {
-                  None -> None
-                  Some(impl_fn) -> {
-                    let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
-                    Some(ECall(new_callee, args_))
-                  }
-                }
-              }
+        #
+        # Issue #546: when two protocols declare an op with the same
+        # name, the bare-name call site carries no protocol — only the
+        # receiver type disambiguates. Iterate every protocol declaring
+        # this op and pick the first that has an impl for the receiver.
+        try_rewrite_proto_candidates(proto_ops_lookup_all(reg, opname),
+                                     callee, args_, reg, opname)
+      }
+    }
+    _ -> None
+  }
+}
+
+# Issue #546: try each protocol declaring `opname` in registry order,
+# returning the first whose impl table has an entry for the receiver
+# type. Candidates whose Self appears only in the return position carry
+# no arg-borne Self information, so they are skipped here and left to
+# the `_with_ret` wrapper. Returning `None` when no candidate matches
+# preserves the prior single-protocol behaviour (residual dispatcher
+# kept for the polymorphic / no-impl paths).
+fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
+                                 args_: [Expr], reg: ProtocolReg,
+                                 opname: String) : Option[ExprKind] {
+  match cands {
+    [] -> None
+    [po, ...rest] -> match po {
+      POR(pname, _, params, ret, _, _) -> {
+        # When Self appears only in the op's return position (e.g.
+        # `from(x: a) : Self`), the args carry no Self information —
+        # defer to the caller-provided ret_ty (the `_with_ret` wrapper).
+        if proto_op_self_only_in_return(params, ret) {
+          try_rewrite_proto_candidates(rest, callee, args_, reg, opname)
+        } else {
+          match find_proto_impl_for_args(reg, pname, opname, args_) {
+            Some(impl_fn) -> {
+              let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
+              Some(ECall(new_callee, args_))
             }
+            None -> try_rewrite_proto_candidates(rest, callee, args_, reg, opname)
           }
         }
       }
     }
-    _ -> None
   }
 }
 
