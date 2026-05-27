@@ -387,6 +387,8 @@ KaiValue *kaix_prelude_char_to_int(KaiValue *c)                { return kai_prel
 KaiValue *kaix_prelude_int_to_char(KaiValue *i)                { return kai_prelude_int_to_char(i); }
 KaiValue *kaix_prelude_int_to_byte_string(KaiValue *i)         { return kai_prelude_int_to_byte_string(i); }
 KaiValue *kaix_prelude_string_byte_at_int(KaiValue *s, KaiValue *i) { return kai_prelude_string_byte_at_int(s, i); }
+KaiValue *kaix_prelude_string_hash(KaiValue *s)                { return kai_prelude_string_hash(s); }
+KaiValue *kaix_prelude_real_bits(KaiValue *v)                  { return kai_prelude_real_bits(v); }
 KaiValue *kaix_prelude_array_make(KaiValue *n, KaiValue *init)           { return kai_prelude_array_make(n, init); }
 KaiValue *kaix_prelude_array_length(KaiValue *a)                         { return kai_prelude_array_length(a); }
 KaiValue *kaix_prelude_array_get(KaiValue *a, KaiValue *i)               { return kai_prelude_array_get(a, i); }
