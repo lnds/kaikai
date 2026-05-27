@@ -3628,9 +3628,23 @@ static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
  * invocation; lifecycle managed at the call lowering).
  */
 
+/* Int add, sub, and mul compute in uint64_t and cast back. kaikai's Int is a
+ * wrapping two's-complement int64_t by design (CLAUDE.md Tier 1 + the
+ * Int contract in docs); the polynomial/FNV hash mixing in
+ * stdlib/protocols.kai relies on the wrap. Signed overflow is UB in
+ * C99 (6.5) even when the hardware wraps, so doing the math directly
+ * on int64_t trips `-fsanitize=undefined` (tier1-asan) the moment a
+ * value overflows — which `impl Hash for Real` makes trivial (a
+ * Real's bit-cast is a large Int, and `acc * 31` overflows). The
+ * unsigned compute is well-defined modular arithmetic (6.3.1.3) and,
+ * on every target kaikai supports (two's-complement clang/gcc),
+ * produces the byte-identical result the signed form did — so this
+ * silences the UB without changing any emitted output. Division and
+ * comparison stay signed (their overflow is not part of the contract).
+ */
 static KaiValue *kai_op_add(KaiValue *a, KaiValue *b) {
     KaiValue *r;
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int(a->as.i + b->as.i);
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int((int64_t)((uint64_t) a->as.i + (uint64_t) b->as.i));
     else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_real(a->as.r + b->as.r);
     else { fprintf(stderr, "kai: type mismatch in +\n"); exit(1); }
     kai_decref(a); kai_decref(b);
@@ -3639,7 +3653,7 @@ static KaiValue *kai_op_add(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_sub(KaiValue *a, KaiValue *b) {
     KaiValue *r;
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int(a->as.i - b->as.i);
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int((int64_t)((uint64_t) a->as.i - (uint64_t) b->as.i));
     else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_real(a->as.r - b->as.r);
     else { fprintf(stderr, "kai: type mismatch in -\n"); exit(1); }
     kai_decref(a); kai_decref(b);
@@ -3648,7 +3662,7 @@ static KaiValue *kai_op_sub(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_mul(KaiValue *a, KaiValue *b) {
     KaiValue *r;
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int(a->as.i * b->as.i);
+    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int((int64_t)((uint64_t) a->as.i * (uint64_t) b->as.i));
     else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_real(a->as.r * b->as.r);
     else { fprintf(stderr, "kai: type mismatch in *\n"); exit(1); }
     kai_decref(a); kai_decref(b);
@@ -4776,6 +4790,48 @@ static KaiValue *kai_prelude_string_byte_at_int(KaiValue *s, KaiValue *i) {
     return kai_int(v);
 }
 
+/* `string_hash(s)` — full-width 64-bit FNV-1a over the raw bytes, the
+ * Hash protocol's String backend (issue #373). Distinct from the
+ * interning hash `kai_str_intern_hash` above, which bucket-truncates
+ * with `& (BUCKETS-1)`; here we return the *whole* 64-bit digest cast
+ * to int64_t. That cast can wrap negative — that is correct and
+ * intended. The future HashMap (#374) normalises to a bucket via
+ * `((h % n) + n) % n` (or `h & (n-1)` for power-of-two n); negativity
+ * is HashMap's contract to absorb, not Hash's to mask. Done in C, not
+ * a kaikai byte loop, because the kaikai loop would box an Int per
+ * byte (one alloc + decref per character) — catastrophic for the hot
+ * path a HashMap exercises. */
+static KaiValue *kai_prelude_string_hash(KaiValue *s) {
+    uint64_t h = 1469598103934665603ull;
+    if (s && s->tag == KAI_STR) {
+        const char *bytes = s->as.s.bytes;
+        size_t len = s->as.s.len;
+        for (size_t i = 0; i < len; i++) {
+            h ^= (uint64_t) (uint8_t) bytes[i];
+            h *= 1099511628211ull;
+        }
+    }
+    if (s) kai_decref(s);
+    return kai_int((int64_t) h);
+}
+
+/* `real_bits(r)` — reinterpret a double's IEEE-754 bit pattern as an
+ * Int, the Hash protocol's Real backend (issue #373). A bit-cast
+ * rather than `int_of_real` truncation because truncation collapses
+ * the fraction (1.5 and 1.9 would hash identically); the bit pattern
+ * separates every distinct double. Note +0.0 and -0.0 have different
+ * bit patterns (and NaN payloads vary) — acceptable for a hash, since
+ * Hash↔Eq consistency on Real is the caller's concern, not ours. */
+static KaiValue *kai_prelude_real_bits(KaiValue *v) {
+    uint64_t bits = 0;
+    if (v && v->tag == KAI_REAL) {
+        double r = v->as.r;
+        memcpy(&bits, &r, sizeof(bits));
+    }
+    if (v) kai_decref(v);
+    return kai_int((int64_t) bits);
+}
+
 static KaiValue *kai_prelude_string_contains(KaiValue *s, KaiValue *sub) {
     int yes = 0;
     if (s && s->tag == KAI_STR && sub && sub->tag == KAI_STR) {
@@ -4874,6 +4930,8 @@ static KaiValue *_kai_prelude_char_to_int_thunk(KaiValue *s, KaiValue **a, int n
 static KaiValue *_kai_prelude_int_to_char_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_int_to_char(a[0]); }
 static KaiValue *_kai_prelude_int_to_byte_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_int_to_byte_string(a[0]); }
 static KaiValue *_kai_prelude_string_byte_at_int_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_byte_at_int(a[0], a[1]); }
+static KaiValue *_kai_prelude_string_hash_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_hash(a[0]); }
+static KaiValue *_kai_prelude_real_bits_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_real_bits(a[0]); }
 static KaiValue *_kai_prelude_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) a; (void) n; return kai_prelude_mailbox_alloc(); }
 static KaiValue *_kai_prelude_mailbox_alloc_bounded_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_mailbox_alloc_bounded(a[0], a[1]); }
 static KaiValue *_kai_prelude_mailbox_send_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_send(a[0], a[1]); }
