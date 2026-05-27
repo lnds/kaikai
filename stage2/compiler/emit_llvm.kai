@@ -1477,12 +1477,143 @@ fn llvm_emit_kind_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
         llvm_unbox_value(eb, eb.last_val, x.ty)
       }
     EUnop(op, inner) -> llvm_emit_unop_raw(e, op, inner, x.ty)
+    # Issue #718 — a raw-context call to a UFn (raw scalar signature)
+    # emits the raw-arg call and keeps the result raw, with no
+    # `kaix_int`/`kaix_to_int` round-trip. The unbox pass marks such
+    # ECalls MUnboxed (`decide_mode` ECall arm), so they reach here.
+    # Non-UFn callees (and callees that don't resolve, e.g. closures)
+    # fall through to the boxed-then-unwrap boundary tactic below.
+    ECall(callee, args_) ->
+      # Issue #718 — a self-tail-call sentinel in raw position lowers to
+      # the same TCO back-edge as in boxed position; `llvm_emit_call`'s
+      # sentinel arm already handles UFn raw vs boxed, so route through
+      # it and report `undef` (the back-edge is a terminator, its value
+      # is dead). Mirror of C `emit_kind_raw`'s tcrec arm.
+      match callee.kind {
+        EVar(cnm) -> if es_tcrec_is_sentinel(cnm) {
+          let ec = llvm_emit_call(e, callee, args_)
+          LlvmRaw { e: ec, reg: "undef", ty: x.ty }
+        } else { llvm_emit_call_raw_or_box(e, x, callee, args_) }
+        _ -> llvm_emit_call_raw_or_box(e, x, callee, args_)
+      }
+    # Issue #718 — `if cond { a } else { b }` with raw arms lowers to a
+    # `br i1` + raw phi, no `kaix_bool` / `kaix_to_int` round-trip.
+    # Mirror of C `emit_kind_raw`'s EIf ternary. The unbox pass marks
+    # such EIfs MUnboxed (`decide_mode` EIf arm), so they reach here.
+    EIf(cnd, ath, opt_eth) -> match opt_eth {
+      Some(eth) -> llvm_emit_if_raw(e, cnd, ath, eth, x.ty)
+      None -> {
+        let eb = llvm_emit_expr_boxed(e, x)
+        llvm_unbox_value(eb, eb.last_val, x.ty)
+      }
+    }
+    # Issue #718 — a single-tail EBlock (no preceding statements) in raw
+    # position just forwards its tail raw. Multi-stmt blocks stay boxed
+    # (the unbox pass keeps them MBoxed). Mirror of C `emit_kind_raw`'s
+    # EBlock arm.
+    EBlock(stmts, opt_tail) -> match stmts {
+      [] -> match opt_tail {
+        Some(t) -> llvm_emit_expr_raw(e, t)
+        None -> {
+          let eb = llvm_emit_expr_boxed(e, x)
+          llvm_unbox_value(eb, eb.last_val, x.ty)
+        }
+      }
+      _ -> {
+        let eb = llvm_emit_expr_boxed(e, x)
+        llvm_unbox_value(eb, eb.last_val, x.ty)
+      }
+    }
     _ -> {
       # Anything else: emit boxed and unwrap. The unbox_pass should
       # not have marked these MUnboxed in the first place — defensive.
       let eb = llvm_emit_expr_boxed(e, x)
       llvm_unbox_value(eb, eb.last_val, x.ty)
     }
+  }
+}
+
+# Issue #718 — raw-context ECall to a UFn emits the raw-arg call and
+# keeps the result raw; non-UFn callees fall back to the boxed-then-
+# unwrap boundary. Factored out so the tcrec-sentinel guard above can
+# share it.
+fn llvm_emit_call_raw_or_box(e: LlvmEmit, x: Expr, callee: Expr, args_: [Expr]) : LlvmRaw / Console {
+  match llvm_raw_call_ufn_sig(e.locals, e.fns, callee) {
+    Some(US(pts, rt)) ->
+      llvm_emit_ufn_call_raw(e, llvm_raw_call_sym(e.fns, callee), pts, rt, args_)
+    None -> {
+      let eb = llvm_emit_expr_boxed(e, x)
+      llvm_unbox_value(eb, eb.last_val, x.ty)
+    }
+  }
+}
+
+# Issue #718 — emit `if cond { a } else { b }` entirely in the raw
+# scalar domain. The cond is a raw bool (i32 0/1 from a raw cmp); the
+# arms produce raw `iN`/`double` values joined by a phi of the result
+# ty. Mirror of `llvm_emit_if` but with no boxing at the cond test or
+# the join. The arm exit labels feed the phi (an arm may branch
+# internally, so its closing label is read from the emitter, not the
+# header).
+fn llvm_emit_if_raw(e: LlvmEmit, c: Expr, t: Expr, eth: Expr, opt_ty: Option[Ty]) : LlvmRaw / Console {
+  let rc = llvm_emit_expr_raw(e, c)
+  let cond = llvm_fresh_reg(rc.e)
+  # Raw bool cmp result is i32 (zext'd i1); compare against 0 for the br.
+  let e2 = llvm_append_body(cond.e, concat_all(["  ", cond.reg, " = icmp ne i32 ", rc.reg, ", 0\n"]))
+  let th = llvm_fresh_label(e2, "rif.then.")
+  let el = llvm_fresh_label(th.e, "rif.else.")
+  let jn = llvm_fresh_label(el.e, "rif.end.")
+  let e3 = llvm_append_body(jn.e, concat_all(["  br i1 ", cond.reg,
+                                              ", label %", th.reg,
+                                              ", label %", el.reg, "\n"]))
+  let e4 = llvm_open_block(e3, th.reg)
+  let rt_then = llvm_emit_expr_raw(e4, t)
+  let then_val = rt_then.reg
+  let then_end = rt_then.e.cur_label
+  let e5 = llvm_append_body(rt_then.e, concat_all(["  br label %", jn.reg, "\n"]))
+  let e6 = llvm_open_block(e5, el.reg)
+  let rt_else = llvm_emit_expr_raw(e6, eth)
+  let else_val = rt_else.reg
+  let else_end = rt_else.e.cur_label
+  let e7 = llvm_append_body(rt_else.e, concat_all(["  br label %", jn.reg, "\n"]))
+  let e8 = llvm_open_block(e7, jn.reg)
+  let ir = llvm_raw_ir_type(opt_ty)
+  let phi = llvm_fresh_reg(e8)
+  let phi_instr = concat_all([
+    "  ", phi.reg, " = phi ", ir, " [ ", then_val, ", %", then_end,
+    " ], [ ", else_val, ", %", else_end, " ]\n"
+  ])
+  let e9 = llvm_append_body(phi.e, phi_instr)
+  LlvmRaw { e: e9, reg: phi.reg, ty: opt_ty }
+}
+
+# Issue #718 — resolve the UFnSig of a raw-context ECall callee, only
+# for the named-call shapes the C `emit_ufn_boxed_call` recognises
+# (EVar / EModCall). A local-shadowed name is NOT a UFn (the local
+# binding wins); a closure / lambda callee resolves to None. Mirror of
+# `call_resolves_to_ufn` in unbox.kai.
+fn llvm_raw_call_ufn_sig(locals: [LlvmLocal], fns: [EFn], callee: Expr) : Option[UFnSig] {
+  match callee.kind {
+    # A local binding shadowing a top-level UFn name is NOT a UFn call
+    # (the local closure value wins). Mirror of C's `emit_ufn_raw_call`
+    # `list_has(lcs, callee)` guard.
+    EVar(nm) -> if list_has(llvm_local_names(locals), nm) { None }
+                else { llvm_ufn_sig_of_callee(fns, nm) }
+    EModCall(mod, fname) -> lookup_ufn_sig(fns, fname, Some(mod))
+    _ -> None
+  }
+}
+
+# Issue #718 — the call symbol for a raw-context ECall callee, matching
+# the boxed call site's symbol minting (`c_sym_of_callee` for bare
+# names, `c_sym(fname, Some(mod))` for qualified). Only called after
+# `llvm_raw_call_ufn_sig` returned `Some`, so the callee is EVar /
+# EModCall.
+fn llvm_raw_call_sym(fns: [EFn], callee: Expr) : String {
+  match callee.kind {
+    EVar(nm) -> string_concat("@kai_", c_sym_of_callee(fns, nm))
+    EModCall(mod, fname) -> string_concat("@kai_", c_sym(fname, Some(mod)))
+    _ -> "@kai_unreachable"
   }
 }
 
@@ -2536,6 +2667,60 @@ fn llvm_emit_bit_intrinsic(e: LlvmEmit, nm: String, xs: [Expr]) : LlvmEmit / Con
   llvm_set_last(llvm_append_body(r.e, instr), r.reg)
 }
 
+# Issue #718 — resolve a bare-name callee to its UFnSig (raw scalar
+# signature) through the EFn registry. `efn_resolve` matches by name
+# and applies the same root/same-module preference the call-site symbol
+# minting (`c_sym_of_callee`) uses, so the sig and the symbol agree.
+fn llvm_ufn_sig_of_callee(fns: [EFn], nm: String) : Option[UFnSig] {
+  match efn_resolve(fns, nm) {
+    Some(EFn(_, _, _, sig)) -> sig
+    None -> None
+  }
+}
+
+# Issue #718 — format a raw-scalar call argument list: `iN %r0, iN %r1,
+# ...` co-indexing the evaluated raw registers with the UFn slot tys.
+fn llvm_format_args_raw(regs: [String], pts: [Ty]) : String {
+  match regs {
+    [] -> ""
+    [x] -> {
+      let ir = pts_head_ir(pts)
+      concat_all([ir, " ", x])
+    }
+    [x, ...rest] -> {
+      let ir = pts_head_ir(pts)
+      let trest = pts_tail(pts)
+      concat_all([ir, " ", x, ", ", llvm_format_args_raw(rest, trest)])
+    }
+  }
+}
+
+# Issue #718 — emit a UFn call in a BOXED context: evaluate args as raw
+# scalars coerced to the callee's slot tys, call the raw scalar entry
+# (`call iN @kai_<sym>(iN ...)`), then box the raw result so the caller
+# still sees a `%KaiValue*`. Mirror of C's `emit_ufn_boxed_call`
+# (`box_wrap(rt, kai_<sym>(raw_args))`).
+fn llvm_emit_ufn_call_boxed(e: LlvmEmit, sym: String, pts: [Ty], rt: Ty, xs: [Expr]) : LlvmEmit / Console {
+  let raw = llvm_emit_ufn_call_raw(e, sym, pts, rt, xs)
+  llvm_box_wrap_value(raw.e, raw.reg, Some(rt))
+}
+
+# Issue #718 — emit a UFn call in a RAW context: evaluate args raw,
+# call the raw scalar entry, and return the raw `iN`/`double` result
+# WITHOUT boxing. Used both by `llvm_emit_ufn_call_boxed` (which boxes
+# on top) and by the raw-context ECall arm in `llvm_emit_kind_raw`,
+# where the consumer already wants a raw scalar (no round-trip through
+# `kaix_int` / `kaix_to_int`). Mirror of C's `emit_expr_raw` ECall arm.
+fn llvm_emit_ufn_call_raw(e: LlvmEmit, sym: String, pts: [Ty], rt: Ty, xs: [Expr]) : LlvmRaw / Console {
+  let ra = llvm_emit_args_raw(e, xs, pts, [])
+  let ret_ir = llvm_raw_ir_type_t(rt)
+  let r = llvm_fresh_reg(ra.st)
+  let instr = concat_all(["  ", r.reg, " = call ", ret_ir, " ", sym, "(",
+                          llvm_format_args_raw(ra.regs, pts), ")\n"])
+  let e1 = llvm_append_body(r.e, instr)
+  LlvmRaw { e: e1, reg: r.reg, ty: Some(rt) }
+}
+
 fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
 
   match callee.kind {
@@ -2699,19 +2884,31 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
               Some(_) -> llvm_emit_variant_ctor(e, nm, xs)
               None -> match llvm_local_find_loop(e.locals, nm) {
                 Some(reg) -> llvm_emit_apply(e, reg, xs)
-                None      -> {
-                  let ra = llvm_emit_args(e, xs, [])
-                  # m6.2 v2: route the bare-name callee through the
-                  # EFn table so it picks up the right module prefix
-                  # (`@kai_<m>__<n>` for module-owned decls, plain
-                  # `@kai_<n>` for root-file decls).
-                  let sym = if llvm_is_prelude_fn(nm) { llvm_prelude_symbol(nm) }
-                            else { string_concat("@kai_", c_sym_of_callee(e.fns, nm)) }
-                  let r = llvm_fresh_reg(ra.st)
-                  let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
-                                          llvm_format_args(ra.regs), ")\n"])
-                  llvm_set_last(llvm_append_body(r.e, instr), r.reg)
-                }
+                None      ->
+                  # Issue #718 — when the bare-name callee resolves to a
+                  # UFn (raw scalar signature), emit the raw-arg call and
+                  # box the result so this boxed call site still produces a
+                  # `%KaiValue*`. Mirror of C's `emit_ufn_boxed_call`. A
+                  # `lcs` shadow already short-circuited above (the local
+                  # find returned None), so this only fires for top-level
+                  # user UFns.
+                  match llvm_ufn_sig_of_callee(e.fns, nm) {
+                    Some(US(pts, rt)) ->
+                      llvm_emit_ufn_call_boxed(e, string_concat("@kai_", c_sym_of_callee(e.fns, nm)), pts, rt, xs)
+                    None -> {
+                      let ra = llvm_emit_args(e, xs, [])
+                      # m6.2 v2: route the bare-name callee through the
+                      # EFn table so it picks up the right module prefix
+                      # (`@kai_<m>__<n>` for module-owned decls, plain
+                      # `@kai_<n>` for root-file decls).
+                      let sym = if llvm_is_prelude_fn(nm) { llvm_prelude_symbol(nm) }
+                                else { string_concat("@kai_", c_sym_of_callee(e.fns, nm)) }
+                      let r = llvm_fresh_reg(ra.st)
+                      let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
+                                              llvm_format_args(ra.regs), ")\n"])
+                      llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+                    }
+                  }
               }
             }
         }
@@ -2732,27 +2929,34 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
       # circuit before minting `@kai_<mod>__<fname>`.
       match evar_find(e.vars_, fname) {
         Some(_) -> llvm_emit_variant_ctor(e, fname, xs)
-        None -> {
-          let ra = llvm_emit_args(e, xs, [])
-          # m6.2 v2: qualified call `mod.fname(args)`. Mint the prefixed
-          # symbol directly from the EModCall payload — the resolver
-          # already verified `fname` is exported by `mod`, so the EFn
-          # entry for it carries `module_origin = Some(mod)`. We could
-          # equivalently route through `efn_resolve`; using `mod`
-          # directly is one indirection less.
-          # issue #524 — qualified callees never fall back to the prelude
-          # shortcut. The qualifier is authoritative: if the user wrote
-          # `mod.fname`, the resolver already proved `mod` exports
-          # `fname`, so we must emit the module's own symbol even when
-          # `fname` collides with a prelude entry (e.g. `file.read_bytes`
-          # vs. prelude `read_bytes`). The C backend never had this bug
-          # because its EModCall arm goes straight through `c_sym`.
-          let sym = string_concat("@kai_", c_sym(fname, Some(mod)))
-          let r = llvm_fresh_reg(ra.st)
-          let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
-                                  llvm_format_args(ra.regs), ")\n"])
-          llvm_set_last(llvm_append_body(r.e, instr), r.reg)
-        }
+        None ->
+          # Issue #718 — qualified UFn call: raw args + box the result.
+          # Mirror of C's `emit_ufn_boxed_call` EModCall arm.
+          match lookup_ufn_sig(e.fns, fname, Some(mod)) {
+            Some(US(pts, rt)) ->
+              llvm_emit_ufn_call_boxed(e, string_concat("@kai_", c_sym(fname, Some(mod))), pts, rt, xs)
+            None -> {
+              let ra = llvm_emit_args(e, xs, [])
+              # m6.2 v2: qualified call `mod.fname(args)`. Mint the prefixed
+              # symbol directly from the EModCall payload — the resolver
+              # already verified `fname` is exported by `mod`, so the EFn
+              # entry for it carries `module_origin = Some(mod)`. We could
+              # equivalently route through `efn_resolve`; using `mod`
+              # directly is one indirection less.
+              # issue #524 — qualified callees never fall back to the prelude
+              # shortcut. The qualifier is authoritative: if the user wrote
+              # `mod.fname`, the resolver already proved `mod` exports
+              # `fname`, so we must emit the module's own symbol even when
+              # `fname` collides with a prelude entry (e.g. `file.read_bytes`
+              # vs. prelude `read_bytes`). The C backend never had this bug
+              # because its EModCall arm goes straight through `c_sym`.
+              let sym = string_concat("@kai_", c_sym(fname, Some(mod)))
+              let r = llvm_fresh_reg(ra.st)
+              let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
+                                      llvm_format_args(ra.regs), ")\n"])
+              llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+            }
+          }
       }
     _ -> {
       let ec = llvm_emit_expr(e, callee)
@@ -3991,6 +4195,111 @@ fn llvm_init_locals_from_params(ps: [Param]) : [LlvmLocal] {
   }
 }
 
+# Issue #718 — scalar (unboxed) function signatures. When a DFn is
+# classified as a UFn (`Some(US(pts, rt))` in the EFn registry), the
+# LLVM backend emits a raw scalar calling convention matching the C
+# backend's `emit_fn_signature_unboxed`: each param is an `iN`/`double`
+# named `%kair_<name>`, the body reads it as a raw scalar (registered
+# as an `LRaw` local), and the return type is the raw scalar of `rt`.
+# This avoids the per-arg `kaix_int` heap box that inflated every
+# non-tail recursive frame ~25-50× and overflowed the 64 KiB fiber
+# stack (sibling of #706: LLVM dropping a codegen opt the C path has).
+
+# Raw param list for a UFn: `iN %kair_<p0>, iN %kair_<p1>, ...` using
+# each slot's ty from the UFnSig (`pts`). Mirrors C's
+# `emit_param_list_unboxed`. `ps` and `pts` are co-indexed (the
+# classifier guarantees `len(pts) == len(params)`); a short `pts`
+# defensively falls back to the param's own declared ty.
+fn llvm_param_list_unboxed_loop(ps: [Param], pts: [Ty], acc: String) : String {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> {
+      let pty = pts_head_or(pts, llvm_param_ty_or_int(p))
+      let trest = pts_tail(pts)
+      let sep = if string_length(acc) == 0 { "" } else { ", " }
+      let piece = concat_all([sep, llvm_raw_ir_type_t(pty), " %kair_", p.pname])
+      llvm_param_list_unboxed_loop(rest, trest, string_concat(acc, piece))
+    }
+  }
+}
+
+fn llvm_param_list_unboxed(ps: [Param], pts: [Ty]) : String = llvm_param_list_unboxed_loop(ps, pts, "")
+
+# Issue #718 — TCO raw param list for a UFn body that carries a
+# self-tail-call sentinel. Names the incoming args `%pargr_<name>`;
+# the per-iteration reload at the loop head re-mints `%kair_<name>`
+# (the register the body reads), mirroring the boxed TCO path's
+# `%parg_<name>` / `%p_<name>` split.
+fn llvm_param_list_unboxed_tcrec_loop(ps: [Param], pts: [Ty], acc: String) : String {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> {
+      let pty = pts_head_or(pts, llvm_param_ty_or_int(p))
+      let trest = pts_tail(pts)
+      let sep = if string_length(acc) == 0 { "" } else { ", " }
+      let piece = concat_all([sep, llvm_raw_ir_type_t(pty), " %pargr_", p.pname])
+      llvm_param_list_unboxed_tcrec_loop(rest, trest, string_concat(acc, piece))
+    }
+  }
+}
+
+fn llvm_param_list_unboxed_tcrec(ps: [Param], pts: [Ty]) : String = llvm_param_list_unboxed_tcrec_loop(ps, pts, "")
+
+# Issue #718 — seed the local-name scope of a UFn body with each
+# param as an `LRaw(name, "%kair_<name>", ty)`. The body's `EVar`
+# reads of the param then resolve to the raw SSA register through
+# `llvm_raw_local_find` (issue #87's raw-local mechanism) rather than
+# to a boxed `%p_<name>`. Mirror of C's `ufn_param_env` seeding the
+# raw `kair_<name>` aliases.
+fn llvm_init_raw_locals_from_params(ps: [Param], pts: [Ty]) : [LlvmLocal] {
+  match ps {
+    [] -> []
+    [p, ...rest] -> {
+      let pty = pts_head_or(pts, llvm_param_ty_or_int(p))
+      let trest = pts_tail(pts)
+      [LRaw(p.pname, string_concat("%kair_", p.pname), pty),
+       ...llvm_init_raw_locals_from_params(rest, trest)]
+    }
+  }
+}
+
+# Issue #718 — head/tail accessors for the co-indexed UFn slot-ty list
+# (`pts`). Extracted into named helpers because the inline form
+# `match pts { [t, ..._] -> t [] -> fb }` mis-parses: the parser reads
+# `t []` as an index expression `t[]`. The defensive `[]` fallback
+# should not fire — the classifier keeps `pts` co-indexed with the
+# param list — but the match must stay exhaustive.
+fn pts_head_or(pts: [Ty], fb: Ty) : Ty {
+  match pts {
+    [t, ..._] -> t
+    []        -> fb
+  }
+}
+
+fn pts_tail(pts: [Ty]) : [Ty] {
+  match pts {
+    [_, ...r] -> r
+    []        -> []
+  }
+}
+
+fn pts_head_ir(pts: [Ty]) : String {
+  match pts {
+    [t, ..._] -> llvm_raw_ir_type_t(t)
+    []        -> "i64"
+  }
+}
+
+# Resolve a param's declared ty for the defensive `pts`-too-short path
+# (should not fire — the classifier keeps `pts` co-indexed with the
+# param list). Falls back to TyInt when the param carries no annotation.
+fn llvm_param_ty_or_int(p: Param) : Ty {
+  match p.ptype {
+    Some(te) -> resolve_ty(te)
+    None     -> TyInt
+  }
+}
+
 # ---- list literals ----
 
 fn llvm_emit_list(e: LlvmEmit, elems: [ListElem]) : LlvmEmit / Console = llvm_emit_list_tail(e, elems)
@@ -4833,18 +5142,76 @@ fn llvm_emit_bang(e: LlvmEmit, inner: Expr) : LlvmEmit / Console {
 # m6.2 v2: `nm` here is already the c_sym suffix (`<name>` for
 # root-file decls, `<m>__<name>` for module-owned decls); the
 # caller in llvm_emit_fn does the c_sym build before passing in.
-fn llvm_emit_thunk(nm: String, arity: Int) : String {
+fn llvm_emit_thunk(nm: String, arity: Int, opt_sig: Option[UFnSig]) : String {
   let thunk_sym = concat_all(["@_kai_", nm, "_thunk"])
   let target_sym = concat_all(["@kai_", nm])
   let load_lines = llvm_thunk_loads(0, arity, "")
-  let call_args = llvm_thunk_call_args(0, arity, "")
-  concat_all([
-    "\ndefine %KaiValue* ", thunk_sym, "(%KaiValue* %self, %KaiValue** %args, i32 %n) {\n",
-    load_lines,
-    "  %r = call %KaiValue* ", target_sym, "(", call_args, ")\n",
-    "  ret %KaiValue* %r\n",
-    "}\n"
-  ])
+  match opt_sig {
+    # Issue #718 — UFn thunk: unbox each boxed `%a<i>` into a raw
+    # `%ar<i>` scalar (and decref the boxed slot, mirroring C's
+    # `kai_decref(args[i])`), call the raw entry, box the raw result.
+    # Mirror of C's `emit_fn_thunk` `Some(US(pts, rt))` branch.
+    Some(US(pts, rt)) -> {
+      let unbox_lines = llvm_thunk_unbox_args(0, pts, "")
+      let raw_args = llvm_thunk_raw_call_args(0, pts, "")
+      let ret_ir = llvm_raw_ir_type_t(rt)
+      let box_ctor = llvm_box_ctor_t(rt)
+      let box_arg_ir = llvm_box_arg_ir_t(rt)
+      concat_all([
+        "\ndefine %KaiValue* ", thunk_sym, "(%KaiValue* %self, %KaiValue** %args, i32 %n) {\n",
+        load_lines,
+        unbox_lines,
+        "  %rraw = call ", ret_ir, " ", target_sym, "(", raw_args, ")\n",
+        "  %r = call %KaiValue* ", box_ctor, "(", box_arg_ir, " %rraw)\n",
+        "  ret %KaiValue* %r\n",
+        "}\n"
+      ])
+    }
+    None -> {
+      let call_args = llvm_thunk_call_args(0, arity, "")
+      concat_all([
+        "\ndefine %KaiValue* ", thunk_sym, "(%KaiValue* %self, %KaiValue** %args, i32 %n) {\n",
+        load_lines,
+        "  %r = call %KaiValue* ", target_sym, "(", call_args, ")\n",
+        "  ret %KaiValue* %r\n",
+        "}\n"
+      ])
+    }
+  }
+}
+
+# Issue #718 — per-arg unbox + decref inside a UFn thunk. Reads the
+# raw scalar field out of each loaded `%a<i>` via the matching
+# `kaix_to_*` helper into `%ar<i>`, then decrefs the boxed slot (the
+# thunk takes ownership of each arg, mirroring C's
+# `kai_decref(args[i])`). The decref result register is discarded
+# (`%adrop<i>` keeps the SSA name unique).
+fn llvm_thunk_unbox_args(i: Int, pts: [Ty], acc: String) : String {
+  match pts {
+    [] -> acc
+    [t, ...rest] -> {
+      let ix = int_to_string(i)
+      let unbox_sym = llvm_unbox_helper_t(t)
+      let raw_ir = llvm_raw_ir_type_t(t)
+      let line = concat_all([
+        "  %ar", ix, " = call ", raw_ir, " ", unbox_sym, "(%KaiValue* %a", ix, ")\n",
+        "  %adrop", ix, " = call %KaiValue* @kaix_internal_drop(%KaiValue* %a", ix, ")\n"
+      ])
+      llvm_thunk_unbox_args(i + 1, rest, string_concat(acc, line))
+    }
+  }
+}
+
+fn llvm_thunk_raw_call_args(i: Int, pts: [Ty], acc: String) : String {
+  match pts {
+    [] -> acc
+    [t, ...rest] -> {
+      let sep = if i == 0 { "" } else { ", " }
+      let raw_ir = llvm_raw_ir_type_t(t)
+      let piece = concat_all([sep, raw_ir, " %ar", int_to_string(i)])
+      llvm_thunk_raw_call_args(i + 1, rest, string_concat(acc, piece))
+    }
+  }
 }
 
 fn llvm_thunk_loads(i: Int, arity: Int, acc: String) : String {
@@ -4883,7 +5250,12 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
       let csuffix = c_sym(nm, mo)
       let sym = if nm == "main" { "@kai_main" } else { string_concat("@kai_", csuffix) }
       let arity = list_length(ps)
-      let thunk = llvm_emit_thunk(csuffix, arity)
+      # Issue #718 — a UFn carries a raw scalar entry; its first-class
+      # thunk must marshal the boxed `args[i]` slots into raw scalars,
+      # call the raw entry, and box the result so `kaix_apply` still
+      # hands back a `%KaiValue*`. Mirror of C's `emit_fn_thunk`
+      # `Some(US(...))` branch. Non-UFns keep the plain boxed thunk.
+      let thunk = llvm_emit_thunk(csuffix, arity, lookup_ufn_sig(fns, nm, mo))
       # m12.7.x FFI v1: an `[<extern_c>]` axiom's body is the magic
       # ETodo tag. Synthesise an LLVM shim that mirrors the C-side
       # output: the extern is declared at module scope and the
@@ -4902,68 +5274,118 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
         let shim = llvm_emit_proto_dispatch_shim(sym, proto_dispatch_parts(body), ps, start_id)
         LlvmDeclOut { text: concat_all([shim.text, thunk]), next_id: shim.next_id }
       } else {
-      let locals0 = llvm_init_locals_from_params(ps)
-      # Issue #706: when the body carries a self-tail-call sentinel
-      # (planted by `tcrec_rewrite_decls`, run for both backends),
-      # convert the recursion into a loop. The params can't be SSA
-      # arguments (the back-edge must reassign them), so we alloca a
-      # slot per param in `entry:`, branch to `%tcrec.loop`, and reload
-      # each param as `%p_<name>` at the loop head. The body reads
-      # `%p_<name>` unchanged; the sentinel lowering stores new values
-      # into the slots and branches back. See `llvm_emit_tcrec_goto`.
-      let has_sentinel = llvm_body_has_sentinel(body)
+      # Issue #718 — scalar UFn signature. Resolve the UFnSig once and
+      # thread the decision (`opt_sig`) through every site that the C
+      # backend bifurcates on: the param list, the body's local-name
+      # scope (raw vs boxed params), the TCO prologue/back-edge, the
+      # return type, and the return value. asu's review (#718): wire
+      # `is_ufn` once and pass it down — if the signature says "raw" but
+      # the loop header reloads boxed, the IR is mistyped.
+      let opt_sig = lookup_ufn_sig(fns, nm, mo)
       # Same-module preference: rotate `fns` so DFns from this DFn's
       # module come first. `efn_resolve`'s ambiguous fallback returns
       # the first match so a recursive call resolves to the local
       # module entry. Mirror of the C backend's emit_fn_body.
       let body_fns = fns_prefer_module(fns, mo)
-      # The body's first basic block: `entry` without TCO, `tcrec.loop`
-      # with it (so phi nodes whose incoming value is produced in the
-      # first body block reference the right predecessor).
-      let first_label = if has_sentinel { "tcrec.loop" } else { "entry" }
-      let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
-                          globals: "", body: "",
-                          last_val: "", cur_label: first_label,
-                          locals: locals0, fns: body_fns, vars_: vs, lams: lams,
-                          op_offsets: oo, cls: cls }
-      # Prologue (TCO only): alloca + store the incoming args, branch
-      # into the loop header, reload params. Emitted into the body so it
-      # precedes the real body's IR; `cur_label` is already
-      # `tcrec.loop` so the body's first instructions land there.
-      let e_pro = if has_sentinel {
-        let e_slots = llvm_emit_tcrec_slots(e0, ps)
-        llvm_emit_tcrec_loop_header(e_slots, ps)
-      } else { e0 }
-      let e1 = llvm_emit_expr(e_pro, body)
-      # m6.2 v2: mint the prefixed symbol when the decl is owned by
-      # an imported module. `main` is special-cased — it is always
-      # `@kai_main` (the runtime calls it directly), so a hypothetical
-      # `pub fn main` defined in a prelude file (none exist today)
-      # would still emit unprefixed.
-      let param_list = if has_sentinel { llvm_param_list_tcrec(ps) } else { llvm_param_list(ps) }
-      let text = concat_all([
-        e1.globals,
-        "\n",
-        "define %KaiValue* ", sym, "(", param_list, ") {\n",
-        # The emitter initialises `cur_label` to "entry" (llvm_emit_new
-        # / e0 above), so a phi whose incoming value was produced in the
-        # function's first basic block references `%entry`. LLVM's
-        # implicit first block is unnamed unless explicitly labelled, so
-        # that reference is invalid IR ("use of undefined value
-        # '%entry'"). This surfaces only when the first match arm's body
-        # ends in the entry block (e.g. Perceus reuse lowering, issue
-        # #622) — EIf always phi-joins freshly opened blocks. Emit the
-        # `entry:` header so the label the emitter already tracks is a
-        # real block. Mirrors the FFI/proto shims, which label `entry:`.
-        # With TCO, `entry:` holds the alloca prologue and the loop body
-        # opens its own `tcrec.loop:` header inside `e1.body`.
-        "entry:\n",
-        e1.body,
-        "  ret %KaiValue* ", e1.last_val, "\n",
-        "}\n",
-        thunk
-      ])
-      LlvmDeclOut { text: text, next_id: e1.ids.next }
+      # Issue #706: when the body carries a self-tail-call sentinel
+      # (planted by `tcrec_rewrite_decls`, run for both backends),
+      # convert the recursion into a loop. The params can't be SSA
+      # arguments (the back-edge must reassign them), so we alloca a
+      # slot per param in `entry:`, branch to `%tcrec.loop`, and reload
+      # each param at the loop head. The body reads the reloaded
+      # register unchanged; the sentinel lowering stores new values into
+      # the slots and branches back. See `llvm_emit_tcrec_goto`.
+      let has_sentinel = llvm_body_has_sentinel(body)
+      match opt_sig {
+        # --- UFn: raw scalar calling convention (issue #718) ---
+        Some(US(pts, rt)) -> {
+          # Params seed the body's scope as raw `LRaw(name, %kair_<n>, ty)`
+          # so EVar reads lower to the raw SSA register, not a boxed
+          # `%p_<n>`. Mirror of C's `ufn_param_env`.
+          let locals0 = llvm_init_raw_locals_from_params(ps, pts)
+          let first_label = if has_sentinel { "tcrec.loop" } else { "entry" }
+          let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
+                              globals: "", body: "",
+                              last_val: "", cur_label: first_label,
+                              locals: locals0, fns: body_fns, vars_: vs, lams: lams,
+                              op_offsets: oo, cls: cls }
+          # TCO raw prologue: alloca `iN` slot per param, store the
+          # incoming `%pargr_<n>`, branch into the loop header, reload as
+          # `%kair_<n>`. No box, no RC — raw scalars carry no reference
+          # count (mirror of C `tcrec_emit_goto`'s `Some(US(...))` branch,
+          # which emits zero drops).
+          let e_pro = if has_sentinel {
+            let e_slots = llvm_emit_tcrec_slots_raw(e0, ps, pts)
+            llvm_emit_tcrec_loop_header_raw(e_slots, ps, pts)
+          } else { e0 }
+          # The body is MUnboxed (the unbox pass marks a UFn body raw);
+          # emit it raw so the return is a native scalar, not a boxed
+          # `%KaiValue*`. Mirror of C `emit_fn_body`'s `emit_expr_raw`.
+          let rret = llvm_emit_expr_raw(e_pro, body)
+          let e1 = rret.e
+          let ret_ir = llvm_raw_ir_type_t(rt)
+          let param_list = if has_sentinel { llvm_param_list_unboxed_tcrec(ps, pts) }
+                           else { llvm_param_list_unboxed(ps, pts) }
+          let text = concat_all([
+            e1.globals, "\n",
+            "define ", ret_ir, " ", sym, "(", param_list, ") {\n",
+            "entry:\n",
+            e1.body,
+            "  ret ", ret_ir, " ", rret.reg, "\n",
+            "}\n",
+            thunk
+          ])
+          LlvmDeclOut { text: text, next_id: e1.ids.next }
+        }
+        # --- boxed `%KaiValue*` calling convention (unchanged) ---
+        None -> {
+          let locals0 = llvm_init_locals_from_params(ps)
+          let first_label = if has_sentinel { "tcrec.loop" } else { "entry" }
+          let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
+                              globals: "", body: "",
+                              last_val: "", cur_label: first_label,
+                              locals: locals0, fns: body_fns, vars_: vs, lams: lams,
+                              op_offsets: oo, cls: cls }
+          # Prologue (TCO only): alloca + store the incoming args, branch
+          # into the loop header, reload params. Emitted into the body so it
+          # precedes the real body's IR; `cur_label` is already
+          # `tcrec.loop` so the body's first instructions land there.
+          let e_pro = if has_sentinel {
+            let e_slots = llvm_emit_tcrec_slots(e0, ps)
+            llvm_emit_tcrec_loop_header(e_slots, ps)
+          } else { e0 }
+          let e1 = llvm_emit_expr(e_pro, body)
+          # m6.2 v2: mint the prefixed symbol when the decl is owned by
+          # an imported module. `main` is special-cased — it is always
+          # `@kai_main` (the runtime calls it directly), so a hypothetical
+          # `pub fn main` defined in a prelude file (none exist today)
+          # would still emit unprefixed.
+          let param_list = if has_sentinel { llvm_param_list_tcrec(ps) } else { llvm_param_list(ps) }
+          let text = concat_all([
+            e1.globals,
+            "\n",
+            "define %KaiValue* ", sym, "(", param_list, ") {\n",
+            # The emitter initialises `cur_label` to "entry" (llvm_emit_new
+            # / e0 above), so a phi whose incoming value was produced in the
+            # function's first basic block references `%entry`. LLVM's
+            # implicit first block is unnamed unless explicitly labelled, so
+            # that reference is invalid IR ("use of undefined value
+            # '%entry'"). This surfaces only when the first match arm's body
+            # ends in the entry block (e.g. Perceus reuse lowering, issue
+            # #622) — EIf always phi-joins freshly opened blocks. Emit the
+            # `entry:` header so the label the emitter already tracks is a
+            # real block. Mirrors the FFI/proto shims, which label `entry:`.
+            # With TCO, `entry:` holds the alloca prologue and the loop body
+            # opens its own `tcrec.loop:` header inside `e1.body`.
+            "entry:\n",
+            e1.body,
+            "  ret %KaiValue* ", e1.last_val, "\n",
+            "}\n",
+            thunk
+          ])
+          LlvmDeclOut { text: text, next_id: e1.ids.next }
+        }
+      }
       }
     }
     _ -> LlvmDeclOut { text: "", next_id: start_id }
@@ -5741,6 +6163,27 @@ fn llvm_emit_tcrec_slots(e: LlvmEmit, ps: [Param]) : LlvmEmit {
   }
 }
 
+# Issue #718 — TCO raw prologue for a UFn. Each slot is an `alloca iN`
+# storing the incoming `%pargr_<name>` scalar; no box, no RC. Mirror
+# of `llvm_emit_tcrec_slots` but for the raw calling convention.
+fn llvm_emit_tcrec_slots_raw(e: LlvmEmit, ps: [Param], pts: [Ty]) : LlvmEmit {
+  match ps {
+    [] -> llvm_append_body(e, "  br label %tcrec.loop\n")
+    [p, ...rest] -> {
+      let pty = pts_head_or(pts, llvm_param_ty_or_int(p))
+      let trest = pts_tail(pts)
+      let ir = llvm_raw_ir_type_t(pty)
+      let slot = string_concat("%pslotr_", p.pname)
+      let arg  = string_concat("%pargr_", p.pname)
+      let e1 = llvm_append_body(e, concat_all([
+        "  ", slot, " = alloca ", ir, "\n",
+        "  store ", ir, " ", arg, ", ", ir, "* ", slot, "\n"
+      ]))
+      llvm_emit_tcrec_slots_raw(e1, rest, trest)
+    }
+  }
+}
+
 # Open `%tcrec.loop` and reload each param into its `%p_<name>`
 # register so the body — which reads params via `%p_<name>` — sees the
 # current loop value. Emits a fresh temp for each load, then renames it
@@ -5763,6 +6206,31 @@ fn llvm_emit_tcrec_reloads(e: LlvmEmit, ps: [Param]) : LlvmEmit {
         "  ", reg, " = load %KaiValue*, %KaiValue** ", slot, "\n"
       ]))
       llvm_emit_tcrec_reloads(e1, rest)
+    }
+  }
+}
+
+# Issue #718 — TCO raw loop header for a UFn. Reloads each param slot
+# as `%kair_<name>` (the raw register the body reads). Mirror of
+# `llvm_emit_tcrec_loop_header` for the raw calling convention.
+fn llvm_emit_tcrec_loop_header_raw(e: LlvmEmit, ps: [Param], pts: [Ty]) : LlvmEmit {
+  let e0 = llvm_open_block(e, "tcrec.loop")
+  llvm_emit_tcrec_reloads_raw(e0, ps, pts)
+}
+
+fn llvm_emit_tcrec_reloads_raw(e: LlvmEmit, ps: [Param], pts: [Ty]) : LlvmEmit {
+  match ps {
+    [] -> e
+    [p, ...rest] -> {
+      let pty = pts_head_or(pts, llvm_param_ty_or_int(p))
+      let trest = pts_tail(pts)
+      let ir = llvm_raw_ir_type_t(pty)
+      let slot = string_concat("%pslotr_", p.pname)
+      let reg  = string_concat("%kair_", p.pname)
+      let e1 = llvm_append_body(e, concat_all([
+        "  ", reg, " = load ", ir, ", ", ir, "* ", slot, "\n"
+      ]))
+      llvm_emit_tcrec_reloads_raw(e1, rest, trest)
     }
   }
 }
@@ -5797,29 +6265,83 @@ fn llvm_emit_tcrec_reloads(e: LlvmEmit, ps: [Param]) : LlvmEmit {
 #     already dead and must NOT be dropped again.
 fn llvm_emit_tcrec_goto(e: LlvmEmit, c_sym: String, dropmask: Int,
                         pnames: [String], xs: [Expr]) : LlvmEmit / Console {
-  # 1. evaluate every new arg into a temp register (in order).
-  let ra = llvm_emit_args(e, xs, [])
-  # 2. drop the outgoing slot values, reading the *current* loaded
-  #    `%p_<name>` value. A UFn drops all params (borrow-read body, every
-  #    slot live); a non-UFn follows the C dropmask.
-  let is_ufn = match llvm_lookup_ufn_by_csym(ra.st.fns, c_sym) {
-    Some(_) -> true
-    None    -> false
+  # Issue #718 — a UFn carries a raw scalar signature, so its TCO slots
+  # are `iN` (not boxed `%KaiValue*`): evaluate the new args raw, store
+  # them into the `iN` slots, and emit ZERO drops (raw scalars carry no
+  # reference count). Mirror of the C `tcrec_emit_goto` `Some(US(...))`
+  # branch (emit_c.kai:9770), which likewise discards the dropmask and
+  # rebinds raw. The boxed back-edge (`None` below) is unchanged.
+  match llvm_lookup_ufn_by_csym(e.fns, c_sym) {
+    Some(US(pts, _)) -> llvm_emit_tcrec_goto_raw(e, pnames, pts, xs)
+    None -> {
+      # 1. evaluate every new arg into a temp register (in order).
+      let ra = llvm_emit_args(e, xs, [])
+      # 2. drop the outgoing slot values, reading the *current* loaded
+      #    `%p_<name>` value, following the C dropmask. (A UFn never
+      #    reaches here — it took the raw branch above.)
+      let e_drops = llvm_emit_tcrec_drops(ra.st, pnames, dropmask, 0)
+      # 3. store each temp into its param slot (declaration order).
+      let e_stores = llvm_emit_tcrec_stores(e_drops, pnames, ra.regs, 0)
+      # 4. branch back to the loop header.
+      let e_br = llvm_append_body(e_stores, "  br label %tcrec.loop\n")
+      # 5. open a fresh dead block; the surrounding tail handling appends a
+      #    terminator here that will never execute.
+      let dead = llvm_fresh_label(e_br, "tcrec.dead.")
+      let e_dead = llvm_open_block(dead.e, dead.reg)
+      llvm_set_last(e_dead, "undef")
+    }
   }
-  let e_drops = if is_ufn {
-    llvm_emit_tcrec_drops_all(ra.st, pnames)
-  } else {
-    llvm_emit_tcrec_drops(ra.st, pnames, dropmask, 0)
-  }
-  # 3. store each temp into its param slot (declaration order).
-  let e_stores = llvm_emit_tcrec_stores(e_drops, pnames, ra.regs, 0)
-  # 4. branch back to the loop header.
+}
+
+# Issue #718 — raw back-edge for a UFn self-tail-call. Evaluates each
+# new arg as a raw scalar (`llvm_emit_expr_raw`, coercing the slot's
+# `iN` ty), stores into the `%pslotr_<name>` slots, and branches back.
+# No drops: raw scalars have no reference count, exactly as C emits
+# zero drops for a UFn back-edge. Args are evaluated into temps BEFORE
+# any store fires so a new arg that reads an old param value (e.g.
+# `loop(n-1, acc+1)`) sees the pre-iteration value (mirror of C's
+# `tcrec_emit_arg_lets_raw` decoupling).
+fn llvm_emit_tcrec_goto_raw(e: LlvmEmit, pnames: [String], pts: [Ty], xs: [Expr]) : LlvmEmit / Console {
+  let ra = llvm_emit_args_raw(e, xs, pts, [])
+  let e_stores = llvm_emit_tcrec_stores_raw(ra.st, pnames, pts, ra.regs, 0)
   let e_br = llvm_append_body(e_stores, "  br label %tcrec.loop\n")
-  # 5. open a fresh dead block; the surrounding tail handling appends a
-  #    terminator here that will never execute.
   let dead = llvm_fresh_label(e_br, "tcrec.dead.")
   let e_dead = llvm_open_block(dead.e, dead.reg)
   llvm_set_last(e_dead, "undef")
+}
+
+# Issue #718 — evaluate each arg as a raw scalar coerced to the
+# matching UFn slot ty (`pts`). The slot ty drives the IR type the
+# store expects, so the raw register must already be that width. The
+# `LlvmRaw.reg` produced by `llvm_emit_expr_raw` is the native scalar.
+fn llvm_emit_args_raw(e: LlvmEmit, xs: [Expr], pts: [Ty], acc: [String]) : LlvmArgs / Console {
+  match xs {
+    [] -> LlvmArgs { st: e, regs: list_reverse(acc) }
+    [x0, ...rest] -> {
+      let trest = pts_tail(pts)
+      let r = llvm_emit_expr_raw(e, x0)
+      llvm_emit_args_raw(r.e, rest, trest, [r.reg, ...acc])
+    }
+  }
+}
+
+fn llvm_emit_tcrec_stores_raw(e: LlvmEmit, pnames: [String], pts: [Ty], regs: [String], i: Int) : LlvmEmit {
+  match pnames {
+    [] -> e
+    [p, ...rest] -> match regs {
+      [] -> e
+      [r, ...rrest] -> {
+        let pty = pts_head_or(pts, TyInt)
+        let trest = pts_tail(pts)
+        let ir = llvm_raw_ir_type_t(pty)
+        let slot = string_concat("%pslotr_", p)
+        let e1 = llvm_append_body(e, concat_all([
+          "  store ", ir, " ", r, ", ", ir, "* ", slot, "\n"
+        ]))
+        llvm_emit_tcrec_stores_raw(e1, rest, trest, rrest, i + 1)
+      }
+    }
+  }
 }
 
 fn llvm_emit_tcrec_drops(e: LlvmEmit, pnames: [String], dropmask: Int, i: Int) : LlvmEmit / Console {
@@ -5839,24 +6361,13 @@ fn llvm_emit_tcrec_drops(e: LlvmEmit, pnames: [String], dropmask: Int, i: Int) :
   }
 }
 
-# Issue #709 — UFn back-edge: drop the outgoing slot value of *every*
-# param. A UFn body reads its (boxed-in-LLVM) params via non-consuming
-# borrow-readers, so each `%p_<name>` reloaded at the loop head is still
-# live at the store; dropping it once balances the slot's reference. This
-# subsumes — does not stack on top of — the C dropmask drops.
-fn llvm_emit_tcrec_drops_all(e: LlvmEmit, pnames: [String]) : LlvmEmit / Console {
-  match pnames {
-    [] -> e
-    [p, ...rest] -> {
-      let reg = string_concat("%p_", p)
-      let d = llvm_fresh_reg(e)
-      let e1 = llvm_append_body(d.e, concat_all([
-        "  ", d.reg, " = call %KaiValue* @kaix_internal_drop(%KaiValue* ", reg, ")\n"
-      ]))
-      llvm_emit_tcrec_drops_all(e1, rest)
-    }
-  }
-}
+# Issue #709 / #718 — the boxed UFn back-edge that this used to handle
+# (drop every slot value before the store, because the body read the
+# boxed params via borrow-readers and the slot stayed live) no longer
+# exists: a UFn now carries a raw scalar signature (#718), so its slots
+# are `iN` with no reference count and its back-edge takes
+# `llvm_emit_tcrec_goto_raw` (zero drops). The boxed back-edge is now
+# reached only by non-UFn fns, which follow the C dropmask verbatim.
 
 # Issue #709 — local mirror of emit_c.kai's `lookup_ufn_by_csym`. Finds
 # the EFn registry entry whose emitted C symbol matches `csym` and is
