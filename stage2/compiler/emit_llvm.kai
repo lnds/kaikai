@@ -1744,9 +1744,60 @@ fn llvm_emit_field(e: LlvmEmit, obj: Expr, fnm: String) : LlvmEmit / Console {
 
 # m7d §28 (LLVM): destructure a record-shaped rhs into one local
 # per field. `scr_reg` is the LLVM register holding the rhs value;
-# `fields` is the list of PFields the parser produced. Sub-patterns
-# other than PBind/PWild are not supported in v1 — match-arm
-# destructuring covers the nested-pattern case.
+# `fields` is the list of PFields the parser produced. Nested record
+# sub-patterns (`p: { x, y }`) re-root onto the extracted field via
+# `llvm_emit_let_subpat`, mirroring emit_pat_binds_record in emit_c.kai
+# (Cluster F, refs #622).
+# Helper for one record field in an irrefutable let-destructure: emit
+# `tmp = kaix_field(scr_reg, name)` and return the owned field register.
+fn llvm_emit_let_field_extract(e: LlvmEmit, scr_reg: String, name: String) : LlvmReg / Console {
+  let nameinfo = llvm_emit_name_constant(e, name, "fld.")
+  let r = llvm_fresh_reg(nameinfo.e)
+  let instr = concat_all([
+    "  ", r.reg, " = call %KaiValue* @kaix_field(%KaiValue* ",
+    scr_reg, ", i8* ", nameinfo.gep, ")\n"
+  ])
+  LlvmReg { e: llvm_append_body(r.e, instr), reg: r.reg }
+}
+
+# Bind a sub-pattern of an irrefutable let-destructure against the
+# already-extracted owned field register `scr`. Mirrors the C path's
+# `emit_pat_binds` reached from `emit_pat_binds_record` (emit_c.kai
+# ~line 2416): a `let` pattern is irrefutable, so refutable tests are
+# never emitted — only the binds. The caller (the `_` arm of
+# `llvm_emit_let_record`) owns `scr` and decrefs it after this returns,
+# so this helper does NOT drop `scr` itself — every leaf binder inside
+# extracts its own owned field, the same `is_alias`-true recursion the
+# C path uses on a destructuring sub.
+fn llvm_emit_let_subpat(e: LlvmEmit, sub: Pattern, scr: String) : LlvmEmit / Console {
+  match sub.pkind {
+    PBind(local) ->
+      llvm_push_local(llvm_set_last(e, scr), local, scr)
+    PWild -> e
+    # Nested record sub-pattern — re-root the record binder on the
+    # extracted inner-record register. This is the Cluster F fix: the
+    # inner pattern must bind against `scr` (the field value), not the
+    # outer scrutinee. Mirrors emit_pat_binds_record recursing into a
+    # destructuring sub via a fresh temp.
+    PRecord(inner) -> llvm_emit_let_record(e, scr, inner)
+    PVariantRecord(_, inner) -> llvm_emit_let_record(e, scr, inner)
+    PAs(nm, inner) -> {
+      # The as-name shares `scr` with the inner binds and the caller
+      # decrefs `scr` afterward, so take an owned incref for the alias.
+      # kaix_incref returns the value; discard it into a fresh reg.
+      let ir = llvm_fresh_reg(e)
+      let e0 = llvm_append_body(ir.e,
+        concat_all(["  ", ir.reg, " = call %KaiValue* @kaix_incref(%KaiValue* ", scr, ")\n"]))
+      let e1 = llvm_push_local(e0, nm, scr)
+      llvm_emit_let_subpat(e1, inner, scr)
+    }
+    _ -> {
+      eprint("llvm: nested pattern kind in let-destructure not supported in v1 at #{int_to_string(sub.line)}:#{int_to_string(sub.col)}")
+      e
+    }
+  }
+}
+
 fn llvm_emit_let_record(e: LlvmEmit, scr_reg: String,
                           fields: [PField]) : LlvmEmit / Console {
   match fields {
@@ -1754,22 +1805,25 @@ fn llvm_emit_let_record(e: LlvmEmit, scr_reg: String,
     [pf, ...rest] -> match pf {
       PField(name, sub, _) -> {
         match sub.pkind {
+          # Leaf binder: `local := kaix_field(scr_reg, "name")` and the
+          # local owns the field value directly (no decref of the temp).
           PBind(local) -> {
-            # local := kaix_field(scr_reg, "name")
-            let nameinfo = llvm_emit_name_constant(e, name, "fld.")
-            let r = llvm_fresh_reg(nameinfo.e)
-            let instr = concat_all([
-              "  ", r.reg, " = call %KaiValue* @kaix_field(%KaiValue* ",
-              scr_reg, ", i8* ", nameinfo.gep, ")\n"
-            ])
-            let e1 = llvm_append_body(r.e, instr)
-            let e2 = llvm_push_local(llvm_set_last(e1, r.reg), local, r.reg)
+            let fr = llvm_emit_let_field_extract(e, scr_reg, name)
+            let e2 = llvm_push_local(llvm_set_last(fr.e, fr.reg), local, fr.reg)
             llvm_emit_let_record(e2, scr_reg, rest)
           }
           PWild -> llvm_emit_let_record(e, scr_reg, rest)
+          # Nested destructuring sub-pattern (e.g. `p: { x, y }`).
+          # Extract the field to an owned temp, re-root the sub-pattern
+          # on it, then drop the intermediate — the leaf binders inside
+          # extract their own owned fields. Mirrors emit_pat_binds_record
+          # in emit_c.kai (the `pat_is_destructuring` branch).
           _ -> {
-            eprint("llvm: nested pattern in let-destructure not supported in v1")
-            llvm_emit_let_record(e, scr_reg, rest)
+            let fr = llvm_emit_let_field_extract(e, scr_reg, name)
+            let e1 = llvm_emit_let_subpat(fr.e, sub, fr.reg)
+            let e2 = llvm_append_body(e1,
+              concat_all(["  call void @kaix_decref(%KaiValue* ", fr.reg, ")\n"]))
+            llvm_emit_let_record(e2, scr_reg, rest)
           }
         }
       }
