@@ -292,73 +292,87 @@ static void count_local_uses_in_string(E *e, Node *s, int in_lambda);
  * String literals carry interpolations that are re-parsed at emit
  * time. Counting has to mirror that or captured names referenced
  * only from inside `#{...}` would be undercounted. */
-static void count_local_uses(E *e, Node *n, int in_lambda) {
-    if (!n) return;
-
-    if (n->kind == N_IDENT) {
-        Node *decl = ls_resolve(e, n->name, n->name_len);
-        LocalUse *u = lu_lookup(e, decl);
-        if (u) {
-            u->total_count++;
-            if (in_lambda) u->lambda_count++;
-        }
-        return;
+/* N_IDENT use: bump the resolved binding's counters. */
+static void count_ident_use(E *e, Node *n, int in_lambda) {
+    Node *decl = ls_resolve(e, n->name, n->name_len);
+    LocalUse *u = lu_lookup(e, decl);
+    if (u) {
+        u->total_count++;
+        if (in_lambda) u->lambda_count++;
     }
+}
 
-    if (n->kind == N_STRING) {
-        count_local_uses_in_string(e, n, in_lambda);
-        return;
+/* N_LAMBDA: parameters shadow outer locals; the body is counted in-lambda. */
+static void count_uses_in_lambda(E *e, Node *n) {
+    ls_push_mark(e);
+    for (size_t i = 1; i < n->n_children; ++i) {
+        Node *p = n->children[i];
+        if (p && p->kind == N_IDENT) ls_add(e, p->name, p->name_len, NULL); /* shadow only */
     }
+    if (n->n_children >= 1) count_local_uses(e, n->children[0], 1);
+    ls_pop_mark(e);
+}
 
-    if (n->kind == N_LAMBDA) {
-        ls_push_mark(e);
-        for (size_t i = 1; i < n->n_children; ++i) {
-            Node *p = n->children[i];
-            if (p && p->kind == N_IDENT) {
-                ls_add(e, p->name, p->name_len, NULL);  /* shadow only */
-            }
-        }
-        if (n->n_children >= 1) count_local_uses(e, n->children[0], 1);
-        ls_pop_mark(e);
-        return;
-    }
-
-    if (n->kind == N_LET) {
-        /* RHS sees the outer scope, not the new binding. */
-        if (n->n_children >= 3) count_local_uses(e, n->children[2], in_lambda);
-        if (n->n_children >= 1) {
-            Node *pat = n->children[0];
-            if (!in_lambda) pat_register_uses(e, pat);
-            pat_add_locals(e, pat);
-        }
-        return;
-    }
-
-    if (n->kind == N_BLOCK) {
-        ls_push_mark(e);
-        for (size_t i = 0; i < n->n_children; ++i)
-            count_local_uses(e, n->children[i], in_lambda);
-        ls_pop_mark(e);
-        return;
-    }
-
-    if (n->kind == N_ARM) {
+/* N_LET: the RHS sees the outer scope; the pattern then binds new locals. */
+static void count_uses_in_let(E *e, Node *n, int in_lambda) {
+    if (n->n_children >= 3) count_local_uses(e, n->children[2], in_lambda);
+    if (n->n_children >= 1) {
         Node *pat = n->children[0];
-        int has_guard = (n->v.flags & 0x1) != 0;
-        Node *body  = n->children[has_guard ? 2 : 1];
-        Node *guard = has_guard ? n->children[1] : NULL;
-        ls_push_mark(e);
         if (!in_lambda) pat_register_uses(e, pat);
         pat_add_locals(e, pat);
-        if (guard) count_local_uses(e, guard, in_lambda);
-        if (body)  count_local_uses(e, body,  in_lambda);
-        ls_pop_mark(e);
-        return;
     }
+}
 
-    for (size_t i = 0; i < n->n_children; ++i) {
-        count_local_uses(e, n->children[i], in_lambda);
+/* N_ARM: the pattern binds locals visible to the guard and body. */
+static void count_uses_in_arm(E *e, Node *n, int in_lambda) {
+    int has_guard = (n->v.flags & 0x1) != 0;
+    Node *pat   = n->children[0];
+    Node *body  = n->children[has_guard ? 2 : 1];
+    Node *guard = has_guard ? n->children[1] : NULL;
+    ls_push_mark(e);
+    if (!in_lambda) pat_register_uses(e, pat);
+    pat_add_locals(e, pat);
+    if (guard) count_local_uses(e, guard, in_lambda);
+    if (body)  count_local_uses(e, body,  in_lambda);
+    ls_pop_mark(e);
+}
+
+static void count_local_uses(E *e, Node *n, int in_lambda) {
+    if (!n) return;
+    switch (n->kind) {
+        case N_IDENT:  count_ident_use(e, n, in_lambda);               return;
+        case N_STRING: count_local_uses_in_string(e, n, in_lambda);    return;
+        case N_LAMBDA: count_uses_in_lambda(e, n);                     return;
+        case N_LET:    count_uses_in_let(e, n, in_lambda);             return;
+        case N_ARM:    count_uses_in_arm(e, n, in_lambda);             return;
+        case N_BLOCK:
+            ls_push_mark(e);
+            for (size_t i = 0; i < n->n_children; ++i)
+                count_local_uses(e, n->children[i], in_lambda);
+            ls_pop_mark(e);
+            return;
+        default:
+            for (size_t i = 0; i < n->n_children; ++i)
+                count_local_uses(e, n->children[i], in_lambda);
+            return;
     }
+}
+
+/* Scan a `#{...}` interpolation body. On entry `i` points just past the
+ * opening `#{`; advances `i` to the matching `}` (the one closing depth 0,
+ * tracking nested braces) or to `end` if unterminated, and returns the
+ * index where the expression text starts. Shared by the three places that
+ * walk interpolations: count_local_uses_in_string, collect_free_vars_in_string,
+ * and emit_string_expr. */
+static size_t scan_interp_expr(const char *src, size_t *i, size_t end) {
+    size_t expr_start = *i;
+    int depth = 1;
+    while (*i < end && depth > 0) {
+        if      (src[*i] == '{') depth++;
+        else if (src[*i] == '}') { depth--; if (depth == 0) break; }
+        ++(*i);
+    }
+    return expr_start;
 }
 
 /* Mirror of `collect_free_vars_in_string`: re-parse `#{...}` chunks
@@ -375,13 +389,7 @@ static void count_local_uses_in_string(E *e, Node *s, int in_lambda) {
     while (i < end) {
         if (src[i] == '#' && i + 1 < end && src[i + 1] == '{') {
             i += 2;
-            size_t expr_start = i;
-            int depth = 1;
-            while (i < end && depth > 0) {
-                if      (src[i] == '{') depth++;
-                else if (src[i] == '}') { depth--; if (depth == 0) break; }
-                ++i;
-            }
+            size_t expr_start = scan_interp_expr(src, &i, end);
             size_t ntk = 0;
             Token *toks = kai_lex("<interp>", src + expr_start, i - expr_start, &ntk);
             Node *en = kai_parse_expr_standalone("<interp>", src + expr_start, toks, ntk);
@@ -673,13 +681,7 @@ static void collect_free_vars_in_string(E *e, Node *s, Node *lam, LamInfo *info)
     while (i < end) {
         if (src[i] == '#' && i + 1 < end && src[i + 1] == '{') {
             i += 2;
-            size_t expr_start = i;
-            int depth = 1;
-            while (i < end && depth > 0) {
-                if      (src[i] == '{') depth++;
-                else if (src[i] == '}') { depth--; if (depth == 0) break; }
-                ++i;
-            }
+            size_t expr_start = scan_interp_expr(src, &i, end);
             size_t ntk = 0;
             Token *toks = kai_lex("<interp>", src + expr_start, i - expr_start, &ntk);
             Node *en = kai_parse_expr_standalone("<interp>", src + expr_start, toks, ntk);
@@ -695,62 +697,56 @@ static void collect_free_vars_in_string(E *e, Node *s, Node *lam, LamInfo *info)
     }
 }
 
+/* N_IDENT: capture it unless it's a lambda param, a global, or a local. */
+static void collect_ident_free_var(E *e, Node *n, Node *lam, LamInfo *info) {
+    if (!is_lambda_param(lam, n->name, n->name_len) &&
+        !is_global_name(e, n->name, n->name_len) &&
+        !ls_has(e, n->name, n->name_len)) {
+        add_capture(info, n->name, n->name_len);
+    }
+}
+
+/* N_ARM: the pattern binds locals (own scope) visible to guard and body. */
+static void collect_arm_free_vars(E *e, Node *n, Node *lam, LamInfo *info) {
+    int has_guard = (n->v.flags & 0x1) != 0;
+    Node *pat      = n->children[0];
+    Node *body_idx = n->children[has_guard ? 2 : 1];
+    Node *guard    = has_guard ? n->children[1] : NULL;
+    ls_push_mark(e);
+    pat_add_locals(e, pat);
+    if (guard)    collect_free_vars(e, guard,    lam, info);
+    if (body_idx) collect_free_vars(e, body_idx, lam, info);
+    ls_pop_mark(e);
+}
+
 static void collect_free_vars(E *e, Node *n, Node *lam, LamInfo *info) {
     if (!n) return;
-    if (n->kind == N_LAMBDA) return;         /* inner lambdas have their own */
-    if (n->kind == N_IDENT) {
-        if (!is_lambda_param(lam, n->name, n->name_len) &&
-            !is_global_name(e, n->name, n->name_len) &&
-            !ls_has(e, n->name, n->name_len)) {
-            add_capture(info, n->name, n->name_len);
-        }
-        return;
+    switch (n->kind) {
+        case N_LAMBDA: return;                 /* inner lambdas have their own */
+        case N_IDENT:  collect_ident_free_var(e, n, lam, info);        return;
+        case N_STRING: collect_free_vars_in_string(e, n, lam, info);   return;
+        case N_FIELD:
+            if (n->n_children >= 1) collect_free_vars(e, n->children[0], lam, info);
+            return;
+        case N_ARM:    collect_arm_free_vars(e, n, lam, info);         return;
+        case N_LET:
+            /* The RHS is walked before the pattern binds new locals, so
+               `let x = expr` cannot see x in expr. */
+            if (n->n_children >= 3) collect_free_vars(e, n->children[2], lam, info);
+            if (n->n_children >= 1) pat_add_locals(e, n->children[0]);
+            return;
+        case N_BLOCK:
+            /* Own scope so a nested `let` doesn't leak. */
+            ls_push_mark(e);
+            for (size_t i = 0; i < n->n_children; ++i)
+                collect_free_vars(e, n->children[i], lam, info);
+            ls_pop_mark(e);
+            return;
+        default:
+            for (size_t i = 0; i < n->n_children; ++i)
+                collect_free_vars(e, n->children[i], lam, info);
+            return;
     }
-    if (n->kind == N_STRING) {
-        collect_free_vars_in_string(e, n, lam, info);
-        return;
-    }
-    if (n->kind == N_FIELD) {
-        if (n->n_children >= 1) collect_free_vars(e, n->children[0], lam, info);
-        return;
-    }
-    if (n->kind == N_RECORD_LIT) {
-        for (size_t i = 0; i < n->n_children; ++i)
-            collect_free_vars(e, n->children[i], lam, info);
-        return;
-    }
-    /* N_LET adds pattern binds into scope *after* its RHS, so the RHS
-       doesn't see the new name (correct: `let x = expr` where expr
-       cannot refer to x). */
-    if (n->kind == N_LET) {
-        if (n->n_children >= 3) collect_free_vars(e, n->children[2], lam, info);
-        if (n->n_children >= 1) pat_add_locals(e, n->children[0]);
-        return;
-    }
-    /* Each match arm is its own scope: walk the pattern for binds,
-       push, walk guard + body, pop. */
-    if (n->kind == N_ARM) {
-        Node *pat = n->children[0];
-        int has_guard = (n->v.flags & 0x1) != 0;
-        Node *body_idx = n->children[has_guard ? 2 : 1];
-        Node *guard    = has_guard ? n->children[1] : NULL;
-        ls_push_mark(e);
-        pat_add_locals(e, pat);
-        if (guard)    collect_free_vars(e, guard,    lam, info);
-        if (body_idx) collect_free_vars(e, body_idx, lam, info);
-        ls_pop_mark(e);
-        return;
-    }
-    /* Blocks get their own scope so a nested `let` doesn't leak. */
-    if (n->kind == N_BLOCK) {
-        ls_push_mark(e);
-        for (size_t i = 0; i < n->n_children; ++i)
-            collect_free_vars(e, n->children[i], lam, info);
-        ls_pop_mark(e);
-        return;
-    }
-    for (size_t i = 0; i < n->n_children; ++i)
-        collect_free_vars(e, n->children[i], lam, info);
 }
 
 static LamInfo *register_lambda(E *e, Node *lam) {
@@ -945,43 +941,50 @@ static void emit_call(E *e, Node *n) {
     fputs("})", e->out);
 }
 
+/* Emit `lhs |> rhs(...)` where rhs is a call: a variant constructor with the
+   piped value as its first arg, a known callee taking a prepended arg, or a
+   general kai_apply with lhs spliced in front of the call's args. */
+static void emit_pipe_into_call(E *e, Node *lhs, Node *rhs) {
+    Node *callee = rhs->children[0];
+    if (callee && callee->kind == N_IDENT) {
+        int arity = 0;
+        int vtag = 0;
+        if (find_variant(e, callee->name, callee->name_len, &arity, &vtag)) {
+            /* Variant constructor with piped first arg. Stage 0
+             * only emits boxed args, mask is always 0. */
+            fprintf(e->out, "kai_variant_u(%d, \"%.*s\", %d, 0, (KaiVarSlot[]){",
+                    vtag, (int) callee->name_len, callee->name,
+                    (int) rhs->n_children);
+            fputs("{.ptr = ", e->out);
+            emit_expr(e, lhs);
+            fputc('}', e->out);
+            for (size_t i = 1; i < rhs->n_children; ++i) {
+                fputs(", {.ptr = ", e->out);
+                emit_expr(e, rhs->children[i]);
+                fputc('}', e->out);
+            }
+            fputs("})", e->out);
+            return;
+        }
+        int handled = emit_ident_callee(e, callee->name, callee->name_len);
+        if (handled) { emit_args_with_prepend(e, rhs, lhs); return; }
+    }
+    fputs("kai_apply(", e->out);
+    emit_expr(e, callee);
+    fprintf(e->out, ", %d, (KaiValue *[]){", (int) rhs->n_children);
+    emit_expr(e, lhs);
+    for (size_t i = 1; i < rhs->n_children; ++i) {
+        fputs(", ", e->out);
+        emit_expr(e, rhs->children[i]);
+    }
+    fputs("})", e->out);
+}
+
 static void emit_pipe(E *e, Node *n) {
     Node *lhs = n->children[0];
     Node *rhs = n->children[1];
     if (rhs && rhs->kind == N_CALL) {
-        Node *callee = rhs->children[0];
-        if (callee && callee->kind == N_IDENT) {
-            int arity = 0;
-            int vtag = 0;
-            if (find_variant(e, callee->name, callee->name_len, &arity, &vtag)) {
-                /* Variant constructor with piped first arg. Stage 0
-                 * only emits boxed args, mask is always 0. */
-                fprintf(e->out, "kai_variant_u(%d, \"%.*s\", %d, 0, (KaiVarSlot[]){",
-                        vtag, (int) callee->name_len, callee->name,
-                        (int) rhs->n_children);
-                fputs("{.ptr = ", e->out);
-                emit_expr(e, lhs);
-                fputc('}', e->out);
-                for (size_t i = 1; i < rhs->n_children; ++i) {
-                    fputs(", {.ptr = ", e->out);
-                    emit_expr(e, rhs->children[i]);
-                    fputc('}', e->out);
-                }
-                fputs("})", e->out);
-                return;
-            }
-            int handled = emit_ident_callee(e, callee->name, callee->name_len);
-            if (handled) { emit_args_with_prepend(e, rhs, lhs); return; }
-        }
-        fputs("kai_apply(", e->out);
-        emit_expr(e, callee);
-        fprintf(e->out, ", %d, (KaiValue *[]){", (int) rhs->n_children);
-        emit_expr(e, lhs);
-        for (size_t i = 1; i < rhs->n_children; ++i) {
-            fputs(", ", e->out);
-            emit_expr(e, rhs->children[i]);
-        }
-        fputs("})", e->out);
+        emit_pipe_into_call(e, lhs, rhs);
         return;
     }
     if (rhs && rhs->kind == N_IDENT) {
@@ -1315,13 +1318,7 @@ static void emit_string_expr(E *e, Node *s) {
                 n_parts++;
             }
             i += 2;
-            size_t expr_start = i;
-            int depth = 1;
-            while (i < end && depth > 0) {
-                if      (src[i] == '{') depth++;
-                else if (src[i] == '}') { depth--; if (depth == 0) break; }
-                ++i;
-            }
+            size_t expr_start = scan_interp_expr(src, &i, end);
             parts[n_parts].is_expr      = 1;
             parts[n_parts].expr_src     = src + expr_start;
             parts[n_parts].expr_src_len = i - expr_start;
@@ -1496,47 +1493,46 @@ static void emit_let(E *e, Node *n) {
     pat_add_locals(e, pat);
 }
 
+/* Emit the test-description argument for kai_test_fail (the raw string
+   literal span, or "" when outside a `test` block). */
+static void emit_test_desc(E *e) {
+    if (e->cur_test_desc_start) {
+        fprintf(e->out, "%.*s", (int) e->cur_test_desc_len, e->cur_test_desc_start);
+    } else {
+        fputs("\"\"", e->out);
+    }
+}
+
+static void emit_assert(E *e, Node *n) {
+    int has_msg = (n->v.flags & 0x1) != 0;
+    if (!e->test_mode) {
+        /* Outside tests, a failed assertion panics. */
+        fputs("{ KaiValue *_c = ", e->out);
+        emit_expr(e, n->children[0]);
+        fputs("; if (!kai_op_truthy(_c)) { kai_prelude_panic(kai_str(\"assertion failed\")); } }", e->out);
+        return;
+    }
+    fputs("{ KaiValue *_c = ", e->out);
+    emit_expr(e, n->children[0]);
+    if (has_msg) {
+        /* assert cond, msg — msg is an expression stringified for the report. */
+        fputs("; if (!kai_op_truthy(_c)) { KaiValue *_m = ", e->out);
+        emit_expr(e, n->children[1]);
+        fputs("; kai_test_fail(", e->out);
+        emit_test_desc(e);
+        fputs(", (_m && _m->tag == KAI_STR) ? _m->as.s.bytes : \"assertion failed\"); return; } }", e->out);
+    } else {
+        fputs("; if (!kai_op_truthy(_c)) { kai_test_fail(", e->out);
+        emit_test_desc(e);
+        fputs(", \"assertion failed\"); return; } }", e->out);
+    }
+}
+
 static void emit_stmt(E *e, Node *n) {
     if (!n) return;
     switch (n->kind) {
-        case N_LET:       emit_let(e, n); return;
-        case N_ASSERT: {
-            const char *msg_expr = NULL;
-            if (n->v.flags & 0x1) {
-                /* assert cond, msg — msg is an expression; stringify and
-                   pass to kai_test_fail / kai_prelude_panic. */
-                msg_expr = "";
-            }
-            if (e->test_mode) {
-                fputs("{ KaiValue *_c = ", e->out);
-                emit_expr(e, n->children[0]);
-                if (n->v.flags & 0x1) {
-                    fputs("; if (!kai_op_truthy(_c)) { KaiValue *_m = ", e->out);
-                    emit_expr(e, n->children[1]);
-                    fputs("; kai_test_fail(", e->out);
-                    if (e->cur_test_desc_start) {
-                        fprintf(e->out, "%.*s", (int) e->cur_test_desc_len, e->cur_test_desc_start);
-                    } else {
-                        fputs("\"\"", e->out);
-                    }
-                    fputs(", (_m && _m->tag == KAI_STR) ? _m->as.s.bytes : \"assertion failed\"); return; } }", e->out);
-                } else {
-                    fputs("; if (!kai_op_truthy(_c)) { kai_test_fail(", e->out);
-                    if (e->cur_test_desc_start) {
-                        fprintf(e->out, "%.*s", (int) e->cur_test_desc_len, e->cur_test_desc_start);
-                    } else {
-                        fputs("\"\"", e->out);
-                    }
-                    fputs(", \"assertion failed\"); return; } }", e->out);
-                }
-            } else {
-                fputs("{ KaiValue *_c = ", e->out);
-                emit_expr(e, n->children[0]);
-                fputs("; if (!kai_op_truthy(_c)) { kai_prelude_panic(kai_str(\"assertion failed\")); } }", e->out);
-            }
-            (void) msg_expr;
-            return;
-        }
+        case N_LET:    emit_let(e, n);    return;
+        case N_ASSERT: emit_assert(e, n); return;
         case N_EXPR_STMT:
             fputs("{ KaiValue *_ = ", e->out);
             emit_expr(e, n->children[0]);

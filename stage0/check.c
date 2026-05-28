@@ -166,132 +166,110 @@ static void bind_pattern(C *c, Node *pat) {
 
 /* ---------- expression checker ---------- */
 
+/* Visit every child in the current scope. Shared by the structural cases
+   that introduce no scope or binding of their own (calls, operators, list
+   literals, record literals, the program root, etc.). */
+static void check_children(C *c, Node *n) {
+    for (size_t i = 0; i < n->n_children; ++i) check_node(c, n->children[i]);
+}
+
+/* N_FN: children = [return_type, body, params...]. Body sees a scope
+   seeded with the parameter names. */
+static void check_fn(C *c, Node *n) {
+    scope_push(c);
+    for (size_t i = 2; i < n->n_children; ++i) {
+        Node *param = n->children[i];
+        if (param && param->kind == N_PARAM) {
+            scope_add(c, param->name, param->name_len);
+        }
+    }
+    check_node(c, n->children[1]);
+    scope_pop(c);
+}
+
+/* N_TEST: the body runs like a function body with no params. */
+static void check_test(C *c, Node *n) {
+    scope_push(c);
+    if (n->n_children >= 1) check_node(c, n->children[0]);
+    scope_pop(c);
+}
+
+/* N_LET: children = [pattern, type, expr]. Evaluate the expression in the
+   current scope, then bind the pattern names into the current scope. */
+static void check_let(C *c, Node *n) {
+    if (n->n_children >= 3) check_node(c, n->children[2]);
+    if (n->n_children >= 1) bind_pattern(c, n->children[0]);
+}
+
+/* N_IDENT: the only case that actually reports an unresolved name. */
+static void check_ident(C *c, Node *n) {
+    if (!scope_has(c, n->name, n->name_len)) {
+        error_at(c, n->line, n->col, "undefined name", n->name, n->name_len);
+    }
+}
+
+/* N_LAMBDA: children = [body, param_idents...]. Body sees a scope seeded
+   with the parameter idents. The `.` placeholder needs no binding. */
+static void check_lambda(C *c, Node *n) {
+    scope_push(c);
+    for (size_t i = 1; i < n->n_children; ++i) {
+        Node *p = n->children[i];
+        if (p && p->kind == N_IDENT) {
+            scope_add(c, p->name, p->name_len);
+        }
+    }
+    if (n->n_children >= 1) check_node(c, n->children[0]);
+    scope_pop(c);
+}
+
+/* N_BLOCK: introduces a new scope so `let` bindings stay local. */
+static void check_block(C *c, Node *n) {
+    scope_push(c);
+    check_children(c, n);
+    scope_pop(c);
+}
+
+/* N_ARM: children = [pattern, (guard), body]. Each arm scope binds the
+   pattern names; the guard (if present) and body see those bindings. */
+static void check_arm(C *c, Node *n) {
+    scope_push(c);
+    bind_pattern(c, n->children[0]);
+    if (n->v.flags & 0x1) {
+        if (n->n_children >= 2) check_node(c, n->children[1]);
+        if (n->n_children >= 3) check_node(c, n->children[2]);
+    } else {
+        if (n->n_children >= 2) check_node(c, n->children[1]);
+    }
+    scope_pop(c);
+}
+
 static void check_node(C *c, Node *n) {
     if (!n) return;
     switch (n->kind) {
 
-    /* -------- declarations visited from program pass -------- */
-    case N_FN: {
-        /* children = [return_type, body, params...] */
-        scope_push(c);
-        for (size_t i = 2; i < n->n_children; ++i) {
-            Node *param = n->children[i];
-            if (param && param->kind == N_PARAM) {
-                scope_add(c, param->name, param->name_len);
-            }
-        }
-        Node *body = n->children[1];
-        check_node(c, body);
-        scope_pop(c);
-        break;
-    }
-    case N_TEST: {
-        /* A test's body runs like a function body with no params. */
-        scope_push(c);
-        if (n->n_children >= 1) check_node(c, n->children[0]);
-        scope_pop(c);
-        break;
-    }
-    case N_TYPE_DECL:
-    case N_IMPORT:
-        /* Nothing to check in the body for stage 0. */
-        break;
+    /* -------- cases with their own scope / binding logic -------- */
+    case N_FN:     check_fn(c, n);     break;
+    case N_TEST:   check_test(c, n);   break;
+    case N_LET:    check_let(c, n);    break;
+    case N_IDENT:  check_ident(c, n);  break;
+    case N_LAMBDA: check_lambda(c, n); break;
+    case N_BLOCK:  check_block(c, n);  break;
+    case N_ARM:    check_arm(c, n);    break;
 
-    /* -------- statements -------- */
-    case N_LET: {
-        /* children = [pattern, type, expr]; evaluate expr in current
-           scope, then bind pattern names in current scope. */
-        if (n->n_children >= 3) check_node(c, n->children[2]);
-        if (n->n_children >= 1) bind_pattern(c, n->children[0]);
-        break;
-    }
-    case N_ASSERT:
-    case N_EXPR_STMT: {
-        for (size_t i = 0; i < n->n_children; ++i) check_node(c, n->children[i]);
-        break;
-    }
-
-    /* -------- expressions -------- */
-    case N_IDENT: {
-        if (!scope_has(c, n->name, n->name_len)) {
-            error_at(c, n->line, n->col, "undefined name", n->name, n->name_len);
-        }
-        break;
-    }
-    case N_FIELD: {
-        /* Only check the base; the field name is resolved structurally,
-           not against the scope. */
-        if (n->n_children >= 1) check_node(c, n->children[0]);
-        break;
-    }
-    case N_RECORD_LIT: {
-        /* record type name is a type; we don't resolve type names here.
-           Visit the field initializers' values. */
-        for (size_t i = 0; i < n->n_children; ++i) check_node(c, n->children[i]);
-        break;
-    }
-    case N_FIELD_INIT: {
-        if (n->n_children >= 1) check_node(c, n->children[0]);
-        break;
-    }
-    case N_LAMBDA: {
-        /* children = [body, param_idents...] */
-        scope_push(c);
-        for (size_t i = 1; i < n->n_children; ++i) {
-            Node *p = n->children[i];
-            if (p && p->kind == N_IDENT) {
-                scope_add(c, p->name, p->name_len);
-            }
-        }
-        /* Also allow `.` placeholder usage inside lambda bodies — nothing
-           special to bind; we just let it through during check. */
-        if (n->n_children >= 1) check_node(c, n->children[0]);
-        scope_pop(c);
-        break;
-    }
-    case N_BLOCK: {
-        /* A block introduces a new scope so `let` bindings are local. */
-        scope_push(c);
-        for (size_t i = 0; i < n->n_children; ++i) check_node(c, n->children[i]);
-        scope_pop(c);
-        break;
-    }
-    case N_MATCH: {
-        /* children = [scrutinee, arms...] */
-        if (n->n_children >= 1) check_node(c, n->children[0]);
-        for (size_t i = 1; i < n->n_children; ++i) check_node(c, n->children[i]);
-        break;
-    }
-    case N_ARM: {
-        /* children = [pattern, (guard), body]; each arm scope binds pattern names. */
-        scope_push(c);
-        Node *pat = n->children[0];
-        bind_pattern(c, pat);
-        if (n->v.flags & 0x1) {
-            /* guard */
-            if (n->n_children >= 2) check_node(c, n->children[1]);
-            if (n->n_children >= 3) check_node(c, n->children[2]);
-        } else {
-            if (n->n_children >= 2) check_node(c, n->children[1]);
-        }
-        scope_pop(c);
-        break;
-    }
-    case N_PLACEHOLDER:
-        /* `.` is accepted anywhere; semantic validation (must appear in
-           lambda-expected position) is deferred to the emitter. */
-        break;
-
-    /* -------- simple recursive cases -------- */
+    /* -------- structural cases: just visit children in scope -------- */
     case N_PROGRAM:
+    case N_ASSERT: case N_EXPR_STMT:
+    case N_FIELD: case N_RECORD_LIT: case N_FIELD_INIT:
+    case N_MATCH:
     case N_CALL: case N_BINOP: case N_UNOP: case N_IF:
     case N_LIST_LIT: case N_RANGE_LIT: case N_SPREAD: case N_PIPE:
-    case N_INDEX: {
-        for (size_t i = 0; i < n->n_children; ++i) check_node(c, n->children[i]);
+    case N_INDEX:
+        check_children(c, n);
         break;
-    }
 
-    /* -------- leaves / uninteresting -------- */
+    /* -------- leaves / nothing to resolve -------- */
+    case N_TYPE_DECL: case N_IMPORT:   /* no body to check in stage 0 */
+    case N_PLACEHOLDER:                /* `.` accepted anywhere; emitter validates */
     case N_INT: case N_REAL: case N_CHAR: case N_STRING:
     case N_BOOL: case N_UNIT:
     case N_TY_NAME: case N_TY_LIST: case N_TY_FN: case N_TY_RECORD:
@@ -301,59 +279,59 @@ static void check_node(C *c, Node *n) {
     case N_PAT_LIST: case N_PAT_VARIANT: case N_PAT_RECORD:
     case N_PAT_FIELD:
     case N_KIND_COUNT:
-        /* nothing to resolve inside these */
         break;
     }
 }
 
 /* ---------- first pass: register top-level decls ---------- */
 
+/* type X = ... : register the type name, and if the body is a sum, each
+   variant constructor name. */
+static void register_type_decl(C *c, Node *d) {
+    scope_add(c, d->name, d->name_len);
+    if (d->n_children < 1) return;
+    Node *body = d->children[0];
+    if (!body || body->kind != N_TY_SUM) return;
+    for (size_t j = 0; j < body->n_children; ++j) {
+        Node *v = body->children[j];
+        if (v && v->kind == N_VARIANT) scope_add(c, v->name, v->name_len);
+    }
+}
+
+/* import a.b.c [as x] [.{ sel, ... }] : bring the alias, the selected
+   names, or (bare) the last dotted segment into scope. */
+static void register_import(C *c, Node *d) {
+    if (d->v.flags & 0x1) {
+        /* has_alias: first child is the alias ident */
+        Node *a = d->n_children >= 1 ? d->children[0] : NULL;
+        if (a && a->kind == N_IDENT) scope_add(c, a->name, a->name_len);
+        return;
+    }
+    if (d->n_children > 0) {
+        /* selection list */
+        for (size_t j = 0; j < d->n_children; ++j) {
+            Node *sel = d->children[j];
+            if (sel && sel->kind == N_IDENT) scope_add(c, sel->name, sel->name_len);
+        }
+        return;
+    }
+    /* Bare qualified import: bring the last path segment into scope. */
+    const char *p = d->name;
+    size_t len = d->name_len;
+    size_t start = 0;
+    for (size_t j = 0; j < len; ++j) if (p[j] == '.') start = j + 1;
+    scope_add(c, p + start, len - start);
+}
+
 static void register_top_level(C *c, Node *prog) {
     for (size_t i = 0; i < prog->n_children; ++i) {
         Node *d = prog->children[i];
         if (!d) continue;
-        if (d->kind == N_FN) {
-            scope_add(c, d->name, d->name_len);
-        } else if (d->kind == N_TYPE_DECL) {
-            /* Register the type name (mostly for completeness; we don't
-               check its uses in type positions yet). If the body is a
-               sum, register each variant as a constructor name. */
-            scope_add(c, d->name, d->name_len);
-            if (d->n_children >= 1) {
-                Node *body = d->children[0];
-                if (body && body->kind == N_TY_SUM) {
-                    for (size_t j = 0; j < body->n_children; ++j) {
-                        Node *v = body->children[j];
-                        if (v && v->kind == N_VARIANT) {
-                            scope_add(c, v->name, v->name_len);
-                        }
-                    }
-                }
-            }
-        } else if (d->kind == N_IMPORT) {
-            /* For single-module stage 0, imports introduce at least the
-               last segment of the dotted path into scope. Alias and
-               selection children are already N_IDENT. */
-            if (d->v.flags & 0x1) {
-                /* has_alias: first child is the alias ident */
-                if (d->n_children >= 1) {
-                    Node *a = d->children[0];
-                    if (a && a->kind == N_IDENT) scope_add(c, a->name, a->name_len);
-                }
-            } else if (d->n_children > 0) {
-                /* selection list */
-                for (size_t j = 0; j < d->n_children; ++j) {
-                    Node *sel = d->children[j];
-                    if (sel && sel->kind == N_IDENT) scope_add(c, sel->name, sel->name_len);
-                }
-            } else {
-                /* Bare qualified import: bring the last path segment into scope. */
-                const char *p = d->name;
-                size_t len = d->name_len;
-                size_t start = 0;
-                for (size_t j = 0; j < len; ++j) if (p[j] == '.') start = j + 1;
-                scope_add(c, p + start, len - start);
-            }
+        switch (d->kind) {
+            case N_FN:        scope_add(c, d->name, d->name_len); break;
+            case N_TYPE_DECL: register_type_decl(c, d);           break;
+            case N_IMPORT:    register_import(c, d);              break;
+            default: break;
         }
     }
 }
