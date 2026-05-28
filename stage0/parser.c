@@ -349,6 +349,133 @@ static Node *parse_fn(P *p, int is_pub, int line, int col) {
     return fn;
 }
 
+/* Parse the optional `[a, b, c]` type-parameter list of a type decl,
+   pushing one N_IDENT per parameter onto `td`. On entry the `[` has not
+   yet been consumed; this is called only when the caller has matched it.
+   Returns 1 on success, 0 on error (caller frees `td`). */
+static int parse_type_params(P *p, Node *td) {
+    skip_newlines(p);
+    for (;;) {
+        const Token *tp = expect(p, TK_IDENT, "expected type parameter name");
+        if (!tp) return 0;
+        Node *id = kai_new_node(N_IDENT, tp->line, tp->col);
+        set_name_from_token(id, tp, p->src);
+        kai_node_push(td, id);
+        skip_newlines(p);
+        if (!match(p, TK_COMMA)) break;
+        skip_newlines(p);
+    }
+    if (!expect(p, TK_RBRACKET, "expected `]` after type parameters")) return 0;
+    skip_newlines(p);
+    return 1;
+}
+
+/* Parse a record type body `{ field: T, ... }` into an N_TY_RECORD node.
+   On entry the opening `{` has already been consumed. Returns the body
+   node, or NULL on error (caller frees `td`). */
+static Node *parse_record_type_body(P *p, int line, int col) {
+    Node *body = kai_new_node(N_TY_RECORD, line, col);
+    skip_newlines(p);
+    if (!at(p, TK_RBRACE)) {
+        for (;;) {
+            skip_newlines(p);
+            const Token *fn_ = expect(p, TK_IDENT, "expected field name");
+            if (!fn_) { kai_free_node(body); return NULL; }
+            if (!expect(p, TK_COLON, "expected `:` after field name")) {
+                kai_free_node(body); return NULL;
+            }
+            Node *ftype = parse_type(p);
+            if (!ftype) { kai_free_node(body); return NULL; }
+            Node *fd = kai_new_node(N_FIELD_DECL, fn_->line, fn_->col);
+            set_name_from_token(fd, fn_, p->src);
+            kai_node_push(fd, ftype);
+            kai_node_push(body, fd);
+            skip_newlines(p);
+            if (!match(p, TK_COMMA)) break;
+        }
+    }
+    skip_newlines(p);
+    if (!expect(p, TK_RBRACE, "expected `}` at end of record type")) {
+        kai_free_node(body); return NULL;
+    }
+    return body;
+}
+
+/* Decide whether the tokens after `=` introduce a sum type rather than an
+   alias. A bare `Uppercase(` unambiguously marks a variant with arguments;
+   otherwise the sum form requires a `|` at brace depth 0 before the decl
+   ends (a single TypeName is indistinguishable from an alias). Does not
+   advance `p`. */
+static int looks_like_sum_ahead(P *p) {
+    const Token *head = peek_tok(p);
+    if (!is_uppercase_ident(head, p->src)) return 0;
+
+    const Token *after_head = (p->i + 1 < p->n) ? &p->toks[p->i + 1] : NULL;
+    if (after_head && after_head->kind == TK_LPAREN) return 1;
+
+    /* Scan for a `|` before the decl ends, tracking bracket depth so a `|`
+       inside a function type is not mistaken for the variant separator. */
+    size_t j = p->i;
+    int depth = 0;
+    while (j < p->n) {
+        TokenKind k = p->toks[j].kind;
+        if (k == TK_EOF) break;
+        if (k == TK_LPAREN || k == TK_LBRACKET || k == TK_LBRACE) depth++;
+        else if (k == TK_RPAREN || k == TK_RBRACKET || k == TK_RBRACE) depth--;
+        else if (depth == 0) {
+            if (k == TK_PIPE) return 1;
+            if (k == TK_NEWLINE) {
+                /* Newline between variants is allowed: peek past newlines
+                   and treat it as sum only if a `|` follows. */
+                size_t m = j + 1;
+                while (m < p->n && p->toks[m].kind == TK_NEWLINE) m++;
+                return (m < p->n && p->toks[m].kind == TK_PIPE) ? 1 : 0;
+            }
+        }
+        j++;
+    }
+    return 0;
+}
+
+/* Parse a sum type body `Ctor | Ctor(T, ...) | ...` into an N_TY_SUM node.
+   Returns the body node, or NULL on error (caller frees `td`). */
+static Node *parse_sum_type_body(P *p, int line, int col) {
+    Node *body = kai_new_node(N_TY_SUM, line, col);
+    skip_newlines(p);
+    for (;;) {
+        skip_newlines(p);
+        const Token *cn = expect(p, TK_IDENT, "expected variant constructor name");
+        if (!cn) { kai_free_node(body); return NULL; }
+        if (!is_uppercase_ident(cn, p->src)) {
+            error_at(p, cn, "variant constructor must start with uppercase");
+            kai_free_node(body); return NULL;
+        }
+        Node *var = kai_new_node(N_VARIANT, cn->line, cn->col);
+        set_name_from_token(var, cn, p->src);
+        if (match(p, TK_LPAREN)) {
+            skip_newlines(p);
+            if (!at(p, TK_RPAREN)) {
+                for (;;) {
+                    Node *ty = parse_type(p);
+                    if (!ty) { kai_free_node(var); kai_free_node(body); return NULL; }
+                    kai_node_push(var, ty);
+                    skip_newlines(p);
+                    if (!match(p, TK_COMMA)) break;
+                    skip_newlines(p);
+                }
+            }
+            if (!expect(p, TK_RPAREN, "expected `)` after variant fields")) {
+                kai_free_node(var); kai_free_node(body); return NULL;
+            }
+        }
+        kai_node_push(body, var);
+        skip_newlines(p);
+        if (!match(p, TK_PIPE)) break;
+        skip_newlines(p);
+    }
+    return body;
+}
+
 static Node *parse_type_decl(P *p, int is_pub, int line, int col) {
     Node *td = kai_new_node(N_TYPE_DECL, line, col);
     td->v.flags = is_pub ? 0x1 : 0;
@@ -371,21 +498,7 @@ static Node *parse_type_decl(P *p, int is_pub, int line, int col) {
 
     /* Optional type parameters: [a, b, c] */
     if (match(p, TK_LBRACKET)) {
-        skip_newlines(p);
-        for (;;) {
-            const Token *tp = expect(p, TK_IDENT, "expected type parameter name");
-            if (!tp) { kai_free_node(td); return NULL; }
-            Node *id = kai_new_node(N_IDENT, tp->line, tp->col);
-            set_name_from_token(id, tp, p->src);
-            kai_node_push(td, id);
-            skip_newlines(p);
-            if (!match(p, TK_COMMA)) break;
-            skip_newlines(p);
-        }
-        if (!expect(p, TK_RBRACKET, "expected `]` after type parameters")) {
-            kai_free_node(td); return NULL;
-        }
-        skip_newlines(p);
+        if (!parse_type_params(p, td)) { kai_free_node(td); return NULL; }
     }
 
     if (!expect(p, TK_EQ, "expected `=` in type declaration")) {
@@ -394,119 +507,23 @@ static Node *parse_type_decl(P *p, int is_pub, int line, int col) {
     skip_newlines(p);
 
     Node *body;
-    /* Record: `{ ... }` */
     if (at(p, TK_LBRACE)) {
+        /* Record: `{ ... }` */
         p->i++;
-        body = kai_new_node(N_TY_RECORD, line, col);
-        skip_newlines(p);
-        if (!at(p, TK_RBRACE)) {
-            for (;;) {
-                skip_newlines(p);
-                const Token *fn_ = expect(p, TK_IDENT, "expected field name");
-                if (!fn_) { kai_free_node(body); kai_free_node(td); return NULL; }
-                if (!expect(p, TK_COLON, "expected `:` after field name")) {
-                    kai_free_node(body); kai_free_node(td); return NULL;
-                }
-                Node *ftype = parse_type(p);
-                if (!ftype) { kai_free_node(body); kai_free_node(td); return NULL; }
-                Node *fd = kai_new_node(N_FIELD_DECL, fn_->line, fn_->col);
-                set_name_from_token(fd, fn_, p->src);
-                kai_node_push(fd, ftype);
-                kai_node_push(body, fd);
-                skip_newlines(p);
-                if (!match(p, TK_COMMA)) break;
-            }
-        }
-        skip_newlines(p);
-        if (!expect(p, TK_RBRACE, "expected `}` at end of record type")) {
-            kai_free_node(body); kai_free_node(td); return NULL;
-        }
+        body = parse_record_type_body(p, line, col);
+        if (!body) { kai_free_node(td); return NULL; }
     } else {
-        /* Could be either alias or sum. Peek: if the next non-newline
-           token introduces a constructor (IDENT with uppercase) followed
-           by either `|`, end-of-decl, or `(`, try to parse as sum. */
+        /* Either a sum type or an alias — decide with bounded lookahead
+           that does not consume tokens. */
         size_t save = p->i;
         skip_newlines(p);
-        const Token *head = peek_tok(p);
-
-        int looks_like_sum = 0;
-        if (is_uppercase_ident(head, p->src)) {
-            /* A bare `Uppercase(` right after `=` unambiguously marks a
-               variant with arguments: named types never carry parens
-               (generic args use `[...]`). Accept the decl as a sum even
-               if it has a single variant — otherwise `type X = Foo(A)`
-               is misread as an alias to `Foo` with a dangling `(`. */
-            const Token *after_head = (p->i + 1 < p->n) ? &p->toks[p->i + 1] : NULL;
-            if (after_head && after_head->kind == TK_LPAREN) {
-                looks_like_sum = 1;
-            }
-            /* Otherwise fall back to "scan for a `|` before the decl
-               ends". The sum form requires at least one `|` between the
-               first variant and the next, because a single TypeName is
-               indistinguishable from an alias. Parentheses mark variant
-               payload and are tracked to avoid mistaking a `|` inside a
-               function type for the variant separator. */
-            if (!looks_like_sum) {
-                size_t j = p->i;
-                int depth = 0;
-                while (j < p->n) {
-                    TokenKind k = p->toks[j].kind;
-                    if (k == TK_EOF) break;
-                    if (k == TK_LPAREN || k == TK_LBRACKET || k == TK_LBRACE) depth++;
-                    else if (k == TK_RPAREN || k == TK_RBRACKET || k == TK_RBRACE) depth--;
-                    else if (depth == 0) {
-                        if (k == TK_PIPE)   { looks_like_sum = 1; break; }
-                        if (k == TK_NEWLINE) {
-                            /* Continue: newline between variants is allowed. */
-                            /* Scan past newlines — if next is `|`, it's sum; else end. */
-                            size_t m = j + 1;
-                            while (m < p->n && p->toks[m].kind == TK_NEWLINE) m++;
-                            if (m < p->n && p->toks[m].kind == TK_PIPE) {
-                                looks_like_sum = 1;
-                            }
-                            break;
-                        }
-                    }
-                    j++;
-                }
-            }
-        }
+        int is_sum = looks_like_sum_ahead(p);
         p->i = save;
 
-        if (looks_like_sum) {
-            body = kai_new_node(N_TY_SUM, line, col);
+        if (is_sum) {
             skip_newlines(p);
-            for (;;) {
-                skip_newlines(p);
-                const Token *cn = expect(p, TK_IDENT, "expected variant constructor name");
-                if (!cn) { kai_free_node(body); kai_free_node(td); return NULL; }
-                if (!is_uppercase_ident(cn, p->src)) {
-                    error_at(p, cn, "variant constructor must start with uppercase");
-                    kai_free_node(body); kai_free_node(td); return NULL;
-                }
-                Node *var = kai_new_node(N_VARIANT, cn->line, cn->col);
-                set_name_from_token(var, cn, p->src);
-                if (match(p, TK_LPAREN)) {
-                    skip_newlines(p);
-                    if (!at(p, TK_RPAREN)) {
-                        for (;;) {
-                            Node *ty = parse_type(p);
-                            if (!ty) { kai_free_node(var); kai_free_node(body); kai_free_node(td); return NULL; }
-                            kai_node_push(var, ty);
-                            skip_newlines(p);
-                            if (!match(p, TK_COMMA)) break;
-                            skip_newlines(p);
-                        }
-                    }
-                    if (!expect(p, TK_RPAREN, "expected `)` after variant fields")) {
-                        kai_free_node(var); kai_free_node(body); kai_free_node(td); return NULL;
-                    }
-                }
-                kai_node_push(body, var);
-                skip_newlines(p);
-                if (!match(p, TK_PIPE)) break;
-                skip_newlines(p);
-            }
+            body = parse_sum_type_body(p, line, col);
+            if (!body) { kai_free_node(td); return NULL; }
         } else {
             /* Alias to a regular Type expression. */
             Node *aliased = parse_type(p);
@@ -1327,6 +1344,41 @@ static Node *parse_block(P *p) {
 
 /* ---------- patterns ---------- */
 
+/* Parse the body of a record pattern — the `field, field: subpat, ...`
+   sequence — appending an N_PAT_FIELD per field to `pr`. On entry the
+   opening `{` has already been consumed; on success the closing `}` has
+   been consumed too. Returns 1 on success, 0 on error (caller frees `pr`).
+   Shared by the bare `{...}` record pattern and the `Ctor{...}` form. */
+static int parse_record_pattern_fields(P *p, Node *pr) {
+    skip_newlines(p);
+    if (!at(p, TK_RBRACE)) {
+        for (;;) {
+            skip_newlines(p);
+            const Token *fn = expect(p, TK_IDENT, "expected field name in record pattern");
+            if (!fn) return 0;
+            Node *pf = kai_new_node(N_PAT_FIELD, fn->line, fn->col);
+            set_name_from_token(pf, fn, p->src);
+            if (match(p, TK_COLON)) {
+                Node *sub = parse_pattern(p);
+                if (!sub) { kai_free_node(pf); return 0; }
+                kai_node_push(pf, sub);
+            } else {
+                /* shorthand: bind field value to its own name */
+                pf->v.flags |= 0x1;
+                Node *bind = kai_new_node(N_PAT_BIND, fn->line, fn->col);
+                set_name_from_token(bind, fn, p->src);
+                kai_node_push(pf, bind);
+            }
+            kai_node_push(pr, pf);
+            skip_newlines(p);
+            if (!match(p, TK_COMMA)) break;
+        }
+    }
+    skip_newlines(p);
+    if (!expect(p, TK_RBRACE, "expected `}` in record pattern")) return 0;
+    return 1;
+}
+
 static Node *parse_pattern(P *p) {
     const Token *t = peek_tok(p);
 
@@ -1419,34 +1471,7 @@ static Node *parse_pattern(P *p) {
                sole child). */
             p->i++;
             Node *pr = kai_new_node(N_PAT_RECORD, id->line, id->col);
-            skip_newlines(p);
-            if (!at(p, TK_RBRACE)) {
-                for (;;) {
-                    skip_newlines(p);
-                    const Token *fn = expect(p, TK_IDENT, "expected field name in record pattern");
-                    if (!fn) { kai_free_node(pr); return NULL; }
-                    Node *pf = kai_new_node(N_PAT_FIELD, fn->line, fn->col);
-                    set_name_from_token(pf, fn, p->src);
-                    if (match(p, TK_COLON)) {
-                        Node *sub = parse_pattern(p);
-                        if (!sub) { kai_free_node(pf); kai_free_node(pr); return NULL; }
-                        kai_node_push(pf, sub);
-                    } else {
-                        /* shorthand: bind field value to its own name */
-                        pf->v.flags |= 0x1;
-                        Node *bind = kai_new_node(N_PAT_BIND, fn->line, fn->col);
-                        set_name_from_token(bind, fn, p->src);
-                        kai_node_push(pf, bind);
-                    }
-                    kai_node_push(pr, pf);
-                    skip_newlines(p);
-                    if (!match(p, TK_COMMA)) break;
-                }
-            }
-            skip_newlines(p);
-            if (!expect(p, TK_RBRACE, "expected `}` in record pattern")) {
-                kai_free_node(pr); return NULL;
-            }
+            if (!parse_record_pattern_fields(p, pr)) { kai_free_node(pr); return NULL; }
             Node *pv = kai_new_node(N_PAT_VARIANT, id->line, id->col);
             set_name_from_token(pv, id, p->src);
             kai_node_push(pv, pr);
@@ -1467,33 +1492,7 @@ static Node *parse_pattern(P *p) {
         /* Pure record pattern without ctor. */
         p->i++;
         Node *pr = kai_new_node(N_PAT_RECORD, t->line, t->col);
-        skip_newlines(p);
-        if (!at(p, TK_RBRACE)) {
-            for (;;) {
-                skip_newlines(p);
-                const Token *fn = expect(p, TK_IDENT, "expected field name in record pattern");
-                if (!fn) { kai_free_node(pr); return NULL; }
-                Node *pf = kai_new_node(N_PAT_FIELD, fn->line, fn->col);
-                set_name_from_token(pf, fn, p->src);
-                if (match(p, TK_COLON)) {
-                    Node *sub = parse_pattern(p);
-                    if (!sub) { kai_free_node(pf); kai_free_node(pr); return NULL; }
-                    kai_node_push(pf, sub);
-                } else {
-                    pf->v.flags |= 0x1;
-                    Node *bind = kai_new_node(N_PAT_BIND, fn->line, fn->col);
-                    set_name_from_token(bind, fn, p->src);
-                    kai_node_push(pf, bind);
-                }
-                kai_node_push(pr, pf);
-                skip_newlines(p);
-                if (!match(p, TK_COMMA)) break;
-            }
-        }
-        skip_newlines(p);
-        if (!expect(p, TK_RBRACE, "expected `}` in record pattern")) {
-            kai_free_node(pr); return NULL;
-        }
+        if (!parse_record_pattern_fields(p, pr)) { kai_free_node(pr); return NULL; }
         return pr;
     }
 
