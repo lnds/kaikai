@@ -1815,19 +1815,35 @@ pub fn find_substring(hay: String, needle: String, from: Int) : Int {
 # back to the integer constants pinned in runtime.h.
 
 # `kai_variant_to_head[]` — one int32_t per variant tag, mapping each
-# constructor to its sum-type head. Indexed by `variant_tag`.
-#[doc("`kai_variant_to_head[]` — one int32_t per variant tag, mapping each constructor to its sum-type head. Indexed by `variant_tag`.")]
+# constructor to its sum-type head. The runtime indexes this array by
+# `variant_tag` (runtime.h `kai_head_tag` for KAI_VARIANT), so slot i
+# MUST hold the head of the constructor whose tag == i — NOT the i-th
+# entry of the (head-consed, tag-unsorted) EVar list. We therefore walk
+# tags 0..N-1 in order and place each constructor's head in its own slot.
+# Variant tags are dense and contiguous (vs_to_evars_count only consumes
+# a tag when it emits an EVar; re-emitted builtins are skipped without
+# advancing), so N == list_length(variants) and there are no gaps.
+#[doc("`kai_variant_to_head[]` — one int32_t per variant tag, mapping each constructor to its sum-type head. Indexed by `variant_tag` (slot i = head of the ctor with tag i).")]
 pub fn collect_variant_to_head(variants: [EVar], decls: [Decl]) : [Int] =
-  collect_v2h_loop(variants, decls, [])
+  collect_v2h_by_tag(0, list_length(variants), variants, decls, [])
 
-#[doc("AST collector walking v2h loop.")]
-pub fn collect_v2h_loop(vs: [EVar], decls: [Decl], acc: [Int]) : [Int] {
-  match vs {
-    [] -> list_reverse(acc)
-    [EV(name, _, _, _), ...rest] -> {
-      let head = variant_head_tag_for(name, decls)
-      collect_v2h_loop(rest, decls, [head, ...acc])
+#[doc("Build the variant-to-head array slot-by-slot in tag order; slot `tag` gets the head of the EVar whose tag == `tag`.")]
+pub fn collect_v2h_by_tag(tag: Int, n: Int, variants: [EVar], decls: [Decl], acc: [Int]) : [Int] {
+  if tag >= n { list_reverse(acc) }
+  else {
+    let head = match evar_name_for_tag(variants, tag) {
+      Some(name) -> variant_head_tag_for(name, decls)
+      None       -> 0   # KAI_HEAD_ANON — defensive; tags are dense so this is unreached
     }
+    collect_v2h_by_tag(tag + 1, n, variants, decls, [head, ...acc])
+  }
+}
+
+#[doc("Name of the constructor whose variant tag == `tag`, or None.")]
+pub fn evar_name_for_tag(vs: [EVar], tag: Int) : Option[String] {
+  match vs {
+    [] -> None
+    [EV(name, _, _, t), ...rest] -> if t == tag { Some(name) } else { evar_name_for_tag(rest, tag) }
   }
 }
 
@@ -1840,7 +1856,61 @@ pub fn collect_v2h_loop(vs: [EVar], decls: [Decl], acc: [Int]) : [Int] {
 # up that sum's head tag. Builtins use the reserved ids; user sums
 # would need a registry — out of scope for v1 (the dispatcher's
 # runtime panic catches the miss).
-#[doc("For a constructor `name`, find the sum type it belongs to and look up that sum's head tag. Builtins use the reserved ids; user sums would need a registry — out of scope for v1…")]
+# Dense head-tag registry for user-declared nominal types. Every DType
+# with a TBRecord or TBSum body gets a stable head tag starting at
+# KAI_USER_HEAD_TAG_BASE (20, runtime.h:158), assigned by declaration
+# order among record/sum decls only (aliases / effect aliases do not
+# count and do not increment the index). Giving EVERY user type a tag —
+# impl or not — is sound: kai_lookup_impl returns NULL for tagless types
+# and the structural fallback recurses per field, so a nested field that
+# DOES carry an impl still dispatches. Presence of an impl is `lookup !=
+# NULL`, never `tag >= 20`.
+#[doc("Head tag for a user-declared record/sum type `tname`: 20 + its declaration index among record/sum decls, or -1 if not found.")]
+pub fn user_type_head_tag(tname: String, decls: [Decl]) : Int =
+  user_type_head_tag_loop(tname, decls, 0)
+
+#[doc("Indexed walk backing user_type_head_tag; idx advances only on record/sum DTypes.")]
+pub fn user_type_head_tag_loop(tname: String, decls: [Decl], idx: Int) : Int {
+  match decls {
+    [] -> 0 - 1
+    [d, ...rest] -> match d {
+      DType(_, dn, _, body, _, _, _) -> match body {
+        TBRecord(_) -> if dn == tname { 20 + idx } else { user_type_head_tag_loop(tname, rest, idx + 1) }
+        TBSum(_)    -> if dn == tname { 20 + idx } else { user_type_head_tag_loop(tname, rest, idx + 1) }
+        _           -> user_type_head_tag_loop(tname, rest, idx)
+      }
+      _ -> user_type_head_tag_loop(tname, rest, idx)
+    }
+  }
+}
+
+#[doc("Head tag for the sum type owning constructor `ctor`, or -1 if no user sum declares it.")]
+pub fn user_ctor_type_head_tag(ctor: String, decls: [Decl]) : Int =
+  user_ctor_type_head_tag_loop(ctor, decls, decls)
+
+#[doc("Backing loop for user_ctor_type_head_tag; `all` is the full decl list (so the dense index is computed over all decls, not the recursion tail).")]
+pub fn user_ctor_type_head_tag_loop(ctor: String, rem: [Decl], all: [Decl]) : Int {
+  match rem {
+    [] -> 0 - 1
+    [d, ...rest] -> match d {
+      DType(_, dn, _, body, _, _, _) -> match body {
+        TBSum(vs) -> if ctor_in_variants(ctor, vs) { user_type_head_tag(dn, all) } else { user_ctor_type_head_tag_loop(ctor, rest, all) }
+        _         -> user_ctor_type_head_tag_loop(ctor, rest, all)
+      }
+      _ -> user_ctor_type_head_tag_loop(ctor, rest, all)
+    }
+  }
+}
+
+#[doc("True when constructor `ctor` appears among the variant list `vs`.")]
+pub fn ctor_in_variants(ctor: String, vs: [Variant]) : Bool {
+  match vs {
+    [] -> false
+    [Var(cname, _), ...rest] -> if cname == ctor { true } else { ctor_in_variants(ctor, rest) }
+  }
+}
+
+#[doc("For a constructor `name`, find the sum type it belongs to and look up that sum's head tag. Builtins use the reserved ids; user sums resolve to dense user head tags via user_ctor_type_head_tag.")]
 pub fn variant_head_tag_for(name: String, decls: [Decl]) : Int {
   if name == "Some" { 16 }
   else if name == "None" { 16 }
@@ -1853,7 +1923,7 @@ pub fn variant_head_tag_for(name: String, decls: [Decl]) : Int {
   else if name == "SigUsr2" { 18 }
   else if name == "Exited" { 19 }
   else if name == "Signaled" { 19 }
-  else { 0 }   # user variant: anonymous head, dispatcher will miss
+  else { user_ctor_type_head_tag(name, decls) }
 }
 
 # m7e §24: build a RowExpr from the body-performed labels collected

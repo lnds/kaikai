@@ -5900,9 +5900,9 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String 
 fn llvm_emit_proto_init(decls: [Decl], variants: [EVar]) : String {
   let impl_rows = collect_pimpl_rows(decls, [])
   let v2h       = collect_variant_to_head(variants, decls)
-  let impl_calls   = llvm_emit_impl_register_calls(impl_rows, 0, "")
+  let impl_calls   = llvm_emit_impl_register_calls(impl_rows, decls, 0, "")
   let variant_calls = llvm_emit_variant_register_calls(v2h, 0, "")
-  let fn_declares  = llvm_emit_pimpl_extern_declares(impl_rows, [], "")
+  let fn_declares  = llvm_emit_pimpl_extern_declares(impl_rows, decls, [], "")
   # issue #118 layer 3 — mirror the C backend's reusable-tag registry
   # (emit_c.kai `emit_proto_runtime_tables`). Without this the LLVM
   # backend immortalises reuse-target variants while C does not,
@@ -5948,17 +5948,18 @@ fn llvm_emit_reusable_tag_calls(tags: [Int], acc: String) : String {
 # For each pimpl row, emit one register call. Skips entries whose
 # head_tag is -1 (user/unknown types) since the runtime hashmap would
 # never match them anyway.
-fn llvm_emit_impl_register_calls(rows: [PimplRow], i: Int, acc: String) : String {
+fn llvm_emit_impl_register_calls(rows: [PimplRow], decls: [Decl], i: Int, acc: String) : String {
   match rows {
     [] -> acc
     [PR(csym, p, t, arity), ...rest] -> {
-      let head_int = stdlib_head_tag_int(t)
+      let head_int = stdlib_head_tag_int(t, decls)
       let proto_int = llvm_stdlib_proto_id(p)
       if head_int < 0 {
-        # Skip user-types; the C backend keeps them in the table (with
-        # -1) as a documentation footprint, but LLVM IR errors out on
-        # the bitcast if the impl ever runs. Safer to omit here.
-        llvm_emit_impl_register_calls(rest, i + 1, acc)
+        # Only genuinely unknown type names land here now (user record/sum
+        # types resolve to a dense head tag >= 20 via stdlib_head_tag_int).
+        # Their boxed VARIANT/RECORD impls bitcast cleanly. We still skip a
+        # truly-unknown name: the runtime hashmap would never match it.
+        llvm_emit_impl_register_calls(rest, decls, i + 1, acc)
       } else {
         # The bitcast target type must match the impl fn's actual
         # signature (`%KaiValue* (%KaiValue*, ...)*` with N params).
@@ -5975,7 +5976,7 @@ fn llvm_emit_impl_register_calls(rows: [PimplRow], i: Int, acc: String) : String
           ", i32 ", int_to_string(head_int),
           ", i8* ", fn_ptr, ")\n"
         ])
-        llvm_emit_impl_register_calls(rest, i + 1, concat_all([acc, line]))
+        llvm_emit_impl_register_calls(rest, decls, i + 1, concat_all([acc, line]))
       }
     }
   }
@@ -5998,20 +5999,20 @@ fn llvm_emit_variant_register_calls(v2h: [Int], i: Int, acc: String) : String {
 # Emit forward `declare`s for each `__pimpl_*` we bitcast above.
 # These names are already defined in the same module so the declare
 # acts only as a no-op type assertion.
-fn llvm_emit_pimpl_extern_declares(rows: [PimplRow], seen: [String], acc: String) : String {
+fn llvm_emit_pimpl_extern_declares(rows: [PimplRow], decls: [Decl], seen: [String], acc: String) : String {
   match rows {
     [] -> acc
     [PR(csym, _, t, _), ...rest] -> {
-      let head_int = stdlib_head_tag_int(t)
+      let head_int = stdlib_head_tag_int(t, decls)
       if head_int < 0 or list_has(seen, csym) {
-        llvm_emit_pimpl_extern_declares(rest, seen, acc)
+        llvm_emit_pimpl_extern_declares(rest, decls, seen, acc)
       } else {
         # Always declare with 1-arg shape since pimpl arities vary
         # and the actual call type comes through the bitcast. The
         # declare is omitted — LLVM resolves @kai_<csym> from the
         # same module's `define %KaiValue* @kai_<csym>(...)`. We
         # leave a comment for readers.
-        llvm_emit_pimpl_extern_declares(rest, [csym, ...seen],
+        llvm_emit_pimpl_extern_declares(rest, decls, [csym, ...seen],
                                           concat_all([acc, "; pimpl ref ", csym, "\n"]))
       }
     }
@@ -6019,9 +6020,10 @@ fn llvm_emit_pimpl_extern_declares(rows: [PimplRow], seen: [String], acc: String
 }
 
 # Integer version of `stdlib_head_tag_c` for direct LLVM emission.
-# Returns -1 for unknown/user types.
-#[doc("Integer head tag for a builtin type name (Int -> 3, Real -> 4, Bool -> 2, ...) for direct LLVM emission; -1 for unknown/user types. Pub for unit testing.")]
-pub fn stdlib_head_tag_int(tname: String) : Int {
+# Returns the dense user head tag (>= 20) for user record/sum types and
+# -1 only for genuinely unknown names.
+#[doc("Integer head tag for a builtin type name (Int -> 3, Real -> 4, Bool -> 2, ...) or a user record/sum type (dense, >= 20) for direct LLVM emission; -1 for unknown types. Pub for unit testing.")]
+pub fn stdlib_head_tag_int(tname: String, decls: [Decl]) : Int {
   if tname == "Int"          { 3 }
   else if tname == "Real"    { 4 }
   else if tname == "Bool"    { 2 }
@@ -6035,7 +6037,7 @@ pub fn stdlib_head_tag_int(tname: String) : Int {
   else if tname == "Result"  { 17 }
   else if tname == "Signal"  { 18 }
   else if tname == "ProcessExit" { 19 }
-  else { -1 }
+  else { user_type_head_tag(tname, decls) }
 }
 
 # m7c-c: per-decl walker that flattens every effect's ops into a
