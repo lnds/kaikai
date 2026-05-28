@@ -285,52 +285,53 @@ static void check_node(C *c, Node *n) {
 
 /* ---------- first pass: register top-level decls ---------- */
 
+/* type X = ... : register the type name, and if the body is a sum, each
+   variant constructor name. */
+static void register_type_decl(C *c, Node *d) {
+    scope_add(c, d->name, d->name_len);
+    if (d->n_children < 1) return;
+    Node *body = d->children[0];
+    if (!body || body->kind != N_TY_SUM) return;
+    for (size_t j = 0; j < body->n_children; ++j) {
+        Node *v = body->children[j];
+        if (v && v->kind == N_VARIANT) scope_add(c, v->name, v->name_len);
+    }
+}
+
+/* import a.b.c [as x] [.{ sel, ... }] : bring the alias, the selected
+   names, or (bare) the last dotted segment into scope. */
+static void register_import(C *c, Node *d) {
+    if (d->v.flags & 0x1) {
+        /* has_alias: first child is the alias ident */
+        Node *a = d->n_children >= 1 ? d->children[0] : NULL;
+        if (a && a->kind == N_IDENT) scope_add(c, a->name, a->name_len);
+        return;
+    }
+    if (d->n_children > 0) {
+        /* selection list */
+        for (size_t j = 0; j < d->n_children; ++j) {
+            Node *sel = d->children[j];
+            if (sel && sel->kind == N_IDENT) scope_add(c, sel->name, sel->name_len);
+        }
+        return;
+    }
+    /* Bare qualified import: bring the last path segment into scope. */
+    const char *p = d->name;
+    size_t len = d->name_len;
+    size_t start = 0;
+    for (size_t j = 0; j < len; ++j) if (p[j] == '.') start = j + 1;
+    scope_add(c, p + start, len - start);
+}
+
 static void register_top_level(C *c, Node *prog) {
     for (size_t i = 0; i < prog->n_children; ++i) {
         Node *d = prog->children[i];
         if (!d) continue;
-        if (d->kind == N_FN) {
-            scope_add(c, d->name, d->name_len);
-        } else if (d->kind == N_TYPE_DECL) {
-            /* Register the type name (mostly for completeness; we don't
-               check its uses in type positions yet). If the body is a
-               sum, register each variant as a constructor name. */
-            scope_add(c, d->name, d->name_len);
-            if (d->n_children >= 1) {
-                Node *body = d->children[0];
-                if (body && body->kind == N_TY_SUM) {
-                    for (size_t j = 0; j < body->n_children; ++j) {
-                        Node *v = body->children[j];
-                        if (v && v->kind == N_VARIANT) {
-                            scope_add(c, v->name, v->name_len);
-                        }
-                    }
-                }
-            }
-        } else if (d->kind == N_IMPORT) {
-            /* For single-module stage 0, imports introduce at least the
-               last segment of the dotted path into scope. Alias and
-               selection children are already N_IDENT. */
-            if (d->v.flags & 0x1) {
-                /* has_alias: first child is the alias ident */
-                if (d->n_children >= 1) {
-                    Node *a = d->children[0];
-                    if (a && a->kind == N_IDENT) scope_add(c, a->name, a->name_len);
-                }
-            } else if (d->n_children > 0) {
-                /* selection list */
-                for (size_t j = 0; j < d->n_children; ++j) {
-                    Node *sel = d->children[j];
-                    if (sel && sel->kind == N_IDENT) scope_add(c, sel->name, sel->name_len);
-                }
-            } else {
-                /* Bare qualified import: bring the last path segment into scope. */
-                const char *p = d->name;
-                size_t len = d->name_len;
-                size_t start = 0;
-                for (size_t j = 0; j < len; ++j) if (p[j] == '.') start = j + 1;
-                scope_add(c, p + start, len - start);
-            }
+        switch (d->kind) {
+            case N_FN:        scope_add(c, d->name, d->name_len); break;
+            case N_TYPE_DECL: register_type_decl(c, d);           break;
+            case N_IMPORT:    register_import(c, d);              break;
+            default: break;
         }
     }
 }
