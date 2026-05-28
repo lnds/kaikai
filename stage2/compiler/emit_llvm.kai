@@ -2785,17 +2785,43 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
           _ -> llvm_set_last(e, "undef")
         }
       } else if nm == "__perceus_reuse_variant" {
-        # issue #210 — LLVM mirror of the variant reuse-in-place
-        # lowering. Recogniser synthesises
-        # `__perceus_reuse_variant(__pcs_scr, Ctor(args...))` with
-        # the 2nd arg always an `ECall(EVar(cname), cargs)`; we
-        # unpack the ctor name + args and call
-        # `kaix_reuse_or_alloc_variant(scr, 0, name, n, args)`.
+        # issue #210 / #118 layer 1-2 — LLVM mirror of the variant
+        # reuse-in-place lowering. Recogniser synthesises
+        # `__perceus_reuse_variant(__pcs_scr, Ctor(args...))`. The ctor
+        # callee is `EVar(cname)` (pre-resolution) or — the common case
+        # after the resolver qualifies user constructors —
+        # `EModCall(tycon, cname)`. Both must be accepted; before this
+        # the EModCall form fell to `undef`, producing wrong output /
+        # segfault and breaking C↔LLVM parity once the recogniser began
+        # firing on resolved variants.
+        #
+        # Mirror C's `emit_reuse_variant_body` has_prim guard: a ctor
+        # with an Int/Real payload slot cannot reuse in place
+        # (`kaix_reuse_or_alloc_variant` assumes slot_mask==0), so route
+        # it to the normal `llvm_emit_variant_ctor` alloc path exactly
+        # like the C backend.
         match xs {
           [scr_e, ctor] -> match ctor.kind {
-            ECall(cf, cargs) -> match cf.kind {
-              EVar(cname) -> llvm_emit_reuse_variant(e, scr_e, cname, cargs)
-              _ -> llvm_set_last(e, "undef")
+            ECall(cf, cargs) -> {
+              let cname_opt = match cf.kind {
+                EVar(cn)        -> Some(cn)
+                EModCall(_, cn) -> Some(cn)
+                _               -> None
+              }
+              match cname_opt {
+                None -> llvm_set_last(e, "undef")
+                Some(cname) -> {
+                  let has_prim = match evar_payload_tys(e.vars_, cname) {
+                    Some(ts) -> variant_has_primitive_slot(ts)
+                    None     -> false
+                  }
+                  if has_prim {
+                    llvm_emit_variant_ctor(e, cname, cargs)
+                  } else {
+                    llvm_emit_reuse_variant(e, scr_e, cname, cargs)
+                  }
+                }
+              }
             }
             _ -> llvm_set_last(e, "undef")
           }
@@ -5877,9 +5903,19 @@ fn llvm_emit_proto_init(decls: [Decl], variants: [EVar]) : String {
   let impl_calls   = llvm_emit_impl_register_calls(impl_rows, 0, "")
   let variant_calls = llvm_emit_variant_register_calls(v2h, 0, "")
   let fn_declares  = llvm_emit_pimpl_extern_declares(impl_rows, [], "")
+  # issue #118 layer 3 — mirror the C backend's reusable-tag registry
+  # (emit_c.kai `emit_proto_runtime_tables`). Without this the LLVM
+  # backend immortalises reuse-target variants while C does not,
+  # diverging output (backend-parity regression). The reuse calls are
+  # already in the shared post-Perceus AST, so LLVM must apply the same
+  # bitset to make them safe.
+  let reuse_ctors = collect_reuse_ctors(decls, [])
+  let reuse_tags  = reuse_ctor_tags(reuse_ctors, variants, [])
+  let reuse_calls = llvm_emit_reusable_tag_calls(reuse_tags, "")
   concat_all([
     "\ndeclare void @kaix_register_one_impl(i32, i32, i8*)\n",
     "declare void @kaix_register_one_variant_head(i32, i32)\n",
+    "declare void @kaix_register_one_reusable_tag(i32)\n",
     "declare i32 @kaix_head_tag(%KaiValue*)\n",
     "declare i8* @kaix_lookup_impl(i32, i32)\n",
     "declare void @kaix_panic_no_impl(i8*, i8*, i32)\n",
@@ -5888,9 +5924,25 @@ fn llvm_emit_proto_init(decls: [Decl], variants: [EVar]) : String {
     "entry:\n",
     variant_calls,
     impl_calls,
+    reuse_calls,
     "  ret void\n",
     "}\n"
   ])
+}
+
+# issue #118 layer 3 — one `@kaix_register_one_reusable_tag(i32 tag)`
+# per reuse-target tag. Mirrors the C backend's bitset registration.
+fn llvm_emit_reusable_tag_calls(tags: [Int], acc: String) : String {
+  match tags {
+    [] -> acc
+    [t, ...rest] -> {
+      let line = concat_all([
+        "  call void @kaix_register_one_reusable_tag(i32 ",
+        int_to_string(t), ")\n"
+      ])
+      llvm_emit_reusable_tag_calls(rest, concat_all([acc, line]))
+    }
+  }
 }
 
 # For each pimpl row, emit one register call. Skips entries whose

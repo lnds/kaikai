@@ -834,6 +834,17 @@ void kaix_register_one_variant_head(int32_t variant_tag, int32_t head_tag) {
     kai_register_variant_heads(_kaix_v2h_heap, _kaix_v2h_capacity);
 }
 
+/* issue #118 layer 3 — reusable-tag registration shim. The LLVM IR
+ * calls this once per tag that the Perceus recogniser marked as a
+ * reuse target; it stamps the runtime bitset so kai_variant_u stops
+ * immortalising those cells (which would saturate rc and block
+ * reuse-in-place). Mirrors the C backend's
+ * kai_register_reusable_tags(arr, n) but one-at-a-time, matching the
+ * per-entry shape of the other kaix_register_one_* shims. */
+void kaix_register_one_reusable_tag(int32_t tag) {
+    kai_register_reusable_tags(&tag, 1);
+}
+
 /* Impl-table registration shim. The LLVM IR calls this once per impl
  * with the resolved function pointer. Builds an in-place hashmap by
  * accumulating + reinserting on each call. Cheap because each
