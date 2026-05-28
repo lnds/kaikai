@@ -1,5 +1,5 @@
 CC      ?= cc
-CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g -O0
+CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g -O2
 # macOS caps the main-thread stack at the LINKED size, not the ulimit
 # soft limit (ulimit -s only matters where the kernel is the
 # allocator — i.e. Linux). The Tongariki kai fmt lane (2026-05-01)
