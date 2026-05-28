@@ -12,6 +12,7 @@
  */
 
 #include "parser.h"
+#include "parser_internal.h"
 
 #include <assert.h>
 #include <ctype.h>
@@ -19,76 +20,42 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-    const char  *file;
-    const char  *src;
-    const Token *toks;
-    size_t       n;
-    size_t       i;
-    int          had_error;
-} P;
-
-/* Forward decls */
+/* Forward decls — declarations / statements internal to this unit. */
 static Node *parse_decl(P *p);
 static Node *parse_fn(P *p, int is_pub, int line, int col);
 static Node *parse_type_decl(P *p, int is_pub, int line, int col);
 static Node *parse_test(P *p, int line, int col);
 static Node *parse_import(P *p, int line, int col);
 
-static Node *parse_stmt(P *p);
 static Node *parse_let(P *p);
 static Node *parse_assert(P *p);
 
-static Node *parse_expr(P *p);
-static Node *parse_pipe(P *p);
-static Node *parse_or(P *p);
-static Node *parse_and(P *p);
-static Node *parse_cmp(P *p);
-static Node *parse_add(P *p);
-static Node *parse_mul(P *p);
-static Node *parse_unary(P *p);
-static Node *parse_postfix(P *p);
-static Node *parse_primary(P *p);
+/* ---------- helpers (shared via parser_internal.h) ---------- */
 
-static Node *parse_if(P *p);
-static Node *parse_match(P *p);
-static Node *parse_block(P *p);
-static Node *parse_lambda_from_ident(P *p, Node *ident);
-static Node *parse_list_or_range(P *p);
-static Node *parse_record_lit(P *p, Node *type_ident);
-static Node *parse_string_literal(P *p);
-
-static Node *parse_pattern(P *p);
-static Node *parse_type(P *p);
-
-static int is_uppercase_ident(const Token *t, const char *src);
-
-/* ---------- helpers ---------- */
-
-static const Token *peek_tok(P *p) { return &p->toks[p->i]; }
-static TokenKind    peek_kind(P *p) { return p->toks[p->i].kind; }
-static TokenKind    peek_kind_n(P *p, size_t off) {
+const Token *peek_tok(P *p) { return &p->toks[p->i]; }
+TokenKind    peek_kind(P *p) { return p->toks[p->i].kind; }
+TokenKind    peek_kind_n(P *p, size_t off) {
     size_t j = p->i + off;
     if (j >= p->n) return TK_EOF;
     return p->toks[j].kind;
 }
 
-static void skip_newlines(P *p) {
+void skip_newlines(P *p) {
     while (peek_kind(p) == TK_NEWLINE) p->i++;
 }
 
-static void skip_newlines_and_semis(P *p) {
+void skip_newlines_and_semis(P *p) {
     while (peek_kind(p) == TK_NEWLINE || peek_kind(p) == TK_SEMI) p->i++;
 }
 
-static int at(P *p, TokenKind k) { return peek_kind(p) == k; }
+int at(P *p, TokenKind k) { return peek_kind(p) == k; }
 
-static int match(P *p, TokenKind k) {
+int match(P *p, TokenKind k) {
     if (peek_kind(p) == k) { p->i++; return 1; }
     return 0;
 }
 
-static void error_at(P *p, const Token *t, const char *msg) {
+void error_at(P *p, const Token *t, const char *msg) {
     if (!p->had_error) {
         fprintf(stderr, "%s:%d:%d: error: %s\n", p->file, t->line, t->col, msg);
         /* Print the source line with a caret. */
@@ -108,15 +75,15 @@ static void error_at(P *p, const Token *t, const char *msg) {
     p->had_error = 1;
 }
 
-static void error_here(P *p, const char *msg) { error_at(p, peek_tok(p), msg); }
+void error_here(P *p, const char *msg) { error_at(p, peek_tok(p), msg); }
 
-static const Token *expect(P *p, TokenKind k, const char *msg) {
+const Token *expect(P *p, TokenKind k, const char *msg) {
     if (peek_kind(p) == k) return &p->toks[p->i++];
     error_here(p, msg);
     return NULL;
 }
 
-static int is_uppercase_ident(const Token *t, const char *src) {
+int is_uppercase_ident(const Token *t, const char *src) {
     if (t->kind != TK_IDENT || t->length == 0) return 0;
     char c = src[t->start];
     return c >= 'A' && c <= 'Z';
@@ -124,14 +91,14 @@ static int is_uppercase_ident(const Token *t, const char *src) {
 
 /* Copy the source span of a token into a freshly-allocated Node's name field
    as a (start, length) pair pointing into the original source. */
-static void set_name_from_token(Node *n, const Token *t, const char *src) {
+void set_name_from_token(Node *n, const Token *t, const char *src) {
     n->name     = src + t->start;
     n->name_len = t->length;
 }
 
 /* ---------- decoders for literal values ---------- */
 
-static int64_t decode_int(const char *s, size_t len) {
+int64_t decode_int(const char *s, size_t len) {
     int64_t v = 0;
     int neg = 0;
     size_t i = 0;
@@ -145,7 +112,7 @@ static int64_t decode_int(const char *s, size_t len) {
     return neg ? -v : v;
 }
 
-static double decode_real(const char *s, size_t len) {
+double decode_real(const char *s, size_t len) {
     /* Copy to a temporary buffer removing underscores, then strtod. */
     char buf[128];
     size_t j = 0;
@@ -191,7 +158,7 @@ static uint32_t decode_utf8_char(const char *p, const char *end) {
     return v;
 }
 
-static uint32_t decode_char(const char *s, size_t len) {
+uint32_t decode_char(const char *s, size_t len) {
     /* s points at the opening quote; len includes both quotes. */
     if (len < 2) return 0;
     const char *p = s + 1;
@@ -287,34 +254,19 @@ static Node *parse_decl(P *p) {
     }
 }
 
-static Node *parse_fn(P *p, int is_pub, int line, int col) {
-    Node *fn = kai_new_node(N_FN, line, col);
-    fn->v.flags = is_pub ? 0x1 : 0;
-
-    const Token *name = expect(p, TK_IDENT, "expected function name after `fn`");
-    if (!name) { kai_free_node(fn); return NULL; }
-    set_name_from_token(fn, name, p->src);
-
-    if (!expect(p, TK_LPAREN, "expected `(` after function name")) {
-        kai_free_node(fn); return NULL;
-    }
-
-    /* Placeholders: [0]=return_type, [1]=body; params append after.
-       We fill them later; push NULL stubs for now. */
-    kai_node_push(fn, NULL); /* return_type */
-    kai_node_push(fn, NULL); /* body */
-
+/* Parse the `( name: T, ... )` parameter list, appending one N_PARAM per
+   parameter onto `fn`. The `(` has already been consumed. Returns 1 on
+   success, 0 on error (caller frees `fn`). */
+static int parse_fn_params(P *p, Node *fn) {
     skip_newlines(p);
     if (!at(p, TK_RPAREN)) {
         for (;;) {
             skip_newlines(p);
             const Token *pn = expect(p, TK_IDENT, "expected parameter name");
-            if (!pn) { kai_free_node(fn); return NULL; }
-            if (!expect(p, TK_COLON, "expected `:` after parameter name")) {
-                kai_free_node(fn); return NULL;
-            }
+            if (!pn) return 0;
+            if (!expect(p, TK_COLON, "expected `:` after parameter name")) return 0;
             Node *ptype = parse_type(p);
-            if (!ptype) { kai_free_node(fn); return NULL; }
+            if (!ptype) return 0;
             Node *param = kai_new_node(N_PARAM, pn->line, pn->col);
             set_name_from_token(param, pn, p->src);
             kai_node_push(param, ptype);
@@ -323,15 +275,18 @@ static Node *parse_fn(P *p, int is_pub, int line, int col) {
             if (!match(p, TK_COMMA)) break;
         }
     }
-    if (!expect(p, TK_RPAREN, "expected `)` or `,` after parameter")) {
-        kai_free_node(fn); return NULL;
-    }
+    return expect(p, TK_RPAREN, "expected `)` or `,` after parameter") != NULL;
+}
 
-    /* Optional return type. */
+/* Parse the optional `: RetType` and the body (`= expr` or `{ block }`),
+   filling fn->children[0] (return type) and [1] (body). The closing `)` of
+   the parameter list has already been consumed. Returns 1 on success, 0 on
+   error (caller frees `fn`). */
+static int parse_fn_ret_and_body(P *p, Node *fn, int line, int col) {
     Node *ret_ty;
     if (match(p, TK_COLON)) {
         ret_ty = parse_type(p);
-        if (!ret_ty) { kai_free_node(fn); return NULL; }
+        if (!ret_ty) return 0;
     } else {
         /* When omitted, synthesize N_TY_NAME "Unit". */
         ret_ty = kai_new_node(N_TY_NAME, line, col);
@@ -351,11 +306,31 @@ static Node *parse_fn(P *p, int is_pub, int line, int col) {
         body = parse_block(p);
     } else {
         error_here(p, "expected `=` or `{` for function body");
+        return 0;
+    }
+    if (!body) return 0;
+    fn->children[1] = body;
+    return 1;
+}
+
+static Node *parse_fn(P *p, int is_pub, int line, int col) {
+    Node *fn = kai_new_node(N_FN, line, col);
+    fn->v.flags = is_pub ? 0x1 : 0;
+
+    const Token *name = expect(p, TK_IDENT, "expected function name after `fn`");
+    if (!name) { kai_free_node(fn); return NULL; }
+    set_name_from_token(fn, name, p->src);
+
+    if (!expect(p, TK_LPAREN, "expected `(` after function name")) {
         kai_free_node(fn); return NULL;
     }
-    if (!body) { kai_free_node(fn); return NULL; }
-    fn->children[1] = body;
 
+    /* Placeholders: [0]=return_type, [1]=body; params append after. */
+    kai_node_push(fn, NULL); /* return_type */
+    kai_node_push(fn, NULL); /* body */
+
+    if (!parse_fn_params(p, fn))               { kai_free_node(fn); return NULL; }
+    if (!parse_fn_ret_and_body(p, fn, line, col)) { kai_free_node(fn); return NULL; }
     return fn;
 }
 
@@ -449,35 +424,43 @@ static int looks_like_sum_ahead(P *p) {
 
 /* Parse a sum type body `Ctor | Ctor(T, ...) | ...` into an N_TY_SUM node.
    Returns the body node, or NULL on error (caller frees `td`). */
+/* Parse one sum variant: `Ctor` or `Ctor(T, ...)`. Returns the N_VARIANT,
+   or NULL on error (the caller frees the enclosing sum body). */
+static Node *parse_variant(P *p) {
+    const Token *cn = expect(p, TK_IDENT, "expected variant constructor name");
+    if (!cn) return NULL;
+    if (!is_uppercase_ident(cn, p->src)) {
+        error_at(p, cn, "variant constructor must start with uppercase");
+        return NULL;
+    }
+    Node *var = kai_new_node(N_VARIANT, cn->line, cn->col);
+    set_name_from_token(var, cn, p->src);
+    if (match(p, TK_LPAREN)) {
+        skip_newlines(p);
+        if (!at(p, TK_RPAREN)) {
+            for (;;) {
+                Node *ty = parse_type(p);
+                if (!ty) { kai_free_node(var); return NULL; }
+                kai_node_push(var, ty);
+                skip_newlines(p);
+                if (!match(p, TK_COMMA)) break;
+                skip_newlines(p);
+            }
+        }
+        if (!expect(p, TK_RPAREN, "expected `)` after variant fields")) {
+            kai_free_node(var); return NULL;
+        }
+    }
+    return var;
+}
+
 static Node *parse_sum_type_body(P *p, int line, int col) {
     Node *body = kai_new_node(N_TY_SUM, line, col);
     skip_newlines(p);
     for (;;) {
         skip_newlines(p);
-        const Token *cn = expect(p, TK_IDENT, "expected variant constructor name");
-        if (!cn) { kai_free_node(body); return NULL; }
-        if (!is_uppercase_ident(cn, p->src)) {
-            error_at(p, cn, "variant constructor must start with uppercase");
-            kai_free_node(body); return NULL;
-        }
-        Node *var = kai_new_node(N_VARIANT, cn->line, cn->col);
-        set_name_from_token(var, cn, p->src);
-        if (match(p, TK_LPAREN)) {
-            skip_newlines(p);
-            if (!at(p, TK_RPAREN)) {
-                for (;;) {
-                    Node *ty = parse_type(p);
-                    if (!ty) { kai_free_node(var); kai_free_node(body); return NULL; }
-                    kai_node_push(var, ty);
-                    skip_newlines(p);
-                    if (!match(p, TK_COMMA)) break;
-                    skip_newlines(p);
-                }
-            }
-            if (!expect(p, TK_RPAREN, "expected `)` after variant fields")) {
-                kai_free_node(var); kai_free_node(body); return NULL;
-            }
-        }
+        Node *var = parse_variant(p);
+        if (!var) { kai_free_node(body); return NULL; }
         kai_node_push(body, var);
         skip_newlines(p);
         if (!match(p, TK_PIPE)) break;
@@ -660,7 +643,7 @@ static Node *parse_named_type(P *p) {
     return n;
 }
 
-static Node *parse_type(P *p) {
+Node *parse_type(P *p) {
     /* Forms:
          [T]
          ( T , ... ) -> T          (function type)
@@ -684,7 +667,7 @@ static Node *parse_type(P *p) {
 
 /* ---------- statements ---------- */
 
-static Node *parse_stmt(P *p) {
+Node *parse_stmt(P *p) {
     if (at(p, TK_LET))    { p->i++; return parse_let(p); }
     if (at(p, TK_ASSERT)) { p->i++; return parse_assert(p); }
     /* Otherwise, an expression statement. */
@@ -739,802 +722,3 @@ static Node *parse_assert(P *p) {
     return a;
 }
 
-/* ---------- expressions (by precedence) ---------- */
-
-/*
- * Precedence (high to low):
- *   postfix:    . [] ()
- *   unary:      - not
- *   multiplicative: * / // %
- *   additive:   + -
- *   comparison: == != < > <= >=
- *   and
- *   or
- *   pipe:       |>
- */
-
-static Node *parse_expr(P *p) { return parse_pipe(p); }
-
-static Node *parse_pipe(P *p) {
-    Node *lhs = parse_or(p);
-    if (!lhs) return NULL;
-    for (;;) {
-        if (peek_kind(p) == TK_NEWLINE && peek_kind_n(p, 1) == TK_PIPE_APPLY) {
-            /* allow newlines before |> continuation */
-            p->i++;
-        }
-        if (!at(p, TK_PIPE_APPLY)) break;
-        int line = peek_tok(p)->line, col = peek_tok(p)->col;
-        p->i++;
-        skip_newlines(p);
-        Node *rhs = parse_or(p);
-        if (!rhs) { kai_free_node(lhs); return NULL; }
-        Node *pipe = kai_new_node(N_PIPE, line, col);
-        kai_node_push(pipe, lhs);
-        kai_node_push(pipe, rhs);
-        lhs = pipe;
-    }
-    return lhs;
-}
-
-static Node *binop(int op, Node *lhs, Node *rhs, int line, int col) {
-    Node *n = kai_new_node(N_BINOP, line, col);
-    n->v.op = op;
-    kai_node_push(n, lhs);
-    kai_node_push(n, rhs);
-    return n;
-}
-
-static Node *parse_or(P *p) {
-    Node *lhs = parse_and(p);
-    if (!lhs) return NULL;
-    while (at(p, TK_OR)) {
-        int line = peek_tok(p)->line, col = peek_tok(p)->col;
-        p->i++; skip_newlines(p);
-        Node *rhs = parse_and(p);
-        if (!rhs) { kai_free_node(lhs); return NULL; }
-        lhs = binop(TK_OR, lhs, rhs, line, col);
-    }
-    return lhs;
-}
-
-static Node *parse_and(P *p) {
-    Node *lhs = parse_cmp(p);
-    if (!lhs) return NULL;
-    while (at(p, TK_AND)) {
-        int line = peek_tok(p)->line, col = peek_tok(p)->col;
-        p->i++; skip_newlines(p);
-        Node *rhs = parse_cmp(p);
-        if (!rhs) { kai_free_node(lhs); return NULL; }
-        lhs = binop(TK_AND, lhs, rhs, line, col);
-    }
-    return lhs;
-}
-
-static int is_cmp(TokenKind k) {
-    return k == TK_EQEQ || k == TK_NEQ || k == TK_LT || k == TK_GT ||
-           k == TK_LE   || k == TK_GE;
-}
-
-static Node *parse_cmp(P *p) {
-    Node *lhs = parse_add(p);
-    if (!lhs) return NULL;
-    if (is_cmp(peek_kind(p))) {
-        int op = peek_kind(p);
-        int line = peek_tok(p)->line, col = peek_tok(p)->col;
-        p->i++; skip_newlines(p);
-        Node *rhs = parse_add(p);
-        if (!rhs) { kai_free_node(lhs); return NULL; }
-        lhs = binop(op, lhs, rhs, line, col);
-    }
-    return lhs;
-}
-
-static Node *parse_add(P *p) {
-    Node *lhs = parse_mul(p);
-    if (!lhs) return NULL;
-    while (at(p, TK_PLUS) || at(p, TK_MINUS)) {
-        int op = peek_kind(p);
-        int line = peek_tok(p)->line, col = peek_tok(p)->col;
-        p->i++; skip_newlines(p);
-        Node *rhs = parse_mul(p);
-        if (!rhs) { kai_free_node(lhs); return NULL; }
-        lhs = binop(op, lhs, rhs, line, col);
-    }
-    return lhs;
-}
-
-static Node *parse_mul(P *p) {
-    Node *lhs = parse_unary(p);
-    if (!lhs) return NULL;
-    while (at(p, TK_STAR) || at(p, TK_SLASH) ||
-           at(p, TK_SLASH_SLASH) || at(p, TK_PERCENT)) {
-        int op = peek_kind(p);
-        int line = peek_tok(p)->line, col = peek_tok(p)->col;
-        p->i++; skip_newlines(p);
-        Node *rhs = parse_unary(p);
-        if (!rhs) { kai_free_node(lhs); return NULL; }
-        lhs = binop(op, lhs, rhs, line, col);
-    }
-    return lhs;
-}
-
-static Node *parse_unary(P *p) {
-    if (at(p, TK_MINUS) || at(p, TK_NOT)) {
-        int op = peek_kind(p);
-        int line = peek_tok(p)->line, col = peek_tok(p)->col;
-        p->i++; skip_newlines(p);
-        Node *rhs = parse_unary(p);
-        if (!rhs) return NULL;
-        Node *n = kai_new_node(N_UNOP, line, col);
-        n->v.op = op;
-        kai_node_push(n, rhs);
-        return n;
-    }
-    return parse_postfix(p);
-}
-
-static Node *parse_postfix(P *p) {
-    Node *lhs = parse_primary(p);
-    if (!lhs) return NULL;
-    for (;;) {
-        const Token *t = peek_tok(p);
-        if (t->kind == TK_LPAREN) {
-            /* Call. */
-            p->i++;
-            skip_newlines(p);
-            Node *call = kai_new_node(N_CALL, t->line, t->col);
-            kai_node_push(call, lhs);
-            if (!at(p, TK_RPAREN)) {
-                for (;;) {
-                    skip_newlines(p);
-                    Node *arg = parse_expr(p);
-                    if (!arg) { kai_free_node(call); return NULL; }
-                    kai_node_push(call, arg);
-                    skip_newlines(p);
-                    if (!match(p, TK_COMMA)) break;
-                }
-            }
-            if (!expect(p, TK_RPAREN, "expected `)` after call arguments")) {
-                kai_free_node(call); return NULL;
-            }
-            lhs = call;
-        } else if (t->kind == TK_DOT && peek_kind_n(p, 1) == TK_IDENT) {
-            p->i++;
-            const Token *fn = &p->toks[p->i++];
-            Node *f = kai_new_node(N_FIELD, t->line, t->col);
-            set_name_from_token(f, fn, p->src);
-            kai_node_push(f, lhs);
-            lhs = f;
-        } else if (t->kind == TK_LBRACKET) {
-            p->i++;
-            skip_newlines(p);
-            Node *idx = parse_expr(p);
-            if (!idx) { kai_free_node(lhs); return NULL; }
-            if (!expect(p, TK_RBRACKET, "expected `]` after index")) {
-                kai_free_node(idx); kai_free_node(lhs); return NULL;
-            }
-            Node *n = kai_new_node(N_INDEX, t->line, t->col);
-            kai_node_push(n, lhs);
-            kai_node_push(n, idx);
-            lhs = n;
-        } else {
-            break;
-        }
-    }
-    return lhs;
-}
-
-/* ---------- primary expressions ---------- */
-
-/* Parse a parenthesized primary: `()` Unit, `(expr)` grouping, or a
-   parameter-list lambda `(a, b) => body` (including the zero-arg `() =>`).
-   On entry `t` is the `(` token (for line/col); the `(` has NOT been
-   consumed yet. */
-/* Lookahead (no consume): is the run from `p->i` shaped `IDENT (, IDENT)* )
-   =>`, i.e. a parameter-list lambda? */
-static int scan_paren_is_lambda(P *p) {
-    if (!at(p, TK_IDENT)) return 0;
-    size_t j = p->i;
-    for (;;) {
-        if (p->toks[j].kind != TK_IDENT) return 0;
-        j++;
-        if (p->toks[j].kind == TK_RPAREN) {
-            return p->toks[j + 1].kind == TK_FAT_ARROW;
-        }
-        if (p->toks[j].kind != TK_COMMA) return 0;
-        j++;
-        while (p->toks[j].kind == TK_NEWLINE) j++;
-    }
-}
-
-/* Build a parameter-list lambda `(a, b) => body`. On entry `p->i` is at the
-   first parameter IDENT; `t` carries the `(` line/col. */
-static Node *parse_paren_lambda(P *p, const Token *t) {
-    Node *lam = kai_new_node(N_LAMBDA, t->line, t->col);
-    kai_node_push(lam, NULL); /* body placeholder */
-    for (;;) {
-        const Token *pn = expect(p, TK_IDENT, "expected parameter name");
-        if (!pn) { kai_free_node(lam); return NULL; }
-        Node *id = kai_new_node(N_IDENT, pn->line, pn->col);
-        set_name_from_token(id, pn, p->src);
-        kai_node_push(lam, id);
-        if (!match(p, TK_COMMA)) break;
-        skip_newlines(p);
-    }
-    if (!expect(p, TK_RPAREN, "expected `)` after lambda parameters")) {
-        kai_free_node(lam); return NULL;
-    }
-    if (!expect(p, TK_FAT_ARROW, "expected `=>`")) {
-        kai_free_node(lam); return NULL;
-    }
-    skip_newlines(p);
-    Node *body = parse_expr(p);
-    if (!body) { kai_free_node(lam); return NULL; }
-    lam->children[0] = body;
-    return lam;
-}
-
-static Node *parse_paren_expr(P *p, const Token *t) {
-    p->i++;
-    /* `()` Unit, or `() => expr` zero-arg lambda. */
-    if (at(p, TK_RPAREN)) {
-        p->i++;
-        if (at(p, TK_FAT_ARROW)) {
-            p->i++; skip_newlines(p);
-            Node *body = parse_expr(p);
-            if (!body) return NULL;
-            Node *lam = kai_new_node(N_LAMBDA, t->line, t->col);
-            kai_node_push(lam, body);
-            return lam;
-        }
-        return kai_new_node(N_UNIT, t->line, t->col);
-    }
-    if (scan_paren_is_lambda(p)) return parse_paren_lambda(p, t);
-    /* Otherwise: plain parenthesized expression. */
-    skip_newlines(p);
-    Node *e = parse_expr(p);
-    if (!e) return NULL;
-    if (!expect(p, TK_RPAREN, "expected `)`")) { kai_free_node(e); return NULL; }
-    return e;
-}
-
-static Node *parse_primary(P *p) {
-    const Token *t = peek_tok(p);
-
-    switch (t->kind) {
-        case TK_INT: {
-            p->i++;
-            Node *n = kai_new_node(N_INT, t->line, t->col);
-            n->v.i = decode_int(p->src + t->start, t->length);
-            n->name = p->src + t->start; n->name_len = t->length;
-            return n;
-        }
-        case TK_REAL: {
-            p->i++;
-            Node *n = kai_new_node(N_REAL, t->line, t->col);
-            n->v.r = decode_real(p->src + t->start, t->length);
-            n->name = p->src + t->start; n->name_len = t->length;
-            return n;
-        }
-        case TK_CHAR: {
-            p->i++;
-            Node *n = kai_new_node(N_CHAR, t->line, t->col);
-            n->v.c = decode_char(p->src + t->start, t->length);
-            n->name = p->src + t->start; n->name_len = t->length;
-            return n;
-        }
-        case TK_STRING: {
-            return parse_string_literal(p);
-        }
-        case TK_TRUE: {
-            p->i++;
-            Node *n = kai_new_node(N_BOOL, t->line, t->col);
-            n->v.b = 1;
-            return n;
-        }
-        case TK_FALSE: {
-            p->i++;
-            Node *n = kai_new_node(N_BOOL, t->line, t->col);
-            n->v.b = 0;
-            return n;
-        }
-        case TK_UNDERSCORE: {
-            /* Underscore in expression position is not valid in minimal;
-               it's for patterns only. Emit an error. */
-            error_here(p, "`_` is only valid inside patterns");
-            return NULL;
-        }
-        case TK_DOT: {
-            p->i++;
-            return kai_new_node(N_PLACEHOLDER, t->line, t->col);
-        }
-        case TK_LBRACKET: {
-            return parse_list_or_range(p);
-        }
-        case TK_LBRACE: {
-            return parse_block(p);
-        }
-        case TK_IF:    return parse_if(p);
-        case TK_MATCH: return parse_match(p);
-
-        case TK_LPAREN:
-            /* `()` Unit, `(expr)` grouping, or `(a, ...) => body` lambda. */
-            return parse_paren_expr(p, t);
-
-        case TK_IDENT: {
-            /* Might be: ident, ident => body (single-param lambda),
-                        IDENT{...} record literal (if uppercase and next is `{`). */
-            const Token *id = &p->toks[p->i++];
-            /* Lambda shape: IDENT `=>` */
-            if (at(p, TK_FAT_ARROW)) {
-                Node *idn = kai_new_node(N_IDENT, id->line, id->col);
-                set_name_from_token(idn, id, p->src);
-                return parse_lambda_from_ident(p, idn);
-            }
-            /* Record literal: only if name is uppercase AND next token is `{`
-               — but we must avoid grabbing block braces of if/while. In minimal
-               only record-literal use `TypeName {`. */
-            if (is_uppercase_ident(id, p->src) && at(p, TK_LBRACE)) {
-                Node *tn = kai_new_node(N_IDENT, id->line, id->col);
-                set_name_from_token(tn, id, p->src);
-                return parse_record_lit(p, tn);
-            }
-            Node *n = kai_new_node(N_IDENT, id->line, id->col);
-            set_name_from_token(n, id, p->src);
-            return n;
-        }
-
-        default:
-            error_here(p, "expected expression");
-            return NULL;
-    }
-}
-
-static Node *parse_lambda_from_ident(P *p, Node *ident) {
-    int line = ident->line, col = ident->col;
-    if (!expect(p, TK_FAT_ARROW, "expected `=>`")) { kai_free_node(ident); return NULL; }
-    skip_newlines(p);
-    Node *body = parse_expr(p);
-    if (!body) { kai_free_node(ident); return NULL; }
-    Node *lam = kai_new_node(N_LAMBDA, line, col);
-    kai_node_push(lam, body);
-    kai_node_push(lam, ident);
-    return lam;
-}
-
-/* ---------- lists and ranges ---------- */
-
-/* Range tail `.. b` or `.. b .. step`, after `first` and the first `..`
-   marker. The `..` has been consumed; `open` carries the `[` line/col. */
-static Node *parse_range_tail(P *p, const Token *open, Node *first) {
-    skip_newlines(p);
-    Node *to = parse_expr(p);
-    if (!to) { kai_free_node(first); return NULL; }
-    Node *step = NULL;
-    if (match(p, TK_DOTDOT)) {
-        skip_newlines(p);
-        step = parse_expr(p);
-        if (!step) { kai_free_node(first); kai_free_node(to); return NULL; }
-    }
-    if (!expect(p, TK_RBRACKET, "expected `]` after range")) {
-        kai_free_node(first); kai_free_node(to); if (step) kai_free_node(step);
-        return NULL;
-    }
-    Node *r = kai_new_node(N_RANGE_LIT, open->line, open->col);
-    if (step) r->v.flags |= 0x1;
-    kai_node_push(r, first);
-    kai_node_push(r, to);
-    if (step) kai_node_push(r, step);
-    return r;
-}
-
-/* Append `expr` to `list`, wrapping it in N_SPREAD when `is_spread`. */
-static void push_list_elt(Node *list, Node *expr, int is_spread) {
-    if (is_spread) {
-        Node *sp = kai_new_node(N_SPREAD, expr->line, expr->col);
-        kai_node_push(sp, expr);
-        kai_node_push(list, sp);
-    } else {
-        kai_node_push(list, expr);
-    }
-}
-
-/* Regular list literal tail, after the already-parsed `first` element. */
-static Node *parse_list_tail(P *p, const Token *open, Node *first, int first_is_spread) {
-    Node *list = kai_new_node(N_LIST_LIT, open->line, open->col);
-    push_list_elt(list, first, first_is_spread);
-    while (match(p, TK_COMMA)) {
-        skip_newlines(p);
-        if (at(p, TK_RBRACKET)) break;
-        int spread = match(p, TK_ELLIPSIS);
-        Node *e = parse_expr(p);
-        if (!e) { kai_free_node(list); return NULL; }
-        push_list_elt(list, e, spread);
-    }
-    skip_newlines(p);
-    if (!expect(p, TK_RBRACKET, "expected `]` to close list")) {
-        kai_free_node(list); return NULL;
-    }
-    return list;
-}
-
-static Node *parse_list_or_range(P *p) {
-    const Token *open = expect(p, TK_LBRACKET, "expected `[`");
-    if (!open) return NULL;
-    skip_newlines(p);
-    /* Empty list. */
-    if (match(p, TK_RBRACKET)) {
-        return kai_new_node(N_LIST_LIT, open->line, open->col);
-    }
-
-    /* Parse the first expression. Could be elem of list, or start of range. */
-    int first_is_spread = match(p, TK_ELLIPSIS) ? 1 : 0;
-    Node *first = parse_expr(p);
-    if (!first) return NULL;
-
-    if (at(p, TK_DOTDOT) && !first_is_spread) {
-        p->i++;
-        return parse_range_tail(p, open, first);
-    }
-    return parse_list_tail(p, open, first, first_is_spread);
-}
-
-/* ---------- record literal ---------- */
-
-static Node *parse_record_lit(P *p, Node *type_ident) {
-    int line = type_ident->line, col = type_ident->col;
-    if (!expect(p, TK_LBRACE, "expected `{` after record type name")) {
-        kai_free_node(type_ident); return NULL;
-    }
-    Node *rec = kai_new_node(N_RECORD_LIT, line, col);
-    rec->name     = type_ident->name;
-    rec->name_len = type_ident->name_len;
-    kai_free_node(type_ident); /* we copied the span */
-
-    skip_newlines(p);
-    if (!at(p, TK_RBRACE)) {
-        for (;;) {
-            skip_newlines(p);
-            const Token *fn = expect(p, TK_IDENT, "expected field name");
-            if (!fn) { kai_free_node(rec); return NULL; }
-            if (!expect(p, TK_COLON, "expected `:` after field name")) {
-                kai_free_node(rec); return NULL;
-            }
-            Node *val = parse_expr(p);
-            if (!val) { kai_free_node(rec); return NULL; }
-            Node *fi = kai_new_node(N_FIELD_INIT, fn->line, fn->col);
-            set_name_from_token(fi, fn, p->src);
-            kai_node_push(fi, val);
-            kai_node_push(rec, fi);
-            skip_newlines(p);
-            if (!match(p, TK_COMMA)) break;
-        }
-    }
-    skip_newlines(p);
-    if (!expect(p, TK_RBRACE, "expected `}` to close record")) {
-        kai_free_node(rec); return NULL;
-    }
-    return rec;
-}
-
-/* ---------- string literal ---------- */
-
-static Node *parse_string_literal(P *p) {
-    const Token *t = &p->toks[p->i++];
-    Node *s = kai_new_node(N_STRING, t->line, t->col);
-    set_name_from_token(s, t, p->src);
-    if (t->length >= 3 && p->src[t->start] == '"' && p->src[t->start + 1] == '"') {
-        s->v.flags |= 0x1; /* triple-quoted */
-    }
-    return s;
-}
-
-/* ---------- if / match / block ---------- */
-
-static Node *parse_if(P *p) {
-    const Token *t = expect(p, TK_IF, "expected `if`");
-    if (!t) return NULL;
-    skip_newlines(p);
-    Node *cond = parse_expr(p);
-    if (!cond) return NULL;
-    skip_newlines(p);
-    if (!at(p, TK_LBRACE)) {
-        error_here(p, "expected `{` after if condition");
-        kai_free_node(cond); return NULL;
-    }
-    Node *then_block = parse_block(p);
-    if (!then_block) { kai_free_node(cond); return NULL; }
-
-    Node *if_n = kai_new_node(N_IF, t->line, t->col);
-    kai_node_push(if_n, cond);
-    kai_node_push(if_n, then_block);
-
-    skip_newlines(p);
-    if (at(p, TK_ELSE)) {
-        p->i++;
-        skip_newlines(p);
-        if_n->v.flags |= 0x1;
-        Node *else_branch;
-        if (at(p, TK_IF)) {
-            else_branch = parse_if(p);
-        } else {
-            if (!at(p, TK_LBRACE)) {
-                error_here(p, "expected `{` or `if` after `else`");
-                kai_free_node(if_n); return NULL;
-            }
-            else_branch = parse_block(p);
-        }
-        if (!else_branch) { kai_free_node(if_n); return NULL; }
-        kai_node_push(if_n, else_branch);
-    }
-    return if_n;
-}
-
-static Node *parse_match(P *p) {
-    const Token *t = expect(p, TK_MATCH, "expected `match`");
-    if (!t) return NULL;
-    skip_newlines(p);
-    Node *scrutinee = parse_expr(p);
-    if (!scrutinee) return NULL;
-    skip_newlines(p);
-    if (!expect(p, TK_LBRACE, "expected `{` after match scrutinee")) {
-        kai_free_node(scrutinee); return NULL;
-    }
-    Node *m = kai_new_node(N_MATCH, t->line, t->col);
-    kai_node_push(m, scrutinee);
-
-    skip_newlines(p);
-    while (!at(p, TK_RBRACE) && !at(p, TK_EOF)) {
-        int line = peek_tok(p)->line, col = peek_tok(p)->col;
-        Node *pat = parse_pattern(p);
-        if (!pat) { kai_free_node(m); return NULL; }
-        Node *arm = kai_new_node(N_ARM, line, col);
-        kai_node_push(arm, pat);
-        if (match(p, TK_IF)) {
-            arm->v.flags |= 0x1;
-            Node *guard = parse_expr(p);
-            if (!guard) { kai_free_node(arm); kai_free_node(m); return NULL; }
-            kai_node_push(arm, guard);
-        }
-        if (!expect(p, TK_ARROW, "expected `->` in match arm")) {
-            kai_free_node(arm); kai_free_node(m); return NULL;
-        }
-        skip_newlines(p);
-        Node *body;
-        if (at(p, TK_LBRACE)) body = parse_block(p);
-        else                  body = parse_expr(p);
-        if (!body) { kai_free_node(arm); kai_free_node(m); return NULL; }
-        kai_node_push(arm, body);
-        kai_node_push(m, arm);
-        skip_newlines_and_semis(p);
-    }
-    if (!expect(p, TK_RBRACE, "expected `}` to close match")) {
-        kai_free_node(m); return NULL;
-    }
-    return m;
-}
-
-static Node *parse_block(P *p) {
-    const Token *open = expect(p, TK_LBRACE, "expected `{`");
-    if (!open) return NULL;
-    Node *b = kai_new_node(N_BLOCK, open->line, open->col);
-    skip_newlines_and_semis(p);
-    Node *last_expr = NULL;
-    while (!at(p, TK_RBRACE) && !at(p, TK_EOF)) {
-        /* A block item is either a let/assert statement or an expression.
-           If we're on `let` or `assert`, it's a stmt; otherwise parse expr
-           then decide: if followed by newline-then-`}` or just `}`, it's
-           the final value; otherwise it's an expr-stmt. */
-        if (at(p, TK_LET) || at(p, TK_ASSERT)) {
-            Node *s = parse_stmt(p);
-            if (!s) { kai_free_node(b); return NULL; }
-            kai_node_push(b, s);
-        } else {
-            int line = peek_tok(p)->line, col = peek_tok(p)->col;
-            Node *e = parse_expr(p);
-            if (!e) { kai_free_node(b); return NULL; }
-            /* Determine if this is the final expression or a statement. */
-            /* Skip newlines/semis to see what follows. */
-            size_t save = p->i;
-            while (peek_kind(p) == TK_NEWLINE || peek_kind(p) == TK_SEMI) p->i++;
-            if (at(p, TK_RBRACE)) {
-                last_expr = e;
-                (void) line; (void) col;
-                break;
-            }
-            /* Not final — wrap as an expr statement. */
-            p->i = save;
-            Node *s = kai_new_node(N_EXPR_STMT, line, col);
-            kai_node_push(s, e);
-            kai_node_push(b, s);
-        }
-        skip_newlines_and_semis(p);
-    }
-    if (!expect(p, TK_RBRACE, "expected `}` to close block")) {
-        kai_free_node(b); return NULL;
-    }
-    if (last_expr) {
-        b->v.flags |= 0x1;
-        kai_node_push(b, last_expr);
-    } else {
-        /* Synthesize a trailing Unit value. */
-        Node *u = kai_new_node(N_UNIT, open->line, open->col);
-        kai_node_push(b, u);
-    }
-    return b;
-}
-
-/* ---------- patterns ---------- */
-
-/* Parse the body of a record pattern — the `field, field: subpat, ...`
-   sequence — appending an N_PAT_FIELD per field to `pr`. On entry the
-   opening `{` has already been consumed; on success the closing `}` has
-   been consumed too. Returns 1 on success, 0 on error (caller frees `pr`).
-   Shared by the bare `{...}` record pattern and the `Ctor{...}` form. */
-static int parse_record_pattern_fields(P *p, Node *pr) {
-    skip_newlines(p);
-    if (!at(p, TK_RBRACE)) {
-        for (;;) {
-            skip_newlines(p);
-            const Token *fn = expect(p, TK_IDENT, "expected field name in record pattern");
-            if (!fn) return 0;
-            Node *pf = kai_new_node(N_PAT_FIELD, fn->line, fn->col);
-            set_name_from_token(pf, fn, p->src);
-            if (match(p, TK_COLON)) {
-                Node *sub = parse_pattern(p);
-                if (!sub) { kai_free_node(pf); return 0; }
-                kai_node_push(pf, sub);
-            } else {
-                /* shorthand: bind field value to its own name */
-                pf->v.flags |= 0x1;
-                Node *bind = kai_new_node(N_PAT_BIND, fn->line, fn->col);
-                set_name_from_token(bind, fn, p->src);
-                kai_node_push(pf, bind);
-            }
-            kai_node_push(pr, pf);
-            skip_newlines(p);
-            if (!match(p, TK_COMMA)) break;
-        }
-    }
-    skip_newlines(p);
-    if (!expect(p, TK_RBRACE, "expected `}` in record pattern")) return 0;
-    return 1;
-}
-
-/* `[ p, ..., ...rest ]` list pattern. The `[` token `t` is for line/col;
-   on entry it has not yet been consumed. */
-static Node *parse_list_pattern(P *p, const Token *t) {
-    p->i++;
-    Node *pl = kai_new_node(N_PAT_LIST, t->line, t->col);
-    skip_newlines(p);
-    if (!at(p, TK_RBRACKET)) {
-        for (;;) {
-            skip_newlines(p);
-            if (match(p, TK_ELLIPSIS)) {
-                pl->v.flags |= 0x1;
-                const Token *rn = expect(p, TK_IDENT, "expected identifier after `...` in list pattern");
-                if (!rn) { kai_free_node(pl); return NULL; }
-                Node *b = kai_new_node(N_PAT_BIND, rn->line, rn->col);
-                set_name_from_token(b, rn, p->src);
-                kai_node_push(pl, b);
-                break; /* rest must be last */
-            }
-            Node *elt = parse_pattern(p);
-            if (!elt) { kai_free_node(pl); return NULL; }
-            kai_node_push(pl, elt);
-            skip_newlines(p);
-            if (!match(p, TK_COMMA)) break;
-        }
-    }
-    skip_newlines(p);
-    if (!expect(p, TK_RBRACKET, "expected `]` at end of list pattern")) {
-        kai_free_node(pl); return NULL;
-    }
-    return pl;
-}
-
-/* A literal pattern, including the `-number` negative-int form. `t` is the
-   first token; on entry it has not yet been consumed. */
-static Node *parse_lit_pattern(P *p, const Token *t) {
-    Node *lit;
-    if (t->kind == TK_MINUS) {
-        /* negative integer literal */
-        p->i++;
-        const Token *numtok = &p->toks[p->i++];
-        Node *num = kai_new_node(N_INT, numtok->line, numtok->col);
-        num->v.i = -decode_int(p->src + numtok->start, numtok->length);
-        num->name = p->src + numtok->start; num->name_len = numtok->length;
-        lit = num;
-    } else {
-        lit = parse_primary(p);
-        if (!lit) return NULL;
-    }
-    Node *pl = kai_new_node(N_PAT_LIT, t->line, t->col);
-    kai_node_push(pl, lit);
-    return pl;
-}
-
-/* True when `t` opens a literal pattern. */
-static int starts_lit_pattern(P *p, const Token *t) {
-    if (t->kind == TK_INT || t->kind == TK_REAL || t->kind == TK_CHAR ||
-        t->kind == TK_STRING || t->kind == TK_TRUE || t->kind == TK_FALSE)
-        return 1;
-    return t->kind == TK_MINUS && peek_kind_n(p, 1) == TK_INT;
-}
-
-/* Parse `Ctor(sub, ...)` variant args into `pv`. The `(` has not yet been
-   consumed. Returns 1 on success, 0 on error (caller frees `pv`). */
-static int parse_variant_pattern_args(P *p, Node *pv) {
-    p->i++;
-    skip_newlines(p);
-    if (!at(p, TK_RPAREN)) {
-        for (;;) {
-            skip_newlines(p);
-            Node *sub = parse_pattern(p);
-            if (!sub) return 0;
-            kai_node_push(pv, sub);
-            skip_newlines(p);
-            if (!match(p, TK_COMMA)) break;
-        }
-    }
-    skip_newlines(p);
-    if (!expect(p, TK_RPAREN, "expected `)` to close variant pattern")) return 0;
-    return 1;
-}
-
-/* An IDENT-led pattern: Ctor(...), Ctor{...}, bare Ctor (0-arg variant), or
-   a plain binding. The leading IDENT has not yet been consumed. */
-static Node *parse_ident_pattern(P *p) {
-    const Token *id = &p->toks[p->i++];
-    int upper = is_uppercase_ident(id, p->src);
-    if (upper && at(p, TK_LPAREN)) {
-        Node *pv = kai_new_node(N_PAT_VARIANT, id->line, id->col);
-        set_name_from_token(pv, id, p->src);
-        if (!parse_variant_pattern_args(p, pv)) { kai_free_node(pv); return NULL; }
-        return pv;
-    }
-    if (upper && at(p, TK_LBRACE)) {
-        /* Variant-record: an N_PAT_RECORD attached to the ctor name via
-           N_PAT_VARIANT (carrying the record as its sole child). */
-        p->i++;
-        Node *pr = kai_new_node(N_PAT_RECORD, id->line, id->col);
-        if (!parse_record_pattern_fields(p, pr)) { kai_free_node(pr); return NULL; }
-        Node *pv = kai_new_node(N_PAT_VARIANT, id->line, id->col);
-        set_name_from_token(pv, id, p->src);
-        kai_node_push(pv, pr);
-        return pv;
-    }
-    if (upper) {
-        /* Bare constructor name: 0-arg variant. */
-        Node *pv = kai_new_node(N_PAT_VARIANT, id->line, id->col);
-        set_name_from_token(pv, id, p->src);
-        return pv;
-    }
-    /* Plain identifier binding. */
-    Node *b = kai_new_node(N_PAT_BIND, id->line, id->col);
-    set_name_from_token(b, id, p->src);
-    return b;
-}
-
-static Node *parse_pattern(P *p) {
-    const Token *t = peek_tok(p);
-
-    if (t->kind == TK_UNDERSCORE) {
-        p->i++;
-        return kai_new_node(N_PAT_WILD, t->line, t->col);
-    }
-    if (t->kind == TK_LBRACKET) return parse_list_pattern(p, t);
-    if (starts_lit_pattern(p, t)) return parse_lit_pattern(p, t);
-    if (t->kind == TK_IDENT)    return parse_ident_pattern(p);
-    if (t->kind == TK_LBRACE) {
-        /* Pure record pattern without ctor. */
-        p->i++;
-        Node *pr = kai_new_node(N_PAT_RECORD, t->line, t->col);
-        if (!parse_record_pattern_fields(p, pr)) { kai_free_node(pr); return NULL; }
-        return pr;
-    }
-
-    error_here(p, "expected pattern");
-    return NULL;
-}

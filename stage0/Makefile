@@ -5,7 +5,7 @@ CFLAGS  ?= -std=c99 -Wall -Wextra -Wpedantic -g -O0
 # libSystem already exposes those symbols. Trailed at the end of
 # every $(CC) compile-and-link line that consumes runtime.h.
 LDLIBS_M := -lm
-SRCS    := main.c lexer.c ast.c parser.c check.c emit.c
+SRCS    := main.c lexer.c ast.c parser.c parser_expr.c check.c emit.c
 OBJS    := $(SRCS:.c=.o)
 TARGET  := kaic0
 
