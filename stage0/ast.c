@@ -41,68 +41,79 @@ void kai_free_node(Node *n) {
     free(n);
 }
 
+/* Name table indexed by NodeKind. Designated initializers keep entries
+   pinned to their enum value, so reordering the enum cannot desync this
+   table. The _Static_assert below fails the build if a new kind is added
+   without a matching row here (NODE_NAMES would grow past N_KIND_COUNT or
+   leave a hole that trips the assert). */
+static const char *const NODE_NAMES[] = {
+    [N_PROGRAM]     = "program",
+    [N_FN]          = "fn",
+    [N_PARAM]       = "param",
+    [N_TYPE_DECL]   = "type_decl",
+    [N_TEST]        = "test",
+    [N_IMPORT]      = "import",
+
+    [N_TY_NAME]     = "ty_name",
+    [N_TY_LIST]     = "ty_list",
+    [N_TY_FN]       = "ty_fn",
+    [N_TY_RECORD]   = "ty_record",
+    [N_TY_SUM]      = "ty_sum",
+    [N_TY_ALIAS]    = "ty_alias",
+    [N_TY_INFER]    = "ty_infer",
+    [N_FIELD_DECL]  = "field_decl",
+    [N_VARIANT]     = "variant",
+
+    [N_LET]         = "let",
+    [N_ASSERT]      = "assert",
+    [N_EXPR_STMT]   = "expr_stmt",
+
+    [N_INT]         = "int",
+    [N_REAL]        = "real",
+    [N_CHAR]        = "char",
+    [N_STRING]      = "string",
+    [N_BOOL]        = "bool",
+    [N_UNIT]        = "unit",
+    [N_IDENT]       = "ident",
+    [N_PLACEHOLDER] = "placeholder",
+
+    [N_CALL]        = "call",
+    [N_FIELD]       = "field",
+    [N_INDEX]       = "index",
+    [N_BINOP]       = "binop",
+    [N_UNOP]        = "unop",
+
+    [N_IF]          = "if",
+    [N_MATCH]       = "match",
+    [N_ARM]         = "arm",
+    [N_LAMBDA]      = "lambda",
+
+    [N_RECORD_LIT]  = "record_lit",
+    [N_FIELD_INIT]  = "field_init",
+    [N_LIST_LIT]    = "list_lit",
+    [N_RANGE_LIT]   = "range_lit",
+    [N_SPREAD]      = "spread",
+    [N_PIPE]        = "pipe",
+    [N_BLOCK]       = "block",
+
+    [N_PAT_WILD]    = "pat_wild",
+    [N_PAT_LIT]     = "pat_lit",
+    [N_PAT_BIND]    = "pat_bind",
+    [N_PAT_LIST]    = "pat_list",
+    [N_PAT_VARIANT] = "pat_variant",
+    [N_PAT_RECORD]  = "pat_record",
+    [N_PAT_FIELD]   = "pat_field",
+};
+
+/* One row per NodeKind: the table must cover the whole enum exactly.
+   C99-portable static assert (no C11 _Static_assert) — a negative-size
+   array typedef fails the build if NODE_NAMES drifts from NodeKind. */
+typedef char node_names_in_sync[
+    (sizeof(NODE_NAMES) / sizeof(NODE_NAMES[0]) == N_KIND_COUNT) ? 1 : -1];
+
 const char *nk_name(NodeKind k) {
-    switch (k) {
-        case N_PROGRAM:     return "program";
-        case N_FN:          return "fn";
-        case N_PARAM:       return "param";
-        case N_TYPE_DECL:   return "type_decl";
-        case N_TEST:        return "test";
-        case N_IMPORT:      return "import";
-
-        case N_TY_NAME:     return "ty_name";
-        case N_TY_LIST:     return "ty_list";
-        case N_TY_FN:       return "ty_fn";
-        case N_TY_RECORD:   return "ty_record";
-        case N_TY_SUM:      return "ty_sum";
-        case N_TY_ALIAS:    return "ty_alias";
-        case N_TY_INFER:    return "ty_infer";
-        case N_FIELD_DECL:  return "field_decl";
-        case N_VARIANT:     return "variant";
-
-        case N_LET:         return "let";
-        case N_ASSERT:      return "assert";
-        case N_EXPR_STMT:   return "expr_stmt";
-
-        case N_INT:         return "int";
-        case N_REAL:        return "real";
-        case N_CHAR:        return "char";
-        case N_STRING:      return "string";
-        case N_BOOL:        return "bool";
-        case N_UNIT:        return "unit";
-        case N_IDENT:       return "ident";
-        case N_PLACEHOLDER: return "placeholder";
-
-        case N_CALL:        return "call";
-        case N_FIELD:       return "field";
-        case N_INDEX:       return "index";
-        case N_BINOP:       return "binop";
-        case N_UNOP:        return "unop";
-
-        case N_IF:          return "if";
-        case N_MATCH:       return "match";
-        case N_ARM:         return "arm";
-        case N_LAMBDA:      return "lambda";
-
-        case N_RECORD_LIT:  return "record_lit";
-        case N_FIELD_INIT:  return "field_init";
-        case N_LIST_LIT:    return "list_lit";
-        case N_RANGE_LIT:   return "range_lit";
-        case N_SPREAD:      return "spread";
-        case N_PIPE:        return "pipe";
-        case N_BLOCK:       return "block";
-
-        case N_PAT_WILD:    return "pat_wild";
-        case N_PAT_LIT:     return "pat_lit";
-        case N_PAT_BIND:    return "pat_bind";
-        case N_PAT_LIST:    return "pat_list";
-        case N_PAT_VARIANT: return "pat_variant";
-        case N_PAT_RECORD:  return "pat_record";
-        case N_PAT_FIELD:   return "pat_field";
-
-        case N_KIND_COUNT:  return "?";
-    }
-    return "?";
+    if (k < 0 || k >= N_KIND_COUNT || !NODE_NAMES[k]) return "?";
+    return NODE_NAMES[k];
 }
 
 static void dump_indent(int depth) { for (int i = 0; i < depth; ++i) fputs("  ", stdout); }

@@ -450,65 +450,77 @@ const char *kai_lex_error_message(size_t idx) {
     return NULL;
 }
 
+/* Name table indexed by TokenKind. Designated initializers pin each entry
+   to its enum value, so reordering TokenKind cannot desync this table.
+   The static assert below fails the build if the enum grows past the last
+   covered value without a matching row. */
+static const char *const TOKEN_NAMES[] = {
+    [TK_EOF]         = "EOF",
+    [TK_NEWLINE]     = "NEWLINE",
+    [TK_AND]         = "and",
+    [TK_AS]          = "as",
+    [TK_ASSERT]      = "assert",
+    [TK_ELSE]        = "else",
+    [TK_FALSE]       = "false",
+    [TK_FN]          = "fn",
+    [TK_IF]          = "if",
+    [TK_IMPORT]      = "import",
+    [TK_LET]         = "let",
+    [TK_MATCH]       = "match",
+    [TK_NOT]         = "not",
+    [TK_OR]          = "or",
+    [TK_PUB]         = "pub",
+    [TK_TEST]        = "test",
+    [TK_TRUE]        = "true",
+    [TK_TYPE]        = "type",
+    [TK_INT]         = "INT",
+    [TK_REAL]        = "REAL",
+    [TK_CHAR]        = "CHAR",
+    [TK_STRING]      = "STRING",
+    [TK_IDENT]       = "IDENT",
+    [TK_UNDERSCORE]  = "_",
+    [TK_LPAREN]      = "(",
+    [TK_RPAREN]      = ")",
+    [TK_LBRACKET]    = "[",
+    [TK_RBRACKET]    = "]",
+    [TK_LBRACE]      = "{",
+    [TK_RBRACE]      = "}",
+    [TK_COMMA]       = ",",
+    [TK_COLON]       = ":",
+    [TK_SEMI]        = ";",
+    [TK_DOT]         = ".",
+    [TK_DOTDOT]      = "..",
+    [TK_ELLIPSIS]    = "...",
+    [TK_EQ]          = "=",
+    [TK_ARROW]       = "->",
+    [TK_FAT_ARROW]   = "=>",
+    [TK_PIPE]        = "|",
+    [TK_PIPE_APPLY]  = "|>",
+    [TK_PLUS]        = "+",
+    [TK_MINUS]       = "-",
+    [TK_STAR]        = "*",
+    [TK_SLASH]       = "/",
+    [TK_SLASH_SLASH] = "//",
+    [TK_PERCENT]     = "%",
+    [TK_EQEQ]        = "==",
+    [TK_NEQ]         = "!=",
+    [TK_LT]          = "<",
+    [TK_GT]          = ">",
+    [TK_LE]          = "<=",
+    [TK_GE]          = ">=",
+    [TK_BANG]        = "!",
+    [TK_ERROR]       = "ERROR",
+};
+
+/* One row per TokenKind: the table must cover the enum through TK_ERROR.
+   C99-portable static assert (no C11 _Static_assert) — a negative-size
+   array typedef fails the build if TOKEN_NAMES drifts from TokenKind. */
+typedef char token_names_in_sync[
+    (sizeof(TOKEN_NAMES) / sizeof(TOKEN_NAMES[0]) == TK_ERROR + 1) ? 1 : -1];
+
 const char *tk_name(TokenKind k) {
-    switch (k) {
-        case TK_EOF:         return "EOF";
-        case TK_NEWLINE:     return "NEWLINE";
-        case TK_AND:         return "and";
-        case TK_AS:          return "as";
-        case TK_ASSERT:      return "assert";
-        case TK_ELSE:        return "else";
-        case TK_FALSE:       return "false";
-        case TK_FN:          return "fn";
-        case TK_IF:          return "if";
-        case TK_IMPORT:      return "import";
-        case TK_LET:         return "let";
-        case TK_MATCH:       return "match";
-        case TK_NOT:         return "not";
-        case TK_OR:          return "or";
-        case TK_PUB:         return "pub";
-        case TK_TEST:        return "test";
-        case TK_TRUE:        return "true";
-        case TK_TYPE:        return "type";
-        case TK_INT:         return "INT";
-        case TK_REAL:        return "REAL";
-        case TK_CHAR:        return "CHAR";
-        case TK_STRING:      return "STRING";
-        case TK_IDENT:       return "IDENT";
-        case TK_UNDERSCORE:  return "_";
-        case TK_LPAREN:      return "(";
-        case TK_RPAREN:      return ")";
-        case TK_LBRACKET:    return "[";
-        case TK_RBRACKET:    return "]";
-        case TK_LBRACE:      return "{";
-        case TK_RBRACE:      return "}";
-        case TK_COMMA:       return ",";
-        case TK_COLON:       return ":";
-        case TK_SEMI:        return ";";
-        case TK_DOT:         return ".";
-        case TK_DOTDOT:      return "..";
-        case TK_ELLIPSIS:    return "...";
-        case TK_EQ:          return "=";
-        case TK_ARROW:       return "->";
-        case TK_FAT_ARROW:   return "=>";
-        case TK_PIPE:        return "|";
-        case TK_PIPE_APPLY:  return "|>";
-        case TK_PLUS:        return "+";
-        case TK_MINUS:       return "-";
-        case TK_STAR:        return "*";
-        case TK_SLASH:       return "/";
-        case TK_SLASH_SLASH: return "//";
-        case TK_PERCENT:     return "%";
-        case TK_EQEQ:        return "==";
-        case TK_NEQ:         return "!=";
-        case TK_LT:          return "<";
-        case TK_GT:          return ">";
-        case TK_LE:          return "<=";
-        case TK_GE:          return ">=";
-        case TK_BANG:        return "!";
-        case TK_ERROR:       return "ERROR";
-    }
-    return "?";
+    if (k < 0 || k > TK_ERROR || !TOKEN_NAMES[k]) return "?";
+    return TOKEN_NAMES[k];
 }
 
 void kai_lex_dump(const char *file, const char *src, const Token *toks, size_t n) {
