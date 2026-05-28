@@ -84,6 +84,39 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.85.0 (2026-05-27)
+
+### Added
+
+- **runtime**: string_hash + real_bits builtins, wrapping Int arithmetic (refs #373)
+- **emit**: scalar function signatures in the LLVM backend (closes #718, refs #622)
+- **runtime**: add kaix_default_* forwarders for File/Stdin/Process/Env/Signal (refs #622)
+- **emit**: implement TCO in the LLVM backend via tcrec sentinel (closes #706)
+
+### Fixed
+
+- **stdlib**: correct Hashable — string_hash, Real impl, multiplicative variant mix (closes #373, refs #374)
+- **typer**: resolve shared protocol op-names by receiver type (closes #546)
+- **emit**: borrow check-clause params under Perceus so string-op bodies don't SIGTRAP (closes #697)
+- **desugar**: @cap inside string interpolation resolves in the enclosing scope (closes #672)
+- **runtime**: honor variant slot_mask in kaix_variant_arg under LLVM (refs #622)
+- **emit**: install Cancel pad + unwind on continuation-discard under LLVM (refs #622)
+- **emit**: correct clause-capture env rebind + continuation resume under LLVM (refs #622)
+- **emit**: resolve @var to the correct State evidence frame under LLVM (refs #622)
+- **runtime**: add kaix_evidence_lookup_node_by_id LLVM mirror (refs #622)
+- **emit**: re-root nested record sub-patterns in LLVM destructuring (refs #622)
+- **emit**: install File/Stdin/Process + user-effect default handlers under LLVM (parity lane B, refs #622)
+- **emit**: drop outgoing param-slot value on LLVM TCO back-edge (closes #709)
+- **emit**: decode \xNN hex escapes in LLVM string literals (closes #618, refs #622)
+- **perceus**: walk UFn fn bodies so boxed locals keep dup/drop discipline (closes #703)
+- **emit**: dedup @eff.disp.name globals across emit phases
+- **emit**: reuse phi references nonexistent entry block
+
+### Changed
+
+- **build**: compile kaic2 at -O2 (2.4x faster self-compile)
+- **emit**: single-source the tcrec sentinel wire format in emit_shared
+
 ## v0.84.0 (2026-05-25)
 
 ### Added
