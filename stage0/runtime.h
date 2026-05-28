@@ -2436,6 +2436,45 @@ typedef struct {
 static KaiImmortalVarBucket
     kai_immortal_vars[KAI_IMMORTAL_VAR_BUCKETS];
 
+/* Reusable-tag registry (issue #118 layer 3) — the immortal-args
+ * cache above immortalises any variant whose slots are all immortal,
+ * on the #293 premise that such a cell "can never be mutated and has
+ * no observable identity". That premise is FALSE for any tag the
+ * program rewrites in place via a Perceus reuse-arm: `mirror`/`rotate`
+ * over a `Tree` whose leaves are immortal `TLeaf` + interned strings
+ * would immortalise every node (rc=INT32_MAX), and `kai_check_unique`
+ * then rejects them — reuse-in-place never fires and the structure
+ * leaks wholesale.
+ *
+ * The compiler's Perceus recogniser already knows exactly which tags
+ * are reuse targets (it emits `kai_reuse_or_alloc_variant` for them).
+ * It stamps that set here at startup via `kai_register_reusable_tags`.
+ * `kai_variant_u` consults the set and skips immortalisation for a
+ * reusable tag, leaving its cells with a real refcount so reuse can
+ * fire. Some/Ok/AST-`Expr` (no reuse-arm) keep the #293 win intact;
+ * only the tags the program actually mutates leave the cache.
+ *
+ * Storage — a bitset indexed by tag. Tags are dense small ints
+ * assigned by the emitter; 1<<16 covers every realistic program with
+ * a single 8 KiB static array. Out-of-range tags (defensive) are
+ * treated as non-reusable, i.e. cacheable as before. */
+#define KAI_REUSABLE_TAG_MAX 65536
+static unsigned char kai_reusable_tag_bits[KAI_REUSABLE_TAG_MAX / 8];
+
+static void kai_register_reusable_tags(const int32_t *tags, int n) {
+    for (int i = 0; i < n; i++) {
+        int32_t t = tags[i];
+        if (t >= 0 && t < KAI_REUSABLE_TAG_MAX) {
+            kai_reusable_tag_bits[t >> 3] |= (unsigned char) (1u << (t & 7));
+        }
+    }
+}
+
+static inline int kai_tag_is_reusable(int32_t tag) {
+    if (tag < 0 || tag >= KAI_REUSABLE_TAG_MAX) return 0;
+    return (kai_reusable_tag_bits[tag >> 3] >> (tag & 7)) & 1;
+}
+
 /* Issue #688 — single variant constructor.
  *
  * `kai_variant_u` is the only entry point for KAI_VARIANT construction.
@@ -2538,8 +2577,15 @@ static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
     /* Immortal-args fast path — only when every slot is a boxed pointer
      * (mask == 0) and every pointer is itself immortal. Cells with
      * primitive slots are not cached: their identity is the bit
-     * pattern, which the existing cache shape does not key on. */
-    if (mask == 0 && name != NULL && kai_slots_all_immortal_ptr(n, slots)) {
+     * pattern, which the existing cache shape does not key on.
+     *
+     * Issue #118 layer 3 — a tag the program rewrites in place (reuse
+     * target) is excluded: immortalising it would saturate its rc and
+     * permanently block `kai_check_unique`, killing reuse-in-place on
+     * every cell of that type. The reusable-tag bitset is stamped at
+     * startup by the compiler's Perceus recogniser. */
+    if (mask == 0 && name != NULL && !kai_tag_is_reusable(tag) &&
+        kai_slots_all_immortal_ptr(n, slots)) {
         KaiValue *cached = kai_immortal_slot_lookup(tag, name, n, slots);
         if (cached) return cached;
         KAI_VAR_NAME_REAL_ALLOC(name);

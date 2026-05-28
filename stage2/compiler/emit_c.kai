@@ -231,6 +231,162 @@ pub fn report_ambig_efns(amb: [AmbigEntry], used: [String]) : Unit / Console = m
 # Module-origin filtering happens at the caller (only root decls are
 # walked), so this returns the nameset for the active root file alone.
 #[doc("issue #243: collect the set of bare-name callees used in the root file's decls. A 'bare-name callee' is `ECall(callee, _)` where the callee node is `EVar(name)` — i.e. an…")]
+# issue #118 layer 3 — collect the constructor names that the Perceus
+# recogniser turned into reuse targets, i.e. every `ctor` appearing as
+# the second argument of a synthesised `__perceus_reuse_variant(_scr,
+# ctor(args...))`. The emitter maps these names to tags and stamps the
+# runtime reusable-tag bitset so `kai_variant_u` stops immortalising
+# them (which would saturate their rc and block reuse-in-place). Runs
+# over the post-Perceus AST inside `emit_program`.
+pub fn collect_reuse_ctors(decls: [Decl], acc: [String]) : [String] = match decls {
+  []           -> acc
+  [d, ...rest] -> collect_reuse_ctors(rest, collect_reuse_ctors_decl(d, acc))
+}
+
+fn collect_reuse_ctors_decl(d: Decl, acc: [String]) : [String] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> walk_reuse_ctors(body, acc)
+  DTest(_, body, _, _)     -> walk_reuse_ctors(body, acc)
+  DBench(_, body, _, _)    -> walk_reuse_ctors(body, acc)
+  DCheck(_, _, body, _, _) -> walk_reuse_ctors(body, acc)
+  _ -> acc
+}
+
+# Pull the ctor name out of a `__perceus_reuse_variant`'s second arg,
+# which is `ECall(EVar(ctor) | EModCall(_, ctor), _)`. None for any
+# other shape.
+fn reuse_ctor_name(ctor: Expr) : Option[String] = match ctor.kind {
+  ECall(cf, _) -> match cf.kind {
+    EVar(cname)        -> Some(cname)
+    EModCall(_, cname) -> Some(cname)
+    _                  -> None
+  }
+  _ -> None
+}
+
+fn walk_reuse_ctors(e: Expr, acc: [String]) : [String] = {
+  # Detect the reuse-variant call shape at this node, then recurse via
+  # the shared `walk_bare_callees` traversal for the sub-expressions.
+  # We reuse the existing full ExprKind walker to descend; it already
+  # visits every child, and the only node we care about adds a name.
+  let acc1 = match e.kind {
+    ECall(callee, args_) -> match callee.kind {
+      EVar(nm) ->
+        if nm == "__perceus_reuse_variant" {
+          match args_ {
+            [_scr, ctor] -> match reuse_ctor_name(ctor) {
+              Some(cn) -> if list_has(acc, cn) { acc } else { [cn, ...acc] }
+              None     -> acc
+            }
+            _ -> acc
+          }
+        } else { acc }
+      _ -> acc
+    }
+    _ -> acc
+  }
+  walk_reuse_ctors_children(e.kind, acc1)
+}
+
+# Descend into every child expression. Mirrors `walk_bare_callees`'s
+# structural recursion but invokes `walk_reuse_ctors` so the reuse-call
+# detection fires at every level.
+fn walk_reuse_ctors_children(k: ExprKind, acc: [String]) : [String] = match k {
+  ECall(callee, args_) -> walk_reuse_ctors_list(args_, walk_reuse_ctors(callee, acc))
+  EIntrinsic(_, args_)  -> walk_reuse_ctors_list(args_, acc)
+  EField(base, _)       -> walk_reuse_ctors(base, acc)
+  EIndex(a, b)          -> walk_reuse_ctors(b, walk_reuse_ctors(a, acc))
+  EBinop(_, a, b)       -> walk_reuse_ctors(b, walk_reuse_ctors(a, acc))
+  EUnop(_, x)           -> walk_reuse_ctors(x, acc)
+  EIf(c, t, eo)         -> {
+    let a1 = walk_reuse_ctors(t, walk_reuse_ctors(c, acc))
+    match eo { Some(b) -> walk_reuse_ctors(b, a1) None -> a1 }
+  }
+  EMatch(scr, arms)     -> walk_reuse_ctors_arms(arms, walk_reuse_ctors(scr, acc))
+  ELambda(_, body)      -> walk_reuse_ctors(body, acc)
+  ERecordLit(_, fs)     -> walk_reuse_ctors_fields(fs, acc)
+  EList(els)            -> walk_reuse_ctors_elems(els, acc)
+  ERange(a, b, opt)     -> {
+    let a1 = walk_reuse_ctors(b, walk_reuse_ctors(a, acc))
+    match opt { Some(s) -> walk_reuse_ctors(s, a1) None -> a1 }
+  }
+  EBlock(stmts, tail)   -> {
+    let a1 = walk_reuse_ctors_stmts(stmts, acc)
+    match tail { Some(t) -> walk_reuse_ctors(t, a1) None -> a1 }
+  }
+  EPipe(a, b)           -> walk_reuse_ctors(b, walk_reuse_ctors(a, acc))
+  EMapPipe(a, b)        -> walk_reuse_ctors(b, walk_reuse_ctors(a, acc))
+  EFlatMapPipe(a, b)    -> walk_reuse_ctors(b, walk_reuse_ctors(a, acc))
+  EFilterPipe(a, b)     -> walk_reuse_ctors(b, walk_reuse_ctors(a, acc))
+  EBang(inner)          -> walk_reuse_ctors(inner, acc)
+  ELitUnit(inner, _)    -> walk_reuse_ctors(inner, acc)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    let a1 = walk_reuse_ctors(body, acc)
+    let a2 = match init_opt { Some(i) -> walk_reuse_ctors(i, a1) None -> a1 }
+    let a3 = walk_reuse_ctors_clauses(clauses, a2)
+    match ret_opt {
+      Some(r) -> match r { HR(_, b, _, _) -> walk_reuse_ctors(b, a3) }
+      None    -> a3
+    }
+  }
+  _ -> acc
+}
+
+fn walk_reuse_ctors_list(es: [Expr], acc: [String]) : [String] = match es {
+  []           -> acc
+  [h, ...rest] -> walk_reuse_ctors_list(rest, walk_reuse_ctors(h, acc))
+}
+
+fn walk_reuse_ctors_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []           -> acc
+  [a, ...rest] -> match a {
+    Arm(_, opt_guard, body) -> {
+      let a1 = match opt_guard { Some(g) -> walk_reuse_ctors(g, acc) None -> acc }
+      walk_reuse_ctors_arms(rest, walk_reuse_ctors(body, a1))
+    }
+  }
+}
+
+fn walk_reuse_ctors_fields(fs: [FieldInit], acc: [String]) : [String] = match fs {
+  []           -> acc
+  [f, ...rest] -> match f {
+    FI(_, e) -> walk_reuse_ctors_fields(rest, walk_reuse_ctors(e, acc))
+  }
+}
+
+fn walk_reuse_ctors_elems(els: [ListElem], acc: [String]) : [String] = match els {
+  []           -> acc
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> walk_reuse_ctors_elems(rest, walk_reuse_ctors(e, acc))
+    ElSpread(e) -> walk_reuse_ctors_elems(rest, walk_reuse_ctors(e, acc))
+  }
+}
+
+fn walk_reuse_ctors_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+  []           -> acc
+  [s, ...rest] -> match s {
+    SLet(_, _, e)        -> walk_reuse_ctors_stmts(rest, walk_reuse_ctors(e, acc))
+    SVar(_, _, e, _, _)  -> walk_reuse_ctors_stmts(rest, walk_reuse_ctors(e, acc))
+    SAssert(e, og)       -> {
+      let a1 = walk_reuse_ctors(e, acc)
+      let a2 = match og { Some(g) -> walk_reuse_ctors(g, a1) None -> a1 }
+      walk_reuse_ctors_stmts(rest, a2)
+    }
+    SExprStmt(e)         -> walk_reuse_ctors_stmts(rest, walk_reuse_ctors(e, acc))
+    SIndexAssign(a, b, c, _, _) -> {
+      let a1 = walk_reuse_ctors(c, walk_reuse_ctors(b, walk_reuse_ctors(a, acc)))
+      walk_reuse_ctors_stmts(rest, a1)
+    }
+    SUse(_, _, _)        -> walk_reuse_ctors_stmts(rest, acc)
+  }
+}
+
+fn walk_reuse_ctors_clauses(cs: [HClause], acc: [String]) : [String] = match cs {
+  []           -> acc
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> walk_reuse_ctors_clauses(rest, walk_reuse_ctors(body, acc))
+  }
+}
+
 pub fn collect_root_bare_callees(decls: [Decl], acc: [String]) : [String] = match decls {
   []           -> acc
   [d, ...rest] -> collect_root_bare_callees(rest, collect_root_bare_callees_decl(d, acc))
@@ -1247,6 +1403,53 @@ fn emit_variant_call_typed(name: String, args_e: [Expr], tys: [TypeExpr],
   }
 }
 
+# issue #118 — lower a `__perceus_reuse_variant` rebuild given the
+# constructor name + arg expressions. Shared by the `EVar` and
+# `EModCall` callee shapes (the resolver qualifies user ctors to the
+# latter). Typed-payload ctors (issue #440) still route to the
+# alloc-fresh `kai_variant_u`: `kai_reuse_or_alloc_variant` writes
+# `slots[i].ptr` and assumes `slot_mask == 0`, which would mismatch
+# the typed extract (`slots[i].i64`). Reuse-for-typed-cells is a
+# follow-up lane.
+fn emit_reuse_variant_body(src: String, cname: String, cargs: [Expr],
+                           lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String / Console {
+  let n = list_length(cargs)
+  let tys_opt = evar_payload_tys(variants, cname)
+  let has_prim = match tys_opt {
+    Some(ts) -> variant_has_primitive_slot(ts)
+    None     -> false
+  }
+  if has_prim {
+    match tys_opt {
+      Some(ts) -> {
+        let mask = variant_slot_mask(ts)
+        let slot_inits = emit_variant_slot_init_list(src, cargs, ts, lcs, fns, variants, lams, cls)
+        let tag_str = int_to_string(evar_find_tag(variants, cname))
+        concat_all([
+          "kai_variant_u(", tag_str, ", \"", cname, "\", ", int_to_string(n),
+          ", ", int_to_string(mask),
+          ", (KaiVarSlot[]){", slot_inits, "})"
+        ])
+      }
+      None -> "kai_unit() /* __perceus_reuse_variant: typed lookup vanished */"
+    }
+  } else if n == 0 {
+    let tag_str = int_to_string(evar_find_tag(variants, cname))
+    concat_all([
+      "kai_reuse_or_alloc_variant(_scr, ", tag_str, ", \"", cname,
+      "\", 0, 0, NULL)"
+    ])
+  } else {
+    let slot_strs = emit_call_args_slots(src, cargs, lcs, fns, variants, lams, cls)
+    let tag_str = int_to_string(evar_find_tag(variants, cname))
+    concat_all([
+      "kai_reuse_or_alloc_variant(_scr, ", tag_str, ", \"", cname,
+      "\", ", int_to_string(n),
+      ", 0, (KaiVarSlot[]){", slot_strs, "})"
+    ])
+  }
+}
+
 fn emit_call_expr(src: String, f: Expr, args_e: [Expr], lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo]) : String / Console {
 
   # Phase 3 unboxing — when the callee resolves to a UFn (raw C
@@ -1448,47 +1651,16 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], lcs: [String], f
         # cells extension is a follow-up lane.
         match args_e {
           [_scr, ctor] -> match ctor.kind {
+            # The recogniser may hand the ctor either as a bare
+            # `EVar(cname)` (pre-resolution shape) or — the common
+            # case after the resolver qualifies user constructors —
+            # as `EModCall(tycon, cname)`. Both lower identically;
+            # `emit_reuse_variant_body` shares the slot logic.
             ECall(cf, cargs) -> match cf.kind {
-              EVar(cname) -> {
-                let n = list_length(cargs)
-                let tys_opt = evar_payload_tys(variants, cname)
-                let has_prim = match tys_opt {
-                  Some(ts) -> variant_has_primitive_slot(ts)
-                  None     -> false
-                }
-                if has_prim {
-                  # Force the typed alloc-fresh path. Mirrors
-                  # `emit_variant_call_typed` but with the existing
-                  # `cargs` already in expression form.
-                  match tys_opt {
-                    Some(ts) -> {
-                      let mask = variant_slot_mask(ts)
-                      let slot_inits = emit_variant_slot_init_list(src, cargs, ts, lcs, fns, variants, lams, cls)
-                      let tag_str = int_to_string(evar_find_tag(variants, cname))
-                      concat_all([
-                        "kai_variant_u(", tag_str, ", \"", cname, "\", ", int_to_string(n),
-                        ", ", int_to_string(mask),
-                        ", (KaiVarSlot[]){", slot_inits, "})"
-                      ])
-                    }
-                    None -> "kai_unit() /* __perceus_reuse_variant: typed lookup vanished */"
-                  }
-                } else if n == 0 {
-                  let tag_str = int_to_string(evar_find_tag(variants, cname))
-                  concat_all([
-                    "kai_reuse_or_alloc_variant(_scr, ", tag_str, ", \"", cname,
-                    "\", 0, 0, NULL)"
-                  ])
-                } else {
-                  let slot_strs = emit_call_args_slots(src, cargs, lcs, fns, variants, lams, cls)
-                  let tag_str = int_to_string(evar_find_tag(variants, cname))
-                  concat_all([
-                    "kai_reuse_or_alloc_variant(_scr, ", tag_str, ", \"", cname,
-                    "\", ", int_to_string(n),
-                    ", 0, (KaiVarSlot[]){", slot_strs, "})"
-                  ])
-                }
-              }
+              EVar(cname) ->
+                emit_reuse_variant_body(src, cname, cargs, lcs, fns, variants, lams, cls)
+              EModCall(_mod, cname) ->
+                emit_reuse_variant_body(src, cname, cargs, lcs, fns, variants, lams, cls)
               _ -> "kai_unit() /* __perceus_reuse_variant: 2nd arg must be a variant constructor call */"
             }
             _ -> "kai_unit() /* __perceus_reuse_variant: 2nd arg must be a variant constructor call */"
@@ -5677,6 +5849,14 @@ fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar]) : String {
   let impl_arr  = emit_impl_table_array(impl_rows)
   let v2h_arr   = emit_variant_to_head_array(v2h)
   let fwds      = emit_pimpl_forwards(impl_rows, [])
+  # issue #118 layer 3 — reusable-tag registry. Collect ctor names the
+  # Perceus recogniser marked as reuse targets, map them to tags, and
+  # stamp the runtime bitset so `kai_variant_u` skips immortalising
+  # those cells (immortalisation saturates rc and blocks reuse).
+  let reuse_ctors = collect_reuse_ctors(decls, [])
+  let reuse_tags  = reuse_ctor_tags(reuse_ctors, variants, [])
+  let n_reuse     = list_length(reuse_tags)
+  let reuse_arr   = emit_reuse_tag_array(reuse_tags)
   concat_all([
     fwds,
     "static const int32_t _kai_variant_to_head_tbl[] = {",
@@ -5685,13 +5865,43 @@ fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar]) : String {
     "static const KaiImplEntry _kai_impl_table_entries[] = {",
     impl_arr,
     "};\n",
+    "static const int32_t _kai_reusable_tags_tbl[] = {",
+    reuse_arr,
+    "};\n",
     "static void _kai_register_proto_tables(void) {\n",
     "    kai_register_variant_heads(_kai_variant_to_head_tbl, ",
     int_to_string(n_v2h), ");\n",
     "    kai_register_impls(_kai_impl_table_entries, ",
     int_to_string(n_impl), ");\n",
+    "    kai_register_reusable_tags(_kai_reusable_tags_tbl, ",
+    int_to_string(n_reuse), ");\n",
     "}\n\n"
   ])
+}
+
+# Map reuse-target ctor names to their integer tags via the global
+# EVar table. Names with no tag (defensive — should not happen for a
+# recognised ctor) are dropped.
+fn reuse_ctor_tags(names: [String], variants: [EVar], acc: [Int]) : [Int] = match names {
+  []           -> acc
+  [n, ...rest] -> match evar_find_tag_opt(variants, n) {
+    Some(t) -> reuse_ctor_tags(rest, variants, [t, ...acc])
+    None    -> reuse_ctor_tags(rest, variants, acc)
+  }
+}
+
+# A zero-length array initialiser is illegal in C99, so emit a single
+# `-1` sentinel when no reuse ctors exist. `kai_register_reusable_tags`
+# is then called with n=0 and never reads the slot; and even if it did,
+# `-1` is out of range and ignored.
+fn emit_reuse_tag_array(tags: [Int]) : String = match tags {
+  []           -> "-1"
+  [t, ...rest] -> concat_all([int_to_string(t), ", ", emit_reuse_tag_array_loop(rest)])
+}
+
+fn emit_reuse_tag_array_loop(tags: [Int]) : String = match tags {
+  []           -> ""
+  [t, ...rest] -> concat_all([int_to_string(t), ", ", emit_reuse_tag_array_loop(rest)])
 }
 
 fn emit_impl_table_array(rows: [PimplRow]) : String =
