@@ -361,6 +361,23 @@ static void count_local_uses(E *e, Node *n, int in_lambda) {
     }
 }
 
+/* Scan a `#{...}` interpolation body. On entry `i` points just past the
+ * opening `#{`; advances `i` to the matching `}` (the one closing depth 0,
+ * tracking nested braces) or to `end` if unterminated, and returns the
+ * index where the expression text starts. Shared by the three places that
+ * walk interpolations: count_local_uses_in_string, collect_free_vars_in_string,
+ * and emit_string_expr. */
+static size_t scan_interp_expr(const char *src, size_t *i, size_t end) {
+    size_t expr_start = *i;
+    int depth = 1;
+    while (*i < end && depth > 0) {
+        if      (src[*i] == '{') depth++;
+        else if (src[*i] == '}') { depth--; if (depth == 0) break; }
+        ++(*i);
+    }
+    return expr_start;
+}
+
 /* Mirror of `collect_free_vars_in_string`: re-parse `#{...}` chunks
  * and walk them so identifiers referenced only from interpolations
  * are still counted against the binding they read. Keep in
@@ -375,13 +392,7 @@ static void count_local_uses_in_string(E *e, Node *s, int in_lambda) {
     while (i < end) {
         if (src[i] == '#' && i + 1 < end && src[i + 1] == '{') {
             i += 2;
-            size_t expr_start = i;
-            int depth = 1;
-            while (i < end && depth > 0) {
-                if      (src[i] == '{') depth++;
-                else if (src[i] == '}') { depth--; if (depth == 0) break; }
-                ++i;
-            }
+            size_t expr_start = scan_interp_expr(src, &i, end);
             size_t ntk = 0;
             Token *toks = kai_lex("<interp>", src + expr_start, i - expr_start, &ntk);
             Node *en = kai_parse_expr_standalone("<interp>", src + expr_start, toks, ntk);
@@ -673,13 +684,7 @@ static void collect_free_vars_in_string(E *e, Node *s, Node *lam, LamInfo *info)
     while (i < end) {
         if (src[i] == '#' && i + 1 < end && src[i + 1] == '{') {
             i += 2;
-            size_t expr_start = i;
-            int depth = 1;
-            while (i < end && depth > 0) {
-                if      (src[i] == '{') depth++;
-                else if (src[i] == '}') { depth--; if (depth == 0) break; }
-                ++i;
-            }
+            size_t expr_start = scan_interp_expr(src, &i, end);
             size_t ntk = 0;
             Token *toks = kai_lex("<interp>", src + expr_start, i - expr_start, &ntk);
             Node *en = kai_parse_expr_standalone("<interp>", src + expr_start, toks, ntk);
@@ -1315,13 +1320,7 @@ static void emit_string_expr(E *e, Node *s) {
                 n_parts++;
             }
             i += 2;
-            size_t expr_start = i;
-            int depth = 1;
-            while (i < end && depth > 0) {
-                if      (src[i] == '{') depth++;
-                else if (src[i] == '}') { depth--; if (depth == 0) break; }
-                ++i;
-            }
+            size_t expr_start = scan_interp_expr(src, &i, end);
             parts[n_parts].is_expr      = 1;
             parts[n_parts].expr_src     = src + expr_start;
             parts[n_parts].expr_src_len = i - expr_start;
