@@ -2927,7 +2927,21 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
         case KAI_CONS:
             return kai_op_eq(a->as.cons.head, b->as.cons.head) &&
                    kai_op_eq(a->as.cons.tail, b->as.cons.tail);
-        case KAI_VARIANT:
+        case KAI_VARIANT: {
+            /* Eq dispatch: if a's head type has a custom impl Eq, route to it
+             * before structural fallback. Covers root AND nested cases (this
+             * fires on every recursive descent into a field of this kind).
+             * kai_op_eq is NON-consuming, so we incref a/b for the impl (which
+             * consumes them) and do NOT decref here. */
+            int32_t _eq_head = kai_head_tag(a);
+            void *_eq_fn = kai_lookup_impl(KAI_PROTO_EQ, _eq_head);
+            if (_eq_fn) {
+                kai_incref(a); kai_incref(b);
+                KaiValue *_eq_r = ((KaiValue *(*)(KaiValue *, KaiValue *)) _eq_fn)(a, b);
+                int _eq_res = kai_op_truthy(_eq_r);
+                kai_decref(_eq_r);
+                return _eq_res;
+            }
             if (a->as.var.variant_tag != b->as.var.variant_tag) return 0;
             if (a->as.var.n_args != b->as.var.n_args) return 0;
             /* Phase 2: if either cell carries primitive slots, the
@@ -2954,12 +2968,28 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
                 }
             }
             return 1;
-        case KAI_RECORD:
+        }
+        case KAI_RECORD: {
+            /* Eq dispatch for records carrying a custom impl Eq. Records only
+             * get a dispatchable head_type_tag when stamped at construction
+             * (see LIMITATION in the handoff: nested record fields do not get
+             * a tag today). Root records reached via the resolver still work;
+             * this hook fires only when as.rec.head_type_tag is a real impl. */
+            int32_t _eq_head = kai_head_tag(a);
+            void *_eq_fn = kai_lookup_impl(KAI_PROTO_EQ, _eq_head);
+            if (_eq_fn) {
+                kai_incref(a); kai_incref(b);
+                KaiValue *_eq_r = ((KaiValue *(*)(KaiValue *, KaiValue *)) _eq_fn)(a, b);
+                int _eq_res = kai_op_truthy(_eq_r);
+                kai_decref(_eq_r);
+                return _eq_res;
+            }
             if (a->as.rec.n_fields != b->as.rec.n_fields) return 0;
             for (int i = 0; i < a->as.rec.n_fields; ++i) {
                 if (!kai_op_eq(a->as.rec.fields[i], b->as.rec.fields[i])) return 0;
             }
             return 1;
+        }
         case KAI_CLOSURE: return 0;      /* closures are not equatable */
         case KAI_ARRAY:   return 0;      /* arrays are opaque, identity-compared */
         case KAI_REF:     return 0;      /* refs are identity-compared; a==b handled above */
@@ -3797,7 +3827,22 @@ static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
         if (c != 0) r = kai_bool(c < 0);
         else        r = kai_bool(a->as.s.len < b->as.s.len);
-    } else { fprintf(stderr, "kai: type mismatch in <\n"); exit(1); }
+    } else {
+        /* Ord dispatch: route to custom impl Ord.cmp when present (root and
+         * nested). kai_op_lt CONSUMES a/b, so incref for the impl (which also
+         * consumes) AND decref a/b at the end. cmp result < 0 means a < b. */
+        int32_t _o_head = kai_head_tag(a);
+        void *_o_fn = kai_lookup_impl(KAI_PROTO_ORD, _o_head);
+        if (_o_fn) {
+            kai_incref(a); kai_incref(b);
+            KaiValue *_o_c = ((KaiValue *(*)(KaiValue *, KaiValue *)) _o_fn)(a, b);
+            int _o_r = _o_c->as.i < 0;
+            kai_decref(_o_c);
+            kai_decref(a); kai_decref(b);
+            return kai_bool(_o_r);
+        }
+        fprintf(stderr, "kai: type mismatch in <\n"); exit(1);
+    }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -3812,7 +3857,20 @@ static KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
         if (c != 0) r = kai_bool(c > 0);
         else        r = kai_bool(a->as.s.len > b->as.s.len);
-    } else { fprintf(stderr, "kai: type mismatch in >\n"); exit(1); }
+    } else {
+        /* Ord dispatch (mirror of kai_op_lt). cmp result > 0 means a > b. */
+        int32_t _o_head = kai_head_tag(a);
+        void *_o_fn = kai_lookup_impl(KAI_PROTO_ORD, _o_head);
+        if (_o_fn) {
+            kai_incref(a); kai_incref(b);
+            KaiValue *_o_c = ((KaiValue *(*)(KaiValue *, KaiValue *)) _o_fn)(a, b);
+            int _o_r = _o_c->as.i > 0;
+            kai_decref(_o_c);
+            kai_decref(a); kai_decref(b);
+            return kai_bool(_o_r);
+        }
+        fprintf(stderr, "kai: type mismatch in >\n"); exit(1);
+    }
     kai_decref(a); kai_decref(b);
     return r;
 }
