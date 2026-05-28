@@ -325,6 +325,82 @@ static void lex_char(Lexer *l) {
 
 /* -------- main tokenize loop -------- */
 
+/* Lex a single-char-led operator or punctuation token. `c` has already been
+   consumed (advance called); `start`/`sl`/`sc` mark its source position. The
+   multi-char forms (->, =>, ==, |>, .., ...) peek ahead with match/peek. */
+static void lex_operator(Lexer *l, char c, size_t start, int32_t sl, int32_t sc) {
+    switch (c) {
+        case '(': push_token(l, TK_LPAREN,   start, l->pos, sl, sc); break;
+        case ')': push_token(l, TK_RPAREN,   start, l->pos, sl, sc); break;
+        case '[': push_token(l, TK_LBRACKET, start, l->pos, sl, sc); break;
+        case ']': push_token(l, TK_RBRACKET, start, l->pos, sl, sc); break;
+        case '{': push_token(l, TK_LBRACE,   start, l->pos, sl, sc); break;
+        case '}': push_token(l, TK_RBRACE,   start, l->pos, sl, sc); break;
+        case ',': push_token(l, TK_COMMA,    start, l->pos, sl, sc); break;
+        case ':': push_token(l, TK_COLON,    start, l->pos, sl, sc); break;
+        case ';': push_token(l, TK_SEMI,     start, l->pos, sl, sc); break;
+        case '+': push_token(l, TK_PLUS,     start, l->pos, sl, sc); break;
+        case '*': push_token(l, TK_STAR,     start, l->pos, sl, sc); break;
+        case '%': push_token(l, TK_PERCENT,  start, l->pos, sl, sc); break;
+
+        case '-':
+            if (match(l, '>')) push_token(l, TK_ARROW, start, l->pos, sl, sc);
+            else               push_token(l, TK_MINUS, start, l->pos, sl, sc);
+            break;
+
+        case '/':
+            if (match(l, '/')) push_token(l, TK_SLASH_SLASH, start, l->pos, sl, sc);
+            else               push_token(l, TK_SLASH,       start, l->pos, sl, sc);
+            break;
+
+        case '=':
+            if (match(l, '=')) push_token(l, TK_EQEQ,      start, l->pos, sl, sc);
+            else if (match(l, '>')) push_token(l, TK_FAT_ARROW, start, l->pos, sl, sc);
+            else               push_token(l, TK_EQ,        start, l->pos, sl, sc);
+            break;
+
+        case '<':
+            if (match(l, '=')) push_token(l, TK_LE, start, l->pos, sl, sc);
+            else               push_token(l, TK_LT, start, l->pos, sl, sc);
+            break;
+
+        case '>':
+            if (match(l, '=')) push_token(l, TK_GE, start, l->pos, sl, sc);
+            else               push_token(l, TK_GT, start, l->pos, sl, sc);
+            break;
+
+        case '!':
+            if (match(l, '=')) push_token(l, TK_NEQ,  start, l->pos, sl, sc);
+            else               push_token(l, TK_BANG, start, l->pos, sl, sc);
+            break;
+
+        case '|':
+            if (match(l, '>')) push_token(l, TK_PIPE_APPLY, start, l->pos, sl, sc);
+            else               push_token(l, TK_PIPE,       start, l->pos, sl, sc);
+            break;
+
+        case '.':
+            if (peek(l) == '.' && peek2(l) == '.') {
+                advance(l); advance(l);
+                push_token(l, TK_ELLIPSIS, start, l->pos, sl, sc);
+            } else if (peek(l) == '.') {
+                advance(l);
+                push_token(l, TK_DOTDOT, start, l->pos, sl, sc);
+            } else {
+                push_token(l, TK_DOT, start, l->pos, sl, sc);
+            }
+            break;
+
+        default: {
+            static char msgbuf[64];
+            snprintf(msgbuf, sizeof(msgbuf),
+                     "unexpected character '%c' (0x%02x)", c, (unsigned char) c);
+            push_error(l, msgbuf, start, l->pos, sl, sc);
+            break;
+        }
+    }
+}
+
 Token *kai_lex(const char *file, const char *src, size_t len, size_t *out_n) {
     Lexer l;
     memset(&l, 0, sizeof(l));
@@ -355,77 +431,7 @@ Token *kai_lex(const char *file, const char *src, size_t len, size_t *out_n) {
         if (c == '\'')              { lex_char(&l);             continue; }
 
         advance(&l);                                  /* consume `c` */
-
-        switch (c) {
-            case '(': push_token(&l, TK_LPAREN,   start, l.pos, sl, sc); break;
-            case ')': push_token(&l, TK_RPAREN,   start, l.pos, sl, sc); break;
-            case '[': push_token(&l, TK_LBRACKET, start, l.pos, sl, sc); break;
-            case ']': push_token(&l, TK_RBRACKET, start, l.pos, sl, sc); break;
-            case '{': push_token(&l, TK_LBRACE,   start, l.pos, sl, sc); break;
-            case '}': push_token(&l, TK_RBRACE,   start, l.pos, sl, sc); break;
-            case ',': push_token(&l, TK_COMMA,    start, l.pos, sl, sc); break;
-            case ':': push_token(&l, TK_COLON,    start, l.pos, sl, sc); break;
-            case ';': push_token(&l, TK_SEMI,     start, l.pos, sl, sc); break;
-            case '+': push_token(&l, TK_PLUS,     start, l.pos, sl, sc); break;
-            case '*': push_token(&l, TK_STAR,     start, l.pos, sl, sc); break;
-            case '%': push_token(&l, TK_PERCENT,  start, l.pos, sl, sc); break;
-
-            case '-':
-                if (match(&l, '>')) push_token(&l, TK_ARROW, start, l.pos, sl, sc);
-                else                push_token(&l, TK_MINUS, start, l.pos, sl, sc);
-                break;
-
-            case '/':
-                if (match(&l, '/')) push_token(&l, TK_SLASH_SLASH, start, l.pos, sl, sc);
-                else                push_token(&l, TK_SLASH,       start, l.pos, sl, sc);
-                break;
-
-            case '=':
-                if (match(&l, '=')) push_token(&l, TK_EQEQ,      start, l.pos, sl, sc);
-                else if (match(&l, '>')) push_token(&l, TK_FAT_ARROW, start, l.pos, sl, sc);
-                else                push_token(&l, TK_EQ,        start, l.pos, sl, sc);
-                break;
-
-            case '<':
-                if (match(&l, '=')) push_token(&l, TK_LE, start, l.pos, sl, sc);
-                else                push_token(&l, TK_LT, start, l.pos, sl, sc);
-                break;
-
-            case '>':
-                if (match(&l, '=')) push_token(&l, TK_GE, start, l.pos, sl, sc);
-                else                push_token(&l, TK_GT, start, l.pos, sl, sc);
-                break;
-
-            case '!':
-                if (match(&l, '=')) push_token(&l, TK_NEQ,  start, l.pos, sl, sc);
-                else                push_token(&l, TK_BANG, start, l.pos, sl, sc);
-                break;
-
-            case '|':
-                if (match(&l, '>')) push_token(&l, TK_PIPE_APPLY, start, l.pos, sl, sc);
-                else                push_token(&l, TK_PIPE,       start, l.pos, sl, sc);
-                break;
-
-            case '.':
-                if (peek(&l) == '.' && peek2(&l) == '.') {
-                    advance(&l); advance(&l);
-                    push_token(&l, TK_ELLIPSIS, start, l.pos, sl, sc);
-                } else if (peek(&l) == '.') {
-                    advance(&l);
-                    push_token(&l, TK_DOTDOT, start, l.pos, sl, sc);
-                } else {
-                    push_token(&l, TK_DOT, start, l.pos, sl, sc);
-                }
-                break;
-
-            default: {
-                static char msgbuf[64];
-                snprintf(msgbuf, sizeof(msgbuf),
-                         "unexpected character '%c' (0x%02x)", c, (unsigned char) c);
-                push_error(&l, msgbuf, start, l.pos, sl, sc);
-                break;
-            }
-        }
+        lex_operator(&l, c, start, sl, sc);
     }
 
     /* Always append an EOF token. */
