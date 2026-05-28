@@ -121,6 +121,12 @@ typedef enum {
     KAI_VARIANT,
     KAI_CLOSURE,
     KAI_ARRAY,
+    KAI_REF,        /* Ref[T]: single-cell mutable reference (Mutable effect).
+                     * Distinct from KAI_ARRAY — a Ref is exactly one slot, with
+                     * no length / capacity / indexing. The earlier hack backed
+                     * Ref with a length-1 KAI_ARRAY (issue #257); this is the
+                     * "clean fix" the #257 retro flagged. ML/OCaml `ref`,
+                     * Haskell `IORef` lineage. */
     KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
     KAI_PID,        /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
     KAI_BYTE          /* Lane 4 (#473): unsigned 8-bit integer, nominal */
@@ -386,6 +392,14 @@ struct KaiValue {
             int64_t     cap;
             KaiValue  **items;
         } arr;
+        /* KAI_REF: a single mutable cell. Owns one strong reference to
+         * `cell`. ref_set drops the old cell and steals the new value;
+         * ref_get hands back an incref'd copy; ref_make steals its init.
+         * No length, no indexing — the invariant "a Ref is one slot" is
+         * in the representation, not just the surface type. */
+        struct {
+            KaiValue   *cell;
+        } ref;
         /* m8 #3: opaque handle to a KaiFiber. The KaiFiber struct
          * itself is heap-allocated by Spawn.spawn and owned by this
          * value: when the value's RC drops to zero, kai_free_value
@@ -427,6 +441,7 @@ static inline int32_t kai_head_tag(KaiValue *v) {
         }
         case KAI_CLOSURE: return KAI_HEAD_CLOSURE;
         case KAI_ARRAY:   return KAI_HEAD_ARRAY;
+        case KAI_REF:     return KAI_HEAD_ANON;  /* Ref is not protocol-dispatchable */
         case KAI_FIBER:   return KAI_HEAD_FIBER;
         case KAI_PID:     return KAI_HEAD_PID;
         case KAI_BYTE:    return KAI_HEAD_BYTE;
@@ -468,6 +483,7 @@ static const char *kai_rc_tag_name(int t) {
         case KAI_VARIANT: return "variant";
         case KAI_CLOSURE: return "closure";
         case KAI_ARRAY:   return "array";
+        case KAI_REF:     return "ref";
         case KAI_BYTE:      return "Byte";
         default:          return "?";
     }
@@ -1967,6 +1983,10 @@ static void kai_free_value(KaiValue *v) {
             for (int64_t i = 0; i < v->as.arr.len; ++i) kai_decref(v->as.arr.items[i]);
             free(v->as.arr.items);
             break;
+        case KAI_REF:
+            /* A Ref owns one strong reference to its cell. */
+            kai_decref(v->as.ref.cell);
+            break;
         case KAI_FIBER:
             if (v->as.fib) {
                 /* Issue #104 — free the heap-cloned inherited
@@ -2896,6 +2916,7 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
             return 1;
         case KAI_CLOSURE: return 0;      /* closures are not equatable */
         case KAI_ARRAY:   return 0;      /* arrays are opaque, identity-compared */
+        case KAI_REF:     return 0;      /* refs are identity-compared; a==b handled above */
         case KAI_FIBER:   return a->as.fib == b->as.fib;  /* identity */
         case KAI_PID:     return a->as.mb  == b->as.mb;   /* identity */
         case KAI_BYTE:      return a->as.byte_val == b->as.byte_val;    /* Lane 4 (#473) */
@@ -2984,6 +3005,15 @@ static KaiValue *kai_to_string(KaiValue *v) {
         }
         case KAI_CLOSURE: return kai_str("<closure>");
         case KAI_ARRAY:   return kai_str("<array>");
+        case KAI_REF: {
+            /* Honest render `Ref(<inner>)` — closes the follow-up the
+             * #257 retro left open (length-1 array printed as <array>). */
+            KaiValue *inner = kai_to_string(v->as.ref.cell);
+            KaiValue *open  = kai_string_concat(kai_str("Ref("), inner);
+            KaiValue *full  = kai_string_concat(open, kai_str(")"));
+            kai_decref(inner); kai_decref(open);
+            return full;
+        }
         case KAI_FIBER:   return kai_str("<fiber>");
         case KAI_PID:     return kai_str("<pid>");
         case KAI_BYTE:                                       /* Lane 4 (#473) */
@@ -3416,33 +3446,39 @@ static KaiValue *kai_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init
  *   ref_get[T](r: Ref[T])       : T
  *   ref_set[T](r: Ref[T], v: T) : Unit
  *
- * Runtime layout: a Ref is a 1-slot KAI_ARRAY. Reusing the array
- * representation avoids a new tag plus parallel branches in
- * kai_decref / kai_to_string / kai_op_eq while preserving the
- * surface-level distinction enforced by the typer. */
+ * Runtime layout: a Ref is a KAI_REF — a single mutable cell with its
+ * own tag (one `KaiValue *cell` field). Distinct from KAI_ARRAY: no
+ * length, no capacity, no indexing — the "a Ref is exactly one slot"
+ * invariant lives in the representation, not just the surface type.
+ * (The earlier length-1 KAI_ARRAY hack from #257 is replaced here.)
+ * RC: a Ref owns one strong reference to its cell. All three ops obey
+ * the callee-consumes convention. */
 static KaiValue *kai_prelude_ref_make(KaiValue *init) {
-    /* kai_array_make increfs `init` once for the slot; we still
-     * decref our own input ref under the callee-consumes
-     * convention, mirroring kai_prelude_array_make. */
-    KaiValue *r = kai_array_make(1, init);
-    if (init) kai_decref(init);
+    /* Steal `init` straight into the cell — no incref/decref dance
+     * (the array-backed version did one of each; this is strictly less
+     * RC work, which matters on the hot path of Front A). */
+    KaiValue *r = kai_alloc(KAI_REF);
+    r->as.ref.cell = init;
     return r;
 }
 
 static KaiValue *kai_prelude_ref_get(KaiValue *r) {
-    KaiValue *v = kai_array_get_impl(r, 0);
+    /* Hand back a fresh strong reference to the cell; consume `r`. */
+    KaiValue *v = r ? kai_incref(r->as.ref.cell) : NULL;
     if (r) kai_decref(r);
     return v;
 }
 
 static KaiValue *kai_prelude_ref_set(KaiValue *r, KaiValue *v) {
-    /* kai_array_set_impl steals `v` (inserts into the slot) and
-     * returns kai_incref(r). Surface contract is Unit-typed, so
-     * drop the returned array ref and synthesise unit. */
-    KaiValue *a = kai_array_set_impl(r, 0, kai_incref(v));
-    if (a) kai_decref(a);
-    if (r) kai_decref(r);
-    if (v) kai_decref(v);
+    /* Drop the old contents, steal `v` into the cell; consume `r`.
+     * Surface contract is Unit-typed. No bounds check, no index. */
+    if (r) {
+        kai_decref(r->as.ref.cell);
+        r->as.ref.cell = v;       /* steals v */
+        kai_decref(r);
+    } else if (v) {
+        kai_decref(v);
+    }
     return kai_unit();
 }
 
