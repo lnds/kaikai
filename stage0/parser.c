@@ -156,6 +156,41 @@ static double decode_real(const char *s, size_t len) {
     return strtod(buf, NULL);
 }
 
+/* Decode a `\u{...}` escape body. On entry `p` points at the `u`; reads the
+   hex digits between the braces (lenient: stops at `}` or `end`). Returns the
+   code point, or 0 if the `{` is missing. */
+static uint32_t decode_unicode_escape(const char *p, const char *end) {
+    if (p + 1 >= end || p[1] != '{') return 0;
+    p += 2;
+    uint32_t v = 0;
+    while (p < end && *p != '}') {
+        char c = *p++;
+        v *= 16;
+        if      (c >= '0' && c <= '9') v += c - '0';
+        else if (c >= 'a' && c <= 'f') v += 10 + c - 'a';
+        else if (c >= 'A' && c <= 'F') v += 10 + c - 'A';
+    }
+    return v;
+}
+
+/* Decode a single (possibly multi-byte UTF-8) character starting at `p`.
+   Lenient: a malformed lead byte is returned as-is. */
+static uint32_t decode_utf8_char(const char *p, const char *end) {
+    unsigned char b0 = (unsigned char) *p++;
+    if (b0 < 0x80) return b0;
+    uint32_t v = 0;
+    int extra = 0;
+    if      ((b0 & 0xE0) == 0xC0) { v = b0 & 0x1F; extra = 1; }
+    else if ((b0 & 0xF0) == 0xE0) { v = b0 & 0x0F; extra = 2; }
+    else if ((b0 & 0xF8) == 0xF0) { v = b0 & 0x07; extra = 3; }
+    else                          { v = b0; }
+    while (extra-- > 0 && p < end) {
+        unsigned char b = (unsigned char) *p++;
+        v = (v << 6) | (b & 0x3F);
+    }
+    return v;
+}
+
 static uint32_t decode_char(const char *s, size_t len) {
     /* s points at the opening quote; len includes both quotes. */
     if (len < 2) return 0;
@@ -165,44 +200,19 @@ static uint32_t decode_char(const char *s, size_t len) {
         p++;
         if (p >= end) return 0;
         switch (*p) {
-            case 'n': return '\n';
-            case 't': return '\t';
-            case 'r': return '\r';
+            case 'n':  return '\n';
+            case 't':  return '\t';
+            case 'r':  return '\r';
             case '\\': return '\\';
             case '\'': return '\'';
-            case '"': return '"';
-            case '0': return 0;
-            case 'u': {
-                if (p + 1 >= end || p[1] != '{') return 0;
-                p += 2;
-                uint32_t v = 0;
-                while (p < end && *p != '}') {
-                    char c = *p++;
-                    v *= 16;
-                    if (c >= '0' && c <= '9') v += c - '0';
-                    else if (c >= 'a' && c <= 'f') v += 10 + c - 'a';
-                    else if (c >= 'A' && c <= 'F') v += 10 + c - 'A';
-                }
-                return v;
-            }
-            default: return (unsigned char) *p;
+            case '"':  return '"';
+            case '0':  return 0;
+            case 'u':  return decode_unicode_escape(p, end);
+            default:   return (unsigned char) *p;
         }
     }
-    /* Otherwise, single byte (or UTF-8 first byte — we decode leniently). */
-    unsigned char b0 = (unsigned char) *p++;
-    if (b0 < 0x80) return b0;
-    /* Simple UTF-8 decode. */
-    uint32_t v = 0;
-    int extra = 0;
-    if      ((b0 & 0xE0) == 0xC0) { v = b0 & 0x1F; extra = 1; }
-    else if ((b0 & 0xF0) == 0xE0) { v = b0 & 0x0F; extra = 2; }
-    else if ((b0 & 0xF8) == 0xF0) { v = b0 & 0x07; extra = 3; }
-    else                           { v = b0; }
-    while (extra-- > 0 && p < end) {
-        unsigned char b = (unsigned char) *p++;
-        v = (v << 6) | (b & 0x3F);
-    }
-    return v;
+    /* Otherwise, single byte or UTF-8 (decoded leniently). */
+    return decode_utf8_char(p, end);
 }
 
 /* ---------- entry ---------- */
@@ -909,6 +919,77 @@ static Node *parse_postfix(P *p) {
 
 /* ---------- primary expressions ---------- */
 
+/* Parse a parenthesized primary: `()` Unit, `(expr)` grouping, or a
+   parameter-list lambda `(a, b) => body` (including the zero-arg `() =>`).
+   On entry `t` is the `(` token (for line/col); the `(` has NOT been
+   consumed yet. */
+static Node *parse_paren_expr(P *p, const Token *t) {
+    p->i++;
+    /* Detect `()` */
+    if (at(p, TK_RPAREN)) {
+        p->i++;
+        /* Could still be `() => expr` (zero-arg lambda). */
+        if (at(p, TK_FAT_ARROW)) {
+            p->i++; skip_newlines(p);
+            Node *body = parse_expr(p);
+            if (!body) return NULL;
+            Node *lam = kai_new_node(N_LAMBDA, t->line, t->col);
+            kai_node_push(lam, body);
+            return lam;
+        }
+        return kai_new_node(N_UNIT, t->line, t->col);
+    }
+    /* Save state to try lambda shape first if it starts with IDENT. */
+    size_t save = p->i;
+    int could_be_lambda = 0;
+    if (at(p, TK_IDENT)) {
+        /* Scan IDENT (, IDENT)* ) => */
+        size_t j = p->i;
+        for (;;) {
+            if (p->toks[j].kind != TK_IDENT) { could_be_lambda = 0; break; }
+            j++;
+            if (p->toks[j].kind == TK_RPAREN) {
+                if (p->toks[j + 1].kind == TK_FAT_ARROW) could_be_lambda = 1;
+                break;
+            }
+            if (p->toks[j].kind != TK_COMMA) { could_be_lambda = 0; break; }
+            j++;
+            while (p->toks[j].kind == TK_NEWLINE) j++;
+        }
+    }
+    if (could_be_lambda) {
+        Node *lam = kai_new_node(N_LAMBDA, t->line, t->col);
+        kai_node_push(lam, NULL); /* body placeholder */
+        for (;;) {
+            const Token *pn = expect(p, TK_IDENT, "expected parameter name");
+            if (!pn) { kai_free_node(lam); return NULL; }
+            Node *id = kai_new_node(N_IDENT, pn->line, pn->col);
+            set_name_from_token(id, pn, p->src);
+            kai_node_push(lam, id);
+            if (!match(p, TK_COMMA)) break;
+            skip_newlines(p);
+        }
+        if (!expect(p, TK_RPAREN, "expected `)` after lambda parameters")) {
+            kai_free_node(lam); return NULL;
+        }
+        if (!expect(p, TK_FAT_ARROW, "expected `=>`")) {
+            kai_free_node(lam); return NULL;
+        }
+        skip_newlines(p);
+        Node *body = parse_expr(p);
+        if (!body) { kai_free_node(lam); return NULL; }
+        lam->children[0] = body;
+        return lam;
+    }
+    /* Otherwise: plain parenthesized expression. */
+    p->i = save;
+    skip_newlines(p);
+    Node *e = parse_expr(p);
+    if (!e) return NULL;
+    if (!expect(p, TK_RPAREN, "expected `)`")) { kai_free_node(e); return NULL; }
+    return e;
+}
+
 static Node *parse_primary(P *p) {
     const Token *t = peek_tok(p);
 
@@ -968,76 +1049,9 @@ static Node *parse_primary(P *p) {
         case TK_IF:    return parse_if(p);
         case TK_MATCH: return parse_match(p);
 
-        case TK_LPAREN: {
-            /* Could be: `()` = Unit literal
-                        `( expr )` = parens
-                        `( ident , ident , ... ) => expr` = lambda
-             */
-            p->i++;
-            /* Detect `()` */
-            if (at(p, TK_RPAREN)) {
-                p->i++;
-                /* Could still be `() => expr` (zero-arg lambda). */
-                if (at(p, TK_FAT_ARROW)) {
-                    p->i++; skip_newlines(p);
-                    Node *body = parse_expr(p);
-                    if (!body) return NULL;
-                    Node *lam = kai_new_node(N_LAMBDA, t->line, t->col);
-                    kai_node_push(lam, body);
-                    return lam;
-                }
-                return kai_new_node(N_UNIT, t->line, t->col);
-            }
-            /* Save state to try lambda shape first if it starts with IDENT. */
-            size_t save = p->i;
-            int could_be_lambda = 0;
-            if (at(p, TK_IDENT)) {
-                /* Scan IDENT (, IDENT)* ) => */
-                size_t j = p->i;
-                for (;;) {
-                    if (p->toks[j].kind != TK_IDENT) { could_be_lambda = 0; break; }
-                    j++;
-                    if (p->toks[j].kind == TK_RPAREN) {
-                        if (p->toks[j + 1].kind == TK_FAT_ARROW) could_be_lambda = 1;
-                        break;
-                    }
-                    if (p->toks[j].kind != TK_COMMA) { could_be_lambda = 0; break; }
-                    j++;
-                    while (p->toks[j].kind == TK_NEWLINE) j++;
-                }
-            }
-            if (could_be_lambda) {
-                Node *lam = kai_new_node(N_LAMBDA, t->line, t->col);
-                kai_node_push(lam, NULL); /* body placeholder */
-                for (;;) {
-                    const Token *pn = expect(p, TK_IDENT, "expected parameter name");
-                    if (!pn) { kai_free_node(lam); return NULL; }
-                    Node *id = kai_new_node(N_IDENT, pn->line, pn->col);
-                    set_name_from_token(id, pn, p->src);
-                    kai_node_push(lam, id);
-                    if (!match(p, TK_COMMA)) break;
-                    skip_newlines(p);
-                }
-                if (!expect(p, TK_RPAREN, "expected `)` after lambda parameters")) {
-                    kai_free_node(lam); return NULL;
-                }
-                if (!expect(p, TK_FAT_ARROW, "expected `=>`")) {
-                    kai_free_node(lam); return NULL;
-                }
-                skip_newlines(p);
-                Node *body = parse_expr(p);
-                if (!body) { kai_free_node(lam); return NULL; }
-                lam->children[0] = body;
-                return lam;
-            }
-            /* Otherwise: plain parenthesized expression. */
-            p->i = save;
-            skip_newlines(p);
-            Node *e = parse_expr(p);
-            if (!e) return NULL;
-            if (!expect(p, TK_RPAREN, "expected `)`")) { kai_free_node(e); return NULL; }
-            return e;
-        }
+        case TK_LPAREN:
+            /* `()` Unit, `(expr)` grouping, or `(a, ...) => body` lambda. */
+            return parse_paren_expr(p, t);
 
         case TK_IDENT: {
             /* Might be: ident, ident => body (single-param lambda),
