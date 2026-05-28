@@ -1,0 +1,76 @@
+# Inference branch-isolation canary (authored during the Front A
+# investigation, docs/lane-experience-front-a-rc-churn.md). Exercises
+# the substitution/backtracking interaction in the typer:
+#
+#  * a polymorphic identity + pair builder instantiated at several
+#    distinct types across sibling match arms — each instantiation
+#    allocates fresh type vars and can grow the substitution slot Array;
+#  * a generic `apply` (higher-order, its own row var) whose tail
+#    unifies both-flex with the argument function's row — the
+#    `bind_row_tails` path that bumps `row_fresh` by value;
+#  * sibling match arms that unify a shared result var differently
+#    before converging, exercising `st_restore_entries` branch
+#    isolation.
+#
+# A broken substitution-threading or branch-isolation change corrupts
+# inference here (wrong result / type error) rather than silently in
+# the 77k-LOC selfhost.
+
+pub type Shape
+  = Dot
+  | Seg(Int)
+  | Box(Int, Int)
+
+pub fn idr[T](x: T) : T = x
+
+pub fn apply[A, B](f: (A) -> B, x: A) : B = f(x)
+
+pub fn dup[T](x: T) : Pair[T] = MkPair(x, x)
+
+pub type Pair[T] = MkPair(T, T)
+
+pub fn first[T](p: Pair[T]) : T =
+  match p { MkPair(a, _) -> a }
+
+# Each arm instantiates the generics at a different type, forcing
+# fresh-var allocation and slot growth between arms; the int result
+# of every arm must still converge to Int.
+pub fn measure(s: Shape) : Int {
+  match s {
+    Dot       -> first(dup(idr(0)))
+    Seg(n)    -> apply((m) => m + 1, idr(n))
+    Box(w, h) -> {
+      let pw = dup(idr(w))
+      let ph = dup(idr(h))
+      apply((m) => first(pw) * first(ph) + m, idr(0))
+    }
+  }
+}
+
+# Polymorphic over the carried type but used at two types in one
+# body: forces the scheme to re-instantiate, growing the substitution
+# while a sibling binding still references the earlier fresh vars.
+pub fn label[T](tag: Int, val: T) : Pair[Int] =
+  match tag {
+    0 -> dup(idr(tag))
+    _ -> MkPair(tag, first(dup(idr(tag))))
+  }
+
+fn main() {
+  let a = measure(Dot)
+  let b = measure(Seg(41))
+  let c = measure(Box(6, 7))
+  let p = label(9, "x")
+  print(int_to_string(a + b + c + first(p)))
+}
+
+test "measure converges across heterogeneous arms" {
+  assert measure(Dot) == 0
+  assert measure(Seg(41)) == 42
+  assert measure(Box(6, 7)) == 42
+}
+
+test "polymorphic label reuses fresh vars correctly" {
+  assert first(label(5, "k")) == 5
+  assert first(label(0, "z")) == 0
+}
