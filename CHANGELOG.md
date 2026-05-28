@@ -84,6 +84,27 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.85.1 (2026-05-28)
+
+### Fixed
+
+- **emit**: dense user-type head tags — nested Eq/Ord dispatch + v2h tag indexing
+- **typer**: == / != / < / > / <= / >= honour custom Eq/Ord impls (root type)
+- **emit**: mirror variant reuse-in-place into LLVM backend (restore C↔LLVM parity)
+- **perceus**: unblock variant reuse-in-place (EModCall recognition + immortal-tag exclusion)
+
+### Changed
+
+- **stage0**: flatten emit.c's worst cognitive functions
+- **stage0**: split parser into parser.c + parser_expr.c (both C-)
+- **stage0**: flatten parser dispatchers to cut cognitive load
+- **stage0**: flatten high-cognitive functions in check and lexer
+- **stage0**: split parse_primary and decode_char
+- **stage0**: decompose parse_pattern and parse_type_decl
+- **stage0**: split check_node and kai_lex dispatchers
+- **stage0**: replace name switches with enum-indexed tables
+- **typer**: drop unused cmp-sugar scaffolding (synth_cmp_proto_eq/ord)
+
 ## v0.85.0 (2026-05-27)
 
 ### Added
