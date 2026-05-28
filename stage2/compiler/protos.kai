@@ -3396,7 +3396,101 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
         None     -> ECall(new_callee, new_args)
       }
     }
+    # `==` / `!=` / `<` / `>` / `<=` / `>=` are sugar for Eq.eq / Ord.cmp.
+    # The typer leaves them as the structural builtin EBinop; here, with
+    # concrete operand types (post-monomorph per spec), rewrite to the
+    # custom impl when the left operand's type carries one. Fully
+    # structural types (no custom impl — the common case, e.g. the
+    # compiler's own Expr/Stmt) keep the builtin EBinop unchanged.
+    EBinop(op, l, r) -> {
+      let nl = resolve_protocol_calls_expr(l, reg, local_arities)
+      let nr = resolve_protocol_calls_expr(r, reg, local_arities)
+      prc_rewrite_cmp_binop(op, nl, nr, reg)
+    }
     _ -> proto_map_expr_kind(k, (sub) => resolve_protocol_calls_expr(sub, reg, local_arities))
+  }
+}
+
+# Rewrite a comparison binop to a custom-impl call when the left
+# operand's type has one. `==`/`!=` → Eq.eq (`!=` wraps in `not`);
+# `<`/`>`/`<=`/`>=` → Ord.cmp reduced to Bool against 0. Any other op,
+# or an operand type with no custom impl, is left as the structural
+# builtin EBinop (which lowers to kai_op_eq_v / direct compare).
+fn prc_rewrite_cmp_binop(op: String, l: Expr, r: Expr, reg: ProtocolReg) : ExprKind {
+  if op == "==" or op == "!=" {
+    match prc_cmp_custom_head(reg, "Eq", l.ty) {
+      None -> EBinop(op, l, r)
+      Some(head) -> {
+        let mangled = concat_all(["__pimpl_Eq_", head, "_eq"])
+        let eqcall = prc_mk_ty(ECall(mk_expr(EVar(mangled), l.line, l.col), [l, r]),
+                               l.line, l.col, Some(TyBool))
+        if op == "==" {
+          ECall(mk_expr(EVar(mangled), l.line, l.col), [l, r])
+        } else {
+          EUnop("not", eqcall)
+        }
+      }
+    }
+  } else if op == "<" or op == ">" or op == "<=" or op == ">=" {
+    match prc_cmp_custom_head(reg, "Ord", l.ty) {
+      None -> EBinop(op, l, r)
+      Some(head) -> {
+        let mangled = concat_all(["__pimpl_Ord_", head, "_cmp"])
+        let cmpcall = prc_mk_ty(ECall(mk_expr(EVar(mangled), l.line, l.col), [l, r]),
+                                l.line, l.col, Some(TyInt))
+        let zero = prc_mk_ty(EInt(0), l.line, l.col, Some(TyInt))
+        EBinop(op, cmpcall, zero)
+      }
+    }
+  } else {
+    EBinop(op, l, r)
+  }
+}
+
+# Build an Expr with an explicit type annotation. `mk_expr` defaults
+# `ty` to None; the cmp rewrite pins TyBool / TyInt so downstream
+# passes see concrete types.
+fn prc_mk_ty(k: ExprKind, line: Int, col: Int, ty: Option[Ty]) : Expr =
+  Expr { kind: k, line: line, col: col, ty: ty, mode: MUnknown }
+
+# Head type name iff `proto` (Eq / Ord) has a user `impl proto for T`
+# registered for the operand's root type. `None` when the type is
+# fully structural (no custom impl) or unresolved → keep the builtin.
+# v1 checks the root type only; a contained field with a custom impl
+# is a documented follow-up (the compiler's own comparisons are all
+# fully structural, so root-only suffices for self-host correctness).
+fn prc_cmp_custom_head(reg: ProtocolReg, proto: String, ty: Option[Ty]) : Option[String] {
+  match ty {
+    None -> None
+    Some(t) -> match prc_ty_head_name(t) {
+      None -> None
+      Some(head) ->
+        if prc_reg_has_impl(reg, proto, head) { Some(head) } else { None }
+    }
+  }
+}
+
+# Root head name of a Ty, for impl-table lookup. Only nominal TyCon
+# heads can carry a user impl; everything else returns None.
+fn prc_ty_head_name(t: Ty) : Option[String] {
+  match t {
+    TyCon(_, name, _) -> Some(name)
+    _ -> None
+  }
+}
+
+# True iff `reg` holds an `impl proto for head` entry.
+fn prc_reg_has_impl(reg: ProtocolReg, proto: String, head: String) : Bool =
+  prc_impls_has(reg.impls, proto, head)
+
+fn prc_impls_has(impls: [ProtoImplReg], proto: String, head: String) : Bool {
+  match impls {
+    [] -> false
+    [pir, ...rest] -> match pir {
+      PIR(p, t, _, _, _) ->
+        if p == proto and t == head { true }
+        else { prc_impls_has(rest, proto, head) }
+    }
   }
 }
 
