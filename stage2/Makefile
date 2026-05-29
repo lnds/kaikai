@@ -46,7 +46,7 @@ SRC     := main.kai
 # dependencies. kaic1 parses `import` lines (stage1/compiler.kai
 # `parse_import_decl`) and ignores them downstream, so the bundle
 # compiles clean without stripping the import statements.
-BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/intervals.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/desugar.kai compiler/infer.kai compiler/fnreg.kai compiler/unbox.kai compiler/perceus.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/emit_llvm.kai compiler/emit_c.kai compiler/driver.kai main.kai
+BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/intervals.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/desugar.kai compiler/infer.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/emit_llvm.kai compiler/emit_c.kai compiler/driver.kai main.kai
 
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
@@ -186,6 +186,27 @@ test-dump-typed: $(TARGET) build
 	  else \
 	    echo "dump-typed OK $$name"; \
 	  fi; \
+	done
+
+# Phase 1.B.0 — cons-head raw-safe use-analysis (--dump-rawsafe). The
+# golden pins only the USER fns' marks (grep by fn name), so a stdlib
+# edit cannot perturb the fixture. Verifies the two load-bearing shapes:
+# `bump` (head only feeds raw arithmetic) marks load+store `raw`, and
+# `show_heads` (head feeds a boxed call `int_to_string(h)`) marks load
+# `boxed` — the 4th-dead-end antidote. The pass changes no runtime and
+# no emitted text; this is a pure analysis golden.
+RAWSAFE_FIXTURES := rawsafe_bump:bump,main rawsafe_boxed:show_heads,keep_pos,main
+
+test-rawsafe: $(TARGET) build
+	@set -e; \
+	for spec in $(RAWSAFE_FIXTURES); do \
+	  name=$${spec%%:*}; fns=$${spec#*:}; \
+	  pat=$$(echo "$$fns" | sed 's/,/|/g'); \
+	  ./$(TARGET) --path ../stdlib --dump-rawsafe ../examples/perceus/$$name.kai 2> build/$$name.rawsafe.err \
+	    | grep -E "^($$pat) (load|store)" > build/$$name.rawsafe || true; \
+	  diff -q ../examples/perceus/$$name.out.expected build/$$name.rawsafe > /dev/null \
+	    && echo "rawsafe OK $$name (use-analysis marks match golden)" \
+	    || { echo "rawsafe DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.rawsafe; exit 1; }; \
 	done
 
 # --check: name resolution + HM inference, with no --infer noise on stdout.
@@ -4574,7 +4595,7 @@ COSTLY_JOBS ?= 5
 test-costly-parallel: $(TARGET) build
 	@$(MAKE) -j$(COSTLY_JOBS) test-tokens test-ast test-types test-env test-check
 
-test: test-costly-parallel test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-runtime-shadow test-issue-501 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-int-cache test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing
+test: test-costly-parallel test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-runtime-shadow test-issue-501 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-int-cache test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -4583,7 +4604,7 @@ test: test-costly-parallel test-infer test-infer-check test-dump-typed test-dump
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-unused-bindings test-packages
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-unused-bindings test-packages
 
 # Package-mode harness (issue #569). Exercises kaikai as a package
 # consumer through tools/test-packages.sh; covers the 9-category
