@@ -472,6 +472,337 @@ fn rs_uses_mentions(name: String, uses: [Use]) : Bool {
   }
 }
 
+# ---- Phase 1.B.1: borrow-safe head predicate -----------------------
+#
+# A cons-head pattern bind `h` (the head of `[h, ...t]`) is BORROW-SAFE
+# in an arm body when NO use of `h` propagates the head `KaiValue *`
+# pointer beyond the arm: every use consumes it as a scalar read
+# (`->as.i` via raw arithmetic / comparison), never as the object
+# itself. This is the scalar instance of the Perceus/Koka "borrow vs
+# owned" rule: a borrowed binding may be INSPECTED (read fields, match,
+# read scalars) but never CONSUMED (stored, passed to an owner,
+# returned).
+#
+# When borrow-safe, the emitter can bind the head WITHOUT `kai_incref`
+# (it borrows the scrutinee's existing reference) and the match-exit
+# `kai_decref(_scr)` still balances RC — we elide an incref/drop PAIR
+# that cancelled. The cons representation is UNCHANGED (the head stays a
+# boxed `KaiValue *`); only the bind's reference-count traffic is
+# removed. This is independent of whether the arm's RESULT escapes: the
+# escaping value is a fresh Int, never the borrowed head pointer.
+#
+# This differs from `rs_all_uses_raw` (1.B.0) in exactly the EList case:
+# 1.B.0 accepts `[h, ...]` (bare head in an integral list) as raw-capable
+# because the SLOT could be raw; borrow-safe REJECTS it because there `h`
+# is the object propagated into the slot. `[h+1, ...]` is borrow-safe in
+# both (the element is `EBinop`, so `h` is a raw operand, not the object).
+#
+# SOUNDNESS PRECONDITION (the emitter must honour): `_scr` stays live
+# until after the last read of the borrowed head, since the head aliases
+# `_scr`'s storage. The standard match layout decrefs `_scr` at arm exit,
+# after the body — safe. The tcrec-sentinel path injects the decref
+# before a goto; borrow there is gated off (see emit_match_arm).
+
+# If `pat` binds a cons head as a plain `PBind` and that head is
+# borrow-safe in `body`, return its name. Otherwise None.
+pub fn bs_head_borrow_safe(pat: Pattern, body: Expr) : Option[String] / Console {
+  match pat.pkind {
+    PList(subs, _rest) -> match subs {
+      [first, ..._] -> match first.pkind {
+        PBind(hn) ->
+          if not name_is_unused_bs(hn) and bs_uses_borrow(hn, body, false) { Some(hn) }
+          else { None }
+        _ -> None
+      }
+      [] -> None
+    }
+    _ -> None
+  }
+}
+
+# `_`-prefixed names are unused-by-convention; the emitter already drops
+# them, so there is no bind to borrow. Mirrors emit_c's `name_is_unused`
+# (single `_` prefix, not `__`-prefixed compiler-internal names).
+fn name_is_unused_bs(name: String) : Bool {
+  match char_at(name, 0) {
+    Some(c0) -> c0 == '_' and match char_at(name, 1) {
+      Some(c1) -> c1 != '_'
+      None -> true
+    }
+    None -> false
+  }
+}
+
+# Returns true iff every occurrence of `name` in `e` is a scalar READ,
+# never the object pointer propagated. `cap` = "the enclosing slot reads
+# the scalar value" (raw binop/unop operand). Differs from
+# rs_uses_raw_in only in EList: here a list slot NEVER reads the scalar
+# of `name` — it stores the object — so cap=false for every element.
+fn bs_uses_borrow(name: String, e: Expr, cap: Bool) : Bool / Console {
+  match e.kind {
+    EVar(n) -> if n == name { cap } else { true }
+    EInt(_) -> true
+    EReal(_) -> true
+    EBool(_) -> true
+    EChar(_) -> true
+    EStr(span, is_triple) ->
+      # `#{name}` formats the object → propagates the pointer.
+      not interp_reads_name(name, span, is_triple)
+    EUnit -> true
+    EBinop(op, a, b) -> {
+      let raw = op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op)
+      bs_uses_borrow(name, a, raw) and bs_uses_borrow(name, b, raw)
+    }
+    EUnop(op, x) -> {
+      let raw = (op == "-" or op == "not")
+      bs_uses_borrow(name, x, raw)
+    }
+    # A list literal STORES the object in every slot — never a scalar
+    # read. cap=false for all elements: `[h, ...]` propagates `h`.
+    EList(elems) -> bs_uses_borrow_list(name, elems)
+    ECall(f, xs) -> bs_uses_borrow(name, f, false) and bs_uses_borrow_exprs(name, xs, false)
+    EField(x, _) -> bs_uses_borrow(name, x, false)
+    EIndex(a, b) -> bs_uses_borrow(name, a, false) and bs_uses_borrow(name, b, false)
+    EIf(c, t, eo) -> {
+      let p = bs_uses_borrow(name, c, false) and bs_uses_borrow(name, t, cap)
+      match eo { None -> p  Some(e2) -> p and bs_uses_borrow(name, e2, cap) }
+    }
+    EMatch(scr, arms) ->
+      bs_uses_borrow(name, scr, false) and bs_uses_borrow_arms(name, arms, cap)
+    ELambda(_, b) -> bs_uses_borrow(name, b, false)
+    ERecordLit(_, fis) -> bs_uses_borrow_fields(name, fis, false)
+    EBlock(stmts, tail) -> {
+      let p = bs_uses_borrow_stmts(name, stmts)
+      match tail { None -> p  Some(e2) -> p and bs_uses_borrow(name, e2, cap) }
+    }
+    ERange(lo, hi, by) -> {
+      let p = bs_uses_borrow(name, lo, false) and bs_uses_borrow(name, hi, false)
+      match by { None -> p  Some(e2) -> p and bs_uses_borrow(name, e2, false) }
+    }
+    EPipe(l, r)        -> bs_uses_borrow(name, l, false) and bs_uses_borrow(name, r, false)
+    EMapPipe(l, r)     -> bs_uses_borrow(name, l, false) and bs_uses_borrow(name, r, false)
+    EFlatMapPipe(l, r) -> bs_uses_borrow(name, l, false) and bs_uses_borrow(name, r, false)
+    EFilterPipe(l, r)  -> bs_uses_borrow(name, l, false) and bs_uses_borrow(name, r, false)
+    EIntrinsic(_, xs)  -> bs_uses_borrow_exprs(name, xs, false)
+    _ -> true
+  }
+}
+
+fn bs_uses_borrow_exprs(name: String, es: [Expr], cap: Bool) : Bool / Console {
+  match es {
+    [] -> true
+    [h, ...rest] -> bs_uses_borrow(name, h, cap) and bs_uses_borrow_exprs(name, rest, cap)
+  }
+}
+
+fn bs_uses_borrow_list(name: String, es: [ListElem]) : Bool / Console {
+  match es {
+    [] -> true
+    [h, ...rest] -> {
+      let inner = match h { ElPlain(e) -> e  ElSpread(e) -> e }
+      bs_uses_borrow(name, inner, false) and bs_uses_borrow_list(name, rest)
+    }
+  }
+}
+
+fn bs_uses_borrow_arms(name: String, arms: [Arm], cap: Bool) : Bool / Console {
+  match arms {
+    [] -> true
+    [a, ...rest] -> match a {
+      Arm(_, guard, body) -> {
+        let g = match guard { None -> true  Some(gx) -> bs_uses_borrow(name, gx, false) }
+        g and bs_uses_borrow(name, body, cap) and bs_uses_borrow_arms(name, rest, cap)
+      }
+    }
+  }
+}
+
+fn bs_uses_borrow_fields(name: String, fis: [FieldInit], cap: Bool) : Bool / Console {
+  match fis {
+    [] -> true
+    [h, ...rest] -> match h {
+      FI(_, e) -> bs_uses_borrow(name, e, cap) and bs_uses_borrow_fields(name, rest, cap)
+    }
+  }
+}
+
+fn bs_uses_borrow_stmts(name: String, stmts: [Stmt]) : Bool / Console {
+  match stmts {
+    [] -> true
+    [h, ...rest] -> bs_uses_borrow_stmt(name, h) and bs_uses_borrow_stmts(name, rest)
+  }
+}
+
+fn bs_uses_borrow_stmt(name: String, s: Stmt) : Bool / Console {
+  match s {
+    SLet(_, _, e) -> bs_uses_borrow(name, e, false)
+    SVar(_, _, e, _, _) -> bs_uses_borrow(name, e, false)
+    SAssert(e, mo) -> {
+      let p = bs_uses_borrow(name, e, false)
+      match mo { None -> p  Some(e2) -> p and bs_uses_borrow(name, e2, false) }
+    }
+    SExprStmt(e) -> bs_uses_borrow(name, e, false)
+    _ -> true
+  }
+}
+
+# ---- borrow-safe analysis + dump (separate from 1.B.0 rawsafe) -----
+
+# Walk every fn, emitting one RSM "borrow" mark per cons-head pattern
+# bind: RSRaw when bs_head_borrow_safe holds, RSBoxed otherwise. Kept in
+# its own table + dump so it does not perturb the 1.B.0 --dump-rawsafe
+# goldens (the `nth` ordinals would shift if interleaved).
+pub fn borrowsafe_analyze(decls: [Decl]) : [RSMark] / Console =
+  bs_decls_loop(decls, [])
+
+fn bs_decls_loop(decls: [Decl], acc: [RSMark]) : [RSMark] / Console {
+  match decls {
+    [] -> acc
+    [d, ...rest] -> bs_decls_loop(rest, list_append(acc, bs_decl(d)))
+  }
+}
+
+fn bs_decl(d: Decl) : [RSMark] / Console {
+  match d {
+    DFn(_, name, _, _, _, _, body, _, _, _) -> bs_st_marks(bs_walk(name, body, RSWalk([], 0)))
+    _ -> []
+  }
+}
+
+fn bs_st_marks(w: RSWalk) : [RSMark] = match w { RSWalk(ms, _) -> ms }
+
+# Walk Exprs looking for EMatch arms whose pattern binds a cons head;
+# emit the borrow verdict for each. Recurses into every sub-Expr so
+# nested matches are covered. Shares RSWalk for the nth counter.
+fn bs_walk(fnm: String, e: Expr, w: RSWalk) : RSWalk / Console {
+  match e.kind {
+    EMatch(scr, arms) -> bs_walk_arms(fnm, arms, bs_walk(fnm, scr, w))
+    EList(elems)       -> bs_walk_list_elems(fnm, elems, w)
+    ECall(f, xs)       -> rs_walk_exprs_via(fnm, xs, bs_walk(fnm, f, w))
+    EBinop(_, a, b)    -> bs_walk(fnm, b, bs_walk(fnm, a, w))
+    EUnop(_, x)        -> bs_walk(fnm, x, w)
+    EField(x, _)       -> bs_walk(fnm, x, w)
+    EIndex(a, b)       -> bs_walk(fnm, b, bs_walk(fnm, a, w))
+    EIf(c, t, eo) -> {
+      let w1 = bs_walk(fnm, t, bs_walk(fnm, c, w))
+      match eo { None -> w1  Some(e2) -> bs_walk(fnm, e2, w1) }
+    }
+    ELambda(_, body)   -> bs_walk(fnm, body, w)
+    ERecordLit(_, fis) -> bs_walk_fields(fnm, fis, w)
+    EBlock(stmts, tail) -> {
+      let w1 = bs_walk_stmts(fnm, stmts, w)
+      match tail { None -> w1  Some(e2) -> bs_walk(fnm, e2, w1) }
+    }
+    ERange(lo, hi, by) -> {
+      let w1 = bs_walk(fnm, hi, bs_walk(fnm, lo, w))
+      match by { None -> w1  Some(e2) -> bs_walk(fnm, e2, w1) }
+    }
+    EPipe(l, r)        -> bs_walk(fnm, r, bs_walk(fnm, l, w))
+    EMapPipe(l, r)     -> bs_walk(fnm, r, bs_walk(fnm, l, w))
+    EFlatMapPipe(l, r) -> bs_walk(fnm, r, bs_walk(fnm, l, w))
+    EFilterPipe(l, r)  -> bs_walk(fnm, r, bs_walk(fnm, l, w))
+    EIntrinsic(_, xs)  -> rs_walk_exprs_via(fnm, xs, w)
+    _ -> w
+  }
+}
+
+fn rs_walk_exprs_via(fnm: String, es: [Expr], w: RSWalk) : RSWalk / Console {
+  match es {
+    [] -> w
+    [h, ...rest] -> rs_walk_exprs_via(fnm, rest, bs_walk(fnm, h, w))
+  }
+}
+
+fn bs_walk_list_elems(fnm: String, es: [ListElem], w: RSWalk) : RSWalk / Console {
+  match es {
+    [] -> w
+    [h, ...rest] -> {
+      let inner = match h { ElPlain(e) -> e  ElSpread(e) -> e }
+      bs_walk_list_elems(fnm, rest, bs_walk(fnm, inner, w))
+    }
+  }
+}
+
+fn bs_walk_fields(fnm: String, fis: [FieldInit], w: RSWalk) : RSWalk / Console {
+  match fis {
+    [] -> w
+    [h, ...rest] -> match h {
+      FI(_, e) -> bs_walk_fields(fnm, rest, bs_walk(fnm, e, w))
+    }
+  }
+}
+
+fn bs_walk_stmts(fnm: String, stmts: [Stmt], w: RSWalk) : RSWalk / Console {
+  match stmts {
+    [] -> w
+    [h, ...rest] -> bs_walk_stmts(fnm, rest, bs_walk_stmt(fnm, h, w))
+  }
+}
+
+fn bs_walk_stmt(fnm: String, s: Stmt, w: RSWalk) : RSWalk / Console {
+  match s {
+    SLet(_, _, e) -> bs_walk(fnm, e, w)
+    SVar(_, _, e, _, _) -> bs_walk(fnm, e, w)
+    SAssert(e, mo) -> {
+      let w1 = bs_walk(fnm, e, w)
+      match mo { None -> w1  Some(e2) -> bs_walk(fnm, e2, w1) }
+    }
+    SExprStmt(e) -> bs_walk(fnm, e, w)
+    _ -> w
+  }
+}
+
+fn bs_walk_arms(fnm: String, arms: [Arm], w: RSWalk) : RSWalk / Console {
+  match arms {
+    [] -> w
+    [a, ...rest] -> bs_walk_arms(fnm, rest, bs_walk_arm(fnm, a, w))
+  }
+}
+
+fn bs_walk_arm(fnm: String, a: Arm, w: RSWalk) : RSWalk / Console {
+  match a {
+    Arm(pat, _guard, body) -> {
+      let w1 = match bs_head_borrow_safe(pat, body) {
+        Some(hn) -> bs_emit_at(w, fnm, pat, hn)
+        None     -> bs_emit_boxed(w, fnm, pat)
+      }
+      bs_walk(fnm, body, w1)
+    }
+  }
+}
+
+# Emit a borrow=raw mark at the head bind's position.
+fn bs_emit_at(w: RSWalk, fnm: String, pat: Pattern, hn: String) : RSWalk =
+  match pat.pkind {
+    PList(subs, _) -> match subs {
+      [first, ..._] -> rs_emit(w, fnm, first.line, first.col, "borrow", RSRaw)
+      [] -> w
+    }
+    _ -> w
+  }
+
+# Emit a borrow=boxed mark for a cons-head that exists but is not
+# borrow-safe (so the dump shows the negative cases too).
+fn bs_emit_boxed(w: RSWalk, fnm: String, pat: Pattern) : RSWalk =
+  match pat.pkind {
+    PList(subs, _) -> match subs {
+      [first, ..._] -> match first.pkind {
+        PBind(_) -> rs_emit(w, fnm, first.line, first.col, "borrow", RSBoxed)
+        _ -> w
+      }
+      [] -> w
+    }
+    _ -> w
+  }
+
+# `--dump-borrowsafe`: print one borrow mark per cons-head bind.
+pub fn dump_borrowsafe(file: String, decls: [Decl]) : Int / Console + File = {
+  let r = infer_program(file, decls, false)
+  let marks = borrowsafe_analyze(r.decls)
+  rs_dump_loop(marks)
+  r.errs
+}
+
 # ---- dump ----------------------------------------------------------
 
 # `--dump-rawsafe`: run HM inference to stamp `.ty` on every node, then

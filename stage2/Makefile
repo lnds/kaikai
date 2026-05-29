@@ -209,6 +209,25 @@ test-rawsafe: $(TARGET) build
 	    || { echo "rawsafe DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.rawsafe; exit 1; }; \
 	done
 
+# Phase 1.B.1 — cons-head borrow-safe classifier (--dump-borrowsafe).
+# Pins the four discriminating shapes: sum_sq/bump raw (head only read
+# as scalar), first/show boxed (head pointer propagated via return /
+# call). The classifier changes no emitted text; this is a pure
+# analysis golden, the prerequisite for the perceus borrow consumer.
+BORROWSAFE_FIXTURES := borrowsafe_classify:sum_sq,first,bump,show
+
+test-borrowsafe: $(TARGET) build
+	@set -e; \
+	for spec in $(BORROWSAFE_FIXTURES); do \
+	  name=$${spec%%:*}; fns=$${spec#*:}; \
+	  pat=$$(echo "$$fns" | sed 's/,/|/g'); \
+	  ./$(TARGET) --path ../stdlib --dump-borrowsafe ../examples/perceus/$$name.kai 2> build/$$name.borrowsafe.err \
+	    | grep -E "^($$pat) borrow" > build/$$name.borrowsafe || true; \
+	  diff -q ../examples/perceus/$$name.out.expected build/$$name.borrowsafe > /dev/null \
+	    && echo "borrowsafe OK $$name (borrow classifier matches golden)" \
+	    || { echo "borrowsafe DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.borrowsafe; exit 1; }; \
+	done
+
 # --check: name resolution + HM inference, with no --infer noise on stdout.
 # A clean run must leave both stdout and stderr empty.
 test-infer-check: $(TARGET) build
@@ -4595,7 +4614,7 @@ COSTLY_JOBS ?= 5
 test-costly-parallel: $(TARGET) build
 	@$(MAKE) -j$(COSTLY_JOBS) test-tokens test-ast test-types test-env test-check
 
-test: test-costly-parallel test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-runtime-shadow test-issue-501 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-int-cache test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing
+test: test-costly-parallel test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-runtime-shadow test-issue-501 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-int-cache test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -4604,7 +4623,7 @@ test: test-costly-parallel test-infer test-infer-check test-dump-typed test-dump
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-unused-bindings test-packages
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-unused-bindings test-packages
 
 # Package-mode harness (issue #569). Exercises kaikai as a package
 # consumer through tools/test-packages.sh; covers the 9-category
