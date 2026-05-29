@@ -468,6 +468,13 @@ static int64_t kai_rc_alloc_by_tag[16] = {0};
 /* issue #118 — Perceus reuse-in-place counter. Bumped by every
  * successful in-place rewrite in kai_reuse_or_alloc_* (further down). */
 static int64_t kai_rc_reuse_total = 0;
+/* Phase 1.B.1 — incref/decref call counters (the ones that actually
+ * touch `rc`; pinned/INT32_MAX short-circuits are NOT counted). Lets a
+ * borrow optimisation that elides incref/decref pairs show its effect
+ * directly (alloc_total is unchanged by a borrow — the head is never
+ * allocated, only refcounted). Only compiled under -DKAI_TRACE_RC. */
+static int64_t kai_rc_incref_total = 0;
+static int64_t kai_rc_decref_total = 0;
 
 static const char *kai_rc_tag_name(int t) {
     switch (t) {
@@ -510,6 +517,10 @@ static void kai_rc_report(void) {
         fprintf(stderr, "[KAI_TRACE_RC]   reuse_in_place=%lld\n",
                 (long long) kai_rc_reuse_total);
     }
+    /* Phase 1.B.1 — RC traffic (rc-touching incref/decref calls). */
+    fprintf(stderr, "[KAI_TRACE_RC]   incref_total=%lld decref_total=%lld\n",
+            (long long) kai_rc_incref_total,
+            (long long) kai_rc_decref_total);
 }
 
 static int kai_rc_registered = 0;
@@ -1371,6 +1382,7 @@ static KaiValue *kai_incref(KaiValue *v) {
     KAI_PROF_ENTER();
     v->rc++;
 #ifdef KAI_TRACE_RC
+    kai_rc_incref_total++;
     kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
     KAI_PROF_EXIT(incref);
@@ -2104,6 +2116,7 @@ static void kai_decref(KaiValue *v) {
     if (v->rc == INT32_MAX) return;   /* m5 #7 — singleton, saturated */
     KAI_PROF_ENTER();
 #ifdef KAI_TRACE_RC
+    kai_rc_decref_total++;
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
     if (--v->rc == 0) {
