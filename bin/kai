@@ -203,6 +203,55 @@ ensure_built() {
   fi
 }
 
+# Build a helper tool ($2 source -> $3 binary, $1 a human label)
+# atomically and under a lock, so concurrent `kai` invocations sharing
+# the same checkout (e.g. the parity harness fan-out, 16 workers) never
+# observe a half-linked binary. Without this, worker B reaches the
+# execute site while worker A is mid-`cc -o`, and the partial file
+# fails with "Permission denied" / "Text file busy" (tier1-backend-parity
+# flake). Two guards: (1) compile to a per-PID temp then `mv` (atomic
+# rename on the same filesystem) so every reader sees a complete binary
+# or none; (2) a `mkdir` lock (atomic create) serialises the build so
+# losers wait for the winner instead of racing a second `cc` to the
+# same path.
+build_helper_tool() {
+  label="$1"; src="$2"; bin="$3"
+  if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
+    ensure_built
+    lock="$bin.lock"
+    # Spin briefly for the lock. The winner builds; losers re-check the
+    # predicate after it clears (the build may have satisfied it).
+    waited=0
+    while ! mkdir "$lock" 2>/dev/null; do
+      # If the lock is stale (>120s) reclaim it; otherwise wait.
+      if [ "$waited" -ge 120 ]; then
+        rm -rf "$lock" 2>/dev/null
+        continue
+      fi
+      sleep 1
+      waited=$((waited + 1))
+      # Another worker may have finished the build while we waited.
+      if [ -x "$bin" ] && [ ! "$src" -nt "$bin" ]; then
+        return 0
+      fi
+    done
+    # We hold the lock. Re-check under it (someone may have built between
+    # our predicate test and acquiring the lock).
+    if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
+      echo "kai: building $label ..." >&2
+      tmp_bin="$bin.tmp.$$"
+      if "$0" build "$src" -o "$tmp_bin" >&2; then
+        mv -f "$tmp_bin" "$bin"
+      else
+        rm -f "$tmp_bin"
+        rmdir "$lock" 2>/dev/null
+        die "failed to build $label from $src"
+      fi
+    fi
+    rmdir "$lock" 2>/dev/null
+  fi
+}
+
 # Build tools/kai-pkg on first use; idempotent. Installed layout
 # ships the binary, so we only re-check existence.
 ensure_kaipkg() {
@@ -212,11 +261,7 @@ ensure_kaipkg() {
     fi
     return 0
   fi
-  if [ ! -x "$KAIPKG_BIN" ] || [ "$KAIPKG_SRC" -nt "$KAIPKG_BIN" ]; then
-    ensure_built
-    echo "kai: building tools/kai-pkg ..." >&2
-    "$0" build "$KAIPKG_SRC" -o "$KAIPKG_BIN" >&2
-  fi
+  build_helper_tool "tools/kai-pkg" "$KAIPKG_SRC" "$KAIPKG_BIN"
 }
 
 # Build tools/kai-lsp on first use; idempotent. Same shape as
@@ -228,11 +273,7 @@ ensure_kailsp() {
     fi
     return 0
   fi
-  if [ ! -x "$KAILSP_BIN" ] || [ "$KAILSP_SRC" -nt "$KAILSP_BIN" ]; then
-    ensure_built
-    echo "kai: building tools/kai-lsp ..." >&2
-    "$0" build "$KAILSP_SRC" -o "$KAILSP_BIN" >&2
-  fi
+  build_helper_tool "tools/kai-lsp" "$KAILSP_SRC" "$KAILSP_BIN"
 }
 
 # Resolve the cache root for package downloads. Precedence:
