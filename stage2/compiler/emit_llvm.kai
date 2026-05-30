@@ -5885,7 +5885,7 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String 
   let install = llvm_emit_main_install_defaults(main_row, decls, oo)
   let teardown = llvm_emit_main_teardown_defaults(main_row, decls)
   let default_op_declares = lvm_default_op_declares(main_row, decls)
-  let proto_init = llvm_emit_proto_init(decls, vs)
+  let proto_init = llvm_emit_proto_init(decls, vs, fns)
   concat_all([llvm_header(), default_op_declares, eff_structs,
               env_typedefs, "\n",
               decls_out.text, lam_bodies.text, clauses_out.text,
@@ -5897,12 +5897,19 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String 
 # Each impl-table entry becomes one `call void @kaix_register_one_impl
 # (i32 proto_id, i32 head_tag, i8* fn_ptr)`; each variant becomes one
 # `call void @kaix_register_one_variant_head(i32 variant_tag, i32 head_tag)`.
-fn llvm_emit_proto_init(decls: [Decl], variants: [EVar]) : String {
-  let impl_rows = collect_pimpl_rows(decls, [])
+fn llvm_emit_proto_init(decls: [Decl], variants: [EVar], fns: [EFn]) : String {
+  let impl_rows = collect_pimpl_rows(decls, fns, [])
   let v2h       = collect_variant_to_head(variants, decls)
   let impl_calls   = llvm_emit_impl_register_calls(impl_rows, decls, 0, "")
   let variant_calls = llvm_emit_variant_register_calls(v2h, 0, "")
   let fn_declares  = llvm_emit_pimpl_extern_declares(impl_rows, decls, [], "")
+  # Boxed shims for the unboxed builtin impls — the LLVM mirror of the C
+  # backend's `emit_impl_shim_defs`. The dispatch sites in runtime_llvm.c
+  # call the impl as `%KaiValue*(%KaiValue*,%KaiValue*)`; a raw scalar
+  # impl (`i1 @kai_..._eq(i64, i64)`) bitcast to that shape is the same
+  # ABI mismatch as in C. The shim unpacks, decrefs (consume), calls the
+  # raw pimpl, and boxes the return. Registered in the table below.
+  let shim_defs    = llvm_emit_impl_shim_defs(impl_rows, [], "")
   # issue #118 layer 3 — mirror the C backend's reusable-tag registry
   # (emit_c.kai `emit_proto_runtime_tables`). Without this the LLVM
   # backend immortalises reuse-target variants while C does not,
@@ -5920,6 +5927,7 @@ fn llvm_emit_proto_init(decls: [Decl], variants: [EVar]) : String {
     "declare i8* @kaix_lookup_impl(i32, i32)\n",
     "declare void @kaix_panic_no_impl(i8*, i8*, i32)\n",
     fn_declares,
+    shim_defs,
     "\ndefine void @_kai_proto_init_llvm() {\n",
     "entry:\n",
     variant_calls,
@@ -5928,6 +5936,65 @@ fn llvm_emit_proto_init(decls: [Decl], variants: [EVar]) : String {
     "  ret void\n",
     "}\n"
   ])
+}
+
+# Emit one boxed shim per unboxed builtin pimpl row (LLVM mirror of C's
+# `emit_impl_shim_defs`). Signature `%KaiValue* @kai_<csym>__boxed
+# (%KaiValue* %a0, ...)`: unbox each arg to its raw scalar via
+# `@kaix_to_*`, decref the boxed slot (consume — the runtime dispatch
+# increfs args before calling and requires the impl to consume them),
+# call the raw `@kai_<csym>`, and box the raw return via `@kaix_int` /
+# `@kaix_bool` / `@kaix_real` / `@kaix_char`. Boxed rows emit nothing.
+fn llvm_emit_impl_shim_defs(rows: [PimplRow], seen: [String], acc: String) : String {
+  match rows {
+    [] -> acc
+    [pr, ...rest] -> match pr {
+      PR(csym, _, _, _, sig) ->
+        if list_has(seen, csym) or not pimpl_row_is_unboxed(pr) {
+          llvm_emit_impl_shim_defs(rest, seen, acc)
+        } else {
+          match sig {
+            Some(US(pts, rt)) ->
+              llvm_emit_impl_shim_defs(rest, [csym, ...seen],
+                                        string_concat(acc, llvm_one_impl_shim(csym, pts, rt)))
+            None -> llvm_emit_impl_shim_defs(rest, [csym, ...seen], acc)
+          }
+        }
+    }
+  }
+}
+
+# A single LLVM boxed shim. `pts` raw param tys, `rt` raw return ty.
+fn llvm_one_impl_shim(csym: String, pts: [Ty], rt: Ty) : String {
+  let target_sym = concat_all(["@kai_", csym])
+  let param_list = llvm_shim_param_list(pts, 0)
+  let unbox_lines = llvm_thunk_unbox_args(0, pts, "")
+  let raw_args = llvm_thunk_raw_call_args(0, pts, "")
+  let ret_ir = llvm_raw_ir_type_t(rt)
+  let box_ctor = llvm_box_ctor_t(rt)
+  let box_arg_ir = llvm_box_arg_ir_t(rt)
+  concat_all([
+    "\ndefine %KaiValue* @kai_", csym, "__boxed(", param_list, ") {\n",
+    "entry:\n",
+    unbox_lines,
+    "  %rraw = call ", ret_ir, " ", target_sym, "(", raw_args, ")\n",
+    "  %r = call %KaiValue* ", box_ctor, "(", box_arg_ir, " %rraw)\n",
+    "  ret %KaiValue* %r\n",
+    "}\n"
+  ])
+}
+
+# `%KaiValue* %a0, %KaiValue* %a1, …` — one boxed param per impl arg.
+# Mirrors the `%a<i>` register names `llvm_thunk_unbox_args` reads.
+fn llvm_shim_param_list(pts: [Ty], i: Int) : String {
+  match pts {
+    [] -> ""
+    [_, ...rest] -> {
+      let sep = if i == 0 { "" } else { ", " }
+      let piece = concat_all([sep, "%KaiValue* %a", int_to_string(i)])
+      concat_all([piece, llvm_shim_param_list(rest, i + 1)])
+    }
+  }
 }
 
 # issue #118 layer 3 — one `@kaix_register_one_reusable_tag(i32 tag)`
@@ -5951,32 +6018,44 @@ fn llvm_emit_reusable_tag_calls(tags: [Int], acc: String) : String {
 fn llvm_emit_impl_register_calls(rows: [PimplRow], decls: [Decl], i: Int, acc: String) : String {
   match rows {
     [] -> acc
-    [PR(csym, p, t, arity), ...rest] -> {
-      let head_int = stdlib_head_tag_int(t, decls)
-      let proto_int = llvm_stdlib_proto_id(p)
-      if head_int < 0 {
-        # Only genuinely unknown type names land here now (user record/sum
-        # types resolve to a dense head tag >= 20 via stdlib_head_tag_int).
-        # Their boxed VARIANT/RECORD impls bitcast cleanly. We still skip a
-        # truly-unknown name: the runtime hashmap would never match it.
-        llvm_emit_impl_register_calls(rest, decls, i + 1, acc)
-      } else {
-        # The bitcast target type must match the impl fn's actual
-        # signature (`%KaiValue* (%KaiValue*, ...)*` with N params).
-        # Hardcoding arity 1 here was a v0.83.x release-build regression:
-        # heterogeneous operator-overload impls like
-        # `__pimpl_Add_Real_add__a_Complex` are arity 2 and clang's
-        # LLVM verifier rejects the type mismatch at link time. The
-        # arity is threaded from `collect_pimpl_rows` which reads
-        # `length(params)` on the original DFn.
-        let fn_ty = llvm_proto_fn_ty(arity)
-        let fn_ptr = concat_all(["bitcast (", fn_ty, " @kai_", csym, " to i8*)"])
-        let line = concat_all([
-          "  call void @kaix_register_one_impl(i32 ", proto_int,
-          ", i32 ", int_to_string(head_int),
-          ", i8* ", fn_ptr, ")\n"
-        ])
-        llvm_emit_impl_register_calls(rest, decls, i + 1, concat_all([acc, line]))
+    [pr, ...rest] -> match pr {
+      PR(csym, p, t, arity, _) -> {
+        let head_int = stdlib_head_tag_int(t, decls)
+        let proto_int = llvm_stdlib_proto_id(p)
+        if head_int < 0 {
+          # Only genuinely unknown type names land here now (user record/sum
+          # types resolve to a dense head tag >= 20 via stdlib_head_tag_int).
+          # Their boxed VARIANT/RECORD impls bitcast cleanly. We still skip a
+          # truly-unknown name: the runtime hashmap would never match it.
+          llvm_emit_impl_register_calls(rest, decls, i + 1, acc)
+        } else {
+          # The bitcast target type must match the impl fn's actual
+          # signature (`%KaiValue* (%KaiValue*, ...)*` with N params).
+          # Hardcoding arity 1 here was a v0.83.x release-build regression:
+          # heterogeneous operator-overload impls like
+          # `__pimpl_Add_Real_add__a_Complex` are arity 2 and clang's
+          # LLVM verifier rejects the type mismatch at link time. The
+          # arity is threaded from `collect_pimpl_rows` which reads
+          # `length(params)` on the original DFn.
+          #
+          # Unboxed builtin impls register their boxed shim
+          # (`@kai_<csym>__boxed`, already `%KaiValue*(%KaiValue*,...)`)
+          # so the bitcast is identity and the runtime call hits the
+          # right ABI — same fix as the C backend (fix-proto-eq-abi).
+          let reg_sym = if pimpl_row_is_unboxed(pr) {
+            concat_all(["@kai_", csym, "__boxed"])
+          } else {
+            concat_all(["@kai_", csym])
+          }
+          let fn_ty = llvm_proto_fn_ty(arity)
+          let fn_ptr = concat_all(["bitcast (", fn_ty, " ", reg_sym, " to i8*)"])
+          let line = concat_all([
+            "  call void @kaix_register_one_impl(i32 ", proto_int,
+            ", i32 ", int_to_string(head_int),
+            ", i8* ", fn_ptr, ")\n"
+          ])
+          llvm_emit_impl_register_calls(rest, decls, i + 1, concat_all([acc, line]))
+        }
       }
     }
   }
@@ -6002,7 +6081,7 @@ fn llvm_emit_variant_register_calls(v2h: [Int], i: Int, acc: String) : String {
 fn llvm_emit_pimpl_extern_declares(rows: [PimplRow], decls: [Decl], seen: [String], acc: String) : String {
   match rows {
     [] -> acc
-    [PR(csym, _, t, _), ...rest] -> {
+    [PR(csym, _, t, _, _), ...rest] -> {
       let head_int = stdlib_head_tag_int(t, decls)
       if head_int < 0 or list_has(seen, csym) {
         llvm_emit_pimpl_extern_declares(rest, decls, seen, acc)
