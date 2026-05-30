@@ -70,10 +70,11 @@ hinges:
    literal brief and the correct minimal change diverged; I took the correct
    minimal change.
 
-`effect_default_op_names` itself is now unreferenced in the walk but left intact
-(it is private, harmless, and its comment documents the extern-bridge rule). It
-could be deleted, but doing so is out of the lane's perf scope and would touch
-behavior-irrelevant surface; left for a future cleanup if desired.
+`effect_default_op_names` had no callers left once both hot sites moved to the
+map (grep across `stage2/` confirmed zero), so it was deleted. Its extern-bridge
+extraction logic — and its doc comment documenting the `$extern_handler` rule —
+survive as the shared `default_block_extern_ops(Option[DefaultBlock])` helper the
+map builder calls. One per-effect extractor, one source of truth.
 
 ## Complexity before/after
 
