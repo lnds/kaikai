@@ -4175,287 +4175,163 @@ fn report_dup_type_decl(file: String, name: String, line: Int, col: Int,
   }
 }
 
-# Issue #538 shape 2 — reject two `fn foo` declarations in the same
-# module. The resolver historically prepended decls into the env
-# blindly (see `register_one`), so a second `fn foo` silently
-# shadowed the first. Companion to `validate_type_name_collisions_decls`
-# for `type`; this walker only checks same-module same-name DFn pairs
-# in `root_only_decls`. Cross-module shadowing (`pub fn foo` in one
-# module, `fn foo` private in another) is gated by `pub` + `use` and
-# remains permitted.
+# Issue #538 shape 2 / Issue #543 — reject two declarations sharing a
+# name in the same module across the `fn`, `effect`, `const`, `axiom`
+# kinds. The resolver historically prepended decls into the env blindly
+# (see `register_one`), so a second `fn foo` (or `effect E`, `const N`,
+# `axiom A`) silently shadowed the first. Companion to
+# `validate_type_name_collisions_decls` for `type`; these walkers only
+# check same-module same-name pairs in `root_only_decls`. Cross-module
+# shadowing (`pub fn foo` in one module, `fn foo` private in another) is
+# gated by `pub` + `use` and remains permitted.
 #
 # Diagnostic shape mirrors the type case: anchor at the second site,
 # cite the earlier file:line:col in the message body, and add a help
 # line nudging the user to rename or remove the redeclaration.
+#
+# The four kinds differ only in (a) which Decl variant carries the
+# name/line/col, and (b) three words of diagnostic text. A single
+# parametric walker (`validate_name_collisions_walk`) carries the shared
+# linear scan; each public entry point supplies a pure extractor naming
+# its Decl variant plus an `EntitySpec` for the three varying words. The
+# `type` and union validators stay bespoke — `type` layers cross-module
+# / reserved-name / DDerive-DUnstable cases and a distinct message, and
+# union collision accumulates per-variant claims with builtin seeding;
+# forcing either into this mould would drag their special logic into the
+# generic path.
 
-type FnNameClaim = FNC(String, Int, Int)
+# A name claimed by a decl at a source position. `NS(name, line, col)`.
+type NameSite = NS(String, Int, Int)
+
+# The three words of diagnostic text that vary per entity kind:
+#   word   — noun in the error line ("function" / "effect" / ...)
+#   kw     — keyword fragment opening the help suggestion ("fn" / ...)
+#   syntax — the rest of the help's declaration shape ("(...)" / ...)
+type EntitySpec = ES(String, String, String)
+
+# Parametric same-module duplicate-name walker. `extract` returns
+# `Some(NS(name, line, col))` for the decls this entity owns and `None`
+# for every other decl kind; `spec` supplies the varying diagnostic
+# words. Linear scan accumulating seen claims (prepend; order does not
+# affect the count) and an error tally.
+fn validate_name_collisions_walk(remaining: [Decl], file: String,
+                                    extract: (Decl) -> Option[NameSite],
+                                    spec: EntitySpec,
+                                    seen: [NameSite],
+                                    errs: Int) : Int / Console + File {
+
+  match remaining {
+    [] -> errs
+    [d, ...rest] -> match extract(d) {
+      Some(site) -> match site {
+        NS(name, line, col) -> match find_name_site(seen, name) {
+          Some(prev) -> {
+            report_dup_name_decl(file, name, line, col, prev, spec)
+            validate_name_collisions_walk(rest, file, extract, spec, seen, errs + 1)
+          }
+          None ->
+            validate_name_collisions_walk(rest, file, extract, spec,
+                                             [NS(name, line, col), ...seen], errs)
+        }
+      }
+      None -> validate_name_collisions_walk(rest, file, extract, spec, seen, errs)
+    }
+  }
+}
+
+fn find_name_site(seen: [NameSite], name: String) : Option[NameSite] {
+  match seen {
+    [] -> None
+    [c, ...rest] -> match c {
+      NS(n, _, _) -> if n == name { Some(c) } else { find_name_site(rest, name) }
+    }
+  }
+}
+
+fn report_dup_name_decl(file: String, name: String, line: Int, col: Int,
+                          prev: NameSite, spec: EntitySpec) : Unit / Console + File {
+
+  match prev {
+    NS(_, prev_line, prev_col) -> match spec {
+      ES(word, kw, syntax) -> {
+        let msg = concat_all([word, " '", name,
+                              "' is already declared in this module (earlier at ",
+                              file, ":", int_to_string(prev_line), ":",
+                              int_to_string(prev_col), ")"])
+        diag_error(file, line, col, msg)
+        diag_help(concat_all(["remove or rename the second '", kw, " ", name,
+                                syntax, "' declaration"]))
+      }
+    }
+  }
+}
+
+fn extract_fn_site(d: Decl) : Option[NameSite] = match d {
+  DFn(_, name, _, _, _, _, _, line, col, _) -> Some(NS(name, line, col))
+  _ -> None
+}
 
 #[doc("infer: `validate_fn_name_collisions_decls` — typer entry point invoked by the driver.")]
 pub fn validate_fn_name_collisions_decls(root_decls: [Decl],
                                         file: String) : Int / Console + File {
 
-  validate_fn_name_collisions_loop(root_decls, file, [], 0)
-}
-
-fn validate_fn_name_collisions_loop(remaining: [Decl], file: String,
-                                       claims: [FnNameClaim],
-                                       errs: Int) : Int / Console + File {
-
-  match remaining {
-    [] -> errs
-    [d, ...rest] -> match d {
-      DFn(_, name, _, _, _, _, _, line, col, _) ->
-        validate_one_fn_decl(rest, file, claims, errs, name, line, col)
-      _ -> validate_fn_name_collisions_loop(rest, file, claims, errs)
-    }
-  }
-}
-
-fn validate_one_fn_decl(rest: [Decl], file: String,
-                           claims: [FnNameClaim], errs: Int,
-                           name: String, line: Int, col: Int) : Int / Console + File {
-
-  match find_fn_name_claim(claims, name) {
-    Some(prev) -> {
-      report_dup_fn_decl(file, name, line, col, prev)
-      validate_fn_name_collisions_loop(rest, file, claims, errs + 1)
-    }
-    None ->
-      validate_fn_name_collisions_loop(rest, file,
-                                          [FNC(name, line, col), ...claims],
-                                          errs)
-  }
-}
-
-fn find_fn_name_claim(claims: [FnNameClaim], name: String) : Option[FnNameClaim] {
-  match claims {
-    [] -> None
-    [c, ...rest] -> match c {
-      FNC(n, _, _) -> if n == name { Some(c) } else { find_fn_name_claim(rest, name) }
-    }
-  }
-}
-
-fn report_dup_fn_decl(file: String, name: String, line: Int, col: Int,
-                         prev: FnNameClaim) : Unit / Console + File {
-
-  match prev {
-    FNC(_, prev_line, prev_col) -> {
-      let msg = concat_all(["function '", name,
-                            "' is already declared in this module (earlier at ",
-                            file, ":", int_to_string(prev_line), ":",
-                            int_to_string(prev_col), ")"])
-      diag_error(file, line, col, msg)
-      diag_help(concat_all(["remove or rename the second 'fn ", name,
-                              "(...)' declaration"]))
-    }
-  }
+  validate_name_collisions_walk(root_decls, file, extract_fn_site,
+                                   ES("function", "fn", "(...)"), [], 0)
 }
 
 # Issue #543 — reject two `effect Foo` declarations in the same module.
 # The resolver's `register_one` prepends DEffect names into the env
 # blindly so the second silently shadows the first. Companion to the
-# DFn / DType walkers above.
+# DFn / DType walkers above; shares `validate_name_collisions_walk`.
 
-type EffectNameClaim = ENC(String, Int, Int)
+fn extract_effect_site(d: Decl) : Option[NameSite] = match d {
+  DEffect(_, name, _, _, _, line, col) -> Some(NS(name, line, col))
+  _ -> None
+}
 
 #[doc("infer: `validate_effect_name_collisions_decls` — typer entry point invoked by the driver.")]
 pub fn validate_effect_name_collisions_decls(root_decls: [Decl],
                                             file: String) : Int / Console + File {
 
-  validate_effect_name_collisions_loop(root_decls, file, [], 0)
-}
-
-fn validate_effect_name_collisions_loop(remaining: [Decl], file: String,
-                                           claims: [EffectNameClaim],
-                                           errs: Int) : Int / Console + File {
-
-  match remaining {
-    [] -> errs
-    [d, ...rest] -> match d {
-      DEffect(_, name, _, _, _, line, col) ->
-        validate_one_effect_decl(rest, file, claims, errs, name, line, col)
-      _ -> validate_effect_name_collisions_loop(rest, file, claims, errs)
-    }
-  }
-}
-
-fn validate_one_effect_decl(rest: [Decl], file: String,
-                               claims: [EffectNameClaim], errs: Int,
-                               name: String, line: Int, col: Int) : Int / Console + File {
-
-  match find_effect_name_claim(claims, name) {
-    Some(prev) -> {
-      report_dup_effect_decl(file, name, line, col, prev)
-      validate_effect_name_collisions_loop(rest, file, claims, errs + 1)
-    }
-    None ->
-      validate_effect_name_collisions_loop(rest, file,
-                                              [ENC(name, line, col), ...claims],
-                                              errs)
-  }
-}
-
-fn find_effect_name_claim(claims: [EffectNameClaim], name: String) : Option[EffectNameClaim] {
-  match claims {
-    [] -> None
-    [c, ...rest] -> match c {
-      ENC(n, _, _) -> if n == name { Some(c) } else { find_effect_name_claim(rest, name) }
-    }
-  }
-}
-
-fn report_dup_effect_decl(file: String, name: String, line: Int, col: Int,
-                             prev: EffectNameClaim) : Unit / Console + File {
-
-  match prev {
-    ENC(_, prev_line, prev_col) -> {
-      let msg = concat_all(["effect '", name,
-                            "' is already declared in this module (earlier at ",
-                            file, ":", int_to_string(prev_line), ":",
-                            int_to_string(prev_col), ")"])
-      diag_error(file, line, col, msg)
-      diag_help(concat_all(["remove or rename the second 'effect ", name,
-                              " { ... }' declaration"]))
-    }
-  }
+  validate_name_collisions_walk(root_decls, file, extract_effect_site,
+                                   ES("effect", "effect", " { ... }"), [], 0)
 }
 
 # Issue #543 — reject two `const N = ...` declarations in the same
 # module. DConst flows through `register_one` with the same blind
-# prepend pattern.
+# prepend pattern; shares `validate_name_collisions_walk`.
 
-type ConstNameClaim = CNC(String, Int, Int)
+fn extract_const_site(d: Decl) : Option[NameSite] = match d {
+  DConst(_, name, _, _, line, col) -> Some(NS(name, line, col))
+  _ -> None
+}
 
 #[doc("infer: `validate_const_name_collisions_decls` — typer entry point invoked by the driver.")]
 pub fn validate_const_name_collisions_decls(root_decls: [Decl],
                                            file: String) : Int / Console + File {
 
-  validate_const_name_collisions_loop(root_decls, file, [], 0)
-}
-
-fn validate_const_name_collisions_loop(remaining: [Decl], file: String,
-                                          claims: [ConstNameClaim],
-                                          errs: Int) : Int / Console + File {
-
-  match remaining {
-    [] -> errs
-    [d, ...rest] -> match d {
-      DConst(_, name, _, _, line, col) ->
-        validate_one_const_decl(rest, file, claims, errs, name, line, col)
-      _ -> validate_const_name_collisions_loop(rest, file, claims, errs)
-    }
-  }
-}
-
-fn validate_one_const_decl(rest: [Decl], file: String,
-                              claims: [ConstNameClaim], errs: Int,
-                              name: String, line: Int, col: Int) : Int / Console + File {
-
-  match find_const_name_claim(claims, name) {
-    Some(prev) -> {
-      report_dup_const_decl(file, name, line, col, prev)
-      validate_const_name_collisions_loop(rest, file, claims, errs + 1)
-    }
-    None ->
-      validate_const_name_collisions_loop(rest, file,
-                                             [CNC(name, line, col), ...claims],
-                                             errs)
-  }
-}
-
-fn find_const_name_claim(claims: [ConstNameClaim], name: String) : Option[ConstNameClaim] {
-  match claims {
-    [] -> None
-    [c, ...rest] -> match c {
-      CNC(n, _, _) -> if n == name { Some(c) } else { find_const_name_claim(rest, name) }
-    }
-  }
-}
-
-fn report_dup_const_decl(file: String, name: String, line: Int, col: Int,
-                            prev: ConstNameClaim) : Unit / Console + File {
-
-  match prev {
-    CNC(_, prev_line, prev_col) -> {
-      let msg = concat_all(["const '", name,
-                            "' is already declared in this module (earlier at ",
-                            file, ":", int_to_string(prev_line), ":",
-                            int_to_string(prev_col), ")"])
-      diag_error(file, line, col, msg)
-      diag_help(concat_all(["remove or rename the second 'const ", name,
-                              " = ...' declaration"]))
-    }
-  }
+  validate_name_collisions_walk(root_decls, file, extract_const_site,
+                                   ES("const", "const", " = ..."), [], 0)
 }
 
 # Issue #543 — reject two axiom declarations sharing a name in the
 # same module. DAxiom is rewritten to DFn by `lower_axioms`, but the
 # walk must run on the raw decl list (before the lowering) so the
-# diagnostic anchors at the original axiom site.
+# diagnostic anchors at the original axiom site. Shares
+# `validate_name_collisions_walk`; the caller feeds it the pre-lowering
+# decls so DAxiom still appears.
 
-type AxiomNameClaim = ANC(String, Int, Int)
+fn extract_axiom_site(d: Decl) : Option[NameSite] = match d {
+  DAxiom(_, _, name, _, _, _, _, _, line, col) -> Some(NS(name, line, col))
+  _ -> None
+}
 
 #[doc("infer: `validate_axiom_name_collisions_decls` — typer entry point invoked by the driver.")]
 pub fn validate_axiom_name_collisions_decls(root_decls: [Decl],
                                            file: String) : Int / Console + File {
 
-  validate_axiom_name_collisions_loop(root_decls, file, [], 0)
-}
-
-fn validate_axiom_name_collisions_loop(remaining: [Decl], file: String,
-                                          claims: [AxiomNameClaim],
-                                          errs: Int) : Int / Console + File {
-
-  match remaining {
-    [] -> errs
-    [d, ...rest] -> match d {
-      DAxiom(_, _, name, _, _, _, _, _, line, col) ->
-        validate_one_axiom_decl(rest, file, claims, errs, name, line, col)
-      _ -> validate_axiom_name_collisions_loop(rest, file, claims, errs)
-    }
-  }
-}
-
-fn validate_one_axiom_decl(rest: [Decl], file: String,
-                              claims: [AxiomNameClaim], errs: Int,
-                              name: String, line: Int, col: Int) : Int / Console + File {
-
-  match find_axiom_name_claim(claims, name) {
-    Some(prev) -> {
-      report_dup_axiom_decl(file, name, line, col, prev)
-      validate_axiom_name_collisions_loop(rest, file, claims, errs + 1)
-    }
-    None ->
-      validate_axiom_name_collisions_loop(rest, file,
-                                             [ANC(name, line, col), ...claims],
-                                             errs)
-  }
-}
-
-fn find_axiom_name_claim(claims: [AxiomNameClaim], name: String) : Option[AxiomNameClaim] {
-  match claims {
-    [] -> None
-    [c, ...rest] -> match c {
-      ANC(n, _, _) -> if n == name { Some(c) } else { find_axiom_name_claim(rest, name) }
-    }
-  }
-}
-
-fn report_dup_axiom_decl(file: String, name: String, line: Int, col: Int,
-                            prev: AxiomNameClaim) : Unit / Console + File {
-
-  match prev {
-    ANC(_, prev_line, prev_col) -> {
-      let msg = concat_all(["axiom '", name,
-                            "' is already declared in this module (earlier at ",
-                            file, ":", int_to_string(prev_line), ":",
-                            int_to_string(prev_col), ")"])
-      diag_error(file, line, col, msg)
-      diag_help(concat_all(["remove or rename the second 'axiom ", name,
-                              "(...)' declaration"]))
-    }
-  }
+  validate_name_collisions_walk(root_decls, file, extract_axiom_site,
+                                   ES("axiom", "axiom", "(...)"), [], 0)
 }
 
 # Run every same-module duplicate-decl validator over a single module's
