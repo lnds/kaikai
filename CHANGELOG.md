@@ -84,6 +84,30 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.86.0 (2026-05-30)
+
+### Added
+
+- **runtime**: RC-traffic counter + Phase 1.B.1 borrow-flip finding
+- **perceus**: cons-head borrow-safe classifier (Phase 1.B.1 infra)
+- **perceus**: cons-head raw-safe use-analysis (Phase 1.B.0)
+
+### Fixed
+
+- **emit**: register boxed shim for unboxed builtin protocol impls (#732)
+- **emit**: register boxed shim for unboxed builtin protocol impls
+- **tooling**: build kai-pkg/kai-lsp helpers atomically — kill parity fan-out race
+
+### Changed
+
+- **typer**: precompute effect-op map for coverage walk (#735)
+- **typer**: precompute effect-op map for coverage walk (drop per-EHandle rescan)
+- **typer**: unify name-collision validators into one parametric walker (#733)
+- **typer**: unify name-collision validators into one parametric walker
+- **runtime**: widen small-int cache to [-65536,65535] (Phase 1.A)
+- **typer**: inf_scan_uses_* O(n^2) to accumulator
+- **emit**: introduce EmitCtx record
+
 ## v0.85.1 (2026-05-28)
 
 ### Fixed
