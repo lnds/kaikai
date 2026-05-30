@@ -1781,20 +1781,26 @@ fn eff_already_in(acc: [Label], eff: String) : Bool = match acc {
 # have read from an explicit annotation.
 
 fn check_default_coverage(file: String, mod_decls: [Decl], all_decls: [Decl]) : Int / Console + File {
-  check_default_coverage_loop(file, all_decls, mod_decls, 0)
+  # Precompute the `eff_name -> default ops` table once over `all_decls`,
+  # then thread it through every per-DFn body walk so each `EHandle`
+  # resolves its effect's default ops by assoc-list lookup instead of
+  # re-scanning all declarations (lane linus-e).
+  let eff_map = build_effect_default_op_map(all_decls)
+  check_default_coverage_loop(file, all_decls, eff_map, mod_decls, 0)
 }
 
 
-fn check_default_coverage_loop(file: String, all_decls: [Decl], ds: [Decl],
+fn check_default_coverage_loop(file: String, all_decls: [Decl],
+                                eff_map: [EffDefaultOps], ds: [Decl],
                                 acc: Int) : Int / Console + File {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
       DFn(_, fname, _, _, _, _, body, _, _, _) -> {
-        let n = walk_coverage_expr(file, all_decls, fname, body, [], 0)
-        check_default_coverage_loop(file, all_decls, rest, acc + n)
+        let n = walk_coverage_expr(file, all_decls, eff_map, fname, body, [], 0)
+        check_default_coverage_loop(file, all_decls, eff_map, rest, acc + n)
       }
-      _ -> check_default_coverage_loop(file, all_decls, rest, acc)
+      _ -> check_default_coverage_loop(file, all_decls, eff_map, rest, acc)
     }
   }
 }
@@ -2204,13 +2210,53 @@ fn handle_clause_op_names(cs: [HClause]) : [String] = match cs {
 # that case identically to "default block exists but covers no extern
 # handlerable ops".
 
-fn effect_default_op_names(eff_name: String, decls: [Decl]) : [String] =
-  match inf_find_effect_default_block(eff_name, decls) {
-    None         -> []
-    Some(defblk) -> match defblk {
+fn default_block_extern_ops(defblk: Option[DefaultBlock]) : [String] =
+  match defblk {
+    None      -> []
+    Some(blk) -> match blk {
       DBlk(clauses, _, _, _) -> extern_handler_op_names(clauses)
     }
   }
+
+
+# Lane linus-e: precomputed `eff_name -> extern-handlerable default ops`
+# table. The coverage walk used to call `effect_default_op_names`, an
+# O(n_decls) scan over every declaration, at every `EHandle` node and at
+# every main-level uncovered op-call — O(N_EHandle x n_decls) overall.
+# This table walks `decls` ONCE, recording per effect exactly the op
+# names the old scan would have returned, so each use site is a single
+# assoc-list lookup. Mirrors the `EffOps`/`use_eff_lookup` idiom from
+# desugar.kai (kept local here because this lane touches only infer.kai).
+# Effects absent from the table (lookup `None`) resolve to `[]` at the use
+# site, matching the old scan on an effect with no `default { }` block.
+type EffDefaultOps = EDOps(String, [String])
+
+
+fn build_effect_default_op_map(decls: [Decl]) : [EffDefaultOps] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, name, _, _, defblk, _, _) ->
+        [EDOps(name, default_block_extern_ops(defblk)),
+         ...build_effect_default_op_map(rest)]
+      _ -> build_effect_default_op_map(rest)
+    }
+  }
+}
+
+
+# Lookup matching `effect_default_op_names`'s contract: an undeclared
+# effect (no table entry) returns `[]`, exactly as the original scan does
+# when `inf_find_effect_default_block` finds no DEffect.
+fn effect_default_op_map_get(table: [EffDefaultOps], eff_name: String) : [String] {
+  match table {
+    [] -> []
+    [h, ...rest] -> match h {
+      EDOps(n, ops) ->
+        if n == eff_name { ops } else { effect_default_op_map_get(rest, eff_name) }
+    }
+  }
+}
 
 
 fn extern_handler_op_names(cs: [HClause]) : [String] = match cs {
@@ -2238,7 +2284,8 @@ fn find_top_eff_frame(stack: [HandleFrame], eff_name: String) : Option[HandleFra
 # enclosing `DFn` name, used for the main-discharge step (step 4) and
 # for diagnostic context.
 
-fn walk_coverage_expr(file: String, decls: [Decl], fname: String,
+fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
+                       fname: String,
                        e: Expr, stack: [HandleFrame], acc: Int) : Int / Console + File {
   match e.kind {
     EInt(_)           -> acc
@@ -2255,211 +2302,217 @@ fn walk_coverage_expr(file: String, decls: [Decl], fname: String,
     EVariantsOf(_, _) -> acc
     EModCall(_, _)    -> acc
     EIntrinsic(_, args_) ->
-      walk_coverage_list(file, decls, fname, args_, stack, acc)
+      walk_coverage_list(file, decls, eff_map, fname, args_, stack, acc)
     ECall(callee, args_) -> {
       # Detect `Eff.op(...)` shape produced by synth_op_call_with_scheme.
       # The callee is `EVar("Eff.op")` (possibly with an `@alias` suffix on
       # the dispatch key — strip that before splitting).
       let head_errs = match callee.kind {
-        EVar(key) -> check_op_call_coverage(file, decls, fname, key,
+        EVar(key) -> check_op_call_coverage(file, decls, eff_map, fname, key,
                                               stack, e.line, e.col)
         _ -> 0
       }
       let acc1 = acc + head_errs
-      let acc2 = walk_coverage_expr(file, decls, fname, callee, stack, acc1)
-      walk_coverage_list(file, decls, fname, args_, stack, acc2)
+      let acc2 = walk_coverage_expr(file, decls, eff_map, fname, callee, stack, acc1)
+      walk_coverage_list(file, decls, eff_map, fname, args_, stack, acc2)
     }
-    EField(base, _) -> walk_coverage_expr(file, decls, fname, base, stack, acc)
+    EField(base, _) -> walk_coverage_expr(file, decls, eff_map, fname, base, stack, acc)
     EIndex(a, b)    -> {
-      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
     }
     EBinop(_, a, b) -> {
-      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
     }
-    EUnop(_, x)     -> walk_coverage_expr(file, decls, fname, x, stack, acc)
+    EUnop(_, x)     -> walk_coverage_expr(file, decls, eff_map, fname, x, stack, acc)
     EIf(c, t, eo)   -> {
-      let a1 = walk_coverage_expr(file, decls, fname, c, stack, acc)
-      let a2 = walk_coverage_expr(file, decls, fname, t, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, fname, c, stack, acc)
+      let a2 = walk_coverage_expr(file, decls, eff_map, fname, t, stack, a1)
       match eo {
-        Some(b) -> walk_coverage_expr(file, decls, fname, b, stack, a2)
+        Some(b) -> walk_coverage_expr(file, decls, eff_map, fname, b, stack, a2)
         None    -> a2
       }
     }
     EMatch(scr, arms) -> {
-      let a1 = walk_coverage_expr(file, decls, fname, scr, stack, acc)
-      walk_coverage_arms(file, decls, fname, arms, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, fname, scr, stack, acc)
+      walk_coverage_arms(file, decls, eff_map, fname, arms, stack, a1)
     }
     ELambda(_, _) -> acc           # lambda bodies have their own row
-    ERecordLit(_, fs) -> walk_coverage_fields(file, decls, fname, fs, stack, acc)
-    EList(els)        -> walk_coverage_elems(file, decls, fname, els, stack, acc)
+    ERecordLit(_, fs) -> walk_coverage_fields(file, decls, eff_map, fname, fs, stack, acc)
+    EList(els)        -> walk_coverage_elems(file, decls, eff_map, fname, els, stack, acc)
     ERange(a, b, opt) -> {
-      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
-      let a2 = walk_coverage_expr(file, decls, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
+      let a2 = walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
       match opt {
-        Some(s) -> walk_coverage_expr(file, decls, fname, s, stack, a2)
+        Some(s) -> walk_coverage_expr(file, decls, eff_map, fname, s, stack, a2)
         None    -> a2
       }
     }
     EBlock(stmts, tail) -> {
-      let a1 = walk_coverage_stmts(file, decls, fname, stmts, stack, acc)
+      let a1 = walk_coverage_stmts(file, decls, eff_map, fname, stmts, stack, acc)
       match tail {
-        Some(t) -> walk_coverage_expr(file, decls, fname, t, stack, a1)
+        Some(t) -> walk_coverage_expr(file, decls, eff_map, fname, t, stack, a1)
         None    -> a1
       }
     }
     EPipe(a, b)        -> {
-      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
     }
     EMapPipe(a, b)     -> {
-      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
     }
     EFlatMapPipe(a, b) -> {
-      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
     }
     EFilterPipe(a, b)  -> {
-      let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
     }
-    EBang(inner)       -> walk_coverage_expr(file, decls, fname, inner, stack, acc)
-    ELitUnit(inner, _) -> walk_coverage_expr(file, decls, fname, inner, stack, acc)
+    EBang(inner)       -> walk_coverage_expr(file, decls, eff_map, fname, inner, stack, acc)
+    ELitUnit(inner, _) -> walk_coverage_expr(file, decls, eff_map, fname, inner, stack, acc)
     EHandle(body, eff_name, _, init_opt, _, clauses, ret_opt) -> {
       let frame = HF(eff_name,
                      handle_clause_op_names(clauses),
-                     effect_default_op_names(eff_name, decls),
+                     effect_default_op_map_get(eff_map, eff_name),
                      e.line, e.col)
       let a1 = match init_opt {
-        Some(i) -> walk_coverage_expr(file, decls, fname, i, stack, acc)
+        Some(i) -> walk_coverage_expr(file, decls, eff_map, fname, i, stack, acc)
         None    -> acc
       }
       # Clause bodies execute outside `with eff_name` (the typer enforces
       # this; clauses are separate functions). Walk them under the outer
       # stack so a Eff.op clause body that itself calls Eff.op is not
       # silently treated as discharged by this frame.
-      let a2 = walk_coverage_clauses(file, decls, fname, clauses, stack, a1)
+      let a2 = walk_coverage_clauses(file, decls, eff_map, fname, clauses, stack, a1)
       let a3 = match ret_opt {
         Some(r) -> match r {
-          HR(_, b, _, _) -> walk_coverage_expr(file, decls, fname, b, stack, a2)
+          HR(_, b, _, _) -> walk_coverage_expr(file, decls, eff_map, fname, b, stack, a2)
         }
         None -> a2
       }
-      walk_coverage_expr(file, decls, fname, body, [frame, ...stack], a3)
+      walk_coverage_expr(file, decls, eff_map, fname, body, [frame, ...stack], a3)
     }
   }
 }
 
 
-fn walk_coverage_list(file: String, decls: [Decl], fname: String,
+fn walk_coverage_list(file: String, decls: [Decl], eff_map: [EffDefaultOps],
+                       fname: String,
                        es: [Expr], stack: [HandleFrame], acc: Int) : Int / Console + File {
   match es {
     []           -> acc
     [h, ...rest] -> {
-      let a1 = walk_coverage_expr(file, decls, fname, h, stack, acc)
-      walk_coverage_list(file, decls, fname, rest, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, fname, h, stack, acc)
+      walk_coverage_list(file, decls, eff_map, fname, rest, stack, a1)
     }
   }
 }
 
 
-fn walk_coverage_arms(file: String, decls: [Decl], fname: String,
+fn walk_coverage_arms(file: String, decls: [Decl], eff_map: [EffDefaultOps],
+                       fname: String,
                        arms: [Arm], stack: [HandleFrame], acc: Int) : Int / Console + File {
   match arms {
     []           -> acc
     [a, ...rest] -> match a {
       Arm(_, og, body) -> {
         let a1 = match og {
-          Some(g) -> walk_coverage_expr(file, decls, fname, g, stack, acc)
+          Some(g) -> walk_coverage_expr(file, decls, eff_map, fname, g, stack, acc)
           None    -> acc
         }
-        let a2 = walk_coverage_expr(file, decls, fname, body, stack, a1)
-        walk_coverage_arms(file, decls, fname, rest, stack, a2)
+        let a2 = walk_coverage_expr(file, decls, eff_map, fname, body, stack, a1)
+        walk_coverage_arms(file, decls, eff_map, fname, rest, stack, a2)
       }
     }
   }
 }
 
 
-fn walk_coverage_fields(file: String, decls: [Decl], fname: String,
+fn walk_coverage_fields(file: String, decls: [Decl], eff_map: [EffDefaultOps],
+                         fname: String,
                          fs: [FieldInit], stack: [HandleFrame], acc: Int) : Int / Console + File {
   match fs {
     []           -> acc
     [f, ...rest] -> match f {
       FI(_, e) -> {
-        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
-        walk_coverage_fields(file, decls, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
+        walk_coverage_fields(file, decls, eff_map, fname, rest, stack, a1)
       }
     }
   }
 }
 
 
-fn walk_coverage_elems(file: String, decls: [Decl], fname: String,
+fn walk_coverage_elems(file: String, decls: [Decl], eff_map: [EffDefaultOps],
+                        fname: String,
                         els: [ListElem], stack: [HandleFrame], acc: Int) : Int / Console + File {
   match els {
     []            -> acc
     [el, ...rest] -> match el {
       ElPlain(e)  -> {
-        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
-        walk_coverage_elems(file, decls, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
+        walk_coverage_elems(file, decls, eff_map, fname, rest, stack, a1)
       }
       ElSpread(e) -> {
-        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
-        walk_coverage_elems(file, decls, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
+        walk_coverage_elems(file, decls, eff_map, fname, rest, stack, a1)
       }
     }
   }
 }
 
 
-fn walk_coverage_stmts(file: String, decls: [Decl], fname: String,
+fn walk_coverage_stmts(file: String, decls: [Decl], eff_map: [EffDefaultOps],
+                        fname: String,
                         ss: [Stmt], stack: [HandleFrame], acc: Int) : Int / Console + File {
   match ss {
     []           -> acc
     [s, ...rest] -> match s {
       SLet(_, _, e) -> {
-        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
-        walk_coverage_stmts(file, decls, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
+        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a1)
       }
       SVar(_, _, e, _, _) -> {
-        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
-        walk_coverage_stmts(file, decls, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
+        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a1)
       }
       SAssert(e, og) -> {
-        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
+        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
         let a2 = match og {
-          Some(g) -> walk_coverage_expr(file, decls, fname, g, stack, a1)
+          Some(g) -> walk_coverage_expr(file, decls, eff_map, fname, g, stack, a1)
           None    -> a1
         }
-        walk_coverage_stmts(file, decls, fname, rest, stack, a2)
+        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a2)
       }
       SExprStmt(e) -> {
-        let a1 = walk_coverage_expr(file, decls, fname, e, stack, acc)
-        walk_coverage_stmts(file, decls, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
+        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a1)
       }
       SIndexAssign(a, b, c, _, _) -> {
-        let a1 = walk_coverage_expr(file, decls, fname, a, stack, acc)
-        let a2 = walk_coverage_expr(file, decls, fname, b, stack, a1)
-        let a3 = walk_coverage_expr(file, decls, fname, c, stack, a2)
-        walk_coverage_stmts(file, decls, fname, rest, stack, a3)
+        let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
+        let a2 = walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
+        let a3 = walk_coverage_expr(file, decls, eff_map, fname, c, stack, a2)
+        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a3)
       }
-      SUse(_, _, _) -> walk_coverage_stmts(file, decls, fname, rest, stack, acc)
+      SUse(_, _, _) -> walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, acc)
     }
   }
 }
 
 
-fn walk_coverage_clauses(file: String, decls: [Decl], fname: String,
+fn walk_coverage_clauses(file: String, decls: [Decl], eff_map: [EffDefaultOps],
+                          fname: String,
                           cs: [HClause], stack: [HandleFrame], acc: Int) : Int / Console + File {
   match cs {
     []           -> acc
     [c, ...rest] -> match c {
       HC(_, _, body, _, _) -> {
-        let a1 = walk_coverage_expr(file, decls, fname, body, stack, acc)
-        walk_coverage_clauses(file, decls, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, fname, body, stack, acc)
+        walk_coverage_clauses(file, decls, eff_map, fname, rest, stack, a1)
       }
     }
   }
@@ -2471,7 +2524,8 @@ fn walk_coverage_clauses(file: String, decls: [Decl], fname: String,
 # fired. Returns 0 when the callee is not in `Eff.op` form (regular
 # function call, FFI shim, etc.).
 
-fn check_op_call_coverage(file: String, decls: [Decl], fname: String,
+fn check_op_call_coverage(file: String, decls: [Decl],
+                           eff_map: [EffDefaultOps], fname: String,
                            key: String, stack: [HandleFrame],
                            line: Int, col: Int) : Int / Console + File {
   let bare = strip_alias_suffix(key)
@@ -2516,7 +2570,7 @@ fn check_op_call_coverage(file: String, decls: [Decl], fname: String,
             # source-level `default { }` block bridging via
             # `$extern_handler` gets auto-installed at main. The
             # check is now uniform — no special builtin list.
-            let default_ops = effect_default_op_names(eff_name, decls)
+            let default_ops = effect_default_op_map_get(eff_map, eff_name)
             if list_has_string(default_ops, op_name) { 0 }
             else {
               report_uncovered_op(file, fname, eff_name, op_name, decls,
