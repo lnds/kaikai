@@ -1640,12 +1640,25 @@ pub fn ffi_kind_of_ty(t: TypeExpr) : FfiRetKind {
 # target type (`%KaiValue* (%KaiValue*, ...)*`) with the right number
 # of params — without it every impl would be bitcast to arity 1 and
 # clang rejects the mismatch (issue surfaced in release v0.83.x build).
-#[doc("Row for one `__pimpl_*` entry: the C symbol name, the proto name, the kaikai type name (head), and the impl fn's arity. Heterogeneous- mangled impls…")]
-pub type PimplRow = PR(String, String, String, Int)
-#                  c_sym    proto   type_name arity
+#
+# The fifth slot is the impl fn's unboxed signature, captured in situ
+# from the `EFn` registry by `collect_pimpl_rows`. `Some(US([Ty], Ty))`
+# means the builtin scalar impl (`Eq_Int_eq(int64_t,int64_t)`,
+# `Ord_Real_cmp(double,double)`, …) was classified by the unbox pass as
+# taking + returning raw C scalars — its C symbol does NOT have the
+# `KaiValue*(KaiValue*,KaiValue*)` shape the runtime dispatch sites
+# (`kai_op_eq` / `kai_op_lt` / `kai_op_gt`) cast to and call. Such rows
+# register a boxed shim (`&kai_<csym>__boxed`) in the impl table instead
+# of the raw pimpl; the raw pimpl stays reachable for the monomorphic
+# fast path. `None` means the impl already has the boxed
+# `KaiValue*(...)` shape (String / Unit / List / Option / Result) and is
+# registered directly. See `emit_impl_shim_defs` (fix-proto-eq-abi).
+#[doc("Row for one `__pimpl_*` entry: the C symbol name, the proto name, the kaikai type name (head), the impl fn's arity, and its unboxed signature (Some when scalar, None when boxed). Heterogeneous- mangled impls…")]
+pub type PimplRow = PR(String, String, String, Int, Option[UFnSig])
+#                  c_sym    proto   type_name arity      unboxed sig
 
-#[doc("AST collector walking pimpl rows.")]
-pub fn collect_pimpl_rows(ds: [Decl], acc: [PimplRow]) : [PimplRow] {
+#[doc("AST collector walking pimpl rows. `fns` is the EFn registry, used to recover each pimpl's unboxed signature (the unbox pass stamps it there).")]
+pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], acc: [PimplRow]) : [PimplRow] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
@@ -1655,22 +1668,54 @@ pub fn collect_pimpl_rows(ds: [Decl], acc: [PimplRow]) : [PimplRow] {
             Some(pr) -> {
               let csym = c_sym(name, mo)
               let arity = list_length(params)
-              collect_pimpl_rows(rest, [pr_with_csym(pr, csym, arity), ...acc])
+              let sig = lookup_ufn_sig(fns, name, mo)
+              collect_pimpl_rows(rest, fns, [pr_with_csym(pr, csym, arity, sig), ...acc])
             }
-            None -> collect_pimpl_rows(rest, acc)
+            None -> collect_pimpl_rows(rest, fns, acc)
           }
         } else {
-          collect_pimpl_rows(rest, acc)
+          collect_pimpl_rows(rest, fns, acc)
         }
       }
-      _ -> collect_pimpl_rows(rest, acc)
+      _ -> collect_pimpl_rows(rest, fns, acc)
     }
   }
 }
 
-#[doc("Attach the minted C symbol to a decoded protocol-impl row.")]
-pub fn pr_with_csym(pr: PimplRow, csym: String, arity: Int) : PimplRow {
-  match pr { PR(_, p, t, _) -> PR(csym, p, t, arity) }
+#[doc("Attach the minted C symbol + unboxed signature to a decoded protocol-impl row.")]
+pub fn pr_with_csym(pr: PimplRow, csym: String, arity: Int, sig: Option[UFnSig]) : PimplRow {
+  match pr { PR(_, p, t, _, _) -> PR(csym, p, t, arity, sig) }
+}
+
+#[doc("True when this pimpl row has an unboxed (raw-scalar) C signature and so needs a boxed shim before it can be registered in the impl table. A row is unboxed when the unbox pass classified it (`Some(US ...)`) AND at least one param type is a raw scalar.")]
+pub fn pimpl_row_is_unboxed(pr: PimplRow) : Bool {
+  match pr {
+    PR(_, _, _, _, sig) -> match sig {
+      None -> false
+      Some(US(pts, _)) -> any_param_scalar(pts)
+    }
+  }
+}
+
+#[doc("True when any type in the list is a raw C scalar (Int/Bool/Char/Real), peeling Dim/Refine wrappers. The unbox pass only classifies a fn when every param + the return are scalar, so a non-empty scalar param implies the whole signature is unboxed.")]
+pub fn any_param_scalar(ts: [Ty]) : Bool {
+  match ts {
+    [] -> false
+    [t, ...rest] -> if ty_is_scalar(t) { true } else { any_param_scalar(rest) }
+  }
+}
+
+#[doc("True when a Ty is a raw C scalar (Int/Bool/Char/Real), peeling unit-of-measure and refinement wrappers.")]
+pub fn ty_is_scalar(t: Ty) : Bool {
+  match t {
+    TyInt  -> true
+    TyReal -> true
+    TyBool -> true
+    TyChar -> true
+    TyDimT(inner, _)    -> ty_is_scalar(inner)
+    TyRefineT(inner, _) -> ty_is_scalar(inner)
+    _ -> false
+  }
 }
 
 # Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>`
@@ -1704,7 +1749,7 @@ pub fn parse_pimpl_name(name: String) : Option[PimplRow] {
           if last <= 0 { None }
           else {
             let tname = string_slice(rest1, 0, last)
-            Some(PR("", p, tname, 0))
+            Some(PR("", p, tname, 0, None))
           }
         }
       }
