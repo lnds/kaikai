@@ -5857,14 +5857,18 @@ fn has_main_decl(decls: [Decl]) : Bool {
 # `kai_variant_to_head` is rebuilt the same way: every entry in
 # `variants` (the global EVar table) gets its head tag derived from
 # the constructor->sum mapping in the user's declarations.
-fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar]) : String {
-  let impl_rows = collect_pimpl_rows(decls, [])
+fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar], fns: [EFn]) : String {
+  let impl_rows = collect_pimpl_rows(decls, fns, [])
   let v2h       = collect_variant_to_head(variants, decls)
   let n_impl    = list_length(impl_rows)
   let n_v2h     = list_length(v2h)
   let impl_arr  = emit_impl_table_array(impl_rows, decls)
   let v2h_arr   = emit_variant_to_head_array(v2h)
-  let fwds      = emit_pimpl_forwards(impl_rows, [])
+  # Boxed shims for the unboxed builtin impls registered in the table,
+  # emitted before the table so `&kai_<csym>__boxed` resolves. The raw
+  # pimpls they call are forward-declared with the other fn bodies.
+  let shim_defs = emit_impl_shim_defs(impl_rows, [])
+  let fwds      = concat_all([emit_pimpl_forwards(impl_rows, []), shim_defs])
   # issue #118 layer 3 — reusable-tag registry. Collect ctor names the
   # Perceus recogniser marked as reuse targets, map them to tags, and
   # stamp the runtime bitset so `kai_variant_u` skips immortalising
@@ -5927,11 +5931,24 @@ fn emit_impl_table_array(rows: [PimplRow], decls: [Decl]) : String =
 fn emit_impl_table_array_loop(rows: [PimplRow], decls: [Decl], acc: String) : String {
   match rows {
     [] -> acc
-    [PR(csym, p, t, _), ...rest] -> {
-      let line = concat_all(["\n    { .proto_id = ", stdlib_proto_id_c(p),
-                              ", .head_tag = ", stdlib_head_tag_c(t, decls),
-                              ", .fn = (void *) &kai_", csym, " },"])
-      emit_impl_table_array_loop(rest, decls, concat_all([acc, line]))
+    [pr, ...rest] -> match pr {
+      PR(csym, p, t, _, _) -> {
+        # Unboxed builtin impls (`Eq_Int_eq(int64_t,int64_t)`, …) cannot
+        # be cast to the dispatch shape `KaiValue*(KaiValue*,KaiValue*)`
+        # the runtime expects: the runtime would reinterpret boxed
+        # pointers as raw scalars and the raw return as a `KaiValue*`,
+        # dereferencing a small integer (SIGSEGV — issue fix-proto-eq-abi).
+        # Register the boxed shim instead; boxed impls register directly.
+        let fn_sym = if pimpl_row_is_unboxed(pr) {
+          concat_all(["kai_", csym, "__boxed"])
+        } else {
+          concat_all(["kai_", csym])
+        }
+        let line = concat_all(["\n    { .proto_id = ", stdlib_proto_id_c(p),
+                                ", .head_tag = ", stdlib_head_tag_c(t, decls),
+                                ", .fn = (void *) &", fn_sym, " },"])
+        emit_impl_table_array_loop(rest, decls, concat_all([acc, line]))
+      }
     }
   }
 }
@@ -5991,7 +6008,7 @@ fn emit_pimpl_forwards(rows: [PimplRow], _seen: [String]) : String =
 fn emit_pimpl_forwards_loop(rows: [PimplRow], seen: [String]) : String {
   match rows {
     [] -> ""
-    [PR(csym, _, _, _), ...rest] ->
+    [PR(csym, _, _, _, _), ...rest] ->
       if list_has(seen, csym) {
         emit_pimpl_forwards_loop(rest, seen)
       } else {
@@ -6001,8 +6018,100 @@ fn emit_pimpl_forwards_loop(rows: [PimplRow], seen: [String]) : String {
   }
 }
 
-fn emit_main_wrapper(decls: [Decl], bmode: BuildMode, variants: [EVar]) : String {
-  let proto_tables = emit_proto_runtime_tables(decls, variants)
+# Emit one boxed shim per unboxed builtin pimpl row registered in the
+# impl table. The shim has the dispatch shape
+# `KaiValue *kai_<csym>__boxed(KaiValue *a, KaiValue *b)` (or one arg for
+# arity-1 impls like Hash). It unpacks each boxed arg to its raw scalar,
+# decrefs it (consuming ownership exactly like the runtime's
+# `__pimpl_*_thunk` does — the dispatch sites incref a/b before calling
+# and require the impl to consume both), calls the raw pimpl, and boxes
+# the raw return: `kai_bool` for an Int-returning op (Eq), and the
+# return type's constructor (`kai_int` for cmp, `kai_real`/`kai_char`
+# for min/max) via `box_wrap`. Boxed pimpls have `None` here and emit
+# nothing — they are registered directly.
+fn emit_impl_shim_defs(rows: [PimplRow], seen: [String]) : String {
+  match rows {
+    [] -> ""
+    [pr, ...rest] -> match pr {
+      PR(csym, _, _, _, sig) ->
+        if list_has(seen, csym) or not pimpl_row_is_unboxed(pr) {
+          emit_impl_shim_defs(rest, seen)
+        } else {
+          match sig {
+            Some(US(pts, rt)) -> concat_all([
+              emit_one_impl_shim(csym, pts, rt),
+              emit_impl_shim_defs(rest, [csym, ...seen])
+            ])
+            None -> emit_impl_shim_defs(rest, [csym, ...seen])
+          }
+        }
+    }
+  }
+}
+
+# Emit a single boxed shim. `pts` are the raw param tys, `rt` the raw
+# return ty. The shim reads `a->as.X` / `b->as.X` per param ty, decrefs
+# each boxed arg (consume), calls the raw pimpl, and boxes the return.
+fn emit_one_impl_shim(csym: String, pts: [Ty], rt: Ty) : String {
+  let unbox  = emit_shim_unbox_args(pts, 0)
+  let args   = emit_shim_raw_arg_list(pts, 0)
+  let call   = concat_all(["kai_", csym, "(", args, ")"])
+  concat_all([
+    "static KaiValue *kai_", csym, "__boxed(", emit_shim_param_list(pts, 0), ") {\n",
+    unbox,
+    "    return ", box_wrap(Some(rt), call), ";\n",
+    "}\n\n"
+  ])
+}
+
+# `KaiValue *a0, KaiValue *a1, …` — one boxed param per impl arg.
+fn emit_shim_param_list(pts: [Ty], i: Int) : String {
+  match pts {
+    [] -> ""
+    [_, ...rest] -> {
+      let head = concat_all(["KaiValue *a", int_to_string(i)])
+      match rest {
+        [] -> head
+        _  -> concat_all([head, ", ", emit_shim_param_list(rest, i + 1)])
+      }
+    }
+  }
+}
+
+# `<raw_ty> r0 = a0->as.X; kai_decref(a0); …` per param. Decref consumes
+# the boxed arg, matching the runtime dispatch contract (caller increfs
+# a/b; impl owns + drops both).
+fn emit_shim_unbox_args(pts: [Ty], i: Int) : String {
+  match pts {
+    [] -> ""
+    [t, ...rest] -> {
+      let ix = int_to_string(i)
+      let line = concat_all([
+        "    ", raw_c_type(Some(t)), " r", ix,
+        " = a", ix, unbox_field_for(Some(t)), ";\n",
+        "    kai_decref(a", ix, ");\n"
+      ])
+      concat_all([line, emit_shim_unbox_args(rest, i + 1)])
+    }
+  }
+}
+
+# `r0, r1, …` — the raw scalar locals passed to the raw pimpl.
+fn emit_shim_raw_arg_list(pts: [Ty], i: Int) : String {
+  match pts {
+    [] -> ""
+    [_, ...rest] -> {
+      let head = concat_all(["r", int_to_string(i)])
+      match rest {
+        [] -> head
+        _  -> concat_all([head, ", ", emit_shim_raw_arg_list(rest, i + 1)])
+      }
+    }
+  }
+}
+
+fn emit_main_wrapper(decls: [Decl], bmode: BuildMode, variants: [EVar], fns: [EFn]) : String {
+  let proto_tables = emit_proto_runtime_tables(decls, variants, fns)
   let proto_init   = "    _kai_register_proto_tables();\n"
   match bmode {
     BMTest -> {
@@ -6734,7 +6843,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   let tests = emit_all_tests(src, decls, cx, target_origin)
   let benches = emit_all_benches(src, decls, cx, target_origin)
   let checks = emit_all_checks(src, decls, cx, target_origin)
-  let main_wr = emit_main_wrapper(decls, bmode, variants)
+  let main_wr = emit_main_wrapper(decls, bmode, variants, fns)
   concat_all([header, eff_structs, env_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
 }
 
