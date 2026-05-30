@@ -197,15 +197,17 @@ Euler #4 numbers). The "scope expanded to all four primitives" hard
 requirement on the day-5/7/10 gates was met as a single shipped
 release rather than a phased subset.
 
-Phase 1 unboxing (small-int + char cache for `[-128, 127]` ints
-and `[0, 127]` chars) landed earlier (commit `69c6166`); Phase 2 +
-Phase 3 are contained chunks that do **not** require the
-multi-threaded scheduler / cross-thread atomics design that the
-full Koka feature set needs.
+Phase 1 unboxing (small-int + char cache for `[-65536, 65535]` ints
+and `[0, 127]` chars) landed earlier (commit `69c6166`); the int
+range was widened from `[-128, 127]` to `[-65536, 65535]` in
+Phase 1.A (perceus-int-cache, 2026-05-29); Phase 2 + Phase 3 are
+contained chunks that do **not** require the multi-threaded
+scheduler / cross-thread atomics design that the full Koka feature
+set needs.
 
 | Phase | What it does | Status | Performance vs C |
 |---|---|---|---:|
-| Phase 1 — small-int + char cache | Cache hits for ints in [-128, 127] / chars [0, 127] reuse singletons; no alloc | ✅ landed (`69c6166`) | 50–100× slower (cache hits free, miss boxes) |
+| Phase 1 — small-int + char cache | Cache hits for ints in [-65536, 65535] / chars [0, 127] reuse pinned slots; no alloc. Int range widened from [-128,127] in Phase 1.A (per-entry lazy warm: RSS scales with the int working set, not the range) | ✅ landed (`69c6166`); widened 2026-05-29 | 50–100× slower (cache hits free, miss boxes) |
 | Phase 2 — locals + return values unboxed | `Int` / `Bool` / `Char` / `Real` live in C `int64_t` / `int` / `double` directly inside fn bodies; boxing only at call boundaries and storage edges. | ✅ landed | 5–10× slower (boxing at call boundaries) |
 | **Phase 3 — call boundaries unboxed (#383)** | Top-level fns with all-primitive concrete signatures emit raw C signatures (`int64_t fib(int64_t)` etc.). Boxing collapses to ~zero on compute-only programs. | ✅ landed 2026-05-09 | **~1× C on compute (fib 1.0×, Euler #4 1.05×)** |
 | Phase 4 Option A — variant field unboxing (#440) | Each user variant whose declaration spells `Int` / `Real` literally gets a typed payload slot encoded in `slot_mask`; the runtime walkers (free, eq, to_string, reuse) branch on per-slot kind; cells with all-pointer payloads stay on the legacy hot path. | 🟡 layout shipped 2026-05-14, gate not met | 12.6× C on RB-tree (down from 15.9× C baseline #439). Target was ≤ 10× C; follow-up lane needed for primitive-slot extract that survives without a fresh `kai_int` alloc. |

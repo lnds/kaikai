@@ -468,6 +468,13 @@ static int64_t kai_rc_alloc_by_tag[16] = {0};
 /* issue #118 — Perceus reuse-in-place counter. Bumped by every
  * successful in-place rewrite in kai_reuse_or_alloc_* (further down). */
 static int64_t kai_rc_reuse_total = 0;
+/* Phase 1.B.1 — incref/decref call counters (the ones that actually
+ * touch `rc`; pinned/INT32_MAX short-circuits are NOT counted). Lets a
+ * borrow optimisation that elides incref/decref pairs show its effect
+ * directly (alloc_total is unchanged by a borrow — the head is never
+ * allocated, only refcounted). Only compiled under -DKAI_TRACE_RC. */
+static int64_t kai_rc_incref_total = 0;
+static int64_t kai_rc_decref_total = 0;
 
 static const char *kai_rc_tag_name(int t) {
     switch (t) {
@@ -510,6 +517,10 @@ static void kai_rc_report(void) {
         fprintf(stderr, "[KAI_TRACE_RC]   reuse_in_place=%lld\n",
                 (long long) kai_rc_reuse_total);
     }
+    /* Phase 1.B.1 — RC traffic (rc-touching incref/decref calls). */
+    fprintf(stderr, "[KAI_TRACE_RC]   incref_total=%lld decref_total=%lld\n",
+            (long long) kai_rc_incref_total,
+            (long long) kai_rc_decref_total);
 }
 
 static int kai_rc_registered = 0;
@@ -1371,6 +1382,7 @@ static KaiValue *kai_incref(KaiValue *v) {
     KAI_PROF_ENTER();
     v->rc++;
 #ifdef KAI_TRACE_RC
+    kai_rc_incref_total++;
     kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
     KAI_PROF_EXIT(incref);
@@ -2104,6 +2116,7 @@ static void kai_decref(KaiValue *v) {
     if (v->rc == INT32_MAX) return;   /* m5 #7 — singleton, saturated */
     KAI_PROF_ENTER();
 #ifdef KAI_TRACE_RC
+    kai_rc_decref_total++;
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
     if (--v->rc == 0) {
@@ -2148,34 +2161,59 @@ static KaiValue *kai_bool(int b) {
  * The flag lazily initializes the table on first call so the
  * constructor stays trivial when the program never reaches one
  * of these constructors (e.g., a fizzbuzz that only allocates
- * strings). The ranges are deliberately narrow:
- *   - Int  [-128..127]: covers tight loop indices, list lengths
- *     under ~100 elements, comparison constants, AST tag ints.
+ * strings).
+ *
+ * Phase 1.A (perceus-int-cache, 2026-05-29): widened the Int range
+ * from [-128..127] to [-65536..65535] (131072 entries). Measurement
+ * (docs/benchmarks/perceus_promise_2026-05-29.md) showed that once
+ * reuse-in-place eliminates cons-cell allocation, the entire residual
+ * cost of a hot scalar workload is the `kai_int(...)` box minted for
+ * every arithmetic result — and the typical values (loop indices,
+ * lengths, tags, modest compute) all fall under 64Ki. Widening the
+ * cache makes those values value-immediate-ish (a pinned shared box,
+ * never freed, never re-alloc'd) WITHOUT touching the ABI or the
+ * emitted text — so selfhost stays byte-identical. This is NOT
+ * value-immediate / tagged-pointer scalars: ints outside the range
+ * still allocate. It removes the alloc for the measured typical case,
+ * nothing more. Tagged pointers + raw-slot extract (Phase 1.B) remain
+ * the real follow-up for full scalar Perceus.
+ *
+ * The ranges:
+ *   - Int  [-65536..65535]: covers loop indices, list lengths, AST
+ *     tag ints, and most modest arithmetic. ~5 MB static .bss table.
  *   - Char [0..127]: ASCII printable + control. UTF-8 multibyte
  *     codepoints fall through to a fresh alloc.
- * On the kaic2 self-compile, the int+char tags account for
- * ~39M of 66M total allocs; the cache wipes most of those out
- * without changing any caller. */
-#define KAI_INT_CACHE_LO   ((int64_t) -128)
-#define KAI_INT_CACHE_HI   ((int64_t) 127)
-#define KAI_INT_CACHE_SIZE 256
+ * The table is lazily warmed on first in-range `kai_int` (O(size)
+ * one-shot, ~131k trivial stores, well under 1 ms — kept lazy so a
+ * program that never mints an in-range Int pays nothing). */
+#define KAI_INT_CACHE_LO   ((int64_t) -65536)
+#define KAI_INT_CACHE_HI   ((int64_t) 65535)
+#define KAI_INT_CACHE_SIZE 131072
 #define KAI_CHAR_CACHE_HI  ((uint32_t) 127)
 #define KAI_CHAR_CACHE_SIZE 128
 
 static KaiValue kai_int_cache[KAI_INT_CACHE_SIZE];
 static KaiValue kai_char_cache[KAI_CHAR_CACHE_SIZE];
-static int kai_int_cache_init  = 0;
 static int kai_char_cache_init = 0;
 
-static void kai_int_cache_warm(void) {
-    for (int k = 0; k < KAI_INT_CACHE_SIZE; k++) {
-        kai_int_cache[k].rc = INT32_MAX;
-        kai_int_cache[k].tag = KAI_INT;
-        kai_int_cache[k].as.i = (int64_t) k + KAI_INT_CACHE_LO;
-    }
-    kai_int_cache_init = 1;
-}
-
+/* Per-entry lazy warm for the Int cache (Phase 1.A, 2026-05-29).
+ *
+ * The widened range (131072 entries x 48 B = 6 MB) makes a one-shot
+ * O(size) warm a 6 MB RSS hit on the FIRST in-range int — paid even
+ * by a program that only ever mints `0` and `1`. Measured: a hello
+ * world jumped 1.5 MB -> 6.8 MB under the eager warm.
+ *
+ * Instead we initialize each cache slot the first time its exact value
+ * is requested. A never-warmed slot is all-zero (.bss), i.e.
+ * rc == 0 != INT32_MAX, so the `rc != INT32_MAX` test detects it. This
+ * touches only the OS pages (4 KB) backing the int values actually
+ * used, so RSS scales with the program's working set of small ints,
+ * not with the cache range. The pinned `rc = INT32_MAX` still makes
+ * `kai_incref` / `kai_decref` short-circuit, and the returned pointer
+ * is stable for the process lifetime (slots are never re-warmed once
+ * pinned). One extra branch per in-range `kai_int`, predictably taken
+ * after the slot is hot. (CPython's small-int cache warms eagerly; we
+ * warm lazily because our range — and entry size — is far larger.) */
 static void kai_char_cache_warm(void) {
     for (int k = 0; k < KAI_CHAR_CACHE_SIZE; k++) {
         kai_char_cache[k].rc = INT32_MAX;
@@ -2187,8 +2225,13 @@ static void kai_char_cache_warm(void) {
 
 static KAI_RC_NOINLINE KaiValue *kai_int(int64_t i) {
     if (i >= KAI_INT_CACHE_LO && i <= KAI_INT_CACHE_HI) {
-        if (!kai_int_cache_init) kai_int_cache_warm();
-        return &kai_int_cache[i - KAI_INT_CACHE_LO];
+        KaiValue *slot = &kai_int_cache[i - KAI_INT_CACHE_LO];
+        if (slot->rc != INT32_MAX) {       /* cold .bss slot -> warm it */
+            slot->rc = INT32_MAX;
+            slot->tag = KAI_INT;
+            slot->as.i = i;
+        }
+        return slot;
     }
     KaiValue *v = kai_alloc(KAI_INT);
     v->as.i = i;
