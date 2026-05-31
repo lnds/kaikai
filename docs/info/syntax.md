@@ -390,6 +390,50 @@ fn main() : Int = 0
 The checker reports each hole with expected type and bindings in
 scope under `kai build --holes file.kai`. JSON via `--holes-json`.
 
+## Regions
+
+`region { ... }` is an expression-block. List/record/variant
+constructors written **lexically inside** the block are bump-allocated
+in a per-region arena that frees in one shot at the closing brace,
+skipping reference counting entirely. Opt-in — you write `region`; the
+compiler never infers it.
+
+```kaikai
+fn sum_list(xs: [Int]) : Int = match xs {
+  []        -> 0
+  [h, ...t] -> h + sum_list(t)
+}
+
+fn main() : Unit / Stdout = {
+  let total = region {                          # bump-arena scope
+    let a = [1, 2, 3, 4, 5]                      # built in the arena
+    let b = [10, 20, 30]                         # built in the arena
+    sum_list(a) + sum_list(b)                    # scalar result
+  }                                              # whole arena freed here
+  Stdout.print("#{int_to_string(total)}")
+}
+```
+
+The block's value is wrapped in a deep-copy-out: a **scalar passes
+through free** (nothing crosses the arena boundary), but a **pointer
+that escapes** the brace is deep-copied onto the RC heap before the
+arena dies. That copy is the cost — so regions pay off only when the
+result is a scalar (or nothing escapes).
+
+Two limits to know:
+
+- **Escaping data is a net loss.** If the block returns a list/record
+  that outlives it, the deep-copy-out makes `region` *slower* than the
+  plain RC heap. The niche is escape-free scratch.
+- **Only lexically-inside constructors are arena-routed.** A
+  `region { build(...) }` where `build` is a helper allocates nothing in
+  the arena — the helper's constructors run under the normal heap. To
+  benefit, write the throwaway allocation inline in the block.
+
+The sweet spot: a hot loop that builds throwaway aggregates inline and
+folds them to a scalar. See `examples/perceus/region_scratch.kai` and
+the benchmark in `docs/benchmarks/region-120-2026-05-31.md`.
+
 ## NOT IN KAIKAI
 
 These look plausible but DO NOT EXIST. Do not write them.
