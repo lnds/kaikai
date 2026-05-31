@@ -155,6 +155,18 @@ KaiValue *kaix_prelude_int_to_string(KaiValue *v)  { return kai_prelude_int_to_s
 KaiValue *kaix_string_concat(KaiValue *a, KaiValue *b)         { return kai_string_concat(a, b); }
 KaiValue *kaix_to_string(KaiValue *v)                           { return kai_to_string(v); }
 
+/* Issue #86: contract / plain asserts under the LLVM backend. The C
+   backend has always lowered `SAssert` to `kai_assert_check`; the LLVM
+   arm used to be a no-op (cond evaluated for effects, bool discarded),
+   so contracts never fired under LLVM. These forwarders wire the same
+   runtime entry points, with `kaix_assert_check_with_value` carrying
+   the offending binding's runtime value (issue #86 piece 2). */
+void      kaix_assert_check(KaiValue *cond, const char *msg)    { kai_assert_check(cond, msg); }
+void      kaix_assert_check_with_value(KaiValue *cond, const char *base_msg,
+                                       const char *ident_name, KaiValue *val) {
+    kai_assert_check_with_value(cond, base_msg, ident_name, val);
+}
+
 KaiValue *kaix_range(KaiValue *from, KaiValue *to)              { return kai_range(from, to); }
 KaiValue *kaix_range_step(KaiValue *f, KaiValue *t, KaiValue *s){ return kai_range_step(f, t, s); }
 

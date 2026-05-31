@@ -1307,6 +1307,108 @@ fn expr_show_pred(e: Expr) : String = match e.kind {
   _ -> "<expr>"
 }
 
+# Issue #86 (piece 2): when a contract predicate has the simple shape
+# `<ident> <cmp> <literal>` (e.g. `b != 0.0`, `n >= 0`, `c == 'x'`),
+# return the offending parameter so the emitter can attach the binding's
+# runtime value to the violation panic. Returns None for any other shape
+# (two idents, nested expressions, calls, unops) — the emitter then
+# falls back to the value-less `kai_assert_check`, with no regression.
+# The single-EVar / scalar-literal restriction is what lets the emitter
+# safely reference the *one* already-bound local; richer predicates
+# would need to evaluate sub-expressions, which the panic path must not
+# do (re-emitting would double-evaluate side effects and break Perceus
+# RC).
+#
+# A matched simple-shape predicate carries two nodes:
+#   - the ident EVar node — its `mode` is the *repr oracle*. The emitter
+#     mirrors exactly what `emit_expr` would do for this same node: a
+#     raw-unboxed EVar reads from `kair_<name>`, a boxed one from
+#     `kai_<name>`. Using the ident node's own mode (not the literal's)
+#     guarantees the emitter and `emit_expr` agree on which C local
+#     name exists — the local's repr is a property of the *binding*,
+#     not of how the comparison happened to be lowered.
+#   - the literal node — its `ty` is the *box-type oracle* for the raw
+#     case (Perceus never rewrites a literal, so its `ty` is always
+#     present, whereas a dup-wrapped ident node's `ty` may be blank).
+pub type ContractIdent = CtrId(String, Expr, Expr)
+#                              ^name  ^ident ^literal
+
+pub fn contract_single_ident(pred: Expr) : Option[String] =
+  match contract_single_ident_node(pred) {
+    Some(ci) -> match ci { CtrId(nm, _, _) -> Some(nm) }
+    None -> None
+  }
+
+# Simple-shape detector for the C / LLVM emitters: returns the binding
+# name, the ident node (repr oracle), and the comparison literal (box-ty
+# oracle) so they can attach the binding's runtime value to a
+# contract-violation panic.
+pub fn contract_single_ident_node(pred: Expr) : Option[ContractIdent] = match pred.kind {
+  EBinop(op, a, b) ->
+    if pred_op_is_cmp(op) {
+      match expr_pred_ident_node(a) {
+        Some(na) -> if expr_pred_is_scalar_lit(b) { Some(CtrId(ci_name(na), na, b)) } else { None }
+        None -> match expr_pred_ident_node(b) {
+          Some(nb) -> if expr_pred_is_scalar_lit(a) { Some(CtrId(ci_name(nb), nb, a)) } else { None }
+          None -> None
+        }
+      }
+    } else { None }
+  _ -> None
+}
+
+fn ci_name(e: Expr) : String = match e.kind { EVar(s) -> s _ -> "?" }
+
+# Does this EStr span (raw — includes the opening quote) start with the
+# load-bearing `requires violated` contract prefix? The value-carrying
+# panic path (issue #86 piece 2) is narrowed to `requires` because a
+# requires-assert runs before the body consumes any param, so the
+# offending binding's local is guaranteed live; an ensures-assert may
+# reference an already-consumed param. Shared by the C and LLVM emitters.
+pub fn assert_span_is_requires(span: String) : Bool =
+  assert_span_prefix_loop(span, "\"requires violated", 0)
+
+fn assert_span_prefix_loop(s: String, prefix: String, i: Int) : Bool {
+  let pn = string_length(prefix)
+  if i >= pn { true }
+  else { match char_at(s, i) {
+    None -> false
+    Some(sc) -> match char_at(prefix, i) {
+      None -> true
+      Some(pc) -> if sc == pc { assert_span_prefix_loop(s, prefix, i + 1) } else { false }
+    }
+  } }
+}
+
+fn pred_op_is_cmp(op: String) : Bool =
+  op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">="
+
+# Recover the bare ident node behind a predicate operand. By emit time
+# the Perceus pass may have wrapped a non-last read as
+# `__perceus_dup(<ident>)`; unwrap that one layer so the simple-shape
+# detector still fires on `b != 0.0` whether or not `b` is read again
+# later in the body. The returned node carries the `mode`/`ty` the
+# emitter needs to pick boxed vs raw repr; the emitter only references
+# the bound local, never re-emits this sub-expression.
+fn expr_pred_ident_node(e: Expr) : Option[Expr] = match e.kind {
+  EVar(_) -> Some(e)
+  ECall(callee, args) -> match callee.kind {
+    EVar(dn) -> if dn == "__perceus_dup" or dn == "__perceus_drop" {
+      match args { [a] -> expr_pred_ident_node(a) _ -> None }
+    } else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn expr_pred_is_scalar_lit(e: Expr) : Bool = match e.kind {
+  EInt(_) -> true
+  EReal(_) -> true
+  EBool(_) -> true
+  EChar(_) -> true
+  _ -> false
+}
+
 # Walk a body expression collecting reports for every ECall(EVar, ...).
 # Calls into anonymous lambdas, method calls, etc. are skipped — the
 # entailment table is keyed by fn name and we don't track higher-order
