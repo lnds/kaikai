@@ -511,6 +511,15 @@ pub fn llvm_header() : String =
     "declare %KaiValue* @kaix_bit_toggle(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_string_concat(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_to_string(%KaiValue*)\n",
+    # Issue #86: contract / plain asserts. The LLVM `SAssert` arm used
+    # to be a no-op; these wire the same runtime entry points as the C
+    # backend. The IR declare signatures MUST match the forwarder
+    # definitions in stage0/runtime_llvm.c byte-for-byte (a swapped
+    # `i8*` / `%KaiValue*` compiles silently in C but mismatches the
+    # ABI — the #732/#736 bug class). `kaix_assert_check_with_value`
+    # carries the offending binding's runtime value (issue #86 piece 2).
+    "declare void         @kaix_assert_check(%KaiValue*, i8*)\n",
+    "declare void         @kaix_assert_check_with_value(%KaiValue*, i8*, i8*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_range(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_range_step(%KaiValue*, %KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_closure(i8*, i32, i32, i8*)\n",
@@ -4153,10 +4162,7 @@ fn llvm_emit_stmt(e: LlvmEmit, s: Stmt) : LlvmEmit / Console {
         }
       }
     }
-    SAssert(cond, _) -> {
-      # Evaluate for side effects; assert-message handling is M3b+.
-      llvm_emit_expr(e, cond)
-    }
+    SAssert(cond, opt_m) -> llvm_emit_assert(e, cond, opt_m)
     SExprStmt(ex) -> {
       # #293 Phase 2.1: a stmt-position expression is always
       # discarded — emit_expr returns an owned ref (perceus_pass
@@ -4185,6 +4191,120 @@ fn llvm_emit_stmt(e: LlvmEmit, s: Stmt) : LlvmEmit / Console {
       e
     }
   }
+}
+
+# Issue #86: lower `SAssert` under the LLVM backend (previously a
+# no-op, so contracts never fired). Mirrors the C `emit_assert_stmt`:
+# `cond` is emitted exactly once; the boxed result is consumed by the
+# runtime assert helper. When the message is a `requires` contract
+# violation whose predicate has the simple `<ident> <cmp> <literal>`
+# shape, the offending binding's runtime value is forwarded too (piece
+# 2), restricted to `requires` for the same liveness reason as C.
+fn llvm_emit_assert(e: LlvmEmit, cond: Expr, opt_m: Option[Expr]) : LlvmEmit / Console {
+  # When a value is forwarded, the incref/box of the offending binding
+  # must be emitted BEFORE the condition: evaluating the condition
+  # consumes that binding's local (the `kaix_*` comparison helpers
+  # decref both operands), so reading it afterwards for the incref
+  # would touch a freed object (boxed repr) — the LLVM mirror of the C
+  # statement-expression ordering. So the value path captures the value
+  # first, then emits the condition, then the call.
+  match opt_m {
+    Some(m) -> match m.kind {
+      EStr(span, false) ->
+        if assert_span_is_requires(span) {
+          match contract_single_ident_node(cond) {
+            # The ident node's mode is the repr oracle in C; here the
+            # `locals` table is, so the ident node itself is unused.
+            Some(ci) -> match ci {
+              CtrId(ident, _, lit) -> {
+                let vb = llvm_emit_contract_value(e, ident, lit)
+                let val_reg = vb.last_val
+                let ec = llvm_emit_expr(vb, cond)
+                llvm_emit_assert_call_with_value(ec, ec.last_val, span, ident, val_reg)
+              }
+            }
+            None -> {
+              let ec = llvm_emit_expr(e, cond)
+              llvm_emit_assert_plain(ec, ec.last_val, span)
+            }
+          }
+        } else {
+          let ec = llvm_emit_expr(e, cond)
+          llvm_emit_assert_plain(ec, ec.last_val, span)
+        }
+      _ -> {
+        let ec = llvm_emit_expr(e, cond)
+        llvm_emit_assert_plain(ec, ec.last_val, "\"assertion failed\"")
+      }
+    }
+    None -> {
+      let ec = llvm_emit_expr(e, cond)
+      llvm_emit_assert_plain(ec, ec.last_val, "\"assertion failed\"")
+    }
+  }
+}
+
+# Build the `i8*` gep for a contract-message body. `span` includes the
+# surrounding quotes and `\n` escapes; strip the quotes and let
+# `llvm_emit_string_const_enc` decode the escapes (mirror of
+# `llvm_emit_plain_str_body`, but yielding the pointer rather than a
+# boxed `kaix_str`).
+fn llvm_emit_msg_gep(e: LlvmEmit, span: String) : LlvmNameLabel {
+  let body = llvm_str_body(span)
+  let label_id = llvm_fresh_label(e, "assert.msg.")
+  let sc = llvm_emit_string_const_enc(label_id.reg, body)
+  let e2 = llvm_append_global(label_id.e, sc.text)
+  LlvmNameLabel { e: e2, gep: llvm_gep_str(label_id.reg, sc.n) }
+}
+
+fn llvm_emit_assert_plain(e: LlvmEmit, cond_reg: String, span: String) : LlvmEmit {
+  let mg = llvm_emit_msg_gep(e, span)
+  llvm_append_body(mg.e,
+    concat_all(["  call void @kaix_assert_check(%KaiValue* ", cond_reg,
+                ", i8* ", mg.gep, ")\n"]))
+}
+
+# Emit the owned `%KaiValue*` value arg, leaving it on `last_val`. The
+# helper CONSUMES it: a raw-unboxed local is boxed fresh; a boxed local
+# is forwarded via a fresh `kaix_incref` ref so the local's own ref
+# (and any Perceus drop) stays balanced. The `locals` table is the
+# definitive repr oracle (more robust than any AST `mode`): a `LRaw`
+# entry means the binding is stored raw, an `LL` entry means boxed. The
+# literal's `ty` is the box-type fallback when a raw local lacks a
+# recorded type. Emitted BEFORE the condition (see `llvm_emit_assert`).
+fn llvm_emit_contract_value(e: LlvmEmit, ident: String, lit: Expr) : LlvmEmit {
+  match llvm_raw_local_find(e.locals, ident) {
+    Some(r) -> match r {
+      LRaw(_, reg, t) -> llvm_box_wrap_value(e, reg, Some(t))
+      _ -> llvm_box_wrap_value(e, "0", lit.ty)
+    }
+    None -> match llvm_local_find(e.locals, ident) {
+      Some(reg) -> llvm_emit_incref_value(e, reg)
+      # Defensive: neither a raw nor a boxed local resolves (should not
+      # happen for a param read at a requires-assert). Emit a 0-box so
+      # the call stays well-typed rather than referencing a missing reg.
+      None -> llvm_box_wrap_value(e, "0", lit.ty)
+    }
+  }
+}
+
+fn llvm_emit_assert_call_with_value(e: LlvmEmit, cond_reg: String, span: String,
+                                    ident: String, val_reg: String) : LlvmEmit {
+  let mg = llvm_emit_msg_gep(e, span)
+  let idg = llvm_emit_name_constant(mg.e, ident, "assert.id.")
+  llvm_append_body(idg.e,
+    concat_all(["  call void @kaix_assert_check_with_value(%KaiValue* ", cond_reg,
+                ", i8* ", mg.gep, ", i8* ", idg.gep,
+                ", %KaiValue* ", val_reg, ")\n"]))
+}
+
+# Forward a boxed local as a fresh owned ref (`kaix_incref` returns the
+# same pointer with the refcount bumped). Leaves `last_val` on the
+# incref'd register so the assert helper can consume it.
+fn llvm_emit_incref_value(e: LlvmEmit, reg: String) : LlvmEmit {
+  let r = llvm_fresh_reg(e)
+  let instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_incref(%KaiValue* ", reg, ")\n"])
+  llvm_set_last(llvm_append_body(r.e, instr), r.reg)
 }
 
 # ---- fn emission ----

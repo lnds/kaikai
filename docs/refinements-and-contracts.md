@@ -379,25 +379,29 @@ Neither participates in effect inference.
 specialised messages with the predicate text, the offending
 value, and the call site.
 
-> **v2 status (2026-05-08, refs #86):** the runtime panic now
-> emits clause kind, function name, rendered predicate, and
-> decl-site line/col. Call-site span and runtime value of the
-> offending binding are still pending. Concretely, today's
-> output is:
+> **v2 status (2026-05-30, refs #86):** the runtime panic now
+> emits clause kind, function name, rendered predicate, decl-site
+> line/col, **and the runtime value of the offending binding** for
+> `requires` predicates of the simple `<ident> <cmp> <literal>`
+> shape (the predicate-aware piece-1 context plus the piece-2
+> value line). Both backends (C and LLVM) produce identical output.
+> Concretely, today's output is:
 >
 > ```
 > panic: requires violated in `divide`
 > required: b != 0
 > declared at line 15, col 14
+> argument b was: 0
 > ```
 >
-> The aspirational form below — call-site `--> file:line:col`
-> caret, "argument `b` was: 0.0", and the help suggestion — is
-> the v3 target. Issue #86 stays open to track it; threading the
-> caller's span into the assert insertion is the load-bearing
-> piece that v2 deferred.
+> Still pending (the aspirational form below): the call-site
+> `--> file:line:col` caret and the `help: narrow b to ...`
+> suggestion. The help line needs the binding's *base* type from
+> the typer, which is not available at the assert-insertion site;
+> the caller-span caret needs the call-site span threaded into the
+> assert. Issue #86 stays open to track those two pieces.
 
-Aspirational target (v3, tracked under #86):
+Aspirational target (call-site caret + narrowing help, tracked under #86):
 
 ```
 error: precondition violated in `divide`
@@ -619,8 +623,10 @@ is doc duplication.
    day specifically for diagnostics — show the predicate text,
    the offending value, suggest a narrowing helper. *v2 (refs
    #86) shipped predicate text + clause kind + function name +
-   decl-site line/col; runtime value + call-site span are the
-   v3 target tracked under the same issue.*
+   decl-site line/col + the runtime value of the offending
+   binding (for simple `requires` predicates, both backends).
+   The call-site span caret and the narrowing-help suggestion
+   remain the follow-up tracked under the same issue.*
 
 6. **Composition with UoM**. `Decimal<USD> where >= 0`
    composes correctly when canonicalised; but error messages
