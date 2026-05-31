@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages test-binserialize-budget demos-verify demos-no-regression selfhost clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages test-binserialize-budget demos-verify demos-no-regression selfhost test-arena clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -166,8 +166,15 @@ clean:
 #
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost demos-no-regression
-	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds"
+tier0: selfhost demos-no-regression test-arena
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes"
+
+# issue #120 — opt-in Perceus regions: P0 runtime arena gate. Plain +
+# ASAN build of the C-level bump-arena fixture. Fast (~1s), no kaic2
+# dependency, so it runs in tier0 and again under tier1-asan.
+test-arena:
+	@echo "== test-arena: bump-arena runtime gate (plain + ASAN) =="
+	@bash tools/run-arena-c-fixture.sh
 
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
@@ -441,7 +448,7 @@ test-packages: kaic2
 # scopes) within 24h of merge — not gating. CI: invoked from
 # `make daily` so `.github/workflows/daily.yml` picks it up
 # automatically.
-tier1-asan: kaic2
+tier1-asan: kaic2 test-arena
 	@ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	 $(MAKE) -C demos verify \

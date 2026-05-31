@@ -292,6 +292,47 @@ KaiValue *kaix_incref(KaiValue *v)                        { return kai_incref(v)
    the binding when last-use analysis proves the name is unread. */
 void      kaix_decref(KaiValue *v)                        { kai_decref(v); }
 
+/* ---------- issue #120: opt-in Perceus regions ----------
+ * The LLVM backend lowers `region { ... }` to kaix_arena_push on entry,
+ * kaix_arena_pop on exit, and routes every constructor inside the block
+ * through kaix_arena_alloc — the SAME C arena helpers the C backend
+ * calls inline (docs/issue-120-regions-design.md: one helper, both
+ * backends, no separate LLVM bump-alloc). The arena stack is a runtime
+ * global, so push/pop/alloc need no KaiArena* across the IR boundary.
+ * P0 links these even though no lowering emits them yet — the
+ * build-release.sh LLVM smoke gate verifies the symbols resolve. */
+void      kaix_arena_push(void)                          { (void) kai_arena_push(); }
+void      kaix_arena_pop(void)                           { kai_arena_pop(); }
+KaiValue *kaix_arena_alloc(KaiTag tag) {
+    KaiArena *a = kai_arena_current();
+    /* Defensive: if codegen ever calls this outside a region (a bug),
+     * fall back to the normal RC heap rather than dereference NULL. */
+    return a ? kai_arena_alloc(a, tag) : kai_alloc(tag);
+}
+
+/* issue #120 — opt-in Perceus regions (Phase P1): arena-backed
+ * constructor + deep-copy-out shims, mirroring the C-backend helpers so
+ * both emitters call the SAME runtime code (no separate LLVM path). */
+KaiValue *kaix_arena_cons(KaiValue *h, KaiValue *t)                       { return kai_arena_cons(h, t); }
+KaiValue *kaix_arena_record(int n, KaiValue **fields, const char **names) { return kai_arena_record(n, fields, names); }
+KaiValue *kaix_arena_variant(int32_t tag, const char *name, int n, KaiValue **args) {
+    /* Same boxed-args bridge as kaix_variant: stamp into slot-mask shape
+     * with mask 0 and forward to the arena variant ctor. */
+    if (n <= 0) return kai_arena_variant(tag, name, 0, 0, NULL);
+    KaiVarSlot stack_slots[16];
+    KaiVarSlot *slots = stack_slots;
+    KaiVarSlot *heap = NULL;
+    if (n > (int)(sizeof(stack_slots) / sizeof(stack_slots[0]))) {
+        heap = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+        slots = heap;
+    }
+    for (int i = 0; i < n; i++) slots[i].ptr = args[i];
+    KaiValue *r = kai_arena_variant(tag, name, n, 0, slots);
+    if (heap) free(heap);
+    return r;
+}
+KaiValue *kaix_deep_copy_out(KaiValue *v)                                 { return kai_deep_copy_out(v); }
+
 /* ---------- M3e: lists + closures-with-captures ---------- */
 KaiValue *kaix_cons(KaiValue *h, KaiValue *t)            { return kai_cons(h, t); }
 KaiValue *kaix_nil(void)                                  { return kai_nil(); }

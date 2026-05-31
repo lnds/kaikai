@@ -28,6 +28,7 @@ import compiler.fmt
 import compiler.cache
 import compiler.modules
 import compiler.desugar
+import compiler.region
 import compiler.infer
 import compiler.fnreg
 import compiler.unbox
@@ -4741,9 +4742,27 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # diagnostics; on errs > 0 we short-circuit before
             # invariants downstream can panic on the still-tagged AST.
             let pos_rec = desugar_pos_records_decls(raw_decls_pre_pos, path)
-            let raw_decls = pos_rec.decls
+            let raw_decls_with_regions = pos_rec.decls
             let pos_rec_errs = pos_rec.errs
             if pos_rec_errs > 0 { pos_rec_errs } else {
+            # issue #120: opt-in Perceus regions. Unwrap the
+            # `region { }` markers (`ECall(EVar("region"), [block])`) the
+            # parser emitted, as the FIRST post-parse rewrite — before
+            # any other desugar pass can choke on the unusual "block as a
+            # call argument" shape (a marker that survives into a pass
+            # whose match assumes call args are non-blocks panics with
+            # "non-exhaustive match"). Records the region side table
+            # (`region_marks`, consumed by the emitter in P1 for arena
+            # lowering + deep-copy-out at the block border) and replaces
+            # each marker with its bare block, so every downstream pass +
+            # the typer + both emitters see an ordinary block. P2a lowers
+            # regions to ordinary RC alloc, so selfhost stays
+            # byte-identical for non-region code; v1 escape policy is
+            # deep-copy-out at emit, not compile-time rejection, so this
+            # rewrite emits no diagnostics. Lexical — no resolved binders.
+            let region_rw = rewrite_regions_decls(raw_decls_with_regions, path)
+            let raw_decls = region_rw.decls
+            let region_marks = region_rw.regions
             # m7b #6: pre-resolve desugar of `a[i]` and `a[i] := v` into
             # the underlying array_get / array_set calls. Runs before
             # name resolution so every downstream pass sees only the
@@ -5116,9 +5135,9 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       else if mono_dispatch_errs != 0 { mono_dispatch_errs }
                       else {
                         let out = if use_llvm {
-                          emit_program_llvm(path, src, perceus_decls)
+                          emit_program_llvm(path, src, perceus_decls, region_marks)
                         } else {
-                          emit_program(path, src, perceus_decls, bmode, Some(target_mod_name))
+                          emit_program(path, src, perceus_decls, bmode, Some(target_mod_name), region_marks)
                         }
                         print(out)
                         0
