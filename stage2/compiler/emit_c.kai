@@ -2845,6 +2845,151 @@ fn emit_match_arm_reuse_cons(src: String, arm_lcs: [String], rca: ReuseConsArm,
   }
 }
 
+# Phase 1.B.3 — 1:1 variant reuse arm. Mirrors `try_reuse_cons_arm`
+# generalised to N typed slots. Detects an arm whose pattern is
+# `PVariant(C, subs)` and whose body is `__perceus_reuse_variant(_scr,
+# C(args))` rebuilding the SAME ctor name + arity. That is the shape the
+# cons dual-path generalises safely (the matched cell maps directly onto
+# the rebuilt cell, slot-for-slot). The recolor case in insert_loop
+# (`RBNode(c,l,k0,v,r)`) and balance's default arm match; the rotation
+# cases (a different ctor nesting) do not and fall through.
+type ReuseVariantArm = ReuseVariantArm([Pattern], String, [Expr], [TypeExpr])
+
+# Detect a 1:1 variant reuse arm. The arm body, post-perceus, is the
+# sentinel `__perceus_reuse_variant(_scr, C(args))`. We match the
+# pattern ctor against the rebuilt ctor (same name + arity) and pull the
+# payload types from the EVar registry. Mirrors the working extractor in
+# emit_call_value (the `__perceus_reuse_variant` branch) exactly — the
+# body IS the sentinel ECall here (the recogniser wraps the arm-tail
+# directly, and emit_match_arm receives that tail as `body`).
+fn try_reuse_variant_arm(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseVariantArm] {
+  match pat.pkind {
+    PVariant(pcname, subs) -> match body.kind {
+      ECall(scallee, sargs) -> match scallee.kind {
+        EVar(sname) ->
+          if sname == "__perceus_reuse_variant" {
+            match sargs {
+              [_scr_arg, ctor] -> match reuse_ctor_name(ctor) {
+                Some(bcname) -> match ctor.kind {
+                  ECall(_cf, cargs) ->
+                    if pcname == bcname and list_length(subs) == list_length(cargs) {
+                      match evar_payload_tys(cx.variants, bcname) {
+                        Some(tys) ->
+                          if list_length(tys) == list_length(subs) {
+                            Some(ReuseVariantArm(subs, bcname, cargs, tys))
+                          } else { None }
+                        None -> None
+                      }
+                    } else { None }
+                  _ -> None
+                }
+                None -> None
+              }
+              _ -> None
+            }
+          } else { None }
+        _ -> None
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+# Emit the 1:1 variant reuse arm, mirroring emit_match_arm_reuse_cons.
+# Unique branch: borrow-bind each slot (ptr: no incref; prim: raw .i64/.r
+# copy), eval the new ctor args (which consume the borrowed binds via the
+# perceus-inserted dup/drop), overwrite slots in place WITHOUT decref-ing
+# the old pointer slots (transferred). Fallback: owned binds + fresh ctor.
+fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVariantArm,
+                                cx: EmitCtx) : String / Console {
+  let arm_cx = emit_ctx_with_lcs(cx, arm_lcs)
+  match rva {
+    ReuseVariantArm(subs, cname, cargs, tys) -> {
+      let n = list_length(subs)
+      let mask = variant_slot_mask(tys)
+      let tag_str = int_to_string(evar_find_tag(cx.variants, cname))
+      let borrow_binds = rv_slot_binds(subs, tys, 0, true, cx)
+      let owned_binds  = rv_slot_binds(subs, tys, 0, false, cx)
+      # The new-ctor-arg expressions reference the pattern binders
+      # (`kai_<nm>`), so they MUST be emitted under `arm_cx` (lcs
+      # extended with the binder names). Emitting under the bare `cx`
+      # resolved a binder named like a stdlib fn (e.g. `tail`) to the
+      # GLOBAL fn closure instead of the local bind — the latent
+      # corruption the cell free-list surfaced.
+      let new_temps    = rv_new_temps(src, cargs, tys, 0, arm_cx)
+      let overwrites   = rv_overwrites(cargs, tys, 0)
+      let fresh_slots  = emit_variant_slot_init_list(src, cargs, tys, arm_cx)
+      concat_all([
+        "if (kai_check_unique(_scr)) { ",
+        borrow_binds, new_temps, overwrites,
+        "_scr->as.var.variant_tag = ", tag_str, "; ",
+        "_scr->as.var.variant_name = \"", cname, "\"; ",
+        "_scr->as.var.slot_mask = ", int_to_string(mask), "; ",
+        "kai_rc_reuse_total++; _r = kai_incref(_scr); ",
+        "} else { ",
+        owned_binds,
+        "_r = kai_variant_u(", tag_str, ", \"", cname, "\", ", int_to_string(n),
+        ", ", int_to_string(mask), ", (KaiVarSlot[]){", fresh_slots, "}); ",
+        "}"
+      ])
+    }
+  }
+}
+
+# Bind each slot for a reuse arm. borrow=true → unique branch.
+fn rv_slot_binds(subs: [Pattern], tys: [TypeExpr], i: Int, borrow: Bool, cx: EmitCtx) : String {
+  match subs {
+    [] -> ""
+    [sp, ...rest] -> {
+      let k = match list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t) None -> 0 }
+      let slot = concat_all(["_scr->as.var.slots[", int_to_string(i), "]"])
+      let here = match sp.pkind {
+        PWild -> ""
+        PBind(nm) ->
+          if name_is_unused(nm) { "" }
+          else if k == 1 { concat_all(["KaiValue *kai_", nm, " = kai_int(", slot, ".i64); "]) }
+          else if k == 2 { concat_all(["KaiValue *kai_", nm, " = kai_real(", slot, ".r); "]) }
+          else if borrow { concat_all(["KaiValue *kai_", nm, " = ", slot, ".ptr; "]) }
+          else { concat_all(["KaiValue *kai_", nm, " = kai_incref(", slot, ".ptr); "]) }
+        _ -> ""
+      }
+      cat2(here, rv_slot_binds(rest, tys, i + 1, borrow, cx))
+    }
+  }
+}
+
+# Eval each new ctor arg into `_rv<i>` BEFORE any overwrite. Pointer
+# slots: boxed KaiValue*. Primitive slots: extract the raw scalar via
+# kai_take_int/kai_take_real (the arg is a boxed kai_int from the bind).
+fn rv_new_temps(src: String, cargs: [Expr], tys: [TypeExpr], i: Int, cx: EmitCtx) : String / Console {
+  match cargs {
+    [] -> ""
+    [e, ...rest] -> {
+      let k = match list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t) None -> 0 }
+      let here =
+        if k == 1 { concat_all(["int64_t _rv", int_to_string(i), " = kai_take_int(", emit_expr(src, e, cx), "); "]) }
+        else if k == 2 { concat_all(["double _rv", int_to_string(i), " = kai_take_real(", emit_expr(src, e, cx), "); "]) }
+        else { concat_all(["KaiValue *_rv", int_to_string(i), " = ", emit_expr(src, e, cx), "; "]) }
+      cat2(here, rv_new_temps(src, rest, tys, i + 1, cx))
+    }
+  }
+}
+
+# Overwrite each slot from its `_rv<i>` temp. Pointer slots written
+# WITHOUT decref of the old (transferred via the borrow bind).
+fn rv_overwrites(cargs: [Expr], tys: [TypeExpr], i: Int) : String {
+  match cargs {
+    [] -> ""
+    [_e, ...rest] -> {
+      let k = match list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t) None -> 0 }
+      let fld = if k == 1 { ".i64" } else if k == 2 { ".r" } else { ".ptr" }
+      cat2(concat_all(["_scr->as.var.slots[", int_to_string(i), "]", fld, " = _rv", int_to_string(i), "; "]),
+           rv_overwrites(rest, tys, i + 1))
+    }
+  }
+}
+
 fn emit_match_arm(src: String, a: Arm, cx: EmitCtx) : String / Console {
 
   match a {
@@ -2866,6 +3011,11 @@ fn emit_match_arm(src: String, a: Arm, cx: EmitCtx) : String / Console {
             let arm_body = emit_match_arm_reuse_cons(src, arm_lcs, rca, cx)
             concat_all(["    if (", pt, ") { ", arm_body, " break; }\n"])
           }
+          None -> match try_reuse_variant_arm(pat, body, cx) {
+            Some(rva) -> {
+              let arm_body = emit_match_arm_reuse_variant(src, arm_lcs, rva, cx)
+              concat_all(["    if (", pt, ") { ", arm_body, " break; }\n"])
+            }
           None -> {
             # _scr is shared across all match arms — subsequent arms re-read
             # it after this one's pat_test/guard rejects, and a guard inside
@@ -2889,6 +3039,7 @@ fn emit_match_arm(src: String, a: Arm, cx: EmitCtx) : String / Console {
             } else {
               concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
             }
+          }
           }
         }
         Some(g) -> {
