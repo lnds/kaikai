@@ -1,0 +1,423 @@
+# compiler/region.kai — issue #120 opt-in Perceus regions: surface
+# recognition + region side-table (Phase P2a). Drives arena lowering +
+# deep-copy-out in the emitter (Phase P1).
+#
+# THE SHAPE. The parser lowers `region { ... }` to the marker
+# `ECall(EVar("region"), [block])` where `block` is an `EBlock`
+# (parse.kai parse_region). `region` is not a fn, not an effect, and
+# not a lexer keyword — the marker exists ONLY between parse and this
+# pass. This pass:
+#   1. recognises the marker by shape (exactly as the nursery rewrite
+#      recognises `ECall(EVar("nursery"), ...)` in desugar.kai),
+#   2. records each region's (file,line,col,nth) in a side table so the
+#      emitter (P1) can bump-allocate the region's constructors into an
+#      arena, free the arena at block exit, and deep-copy-out any value
+#      that crosses the block boundary,
+#   3. UNWRAPS the marker back to the bare `block`, so the typer and
+#      both emitters see an ordinary block. In P2a the block lowers to
+#      ordinary RC alloc (selfhost stays byte-identical for non-region
+#      code; region code is just a normal block). P1 flips the lowering
+#      to arena alloc by consulting the side table.
+#
+# WHY A MARKER + UNWRAP, NOT A NEW AST NODE. A dedicated `ERegion`
+# variant would force a new arm at ~98 exhaustive ExprKind-matcher
+# sites across 18 modules (the `EHandle` matcher count). The marker
+# reuses ECall/EVar/EBlock — every matcher already handles those — so
+# there is zero byte-identity risk and zero non-exhaustive-match risk.
+# See docs/issue-120-regions-design.md.
+#
+# ESCAPE SEMANTICS (v1, asu + linus design doc, confirmed by Eduardo):
+# DEEP-COPY-OUT, not compile-time rejection. A value allocated inside a
+# `region { }` is bump-allocated in the region's arena. When such a
+# value crosses the block boundary — the block's final expression
+# value, a store into an outer binding, a closure capture, a fn-arg —
+# the EMITTER (P1) deep-copies it OUT of the arena with rc = 1 (NOT the
+# INT32_MAX arena sentinel; a sentinel-inheriting copy would never
+# free = leak). So `let x = region { [1, 2, 3] }` is LEGAL: the list is
+# built in the arena and copied out as an ordinary rc=1 value when it
+# leaves. For pure LIFO scratch (a buffer consumed and discarded inside
+# the block — issue #120's target) nothing crosses the border, so the
+# copy never fires and the whole region frees in one shot with zero RC
+# traffic. The PRECISE zero-copy escape (brand-in-signature + region
+# polymorphism via the deferred TyBranded work) is a documented v1.x
+# follow-up — see docs/lane-experience-issue-120.md.
+#
+# Therefore THIS PASS does NO escape checking and emits NO diagnostics.
+# Its whole job is to mark which blocks are regions (the side table)
+# and to strip the surface marker. The border-crossing detection +
+# deep-copy-out lives in the emitter (P1), where the lowering of each
+# region constructor and each block exit is generated.
+#
+# PIPELINE POSITION. Pre-typer, a sibling of the nursery rewrite in
+# the driver (driver.kai, just after the const-ref desugar, before
+# inference). Lexical only — no resolved binders needed, so it runs
+# before the fused resolve/infer. Perceus is NOT touched: P0's
+# `rc = INT32_MAX` arena sentinel already makes Perceus's reuse-in-place
+# auto-disable on region values for free (kai_check_unique returns 0).
+
+import compiler.ast
+import compiler.util
+
+# ---- side table ----------------------------------------------------
+
+# One recorded region: the source position of its `region` keyword plus
+# an ordinal so two regions sharing (line,col) after a span-copying
+# desugar never collide (the indexed-by-position bug-class — same key
+# discipline as rawsafe.kai's RSMark).
+#[doc("A recorded `region { }` block: file, line, col, nth (ordinal disambiguator).")]
+pub type RegionMark = RM(String, Int, Int, Int)
+
+pub fn rmark_line(m: RegionMark) : Int = match m { RM(_, l, _, _) -> l }
+pub fn rmark_col(m: RegionMark) : Int = match m { RM(_, _, c, _) -> c }
+pub fn rmark_nth(m: RegionMark) : Int = match m { RM(_, _, _, n) -> n }
+
+# Result of the region rewrite: the unwrapped decls plus the region
+# side table (consumed by the emitter in P1 for arena lowering).
+#[doc("Result of the region rewrite: unwrapped decls and the region side table.")]
+pub type RegionRwProgram = { decls: [Decl], regions: [RegionMark] }
+
+# ---- walk state ----------------------------------------------------
+
+# Threaded accumulator: the region side table plus a monotonic ordinal
+# so `nth` is deterministic across the whole program walk.
+type RWalk = { regions: [RegionMark], nth: Int }
+
+fn rw0() : RWalk = RWalk { regions: [], nth: 0 }
+
+# ---- entry point ---------------------------------------------------
+
+#[doc("issue #120: recognise `region { }` markers, record the region side table, and unwrap markers to bare blocks.")]
+pub fn rewrite_regions_decls(decls: [Decl], file: String) : RegionRwProgram {
+  let r = rw_decls_loop(decls, file, rw0(), [])
+  RegionRwProgram { decls: r.decls, regions: list_reverse(r.w.regions) }
+}
+
+type RWDecls = { decls: [Decl], w: RWalk }
+
+fn rw_decls_loop(decls: [Decl], file: String, w: RWalk, acc: [Decl]) : RWDecls {
+  match decls {
+    [] -> RWDecls { decls: list_reverse(acc), w: w }
+    [d, ...rest] -> {
+      let r = rw_decl(d, file, w)
+      rw_decls_loop(rest, file, r.w, [r.decl, ...acc])
+    }
+  }
+}
+
+type RWDecl = { decl: Decl, w: RWalk }
+
+fn rw_decl(d: Decl, file: String, w: RWalk) : RWDecl {
+  match d {
+    DFn(p_, n, tps, ps, ret, row, body, l, c, mo) -> {
+      let r = rw_expr(body, file, w)
+      RWDecl { decl: DFn(p_, n, tps, ps, ret, row, r.expr, l, c, mo), w: r.w }
+    }
+    DTest(desc, body, l, c) -> {
+      let r = rw_expr(body, file, w)
+      RWDecl { decl: DTest(desc, r.expr, l, c), w: r.w }
+    }
+    DBench(desc, body, l, c) -> {
+      let r = rw_expr(body, file, w)
+      RWDecl { decl: DBench(desc, r.expr, l, c), w: r.w }
+    }
+    DCheck(desc, ps, body, l, c) -> {
+      let r = rw_expr(body, file, w)
+      RWDecl { decl: DCheck(desc, ps, r.expr, l, c), w: r.w }
+    }
+    DImpl(pname, proto_args, target, ms, l, c) -> {
+      let r = rw_decls_loop(ms, file, w, [])
+      RWDecl { decl: DImpl(pname, proto_args, target, r.decls, l, c), w: r.w }
+    }
+    DDerive(names, inner, l, c) -> {
+      let r = rw_decl(inner, file, w)
+      RWDecl { decl: DDerive(names, r.decl, l, c), w: r.w }
+    }
+    DUnstable(inner, l, c) -> {
+      let r = rw_decl(inner, file, w)
+      RWDecl { decl: DUnstable(r.decl, l, c), w: r.w }
+    }
+    _ -> RWDecl { decl: d, w: w }
+  }
+}
+
+type RWExpr = { expr: Expr, w: RWalk }
+
+# Recurse an expression. The only special case is the region marker
+# `ECall(EVar("region"), [block])`: recognise it, record the region,
+# and unwrap to the bare block (after recursing INTO the block so
+# nested regions are handled too).
+fn rw_expr(e: Expr, file: String, w: RWalk) : RWExpr {
+  match e.kind {
+    ECall(callee, args) -> {
+      match rw_region_marker(callee, args) {
+        Some(block) -> {
+          # Recurse into the block first (nested regions, inner markers).
+          let inner = rw_expr(block, file, w)
+          # Record this region. The marker's own line/col is the
+          # `region` keyword position; nth disambiguates duplicates.
+          let nth = inner.w.nth
+          let mark = RM(file, e.line, e.col, nth)
+          let w2 = RWalk { regions: [mark, ...inner.w.regions], nth: nth + 1 }
+          # Unwrap: the region's value IS the block's value. Downstream
+          # sees a plain block (P2a normal alloc; P1 arena via the side
+          # table keyed on this RegionMark).
+          RWExpr { expr: inner.expr, w: w2 }
+        }
+        None -> {
+          let rc = rw_expr(callee, file, w)
+          let ra = rw_exprs(args, file, rc.w)
+          RWExpr { expr: rebuild(e, ECall(rc.expr, ra.exprs)), w: ra.w }
+        }
+      }
+    }
+    EField(x, nm) -> {
+      let r = rw_expr(x, file, w)
+      RWExpr { expr: rebuild(e, EField(r.expr, nm)), w: r.w }
+    }
+    EIndex(a, b) -> {
+      let ra = rw_expr(a, file, w)
+      let rb = rw_expr(b, file, ra.w)
+      RWExpr { expr: rebuild(e, EIndex(ra.expr, rb.expr)), w: rb.w }
+    }
+    EBinop(op, a, b) -> {
+      let ra = rw_expr(a, file, w)
+      let rb = rw_expr(b, file, ra.w)
+      RWExpr { expr: rebuild(e, EBinop(op, ra.expr, rb.expr)), w: rb.w }
+    }
+    EUnop(op, x) -> {
+      let r = rw_expr(x, file, w)
+      RWExpr { expr: rebuild(e, EUnop(op, r.expr)), w: r.w }
+    }
+    EIf(c, t, eo) -> {
+      let rc = rw_expr(c, file, w)
+      let rt = rw_expr(t, file, rc.w)
+      match eo {
+        None -> RWExpr { expr: rebuild(e, EIf(rc.expr, rt.expr, None)), w: rt.w }
+        Some(e2) -> {
+          let re = rw_expr(e2, file, rt.w)
+          RWExpr { expr: rebuild(e, EIf(rc.expr, rt.expr, Some(re.expr))), w: re.w }
+        }
+      }
+    }
+    EMatch(scr, arms) -> {
+      let rs = rw_expr(scr, file, w)
+      let ra = rw_arms(arms, file, rs.w)
+      RWExpr { expr: rebuild(e, EMatch(rs.expr, ra.arms)), w: ra.w }
+    }
+    ELambda(ps, body) -> {
+      let r = rw_expr(body, file, w)
+      RWExpr { expr: rebuild(e, ELambda(ps, r.expr)), w: r.w }
+    }
+    ERecordLit(nm, fis) -> {
+      let r = rw_fields(fis, file, w)
+      RWExpr { expr: rebuild(e, ERecordLit(nm, r.fields)), w: r.w }
+    }
+    EList(elems) -> {
+      let r = rw_elems(elems, file, w)
+      RWExpr { expr: rebuild(e, EList(r.elems)), w: r.w }
+    }
+    ERange(lo, hi, by) -> {
+      let rl = rw_expr(lo, file, w)
+      let rh = rw_expr(hi, file, rl.w)
+      match by {
+        None -> RWExpr { expr: rebuild(e, ERange(rl.expr, rh.expr, None)), w: rh.w }
+        Some(s) -> {
+          let rs = rw_expr(s, file, rh.w)
+          RWExpr { expr: rebuild(e, ERange(rl.expr, rh.expr, Some(rs.expr))), w: rs.w }
+        }
+      }
+    }
+    EBlock(stmts, tail) -> {
+      let rs = rw_stmts(stmts, file, w)
+      match tail {
+        None -> RWExpr { expr: rebuild(e, EBlock(rs.stmts, None)), w: rs.w }
+        Some(e2) -> {
+          let rt = rw_expr(e2, file, rs.w)
+          RWExpr { expr: rebuild(e, EBlock(rs.stmts, Some(rt.expr))), w: rt.w }
+        }
+      }
+    }
+    EPipe(l, r) -> {
+      let rl = rw_expr(l, file, w)
+      let rr = rw_expr(r, file, rl.w)
+      RWExpr { expr: rebuild(e, EPipe(rl.expr, rr.expr)), w: rr.w }
+    }
+    EMapPipe(l, r) -> {
+      let rl = rw_expr(l, file, w)
+      let rr = rw_expr(r, file, rl.w)
+      RWExpr { expr: rebuild(e, EMapPipe(rl.expr, rr.expr)), w: rr.w }
+    }
+    EFlatMapPipe(l, r) -> {
+      let rl = rw_expr(l, file, w)
+      let rr = rw_expr(r, file, rl.w)
+      RWExpr { expr: rebuild(e, EFlatMapPipe(rl.expr, rr.expr)), w: rr.w }
+    }
+    EFilterPipe(l, r) -> {
+      let rl = rw_expr(l, file, w)
+      let rr = rw_expr(r, file, rl.w)
+      RWExpr { expr: rebuild(e, EFilterPipe(rl.expr, rr.expr)), w: rr.w }
+    }
+    EBang(x) -> {
+      let r = rw_expr(x, file, w)
+      RWExpr { expr: rebuild(e, EBang(r.expr)), w: r.w }
+    }
+    ELitUnit(inner, u) -> {
+      let r = rw_expr(inner, file, w)
+      RWExpr { expr: rebuild(e, ELitUnit(r.expr, u)), w: r.w }
+    }
+    _ -> RWExpr { expr: e, w: w }
+  }
+}
+
+# Build the new Expr preserving line/col/ty/mode, swapping only kind.
+fn rebuild(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+# Is `callee`/`args` the region marker `ECall(EVar("region"), [block])`?
+# Returns the block when it matches.
+fn rw_region_marker(callee: Expr, args: [Expr]) : Option[Expr] {
+  match callee.kind {
+    EVar(nm) ->
+      if nm == "region" {
+        match args {
+          [block] -> Some(block)
+          _ -> None
+        }
+      } else { None }
+    _ -> None
+  }
+}
+
+type RWExprs = { exprs: [Expr], w: RWalk }
+
+fn rw_exprs(es: [Expr], file: String, w: RWalk) : RWExprs {
+  match es {
+    [] -> RWExprs { exprs: [], w: w }
+    [h, ...rest] -> {
+      let rh = rw_expr(h, file, w)
+      let rr = rw_exprs(rest, file, rh.w)
+      RWExprs { exprs: [rh.expr, ...rr.exprs], w: rr.w }
+    }
+  }
+}
+
+type RWArms = { arms: [Arm], w: RWalk }
+
+fn rw_arms(arms: [Arm], file: String, w: RWalk) : RWArms {
+  match arms {
+    [] -> RWArms { arms: [], w: w }
+    [a, ...rest] -> {
+      let ra = rw_arm(a, file, w)
+      let rr = rw_arms(rest, file, ra.w)
+      RWArms { arms: [ra.arm, ...rr.arms], w: rr.w }
+    }
+  }
+}
+
+type RWArm = { arm: Arm, w: RWalk }
+
+fn rw_arm(a: Arm, file: String, w: RWalk) : RWArm {
+  match a {
+    Arm(pat, guard, body) -> {
+      let gres = match guard {
+        None -> RWGuard { guard: None, w: w }
+        Some(g) -> {
+          let rg = rw_expr(g, file, w)
+          RWGuard { guard: Some(rg.expr), w: rg.w }
+        }
+      }
+      let rb = rw_expr(body, file, gres.w)
+      RWArm { arm: Arm(pat, gres.guard, rb.expr), w: rb.w }
+    }
+  }
+}
+
+type RWGuard = { guard: Option[Expr], w: RWalk }
+
+type RWFields = { fields: [FieldInit], w: RWalk }
+
+fn rw_fields(fis: [FieldInit], file: String, w: RWalk) : RWFields {
+  match fis {
+    [] -> RWFields { fields: [], w: w }
+    [h, ...rest] -> match h {
+      FI(nm, e) -> {
+        let re = rw_expr(e, file, w)
+        let rr = rw_fields(rest, file, re.w)
+        RWFields { fields: [FI(nm, re.expr), ...rr.fields], w: rr.w }
+      }
+    }
+  }
+}
+
+type RWElems = { elems: [ListElem], w: RWalk }
+
+fn rw_elems(es: [ListElem], file: String, w: RWalk) : RWElems {
+  match es {
+    [] -> RWElems { elems: [], w: w }
+    [h, ...rest] -> {
+      let re = match h {
+        ElPlain(e) -> {
+          let r = rw_expr(e, file, w)
+          RWElem { elem: ElPlain(r.expr), w: r.w }
+        }
+        ElSpread(e) -> {
+          let r = rw_expr(e, file, w)
+          RWElem { elem: ElSpread(r.expr), w: r.w }
+        }
+      }
+      let rr = rw_elems(rest, file, re.w)
+      RWElems { elems: [re.elem, ...rr.elems], w: rr.w }
+    }
+  }
+}
+
+type RWElem = { elem: ListElem, w: RWalk }
+
+type RWStmts = { stmts: [Stmt], w: RWalk }
+
+fn rw_stmts(ss: [Stmt], file: String, w: RWalk) : RWStmts {
+  match ss {
+    [] -> RWStmts { stmts: [], w: w }
+    [h, ...rest] -> {
+      let rh = rw_stmt(h, file, w)
+      let rr = rw_stmts(rest, file, rh.w)
+      RWStmts { stmts: [rh.stmt, ...rr.stmts], w: rr.w }
+    }
+  }
+}
+
+type RWStmt = { stmt: Stmt, w: RWalk }
+
+fn rw_stmt(s: Stmt, file: String, w: RWalk) : RWStmt {
+  match s {
+    SLet(pat, ty, e) -> {
+      let r = rw_expr(e, file, w)
+      RWStmt { stmt: SLet(pat, ty, r.expr), w: r.w }
+    }
+    SVar(nm, ty, e, l, c) -> {
+      let r = rw_expr(e, file, w)
+      RWStmt { stmt: SVar(nm, ty, r.expr, l, c), w: r.w }
+    }
+    SIndexAssign(tgt, idx, e, l, c) -> {
+      let rt = rw_expr(tgt, file, w)
+      let ri = rw_expr(idx, file, rt.w)
+      let re = rw_expr(e, file, ri.w)
+      RWStmt { stmt: SIndexAssign(rt.expr, ri.expr, re.expr, l, c), w: re.w }
+    }
+    SExprStmt(e) -> {
+      let r = rw_expr(e, file, w)
+      RWStmt { stmt: SExprStmt(r.expr), w: r.w }
+    }
+    SAssert(e, mo) -> {
+      let re = rw_expr(e, file, w)
+      match mo {
+        None -> RWStmt { stmt: SAssert(re.expr, None), w: re.w }
+        Some(m) -> {
+          let rm = rw_expr(m, file, re.w)
+          RWStmt { stmt: SAssert(re.expr, Some(rm.expr)), w: rm.w }
+        }
+      }
+    }
+    _ -> RWStmt { stmt: s, w: w }
+  }
+}
