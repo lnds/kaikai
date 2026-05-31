@@ -84,6 +84,14 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.86.1 (2026-05-30)
+
+### Fixed
+
+- **examples**: default_polymorphic must not redefine stdlib Default impls
+- **emit**: boxed shim for arity-0 Default + audit protocol impls (#736)
+- **emit**: boxed shim for arity-0 Default + audit all protocol impls
+
 ## v0.86.0 (2026-05-30)
 
 ### Added
