@@ -4515,13 +4515,20 @@ test-rc-trace-callsite: $(TARGET) build
 	  || { echo "rc-trace-callsite NO site rows"; cat build/rc_trace_callsite.err; exit 1; }; \
 	echo "rc-trace-callsite OK"
 
-# Issue #86 v2 — structured violation context for contract panics.
+# Issue #86 v2/v3 — structured violation context for contract panics.
 # Each fixture under examples/refinements/ either panics at runtime
 # with the exact bytes in `<name>.run.err.expected` (negative cases)
 # or runs cleanly with stdout matching `<name>.out.expected` (the
 # happy-path companion). Keeps the violation message format byte-
 # pinned so a regression in build_violation_msg_span trips a clear
 # test rather than a downstream user surprise.
+#
+# v3 (#86 piece 2): every fixture is exercised under BOTH backends. The
+# LLVM `SAssert` arm used to be a no-op (contracts never fired); it is
+# now wired and must produce byte-identical output to the C backend, so
+# each fixture is diffed against the same golden under C and LLVM. A
+# divergence (e.g. the `kaix_assert_check_with_value` IR declare drifting
+# from the runtime_llvm.c forwarder ABI) trips here.
 test-violations: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/refinements/*.kai; do \
@@ -4529,24 +4536,39 @@ test-violations: $(TARGET) build
 	  exp_run_err=../examples/refinements/$$name.run.err.expected; \
 	  exp_out=../examples/refinements/$$name.out.expected; \
 	  ./$(TARGET) $$f > build/viol-$$name.c \
-	    || { echo "violations FAIL $$name (kaic2 errored)"; exit 1; }; \
+	    || { echo "violations FAIL $$name (kaic2 C errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/viol-$$name.c -o build/viol-$$name $(LDLIBS_M) \
 	    || { echo "violations FAIL $$name (C compile failed)"; exit 1; }; \
 	  rc=0; ./build/viol-$$name > build/viol-$$name.out 2> build/viol-$$name.err || rc=$$?; \
+	  ./$(TARGET) --emit=llvm $$f > build/viol-$$name.ll \
+	    || { echo "violations FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
+	  clang -w -I ../stage0 build/viol-$$name.ll ../stage0/runtime_llvm.c -o build/viol-$$name-llvm $(LDLIBS_M) \
+	    || { echo "violations FAIL $$name (LLVM compile failed)"; exit 1; }; \
+	  lrc=0; ./build/viol-$$name-llvm > build/viol-$$name-llvm.out 2> build/viol-$$name-llvm.err || lrc=$$?; \
 	  if [ -f $$exp_run_err ]; then \
 	    if [ $$rc -eq 0 ]; then \
-	      echo "violations FAIL $$name (expected runtime panic, got success)"; exit 1; \
+	      echo "violations FAIL $$name (C: expected runtime panic, got success)"; exit 1; \
 	    fi; \
 	    diff -q $$exp_run_err build/viol-$$name.err > /dev/null \
-	      && echo "violations OK $$name (panic matches)" \
-	      || { echo "violations DIFF $$name"; diff $$exp_run_err build/viol-$$name.err; exit 1; }; \
+	      || { echo "violations DIFF $$name (C panic)"; diff $$exp_run_err build/viol-$$name.err; exit 1; }; \
+	    if [ $$lrc -eq 0 ]; then \
+	      echo "violations FAIL $$name (LLVM: expected runtime panic, got success)"; exit 1; \
+	    fi; \
+	    diff -q $$exp_run_err build/viol-$$name-llvm.err > /dev/null \
+	      && echo "violations OK $$name (C + LLVM panic match)" \
+	      || { echo "violations DIFF $$name (LLVM panic)"; diff $$exp_run_err build/viol-$$name-llvm.err; exit 1; }; \
 	  elif [ -f $$exp_out ]; then \
 	    if [ $$rc -ne 0 ]; then \
-	      echo "violations FAIL $$name (unexpected runtime error)"; cat build/viol-$$name.err; exit 1; \
+	      echo "violations FAIL $$name (C: unexpected runtime error)"; cat build/viol-$$name.err; exit 1; \
 	    fi; \
 	    diff -q $$exp_out build/viol-$$name.out > /dev/null \
-	      && echo "violations OK $$name" \
-	      || { echo "violations DIFF $$name"; diff $$exp_out build/viol-$$name.out; exit 1; }; \
+	      || { echo "violations DIFF $$name (C out)"; diff $$exp_out build/viol-$$name.out; exit 1; }; \
+	    if [ $$lrc -ne 0 ]; then \
+	      echo "violations FAIL $$name (LLVM: unexpected runtime error)"; cat build/viol-$$name-llvm.err; exit 1; \
+	    fi; \
+	    diff -q $$exp_out build/viol-$$name-llvm.out > /dev/null \
+	      && echo "violations OK $$name (C + LLVM out match)" \
+	      || { echo "violations DIFF $$name (LLVM out)"; diff $$exp_out build/viol-$$name-llvm.out; exit 1; }; \
 	  else \
 	    echo "violations SKIP $$name (no golden)"; \
 	  fi; \
