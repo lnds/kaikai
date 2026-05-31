@@ -564,6 +564,18 @@ pub fn llvm_header() : String =
     "declare %KaiValue* @kaix_real(double)\n",
     "declare %KaiValue* @kaix_unit()\n",
     "declare %KaiValue* @kaix_record(i32, %KaiValue**, i8**)\n",
+    # issue #120 — opt-in Perceus regions: bump-arena scope + ctors +
+    # deep-copy-out. These mirror the C backend's kai_arena_* runtime
+    # entries (stage0/runtime_llvm.c kaix_arena_* shims). CRITICAL:
+    # selfhost does NOT catch a missing declare — only a real
+    # `--backend=llvm` program containing a `region { }` does (clang
+    # rejects IR that calls an undeclared symbol).
+    "declare void         @kaix_arena_push()\n",
+    "declare void         @kaix_arena_pop()\n",
+    "declare %KaiValue* @kaix_deep_copy_out(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_arena_cons(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_arena_record(i32, %KaiValue**, i8**)\n",
+    "declare %KaiValue* @kaix_arena_variant(i32, i8*, i32, %KaiValue**)\n",
     "declare %KaiValue* @kaix_field(%KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_prelude_args()\n",
     "declare %KaiValue* @kaix_prelude_program_name()\n",
@@ -861,6 +873,44 @@ fn llvm_set_last(e: LlvmEmit, v: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: v, cur_label: e.cur_label,
              locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
+
+# issue #120 — set the lexical `in_region` flag (mirror of llvm_set_last).
+# The EBlock arm flips it to true inside a recorded `region { }` so the
+# ctor-routing helpers below pick the bump-arena entry point; the block's
+# outer-scope restore returns it to the entering value.
+fn llvm_set_in_region(e: LlvmEmit, b: Bool) : LlvmEmit =
+  LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
+             last_val: e.last_val, cur_label: e.cur_label,
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: b }
+
+# issue #120 — ctor target selection. Inside a `region { }` the cons /
+# record / variant constructors route to the bump-arena runtime entries
+# so their cells are allocated in the region's arena (freed in one shot
+# at block exit). Outside a region they use the ordinary RC heap entries.
+# Mirror of the C backend's emit_cons_ctor / emit_record_ctor /
+# emit_variant_ctor. Nullary variants, the reuse-in-place path, and
+# closures intentionally stay on the RC heap (see region.kai + handoff).
+fn llvm_cons_target(e: LlvmEmit) : String = if e.in_region { "@kaix_arena_cons" } else { "@kaix_cons" }
+fn llvm_record_target(e: LlvmEmit) : String = if e.in_region { "@kaix_arena_record" } else { "@kaix_record" }
+fn llvm_variant_target(e: LlvmEmit) : String = if e.in_region { "@kaix_arena_variant" } else { "@kaix_variant" }
+
+# issue #120 — is the block at (line, col) recorded as a `region { }`?
+# Mirror of the C backend's emit_block_is_region / emit_region_marks_has.
+# region.kai records each region keyword's (file, line, col, nth); the
+# emitter keys on (line, col) — a single file is emitted per invocation
+# so the file component is implied. nth disambiguates duplicate spans
+# only in the side table, not at the lookup, matching the C path.
+fn llvm_block_is_region(e: LlvmEmit, line: Int, col: Int) : Bool =
+  llvm_region_marks_has(e.regions, line, col)
+
+fn llvm_region_marks_has(ms: [RegionMark], line: Int, col: Int) : Bool {
+  match ms {
+    [] -> false
+    [m, ...rest] ->
+      if rmark_line(m) == line and rmark_col(m) == col { true }
+      else { llvm_region_marks_has(rest, line, col) }
+  }
+}
 
 fn llvm_set_label(e: LlvmEmit, lbl: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
@@ -1856,7 +1906,7 @@ fn llvm_emit_expr_boxed(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
     EBinop(op, l, r) -> llvm_emit_binop_typed(e, op, l, r, x.ty)
     EUnop(op, inner) -> llvm_emit_unop(e, op, inner)
     EIf(c, t, eo) -> llvm_emit_if(e, c, t, eo)
-    EBlock(stmts, tail) -> llvm_emit_block(e, stmts, tail)
+    EBlock(stmts, tail) -> llvm_emit_block(e, stmts, tail, x.line, x.col)
     ERange(lo, hi, stp) -> llvm_emit_range(e, lo, hi, stp)
     EPipe(lhs, rhs) -> llvm_emit_pipe(e, lhs, rhs)
     # issue #201: rewritten by typer to ECall before LLVM emission.
@@ -2250,7 +2300,7 @@ fn llvm_emit_record_lit(e: LlvmEmit, nm: String, fis: [FieldInit]) : LlvmEmit / 
   if n == 0 {
     let r = llvm_fresh_reg(e)
     let instr = concat_all([
-      "  ", r.reg, " = call %KaiValue* @kaix_record(i32 0, %KaiValue** null, i8** null)\n"
+      "  ", r.reg, " = call %KaiValue* ", llvm_record_target(e), "(i32 0, %KaiValue** null, i8** null)\n"
     ])
     llvm_set_last(llvm_append_body(r.e, instr), r.reg)
   } else {
@@ -2268,7 +2318,7 @@ fn llvm_emit_record_lit(e: LlvmEmit, nm: String, fis: [FieldInit]) : LlvmEmit / 
     let e3 = llvm_emit_rec_fill(e2, fb.reg, nb.reg, fis, 0)
     let r = llvm_fresh_reg(e3)
     let instr = concat_all([
-      "  ", r.reg, " = call %KaiValue* @kaix_record(i32 ", int_to_string(n),
+      "  ", r.reg, " = call %KaiValue* ", llvm_record_target(e), "(i32 ", int_to_string(n),
       ", %KaiValue** ", fb.reg, ", i8** ", nb.reg, ")\n"
     ])
     llvm_set_last(llvm_append_body(r.e, instr), r.reg)
@@ -3085,7 +3135,7 @@ fn llvm_emit_variant_ctor(e: LlvmEmit, cname: String, xs: [Expr]) : LlvmEmit / C
     let e3 = llvm_emit_variant_stores(e2, buf.reg, ra.regs, 0)
     let r = llvm_fresh_reg(e3)
     let call_instr = concat_all([
-      "  ", r.reg, " = call %KaiValue* @kaix_variant(i32 ", tag_str, ", i8* ",
+      "  ", r.reg, " = call %KaiValue* ", llvm_variant_target(e), "(i32 ", tag_str, ", i8* ",
       llvm_gep_str(name_label, name_len),
       ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"
     ])
@@ -4045,15 +4095,27 @@ fn llvm_emit_handle(e: LlvmEmit, body: Expr, eff_name: String,
   }
 }
 
-fn llvm_emit_block(e: LlvmEmit, stmts: [Stmt], tail: Option[Expr]) : LlvmEmit / Console {
+fn llvm_emit_block(e: LlvmEmit, stmts: [Stmt], tail: Option[Expr], bline: Int, bcol: Int) : LlvmEmit / Console {
 
   let outer_locals = e.locals
+  # issue #120 (P1): a block recorded as a `region { }` lowers to a
+  # bump-arena scope. `bcx` carries in_region = true so constructors
+  # lexically inside the body bump-allocate into the arena (the
+  # llvm_*_target helpers pick the @kaix_arena_* entry points); the
+  # block's value is deep-copied OUT of the arena (rc=1) BEFORE the
+  # arena is freed (copy-before-pop is load-bearing), so it survives.
+  # A non-region block leaves the flag unchanged and emits the ordinary
+  # statement sequence. Mirror of the C backend's EBlock arm.
+  let is_region = llvm_block_is_region(e, bline, bcol)
+  let e_open = if is_region {
+    llvm_set_in_region(llvm_append_body(e, "  call void @kaix_arena_push()\n"), true)
+  } else { e }
   # m5 #3 LLVM mirror — drops for unused let-bindings whose RHS is a
   # fresh allocation. Same per-block drop set the C-emitter computes
   # in emit_expr's EBlock arm; reuses block_unused_lets unchanged so
   # both backends agree on which bindings are droppable.
   let drops = block_unused_lets(stmts, tail)
-  let after = llvm_emit_stmts_with_drops(e, stmts, drops)
+  let after = llvm_emit_stmts_with_drops(e_open, stmts, drops)
   let tailed = match tail {
     Some(te) -> llvm_emit_expr(after, te)
     None -> {
@@ -4062,14 +4124,27 @@ fn llvm_emit_block(e: LlvmEmit, stmts: [Stmt], tail: Option[Expr]) : LlvmEmit / 
       llvm_set_last(llvm_append_body(reg.e, instr), reg.reg)
     }
   }
+  # issue #120 (P1): close the arena scope. The block's final value is
+  # deep-copied OUT (rc=1) BEFORE the pop so it outlives the freed arena.
+  # The copy-before-pop ordering matches the C statement-expression
+  # `__rout = kai_deep_copy_out(final); kai_arena_pop(); __rout`.
+  let closed = if is_region {
+    let rout = llvm_fresh_reg(tailed)
+    let copy_instr = concat_all([
+      "  ", rout.reg, " = call %KaiValue* @kaix_deep_copy_out(%KaiValue* ", tailed.last_val, ")\n"
+    ])
+    let e_copy = llvm_append_body(rout.e, copy_instr)
+    let e_pop = llvm_append_body(e_copy, "  call void @kaix_arena_pop()\n")
+    llvm_set_last(e_pop, rout.reg)
+  } else { tailed }
   # Restore outer scope, keep id counter / body / globals / last_val.
   # issue #120: `in_region` restores to the ENTERING value `e.in_region`
   # so a nested non-region block inside a `region { }` does not leak the
-  # flag back out, and a region block (when the P1 logic lands below)
-  # closes its arena scope here.
-  LlvmEmit { ids: tailed.ids, globals: tailed.globals, body: tailed.body,
-             last_val: tailed.last_val, cur_label: tailed.cur_label,
-             locals: outer_locals, fns: tailed.fns, vars_: tailed.vars_, lams: tailed.lams, op_offsets: tailed.op_offsets, cls: tailed.cls, regions: tailed.regions, in_region: e.in_region }
+  # flag back out, and a region block closes its arena scope (above) and
+  # hands the flag back to the enclosing context here.
+  LlvmEmit { ids: closed.ids, globals: closed.globals, body: closed.body,
+             last_val: closed.last_val, cur_label: closed.cur_label,
+             locals: outer_locals, fns: closed.fns, vars_: closed.vars_, lams: closed.lams, op_offsets: closed.op_offsets, cls: closed.cls, regions: closed.regions, in_region: e.in_region }
 }
 
 fn llvm_emit_stmts(e: LlvmEmit, stmts: [Stmt]) : LlvmEmit / Console {
@@ -4490,7 +4565,7 @@ fn llvm_emit_list_tail(e: LlvmEmit, elems: [ListElem]) : LlvmEmit / Console {
         let einil = llvm_append_body(rnil.e, concat_all(["  ", rnil.reg, " = call %KaiValue* @kaix_nil()\n"]))
         let r = llvm_fresh_reg(einil)
         let instr = concat_all([
-          "  ", r.reg, " = call %KaiValue* @kaix_cons(%KaiValue* ", head_val,
+          "  ", r.reg, " = call %KaiValue* ", llvm_cons_target(e), "(%KaiValue* ", head_val,
           ", %KaiValue* ", rnil.reg, ")\n"
         ])
         llvm_set_last(llvm_append_body(r.e, instr), r.reg)
@@ -4513,7 +4588,7 @@ fn llvm_emit_list_tail(e: LlvmEmit, elems: [ListElem]) : LlvmEmit / Console {
         let tail_val = et.last_val
         let r = llvm_fresh_reg(et)
         let instr = concat_all([
-          "  ", r.reg, " = call %KaiValue* @kaix_cons(%KaiValue* ", head_val,
+          "  ", r.reg, " = call %KaiValue* ", llvm_cons_target(e), "(%KaiValue* ", head_val,
           ", %KaiValue* ", tail_val, ")\n"
         ])
         llvm_set_last(llvm_append_body(r.e, instr), r.reg)
