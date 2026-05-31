@@ -58,6 +58,7 @@ import compiler.unbox
 import compiler.perceus
 import compiler.protos
 import compiler.emit_shared
+import compiler.region
 
 # ====================================================================
 
@@ -83,10 +84,34 @@ pub type BuildMode = BMBuild | BMTest | BMBench | BMCheck
 # built once at entry. `emit_ctx_with_lcs` rebuilds the record with a new
 # `lcs` for those descent points — semantically identical to the old
 # `..., new_lcs, fns, variants, lams, cls` argument shuffle.
-type EmitCtx = { lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo] }
+type EmitCtx = { lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
+                 regions: [RegionMark], in_region: Bool }
 
 fn emit_ctx_with_lcs(cx: EmitCtx, l: [String]) : EmitCtx =
-  EmitCtx { lcs: l, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls }
+  EmitCtx { lcs: l, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region }
+
+# issue #120 — opt-in Perceus regions (Phase P1): set/clear in_region.
+fn emit_ctx_with_in_region(cx: EmitCtx, b: Bool) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: b }
+
+# True when a block at (line, col) is a recorded `region { }`.
+fn emit_block_is_region(cx: EmitCtx, line: Int, col: Int) : Bool =
+  emit_region_marks_has(cx.regions, line, col)
+
+fn emit_region_marks_has(ms: [RegionMark], line: Int, col: Int) : Bool {
+  match ms {
+    [] -> false
+    [m, ...rest] ->
+      if rmark_line(m) == line and rmark_col(m) == col { true }
+      else { emit_region_marks_has(rest, line, col) }
+  }
+}
+
+# The C cons constructor a region-lexical site emits: arena-bump inside
+# a region body, ordinary RC otherwise.
+fn emit_cons_ctor(cx: EmitCtx) : String = if cx.in_region { "kai_arena_cons(" } else { "kai_cons(" }
 
 # Issue #452 Phase A.0 step 3: `prelude_caches` is parallel to
 # `preludes`. Each slot is either "" (no cache, force re-parse from
@@ -3272,7 +3297,8 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
 
 fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [EVar], cls: [ClauseInfo]) : String / Console =
 
-  concat_all(map(lams, (l) => emit_lam_helper(src, l, EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls })))
+  concat_all(map(lams, (l) => emit_lam_helper(src, l, EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
+                                                                regions: [], in_region: false })))
 
 fn emit_one_lam_forward(l: LamInfo) : String =
   match l {
@@ -4008,10 +4034,24 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     EList(elems) -> emit_list_expr(src, elems, cx)
     ERange(a, b, opt_step) -> emit_range_expr(src, a, b, opt_step, cx)
     EBlock(stmts, opt_final) -> {
+      # issue #120 (P1): a block recorded as a `region { }` lowers to a
+      # bump-arena scope. `bcx` carries in_region = true so constructors
+      # lexically inside the body bump-allocate into the arena; the
+      # block's value is deep-copied OUT of the arena (rc=1) BEFORE the
+      # arena is freed (copy-before-pop is load-bearing), so it survives.
+      # A non-region block emits the ordinary statement-expression.
+      let is_region = emit_block_is_region(cx, x.line, x.col)
+      let bcx = if is_region { emit_ctx_with_in_region(cx, true) } else { cx }
       match stmts {
         [] -> match opt_final {
-          Some(fe) -> emit_expr(src, fe, cx)
-          None -> "kai_unit()"
+          Some(fe) ->
+            if is_region {
+              concat_all(["({ kai_arena_push(); KaiValue *__rout = kai_deep_copy_out(",
+                          emit_expr(src, fe, bcx), "); kai_arena_pop(); __rout; })"])
+            } else { emit_expr(src, fe, cx) }
+          None ->
+            if is_region { "({ kai_arena_push(); kai_arena_pop(); kai_unit(); })" }
+            else { "kai_unit()" }
         }
         _ -> {
           # m5 #3 — drops for unused let-bindings whose RHS is a
@@ -4025,14 +4065,24 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
           # binders so a later stmt or the final expression resolves
           # `EVar(name)` to the local read instead of a same-named
           # top-level fn.
-          let stmt_acc = emit_block_stmts(src, stmts, drops, cx)
+          let stmt_acc = emit_block_stmts(src, stmts, drops, bcx)
           let stmt_out = match stmt_acc { EBSA(_, t) -> t }
           let block_lcs = match stmt_acc { EBSA(l, _) -> l }
-          let final_out = match opt_final {
-            Some(fe) -> cat2(emit_expr(src, fe, emit_ctx_with_lcs(cx, block_lcs)), "; ")
-            None -> "kai_unit(); "
+          if is_region {
+            let final_in = match opt_final {
+              Some(fe) -> emit_expr(src, fe, emit_ctx_with_in_region(emit_ctx_with_lcs(cx, block_lcs), true))
+              None -> "kai_unit()"
+            }
+            concat_all(["({ kai_arena_push(); ", stmt_out,
+                        " KaiValue *__rout = kai_deep_copy_out(", final_in, ");",
+                        " kai_arena_pop(); __rout; })"])
+          } else {
+            let final_out = match opt_final {
+              Some(fe) -> cat2(emit_expr(src, fe, emit_ctx_with_lcs(cx, block_lcs)), "; ")
+              None -> "kai_unit(); "
+            }
+            cat4("({ ", stmt_out, final_out, "})")
           }
-          cat4("({ ", stmt_out, final_out, "})")
         }
       }
     }
@@ -4859,7 +4909,8 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx) : String / Console {
         let body_fns = fns_prefer_module(cx.fns, mo)
         # Body sees the extended lexical scope and the module-rotated
         # EFn table; the other three context fields are unchanged.
-        let body_cx = EmitCtx { lcs: body_lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls }
+        let body_cx = EmitCtx { lcs: body_lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+                                regions: cx.regions, in_region: cx.in_region }
         # Phase 3 unboxing — UFn body emits a raw return expression
         # whose value is the raw scalar matching `ret_ty`. The
         # body's `mode` is set by `unbox_pass`/`ufn_promote_calls`;
@@ -5357,7 +5408,8 @@ fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
   # rather than a sibling prelude's clashing export. Mirrors the rotate
   # `emit_fn_body` already does for DFn bodies.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
-  let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls }
+  let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+                          regions: cx.regions, in_region: cx.in_region }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_test_", int_to_string(id), "(void) {\n",
@@ -5443,7 +5495,8 @@ fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
 
   # Issue #335: same file-local rotate as emit_test_fn.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
-  let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls }
+  let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+                          regions: cx.regions, in_region: cx.in_region }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_bench_", int_to_string(id), "(void) {\n",
@@ -5791,7 +5844,8 @@ fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body:
   let lcs2 = list_append(check_param_names(params), cx.lcs)
   # Issue #335: same file-local rotate as emit_test_fn.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
-  let body_cx = EmitCtx { lcs: lcs2, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls }
+  let body_cx = EmitCtx { lcs: lcs2, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+                          regions: cx.regions, in_region: cx.in_region }
   let body_c = emit_expr(src, body, body_cx)
   # Issue #438: hoist param locals to function scope so the post-loop
   # shrink section can keep mutating them. The per-iter loop now
@@ -6860,7 +6914,7 @@ fn interp_part_to_expr(p: IPart, op_names: [String], op_arities: [OpAr],
 }
 
 #[doc("Emit-layer entry point emit_program")]
-pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String]) : String / Console {
+pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark]) : String / Console {
 
   # m7a #6c: rewrite `Eff.op(args)` callees from `EField(EVar(Eff), op)`
   # to `EVar("Eff.op")` before code emission. The typer (synth_op_call_with_scheme)
@@ -6904,7 +6958,8 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # and bundled with an empty top-level lexical scope. Each fn / lambda /
   # clause / test body seeds its own scope from its params before
   # recursing, so the entry `lcs` is `[]`.
-  let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls }
+  let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
+                     regions: regions, in_region: false }
   let bodies = fn_bodies(src, decls, cx)
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants, cls)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
