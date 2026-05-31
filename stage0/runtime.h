@@ -1349,12 +1349,94 @@ static void kai_var_name_report_at_exit(void) {
 #endif /* KAI_TRACE_VAR_NAMES */
 
 #ifdef KAI_TRACE_RC
+/* Under trace/profile the cell + slot free-lists are disabled (they
+ * would perturb leak attribution and poisoning). Provide malloc-only
+ * slot helpers here so the variant constructors below link in this
+ * mode too — the pooled versions live in the #else branch. */
+static KaiVarSlot *kai_slots_alloc(int n) {
+    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+}
+static void kai_slots_free(KaiVarSlot *slots, int n) { (void) n; free(slots); }
 static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
 #else
+/* Issue #118 follow-up #3 — fixed-size cell free-list (Koka/mimalloc
+ * model). Every KaiValue is the same size, so a freed cell can host the
+ * next allocation without a malloc/free round-trip. This is the
+ * size-keyed reuse Koka gets implicitly from its heap: the functional
+ * rebuild's discarded spine cells are recycled by the very next
+ * constructor of the same size, WITHOUT any compiler-level token
+ * threading. Bounded so a transient spike does not pin memory forever.
+ *
+ * Disabled under KAI_TRACE_RC / KAI_PROFILE_RC: those modes poison freed
+ * cells and rely on exact malloc/free pairing for leak attribution, so
+ * recycling would corrupt their bookkeeping. The free-list is a pure
+ * production-path allocator optimisation — RC semantics and emitted code
+ * are byte-identical; only the malloc/free traffic changes. */
+#if !defined(KAI_TRACE_RC) && !defined(KAI_PROFILE_RC) && !defined(KAI_NO_CELL_POOL)
+#define KAI_CELL_POOL_ACTIVE 1
+/* Cap sized for the functional-rebuild working set. The rb-tree churns
+ * a ~1M-cell live set with a deep free/realloc cycle; a cap below the
+ * peak free-list depth spills to libc and the wall destabilises around
+ * the 10× target (measured: 262Ki oscillates 9.9–10.3× by run, 1Mi
+ * holds a stable 9.8–9.9×). 1Mi entries (8 MB of pointers, lazy .bss)
+ * keep the recycle hit-rate high; beyond it we fall through to
+ * malloc/free. */
+#define KAI_CELL_POOL_CAP 1048576
+static KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
+static int kai_cell_pool_n = 0;
+
+/* Companion free-list for the variant `slots[]` arrays, keyed by arity
+ * (the dominant per-node malloc alongside the cell header). Arity 1..8
+ * covers every variant the functional rebuild churns; larger arities
+ * fall through to malloc/free. Sized to match the cell pool's working
+ * set so slot reuse does not become the spill bottleneck. */
+#define KAI_SLOT_POOL_MAXN 8
+#define KAI_SLOT_POOL_CAP  1048576
+static KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
+static int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
+
+static KaiVarSlot *kai_slots_alloc(int n) {
+#ifndef KAI_NO_SLOT_POOL
+    if (n >= 1 && n <= KAI_SLOT_POOL_MAXN && kai_slot_pool_n[n] > 0) {
+        return kai_slot_pool[n][--kai_slot_pool_n[n]];
+    }
+#endif
+    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+}
+
+static void kai_slots_free(KaiVarSlot *slots, int n) {
+    if (slots == NULL) return;
+#ifndef KAI_NO_SLOT_POOL
+    if (n >= 1 && n <= KAI_SLOT_POOL_MAXN && kai_slot_pool_n[n] < KAI_SLOT_POOL_CAP) {
+        kai_slot_pool[n][kai_slot_pool_n[n]++] = slots;
+        return;
+    }
+#endif
+    free(slots);
+}
+#else
+static KaiVarSlot *kai_slots_alloc(int n) {
+    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+}
+static void kai_slots_free(KaiVarSlot *slots, int n) { (void) n; free(slots); }
+#endif
+
 static KaiValue *kai_alloc(KaiTag tag) {
 #endif
     KAI_PROF_ENTER();
+#ifdef KAI_CELL_POOL_ACTIVE
+    KaiValue *v;
+    if (kai_cell_pool_n > 0) {
+        v = kai_cell_pool[--kai_cell_pool_n];
+        /* Zero the struct so callers see calloc-equivalent state (the
+         * union, slots ptr, etc. must start clean). */
+        memset(v, 0, sizeof(KaiValue));
+    } else {
+        v = (KaiValue *) calloc(1, sizeof(KaiValue));
+    }
+#else
     KaiValue *v = (KaiValue *) calloc(1, sizeof(KaiValue));
+#endif
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     v->rc = 1;
     v->tag = (int32_t) tag;
@@ -2181,7 +2263,7 @@ static void kai_free_value(KaiValue *v) {
                     }
                 }
             }
-            free(v->as.var.slots);
+            kai_slots_free(v->as.var.slots, v->as.var.n_args);
             break;
         case KAI_CLOSURE:
             for (int i = 0; i < v->as.clo.n_captures; ++i) kai_decref(v->as.clo.captures[i]);
@@ -2300,7 +2382,18 @@ static void kai_free_value(KaiValue *v) {
         for (size_t i = 0; i < nq; i++) p64[i] = KAI_RC_SENTINEL_U64;
     }
 #endif
+#ifdef KAI_CELL_POOL_ACTIVE
+    /* Recycle the fixed-size cell instead of returning it to libc, so
+     * the next same-size allocation skips malloc. Bounded; overflow
+     * falls through to a real free. */
+    if (kai_cell_pool_n < KAI_CELL_POOL_CAP) {
+        kai_cell_pool[kai_cell_pool_n++] = v;
+    } else {
+        free(v);
+    }
+#else
     free(v);
+#endif
     /* trace */
     kai_rc_free_total++;
     kai_rc_live_now--;
@@ -2848,7 +2941,7 @@ static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
     v->as.var.n_args = n;
     v->as.var.slot_mask = mask;
     if (n > 0) {
-        v->as.var.slots = (KaiVarSlot *) malloc(n * sizeof(KaiVarSlot));
+        v->as.var.slots = kai_slots_alloc(n);
         for (int i = 0; i < n; ++i) v->as.var.slots[i] = slots[i];
     } else {
         v->as.var.slots = NULL;
@@ -3053,10 +3146,18 @@ static int kai_check_unique(KaiValue *v) {
 static KaiValue *kai_reuse_or_alloc_cons(KaiValue *_scr,
                                          KaiValue *head, KaiValue *tail) {
     if (_scr != NULL && _scr->tag == KAI_CONS && kai_check_unique(_scr)) {
-        kai_decref(_scr->as.cons.head);
-        kai_decref(_scr->as.cons.tail);
+        /* Aliasing guard (see kai_reuse_or_alloc_variant): the incoming
+         * head/tail may alias the outgoing ones when `f` reused the
+         * child cell in place. Store first, decref the old only if it
+         * differs — decref-then-store would free a cell the new slot
+         * still points at. Latent under libc malloc, exposed by the
+         * cell free-list's immediate recycle. */
+        KaiValue *old_h = _scr->as.cons.head;
+        KaiValue *old_t = _scr->as.cons.tail;
         _scr->as.cons.head = head;
         _scr->as.cons.tail = tail;
+        if (old_h != head) kai_decref(old_h);
+        if (old_t != tail) kai_decref(old_t);
         kai_rc_reuse_total++;
         return kai_incref(_scr);   /* survive enclosing match-exit decref */
     }
@@ -3075,9 +3176,11 @@ static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr,
          * rebuilds (parsers thread the same record shape), so
          * overwriting is idempotent in the common case. */
         for (int i = 0; i < n; ++i) {
-            kai_decref(_scr->as.rec.fields[i]);
+            /* Aliasing guard (see kai_reuse_or_alloc_variant). */
+            KaiValue *old_f = _scr->as.rec.fields[i];
             _scr->as.rec.fields[i] = fields[i];
             _scr->as.rec.names[i]  = names[i];
+            if (old_f != fields[i]) kai_decref(old_f);
         }
         kai_rc_reuse_total++;
         return kai_incref(_scr);
@@ -3110,13 +3213,28 @@ static KaiValue *kai_reuse_or_alloc_variant(KaiValue *_scr,
          * no RC discipline; the call sites that emit
          * `kai_reuse_or_alloc_variant` for typed payloads are
          * synthesised by stage 2's Perceus recogniser only when the
-         * mask matches, so this branch stays sound. */
+         * mask matches, so this branch stays sound.
+         *
+         * ALIASING GUARD (issue #118 #3 latent UAF, surfaced by the cell
+         * free-list): the incoming `slots[i]` may ALIAS the outgoing
+         * `_scr->slots[i]` — the common desugar shape
+         * `Some(e) -> Some(f(e))` increfs `e`, computes `f(e)` (which
+         * may reuse e's own cell in place, so the result pointer ==
+         * the old slot pointer), then reuses `_scr`. Decref-then-store
+         * would free the very cell the new slot points at. We decref the
+         * OLD pointer only when it differs from the incoming one; an
+         * aliased slot keeps the cell live (the incref/decref pair from
+         * the bind + f's consumption already balanced it). With libc
+         * malloc this latent double-free was masked (the freed cell
+         * survived untouched until a far-off reuse); the immediate
+         * free-list recycle exposed it. */
         for (int i = 0; i < n; ++i) {
             uint32_t bit = (uint32_t) 1 << i;
-            if ((mask & bit) == 0) {
-                kai_decref(_scr->as.var.slots[i].ptr);
-            }
+            KaiValue *old_ptr = _scr->as.var.slots[i].ptr;
             _scr->as.var.slots[i] = slots[i];
+            if ((mask & bit) == 0 && old_ptr != slots[i].ptr) {
+                kai_decref(old_ptr);
+            }
         }
         _scr->as.var.variant_tag  = tag;
         _scr->as.var.variant_name = name;
