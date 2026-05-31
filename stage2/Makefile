@@ -3120,7 +3120,17 @@ test-proto-scalar-dispatch: $(TARGET) build
 	./build/psd > build/psd.out 2>&1; \
 	diff -q $$exp build/psd.out > /dev/null \
 	  && echo "proto-scalar-dispatch OK (C)" \
-	  || { echo "proto-scalar-dispatch DIFF (C)"; diff $$exp build/psd.out; exit 1; }
+	  || { echo "proto-scalar-dispatch DIFF (C)"; diff $$exp build/psd.out; exit 1; }; \
+	echo "=== arity-0 Default boxed-shim (issue fix-default-shim) ==="; \
+	./$(TARGET) --emit=llvm ../examples/protocols/default_basic.kai > build/default-basic.ll 2>build/default-basic.ll.err \
+	  || { echo "default-shim FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
+	for t in Int Real Bool; do \
+	  grep -q "register_one_impl.*@kai_protocols____pimpl_Default_$${t}_default to i8" build/default-basic.ll \
+	    && { echo "default-shim FAIL: Default_$${t}_default registered RAW (scalar fn bitcast as %KaiValue*()* — the clang verifier mismatch that broke v0.85/0.86 releases)"; exit 1; }; \
+	  grep -q "register_one_impl.*@kai_protocols____pimpl_Default_$${t}_default__boxed to i8" build/default-basic.ll \
+	    || { echo "default-shim FAIL: Default_$${t}_default __boxed shim not registered"; exit 1; }; \
+	done; \
+	echo "    arity-0 Default boxed-shim OK (Int/Real/Bool register via __boxed, not raw)"
 
 # Self-hosting: per-compiler determinism.
 #
