@@ -465,6 +465,20 @@ static int64_t kai_rc_free_total  = 0;
 static int64_t kai_rc_live_now    = 0;
 static int64_t kai_rc_live_peak   = 0;
 static int64_t kai_rc_alloc_by_tag[16] = {0};
+/* issue #120 — opt-in Perceus regions. Dedicated arena counters,
+ * distinct from kai_rc_alloc_total / kai_rc_free_total so a region's
+ * bulk lifecycle is visible without polluting the per-value RC ledger.
+ * kai_arena_alloc_total counts KaiValue headers stamped by
+ * kai_arena_alloc; kai_arena_free_total counts the same headers
+ * reclaimed in bulk by kai_arena_free. The two must converge at exit
+ * exactly as alloc/free does — divergence flags a wrong-codegen silent
+ * leak (a non-region value mistakenly arena-allocated, invisible to
+ * ASAN because nothing is freed). Defined here, beside the RC ledger,
+ * so kai_rc_report() / kai_rc_strict_report() (below) can read them
+ * without a forward declaration; the arena machinery itself lives
+ * after the singletons. */
+static int64_t kai_arena_alloc_total = 0;
+static int64_t kai_arena_free_total  = 0;
 /* issue #118 — Perceus reuse-in-place counter. Bumped by every
  * successful in-place rewrite in kai_reuse_or_alloc_* (further down). */
 static int64_t kai_rc_reuse_total = 0;
@@ -521,6 +535,16 @@ static void kai_rc_report(void) {
     fprintf(stderr, "[KAI_TRACE_RC]   incref_total=%lld decref_total=%lld\n",
             (long long) kai_rc_incref_total,
             (long long) kai_rc_decref_total);
+    /* issue #120 — region arena lifecycle. arena_live != 0 at exit
+     * flags a wrong-codegen silent leak (a non-region value mistakenly
+     * arena-allocated, which never frees and which ASAN cannot see). */
+    if (kai_arena_alloc_total > 0 || kai_arena_free_total > 0) {
+        fprintf(stderr,
+            "[KAI_TRACE_RC]   arena_alloc=%lld arena_free=%lld arena_live=%lld\n",
+            (long long) kai_arena_alloc_total,
+            (long long) kai_arena_free_total,
+            (long long) (kai_arena_alloc_total - kai_arena_free_total));
+    }
 }
 
 static int kai_rc_registered = 0;
@@ -630,6 +654,22 @@ static void kai_rc_strict_report(void) {
             "[KAI_TRACE_RC] tag=%-7s allocs=%lld frees=%lld live=%lld%s\n",
             kai_rc_tag_name(i),
             (long long) a, (long long) f, (long long) live, flag);
+    }
+    /* issue #120 — region arena lifecycle under strict tracing. A
+     * non-zero arena_live is the ONLY visible signal of a wrong-codegen
+     * silent leak: arena memory is reclaimed in bulk without a free
+     * walk, so ASAN sees no use-after-free and the per-tag table above
+     * never moves for arena values. */
+    if (kai_arena_alloc_total > 0 || kai_arena_free_total > 0) {
+        int64_t arena_live = kai_arena_alloc_total - kai_arena_free_total;
+        const char *aflag = (arena_live != 0) ? " LEAK"
+                          : (kai_arena_free_total > kai_arena_alloc_total) ? " DOUBLE"
+                          : "";
+        fprintf(stderr,
+            "[KAI_TRACE_RC] arena   allocs=%lld frees=%lld live=%lld%s\n",
+            (long long) kai_arena_alloc_total,
+            (long long) kai_arena_free_total,
+            (long long) arena_live, aflag);
     }
     if (kai_rc_history_enabled() && kai_rc_history_count > 0) {
         uint64_t total = kai_rc_history_count;
@@ -1371,6 +1411,162 @@ static KaiValue kai_singleton_unit  = { .rc = INT32_MAX, .tag = KAI_UNIT, .as = 
 static KaiValue kai_singleton_true  = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 1 } };
 static KaiValue kai_singleton_false = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 0 } };
 static KaiValue kai_singleton_nil   = { .rc = INT32_MAX, .tag = KAI_NIL,  .as = { .b = 0 } };
+
+/* issue #120 — opt-in Perceus regions: bump-arena primitive (P0).
+ *
+ * A `region { ... }` block bump-allocates every value constructed
+ * inside it into an arena and frees the whole arena in one shot when
+ * the brace closes — no per-value RC traffic, no per-value free walk.
+ * This pays where allocation is tight LIFO scratch (lexer / parser /
+ * formatter buffers): issue #120.
+ *
+ * KEY TRICK (asu + linus, docs/issue-120-regions-design.md): an arena
+ * value carries `rc = INT32_MAX`, the EXISTING saturation sentinel the
+ * runtime already short-circuits in kai_incref / kai_decref /
+ * kai_check_unique. So to the RC machinery an arena value is
+ * indistinguishable from a singleton:
+ *   - decref is a no-op (kai_decref returns early on INT32_MAX) — FREE.
+ *   - reuse-in-place auto-disables (kai_check_unique returns 0 for
+ *     INT32_MAX) — FREE, no Perceus pass change.
+ * No new tag, no new branch in the hot RC path, no struct growth.
+ *
+ * BOOKKEEPING LANDMINE: because kai_arena_free reclaims in bulk
+ * WITHOUT walking values, kai_rc_live_now is never decremented per
+ * value. Left alone, KAI_TRACE_RC leaked-vs-iterations gates would
+ * report false leaks. Fix: a SEPARATE per-arena live count
+ * (`n_live`) is subtracted from kai_rc_live_now on free, and the
+ * dedicated kai_arena_alloc_total / kai_arena_free_total counters are
+ * surfaced in kai_rc_report() so a wrong-codegen silent leak (a
+ * non-region value mistakenly arena-allocated — invisible to ASAN
+ * because nothing is freed) shows up as alloc/free divergence.
+ *
+ * PORTABILITY: malloc-backed chunks, NOT mmap — stage0 must build on
+ * any ANSI cc with zero deps (CLAUDE.md "no deps in stage0"). The
+ * arena stack is a plain global, not __thread: kaikai fibers each run
+ * to a suspension point on the OS thread that dispatched them, so a
+ * region never spans a fiber switch in v1. A per-fiber arena stack is
+ * the natural follow-up once regions are allowed to straddle await
+ * (see docs/lane-experience-issue-120.md). */
+
+#define KAI_ARENA_CHUNK_BYTES (64 * 1024)
+#define KAI_ARENA_ALIGN       16
+
+typedef struct KaiArenaChunk {
+    struct KaiArenaChunk *next;   /* grow-only singly-linked list */
+    size_t                used;   /* bytes consumed in `data` */
+    size_t                cap;    /* usable bytes in `data` */
+    unsigned char        *data;   /* malloc-backed payload */
+} KaiArenaChunk;
+
+typedef struct KaiArena {
+    KaiArenaChunk *head;          /* current (most-recently-grown) chunk */
+    int64_t        n_live;        /* KaiValue headers stamped into this arena */
+} KaiArena;
+
+static size_t kai_arena_align_up(size_t n) {
+    return (n + (KAI_ARENA_ALIGN - 1)) & ~((size_t) (KAI_ARENA_ALIGN - 1));
+}
+
+static KaiArenaChunk *kai_arena_chunk_new(size_t need) {
+    size_t cap = KAI_ARENA_CHUNK_BYTES;
+    if (need > cap) cap = need;               /* oversized single object */
+    KaiArenaChunk *c = (KaiArenaChunk *) malloc(sizeof(KaiArenaChunk));
+    if (!c) { fprintf(stderr, "kai: out of memory (arena chunk)\n"); exit(1); }
+    c->data = (unsigned char *) malloc(cap);
+    if (!c->data) { fprintf(stderr, "kai: out of memory (arena data)\n"); exit(1); }
+    c->next = NULL;
+    c->used = 0;
+    c->cap  = cap;
+    return c;
+}
+
+static void kai_arena_init(KaiArena *a) {
+    a->head   = NULL;
+    a->n_live = 0;
+}
+
+/* Raw aligned bump for interior storage (record `fields`, variant
+ * `slots`, array `items`, KAI_STR `bytes`) so an aggregate built in a
+ * region keeps ALL of its memory inside the arena — otherwise the
+ * interior arrays would dangle on bulk free. Returns uninitialised
+ * memory; the caller writes it. Not refcounted, not a KaiValue. */
+static void *kai_arena_raw(KaiArena *a, size_t nbytes) {
+    size_t need = kai_arena_align_up(nbytes ? nbytes : 1);
+    if (!a->head || a->head->used + need > a->head->cap) {
+        KaiArenaChunk *c = kai_arena_chunk_new(need);
+        c->next = a->head;
+        a->head = c;
+    }
+    void *p = a->head->data + a->head->used;
+    a->head->used += need;
+    return p;
+}
+
+/* Bump a KaiValue header into the arena, stamped with the immortal
+ * sentinel so RC skips it. Mirrors kai_alloc's header init (rc, tag,
+ * zeroed union) but never calls calloc/free and never touches the
+ * per-value RC counters — only the dedicated arena counters. Live-now
+ * is bumped so live_peak stays honest mid-region; kai_arena_free
+ * subtracts the whole batch back. */
+static KaiValue *kai_arena_alloc(KaiArena *a, KaiTag tag) {
+    KaiValue *v = (KaiValue *) kai_arena_raw(a, sizeof(KaiValue));
+    memset(v, 0, sizeof(KaiValue));
+    v->rc  = INT32_MAX;                 /* immortal sentinel: decref no-op */
+    v->tag = (int32_t) tag;
+    a->n_live++;
+    kai_arena_alloc_total++;
+    kai_rc_live_now++;
+    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+    return v;
+}
+
+/* Bulk reclaim: free every chunk WITHOUT walking values (the whole
+ * point — no per-value free, no per-value decref). Balance the trace
+ * ledger by subtracting this arena's live count from kai_rc_live_now
+ * and crediting kai_arena_free_total, then reset so the arena can be
+ * reused. */
+static void kai_arena_free(KaiArena *a) {
+    KaiArenaChunk *c = a->head;
+    while (c) {
+        KaiArenaChunk *next = c->next;
+        free(c->data);
+        free(c);
+        c = next;
+    }
+    kai_arena_free_total += a->n_live;
+    kai_rc_live_now      -= a->n_live;
+    a->head   = NULL;
+    a->n_live = 0;
+}
+
+/* Lexical region stack. `region { ... }` pushes a fresh arena on
+ * entry and pops+frees it on exit; constructors inside the block call
+ * kai_arena_alloc on the current top. Nesting is bounded by lexical
+ * block depth — 64 is far beyond any realistic region nesting and
+ * keeps the stack a flat global with no allocation of its own. */
+#define KAI_ARENA_STACK_MAX 64
+static KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
+static int      kai_arena_sp = 0;
+
+static KaiArena *kai_arena_push(void) {
+    if (kai_arena_sp >= KAI_ARENA_STACK_MAX) {
+        fprintf(stderr, "kai: region nesting exceeds %d\n", KAI_ARENA_STACK_MAX);
+        exit(1);
+    }
+    KaiArena *a = &kai_arena_stack[kai_arena_sp++];
+    kai_arena_init(a);
+    return a;
+}
+
+static KaiArena *kai_arena_current(void) {
+    if (kai_arena_sp == 0) return NULL;     /* not inside a region */
+    return &kai_arena_stack[kai_arena_sp - 1];
+}
+
+static void kai_arena_pop(void) {
+    if (kai_arena_sp == 0) return;
+    kai_arena_free(&kai_arena_stack[--kai_arena_sp]);
+}
 
 static KaiValue *kai_incref(KaiValue *v) {
     if (!v || v->rc == INT32_MAX) {

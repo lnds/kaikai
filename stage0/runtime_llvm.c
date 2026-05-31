@@ -292,6 +292,24 @@ KaiValue *kaix_incref(KaiValue *v)                        { return kai_incref(v)
    the binding when last-use analysis proves the name is unread. */
 void      kaix_decref(KaiValue *v)                        { kai_decref(v); }
 
+/* ---------- issue #120: opt-in Perceus regions ----------
+ * The LLVM backend lowers `region { ... }` to kaix_arena_push on entry,
+ * kaix_arena_pop on exit, and routes every constructor inside the block
+ * through kaix_arena_alloc — the SAME C arena helpers the C backend
+ * calls inline (docs/issue-120-regions-design.md: one helper, both
+ * backends, no separate LLVM bump-alloc). The arena stack is a runtime
+ * global, so push/pop/alloc need no KaiArena* across the IR boundary.
+ * P0 links these even though no lowering emits them yet — the
+ * build-release.sh LLVM smoke gate verifies the symbols resolve. */
+void      kaix_arena_push(void)                          { (void) kai_arena_push(); }
+void      kaix_arena_pop(void)                           { kai_arena_pop(); }
+KaiValue *kaix_arena_alloc(KaiTag tag) {
+    KaiArena *a = kai_arena_current();
+    /* Defensive: if codegen ever calls this outside a region (a bug),
+     * fall back to the normal RC heap rather than dereference NULL. */
+    return a ? kai_arena_alloc(a, tag) : kai_alloc(tag);
+}
+
 /* ---------- M3e: lists + closures-with-captures ---------- */
 KaiValue *kaix_cons(KaiValue *h, KaiValue *t)            { return kai_cons(h, t); }
 KaiValue *kaix_nil(void)                                  { return kai_nil(); }
