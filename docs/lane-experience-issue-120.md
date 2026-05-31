@@ -1,9 +1,12 @@
 # Lane experience — issue #120: opt-in Perceus regions (`region { }`)
 
-**Scope shipped (this PR):** the C backend of opt-in Perceus regions, end to end —
-runtime bump-arena (P0), surface + side-table (P2a), and arena lowering with
-deep-copy-out at the border plus per-constructor arena routing (P1). The LLVM
-backend parity is deferred to a documented follow-up (see *Follow-ups*).
+**Scope shipped (this PR):** opt-in Perceus regions on **both backends**, end to
+end — runtime bump-arena (P0), surface + side-table (P2a), and arena lowering with
+deep-copy-out at the border plus per-constructor arena routing (P1) on the C
+emitter and, in the closing commits of this lane, the matching LLVM lowering.
+Both backends are byte-for-byte at parity on the five `region_*` fixtures
+(`75 / 3 / 6 / 7 / 42`) with identical `KAI_TRACE_RC` arena accounting
+(`arena_alloc=8 arena_free=8 arena_live=0`).
 
 ## Scope as planned vs as shipped
 
@@ -55,8 +58,20 @@ soundness (not as ship gates):
   `kai_arena_*` when `cx.in_region` and the RC ctor otherwise. **Shipped as
   planned for the C backend.**
 
+- **P1 (LLVM) — same lowering on the LLVM emitter.** `LlvmEmit` gained the same
+  two fields (`regions: [RegionMark]`, `in_region: Bool`), threaded from the
+  driver's `region_marks` through `emit_program_llvm` and down every body-emit
+  path. The `EBlock` arm of `llvm_emit_block` checks `llvm_block_is_region` and,
+  for a region, emits the sequential IR analogue of the C statement-expression:
+  `call void @kaix_arena_push()`, body with `in_region = true`,
+  `%rout = call @kaix_deep_copy_out(<final>)` **before** `call void @kaix_arena_pop()`,
+  then `set_last(%rout)`. The constructor target helpers (`llvm_cons_target` /
+  `llvm_record_target` / `llvm_variant_target`) pick `@kaix_arena_*` when
+  `in_region`. Nullary variants, the reuse-in-place path, and the internal
+  nullary-spine `llvm_emit_variants_of` stay on the RC heap, matching the C
+  carve-outs. **Shipped this lane.**
+
 - **P3 — bench + retro + docs + PR.** This retro, the doc updates, and the PR.
-  The LLVM half of P1 is deferred (below).
 
 ## Design decisions and alternatives considered
 
@@ -141,14 +156,38 @@ fixture set:
 - `region_with_lambda.kai` → `42` — a closure escapes the region and is applied
   after the arena pops (carve-out; ASAN-guarded).
 
+## LLVM backend parity — shipped this lane (lessons)
+
+The LLVM half closed in the final two commits of this lane (scaffold-first, then
+arena logic). Three lessons transferred from the C-emitter cost and held:
+
+- **Scaffold the ctx threading first, with zero region logic, and gate it.** The
+  `LlvmEmit` struct gained `regions` + `in_region` and every construction site
+  (passthrough helpers, the three `e_scoped` match/switch restores, the four
+  seed-fresh body emitters, `llvm_emit_new`) plus the seven-fn signature chain
+  (`emit_program_llvm` → `decls_loop` / `lambda_bodies` / `clause_bodies` →
+  `llvm_emit_fn` / `llvm_emit_lambda_body` / `llvm_emit_clause_body`) was threaded
+  in a **first commit that compiles, self-hosts byte-identical, and still routes
+  every ctor to the RC heap.** That isolates "is the threading sound?" from "is
+  the lowering correct?" — a stale caller after a signature change auto-miscompiles
+  `kaic2` (symptom: a runtime "field access on non-record" far from the edit), so
+  the scaffold's selfhost gate is the cheap detector.
+- **The six `declare` lines are invisible to selfhost.** `kaix_arena_push` /
+  `kaix_arena_pop` / `kaix_deep_copy_out` / `kaix_arena_cons` / `kaix_arena_record`
+  / `kaix_arena_variant` must be declared near the other `@kaix_*` ctor declares.
+  Selfhost never emits a `region { }`, so a missing declare passes every internal
+  gate and only a real `--backend=llvm` program with a region trips it (clang
+  rejects IR that calls an undeclared symbol). The gate that catches it is running
+  the fixtures through `--backend=llvm`, not selfhost.
+- **The carve-outs are by call-site, not by helper.** Routing is per ctor
+  call-site: the real list/record/variant builders go to `@kaix_arena_*` when
+  `in_region`, but the nullary `@kaix_variant(...,0,null)` branch, the
+  reuse-in-place path, and the internal nullary-spine `llvm_emit_variants_of`
+  (`variants[T]()`) stay on `@kaix_cons` / `@kaix_variant`. Mis-routing the
+  nullary or internal-spine sites would diverge from the C carve-outs.
+
 ## Coverage gaps left for next lanes
 
-- **LLVM backend parity.** The C backend is complete; the LLVM backend
-  (`emit_llvm.kai`) needs the same `LlvmEmit` ctx threading (~20 literal
-  construction sites), the region wrap in `llvm_emit_block`, constructor target
-  routing to `kaix_arena_*`, and six `declare` lines (which selfhost does **not**
-  catch — only a `--backend=llvm` region run does). Deferred per maintainer
-  decision; the `kaix_*` runtime shims already exist.
 - **Region nominal records in protocol dispatch.** `kai_arena_record` stamps
   `head_type_tag = 0` (like `kai_record`, unlike `kai_record_h`). A nominal
   record built inside a region and used as a protocol-dispatch receiver would
@@ -161,7 +200,11 @@ fixture set:
 
 Larger than a clean implementation would suggest, almost entirely due to the
 signature-change-caller-miss bug (two reset cycles) and tooling instability
-during the session. The runtime (P0) and surface (P2a) were straightforward; the
-C emit routing (P1) was where the cost landed, and the discipline that finally
-worked — incremental per-ctor commits, each fully gated on a fresh rebuild — is
-the transferable takeaway.
+during the C-emitter session. The runtime (P0) and surface (P2a) were
+straightforward; the C emit routing (P1) was where the cost landed, and the
+discipline that finally worked — incremental per-ctor commits, each fully gated on
+a fresh rebuild — is the transferable takeaway. The LLVM half, by contrast,
+landed cleanly in two commits (scaffold + logic) with **no reset cycles**, because
+the scaffold-first split made the signature-change-caller-miss class detectable by
+the selfhost gate before any region logic existed — exactly the lesson the C side
+paid for.
