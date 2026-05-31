@@ -310,6 +310,29 @@ KaiValue *kaix_arena_alloc(KaiTag tag) {
     return a ? kai_arena_alloc(a, tag) : kai_alloc(tag);
 }
 
+/* issue #120 — opt-in Perceus regions (Phase P1): arena-backed
+ * constructor + deep-copy-out shims, mirroring the C-backend helpers so
+ * both emitters call the SAME runtime code (no separate LLVM path). */
+KaiValue *kaix_arena_cons(KaiValue *h, KaiValue *t)                       { return kai_arena_cons(h, t); }
+KaiValue *kaix_arena_record(int n, KaiValue **fields, const char **names) { return kai_arena_record(n, fields, names); }
+KaiValue *kaix_arena_variant(int32_t tag, const char *name, int n, KaiValue **args) {
+    /* Same boxed-args bridge as kaix_variant: stamp into slot-mask shape
+     * with mask 0 and forward to the arena variant ctor. */
+    if (n <= 0) return kai_arena_variant(tag, name, 0, 0, NULL);
+    KaiVarSlot stack_slots[16];
+    KaiVarSlot *slots = stack_slots;
+    KaiVarSlot *heap = NULL;
+    if (n > (int)(sizeof(stack_slots) / sizeof(stack_slots[0]))) {
+        heap = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+        slots = heap;
+    }
+    for (int i = 0; i < n; i++) slots[i].ptr = args[i];
+    KaiValue *r = kai_arena_variant(tag, name, n, 0, slots);
+    if (heap) free(heap);
+    return r;
+}
+KaiValue *kaix_deep_copy_out(KaiValue *v)                                 { return kai_deep_copy_out(v); }
+
 /* ---------- M3e: lists + closures-with-captures ---------- */
 KaiValue *kaix_cons(KaiValue *h, KaiValue *t)            { return kai_cons(h, t); }
 KaiValue *kaix_nil(void)                                  { return kai_nil(); }

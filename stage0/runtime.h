@@ -2856,6 +2856,126 @@ static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
     return v;
 }
 
+/* issue #120 — opt-in Perceus regions (Phase P1): arena-backed
+ * constructors. Mirror kai_cons / kai_record / kai_variant_u but
+ * bump-allocate the header (and interior arrays) into the current
+ * region arena instead of the RC heap. The emitter routes every
+ * constructor lexically inside a `region { }` block through these when
+ * `cx.in_region` is set; the resulting nodes carry rc = INT32_MAX (the
+ * arena sentinel) so RC skips them and the whole arena frees in one
+ * shot at block exit. No active region (defensive — codegen bug) →
+ * fall back to the RC constructor (correct, just unpooled). The arena
+ * variant ctor does NOT intern nullaries (unlike kai_variant_u): an
+ * arena nullary must die with its arena, not join the process-lifetime
+ * singleton cache. */
+static KaiValue *kai_arena_cons(KaiValue *head, KaiValue *tail) {
+    KaiArena *ar = kai_arena_current();
+    if (!ar) return kai_cons(head, tail);
+    KaiValue *v = kai_arena_alloc(ar, KAI_CONS);
+    v->as.cons.head = head;
+    v->as.cons.tail = tail;
+    return v;
+}
+
+static KaiValue *kai_arena_record(int n, KaiValue **fields, const char **names) {
+    KaiArena *ar = kai_arena_current();
+    if (!ar) return kai_record(n, fields, names);
+    KaiValue *v = kai_arena_alloc(ar, KAI_RECORD);
+    KaiValue **af = (KaiValue **) kai_arena_raw(ar, (size_t) (n > 0 ? n : 1) * sizeof(KaiValue *));
+    const char **an = (const char **) kai_arena_raw(ar, (size_t) (n > 0 ? n : 1) * sizeof(const char *));
+    for (int i = 0; i < n; ++i) { af[i] = fields[i]; an[i] = names[i]; }
+    v->as.rec.n_fields = n;
+    v->as.rec.fields = af;
+    v->as.rec.names = an;
+    v->as.rec.head_type_tag = 0;
+    return v;
+}
+
+static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
+                                   uint32_t mask, KaiVarSlot *slots) {
+    KaiArena *ar = kai_arena_current();
+    if (!ar) return kai_variant_u(tag, name, n, mask, slots);
+    KaiValue *v = kai_arena_alloc(ar, KAI_VARIANT);
+    v->as.var.variant_tag = tag;
+    v->as.var.variant_name = name;
+    v->as.var.n_args = n;
+    v->as.var.slot_mask = mask;
+    if (n > 0) {
+        KaiVarSlot *as = (KaiVarSlot *) kai_arena_raw(ar, (size_t) n * sizeof(KaiVarSlot));
+        for (int i = 0; i < n; ++i) as[i] = slots[i];
+        v->as.var.slots = as;
+    } else {
+        v->as.var.slots = NULL;
+    }
+    return v;
+}
+
+/* issue #120 — deep-copy-out at the region border (Phase P1). When a
+ * value built inside a `region { }` crosses out of the block (its
+ * final-expression value), the emitter calls this to clone it OUT of
+ * the arena onto the ordinary RC heap with rc = 1, BEFORE the arena is
+ * bulk-freed. Gate on TAG (not on rc == INT32_MAX, which singletons
+ * share with arena values): structural CONS/RECORD/VARIANT/ARRAY/STR
+ * are reallocated fresh via kai_alloc (rc = 1) with fresh interior
+ * arrays and recursively-copied children; scalar / singleton / opaque
+ * leaves are kai_incref'd and shared (no interior pointers into the
+ * arena, or already on the RC heap). */
+static KaiValue *kai_deep_copy_out(KaiValue *v) {
+    if (!v) return v;
+    switch ((KaiTag) v->tag) {
+        case KAI_CONS: {
+            KaiValue *h = kai_deep_copy_out(v->as.cons.head);
+            KaiValue *t = kai_deep_copy_out(v->as.cons.tail);
+            return kai_cons(h, t);
+        }
+        case KAI_RECORD: {
+            int n = v->as.rec.n_fields;
+            KaiValue **fields = (KaiValue **) malloc((size_t) (n > 0 ? n : 1) * sizeof(KaiValue *));
+            if (!fields) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
+            for (int i = 0; i < n; ++i) fields[i] = kai_deep_copy_out(v->as.rec.fields[i]);
+            KaiValue *c = kai_record(n, fields, v->as.rec.names);
+            c->as.rec.head_type_tag = v->as.rec.head_type_tag;
+            free(fields);
+            return c;
+        }
+        case KAI_VARIANT: {
+            int n = v->as.var.n_args;
+            if (n <= 0) return kai_variant_u(v->as.var.variant_tag, v->as.var.variant_name, 0, 0, NULL);
+            KaiVarSlot *slots = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+            if (!slots) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
+            for (int i = 0; i < n; ++i)
+                slots[i].ptr = kai_deep_copy_out(v->as.var.slots[i].ptr);
+            KaiValue *c = kai_variant_u(v->as.var.variant_tag, v->as.var.variant_name, n,
+                                        v->as.var.slot_mask, slots);
+            free(slots);
+            return c;
+        }
+        case KAI_ARRAY: {
+            int64_t len = v->as.arr.len;
+            KaiValue *c = kai_alloc(KAI_ARRAY);
+            c->as.arr.len = len;
+            c->as.arr.cap = len > 0 ? len : 1;
+            c->as.arr.items = (KaiValue **) malloc((size_t) c->as.arr.cap * sizeof(KaiValue *));
+            if (!c->as.arr.items) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
+            for (int64_t i = 0; i < len; ++i)
+                c->as.arr.items[i] = kai_deep_copy_out(v->as.arr.items[i]);
+            return c;
+        }
+        case KAI_STR: {
+            size_t len = v->as.s.len;
+            KaiValue *c = kai_alloc(KAI_STR);
+            c->as.s.len = len;
+            c->as.s.bytes = (char *) malloc(len + 1);
+            if (!c->as.s.bytes) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
+            if (len > 0) memcpy(c->as.s.bytes, v->as.s.bytes, len);
+            c->as.s.bytes[len] = '\0';
+            return c;
+        }
+        default:
+            return kai_incref(v);
+    }
+}
+
 /* Issue #440 Phase 2 — borrow a slot as a boxed `KaiValue *`. Used by
  * match-arm extraction, by the generic walkers (eq, to_string) and by
  * any other code path that needs the boxed view. For pointer slots
