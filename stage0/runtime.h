@@ -5632,6 +5632,44 @@ static void kai_assert_check(KaiValue *cond, const char *msg) {
     }
 }
 
+/* Issue #86 (piece 2): contract-violation assert that appends the
+   runtime value of the offending binding to the panic message. Used
+   by the refinement-desugar path when the predicate has the simple
+   shape `<ident> <binop> <literal>` and the emitter could statically
+   resolve the single ident's local. `base_msg` is the predicate-aware
+   piece-1 context ("requires violated in `<fn>`\nrequired: ..."); the
+   appended line is "\nargument <ident_name> was: <value>".
+
+   Ownership: `cond` and `val` are both CONSUMED (decref'd on every
+   path). The call site passes a fresh owned ref for `val` — a boxed
+   local is forwarded via `kai_incref`, a raw-unboxed scalar via a
+   fresh `kai_real`/`kai_int` box. `kai_to_string` is a borrow on its
+   argument, so we decref `val` ourselves once the string is built.
+   Every owned temp (`vs`, `full`, `val`) is released before the
+   longjmp so a failure inside an active test block does not leak
+   (KAI_TRACE_RC / ASAN gate the lane on this). */
+static void kai_assert_check_with_value(KaiValue *cond, const char *base_msg,
+                                        const char *ident_name, KaiValue *val) {
+    int ok = kai_op_truthy(cond);
+    kai_decref(cond);
+    if (ok) { kai_decref(val); return; }
+    KaiValue *vs   = kai_to_string(val);
+    kai_decref(val);
+    KaiValue *m0   = kai_str(base_msg ? base_msg : "assertion failed");
+    KaiValue *m1   = kai_string_concat(m0, kai_str("\nargument "));
+    KaiValue *m2   = kai_string_concat(m1, kai_str(ident_name ? ident_name : "?"));
+    KaiValue *m3   = kai_string_concat(m2, kai_str(" was: "));
+    KaiValue *full = kai_string_concat(m3, vs);
+    kai_decref(m0); kai_decref(m1); kai_decref(m2); kai_decref(m3); kai_decref(vs);
+    if (kai_test_in_progress) {
+        kai_test_fail(kai_test_current, full->as.s.bytes);
+        kai_decref(full);
+        longjmp(kai_test_jmp, 1);
+    } else {
+        kai_prelude_panic(full);
+    }
+}
+
 /* =================================================================
  * Effects: handler-stack runtime (m7a #5)
  * =================================================================

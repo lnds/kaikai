@@ -4568,6 +4568,10 @@ fn emit_assert_stmt(src: String, cond: Expr, opt_msg: Option[Expr],
   # generic "assertion failed". Non-literal msgs fall back to the
   # generic — runtime evaluation of an arbitrary Expr to a C string
   # would need a kai_to_cstring helper that doesn't exist.
+  # cond is emitted EXACTLY once; `cc` is reused for both the plain and
+  # the value-carrying call. Never re-emit a sub-expression (a second
+  # emit_expr would double-evaluate side effects and double-decref under
+  # Perceus).
   let cc = emit_expr(src, cond, cx)
   let msg_lit = match opt_msg {
     Some(m) -> match m.kind {
@@ -4576,7 +4580,66 @@ fn emit_assert_stmt(src: String, cond: Expr, opt_msg: Option[Expr],
     }
     None -> "\"assertion failed\""
   }
-  concat_all(["kai_assert_check(", cc, ", ", msg_lit, "); "])
+  # Issue #86 (piece 2): when this is a `requires` contract violation
+  # whose predicate has the simple `<ident> <cmp> <literal>` shape, append
+  # the offending binding's runtime value. Restricted to `requires` (not
+  # `ensures`): a requires-assert runs before the body consumes any
+  # param, so the binding's local is guaranteed live; an ensures-assert
+  # runs after `let result = body`, where the referenced param may have
+  # already been consumed (its local freed), so referencing it would be a
+  # use-after-free. The ensures case keeps the value-less form (piece 1
+  # context only) — documented as a follow-up.
+  match opt_msg {
+    Some(m) -> match m.kind {
+      EStr(span, false) ->
+        if assert_span_is_requires(span) {
+          match contract_single_ident_node(cond) {
+            Some(ci) -> match ci {
+              CtrId(ident, idnode, lit) -> {
+                let valarg = emit_contract_value_arg(ident, idnode, lit)
+                let idlit = concat_all(["\"", escape_str_body_for_c(ident), "\""])
+                # Capture the value arg into a temp that is evaluated
+                # BEFORE the condition. The condition consumes the
+                # offending binding's local (the comparison helpers
+                # `kai_op_*_v` decref both operands), so a `kai_incref`
+                # of that same local must run first — otherwise C's
+                # unspecified argument-evaluation order can incref a
+                # freed object (boxed repr) → crash. The statement-
+                # expression pins the order: `_av` first, then `cc`.
+                concat_all(["({ KaiValue *_av = ", valarg, "; ",
+                            "kai_assert_check_with_value(", cc, ", ", span,
+                            ", ", idlit, ", _av); }); "])
+              }
+            }
+            None -> concat_all(["kai_assert_check(", cc, ", ", msg_lit, "); "])
+          }
+        } else { concat_all(["kai_assert_check(", cc, ", ", msg_lit, "); "]) }
+      _ -> concat_all(["kai_assert_check(", cc, ", ", msg_lit, "); "])
+    }
+    None -> concat_all(["kai_assert_check(", cc, ", ", msg_lit, "); "])
+  }
+}
+
+# Issue #86 (piece 2): build the owned `KaiValue*` value argument for
+# `kai_assert_check_with_value`. The helper CONSUMES `val`, so:
+#   - boxed local  → `kai_incref(kai_<ident>)` transfers a fresh ref the
+#     helper consumes, leaving the local's own ref (and any Perceus drop)
+#     untouched.
+#   - raw-unboxed local → `box_wrap` mints a fresh `kai_real`/`kai_int`
+#     box from the raw scalar `kair_<ident>`.
+# The *repr* (which local name exists) comes from the ident node's own
+# `mode` — the exact value `emit_expr` consults for this same node, so
+# the two agree on `kair_` vs `kai_`. The literal's `ty` is the box-type
+# oracle for the raw case (a dup-wrapped ident node's `ty` may be blank,
+# the literal's never is). A boxed local in a raw comparison (e.g. a
+# `Char` param compared via a raw `!=`) still reads from `kai_<ident>`
+# because the binding's storage is boxed regardless of the comparison's
+# lowering.
+fn emit_contract_value_arg(ident: String, idnode: Expr, lit: Expr) : String {
+  match idnode.mode {
+    MUnboxed -> box_wrap(lit.ty, cat2("kair_", ident))
+    _        -> cat3("kai_incref(kai_", ident, ")")
+  }
 }
 
 # ---- declaration emission ----
