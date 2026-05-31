@@ -32,6 +32,7 @@ import compiler.infer
 import compiler.fnreg
 import compiler.unbox
 import compiler.emit_shared
+import compiler.region
 
 # ---- mirrored helper types (Lvm*-renamed; main keeps originals) ----
 
@@ -283,6 +284,7 @@ fn lvm_clause_cap_bind(e: LlvmEmit, c: String, reg: String) : LlvmEmit {
 
 fn llvm_emit_clause_body(c: ClauseInfo, fns: [EFn], vs: [EVar], lams: [LamInfo],
                           oo: [OpOffset], cls: [ClauseInfo],
+                          regions: [RegionMark],
                           start_id: Int) : LlvmDeclOut / Console {
 
   match c {
@@ -303,7 +305,7 @@ fn llvm_emit_clause_body(c: ClauseInfo, fns: [EFn], vs: [EVar], lams: [LamInfo],
                           globals: "", body: "",
                           last_val: "", cur_label: "entry",
                           locals: locals0, fns: fns, vars_: vs, lams: lams,
-                          op_offsets: oo, cls: cls }
+                          op_offsets: oo, cls: cls, regions: regions, in_region: false }
       # R9 env prologue: rebind each capture from `self->env` so the
       # body's `EVar(name)` reads resolve to a local. The env-struct
       # named type is keyed by the same (enc_fn, line, col) triple the
@@ -362,14 +364,14 @@ fn llvm_clause_locals(ps: [Param]) : [LlvmLocal] {
 
 fn llvm_emit_clause_bodies(cs: [ClauseInfo], fns: [EFn], vs: [EVar],
                             lams: [LamInfo], oo: [OpOffset],
-                            cls_all: [ClauseInfo],
+                            cls_all: [ClauseInfo], regions: [RegionMark],
                             start_id: Int, acc: String) : LlvmDeclOut / Console {
 
   match cs {
     [] -> LlvmDeclOut { text: acc, next_id: start_id }
     [c, ...rest] -> {
-      let out = llvm_emit_clause_body(c, fns, vs, lams, oo, cls_all, start_id)
-      llvm_emit_clause_bodies(rest, fns, vs, lams, oo, cls_all,
+      let out = llvm_emit_clause_body(c, fns, vs, lams, oo, cls_all, regions, start_id)
+      llvm_emit_clause_bodies(rest, fns, vs, lams, oo, cls_all, regions,
                               out.next_id, string_concat(acc, out.text))
     }
   }
@@ -832,7 +834,15 @@ type LlvmEmit = {
   # the enclosing fn name stamped on each clause and mint the same C
   # symbol the body emit produces. Populated once at the top of
   # `emit_program_llvm`; pure read-only afterwards.
-  cls: [ClauseInfo]
+  cls: [ClauseInfo],
+  # issue #120 — opt-in Perceus regions. `regions` is the side table
+  # built by `rewrite_regions_decls` (threaded from the driver through
+  # `emit_program_llvm`); `in_region` is the lexical flag the EBlock
+  # arm sets when it opens a `region { }` so the ctor-routing helpers
+  # (`llvm_cons_target` etc.) bump-allocate into the arena. Mirror of
+  # the C backend's `EmitCtx.regions` / `EmitCtx.in_region`.
+  regions: [RegionMark],
+  in_region: Bool
 }
 
 type OpOffset = OO(String, Int)
@@ -840,37 +850,37 @@ type OpOffset = OO(String, Int)
 fn llvm_emit_new() : LlvmEmit =
   LlvmEmit { ids: llvm_id_new(), globals: "", body: "", last_val: "",
              cur_label: "entry", locals: [], fns: [], vars_: [], lams: [],
-             op_offsets: [], cls: [] }
+             op_offsets: [], cls: [], regions: [], in_region: false }
 
 fn llvm_append_body(e: LlvmEmit, s: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: string_concat(e.body, s),
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
 
 fn llvm_set_last(e: LlvmEmit, v: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: v, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
 
 fn llvm_set_label(e: LlvmEmit, lbl: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: lbl,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
 
 fn llvm_append_global(e: LlvmEmit, s: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: string_concat(e.globals, s), body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
 
 fn llvm_fresh_id(e: LlvmEmit) : LlvmEmit =
   LlvmEmit { ids: llvm_id_bump(e.ids), globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
 
 fn llvm_push_local(e: LlvmEmit, nm: String, reg: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: [LL(nm, reg), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls }
+             locals: [LL(nm, reg), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
 
 # Issue #87 — Phase 2 unbox LLVM mirror. A let-bound name whose
 # rhs is `MUnboxed` becomes a raw SSA register. Stored alongside
@@ -879,7 +889,7 @@ fn llvm_push_local(e: LlvmEmit, nm: String, reg: String) : LlvmEmit =
 fn llvm_push_raw_local(e: LlvmEmit, nm: String, reg: String, t: Ty) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: [LRaw(nm, reg, t), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls }
+             locals: [LRaw(nm, reg, t), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
 
 # Open a new LLVM basic block: emit the `<label>:` header and
 # record `label` as the active one so downstream phi nodes can
@@ -4053,9 +4063,13 @@ fn llvm_emit_block(e: LlvmEmit, stmts: [Stmt], tail: Option[Expr]) : LlvmEmit / 
     }
   }
   # Restore outer scope, keep id counter / body / globals / last_val.
+  # issue #120: `in_region` restores to the ENTERING value `e.in_region`
+  # so a nested non-region block inside a `region { }` does not leak the
+  # flag back out, and a region block (when the P1 logic lands below)
+  # closes its arena scope here.
   LlvmEmit { ids: tailed.ids, globals: tailed.globals, body: tailed.body,
              last_val: tailed.last_val, cur_label: tailed.cur_label,
-             locals: outer_locals, fns: tailed.fns, vars_: tailed.vars_, lams: tailed.lams, op_offsets: tailed.op_offsets, cls: tailed.cls }
+             locals: outer_locals, fns: tailed.fns, vars_: tailed.vars_, lams: tailed.lams, op_offsets: tailed.op_offsets, cls: tailed.cls, regions: tailed.regions, in_region: e.in_region }
 }
 
 fn llvm_emit_stmts(e: LlvmEmit, stmts: [Stmt]) : LlvmEmit / Console {
@@ -4927,7 +4941,8 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
           ids: e_br.ids, globals: e_br.globals, body: e_br.body,
           last_val: e_br.last_val, cur_label: e_br.cur_label,
           locals: outer_locals, fns: e_br.fns, vars_: e_br.vars_,
-          lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls
+          lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls,
+          regions: e_br.regions, in_region: e_br.in_region
         }
         let e_next = llvm_open_block(e_scoped, next_try.reg)
         llvm_emit_match_arms(e_next, rest, scr_reg, end_lbl,
@@ -5054,7 +5069,8 @@ fn llvm_emit_match_switch(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: I
         ids: e_br.ids, globals: e_br.globals, body: e_br.body,
         last_val: e_br.last_val, cur_label: e_br.cur_label,
         locals: outer_locals, fns: e_br.fns, vars_: e_br.vars_,
-        lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls
+        lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls,
+        regions: e_br.regions, in_region: e_br.in_region
       }
       LlvmSD { st: e_scoped, entries: [AE(body_val, body_end), ...case_emit.entries] }
     } }
@@ -5185,7 +5201,8 @@ fn llvm_emit_switch_case_bodies(e: LlvmEmit, cases: [SwCase], end_lbl: String,
           ids: e_br.ids, globals: e_br.globals, body: e_br.body,
           last_val: e_br.last_val, cur_label: e_br.cur_label,
           locals: outer_locals, fns: e_br.fns, vars_: e_br.vars_,
-          lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls
+          lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls,
+          regions: e_br.regions, in_region: e_br.in_region
         }
         llvm_emit_switch_case_bodies(e_scoped, rest, end_lbl,
                                        [AE(body_val, body_end), ...acc])
@@ -5394,7 +5411,7 @@ fn llvm_thunk_call_args(i: Int, arity: Int, acc: String) : String {
 # through all decls.
 type LlvmDeclOut = { text: String, next_id: Int }
 
-fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], start_id: Int) : LlvmDeclOut / Console {
+fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], start_id: Int) : LlvmDeclOut / Console {
 
   match d {
     DFn(_, nm, _, ps, ret_ty_opt, _, body, _, _, mo) -> {
@@ -5459,7 +5476,7 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
                               globals: "", body: "",
                               last_val: "", cur_label: first_label,
                               locals: locals0, fns: body_fns, vars_: vs, lams: lams,
-                              op_offsets: oo, cls: cls }
+                              op_offsets: oo, cls: cls, regions: regions, in_region: false }
           # TCO raw prologue: alloca `iN` slot per param, store the
           # incoming `%pargr_<n>`, branch into the loop header, reload as
           # `%kair_<n>`. No box, no RC — raw scalars carry no reference
@@ -5496,7 +5513,7 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
                               globals: "", body: "",
                               last_val: "", cur_label: first_label,
                               locals: locals0, fns: body_fns, vars_: vs, lams: lams,
-                              op_offsets: oo, cls: cls }
+                              op_offsets: oo, cls: cls, regions: regions, in_region: false }
           # Prologue (TCO only): alloca + store the incoming args, branch
           # into the loop header, reload params. Emitted into the body so it
           # precedes the real body's IR; `cur_label` is already
@@ -5834,13 +5851,13 @@ fn llvm_ffi_param_decrefs(params: [Param], i: Int) : String {
   }
 }
 
-fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : LlvmDeclOut / Console {
+fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], start_id: Int, acc: String) : LlvmDeclOut / Console {
 
   match ds {
     [] -> LlvmDeclOut { text: acc, next_id: start_id }
     [d, ...rest] -> {
-      let out = llvm_emit_fn(d, fns, vs, lams, oo, cls, start_id)
-      llvm_emit_decls_loop(rest, fns, vs, lams, oo, cls, out.next_id, string_concat(acc, out.text))
+      let out = llvm_emit_fn(d, fns, vs, lams, oo, cls, regions, start_id)
+      llvm_emit_decls_loop(rest, fns, vs, lams, oo, cls, regions, out.next_id, string_concat(acc, out.text))
     }
   }
 }
@@ -5850,7 +5867,7 @@ fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], lams: [LamInfo], oo:
 # has thunk signature `(self, args, n)` — args[i] reads the i-th
 # param, `kaix_capture(self, i)` reads the i-th captured local. The
 # body is then emitted under an env that pushes both as named regs.
-fn llvm_emit_lambda_body(l: LamInfo, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], start_id: Int) : LlvmDeclOut / Console {
+fn llvm_emit_lambda_body(l: LamInfo, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], start_id: Int) : LlvmDeclOut / Console {
 
   match l {
     LamInfo(id, _, _, params, caps, body) -> {
@@ -5858,7 +5875,7 @@ fn llvm_emit_lambda_body(l: LamInfo, fns: [EFn], vs: [EVar], lams: [LamInfo], oo
                           globals: "", body: "",
                           last_val: "", cur_label: "entry",
                           locals: [], fns: fns, vars_: vs, lams: lams,
-                          op_offsets: oo, cls: cls }
+                          op_offsets: oo, cls: cls, regions: regions, in_region: false }
       let e1 = llvm_emit_lambda_param_loads(e0, params, 0)
       let e2 = llvm_emit_lambda_capture_loads(e1, caps, 0)
       let e3 = llvm_emit_expr(e2, body)
@@ -5920,9 +5937,9 @@ fn llvm_emit_lambda_capture_loads(e: LlvmEmit, caps: [String], i: Int) : LlvmEmi
 # lambda's body was emitted; `find_lam` then failed at the inner
 # `ELambda` use site and the emitter substituted `undef` for the
 # closure pointer (visible as the "lambda info missing" stderr line).
-fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : LlvmDeclOut / Console {
+fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], start_id: Int, acc: String) : LlvmDeclOut / Console {
 
-  llvm_emit_lambda_bodies_loop(lams, lams, fns, vs, oo, cls, start_id, acc)
+  llvm_emit_lambda_bodies_loop(lams, lams, fns, vs, oo, cls, regions, start_id, acc)
 }
 
 # Returns LlvmDeclOut (not just the text) so the id counter survives
@@ -5930,13 +5947,13 @@ fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffse
 # otherwise both phases mint globals from the same `decls_out.next_id`
 # base and collide (e.g. two `@eff.disp.name.N` for distinct effects,
 # issue #622 — clang rejects the redefinition).
-fn llvm_emit_lambda_bodies_loop(remaining: [LamInfo], all_lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], start_id: Int, acc: String) : LlvmDeclOut / Console {
+fn llvm_emit_lambda_bodies_loop(remaining: [LamInfo], all_lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], start_id: Int, acc: String) : LlvmDeclOut / Console {
 
   match remaining {
     [] -> LlvmDeclOut { text: acc, next_id: start_id }
     [l, ...rest] -> {
-      let out = llvm_emit_lambda_body(l, fns, vs, all_lams, oo, cls, start_id)
-      llvm_emit_lambda_bodies_loop(rest, all_lams, fns, vs, oo, cls, out.next_id, string_concat(acc, out.text))
+      let out = llvm_emit_lambda_body(l, fns, vs, all_lams, oo, cls, regions, start_id)
+      llvm_emit_lambda_bodies_loop(rest, all_lams, fns, vs, oo, cls, regions, out.next_id, string_concat(acc, out.text))
     }
   }
 }
@@ -5944,7 +5961,7 @@ fn llvm_emit_lambda_bodies_loop(remaining: [LamInfo], all_lams: [LamInfo], fns: 
 fn llvm_build_globals_names(fns: [EFn], vs: [EVar], eff_names: [String], op_quals: [String]) : [String] = build_globals(fns, vs, eff_names, op_quals)
 
 #[doc("Entry point: lower a parsed+resolved [Decl] program to textual LLVM IR linking against stage0/runtime_llvm.c. The driver calls this when KAI_BACKEND=llvm; the default selfhost path stays on the C emitter.")]
-pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String / Console {
+pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], regions: [RegionMark]) : String / Console {
 
   let alias_resolved = rewrite_alias_decls(raw_decls)
   let decls = alias_resolved
@@ -5978,14 +5995,14 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl]) : String 
   # through every emit step so install code in `llvm_emit_handle` can
   # mint the same prefixed clause symbols that the bodies emit.
   let cls = lc.clauses
-  let decls_out = llvm_emit_decls_loop(decls, fns, vs, lams, oo, cls, 0, "")
-  let lam_bodies = llvm_emit_lambda_bodies(lams, fns, vs, oo, cls, decls_out.next_id, "")
+  let decls_out = llvm_emit_decls_loop(decls, fns, vs, lams, oo, cls, regions, 0, "")
+  let lam_bodies = llvm_emit_lambda_bodies(lams, fns, vs, oo, cls, regions, decls_out.next_id, "")
   # m7c-d: emit each handler clause as a top-level LLVM function;
   # the handle prologue stores function pointers to these into
   # the matching `%EvX` field.
   let clauses_info = lc.clauses
   let clauses_out = llvm_emit_clause_bodies(clauses_info, fns, vs, lams, oo,
-                                              clauses_info,
+                                              clauses_info, regions,
                                               lam_bodies.next_id, "")
   # m7c-d: emit the install/teardown wrappers the LLVM runtime's
   # `int main` calls. They push/pop default-handler evidence
