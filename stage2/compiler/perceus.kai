@@ -372,6 +372,177 @@ pub fn perceus_pass(decls: [Decl]) : [Decl] / Console {
   map(decls, (d) => perceus_decl(d, fns))
 }
 
+# ---------- Borrow inference (Koka kk_borrow_t, B1) ----------
+#
+# A parameter is BORROWED when the body only INSPECTS it: every read of
+# the param is the scrutinee of a `match` whose arms never use any
+# binder of the matched pattern (the children never escape). `is_red`
+# is the canonical case:
+#
+#   fn is_red(t) = match t { RBNode(Red,_,_,_,_) -> true; _ -> false }
+#
+# `t` is read once, as a match scrutinee, and the arms bind nothing —
+# so no component of `t` escapes the call. A borrowed param is the dual
+# of the #599 skip-set: the callee does NOT consume it (no scrutinee
+# decref, no exit drop), and the caller does NOT dup it. This removes
+# the `kai_internal_dup` the caller would otherwise emit on a multi-use
+# argument — the 37%-of-wall RC traffic the rb-tree spends on
+# inspection calls (is_red, comparisons).
+#
+# Soundness (asu trap #1): the danger is escape of a CHILD of the
+# param, not the param itself. The rule is conservative toward owned —
+# it only fires when the arms bind NOTHING that is later read, so there
+# is provably no escape. Anything more (a binder used anywhere in the
+# arm body) marks the param owned and falls back to the dup discipline.
+
+pub fn pcs_borrow_params(pnames: [String], body: Expr) : [String] = match pnames {
+  []           -> []
+  [h, ...rest] -> {
+    let rest_b = pcs_borrow_params(rest, body)
+    if pcs_name_only_inspected(h, body) { [h, ...rest_b] } else { rest_b }
+  }
+}
+
+# True iff every read of `nm` in `e` is an inspect-only position: the
+# bare scrutinee of a match whose arms escape nothing. A use anywhere
+# else (arg to a call, ctor slot, field, return, etc.) is NOT
+# inspect-only → the param is owned. Conservative: returns false the
+# moment it sees `nm` outside an inspecting match.
+fn pcs_name_only_inspected(nm: String, e: Expr) : Bool =
+  pcs_inspected_kind(nm, e.kind)
+
+fn pcs_inspected_kind(nm: String, k: ExprKind) : Bool = match k {
+  EMatch(s, arms) -> {
+    # `nm` as the bare scrutinee is an inspect, IF the arms escape
+    # nothing. `nm` appearing inside a non-bare scrutinee expression,
+    # or inside any arm body, must itself be inspect-only.
+    let scr_inspect = match s.kind {
+      EVar(uname) -> if uname == nm { pcs_arms_escape_nothing(arms) } else { true }
+      _           -> pcs_name_only_inspected(nm, s)
+    }
+    scr_inspect and pcs_inspected_arms(nm, arms)
+  }
+  EVar(uname)         -> uname != nm   # a bare read NOT as scrutinee = owned use
+  ECall(f, xs)        -> pcs_inspected(nm, f) and pcs_inspected_list(nm, xs)
+  EIntrinsic(_, xs)   -> pcs_inspected_list(nm, xs)
+  EField(x, _)        -> pcs_name_absent(nm, x)   # field read of nm = owned
+  EIndex(a, b)        -> pcs_name_absent(nm, a) and pcs_name_only_inspected(nm, b)
+  EBinop(_, a, b)     -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
+  EUnop(_, x)         -> pcs_name_only_inspected(nm, x)
+  EIf(c, t, oe)       -> pcs_name_only_inspected(nm, c) and
+                          pcs_name_only_inspected(nm, t) and
+                          pcs_inspected_opt(nm, oe)
+  EBlock(stmts, tail) -> pcs_inspected_block(nm, stmts, tail)
+  ELambda(_, b)       -> pcs_name_absent(nm, b)   # capture = owned
+  ERecordLit(_, fis)  -> pcs_inspected_fields(nm, fis)
+  EList(els)          -> pcs_inspected_elems(nm, els)
+  ERange(a, b, oe)    -> pcs_name_only_inspected(nm, a) and
+                          pcs_name_only_inspected(nm, b) and pcs_inspected_opt(nm, oe)
+  EPipe(a, b)         -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
+  EMapPipe(a, b)      -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
+  EFlatMapPipe(a, b)  -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
+  EFilterPipe(a, b)   -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
+  EBang(x)            -> pcs_name_only_inspected(nm, x)
+  ELitUnit(x, _)      -> pcs_name_only_inspected(nm, x)
+  EStr(_, _)          -> false   # interpolation reads are owned (conservative)
+  EHandle(_, _, _, _, _, _, _) -> false   # conservative: handlers are owned
+  _                   -> true    # leaves never reference nm
+}
+
+# An arm escapes nothing iff none of its pattern's binders are read in
+# the arm body. Conservative: a guard counts as the body too.
+fn pcs_arms_escape_nothing(arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(pat, opt_g, abody) -> {
+      let binders = prc_pat_binders(pat, [])
+      let body_clean = pcs_no_binder_used(binders, abody)
+      let guard_clean = match opt_g {
+        None    -> true
+        Some(g) -> pcs_no_binder_used(binders, g)
+      }
+      if body_clean and guard_clean { pcs_arms_escape_nothing(rest) } else { false }
+    }
+  }
+}
+
+# None of `binders` is read anywhere in `e`.
+fn pcs_no_binder_used(binders: [String], e: Expr) : Bool = match binders {
+  []           -> true
+  [b, ...rest] -> if pcs_name_absent(b, e) { pcs_no_binder_used(rest, e) } else { false }
+}
+
+# `nm` does not appear as a read anywhere in `e`. Pure structural walk
+# (no effects) — must stay effect-free so the borrow analysis carries
+# no Console row (the use-collector pcs_collect_uses_expr does, and
+# threading that row through the inference would be both heavy and
+# wrong: inference is a pure query). Reuses the existing
+# pcs_max_paths_in_expr, which counts reads of `nm` purely.
+fn pcs_name_absent(nm: String, e: Expr) : Bool =
+  pcs_max_paths_in_expr(nm, e) == 0
+
+fn pcs_inspected(nm: String, e: Expr) : Bool = pcs_name_only_inspected(nm, e)
+
+fn pcs_inspected_list(nm: String, es: [Expr]) : Bool = match es {
+  []           -> true
+  [e, ...rest] -> if pcs_name_only_inspected(nm, e) { pcs_inspected_list(nm, rest) } else { false }
+}
+
+fn pcs_inspected_opt(nm: String, oe: Option[Expr]) : Bool = match oe {
+  None    -> true
+  Some(e) -> pcs_name_only_inspected(nm, e)
+}
+
+fn pcs_inspected_arms(nm: String, arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, abody) -> {
+      let g_ok = match opt_g { None -> true Some(g) -> pcs_name_only_inspected(nm, g) }
+      if g_ok and pcs_name_only_inspected(nm, abody) { pcs_inspected_arms(nm, rest) } else { false }
+    }
+  }
+}
+
+fn pcs_inspected_block(nm: String, stmts: [Stmt], tail: Option[Expr]) : Bool = {
+  let s_ok = pcs_inspected_stmts(nm, stmts)
+  s_ok and pcs_inspected_opt(nm, tail)
+}
+
+fn pcs_inspected_stmts(nm: String, stmts: [Stmt]) : Bool = match stmts {
+  []           -> true
+  [s, ...rest] -> if pcs_inspected_stmt(nm, s) { pcs_inspected_stmts(nm, rest) } else { false }
+}
+
+fn pcs_inspected_stmt(nm: String, s: Stmt) : Bool = match s {
+  SLet(_, _, rhs)         -> pcs_name_only_inspected(nm, rhs)
+  SExprStmt(e)            -> pcs_name_only_inspected(nm, e)
+  _                       -> pcs_name_absent_stmt(nm, s)
+}
+
+fn pcs_name_absent_stmt(nm: String, s: Stmt) : Bool = match s {
+  SLet(_, _, rhs) -> pcs_name_absent(nm, rhs)
+  SExprStmt(e)    -> pcs_name_absent(nm, e)
+  _               -> true
+}
+
+fn pcs_inspected_fields(nm: String, fis: [FieldInit]) : Bool = match fis {
+  []           -> true
+  [f, ...rest] -> match f {
+    FI(_, v) -> if pcs_name_only_inspected(nm, v) { pcs_inspected_fields(nm, rest) } else { false }
+  }
+}
+
+fn pcs_inspected_elems(nm: String, els: [ListElem]) : Bool = match els {
+  []           -> true
+  [el, ...rest] -> {
+    let ok = match el {
+      ElPlain(e)  -> pcs_name_only_inspected(nm, e)
+      ElSpread(e) -> pcs_name_absent(nm, e)   # spread tail owns the value
+    }
+    if ok { pcs_inspected_elems(nm, rest) } else { false }
+  }
+}
+
 fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
 
   match d {
