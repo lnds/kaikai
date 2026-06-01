@@ -3357,6 +3357,51 @@ typedef KaiValue *KaiReuse;
 #define kai_reuse_null NULL
 static inline KaiReuse kai_ptr_reuse(KaiValue *v) { return v; }
 
+/* arm-top drop-reuse, BORROW model (Koka kk_block_drop_reuse, kklib.h:818).
+ * Runs at the TOP of a match arm whose binds are BORROW (children read from
+ * `v`'s slots WITHOUT an incref), exactly like Koka's insert_loop:
+ *
+ *     tree l = con->left; ... r = con->right;      // borrow binds, no dup
+ *     reuse_t _ru = kk_reuse_null;
+ *     if (is_unique(t)) { _ru = reuse(t); }         // UNIQUE: take shell, children MOVE
+ *     else { dup(l); dup(r); ...; decref(t); }      // SHARED: dup kept children, drop t
+ *
+ *   - UNIQUE (kaikai rc==1): return the bare cell as a token. Do NOT touch
+ *     the children — they MOVE from this shell into the rebuilt node (the
+ *     borrow binds become the owners; net RC 0). The emit does NOT dup them
+ *     in the unique branch; kai_variant_at overwrites the slots next.
+ *   - SHARED (rc>1): NON-recursive `rc--` only. The cell stays live for its
+ *     other owners; its children stay referenced by it. The emit has dup'd
+ *     the children it keeps in the shared branch. Return null → fresh alloc.
+ *
+ * `n` is the rebuild arity; n_args != n cannot host the rebuild. With borrow
+ * binds the children are not owned here, so on mismatch we must NOT cascade:
+ * refcount-only decrement, no token. (A mismatch is a recogniser bug.)
+ *
+ * CRITICAL vs kai_decref: the shared branch is a NON-recursive `rc--`. A
+ * recursive decref would cascade into the borrow-bound children the emit is
+ * about to use — the 14x-tree leak/UAF from the misplaced first attempt.
+ * Koka's kk_block_drop_reuse is likewise refcount-only; child drops happen
+ * via explicit emit-side dup/decref, never inside the reuse primitive. */
+static inline KaiReuse kai_drop_reuse_token(KaiValue *v, int n) {
+    if (v == NULL || kai_is_value(v) || v->tag != KAI_VARIANT ||
+        v->as.var.n_args != n) {
+        if (v != NULL && !kai_is_value(v) && v->tag == KAI_VARIANT &&
+            v->rc != INT32_MAX) {
+            v->rc -= 1;   /* non-recursive: children are borrow-bound, not ours */
+        }
+        return kai_reuse_null;
+    }
+    if (kai_check_unique(v)) {
+        /* sole owner: hand back the shell. Children MOVE into the rebuild
+         * (borrow binds become the owners). kai_variant_at overwrites next. */
+        return v;
+    }
+    /* shared: non-recursive refcount decrement. */
+    if (v->rc != INT32_MAX) v->rc -= 1;
+    return kai_reuse_null;
+}
+
 /* alloc-at: write a variant Ctor into a donated cell IN PLACE (no malloc),
  * else fall back to a fresh alloc. Move semantics — does NOT decref the
  * donor's old slots (they were extracted into locals and either moved into

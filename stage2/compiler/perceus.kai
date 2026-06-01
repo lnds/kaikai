@@ -1570,11 +1570,24 @@ fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, ski
     [a, ...rest] -> match a {
       Arm(pat, opt_g, body) -> {
         let scope1 = prc_pat_bindings(pat, scope)
+        # Issue #599 (locals): extend the skip-set with this arm's pattern
+        # binders that pass the branch-aware safety check over the arm body.
+        # A guard disables the optimisation (the body may not run after the
+        # binders are read in the guard), so only the guard-less arms get it.
+        # Issue #599 (locals): extend the skip-set with this arm's pattern
+        # binders that pass the branch-aware safety check — BUT only when the
+        # arm is purely constructor-rebuild on every tail (no external fn call
+        # like balance_left). That matches exactly the emit's arm-top-reuse
+        # eligibility (arm_all_tails_consume_token): the recolor arm qualifies,
+        # the balance arm does not. Keeping the two predicates aligned is what
+        # makes the move (perceus) and the shared-branch dup (emit) agree, so
+        # RC balances. A guard also disables it (body may not run).
+        let body_skip = skip_set
         let g1 = match opt_g {
           None -> None
           Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam, skip_set, force_set))
         }
-        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set, force_set)
+        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, body_skip, force_set)
         [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam, skip_set, force_set)]
       }
     }
@@ -1929,6 +1942,58 @@ pub fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] = m
   }
 }
 
+# Issue #599 extended to LOCALS (arm-level pattern binders). A match-arm
+# binder `l` whose body reads it at most once on any path (branch-aware
+# max-path <= 1), consumes it on every path, and only in linear positions
+# can transfer ownership RAW — exactly the params rule, scoped to the arm
+# body. This is the half that makes reuse fire in insert_loop: without it,
+# `l`/`r` fall to the flat `count_non_lam_uses >= 2` fallback (they appear
+# in several mutually-exclusive if-branches, so the flat count is >= 2) and
+# get a redundant dup that keeps the descent tree shared (rc >= 2 -> never
+# unique -> reuse inert). The three conditions operate on the arm `body`
+# expr, so they are naturally scoped to the binder's lifetime (a pattern
+# binder is local to its arm). Same soundness contract as the params path.
+# Pre-TRMC mirror of emit_c's `arm_all_tails_consume_token`: every tail leaf
+# of the arm body is a CONSTRUCTOR rebuild (ECall to an uppercase ctor name,
+# bare EVar or resolved EModCall). That is the arm shape whose every branch
+# rebuilds the donated cell — so moving the arm's binders is sound (each
+# branch consumes them building the node). An arm with a tail call to an
+# EXTERNAL fn (balance_left, …) fails: that branch would drop `_scr` (arm-top)
+# and read moved children → the OOM/panic. Keeping this aligned with the
+# emit predicate is what makes the perceus-move / emit-dup pair balance.
+fn pcs_arm_all_tails_ctor(e: Expr) : Bool = pcs_arm_tail_ctor_kind(e.kind)
+
+fn pcs_arm_tail_ctor_kind(k: ExprKind) : Bool = match k {
+  EIf(_, t, opt_e) ->
+    pcs_arm_all_tails_ctor(t) and
+    (match opt_e { None -> false Some(e2) -> pcs_arm_all_tails_ctor(e2) })
+  EBlock(_, opt_tail) -> match opt_tail { None -> false Some(e) -> pcs_arm_all_tails_ctor(e) }
+  EMatch(_, arms) -> pcs_arm_tail_ctor_arms(arms)
+  ECall(f, _) -> match f.kind {
+    EVar(c)        -> pcs_name_is_ctor(c)
+    EModCall(_, c) -> pcs_name_is_ctor(c)
+    _              -> false
+  }
+  _ -> false
+}
+
+fn pcs_arm_tail_ctor_arms(arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a { Arm(_, _, b) -> pcs_arm_all_tails_ctor(b) and pcs_arm_tail_ctor_arms(rest) }
+}
+
+#[doc("Arm-level pattern binders that pass the branch-aware safety check over the arm body (max-path<=1, consumed-on-every-path, all-consumers-linear). Pub: emit_c's arm-top reuse consults it so the shared-branch dup set matches exactly the binders perceus moves — the two must agree or RC double-counts.")]
+pub fn pcs_branch_aware_skip_locals(binders: [String], body: Expr) : [String] = match binders {
+  []           -> []
+  [h, ...rest] -> {
+    let mp = pcs_max_paths_in_expr(h, body)
+    let cv = pcs_consumed_on_every_path(h, body)
+    let ln = pcs_all_consumers_linear(h, body)
+    let rest_skip = pcs_branch_aware_skip_locals(rest, body)
+    if mp <= 1 and cv and ln { [h, ...rest_skip] } else { rest_skip }
+  }
+}
+
 # Returns `true` if every read of `nm` in `e` is a linear consumer
 # context — either:
 #   - direct arg to `ECall(EVar(<user_fn>), ...)` — call to a
@@ -2052,6 +2117,19 @@ fn pcs_call_consumers_linear(nm: String, f: Expr, xs: [Expr]) : Bool = {
         else { pcs_all_consumers_linear(nm, effective_f) and
                 pcs_all_args_consumers_linear(nm, xs) }
       }
+      # The resolver qualifies a user CONSTRUCTOR to `EModCall(mod, Ctor)`
+      # (uppercase head). A constructor takes ownership of its slots —
+      # linear, exactly like the bare `EVar(C)` ctor shape. Without this
+      # arm a resolved `RBNode(..., nm, ...)` ctor was misclassified
+      # non-linear, blocking the branch-aware skip for `nm` (the rb-tree
+      # insert_loop `l`/`r` ln=F bug). Restricted to ctors (uppercase):
+      # a lowercase `EModCall` is a module FN call whose linearity we do
+      # NOT assume here (capability ops, etc. internally incref) — those
+      # stay conservative (non-linear → dup).
+      EModCall(_mod, callee_name) ->
+        if pcs_name_is_ctor(callee_name) {
+          pcs_all_args_consumers_linear(nm, xs)
+        } else { false }
       _ -> false   # call through capability/closure: assume non-linear
     }
   }
