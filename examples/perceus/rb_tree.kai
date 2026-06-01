@@ -23,78 +23,68 @@
 pub type Color = Red | Black
 pub type RBTree = RBLeaf | RBNode(Color, RBTree, Int, Int, RBTree)
 
-# Okasaki's four imbalance patterns. Each rebuilds three RBNode
-# cells — the new root and its two children — over the same
-# RBTree type. The reuse-in-place predicate (issue #210, PR #289)
-# admits the rewrite when the scrutinee is uniquely owned, so
-# the spine collapses to in-place mutation under Perceus.
-pub fn balance(c: Color, l: RBTree, k: Int, v: Int, r: RBTree) : RBTree =
-  match c {
-    Black -> match l {
-      RBNode(Red, ll, lk, lv, lr) -> match ll {
-        # Case LL: left-left red-red.
-        RBNode(Red, lll, llk, llv, llr) ->
-          RBNode(Red,
-                 RBNode(Black, lll, llk, llv, llr),
-                 lk, lv,
-                 RBNode(Black, lr, k, v, r))
-        _ -> match lr {
-          # Case LR: left-right red-red.
-          RBNode(Red, lrl, lrk, lrv, lrr) ->
-            RBNode(Red,
-                   RBNode(Black, ll, lk, lv, lrl),
-                   lrk, lrv,
-                   RBNode(Black, lrr, k, v, r))
-          _ -> match r {
-            RBNode(Red, rl, rk, rv, rr) -> match rl {
-              RBNode(Red, rll, rlk, rlv, rlr) ->
-                RBNode(Red,
-                       RBNode(Black, l, k, v, rll),
-                       rlk, rlv,
-                       RBNode(Black, rlr, rk, rv, rr))
-              _ -> match rr {
-                RBNode(Red, rrl, rrk, rrv, rrr) ->
-                  RBNode(Red,
-                         RBNode(Black, l, k, v, rl),
-                         rk, rv,
-                         RBNode(Black, rrl, rrk, rrv, rrr))
-                _ -> RBNode(c, l, k, v, r)
-              }
-            }
-            _ -> RBNode(c, l, k, v, r)
-          }
-        }
-      }
-      _ -> match r {
-        RBNode(Red, rl, rk, rv, rr) -> match rl {
-          # Case RL: right-left red-red.
-          RBNode(Red, rll, rlk, rlv, rlr) ->
-            RBNode(Red,
-                   RBNode(Black, l, k, v, rll),
-                   rlk, rlv,
-                   RBNode(Black, rlr, rk, rv, rr))
-          _ -> match rr {
-            # Case RR: right-right red-red.
-            RBNode(Red, rrl, rrk, rrv, rrr) ->
-              RBNode(Red,
-                     RBNode(Black, l, k, v, rl),
-                     rk, rv,
-                     RBNode(Black, rrl, rrk, rrv, rrr))
-            _ -> RBNode(c, l, k, v, r)
-          }
-        }
-        _ -> RBNode(c, l, k, v, r)
-      }
-    }
-    Red -> RBNode(c, l, k, v, r)
+# Lean4/Koka-style red-black insert (the modulo-cons shape).
+#
+# This is the form Koka's bench/rbtree.kk uses (adapted from
+# lean4/IFL19). Unlike Okasaki's monolithic `balance`, the common
+# descent in `insert_loop` rebuilds the spine via a constructor in
+# *tail position* — `RBNode(Red, insert_loop(l, ...), k0, v0, r)` —
+# which is exactly the Tail-Recursion-Modulo-Cons shape the TRMC
+# codegen pass recognises (Leijen & Lorenzen, POPL'22). Rebalancing
+# is deferred to the two narrow `balance_left`/`balance_right`
+# rotations, invoked only under an `is_red` guard.
+
+# Is the root of `t` a red node?
+fn is_red(t: RBTree) : Bool = match t {
+  RBNode(Red, _, _, _, _) -> true
+  _                       -> false
+}
+
+# Left-leaning rebalance after inserting into a red left subtree.
+# Mirror of Koka rbtree.kk `balance-left`.
+fn balance_left(l: RBTree, k: Int, v: Int, r: RBTree) : RBTree =
+  match l {
+    RBNode(_, RBNode(Red, lx, kx, vx, rx), ky, vy, ry) ->
+      RBNode(Red, RBNode(Black, lx, kx, vx, rx), ky, vy, RBNode(Black, ry, k, v, r))
+    RBNode(_, ly, ky, vy, RBNode(Red, lx, kx, vx, rx)) ->
+      RBNode(Red, RBNode(Black, ly, ky, vy, lx), kx, vx, RBNode(Black, rx, k, v, r))
+    RBNode(_, lx, kx, vx, rx) ->
+      RBNode(Black, RBNode(Red, lx, kx, vx, rx), k, v, r)
+    RBLeaf -> RBLeaf
   }
 
+# Right-leaning rebalance after inserting into a red right subtree.
+# Mirror of Koka rbtree.kk `balance-right`.
+fn balance_right(l: RBTree, k: Int, v: Int, r: RBTree) : RBTree =
+  match r {
+    RBNode(_, RBNode(Red, lx, kx, vx, rx), ky, vy, ry) ->
+      RBNode(Red, RBNode(Black, l, k, v, lx), kx, vx, RBNode(Black, rx, ky, vy, ry))
+    RBNode(_, lx, kx, vx, RBNode(Red, ly, ky, vy, ry)) ->
+      RBNode(Red, RBNode(Black, l, k, v, lx), kx, vx, RBNode(Black, ly, ky, vy, ry))
+    RBNode(_, lx, kx, vx, rx) ->
+      RBNode(Black, l, k, v, RBNode(Red, lx, kx, vx, rx))
+    RBLeaf -> RBLeaf
+  }
+
+# Insert in the Koka `ins` shape. The Red-node and Black-node arms
+# each recur through a constructor in tail position (modulo-cons);
+# only the rebalancing sub-case detours through balance_left/right.
 pub fn insert_loop(t: RBTree, k: Int, v: Int) : RBTree = match t {
+  RBNode(Red, l, kx, vx, r) ->
+    if k < kx      { RBNode(Red, insert_loop(l, k, v), kx, vx, r) }
+    else if k > kx { RBNode(Red, l, kx, vx, insert_loop(r, k, v)) }
+    else           { RBNode(Red, l, k, v, r) }
+  RBNode(Black, l, kx, vx, r) ->
+    if k < kx {
+      if is_red(l) { balance_left(insert_loop(l, k, v), kx, vx, r) }
+      else         { RBNode(Black, insert_loop(l, k, v), kx, vx, r) }
+    }
+    else if k > kx {
+      if is_red(r) { balance_right(l, kx, vx, insert_loop(r, k, v)) }
+      else         { RBNode(Black, l, kx, vx, insert_loop(r, k, v)) }
+    }
+    else { RBNode(Black, l, k, v, r) }
   RBLeaf -> RBNode(Red, RBLeaf, k, v, RBLeaf)
-  RBNode(c, l, k0, v0, r) ->
-    if k < k0      { balance(c, insert_loop(l, k, v), k0, v0, r) }
-    else if k > k0 { balance(c, l, k0, v0, insert_loop(r, k, v)) }
-    else           { RBNode(c, l, k0, v, r) }
 }
 
 # Top-level insert. Always repaints the root black per Okasaki
