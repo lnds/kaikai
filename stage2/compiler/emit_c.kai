@@ -3181,7 +3181,44 @@ fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String 
   }
 }
 
+# Detect a borrowed scrutinee: perceus wraps `match p { ... }` as
+# `match __perceus_borrow(p) { ... }` when `p` is an inferred-borrowed
+# param (inspect-only, arms escape nothing). The match then BORROWS the
+# scrutinee — it reads it without owning it, so it must NOT decref it on
+# exit (the owner up the call stack reclaims it). Returns the inner
+# scrutinee expr when the wrap is present.
+fn match_borrow_inner(scrut: Expr) : Option[Expr] = match scrut.kind {
+  ECall(callee, args_) -> match callee.kind {
+    EVar(nm) -> if nm == "__perceus_borrow" {
+      match args_ { [inner] -> Some(inner) _ -> None }
+    } else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
 fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String / Console {
+
+  # Borrowed scrutinee: emit the inner value and SKIP the exit decref —
+  # the callee does not own the value (Koka borrow). This is the
+  # callee side of borrow inference; the caller side strips the matching
+  # __perceus_dup so no incref is paid either → net-zero RC on the
+  # inspected param.
+  match match_borrow_inner(scrut) {
+    Some(inner) -> {
+      let sc = emit_expr(src, inner, cx)
+      concat_all([
+        "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
+        emit_match_arms(src, arms, cx),
+        "    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n",
+        "} while (0); _r; })"   # NO kai_decref(_scr) — borrowed
+      ])
+    }
+    None -> emit_match_default_owned(src, scrut, arms, cx)
+  }
+}
+
+fn emit_match_default_owned(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String / Console {
 
   let sc = emit_expr(src,scrut, cx)
   # m5.x flip Phase 3 closeout (original 9fe6f6d shape, restored after
