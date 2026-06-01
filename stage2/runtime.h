@@ -416,11 +416,66 @@ struct KaiValue {
     } as;
 };
 
+/* ---------- Koka-style tagged-value Int representation ----------
+ *
+ * Ported from Koka's kklib (box.h / integer.h / kklib.h, Daan Leijen).
+ * The structure kaikai never had: a value is ONE machine word. Koka,
+ * box.h:26-29 — on 64-bit, using `z` for the least-significant byte:
+ *
+ *   xxxx xxxz   z = bbbbbbb0  : a heap pointer p (always >= 2-byte aligned)
+ *   xxxx xxxz   z = bbbbbbb1  : a 63-bit value n, encoded as n*2+1
+ *
+ * Pointers from malloc/calloc are >= 8-byte aligned, so the bottom bit
+ * is free. A small Int is therefore an immediate — no heap block, no RC
+ * header. dup/drop on it are no-ops: Koka's kk_integer_dup/drop
+ * (integer.h:271-278) are literally "if (is_bigint) block_dup/drop;
+ * return i". This is what removes the rb-tree's 68.75M `kai_int` heap
+ * allocations (75% of all allocs) and the ~800M RC ops riding on them —
+ * the "kaikai-vs-Koka crux" of docs/benchmarks/rb_tree_2026-05-28.md.
+ *
+ * v1 uses extra_shift=0 (n*2+1, KK_TAG_BITS=1): the win is immediacy,
+ * not the fused-overflow add. Out-of-range Ints (|n| > 2^62) fall back
+ * to a heap KAI_INT — Koka's bigint path, identical shape. Every Int
+ * accessor below understands both forms, so the boxed↔unboxed frontier
+ * disappears: no re-box on a call boundary, comparison, or field read. */
+
+#define KAI_INT_TAG_BIT  ((intptr_t) 1)
+
+/* Bottom-bit discriminator — Koka kk_is_value / kk_is_ptr (kklib.h). */
+static inline int kai_is_value(KaiValue *v) {
+    return (((intptr_t) v) & KAI_INT_TAG_BIT) != 0;
+}
+static inline int kai_is_ptr(KaiValue *v) {
+    return v != NULL && (((intptr_t) v) & KAI_INT_TAG_BIT) == 0;
+}
+
+/* Encode/decode a 63-bit immediate Int — Koka kk_integer_from_small /
+ * kk_smallint_from_integer (integer.h:206-215). Arithmetic >> keeps
+ * the sign. */
+static inline KaiValue *kai_tagged_int(int64_t n) {
+    /* Shift through uintptr_t: a signed left shift of a negative value
+     * is C UB (-fsanitize=undefined trips on it). The bit pattern is
+     * identical to the two's-complement signed shift, and kai_untag_int
+     * uses an arithmetic `>>` to restore the sign. */
+    return (KaiValue *) ((((uintptr_t) n) << 1) | (uintptr_t) KAI_INT_TAG_BIT);
+}
+static inline int64_t kai_untag_int(KaiValue *v) {
+    return ((intptr_t) v) >> 1;
+}
+
+/* The immediate range (63-bit on a 64-bit host). */
+#define KAI_SMALLINT_MAX ((int64_t) (INTPTR_MAX >> 1))
+#define KAI_SMALLINT_MIN ((int64_t) (INTPTR_MIN >> 1))
+static inline int kai_int_fits_immediate(int64_t n) {
+    return n >= KAI_SMALLINT_MIN && n <= KAI_SMALLINT_MAX;
+}
+
 /* ---------- head-type tag derivation ---------- */
 
 /* kai_head_tag — single-dispatch protocol dispatch key for any value.
  * See docs/variant-tags.md "Head-type tags". O(1), cache-warm hot path. */
 static inline int32_t kai_head_tag(KaiValue *v) {
+    if (kai_is_value(v)) return KAI_HEAD_INT;   /* immediate small Int */
     if (v == NULL) return KAI_HEAD_ANON;
     switch ((KaiTag) v->tag) {
         case KAI_UNIT:    return KAI_HEAD_UNIT;
@@ -1651,6 +1706,7 @@ static void kai_arena_pop(void) {
 }
 
 static KaiValue *kai_incref(KaiValue *v) {
+    if (kai_is_value(v)) return v;   /* immediate Int: no header — dup is a no-op (Koka kk_box_dup) */
     if (!v || v->rc == INT32_MAX) {
 #ifdef KAI_TRACE_RC
         if (v) kai_rc_history_log(v, /* op=incref */ 1, v->tag);
@@ -2401,6 +2457,7 @@ static void kai_free_value(KaiValue *v) {
 }
 
 static void kai_decref(KaiValue *v) {
+    if (kai_is_value(v)) return;   /* immediate Int: no header — drop is a no-op (Koka kk_box_drop) */
     if (!v) return;
     if (v->rc == INT32_MAX) return;   /* m5 #7 — singleton, saturated */
     KAI_PROF_ENTER();
@@ -2444,44 +2501,19 @@ static KaiValue *kai_bool(int b) {
     return b ? &kai_singleton_true : &kai_singleton_false;
 }
 
-/* m5.x flip Phase 4 (small-int + char cache). Same idea as the
- * m5 #7 singleton pool — every cached entry carries
- * `rc = INT32_MAX` so `kai_incref` / `kai_decref` skip them.
- * The flag lazily initializes the table on first call so the
- * constructor stays trivial when the program never reaches one
- * of these constructors (e.g., a fizzbuzz that only allocates
- * strings).
+/* Char cache (Char is not yet a value-immediate). Every cached entry
+ * carries `rc = INT32_MAX` so `kai_incref` / `kai_decref` skip them.
  *
- * Phase 1.A (perceus-int-cache, 2026-05-29): widened the Int range
- * from [-128..127] to [-65536..65535] (131072 entries). Measurement
- * (docs/benchmarks/perceus_promise_2026-05-29.md) showed that once
- * reuse-in-place eliminates cons-cell allocation, the entire residual
- * cost of a hot scalar workload is the `kai_int(...)` box minted for
- * every arithmetic result — and the typical values (loop indices,
- * lengths, tags, modest compute) all fall under 64Ki. Widening the
- * cache makes those values value-immediate-ish (a pinned shared box,
- * never freed, never re-alloc'd) WITHOUT touching the ABI or the
- * emitted text — so selfhost stays byte-identical. This is NOT
- * value-immediate / tagged-pointer scalars: ints outside the range
- * still allocate. It removes the alloc for the measured typical case,
- * nothing more. Tagged pointers + raw-slot extract (Phase 1.B) remain
- * the real follow-up for full scalar Perceus.
- *
- * The ranges:
- *   - Int  [-65536..65535]: covers loop indices, list lengths, AST
- *     tag ints, and most modest arithmetic. ~5 MB static .bss table.
- *   - Char [0..127]: ASCII printable + control. UTF-8 multibyte
- *     codepoints fall through to a fresh alloc.
- * The table is lazily warmed on first in-range `kai_int` (O(size)
- * one-shot, ~131k trivial stores, well under 1 ms — kept lazy so a
- * program that never mints an in-range Int pays nothing). */
-#define KAI_INT_CACHE_LO   ((int64_t) -65536)
-#define KAI_INT_CACHE_HI   ((int64_t) 65535)
-#define KAI_INT_CACHE_SIZE 131072
+ * The Int cache that used to live here is GONE: with the Koka
+ * tagged-value Int (see the section near struct KaiValue) a small Int
+ * is an immediate with no heap footprint, so there is nothing to
+ * cache. The old [-65536..65535] x 48 B .bss table and its lazy-warm
+ * branch were the m5.x patch that approximated value-immediates; its
+ * own comment named "tagged pointers + raw-slot extract" as the real
+ * follow-up, which is exactly this port. */
 #define KAI_CHAR_CACHE_HI  ((uint32_t) 127)
 #define KAI_CHAR_CACHE_SIZE 128
 
-static KaiValue kai_int_cache[KAI_INT_CACHE_SIZE];
 static KaiValue kai_char_cache[KAI_CHAR_CACHE_SIZE];
 static int kai_char_cache_init = 0;
 
@@ -2512,19 +2544,27 @@ static void kai_char_cache_warm(void) {
     kai_char_cache_init = 1;
 }
 
+/* Koka kk_integer_from_small (integer.h:211-215): a small Int is an
+ * immediate value — no heap, no RC. Only out-of-range Ints (Koka's
+ * bigint path) heap-allocate a KAI_INT fallback. The 5 MB int cache is
+ * gone; immediacy makes it pointless. */
 static KAI_RC_NOINLINE KaiValue *kai_int(int64_t i) {
-    if (i >= KAI_INT_CACHE_LO && i <= KAI_INT_CACHE_HI) {
-        KaiValue *slot = &kai_int_cache[i - KAI_INT_CACHE_LO];
-        if (slot->rc != INT32_MAX) {       /* cold .bss slot -> warm it */
-            slot->rc = INT32_MAX;
-            slot->tag = KAI_INT;
-            slot->as.i = i;
-        }
-        return slot;
-    }
+    if (kai_int_fits_immediate(i)) return kai_tagged_int(i);
     KaiValue *v = kai_alloc(KAI_INT);
     v->as.i = i;
     return v;
+}
+
+/* Uniform Int accessors — understand BOTH the immediate and the heap
+ * fallback forms, so every hot op (kai_op_*) and every emitter unbox
+ * site reads an Int the same way and the boxed↔unboxed frontier (the
+ * re-box-on-every-boundary that the rb-tree bench measured) is gone.
+ * Mirror of Koka's kk_integer accessors (integer.h). */
+static inline int kai_is_int(KaiValue *v) {
+    return kai_is_value(v) || (v != NULL && v->tag == KAI_INT);
+}
+static inline int64_t kai_intf(KaiValue *v) {
+    return kai_is_value(v) ? kai_untag_int(v) : v->as.i;
 }
 
 static KAI_RC_NOINLINE KaiValue *kai_real(double r) {
@@ -2828,6 +2868,10 @@ static inline int kai_tag_is_reusable(int32_t tag) {
 static int kai_slots_all_immortal_ptr(int n, KaiVarSlot *slots) {
     if (n <= 0 || n > KAI_IMMORTAL_VAR_MAXN) return 0;
     for (int i = 0; i < n; i++) {
+        /* An immediate value (tagged Int) has no header and is never
+         * freed — it counts as immortal. A heap value is immortal only
+         * when its rc is saturated. */
+        if (kai_is_value(slots[i].ptr)) continue;
         if (slots[i].ptr == NULL || slots[i].ptr->rc != INT32_MAX) return 0;
     }
     return 1;
@@ -3015,6 +3059,11 @@ static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
  * arena, or already on the RC heap). */
 static KaiValue *kai_deep_copy_out(KaiValue *v) {
     if (!v) return v;
+    /* Koka tagged-Int: an immediate small Int has no heap header, so
+     * `v->tag` would dereference a fake pointer. It is shared-nothing
+     * by construction — copy-out returns it verbatim (incref is a
+     * no-op for immediates, matching the default branch). */
+    if (kai_is_value(v)) return v;
     switch ((KaiTag) v->tag) {
         case KAI_CONS: {
             KaiValue *h = kai_deep_copy_out(v->as.cons.head);
@@ -3093,6 +3142,7 @@ static inline KaiValue *kai_variant_slot_box(KaiValue *v, int i) {
  * write into `slot.i64` / `slot.r`. Singleton Ints (rc == INT32_MAX)
  * survive the decref unchanged. */
 static inline int64_t kai_take_int(KaiValue *v) {
+    if (kai_is_value(v)) return kai_untag_int(v);   /* immediate: no header to decref */
     int64_t x = v->as.i;
     kai_decref(v);
     return x;
@@ -3140,7 +3190,7 @@ static int kai_check_unique(KaiValue *v) {
      * fires on KAI_CONS / KAI_RECORD / KAI_VARIANT, none of which
      * are pooled today, so the singleton check is defensive but
      * cheap and keeps the predicate honest. */
-    return v != NULL && v->rc == 1 && v->rc != INT32_MAX;
+    return v != NULL && !kai_is_value(v) && v->rc == 1 && v->rc != INT32_MAX;
 }
 
 static KaiValue *kai_reuse_or_alloc_cons(KaiValue *_scr,
@@ -3330,6 +3380,37 @@ static inline KaiValue *kai_variant_at(KaiReuse at, int32_t tag,
     return kai_variant_u(tag, name, n, mask, slots);
 }
 
+/* TRMC reuse-in-place (Koka kk_block_drop_reuse + kk_block_alloc_at,
+ * fused for the TRMC modulo-cons site). `_scr` is the variant cell the
+ * enclosing `match` arm just consumed. When it is UNIQUE and has the
+ * target arity, donate it as the storage for the rebuilt node:
+ * overwrite the slot words (MOVE semantics — the arm already extracted
+ * the donor's children into locals via kai_incref, so we must NOT
+ * decref them), retag, and `incref` the cell so it survives the
+ * `kai_decref(_scr)` the match emits at arm exit (net rc after exit:
+ * 1, a unique freshly-built node — exactly the kai_reuse_or_alloc_cons
+ * discipline). When `_scr` is shared or wrong-arity, allocate a fresh
+ * node and leave `_scr` for the match exit to reclaim normally.
+ *
+ * This is what collapses the rb-tree's RBNode rebuild churn: each
+ * insert reuses the cells it walked instead of paired free+alloc,
+ * approaching Koka's in-place cost. Koka's unique gate is rc==0;
+ * kaikai's is rc==1 (kai_check_unique). */
+static inline KaiValue *kai_variant_reuse_at(KaiValue *_scr, int32_t tag,
+                                             const char *name, int n,
+                                             uint32_t mask, KaiVarSlot *slots) {
+    if (_scr != NULL && !kai_is_value(_scr) && _scr->tag == KAI_VARIANT &&
+        _scr->as.var.n_args == n && kai_check_unique(_scr)) {
+        for (int i = 0; i < n; ++i) _scr->as.var.slots[i] = slots[i];
+        _scr->as.var.variant_tag = tag;
+        _scr->as.var.variant_name = name;
+        _scr->as.var.slot_mask = mask;
+        kai_rc_reuse_total++;
+        return kai_incref(_scr);   /* survive the match-exit kai_decref(_scr) */
+    }
+    return kai_variant_u(tag, name, n, mask, slots);
+}
+
 /* Allocate an array of `len` slots, each initialised to `init`
    (incref'd once per slot). Caller owns the returned array. */
 static KAI_RC_NOINLINE KaiValue *kai_array_make(int64_t len, KaiValue *init) {
@@ -3475,13 +3556,19 @@ static KaiValue *kai_op_field_borrow(KaiValue *rec, const char *name) {
 /* ---------- equality ---------- */
 
 static int kai_op_eq(KaiValue *a, KaiValue *b) {
-    if (a == b) return 1;
+    if (a == b) return 1;   /* identical word — covers two equal immediates (Koka kk_box_eq) */
+    /* Immediate Int: equal iff both are Ints with the same value. An
+     * immediate vs a heap value of any other type is unequal. Done
+     * before any header deref, since an immediate has no header. */
+    if (kai_is_value(a) || kai_is_value(b)) {
+        return kai_is_int(a) && kai_is_int(b) && kai_intf(a) == kai_intf(b);
+    }
     if (!a || !b) return 0;
     if (a->tag != b->tag) return 0;
     switch ((KaiTag) a->tag) {
         case KAI_UNIT: return 1;
         case KAI_BOOL: return a->as.b == b->as.b;
-        case KAI_INT:  return a->as.i == b->as.i;
+        case KAI_INT:  return a->as.i == kai_intf(b);
         case KAI_REAL: return a->as.r == b->as.r;
         case KAI_CHAR: return a->as.c == b->as.c;
         case KAI_STR:  return a->as.s.len == b->as.s.len &&
@@ -3572,7 +3659,7 @@ static KaiValue *kai_to_string(KaiValue *v);
 static KaiValue *kai_list_to_string(KaiValue *v) {
     KaiValue *acc = kai_str("[");
     int first = 1;
-    while (v && v->tag == KAI_CONS) {
+    while (kai_is_ptr(v) && v->tag == KAI_CONS) {
         if (!first) {
             KaiValue *c = kai_string_concat(acc, kai_str(", "));
             kai_decref(acc); acc = c;
@@ -3590,11 +3677,18 @@ static KaiValue *kai_list_to_string(KaiValue *v) {
 static KaiValue *kai_to_string(KaiValue *v) {
     if (!v) return kai_str("<null>");
     char buf[64];
+    /* Koka tagged-Int: a small Int is an immediate, not a heap value —
+     * `v->tag` would dereference the fake pointer and crash. Render it
+     * as the decoded integer before touching the header. */
+    if (kai_is_value(v)) {
+        snprintf(buf, sizeof(buf), "%lld", (long long) kai_intf(v));
+        return kai_str(buf);
+    }
     switch ((KaiTag) v->tag) {
         case KAI_UNIT: return kai_str("()");
         case KAI_BOOL: return kai_str(v->as.b ? "true" : "false");
         case KAI_INT:
-            snprintf(buf, sizeof(buf), "%lld", (long long) v->as.i);
+            snprintf(buf, sizeof(buf), "%lld", (long long) kai_intf(v));
             return kai_str(buf);
         case KAI_REAL:
             snprintf(buf, sizeof(buf), "%g", v->as.r);
@@ -3663,8 +3757,8 @@ static KaiValue *kai_to_string(KaiValue *v) {
 }
 
 static KAI_RC_NOINLINE KaiValue *kai_string_concat(KaiValue *a, KaiValue *b) {
-    size_t la = (a && a->tag == KAI_STR) ? a->as.s.len : 0;
-    size_t lb = (b && b->tag == KAI_STR) ? b->as.s.len : 0;
+    size_t la = (a && kai_is_ptr(a) && a->tag == KAI_STR) ? a->as.s.len : 0;
+    size_t lb = (b && kai_is_ptr(b) && b->tag == KAI_STR) ? b->as.s.len : 0;
     KaiValue *v = kai_alloc(KAI_STR);
     v->as.s.len = la + lb;
     v->as.s.bytes = (char *) malloc(la + lb + 1);
@@ -3682,7 +3776,7 @@ static KAI_RC_NOINLINE KaiValue *kai_string_concat_all_impl(KaiValue *xs) {
     size_t total = 0;
     for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
         KaiValue *s = p->as.cons.head;
-        if (s && s->tag == KAI_STR) total += s->as.s.len;
+        if (kai_is_ptr(s) && s->tag == KAI_STR) total += s->as.s.len;
     }
     KaiValue *v = kai_alloc(KAI_STR);
     v->as.s.len = total;
@@ -3702,12 +3796,12 @@ static KAI_RC_NOINLINE KaiValue *kai_string_concat_all_impl(KaiValue *xs) {
 
 /* Two-pass join: like concat_all but interleaves `sep` between pieces. */
 static KAI_RC_NOINLINE KaiValue *kai_string_join_impl(KaiValue *xs, KaiValue *sep) {
-    size_t slen = (sep && sep->tag == KAI_STR) ? sep->as.s.len : 0;
+    size_t slen = (kai_is_ptr(sep) && sep->tag == KAI_STR) ? sep->as.s.len : 0;
     size_t total = 0;
     int count = 0;
     for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
         KaiValue *s = p->as.cons.head;
-        if (s && s->tag == KAI_STR) total += s->as.s.len;
+        if (kai_is_ptr(s) && s->tag == KAI_STR) total += s->as.s.len;
         count++;
     }
     if (count > 1) total += slen * (size_t)(count - 1);
@@ -3792,7 +3886,7 @@ static KaiValue *kai_prelude_write_stdout(KaiValue *arg) {
 
 static KaiValue *kai_prelude_panic(KaiValue *msg) {
     fprintf(stderr, "panic: ");
-    if (msg && msg->tag == KAI_STR) {
+    if (kai_is_ptr(msg) && msg->tag == KAI_STR) {
         fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
     }
     fputc('\n', stderr);
@@ -3801,7 +3895,7 @@ static KaiValue *kai_prelude_panic(KaiValue *msg) {
 }
 
 static KaiValue *kai_prelude_exit(KaiValue *code) {
-    int c = (code && code->tag == KAI_INT) ? (int) code->as.i : 0;
+    int c = (kai_is_int(code)) ? (int) kai_intf(code) : 0;
     exit(c);
     return kai_unit();
 }
@@ -3810,7 +3904,7 @@ static KaiValue *kai_prelude_exit(KaiValue *code) {
 
 static KaiValue *kai_prelude_int_to_string(KaiValue *v) {
     char buf[32];
-    snprintf(buf, sizeof(buf), "%lld", (long long) v->as.i);
+    snprintf(buf, sizeof(buf), "%lld", (long long) kai_intf(v));
     KaiValue *r = kai_str(buf);
     kai_decref(v);
     return r;
@@ -3825,7 +3919,7 @@ static KaiValue *kai_prelude_real_to_string(KaiValue *v) {
 }
 
 static KaiValue *kai_prelude_int_to_real(KaiValue *v) {
-    int64_t n = (v && v->tag == KAI_INT) ? v->as.i : 0;
+    int64_t n = (kai_is_int(v)) ? kai_intf(v) : 0;
     KaiValue *r = kai_real((double) n);
     kai_decref(v);
     return r;
@@ -3853,12 +3947,12 @@ static KaiValue *kai_prelude_real_to_int(KaiValue *v) {
  * 0..255, Ok otherwise. The Result is encoded as a KAI_VARIANT (Ok /
  * Err) with one payload. */
 static KaiValue *kai_prelude_int_to_byte(KaiValue *v) {
-    if (!v || v->tag != KAI_INT) {
+    if (!kai_is_int(v)) {
         if (v) kai_decref(v);
         KaiValue *err = kai_str("int_to_byte: not an Int");
         return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = err}});
     }
-    int64_t n = v->as.i;
+    int64_t n = kai_intf(v);
     kai_decref(v);
     if (n < 0 || n > 255) {
         char buf[64];
@@ -3879,32 +3973,32 @@ static KaiValue *kai_prelude_byte_to_int(KaiValue *v) {
 
 /* Wrapping arithmetic per uint8_t C semantics. Overflow is defined. */
 static KaiValue *kai_prelude_byte_add(KaiValue *a, KaiValue *b) {
-    uint8_t av = (a && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
-    uint8_t bv = (b && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
+    uint8_t av = (kai_is_ptr(a) && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
+    uint8_t bv = (kai_is_ptr(b) && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
     if (a) kai_decref(a);
     if (b) kai_decref(b);
     return kai_byte((uint8_t) (av + bv));
 }
 
 static KaiValue *kai_prelude_byte_sub(KaiValue *a, KaiValue *b) {
-    uint8_t av = (a && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
-    uint8_t bv = (b && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
+    uint8_t av = (kai_is_ptr(a) && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
+    uint8_t bv = (kai_is_ptr(b) && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
     if (a) kai_decref(a);
     if (b) kai_decref(b);
     return kai_byte((uint8_t) (av - bv));
 }
 
 static KaiValue *kai_prelude_byte_eq(KaiValue *a, KaiValue *b) {
-    uint8_t av = (a && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
-    uint8_t bv = (b && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
+    uint8_t av = (kai_is_ptr(a) && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
+    uint8_t bv = (kai_is_ptr(b) && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
     if (a) kai_decref(a);
     if (b) kai_decref(b);
     return kai_bool(av == bv);
 }
 
 static KaiValue *kai_prelude_byte_lt(KaiValue *a, KaiValue *b) {
-    uint8_t av = (a && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
-    uint8_t bv = (b && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
+    uint8_t av = (kai_is_ptr(a) && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
+    uint8_t bv = (kai_is_ptr(b) && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
     if (a) kai_decref(a);
     if (b) kai_decref(b);
     return kai_bool(av < bv);
@@ -3924,7 +4018,7 @@ static KaiValue *kai_prelude_byte_to_string(KaiValue *v) {
 
 #define KAI_LIBM_REAL1(name, fn)                                         \
     static KaiValue *kai_prelude_real_##name(KaiValue *x) {              \
-        double r = (x && x->tag == KAI_REAL) ? fn(x->as.r) : 0.0;        \
+        double r = (kai_is_ptr(x) && x->tag == KAI_REAL) ? fn(x->as.r) : 0.0;        \
         KaiValue *out = kai_real(r);                                     \
         if (x) kai_decref(x);                                            \
         return out;                                                      \
@@ -3932,8 +4026,8 @@ static KaiValue *kai_prelude_byte_to_string(KaiValue *v) {
 
 #define KAI_LIBM_REAL2(name, fn)                                         \
     static KaiValue *kai_prelude_real_##name(KaiValue *a, KaiValue *b) { \
-        double av = (a && a->tag == KAI_REAL) ? a->as.r : 0.0;           \
-        double bv = (b && b->tag == KAI_REAL) ? b->as.r : 0.0;           \
+        double av = (a && kai_is_ptr(a) && a->tag == KAI_REAL) ? a->as.r : 0.0;           \
+        double bv = (b && kai_is_ptr(b) && b->tag == KAI_REAL) ? b->as.r : 0.0;           \
         KaiValue *out = kai_real(fn(av, bv));                            \
         if (a) kai_decref(a);                                            \
         if (b) kai_decref(b);                                            \
@@ -3965,7 +4059,7 @@ KAI_LIBM_REAL2(rem,   fmod)
 
 /* signum: -1.0 / 0.0 / +1.0; NaN passes through as NaN. */
 static KaiValue *kai_prelude_real_signum(KaiValue *x) {
-    double r = (x && x->tag == KAI_REAL) ? x->as.r : 0.0;
+    double r = (kai_is_ptr(x) && x->tag == KAI_REAL) ? x->as.r : 0.0;
     double s;
     if (r != r)        s = r;          /* NaN */
     else if (r > 0.0)  s = 1.0;
@@ -3978,7 +4072,7 @@ static KaiValue *kai_prelude_real_signum(KaiValue *x) {
 
 static KaiValue *kai_prelude_real_is_nan(KaiValue *x) {
     int yes = 0;
-    if (x && x->tag == KAI_REAL) { double r = x->as.r; yes = (r != r); }
+    if (kai_is_ptr(x) && x->tag == KAI_REAL) { double r = x->as.r; yes = (r != r); }
     KaiValue *out = kai_bool(yes);
     if (x) kai_decref(x);
     return out;
@@ -3986,7 +4080,7 @@ static KaiValue *kai_prelude_real_is_nan(KaiValue *x) {
 
 static KaiValue *kai_prelude_real_is_inf(KaiValue *x) {
     int yes = 0;
-    if (x && x->tag == KAI_REAL) {
+    if (kai_is_ptr(x) && x->tag == KAI_REAL) {
         double r = x->as.r;
         yes = (r > 1.7976931348623157e308) || (r < -1.7976931348623157e308);
     }
@@ -3998,7 +4092,7 @@ static KaiValue *kai_prelude_real_is_inf(KaiValue *x) {
 /* ---------- prelude: strings ---------- */
 
 static KaiValue *kai_prelude_string_length(KaiValue *s) {
-    int64_t n = (s && s->tag == KAI_STR) ? (int64_t) s->as.s.len : 0;
+    int64_t n = (kai_is_ptr(s) && s->tag == KAI_STR) ? (int64_t) s->as.s.len : 0;
     KaiValue *r = kai_int(n);
     if (s) kai_decref(s);
     return r;
@@ -4027,7 +4121,7 @@ static KaiValue *kai_prelude_string_join(KaiValue *xs, KaiValue *sep) {
 /* ---------- prelude: arrays ---------- */
 
 static KaiValue *kai_prelude_array_make(KaiValue *n, KaiValue *init) {
-    int64_t len = (n && n->tag == KAI_INT) ? n->as.i : 0;
+    int64_t len = (kai_is_int(n)) ? kai_intf(n) : 0;
     /* impl increfs `init` once per slot; consume our own input
      * refs (n and init) at the boundary. */
     KaiValue *r = kai_array_make(len, init);
@@ -4037,14 +4131,14 @@ static KaiValue *kai_prelude_array_make(KaiValue *n, KaiValue *init) {
 }
 
 static KaiValue *kai_prelude_array_length(KaiValue *a) {
-    int64_t len = (a && a->tag == KAI_ARRAY) ? a->as.arr.len : 0;
+    int64_t len = (kai_is_ptr(a) && a->tag == KAI_ARRAY) ? a->as.arr.len : 0;
     KaiValue *r = kai_int(len);
     if (a) kai_decref(a);
     return r;
 }
 
 static KaiValue *kai_prelude_array_get(KaiValue *a, KaiValue *i) {
-    int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
     KaiValue *r = kai_array_get_impl(a, idx);
     if (a) kai_decref(a);
     if (i) kai_decref(i);
@@ -4052,7 +4146,7 @@ static KaiValue *kai_prelude_array_get(KaiValue *a, KaiValue *i) {
 }
 
 static KaiValue *kai_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
-    int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
     /* impl returns kai_incref(a) — a fresh ref the caller owns.
      * Our input `a` ref is therefore redundant under the callee-
      * consumes convention; decref it so the array's refcount only
@@ -4066,7 +4160,7 @@ static KaiValue *kai_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
 }
 
 static KaiValue *kai_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) {
-    int64_t new_len = (n && n->tag == KAI_INT) ? n->as.i : 0;
+    int64_t new_len = (kai_is_int(n)) ? kai_intf(n) : 0;
     /* impl returns kai_incref(a) — caller owns the new ref. The
      * input `a` ref is consumed under the callee-consumes
      * convention. */
@@ -4126,7 +4220,7 @@ static KaiValue *kai_prelude_ref_set(KaiValue *r, KaiValue *v) {
 static KaiValue *kai_prelude_list_length(KaiValue *xs) {
     int64_t n = 0;
     KaiValue *p = xs;
-    while (p && p->tag == KAI_CONS) { n++; p = p->as.cons.tail; }
+    while (kai_is_ptr(p) && p->tag == KAI_CONS) { n++; p = p->as.cons.tail; }
     KaiValue *r = kai_int(n);
     if (xs) kai_decref(xs);
     return r;
@@ -4152,7 +4246,7 @@ static KaiValue *kai_prelude_list_append(KaiValue *xs, KaiValue *ys) {
 static KaiValue *kai_prelude_list_reverse(KaiValue *xs) {
     KaiValue *acc = kai_nil();
     KaiValue *p   = xs;
-    while (p && p->tag == KAI_CONS) {
+    while (kai_is_ptr(p) && p->tag == KAI_CONS) {
         acc = kai_cons(kai_incref(p->as.cons.head), acc);
         p   = p->as.cons.tail;
     }
@@ -4188,7 +4282,7 @@ static KaiValue *kai_prelude_list_reverse(KaiValue *xs) {
 static KaiValue *kai_prelude_map(KaiValue *xs, KaiValue *f) {
     KaiValue *acc = kai_nil();
     KaiValue *p = xs;
-    while (p && p->tag == KAI_CONS) {
+    while (kai_is_ptr(p) && p->tag == KAI_CONS) {
         KaiValue *arg0 = kai_incref(p->as.cons.head);
         /* kai_apply consumes (#298): give it its own ref each iter. */
         KaiValue *head = kai_apply(kai_incref(f), 1, &arg0);
@@ -4211,7 +4305,7 @@ static KaiValue *kai_prelude_map(KaiValue *xs, KaiValue *f) {
 static KaiValue *kai_prelude_flat_map(KaiValue *xs, KaiValue *f) {
     KaiValue *acc = kai_nil();
     KaiValue *p = xs;
-    while (p && p->tag == KAI_CONS) {
+    while (kai_is_ptr(p) && p->tag == KAI_CONS) {
         KaiValue *arg0 = kai_incref(p->as.cons.head);
         /* kai_apply consumes (#298): incref f for each iter. */
         KaiValue *piece = kai_apply(kai_incref(f), 1, &arg0);
@@ -4221,7 +4315,7 @@ static KaiValue *kai_prelude_flat_map(KaiValue *xs, KaiValue *f) {
          * reversed form by reversing piece into acc cons-by-cons.
          */
         KaiValue *q = piece;
-        while (q && q->tag == KAI_CONS) {
+        while (kai_is_ptr(q) && q->tag == KAI_CONS) {
             acc = kai_cons(kai_incref(q->as.cons.head), acc);
             q = q->as.cons.tail;
         }
@@ -4237,7 +4331,7 @@ static KaiValue *kai_prelude_flat_map(KaiValue *xs, KaiValue *f) {
 static KaiValue *kai_prelude_filter(KaiValue *xs, KaiValue *pred) {
     KaiValue *acc = kai_nil();
     KaiValue *p = xs;
-    while (p && p->tag == KAI_CONS) {
+    while (kai_is_ptr(p) && p->tag == KAI_CONS) {
         KaiValue *arg0 = kai_incref(p->as.cons.head);
         /* kai_apply consumes (#298): incref pred for each iter. */
         KaiValue *keep = kai_apply(kai_incref(pred), 1, &arg0);
@@ -4262,7 +4356,7 @@ static KaiValue *kai_prelude_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
      * caller. */
     KaiValue *acc = init;
     KaiValue *p = xs;
-    while (p && p->tag == KAI_CONS) {
+    while (kai_is_ptr(p) && p->tag == KAI_CONS) {
         KaiValue *args[2];
         args[0] = acc;                              /* transfer to closure */
         args[1] = kai_incref(p->as.cons.head);      /* closure consumes */
@@ -4277,7 +4371,7 @@ static KaiValue *kai_prelude_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
 
 static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
     KaiValue *p = xs;
-    while (p && p->tag == KAI_CONS) {
+    while (kai_is_ptr(p) && p->tag == KAI_CONS) {
         KaiValue *arg0 = kai_incref(p->as.cons.head);
         /* kai_apply consumes (#298): incref f for each iter. */
         KaiValue *r = kai_apply(kai_incref(f), 1, &arg0);
@@ -4319,8 +4413,8 @@ static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
  */
 static KaiValue *kai_op_add(KaiValue *a, KaiValue *b) {
     KaiValue *r;
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int((int64_t)((uint64_t) a->as.i + (uint64_t) b->as.i));
-    else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_real(a->as.r + b->as.r);
+    if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) + (uint64_t) kai_intf(b)));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r + b->as.r);
     else { fprintf(stderr, "kai: type mismatch in +\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -4328,8 +4422,8 @@ static KaiValue *kai_op_add(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_sub(KaiValue *a, KaiValue *b) {
     KaiValue *r;
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int((int64_t)((uint64_t) a->as.i - (uint64_t) b->as.i));
-    else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_real(a->as.r - b->as.r);
+    if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) - (uint64_t) kai_intf(b)));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r - b->as.r);
     else { fprintf(stderr, "kai: type mismatch in -\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -4337,8 +4431,8 @@ static KaiValue *kai_op_sub(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_mul(KaiValue *a, KaiValue *b) {
     KaiValue *r;
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_int((int64_t)((uint64_t) a->as.i * (uint64_t) b->as.i));
-    else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_real(a->as.r * b->as.r);
+    if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) * (uint64_t) kai_intf(b)));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r * b->as.r);
     else { fprintf(stderr, "kai: type mismatch in *\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -4346,10 +4440,10 @@ static KaiValue *kai_op_mul(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_div(KaiValue *a, KaiValue *b) {
     KaiValue *r;
-    if (a->tag == KAI_INT && b->tag == KAI_INT) {
-        if (b->as.i == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); }
-        r = kai_int(a->as.i / b->as.i);
-    } else if (a->tag == KAI_REAL && b->tag == KAI_REAL) {
+    if (kai_is_int(a) && kai_is_int(b)) {
+        if (kai_intf(b) == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); }
+        r = kai_int(kai_intf(a) / kai_intf(b));
+    } else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) {
         r = kai_real(a->as.r / b->as.r);
     } else { fprintf(stderr, "kai: type mismatch in /\n"); exit(1); }
     kai_decref(a); kai_decref(b);
@@ -4358,11 +4452,11 @@ static KaiValue *kai_op_div(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_idiv(KaiValue *a, KaiValue *b) {
     int64_t av = 0, bv = 0;
-    if      (a->tag == KAI_INT)  av = a->as.i;
-    else if (a->tag == KAI_REAL) av = (int64_t) a->as.r;
+    if      (kai_is_int(a))  av = kai_intf(a);
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL) av = (int64_t) a->as.r;
     else { fprintf(stderr, "kai: type mismatch in //\n"); exit(1); }
-    if      (b->tag == KAI_INT)  bv = b->as.i;
-    else if (b->tag == KAI_REAL) bv = (int64_t) b->as.r;
+    if      (kai_is_int(b))  bv = kai_intf(b);
+    else if (kai_is_ptr(b) && b->tag == KAI_REAL) bv = (int64_t) b->as.r;
     else { fprintf(stderr, "kai: type mismatch in //\n"); exit(1); }
     if (bv == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); }
     KaiValue *r = kai_int(av / bv);
@@ -4372,9 +4466,9 @@ static KaiValue *kai_op_idiv(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
     KaiValue *r;
-    if (a->tag == KAI_INT && b->tag == KAI_INT) {
-        if (b->as.i == 0) { fprintf(stderr, "kai: mod by zero\n"); exit(1); }
-        r = kai_int(a->as.i % b->as.i);
+    if (kai_is_int(a) && kai_is_int(b)) {
+        if (kai_intf(b) == 0) { fprintf(stderr, "kai: mod by zero\n"); exit(1); }
+        r = kai_int(kai_intf(a) % kai_intf(b));
     } else { fprintf(stderr, "kai: type mismatch in %%\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -4382,10 +4476,10 @@ static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
     KaiValue *r;
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_bool(a->as.i < b->as.i);
-    else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_bool(a->as.r < b->as.r);
-    else if (a->tag == KAI_CHAR && b->tag == KAI_CHAR) r = kai_bool(a->as.c < b->as.c);
-    else if (a->tag == KAI_STR  && b->tag == KAI_STR) {
+    if (kai_is_int(a)  && kai_is_int(b))       r = kai_bool(kai_intf(a) < kai_intf(b));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_bool(a->as.r < b->as.r);
+    else if (kai_is_ptr(a) && a->tag == KAI_CHAR && kai_is_ptr(b) && b->tag == KAI_CHAR) r = kai_bool(a->as.c < b->as.c);
+    else if (kai_is_ptr(a) && a->tag == KAI_STR  && kai_is_ptr(b) && b->tag == KAI_STR) {
         size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
         if (c != 0) r = kai_bool(c < 0);
@@ -4399,7 +4493,7 @@ static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
         if (_o_fn) {
             kai_incref(a); kai_incref(b);
             KaiValue *_o_c = ((KaiValue *(*)(KaiValue *, KaiValue *)) _o_fn)(a, b);
-            int _o_r = _o_c->as.i < 0;
+            int _o_r = kai_intf(_o_c) < 0;
             kai_decref(_o_c);
             kai_decref(a); kai_decref(b);
             return kai_bool(_o_r);
@@ -4412,10 +4506,10 @@ static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
     KaiValue *r;
-    if (a->tag == KAI_INT  && b->tag == KAI_INT)       r = kai_bool(a->as.i > b->as.i);
-    else if (a->tag == KAI_REAL && b->tag == KAI_REAL) r = kai_bool(a->as.r > b->as.r);
-    else if (a->tag == KAI_CHAR && b->tag == KAI_CHAR) r = kai_bool(a->as.c > b->as.c);
-    else if (a->tag == KAI_STR  && b->tag == KAI_STR) {
+    if (kai_is_int(a)  && kai_is_int(b))       r = kai_bool(kai_intf(a) > kai_intf(b));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_bool(a->as.r > b->as.r);
+    else if (kai_is_ptr(a) && a->tag == KAI_CHAR && kai_is_ptr(b) && b->tag == KAI_CHAR) r = kai_bool(a->as.c > b->as.c);
+    else if (kai_is_ptr(a) && a->tag == KAI_STR  && kai_is_ptr(b) && b->tag == KAI_STR) {
         size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
         if (c != 0) r = kai_bool(c > 0);
@@ -4427,7 +4521,7 @@ static KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
         if (_o_fn) {
             kai_incref(a); kai_incref(b);
             KaiValue *_o_c = ((KaiValue *(*)(KaiValue *, KaiValue *)) _o_fn)(a, b);
-            int _o_r = _o_c->as.i > 0;
+            int _o_r = kai_intf(_o_c) > 0;
             kai_decref(_o_c);
             kai_decref(a); kai_decref(b);
             return kai_bool(_o_r);
@@ -4487,20 +4581,20 @@ static KaiValue *kai_op_ne_v(KaiValue *a, KaiValue *b) {
  * negatives to 0; the discrepancy is acceptable because `^`
  * dispatches through this helper, never through the protocol. */
 static KaiValue *kai_op_pow_int(KaiValue *a, KaiValue *b) {
-    if (b->tag != KAI_INT) {
+    if (!kai_is_int(b)) {
         fprintf(stderr, "kai: type mismatch in ^ (exponent must be Int)\n"); exit(1);
     }
-    int64_t e = b->as.i;
+    int64_t e = kai_intf(b);
     KaiValue *r;
-    if (a->tag == KAI_INT) {
+    if (kai_is_int(a)) {
         if (e < 0) { r = kai_int(0); }
         else {
-            int64_t base = a->as.i;
+            int64_t base = kai_intf(a);
             int64_t acc = 1;
             for (int64_t i = 0; i < e; i++) { acc *= base; }
             r = kai_int(acc);
         }
-    } else if (a->tag == KAI_REAL) {
+    } else if (kai_is_ptr(a) && a->tag == KAI_REAL) {
         double base = a->as.r;
         int64_t k = e < 0 ? -e : e;
         double acc = 1.0;
@@ -4514,8 +4608,8 @@ static KaiValue *kai_op_pow_int(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_neg(KaiValue *a) {
     KaiValue *r;
-    if (a->tag == KAI_INT)       r = kai_int(-a->as.i);
-    else if (a->tag == KAI_REAL) r = kai_real(-a->as.r);
+    if (kai_is_int(a))       r = kai_int(-kai_intf(a));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL) r = kai_real(-a->as.r);
     else { fprintf(stderr, "kai: type mismatch in unary -\n"); exit(1); }
     kai_decref(a);
     return r;
@@ -4545,14 +4639,14 @@ static int kai_op_truthy(KaiValue *v) {
 /* ---------- range construction ---------- */
 
 static KaiValue *kai_range(KaiValue *from, KaiValue *to) {
-    int64_t f = from->as.i, t = to->as.i;
+    int64_t f = kai_intf(from), t = kai_intf(to);
     KaiValue *acc = kai_nil();
     for (int64_t i = t; i >= f; --i) acc = kai_cons(kai_int(i), acc);
     return acc;
 }
 
 static KaiValue *kai_range_step(KaiValue *from, KaiValue *to, KaiValue *step) {
-    int64_t f = from->as.i, t = to->as.i, s = step->as.i;
+    int64_t f = kai_intf(from), t = kai_intf(to), s = kai_intf(step);
     if (s == 0) { fprintf(stderr, "kai: zero step in range\n"); exit(1); }
     int64_t *buf = NULL;
     size_t cap = 0, n = 0;
@@ -4705,8 +4799,8 @@ static KaiValue *kai_prelude_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber
 }
 
 static KaiValue *kai_prelude_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {
-    int c = (cap && cap->tag == KAI_INT) ? (int) cap->as.i : 0;
-    int o = (overflow && overflow->tag == KAI_INT) ? (int) overflow->as.i : 0;
+    int c = (kai_is_int(cap)) ? (int) kai_intf(cap) : 0;
+    int o = (kai_is_int(overflow)) ? (int) kai_intf(overflow) : 0;
     KaiValue *r = kai_pid_value(kai_mailbox_alloc_bounded(c, o));
     /* m5.x flip Phase 3 closeout (issue #82): consume input refs. */
     if (cap)      kai_decref(cap);
@@ -4840,7 +4934,7 @@ static KaiValue *kai_prelude_write_file(KaiValue *path, KaiValue *content) {
 
 static KaiValue *kai_prelude_file_exists(KaiValue *path) {
     int present = 0;
-    if (path && path->tag == KAI_STR) {
+    if (kai_is_ptr(path) && path->tag == KAI_STR) {
         char pbuf[4096];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
@@ -5033,7 +5127,7 @@ static KaiValue *kai_prelude_file_write_bytes(KaiValue *path, KaiValue *bytes) {
 
 static KaiValue *kai_prelude_dir_list_dir(KaiValue *path) {
     KaiValue *acc = kai_nil();
-    if (path && path->tag == KAI_STR) {
+    if (kai_is_ptr(path) && path->tag == KAI_STR) {
         char pbuf[4096];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
@@ -5276,7 +5370,7 @@ static KaiValue *kai_prelude_read_line(void) {
  * parks the fiber on EAGAIN. */
 static KaiValue *kai_prelude_read_bytes(KaiValue *n) {
     int64_t want = 0;
-    if (n && n->tag == KAI_INT && n->as.i > 0) want = n->as.i;
+    if (n && kai_is_int(n) && kai_intf(n) > 0) want = kai_intf(n);
     if (n) kai_decref(n);
     if (want <= 0) return kai_str_from_bytes("", 0);
     char *buf = (char *) malloc((size_t) want);
@@ -5360,8 +5454,8 @@ static KaiValue *kai_prelude_string_to_real(KaiValue *s) {
 static KaiValue *kai_prelude_char_at(KaiValue *s, KaiValue *i) {
     int ok = 0;
     uint32_t value = 0;
-    if (s && s->tag == KAI_STR && i && i->tag == KAI_INT) {
-        int64_t idx = i->as.i;
+    if (s && s->tag == KAI_STR && i && kai_is_int(i)) {
+        int64_t idx = kai_intf(i);
         if (idx >= 0 && (size_t) idx < s->as.s.len) {
             /* Byte-at semantics for now; multi-byte UTF-8 can return
              * surrogate-like codepoints once we need them. Stage 0
@@ -5429,8 +5523,8 @@ static KaiValue *kai_prelude_string_slice(KaiValue *s, KaiValue *from, KaiValue 
     if (!s || s->tag != KAI_STR) {
         r = kai_str("");
     } else {
-        int64_t f = (from && from->tag == KAI_INT) ? from->as.i : 0;
-        int64_t l = (len  && len->tag  == KAI_INT) ? len->as.i  : 0;
+        int64_t f = (kai_is_int(from)) ? kai_intf(from) : 0;
+        int64_t l = (kai_is_int(len)) ? kai_intf(len)  : 0;
         if (f < 0) f = 0;
         if (l < 0) l = 0;
         if ((size_t) f > s->as.s.len) f = (int64_t) s->as.s.len;
@@ -5445,13 +5539,13 @@ static KaiValue *kai_prelude_string_slice(KaiValue *s, KaiValue *from, KaiValue 
 }
 
 static KaiValue *kai_prelude_char_to_int(KaiValue *c) {
-    int64_t value = (c && c->tag == KAI_CHAR) ? (int64_t) c->as.c : 0;
+    int64_t value = (kai_is_ptr(c) && c->tag == KAI_CHAR) ? (int64_t) c->as.c : 0;
     if (c) kai_decref(c);
     return kai_int(value);
 }
 
 static KaiValue *kai_prelude_int_to_char(KaiValue *n) {
-    uint32_t value = (n && n->tag == KAI_INT) ? (uint32_t) n->as.i : 0;
+    uint32_t value = (kai_is_int(n)) ? (uint32_t) kai_intf(n) : 0;
     if (n) kai_decref(n);
     return kai_char(value);
 }
@@ -5466,7 +5560,7 @@ static KaiValue *kai_prelude_int_to_char(KaiValue *n) {
  * sidebar in `stdlib/protocols.kai` (BinSerialize String/Real ASCII-
  * only) closes once Phase A/B serdes routes through this. */
 static KaiValue *kai_prelude_int_to_byte_string(KaiValue *n) {
-    int64_t v = (n && n->tag == KAI_INT) ? n->as.i : 0;
+    int64_t v = (kai_is_int(n)) ? kai_intf(n) : 0;
     if (n) kai_decref(n);
     unsigned char b = (unsigned char) (v & 0xff);
     return kai_str_from_bytes((const char *) &b, 1);
@@ -5482,8 +5576,8 @@ static KaiValue *kai_prelude_int_to_byte_string(KaiValue *n) {
  * from ~0.26s to under 0.04s. */
 static KaiValue *kai_prelude_string_byte_at_int(KaiValue *s, KaiValue *i) {
     int64_t v = -1;
-    if (s && s->tag == KAI_STR && i && i->tag == KAI_INT) {
-        int64_t idx = i->as.i;
+    if (s && s->tag == KAI_STR && i && kai_is_int(i)) {
+        int64_t idx = kai_intf(i);
         if (idx >= 0 && (size_t) idx < s->as.s.len) {
             v = (int64_t)(unsigned char) s->as.s.bytes[idx];
         }
@@ -5506,7 +5600,7 @@ static KaiValue *kai_prelude_string_byte_at_int(KaiValue *s, KaiValue *i) {
  * path a HashMap exercises. */
 static KaiValue *kai_prelude_string_hash(KaiValue *s) {
     uint64_t h = 1469598103934665603ull;
-    if (s && s->tag == KAI_STR) {
+    if (kai_is_ptr(s) && s->tag == KAI_STR) {
         const char *bytes = s->as.s.bytes;
         size_t len = s->as.s.len;
         for (size_t i = 0; i < len; i++) {
@@ -5527,7 +5621,7 @@ static KaiValue *kai_prelude_string_hash(KaiValue *s) {
  * Hash↔Eq consistency on Real is the caller's concern, not ours. */
 static KaiValue *kai_prelude_real_bits(KaiValue *v) {
     uint64_t bits = 0;
-    if (v && v->tag == KAI_REAL) {
+    if (kai_is_ptr(v) && v->tag == KAI_REAL) {
         double r = v->as.r;
         memcpy(&bits, &r, sizeof(bits));
     }
@@ -5887,7 +5981,7 @@ static void kai_check_record_param(const char *name, KaiValue *v) {
     kai_check_cx_append(name);
     kai_check_cx_append("=");
     KaiValue *s = kai_to_string(v);
-    if (s && s->tag == KAI_STR) {
+    if (kai_is_ptr(s) && s->tag == KAI_STR) {
         kai_check_cx_append_raw(s->as.s.bytes, s->as.s.len);
     }
     kai_decref(s);
@@ -5987,8 +6081,11 @@ KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_string, kai_arbitrary_string)
  * backtracking is post-1.0 per #438 out-of-scope). */
 
 static KaiValue *kai_shrink_int(KaiValue *v) {
-    if (!v || v->tag != KAI_INT) return NULL;
-    int64_t x = v->as.i;
+    if (!kai_is_int(v)) return NULL;
+    /* `v` may be a Koka-style tagged immediate (small Int) OR a heap
+       KAI_INT, so read through kai_intf — a raw `v->as.i` deref would
+       segv on the immediate (which has no header). */
+    int64_t x = kai_intf(v);
     if (x == 0) return NULL;
     /* Halve toward zero. Integer division on negatives in C is
        truncation toward zero (C99 §6.5.5/6), so x/2 already does the
@@ -6286,7 +6383,7 @@ static KaiValue *kai_cont_resume(KaiCont *k, KaiValue *v) {
  * default behaviour. The minimal-but-useful path lands first. */
 static KaiValue *kai_default_stdout_print(void *self, KaiValue *s, KaiCont *k) {
     (void) self;
-    if (s && s->tag == KAI_STR) {
+    if (kai_is_ptr(s) && s->tag == KAI_STR) {
         fwrite(s->as.s.bytes, 1, s->as.s.len, stdout);
     }
     fputc('\n', stdout);
@@ -6295,7 +6392,7 @@ static KaiValue *kai_default_stdout_print(void *self, KaiValue *s, KaiCont *k) {
 
 static KaiValue *kai_default_stderr_eprint(void *self, KaiValue *s, KaiCont *k) {
     (void) self;
-    if (s && s->tag == KAI_STR) {
+    if (kai_is_ptr(s) && s->tag == KAI_STR) {
         fwrite(s->as.s.bytes, 1, s->as.s.len, stderr);
     }
     fputc('\n', stderr);
@@ -6313,7 +6410,7 @@ static KaiValue *kai_default_fail_fail(void *self, KaiValue *msg, KaiCont *k) {
     (void) self;
     (void) k;
     fputs("kai: Fail.fail: ", stderr);
-    if (msg && msg->tag == KAI_STR) {
+    if (kai_is_ptr(msg) && msg->tag == KAI_STR) {
         fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
     }
     fputc('\n', stderr);
@@ -6401,7 +6498,7 @@ static KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k) {
 static KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, KaiCont *k) {
     (void) self;
     int64_t want = 0;
-    if (n && n->tag == KAI_INT && n->as.i > 0) want = n->as.i;
+    if (n && kai_is_int(n) && kai_intf(n) > 0) want = kai_intf(n);
     if (n) kai_decref(n);
     if (want <= 0) {
         return kai_cont_resume(k, kai_str_from_bytes("", 0));
@@ -6700,8 +6797,8 @@ static void _kai_pcg32_ensure_seeded(void) {
  * is a future polish. */
 static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue *hi, KaiCont *k) {
     (void) self;
-    int64_t lo_v = (lo && lo->tag == KAI_INT) ? lo->as.i : 0;
-    int64_t hi_v = (hi && hi->tag == KAI_INT) ? hi->as.i : 0;
+    int64_t lo_v = (kai_is_int(lo)) ? kai_intf(lo) : 0;
+    int64_t hi_v = (kai_is_int(hi)) ? kai_intf(hi) : 0;
     if (lo_v >= hi_v) {
         fprintf(stderr, "kai: Random.int_range: lo (%lld) >= hi (%lld)\n",
                 (long long) lo_v, (long long) hi_v);
@@ -6776,7 +6873,7 @@ static KaiValue *kai_default_clock_monotonic_now(void *self, KaiCont *k) {
 
 static KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiCont *k) {
     (void) self;
-    int64_t ns_v = (ns && ns->tag == KAI_INT) ? ns->as.i : 0;
+    int64_t ns_v = (kai_is_int(ns)) ? kai_intf(ns) : 0;
     if (ns_v > 0) {
         kai_reactor_init();
         uint64_t deadline = kai_reactor_now_ns() + (uint64_t) ns_v;
@@ -6852,8 +6949,8 @@ static int _kai_net_record_fd(KaiValue *v) {
     for (int i = 0; i < v->as.rec.n_fields; ++i) {
         if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "fd") == 0) {
             KaiValue *f = v->as.rec.fields[i];
-            if (!f || f->tag != KAI_INT) return -1;
-            return (int) f->as.i;
+            if (!kai_is_int(f)) return -1;
+            return (int) kai_intf(f);
         }
     }
     return -1;
@@ -6874,7 +6971,7 @@ static int _kai_net_record_fd(KaiValue *v) {
  * to EINPROGRESS for safety. */
 static KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
     (void) self;
-    if (!host || host->tag != KAI_STR || !port || port->tag != KAI_INT) {
+    if (!host || host->tag != KAI_STR || !kai_is_int(port)) {
         return _kai_net_err_msg(k, "connect: bad arguments");
     }
     char host_buf[256];
@@ -6882,7 +6979,7 @@ static KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue
     memcpy(host_buf, host->as.s.bytes, hlen);
     host_buf[hlen] = '\0';
     char port_buf[16];
-    snprintf(port_buf, sizeof(port_buf), "%lld", (long long) port->as.i);
+    snprintf(port_buf, sizeof(port_buf), "%lld", (long long) kai_intf(port));
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -6949,7 +7046,7 @@ static KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue
  * via getsockname so callers don't need a separate effect op. */
 static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
     (void) self;
-    if (!host || host->tag != KAI_STR || !port || port->tag != KAI_INT) {
+    if (!host || host->tag != KAI_STR || !kai_is_int(port)) {
         return _kai_net_err_msg(k, "listen: bad arguments");
     }
     char host_buf[256];
@@ -6971,7 +7068,7 @@ static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port   = htons((uint16_t) port->as.i);
+    addr.sin_port   = htons((uint16_t) kai_intf(port));
     if (host_buf[0] == '\0') {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     } else if (inet_pton(AF_INET, host_buf, &addr.sin_addr) != 1) {
@@ -7008,7 +7105,7 @@ static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue 
      * the caller passed 0). */
     struct sockaddr_in bound;
     socklen_t blen = sizeof(bound);
-    int actual_port = (int) port->as.i;
+    int actual_port = (int) kai_intf(port);
     if (getsockname(fd, (struct sockaddr *) &bound, &blen) == 0) {
         actual_port = (int) ntohs(bound.sin_port);
     }
@@ -7090,7 +7187,7 @@ static KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data
         size_t i = 0;
         for (KaiValue *p = data; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
             KaiValue *h = p->as.cons.head;
-            int64_t b = (h && h->tag == KAI_INT) ? h->as.i : 0;
+            int64_t b = (kai_is_int(h)) ? kai_intf(h) : 0;
             buf[i++] = (unsigned char) (b & 0xff);
         }
     }
@@ -7154,7 +7251,7 @@ static KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max,
     (void) self;
     int fd = _kai_net_record_fd(c);
     if (fd < 0) return _kai_net_err_msg(k, "recv: invalid conn");
-    int64_t cap = (max && max->tag == KAI_INT) ? max->as.i : 0;
+    int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
     if (cap <= 0) {
         fputs("kai: NetTcp.recv: max must be > 0\n", stderr);
         exit(1);
@@ -7460,8 +7557,8 @@ static int _kai_process_record_pid(KaiValue *v) {
     for (int i = 0; i < v->as.rec.n_fields; ++i) {
         if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "pid") == 0) {
             KaiValue *f = v->as.rec.fields[i];
-            if (!f || f->tag != KAI_INT) return -1;
-            return (int) f->as.i;
+            if (!kai_is_int(f)) return -1;
+            return (int) kai_intf(f);
         }
     }
     return -1;
@@ -7507,7 +7604,7 @@ static char **_kai_process_build_argv(const char *cmd, KaiValue *args, int *out_
     int i = 1;
     for (KaiValue *p = args; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
         KaiValue *h = p->as.cons.head;
-        if (h && h->tag == KAI_STR) {
+        if (kai_is_ptr(h) && h->tag == KAI_STR) {
             argv[i] = strdup(h->as.s.bytes ? h->as.s.bytes : "");
         } else {
             argv[i] = strdup("");
@@ -7636,7 +7733,7 @@ static KaiValue *kai_default_process_kill(void *self, KaiValue *child, KaiValue 
         KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
         return kai_cont_resume(k, err);
     }
-    int signo = (sig && sig->tag == KAI_INT) ? (int) sig->as.i : 0;
+    int signo = (kai_is_int(sig)) ? (int) kai_intf(sig) : 0;
     if (kill((pid_t) pid, signo) < 0) {
         return _kai_process_err(k, errno);
     }
@@ -7651,7 +7748,7 @@ static KaiValue *kai_default_process_kill(void *self, KaiValue *child, KaiValue 
 static KaiValue *kai_default_process_exit(void *self, KaiValue *code, KaiCont *k) {
     (void) self;
     (void) k;
-    int c = (code && code->tag == KAI_INT) ? (int) code->as.i : 0;
+    int c = (kai_is_int(code)) ? (int) kai_intf(code) : 0;
     _exit(c);
     /* unreachable */
     return NULL;
@@ -7807,8 +7904,8 @@ static void _kai_securerandom_fill(unsigned char *buf, size_t n) {
  * field by name. */
 static KaiValue *kai_default_securerandom_int_range(void *self, KaiValue *min_v, KaiValue *max_v, KaiCont *k) {
     (void) self;
-    int64_t lo = (min_v && min_v->tag == KAI_INT) ? min_v->as.i : 0;
-    int64_t hi = (max_v && max_v->tag == KAI_INT) ? max_v->as.i : 0;
+    int64_t lo = (kai_is_int(min_v)) ? kai_intf(min_v) : 0;
+    int64_t hi = (kai_is_int(max_v)) ? kai_intf(max_v) : 0;
     if (lo > hi) {
         fprintf(stderr, "kai: SecureRandom.int: min (%lld) > max (%lld)\n",
                 (long long) lo, (long long) hi);
@@ -7831,7 +7928,7 @@ static KaiValue *kai_default_securerandom_int_range(void *self, KaiValue *min_v,
  * which is happier with smaller, repeated draws). */
 static KaiValue *kai_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCont *k) {
     (void) self;
-    int64_t n = (n_v && n_v->tag == KAI_INT) ? n_v->as.i : 0;
+    int64_t n = (kai_is_int(n_v)) ? kai_intf(n_v) : 0;
     if (n <= 0) {
         return kai_cont_resume(k, kai_nil());
     }
@@ -9205,7 +9302,7 @@ static KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, KaiCont 
      * Phase 4 together with the blocking-mailbox primitives. */
     KaiValue *cur   = fibs_v;
     KaiFiber *head  = NULL;
-    while (cur && cur->tag == KAI_CONS) {
+    while (kai_is_ptr(cur) && cur->tag == KAI_CONS) {
         KaiValue *elem = cur->as.cons.head;
         if (!elem || elem->tag != KAI_FIBER || !elem->as.fib) {
             fprintf(stderr, "kai: Spawn.select: list element is not a fiber\n");

@@ -52,7 +52,15 @@ BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/l
 # loader inside kaic2 can find core/*.kai, protocols.kai,
 # effects.kai, array.kai without any --prelude flag at runtime.
 STDLIB_ABS := $(abspath ../stdlib)
-CPPFLAGS_CORE := -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
+# Stage 2 has its OWN runtime.h (stage2/runtime.h) carrying the Koka
+# tagged-Int value representation + reuse-token Perceus. The `-I .`
+# comes first so the generated C's `#include "runtime.h"` resolves to
+# stage2/runtime.h, while the trailing `-I ../stage0` on each compile
+# line still supplies any stage0 headers. Stage 0 and stage 1 keep
+# their original heap-everything runtime untouched — the new
+# representation is isolated to the self-hosted compiler that builds
+# the real programs (and the rb-tree benchmark).
+CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 
 # Issue #42 closure (2026-05-01): the recursive lex_loop / parse_*
 # inside kaic1 / kaic2 used to need a 32-64 MB stack bump to handle
@@ -681,7 +689,7 @@ test-issue-672: $(TARGET) build
 test-ffi-extern-c: $(TARGET) build
 	@set -e; \
 	./$(TARGET) ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic.c; \
-	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage0 build/ffi_extern_c_basic.c -o build/ffi_extern_c_basic-c $(LDLIBS_M) ; \
+	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage2 -I ../stage0 build/ffi_extern_c_basic.c -o build/ffi_extern_c_basic-c $(LDLIBS_M) ; \
 	./build/ffi_extern_c_basic-c > build/ffi_extern_c_basic.out; \
 	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic.out > /dev/null \
 	  && echo "ffi-extern-c OK (C backend)" \
@@ -755,7 +763,7 @@ test-ffi-pub-axiom-cross-module: $(TARGET) build
 	./$(TARGET) --path ../examples/effects/ffi_pub_axiom_cross_module \
 	  ../examples/effects/ffi_pub_axiom_cross_module/main.kai \
 	  > build/ffi_pub_axiom_cross_module.c; \
-	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage0 \
+	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage2 -I ../stage0 \
 	  build/ffi_pub_axiom_cross_module.c -o build/ffi_pub_axiom_cross_module-c $(LDLIBS_M); \
 	./build/ffi_pub_axiom_cross_module-c > build/ffi_pub_axiom_cross_module.out; \
 	diff -q ../examples/effects/ffi_pub_axiom_cross_module/main.out.expected \
@@ -812,7 +820,7 @@ test-ffi-extern-c-asan: $(TARGET) build
 	./$(TARGET) ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable -Wno-absolute-value \
-	      -I ../stage0 build/ffi_extern_c_basic-asan.c -o build/ffi_extern_c_basic-c-asan; \
+	      -I ../stage2 -I ../stage0 build/ffi_extern_c_basic-asan.c -o build/ffi_extern_c_basic-c-asan; \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	  ./build/ffi_extern_c_basic-c-asan > build/ffi_extern_c_basic-asan.out 2>&1; \
@@ -944,7 +952,7 @@ test-trace: $(TARGET) build
 	@set -e; \
 	for name in $(TRACE_FIXTURES); do \
 	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
-	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
+	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
 	  ./build/$$name-c > build/$$name.out; \
 	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
 	    && echo "trace OK $$name" \
@@ -964,7 +972,7 @@ test-trace-asan: $(TARGET) build
 	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -994,7 +1002,7 @@ test-runtime-shadow: $(TARGET) build
 	@set -e; \
 	for name in $(RUNTIME_SHADOW_FIXTURES); do \
 	  ./$(TARGET) ../examples/effects/$$name.kai > build/$$name.c; \
-	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
+	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
 	  ./build/$$name-c > build/$$name.out; \
 	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
 	    && echo "runtime-shadow OK $$name" \
@@ -1011,7 +1019,7 @@ test-runtime-shadow-asan: $(TARGET) build
 	  ./$(TARGET) ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -1040,7 +1048,7 @@ test-issue-501: $(TARGET) build
 	for name in $(ISSUE_501_FIXTURES); do \
 	  ./$(TARGET) ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) -std=c99 -Wno-unused-function -Wno-unused-variable -O2 \
-	        $(LDFLAGS_STACK) -I ../stage0 build/$$name.c \
+	        $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/$$name.c \
 	        -o build/$$name-c $(LDLIBS_M); \
 	  ./build/$$name-c > build/$$name.out; \
 	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
@@ -1064,7 +1072,7 @@ test-signal-trap-asan: $(TARGET) build
 	  ./$(TARGET) ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        ../tests/sigharness.c -o build/$$name-asan.harness; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
@@ -1097,7 +1105,7 @@ test-log-asan: $(TARGET) build
 	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -1134,7 +1142,7 @@ test-securerandom-asan: $(TARGET) build
 	    ../examples/stdlib/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -1162,7 +1170,7 @@ test-trap-exit-cancel-asan: $(TARGET) build
 	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -1195,7 +1203,7 @@ test-process-basic-asan: $(TARGET) build
 	  ./$(TARGET) ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -1419,26 +1427,28 @@ test-stdlib: $(TARGET) build
 	    && echo "stdlib OK $$name" \
 	    || { echo "stdlib DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out; exit 1; }; \
 	done
-	@# m13: assert bit ops lowered as compiler intrinsics. The emitted
-	@# C must contain each raw operator inline next to `_a->as.i`, and
-	@# must NOT reference any `kai_bit_*` runtime helper (we never
-	@# declared one — a leak would be an emit-pass miss).
+	@# m13: assert bit ops lowered as compiler intrinsics. Under the
+	@# Koka tagged-Int runtime a small Int is an immediate (no heap
+	@# `->as.i` slot), so the operand is decoded inline via `kai_intf(_a)`
+	@# rather than `_a->as.i`. The intent is unchanged: each raw operator
+	@# appears inline and must NOT reference any `kai_bit_*` runtime
+	@# helper (we never declared one — a leak would be an emit-pass miss).
 	@if grep -q 'kai_bit_' build/stdlib-bits_basic.c; then \
 	  echo "stdlib FAIL bits_basic (intrinsic leaked as kai_bit_* call)"; \
 	  grep 'kai_bit_' build/stdlib-bits_basic.c; \
 	  exit 1; \
 	fi
-	@grep -F -q '_a->as.i << _b' build/stdlib-bits_basic.c \
+	@grep -F -q 'kai_intf(_a) << kai_intf(_b)' build/stdlib-bits_basic.c \
 	  || { echo "stdlib FAIL bits_basic (<< not inlined)"; exit 1; }
-	@grep -F -q '_a->as.i >> _b' build/stdlib-bits_basic.c \
+	@grep -F -q 'kai_intf(_a) >> kai_intf(_b)' build/stdlib-bits_basic.c \
 	  || { echo "stdlib FAIL bits_basic (>> not inlined)"; exit 1; }
-	@grep -F -q '_a->as.i & _b'  build/stdlib-bits_basic.c \
+	@grep -F -q 'kai_intf(_a) & kai_intf(_b)'  build/stdlib-bits_basic.c \
 	  || { echo "stdlib FAIL bits_basic (& not inlined)"; exit 1; }
-	@grep -F -q '_a->as.i | _b'  build/stdlib-bits_basic.c \
+	@grep -F -q 'kai_intf(_a) | kai_intf(_b)'  build/stdlib-bits_basic.c \
 	  || { echo "stdlib FAIL bits_basic (| not inlined)"; exit 1; }
-	@grep -F -q '_a->as.i ^ _b'  build/stdlib-bits_basic.c \
+	@grep -F -q 'kai_intf(_a) ^ kai_intf(_b)'  build/stdlib-bits_basic.c \
 	  || { echo "stdlib FAIL bits_basic (^ not inlined)"; exit 1; }
-	@grep -F -q '~ _a->as.i'     build/stdlib-bits_basic.c \
+	@grep -F -q '~ kai_intf(_a)'     build/stdlib-bits_basic.c \
 	  || { echo "stdlib FAIL bits_basic (~ not inlined)"; exit 1; }
 	@grep -F -q '__builtin_popcountll' build/stdlib-bits_basic.c \
 	  || { echo "stdlib FAIL bits_basic (popcount not inlined)"; exit 1; }
@@ -1453,9 +1463,9 @@ test-stdlib: $(TARGET) build
 	  grep 'kai_bit_' build/stdlib-bits_dotted.c; \
 	  exit 1; \
 	fi
-	@grep -F -q '_a->as.i << _b' build/stdlib-bits_dotted.c \
+	@grep -F -q 'kai_intf(_a) << kai_intf(_b)' build/stdlib-bits_dotted.c \
 	  || { echo "stdlib FAIL bits_dotted (<< not inlined)"; exit 1; }
-	@grep -F -q '_a->as.i & _b'  build/stdlib-bits_dotted.c \
+	@grep -F -q 'kai_intf(_a) & kai_intf(_b)'  build/stdlib-bits_dotted.c \
 	  || { echo "stdlib FAIL bits_dotted (& not inlined)"; exit 1; }
 	@grep -F -q '__builtin_popcountll' build/stdlib-bits_dotted.c \
 	  || { echo "stdlib FAIL bits_dotted (popcount not inlined)"; exit 1; }
@@ -1479,7 +1489,7 @@ test-stdlib-crypto-asan: $(TARGET) build
 	  || { echo "stdlib-crypto-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
+	      -I ../stage2 -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
 	  || { echo "stdlib-crypto-asan FAIL $$name (cc errored)"; exit 1; }; \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
@@ -1516,7 +1526,7 @@ test-stdlib-regex-predicate-asan: $(TARGET) build
 	    || { echo "stdlib-regex-predicate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
+	        -I ../stage2 -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
 	    || { echo "stdlib-regex-predicate-asan FAIL $$name (cc errored)"; exit 1; }; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
@@ -2990,7 +3000,7 @@ test-string: $(TARGET) build
 	    ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f \
 	      > build/str-$$name.c \
 	      || { echo "string FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage0 build/str-$$name.c -o build/str-$$name $(LDLIBS_M) \
+	    $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/str-$$name.c -o build/str-$$name $(LDLIBS_M) \
 	      || { echo "string FAIL $$name (C compile failed)"; exit 1; }; \
 	    ./build/str-$$name > build/str-$$name.out \
 	      || { echo "string FAIL $$name (run errored)"; cat build/str-$$name.out; exit 1; }; \
@@ -3911,7 +3921,7 @@ test-perceus-issue82-asan: $(TARGET) build
 	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -3959,7 +3969,7 @@ test-perceus-issue703-asan: $(TARGET) build
 	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -4029,7 +4039,7 @@ test-perceus-issue350-asan: $(TARGET) build
 	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -4071,7 +4081,7 @@ test-perceus-int-cache-asan: $(TARGET) build
 	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -4094,7 +4104,7 @@ test-perceus-issue298-asan: $(TARGET) build
 	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -4145,6 +4155,8 @@ PERCEUS_ISSUE118_FIXTURES := reuse_cons_basic reuse_alias_aborts \
                               reuse_pass_ordering reuse_record_basic \
                               reuse_variant_basic \
                               reuse_variant_no_misfire \
+                              reuse_nested_subpattern \
+                              reuse_diagonal_guard \
                               tco_double_incref_repro \
                               nullary_variant_singleton
 
@@ -4169,7 +4181,7 @@ test-perceus-issue118-asan: $(TARGET) build
 	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
@@ -4195,7 +4207,7 @@ test-match-pbind-catchall-asan: $(TARGET) build
 	  || { echo "match-pbind-catchall-asan FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage0 build/match_pbind_catchall_raw-asan.c -o build/match_pbind_catchall_raw-asan-c \
+	      -I ../stage2 -I ../stage0 build/match_pbind_catchall_raw-asan.c -o build/match_pbind_catchall_raw-asan-c \
 	  || { echo "match-pbind-catchall-asan FAIL (C compile failed)"; exit 1; }; \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
@@ -4228,7 +4240,7 @@ test-http-client-asan: $(TARGET) build
 	    || { echo "http-client-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
+	        -I ../stage2 -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
 	    || { echo "http-client-asan FAIL $$name (C compile failed)"; exit 1; }; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
@@ -4261,7 +4273,7 @@ test-env-mutate-asan: $(TARGET) build
 	    || { echo "env-mutate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
+	        -I ../stage2 -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
 	    || { echo "env-mutate-asan FAIL $$name (C compile failed)"; exit 1; }; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
@@ -4324,7 +4336,7 @@ test-unbox-llvm-bench: $(TARGET) build
 	@./build/unbox-bench-llvm > build/unbox-bench-llvm.out \
 	  || { echo "unbox-llvm-bench FAIL (LLVM binary errored at runtime)"; exit 1; }
 	@./$(TARGET) ../examples/perceus/unbox_bench.kai > build/unbox-bench-c.c \
-	  && cc -std=c99 -w -I ../stage0 build/unbox-bench-c.c -o build/unbox-bench-c $(LDLIBS_M) \
+	  && cc -std=c99 -w -I ../stage2 -I ../stage0 build/unbox-bench-c.c -o build/unbox-bench-c $(LDLIBS_M) \
 	  && ./build/unbox-bench-c > build/unbox-bench-c.out \
 	  || { echo "unbox-llvm-bench FAIL (C backend build/run errored)"; exit 1; }
 	@diff -q build/unbox-bench-c.out build/unbox-bench-llvm.out > /dev/null \
@@ -4503,7 +4515,7 @@ test-aliases: $(TARGET) build
 test-rc-trace-callsite: $(TARGET) build
 	@set -e; \
 	./$(TARGET) ../examples/effects/rc_trace_callsite.kai > build/rc_trace_callsite.c; \
-	$(CC) $(CFLAGS) -DKAI_TRACE_RC=1 -I ../stage0 build/rc_trace_callsite.c -o build/rc_trace_callsite-c $(LDLIBS_M) ; \
+	$(CC) $(CFLAGS) -DKAI_TRACE_RC=1 -I ../stage2 -I ../stage0 build/rc_trace_callsite.c -o build/rc_trace_callsite-c $(LDLIBS_M) ; \
 	./build/rc_trace_callsite-c > build/rc_trace_callsite.out 2> build/rc_trace_callsite.err; \
 	diff -q ../examples/effects/rc_trace_callsite.out.expected build/rc_trace_callsite.out > /dev/null \
 	  || { echo "rc-trace-callsite STDOUT DIFF"; diff ../examples/effects/rc_trace_callsite.out.expected build/rc_trace_callsite.out; exit 1; }; \
@@ -4644,7 +4656,7 @@ test-shadowing: $(TARGET) build
 	    ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f \
 	      > build/shadowing-$$name.c \
 	      || { echo "shadowing FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage0 build/shadowing-$$name.c -o build/shadowing-$$name $(LDLIBS_M) \
+	    $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/shadowing-$$name.c -o build/shadowing-$$name $(LDLIBS_M) \
 	      || { echo "shadowing FAIL $$name (C compile failed)"; exit 1; }; \
 	    ./build/shadowing-$$name > build/shadowing-$$name.out \
 	      || { echo "shadowing FAIL $$name (run errored)"; cat build/shadowing-$$name.out; exit 1; }; \

@@ -369,10 +369,326 @@ fn prc_is_ufn_decl(fns: [EFn], name: String, mo: Option[String]) : Bool {
 pub fn perceus_pass(decls: [Decl]) : [Decl] / Console {
 
   let fns = register_fn_decls(decls)
-  map(decls, (d) => perceus_decl(d, fns))
+  # Borrow inference pre-pass (Koka pre-Parc): per-fn borrowed param
+  # positions, consumed by BOTH sides of the flip (callee wraps the
+  # borrowed scrutinee in __perceus_borrow so emit_match skips its exit
+  # decref; caller strips the __perceus_dup on args in borrowed slots).
+  let bmap = pcs_build_borrow_map(decls, [])
+  map(decls, (d) => perceus_decl_b(d, fns, bmap))
 }
 
-fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
+type BorrowEntry = BE(String, [Int])
+
+fn pcs_build_borrow_map(decls: [Decl], acc: [BorrowEntry]) : [BorrowEntry] = match decls {
+  []           -> acc
+  [d, ...rest] -> pcs_build_borrow_map(rest, pcs_borrow_entry_of(d, acc))
+}
+
+fn pcs_borrow_entry_of(d: Decl, acc: [BorrowEntry]) : [BorrowEntry] = match d {
+  DFn(_, name, _, params, _, _, body, _, _, mo) -> {
+    let pnames = map(params, (p) => p.pname)
+    let bset = pcs_borrow_params(pnames, body)
+    match bset {
+      [] -> acc
+      _  -> {
+        let positions = pcs_borrow_positions(pnames, bset, 0)
+        # Register under BOTH the qualified key and the bare name, so a
+        # caller referencing the fn either way (EModCall(mod,name) or a
+        # bare EVar(name)) finds it.
+        let qual = [BE(pcs_borrow_key(name, mo), positions), ...acc]
+        match mo {
+          None    -> qual
+          Some(_) -> [BE(name, positions), ...qual]
+        }
+      }
+    }
+  }
+  _ -> acc
+}
+
+fn pcs_borrow_key(name: String, mo: Option[String]) : String = match mo {
+  None    -> name
+  Some(m) -> concat_all([m, ".", name])
+}
+
+fn pcs_borrow_positions(pnames: [String], bset: [String], i: Int) : [Int] = match pnames {
+  []           -> []
+  [p, ...rest] ->
+    if list_has(bset, p) { [i, ...pcs_borrow_positions(rest, bset, i + 1)] }
+    else { pcs_borrow_positions(rest, bset, i + 1) }
+}
+
+fn pcs_borrow_lookup(bmap: [BorrowEntry], key: String) : [Int] = match bmap {
+  []           -> []
+  [e, ...rest] -> match e {
+    BE(k, ps) -> if k == key { ps } else { pcs_borrow_lookup(rest, key) }
+  }
+}
+
+# Back-compat: tests call the 2-arg form with no borrow map.
+fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console =
+  perceus_decl_b(d, fns, [])
+
+# Callee side: wrap `match p { ... }` as `match __perceus_borrow(p) {...}`
+# for each borrowed param `p` whose scrutinee is the bare param —
+# emit_match then skips the exit decref (the value is borrowed, owned up
+# the stack). Walks the whole body.
+fn pcs_wrap_borrow_scrutinees(e: Expr, borrowed: [String]) : Expr =
+  Expr { kind: pcs_wrap_borrow_kind(e.kind, borrowed),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn pcs_wrap_borrow_kind(k: ExprKind, borrowed: [String]) : ExprKind = match k {
+  EMatch(scr, arms) -> {
+    let scr2 = match scr.kind {
+      EVar(nm) ->
+        if list_has(borrowed, nm) {
+          Expr { kind: ECall(
+                   Expr { kind: EVar("__perceus_borrow"), line: scr.line, col: scr.col,
+                          ty: None, mode: MUnknown },
+                   [scr]),
+                 line: scr.line, col: scr.col, ty: scr.ty, mode: scr.mode }
+        } else { pcs_wrap_borrow_scrutinees(scr, borrowed) }
+      _ -> pcs_wrap_borrow_scrutinees(scr, borrowed)
+    }
+    EMatch(scr2, pcs_wrap_borrow_arms(arms, borrowed))
+  }
+  _ -> prc_map_expr_kind(k, (sub) => pcs_wrap_borrow_scrutinees(sub, borrowed))
+}
+
+fn pcs_wrap_borrow_arms(arms: [Arm], borrowed: [String]) : [Arm] = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(p, g, b) -> [Arm(p, g, pcs_wrap_borrow_scrutinees(b, borrowed)),
+                     ...pcs_wrap_borrow_arms(rest, borrowed)]
+  }
+}
+
+# Caller side: strip the __perceus_dup the rewrite put on an argument
+# that lands in a borrowed parameter slot of the callee. The callee
+# borrows (does not consume) so the caller need not dup → the incref is
+# removed. Uses the global borrow map keyed by callee name.
+fn pcs_strip_borrow_args(e: Expr, bmap: [BorrowEntry]) : Expr =
+  Expr { kind: pcs_strip_borrow_kind(e.kind, bmap),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn pcs_strip_borrow_kind(k: ExprKind, bmap: [BorrowEntry]) : ExprKind = match k {
+  ECall(callee, args_) -> {
+    let key = pcs_callee_key(callee)
+    let positions = pcs_borrow_lookup(bmap, key)
+    let args2 = pcs_strip_args_at(args_, positions, 0, bmap)
+    ECall(pcs_strip_borrow_args(callee, bmap), args2)
+  }
+  _ -> prc_map_expr_kind(k, (sub) => pcs_strip_borrow_args(sub, bmap))
+}
+
+# The call key for a callee expr — bare EVar or resolved EModCall.
+fn pcs_callee_key(callee: Expr) : String = match callee.kind {
+  EVar(nm)          -> nm
+  EModCall(m, nm)   -> concat_all([m, ".", nm])
+  _                 -> ""
+}
+
+# For each arg: if its index is in `positions` (borrowed slot) and it is
+# `__perceus_dup(x)`, strip to `x`. Recurse into every arg either way.
+fn pcs_strip_args_at(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry]) : [Expr] = match args_ {
+  []           -> []
+  [a, ...rest] -> {
+    let a1 = pcs_strip_borrow_args(a, bmap)
+    let a2 = if pcs_has_int(positions, i) { pcs_strip_dup_wrap(a1) } else { a1 }
+    [a2, ...pcs_strip_args_at(rest, positions, i + 1, bmap)]
+  }
+}
+
+fn pcs_has_int(xs: [Int], t: Int) : Bool = match xs {
+  []           -> false
+  [x, ...rest] -> if x == t { true } else { pcs_has_int(rest, t) }
+}
+
+fn pcs_list_union(xs: [String], ys: [String]) : [String] = match ys {
+  []           -> xs
+  [y, ...rest] -> if list_has(xs, y) { pcs_list_union(xs, rest) }
+                  else { pcs_list_union([y, ...xs], rest) }
+}
+
+fn pcs_params_minus(params: [Param], borrowed: [String]) : [Param] = match params {
+  []           -> []
+  [p, ...rest] ->
+    if list_has(borrowed, p.pname) { pcs_params_minus(rest, borrowed) }
+    else { [p, ...pcs_params_minus(rest, borrowed)] }
+}
+
+# ---------- Borrow inference (Koka kk_borrow_t, B1) ----------
+#
+# A parameter is BORROWED when the body only INSPECTS it: every read of
+# the param is the scrutinee of a `match` whose arms never use any
+# binder of the matched pattern (the children never escape). `is_red`
+# is the canonical case:
+#
+#   fn is_red(t) = match t { RBNode(Red,_,_,_,_) -> true; _ -> false }
+#
+# `t` is read once, as a match scrutinee, and the arms bind nothing —
+# so no component of `t` escapes the call. A borrowed param is the dual
+# of the #599 skip-set: the callee does NOT consume it (no scrutinee
+# decref, no exit drop), and the caller does NOT dup it. This removes
+# the `kai_internal_dup` the caller would otherwise emit on a multi-use
+# argument — the 37%-of-wall RC traffic the rb-tree spends on
+# inspection calls (is_red, comparisons).
+#
+# Soundness (asu trap #1): the danger is escape of a CHILD of the
+# param, not the param itself. The rule is conservative toward owned —
+# it only fires when the arms bind NOTHING that is later read, so there
+# is provably no escape. Anything more (a binder used anywhere in the
+# arm body) marks the param owned and falls back to the dup discipline.
+
+pub fn pcs_borrow_params(pnames: [String], body: Expr) : [String] = match pnames {
+  []           -> []
+  [h, ...rest] -> {
+    let rest_b = pcs_borrow_params(rest, body)
+    if pcs_name_only_inspected(h, body) { [h, ...rest_b] } else { rest_b }
+  }
+}
+
+# True iff every read of `nm` in `e` is an inspect-only position: the
+# bare scrutinee of a match whose arms escape nothing. A use anywhere
+# else (arg to a call, ctor slot, field, return, etc.) is NOT
+# inspect-only → the param is owned. Conservative: returns false the
+# moment it sees `nm` outside an inspecting match.
+fn pcs_name_only_inspected(nm: String, e: Expr) : Bool =
+  pcs_inspected_kind(nm, e.kind)
+
+fn pcs_inspected_kind(nm: String, k: ExprKind) : Bool = match k {
+  EMatch(s, arms) -> {
+    # `nm` as the bare scrutinee is an inspect, IF the arms escape
+    # nothing. `nm` appearing inside a non-bare scrutinee expression,
+    # or inside any arm body, must itself be inspect-only.
+    let scr_inspect = match s.kind {
+      EVar(uname) -> if uname == nm { pcs_arms_escape_nothing(arms) } else { true }
+      _           -> pcs_name_only_inspected(nm, s)
+    }
+    scr_inspect and pcs_inspected_arms(nm, arms)
+  }
+  EVar(uname)         -> uname != nm   # a bare read NOT as scrutinee = owned use
+  ECall(f, xs)        -> pcs_inspected(nm, f) and pcs_inspected_list(nm, xs)
+  EIntrinsic(_, xs)   -> pcs_inspected_list(nm, xs)
+  EField(x, _)        -> pcs_name_absent(nm, x)   # field read of nm = owned
+  EIndex(a, b)        -> pcs_name_absent(nm, a) and pcs_name_only_inspected(nm, b)
+  EBinop(_, a, b)     -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
+  EUnop(_, x)         -> pcs_name_only_inspected(nm, x)
+  EIf(c, t, oe)       -> pcs_name_only_inspected(nm, c) and
+                          pcs_name_only_inspected(nm, t) and
+                          pcs_inspected_opt(nm, oe)
+  EBlock(stmts, tail) -> pcs_inspected_block(nm, stmts, tail)
+  ELambda(_, b)       -> pcs_name_absent(nm, b)   # capture = owned
+  ERecordLit(_, fis)  -> pcs_inspected_fields(nm, fis)
+  EList(els)          -> pcs_inspected_elems(nm, els)
+  ERange(a, b, oe)    -> pcs_name_only_inspected(nm, a) and
+                          pcs_name_only_inspected(nm, b) and pcs_inspected_opt(nm, oe)
+  EPipe(a, b)         -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
+  EMapPipe(a, b)      -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
+  EFlatMapPipe(a, b)  -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
+  EFilterPipe(a, b)   -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
+  EBang(x)            -> pcs_name_only_inspected(nm, x)
+  ELitUnit(x, _)      -> pcs_name_only_inspected(nm, x)
+  EStr(_, _)          -> false   # interpolation reads are owned (conservative)
+  EHandle(_, _, _, _, _, _, _) -> false   # conservative: handlers are owned
+  _                   -> true    # leaves never reference nm
+}
+
+# An arm escapes nothing iff none of its pattern's binders are read in
+# the arm body. Conservative: a guard counts as the body too.
+fn pcs_arms_escape_nothing(arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(pat, opt_g, abody) -> {
+      let binders = prc_pat_binders(pat, [])
+      let body_clean = pcs_no_binder_used(binders, abody)
+      let guard_clean = match opt_g {
+        None    -> true
+        Some(g) -> pcs_no_binder_used(binders, g)
+      }
+      if body_clean and guard_clean { pcs_arms_escape_nothing(rest) } else { false }
+    }
+  }
+}
+
+# None of `binders` is read anywhere in `e`.
+fn pcs_no_binder_used(binders: [String], e: Expr) : Bool = match binders {
+  []           -> true
+  [b, ...rest] -> if pcs_name_absent(b, e) { pcs_no_binder_used(rest, e) } else { false }
+}
+
+# `nm` does not appear as a read anywhere in `e`. Pure structural walk
+# (no effects) — must stay effect-free so the borrow analysis carries
+# no Console row (the use-collector pcs_collect_uses_expr does, and
+# threading that row through the inference would be both heavy and
+# wrong: inference is a pure query). Reuses the existing
+# pcs_max_paths_in_expr, which counts reads of `nm` purely.
+fn pcs_name_absent(nm: String, e: Expr) : Bool =
+  pcs_max_paths_in_expr(nm, e) == 0
+
+fn pcs_inspected(nm: String, e: Expr) : Bool = pcs_name_only_inspected(nm, e)
+
+fn pcs_inspected_list(nm: String, es: [Expr]) : Bool = match es {
+  []           -> true
+  [e, ...rest] -> if pcs_name_only_inspected(nm, e) { pcs_inspected_list(nm, rest) } else { false }
+}
+
+fn pcs_inspected_opt(nm: String, oe: Option[Expr]) : Bool = match oe {
+  None    -> true
+  Some(e) -> pcs_name_only_inspected(nm, e)
+}
+
+fn pcs_inspected_arms(nm: String, arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, abody) -> {
+      let g_ok = match opt_g { None -> true Some(g) -> pcs_name_only_inspected(nm, g) }
+      if g_ok and pcs_name_only_inspected(nm, abody) { pcs_inspected_arms(nm, rest) } else { false }
+    }
+  }
+}
+
+fn pcs_inspected_block(nm: String, stmts: [Stmt], tail: Option[Expr]) : Bool = {
+  let s_ok = pcs_inspected_stmts(nm, stmts)
+  s_ok and pcs_inspected_opt(nm, tail)
+}
+
+fn pcs_inspected_stmts(nm: String, stmts: [Stmt]) : Bool = match stmts {
+  []           -> true
+  [s, ...rest] -> if pcs_inspected_stmt(nm, s) { pcs_inspected_stmts(nm, rest) } else { false }
+}
+
+fn pcs_inspected_stmt(nm: String, s: Stmt) : Bool = match s {
+  SLet(_, _, rhs)         -> pcs_name_only_inspected(nm, rhs)
+  SExprStmt(e)            -> pcs_name_only_inspected(nm, e)
+  _                       -> pcs_name_absent_stmt(nm, s)
+}
+
+fn pcs_name_absent_stmt(nm: String, s: Stmt) : Bool = match s {
+  SLet(_, _, rhs) -> pcs_name_absent(nm, rhs)
+  SExprStmt(e)    -> pcs_name_absent(nm, e)
+  _               -> true
+}
+
+fn pcs_inspected_fields(nm: String, fis: [FieldInit]) : Bool = match fis {
+  []           -> true
+  [f, ...rest] -> match f {
+    FI(_, v) -> if pcs_name_only_inspected(nm, v) { pcs_inspected_fields(nm, rest) } else { false }
+  }
+}
+
+fn pcs_inspected_elems(nm: String, els: [ListElem]) : Bool = match els {
+  []           -> true
+  [el, ...rest] -> {
+    let ok = match el {
+      ElPlain(e)  -> pcs_name_only_inspected(nm, e)
+      ElSpread(e) -> pcs_name_absent(nm, e)   # spread tail owns the value
+    }
+    if ok { pcs_inspected_elems(nm, rest) } else { false }
+  }
+}
+
+fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry]) : Decl / Console {
 
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
@@ -413,21 +729,32 @@ fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console {
       else {
         let pnames = map(params, (p) => p.pname)
         let uses = pcs_collect_uses_expr(body, pnames, false, [])
-        # Issue #599 — branch-aware skip-set: every top-level fn param
-        # whose max non-lam reads on any single execution path is <= 1.
-        # Such a param is safe to read raw: the single read on the
-        # path that executes transfers ownership; no dup wrap needed.
-        let skip_set = pcs_branch_aware_skip_params(pnames, body)
+        # Borrow inference (Koka). A borrowed param is inspect-only:
+        # the body reads it WITHOUT dup (so it must be in the skip-set,
+        # never dup'd) and its match scrutinee is wrapped in
+        # __perceus_borrow so emit_match skips the exit decref → the
+        # callee never touches the param's RC. The caller side
+        # (pcs_strip_borrow_args) strips the __perceus_dup on the matching
+        # argument → no incref is paid either. Net: zero RC on the
+        # inspected param, which is exactly the 37%-of-wall traffic the
+        # rb-tree spends on is_red / comparisons.
+        let borrowed = pcs_borrow_params(pnames, body)
+        # Issue #599 — branch-aware skip-set: params read <= 1 time per
+        # path transfer ownership raw (no dup). Borrowed params join the
+        # skip-set too (they are never dup'd) — union the two.
+        let skip_set = pcs_list_union(pcs_branch_aware_skip_params(pnames, body), borrowed)
         let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, [])
-        # Issue #350 — emit `__perceus_drop` for multi-use pattern
-        # bindings introduced by match arms (mirror of the SLet
-        # exit-drop pass from #342). Runs BEFORE reuse recognition so
-        # the synthetic `__perceus_reuse_*` rewrites see the drops as
-        # part of the canonicalised arm body.
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
-        let body_with_drops = pcs_prepend_unused_drops(reused_body, params, uses, skip_set)
-        DFn(is_pub, name, tparams, params, opt_ret, row, body_with_drops, ln, cl, mo)
+        # Borrowed params carry no exit obligation — exclude from the
+        # unused-param drop.
+        let drop_params = pcs_params_minus(params, borrowed)
+        let body_with_drops = pcs_prepend_unused_drops(reused_body, drop_params, uses, skip_set)
+        # Callee flip: wrap borrowed scrutinees so emit_match skips the
+        # decref. Caller flip: strip __perceus_dup on borrowed-slot args.
+        let body_borrow_scr = pcs_wrap_borrow_scrutinees(body_with_drops, borrowed)
+        let body_borrow = pcs_strip_borrow_args(body_borrow_scr, bmap)
+        DFn(is_pub, name, tparams, params, opt_ret, row, body_borrow, ln, cl, mo)
       }
     }
     # Test bodies are emitted as their own thunk fns; without rewriting
@@ -583,10 +910,37 @@ fn pcs_try_reuse_arm(scr_ty: Option[Ty], pat: Pattern, body: Expr) : Expr {
     # with the same head name and tparams (equal `mangle_ty`); a
     # rebuild like `Some(d) -> Some(false)` over `Maybe[Int]`
     # produces `Maybe[Bool]` and is rejected.
-    PVariant(_cname, ps) ->
-      if pcs_shape_matches(scr_ty, body.ty) {
+    # The 1:1 reuse lowering (emit_match_arm_reuse_variant) only binds
+    # FLAT slot sub-patterns (PBind / PWild). A nested variant/list/
+    # record sub-pattern binds inner vars the reuse emit never declares,
+    # producing C that references undeclared `kai_<inner>` identifiers.
+    # Restrict reuse to arms whose slots are all flat; nested-pattern
+    # arms fall through to the fresh `kai_variant_u` allocator (a missed
+    # optimisation, not a miscompile).
+    # The reuse must also be DIAGONAL: each boxed slot of the rebuild
+    # must be exactly the binder of the same slot in the pattern. A
+    # rebuild that puts a fresh node, or another slot's binder, into a
+    # pointer slot orphans the old child (memory leak) — the 1:1 lowering
+    # transfers slots without dropping the old pointer. Unboxed slots
+    # (Int/Real/Bool) are copy-by-value with no RC, so any derived
+    # expression (`k + 1`) is safe. Non-diagonal arms fall through to the
+    # fresh allocator, which drops the old children correctly.
+    PVariant(_cname, ps) -> {
+      let flat_ok = pcs_all_flat_subs(ps)
+      let shape_ok = pcs_shape_matches(scr_ty, body.ty)
+      # The diagonal gate was only needed for the old eager-1:1-decref
+      # embryo (kai_reuse_or_alloc_variant), which orphaned children on
+      # a non-diagonal rebuild. The reuse lowering now uses
+      # kai_variant_reuse_at (Koka move semantics: donate the unique
+      # cell, write the new slots, do NOT decref the donor's old
+      # children — the arm already extracted/owns them). A non-diagonal
+      # rebuild is therefore sound, so the diagonal gate is dropped.
+      # `flat_ok` stays: nested sub-patterns bind inner vars the reuse
+      # emit never declares, producing undeclared-identifier C.
+      if flat_ok and shape_ok {
         pcs_try_reuse_variant(body, list_length(ps))
       } else { body }
+    }
     # Record rebuild — `{ a, b } -> Rec { a: f(a), b }`. Same shape
     # predicate as variants; field count must also match (already
     # enforced inside `pcs_try_reuse_record`).
@@ -687,6 +1041,108 @@ fn pcs_name_is_ctor(nm: String) : Bool {
     None    -> false
   }
 }
+
+# A slot sub-pattern is "flat" if the reuse-in-place emit can bind it
+# without descending: a bare binder or a wildcard. Anything else
+# (nested variant / list / record / literal) binds inner names the
+# 1:1 reuse lowering does not declare, so such arms must not be
+# recognised as reusable.
+fn pcs_sub_is_flat(p: Pattern) : Bool =
+  match p.pkind {
+    PBind(_) -> true
+    PWild    -> true
+    # Nested sub-patterns (variant/list/record) bind inner names that
+    # the reuse-in-place lowering does not descend to declare — a
+    # nested-variant arm like balance_left's
+    # `RBNode(_, RBNode(Red, lx, ..), ..)` would emit C referencing an
+    # undeclared `kai_lx`. Capturing these (donate the inner cell as a
+    # second pool token, declare the inner binders in the reuse path) is
+    # the nested-subpattern token-POOL lever, still pending. Until then
+    # they fall through to the fresh allocator (a missed optimisation,
+    # not a miscompile).
+    _        -> false
+  }
+
+fn pcs_all_flat_subs(ps: [Pattern]) : Bool =
+  match ps {
+    []          -> true
+    [p, ...rest] -> if pcs_sub_is_flat(p) { pcs_all_flat_subs(rest) } else { false }
+  }
+
+# A variant slot is "unboxed" (copy-by-value, no RC) only for the kinds
+# the emitter inlines into the slot word: Int (.i64) and Real (.r). Bool,
+# Char, String, Byte are stored as BOXED pointers in the variant cell
+# (variant_slot_kind in emit_c.kai returns 0 for them), so overwriting
+# such a slot non-diagonally would orphan the old pointer. Keep this in
+# lockstep with `variant_slot_kind`.
+fn pcs_ty_is_unboxed(t: Option[Ty]) : Bool =
+  match t {
+    None -> false
+    Some(ty) -> match ty {
+      TyInt  -> true
+      TyReal -> true
+      _      -> false
+    }
+  }
+
+# Diagonal-reuse predicate. The arm rebuilds `C(e0, ..., en)` over the
+# pattern `C(p0, ..., pn)`. Reuse-in-place is leak-safe ONLY when, for
+# every slot i:
+#   - the slot is unboxed (copy-by-value, any `ei` is fine), OR
+#   - `ei` is exactly the binder of `pi` (strict identity — the same
+#     child stays in the same slot; no pointer is orphaned and the
+#     borrowed alias is not consumed, avoiding both leak and UAF).
+# A boxed slot whose rebuild expression is a fresh ctor, another slot's
+# binder, or a consuming call `g(pi)` is NON-diagonal and must fall
+# through to the fresh allocator.
+fn pcs_reuse_is_diagonal(ps: [Pattern], body: Expr) : Bool =
+  match pcs_ctor_args(body) {
+    None       -> false
+    Some(cargs) ->
+      if list_length(cargs) == list_length(ps) {
+        pcs_diag_slots(ps, cargs)
+      } else { false }
+  }
+
+# Pull the constructor argument list out of a rebuild body, accepting
+# both the bare `EVar(C)` and resolved `EModCall(mod, C)` callee shapes.
+# NB: the binder must NOT be named `args` — that shadows against the
+# prelude `args()` fn and silently resolves to an empty list (stage1
+# shadow bug). Use `cargs`.
+fn pcs_ctor_args(body: Expr) : Option[[Expr]] =
+  match body.kind {
+    ECall(callee, cargs) -> match callee.kind {
+      EVar(_)        -> Some(cargs)
+      EModCall(_, _) -> Some(cargs)
+      _              -> None
+    }
+    _ -> None
+  }
+
+fn pcs_diag_slots(ps: [Pattern], cargs: [Expr]) : Bool =
+  match ps {
+    [] -> true
+    [p, ...prest] -> match cargs {
+      [] -> true
+      [a, ...arest] ->
+        if pcs_slot_is_diagonal(p, a) { pcs_diag_slots(prest, arest) }
+        else { false }
+    }
+  }
+
+# One slot is diagonal if its rebuild value is unboxed (copy-by-value),
+# or it is exactly the binder of the slot pattern.
+fn pcs_slot_is_diagonal(p: Pattern, a: Expr) : Bool =
+  if pcs_ty_is_unboxed(a.ty) { true }
+  else {
+    match p.pkind {
+      PBind(bn) -> match a.kind {
+        EVar(an) -> an == bn
+        _        -> false
+      }
+      _ -> false
+    }
+  }
 
 fn pcs_try_reuse_record(body: Expr, expected_n: Int) : Expr {
   match body.kind {
