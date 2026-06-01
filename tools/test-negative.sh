@@ -170,7 +170,11 @@ run_one_runtime() {
     echo "FAIL $rel — kaic2 rejected at compile (this is a runtime-negative fixture)"
     return
   fi
-  if ! cc -std=c99 -Wall -Wno-incompatible-function-pointer-types -I "$ROOT/stage0" "$cfile" -o "$bin" -lm 2> "$errfile.cc"; then
+  # `-I "$ROOT/stage2"` comes BEFORE `-I "$ROOT/stage0"` so the emitted
+  # `#include "runtime.h"` resolves to stage 2's Koka-style runtime
+  # (tagged Int, kai_intf, reuse-token). Compiling kaic2-emitted C
+  # against stage0/runtime.h alone leaves `kai_intf` undeclared.
+  if ! cc -std=c99 -Wall -Wno-incompatible-function-pointer-types -I "$ROOT/stage2" -I "$ROOT/stage0" "$cfile" -o "$bin" -lm 2> "$errfile.cc"; then
     echo "FAIL $rel — cc rejected the generated C (likely silent type-level contract)"
     head -3 "$errfile.cc"
     return

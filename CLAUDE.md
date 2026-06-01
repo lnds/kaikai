@@ -177,6 +177,13 @@ cz reads `.cz.toml` (`change_type_map = { feat = "Added", fix = "Fixed", … }`,
 - **Coverage probe ratchet**: `tools/coverage-baseline.txt` is the current allowed gap count. New gaps fail the probe; closed gaps bump the baseline down. Add `<!-- coverage: skip -->` only for non-testable concerns (design rationale, references), not for forgotten fixtures.
 - **Honesty targets**: runtime changes affecting fibers or Perceus update the relevant tier in `docs/fibers-honesty-targets.md` or `docs/perceus-honesty-targets.md`.
 
+## Working discipline (speed)
+
+- **Think before acting; don't over-complicate.** Pick the direct path, do it, move on. No analysis spirals on simple tasks.
+- **Use what's already in context.** Don't re-run commands for facts you already have (branch states, commit logs, file contents read this session). Re-running known state is wasted time.
+- **Commands must be direct and fast.** One command that answers the question, not a chain of exploratory probes. For git state: a single `git log`/`git branch`/`git status` answers it — don't bisect what one command shows.
+- **Simple things stay simple.** Resolving commits in a log, checking a branch, confirming a merge — these are one-command answers, not investigations.
+
 ## Things to avoid
 
 - **Do not go back to Go** for the compiler. The prior Go frontend was discarded on purpose.
