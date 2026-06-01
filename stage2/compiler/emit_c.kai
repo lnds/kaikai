@@ -9213,8 +9213,8 @@ pub fn dump_mono_out(file: String, decls: [Decl]) : Int / Console + File {
 #
 # M1 lands the walker only; no caller wires it into the pipeline,
 # so selfhost stays byte-identical until M3 flips emission.
-fn tcrec_has_tail_self_call(body: Expr, nm: String, arity: Int) : Bool =
-  tcrec_walk_tail(body.kind, nm, arity, [])
+fn tcrec_has_tail_self_call(body: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
+  tcrec_walk_tail(body.kind, nm, arity, own_mod, [])
 
 # ---- TRMC (tail-recursion-modulo-cons) recognition -----------------
 #
@@ -9239,37 +9239,50 @@ fn tcrec_has_tail_self_call(body: Expr, nm: String, arity: Int) : Bool =
 #     ctor args here are simple binders/primitives, so self-call-free
 #     is the load-bearing predicate. Nested-ctor modulo-cons (Koka's
 #     recurse-into-other-con case) is DEFERRED — not needed for rb-tree.
-fn tcrec_ctor_modcons_slot(xs: [Expr], nm: String, arity: Int) : Option[Int] =
-  tcrec_ctor_modcons_scan(xs, nm, arity, 0, None)
+fn tcrec_ctor_modcons_slot(xs: [Expr], nm: String, arity: Int, own_mod: Option[String]) : Option[Int] =
+  tcrec_ctor_modcons_scan(xs, nm, arity, own_mod, 0, None)
 
-fn tcrec_ctor_modcons_scan(xs: [Expr], nm: String, arity: Int, i: Int,
+fn tcrec_ctor_modcons_scan(xs: [Expr], nm: String, arity: Int, own_mod: Option[String], i: Int,
                            found: Option[Int]) : Option[Int] {
   match xs {
     [] -> found
     [a, ...rest] -> {
-      if tcrec_is_direct_self_call(a, nm, arity) {
+      if tcrec_is_direct_self_call(a, nm, arity, own_mod) {
         # A second self-call slot disqualifies (not single-recursive).
         match found {
           Some(_) -> None
-          None    -> tcrec_ctor_modcons_scan(rest, nm, arity, i + 1, Some(i))
+          None    -> tcrec_ctor_modcons_scan(rest, nm, arity, own_mod, i + 1, Some(i))
         }
-      } else if tcrec_expr_has_self_call(a, nm, arity) {
+      } else if tcrec_expr_has_self_call(a, nm, arity, own_mod) {
         # Self-call buried inside a non-modulo-cons position (e.g. an
         # argument to a regular fn nested in this slot) → not a clean
         # modulo-cons site; bail.
         None
       } else {
-        tcrec_ctor_modcons_scan(rest, nm, arity, i + 1, found)
+        tcrec_ctor_modcons_scan(rest, nm, arity, own_mod, i + 1, found)
       }
     }
   }
 }
 
-fn tcrec_is_direct_self_call(e: Expr, nm: String, arity: Int) : Bool =
+# A self-call is `nm(...)` with matching arity. The qualified form
+# `EModCall(mod, nm)` is a self-call ONLY when `mod` names the
+# function's own module (`own_mod`); a foreign call with the same
+# bare name (e.g. `decimal.cmp` inside `money.cmp`) must NOT be
+# mistaken for recursion, or TRMC rewrites it into a `goto` that
+# rebinds the loop vars to the foreign call's args and corrupts the
+# spine. Root-file fns (own_mod = None) never self-call via EModCall.
+fn tcrec_modcall_is_self(callmod: String, own_mod: Option[String]) : Bool =
+  match own_mod {
+    None    -> false
+    Some(m) -> callmod == m
+  }
+
+fn tcrec_is_direct_self_call(e: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
   match e.kind {
     ECall(f, xs) -> match f.kind {
-      EVar(callee)        -> callee == nm and list_length(xs) == arity
-      EModCall(_, callee) -> callee == nm and list_length(xs) == arity
+      EVar(callee)              -> callee == nm and list_length(xs) == arity
+      EModCall(callmod, callee) -> callee == nm and list_length(xs) == arity and tcrec_modcall_is_self(callmod, own_mod)
       _ -> false
     }
     _ -> false
@@ -9278,7 +9291,7 @@ fn tcrec_is_direct_self_call(e: Expr, nm: String, arity: Int) : Bool =
 # Does `e` contain a self-call to `nm` anywhere (any position)? Used to
 # reject ctor slots (other than the modulo-cons one) that hide a
 # recursion the TRMC rewrite would otherwise drop.
-fn tcrec_expr_has_self_call(e: Expr, nm: String, arity: Int) : Bool =
+fn tcrec_expr_has_self_call(e: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
   match e.kind {
     EVar(_)             -> false
     EInt(_)             -> false
@@ -9290,49 +9303,49 @@ fn tcrec_expr_has_self_call(e: Expr, nm: String, arity: Int) : Bool =
     EUnder              -> false
     ECall(f, xs) -> {
       let here = match f.kind {
-        EVar(callee)        -> callee == nm and list_length(xs) == arity
-        EModCall(_, callee) -> callee == nm and list_length(xs) == arity
+        EVar(callee)              -> callee == nm and list_length(xs) == arity
+        EModCall(callmod, callee) -> callee == nm and list_length(xs) == arity and tcrec_modcall_is_self(callmod, own_mod)
         _ -> false
       }
-      here or tcrec_any_has_self_call(xs, nm, arity) or tcrec_expr_has_self_call(f, nm, arity)
+      here or tcrec_any_has_self_call(xs, nm, arity, own_mod) or tcrec_expr_has_self_call(f, nm, arity, own_mod)
     }
-    EBinop(_, a, b)     -> tcrec_expr_has_self_call(a, nm, arity) or tcrec_expr_has_self_call(b, nm, arity)
-    EUnop(_, a)         -> tcrec_expr_has_self_call(a, nm, arity)
-    EIf(c, t, oe)       -> tcrec_expr_has_self_call(c, nm, arity) or tcrec_expr_has_self_call(t, nm, arity) or (match oe { Some(x) -> tcrec_expr_has_self_call(x, nm, arity) None -> false })
-    EBlock(stmts, ot)   -> tcrec_stmts_have_self_call(stmts, nm, arity) or (match ot { Some(x) -> tcrec_expr_has_self_call(x, nm, arity) None -> false })
-    EMatch(s, arms)     -> tcrec_expr_has_self_call(s, nm, arity) or tcrec_arms_have_self_call(arms, nm, arity)
-    EField(a, _)        -> tcrec_expr_has_self_call(a, nm, arity)
-    EIndex(a, b)        -> tcrec_expr_has_self_call(a, nm, arity) or tcrec_expr_has_self_call(b, nm, arity)
-    EIntrinsic(_, xs)   -> tcrec_any_has_self_call(xs, nm, arity)
+    EBinop(_, a, b)     -> tcrec_expr_has_self_call(a, nm, arity, own_mod) or tcrec_expr_has_self_call(b, nm, arity, own_mod)
+    EUnop(_, a)         -> tcrec_expr_has_self_call(a, nm, arity, own_mod)
+    EIf(c, t, oe)       -> tcrec_expr_has_self_call(c, nm, arity, own_mod) or tcrec_expr_has_self_call(t, nm, arity, own_mod) or (match oe { Some(x) -> tcrec_expr_has_self_call(x, nm, arity, own_mod) None -> false })
+    EBlock(stmts, ot)   -> tcrec_stmts_have_self_call(stmts, nm, arity, own_mod) or (match ot { Some(x) -> tcrec_expr_has_self_call(x, nm, arity, own_mod) None -> false })
+    EMatch(s, arms)     -> tcrec_expr_has_self_call(s, nm, arity, own_mod) or tcrec_arms_have_self_call(arms, nm, arity, own_mod)
+    EField(a, _)        -> tcrec_expr_has_self_call(a, nm, arity, own_mod)
+    EIndex(a, b)        -> tcrec_expr_has_self_call(a, nm, arity, own_mod) or tcrec_expr_has_self_call(b, nm, arity, own_mod)
+    EIntrinsic(_, xs)   -> tcrec_any_has_self_call(xs, nm, arity, own_mod)
     _                   -> true   # conservative: unknown shape may hide a self-call
   }
 
-fn tcrec_any_has_self_call(xs: [Expr], nm: String, arity: Int) : Bool =
+fn tcrec_any_has_self_call(xs: [Expr], nm: String, arity: Int, own_mod: Option[String]) : Bool =
   match xs {
     [] -> false
-    [a, ...rest] -> tcrec_expr_has_self_call(a, nm, arity) or tcrec_any_has_self_call(rest, nm, arity)
+    [a, ...rest] -> tcrec_expr_has_self_call(a, nm, arity, own_mod) or tcrec_any_has_self_call(rest, nm, arity, own_mod)
   }
 
-fn tcrec_stmts_have_self_call(stmts: [Stmt], nm: String, arity: Int) : Bool =
+fn tcrec_stmts_have_self_call(stmts: [Stmt], nm: String, arity: Int, own_mod: Option[String]) : Bool =
   match stmts {
     [] -> false
     [s, ...rest] -> {
       let here = match s {
-        SLet(_, _, rhs)      -> tcrec_expr_has_self_call(rhs, nm, arity)
-        SExprStmt(e)         -> tcrec_expr_has_self_call(e, nm, arity)
+        SLet(_, _, rhs)      -> tcrec_expr_has_self_call(rhs, nm, arity, own_mod)
+        SExprStmt(e)         -> tcrec_expr_has_self_call(e, nm, arity, own_mod)
         _ -> false
       }
-      here or tcrec_stmts_have_self_call(rest, nm, arity)
+      here or tcrec_stmts_have_self_call(rest, nm, arity, own_mod)
     }
   }
 
-fn tcrec_arms_have_self_call(arms: [Arm], nm: String, arity: Int) : Bool =
+fn tcrec_arms_have_self_call(arms: [Arm], nm: String, arity: Int, own_mod: Option[String]) : Bool =
   match arms {
     [] -> false
-    [Arm(_, _, body), ...rest] -> tcrec_expr_has_self_call(body, nm, arity) or tcrec_arms_have_self_call(rest, nm, arity)
+    [Arm(_, _, body), ...rest] -> tcrec_expr_has_self_call(body, nm, arity, own_mod) or tcrec_arms_have_self_call(rest, nm, arity, own_mod)
   }
 
-fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, scope: [String]) : Bool {
+fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, own_mod: Option[String], scope: [String]) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
@@ -9341,42 +9354,42 @@ fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, scope: [String]) : Bool 
         } else if name_first_is_upper(callee) and not list_has(scope, nm) {
           # TRMC: a constructor application in tail position with a
           # self-call in exactly one slot is modulo-cons-eligible.
-          match tcrec_ctor_modcons_slot(xs, nm, arity) { Some(_) -> true None -> false }
+          match tcrec_ctor_modcons_slot(xs, nm, arity, own_mod) { Some(_) -> true None -> false }
         } else { false }
       EModCall(_, callee) ->
         if name_first_is_upper(callee) and not list_has(scope, nm) {
           # Resolver qualifies user ctors as EModCall(tycon, Ctor).
-          match tcrec_ctor_modcons_slot(xs, nm, arity) { Some(_) -> true None -> false }
+          match tcrec_ctor_modcons_slot(xs, nm, arity, own_mod) { Some(_) -> true None -> false }
         } else { false }
       _ -> false
     }
     EIf(_, t, opt_e) -> {
-      if tcrec_walk_tail(t.kind, nm, arity, scope) { true }
+      if tcrec_walk_tail(t.kind, nm, arity, own_mod, scope) { true }
       else { match opt_e {
         None -> false
-        Some(e2) -> tcrec_walk_tail(e2.kind, nm, arity, scope)
+        Some(e2) -> tcrec_walk_tail(e2.kind, nm, arity, own_mod, scope)
       } }
     }
-    EMatch(_, arms) -> tcrec_walk_arms(arms, nm, arity, scope)
+    EMatch(_, arms) -> tcrec_walk_arms(arms, nm, arity, own_mod, scope)
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
         None -> false
-        Some(e) -> tcrec_walk_tail(e.kind, nm, arity, scope1)
+        Some(e) -> tcrec_walk_tail(e.kind, nm, arity, own_mod, scope1)
       }
     }
     _ -> false
   }
 }
 
-fn tcrec_walk_arms(arms: [Arm], nm: String, arity: Int, scope: [String]) : Bool {
+fn tcrec_walk_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], scope: [String]) : Bool {
   match arms {
     [] -> false
     [a, ...rest] -> match a {
       Arm(pat, _, body) -> {
         let scope1 = pat_bindings(pat, scope)
-        if tcrec_walk_tail(body.kind, nm, arity, scope1) { true }
-        else { tcrec_walk_arms(rest, nm, arity, scope) }
+        if tcrec_walk_tail(body.kind, nm, arity, own_mod, scope1) { true }
+        else { tcrec_walk_arms(rest, nm, arity, own_mod, scope) }
       }
     }
   }
@@ -9503,7 +9516,7 @@ fn tcrec_rewrite_decl(d: Decl) : Decl / Console {
           _ -> d
         }
       } else {
-        if not tcrec_has_tail_self_call(body, name, arity) { d }
+        if not tcrec_has_tail_self_call(body, name, arity, mo) { d }
         else {
           let pnames = map(params, (p) => p.pname)
           let uses = pcs_collect_uses_expr(body, pnames, false, [])
@@ -9540,8 +9553,8 @@ fn tcrec_rewrite_decl(d: Decl) : Decl / Console {
             # ordinary tcrec rewrite handles fns whose tail is a direct
             # self-call; TRMC handles fns whose tail is `Ctor(.., self,..)`.
             let new_body =
-              if trmc_row_is_affine(row) and trmc_body_has_modcons(body, name, arity) {
-                trmc_rewrite_body(body, name, arity, c_sym_str,
+              if trmc_row_is_affine(row) and trmc_body_has_modcons(body, name, arity, mo) {
+                trmc_rewrite_body(body, name, arity, mo, c_sym_str,
                                   params, pnames, uses, dm_table, skip_set, [])
               } else {
                 tcrec_rewrite_body(body, name, arity, c_sym_str,
@@ -9570,41 +9583,41 @@ fn trmc_row_is_affine(row: RowExpr) : Bool = match row {
 # Does the body have at least one modulo-cons tail leaf? (a ctor in
 # tail position with a self-call slot). Distinguishes a TRMC fn from a
 # direct-tail-self-call fn so the right rewrite fires.
-fn trmc_body_has_modcons(body: Expr, nm: String, arity: Int) : Bool =
-  trmc_walk_modcons((trmc_unwrap_ret(body)).kind, nm, arity, [])
+fn trmc_body_has_modcons(body: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
+  trmc_walk_modcons((trmc_unwrap_ret(body)).kind, nm, arity, own_mod, [])
 
-fn trmc_walk_modcons(k: ExprKind, nm: String, arity: Int, scope: [String]) : Bool {
+fn trmc_walk_modcons(k: ExprKind, nm: String, arity: Int, own_mod: Option[String], scope: [String]) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
         if name_first_is_upper(callee) and not list_has(scope, nm) {
-          match tcrec_ctor_modcons_slot(xs, nm, arity) { Some(_) -> true None -> false }
+          match tcrec_ctor_modcons_slot(xs, nm, arity, own_mod) { Some(_) -> true None -> false }
         } else { false }
       EModCall(_, callee) ->
         if name_first_is_upper(callee) and not list_has(scope, nm) {
-          match tcrec_ctor_modcons_slot(xs, nm, arity) { Some(_) -> true None -> false }
+          match tcrec_ctor_modcons_slot(xs, nm, arity, own_mod) { Some(_) -> true None -> false }
         } else { false }
       _ -> false
     }
     EIf(_, t, opt_e) ->
-      if trmc_walk_modcons((trmc_unwrap_ret(t)).kind, nm, arity, scope) { true }
-      else { match opt_e { None -> false Some(e2) -> trmc_walk_modcons((trmc_unwrap_ret(e2)).kind, nm, arity, scope) } }
-    EMatch(_, arms) -> trmc_walk_modcons_arms(arms, nm, arity, scope)
+      if trmc_walk_modcons((trmc_unwrap_ret(t)).kind, nm, arity, own_mod, scope) { true }
+      else { match opt_e { None -> false Some(e2) -> trmc_walk_modcons((trmc_unwrap_ret(e2)).kind, nm, arity, own_mod, scope) } }
+    EMatch(_, arms) -> trmc_walk_modcons_arms(arms, nm, arity, own_mod, scope)
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
-      match opt_tail { None -> false Some(e) -> trmc_walk_modcons((trmc_unwrap_ret(e)).kind, nm, arity, scope1) }
+      match opt_tail { None -> false Some(e) -> trmc_walk_modcons((trmc_unwrap_ret(e)).kind, nm, arity, own_mod, scope1) }
     }
     _ -> false
   }
 }
 
-fn trmc_walk_modcons_arms(arms: [Arm], nm: String, arity: Int, scope: [String]) : Bool {
+fn trmc_walk_modcons_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], scope: [String]) : Bool {
   match arms {
     [] -> false
     [Arm(pat, _, body), ...rest] -> {
       let scope1 = pat_bindings(pat, scope)
-      if trmc_walk_modcons((trmc_unwrap_ret(body)).kind, nm, arity, scope1) { true }
-      else { trmc_walk_modcons_arms(rest, nm, arity, scope) }
+      if trmc_walk_modcons((trmc_unwrap_ret(body)).kind, nm, arity, own_mod, scope1) { true }
+      else { trmc_walk_modcons_arms(rest, nm, arity, own_mod, scope) }
     }
   }
 }
@@ -9644,8 +9657,8 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
       TcrecPcsTriple(before, inner, after) -> {
         # TRMC eligibility (modulo-cons through arm-wraps) OR an ordinary
         # direct tail self-call qualifies the inner for rewrite.
-        let is_trmc_inner = trmc_row_is_affine(row) and trmc_body_has_modcons(inner, name, arity)
-        let has_direct = tcrec_has_tail_self_call(inner, name, arity)
+        let is_trmc_inner = trmc_row_is_affine(row) and trmc_body_has_modcons(inner, name, arity, mo)
+        let has_direct = tcrec_has_tail_self_call(inner, name, arity, mo)
         if not has_direct and not is_trmc_inner { d }
         else {
           let pnames = map(params, (p) => p.pname)
@@ -9667,8 +9680,8 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
             # and non-modulo-cons leaves `cctx_apply_linear`. Re-wrapping
             # would double-handle RC on the apply leaves.
             let new_body =
-              if trmc_row_is_affine(row) and trmc_body_has_modcons(inner, name, arity) {
-                trmc_rewrite_body(inner, name, arity, c_sym_str,
+              if trmc_row_is_affine(row) and trmc_body_has_modcons(inner, name, arity, mo) {
+                trmc_rewrite_body(inner, name, arity, mo, c_sym_str,
                                   params, pnames, uses, dm_table, skip_set, [])
               } else {
                 let new_inner = tcrec_rewrite_body(inner, name, arity, c_sym_str,
@@ -10553,43 +10566,43 @@ fn trmc_find_ret_let_rhs(stmts: [Stmt], ret_name: String) : Option[Expr] {
 # threaded into the step is the same per-site dropmask the ordinary
 # tcrec uses, computed from the self-call's args; it reconciles
 # Perceus's exit-drops that the goto skips.
-fn trmc_rewrite_body(body0: Expr, nm: String, arity: Int, c_sym_str: String,
+fn trmc_rewrite_body(body0: Expr, nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
                      params: [Param], pnames: [String], uses: [Use],
                      dm_table: [TcrDm], skip_set: [String], scope: [String]) : Expr {
   # Peel a Perceus arm/block-ret wrap so the modulo-cons ctor (or the
   # tail leaf) is visible; the cctx replaces the wrap's exit drops.
   let body = trmc_unwrap_ret(body0)
-  Expr { kind: trmc_rewrite_kind(body.kind, body.line, body.col, nm, arity,
+  Expr { kind: trmc_rewrite_kind(body.kind, body.line, body.col, nm, arity, own_mod,
                                   c_sym_str, params, pnames, uses, dm_table, skip_set, scope),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode }
 }
 
-fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
+fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int, own_mod: Option[String],
                      c_sym_str: String, params: [Param], pnames: [String],
                      uses: [Use], dm_table: [TcrDm], skip_set: [String], scope: [String]) : ExprKind {
   match k {
     EIf(c, t, opt_e) -> {
-      let t1 = trmc_rewrite_body(t, nm, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope)
+      let t1 = trmc_rewrite_body(t, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope)
       let opt_e1 = match opt_e {
         None -> None
-        Some(e2) -> Some(trmc_rewrite_body(e2, nm, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope))
+        Some(e2) -> Some(trmc_rewrite_body(e2, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope))
       }
       EIf(c, t1, opt_e1)
     }
     EMatch(s, arms) ->
-      EMatch(s, trmc_rewrite_arms(arms, nm, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, []))
+      EMatch(s, trmc_rewrite_arms(arms, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, []))
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
         None -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
-        Some(e) -> EBlock(stmts, Some(trmc_rewrite_body(e, nm, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope1)))
+        Some(e) -> EBlock(stmts, Some(trmc_rewrite_body(e, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope1)))
       }
     }
     ECall(f, xs) -> {
       # Tail-position ctor application: is it modulo-cons?
       let modslot = match f.kind {
-        EVar(callee)        -> if name_first_is_upper(callee) and not list_has(scope, nm) { tcrec_ctor_modcons_slot(xs, nm, arity) } else { None }
-        EModCall(_, callee) -> if name_first_is_upper(callee) and not list_has(scope, nm) { tcrec_ctor_modcons_slot(xs, nm, arity) } else { None }
+        EVar(callee)        -> if name_first_is_upper(callee) and not list_has(scope, nm) { tcrec_ctor_modcons_slot(xs, nm, arity, own_mod) } else { None }
+        EModCall(_, callee) -> if name_first_is_upper(callee) and not list_has(scope, nm) { tcrec_ctor_modcons_slot(xs, nm, arity, own_mod) } else { None }
         _ -> None
       }
       match modslot {
@@ -10623,7 +10636,7 @@ fn trmc_wrap_apply(leaf: Expr) : ExprKind =
   ECall(Expr { kind: EVar("__kai_trmc_apply"), line: leaf.line, col: leaf.col, ty: leaf.ty, mode: leaf.mode },
         [leaf])
 
-fn trmc_rewrite_arms(arms: [Arm], nm: String, arity: Int, c_sym_str: String,
+fn trmc_rewrite_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
                      params: [Param], pnames: [String], uses: [Use],
                      dm_table: [TcrDm], skip_set: [String], scope: [String], acc: [Arm]) : [Arm] {
   match arms {
@@ -10631,8 +10644,8 @@ fn trmc_rewrite_arms(arms: [Arm], nm: String, arity: Int, c_sym_str: String,
     [a, ...rest] -> match a {
       Arm(pat, opt_g, body) -> {
         let scope1 = pat_bindings(pat, scope)
-        let new_body = trmc_rewrite_body(body, nm, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope1)
-        trmc_rewrite_arms(rest, nm, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, [Arm(pat, opt_g, new_body), ...acc])
+        let new_body = trmc_rewrite_body(body, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope1)
+        trmc_rewrite_arms(rest, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, [Arm(pat, opt_g, new_body), ...acc])
       }
     }
   }
@@ -11007,11 +11020,14 @@ fn emit_trmc_step(src: String, sym: String, holeslot: Int, cname: String,
   let rebinds  = tcrec_emit_rebinds(pnames, 0)
   concat_all([
     "({ KaiVarSlot _trmc_sl[", int_to_string(n), "] = {", slot_inits, "}; ",
-    # Koka reuse-in-place: donate the consumed match scrutinee `_scr`
-    # as the storage for this rebuilt node when it is unique (drop_reuse
-    # + alloc_at, fused). Falls back to a fresh alloc when `_scr` is
-    # shared or wrong-arity. `_scr` is the enclosing match arm's local.
-    "KaiValue *_trmc_node = kai_variant_reuse_at(_scr, ", tag_str, ", \"", cname, "\", ",
+    # Fresh-alloc the spine node. An earlier version donated the
+    # enclosing match arm's `_scr` here, but a TRMC step is NOT always
+    # inside a match (e.g. a fn whose tail is an `if`-chain building a
+    # variant) — `_scr` is then undeclared and the C does not compile
+    # (stdlib fx_basic). The real reuse-in-place comes from the
+    # match-arm path (emit_match_arm_reuse_variant), which is properly
+    # scoped to `_scr`; the TRMC step stays a plain fresh alloc.
+    "KaiValue *_trmc_node = kai_variant_u(", tag_str, ", \"", cname, "\", ",
     int_to_string(n), ", ", int_to_string(mask), ", _trmc_sl); ",
     "_kai_acc = kai_cctx_extend_linear(_kai_acc, _trmc_node, ",
     "kai_field_addr_create(&_trmc_node->as.var.slots[", int_to_string(holeslot), "].ptr)); ",

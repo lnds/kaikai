@@ -453,7 +453,11 @@ static inline int kai_is_ptr(KaiValue *v) {
  * kk_smallint_from_integer (integer.h:206-215). Arithmetic >> keeps
  * the sign. */
 static inline KaiValue *kai_tagged_int(int64_t n) {
-    return (KaiValue *) ((((intptr_t) n) << 1) | KAI_INT_TAG_BIT);
+    /* Shift through uintptr_t: a signed left shift of a negative value
+     * is C UB (-fsanitize=undefined trips on it). The bit pattern is
+     * identical to the two's-complement signed shift, and kai_untag_int
+     * uses an arithmetic `>>` to restore the sign. */
+    return (KaiValue *) ((((uintptr_t) n) << 1) | (uintptr_t) KAI_INT_TAG_BIT);
 }
 static inline int64_t kai_untag_int(KaiValue *v) {
     return ((intptr_t) v) >> 1;
@@ -3055,6 +3059,11 @@ static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
  * arena, or already on the RC heap). */
 static KaiValue *kai_deep_copy_out(KaiValue *v) {
     if (!v) return v;
+    /* Koka tagged-Int: an immediate small Int has no heap header, so
+     * `v->tag` would dereference a fake pointer. It is shared-nothing
+     * by construction — copy-out returns it verbatim (incref is a
+     * no-op for immediates, matching the default branch). */
+    if (kai_is_value(v)) return v;
     switch ((KaiTag) v->tag) {
         case KAI_CONS: {
             KaiValue *h = kai_deep_copy_out(v->as.cons.head);
@@ -3668,6 +3677,13 @@ static KaiValue *kai_list_to_string(KaiValue *v) {
 static KaiValue *kai_to_string(KaiValue *v) {
     if (!v) return kai_str("<null>");
     char buf[64];
+    /* Koka tagged-Int: a small Int is an immediate, not a heap value —
+     * `v->tag` would dereference the fake pointer and crash. Render it
+     * as the decoded integer before touching the header. */
+    if (kai_is_value(v)) {
+        snprintf(buf, sizeof(buf), "%lld", (long long) kai_intf(v));
+        return kai_str(buf);
+    }
     switch ((KaiTag) v->tag) {
         case KAI_UNIT: return kai_str("()");
         case KAI_BOOL: return kai_str(v->as.b ? "true" : "false");
@@ -6066,7 +6082,10 @@ KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_string, kai_arbitrary_string)
 
 static KaiValue *kai_shrink_int(KaiValue *v) {
     if (!kai_is_int(v)) return NULL;
-    int64_t x = v->as.i;
+    /* `v` may be a Koka-style tagged immediate (small Int) OR a heap
+       KAI_INT, so read through kai_intf — a raw `v->as.i` deref would
+       segv on the immediate (which has no header). */
+    int64_t x = kai_intf(v);
     if (x == 0) return NULL;
     /* Halve toward zero. Integer division on negatives in C is
        truncation toward zero (C99 §6.5.5/6), so x/2 already does the
