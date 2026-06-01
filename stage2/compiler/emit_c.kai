@@ -9121,12 +9121,137 @@ pub fn dump_mono_out(file: String, decls: [Decl]) : Int / Console + File {
 fn tcrec_has_tail_self_call(body: Expr, nm: String, arity: Int) : Bool =
   tcrec_walk_tail(body.kind, nm, arity, [])
 
+# ---- TRMC (tail-recursion-modulo-cons) recognition -----------------
+#
+# Port of Koka's hasCTailCall/hasCTailCallArg (Core/CTail.hs:193-227).
+# A modulo-cons site is a constructor application in tail position
+# exactly ONE of whose argument slots is a direct self-call (the
+# recursion "modulo" the constructor), with every other slot a total
+# (effect-free, self-call-free) expression.
+#
+# `tcrec_ctor_modcons_slot(xs, nm, arity)` returns Some(i) where `i`
+# is the slot index carrying the self-call, else None. The slot
+# becomes the cctx hole; the constructor is built with a hole there,
+# the cctx is extended to point at it, and the loop variable rebinds
+# to the self-call's arguments (the TRMC goto).
+#
+# v1 restrictions (conservative, mirror Koka's affine path):
+#   - exactly one slot is the self-call (single-recursive modulo-cons);
+#   - the self-call is a direct `nm(...)` with matching arity;
+#   - every other slot is self-call-free (checked by
+#     `tcrec_expr_has_self_call`). Koka additionally requires the other
+#     args be `isTotal`; kaikai's match/if guards already ran, and the
+#     ctor args here are simple binders/primitives, so self-call-free
+#     is the load-bearing predicate. Nested-ctor modulo-cons (Koka's
+#     recurse-into-other-con case) is DEFERRED — not needed for rb-tree.
+fn tcrec_ctor_modcons_slot(xs: [Expr], nm: String, arity: Int) : Option[Int] =
+  tcrec_ctor_modcons_scan(xs, nm, arity, 0, None)
+
+fn tcrec_ctor_modcons_scan(xs: [Expr], nm: String, arity: Int, i: Int,
+                           found: Option[Int]) : Option[Int] {
+  match xs {
+    [] -> found
+    [a, ...rest] -> {
+      if tcrec_is_direct_self_call(a, nm, arity) {
+        # A second self-call slot disqualifies (not single-recursive).
+        match found {
+          Some(_) -> None
+          None    -> tcrec_ctor_modcons_scan(rest, nm, arity, i + 1, Some(i))
+        }
+      } else if tcrec_expr_has_self_call(a, nm, arity) {
+        # Self-call buried inside a non-modulo-cons position (e.g. an
+        # argument to a regular fn nested in this slot) → not a clean
+        # modulo-cons site; bail.
+        None
+      } else {
+        tcrec_ctor_modcons_scan(rest, nm, arity, i + 1, found)
+      }
+    }
+  }
+}
+
+fn tcrec_is_direct_self_call(e: Expr, nm: String, arity: Int) : Bool =
+  match e.kind {
+    ECall(f, xs) -> match f.kind {
+      EVar(callee)        -> callee == nm and list_length(xs) == arity
+      EModCall(_, callee) -> callee == nm and list_length(xs) == arity
+      _ -> false
+    }
+    _ -> false
+  }
+
+# Does `e` contain a self-call to `nm` anywhere (any position)? Used to
+# reject ctor slots (other than the modulo-cons one) that hide a
+# recursion the TRMC rewrite would otherwise drop.
+fn tcrec_expr_has_self_call(e: Expr, nm: String, arity: Int) : Bool =
+  match e.kind {
+    EVar(_)             -> false
+    EInt(_)             -> false
+    EReal(_)            -> false
+    EStr(_, _)          -> false
+    EBool(_)            -> false
+    EChar(_)            -> false
+    EUnit               -> false
+    EUnder              -> false
+    ECall(f, xs) -> {
+      let here = match f.kind {
+        EVar(callee)        -> callee == nm and list_length(xs) == arity
+        EModCall(_, callee) -> callee == nm and list_length(xs) == arity
+        _ -> false
+      }
+      here or tcrec_any_has_self_call(xs, nm, arity) or tcrec_expr_has_self_call(f, nm, arity)
+    }
+    EBinop(_, a, b)     -> tcrec_expr_has_self_call(a, nm, arity) or tcrec_expr_has_self_call(b, nm, arity)
+    EUnop(_, a)         -> tcrec_expr_has_self_call(a, nm, arity)
+    EIf(c, t, oe)       -> tcrec_expr_has_self_call(c, nm, arity) or tcrec_expr_has_self_call(t, nm, arity) or (match oe { Some(x) -> tcrec_expr_has_self_call(x, nm, arity) None -> false })
+    EBlock(stmts, ot)   -> tcrec_stmts_have_self_call(stmts, nm, arity) or (match ot { Some(x) -> tcrec_expr_has_self_call(x, nm, arity) None -> false })
+    EMatch(s, arms)     -> tcrec_expr_has_self_call(s, nm, arity) or tcrec_arms_have_self_call(arms, nm, arity)
+    EField(a, _)        -> tcrec_expr_has_self_call(a, nm, arity)
+    EIndex(a, b)        -> tcrec_expr_has_self_call(a, nm, arity) or tcrec_expr_has_self_call(b, nm, arity)
+    EIntrinsic(_, xs)   -> tcrec_any_has_self_call(xs, nm, arity)
+    _                   -> true   # conservative: unknown shape may hide a self-call
+  }
+
+fn tcrec_any_has_self_call(xs: [Expr], nm: String, arity: Int) : Bool =
+  match xs {
+    [] -> false
+    [a, ...rest] -> tcrec_expr_has_self_call(a, nm, arity) or tcrec_any_has_self_call(rest, nm, arity)
+  }
+
+fn tcrec_stmts_have_self_call(stmts: [Stmt], nm: String, arity: Int) : Bool =
+  match stmts {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, rhs)      -> tcrec_expr_has_self_call(rhs, nm, arity)
+        SExprStmt(e)         -> tcrec_expr_has_self_call(e, nm, arity)
+        _ -> false
+      }
+      here or tcrec_stmts_have_self_call(rest, nm, arity)
+    }
+  }
+
+fn tcrec_arms_have_self_call(arms: [Arm], nm: String, arity: Int) : Bool =
+  match arms {
+    [] -> false
+    [Arm(_, _, body), ...rest] -> tcrec_expr_has_self_call(body, nm, arity) or tcrec_arms_have_self_call(rest, nm, arity)
+  }
+
 fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, scope: [String]) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
         if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
           true
+        } else if name_first_is_upper(callee) and not list_has(scope, nm) {
+          # TRMC: a constructor application in tail position with a
+          # self-call in exactly one slot is modulo-cons-eligible.
+          match tcrec_ctor_modcons_slot(xs, nm, arity) { Some(_) -> true None -> false }
+        } else { false }
+      EModCall(_, callee) ->
+        if name_first_is_upper(callee) and not list_has(scope, nm) {
+          # Resolver qualifies user ctors as EModCall(tycon, Ctor).
+          match tcrec_ctor_modcons_slot(xs, nm, arity) { Some(_) -> true None -> false }
         } else { false }
       _ -> false
     }
