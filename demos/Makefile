@@ -25,7 +25,13 @@ KAIC2     := ../stage2/kaic2
 CORE_PRELUDES :=
 PRELUDES  :=
 STDLIB    := ../stdlib
-RT_INC    := -I ../stage0
+# These demos are built by kaic2 (stage 2), whose emitted C uses the
+# stage-2 runtime (Koka tagged-Int, kai_intf, reuse-token, borrow).
+# Resolve `#include "runtime.h"` to stage2/runtime.h — `-I ../stage2`
+# first, `-I ../stage0` kept after for any stage0-only headers. Without
+# this, kaic2-emitted `kai_intf(...)` is undeclared against the old
+# stage0/runtime.h.
+RT_INC    := -I ../stage2 -I ../stage0
 CC        := cc
 CFLAGS    := -std=c99 -O2 -Wno-unused-function -Wno-unused-variable -DKAI_STDLIB_PATH=\"$(abspath ../stdlib)\"
 # issue #343 — math/real libm bindings live in stage0/runtime.h.
