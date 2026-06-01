@@ -107,6 +107,68 @@ Coverage gap: no fixture yet exercises a minimal modulo-cons TRMC fn
 with a leaked==0 gate, because the donate is reverted (fresh-alloc
 leaks the spine cell). That fixture lands with the donate fix.
 
+## Mixed-signature Int unboxing — implemented end-to-end, parked in stash
+
+The session went on to attack the Int-boxing floor directly (the lever
+the diagnosis named). The mixed-signature unboxing — let a fn with some
+boxed and some unboxable params pass the unboxable ones as native i64,
+exactly Koka's `trmc_ins(tree t, int32_t k, bool v)` ABI — was
+implemented across every touch point and **compiles the rb-tree
+correctly** (`insert_loop` emits `KaiValue* kai_t, int64_t kair_k,
+int64_t kair_v`, size=1M/height=29). The work is in `git stash@{0}` on
+this branch ("WIP mixed-signature Int unboxing"). What landed there:
+
+- `fnreg.kai classify_unbox_sig`: accept mixed (`some_param_unboxable` +
+  no lambda), record per-param Ty in `US`. Crucial unblock: the
+  `body_is_effectful` `EModCall(_, name) -> true` arm was a false
+  positive for qualified constructors (`RBTree.RBNode`); split by casing
+  (effect ops lowercase, ctors uppercase) — without it every pure fn with
+  a qualified ctor was disqualified. Excluded `__proto_*` / `__pimpl_*`
+  (protocol glue uses fixed boxed fn-pointer casts a raw param mismatches).
+- `unbox.kai ufn_param_env`: a boxed param stays MBoxed (reads `kai_<n>`),
+  an unboxable param is MUnboxed (reads `kair_<n>`).
+- `emit_c.kai`: `emit_param_list_unboxed_each` (kai_/kair_ per param),
+  `raw_c_type` → `KaiValue *` for boxed, `emit_call_args_mixed` (per-arg
+  marshalling at call sites — both boxed-context and raw-context UFn
+  calls), `emit_fn_thunk` (per-param unbox + boxed-vs-raw return), the
+  TCO goto raw path (`tcrec_emit_drops_mixed` / `tcrec_emit_rebinds_raw`
+  with per-param prefix + boxed-return dead-tail), `emit_trmc_step`
+  rebind, and the boxed-return body emit in `emit_fn_body`.
+
+**Why it is parked, not shipped (two honest blockers):**
+
+1. **Selfhost breaks at runtime.** The emitted C compiles, but `kaic2b`
+   (the compiler compiled by the mixed-sig kaic2) crashes compiling its
+   own source with `field access on non-record`. The global mixed-sig
+   reclassified many compiler fns; one ABI path is uncovered — a boxed
+   param reaching a `.field` access where the new raw ABI passed a
+   scalar (or vice-versa). Needs the offending fn bisected; likely one
+   more call/return path (closure capture? higher-order?) to marshal, or
+   a tighter eligibility gate that excludes the compiler's own shapes.
+
+2. **The wall did not move even on the rb-tree (~2.1s, ~8.5×C).**
+   Signature unboxing ALONE is inert on the clock: `insert_loop`'s body
+   still emits `kai_op_lt(kai_int(slots[2].i64), boxed_k)` because the
+   match binder `kx` (a variant Int SLOT) is still read as
+   `kai_int(slots[2].i64)` (boxed) — `emit_pat_binds_variant` (emit_c.kai
+   ~2687) re-boxes every Int slot, so `decide_mode_aware`'s `op_is_raw_cmp`
+   path (unbox.kai:503) sees a boxed operand and keeps `<` boxed. The
+   COMPLEMENTARY change — **variant Int-slot unbox-on-read** (read
+   `slots[2].i64` as a raw `int64_t kair_kx`, mark the binder MUnboxed) —
+   is required for the compare to lower to native C `<` and the
+   `kai_int`/`kai_op_lt`/`kai_bool` churn to vanish. Per project memory
+   [[project_kaikai_1b1_native_bind_unbox_one_change]] and
+   [[project_kaikai_variant_int_field_unbox_lane]]: native-bind +
+   unbox-on-read must be ONE change (bind-site alone regressed +60%
+   historically). Signature unboxing is now the prerequisite that memory
+   named; the slot-read is the second half, gated on `leaked==0` with
+   random keys outside the small-int cache.
+
+Next-lane order: (a) bisect the selfhost field-access crash (or narrow
+eligibility to non-compiler shapes), (b) land variant Int-slot
+unbox-on-read so the compare goes raw, (c) measure — only then does the
+wall move toward Koka's 0.28×C.
+
 ## Follow-ups for the next lane (the real path to 1×C)
 
 1. **Int-in-slot unboxing of RBNode key/value (the dominant lever).**
