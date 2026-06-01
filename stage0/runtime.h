@@ -3244,6 +3244,92 @@ static KaiValue *kai_reuse_or_alloc_variant(KaiValue *_scr,
     return kai_variant_u(tag, name, n, mask, slots);
 }
 
+/* ---------- TRMC constructor-context (port of Koka types-cctx.h) ----------
+ *
+ * Tail-Recursion-Modulo-Cons. Direct port of Koka's
+ * `lib/std/core/inline/types-cctx.h` (Leijen & Lorenzen, "Tail Recursion
+ * Modulo Context", POPL'22). A recursive spine-rebuild whose tail
+ * expression is `Ctor(.., recur(child), ..)` is rewritten into a
+ * `goto`-loop carrying a *constructor context* (`KaiCctx`): the partially
+ * built result `res` plus a pointer `holeptr` to the open field where the
+ * next node attaches. Each loop iteration builds one node with a HOLE in
+ * the recursive slot, extends the cctx to point at that hole, and rebinds
+ * the loop variable to the child — O(1) stack, perfect spine reuse when
+ * the consumed cell is unique.
+ *
+ * kaikai difference from Koka: kaikai's holeptr points into the SEPARATE
+ * `slots[]` array (`&node->as.var.slots[i].ptr`), not an inline field of
+ * the block. The array stays alive and stable for the node's lifetime
+ * (kai_variant_at overwrites in place; the fresh-alloc branch allocates a
+ * fresh stable array), so the hole address never dangles. Koka's
+ * unique-check is rc==0; kaikai's is rc==1 (see kai_check_unique).
+ *
+ * The `_linear` variants are what the compiler emits for affine effect
+ * rows (the rb-tree's effect is total/affine). They assume `acc.res` is
+ * unique — which TRMC guarantees because every node on the spine was just
+ * built (or reused) by this loop and is held only by the cctx. Non-affine
+ * (multi-resume) fns are NOT recognised by the TRMC pass; they fall back
+ * to ordinary recursion, so the non-linear cctx path is not needed yet.
+ */
+typedef KaiValue **KaiFieldAddr;                  /* &node->as.var.slots[i].ptr */
+typedef struct { KaiValue *res; KaiFieldAddr holeptr; } KaiCctx;
+
+static inline KaiFieldAddr kai_field_addr_create(KaiValue **p) { return p; }
+
+static inline KaiCctx kai_cctx_empty(void) { KaiCctx c = { NULL, NULL }; return c; }
+
+/* apply_linear: plug `child` into the open hole, return the spine root.
+ * Empty cctx (first level) → the child IS the root. Mirrors Koka
+ * kk_cctx_apply_linear (types-cctx.h:66). */
+static inline KaiValue *kai_cctx_apply_linear(KaiCctx acc, KaiValue *child) {
+    if (acc.holeptr != NULL) { *acc.holeptr = child; return acc.res; }
+    return child;
+}
+
+/* extend_linear: plug `child` into the old hole, return a new cctx whose
+ * open hole is `field` (a slot inside `child`). Mirrors Koka
+ * kk_cctx_extend_linear (types-cctx.h:91). */
+static inline KaiCctx kai_cctx_extend_linear(KaiCctx acc, KaiValue *child,
+                                             KaiFieldAddr field) {
+    KaiCctx c;
+    c.res = kai_cctx_apply_linear(acc, child);
+    c.holeptr = field;
+    return c;
+}
+
+/* Reuse token (Koka kk_datatype_ptr_reuse). The caller has already proven
+ * `v` unique with kai_check_unique. Unlike kai_reuse_or_alloc_variant,
+ * this does NOT decref the donor's children: the emitter MOVES them into
+ * the new node (the unique branch) or dups+decrefs explicitly (the shared
+ * branch), exactly as rbtree__koka.c:268-285. Returning the raw cell lets
+ * kai_variant_at overwrite it in place. */
+typedef KaiValue *KaiReuse;
+#define kai_reuse_null NULL
+static inline KaiReuse kai_ptr_reuse(KaiValue *v) { return v; }
+
+/* alloc-at: write a variant Ctor into a donated cell IN PLACE (no malloc),
+ * else fall back to a fresh alloc. Move semantics — does NOT decref the
+ * donor's old slots (they were extracted into locals and either moved into
+ * `slots[]` or dup'd by the emitter before donation). This is the correct
+ * embryo; kai_reuse_or_alloc_variant's eager-1:1-decref is NOT (it
+ * double-frees on non-bijective rebuilds — see lane memory). The donated
+ * cell already has the right slots[] array length (n_args >= n checked);
+ * we overwrite the slot words, retag, and reset rc=1. */
+static inline KaiValue *kai_variant_at(KaiReuse at, int32_t tag,
+                                       const char *name, int n, uint32_t mask,
+                                       KaiVarSlot *slots) {
+    if (at != NULL && at->tag == KAI_VARIANT && at->as.var.n_args == n) {
+        for (int i = 0; i < n; ++i) at->as.var.slots[i] = slots[i];
+        at->as.var.variant_tag = tag;
+        at->as.var.variant_name = name;
+        at->as.var.slot_mask = mask;
+        at->rc = 1;
+        kai_rc_reuse_total++;
+        return at;
+    }
+    return kai_variant_u(tag, name, n, mask, slots);
+}
+
 /* Allocate an array of `len` slots, each initialised to `init`
    (incref'd once per slot). Caller owns the returned array. */
 static KAI_RC_NOINLINE KaiValue *kai_array_make(int64_t len, KaiValue *init) {
