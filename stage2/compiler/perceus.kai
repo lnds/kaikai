@@ -583,10 +583,29 @@ fn pcs_try_reuse_arm(scr_ty: Option[Ty], pat: Pattern, body: Expr) : Expr {
     # with the same head name and tparams (equal `mangle_ty`); a
     # rebuild like `Some(d) -> Some(false)` over `Maybe[Int]`
     # produces `Maybe[Bool]` and is rejected.
-    PVariant(_cname, ps) ->
-      if pcs_shape_matches(scr_ty, body.ty) {
+    # The 1:1 reuse lowering (emit_match_arm_reuse_variant) only binds
+    # FLAT slot sub-patterns (PBind / PWild). A nested variant/list/
+    # record sub-pattern binds inner vars the reuse emit never declares,
+    # producing C that references undeclared `kai_<inner>` identifiers.
+    # Restrict reuse to arms whose slots are all flat; nested-pattern
+    # arms fall through to the fresh `kai_variant_u` allocator (a missed
+    # optimisation, not a miscompile).
+    # The reuse must also be DIAGONAL: each boxed slot of the rebuild
+    # must be exactly the binder of the same slot in the pattern. A
+    # rebuild that puts a fresh node, or another slot's binder, into a
+    # pointer slot orphans the old child (memory leak) — the 1:1 lowering
+    # transfers slots without dropping the old pointer. Unboxed slots
+    # (Int/Real/Bool) are copy-by-value with no RC, so any derived
+    # expression (`k + 1`) is safe. Non-diagonal arms fall through to the
+    # fresh allocator, which drops the old children correctly.
+    PVariant(_cname, ps) -> {
+      let flat_ok = pcs_all_flat_subs(ps)
+      let shape_ok = pcs_shape_matches(scr_ty, body.ty)
+      let diag_ok = pcs_reuse_is_diagonal(ps, body)
+      if flat_ok and shape_ok and diag_ok {
         pcs_try_reuse_variant(body, list_length(ps))
       } else { body }
+    }
     # Record rebuild — `{ a, b } -> Rec { a: f(a), b }`. Same shape
     # predicate as variants; field count must also match (already
     # enforced inside `pcs_try_reuse_record`).
@@ -687,6 +706,99 @@ fn pcs_name_is_ctor(nm: String) : Bool {
     None    -> false
   }
 }
+
+# A slot sub-pattern is "flat" if the reuse-in-place emit can bind it
+# without descending: a bare binder or a wildcard. Anything else
+# (nested variant / list / record / literal) binds inner names the
+# 1:1 reuse lowering does not declare, so such arms must not be
+# recognised as reusable.
+fn pcs_sub_is_flat(p: Pattern) : Bool =
+  match p.pkind {
+    PBind(_) -> true
+    PWild    -> true
+    _        -> false
+  }
+
+fn pcs_all_flat_subs(ps: [Pattern]) : Bool =
+  match ps {
+    []          -> true
+    [p, ...rest] -> if pcs_sub_is_flat(p) { pcs_all_flat_subs(rest) } else { false }
+  }
+
+# A variant slot is "unboxed" (copy-by-value, no RC) only for the kinds
+# the emitter inlines into the slot word: Int (.i64) and Real (.r). Bool,
+# Char, String, Byte are stored as BOXED pointers in the variant cell
+# (variant_slot_kind in emit_c.kai returns 0 for them), so overwriting
+# such a slot non-diagonally would orphan the old pointer. Keep this in
+# lockstep with `variant_slot_kind`.
+fn pcs_ty_is_unboxed(t: Option[Ty]) : Bool =
+  match t {
+    None -> false
+    Some(ty) -> match ty {
+      TyInt  -> true
+      TyReal -> true
+      _      -> false
+    }
+  }
+
+# Diagonal-reuse predicate. The arm rebuilds `C(e0, ..., en)` over the
+# pattern `C(p0, ..., pn)`. Reuse-in-place is leak-safe ONLY when, for
+# every slot i:
+#   - the slot is unboxed (copy-by-value, any `ei` is fine), OR
+#   - `ei` is exactly the binder of `pi` (strict identity — the same
+#     child stays in the same slot; no pointer is orphaned and the
+#     borrowed alias is not consumed, avoiding both leak and UAF).
+# A boxed slot whose rebuild expression is a fresh ctor, another slot's
+# binder, or a consuming call `g(pi)` is NON-diagonal and must fall
+# through to the fresh allocator.
+fn pcs_reuse_is_diagonal(ps: [Pattern], body: Expr) : Bool =
+  match pcs_ctor_args(body) {
+    None       -> false
+    Some(cargs) ->
+      if list_length(cargs) == list_length(ps) {
+        pcs_diag_slots(ps, cargs)
+      } else { false }
+  }
+
+# Pull the constructor argument list out of a rebuild body, accepting
+# both the bare `EVar(C)` and resolved `EModCall(mod, C)` callee shapes.
+# NB: the binder must NOT be named `args` — that shadows against the
+# prelude `args()` fn and silently resolves to an empty list (stage1
+# shadow bug). Use `cargs`.
+fn pcs_ctor_args(body: Expr) : Option[[Expr]] =
+  match body.kind {
+    ECall(callee, cargs) -> match callee.kind {
+      EVar(_)        -> Some(cargs)
+      EModCall(_, _) -> Some(cargs)
+      _              -> None
+    }
+    _ -> None
+  }
+
+fn pcs_diag_slots(ps: [Pattern], cargs: [Expr]) : Bool =
+  match ps {
+    [] -> true
+    [p, ...prest] -> match cargs {
+      [] -> true
+      [a, ...arest] ->
+        if pcs_slot_is_diagonal(p, a) { pcs_diag_slots(prest, arest) }
+        else { false }
+    }
+  }
+
+# One slot is diagonal if its rebuild value is unboxed (copy-by-value),
+# or it is exactly the binder of the slot pattern.
+fn pcs_slot_is_diagonal(p: Pattern, a: Expr) : Bool =
+  if pcs_ty_is_unboxed(a.ty) { true }
+  else {
+    match p.pkind {
+      PBind(bn) -> match a.kind {
+        EVar(an) -> an == bn
+        _        -> false
+      }
+      _ -> false
+    }
+  }
 
 fn pcs_try_reuse_record(body: Expr, expected_n: Int) : Expr {
   match body.kind {

@@ -4145,6 +4145,8 @@ PERCEUS_ISSUE118_FIXTURES := reuse_cons_basic reuse_alias_aborts \
                               reuse_pass_ordering reuse_record_basic \
                               reuse_variant_basic \
                               reuse_variant_no_misfire \
+                              reuse_nested_subpattern \
+                              reuse_diagonal_guard \
                               tco_double_incref_repro \
                               nullary_variant_singleton
 
