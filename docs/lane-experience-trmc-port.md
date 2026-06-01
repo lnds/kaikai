@@ -135,39 +135,62 @@ this branch ("WIP mixed-signature Int unboxing"). What landed there:
   with per-param prefix + boxed-return dead-tail), `emit_trmc_step`
   rebind, and the boxed-return body emit in `emit_fn_body`.
 
-**Why it is parked, not shipped (two honest blockers):**
+**Variant Int-slot unbox-on-read — ALSO implemented this session** (in
+the same stash). The complementary half: read a variant's Int/Real slot
+as a raw scalar (`int64_t kair_kx = scr->...slots[i].i64`) instead of
+`kai_int(...)`, and mark the binder MUnboxed so the body's compare
+lowers to native C. What landed:
 
-1. **Selfhost breaks at runtime.** The emitted C compiles, but `kaic2b`
-   (the compiler compiled by the mixed-sig kaic2) crashes compiling its
-   own source with `field access on non-record`. The global mixed-sig
-   reclassified many compiler fns; one ABI path is uncovered — a boxed
-   param reaching a `.field` access where the new raw ABI passed a
-   scalar (or vice-versa). Needs the offending fn bisected; likely one
-   more call/return path (closure capture? higher-order?) to marshal, or
-   a tighter eligibility gate that excludes the compiler's own shapes.
+- `emit_c.kai emit_pat_binds_variant`: a PBind sub-pattern over an Int/
+  Real slot emits `int64_t kair_<n> = slots[i].i64` (raw), not the boxed
+  `kai_int(...)` temp. Nested-variant sub-patterns descend (balance_left's
+  `RBNode(_, RBNode(Red,lx,kx,..),..)`).
+- `unbox.kai`: `collect_vctor_tys` builds a ctor→[Ty] map from DType
+  TBSum decls (threaded `vts` through the whole unbox walk —
+  `unbox_decl`/`unbox_expr_aware`/`unbox_kind_aware`/`unbox_arm_with_scr_aware`,
+  ~12 fns). `unbox_variant_slot_env` marks each Int/Real-slot binder
+  MUnboxed (recursive into nested PVariant). `decide_mode_aware` now
+  consults the env FIRST for an EVar (before the `not ty_is_unboxable`
+  short-circuit) — a binder marked MUnboxed is raw regardless of the
+  node's resolved `.ty` (the typer leaves some ctor-arg EVar tys
+  un-propagated).
+- `perceus.kai pcs_rewrite_kind`: preserve the EVar's `.mode` on the node
+  wrapped in `__perceus_dup` (was hard-coded MUnknown).
+- `emit_c.kai __perceus_dup` lowering: a dup over an MUnboxed operand is
+  a NO-OP (emit the raw value) — raw scalars carry no RC.
 
-2. **The wall did not move even on the rb-tree (~2.1s, ~8.5×C).**
-   Signature unboxing ALONE is inert on the clock: `insert_loop`'s body
-   still emits `kai_op_lt(kai_int(slots[2].i64), boxed_k)` because the
-   match binder `kx` (a variant Int SLOT) is still read as
-   `kai_int(slots[2].i64)` (boxed) — `emit_pat_binds_variant` (emit_c.kai
-   ~2687) re-boxes every Int slot, so `decide_mode_aware`'s `op_is_raw_cmp`
-   path (unbox.kai:503) sees a boxed operand and keeps `<` boxed. The
-   COMPLEMENTARY change — **variant Int-slot unbox-on-read** (read
-   `slots[2].i64` as a raw `int64_t kair_kx`, mark the binder MUnboxed) —
-   is required for the compare to lower to native C `<` and the
-   `kai_int`/`kai_op_lt`/`kai_bool` churn to vanish. Per project memory
-   [[project_kaikai_1b1_native_bind_unbox_one_change]] and
-   [[project_kaikai_variant_int_field_unbox_lane]]: native-bind +
-   unbox-on-read must be ONE change (bind-site alone regressed +60%
-   historically). Signature unboxing is now the prerequisite that memory
-   named; the slot-read is the second half, gated on `leaked==0` with
-   random keys outside the small-int cache.
+**RESULT: the main compare lowers to native C `kair_k < kair_kx`** (no
+kai_op_lt, no kai_int, no kai_bool) — measured in the emitted insert_loop.
+This is the Koka mechanism working.
 
-Next-lane order: (a) bisect the selfhost field-access crash (or narrow
-eligibility to non-compiler shapes), (b) land variant Int-slot
-unbox-on-read so the compare goes raw, (c) measure — only then does the
-wall move toward Koka's 0.28×C.
+**Two remaining blockers (both precise, both next-lane):**
+
+1. **The LAST ESLABÓN — 19 cc errors in `balance_left`/`balance_right`.**
+   All the same shape: `use of undeclared identifier 'kai_kx'` (also ky/
+   vx/vy). The slot binder IS marked MUnboxed (debug `SLOTBIND kx raw=Y`
+   confirms), the compare uses `kair_kx`, BUT one use of `kx` — as a
+   ctor argument wrapped in `__perceus_dup` and fed to a NEW node's Int
+   slot — still emits `kai_int((kai_internal_dup(kai_kx))->as.i)`, i.e.
+   that specific EVar node kept mode MBoxed despite kx being MUnboxed in
+   the arm env. The dup-noop + perceus mode-preserve fixes did NOT reach
+   it, so the EVar's `.mode` at that position is genuinely MBoxed.
+   NEXT STEP: dump the post-unbox AST mode of the ctor-arg `kx` in
+   balance_left to find why `decide_mode_aware` (or `ufn_promote_calls`)
+   leaves it MBoxed when the arm env has kx→MUnboxed. Likely the
+   ctor-arg is processed with an env that lost the slot binding, or
+   `ufn_promote_calls` runs and resets it. Confined to fns that re-use a
+   matched Int slot in a freshly-built node (balance rotations);
+   insert_loop itself is clean (compare native, compiles).
+
+2. **Selfhost (still open from the signature half).** The global mixed-
+   sig reclassifies compiler fns; `kaic2b` crashed at runtime with
+   `field access on non-record`. Bisect or narrow eligibility (e.g. add
+   a no-higher-order-call gate) so it excludes the compiler shapes while
+   keeping insert_loop/balance.
+
+Next-lane order: (a) fix blocker 1 (one AST-mode dump away), (b) fix
+blocker 2 selfhost, (c) measure the wall — the native compare should
+collapse the ~60% Int allocs and move the clock toward Koka's 0.28×C.
 
 ## Follow-ups for the next lane (the real path to 1×C)
 
