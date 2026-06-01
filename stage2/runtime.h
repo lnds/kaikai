@@ -3181,7 +3181,7 @@ static int kai_check_unique(KaiValue *v) {
      * fires on KAI_CONS / KAI_RECORD / KAI_VARIANT, none of which
      * are pooled today, so the singleton check is defensive but
      * cheap and keeps the predicate honest. */
-    return v != NULL && v->rc == 1 && v->rc != INT32_MAX;
+    return v != NULL && !kai_is_value(v) && v->rc == 1 && v->rc != INT32_MAX;
 }
 
 static KaiValue *kai_reuse_or_alloc_cons(KaiValue *_scr,
@@ -3367,6 +3367,37 @@ static inline KaiValue *kai_variant_at(KaiReuse at, int32_t tag,
         at->rc = 1;
         kai_rc_reuse_total++;
         return at;
+    }
+    return kai_variant_u(tag, name, n, mask, slots);
+}
+
+/* TRMC reuse-in-place (Koka kk_block_drop_reuse + kk_block_alloc_at,
+ * fused for the TRMC modulo-cons site). `_scr` is the variant cell the
+ * enclosing `match` arm just consumed. When it is UNIQUE and has the
+ * target arity, donate it as the storage for the rebuilt node:
+ * overwrite the slot words (MOVE semantics — the arm already extracted
+ * the donor's children into locals via kai_incref, so we must NOT
+ * decref them), retag, and `incref` the cell so it survives the
+ * `kai_decref(_scr)` the match emits at arm exit (net rc after exit:
+ * 1, a unique freshly-built node — exactly the kai_reuse_or_alloc_cons
+ * discipline). When `_scr` is shared or wrong-arity, allocate a fresh
+ * node and leave `_scr` for the match exit to reclaim normally.
+ *
+ * This is what collapses the rb-tree's RBNode rebuild churn: each
+ * insert reuses the cells it walked instead of paired free+alloc,
+ * approaching Koka's in-place cost. Koka's unique gate is rc==0;
+ * kaikai's is rc==1 (kai_check_unique). */
+static inline KaiValue *kai_variant_reuse_at(KaiValue *_scr, int32_t tag,
+                                             const char *name, int n,
+                                             uint32_t mask, KaiVarSlot *slots) {
+    if (_scr != NULL && !kai_is_value(_scr) && _scr->tag == KAI_VARIANT &&
+        _scr->as.var.n_args == n && kai_check_unique(_scr)) {
+        for (int i = 0; i < n; ++i) _scr->as.var.slots[i] = slots[i];
+        _scr->as.var.variant_tag = tag;
+        _scr->as.var.variant_name = name;
+        _scr->as.var.slot_mask = mask;
+        kai_rc_reuse_total++;
+        return kai_incref(_scr);   /* survive the match-exit kai_decref(_scr) */
     }
     return kai_variant_u(tag, name, n, mask, slots);
 }
