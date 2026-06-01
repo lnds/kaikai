@@ -52,7 +52,15 @@ BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/l
 # loader inside kaic2 can find core/*.kai, protocols.kai,
 # effects.kai, array.kai without any --prelude flag at runtime.
 STDLIB_ABS := $(abspath ../stdlib)
-CPPFLAGS_CORE := -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
+# Stage 2 has its OWN runtime.h (stage2/runtime.h) carrying the Koka
+# tagged-Int value representation + reuse-token Perceus. The `-I .`
+# comes first so the generated C's `#include "runtime.h"` resolves to
+# stage2/runtime.h, while the trailing `-I ../stage0` on each compile
+# line still supplies any stage0 headers. Stage 0 and stage 1 keep
+# their original heap-everything runtime untouched — the new
+# representation is isolated to the self-hosted compiler that builds
+# the real programs (and the rb-tree benchmark).
+CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 
 # Issue #42 closure (2026-05-01): the recursive lex_loop / parse_*
 # inside kaic1 / kaic2 used to need a 32-64 MB stack bump to handle
