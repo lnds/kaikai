@@ -4326,18 +4326,41 @@ fn box_wrap(opt_ty: Option[Ty], raw: String) : String {
 # C; `/` and `%` are excluded (their overflow is not contractually a
 # wrap, and div-by-INT64_MIN is a separate concern) and Real `+`/`-`/`*`
 # are excluded by the TyInt gate. See the EBinop arm in emit_kind_raw.
+# True iff the optional type is Int (or an Int newtype/refinement). Shared
+# by the wrapping-arith gate and the direct-Int-comparison fast path.
+fn ty_opt_is_int(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> match t {
+    TyInt -> true
+    TyDimT(inner, _)    -> match inner { TyInt -> true _ -> false }
+    TyRefineT(inner, _) -> match inner { TyInt -> true _ -> false }
+    _ -> false
+  }
+  None -> false
+}
+
 fn raw_arith_is_wrapping_int(op: String, opt_ty: Option[Ty]) : Bool {
   let is_wrap_op = op == "+" or op == "-" or op == "*"
-  let is_int = match opt_ty {
-    Some(t) -> match t {
-      TyInt -> true
-      TyDimT(inner, _)    -> match inner { TyInt -> true _ -> false }
-      TyRefineT(inner, _) -> match inner { TyInt -> true _ -> false }
-      _ -> false
-    }
-    None -> false
-  }
-  is_wrap_op and is_int
+  is_wrap_op and ty_opt_is_int(opt_ty)
+}
+
+# C operator for an order-comparison op, when both operands are Int and the
+# comparison can lower to a direct `kai_intf(a) <op> kai_intf(b)` instead of
+# the boxed kai_op_lt/gt/le/ge dispatch (type-test + boxed-bool + truthy +
+# decref). Only the four ORDER comparisons — `==`/`!=` keep structural
+# semantics (Eq dispatch) and are not lowered here.
+fn int_cmp_c_op(op: String) : Option[String] {
+  if op == "<"       { Some("<") }
+  else if op == ">"  { Some(">") }
+  else if op == "<=" { Some("<=") }
+  else if op == ">=" { Some(">=") }
+  else { None }
+}
+
+# Gate for the direct-Int-comparison fast path: an order comparison whose
+# both operands are statically Int.
+fn is_int_order_cmp(op: String, a: Expr, b: Expr) : Bool {
+  let is_cmp = match int_cmp_c_op(op) { Some(_) -> true None -> false }
+  is_cmp and ty_opt_is_int(a.ty) and ty_opt_is_int(b.ty)
 }
 
 fn unbox_field_for(opt_ty: Option[Ty]) : String {
@@ -4677,6 +4700,22 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
           helper, "(",
           emit_expr(src, a, cx), ", ",
           emit_expr(src, b, cx), ")"
+        ])
+      } else if is_int_order_cmp(op, a, b) {
+        # Direct Int order-comparison: both operands are Int, so skip the
+        # boxed kai_op_lt/gt/le/ge (type-dispatch + boxed bool + truthy +
+        # decref) and compare the unboxed values inline. The boxed
+        # dispatch CONSUMED both operands, so we must too: capture each in
+        # a local, read it with kai_take_int (which decrefs a heap Int and
+        # is a no-op on a tagged immediate), then compare the raw scalars.
+        # Sound for both immediate and bigint operands; on the rb-tree hot
+        # path (immediate keys) the takes are free and ~40M boxed-dispatch
+        # round-trips disappear.
+        let c_op = match int_cmp_c_op(op) { Some(o) -> o None -> "<" }
+        concat_all([
+          "({ int64_t _la = kai_take_int(", emit_expr(src, a, cx),
+          "); int64_t _lb = kai_take_int(", emit_expr(src, b, cx),
+          "); kai_bool(_la ", c_op, " _lb); })"
         ])
       } else {
         match binop_cname(op) {
