@@ -3011,8 +3011,21 @@ fn arm_apply_is_ctor(xs: [Expr]) : Bool = match xs {
 }
 
 fn try_arm_top_reuse(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse] {
+  # The Koka borrow-bind + is_unique-gated dispose model coordinates the move
+  # of a deconstructed child: bind borrow (no incref); decide once at the arm
+  # top — unique → steal the shell as a reuse-token (children move raw);
+  # shared → dup kept children + non-recursive decref. The token is consumed
+  # by a downstream kai_variant_at (TRMC step) or freed (kai_reuse_free).
+  #
+  # Eligibility is the TRMC body (the shell-dispose machinery — acc_decl +
+  # the fn-wide `_arm_ru` slot — is wired only there) AND perceus having
+  # MOVED ≥1 ptr binder. Generalising the borrow model to *every*
+  # deconstructing arm is the right Koka shape (asu confirmed) but needs the
+  # acc_decl / `_arm_ru` plumbing lifted out of the TRMC-only path first; until
+  # then a non-TRMC arm keeps the legacy incref-bind path, and perceus must
+  # NOT mark its binders as moved (pcs_arm_eligible_for_move keeps the two in
+  # lock-step — moving a binder whose arm uses the legacy emit double-frees).
   if not trmc_body_has_step(body) { None }
-  else if not arm_all_tails_consume_token(body) { None }
   else {
     match pat.pkind {
       PVariant(cname, subs) -> match evar_payload_tys(cx.variants, cname) {
@@ -3139,11 +3152,34 @@ fn emit_arm_top_reuse(src: String, atr: ArmTopReuse, body: Expr,
       let borrow_binds = emit_arm_borrow_binds(src, subs, tys, 0, cx)
       let shared_dups  = arm_shared_dups(moved)
       let body_c = emit_expr(src, body, arm_cx)
+      # Linear reuse-token disposal (Koka ParcReuse): the token captured
+      # at the arm top is consumed by a `kai_variant_at(_arm_ru, ...)`
+      # TRMC step (which resets `_arm_ru = kai_reuse_null` then `goto`s out,
+      # never reaching this tail) OR — for a tail that does NOT host a
+      # same-size rebuild here (the balance arm: `balance_left(insert_loop(
+      # l,...), ..., r)` allocates its node inside balance_left's own frame,
+      # and the recolor `RBNode(Black, l, k, v, r)` apply that fresh-allocs)
+      # — it survives unconsumed and MUST be dropped, else the stolen Black
+      # cell leaks. `kai_reuse_free` frees the cell only; the children were
+      # already moved into owned binders the body still uses. This replaces
+      # the old `arm_all_tails_consume_token` gate that rejected such arms.
       concat_all([
         borrow_binds,
         "KaiReuse _arm_ru = kai_drop_reuse_token(_scr, ", int_to_string(n), "); ",
         "if (_arm_ru == kai_reuse_null) { ", shared_dups, "} ",
-        "_r = ", body_c, "; "
+        # The token-steal consumed the shell's ownership (Koka: a cell that
+        # becomes a reuse-token is no longer a live RC value). Neutralise the
+        # match-exit `kai_decref(_scr)` so it does not double-dispose the cell
+        # we either rebuilt into (kai_variant_at) or freed (kai_reuse_free).
+        # In the SHARED branch kai_drop_reuse_token already did the
+        # non-recursive rc-- and returned null, so the shell needs no further
+        # decref either — nulling _scr is correct on both paths. The Red arm
+        # got away without this because every tail `goto`s out before the
+        # exit decref; the Black arm has a returning (balance) tail that
+        # reaches it.
+        "_scr = NULL; ",
+        "_r = ", body_c, "; ",
+        "if (_arm_ru != kai_reuse_null) { kai_reuse_free(_arm_ru); _arm_ru = kai_reuse_null; } "
       ])
     }
   }

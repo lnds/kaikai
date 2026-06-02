@@ -3425,6 +3425,29 @@ static inline KaiValue *kai_variant_at(KaiReuse at, int32_t tag,
     return kai_variant_u(tag, name, n, mask, slots);
 }
 
+/* Free a reuse-TOKEN whose children have already MOVED out (Koka
+ * kk_block_drop / ParcReuse's drop of an unconsumed `Available` cell).
+ * A reuse-token is captured at the arm top (kai_drop_reuse_token UNIQUE
+ * branch) WITHOUT touching its children — the borrow binds become the
+ * owners. When the arm body reaches a tail that does NOT host a
+ * kai_variant_at rebuild (e.g. `balance_left(insert_loop(l,...), ..., r)`
+ * — the call allocates its own node inside its own frame), the token is
+ * never consumed. ParcReuse treats the reuse-token as LINEAR: consumed by
+ * a Con@reuse, else dropped on the non-consuming path. This is that drop.
+ *
+ * CRITICAL: it must free ONLY the cell, never cascade into the children —
+ * those were stolen (no incref) into owned binders the body is still using
+ * (the rb-tree balance arm passes them to balance_left). We zero n_args so
+ * the KAI_VARIANT case of kai_free_value skips the slot decref loop, then
+ * route through the normal free path (poison / cell-pool / counters stay
+ * correct). A null token is a no-op (the shared branch returned null). */
+static inline void kai_reuse_free(KaiReuse at) {
+    if (at == NULL) return;
+    if (kai_is_value(at) || at->tag != KAI_VARIANT) return;
+    at->as.var.n_args = 0;     /* children already moved: do NOT cascade */
+    kai_free_value(at);
+}
+
 /* TRMC reuse-in-place (Koka kk_block_drop_reuse + kk_block_alloc_at,
  * fused for the TRMC modulo-cons site). `_scr` is the variant cell the
  * enclosing `match` arm just consumed. When it is UNIQUE and has the

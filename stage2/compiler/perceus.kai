@@ -377,7 +377,7 @@ pub fn perceus_pass(decls: [Decl]) : [Decl] / Console {
   map(decls, (d) => perceus_decl_b(d, fns, bmap))
 }
 
-type BorrowEntry = BE(String, [Int])
+pub type BorrowEntry = BE(String, [Int])
 
 fn pcs_build_borrow_map(decls: [Decl], acc: [BorrowEntry]) : [BorrowEntry] = match decls {
   []           -> acc
@@ -721,7 +721,7 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry]) : Decl / Console {
       # reclaim).
       else if prc_is_ufn_decl(fns, name, mo) {
         let uses = pcs_collect_uses_expr(body, [], false, [])
-        let new_body = pcs_rewrite_expr(body, [], uses, false, [], [])
+        let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap)
         let arm_dropped = pcs_arm_drop_pass(new_body, name, [], uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
         DFn(is_pub, name, tparams, params, opt_ret, row, reused_body, ln, cl, mo)
@@ -742,8 +742,20 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry]) : Decl / Console {
         # Issue #599 — branch-aware skip-set: params read <= 1 time per
         # path transfer ownership raw (no dup). Borrowed params join the
         # skip-set too (they are never dup'd) — union the two.
-        let skip_set = pcs_list_union(pcs_branch_aware_skip_params(pnames, body), borrowed)
-        let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, [])
+        # Plus the arm-binder per-path move set (Koka Parc per-branch
+        # ownership): pattern binders of SELF-RECURSIVE MODULO-CONS arms whose
+        # max-path count (borrow-aware, discounting is_red(l)) is <= 1,
+        # consumed-on-every-path, all-consumers-linear. Restricted to
+        # self-rec-modulo-cons arms because emit disposes only those via the
+        # borrow-model (arm-top reuse); a non-self-rec arm keeps the legacy
+        # emit and moving its binders would double-free (the regexp UAF). This
+        # is the half that lets insert_loop's Black arm move l/r instead of
+        # spuriously dup'ing them — the ~8.8-nodes-per-insert spine leak.
+        let arm_moves = pcs_collect_arm_skip_binders(name, body, bmap)
+        let skip_set = pcs_list_union(
+          pcs_list_union(pcs_branch_aware_skip_params(pnames, body), borrowed),
+          arm_moves)
+        let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, [], bmap)
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
         # Borrowed params carry no exit obligation — exclude from the
@@ -765,13 +777,13 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry]) : Decl / Console {
     # bindings.
     DTest(desc, body, ln, cl) -> {
       let uses = pcs_collect_uses_expr(body, [], false, [])
-      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [])
+      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap)
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DTest(desc, reused_body, ln, cl)
     }
     DBench(desc, body, ln, cl) -> {
       let uses = pcs_collect_uses_expr(body, [], false, [])
-      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [])
+      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap)
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DBench(desc, reused_body, ln, cl)
     }
@@ -796,7 +808,7 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry]) : Decl / Console {
       let pnames = map(ps, (p) => p.pname)
       let uses = pcs_collect_uses_expr(body, pnames, false, [])
       let skip_set = pcs_branch_aware_skip_params(pnames, body)
-      let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, pnames)
+      let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, pnames, bmap)
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DCheck(desc, ps, reused_body, ln, cl)
     }
@@ -1398,18 +1410,18 @@ fn pcs_collect_uses_interp_parts(parts: [IPart], scope: [String], in_lam: Bool,
 
 # ---- pcs_rewrite: wrap non-last in-scope EVar reads in __perceus_dup ----
 
-fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : Expr / Console =
+fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : Expr / Console =
 
-  Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam, skip_set, force_set),
+  Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam, skip_set, force_set, bmap),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
-                    uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : ExprKind / Console {
+                    uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : ExprKind / Console {
 
   match k {
     # The actual rewrite: wrap a non-last `EVar` use in `__perceus_dup`.
     EVar(nm) -> {
-      if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam, skip_set, force_set) {
+      if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam, skip_set, force_set, bmap) {
         ECall(
           Expr { kind: EVar("__perceus_dup"), line: line, col: col,
                  ty: None, mode: MUnknown },
@@ -1424,7 +1436,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     # the parsed Expr, then surgically rewrite the source by replacing
     # the wrapped ident tokens with `__perceus_dup(NAME)`. Result rounds
     # back through the parser at emit time as a normal ECall(__perceus_dup).
-    EStr(span, is_triple) -> EStr(pcs_rewrite_estr_span(span, is_triple, scope, uses, in_lam, skip_set, force_set), is_triple)
+    EStr(span, is_triple) -> EStr(pcs_rewrite_estr_span(span, is_triple, scope, uses, in_lam, skip_set, force_set, bmap), is_triple)
     # Scope-aware kinds: ELambda extends scope with params and flips
     # in_lam; EBlock threads scope through SLet/SVar bindings; EMatch
     # delegates to pcs_rewrite_arms which adds pattern bindings to the
@@ -1432,13 +1444,13 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     # state/log/op-param scope.
     ELambda(ps, body) -> {
       let pn = map(ps, (p) => p.pname)
-      ELambda(ps, pcs_rewrite_expr(body, list_append(scope, pn), uses, true, skip_set, force_set))
+      ELambda(ps, pcs_rewrite_expr(body, list_append(scope, pn), uses, true, skip_set, force_set, bmap))
     }
     EBlock(stmts, opt_tail) -> {
-      let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [], skip_set, force_set)
+      let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [], skip_set, force_set, bmap)
       let new_tail = match opt_tail {
         None -> None
-        Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam, skip_set, force_set))
+        Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam, skip_set, force_set, bmap))
       }
       # Issue #297 (partial) — block-scope exit drops for SLet PBind
       # bindings that took a `__perceus_dup` per non-last read above.
@@ -1464,21 +1476,21 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
                                                          opt_tail, [])
       EBlock(pcs_append_drops(r.stmts, exit_drops), new_tail)
     }
-    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set, force_set),
-                              pcs_rewrite_arms(arms, scope, uses, in_lam, skip_set, force_set))
+    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set, force_set, bmap),
+                              pcs_rewrite_arms(arms, scope, uses, in_lam, skip_set, force_set, bmap))
     EHandle(body, eff, eff_tas, init_opt, alias, clauses, ret_opt) -> {
-      let body1 = pcs_rewrite_expr(body, scope, uses, in_lam, skip_set, force_set)
+      let body1 = pcs_rewrite_expr(body, scope, uses, in_lam, skip_set, force_set, bmap)
       let init1 = match init_opt {
         None -> None
-        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam, skip_set, force_set))
+        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam, skip_set, force_set, bmap))
       }
-      let cls1 = pcs_rewrite_clauses(clauses, scope, uses, in_lam, skip_set, force_set)
+      let cls1 = pcs_rewrite_clauses(clauses, scope, uses, in_lam, skip_set, force_set, bmap)
       let ret1 = match ret_opt {
         None -> None
         Some(hr) -> match hr {
           HR(pname, body2, hl, hc) ->
             Some(HR(pname,
-                    pcs_rewrite_expr(body2, [pname, ...scope], uses, in_lam, skip_set, force_set),
+                    pcs_rewrite_expr(body2, [pname, ...scope], uses, in_lam, skip_set, force_set, bmap),
                     hl, hc))
         }
       }
@@ -1500,95 +1512,88 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
     EIntrinsic(name, args_) ->
-      EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set))
+      EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set, bmap))
     ECall(callee, args_) ->
-      ECall(pcs_rewrite_expr(callee, scope, uses, in_lam, skip_set, force_set),
-            pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set))
-    EField(base, nm)     -> EField(pcs_rewrite_expr(base, scope, uses, in_lam, skip_set, force_set), nm)
-    EIndex(a, b)         -> EIndex(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
-                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
-    EBinop(op, a, b)     -> EBinop(op, pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
-                                        pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
-    EUnop(op, x)         -> EUnop(op, pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set))
-    EIf(c, t_, eo)       -> EIf(pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set),
-                                  pcs_rewrite_expr(t_, scope, uses, in_lam, skip_set, force_set),
-                                  pcs_rewrite_expr_opt(eo, scope, uses, in_lam, skip_set, force_set))
-    ERecordLit(name, fs) -> ERecordLit(name, pcs_rewrite_fields_init(fs, scope, uses, in_lam, skip_set, force_set))
-    EList(els)           -> EList(pcs_rewrite_list_elems(els, scope, uses, in_lam, skip_set, force_set))
-    ERange(a, b, opt_step) -> ERange(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
-                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set),
-                                       pcs_rewrite_expr_opt(opt_step, scope, uses, in_lam, skip_set, force_set))
-    EPipe(a, b)          -> EPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
-                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
-    EMapPipe(a, b)       -> EMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
-                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
-    EFlatMapPipe(a, b)   -> EFlatMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
-                                            pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
-    EFilterPipe(a, b)    -> EFilterPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set),
-                                           pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set))
-    ELitUnit(inner, u)   -> ELitUnit(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set), u)
-    EBang(inner)         -> EBang(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set))
+      ECall(pcs_rewrite_expr(callee, scope, uses, in_lam, skip_set, force_set, bmap),
+            pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set, bmap))
+    EField(base, nm)     -> EField(pcs_rewrite_expr(base, scope, uses, in_lam, skip_set, force_set, bmap), nm)
+    EIndex(a, b)         -> EIndex(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
+                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
+    EBinop(op, a, b)     -> EBinop(op, pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
+                                        pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
+    EUnop(op, x)         -> EUnop(op, pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set, bmap))
+    EIf(c, t_, eo)       -> EIf(pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set, bmap),
+                                  pcs_rewrite_expr(t_, scope, uses, in_lam, skip_set, force_set, bmap),
+                                  pcs_rewrite_expr_opt(eo, scope, uses, in_lam, skip_set, force_set, bmap))
+    ERecordLit(name, fs) -> ERecordLit(name, pcs_rewrite_fields_init(fs, scope, uses, in_lam, skip_set, force_set, bmap))
+    EList(els)           -> EList(pcs_rewrite_list_elems(els, scope, uses, in_lam, skip_set, force_set, bmap))
+    ERange(a, b, opt_step) -> ERange(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
+                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap),
+                                       pcs_rewrite_expr_opt(opt_step, scope, uses, in_lam, skip_set, force_set, bmap))
+    EPipe(a, b)          -> EPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
+                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
+    EMapPipe(a, b)       -> EMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
+                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
+                                            pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
+    EFilterPipe(a, b)    -> EFilterPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
+                                           pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
+    ELitUnit(inner, u)   -> ELitUnit(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set, bmap), u)
+    EBang(inner)         -> EBang(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set, bmap))
   }
 }
 
-fn pcs_rewrite_expr_opt(opt: Option[Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : Option[Expr] / Console = match opt {
+fn pcs_rewrite_expr_opt(opt: Option[Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : Option[Expr] / Console = match opt {
   None    -> None
-  Some(x) -> Some(pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set))
+  Some(x) -> Some(pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set, bmap))
 }
 
-fn pcs_rewrite_expr_list(es: [Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : [Expr] / Console = match es {
+fn pcs_rewrite_expr_list(es: [Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [Expr] / Console = match es {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, in_lam, skip_set, force_set),
-                   ...pcs_rewrite_expr_list(rest, scope, uses, in_lam, skip_set, force_set)]
+  [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, in_lam, skip_set, force_set, bmap),
+                   ...pcs_rewrite_expr_list(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
 }
 
-fn pcs_rewrite_fields_init(fs: [FieldInit], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : [FieldInit] / Console = match fs {
+fn pcs_rewrite_fields_init(fs: [FieldInit], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [FieldInit] / Console = match fs {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_field_init(h, scope, uses, in_lam, skip_set, force_set),
-                   ...pcs_rewrite_fields_init(rest, scope, uses, in_lam, skip_set, force_set)]
+  [h, ...rest] -> [pcs_rewrite_field_init(h, scope, uses, in_lam, skip_set, force_set, bmap),
+                   ...pcs_rewrite_fields_init(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
 }
 
-fn pcs_rewrite_field_init(fi: FieldInit, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : FieldInit / Console = match fi {
-  FI(name, e) -> FI(name, pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set))
+fn pcs_rewrite_field_init(fi: FieldInit, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : FieldInit / Console = match fi {
+  FI(name, e) -> FI(name, pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap))
 }
 
-fn pcs_rewrite_list_elems(els: [ListElem], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : [ListElem] / Console = match els {
+fn pcs_rewrite_list_elems(els: [ListElem], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [ListElem] / Console = match els {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_list_elem(h, scope, uses, in_lam, skip_set, force_set),
-                   ...pcs_rewrite_list_elems(rest, scope, uses, in_lam, skip_set, force_set)]
+  [h, ...rest] -> [pcs_rewrite_list_elem(h, scope, uses, in_lam, skip_set, force_set, bmap),
+                   ...pcs_rewrite_list_elems(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
 }
 
-fn pcs_rewrite_list_elem(el: ListElem, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : ListElem / Console = match el {
-  ElPlain(e)  -> ElPlain(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set))
-  ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set))
+fn pcs_rewrite_list_elem(el: ListElem, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : ListElem / Console = match el {
+  ElPlain(e)  -> ElPlain(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap))
+  ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap))
 }
 
-fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : [Arm] / Console {
+fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [Arm] / Console {
 
   match arms {
     [] -> []
     [a, ...rest] -> match a {
       Arm(pat, opt_g, body) -> {
         let scope1 = prc_pat_bindings(pat, scope)
-        # Issue #599 (locals): extend the skip-set with this arm's pattern
-        # binders that pass the branch-aware safety check over the arm body.
-        # A guard disables the optimisation (the body may not run after the
-        # binders are read in the guard), so only the guard-less arms get it.
-        # Issue #599 (locals): extend the skip-set with this arm's pattern
-        # binders that pass the branch-aware safety check — BUT only when the
-        # arm is purely constructor-rebuild on every tail (no external fn call
-        # like balance_left). That matches exactly the emit's arm-top-reuse
-        # eligibility (arm_all_tails_consume_token): the recolor arm qualifies,
-        # the balance arm does not. Keeping the two predicates aligned is what
-        # makes the move (perceus) and the shared-branch dup (emit) agree, so
-        # RC balances. A guard also disables it (body may not run).
+        # The arm-binder per-path move set is precomputed once in
+        # perceus_decl_b (pcs_collect_trmc_arm_moves) — restricted to arms
+        # that are self-recursive modulo-cons (the shape emit turns into a
+        # TRMC step and disposes via the borrow-model). It is already unioned
+        # into the incoming skip_set, so no per-arm recompute here.
         let body_skip = skip_set
         let g1 = match opt_g {
           None -> None
-          Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam, skip_set, force_set))
+          Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam, skip_set, force_set, bmap))
         }
-        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, body_skip, force_set)
-        [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam, skip_set, force_set)]
+        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, body_skip, force_set, bmap)
+        [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
       }
     }
   }
@@ -1597,24 +1602,24 @@ fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, ski
 type PcsRwBlock = { stmts: [Stmt], scope: [String] }
 
 fn pcs_rewrite_block(stmts: [Stmt], scope: [String], uses: [Use], in_lam: Bool,
-                     acc: [Stmt], skip_set: [String], force_set: [String]) : PcsRwBlock / Console {
+                     acc: [Stmt], skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : PcsRwBlock / Console {
 
   match stmts {
     [] -> PcsRwBlock { stmts: list_reverse(acc), scope: scope }
     [s, ...rest] -> {
-      let r = pcs_rewrite_stmt(s, scope, uses, in_lam, skip_set, force_set)
-      pcs_rewrite_block(rest, r.scope, uses, in_lam, [r.stmt, ...acc], skip_set, force_set)
+      let r = pcs_rewrite_stmt(s, scope, uses, in_lam, skip_set, force_set, bmap)
+      pcs_rewrite_block(rest, r.scope, uses, in_lam, [r.stmt, ...acc], skip_set, force_set, bmap)
     }
   }
 }
 
 type PcsRwStmt = { stmt: Stmt, scope: [String] }
 
-fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : PcsRwStmt / Console {
+fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : PcsRwStmt / Console {
 
   match s {
     SLet(pat, ty_opt, rhs) -> {
-      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set)
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set, bmap)
       # See `pcs_collect_uses_in_block` SLet — raw locals stay
       # outside the Perceus scope so EVar reads of them are not
       # rewritten into `__perceus_dup` calls (which expect boxed
@@ -1623,25 +1628,25 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_se
                   scope: prc_pat_bindings_skip_raw(pat, rhs, scope) }
     }
     SVar(name, ty_opt, rhs, ln, cl) -> {
-      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set)
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set, bmap)
       PcsRwStmt { stmt: SVar(name, ty_opt, rhs1, ln, cl), scope: [name, ...scope] }
     }
     SAssert(c, opt_m) -> {
-      let c1 = pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set)
+      let c1 = pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set, bmap)
       let m1 = match opt_m {
         None -> None
-        Some(m) -> Some(pcs_rewrite_expr(m, scope, uses, in_lam, skip_set, force_set))
+        Some(m) -> Some(pcs_rewrite_expr(m, scope, uses, in_lam, skip_set, force_set, bmap))
       }
       PcsRwStmt { stmt: SAssert(c1, m1), scope: scope }
     }
     SExprStmt(e) -> {
-      let e1 = pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set)
+      let e1 = pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap)
       PcsRwStmt { stmt: SExprStmt(e1), scope: scope }
     }
     SIndexAssign(b, i, v, ln, cl) -> {
-      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set)
-      let i1 = pcs_rewrite_expr(i, scope, uses, in_lam, skip_set, force_set)
-      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam, skip_set, force_set)
+      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap)
+      let i1 = pcs_rewrite_expr(i, scope, uses, in_lam, skip_set, force_set, bmap)
+      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam, skip_set, force_set, bmap)
       PcsRwStmt { stmt: SIndexAssign(b1, i1, v1, ln, cl), scope: scope }
     }
     # m7e §25: SUse has no expression and binds nothing.
@@ -1650,7 +1655,7 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_se
 }
 
 fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
-                        in_lam: Bool, skip_set: [String], force_set: [String]) : [HClause] / Console {
+                        in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [HClause] / Console {
 
   match cs {
     [] -> []
@@ -1658,8 +1663,8 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
       HC(op, params, body, ln, cl) -> {
         let pn = pcs_filter_non_resume(map(params, (p) => p.pname), [])
         let scope1 = list_append(scope, ["state", "log", ...pn])
-        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set, force_set)
-        [HC(op, params, body1, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam, skip_set, force_set)]
+        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set, force_set, bmap)
+        [HC(op, params, body1, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
       }
     }
   }
@@ -1709,7 +1714,7 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
 # (issues #77–#82). Closed R10 and R11 (issue #61).
 
 fn pcs_is_non_last(nm: String, line: Int, col: Int, uses: [Use],
-                   in_lam_here: Bool, skip_set: [String], force_set: [String]) : Bool {
+                   in_lam_here: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : Bool {
   # Issue #697 — `force_set` carries the names that must dup on EVERY
   # read, last-use included, because the body does not own them: it
   # borrows them. The sole populator is the `DCheck` branch, whose
@@ -1784,7 +1789,153 @@ pub fn pcs_count_non_lam_uses(nm: String, uses: [Use], acc: Int) : Int {
 # lazily from `pcs_is_non_last` only for top-level fn params; per-fn
 # bodies are small enough that the O(body-size) walk per param is
 # cheap compared with the rest of the perceus pass.
+# Back-compat wrapper: the borrow-unaware count (used by the params path
+# and other call sites that have no borrow map in scope).
 fn pcs_max_paths_in_expr(nm: String, e: Expr) : Int =
+  pcs_max_paths_b_expr(nm, e, [])
+
+# Borrow-aware path count (Koka Parc: a use of `nm` that lands in a
+# BORROWED parameter slot of the callee does NOT consume `nm`, so it must
+# NOT count toward the dup decision — the canonical case is `is_red(l)`,
+# which inspects `l` without taking ownership. Without this, `l`'s use in
+# `is_red(l)` plus its use in `insert_loop(l)` sum to 2 on the same path →
+# the binder fails the `mp <= 1` skip check → a spurious dup keeps the
+# descent tree shared → the rb-tree spine leaks. `bmap` is the borrow map
+# built by pcs_build_borrow_map. The arg-position filter mirrors
+# pcs_strip_borrow_args exactly.)
+fn pcs_max_paths_b_expr(nm: String, e: Expr, bmap: [BorrowEntry]) : Int =
+  pcs_max_paths_b_kind(nm, e.kind, bmap)
+
+fn pcs_max_paths_b_kind(nm: String, k: ExprKind, bmap: [BorrowEntry]) : Int = match k {
+  EVar(uname)         -> if uname == nm { 1 } else { 0 }
+  EStr(_, _)          -> 0
+  ECall(f, xs)        -> {
+    # Discount args that land in a borrowed slot of the callee: those uses
+    # of `nm` are borrows, not consumers, and do not count.
+    let key = pcs_callee_key(f)
+    let positions = pcs_borrow_lookup(bmap, key)
+    pcs_max_paths_b_expr(nm, f, bmap) + pcs_max_paths_b_args(nm, xs, positions, 0, bmap)
+  }
+  EIntrinsic(_, xs)   -> pcs_max_paths_b_seq(nm, xs, bmap)
+  EField(x, _)        -> pcs_max_paths_b_expr(nm, x, bmap)
+  EIndex(a, b)        -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
+  EBinop(_, a, b)     -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
+  EUnop(_, x)         -> pcs_max_paths_b_expr(nm, x, bmap)
+  EIf(c, t, opt_e)    -> pcs_max_paths_b_expr(nm, c, bmap) +
+                          pcs_max_paths_b_alt2(nm, t, opt_e, bmap)
+  EMatch(s, arms)     -> pcs_max_paths_b_expr(nm, s, bmap) +
+                          pcs_max_paths_b_arms(nm, arms, 0, bmap)
+  ELambda(_, _)       -> 0
+  ERecordLit(_, fis)  -> pcs_max_paths_b_field_inits(nm, fis, bmap)
+  EList(els)          -> pcs_max_paths_b_list_elems(nm, els, bmap)
+  ERange(a, b, opt)   -> pcs_max_paths_b_expr(nm, a, bmap) +
+                          pcs_max_paths_b_expr(nm, b, bmap) +
+                          pcs_max_paths_b_opt(nm, opt, bmap)
+  EBlock(stmts, tail) -> pcs_max_paths_b_block(nm, stmts, tail, bmap)
+  EPipe(a, b)         -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
+  EMapPipe(a, b)      -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
+  EFlatMapPipe(a, b)  -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
+  EFilterPipe(a, b)   -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    let bp = pcs_max_paths_b_expr(nm, body, bmap)
+    let ip = pcs_max_paths_b_opt(nm, init_opt, bmap)
+    let cp = pcs_max_paths_b_clauses(nm, clauses, bmap)
+    let rp = pcs_max_paths_b_ret_opt(nm, ret_opt, bmap)
+    bp + ip + cp + rp
+  }
+  EBang(inner)        -> pcs_max_paths_b_expr(nm, inner, bmap)
+  ELitUnit(inner, _)  -> pcs_max_paths_b_expr(nm, inner, bmap)
+  _                   -> 0
+}
+
+# Walk args, charging 0 for any arg whose index is a borrowed slot of the
+# callee (the use is a borrow, not a consume).
+fn pcs_max_paths_b_args(nm: String, es: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry]) : Int = match es {
+  []           -> 0
+  [h, ...rest] -> {
+    let here = if pcs_has_int(positions, i) { 0 } else { pcs_max_paths_b_expr(nm, h, bmap) }
+    here + pcs_max_paths_b_args(nm, rest, positions, i + 1, bmap)
+  }
+}
+
+fn pcs_max_paths_b_seq(nm: String, es: [Expr], bmap: [BorrowEntry]) : Int = match es {
+  []           -> 0
+  [h, ...rest] -> pcs_max_paths_b_expr(nm, h, bmap) + pcs_max_paths_b_seq(nm, rest, bmap)
+}
+
+fn pcs_max_paths_b_alt2(nm: String, t: Expr, opt_e: Option[Expr], bmap: [BorrowEntry]) : Int = {
+  let tp = pcs_max_paths_b_expr(nm, t, bmap)
+  let ep = match opt_e { None -> 0 Some(e) -> pcs_max_paths_b_expr(nm, e, bmap) }
+  if tp > ep { tp } else { ep }
+}
+
+fn pcs_max_paths_b_arms(nm: String, arms: [Arm], best: Int, bmap: [BorrowEntry]) : Int = match arms {
+  [] -> best
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, body) -> {
+      let gp = match opt_g { None -> 0 Some(g) -> pcs_max_paths_b_expr(nm, g, bmap) }
+      let bp = pcs_max_paths_b_expr(nm, body, bmap)
+      let armp = gp + bp
+      let nb = if armp > best { armp } else { best }
+      pcs_max_paths_b_arms(nm, rest, nb, bmap)
+    }
+  }
+}
+
+fn pcs_max_paths_b_field_inits(nm: String, fis: [FieldInit], bmap: [BorrowEntry]) : Int = match fis {
+  []           -> 0
+  [h, ...rest] -> match h {
+    FI(_, e) -> pcs_max_paths_b_expr(nm, e, bmap) + pcs_max_paths_b_field_inits(nm, rest, bmap)
+  }
+}
+
+fn pcs_max_paths_b_list_elems(nm: String, els: [ListElem], bmap: [BorrowEntry]) : Int = match els {
+  []           -> 0
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    pcs_max_paths_b_expr(nm, inner, bmap) + pcs_max_paths_b_list_elems(nm, rest, bmap)
+  }
+}
+
+fn pcs_max_paths_b_opt(nm: String, opt: Option[Expr], bmap: [BorrowEntry]) : Int = match opt {
+  None    -> 0
+  Some(e) -> pcs_max_paths_b_expr(nm, e, bmap)
+}
+
+fn pcs_max_paths_b_block(nm: String, stmts: [Stmt], tail: Option[Expr], bmap: [BorrowEntry]) : Int =
+  pcs_max_paths_b_stmts(nm, stmts, bmap) + pcs_max_paths_b_opt(nm, tail, bmap)
+
+fn pcs_max_paths_b_stmts(nm: String, stmts: [Stmt], bmap: [BorrowEntry]) : Int = match stmts {
+  []           -> 0
+  [h, ...rest] -> pcs_max_paths_b_stmt(nm, h, bmap) + pcs_max_paths_b_stmts(nm, rest, bmap)
+}
+
+fn pcs_max_paths_b_stmt(nm: String, s: Stmt, bmap: [BorrowEntry]) : Int = match s {
+  SLet(_, _, e)                  -> pcs_max_paths_b_expr(nm, e, bmap)
+  SVar(_, _, e, _, _)            -> pcs_max_paths_b_expr(nm, e, bmap)
+  SAssert(e, opt_m)              -> pcs_max_paths_b_expr(nm, e, bmap) +
+                                     pcs_max_paths_b_opt(nm, opt_m, bmap)
+  SExprStmt(e)                   -> pcs_max_paths_b_expr(nm, e, bmap)
+  SIndexAssign(a, b, c, _, _)    -> pcs_max_paths_b_expr(nm, a, bmap) +
+                                     pcs_max_paths_b_expr(nm, b, bmap) +
+                                     pcs_max_paths_b_expr(nm, c, bmap)
+  SUse(_, _, _)                  -> 0
+}
+
+fn pcs_max_paths_b_clauses(nm: String, cs: [HClause], bmap: [BorrowEntry]) : Int = match cs {
+  []           -> 0
+  [h, ...rest] -> match h {
+    HC(_, _, body, _, _) ->
+      pcs_max_paths_b_expr(nm, body, bmap) + pcs_max_paths_b_clauses(nm, rest, bmap)
+  }
+}
+
+fn pcs_max_paths_b_ret_opt(nm: String, opt: Option[HReturn], bmap: [BorrowEntry]) : Int = match opt {
+  None    -> 0
+  Some(hr) -> match hr { HR(_, body, _, _) -> pcs_max_paths_b_expr(nm, body, bmap) }
+}
+
+fn pcs_max_paths_in_kind_UNUSED(nm: String, e: Expr) : Int =
   pcs_max_paths_in_kind(nm, e.kind)
 
 fn pcs_max_paths_in_kind(nm: String, k: ExprKind) : Int = match k {
@@ -1983,15 +2134,210 @@ fn pcs_arm_tail_ctor_arms(arms: [Arm]) : Bool = match arms {
 }
 
 #[doc("Arm-level pattern binders that pass the branch-aware safety check over the arm body (max-path<=1, consumed-on-every-path, all-consumers-linear). Pub: emit_c's arm-top reuse consults it so the shared-branch dup set matches exactly the binders perceus moves — the two must agree or RC double-counts.")]
-pub fn pcs_branch_aware_skip_locals(binders: [String], body: Expr) : [String] = match binders {
+pub fn pcs_branch_aware_skip_locals(binders: [String], body: Expr) : [String] =
+  pcs_branch_aware_skip_locals_b(binders, body, [])
+
+# Borrow-aware variant: the max-path count discounts uses of a binder that
+# land in a borrowed callee slot (is_red(l) does not consume l). This is
+# what lets the rb-tree Black arm's l/r pass `mp <= 1` — without it, the
+# is_red(l) + insert_loop(l) uses sum to 2 on the descent path. `bmap` is
+# the global borrow map; pass [] for the borrow-unaware behaviour.
+pub fn pcs_branch_aware_skip_locals_b(binders: [String], body: Expr, bmap: [BorrowEntry]) : [String] = match binders {
   []           -> []
   [h, ...rest] -> {
-    let mp = pcs_max_paths_in_expr(h, body)
+    let mp = pcs_max_paths_b_expr(h, body, bmap)
     let cv = pcs_consumed_on_every_path(h, body)
     let ln = pcs_all_consumers_linear(h, body)
-    let rest_skip = pcs_branch_aware_skip_locals(rest, body)
+    let rest_skip = pcs_branch_aware_skip_locals_b(rest, body, bmap)
     if mp <= 1 and cv and ln { [h, ...rest_skip] } else { rest_skip }
   }
+}
+
+# Walk a fn body, collecting EVERY guard-less match arm's pattern binders
+# that pass the borrow-aware branch-aware safety check over THAT arm's body.
+# Precomputed once in perceus_decl_b (where the borrow map is in scope) and
+# unioned into the global skip-set, so pcs_rewrite_arms need not thread the
+# borrow map through all 59 rewrite call sites. A binder is added only when
+# it passes the check in its own arm body (max-path<=1 borrow-aware,
+# consumed-on-every-path, all-consumers-linear); the three conditions ARE
+# Koka's per-branch ownership reconcile and are sound on their own.
+pub fn pcs_collect_arm_skip_binders(self_name: String, e: Expr, bmap: [BorrowEntry]) : [String] =
+  pcs_collect_arm_skip_kind(self_name, e.kind, bmap)
+
+fn pcs_collect_arm_skip_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry]) : [String] = match k {
+  EMatch(s, arms) ->
+    pcs_list_union(pcs_collect_arm_skip_binders(self_name, s, bmap),
+                   pcs_collect_arm_skip_arms(self_name, arms, bmap))
+  ECall(f, xs) ->
+    pcs_list_union(pcs_collect_arm_skip_binders(self_name, f, bmap),
+                   pcs_collect_arm_skip_seq(self_name, xs, bmap))
+  EIf(c, t, opt_e) ->
+    pcs_list_union(pcs_collect_arm_skip_binders(self_name, c, bmap),
+      pcs_list_union(pcs_collect_arm_skip_binders(self_name, t, bmap),
+                     match opt_e { None -> [] Some(e2) -> pcs_collect_arm_skip_binders(self_name, e2, bmap) }))
+  EBlock(stmts, tail) ->
+    pcs_list_union(pcs_collect_arm_skip_stmts(self_name, stmts, bmap),
+                   match tail { None -> [] Some(e) -> pcs_collect_arm_skip_binders(self_name, e, bmap) })
+  EBinop(_, a, b)    -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
+  EUnop(_, x)        -> pcs_collect_arm_skip_binders(self_name, x, bmap)
+  EField(x, _)       -> pcs_collect_arm_skip_binders(self_name, x, bmap)
+  EIndex(a, b)       -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
+  ELambda(_, body)   -> pcs_collect_arm_skip_binders(self_name, body, bmap)
+  ERecordLit(_, fis) -> pcs_collect_arm_skip_field_inits(self_name, fis, bmap)
+  EList(els)         -> pcs_collect_arm_skip_list_elems(self_name, els, bmap)
+  ERange(a, b, opt)  -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap),
+                          pcs_list_union(pcs_collect_arm_skip_binders(self_name, b, bmap),
+                            match opt { None -> [] Some(e) -> pcs_collect_arm_skip_binders(self_name, e, bmap) }))
+  EPipe(a, b)        -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
+  EMapPipe(a, b)     -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
+  EFlatMapPipe(a, b) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
+  EFilterPipe(a, b)  -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
+  EBang(x)           -> pcs_collect_arm_skip_binders(self_name, x, bmap)
+  ELitUnit(x, _)     -> pcs_collect_arm_skip_binders(self_name, x, bmap)
+  _ -> []
+}
+
+fn pcs_collect_arm_skip_seq(self_name: String, es: [Expr], bmap: [BorrowEntry]) : [String] = match es {
+  []           -> []
+  [h, ...rest] -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, h, bmap),
+                                 pcs_collect_arm_skip_seq(self_name, rest, bmap))
+}
+
+fn pcs_collect_arm_skip_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry]) : [String] = match stmts {
+  []           -> []
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)               -> pcs_collect_arm_skip_binders(self_name, e, bmap)
+      SVar(_, _, e, _, _)         -> pcs_collect_arm_skip_binders(self_name, e, bmap)
+      SExprStmt(e)                -> pcs_collect_arm_skip_binders(self_name, e, bmap)
+      SAssert(e, opt_m)           -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, e, bmap),
+                                       match opt_m { None -> [] Some(m) -> pcs_collect_arm_skip_binders(self_name, m, bmap) })
+      SIndexAssign(a, b, c, _, _) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap),
+                                       pcs_list_union(pcs_collect_arm_skip_binders(self_name, b, bmap),
+                                                      pcs_collect_arm_skip_binders(self_name, c, bmap)))
+      _                           -> []
+    }
+    pcs_list_union(here, pcs_collect_arm_skip_stmts(self_name, rest, bmap))
+  }
+}
+
+fn pcs_collect_arm_skip_field_inits(self_name: String, fis: [FieldInit], bmap: [BorrowEntry]) : [String] = match fis {
+  []           -> []
+  [h, ...rest] -> match h {
+    FI(_, e) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, e, bmap),
+                               pcs_collect_arm_skip_field_inits(self_name, rest, bmap))
+  }
+}
+
+fn pcs_collect_arm_skip_list_elems(self_name: String, els: [ListElem], bmap: [BorrowEntry]) : [String] = match els {
+  []           -> []
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    pcs_list_union(pcs_collect_arm_skip_binders(self_name, inner, bmap),
+                   pcs_collect_arm_skip_list_elems(self_name, rest, bmap))
+  }
+}
+
+fn pcs_collect_arm_skip_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry]) : [String] = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(pat, opt_g, body) -> {
+      # Recurse into the body for nested matches regardless.
+      let nested = pcs_collect_arm_skip_binders(self_name, body, bmap)
+      # Collect THIS arm's movable binders ONLY when the arm is self-recursive
+      # modulo-cons (`self_name(...)` sits in a constructor-rebuild slot) — the
+      # shape tcrec turns into a TRMC step, which emit disposes via the
+      # borrow-model (arm-top reuse: borrow binds + is_unique-gated shell
+      # dispose that does NOT cascade into the moved child). A NON-self-rec
+      # arm (the stdlib/regexp `compile_repeat_optional` arm, whose body calls
+      # nb_add_transition) keeps the legacy emit (incref bind + recursive
+      # decref(_scr)); moving a binder there double-disposes it → UAF. The
+      # self-rec-modulo-cons gate is the pre-tcrec proxy that keeps perceus
+      # (move) and emit (borrow-model) in lock-step.
+      let here = match opt_g {
+        None    ->
+          if pcs_arm_self_modulo_cons(self_name, body) {
+            pcs_branch_aware_skip_locals_b(prc_pat_binders(pat, []), body, bmap)
+          } else { [] }
+        Some(_) -> []
+      }
+      pcs_list_union(pcs_list_union(here, nested),
+                     pcs_collect_arm_skip_arms(self_name, rest, bmap))
+    }
+  }
+}
+
+# True iff `body` contains a self-recursive call `self_name(...)` sitting in a
+# constructor-rebuild slot OR a tail-recursive position — i.e. the Okasaki
+# modulo-cons shape (`RBNode(Red, self(l,...), ...)`) that tcrec lowers to a
+# TRMC step. This is the arm shape for which emit applies the borrow-model
+# shell dispose; only there is moving a deconstructed child sound.
+fn pcs_arm_self_modulo_cons(self_name: String, e: Expr) : Bool =
+  pcs_smc_kind(self_name, e.kind)
+
+fn pcs_smc_kind(self_name: String, k: ExprKind) : Bool = match k {
+  # ONLY the modulo-cons shape: a CONSTRUCTOR rebuild one of whose slots is a
+  # self-call `self_name(...)`. A bare self tail-call (`r = self(...)` bound to
+  # a let, then matched — as in stdlib/regexp compile_repeat_optional) is
+  # plain recursion, NOT modulo-cons, and tcrec does NOT lower it to a TRMC
+  # step in a constructor slot; moving binders there is unsound (it keeps the
+  # legacy emit). So we require the self-call to sit in a ctor slot.
+  ECall(f, xs) -> match f.kind {
+    EVar(c)        -> if pcs_name_is_ctor(c) { pcs_smc_any_arg_is_self(self_name, xs) }
+                      else { pcs_smc_seq(self_name, xs) }
+    EModCall(_, c) -> if pcs_name_is_ctor(c) { pcs_smc_any_arg_is_self(self_name, xs) }
+                      else { pcs_smc_seq(self_name, xs) }
+    _              -> pcs_smc_seq(self_name, xs)
+  }
+  EIf(c, t, opt_e) ->
+    pcs_smc_kind(self_name, c.kind) or pcs_smc_kind(self_name, t.kind) or
+    (match opt_e { None -> false Some(e2) -> pcs_smc_kind(self_name, e2.kind) })
+  EBlock(stmts, tail) ->
+    pcs_smc_stmts(self_name, stmts) or
+    (match tail { None -> false Some(e) -> pcs_smc_kind(self_name, e.kind) })
+  EMatch(s, arms) ->
+    pcs_smc_kind(self_name, s.kind) or pcs_smc_arms(self_name, arms)
+  _ -> false
+}
+
+# True iff any direct arg of a ctor call is a self-call (the modulo-cons hole)
+# or recursively contains the modulo-cons shape.
+fn pcs_smc_any_arg_is_self(self_name: String, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> {
+    let here = match h.kind {
+      ECall(f, _) -> match f.kind {
+        EVar(c)        -> c == self_name
+        EModCall(_, c) -> c == self_name
+        _              -> false
+      }
+      _ -> pcs_smc_kind(self_name, h.kind)
+    }
+    here or pcs_smc_any_arg_is_self(self_name, rest)
+  }
+}
+
+fn pcs_smc_seq(self_name: String, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_smc_kind(self_name, h.kind) or pcs_smc_seq(self_name, rest)
+}
+
+fn pcs_smc_stmts(self_name: String, stmts: [Stmt]) : Bool = match stmts {
+  []           -> false
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)       -> pcs_smc_kind(self_name, e.kind)
+      SVar(_, _, e, _, _) -> pcs_smc_kind(self_name, e.kind)
+      SExprStmt(e)        -> pcs_smc_kind(self_name, e.kind)
+      _                   -> false
+    }
+    here or pcs_smc_stmts(self_name, rest)
+  }
+}
+
+fn pcs_smc_arms(self_name: String, arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a { Arm(_, _, b) -> pcs_smc_kind(self_name, b.kind) or pcs_smc_arms(self_name, rest) }
 }
 
 # Returns `true` if every read of `nm` in `e` is a linear consumer
@@ -2405,7 +2751,7 @@ fn pcs_consumed_in_stmt(nm: String, s: Stmt) : Bool = match s {
 type DupMark = DM(Int, Int)   # line, col of an EVar that needs wrapping
 
 fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
-                          uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String]) : String / Console {
+                          uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : String / Console {
 
   let n = string_length(span)
   let body_start = if is_triple { 3 } else { 1 }
@@ -2414,7 +2760,7 @@ fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
   else {
     let parts = iscan_collect(span, body_end,
                   IScan { parts: [], lit_start: body_start, i: body_start })
-    let new_parts = pcs_rewrite_iparts(parts, scope, uses, in_lam, [], skip_set, force_set)
+    let new_parts = pcs_rewrite_iparts(parts, scope, uses, in_lam, [], skip_set, force_set, bmap)
     let body = pcs_concat_iparts(new_parts, "")
     let prefix = if is_triple { "\"\"\"" } else { "\"" }
     concat_all([prefix, body, prefix])
@@ -2422,16 +2768,16 @@ fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
 }
 
 fn pcs_rewrite_iparts(parts: [IPart], scope: [String], uses: [Use],
-                       in_lam: Bool, acc: [IPart], skip_set: [String], force_set: [String]) : [IPart] / Console {
+                       in_lam: Bool, acc: [IPart], skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [IPart] / Console {
 
   match parts {
     [] -> list_reverse(acc)
     [p, ...rest] -> {
       let p1 = match p {
         IpLit(_, _) -> p
-        IpExp(esrc) -> IpExp(pcs_rewrite_interp_src(esrc, scope, uses, in_lam, skip_set, force_set))
+        IpExp(esrc) -> IpExp(pcs_rewrite_interp_src(esrc, scope, uses, in_lam, skip_set, force_set, bmap))
       }
-      pcs_rewrite_iparts(rest, scope, uses, in_lam, [p1, ...acc], skip_set, force_set)
+      pcs_rewrite_iparts(rest, scope, uses, in_lam, [p1, ...acc], skip_set, force_set, bmap)
     }
   }
 }
@@ -2450,7 +2796,7 @@ fn pcs_concat_iparts(parts: [IPart], acc: String) : String {
 }
 
 fn pcs_rewrite_interp_src(esrc: String, scope: [String], uses: [Use],
-                           in_lam: Bool, skip_set: [String], force_set: [String]) : String / Console {
+                           in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : String / Console {
 
   # Tokenise once for pcs_render_with_marks (it needs the token
   # stream to map AST positions back to source spans); parse_interp_expr
@@ -2461,7 +2807,7 @@ fn pcs_rewrite_interp_src(esrc: String, scope: [String], uses: [Use],
   match parse_interp_expr(esrc) {
     None -> esrc
     Some(parsed) -> {
-      let rewritten = pcs_rewrite_expr(parsed, scope, uses, in_lam, skip_set, force_set)
+      let rewritten = pcs_rewrite_expr(parsed, scope, uses, in_lam, skip_set, force_set, bmap)
       let marks = pcs_dup_marks_expr(rewritten, [])
       match marks {
         [] -> esrc
