@@ -3740,9 +3740,33 @@ fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, cx: EmitCtx, saw_
           # scalar `_scr` as `kair_<name>` for the body. Body
           # EVar reads of `name` resolve raw via the env extension
           # in `unbox_arm_with_scr`.
+          #
+          # BUT the unbox pass declines to mark `name` MUnboxed when it
+          # appears in a string interpolation (`#{name}`) — interp wants
+          # a boxed `KaiValue *`. Such a body reads `kai_<name>`, not
+          # `kair_<name>` (the beer_song `verse` failure: `"#{m} bottles"`
+          # over `match n { .. m -> .. }` → undeclared `kai_m`). Declare
+          # BOTH: the raw `kair_<name>` and a boxed `kai_<name>` re-boxed
+          # from it, so the body resolves with either prefix. The boxed
+          # box is owned locally and dropped at block exit; the raw needs
+          # no drop. `(void)` casts silence unused-var warnings when the
+          # body happens to use only one form.
           PBind(name) -> {
+            # Declare the raw binder AND a boxed alias. The body resolves
+            # `name` to `kair_<name>` (raw) for unboxed uses and to
+            # `kai_<name>` (boxed) for uses the unbox pass kept boxed —
+            # notably string interpolation (`#{name}`), which declines raw
+            # marking (beer_song `verse`: `"#{m}.."` over `match n{..m->..}`).
+            # The boxed alias is created with rc=1 and CONSUMED by the
+            # boxed consumer (interp's show/concat decref their args), so
+            # no local decref is emitted. Perceus dups it for multi-use.
+            let boxed_decl = concat_all([
+              "KaiValue *kai_", name, " = ",
+              box_for_raw_cty(scr_cty, concat_all(["kair_", name])), "; "])
             let head = concat_all([
-              "    default: { ", scr_cty, " kair_", name, " = _scr; _r = ",
+              "    default: { ", scr_cty, " kair_", name, " = _scr; ",
+              boxed_decl,
+              "(void) kair_", name, "; (void) kai_", name, "; _r = ",
               body_c, "; } break;\n"
             ])
             cat2(head, emit_switch_arms(src, rest, scr_cty, cx, true))
@@ -3759,6 +3783,18 @@ fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, cx: EmitCtx, saw_
 }
 
 fn cty_for_bind(opt_ty: Option[Ty]) : String = raw_c_type(opt_ty)
+
+# Box a raw C scalar expression back to a `KaiValue *` based on its C
+# type string. Used by the switch-on-raw default PBind to provide a
+# boxed alias (`kai_<name>`) alongside the raw binder for body uses the
+# unbox pass kept boxed (e.g. string interpolation). The switch fast
+# path only fires for integral-raw scrutinees, so int64_t (Int) is the
+# common case; double / char covered for completeness.
+fn box_for_raw_cty(cty: String, expr: String) : String =
+  if cty == "int64_t" { concat_all(["kai_int(", expr, ")"]) }
+  else if cty == "double" { concat_all(["kai_real(", expr, ")"]) }
+  else if cty == "uint32_t" { concat_all(["kai_char(", expr, ")"]) }
+  else { concat_all(["kai_int(", expr, ")"]) }
 
 fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String / Console {
 
@@ -6372,9 +6408,14 @@ fn emit_thunk_unbox_args_masked(params: [Param], tys: [Ty], mask: [Bool], i: Int
       let ix = int_to_string(i)
       let line =
         if is_raw {
+          # Read via `unbox_boxed_scalar` (kai_intf for Int) NOT a raw
+          # `->as.i`: a thunk arg may be a TAGGED immediate Int (no heap
+          # header), and `->as.i` would dereference the tag bits and
+          # segfault (the chain-thunk crash, address=0xb = tagged 11).
+          # kai_decref is already tagged-safe (no-op on immediates).
           concat_all([
             "    ", raw_c_type(Some(pty)), " kair_", p.pname,
-            " = args[", ix, "]", unbox_field_for(Some(pty)), ";\n",
+            " = ", unbox_boxed_scalar(concat_all(["args[", ix, "]"]), Some(pty)), ";\n",
             "    kai_decref(args[", ix, "]);\n"
           ])
         } else {
