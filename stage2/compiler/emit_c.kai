@@ -3265,7 +3265,17 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       let n = list_length(subs)
       let mask = variant_slot_mask(tys)
       let tag_str = int_to_string(evar_find_tag(cx.variants, cname))
-      let borrow_binds = rv_slot_binds(subs, tys, 0, true, cx)
+      # Non-bijective rebuild: a new ctor slot is a NESTED ctor that embeds a
+      # pointer child of `_scr` (the rb-tree rotation / gap3 shape:
+      # `Node(Node(lll,...), lk, Node(lr,...))`). Borrow-binding such children
+      # then overwriting `_scr` in place ALIASES them — emit does not dup them,
+      # so the reused cell ends up referencing its own former descendants → a
+      # CYCLE (gap3 stack-overflows in `size`). For that shape the unique
+      # branch must OWN (incref) its children so the rebuild copies references
+      # instead of aliasing. A bijective (flat) rebuild keeps the cheap borrow
+      # binds. Detected structurally: any carg is a ctor-call with >0 args.
+      let nonbij = rv_any_nested_ctor(cargs)
+      let borrow_binds = rv_slot_binds(subs, tys, 0, not nonbij, cx)
       let owned_binds  = rv_slot_binds(subs, tys, 0, false, cx)
       # The new-ctor-arg expressions reference the pattern binders
       # (`kai_<nm>`), so they MUST be emitted under `arm_cx` (lcs
@@ -3276,9 +3286,16 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       let new_temps    = rv_new_temps(src, cargs, tys, 0, arm_cx)
       let overwrites   = rv_overwrites(cargs, tys, 0)
       let fresh_slots  = emit_variant_slot_init_list(src, cargs, tys, arm_cx)
+      # Non-bijective unique branch owns (incref'd) its children, so the OLD
+      # pointer slots of `_scr` (which still reference those children) must be
+      # decref'd before they are overwritten — else the old reference leaks.
+      # The temps are computed first (they read the now-owned children), so the
+      # decref is safe to emit before the overwrites. A bijective rebuild
+      # transfers (borrow binds) and must NOT decref.
+      let old_drops = if nonbij { rv_old_slot_drops(tys, 0) } else { "" }
       concat_all([
         "if (kai_check_unique(_scr)) { ",
-        borrow_binds, new_temps, overwrites,
+        borrow_binds, new_temps, old_drops, overwrites,
         "_scr->as.var.variant_tag = ", tag_str, "; ",
         "_scr->as.var.variant_name = \"", cname, "\"; ",
         "_scr->as.var.slot_mask = ", int_to_string(mask), "; ",
@@ -3343,6 +3360,39 @@ fn rv_overwrites(cargs: [Expr], tys: [TypeExpr], i: Int) : String {
       cat2(concat_all(["_scr->as.var.slots[", int_to_string(i), "]", fld, " = _rv", int_to_string(i), "; "]),
            rv_overwrites(rest, tys, i + 1))
     }
+  }
+}
+
+# True iff any new ctor arg is a NESTED ctor call with at least one arg — the
+# non-bijective shape that embeds a pointer child of the reused cell.
+fn rv_any_nested_ctor(cargs: [Expr]) : Bool = match cargs {
+  []           -> false
+  [e, ...rest] -> {
+    let here = match e.kind {
+      ECall(f, xs) -> match f.kind {
+        EVar(c)        -> name_first_is_upper(c) and rv_nonempty(xs)
+        EModCall(_, c) -> name_first_is_upper(c) and rv_nonempty(xs)
+        _              -> false
+      }
+      _ -> false
+    }
+    here or rv_any_nested_ctor(rest)
+  }
+}
+
+fn rv_nonempty(xs: [Expr]) : Bool = match xs { [] -> false _ -> true }
+
+# Decref every OLD pointer slot of `_scr` before the non-bijective overwrite
+# (the unique branch owns/incref'd its children, so the old refs must be
+# released). Primitive slots (tagged Int / Real) carry no RC → skipped.
+fn rv_old_slot_drops(tys: [TypeExpr], i: Int) : String = match tys {
+  []          -> ""
+  [t, ...rest] -> {
+    let k = variant_slot_kind(t)
+    let here = if k == 0 {
+      concat_all(["kai_decref(_scr->as.var.slots[", int_to_string(i), "].ptr); "])
+    } else { "" }
+    cat2(here, rv_old_slot_drops(rest, i + 1))
   }
 }
 
