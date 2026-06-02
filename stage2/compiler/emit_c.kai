@@ -1232,6 +1232,57 @@ fn emit_call_args_raw(src: String, args_e: [Expr], cx: EmitCtx) : String / Conso
 
   join_with(map(args_e, (a) => emit_expr_raw(src, a, cx)), ", ")
 
+# Mixed-param lane (issue #440 follow-up) — marshal each call argument
+# per the callee's raw mask: a raw slot emits `emit_expr_raw` (a raw
+# scalar passed by value, no box), a boxed slot emits `emit_expr` (the
+# normal boxed `KaiValue *` path, with Perceus's dup/drop intact). The
+# mask comes from the callee's UFnSig; args past the mask (defensive)
+# default to raw, matching the all-raw signature shape.
+fn emit_call_args_masked(src: String, args_e: [Expr], mask: [Bool], cx: EmitCtx) : String / Console =
+  join_with(emit_call_args_masked_each(src, args_e, mask, cx, []), ", ")
+
+fn emit_call_args_masked_each(src: String, args_e: [Expr], mask: [Bool], cx: EmitCtx, acc: [String]) : [String] / Console {
+  match args_e {
+    [] -> list_reverse(acc)
+    [a, ...rest] -> {
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let entry =
+        if is_raw { emit_expr_raw(src, a, cx) }
+        else { emit_expr(src, a, cx) }
+      emit_call_args_masked_each(src, rest, mrest, cx, [entry, ...acc])
+    }
+  }
+}
+
+# Wrap a UFn call result only when the return is raw; a boxed-return
+# UFn already yields a `KaiValue *`, so wrapping would double-box.
+fn ufn_call_result(rt: Ty, raw_call: String) : String =
+  if ty_is_unboxable_t(rt) { box_wrap(Some(rt), raw_call) } else { raw_call }
+
+# Emit a single pipe LHS / arg at mask position `i`: raw or boxed.
+fn pipe_arg_masked(src: String, a: Expr, mask: [Bool], i: Int, cx: EmitCtx) : String / Console {
+  let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+  if is_raw { emit_expr_raw(src, a, cx) }
+  else { emit_expr(src, a, cx) }
+}
+
+# Drop the first mask entry (the pipe LHS consumed param 0); the
+# remaining entries align with `args_e` (params 1+).
+fn mask_drop1(mask: [Bool]) : [Bool] = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+
 # m8.x bug #12: emit `KaiValue *_op_arg_<i> = <expr>; ` for each
 # arg of an op call. The args are evaluated *before* the
 # `in_dispatch` flag is set, so any inner op call to the same
@@ -1662,18 +1713,18 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
     EVar(callee) ->
       if list_has(cx.lcs, callee) { None }
       else { match efn_resolve(cx.fns, callee) {
-        Some(EFn(_, _, mo, Some(US(_, rt)))) -> {
-          let raw_args = emit_call_args_raw(src, args_e, cx)
+        Some(EFn(_, _, mo, Some(US(_, rt, mask)))) -> {
+          let raw_args = emit_call_args_masked(src, args_e, mask, cx)
           let raw_call = cat5("kai_", c_sym(callee, mo), "(", raw_args, ")")
-          Some(box_wrap(Some(rt), raw_call))
+          Some(ufn_call_result(rt, raw_call))
         }
         _ -> None
       } }
     EModCall(mod, fname) -> match lookup_ufn_sig(cx.fns, fname, Some(mod)) {
-      Some(US(_, rt)) -> {
-        let raw_args = emit_call_args_raw(src, args_e, cx)
+      Some(US(_, rt, mask)) -> {
+        let raw_args = emit_call_args_masked(src, args_e, mask, cx)
         let raw_call = cat5("kai_", c_sym(fname, Some(mod)), "(", raw_args, ")")
-        Some(box_wrap(Some(rt), raw_call))
+        Some(ufn_call_result(rt, raw_call))
       }
       None -> None
     }
@@ -2261,12 +2312,14 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
           let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
           emit_pipe_named_lookup(src, callee, list_length(args_e) + 1, lhs_c, args_e, args_all, cx)
         } else { match efn_resolve(cx.fns, callee) {
-          Some(EFn(_, _, mo, Some(US(_, rt)))) -> {
-            let lhs_raw = emit_expr_raw(src, lhs, cx)
-            let rest_raw = emit_call_args_raw(src, args_e, cx)
+          Some(EFn(_, _, mo, Some(US(_, rt, mask)))) -> {
+            # Pipe: LHS is param 0, args_e are params 1+. Marshal each
+            # per the mask (mixed-param lane, issue #440 follow-up).
+            let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
+            let rest_raw = emit_call_args_masked(src, args_e, mask_drop1(mask), cx)
             let args_all = if list_length(args_e) == 0 { lhs_raw } else { cat3(lhs_raw, ", ", rest_raw) }
             let raw_call = cat5("kai_", c_sym(callee, mo), "(", args_all, ")")
-            box_wrap(Some(rt), raw_call)
+            ufn_call_result(rt, raw_call)
           }
           _ -> {
             let lhs_c = emit_expr(src, lhs, cx)
@@ -2281,12 +2334,12 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
       # non-piped EModCall branch in emit_call_expr. Phase 3
       # routes UFn-classified targets through the raw shape too.
       EModCall(mod, fname) -> match lookup_ufn_sig(cx.fns, fname, Some(mod)) {
-        Some(US(_, rt)) -> {
-          let lhs_raw = emit_expr_raw(src, lhs, cx)
-          let rest_raw = emit_call_args_raw(src, args_e, cx)
+        Some(US(_, rt, mask)) -> {
+          let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
+          let rest_raw = emit_call_args_masked(src, args_e, mask_drop1(mask), cx)
           let args_all = if list_length(args_e) == 0 { lhs_raw } else { cat3(lhs_raw, ", ", rest_raw) }
           let raw_call = cat5("kai_", c_sym(fname, Some(mod)), "(", args_all, ")")
-          box_wrap(Some(rt), raw_call)
+          ufn_call_result(rt, raw_call)
         }
         None -> {
           let lhs_c = emit_expr(src, lhs, cx)
@@ -2311,10 +2364,10 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
         let lhs_c = emit_expr(src, lhs, cx)
         emit_pipe_named_lookup(src, callee, 1, lhs_c, [], lhs_c, cx)
       } else { match efn_resolve(cx.fns, callee) {
-        Some(EFn(_, _, mo, Some(US(_, rt)))) -> {
-          let lhs_raw = emit_expr_raw(src, lhs, cx)
+        Some(EFn(_, _, mo, Some(US(_, rt, mask)))) -> {
+          let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
           let raw_call = cat5("kai_", c_sym(callee, mo), "(", lhs_raw, ")")
-          box_wrap(Some(rt), raw_call)
+          ufn_call_result(rt, raw_call)
         }
         _ -> {
           let lhs_c = emit_expr(src, lhs, cx)
@@ -2325,10 +2378,10 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
     # m6.2 Phase 3 / v2: piped qualified-call shorthand `x |> mod.f`
     # (no parens) — same direct mint as the parens form.
     EModCall(mod, fname) -> match lookup_ufn_sig(cx.fns, fname, Some(mod)) {
-      Some(US(_, rt)) -> {
-        let lhs_raw = emit_expr_raw(src, lhs, cx)
+      Some(US(_, rt, mask)) -> {
+        let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
         let raw_call = cat5("kai_", c_sym(fname, Some(mod)), "(", lhs_raw, ")")
-        box_wrap(Some(rt), raw_call)
+        ufn_call_result(rt, raw_call)
       }
       None -> {
         let lhs_c = emit_expr(src, lhs, cx)
@@ -4707,17 +4760,23 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
     EVar(callee) ->
       if list_has(cx.lcs, callee) { None }
       else { match efn_resolve(cx.fns, callee) {
-        Some(EFn(_, _, mo, Some(_))) -> {
-          let raw_args = emit_call_args_raw(src, args_e, cx)
-          Some(cat5("kai_", c_sym(callee, mo), "(", raw_args, ")"))
-        }
+        # Mixed-param lane: only take the raw-call path when the callee
+        # RETURNS raw (a raw context cannot consume a boxed result).
+        # Args are still marshalled per the mask — boxed params pass
+        # `KaiValue *`, raw params pass scalars.
+        Some(EFn(_, _, mo, Some(US(_, rt, mask)))) ->
+          if ty_is_unboxable_t(rt) {
+            let raw_args = emit_call_args_masked(src, args_e, mask, cx)
+            Some(cat5("kai_", c_sym(callee, mo), "(", raw_args, ")"))
+          } else { None }
         _ -> None
       } }
     EModCall(mod, fname) -> match lookup_ufn_sig(cx.fns, fname, Some(mod)) {
-      Some(_) -> {
-        let raw_args = emit_call_args_raw(src, args_e, cx)
-        Some(cat5("kai_", c_sym(fname, Some(mod)), "(", raw_args, ")"))
-      }
+      Some(US(_, rt, mask)) ->
+        if ty_is_unboxable_t(rt) {
+          let raw_args = emit_call_args_masked(src, args_e, mask, cx)
+          Some(cat5("kai_", c_sym(fname, Some(mod)), "(", raw_args, ")"))
+        } else { None }
       None -> None
     }
     _ -> None
@@ -5660,11 +5719,54 @@ fn emit_fn_signature(name: String, params: [Param]) : String =
 # locals typed to each `param_ty`.
 fn emit_fn_signature_unboxed(name: String, params: [Param], sig: UFnSig) : String =
   match sig {
-    US(pts, rt) -> concat_all([
-      "static ", raw_c_type(Some(rt)),
-      " kai_", name, "(", emit_param_list_unboxed(params, pts), ")"
+    US(pts, rt, mask) -> concat_all([
+      "static ", ufn_ret_c_type(rt),
+      " kai_", name, "(", emit_param_list_masked(params, pts, mask, []), ")"
     ])
   }
+
+# Return-type C string for a (possibly mixed) UFn: raw scalar when the
+# return ty is unboxable, else `KaiValue *` (boxed return — e.g.
+# `balance(...) : RBTree`). Mixed-param lane (issue #440 follow-up).
+fn ufn_ret_c_type(rt: Ty) : String =
+  if ty_is_unboxable_t(rt) { raw_c_type(Some(rt)) } else { "KaiValue *" }
+
+# True iff the UFn's return lowers to a raw scalar (vs a boxed
+# `KaiValue *`). Drives the body's `return` form and the call-site
+# box_wrap decision.
+fn ufn_ret_is_raw(sig: UFnSig) : Bool = match sig { US(_, rt, _) -> ty_is_unboxable_t(rt) }
+
+# Per-param C parameter list honouring the raw mask: raw slots emit
+# `<scalar> kair_<p>`, boxed slots emit `KaiValue *kai_<p>`. The two
+# name prefixes (`kair_` vs `kai_`) match what the body's EVar reads
+# resolve to (unbox pass marks only raw params MUnboxed).
+fn emit_param_list_masked(params: [Param], tys: [Ty], mask: [Bool], acc: [String]) : String {
+  match params {
+    [] -> match acc { [] -> "void" _ -> join_with(list_reverse(acc), ", ") }
+    [p, ...rest] -> {
+      let pty = match tys {
+        [t, ..._] -> t
+        [] -> param_ty(p)
+      }
+      let trest = match tys {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let entry =
+        if is_raw { concat_all([raw_c_type(Some(pty)), " kair_", p.pname]) }
+        else { concat_all(["KaiValue *kai_", p.pname]) }
+      emit_param_list_masked(rest, trest, mrest, [entry, ...acc])
+    }
+  }
+}
 
 fn is_ufn_decl(fns: [EFn], name: String, mo: Option[String]) : Bool {
   match lookup_ufn_sig(fns, name, mo) {
@@ -5774,8 +5876,19 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx) : String / Console {
           "KaiCctx _kai_acc = kai_cctx_empty();\n    KaiReuse _arm_ru = kai_reuse_null;\n    "
         } else { "" }
         match opt_sig {
-          Some(_) -> {
-            let body_c = emit_expr_raw(src, body, body_cx)
+          Some(usig) -> {
+            # Mixed-param lane: a UFn with a RAW return emits its body
+            # raw (`emit_expr_raw`); a UFn with a BOXED return (e.g.
+            # `balance(...) : RBTree` — raw k/v params, boxed result)
+            # emits the body boxed (`emit_expr`), exactly like a non-UFn
+            # return. The raw params still travel raw inside the body;
+            # only the returned value is a `KaiValue *`.
+            let body_c =
+              if ufn_ret_is_raw(usig) {
+                emit_expr_raw(src, body, body_cx)
+              } else {
+                emit_expr(src, body, body_cx)
+              }
             let label = if tcrec_body_has_sentinel(body) {
               concat_all(["_kai_", c_sym(name, mo), "_entry:;\n    "])
             } else { "" }
@@ -6157,13 +6270,17 @@ fn emit_fn_thunk(d: Decl, fns: [EFn]) : String {
       # bridge between the boxed first-class-fn world and the
       # raw direct-call world.
       match lookup_ufn_sig(fns, name, mo) {
-        Some(US(pts, rt)) -> {
-          let arg_unbox = emit_thunk_unbox_args(params, pts, 0)
-          let arg_list = emit_thunk_raw_arg_list(params, 0)
+        Some(US(pts, rt, mask)) -> {
+          # Mixed-param lane: raw slots unbox `args[i]` to `kair_<p>`,
+          # boxed slots bind `kai_<p> = args[i]` straight (the fn
+          # consumes the ref). The call mixes `kair_`/`kai_` per mask
+          # and the result wraps only if the return is raw.
+          let arg_unbox = emit_thunk_unbox_args_masked(params, pts, mask, 0)
+          let arg_list = emit_thunk_arg_list_masked(params, mask, 0)
           let call_raw = concat_all(["kai_", sym, "(", arg_list, ")"])
           let body = concat_all([
             arg_unbox,
-            "    return ", box_wrap(Some(rt), call_raw), ";\n}\n\n"
+            "    return ", ufn_call_result(rt, call_raw), ";\n}\n\n"
           ])
           concat_all([hdr, body])
         }
@@ -6223,6 +6340,69 @@ fn emit_thunk_raw_arg_list(params: [Param], i: Int) : String {
       match rest {
         [] -> head
         _  -> concat_all([head, ", ", emit_thunk_raw_arg_list(rest, i + 1)])
+      }
+    }
+  }
+}
+
+# Mixed-param thunk: raw slots unbox `args[i]` into `<raw> kair_<p>`
+# (consuming the boxed arg via decref); boxed slots bind
+# `KaiValue *kai_<p> = args[i]` straight (the called fn takes the ref,
+# no decref here — matching the boxed thunk's ownership transfer).
+fn emit_thunk_unbox_args_masked(params: [Param], tys: [Ty], mask: [Bool], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let pty = match tys {
+        [t, ..._] -> t
+        [] -> param_ty(p)
+      }
+      let trest = match tys {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let ix = int_to_string(i)
+      let line =
+        if is_raw {
+          concat_all([
+            "    ", raw_c_type(Some(pty)), " kair_", p.pname,
+            " = args[", ix, "]", unbox_field_for(Some(pty)), ";\n",
+            "    kai_decref(args[", ix, "]);\n"
+          ])
+        } else {
+          concat_all(["    KaiValue *kai_", p.pname, " = args[", ix, "];\n"])
+        }
+      cat2(line, emit_thunk_unbox_args_masked(rest, trest, mrest, i + 1))
+    }
+  }
+}
+
+# Mixed-param thunk arg list: `kair_<p>` for raw slots, `kai_<p>` for
+# boxed slots, in declaration order.
+fn emit_thunk_arg_list_masked(params: [Param], mask: [Bool], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let head = if is_raw { concat_all(["kair_", p.pname]) } else { concat_all(["kai_", p.pname]) }
+      match rest {
+        [] -> head
+        _  -> concat_all([head, ", ", emit_thunk_arg_list_masked(rest, mrest, i + 1)])
       }
     }
   }
@@ -7009,8 +7189,8 @@ fn emit_impl_shim_defs(rows: [PimplRow], seen: [String]) : String {
           emit_impl_shim_defs(rest, seen)
         } else {
           match sig {
-            Some(US(pts, rt)) -> concat_all([
-              emit_one_impl_shim(csym, pts, rt),
+            Some(US(pts, rt, mask)) -> concat_all([
+              emit_one_impl_shim(csym, pts, rt, mask),
               emit_impl_shim_defs(rest, [csym, ...seen])
             ])
             None -> emit_impl_shim_defs(rest, [csym, ...seen])
@@ -7020,17 +7200,26 @@ fn emit_impl_shim_defs(rows: [PimplRow], seen: [String]) : String {
   }
 }
 
-# Emit a single boxed shim. `pts` are the raw param tys, `rt` the raw
-# return ty. The shim reads `a->as.X` / `b->as.X` per param ty, decrefs
-# each boxed arg (consume), calls the raw pimpl, and boxes the return.
-fn emit_one_impl_shim(csym: String, pts: [Ty], rt: Ty) : String {
-  let unbox  = emit_shim_unbox_args(pts, 0)
-  let args   = emit_shim_raw_arg_list(pts, 0)
+# Emit a single boxed shim. `pts` are the param tys, `rt` the return
+# ty, `mask` the per-param raw flags (mixed-param lane). For each param:
+#   - RAW slot: read `a_i->as.X` into `r_i`, decref `a_i` (consume), pass
+#     `r_i` to the pimpl.
+#   - BOXED slot: pass `a_i` straight through (the pimpl param is also
+#     `KaiValue *`); the pimpl consumes the reference, matching the
+#     dispatch contract (caller increfs args before calling).
+# The return is boxed via `box_wrap` only when `rt` is unboxable; a
+# boxed-return mixed pimpl already yields a `KaiValue *`, so wrapping it
+# (e.g. with `kai_int`) would corrupt it — the `Complex add(self, rhs)`
+# case that produced `kai_int(<KaiValue*>)`.
+fn emit_one_impl_shim(csym: String, pts: [Ty], rt: Ty, mask: [Bool]) : String {
+  let unbox  = emit_shim_unbox_args_masked(pts, mask, 0)
+  let args   = emit_shim_arg_list_masked(pts, mask, 0)
   let call   = concat_all(["kai_", csym, "(", args, ")"])
+  let ret    = if ty_is_unboxable_t(rt) { box_wrap(Some(rt), call) } else { call }
   concat_all([
     "static KaiValue *kai_", csym, "__boxed(", emit_shim_param_list(pts, 0), ") {\n",
     unbox,
-    "    return ", box_wrap(Some(rt), call), ";\n",
+    "    return ", ret, ";\n",
     "}\n\n"
   ])
 }
@@ -7081,6 +7270,58 @@ fn emit_shim_raw_arg_list(pts: [Ty], i: Int) : String {
       match rest {
         [] -> head
         _  -> concat_all([head, ", ", emit_shim_raw_arg_list(rest, i + 1)])
+      }
+    }
+  }
+}
+
+# Mask-aware unbox: a RAW param i reads `a_i->as.X` into `r_i` and
+# decrefs `a_i` (consume). A BOXED param emits nothing here — it is
+# passed straight through to the pimpl, which consumes the reference.
+fn emit_shim_unbox_args_masked(pts: [Ty], mask: [Bool], i: Int) : String {
+  match pts {
+    [] -> ""
+    [t, ...rest] -> {
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let ix = int_to_string(i)
+      let line = if is_raw {
+        concat_all([
+          "    ", raw_c_type(Some(t)), " r", ix,
+          " = ", unbox_boxed_scalar(concat_all(["a", ix]), Some(t)), ";\n",
+          "    kai_decref(a", ix, ");\n"
+        ])
+      } else { "" }
+      concat_all([line, emit_shim_unbox_args_masked(rest, mrest, i + 1)])
+    }
+  }
+}
+
+# Mask-aware arg list: RAW param i passes `r_i` (the unboxed local),
+# BOXED param i passes `a_i` (the original pointer) straight through.
+fn emit_shim_arg_list_masked(pts: [Ty], mask: [Bool], i: Int) : String {
+  match pts {
+    [] -> ""
+    [_, ...rest] -> {
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let head = if is_raw { concat_all(["r", int_to_string(i)]) }
+                 else { concat_all(["a", int_to_string(i)]) }
+      match rest {
+        [] -> head
+        _  -> concat_all([head, ", ", emit_shim_arg_list_masked(rest, mrest, i + 1)])
       }
     }
   }
@@ -9974,7 +10215,25 @@ fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, own_mod: Option[String],
       let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
         None -> false
-        Some(e) -> tcrec_walk_tail(e.kind, nm, arity, own_mod, scope1)
+        # Perceus wraps an arm/block tail as `EBlock([..SLet(__pcs_arm_ret,
+        # INNER)..], Some(EVar(__pcs_arm_ret)))`. The tail `EVar` carries no
+        # self-call shape, so the naive descent reports `false` and the TRMC
+        # rewrite is skipped — exactly the mixed-signature regression where
+        # the unbox/perceus passes introduce this wrap and the gate then
+        # loses the modulo-cons site `trmc_walk_modcons` (which DOES unwrap)
+        # still sees. Peel the wrap here too so the gate and the modcons
+        # recogniser agree, keeping TRMC (and its fused reuse-in-place)
+        # alive through mixed-signature unboxing.
+        Some(e) -> match e.kind {
+          EVar(tn) ->
+            if tn == "__pcs_arm_ret" or tn == "__pcs_block_ret" {
+              match trmc_find_ret_let_rhs(stmts, tn) {
+                Some(inner) -> tcrec_walk_tail(inner.kind, nm, arity, own_mod, scope1)
+                None        -> false
+              }
+            } else { false }
+          _ -> tcrec_walk_tail(e.kind, nm, arity, own_mod, scope1)
+        }
       }
     }
     _ -> false
@@ -11614,9 +11873,26 @@ fn emit_trmc_step(src: String, sym: String, holeslot: Int, cname: String,
   }
   # Rebind the loop params from the self-call args, with dropmask
   # reconciling the skipped exit-drops (same shape as tcrec_emit_goto).
-  let arg_lets = tcrec_emit_arg_lets(src, self_args, 0, cx)
-  let drops    = tcrec_emit_drops(pnames, dropmask, 0)
-  let rebinds  = tcrec_emit_rebinds(pnames, 0)
+  # Mixed-param lane: when the recursive fn has a (possibly mixed) raw
+  # signature, the goto's arg-eval / drop / rebind must honour the
+  # per-param mask — raw params evaluate raw, rebind `kair_<p>`, and are
+  # NOT dropped (a scalar has no rc, the #709 corruption). Without this
+  # the TRMC step rebinds `kai_<p>` (boxed prefix) for a param the
+  # signature minted as `kair_<p>` (`undeclared identifier 'kai_k'`) —
+  # the exact failure when mixed-sig and the TRMC+reuse path compose.
+  let sig_opt  = lookup_ufn_by_csym(cx.fns, sym)
+  let arg_lets = match sig_opt {
+    Some(US(pts, _, pmask)) -> tcrec_emit_arg_lets_masked(src, self_args, pts, pmask, 0, cx)
+    None                    -> tcrec_emit_arg_lets(src, self_args, 0, cx)
+  }
+  let drops    = match sig_opt {
+    Some(US(_, _, pmask)) -> tcrec_emit_drops_masked(pnames, pmask, dropmask, 0)
+    None                  -> tcrec_emit_drops(pnames, dropmask, 0)
+  }
+  let rebinds  = match sig_opt {
+    Some(US(_, _, pmask)) -> tcrec_emit_rebinds_masked(pnames, pmask, 0)
+    None                  -> tcrec_emit_rebinds(pnames, 0)
+  }
   concat_all([
     "({ KaiVarSlot _trmc_sl[", int_to_string(n), "] = {", slot_inits, "}; ",
     # Build the spine node REUSING `_arm_ru` (the token the arm-top
@@ -11694,12 +11970,26 @@ fn tcrec_emit_goto(src: String, sym: String, dropmask: Int, pnames: [String],
   # arg values are evaluated as raw expressions. Drops collapse
   # to no-ops since raw scalars carry no reference count.
   match lookup_ufn_by_csym(cx.fns, sym) {
-    Some(US(pts, _)) -> {
-      let arg_lets = tcrec_emit_arg_lets_raw(src, args_e, pts, 0, cx)
-      let rebinds  = tcrec_emit_rebinds_raw(pnames, 0)
+    Some(US(pts, rt, mask)) -> {
+      # Mixed-param lane (issue #440 follow-up): params are a mix of raw
+      # scalars (`kair_<p>`) and boxed pointers (`kai_<p>`). Per slot:
+      #   - raw: raw `_tN`, rebind `kair_<p> = _tN`, NO drop (decref of a
+      #     scalar would corrupt — the #709 bug-class).
+      #   - boxed: `KaiValue *_tN`, drop OLD `kai_<p>` if dropmask, rebind
+      #     `kai_<p> = _tN` (the all-boxed path, per slot).
+      # Temporaries computed before any rebind (args may reference old
+      # param values).
+      let arg_lets = tcrec_emit_arg_lets_masked(src, args_e, pts, mask, 0, cx)
+      let drops    = tcrec_emit_drops_masked(pnames, mask, dropmask, 0)
+      let rebinds  = tcrec_emit_rebinds_masked(pnames, mask, 0)
+      # The statement-expression's value type must match the enclosing
+      # match `_r`: a RAW-return UFn uses a scalar `0`; a BOXED-return
+      # mixed UFn (e.g. `drop(xs, n) : [a]`) needs `(KaiValue *)0` so the
+      # `_r = ({ ...; (KaiValue *)0; })` assignment type-checks.
+      let sentinel = if ty_is_unboxable_t(rt) { "0" } else { "(KaiValue *)0" }
       concat_all([
-        "({ ", arg_lets, rebinds,
-        "goto _kai_", sym, "_entry; 0; })"
+        "({ ", arg_lets, drops, rebinds,
+        "goto _kai_", sym, "_entry; ", sentinel, "; })"
       ])
     }
     None -> {
@@ -11808,6 +12098,91 @@ fn tcrec_emit_rebinds_raw(pnames: [String], i: Int) : String {
         "kair_", p, " = _t", int_to_string(i), "; "
       ])
       string_concat(head, tcrec_emit_rebinds_raw(rest, i + 1))
+    }
+  }
+}
+
+# Mixed-param lane (issue #440 follow-up) — TCO back-edge for a fn with
+# a mix of raw and boxed params. Three helpers, all walked in lockstep
+# with the same `mask`.
+
+# Arg evaluation into temporaries: raw slot → `<scalar> _tN = <raw>`,
+# boxed slot → `KaiValue *_tN = <boxed>`. Done before any rebind.
+fn tcrec_emit_arg_lets_masked(src: String, args_e: [Expr], pts: [Ty], mask: [Bool], i: Int, cx: EmitCtx) : String / Console {
+  match args_e {
+    [] -> ""
+    [a, ...rest] -> {
+      let pty = match pts {
+        [t, ..._] -> t
+        [] -> match a.ty { Some(t) -> t  None -> TyInt }
+      }
+      let trest = match pts {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let head =
+        if is_raw {
+          concat_all([raw_c_type(Some(pty)), " _t", int_to_string(i), " = ",
+                      emit_expr_raw(src, a, cx), "; "])
+        } else {
+          concat_all(["KaiValue *_t", int_to_string(i), " = ",
+                      emit_expr(src, a, cx), "; "])
+        }
+      string_concat(head, tcrec_emit_arg_lets_masked(src, rest, trest, mrest, i + 1, cx))
+    }
+  }
+}
+
+# Drops: ONLY boxed slots whose dropmask bit is set get a drop of the
+# old `kai_<p>`. Raw slots are skipped (a scalar has no refcount —
+# dropping it is the #709 corruption bug).
+fn tcrec_emit_drops_masked(pnames: [String], mask: [Bool], dropmask: Int, i: Int) : String {
+  match pnames {
+    [] -> ""
+    [p, ...rest] -> {
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let bit = tcrec_pow2(i)
+      let head =
+        if is_raw { "" }
+        else if (dropmask / bit) % 2 == 1 {
+          concat_all(["{ KaiValue *_ = kai_internal_drop(kai_", p, "); (void) _; } "])
+        } else { "" }
+      string_concat(head, tcrec_emit_drops_masked(rest, mrest, dropmask, i + 1))
+    }
+  }
+}
+
+# Rebind: raw slot → `kair_<p> = _tN`, boxed slot → `kai_<p> = _tN`.
+fn tcrec_emit_rebinds_masked(pnames: [String], mask: [Bool], i: Int) : String {
+  match pnames {
+    [] -> ""
+    [p, ...rest] -> {
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let prefix = if is_raw { "kair_" } else { "kai_" }
+      let head = concat_all([prefix, p, " = _t", int_to_string(i), "; "])
+      string_concat(head, tcrec_emit_rebinds_masked(rest, mrest, i + 1))
     }
   }
 }

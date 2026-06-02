@@ -57,17 +57,25 @@ import compiler.infer
 #
 # Phase 3 unboxing (issue #383): the fourth slot is the unboxed-
 # signature classification. `None` means the classical
-# `static KaiValue *kai_<name>(KaiValue *...)` calling convention.
-# `Some(US([Ty], Ty))` means the fn was classified by `unbox_classify`
-# as taking + returning raw C scalars (`int64_t` / `double` /
-# `int` / `uint32_t`); the emitter mints a raw signature, EVar reads
-# of the fn's parameters resolve to `kair_<name>`, and call sites
-# emit raw arguments via `emit_expr_raw`. The classifier requires
-# every param ty + return ty to be in {Int, Bool, Char, Real}
-# (concretely; not parametric T), no FFI shim, no protocol-impl
-# child, no effect row, no closure parameters. See
-# `unbox_classify_decl`.
-pub type UFnSig = US([Ty], Ty)
+# `static <ret> kai_<name>(<per-param>...)` calling convention.
+# `Some(US(param_tys, ret_ty, raw_mask))` means the fn was classified
+# as having AT LEAST ONE raw C-scalar parameter. The third field is a
+# per-param boolean mask: `raw_mask[i] == true` means param `i` is a
+# raw scalar (`int64_t` / `double` / `int` / `uint32_t`), `false` means
+# it stays boxed (`KaiValue *`). `param_tys[i]` always carries the
+# param's real Ty (raw or boxed), indexed positionally by the signature
+# emitter, the call-site marshaller, and the TCO rebind.
+#
+# MIXED signatures (issue #440 follow-up): originally the classifier
+# required ALL params + the return to be unboxable (`US([Ty], Ty)`);
+# `balance(Color, RBTree, Int, Int, RBTree) : RBTree` then stayed fully
+# boxed and the rb-tree rebuild re-boxed k/v on every recursive call.
+# The mask lets per-param raw lowering, so k/v travel as `int64_t`
+# alongside the boxed Color/RBTree pointers, and a boxed return type is
+# now allowed (the return is raw iff `ret_ty` is unboxable, derivable
+# from `ret_ty`; the signature emitter / call-site branch on it).
+# Global gates still hold: no tparams, no FFI, no effect row.
+pub type UFnSig = US([Ty], Ty, [Bool])
 
 pub type EFn  = EFn(String, Int, Option[String], Option[UFnSig])
 # Issue #440 Phase 2 — payload type list per variant. Carries the
@@ -188,20 +196,128 @@ pub fn classify_unbox_sig(name: String, mo: Option[String], tparams: [String], p
   if name == "main" and (match mo { None -> true _ -> false }) { None }
   else if list_length(tparams) > 0 { None }
   else if body_is_ffi_extern(body) { None }
+  # Protocol-dispatch shims (`body_is_proto_dispatch`) emit a runtime
+  # `kai_lookup_impl` + an indirect call that hands ALL args to the
+  # impl as boxed `KaiValue *`. A mixed/raw signature would mint a
+  # `kair_<p>` param the shim then passes to a boxed fn-pointer slot
+  # (`cc: undeclared identifier 'kai_<p>'`). Keep these fully boxed.
+  else if body_is_proto_dispatch_local(body) { None }
   else if not row_is_empty(row_of_expr(row)) { None }
   else if body_is_effectful(body) { None }
-  else if not all_params_unboxable(params) { None }
+  # Mixed-param eligibility bound: a fn that mixes a BOXED param with a
+  # RAW one AND contains a lambda is disqualified. The unbox pass seeds
+  # raw params `MUnboxed` so the body reads `kair_<p>`, but it does not
+  # propagate that env INTO a lambda body — a closure that captures a
+  # raw param then reads `kai_<p>` (boxed prefix), which does not exist
+  # (`cc: undeclared identifier 'kai_pos'` — stdlib `bin_bytes_to_int`,
+  # whose `(st, k) => buf[pos + k]` captures the raw `pos`). Rather than
+  # chase every closure-capture boundary, bound eligibility: a mixed
+  # signature must have a lambda-free body. All-raw fns (every param
+  # unboxable) keep working with lambdas — there is no boxed↔raw frontier
+  # for a capture to straddle. The rb-tree `insert_loop` / `balance_*`
+  # are lambda-free, so they still qualify.
+  else if (not all_params_unboxable(params)) and body_has_lambda(body) { None }
+  else if not any_param_unboxable(params) { None }
   else {
     match opt_ret {
       None -> None
       Some(rty) -> {
         let ret_t = resolve_ty(rty)
-        if ty_is_unboxable_t(ret_t) {
-          Some(US(map(params, param_ty), ret_t))
-        } else { None }
+        Some(US(map(params, param_ty), ret_t, param_raw_mask(params)))
       }
     }
   }
+}
+
+# True iff `e` contains a lambda ANYWHERE in its tree. Used to bound
+# mixed-signature eligibility: a fn whose body has a lambda cannot be
+# given a mixed boxed/raw signature, because the unbox pass does not
+# thread the raw-param env into a captured lambda body (the capture
+# would read `kai_<p>` for a raw param). MUST descend INTO `ELambda`
+# bodies as well — a `true` at the top is enough, but nested lambdas in
+# otherwise-non-lambda positions must still be found.
+pub fn body_has_lambda(e: Expr) : Bool = body_kind_has_lambda(e.kind)
+
+pub fn body_kind_has_lambda(k: ExprKind) : Bool {
+  match k {
+    ELambda(_, _) -> true
+    ECall(callee, args_) -> body_has_lambda(callee) or any_has_lambda(args_)
+    EBinop(_, a, b) -> body_has_lambda(a) or body_has_lambda(b)
+    EUnop(_, x) -> body_has_lambda(x)
+    EIf(c, t_, eo) -> body_has_lambda(c) or body_has_lambda(t_) or opt_has_lambda(eo)
+    EMatch(scr, arms) -> body_has_lambda(scr) or any_arm_has_lambda(arms)
+    EBlock(stmts, tail) -> any_stmt_has_lambda(stmts) or opt_has_lambda(tail)
+    EField(b, _) -> body_has_lambda(b)
+    EIndex(a, b) -> body_has_lambda(a) or body_has_lambda(b)
+    ERecordLit(_, fs) -> any_field_has_lambda(fs)
+    EList(els) -> any_elem_has_lambda(els)
+    ERange(a, b, opt_step) -> body_has_lambda(a) or body_has_lambda(b) or opt_has_lambda(opt_step)
+    EPipe(a, b) -> body_has_lambda(a) or body_has_lambda(b)
+    EMapPipe(a, b) -> body_has_lambda(a) or body_has_lambda(b)
+    EFlatMapPipe(a, b) -> body_has_lambda(a) or body_has_lambda(b)
+    EFilterPipe(a, b) -> body_has_lambda(a) or body_has_lambda(b)
+    ELitUnit(inner, _) -> body_has_lambda(inner)
+    EBang(x) -> body_has_lambda(x)
+    _ -> false
+  }
+}
+
+fn opt_has_lambda(opt: Option[Expr]) : Bool = match opt {
+  Some(e) -> body_has_lambda(e)
+  None    -> false
+}
+
+fn any_has_lambda(es: [Expr]) : Bool = match es {
+  [] -> false
+  [h, ...rest] -> if body_has_lambda(h) { true } else { any_has_lambda(rest) }
+}
+
+fn any_arm_has_lambda(arms: [Arm]) : Bool = match arms {
+  [] -> false
+  [Arm(_, g, b), ...rest] ->
+    if opt_has_lambda(g) { true }
+    else if body_has_lambda(b) { true }
+    else { any_arm_has_lambda(rest) }
+}
+
+fn any_field_has_lambda(fs: [FieldInit]) : Bool = match fs {
+  [] -> false
+  [FI(_, v), ...rest] -> if body_has_lambda(v) { true } else { any_field_has_lambda(rest) }
+}
+
+fn any_elem_has_lambda(els: [ListElem]) : Bool = match els {
+  [] -> false
+  [ElPlain(x), ...rest] -> if body_has_lambda(x) { true } else { any_elem_has_lambda(rest) }
+  [ElSpread(x), ...rest] -> if body_has_lambda(x) { true } else { any_elem_has_lambda(rest) }
+}
+
+fn any_stmt_has_lambda(ss: [Stmt]) : Bool = match ss {
+  [] -> false
+  [s, ...rest] -> if stmt_has_lambda(s) { true } else { any_stmt_has_lambda(rest) }
+}
+
+fn stmt_has_lambda(s: Stmt) : Bool = match s {
+  SLet(_, _, rhs) -> body_has_lambda(rhs)
+  SVar(_, _, _, _, _) -> false
+  SAssert(cond, m) -> body_has_lambda(cond) or opt_has_lambda(m)
+  SExprStmt(x) -> body_has_lambda(x)
+  SIndexAssign(b, i, v, _, _) -> body_has_lambda(b) or body_has_lambda(i) or body_has_lambda(v)
+  SUse(_, _, _) -> false
+}
+
+# Per-param raw mask: `true` at position i iff param i lowers to a raw
+# C scalar (Int / Bool / Char / Real). Mixed-param lane (issue #440
+# follow-up). For an all-raw signature every entry is `true`.
+pub fn param_raw_mask(ps: [Param]) : [Bool] = match ps {
+  [] -> []
+  [p, ...rest] -> [ty_is_unboxable_t(param_ty(p)), ...param_raw_mask(rest)]
+}
+
+# True iff at least one param lowers to a raw C scalar. Gate for the
+# mixed-param signature: a fn with zero raw params has nothing to gain.
+pub fn any_param_unboxable(ps: [Param]) : Bool = match ps {
+  [] -> false
+  [p, ...rest] -> if ty_is_unboxable_t(param_ty(p)) { true } else { any_param_unboxable(rest) }
 }
 
 # Phase 3 unboxing — recognise body shapes that pull in handler
@@ -240,8 +356,28 @@ pub fn body_kind_is_effectful(k: ExprKind) : Bool {
     EFlatMapPipe(a, b) -> body_is_effectful(a) or body_is_effectful(b)
     EFilterPipe(a, b) -> body_is_effectful(a) or body_is_effectful(b)
     ELitUnit(inner, _) -> body_is_effectful(inner)
-    EModCall(_, _) -> true
+    # An `EModCall(mod, name)` is an effect OP only when `name` is an
+    # effect operation, which is ALWAYS lowercase. After resolution an
+    # ADT constructor call `RBNode(...)` / `RBLeaf` is also spelled
+    # `EModCall(tycon, Ctor)`, but constructors are uppercase and pure —
+    # marking them effectful needlessly disqualifies pure fns like the
+    # rb-tree `insert_loop` (a body full of `RBNode(...)`) from mixed
+    # signature unboxing. Distinguish by casing: uppercase head = pure
+    # constructor, lowercase head = effect op. Sound because the two
+    # name classes never overlap (ops lowercase, ctors uppercase).
+    EModCall(_, name) -> not fnreg_name_first_is_upper(name)
     _ -> false
+  }
+}
+
+# True iff `s` begins with an uppercase letter (A–Z). Used by
+# `body_kind_is_effectful` to tell a pure ADT constructor call
+# (`EModCall(tycon, Ctor)`) from an effect-op call
+# (`EModCall(Eff, op)`); ops are always lowercase.
+fn fnreg_name_first_is_upper(s: String) : Bool {
+  match char_at(s, 0) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None -> false
   }
 }
 
@@ -461,6 +597,20 @@ pub fn body_is_ffi_extern(body: Expr) : Bool {
   match body.kind {
     ETodo(msg) -> msg == ffi_extern_tag() or string_starts_with_q(msg, ffi_extern_tag_prefix())
     _ -> false
+  }
+}
+
+# Local copy of emit_shared's `body_is_proto_dispatch` (fnreg cannot
+# import emit_shared — that module imports fnreg, which would cycle).
+# Detects the protocol-dispatch shim marker (a tail `ETodo` whose
+# message starts with `__kai_proto_dispatch__:`, possibly wrapped in an
+# EBlock by Perceus's exit-drop). Kept byte-compatible with the prefix
+# `proto_dispatch_tag_prefix()` in emit_shared.kai.
+pub fn body_is_proto_dispatch_local(e: Expr) : Bool {
+  match e.kind {
+    ETodo(msg)            -> string_starts_with_q(msg, "__kai_proto_dispatch__:")
+    EBlock(_, Some(tail)) -> body_is_proto_dispatch_local(tail)
+    _                     -> false
   }
 }
 
